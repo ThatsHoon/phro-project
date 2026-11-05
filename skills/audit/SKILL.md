@@ -1,6 +1,6 @@
 ---
 name: audit
-description: Reads a plugin's current structure and proposes merges, deletions and repairs, without editing it. 플러그인 점검, 통폐합, 정리, 유지보수, 이거 지우면 뭐가 깨지나.
+description: Reads a plugin's current structure and proposes merges, deletions and repairs, without editing it.
 disable-model-invocation: true
 ---
 
@@ -16,7 +16,7 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
    - `duplicate-file`: may be deliberate, such as a template copied into examples or one rule file per platform.
    - `orphan`: may be a tool run by hand or a file other platforms read.
    - `overlap-candidate`: word overlap only. Read both descriptions, and ask which real requests would fit both.
-   - `never-called`: means nothing if the transcripts predate the skill or come from another project.
+   - `never-called`: means nothing if the transcripts predate the skill or come from another project. `unmeasured` means no transcripts were found, so use is unknown.
 4. Find what the script cannot: skills that do the same job in different words, a rule that no longer matches the code, and steps a script could do deterministically. Use `sql` and `impact <plugin> <node>` for structure questions.
 5. Write proposals, deletions and merges first:
 

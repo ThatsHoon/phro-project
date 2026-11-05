@@ -1,6 +1,6 @@
 ---
 name: design
-description: Before adding a plugin feature, decides where it belongs (skill, script, hook, MCP, existing part, or nothing) and writes trigger prompts first. 플러그인 기능 추가 설계, 어디에 넣을지, 스킬로 만들지 스크립트로 만들지.
+description: Before adding a plugin feature, decides where it belongs (skill, script, hook, MCP, existing part, or nothing). 플러그인 기능 추가 설계, 어디에 넣을지, 스킬로 만들지 스크립트로 만들지.
 ---
 
 # design

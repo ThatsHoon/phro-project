@@ -6,6 +6,7 @@ Manifest, docs/core/core.json:
 The script adds "reviewed", "checked", "drift" and "goal_sha" to it. `*` also crosses folders. `~memory` is this project's Claude Code memory folder.
 """
 import argparse
+import collections
 import fnmatch
 import hashlib
 import json
@@ -49,6 +50,13 @@ def memory_dir(root):
     return Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path(root).resolve())) / "memory"
 
 
+def walk(start, skip):
+    for folder, dirs, files in os.walk(start):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d not in skip and not (Path(folder) / d / "pyvenv.cfg").exists()]
+        for name in files:
+            yield Path(folder) / name
+
+
 def source_files(root, pattern, skip):
     """Files behind one source pattern. Walks only below the pattern's literal prefix, since a project can hold 200k files."""
     if pattern == "~memory":
@@ -66,12 +74,9 @@ def source_files(root, pattern, skip):
         yield start
         return
     wanted = pattern if len(fixed) < len(parts) else pattern.rstrip("/") + "/*"
-    for folder, dirs, files in os.walk(start):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d not in skip and not (Path(folder) / d / "pyvenv.cfg").exists()]
-        for name in files:
-            path = Path(folder) / name
-            if fnmatch.fnmatch(path.relative_to(root).as_posix(), wanted):
-                yield path
+    for path in walk(start, skip):
+        if fnmatch.fnmatch(path.relative_to(root).as_posix(), wanted):
+            yield path
 
 
 def stale(root, manifest):
@@ -95,6 +100,26 @@ def stale(root, manifest):
                     continue
         rows.append((doc["file"], list(dict.fromkeys(changed)), (now - since) / 86400 if since else None))
     return rows
+
+
+def elsewhere(root, manifest):
+    """Changed files per folder that no document's sources cover, since the oldest review. Sources stay narrow, so this is where a refresh sees work outside the documents."""
+    since = min(manifest.get("reviewed", {}).values(), default=None)
+    counts = collections.Counter()
+    if since is None:
+        return counts
+    root = Path(root)
+    skip = set(manifest.get("skip", []))
+    covered = {path for doc in manifest["docs"] for pattern in doc.get("sources", []) if pattern != "~memory" for path in source_files(root, pattern, skip)}
+    for path in walk(root, skip):
+        try:
+            if path.stat().st_mtime <= since:
+                continue
+        except OSError:
+            continue
+        if path not in covered and not path.is_relative_to(root / CORE):
+            counts["/".join(path.relative_to(root).parts[:-1][:2]) or "."] += 1
+    return counts
 
 
 def goal_section(text):
@@ -281,7 +306,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("hook", help="print the index for a session; silent where docs/core does not exist")
-    sub.add_parser("status", help="documents whose sources changed since their last review").add_argument("root")
+    sub.add_parser("status", help="documents whose sources changed since their last review, and changed folders no source covers").add_argument("root")
     sub.add_parser("lint", help="length, history, dates, AI marks, dead paths, a moved final goal").add_argument("root")
     p = sub.add_parser("stamp", help="mark documents reviewed, only when lint is clean")
     p.add_argument("root")
@@ -318,6 +343,12 @@ def main():
                 print(f"  and {len(fresh) - SHOWN} more not listed: read the folder, or narrow this source")
             if len(changed) > len(fresh):
                 print(f"  and {len(changed) - len(fresh)} listed above")
+        outside = elsewhere(args.root, manifest)
+        for folder, number in outside.most_common(SHOWN):
+            print(f"elsewhere\t{folder}\t{number} changed")
+        if len(outside) > SHOWN:
+            print(f"  and {len(outside) - SHOWN} more folders")
+        print(f"ELSEWHERE\t{sum(outside.values())}")
         print(f"STALE\t{count}")
         return
     found = lint(args.root) if args.command == "lint" else stamp(args.root, args.files, args.accept_goal, args.drift)

@@ -203,6 +203,9 @@ def demo():
         (root / "docs/core/structure.json").write_text(json.dumps(rules), encoding="utf-8")
         check = lambda: subprocess.run([sys.executable, "-I", "-X", "utf8", "tests/test_structure.py"], capture_output=True, text=True, cwd=root)
         assert check().returncode == 0, check().stderr
+        (root / "docs/core/structure.json").write_text(json.dumps({**rules, "layer": {"core": ["services"]}}), encoding="utf-8")
+        assert check().returncode == 1 and "layer" in check().stderr, "a misspelled rule would otherwise check nothing"
+        (root / "docs/core/structure.json").write_text(json.dumps(rules), encoding="utf-8")
         for rel, text in {"misc/x.txt": "x\n", "docs/y.py": "Y = 1\n", "core/c.py": "from services.b import X\n", "services/d.py": "import sys\nsys.path.insert(0, '.')\n"}.items():
             path = root / rel
             path.parent.mkdir(parents=True, exist_ok=True)

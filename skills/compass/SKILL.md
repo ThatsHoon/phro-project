@@ -39,17 +39,17 @@ These documents belong to one project. Use only the project at the given root: i
 
 1. Harvest: the memory index and its goal entries, READMEs, existing indexes, the top folders (`restructure.py map` for a large project), and the titles of this project's sessions if a session list tool exists. Such a list can span every project, so keep only rows whose folder is this root.
 2. Propose the areas (at most 8) and the document list in one message, and wait for a yes. Take the final goal only from the user's words. If none exist, ask for it. Never infer one.
-3. Write the documents and `core.json`. Keep `sources` narrow, such as `src/*.py` and `~memory`, and put data folders in `skip`.
+3. Write the documents and `core.json`. Keep `sources` narrow, such as `src/*.py` and `~memory`, and put data folders in `skip`. Work outside `sources` still shows in `status`, by folder.
 4. Run `lint`, fix what it flags, then `stamp`.
 5. Offer a daily refresh. A scheduled task is standing configuration, so ask first. Create one task per project, named after it, with the scheduled task tool and a self-contained prompt: `Run /phro-project:compass refresh for <absolute project root>. End with at most 5 lines.`
 
 ## Refresh, the default
 
-1. Run `status`. If `STALE 0`, say so in one line and stop. It records when it looked, and `stamp` uses that time, so a file saved during the refresh stays stale for the next one.
+1. Run `status`. If `STALE 0` and `ELSEWHERE 0`, say so in one line and stop. It records when it looked, and `stamp` uses that time, so a file saved during the refresh stays stale for the next one.
 2. For each stale document, read the changed files it lists, and the memory entries when `~memory` changed. A path prints once, under the first document that depends on it: "listed above" means those paths apply here too, and "not listed" means read the folder or narrow the source. Change only what is no longer true. A stale document that is still right stays as it is.
 3. Never edit the first section of `goals.md` on your own. A result or a fork's work cannot move a final goal: report the conflict instead. Only after the user says so, edit it and use `stamp --accept-goal`.
 4. Run `lint`, edit only what it flags. `dead-source` means a pattern in `core.json` matches no file: point it at where those files are now, or remove it.
-5. Write the drift in one line, at most 200 characters in the user's language: areas with recent changes that serve no listed goal, and goals with no recent work. Run `stamp --drift "<line>"`, or `--drift ""` when there is none. Every session receives this line.
+5. Write the drift in one line, at most 200 characters in the user's language: areas with recent changes that serve no listed goal, and goals with no recent work. The `elsewhere` lines show where work happened outside every document's sources, by folder and count. Judge from those, and open a file only when a folder name does not say what it holds. A folder of generated or vendor files goes in `skip`, and a folder a document should follow goes in its `sources`. Run `stamp --drift "<line>"`, or `--drift ""` when there is none, also when nothing was stale. Every session receives this line.
 6. Report the documents changed and the drift.
 
 ## Add a document

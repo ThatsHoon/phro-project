@@ -10,8 +10,37 @@ It has no universal structure, because plugins differ too much between projects.
 
 Always-on cost, in every session of every project where the plugin is enabled:
 
-- Two skill descriptions, `compass` and `design`, about 230 tokens. The other three skills are not listed, so they cost nothing until you type them.
+- Two skill descriptions, `compass` and `design`, about 160 tokens by `/skill-doctor`. The other three skills are not listed, so they cost nothing until you type them.
 - One `SessionStart` hook, at start, clear and compaction. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing.
+
+## 새 프로젝트에서 쓰기
+
+한 번 설치하면 모든 폴더에서 켜져 있고, 문서와 기록은 프로젝트마다 따로 둡니다.
+
+1. 일부 프로젝트에서만 쓰려면 사용자 범위 설치를 지우고, 그 프로젝트 폴더에서 설치합니다. 안 쓰는 폴더에서 목록 비용 약 160토큰을 아낍니다.
+
+   ```bash
+   claude plugin install phro-project@phro-project --scope local
+   ```
+
+2. 그 폴더에서 새 세션을 열고 "핵심 문서 만들어줘"라고 합니다. 다른 폴더에서 작업하던 세션은 맥락이 섞이지 않게 멈춥니다.
+3. 영역 제안을 확인합니다. 최종 목표는 사용자의 말로만 적으니, 없으면 물을 때 한두 문장으로 답합니다.
+4. 매일 갱신 예약을 물으면 답합니다. 예약 작업은 프로젝트마다 하나입니다.
+5. 평소에는 그대로 일합니다. 필요할 때만 부릅니다.
+
+| 언제 | 무엇을 |
+|---|---|
+| 목표가 바뀌었을 때 | 그렇게 말하면 해당 문서를 같은 단계에서 고칩니다 |
+| 폴더가 지저분할 때 | `/phro-project:restructure` |
+| 이 프로젝트의 플러그인에 기능을 더할 때 | "이 기능 어디에 넣을까" 또는 `/phro-project:design` |
+| 스킬이 안 불리는 것 같을 때 | `/phro-project:route-test`, 비용을 먼저 알려 줍니다 |
+| 플러그인이 커졌을 때 | `/phro-project:audit` |
+
+제대로 돌면 이렇게 보입니다.
+
+- 새 세션에서 "이 프로젝트 최종 목표가 뭐야?"라고 물으면 파일을 열지 않고 답합니다.
+- 갱신이 멈추면 세션 시작 때 경고가 나옵니다.
+- 다른 폴더의 세션은 이 문서를 모릅니다.
 
 ## Skeleton
 
@@ -93,14 +122,14 @@ restructure -> map -> proposal, your yes -> phased moves -> tests -> folder rule
 2. Collect competitors (`catalog`). Real misses come from the other installed skills.
 3. Build the test on a scratch copy (`build`). The plugin itself is not touched.
 4. State the estimate, get approval, then run `claude plugin eval`. A case costs about $0.15 at 55 skills on Opus.
-5. Tally (`tally`): hits, other skill, cut off by the turn limit, no skill, false fires.
+5. Tally (`tally`): hits, other skill, unresolved, no skill, false fires. A run that ended abnormally with no skill called, by turn limit, timeout or API error, is unresolved, not a miss.
 6. Act on the result:
 
    | Result | Next |
    |---|---|
    | Another skill took it | Read both descriptions, fix the overlap or merge |
    | No skill fired | Try the description, then `paths`, then a hook |
-   | Cut off | Raise `--max-turns` and rerun |
+   | Unresolved | Rerun, with a higher `--max-turns` if the turn limit ended it |
    | False fire | Narrow the description |
    | All pass | Stop. Add nothing |
 
@@ -139,10 +168,10 @@ Detection machinery is not stacked in advance. Measure per skill, and move a ski
 
 1. Init: harvest memory, READMEs and top folders, propose at most 8 areas, wait for a yes. The final goal comes only from the user's words.
 2. Every session and fork receives the index from the hook. They read the same files, so a fork's work reaches later sessions through them.
-3. Refresh runs once a day as one scheduled session, set up only after you agree. `status` finds documents whose sources changed; with none stale it stops without further work. It records when it looked, and `stamp` uses that time, so a file saved during a refresh stays stale for the next one. The hook warns when nothing has looked for longer than `refresh_days` plus one day, not merely when a quiet project had nothing to change.
+3. Refresh runs once a day as one scheduled session, set up only after you agree. `status` finds documents whose sources changed, and lists by folder what changed outside every source; with neither it stops without further work. It records when it looked, and `stamp` uses that time, so a file saved during a refresh stays stale for the next one. The hook warns when nothing has looked for longer than `refresh_days` plus one day, not merely when a quiet project had nothing to change.
 4. A refresh changes only what is no longer true. It cannot edit the final goal: `lint` flags that as `goal-changed`, and only `stamp --accept-goal` after you say so clears it.
 5. `lint` must pass before `stamp`. It flags AI marks and tells, change history, dates, overlong documents, dead paths, unlisted documents and source patterns that match no file. A `>` quote is the user's own words, so it is never flagged.
-6. A refresh ends with `stamp --drift "<line>"`: work that serves no listed goal, and goals with no recent work, in at most 200 characters. Every session receives this line after the index, about 50 tokens.
+6. A refresh ends with `stamp --drift "<line>"`: work that serves no listed goal, and goals with no recent work, in at most 200 characters. The folder list from `status` is what it judges this from. Every session receives this line after the index, about 50 tokens.
 
 Session transcripts are never a source for these documents. Durable decisions are already in memory, documents and code, and transcripts can hold private data. `usage` is the one script that opens them: it counts reads of each document and prints no text.
 
@@ -155,7 +184,7 @@ Fires when you ask. Nothing moves without your yes on the proposal.
 3. Prepare: stop running jobs, pause this project's scheduled tasks, take a checkpoint, record the test baseline, pin untested behaviour with tests.
 4. Move in phases: `plan`, `apply`, fix the listed manual and fragile lines, `verify`, then the full test suite. `apply` also moves the source patterns in `docs/core/core.json`, including a file that leaves a pattern's folder, so later edits still mark documents stale.
 5. Add tests for any code whose logic changed. `verify` blocks on `no-test` until they exist.
-6. Write the rules: `docs/core/structure.md`, `docs/core/structure.json` and a copy of `references/test_structure.py`, so a later break fails a test. Add `structure.md` to `core.json`, then run compass `lint` and `stamp`. Fix memory, schedules and settings that name old paths.
+6. Write the rules: `docs/core/structure.md`, `docs/core/structure.json` and a copy of `references/test_structure.py`, so a later break fails a test. Plant one violation of each rule to prove it can fail. A misspelled rule name fails the test. Add `structure.md` to `core.json`, then run compass `lint` and `stamp`. Fix memory, schedules and settings that name old paths.
 
 `verify` blocks on references lost, files missing, syntax errors and changed code without a test. It also lists old mentions, but passing is not enough: on one real move it passed while the suite had 41 failures, because tests built the path from the folder name in ways no scanner resolves. The suite decides.
 
@@ -201,8 +230,8 @@ Findings from `check` are candidates, not verdicts:
 | `broken-ref` | A running file points at a missing file |
 | `duplicate-file`, `shared-lines` | A whole file repeated, or lines copied between instructions |
 | `orphan` | A script or doc nothing points at |
-| `no-eval`, `never-called` | No eval case or `tests/route_cases.json` entry grades it, or no call in the transcripts. A skill only the user invokes needs no eval |
-| `no-description`, `long-description`, `long-body` | No description, over 1,536 characters, over 500 lines |
+| `no-eval`, `never-called`, `unmeasured` | No eval case or `tests/route_cases.json` entry grades it, or no call in the transcripts, or no transcripts to count in. A skill only the user invokes needs no eval |
+| `no-description`, `long-description`, `long-body` | No description, over 1,536 characters, over about 5,000 tokens, where a compaction cuts a skill |
 | `overlap-candidate` | Descriptions share many words. `audit` judges the meaning |
 
 On real plugins, `broken-ref` was often an example path in a skill about writing skills, and `duplicate-file` was often deliberate. That is why `audit` opens each file.
@@ -214,7 +243,7 @@ Run as `python -I -X utf8 scripts/compass.py <command>`.
 | Command | Does |
 |---|---|
 | `hook` | Reads the event from standard input and prints the index. Called by `hooks/hooks.json` |
-| `status <root>` | Per document: stale or current, sources changed, age, then `STALE n`. Lists up to 100 new paths per document, each path once, and says how many it left out. Records when it looked |
+| `status <root>` | Per document: stale or current, sources changed, age. Lists up to 100 new paths per document, each path once, and says how many it left out. Then folders with changes outside every source since the oldest review, `ELSEWHERE n` and `STALE n`. Records when it looked |
 | `lint <root>` | One finding per line, then `OK` or `FINDINGS n` |
 | `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint and the drift line |
 | `usage <root>` | Reads of each document in this project's transcripts, leaving out sessions that ran `stamp`. Counts only |

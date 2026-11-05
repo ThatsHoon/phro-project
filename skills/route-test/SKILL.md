@@ -1,6 +1,6 @@
 ---
 name: route-test
-description: Measures whether a plugin's skills get called and which skill takes each miss, on real prompts. 스킬이 호출되는지 측정, 왜 안 불렸는지, 설명문 수정 전후 비교.
+description: Measures whether a plugin's skills get called and which skill takes each miss, on real prompts. Spends money, so it runs only when you type it.
 disable-model-invocation: true
 ---
 
@@ -39,7 +39,7 @@ project.py tally result.json
 
 Always pass `--no-publish`. Pin the model, since firing rates differ widely between models. The cost ceiling is only checked before each run starts, so with `-j 4` spend can pass it by several runs: set it below what the user approved.
 
-`cut_off` runs hit the turn limit with no skill called yet. They are unresolved, not misses. Rerun them with a higher `--max-turns` before drawing a conclusion.
+`unresolved` runs ended abnormally with no skill called yet, and each `miss` line gives the reason. They are not misses. Rerun them before drawing a conclusion, with a higher `--max-turns` when the turn limit ended them.
 
 One run per case moves a rate by a whole case, so a difference of one or two cases is noise. Rerun the disputed cases with `--runs 3` before acting on them.
 

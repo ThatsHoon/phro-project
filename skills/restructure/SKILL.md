@@ -1,6 +1,6 @@
 ---
 name: restructure
-description: Reorganizes a whole project's files and folders: maps every file and dependency, proposes the best structure without compromising for the current one, moves files, fixes references, adds tests for changed code, and writes the folder rules later sessions follow. 폴더 구조 정리, 디렉토리 리팩토링, 재구조화, 파일이 지저분해, 모듈화, directory structure refactoring.
+description: Reorganizes a whole project's files and folders, from the dependency map to a working new layout, tests and folder rules. Moves files, so it runs only when you type it.
 disable-model-invocation: true
 ---
 
@@ -54,7 +54,7 @@ For each phase, usually one module at a time with shared code first:
 ## 6. Write the rules
 
 1. Write `docs/core/structure.md`: the tree with one line per folder, where a new file of each kind goes, how to run things, and the rules (what must not import what, what is banned). State what is true now, with no history. If `docs/core/README.md` exists, name it there, with the folder rules in a line or two. Sessions receive that file through the plugin hook. If it does not exist, create it with those lines and a `core.json`, as the `compass` skill describes.
-2. Write the same rules as data in `docs/core/structure.json`, and copy `${CLAUDE_PLUGIN_ROOT}/skills/restructure/references/test_structure.py` to `tests/test_structure.py`. Run it. From then on, a file in the wrong place fails the suite.
+2. Write the same rules as data in `docs/core/structure.json`, and copy `${CLAUDE_PLUGIN_ROOT}/skills/restructure/references/test_structure.py` to `tests/test_structure.py`. Run it. Then prove each rule catches something: plant one violation of each rule you wrote, in the language the project uses, see the test fail, remove it and see it pass. A rule that cannot fail is removed, or `structure.md` says it is not enforced. `layers` reads Python imports only, so write banned imports in other languages as `forbid` patterns. From then on, a file in the wrong place fails the suite.
 3. Add `structure.md` to the `docs` list in `core.json` with empty `sources`, since the test holds it to the code. Run `compass.py lint <root>` from the same scripts folder, fix what it flags, then `compass.py stamp <root>`. Without the list entry `lint` fails and every later refresh stops at `stamp`.
 4. Fix what still names old paths: memory, scheduled tasks, settings, server scripts.
 5. Report: before and after top-level folders and file counts, references rewritten, tests before and after, what is left, and the state of each `verify` count.

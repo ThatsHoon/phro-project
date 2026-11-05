@@ -5,6 +5,7 @@ Run: python tests/test_structure.py, or through pytest.
 structure.json:
 {"top": ["core", "services", "docs"], "no_code_in": ["docs"], "layers": {"core": [], "services": ["core"]},
  "forbid": [{"pattern": "sys\\.path\\.insert", "except": ["legacy/"]}]}
+"layers" reads Python imports only. For other code, write the banned import as a "forbid" pattern.
 """
 import ast
 import json
@@ -32,6 +33,11 @@ def code_files():
 
 def rel(path):
     return path.relative_to(ROOT).as_posix()
+
+
+def test_rule_names():
+    unknown = set(RULES) - {"top", "no_code_in", "layers", "forbid"}
+    assert not unknown, f"docs/core/structure.json names rules that do not exist, so they check nothing: {sorted(unknown)}"
 
 
 def test_top_level_folders():
@@ -84,6 +90,6 @@ def test_forbidden_patterns():
 
 
 if __name__ == "__main__":
-    for check in (test_top_level_folders, test_no_code_where_it_does_not_belong, test_layers, test_forbidden_patterns):
+    for check in (test_rule_names, test_top_level_folders, test_no_code_where_it_does_not_belong, test_layers, test_forbidden_patterns):
         check()
     print("ok")

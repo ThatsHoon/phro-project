@@ -228,6 +228,35 @@ def demo():
         write(project, "refresh.jsonl", read("4", core / "features/app.md") + ran)
         write(Path(home) / ".claude/projects/C--other", "b.jsonl", read("5", core / "goals.md"))
         assert compass.usage(d) == ({"goals.md": 2, "features/app.md": 0}, 3, 1), compass.usage(d)
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        write(d, "other/x.py", "\n")
+        assert not compass.elsewhere(d, compass.load(d)), "before any review there is no window to count in"
+        assert compass.stamp(d, []) == []
+        assert not compass.elsewhere(d, compass.load(d)), "nothing changed since the review"
+        manifest = compass.load(d)
+        manifest["skip"] = ["runs"]
+        compass.save(d, manifest)
+        write(d, "venv2/pyvenv.cfg", "\n")
+        future = time.time() + 60
+        for rel in ("demo/twin/a.js", "demo/twin/deep/b.js", "demo/c.js", "top.txt", "src/app.py", "runs/big.bin", "docs/core/extra.txt", "venv2/x.py"):
+            write(d, rel, "x\n")
+            os.utime(Path(d) / rel, (future, future))
+        assert dict(compass.elsewhere(d, compass.load(d))) == {"demo/twin": 2, "demo": 1, ".": 1}, "folders only, without sources, skipped folders, docs/core or a venv"
+        for _ in range(2):  # running status by hand must not use up what the next refresh sees
+            said = status(d)
+            assert "elsewhere\tdemo/twin\t2 changed" in said and "ELSEWHERE\t4\n" in said and said.endswith("STALE\t1\n"), said
+        for number in range(compass.SHOWN):
+            write(d, f"many/f{number}/x.py", "\n")
+        said = status(d)
+        assert "and 3 more folders" in said and f"ELSEWHERE\t{compass.SHOWN + 4}\n" in said, said[-200:]
+        assert compass.stamp(d, []) == []
+        assert not [k for k in compass.elsewhere(d, compass.load(d)) if k.startswith("many")], "a refresh moves the window past what it saw"
+        manifest = compass.load(d)
+        manifest["reviewed"]["goals.md"] = time.time() - 60
+        manifest["reviewed"]["features/app.md"] = time.time() + 600
+        assert "many/f0" in compass.elsewhere(d, manifest), "stamping one document must not hide what the others have not seen"
     print("ok")
 
 

@@ -25,7 +25,7 @@ from pathlib import Path
 SKIP = {".git", "__pycache__", "node_modules", "results", ".venv"}
 TEXT = {".md", ".py", ".json", ".yaml", ".yml", ".sh", ".js", ".ts", ".tsx", ".cjs", ".mjs", ".toml", ".txt", ".ps1", ".jsonl"}
 LISTING_LIMIT = 1536  # description + when_to_use, cut off in the skill listing beyond this
-LONG_BODY_LINES = 500
+LONG_BODY_TOKENS = 5000  # a compaction re-attaches a skill cut to its first 5,000 tokens
 OVERLAP_MIN = 0.25  # ponytail: word Jaccard only finds candidates; semantic overlap is the model's call in audit
 SHARED_LINES_MIN = 3
 PATH_REF = re.compile(r"(?<![\w./-])((?:references|scripts|hooks|agents|skills|commands|assets|templates|fixtures)/[\w./-]*\w\.\w+)")
@@ -155,9 +155,12 @@ def add_edges(db, plugin, kinds, texts, sources):
 
 
 def usage(directory, plugin):
-    """Typed commands and model Skill calls per skill. Forked sessions copy lines, so every event counts once by uuid. Counts only, no text."""
+    """Typed commands and model Skill calls per skill, or None without any transcript, which is not a count of zero. Forked sessions copy lines, so every event counts once by uuid. Counts only, no text."""
     typed, model, seen = collections.Counter(), collections.Counter(), set()
-    for path in Path(directory).rglob("*.jsonl"):
+    paths = list(Path(directory).rglob("*.jsonl"))
+    if not paths:
+        return None
+    for path in paths:
         for line in path.open(encoding="utf-8", errors="replace"):
             if '"Skill"' not in line and "<command-name>" not in line:
                 continue
@@ -246,8 +249,8 @@ def findings(root, usage_dir=None):
             out.append(("no-description", node, "the model cannot pick it from the listing"))
         elif len(description) > LISTING_LIMIT:
             out.append(("long-description", node, f"{len(description)} chars, cut at {LISTING_LIMIT}"))
-        if frontmatter(texts[node])[1].count("\n") > LONG_BODY_LINES:
-            out.append(("long-body", node, f"over {LONG_BODY_LINES} lines"))
+        if tokens(frontmatter(texts[node])[1]) > LONG_BODY_TOKENS:
+            out.append(("long-body", node, f"over about {LONG_BODY_TOKENS} tokens, and a compaction cuts the rest"))
         if not user_only(fields):
             words[node] = {w for w in re.findall(r"\w{3,}", description.lower()) if w not in STOP}
     listed = sorted(words)
@@ -259,7 +262,10 @@ def findings(root, usage_dir=None):
                 out.append(("overlap-candidate", a, f"{b}: {score:.2f}"))
     if usage_dir:
         used = usage(usage_dir, plugin)
-        out += [("never-called", n[0], "0 typed, 0 model calls in these transcripts") for n in nodes if n[1] == "skill" and used(n[0].split(":", 1)[1]) == (0, 0)]
+        if used:
+            out += [("never-called", n[0], "0 typed, 0 model calls in these transcripts") for n in nodes if n[1] == "skill" and used(n[0].split(":", 1)[1]) == (0, 0)]
+        else:
+            out.append(("unmeasured", str(usage_dir), "no transcripts here, so use is unknown"))
     return out
 
 
@@ -413,31 +419,34 @@ def cmd_tally(a):
                 took = sorted(n[3:] for n, ok in graders.items() if n.startswith("to-") and ok)
                 pattern = next((g["config"].get("input_match", "") for g in case["graders"] if g["name"] == "target"), "")
                 expected = m.group(1) if (m := re.search(r'\?([\w-]+)"$', pattern)) else None
+                # A run that ended abnormally with no skill yet, by turn limit, timeout or API error, has shown nothing; it is unresolved.
+                error = str(run.get("error") or "")[:60]
                 if expected is None:
+                    if error and not took:
+                        misses.append(f"{case['name']} no skill expected -> unresolved, {error}")
+                        continue
                     negatives += 1
                     if took:
                         false_fires.append(f"{case['name']} -> {','.join(took)}")
                     continue
                 row = per[expected]
                 row[0] += 1
-                # A run stopped by the turn limit with no skill yet has not missed; it is unresolved.
-                cut = "maximum number of turns" in str(run.get("error"))
                 if graders.get("target"):
                     row[1] += 1
                 elif took:
                     row[2] += 1
                     misses.append(f"{case['name']} {expected} -> {','.join(took)}")
-                elif cut:
+                elif error:
                     row[3] += 1
-                    misses.append(f"{case['name']} {expected} -> unresolved, cut off")
+                    misses.append(f"{case['name']} {expected} -> unresolved, {error}")
                 else:
                     misses.append(f"{case['name']} {expected} -> none")
         total, hit = sum(r[0] for r in per.values()), sum(r[1] for r in per.values())
         print(f"file\t{file}\truns\t{runs}\tcost\t{data.get('costUsd', 0):.2f}\tpartial\t{data.get('partial')}")
         print(f"target\t{hit}/{total}\tfalse_fires\t{len(false_fires)}/{negatives}")
-        print("skill\tcases\thit\tother_skill\tcut_off\tno_skill")
-        for skill, (n, h, other, cut) in sorted(per.items()):
-            print(f"{skill}\t{n}\t{h}\t{other}\t{cut}\t{n - h - other - cut}")
+        print("skill\tcases\thit\tother_skill\tunresolved\tno_skill")
+        for skill, (n, h, other, open_) in sorted(per.items()):
+            print(f"{skill}\t{n}\t{h}\t{other}\t{open_}\t{n - h - other - open_}")
         for line in misses:
             print(f"miss\t{line}")
         for line in false_fires:
