@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Report per skill: hits, false fires, and who took each miss. A pass rate with no confusion table cannot say what to fix.
 
-Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. Every model run costs money, about $0.15 per case at 55 skills on Opus. State the estimate (cases x runs x cost) and get a yes before any `claude plugin eval`.
+Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. `<plugin>` is a plugin folder, or a project root, which means the skills in its `.claude`. Every model run costs money, about $0.15 per case at 55 skills on Opus. State the estimate (cases x runs x cost) and get a yes before any `claude plugin eval`.
 
 ## 1. Cases
 
@@ -57,5 +57,11 @@ A label can be wrong: when the other skill also fits the request, say so and fix
 For any change, run the same cases on both versions and report what was gained and what broke, not only the net. A change that gains one case and breaks another needs the user's call.
 
 A loaded skill can still be ignored. When following its procedure matters, drop `--stub`, raise `--max-turns`, and add a grader for a step of the procedure.
+
+## 5. A skill that fires from a step
+
+Some skills should fire partway through the work, such as after a draft and before the report. To a case, add `"after": "Write"`, the tool that marks the step, and `"rule": "<the standing rule's text>"`. `build` adds a `tool_order` grader and prints the `--allow-tools` the run needs, and `tally` counts a call at the wrong moment as `wrong_order`. Write the prompt so the step really happens, and add the same prompt without `rule` as a control.
+
+An eval reads no project configuration, so `rule` reaches the run through `append_system_prompt`, standing in for the core index. A pass says the wording works, not that the hook delivered it.
 
 Report in the user's language with the model, cases, runs and cost, and say which prompts were real.

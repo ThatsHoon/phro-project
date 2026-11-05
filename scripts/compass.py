@@ -21,6 +21,8 @@ INDEX_LINES, INDEX_CHARS = 40, 2500
 DOC_LINES = 80
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".pytest_cache", ".phro-project", "venv", ".venv"}
 SHOWN = 100
+SHOWN_DOCS = 30
+DOC_SUFFIXES = {".md", ".rst", ".adoc"}
 DRIFT_CHARS = 200
 
 # The same lists as the style check in phro-search, cut to what a reference document can trip on.
@@ -106,23 +108,25 @@ def stale(root, manifest):
 
 
 def elsewhere(root, manifest):
-    """Changed files per folder that no document's sources cover, since the oldest review. Sources stay narrow, so this is where a refresh sees work outside the documents."""
+    """Changed files that no document's sources cover, since the oldest review: a count per folder, and the documents among them, newest first. Sources stay narrow, so this is where a refresh sees work and writing outside the core documents."""
     since = min(manifest.get("reviewed", {}).values(), default=None)
-    counts = collections.Counter()
+    counts, documents = collections.Counter(), []
     if since is None:
-        return counts
+        return counts, documents
     root = Path(root)
     skip = set(manifest.get("skip", []))
     covered = {path for doc in manifest["docs"] for pattern in doc.get("sources", []) if pattern != "~memory" for path in source_files(root, pattern, skip)}
     for path in walk(root, skip):
         try:
-            if path.stat().st_mtime <= since:
-                continue
+            changed = path.stat().st_mtime
         except OSError:
             continue
-        if path not in covered and not path.is_relative_to(root / CORE):
-            counts["/".join(path.relative_to(root).parts[:-1][:2]) or "."] += 1
-    return counts
+        if changed <= since or path in covered or path.is_relative_to(root / CORE):
+            continue
+        counts["/".join(path.relative_to(root).parts[:-1][:2]) or "."] += 1
+        if path.suffix.lower() in DOC_SUFFIXES:
+            documents.append((changed, path))
+    return counts, [path for _, path in sorted(documents, key=lambda item: item[0], reverse=True)]
 
 
 def goal_section(text):
@@ -355,11 +359,15 @@ def main():
                 print(f"  and {len(fresh) - SHOWN} more not listed: read the folder, or narrow this source")
             if len(changed) > len(fresh):
                 print(f"  and {len(changed) - len(fresh)} listed above")
-        outside = elsewhere(args.root, manifest)
+        outside, documents = elsewhere(args.root, manifest)
         for folder, number in outside.most_common(SHOWN):
             print(f"elsewhere\t{folder}\t{number} changed")
         if len(outside) > SHOWN:
             print(f"  and {len(outside) - SHOWN} more folders")
+        for path in documents[:SHOWN_DOCS]:
+            print(f"document\t{path.relative_to(args.root).as_posix()}")
+        if len(documents) > SHOWN_DOCS:
+            print(f"  and {len(documents) - SHOWN_DOCS} more documents")
         print(f"ELSEWHERE\t{sum(outside.values())}")
         print(f"STALE\t{count}")
         return

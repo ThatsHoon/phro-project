@@ -2,7 +2,7 @@
 
 Keeps a long project on course. It does three jobs:
 
-- Designs and audits the project's plugins: re-reads a plugin's structure from its files, decides where a new capability belongs, measures whether skills really get called, and proposes what to merge, delete or repair.
+- Adds capabilities to the project when told to: finds what already exists, places it in that project, adds the rule that makes later sessions use it, and measures whether it fires. It also audits the project's plugins and proposes what to merge, delete or repair.
 - Holds the project's core documents in `docs/core`: goals and architecture that every session and fork starts from, so local detail does not bury the original goal.
 - Restructures the project's folders on request: maps every file and dependency, moves files, fixes references, adds tests for changed code, and writes the folder rules later sessions follow.
 
@@ -32,7 +32,7 @@ Always-on cost, in every session of every project where the plugin is enabled:
 |---|---|
 | 목표가 바뀌었을 때 | 그렇게 말하면 해당 문서를 같은 단계에서 고칩니다 |
 | 폴더가 지저분할 때 | `/phro-project:restructure` |
-| 이 프로젝트의 플러그인에 기능을 더할 때 | "이 기능 어디에 넣을까" 또는 `/phro-project:design` |
+| 이 프로젝트에 능력을 더할 때 | "이 방식을 스킬로 만들고 앞으로 설계 때마다 호출해", "hwp 읽는 플러그인 찾아서 내장해", 또는 `/phro-project:design` |
 | 스킬이 안 불리는 것 같을 때 | `/phro-project:route-test`, 비용을 먼저 알려 줍니다 |
 | 플러그인이 커졌을 때 | `/phro-project:audit` |
 
@@ -41,6 +41,7 @@ Always-on cost, in every session of every project where the plugin is enabled:
 - 새 세션에서 "이 프로젝트 최종 목표가 뭐야?"라고 물으면 파일을 열지 않고 답합니다.
 - 갱신이 멈추면 세션 시작 때 경고가 나옵니다.
 - 다른 폴더의 세션은 이 문서를 모릅니다.
+- 한 번 시킨 능력은 이 프로젝트의 `.claude/skills`와 색인의 작업 규칙에 남고, 다른 프로젝트에는 나타나지 않습니다.
 
 ## Skeleton
 
@@ -49,7 +50,7 @@ phro-project/
   .claude-plugin/plugin.json   manifest
   hooks/hooks.json             SessionStart: prints the core index
   skills/
-    design/SKILL.md            before adding a capability: where it belongs, trigger prompts first
+    design/SKILL.md            adding a capability: find it, place it, build it, make it fire
     route-test/SKILL.md        whether skills get called on real prompts, and who takes each miss
     audit/SKILL.md             after growth: merge, delete and repair proposals
     compass/SKILL.md           build and refresh docs/core
@@ -94,16 +95,22 @@ compass init -> sessions start from docs/core -> scheduled refresh -> report dri
 restructure -> map -> proposal, your yes -> phased moves -> tests -> folder rules in docs/core
 ```
 
-### 1. Before adding a capability: `design`
+### 1. Adding a capability: `design`
 
-1. Run `summary` and `check` to read the current structure.
-2. Name the recurring problem and how a fix would look. If neither can be named, recommend not building.
-3. Place the capability on the first row that fits:
+Say what the project should be able to do, and from when: "make this method a skill and call it after every design draft", "find a plugin that reads this file type and add it to this project".
+
+1. Run `summary` and `check` to read the current structure. A project root means the skills in its `.claude`.
+2. Name the problem and how a fix would look. If neither can be named, recommend not building.
+3. Look for what exists: installed skills and plugins, the plugin catalog, tools on the machine, packages. A skill only you can invoke cannot be called by the model, and a skill that waits for your answers stops an automatic flow, so its method goes into a project skill instead.
+4. For anything from outside, check the publisher, license, what it runs and whether project files leave the machine. You approve the exact item, and it installs for this project only with `--scope local` or `--scope project`.
+5. Place the capability on the first row that fits:
 
    | Place | When |
    |---|---|
-   | Don't build | The platform, an existing skill or one instruction line covers it |
+   | Don't build | The platform or an installed skill does it and fires when it should |
+   | Install | Someone built it, and it passed step 4 |
    | Extend a part | It is an existing skill's job, reached by its existing trigger |
+   | Standing rule | "When X, do Y", where the model can see X. One line in the core index's work rules, or `.claude/rules` without `docs/core` |
    | Script | The step is deterministic |
    | Skill only you invoke | It needs judgment, and it moves files, spends money or is always typed |
    | Skill | It needs judgment, and a user request can name it |
@@ -111,10 +118,12 @@ restructure -> map -> proposal, your yes -> phased moves -> tests -> folder rule
    | Hook | It must react to an event the model does not act on, and a miss was measured |
    | MCP | It needs a connection or shared state that running a script cannot give |
 
-4. Write down the session token cost of a new skill and the descriptions it would overlap.
-5. Write the trigger prompts before the code: about 8 that should fire and about 8 close misses, in `tests/route_cases.json`.
-6. Write the description last, in the words users really type.
-7. After building, run `route-test` and report which existing cases broke.
+6. A project's skill goes in `<project>/.claude/skills`, never in this plugin, so no other project receives it and an update cannot overwrite it.
+7. Write down the session token cost of a new skill and the descriptions it would overlap.
+8. Write how it fires before the code. From a prompt: about 8 that should fire and about 8 close misses, in `tests/route_cases.json`, which is `.claude/tests/route_cases.json` for a project. From a step in the work: cases with `after` and `rule`.
+9. Write the description last, in the words users really type.
+10. Build it if you asked for that, with its standing rule in the same step.
+11. Run `route-test` once you approve the cost, and report which existing cases broke. Until then it is reported as built and not measured.
 
 ### 2. Measuring calls: `route-test`
 
@@ -122,7 +131,7 @@ restructure -> map -> proposal, your yes -> phased moves -> tests -> folder rule
 2. Collect competitors (`catalog`). Real misses come from the other installed skills.
 3. Build the test on a scratch copy (`build`). The plugin itself is not touched.
 4. State the estimate, get approval, then run `claude plugin eval`. A case costs about $0.15 at 55 skills on Opus.
-5. Tally (`tally`): hits, other skill, unresolved, no skill, false fires. A run that ended abnormally with no skill called, by turn limit, timeout or API error, is unresolved, not a miss.
+5. Tally (`tally`): hits, other skill, unresolved, no skill, wrong order, false fires. A run that ended abnormally with no skill called, by turn limit, timeout or API error, is unresolved, not a miss. A skill meant to fire after a step is graded by `tool_order`, so a call at the wrong moment is not a hit. An eval reads no project configuration, so its standing rule arrives through `append_system_prompt`.
 6. Act on the result:
 
    | Result | Next |
@@ -130,6 +139,7 @@ restructure -> map -> proposal, your yes -> phased moves -> tests -> folder rule
    | Another skill took it | Read both descriptions, fix the overlap or merge |
    | No skill fired | Try the description, then `paths`, then a hook |
    | Unresolved | Rerun, with a higher `--max-turns` if the turn limit ended it |
+   | Wrong order | Sharpen the wording of the standing rule |
    | False fire | Narrow the description |
    | All pass | Stop. Add nothing |
 
@@ -158,9 +168,9 @@ Detection machinery is not stacked in advance. Measure per skill, and move a ski
 
 | File in `docs/core` | Holds |
 |---|---|
-| `README.md` | The index sessions receive: final goal, mid-term goals, one line per area saying when to read it, the names of what was ruled out, folder rules. At most 40 lines |
+| `README.md` | The index sessions receive: final goal, mid-term goals, one line per area saying when to read it, the names of what was ruled out, work rules, folder rules. At most 40 lines |
 | `goals.md` | The final goal in the user's own words, then mid-term and short-term goals, then what was ruled out: what, why, what replaces it, and the condition for looking again |
-| `architecture.md` | The whole system |
+| `architecture.md` | The whole system, then the design principles every part follows |
 | `features/<area>.md` | One per largest functional area |
 | `<name>.md` | A document the user asked for, with its brief in `core.json` |
 | `structure.md`, `structure.json` | Folder rules, written by `restructure` |
@@ -168,7 +178,7 @@ Detection machinery is not stacked in advance. Measure per skill, and move a ski
 
 1. Init: list what already owns each kind of fact in memory, READMEs, registries and ledgers, propose at most 8 areas, wait for a yes. The final goal comes only from the user's words. Documents link to an existing owner instead of copying it, and hold what cannot be found by looking.
 2. Every session and fork receives the index from the hook, with how long ago the documents were reviewed and how long ago changes were checked. The hook also says that the user outranks the documents, and that on a fact about the code the code wins and the mismatch gets reported. They read the same files, so a fork's work reaches later sessions through them.
-3. Refresh runs once a day as one scheduled session, set up only after you agree. `status` finds documents whose sources changed, and lists by folder what changed outside every source; with neither it stops without further work. It records when it looked, and `stamp` uses that time, so a file saved during a refresh stays stale for the next one. The hook warns when nothing has looked for longer than `refresh_days` plus one day, not merely when a quiet project had nothing to change.
+3. Refresh runs once a day as one scheduled session, set up only after you agree. `status` finds documents whose sources changed, and lists what changed outside every source: a count per folder, and the documents by name. With neither it stops without further work. It opens up to 10 of those documents, moves what must survive into the core documents, and may add a new area document on its own, up to 8 areas, saying so in its report. It records when it looked, and `stamp` uses that time, so a file saved during a refresh stays stale for the next one. The hook warns when nothing has looked for longer than `refresh_days` plus one day, not merely when a quiet project had nothing to change.
 4. A refresh changes only what is no longer true. It cannot edit the final goal: `lint` flags that as `goal-changed`, and only `stamp --accept-goal` after you say so clears it.
 5. `lint` must pass before `stamp`. It flags AI marks and tells, change history, dates, overlong documents, dead paths, unlisted documents, source patterns that match no file and hidden text in the index. A `>` quote is the user's own words, so it is never flagged for wording.
 6. A refresh ends with `stamp --drift "<line>"`: work that serves no listed goal, and goals with no recent work, in at most 200 characters. The folder list from `status` is what it judges this from. Every session receives this line after the index, about 50 tokens.
@@ -201,6 +211,8 @@ The code is installed once for the user. What it reads and writes about a projec
 | Restructure undo data | `<root>/.phro-project/restructure`, ignored by git through its own `.gitignore` |
 | Refused audit proposals | `<plugin>/.phro-project/rejected.md` |
 | Daily refresh | one scheduled task per project, naming its root |
+| Skills built on request | `<root>/.claude/skills`, with cases in `<root>/.claude/tests` |
+| Standing rules | the work rules in `<root>/docs/core/README.md`, or `<root>/.claude/rules` |
 
 - The hook reads `docs/core` in the session's own project folder, which is the folder you opened, and never walks up. A project without `README.md` and `core.json` there gets nothing, even inside another project.
 - `restructure` rewrites the text under `--also`, so it refuses the whole scheduled tasks folder, the projects folder and another project's folder.
@@ -211,7 +223,7 @@ The code is installed once for the user. What it reads and writes about a projec
 
 ## `project.py` commands
 
-Run as `python -I -X utf8 scripts/project.py <command>`.
+Run as `python -I -X utf8 scripts/project.py <command>`. `<plugin>` is a plugin folder, or a project root, which means the skills in its `.claude`.
 
 | Command | Does |
 |---|---|
@@ -221,8 +233,8 @@ Run as `python -I -X utf8 scripts/project.py <command>`.
 | `sql <plugin> "<select>"` | Read-only query on `node` and `edge` |
 | `mine <transcripts_dir> <cases.json> [--alias a=b] [--only a,b]` | Labeled prompts from typed commands |
 | `catalog <out.json> <skills_dir>... [--only a,b]` | Competitor skill descriptions |
-| `build <plugin> <cases.json> <out_dir> [--stub] [--also out.json] [--history f.jsonl] [--max-turns N]` | A scratch copy with eval cases |
-| `tally <result.json>...` | Hits, misses by cause, false fires |
+| `build <plugin> <cases.json> <out_dir> [--stub] [--also out.json] [--history f.jsonl] [--max-turns N]` | A scratch copy with eval cases. A case may add `after` and `rule` for a skill that fires from a step |
+| `tally <result.json>...` | Hits, misses by cause, wrong order, false fires |
 
 Findings from `check` are candidates, not verdicts:
 
@@ -244,7 +256,7 @@ Run as `python -I -X utf8 scripts/compass.py <command>`.
 | Command | Does |
 |---|---|
 | `hook` | Reads the event from standard input and prints the index. Called by `hooks/hooks.json` |
-| `status <root>` | Per document: stale or current, sources changed, age. Lists up to 100 new paths per document, each path once, and says how many it left out. Then folders with changes outside every source since the oldest review, `ELSEWHERE n` and `STALE n`. Records when it looked |
+| `status <root>` | Per document: stale or current, sources changed, age. Lists up to 100 new paths per document, each path once, and says how many it left out. Then folders with changes outside every source since the oldest review, up to 30 changed documents among them by name, `ELSEWHERE n` and `STALE n`. Records when it looked |
 | `lint <root>` | One finding per line, then `OK` or `FINDINGS n` |
 | `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint and the drift line |
 | `usage <root>` | Reads of each document in this project's transcripts, leaving out sessions that ran `stamp`. Counts only |
@@ -290,6 +302,19 @@ Always pass `--no-publish`. The cost ceiling is checked only before each run sta
 
 Author-written prompts inflated the rate, so they are not trusted. The description edit used prompts whose failures had been seen and only one held-out case, so it may be overfit. Stub bodies mean nothing here measures compliance after loading.
 
+The core index on a made-up project, 2026-11-05, Opus 5.5, with the hook and without it. Both had the documents on disk. 32 runs, new sessions only:
+
+| Test | With | Without |
+|---|---|---|
+| Flags work the project ruled out, including on 290 files | 6/6 | 6/6 |
+| Goal, priority, code over document, area document, no false alarm | 5/5 | 5/5 |
+| Open question that does not look like it needs the repository | 4/4 | 0/4 |
+| Repeats a wrong value from the index without opening the code | 5/16 | 0/16 |
+| Turns on the same tasks | 49 | 85 |
+| Cost on the same tasks | $1.01 | $1.10 |
+
+Flagging ruled-out work came from `goals.md`, which both sides read, not from the hook. The hook saved turns and changed one open question. The project and the rubrics were written by the author, and long mid-task sessions were not measured, so this does not settle whether sessions keep the goal.
+
 `restructure.py` on scratch copies of two real projects, 2026-11-05:
 
 | Project | Move | Rewritten | Tests before | After the script alone | After fixing flagged lines | Undo |
@@ -331,7 +356,7 @@ Then type `/reload-plugins` in a running session.
 
 ## Not done yet
 
-- Use of the design, route-test and audit skills in real plugin work.
+- Use of the design, route-test and audit skills in real work. A capability built on request and a step-triggered skill have only passed scripted checks, not a run with a model.
 - A scheduled `compass` refresh, and a session in a second project. One project has its documents, and the hook has fired there.
 - `restructure` start to finish with a person choosing the structure. Only its script has met real projects, on scratch copies.
 - Routing test of this plugin's own skills with `tests/route_cases.json`, 36 cases, about $5. The cases are written by the author, which inflates the rate, so it waits for prompts really typed.

@@ -1,5 +1,7 @@
 """Read a plugin's current structure and measure whether its skills get called. Standard library only.
 
+<plugin> is a plugin folder, or a project root, which means the skills in its .claude.
+
 Structure, rebuilt from the plugin's files on every call (the files are the source, the database is a throwaway copy):
   project.py summary <plugin> [--usage DIR]     nodes, and per skill its token cost, tests and use
   project.py check   <plugin> [--usage DIR]     deterministic findings, one per line
@@ -35,10 +37,26 @@ STOP = set("the and for with use when this that from not you your any are can in
 PROMPT_MIN, PROMPT_MAX = 10, 200  # shorter is a mode word, longer is usually pasted material
 TOOLS = "[Read, Glob, Grep, WebSearch, Skill]"
 ROUTE_CASES = "tests/route_cases.json"  # routing cases that live in the plugin count as evals, one node for the file
+PROJECT_PARTS = ("skills", "agents", "commands", "tests")  # a project's .claude also holds settings and worktrees, which are not capabilities
+STEP_TOOLS = "[Read, Glob, Grep, WebSearch, Write, Edit, Skill]"
+STEP_TURNS = 10  # a step-triggered case has to do the step first
+SKILL_CALL = '"skill"\\s*:\\s*"(?:[\\w-]+:)?{}"'
 
 
 def tokens(text):
     return len(text.encode("utf-8")) // 4  # ponytail: rough byte estimate; `claude plugin details` has the real listing cost
+
+
+def plugin_root(path):
+    """A plugin folder as given. A project root means its .claude: its skills live there, and the root can hold 200k files."""
+    path = Path(path).resolve()
+    if not (path / ".claude-plugin").exists() and not (path / "skills").is_dir() and (path / ".claude/skills").is_dir():
+        return path / ".claude"
+    return path
+
+
+def parts_of(root):
+    return [root / part for part in PROJECT_PARTS if (root / part).exists()] if root.name == ".claude" else [root]
 
 
 def frontmatter(text):
@@ -93,7 +111,7 @@ def scan(root):
         create table node(id text primary key, kind text, path text, description text, desc_tokens int, body_tokens int);
         create table edge(src text, dst text, how text, primary key(src, dst, how));""")
     texts, sources, kinds = collections.defaultdict(str), collections.defaultdict(list), {}
-    for path in sorted(root.rglob("*")):
+    for path in sorted(found for part in parts_of(root) for found in part.rglob("*")):
         rel = path.relative_to(root).as_posix()
         if not path.is_file() or SKIP & set(rel.split("/")):
             continue
@@ -367,9 +385,13 @@ def cmd_catalog(a):
 
 
 def grader(name_pattern=None, none=False):
-    match = f"input_match: '\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?{name_pattern}\"'\n" if name_pattern else ""
+    match = f"input_match: '{SKILL_CALL.format(name_pattern)}'\n" if name_pattern else ""
     limit = "min: 0\nmax: 0\n" if none else ""
     return f"---\ntype: tool_used\ntool: Skill\n{match}{limit}---\n\nGraded from the transcript.\n"
+
+
+def order_grader(step, name):
+    return f"---\ntype: tool_order\nbefore: {step}\nafter: {{ tool: Skill, input_match: '{SKILL_CALL.format(name)}' }}\n---\n\nGraded from the transcript.\n"
 
 
 def cmd_build(a):
@@ -377,7 +399,13 @@ def cmd_build(a):
     if out == src or src in out.parents:
         sys.exit("out_dir must be outside the plugin")
     shutil.rmtree(out, ignore_errors=True)
-    shutil.copytree(src, out, ignore=shutil.ignore_patterns(*SKIP, "evals", "tests"))
+    ignore = shutil.ignore_patterns(*SKIP, "evals", "tests")
+    if src.name == ".claude":
+        for part in parts_of(src):
+            if part.name != "tests":
+                shutil.copytree(part, out / part.name, ignore=ignore)
+    else:
+        shutil.copytree(src, out, ignore=ignore)
     skills = {}
     for path in out.glob("skills/*/SKILL.md"):
         skills[frontmatter(path.read_text(encoding="utf-8"))[0].get("name", path.parent.name)] = path
@@ -395,22 +423,28 @@ def cmd_build(a):
     for case in cases:
         d = out / "evals" / case["id"]
         (d / "graders").mkdir(parents=True)
-        (d / "prompt.md").write_text(f"---\nmax_turns: {a.max_turns}\ntimeout_seconds: 180\nallowed_tools: {TOOLS}\n---\n\n{case['prompt']}\n", encoding="utf-8")
+        step = case.get("after")  # a skill meant to fire after this tool, not on the prompt itself
+        rule = f"append_system_prompt: {json.dumps(case['rule'], ensure_ascii=False)}\n" if case.get("rule") else ""  # stands in for the core index: an eval reads no project configuration
+        head = f"max_turns: {max(a.max_turns, STEP_TURNS)}\ntimeout_seconds: 240\nallowed_tools: {STEP_TOOLS}\n" if step else f"max_turns: {a.max_turns}\ntimeout_seconds: 180\nallowed_tools: {TOOLS}\n"
+        (d / "prompt.md").write_text(f"---\n{head}{rule}---\n\n{case['prompt']}\n", encoding="utf-8")
         target = case.get("skill")
         (d / "graders/target.md").write_text(grader(target) if target else grader(none=True), encoding="utf-8")
+        if step:
+            (d / "graders/order.md").write_text(order_grader(step, target), encoding="utf-8")
         for name in skills:  # free graders, so a miss shows which skill took it
             (d / f"graders/to-{name}.md").write_text(grader(name), encoding="utf-8")
         if a.history:
             shutil.copy(a.history, d / "history.jsonl")
             (d / "case.yaml").write_text(f"schema_version: \"1.1\"\nname: {case['id']}\ncontext:\n  history_file: history.jsonl\n", encoding="utf-8")
     print(f"built\t{out}\tskills\t{len(skills)}\tcases\t{len(cases)}")
-    print(f'next\tclaude plugin eval "{out}" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --json <result.json>')
+    grant = " --allow-tools Write Edit" if any(case.get("after") for case in cases) else ""
+    print(f'next\tclaude plugin eval "{out}" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --json <result.json>{grant}')
 
 
 def cmd_tally(a):
     for file in a.results:
         data = json.loads(Path(file).read_text(encoding="utf-8"))
-        per = collections.defaultdict(lambda: [0, 0, 0, 0])
+        per = collections.defaultdict(lambda: [0, 0, 0, 0, 0])
         false_fires, misses, runs, negatives = [], [], 0, 0
         for case in data["cases"]:
             for run in case["arms"]["with"]:
@@ -431,8 +465,11 @@ def cmd_tally(a):
                     continue
                 row = per[expected]
                 row[0] += 1
-                if graders.get("target"):
+                if graders.get("target") and graders.get("order", True):
                     row[1] += 1
+                elif graders.get("target"):
+                    row[4] += 1
+                    misses.append(f"{case['name']} {expected} -> called, but not after the step")
                 elif took:
                     row[2] += 1
                     misses.append(f"{case['name']} {expected} -> {','.join(took)}")
@@ -444,9 +481,9 @@ def cmd_tally(a):
         total, hit = sum(r[0] for r in per.values()), sum(r[1] for r in per.values())
         print(f"file\t{file}\truns\t{runs}\tcost\t{data.get('costUsd', 0):.2f}\tpartial\t{data.get('partial')}")
         print(f"target\t{hit}/{total}\tfalse_fires\t{len(false_fires)}/{negatives}")
-        print("skill\tcases\thit\tother_skill\tunresolved\tno_skill")
-        for skill, (n, h, other, open_) in sorted(per.items()):
-            print(f"{skill}\t{n}\t{h}\t{other}\t{open_}\t{n - h - other - open_}")
+        print("skill\tcases\thit\tother_skill\tunresolved\tno_skill\twrong_order")
+        for skill, (n, h, other, open_, late) in sorted(per.items()):
+            print(f"{skill}\t{n}\t{h}\t{other}\t{open_}\t{n - h - other - open_ - late}\t{late}")
         for line in misses:
             print(f"miss\t{line}")
         for line in false_fires:
@@ -459,15 +496,15 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in (("summary", cmd_summary), ("check", cmd_check)):
         p = sub.add_parser(name)
-        p.add_argument("plugin")
+        p.add_argument("plugin", type=plugin_root)
         p.add_argument("--usage")
         p.set_defaults(fn=fn)
     p = sub.add_parser("impact")
-    p.add_argument("plugin")
+    p.add_argument("plugin", type=plugin_root)
     p.add_argument("node")
     p.set_defaults(fn=cmd_impact)
     p = sub.add_parser("sql")
-    p.add_argument("plugin")
+    p.add_argument("plugin", type=plugin_root)
     p.add_argument("query")
     p.set_defaults(fn=cmd_sql)
     p = sub.add_parser("mine")
@@ -482,7 +519,7 @@ def main():
     p.add_argument("--only")
     p.set_defaults(fn=cmd_catalog)
     p = sub.add_parser("build")
-    p.add_argument("plugin")
+    p.add_argument("plugin", type=plugin_root)
     p.add_argument("cases")
     p.add_argument("out")
     p.add_argument("--history")

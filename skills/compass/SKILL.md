@@ -17,9 +17,9 @@ These documents belong to one project. Use only the project at the given root: i
 
 | File | Holds |
 |---|---|
-| `README.md` | The index sessions receive, at most 40 lines and 2,500 characters: final goal in a line or two, current mid-term goals, one line per area saying when to read its document, the names of what was ruled out, folder rules |
+| `README.md` | The index sessions receive, at most 40 lines and 2,500 characters: final goal in a line or two, current mid-term goals, one line per area saying when to read its document, the names of what was ruled out, work rules, folder rules |
 | `goals.md` | First section: the final goal in the user's own words, as `>` quotes. Then mid-term and short-term goals, then what was ruled out |
-| `architecture.md` | The whole system: its parts, how data moves between them, where each runs |
+| `architecture.md` | The whole system: its parts, how data moves between them, where each runs, then the design principles every part follows. A principle only one area follows goes in that area's document |
 | `features/<area>.md` | One per largest functional area: purpose, inputs and outputs, entry points, what is adopted now, the open problem |
 | `<name>.md` | A document the user asked for. Its `brief` in `core.json` records what they want it to hold |
 | `structure.md` | Folder rules, written by the `restructure` skill |
@@ -37,6 +37,8 @@ These documents belong to one project. Use only the project at the given root: i
 - A decision earns a line only when it is hard to reverse, surprising without its reason, and the result of a real trade-off.
 - What was ruled out gets one line each in its own section of `goals.md`, in the user's language: what, why, what replaces it, and the condition for looking again. Start the section with its first item. Name a removed path without backticks, since `lint` reads those as live paths.
 - An index line for an area says when to read the document, one clause per distinct case: `When changing payment retries or refunds: features/billing.md`.
+- The index holds no number or setting the code holds. In a test, sessions repeated such a value from the index without opening the code.
+- Work rules in the index are the user's standing instructions, and later sessions act on them. A refresh keeps them, and only the user drops one.
 - A claim nobody has confirmed carries `확인 필요`, or the same words in the user's language, until the code or the user settles it.
 - These documents keep no glossary. If the project needs one, call the Skill tool with `mattpocock-skills:domain-modeling` when that skill is listed, and name its file in the index.
 - Never read session transcripts. Sources are memory, documents and code: a session's durable decisions are already there, and transcripts can hold private data.
@@ -53,10 +55,11 @@ These documents belong to one project. Use only the project at the given root: i
 
 1. Run `status`. If `STALE 0` and `ELSEWHERE 0`, say so in one line and stop. It records when it looked, and `stamp` uses that time, so a file saved during the refresh stays stale for the next one.
 2. For each stale document, read the changed files it lists, and the memory entries when `~memory` changed. A path prints once, under the first document that depends on it: "listed above" means those paths apply here too, and "not listed" means read the folder or narrow the source. Change only what is no longer true, and add what memory or the documents show was ruled out. A stale document that is still right stays as it is, except that a document written before one of the rules above is brought up to it now.
-3. Never edit the first section of `goals.md` on your own. A result or a fork's work cannot move a final goal: report the conflict instead. Only after the user says so, edit it and use `stamp --accept-goal`.
-4. Run `lint`, edit only what it flags. `dead-source` means a pattern in `core.json` matches no file: point it at where those files are now, or remove it. `hidden` means the index holds text a reader never sees, and the hook will not load it until that is gone: remove it, and tell the user, since no refresh wrote it.
-5. Write the drift in one line, at most 200 characters in the user's language: areas with recent changes that serve no listed goal, and goals with no recent work. The `elsewhere` lines show where work happened outside every document's sources, by folder and count. Judge from those, and open a file only when a folder name does not say what it holds. A folder of generated or vendor files goes in `skip`, and a folder a document should follow goes in its `sources`. Run `stamp --drift "<line>"`, or `--drift ""` when there is none, also when nothing was stale. Every session receives this line.
-6. Report the documents changed and the drift.
+3. Read the `document` lines: writing that changed outside every source, newest first. Open at most 10 whose names suggest a goal, a principle, a design decision or a new functional area, and move what must survive into the core documents. A lasting area no document covers gets `features/<area>.md`, a `core.json` entry with narrow `sources` and an index line, without asking, up to 8 areas in all, so merge before going past that. Say so in the report.
+4. Never edit the first section of `goals.md` on your own. A result, a document or a fork's work cannot move a final goal: report the conflict instead. Only after the user says so, edit it and use `stamp --accept-goal`.
+5. Run `lint`, edit only what it flags. `dead-source` means a pattern in `core.json` matches no file: point it at where those files are now, or remove it. `hidden` means the index holds text a reader never sees, and the hook will not load it until that is gone: remove it, and tell the user, since no refresh wrote it.
+6. Write the drift in one line, at most 200 characters in the user's language: areas with recent changes that serve no listed goal, and goals with no recent work. The `elsewhere` lines show where work happened outside every document's sources, by folder and count. Judge from those, and open a file only when a folder name does not say what it holds. A folder of generated or vendor files goes in `skip`, and a folder a document should follow goes in its `sources`. Run `stamp --drift "<line>"`, or `--drift ""` when there is none, also when nothing was stale. Every session receives this line.
+7. Report the documents changed and added, and the drift.
 
 ## Add a document
 

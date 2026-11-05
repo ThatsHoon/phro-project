@@ -232,9 +232,9 @@ def demo():
     with tempfile.TemporaryDirectory() as d:
         clean(d)
         write(d, "other/x.py", "\n")
-        assert not compass.elsewhere(d, compass.load(d)), "before any review there is no window to count in"
+        assert compass.elsewhere(d, compass.load(d)) == ({}, []), "before any review there is no window to count in"
         assert compass.stamp(d, []) == []
-        assert not compass.elsewhere(d, compass.load(d)), "nothing changed since the review"
+        assert compass.elsewhere(d, compass.load(d)) == ({}, []), "nothing changed since the review"
         manifest = compass.load(d)
         manifest["skip"] = ["runs"]
         compass.save(d, manifest)
@@ -243,7 +243,7 @@ def demo():
         for rel in ("demo/twin/a.js", "demo/twin/deep/b.js", "demo/c.js", "top.txt", "src/app.py", "runs/big.bin", "docs/core/extra.txt", "venv2/x.py"):
             write(d, rel, "x\n")
             os.utime(Path(d) / rel, (future, future))
-        assert dict(compass.elsewhere(d, compass.load(d))) == {"demo/twin": 2, "demo": 1, ".": 1}, "folders only, without sources, skipped folders, docs/core or a venv"
+        assert dict(compass.elsewhere(d, compass.load(d))[0]) == {"demo/twin": 2, "demo": 1, ".": 1}, "folders only, without sources, skipped folders, docs/core or a venv"
         for _ in range(2):  # running status by hand must not use up what the next refresh sees
             said = status(d)
             assert "elsewhere\tdemo/twin\t2 changed" in said and "ELSEWHERE\t4\n" in said and said.endswith("STALE\t1\n"), said
@@ -252,11 +252,26 @@ def demo():
         said = status(d)
         assert "and 3 more folders" in said and f"ELSEWHERE\t{compass.SHOWN + 4}\n" in said, said[-200:]
         assert compass.stamp(d, []) == []
-        assert not [k for k in compass.elsewhere(d, compass.load(d)) if k.startswith("many")], "a refresh moves the window past what it saw"
+        assert not [k for k in compass.elsewhere(d, compass.load(d))[0] if k.startswith("many")], "a refresh moves the window past what it saw"
         manifest = compass.load(d)
         manifest["reviewed"]["goals.md"] = time.time() - 60
         manifest["reviewed"]["features/app.md"] = time.time() + 600
-        assert "many/f0" in compass.elsewhere(d, manifest), "stamping one document must not hide what the others have not seen"
+        assert "many/f0" in compass.elsewhere(d, manifest)[0], "stamping one document must not hide what the others have not seen"
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        compass.stamp(d, [])
+        future = time.time() + 60
+        for number, rel in enumerate(("notes/plan.md", "guide/intro.rst", "notes/run.py", "notes/data.txt", "docs/core/inside.md")):
+            write(d, rel, "x\n")
+            os.utime(Path(d) / rel, (future + number, future + number))
+        documents = compass.elsewhere(d, compass.load(d))[1]
+        assert [p.relative_to(Path(d)).as_posix() for p in documents] == ["guide/intro.rst", "notes/plan.md"], "newest first, documents only, never docs/core"
+        said = status(d)
+        assert "document\tnotes/plan.md" in said and "document\tnotes/run.py" not in said, said
+        for number in range(compass.SHOWN_DOCS):
+            write(d, f"notes/n{number}.md", "x\n")
+        assert "and 2 more documents" in status(d), "a long list is cut, and says so"
 
     with tempfile.TemporaryDirectory() as d:
         clean(d)

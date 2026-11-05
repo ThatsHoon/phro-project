@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Output: a short ranked proposal list. "No change" is a normal result. Do not edit the plugin during an audit.
 
-Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. It rebuilds the graph from the files on every call, so never rely on an earlier reading.
+Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. It rebuilds the graph from the files on every call, so never rely on an earlier reading. `<plugin>` is a plugin folder, or a project root, which means the skills in its `.claude`.
 
 1. Run `summary <plugin> --usage <transcripts_dir>` and `check <plugin> --usage <transcripts_dir>`. Omit `--usage` if there are no transcripts.
 2. Read `<plugin>/.phro-project/rejected.md` if it exists. Do not raise a rejected proposal again unless its reason no longer holds.

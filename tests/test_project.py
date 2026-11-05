@@ -129,6 +129,53 @@ def demo():
         assert [f[1] for f in project.findings(root, seen)] == ["skill:beta"], "with transcripts, an unused skill still shows"
 
     with tempfile.TemporaryDirectory() as d:
+        proj = Path(d) / "proj"
+        write(proj, "src/app.py", "print(1)\n")
+        write(proj, ".claude/skills/alpha/SKILL.md", skill("alpha", "Rotates database credentials on a schedule.", "Do it."))
+        write(proj, ".claude/settings.local.json", '{"env": {"NAME": "value"}}')
+        write(proj, ".claude/worktrees/w/skills/ghost/SKILL.md", skill("ghost", "A copy in a worktree.", "Do it."))
+        write(proj, ".claude/tests/route_cases.json", json.dumps([{"id": "c1", "skill": "alpha", "prompt": "rotate"}]))
+        assert project.plugin_root(proj) == proj.resolve() / ".claude", "a project's capabilities live in its .claude"
+        assert project.plugin_root(proj / ".claude") == proj.resolve() / ".claude"
+
+        def cli(*args):
+            return subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), *args], capture_output=True, text=True, encoding="utf-8").stdout
+        said = cli("summary", str(proj))
+        assert "skill:alpha" in said and "ghost" not in said, said
+        assert cli("check", str(proj)).strip() == "FINDINGS\t0", "a routing case in the project's .claude counts as tested"
+
+        cases = Path(d) / "cases.json"
+        cases.write_text(json.dumps([
+            {"id": "o1", "skill": "alpha", "prompt": "write the draft", "after": "Write", "rule": "After a draft, call alpha."},
+            {"id": "c1", "skill": "alpha", "prompt": "rotate"},
+        ]), encoding="utf-8")
+        built = Path(d) / "built"
+        said = cli("build", str(proj), str(cases), str(built), "--stub")
+        assert (built / "skills/alpha/SKILL.md").exists() and not (built / "settings.local.json").exists() and not (built / "worktrees").exists(), said
+        assert "--allow-tools Write Edit" in said, "a step needs its tool granted"
+        order = (built / "evals/o1/graders/order.md").read_text(encoding="utf-8")
+        assert "type: tool_order" in order and "before: Write" in order and "tool: Skill" in order and "alpha" in order, order
+        first = (built / "evals/o1/prompt.md").read_text(encoding="utf-8")
+        assert "max_turns: 10" in first and "Write" in first and 'append_system_prompt: "After a draft, call alpha."' in first, first
+        plain = (built / "evals/c1/prompt.md").read_text(encoding="utf-8")
+        assert "max_turns: 4" in plain and "Write" not in plain and "append_system_prompt" not in plain, plain
+        assert not (built / "evals/c1/graders/order.md").exists()
+
+    with tempfile.TemporaryDirectory() as d:
+        extra = skill("gamma", "Compresses satellite imagery tiles for archive storage.", "Do it.")
+        manifest_only = Path(d) / "manifest-only"
+        write(manifest_only, ".claude-plugin/plugin.json", json.dumps({"name": "demo", "version": "0.1.0"}))
+        write(manifest_only, ".claude/skills/gamma/SKILL.md", extra)
+        assert project.plugin_root(manifest_only) == manifest_only.resolve(), "a plugin folder stays as given, whatever else it holds"
+        skills_folder = Path(d) / "skills-folder"
+        write(skills_folder, "skills/alpha/SKILL.md", extra)
+        write(skills_folder, ".claude/skills/gamma/SKILL.md", extra)
+        assert project.plugin_root(skills_folder) == skills_folder.resolve(), "so does a folder of skills without a manifest"
+        plain = Path(d) / "plain"
+        plain.mkdir()
+        assert project.plugin_root(plain) == plain.resolve(), "and a folder with no skills anywhere"
+
+    with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "demo"
         clean(root)
         db = project.scan(root)[0]
@@ -167,6 +214,16 @@ def demo():
         assert "target\t2/6\tfalse_fires\t1/2" in out and "alpha\t6\t2\t1\t2\t1" in out and "c4 alpha -> none" in out, out
         assert "c3 alpha -> unresolved, " + cut in out and "c5 alpha -> unresolved, " + api in out, "an abnormal end is not a miss, whatever ended it"
         assert "n1 no skill expected -> unresolved, " + api in out and "false_fire\tn3 -> alpha" in out, "a negative that never ran proves nothing"
+
+        def ordered(name, in_order):
+            case = result(name, True, "alpha")
+            case["arms"]["with"][0]["graders"].append({"name": "order", "passed": in_order})
+            return case
+        doc = {"costUsd": 1, "partial": False, "cases": [ordered("o1", True), ordered("o2", False), result("c1", True, "alpha")]}
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        out = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "tally", str(path)], capture_output=True, text=True, encoding="utf-8").stdout
+        assert "target\t2/3" in out and "alpha\t3\t2\t0\t0\t0\t1" in out and "wrong_order" in out, out
+        assert "o2 alpha -> called, but not after the step" in out, "a call at the wrong moment is not a hit"
     print("ok")
 
 
