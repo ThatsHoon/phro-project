@@ -1,0 +1,22 @@
+[
+ {"id": "a01", "skill": "audit", "prompt": "이 플러그인 만든 지 좀 됐는데 안 쓰는 거나 겹치는 거 정리할 게 있는지 봐줘"},
+ {"id": "a02", "skill": "audit", "prompt": "우리 플러그인에서 scripts/parse.py 지우면 뭐가 깨지는지 알려줘"},
+ {"id": "a03", "skill": "audit", "prompt": "플러그인 스킬이 20개까지 늘었어. 통폐합할 수 있는 거 있으면 제안해"},
+ {"id": "a04", "skill": "audit", "prompt": "check what can be merged or removed in this plugin, it has grown a lot"},
+ {"id": "r01", "skill": "route-test", "prompt": "내가 만든 플러그인 스킬이 자동으로 호출이 잘 안 되는 것 같은데 실제로 몇 번 호출되는지 재봐줘"},
+ {"id": "r02", "skill": "route-test", "prompt": "스킬 설명문 고쳤는데 고치기 전이랑 호출률 비교하고 싶어"},
+ {"id": "r03", "skill": "route-test", "prompt": "이 프롬프트들이 어느 스킬로 새는지 혼동표 뽑아줘"},
+ {"id": "r04", "skill": "route-test", "prompt": "does my plugin's deploy skill actually fire on real prompts? measure it"},
+ {"id": "d01", "skill": "design", "prompt": "프로젝트 플러그인에 로그 요약 기능을 넣으려는데 스킬로 할지 스크립트로 할지 훅으로 할지 정해줘"},
+ {"id": "d02", "skill": "design", "prompt": "플러그인에 새 기능 추가하기 전에 어디에 두는 게 맞는지 구조부터 봐줘"},
+ {"id": "d03", "skill": "design", "prompt": "우리 플러그인에 MCP 서버 하나 붙일까 하는데 그냥 기존 스킬을 확장하는 게 나을까"},
+ {"id": "d04", "skill": "design", "prompt": "before I add a new capability to this plugin, where should it live?"},
+ {"id": "n01", "skill": null, "prompt": "이 파이썬 함수 왜 None을 돌려주는지 봐줘"},
+ {"id": "n02", "skill": null, "prompt": "오늘 회의 내용 세 줄로 요약해줘"},
+ {"id": "n03", "skill": null, "prompt": "플러그인이라는 단어가 원래 어디서 온 말이야?"},
+ {"id": "n04", "skill": null, "prompt": "크롬 플러그인 추천해줘"},
+ {"id": "n05", "skill": null, "prompt": "이 회사 조직 구조 효율화 방안 알려줘"},
+ {"id": "n06", "skill": null, "prompt": "API 응답 시간을 측정하는 코드 한 줄만 알려줘"},
+ {"id": "n07", "skill": null, "prompt": "git 브랜치 정리하는 명령어가 뭐였지"},
+ {"id": "n08", "skill": null, "prompt": "시험 점수 평균 계산해줘: 80, 90, 70"}
+]
