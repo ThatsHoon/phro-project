@@ -84,6 +84,20 @@ def demo():
         write(root, "skills/gamma/SKILL.md", skill("gamma", "Compresses satellite imagery tiles for archive storage.", "Do it."))
     assert kinds(run(untested)[0]) == {"no-eval"}
 
+    def in_route_cases(root):
+        untested(root)
+        write(root, "tests/route_cases.json", json.dumps([{"id": "c1", "skill": "gamma", "prompt": "compress"}]))
+    assert not run(in_route_cases)[0], "a skill with routing cases is tested"
+
+    def only_a_negative(root):
+        untested(root)
+        write(root, "tests/route_cases.json", json.dumps([{"id": "n1", "skill": None, "prompt": "do not fire gamma"}]))
+    assert kinds(run(only_a_negative)[0]) == {"no-eval"}, "a negative case that names a skill does not test it"
+
+    def user_only(root):
+        write(root, "skills/gamma/SKILL.md", "---\nname: gamma\ndescription: Compresses satellite imagery tiles for archive storage.\ndisable-model-invocation: true\n---\n\nDo it.\n")
+    assert not run(user_only)[0], "routing cannot select a skill only the user invokes"
+
     def overlap(root):
         write(root, "skills/gamma/SKILL.md", skill("gamma", "Renders invoice PDFs from monthly billing exports for accounting.", "Do it."))
         write(root, "evals/gamma-case/prompt.md", "x\n")

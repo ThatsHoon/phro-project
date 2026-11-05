@@ -9,7 +9,7 @@ Output: short documents in `docs/core`, then at most 5 lines to the user. Long w
 
 Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/compass.py <command> <project root>`.
 
-A plugin hook prints `docs/core/README.md` at every session start and after every compaction, in every session and fork of the project. It is silent in a project without that file.
+A plugin hook prints `docs/core/README.md` at every session start and after every compaction, in every session and fork of the project. It is silent in a project without that file and `core.json`.
 
 These documents belong to one project. Use only the project at the given root: its files, its own memory folder and its own sessions. If this session has been working in another folder, stop and ask the user to open a session in the target project, so this conversation's context stays out of the documents. A scheduled run starts clean, so it goes ahead.
 
@@ -45,15 +45,20 @@ These documents belong to one project. Use only the project at the given root: i
 
 ## Refresh, the default
 
-1. Run `status`. If `STALE 0`, say so in one line and stop.
-2. For each stale document, read the changed files it lists, and the memory entries when `~memory` changed. Change only what is no longer true. A stale document that is still right stays as it is.
+1. Run `status`. If `STALE 0`, say so in one line and stop. It records when it looked, and `stamp` uses that time, so a file saved during the refresh stays stale for the next one.
+2. For each stale document, read the changed files it lists, and the memory entries when `~memory` changed. A path prints once, under the first document that depends on it: "listed above" means those paths apply here too, and "not listed" means read the folder or narrow the source. Change only what is no longer true. A stale document that is still right stays as it is.
 3. Never edit the first section of `goals.md` on your own. A result or a fork's work cannot move a final goal: report the conflict instead. Only after the user says so, edit it and use `stamp --accept-goal`.
-4. Run `lint`, edit only what it flags, then `stamp`.
-5. Report the documents changed and the drift: areas with recent changes that serve no listed goal, and goals with no recent work.
+4. Run `lint`, edit only what it flags. `dead-source` means a pattern in `core.json` matches no file: point it at where those files are now, or remove it.
+5. Write the drift in one line, at most 200 characters in the user's language: areas with recent changes that serve no listed goal, and goals with no recent work. Run `stamp --drift "<line>"`, or `--drift ""` when there is none. Every session receives this line.
+6. Report the documents changed and the drift.
 
 ## Add a document
 
 Add an entry with `file`, `brief` and `sources` to `core.json`, write the document, name it in `README.md`, then `lint` and `stamp <file>`.
+
+## Whether sessions read them
+
+`usage <root>` counts reads of each document in this project's own transcripts, leaving out sessions that ran `stamp`. It prints counts, never text. The index arrives through the hook, so a low count on `README.md` means nothing.
 
 ## In a fork
 

@@ -1,6 +1,7 @@
 ---
 name: audit
 description: Reads a plugin's current structure and proposes merges, deletions and repairs, without editing it. 플러그인 점검, 통폐합, 정리, 유지보수, 이거 지우면 뭐가 깨지나.
+disable-model-invocation: true
 ---
 
 # audit
@@ -28,6 +29,6 @@ Rules for the list:
 - At most 5 proposals. Mention the rest in one line.
 - If findings are noise or the plugin is fine, say so and stop.
 
-6. Ask which to apply. Apply only those, on a copy or a branch, then run the `route-test` skill on both versions and report what was gained and what broke. Record refused proposals in `<plugin>/.phro-project/rejected.md`, one line each with the reason.
+6. Ask which to apply. Apply only those, on a copy or a branch, then read `${CLAUDE_PLUGIN_ROOT}/skills/route-test/SKILL.md` and follow it on both versions, and report what was gained and what broke. Record refused proposals in `<plugin>/.phro-project/rejected.md`, one line each with the reason.
 
 Report in the user's language.

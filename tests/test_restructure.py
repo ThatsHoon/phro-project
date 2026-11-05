@@ -4,11 +4,13 @@ Run: python -I -X utf8 tests/test_restructure.py
 """
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -225,6 +227,97 @@ def demo():
             else:
                 raise AssertionError(shared)
         restructure.check_also(root, [mine, tasks / "b-refresh", home / "elsewhere"])
+
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outside:
+        folder, outer = Path(d), Path(outside)
+        root = folder / "proj"
+        for rel, text in {"src/a.py": "X = 1\n", "docs/n.md": "n\n"}.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text, encoding="utf-8")
+        note = outer / "note.md"
+        note.write_text("see `src/a.py`\n", encoding="utf-8")
+        moves = folder / "moves.json"
+        moves.write_text(json.dumps({"moves": {"src": "app"}, "also": [str(outer)]}), encoding="utf-8")
+        assert tool(root, "map", str(root)).returncode == 0 and not (root / ".phro-project").exists(), "map writes nothing unless asked"
+        out = tool(root, "map", str(root), "--out", str(folder / "map.json"))
+        assert out.returncode == 0 and (folder / "map.json").exists(), out.stdout + out.stderr
+
+        out = tool(root, "apply", str(root), str(moves))
+        assert out.returncode == 0, out.stdout + out.stderr
+        stamp = out.stdout.split("\n")[0].split("\t")[1]
+        if shutil.which("git"):
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            listed = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"], capture_output=True, text=True, check=True).stdout
+            assert ".phro-project" not in listed, "undo data stays out of git"
+            shutil.rmtree(root / ".git", onerror=lambda f, p, e: (os.chmod(p, 0o700), f(p)))
+        kept = note.read_text(encoding="utf-8") + "a memory written after the move\n"
+        note.write_text(kept, encoding="utf-8")
+        held = tool(root, "undo", str(root), stamp)
+        assert held.returncode == 1 and "note.md" in held.stdout and note.read_text(encoding="utf-8") == kept, "undo must not drop a later edit outside the project"
+        assert tool(root, "undo", str(root), stamp, "--force").returncode == 0
+        assert note.read_text(encoding="utf-8") == "see `src/a.py`\n"
+
+    compass = lambda root, *args: subprocess.run([sys.executable, "-I", "-X", "utf8", str(HERE / "scripts/compass.py"), *args, str(root)], capture_output=True, text=True, encoding="utf-8")
+    with tempfile.TemporaryDirectory() as d:
+        folder = Path(d)
+        root = folder / "proj"
+        files = {
+            "src/app.py": "X = 1\n",
+            "src/deep/job.py": "Y = 1\n",
+            "src/deep/table.json": "{}\n",
+            "src/single.py": "Z = 1\n",
+            "src/readme.txt": "stays\n",
+            "pipeline/run.py": "W = 1\n",
+            "other/o.py": "V = 1\n",
+            "setup.toml": "\n",
+            "docs/core/README.md": "# 핵심\n\n- `goals.md`\n- `features/app.md`\n",
+            "docs/core/goals.md": "# 목표\n\n## 최종 목표\n\n> 결제 API 안정화\n",
+            "docs/core/features/app.md": "# 앱\n\n진입점은 `src/app.py`다.\n",
+        }
+        for rel, text in files.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text, encoding="utf-8")
+        manifest = {"refresh_days": 1, "docs": [{"file": "goals.md", "sources": ["~memory"]}, {"file": "features/app.md", "sources": ["src/*.py", "pipeline/run.py", "pipeline", "other/*.py", "*.toml"]}]}
+        (root / "docs/core/core.json").write_text(json.dumps(manifest), encoding="utf-8")
+        assert compass(root, "stamp").returncode == 0
+        original = fingerprint(root)
+        plan = folder / "moves.json"
+        plan.write_text(json.dumps({"moves": {"src/deep": "lib/deep", "src/single.py": "lib/single.py", "src/app.py": "web/app.py", "pipeline": "training"}}), encoding="utf-8")
+        out = tool(root, "apply", str(root), str(plan))
+        assert out.returncode == 0, out.stdout + out.stderr
+        stamp = out.stdout.split("\n")[0].split("\t")[1]
+        sources = json.loads((root / "docs/core/core.json").read_text(encoding="utf-8"))["docs"]
+        assert sources[0]["sources"] == ["~memory"], sources
+        assert sources[1]["sources"] == ["src/*.py", "lib/deep/*.py", "lib/single.py", "web/app.py", "training/run.py", "training", "other/*.py", "*.toml"], sources
+        lint = compass(root, "lint")
+        assert lint.stdout.splitlines() == ["dead-source\tfeatures/app.md\tsrc/*.py", "FINDINGS\t1"], lint.stdout
+        manifest = json.loads((root / "docs/core/core.json").read_text(encoding="utf-8"))
+        manifest["docs"][1]["sources"].remove("src/*.py")
+        (root / "docs/core/core.json").write_text(json.dumps(manifest), encoding="utf-8")
+        assert compass(root, "lint").stdout.strip() == "OK", compass(root, "lint").stdout
+        assert compass(root, "stamp").returncode == 0
+        future = time.time() + 60
+        for rel in ("web/app.py", "lib/deep/job.py", "lib/single.py", "training/run.py"):
+            os.utime(root / rel, (future, future))
+        said = compass(root, "status").stdout
+        assert "features/app.md\t4 changed" in said, said
+
+        (root / "docs/core/structure.md").write_text("# 구조\n", encoding="utf-8")
+        manifest = json.loads((root / "docs/core/core.json").read_text(encoding="utf-8"))
+        manifest["docs"].append({"file": "structure.md", "brief": "folder rules", "sources": []})
+        (root / "docs/core/core.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (root / "docs/core/structure.json").write_text("{}\n", encoding="utf-8")
+        readme = (root / "docs/core/README.md").read_text(encoding="utf-8") + "- `structure.md`\n"
+        (root / "docs/core/README.md").write_text(readme, encoding="utf-8")
+        assert compass(root, "stamp").returncode == 0, "the rules step of the restructure skill leaves compass clean"
+
+        assert tool(root, "undo", str(root), stamp, "--force").returncode == 0
+        (root / "docs/core/structure.md").unlink()
+        (root / "docs/core/structure.json").unlink()
+        (root / "docs/core/README.md").write_text(files["docs/core/README.md"], encoding="utf-8")
+        assert json.loads((root / "docs/core/core.json").read_text(encoding="utf-8"))["docs"][1]["sources"][:2] == ["src/*.py", "pipeline/run.py"], "undo restores the sources too"
+        restored = fingerprint(root)
+        assert restored == original, sorted(k for k in set(original) | set(restored) if original.get(k) != restored.get(k))
     print("ok")
 
 

@@ -6,6 +6,7 @@ Move plan, moves.json: {"moves": {"old/path": "new/path"}, "also": ["a folder ou
 import argparse
 import ast
 import collections
+import fnmatch
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ BULK_FILES = 200  # a folder with this many files and almost no code is data, mo
 HARD = {"import", "js", "path"}
 SHOWN = 12
 STATE = ".phro-project/restructure"
+MANIFEST = "docs/core/core.json"
 
 QUOTED = re.compile(r"""(["'`])((?:(?!\1)[^\n]){2,240})\1""")
 MD_LINK = re.compile(r"\]\(([^)\s]+)\)")
@@ -629,6 +631,46 @@ def reverse_moves(root, done):
         prune(root, new)
 
 
+def moved_sources(root, patterns, moves):
+    """Source patterns of core.json after the moves. They are globs, so the reference scan cannot see them, and a pattern left behind means later edits never mark a document stale. Call it before moving, since it reads what each move takes along."""
+    mapped = mapper(moves)
+    out = []
+    for pattern in patterns:
+        if pattern.startswith("~"):
+            out.append(pattern)
+            continue
+        parts = pattern.split("/")
+        fixed = next((i for i, part in enumerate(parts) if "*" in part or "?" in part), len(parts))
+        prefix, tail = "/".join(parts[:fixed]), "/".join(parts[fixed:])
+        out.append("/".join(filter(None, [mapped(prefix), tail])))
+        wanted = pattern if tail else pattern.rstrip("/") + "/*"
+        for old, new in moves.items():
+            # A move out from under the pattern takes files it covered somewhere it no longer reaches.
+            if not prefix or not old.startswith(prefix + "/") or new.startswith(mapped(prefix) + "/"):
+                continue
+            path = root / old
+            if path.is_file():
+                if fnmatch.fnmatch(old, wanted):
+                    out.append(new)
+            elif any(p.is_file() and fnmatch.fnmatch(p.relative_to(root).as_posix(), wanted) for p in path.rglob("*")):
+                out.append(f"{new}/{tail}" if tail else new)
+    return list(dict.fromkeys(out))
+
+
+def moved_manifest(root, original, current, moves):
+    """The text of core.json after the moves. Patterns come from the original, since the reference rewrite may already have moved a plain path. A manifest this cannot read stays as it is, and compass reports it."""
+    try:
+        manifest = json.loads(current)
+        changed = False
+        for doc, old in zip(manifest["docs"], json.loads(original)["docs"]):
+            sources = moved_sources(root, old.get("sources", []), moves)
+            changed = changed or sources != doc.get("sources", [])
+            doc["sources"] = sources
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return current
+    return json.dumps(manifest, ensure_ascii=False, indent=1) + "\n" if changed else current
+
+
 def command_apply(args):
     root = Path(args.root).resolve()
     moves, also = load_plan(args.moves)
@@ -642,6 +684,7 @@ def command_apply(args):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     state = root / STATE / stamp
     (state / "orig").mkdir(parents=True)
+    (root / STATE / ".gitignore").write_bytes(b"*\n")
     done, edited, auto = [], [], 0
     planned = {}
     for index, (src, per_line) in enumerate(sorted(edits.items())):
@@ -653,8 +696,17 @@ def command_apply(args):
             backup = f"{index:05d}"
             (state / "orig" / backup).write_bytes(text.encode("utf-8"))
             planned[src] = new_text
-            edited.append({"src": src, "after": src if external else mapped(src), "orig": backup})
+            edited.append({"src": src, "after": src if external else mapped(src), "orig": backup, "sha": sha(new_text.encode("utf-8"))})
             auto += count
+    if (root / MANIFEST).is_file():
+        text = read_text(root / MANIFEST)
+        current = planned.get(MANIFEST, text)
+        new_text = moved_manifest(root, text, current, moves)
+        if new_text != current:
+            if MANIFEST not in planned:
+                (state / "orig" / "manifest").write_bytes(text.encode("utf-8"))
+                edited.append({"src": MANIFEST, "after": mapped(MANIFEST), "orig": "manifest"})
+            planned[MANIFEST] = new_text
     try:
         for old in sorted(moves, key=len, reverse=True):
             move_tree(root, old, moves[old], done)
@@ -795,6 +847,11 @@ def command_undo(args):
         path = root / rel
         if not path.is_file() or sha(path.read_bytes()) != value:
             later.append(rel)
+    for item in journal["edited"]:
+        if item["src"].startswith("also:") and "sha" in item:
+            path = Path(item["src"][5:])
+            if not path.is_file() or sha(path.read_bytes()) != item["sha"]:
+                later.append(path.as_posix())
     if later and not args.force:
         print(f"CHANGED SINCE APPLY\t{len(later)}")
         for rel in later[:args.limit]:
@@ -810,11 +867,14 @@ def command_undo(args):
 
 def command_map(args):
     scan = Scan(args.root, args.also)
-    out = Path(args.out) if args.out else Path(args.root) / STATE / "map.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"files": scan.files, "dirs": sorted(scan.dirs), "bulk": scan.bulk, "edges": scan.edges, "fragile": scan.fragile, "undecodable": scan.undecodable}
-    out.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    print(f"FILES\t{len(scan.files)}\nREFERENCES\t{len(scan.edges)}\nMAP\t{out.as_posix()}\n")
+    print(f"FILES\t{len(scan.files)}\nREFERENCES\t{len(scan.edges)}")
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"files": scan.files, "dirs": sorted(scan.dirs), "bulk": scan.bulk, "edges": scan.edges, "fragile": scan.fragile, "undecodable": scan.undecodable}
+        out.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        print(f"MAP\t{out.as_posix()}")
+    print()
     summary(scan)
 
 

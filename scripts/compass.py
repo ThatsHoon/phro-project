@@ -3,7 +3,7 @@
 
 Manifest, docs/core/core.json:
 {"refresh_days": 1, "skip": ["runs"], "docs": [{"file": "goals.md", "brief": "what it holds", "sources": ["~memory", "src/*.py"]}]}
-The script adds "reviewed" and "goal_sha" to it. `*` also crosses folders. `~memory` is this project's Claude Code memory folder.
+The script adds "reviewed", "checked", "drift" and "goal_sha" to it. `*` also crosses folders. `~memory` is this project's Claude Code memory folder.
 """
 import argparse
 import fnmatch
@@ -19,7 +19,8 @@ CORE = Path("docs/core")
 INDEX_LINES, INDEX_CHARS = 40, 2500
 DOC_LINES = 80
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".pytest_cache", ".phro-project", "venv", ".venv"}
-SHOWN = 8
+SHOWN = 100
+DRIFT_CHARS = 200
 
 # The same lists as the style check in phro-search, cut to what a reference document can trip on.
 MARKS = ["Generated with", "Co-Authored-By", "Written by Claude", "AI-generated", "as an AI", "Claude가 작성", "AI가 작성", "AI 요약", "언어 모델로서",
@@ -77,6 +78,7 @@ def stale(root, manifest):
     """Rows of (doc, changed source paths, days since review, never reviewed)."""
     skip = set(manifest.get("skip", []))
     reviewed = manifest.get("reviewed", {})
+    core = Path(root) / CORE
     now = time.time()
     rows = []
     for doc in manifest["docs"]:
@@ -84,12 +86,14 @@ def stale(root, manifest):
         changed = []
         for pattern in doc.get("sources", []):
             for path in source_files(root, pattern, skip):
+                if path.is_relative_to(core):  # a refresh edits these after the review time it records
+                    continue
                 try:
                     if path.stat().st_mtime > since:
                         changed.append(path)
                 except OSError:
                     continue
-        rows.append((doc["file"], changed, (now - since) / 86400 if since else None))
+        rows.append((doc["file"], list(dict.fromkeys(changed)), (now - since) / 86400 if since else None))
     return rows
 
 
@@ -136,7 +140,12 @@ def lint(root, accept_goal=False):
     for name in files:
         if name not in listed:
             out.append(("unlisted", name, "the index does not name it"))
-    known = {(core / f).resolve() for f in files} | {index.resolve()}
+    skip = set(manifest.get("skip", []))
+    for doc in manifest["docs"]:
+        for pattern in doc.get("sources", []):
+            if pattern != "~memory" and next(source_files(root, pattern, skip), None) is None:
+                out.append(("dead-source", doc["file"], pattern))
+    known ={(core / f).resolve() for f in files} | {index.resolve()}
     for path in sorted(core.rglob("*.md")):
         if path.resolve() not in known:
             out.append(("no-manifest", path.relative_to(core).as_posix(), "not in core.json"))
@@ -149,18 +158,19 @@ def lint(root, accept_goal=False):
         if name != "README.md" and len(text.splitlines()) > DOC_LINES:
             out.append(("long", name, f"{len(text.splitlines())} lines, limit {DOC_LINES}"))
         for line_no, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith(">"):  # the user's own words stay as they are
+                continue
             where = f"{name}:{line_no}"
-            quote = line.lstrip().startswith(">")
             lowered = line.lower()
             for mark in MARKS:
                 if mark.lower() in lowered:
                     out.append(("watermark", where, mark))
             found = TELLS.search(line)
-            if found and not quote:
+            if found:
                 out.append(("tell", where, f"U+{ord(found.group(0)):04X}"))
             if HISTORY.search(line) or CHAIN.search(line):
                 out.append(("history", where, "state what is true now, the record belongs elsewhere"))
-            if DATE.search(line) and not quote:
+            if DATE.search(line):
                 out.append(("dated", where, DATE.search(line).group(0)))
         out += path_findings(root, path, text)
     goals = core / "goals.md"
@@ -170,12 +180,12 @@ def lint(root, accept_goal=False):
     return out
 
 
-def stamp(root, names, accept_goal=False):
+def stamp(root, names, accept_goal=False, drift=None):
     found = lint(root, accept_goal)
     if found:
         return found
     manifest = load(root)
-    now = time.time()
+    now = manifest.get("checked") or time.time()  # when status looked: a file saved since then was never read, so it stays stale
     reviewed = manifest.setdefault("reviewed", {})
     for doc in manifest["docs"]:
         if not names or doc["file"] in names:
@@ -183,6 +193,8 @@ def stamp(root, names, accept_goal=False):
     goals = Path(root) / CORE / "goals.md"
     if goals.exists() and (accept_goal or not manifest.get("goal_sha")):
         manifest["goal_sha"] = sha(goal_section(goals.read_text(encoding="utf-8")))
+    if drift is not None:
+        manifest["drift"] = drift[:DRIFT_CHARS]
     save(root, manifest)
     return []
 
@@ -191,19 +203,24 @@ def session_text(root):
     """What a session receives. Reads two small files and never walks the project, so it stays fast everywhere."""
     core = Path(root) / CORE
     index = core / "README.md"
-    if not index.is_file():
+    if not index.is_file() or not (core / "core.json").is_file():  # README.md alone may be another tool's docs/core
         return ""
     parts = ["Project core docs. Read the one for your work area before a large decision. "
              "When the user changes a goal or a design here, update that doc in the same step."]
     if (core / "structure.md").exists():
         parts[0] += " New files go where docs/core/structure.md says."
-    parts.append(index.read_text(encoding="utf-8").strip())
+    text = index.read_text(encoding="utf-8").strip()
+    if len(text) > INDEX_CHARS:
+        text = text[:INDEX_CHARS] + "\n\nThis index is over its limit and was cut here. Read docs/core/README.md, and shorten it."
+    parts.append(text)
     try:
         manifest = load(root)
-        reviewed = manifest.get("reviewed", {})
-        days = (time.time() - min(reviewed.values())) / 86400 if reviewed else None
+        checked = manifest.get("checked") or min(manifest.get("reviewed", {}).values(), default=None)
+        days = (time.time() - checked) / 86400 if checked else None
         if days is not None and days > manifest.get("refresh_days", 1) + 1:
-            parts.append(f"Oldest core doc review was {days:.0f} days ago. The scheduled refresh may be off: tell the user, or run /phro-project:compass refresh at a stopping point.")
+            parts.append(f"Core docs were last checked {days:.0f} days ago. The scheduled refresh may be off: tell the user, or run /phro-project:compass refresh at a stopping point.")
+        if manifest.get("drift"):
+            parts.append(f"Last drift report: {manifest['drift']}")
     except (OSError, ValueError):
         pass
     return "\n\n".join(parts)
@@ -217,10 +234,47 @@ def hook():
         event = {}
     try:
         text = session_text(os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd") or ".")
-    except OSError:
+    except Exception:
         return
     if text:
         print(text)
+
+
+def usage(root):
+    """Reads of each core document in this project's own transcripts, leaving out sessions that ran stamp, since a refresh reads what it writes. A fork copies lines, so each event counts once. Counts only, never text."""
+    core = Path(root).resolve() / CORE
+    counts = {doc["file"]: 0 for doc in load(root)["docs"]}
+    seen = set()
+    sessions = refreshes = 0
+    for path in sorted(memory_dir(root).parent.glob("*.jsonl")):
+        sessions += 1
+        reads, stamped = [], False
+        with path.open(encoding="utf-8", errors="replace") as lines:
+            for line in lines:
+                if '"Read"' not in line and "compass.py" not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                content = (event.get("message") or {}).get("content")
+                if event.get("type") != "assistant" or event.get("isSidechain") or event.get("uuid") in seen or not isinstance(content, list):
+                    continue
+                seen.add(event.get("uuid"))
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    given = block.get("input") or {}
+                    command = str(given.get("command", ""))
+                    stamped = stamped or ("compass.py" in command and " stamp" in command)
+                    if block.get("name") == "Read" and Path(str(given.get("file_path", ""))).is_relative_to(core):
+                        reads.append(Path(given["file_path"]).relative_to(core).as_posix())
+        if stamped:
+            refreshes += 1
+            continue
+        for name in reads:
+            counts[name] = counts.get(name, 0) + 1
+    return counts, sessions, refreshes
 
 
 def main():
@@ -233,21 +287,40 @@ def main():
     p.add_argument("root")
     p.add_argument("files", nargs="*")
     p.add_argument("--accept-goal", action="store_true", help="the user changed the final goal")
+    p.add_argument("--drift", help="one line for every session on work that serves no goal; empty clears it")
+    sub.add_parser("usage", help="how often sessions open each document, counted from this project's transcripts").add_argument("root")
     args = parser.parse_args()
     if args.command == "hook":
         return hook()
+    if args.command == "usage":
+        counts, sessions, refreshes = usage(args.root)
+        for name, count in counts.items():
+            print(f"{name}\t{count}")
+        print(f"SESSIONS\t{sessions}\tleft out as refreshes\t{refreshes}")
+        return
     if args.command == "status":
+        checked = time.time()
         manifest = load(args.root)
+        rows = stale(args.root, manifest)
+        manifest["checked"] = checked
+        save(args.root, manifest)
         count = 0
-        for name, changed, age in stale(args.root, manifest):
+        listed = set()
+        for name, changed, age in rows:
             state = "never-reviewed" if age is None else ("stale" if changed else "ok")
             count += state != "ok"
             print(f"{state}\t{name}\t{len(changed)} changed\t{'-' if age is None else f'{age:.1f}d'}")
-            for path in sorted(changed, key=lambda p: -p.stat().st_mtime)[:SHOWN]:
+            fresh = [p for p in sorted(changed, key=lambda p: -p.stat().st_mtime) if p not in listed]
+            listed.update(fresh[:SHOWN])
+            for path in fresh[:SHOWN]:
                 print(f"  {path.as_posix()}")
+            if len(fresh) > SHOWN:
+                print(f"  and {len(fresh) - SHOWN} more not listed: read the folder, or narrow this source")
+            if len(changed) > len(fresh):
+                print(f"  and {len(changed) - len(fresh)} listed above")
         print(f"STALE\t{count}")
         return
-    found = lint(args.root) if args.command == "lint" else stamp(args.root, args.files, args.accept_goal)
+    found = lint(args.root) if args.command == "lint" else stamp(args.root, args.files, args.accept_goal, args.drift)
     for row in found:
         print("\t".join(row))
     print(f"FINDINGS\t{len(found)}" if found else "OK")

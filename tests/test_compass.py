@@ -112,6 +112,122 @@ def demo():
             inside = Path(d) / "vendor/other"
             inside.mkdir(parents=True)
             assert run_hook(inside).stdout == "", "a project inside this one gets nothing either"
+
+    with tempfile.TemporaryDirectory() as d:
+        write(d, "docs/core/README.md", "# 다른 도구가 만든 문서\n")
+        assert run_hook(d).stdout == "", "a docs/core this plugin did not make stays out of the session"
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        (Path(d) / "docs/core/README.md").write_bytes("# 핵심 `goals.md` `features/app.md`\n".encode("cp949"))
+        out = run_hook(d)
+        assert out.returncode == 0 and out.stdout == "" and "Traceback" not in out.stderr, out.stderr
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        write(d, "docs/core/README.md", "# 핵심\n\n- `goals.md`\n- `features/app.md`\n" + "줄\n" * 25000)
+        out = run_hook(d).stdout
+        assert len(out) < compass.INDEX_CHARS + 500 and "docs/core/README.md" in out, len(out)
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        write(d, "docs/core/goals.md", GOALS.replace("결제 API", "혁신적 결제 API"))
+        assert compass.lint(d) == [], "the user's own quote is never flagged"
+        write(d, "docs/core/goals.md", GOALS.replace("결제 API", "> 변경 이력 말고 지금 구조만"))
+        assert compass.lint(d) == [], "the user's own quote is never flagged"
+        write(d, "docs/core/goals.md", GOALS + "\n혁신적 정산\n")
+        assert "watermark" in kinds(d), "outside a quote it still counts"
+
+    def status(root):
+        return subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "status", str(root)], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+
+    def backdate(root, days):
+        manifest = compass.load(root)
+        old = time.time() - days * 86400
+        manifest["reviewed"] = {k: old for k in manifest["reviewed"]}
+        if "checked" in manifest:
+            manifest["checked"] = old
+        compass.save(root, manifest)
+        os.utime(Path(root) / "src/app.py", (old - 100, old - 100))
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        compass.stamp(d, [])
+        backdate(d, 5)
+        assert "refresh may be off" in run_hook(d).stdout, "nothing has checked for five days"
+        assert status(d).endswith("STALE\t0\n")
+        assert "refresh may be off" not in run_hook(d).stdout, "a quiet project with a running refresh gets no warning"
+        backdate(d, 5)
+        assert "refresh may be off" in run_hook(d).stdout, "the refresh stopped"
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        compass.stamp(d, [])
+        write(d, "src/app.py", "print(2)\n")
+        future = time.time() + 5
+        os.utime(Path(d) / "src/app.py", (future, future))
+        status(d)
+        manifest = compass.load(d)
+        manifest["checked"] = future + 5
+        compass.save(d, manifest)
+        write(d, "src/new.py", "print(3)\n")
+        os.utime(Path(d) / "src/new.py", (future + 10, future + 10))
+        assert compass.stamp(d, []) == []
+        changed = compass.stale(d, compass.load(d))[1][1]
+        assert [p.name for p in changed] == ["new.py"], "a file saved during a refresh was never read, so it stays stale"
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        manifest = compass.load(d)
+        manifest["docs"][1]["sources"] = ["docs/*.md", "src/*.py"]
+        compass.save(d, manifest)
+        compass.stamp(d, [])
+        status(d)
+        future = time.time() + 60
+        os.utime(Path(d) / "docs/core/features/app.md", (future, future))
+        assert compass.stale(d, compass.load(d))[1][1] == [], "a refresh edits these documents, and that alone never makes them stale"
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        manifest = compass.load(d)
+        manifest["docs"][0]["sources"] = ["src/*.py"]
+        compass.save(d, manifest)
+        for number in range(compass.SHOWN + 20):
+            write(d, f"src/m{number}.py", "\n")
+        said = status(d)
+        assert said.count("m0.py") == 1, "a path a second document depends on prints once"
+        assert f"{compass.SHOWN + 21} changed" in said and said.count(".py\n") == compass.SHOWN + 21, said[:400]
+        assert "21 more not listed" in said and f"{compass.SHOWN} listed above" in said, said[-300:]
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        assert compass.stamp(d, []) == []
+        manifest = compass.load(d)
+        manifest["docs"][1]["sources"] = ["gone/*.py", "src/*.py", "~memory"]
+        compass.save(d, manifest)
+        assert [f[2] for f in compass.lint(d) if f[0] == "dead-source"] == ["gone/*.py"], compass.lint(d)
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        assert compass.stamp(d, [], drift="정산에 맞지 않는 작업이 늘었다") == []
+        assert "정산에 맞지 않는 작업이 늘었다" in run_hook(d).stdout
+        assert compass.stamp(d, []) == [] and "정산에" in run_hook(d).stdout, "a stamp without a report keeps the last one"
+        assert compass.stamp(d, [], drift="") == [] and "drift" not in run_hook(d).stdout
+        assert compass.stamp(d, [], drift="x" * 900) == [] and len(compass.load(d)["drift"]) == compass.DRIFT_CHARS
+
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home, mock.patch.object(compass.Path, "home", return_value=Path(home)):
+        clean(d)
+        project = Path(home) / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path(d).resolve()))
+        core = Path(d).resolve() / "docs/core"
+
+        def read(uuid, path):
+            return json.dumps({"type": "assistant", "uuid": uuid, "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": str(path)}}]}}) + "\n"
+        write(project, "a.jsonl", read("1", core / "goals.md") + read("2", core / "goals.md") + read("3", Path(d) / "src/app.py"))
+        write(project, "fork.jsonl", read("1", core / "goals.md"))
+        ran = json.dumps({"type": "assistant", "uuid": "9", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "python compass.py stamp ."}}]}}) + "\n"
+        write(project, "refresh.jsonl", read("4", core / "features/app.md") + ran)
+        write(Path(home) / ".claude/projects/C--other", "b.jsonl", read("5", core / "goals.md"))
+        assert compass.usage(d) == ({"goals.md": 2, "features/app.md": 0}, 3, 1), compass.usage(d)
     print("ok")
 
 

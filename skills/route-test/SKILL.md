@@ -1,6 +1,7 @@
 ---
 name: route-test
 description: Measures whether a plugin's skills get called and which skill takes each miss, on real prompts. 스킬이 호출되는지 측정, 왜 안 불렸는지, 설명문 수정 전후 비교.
+disable-model-invocation: true
 ---
 
 # route-test
@@ -15,10 +16,10 @@ Write `cases.json`: `[{"id": "c01", "skill": "name", "prompt": "..."}, {"id": "n
 
 Use these sources, best first:
 1. Typed commands: `project.py mine <transcripts_dir> cases.json --only a,b`, with this project's own transcripts folder only. Keep `cases.json` with this project too. The user's own command is the label. The script drops anything pasted. Read the file and drop bare topics, which were arguments and not requests. Do this by a stated rule, and sample with a fixed seed.
-2. Prompts written for the feature in the `design` skill.
+2. Prompts written for the feature in the `design` skill, kept in the plugin as `tests/route_cases.json`.
 3. Your own prompts, only when neither exists. Write them before reading the description, and mark them as written by the author in the report.
 
-Include negatives: close misses that share words with the skill and should fire nothing. Aim for about 8 positive and 8 negative per skill under test. Never put a project's restricted data in a case; if the project forbids reading some transcripts' content, stop and ask.
+Include negatives: close misses that share words with the skill and should fire nothing. Aim for about 8 positive and 8 negative per skill under test. Leave out a skill with `disable-model-invocation: true`, since the model cannot select it. Never put a project's restricted data in a case; if the project forbids reading some transcripts' content, stop and ask.
 
 ## 2. Build
 

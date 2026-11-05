@@ -34,6 +34,7 @@ IMPORT = re.compile(r"^\s*(?:from|import)\s+(\w+)", re.M)
 STOP = set("the and for with use when this that from not you your any are can into only about all its it's run runs used using skill skills user users asks wants whenever even".split())
 PROMPT_MIN, PROMPT_MAX = 10, 200  # shorter is a mode word, longer is usually pasted material
 TOOLS = "[Read, Glob, Grep, WebSearch, Skill]"
+ROUTE_CASES = "tests/route_cases.json"  # routing cases that live in the plugin count as evals, one node for the file
 
 
 def tokens(text):
@@ -55,6 +56,11 @@ def frontmatter(text):
     return {k: re.sub(r"^(>-?|\|-?)\s*", "", v).strip().strip("'\"") for k, v in fields.items()}, text[m.end():]
 
 
+def user_only(fields):
+    """Only the user can call this skill, so it has no listing cost and nothing for routing to measure."""
+    return fields.get("disable-model-invocation") == "true"
+
+
 def classify(rel):
     parts = rel.split("/")
     name = parts[-1]
@@ -66,6 +72,8 @@ def classify(rel):
         return "command", f"command:{Path(name).stem}"
     if parts[0] == "evals" and len(parts) > 2:
         return "eval", f"eval:{parts[1]}"
+    if rel == ROUTE_CASES:
+        return "eval", "eval:route-cases"
     if rel in ("hooks/hooks.json", ".mcp.json", ".claude-plugin/plugin.json"):
         return "config", rel
     suffix = Path(name).suffix
@@ -107,7 +115,8 @@ def scan(root):
         fields, body = frontmatter(texts[node]) if kind in ("skill", "agent", "command") else ({}, texts[node])
         listing = " ".join(filter(None, [fields.get("description"), fields.get("when_to_use")]))
         where = sources[node][0] if sources[node] else ""
-        db.execute("insert into node values(?,?,?,?,?,?)", (node, kind, where, listing, tokens(listing), tokens(body)))
+        cost = 0 if user_only(fields) else tokens(listing)
+        db.execute("insert into node values(?,?,?,?,?,?)", (node, kind, where, listing, cost, tokens(body)))
     add_edges(db, plugin, kinds, texts, sources)
     return db, plugin, texts, sources
 
@@ -137,7 +146,10 @@ def add_edges(db, plugin, kinds, texts, sources):
             if node == src:
                 continue
             called = re.search(r"(?<![\w-])" + re.escape(f"{plugin}:{name}") + r"(?![\w-])", text)
-            graded = kinds[src] == "eval" and re.search(r"(?m)^.*(?:input_match|skill).*(?<![\w-])" + re.escape(name) + r"(?![\w-]).*$", text)
+            if src == "eval:route-cases":
+                graded = re.search(r'"skill"\s*:\s*"' + re.escape(name) + '"', text)
+            else:
+                graded = kinds[src] == "eval" and re.search(r"(?m)^.*(?:input_match|skill).*(?<![\w-])" + re.escape(name) + r"(?![\w-]).*$", text)
             if called or graded:
                 db.execute("insert or ignore into edge values(?,?,'name')", (src, node))
 
@@ -227,7 +239,8 @@ def findings(root, usage_dir=None):
     for node, kind, description, _ in nodes:
         if kind != "skill":
             continue
-        if node not in tested:
+        fields = frontmatter(texts[node])[0]
+        if node not in tested and not user_only(fields):
             out.append(("no-eval", node, "no eval case grades it"))
         if not description:
             out.append(("no-description", node, "the model cannot pick it from the listing"))
@@ -235,17 +248,18 @@ def findings(root, usage_dir=None):
             out.append(("long-description", node, f"{len(description)} chars, cut at {LISTING_LIMIT}"))
         if frontmatter(texts[node])[1].count("\n") > LONG_BODY_LINES:
             out.append(("long-body", node, f"over {LONG_BODY_LINES} lines"))
-        words[node] = {w for w in re.findall(r"\w{3,}", description.lower()) if w not in STOP}
-    skills = sorted(words)
-    for i, a in enumerate(skills):
-        for b in skills[i + 1:]:
+        if not user_only(fields):
+            words[node] = {w for w in re.findall(r"\w{3,}", description.lower()) if w not in STOP}
+    listed = sorted(words)
+    for i, a in enumerate(listed):
+        for b in listed[i + 1:]:
             union = words[a] | words[b]
             score = len(words[a] & words[b]) / len(union) if union else 0
             if score >= OVERLAP_MIN:
                 out.append(("overlap-candidate", a, f"{b}: {score:.2f}"))
     if usage_dir:
         used = usage(usage_dir, plugin)
-        out += [("never-called", s, "0 typed, 0 model calls in these transcripts") for s in skills if used(s.split(":", 1)[1]) == (0, 0)]
+        out += [("never-called", n[0], "0 typed, 0 model calls in these transcripts") for n in nodes if n[1] == "skill" and used(n[0].split(":", 1)[1]) == (0, 0)]
     return out
 
 

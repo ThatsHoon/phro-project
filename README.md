@@ -10,8 +10,8 @@ It has no universal structure, because plugins differ too much between projects.
 
 Always-on cost, in every session of every project where the plugin is enabled:
 
-- Five skill descriptions, about 329 tokens.
-- One `SessionStart` hook, at start, clear and compaction. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, at most 2,500 characters. It makes no model call and never walks the project. Without `docs/core/README.md` it prints nothing.
+- Two skill descriptions, `compass` and `design`, about 230 tokens. The other three skills are not listed, so they cost nothing until you type them.
+- One `SessionStart` hook, at start, clear and compaction. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing.
 
 ## Skeleton
 
@@ -28,7 +28,7 @@ phro-project/
       references/test_structure.py   copied into the project: enforces its folder rules
   scripts/
     project.py                 plugin structure, routing tests. Standard library only
-    compass.py                 the hook; status, lint and stamp of docs/core. Standard library only
+    compass.py                 the hook; status, lint, stamp and usage of docs/core. Standard library only
     restructure.py             map, plan, apply, verify and undo of a move. Standard library only
   fixtures/
     midwork.jsonl              synthetic mid-task conversation that route-test resumes
@@ -36,8 +36,8 @@ phro-project/
   tests/
     test_project.py            seeded-defect test of project.py
     test_compass.py            seeded-defect test of compass.py
-    test_restructure.py        a small real project moved end to end
-    route_cases.json           this plugin's own routing cases, written by its author
+    test_restructure.py        a small real project moved end to end, then compass and restructure together
+    route_cases.json           this plugin's own routing cases, written by its author. `check` counts them as evals
 ```
 
 | Part | Does | Does not |
@@ -57,7 +57,7 @@ The graph answers structure questions such as what breaks if a part is removed. 
 
 ## Workflow
 
-Each skill fires on its own or by name, such as `/phro-project:design`. Sections 1 to 3 follow a plugin's life. Sections 4 and 5 serve the project itself.
+`compass` and `design` fire on their own or by name, such as `/phro-project:design`. `route-test`, `audit` and `restructure` run only when you type them, because they spend money or move files. When `design` or `audit` reaches its routing step, it reads the `route-test` instructions directly. Sections 1 to 3 follow a plugin's life. Sections 4 and 5 serve the project itself.
 
 ```
 design -> build -> route-test -> use in real work -> audit -> apply on a copy -> route-test
@@ -76,13 +76,14 @@ restructure -> map -> proposal, your yes -> phased moves -> tests -> folder rule
    | Don't build | The platform, an existing skill or one instruction line covers it |
    | Extend a part | It is an existing skill's job, reached by its existing trigger |
    | Script | The step is deterministic |
+   | Skill only you invoke | It needs judgment, and it moves files, spends money or is always typed |
    | Skill | It needs judgment, and a user request can name it |
    | Skill with `paths` | It matters only when certain files are touched |
    | Hook | It must react to an event the model does not act on, and a miss was measured |
    | MCP | It needs a connection or shared state that running a script cannot give |
 
 4. Write down the session token cost of a new skill and the descriptions it would overlap.
-5. Write the trigger prompts before the code: about 8 that should fire and about 8 close misses.
+5. Write the trigger prompts before the code: about 8 that should fire and about 8 close misses, in `tests/route_cases.json`.
 6. Write the description last, in the words users really type.
 7. After building, run `route-test` and report which existing cases broke.
 
@@ -138,11 +139,12 @@ Detection machinery is not stacked in advance. Measure per skill, and move a ski
 
 1. Init: harvest memory, READMEs and top folders, propose at most 8 areas, wait for a yes. The final goal comes only from the user's words.
 2. Every session and fork receives the index from the hook. They read the same files, so a fork's work reaches later sessions through them.
-3. Refresh runs once a day as one scheduled session, set up only after you agree. `status` finds documents whose sources changed; with none stale it stops without further work.
+3. Refresh runs once a day as one scheduled session, set up only after you agree. `status` finds documents whose sources changed; with none stale it stops without further work. It records when it looked, and `stamp` uses that time, so a file saved during a refresh stays stale for the next one. The hook warns when nothing has looked for longer than `refresh_days` plus one day, not merely when a quiet project had nothing to change.
 4. A refresh changes only what is no longer true. It cannot edit the final goal: `lint` flags that as `goal-changed`, and only `stamp --accept-goal` after you say so clears it.
-5. `lint` must pass before `stamp`. It flags AI marks and tells, change history, dates, overlong documents, dead paths and unlisted documents.
+5. `lint` must pass before `stamp`. It flags AI marks and tells, change history, dates, overlong documents, dead paths, unlisted documents and source patterns that match no file. A `>` quote is the user's own words, so it is never flagged.
+6. A refresh ends with `stamp --drift "<line>"`: work that serves no listed goal, and goals with no recent work, in at most 200 characters. Every session receives this line after the index, about 50 tokens.
 
-Session transcripts are never a source. Durable decisions are already in memory, documents and code, and transcripts can hold private data.
+Session transcripts are never a source for these documents. Durable decisions are already in memory, documents and code, and transcripts can hold private data. `usage` is the one script that opens them: it counts reads of each document and prints no text.
 
 ### 5. Restructuring: `restructure`
 
@@ -150,14 +152,14 @@ Fires when you ask. Nothing moves without your yes on the proposal.
 
 1. Read: `map` lists folders, smells, fragile path code, clusters that import each other, and hubs.
 2. Propose the structure you would choose for a new repository, not a patch of the current one. Wait for a yes.
-3. Prepare: stop running jobs, take a checkpoint, record the test baseline, pin untested behaviour with tests.
-4. Move in phases: `plan`, `apply`, fix the listed manual and fragile lines, `verify`, then the full test suite.
+3. Prepare: stop running jobs, pause this project's scheduled tasks, take a checkpoint, record the test baseline, pin untested behaviour with tests.
+4. Move in phases: `plan`, `apply`, fix the listed manual and fragile lines, `verify`, then the full test suite. `apply` also moves the source patterns in `docs/core/core.json`, including a file that leaves a pattern's folder, so later edits still mark documents stale.
 5. Add tests for any code whose logic changed. `verify` blocks on `no-test` until they exist.
-6. Write the rules: `docs/core/structure.md`, `docs/core/structure.json` and a copy of `references/test_structure.py`, so a later break fails a test. Fix memory, schedules and settings that name old paths.
+6. Write the rules: `docs/core/structure.md`, `docs/core/structure.json` and a copy of `references/test_structure.py`, so a later break fails a test. Add `structure.md` to `core.json`, then run compass `lint` and `stamp`. Fix memory, schedules and settings that name old paths.
 
 `verify` blocks on references lost, files missing, syntax errors and changed code without a test. It also lists old mentions, but passing is not enough: on one real move it passed while the suite had 41 failures, because tests built the path from the folder name in ways no scanner resolves. The suite decides.
 
-`undo` restores the moved files and the original text of every edited file.
+`undo` restores the moved files and the original text of every edited file. It refuses without `--force` if any of them changed after `apply`, including a file edited under `--also`.
 
 ## One project at a time
 
@@ -167,11 +169,11 @@ The code is installed once for the user. What it reads and writes about a projec
 |---|---|
 | Core documents and their list | `<root>/docs/core` |
 | The `~memory` source | that root's own folder, `~/.claude/projects/<slug>/memory` |
-| Restructure plans and undo data | `<root>/.phro-project/restructure` |
+| Restructure undo data | `<root>/.phro-project/restructure`, ignored by git through its own `.gitignore` |
 | Refused audit proposals | `<plugin>/.phro-project/rejected.md` |
 | Daily refresh | one scheduled task per project, naming its root |
 
-- The hook reads `docs/core` in the session's own project folder and never walks up. A project without it gets nothing, even inside another project.
+- The hook reads `docs/core` in the session's own project folder, which is the folder you opened, and never walks up. A project without `README.md` and `core.json` there gets nothing, even inside another project.
 - `restructure` rewrites the text under `--also`, so it refuses the whole scheduled tasks folder, the projects folder and another project's folder.
 - `compass` stops when the session has been working in another folder, so that conversation's context stays out of the documents. Open a session in the target project instead.
 - `route-test` cases come from this project's own transcripts and stay with this project.
@@ -199,7 +201,7 @@ Findings from `check` are candidates, not verdicts:
 | `broken-ref` | A running file points at a missing file |
 | `duplicate-file`, `shared-lines` | A whole file repeated, or lines copied between instructions |
 | `orphan` | A script or doc nothing points at |
-| `no-eval`, `never-called` | No eval case grades it, or no call in the transcripts |
+| `no-eval`, `never-called` | No eval case or `tests/route_cases.json` entry grades it, or no call in the transcripts. A skill only the user invokes needs no eval |
 | `no-description`, `long-description`, `long-body` | No description, over 1,536 characters, over 500 lines |
 | `overlap-candidate` | Descriptions share many words. `audit` judges the meaning |
 
@@ -212,9 +214,10 @@ Run as `python -I -X utf8 scripts/compass.py <command>`.
 | Command | Does |
 |---|---|
 | `hook` | Reads the event from standard input and prints the index. Called by `hooks/hooks.json` |
-| `status <root>` | Per document: stale or current, sources changed, age, then `STALE n` |
+| `status <root>` | Per document: stale or current, sources changed, age, then `STALE n`. Lists up to 100 new paths per document, each path once, and says how many it left out. Records when it looked |
 | `lint <root>` | One finding per line, then `OK` or `FINDINGS n` |
-| `stamp <root> [files] [--accept-goal]` | Records the review time and the goal's fingerprint |
+| `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint and the drift line |
+| `usage <root>` | Reads of each document in this project's transcripts, leaving out sessions that ran `stamp`. Counts only |
 
 ## `restructure.py` commands
 
@@ -222,7 +225,7 @@ Run as `python -I -X utf8 scripts/restructure.py <command>`. State stays in `<ro
 
 | Command | Does |
 |---|---|
-| `map <root> [--out f] [--also dir]` | Whole-project map. Read-only apart from its JSON file |
+| `map <root> [--out f] [--also dir]` | Whole-project map. Writes nothing unless `--out` names a file for the full JSON |
 | `plan <root> moves.json [--limit n]` | Lists every rewrite and manual line. Writes nothing |
 | `apply <root> moves.json [--limit n]` | Moves files, rewrites references, saves what undo needs |
 | `verify <root> <stamp> [--limit n]` | Compares dependencies, syntax and logic with the state before the move |
@@ -299,13 +302,13 @@ Then type `/reload-plugins` in a running session.
 ## Not done yet
 
 - Use of the design, route-test and audit skills in real plugin work.
-- `compass` on a real project, and the hook firing in a real session.
+- A scheduled `compass` refresh, and a session in a second project. One project has its documents, and the hook has fired there.
 - `restructure` start to finish with a person choosing the structure. Only its script has met real projects, on scratch copies.
-- Routing test of this plugin's own skills with `tests/route_cases.json`, 52 cases, about $8.
-- Signal hook, local search and compliance grading.
+- Routing test of this plugin's own skills with `tests/route_cases.json`, 36 cases, about $5. The cases are written by the author, which inflates the rate, so it waits for prompts really typed.
+- A hook at write time that enforces folder rules, a search over the documents, signal hook, local search and compliance grading. Each waits for a measured failure.
 
 ## When to delete it
 
 - The plugin: if two audits of real plugins produce no adopted proposal and no routing problem.
-- `compass` and its hook: if after a month sessions still lose the goal with `docs/core` in place, or nobody opens the documents and the refresh changes nothing.
+- `compass` and its hook: if after a month sessions still lose the goal with `docs/core` in place, or `usage` shows nobody opens the documents and the refresh changes nothing.
 - `restructure`: if a real restructure takes more of your time with it than by hand, or its misses reach the test suite more than its manual list catches them.
