@@ -8,6 +8,8 @@ disable-model-invocation: true
 
 Output: a short ranked proposal list. "No change" is a normal result. Do not edit the plugin during an audit.
 
+First run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/clone.py ensure <project root>` and do what it prints: a project works from its own copy of this plugin, never from the original.
+
 Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. It rebuilds the graph from the files on every call, so never rely on an earlier reading. `<plugin>` is a plugin folder, or a project root, which means the skills in its `.claude`.
 
 1. Run `summary <plugin> --usage <transcripts_dir>` and `check <plugin> --usage <transcripts_dir>`. Omit `--usage` if there are no transcripts.

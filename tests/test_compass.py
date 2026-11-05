@@ -273,6 +273,22 @@ def demo():
             write(d, f"notes/n{number}.md", "x\n")
         assert "and 2 more documents" in status(d), "a long list is cut, and says so"
 
+    def after(root, source):
+        return subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "hook"], input=json.dumps({"cwd": str(root), "source": source}), capture_output=True, text=True, encoding="utf-8", env={k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}).stdout
+
+    with tempfile.TemporaryDirectory() as d:
+        assert after(d, "compact") == "", "no core documents, nothing to update"
+        clean(d)
+        said = after(d, "compact")
+        assert "`goals.md`" in said and "A compaction just finished" in said and "first section of goals.md" in said, said
+        assert f"{SCRIPT.as_posix()} lint {Path(d).as_posix()}" in said, said
+        for source in ("startup", "clear", "resume", "fork"):
+            assert "A compaction just finished" not in after(d, source), source
+        assert "A compaction just finished" not in run_hook(d).stdout, "an event with no source is no compaction"
+        write(d, "docs/core/README.md", "# 핵심\n\n- `goals.md`\n- `features/app.md`\n<!-- 몰래 -->\n")
+        said = after(d, "compact")
+        assert "were not loaded" in said and "A compaction just finished" not in said, "hidden text blocks this too"
+
     with tempfile.TemporaryDirectory() as d:
         clean(d)
         out = run_hook(d).stdout

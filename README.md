@@ -10,23 +10,19 @@ It has no universal structure, because plugins differ too much between projects.
 
 Always-on cost, in every session of every project where the plugin is enabled:
 
-- Two skill descriptions, `compass` and `design`, about 160 tokens by `/skill-doctor`. The other three skills are not listed, so they cost nothing until you type them.
-- One `SessionStart` hook, at start, clear and compaction. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing. An index holding hidden text prints one warning instead.
+- One skill description, `design`, about 80 tokens. The other four skills are not listed, so they cost nothing until you type them.
+- One `SessionStart` hook, at start, clear and compaction. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing. An index holding hidden text prints one warning instead. After a compaction it adds about 150 tokens telling the session to update the documents from its summary, which can take that session a few turns.
 
 ## 새 프로젝트에서 쓰기
 
-한 번 설치하면 모든 폴더에서 켜져 있고, 문서와 기록은 프로젝트마다 따로 둡니다.
+이 플러그인은 원본입니다. 프로젝트에서 처음 쓰면 `~/phro-project_<프로젝트>`에 복제본이 생기고, 그 프로젝트에서는 복제본만 켜집니다. 프로젝트가 만든 것은 복제본과 프로젝트 안에 남고 원본은 그대로라, 원본은 언제든 그대로 푸시할 수 있습니다.
 
-1. 일부 프로젝트에서만 쓰려면 사용자 범위 설치를 지우고, 그 프로젝트 폴더에서 설치합니다. 안 쓰는 폴더에서 목록 비용 약 160토큰을 아낍니다.
-
-   ```bash
-   claude plugin install phro-project@phro-project --scope local
-   ```
-
-2. 그 폴더에서 새 세션을 열고 "핵심 문서 만들어줘"라고 합니다. 다른 폴더에서 작업하던 세션은 맥락이 섞이지 않게 멈춥니다.
+1. 프로젝트 폴더에서 새 세션을 열고 `/phro-project:compass`를 입력합니다. 복제본이 생기고 작업이 이어집니다. 다른 폴더에서 작업하던 세션은 맥락이 섞이지 않게 멈춥니다.
+2. 끝나면 `/reload-plugins`를 입력합니다. 이후 이 프로젝트에서는 `/phro-project_<프로젝트>:compass`처럼 부릅니다.
 3. 영역 제안을 확인합니다. 최종 목표는 사용자의 말로만 적으니, 없으면 물을 때 한두 문장으로 답합니다.
 4. 매일 갱신 예약을 물으면 답합니다. 예약 작업은 프로젝트마다 하나입니다.
-5. 평소에는 그대로 일합니다. 필요할 때만 부릅니다.
+5. 평소에는 그대로 일합니다. `/compact`나 자동 압축이 일어나면 그 세션이 압축 요약을 핵심 문서와 대조해 바뀐 결정을 반영합니다. 프로젝트 폴더의 세션과 포크 모두 같습니다. `/compact` 뒤에는 다음 메시지를 보낼 때 진행됩니다.
+6. 원본이 새 판이 되면 세션 시작 때 알려 줍니다. `clone.py sync`를 돌리면 원본에서 바뀐 파일만 가져오고, 프로젝트가 더하거나 고친 파일은 그대로 둡니다.
 
 | 언제 | 무엇을 |
 |---|---|
@@ -41,7 +37,8 @@ Always-on cost, in every session of every project where the plugin is enabled:
 - 새 세션에서 "이 프로젝트 최종 목표가 뭐야?"라고 물으면 파일을 열지 않고 답합니다.
 - 갱신이 멈추면 세션 시작 때 경고가 나옵니다.
 - 다른 폴더의 세션은 이 문서를 모릅니다.
-- 한 번 시킨 능력은 이 프로젝트의 `.claude/skills`와 색인의 작업 규칙에 남고, 다른 프로젝트에는 나타나지 않습니다.
+- 한 번 시킨 능력은 이 프로젝트의 복제본과 색인의 작업 규칙에 남고, 다른 프로젝트에는 나타나지 않습니다.
+- 원본 저장소의 `git status`는 어떤 프로젝트에서 무엇을 해도 깨끗합니다.
 
 ## Skeleton
 
@@ -58,6 +55,7 @@ phro-project/
       references/test_structure.py   copied into the project: enforces its folder rules
   scripts/
     project.py                 plugin structure, routing tests. Standard library only
+    clone.py                   a project's own copy of this plugin: ensure and sync. Standard library only
     compass.py                 the hook; status, lint, stamp and usage of docs/core. Standard library only
     restructure.py             map, plan, apply, verify and undo of a move. Standard library only
   fixtures/
@@ -65,6 +63,7 @@ phro-project/
     make_midwork.py            regenerates it
   tests/
     test_project.py            seeded-defect test of project.py
+    test_clone.py              a project's copy: the original stays unchanged, projects stay apart, sync keeps the project's files
     test_compass.py            seeded-defect test of compass.py
     test_restructure.py        a small real project moved end to end, then compass and restructure together
     route_cases.json           this plugin's own routing cases, written by its author. `check` counts them as evals
@@ -87,7 +86,7 @@ The graph answers structure questions such as what breaks if a part is removed. 
 
 ## Workflow
 
-`compass` and `design` fire on their own or by name, such as `/phro-project:design`. `route-test`, `audit` and `restructure` run only when you type them, because they spend money or move files. When `design` or `audit` reaches its routing step, it reads the `route-test` instructions directly. Sections 1 to 3 follow a plugin's life. Sections 4 and 5 serve the project itself.
+`design` fires on its own or by name. `compass`, `route-test`, `audit` and `restructure` run only when you type them. The core documents also update after every compaction, without a skill call. When `design` or `audit` reaches its routing step, it reads the `route-test` instructions directly. Sections 1 to 3 follow a plugin's life. Sections 4 and 5 serve the project itself.
 
 ```
 design -> build -> route-test -> use in real work -> audit -> apply on a copy -> route-test
@@ -118,9 +117,9 @@ Say what the project should be able to do, and from when: "make this method a sk
    | Hook | It must react to an event the model does not act on, and a miss was measured |
    | MCP | It needs a connection or shared state that running a script cannot give |
 
-6. A project's skill goes in `<project>/.claude/skills`, never in this plugin, so no other project receives it and an update cannot overwrite it.
+6. A project's skill goes in that project's copy of this plugin, never in the original, so no other project receives it and a sync cannot overwrite it.
 7. Write down the session token cost of a new skill and the descriptions it would overlap.
-8. Write how it fires before the code. From a prompt: about 8 that should fire and about 8 close misses, in `tests/route_cases.json`, which is `.claude/tests/route_cases.json` for a project. From a step in the work: cases with `after` and `rule`.
+8. Write how it fires before the code. From a prompt: about 8 that should fire and about 8 close misses, in the copy's `tests/route_cases.json`. From a step in the work: cases with `after` and `rule`.
 9. Write the description last, in the words users really type.
 10. Build it if you asked for that, with its standing rule in the same step.
 11. Run `route-test` once you approve the cost, and report which existing cases broke. Until then it is reported as built and not measured.
@@ -181,9 +180,10 @@ Detection machinery is not stacked in advance. Measure per skill, and move a ski
 3. Refresh runs once a day as one scheduled session, set up only after you agree. `status` finds documents whose sources changed, and lists what changed outside every source: a count per folder, and the documents by name. With neither it stops without further work. It opens up to 10 of those documents, moves what must survive into the core documents, and may add a new area document on its own, up to 8 areas, saying so in its report. It records when it looked, and `stamp` uses that time, so a file saved during a refresh stays stale for the next one. The hook warns when nothing has looked for longer than `refresh_days` plus one day, not merely when a quiet project had nothing to change.
 4. A refresh changes only what is no longer true. It cannot edit the final goal: `lint` flags that as `goal-changed`, and only `stamp --accept-goal` after you say so clears it.
 5. `lint` must pass before `stamp`. It flags AI marks and tells, change history, dates, overlong documents, dead paths, unlisted documents, source patterns that match no file and hidden text in the index. A `>` quote is the user's own words, so it is never flagged for wording.
-6. A refresh ends with `stamp --drift "<line>"`: work that serves no listed goal, and goals with no recent work, in at most 200 characters. The folder list from `status` is what it judges this from. Every session receives this line after the index, about 50 tokens.
+6. After `/compact` or an automatic compaction, in any session or fork of the project, the hook tells that session to compare its summary with the documents and update what is out of date, then run `lint`. A summary reaches a hook only on `PostCompact`, which cannot call a model or reach the session, so the session that already holds the summary does the work and no extra run is paid for. After a manual `/compact` this happens with your next message. A session that ends first updates nothing, and whether sessions follow the instruction is not measured.
+7. A refresh ends with `stamp --drift "<line>"`: work that serves no listed goal, and goals with no recent work, in at most 200 characters. The folder list from `status` is what it judges this from. Every session receives this line after the index, about 50 tokens.
 
-Session transcripts are never a source for these documents. Durable decisions are already in memory, documents and code, and transcripts can hold private data. `usage` is the one script that opens them: it counts reads of each document and prints no text.
+Session transcripts are never a source for these documents, since they can hold private data. Sources are memory, documents, code and, right after a compaction, the summary the session already holds. `usage` is the one script that opens them: it counts reads of each document and prints no text.
 
 ### 5. Restructuring: `restructure`
 
@@ -202,16 +202,17 @@ Fires when you ask. Nothing moves without your yes on the proposal.
 
 ## One project at a time
 
-The code is installed once for the user. What it reads and writes about a project stays with that project.
+The original is installed once for the user and holds no project. A project's first use of any skill runs `clone.py ensure`, which copies the plugin to `~/phro-project_<project>`, registers that copy as its own marketplace and turns it on with `--scope local`, and turns the original off with `--scope local`. The copy loads in place, so an edit needs only `/reload-plugins`. Two projects with one folder name get separate copies, and a copy refuses to run for any project but its own. Inside the plugin's own folder, no copy is made.
 
 | What | Where |
 |---|---|
+| The project's copy of this plugin | `~/phro-project_<project>`, with `origin.json` recording its project and the original's files |
 | Core documents and their list | `<root>/docs/core` |
 | The `~memory` source | that root's own folder, `~/.claude/projects/<slug>/memory` |
 | Restructure undo data | `<root>/.phro-project/restructure`, ignored by git through its own `.gitignore` |
 | Refused audit proposals | `<plugin>/.phro-project/rejected.md` |
 | Daily refresh | one scheduled task per project, naming its root |
-| Skills built on request | `<root>/.claude/skills`, with cases in `<root>/.claude/tests` |
+| Skills built on request | the project's copy: `skills/<name>`, with cases in `tests/route_cases.json` |
 | Standing rules | the work rules in `<root>/docs/core/README.md`, or `<root>/.claude/rules` |
 
 - The hook reads `docs/core` in the session's own project folder, which is the folder you opened, and never walks up. A project without `README.md` and `core.json` there gets nothing, even inside another project.
@@ -260,6 +261,15 @@ Run as `python -I -X utf8 scripts/compass.py <command>`.
 | `lint <root>` | One finding per line, then `OK` or `FINDINGS n` |
 | `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint and the drift line |
 | `usage <root>` | Reads of each document in this project's transcripts, leaving out sessions that ran `stamp`. Counts only |
+
+## `clone.py` commands
+
+Run as `python -I -X utf8 scripts/clone.py <command>`.
+
+| Command | Does |
+|---|---|
+| `ensure <root> [--dest dir] [--no-register]` | Prints `CREATED`, `EXISTS`, `THIS`, `ORIGINAL`, `WRONG-PROJECT` or `NO-PROJECT`, and what to do. Every skill runs it first |
+| `sync [--from dir]` | Run from a copy. Takes a newer original: files the project did not touch are updated, new ones added, dropped ones removed. Files the project added stay, and files it changed stay and print as `kept` |
 
 ## `restructure.py` commands
 
@@ -331,6 +341,10 @@ python -I -X utf8 tests/test_project.py
 ```
 
 ```bash
+python -I -X utf8 tests/test_clone.py
+```
+
+```bash
 python -I -X utf8 tests/test_compass.py
 ```
 
@@ -359,7 +373,7 @@ Then type `/reload-plugins` in a running session.
 - Use of the design, route-test and audit skills in real work. A capability built on request and a step-triggered skill have only passed scripted checks, not a run with a model.
 - A scheduled `compass` refresh, and a session in a second project. One project has its documents, and the hook has fired there.
 - `restructure` start to finish with a person choosing the structure. Only its script has met real projects, on scratch copies.
-- Routing test of this plugin's own skills with `tests/route_cases.json`, 36 cases, about $5. The cases are written by the author, which inflates the rate, so it waits for prompts really typed.
+- Routing test of this plugin's own skills with `tests/route_cases.json`, 28 cases, about $4. The cases are written by the author, which inflates the rate, so it waits for prompts really typed.
 - A hook at write time that enforces folder rules, a search over the documents, signal hook, local search and compliance grading. Each waits for a measured failure.
 
 ## When to delete it

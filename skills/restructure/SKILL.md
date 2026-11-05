@@ -8,6 +8,8 @@ disable-model-invocation: true
 
 Output: a target structure the user approves, then that structure in place with every reference working and its rules written down.
 
+First run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/clone.py ensure <project root>` and do what it prints: a project works from its own copy of this plugin, never from the original.
+
 Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/restructure.py <command>`. It prints paths and counts, never file contents. It works on any project, including one without git.
 
 Be bold about the target and strict about the proof. The current layout never limits the proposal, and nothing counts as done until `verify` and the tests say so.

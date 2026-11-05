@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 CORE = Path("docs/core")
+PLUGIN = Path(__file__).resolve().parents[1]
 INDEX_LINES, INDEX_CHARS = 40, 2500
 DOC_LINES = 80
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".pytest_cache", ".phro-project", "venv", ".venv"}
@@ -233,7 +234,19 @@ def stamp(root, names, accept_goal=False, drift=None):
     return []
 
 
-def session_text(root):
+def newer_original():
+    """For a project's copy of this plugin: the newest installed original, when it is ahead of the copy."""
+    try:
+        record = json.loads((PLUGIN / "origin.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    key = lambda version: tuple(int(n) for n in version.split("."))
+    versions = [p.name for p in Path(record["origin_dir"]).parent.glob("*") if re.fullmatch(r"\d+\.\d+\.\d+", p.name)]
+    newest = max(versions, key=key, default=None)
+    return (record["origin"], newest) if newest and key(newest) > key(record["version"]) else None
+
+
+def session_text(root, source=None):
     """What a session receives. Reads two small files and never walks the project, so it stays fast everywhere."""
     core = Path(root) / CORE
     index = core / "README.md"
@@ -259,11 +272,20 @@ def session_text(root):
             days = (now - (manifest.get("checked") or reviewed)) / 86400
             parts.append(f"Reviewed {(now - reviewed) / 86400:.0f} days ago, last checked for changes {days:.0f} days ago.")
             if days > manifest.get("refresh_days", 1) + 1:
-                parts.append("The scheduled refresh may be off: tell the user, or run /phro-project:compass refresh at a stopping point.")
+                name = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))["name"]
+                parts.append(f"The scheduled refresh may be off: tell the user, who can run /{name}:compass refresh.")
         if manifest.get("drift") and not HIDDEN.search(manifest["drift"]):
             parts.append(f"Last drift report: {manifest['drift']}")
+        newer = newer_original()
+        if newer:
+            parts.append(f"{newer[0]} {newer[1]} is newer than this project's copy. Tell the user, or at a stopping point run: python -I -X utf8 {PLUGIN.as_posix()}/scripts/clone.py sync")
     except (OSError, ValueError):
         pass
+    if source == "compact":  # the summary is in this session's context, and no hook on this event can call a model, so the session itself does the update
+        parts.append("A compaction just finished, and the summary above is this session's record. Before the next step, compare it with these documents. "
+                     "If it shows the user settled or changed a goal, a design or a principle, ruled something out or adopted something, and the matching document in docs/core does not say so, update that document now: "
+                     "only what outlasts this task, stated as true now, no progress or numbers, and never the first section of goals.md unless the user said so. "
+                     f"Then run: python -I -X utf8 {Path(__file__).resolve().as_posix()} lint {Path(root).as_posix()} and fix what it flags. If nothing needs changing, say nothing about it and go on.")
     return "\n\n".join(parts)
 
 
@@ -274,7 +296,7 @@ def hook():
     except ValueError:
         event = {}
     try:
-        text = session_text(os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd") or ".")
+        text = session_text(os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd") or ".", event.get("source"))
     except Exception:
         return
     if text:

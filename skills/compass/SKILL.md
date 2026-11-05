@@ -1,15 +1,18 @@
 ---
 name: compass
-description: Builds and refreshes a project's core documents in docs/core, the fixed point every session and fork starts from: final and mid-term goals, overall and per-feature architecture, documents the user names. 핵심 문서, 전체 구조 문서, 목표 정리, 문서 최신화, 아키텍처 요약, 방향 잃지 않게.
+description: Builds and refreshes a project's core documents in docs/core, the fixed point every session and fork starts from. Runs only when you type it.
+disable-model-invocation: true
 ---
 
 # compass
 
 Output: short documents in `docs/core`, then at most 5 lines to the user. Long work buries the original goal under local detail. These documents hold what must survive that, so they stay short.
 
+First run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/clone.py ensure <project root>` and do what it prints: a project works from its own copy of this plugin, never from the original.
+
 Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/compass.py <command> <project root>`.
 
-A plugin hook prints `docs/core/README.md` at every session start and after every compaction, in every session and fork of the project. It is silent in a project without that file and `core.json`.
+A plugin hook prints `docs/core/README.md` at every session start and after every compaction, in every session and fork of the project. It is silent in a project without that file and `core.json`. After a compaction, manual or automatic, it also tells that session to compare its summary with these documents and update what the summary shows is out of date, so the documents keep up with no one asking.
 
 These documents belong to one project. Use only the project at the given root: its files, its own memory folder and its own sessions. If this session has been working in another folder, stop and ask the user to open a session in the target project, so this conversation's context stays out of the documents. A scheduled run starts clean, so it goes ahead.
 
@@ -41,7 +44,7 @@ These documents belong to one project. Use only the project at the given root: i
 - Work rules in the index are the user's standing instructions, and later sessions act on them. A refresh keeps them, and only the user drops one.
 - A claim nobody has confirmed carries `확인 필요`, or the same words in the user's language, until the code or the user settles it.
 - These documents keep no glossary. If the project needs one, call the Skill tool with `mattpocock-skills:domain-modeling` when that skill is listed, and name its file in the index.
-- Never read session transcripts. Sources are memory, documents and code: a session's durable decisions are already there, and transcripts can hold private data.
+- Never read session transcripts, which can hold private data. Sources are memory, documents, code and, right after a compaction, the summary the session already holds. Keep out of the documents anything in that summary a project forbids copying.
 
 ## Init, when `docs/core` does not exist
 
@@ -49,7 +52,7 @@ These documents belong to one project. Use only the project at the given root: i
 2. Propose the areas (at most 8) and the document list in one message, and wait for a yes. Take the final goal only from the user's words. If none exist, ask for it. Never infer one.
 3. Write the documents and `core.json`. Keep `sources` narrow, such as `src/*.py` and `~memory`, and put data folders in `skip`. Work outside `sources` still shows in `status`, by folder.
 4. Run `lint`, fix what it flags, then `stamp`.
-5. Offer a daily refresh. A scheduled task is standing configuration, so ask first. Create one task per project, named after it, with the scheduled task tool and a self-contained prompt: `Run /phro-project:compass refresh for <absolute project root>. End with at most 5 lines.`
+5. Offer a daily refresh. A scheduled task is standing configuration, so ask first. Create one task per project, named after it, with the scheduled task tool and a self-contained prompt: `Read <copy>/skills/compass/SKILL.md and follow its Refresh section for <absolute project root>, reading ${CLAUDE_PLUGIN_ROOT} as <copy>. End with at most 5 lines.` `<copy>` is the folder `ensure` printed. The prompt reads the file because this skill runs only when typed.
 
 ## Refresh, the default
 
@@ -71,4 +74,4 @@ Add an entry with `file`, `brief` and `sources` to `core.json`, write the docume
 
 ## In a fork
 
-Forks read the same files. One scheduled session refreshes them, so a fork does not run a refresh on its own. When the user settles a direction in a fork, that fork updates the matching document in the same step.
+Forks read the same files, and a fork's compaction updates them the way any session's does. A fork does not run a refresh on its own. When the user settles a direction in a fork, that fork updates the matching document in the same step.

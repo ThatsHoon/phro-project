@@ -7,9 +7,11 @@ description: Adds a capability to this project or its plugin: finds what already
 
 Output: the capability in place and firing at the right moment, with what was measured. If the user only asked where something belongs, a decision of a few lines. If nothing should be built, a short reason. Build only what the user asked for, never on your own idea.
 
+First run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/clone.py ensure <project root>` and do what it prints: a project works from its own copy of this plugin, never from the original.
+
 Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. `<plugin>` is a plugin folder, or a project root, which means the skills in its `.claude`.
 
-1. Run `summary <plugin>` and `check <plugin>`. Read the parts nearest the new capability.
+1. Run `summary <plugin>` and `check <plugin>` on this project's copy, and on the project root if it has its own `.claude/skills`. Read the parts nearest the new capability.
 2. Name the real problem: what failed or repeats in actual work, or what the user says they need, and how a working run would show the fix. If nobody can name one, recommend not building it, and stop.
 3. Look for what exists before writing anything, in this order: skills and plugins already installed (`/skill-doctor`, `project.py catalog`), the plugin catalog (the `SearchPlugins` tool if present, `claude plugin marketplace list`), tools on this machine, then packages. A skill only the user can invoke (`disable-model-invocation: true`) cannot be called by the model, and a skill that waits for the user's answers stops an automatic flow. To use its method inside a flow, write a project skill that holds the method: answer what the code and documents can answer, act on it, and leave only the user's decisions for the report.
 4. For anything from outside, check before installing: who publishes it, its license, what it runs on this machine, and whether project files leave the machine. A service that receives files needs the user's explicit yes, and data the project restricts never goes there. Name the exact item to the user and wait for a yes. Install it for this project only: `claude plugin install <plugin>@<marketplace> --scope local`, or `--scope project` to share it through git.
@@ -28,9 +30,9 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
 | Hook | Must react to an event the model will not act on by itself, such as a tool error. Measured misses come first (`route-test`). A hook cannot see a step like "the draft is done": that is a standing rule | Runs every time, so it costs every time |
 | MCP | A tool or a live connection that a script run cannot provide, or state shared across calls | Costs a server |
 
-6. Put it in this project, not in this plugin:
-   - A skill goes in `<project>/.claude/skills/<name>/SKILL.md`, its cases in `<project>/.claude/tests/route_cases.json`. Never in this plugin's folder or cache: every project would receive it, and an update would overwrite it. A project with its own plugin uses that plugin's folder.
-   - A standing rule is one line under the work rules in `docs/core/README.md`, naming the skill exactly: `After writing a design draft, before reporting, call the Skill tool with design-review.` The hook delivers it at every session start and after every compaction, in this project only. Without `docs/core`, use `.claude/rules/<name>.md` with no `paths`. Use `CLAUDE.md` only if the user asks.
+6. Put it in this project's copy, never in the original:
+   - A skill goes in `skills/<name>/SKILL.md` of the copy `ensure` printed, its cases in that copy's `tests/route_cases.json`. The copy loads in place, so `/reload-plugins` makes it live, and `clone.py sync` never touches what the project added. The original stays free of any project, so it can be pushed as it is.
+   - A standing rule is one line under the work rules in `docs/core/README.md`, naming the skill exactly, with this copy's name: `After writing a design draft, before reporting, call the Skill tool with <copy>:design-review.` The hook delivers it at every session start and after every compaction, in this project only. Without `docs/core`, use `.claude/rules/<name>.md` with no `paths`. Use `CLAUDE.md` only if the user asks.
    - A third-party skill keeps its own description. Add a standing rule that names it, since a crowded listing can leave it with only a name.
 7. Check the cost. A new skill costs listing tokens on every session and adds a competitor to every other skill, which can break tasks that already worked. The listing holds about 1% of the context window, and when it overflows, the least used skills lose their descriptions first. Name the overlapping description it will sit beside, and say what could be merged instead.
 8. Write how it fires before the code, in the language users really type:

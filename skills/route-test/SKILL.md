@@ -8,6 +8,8 @@ disable-model-invocation: true
 
 Report per skill: hits, false fires, and who took each miss. A pass rate with no confusion table cannot say what to fix.
 
+First run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/clone.py ensure <project root>` and do what it prints: a project works from its own copy of this plugin, never from the original.
+
 Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. `<plugin>` is a plugin folder, or a project root, which means the skills in its `.claude`. Every model run costs money, about $0.15 per case at 55 skills on Opus. State the estimate (cases x runs x cost) and get a yes before any `claude plugin eval`.
 
 ## 1. Cases
