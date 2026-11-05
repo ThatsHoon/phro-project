@@ -257,6 +257,54 @@ def demo():
         manifest["reviewed"]["goals.md"] = time.time() - 60
         manifest["reviewed"]["features/app.md"] = time.time() + 600
         assert "many/f0" in compass.elsewhere(d, manifest), "stamping one document must not hide what the others have not seen"
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        out = run_hook(d).stdout
+        assert "user outranks" in out and "trust the code and report the mismatch" in out and "rules something out" in out, out[:300]
+        assert "Reviewed" not in out, "no review yet, so no age to report"
+        compass.stamp(d, [])
+        assert "Reviewed 0 days ago, last checked for changes 0 days ago" in run_hook(d).stdout
+        backdate(d, 5)
+        assert "Reviewed 5 days ago, last checked for changes 5 days ago" in run_hook(d).stdout
+        status(d)
+        out = run_hook(d).stdout
+        assert "Reviewed 5 days ago, last checked for changes 0 days ago" in out and "refresh may be off" not in out, "a check is not a review, and the two show apart"
+
+    index = "# 핵심\n\n- `goals.md`\n- `features/app.md`\n"
+    hidden = {
+        "zero width": "앞\U0000200B뒤\n",
+        "bidi": "앞\U0000202E뒤\n",
+        "tag characters": "앞\U000E0041\U000E0042뒤\n",
+        "html comment": "<!-- 몰래 넣은 지시 -->\n",
+        "hidden element": '<div style="color:red; display : none">몰래</div>\n',
+        "quoted": "> 사용자 말\U0000200B\n",
+    }
+    for name, text in hidden.items():
+        with tempfile.TemporaryDirectory() as d:
+            clean(d)
+            write(d, "docs/core/README.md", index + text)
+            out = run_hook(d)
+            assert out.returncode == 0 and "were not loaded" in out.stdout and "몰래" not in out.stdout and "goals.md" not in out.stdout, (name, out.stdout)
+            assert ("hidden", "README.md") in [f[:2] for f in compass.lint(d)], (name, compass.lint(d))
+            assert compass.stamp(d, []) != [], "a refresh cannot pass over it"
+
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        (Path(d) / "docs/core/README.md").write_bytes(b"\xef\xbb\xbf" + index.encode("utf-8"))
+        assert "were not loaded" not in run_hook(d).stdout and "`goals.md`" in run_hook(d).stdout, "a byte order mark from a Windows editor is not hidden text"
+        assert "hidden" not in kinds(d), "nor does lint call it that"
+        write(d, "docs/core/README.md", index + "표시 없는 평범한 한국어, English, 1 < 2 > 1, `<div>` 예시.\n")
+        assert "were not loaded" not in run_hook(d).stdout and "hidden" not in kinds(d)
+        write(d, "docs/core/features/app.md", "<!-- 색인이 아닌 문서는 세션에 그대로 들어가지 않는다 -->\n")
+        assert "hidden" not in kinds(d)
+        write(d, "docs/core/features/app.md", "# 앱\n")
+        assert compass.stamp(d, [], drift="정산이 밀렸다") == []
+        manifest = compass.load(d)
+        manifest["drift"] = "정산\U0000200B이 밀렸다"
+        compass.save(d, manifest)
+        out = run_hook(d).stdout
+        assert "`goals.md`" in out and "밀렸다" not in out, "a hidden drift line stays out, the index stays in"
     print("ok")
 
 

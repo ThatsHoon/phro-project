@@ -11,7 +11,7 @@ It has no universal structure, because plugins differ too much between projects.
 Always-on cost, in every session of every project where the plugin is enabled:
 
 - Two skill descriptions, `compass` and `design`, about 160 tokens by `/skill-doctor`. The other three skills are not listed, so they cost nothing until you type them.
-- One `SessionStart` hook, at start, clear and compaction. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing.
+- One `SessionStart` hook, at start, clear and compaction. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing. An index holding hidden text prints one warning instead.
 
 ## 새 프로젝트에서 쓰기
 
@@ -158,19 +158,19 @@ Detection machinery is not stacked in advance. Measure per skill, and move a ski
 
 | File in `docs/core` | Holds |
 |---|---|
-| `README.md` | The index sessions receive: final goal, mid-term goals, one line per area, folder rules. At most 40 lines |
-| `goals.md` | The final goal in the user's own words, then mid-term and short-term goals |
+| `README.md` | The index sessions receive: final goal, mid-term goals, one line per area saying when to read it, the names of what was ruled out, folder rules. At most 40 lines |
+| `goals.md` | The final goal in the user's own words, then mid-term and short-term goals, then what was ruled out: what, why, what replaces it, and the condition for looking again |
 | `architecture.md` | The whole system |
 | `features/<area>.md` | One per largest functional area |
 | `<name>.md` | A document the user asked for, with its brief in `core.json` |
 | `structure.md`, `structure.json` | Folder rules, written by `restructure` |
 | `core.json` | The documents and the sources each depends on |
 
-1. Init: harvest memory, READMEs and top folders, propose at most 8 areas, wait for a yes. The final goal comes only from the user's words.
-2. Every session and fork receives the index from the hook. They read the same files, so a fork's work reaches later sessions through them.
+1. Init: list what already owns each kind of fact in memory, READMEs, registries and ledgers, propose at most 8 areas, wait for a yes. The final goal comes only from the user's words. Documents link to an existing owner instead of copying it, and hold what cannot be found by looking.
+2. Every session and fork receives the index from the hook, with how long ago the documents were reviewed and how long ago changes were checked. The hook also says that the user outranks the documents, and that on a fact about the code the code wins and the mismatch gets reported. They read the same files, so a fork's work reaches later sessions through them.
 3. Refresh runs once a day as one scheduled session, set up only after you agree. `status` finds documents whose sources changed, and lists by folder what changed outside every source; with neither it stops without further work. It records when it looked, and `stamp` uses that time, so a file saved during a refresh stays stale for the next one. The hook warns when nothing has looked for longer than `refresh_days` plus one day, not merely when a quiet project had nothing to change.
 4. A refresh changes only what is no longer true. It cannot edit the final goal: `lint` flags that as `goal-changed`, and only `stamp --accept-goal` after you say so clears it.
-5. `lint` must pass before `stamp`. It flags AI marks and tells, change history, dates, overlong documents, dead paths, unlisted documents and source patterns that match no file. A `>` quote is the user's own words, so it is never flagged.
+5. `lint` must pass before `stamp`. It flags AI marks and tells, change history, dates, overlong documents, dead paths, unlisted documents, source patterns that match no file and hidden text in the index. A `>` quote is the user's own words, so it is never flagged for wording.
 6. A refresh ends with `stamp --drift "<line>"`: work that serves no listed goal, and goals with no recent work, in at most 200 characters. The folder list from `status` is what it judges this from. Every session receives this line after the index, about 50 tokens.
 
 Session transcripts are never a source for these documents. Durable decisions are already in memory, documents and code, and transcripts can hold private data. `usage` is the one script that opens them: it counts reads of each document and prints no text.
@@ -205,6 +205,7 @@ The code is installed once for the user. What it reads and writes about a projec
 - The hook reads `docs/core` in the session's own project folder, which is the folder you opened, and never walks up. A project without `README.md` and `core.json` there gets nothing, even inside another project.
 - `restructure` rewrites the text under `--also`, so it refuses the whole scheduled tasks folder, the projects folder and another project's folder.
 - `compass` stops when the session has been working in another folder, so that conversation's context stays out of the documents. Open a session in the target project instead.
+- A cloned repository's `docs/core` enters the session the way its `CLAUDE.md` does. The hook refuses an index with an HTML comment, an invisible character or a hidden element. Plain instructions in the text are not detected.
 - `route-test` cases come from this project's own transcripts and stay with this project.
 - Nothing from a project ships in this plugin. Skills and tests use made-up examples.
 
