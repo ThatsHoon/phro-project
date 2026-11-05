@@ -1,6 +1,6 @@
 ---
 name: design
-description: Decides where a new plugin capability belongs (skill, script, hook, MCP, extending an existing part, or not building it) from the plugin's current structure, and writes its trigger prompts first. Use before adding a feature to a plugin. 플러그인에 기능 추가 전 설계, 어디에 넣을지, 스킬로 만들지 스크립트로 만들지.
+description: Before adding a plugin feature, decides where it belongs (skill, script, hook, MCP, existing part, or nothing) and writes trigger prompts first. 플러그인 기능 추가 설계, 어디에 넣을지, 스킬로 만들지 스크립트로 만들지.
 ---
 
 # design
@@ -25,7 +25,7 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`.
 
 4. Check the cost. A new skill costs listing tokens on every session and adds a competitor to every other skill, which can break tasks that already worked. Name the overlapping description it will sit beside, and say what could be merged instead.
 5. Write trigger prompts before the code: about 8 that should fire it and 8 close misses that should not, in the language users really type. Save them as `cases.json` for the `route-test` skill.
-6. Write the description last, from those prompts: what it does, then when to use it. Keep the combined description and when_to_use under 1,536 characters; shorter is better, since a description is read every session.
+6. Write the description last, from those prompts: what it does, then the words users really type, in their language. In one measurement, adding the user's own verbs to a description moved a skill from 1 of 7 to 6 of 7. Keep the combined description and when_to_use under 1,536 characters; shorter is better, since a description is read every session.
 7. After building, run `route-test` with the existing skills as competitors, and report any existing case that broke.
 
 Report in the user's language. Mark as inference anything you did not measure.

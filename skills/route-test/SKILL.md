@@ -1,6 +1,6 @@
 ---
 name: route-test
-description: Measures whether a plugin's skills actually get called and which skill takes each miss, using labelled real prompts and an eval on a scratch copy. Use when asked if a skill fires, why it was not called, or to compare a description or hook before and after. 스킬이 호출되는지 측정, 왜 안 불렸는지, 설명문 수정 전후 비교.
+description: Measures whether a plugin's skills get called and which skill takes each miss, on real prompts. 스킬이 호출되는지 측정, 왜 안 불렸는지, 설명문 수정 전후 비교.
 ---
 
 # route-test

@@ -391,7 +391,7 @@ def cmd_tally(a):
     for file in a.results:
         data = json.loads(Path(file).read_text(encoding="utf-8"))
         per = collections.defaultdict(lambda: [0, 0, 0, 0])
-        false_fires, misses, runs = [], [], 0
+        false_fires, misses, runs, negatives = [], [], 0, 0
         for case in data["cases"]:
             for run in case["arms"]["with"]:
                 runs += 1
@@ -400,6 +400,7 @@ def cmd_tally(a):
                 pattern = next((g["config"].get("input_match", "") for g in case["graders"] if g["name"] == "target"), "")
                 expected = m.group(1) if (m := re.search(r'\?([\w-]+)"$', pattern)) else None
                 if expected is None:
+                    negatives += 1
                     if took:
                         false_fires.append(f"{case['name']} -> {','.join(took)}")
                     continue
@@ -419,7 +420,7 @@ def cmd_tally(a):
                     misses.append(f"{case['name']} {expected} -> none")
         total, hit = sum(r[0] for r in per.values()), sum(r[1] for r in per.values())
         print(f"file\t{file}\truns\t{runs}\tcost\t{data.get('costUsd', 0):.2f}\tpartial\t{data.get('partial')}")
-        print(f"target\t{hit}/{total}")
+        print(f"target\t{hit}/{total}\tfalse_fires\t{len(false_fires)}/{negatives}")
         print("skill\tcases\thit\tother_skill\tcut_off\tno_skill")
         for skill, (n, h, other, cut) in sorted(per.items()):
             print(f"{skill}\t{n}\t{h}\t{other}\t{cut}\t{n - h - other - cut}")

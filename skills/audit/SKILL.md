@@ -1,6 +1,6 @@
 ---
 name: audit
-description: Reads a plugin's current structure and proposes merges, deletions, description fixes and repairs, never editing it. Use after a plugin has grown for a while, or when asked what to clean up or what breaks if a part is removed. 플러그인 구조 점검, 통폐합, 정리, 유지보수, 이거 지우면 뭐가 깨지나.
+description: Reads a plugin's current structure and proposes merges, deletions and repairs, without editing it. 플러그인 점검, 통폐합, 정리, 유지보수, 이거 지우면 뭐가 깨지나.
 ---
 
 # audit

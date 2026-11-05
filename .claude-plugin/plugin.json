@@ -1,6 +1,6 @@
 {
   "name": "phro-project",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Designer for project-specific plugins: reads a plugin's current structure each time, proposes consolidation and cleanup, and measures whether its skills are actually called.",
   "author": { "name": "thatshoon" },
   "homepage": "https://github.com/ThatsHoon/phro-project",
