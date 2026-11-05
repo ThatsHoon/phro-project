@@ -81,12 +81,25 @@ def dotted(rel):
     return ".".join(parts) if parts and all(p.isidentifier() for p in parts) else None
 
 
+def check_also(root, also):
+    """A move here rewrites the text under --also, so folders shared by every project and other projects' folders are refused."""
+    claude = Path.home().resolve() / ".claude"
+    projects = claude / "projects"
+    mine = projects / re.sub(r"[^A-Za-z0-9]", "-", str(Path(root).resolve()))
+    for folder in also:
+        shared = folder in (claude, projects, claude / "scheduled-tasks") or folder in claude.parents
+        other = projects in folder.parents and folder != mine and mine not in folder.parents
+        if shared or other:
+            sys.exit(f"--also {folder}: shared with other projects. Name this project's memory folder or one task's folder.")
+
+
 class Scan:
     """The project as read now: files, folders, and every reference that resolves to one of them."""
 
     def __init__(self, root, also=()):
         self.root = Path(root).resolve()
         self.also = [Path(a).expanduser().resolve() for a in also]
+        check_also(self.root, self.also)
         self.files, self.dirs, self.bulk = {}, set(), {}
         self.edges, self.fragile, self.undecodable = [], [], []
         self.suffix = collections.defaultdict(list)

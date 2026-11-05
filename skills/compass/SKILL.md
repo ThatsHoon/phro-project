@@ -11,6 +11,8 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/compass.py <command> <p
 
 A plugin hook prints `docs/core/README.md` at every session start and after every compaction, in every session and fork of the project. It is silent in a project without that file.
 
+These documents belong to one project. Use only the project at the given root: its files, its own memory folder and its own sessions. If this session has been working in another folder, stop and ask the user to open a session in the target project, so this conversation's context stays out of the documents. A scheduled run starts clean, so it goes ahead.
+
 ## The documents
 
 | File | Holds |
@@ -35,11 +37,11 @@ A plugin hook prints `docs/core/README.md` at every session start and after ever
 
 ## Init, when `docs/core` does not exist
 
-1. Harvest: the memory index and its goal entries, READMEs, existing indexes, the top folders (`restructure.py map` for a large project), and session titles if a session list tool exists.
+1. Harvest: the memory index and its goal entries, READMEs, existing indexes, the top folders (`restructure.py map` for a large project), and the titles of this project's sessions if a session list tool exists. Such a list can span every project, so keep only rows whose folder is this root.
 2. Propose the areas (at most 8) and the document list in one message, and wait for a yes. Take the final goal only from the user's words. If none exist, ask for it. Never infer one.
-3. Write the documents and `core.json`. Keep `sources` narrow, such as `svlm/*.py` and `~memory`, and put data folders in `skip`.
+3. Write the documents and `core.json`. Keep `sources` narrow, such as `src/*.py` and `~memory`, and put data folders in `skip`.
 4. Run `lint`, fix what it flags, then `stamp`.
-5. Offer a daily refresh. A scheduled task is standing configuration, so ask first. Create it with the scheduled task tool, using a self-contained prompt: `Run /phro-project:compass refresh for <absolute project root>. End with at most 5 lines.`
+5. Offer a daily refresh. A scheduled task is standing configuration, so ask first. Create one task per project, named after it, with the scheduled task tool and a self-contained prompt: `Run /phro-project:compass refresh for <absolute project root>. End with at most 5 lines.`
 
 ## Refresh, the default
 

@@ -4,11 +4,13 @@ Run: python -I -X utf8 tests/test_restructure.py
 """
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 SCRIPT = HERE / "scripts/restructure.py"
@@ -208,6 +210,21 @@ def demo():
             if rel.startswith("misc/"):
                 path.parent.rmdir()
         assert check().returncode == 0
+
+    with tempfile.TemporaryDirectory() as d, mock.patch.object(restructure.Path, "home", return_value=Path(d)):
+        home = Path(d).resolve()
+        projects = home / ".claude/projects"
+        tasks = home / ".claude/scheduled-tasks"
+        root = home / "work/b"
+        mine = projects / re.sub(r"[^A-Za-z0-9]", "-", str(root)) / "memory"
+        for shared in (tasks, projects, projects / "C--work-a/memory", home):
+            try:
+                restructure.check_also(root, [shared])
+            except SystemExit as stop:
+                assert "shared with other projects" in str(stop)
+            else:
+                raise AssertionError(shared)
+        restructure.check_also(root, [mine, tasks / "b-refresh", home / "elsewhere"])
     print("ok")
 
 

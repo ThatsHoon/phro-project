@@ -159,6 +159,24 @@ Fires when you ask. Nothing moves without your yes on the proposal.
 
 `undo` restores the moved files and the original text of every edited file.
 
+## One project at a time
+
+The code is installed once for the user. What it reads and writes about a project stays with that project.
+
+| What | Where |
+|---|---|
+| Core documents and their list | `<root>/docs/core` |
+| The `~memory` source | that root's own folder, `~/.claude/projects/<slug>/memory` |
+| Restructure plans and undo data | `<root>/.phro-project/restructure` |
+| Refused audit proposals | `<plugin>/.phro-project/rejected.md` |
+| Daily refresh | one scheduled task per project, naming its root |
+
+- The hook reads `docs/core` in the session's own project folder and never walks up. A project without it gets nothing, even inside another project.
+- `restructure` rewrites the text under `--also`, so it refuses the whole scheduled tasks folder, the projects folder and another project's folder.
+- `compass` stops when the session has been working in another folder, so that conversation's context stays out of the documents. Open a session in the target project instead.
+- `route-test` cases come from this project's own transcripts and stay with this project.
+- Nothing from a project ships in this plugin. Skills and tests use made-up examples.
+
 ## `project.py` commands
 
 Run as `python -I -X utf8 scripts/project.py <command>`.

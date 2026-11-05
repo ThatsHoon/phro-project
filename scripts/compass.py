@@ -45,7 +45,7 @@ def save(root, manifest):
 
 
 def memory_dir(root):
-    return Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path(root).resolve()))
+    return Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path(root).resolve())) / "memory"
 
 
 def source_files(root, pattern, skip):

@@ -4,17 +4,19 @@ Run: python -I -X utf8 tests/test_compass.py
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/compass.py"
 sys.path.insert(0, str(SCRIPT.parent))
 import compass  # noqa: E402
 
-GOALS = "# 목표\n\n## 최종 목표\n\n> 2026-11-05 사용자: 모델 다섯 개를 고성능으로 만든다\n\n## 중기 목표\n\n- 화재 먼저\n"
+GOALS = "# 목표\n\n## 최종 목표\n\n> 2026-11-05 사용자: 결제 API 다섯 개를 안정화한다\n\n## 중기 목표\n\n- 정산 먼저\n"
 
 
 def write(root, rel, text):
@@ -92,6 +94,24 @@ def demo():
         assert "long" in kinds(d)
         clean(d)
         assert compass.lint(d) == [], "a quoted date in goals.md stays allowed"
+
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home, mock.patch.object(compass.Path, "home", return_value=Path(home)):
+        clean(d)
+        project = Path(home) / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path(d).resolve()))
+        write(project, "memory/fact.md", "fact\n")
+        write(project, "not-memory.md", "a project-folder file that is not a memory\n")
+        assert [p.name for p in compass.source_files(d, "~memory", set())] == ["fact.md"], "~memory reads the memory folder only"
+        manifest = compass.load(d)
+        manifest["reviewed"] = {"goals.md": time.time() - 60}
+        manifest["docs"][0]["sources"] = ["~memory"]
+        assert [p.name for p in compass.stale(d, manifest)[0][1]] == ["fact.md"], "a changed memory makes its document stale"
+
+        with tempfile.TemporaryDirectory() as other:
+            assert run_hook(other).stdout == "", "another project gets nothing from this one"
+            assert list(compass.source_files(other, "~memory", set())) == [], "another project reads its own memory only"
+            inside = Path(d) / "vendor/other"
+            inside.mkdir(parents=True)
+            assert run_hook(inside).stdout == "", "a project inside this one gets nothing either"
     print("ok")
 
 

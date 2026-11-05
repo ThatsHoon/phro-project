@@ -14,7 +14,7 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
 Write `cases.json`: `[{"id": "c01", "skill": "name", "prompt": "..."}, {"id": "n01", "skill": null, "prompt": "..."}]`.
 
 Use these sources, best first:
-1. Typed commands: `project.py mine <transcripts_dir> cases.json --only a,b`. The user's own command is the label. The script drops anything pasted. Read the file and drop bare topics, which were arguments and not requests. Do this by a stated rule, and sample with a fixed seed.
+1. Typed commands: `project.py mine <transcripts_dir> cases.json --only a,b`, with this project's own transcripts folder only. Keep `cases.json` with this project too. The user's own command is the label. The script drops anything pasted. Read the file and drop bare topics, which were arguments and not requests. Do this by a stated rule, and sample with a fixed seed.
 2. Prompts written for the feature in the `design` skill.
 3. Your own prompts, only when neither exists. Write them before reading the description, and mark them as written by the author in the report.
 

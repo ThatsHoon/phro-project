@@ -46,7 +46,7 @@
  {"id": "ns1", "skill": null, "prompt": "이 함수 너무 길어. 리팩토링해줘"},
  {"id": "ns2", "skill": null, "prompt": "파일 하나 이름만 바꿔줘: util.py를 helpers.py로"},
  {"id": "ns3", "skill": null, "prompt": "임시 파일 지워줘"},
- {"id": "ns4", "skill": null, "prompt": "압축기 폴더가 어디 있어?"},
+ {"id": "ns4", "skill": null, "prompt": "결제 모듈 폴더가 어디 있어?"},
  {"id": "ns5", "skill": null, "prompt": "이 클래스 인터페이스 설계 좀 봐줘"},
  {"id": "ns6", "skill": null, "prompt": "다운로드 폴더 정리하는 파워쉘 스크립트 알려줘"},
  {"id": "ns7", "skill": null, "prompt": "이 모듈 테스트 코드 작성해줘"},

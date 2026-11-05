@@ -13,7 +13,7 @@ Be bold about the target and strict about the proof. The current layout never li
 
 ## 1. Read the project
 
-1. Run `map <root>`, adding `--also <folder>` for anything outside the project that names its paths, such as the Claude Code memory folder and scheduled tasks. Also read `.claude/settings*.json`, launch configs, cron lines and server paths that use these files.
+1. Run `map <root>`, adding `--also <folder>` for anything outside the project that names its paths: this project's own memory folder, and the folder of each scheduled task that works on this project. Never the whole scheduled tasks folder or another project's folder, since a move here would rewrite their text. The script refuses those. Also read `.claude/settings*.json`, launch configs, cron lines and server paths that use these files.
 2. Read the READMEs, and `docs/core` if it exists, to learn what each part is for. Read code where a cluster's purpose is unclear.
 3. Use the clusters, not the folders, as the map of real modules. Hubs are candidates for shared code. Folder cycles, code in docs, duplicates and backups show what the layout hides.
 
