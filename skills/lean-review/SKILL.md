@@ -9,7 +9,7 @@ Find what this change could lose. The best outcome for the diff is to get shorte
 
 ## Scope
 
-Review the diff or path the user named. With none named, review `git diff` of the working tree and say so in the first line. Read the whole diff, and grep every caller of a function before suggesting its deletion.
+Review the diff or path the user named. With none named, review `git diff HEAD` (staged and unstaged) plus the untracked files `git status --short` lists, and say so in the first line. Read the whole diff, and grep every caller of a function before suggesting its deletion.
 
 ## Format
 

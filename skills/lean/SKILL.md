@@ -9,7 +9,7 @@ A hook injects the sections below: Build, Answer and Switch into the main sessio
 
 ## Build
 
-Precedence, highest first: the user's own words and CLAUDE.md (language rules included); the harness and system prompt; process skills in use (TDD, brainstorming, plans); these rules.
+Precedence, highest first: the user's own words and CLAUDE.md (language rules included); the harness and system prompt; skills in use (TDD, brainstorming, plans, grill and the like), whose own formats win; these rules. In a subagent, the brief counts as the user's words: a step it names is needed.
 
 - Read the task and every file the change touches, and trace the real flow, before choosing a solution. Minimal applies to the solution, never to the reading.
 - Then take the first rung that holds: (1) is the change needed at all; (2) does it already exist in this codebase; (3) does the standard library do it; (4) does a native platform feature cover it; (5) does an installed dependency solve it; (6) can it be one line; (7) only then, the minimum code that works.
@@ -26,7 +26,7 @@ Precedence, highest first: the user's own words and CLAUDE.md (language rules in
 
 - The first line is the next action. When the user asked a question, the first line is the answer.
 - Multi-step work is a numbered list of single actions, the fewest steps that work.
-- When something is left open, end with one concrete next action. Ask a question once. Do not re-append a question the user has not answered; if it still blocks work, name it once in the state line.
+- When something is left open, end with one concrete next action. Ask a question at most once. Do not re-append a question the user has not answered; if it still blocks work, name it once in the state line.
 - One topic. Offer a second issue once, at the end, as a separate question.
 - On multi-step work restate the state ("step 3 of 5 done"); use the task tool when there is one.
 - Time estimates in concrete units.
@@ -40,11 +40,11 @@ Precedence, highest first: the user's own words and CLAUDE.md (language rules in
 ## Report
 
 - The first line is the status.
-- Long output goes to a file; the reply gives the path.
+- Long output goes to a file when you can write files and the brief allows it; the reply gives the path. Otherwise put it in the reply.
 - Do not restate the brief.
 - Quote only the log lines needed as evidence.
 - No progress narration.
-- Keep the reply within 20 lines unless the brief asks for more.
+- Keep the reply within 20 lines unless the brief asks for more; never drop a finding to fit.
 - Once you return, you are finished: no background waits, no re-sending the report.
 
 ## Switch

@@ -196,8 +196,18 @@ def lean_review_rules():
                                             "Does not apply the fixes"))
 
 
+def review_fixes():
+    """Final-review fixes: each phrase pins one finding."""
+    has_all("skills/lean/SKILL.md", ("Ask a question at most once",
+                                     "never drop a finding to fit",
+                                     "when you can write files and the brief allows it",
+                                     "skills in use (TDD, brainstorming, plans, grill and the like)",
+                                     "In a subagent, the brief counts as the user's words"))
+    has_all("skills/lean-review/SKILL.md", ("git diff HEAD", "untracked"))
+
+
 CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules,
-          toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules]
+          toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules, review_fixes]
 
 
 def main():
