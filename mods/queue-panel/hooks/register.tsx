@@ -172,7 +172,7 @@ export const register: Register = on => {
             <Text bold>Decided, not picked up ({decided.length})</Text>
             {decided.map(t => (
               <Text key={`ready-${t.id}`} color={t.changed_s > 86400 ? 'warning' : undefined}>
-                {t.title} <Text dimColor>· {who(t)} · decided {age(t.changed_s)} ago</Text>
+                {t.title} <Text dimColor>· {who(t)} · {t.dropped ? 'dropped' : 'decided'} {age(t.changed_s)} ago</Text>
               </Text>
             ))}
           </Box>

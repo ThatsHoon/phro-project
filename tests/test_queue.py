@@ -11,7 +11,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 HERE = Path(__file__).resolve().parents[1]
 SCRIPT = HERE / "scripts" / "queue.py"
@@ -146,7 +149,7 @@ def test_parallel():
         sha = git(root, "log", "--format=%H", "--diff-filter=A", "--", mine).split()[-1]
         files = git(root, "show", "--name-only", "--format=", sha).split()
         assert mine in files and other not in files, (mine, files)
-        assert set(files) <= {mine, "board.json", "inbox.html"}, files
+        assert set(files) <= {mine, "board.json"}, files
 
 
 def test_board():
@@ -225,22 +228,52 @@ def test_atomic():
     assert not list((root / "queue").glob("*.tmp"))
 
 
-def test_inbox():
+@contextmanager
+def served(root, port="0"):
+    p = subprocess.Popen([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "serve", str(root), "--port", port],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", env=ENV)
+    try:
+        line = p.stdout.readline()
+        assert line.startswith("SERVING\t"), line + (p.stderr.read() if p.poll() is not None else "")
+        yield line.split("\t")[1].strip().rstrip("/")
+    finally:
+        p.kill()
+        p.wait()
+
+
+def http(url, path, body=None, token=None, headers=()):
+    h = {"Content-Type": "application/json", **({"X-Queue-Token": token} if token else {}), **dict(headers)}
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    try:
+        with urlopen(Request(url + path, data=data, headers=h, method="GET" if body is None else "POST"), timeout=10) as r:
+            return r.status, r.read().decode("utf-8")
+    except HTTPError as e:
+        return e.code, e.read().decode("utf-8")
+
+
+def test_view():
     root = fresh()
     (root / "log.md").write_text("halfway there\n", encoding="utf-8")
-    path_of(ask(root, title="second <script>x</script>", question="Is this second?", priority="2"))
+    second = path_of(ask(root, title="second <script>x</script>", question="Is this second?\nline two", priority="2"))
     path_of(ask(root, title="first", question="Is this first?", priority="1"))
     run = path_of(ask(root, title="running", extra=("--link", "log.md")))
     path_of(q(root, "decide", run.stem, "--text", "go"))
     path_of(q(root, "move", run.stem, "doing"))
-    html = (root / "queue/inbox.html").read_text(encoding="utf-8")
-    assert html.index("first") < html.index("second &lt;script&gt;"), html
-    assert "<script>" not in html
-    assert "Is this first?" in html and "Is this second?" in html and "A: small" in html
-    assert html.index("In progress") < html.index("halfway there")
-    assert "http://" not in html and "https://" not in html
-    assert "<title>Work queue</title>" in html
-    assert "Core documents" not in html, "no docs/core, no section"
+    with served(root) as url:
+        code, page = http(url, "/")
+        assert code == 200 and "<title>Work queue</title>" in page
+        token = re.search(r'const TOKEN = "([^"]+)"', page).group(1)
+        assert token != "__TOKEN__" and len(token) > 20
+        assert "https://" not in page and "http://" not in page, "one self-contained page"
+        assert "innerHTML" not in page and "insertAdjacentHTML" not in page, "queue text is only ever set as text"
+        code, raw = http(url, "/api/view")
+        v = json.loads(raw)
+    titles = [t["title"] for t in v["tickets"]]
+    assert titles[0] == "first" and sorted(titles[1:]) == ["running", "second <script>x</script>"], titles
+    assert v["questions"][second.stem] == {"question": "Is this second?\nline two", "options": ["A: small", "B: large"]}
+    assert run.stem not in v["questions"], "only waiting tickets carry the full question"
+    assert {t["title"]: t for t in v["tickets"]}["running"]["last_line"] == "halfway there"
+    assert v["core"] is None and v["project"] == root.resolve().name
 
 
 def test_core_docs():
@@ -253,13 +286,43 @@ def test_core_docs():
                                                 "docs": [{"file": "goals.md", "brief": "what we aim at"},
                                                          {"file": "features/app.md", "brief": "the app"},
                                                          {"file": "gone.md", "brief": "deleted file"}]}), encoding="utf-8")
-    assert q(root, "board").returncode == 0
-    html = (root / "queue/inbox.html").read_text(encoding="utf-8")
-    sec = html[html.index("Core documents"):]
-    for s in ("Ship five &lt;b&gt;stable&lt;/b&gt; APIs.", "billing has no recent work", "goals.md", "what we aim at", "Final goal · Now",
-              "features/app.md", "The entry point is `src/app.py`.", "Flow · Traps", "3 d", "never reviewed", "gone.md", "missing"):
-        assert s in sec, s
-    assert "<b>stable</b>" not in html
+    with served(root) as url:
+        c = json.loads(http(url, "/api/view")[1])["core"]
+    assert c["goal"] == "Ship five <b>stable</b> APIs." and c["drift"] == "billing has no recent work"
+    docs = {d["file"]: d for d in c["docs"]}
+    assert docs["goals.md"]["brief"] == "what we aim at" and docs["goals.md"]["heads"] == ["Final goal", "Now"]
+    assert docs["goals.md"]["reviewed_days"] == 3 and docs["features/app.md"]["reviewed_days"] is None
+    assert docs["features/app.md"]["first"] == "The entry point is `src/app.py`." and docs["features/app.md"]["heads"] == ["Flow", "Traps"]
+    assert docs["gone.md"]["missing"] and not docs["goals.md"]["missing"]
+
+
+def test_serve_writes():
+    root = fresh()
+    (root / "queue/inbox.html").write_text("old page", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root / "queue"), "add", "inbox.html"], check=True)
+    subprocess.run(["git", "-C", str(root / "queue"), "commit", "-q", "-m", "old"], check=True, env=ENV)
+    t = path_of(ask(root, title="pick"))
+    gone = path_of(ask(root, title="stale"))
+    with served(root) as url:
+        assert not (root / "queue/inbox.html").exists() and "inbox.html" not in git(root, "ls-files"), "the old static page is retired"
+        token = re.search(r'const TOKEN = "([^"]+)"', http(url, "/")[1]).group(1)
+        assert http(url, "/api/decide", {"id": t.stem, "text": "A"})[0] == 403, "no token"
+        assert http(url, "/api/decide", {"id": t.stem, "text": "A"}, token="x" * 32)[0] == 403, "wrong token"
+        assert http(url, "/api/decide", {"id": t.stem, "text": "A"}, token, {"Origin": "https://evil.example"})[0] == 403
+        assert http(url, "/api/view", headers={"Host": "evil.example"})[0] == 403, "DNS rebinding: foreign Host"
+        assert http(url, "/api/decide", {"id": "../x", "text": "A"}, token)[0] == 400
+        assert http(url, "/api/decide", {"id": t.stem, "text": "  "}, token)[0] == 409
+        assert http(url, "/api/decide", {"id": f"{TODAY}-nope", "text": "A"}, token)[0] == 409
+        assert "status: needs-owner" in t.read_text(encoding="utf-8"), "refused writes change nothing"
+        assert http(url, "/api/decide", {"id": t.stem, "text": "A: small"}, token) == (200, '{"ok": true}')
+        assert "status: ready" in t.read_text(encoding="utf-8") and "decision: " in t.read_text(encoding="utf-8")
+        assert http(url, "/api/drop", {"id": gone.stem}, token)[0] == 200
+        assert "dropped by the owner" in gone.read_text(encoding="utf-8")
+        port = url.rsplit(":", 1)[1]
+        again = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "serve", str(root), "--port", port],
+                               capture_output=True, text=True, encoding="utf-8", env=ENV, timeout=20)
+        assert again.stdout == f"RUNNING\t{url}/\n", "a second serve for the same root reuses the running one"
+    assert not [r for r in board(root)["tickets"] if r["status"] == "needs-owner"]
 
 
 def test_session_ids():
@@ -354,14 +417,11 @@ def test_can_wait():
     block = path_of(ask(root, title="blocking"))
     rows = {t["title"]: t for t in board(root)["tickets"]}
     assert rows["can wait"]["can_wait"] and rows["can wait"]["default"] == "keep A and go on" and not rows["blocking"]["can_wait"]
-    html = (root / "queue/inbox.html").read_text(encoding="utf-8")
-    needs, later = html.index("Needs your answer (1)"), html.index("Can wait (1)")
-    assert needs < html.index("blocking") < later < html.index("can wait") and "keep A and go on" in html, html
     path_of(q(root, "decide", wait.stem, "--text", "self: kept A"))
     assert "status: done" in wait.read_text(encoding="utf-8"), "a self decision closes the ticket"
-    assert "Can wait" not in (root / "queue/inbox.html").read_text(encoding="utf-8")
+    assert [t["title"] for t in board(root)["tickets"] if t["status"] == "needs-owner"] == ["blocking"]
     path_of(q(root, "done", block.stem))
-    assert "Needs your answer (0)" in (root / "queue/inbox.html").read_text(encoding="utf-8")
+    assert board(root)["counts"]["needs-owner"] == 0
 
 
 def test_board_sessions():
@@ -380,14 +440,10 @@ def test_board_sessions():
     assert rows["for a"]["still_working"] and not rows["for b"]["still_working"]
     assert data["sessions"][gone]["gone"] and data["attention"]["gone"] == 1
     assert data["inbox"].endswith(":inbox")
-    html = (root / "queue/inbox.html").read_text(encoding="utf-8")
-    assert "Fire model work" in html and "still working" in html and "stopped" in html
-    assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-", html), "no full session id on the page"
     path_of(q(root, "decide", t_b.stem, "--text", "go"))
     os.utime(t_b, (time.time() - 2 * 86400,) * 2)
     data = json.loads((q(root, "board"), (root / "queue/board.json").read_text(encoding="utf-8"))[1])
     assert data["attention"]["stale_ready"] == 1
-    assert "Decided, not picked up (1)" in (root / "queue/inbox.html").read_text(encoding="utf-8")
 
 
 def test_drop():
@@ -395,9 +451,14 @@ def test_drop():
     t = path_of(ask(root, title="stale"))
     path_of(q(root, "drop", t.stem))
     text = t.read_text(encoding="utf-8")
-    assert "status: done" in text and f"decision: {TODAY} dropped by the owner" in text, text
-    assert "Needs your answer (0)" in (root / "queue/inbox.html").read_text(encoding="utf-8")
+    assert "status: ready" in text and f"decision: {TODAY} dropped by the owner" in text, text
+    assert not [r for r in board(root)["tickets"] if r["status"] == "needs-owner"], "gone from Needs your answer at once"
     assert f"drop {t.stem}" in git(root, "log", "-1", "--format=%s"), "kept in git, so move can reopen it"
+    pulled = hook(root, A, "UserPromptSubmit", "hi")
+    assert f"Ticket {t.stem} was dropped by the owner" in pulled and f"done \"{root.resolve().as_posix()}\" {t.stem}" in pulled, pulled
+    assert "decided for you" not in pulled and hook(root, B, "UserPromptSubmit", "hi") == "", "only the asking session hears it"
+    path_of(q(root, "done", t.stem))
+    assert hook(root, A, "UserPromptSubmit", "hi") == ""
     data = board(root)
     assert data["script"] == SCRIPT.as_posix() and data["root"] == root.resolve().as_posix(), "the panel's drop button runs these"
 

@@ -38,6 +38,7 @@ const BOARD = {
     ticket('b', 'needs-owner', 2, { session: B, still_working: false }),
     ticket('w', 'needs-owner', 2, { can_wait: true, default: 'keep A' }),
     ticket('r', 'ready', 2, { changed_s: 2 * 86400 }),
+    ticket('x', 'ready', 3, { dropped: true }),
     ticket('c', 'doing', 2, { last_line: 'step 3 done' }),
   ],
 }
@@ -67,7 +68,7 @@ test('sections in order, blocking only in Needs your answer, titles not ids, ans
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const text = await textOf(ui)
   const at = (s: string) => text.indexOf(s)
-  for (const s of ['Needs your answer (2)', 'Can wait (1)', 'Decided, not picked up (1)', 'In progress (1)', 'Sessions (2)']) expect(at(s)).toBeGreaterThan(-1)
+  for (const s of ['Needs your answer (2)', 'Can wait (1)', 'Decided, not picked up (2)', 'In progress (1)', 'Sessions (2)']) expect(at(s)).toBeGreaterThan(-1)
   expect(at('Needs your answer') < at('Can wait') && at('Can wait') < at('Decided, not picked up')).toBe(true)
   expect(at('Decided, not picked up') < at('In progress') && at('In progress') < at('Sessions')).toBe(true)
   expect(at('title a') < at('title b') && at('title b') < at('Can wait')).toBe(true)
@@ -75,6 +76,7 @@ test('sections in order, blocking only in Needs your answer, titles not ids, ans
   expect(text).toContain('Fire model work')
   expect(text).toContain('stopped')
   expect(text).toContain('decided 2d ago')
+  expect(text).toContain('title x · Fire model work · dropped 10m ago')
   expect(text).toContain('step 3 done')
   expect(text).toContain('1 with the asking session gone')
   expect(text).toContain('Done in 7 days: 4')

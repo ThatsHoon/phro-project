@@ -8,6 +8,7 @@ export type Ticket = {
   changed_s: number
   returns: number
   can_wait: boolean
+  dropped?: boolean
   default: string
   question: string
   still_working: boolean

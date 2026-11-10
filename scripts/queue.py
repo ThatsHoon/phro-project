@@ -2,7 +2,7 @@
 """The project's queue of owner decisions. Standard library only.
 
 Tickets are Markdown files in <root>/queue/, its own git repository. This script is the only writer: every write
-regenerates board.json (and inbox.html) and commits only its own paths, so sessions writing at once never commit
+regenerates board.json and commits only its own paths, so sessions writing at once never commit
 each other's files. Output is paths and counts, never ticket bodies.
 
   queue.py init <root>
@@ -14,6 +14,7 @@ each other's files. Output is paths and counts, never ticket bodies.
   queue.py board <root>
   queue.py deliver <root> <id>     prints SEND<TAB>local_<UUID><TAB><message> for the asking session
   queue.py sessions <root>         repairs ticket session values to bare UUIDs
+  queue.py serve <root> [--port N] the board page (ui/board.html) on 127.0.0.1, read live, answers and drops written through
   queue.py hook                    SessionStart / UserPromptSubmit hook: event JSON on stdin
 """
 import argparse
@@ -33,6 +34,7 @@ OPTIONAL = ("default",)  # tickets written before it still parse
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 TICKET_ID = re.compile(r"\b\d{8}-[a-z0-9-]+\b")
 SELF = "self:"
+DROPPED = "dropped by the owner"
 HOOK_LINES = 10
 WORKING_S = 600  # a transcript written this recently counts as a working session
 CLOSE_OR_SHRINK = "Close this ticket or shrink it to one step?"
@@ -219,6 +221,7 @@ def board(root):
         rows.append({"id": t["id"], "title": t["title"], "status": t["status"], "priority": t["priority"],
                      "session": t["session"], "age_s": age_of(root, path), "changed_s": int(now - changed), "returns": t["returns"],
                      "can_wait": bool(t["default"]), "default": t["default"],
+                     "dropped": t["status"] == "ready" and bool(t["decisions"]) and t["decisions"][-1].endswith(DROPPED),
                      "question": t["question"][:300] if t["status"] == "needs-owner" else "",
                      "last_line": last_line(root, t["links"]) if t["status"] in ("doing", "verify") else ""})
     rows.sort(key=lambda r: (r["priority"], -r["age_s"]))
@@ -236,38 +239,17 @@ def board(root):
             "script": Path(__file__).resolve().as_posix(), "root": Path(root).resolve().as_posix(),
             "attention": attention, "sessions": sessions, "tickets": rows}
     write_atomic(qdir(root) / "board.json", json.dumps(data, ensure_ascii=False, indent=1) + "\n")
-    render_inbox(root, data)
     return data
 
 
-PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Work queue</title>
-<style>
-:root { --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --card: #ffffff; --line: #e7e5e4; --accent: #b45309; }
-@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --card: #292524; --line: #44403c; --accent: #f59e0b; } }
-:root[data-theme="dark"] { --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --card: #292524; --line: #44403c; --accent: #f59e0b; }
-body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
-main { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
-h1 { font-size: 20px; margin: 0 0 4px; } h2 { font-size: 15px; margin: 28px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 8px 0; overflow-wrap: anywhere; }
-.meta { color: var(--muted); font-size: 13px; } .p1 { border-left: 4px solid var(--accent); }
-ul { margin: 6px 0 0; padding-left: 20px; } p { margin: 6px 0; }
-</style></head><body><main>
-<h1>Work queue</h1><div class="meta">{stamp}</div>
-{sections}
-</main></body></html>
-"""
-
-
-def core_section(root):
-    """A rough map of docs/core: the final goal, the drift line, and per document its brief, headings and first sentence. Empty without core.json."""
-    from html import escape
+def core_data(root):
+    """docs/core at a glance for the board page: final goal, drift, and per document its brief, headings, first line and review age.
+    None without core.json."""
     core = Path(root) / "docs/core"
     try:
         manifest = json.loads((core / "core.json").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return ""
+        return None
     def text_of(name):
         try:
             return (core / name).read_text(encoding="utf-8-sig")
@@ -276,93 +258,129 @@ def core_section(root):
     lines_of = lambda text: [l.strip() for l in text.splitlines() if l.strip()]
     goals = text_of("goals.md") or ""
     goal = next((l.lstrip("> ").strip() for l in lines_of(goals.split("\n## ", 2)[1] if "\n## " in goals else "")[1:]), "")
-    top = "".join(f"<p><b>{label}</b> {escape(value)}</p>" for label, value in (("Final goal", goal), ("Drift", manifest.get("drift") or ""))
-                  if value)
-    cards = []
+    docs = []
     for doc in manifest.get("docs", []):
         name = str(doc.get("file", ""))
         text = text_of(name)
         reviewed = (manifest.get("reviewed") or {}).get(name)
-        age = "never reviewed" if not reviewed else f"reviewed {int((time.time() - reviewed) // 86400)} d ago"
-        if text is None:
-            cards.append(f'<div class="card"><b>{escape(name)}</b> <span class="meta">missing</span><p>{escape(str(doc.get("brief", "")))}</p></div>')
-            continue
-        body = lines_of(text)
-        heads = [l[3:] for l in body if l.startswith("## ")]
-        first = next((l for l in body if not l.startswith("#")), "")
-        cards.append(f'<div class="card"><b>{escape(name)}</b> <span class="meta">{escape(str(doc.get("brief", "")))}</span>'
-                     f'<div class="meta">{len(text.splitlines())} lines · {age}</div>'
-                     + (f'<p class="meta">{escape(" · ".join(heads[:8]))}</p>' if heads else "")
-                     + (f"<p>{escape(first[:200])}</p>" if first else "") + "</div>")
-    return f"<h2>Core documents ({len(cards)})</h2>{top}" + "".join(cards)
+        row = {"file": name, "brief": str(doc.get("brief", "")), "missing": text is None,
+               "reviewed_days": int((time.time() - reviewed) // 86400) if reviewed else None}
+        if text is not None:
+            body = lines_of(text)
+            row.update(lines=len(text.splitlines()), heads=[l[3:] for l in body if l.startswith("## ")][:8],
+                       first=next((l for l in body if not l.startswith("#")), "")[:200])
+        docs.append(row)
+    return {"goal": goal, "drift": str(manifest.get("drift") or ""), "docs": docs}
 
 
-def ago(s):
-    s = max(0, int(s))
-    return f"{s // 86400} d" if s >= 86400 else f"{s // 3600} h" if s >= 3600 else f"{max(1, s // 60)} m"
-
-
-def render_inbox(root, data):
-    """One self-contained page, in the panel's order. Every ticket field is escaped."""
-    from html import escape
-    sessions = data.get("sessions", {})
-    who = lambda t: escape(sessions.get(t["session"], {}).get("title") or t["session"][:8])
-    by_id = {}
+def view(root):
+    """What the board page draws: board.json, plus each waiting question in full with its options, plus the core documents map."""
+    data = board(root)
+    questions = {}
     for t in data["tickets"]:
         if t["status"] == "needs-owner":
             try:
-                by_id[t["id"]] = read_ticket(qdir(root) / "tickets" / f"{t['id']}.md")
+                full = read_ticket(qdir(root) / "tickets" / f"{t['id']}.md")
+                questions[t["id"]] = {"question": full["question"], "options": full["options"]}
             except (ValueError, OSError):
                 pass
-    blocking, can_wait, decided, running = [], [], [], []
-    for t in data["tickets"]:
-        meta = f'<div class="meta">P{t["priority"]} · {who(t)} · {ago(t["age_s"])} · {t["id"]}</div>'
-        if t["status"] == "needs-owner" and t["id"] in by_id:
-            full = by_id[t["id"]]
-            opts = "".join(f"<li>{escape(o)}</li>" for o in full["options"])
-            if t.get("can_wait"):
-                can_wait.append(f'<div class="card"><b>{escape(t["title"])}</b>{meta}<p>{escape(full["question"])}</p><ul>{opts}</ul>'
-                                f'<p class="meta">Without an answer: {escape(t["default"])}</p></div>')
-            else:
-                state = "still working" if t.get("still_working") else "stopped"
-                blocking.append(f'<div class="card{" p1" if t["priority"] == 1 else ""}"><b>{escape(t["title"])}</b>{meta}'
-                                f'<p>{escape(full["question"])}</p><ul>{opts}</ul><p class="meta">Session {state}</p></div>')
-        elif t["status"] == "ready":
-            late = " p1" if t.get("changed_s", 0) > 86400 else ""
-            decided.append(f'<div class="card{late}"><b>{escape(t["title"])}</b> <span class="meta">decided {ago(t.get("changed_s", 0))} ago, '
-                           f'not picked up</span>{meta}</div>')
-        elif t["status"] in ("doing", "verify"):
-            running.append(f'<div class="card"><b>{escape(t["title"])}</b> <span class="meta">{t["status"]}</span>{meta}'
-                           f'<p>{escape(t["last_line"])}</p></div>')
-    now = data["generated"]
-    people = []
-    for sid, s in sessions.items():
-        mine = [t for t in data["tickets"] if t["session"] == sid and t["status"] != "done"]
-        state = "gone" if s["gone"] else "working" if now - (s["last_active"] or 0) < WORKING_S else f"idle {ago(now - s['last_active'])}"
-        people.append(f'<p><b>{escape(s["title"])}</b> <span class="meta">{state} · {len(mine)} open</span></p>')
-    at = data.get("attention", {})
-    notes = [f"{n} {label}" for n, label in ((at.get("gone", 0), "with the asking session gone"), (at.get("returned", 0), "returned 3 times"),
-                                             (data["counts"].get("blocked", 0), "blocked")) if n]
-    sections = "\n".join(s for s in [
-        f"<h2>Needs your answer ({len(blocking)})</h2>" + ("".join(blocking) or '<p class="meta">Nothing is waiting on you.</p>'),
-        f"<details><summary><h2 style=\"display:inline\">Can wait ({len(can_wait)})</h2></summary>{''.join(can_wait)}</details>" if can_wait else "",
-        f"<h2>Decided, not picked up ({len(decided)})</h2>" + "".join(decided) if decided else "",
-        f"<h2>In progress ({len(running)})</h2>" + "".join(running) if running else "",
-        f"<h2>Sessions ({len(people)})</h2>" + "".join(people) if people else "",
-        f"<h2>Attention</h2><p>{' · '.join(notes)}</p>" if notes else "",
-        f"<h2>Done in 7 days</h2><p>{data['closed_7d']}</p>" if data["closed_7d"] else "",
-        core_section(root),
-    ] if s)
-    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(data["generated"]))
-    path = qdir(root) / "inbox.html"
-    write_atomic(path, PAGE.replace("{stamp}", stamp).replace("{sections}", sections))
-    return path
+    return {**data, "questions": questions, "core": core_data(root), "project": Path(root).resolve().name}
+
+
+def cmd_serve(a):
+    """The board page on 127.0.0.1. Reads come from queue/ and docs/core on every request; answers and drops go through the
+    same functions as the command line. Writes need the token the page was served with and a local Host and Origin."""
+    import secrets
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.request import urlopen
+    root, token, lock = Path(a.root), secrets.token_urlsafe(24), threading.Lock()
+    try:
+        with urlopen(f"http://127.0.0.1:{a.port}/api/ping", timeout=1) as r:  # a server for this root already runs there
+            if a.port and json.loads(r.read()).get("root") == root.resolve().as_posix():
+                print(f"RUNNING\thttp://127.0.0.1:{a.port}/", flush=True)
+                return None
+    except (OSError, ValueError):
+        pass
+    page = (PLUGIN / "ui/board.html").read_text(encoding="utf-8").replace("__TOKEN__", token)
+    old = qdir(root) / "inbox.html"  # the static page this server replaces
+    if old.exists():
+        old.unlink()
+        git(root, "rm", "-q", "--cached", "--ignore-unmatch", "inbox.html", check=False)
+        git(root, "commit", "-q", "-m", "board page is served now", "--", "inbox.html", check=False)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def local(self):
+            port = self.server.server_address[1]
+            hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+            origin = self.headers.get("Origin")
+            return self.headers.get("Host") in hosts and (origin is None or origin.split("//", 1)[-1] in hosts)
+
+        def send(self, code, body, kind="application/json; charset=utf-8"):
+            raw = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", kind)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            if not self.local():
+                return self.send(403, {"error": "local requests only"})
+            if self.path in ("/", "/index.html"):
+                return self.send(200, page.encode("utf-8"), "text/html; charset=utf-8")
+            if self.path == "/api/ping":
+                return self.send(200, {"root": root.resolve().as_posix()})
+            if self.path == "/api/view":
+                with lock:
+                    return self.send(200, view(root))
+            self.send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if not self.local() or not secrets.compare_digest(self.headers.get("X-Queue-Token", ""), token):
+                return self.send(403, {"error": "this page is out of date: reload it"})
+            try:
+                body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)) or b"{}")
+                tid, text = str(body.get("id", "")), str(body.get("text", "")).strip()
+            except (ValueError, AttributeError):
+                return self.send(400, {"error": "bad request"})
+            if not re.fullmatch(r"\d{8}-[a-z0-9-]+", tid):
+                return self.send(400, {"error": "bad ticket id"})
+            act = argparse.Namespace(root=root, id=tid, text=text, priority=None)
+            try:
+                with lock:
+                    if self.path == "/api/decide":
+                        if not text:
+                            raise Refused("write an answer or pick an option")
+                        cmd_decide(act)
+                    elif self.path == "/api/drop":
+                        cmd_drop(act)
+                    else:
+                        return self.send(404, {"error": "not found"})
+            except (Refused, ValueError) as e:
+                return self.send(409, {"error": str(e)})
+            self.send(200, {"ok": True})
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+    except OSError:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)  # the port is taken by something else
+    print(f"SERVING\thttp://127.0.0.1:{server.server_address[1]}/", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return None
 
 
 def commit(root, message, paths):
     """Commit only these paths. Another session may hold the index lock or be replacing board.json, so retry."""
     board(root)
-    paths = [p for p in [*paths, "board.json", "inbox.html"] if (qdir(root) / p).exists()]
+    paths = [p for p in [*paths, "board.json"] if (qdir(root) / p).exists()]
     for _ in range(10):
         add = git(root, "add", "--", *paths, check=False)
         r = add if add.returncode else git(root, "commit", "-q", "-m", message, "--", *paths, check=False)
@@ -484,12 +502,12 @@ def cmd_done(a):
 
 
 def cmd_drop(a):
-    """The owner removes a question from the list. The ticket closes with a record line, so git keeps it and move can reopen it."""
+    """The owner removes a question. It leaves Needs your answer at once; the asking session's hook pulls the drop like a decision,
+    and that session closes the ticket. git keeps it, so move can reopen it."""
     path = ticket_path(a.root, a.id)
     t = read_ticket(path)
-    # lean: only deliver tells the asking session; the hook does not pull a drop | when: a blocking session sits stopped on a dropped ticket | fix: pull dropped tickets in the hook like decided ones
-    t["decisions"].append(f"{time.strftime('%Y%m%d')} dropped by the owner")
-    set_status(t, "done")
+    t["decisions"].append(f"{time.strftime('%Y%m%d')} {DROPPED}")
+    set_status(t, "ready")
     return save(a.root, path, t, f"drop {path.stem}"), None
 
 
@@ -572,7 +590,10 @@ def hook_lines(event):
     for t in rows:
         if t.get("session") == sid and t.get("status") == "ready":
             path = (qdir(root) / "tickets" / f"{t['id']}.md").as_posix()
-            out.append(f"Ticket {t['id']} was decided for you: read {path}, then run {queue} move {r} {t['id']} doing.")
+            if t.get("dropped"):
+                out.append(f"Ticket {t['id']} was dropped by the owner: stop waiting on it and do not do its work. Close it with {queue} done {r} {t['id']}.")
+            else:
+                out.append(f"Ticket {t['id']} was decided for you: read {path}, then run {queue} move {r} {t['id']} doing.")
     if name == "UserPromptSubmit":
         by_id = {t["id"]: t for t in rows}
         for tid in dict.fromkeys(TICKET_ID.findall(str(event.get("prompt") or ""))):
@@ -621,6 +642,8 @@ def main(argv=None):
     s = sub.add_parser("board"); s.add_argument("root"); s.set_defaults(fn=cmd_board)
     s = sub.add_parser("deliver"); s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_deliver)
     s = sub.add_parser("sessions"); s.add_argument("root"); s.set_defaults(fn=cmd_sessions)
+    s = sub.add_parser("serve", help="the board page on 127.0.0.1, read live from queue/ and docs/core")
+    s.add_argument("root"); s.add_argument("--port", type=int, default=8765); s.set_defaults(fn=cmd_serve)
     a = p.parse_args(argv)
     a.root = Path(a.root).resolve()
     if a.cmd != "init" and not (qdir(a.root) / ".git").is_dir():

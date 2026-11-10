@@ -47,6 +47,13 @@ def demo():
             (path / "src/app.py").write_text("print(1)\n", encoding="utf-8")
             return path
 
+        if (original / clone.ORIGIN).is_file():  # run from a project's copy: turn the copied tree back into an original
+            (original / clone.ORIGIN).unlink()
+            (original / clone.MARKET).unlink(missing_ok=True)
+            data = json.loads((original / clone.MANIFEST).read_text(encoding="utf-8"))
+            (original / clone.MANIFEST).write_text(json.dumps({**data, "name": "phro-project"}), encoding="utf-8")
+            shutil.rmtree(original / ".in_use", ignore_errors=True)
+
         before = tree(original)
         app = project("work/demo-app")
         out = ensure(original, app)

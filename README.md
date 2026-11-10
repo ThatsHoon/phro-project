@@ -401,13 +401,15 @@ Then type `/reload-plugins` in a running session.
 
 Sessions and forks that need the owner's decision file a ticket instead of waiting in a chat nobody reads. Tickets are Markdown files in `<project>/queue/`, its own git repository; `scripts/queue.py` is the only writer and commits only the paths it wrote, so sessions writing at once never commit each other's files.
 
-- `/phro-project:init`: once per project. Makes the project's copy, the queue, the first inbox page (a private Artifact) and turns on the panel.
+- `/phro-project:init`: once per project. Makes the project's copy and the queue, and turns on the panel.
 - Routing by exact id: `queue.py hook` runs at session start and on every prompt. At start it gives the session the rule with its own id (`ask ... --session <UUID>`) and lists its open tickets. On every prompt it pulls this session's decided tickets ("decided for you: read <path>"), and when the prompt names another session's ticket id it says whose it is and how to record and deliver the answer without doing that work here. Tickets store the bare transcript UUID; `queue.py sessions` repairs older values.
 - Blocking or not: `ask --default "<what I do without an answer>"` makes a ticket can-wait, so only tickets that stop a session show as needing an answer. A session that went past its own ticket closes it with `done` or `decide --text "self: ..."`.
 - `/phro-project:inbox [id]`: walks the waiting tickets one at a time, highest priority first, records each answer and sends what `queue.py deliver` prints to the asking session.
 - A decided question is not asked again. A ticket returned three times becomes the question "close it or shrink it to one step".
 
-`queue.py` commands: `init`, `ask`, `decide`, `move`, `done`, `drop`, `board`, `deliver`, `sessions`, `hook`; each prints `OK`, `SEND` or `REFUSED` with a path, never a ticket body.
+- The board page: `ui/board.html`, one self-contained file. `queue.py serve <project> [--port 8765]` hands it out on 127.0.0.1 and fills it on each refresh (every 10 s) from `queue/` and `docs/core/`: waiting questions with their options, a free answer box and a two-press drop, can-wait, decided, in progress, sessions and the core documents map. Answers and drops go through `decide` and `drop`; writes need the token the page was served with and a local Host and Origin. Nothing is published. The `show` skill starts it through `<project>/.claude/launch.json` and opens it in the browser pane.
+
+`queue.py` commands: `init`, `ask`, `decide`, `move`, `done`, `drop`, `board`, `deliver`, `sessions`, `serve`, `hook`; each prints `OK`, `SEND` or `REFUSED` with a path, never a ticket body.
 
 ### The queue panel
 

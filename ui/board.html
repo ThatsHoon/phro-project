@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Work queue</title>
+<style>
+/* Layout: one reading column; decisions first, then work in flight, then the core documents map. */
+:root {
+  --bg: #f6f7f5; --surface: #ffffff; --fg: #1d2421; --muted: #66706b; --line: #dfe3e0;
+  --accent: #1f6f5c; --accent-fg: #ffffff; --warn: #a1500f; --warn-bg: #fbefe4; --danger: #a1262b;
+  --sans: "Segoe UI", system-ui, -apple-system, sans-serif; --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #141917; --surface: #1c2320; --fg: #e6ebe8; --muted: #9aa5a0; --line: #2e3833;
+  --accent: #5fbfa4; --accent-fg: #0d1513; --warn: #f0a35e; --warn-bg: #2f2418; --danger: #f07a7f; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #141917; --surface: #1c2320; --fg: #e6ebe8; --muted: #9aa5a0; --line: #2e3833;
+  --accent: #5fbfa4; --accent-fg: #0d1513; --warn: #f0a35e; --warn-bg: #2f2418; --danger: #f07a7f; color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 var(--sans); }
+main { max-width: 780px; margin: 0 auto; padding-block: 24px 48px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 28px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+h1 { font-size: 22px; margin: 0; text-wrap: balance; }
+h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+section { display: grid; gap: 10px; min-width: 0; }
+.meta { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: grid; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+.card.p1 { border-color: var(--warn); }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chip { font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.chip.p1 { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
+.chip.stop { color: var(--danger); border-color: var(--danger); }
+.title { font-weight: 600; }
+.q { white-space: pre-wrap; margin: 0; }
+button { font: inherit; font-size: 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); padding: 5px 12px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+button.armed { color: var(--danger); border-color: var(--danger); }
+input[type=text] { font: inherit; flex: 1 1 220px; min-width: 0; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+.line { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.line:last-child { border-bottom: 0; }
+.late { color: var(--warn); }
+details > summary { cursor: pointer; list-style: none; }
+details > summary h2 { display: inline; }
+details > summary::before { content: "▸ "; color: var(--muted); }
+details[open] > summary::before { content: "▾ "; }
+.empty { color: var(--muted); }
+.error { color: var(--danger); font-size: 13px; }
+.doc .heads { color: var(--muted); font-size: 13px; }
+.file { font-family: var(--mono); font-size: 13px; }
+@media (prefers-reduced-motion: no-preference) { .card { transition: border-color .15s; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="name">Work queue</h1>
+    <span class="meta" id="stamp">loading…</span>
+  </header>
+  <div id="error" class="error" hidden></div>
+  <div id="body" style="display:grid; gap:28px"></div>
+</main>
+<script>
+// Served by queue.py serve, which fills in the token. Every value from the queue is set as text, never as HTML.
+const TOKEN = "__TOKEN__";
+const EVERY_MS = 10000;
+const WORKING_S = 600;
+let armed = null;     // ticket id whose drop button waits for its second press
+let last = null;
+
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v; else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) if (k !== null && k !== undefined && k !== false) n.append(k instanceof Node ? k : String(k));
+  return n;
+};
+const age = s => s >= 86400 ? `${Math.floor(s / 86400)}d` : s >= 3600 ? `${Math.floor(s / 3600)}h` : `${Math.max(1, Math.floor(s / 60))}m`;
+
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Queue-Token": TOKEN }, body: JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `failed (${r.status})`);
+}
+
+async function act(path, body, note) {
+  try { await post(path, body); armed = null; await load(true); }
+  catch (e) { note.textContent = e.message; note.hidden = false; }
+}
+
+function waiting(v, t, full) {
+  const sessions = v.sessions || {};
+  const who = (sessions[t.session] || {}).title || t.session.slice(0, 8);
+  const note = el("div", { class: "error", hidden: "" });
+  const input = el("input", { type: "text", id: `answer-${t.id}`, placeholder: "Your answer", "aria-label": `Answer to ${t.title}` });
+  input.addEventListener("keydown", e => { if (e.key === "Enter" && input.value.trim()) act("/api/decide", { id: t.id, text: input.value.trim() }, note); });
+  const drop = el("button", { class: armed === t.id ? "armed" : "", onclick: () => {
+    if (armed !== t.id) { armed = t.id; render(last); return; }
+    act("/api/drop", { id: t.id }, note);
+  } }, armed === t.id ? "Confirm drop" : "Drop");
+  return el("div", { class: `card${t.priority === 1 ? " p1" : ""}` },
+    el("div", { class: "row" },
+      el("span", { class: `chip${t.priority === 1 ? " p1" : ""}` }, `P${t.priority}`),
+      el("span", { class: "title" }, t.title)),
+    el("p", { class: "q" }, full ? full.question : t.question),
+    full && full.options.length ? el("div", { class: "row" }, full.options.map(o =>
+      el("button", { onclick: () => act("/api/decide", { id: t.id, text: o }, note) }, o))) : null,
+    el("div", { class: "row" }, input,
+      el("button", { class: "primary", onclick: () => input.value.trim() && act("/api/decide", { id: t.id, text: input.value.trim() }, note) }, "Answer"),
+      drop),
+    t.can_wait ? el("div", { class: "meta" }, `Without an answer: ${t.default}`) : null,
+    el("div", { class: "row meta" },
+      el("span", {}, who),
+      t.can_wait ? null : el("span", { class: t.still_working ? "chip" : "chip stop" }, t.still_working ? "still working" : "stopped"),
+      el("span", {}, `asked ${age(t.age_s)} ago`), el("span", { class: "file" }, t.id)),
+    note);
+}
+
+function render(v) {
+  if (!v) return;
+  const body = document.getElementById("body");
+  const focused = document.activeElement && document.activeElement.id;
+  const typed = Object.fromEntries([...document.querySelectorAll("input[id^=answer-]")].map(i => [i.id, i.value]));
+  const open = document.getElementById("canwait")?.open || false;
+  const sessions = v.sessions || {};
+  const who = t => (sessions[t.session] || {}).title || t.session.slice(0, 8);
+  const q = v.questions || {};
+  const needs = v.tickets.filter(t => t.status === "needs-owner" && !t.can_wait);
+  const later = v.tickets.filter(t => t.status === "needs-owner" && t.can_wait);
+  const decided = v.tickets.filter(t => t.status === "ready");
+  const running = v.tickets.filter(t => t.status === "doing" || t.status === "verify");
+  const people = Object.entries(sessions);
+  const at = v.attention || {};
+  const notes = [[at.gone, "with the asking session gone"], [at.returned, "returned 3 times"], [v.counts.blocked, "blocked"]].filter(([n]) => n).map(([n, s]) => `${n} ${s}`);
+  const parts = [
+    el("section", {}, el("h2", {}, `Needs your answer (${needs.length})`),
+      needs.length ? needs.map(t => waiting(v, t, q[t.id])) : el("p", { class: "empty" }, "Nothing is waiting on you.")),
+    later.length ? el("details", { id: "canwait", ...(open ? { open: "" } : {}) },
+      el("summary", {}, el("h2", {}, `Can wait (${later.length})`)),
+      el("section", { style: "margin-top:10px" }, later.map(t => waiting(v, t, q[t.id])))) : null,
+    decided.length ? el("section", {}, el("h2", {}, `Decided, not picked up (${decided.length})`),
+      el("div", { class: "card" }, decided.map(t => el("div", { class: "line" },
+        el("span", { class: "title" }, t.title),
+        el("span", { class: `meta${t.changed_s > 86400 ? " late" : ""}` }, `${who(t)} · ${t.dropped ? "dropped" : "decided"} ${age(t.changed_s)} ago`))))) : null,
+    running.length ? el("section", {}, el("h2", {}, `In progress (${running.length})`),
+      el("div", { class: "card" }, running.map(t => el("div", { class: "line" },
+        el("span", { class: "title" }, t.title), el("span", { class: "meta" }, `${t.status} · ${who(t)}`),
+        t.last_line ? el("span", { class: "meta" }, t.last_line) : null)))) : null,
+    people.length ? el("section", {}, el("h2", {}, `Sessions (${people.length})`),
+      el("div", { class: "card" }, people.map(([sid, s]) => {
+        const n = v.tickets.filter(t => t.session === sid && t.status !== "done").length;
+        const state = s.gone ? "gone" : v.generated - (s.last_active || 0) < WORKING_S ? "working" : `idle ${age(v.generated - (s.last_active || 0))}`;
+        return el("div", { class: "line" }, el("span", { class: "title" }, s.title || sid.slice(0, 8)), el("span", { class: "meta" }, `${state} · ${n} open`));
+      }))) : null,
+    notes.length ? el("section", {}, el("h2", {}, "Attention"), el("p", { class: "late", style: "margin:0" }, notes.join(" · "))) : null,
+    v.closed_7d ? el("p", { class: "meta", style: "margin:0" }, `Done in 7 days: ${v.closed_7d}`) : null,
+    v.core ? el("section", {}, el("h2", {}, `Core documents (${v.core.docs.length})`),
+      v.core.goal ? el("p", { style: "margin:0" }, el("b", {}, "Final goal "), v.core.goal) : null,
+      v.core.drift ? el("p", { style: "margin:0" }, el("b", {}, "Drift "), v.core.drift) : null,
+      v.core.docs.map(d => el("div", { class: "card doc" },
+        el("div", { class: "row" }, el("span", { class: "file" }, d.file), el("span", { class: "meta" }, d.brief)),
+        d.missing ? el("span", { class: "late" }, "missing") : el("div", { class: "meta" },
+          `${d.lines} lines · ${d.reviewed_days === null ? "never reviewed" : `reviewed ${d.reviewed_days} d ago`}`),
+        d.heads && d.heads.length ? el("div", { class: "heads" }, d.heads.join(" · ")) : null,
+        d.first ? el("div", {}, d.first) : null))) : null,
+  ];
+  body.replaceChildren(...parts.filter(Boolean));
+  for (const [id, value] of Object.entries(typed)) { const i = document.getElementById(id); if (i) i.value = value; }
+  if (focused) document.getElementById(focused)?.focus();
+  document.getElementById("name").textContent = `Work queue · ${v.project}`;
+  document.title = `Work queue · ${v.project}`;
+  document.getElementById("stamp").textContent = `updated ${new Date(v.generated * 1000).toLocaleTimeString()}`;
+}
+
+async function load(force = false) {
+  // leave the page alone while the owner types or has a drop armed
+  const typing = [...document.querySelectorAll("input[id^=answer-]")].some(i => i.value);
+  if (!force && (typing || armed)) return;
+  const error = document.getElementById("error");
+  try {
+    const r = await fetch("/api/view", { cache: "no-store" });
+    if (!r.ok) throw new Error(`the queue server answered ${r.status}`);
+    last = await r.json();
+    error.hidden = true;
+    render(last);
+  } catch (e) {
+    error.textContent = `Cannot read the queue: ${e.message}. Is queue.py serve still running?`;
+    error.hidden = false;
+  }
+}
+load(true);
+setInterval(load, EVERY_MS);
+</script>
+</body>
+</html>
