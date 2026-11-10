@@ -10,6 +10,7 @@ each other's files. Output is paths and counts, never ticket bodies.
   queue.py decide <root> <id> --text T [--priority N]
   queue.py move <root> <id> <status> [--priority N] [--session UUID]
   queue.py done <root> <id>
+  queue.py drop <root> <id>        the owner removes a waiting question (closed with a record line)
   queue.py board <root>
   queue.py deliver <root> <id>     prints SEND<TAB>local_<UUID><TAB><message> for the asking session
   queue.py sessions <root>         repairs ticket session values to bare UUIDs
@@ -230,7 +231,9 @@ def board(root):
     attention = {"gone": sum(1 for r in open_rows if sessions[r["session"]]["gone"]),
                  "returned": sum(1 for r in open_rows if r["returns"] >= 3),
                  "stale_ready": sum(1 for r in rows if r["status"] == "ready" and r["changed_s"] > 86400)}
+    # the panel's drop button runs this script on this root
     data = {"generated": int(now), "counts": counts, "closed_7d": closed, "inbox": f"/{plugin_name()}:inbox",
+            "script": Path(__file__).resolve().as_posix(), "root": Path(root).resolve().as_posix(),
             "attention": attention, "sessions": sessions, "tickets": rows}
     write_atomic(qdir(root) / "board.json", json.dumps(data, ensure_ascii=False, indent=1) + "\n")
     render_inbox(root, data)
@@ -480,6 +483,16 @@ def cmd_done(a):
     return save(a.root, path, t, f"done {path.stem}"), None
 
 
+def cmd_drop(a):
+    """The owner removes a question from the list. The ticket closes with a record line, so git keeps it and move can reopen it."""
+    path = ticket_path(a.root, a.id)
+    t = read_ticket(path)
+    # lean: only deliver tells the asking session; the hook does not pull a drop | when: a blocking session sits stopped on a dropped ticket | fix: pull dropped tickets in the hook like decided ones
+    t["decisions"].append(f"{time.strftime('%Y%m%d')} dropped by the owner")
+    set_status(t, "done")
+    return save(a.root, path, t, f"drop {path.stem}"), None
+
+
 def cmd_board(a):
     data = board(a.root)
     return qdir(a.root) / "board.json", f"{len(data['tickets'])} tickets"
@@ -603,6 +616,8 @@ def main(argv=None):
     s = sub.add_parser("move"); s.add_argument("root"); s.add_argument("id"); s.add_argument("status", choices=STATES)
     s.add_argument("--priority", **prio); s.add_argument("--session", help="reassign to this session"); s.set_defaults(fn=cmd_move)
     s = sub.add_parser("done"); s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_done)
+    s = sub.add_parser("drop", help="the owner removes a waiting question; closes it with a record line")
+    s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_drop)
     s = sub.add_parser("board"); s.add_argument("root"); s.set_defaults(fn=cmd_board)
     s = sub.add_parser("deliver"); s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_deliver)
     s = sub.add_parser("sessions"); s.add_argument("root"); s.set_defaults(fn=cmd_sessions)

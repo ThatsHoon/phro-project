@@ -11,6 +11,23 @@ const EVERY_MS = 15000
 const WORKING_S = 600
 const board = atom({ plugin: 'queue-panel', key: 'board' } as const, null, { shape: 'board-2' })
 const canWaitOpen = atom({ plugin: 'queue-panel', key: 'canWaitOpen' } as const, false)
+const confirmDrop = atom({ plugin: 'queue-panel', key: 'confirmDrop' } as const, null as string | null)
+const TICKET_ID = /^\d{8}-[a-z0-9-]+$/
+
+// The first press arms the button, the second closes the ticket through queue.py, the queue's only writer.
+// board.json names the script; only a queue.py path and a ticket-shaped id are ever run.
+async function drop($: any, b: Board, id: string, isArmed: boolean) {
+  if (!isArmed) return void (await update($, confirmDrop, () => id)) // the drawn label said "drop", not "confirm drop"
+  await update($, confirmDrop, () => null)
+  if (!/\/scripts\/queue\.py$/.test(b.script ?? '') || !TICKET_ID.test(id)) return void $.ui.toast('Cannot drop: the board names no queue script')
+  try {
+    const r = await $.process.run(['python', '-I', '-X', 'utf8', b.script, 'drop', b.root, id])
+    if (r.exitCode !== 0 || !String(r.stdout).startsWith('OK')) $.ui.toast(`Drop failed: ${String(r.stdout || r.stderr).split('\n')[0]}`)
+  } catch {
+    $.ui.toast('Drop failed: python did not start')
+  }
+  await refresh($, true)
+}
 
 const age = (s: number) => (s >= 86400 ? `${Math.floor(s / 86400)}d` : s >= 3600 ? `${Math.floor(s / 3600)}h` : `${Math.max(1, Math.floor(s / 60))}m`)
 const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
@@ -106,8 +123,12 @@ export const register: Register = on => {
       at.returned ? `${at.returned} returned 3 times` : '',
       b.counts?.blocked ? `${b.counts.blocked} blocked` : '',
     ].filter(Boolean)
+    const armed = await read($, confirmDrop)
     const answer = (t: Ticket) => (
-      <Button key={`answer-${t.id}`} onPress={() => void $.prompt.fill({ text: `${b.inbox || '/inbox'} ${t.id}` })}>answer</Button>
+      <Box flexDirection="row" gap={1}>
+        <Button key={`answer-${t.id}`} onPress={() => void $.prompt.fill({ text: `${b.inbox || '/inbox'} ${t.id}` })}>answer</Button>
+        <Button key={`drop-${t.id}`} onPress={() => void drop($, b, t.id, armed === t.id)}>{armed === t.id ? 'confirm drop' : 'drop'}</Button>
+      </Box>
     )
     return (
       <Box flexDirection="column" gap={1}>

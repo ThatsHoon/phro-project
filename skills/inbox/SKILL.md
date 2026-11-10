@@ -16,9 +16,10 @@ Output: each waiting ticket decided or left as it was, every decision committed 
 4. On the owner's answer:
    - A decision: run `Q decide <root> <id> --text "<the owner's answer, verbatim>"`.
    - A priority change only ("make this 1"): run `Q move <root> <id> needs-owner --priority <n>`, then show the next ticket.
+   - "Delete", "drop" or "no longer needed" ("삭제", "필요 없어"): run `Q drop <root> <id>`, then deliver as in step 5.
    - "Skip" or "later": leave the ticket and show the next one.
    - "Stop": stop.
-5. After a decision, run `Q deliver <root> <id>`. It prints `SEND<TAB><target><TAB><message>`: send that message, unchanged, to that target with the session messaging tool. If the tool refuses the target or `deliver` is refused, send nothing; the owner session's hook pulls the decision on its next prompt. Send nothing else.
+5. After a decision or a drop, run `Q deliver <root> <id>`. It prints `SEND<TAB><target><TAB><message>`: send that message, unchanged, to that target with the session messaging tool. If the tool refuses the target or `deliver` is refused, send nothing; the owner session's hook pulls the decision on its next prompt. Send nothing else.
 6. Go back to step 3 with the next waiting ticket. When none are left, rerun step 1 and report how many were decided, skipped and left.
 
 Never decide for the owner, never edit a ticket by hand, and never paste a ticket's body into a message to another session.

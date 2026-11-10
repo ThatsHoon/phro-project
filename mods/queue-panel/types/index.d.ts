@@ -25,6 +25,8 @@ export type Board = {
   counts: Record<string, number>
   closed_7d: number
   inbox: string
+  script: string
+  root: string
   attention: { gone: number; returned: number; stale_ready: number }
   sessions: Record<string, Session>
   tickets: Ticket[]
@@ -32,6 +34,6 @@ export type Board = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'queue-panel': { board: Shaped<Board | null>; canWaitOpen: boolean }
+    'queue-panel': { board: Shaped<Board | null>; canWaitOpen: boolean; confirmDrop: string | null }
   }
 }

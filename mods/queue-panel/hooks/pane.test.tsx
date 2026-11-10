@@ -89,6 +89,43 @@ test('sections in order, blocking only in Needs your answer, titles not ids, ans
   await ui.unmount()
 })
 
+test('drop needs a second press, then runs queue.py drop and redraws without the ticket', async ($, on) => {
+  const ID = '20261110-pick-a'
+  const tickets = [ticket(ID, 'needs-owner', 1), ...BOARD.tickets.slice(1)]
+  const { write, seen } = world(on, { ...BOARD, tickets, script: 'C:/x/phro-project_e-call/scripts/queue.py', root: 'C:/p' })
+  const runs: string[][] = []
+  on('process.run', (_: any, e: any) => {
+    runs.push([...e.argv])
+    write({ ...BOARD, tickets: tickets.slice(1) })
+    return { value: { exitCode: 0, stdout: `OK\tdrop\tC:/p/queue/tickets/${ID}.md\n`, stderr: '' } }
+  })
+  await $.session.start({ cwd: '/p', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: `drop-${ID}` })
+  expect(runs).toEqual([])
+  expect(await textOf(ui)).toContain(`title ${ID}`)
+  await ui.press({ key: `drop-${ID}` })
+  expect(seen.toasts).toEqual([])
+  expect(runs).toEqual([['python', '-I', '-X', 'utf8', 'C:/x/phro-project_e-call/scripts/queue.py', 'drop', 'C:/p', ID]])
+  const text = await textOf(ui)
+  expect(text).not.toContain(`title ${ID}`)
+  expect(text).toContain('Needs your answer (1)')
+  await ui.unmount()
+})
+
+test('drop never runs a script the board names unless it is queue.py', async ($, on) => {
+  const { seen } = world(on, { ...BOARD, script: 'C:/evil/run.exe', root: 'C:/p' })
+  const runs: unknown[] = []
+  on('process.run', (_: any, e: any) => { runs.push(e.argv); return { exitCode: 0, stdout: '', stderr: '' } })
+  await $.session.start({ cwd: '/p', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'drop-a' })
+  await ui.press({ key: 'drop-a' })
+  expect(runs).toEqual([])
+  expect(seen.toasts.at(-1)).toContain('Cannot drop')
+  await ui.unmount()
+})
+
 test('the can-wait section opens on show and lists the default it will take', async ($, on) => {
   world(on)
   await $.session.start({ cwd: '/p', surface: 'desktop', isInteractive: true })

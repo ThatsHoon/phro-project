@@ -407,11 +407,11 @@ Sessions and forks that need the owner's decision file a ticket instead of waiti
 - `/phro-project:inbox [id]`: walks the waiting tickets one at a time, highest priority first, records each answer and sends what `queue.py deliver` prints to the asking session.
 - A decided question is not asked again. A ticket returned three times becomes the question "close it or shrink it to one step".
 
-`queue.py` commands: `init`, `ask`, `decide`, `move`, `done`, `board`, `deliver`, `sessions`, `hook`; each prints `OK`, `SEND` or `REFUSED` with a path, never a ticket body.
+`queue.py` commands: `init`, `ask`, `decide`, `move`, `done`, `drop`, `board`, `deliver`, `sessions`, `hook`; each prints `OK`, `SEND` or `REFUSED` with a path, never a ticket body.
 
 ### The queue panel
 
-The panel (`mods/queue-panel/`) reads `queue/board.json` only. Sections, empty ones hidden except the first: Needs your answer (blocking tickets, with the question, the session's title, stopped or still working, and an answer button that fills `/<copy>:inbox <id>`), Can wait (collapsed), Decided not picked up (over a day highlighted), In progress, Sessions (title, working or idle, open count), attention counts and what closed in 7 days. Sessions appear by title, never by full id. It is a plugin of its own, because a plugin's panel state belongs to that plugin's name and each project's copy has another name. `init` turns it on for one project, from the project folder:
+The panel (`mods/queue-panel/`) reads `queue/board.json` only. Sections, empty ones hidden except the first: Needs your answer (blocking tickets, with the question, the session's title, stopped or still working, an answer button that fills `/<copy>:inbox <id>`, and a drop button that on a second press runs `queue.py drop`, closing the ticket with a record line), Can wait (collapsed), Decided not picked up (over a day highlighted), In progress, Sessions (title, working or idle, open count), attention counts and what closed in 7 days. Sessions appear by title, never by full id. It is a plugin of its own, because a plugin's panel state belongs to that plugin's name and each project's copy has another name. `init` turns it on for one project, from the project folder:
 
 ```bash
 claude plugin marketplace add <the project's copy>/mods/queue-panel --scope local

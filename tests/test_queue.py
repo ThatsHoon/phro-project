@@ -390,6 +390,18 @@ def test_board_sessions():
     assert "Decided, not picked up (1)" in (root / "queue/inbox.html").read_text(encoding="utf-8")
 
 
+def test_drop():
+    root = fresh()
+    t = path_of(ask(root, title="stale"))
+    path_of(q(root, "drop", t.stem))
+    text = t.read_text(encoding="utf-8")
+    assert "status: done" in text and f"decision: {TODAY} dropped by the owner" in text, text
+    assert "Needs your answer (0)" in (root / "queue/inbox.html").read_text(encoding="utf-8")
+    assert f"drop {t.stem}" in git(root, "log", "-1", "--format=%s"), "kept in git, so move can reopen it"
+    data = board(root)
+    assert data["script"] == SCRIPT.as_posix() and data["root"] == root.resolve().as_posix(), "the panel's drop button runs these"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
