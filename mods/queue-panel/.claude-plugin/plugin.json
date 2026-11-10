@@ -1,0 +1,6 @@
+{
+  "name": "queue-panel",
+  "version": "0.1.0",
+  "description": "Shows the project's decision queue and running work beside the chat, from queue/board.json.",
+  "types": "./types/index.d.ts"
+}
