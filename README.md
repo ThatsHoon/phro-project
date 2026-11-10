@@ -200,6 +200,17 @@ Fires when you ask. Nothing moves without your yes on the proposal.
 
 `undo` restores the moved files and the original text of every edited file. It refuses without `--force` if any of them changed after `apply`, including a file edited under `--also`.
 
+### 6. Portable modules: `modularize`
+
+Fires when you ask. Where `restructure` makes a layout a newcomer can read, this one makes a layout another team can lift piece by piece: one folder per feature with its contract, examples, weights manifest, `requirements.txt` and tests, grouped into one bundle per consumer plus `shared/`.
+
+1. Facts first: features, consumers, the wires between them, outside needs and state, found from the code.
+2. Decide the rest with you in rounds, then a spec and a step plan, each waiting for your yes.
+3. Move in a worktree with `restructure.py`, one phase per commit. After each phase: `modularize.py imports` (0 forbidden), `modularize.py copytest <feature> --venv` (the feature copied alone, with only its own requirements, passes its tests) and the whole suite.
+4. Last, `contracts/README.md` for outside readers, checked with `modularize.py contracts`.
+
+The import rules live in `contracts/modules.json`: `{"features": {"control/hazard": ["shared", "control/geo"]}, "consumers": ["training", "examples", "tools"]}`. A feature imports itself and what its row lists; consumers may import features, never the reverse.
+
 ## One project at a time
 
 The original is installed once for the user and holds no project. A project's first use of any skill runs `clone.py ensure`, which copies the plugin to `~/phro-project_<project>`, registers that copy as its own marketplace and turns it on with `--scope local`, and turns the original off with `--scope local`. The copy loads in place, so an edit needs only `/reload-plugins`. Two projects with one folder name get separate copies, and a copy refuses to run for any project but its own. Inside the plugin's own folder, no copy is made.
