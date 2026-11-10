@@ -367,18 +367,11 @@ def hook():
         event = {}
     try:
         root = os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd") or "."
-        text = session_text(root, event.get("source"))
-        if (Path(root) / "queue" / "board.json").is_file():
-            rule = QUEUE_RULE.format(queue=f'python -I -X utf8 "{(PLUGIN / "scripts/queue.py").as_posix()}"', root=f'"{Path(root).resolve().as_posix()}"')
-            text = f"{text}\n\n{rule}" if text else rule
+        text = session_text(root, event.get("source"))  # the queue rule comes from queue.py hook, which knows the session id
     except Exception:
         return
     if text:
         print(text)
-
-
-QUEUE_RULE = ("When you need the owner's decision, open a ticket with `{queue} ask {root}` (add --help for its options) and also ask in chat in one line naming the ticket id. "
-              "Record whichever answer comes first with `{queue} decide {root} <id> --text <answer>`. While you wait, keep doing other work; if there is none, stop.")
 
 
 def usage(root):

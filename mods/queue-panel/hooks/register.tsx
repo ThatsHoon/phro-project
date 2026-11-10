@@ -8,12 +8,17 @@ const PANE = 'queue-panel'
 const TITLE = 'Work queue'
 const FILE = 'queue/board.json'
 const EVERY_MS = 15000
-const board = atom({ plugin: 'queue-panel', key: 'board' } as const, null, { shape: 'board-1' })
+const WORKING_S = 600
+const board = atom({ plugin: 'queue-panel', key: 'board' } as const, null, { shape: 'board-2' })
+const canWaitOpen = atom({ plugin: 'queue-panel', key: 'canWaitOpen' } as const, false)
 
 const age = (s: number) => (s >= 86400 ? `${Math.floor(s / 86400)}d` : s >= 3600 ? `${Math.floor(s / 3600)}h` : `${Math.max(1, Math.floor(s / 60))}m`)
+const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+// a ticket blocks its session unless it carries a default the session goes on with
+const blocking = (b: Board) => b.tickets.filter(t => t.status === 'needs-owner' && !t.can_wait)
 
 let mtime = -1
-let seen: Set<string> | null = null // waiting ids at the last read; null before the first, so a reload toasts nothing
+let seen: Set<string> | null = null // blocking ids at the last read; null before the first, so a reload toasts nothing
 
 async function refresh($: any, force = false) {
   let stat
@@ -31,7 +36,7 @@ async function refresh($: any, force = false) {
   }
   if (!next || !Array.isArray(next.tickets)) return
   mtime = stat.mtimeMs
-  const waiting = next.tickets.filter(t => t.status === 'needs-owner')
+  const waiting = blocking(next)
   if (seen) {
     for (const t of waiting) if (t.priority === 1 && !seen.has(t.id)) $.ui.toast(`Decision needed: ${t.title}`)
   }
@@ -85,29 +90,98 @@ export const register: Register = on => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const b = await read($, board)
     if (!b) return <Text dimColor>No queue/board.json in this project.</Text>
-    const waiting = b.tickets.filter((t: Ticket) => t.status === 'needs-owner')
-    const running = b.tickets.filter((t: Ticket) => t.status === 'doing' || t.status === 'verify')
-    const blocked = b.counts.blocked ?? 0
-    const thrice = b.tickets.filter((t: Ticket) => t.returns >= 3 && t.status !== 'done').length
+    const open = await read($, canWaitOpen)
+    const sessions = b.sessions ?? {}
+    // full session ids never reach the pane: the session's title, else the first 8 characters
+    const who = (t: Ticket) => cut(sessions[t.session]?.title || t.session.slice(0, 8), 40)
+    const now = b.generated
+    const needs = blocking(b)
+    const later = b.tickets.filter(t => t.status === 'needs-owner' && t.can_wait)
+    const decided = b.tickets.filter(t => t.status === 'ready')
+    const running = b.tickets.filter(t => t.status === 'doing' || t.status === 'verify')
+    const people = Object.entries(sessions)
+    const at = b.attention ?? { gone: 0, returned: 0, stale_ready: 0 }
+    const notes = [
+      at.gone ? `${at.gone} with the asking session gone` : '',
+      at.returned ? `${at.returned} returned 3 times` : '',
+      b.counts?.blocked ? `${b.counts.blocked} blocked` : '',
+    ].filter(Boolean)
+    const answer = (t: Ticket) => (
+      <Button key={`answer-${t.id}`} onPress={() => void $.prompt.fill({ text: `${b.inbox || '/inbox'} ${t.id}` })}>answer</Button>
+    )
     return (
-      <Box flexDirection="column">
-        <Text bold>Waiting on you ({waiting.length})</Text>
-        {waiting.length === 0 && <Text dimColor>Nothing waiting.</Text>}
-        {waiting.map((t: Ticket) => (
-          <Box flexDirection="row">
-            <Text>P{t.priority} {t.title} <Text dimColor>{t.session} · {age(t.age_s)}</Text></Text>
-            <Button key={`answer-${t.id}`} onPress={() => void $.prompt.fill({ text: `/inbox ${t.id}` })}>answer</Button>
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="column">
+          <Text bold>Needs your answer ({needs.length})</Text>
+          {needs.length === 0 && <Text dimColor>Nothing is waiting on you.</Text>}
+          {needs.map(t => (
+            <Box key={`need-${t.id}`} flexDirection="column">
+              <Text>
+                <Text bold color={t.priority === 1 ? 'warning' : undefined}>P{t.priority}</Text> {t.title}
+              </Text>
+              {t.question ? <Text wrap="wrap">{cut(t.question.replace(/\s+/g, ' '), 160)}</Text> : null}
+              <Box flexDirection="row" gap={1}>
+                <Text dimColor>
+                  {who(t)} · {t.still_working ? 'still working' : 'stopped'} · {age(t.age_s)}
+                </Text>
+                {answer(t)}
+              </Box>
+            </Box>
+          ))}
+        </Box>
+        {later.length > 0 && (
+          <Box flexDirection="column">
+            <Box flexDirection="row" gap={1}>
+              <Text bold>Can wait ({later.length})</Text>
+              <Button key="can-wait-toggle" onPress={() => void update($, canWaitOpen, v => !v)}>{open ? 'hide' : 'show'}</Button>
+            </Box>
+            {open &&
+              later.map(t => (
+                <Box key={`wait-${t.id}`} flexDirection="row" gap={1}>
+                  <Text>
+                    {t.title} <Text dimColor>· {who(t)} · otherwise: {cut(t.default, 80)}</Text>
+                  </Text>
+                  {answer(t)}
+                </Box>
+              ))}
           </Box>
-        ))}
-        <Text bold>Running ({running.length})</Text>
-        {running.length === 0 && <Text dimColor>Nothing running.</Text>}
-        {running.map((t: Ticket) => (
-          <Text>{t.title} <Text dimColor>{t.status} · {t.session} · {t.last_line || 'no record line'}</Text></Text>
-        ))}
-        <Text bold>Attention</Text>
-        <Text>blocked {blocked} · returned 3 times {thrice}</Text>
-        <Text bold>Done in 7 days</Text>
-        <Text>{b.closed_7d}</Text>
+        )}
+        {decided.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>Decided, not picked up ({decided.length})</Text>
+            {decided.map(t => (
+              <Text key={`ready-${t.id}`} color={t.changed_s > 86400 ? 'warning' : undefined}>
+                {t.title} <Text dimColor>· {who(t)} · decided {age(t.changed_s)} ago</Text>
+              </Text>
+            ))}
+          </Box>
+        )}
+        {running.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>In progress ({running.length})</Text>
+            {running.map(t => (
+              <Text key={`run-${t.id}`}>
+                {t.title} <Text dimColor>· {t.status} · {who(t)} · {t.last_line || 'no record line'}</Text>
+              </Text>
+            ))}
+          </Box>
+        )}
+        {people.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>Sessions ({people.length})</Text>
+            {people.map(([sid, s]) => {
+              const open = b.tickets.filter(t => t.session === sid && t.status !== 'done').length
+              const state = s.gone ? 'gone' : now - (s.last_active ?? 0) < WORKING_S ? 'working' : `idle ${age(now - (s.last_active ?? 0))}`
+              return (
+                <Text key={`s-${sid}`}>
+                  {cut(s.title || sid.slice(0, 8), 40)} <Text dimColor>· {state} · {open} open</Text>
+                </Text>
+              )
+            })}
+          </Box>
+        )}
+        {notes.length > 0 && <Text color="warning">{notes.join(' · ')}</Text>}
+        {b.closed_7d > 0 && <Text dimColor>Done in 7 days: {b.closed_7d}</Text>}
       </Box>
     )
   })

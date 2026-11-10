@@ -181,8 +181,12 @@ def hooks_json():
     assert any("compass.py" in h["command"] and e["matcher"] == "startup|resume|clear|compact" for e in starts for h in e["hooks"])
     assert any(e.get("matcher") == "startup|resume|clear|compact" and e["hooks"] == [{"type": "command", "command": cmd, "timeout": 5}]
                for e in starts), starts
-    for event in ("SubagentStart", "UserPromptSubmit"):
-        assert hooks[event] == [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}], hooks.get(event)
+    lean = {"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}
+    assert hooks["SubagentStart"] == [lean], hooks.get("SubagentStart")
+    assert hooks["UserPromptSubmit"][0] == lean, "lean first; the queue hook may follow"
+    queue = 'python -I -X utf8 "${CLAUDE_PLUGIN_ROOT}/scripts/queue.py" hook'
+    assert hooks["UserPromptSubmit"][1:] == [{"hooks": [{"type": "command", "command": queue, "timeout": 5}]}], hooks["UserPromptSubmit"]
+    assert any(h["command"] == queue for e in starts for h in e["hooks"]), starts
 
 
 def has_all(rel, strings):

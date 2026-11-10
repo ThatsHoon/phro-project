@@ -6,11 +6,14 @@ regenerates board.json (and inbox.html) and commits only its own paths, so sessi
 each other's files. Output is paths and counts, never ticket bodies.
 
   queue.py init <root>
-  queue.py ask <root> --title T --question Q --option O [--option O ...] --priority N --reason R --session S [--link P ...] [--ticket ID]
+  queue.py ask <root> --title T --question Q --option O [--option O ...] --priority N --reason R --session UUID [--default D] [--link P ...] [--ticket ID]
   queue.py decide <root> <id> --text T [--priority N]
-  queue.py move <root> <id> <status> [--priority N]
+  queue.py move <root> <id> <status> [--priority N] [--session UUID]
   queue.py done <root> <id>
   queue.py board <root>
+  queue.py deliver <root> <id>     prints SEND<TAB>local_<UUID><TAB><message> for the asking session
+  queue.py sessions <root>         repairs ticket session values to bare UUIDs
+  queue.py hook                    SessionStart / UserPromptSubmit hook: event JSON on stdin
 """
 import argparse
 import json
@@ -22,8 +25,15 @@ import time
 from pathlib import Path
 
 QUEUE = "queue"
+PLUGIN = Path(__file__).resolve().parents[1]
 STATES = ("new", "researching", "ready", "doing", "verify", "done", "needs-owner", "blocked")
 FIELDS = ("status", "waiting_on", "priority", "priority_reason", "session", "links", "returns")
+OPTIONAL = ("default",)  # tickets written before it still parse
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+TICKET_ID = re.compile(r"\b\d{8}-[a-z0-9-]+\b")
+SELF = "self:"
+HOOK_LINES = 10
+WORKING_S = 600  # a transcript written this recently counts as a working session
 CLOSE_OR_SHRINK = "Close this ticket or shrink it to one step?"
 CLOSE_OPTIONS = ["A: close it", "B: shrink it to one step"]
 LINE_MAX = 120
@@ -69,10 +79,10 @@ def parse_ticket(text, tid):
     meta = {}
     for line in m.group(1).splitlines():
         key, sep, value = line.partition(": ")
-        if not sep or key not in FIELDS:
+        if not sep or key not in FIELDS + OPTIONAL:
             raise ValueError(f"bad line: {line[:40]}")
         meta[key] = value
-    if set(meta) != set(FIELDS):
+    if not set(FIELDS) <= set(meta):
         raise ValueError(f"missing: {', '.join(sorted(set(FIELDS) - set(meta)))}")
     if meta["status"] not in STATES or meta["priority"] not in ("1", "2", "3"):
         raise ValueError("bad status or priority")
@@ -87,13 +97,13 @@ def parse_ticket(text, tid):
     question = "\n".join(l for l in body[1:] if l.strip() and not l.startswith(("- ", "decision: "))).strip()
     return {"id": tid, "title": body[0][2:], "status": meta["status"], "waiting_on": meta["waiting_on"],
             "priority": int(meta["priority"]), "priority_reason": meta["priority_reason"], "session": meta["session"],
-            "links": links, "returns": int(meta["returns"]), "question": question, "options": options,
-            "decisions": decisions}
+            "links": links, "returns": int(meta["returns"]), "default": meta.get("default", ""), "question": question,
+            "options": options, "decisions": decisions}
 
 
 def render_ticket(t):
     meta = dict(t, priority=str(t["priority"]), returns=str(t["returns"]), links=json.dumps(t["links"], ensure_ascii=False))
-    head = "\n".join(f"{k}: {meta[k]}" for k in FIELDS)
+    head = "\n".join(f"{k}: {meta[k]}" for k in FIELDS + OPTIONAL if k in FIELDS or meta.get(k))
     body = [f"# {t['title']}", "", t["question"], ""] + [f"- {o}" for o in t["options"]]
     if t["decisions"]:
         body += [""] + [f"decision: {d}" for d in t["decisions"]]
@@ -143,10 +153,58 @@ def age_of(root, path):
     return int(time.time()) - born
 
 
+def clean(text):
+    return re.sub(r"[\r\n`]+", " ", str(text)).strip()
+
+
+def norm_session(value):
+    """The canonical session value is the bare transcript UUID, lowercase; the desktop app's local_<UUID> is accepted."""
+    v = (value or "").strip().lower()
+    v = v[len("local_"):] if v.startswith("local_") else v
+    if not UUID.fullmatch(v):
+        raise Refused("--session takes this session's id, a UUID or local_<UUID>; the queue hook prints it at session start")
+    return v
+
+
+def transcripts(root):
+    """The folder of this project's session transcripts, one <UUID>.jsonl per session."""
+    return Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path(root).resolve()))
+
+
+def session_info(root, sid):
+    """Title from the last custom-title in the transcript's tail, last activity from its mtime; gone without a transcript."""
+    path = transcripts(root) / f"{sid}.jsonl"
+    try:
+        size, mtime = path.stat().st_size, int(path.stat().st_mtime)
+    except (OSError, ValueError):
+        return {"title": clean(sid)[:8], "last_active": None, "gone": True}
+    title = ""
+    try:
+        with path.open("rb") as f:
+            f.seek(max(0, size - 65536))
+            for line in f.read().decode("utf-8", "replace").splitlines():
+                if '"custom-title"' in line:
+                    try:
+                        title = json.loads(line).get("customTitle") or title
+                    except (ValueError, AttributeError):
+                        pass  # the first line of the tail is usually cut
+    except OSError:
+        pass
+    return {"title": clean(title)[:80] or sid[:8], "last_active": mtime, "gone": False}
+
+
+def plugin_name():
+    try:
+        return json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))["name"]
+    except (OSError, ValueError, KeyError):
+        return "phro-project"
+
+
 def board(root):
     """Write board.json from every ticket; tickets that do not parse are reported and left out."""
     rows, counts, closed = [], {s: 0 for s in STATES}, 0
-    week = time.time() - 7 * 86400
+    now = time.time()
+    week = now - 7 * 86400
     for path in sorted((qdir(root) / "tickets").glob("*.md")):
         try:
             t = read_ticket(path)
@@ -154,13 +212,26 @@ def board(root):
             print(f"SKIPPED\t{path.as_posix()}\t{e}")
             continue
         counts[t["status"]] += 1
-        if t["status"] == "done" and path.stat().st_mtime >= week:  # lean: done time = file mtime | when: edits after done skew the weekly count | fix: add a done_at field
+        changed = path.stat().st_mtime  # lean: last change = file mtime | when: a copy or checkout touches tickets | fix: a changed_at field
+        if t["status"] == "done" and changed >= week:
             closed += 1
         rows.append({"id": t["id"], "title": t["title"], "status": t["status"], "priority": t["priority"],
-                     "session": t["session"], "age_s": age_of(root, path), "returns": t["returns"],
+                     "session": t["session"], "age_s": age_of(root, path), "changed_s": int(now - changed), "returns": t["returns"],
+                     "can_wait": bool(t["default"]), "default": t["default"],
+                     "question": t["question"][:300] if t["status"] == "needs-owner" else "",
                      "last_line": last_line(root, t["links"]) if t["status"] in ("doing", "verify") else ""})
     rows.sort(key=lambda r: (r["priority"], -r["age_s"]))
-    data = {"generated": int(time.time()), "counts": counts, "closed_7d": closed, "tickets": rows}
+    sessions = {sid: session_info(root, sid) for sid in sorted({r["session"] for r in rows if r["status"] != "done"})}
+    for r in rows:
+        last = sessions.get(r["session"], {}).get("last_active")
+        # the asking turn writes for a while after the ask, so only activity well after it counts
+        r["still_working"] = bool(r["status"] == "needs-owner" and last and last > now - r["changed_s"] + 300)
+    open_rows = [r for r in rows if r["status"] != "done"]
+    attention = {"gone": sum(1 for r in open_rows if sessions[r["session"]]["gone"]),
+                 "returned": sum(1 for r in open_rows if r["returns"] >= 3),
+                 "stale_ready": sum(1 for r in rows if r["status"] == "ready" and r["changed_s"] > 86400)}
+    data = {"generated": int(now), "counts": counts, "closed_7d": closed, "inbox": f"/{plugin_name()}:inbox",
+            "attention": attention, "sessions": sessions, "tickets": rows}
     write_atomic(qdir(root) / "board.json", json.dumps(data, ensure_ascii=False, indent=1) + "\n")
     render_inbox(root, data)
     return data
@@ -223,9 +294,16 @@ def core_section(root):
     return f"<h2>Core documents ({len(cards)})</h2>{top}" + "".join(cards)
 
 
+def ago(s):
+    s = max(0, int(s))
+    return f"{s // 86400} d" if s >= 86400 else f"{s // 3600} h" if s >= 3600 else f"{max(1, s // 60)} m"
+
+
 def render_inbox(root, data):
     """One self-contained page, in the panel's order. Every ticket field is escaped."""
     from html import escape
+    sessions = data.get("sessions", {})
+    who = lambda t: escape(sessions.get(t["session"], {}).get("title") or t["session"][:8])
     by_id = {}
     for t in data["tickets"]:
         if t["status"] == "needs-owner":
@@ -233,25 +311,45 @@ def render_inbox(root, data):
                 by_id[t["id"]] = read_ticket(qdir(root) / "tickets" / f"{t['id']}.md")
             except (ValueError, OSError):
                 pass
-    meta = lambda t: f'<div class="meta">P{t["priority"]} · {escape(t["session"])} · {t["age_s"] // 86400} d · {t["id"]}</div>'
-    waiting, running = [], []
+    blocking, can_wait, decided, running = [], [], [], []
     for t in data["tickets"]:
+        meta = f'<div class="meta">P{t["priority"]} · {who(t)} · {ago(t["age_s"])} · {t["id"]}</div>'
         if t["status"] == "needs-owner" and t["id"] in by_id:
             full = by_id[t["id"]]
             opts = "".join(f"<li>{escape(o)}</li>" for o in full["options"])
-            waiting.append(f'<div class="card{" p1" if t["priority"] == 1 else ""}"><b>{escape(t["title"])}</b>{meta(t)}'
-                           f'<p>{escape(full["question"])}</p><ul>{opts}</ul></div>')
+            if t.get("can_wait"):
+                can_wait.append(f'<div class="card"><b>{escape(t["title"])}</b>{meta}<p>{escape(full["question"])}</p><ul>{opts}</ul>'
+                                f'<p class="meta">Without an answer: {escape(t["default"])}</p></div>')
+            else:
+                state = "still working" if t.get("still_working") else "stopped"
+                blocking.append(f'<div class="card{" p1" if t["priority"] == 1 else ""}"><b>{escape(t["title"])}</b>{meta}'
+                                f'<p>{escape(full["question"])}</p><ul>{opts}</ul><p class="meta">Session {state}</p></div>')
+        elif t["status"] == "ready":
+            late = " p1" if t.get("changed_s", 0) > 86400 else ""
+            decided.append(f'<div class="card{late}"><b>{escape(t["title"])}</b> <span class="meta">decided {ago(t.get("changed_s", 0))} ago, '
+                           f'not picked up</span>{meta}</div>')
         elif t["status"] in ("doing", "verify"):
-            running.append(f'<div class="card"><b>{escape(t["title"])}</b> <span class="meta">{t["status"]}</span>{meta(t)}'
+            running.append(f'<div class="card"><b>{escape(t["title"])}</b> <span class="meta">{t["status"]}</span>{meta}'
                            f'<p>{escape(t["last_line"])}</p></div>')
-    attention = sum(1 for t in data["tickets"] if t["status"] == "blocked" or t["returns"] >= 3)
-    sections = "\n".join([
-        f"<h2>Waiting on you ({len(waiting)})</h2>" + ("".join(waiting) or '<p class="meta">Nothing waiting.</p>'),
-        f"<h2>Running ({len(running)})</h2>" + ("".join(running) or '<p class="meta">Nothing running.</p>'),
-        f"<h2>Attention</h2><p>blocked {data['counts']['blocked']} · returned 3 times {attention - data['counts']['blocked']}</p>",
-        f"<h2>Done in 7 days</h2><p>{data['closed_7d']}</p>",
+    now = data["generated"]
+    people = []
+    for sid, s in sessions.items():
+        mine = [t for t in data["tickets"] if t["session"] == sid and t["status"] != "done"]
+        state = "gone" if s["gone"] else "working" if now - (s["last_active"] or 0) < WORKING_S else f"idle {ago(now - s['last_active'])}"
+        people.append(f'<p><b>{escape(s["title"])}</b> <span class="meta">{state} · {len(mine)} open</span></p>')
+    at = data.get("attention", {})
+    notes = [f"{n} {label}" for n, label in ((at.get("gone", 0), "with the asking session gone"), (at.get("returned", 0), "returned 3 times"),
+                                             (data["counts"].get("blocked", 0), "blocked")) if n]
+    sections = "\n".join(s for s in [
+        f"<h2>Needs your answer ({len(blocking)})</h2>" + ("".join(blocking) or '<p class="meta">Nothing is waiting on you.</p>'),
+        f"<details><summary><h2 style=\"display:inline\">Can wait ({len(can_wait)})</h2></summary>{''.join(can_wait)}</details>" if can_wait else "",
+        f"<h2>Decided, not picked up ({len(decided)})</h2>" + "".join(decided) if decided else "",
+        f"<h2>In progress ({len(running)})</h2>" + "".join(running) if running else "",
+        f"<h2>Sessions ({len(people)})</h2>" + "".join(people) if people else "",
+        f"<h2>Attention</h2><p>{' · '.join(notes)}</p>" if notes else "",
+        f"<h2>Done in 7 days</h2><p>{data['closed_7d']}</p>" if data["closed_7d"] else "",
         core_section(root),
-    ])
+    ] if s)
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(data["generated"]))
     path = qdir(root) / "inbox.html"
     write_atomic(path, PAGE.replace("{stamp}", stamp).replace("{sections}", sections))
@@ -328,7 +426,8 @@ def cmd_ask(a):
             raise Refused(f"already decided: {path.as_posix()}")
         if a.title:
             t["title"] = a.title
-        t.update(question=one_block(a.question), options=a.option, priority=a.priority, priority_reason=a.reason, session=a.session)
+        t.update(question=one_block(a.question), options=a.option, priority=a.priority, priority_reason=a.reason,
+                 session=norm_session(a.session), default=a.default or "")
         t["links"] = t["links"] + [l for l in links_of(a) if l not in t["links"]]
         set_status(t, "needs-owner")
     else:
@@ -337,8 +436,8 @@ def cmd_ask(a):
         tickets = qdir(a.root) / "tickets"
         path = tickets / f"{slug(a.title, time.strftime('%Y%m%d'), tickets)}.md"
         t = {"title": a.title, "status": "needs-owner", "waiting_on": "owner", "priority": a.priority,
-             "priority_reason": a.reason, "session": a.session, "links": links_of(a), "returns": 0,
-             "question": one_block(a.question), "options": a.option, "decisions": []}
+             "priority_reason": a.reason, "session": norm_session(a.session), "links": links_of(a), "returns": 0,
+             "default": a.default or "", "question": one_block(a.question), "options": a.option, "decisions": []}
     return save(a.root, path, t, f"ask {path.stem}"), None
 
 
@@ -357,7 +456,8 @@ def cmd_decide(a):
     t["decisions"].append(f"{time.strftime('%Y%m%d')} {a.text}")
     if a.priority:
         t["priority"] = a.priority
-    t["status"], t["waiting_on"] = "ready", "agent"
+    # a session that went past its own question records what it did; nothing is left for anyone to pick up
+    t["status"], t["waiting_on"] = ("done" if a.text.strip().startswith(SELF) else "ready"), "agent"
     return save(a.root, path, t, f"decide {path.stem}"), None
 
 
@@ -366,6 +466,8 @@ def cmd_move(a):
     t = read_ticket(path)
     if a.priority:
         t["priority"] = a.priority
+    if a.session:
+        t["session"] = norm_session(a.session)
     if a.status != t["status"]:
         set_status(t, a.status)
     return save(a.root, path, t, f"move {path.stem} {t['status']}"), None
@@ -383,7 +485,108 @@ def cmd_board(a):
     return qdir(a.root) / "board.json", f"{len(data['tickets'])} tickets"
 
 
+def cmd_deliver(a):
+    """Only the session holds the messaging tool, so this prints the target and the exact message for it to send."""
+    path = ticket_path(a.root, a.id)
+    t = read_ticket(path)
+    if not UUID.fullmatch(t["session"]):
+        raise Refused(f"the ticket's session {clean(t['session'])[:40]!r} is not a session id: run queue.py sessions first")
+    if t["status"] == "needs-owner":
+        raise Refused("not decided yet: run decide first")
+    print(f"SEND\tlocal_{t['session']}\tticket {t['id']} decided, read the ticket file {path.resolve().as_posix()}")
+    return None
+
+
+def cmd_sessions(a):
+    """Rewrite each ticket's session to the bare UUID: strip local_, resolve a prefix that names exactly one transcript."""
+    names = [p.stem.lower() for p in transcripts(a.root).glob("*.jsonl")]
+    changed = []
+    for path in sorted((qdir(a.root) / "tickets").glob("*.md")):
+        try:
+            t = read_ticket(path)
+        except (ValueError, OSError):
+            continue
+        v = t["session"].strip().lower()
+        v = v[len("local_"):] if v.startswith("local_") else v
+        if not UUID.fullmatch(v):
+            hits = [n for n in names if n.startswith(v)] if re.fullmatch(r"[0-9a-f][0-9a-f-]{3,}", v) else []
+            if len(hits) != 1:
+                print(f"LEFT\t{t['id']}\t{clean(t['session'])[:40]}\t{len(hits)} matching transcripts")
+                continue
+            v = hits[0]
+        if v != t["session"]:
+            t["session"] = v
+            write_atomic(path, render_ticket(t))
+            changed.append(f"tickets/{path.name}")
+    if changed:
+        commit(a.root, f"sessions {len(changed)}", changed)
+    else:
+        board(a.root)
+    return qdir(a.root) / "board.json", f"{len(changed)} fixed"
+
+
+RULE = ("When you need the owner's decision, open a ticket with `{queue} ask {root} --session {sid}` (add --help for its options) "
+        "and also ask in chat in one line naming the ticket id. Give --default \"<what you will do without an answer>\" whenever going on is reasonable, "
+        "and go on with it; a ticket without a default blocks, so stop after asking. "
+        "Record whichever answer comes first with `{queue} decide {root} <id> --text <answer>`. "
+        "When you go past your own ticket, close it with `{queue} done {root} <id>`, or decide it with --text \"self: <what you did>\". "
+        "When the owner answers here a ticket another session owns, record it with decide, run `{queue} deliver {root} <id>` "
+        "and send the printed message to the printed session; do not do that ticket's work here. "
+        "If an answer names no ticket id and this session owns no waiting ticket, ask the owner for the id in one line.")
+
+
+def find_root(start):
+    here = Path(start).resolve()
+    return next((p for p in (here, *here.parents) if (qdir(p) / "board.json").is_file()), None)
+
+
+def hook_lines(event):
+    """Reads board.json only. The session's own decided tickets on every event; tickets of other sessions named in the prompt."""
+    sid = str(event.get("session_id") or "").lower()
+    root = find_root(os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd") or ".")
+    if not root or not UUID.fullmatch(sid):
+        return []
+    data = json.loads((qdir(root) / "board.json").read_text(encoding="utf-8"))
+    rows = [t for t in data.get("tickets", []) if isinstance(t, dict) and "id" in t]
+    queue, r = f'python -I -X utf8 "{Path(__file__).resolve().as_posix()}"', f'"{root.as_posix()}"'
+    out, name = [], event.get("hook_event_name")
+    if name == "SessionStart":
+        out.append(RULE.format(queue=queue, root=r, sid=sid))
+        mine = [t for t in rows if t.get("session") == sid and t.get("status") in ("needs-owner", "doing", "verify", "blocked")]
+        if mine:
+            out.append("Your open tickets: " + ", ".join(f"{t['id']} ({t.get('status')})" for t in mine[:8])
+                       + ". Close any you already went past, as the rule says.")
+    for t in rows:
+        if t.get("session") == sid and t.get("status") == "ready":
+            path = (qdir(root) / "tickets" / f"{t['id']}.md").as_posix()
+            out.append(f"Ticket {t['id']} was decided for you: read {path}, then run {queue} move {r} {t['id']} doing.")
+    if name == "UserPromptSubmit":
+        by_id = {t["id"]: t for t in rows}
+        for tid in dict.fromkeys(TICKET_ID.findall(str(event.get("prompt") or ""))):
+            t = by_id.get(tid)
+            if not t or t.get("session") == sid or t.get("status") == "done":
+                continue
+            owner = clean(t.get("session"))[:40]
+            title = clean((data.get("sessions") or {}).get(owner, {}).get("title") or owner[:8])[:80]
+            out.append(f'Ticket {tid} belongs to session {owner} ("{title}"), not this one. Record the owner\'s answer with '
+                       f'{queue} decide {r} {tid} --text "<answer>", then deliver: {queue} deliver {r} {tid}. Do not do that ticket\'s work here.')
+    return out[:HOOK_LINES]
+
+
+def hook():
+    """A hook must never break a session: every failure ends silently with exit 0."""
+    try:
+        lines = hook_lines(json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}"))
+    except Exception:
+        return 0
+    if lines:
+        sys.stdout.buffer.write(("\n".join(lines) + "\n").encode("utf-8"))
+    return 0
+
+
 def main(argv=None):
+    if (argv if argv is not None else sys.argv[1:])[:1] == ["hook"]:
+        return hook()
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     prio = dict(type=int, choices=(1, 2, 3))
@@ -391,23 +594,31 @@ def main(argv=None):
     s = sub.add_parser("ask"); s.add_argument("root"); s.set_defaults(fn=cmd_ask)
     s.add_argument("--title"); s.add_argument("--question", required=True); s.add_argument("--option", action="append", required=True)
     s.add_argument("--priority", required=True, **prio); s.add_argument("--reason", required=True)
-    s.add_argument("--session", required=True); s.add_argument("--link", action="append"); s.add_argument("--ticket")
+    s.add_argument("--session", required=True, help="this session's id, a UUID or local_<UUID>")
+    s.add_argument("--default", help="what the session does without an answer; makes the ticket can-wait")
+    s.add_argument("--link", action="append"); s.add_argument("--ticket")
     s = sub.add_parser("decide"); s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_decide)
-    s.add_argument("--text", required=True); s.add_argument("--priority", **prio)
+    s.add_argument("--text", required=True, help='the answer; "self: ..." when the asking session went past it (closes the ticket)')
+    s.add_argument("--priority", **prio)
     s = sub.add_parser("move"); s.add_argument("root"); s.add_argument("id"); s.add_argument("status", choices=STATES)
-    s.add_argument("--priority", **prio); s.set_defaults(fn=cmd_move)
+    s.add_argument("--priority", **prio); s.add_argument("--session", help="reassign to this session"); s.set_defaults(fn=cmd_move)
     s = sub.add_parser("done"); s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_done)
     s = sub.add_parser("board"); s.add_argument("root"); s.set_defaults(fn=cmd_board)
+    s = sub.add_parser("deliver"); s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_deliver)
+    s = sub.add_parser("sessions"); s.add_argument("root"); s.set_defaults(fn=cmd_sessions)
     a = p.parse_args(argv)
     a.root = Path(a.root).resolve()
     if a.cmd != "init" and not (qdir(a.root) / ".git").is_dir():
         print(f"REFUSED\tno queue at {qdir(a.root).as_posix()}: run queue.py init first")
         return 1
     try:
-        path, note = a.fn(a)
+        done = a.fn(a)
     except (Refused, ValueError) as e:
         print(f"REFUSED\t{e}")
         return 1
+    if done is None:  # the command printed its own result
+        return 0
+    path, note = done
     print("\t".join(["OK", a.cmd, Path(path).as_posix()] + ([note] if note else [])))
     return 0
 

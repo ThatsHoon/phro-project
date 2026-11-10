@@ -18,7 +18,7 @@ Output: each waiting ticket decided or left as it was, every decision committed 
    - A priority change only ("make this 1"): run `Q move <root> <id> needs-owner --priority <n>`, then show the next ticket.
    - "Skip" or "later": leave the ticket and show the next one.
    - "Stop": stop.
-5. After a decision, if the ticket's `session` is a session the session tools list as existing, send it exactly: `ticket <id> decided, read the ticket file <absolute path of the ticket>`. The receiving session acts on the file, not on this message. Send nothing else, and nothing to a session that is not listed.
+5. After a decision, run `Q deliver <root> <id>`. It prints `SEND<TAB><target><TAB><message>`: send that message, unchanged, to that target with the session messaging tool. If the tool refuses the target or `deliver` is refused, send nothing; the owner session's hook pulls the decision on its next prompt. Send nothing else.
 6. Go back to step 3 with the next waiting ticket. When none are left, rerun step 1 and report how many were decided, skipped and left.
 
 Never decide for the owner, never edit a ticket by hand, and never paste a ticket's body into a message to another session.

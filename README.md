@@ -402,15 +402,16 @@ Then type `/reload-plugins` in a running session.
 Sessions and forks that need the owner's decision file a ticket instead of waiting in a chat nobody reads. Tickets are Markdown files in `<project>/queue/`, its own git repository; `scripts/queue.py` is the only writer and commits only the paths it wrote, so sessions writing at once never commit each other's files.
 
 - `/phro-project:init`: once per project. Makes the project's copy, the queue, the first inbox page (a private Artifact) and turns on the panel.
-- The session rule: when `queue/board.json` exists, the compass hook tells every session to open a ticket with `queue.py ask`, ask in chat too, and record the first answer with `queue.py decide`.
-- `/phro-project:inbox [id]`: walks the waiting tickets one at a time, highest priority first, records each answer and tells the waiting session to read its ticket.
+- Routing by exact id: `queue.py hook` runs at session start and on every prompt. At start it gives the session the rule with its own id (`ask ... --session <UUID>`) and lists its open tickets. On every prompt it pulls this session's decided tickets ("decided for you: read <path>"), and when the prompt names another session's ticket id it says whose it is and how to record and deliver the answer without doing that work here. Tickets store the bare transcript UUID; `queue.py sessions` repairs older values.
+- Blocking or not: `ask --default "<what I do without an answer>"` makes a ticket can-wait, so only tickets that stop a session show as needing an answer. A session that went past its own ticket closes it with `done` or `decide --text "self: ..."`.
+- `/phro-project:inbox [id]`: walks the waiting tickets one at a time, highest priority first, records each answer and sends what `queue.py deliver` prints to the asking session.
 - A decided question is not asked again. A ticket returned three times becomes the question "close it or shrink it to one step".
 
-`queue.py` commands: `init`, `ask`, `decide`, `move`, `done`, `board`; each prints `OK` or `REFUSED` with a path, never a ticket body.
+`queue.py` commands: `init`, `ask`, `decide`, `move`, `done`, `board`, `deliver`, `sessions`, `hook`; each prints `OK`, `SEND` or `REFUSED` with a path, never a ticket body.
 
 ### The queue panel
 
-The panel (`mods/queue-panel/`) reads `queue/board.json` only: waiting decisions with an answer button that fills `/inbox <id>`, running work with the last line of its record, blocked and thrice-returned counts, and what closed in 7 days. It is a plugin of its own, because a plugin's panel state belongs to that plugin's name and each project's copy has another name. `init` turns it on for one project, from the project folder:
+The panel (`mods/queue-panel/`) reads `queue/board.json` only. Sections, empty ones hidden except the first: Needs your answer (blocking tickets, with the question, the session's title, stopped or still working, and an answer button that fills `/<copy>:inbox <id>`), Can wait (collapsed), Decided not picked up (over a day highlighted), In progress, Sessions (title, working or idle, open count), attention counts and what closed in 7 days. Sessions appear by title, never by full id. It is a plugin of its own, because a plugin's panel state belongs to that plugin's name and each project's copy has another name. `init` turns it on for one project, from the project folder:
 
 ```bash
 claude plugin marketplace add <the project's copy>/mods/queue-panel --scope local
