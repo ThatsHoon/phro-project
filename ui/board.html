@@ -49,6 +49,7 @@ details[open] > summary::before { content: "▾ "; }
 .empty { color: var(--muted); }
 .error { color: var(--danger); font-size: 13px; }
 .doc .heads { color: var(--muted); font-size: 13px; }
+blockquote.goal { margin: 4px 0; padding-left: 10px; border-left: 3px solid var(--accent); }
 .file { font-family: var(--mono); font-size: 13px; }
 @media (prefers-reduced-motion: no-preference) { .card { transition: border-color .15s; } }
 </style>
@@ -158,7 +159,10 @@ function render(v) {
     notes.length ? el("section", {}, el("h2", {}, "Attention"), el("p", { class: "late", style: "margin:0" }, notes.join(" · "))) : null,
     v.closed_7d ? el("p", { class: "meta", style: "margin:0" }, `Done in 7 days: ${v.closed_7d}`) : null,
     v.core ? el("section", {}, el("h2", {}, `Core documents (${v.core.docs.length})`),
-      v.core.goal ? el("p", { style: "margin:0" }, el("b", {}, "Final goal "), v.core.goal) : null,
+      v.core.goals && v.core.goals.length ? el("div", { class: "card" }, el("b", {}, "Final goal"),
+        v.core.goals.map(g => el("div", {},
+          g.label ? el("div", { class: "meta" }, g.label) : null,
+          g.quotes.map(q => el("blockquote", { class: "goal" }, q))))) : null,
       v.core.drift ? el("p", { style: "margin:0" }, el("b", {}, "Drift "), v.core.drift) : null,
       v.core.docs.map(d => el("div", { class: "card doc" },
         el("div", { class: "row" }, el("span", { class: "file" }, d.file), el("span", { class: "meta" }, d.brief)),

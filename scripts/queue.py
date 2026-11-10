@@ -257,7 +257,16 @@ def core_data(root):
             return None
     lines_of = lambda text: [l.strip() for l in text.splitlines() if l.strip()]
     goals = text_of("goals.md") or ""
-    goal = next((l.lstrip("> ").strip() for l in lines_of(goals.split("\n## ", 2)[1] if "\n## " in goals else "")[1:]), "")
+    first = goals.split("\n## ", 2)[1] if "\n## " in goals else ""  # the first section: the final goal, in the owner's words
+    goal, label, quoting = [], "", False
+    for l in lines_of(first)[1:]:
+        if l.startswith(">"):  # quoted lines are the goal itself; the plain line above a block names it
+            if not quoting:
+                goal.append({"label": label, "quotes": []})
+            goal[-1]["quotes"].append(l.lstrip("> ").strip())
+            quoting = True
+        else:
+            label, quoting = l, False
     docs = []
     for doc in manifest.get("docs", []):
         name = str(doc.get("file", ""))
@@ -270,7 +279,7 @@ def core_data(root):
             row.update(lines=len(text.splitlines()), heads=[l[3:] for l in body if l.startswith("## ")][:8],
                        first=next((l for l in body if not l.startswith("#")), "")[:200])
         docs.append(row)
-    return {"goal": goal, "drift": str(manifest.get("drift") or ""), "docs": docs}
+    return {"goals": goal, "drift": str(manifest.get("drift") or ""), "docs": docs}
 
 
 def view(root):

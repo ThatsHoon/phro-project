@@ -280,7 +280,8 @@ def test_core_docs():
     root = fresh()
     core = root / "docs/core"
     (core / "features").mkdir(parents=True)
-    (core / "goals.md").write_text("# Goals\n\n## Final goal\n\n> Ship five <b>stable</b> APIs.\n\n## Now\n\n- billing first\n", encoding="utf-8")
+    (core / "goals.md").write_text("# Goals\n\n## Final goal\n\nKept in the owner's words.\n\nAPI (owner's words)\n\n> Ship five <b>stable</b> APIs.\n> Keep them fast.\n\n"
+                                   "Billing\n\n> Bill monthly.\n\n## Now\n\n> not a final goal\n", encoding="utf-8")
     (core / "features/app.md").write_text("# App\n\nThe entry point is `src/app.py`.\n\n## Flow\n\ntext\n\n## Traps\n\ntext\n", encoding="utf-8")
     (core / "core.json").write_text(json.dumps({"drift": "billing has no recent work", "reviewed": {"goals.md": time.time() - 3 * 86400},
                                                 "docs": [{"file": "goals.md", "brief": "what we aim at"},
@@ -288,7 +289,9 @@ def test_core_docs():
                                                          {"file": "gone.md", "brief": "deleted file"}]}), encoding="utf-8")
     with served(root) as url:
         c = json.loads(http(url, "/api/view")[1])["core"]
-    assert c["goal"] == "Ship five <b>stable</b> APIs." and c["drift"] == "billing has no recent work"
+    assert c["goals"] == [{"label": "API (owner's words)", "quotes": ["Ship five <b>stable</b> APIs.", "Keep them fast."]},
+                          {"label": "Billing", "quotes": ["Bill monthly."]}], c["goals"]
+    assert c["drift"] == "billing has no recent work"
     docs = {d["file"]: d for d in c["docs"]}
     assert docs["goals.md"]["brief"] == "what we aim at" and docs["goals.md"]["heads"] == ["Final goal", "Now"]
     assert docs["goals.md"]["reviewed_days"] == 3 and docs["features/app.md"]["reviewed_days"] is None
