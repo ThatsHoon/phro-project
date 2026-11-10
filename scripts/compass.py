@@ -62,9 +62,11 @@ def memory_dir(root):
     return Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path(root).resolve())) / "memory"
 
 
-def walk(start, skip):
+def walk(start, skip, nested=True):
+    """nested=False also leaves out folders that are their own git checkout, such as worktrees and the queue."""
     for folder, dirs, files in os.walk(start):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d not in skip and not (Path(folder) / d / "pyvenv.cfg").exists()]
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d not in skip and not (Path(folder) / d / "pyvenv.cfg").exists()
+                   and (nested or not (Path(folder) / d / ".git").exists())]
         for name in files:
             yield Path(folder) / name
 
@@ -80,12 +82,16 @@ def debt_items(root):
     """(path, line, kind, text, complete) for each lean or ponytail comment and each skipped test with no such comment."""
     manifest = manifest_or_none(root) or {}
     items = []
-    for path in sorted(walk(root, set(manifest.get("skip", [])))):
-        if path.suffix.lower() not in CODE_SUFFIXES or path.stat().st_size > DEBT_MAX_BYTES:
+    for path in sorted(walk(root, set(manifest.get("skip", [])), nested=False)):
+        try:
+            if path.suffix.lower() not in CODE_SUFFIXES or path.stat().st_size > DEBT_MAX_BYTES:
+                continue
+            text_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:  # vanished, unreadable or a broken link: skip it rather than stop the refresh
             continue
         rel = path.relative_to(root).as_posix()
         previous = None
-        for number, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+        for number, line in enumerate(text_lines, 1):
             marker = MARKER.search(line)
             if marker:
                 text = marker.group(1)
@@ -293,7 +299,7 @@ def stamp(root, names, accept_goal=False, drift=None):
         manifest["goal_sha"] = sha(goal_section(goals.read_text(encoding="utf-8")))
     if drift is not None:
         manifest["drift"] = drift[:DRIFT_CHARS]
-    manifest["debt"] = sorted(fingerprint(i) for i in debt_items(root))
+        manifest["debt"] = sorted(fingerprint(i) for i in debt_items(root))  # only a refresh moves the baseline
     save(root, manifest)
     return []
 

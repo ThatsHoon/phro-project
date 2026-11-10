@@ -9,7 +9,7 @@ Find what this change could lose. The best outcome for the diff is to get shorte
 
 ## Scope
 
-Review the diff or path the user named. With none named, review `git diff HEAD` (staged and unstaged) plus the untracked files `git status --short` lists, and say so in the first line. Read the whole diff, and grep every caller of a function before suggesting its deletion. Also run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/compass.py debt <project root>` and check the markers under the reviewed paths.
+Review the diff or path the user named. With none named, review `git diff HEAD` (staged and unstaged) plus the untracked files `git status --short` lists, and say so in the first line. Read the whole diff, and grep every caller of a function before suggesting its deletion. Also run `grep -rn "lean:\|ponytail:" <reviewed paths>` and check each marker's `when` against the code as it is now.
 
 ## Format
 

@@ -220,7 +220,10 @@ def debt_rules():
     text = SKILL.read_text(encoding="utf-8")
     for injected in (lean.main_text(), lean.sections(text, lean.SUB)):
         assert form in injected and "English comment" in injected, injected[:200]
-    has_all("skills/lean-review/SKILL.md", ("`debt:`", "compass.py debt"))
+    has_all("skills/lean-review/SKILL.md", ("`debt:`", "grep -rn \"lean:\\|ponytail:\" <reviewed paths>"))
+    assert "compass.py debt" not in (ROOT / "skills/lean-review/SKILL.md").read_text(encoding="utf-8")
+    step6_text = (ROOT / "skills/compass/SKILL.md").read_text(encoding="utf-8")
+    assert "already lists an open ticket" in step6_text
     step6 = next(l for l in (ROOT / "skills/compass/SKILL.md").read_text(encoding="utf-8").splitlines() if l.startswith("6. "))
     assert "`debt <root>`" in step6 and "when` is `owner`" in step6, step6
 

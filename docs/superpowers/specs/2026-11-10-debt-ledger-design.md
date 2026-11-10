@@ -42,12 +42,12 @@ gone	scripts/old.py	marker	...
 ```
 
 - `NEW` and `GONE` compare against the snapshot saved in `docs/core/core.json` under `debt` (a sorted list of fingerprints). With no snapshot, `NEW` is 0 and the line says `no baseline`.
-- `stamp` saves the current snapshot, so a refresh that ends with `stamp` moves the baseline. `debt` itself never writes.
+- `stamp --drift` (the refresh's stamp) saves the current snapshot; other stamps leave it, so a marker added between refreshes still shows as new. `debt` itself never writes. Nested git checkouts (worktrees, the queue) and unreadable files are skipped.
 
 ## Compass refresh
 
 - Refresh step 6 runs `debt` before writing the drift line, and appends `debt N (+K)` to it, in the user's language, inside the existing 200-character limit. Every session already receives the drift line, so nothing new is injected.
-- Refresh never pays debt. For a new marker whose `when` is `owner`, or one whose `when` the refresh can see is already true from the scan output alone, it opens a ticket with `queue.py ask` (the queue's normal dedup applies). Every other marker stays in code.
+- Refresh never pays debt. For a new marker whose `when` is `owner`, or one whose `when` the refresh can see is already true from the scan output alone, it opens a ticket with `queue.py ask` titled `debt: <path>: <ceiling>`, unless `board.json` already lists an open ticket with that title (`ask` itself has no dedup for new tickets). Every other marker stays in code.
 
 ## lean rules
 
@@ -56,7 +56,7 @@ gone	scripts/old.py	marker	...
 
 ## lean-review
 
-When it reviews a folder, it also runs `compass.py debt` on the project, takes the items under that folder, and reports each marker whose `when` already holds as a `debt:` finding with its `fix`. It still edits nothing.
+When it reviews a folder, it also greps the markers under that folder (the scan lists only new and incomplete ones), and reports each marker whose `when` already holds as a `debt:` finding with its `fix`. It still edits nothing.
 
 ## Existing comments
 

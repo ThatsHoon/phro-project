@@ -371,17 +371,33 @@ def debt_scan():
         mark = "# lean: one pass | when: input > 1e6 rows | fix: stream it\n"
         write(d, "src/b.py", mark)
         assert compass.stamp(d, []) == []
+        assert compass.debt_lines(d)[0].endswith("no baseline"), "only a refresh stamp (with --drift) moves the baseline"
+        assert compass.stamp(d, [], drift="") == []
         assert compass.debt_lines(d)[0] == "DEBT 1 NEW 0 GONE 0 INCOMPLETE 0 SKIP 0"
         write(d, "src/b.py", "\n\n" + mark)
         assert compass.debt_lines(d)[0].startswith("DEBT 1 NEW 0 GONE 0"), "a moved marker is not new"
         write(d, "src/b.py", mark + mark)
         lines = compass.debt_lines(d)
         assert lines[0].startswith("DEBT 2 NEW 1 GONE 0") and lines[1].startswith("new\tsrc/b.py:2\tmarker"), lines
-        assert compass.stamp(d, []) == []
+        assert compass.stamp(d, [], drift="") == []
         write(d, "src/b.py", mark)
         lines = compass.debt_lines(d)
         assert lines[0].startswith("DEBT 1 NEW 0 GONE 1") and lines[1].startswith("gone\tsrc/b.py\tmarker\tone pass"), lines
         assert compass.lint(d) == []
+    with tempfile.TemporaryDirectory() as d:
+        write(d, "src/ok.py", "# lean: kept | when: x | fix: y\n")
+        write(d, "src/locked.py", "# lean: unreadable\n")
+        write(d, ".worktrees/branch/.git", "gitdir: elsewhere\n")
+        write(d, ".worktrees/branch/src/ok.py", "# lean: kept | when: x | fix: y\n")
+        write(d, "queue/.git/HEAD", "ref: refs/heads/main\n")
+        write(d, "queue/tool.py", "# lean: nested repo | when: x | fix: y\n")
+        real = Path.read_text
+        def flaky(self, *a, **k):
+            if self.name == "locked.py":
+                raise PermissionError("denied")
+            return real(self, *a, **k)
+        with mock.patch.object(Path, "read_text", flaky):
+            assert compass.debt_lines(d)[0] == "DEBT 1 NEW 0 GONE 0 INCOMPLETE 0 SKIP 0 no baseline", compass.debt_lines(d)
     own = [i for i in compass.debt_items(SCRIPT.parents[1]) if i[0].startswith("scripts/") and not i[4]]
     assert not own, own
 
