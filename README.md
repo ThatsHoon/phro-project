@@ -422,6 +422,14 @@ claude plugin install queue-panel@queue-panel --scope local
 
 Then `/reload-plugins`. Every project registers the marketplace under the one name `queue-panel`; the panel code is the same in every copy, so the last one registered serves all of them.
 
+## Daily report
+
+A project's copy writes `docs/daily/<YYYY-MM-DD>(<요일>).md` on each weekday: what was finished since the previous weekday and what comes today, in short Korean list items (style in `skills/daily/SKILL.md`). No scheduler: `daily.py hook` runs at every session start and prompt, and the first one after 08:00 KST that finds today's file missing starts `daily.py run` in the background. `run` reads the tails of every session transcript of the project for the period (previous weekday 00:00 to today 00:00 KST, so Monday covers Friday to Sunday), the project's commits, the queue's closed and open tickets and the current goals in `docs/core/README.md`, asks `claude -p --model sonnet` with no tools, checks the form and writes the file. A failure is kept in `docs/daily/.state/<date>.error` and retried after 30 minutes. The original plugin never writes one.
+
+```bash
+python -I -X utf8 <copy>/scripts/daily.py run --force [--date YYYY-MM-DD]
+```
+
 ## Not done yet
 
 - Use of the design, route-test and audit skills in real work. A capability built on request and a step-triggered skill have only passed scripted checks, not a run with a model.

@@ -185,7 +185,8 @@ def hooks_json():
     assert hooks["SubagentStart"] == [lean], hooks.get("SubagentStart")
     assert hooks["UserPromptSubmit"][0] == lean, "lean first; the queue hook may follow"
     queue = 'python -I -X utf8 "${CLAUDE_PLUGIN_ROOT}/scripts/queue.py" hook'
-    assert hooks["UserPromptSubmit"][1:] == [{"hooks": [{"type": "command", "command": queue, "timeout": 5}]}], hooks["UserPromptSubmit"]
+    daily = 'python -I -X utf8 "${CLAUDE_PLUGIN_ROOT}/scripts/daily.py" hook'
+    assert hooks["UserPromptSubmit"][1:] == [{"hooks": [{"type": "command", "command": c, "timeout": 5}]} for c in (queue, daily)], hooks["UserPromptSubmit"]
     assert any(h["command"] == queue for e in starts for h in e["hooks"]), starts
 
 

@@ -30,6 +30,16 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I -X utf8 \"${CLAUDE_PLUGIN_ROOT}/scripts/daily.py\" hook",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SubagentStart": [
@@ -58,6 +68,15 @@
           {
             "type": "command",
             "command": "python -I -X utf8 \"${CLAUDE_PLUGIN_ROOT}/scripts/queue.py\" hook",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I -X utf8 \"${CLAUDE_PLUGIN_ROOT}/scripts/daily.py\" hook",
             "timeout": 5
           }
         ]
