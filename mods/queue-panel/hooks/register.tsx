@@ -40,20 +40,34 @@ async function refresh($: any, force = false) {
   await update($, board, () => next)
 }
 
+let opened = false // per module load: a reload starts over, so the first prompt after /reload-plugins opens it
+
+async function start($: any) {
+  if (opened) return
+  try {
+    await $.fs.stat(FILE)
+  } catch {
+    return // no queue in this project: stay out of the way
+  }
+  opened = true
+  await $.command.register({ name: 'queue-panel', description: 'Show the work queue beside the chat' })
+  await refresh($, true)
+  void $.ui.open({ id: PANE, title: TITLE })
+  $.clock.every(EVERY_MS, () => void refresh($))
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    try {
-      await $.fs.stat(FILE)
-    } catch {
-      return started // no queue in this project: stay out of the way
-    }
-    await $.command.register({ name: 'queue-panel', description: 'Show the work queue beside the chat' })
-    await refresh($, true)
-    void $.ui.open({ id: PANE, title: TITLE })
-    $.clock.every(EVERY_MS, () => void refresh($))
+    await start($)
     return started
   })
+
+  // session.start fires once per session, so a panel installed or reloaded mid-session opens at the next prompt
+  on('prompt.submit', async ($, e, next) => {
+    await start($)
+    return next(e)
+  }).catch(($, e, next) => next(e)) // a failed start never changes the prompt
 
   on('command.run', { command: 'queue-panel' }, async $ => {
     await refresh($, true)

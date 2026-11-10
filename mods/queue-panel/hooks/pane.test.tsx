@@ -32,16 +32,16 @@ const BOARD = {
 
 function world(on: any) {
   const disk = { text: JSON.stringify(BOARD), mtime: 1 }
-  const seen = { status: [] as (string | undefined)[], toasts: [] as string[], fills: [] as string[], submits: 0 }
+  const seen = { status: [] as (string | undefined)[], toasts: [] as string[], fills: [] as string[], submits: 0, opens: 0 }
   on('fs.stat', () => ({ value: { kind: 'file', size: disk.text.length, mtimeMs: disk.mtime } }))
   on('fs.read', () => ({ value: disk.text }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', () => { seen.opens++; return { value: { isPlaced: true } } })
   on('command.register', () => ({ value: { command: 'queue-panel' } }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('ui.status', (_: any, e: any) => { seen.status.push(e.text); return { value: undefined } })
   on('ui.toast', (_: any, e: any) => { seen.toasts.push(e.text); return { value: undefined } })
   on('prompt.fill', (_: any, e: any) => { seen.fills.push(e.text); return { isFilled: true } })
-  on('prompt.submit', () => { seen.submits++; return {} })
+  on('prompt.submit', (_: any, e: any) => { seen.submits++; return { text: e.text } })
   const clock = mock.clock(on)
   const write = (board: unknown) => { disk.text = typeof board === 'string' ? board : JSON.stringify(board); disk.mtime++ }
   return { seen, clock, write }
@@ -98,4 +98,13 @@ test('a queue.py run refreshes at once', async ($, on) => {
   write({ ...BOARD, tickets: [ticket('a', 'needs-owner', 1)] })
   await $.tool.call({ tool: 'Bash', command: 'python -I -X utf8 scripts/queue.py decide . b --text go' })
   expect(seen.status.at(-1)).toBe('waiting on you: 1')
+})
+
+test('installed mid-session (no session.start): the first prompt opens the panel, once', async ($, on) => {
+  const { seen } = world(on)
+  await $.prompt.submit({ text: 'hi' })
+  expect(seen.opens).toBe(1)
+  expect(seen.status.at(-1)).toBe('waiting on you: 2')
+  await $.prompt.submit({ text: 'again' })
+  expect(seen.opens).toBe(1)
 })
