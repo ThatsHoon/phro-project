@@ -178,7 +178,7 @@ def hooks_json():
     cmd = 'python -I -X utf8 "${CLAUDE_PLUGIN_ROOT}/scripts/lean.py" hook'
     hooks = json.loads((ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))["hooks"]
     starts = hooks["SessionStart"]
-    assert any("compass.py" in h["command"] and e["matcher"] == "startup|clear|compact" for e in starts for h in e["hooks"])
+    assert any("compass.py" in h["command"] and e["matcher"] == "startup|resume|clear|compact" for e in starts for h in e["hooks"])
     assert any(e.get("matcher") == "startup|resume|clear|compact" and e["hooks"] == [{"type": "command", "command": cmd, "timeout": 5}]
                for e in starts), starts
     for event in ("SubagentStart", "UserPromptSubmit"):

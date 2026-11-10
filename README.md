@@ -11,7 +11,7 @@ It has no universal structure, because plugins differ too much between projects.
 Always-on cost, in every session of every project where the plugin is enabled:
 
 - One skill description, `design`, about 80 tokens. The other four skills are not listed, so they cost nothing until you type them.
-- One `SessionStart` hook, at start, clear and compaction. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing. An index holding hidden text prints one warning instead. After a compaction it adds about 150 tokens telling the session to update the documents from its summary, which can take that session a few turns.
+- One `SessionStart` hook, at start, resume, clear and compaction. Resume matters for forks and sessions reopened after a restart, which otherwise never see a rule added since they began. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing. An index holding hidden text prints one warning instead. After a compaction it adds about 150 tokens telling the session to update the documents from its summary, which can take that session a few turns.
 
 ## 새 프로젝트에서 쓰기
 
