@@ -198,8 +198,11 @@ def style():
     return text[text.index("## Style"):].strip()
 
 
+HEADS = ["어제 완료:", "오늘 할 일:"]
+ITEM_MAX = 42  # "* " plus 40 characters
+
 PROMPT = """Write a Korean daily work report from the material below. Output only the report, nothing before or after it.
-Sections: `어제 완료:` (work finished or clearly advanced in the period) and `오늘 할 일:` (the next steps the material names: open questions, open tickets, the last replies' next actions, the current goals). Merge the same work across sessions. Leave out chatter, tool noise, file paths, ids and numbers nobody needs. When the period had no work, write `* 작업 없음` under 어제 완료.
+Exactly two sections, each heading once: `어제 완료:` (work finished or clearly advanced in the period) and `오늘 할 일:` (the next steps the material names: open questions, open tickets, the last replies' next actions, the current goals). Merge the same work across sessions into one item per piece of work. The reader is a teammate who never saw these sessions: say what was done in everyday words, the way a person posts it in the team chat. When the period had no work, write `* 작업 없음` under 어제 완료.
 
 {style}
 
@@ -213,11 +216,22 @@ def check(text):
     lines = [l.rstrip() for l in text.strip().strip("`").strip().splitlines()]
     if not lines or not lines[0].endswith(":"):
         raise ValueError(f"first line is not a heading: {lines[:1]}")
+    heads, count = [], {}
     for l in lines:
         if l and not (l.startswith("* ") or (l.endswith(":") and not l.startswith(("-", "#")))):
             raise ValueError(f"not a heading or a `* ` item: {l[:80]}")
-        if l.startswith("* ") and re.search(r"[다요]\.?$", l):
-            raise ValueError(f"item ends as a sentence: {l[:80]}")
+        if l.endswith(":") and not l.startswith("* "):
+            heads.append(l)
+        elif l:
+            if re.search(r"[다요]\.?$", l):
+                raise ValueError(f"item ends as a sentence: {l[:80]}")
+            if len(l) > ITEM_MAX:  # long items are where the jargon goes
+                raise ValueError(f"item longer than {ITEM_MAX - 2} characters: {l[:80]}")
+            count[heads[-1]] = count.get(heads[-1], 0) + 1
+    if heads != HEADS:
+        raise ValueError(f"headings must be exactly {HEADS}, got {heads}")
+    if any(n > 5 for n in count.values()):
+        raise ValueError(f"more than 5 items under one heading: {count}")
     return "\n".join(lines) + "\n"
 
 

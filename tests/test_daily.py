@@ -111,7 +111,13 @@ def test_session_text():
 def test_check():
     d = load(copy_of(Path(tempfile.mkdtemp())))
     assert d.check("```\n" + GOOD + "```") == GOOD
-    for bad in ("오늘은 홍수 모델을 개선할 예정입니다.", "어제 완료:\n* 홍수 모델을 만들었습니다", "어제 완료:\n- 홍수 모델", "# 일일\n어제 완료:\n* x"):
+    many = "어제 완료:\n" + "".join(f"* 일 {i}\n" for i in range(6)) + "\n오늘 할 일:\n* x\n"
+    for bad in ("오늘은 홍수 모델을 개선할 예정입니다.", "어제 완료:\n* 홍수 모델을 만들었습니다", "어제 완료:\n- 홍수 모델", "# 일일\n어제 완료:\n* x",
+                "어제 완료 - 재난:\n* x\n\n오늘 할 일:\n* y",  # one 어제 완료 heading, no split
+                "어제 완료:\n* x\n\n어제 완료:\n* y\n\n오늘 할 일:\n* z",
+                "어제 완료:\n* x",  # 오늘 할 일 missing
+                many,
+                "어제 완료:\n* 화재 복합 판독 실험 - 열원+연기(high) 단계 불통과로 종결, 열원+탄 자국(confirmed) 후보는 2024 봄 오탐 기준 통과\n\n오늘 할 일:\n* y"):
         try:
             d.check(bad)
         except ValueError:
