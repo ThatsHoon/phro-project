@@ -119,6 +119,7 @@ def test_check():
                 many,
                 "어제 완료:\n* 졸음운전 판정 실험 설계 (089 데이터)\n\n오늘 할 일:\n* y",  # internal numbers
                 "어제 완료:\n* 화재 열원+탄 자국 실험\n\n오늘 할 일:\n* y",  # symbol shorthand
+                "어제 완료:\n* 재난 분석 결과 화면 개선 (프런트 전달)\n\n오늘 할 일:\n* y",  # parentheses
                 "어제 완료:\n* 화재 복합 판독 실험 - 열원+연기(high) 단계 불통과로 종결, 열원+탄 자국(confirmed) 후보는 2024 봄 오탐 기준 통과\n\n오늘 할 일:\n* y"):
         try:
             d.check(bad)

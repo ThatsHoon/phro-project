@@ -227,8 +227,8 @@ def check(text):
                 raise ValueError(f"item ends as a sentence: {l[:80]}")
             if len(l) > ITEM_MAX:  # long items are where the jargon goes
                 raise ValueError(f"item longer than {ITEM_MAX - 2} characters: {l[:80]}")
-            if re.search(r"[0-9+?]", l):  # run numbers, versions, ports, `a+b` shorthand
-                raise ValueError(f"item holds a digit, `+` or `?`; say it in words: {l[:80]}")
+            if re.search(r"[0-9+?()\[\]]", l):  # run numbers, versions, ports, `a+b` shorthand, side notes
+                raise ValueError(f"item holds a digit, `+`, `?` or brackets; say it in words: {l[:80]}")
             count[heads[-1]] = count.get(heads[-1], 0) + 1
     if heads != HEADS:
         raise ValueError(f"headings must be exactly {HEADS}, got {heads}")
