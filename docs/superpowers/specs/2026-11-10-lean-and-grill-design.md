@@ -16,7 +16,7 @@ Success:
 ## Decisions (user, 2026-11-10)
 
 1. Names: `lean` and `grill`, inside phro-project.
-2. Only the ponytail core is forked. ponytail-review, -audit, -debt, -gain and -help are dropped. The debt harvest becomes one grep line in the rules.
+2. The ponytail core is forked, and ponytail-review is forked as `phro-project:lean-review`, an on-demand over-engineering review. ponytail-review was added at the user's word on 2026-11-10, after it showed 89 calls in 30 days. ponytail-audit, -debt, -gain and -help are dropped. The debt harvest becomes one grep line in the rules.
 3. There is one intensity. lite, full, ultra and the mode-tracking hook are gone.
 4. Subagents get the build rules plus output-saving report rules. They do not get the answer-shaping rules.
 5. `phro-lean on|off` switches the mode. The default is on, and off applies to the current session only. A global off is out of scope, because the user runs several forks at once.
@@ -186,7 +186,7 @@ Every existing test in `tests/` still passes.
 
 - A global off switch.
 - Intensity levels.
-- Porting ponytail-review, -audit, -debt, -gain or -help.
+- Porting ponytail-audit, -debt, -gain or -help.
 - A status line indicator.
 - Changes to karpathy-guidelines or other skills that overlap.
 - Detecting two enabled copies of phro-project in one project.

@@ -242,6 +242,62 @@
   git commit -m "grill: design-tree interview with rationale, tree file and round cap"
   ```
 
+### Task 3b: lean-review skill (user addition, 2026-11-10)
+
+**Files:**
+- Create: `skills/lean-review/SKILL.md`
+- Modify: `tests/test_lean.py`, `tests/route_cases.json`
+
+**Interfaces:**
+- SKILL.md frontmatter:
+  - `name: lean-review`
+  - The description is an over-engineering review of a diff or a named path: it finds what to delete. It keeps ponytail-review's triggers: "review for over-engineering", "what can we delete", "is this over-engineered", "simplify review", "과설계 리뷰", "뭘 지울 수 있어".
+
+- [ ] **Step 1: Add a failing check `lean_review_rules` to `tests/test_lean.py`**
+
+  `skills/lean-review/SKILL.md` contains each of these verbatim:
+  - `delete:`
+  - `stdlib:`
+  - `native:`
+  - `yagni:`
+  - `shrink:`
+  - `net: -<N> lines possible.`
+  - `Lean already. Ship.`
+  - `Correctness bugs, security holes and performance are out of scope`
+  - `Does not apply the fixes`
+
+- [ ] **Step 2: Run the tests and watch them fail**
+
+  Run: `python -I -X utf8 tests/test_lean.py`
+  Expected: FAIL at `lean_review_rules`.
+
+- [ ] **Step 3: Write `skills/lean-review/SKILL.md`**
+
+  Fork ponytail-review (`C:\Users\hunje\.claude\plugins\cache\ponytail\ponytail\4.10.0\skills\ponytail-review\SKILL.md`): the line format `<file>:L<line>: <tag> <what>. <replacement>.`, the five tags, the net score, the empty result, and the boundaries.
+  - Reword the text; do not paste it.
+  - Keep one example per tag.
+  - Drop the ❌ example.
+  - Read the whole diff and every caller of a function before suggesting its deletion.
+  - When no diff is named, review `git diff` of the working tree, and say so in the first line.
+  - A `lean:` or `ponytail:` comment marks a deliberate corner. Flag it only if its stated ceiling has been reached.
+  - The one runnable check that lean's Build rules leave behind is never flagged.
+
+- [ ] **Step 4: Add routing cases**
+
+  - `r01`, skill `lean-review`: "이 diff 과설계 리뷰해줘, 지울 수 있는 것만 뽑아"
+  - `r02`, skill `lean-review`: "review this PR for over-engineering, what can we delete"
+
+- [ ] **Step 5: Run the tests**
+
+  Run: `python -I -X utf8 tests/test_lean.py`
+  Expected: `pass`.
+
+- [ ] **Step 6: Commit**
+  ```bash
+  git add skills/lean-review/SKILL.md tests/test_lean.py tests/route_cases.json
+  git commit -m "lean-review: over-engineering review forked from ponytail-review"
+  ```
+
 ### Task 4: notices, README, version
 
 **Files:**
@@ -264,7 +320,7 @@
     - what lean injects, and where (session versus subagent);
     - `phro-lean on|off` and that it is per session;
     - that lean stays silent while ponytail or i-have-adhd is enabled;
-    - what grill does;
+    - what grill and lean-review do;
     - a pointer to THIRD_PARTY_NOTICES.md.
   - In `plugin.json`, set `"version": "0.5.0"` and append ", and an always-on working style with a design interview" to the description.
 
