@@ -109,11 +109,11 @@ def debt_lines(root):
     if baseline is not None:
         new, gone = now - collections.Counter(baseline), collections.Counter(baseline) - now
     rows, left = [], dict(new)
-    for item in items:  # the last copies of a fingerprint are the new ones
+    for item in reversed(items):  # the last copies of a fingerprint are the new ones
         key = fingerprint(item)
         if left.get(key):
             left[key] -= 1
-            rows.append(("new", item))
+            rows.insert(0, ("new", item))
     rows += [("skip", i) for i in items if i[2] == "skip"]
     rows += [("incomplete", i) for i in items if i[2] == "marker" and not i[4]]
     shown = [f"{state}\t{i[0]}:{i[1]}\t{i[2]}\t{i[3]}" for state, i in rows]
@@ -293,6 +293,7 @@ def stamp(root, names, accept_goal=False, drift=None):
         manifest["goal_sha"] = sha(goal_section(goals.read_text(encoding="utf-8")))
     if drift is not None:
         manifest["drift"] = drift[:DRIFT_CHARS]
+    manifest["debt"] = sorted(fingerprint(i) for i in debt_items(root))
     save(root, manifest)
     return []
 

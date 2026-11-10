@@ -366,6 +366,22 @@ def debt_scan():
         write(d, "src/huge.py", "# lean: big\n" + "x = 1\n" * 400_000)
         (Path(d) / "src/noise.py").write_bytes(os.urandom(4096))
         compass.debt_lines(d)
+    with tempfile.TemporaryDirectory() as d:
+        clean(d)
+        mark = "# lean: one pass | when: input > 1e6 rows | fix: stream it\n"
+        write(d, "src/b.py", mark)
+        assert compass.stamp(d, []) == []
+        assert compass.debt_lines(d)[0] == "DEBT 1 NEW 0 GONE 0 INCOMPLETE 0 SKIP 0"
+        write(d, "src/b.py", "\n\n" + mark)
+        assert compass.debt_lines(d)[0].startswith("DEBT 1 NEW 0 GONE 0"), "a moved marker is not new"
+        write(d, "src/b.py", mark + mark)
+        lines = compass.debt_lines(d)
+        assert lines[0].startswith("DEBT 2 NEW 1 GONE 0") and lines[1].startswith("new\tsrc/b.py:2\tmarker"), lines
+        assert compass.stamp(d, []) == []
+        write(d, "src/b.py", mark)
+        lines = compass.debt_lines(d)
+        assert lines[0].startswith("DEBT 1 NEW 0 GONE 1") and lines[1].startswith("gone\tsrc/b.py\tmarker\tone pass"), lines
+        assert compass.lint(d) == []
 
 
 
