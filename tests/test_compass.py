@@ -338,7 +338,35 @@ def demo():
         out = run_hook(d).stdout
         assert "`goals.md`" in out and "밀렸다" not in out, "a hidden drift line stays out, the index stays in"
     queue_rule()
+    debt_scan()
     print("ok")
+
+
+def debt_scan():
+    with tempfile.TemporaryDirectory() as d:
+        write(d, "src/a.py", 'x = 1  # lean: one pass only | when: input > 1e6 rows | fix: stream it\n'
+                             '# lean: rough guess\n# ponytail: old style\ns = "lean: not a comment"\n')
+        write(d, "notes.md", "# lean: in docs | when: never | fix: none\n")
+        write(d, "tests/test_a.py", "# lean: needs GPU | when: CI has a GPU | fix: unskip\n@pytest.mark.skip\ndef t(): pass\n\n"
+                                    "@pytest.mark.xfail\ndef u(): pass\n")
+        write(d, "web/a.test.cjs", 'it.skip("x", () => {})\n')
+        write(d, "runs/big.py", "# lean: ignored | when: x | fix: y\n")
+        lines = compass.debt_lines(d)
+        assert lines[0] == "DEBT 7 NEW 0 GONE 0 INCOMPLETE 2 SKIP 2 no baseline", lines
+        assert any(l.startswith("incomplete\tsrc/a.py:2\tmarker\trough guess") for l in lines), lines
+        assert not any("notes.md" in l or "not a comment" in l for l in lines), lines
+        write(d, "docs/core/core.json", json.dumps({"skip": ["runs"], "docs": []}))
+        assert compass.debt_lines(d)[0] == "DEBT 6 NEW 0 GONE 0 INCOMPLETE 2 SKIP 2 no baseline"
+        ran = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "debt", d], capture_output=True, text=True, encoding="utf-8")
+        assert ran.returncode == 0 and ran.stdout.splitlines()[0] == "DEBT 6 NEW 0 GONE 0 INCOMPLETE 2 SKIP 2 no baseline", ran.stdout + ran.stderr
+        write(d, "src/many.py", "".join(f"# lean: corner {i}\n" for i in range(60)))
+        lines = compass.debt_lines(d)
+        assert lines[0] == "DEBT 66 NEW 0 GONE 0 INCOMPLETE 62 SKIP 2 no baseline", lines[0]
+        assert len(lines) == 52 and lines[-1].startswith("and 14 more"), (len(lines), lines[-1])
+        write(d, "src/huge.py", "# lean: big\n" + "x = 1\n" * 400_000)
+        (Path(d) / "src/noise.py").write_bytes(os.urandom(4096))
+        compass.debt_lines(d)
+
 
 
 def queue_rule():

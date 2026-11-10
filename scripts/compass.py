@@ -25,6 +25,12 @@ SHOWN = 100
 SHOWN_DOCS = 30
 DOC_SUFFIXES = {".md", ".rst", ".adoc"}
 DRIFT_CHARS = 200
+CODE_SUFFIXES = {".py", ".js", ".cjs", ".mjs", ".ts", ".tsx", ".jsx", ".sh", ".ps1", ".go", ".rs", ".java", ".kt", ".swift",
+                 ".c", ".h", ".cpp", ".cs", ".rb", ".html", ".css", ".yml", ".yaml", ".toml"}
+DEBT_SHOWN = 50
+DEBT_MAX_BYTES = 1_000_000
+MARKER = re.compile(r"(?:#|//|/\*|\*|<!--|--)\s*(?:lean|ponytail):\s*(.*?)\s*(?:\*/|-->)?\s*$")
+SKIPPED = re.compile(r"pytest\.mark\.(?:skip|xfail)|pytest\.skip\(|unittest\.skip|\b(?:it|test|describe)\.skip\(|\bx(?:it|describe)\(")
 
 # The same lists as the style check in phro-search, cut to what a reference document can trip on.
 MARKS = ["Generated with", "Co-Authored-By", "Written by Claude", "AI-generated", "as an AI", "Claude가 작성", "AI가 작성", "AI 요약", "언어 모델로서",
@@ -61,6 +67,63 @@ def walk(start, skip):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d not in skip and not (Path(folder) / d / "pyvenv.cfg").exists()]
         for name in files:
             yield Path(folder) / name
+
+
+def manifest_or_none(root):
+    try:
+        return load(root)
+    except (OSError, ValueError):
+        return None
+
+
+def debt_items(root):
+    """(path, line, kind, text, complete) for each lean or ponytail comment and each skipped test with no such comment."""
+    manifest = manifest_or_none(root) or {}
+    items = []
+    for path in sorted(walk(root, set(manifest.get("skip", [])))):
+        if path.suffix.lower() not in CODE_SUFFIXES or path.stat().st_size > DEBT_MAX_BYTES:
+            continue
+        rel = path.relative_to(root).as_posix()
+        previous = None
+        for number, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+            marker = MARKER.search(line)
+            if marker:
+                text = marker.group(1)
+                items.append((rel, number, "marker", text, bool(re.search(r"\|\s*when:", text, re.I))))
+            elif SKIPPED.search(line) and not (previous and MARKER.search(previous)):
+                items.append((rel, number, "skip", line.strip(), False))
+            previous = line
+    return items
+
+
+def fingerprint(item):
+    path, _, kind, text, _ = item
+    return f"{path}\t{kind}\t{' '.join(text.split())}"
+
+
+def debt_lines(root):
+    items = debt_items(root)
+    baseline = (manifest_or_none(root) or {}).get("debt")
+    now = collections.Counter(fingerprint(i) for i in items)
+    new, gone = collections.Counter(), collections.Counter()
+    if baseline is not None:
+        new, gone = now - collections.Counter(baseline), collections.Counter(baseline) - now
+    rows, left = [], dict(new)
+    for item in items:  # the last copies of a fingerprint are the new ones
+        key = fingerprint(item)
+        if left.get(key):
+            left[key] -= 1
+            rows.append(("new", item))
+    rows += [("skip", i) for i in items if i[2] == "skip"]
+    rows += [("incomplete", i) for i in items if i[2] == "marker" and not i[4]]
+    shown = [f"{state}\t{i[0]}:{i[1]}\t{i[2]}\t{i[3]}" for state, i in rows]
+    shown += ["gone\t" + key for key in sorted(gone.elements())]
+    head = (f"DEBT {len(items)} NEW {sum(new.values())} GONE {sum(gone.values())} "
+            f"INCOMPLETE {sum(1 for i in items if i[2] == 'marker' and not i[4])} SKIP {sum(1 for i in items if i[2] == 'skip')}")
+    if baseline is None:
+        head += " no baseline"
+    tail = [f"and {len(shown) - DEBT_SHOWN} more"] if len(shown) > DEBT_SHOWN else []
+    return [head] + shown[:DEBT_SHOWN] + tail
 
 
 def source_files(root, pattern, skip):
@@ -360,7 +423,11 @@ def main():
     p.add_argument("--accept-goal", action="store_true", help="the user changed the final goal")
     p.add_argument("--drift", help="one line for every session on work that serves no goal; empty clears it")
     sub.add_parser("usage", help="how often sessions open each document, counted from this project's transcripts").add_argument("root")
+    sub.add_parser("debt", help="lean and ponytail comments and unmarked skipped tests, against the last stamp").add_argument("root")
     args = parser.parse_args()
+    if args.command == "debt":
+        print("\n".join(debt_lines(args.root)))
+        return
     if args.command == "hook":
         return hook()
     if args.command == "usage":
