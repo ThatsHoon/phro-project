@@ -1,0 +1,14 @@
+{
+  "name": "queue-panel",
+  "owner": {
+    "name": "thatshoon"
+  },
+  "description": "The work queue panel of phro-project, loaded from this folder.",
+  "plugins": [
+    {
+      "name": "queue-panel",
+      "source": "./",
+      "description": "Shows the project's decision queue and running work beside the chat, from queue/board.json."
+    }
+  ]
+}

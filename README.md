@@ -381,7 +381,14 @@ Sessions and forks that need the owner's decision file a ticket instead of waiti
 
 ### The queue panel
 
-The panel (`mods/queue-panel/`) reads `queue/board.json` only: waiting decisions with an answer button that fills `/inbox <id>`, running work with the last line of its record, blocked and thrice-returned counts, and what closed in 7 days. How to turn it on is written here when the panel ships.
+The panel (`mods/queue-panel/`) reads `queue/board.json` only: waiting decisions with an answer button that fills `/inbox <id>`, running work with the last line of its record, blocked and thrice-returned counts, and what closed in 7 days. It is a plugin of its own, because a plugin's panel state belongs to that plugin's name and each project's copy has another name. `init` turns it on for one project, from the project folder:
+
+```bash
+claude plugin marketplace add <the project's copy>/mods/queue-panel --scope local
+claude plugin install queue-panel@queue-panel --scope local
+```
+
+Then `/reload-plugins`. Every project registers the marketplace under the one name `queue-panel`; the panel code is the same in every copy, so the last one registered serves all of them.
 
 ## Not done yet
 

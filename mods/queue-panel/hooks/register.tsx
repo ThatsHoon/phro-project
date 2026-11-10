@@ -65,7 +65,7 @@ export const register: Register = on => {
     const ran = await next(e)
     if ((e.tool === 'Bash' || e.tool === 'PowerShell') && String((e as any).command ?? '').includes('queue.py')) await refresh($)
     return ran
-  })
+  }).catch(($, e, next) => next(e)) // a failed refresh never changes the tool call's result
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
