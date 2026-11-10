@@ -59,7 +59,10 @@ def write_atomic(path, text):
 
 def read_ticket(path):
     """Parse one ticket; ValueError when it is not one."""
-    text = Path(path).read_text(encoding="utf-8")
+    return parse_ticket(Path(path).read_text(encoding="utf-8"), Path(path).stem)
+
+
+def parse_ticket(text, tid):
     m = re.match(r"---\n(.*?)\n---\n(.*)\Z", text, re.S)
     if not m:
         raise ValueError("no frontmatter")
@@ -74,13 +77,15 @@ def read_ticket(path):
     if meta["status"] not in STATES or meta["priority"] not in ("1", "2", "3"):
         raise ValueError("bad status or priority")
     links = json.loads(meta["links"])
+    if not isinstance(links, list) or not all(isinstance(l, str) for l in links):
+        raise ValueError("links is not a list of paths")
     body = m.group(2).splitlines()
     if not body or not body[0].startswith("# "):
         raise ValueError("no title")
     options = [l[2:] for l in body if l.startswith("- ")]
     decisions = [l[len("decision: "):] for l in body if l.startswith("decision: ")]
     question = "\n".join(l for l in body[1:] if l.strip() and not l.startswith(("- ", "decision: "))).strip()
-    return {"id": Path(path).stem, "title": body[0][2:], "status": meta["status"], "waiting_on": meta["waiting_on"],
+    return {"id": tid, "title": body[0][2:], "status": meta["status"], "waiting_on": meta["waiting_on"],
             "priority": int(meta["priority"]), "priority_reason": meta["priority_reason"], "session": meta["session"],
             "links": links, "returns": int(meta["returns"]), "question": question, "options": options,
             "decisions": decisions}
@@ -239,9 +244,20 @@ def ticket_path(root, tid):
 
 
 def save(root, path, t, message):
-    write_atomic(path, render_ticket(t))
+    text = render_ticket(t)
+    try:  # a newline in a one-line field would turn into another field or a decision
+        back = parse_ticket(text, path.stem)
+    except ValueError as e:
+        raise Refused(f"a field would not read back: {e}")
+    if any(back[k] != t[k] for k in back if k != "id"):
+        raise Refused("a field would not read back the same: keep titles, options, reasons and answers on one line")
+    write_atomic(path, text)
     commit(root, message, [f"tickets/{path.name}"])
     return path
+
+
+def git_out(root, *args):
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8").stdout.strip()
 
 
 def cmd_init(a):
@@ -255,8 +271,10 @@ def cmd_init(a):
         exclude = exclude if exclude.is_absolute() else Path(a.root) / exclude
         exclude.parent.mkdir(parents=True, exist_ok=True)
         old = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-        if f"/{QUEUE}/" not in old.split() and f"{QUEUE}/" not in old.split():
-            exclude.write_text(old + ("" if old.endswith("\n") or not old else "\n") + f"{QUEUE}/\n", encoding="utf-8")
+        prefix = git_out(a.root, "rev-parse", "--show-prefix")  # the root may sit inside the outer repo
+        entry = f"/{prefix}{QUEUE}/"  # anchored, so a src/queue/ elsewhere stays visible
+        if entry not in old.split():
+            exclude.write_text(old + ("" if old.endswith("\n") or not old else "\n") + entry + "\n", encoding="utf-8")
     (q / "tickets").mkdir(parents=True, exist_ok=True)
     git(a.root, "init", "-q")
     git(a.root, "config", "core.autocrlf", "false")
@@ -272,7 +290,7 @@ def cmd_ask(a):
             raise Refused(f"already decided: {path.as_posix()}")
         if a.title:
             t["title"] = a.title
-        t.update(question=a.question, options=a.option, priority=a.priority, priority_reason=a.reason, session=a.session)
+        t.update(question=one_block(a.question), options=a.option, priority=a.priority, priority_reason=a.reason, session=a.session)
         t["links"] = t["links"] + [l for l in links_of(a) if l not in t["links"]]
         set_status(t, "needs-owner")
     else:
@@ -282,8 +300,13 @@ def cmd_ask(a):
         path = tickets / f"{slug(a.title, time.strftime('%Y%m%d'), tickets)}.md"
         t = {"title": a.title, "status": "needs-owner", "waiting_on": "owner", "priority": a.priority,
              "priority_reason": a.reason, "session": a.session, "links": links_of(a), "returns": 0,
-             "question": a.question, "options": a.option, "decisions": []}
+             "question": one_block(a.question), "options": a.option, "decisions": []}
     return save(a.root, path, t, f"ask {path.stem}"), None
+
+
+def one_block(text):
+    """The question as it reads back: no blank lines, no outer spaces."""
+    return "\n".join(l for l in text.splitlines() if l.strip()).strip()
 
 
 def links_of(a):

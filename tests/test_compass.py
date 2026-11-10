@@ -5,6 +5,7 @@ Run: python -I -X utf8 tests/test_compass.py
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -347,6 +348,11 @@ def queue_rule():
         write(d, "queue/board.json", "{}")
         out = run_hook(d).stdout
         assert "open a ticket with" in out and queue_py in out and Path(d).as_posix() in out, out
+        commands = [c.split(" <")[0] for c in re.findall(r"`([^`]*queue\.py[^`]*)`", out)]
+        assert len(commands) == 2, out
+        for c in commands:  # each command the rule gives must parse as written
+            ran = subprocess.run(shlex.split(c) + ["--help"], capture_output=True, text=True, encoding="utf-8")
+            assert ran.returncode == 0 and "usage:" in ran.stdout, c + ran.stderr
         clean(d)
         out = run_hook(d).stdout
         assert "`features/app.md`" in out and out.index("`features/app.md`") < out.index("open a ticket with"), out

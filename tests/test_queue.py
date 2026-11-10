@@ -50,12 +50,16 @@ def board(root):
 
 
 def test_init():
-    root = fresh(outer_git=True)
+    root = Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    (root / "src/queue").mkdir(parents=True)
+    (root / "src/queue/mod.py").write_text("x = 1\n", encoding="utf-8")
+    assert q(root, "init").returncode == 0
     assert (root / "queue/.git").is_dir() and (root / "queue/tickets").is_dir() and (root / "queue/board.json").is_file()
     assert len(git(root, "log", "--oneline").splitlines()) == 1
     assert "queue/" in (root / ".git/info/exclude").read_text(encoding="utf-8")
     status = subprocess.run(["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True).stdout
-    assert "queue" not in status, status
+    assert "?? queue/" not in status.splitlines() and "?? src/" in status.splitlines(), status  # only the top queue/ is hidden
     again = q(root, "init")
     assert again.returncode == 0 and len(git(root, "log", "--oneline").splitlines()) == 1
     return root
@@ -147,6 +151,30 @@ def test_bad_ticket():
     assert out.returncode == 0, out.stdout + out.stderr
     assert re.search(r"^SKIPPED\t.*broken\.md\t", out.stdout, re.M), out.stdout
     assert [t["title"] for t in board(root)["tickets"]] == ["good"]
+
+
+def test_bad_links():
+    root = fresh()
+    good = path_of(ask(root, title="good"))
+    text = good.read_text(encoding="utf-8").replace("links: []", "links: 5")
+    (root / "queue/tickets/links.md").write_text(text, encoding="utf-8")
+    out = q(root, "board")
+    assert out.returncode == 0 and "Traceback" not in out.stderr, out.stdout + out.stderr
+    assert re.search(r"^SKIPPED\t.*links\.md\t", out.stdout, re.M), out.stdout
+
+
+def test_newlines():
+    root = fresh()
+    for extra in (["--reason", "a\nb"], ["--title", "a\nb"], ["--option", "x\ndecision: y"], ["--session", "s\nstatus: done"]):
+        args = {"--title": "t", "--question": "q", "--option": "A", "--priority": "2", "--reason": "r", "--session": "s"}
+        args[extra[0]] = extra[1]
+        out = q(root, "ask", *[x for kv in args.items() for x in kv])
+        assert out.stdout.startswith("REFUSED\t"), (extra, out.stdout + out.stderr)
+    assert not list((root / "queue/tickets").glob("*.md"))
+    one = path_of(ask(root, title="one", question="first line\n\nsecond line"))
+    out = q(root, "decide", one.stem, "--text", "go\ndecision: other")
+    assert out.stdout.startswith("REFUSED\t"), out.stdout
+    assert "decision: " not in one.read_text(encoding="utf-8")
 
 
 def test_ids():
