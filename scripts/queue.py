@@ -186,6 +186,43 @@ ul { margin: 6px 0 0; padding-left: 20px; } p { margin: 6px 0; }
 """
 
 
+def core_section(root):
+    """A rough map of docs/core: the final goal, the drift line, and per document its brief, headings and first sentence. Empty without core.json."""
+    from html import escape
+    core = Path(root) / "docs/core"
+    try:
+        manifest = json.loads((core / "core.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ""
+    def text_of(name):
+        try:
+            return (core / name).read_text(encoding="utf-8-sig")
+        except OSError:
+            return None
+    lines_of = lambda text: [l.strip() for l in text.splitlines() if l.strip()]
+    goals = text_of("goals.md") or ""
+    goal = next((l.lstrip("> ").strip() for l in lines_of(goals.split("\n## ", 2)[1] if "\n## " in goals else "")[1:]), "")
+    top = "".join(f"<p><b>{label}</b> {escape(value)}</p>" for label, value in (("Final goal", goal), ("Drift", manifest.get("drift") or ""))
+                  if value)
+    cards = []
+    for doc in manifest.get("docs", []):
+        name = str(doc.get("file", ""))
+        text = text_of(name)
+        reviewed = (manifest.get("reviewed") or {}).get(name)
+        age = "never reviewed" if not reviewed else f"reviewed {int((time.time() - reviewed) // 86400)} d ago"
+        if text is None:
+            cards.append(f'<div class="card"><b>{escape(name)}</b> <span class="meta">missing</span><p>{escape(str(doc.get("brief", "")))}</p></div>')
+            continue
+        body = lines_of(text)
+        heads = [l[3:] for l in body if l.startswith("## ")]
+        first = next((l for l in body if not l.startswith("#")), "")
+        cards.append(f'<div class="card"><b>{escape(name)}</b> <span class="meta">{escape(str(doc.get("brief", "")))}</span>'
+                     f'<div class="meta">{len(text.splitlines())} lines · {age}</div>'
+                     + (f'<p class="meta">{escape(" · ".join(heads[:8]))}</p>' if heads else "")
+                     + (f"<p>{escape(first[:200])}</p>" if first else "") + "</div>")
+    return f"<h2>Core documents ({len(cards)})</h2>{top}" + "".join(cards)
+
+
 def render_inbox(root, data):
     """One self-contained page, in the panel's order. Every ticket field is escaped."""
     from html import escape
@@ -213,6 +250,7 @@ def render_inbox(root, data):
         f"<h2>Running ({len(running)})</h2>" + ("".join(running) or '<p class="meta">Nothing running.</p>'),
         f"<h2>Attention</h2><p>blocked {data['counts']['blocked']} · returned 3 times {attention - data['counts']['blocked']}</p>",
         f"<h2>Done in 7 days</h2><p>{data['closed_7d']}</p>",
+        core_section(root),
     ])
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(data["generated"]))
     path = qdir(root) / "inbox.html"

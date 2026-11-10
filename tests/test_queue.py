@@ -208,6 +208,26 @@ def test_inbox():
     assert html.index("Running") < html.index("halfway there")
     assert "http://" not in html and "https://" not in html
     assert "<title>Work queue</title>" in html
+    assert "Core documents" not in html, "no docs/core, no section"
+
+
+def test_core_docs():
+    root = fresh()
+    core = root / "docs/core"
+    (core / "features").mkdir(parents=True)
+    (core / "goals.md").write_text("# Goals\n\n## Final goal\n\n> Ship five <b>stable</b> APIs.\n\n## Now\n\n- billing first\n", encoding="utf-8")
+    (core / "features/app.md").write_text("# App\n\nThe entry point is `src/app.py`.\n\n## Flow\n\ntext\n\n## Traps\n\ntext\n", encoding="utf-8")
+    (core / "core.json").write_text(json.dumps({"drift": "billing has no recent work", "reviewed": {"goals.md": time.time() - 3 * 86400},
+                                                "docs": [{"file": "goals.md", "brief": "what we aim at"},
+                                                         {"file": "features/app.md", "brief": "the app"},
+                                                         {"file": "gone.md", "brief": "deleted file"}]}), encoding="utf-8")
+    assert q(root, "board").returncode == 0
+    html = (root / "queue/inbox.html").read_text(encoding="utf-8")
+    sec = html[html.index("Core documents"):]
+    for s in ("Ship five &lt;b&gt;stable&lt;/b&gt; APIs.", "billing has no recent work", "goals.md", "what we aim at", "Final goal · Now",
+              "features/app.md", "The entry point is `src/app.py`.", "Flow · Traps", "3 d", "never reviewed", "gone.md", "missing"):
+        assert s in sec, s
+    assert "<b>stable</b>" not in html
 
 
 def main():
