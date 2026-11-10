@@ -22,7 +22,7 @@ SUB = ["Build", "Report"]
 HEADER = "PHRO-LEAN ON. The rules below apply to every response in this session."
 ORIGINALS = ("ponytail@", "i-have-adhd@")
 TOKEN = re.compile(r"[A-Za-z0-9_-]+")
-SWITCH = re.compile(r"\s*/?(?:phro-lean|phro-project:lean)\s+(on|off)\s*\Z", re.I)
+SWITCH = re.compile(r"\s*/?(?:phro-lean|phro-project[\w.-]*:lean)\s+(on|off)\s*\Z", re.I)
 OFF_TEXT = 'PHRO-LEAN OFF for this session: stop applying the lean rules from here on. "phro-lean on" brings them back.'
 GUARD_NOTE = " (ponytail or i-have-adhd is still enabled, so lean injects nothing until they are disabled.)"
 

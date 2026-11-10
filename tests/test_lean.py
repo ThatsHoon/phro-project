@@ -129,6 +129,14 @@ def toggle():
     assert run(start("s1", cwd, "resume"), config, cwd)[1] == ""
 
 
+def copy_toggle():
+    import lean
+    config, cwd = fresh()
+    assert run(prompt("/other-plugin:lean off", "s1", cwd), config, cwd)[1] == ""
+    assert run(prompt("/phro-project_e-call:lean off", "s1", cwd), config, cwd)[1].strip() == lean.OFF_TEXT
+    assert run(sub("s1", cwd), config, cwd)[1] == ""
+
+
 def mention_only():
     config, cwd = fresh()
     for text in ("phro-lean off 하면 어떻게 돼?", "please run\nphro-lean off", "what is phro-lean"):
@@ -207,7 +215,7 @@ def review_fixes():
 
 
 CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules,
-          toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules, review_fixes]
+          toggle, copy_toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules, review_fixes]
 
 
 def main():
