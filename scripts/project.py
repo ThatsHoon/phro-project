@@ -28,7 +28,7 @@ SKIP = {".git", "__pycache__", "node_modules", "results", ".venv"}
 TEXT = {".md", ".py", ".json", ".yaml", ".yml", ".sh", ".js", ".ts", ".tsx", ".cjs", ".mjs", ".toml", ".txt", ".ps1", ".jsonl"}
 LISTING_LIMIT = 1536  # description + when_to_use, cut off in the skill listing beyond this
 LONG_BODY_TOKENS = 5000  # a compaction re-attaches a skill cut to its first 5,000 tokens
-OVERLAP_MIN = 0.25  # ponytail: word Jaccard only finds candidates; semantic overlap is the model's call in audit
+OVERLAP_MIN = 0.25  # lean: word Jaccard only finds candidates | when: audit misses an overlap the user spots | fix: let the model judge overlap in audit
 SHARED_LINES_MIN = 3
 PATH_REF = re.compile(r"(?<![\w./-])((?:references|scripts|hooks|agents|skills|commands|assets|templates|fixtures)/[\w./-]*\w\.\w+)")
 MD_LINK = re.compile(r"\]\(([^)#:\s<>]+\.\w+)\)")
@@ -44,7 +44,7 @@ SKILL_CALL = '"skill"\\s*:\\s*"(?:[\\w-]+:)?{}"'
 
 
 def tokens(text):
-    return len(text.encode("utf-8")) // 4  # ponytail: rough byte estimate; `claude plugin details` has the real listing cost
+    return len(text.encode("utf-8")) // 4  # lean: rough byte estimate | when: a listing-cost decision rests on it | fix: read claude plugin details
 
 
 def plugin_root(path):

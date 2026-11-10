@@ -214,8 +214,20 @@ def review_fixes():
     has_all("skills/lean-review/SKILL.md", ("git diff HEAD", "untracked"))
 
 
+def debt_rules():
+    import lean
+    form = "lean: <ceiling> | when: <trigger> | fix: <upgrade path>"
+    text = SKILL.read_text(encoding="utf-8")
+    for injected in (lean.main_text(), lean.sections(text, lean.SUB)):
+        assert form in injected and "English comment" in injected, injected[:200]
+    has_all("skills/lean-review/SKILL.md", ("`debt:`", "compass.py debt"))
+    step6 = next(l for l in (ROOT / "skills/compass/SKILL.md").read_text(encoding="utf-8").splitlines() if l.startswith("6. "))
+    assert "`debt <root>`" in step6 and "when` is `owner`" in step6, step6
+
+
 CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules,
-          toggle, copy_toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules, review_fixes]
+          toggle, copy_toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules, review_fixes,
+          debt_rules]
 
 
 def main():

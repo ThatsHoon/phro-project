@@ -42,7 +42,7 @@ DATE = re.compile(r"(?<!\d)20\d\d[-./]\d{1,2}[-./]\d{1,2}(?!\d)")
 CHAIN = re.compile(r"\bv\d+\s*(?:->|→)\s*v\d+", re.I)
 TICKED = re.compile(r"`([^`\n]+)`")
 LINK = re.compile(r"\]\(([^)\s]+)\)")
-# ponytail: text a reader of the page never sees. Plain instructions in a repository's docs are the same exposure as its CLAUDE.md, so they pass.
+# lean: blocks hidden text only, plain doc text passes like CLAUDE.md | when: a plain-text injection is seen | fix: owner reviews index changes
 HIDDEN = re.compile(r"[\U0000200B-\U0000200D\U00002060\U00002062-\U00002064\U0000FEFF\U0000202A-\U0000202E\U00002066-\U00002069\U000E0000-\U000E007F]"
                     r"|<!--|<[a-z]+\s[^>]*(?:display\s*:\s*none|visibility\s*:\s*hidden|\bhidden\b)", re.I)
 

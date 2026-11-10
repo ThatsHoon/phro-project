@@ -136,7 +136,7 @@ def last_line(root, links):
 
 
 def age_of(root, path):
-    # ponytail: one git call per ticket; batch with one `git log` if a queue grows past a few hundred tickets
+    # lean: one git call per ticket | when: queue > 300 tickets | fix: batch with one git log
     r = git(root, "log", "--diff-filter=A", "--format=%ct", "--", f"tickets/{path.name}", check=False)
     stamps = r.stdout.split()
     born = int(stamps[-1]) if stamps else int(path.stat().st_mtime)
@@ -154,7 +154,7 @@ def board(root):
             print(f"SKIPPED\t{path.as_posix()}\t{e}")
             continue
         counts[t["status"]] += 1
-        if t["status"] == "done" and path.stat().st_mtime >= week:  # ponytail: done time = file time, add a field if edits blur it
+        if t["status"] == "done" and path.stat().st_mtime >= week:  # lean: done time = file mtime | when: edits after done skew the weekly count | fix: add a done_at field
             closed += 1
         rows.append({"id": t["id"], "title": t["title"], "status": t["status"], "priority": t["priority"],
                      "session": t["session"], "age_s": age_of(root, path), "returns": t["returns"],
@@ -286,7 +286,7 @@ def cmd_ask(a):
     if a.ticket:
         path = ticket_path(a.root, a.ticket)
         t = read_ticket(path)
-        if t["decisions"] and t["question"] == a.question:  # ponytail: checks the current question only, not earlier ones
+        if t["decisions"] and t["question"] == a.question:  # lean: dedup checks the current question only | when: an old question is asked again | fix: compare every past question
             raise Refused(f"already decided: {path.as_posix()}")
         if a.title:
             t["title"] = a.title

@@ -222,6 +222,8 @@ Type `phro-lean off` as the whole prompt to stop the rules for the current sessi
 
 `lean-review` fires when you ask for an over-engineering review. It lists what a diff could delete or shrink, one line per finding, and ends with the lines it could save.
 
+Technical debt lives in the code: each shortcut and each skipped test carries one English comment, `lean: <ceiling> | when: <trigger> | fix: <upgrade path>`. `compass.py debt` counts them against the last refresh, the daily refresh adds `debt N (+K)` to the drift line every session receives, and only debt whose `when` is `owner` or already met becomes a work-queue ticket. `lean-review` reports markers whose `when` holds as `debt:` findings.
+
 `grill` interviews you about a plan in rounds of at most 5 numbered questions. Each question has a recommended answer and one line of reason. The design tree is kept in a file, so a compaction does not lose it.
 
 These three are reworded forks of MIT-licensed skills; see `THIRD_PARTY_NOTICES.md`.
@@ -285,7 +287,8 @@ Run as `python -I -X utf8 scripts/compass.py <command>`.
 | `hook` | Reads the event from standard input and prints the index. Called by `hooks/hooks.json` |
 | `status <root>` | Per document: stale or current, sources changed, age. Lists up to 100 new paths per document, each path once, and says how many it left out. Then folders with changes outside every source since the oldest review, up to 30 changed documents among them by name, `ELSEWHERE n` and `STALE n`. Records when it looked |
 | `lint <root>` | One finding per line, then `OK` or `FINDINGS n` |
-| `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint and the drift line |
+| `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint, the drift line and the debt baseline |
+| `debt <root>` | `DEBT n NEW n GONE n INCOMPLETE n SKIP n`, then up to 50 lines: new markers, skipped tests with no marker, markers with no `when`, removed markers. Reads code files only and writes nothing |
 | `usage <root>` | Reads of each document in this project's transcripts, leaving out sessions that ran `stamp`. Counts only |
 
 ## `clone.py` commands

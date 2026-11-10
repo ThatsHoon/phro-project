@@ -382,6 +382,8 @@ def debt_scan():
         lines = compass.debt_lines(d)
         assert lines[0].startswith("DEBT 1 NEW 0 GONE 1") and lines[1].startswith("gone\tsrc/b.py\tmarker\tone pass"), lines
         assert compass.lint(d) == []
+    own = [i for i in compass.debt_items(SCRIPT.parents[1]) if i[0].startswith("scripts/") and not i[4]]
+    assert not own, own
 
 
 

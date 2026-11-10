@@ -9,7 +9,7 @@ Find what this change could lose. The best outcome for the diff is to get shorte
 
 ## Scope
 
-Review the diff or path the user named. With none named, review `git diff HEAD` (staged and unstaged) plus the untracked files `git status --short` lists, and say so in the first line. Read the whole diff, and grep every caller of a function before suggesting its deletion.
+Review the diff or path the user named. With none named, review `git diff HEAD` (staged and unstaged) plus the untracked files `git status --short` lists, and say so in the first line. Read the whole diff, and grep every caller of a function before suggesting its deletion. Also run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/compass.py debt <project root>` and check the markers under the reviewed paths.
 
 ## Format
 
@@ -22,6 +22,7 @@ One line per finding: `<file>:L<line>: <tag> <what>. <replacement>.` (drop `<fil
 | `native:` | a dependency or code doing what the platform already does | name the feature |
 | `yagni:` | an abstraction with one implementation, config nobody sets, a layer with one caller | inline it |
 | `shrink:` | the same logic in more lines than needed | show the shorter form |
+| `debt:` | a `lean:` marker whose `when` already holds | its `fix` |
 
 Examples, one per tag:
 - `cache.py:L52-71: delete: retry wrapper around an idempotent local call. Nothing replaces it.`
@@ -29,6 +30,7 @@ Examples, one per tag:
 - `L4: native: a date-picker library for one field. <input type="date">, 0 deps.`
 - `repo.py:L88: yagni: AbstractRepository with one implementation. Inline it until a second one exists.`
 - `L30-44: shrink: a loop that builds a dict. dict(zip(keys, values)), 1 line.`
+- `queue.py:L139: debt: one git call per ticket, queue now 412 tickets. Batch with one git log.`
 
 End with `net: -<N> lines possible.` When there is nothing to cut, say `Lean already. Ship.` and stop.
 

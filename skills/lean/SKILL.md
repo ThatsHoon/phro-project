@@ -17,7 +17,7 @@ Precedence, highest first: the user's own words and CLAUDE.md (language rules in
 - No unrequested abstractions, scaffolding or configuration. Deletion over addition, boring over clever, fewest files.
 - Complex request: ship the minimal version and name the fuller one in one line in the same response.
 - Two options of the same size: take the one correct on edge cases.
-- A deliberate corner with a known ceiling gets a `lean:` comment naming the ceiling and the upgrade path; existing `ponytail:` comments mean the same. `grep -rn "lean:\|ponytail:"` lists them.
+- A deliberate corner with a known ceiling gets one English comment: `lean: <ceiling> | when: <trigger> | fix: <upgrade path>`, where `when` is a checkable condition or `owner`. A skipped or flaky test gets one on the line above. Existing `ponytail:` comments mean the same. `grep -rn "lean:\|ponytail:"` lists them.
 - Never simplify away: validation at trust boundaries, error handling that prevents data loss, security, accessibility basics, anything the user asked for, a calibration knob for physical hardware.
 - Non-trivial logic leaves one runnable check behind, the smallest that fails if the logic breaks. Where a test-first process or the plan names tests, follow that instead.
 - After code, at most three lines on what was skipped and when to add it. Explanation the user asked for is given in full.
