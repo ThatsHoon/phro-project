@@ -177,8 +177,21 @@ def hooks_json():
         assert hooks[event] == [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}], hooks.get(event)
 
 
+def has_all(rel, strings):
+    text = (ROOT / rel).read_text(encoding="utf-8")
+    for s in strings:
+        assert s in text, (rel, s)
+
+
+def grill_rules():
+    has_all("skills/grill/SKILL.md", ("one line of rationale", "grill-<topic>.md", "at most 5 questions",
+                                      "When at most 2 decisions remain and both are cheap to reverse",
+                                      "restate that decision's cost in one line", 'Word each question so "yes" accepts',
+                                      "Finding facts is your job"))
+
+
 CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules,
-          toggle, mention_only, bad_id, guard_toggle, prune, hooks_json]
+          toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules]
 
 
 def main():

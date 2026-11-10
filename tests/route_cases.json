@@ -26,5 +26,9 @@
  {"id": "ns5", "skill": null, "prompt": "이 클래스 인터페이스 설계 좀 봐줘"},
  {"id": "ns6", "skill": null, "prompt": "다운로드 폴더 정리하는 파워쉘 스크립트 알려줘"},
  {"id": "ns7", "skill": null, "prompt": "이 모듈 테스트 코드 작성해줘"},
- {"id": "ns8", "skill": null, "prompt": "git 저장소에서 큰 파일 찾아서 알려줘"}
+ {"id": "ns8", "skill": null, "prompt": "git 저장소에서 큰 파일 찾아서 알려줘"},
+ {"id": "g01", "skill": "grill", "prompt": "이 설계 grill 해줘, 빠진 결정 없는지 질문으로 검수해"},
+ {"id": "g02", "skill": "grill", "prompt": "stress-test this migration plan by interviewing me"},
+ {"id": "l01", "skill": "lean", "prompt": "phro-lean 모드가 지금 뭘 하는 거야?"},
+ {"id": "n_l1", "skill": null, "prompt": "이 함수 최소한으로 짧게 고쳐줘"}
 ]
