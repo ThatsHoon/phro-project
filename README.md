@@ -211,6 +211,21 @@ Fires when you ask. Where `restructure` makes a layout a newcomer can read, this
 
 The import rules live in `contracts/modules.json`: `{"features": {"control/hazard": ["shared", "control/geo"]}, "consumers": ["training", "examples", "tools"]}`. A feature imports itself and what its row lists; consumers may import features, never the reverse.
 
+### 7. Working style: `lean`, `lean-review` and `grill`
+
+`lean` is always on. A hook injects its rules from `skills/lean/SKILL.md`:
+
+- Main session, at start, resume, clear and compact: **Build** (minimal code, root-cause fixes, one runnable check) and **Answer** (the action or the answer first, one open question at a time, short visible lists).
+- Each subagent: **Build** and **Report** (status first, long output to a file, at most 20 lines).
+
+Type `phro-lean off` as the whole prompt to stop the rules for the current session and its subagents, and `phro-lean on` to bring them back. Other sessions are not affected. lean injects nothing while the original ponytail or i-have-adhd plugin is enabled, so the two never stack; disable those and lean takes over.
+
+`lean-review` fires when you ask for an over-engineering review. It lists what a diff could delete or shrink, one line per finding, and ends with the lines it could save.
+
+`grill` interviews you about a plan in rounds of at most 5 numbered questions. Each question has a recommended answer and one line of reason. The design tree is kept in a file, so a compaction does not lose it.
+
+These three are reworded forks of MIT-licensed skills; see `THIRD_PARTY_NOTICES.md`.
+
 ## One project at a time
 
 The original is installed once for the user and holds no project. A project's first use of any skill runs `clone.py ensure`, which copies the plugin to `~/phro-project_<project>`, registers that copy as its own marketplace and turns it on with `--scope local`, and turns the original off with `--scope local`. The copy loads in place, so an edit needs only `/reload-plugins`. Two projects with one folder name get separate copies, and a copy refuses to run for any project but its own. Inside the plugin's own folder, no copy is made.
