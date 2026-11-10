@@ -47,7 +47,14 @@ def git(root, *args, check=True):
 def write_atomic(path, text):
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+    for _ in range(40):  # Windows refuses the replace while another process has the target open
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    tmp.unlink(missing_ok=True)
+    raise Refused(f"could not replace {path.as_posix()}: in use")
 
 
 def read_ticket(path):
@@ -150,11 +157,66 @@ def board(root):
     rows.sort(key=lambda r: (r["priority"], -r["age_s"]))
     data = {"generated": int(time.time()), "counts": counts, "closed_7d": closed, "tickets": rows}
     write_atomic(qdir(root) / "board.json", json.dumps(data, ensure_ascii=False, indent=1) + "\n")
+    render_inbox(root, data)
     return data
 
 
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Work queue</title>
+<style>
+:root { --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --card: #ffffff; --line: #e7e5e4; --accent: #b45309; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --card: #292524; --line: #44403c; --accent: #f59e0b; } }
+:root[data-theme="dark"] { --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --card: #292524; --line: #44403c; --accent: #f59e0b; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
+h1 { font-size: 20px; margin: 0 0 4px; } h2 { font-size: 15px; margin: 28px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 8px 0; overflow-wrap: anywhere; }
+.meta { color: var(--muted); font-size: 13px; } .p1 { border-left: 4px solid var(--accent); }
+ul { margin: 6px 0 0; padding-left: 20px; } p { margin: 6px 0; }
+</style></head><body><main>
+<h1>Work queue</h1><div class="meta">{stamp}</div>
+{sections}
+</main></body></html>
+"""
+
+
+def render_inbox(root, data):
+    """One self-contained page, in the panel's order. Every ticket field is escaped."""
+    from html import escape
+    by_id = {}
+    for t in data["tickets"]:
+        if t["status"] == "needs-owner":
+            try:
+                by_id[t["id"]] = read_ticket(qdir(root) / "tickets" / f"{t['id']}.md")
+            except (ValueError, OSError):
+                pass
+    meta = lambda t: f'<div class="meta">P{t["priority"]} · {escape(t["session"])} · {t["age_s"] // 86400} d · {t["id"]}</div>'
+    waiting, running = [], []
+    for t in data["tickets"]:
+        if t["status"] == "needs-owner" and t["id"] in by_id:
+            full = by_id[t["id"]]
+            opts = "".join(f"<li>{escape(o)}</li>" for o in full["options"])
+            waiting.append(f'<div class="card{" p1" if t["priority"] == 1 else ""}"><b>{escape(t["title"])}</b>{meta(t)}'
+                           f'<p>{escape(full["question"])}</p><ul>{opts}</ul></div>')
+        elif t["status"] in ("doing", "verify"):
+            running.append(f'<div class="card"><b>{escape(t["title"])}</b> <span class="meta">{t["status"]}</span>{meta(t)}'
+                           f'<p>{escape(t["last_line"])}</p></div>')
+    attention = sum(1 for t in data["tickets"] if t["status"] == "blocked" or t["returns"] >= 3)
+    sections = "\n".join([
+        f"<h2>Waiting on you ({len(waiting)})</h2>" + ("".join(waiting) or '<p class="meta">Nothing waiting.</p>'),
+        f"<h2>Running ({len(running)})</h2>" + ("".join(running) or '<p class="meta">Nothing running.</p>'),
+        f"<h2>Attention</h2><p>blocked {data['counts']['blocked']} · returned 3 times {attention - data['counts']['blocked']}</p>",
+        f"<h2>Done in 7 days</h2><p>{data['closed_7d']}</p>",
+    ])
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(data["generated"]))
+    path = qdir(root) / "inbox.html"
+    write_atomic(path, PAGE.replace("{stamp}", stamp).replace("{sections}", sections))
+    return path
+
+
 def commit(root, message, paths):
-    """Commit only these paths; retry while another session holds the index lock."""
+    """Commit only these paths. Another session may hold the index lock or be replacing board.json, so retry."""
     board(root)
     paths = [p for p in [*paths, "board.json", "inbox.html"] if (qdir(root) / p).exists()]
     for _ in range(10):
@@ -162,10 +224,11 @@ def commit(root, message, paths):
         r = add if add.returncode else git(root, "commit", "-q", "-m", message, "--", *paths, check=False)
         if not r.returncode:
             return
-        if "index.lock" not in (r.stderr + r.stdout):
-            raise Refused(f"git: {(r.stderr or r.stdout).strip()[:200]}")
         time.sleep(0.5)
-    raise Refused(f"git index locked: {(qdir(root) / '.git/index.lock').as_posix()}")
+    err = [l for l in (r.stderr + r.stdout).splitlines() if not l.startswith("warning:")] or ["unknown"]
+    if any("index.lock" in l for l in err):
+        raise Refused(f"git index locked: {(qdir(root) / '.git/index.lock').as_posix()}")
+    raise Refused(f"git: {err[-1][:200]}")
 
 
 def ticket_path(root, tid):
@@ -196,6 +259,7 @@ def cmd_init(a):
             exclude.write_text(old + ("" if old.endswith("\n") or not old else "\n") + f"{QUEUE}/\n", encoding="utf-8")
     (q / "tickets").mkdir(parents=True, exist_ok=True)
     git(a.root, "init", "-q")
+    git(a.root, "config", "core.autocrlf", "false")
     commit(a.root, "init queue", [])
     return q, None
 

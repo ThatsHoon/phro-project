@@ -165,6 +165,23 @@ def test_atomic():
     assert not list((root / "queue").glob("*.tmp"))
 
 
+def test_inbox():
+    root = fresh()
+    (root / "log.md").write_text("halfway there\n", encoding="utf-8")
+    path_of(ask(root, title="second <script>x</script>", question="Is this second?", priority="2"))
+    path_of(ask(root, title="first", question="Is this first?", priority="1"))
+    run = path_of(ask(root, title="running", extra=("--link", "log.md")))
+    path_of(q(root, "decide", run.stem, "--text", "go"))
+    path_of(q(root, "move", run.stem, "doing"))
+    html = (root / "queue/inbox.html").read_text(encoding="utf-8")
+    assert html.index("first") < html.index("second &lt;script&gt;"), html
+    assert "<script>" not in html
+    assert "Is this first?" in html and "Is this second?" in html and "A: small" in html
+    assert html.index("Running") < html.index("halfway there")
+    assert "http://" not in html and "https://" not in html
+    assert "<title>Work queue</title>" in html
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
