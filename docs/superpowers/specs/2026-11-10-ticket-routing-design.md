@@ -39,10 +39,28 @@ SEND	local_<UUID>	ticket <id> decided, read the ticket file <absolute path>
 
 The session sends it with its messaging tool to that target. If the tool refuses the target (a CLI session, or a session no longer running), nothing else is needed: the pull delivers on the owner's next prompt. `inbox` step 5 is replaced by the same command, so `inbox` and an answer typed anywhere take one path.
 
-## Board and page
+## Blocking or not
 
-- `board.json` entries keep `session`; the page and the queue pane show its first 8 characters beside each ticket.
-- Attention adds two counts: decided but not picked up for more than a day (`ready` with an old decision), and owner gone (no transcript with that UUID in the project folder). An orphan is shown, not reassigned: the owner moves it with `queue.py move ... --session <UUID>` (a new option) or closes it.
+"Waiting on you" must mean a session is stopped until the owner answers. Owner report 2026-11-10: a ticket whose session had already moved on (`NPU 속도 측정 대상`) sat there with the real blockers.
+
+- `ask` takes `--default "<what I do if no answer>"`. With it, the ticket is `can-wait`: the session goes on with the default, and an answer only changes course. Without it, the ticket is blocking and the session stops after asking. The rule says to give a default whenever one is reasonable.
+- When a session proceeds past its own ticket (it chose, or the question went away), it runs `queue.py done <root> <id>` or `decide <root> <id> --text "self: <what it did>"`. The rule says so, and the session's own hook lists its open tickets once at `SessionStart` so stale ones get closed.
+- The board reads each owner session's last activity from its transcript's modification time. A blocking ticket whose session wrote after asking is shown as "session still working", a hint that it may no longer block.
+
+## Board and pane
+
+Owner report 2026-11-10: the pane is hard to read (raw UUIDs, one undifferentiated list). The board data and the pane follow one layout:
+
+- Each session is named by its title: the last `custom-title` entry in its transcript, read from the file's tail (last 64 KB) so it stays fast. Without one, the first 8 characters of the id. Full ids never appear in the pane.
+- Sections, in order, empty ones hidden except the first:
+  1. **Needs your answer**: blocking tickets, priority then age. Card: priority chip, title, the question cut to two lines, the session title with "stopped" or "still working", age, and an `answer` button that sends `/phro-project:inbox <id>` (the copy's name in a project).
+  2. **Can wait**: can-wait tickets, collapsed to a count line until expanded; card shows the default it will take.
+  3. **Decided, not picked up**: `ready` tickets, with how long since the decision; more than a day is highlighted.
+  4. **In progress**: `doing` and `verify`, one line each with the session title and the ticket's last record line.
+  5. **Sessions**: one line per session with open tickets: title, stopped or working, last activity, counts.
+  6. **Done in 7 days**: a count.
+- Attention lines: owner gone (no transcript with that UUID in the project folder; shown, not reassigned; `queue.py move ... --session <UUID>` is a new option to reassign) and returned 3 times.
+- The HTML page (`inbox.html`, the `show` skill) uses the same sections and adds the core documents map at the end.
 
 ## Tests (`tests/test_queue.py`)
 
@@ -56,6 +74,9 @@ Two simulated sessions A and B, fed through `queue.py hook` with JSON on stdin:
 - No queue, a broken `board.json`, and broken stdin: silent, exit 0.
 - Eleven waiting tickets for one session: output stops at 10 lines.
 - `compass.py hook` no longer prints the queue rule; `queue.py hook` does.
+- `ask --default` lands in Can wait, not Needs your answer; `decide --text "self: ..."` and `done` clear it.
+- The board names a session by its last `custom-title`, falls back to the short id, and never prints a full UUID in the pane data; a session whose transcript changed after the ask is marked still working; a UUID with no transcript is counted as owner gone.
+- The pane test (`mods/queue-panel/hooks/pane.test.tsx`) renders each section from a seeded board and checks the answer button's prompt and that empty sections other than the first are hidden.
 
 ## Rollout
 
@@ -65,4 +86,4 @@ After merge and sync to the e-call copy: run `queue.py sessions` on e-call once,
 
 - A resident broker, an MCP server, or model calls inside hooks.
 - Reading free-form answers that name no ticket id in a session that does not own the ticket.
-- Session titles on the board; the short id is shown instead.
+- Ranking or summarising what a session is doing; the pane shows only its title, state and last activity.
