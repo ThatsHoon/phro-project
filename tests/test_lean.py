@@ -190,8 +190,14 @@ def grill_rules():
                                       "Finding facts is your job"))
 
 
+def lean_review_rules():
+    has_all("skills/lean-review/SKILL.md", ("delete:", "stdlib:", "native:", "yagni:", "shrink:", "net: -<N> lines possible.",
+                                            "Lean already. Ship.", "Correctness bugs, security holes and performance are out of scope",
+                                            "Does not apply the fixes"))
+
+
 CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules,
-          toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules]
+          toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules]
 
 
 def main():

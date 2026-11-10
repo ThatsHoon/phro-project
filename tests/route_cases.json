@@ -30,5 +30,7 @@
  {"id": "g01", "skill": "grill", "prompt": "이 설계 grill 해줘, 빠진 결정 없는지 질문으로 검수해"},
  {"id": "g02", "skill": "grill", "prompt": "stress-test this migration plan by interviewing me"},
  {"id": "l01", "skill": "lean", "prompt": "phro-lean 모드가 지금 뭘 하는 거야?"},
- {"id": "n_l1", "skill": null, "prompt": "이 함수 최소한으로 짧게 고쳐줘"}
+ {"id": "n_l1", "skill": null, "prompt": "이 함수 최소한으로 짧게 고쳐줘"},
+ {"id": "r01", "skill": "lean-review", "prompt": "이 diff 과설계 리뷰해줘, 지울 수 있는 것만 뽑아"},
+ {"id": "r02", "skill": "lean-review", "prompt": "review this PR for over-engineering, what can we delete"}
 ]
