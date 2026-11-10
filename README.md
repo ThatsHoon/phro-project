@@ -368,6 +368,21 @@ claude plugin update phro-project@phro-project
 
 Then type `/reload-plugins` in a running session.
 
+## Work queue
+
+Sessions and forks that need the owner's decision file a ticket instead of waiting in a chat nobody reads. Tickets are Markdown files in `<project>/queue/`, its own git repository; `scripts/queue.py` is the only writer and commits only the paths it wrote, so sessions writing at once never commit each other's files.
+
+- `/phro-project:init`: once per project. Makes the project's copy, the queue, the first inbox page (a private Artifact) and turns on the panel.
+- The session rule: when `queue/board.json` exists, the compass hook tells every session to open a ticket with `queue.py ask`, ask in chat too, and record the first answer with `queue.py decide`.
+- `/phro-project:inbox [id]`: walks the waiting tickets one at a time, highest priority first, records each answer and tells the waiting session to read its ticket.
+- A decided question is not asked again. A ticket returned three times becomes the question "close it or shrink it to one step".
+
+`queue.py` commands: `init`, `ask`, `decide`, `move`, `done`, `board`; each prints `OK` or `REFUSED` with a path, never a ticket body.
+
+### The queue panel
+
+The panel (`mods/queue-panel/`) reads `queue/board.json` only: waiting decisions with an answer button that fills `/inbox <id>`, running work with the last line of its record, blocked and thrice-returned counts, and what closed in 7 days. How to turn it on is written here when the panel ships.
+
 ## Not done yet
 
 - Use of the design, route-test and audit skills in real work. A capability built on request and a step-triggered skill have only passed scripted checks, not a run with a model.
@@ -378,6 +393,7 @@ Then type `/reload-plugins` in a running session.
 
 ## When to delete it
 
+- The work queue: if fewer than 5 decisions close through it in its first two weeks; remove `queue.py`, the `init` and `inbox` skills, the panel and the hook rule.
 - The plugin: if two audits of real plugins produce no adopted proposal and no routing problem.
 - `compass` and its hook: if after a month sessions still lose the goal with `docs/core` in place, or `usage` shows nobody opens the documents and the refresh changes nothing.
 - `restructure`: if a real restructure takes more of your time with it than by hand, or its misses reach the test suite more than its manual list catches them.

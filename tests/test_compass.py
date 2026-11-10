@@ -336,7 +336,22 @@ def demo():
         compass.save(d, manifest)
         out = run_hook(d).stdout
         assert "`goals.md`" in out and "밀렸다" not in out, "a hidden drift line stays out, the index stays in"
+    queue_rule()
     print("ok")
+
+
+def queue_rule():
+    queue_py = (SCRIPT.parent / "queue.py").as_posix()
+    with tempfile.TemporaryDirectory() as d:
+        assert run_hook(d).stdout == "", "no docs/core and no queue: silent"
+        write(d, "queue/board.json", "{}")
+        out = run_hook(d).stdout
+        assert "open a ticket with" in out and queue_py in out and Path(d).as_posix() in out, out
+        clean(d)
+        out = run_hook(d).stdout
+        assert "`features/app.md`" in out and out.index("`features/app.md`") < out.index("open a ticket with"), out
+        (Path(d) / "queue/board.json").unlink()
+        assert "open a ticket with" not in run_hook(d).stdout, "the rule leaves with the queue"
 
 
 if __name__ == "__main__":

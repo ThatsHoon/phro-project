@@ -1,8 +1,10 @@
 {
   "name": "phro-project",
-  "version": "0.2.6",
-  "description": "Keeps a long project on course: designs and audits its plugins, measures whether skills get called, holds core goal and architecture documents for every session and fork, and restructures its folders.",
-  "author": { "name": "thatshoon" },
+  "version": "0.3.0",
+  "description": "Keeps a long project on course: designs and audits its plugins, measures whether skills get called, holds core goal and architecture documents for every session and fork, and restructures its folders and keeps a queue of the owner's decisions.",
+  "author": {
+    "name": "thatshoon"
+  },
   "homepage": "https://github.com/ThatsHoon/phro-project",
   "repository": "https://github.com/ThatsHoon/phro-project"
 }
