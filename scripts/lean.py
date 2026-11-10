@@ -3,6 +3,8 @@
 
   lean.py hook    read a Claude Code hook event on stdin, print what it should inject
 
+UserPromptSubmit "phro-lean off|on" (the whole prompt) switches the current session; the marker is <config>/phro-lean/off/<session_id>.
+
 SessionStart gets Build, Answer and Switch; SubagentStart gets Build and Report. Nothing is injected while the
 original ponytail or i-have-adhd plugin is enabled, so the two never stack. A hook never blocks: any failure prints nothing.
 """
@@ -10,6 +12,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parents[1]
@@ -19,6 +22,9 @@ SUB = ["Build", "Report"]
 HEADER = "PHRO-LEAN ON. The rules below apply to every response in this session."
 ORIGINALS = ("ponytail@", "i-have-adhd@")
 TOKEN = re.compile(r"[A-Za-z0-9_-]+")
+SWITCH = re.compile(r"\s*/?(?:phro-lean|phro-project:lean)\s+(on|off)\s*\Z", re.I)
+OFF_TEXT = 'PHRO-LEAN OFF for this session: stop applying the lean rules from here on. "phro-lean on" brings them back.'
+GUARD_NOTE = " (ponytail or i-have-adhd is still enabled, so lean injects nothing until they are disabled.)"
 
 
 def config_dir():
@@ -56,12 +62,48 @@ def is_off(session_id):
     return bool(path and path.exists())
 
 
+def set_off(session_id, off):
+    """Marks this session off or on; False for an id that is not a plain token, which then stays on."""
+    path = off_file(session_id)
+    if not path:
+        return False
+    if off:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    else:
+        path.unlink(missing_ok=True)
+    return True
+
+
+def prune(days=7):
+    """Drops off-markers older than `days`; only session-named files, nothing else in the folder."""
+    folder = config_dir() / "phro-lean/off"
+    cutoff = time.time() - days * 86400
+    for path in folder.glob("*") if folder.is_dir() else []:
+        if TOKEN.fullmatch(path.name) and path.is_file() and path.stat().st_mtime < cutoff:
+            path.unlink(missing_ok=True)
+
+
 def main_text():
     return HEADER + "\n\n" + sections(SKILL.read_text(encoding="utf-8"), MAIN)
 
 
+def switch(event):
+    m = SWITCH.match(event.get("prompt") or "")
+    if not m:
+        return ""
+    off = m.group(1).lower() == "off"
+    set_off(event.get("session_id") or "", off)
+    note = GUARD_NOTE if originals_enabled(event.get("cwd")) else ""
+    return (OFF_TEXT if off else main_text()) + note
+
+
 def handle(event):
     name, sid = event.get("hook_event_name"), event.get("session_id") or ""
+    if name == "UserPromptSubmit":
+        return switch(event)
+    if name == "SessionStart" and event.get("source") == "startup":
+        prune()
     if name not in ("SessionStart", "SubagentStart") or is_off(sid) or originals_enabled(event.get("cwd")):
         return ""
     if name == "SessionStart":

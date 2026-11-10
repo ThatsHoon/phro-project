@@ -10,6 +10,38 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I -X utf8 \"${CLAUDE_PLUGIN_ROOT}/scripts/lean.py\" hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I -X utf8 \"${CLAUDE_PLUGIN_ROOT}/scripts/lean.py\" hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I -X utf8 \"${CLAUDE_PLUGIN_ROOT}/scripts/lean.py\" hook",
+            "timeout": 5
+          }
+        ]
       }
     ]
   }

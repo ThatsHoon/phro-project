@@ -112,7 +112,73 @@ def fixed_rules():
         assert s in text, s
 
 
-CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules]
+def prompt(text, sid, cwd):
+    return {"hook_event_name": "UserPromptSubmit", "prompt": text, "session_id": sid, "cwd": str(cwd)}
+
+
+def toggle():
+    import lean
+    config, cwd = fresh()
+    assert run(prompt("phro-lean off", "s1", cwd), config, cwd)[1].strip() == lean.OFF_TEXT
+    assert run(start("s1", cwd, "compact"), config, cwd)[1] == ""
+    assert run(sub("s1", cwd), config, cwd)[1] == ""
+    assert "## Build" in run(start("s2", cwd), config, cwd)[1], "another session is untouched"
+    assert run(prompt("/phro-lean on", "s1", cwd), config, cwd)[1].strip() == lean.main_text().strip()
+    assert "## Build" in run(start("s1", cwd, "compact"), config, cwd)[1]
+    run(prompt("/phro-project:lean OFF ", "s1", cwd), config, cwd)
+    assert run(start("s1", cwd, "resume"), config, cwd)[1] == ""
+
+
+def mention_only():
+    config, cwd = fresh()
+    for text in ("phro-lean off 하면 어떻게 돼?", "please run\nphro-lean off", "what is phro-lean"):
+        assert run(prompt(text, "s1", cwd), config, cwd)[1] == "", text
+    assert not (config / "phro-lean").exists()
+    assert "## Build" in run(start("s1", cwd), config, cwd)[1]
+
+
+def bad_id():
+    config, cwd = fresh()
+    run(prompt("phro-lean off", "../x", cwd), config, cwd)
+    assert not [p for p in config.rglob("*") if p.is_file()], list(config.rglob("*"))
+    assert "## Build" in run(start("../x", cwd), config, cwd)[1]
+
+
+def guard_toggle():
+    import lean
+    config, cwd = fresh()
+    write(config / "settings.json", json.dumps({"enabledPlugins": {"ponytail@ponytail": True}}))
+    assert run(prompt("phro-lean off", "s1", cwd), config, cwd)[1].strip() == lean.OFF_TEXT + lean.GUARD_NOTE
+
+
+def prune():
+    config, cwd = fresh()
+    folder = config / "phro-lean/off"
+    folder.mkdir(parents=True)
+    for name in ("old", "new", "notes.txt"):
+        (folder / name).write_text("", encoding="utf-8")
+    week_ago = (folder / "old").stat().st_mtime - 8 * 86400
+    os.utime(folder / "old", (week_ago, week_ago))
+    os.utime(folder / "notes.txt", (week_ago, week_ago))
+    run(start("s9", cwd, "compact"), config, cwd)
+    assert (folder / "old").exists(), "only startup prunes"
+    run(start("s9", cwd, "startup"), config, cwd)
+    assert not (folder / "old").exists() and (folder / "new").exists() and (folder / "notes.txt").exists()
+
+
+def hooks_json():
+    cmd = 'python -I -X utf8 "${CLAUDE_PLUGIN_ROOT}/scripts/lean.py" hook'
+    hooks = json.loads((ROOT / "hooks/hooks.json").read_text(encoding="utf-8"))["hooks"]
+    starts = hooks["SessionStart"]
+    assert any("compass.py" in h["command"] and e["matcher"] == "startup|clear|compact" for e in starts for h in e["hooks"])
+    assert any(e.get("matcher") == "startup|resume|clear|compact" and e["hooks"] == [{"type": "command", "command": cmd, "timeout": 5}]
+               for e in starts), starts
+    for event in ("SubagentStart", "UserPromptSubmit"):
+        assert hooks[event] == [{"hooks": [{"type": "command", "command": cmd, "timeout": 5}]}], hooks.get(event)
+
+
+CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules,
+          toggle, mention_only, bad_id, guard_toggle, prune, hooks_json]
 
 
 def main():
