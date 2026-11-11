@@ -181,12 +181,8 @@ def test_depth_guard():
     b = P("x")
     for _ in range(limits.MAX_DEPTH + 5):
         b = Quote([b])
-    try:
-        R(Doc(blocks=[b]))
-    except ReadError as e:
-        assert e.kind == "damaged"
-        return
-    raise AssertionError("ReadError not raised")
+    out = R(Doc(blocks=[P("lead"), b]))
+    assert "lead" in out and "nested too deeply left out" in out
 
 
 def test_deep_nesting_is_fast():
@@ -282,6 +278,15 @@ def test_table_stops_at_output_cap_while_rendering():
             assert out.endswith("(output truncated at 20 MB)" + chr(10)) and len(out) < 150_000
     finally:
         limits.MAX_OUTPUT = old
+
+
+def test_over_deep_nesting_is_left_out():
+    inner = c("deep")
+    for _ in range(100):
+        inner = Cell([Table([[inner, c("x")]])])
+    doc = Doc(blocks=[P("lead"), Table([[inner, c("y")]])])
+    out = R(doc)
+    assert "lead" in out and "places nested too deeply left out)" in out.split(chr(10) * 2)[0], out[:200]
 
 
 def main():

@@ -71,6 +71,7 @@ class _Render:
         self.doc, self.assets_dir, self.show = doc, assets_dir, show_hidden
         self.hidden_count = 0
         self.depth = 0
+        self.too_deep = 0  # subtrees left out for nesting past MAX_DEPTH
         self.note_no: dict[str, int] = {}
         self.assets = Assets(assets_dir)
         self.unviewable: list[str] = []
@@ -84,10 +85,13 @@ class _Render:
             return True
         return False
 
-    def _enter(self):
+    def _enter(self) -> bool:
+        """Step one level in; False (counted, nothing to undo) when past MAX_DEPTH."""
+        if self.depth >= limits.MAX_DEPTH:
+            self.too_deep += 1
+            return False
         self.depth += 1
-        if self.depth > limits.MAX_DEPTH:
-            raise ReadError("damaged", "nesting too deep")
+        return True
 
     # ---- inlines
     def inlines(self, items, m=BLOCK) -> str:
@@ -151,7 +155,8 @@ class _Render:
     # ---- blocks
     def blocks(self, blocks) -> list:
         """Rendered pieces as (kind, text); kind 'li' pieces stay tight."""
-        self._enter()
+        if not self._enter():
+            return []
         try:
             out = []
             for b in blocks:
@@ -260,7 +265,8 @@ class _Render:
         if b.hidden and not self.show:
             self.hidden_count += 1
             return ""
-        self._enter()
+        if not self._enter():
+            return ""
         try:
             if isinstance(b, (Para, ListItem)):
                 s = self.inlines(b.inlines, m)
@@ -290,7 +296,8 @@ class _Render:
 
     def _has_text(self, blocks) -> bool:
         """Whether blocks would render to something, decided without rendering."""
-        self._enter()
+        if not self._enter():
+            return False
         try:
             return any(self._block_has_text(b) for b in blocks)
         finally:
@@ -492,8 +499,10 @@ class _Render:
                 top.append("# " + self.doc.title.strip())
         if self.hidden_count:
             top.insert(0, f"({self.hidden_count} hidden places left out)")
+        if self.too_deep:
+            top.insert(1 if self.hidden_count else 0, f"({self.too_deep} places nested too deeply left out)")
         if hf:
-            top.insert(1 if self.hidden_count else 0, "\n".join(hf))
+            top.insert((1 if self.hidden_count else 0) + (1 if self.too_deep else 0), "\n".join(hf))
         if self.unviewable:
             tail = "Not viewable here: " + ", ".join(self.unviewable)
             return "\n\n".join(top + ([text] if text else []) + [tail])

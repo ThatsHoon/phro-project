@@ -635,7 +635,7 @@ class _Reader:
                     open_[col].rowspan += 1
                     new_open[col] = open_[col]
                 else:
-                    cell = Cell(self.blocks(tc, d + 2), 1, span, header)  # the renderer nests two levels per table
+                    cell = Cell(self.blocks(tc, d + 1), 1, span, header)
                     row.append(cell)
                     if merge == "restart":
                         new_open[col] = cell
