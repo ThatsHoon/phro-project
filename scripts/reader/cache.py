@@ -13,6 +13,7 @@ from . import VERSION, convert
 
 _counter = itertools.count()
 _lock = threading.Lock()
+_code = None
 
 
 def root() -> Path:
@@ -32,8 +33,24 @@ def root() -> Path:
         return fb
 
 
+def code_digest(base=None) -> str:
+    """sha1 over the reader's own source (sorted relative paths and bytes, CRLF read as LF), so a code change
+    misses the cache; the installed package's digest is worked out once per process."""
+    global _code
+    if base is None and _code is not None:
+        return _code
+    top = Path(base) if base is not None else Path(__file__).resolve().parent
+    h = hashlib.sha1()
+    for f in sorted(top.rglob("*.py"), key=lambda q: q.relative_to(top).as_posix()):
+        h.update(f.relative_to(top).as_posix().encode("utf-8") + b"\0")
+        h.update(f.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    if base is None:
+        _code = h.hexdigest()
+    return h.hexdigest()
+
+
 def key(path) -> str:
-    h = hashlib.sha1(VERSION.encode() + b"\0")
+    h = hashlib.sha1(VERSION.encode() + b"\0" + code_digest().encode() + b"\0")
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
             h.update(chunk)

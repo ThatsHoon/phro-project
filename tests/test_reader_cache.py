@@ -116,6 +116,26 @@ def test_cache_key_follows_content():
         assert d1 != d2 and (d2 / "out.md").read_text() == "two\n"
 
 
+def test_cache_key_follows_code():
+    import shutil
+    p = sample()
+    k = cache.key(p)
+    old = cache.code_digest
+    cache.code_digest = lambda: "0" * 40
+    try:
+        assert cache.key(p) != k
+    finally:
+        cache.code_digest = old
+    assert cache.key(p) == k
+    copy = tmp() / "reader"
+    shutil.copytree(HERE / "scripts" / "reader", copy, ignore=shutil.ignore_patterns("__pycache__"))
+    d1 = cache.code_digest(copy)
+    assert d1 == cache.code_digest()
+    f = copy / "markdown.py"
+    f.write_bytes(f.read_bytes() + b"#")
+    assert cache.code_digest(copy) != d1
+
+
 def test_cache_concurrent_store():
     with stub():
         p = sample()
