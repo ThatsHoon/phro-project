@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 from . import limits
+from .images import Assets
 from .limits import ReadError
 from .model import (
     Bold, Break, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math,
@@ -48,6 +49,8 @@ class _Render:
         self.hidden_count = 0
         self.depth = 0
         self.note_no: dict[str, int] = {}
+        self.assets = Assets(assets_dir)
+        self.unviewable: list[str] = []
 
     # ---- hidden handling
     def _skip(self, node) -> bool:
@@ -188,8 +191,15 @@ class _Render:
             return s[:-2] + "\\. "
         return "\\" + s
 
-    def _image(self, b: Image) -> list:  # Task 4 replaces this with Assets
-        return [("p", self._tag(b, b.alt))] if b.alt.strip() else []
+    def _image(self, b: Image) -> list:
+        path, ok = self.assets.add(b.data, b.alt)
+        alt = re.sub(r"\s+", " ", b.alt).strip()
+        if ok:
+            alt = alt.replace("\\", "\\\\").replace("]", "\\]")
+            return [("p", self._tag(b, f"![{alt}]({path})"))]
+        if path:
+            self.unviewable.append(path)
+        return [("p", self._tag(b, f"[image: {alt}]"))] if alt else []
 
     def _section(self, s: Section) -> list:
         out = []
@@ -431,6 +441,9 @@ class _Render:
             top.insert(0, f"({self.hidden_count} hidden places left out)")
         if hf:
             top.insert(1 if self.hidden_count else 0, "\n".join(hf))
+        if self.unviewable:
+            tail = "Not viewable here: " + ", ".join(self.unviewable)
+            return "\n\n".join(top + ([text] if text else []) + [tail])
         return "\n\n".join(top + ([text] if text else []))
 
     def _note_defs(self) -> str:

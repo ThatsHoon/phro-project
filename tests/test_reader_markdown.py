@@ -158,7 +158,7 @@ def test_equations():
 
 def test_quote_and_image():
     assert R(Doc(blocks=[Quote([P("a"), P("b")])])) == "> a\n>\n> b\n"
-    assert R(Doc(blocks=[Image(b"x", alt="pic"), Image(b"x")])) == "pic\n"
+    assert R(Doc(blocks=[Image(b"x", alt="pic"), Image(b"x")])) == "[image: pic]\n"
 
 
 def test_output_cap():
