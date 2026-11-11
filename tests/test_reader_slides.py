@@ -146,6 +146,36 @@ def test_group_geometry_order():
     assert out.index("B") < out.index("A") < out.index("C") < out.index("D"), out
 
 
+def _layout(shapes, tag="sldLayout"):
+    return sld(shapes).replace("<p:sld ", f"<p:{tag} ").replace("</p:sld>", f"</p:{tag}>")
+
+
+def _ph(ph_attrs, text=None, off=None):
+    xf = f'<p:spPr><a:xfrm><a:off x="{off[0]}" y="{off[1]}"/><a:ext cx="1" cy="1"/></a:xfrm></p:spPr>' if off else "<p:spPr/>"
+    body = f"<p:txBody><a:bodyPr/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody>" if text else ""
+    return (f'<p:sp><p:nvSpPr><p:cNvPr id="2" name="s"/><p:cNvSpPr/><p:nvPr><p:ph {ph_attrs}/></p:nvPr></p:nvSpPr>'
+            f"{xf}{body}</p:sp>")
+
+
+def test_placeholder_position_from_layout_and_master():
+    slide = (_ph('type="title"', "Title") + _ph('idx="1"', "body text") + _ph('type="body" idx="7"', "from master")
+             + sp("bottom text", off=(0, 6000000), ext=(1, 1)))
+    layout = _layout(_ph('type="title"', off=(0, 300000)) + _ph('idx="1"', off=(0, 1600000)))
+    master = _layout(_ph('type="body"', off=(0, 2000000)), "sldMaster")
+    d = deck([slide], kind="pptm", srels={1: [("rL", "slideLayout", "../slideLayouts/slideLayout1.xml")]},
+             extra={"ppt/slideLayouts/slideLayout1.xml": layout, "ppt/slideMasters/slideMaster1.xml": master,
+                    "ppt/slideLayouts/_rels/slideLayout1.xml.rels":
+                        rels_xml([("rM", "slideMaster", "../slideMasters/slideMaster1.xml")])})
+    out = md(d)
+    assert out == "## Slide 1: Title\n\nbody text\n\nfrom master\n\nbottom text\n", repr(out)
+
+
+def test_unplaced_shape_keeps_its_spTree_place():
+    out = md(deck([sp("first") + sp("later", off=(0, 500), ext=(1, 1)) + sp("top", off=(0, 100), ext=(1, 1))
+                   + sp("last")]))
+    assert out == "## Slide 1\n\nfirst\n\ntop\n\nlater\n\nlast\n", repr(out)
+
+
 def test_group_mapping_nested():
     inner = grp(sp("In", off=(0, 50), ext=(1, 1)), off=(0, 0), ext=(200, 200), choff=(0, 0), chext=(100, 100))
     outer = grp(inner, off=(0, 1000), ext=(100, 100), choff=(0, 0), chext=(100, 100))

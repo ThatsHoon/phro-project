@@ -1,4 +1,7 @@
-"""PresentationML (pptm, ppsx) to the document model. Elements match by local name; layouts and masters are not read."""
+"""PresentationML (pptm, ppsx) to the document model. Elements match by local name.
+
+Layouts and masters are read only for the position of a placeholder that has none of its own.
+"""
 import re
 
 from .. import limits
@@ -15,6 +18,7 @@ MAX_ALT, MAX_TITLE = 200, 200
 COORD = 10**13
 
 _TITLES = frozenset({"title", "ctrTitle"})
+_PH_ALIAS = {"ctrTitle": ("title",), "subTitle": ("body",), "obj": ("body",)}  # inherited from these on a master
 _SKIP_PH = frozenset({"sldNum", "dt", "ftr", "hdr", "sldImg"})
 _SHAPES = frozenset({"sp", "pic", "graphicFrame"})
 
@@ -119,6 +123,8 @@ class _Reader:
         self.scope = None
         self.image_bytes = 0
         self.chart_cells = 0
+        self.ph_maps = {}  # layout or master part -> {("idx", i) | ("type", t): (y, x)}
+        self.inherit = []  # the current slide's layout and master maps, in lookup order
 
     def deep(self):
         self.ctx.skipped["depth"] += 1
@@ -164,16 +170,62 @@ class _Reader:
         sec = Section("slide", number=number, hidden="hidden" if attr(root, "show") in ("0", "false") else "")
         tree = _kid(_kid(root, "cSld"), "spTree") if _kid(root, "cSld") is not None else None
         out, titles = [], []
+        self.inherit = self.layout_maps(name)
         if tree is not None:
             self.walk(tree, _Xf(), 0, False, out, titles)
-        placed = sorted((e for e in out if e[0] is not None), key=lambda e: e[0])
-        for _, blocks in placed + [e for e in out if e[0] is None]:
+        for _, blocks in _reading_order(out):
             sec.blocks.extend(blocks)
         sec.title = re.sub(r"\s+", " ", " ".join(titles)).strip()[:MAX_TITLE]
         notes = self.notes_part(name)
         if notes:
             sec.notes = notes
         return sec
+
+    # ---- inherited placeholder positions
+    def related(self, part, suffix):
+        for rel in ooxml_base.rels(self.pkg, part, self.ctx).values():
+            if not rel.external and rel.type.endswith(suffix) and self.pkg.has(rel.target):
+                return rel.target
+        return None
+
+    def layout_maps(self, slide):
+        layout = self.related(slide, "/slideLayout")
+        master = self.related(layout, "/slideMaster") if layout else None
+        return [self.ph_map(p) for p in (layout, master) if p]
+
+    def ph_map(self, part):
+        """Positions of the placeholders a layout or master gives, by idx and by type; cached per part."""
+        if part not in self.ph_maps:
+            m = {}
+            try:
+                root, _ = ooxml_base.load(self.pkg, part)
+            except ReadError as e:
+                if e.kind not in ("damaged", "too_large"):
+                    raise
+                root = None
+            csld = _kid(root, "cSld") if root is not None else None
+            tree = _kid(csld, "spTree") if csld is not None else None
+            for el in (tree if tree is not None else ()):
+                _, ph = _nv(el)
+                pos = _Xf().point(_xfrm(el)) if ph is not None else None
+                if pos is None:
+                    continue
+                if attr(ph, "idx") is not None:
+                    m.setdefault(("idx", attr(ph, "idx")), pos)
+                m.setdefault(("type", attr(ph, "type") or "body"), pos)
+            self.ph_maps[part] = m
+        return self.ph_maps[part]
+
+    def inherited(self, ph):
+        """Slide position of a placeholder from its layout (by idx, then type), then its master; None if neither has it."""
+        idx, kind = attr(ph, "idx"), attr(ph, "type") or "body"
+        for m in self.inherit:
+            if idx is not None and ("idx", idx) in m:
+                return m[("idx", idx)]
+            for t in (kind, *_PH_ALIAS.get(kind, ())):
+                if ("type", t) in m:
+                    return m[("type", t)]
+        return None
 
     def notes_part(self, name):
         for rel in ooxml_base.rels(self.pkg, name, self.ctx).values():
@@ -228,6 +280,8 @@ class _Reader:
         if ptype in _SKIP_PH:
             return
         geom = xf.point(_xfrm(el))
+        if geom is None and ph is not None:
+            geom = self.inherited(ph)
         if n == "sp":
             body = _kid(el, "txBody")
             blocks = self.text_blocks(body)
@@ -339,6 +393,20 @@ class _Reader:
                 row.append(Cell(self.text_blocks(_kid(tc, "txBody")), rspan, span))
             out.append(row)
         return [Table(out)] if out else []
+
+
+def _reading_order(out):
+    """(position, blocks) entries sorted by position. One without a position keeps its spTree place: it goes just
+    before the highest shape that follows it, or last when none with a position follows."""
+    keys, low = [], None
+    for i in range(len(out) - 1, -1, -1):
+        pos = out[i][0]
+        if pos is not None:
+            low = pos if low is None or pos < low else low
+        at = pos if pos is not None else low
+        keys.append(((0, at) if at is not None else (1,), i))
+    order = sorted(keys)
+    return [out[i] for _, i in order]
 
 
 def parse_slides(pkg, part, ctx) -> Doc:
