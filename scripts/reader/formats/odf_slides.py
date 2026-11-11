@@ -13,6 +13,7 @@ _SHAPES = frozenset({"frame", "custom-shape", "rect", "ellipse", "circle", "poly
 _GROUPS = frozenset({"g", "a"})
 _SKIP = frozenset({"page-number", "date-time", "header", "footer", "page"})
 _MASTER_SKIP = _SKIP | {"title", "outline", "subtitle"}
+_DEFAULT_NAME = re.compile(r"^(page|slide|folie|diapositive|diapositiva|dia|슬라이드)\s*\d+$", re.I)
 _UNITS = {"cm": 1.0, "mm": 0.1, "in": 2.54, "pt": 2.54 / 72, "px": 2.54 / 96, "pc": 2.54 / 6}
 _LEN = re.compile(r"^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(cm|mm|in|pt|px|pc)\s*$")
 
@@ -76,6 +77,10 @@ class _Slides:
         for nt in kids(page, "notes"):
             for el, _ in self.shapes(nt, _SKIP):
                 notes.extend(b for b in self.blocks(el) if not isinstance(b, Image))
+        if not title:  # a slide the user renamed is labelled by that name
+            name = (attr(page, "name") or "").strip()
+            if name and not _DEFAULT_NAME.match(name):
+                title.append(name)
         sec = Section("slide", _squash(" ".join(title), 200), number, blocks, notes)
         style = attr(page, "style-name")
         if style and self.body.styles.prop(style, "drawing-page", "visibility") == "hidden":

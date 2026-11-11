@@ -291,6 +291,18 @@ def test_slide_title_and_numbering():
     assert "Slide 2" not in out and out.count("A") == 1 and "body1" in out and "body3" in out
 
 
+def test_custom_slide_name_is_the_title_when_none_else():
+    out = md(odp(page("Quarterly plan", frame("body")) + page("page2", frame("b2")) + page("Slide 3", frame("b3"))
+                 + page("슬라이드 4", frame("b4")) + page("Folie 5") + page("", frame("b6"))
+                 + page("Named", frame("T", cls="title"), frame("b7"))))
+    assert "## Slide 1: Quarterly plan" in out, out
+    for n in (2, 3, 4, 6):
+        assert f"## Slide {n}" + chr(10) in out, out
+    assert "## Slide 7: T" in out and "Named" not in out, out
+    long = md(odp(page("x" * 500, frame("body"))))
+    assert "## Slide 1: " + "x" * 199 in long and "x" * 201 not in long, long
+
+
 def test_custom_shape_and_group():
     cs = f'<draw:custom-shape>{P("모양글")}<draw:enhanced-geometry/></draw:custom-shape>'
     grp = f'<draw:g>{frame("묶음글")}<draw:g>{frame("깊은글")}</draw:g></draw:g>'
