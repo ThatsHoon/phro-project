@@ -151,6 +151,17 @@ def test_merged_table():
     assert out.count('<td rowspan="2">') == 1 and "<td>우</td>" in out and "<td>하</td>" in out
 
 
+def test_span_counts_compacted_columns():
+    # column 1 never starts a cell, so the grid keeps columns 0, 2, 3; A (columns 0-2) covers two of them
+    sec = _tbl(_tc("A", 0, 0, cs=3) + _tc("B", 3, 0),
+               _tc("C", 0, 1, cs=2) + _tc("D", 2, 1) + _tc("E", 3, 1))
+    doc, _ = parse(hwpx_doc(sec))
+    spans = [[(c.colspan, c.rowspan) for c in row] for row in doc.blocks[0].rows]
+    assert spans == [[(2, 1), (1, 1)], [(1, 1), (1, 1), (1, 1)]], spans
+    out = md(hwpx_doc(sec))
+    assert '<td colspan="2">A</td><td>B</td>' in out, out
+
+
 def test_header_cell_pipe_table():
     sec = _tbl(_tc("머", 0, 0, header="1") + _tc("리", 1, 0, header="1"), _tc("값", 0, 1) + _tc("둘", 1, 1))
     doc, _ = parse(hwpx_doc(sec))

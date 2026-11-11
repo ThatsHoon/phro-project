@@ -1,6 +1,7 @@
 """HWPX (Hancom Office, zip + XML) to the document model. Elements match by local name."""
 import fnmatch
 import re
+from bisect import bisect_left
 
 from .. import limits
 from ..charts import chart_table
@@ -566,14 +567,17 @@ class _Reader:
                 plain = plain and self.hdr.plain.get(attr(tc, "borderFillIDRef"), False)
         if not raw:
             return []
-        ri = {v: i for i, v in enumerate(sorted({x[0] for x in raw}))}
-        ci = {v: i for i, v in enumerate(sorted({x[1] for x in raw}))}
-        nrows, ncols = len(ri), len(ci)
-        grid = [[] for _ in range(nrows)]
+        # the grid keeps only rows and columns where a cell starts; a span counts the kept ones it covers
+        rows_at, cols_at = sorted({x[0] for x in raw}), sorted({x[1] for x in raw})
+        ri = {v: i for i, v in enumerate(rows_at)}
+        ci = {v: i for i, v in enumerate(cols_at)}
+        grid = [[] for _ in range(len(rows_at))]
         for row, col, rs, cs, cell in raw:
             r, c = ri[row], ci[col]
-            cell.rowspan, cell.colspan = min(rs, nrows - r), min(cs, ncols - c)
+            cell.rowspan = bisect_left(rows_at, row + rs) - r
+            cell.colspan = bisect_left(cols_at, col + cs) - c
             grid[r].append((c, cell))
+        nrows, ncols = len(rows_at), len(cols_at)
         rows = [[cell for _, cell in sorted(g, key=lambda x: x[0])] for g in grid]
         if plain and (nrows == 1 or ncols == 1):
             return [b for row in rows for c in row for b in c.blocks]
