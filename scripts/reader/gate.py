@@ -17,8 +17,12 @@ REASONS = {
     "unsupported": "this format is not supported yet",
     "encrypted": "the file is encrypted and needs a password",
     "drm": "the file is DRM-protected",
-    "too_large": "the file is over 512 MiB",
+    "too_large": f"the file is over {limits.MAX_INPUT // 2**20} MiB",
     "timeout": f"conversion took over {limits.CONVERT_SECONDS} seconds",
+}
+TOO_LARGE = {  # by the start of a too_large detail
+    limits.BIG_PART: "a part expands too much to read safely",
+    limits.BIG_TOTAL: f"the file expands past the {limits.ZIP_TOTAL // 2**30} GiB safety limit",
 }
 
 
@@ -78,6 +82,8 @@ def deny_text(path, why):
 def _deny(path, kind, detail=""):
     if kind == "damaged":
         why = f"the file looks damaged ({detail})"
+    elif kind == "too_large":
+        why = TOO_LARGE.get(detail.split(":", 1)[0], REASONS["too_large"])
     else:
         why = REASONS.get(kind) or f"{kind} {detail}".strip()
     return deny_text(path, why)
@@ -141,7 +147,7 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
     if reader.ext_of(path) not in reader.BUILT:
         return _deny(path, "unsupported")
     if path.stat().st_size > limits.MAX_INPUT:
-        return _deny(path, "too_large")
+        return _deny(path, "too_large", limits.BIG_INPUT)
     from reader import cache
     k = cache.key(path)
     entry = cache.lookup(k)

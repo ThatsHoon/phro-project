@@ -363,6 +363,39 @@ def test_missing_chart_counted():
     assert ctx.skipped["chart"] == 1
 
 
+def _flat_bmp(w, h):
+    import struct
+    stride = (w * 3 + 3) // 4 * 4
+    size = 54 + stride * h
+    head = b"BM" + struct.pack("<IHHI", size, 0, 0, 54) + struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, 0, 0, 0, 0, 0)
+    return head + b"\xff" * (stride * h)
+
+
+def test_flat_bmp_image_is_skipped_not_fatal():
+    bmp = _flat_bmp(3000, 1000)  # 9 MB that deflates far past the ratio limit
+    items = '<opf:item id="image1" href="BinData/image1.bmp" media-type="image/bmp"/>'
+    pic = '<hp:p><hp:run><hp:pic><hc:img binaryItemIDRef="image1"/></hp:pic></hp:run></hp:p>'
+    path = hwpx_doc(P("본문") + pic, hpf_items=items, extra={"BinData/image1.bmp": bmp})
+    assert path.stat().st_size < 50_000
+    out = tmp() / "out"
+    meta = reader.convert(path, out)
+    text = (out / "out.md").read_text(encoding="utf-8")
+    assert text == "(could not read: 1 image)\n\n본문\n", text
+    assert meta["unread"] == ["1 image"] and meta["images"] == 0, meta
+
+
+def test_body_part_over_ratio_limit_is_denied():
+    from reader import gate, limits
+    path = hwpx_doc(P("본문") + " " * (3 * 2**20))
+    try:
+        reader.convert(path, tmp() / "out")
+        raise AssertionError("converted")
+    except ReadError as e:
+        assert e.kind == "too_large" and e.detail == limits.BIG_PART + ": Contents/section0.xml", e
+        why = gate._deny(path, e.kind, e.detail)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert why.startswith("a.hwpx: a part expands too much to read safely."), why
+
+
 def test_nothing_readable_is_damaged():
     sec = '<hp:p><hp:run><hp:chart chartIDRef="Chart/none.xml"/></hp:run></hp:p>'
     try:

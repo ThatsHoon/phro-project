@@ -376,7 +376,7 @@ class _Reader:
                         stack.append((c, cur))
                 story = (paras, index)
             except ReadError as e:
-                if e.kind != "damaged":
+                if e.kind not in ("damaged", "too_large"):  # only reading order is lost
                     raise
                 self.count("story", "story: damaged StoryFragments ignored")
             self.stories[part] = story
@@ -394,7 +394,7 @@ class _Reader:
                 try:
                     data = self.pkg.read(name)
                 except ReadError as e:
-                    if e.kind != "damaged":
+                    if e.kind not in ("damaged", "too_large"):  # an image or object over a limit is skipped
                         raise
             self.images[name] = data if data and sniff(data) else None
         data = self.images[name]

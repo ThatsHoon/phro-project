@@ -252,7 +252,7 @@ class _Reader:
             try:
                 self.cache[name] = self.pkg.read(name)
             except ReadError as e:
-                if e.kind != "damaged":
+                if e.kind not in ("damaged", "too_large"):  # an image or object over a limit is skipped
                     raise
                 self.ctx.skipped[kind] += 1
                 self.cache[name] = None

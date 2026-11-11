@@ -31,14 +31,14 @@ def ext_of(path) -> str:
 
 def precheck(path) -> None:
     """Cheap gate shared by parse and the CLI: extension and size."""
-    from .limits import MAX_INPUT, ReadError
+    from .limits import BIG_INPUT, MAX_INPUT, ReadError
     path = Path(path)
     ext = ext_of(path)
     if ext not in BUILT:
         raise ReadError("unsupported", ext or "no extension")
     size = path.stat().st_size
     if size > MAX_INPUT:
-        raise ReadError("too_large", f"{size} bytes")
+        raise ReadError("too_large", f"{BIG_INPUT}: {size} bytes")
 
 
 def parse(path, ctx):

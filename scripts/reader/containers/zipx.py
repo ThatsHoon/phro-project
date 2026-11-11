@@ -157,14 +157,15 @@ class Package:
         info = self._zip.getinfo(real)
         if info.flag_bits & 1:
             raise ReadError("encrypted", real)
-        if real not in self._seen:
-            self._seen.add(real)
-            self._total += info.file_size
-        if self._total > limits.ZIP_TOTAL:
-            raise ReadError("too_large", "zip total uncompressed size")
+        # a refused member is not charged, so a caller that skips it can go on reading the rest
         if (info.file_size > limits.ZIP_RATIO_FLOOR
                 and info.file_size / max(info.compress_size, 1) > limits.ZIP_RATIO):
-            raise ReadError("too_large", f"compression ratio of {real}")
+            raise ReadError("too_large", f"{limits.BIG_PART}: {real}")
+        if real not in self._seen:
+            if self._total + info.file_size > limits.ZIP_TOTAL:
+                raise ReadError("too_large", f"{limits.BIG_TOTAL}: zip uncompressed size")
+            self._seen.add(real)
+            self._total += info.file_size
         try:
             return self._zip.read(info)
         except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError) as e:

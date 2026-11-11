@@ -14,6 +14,10 @@ SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one documen
 GRID_COLS = 1_000        # columns a span may reach in a rendered table
 GRID_SLOTS = 2_000_000    # grid slots all spans of one rendered table may cover
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
+# a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
+BIG_INPUT = "input"  # the file is over MAX_INPUT
+BIG_PART = "part"    # one zip member passes ZIP_RATIO
+BIG_TOTAL = "total"  # the members read so far pass ZIP_TOTAL
 
 
 class ReadError(Exception):

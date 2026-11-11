@@ -228,6 +228,17 @@ def test_gate_wrong_content():
     assert o["permissionDecision"] == "deny" and "looks damaged" in o["permissionDecisionReason"]
 
 
+def test_too_large_reason_names_the_limit():
+    from reader import limits
+    p = Path("x/a.hwpx")
+    why = {d: gate._deny(p, "too_large", d)["hookSpecificOutput"]["permissionDecisionReason"]
+           for d in ("input: 600000000 bytes", "part: Contents/section0.xml", "total: zip uncompressed size")}
+    assert why["input: 600000000 bytes"].startswith("a.hwpx: the file is over 512 MiB"), why
+    assert why["part: Contents/section0.xml"].startswith("a.hwpx: a part expands too much to read safely"), why
+    assert why["total: zip uncompressed size"].startswith("a.hwpx: the file expands past the 1 GiB safety limit"), why
+    assert limits.MAX_INPUT == 512 * 2**20 and limits.ZIP_TOTAL == 2**30
+
+
 def test_timeout_denies():
     with stub():
         d = gate.decide(ev(sample()), command=[sys.executable, "-c", "import time; time.sleep(5)"], timeout=1)

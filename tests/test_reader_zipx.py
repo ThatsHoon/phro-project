@@ -102,6 +102,41 @@ def test_total_counts_each_member_once():
         limits.ZIP_TOTAL = old
 
 
+def test_refused_member_keeps_the_total_budget():
+    p = make_zip(tmp() / "t.zip", {"a": b"x" * 600, "b": b"y" * 600, "c": b"z" * 300}, stored=())
+    old = limits.ZIP_TOTAL
+    limits.ZIP_TOTAL = 1000
+    try:
+        with zipx.Package(p) as pkg:
+            pkg.read("a")
+            try:
+                pkg.read("b")
+                raise AssertionError("b read")
+            except ReadError as e:
+                assert e.kind == "too_large" and e.detail.startswith(limits.BIG_TOTAL + ":"), e
+            assert pkg.read("c") == b"z" * 300
+    finally:
+        limits.ZIP_TOTAL = old
+
+
+def test_too_large_details_name_the_limit():
+    p = make_zip(tmp() / "b.zip", {"big.bin": b"\0" * (3 * 2**20)}, stored=())
+    with zipx.Package(p) as pkg:
+        try:
+            pkg.read("big.bin")
+            raise AssertionError("read")
+        except ReadError as e:
+            assert e.kind == "too_large" and e.detail == limits.BIG_PART + ": big.bin", e
+    big = tmp() / "x.hwpx"
+    with open(big, "wb") as f:
+        f.truncate(limits.MAX_INPUT + 1)
+    try:
+        reader.precheck(big)
+        raise AssertionError("precheck passed")
+    except ReadError as e:
+        assert e.kind == "too_large" and e.detail.startswith(limits.BIG_INPUT + ":"), e
+
+
 def test_case_duplicate_names_are_damaged():
     p = make_zip(tmp() / "c.zip", {"A.xml": "<a/>", "a.XML": "<b/>"}, stored=())
     raises_kind(lambda: zipx.Package(p), "damaged")

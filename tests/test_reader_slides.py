@@ -294,6 +294,15 @@ def test_missing_notes_and_image_counted():
     assert ctx.skipped["image"] == 1 and doc.blocks[0].title == "t"
 
 
+def test_image_over_ratio_limit_is_skipped():
+    pic = ('<p:pic><p:nvPicPr><p:cNvPr id="5" name="p"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>'
+           '<p:blipFill><a:blip r:embed="rI"/></p:blipFill><p:spPr/></p:pic>')
+    d = deck([sp("t", "title") + sp("body") + pic], srels={1: [("rI", "image", "../media/i.png")]},
+             extra={"ppt/media/i.png": PNG + bytes(3 * 2**20)})
+    doc, ctx = parse(d)
+    assert ctx.skipped["image"] == 1 and "body" in markdown.render(doc, tmp() / "assets")
+
+
 def test_notes_missing_and_damaged():
     d = deck([sp("t", "title")], srels={1: [("rN", "notesSlide", "../notesSlides/none.xml")]})
     doc, ctx = parse(d)

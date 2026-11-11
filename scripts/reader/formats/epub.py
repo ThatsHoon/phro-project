@@ -213,7 +213,7 @@ class _Book:
             try:
                 self.sheets[name] = xhtml.decode(self.pkg.read(name)[:xhtml.MAX_SHEET * 4])
             except ReadError as e:
-                if e.kind != "damaged":
+                if e.kind not in ("damaged", "too_large"):  # a stylesheet over a limit is skipped
                     raise
                 self.sheets[name] = None
         return self.sheets[name]
@@ -225,7 +225,7 @@ class _Book:
         try:
             data = self.pkg.read(name)
         except ReadError as e:
-            if e.kind != "damaged":
+            if e.kind not in ("damaged", "too_large"):  # an image or object over a limit is skipped
                 raise
             return None
         self.image_bytes += len(data)
