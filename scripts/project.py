@@ -13,6 +13,9 @@ Routing, on a scratch copy so the plugin itself is never edited:
   project.py catalog <out.json> <skills_dir> [<skills_dir> ...] [--only a,b]         competing descriptions from installed skills
   project.py build   <plugin> <cases.json> <out_dir> [--history f.jsonl] [--stub] [--also out.json] [--max-turns N]
   project.py tally   <result.json> [<result.json> ...]                              hits, misses, and which skill took each miss
+
+Output quality, from a `claude plugin eval --ablation with-without` run (graders named b-* are boundaries):
+  project.py quality <result.json> [--accepted accepted.json] [--save accepted.json]  per-grader pass rate in each arm, breaks, gained and broken
 """
 import argparse
 import collections
@@ -490,6 +493,69 @@ def cmd_tally(a):
             print(f"false_fire\t{line}")
 
 
+NOISE = 0.34  # one run in three moving is noise, two is a change
+
+
+def cmd_quality(a):
+    """Output quality of a with-without run: per case and grader, pass rate in each arm and what it proves."""
+    data = json.loads(Path(a.result).read_text(encoding="utf-8"))
+    rows, breaks, cost = [], [], collections.Counter()
+    for case in data["cases"]:
+        defs = {g["name"]: g for g in case.get("graders", [])}
+        withs, withouts = case["arms"].get("with", []), case["arms"].get("without", [])
+        for arm, runs in (("with", withs), ("without", withouts)):
+            cost[arm] += sum(r.get("costUsd") or 0 for r in runs)
+        indicator = {n for n, g in defs.items() if g.get("type") == "tool_used" and g.get("config", {}).get("tool") == "Skill"}
+
+        def rate(runs, name):
+            seen = [g["passed"] for r in runs for g in r["graders"] if g["name"] == name]
+            return sum(seen) / len(seen) if seen else None
+        fired = sum(any(g["passed"] for g in r["graders"] if g["name"] in indicator) for r in withs)
+        fired = f"{fired}/{len(withs)}" if indicator else "-"  # no indicator grader: firing unknown, not 0
+        errors = sum(bool(r.get("error")) for r in withs + withouts)
+        print(f"case\t{case['name']}\tfired\t{fired}\terrors\t{errors}")
+        for name in sorted(defs):
+            if name in indicator:
+                continue
+            w, wo = rate(withs, name), rate(withouts, name)
+            if w is None:
+                continue
+            flags = []
+            if name.startswith("b-") and w < 1:
+                flags.append("BOUNDARY")
+                breaks.append(f"{case['name']}\t{name}\t{w:.2f}")
+            if wo is not None and w == 1 and wo == 1:
+                flags.append("nondiscriminating")
+            if 0 < w < 1:
+                flags.append("flaky")
+            rows.append((case["name"], name, w, wo, flags))
+    print(f"file\t{a.result}\tcost_with\t{cost['with']:.2f}\tcost_without\t{cost['without']:.2f}\tpartial\t{data.get('partial')}")
+    for line in breaks:
+        print(f"break\t{line}")
+    print("case\tgrader\twith\twithout\tdelta\tflags")
+    for name, grader_name, w, wo, flags in rows:
+        delta = "" if wo is None else f"{w - wo:+.2f}"
+        print(f"{name}\t{grader_name}\t{w:.2f}\t{'' if wo is None else f'{wo:.2f}'}\t{delta}\t{','.join(flags)}")
+    deltas = [w - wo for _, _, w, wo, _ in rows if wo is not None]
+    print(f"summary\tgraders\t{len(rows)}\tboundary_breaks\t{len(breaks)}\tnondiscriminating\t{sum('nondiscriminating' in r[4] for r in rows)}"
+          f"\tflaky\t{sum('flaky' in r[4] for r in rows)}\tmean_delta\t{sum(deltas) / len(deltas) if deltas else 0:+.2f}")
+    now = {}
+    for name, grader_name, w, _, _ in rows:
+        now.setdefault(name, {})[grader_name] = w
+    if a.accepted:
+        old = json.loads(Path(a.accepted).read_text(encoding="utf-8"))
+        for name, graders in now.items():
+            for grader_name, w in graders.items():
+                before = old.get(name, {}).get(grader_name)
+                if before is None:
+                    print(f"new\t{name}\t{grader_name}\t{w:.2f}")
+                elif abs(w - before) > NOISE:
+                    print(f"{'gained' if w > before else 'broken'}\t{name}\t{grader_name}\t{before:.2f} -> {w:.2f}")
+    if a.save:
+        Path(a.save).write_text(json.dumps(now, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"saved\t{a.save}")
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -530,6 +596,11 @@ def main():
     p = sub.add_parser("tally")
     p.add_argument("results", nargs="+")
     p.set_defaults(fn=cmd_tally)
+    p = sub.add_parser("quality")
+    p.add_argument("result")
+    p.add_argument("--accepted")
+    p.add_argument("--save")
+    p.set_defaults(fn=cmd_quality)
     a = parser.parse_args()
     a.fn(a)
 

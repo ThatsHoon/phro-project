@@ -224,6 +224,26 @@ def demo():
         out = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "tally", str(path)], capture_output=True, text=True, encoding="utf-8").stdout
         assert "target\t2/3" in out and "alpha\t3\t2\t0\t0\t0\t1" in out and "wrong_order" in out, out
         assert "o2 alpha -> called, but not after the step" in out, "a call at the wrong moment is not a hit"
+
+        def arm(passes, n=3):  # passes: grader name -> how many of n runs passed it
+            return [{"costUsd": 0.1, "error": None, "graders": [{"name": g, "passed": i < k} for g, k in passes.items()]} for i in range(n)]
+        defs = [{"name": "skill", "type": "tool_used", "config": {"tool": "Skill"}}] + [{"name": g, "type": "regex", "config": {}} for g in ("b-ban", "f-num", "j-faith")]
+        doc = {"partial": False, "cases": [
+            {"name": "q1", "graders": defs, "arms": {"with": arm({"skill": 3, "b-ban": 3, "f-num": 3, "j-faith": 2}), "without": arm({"b-ban": 1, "f-num": 3, "j-faith": 0})}},
+            {"name": "q2", "graders": defs, "arms": {"with": arm({"skill": 2, "b-ban": 2, "f-num": 3, "j-faith": 3}), "without": arm({"b-ban": 0, "f-num": 0, "j-faith": 0})}},
+            {"name": "q3", "graders": defs[1:2], "arms": {"with": arm({"b-ban": 3}), "without": arm({"b-ban": 3})}},
+        ]}
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        accepted = Path(d) / "accepted.json"
+        accepted.write_text(json.dumps({"q1": {"b-ban": 1.0, "f-num": 1.0, "j-faith": 1 / 3}, "q2": {"b-ban": 1.0, "f-num": 1.0}}), encoding="utf-8")
+        out = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "quality", str(path), "--accepted", str(accepted)], capture_output=True, text=True, encoding="utf-8").stdout
+        assert "case\tq1\tfired\t3/3" in out and "case\tq2\tfired\t2/3" in out, "the Skill indicator shows firing and is not scored"
+        assert "case\tq3\tfired\t-" in out, "a case without an indicator shows unknown firing, not 0"
+        assert "break\tq2\tb-ban\t0.67" in out and "q1\tb-ban\t1.00\t0.33\t+0.67\t\n" in out, "a boundary that fails one run is a break"
+        assert "q1\tf-num\t1.00\t1.00\t+0.00\tnondiscriminating" in out and "q1\tj-faith\t0.67\t0.00\t+0.67\tflaky" in out, out
+        assert "gained\tq1\tj-faith\t0.33 -> 0.67" not in out, "one run in three moving is noise"
+        assert "new\tq2\tj-faith\t1.00" in out and "broken" not in out, out
+        assert "\tskill\t" not in out.split("case\tgrader")[1], "the indicator has no row"
     print("ok")
 
 

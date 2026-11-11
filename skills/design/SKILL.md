@@ -38,8 +38,9 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
 8. Write how it fires before the code, in the language users really type:
    - From a prompt: about 8 cases that should fire it and 8 close misses that should not, in `tests/route_cases.json`, in the format `route-test` uses. `check` counts a skill named there as tested.
    - From a step in the work: cases with `after` and `rule`, as `route-test` describes.
+8b. For a skill that produces something (text, a file, a decision), write what it must produce before the body: `skills/<name>/CONTRACT.md` and 3 to 5 cases in `evals/quality/<name>/`, by `${CLAUDE_PLUGIN_ROOT}/skills/design/references/quality.md`. Agree the contract with the user; after that it changes only on their word.
 9. Write the description last, from those prompts: what it does, then the words users really type, in their language. In one measurement, adding the user's own verbs to a description moved a skill from 1 of 7 to 6 of 7. Keep the combined description and when_to_use under 1,536 characters; shorter is better, since a description is read every session.
 10. Build it if the user told you to, and write its standing rule in the same step.
-11. Read `${CLAUDE_PLUGIN_ROOT}/skills/route-test/SKILL.md`. It spends money, so state the estimate and get a yes, then follow it with the existing skills as competitors, and report any existing case that broke. Without that yes, report the capability as built and not measured.
+11. Read `${CLAUDE_PLUGIN_ROOT}/skills/route-test/SKILL.md`, and `${CLAUDE_PLUGIN_ROOT}/skills/quality-test/SKILL.md` when 8b wrote cases. Both spend money, so state each estimate and get a yes, then follow route-test with the existing skills as competitors, and report any existing case that broke. Without that yes, report the capability as built and not measured.
 
-Report in the user's language: what was built, where, what makes it fire, and what was measured. Mark as inference anything you did not measure.
+Report in the user's language: what was built, where, what makes it fire, what it produced against its contract, and what was measured. Mark as inference anything you did not measure.
