@@ -26,7 +26,7 @@ ORIGIN = "origin.json"
 MANIFEST = ".claude-plugin/plugin.json"
 MARKET = ".claude-plugin/marketplace.json"
 OWN = {ORIGIN, MANIFEST, MARKET}  # written for each copy, so a sync leaves them to this script
-IGNORE = {".git", "__pycache__", ".phro-project", "results", ".venv", "node_modules", ".superpowers", ".worktrees"}  # folder or file names; a worktree's .git is a file
+IGNORE = {".git", ".in_use", "__pycache__", ".phro-project", "results", ".venv", "node_modules", ".superpowers", ".worktrees"}  # folder or file names; a worktree's .git is a file
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 

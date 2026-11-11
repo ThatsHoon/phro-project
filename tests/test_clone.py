@@ -33,6 +33,8 @@ def demo():
         shutil.copytree(ROOT, original, ignore=shutil.ignore_patterns(".git", "__pycache__"))
         (original / ".git").mkdir()
         (original / ".git/config").write_text("x\n", encoding="utf-8")
+        (original / ".in_use").mkdir()  # what Claude Code leaves in a plugin folder while a session uses it
+        (original / ".in_use/123").write_text('{"pid":123}\n', encoding="utf-8")
         version = json.loads((original / clone.MANIFEST).read_text(encoding="utf-8"))["version"]
 
         def run(plugin, *args):
@@ -77,7 +79,8 @@ def demo():
         assert not (copy / ".git").exists(), "a copy shares no history with the original"
         assert not (copy / "mods/.git").exists(), "a .git pointer file would make git in the copy act on the original's repository"
         assert not (copy / ".superpowers").exists() and not (copy / ".worktrees").exists(), "work logs and worktrees are not the plugin"
-        same = [rel for rel in before if not rel.startswith((".git/", ".superpowers/", ".worktrees/")) and rel not in clone.OWN and rel != "mods/.git"]
+        assert not (copy / ".in_use").exists(), "nor Claude Code's in-use marks on the original"
+        same = [rel for rel in before if not rel.startswith((".git/", ".superpowers/", ".worktrees/", ".in_use/")) and rel not in clone.OWN and rel != "mods/.git"]
         assert same and all((copy / rel).read_bytes() == (original / rel).read_bytes() for rel in same), "a copy is the plugin as it was"
 
         assert ensure(original, app).stdout.startswith(f"EXISTS\t{copy}"), "one project, one copy"
@@ -115,6 +118,8 @@ def demo():
         said = hook(copy, app)
         assert f"/{manifest['name']}:compass" in said and "/phro-project:compass" not in said, "a copy names itself"
         assert "newer" not in said, "nothing newer yet"
+        (original / ".in_use/456").write_text('{"pid":456}\n', encoding="utf-8")
+        assert "newer" not in hook(copy, app), "a session opening on the original is no new original"
         assert "/phro-project:compass" in hook(original, app), "the original names itself"
 
         newer = base / "cache/9.0.0"
