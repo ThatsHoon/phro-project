@@ -22,6 +22,9 @@ Find these yourself, from code, docs and git, never by asking:
 3. Every wire between consumers: messages, HTTP ingest routes, files. A wire hidden inside one feature is a shared format to pull out.
 4. What each feature needs from outside: data it fetches, keys, model files, base models, device formats that do not exist yet.
 5. State each feature keeps (windows, sessions, tracks, stores), version couplings (dictionary or schema versions, trained-on versions), uncommitted work and other sessions editing the repo.
+6. Files git does not track under every path that will move: `git status --ignored --short -- <path>` in the main checkout (weights, runtime state, account and token files, local data). A merge leaves them at the old path.
+7. Environment variables each feature reads, and deployments that set them.
+8. Line endings: `git ls-files --eol`. When they are mixed, every edit keeps the file's own endings (read and write bytes).
 
 ## 2. Decide with the user, in rounds
 
@@ -32,20 +35,24 @@ Ask in rounds (the grilling form: numbered questions, each with a recommended an
 4. The contract source: machine-readable files beside the code (JSON Schema, golden examples the tests replay, OpenAPI generated from the router). The document only indexes them.
 5. Feature list and common layers: merge features that import each other both ways; pull helpers that several features share into one common layer per bundle.
 6. Outside needs: fetch built in with keys from the environment, plus an entry that takes the data from the caller. Missing device formats are written as "not decided", not built.
-7. State goes in and out of calls; stores sit behind a replaceable interface. Auth is an overridable dependency.
+7. State goes in and out of calls; stores sit behind a replaceable interface. Auth is an overridable dependency. A renamed environment variable still reads its old name as a fallback, with a test that sets only the old one.
 8. Versions: one table of what each feature supports; mismatches fail loudly.
 9. What is dropped (to `legacy/`) and what is out of scope (experiments, conversions, packaging). The move changes no behaviour except what the spec names.
-10. Order, done criteria, and what to update after the merge (deployments, docs and memory that name old paths, pushes, which need a fresh yes).
+10. Order, done criteria, and what to update after the merge (the untracked-file moves from fact 6, deployments, launch configs, docs and memory that name old paths, pushes, which need a fresh yes).
 
 When the tree is empty, show the whole design in one message and wait for the user's yes.
 
 ## 3. Spec
 
-Write the spec in English to `docs/superpowers/specs/<date>-portable-modules-design.md` on a new branch in a local worktree (`git worktree add .worktrees/<branch> -b <branch>`, `.worktrees/` in `.git/info/exclude`), so sessions on the main checkout are not disturbed. Commit it with the repository's own author. Sections: purpose and success, bundles, target tree, one feature folder, rules, version table, per-feature decisions, migration, done criteria, after the merge, out of scope, risks. Ask the user to review it. Then write the step plan with `superpowers:writing-plans` if installed, otherwise as a numbered plan in the spec's folder, and wait for its approval.
+Write the spec in English to `docs/superpowers/specs/<date>-portable-modules-design.md` on a new branch in a local worktree (`git worktree add .worktrees/<branch> -b <branch>`, `.worktrees/` in `.git/info/exclude`), so sessions on the main checkout are not disturbed. Commit it with the repository's own author. Sections: purpose and success, bundles, target tree, one feature folder, rules, version table, per-feature decisions, migration, untracked files (old path, new path, how to check: hash file, or delete when it is a byte-identical copy), done criteria, after the merge, out of scope, risks. Ask the user to review it. Then write the step plan with `superpowers:writing-plans` if installed, otherwise as a numbered plan in the spec's folder, and wait for its approval.
 
 ## 4. Move
 
 Follow sections 3 to 5 of `${CLAUDE_PLUGIN_ROOT}/skills/restructure/SKILL.md` (stop the world, baseline, phases with `plan`, `apply`, `verify`, tests per phase) inside the worktree. Order: shared formats, common layers, then features from the most depended on, the feature another session is editing last. One commit per phase.
+
+The baseline adds two numbers: the tests the suite runner collects (`pytest --collect-only -q` per pytest run it makes, plus its other test files), and which tests fail when the suite runs twice (timing-sensitive; they are marked, not blamed on the move). A moved test that drops out of the runner lowers both the suite and its pass count, so a matching pass count alone proves nothing.
+
+`.gitignore`: the phase that moves a path adds its ignore lines at the new path. Old-path lines for fact 6 go in one block marked for deletion after the merge; lines for data that stays where it is never go in that block.
 
 Write `contracts/modules.json` as the first phase, and keep it current:
 ```
@@ -56,14 +63,14 @@ Write `contracts/modules.json` as the first phase, and keep it current:
 After each phase run:
 1. `modularize.py imports <worktree>`: 0 forbidden.
 2. `modularize.py copytest <worktree> <feature> --venv` for each feature moved: OK. A feature without tests fails here, so it gets its contract replay test in the same phase.
-3. The whole suite against the baseline.
+3. The whole suite against the baseline, and the collected test count: equal, or higher by the tests this phase added.
 
 ## 5. Contract document
 
-After the last phase, write `contracts/README.md` in the user's language for outside readers: no internal version names, run history, server paths or account names. For each wire in `shared/` and each feature: what it does, how to call it (function and HTTP), inputs and outputs by link to its `contract/` files with one example inline, errors, state it expects the caller to keep, auth, versions, weights and keys it needs. Then run `modularize.py contracts <worktree>` until every feature reads OK, and check that each inline example matches its file.
+After the last phase, write `contracts/README.md` in the user's language for outside readers: no internal version names, run history, server paths or account names. For each wire in `shared/` and each feature: what it does, how to call it (function and HTTP), inputs and outputs by link to its `contract/` files with one example inline, errors, state it expects the caller to keep, auth, versions, weights and keys it needs. Each example names the schema it follows (`"schema": "<file>"` for the whole example, or `{"input": "<file>", "output": "<file>"}`), and the feature's contract test validates it against that schema. Then run `modularize.py contracts <worktree>` until every feature reads OK, and check that each inline example matches its file.
 
 ## 6. Finish
 
-1. Done means: suite matches the baseline, `imports` 0, `copytest` OK for every feature, generated OpenAPI equals the committed one, every consumer example starts without errors, no old-path mentions outside `legacy/` and training.
+1. Done means: suite matches the baseline with no fewer collected tests, `imports` 0, `copytest` OK for every feature, generated OpenAPI equals the committed one, every consumer example starts without errors, no old-path mentions outside `legacy/` and training.
 2. Write the folder rules the way `restructure` section 6 does, adding the import rule and the copy test to the suite.
 3. Report in the user's language: the tree, each feature's `copytest` line, `contracts` counts, what changed beyond moves, what was left out of scope, and the after-merge steps still waiting for the user's yes. Merging the branch and pushing are the user's call.

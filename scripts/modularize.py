@@ -8,7 +8,8 @@ Standard library only. Prints paths and counts, never file contents.
 
   imports   <root> [--rules F]                       every forbidden import, exit 1 if any
   copytest  <root> <feature> [--rules F] [--venv]    copy the feature and what it may import to an empty dir, run its tests
-  contracts <root> [--rules F] [--doc F]             contract files per feature and their link from the contract doc
+  contracts <root> [--rules F] [--doc F]             contract files per feature, the schema each example names,
+                                                     and their link from the contract doc
 """
 import argparse
 import ast
@@ -136,6 +137,16 @@ def cmd_copytest(a):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def schema_links(name, data, schema_dir):
+    """An example names the schema it follows: "schema": "<file>" for the whole example, or {"input": "<file>", ...}
+    per part. The feature's own contract test validates the example against it (jsonschema lives in its requirements)."""
+    ref = data.get("schema") if isinstance(data, dict) else None
+    files = [ref] if isinstance(ref, str) else list(ref.values()) if isinstance(ref, dict) else []
+    if not files:
+        return [f"{name} names no schema"]
+    return [f"{name} names missing {f}" for f in files if not (schema_dir / str(f)).is_file()]
+
+
 def cmd_contracts(a):
     root = Path(a.root).resolve()
     feats, _ = load(root, a.rules)
@@ -146,16 +157,19 @@ def cmd_contracts(a):
         c = root / feat / "contract"
         schemas = sorted((c / "schema").glob("*.json")) if c.is_dir() else []
         examples = sorted((c / "examples").glob("*.json")) if c.is_dir() else []
-        broken = []
+        broken, unlinked = [], []
         for f in schemas + examples + [c / "openapi.json"]:
             if f.exists():
                 try:
-                    json.loads(f.read_text(encoding="utf-8"))
+                    data = json.loads(f.read_text(encoding="utf-8"))
                 except (ValueError, UnicodeDecodeError):
                     broken.append(f.relative_to(root).as_posix())
+                    continue
+                if f in examples:
+                    unlinked += schema_links(f.name, data, c / "schema")
         linked = f"{feat}/contract" in text
         problems = (["no schema"] if not schemas else []) + (["no examples"] if not examples else []) + \
-                   ([f"bad json {b}" for b in broken]) + ([] if linked else [f"not linked from {a.doc}"])
+                   ([f"bad json {b}" for b in broken]) + unlinked + ([] if linked else [f"not linked from {a.doc}"])
         bad += bool(problems)
         print(f"{'OK' if not problems else 'MISSING'}\t{feat}\tschema {len(schemas)}\texamples {len(examples)}"
               f"\topenapi {'yes' if (c / 'openapi.json').exists() else 'no'}" + ("\t" + "; ".join(problems) if problems else ""))
