@@ -100,9 +100,8 @@ def test_shape_text_markers():
 
 
 def test_text_line_break_and_empty_skipped():
-    p = vsdx({"P": shape(1, "a\nb") + shape(2, "   ") + shape(3, None)})
-    out, _ = md(p)
-    assert "a" in out and "b" in out and out.count("\n\n") <= 3
+    out, _ = md(vsdx({"P": shape(1, "a\nb", (0, 9)) + shape(2, "   ", (0, 8)) + shape(3, None, (0, 7))}))
+    assert out == "## Page: P\n\na\nb\n", repr(out)
 
 
 def test_group_recursion_and_order():
@@ -118,6 +117,44 @@ def test_group_offset_and_page_order():
     p = vsdx({"P": shape(9, "page", (0, 5)) + g})
     out, _ = md(p)
     assert out.index("child") < out.index("page")
+
+
+def test_group_offset_sign():
+    # offset = Pin - LocPin = 10 - 6 = +4: child y 2 -> 6, below the page shape at 9 (+LocPin would give 18)
+    g = shape(1, None, (0, 10, 0, 6), "<Shapes>" + shape(2, "child", (0, 2)) + "</Shapes>")
+    out, _ = md(vsdx({"P": shape(9, "page", (0, 9)) + g}))
+    assert out.index("page") < out.index("child")
+    # offset X = 10 - 6 = +4: child x 2 -> 6 stays right of the page shape at x 5, same y
+    g = shape(1, None, (10, 0, 6, 0), "<Shapes>" + shape(2, "child", (2, 0)) + "</Shapes>")
+    out, _ = md(vsdx({"P": shape(9, "page", (5, 0)) + g}))
+    assert out.index("page") < out.index("child")
+    g = shape(1, None, (10, 0, 6, 0), "<Shapes>" + shape(2, "child", (0, 0)) + "</Shapes>")
+    out, _ = md(vsdx({"P": shape(9, "page", (5, 0)) + g}))  # child x 0 -> 4, left of 5
+    assert out.index("child") < out.index("page")
+
+
+def test_nested_group_offsets_add():
+    # outer +4 (10-6), inner +3 (8-5): grandchild y 1 -> 8; sits between the page shapes at 9 and 7
+    inner = shape(3, None, (0, 8, 0, 5), "<Shapes>" + shape(4, "grand", (0, 1)) + "</Shapes>")
+    outer = shape(2, None, (0, 10, 0, 6), f"<Shapes>{inner}</Shapes>")
+    out, _ = md(vsdx({"P": shape(8, "above", (0, 9)) + outer + shape(9, "below", (0, 7))}))
+    assert out.index("above") < out.index("grand") < out.index("below")
+
+
+def test_missing_locpin_counts_as_zero():
+    # PinY 10, no LocPinY: offset +10, child y 1 -> 11, above the page shape at 9
+    g = shape(1, None, (0, 10), "<Shapes>" + shape(2, "child", (0, 1)) + "</Shapes>")
+    out, _ = md(vsdx({"P": shape(9, "page", (0, 9)) + g}))
+    assert out.index("child") < out.index("page")
+    # same on X: PinX 10, no LocPinX, child x 1 -> 11, right of the page shape at x 5
+    g = shape(1, None, (10, 0), "<Shapes>" + shape(2, "child", (1, 0)) + "</Shapes>")
+    out, _ = md(vsdx({"P": shape(9, "page", (5, 0)) + g}))
+    assert out.index("page") < out.index("child")
+    # LocPinY without PinY: offset -6, child y 8 -> 2, below the page shape at 5
+    g = shape(1, None, (), "<Shapes>" + shape(2, "child", (0, 8)) + "</Shapes>")
+    g = g.replace("<Shapes>", '<Cell N="LocPinY" V="6"/><Shapes>')
+    out, _ = md(vsdx({"P": shape(9, "page", (0, 5)) + g}))
+    assert out.index("page") < out.index("child")
 
 
 def test_unpositioned_after_positioned():
@@ -180,10 +217,12 @@ def test_shared_media_and_master_ignored():
     fd = '<ForeignData ForeignType="Bitmap"><Rel r:id="rId1"/></ForeignData>'
     many = "".join(shape(i, None, (i, 0), fd) for i in range(1, 300))
     many += shape(999, None, (0, 9), "", 'Master="2" MasterShape="3"')
-    p = vsdx({"P": many}, extra={"visio/media/image1.png": PNG},
+    master = (f'<MasterContents {VNS}><Shapes><Shape ID="3"><Text>MASTERTEXT</Text></Shape></Shapes></MasterContents>')
+    p = vsdx({"P": many}, extra={"visio/media/image1.png": PNG, "visio/masters/master1.xml": master,
+                                 "visio/masters/masters.xml": f"<Masters {VNS}><Master ID=\"2\"/></Masters>"},
              page_rels={1: [("rId1", "image", "../media/image1.png")]})
     out, ctx = md(p)
-    assert out.count("![](") == 299 and not ctx.skipped["image"]
+    assert out.count("![](") == 299 and not ctx.skipped["image"] and "MASTERTEXT" not in out
 
 
 def test_missing_image_counted():

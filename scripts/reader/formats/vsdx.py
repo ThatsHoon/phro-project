@@ -131,25 +131,21 @@ class _Reader:
         sec = Section("page", title=name)
         shapes = _kid(root, "Shapes")
         if shapes is not None:
-            for _, blocks in self.order(self.walk(shapes, 0.0, 0.0, 0)):
+            out = []
+            self.walk(shapes, 0.0, 0.0, 0, out)
+            placed = sorted((e for e in out if e[0] is not None), key=lambda e: e[0])
+            for _, blocks in placed + [e for e in out if e[0] is None]:
                 sec.blocks.extend(blocks)
         return sec
 
-    @staticmethod
-    def order(entries):
-        placed = sorted((e for e in entries if e[0] is not None), key=lambda e: e[0])
-        return placed + [e for e in entries if e[0] is None]
-
-    def walk(self, container, dx, dy, d):
-        """[(sort key or None, blocks)] for the Shape children of `container`; (dx, dy) is the group offset."""
-        out = []
+    def walk(self, container, dx, dy, d, out):
+        """Append (sort key or None, blocks) for every Shape under `container`; (dx, dy) is the group offset."""
         if d > limits.MAX_DEPTH:
             self.deep()
-            return out
+            return
         for el in kids(container, "Shape"):
             with self.ctx.guard("shape"):
                 self.shape(el, dx, dy, d, out)
-        return out
 
     def shape(self, el, dx, dy, d, out):
         cells = _cells(el)
@@ -160,15 +156,13 @@ class _Reader:
         if text.strip():
             blocks.append(Para(_inlines(text.strip("\n"))))
         blocks.extend(self.picture(el))
-        sub = _kid(el, "Shapes")
-        if sub is not None:
-            lx, ly = _num(cells.get("LocPinX")), _num(cells.get("LocPinY"))
-            ox = dx + x - lx if None not in (x, lx) else dx
-            oy = dy + y - ly if None not in (y, ly) else dy
-            for _, b in self.order(self.walk(sub, ox, oy, d + 1)):
-                blocks.extend(b)
         if blocks:
             out.append((key, blocks))
+        sub = _kid(el, "Shapes")
+        if sub is not None:  # a missing pin or loc-pin term counts as 0, the other term still applies
+            ox = dx + (x or 0.0) - (_num(cells.get("LocPinX")) or 0.0)
+            oy = dy + (y or 0.0) - (_num(cells.get("LocPinY")) or 0.0)
+            self.walk(sub, ox, oy, d + 1, out)
 
     def picture(self, el):
         fd = _kid(el, "ForeignData")
