@@ -16,7 +16,7 @@ from reader import markdown  # noqa: E402
 from reader.containers.zipx import Package, parse_xml  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader.formats import odf  # noqa: E402
+from reader.formats import odf, odf_base  # noqa: E402
 from reader_fix import make_zip  # noqa: E402
 
 NS = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
@@ -111,7 +111,7 @@ def test_styles_chain_cycle_and_defaults():
            '<style:style style:name="A" style:family="text" style:parent-style-name="B"/>'
            '<style:style style:name="B" style:family="text" style:parent-style-name="A"/>'
            '</office:styles></office:document-styles>')
-    s = odf.Styles(None, parse_xml(xml.encode()))
+    s = odf_base.Styles(None, parse_xml(xml.encode()))
     assert s.prop("A", "text", "font-weight") == "bold"  # cycle ends, family default answers
     assert s.prop("A", "text", "font-style") is None
     assert s.prop("missing", "text", "font-weight") == "bold"
@@ -288,11 +288,11 @@ def test_dispatch_by_mimetype_and_body():
 
 def test_para_inlines_public():
     root = parse_xml(f'<text:p {NS}>가<text:span text:style-name="S">나</text:span></text:p>'.encode())
-    sty = odf.Styles(parse_xml(
+    sty = odf_base.Styles(parse_xml(
         f'<office:document-content {NS}><office:automatic-styles><style:style style:name="S" style:family="text">'
         '<style:text-properties fo:font-weight="bold"/></style:style></office:automatic-styles>'
         '</office:document-content>'.encode()), None)
-    inl = odf.para_inlines(root, sty, None, Context())
+    inl = odf_base.para_inlines(root, sty, None, Context())
     assert [type(i).__name__ for i in inl] == ["Text", "Bold"]
 
 
@@ -486,15 +486,15 @@ def test_strings_are_capped():
 
 
 def test_one_bad_block_loses_only_itself():
-    orig = odf.Body.table
+    orig = odf_base.Body.table
 
     def boom(self, tbl, d):
         raise ValueError("boom")
-    odf.Body.table = boom
+    odf_base.Body.table = boom
     try:
         doc, ctx = parse(odt_doc(table_xml([cell("x")]) + P("뒤")))
     finally:
-        odf.Body.table = orig
+        odf_base.Body.table = orig
     assert ctx.skipped["block"] == 1 and markdown.render(doc, tmp() / "a") == "뒤\n"
 
 
