@@ -286,6 +286,15 @@ def test_cli_cache_hit_hidden_and_out():
         assert (od / "out.md").read_text() == "hello\n"
 
 
+def test_cli_key_from_the_gate():
+    with stub():
+        p = sample()
+        code, o = cli("convert", str(p), "--key", "ab" * 20)
+        assert code == 0 and Path(o.strip()).parent.name == "ab" * 20, o
+        code, o = cli("convert", str(p), "--key", "../x")
+        assert code == 0 and Path(o.strip()).parent.name == cache.key(p), o
+
+
 def test_prune_stale_tmp():
     with stub():
         p = sample()

@@ -245,6 +245,50 @@ def test_timeout_denies():
         assert "conversion took over 45 seconds" in out(d)["permissionDecisionReason"]
 
 
+@contextmanager
+def clock(*ticks):
+    """gate._now returns these seconds in turn, then the last one again."""
+    ticks, old = list(ticks), gate._now
+    gate._now = lambda: ticks.pop(0) if len(ticks) > 1 else ticks[0]
+    try:
+        yield
+    finally:
+        gate._now = old
+
+
+def test_slow_hash_denies_without_a_child():
+    from reader import limits
+    with stub(), clock(0.0, limits.HOOK_SECONDS - limits.HOOK_CHILD_MIN + 1):
+        # starting this command would raise FileNotFoundError
+        d = gate.decide(ev(sample()), command=["phro-no-such-program"])
+    o = out(d)
+    assert o["permissionDecision"] == "deny", o
+    assert "a.txtx: reading the file used up the hook's time limit" in o["permissionDecisionReason"], o
+
+
+def test_child_gets_what_is_left_of_the_budget():
+    import subprocess as sp
+    from reader import limits
+    seen, old = [], gate.subprocess.run
+
+    def fake(cmd, **kw):
+        seen.append(kw["timeout"])
+        raise sp.TimeoutExpired(cmd, kw["timeout"])
+
+    gate.subprocess.run = fake
+    try:
+        with stub(), clock(0.0, 30.0):
+            d = gate.decide(ev(sample()), command=["x"])
+        assert seen == [limits.HOOK_SECONDS - 30.0], seen
+        assert "used up the hook's time limit" in out(d)["permissionDecisionReason"]
+        with stub(), clock(0.0, 1.0):
+            d = gate.decide(ev(sample()), command=["x"])
+        assert seen[1] == limits.CONVERT_SECONDS, seen
+        assert f"conversion took over {limits.CONVERT_SECONDS} seconds" in out(d)["permissionDecisionReason"]
+    finally:
+        gate.subprocess.run = old
+
+
 def test_child_fail_kind():
     with stub():
         cmd = [sys.executable, "-c", "print('FAIL\\tencrypted\\t')"]

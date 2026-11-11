@@ -20,6 +20,8 @@ REASONS = {
     "too_large": f"the file is over {limits.MAX_INPUT // 2**20} MiB",
     "timeout": f"conversion took over {limits.CONVERT_SECONDS} seconds",
 }
+LATE = "hook"  # timeout detail: the hook's own budget ran out, not the conversion's
+LATE_TEXT = "reading the file used up the hook's time limit"
 TOO_LARGE = {  # by the start of a too_large detail
     limits.BIG_PART: "a part expands too much to read safely",
     limits.BIG_TOTAL: f"the file expands past the {limits.ZIP_TOTAL // 2**30} GiB safety limit",
@@ -97,6 +99,8 @@ def _deny(path, kind, detail=""):
         why = f"the file looks damaged ({detail})"
     elif kind == "too_large":
         why = TOO_LARGE.get(detail.split(":", 1)[0], REASONS["too_large"])
+    elif kind == "timeout" and detail == LATE:
+        why = LATE_TEXT
     else:
         why = REASONS.get(kind) or f"{kind} {detail}".strip()
     return deny_text(path, why)
@@ -151,7 +155,13 @@ def _context(name, meta, out_md):
     return head + index + tail
 
 
+def _now():
+    import time  # not at module level: the gate's imports stay light for every Read
+    return time.monotonic()
+
+
 def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
+    start = _now()
     path = scope(event)
     if path is None:
         return None
@@ -165,12 +175,17 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
     k = cache.key(path)
     entry = cache.lookup(k)
     if entry is None:
-        cmd = command or [sys.executable, "-I", "-X", "utf8", str(READ_PY), "convert", str(path)]
+        # hashing a big file on slow storage counts against the hook's 60 seconds too
+        left = limits.HOOK_SECONDS - (_now() - start)
+        if left < limits.HOOK_CHILD_MIN:
+            return _deny(path, "timeout", LATE)
+        budget = min(timeout, left)
+        cmd = command or [sys.executable, "-I", "-X", "utf8", str(READ_PY), "convert", str(path), "--key", k]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", timeout=timeout)
+                               errors="replace", timeout=budget)
         except subprocess.TimeoutExpired:
-            return _deny(path, "timeout")
+            return _deny(path, "timeout", LATE if budget < timeout else "")
         lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
         last = lines[-1] if lines else ""
         if last.startswith("FAIL\t"):

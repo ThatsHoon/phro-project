@@ -15,6 +15,10 @@ def _flat(x) -> str:
     return " ".join(str(x).split())
 
 
+def _is_key(k) -> bool:
+    return isinstance(k, str) and len(k) == 40 and all(ch in "0123456789abcdef" for ch in k)
+
+
 def cmd_convert(a) -> int:
     from reader import cache
     src = Path(a.file)
@@ -26,7 +30,7 @@ def cmd_convert(a) -> int:
                 out = Path(a.out)
                 reader.convert(src, out, a.hidden)
             else:
-                k = cache.key(src)
+                k = a.key if _is_key(a.key) else cache.key(src)  # the gate passes the key it already worked out
                 if a.hidden:
                     k += "-hidden"
                 out = cache.lookup(k) or cache.store(k, src, a.hidden)
@@ -78,6 +82,7 @@ def main(argv=None) -> int:
     c.add_argument("file")
     c.add_argument("--out")
     c.add_argument("--hidden", action="store_true")
+    c.add_argument("--key", help=argparse.SUPPRESS)
     c.set_defaults(fn=cmd_convert)
     sub.add_parser("formats").set_defaults(fn=cmd_formats)
     pr = sub.add_parser("prune")
