@@ -295,13 +295,72 @@ def test_section_order_and_damaged_section():
     items = '<opf:item id="section1" href="Contents/section1.xml" media-type="application/xml"/>'
     p = hwpx_doc(P("하나"), hpf_items=items, extra={"Contents/section1.xml": f'<hs:sec {NS}>{P("둘")}</hs:sec>'})
     assert md(p) == "하나\n\n둘\n"
-    p = hwpx_doc(P("하나"), hpf_items=items, extra={"Contents/section1.xml": "<broken"})
-    # a section that fails to parse is damaged input, not a crash
+    p = hwpx_doc(P("하나"), hpf_items=items, extra={"Contents/section1.xml": "<x"})
+    doc, ctx = parse(p)
+    assert markdown.render(doc, tmp() / "a") == "하나\n" and ctx.skipped["section"] == 1
+    p = hwpx_doc("<x", extra={"Contents/section0.xml": "<x"})
     try:
         parse(p)
         raise AssertionError("expected ReadError")
     except ReadError as e:
-        assert e.kind == "damaged"
+        assert e.kind == "damaged" and "no readable section" in e.detail
+
+
+def test_duplicate_sections_and_parts():
+    items = '<opf:item id="s" href="Contents/section0.xml" media-type="application/xml"/>' * 2000
+    doc, ctx = parse(hwpx_doc(P("한번"), hpf_items=items))
+    assert markdown.render(doc, tmp() / "a") == "한번\n"
+    pic = '<hp:p><hp:run><hp:pic><hc:img binaryItemIDRef="image1"/></hp:pic><hp:pic><hc:img binaryItemIDRef="image1"/></hp:pic></hp:run></hp:p>'
+    p = hwpx_doc(pic, hpf_items='<opf:item id="image1" href="BinData/image1.png"/>', extra={"BinData/image1.png": PNG})
+    doc, _ = parse(p)
+    assert doc.blocks[0].data is doc.blocks[1].data
+    doc, ctx = parse(hwpx_doc(pic))
+    assert ctx.skipped["image"] == 2
+
+
+def test_huge_and_negative_addresses():
+    import time
+    t0 = time.monotonic()
+    sec = _tbl(_tc("가", 0, 0) + _tc("나", 1, 0), _tc("먼", 0, 2000000000) + _tc("다", 1, 2000000000, rs=99999))
+    out = md(hwpx_doc(sec))
+    assert time.monotonic() - t0 < 5 and "먼" in out and "다" in out
+    sec = _tbl(_tc("음", 0, -3) + _tc("옆", 1, -3), _tc("양", 0, 0) + _tc("끝", 1, 0))
+    out = md(hwpx_doc(sec))
+    assert "음" in out and "양" in out
+
+
+def test_equation_deep_nesting():
+    for src in ("sqrt {" * 600, "a over {" * 600):
+        sec = f'<hp:p><hp:run><hp:t>글</hp:t><hp:equation><hp:script>{src}</hp:script></hp:equation></hp:run></hp:p>'
+        assert "글" in md(hwpx_doc(sec))
+
+
+def test_field_stack_capped():
+    sec = ('<hp:p><hp:run>' + "".join(_field(i, "HYPERLINK", "https://e.com;1") for i in range(3000))
+           + '<hp:t>남음</hp:t></hp:run></hp:p>')
+    assert "남음" in md(hwpx_doc(sec))
+    sec = '<hp:p><hp:run><hp:t>' + '<hp:deleteBegin Id="1"/>' * 3000 + '남음</hp:t></hp:run></hp:p>'
+    parse(hwpx_doc(sec))
+
+
+def test_marker_capped():
+    hdr = ('<hh:numbering id="1"><hh:paraHead level="1" start="1" numFormat="DIGIT">' + "가" * 200 + '^1</hh:paraHead></hh:numbering>'
+           '<hh:paraPr id="1"><hh:heading type="NUMBER" idRef="1" level="0"/></hh:paraPr>')
+    doc, _ = parse(hwpx_doc(P("x", pr="1"), hdr))
+    assert len(doc.blocks[0].marker) == 64
+
+
+def test_fallback_natural_order():
+    members = {"mimetype": "application/hwp+zip"}
+    for n in (10, 2, 1):
+        members[f"Contents/section{n}.xml"] = f'<hs:sec {NS}>{P(str(n))}</hs:sec>'
+    assert md(make_zip(tmp() / "e.hwpx", members)) == "1\n\n2\n\n10\n"
+
+
+def test_missing_chart_counted():
+    sec = '<hp:p><hp:run><hp:chart chartIDRef="Chart/none.xml"/></hp:run></hp:p>'
+    _, ctx = parse(hwpx_doc(sec))
+    assert ctx.skipped["chart"] == 1
 
 
 def test_section_fallback_without_manifest_entries():

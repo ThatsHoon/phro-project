@@ -37,12 +37,12 @@ def _int(s, default=0):
 
 
 # ---- equation script to TeX
-def _operand(toks, i):
+def _operand(toks, i, depth):
     """One operand starting at toks[i]: ((text, inner-or-None), next index)."""
     if i >= len(toks):
         return ("", None), i
-    if toks[i] == "{":
-        items, j = _group(toks, i + 1, 1)
+    if toks[i] == "{" and depth < _TEX_DEPTH:
+        items, j = _group(toks, i + 1, depth + 1)
         inner = _join(items)
         return ("{" + inner + "}", inner), j
     t = toks[i]
@@ -63,11 +63,11 @@ def _group(toks, i, depth):
             inner = _join(items)
             out.append(("{" + inner + "}", inner))
         elif t == "over" and out and i < len(toks):
-            (den, dinner), i = _operand(toks, i)
+            (den, dinner), i = _operand(toks, i, depth)
             s, inner = out.pop()
             out.append((f"\\frac{{{inner if inner is not None else s}}}{{{dinner if dinner is not None else den}}}", None))
         elif t == "sqrt" and i < len(toks):
-            (s, inner), i = _operand(toks, i)
+            (s, inner), i = _operand(toks, i, depth)
             out.append((f"\\sqrt{{{inner if inner is not None else s}}}", None))
         else:
             out.append((_WORDS.get(t, t), None))
@@ -233,6 +233,8 @@ class _Reader:
         self.images = {}
         self.counts = {"fn": 0, "en": 0, "cm": 0}
         self.numbers = {}
+        self.cache = {}
+        self.charts = {}
 
     # ---- package
     def find(self, href):
@@ -241,17 +243,20 @@ class _Reader:
                 return cand
         return None
 
-    def part_bytes(self, href):
+    def part_bytes(self, href, kind):
         name = self.find(href)
         if name is None:
+            self.ctx.skipped[kind] += 1
             return None
-        try:
-            return self.pkg.read(name)
-        except ReadError as e:
-            if e.kind != "damaged":
-                raise
-            self.ctx.skipped["part"] += 1
-            return None
+        if name not in self.cache:
+            try:
+                self.cache[name] = self.pkg.read(name)
+            except ReadError as e:
+                if e.kind != "damaged":
+                    raise
+                self.ctx.skipped[kind] += 1
+                self.cache[name] = None
+        return self.cache[name]
 
     def run(self):
         pkg = self.pkg
@@ -265,9 +270,17 @@ class _Reader:
             root = pkg.xml(HPF)
             items = [(attr(i, "id"), attr(i, "href", "")) for i in root.iter() if local(i.tag) == "item"]
         self.images = {i: h for i, h in items if i}
-        sections = [h for _, h in items if "section" in h.lower() and h.lower().endswith(".xml")]
-        if not sections:
-            sections = sorted(n for n in pkg.names if fnmatch.fnmatch(n.lower(), "contents/section*.xml"))
+        hrefs = [h for _, h in items if "section" in h.lower() and h.lower().endswith(".xml")]
+        names = []
+        for h in hrefs:
+            n = self.find(h)
+            if n is None:
+                self.ctx.skipped["section"] += 1
+            elif n not in names:
+                names.append(n)
+        if not hrefs:
+            names = sorted((n for n in pkg.names if fnmatch.fnmatch(n.lower(), "contents/section*.xml")),
+                           key=lambda n: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", n.lower())])
         if pkg.has("Contents/header.xml"):
             try:
                 self.hdr = _Header(pkg.xml("Contents/header.xml"))
@@ -275,12 +288,20 @@ class _Reader:
                 if e.kind != "damaged":
                     raise
                 self.ctx.skipped["header"] += 1
-        for href in sections:
+        good = 0
+        for name in names:
             with self.ctx.guard("section"):
-                name = self.find(href)
-                root = pkg.xml(name) if name else None
-                if root is not None:
-                    self.doc.blocks.extend(self.blocks(root, 0, False))
+                try:
+                    root = pkg.xml(name)
+                except ReadError as e:
+                    if e.kind != "damaged":
+                        raise
+                    self.ctx.skipped["section"] += 1
+                    continue
+                self.doc.blocks.extend(self.blocks(root, 0, False))
+                good += 1
+        if not good:
+            raise ReadError("damaged", "no readable section")
         return self.doc
 
     # ---- blocks
@@ -375,7 +396,7 @@ class _Reader:
             return _fmt(cnt.get(n - 1, h[2] if h else 1), h[1] if h else "DIGIT")
 
         fmt = head[0] if head and head[0] else f"^{lvl + 1}."
-        return re.sub(r"\^(\d)", sub, fmt).strip() or "-"
+        return re.sub(r"\^(\d)", sub, fmt).strip()[:64] or "-"
 
     # ---- inline scopes
     def add(self, st, inline):
@@ -397,15 +418,19 @@ class _Reader:
             elif f.kind == "pass":
                 parent.extend(f.inl)
 
+    def push(self, st, frame):
+        if len(st.frames) < limits.MAX_DEPTH:
+            st.frames.append(frame)
+
     def field_begin(self, el, st):
         kind = (attr(el, "type") or "").upper()
         fid = attr(el, "id")
         if kind == "HYPERLINK":
             params = {attr(p, "name"): (p.text or "") for p in el.iter() if local(p.tag) == "stringParam"}
             url = _cut_command(params["Command"]) if params.get("Command") else (params.get("Path") or "").strip()
-            st.frames.append(_Frame("link" if url else "pass", fid, url))
+            self.push(st, _Frame("link" if url else "pass", fid, url))
         elif kind == "CLICK_HERE":
-            st.frames.append(_Frame("drop", fid))
+            self.push(st, _Frame("drop", fid))
 
     def field_end(self, el, st):
         ref = attr(el, "beginIDRef")
@@ -448,7 +473,7 @@ class _Reader:
         elif n == "fieldEnd":
             self.field_end(el, st)
         elif n == "deleteBegin":
-            st.frames.append(_Frame("deleted"))
+            self.push(st, _Frame("deleted"))
         elif n == "deleteEnd":
             self.delete_end(st)
         elif n == "switch":
@@ -496,7 +521,7 @@ class _Reader:
 
     def picture(self, pic, st):
         img = first(pic, "img")
-        data = self.part_bytes(self.images.get(attr(img, "binaryItemIDRef"))) if img is not None else None
+        data = self.part_bytes(self.images.get(attr(img, "binaryItemIDRef")), "image") if img is not None else None
         if not data:
             return
         sc = first(pic, "shapeComment")
@@ -504,42 +529,52 @@ class _Reader:
         st.extras.append(Image(data, "" if _AUTO_ALT.match(alt) else alt))
 
     def chart(self, el, st):
-        data = self.part_bytes(attr(el, "chartIDRef"))
-        if not data:
-            return
-        try:
-            tbl = chart_table(parse_xml(data))
-        except ReadError as e:
-            if e.kind != "damaged":
-                raise
-            self.ctx.skipped["chart"] += 1
-            return
-        if tbl is not None:
-            st.extras.append(tbl)
+        href = attr(el, "chartIDRef")
+        name = self.find(href)
+        if name not in self.charts:
+            data = self.part_bytes(href, "chart")
+            tbl = None
+            if data:
+                try:
+                    tbl = chart_table(parse_xml(data))
+                except ReadError as e:
+                    if e.kind != "damaged":
+                        raise
+                    self.ctx.skipped["chart"] += 1
+            self.charts[name] = tbl
+        if self.charts[name] is not None:
+            st.extras.append(self.charts[name])
 
     # ---- tables
     def table(self, tbl, d):
-        grid = {}  # row -> [(col, Cell)]
+        raw = []  # (row, col, rowspan, colspan, Cell)
         plain = True
-        ncols = 0
+        seen = {}
         for r, tr in enumerate(kids(tbl, "tr")):
             for tc in kids(tr, "tc"):
                 addr = kids(tc, "cellAddr")
                 span = kids(tc, "cellSpan")
                 row = _int(attr(addr[0], "rowAddr"), r) if addr else r
-                col = _int(attr(addr[0], "colAddr"), len(grid.get(row, []))) if addr else len(grid.get(row, []))
+                col = _int(attr(addr[0], "colAddr"), seen.get(row, 0)) if addr else seen.get(row, 0)
+                seen[row] = seen.get(row, 0) + 1
                 cs = max(1, _int(attr(span[0], "colSpan"), 1)) if span else 1
                 rs = max(1, _int(attr(span[0], "rowSpan"), 1)) if span else 1
                 blocks = []
                 for sl in kids(tc, "subList"):
                     blocks.extend(self.blocks(sl, d + 1, True))
-                grid.setdefault(row, []).append((col, Cell(blocks, rs, cs, attr(tc, "header") == "1")))
-                ncols = max(ncols, col + cs)
+                raw.append((row, col, rs, cs, Cell(blocks, header=attr(tc, "header") == "1")))
                 plain = plain and self.hdr.plain.get(attr(tc, "borderFillIDRef"), False)
-        if not grid:
+        if not raw:
             return []
-        nrows = max(grid) + 1
-        rows = [[c for _, c in sorted(grid.get(r, []), key=lambda x: x[0])] for r in range(nrows)]
+        ri = {v: i for i, v in enumerate(sorted({x[0] for x in raw}))}
+        ci = {v: i for i, v in enumerate(sorted({x[1] for x in raw}))}
+        nrows, ncols = len(ri), len(ci)
+        grid = [[] for _ in range(nrows)]
+        for row, col, rs, cs, cell in raw:
+            r, c = ri[row], ci[col]
+            cell.rowspan, cell.colspan = min(rs, nrows - r), min(cs, ncols - c)
+            grid[r].append((c, cell))
+        rows = [[cell for _, cell in sorted(g, key=lambda x: x[0])] for g in grid]
         if plain and (nrows == 1 or ncols == 1):
             return [b for row in rows for c in row for b in c.blocks]
         return [Table(rows)]
