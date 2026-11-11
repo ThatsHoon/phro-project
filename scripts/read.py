@@ -1,5 +1,6 @@
 """CLI for the document reader: convert | formats | prune."""
 import argparse
+import contextlib
 import sys
 from pathlib import Path
 
@@ -10,24 +11,31 @@ from reader import cache  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 
 
+def _flat(x) -> str:
+    return " ".join(str(x).split())
+
+
 def cmd_convert(a) -> int:
     src = Path(a.file)
     try:
-        if a.out:
-            out = Path(a.out)
-            reader.convert(src, out, a.hidden)
-        else:
-            k = cache.key(src)
-            if a.hidden:
-                k += "-hidden"
-            out = cache.lookup(k) or cache.store(k, src, a.hidden)
+        # a stray print in a format module must not reach the protocol stream
+        with contextlib.redirect_stdout(sys.stderr):
+            reader.precheck(src)
+            if a.out:
+                out = Path(a.out)
+                reader.convert(src, out, a.hidden)
+            else:
+                k = cache.key(src)
+                if a.hidden:
+                    k += "-hidden"
+                out = cache.lookup(k) or cache.store(k, src, a.hidden)
+        print(out / "out.md")
     except ReadError as e:
-        print(f"FAIL\t{e.kind}\t{e.detail}")
+        print(f"FAIL	{e.kind}	{_flat(e.detail)}")
         return 1
     except Exception as e:  # noqa: BLE001
-        print(f"FAIL\tdamaged\t{type(e).__name__}: {e}")
+        print(f"FAIL	damaged	{type(e).__name__}: {_flat(e)}")
         return 1
-    print(out / "out.md")
     return 0
 
 
@@ -44,6 +52,8 @@ def cmd_prune(a) -> int:
 
 
 def main(argv=None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(prog="read.py")
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("convert")

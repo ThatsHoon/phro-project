@@ -51,10 +51,14 @@ def lookup(k: str):
     return None
 
 
+def _complete(d: Path) -> bool:
+    return (d / "out.md").is_file() and (d / "meta.json").is_file()
+
+
 def store(k: str, src, hidden: bool = False) -> Path:
     bucket = root() / k[:2]
     target = bucket / k
-    if (target / "out.md").is_file() and (target / "meta.json").is_file():
+    if _complete(target):
         return target
     with _lock:
         n = next(_counter)
@@ -64,16 +68,20 @@ def store(k: str, src, hidden: bool = False) -> Path:
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
-    try:
-        os.replace(tmp, target)
-    except OSError:
-        # on Windows replacing onto an existing directory fails: another writer won
-        if target.exists():
-            shutil.rmtree(tmp, ignore_errors=True)
+    for attempt in (0, 1):
+        try:
+            os.replace(tmp, target)
             return target
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise
-    return target
+        except OSError:
+            # on Windows replacing onto an existing directory fails
+            if _complete(target):  # another writer won
+                shutil.rmtree(tmp, ignore_errors=True)
+                return target
+            if attempt == 0 and target.exists():  # incomplete leftover: clear and retry once
+                shutil.rmtree(target, ignore_errors=True)
+                continue
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
 
 
 def prune(days: int = 30) -> int:
@@ -85,6 +93,13 @@ def prune(days: int = 30) -> int:
             continue
         for d in bucket.iterdir():
             if d.name.startswith(".tmp-"):
+                try:
+                    stale = d.stat().st_mtime < time.time() - 86400
+                except OSError:
+                    continue
+                if stale:
+                    shutil.rmtree(d, ignore_errors=True)
+                    n += 1
                 continue
             try:
                 old = (d / "meta.json").stat().st_mtime < cutoff

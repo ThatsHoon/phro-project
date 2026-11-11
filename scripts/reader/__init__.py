@@ -29,17 +29,24 @@ def ext_of(path) -> str:
     return Path(path).suffix.lower().lstrip(".")
 
 
-def parse(path, ctx):
-    """Dispatch to the format module for path's extension."""
-    import importlib
+def precheck(path) -> None:
+    """Cheap gate shared by parse and the CLI: extension and size."""
     from .limits import MAX_INPUT, ReadError
     path = Path(path)
     ext = ext_of(path)
     if ext not in BUILT:
         raise ReadError("unsupported", ext or "no extension")
-    if path.stat().st_size > MAX_INPUT:
-        raise ReadError("too_large", f"{path.stat().st_size} bytes")
-    mod = importlib.import_module("reader.formats." + FORMATS[ext])
+    size = path.stat().st_size
+    if size > MAX_INPUT:
+        raise ReadError("too_large", f"{size} bytes")
+
+
+def parse(path, ctx):
+    """Dispatch to the format module for path's extension."""
+    import importlib
+    path = Path(path)
+    precheck(path)
+    mod = importlib.import_module("reader.formats." + FORMATS[ext_of(path)])
     return mod.parse(path, ctx)
 
 
