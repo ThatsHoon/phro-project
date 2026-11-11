@@ -290,6 +290,14 @@ def test_hooks_json_entry():
     assert {"SessionStart", "SubagentStart", "UserPromptSubmit"} <= set(h)
 
 
+def test_readme_formats_match():
+    text = (HERE / "README.md").read_text(encoding="utf-8")
+    sec = text.split("## Document reader", 1)[1].split("\n## ", 1)[0]
+    for ext in sorted(reader.BUILT):
+        assert "`" + ext + "`" in sec, ext
+    assert "read.py prune" in sec
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
