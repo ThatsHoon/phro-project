@@ -163,6 +163,8 @@ class _Render:
                 if self.size > limits.MAX_OUTPUT:
                     break
                 if self._skip(b):
+                    if isinstance(b, Section) and b.kind == "sheet":  # a hidden sheet is named, not read
+                        out.append(("h", f"## Sheet: {b.title} (hidden, left out)"))
                     continue
                 before = self.size
                 got = self._block(b)

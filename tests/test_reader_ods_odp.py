@@ -141,9 +141,10 @@ def test_interior_gap_and_trailing_dropped():
 def test_hidden_sheet_by_style():
     styles = '<style:style style:name="ta2" style:family="table"><style:table-properties table:display="false"/></style:style>'
     out = md(ods(sheet("Shown", [row(c("a"), c("b"))]) + sheet("Hidden", [row(c("q"), c("w"))], "ta2"), styles))
-    assert "(1 hidden places left out)" in out and "## Sheet: Hidden" not in out and "## Sheet: Shown" in out, out
+    assert "(1 hidden places left out)" in out and "## Sheet: Shown" in out, out
+    assert "## Sheet: Hidden (hidden, left out)" in out and "q" not in out.split("Hidden (hidden, left out)")[1], out
     shown = md(ods(sheet("Hidden", [row(c("q"), c("w"))], "ta2") + sheet("Shown", [row(c("a"))]), styles), True)
-    assert "## Sheet: Hidden (hidden)" in shown
+    assert "## Sheet: Hidden (hidden)" in shown and "left out)" not in shown.replace("hidden places left out)", "")
 
 
 def test_hidden_row():
