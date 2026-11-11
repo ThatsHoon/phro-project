@@ -154,30 +154,20 @@ def test_bad_origin_and_size():
     assert text(xps_doc([body])) == "A B C D"
 
 
-def cols(left=3, right=3, per=1, header=None):
-    out = ""
-    for i in range(max(left, right)):
-        for k in range(per):
-            if i < left:
-                out += g(f"L{i}{k}" if per > 1 else f"L{i}", 50 + 40 * k, 100 + 30 * i)
-            if i < right:
-                out += g(f"R{i}{k}" if per > 1 else f"R{i}", 400 + 40 * k, 100 + 30 * i)
-    return (header or "") + out
-
-
 def cols(left=3, right=3, per=1, header=""):
+    """Two columns of lines 14 apart at size 12 (1.2 leading), so lines of one column join."""
     out = ""
     for i in range(max(left, right)):
         for k in range(per):
             if i < left:
-                out += g(f"L{i}{k}" if per > 1 else f"L{i}", 50 + 40 * k, 100 + 30 * i)
+                out += g(f"L{i}{k}" if per > 1 else f"L{i}", 50 + 40 * k, 100 + 14 * i)
             if i < right:
-                out += g(f"R{i}{k}" if per > 1 else f"R{i}", 400 + 40 * k, 100 + 30 * i)
+                out += g(f"R{i}{k}" if per > 1 else f"R{i}", 400 + 40 * k, 100 + 14 * i)
     return header + out
 
 
 def test_two_columns():
-    assert text(xps_doc([cols()])) == "L0\n\nL1\n\nL2\n\nR0\n\nR1\n\nR2"
+    assert text(xps_doc([cols()])) == "L0 L1 L2\n\nR0 R1 R2"
     crossing = cols() + g("X" * 40, 100, 400)  # a run reaching the middle keeps the page one flow
     out = text(xps_doc([crossing]))
     assert out.index("R0") < out.index("L1")
@@ -185,13 +175,13 @@ def test_two_columns():
 
 def test_columns_need_three_lines_not_runs():
     # two lines of three runs per side: no column mode, so the lines read straight across
-    assert text(xps_doc([cols(2, 2, 3)])) == "L00 L01 L02 R00 R01 R02\n\nL10 L11 L12 R10 R11 R12"
+    assert text(xps_doc([cols(2, 2, 3)])) == "L00 L01 L02 R00 R01 R02 L10 L11 L12 R10 R11 R12"
 
 
 def test_wide_latin_header_disables_columns():
     header = g("H" * 70, 50, 20)  # about 420 wide at size 12, reaches the middle
     out = text(xps_doc([cols(header=header)]))
-    assert out == "H" * 70 + "\n\nL0 R0\n\nL1 R1\n\nL2 R2"
+    assert out == "H" * 70 + "\n\nL0 R0 L1 R1 L2 R2"
 
 
 def test_cjk_width_estimate():
