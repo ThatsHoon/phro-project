@@ -268,6 +268,22 @@ def test_output_cap_applies_while_building():
         limits.MAX_OUTPUT = old
 
 
+def test_table_stops_at_output_cap_while_rendering():
+    import time
+    from reader.model import Cell, Table
+    old = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 100_000
+    try:
+        shared = Cell([P("x" * 1000)])
+        for ncols in (1, 2):
+            t0 = time.monotonic()
+            out = R(Doc(blocks=[Table([[shared] * ncols] * 1_000_000)]))
+            assert time.monotonic() - t0 < 3
+            assert out.endswith("(output truncated at 20 MB)" + chr(10)) and len(out) < 150_000
+    finally:
+        limits.MAX_OUTPUT = old
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

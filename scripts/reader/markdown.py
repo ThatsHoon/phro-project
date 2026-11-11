@@ -43,6 +43,29 @@ def _plain(s):
     return re.sub(r"\s+", " ", s).strip().casefold()
 
 
+def _inl_len(inl) -> int:
+    n = 0
+    for it in inl:
+        if hasattr(it, "text"):
+            n += len(it.text)
+        elif hasattr(it, "inlines"):
+            n += _inl_len(it.inlines)
+    return n
+
+
+def blocks_len(blocks, d=0) -> int:
+    """Rough characters a block list renders to; only used to stop building a table past the cap."""
+    n = 0
+    for b in blocks:
+        if hasattr(b, "inlines"):
+            n += _inl_len(b.inlines)
+        elif d < 8 and hasattr(b, "blocks"):
+            n += blocks_len(b.blocks, d + 1)
+        elif d < 8 and hasattr(b, "rows"):
+            n += sum(blocks_len(c.blocks, d + 1) for row in b.rows for c in row)
+    return n
+
+
 class _Render:
     def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool):
         self.doc, self.assets_dir, self.show = doc, assets_dir, show_hidden
@@ -311,10 +334,18 @@ class _Render:
         """Origin cells by (row, col) on the reconstructed grid, trimmed: (origins, nrows, ncols)."""
         covered = set()
         origins = {}
+        texty = {}  # id(blocks) -> has text; a cell shared by many slots is scanned once
         width = max((len(row) for row in t.rows), default=0)
+        sizes, est = {}, 0  # est: text the origins so far will render; past the cap more rows are pointless
         for r, row in enumerate(t.rows):
+            if self.size + est > limits.MAX_OUTPUT:
+                break
             c = 0
             for cell in row:
+                k = id(cell.blocks)
+                if k not in sizes:
+                    sizes[k] = blocks_len(cell.blocks)
+                est += sizes[k]
                 while (r, c) in covered:
                     c += 1
                 rs = min(max(1, cell.rowspan), len(t.rows) - r)
@@ -326,7 +357,10 @@ class _Render:
                 c += cs
         nrows = ncols = 0
         for (r, c), (cell, rs, cs) in origins.items():
-            if self._has_text(cell.blocks):
+            k = id(cell.blocks)
+            if k not in texty:
+                texty[k] = self._has_text(cell.blocks)
+            if texty[k]:
                 nrows = max(nrows, r + rs)
                 ncols = max(ncols, c + cs)
         kept = {k: v for k, v in origins.items() if k[0] < nrows and k[1] < ncols}
@@ -380,20 +414,26 @@ class _Render:
                 out[0] = (out[0][0], "(hidden) " + out[0][1])
             return ([("p", c) for c in cap]) + out
         if ncols == 1:
-            lines = []
+            lines, used = [], 0
             for r in range(nrows):
+                if self.size + used > limits.MAX_OUTPUT:
+                    break
                 if (r, 0) not in origins:
                     continue
                 s = self._cell_text(origins[(r, 0)][0], LINES)
                 h = hid(r)
                 if s and h is not None:
                     lines.append(("(hidden) " if h else "") + s)
+                    used += len(lines[-1]) + 1
             return finish("\n".join(lines))
         spans = any(rs > 1 or cs > 1 for _, rs, cs in origins.values())
         m = HTML if spans else PIPE
         lines = []
         shown = 0
+        used = 0  # a table stops growing once the document would pass the output cap
         for r in range(nrows):
+            if self.size + used > limits.MAX_OUTPUT:
+                break
             h = hid(r)
             if h is None:
                 continue
@@ -408,6 +448,7 @@ class _Render:
                 cells.append((s, (cell, rs, cs)))
             if h and cells:
                 cells[0] = ("(hidden) " + cells[0][0], cells[0][1])
+            before = len(lines)
             if spans:
                 tds = ""
                 for s, info in cells:
@@ -421,6 +462,7 @@ class _Render:
                 if shown == 0:
                     lines.append("|" + "|".join("---" for _ in range(ncols)) + "|")
             shown += 1
+            used += sum(len(x) + 1 for x in lines[before:])
         if spans:
             lines = ["<table>", *lines, "</table>"] if lines else []
         return finish("\n".join(lines))
