@@ -33,10 +33,37 @@ def scope(event):
     if reader.ext_of(fp) not in reader.FORMATS:
         return None
     p = Path(fp)
+    cwd = event.get("cwd")
+    if not p.is_absolute() and isinstance(cwd, str) and cwd:
+        p = Path(cwd) / p
     try:
         return p if p.is_file() else None
     except OSError:
         return None
+
+
+def _name(path):
+    return " ".join(Path(path).name.split())
+
+
+def looks_like_text(path):
+    """True for a plain-text file (no NUL in the first 4 KiB, valid UTF-8, not RTF)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return False
+    if b"\x00" in head:
+        return False
+    for cut in range(4):
+        try:
+            text = head[:len(head) - cut].decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        return False
+    return not text.lstrip("﻿").startswith("{\\rtf")
 
 
 def deny_text(path, why):
@@ -44,7 +71,7 @@ def deny_text(path, why):
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": f"{path.name}: {why}. Retry by hand: {cmd}",
+        "permissionDecisionReason": f"{_name(path)}: {why}. Retry by hand: {cmd}",
     }}
 
 
@@ -98,6 +125,8 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
     path = scope(event)
     if path is None:
         return None
+    if looks_like_text(path):
+        return None
     if reader.ext_of(path) not in reader.BUILT:
         return _deny(path, "unsupported")
     if path.stat().st_size > limits.MAX_INPUT:
@@ -122,6 +151,8 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
             return _deny(path, "damaged", "conversion gave no output")
         entry = out.parent
     out_md = entry / "out.md"
+    if not out_md.is_file():
+        return _deny(path, "damaged", "cache entry vanished")
     try:
         meta = json.loads((entry / "meta.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -131,7 +162,7 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "permissionDecisionReason": f"phro-project converted {path.name} to Markdown",
+        "permissionDecisionReason": f"phro-project converted {_name(path)} to Markdown",
         "updatedInput": updated,
-        "additionalContext": _context(path.name, meta, out_md),
+        "additionalContext": _context(_name(path), meta, out_md),
     }}

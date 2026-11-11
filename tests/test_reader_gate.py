@@ -29,7 +29,7 @@ import reader
 from reader.model import Doc, Heading, Para, Text
 from pathlib import Path
 mod = types.ModuleType({stub!r})
-mod.parse = lambda path, ctx: Doc(blocks=[Heading(1, [Text(t[2:])]) if t.startswith("# ") else Para([Text(t)]) for t in Path(path).read_text(encoding="utf-8").split("|")])
+mod.parse = lambda path, ctx: Doc(blocks=[Heading(1, [Text(t[2:])]) if t.startswith("# ") else Para([Text(t)]) for t in Path(path).read_text(encoding="utf-8").lstrip(chr(0)).split("|")])
 reader.FORMATS["txtx"] = "_teststub"
 reader.BUILT.add("txtx")
 sys.modules[{stub!r}] = mod
@@ -50,7 +50,7 @@ def stub():
     mod = types.ModuleType(STUB)
     mod.parse = lambda path, ctx: Doc(blocks=[
         Heading(1, [Text(t[2:])]) if t.startswith("# ") else Para([Text(t)])
-        for t in Path(path).read_text(encoding="utf-8").split("|")])
+        for t in Path(path).read_text(encoding="utf-8").lstrip(chr(0)).split("|")])
     try:
         reader.FORMATS["txtx"] = "_teststub"
         reader.BUILT.add("txtx")
@@ -80,7 +80,7 @@ def ev(path, tool="Read", **extra):
 
 def sample(text="hello", name="a.txtx"):
     p = tmp() / name
-    p.write_text(text, encoding="utf-8")
+    p.write_bytes(bytes(1) + text.encode("utf-8"))
     return p
 
 
@@ -105,9 +105,61 @@ def test_pass_through():
     assert gate.decide({"tool_name": "Read", "tool_input": {}}) is None
 
 
+def put(name, data):
+    p = tmp() / name
+    p.write_bytes(data)
+    return p
+
+
+def test_plain_text_passes_through():
+    pem = b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
+    for name, data in (("a.pub", b"ssh-ed25519 AAAA user@host\n"), ("tls.key", pem),
+                       ("a.doc", "안녕하세요 메모".encode("utf-8")), ("e.doc", b""),
+                       ("cut.doc", ("가" * 2000).encode("utf-8")[:4097])):
+        assert gate.decide(ev(put(name, data))) is None, name
+
+
+def test_binary_and_rtf_still_denied():
+    for name, data in (("a.rtf", b"{\\rtf1\\ansi hi}"), ("b.rtf", b"\xef\xbb\xbf{\\rtf1 hi}"),
+                       ("a.hwp", bytes.fromhex("D0CF11E0A1B11AE1") + bytes(100))):
+        o = out(gate.decide(ev(put(name, data))))
+        assert "not supported yet" in o["permissionDecisionReason"], name
+
+
+def test_relative_path_uses_cwd():
+    with stub() as base:
+        p = sample()
+        e = {"tool_name": "Read", "tool_input": {"file_path": p.name}, "cwd": str(p.parent)}
+        o = out(gate.decide(e, command=base + [str(p)]))
+        assert o["permissionDecision"] == "allow"
+        assert gate.decide({"tool_name": "Read", "tool_input": {"file_path": p.name}}) is None
+
+
+def test_vanished_entry_denied():
+    from reader import cache
+    with stub() as base:
+        p = sample()
+        run(p, base)
+        d = cache.lookup(cache.key(p))
+        (d / "out.md").unlink()
+        old = cache.lookup
+        cache.lookup = lambda k: d
+        try:
+            o = out(gate.decide(ev(p), command=base + [str(p)]))
+        finally:
+            cache.lookup = old
+        assert "cache entry vanished" in o["permissionDecisionReason"]
+
+
+def test_name_is_flattened():
+    assert gate._name(Path("x/a\tb\nc.hwp")) == "a b c.hwp"
+    o = gate.deny_text(Path("x/a\tb.hwp"), "why")
+    assert o["hookSpecificOutput"]["permissionDecisionReason"].startswith("a b.hwp: why.")
+
+
 def test_unsupported_phase():
     p = tmp() / "x.hwp"
-    p.write_bytes(b"x")
+    p.write_bytes(b"\xd0\xcf\x11\xe0\x00")
     o = out(gate.decide(ev(p)))
     assert o["permissionDecision"] == "deny"
     assert o["permissionDecisionReason"].startswith("x.hwp: this format is not supported yet. Retry by hand:")
@@ -169,7 +221,7 @@ def test_gate_unicode_path():
         d = tmp() / "한글 폴더 1"
         d.mkdir()
         f = d / "보고서.txtx"
-        f.write_text("안녕", encoding="utf-8")
+        f.write_bytes(bytes(1) + "안녕".encode("utf-8"))
         o = out(run(f, base))
         assert o["permissionDecision"] == "allow"
         got = Path(o["updatedInput"]["file_path"])
@@ -208,7 +260,7 @@ def test_hook_cli_deny_unicode():
     d = tmp() / "한글"
     d.mkdir()
     f = d / "보고서.hwp"
-    f.write_bytes(b"x")
+    f.write_bytes(bytes.fromhex("D0CF11E0"))
     r = hook(ev(f))
     assert r.returncode == 0
     o = json.loads(r.stdout.decode("utf-8"))["hookSpecificOutput"]
