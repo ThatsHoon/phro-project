@@ -7,7 +7,7 @@ from ..containers.zipx import Package, attr, first, kids, local, parse_xml, reso
 from ..limits import ReadError
 from ..model import (
     Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem,
-    NoteRef, Para, Table, Text,
+    NoteRef, Para, Section, Table, Text,
 )
 
 _MIME = "application/vnd.oasis.opendocument."
@@ -21,7 +21,7 @@ _CONTAINERS = frozenset({"table-of-content", "user-index", "alphabetical-index",
 _REPEAT = 100      # a repeated non-empty row or cell is expanded at most this often
 _GAP = 64          # a repeated empty row or cell between content is expanded at most this often
 _SPAN = 1000       # largest span taken from a file
-_CELLS = 100_000   # cells expanded for one table
+_BUDGET = 50_000  # cells one document may expand to, nested tables and reused objects included
 _SPACES = 200
 _SYLLABLE = "가나다라마바사아자차카타파하"
 _ROMAN = ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
@@ -164,6 +164,31 @@ class Body:
         self.cache, self.objects, self.bold_of = {}, {}, {}
         self.counts = collections.Counter()
         self.last, self.ids = None, {}  # list counters: the previous list's, and by xml:id
+        self.left = _BUDGET  # expansion budget still available
+        self.wt = {}  # id(Table) -> (Table, cells it expands to)
+
+    def take(self, n, force=False) -> bool:
+        """Charge n cells to the document budget; False (and counted) once it is spent.
+        A forced charge (the first copy of something the file spells out) always succeeds."""
+        if force:
+            self.left = max(0, self.left - n)
+            return True
+        if n > self.left:
+            self.left = 0
+            self.ctx.skipped["cells"] += 1
+            return False
+        self.left -= n
+        return True
+
+    def weight(self, blocks) -> int:
+        """Cells the blocks expand to when rendered: 1 plus every nested table's weight."""
+        w = 1
+        for b in blocks:
+            if isinstance(b, Table):
+                w += self.wt.get(id(b), (b, 1))[1]
+            elif isinstance(b, Section):
+                w += self.weight(b.blocks)
+        return w
 
     # ---- package
     def deep(self):
@@ -321,16 +346,17 @@ class Body:
         if name is None or not self.pkg.has(name):
             self.ctx.skipped["object"] += 1
             return []
-        if name not in self.objects:
-            self.objects[name] = []  # also breaks an object that refers to itself
-            data = self.data(name, "object")
-            if data:
-                try:
-                    self.objects[name] = self.object_blocks(parse_xml(data), d)
-                except ReadError as e:
-                    if e.kind != "damaged":
-                        raise
-                    self.ctx.skipped["object"] += 1
+        if name in self.objects:  # a reused object costs what it expands to
+            return self.objects[name] if self.take(self.weight(self.objects[name])) else []
+        self.objects[name] = []  # also breaks an object that refers to itself
+        data = self.data(name, "object")
+        if data:
+            try:
+                self.objects[name] = self.object_blocks(parse_xml(data), d)
+            except ReadError as e:
+                if e.kind != "damaged":
+                    raise
+                self.ctx.skipped["object"] += 1
         return self.objects[name]
 
     def object_blocks(self, root, d):
@@ -477,8 +503,8 @@ class Body:
         if d > limits.MAX_DEPTH:
             self.deep()
             return None
-        rows, budget = [], [_CELLS]
-        self.rows_of(tbl, d, False, rows, budget)
+        rows = []
+        self.rows_of(tbl, d, False, rows)
         while rows and all(_empty(c.blocks) for c in rows[-1]):
             rows.pop()
         if not rows:
@@ -486,24 +512,28 @@ class Body:
         for r, row in enumerate(rows):
             for cell in row:
                 cell.rowspan = min(cell.rowspan, len(rows) - r)
-        return Table(rows)
+        t = Table(rows)
+        self.wt[id(t)] = (t, sum(self.weight(c.blocks) for row in rows for c in row) or 1)
+        return t
 
-    def rows_of(self, cont, d, header, rows, budget):
+    def rows_of(self, cont, d, header, rows):
         if d > limits.MAX_DEPTH:
             self.deep()
             return
         for c in cont:
-            if budget[0] <= 0:
+            if self.left <= 0:
                 return
             n = local(c.tag)
             if n == "table-row":
-                cells = self.row(c, d, header, budget)
+                cells = self.row(c, d, header)
                 rep = self.repeat(attr(c, "number-rows-repeated"), all(_empty(x.blocks) for x in cells))
-                for _ in range(rep):
+                rw = sum(self.weight(x.blocks) for x in cells) or 1
+                for i in range(rep):
+                    if not self.take(rw if i else (0 if cells else 1), force=i == 0):
+                        return
                     rows.append([Cell(x.blocks, x.rowspan, x.colspan, x.header) for x in cells])
-                    budget[0] -= len(cells) or 1
             elif n in ("table-header-rows", "table-rows", "table-row-group"):
-                self.rows_of(c, d + 1, header or n == "table-header-rows", rows, budget)
+                self.rows_of(c, d + 1, header or n == "table-header-rows", rows)
 
     def repeat(self, raw, empty):
         rep, cap = max(1, _int(raw, 1)), _GAP if empty else _REPEAT
@@ -512,7 +542,7 @@ class Body:
             return cap
         return rep
 
-    def row(self, tr, d, header, budget):
+    def row(self, tr, d, header):
         cells = []
         for c in tr:
             if local(c.tag) != "table-cell":
@@ -520,11 +550,10 @@ class Body:
             blocks = self.blocks(c, d + 1)
             cs = min(max(_int(attr(c, "number-columns-spanned"), 1), 1), _SPAN)
             rs = min(max(_int(attr(c, "number-rows-spanned"), 1), 1), _SPAN)
-            for _ in range(self.repeat(attr(c, "number-columns-repeated"), _empty(blocks))):
-                if budget[0] <= 0:
-                    self.ctx.skipped["cells"] += 1
+            w = self.weight(blocks)
+            for i in range(self.repeat(attr(c, "number-columns-repeated"), _empty(blocks))):
+                if not self.take(w if i else 1, force=i == 0):  # a first copy's nested cells were charged as built
                     return cells
-                budget[0] -= 1
                 cells.append(Cell(blocks, rs, cs, header))
         while cells and _empty(cells[-1].blocks):
             cells.pop()

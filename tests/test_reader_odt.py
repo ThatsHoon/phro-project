@@ -355,6 +355,34 @@ def test_hostile_repeats_and_spans():
     assert "a" in out and "x" in out and len(out) < 200_000
 
 
+def test_nested_repeat_bomb_is_budgeted():
+    xml = "<text:p>leaf</text:p>"
+    for _ in range(3):  # each level repeats its cell and its row 100 times around the level below
+        xml = ('<table:table><table:table-row table:number-rows-repeated="100">'
+               f'<table:table-cell table:number-columns-repeated="100"><text:p>첫</text:p>{xml}'
+               '</table:table-cell></table:table-row></table:table>')
+    t0 = time.monotonic()
+    doc, ctx = parse(odt_doc(xml))
+    out = markdown.render(doc, tmp() / "a")
+    took = time.monotonic() - t0
+    assert took < 2 and ctx.skipped["cells"] > 0 and "첫" in out and "leaf" in out, (took, dict(ctx.skipped), len(out))
+
+
+def test_object_chain_bomb_is_budgeted():
+    n = 30
+    members = {}
+    for k in range(1, n + 1):
+        ref = frame(f'<draw:object xlink:href="./Object {k + 1}"/>') * 2 if k < n else P("끝")
+        members[f"Object {k}/content.xml"] = (
+            f'<office:document-content {NS}><office:body><office:chart><chart:chart chart:class="chart:bar">'
+            + table_xml([f"<table:table-cell>{P('첫' + str(k))}{ref}</table:table-cell>"])
+            + '</chart:chart></office:chart></office:body></office:document-content>')
+    t0 = time.monotonic()
+    doc, ctx = parse(odt_doc(frame('<draw:object xlink:href="./Object 1"/>'), extra=members))
+    out = markdown.render(doc, tmp() / "a")
+    assert time.monotonic() - t0 < 2 and ctx.skipped["cells"] > 0 and "첫1" in out
+
+
 def test_empty_trailing_repeats_vanish():
     huge = "1000000000"
     body = ('<table:table><table:table-row>' + cell("a") + cell("", f'table:number-columns-repeated="{huge}"')
