@@ -14,7 +14,7 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
 
 ## 1. Cases
 
-Write `cases.json`: `[{"id": "c01", "skill": "name", "prompt": "..."}, {"id": "n01", "skill": null, "prompt": "..."}]`.
+Write `cases.json`: `[{"id": "c01", "skill": "name", "prompt": "..."}, {"id": "n01", "skill": null, "prompt": "..."}]`. For an MCP tool, use `"tool": "mcp__plugin_<plugin>_<server>__<tool>"` in place of `"skill"`: `build` grades the call of that tool and lets the run make it. The eval must load the plugin's server for such a case to mean anything; an `unresolved` or all-miss result there points at the server first.
 
 Use these sources, best first:
 1. Typed commands: `project.py mine <transcripts_dir> cases.json --only a,b`, with this project's own transcripts folder only. Keep `cases.json` with this project too. The user's own command is the label. The script drops anything pasted. Read the file and drop bare topics, which were arguments and not requests. Do this by a stated rule, and sample with a fixed seed.
@@ -61,7 +61,7 @@ A label can be wrong: when the other skill also fits the request, say so and fix
 
 For any change, run the same cases on both versions and report what was gained and what broke, not only the net. A change that gains one case and breaks another needs the user's call.
 
-When the user accepts a result, `project.py tally <run>/result.json --save <plugin>/tests/route_accepted.json` keeps each case's outcome. Later runs pass `--accepted` with that file and print `gained`, `broken` and `changed` per case; an unresolved run on either side is `not compared`, not a change.
+When the user accepts a result, `project.py tally <run>/result.json --save <plugin>/tests/route_accepted.json` keeps each case's outcome. Later runs pass `--accepted` with that file and print `gained`, `broken` and `changed` per case; an unresolved run on either side is `not compared`, not a change. The file also records the model, the Claude Code version and each skill's description. A `stale model` line means the two runs are not comparable: rerun the accepted side on this model first. `stale changed` names the skills whose description moved since then, which should be exactly the ones the change touched.
 
 A loaded skill can still be ignored. When following its procedure matters, drop `--stub`, raise `--max-turns`, and add a grader for a step of the procedure.
 

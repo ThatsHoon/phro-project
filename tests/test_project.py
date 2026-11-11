@@ -150,7 +150,7 @@ def demo():
         seen.mkdir()
         call = {"type": "assistant", "uuid": "1", "message": {"content": [{"type": "tool_use", "name": "Skill", "input": {"skill": "demo:alpha"}}]}}
         (seen / "a.jsonl").write_text(json.dumps(call) + "\n", encoding="utf-8")
-        assert [f[1] for f in project.findings(root, seen)] == ["skill:beta"], "with transcripts, an unused skill still shows"
+        assert [f[1] for f in project.findings(root, seen)] == ["skill:beta", "skills/alpha/references/steps.md"], "with transcripts, an unused skill and an unread reference still show"
 
     with tempfile.TemporaryDirectory() as d:
         proj = Path(d) / "proj"
@@ -303,6 +303,82 @@ def demo():
         assert "case\tq4\tfired\t2/2\tunresolved\t1" in out, "an aborted run is neither a firing nor a miss"
         assert "break\t" not in out and "q4\tb-ban\t1.00\t0.00\t+1.00\t\n" in out, "a run that never finished does not fail its graders"
         assert "rerun\tapi_error\t1\t" in out, out
+
+    def cli(*args):
+        return subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), *map(str, args)], capture_output=True, text=True, encoding="utf-8").stdout
+
+    # An MCP tool case is graded on the tool, and the run may call it.
+    tool = "mcp__plugin_demo_files__search"
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "demo"
+        clean(root)
+        cases = Path(d) / "cases.json"
+        cases.write_text(json.dumps([{"id": "t1", "tool": tool, "prompt": "find last month's invoice files and list them"},
+                                     {"id": "t2", "tool": tool, "prompt": "after drafting, search", "after": "Write", "rule": "After a draft, search the files."}]), encoding="utf-8")
+        built = Path(d) / "built"
+        cli("build", root, cases, built, "--stub")
+        target = (built / "evals/t1/graders/target.md").read_text(encoding="utf-8")
+        assert f"tool: {tool}\n" in target and "input_match" not in target, target
+        assert tool in (built / "evals/t1/prompt.md").read_text(encoding="utf-8"), "the run must be allowed to call the tool"
+        assert f"after: {{ tool: {tool} }}" in (built / "evals/t2/graders/order.md").read_text(encoding="utf-8")
+
+        def tool_result(name, passed, took=None):
+            graders = [{"name": "target", "passed": passed}] + [{"name": f"to-{n}", "passed": n == took} for n in ("alpha", "beta")]
+            return {"name": name, "graders": [{"name": "target", "config": {"tool": tool}}], "arms": {"with": [{"graders": graders, "error": None}]}}
+        path = Path(d) / "result.json"
+        path.write_text(json.dumps({"costUsd": 1, "partial": False, "cases": [tool_result("t1", True), tool_result("t3", False, "beta")]}), encoding="utf-8")
+        out = cli("tally", path)
+        assert f"{tool}\t2\t1\t1\t0\t0\t0" in out and f"t3 {tool} -> beta" in out, out
+
+    # A reference nobody reads is a candidate for removal; a subagent's read counts.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "demo"
+        clean(root)
+        write(root, "skills/beta/SKILL.md", skill("beta", "Renders invoice PDFs from monthly billing exports.", "Hand off to `demo:alpha`. Read `references/layout.md`."))
+        write(root, "skills/beta/references/layout.md", "Layout.\n")
+        write(root, "skills/beta/CONTRACT.md", "Output: an invoice PDF.\n")  # read by quality-test, not by the skill at work
+        seen = Path(d) / "transcripts"
+        events = [{"type": "assistant", "uuid": str(i), "message": {"content": [{"type": "tool_use", "name": "Skill", "input": {"skill": f"demo:{n}"}}]}}
+                  for i, n in enumerate(("alpha", "beta"))]
+        events.append({"type": "assistant", "uuid": "r", "isSidechain": True, "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": str(root / "skills/alpha/references/steps.md").replace("/", "\\")}}]}})
+        write(seen, "a.jsonl", "".join(json.dumps(e) + "\n" for e in events))
+        assert project.findings(root, seen) == [("never-read", "skills/beta/references/layout.md", "0 Reads in these transcripts")], project.findings(root, seen)
+        summary = cli("summary", root, "--usage", seen)
+        assert "skills/alpha/references/steps.md\t1" in summary and "skills/beta/references/layout.md\t0" in summary, summary
+
+    # An accepted baseline remembers the model and what the skills were, and says so when either changed.
+    with tempfile.TemporaryDirectory() as d:
+        copy = Path(d) / "copy"
+        clean(copy)
+        write(copy, "skills/alpha/CONTRACT.md", "Output: a rotation plan.\n")
+
+        def doc(model):
+            graders = [{"name": "target", "passed": True}, {"name": "to-alpha", "passed": True}]
+            return {"costUsd": 1, "partial": False, "claudeVersion": "2.1.300", "suite": {"modelOverride": model, "root": str(copy)},
+                    "cases": [{"name": "c1", "graders": [{"name": "target", "config": {"input_match": '"skill"\\s*:\\s*"(?:[\\w-]+:)?alpha"'}}],
+                               "arms": {"with": [{"graders": graders, "error": None}], "without": [{"graders": [{"name": "f-plan", "passed": True}], "error": None}]}}]}
+        path, accepted = Path(d) / "r.json", Path(d) / "accepted.json"
+        path.write_text(json.dumps(doc("claude-opus-5-5")), encoding="utf-8")
+        cli("tally", path, "--save", accepted)
+        meta = json.loads(accepted.read_text(encoding="utf-8"))["_meta"]
+        assert meta["model"] == "claude-opus-5-5" and meta["claude"] == "2.1.300" and set(meta["files"]) == {"skill:alpha", "skill:beta"}, meta
+        out = cli("tally", path, "--accepted", accepted)
+        assert "stale" not in out and "_meta" not in out, "an unchanged baseline is silent"
+        write(copy, "skills/alpha/SKILL.md", skill("alpha", "Rotates database credentials and API keys on a schedule.", "Read `references/steps.md`."))
+        path.write_text(json.dumps(doc("claude-sonnet-5-5")), encoding="utf-8")
+        out = cli("tally", path, "--accepted", accepted)
+        assert "stale\tmodel\tclaude-opus-5-5 -> claude-sonnet-5-5\toutcomes are not comparable" in out, out
+        assert "stale\tchanged\tskill:alpha" in out and "skill:beta" not in out, "a routing baseline follows descriptions"
+
+        qdoc = doc("claude-opus-5-5")
+        qdoc["cases"][0]["arms"]["with"][0]["graders"].append({"name": "f-plan", "passed": True})
+        path.write_text(json.dumps(qdoc), encoding="utf-8")
+        cli("quality", path, "--save", accepted)
+        assert "skills/alpha/CONTRACT.md" in json.loads(accepted.read_text(encoding="utf-8"))["_meta"]["files"]
+        write(copy, "skills/alpha/CONTRACT.md", "Output: a rotation plan with dates.\n")
+        out = cli("quality", path, "--accepted", accepted)
+        assert "stale\tchanged\tskills/alpha/CONTRACT.md" in out and "new\t_meta" not in out, out
     print("ok")
 
 

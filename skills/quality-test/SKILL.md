@@ -45,6 +45,6 @@ A boundary that never failed proves nothing. Once per skill, and whenever a boun
 
 ## 5. Accept
 
-When the user accepts, `project.py quality <out>/quality.json --save evals/quality/<name>/accepted.json`. Later edits to the skill rerun its cases and report gained and broken against that file before they count as done.
+When the user accepts, `project.py quality <out>/quality.json --save evals/quality/<name>/accepted.json`. Later edits to the skill rerun its cases and report gained and broken against that file before they count as done. The file records the model, the Claude Code version and each `SKILL.md` and `CONTRACT.md`; `stale model` means rerun the accepted side first, and a `stale changed` contract means the user changed it, so the old rates no longer apply.
 
 Report in the user's language: the model, cases, runs and cost, the difference per grader, the breaks, and where the outputs that need human reading are.

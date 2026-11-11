@@ -131,7 +131,7 @@ Say what the project should be able to do, and from when: "make this method a sk
 2. Collect competitors (`catalog`). Real misses come from the other installed skills.
 3. Build the test on a scratch copy (`build`). The plugin itself is not touched.
 4. State the estimate, get approval, then run `claude plugin eval`. A case costs about $0.15 at 55 skills on Opus.
-5. Tally (`tally`): hits, other skill, unresolved, no skill, wrong order, false fires. A run that ended abnormally with no skill called, by turn limit, timeout or API error, is unresolved, not a miss; `tally` names its kind and prints one rerun instruction per kind. `--save` keeps an accepted run's outcome per case, and `--accepted` reports later runs against it. A skill meant to fire after a step is graded by `tool_order`, so a call at the wrong moment is not a hit. An eval reads no project configuration, so its standing rule arrives through `append_system_prompt`.
+5. Tally (`tally`): hits, other skill, unresolved, no skill, wrong order, false fires. A run that ended abnormally with no skill called, by turn limit, timeout or API error, is unresolved, not a miss; `tally` names its kind and prints one rerun instruction per kind. `--save` keeps an accepted run's outcome per case with the model, Claude Code version and skill descriptions it ran on, and `--accepted` reports later runs against it, with a `stale` line when the model or a description changed. A case may name an MCP tool (`"tool"`) instead of a skill. A skill meant to fire after a step is graded by `tool_order`, so a call at the wrong moment is not a hit. An eval reads no project configuration, so its standing rule arrives through `append_system_prompt`.
 6. Act on the result:
 
    | Result | Next |
@@ -257,7 +257,7 @@ Run as `python -I -X utf8 scripts/project.py <command>`. `<plugin>` is a plugin 
 
 | Command | Does |
 |---|---|
-| `summary <plugin> [--usage DIR]` | Node counts, tokens per skill, uses, eval cases, calls in transcripts |
+| `summary <plugin> [--usage DIR]` | Node counts, tokens per skill, uses, eval cases, calls in transcripts, and Reads of each skill's reference files |
 | `check <plugin> [--usage DIR]` | Deterministic findings, one per line |
 | `impact <plugin> <node>` | What breaks if it is removed, and what only it uses |
 | `sql <plugin> "<select>"` | Read-only query on `node` and `edge` |
@@ -274,6 +274,7 @@ Findings from `check` are candidates, not verdicts:
 | `duplicate-file`, `shared-lines` | A whole file repeated, or lines copied between instructions |
 | `orphan` | A script or doc nothing points at |
 | `no-eval`, `never-called`, `unmeasured` | No eval case or `tests/route_cases.json` entry grades it, or no call in the transcripts, or no transcripts to count in. A skill only the user invokes needs no eval |
+| `never-read` | A skill's reference file no Read in the transcripts opened, subagents included: a candidate to fold in or drop |
 | `no-description`, `long-description`, `long-body` | No description, over 1,536 characters, over about 5,000 tokens, where a compaction cuts a skill |
 | `overlap-candidate` | Descriptions share many words. `audit` judges the meaning |
 | `unknown-frontmatter` | A skill key Claude Code does not read, such as `disable_model_invocation`. It is ignored without an error |

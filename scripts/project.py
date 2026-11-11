@@ -3,7 +3,7 @@
 <plugin> is a plugin folder, or a project root, which means the skills in its .claude.
 
 Structure, rebuilt from the plugin's files on every call (the files are the source, the database is a throwaway copy):
-  project.py summary <plugin> [--usage DIR]     nodes, and per skill its token cost, tests and use
+  project.py summary <plugin> [--usage DIR]     nodes, and per skill its token cost, tests and use; with --usage, reads of each reference
   project.py check   <plugin> [--usage DIR]     deterministic findings, one per line
   project.py impact  <plugin> <node>            what depends on it, and what only it uses
   project.py sql     <plugin> "<select>"        read-only query: node(id, kind, path, description, desc_tokens, body_tokens), edge(src, dst, how)
@@ -15,7 +15,7 @@ Routing, on a scratch copy so the plugin itself is never edited:
   project.py tally   <result.json> [<result.json> ...] [--cases cases.json]         hits, misses, which skill took each miss; held-out cases apart
 
 Output quality, from a `claude plugin eval --ablation with-without` run (graders named b-* are boundaries):
-  project.py quality <result.json> [--accepted accepted.json] [--save accepted.json]  per-grader pass rate in each arm, breaks, gained and broken
+  project.py quality <result.json> [--accepted accepted.json] [--save accepted.json]  per-grader pass rate in each arm, breaks, gained and broken, and a stale line when the model or the skill changed since
 """
 import argparse
 import collections
@@ -186,23 +186,29 @@ def add_edges(db, plugin, kinds, texts, sources):
 
 def usage(directory, plugin):
     """Typed commands and model Skill calls per skill, or None without any transcript, which is not a count of zero. Forked sessions copy lines, so every event counts once by uuid. Counts only, no text."""
-    typed, model, seen = collections.Counter(), collections.Counter(), set()
+    typed, model, reads, seen = collections.Counter(), collections.Counter(), collections.Counter(), set()
     paths = list(Path(directory).rglob("*.jsonl"))
     if not paths:
         return None
     for path in paths:
         for line in path.open(encoding="utf-8", errors="replace"):
-            if '"Skill"' not in line and "<command-name>" not in line:
+            if '"Skill"' not in line and "<command-name>" not in line and not ('"Read"' in line and "skills" in line):
                 continue
             try:
                 e = json.loads(line)
             except ValueError:
                 continue
             uid = e.get("uuid")
-            if uid in seen or e.get("isSidechain"):
+            if uid in seen:
                 continue
             seen.add(uid)
             content = (e.get("message") or {}).get("content")
+            if e.get("type") == "assistant" and isinstance(content, list):  # a subagent reading a reference uses it too
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Read":
+                        reads[str((b.get("input") or {}).get("file_path", "")).replace("\\", "/")] += 1
+            if e.get("isSidechain"):
+                continue
             if e.get("type") == "user":
                 text = content if isinstance(content, str) else " ".join(b.get("text", "") for b in content or [] if isinstance(b, dict))
                 m = re.search(r"<command-name>/?([^<\s]+)</command-name>", text[:3000])
@@ -215,7 +221,18 @@ def usage(directory, plugin):
 
     def count(counter, name):
         return counter[name] + counter[f"{plugin}:{name}"]
-    return lambda name: (count(typed, name), count(model, name))
+
+    def used(name):
+        return count(typed, name), count(model, name)
+    # lean: matched by the path inside the plugin, so another plugin's file at the same path counts too | when: two installed plugins share a skill and reference name | fix: match the plugin's folder name as well
+    used.reads = lambda rel: sum(n for path, n in reads.items() if path.endswith("/" + rel))
+    return used
+
+
+def references(sources, kinds):
+    """A skill's own documents other than SKILL.md: read on demand, so a reference nobody reads costs upkeep for nothing."""
+    return sorted(rel for node, files in sources.items() if kinds.get(node) == "doc" for rel in files
+                  if rel.startswith("skills/") and rel.endswith(".md") and Path(rel).name not in ("SKILL.md", "CONTRACT.md"))
 
 
 def fetched_package(entry):
@@ -297,7 +314,7 @@ def findings(root, usage_dir=None):
     for node, kind in kinds.items():
         path = sources[node][0] if sources[node] else ""
         runs = path.startswith(("skills/", "scripts/", "hooks/")) and (kind == "script" or (kind == "doc" and path.endswith(".md")))
-        if runs and node not in reached and Path(path).name not in ("__init__.py", "README.md"):
+        if runs and node not in reached and Path(path).name not in ("__init__.py", "README.md", "CONTRACT.md"):
             out.append(("orphan", node, "no file refers to it"))
     # An MCP server fetched by name runs whatever version is newest at each start, not the one that was reviewed.
     for node, kind in kinds.items():
@@ -333,6 +350,7 @@ def findings(root, usage_dir=None):
         used = usage(usage_dir, plugin)
         if used:
             out += [("never-called", n[0], "0 typed, 0 model calls in these transcripts") for n in nodes if n[1] == "skill" and used(n[0].split(":", 1)[1]) == (0, 0)]
+            out += [("never-read", rel, "0 Reads in these transcripts") for rel in references(sources, kinds) if not used.reads(rel)]
         else:
             out.append(("unmeasured", str(usage_dir), "no transcripts here, so use is unknown"))
     return out
@@ -346,7 +364,7 @@ def resolve(db, name):
 
 
 def cmd_summary(a):
-    db, plugin, _, _ = scan(a.plugin)
+    db, plugin, _, sources = scan(a.plugin)
     print(f"plugin\t{plugin}")
     for kind, n in db.execute("select kind, count(*) from node group by kind order by 2 desc"):
         print(f"{kind}\t{n}")
@@ -359,6 +377,11 @@ def cmd_summary(a):
     for row in db.execute(query):
         extra = "\t%d\t%d" % used(row[0].split(":", 1)[1]) if used else ""
         print("\t".join(map(str, row)) + extra)
+    if used:
+        kinds = dict(db.execute("select id, kind from node"))
+        print("reference\treads")
+        for rel in references(sources, kinds):
+            print(f"{rel}\t{used.reads(rel)}")
 
 
 def cmd_check(a):
@@ -441,8 +464,13 @@ def grader(name_pattern=None, none=False):
     return f"---\ntype: tool_used\ntool: Skill\n{match}{limit}---\n\nGraded from the transcript.\n"
 
 
-def order_grader(step, name):
-    return f"---\ntype: tool_order\nbefore: {step}\nafter: {{ tool: Skill, input_match: '{SKILL_CALL.format(name)}' }}\n---\n\nGraded from the transcript.\n"
+def tool_grader(tool):
+    return f"---\ntype: tool_used\ntool: {tool}\n---\n\nGraded from the transcript.\n"
+
+
+def order_grader(step, name, tool=None):
+    after = f"{{ tool: {tool} }}" if tool else f"{{ tool: Skill, input_match: '{SKILL_CALL.format(name)}' }}"
+    return f"---\ntype: tool_order\nbefore: {step}\nafter: {after}\n---\n\nGraded from the transcript.\n"
 
 
 def cmd_build(a):
@@ -477,12 +505,15 @@ def cmd_build(a):
         (d / "graders").mkdir(parents=True)
         step = case.get("after")  # a skill meant to fire after this tool, not on the prompt itself
         rule = f"append_system_prompt: {json.dumps(case['rule'], ensure_ascii=False)}\n" if case.get("rule") else ""  # stands in for the core index: an eval reads no project configuration
-        head = f"max_turns: {max(a.max_turns, STEP_TURNS)}\ntimeout_seconds: 240\nallowed_tools: {STEP_TOOLS}\n" if step else f"max_turns: {a.max_turns}\ntimeout_seconds: 180\nallowed_tools: {TOOLS}\n"
+        tool = case.get("tool")  # an MCP tool, by its full mcp__plugin_<plugin>_<server>__<tool> name, instead of a skill
+        tools = STEP_TOOLS if step else TOOLS
+        tools = tools[:-1] + f", {tool}]" if tool else tools
+        head = f"max_turns: {max(a.max_turns, STEP_TURNS)}\ntimeout_seconds: 240\nallowed_tools: {tools}\n" if step else f"max_turns: {a.max_turns}\ntimeout_seconds: 180\nallowed_tools: {tools}\n"
         (d / "prompt.md").write_text(f"---\n{head}{rule}---\n\n{case['prompt']}\n", encoding="utf-8")
         target = case.get("skill")
-        (d / "graders/target.md").write_text(grader(target) if target else grader(none=True), encoding="utf-8")
+        (d / "graders/target.md").write_text(tool_grader(tool) if tool else grader(target) if target else grader(none=True), encoding="utf-8")
         if step:
-            (d / "graders/order.md").write_text(order_grader(step, target), encoding="utf-8")
+            (d / "graders/order.md").write_text(order_grader(step, target, tool), encoding="utf-8")
         for name in skills:  # free graders, so a miss shows which skill took it
             (d / f"graders/to-{name}.md").write_text(grader(name), encoding="utf-8")
         if a.history:
@@ -504,6 +535,39 @@ ERROR_KINDS = (
 
 def error_kind(error):
     return next(kind for kind, pattern, _ in ERROR_KINDS if re.search(pattern, error, re.I))
+
+
+def fingerprint(root, whole):
+    """What a run measured: each skill's listing text for routing, or each SKILL.md and CONTRACT.md in full for output quality."""
+    out = {}
+    for path in sorted(Path(root).glob("skills/*/*.md")) if root and Path(root).is_dir() else []:
+        rel, text = path.relative_to(root).as_posix(), path.read_text(encoding="utf-8", errors="replace")
+        if whole and path.name in ("SKILL.md", "CONTRACT.md"):
+            out[rel] = hashlib.sha256(text.encode()).hexdigest()[:16]
+        elif not whole and path.name == "SKILL.md":
+            fields = frontmatter(text)[0]
+            listing = " ".join(filter(None, [fields.get("description"), fields.get("when_to_use")]))
+            out[f"skill:{fields.get('name', path.parent.name)}"] = hashlib.sha256(listing.encode()).hexdigest()[:16]
+    return out
+
+
+def run_meta(data, whole):
+    suite = data.get("suite") or {}
+    return {"model": suite.get("modelOverride") or "default", "claude": data.get("claudeVersion"), "files": fingerprint(suite.get("root"), whole)}
+
+
+def stale(now, then):
+    """Why an accepted baseline may not compare: another model, another Claude Code, or skills changed since. Silent for an old file with no record."""
+    if not then:
+        return
+    if then.get("model") != now["model"]:
+        print(f"stale\tmodel\t{then.get('model')} -> {now['model']}\toutcomes are not comparable")
+    if then.get("claude") != now["claude"]:
+        print(f"stale\tclaude\t{then.get('claude')} -> {now['claude']}")
+    old, new = then.get("files") or {}, now["files"]
+    for key in sorted(set(old) | set(new)):
+        if new and old.get(key) != new.get(key):
+            print(f"stale\tchanged\t{key}")
 
 
 def compare(now, accepted):
@@ -548,8 +612,9 @@ def cmd_tally(a):
                 runs += 1
                 graders = {g["name"]: g["passed"] for g in run["graders"]}
                 took = sorted(n[3:] for n, ok in graders.items() if n.startswith("to-") and ok)
-                pattern = next((g["config"].get("input_match", "") for g in case["graders"] if g["name"] == "target"), "")
-                expected = m.group(1) if (m := re.search(r'\?([\w-]+)"$', pattern)) else None
+                spec = next((g.get("config") or {} for g in case["graders"] if g["name"] == "target"), {})
+                m = re.search(r'\?([\w-]+)"$', spec.get("input_match", ""))
+                expected = m.group(1) if m else spec["tool"] if spec.get("tool") not in (None, "Skill") else None
                 # A run that ended abnormally with no skill yet, by turn limit, timeout or API error, has shown nothing; it is unresolved.
                 error = str(run.get("error") or "")[:60]
                 kind = error_kind(error) if error else ""
@@ -600,10 +665,13 @@ def cmd_tally(a):
                 print(f"rerun\t{kind}\t{reruns[kind]}\t{action}")
     if a.cases:
         by_split(outcomes, json.loads(Path(a.cases).read_text(encoding="utf-8")))
+    meta = run_meta(data, whole=False)
     if a.accepted:
-        compare(outcomes, json.loads(Path(a.accepted).read_text(encoding="utf-8")))
+        old = json.loads(Path(a.accepted).read_text(encoding="utf-8"))
+        stale(meta, old.pop("_meta", None))
+        compare(outcomes, old)
     if a.save:
-        Path(a.save).write_text(json.dumps(outcomes, ensure_ascii=False, indent=1), encoding="utf-8")
+        Path(a.save).write_text(json.dumps({**outcomes, "_meta": meta}, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"saved\t{a.save}")
 
 
@@ -663,8 +731,10 @@ def cmd_quality(a):
     now = {}
     for name, grader_name, w, _, _ in rows:
         now.setdefault(name, {})[grader_name] = w
+    meta = run_meta(data, whole=True)
     if a.accepted:
         old = json.loads(Path(a.accepted).read_text(encoding="utf-8"))
+        stale(meta, old.pop("_meta", None))
         for name, graders in now.items():
             for grader_name, w in graders.items():
                 before = old.get(name, {}).get(grader_name)
@@ -673,7 +743,7 @@ def cmd_quality(a):
                 elif abs(w - before) > NOISE:
                     print(f"{'gained' if w > before else 'broken'}\t{name}\t{grader_name}\t{before:.2f} -> {w:.2f}")
     if a.save:
-        Path(a.save).write_text(json.dumps(now, ensure_ascii=False, indent=1), encoding="utf-8")
+        Path(a.save).write_text(json.dumps({**now, "_meta": meta}, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"saved\t{a.save}")
 
 
