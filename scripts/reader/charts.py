@@ -2,12 +2,13 @@
 import re
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
+from . import limits
 from .containers.zipx import attr, first, kids, local, walk
 from .model import Cell, Para, Table, Text
 
 _CACHES = ("strCache", "numCache", "strLit", "numLit")
 _PCT = re.compile(r"^0(?:\.(0+))?%$")
-CHART_ROWS = 10_000
+CHART_ROWS = 10_000  # point indexes past this are dropped
 
 
 def _kid(el, name):
@@ -52,14 +53,16 @@ def _fmt(text: str, code: str) -> str:
 
 
 def _column(holder):
-    """({idx: text}, row count, clamped) of the cache under a c:cat / c:val / c:xVal / c:yVal."""
+    """({idx: text}, rows its points reach, clamped) of the cache under a c:cat / c:val / c:xVal / c:yVal.
+
+    The row count comes from the points present, never from ptCount, which a file can set to anything.
+    """
     cache = _cache(holder)
     if cache is None:
         return {}, 0, False
     fc = _kid(cache, "formatCode")
     code = (fc.text or "").strip() if fc is not None else ""
-    pc = _kid(cache, "ptCount")
-    top = _int(attr(pc, "val")) if pc is not None else 0
+    top = 0
     clamped = False
     out = {}
     for pt in kids(cache, "pt"):
@@ -72,8 +75,6 @@ def _column(holder):
             continue
         out[idx] = _fmt(v.text or "", (attr(pt, "formatCode") or code).strip())
         top = max(top, idx + 1)
-    if top > CHART_ROWS:
-        top, clamped = CHART_ROWS, True
     return out, top, clamped
 
 
@@ -87,7 +88,9 @@ def _cell(text: str, header=False) -> Cell:
     return Cell([Para([Text(text)])] if text else [], header=header)
 
 
-def chart_table(space):
+def chart_table(space, ctx=None):
+    """The chart's cached values as a Table, or None without series. A table is held to limits.CHART_CELLS cells
+    (series first, then rows); a cut is counted in ctx.skipped["chart_cut"] when ctx is given."""
     plot = first(space, "plotArea")
     if plot is None:
         return None
@@ -110,18 +113,31 @@ def chart_table(space):
     # Category layout when any series has c:val; otherwise x/y layout (scatter, bubble).
     xy = not any(_kid(x, "val") is not None for x in sers)
     label, top, clamped = _column(_kid(sers[0], "xVal" if xy else "cat"))
-    names, cols = ["x" if xy else ""], []
+    names, cols, points, more = ["x" if xy else ""], [], len(label), False
     for n, s in enumerate(sers, 1):
+        if n >= limits.GRID_COLS or points > limits.CHART_CELLS:  # parsed points stay near the cap too
+            more = True
+            break
         holder = _kid(s, "yVal") if xy or _kid(s, "val") is None else _kid(s, "val")
         col, t, c = _column(holder)
         names.append(_name(s, n))
         cols.append(col)
+        points += len(col)
         top = max(top, t)
         clamped = clamped or c
-    top = min(top, CHART_ROWS)
+    room = max(limits.CHART_CELLS // len(names) - 1, 0)  # the header row counts too
+    rows_cut = top > room
+    top = min(top, room)
     caption = f"Chart: {kind} — {title}" if title else f"Chart: {kind}"
-    if clamped:
-        caption += f" (first {CHART_ROWS} points)"
+    notes = []
+    if rows_cut or clamped:
+        notes.append(f"first {top if rows_cut else CHART_ROWS} points")
+    if more:
+        notes.append(f"first {len(cols)} series")
+    if notes:
+        caption += " (" + ", ".join(notes) + ")"
+        if ctx is not None:
+            ctx.skipped["chart_cut"] += 1
 
     rows = [[_cell(n, True) for n in names]]
     for i in range(top):

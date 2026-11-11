@@ -380,6 +380,26 @@ def test_object_chain_bomb_is_budgeted():
     assert time.monotonic() - t0 < 2 and ctx.skipped["cells"] > 0 and "첫1" in out
 
 
+def test_repeated_big_cell_is_budgeted_by_characters():
+    import tracemalloc
+    from reader import limits
+    big = "x" * 1_000_000
+    body = P("앞 글") + table_xml([cell(big, 'table:number-columns-repeated="100"')])
+    path = odt_doc(body)
+    out = tmp() / "out"
+    tracemalloc.start()
+    t0 = time.monotonic()
+    meta = reader.convert(path, out)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    data = (out / "out.md").read_bytes()
+    # a full 20 MB output costs about this much; the unbudgeted build peaked at 478 MiB
+    assert time.monotonic() - t0 < 10 and peak < 200 * 2**20, peak / 2**20
+    assert data.startswith("(could not read: 1 table cut short)\n\n앞 글\n\n|xxx".encode("utf-8")), data[:80]
+    assert len(data) <= limits.MAX_OUTPUT + 64 and data.endswith(b"x\n(output truncated at 20 MB)\n")
+    assert meta["unread"] == ["1 table cut short"], meta
+
+
 def test_hidden_section_is_one_place():
     body = '<text:section text:display="none">' + P("하나") + P("둘") + P("셋") + "</text:section>" + P("보임")
     p = odt_doc(body)

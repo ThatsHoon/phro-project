@@ -536,7 +536,7 @@ class _Reader:
             tbl = None
             if data:
                 try:
-                    tbl = chart_table(parse_xml(data))
+                    tbl = chart_table(parse_xml(data), self.ctx)
                 except ReadError as e:
                     if e.kind != "damaged":
                         raise

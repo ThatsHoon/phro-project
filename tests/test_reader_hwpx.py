@@ -256,6 +256,32 @@ def test_chart():
     assert "Chart: bar" in out and "대체" not in out and "|A|5|" in out
 
 
+def _wide_chart(series, labels=0):
+    cat = ""
+    if labels:
+        pts = "".join(f'<c:pt idx="{i}"><c:v>L{i}</c:v></c:pt>' for i in range(labels))
+        cat = f'<c:cat><c:strRef><c:strCache><c:ptCount val="{labels}"/>{pts}</c:strCache></c:strRef></c:cat>'
+    empty = ('<c:ser>' + '<c:val><c:numRef><c:numCache><c:ptCount val="10000"/></c:numCache></c:numRef></c:val></c:ser>')
+    first = empty.replace("<c:ser>", "<c:ser>" + cat, 1)
+    return ('<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea>'
+            '<c:barChart>' + first + empty * (series - 1) + '</c:barChart></c:plotArea></c:chart></c:chartSpace>')
+
+
+def test_wide_chart_is_bounded():
+    import time
+    from reader import limits
+    sec = '<hp:p><hp:run><hp:t>본문</hp:t><hp:chart chartIDRef="Chart/chart1.xml"/></hp:run></hp:p>'
+    for labels, cut in ((0, 0), (10_000, 1)):
+        path = hwpx_doc(sec, extra={"Chart/chart1.xml": _wide_chart(300, labels)})
+        t0 = time.monotonic()
+        doc, ctx = parse(path)
+        tbl = doc.blocks[1]
+        assert time.monotonic() - t0 < 2, time.monotonic() - t0
+        assert sum(len(r) for r in tbl.rows) <= limits.CHART_CELLS and len(tbl.rows[0]) == 301, len(tbl.rows)
+        assert ctx.skipped["chart_cut"] == cut, ctx.skipped
+    assert len(tbl.rows) == limits.CHART_CELLS // 301 and tbl.caption.endswith(f"(first {len(tbl.rows) - 1} points)")
+
+
 def test_equation():
     eq = '<hp:p><hp:run><hp:equation><hp:script>%s</hp:script></hp:equation>%s</hp:run></hp:p>'
     assert md(hwpx_doc(eq % ("a over b", ""))) == "$$\\frac{a}{b}$$\n"

@@ -319,7 +319,7 @@ class _Reader:
             if n == "tbl":
                 return self.table(e)
             if n == "chart":
-                tbl = ooxml_base.chart(self.pkg, self.scope.part, attr(e, "id"))
+                tbl = ooxml_base.chart(self.pkg, self.scope.part, attr(e, "id"), self.ctx)
                 if tbl is not None:
                     self.chart_cells += sum(len(r) for r in tbl.rows)
                 if tbl is None or self.chart_cells > CHART_CELLS:

@@ -93,8 +93,9 @@ def image(pkg, part, rid):
     return Image(data) if data else None
 
 
-def chart(pkg, part, rid):
-    """Table of the chart cache behind relationship `rid`; None when missing or unreadable. One object per part."""
+def chart(pkg, part, rid, ctx=None):
+    """Table of the chart cache behind relationship `rid`; None when missing or unreadable. One object per part;
+    a table cut to the chart cell cap is counted in ctx once."""
     name = _target(pkg, part, rid, "/chart")
     if name is None:
         return None
@@ -104,7 +105,7 @@ def chart(pkg, part, rid):
         tbl = None
         if data:
             try:
-                tbl = chart_table(parse_xml(data))
+                tbl = chart_table(parse_xml(data), ctx)
             except ReadError as e:
                 if e.kind != "damaged":
                     raise

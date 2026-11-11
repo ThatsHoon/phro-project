@@ -41,6 +41,7 @@ LOST = (
     (("text",), "text run cut short", "text runs cut short"),
     (("truncated", "node", "parse"), "chapter cut short", "chapters cut short"),
     (("sheet_cut",), "sheet cut short", "sheets cut short"),
+    (("chart_cut",), "chart cut short", "charts cut short"),
     (("cells",), "table cut short", "tables cut short"),
     (("repeat",), "repeated row or cell cut short", "repeated rows or cells cut short"),
     (("depth",), "place nested too deeply", "places nested too deeply"),
@@ -428,10 +429,13 @@ class _Render:
 
     def _nested(self, t: Table, m) -> str:
         origins, nrows, _ = self._grid(t)
-        rows = []
+        rows, used = [], 0
         for r in range(nrows):
+            if self.size + used > limits.MAX_OUTPUT:
+                break
             cells = [self._cell_text(origins[k][0], m) for k in sorted(origins) if k[0] == r]
             cells = [x for x in cells if x]
+            used += sum(len(x) + 3 for x in cells)
             if r in t.hidden_rows:
                 if not self.show:
                     self.hidden_count += 1
@@ -497,14 +501,17 @@ class _Render:
             h = hid(r)
             if h is None:
                 continue
-            cells = []
+            cells, row_used = [], 0
             for c in range(ncols):
+                if self.size + used + row_used > limits.MAX_OUTPUT:
+                    break  # the row is cut here; the output is truncated anyway
                 if (r, c) not in origins:
                     if not spans:
                         cells.append(("", None))
                     continue
                 cell, rs, cs = origins[(r, c)]
                 s = self._cell_text(cell, m)
+                row_used += len(s) + 1
                 cells.append((s, (cell, rs, cs)))
             if h and cells:
                 cells[0] = ("(hidden) " + cells[0][0], cells[0][1])
@@ -599,11 +606,14 @@ def _cap(s: str) -> str:
         return s
     out, size = [], 0
     for line in s.split("\n"):
-        n = len(line.encode("utf-8")) + 1
-        if size + n > limit:
+        raw = line.encode("utf-8")
+        if size + len(raw) + 1 > limit:  # keep what fits of the line that crosses the cap
+            part = raw[:max(0, limit - size - 1)].decode("utf-8", "ignore").rstrip()
+            if part:
+                out.append(part)
             break
         out.append(line)
-        size += n
+        size += len(raw) + 1
     return "\n".join(out) + "\n" + _TRUNC + "\n"
 
 

@@ -103,6 +103,19 @@ def test_row_cap_is_fast():
     assert t.caption.endswith("(first 10000 points)")
 
 
+def test_rows_follow_points_not_ptCount_and_series_are_capped():
+    from reader import limits
+    from reader.model import Context
+    empty = '<c:numCache><c:ptCount val="10000"/></c:numCache>'
+    ctx = Context()
+    t = chart_table(space("<c:barChart>" + ser("A", empty) * 50 + "</c:barChart>"), ctx)
+    assert len(t.rows) == 1 and t.caption == "Chart: bar" and not ctx.skipped
+    plot = "<c:barChart>" + ser("A", cache([(0, "1")])) * 1500 + "</c:barChart>"
+    t = chart_table(space(plot), ctx)
+    assert len(t.rows[0]) == limits.GRID_COLS and t.caption == f"Chart: bar (first {limits.GRID_COLS - 1} series)"
+    assert ctx.skipped["chart_cut"] == 1
+
+
 def test_fmt_overflow_and_nan():
     cases = [("1e309", "0.0%"), ("1e30", "#,##0"), ("1" + "0" * 29, "#,##0"), ("NaN", "0%")]
     for v, fmt in cases:

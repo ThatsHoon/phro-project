@@ -13,6 +13,7 @@ SHEET_CELLS = 500_000     # cells one document's sheets may materialize
 SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one document's sheets may materialize
 GRID_COLS = 1_000        # columns a span may reach in a rendered table
 GRID_SLOTS = 2_000_000    # grid slots all spans of one rendered table may cover
+CHART_CELLS = 100_000     # cells one chart table may hold, header row included (series x rows)
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 # a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
 BIG_INPUT = "input"  # the file is over MAX_INPUT

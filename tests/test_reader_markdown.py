@@ -317,6 +317,37 @@ def test_table_stops_at_output_cap_while_rendering():
         limits.MAX_OUTPUT = old
 
 
+def test_overlong_line_is_cut_not_dropped():
+    old = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 100_000
+    try:
+        out = R(Doc(blocks=[P("lead"), P("가" * 300_000), P("after")]))
+    finally:
+        limits.MAX_OUTPUT = old
+    assert out.startswith("lead\n\n가가가") and out.endswith("\n(output truncated at 20 MB)\n"), out[:50]
+    assert 90_000 < len(out.encode("utf-8")) <= 100_000 + 40 and "after" not in out
+
+
+def test_wide_row_stops_at_output_cap():
+    import time
+    import tracemalloc
+    old = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 100_000
+    try:
+        for kw in ({}, {"rowspan": 2}):
+            shared = Cell([P("x" * 10_000)])
+            rows = [[Cell([P("y" * 10_000)], **kw)] + [shared] * 999, [shared] * 999]
+            tracemalloc.start()
+            t0 = time.monotonic()
+            out = R(Doc(blocks=[P("lead"), Table(rows)]))
+            peak = tracemalloc.get_traced_memory()[1]
+            tracemalloc.stop()
+            assert time.monotonic() - t0 < 2 and peak < 3_000_000, peak
+            assert out.startswith("lead\n\n") and "y" * 10_000 in out and out.endswith("(output truncated at 20 MB)\n")
+    finally:
+        limits.MAX_OUTPUT = old
+
+
 def test_over_deep_nesting_is_left_out():
     inner = c("deep")
     for _ in range(100):

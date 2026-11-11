@@ -418,7 +418,7 @@ class _Reader:
         st.extras.append(Image(img.data, st.alt if alt is None else alt))
 
     def chart(self, st, rid):
-        tbl = ooxml_base.chart(self.pkg, self.scope.part, rid)
+        tbl = ooxml_base.chart(self.pkg, self.scope.part, rid, self.ctx)
         if tbl is not None:
             self.chart_cells += sum(len(r) for r in tbl.rows)
         if tbl is None or self.chart_cells > CHART_CELLS:

@@ -6,6 +6,7 @@ import re
 from .. import limits
 from ..containers.zipx import attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
+from ..markdown import blocks_len
 from ..model import (
     Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem,
     NoteRef, Para, Section, Table, Text,
@@ -158,6 +159,7 @@ class Body:
         self.counts = collections.Counter()
         self.last, self.ids = None, {}  # list counters: the previous list's, and by xml:id
         self.left = _BUDGET  # expansion budget still available
+        self.chars_left = limits.SHEET_CHARS  # characters that copies (repeats, reused objects) may still add
         self.wt = {}  # id(Table) -> (Table, cells it expands to)
 
     def hide(self, blocks):
@@ -171,9 +173,9 @@ class Body:
             out.append(c)
         return out
 
-    def take(self, n, force=False) -> bool:
-        """Charge n cells to the document budget; False (and counted) once it is spent.
-        A forced charge (the first copy of something the file spells out) always succeeds."""
+    def take(self, n, force=False, chars=0) -> bool:
+        """Charge n cells and `chars` characters of copied text to the document budgets; False (and counted) once
+        either is spent. A forced charge (the first copy of something the file spells out) always succeeds."""
         if force:
             self.left = max(0, self.left - n)
             return True
@@ -181,7 +183,11 @@ class Body:
             self.left = 0
             self.ctx.skipped["cells"] += 1
             return False
+        if chars > self.chars_left:
+            self.ctx.skipped["cells"] += 1
+            return False
         self.left -= n
+        self.chars_left -= chars
         return True
 
     def weight(self, blocks) -> int:
@@ -355,7 +361,8 @@ class Body:
             self.ctx.skipped["object"] += 1
             return []
         if name in self.objects:  # a reused object costs what it expands to
-            return self.objects[name] if self.take(self.weight(self.objects[name])) else []
+            blocks = self.objects[name]
+            return blocks if self.take(self.weight(blocks), chars=blocks_len(blocks)) else []
         self.objects[name] = []  # also breaks an object that refers to itself
         data = self.data(name, "object")
         if data:
@@ -541,8 +548,9 @@ class Body:
                 empty = all(_empty(x.blocks) for x in cells)
                 rep, cut_here = self.repeat(attr(c, "number-rows-repeated"), empty)
                 rw = sum(self.weight(x.blocks) for x in cells) or 1
+                rc = sum(blocks_len(x.blocks) for x in cells)
                 for i in range(rep):
-                    if not self.take(rw if i else (0 if cells else 1), force=i == 0):
+                    if not self.take(rw if i else (0 if cells else 1), force=i == 0, chars=rc):
                         return
                     rows.append([Cell(x.blocks, x.rowspan, x.colspan, x.header) for x in cells])
                 if cut_here:
@@ -570,10 +578,10 @@ class Body:
             blocks = self.blocks(c, d + 1)
             cs = min(max(_int(attr(c, "number-columns-spanned"), 1), 1), _SPAN)
             rs = min(max(_int(attr(c, "number-rows-spanned"), 1), 1), _SPAN)
-            w = self.weight(blocks)
+            w, size = self.weight(blocks), blocks_len(blocks)
             n, cut_here = self.repeat(attr(c, "number-columns-repeated"), _empty(blocks))
             for i in range(n):
-                if not self.take(w if i else 1, force=i == 0):  # a first copy's nested cells were charged as built
+                if not self.take(w if i else 1, force=i == 0, chars=size):  # a first copy was charged as built
                     return cells
                 cells.append(Cell(blocks, rs, cs, header))
             if cut_here:
