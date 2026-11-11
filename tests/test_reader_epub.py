@@ -179,7 +179,7 @@ def test_image_and_data_uri():
 
 def test_data_uri_limits_and_outside_images():
     assert xhtml._data_uri("data:image/png;base64," + "A" * (7 * 10**6)) is None
-    assert xhtml._data_uri("data:image/png;base64," + "A" * (6 * 10**6)) is not None or True
+    assert xhtml._data_uri("data:image/png;base64," + "A" * (6 * 10**6)) is not None
     body = ('<img src="data:image/png;base64,AAAA"/><img src="data:image/png,abc"/>'
             '<img src="../../x.png"/><img src="http://e.com/x.png"/><img src="/etc/x.png"/><p>ok</p>')
     t0 = time.monotonic()
@@ -273,6 +273,7 @@ def test_deep_nesting_fast():
     t0 = time.monotonic()
     out, ctx = md(epub_book({"c.xhtml": body}))
     assert time.monotonic() - t0 < 10 and "after" in out and "deep" in out
+    assert ctx.skipped["depth"] > 0
 
 
 def test_huge_css_is_capped():
@@ -310,6 +311,86 @@ def test_parser_hostile_runs_stay_fast():
         root = xhtml.tree((unit * 100_000).encode())
         xhtml.blocks(root, css=xhtml.Css([]), load=lambda s: None, notes={}, ctx=Context())
     assert time.monotonic() - t0 < 20
+
+
+def test_lt_inside_quoted_attribute_values():
+    body = ('<p><img src="images/a.png" alt="a<b"/> after</p><p><a href="http://e.com/?a<b">link</a> tail</p>'
+            '<span title="x < y">hello</span>')
+    out, _ = md(epub_book({"c.xhtml": body}, extra={"OEBPS/images/a.png": PNG}))
+    assert "![" in out and "after" in out, out
+    assert "[link](http://e.com/?a" in out and "tail" in out, out
+    assert "hello" in out and "<span" not in out and "title" not in out, out
+
+
+def test_unclosed_tag_runs_are_fast():
+    t0 = time.monotonic()
+    for unit in ("<a ", "<", '<a "<a "', "<a '", '<a x="<a x="'):
+        xhtml.tree((unit * 200_000).encode())
+    assert time.monotonic() - t0 < 4
+
+
+def test_at_rule_brace_bomb():
+    sheet = "@m{" + "{" * 500_000 + "}" * 500_000
+    t0 = time.monotonic()
+    c = xhtml.Css([sheet] * 32)
+    assert time.monotonic() - t0 < 3 and c.capped
+
+
+def test_node_cap():
+    root = xhtml.tree(b"<p>early</p>" + b"<i/>" * 600_000)
+    ctx = Context()
+    out = xhtml.blocks(root, css=xhtml.Css([]), load=lambda s: None, notes={}, ctx=ctx)
+    assert xhtml.text_of(root).startswith("early") and out and ctx.skipped["node"] == 1
+    assert any(w.startswith("node:") for w in ctx.warnings)
+
+
+def test_media_type_with_parameters():
+    p = raw_book('<manifest><item id="c" href="c.xhtml" media-type=" Application/XHTML+xml ; charset=utf-8"/>'
+                 '</manifest><spine><itemref idref="c"/></spine>', {"OEBPS/c.xhtml": page("<p>param</p>")})
+    out, _ = md(p)
+    assert "param" in out
+
+
+def test_plain_link_to_footnote():
+    for kind in ("footnote", "endnote", "rearnote", "note"):
+        body = f'<p>t<a href="#n1">1</a></p><aside epub:type="{kind}" id="n1"><p>정의</p></aside>'
+        out, _ = md(epub_book({"c.xhtml": body}))
+        assert "[^1]" in out and "[^1]: 정의" in out, (kind, out)
+    p = epub_book({"c1.xhtml": '<p>a<a href="notes.xhtml#e1">1</a></p>',
+                   "notes.xhtml": '<aside epub:type="endnote" id="e1">끝</aside>'})
+    out, _ = md(p)
+    assert "[^1]: 끝" in out, out
+
+
+def test_dangling_noteref_stays_text():
+    body = ('<p>x<a epub:type="noteref" href="../q.xhtml#n1">A</a><a epub:type="noteref" href="#nope">B</a>'
+            '<a epub:type="noteref" href="http://e.com/#n">C</a><a href="#top">D</a></p>')
+    out, _ = md(epub_book({"c.xhtml": body}))
+    assert "[^" not in out and "xABC" in out.replace(" ", "").replace("[C](http://e.com/#n)", "C"), out
+
+
+def test_colspan_capped_to_real_width():
+    body = '<table><tr><td colspan="9">a</td></tr><tr><td>b</td><td>c</td></tr></table>'
+    out, _ = md(epub_book({"c.xhtml": body}))
+    assert 'colspan="2"' in out and 'colspan="9"' not in out, out
+
+
+def test_nested_table_list_quote_past_depth():
+    n = 300
+    cases = {"quote": "<blockquote>" * n + "<p>core</p>" + "</blockquote>" * n,
+             "list": "<ul><li>" * n + "core" + "</li></ul>" * n,
+             "table": "<table><tr><td>" * n + "core" + "</td></tr></table>" * n}
+    for name, body in cases.items():
+        t0 = time.monotonic()
+        out, ctx = md(epub_book({"c.xhtml": body + "<p>tail</p>"}))
+        assert time.monotonic() - t0 < 5 and "tail" in out, name
+        assert name == "table" or "core" in out, name  # text flattened into a table row has no cell to live in
+        assert ctx.skipped["depth"] > 0, name
+
+
+def test_damaged_encryption_xml_is_a_warning():
+    out, ctx = md(epub_book({"c.xhtml": "<p>fine</p>"}, extra={"META-INF/encryption.xml": "<encryption"}))
+    assert "fine" in out and any("encryption" in w for w in ctx.warnings)
 
 
 def test_tolerant_html():

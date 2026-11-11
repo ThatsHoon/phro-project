@@ -16,15 +16,15 @@ from urllib.parse import unquote
 
 from . import limits
 from .containers.zipx import resolve
+from .css import MAX_SHEET, Css  # noqa: F401  (re-exported)
 from .model import Bold, Break, Cell, Context, Heading, Hidden, Image, Link, ListItem, Math, NoteRef, Para, Quote, Table, Text
 
 MAX_DOC = 16 * 2**20       # bytes of one document that are parsed
-MAX_SHEET = 2**20          # characters of one stylesheet that are read
-MAX_SELECTORS = 5000       # simple selectors one Css keeps
 MAX_DATA = 5 * 2**20       # decoded bytes of one data: image
 DATA_BUDGET = 64 * 2**20   # decoded data: bytes one blocks() call may emit
 MAX_URL = 2000
 MAX_ALT = 200
+MAX_NODES = 500_000        # elements one document materializes
 
 VOID = frozenset("area base basefont br col command embed frame hr img input isindex keygen link meta param "
                  "source track wbr".split())
@@ -35,8 +35,7 @@ BLOCKS = frozenset("p div section article aside header footer main figure figcap
                    "fieldset address details summary hgroup center nav h1 h2 h3 h4 h5 h6 ul ol li table "
                    "blockquote pre hr img image svg epub:switch caption thead tbody tfoot tr td th".split())
 DROPPED_NAV = frozenset({"toc", "landmarks", "page-list"})
-NOTE_TYPES = frozenset({"footnote", "endnote", "rearnote", "doc-footnote", "doc-endnote"})
-NOTEREF_TYPES = frozenset({"noteref", "doc-noteref"})
+NOTE_TYPES = frozenset({"footnote", "endnote", "rearnote", "note", "doc-footnote", "doc-endnote"})
 EXTERNAL = frozenset({"http", "https", "mailto"})
 _SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*):")
 
@@ -47,6 +46,15 @@ class Node:
     attrs: dict
     children: list = field(default_factory=list)
     deep: int = 0  # root only: tags dropped for nesting past MAX_DEPTH
+    cut: bool = False    # root only: parsing stopped at MAX_NODES
+    fault: bool = False  # root only: the parser raised and the tree is partial
+
+
+@dataclass
+class Ref(NoteRef):
+    """A link that may point at a note. The caller keeps it as a note reference when the target is a
+    note it collected and puts `inlines` (the link text) back otherwise."""
+    inlines: list = field(default_factory=list)
 
 
 # ---- decoding and tree building
@@ -76,6 +84,10 @@ def decode(data: bytes) -> str:
         return data.decode("utf-8", errors="replace")
 
 
+class _Stop(Exception):
+    pass
+
+
 class _Builder(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -83,6 +95,11 @@ class _Builder(HTMLParser):
         self.stack = [self.root]
         self.over = 0  # open elements past MAX_DEPTH: not materialized, only counted
         self.buf = []  # text pieces since the last tag
+        self.nodes = 0
+
+    def stop(self):
+        self.root.cut = True
+        raise _Stop
 
     def handle_starttag(self, tag, attrs):
         self._open(tag, attrs)
@@ -106,6 +123,9 @@ class _Builder(HTMLParser):
 
     def _open(self, tag, attrs):
         self.flush()
+        self.nodes += 1
+        if self.nodes > MAX_NODES:
+            self.stop()
         if self.over or len(self.stack) > limits.MAX_DEPTH:
             self.over += 1
             self.root.deep += 1
@@ -128,18 +148,69 @@ class _Builder(HTMLParser):
                 return
 
 
-_LONELY = re.compile(r"<(?=[^<>]*(?:<|$))")  # a "<" whose tag never closes before the next "<"
+_SPECIAL = re.compile(r"[\"'<>]")
+
+
+def _tag_end(s: str, i: int, dead: set) -> int:
+    """Index after the '>' that closes the tag opened by the '<' at i, or -1 when it never closes: a '<' met
+    outside quotes ends the attempt. `dead` remembers (position, quote) states known to fail, so a run of
+    failures costs one pass in all."""
+    p, q, trail = i + 1, "", []
+    while (p, q) not in dead:
+        trail.append((p, q))
+        if q:
+            j = s.find(q, p)
+            if j < 0:
+                break
+            p, q = j + 1, ""
+        else:
+            m = _SPECIAL.search(s, p)
+            if m is None or m.group() == "<":
+                break
+            if m.group() == ">":
+                return m.end()
+            p, q = m.end(), m.group()
+    dead.update(trail)
+    return -1
+
+
+def _escape_lonely(s: str) -> str:
+    """Text with every '<' that opens no complete tag or comment written as &lt;. The stdlib parser rescans
+    such runs and goes quadratic on "<a <a <a ..."; quotes inside a tag are honoured so alt="a<b" survives."""
+    parts, last, i, dead, no_comment_end = [], 0, 0, set(), False
+    while True:
+        i = s.find("<", i)
+        if i < 0:
+            break
+        if s.startswith("<!--", i):
+            j = -1 if no_comment_end else s.find("-->", i + 4)
+            if j >= 0:
+                i = j + 3
+                continue
+            no_comment_end = True
+        else:
+            end = _tag_end(s, i, dead)
+            if end >= 0:
+                i = end
+                continue
+        parts.append(s[last:i])
+        parts.append("&lt;")
+        last = i = i + 1
+    parts.append(s[last:])
+    return "".join(parts)
 
 
 def tree(data: bytes) -> Node:
-    """Node tree of a document. A "<" that opens no complete tag becomes text: the stdlib parser rescans
-    such runs and goes quadratic (or worse) on "<a <a <a ...". Nesting past MAX_DEPTH is flattened."""
+    """Node tree of a document, nesting past MAX_DEPTH flattened and parsing stopped at MAX_NODES elements
+    (root.cut). A parser fault keeps what was built (root.fault)."""
     p = _Builder()
     try:
-        p.feed(_LONELY.sub("&lt;", decode(data[:MAX_DOC])))
+        p.feed(_escape_lonely(decode(data[:MAX_DOC])))
         p.close()
-    except Exception:  # a parser fault keeps what was built so far
+    except _Stop:
         pass
+    except Exception:
+        p.root.fault = True
     p.flush()
     return p.root
 
@@ -166,120 +237,6 @@ def find(root: Node, tag: str):
                 return n
             stack.extend(reversed(n.children))
     return None
-
-
-# ---- CSS
-_SEL = re.compile(r"^([A-Za-z][A-Za-z0-9:\-]*)?(?:\.([\w\-]+))?$")
-
-
-def _strip_comments(s: str) -> str:
-    out, i = [], 0
-    while True:
-        j = s.find("/*", i)
-        if j < 0:
-            out.append(s[i:])
-            return "".join(out)
-        out.append(s[i:j])
-        k = s.find("*/", j + 2)
-        if k < 0:
-            return "".join(out)
-        i = k + 2
-
-
-def _rules(s: str):
-    """(prelude, body) of each top-level style rule; at-rules and anything nested in them are skipped."""
-    i, n = 0, len(s)
-    while i < n:
-        j = s.find("{", i)
-        if j < 0:
-            return
-        prelude = s[i:j].rsplit(";", 1)[-1].strip()
-        if prelude.startswith("@"):
-            depth, k = 1, j + 1
-            while depth and k < n:
-                a, b = s.find("{", k), s.find("}", k)
-                if b < 0:
-                    k = n
-                elif 0 <= a < b:
-                    depth, k = depth + 1, a + 1
-                else:
-                    depth, k = depth - 1, b + 1
-            i = k
-            continue
-        k = s.find("}", j + 1)
-        if k < 0:
-            k = n
-        yield prelude, s[j + 1:k]
-        i = k + 1
-
-
-def _decls(body: str) -> dict:
-    """{display|font-weight: (value, important)} of one declaration block; the last one wins unless !important."""
-    out = {}
-    for d in body[:10_000].split(";"):
-        name, sep, val = d.partition(":")
-        name = name.strip().lower()
-        if not sep or name not in ("display", "font-weight"):
-            continue
-        val, imp = val.strip().lower(), False
-        if "!important" in val:
-            val, imp = val.replace("!important", "").strip(), True
-        if name not in out or imp or not out[name][1]:
-            out[name] = (val, imp)
-    return out
-
-
-class Css:
-    """Selectors tag, .class, tag.class and comma lists for display and font-weight; the rest is ignored."""
-
-    def __init__(self, sheets: list[str]):
-        self._idx: dict = {}  # (tag, class) -> {prop: (important, order, value)}
-        n = order = 0
-        for sheet in sheets:
-            for prelude, body in _rules(_strip_comments(sheet[:MAX_SHEET])):
-                props = _decls(body)
-                if not props:
-                    continue
-                order += 1
-                for sel in prelude.split(","):
-                    m = _SEL.match(sel.strip())
-                    if not m or not (m.group(1) or m.group(2)):
-                        continue
-                    n += 1
-                    if n > MAX_SELECTORS:
-                        return
-                    slot = self._idx.setdefault(((m.group(1) or "").lower(), m.group(2) or ""), {})
-                    for name, (val, imp) in props.items():
-                        if name not in slot or (imp, order) >= slot[name][:2]:
-                            slot[name] = (imp, order, val)
-
-    def _props(self, node) -> dict:
-        best = {}  # prop -> (rank, value)
-
-        def put(slot, spec):
-            for name, (imp, order, val) in slot.items():
-                rank = (imp, 0, spec, order)
-                if name not in best or rank > best[name][0]:
-                    best[name] = (rank, val)
-        if self._idx:
-            tag = node.tag
-            put(self._idx.get((tag, ""), {}), (0, 1))
-            for c in node.attrs.get("class", "").split()[:32]:
-                put(self._idx.get(("", c), {}), (1, 0))
-                put(self._idx.get((tag, c), {}), (1, 1))
-        for name, (val, imp) in _decls(node.attrs.get("style", "")).items():
-            rank = (imp, 1, (2, 2), 0)
-            if name not in best or rank > best[name][0]:
-                best[name] = (rank, val)
-        return {k: v[1] for k, v in best.items()}
-
-    def display_none(self, node, ancestors) -> bool:
-        """True when node, or any of `ancestors`, has display:none."""
-        return any(self._props(n).get("display") == "none" for n in (node, *ancestors))
-
-    def bold(self, node) -> bool:
-        v = self._props(node).get("font-weight", "")
-        return v in ("bold", "bolder") or (v.isdigit() and int(v) >= 600)
 
 
 # ---- helpers
@@ -347,7 +304,7 @@ class _Walk:
     # ---- notes and hidden
     def note_key(self, href: str):
         file, _, frag = href.partition("#")
-        if not frag:
+        if not frag or file.startswith("/") or "\\" in file:
             return None
         return (resolve(self.part, file) if file and self.part else self.part) + "#" + frag
 
@@ -424,19 +381,20 @@ class _Walk:
 
     def anchor(self, k, cur, imgs):
         href = k.attrs.get("href", "").strip()
-        if _types(k) & NOTEREF_TYPES:
-            key = self.note_key(href)
-            if key:
-                cur.append(NoteRef(key))
-                return
         m = _SCHEME.match(href)
         if m and m.group(1).lower() in EXTERNAL:
             url = re.sub(r"[\s()<>]", lambda x: "%%%02X" % ord(x.group()), href[:MAX_URL])
             sub = []
             self.inl_children(k, sub, imgs)
             cur.append(Link(url, sub))
-        else:
+            return
+        key = None if m else self.note_key(href)
+        if key is None:
             self.inl_children(k, cur, imgs)
+            return
+        sub = []
+        self.inl_children(k, sub, imgs)
+        cur.append(Ref(key, sub))
 
     def image(self, k):
         src = (k.attrs.get("src") or k.attrs.get("href") or k.attrs.get("xlink:href") or "").strip()
@@ -571,7 +529,7 @@ class _Walk:
                     collect(c, d + 1)
         collect(k, 0)
         cells = [[c for c in tr.children if isinstance(c, Node) and c.tag in ("td", "th")] for tr in rows]
-        cap = max(max((len(r) for r in cells), default=0), 16)  # a span never needs to reach past the real grid
+        width = max(max((len(r) for r in cells), default=0), 1)  # a span never reaches past the real grid
         built, hidden_rows = [], set()
         for r, row in enumerate(cells):
             if self.hid(rows[r]):
@@ -582,7 +540,7 @@ class _Walk:
                 rs = len(cells) - r if rs == 0 else min(rs, len(cells) - r)
                 blocks = []
                 self.flow(c.children, blocks, 0, None)
-                line.append(Cell(blocks, max(1, rs), min(max(1, _int(c.attrs.get("colspan"), 1)), cap), c.tag == "th"))
+                line.append(Cell(blocks, max(1, rs), min(max(1, _int(c.attrs.get("colspan"), 1)), width), c.tag == "th"))
             built.append(line)
         if any(built):
             out.append(Table(built, caption, frozenset(hidden_rows)))
@@ -595,8 +553,11 @@ def blocks(root: Node, *, css: Css, load: Callable[[str], bytes | None], notes: 
     w = _Walk(css, load, notes, ctx, part)
     out = []
     w.flow((find(root, "body") or root).children, out, 0, None)
-    if root.deep:
-        ctx.skipped["depth"] += root.deep
-        if ctx.skipped["depth"] == root.deep:
-            ctx.warnings.append("depth: skipped content nested too deeply")
+    for kind, n, msg in (("depth", root.deep, "skipped content nested too deeply"),
+                         ("node", root.cut, "stopped at the element limit of one document"),
+                         ("parse", root.fault, "the parser failed; part of a document is missing")):
+        if n:
+            ctx.skipped[kind] += int(n)
+            if ctx.skipped[kind] == int(n):
+                ctx.warnings.append(f"{kind}: {msg}")
     return out
