@@ -11,6 +11,8 @@ SHEET_ROWS = 100_000
 SHEET_COLS = 1_000        # columns one sheet row may reach
 SHEET_CELLS = 500_000     # cells one document's sheets may materialize
 SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one document's sheets may materialize
+GRID_COLS = 1_000        # columns a span may reach in a rendered table
+GRID_SLOTS = 2_000_000    # grid slots all spans of one rendered table may cover
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 
 

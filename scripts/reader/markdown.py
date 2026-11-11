@@ -342,7 +342,10 @@ class _Render:
         covered = set()
         origins = {}
         texty = {}  # id(blocks) -> has text; a cell shared by many slots is scanned once
-        width = max((len(row) for row in t.rows), default=0)
+        widest = max((len(row) for row in t.rows), default=0)
+        spanned = max((sum(min(max(1, x.colspan), limits.GRID_COLS) for x in row) for row in t.rows), default=0)
+        width = max(widest, min(spanned, limits.GRID_COLS), 1)
+        slots = 0
         sizes, est = {}, 0  # est: text the origins so far will render; past the cap more rows are pointless
         for r, row in enumerate(t.rows):
             if self.size + est > limits.MAX_OUTPUT:
@@ -356,7 +359,10 @@ class _Render:
                 while (r, c) in covered:
                     c += 1
                 rs = min(max(1, cell.rowspan), len(t.rows) - r)
-                cs = min(max(1, cell.colspan), max(1, width))
+                cs = min(max(1, cell.colspan), width)
+                if slots + rs * cs > limits.GRID_SLOTS:
+                    rs = cs = 1
+                slots += rs * cs
                 origins[(r, c)] = (cell, rs, cs)
                 for dr in range(rs):
                     for dc in range(cs):

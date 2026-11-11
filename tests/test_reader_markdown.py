@@ -112,6 +112,24 @@ def test_merged_table_html():
     assert R(doc) == '<table>\n<tr><td rowspan="2">a&lt;&amp;</td><td>b</td></tr>\n<tr><td>d</td></tr>\n</table>\n'
 
 
+def test_span_kept_in_one_row_table():
+    out = R(Doc(blocks=[Table([[Cell([P("a")], colspan=2), Cell([P("b")])]])]))
+    assert '<td colspan="2">a</td>' in out and "<td>b</td>" in out, out
+
+
+def test_huge_spans_render_fast():
+    import time
+    row = [Cell([P("x")], rowspan=9999999, colspan=9999999) for _ in range(5)]
+    t0 = time.time()
+    out = R(Doc(blocks=[Table([list(row) for _ in range(50)])]))
+    assert time.time() - t0 < 5 and "x" in out
+
+
+def test_wide_row_keeps_all_cells():
+    out = R(Doc(blocks=[Table([[c(str(i)) for i in range(5000)]])]))
+    assert "4999" in out and out.count("|") > 5000
+
+
 def test_one_by_one_and_one_column():
     assert R(t([["only"]])) == "only\n"
     assert R(t([["only", ""], ["", ""]])) == "only\n"
@@ -208,7 +226,7 @@ def test_span_is_clamped():
     t0 = time.time()
     doc = Doc(blocks=[Table([[c("a", rowspan=10**6, colspan=10**6), c("b")], [c("d")]])])
     out = R(doc)
-    assert time.time() - t0 < 1 and 'rowspan="2"' in out and "colspan" not in out.replace('colspan="2"', "")
+    assert time.time() - t0 < 1 and 'rowspan="2"' in out and f'colspan="{limits.GRID_COLS}"' in out
 
 
 def test_cell_heading_and_alt_escaped():
