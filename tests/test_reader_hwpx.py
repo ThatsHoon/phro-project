@@ -1,0 +1,346 @@
+"""HWPX parser: text, headings, numbering, tables, objects, notes, fields and limits.
+
+Run: python -I -X utf8 tests/test_reader_hwpx.py
+"""
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HERE / "scripts"))
+sys.path.insert(0, str(Path(__file__).parent))
+
+import reader  # noqa: E402
+from reader import markdown  # noqa: E402
+from reader.limits import ReadError  # noqa: E402
+from reader.model import Context  # noqa: E402
+from reader.formats import hwpx  # noqa: E402
+from reader_fix import make_zip  # noqa: E402
+
+NS = ('xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" '
+      'xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" '
+      'xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" '
+      'xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" '
+      'xmlns:opf="http://www.idpf.org/2007/opf/"')
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+NONE4 = "".join(f'<hh:{s}Border type="NONE"/>' for s in ("left", "right", "top", "bottom"))
+
+
+def tmp():
+    return Path(tempfile.mkdtemp())
+
+
+def hwpx_doc(section_xml, header_xml="", hpf_items="", extra=None):
+    hpf = (f'<?xml version="1.0"?><opf:package {NS}><opf:manifest>'
+           '<opf:item id="header" href="Contents/header.xml" media-type="application/xml"/>'
+           '<opf:item id="section0" href="Contents/section0.xml" media-type="application/xml"/>'
+           f'{hpf_items}</opf:manifest></opf:package>')
+    members = {
+        "mimetype": "application/hwp+zip",
+        "Contents/content.hpf": hpf,
+        "Contents/header.xml": f'<hh:head {NS}><hh:refList>{header_xml}</hh:refList></hh:head>',
+        "Contents/section0.xml": f'<hs:sec {NS}>{section_xml}</hs:sec>',
+    }
+    members.update(extra or {})
+    return make_zip(tmp() / "a.hwpx", members)
+
+
+def P(text, pr="0", style="0", run="0"):
+    return (f'<hp:p paraPrIDRef="{pr}" styleIDRef="{style}"><hp:run charPrIDRef="{run}">'
+            f'<hp:t>{text}</hp:t></hp:run></hp:p>')
+
+
+def parse(path):
+    ctx = Context()
+    return hwpx.parse(Path(path), ctx), ctx
+
+
+def md(path, hidden=False):
+    doc, _ = parse(path)
+    return markdown.render(doc, tmp() / "assets", hidden)
+
+
+def test_registered():
+    assert "hwpx" in reader.BUILT and len(reader.FORMATS) == 28
+
+
+def test_text_tail_and_tab():
+    p = hwpx_doc('<hp:p><hp:run><hp:t>가<hp:tab/>나</hp:t></hp:run></hp:p>')
+    assert md(p) == "가\t나\n"
+    p = hwpx_doc('<hp:p><hp:run><hp:t>a<hp:fwSpace/>b<hp:lineBreak/>c</hp:t></hp:run></hp:p>')
+    assert md(p) == "a b\nc\n"
+
+
+def test_bold_run():
+    p = hwpx_doc(P("굵게", run="1") + P("보통"), '<hh:charPr id="1"><hh:bold/></hh:charPr>')
+    assert md(p) == "**굵게**\n\n보통\n"
+
+
+def test_outline_heading():
+    hdr = '<hh:paraPr id="1"><hh:heading type="OUTLINE" idRef="0" level="0"/></hh:paraPr>'
+    assert md(hwpx_doc(P("제목", pr="1"), hdr)) == "# 제목\n"
+    hdr = '<hh:paraPr id="1"><hh:heading type="OUTLINE" idRef="0" level="8"/></hh:paraPr>'
+    assert md(hwpx_doc(P("깊음", pr="1"), hdr)) == "###### 깊음\n"
+
+
+def test_style_name_heading():
+    hdr = ('<hh:style id="3" name="개요 2" paraPrIDRef="0"/>'
+           '<hh:style id="4" name="제목" paraPrIDRef="0"/>'
+           '<hh:style id="5" name="부제목" paraPrIDRef="0"/>')
+    assert md(hwpx_doc(P("가", style="3") + P("나", style="4") + P("다", style="5"), hdr)) \
+        == "## 가\n\n# 나\n\n## 다\n"
+
+
+def test_long_outline_demoted():
+    hdr = '<hh:style id="2" name="개요 2" paraPrIDRef="0"/>'
+    out = md(hwpx_doc(P("가" * 149 + "다.", style="2"), hdr))
+    assert "#" not in out and out.startswith("가")
+    out = md(hwpx_doc(P("가" * 41 + "?", style="2"), hdr))
+    assert "#" not in out
+    assert md(hwpx_doc(P("가" * 41, style="2"), hdr)).startswith("## ")
+
+
+def test_no_heading_in_cell():
+    hdr = '<hh:paraPr id="1"><hh:heading type="OUTLINE" idRef="0" level="0"/></hh:paraPr>'
+    cell = (f'<hp:tc><hp:subList>{P("칸", pr="1")}</hp:subList><hp:cellAddr colAddr="0" rowAddr="0"/></hp:tc>'
+            f'<hp:tc><hp:subList>{P("옆")}</hp:subList><hp:cellAddr colAddr="1" rowAddr="0"/></hp:tc>')
+    row2 = (f'<hp:tc><hp:subList>{P("아래")}</hp:subList><hp:cellAddr colAddr="0" rowAddr="1"/></hp:tc>'
+            f'<hp:tc><hp:subList>{P("끝")}</hp:subList><hp:cellAddr colAddr="1" rowAddr="1"/></hp:tc>')
+    sec = f'<hp:p><hp:run><hp:tbl><hp:tr>{cell}</hp:tr><hp:tr>{row2}</hp:tr></hp:tbl></hp:run></hp:p>'
+    out = md(hwpx_doc(sec, hdr))
+    assert "#" not in out and "|칸|옆|" in out
+
+
+NUM = ('<hh:numbering id="1"><hh:paraHead level="1" start="1" numFormat="DIGIT">^1.</hh:paraHead>'
+       '<hh:paraHead level="2" start="1" numFormat="DIGIT">^2)</hh:paraHead></hh:numbering>'
+       '<hh:paraPr id="1"><hh:heading type="NUMBER" idRef="1" level="0"/></hh:paraPr>'
+       '<hh:paraPr id="2"><hh:heading type="NUMBER" idRef="1" level="1"/></hh:paraPr>'
+       '<hh:paraPr id="3"><hh:heading type="BULLET" idRef="1" level="0"/></hh:paraPr>')
+
+
+def test_numbering_counters():
+    sec = P("a", pr="1") + P("b", pr="1") + P("c", pr="2") + P("d", pr="1") + P("e", pr="2")
+    assert md(hwpx_doc(sec, NUM)) == "1. a\n2. b\n  1) c\n3. d\n  1) e\n"
+    out = md(hwpx_doc(P("1. x", pr="1"), NUM))
+    assert out == "1. x\n"
+    assert md(hwpx_doc(P("점", pr="3"), NUM)) == "- 점\n"
+
+
+def test_numbering_formats():
+    want = {"CIRCLED_DIGIT": ("①", "②"), "ROMAN_CAPITAL": ("I", "II"), "ROMAN_SMALL": ("i", "ii"),
+            "LATIN_CAPITAL": ("A", "B"), "LATIN_SMALL": ("a", "b"), "HANGUL_SYLLABLE": ("가", "나"),
+            "HANGUL_JAMO": ("ㄱ", "ㄴ"), "WEIRD": ("1", "2")}
+    for f, (m1, m2) in want.items():
+        hdr = (f'<hh:numbering id="1"><hh:paraHead level="1" start="1" numFormat="{f}">^1</hh:paraHead>'
+               '</hh:numbering><hh:paraPr id="1"><hh:heading type="NUMBER" idRef="1" level="0"/></hh:paraPr>')
+        assert md(hwpx_doc(P("x", pr="1") + P("y", pr="1"), hdr)) == f"{m1} x\n{m2} y\n", f
+
+
+def _tc(text, col, row, cs=1, rs=1, header="0", bf="0"):
+    return (f'<hp:tc header="{header}" borderFillIDRef="{bf}"><hp:subList>{P(text)}</hp:subList>'
+            f'<hp:cellAddr colAddr="{col}" rowAddr="{row}"/><hp:cellSpan colSpan="{cs}" rowSpan="{rs}"/></hp:tc>')
+
+
+def _tbl(*rows):
+    return '<hp:p><hp:run><hp:tbl>' + "".join(f"<hp:tr>{r}</hp:tr>" for r in rows) + '</hp:tbl></hp:run></hp:p>'
+
+
+def test_merged_table():
+    sec = _tbl(_tc("합", 0, 0, rs=2) + _tc("우", 1, 0), _tc("하", 1, 1))
+    out = md(hwpx_doc(sec))
+    assert out.count('<td rowspan="2">') == 1 and "<td>우</td>" in out and "<td>하</td>" in out
+
+
+def test_header_cell_pipe_table():
+    sec = _tbl(_tc("머", 0, 0, header="1") + _tc("리", 1, 0, header="1"), _tc("값", 0, 1) + _tc("둘", 1, 1))
+    doc, _ = parse(hwpx_doc(sec))
+    assert doc.blocks[0].rows[0][0].header and not doc.blocks[0].rows[1][0].header
+    assert "|머|리|\n|---|---|\n|값|둘|" in md(hwpx_doc(sec))
+
+
+def test_layout_table_unwrapped():
+    hdr = f'<hh:borderFill id="5">{NONE4}</hh:borderFill>'
+    sec = _tbl(_tc("왼쪽", 0, 0, bf="5") + _tc("오른쪽", 1, 0, bf="5"))
+    assert md(hwpx_doc(sec, hdr)) == "왼쪽\n\n오른쪽\n"
+    # a bordered one-row table stays a table
+    hdr = '<hh:borderFill id="5"><hh:leftBorder type="SOLID"/></hh:borderFill>'
+    assert "왼쪽" in md(hwpx_doc(sec, hdr)) and "|" in md(hwpx_doc(sec, hdr))
+
+
+def test_switch_case():
+    sec = ('<hp:p><hp:run><hp:switch>'
+           '<hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/unknown"><hp:t>X</hp:t></hp:case>'
+           '<hp:default><hp:t>Y</hp:t></hp:default></hp:switch></hp:run></hp:p>')
+    assert md(hwpx_doc(sec)) == "Y\n"
+    sec = sec.replace("2016/unknown", "2016/paragraph")
+    assert md(hwpx_doc(sec)) == "X\n"
+
+
+def test_image_and_auto_alt():
+    items = '<opf:item id="image1" href="BinData/image1.png" media-type="image/png"/>'
+    pic = '<hp:p><hp:run><hp:pic><hp:shapeComment>%s</hp:shapeComment><hc:img binaryItemIDRef="image1"/></hp:pic></hp:run></hp:p>'
+    p = hwpx_doc(pic % "그림입니다.", hpf_items=items, extra={"BinData/image1.png": PNG})
+    assert md(p) == "![](assets/img-001.png)\n"
+    p = hwpx_doc(pic % "회사 로고", hpf_items=items, extra={"BinData/image1.png": PNG})
+    assert md(p) == "![회사 로고](assets/img-001.png)\n"
+
+
+def test_footnote():
+    sec = ('<hp:p><hp:run><hp:t>본문</hp:t><hp:ctrl><hp:footNote><hp:subList>'
+           + P("주석") + '</hp:subList></hp:footNote></hp:ctrl></hp:run></hp:p>')
+    assert md(hwpx_doc(sec)) == "본문[^1]\n\n[^1]: 주석\n"
+    doc, _ = parse(hwpx_doc(sec))
+    assert list(doc.notes) == ["fn-1"]
+
+
+def test_endnote_and_comment():
+    sec = ('<hp:p><hp:run><hp:t>본</hp:t><hp:ctrl><hp:endNote><hp:subList>' + P("끝") + '</hp:subList></hp:endNote></hp:ctrl>'
+           '<hp:ctrl><hp:hiddenComment><hp:subList>' + P("메모") + '</hp:subList></hp:hiddenComment></hp:ctrl></hp:run></hp:p>')
+    doc, _ = parse(hwpx_doc(sec))
+    assert list(doc.notes) == ["en-1", "cm-1"]
+    out = md(hwpx_doc(sec))
+    assert "[^1]: 끝" in out and "[^2]: Comment: 메모" in out
+
+
+def test_header_footer():
+    sec = ('<hp:p><hp:run><hp:ctrl><hp:header><hp:subList>' + P("머리말") + '</hp:subList></hp:header></hp:ctrl>'
+           '<hp:ctrl><hp:footer><hp:subList>' + P("꼬리말") + '</hp:subList></hp:footer></hp:ctrl>'
+           '<hp:t>본문</hp:t></hp:run></hp:p>')
+    doc, _ = parse(hwpx_doc(sec))
+    assert doc.headers == ["머리말"] and doc.footers == ["꼬리말"]
+
+
+def _field(fid, ftype, cmd=None):
+    params = f'<hp:parameters><hp:stringParam name="Command">{cmd}</hp:stringParam></hp:parameters>' if cmd else ""
+    return f'<hp:ctrl><hp:fieldBegin id="{fid}" type="{ftype}">{params}</hp:fieldBegin></hp:ctrl>'
+
+
+def _fend(fid):
+    return f'<hp:ctrl><hp:fieldEnd beginIDRef="{fid}"/></hp:ctrl>'
+
+
+def test_hyperlink_field():
+    sec = ('<hp:p><hp:run><hp:t>앞 </hp:t>' + _field(7, "HYPERLINK", "https://example.com;1;0;0;")
+           + '<hp:t>링크</hp:t>' + _fend(7) + '<hp:t> 뒤</hp:t></hp:run></hp:p>')
+    assert md(hwpx_doc(sec)) == "앞 [링크](https://example.com) 뒤\n"
+    sec = sec.replace("https://example.com;1", r"http\://a.b/x\;y;1")
+    assert "(http://a.b/x;y)" in md(hwpx_doc(sec))
+
+
+def test_click_here_dropped():
+    sec = ('<hp:p><hp:run>' + _field(3, "CLICK_HERE") + '<hp:t>여기에 입력</hp:t>' + _fend(3)
+           + '<hp:t>남음</hp:t></hp:run></hp:p>')
+    assert md(hwpx_doc(sec)) == "남음\n"
+
+
+def test_track_change_deleted():
+    sec = ('<hp:p><hp:run><hp:t>새<hp:deleteBegin Id="1"/>옛<hp:deleteEnd/>글</hp:t></hp:run></hp:p>')
+    out = md(hwpx_doc(sec))
+    assert out.splitlines()[0] == "(1 hidden places left out)" and "옛" not in out and "새글" in out
+    assert "(hidden: 옛)" in md(hwpx_doc(sec), hidden=True)
+
+
+CHART = ('<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea>'
+         '<c:barChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>S</c:v></c:pt></c:strCache></c:strRef></c:tx>'
+         '<c:cat><c:strRef><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>A</c:v></c:pt></c:strCache></c:strRef></c:cat>'
+         '<c:val><c:numRef><c:numCache><c:ptCount val="1"/><c:pt idx="0"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>'
+         '</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>')
+
+
+def test_chart():
+    sec = ('<hp:p><hp:run><hp:switch>'
+           '<hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/ooxmlchart">'
+           '<hp:chart chartIDRef="Chart/chart1.xml"/></hp:case><hp:default><hp:t>대체</hp:t></hp:default>'
+           '</hp:switch></hp:run></hp:p>')
+    out = md(hwpx_doc(sec, extra={"Chart/chart1.xml": CHART}))
+    assert "Chart: bar" in out and "대체" not in out and "|A|5|" in out
+
+
+def test_equation():
+    eq = '<hp:p><hp:run><hp:equation><hp:script>%s</hp:script></hp:equation>%s</hp:run></hp:p>'
+    assert md(hwpx_doc(eq % ("a over b", ""))) == "$$\\frac{a}{b}$$\n"
+    assert "값 $\\frac{a}{b}$" in md(hwpx_doc('<hp:p><hp:run><hp:t>값 </hp:t><hp:equation><hp:script>a over b</hp:script></hp:equation></hp:run></hp:p>'))
+
+
+def test_equation_script_to_tex():
+    tex = hwpx._tex
+    assert tex("a over b") == r"\frac{a}{b}"
+    assert tex("{a+b} over {c}") == r"\frac{a+b}{c}"
+    assert tex("sqrt x") == r"\sqrt{x}"
+    assert tex("sqrt {x+1}") == r"\sqrt{x+1}"
+    assert tex("x^2 + y_1") == "x^2 + y_1"
+    assert tex("a times b le c ge d") == r"a \times b \le c \ge d"
+    assert tex("alpha + Omega + omega") == r"\alpha + \Omega + \omega"
+    assert tex("foo bar") == "foo bar"
+    assert tex("{" * 500 + "a" + "}" * 500)  # deep groups do not recurse forever
+
+
+def test_text_box():
+    sec = ('<hp:p><hp:run><hp:rect><hp:drawText><hp:subList>' + P("상자 글") + '</hp:subList></hp:drawText></hp:rect>'
+           '<hp:t>밖</hp:t></hp:run></hp:p>')
+    out = md(hwpx_doc(sec))
+    assert "상자 글" in out and "밖" in out
+
+
+def test_depth_counted_not_recursion_error():
+    inner = P("바닥")
+    for _ in range(80):
+        inner = f'<hp:p><hp:run><hp:rect><hp:drawText><hp:subList>{inner}</hp:subList></hp:drawText></hp:rect></hp:run></hp:p>'
+    doc, ctx = parse(hwpx_doc(inner))
+    assert ctx.skipped["depth"] >= 1 and any(w.startswith("depth") for w in ctx.warnings)
+    assert "바닥" not in markdown.render(doc, tmp() / "a")
+
+
+def test_section_order_and_damaged_section():
+    items = '<opf:item id="section1" href="Contents/section1.xml" media-type="application/xml"/>'
+    p = hwpx_doc(P("하나"), hpf_items=items, extra={"Contents/section1.xml": f'<hs:sec {NS}>{P("둘")}</hs:sec>'})
+    assert md(p) == "하나\n\n둘\n"
+    p = hwpx_doc(P("하나"), hpf_items=items, extra={"Contents/section1.xml": "<broken"})
+    # a section that fails to parse is damaged input, not a crash
+    try:
+        parse(p)
+        raise AssertionError("expected ReadError")
+    except ReadError as e:
+        assert e.kind == "damaged"
+
+
+def test_section_fallback_without_manifest_entries():
+    members = {"mimetype": "application/hwp+zip",
+               "Contents/section1.xml": f'<hs:sec {NS}>{P("둘")}</hs:sec>',
+               "Contents/section0.xml": f'<hs:sec {NS}>{P("하나")}</hs:sec>'}
+    assert md(make_zip(tmp() / "b.hwpx", members)) == "하나\n\n둘\n"
+
+
+def test_encrypted_manifest():
+    p = hwpx_doc(P("x"), extra={"META-INF/manifest.xml": "<manifest><encryption-data/></manifest>"})
+    try:
+        parse(p)
+        raise AssertionError("expected ReadError")
+    except ReadError as e:
+        assert e.kind == "encrypted"
+
+
+def test_hwpx_not_a_package():
+    p = make_zip(tmp() / "c.hwpx", {"readme.txt": "hi"})
+    try:
+        parse(p)
+        raise AssertionError("expected ReadError")
+    except ReadError as e:
+        assert e.kind == "damaged" and "not a hwpx package" in e.detail
+
+
+def test_hpf_marks_package_without_mimetype():
+    members = {"Contents/content.hpf": f'<opf:package {NS}><opf:manifest/></opf:package>',
+               "Contents/section0.xml": f'<hs:sec {NS}>{P("본")}</hs:sec>'}
+    assert md(make_zip(tmp() / "d.hwpx", members, stored=())) == "본\n"
+
+
+def main():
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+    print("pass")
+
+
+if __name__ == "__main__":
+    main()

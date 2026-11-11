@@ -203,6 +203,20 @@ def test_cache_hit_no_child():
         assert out(d)["permissionDecision"] == "allow"
 
 
+def test_gate_wrong_content():
+    """A binary-looking file that is not a zip is denied as damaged by the real child."""
+    old = os.environ.get("PHRO_READER_CACHE")
+    os.environ["PHRO_READER_CACHE"] = str(tmp())
+    try:
+        o = out(gate.decide(ev(put("bad.hwpx", b"PK\x03\x04" + b"\x00" * 64 + b"not a zip"))))
+    finally:
+        if old is None:
+            os.environ.pop("PHRO_READER_CACHE", None)
+        else:
+            os.environ["PHRO_READER_CACHE"] = old
+    assert o["permissionDecision"] == "deny" and "looks damaged" in o["permissionDecisionReason"]
+
+
 def test_timeout_denies():
     with stub():
         d = gate.decide(ev(sample()), command=[sys.executable, "-c", "import time; time.sleep(5)"], timeout=1)

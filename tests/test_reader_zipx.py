@@ -35,7 +35,7 @@ def test_formats_cover_scope():
     assert len(reader.FORMATS) == 28 and not (set(reader.FORMATS) & reader.SKILL_EXTS)
     assert reader.ext_of("C:/x/A.HWPX") == "hwpx"
     assert reader.ext_of("C:/x/noext") == ""
-    assert reader.BUILT == set()
+    assert reader.BUILT <= set(reader.FORMATS)
 
 
 def test_read_and_case_insensitive_lookup():
