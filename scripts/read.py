@@ -1,13 +1,13 @@
-"""CLI for the document reader: convert | formats | prune."""
+"""CLI for the document reader: convert | formats | prune | hook."""
 import argparse
 import contextlib
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
-from reader import cache  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 
 
@@ -16,6 +16,7 @@ def _flat(x) -> str:
 
 
 def cmd_convert(a) -> int:
+    from reader import cache
     src = Path(a.file)
     try:
         # a stray print in a format module must not reach the protocol stream
@@ -47,7 +48,24 @@ def cmd_formats(a) -> int:
 
 
 def cmd_prune(a) -> int:
+    from reader import cache
     print(f"PRUNED\t{cache.prune(a.days)}")
+    return 0
+
+
+def cmd_hook(a) -> int:
+    from reader import gate
+    try:
+        event = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
+    except ValueError:
+        return 0
+    try:
+        out = gate.decide(event)
+    except Exception as e:  # noqa: BLE001
+        p = gate.scope(event)
+        out = gate.deny_text(p, f"damaged: internal error {type(e).__name__}") if p else None
+    if out is not None:
+        print(json.dumps(out, ensure_ascii=False))
     return 0
 
 
@@ -65,6 +83,7 @@ def main(argv=None) -> int:
     pr = sub.add_parser("prune")
     pr.add_argument("--days", type=int, default=30)
     pr.set_defaults(fn=cmd_prune)
+    sub.add_parser("hook").set_defaults(fn=cmd_hook)
     a = p.parse_args(argv)
     return a.fn(a)
 
