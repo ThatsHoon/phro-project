@@ -4,16 +4,21 @@
 A project's first use copies the plugin to ~/phro-project_<project> and turns it on for that project alone, so what a project builds never enters the original.
 
   clone.py ensure <project root> [--dest DIR] [--no-register]   make this project's copy if it has none, and say which plugin to use
-  clone.py sync [--from DIR]                                    run from a copy: take a newer original, keeping what the project added or changed
+  clone.py sync [--from DIR] [--dry-run]                        run from a copy: take a newer original, keeping what the project added or changed
+
+Updates flow one way, from the original into a copy. What a project adds to or changes in its copy is its own and never goes back.
 """
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -21,7 +26,7 @@ ORIGIN = "origin.json"
 MANIFEST = ".claude-plugin/plugin.json"
 MARKET = ".claude-plugin/marketplace.json"
 OWN = {ORIGIN, MANIFEST, MARKET}  # written for each copy, so a sync leaves them to this script
-IGNORE = {".git", "__pycache__", ".phro-project", "results", ".venv", "node_modules"}
+IGNORE = {".git", "__pycache__", ".phro-project", "results", ".venv", "node_modules", ".superpowers", ".worktrees"}  # folder or file names; a worktree's .git is a file
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 
@@ -39,12 +44,42 @@ def files_of(root):
         dirs[:] = [d for d in dirs if d not in IGNORE]
         for name in files:
             rel = (Path(folder) / name).relative_to(root).as_posix()
-            if rel not in OWN:
+            if rel not in OWN and name not in IGNORE:
                 yield rel
 
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+
+
+def tree_id(root):
+    """One hash for every file a copy would take, so a changed original shows without a new version number."""
+    h = hashlib.sha256()
+    for rel in sorted(files_of(root)):
+        h.update(f"{rel}\0{digest(root / rel)}\n".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def git(root, *args):
+    if not shutil.which("git"):
+        return None
+    done = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def git_origin(root):
+    """The repository and its published ref, when the original is the top of a git checkout, so a copy follows what was committed, not a worktree that may go away."""
+    if git(root, "rev-parse", "--show-prefix") != "":
+        return None
+    repo = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
+    ref = next((r for r in ("origin/main", "main") if git(repo, "rev-parse", "--verify", "-q", r)), None)
+    return (repo, ref) if ref else None
+
+
+def export(repo, ref, dest):
+    data = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", ref], capture_output=True, check=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        tar.extractall(dest, filter="data")
 
 
 def same_path(a, b):
@@ -69,6 +104,16 @@ def place_for(project, parent, original):
 
 def create(project, folder, source=HERE):
     """A copy that loads in place: its own marketplace at its root, with the plugin at ./, so an edit needs only /reload-plugins."""
+    found = git_origin(source)
+    if found:
+        with tempfile.TemporaryDirectory() as scratch:
+            export(*found, scratch)
+            return make(project, folder, Path(scratch), {"origin_dir": str(source), "origin_repo": str(found[0]), "origin_ref": found[1],
+                                                         "origin_id": git(found[0], "rev-parse", found[1])})
+    return make(project, folder, source, {"origin_dir": str(source), "origin_id": tree_id(source)})
+
+
+def make(project, folder, source, where):
     temporary = folder.with_name(folder.name + ".tmp")
     shutil.rmtree(temporary, ignore_errors=True)
     files = {}
@@ -86,7 +131,7 @@ def create(project, folder, source=HERE):
     write_json(temporary / MANIFEST, manifest)
     owner = manifest.get("author") or {"name": original}
     write_json(temporary / MARKET, {"name": folder.name, "owner": owner, "description": f"Holds this project's own copy of {original}.", "plugins": [{"name": folder.name, "source": "./", "description": manifest["description"]}]})
-    write_json(temporary / ORIGIN, {"origin": original, "origin_dir": str(source), "version": version, "project": str(project), "files": files})
+    write_json(temporary / ORIGIN, {"origin": original, **where, "version": version, "project": str(project), "files": files})
     temporary.rename(folder)
 
 
@@ -138,9 +183,28 @@ def newest_origin(record):
     found = [start] if (start / MANIFEST).is_file() else []
     if start.parent.is_dir():
         found += [p for p in start.parent.iterdir() if VERSION.fullmatch(p.name) and (p / MANIFEST).is_file()]
-    if not found:
-        sys.exit(f"FAILED\tno original found near {start}: pass --from")
-    return max(found, key=lambda p: tuple(int(n) for n in read_json(p / MANIFEST)["version"].split(".")))
+    return max(found, key=lambda p: tuple(int(n) for n in read_json(p / MANIFEST)["version"].split(".")), default=None)
+
+
+def repo_of(record):
+    """A record's git original, also for a copy made before records named one."""
+    if record.get("origin_repo"):
+        return Path(record["origin_repo"]), record["origin_ref"]
+    return git_origin(Path(record["origin_dir"])) if Path(record["origin_dir"]).is_dir() else None
+
+
+def newer(record):
+    """What is ahead of this copy, or None: a new commit on the original's ref, or an original folder that changed or has a newer version."""
+    found = repo_of(record)
+    if found:
+        commit = git(found[0], "rev-parse", found[1])
+        return commit[:7] if commit and commit != record.get("origin_id") else None
+    source = newest_origin(record)
+    if source is None:
+        return None
+    if not same_path(source, record["origin_dir"]) or tree_id(source) != record.get("origin_id"):
+        return read_json(source / MANIFEST)["version"]
+    return None
 
 
 def command_sync(a):
@@ -148,18 +212,45 @@ def command_sync(a):
         print("FAILED\tthis is the original: run sync from a project's copy")
         sys.exit(1)
     record = read_json(HERE / ORIGIN)
-    source = Path(a.source).resolve() if a.source else newest_origin(record)
+    with tempfile.TemporaryDirectory() as scratch:
+        found = None if a.source else repo_of(record)
+        if found:
+            export(*found, scratch)
+            source = Path(scratch)
+            where = {"origin_repo": str(found[0]), "origin_ref": found[1], "origin_id": git(found[0], "rev-parse", found[1])}
+        else:
+            source = Path(a.source).resolve() if a.source else newest_origin(record)
+            if source is None:
+                sys.exit(f"FAILED\tno original found near {record['origin_dir']}: pass --from")
+            for key in ("origin_repo", "origin_ref"):
+                record.pop(key, None)
+            where = {"origin_dir": str(source), "origin_id": tree_id(source)}
+        take(record, source, where, a.dry_run)
+
+
+def take(record, source, where, dry_run):
+    """Bring source into this copy. Files the project added or changed stay as they are."""
     old = record["files"]
     files = {}
     counts = {"updated": 0, "added": 0, "removed": 0}
     kept = []
+    planned = []
+
+    def act(kind, rel):
+        counts[kind] += 1
+        planned.append(f"{kind[:-1] if kind != 'added' else 'add'}\t{rel}")
+        if dry_run:
+            return
+        if kind == "removed":
+            (HERE / rel).unlink()
+        else:
+            (HERE / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / rel, HERE / rel)
     for rel in files_of(source):
         wanted = digest(source / rel)
         target = HERE / rel
         if not target.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source / rel, target)
-            counts["added"] += 1
+            act("added", rel)
         else:
             current = digest(target)
             if current != wanted and old.get(rel) != current:  # the project changed it, so it stays
@@ -168,23 +259,28 @@ def command_sync(a):
                     files[rel] = old[rel]
                 continue
             if current != wanted:
-                shutil.copy2(source / rel, target)
-                counts["updated"] += 1
+                act("updated", rel)
         files[rel] = wanted
     for rel, recorded in old.items():
         target = HERE / rel
         if rel in files or rel in kept or not target.exists():
             continue
-        if digest(target) == recorded:
-            target.unlink()
-            counts["removed"] += 1
+        if any(part in IGNORE for part in rel.split("/")) or digest(target) == recorded:
+            act("removed", rel)
         else:
             kept.append(rel)
     version = read_json(source / MANIFEST)["version"]
+    if dry_run:
+        for line in planned:
+            print(line)
+        for rel in sorted(kept):
+            print(f"keep\t{rel}")
+        print(f"DRY-RUN\t{version}\tnothing was written; run sync without --dry-run to take it")
+        return
     manifest = read_json(HERE / MANIFEST)
     manifest["version"] = version
     write_json(HERE / MANIFEST, manifest)
-    record.update(origin_dir=str(source), version=version, files=files)
+    record.update(**where, version=version, files=files)
     write_json(HERE / ORIGIN, record)
     for name, number in counts.items():
         print(f"{name}\t{number}")
@@ -202,7 +298,8 @@ def main():
     p.add_argument("--no-register", action="store_true", help="make the copy without changing any settings")
     p.set_defaults(fn=command_ensure)
     p = sub.add_parser("sync", help="take a newer original, keeping what the project added or changed")
-    p.add_argument("--from", dest="source", help="the original to take; the default is the newest installed")
+    p.add_argument("--from", dest="source", help="the original to take; the default is the original's published ref, or the newest installed")
+    p.add_argument("--dry-run", action="store_true", help="list what would change and write nothing")
     p.set_defaults(fn=command_sync)
     a = parser.parse_args()
     a.fn(a)

@@ -54,6 +54,11 @@ def demo():
             (original / clone.MANIFEST).write_text(json.dumps({**data, "name": "phro-project"}), encoding="utf-8")
             shutil.rmtree(original / ".in_use", ignore_errors=True)
 
+        (original / "mods/.git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        (original / ".superpowers/sdd").mkdir(parents=True, exist_ok=True)
+        (original / ".superpowers/sdd/progress.md").write_text("log\n", encoding="utf-8")
+        (original / ".worktrees/side").mkdir(parents=True, exist_ok=True)
+        (original / ".worktrees/side/x.md").write_text("x\n", encoding="utf-8")
         before = tree(original)
         app = project("work/demo-app")
         out = ensure(original, app)
@@ -70,7 +75,9 @@ def demo():
         record = json.loads((copy / clone.ORIGIN).read_text(encoding="utf-8"))
         assert Path(record["project"]) == app.resolve() and record["origin"] == "phro-project" and record["version"] == version, record
         assert not (copy / ".git").exists(), "a copy shares no history with the original"
-        same = [rel for rel in before if not rel.startswith(".git/") and rel not in clone.OWN]
+        assert not (copy / "mods/.git").exists(), "a .git pointer file would make git in the copy act on the original's repository"
+        assert not (copy / ".superpowers").exists() and not (copy / ".worktrees").exists(), "work logs and worktrees are not the plugin"
+        same = [rel for rel in before if not rel.startswith((".git/", ".superpowers/", ".worktrees/")) and rel not in clone.OWN and rel != "mods/.git"]
         assert same and all((copy / rel).read_bytes() == (original / rel).read_bytes() for rel in same), "a copy is the plugin as it was"
 
         assert ensure(original, app).stdout.startswith(f"EXISTS\t{copy}"), "one project, one copy"
@@ -130,7 +137,7 @@ def demo():
             f.write("\nThe project changed this.\n")
         changed = (copy / "skills/audit/SKILL.md").read_text(encoding="utf-8")
         said = hook(copy, app)
-        assert "9.0.0" in said and "clone.py" in said and "sync" in said, "a copy hears of a newer original"
+        assert "9.0.0 is newer" in said and "phro-project_demo-app update" in said, "a copy hears of a newer original, and how to take it"
 
         before_newer = tree(newer)
         out = run(copy, "sync")
@@ -151,6 +158,7 @@ def demo():
         assert "updated\t0" in out.stdout and "added\t0" in out.stdout and "removed\t0" in out.stdout, out.stdout
 
         (newer / "skills/design/SKILL.md").write_text("restored\n", encoding="utf-8")
+        assert "9.0.0 is newer" in hook(copy, app), "an original changed in place is newer, with no new version number"
         with (copy / "skills/design/SKILL.md").open("a", encoding="utf-8") as f:
             f.write("\nA second project edit.\n")
         (newer / "skills/fresh/SKILL.md").unlink()
@@ -159,6 +167,40 @@ def demo():
         out = run(copy, "sync")
         assert "restored" not in (copy / "skills/design/SKILL.md").read_text(encoding="utf-8"), "a file the project edited is never overwritten"
         assert (copy / "skills/fresh/SKILL.md").exists() and "kept\tskills/fresh/SKILL.md" in out.stdout, "nor deleted"
+
+        repo = base / "repo"
+        shutil.copytree(original, repo, ignore=shutil.ignore_patterns(".git", "__pycache__", ".superpowers", ".worktrees"))
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
+        git("init", "-q", "-b", "main")
+        git("add", "-A")
+        git("commit", "-q", "-m", "one")
+        git("worktree", "add", "-q", str(base / "repo-wt"), "-b", "side")
+        with (repo / "skills/audit/SKILL.md").open("a", encoding="utf-8") as f:
+            f.write("\nNot committed.\n")
+        gapp = project("work/git-app")
+        shutil.copytree(app / "docs", gapp / "docs")
+        out = ensure(base / "repo-wt", gapp)
+        gcopy = home / "phro-project_git-app"
+        assert out.returncode == 0 and gcopy.is_dir(), (out.stdout, out.stderr)
+        record = json.loads((gcopy / clone.ORIGIN).read_text(encoding="utf-8"))
+        assert Path(record["origin_repo"]) == repo.resolve() and record["origin_ref"] == "main" and record["origin_id"] == git("rev-parse", "main"), record
+        assert "Not committed." not in (gcopy / "skills/audit/SKILL.md").read_text(encoding="utf-8"), "a copy takes what was committed, not a working tree"
+        assert not (gcopy / ".git").exists() and "newer" not in hook(gcopy, gapp)
+
+        (repo / "skills/audit/SKILL.md").write_text("Committed later.\n", encoding="utf-8")
+        git("commit", "-q", "-am", "two")
+        said = hook(gcopy, gapp)
+        assert git("rev-parse", "--short=7", "main") in said and "newer" in said and "phro-project_git-app update" in said, said
+        before_dry = tree(gcopy)
+        out = run(gcopy, "sync", "--dry-run")
+        assert out.returncode == 0 and "update\tskills/audit/SKILL.md" in out.stdout and "DRY-RUN" in out.stdout, out.stdout
+        assert tree(gcopy) == before_dry, "a dry run writes nothing"
+        shutil.rmtree(base / "repo-wt")
+        out = run(gcopy, "sync")
+        assert out.returncode == 0 and (gcopy / "skills/audit/SKILL.md").read_text(encoding="utf-8") == "Committed later.\n", (out.stdout, out.stderr)
+        assert "newer" not in hook(gcopy, gapp), "the worktree it came from is gone, and the copy still follows the repository"
 
         calls = []
 

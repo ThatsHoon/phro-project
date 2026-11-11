@@ -22,7 +22,7 @@ Always-on cost, in every session of every project where the plugin is enabled:
 3. 영역 제안을 확인합니다. 최종 목표는 사용자의 말로만 적으니, 없으면 물을 때 한두 문장으로 답합니다.
 4. 매일 갱신 예약을 물으면 답합니다. 예약 작업은 프로젝트마다 하나입니다.
 5. 평소에는 그대로 일합니다. `/compact`나 자동 압축이 일어나면 그 세션이 압축 요약을 핵심 문서와 대조해 바뀐 결정을 반영합니다. 프로젝트 폴더의 세션과 포크 모두 같습니다. `/compact` 뒤에는 다음 메시지를 보낼 때 진행됩니다.
-6. 원본이 새 판이 되면 세션 시작 때 알려 줍니다. `clone.py sync`를 돌리면 원본에서 바뀐 파일만 가져오고, 프로젝트가 더하거나 고친 파일은 그대로 둡니다.
+6. 원본에 새 커밋이나 새 판이 생기면 세션 시작 때 알려 줍니다. `phro-project_<프로젝트> update`라고 하면 바뀔 목록을 먼저 보여 주고, 원본에서 바뀐 파일만 가져옵니다. 프로젝트가 더하거나 고친 파일은 그대로 둡니다. 반영은 원본에서 사본 쪽으로만 갑니다. 사본에 더한 프로젝트 기능은 원본으로 올라가지 않습니다.
 
 | 언제 | 무엇을 |
 |---|---|
@@ -51,6 +51,7 @@ phro-project/
     route-test/SKILL.md        whether skills get called on real prompts, and who takes each miss
     audit/SKILL.md             after growth: merge, delete and repair proposals
     compass/SKILL.md           build and refresh docs/core
+    update/SKILL.md            take a newer original into this project's copy, one way
     restructure/SKILL.md       reorganize a whole project
       references/test_structure.py   copied into the project: enforces its folder rules
   scripts/
@@ -117,7 +118,7 @@ Say what the project should be able to do, and from when: "make this method a sk
    | Hook | It must react to an event the model does not act on, and a miss was measured |
    | MCP | It needs a connection or shared state that running a script cannot give |
 
-6. A project's skill goes in that project's copy of this plugin, never in the original, so no other project receives it and a sync cannot overwrite it.
+6. A project's skill goes in that project's copy of this plugin, never in the original, so no other project receives it and a sync cannot overwrite it. Updates flow one way, from the original into copies; nothing in a copy goes back.
 7. Write down the session token cost of a new skill and the descriptions it would overlap.
 8. Write how it fires before the code. From a prompt: about 8 that should fire and about 8 close misses, in the copy's `tests/route_cases.json`. From a step in the work: cases with `after` and `rule`.
 9. Write the description last, in the words users really type.
@@ -298,7 +299,7 @@ Run as `python -I -X utf8 scripts/clone.py <command>`.
 | Command | Does |
 |---|---|
 | `ensure <root> [--dest dir] [--no-register]` | Prints `CREATED`, `EXISTS`, `THIS`, `ORIGINAL`, `WRONG-PROJECT` or `NO-PROJECT`, and what to do. Every skill runs it first |
-| `sync [--from dir]` | Run from a copy. Takes a newer original: files the project did not touch are updated, new ones added, dropped ones removed. Files the project added stay, and files it changed stay and print as `kept` |
+| `sync [--from dir] [--dry-run]` | Run from a copy. Takes a newer original: files the project did not touch are updated, new ones added, dropped ones removed. Files the project added stay, and files it changed stay and print as `kept`. An original in a git checkout is taken from its published ref (`origin/main`, else `main`) by `git archive`, never from a worktree; a session hears of a new commit or a changed folder, not only a new version. `--dry-run` lists the changes and writes nothing. `.git` files, `.superpowers` and `.worktrees` never reach a copy |
 
 ## `restructure.py` commands
 
