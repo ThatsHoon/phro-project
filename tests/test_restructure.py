@@ -215,6 +215,10 @@ def demo():
             if rel.startswith("misc/"):
                 path.parent.rmdir()
         assert check().returncode == 0
+        nested = root / ".worktrees/branch/services/e.py"  # a git worktree inside the project holds its own copy
+        nested.parent.mkdir(parents=True)
+        nested.write_text("import sys\nsys.path.insert(0, '.')\n", encoding="utf-8")
+        assert check().returncode == 0, "dot folders (.worktrees, .claude, ...) are not the project's code: " + check().stderr[-300:]
 
     with tempfile.TemporaryDirectory() as d, mock.patch.object(restructure.Path, "home", return_value=Path(d)):
         home = Path(d).resolve()
