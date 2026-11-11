@@ -11,9 +11,37 @@ from .. import limits
 from ..limits import ReadError
 
 
+_BOMS = ((bytes([255, 254, 0, 0]), "utf-32"), (bytes([0, 0, 254, 255]), "utf-32"),
+         (bytes([255, 254]), "utf-16"), (bytes([254, 255]), "utf-16"))
+
+
+def _decode_guess(data: bytes) -> str:
+    """Best-effort text of UTF-16/32 data (BOM or NULs in the first 4 bytes); empty otherwise."""
+    head = data[:4]
+    enc = next((e for bom, e in _BOMS if head.startswith(bom)), None)
+    if enc is None:
+        if 0 not in head:
+            return ""
+        if head[:3] == bytes(3):
+            enc = "utf-32-be"
+        elif head[1:4] == bytes(3):
+            enc = "utf-32-le"
+        elif head[0] == 0:
+            enc = "utf-16-be"
+        else:
+            enc = "utf-16-le"
+    return data.decode(enc, errors="replace")
+
+
+def _declares_entities(data: bytes) -> bool:
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+        return True
+    text = _decode_guess(data)
+    return "<!DOCTYPE" in text or "<!ENTITY" in text
+
+
 def parse_xml(data: bytes):
-    head = data[:4096]
-    if b"<!DOCTYPE" in head or b"<!ENTITY" in head:
+    if _declares_entities(data):
         raise ReadError("damaged", "XML declares a DOCTYPE or ENTITY")
     try:
         return ET.fromstring(data)
@@ -77,7 +105,17 @@ class Package:
             if k in self._lower and self._lower[k] != n:
                 raise ReadError("damaged", "two members differ only by case")
             self._lower[k] = n
+        self._seen = set()
         self._total = 0
+
+    def close(self):
+        self._zip.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def _find(self, name):
         if name in self.names:
@@ -94,7 +132,9 @@ class Package:
         info = self._zip.getinfo(real)
         if info.flag_bits & 1:
             raise ReadError("encrypted", real)
-        self._total += info.file_size
+        if real not in self._seen:
+            self._seen.add(real)
+            self._total += info.file_size
         if self._total > limits.ZIP_TOTAL:
             raise ReadError("too_large", "zip total uncompressed size")
         if (info.file_size > limits.ZIP_RATIO_FLOOR

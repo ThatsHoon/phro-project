@@ -40,7 +40,11 @@ def test_formats_cover_scope():
 
 def test_read_and_case_insensitive_lookup():
     p = make_zip(tmp() / "a.zip", {"mimetype": "x", "Contents/Section0.xml": "<a/>"})
-    pkg = zipx.Package(p)
+    with zipx.Package(p) as pkg:
+        _check_lookup(pkg)
+
+
+def _check_lookup(pkg):
     assert pkg.has("contents/section0.xml")
     assert pkg.read("contents/section0.xml") == b"<a/>"
     assert pkg.xml("missing.xml") is None
@@ -50,6 +54,12 @@ def test_xml_refuses_doctype():
     bad = b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "aa">]><x>&a;</x>'
     raises_kind(lambda: zipx.parse_xml(bad), "damaged")
     raises_kind(lambda: zipx.parse_xml(b"<x"), "damaged")
+    u16 = "<!DOCTYPE x [<!ENTITY a 'b'>]><x/>".encode("utf-16")
+    raises_kind(lambda: zipx.parse_xml(u16), "damaged")
+    raises_kind(lambda: zipx.parse_xml("<!DOCTYPE x><x/>".encode("utf-16-le")), "damaged")
+    raises_kind(lambda: zipx.parse_xml("<!DOCTYPE x><x/>".encode("utf-32")), "damaged")
+    late = b"<?xml version='1.0'?><!--" + b"a" * 5000 + b"--><!DOCTYPE x><x/>"
+    raises_kind(lambda: zipx.parse_xml(late), "damaged")
     assert zipx.local(zipx.parse_xml(b"<x/>").tag) == "x"
 
 
@@ -64,7 +74,8 @@ def test_ratio_bomb_is_too_large():
     old = limits.ZIP_RATIO
     limits.ZIP_RATIO = 10
     try:
-        raises_kind(lambda: zipx.Package(p).read("big.bin"), "too_large")
+        with zipx.Package(p) as pkg:
+            raises_kind(lambda: pkg.read("big.bin"), "too_large")
     finally:
         limits.ZIP_RATIO = old
 
@@ -74,7 +85,26 @@ def test_encrypted_member():
     with zipfile.ZipFile(p, "w") as z:
         z.writestr("s.xml", b"<a/>")
         z.getinfo("s.xml").flag_bits |= 1  # writestr resets it, so mark the central entry
-    raises_kind(lambda: zipx.Package(p).read("s.xml"), "encrypted")
+    with zipx.Package(p) as pkg:
+        raises_kind(lambda: pkg.read("s.xml"), "encrypted")
+
+
+def test_total_counts_each_member_once():
+    p = make_zip(tmp() / "t.zip", {"a": b"x" * 600, "b": b"y" * 600}, stored=())
+    old = limits.ZIP_TOTAL
+    limits.ZIP_TOTAL = 1000
+    try:
+        with zipx.Package(p) as pkg:
+            pkg.read("a")
+            pkg.read("a")
+            raises_kind(lambda: pkg.read("b"), "too_large")
+    finally:
+        limits.ZIP_TOTAL = old
+
+
+def test_case_duplicate_names_are_damaged():
+    p = make_zip(tmp() / "c.zip", {"A.xml": "<a/>", "a.XML": "<b/>"}, stored=())
+    raises_kind(lambda: zipx.Package(p), "damaged")
 
 
 def test_rels_resolve():
@@ -86,7 +116,11 @@ def test_rels_resolve():
              '</Relationships>')
     p = make_zip(tmp() / "r.zip", {"_rels/.rels": rels, "word/_rels/document.xml.rels": drels,
                                    "word/document.xml": "<d/>"}, stored=())
-    pkg = zipx.Package(p)
+    with zipx.Package(p) as pkg:
+        _check_rels(pkg)
+
+
+def _check_rels(pkg):
     assert pkg.rels("")["rId1"].target == "word/document.xml"
     assert pkg.rels("word/document.xml")["rId2"].target == "word/media/a b.png"
     assert pkg.rels("word/document.xml")["rId3"].external
