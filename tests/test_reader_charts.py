@@ -91,6 +91,37 @@ def test_no_series_none():
     assert chart_table(space("")) is None
 
 
+def test_row_cap_is_fast():
+    import time
+    big = ('<c:numCache><c:ptCount val="999999999"/>'
+           '<c:pt idx="999999999"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt></c:numCache>')
+    plot = "<c:barChart>" + ser("A", big) + "</c:barChart>"
+    t0 = time.time()
+    t = chart_table(space(plot))
+    assert time.time() - t0 < 1
+    assert len(t.rows) <= 10_001
+    assert t.caption.endswith("(first 10000 points)")
+
+
+def test_fmt_overflow_and_nan():
+    cases = [("1e309", "0.0%"), ("1e30", "#,##0"), ("1" + "0" * 29, "#,##0"), ("NaN", "0%")]
+    for v, fmt in cases:
+        plot = "<c:barChart>" + ser("A", cache([(0, v)], fmt=fmt)) + "</c:barChart>"
+        t = chart_table(space(plot))
+        assert cells(t)[1][1] == v, (v, cells(t))
+
+
+def test_strip_and_bubble():
+    plot = "<c:barChart>" + ser("A", cache([(0, " 3.0 ")])) + "</c:barChart>"
+    assert cells(chart_table(space(plot)))[1][1] == "3"
+    b = ("<c:bubbleChart><c:ser><c:tx><c:v>S</c:v></c:tx>"
+         f"<c:xVal><c:numRef>{cache([(0, '1')])}</c:numRef></c:xVal>"
+         f"<c:yVal><c:numRef>{cache([(0, '3')])}</c:numRef></c:yVal>"
+         f"<c:bubbleSize><c:numRef>{cache([(0, '9')])}</c:numRef></c:bubbleSize>"
+         "</c:ser></c:bubbleChart>")
+    assert cells(chart_table(space(b))) == [["x", "S"], ["1", "3"]]
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
