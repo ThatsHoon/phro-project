@@ -219,10 +219,10 @@ def test_cell_heading_and_alt_escaped():
     h = Cell([Heading(2, [Text("a|b")])])
     assert "|a\\|b|z|" in R(Doc(blocks=[Table([[h, c("z")]])]))
     img = Cell([Image(b"x", alt="p|q")])
-    assert "|p\\|q|z|" in R(Doc(blocks=[Table([[img, c("z")]])]))
+    assert "|[image: p\\|q]|z|" in R(Doc(blocks=[Table([[img, c("z")]])]))
     h2 = Cell([Heading(1, [Text("<&>")]), Image(b"x", alt="<i>")])
     out = R(Doc(blocks=[Table([[h2, c("z", colspan=1, rowspan=2)], [c("y")]])]))
-    assert "&lt;&amp;>" in out and "&lt;i>" in out
+    assert "&lt;&amp;>" in out and "[image: &lt;i>]" in out
 
 
 def test_stats():

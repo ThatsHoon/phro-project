@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 from . import limits
-from .images import Assets
+from .images import Assets, sniff
 from .limits import ReadError
 from .model import (
     Bold, Break, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math,
@@ -191,15 +191,19 @@ class _Render:
             return s[:-2] + "\\. "
         return "\\" + s
 
-    def _image(self, b: Image) -> list:
+    def _image_text(self, b: Image, m=BLOCK) -> str:
         path, ok = self.assets.add(b.data, b.alt)
         alt = re.sub(r"\s+", " ", b.alt).strip()
         if ok:
             alt = alt.replace("\\", "\\\\").replace("]", "\\]")
-            return [("p", self._tag(b, f"![{alt}]({path})"))]
-        if path:
+            return m.esc(f"![{alt}](") + path + ")"
+        if path and path not in self.unviewable:
             self.unviewable.append(path)
-        return [("p", self._tag(b, f"[image: {alt}]"))] if alt else []
+        return m.esc(f"[image: {alt}]") if alt else ""
+
+    def _image(self, b: Image) -> list:
+        s = self._image_text(b)
+        return [("p", self._tag(b, s))] if s else []
 
     def _section(self, s: Section) -> list:
         out = []
@@ -235,7 +239,7 @@ class _Render:
             elif isinstance(b, Heading):
                 s = self.inlines(b.inlines, _Mode(" ", m.kind, True))
             elif isinstance(b, Image):
-                s = m.esc(b.alt)
+                s = self._image_text(b, m)
             elif isinstance(b, Equation):
                 s = m.esc(f"${b.tex}$")
             elif isinstance(b, Quote):
@@ -286,7 +290,7 @@ class _Render:
         if isinstance(b, (Para, ListItem, Heading)):
             return self._inl_has_text(b.inlines) or isinstance(b, ListItem)
         if isinstance(b, Image):
-            return bool(b.alt.strip())
+            return bool(b.alt.strip()) or (len(b.data) >= 16 and sniff(b.data) is not None)
         if isinstance(b, Equation):
             return True
         if isinstance(b, (Quote, Section)):

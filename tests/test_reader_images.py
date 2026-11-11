@@ -144,7 +144,23 @@ def test_render_alt_escaping_and_cells():
         assert md == "![a\\]b\\\\c](assets/img-001.png)\n"
         t = Table([[Cell([Image(PNG, alt="p|q")]), Cell([Para([Text("z")])])]])
         md = markdown.render(Doc(blocks=[t]), Path(d))
-        assert "p\\|q" in md and "assets/" not in md
+        assert "|![p\\|q](assets/img-001.png)|z|" in md
+
+
+def test_render_images_in_cells():
+    with tempfile.TemporaryDirectory() as d:
+        t = Table([[Cell([Image(PNG, alt="a")]), Cell([Para([Text("z")])])]])
+        md = markdown.render(Doc(blocks=[t]), Path(d))
+        assert "|![a](assets/img-001.png)|z|" in md
+        t = Table([[Cell([Image(EMF, alt="<e>")]), Cell([Image(WMF)], colspan=2)],
+                   [Cell([Para([Text("y")])]), Cell([Para([Text("w")])]), Cell([Para([Text("v")])])]])
+        md = markdown.render(Doc(blocks=[t]), Path(d))
+        assert "<td>[image: &lt;e>]</td>" in md
+        assert md.rstrip().endswith("Not viewable here: assets/img-001.emf, assets/img-002.wmf")
+        inner = Table([[Cell([Image(PNG)]), Cell([Para([Text("n")])])]])
+        outer = Table([[Cell([inner]), Cell([Para([Text("o")])])]])
+        md = markdown.render(Doc(blocks=[outer]), Path(d))
+        assert "![](assets/img-001.png) / n" in md
 
 
 def test_render_no_images_creates_no_dir():
