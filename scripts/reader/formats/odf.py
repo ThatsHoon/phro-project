@@ -1,5 +1,6 @@
 """OpenDocument to the document model: odt here, ods/odp share this layer. Elements match by local name."""
 import collections
+import copy
 import re
 
 from .. import limits
@@ -37,12 +38,6 @@ def _int(s, default=0):
 
 def _squash(s, n=200):
     return re.sub(r"\s+", " ", s or "").strip()[:n]
-
-
-def _hide(blocks):
-    for b in blocks:
-        b.hidden = "hidden"
-    return blocks
 
 
 def _itext(inlines) -> str:
@@ -167,6 +162,17 @@ class Body:
         self.left = _BUDGET  # expansion budget still available
         self.wt = {}  # id(Table) -> (Table, cells it expands to)
 
+    def hide(self, blocks):
+        """Hidden copies of blocks; the originals may be shared with a cached object."""
+        out = []
+        for b in blocks:
+            c = copy.copy(b)
+            c.hidden = "hidden"
+            if id(b) in self.wt:
+                self.wt[id(c)] = (c, self.wt[id(b)][1])
+            out.append(c)
+        return out
+
     def take(self, n, force=False) -> bool:
         """Charge n cells to the document budget; False (and counted) once it is spent.
         A forced charge (the first copy of something the file spells out) always succeeds."""
@@ -245,7 +251,7 @@ class Body:
         if n == "span":
             sub = self.inlines(c, d + 1)
             if sub and self.is_bold(attr(c, "style-name")):
-                out.append(Bold(sub))
+                out.append(Bold([y for x in sub for y in (x.inlines if isinstance(x, Bold) and not x.hidden else [x])]))
             else:
                 out.extend(sub)
         elif n == "a":
@@ -409,7 +415,9 @@ class Body:
             return [t] if t else []
         if n == "section":
             inner = self.blocks(c, d + 1)
-            return _hide(inner) if attr(c, "display") == "none" else inner
+            if attr(c, "display") != "none":
+                return inner
+            return [Section("chapter", blocks=self.hide(inner), hidden="hidden")] if inner else []
         if n == "tracked-changes":
             return self.deletions(c)
         if n in _CONTAINERS:
@@ -432,7 +440,7 @@ class Body:
             main = Para(inl)
         out = ([main] if inl else []) + extras
         if any(local(c.tag) == "hidden-paragraph" for c in p):
-            _hide(out)
+            out = self.hide(out)
         return out
 
     def deletions(self, tc):
@@ -470,14 +478,14 @@ class Body:
             elif n == "list-item":
                 for k in [k for k in cnt if k > level]:
                     del cnt[k]
-                marker = self.marker(style, level, cnt, attr(it, "start-value"))
-                placed = False
+                head = next(iter(it), None)  # only an item that opens with a paragraph is numbered
+                marker = (self.marker(style, level, cnt, attr(it, "start-value"))
+                          if head is not None and local(head.tag) == "p" else None)
                 for c in it:
                     cn = local(c.tag)
                     if cn == "list":
                         out.extend(self.items(c, d + 1, level + 1, style, cnt))
-                    elif cn == "p" and not placed:
-                        placed = True
+                    elif c is head and marker is not None:
                         got = self.para(c, d + 1)
                         if got and isinstance(got[0], Para):
                             got[0] = ListItem(min(level, 6), marker, got[0].inlines, hidden=got[0].hidden)
@@ -503,10 +511,11 @@ class Body:
         if d > limits.MAX_DEPTH:
             self.deep()
             return None
-        rows = []
-        self.rows_of(tbl, d, False, rows)
+        rows, cut = [], []
+        self.rows_of(tbl, d, False, rows, cut)
         while rows and all(_empty(c.blocks) for c in rows[-1]):
             rows.pop()
+        self.count_cut(cut, len(rows))
         if not rows:
             return None
         for r, row in enumerate(rows):
@@ -516,34 +525,43 @@ class Body:
         self.wt[id(t)] = (t, sum(self.weight(c.blocks) for row in rows for c in row) or 1)
         return t
 
-    def rows_of(self, cont, d, header, rows):
+    def rows_of(self, cont, d, header, rows, cut):
         if d > limits.MAX_DEPTH:
             self.deep()
             return
         for c in cont:
             if self.left <= 0:
+                self.ctx.skipped["cells"] += 1
                 return
             n = local(c.tag)
             if n == "table-row":
                 cells = self.row(c, d, header)
-                rep = self.repeat(attr(c, "number-rows-repeated"), all(_empty(x.blocks) for x in cells))
+                empty = all(_empty(x.blocks) for x in cells)
+                rep, cut_here = self.repeat(attr(c, "number-rows-repeated"), empty)
                 rw = sum(self.weight(x.blocks) for x in cells) or 1
                 for i in range(rep):
                     if not self.take(rw if i else (0 if cells else 1), force=i == 0):
                         return
                     rows.append([Cell(x.blocks, x.rowspan, x.colspan, x.header) for x in cells])
+                if cut_here:
+                    cut.append((len(rows), empty))
             elif n in ("table-header-rows", "table-rows", "table-row-group"):
-                self.rows_of(c, d + 1, header or n == "table-header-rows", rows)
+                self.rows_of(c, d + 1, header or n == "table-header-rows", rows, cut)
 
-    def repeat(self, raw, empty):
+    @staticmethod
+    def repeat(raw, empty):
+        """(copies to expand, whether the repeat was cut short)."""
         rep, cap = max(1, _int(raw, 1)), _GAP if empty else _REPEAT
-        if rep > cap:
-            self.ctx.skipped["repeat"] += 1
-            return cap
-        return rep
+        return min(rep, cap), rep > cap
+
+    def count_cut(self, cut, kept):
+        """Count truncated repeats that still show: content, or a gap followed by more content."""
+        for end, empty in cut:
+            if not empty or end < kept:
+                self.ctx.skipped["repeat"] += 1
 
     def row(self, tr, d, header):
-        cells = []
+        cells, cut = [], []
         for c in tr:
             if local(c.tag) != "table-cell":
                 continue  # covered cells carry no content; the spans of their origin cover them
@@ -551,12 +569,16 @@ class Body:
             cs = min(max(_int(attr(c, "number-columns-spanned"), 1), 1), _SPAN)
             rs = min(max(_int(attr(c, "number-rows-spanned"), 1), 1), _SPAN)
             w = self.weight(blocks)
-            for i in range(self.repeat(attr(c, "number-columns-repeated"), _empty(blocks))):
+            n, cut_here = self.repeat(attr(c, "number-columns-repeated"), _empty(blocks))
+            for i in range(n):
                 if not self.take(w if i else 1, force=i == 0):  # a first copy's nested cells were charged as built
                     return cells
                 cells.append(Cell(blocks, rs, cs, header))
+            if cut_here:
+                cut.append((len(cells), _empty(blocks)))
         while cells and _empty(cells[-1].blocks):
             cells.pop()
+        self.count_cut(cut, len(cells))
         return cells
 
     # ---- headers and footers

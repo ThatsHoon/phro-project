@@ -383,6 +383,45 @@ def test_object_chain_bomb_is_budgeted():
     assert time.monotonic() - t0 < 2 and ctx.skipped["cells"] > 0 and "첫1" in out
 
 
+def test_hidden_section_is_one_place():
+    body = '<text:section text:display="none">' + P("하나") + P("둘") + P("셋") + "</text:section>" + P("보임")
+    p = odt_doc(body)
+    assert md(p).startswith("(1 hidden places left out)") and "하나" not in md(p)
+    shown = md(p, hidden=True)
+    assert "(hidden) 하나" in shown and "(hidden) 셋" in shown
+
+
+def test_hidden_copy_does_not_touch_cached_object():
+    chart = frame('<draw:object xlink:href="./Object 1"/>')
+    body = chart + '<text:section text:display="none">' + chart + "</text:section>"
+    out = md(odt_doc(body, extra={"Object 1/content.xml": chart_xml()}))
+    assert out.count("Chart: bar") == 1 and "(1 hidden places left out)" in out
+
+
+def test_nested_bold_is_flat():
+    auto = '<style:style style:name="B" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style>'
+    body = P('<text:span text:style-name="B">a<text:span text:style-name="B">b</text:span>c</text:span>')
+    assert md(odt_doc(body, auto)) == "**abc**" + chr(10)
+
+
+def test_list_item_not_opening_with_paragraph_takes_no_number():
+    body = ('<text:list text:style-name="L1"><text:list-item><text:h>제목</text:h></text:list-item>'
+            '<text:list-item>' + P("a") + '</text:list-item></text:list>')
+    assert md(odt_doc(body, NUM)) == "# 제목" + chr(10) * 2 + "1. a" + chr(10)
+
+
+def test_trailing_repeats_are_not_counted_as_cut():
+    huge = "1000000000"
+    body = ('<table:table><table:table-row>' + cell("a") + cell("", f'table:number-columns-repeated="{huge}"')
+            + f'</table:table-row><table:table-row table:number-rows-repeated="{huge}">'
+            + cell("") + '</table:table-row></table:table>')
+    _, ctx = parse(odt_doc(body))
+    assert ctx.skipped["repeat"] == 0
+    gap = table_xml([cell("a") + cell("", f'table:number-columns-repeated="{huge}"') + cell("b")])
+    _, ctx = parse(odt_doc(gap))
+    assert ctx.skipped["repeat"] == 1
+
+
 def test_empty_trailing_repeats_vanish():
     huge = "1000000000"
     body = ('<table:table><table:table-row>' + cell("a") + cell("", f'table:number-columns-repeated="{huge}"')
