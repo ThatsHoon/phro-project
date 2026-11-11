@@ -137,6 +137,24 @@ def test_local_name_helpers():
     assert zipx.first(el, "nope") is None
 
 
+def test_parse_xml_ns_finds_nested_declarations():
+    pad = "<!-- " + "x" * 70_000 + " -->"
+    data = (f'<a xmlns:p="urn:one">{pad}<b><c xmlns:q="urn:two" xmlns:p="urn:three"/></b></a>').encode()
+    root, ns = zipx.parse_xml_ns(data)
+    assert zipx.local(root.tag) == "a" and ns == {"p": {"urn:one", "urn:three"}, "q": {"urn:two"}}
+    for bad in (b'<!DOCTYPE a><a/>', '<!DOCTYPE a><a/>'.encode("utf-16"), b'<a><!ENTITY x "y"></a>'):
+        try:
+            zipx.parse_xml_ns(bad)
+            assert False
+        except ReadError as e:
+            assert e.kind == "damaged"
+    try:
+        zipx.parse_xml_ns(b"<a>")
+        assert False
+    except ReadError as e:
+        assert e.kind == "damaged"
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

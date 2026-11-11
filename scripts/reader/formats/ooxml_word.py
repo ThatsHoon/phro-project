@@ -357,9 +357,15 @@ class _Reader:
                 b.hidden = "deleted"
             return out
         if n == "AlternateContent":
-            chosen = ooxml.alternate(c, self.scope.nsmap)
+            chosen = self.choose(c)
             return self.blocks(chosen, d + 1) if chosen is not None else []
         return []
+
+    def choose(self, el):
+        chosen = ooxml.alternate(el, self.scope.nsmap)
+        if chosen is None:
+            self.ctx.skipped["alternate"] += 1
+        return chosen
 
     @staticmethod
     def sdt_content(sdt):
@@ -537,7 +543,7 @@ class _Reader:
             for c in self.sdt_content(el):
                 self.node(c, st, d + 1)
         elif n == "AlternateContent":
-            chosen = ooxml.alternate(el, self.scope.nsmap)
+            chosen = self.choose(el)
             for c in (chosen if chosen is not None else ()):
                 self.node(c, st, d + 1)
         elif n in _NOTE_REFS:

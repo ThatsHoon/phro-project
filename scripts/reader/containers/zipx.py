@@ -49,6 +49,31 @@ def parse_xml(data: bytes):
         raise ReadError("damaged", f"XML parse error: {e}")
 
 
+class _NsBuilder(ET.TreeBuilder):
+    """TreeBuilder that also records every namespace declaration: prefix -> set of URIs."""
+
+    def __init__(self):
+        super().__init__()
+        self.ns = {}
+
+    def start_ns(self, prefix, uri):
+        self.ns.setdefault(prefix, set()).add(uri)
+
+
+def parse_xml_ns(data: bytes):
+    """(root, {prefix: {uri, ...}}) with every declaration in the document; same refusals as parse_xml."""
+    if _declares_entities(data):
+        raise ReadError("damaged", "XML declares a DOCTYPE or ENTITY")
+    builder = _NsBuilder()
+    try:
+        parser = ET.XMLParser(target=builder)
+        parser.feed(data)
+        root = parser.close()
+    except ET.ParseError as e:
+        raise ReadError("damaged", f"XML parse error: {e}")
+    return root, builder.ns
+
+
 def local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
 

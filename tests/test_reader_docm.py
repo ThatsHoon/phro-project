@@ -249,6 +249,23 @@ def test_alternate_content():
     assert "XZ" in out and "Y" not in out and "W" not in out, out
 
 
+def test_alternate_prefix_declaration():
+    nested = ('<w:p><w:r><mc:AlternateContent><mc:Choice xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" '
+              'Requires="wp14"><w:t>N</w:t></mc:Choice><mc:Fallback><w:t>F</w:t></mc:Fallback></mc:AlternateContent></w:r></w:p>')
+    assert "N" in md(docm(nested)) and "F" not in md(docm(nested))
+    undeclared = ('<w:p><w:r><mc:AlternateContent><mc:Choice Requires="w14"><w:t>C</w:t></mc:Choice>'
+                  '<mc:Fallback><w:t>F</w:t></mc:Fallback></mc:AlternateContent></w:r></w:p>')
+    out = md(docm(undeclared))
+    assert "F" in out and "C" not in out
+    wrong = ('<w:p xmlns:wps="urn:other"><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:t>C</w:t></mc:Choice>'
+             '<mc:Fallback><w:t>F</w:t></mc:Fallback></mc:AlternateContent></w:r></w:p>')
+    assert "F" in md(docm(wrong))
+    none = ('<w:p><w:r><w:t>keep</w:t></w:r><w:r><mc:AlternateContent><mc:Choice Requires="zz"><w:t>C</w:t></mc:Choice>'
+            '</mc:AlternateContent></w:r></w:p>')
+    doc, ctx = parse(docm(none))
+    assert "keep" in markdown.render(doc, tmp() / "a") and ctx.skipped["alternate"] == 1
+
+
 def test_alternate_textbox_once():
     box = ('<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wps:wsp><wps:txbx><w:txbxContent>'
            '<w:p><w:r><w:t>boxed</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp></w:drawing></mc:Choice>'

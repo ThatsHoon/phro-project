@@ -5,20 +5,28 @@ and elements match by local name, so Transitional and Strict files take the same
 ooxml_word imports this module at load time; this module imports ooxml_word only inside parse(),
 so there is no import cycle.
 """
-import re
 from pathlib import Path
 
 from ..charts import chart_table
-from ..containers.zipx import Package, attr, local, parse_xml
+from ..containers.zipx import Package, attr, local, parse_xml, parse_xml_ns
 from ..limits import ReadError
 from ..model import Image
 
 _CFB_MAGIC = bytes.fromhex("d0cf11e0")
 _ENCRYPTED = "EncryptedPackage".encode("utf-16-le")
 _CFB_SCAN = 64 * 1024
-_XMLNS = re.compile(rb"""xmlns:([A-Za-z_][\w.\-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 
 UNDERSTOOD = frozenset({"wps", "wpg", "wpc", "wpi", "wp14", "w14", "w15", "w16se", "a14", "c14", "v", "o", "w10"})
+_MS = "http://schemas.microsoft.com/office/"
+_URIS = {  # the one namespace each understood prefix may stand for
+    "wps": _MS + "word/2010/wordprocessingShape", "wpg": _MS + "word/2010/wordprocessingGroup",
+    "wpc": _MS + "word/2010/wordprocessingCanvas", "wpi": _MS + "word/2010/wordprocessingInk",
+    "wp14": _MS + "word/2010/wordprocessingDrawing", "w14": _MS + "word/2010/wordml",
+    "w15": _MS + "word/2012/wordml", "w16se": _MS + "word/2015/wordml/symex",
+    "a14": _MS + "drawing/2010/main", "c14": _MS + "drawing/2007/8/2/chart",
+    "v": "urn:schemas-microsoft-com:vml", "o": "urn:schemas-microsoft-com:office:office",
+    "w10": "urn:schemas-microsoft-com:office:word",
+}
 
 
 # ---- shared per-package caches (rels, parsed parts, member bytes, chart tables)
@@ -45,15 +53,12 @@ def rels(pkg, part, ctx=None) -> dict:
 
 
 def load(pkg, part):
-    """(root element, {prefix: uri}) of an XML part, cached. Raises ReadError when missing or damaged."""
+    """(root element, {prefix: {uri, ...}}) of an XML part, cached. Raises ReadError when missing or damaged."""
     c = _cache(pkg)["xml"]
     if part not in c:
         if not pkg.has(part):
             raise ReadError("damaged", f"missing part {part[:80]}")
-        data = pkg.read(part)
-        nsmap = {m.group(1).decode(): (m.group(2) or m.group(3) or b"").decode("utf-8", "replace")
-                 for m in _XMLNS.finditer(data[:_CFB_SCAN])}
-        c[part] = (parse_xml(data), nsmap)
+        c[part] = parse_xml_ns(pkg.read(part))
     return c[part]
 
 
@@ -105,17 +110,25 @@ def chart(pkg, part, rid):
     return c[name]
 
 
-def alternate(el, nsmap=None):
-    """The mc:Choice whose every Requires prefix is understood (and declared, when nsmap is given), else mc:Fallback.
+def _understood(prefix, nsmap) -> bool:
+    if prefix not in UNDERSTOOD:
+        return False
+    if nsmap is None:
+        return True
+    return bool(nsmap.get(prefix)) and nsmap[prefix] <= {_URIS[prefix]}
 
-    None when neither exists.
+
+def alternate(el, nsmap=None):
+    """The mc:Choice whose every Requires prefix is understood, else mc:Fallback; None when neither exists.
+
+    A prefix is understood when it is declared somewhere in the part, only ever for the namespace we know
+    under that name (nsmap from `load`; None skips the declaration check).
     """
     fallback = None
     for c in el:
         n = local(c.tag)
         if n == "Choice":
-            req = (attr(c, "Requires") or "").split()
-            if all(p in UNDERSTOOD and (nsmap is None or p in nsmap) for p in req):
+            if all(_understood(p, nsmap) for p in (attr(c, "Requires") or "").split()):
                 return c
         elif n == "Fallback" and fallback is None:
             fallback = c
