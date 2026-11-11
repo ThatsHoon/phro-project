@@ -442,7 +442,8 @@ class _Reader:
 
     def scoped(self, st, el, d, frame):
         n = len(st.frames)
-        self.push(st, frame)
+        if not self.push(st, frame) and frame.kind == "deleted":
+            return  # counted by push; deleted text is never shown
         for c in el:
             self.node(c, st, d + 1)
         self.close_to(st, n)
@@ -499,8 +500,9 @@ class _Reader:
             old, st.bold = st.bold, bold
             idx = len(st.frames)
             pushed = vanish and self.push(st, _Frame("hidden"))
-            for c in el:
-                self.node(c, st, d + 1)
+            if not vanish or pushed:  # a vanished run that cannot be framed is left out, never shown
+                for c in el:
+                    self.node(c, st, d + 1)
             if pushed:
                 self.close_to(st, idx)
             st.bold = old
@@ -550,6 +552,8 @@ class _Reader:
             key = _NOTE_REFS[n] + (attr(el, "id") or "")
             if key in self.doc.notes:
                 self.add(st, NoteRef(key))
+            else:
+                self.ctx.skipped["note"] += 1
         elif n in ("inline", "anchor"):
             old = st.alt
             pr = kids(el, "docPr")

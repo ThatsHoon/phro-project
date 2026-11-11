@@ -150,36 +150,27 @@ def test_docm_not_a_package():
         assert e.kind == "damaged"
 
 
-def test_wrong_root_is_damaged():
-    p = docm("")
-    # swap the main part for a workbook root
+def swap_main(path, data):
+    """Copy of the package with word/document.xml replaced by `data`."""
     import zipfile
     out = tmp() / "b.docm"
-    with zipfile.ZipFile(p) as zi, zipfile.ZipFile(out, "w") as zo:
+    with zipfile.ZipFile(path) as zi, zipfile.ZipFile(out, "w") as zo:
         for i in zi.infolist():
-            data = zi.read(i.filename)
-            if i.filename == "word/document.xml":
-                data = b"<workbook/>"
-            zo.writestr(i.filename, data)
+            zo.writestr(i.filename, data if i.filename == "word/document.xml" else zi.read(i.filename))
+    return out
+
+
+def test_wrong_root_is_damaged():
     try:
-        parse(out)
+        parse(swap_main(docm(""), b"<workbook/>"))
         assert False
     except ReadError as e:
         assert e.kind == "damaged" and "Word or PowerPoint" in e.detail
 
 
 def test_presentation_not_yet():
-    p = docm("")
-    import zipfile
-    out = tmp() / "b.docm"
-    with zipfile.ZipFile(p) as zi, zipfile.ZipFile(out, "w") as zo:
-        for i in zi.infolist():
-            data = zi.read(i.filename)
-            if i.filename == "word/document.xml":
-                data = b"<presentation/>"
-            zo.writestr(i.filename, data)
     try:
-        parse(out)
+        parse(swap_main(docm(""), b"<presentation/>"))
         assert False
     except ReadError as e:
         assert e.kind == "unsupported"
@@ -441,19 +432,38 @@ def test_deep_nesting_tables_sdt_and_textbox():
         t = '<w:tbl><w:tr><w:tc>' + t + '</w:tc></w:tr></w:tbl>'
     body = '<w:p><w:r><w:t>머리</w:t></w:r></w:p>' + t
     t0 = time.time()
-    out = md(docm(body))
-    assert time.time() - t0 < 5 and "머리" in out
+    doc, ctx = parse(docm(body))
+    out = markdown.render(doc, tmp() / "a")
+    assert time.time() - t0 < 5 and "머리" in out and ctx.skipped["depth"] >= 1
     sdt = P("속")
     for _ in range(500):
         sdt = f"<w:sdt><w:sdtContent>{sdt}</w:sdtContent></w:sdt>"
-    out = md(docm(P("앞") + sdt))
-    assert "앞" in out
+    doc, ctx = parse(docm(P("앞") + sdt))
+    assert "앞" in markdown.render(doc, tmp() / "a") and ctx.skipped["depth"] >= 1
     box = "<w:r><w:t>상자</w:t></w:r>"
     for _ in range(300):
         box = f"<w:r><w:txbxContent><w:p>{box}</w:p></w:txbxContent></w:r>"
-    out = md(docm(P("앞") + f"<w:p>{box}</w:p>"))
-    assert "앞" in out
+    doc, ctx = parse(docm(P("앞") + f"<w:p>{box}</w:p>"))
+    assert "앞" in markdown.render(doc, tmp() / "a") and ctx.skipped["depth"] >= 1
 
+
+def test_unframed_hidden_and_deleted_text_is_never_shown():
+    inner = "<w:r><w:t>보임</w:t></w:r>"
+    for _ in range(200):
+        inner = f"<w:ins>{inner}</w:ins>"
+    deep = "<w:r><w:rPr><w:vanish/></w:rPr><w:t>숨김</w:t></w:r>"
+    for _ in range(100):
+        deep = f"<w:del>{deep}</w:del>"
+    body = f"<w:p>{inner}{deep}<w:r><w:t>끝</w:t></w:r></w:p>"
+    doc, ctx = parse(docm(body))
+    out = markdown.render(doc, tmp() / "a", True)
+    assert ctx.skipped["depth"] >= 1 and "숨김" not in out and "끝" in out
+    assert "숨김" not in markdown.render(doc, tmp() / "b", False)
+
+
+def test_missing_note_targets_counted():
+    doc, ctx = parse(docm('<w:p><w:r><w:t>x</w:t></w:r><w:r><w:commentReference w:id="9"/></w:r></w:p>'))
+    assert ctx.skipped["note"] == 1
 
 def test_repeated_parts_and_references():
     refs = "".join('<w:headerReference w:type="default" r:id="rH"/>' for _ in range(2000))
