@@ -29,6 +29,15 @@ Success:
 
 Carried over from the survey: processing stays on this machine, and the reader is used from Claude Code directly.
 
+### Scope change (user, 2026-11-11, during execution)
+
+Formats that Anthropic's built-in skills read directly are left to those skills and not benchmarked: pdf (`anthropic-skills:pdf`), docx (`anthropic-skills:docx`), pptx (`anthropic-skills:pptx`), xlsx and xlsm (`anthropic-skills:xlsx`). The bench covers the other 28 extensions; the summary's routing table still has 33 rows, the five built-in ones pointing at their skill.
+
+- doc and ppt stay in the bench: the skills read them only after a LibreOffice conversion, which this machine lacks until setup.
+- The baseline for the 28 becomes the built-in route: convert into a built-in format with LibreOffice or Calibre, then read it the way the skill does (docx: `pandoc -t markdown`; pptx: the skill's `scripts/slide_text.py`; xlsx: `markitdown`; pdf: the text layer plus page images, as `Read` sends them). Tokens are reported as a share of this route.
+- Engines whose claimed formats are all built-in are cloned but not installed, and recorded as not testable with that reason.
+- Generated pdf, docx, xlsx and pptx files remain only as intermediates. Real documents in built-in formats are not used.
+
 ## Machine
 
 Windows 11, no NVIDIA GPU, about 15 GB RAM, 131 GB free on C:. Present: Python 3.12, Node 24, uv, git, winget, poppler (`pdftoppm`), Tesseract. Absent: LibreOffice, Calibre, Java, Rust, Docker, WSL.

@@ -25,6 +25,7 @@
 - No engine's cloud feature is enabled (anydoc's Firecrawl route stays off). Downloads happen only in `setup` and corpus building. Portable builds first; winget only as fallback, and the user is told before any administrator prompt.
 - Real documents are read in place, never copied. Their names and content never enter the phro-project repository. Quotes from them appear only in `BENCH/reports/`.
 - Every `claude -p` batch (`calibrate`, `qa`) prints its estimate and runs only with `--approved`, which the main session passes after the user says yes. Model `claude-opus-5-5`.
+- Scope change (spec, "Scope change"): `BUILTIN = {pdf, docx, pptx, xlsx, xlsm}` are read by Anthropic's built-in skills and are not benchmarked: no index rows, no runs, no questions; they appear only as five routing rows in `summary.md`. The `claude-read` baseline is replaced by built-in route baselines `builtin>docx` (LibreOffice to docx, then `pandoc -t markdown`), `builtin>pptx` (LibreOffice to pptx, then the pptx skill's `slide_text.py` under `_gen`), `builtin>xlsx` (LibreOffice to xlsx, then `markitdown`) and `builtin>pdf` (Calibre or PyMuPDF to pdf, then `pdftotext` plus `pdftoppm -r 100` page images). `tools.py` adds portable pandoc. An engine whose formats are all in `BUILTIN` is cloned only, `not_testable`.
 - Reports are Korean; code, comments and working files are English. Files are UTF-8 without BOM, LF; write them with the Write tool or Python, never PowerShell `Set-Content`/`Out-File`.
 
 ## Review Focus
