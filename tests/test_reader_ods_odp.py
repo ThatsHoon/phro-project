@@ -104,7 +104,12 @@ def test_display_text_first():
     pct = c("", 'office:value-type="percentage" office:value="0.25"')
     flt = c("", 'office:value-type="float" office:value="3.0"')
     out = md(ods(sheet("S", [row(cur, pct, flt)])))
-    assert "₩1,385.50" in out and "25%" in out and "3.0" not in out and "3" in out, out
+    assert out == "## Sheet: S\n\n|₩1,385.50|25%|3|\n|---|---|---|\n", repr(out)
+
+
+def test_interior_repeat_kept():
+    out = md(ods(sheet("S", [row(c("a", 'table:number-columns-repeated="3"')), row(c("b"))])))
+    assert "|a|a|a|" in out.replace(" ", ""), out
 
 
 def test_value_types():
@@ -125,10 +130,12 @@ def test_interior_repeat_kept():
 
 
 def test_interior_gap_and_trailing_dropped():
-    out = md(ods(sheet("S", [row(c("a"), c(extra='table:number-columns-repeated="2"'), c("b")),
-                             row(extra='table:number-rows-repeated="500"'), row(c("z")),
-                             row(extra='table:number-rows-repeated="900000"')])))
-    assert "a" in out and "b" in out and "z" in out
+    xml = sheet("S", [row(c("a"), c("b")), row(extra='table:number-rows-repeated="500"'), row(c("z"), c("y")),
+                      row(extra='table:number-rows-repeated="900000"')])
+    doc, ctx = parse(ods(xml))
+    rows = doc.blocks[0].blocks[0].rows
+    assert len(rows) == 1 + 64 + 1, len(rows)  # the gap is capped, the trailing rows are gone
+    assert rows[-1][0].blocks[0].inlines[0].text == "z" and ctx.skipped["repeat"] == 1
 
 
 def test_hidden_sheet_by_style():
@@ -179,13 +186,23 @@ def test_columns_cut():
     assert len(doc.blocks[0].blocks[0].rows) == 1
 
 
+def test_characters_cut():
+    path = ods(sheet("S", [row(c("x" * 1000, 'table:number-columns-repeated="1000"'), extra='table:number-rows-repeated="1000"')]))
+    t0 = time.monotonic()
+    out = md(path)
+    assert time.monotonic() - t0 < 3
+    doc, ctx = parse(path)
+    assert f"sheet S cut at {limits.SHEET_CHARS} characters" in ctx.warnings, ctx.warnings
+    assert len(doc.blocks[0].blocks[0].rows) == limits.SHEET_CHARS // 1_000_000 and "xxxx" in out
+
+
 def test_cells_cut():
     path = ods(sheet("S", [row(c("x", 'table:number-columns-repeated="1000"'), extra='table:number-rows-repeated="1048000"')]))
     t0 = time.monotonic()
     doc, ctx = parse(path)
     assert time.monotonic() - t0 < 2
     assert f"sheet S cut at {limits.SHEET_CELLS} cells" in ctx.warnings, ctx.warnings
-    assert len(doc.blocks[0].blocks[0].rows) == limits.SHEET_CELLS // 1000
+    assert len(doc.blocks[0].blocks[0].rows) == limits.SHEET_CELLS // 1000 == 500
 
 
 def test_rows_cut():
@@ -198,9 +215,11 @@ def test_rows_cut():
 
 
 def test_hostile_span_clamped():
-    out = md(ods(sheet("S", [row(c("a", 'table:number-columns-spanned="999999999" table:number-rows-spanned="999999999"'), c("b")),
-                             row(c("c"), c("d"))])))
-    assert "a" in out and "d" in out
+    xml = sheet("S", [row(c("a", 'table:number-columns-spanned="999999999" table:number-rows-spanned="999999999"'), c("b")),
+                      row(c("c"), c("d"))])
+    doc, _ = parse(ods(xml))
+    a = doc.blocks[0].blocks[0].rows[0][0]
+    assert a.colspan == 1000 and a.rowspan == 2, (a.colspan, a.rowspan)  # the row span stops at the last row
 
 
 def test_nested_groups_depth():
@@ -210,9 +229,9 @@ def test_nested_groups_depth():
     assert "ok" in markdown.render(doc, tmp() / "a")
 
 
-def test_duplicate_sheet_names_deduped():
+def test_duplicate_sheet_names_kept():
     out = md(ods(sheet("S", [row(c("one"), c("1"))]) + sheet("S", [row(c("two"), c("2"))])))
-    assert out.count("## Sheet: S") == 1 and "two" not in out
+    assert out.count("## Sheet: S") == 2 and "one" in out and "two" in out
 
 
 def test_damaged_sheet_isolated():
@@ -243,12 +262,9 @@ def test_all_sheets_damaged_raises():
         odf.odf_sheets._Sheet.walk = orig
 
 
-def test_ods_without_sheets_is_damaged():
-    try:
-        parse(ods(""))
-        raise AssertionError("expected ReadError")
-    except ReadError as e:
-        assert e.kind == "damaged"
+def test_ods_without_sheets_is_empty():
+    doc, _ = parse(ods(""))
+    assert doc.blocks == []
 
 
 # ---- presentations
@@ -349,12 +365,9 @@ def test_damaged_page_isolated():
     assert ctx.skipped["slide"] == 1 and "## Slide 1: A" in out and "## Slide 3: C" in out and "Slide 2" not in out
 
 
-def test_odp_without_pages_is_damaged():
-    try:
-        parse(odp(""))
-        raise AssertionError("expected ReadError")
-    except ReadError as e:
-        assert e.kind == "damaged"
+def test_odp_without_pages_is_empty():
+    doc, _ = parse(odp(""))
+    assert doc.blocks == []
 
 
 def test_group_depth_capped():

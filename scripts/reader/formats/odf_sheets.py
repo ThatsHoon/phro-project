@@ -5,12 +5,22 @@ import re
 from .. import limits
 from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
+from ..markdown import blocks_len
 from ..model import Cell, Doc, Para, Section, Table, Text
 from .odf_base import Body, Styles, _GAP, _SPAN, _empty, _int, _squash
 
+_WS = re.compile(r"[ \t\r\n]+")
 _COVERED = "covered-table-cell"
+_NAMES = {}  # element tag -> local name; a sheet repeats a few tags millions of times
 _GROUPS = ("table-header-rows", "table-rows", "table-row-group")
 _HIDE_ROW = frozenset({"collapse", "filter"})
+
+
+def _ln(tag):
+    n = _NAMES.get(tag)
+    if n is None:
+        n = _NAMES[tag] = local(tag)
+    return n
 
 
 def _plain(v):
@@ -44,8 +54,8 @@ def _value(c) -> str:
 class _Sheet:
     """Rows of one table. Empty rows wait as a count until content follows; trailing ones are never built."""
 
-    def __init__(self, body, name, budget):
-        self.body, self.name, self.budget = body, name, budget  # budget: [cells left for the document]
+    def __init__(self, body, name, budget, chars):
+        self.body, self.name, self.budget, self.chars = body, name, budget, chars  # cells and characters left for the document
         self.rows, self.hidden, self.spanned = [], set(), []
         self.gap, self.stop, self.cols_cut = 0, False, False
 
@@ -62,7 +72,7 @@ class _Sheet:
         for c in cont:
             if self.stop:
                 return
-            n = local(c.tag)
+            n = _ln(c.tag)
             if n == "table-row":
                 self.row(c, d, header)
             elif n in _GROUPS:
@@ -70,7 +80,7 @@ class _Sheet:
 
     def row(self, tr, d, header):
         rep = max(1, _int(attr(tr, "number-rows-repeated"), 1))
-        cells = self.cells(tr, d, header)
+        cells, chars = self.cells(tr, d, header)
         if not cells and not self.cols_cut:
             self.gap += rep
             return
@@ -78,22 +88,25 @@ class _Sheet:
             gap, self.gap = self.gap, 0
             if gap > _GAP:
                 self.body.ctx.skipped["repeat"] += 1
-            self.add([], min(gap, _GAP), False)
+            self.add([], 0, min(gap, _GAP), False)
         if not self.stop:
-            self.add(cells, 1 if self.cols_cut else rep, attr(tr, "visibility") in _HIDE_ROW)
+            self.add(cells, chars, 1 if self.cols_cut else rep, attr(tr, "visibility") in _HIDE_ROW)
         if self.cols_cut:
             self.cut("columns", limits.SHEET_COLS)
 
-    def add(self, cells, rep, hidden):
-        """Append rep copies of a row, as many as the row and cell caps allow."""
+    def add(self, cells, chars, rep, hidden):
+        """Append rep copies of a row, as many as the row, cell and character caps allow."""
         w, n, why = len(cells), rep, None
         room = limits.SHEET_ROWS - len(self.rows)
         if n > room:
             n, why = room, ("rows", limits.SHEET_ROWS)
         if w and n > self.budget[0] // w:
             n, why = self.budget[0] // w, ("cells", limits.SHEET_CELLS)
+        if chars and n > self.chars[0] // chars:
+            n, why = self.chars[0] // chars, ("characters", limits.SHEET_CHARS)
         n = max(n, 0)
         self.budget[0] -= w * n
+        self.chars[0] -= chars * n
         copy = None
         for i in range(n):
             if i == 0:
@@ -111,51 +124,60 @@ class _Sheet:
 
     # ---- cells
     def cells(self, tr, d, header):
-        """The row's origin cells up to its last significant one; repeated empties past it are never built."""
-        out, gap, col = [], 0, 0  # col counts the pending empties too
+        """(the row's origin cells up to its last significant one, their text length);
+        repeated empties past the last one are never built."""
+        out, gap, col, chars = [], 0, 0, 0  # col counts the pending empties too
         empty = Cell([], header=header)
         self.cols_cut = False
         for c in tr:
-            n = local(c.tag)
+            n = _ln(c.tag)
             if n != "table-cell" and n != _COVERED:
                 continue
-            rep = max(1, _int(attr(c, "number-columns-repeated"), 1))
+            rep = cs = rs = 1
+            if c.attrib:
+                rep = max(1, _int(attr(c, "number-columns-repeated"), 1))
+                if n == "table-cell":
+                    cs = min(max(_int(attr(c, "number-columns-spanned"), 1), 1), _SPAN)
+                    rs = min(max(_int(attr(c, "number-rows-spanned"), 1), 1), _SPAN)
             if n == _COVERED:  # its origin's span covers the slot, so it has no cell of its own
                 col += rep
                 if col > limits.SHEET_COLS:
                     self.cols_cut = True
                     break
                 continue
-            cs = min(max(_int(attr(c, "number-columns-spanned"), 1), 1), _SPAN)
-            rs = min(max(_int(attr(c, "number-rows-spanned"), 1), 1), _SPAN)
-            blocks = self.blocks(c, d)
-            if _empty(blocks) and cs == 1 and rs == 1:
+            blocks, text = self.blocks(c, d)
+            if not text and cs == 1 and rs == 1:
                 gap += rep
                 col += rep
                 continue
-            fit = limits.SHEET_COLS - col  # a span's other slots arrive as covered cells
-            take = min(rep, fit)
+            take = min(rep, limits.SHEET_COLS - col)  # a span's other slots arrive as covered cells
             if take > 0:
                 out.extend([empty] * gap)
                 gap = 0
                 out.extend([Cell(blocks, rs, cs, header)] * take)
                 col += take
+                chars += blocks_len(blocks) * take
             if take < rep:
                 self.cols_cut = True
                 break
-        return out
+        return out, chars
 
     def blocks(self, c, d):
+        """(blocks, whether they carry anything but blank paragraphs)."""
+        if len(c) == 1:  # the common cell: one plain paragraph
+            p = c[0]
+            if len(p) == 0 and p.text and p.text.strip() and _ln(p.tag) == "p":
+                return [Para([Text(_WS.sub(" ", p.text))])], True
         blocks = self.body.blocks(c, d + 1)
-        if _empty(blocks):
+        if not blocks or _empty(blocks):
             v = _value(c)
-            return [Para([Text(v)])] if v else []
+            return ([Para([Text(v)])], True) if v else ([], False)
         for a in kids(c, "annotation"):
             out = []
             self.body.annotation(a, out, d + 1)
             if isinstance(blocks[0], Para):
                 blocks[0].inlines.extend(out)
-        return blocks
+        return blocks, True
 
     # ---- result
     def result(self):
@@ -179,29 +201,25 @@ def sheets(pkg, ctx, content, styles_root) -> Doc:
     office = next((c for b in kids(content, "body") for c in b if local(c.tag) == "spreadsheet"), None)
     if office is None:
         raise ReadError("damaged", "no readable body")
-    budget, seen, found, ok = [limits.SHEET_CELLS], set(), 0, 0
-    for t in kids(office, "table"):
-        name = _squash(attr(t, "name", ""), 200)
-        if name and name in seen:
-            ctx.skipped["duplicate"] += 1
-            continue
-        seen.add(name)
+    budget, chars, found, ok = [limits.SHEET_CELLS], [limits.SHEET_CHARS], 0, 0
+    for t in kids(office, "table"):  # sheets of the same name are kept: each is a separate element
         found += 1
+        name = _squash(attr(t, "name", ""), 200)
         try:
             with ctx.guard("sheet"):
-                body.doc.blocks.append(_section(body, t, name, budget))
+                body.doc.blocks.append(_section(body, t, name, budget, chars))
                 ok += 1
         except ReadError as e:
             if e.kind != "damaged":
                 raise
             ctx.skipped["sheet"] += 1
-    if not ok:
+    if found and not ok:
         raise ReadError("damaged", "no readable sheets")
     return body.doc
 
 
-def _section(body, t, name, budget) -> Section:
-    sh = _Sheet(body, name, budget)
+def _section(body, t, name, budget, chars) -> Section:
+    sh = _Sheet(body, name, budget, chars)
     sh.walk(t, 0, False)
     blocks = sh.result()
     for shapes in kids(t, "shapes"):  # charts and pictures anchored to the sheet

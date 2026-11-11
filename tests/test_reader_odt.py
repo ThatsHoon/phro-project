@@ -279,11 +279,8 @@ def test_dispatch_by_mimetype_and_body():
     assert md(odt_doc(P("본"), mime=MIME + "-template")) == "본\n"
     ods = odt_doc(P("x"), mime=None, extra={
         "content.xml": f'<office:document-content {NS}><office:body><office:spreadsheet/></office:body></office:document-content>'})
-    try:
-        parse(ods)
-        raise AssertionError("expected ReadError")
-    except ReadError as e:
-        assert e.kind == "damaged"
+    doc, _ = parse(ods)  # a spreadsheet with no sheets is empty, not damaged
+    assert doc.blocks == []
 
 
 def test_para_inlines_public():

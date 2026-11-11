@@ -115,7 +115,7 @@ def slides(pkg, ctx, content, styles_root) -> Doc:
             if e.kind != "damaged":
                 raise
             ctx.skipped["slide"] += 1
-    if not made:
+    if pages and not made:
         raise ReadError("damaged", "no readable slides")
     if styles_root is not None:
         with ctx.guard("master"):

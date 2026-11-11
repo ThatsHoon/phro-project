@@ -9,7 +9,8 @@ MAX_OUTPUT = 20 * 10**6
 CONVERT_SECONDS = 45
 SHEET_ROWS = 100_000
 SHEET_COLS = 1_000        # columns one sheet row may reach
-SHEET_CELLS = 1_000_000   # cells one document's sheets may materialize
+SHEET_CELLS = 500_000     # cells one document's sheets may materialize
+SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one document's sheets may materialize
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 
 
