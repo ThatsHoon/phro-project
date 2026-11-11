@@ -41,9 +41,22 @@ def scope(event):
     if not p.is_absolute() and isinstance(cwd, str) and cwd:
         p = Path(cwd) / p
     try:
+        p = long_path(p)
         return p if p.is_file() else None
-    except OSError:
+    except (OSError, ValueError):
         return None
+
+
+def long_path(p):
+    """On Windows, the \\\\?\\ form of an absolute path of 260 characters or more, which the file APIs accept even
+    when long paths are not enabled; any other path as it is. The hash, the checks and the child all use it."""
+    s = str(p)
+    if sys.platform != "win32" or len(s) < 260 or s.startswith("\\\\?\\") or not p.is_absolute():
+        return p
+    s = os.path.normpath(s)  # the prefix turns off the API's own clean-up of "/" and ".."
+    if s.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + s[2:])
+    return Path("\\\\?\\" + s)
 
 
 def _name(path):

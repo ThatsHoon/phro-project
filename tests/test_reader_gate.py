@@ -264,6 +264,57 @@ def test_gate_unicode_path():
         assert got.exists() and got.read_text(encoding="utf-8") == "안녕\n"
 
 
+def _odt_bytes(text):
+    from reader_fix import make_zip
+    ns = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+          'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"')
+    p = make_zip(tmp() / "a.odt", {
+        "mimetype": "application/vnd.oasis.opendocument.text",
+        "content.xml": (f"<office:document-content {ns}><office:body><office:text><text:p>{text}</text:p>"
+                        "</office:text></office:body></office:document-content>")})
+    return p.read_bytes()
+
+
+def test_long_windows_path_is_converted():
+    if sys.platform != "win32":
+        print("note: test_long_windows_path_is_converted runs on Windows only")
+        return
+    base = str(tmp())
+    long_dir = os.path.join(base, *(["d" * 60] * 4))
+    target = os.path.join(long_dir, "보고서.odt")
+    assert len(target) >= 260
+    try:
+        os.makedirs("\\\\?\\" + long_dir)
+        with open("\\\\?\\" + target, "wb") as f:
+            f.write(_odt_bytes("long path body"))
+    except OSError as e:
+        print(f"note: test_long_windows_path_is_converted skipped, the OS refused the long path ({e})")
+        return
+    old = os.environ.get("PHRO_READER_CACHE")
+    os.environ["PHRO_READER_CACHE"] = str(tmp())
+    try:
+        o = out(gate.decide(ev(target)))
+    finally:
+        if old is None:
+            os.environ.pop("PHRO_READER_CACHE", None)
+        else:
+            os.environ["PHRO_READER_CACHE"] = old
+    assert o["permissionDecision"] == "allow", o
+    assert Path(o["updatedInput"]["file_path"]).read_text(encoding="utf-8") == "long path body\n"
+    assert o["additionalContext"].startswith("보고서.odt was converted"), o["additionalContext"]
+
+
+def test_long_path_forms():
+    if sys.platform != "win32":
+        assert gate.long_path(Path("/x/" + "a" * 300)) == Path("/x/" + "a" * 300)
+        return
+    name = "a" * 300 + ".odt"
+    assert str(gate.long_path(Path("C:/x/../y/" + name))) == "\\\\?\\C:\\y\\" + name
+    assert str(gate.long_path(Path("//srv/share/" + name))) == "\\\\?\\UNC\\srv\\share\\" + name
+    assert str(gate.long_path(Path("\\\\?\\C:\\" + name))) == "\\\\?\\C:\\" + name
+    assert gate.long_path(Path("C:/x/a.odt")) == Path("C:/x/a.odt")
+
+
 def test_gate_uppercase_ext():
     with stub() as base:
         assert out(run(sample(name="X.TXTX"), base))["permissionDecision"] == "allow"
