@@ -75,7 +75,8 @@ def test_title_not_repeated():
 
 
 def test_bold_merge_and_heading():
-    assert R(Doc(blocks=[Para([Bold([Text("a ")]), Bold([Text("b")]), Text("c")])])) == "**a b** c\n"
+    assert R(Doc(blocks=[Para([Bold([Text("a ")]), Bold([Text("b")]), Text(" c")])])) == "**a b** c\n"
+    assert R(Doc(blocks=[Para([Bold([Text("bold")]), Text("s")])])) == "**bold**s\n"
     assert R(Doc(blocks=[Para([Text("x"), Bold([Text(" y ")]), Text("z")])])) == "x **y** z\n"
     assert R(Doc(blocks=[Heading(2, [Bold([Text("T")])])])) == "## T\n"
     assert R(Doc(blocks=[Heading(9, [Text("T")])])) == "###### T\n"

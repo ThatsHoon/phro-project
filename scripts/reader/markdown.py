@@ -81,19 +81,12 @@ class _Render:
             else:
                 parts.append(self._one(it, m))
         out = ""
-        prev_bold = False
         for p in parts:
             if isinstance(p, list):
                 s = self._bold(p, m)
-                if s.startswith("**") and out[-1:].isascii() and out[-1:].isalnum():
-                    out += " "
                 out += s
-                prev_bold = s.endswith("**")
             else:
-                if prev_bold and p[:1].isascii() and p[:1].isalnum():
-                    out += " "
                 out += p
-                prev_bold = False
         return out
 
     def _bold(self, items, m):
