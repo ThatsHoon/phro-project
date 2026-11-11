@@ -61,7 +61,7 @@ def cmd_hook(a) -> int:
     from reader import gate
     try:
         event = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return 0
     try:
         out = gate.decide(event)

@@ -128,6 +128,7 @@ def _fit(items, room):
 _CLEAN = {c: " " for c in [*range(0x20), *range(0x7f, 0xa0), 0x2028, 0x2029, *range(0x202a, 0x202f),
                             *range(0x2066, 0x206a)]}
 _CLEAN.update({ord(q): None for q in '"“”„‟″＂«»〝〞'})
+_CLEAN.update({c: None for c in (*range(0x200b, 0x2010), 0x061c, 0x2060, 0xfeff)})  # zero-width and bidi marks
 
 
 def _heading(text):
@@ -196,7 +197,8 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
         if left < limits.HOOK_CHILD_MIN:
             return _deny(path, "timeout", LATE)
         budget = min(timeout, left)
-        cmd = command or [sys.executable, "-I", "-X", "utf8", str(READ_PY), "convert", str(path), "--key", k]
+        # the child hashes the bytes itself: a file saved after this hash must not be filed under k
+        cmd = command or [sys.executable, "-I", "-X", "utf8", str(READ_PY), "convert", str(path)]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                errors="replace", timeout=budget)

@@ -438,7 +438,7 @@ Built formats: `hwpx`, `odt`, `ods`, `odp`, `docm`, `pptm`, `ppsx`, `epub`, `xps
 
 Always-on cost: for any file outside the 29 in-scope extensions the hook prints nothing, and each Read costs one Python start. Measured with `Measure-Command` over 20 runs of `read.py hook` on a `.py` event, the median is 84 ms.
 
-Converted output is cached by content hash at `%LOCALAPPDATA%\phro-project\reader\` on Windows and `~/.cache/phro-project/reader/` elsewhere, as `<sha1[:2]>/<sha1>/` holding `out.md`, `assets/` and `meta.json`. `python -I -X utf8 scripts/read.py prune [--days 30]` deletes entries not used for N days.
+Converted output is cached by a hash of the document's bytes and the reader's own source at `%LOCALAPPDATA%\phro-project\reader\` on Windows and `~/.cache/phro-project/reader/` elsewhere, as `<sha1[:2]>/<sha1>/` holding `out.md`, `assets/` and `meta.json`. `python -I -X utf8 scripts/read.py prune [--days 30]` deletes entries not used for N days.
 
 Hidden content (hidden sheets, slides, rows and text) is left out and marked. To get it in full:
 

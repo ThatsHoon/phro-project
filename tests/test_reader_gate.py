@@ -235,6 +235,32 @@ def test_heading_index_text_is_quoted_and_clean():
     assert c.endswith(f' Sections at lines: 5 "say hi now [2J end q", 12 "{"z" * 60}"'), c
 
 
+def test_heading_index_drops_invisible_marks():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = {"lines": 3000, "headings": [(5, "a‎b‏c؜d​e﻿f‍g")]}
+    c = gate._context("a.docx", meta, md)
+    assert c.endswith(' Sections at lines: 5 "abcdefg"'), c
+
+
+def test_child_hashes_the_file_itself():
+    # a key handed to the child would file a document saved in between under the old content's key
+    with stub():
+        p = sample()
+        seen = []
+        real = gate.subprocess.run
+
+        def fake(cmd, **kw):
+            seen.append(cmd)
+            raise gate.subprocess.TimeoutExpired(cmd, 1)
+        gate.subprocess.run = fake
+        try:
+            gate.decide(ev(p))
+        finally:
+            gate.subprocess.run = real
+        assert seen and "--key" not in seen[0], seen
+
+
 def test_heading_index_cut_whole_items():
     with stub() as base:
         parts = [f"# Heading number {i}" if i % 10 == 0 else f"p{i}" for i in range(2500)]
@@ -421,6 +447,12 @@ def hook(payload):
 def test_hook_cli_silent_for_other():
     r = hook({"tool_name": "Read", "tool_input": {"file_path": "C:/x.py"}})
     assert r.returncode == 0 and r.stdout == b""
+
+
+def test_hook_cli_deeply_nested_stdin():
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", str(READ), "hook"], input=b"[" * 100_000,
+                       capture_output=True)
+    assert r.returncode == 0 and r.stdout == b"" and b"Traceback" not in r.stderr, r.stderr[-300:]
 
 
 def test_hook_cli_deny_unicode():
