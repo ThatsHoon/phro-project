@@ -191,7 +191,7 @@ def test_cli_convert_and_fail():
 def test_cli_formats():
     r = run_cli("formats")
     lines = r.stdout.splitlines()
-    assert r.returncode == 0 and len(lines) == 28
+    assert r.returncode == 0 and len(lines) == 29
     assert any(ln.startswith("hwpx\thwpx\t") for ln in lines)
     assert lines == sorted(lines)
     assert all(ln.split("\t")[2] in ("built", "unsupported") for ln in lines)
