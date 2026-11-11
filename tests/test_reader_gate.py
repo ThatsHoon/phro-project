@@ -195,8 +195,28 @@ def test_heading_index_long_output():
     with stub() as base:
         parts = ["# H"] + [f"p{i}" for i in range(599)] + ["# H"] + [f"q{i}" for i in range(600)]
         c = out(run(sample("|".join(parts)), base))["additionalContext"]
-        assert "Sections at lines: 1 H, 1201 H" in c, c
+        assert 'Sections at lines: 1 "H", 1201 "H"' in c, c
         assert len(c) < 600
+
+
+def test_heading_index_reaches_the_second_level():
+    from reader import markdown
+    lines = ["# T"] + [f"## H{i}" if i % 62 == 0 and i < 2480 else f"p{i}" for i in range(2500)]
+    md = tmp() / "out.md"
+    md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    meta = markdown.stats(md.read_text(encoding="utf-8"))
+    assert len(meta["headings"]) == 41
+    c = gate._context("a.docx", meta, md)
+    assert ' Sections at lines: 1 "T", 2 "H0", 64 "H62", 126 "H124"' in c, c
+    assert len(c) < 600 and c.endswith(", …"), c
+
+
+def test_heading_index_text_is_quoted_and_clean():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = {"lines": 3000, "headings": [(5, 'say "hi"\nnow\x1b[2J\x85 ‮end “q” '), (9, '""'), (12, "z" * 80)]}
+    c = gate._context("a.docx", meta, md)
+    assert c.endswith(f' Sections at lines: 5 "say hi now [2J end q", 12 "{"z" * 60}"'), c
 
 
 def test_heading_index_cut_whole_items():

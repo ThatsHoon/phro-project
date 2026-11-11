@@ -1,4 +1,5 @@
 """The one Markdown renderer: every output format and token rule lives here."""
+import collections
 import re
 from pathlib import Path
 
@@ -637,7 +638,13 @@ def stats(md: str) -> dict:
         n_hidden = int(mo.group(1))
     heads = [(i, len(mo.group(1)), mo.group(2).strip())
              for i, ln in enumerate(lines, 1) if (mo := re.match(r"^(#{1,6}) (.+)$", ln))]
-    if heads:
-        top = min(h[1] for h in heads)
-        heads = [(i, t) for i, lvl, t in heads if lvl == top]
+    # every level down to the first one with 3 headings or more (all of them when none has), so a lone
+    # "#" title does not leave a long document with a one-entry index
+    count = collections.Counter(h[1] for h in heads)
+    deepest = max(count, default=0)
+    for lvl in sorted(count):
+        if count[lvl] >= 3:
+            deepest = lvl
+            break
+    heads = [(i, t) for i, lvl, t in heads if lvl <= deepest]
     return {"lines": len(lines), "hidden": n_hidden, "headings": heads}

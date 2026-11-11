@@ -242,7 +242,14 @@ def test_cell_heading_and_alt_escaped():
 def test_stats():
     assert markdown.stats("# A\n\nx\n\n# B\n") == {"lines": 5, "hidden": 0, "headings": [(1, "A"), (5, "B")]}
     s = markdown.stats("(3 hidden places left out)\n\n## A\n\n### b\n")
-    assert s["hidden"] == 3 and s["headings"] == [(3, "A")]
+    assert s["hidden"] == 3 and s["headings"] == [(3, "A"), (5, "b")]  # no level has 3: every level
+
+
+def test_stats_levels_down_to_the_first_with_three():
+    md = "# T\n\n## a\n\n### x\n\n## b\n\n## c\n\n#### y\n"
+    assert markdown.stats(md)["headings"] == [(1, "T"), (3, "a"), (7, "b"), (9, "c")]
+    md = "# A\n\n# B\n\n# C\n\n## d\n"
+    assert markdown.stats(md)["headings"] == [(1, "A"), (3, "B"), (5, "C")]
 
 
 def test_unread_line_words_and_order():

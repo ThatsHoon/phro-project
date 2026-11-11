@@ -118,6 +118,17 @@ def _fit(items, room):
     return out
 
 
+# a heading is document text promoted into Claude's context: drop quotes and control characters
+# (C0, DEL, C1, line and paragraph separators, bidi controls) before it is quoted there
+_CLEAN = {c: " " for c in [*range(0x20), *range(0x7f, 0xa0), 0x2028, 0x2029, *range(0x202a, 0x202f),
+                            *range(0x2066, 0x206a)]}
+_CLEAN.update({ord(q): None for q in '"“”„‟″＂«»〝〞'})
+
+
+def _heading(text):
+    return " ".join(str(text).translate(_CLEAN).split())[:60].strip()
+
+
 def _context(name, meta, out_md):
     n = meta.get("lines", 0)
     m = meta.get("images", 0)
@@ -148,10 +159,10 @@ def _context(name, meta, out_md):
     heads = meta.get("headings") or []
     if long_out and heads:
         prefix = " Sections at lines: "
-        entries = [f"{line} {' '.join(str(text).split())[:60]}" for line, text in heads]
+        entries = [f'{line} "{t}"' for line, text in heads if (t := _heading(text))]
         items = _fit(entries, CONTEXT_MAX - 1 - len(head) - len(tail) - len(prefix) - len(", …"))
         if items:
-            index = prefix + ", ".join(items) + (", …" if len(items) < len(heads) else "")
+            index = prefix + ", ".join(items) + (", …" if len(items) < len(entries) else "")
     return head + index + tail
 
 
