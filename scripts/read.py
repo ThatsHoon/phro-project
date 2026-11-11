@@ -39,7 +39,7 @@ def cmd_convert(a) -> int:
         print(f"FAIL	{e.kind}	{_flat(e.detail)}")
         return 1
     except Exception as e:  # noqa: BLE001
-        print(f"FAIL	damaged	{type(e).__name__}: {_flat(e)}")
+        print(f"FAIL	damaged	internal error {type(e).__name__}")  # the message may quote document text
         return 1
     return 0
 

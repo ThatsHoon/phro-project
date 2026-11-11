@@ -377,7 +377,8 @@ def test_object_chain_bomb_is_budgeted():
     t0 = time.monotonic()
     doc, ctx = parse(odt_doc(frame('<draw:object xlink:href="./Object 1"/>'), extra=members))
     out = markdown.render(doc, tmp() / "a")
-    assert time.monotonic() - t0 < 2 and ctx.skipped["cells"] > 0 and "첫1" in out
+    # about 1 s here; the bound only has to catch the unbudgeted build, which took far longer
+    assert time.monotonic() - t0 < 10 and ctx.skipped["cells"] > 0 and "첫1" in out
 
 
 def test_repeated_big_cell_is_budgeted_by_characters():

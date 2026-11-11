@@ -85,17 +85,22 @@ def looks_like_text(path):
     return not text.lstrip("﻿").startswith("{\\rtf")
 
 
-def deny_text(path, why):
-    cmd = f'python -I -X utf8 "{READ_PY}" convert "{path}"'
+def deny_text(path, why, retry=True):
+    """A deny; with retry, the convert command too (only where running it by hand can help)."""
+    reason = f"{_name(path)}: {why}."
+    if retry:
+        reason += f' Retry by hand: python -I -X utf8 "{READ_PY}" convert "{path}"'
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": f"{_name(path)}: {why}. Retry by hand: {cmd}",
+        "permissionDecisionReason": reason,
     }}
 
 
 def _deny(path, kind, detail=""):
-    if kind == "damaged":
+    if kind == "damaged" and detail.startswith("internal error"):
+        why = f"reading failed ({detail})"
+    elif kind == "damaged":
         why = f"the file looks damaged ({detail})"
     elif kind == "too_large":
         why = TOO_LARGE.get(detail.split(":", 1)[0], REASONS["too_large"])
@@ -103,7 +108,7 @@ def _deny(path, kind, detail=""):
         why = LATE_TEXT
     else:
         why = REASONS.get(kind) or f"{kind} {detail}".strip()
-    return deny_text(path, why)
+    return deny_text(path, why, retry=kind in ("damaged", "timeout"))
 
 
 def _fit(items, room):
@@ -133,9 +138,9 @@ def _context(name, meta, out_md):
     n = meta.get("lines", 0)
     m = meta.get("images", 0)
     k = meta.get("hidden", 0)
-    head = f"{name} was converted to Markdown by phro-project ({n} lines"
+    head = f"{name} was converted to Markdown by phro-project ({n} line{'' if n == 1 else 's'}"
     if m:
-        head += f", {m} images in assets/; Read them to view"
+        head += f", {m} image in assets/; Read it to view" if m == 1 else f", {m} images in assets/; Read them to view"
     head += ")."
     if k:
         head += f" {k} hidden places left out."

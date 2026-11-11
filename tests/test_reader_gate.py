@@ -162,7 +162,19 @@ def test_unsupported_phase():
     p.write_bytes(b"\xd0\xcf\x11\xe0\x00")
     o = out(gate.decide(ev(p)))
     assert o["permissionDecision"] == "deny"
-    assert o["permissionDecisionReason"].startswith("x.hwp: this format is not supported yet. Retry by hand:")
+    assert o["permissionDecisionReason"] == "x.hwp: this format is not supported yet.", o
+
+
+def test_retry_by_hand_only_where_it_can_help():
+    p = Path("d/a.docx")
+    for kind in ("unsupported", "encrypted", "drm", "too_large"):
+        why = out(gate._deny(p, kind, "x"))["permissionDecisionReason"]
+        assert "Retry by hand" not in why and why.endswith("."), why
+    for kind in ("damaged", "timeout"):
+        why = out(gate._deny(p, kind, "x"))["permissionDecisionReason"]
+        assert "Retry by hand: python -I -X utf8" in why, why
+    why = out(gate._deny(p, "damaged", "internal error KeyError"))["permissionDecisionReason"]
+    assert why.startswith("a.docx: reading failed (internal error KeyError). Retry by hand:"), why
 
 
 def test_allow_swaps_path_keeps_keys():
@@ -176,7 +188,7 @@ def test_allow_swaps_path_keeps_keys():
 def test_context_text_and_length():
     with stub() as base:
         c = out(run(sample(), base))["additionalContext"]
-        assert c == "a.txtx was converted to Markdown by phro-project (1 lines).", c
+        assert c == "a.txtx was converted to Markdown by phro-project (1 line).", c
         assert len(c) < 600
 
 
@@ -184,7 +196,11 @@ def test_context_unread_clause_fits():
     md = tmp() / "out.md"
     md.write_text("x\n", encoding="utf-8")
     meta = {"lines": 1, "unread": ["1 slide", "2 images"]}
-    assert gate._context("a.pptm", meta, md).endswith("(1 lines). Some parts could not be read: 1 slide, 2 images.")
+    assert gate._context("a.pptm", meta, md).endswith("(1 line). Some parts could not be read: 1 slide, 2 images.")
+    c = gate._context("a.pptm", {"lines": 2, "images": 1}, md)
+    assert c.endswith("(2 lines, 1 image in assets/; Read it to view)."), c
+    c = gate._context("a.pptm", {"lines": 2, "images": 3}, md)
+    assert c.endswith("(2 lines, 3 images in assets/; Read them to view)."), c
     meta = {"lines": 3000, "hidden": 4, "warnings": ["garbled"], "unread": [f"{i} kinds of thing" for i in range(60)],
             "headings": [(i, "h") for i in range(100)]}
     c = gate._context("n" * 250 + ".pptm", meta, md)

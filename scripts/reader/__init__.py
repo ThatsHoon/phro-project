@@ -79,7 +79,7 @@ def convert(src, out_dir, hidden=False) -> dict:
         "version": VERSION,
         "seconds": round(time.monotonic() - t0, 3),
         "lines": st["lines"],
-        "images": sum(1 for p in assets.iterdir() if p.is_file()) if assets.is_dir() else 0,
+        "images": info["images"],  # viewable images out.md links to, not every file in assets/
         "hidden": st["hidden"],
         "headings": st["headings"],
         "unread": info["unread"],

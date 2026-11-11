@@ -52,6 +52,32 @@ def test_hidden_rows_and_sections_count():
     assert out.splitlines()[0] == "(2 hidden places left out)" and "v" not in out
 
 
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+TIFF = b"II*\x00" + b"\x00" * 20
+
+
+def test_hidden_row_images_are_not_written():
+    def img(n):
+        return Cell([Image(PNG + bytes([n]), "")])
+
+    one_col = Table([[c("a")], [img(1)], [c("b")]], hidden_rows=frozenset({1}))
+    inner = Table([[c("x")], [img(2)], [c("y")]], hidden_rows=frozenset({1}))
+    nested = Table([[Cell([P("k"), inner]), c("z")]])
+    for doc in (Doc(blocks=[one_col]), Doc(blocks=[nested])):
+        d = Path(tempfile.mkdtemp())
+        info = {}
+        out = markdown.render(doc, d, info=info)
+        assert "![" not in out and not any(d.iterdir()), (out, list(d.iterdir()))
+        assert info["images"] == 0 and out.startswith("(1 hidden places left out)"), out
+
+
+def test_image_count_is_linked_and_viewable():
+    info = {}
+    doc = Doc(blocks=[Image(PNG + b"1"), P("x"), Image(PNG + b"1"), Image(PNG + b"2"), Image(TIFF, "t")])
+    out = markdown.render(doc, Path(tempfile.mkdtemp()), info=info)
+    assert out.count("![") == 3 and info["images"] == 2, (out, info)
+
+
 def test_hidden_included():
     doc = Doc(blocks=[P("secret", hidden="hidden"), Para([Hidden([Text("old")], "deleted")]),
                       Section("slide", "T", number=2, hidden="hidden"),

@@ -122,6 +122,7 @@ class _Render:
         self.note_no: dict[str, int] = {}
         self.assets = Assets(assets_dir)
         self.unviewable: list[str] = []
+        self.linked: set[str] = set()  # viewable images the output links to
         self.size = 0  # characters emitted so far by leaf blocks; building stops past MAX_OUTPUT
 
     # ---- hidden handling
@@ -279,6 +280,7 @@ class _Render:
         path, ok = self.assets.add(b.data, b.alt)
         alt = re.sub(r"\s+", " ", b.alt).strip()
         if ok:
+            self.linked.add(path)
             alt = alt.replace("\\", "\\\\").replace("]", "\\]")
             return m.esc(f"![{alt}](") + path + ")"
         if path and path not in self.unviewable:
@@ -434,15 +436,14 @@ class _Render:
         for r in range(nrows):
             if self.size + used > limits.MAX_OUTPUT:
                 break
+            if r in t.hidden_rows and not self.show:  # before the cells are built, so their images are not written
+                self.hidden_count += 1
+                continue
             cells = [self._cell_text(origins[k][0], m) for k in sorted(origins) if k[0] == r]
             cells = [x for x in cells if x]
             used += sum(len(x) + 3 for x in cells)
-            if r in t.hidden_rows:
-                if not self.show:
-                    self.hidden_count += 1
-                    continue
-                if cells:
-                    cells[0] = "(hidden) " + cells[0]
+            if r in t.hidden_rows and cells:
+                cells[0] = "(hidden) " + cells[0]
             if cells:
                 rows.append(" / ".join(cells))
         return " ; ".join(rows)
@@ -485,9 +486,11 @@ class _Render:
                     break
                 if (r, 0) not in origins:
                     continue
-                s = self._cell_text(origins[(r, 0)][0], LINES)
                 h = hid(r)
-                if s and h is not None:
+                if h is None:
+                    continue
+                s = self._cell_text(origins[(r, 0)][0], LINES)
+                if s:
                     lines.append(("(hidden) " if h else "") + s)
                     used += len(lines[-1]) + 1
             return finish("\n".join(lines))
@@ -622,12 +625,13 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     """Render a Doc to Markdown. The Doc is not modified.
 
     `skipped` is the parse context's skip counter; what it says was lost becomes a "(could not read: ...)" line.
-    A dict passed as `info` receives "unread" (that line's items) and "empty" (no content rendered at all).
+    A dict passed as `info` receives "unread" (that line's items), "empty" (no content rendered at all) and
+    "images" (how many viewable images the output links to).
     """
     r = _Render(doc, Path(assets_dir), hidden, skipped)
     md = _cap(_normalize(r.body()))
     if info is not None:
-        info.update(unread=r.unread, empty=r.empty and not r.hidden_count and not r.too_deep)
+        info.update(unread=r.unread, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked))
     return md
 
 

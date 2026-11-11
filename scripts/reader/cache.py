@@ -3,6 +3,7 @@ import hashlib
 import itertools
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -14,6 +15,7 @@ from . import VERSION, convert
 _counter = itertools.count()
 _lock = threading.Lock()
 _code = None
+_private = None  # this process's own cache root when the shared fallback is unsafe
 
 
 def root() -> Path:
@@ -28,9 +30,32 @@ def root() -> Path:
         base.mkdir(parents=True, exist_ok=True)
         return base
     except OSError:
-        fb = Path(tempfile.gettempdir()) / "phro-project-reader"
+        return _fallback()
+
+
+def _fallback() -> Path:
+    """A cache root in the temp dir. On POSIX, /tmp is shared between users, so the directory is per user, 0700,
+    owned by this user and not a symlink; failing that, a fresh private directory for this process only."""
+    global _private
+    tmp = Path(tempfile.gettempdir())
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:  # Windows: the temp dir is already per user
+        fb = tmp / "phro-project-reader"
         fb.mkdir(parents=True, exist_ok=True)
         return fb
+    fb = tmp / f"phro-project-reader-{getuid()}"
+    try:
+        fb.mkdir(mode=0o700, exist_ok=True)
+        st = os.lstat(fb)
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == getuid():  # lstat: a symlink is not S_ISDIR
+            if st.st_mode & 0o077:
+                os.chmod(fb, 0o700)
+            return fb
+    except OSError:
+        pass
+    if _private is None:  # mkdtemp makes it 0700; entries there are not found by later processes
+        _private = Path(tempfile.mkdtemp(prefix="phro-project-reader-", dir=tmp))
+    return _private
 
 
 def code_digest(base=None) -> str:

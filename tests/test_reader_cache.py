@@ -175,6 +175,60 @@ def test_cache_root_fallback():
             os.environ["PHRO_READER_CACHE"] = old
 
 
+def test_cache_root_fallback_is_private():
+    import shutil
+    import stat
+    old_env, old_tmp = os.environ.get("PHRO_READER_CACHE"), tempfile.gettempdir
+    had_uid, old_uid = hasattr(os, "getuid"), getattr(os, "getuid", None)
+    t = tmp()
+    f = t / "afile"
+    f.write_text("x")
+    me = os.lstat(t).st_uid  # 0 on Windows
+    posix = sys.platform != "win32"
+    try:
+        os.environ["PHRO_READER_CACHE"] = str(f)  # a file: the cache root cannot be made there
+        tempfile.gettempdir = lambda: str(t)
+        cache._private = None
+        os.getuid = lambda: me
+        mine = t / f"phro-project-reader-{me}"
+        assert cache.root() == mine and mine.is_dir()
+        if posix:
+            assert stat.S_IMODE(os.stat(mine).st_mode) == 0o700
+            os.chmod(mine, 0o777)
+            assert cache.root() == mine and stat.S_IMODE(os.stat(mine).st_mode) == 0o700
+        # a directory of that name owned by someone else: a fresh private directory, the same one all process long
+        os.getuid = lambda: me + 1
+        (t / f"phro-project-reader-{me + 1}").mkdir()
+        r = cache.root()
+        assert r.parent == t and r.name.startswith("phro-project-reader-") and r.name != f"phro-project-reader-{me + 1}"
+        assert cache.root() == r
+        if posix:
+            assert stat.S_IMODE(os.stat(r).st_mode) == 0o700
+        # a symlink in its place, where one can be made
+        cache._private = None
+        os.getuid = lambda: me
+        shutil.rmtree(mine)
+        (t / "elsewhere").mkdir()
+        try:
+            os.symlink(t / "elsewhere", mine, target_is_directory=True)
+        except OSError:
+            print("note: symlink case skipped (no symlink privilege)")
+        else:
+            r = cache.root()
+            assert r != mine and r.parent == t, r
+    finally:
+        tempfile.gettempdir = old_tmp
+        if had_uid:
+            os.getuid = old_uid
+        else:
+            del os.getuid
+        cache._private = None
+        if old_env is None:
+            os.environ.pop("PHRO_READER_CACHE", None)
+        else:
+            os.environ["PHRO_READER_CACHE"] = old_env
+
+
 def test_prune():
     with stub():
         p = sample()
@@ -268,7 +322,7 @@ def test_cli_other_exception():
 
     with stub(fn=boom):
         code, out = cli("convert", str(sample()))
-        assert code == 1 and out == "FAIL\tdamaged\tValueError: bad thing\n", repr(out)
+        assert code == 1 and out == "FAIL\tdamaged\tinternal error ValueError\n", repr(out)
 
 
 def test_cli_cache_hit_hidden_and_out():
