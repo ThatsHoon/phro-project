@@ -2,6 +2,7 @@
 from ..containers.zipx import Package, kids, local
 from ..limits import ReadError
 from ..model import Doc
+from . import odf_sheets, odf_slides
 from .odf_base import Body, Styles
 
 _MIME = "application/vnd.oasis.opendocument."
@@ -72,4 +73,6 @@ def parse(path, ctx) -> Doc:
         kind, content, styles_root = _open(pkg, ctx)
         if kind == "text":
             return _text(pkg, ctx, content, styles_root)
-        raise ReadError("unsupported", "ods/odp arrive in Task 10")
+        if kind == "spreadsheet":
+            return odf_sheets.sheets(pkg, ctx, content, styles_root)
+        return odf_slides.slides(pkg, ctx, content, styles_root)

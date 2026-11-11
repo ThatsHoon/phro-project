@@ -274,7 +274,7 @@ def test_dispatch_by_mimetype_and_body():
             parse(odt_doc(P("x"), mime=mime))
             raise AssertionError("expected ReadError")
         except ReadError as e:
-            assert e.kind == "unsupported"
+            assert e.kind == "damaged"
     assert md(odt_doc(P("본"), mime=None)) == "본\n"  # no mimetype: root body child decides
     assert md(odt_doc(P("본"), mime=MIME + "-template")) == "본\n"
     ods = odt_doc(P("x"), mime=None, extra={
@@ -283,7 +283,7 @@ def test_dispatch_by_mimetype_and_body():
         parse(ods)
         raise AssertionError("expected ReadError")
     except ReadError as e:
-        assert e.kind == "unsupported"
+        assert e.kind == "damaged"
 
 
 def test_para_inlines_public():

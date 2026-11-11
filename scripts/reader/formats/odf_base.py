@@ -335,6 +335,10 @@ class Body:
                     self.extras.append(Image(data, alt))
             elif n == "text-box":
                 self.extras.extend(self.blocks(k, d + 1))
+            elif n == "table":  # an Impress table sits directly in its frame
+                t = self.table(k, d + 1)
+                if t:
+                    self.extras.append(t)
             elif n == "frame":
                 self.frame(k, d + 1)
 
