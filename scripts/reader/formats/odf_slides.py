@@ -82,13 +82,14 @@ class _Slides:
             sec.blocks, sec.hidden = self.body.hide(blocks), "hidden"
         return sec
 
-    def master_text(self, styles_root, used) -> list:
+    def master_text(self, styles_root, used, footer=False) -> list:
+        skip = _MASTER_SKIP - {"footer"} if footer else _MASTER_SKIP  # a footer shown on a slide is content
         masters = [e for e in styles_root.iter() if local(e.tag) == "master-page"]
         out, seen = [], set()
         for m in [m for m in masters if attr(m, "name") in used] or masters:
             try:
                 with self.body.ctx.guard("master"):
-                    for el, _ in self.shapes(m, _MASTER_SKIP, True):
+                    for el, _ in self.shapes(m, skip, True):
                         text = _flat(self.blocks(el))
                         if text and text not in seen:
                             seen.add(text)
@@ -106,6 +107,7 @@ def slides(pkg, ctx, content, styles_root) -> Doc:
     if office is None:
         raise ReadError("damaged", "no readable body")
     sl, pages, made, used = _Slides(body), kids(office, "page"), [], set()
+    footer = any(body.styles.prop(attr(p, "style-name"), "drawing-page", "display-footer") == "true" for p in pages)
     for number, page in enumerate(pages, 1):  # numbering counts hidden and unreadable slides
         used.add(attr(page, "master-page-name"))
         try:
@@ -119,6 +121,6 @@ def slides(pkg, ctx, content, styles_root) -> Doc:
         raise ReadError("damaged", "no readable slides")
     if styles_root is not None:
         with ctx.guard("master"):
-            body.doc.blocks.extend(sl.master_text(styles_root, used))
+            body.doc.blocks.extend(sl.master_text(styles_root, used, footer))
     body.doc.blocks.extend(made)
     return body.doc

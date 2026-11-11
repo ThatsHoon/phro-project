@@ -322,6 +322,21 @@ def test_master_placeholder_skipped():
     assert out.index("ACME") < out.index("one")
 
 
+def test_master_footer_text_kept_when_slides_show_it():
+    shown = ('<style:style style:name="dp1" style:family="drawing-page"><style:drawing-page-properties '
+             'presentation:display-footer="true"/></style:style>')
+    hidden = shown.replace("dp1", "dp2").replace("true", "false")
+    masters = ('<style:master-page style:name="M">' + frame("Footer line", cls="footer")
+               + frame("", cls="footer") + '</style:master-page>')
+    two = page("p1", style="dp1", master="M") + page("p2", style="dp1", master="M")
+    out = md(odp(two, shown, masters=masters))
+    assert out.count("Footer line") == 1, out
+    off = md(odp(page("p1", style="dp2", master="M"), shown + hidden, masters=masters))
+    assert "Footer line" not in off, off
+    plain = md(odp(page("p1", master="M"), masters=masters))
+    assert "Footer line" not in plain, plain
+
+
 def test_shape_order_by_position():
     out = md(odp(page("p", frame("LOW", "1cm", "5cm"), frame("HIGH", "1cm", "2cm"))))
     assert out.index("HIGH") < out.index("LOW"), out
