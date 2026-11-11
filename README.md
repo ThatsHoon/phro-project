@@ -130,14 +130,14 @@ Say what the project should be able to do, and from when: "make this method a sk
 2. Collect competitors (`catalog`). Real misses come from the other installed skills.
 3. Build the test on a scratch copy (`build`). The plugin itself is not touched.
 4. State the estimate, get approval, then run `claude plugin eval`. A case costs about $0.15 at 55 skills on Opus.
-5. Tally (`tally`): hits, other skill, unresolved, no skill, wrong order, false fires. A run that ended abnormally with no skill called, by turn limit, timeout or API error, is unresolved, not a miss. A skill meant to fire after a step is graded by `tool_order`, so a call at the wrong moment is not a hit. An eval reads no project configuration, so its standing rule arrives through `append_system_prompt`.
+5. Tally (`tally`): hits, other skill, unresolved, no skill, wrong order, false fires. A run that ended abnormally with no skill called, by turn limit, timeout or API error, is unresolved, not a miss; `tally` names its kind and prints one rerun instruction per kind. `--save` keeps an accepted run's outcome per case, and `--accepted` reports later runs against it. A skill meant to fire after a step is graded by `tool_order`, so a call at the wrong moment is not a hit. An eval reads no project configuration, so its standing rule arrives through `append_system_prompt`.
 6. Act on the result:
 
    | Result | Next |
    |---|---|
    | Another skill took it | Read both descriptions, fix the overlap or merge |
    | No skill fired | Try the description, then `paths`, then a hook |
-   | Unresolved | Rerun, with a higher `--max-turns` if the turn limit ended it |
+   | Unresolved | Follow the `rerun` line for its kind: a higher `--max-turns`, one more try, a rerun as is, or read the error first |
    | Wrong order | Sharpen the wording of the standing rule |
    | False fire | Narrow the description |
    | All pass | Stop. Add nothing |
@@ -262,8 +262,8 @@ Run as `python -I -X utf8 scripts/project.py <command>`. `<plugin>` is a plugin 
 | `sql <plugin> "<select>"` | Read-only query on `node` and `edge` |
 | `mine <transcripts_dir> <cases.json> [--alias a=b] [--only a,b]` | Labeled prompts from typed commands |
 | `catalog <out.json> <skills_dir>... [--only a,b]` | Competitor skill descriptions |
-| `build <plugin> <cases.json> <out_dir> [--stub] [--also out.json] [--history f.jsonl] [--max-turns N]` | A scratch copy with eval cases. A case may add `after` and `rule` for a skill that fires from a step |
-| `tally <result.json>...` | Hits, misses by cause, wrong order, false fires |
+| `build <plugin> <cases.json> <out_dir> [--stub] [--also out.json] [--history f.jsonl] [--max-turns N]` | A scratch copy with eval cases, in a new folder; it refuses one that holds files. A case may add `after` and `rule` for a skill that fires from a step |
+| `tally <result.json>... [--save f] [--accepted f]` | Hits, misses by cause, wrong order, false fires, a rerun instruction per kind of abnormal end; outcomes saved or compared per case |
 
 Findings from `check` are candidates, not verdicts:
 
@@ -320,8 +320,8 @@ Run as `python -I -X utf8 scripts/restructure.py <command>`. State stays in `<ro
 python -I -X utf8 scripts/project.py mine <transcripts_dir> cases.json --only search,review
 python -I -X utf8 scripts/project.py catalog catalog.json <skills_dir>
 python -I -X utf8 scripts/project.py build <plugin> cases.json <out_dir> --stub --also catalog.json --history fixtures/midwork.jsonl
-claude plugin eval "<out_dir>" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --model <model> -j 1 --json result.json
-python -I -X utf8 scripts/project.py tally result.json
+claude plugin eval "<out_dir>" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --model <model> -j 1 --json <run>/result.json
+python -I -X utf8 scripts/project.py tally <run>/result.json
 ```
 
 Always pass `--no-publish`. The cost ceiling is checked only before each run starts, so spend can pass it by as many runs as `-j` allows.

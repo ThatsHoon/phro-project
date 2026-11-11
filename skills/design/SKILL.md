@@ -40,7 +40,11 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
    - From a step in the work: cases with `after` and `rule`, as `route-test` describes.
 8b. For a skill that produces something (text, a file, a decision), write what it must produce before the body: `skills/<name>/CONTRACT.md` and 3 to 5 cases in `evals/quality/<name>/`, by `${CLAUDE_PLUGIN_ROOT}/skills/design/references/quality.md`. Agree the contract with the user; after that it changes only on their word.
 9. Write the description last, from those prompts: what it does, then the words users really type, in their language. In one measurement, adding the user's own verbs to a description moved a skill from 1 of 7 to 6 of 7. Keep the combined description and when_to_use under 1,536 characters; shorter is better, since a description is read every session.
-10. Build it if the user told you to, and write its standing rule in the same step.
+10. Build it if the user told you to, and write its standing rule in the same step. A script or hook that runs several steps, or has a side effect such as a push, a deploy or a message, also gets:
+   - one JSON line per step start and end, under one run id, with the elapsed time and the error kind; no secrets or private paths in it;
+   - a log write that fails never stops the work;
+   - a step with a side effect runs once and is never retried by itself; retries follow a fixed list of error kinds;
+   - results go to a new folder each run, written as each step ends, never over an earlier run.
 11. Read `${CLAUDE_PLUGIN_ROOT}/skills/route-test/SKILL.md`, and `${CLAUDE_PLUGIN_ROOT}/skills/quality-test/SKILL.md` when 8b wrote cases. Both spend money, so state each estimate and get a yes, then follow route-test with the existing skills as competitors, and report any existing case that broke. Without that yes, report the capability as built and not measured.
 
-Report in the user's language: what was built, where, what makes it fire, what it produced against its contract, and what was measured. Mark as inference anything you did not measure.
+Report in the user's language: what was built, where and what makes it fire, what it produced against its contract, then what was measured in three parts. Verified: run on the real thing, with the command. Stand-in: measured through a substitute, such as stub bodies, a standing rule passed by `append_system_prompt` instead of the hook, or a fixture instead of real data; a stand-in pass never reads as the real thing working. Not verified: each item with the reason.

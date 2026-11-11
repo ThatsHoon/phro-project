@@ -401,7 +401,8 @@ def cmd_build(a):
     src, out = Path(a.plugin).resolve(), Path(a.out).resolve()
     if out == src or src in out.parents:
         sys.exit("out_dir must be outside the plugin")
-    shutil.rmtree(out, ignore_errors=True)
+    if out.exists() and any(out.iterdir()):
+        sys.exit(f"{out} exists and may hold an earlier run's results; give a new folder")
     ignore = shutil.ignore_patterns(*SKIP, "evals", "tests")
     if src.name == ".claude":
         for part in parts_of(src):
@@ -444,13 +445,45 @@ def cmd_build(a):
     print(f'next\tclaude plugin eval "{out}" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --json <result.json>{grant}')
 
 
+# Why a run ended abnormally decides what to do with it. First match wins.
+ERROR_KINDS = (
+    ("turn_limit", r"maximum number of turns", "rerun these cases after build with a higher --max-turns"),
+    ("timeout", r"timed out|timeout", "rerun once; if it repeats, raise timeout_seconds in the case"),
+    ("api_error", r"api error|overloaded|rate.?limit|\b(?:429|5\d\d)\b", "rerun as is; the service failed, not the skill"),
+    ("other", r"", "read the error before any rerun"),
+)
+
+
+def error_kind(error):
+    return next(kind for kind, pattern, _ in ERROR_KINDS if re.search(pattern, error, re.I))
+
+
+def compare(now, accepted):
+    """Case outcomes against an accepted run. An unresolved run on either side shows no change."""
+    good = ("hit", "ok")
+    for key, outcome in now.items():
+        before = accepted.get(key)
+        if before is None:
+            print(f"new\t{key}\t{outcome}")
+        elif "unresolved" in (before, outcome):
+            if before != outcome:
+                print(f"not compared\t{key}\t{before} -> {outcome}")
+        elif before != outcome:
+            verdict = "gained" if outcome in good else "broken" if before in good else "changed"
+            print(f"{verdict}\t{key}\t{before} -> {outcome}")
+
+
 def cmd_tally(a):
+    outcomes = {}
     for file in a.results:
         data = json.loads(Path(file).read_text(encoding="utf-8"))
         per = collections.defaultdict(lambda: [0, 0, 0, 0, 0])
         false_fires, misses, runs, negatives = [], [], 0, 0
+        reruns = collections.Counter()
         for case in data["cases"]:
-            for run in case["arms"]["with"]:
+            arm = case["arms"]["with"]
+            for i, run in enumerate(arm):
+                key = case["name"] if len(arm) == 1 else f"{case['name']}#{i + 1}"
                 runs += 1
                 graders = {g["name"]: g["passed"] for g in run["graders"]}
                 took = sorted(n[3:] for n, ok in graders.items() if n.startswith("to-") and ok)
@@ -458,11 +491,15 @@ def cmd_tally(a):
                 expected = m.group(1) if (m := re.search(r'\?([\w-]+)"$', pattern)) else None
                 # A run that ended abnormally with no skill yet, by turn limit, timeout or API error, has shown nothing; it is unresolved.
                 error = str(run.get("error") or "")[:60]
+                kind = error_kind(error) if error else ""
                 if expected is None:
                     if error and not took:
-                        misses.append(f"{case['name']} no skill expected -> unresolved, {error}")
+                        reruns[kind] += 1
+                        outcomes[key] = "unresolved"
+                        misses.append(f"{case['name']} no skill expected -> unresolved {kind}, {error}")
                         continue
                     negatives += 1
+                    outcomes[key] = f"false_fire:{','.join(took)}" if took else "ok"
                     if took:
                         false_fires.append(f"{case['name']} -> {','.join(took)}")
                     continue
@@ -470,16 +507,22 @@ def cmd_tally(a):
                 row[0] += 1
                 if graders.get("target") and graders.get("order", True):
                     row[1] += 1
+                    outcomes[key] = "hit"
                 elif graders.get("target"):
                     row[4] += 1
+                    outcomes[key] = "wrong_order"
                     misses.append(f"{case['name']} {expected} -> called, but not after the step")
                 elif took:
                     row[2] += 1
+                    outcomes[key] = f"other:{','.join(took)}"
                     misses.append(f"{case['name']} {expected} -> {','.join(took)}")
                 elif error:
                     row[3] += 1
-                    misses.append(f"{case['name']} {expected} -> unresolved, {error}")
+                    reruns[kind] += 1
+                    outcomes[key] = "unresolved"
+                    misses.append(f"{case['name']} {expected} -> unresolved {kind}, {error}")
                 else:
+                    outcomes[key] = "none"
                     misses.append(f"{case['name']} {expected} -> none")
         total, hit = sum(r[0] for r in per.values()), sum(r[1] for r in per.values())
         print(f"file\t{file}\truns\t{runs}\tcost\t{data.get('costUsd', 0):.2f}\tpartial\t{data.get('partial')}")
@@ -491,6 +534,14 @@ def cmd_tally(a):
             print(f"miss\t{line}")
         for line in false_fires:
             print(f"false_fire\t{line}")
+        for kind, _, action in ERROR_KINDS:
+            if reruns[kind]:
+                print(f"rerun\t{kind}\t{reruns[kind]}\t{action}")
+    if a.accepted:
+        compare(outcomes, json.loads(Path(a.accepted).read_text(encoding="utf-8")))
+    if a.save:
+        Path(a.save).write_text(json.dumps(outcomes, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"saved\t{a.save}")
 
 
 NOISE = 0.34  # one run in three moving is noise, two is a change
@@ -595,6 +646,8 @@ def main():
     p.set_defaults(fn=cmd_build)
     p = sub.add_parser("tally")
     p.add_argument("results", nargs="+")
+    p.add_argument("--accepted", help="case outcomes saved from an accepted run, to report gained and broken")
+    p.add_argument("--save", help="write this run's case outcomes, to accept it")
     p.set_defaults(fn=cmd_tally)
     p = sub.add_parser("quality")
     p.add_argument("result")

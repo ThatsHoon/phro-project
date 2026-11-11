@@ -191,6 +191,9 @@ def demo():
         out_dir = Path(d) / "copy"
         args = [sys.executable, "-I", "-X", "utf8", str(SCRIPT), "build", str(root), str(cases), str(out_dir), "--stub"]
         subprocess.run(args, check=True, capture_output=True)
+        (out_dir / "result.json").write_text("{}", encoding="utf-8")
+        again = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+        assert again.returncode != 0 and "exists" in again.stderr and (out_dir / "result.json").exists(), "a rebuild must not wipe an earlier run's evidence"
         assert "Stop here" in (out_dir / "skills/alpha/SKILL.md").read_text(encoding="utf-8")
         assert "Read `references" in (root / "skills/alpha/SKILL.md").read_text(encoding="utf-8"), "the plugin itself must stay untouched"
         assert "max: 0" in (out_dir / "evals/n1/graders/target.md").read_text(encoding="utf-8")
@@ -212,8 +215,22 @@ def demo():
         path.write_text(json.dumps(doc), encoding="utf-8")
         out = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "tally", str(path)], capture_output=True, text=True, encoding="utf-8").stdout
         assert "target\t2/6\tfalse_fires\t1/2" in out and "alpha\t6\t2\t1\t2\t1" in out and "c4 alpha -> none" in out, out
-        assert "c3 alpha -> unresolved, " + cut in out and "c5 alpha -> unresolved, " + api in out, "an abnormal end is not a miss, whatever ended it"
-        assert "n1 no skill expected -> unresolved, " + api in out and "false_fire\tn3 -> alpha" in out, "a negative that never ran proves nothing"
+        assert "c3 alpha -> unresolved turn_limit, " + cut in out and "c5 alpha -> unresolved api_error, " + api in out, "an abnormal end is not a miss, whatever ended it"
+        assert "n1 no skill expected -> unresolved api_error, " + api in out and "false_fire\tn3 -> alpha" in out, "a negative that never ran proves nothing"
+        assert "rerun\tturn_limit\t1\t" in out and "rerun\tapi_error\t2\t" in out, "each kind of abnormal end says what to do next, once"
+        assert "rerun\ttimeout" not in out, "n3 fired before its timeout, so it is a result, not an unresolved run"
+
+        accepted = Path(d) / "accepted.json"
+        subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "tally", str(path), "--save", str(accepted)], check=True, capture_output=True)
+        saved = json.loads(accepted.read_text(encoding="utf-8"))
+        assert saved["c1"] == "hit" and saved["c2"] == "other:beta" and saved["c3"] == "unresolved" and saved["n3"] == "false_fire:alpha", saved
+        doc["cases"][3] = result("c4", True, "alpha")
+        doc["cases"][0] = result("c1", False, "beta")
+        doc["cases"][2] = result("c3", True, "alpha")
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        out = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "tally", str(path), "--accepted", str(accepted)], capture_output=True, text=True, encoding="utf-8").stdout
+        assert "gained\tc4\tnone -> hit" in out and "broken\tc1\thit -> other:beta" in out, out
+        assert "gained\tc3" not in out and "not compared\tc3" in out, "an unresolved run on either side proves no change"
 
         def ordered(name, in_order):
             case = result(name, True, "alpha")
