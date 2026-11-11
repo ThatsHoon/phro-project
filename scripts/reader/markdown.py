@@ -12,7 +12,6 @@ from .model import (
 _PAGE_ONLY = re.compile(r"^[\s\-–—]*(page\s*)?\d+(\s*(of|/)\s*\d+)?\s*(쪽)?[\s\-–—]*$", re.I)
 _LINE_START = re.compile(r"^(#|>|[-*+] |\d+\. )")
 _HIDDEN_LINE = re.compile(r"^\((\d+) hidden places left out\)$")
-_SPAN_CAP = 1000
 _TRUNC = "(output truncated at 20 MB)"
 
 
@@ -224,9 +223,9 @@ class _Render:
                 if isinstance(b, ListItem):
                     s = b.marker + " " + s
             elif isinstance(b, Heading):
-                s = self.inlines(b.inlines, HEAD)
+                s = self.inlines(b.inlines, _Mode(" ", m.kind, True))
             elif isinstance(b, Image):
-                s = b.alt
+                s = m.esc(b.alt)
             elif isinstance(b, Equation):
                 s = m.esc(f"${b.tex}$")
             elif isinstance(b, Quote):
@@ -245,25 +244,60 @@ class _Render:
     def _cell_text(self, cell, m) -> str:
         return m.br.join(x for x in (self._flat(b, m) for b in cell.blocks) if x)
 
-    def _empty(self, cell) -> bool:
-        n = self.hidden_count
-        saved = dict(self.note_no)
-        empty = not self._cell_text(cell, PIPE)
-        self.hidden_count = n
-        self.note_no = saved
-        return empty
+    def _has_text(self, blocks) -> bool:
+        """Whether blocks would render to something, decided without rendering."""
+        self._enter()
+        try:
+            return any(self._block_has_text(b) for b in blocks)
+        finally:
+            self.depth -= 1
+
+    def _inl_has_text(self, items) -> bool:
+        for it in items:
+            if isinstance(it, Hidden) or it.hidden:
+                if not self.show:
+                    continue
+            if isinstance(it, Text):
+                if it.text.strip():
+                    return True
+            elif isinstance(it, (Bold, Hidden)):
+                if self._inl_has_text(it.inlines):
+                    return True
+            elif isinstance(it, Link):
+                if it.url.strip() or self._inl_has_text(it.inlines):
+                    return True
+            elif isinstance(it, (NoteRef, Math)):
+                return True
+        return False
+
+    def _block_has_text(self, b) -> bool:
+        if b.hidden and not self.show:
+            return False
+        if isinstance(b, (Para, ListItem, Heading)):
+            return self._inl_has_text(b.inlines) or isinstance(b, ListItem)
+        if isinstance(b, Image):
+            return bool(b.alt.strip())
+        if isinstance(b, Equation):
+            return True
+        if isinstance(b, (Quote, Section)):
+            return self._has_text(b.blocks)
+        if isinstance(b, Table):
+            return any(self._has_text(c.blocks) for r, row in enumerate(b.rows)
+                       if self.show or r not in b.hidden_rows for c in row)
+        return False
 
     def _grid(self, t: Table):
         """Origin cells by (row, col) on the reconstructed grid, trimmed: (origins, nrows, ncols)."""
         covered = set()
         origins = {}
+        width = max((len(row) for row in t.rows), default=0)
         for r, row in enumerate(t.rows):
             c = 0
             for cell in row:
                 while (r, c) in covered:
                     c += 1
-                rs = min(max(1, cell.rowspan), _SPAN_CAP)
-                cs = min(max(1, cell.colspan), _SPAN_CAP)
+                rs = min(max(1, cell.rowspan), len(t.rows) - r)
+                cs = min(max(1, cell.colspan), max(1, width))
                 origins[(r, c)] = (cell, rs, cs)
                 for dr in range(rs):
                     for dc in range(cs):
@@ -271,8 +305,8 @@ class _Render:
                 c += cs
         nrows = ncols = 0
         for (r, c), (cell, rs, cs) in origins.items():
-            if not self._empty(cell):
-                nrows = max(nrows, min(r + rs, len(t.rows)))
+            if self._has_text(cell.blocks):
+                nrows = max(nrows, r + rs)
                 ncols = max(ncols, c + cs)
         kept = {k: v for k, v in origins.items() if k[0] < nrows and k[1] < ncols}
         return kept, nrows, ncols
@@ -283,6 +317,12 @@ class _Render:
         for r in range(nrows):
             cells = [self._cell_text(origins[k][0], m) for k in sorted(origins) if k[0] == r]
             cells = [x for x in cells if x]
+            if r in t.hidden_rows:
+                if not self.show:
+                    self.hidden_count += 1
+                    continue
+                if cells:
+                    cells[0] = "(hidden) " + cells[0]
             if cells:
                 rows.append(" / ".join(cells))
         return " ; ".join(rows)

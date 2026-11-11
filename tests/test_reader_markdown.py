@@ -189,6 +189,42 @@ def test_depth_guard():
     raise AssertionError("ReadError not raised")
 
 
+def test_deep_nesting_is_fast():
+    import time
+    t0 = time.time()
+    tb = Table([[c("leaf")]])
+    for _ in range(30):
+        tb = Table([[Cell([P("k"), tb])]])
+    out = R(Doc(blocks=[Table([[Cell([P("k"), tb]), c("z")]])]))
+    assert time.time() - t0 < 1 and "leaf" in out
+
+
+def test_nested_hidden_rows():
+    inner = Table([[c("a")], [c("SECRET")], [c("b")]], hidden_rows=frozenset({1}))
+    doc = Doc(blocks=[Table([[Cell([inner]), c("z")]])])
+    out = R(doc)
+    assert "SECRET" not in out and out.splitlines()[0] == "(1 hidden places left out)" and "|a ; b|z|" in out
+    assert "|a ; (hidden) SECRET ; b|z|" in R(doc, hidden=True)
+
+
+def test_span_is_clamped():
+    import time
+    t0 = time.time()
+    doc = Doc(blocks=[Table([[c("a", rowspan=10**6, colspan=10**6), c("b")], [c("d")]])])
+    out = R(doc)
+    assert time.time() - t0 < 1 and 'rowspan="2"' in out and "colspan" not in out.replace('colspan="2"', "")
+
+
+def test_cell_heading_and_alt_escaped():
+    h = Cell([Heading(2, [Text("a|b")])])
+    assert "|a\\|b|z|" in R(Doc(blocks=[Table([[h, c("z")]])]))
+    img = Cell([Image(b"x", alt="p|q")])
+    assert "|p\\|q|z|" in R(Doc(blocks=[Table([[img, c("z")]])]))
+    h2 = Cell([Heading(1, [Text("<&>")]), Image(b"x", alt="<i>")])
+    out = R(Doc(blocks=[Table([[h2, c("z", colspan=1, rowspan=2)], [c("y")]])]))
+    assert "&lt;&amp;>" in out and "&lt;i>" in out
+
+
 def test_stats():
     assert markdown.stats("# A\n\nx\n\n# B\n") == {"lines": 5, "hidden": 0, "headings": [(1, "A"), (5, "B")]}
     s = markdown.stats("(3 hidden places left out)\n\n## A\n\n### b\n")
