@@ -550,12 +550,17 @@ NOISE = 0.34  # one run in three moving is noise, two is a change
 def cmd_quality(a):
     """Output quality of a with-without run: per case and grader, pass rate in each arm and what it proves."""
     data = json.loads(Path(a.result).read_text(encoding="utf-8"))
-    rows, breaks, cost = [], [], collections.Counter()
+    rows, breaks, cost, reruns = [], [], collections.Counter(), collections.Counter()
     for case in data["cases"]:
         defs = {g["name"]: g for g in case.get("graders", [])}
         withs, withouts = case["arms"].get("with", []), case["arms"].get("without", [])
         for arm, runs in (("with", withs), ("without", withouts)):
             cost[arm] += sum(r.get("costUsd") or 0 for r in runs)
+        # A run that ended abnormally never produced its output, so it neither passes nor fails a grader.
+        aborted = [r for r in withs + withouts if r.get("error")]
+        for r in aborted:
+            reruns[error_kind(str(r["error"]))] += 1
+        withs, withouts = [r for r in withs if not r.get("error")], [r for r in withouts if not r.get("error")]
         indicator = {n for n, g in defs.items() if g.get("type") == "tool_used" and g.get("config", {}).get("tool") == "Skill"}
 
         def rate(runs, name):
@@ -563,8 +568,7 @@ def cmd_quality(a):
             return sum(seen) / len(seen) if seen else None
         fired = sum(any(g["passed"] for g in r["graders"] if g["name"] in indicator) for r in withs)
         fired = f"{fired}/{len(withs)}" if indicator else "-"  # no indicator grader: firing unknown, not 0
-        errors = sum(bool(r.get("error")) for r in withs + withouts)
-        print(f"case\t{case['name']}\tfired\t{fired}\terrors\t{errors}")
+        print(f"case\t{case['name']}\tfired\t{fired}\tunresolved\t{len(aborted)}")
         for name in sorted(defs):
             if name in indicator:
                 continue
@@ -583,6 +587,9 @@ def cmd_quality(a):
     print(f"file\t{a.result}\tcost_with\t{cost['with']:.2f}\tcost_without\t{cost['without']:.2f}\tpartial\t{data.get('partial')}")
     for line in breaks:
         print(f"break\t{line}")
+    for kind, _, action in ERROR_KINDS:
+        if reruns[kind]:
+            print(f"rerun\t{kind}\t{reruns[kind]}\t{action}")
     print("case\tgrader\twith\twithout\tdelta\tflags")
     for name, grader_name, w, wo, flags in rows:
         delta = "" if wo is None else f"{w - wo:+.2f}"

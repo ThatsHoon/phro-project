@@ -261,6 +261,15 @@ def demo():
         assert "gained\tq1\tj-faith\t0.33 -> 0.67" not in out, "one run in three moving is noise"
         assert "new\tq2\tj-faith\t1.00" in out and "broken" not in out, out
         assert "\tskill\t" not in out.split("case\tgrader")[1], "the indicator has no row"
+
+        broke = arm({"skill": 3, "b-ban": 3, "f-num": 3, "j-faith": 3})
+        broke[2] = {"costUsd": 0.1, "error": "exit 1: API Error: 529 overloaded", "graders": [{"name": g["name"], "passed": False} for g in defs]}
+        doc = {"partial": False, "cases": [{"name": "q4", "graders": defs, "arms": {"with": broke, "without": arm({"b-ban": 0, "f-num": 0, "j-faith": 0})}}]}
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        out = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "quality", str(path)], capture_output=True, text=True, encoding="utf-8").stdout
+        assert "case\tq4\tfired\t2/2\tunresolved\t1" in out, "an aborted run is neither a firing nor a miss"
+        assert "break\t" not in out and "q4\tb-ban\t1.00\t0.00\t+1.00\t\n" in out, "a run that never finished does not fail its graders"
+        assert "rerun\tapi_error\t1\t" in out, out
     print("ok")
 
 

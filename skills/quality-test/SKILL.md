@@ -25,7 +25,7 @@ claude plugin eval "<copy>" --eval-dir evals/quality --case "<case glob>" --abla
 project.py quality <out>/quality.json [--accepted evals/quality/<name>/accepted.json]
 ```
 
-`--case` matches case folder names. Keep `<out>` outside the plugin. The ceiling is checked before each run starts, so set it below what the user approved. A difference of one run in three is noise.
+`--case` matches case folder names. Keep `<out>` outside the plugin. The ceiling is checked before each run starts, so set it below what the user approved. A difference of one run in three is noise. A run that ended abnormally is `unresolved`: it is left out of every rate, and its `rerun` line says what to do.
 
 ## 3. Decide with the user
 
