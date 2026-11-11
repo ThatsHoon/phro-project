@@ -51,6 +51,7 @@ class _Render:
         self.note_no: dict[str, int] = {}
         self.assets = Assets(assets_dir)
         self.unviewable: list[str] = []
+        self.size = 0  # characters emitted so far by leaf blocks; building stops past MAX_OUTPUT
 
     # ---- hidden handling
     def _skip(self, node) -> bool:
@@ -131,9 +132,15 @@ class _Render:
         try:
             out = []
             for b in blocks:
+                if self.size > limits.MAX_OUTPUT:
+                    break
                 if self._skip(b):
                     continue
-                out.extend(self._block(b))
+                before = self.size
+                got = self._block(b)
+                if self.size == before:  # nothing nested was counted: count this block itself
+                    self.size += sum(len(s) + 2 for _, s in got)
+                out.extend(got)
             return out
         finally:
             self.depth -= 1

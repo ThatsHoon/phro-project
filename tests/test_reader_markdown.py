@@ -252,6 +252,22 @@ def test_garble_ratio_and_squash():
     assert text.squash("a  b \r\nc   \rd") == "a b\nc\nd"
 
 
+def test_output_cap_applies_while_building():
+    import time
+    old = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 100_000
+    try:
+        one = P("x" * 1000)
+        for blocks in ([one] * 1_000_000, [Section("chapter", blocks=[one] * 1_000_000)],
+                       [Quote([one] * 1_000_000)]):
+            t0 = time.monotonic()
+            out = R(Doc(blocks=blocks))
+            assert time.monotonic() - t0 < 3
+            assert out.endswith("(output truncated at 20 MB)" + chr(10)) and len(out) < 150_000
+    finally:
+        limits.MAX_OUTPUT = old
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
