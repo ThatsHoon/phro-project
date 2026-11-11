@@ -2,82 +2,23 @@
 import re
 
 from .. import limits
-from ..containers.zipx import attr, first, kids, local
+from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
-from . import ooxml
+from . import ooxml_base
+from .ooxml_base import int_of as _int, is_on as _on, val as _val
+from .ooxml_styles import Numbering, Styles, numpr
 
 IMAGE_BYTES = 256 * 2**20  # image bytes one document may emit, copies counted
 CHART_CELLS = 200_000      # chart table cells one document may emit, copies counted
 MAX_COLS = 1_000
-MAX_URL, MAX_ALT, MAX_NAME, MAX_MARKER, MAX_INSTR = 1000, 200, 64, 64, 300
+MAX_URL, MAX_ALT, MAX_NAME, MAX_INSTR = 1000, 200, 64, 300
 
-_HEAD = re.compile(r"^heading\s*(\d+)$", re.I)
-_PLACEHOLDER = re.compile(r"%([1-9])")
 _HYPERLINK = re.compile(r'^\s*HYPERLINK\s+(?:"([^"]*)"|([^\s"\\]+))', re.I)
 _NOTE_SKIP = frozenset({"separator", "continuationSeparator", "continuationNotice"})
 _NOTE_REFS = {"footnoteReference": "fn-", "endnoteReference": "en-", "commentReference": "cm-"}
 _SKIP = frozenset({"pPr", "rPr", "sectPr", "tblPr", "trPr", "tcPr", "proofErr", "bookmarkStart", "bookmarkEnd",
                    "commentRangeStart", "commentRangeEnd", "docPr", "extent", "effectExtent", "lastRenderedPageBreak"})
-_SYLLABLE = "가나다라마바사아자차카타파하"
-_JAMO = "ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎ"
-_ROMAN = ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
-          (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"))
-
-
-def _int(s, default=0):
-    try:
-        return int(s)
-    except (TypeError, ValueError):
-        return default
-
-
-def _on(el) -> bool:
-    return attr(el, "val") not in ("0", "false", "off")
-
-
-def _val(el):
-    return attr(el, "val") if el is not None else None
-
-
-# ---- numbering formats
-def _roman(n):
-    if not 0 < n < 4000:
-        return str(n)
-    out = ""
-    for v, s in _ROMAN:
-        while n >= v:
-            out += s
-            n -= v
-    return out
-
-
-def _bijective(n, alphabet):
-    out = ""
-    while n > 0:
-        n, r = divmod(n - 1, len(alphabet))
-        out = alphabet[r] + out
-    return out or str(n)
-
-
-def _fmt(n, kind):
-    if n < 1:
-        return str(n)
-    if kind == "lowerLetter":
-        return _bijective(n, "abcdefghijklmnopqrstuvwxyz")
-    if kind == "upperLetter":
-        return _bijective(n, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    if kind == "lowerRoman":
-        return _roman(n).lower()
-    if kind == "upperRoman":
-        return _roman(n)
-    if kind == "ganada":
-        return _bijective(n, _SYLLABLE)
-    if kind == "chosung":
-        return _bijective(n, _JAMO)
-    if kind == "decimalEnclosedCircle":
-        return chr(0x2460 + n - 1) if n <= 20 else str(n)
-    return str(n)
 
 
 # ---- inline helpers
@@ -130,8 +71,7 @@ class _Reader:
     def __init__(self, pkg, part, ctx):
         self.pkg, self.part, self.ctx = pkg, part, ctx
         self.doc = Doc()
-        self.styles, self.chains = {}, {}
-        self.abstracts, self.nums, self.counters = {}, {}, {}
+        self.styles, self.numbering = Styles(), Numbering()
         self.scope = None
         self.image_bytes = 0
         self.chart_cells = 0
@@ -145,7 +85,7 @@ class _Reader:
     def related(self, suffix, kind):
         """Unique internal targets of the main part's relationships of one type, in order; missing ones are counted."""
         out = []
-        for rel in ooxml.rels(self.pkg, self.part, self.ctx).values():
+        for rel in ooxml_base.rels(self.pkg, self.part, self.ctx).values():
             if rel.external or not rel.type.endswith(suffix):
                 continue
             if not self.pkg.has(rel.target):
@@ -157,13 +97,13 @@ class _Reader:
     def open(self, name, kind):
         """Make `name` the current scope; its root, or None (counted) when damaged."""
         try:
-            root, nsmap = ooxml.load(self.pkg, name)
+            root, nsmap = ooxml_base.load(self.pkg, name)
         except ReadError as e:
             if e.kind != "damaged":
                 raise
             self.ctx.skipped[kind] += 1
             return None
-        self.scope = _Scope(name, ooxml.rels(self.pkg, name, self.ctx), nsmap)
+        self.scope = _Scope(name, ooxml_base.rels(self.pkg, name, self.ctx), nsmap)
         return root
 
     def run(self):
@@ -171,12 +111,12 @@ class _Reader:
             root = self.open(name, "styles")
             if root is not None:
                 with self.ctx.guard("styles"):
-                    self.load_styles(root)
+                    self.styles.load(root)
         for name in self.related("/numbering", "numbering")[:1]:
             root = self.open(name, "numbering")
             if root is not None:
                 with self.ctx.guard("numbering"):
-                    self.load_numbering(root)
+                    self.numbering.load(root)
         for suffix, tag, prefix in (("/footnotes", "footnote", "fn-"), ("/endnotes", "endnote", "en-")):
             for name in self.related(suffix, "footnotes")[:1]:
                 root = self.open(name, "footnotes")
@@ -200,111 +140,6 @@ class _Reader:
             raise ReadError("damaged", "no readable body")
         self.doc.blocks.extend(self.blocks(body, 0))
         return self.doc
-
-    # ---- styles
-    def load_styles(self, root):
-        for s in kids(root, "style"):
-            sid = attr(s, "styleId")
-            if not sid:
-                continue
-            d = {"name": "", "based": None, "outline": None, "num": (None, None), "bold": None, "vanish": None}
-            for c in s:
-                n = local(c.tag)
-                if n == "name":
-                    d["name"] = (_val(c) or "")[:MAX_NAME]
-                elif n == "basedOn":
-                    d["based"] = _val(c)
-                elif n == "pPr":
-                    for e in c:
-                        en = local(e.tag)
-                        if en == "outlineLvl":
-                            d["outline"] = _int(_val(e), None)
-                        elif en == "numPr":
-                            d["num"] = self.numpr(e)
-                elif n == "rPr":
-                    for e in c:
-                        en = local(e.tag)
-                        if en in ("b", "vanish"):
-                            d["bold" if en == "b" else "vanish"] = _on(e)
-            self.styles[sid] = d
-
-    def chain(self, sid):
-        """The style and its basedOn ancestors, nearest first; cycles and runaway chains stop."""
-        if sid not in self.chains:
-            out, seen, cur = [], set(), sid
-            while cur and cur not in seen and cur in self.styles and len(out) < limits.MAX_DEPTH:
-                seen.add(cur)
-                out.append(self.styles[cur])
-                cur = self.styles[cur]["based"]
-            self.chains[sid] = out
-        return self.chains[sid]
-
-    @staticmethod
-    def numpr(el):
-        ids = kids(el, "numId")
-        lv = kids(el, "ilvl")
-        return (_val(ids[0]) if ids else None, _val(lv[0]) if lv else None)
-
-    @staticmethod
-    def prop(chain, key):
-        return next((s[key] for s in chain if s[key] is not None), None)
-
-    def heading_level(self, own, chain) -> int:
-        if own is not None:
-            return min(own + 1, 6) if 0 <= own <= 8 else 0
-        for s in chain:
-            if m := _HEAD.match(s["name"].strip()):
-                return min(max(int(m.group(1)), 1), 6)
-            if s["name"].strip().lower() == "title":
-                return 1
-        lvl = self.prop(chain, "outline")
-        return min(lvl + 1, 6) if lvl is not None and 0 <= lvl <= 8 else 0
-
-    # ---- numbering
-    def load_numbering(self, root):
-        for a in kids(root, "abstractNum"):
-            aid = attr(a, "abstractNumId")
-            levels = {}
-            for lv in kids(a, "lvl"):
-                st, nf, tx = (first(lv, k) for k in ("start", "numFmt", "lvlText"))
-                levels[_int(attr(lv, "ilvl"))] = (_int(_val(st), 1), _val(nf) or "decimal", (_val(tx) or "")[:MAX_MARKER])
-            if aid is not None:
-                self.abstracts[aid] = levels
-        for n in kids(root, "num"):
-            nid = attr(n, "numId")
-            ab = kids(n, "abstractNumId")
-            over = {_int(attr(o, "ilvl")): _int(_val(first(o, "startOverride")), 1)
-                    for o in kids(n, "lvlOverride") if first(o, "startOverride") is not None}
-            if nid is not None and ab:
-                self.nums[nid] = (_val(ab[0]), over)
-
-    def marker(self, nid, lvl):
-        """List marker for the next paragraph at (numId, level); None when the list is not defined."""
-        num = self.nums.get(nid)
-        if num is None:
-            return None
-        levels, over = self.abstracts.get(num[0], {}), num[1]
-        info = levels.get(lvl)
-        if info is None:
-            return None
-
-        def start(k):
-            return over.get(k, levels[k][0] if k in levels else 1)
-
-        cnt = self.counters.setdefault(nid, {})
-        cnt[lvl] = cnt.get(lvl, start(lvl) - 1) + 1
-        for k in [k for k in cnt if k > lvl]:
-            del cnt[k]
-        if info[1] == "bullet":
-            return "-"
-        if info[1] == "none":
-            return ""
-
-        def sub(m):
-            k = int(m.group(1)) - 1
-            return _fmt(cnt.get(k, start(k)), levels[k][1] if k in levels else "decimal")
-
-        return _PLACEHOLDER.sub(sub, info[2])[:MAX_MARKER].strip()
 
     # ---- notes
     def load_notes(self, root, tag, prefix):
@@ -362,7 +197,7 @@ class _Reader:
         return []
 
     def choose(self, el):
-        chosen = ooxml.alternate(el, self.scope.nsmap)
+        chosen = ooxml_base.alternate(el, self.scope.nsmap)
         if chosen is None:
             self.ctx.skipped["alternate"] += 1
         return chosen
@@ -388,18 +223,18 @@ class _Reader:
                 elif en == "outlineLvl":
                     own_outline = _int(_val(e), None)
                 elif en == "numPr":
-                    own_num, own_lvl = self.numpr(e)
+                    own_num, own_lvl = numpr(e)
         self.close_to(st, 1)
         inl = st.frames[0].inl
-        chain = self.chain(pstyle)
+        chain = self.styles.chain(pstyle)
         num_id, lvl = own_num, own_lvl
         if num_id is None or lvl is None:
             s_num = next((s["num"] for s in chain if s["num"] != (None, None)), (None, None))
             num_id = num_id if num_id is not None else s_num[0]
             lvl = lvl if lvl is not None else s_num[1]
-        mark = self.marker(num_id, _int(lvl)) if num_id not in (None, "0") else None
-        level = self.heading_level(own_outline, chain)
-        hidden = "hidden" if self.prop(chain, "vanish") else ""
+        mark = self.numbering.marker(num_id, _int(lvl)) if num_id not in (None, "0") else None
+        level = self.styles.heading_level(own_outline, chain)
+        hidden = "hidden" if self.styles.prop(chain, "vanish") else ""
         main = None
         if level and _itext(inl).strip():
             if mark and mark != "-":
@@ -484,9 +319,9 @@ class _Reader:
                     vanish = _on(e)
                 elif en == "rStyle":
                     rstyle = _val(e)
-        chain = self.chain(rstyle)
-        bold = bold if bold is not None else self.prop(chain, "bold")
-        vanish = vanish if vanish is not None else self.prop(chain, "vanish")
+        chain = self.styles.chain(rstyle)
+        bold = bold if bold is not None else self.styles.prop(chain, "bold")
+        vanish = vanish if vanish is not None else self.styles.prop(chain, "vanish")
         return bool(bold), bool(vanish)
 
     # ---- paragraph content
@@ -574,7 +409,7 @@ class _Reader:
                 self.node(c, st, d + 1)
 
     def picture(self, st, rid, alt=None):
-        img = ooxml.image(self.pkg, self.scope.part, rid)
+        img = ooxml_base.image(self.pkg, self.scope.part, rid)
         if img is not None:
             self.image_bytes += len(img.data)
         if img is None or self.image_bytes > IMAGE_BYTES:
@@ -583,7 +418,7 @@ class _Reader:
         st.extras.append(Image(img.data, st.alt if alt is None else alt))
 
     def chart(self, st, rid):
-        tbl = ooxml.chart(self.pkg, self.scope.part, rid)
+        tbl = ooxml_base.chart(self.pkg, self.scope.part, rid)
         if tbl is not None:
             self.chart_cells += sum(len(r) for r in tbl.rows)
         if tbl is None or self.chart_cells > CHART_CELLS:
