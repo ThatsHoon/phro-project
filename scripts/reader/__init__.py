@@ -55,6 +55,7 @@ def convert(src, out_dir, hidden=False) -> dict:
     import json
     import time
     from . import markdown
+    from .limits import ReadError
     from .model import Context
     from .text import garble_ratio
     t0 = time.monotonic()
@@ -63,10 +64,13 @@ def convert(src, out_dir, hidden=False) -> dict:
     doc = parse(src, ctx)
     out_dir.mkdir(parents=True, exist_ok=True)
     assets = out_dir / "assets"
-    md = markdown.render(doc, assets, hidden)
+    info = {}
+    md = markdown.render(doc, assets, hidden, ctx.skipped, info)
+    if info["empty"] and info["unread"]:  # every content part failed: nothing was read
+        raise ReadError("damaged", "nothing readable (could not read: " + ", ".join(info["unread"]) + ")")
     (out_dir / "out.md").write_text(md, encoding="utf-8", newline="\n")
     st = markdown.stats(md)
-    warnings = list(ctx.warnings)
+    warnings = list(ctx.warnings) + [w for w in doc.warnings if w not in ctx.warnings]
     if garble_ratio(md) > 0.05:
         warnings.append("garbled")
     meta = {
@@ -78,6 +82,7 @@ def convert(src, out_dir, hidden=False) -> dict:
         "images": sum(1 for p in assets.iterdir() if p.is_file()) if assets.is_dir() else 0,
         "hidden": st["hidden"],
         "headings": st["headings"],
+        "unread": info["unread"],
         "warnings": warnings,
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")

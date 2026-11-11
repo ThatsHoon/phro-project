@@ -245,6 +245,25 @@ def test_stats():
     assert s["hidden"] == 3 and s["headings"] == [(3, "A")]
 
 
+def test_unread_line_words_and_order():
+    import collections
+    sk = collections.Counter({"image": 2, "slide": 1, "styles": 3, "rels": 1, "css": 4, "transform": 2,
+                              "spine": 1, "chapter": 2, "depth": 1, "sheet_cut": 0})
+    assert markdown.unread(sk) == ["3 chapters", "1 slide", "2 images", "1 place nested too deeply"]
+    out = R(Doc(blocks=[P("x", hidden="hidden"), P("body")]), skipped=sk)
+    assert out.startswith("(1 hidden places left out)\n\n(could not read: 3 chapters, 1 slide, 2 images, "
+                          "1 place nested too deeply)\n\nbody"), out
+    assert markdown.unread({}) == [] and R(Doc(blocks=[P("a")]), skipped={"styles": 1}) == "a\n"
+    import re
+    kinds = set()
+    for f in (HERE / "scripts" / "reader").rglob("*.py"):
+        src = f.read_text(encoding="utf-8")
+        kinds |= set(re.findall(r'skipped\["(\w+)"\]', src)) | set(re.findall(r'guard\("(\w+)"\)', src))
+        kinds |= set(re.findall(r'self\.(?:warn|count|part_bytes|data|related|open)\([^)]*?"([a-z_]+)"', src))
+    known = {k for ks, _, _ in markdown.LOST for k in ks} | markdown.INTERNAL
+    assert kinds - known == set(), kinds - known
+
+
 def test_guard_isolates():
     ctx = Context()
     for _ in range(2):

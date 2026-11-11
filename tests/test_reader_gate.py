@@ -180,6 +180,17 @@ def test_context_text_and_length():
         assert len(c) < 600
 
 
+def test_context_unread_clause_fits():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = {"lines": 1, "unread": ["1 slide", "2 images"]}
+    assert gate._context("a.pptm", meta, md).endswith("(1 lines). Some parts could not be read: 1 slide, 2 images.")
+    meta = {"lines": 3000, "hidden": 4, "warnings": ["garbled"], "unread": [f"{i} kinds of thing" for i in range(60)],
+            "headings": [(i, "h") for i in range(100)]}
+    c = gate._context("n" * 250 + ".pptm", meta, md)
+    assert len(c) < 600 and "0 kinds of thing" in c and "…." in c and c.endswith("may be garbled."), c
+
+
 def test_heading_index_long_output():
     with stub() as base:
         parts = ["# H"] + [f"p{i}" for i in range(599)] + ["# H"] + [f"q{i}" for i in range(600)]

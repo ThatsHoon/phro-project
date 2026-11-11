@@ -277,6 +277,17 @@ def test_image_shared_across_pages():
 def test_glyphs_without_unicode():
     out, ctx, doc = md(xps_doc([g(None, 1, 1) + g("ok", 1, 50)]))
     assert out.strip() == "ok" and "1 text runs without Unicode" in doc.warnings
+    meta = reader.convert(xps_doc([g(None, 1, 1) + g("ok", 1, 50)]), tmp() / "out")
+    assert "1 text runs without Unicode" in meta["warnings"] and meta["unread"] == ["1 text run without Unicode"], meta
+
+
+def test_no_unicode_at_all_is_damaged():
+    from reader import gate
+    path = xps_doc([g(None, 1, 1) + g(None, 1, 50), g(None, 5, 5)])
+    e = fails(path)
+    assert e.kind == "damaged" and e.detail == "no text runs with Unicode", e
+    why = gate._deny(path, e.kind, e.detail)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "looks damaged (no text runs with Unicode)" in why, why
 
 
 def test_xps_not_a_package():

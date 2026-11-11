@@ -83,6 +83,18 @@ def _deny(path, kind, detail=""):
     return deny_text(path, why)
 
 
+def _fit(items, room):
+    """The leading whole items whose ", "-joined length fits in room."""
+    out, used = [], 0
+    for item in items:
+        cost = len(item) + (2 if out else 0)
+        if used + cost > room:
+            break
+        out.append(item)
+        used += cost
+    return out
+
+
 def _context(name, meta, out_md):
     n = meta.get("lines", 0)
     m = meta.get("images", 0)
@@ -96,6 +108,12 @@ def _context(name, meta, out_md):
     tail = ""
     if "garbled" in (meta.get("warnings") or []):
         tail = " Warning: the text may be garbled."
+    unread = [" ".join(str(x).split()) for x in meta.get("unread") or []]
+    if unread:
+        prefix = " Some parts could not be read: "
+        items = _fit(unread, CONTEXT_MAX - 1 - len(head) - len(tail) - len(prefix) - len(", …."))
+        if items:
+            head += prefix + ", ".join(items) + (", …." if len(items) < len(unread) else ".")
     long_out = n > INDEX_LINES
     if not long_out:
         try:
@@ -107,15 +125,8 @@ def _context(name, meta, out_md):
     heads = meta.get("headings") or []
     if long_out and heads:
         prefix = " Sections at lines: "
-        room = CONTEXT_MAX - 1 - len(head) - len(tail) - len(prefix) - len(", …")
-        items, used = [], 0
-        for line, text in heads:
-            item = f"{line} {' '.join(str(text).split())[:60]}"
-            cost = len(item) + (2 if items else 0)
-            if used + cost > room:
-                break
-            items.append(item)
-            used += cost
+        entries = [f"{line} {' '.join(str(text).split())[:60]}" for line, text in heads]
+        items = _fit(entries, CONTEXT_MAX - 1 - len(head) - len(tail) - len(prefix) - len(", …"))
         if items:
             index = prefix + ", ".join(items) + (", …" if len(items) < len(heads) else "")
     return head + index + tail

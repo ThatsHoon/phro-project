@@ -251,6 +251,23 @@ def test_damaged_slide_keeps_numbering():
     assert ctx.skipped["slide"] == 1
 
 
+def test_damaged_slide_is_reported():
+    import zipfile
+    from reader import gate
+    d = deck([sp("a", "title"), sp("b", "title"), sp("c", "title")], kind="pptm")
+    bad = tmp() / "b.pptm"
+    with zipfile.ZipFile(d) as zi, zipfile.ZipFile(bad, "w") as zo:
+        for i in zi.infolist():
+            zo.writestr(i.filename, b"<p:sld" if i.filename.endswith("slide2.xml") else zi.read(i.filename))
+    out = tmp() / "out"
+    meta = reader.convert(bad, out)
+    text = (out / "out.md").read_text(encoding="utf-8")
+    assert text.startswith("(could not read: 1 slide)\n\n## Slide 1: a"), text
+    assert meta["unread"] == ["1 slide"], meta
+    c = gate._context("b.pptm", meta, out / "out.md")
+    assert c.endswith(" Some parts could not be read: 1 slide."), c
+
+
 def test_all_slides_damaged():
     d = deck([sp("a", "title")])
     import zipfile

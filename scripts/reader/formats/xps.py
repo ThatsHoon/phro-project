@@ -153,6 +153,8 @@ class _Reader:
             raise ReadError("damaged", "no readable document")
         if listed and not doc.blocks:
             raise ReadError("damaged", "no readable page")
+        if self.no_unicode and not self.chars and not any(isinstance(b, Image) for s in doc.blocks for b in s.blocks):
+            raise ReadError("damaged", "no text runs with Unicode")
         return doc
 
     def pages(self, fdoc, root, seen):

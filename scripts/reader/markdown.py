@@ -15,6 +15,49 @@ _LINE_START = re.compile(r"^(#|>|[-*+] |\d+\. )")
 _HIDDEN_LINE = re.compile(r"^\((\d+) hidden places left out\)$")
 _TRUNC = "(output truncated at 20 MB)"
 
+# Skip kinds the parsers count in ctx.skipped that mean content is missing from the output, in the order the
+# "(could not read: ...)" line lists them: (kinds, singular, plural). Kinds that share words are added up.
+LOST = (
+    (("section",), "section", "sections"),
+    (("chapter", "spine"), "chapter", "chapters"),
+    (("slide",), "slide", "slides"),
+    (("sheet",), "sheet", "sheets"),
+    (("page",), "page", "pages"),
+    (("document",), "document part", "document parts"),
+    (("master",), "master slide", "master slides"),
+    (("notes",), "notes page", "notes pages"),
+    (("header",), "header", "headers"),
+    (("footer",), "footer", "footers"),
+    (("footnotes",), "footnotes part", "footnotes parts"),
+    (("comments",), "comments part", "comments parts"),
+    (("note",), "note", "notes"),
+    (("block",), "text block", "text blocks"),
+    (("shape", "alternate"), "shape", "shapes"),
+    (("image",), "image", "images"),
+    (("chart",), "chart", "charts"),
+    (("object",), "embedded object", "embedded objects"),
+    (("link",), "link", "links"),
+    (("glyphs",), "text run without Unicode", "text runs without Unicode"),
+    (("text",), "text run cut short", "text runs cut short"),
+    (("truncated", "node", "parse"), "chapter cut short", "chapters cut short"),
+    (("sheet_cut",), "sheet cut short", "sheets cut short"),
+    (("cells",), "table cut short", "tables cut short"),
+    (("repeat",), "repeated row or cell cut short", "repeated rows or cells cut short"),
+    (("depth",), "place nested too deeply", "places nested too deeply"),
+)
+# counted too, but they only change formatting or reading order, so they are not reported
+INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story"})
+
+
+def unread(skipped) -> list:
+    """Plain-word counts of what the parsers could not read, e.g. ["1 slide", "2 images"]."""
+    out = []
+    for kinds, one, many in LOST:
+        n = sum(max(0, skipped.get(k, 0)) for k in kinds)
+        if n:
+            out.append(f"{n} {one if n == 1 else many}")
+    return out
+
 
 class _Mode:
     """Where inline text lands: block, table cell (pipe or HTML), or heading."""
@@ -67,8 +110,10 @@ def blocks_len(blocks, d=0) -> int:
 
 
 class _Render:
-    def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool):
+    def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool, skipped=None):
         self.doc, self.assets_dir, self.show = doc, assets_dir, show_hidden
+        self.unread = unread(skipped or {})
+        self.empty = True  # nothing but status lines was rendered
         self.hidden_count = 0
         self.depth = 0
         self.too_deep = 0  # subtrees left out for nesting past MAX_DEPTH
@@ -500,17 +545,22 @@ class _Render:
                     kept.append(it)
             if kept:
                 hf.append(f"{label}: " + " | ".join(kept))
+        self.empty = not text and not hf and not self.unviewable
         if self.doc.title.strip():
             first = pieces[0][1] if pieces else ""
             first = _plain(re.sub(r"^#+\s*", "", first).replace("**", ""))
             if first != _plain(self.doc.title):
                 top.append("# " + self.doc.title.strip())
+        status = []
         if self.hidden_count:
-            top.insert(0, f"({self.hidden_count} hidden places left out)")
+            status.append(f"({self.hidden_count} hidden places left out)")
         if self.too_deep:
-            top.insert(1 if self.hidden_count else 0, f"({self.too_deep} places nested too deeply left out)")
+            status.append(f"({self.too_deep} places nested too deeply left out)")
+        if self.unread:
+            status.append("(could not read: " + ", ".join(self.unread) + ")")
         if hf:
-            top.insert((1 if self.hidden_count else 0) + (1 if self.too_deep else 0), "\n".join(hf))
+            status.append("\n".join(hf))
+        top = status + top
         if self.unviewable:
             tail = "Not viewable here: " + ", ".join(self.unviewable)
             return "\n\n".join(top + ([text] if text else []) + [tail])
@@ -557,9 +607,17 @@ def _cap(s: str) -> str:
     return "\n".join(out) + "\n" + _TRUNC + "\n"
 
 
-def render(doc: Doc, assets_dir: Path, hidden: bool = False) -> str:
-    """Render a Doc to Markdown. The Doc is not modified."""
-    return _cap(_normalize(_Render(doc, Path(assets_dir), hidden).body()))
+def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=None) -> str:
+    """Render a Doc to Markdown. The Doc is not modified.
+
+    `skipped` is the parse context's skip counter; what it says was lost becomes a "(could not read: ...)" line.
+    A dict passed as `info` receives "unread" (that line's items) and "empty" (no content rendered at all).
+    """
+    r = _Render(doc, Path(assets_dir), hidden, skipped)
+    md = _cap(_normalize(r.body()))
+    if info is not None:
+        info.update(unread=r.unread, empty=r.empty and not r.hidden_count and not r.too_deep)
+    return md
 
 
 def stats(md: str) -> dict:

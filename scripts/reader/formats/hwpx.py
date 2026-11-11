@@ -287,7 +287,7 @@ class _Reader:
             except ReadError as e:
                 if e.kind != "damaged":
                     raise
-                self.ctx.skipped["header"] += 1
+                self.ctx.skipped["styles"] += 1  # header.xml holds the style and numbering tables
         good = 0
         for name in names:
             with self.ctx.guard("section"):

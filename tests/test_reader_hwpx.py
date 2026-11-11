@@ -363,6 +363,18 @@ def test_missing_chart_counted():
     assert ctx.skipped["chart"] == 1
 
 
+def test_nothing_readable_is_damaged():
+    sec = '<hp:p><hp:run><hp:chart chartIDRef="Chart/none.xml"/></hp:run></hp:p>'
+    try:
+        reader.convert(hwpx_doc(sec), tmp() / "out")
+    except ReadError as e:
+        assert e.kind == "damaged" and e.detail == "nothing readable (could not read: 1 chart)", e
+    else:
+        raise AssertionError("no error")
+    meta = reader.convert(hwpx_doc(P("본문") + sec), tmp() / "out")
+    assert meta["unread"] == ["1 chart"], meta
+
+
 def test_section_fallback_without_manifest_entries():
     members = {"mimetype": "application/hwp+zip",
                "Contents/section1.xml": f'<hs:sec {NS}>{P("둘")}</hs:sec>',

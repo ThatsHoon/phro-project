@@ -213,6 +213,8 @@ def test_rows_cut():
     assert time.monotonic() - t0 < 2
     assert f"sheet S cut at {limits.SHEET_ROWS} rows" in ctx.warnings, ctx.warnings
     assert len(doc.blocks[0].blocks[0].rows) == limits.SHEET_ROWS
+    out = markdown.render(doc, tmp() / "assets", skipped=ctx.skipped)
+    assert out.startswith("(could not read: 1 sheet cut short)\n\n## Sheet: S"), out[:200]
 
 
 def test_hostile_span_clamped():
