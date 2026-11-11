@@ -4,6 +4,7 @@ Fixed-layout pages carry positioned glyph runs; they are turned back into ordere
 a StoryFragments part gives or by geometry. Elements match by local name, so both namespaces work.
 """
 import math
+import unicodedata
 
 from .. import limits
 from ..containers.zipx import Package, attr, kids, local, parse_xml, resolve
@@ -16,6 +17,7 @@ IMAGE_BYTES = 256 * 2**20  # image bytes one package may emit, copies counted
 MAX_RUN = 100_000          # characters one Glyphs run may emit
 COORD = 1e9                # coordinates and matrix terms are clamped / refused beyond this
 MIN_SIZE = 1e-3
+MAX_REFS = 1_000_000      # NameReferences one StoryFragments part may index
 IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 
@@ -71,15 +73,21 @@ def _lines(runs):
     return out
 
 
+def _extent(text, size):
+    """Estimated width of a run: wide East Asian characters are one em, others half."""
+    wide = sum(1 for ch in text if unicodedata.east_asian_width(ch) in "WF")
+    return (wide + (len(text) - wide) * 0.5) * size
+
+
 def _join(line):
     return " ".join(r[3] for r in sorted(line, key=lambda r: r[1]))
 
 
 def _paras(lines, out):
-    """Consecutive lines join with a space; a gap over 1.5 x the line's size starts a new Para."""
+    """Consecutive lines join with a space; a whitespace gap over 1 x the line's size (dy over 2 x size) starts a new Para."""
     prev, buf = None, []
     for y, size, text in lines:
-        if prev is not None and (y - prev) - size > 1.5 * size and buf:
+        if prev is not None and (y - prev) - size > size and buf:
             out.append(Para([Text(" ".join(buf))]))
             buf = []
         buf.append(text)
@@ -93,7 +101,7 @@ class _Reader:
         self.pkg, self.ctx = pkg, ctx
         self.image_bytes = 0
         self.chars = 0
-        self.stories = {}   # part -> [[name, ...], ...] or None
+        self.stories = {}   # part -> (paragraphs, name index) or None
         self.images = {}    # part -> bytes or None
         self.no_unicode = 0
 
@@ -122,7 +130,7 @@ class _Reader:
             if e.kind != "damaged":
                 raise
             raise ReadError("damaged", "not an XPS package")
-        doc, listed, seen_docs, seen_pages = Doc(), 0, set(), set()
+        doc, listed, ok_docs, seen_docs, seen_pages = Doc(), 0, 0, set(), set()
         for ref in kids(seq_root, "DocumentReference"):
             fdoc = resolve(seq, attr(ref, "Source", ""))
             if fdoc in seen_docs:
@@ -131,6 +139,7 @@ class _Reader:
             try:
                 with self.ctx.guard("document"):
                     fdoc_root = self.xml(fdoc)
+                    ok_docs += 1
                     for page in self.pages(fdoc, fdoc_root, seen_pages):
                         listed += 1
                         self.add_page(doc, page, fdoc)
@@ -140,6 +149,8 @@ class _Reader:
                 self.ctx.skipped["document"] += 1
         if self.no_unicode:
             doc.warnings.append(f"{self.no_unicode} text runs without Unicode")
+        if seen_docs and not ok_docs:
+            raise ReadError("damaged", "no readable document")
         if listed and not doc.blocks:
             raise ReadError("damaged", "no readable page")
         return doc
@@ -256,6 +267,8 @@ class _Reader:
             return
         if text.startswith("{}"):
             text = text[2:]
+        if len(text) > MAX_RUN:
+            self.count("text", "text: long run cut")
         text = " ".join(text[:MAX_RUN].split())
         if not text:
             return
@@ -264,7 +277,10 @@ class _Reader:
             return
         self.chars += len(text)
         own = self.transform(el, res)
-        full = _compose(own, m) or m
+        full = _compose(own, m)
+        if full is None:
+            self.count("transform", "transform: unusable RenderTransform treated as identity")
+            full = m
         a, b, c, d, e, f = full
         x0, y0 = _num(attr(el, "OriginX")), _num(attr(el, "OriginY"))
         em = _num(attr(el, "FontRenderingEmSize"), 1.0)
@@ -286,16 +302,18 @@ class _Reader:
                 by_name[r[4]] = i
         stories = self.story_parts(owners)
         if by_name and stories:
-            for story in stories:
-                for names in story:
-                    texts = []
-                    for n in names:
-                        i = by_name.get(n)
-                        if i is not None and i not in emitted:
-                            emitted.add(i)
-                            texts.append(runs[i][3])
-                    if texts:
-                        blocks.append(Para([Text(" ".join(texts))]))
+            for paras, index in stories:
+                hits = sorted({(p, pos, n) for n in by_name for p, pos in index.get(n, ())})
+                texts, cur = [], None
+                for p, pos, n in hits + [(None, 0, None)]:
+                    if p != cur:
+                        if texts:
+                            blocks.append(Para([Text(" ".join(texts))]))
+                        texts, cur = [], p
+                    i = by_name.get(n)
+                    if i is not None and i not in emitted:
+                        emitted.add(i)
+                        texts.append(runs[i][3])
             runs = [r for i, r in enumerate(runs) if i not in emitted]
             if not runs:
                 return
@@ -307,7 +325,7 @@ class _Reader:
         if width > 0 and len(runs) >= 6:
             mid, band = width / 2, width * 0.05
             lo, hi = mid - band, mid + band
-            if not any(r[1] < hi and r[1] + len(r[3]) * r[2] * 0.5 > lo for r in runs):
+            if not any(r[1] < hi and r[1] + _extent(r[3], r[2]) > lo for r in runs):
                 left = [r for r in runs if r[1] < mid]
                 right = [r for r in runs if r[1] >= mid]
                 if len(_lines(left)) >= 3 and len(_lines(right)) >= 3:
@@ -327,25 +345,38 @@ class _Reader:
         return out
 
     def story(self, part):
-        """[[NameReference, ...] per ParagraphStructure] of a StoryFragments part, cached; None when unreadable."""
+        """(paragraphs, {name: [(paragraph, position)]}) of a StoryFragments part, cached; None when unreadable.
+
+        Each NamedElement belongs to its nearest enclosing ParagraphStructure; the walk is one pass, no recursion.
+        """
         if part not in self.stories:
-            story, total = [], 0
+            story = None
             try:
                 root = self.xml(part)
-                for ps in root.iter():
-                    if local(ps.tag) != "ParagraphStructure":
-                        continue
-                    names = [attr(n, "NameReference") for n in ps.iter() if local(n.tag) == "NamedElement"]
-                    names = [n for n in names if n]
-                    total += len(names)
-                    if total > 1_000_000:
-                        break
-                    story.append(names)
+                paras, index, total = [], {}, 0
+                stack = [(root, None)]
+                while stack:
+                    el, cur = stack.pop()
+                    name = local(el.tag)
+                    if name == "ParagraphStructure":
+                        cur = len(paras)
+                        paras.append(0)
+                    elif name == "NamedElement" and cur is not None:
+                        ref = attr(el, "NameReference")
+                        if ref:
+                            if total >= MAX_REFS:
+                                self.count("story", "story: references beyond the limit ignored")
+                                break
+                            index.setdefault(ref, []).append((cur, paras[cur]))
+                            paras[cur] += 1
+                            total += 1
+                    for c in reversed(el):
+                        stack.append((c, cur))
+                story = (paras, index)
             except ReadError as e:
                 if e.kind != "damaged":
                     raise
                 self.count("story", "story: damaged StoryFragments ignored")
-                story = None
             self.stories[part] = story
         return self.stories[part]
 

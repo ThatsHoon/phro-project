@@ -154,13 +154,58 @@ def test_bad_origin_and_size():
     assert text(xps_doc([body])) == "A B C D"
 
 
+def cols(left=3, right=3, per=1, header=None):
+    out = ""
+    for i in range(max(left, right)):
+        for k in range(per):
+            if i < left:
+                out += g(f"L{i}{k}" if per > 1 else f"L{i}", 50 + 40 * k, 100 + 30 * i)
+            if i < right:
+                out += g(f"R{i}{k}" if per > 1 else f"R{i}", 400 + 40 * k, 100 + 30 * i)
+    return (header or "") + out
+
+
+def cols(left=3, right=3, per=1, header=""):
+    out = ""
+    for i in range(max(left, right)):
+        for k in range(per):
+            if i < left:
+                out += g(f"L{i}{k}" if per > 1 else f"L{i}", 50 + 40 * k, 100 + 30 * i)
+            if i < right:
+                out += g(f"R{i}{k}" if per > 1 else f"R{i}", 400 + 40 * k, 100 + 30 * i)
+    return header + out
+
+
 def test_two_columns():
-    body = "".join(g(f"L{i}", 50, 100 + 30 * i) + g(f"R{i}", 400, 100 + 30 * i) for i in range(3))
-    out = text(xps_doc([body]))
-    assert out.index("L2") < out.index("R0")
-    crossing = body + g("X" * 40, 100, 400)  # a run reaching the middle keeps the page one flow
+    assert text(xps_doc([cols()])) == "L0\n\nL1\n\nL2\n\nR0\n\nR1\n\nR2"
+    crossing = cols() + g("X" * 40, 100, 400)  # a run reaching the middle keeps the page one flow
     out = text(xps_doc([crossing]))
     assert out.index("R0") < out.index("L1")
+
+
+def test_columns_need_three_lines_not_runs():
+    # two lines of three runs per side: no column mode, so the lines read straight across
+    assert text(xps_doc([cols(2, 2, 3)])) == "L00 L01 L02 R00 R01 R02\n\nL10 L11 L12 R10 R11 R12"
+
+
+def test_wide_latin_header_disables_columns():
+    header = g("H" * 70, 50, 20)  # about 420 wide at size 12, reaches the middle
+    out = text(xps_doc([cols(header=header)]))
+    assert out == "H" * 70 + "\n\nL0 R0\n\nL1 R1\n\nL2 R2"
+
+
+def test_cjk_width_estimate():
+    line = g("가" * 28, 50, 100)  # really about 336 wide, past the middle of a 600-wide page
+    rest = "".join(g(f"L{i}", 50, 100 + 30 * i) + g(f"R{i}", 400, 100 + 30 * i) for i in range(1, 4))
+    out = text(xps_doc([line + rest]))
+    assert out.startswith("가" * 28) and out.index("R1") < out.index("L2")
+
+
+def test_paragraph_spacing():
+    one = g("a", 10, 100) + g("b", 10, 128.8)   # single blank line at 1.2 leading
+    assert text(xps_doc([one])) == "a\n\nb"
+    two = g("a", 10, 100) + g("b", 10, 124)     # double spacing stays one paragraph
+    assert text(xps_doc([two])) == "a b"
 
 
 def test_story_fragments_order():
@@ -172,6 +217,45 @@ def test_story_fragments_order():
     assert text(xps_doc([body], story=story)) == "two\n\none\n\nrest"
 
 
+def test_story_shared_by_many_pages_fast():
+    pages, names = 1500, 100_000
+    refs = "".join(f'<NamedElement NameReference="p{i}"/>' for i in range(pages)) + "".join(
+        f'<NamedElement NameReference="z{i}"/>' for i in range(names))
+    story = ("<StoryFragments><StoryFragment><ParagraphStructure>" + refs
+             + "</ParagraphStructure></StoryFragment></StoryFragments>")
+    bodies = [g(f"t{i}", 10, 10, extra=f'Name="p{i}"') for i in range(pages)]
+    t0 = time.monotonic()
+    doc = reader.parse(xps_doc(bodies, story=story), Context())
+    assert len(doc.blocks) == pages and time.monotonic() - t0 < 2
+
+
+def test_nested_paragraph_structure():
+    n = 20_000
+    story = ("<StoryFragments>" + "".join(f'<ParagraphStructure><NamedElement NameReference="n{i}"/>' for i in range(n))
+             + "</ParagraphStructure>" * n + "</StoryFragments>")
+    body = "".join(g(f"w{i}", 10, 10 + 100 * i, extra=f'Name="n{i}"') for i in range(n))
+    t0 = time.monotonic()
+    out = text(xps_doc([body], story=story))
+    assert out.split("\n\n") == [f"w{i}" for i in range(n)] and time.monotonic() - t0 < 10
+
+
+def test_documents_all_missing():
+    members = {"_rels/.rels": rels([(REPR["ms"], "/S.fdseq")]),
+               "S.fdseq": '<FixedDocumentSequence><DocumentReference Source="/A.fdoc"/>'
+                          '<DocumentReference Source="/B.fdoc"/></FixedDocumentSequence>',
+               "B.fdoc": "<bad"}
+    e = fails(make_zip(tmp() / "m.xps", members, stored=()))
+    assert e.kind == "damaged" and "no readable document" in e.detail
+    members["S.fdseq"] = "<FixedDocumentSequence/>"
+    assert reader.parse(make_zip(tmp() / "e.xps", members, stored=()), Context()).blocks == []
+
+
+def test_counted_caps():
+    ctx = Context()
+    reader.parse(xps_doc([g("x" * 100_001, 1, 1)]), ctx)
+    assert ctx.skipped["text"] == 1
+
+
 def test_story_outside_package_ignored():
     p = xps_doc([g("one", 10, 100, extra='Name="g1"')],
                 extra={"Documents/1/_rels/FixedDoc.fdoc.rels": rels([(STORY, "../../../x.xml")])})
@@ -181,7 +265,7 @@ def test_story_outside_package_ignored():
 def test_image_brush():
     body = '<Path><Path.Fill><ImageBrush ImageSource="/Resources/a.png"/></Path.Fill></Path>' + g("t", 10, 10)
     out = text(xps_doc([body], extra={"Resources/a.png": PNG}))
-    assert "![](assets/img-001.png)" in out and "t" in out
+    assert out.splitlines().count("![](assets/img-001.png)") == 1 and "t" in out.splitlines()
 
 
 def test_image_hostile():
