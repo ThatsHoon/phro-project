@@ -5,6 +5,7 @@ and elements match by local name, so Transitional and Strict files take the same
 ooxml_word imports this module at load time; this module imports ooxml_word only inside parse(),
 so there is no import cycle.
 """
+import struct
 from pathlib import Path
 
 from ..charts import chart_table
@@ -137,13 +138,23 @@ def alternate(el, nsmap=None):
 
 # ---- entry
 def _check_cfb(path):
-    """An OLE file is an encrypted package or not an OOXML package; anything else falls through."""
+    """An OLE file is an encrypted package or not an OOXML package; anything else falls through.
+
+    EncryptedPackage is looked for in the first 64 KiB and in the first directory sector the header names.
+    """
     with open(path, "rb") as f:
         head = f.read(8)
         if head[:4] != _CFB_MAGIC:
             return
         head += f.read(_CFB_SCAN - 8)
-    if _ENCRYPTED in head:
+        found = _ENCRYPTED in head
+        if not found and len(head) >= 0x34:
+            shift = struct.unpack_from("<H", head, 0x1E)[0]
+            sid = struct.unpack_from("<I", head, 0x30)[0]
+            if 7 <= shift <= 16 and sid < 0xFFFFFFFA:
+                f.seek((sid + 1) << shift)
+                found = _ENCRYPTED in f.read(1 << shift)
+    if found:
         raise ReadError("encrypted")
     raise ReadError("damaged", "not an OOXML package (OLE file)")
 

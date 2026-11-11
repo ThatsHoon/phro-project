@@ -106,6 +106,31 @@ def test_encrypted_cfb():
         assert e.kind == "encrypted"
 
 
+def test_encrypted_cfb_directory_past_64k():
+    import struct
+    hdr = bytearray(bytes.fromhex("d0cf11e0a1b11ae1") + b"\x00" * 504)
+    struct.pack_into("<H", hdr, 0x1E, 9)
+    struct.pack_into("<I", hdr, 0x30, 400)  # directory sector 400 -> offset 401 * 512 > 64 KiB
+    blob = bytes(hdr) + b"\x00" * (401 * 512 - 512) + "EncryptedPackage".encode("utf-16-le") + b"\x00" * 100
+    p = tmp() / "e.docm"
+    p.write_bytes(blob)
+    try:
+        parse(p)
+        assert False
+    except ReadError as e:
+        assert e.kind == "encrypted"
+    for shift, sid in ((0, 5), (9, 0xFFFFFFFE), (60000, 1), (9, 10**9)):  # garbage header values
+        hdr2 = bytearray(hdr)
+        struct.pack_into("<H", hdr2, 0x1E, shift % 65536)
+        struct.pack_into("<I", hdr2, 0x30, sid)
+        p.write_bytes(bytes(hdr2) + b"\x00" * 4096)
+        try:
+            parse(p)
+            assert False
+        except ReadError as e:
+            assert e.kind == "damaged"
+
+
 def test_plain_cfb_is_damaged():
     p = tmp() / "e.docm"
     p.write_bytes(bytes.fromhex("d0cf11e0a1b11ae1") + b"\x00" * 600)
