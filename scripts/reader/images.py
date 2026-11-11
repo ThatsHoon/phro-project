@@ -5,7 +5,7 @@ import zlib
 from pathlib import Path
 
 VIEWABLE = frozenset({"png", "jpg", "gif", "webp"})
-_MAX_PIXELS = 100_000_000
+_MAX_PIXELS = 16_777_216
 
 
 def sniff(data: bytes) -> str | None:
@@ -102,24 +102,32 @@ def _bmp_to_png(data: bytes) -> bytes | None:
         return None
     alpha = False
     if bpp == 32 and masks is None:
-        alpha = any(data[off + y * stride + x * 4 + 3]
-                    for y in range(h) for x in range(w))
+        alpha = any(data[off + y * stride + 3:off + y * stride + w * 4:4].count(0) != w
+                    for y in range(h))
     elif masks and masks[3]:
         alpha = True
     rows = []
+    if bpp <= 8:
+        per = 8 // bpp
+        mask = (1 << bpp) - 1
+        expand = [bytes((v >> (8 - bpp - i * bpp)) & mask for i in range(per)) for v in range(256)]
+        tabs = [bytes(palette[i][c] if i < len(palette) else 0 for i in range(256)) for c in range(3)]
     for y in range(h):
         base = off + (y if top_down else h - 1 - y) * stride
         line = data[base:base + stride]
-        out = bytearray()
         if bpp == 24:
-            for x in range(w):
-                b, g, r = line[x * 3:x * 3 + 3]
-                out += bytes((r, g, b))
+            out = bytearray(line[:w * 3])
+            out[0::3], out[2::3] = out[2::3], out[0::3]
         elif bpp == 32 and masks is None:
-            for x in range(w):
-                b, g, r, a = line[x * 4:x * 4 + 4]
-                out += bytes((r, g, b, a)) if alpha else bytes((r, g, b))
+            px = bytearray(line[:w * 4])
+            px[0::4], px[2::4] = px[2::4], px[0::4]
+            if alpha:
+                out = px
+            else:
+                out = bytearray(w * 3)
+                out[0::3], out[1::3], out[2::3] = px[0::4], px[1::4], px[2::4]
         elif bpp in (16, 32):
+            out = bytearray()
             fields = [_shift(m) if m else None for m in masks]
             for x in range(w):
                 v = struct.unpack_from("<H" if bpp == 16 else "<I", line, x * (bpp // 8))[0]
@@ -127,12 +135,10 @@ def _bmp_to_png(data: bytes) -> bytes | None:
                       for m, f in zip(masks, fields)]
                 out += bytes(ch if alpha else ch[:3])
         else:
-            per = 8 // bpp
-            mask = (1 << bpp) - 1
-            for x in range(w):
-                byte = line[x // per]
-                idx = (byte >> (8 - bpp - (x % per) * bpp)) & mask
-                out += bytes(palette[idx]) if idx < len(palette) else b"\x00\x00\x00"
+            idx = b"".join(map(expand.__getitem__, line))[:w]
+            out = bytearray(w * 3)
+            for c in range(3):
+                out[c::3] = idx.translate(tabs[c])
         rows.append(bytes(out))
     return _png(w, h, rows, alpha)
 

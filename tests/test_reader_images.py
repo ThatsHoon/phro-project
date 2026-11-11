@@ -95,6 +95,28 @@ def test_bmp16_bitfields():
     assert zlib.decompress(idat_of(png)) == b"\x00\xff\x00\x00"
 
 
+def test_bmp_hostile_headers_and_speed():
+    import time
+    z8 = b"\x00" * 8
+    t0 = time.time()
+    assert images.bmp_to_png(bmp(65535, 65535, 1, z8, palette=z8)) is None
+    assert images.bmp_to_png(bmp(2 ** 31 - 1, 1, 24, z8)) is None
+    assert images.bmp_to_png(bmp(4097, 4096, 1, z8, palette=z8)) is None  # over the pixel cap
+    data = bytearray(bmp(1, 1, 24, b"\x00" * 4))
+    struct.pack_into("<I", data, 10, 10 ** 9)
+    assert images.bmp_to_png(bytes(data)) is None
+    assert time.time() - t0 < 1
+    pal = b"\x09\x09\x09\x00" + b"\x01\x02\x03\x00"
+    png = images.bmp_to_png(bmp(1, 1, 8, b"\x07\x00\x00\x00", palette=pal))  # index 7, 2 entries
+    assert zlib.decompress(idat_of(png)) == b"\x00\x00\x00\x00"
+    t0 = time.time()
+    big = images.bmp_to_png(bmp(2000, 2000, 24, bytes(2000 * 3 * 2000)))
+    assert big is not None and time.time() - t0 < 5
+    t0 = time.time()
+    assert images.bmp_to_png(bmp(4000, 4000, 1, bytes(500 * 4000), palette=z8)) is not None
+    assert time.time() - t0 < 5
+
+
 def test_bmp_rle_not_converted():
     data = bmp(1, 1, 8, b"\x00" * 4, palette=b"\x00" * 8, comp=1)
     assert images.bmp_to_png(data) is None
@@ -168,6 +190,21 @@ def test_render_no_images_creates_no_dir():
         target = Path(d) / "assets"
         markdown.render(Doc(blocks=[Para([Text("hi")])]), target)
         assert not target.exists()
+
+
+def test_truncated_output_keeps_marker_last():
+    from reader import limits
+    old = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 300
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            blocks = [Para([Text("line %d " % i * 5)]) for i in range(60)] + [Image(EMF)]
+            doc = Doc(blocks=blocks, notes={"n": [Para([Text("note")])]})
+            md = markdown.render(doc, Path(d))
+    finally:
+        limits.MAX_OUTPUT = old
+    assert md.rstrip().endswith("(output truncated at 20 MB)")
+    assert "Not viewable" not in md
 
 
 def main():
