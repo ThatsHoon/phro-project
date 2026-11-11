@@ -59,6 +59,6 @@ def parse(path, ctx):
             from . import ooxml_word
             return ooxml_word.parse_word(pkg, part, ctx)
         if kind == "presentation":
-            # Task 12: from . import ooxml_slides; return ooxml_slides.parse_slides(pkg, part, ctx)
-            raise ReadError("unsupported", "pptm/ppsx arrive in Task 12")
+            from . import ooxml_slides
+            return ooxml_slides.parse_slides(pkg, part, ctx)
         raise ReadError("damaged", "not a Word or PowerPoint package")

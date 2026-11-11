@@ -168,12 +168,9 @@ def test_wrong_root_is_damaged():
         assert e.kind == "damaged" and "Word or PowerPoint" in e.detail
 
 
-def test_presentation_not_yet():
-    try:
-        parse(swap_main(docm(""), b"<presentation/>"))
-        assert False
-    except ReadError as e:
-        assert e.kind == "unsupported"
+def test_presentation_root_goes_to_slides():
+    doc, _ = parse(swap_main(docm(""), b"<presentation/>"))
+    assert doc.blocks == []
 
 
 # ---- word rules
