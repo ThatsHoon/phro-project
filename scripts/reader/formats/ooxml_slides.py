@@ -11,7 +11,6 @@ from .ooxml_base import int_of as _int
 IMAGE_BYTES = 256 * 2**20  # image bytes one deck may emit, copies counted
 CHART_CELLS = 200_000      # chart table cells one deck may emit, copies counted
 SPAN_CELLS = 500_000       # grid slots all spans of one table may cover; past it spans become 1
-MAX_COLS = 1_000
 MAX_ALT, MAX_TITLE = 200, 200
 COORD = 10**13
 
@@ -322,7 +321,7 @@ class _Reader:
         rows = kids(tbl, "tr")
         grid = _kid(tbl, "tblGrid")
         width = min(max(len(kids(grid, "gridCol")) if grid is not None else 0,
-                        max((len(kids(r, "tc")) for r in rows), default=0), 1), MAX_COLS)
+                        max((len(kids(r, "tc")) for r in rows), default=0), 1), limits.GRID_COLS)
         out, budget = [], SPAN_CELLS
         for ri, tr in enumerate(rows):
             row = []

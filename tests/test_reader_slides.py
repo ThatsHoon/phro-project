@@ -277,6 +277,21 @@ def test_missing_notes_and_image_counted():
     assert ctx.skipped["image"] == 1 and doc.blocks[0].title == "t"
 
 
+def test_notes_missing_and_damaged():
+    d = deck([sp("t", "title")], srels={1: [("rN", "notesSlide", "../notesSlides/none.xml")]})
+    doc, ctx = parse(d)
+    assert ctx.skipped["notes"] == 1 and doc.blocks[0].title == "t"
+    d = deck([sp("t", "title") + sp("body", "-")], notes={1: sp("m", "body")})
+    import zipfile
+    out = tmp() / "b.ppsx"
+    with zipfile.ZipFile(d) as zi, zipfile.ZipFile(out, "w") as zo:
+        for i in zi.infolist():
+            zo.writestr(i.filename, b"<p:notes" if "notesSlide" in i.filename and "_rels" not in i.filename
+                        else zi.read(i.filename))
+    doc, ctx = parse(out)
+    assert ctx.skipped["notes"] == 1 and "body" in markdown.render(doc, tmp() / "assets")
+
+
 def main():
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
