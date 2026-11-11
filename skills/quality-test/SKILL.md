@@ -31,11 +31,12 @@ project.py quality <out>/quality.json [--accepted evals/quality/<name>/accepted.
 
 | Result | Next |
 |---|---|
-| Boundary broken | Fix the skill body. Fix the grader only when it bans what the contract allows or reads outside the deliverable, and say so |
+| Boundary broken | Read that run's transcript in the kept temp folder first. Fix the skill body. Fix the grader only when it bans what the contract allows or reads outside the deliverable, and say so |
 | `free` criterion fails with the skill | Fix the body, or move the rule into a script the skill calls |
 | Non-discriminating grader | Sharpen it, or drop it and say so. It proves nothing |
 | No gain on any case | Recommend not keeping the skill |
 | An ordered step followed in under 2 of 3 runs, twice | Propose a script or hook. Do not build it |
+| 2 of 3 runs with the skill write the same helper code | Propose it as a script the skill calls. Do not build it |
 | `human` criteria | Show the user the outputs with and without the skill side by side, from the report or the kept temp folders. Their comments become cases or contract edits, by them |
 
 ## 4. Prove the graders

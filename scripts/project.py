@@ -12,7 +12,7 @@ Routing, on a scratch copy so the plugin itself is never edited:
   project.py mine    <transcripts_dir> <cases.json> [--alias a=b ...] [--only a,b]   prompts labelled by the command the user typed
   project.py catalog <out.json> <skills_dir> [<skills_dir> ...] [--only a,b]         competing descriptions from installed skills
   project.py build   <plugin> <cases.json> <out_dir> [--history f.jsonl] [--stub] [--also out.json] [--max-turns N]
-  project.py tally   <result.json> [<result.json> ...]                              hits, misses, and which skill took each miss
+  project.py tally   <result.json> [<result.json> ...] [--cases cases.json]         hits, misses, which skill took each miss; held-out cases apart
 
 Output quality, from a `claude plugin eval --ablation with-without` run (graders named b-* are boundaries):
   project.py quality <result.json> [--accepted accepted.json] [--save accepted.json]  per-grader pass rate in each arm, breaks, gained and broken
@@ -43,6 +43,15 @@ ROUTE_CASES = "tests/route_cases.json"  # routing cases that live in the plugin 
 PROJECT_PARTS = ("skills", "agents", "commands", "tests")  # a project's .claude also holds settings and worktrees, which are not capabilities
 STEP_TOOLS = "[Read, Glob, Grep, WebSearch, Write, Edit, Skill]"
 STEP_TURNS = 10  # a step-triggered case has to do the step first
+FETCHERS = {"npx", "bunx", "uvx", "pipx"}  # lean: docker images and npm exec are not read | when: a project runs an MCP server that way | fix: parse their image or package argument
+PINNED = re.compile(r"(?:@|==)v?\d[\w.+-]*$")
+# From code.claude.com/docs/en/skills and /hooks, read 2026-11-11. A key or event Claude Code does not know is ignored without an error.
+SKILL_KEYS = set("name description when_to_use argument-hint arguments disable-model-invocation user-invocable allowed-tools "
+                 "disallowed-tools model effort context agent background hooks paths shell metadata license compatibility version".split())
+HOOK_EVENTS = set("SessionStart Setup UserPromptSubmit UserPromptExpansion PreToolUse PermissionRequest PermissionDenied PostToolUse "
+                  "PostToolUseFailure PostToolBatch Notification MessageDisplay SubagentStart SubagentStop TaskCreated TaskCompleted "
+                  "Stop StopFailure TeammateIdle InstructionsLoaded ConfigChange CwdChanged DirectoryAdded FileChanged WorktreeCreate "
+                  "WorktreeRemove PreCompact PostCompact PreModelSwitch PostModelSwitch Elicitation ElicitationResult SessionEnd".split())
 SKILL_CALL = '"skill"\\s*:\\s*"(?:[\\w-]+:)?{}"'
 
 
@@ -209,6 +218,38 @@ def usage(directory, plugin):
     return lambda name: (count(typed, name), count(model, name))
 
 
+def fetched_package(entry):
+    """The package an MCP server entry fetches from a registry at start, or None for a local command."""
+    command = re.sub(r"\.(?:cmd|exe)$", "", Path(str(entry.get("command", ""))).name.lower())
+    args = [str(x) for x in entry.get("args") or []]
+    if command not in FETCHERS:
+        return None
+    for flag in ("--from", "--package", "-p", "--spec"):
+        if flag in args[:-1]:
+            return args[args.index(flag) + 1]
+    return next((x for x in args if not x.startswith("-") and x != "run"), None)
+
+
+def hook_findings(root):
+    """hooks/hooks.json entries Claude Code would skip, or that can hold a session for the default timeout."""
+    path = root / "hooks/hooks.json"
+    if not path.exists():
+        return []
+    try:
+        events = json.loads(path.read_text(encoding="utf-8")).get("hooks") or {}
+    except (ValueError, AttributeError):
+        return [("hook-config", "hooks/hooks.json", "not a JSON object with a hooks map")]
+    out = []
+    for event, groups in events.items():
+        if event not in HOOK_EVENTS:
+            out.append(("hook-config", "hooks/hooks.json", f"{event} is not a hook event"))
+            continue
+        for hook in (h for g in groups for h in g.get("hooks") or []):
+            if hook.get("type") == "command" and "timeout" not in hook and not hook.get("async"):
+                out.append(("hook-config", "hooks/hooks.json", f"{event} command has no timeout, so it can hold the session for the default"))
+    return out
+
+
 def findings(root, usage_dir=None):
     root = Path(root).resolve()
     db, plugin, texts, sources = scan(root)
@@ -258,12 +299,19 @@ def findings(root, usage_dir=None):
         runs = path.startswith(("skills/", "scripts/", "hooks/")) and (kind == "script" or (kind == "doc" and path.endswith(".md")))
         if runs and node not in reached and Path(path).name not in ("__init__.py", "README.md"):
             out.append(("orphan", node, "no file refers to it"))
+    # An MCP server fetched by name runs whatever version is newest at each start, not the one that was reviewed.
+    for node, kind in kinds.items():
+        package = fetched_package(json.loads(texts[node])) if kind == "mcp" else None
+        if package and not PINNED.search(package):
+            out.append(("mcp-unpinned", node, package))
+    out += hook_findings(root)
     tested = {r[0] for r in db.execute("select e.dst from edge e join node n on n.id = e.src where n.kind = 'eval'")}
     words = {}
     for node, kind, description, _ in nodes:
         if kind != "skill":
             continue
         fields = frontmatter(texts[node])[0]
+        out += [("unknown-frontmatter", node, key) for key in sorted(fields) if key not in SKILL_KEYS]
         if node not in tested and not user_only(fields):
             out.append(("no-eval", node, "no eval case grades it"))
         if not description:
@@ -473,6 +521,19 @@ def compare(now, accepted):
             print(f"{verdict}\t{key}\t{before} -> {outcome}")
 
 
+def by_split(outcomes, cases):
+    """Hits and false fires per split, so cases kept away from the description's writer show whether it was fitted to the rest."""
+    split = {c["id"]: c.get("split", "write") for c in cases}
+    if "test" not in split.values():
+        return
+    for name in ("write", "test"):
+        mine = [o for key, o in outcomes.items() if split.get(key.split("#")[0], "write") == name and o != "unresolved"]
+        positives = [o for o in mine if not (o == "ok" or o.startswith("false_fire"))]
+        negatives = [o for o in mine if o == "ok" or o.startswith("false_fire")]
+        fired = sum(o.startswith("false_fire") for o in negatives)
+        print(f"split\t{name}\ttarget\t{positives.count('hit')}/{len(positives)}\tfalse_fires\t{fired}/{len(negatives)}")
+
+
 def cmd_tally(a):
     outcomes = {}
     for file in a.results:
@@ -537,6 +598,8 @@ def cmd_tally(a):
         for kind, _, action in ERROR_KINDS:
             if reruns[kind]:
                 print(f"rerun\t{kind}\t{reruns[kind]}\t{action}")
+    if a.cases:
+        by_split(outcomes, json.loads(Path(a.cases).read_text(encoding="utf-8")))
     if a.accepted:
         compare(outcomes, json.loads(Path(a.accepted).read_text(encoding="utf-8")))
     if a.save:
@@ -653,6 +716,7 @@ def main():
     p.set_defaults(fn=cmd_build)
     p = sub.add_parser("tally")
     p.add_argument("results", nargs="+")
+    p.add_argument("--cases", help="the cases.json the run was built from; cases with \"split\": \"test\" are scored apart")
     p.add_argument("--accepted", help="case outcomes saved from an accepted run, to report gained and broken")
     p.add_argument("--save", help="write this run's case outcomes, to accept it")
     p.set_defaults(fn=cmd_tally)

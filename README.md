@@ -264,7 +264,7 @@ Run as `python -I -X utf8 scripts/project.py <command>`. `<plugin>` is a plugin 
 | `mine <transcripts_dir> <cases.json> [--alias a=b] [--only a,b]` | Labeled prompts from typed commands |
 | `catalog <out.json> <skills_dir>... [--only a,b]` | Competitor skill descriptions |
 | `build <plugin> <cases.json> <out_dir> [--stub] [--also out.json] [--history f.jsonl] [--max-turns N]` | A scratch copy with eval cases, in a new folder; it refuses one that holds files. A case may add `after` and `rule` for a skill that fires from a step |
-| `tally <result.json>... [--save f] [--accepted f]` | Hits, misses by cause, wrong order, false fires, a rerun instruction per kind of abnormal end; outcomes saved or compared per case |
+| `tally <result.json>... [--cases f] [--save f] [--accepted f]` | Hits, misses by cause, wrong order, false fires, a rerun instruction per kind of abnormal end; outcomes saved or compared per case; with `--cases`, cases marked `"split": "test"` scored apart from the ones the description was written from |
 
 Findings from `check` are candidates, not verdicts:
 
@@ -276,6 +276,9 @@ Findings from `check` are candidates, not verdicts:
 | `no-eval`, `never-called`, `unmeasured` | No eval case or `tests/route_cases.json` entry grades it, or no call in the transcripts, or no transcripts to count in. A skill only the user invokes needs no eval |
 | `no-description`, `long-description`, `long-body` | No description, over 1,536 characters, over about 5,000 tokens, where a compaction cuts a skill |
 | `overlap-candidate` | Descriptions share many words. `audit` judges the meaning |
+| `unknown-frontmatter` | A skill key Claude Code does not read, such as `disable_model_invocation`. It is ignored without an error |
+| `hook-config` | An event name `hooks.json` does not have, or a command hook with no `timeout`, which can hold a session for the default |
+| `mcp-unpinned` | An MCP server fetched at start by `npx`, `uvx`, `bunx` or `pipx` with no exact version, so it runs whatever is newest |
 
 On real plugins, `broken-ref` was often an example path in a skill about writing skills, and `duplicate-file` was often deliberate. That is why `audit` opens each file.
 

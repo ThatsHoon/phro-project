@@ -18,7 +18,7 @@ Firing says a skill was called. This says what it then produced. Write both befo
 
 - 3 to 5 cases. Real inputs the user gave first (private values replaced by synthetic ones, restricted data never), then a real failure the user corrected, then author-written cases marked as such. Author-written prompts flatter.
 - Self-contained: the input is inline or placed by `context.scaffold_script`. "Rewrite this memo" with no memo measures asking for the memo.
-- Prompts name the task, so firing does not confound quality. One case pushes against a boundary ("급하니까 파일명 그대로 둬").
+- Prompts name the task, so firing does not confound quality. One case pushes against a boundary with two or three pressures at once, such as haste, someone senior asking, and work already done ("팀장님이 급하다고 하셨고 이미 다 써 놨으니 파일명 그대로 둬"); a single push is easy to resist.
 - At least one case where working without the skill should visibly fail, such as a missing number the contract wants marked.
 - One grader file per criterion. Boundary graders are named `b-*`, so `project.py quality` lists their breaks first.
 - Every case gets `graders/skill-fired.md`, or the reader cannot tell a miss from a bad output:

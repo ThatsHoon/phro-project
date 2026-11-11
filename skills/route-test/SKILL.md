@@ -37,8 +37,10 @@ Include negatives: close misses that share words with the skill and should fire 
 
 ```
 claude plugin eval "<out_dir>" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --model <model> -j 4 --json <run>/result.json
-project.py tally <run>/result.json
+project.py tally <run>/result.json --cases cases.json
 ```
+
+`--cases` scores cases marked `"split": "test"` apart from the rest. They were kept from whoever wrote the description, so a clearly lower score there means the description was fitted to its cases.
 
 Always pass `--no-publish`. Pin the model, since firing rates differ widely between models. The cost ceiling is only checked before each run starts, so with `-j 4` spend can pass it by several runs: set it below what the user approved.
 
@@ -65,7 +67,7 @@ A loaded skill can still be ignored. When following its procedure matters, drop 
 
 ## 5. A skill that fires from a step
 
-Some skills should fire partway through the work, such as after a draft and before the report. To a case, add `"after": "Write"`, the tool that marks the step, and `"rule": "<the standing rule's text>"`. `build` adds a `tool_order` grader and prints the `--allow-tools` the run needs, and `tally` counts a call at the wrong moment as `wrong_order`. Write the prompt so the step really happens, and add the same prompt without `rule` as a control.
+Some skills should fire partway through the work, such as after a draft and before the report. To a case, add `"after": "Write"`, the tool that marks the step, and `"rule": "<the standing rule's text>"`. `build` adds a `tool_order` grader and prints the `--allow-tools` the run needs, and `tally` counts a call at the wrong moment as `wrong_order`. Write the prompt so the step really happens, and add the same prompt without `rule` as a control. Add one more with `rule` and a push to skip it ("급하니까 바로 보고해"), since a standing rule matters most when the work is rushed.
 
 An eval reads no project configuration, so `rule` reaches the run through `append_system_prompt`, standing in for the core index. A pass says the wording works, not that the hook delivered it.
 

@@ -112,6 +112,30 @@ def demo():
         write(root, "skills/beta/SKILL.md", skill("beta", "Renders invoice PDFs from monthly billing exports.", "Hand off to `demo:alpha`.\n" + ("A long line of instructions. " * 60 + "\n") * 40))
     assert kinds(run(long_body)[0]) == {"long-body"}, "a compaction keeps the first 5,000 tokens, however few the lines"
 
+    def unpinned_mcp(root):
+        servers = {"loose": {"command": "npx", "args": ["-y", "@acme/files-mcp"]},
+                   "latest": {"command": "uvx", "args": ["notes-mcp@latest"]},
+                   "pinned": {"command": "npx", "args": ["-y", "@acme/files-mcp@1.4.2"]},
+                   "from": {"command": "uvx", "args": ["--from", "notes-mcp==0.3.1", "notes"]},
+                   "local": {"command": "python", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/server.py"]}}
+        write(root, ".mcp.json", json.dumps({"mcpServers": servers}))
+    assert sorted(f for f in run(unpinned_mcp)[0] if f[0] != "orphan") == [
+        ("mcp-unpinned", "mcp:latest", "notes-mcp@latest"), ("mcp-unpinned", "mcp:loose", "@acme/files-mcp")], "a server fetched by name runs whatever is newest"
+
+    def typo_key(root):
+        write(root, "skills/beta/SKILL.md", "---\nname: beta\ndescription: Renders invoice PDFs from monthly billing exports.\n"
+              "disable_model_invocation: true\nwhen_to_use: monthly close\nmetadata:\n  owner: billing\n---\n\nHand off to `demo:alpha`.\n")
+    assert run(typo_key)[0] == [("unknown-frontmatter", "skill:beta", "disable_model_invocation")], "Claude Code ignores a key it does not know, silently"
+
+    def hooks(root):
+        events = {"SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "python x.py", "timeout": 5}]}],
+                  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python x.py"}]}],
+                  "PostToolUse": [{"hooks": [{"type": "command", "command": "python x.py", "async": True}]}],
+                  "SessionBegin": [{"hooks": [{"type": "command", "command": "python x.py", "timeout": 5}]}]}
+        write(root, "hooks/hooks.json", json.dumps({"description": "demo", "hooks": events}))
+    assert sorted(run(hooks)[0]) == [("hook-config", "hooks/hooks.json", "SessionBegin is not a hook event"),
+                                     ("hook-config", "hooks/hooks.json", "UserPromptSubmit command has no timeout, so it can hold the session for the default")], run(hooks)[0]
+
     def many_short_lines(root):
         write(root, "skills/beta/SKILL.md", skill("beta", "Renders invoice PDFs from monthly billing exports.", "Hand off to `demo:alpha`.\n" + "Do it.\n" * 600))
     assert not run(many_short_lines)[0], "lines alone cost little"
@@ -231,6 +255,15 @@ def demo():
         out = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "tally", str(path), "--accepted", str(accepted)], capture_output=True, text=True, encoding="utf-8").stdout
         assert "gained\tc4\tnone -> hit" in out and "broken\tc1\thit -> other:beta" in out, out
         assert "gained\tc3" not in out and "not compared\tc3" in out, "an unresolved run on either side proves no change"
+
+        split = Path(d) / "split.json"
+        split.write_text(json.dumps([{"id": "c1"}, {"id": "c2"}, {"id": "c3", "split": "test"}, {"id": "c4", "split": "test"},
+                                     {"id": "c5", "split": "test"}, {"id": "n2", "split": "test"}, {"id": "n3"}]), encoding="utf-8")
+        out = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "tally", str(path), "--cases", str(split)], capture_output=True, text=True, encoding="utf-8").stdout
+        assert "split\twrite\ttarget\t1/3\tfalse_fires\t1/1" in out, out
+        assert "split\ttest\ttarget\t2/2\tfalse_fires\t0/1" in out, "cases held out from writing the description are scored apart, unresolved ones left out"
+        plain = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "tally", str(path)], capture_output=True, text=True, encoding="utf-8").stdout
+        assert "split\t" not in plain, "no split lines without held-out cases"
 
         def ordered(name, in_order):
             case = result(name, True, "alpha")
