@@ -140,7 +140,7 @@ def hwp_record(tag, level, data):
 _HWP_EXTENDED = (1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23)  # control characters that own a CTRL_HEADER
 
 
-def hwp_para(text, *, shape=0, style=0, chars=((0, 0),), level=0, controls=()):
+def hwp_para(text, *, shape=0, style=0, chars=((0, 0),), level=0, controls=(), ranges=()):
     """One HWP paragraph: PARA_HEADER at `level`, then PARA_TEXT and PARA_CHAR_SHAPE one level deeper.
 
     `text` is written as UTF-16LE units and ends with unit 13. Each U+FFFC takes the next (code, ctrl_id, children)
@@ -148,7 +148,8 @@ def hwp_para(text, *, shape=0, style=0, chars=((0, 0),), level=0, controls=()):
     is big-endian ASCII such as b"tbl " (stored byte-reversed); bytes past its first four are the CTRL_HEADER's own
     fields after the id. For an extended code the builder then appends that CTRL_HEADER at level + 1 and `children`
     as given (records the caller wrote at level + 2); an inline code such as 4 (field end) or 9 (tab) has none.
-    `chars` are the PARA_CHAR_SHAPE (position, char shape id) pairs.
+    `chars` are the PARA_CHAR_SHAPE (position, char shape id) pairs. `ranges` are PARA_RANGE_TAG (start, end, tag)
+    triples in units, written after PARA_CHAR_SHAPE; a tag's top byte is its kind (0x10 insert, 0x11 delete).
     """
     import struct
     units, ctrls = bytearray(), []
@@ -163,10 +164,11 @@ def hwp_para(text, *, shape=0, style=0, chars=((0, 0),), level=0, controls=()):
         if code in _HWP_EXTENDED:
             ctrls += [hwp_record(71, level + 1, raw + bytes(cid[4:])), bytes(children)]
     units += struct.pack("<H", 13)
-    header = struct.pack("<IIHBBHHHI", len(units) // 2, 0, shape, style, 0, len(chars), 0, 0, 0)
+    header = struct.pack("<IIHBBHHHI", len(units) // 2, 0, shape, style, 0, len(chars), len(ranges), 0, 0)
     pairs = b"".join(struct.pack("<II", pos, sid) for pos, sid in chars)
+    tags = hwp_record(70, level + 1, b"".join(struct.pack("<III", *r) for r in ranges)) if ranges else b""
     return (hwp_record(66, level, header) + hwp_record(67, level + 1, bytes(units))
-            + hwp_record(68, level + 1, pairs) + b"".join(ctrls))
+            + hwp_record(68, level + 1, pairs) + tags + b"".join(ctrls))
 
 
 def _hwp_caption(caption, level):
@@ -240,3 +242,32 @@ def make_hwp(path, sections, doc_info=b"", bins=None, flags=1, extra=None):
     path = Path(path)
     make_cfb(path, streams)
     return path
+
+
+def make_dist_section(section: bytes, key: bytes, seed: int, compressed: bool = True) -> bytes:
+    """A distribution document's ViewText/Section<N> stream, the inverse of hwp_records.view_text (tests only).
+
+    DISTRIBUTE_DOC_DATA (tag 28) carries 256 bytes: `seed` as u32 LE at 0-3, then filler XORed with the MSVC rand
+    stream seeded with it (key = rand() & 0xFF, then n = (rand() & 0xF) + 1 bytes), with the 16-byte AES `key` at
+    4 + (seed & 0xF). After it comes `section` (raw-deflated when `compressed`), zero-padded to whole blocks and
+    encrypted with AES-128-ECB under `key`. Needs the reader's scripts folder on sys.path, as the tests set it.
+    """
+    import struct
+    import zlib
+    from reader.containers.crypto import MsvcRand, aes128_ecb_encrypt
+    rand = MsvcRand(seed)
+    mask = bytearray()
+    while len(mask) < 256:
+        fill = rand() & 0xFF
+        mask += bytes([fill]) * ((rand() & 0xF) + 1)
+    # filler that is not zero, so a key read from the wrong offset cannot decrypt
+    plain = bytearray(struct.pack("<I", seed & 0xFFFFFFFF) + bytes((i * 37 + 11) & 0xFF for i in range(4, 256)))
+    at = 4 + (seed & 0xF)
+    plain[at:at + 16] = key
+    payload = plain[:4] + bytes(b ^ m for b, m in zip(plain[4:], mask[4:256]))
+    body = bytes(section)
+    if compressed:
+        c = zlib.compressobj(wbits=-15)
+        body = c.compress(body) + c.flush()
+    body += bytes(-len(body) % 16)
+    return hwp_record(28, 0, payload) + aes128_ecb_encrypt(bytes(key), body)

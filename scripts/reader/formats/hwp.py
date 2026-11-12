@@ -4,8 +4,10 @@ The body is a flat list of records per section; a record's children are the reco
 Logic follows dochan hwp/section.py and records/ctrl_header.py (paragraph walk, controls, field commands, tables,
 drawing objects and their captions), dochan hwp/bin_data.py and rhwp parser/mod.rs (BinData streams and the per-item
 compression bit), kordoc hwp5/body.ts, record.ts and numbering.ts (secd outline numbering, note numbers, %clk
-placeholders, EQEDIT script) and rhwp parser/body_text.rs (control-character classes). The inline model, paragraph
-rules and cell grid are hancom.py's, shared with hwpx.py.
+placeholders, EQEDIT script) and rhwp parser/body_text.rs (control-character classes). Distribution documents read
+ViewText through hwp_records.view_text (dochan hwp/distdoc.py); the DRM sniff and the track-changes ViewText
+preference follow rhwp parser/mod.rs, the PARA_RANGE_TAG kinds rhwp parser/tracked_viewtext.rs and dochan
+hwp/revisions.py. The inline model, paragraph rules and cell grid are hancom.py's, shared with hwpx.py.
 """
 import re
 import struct
@@ -23,14 +25,16 @@ from .hancom import (
     place, plain, strip_marker, style_name_level, tex as _tex,
 )
 from .hwp_records import (
-    CTRL_HEADER, EQEDIT, LIST_HEADER, PARA_CHAR_SHAPE, PARA_HEADER, PARA_TEXT, SHAPE_COMPONENT, SHAPE_PICTURE, TABLE,
-    DocInfo, ParaShape, doc_info, file_header, records,
+    CTRL_HEADER, EQEDIT, LIST_HEADER, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT, SHAPE_COMPONENT,
+    SHAPE_PICTURE, TABLE, DocInfo, ParaShape, doc_info, file_header, first_tag, records, view_text,
 )
 
 _ZIP = b"PK\x03\x04"
 _V3 = b"HWP Document File V3"
-_SECTION = re.compile(r"bodytext/section(\d+)", re.I)
+_DRM = (b"SCDSA", b"\x9b DRMONE")  # SoftCamp and Fasoo DRM containers (rhwp parser/mod.rs)
+_SECTION = re.compile(r"(bodytext|viewtext)/section(\d+)", re.I)
 _SECTIONS = 1000
+_DELETE = 0x11  # the PARA_RANGE_TAG kind (top byte of its tag) of a tracked deletion; 0x10, an insertion, stays
 # control characters: one unit (char class) unless listed here; these take eight units
 _EXTENDED = frozenset((1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23))  # the k-th one owns the k-th CTRL_HEADER
 _INLINE = frozenset((4, 5, 6, 7, 8, 9, 19, 20))
@@ -48,6 +52,20 @@ def _wstr(data: bytes, pos: int) -> str:
     n = struct.unpack_from("<H", data, pos)[0]
     end = min(pos + 2 + 2 * n, len(data))
     return data[pos + 2:end - (end - pos) % 2].decode("utf-16-le", "replace")
+
+
+def _deleted(tags: bytes) -> list:
+    """The units PARA_RANGE_TAG deletions cover (12-byte start, end, tag entries), merged into sorted edges
+    [start, end, start, end, ...]: unit u is deleted when an odd number of edges are <= u. Backwards and empty ranges
+    are left out."""
+    spans = sorted((s, e) for s, e, t in struct.iter_unpack("<III", tags) if t >> 24 == _DELETE and s < e)
+    edges = []
+    for s, e in spans:
+        if edges and s <= edges[-1]:
+            edges[-1] = max(edges[-1], e)
+        else:
+            edges += (s, e)
+    return edges
 
 
 def _ends(recs) -> list:
@@ -88,16 +106,19 @@ class _Reader(Scopes):
         self._ends_of, self._ends = None, []
 
     # ---- streams
-    def load(self, name, parse):
-        """Read a stream, inflate it when the document is compressed and parse it. A cut deflate stream is parsed
-        from what inflated and counts one damaged record, whether or not its last record was split."""
+    def load(self, name, parse, decode=None):
+        """Read a stream, decode it (`decode`, else inflate when the document is compressed) and parse it. A cut
+        deflate stream is parsed from what inflated and counts one damaged record, whether or not its last record
+        was split."""
         data = self.cf.read(name)
         cut = False
-        if self.head.compressed:
-            try:
+        try:
+            if decode is not None:
+                data = decode(data)
+            elif self.head.compressed:
                 data = flate.inflate(data, self.budget)
-            except flate.Truncated as e:
-                data, cut = e.data, True
+        except flate.Truncated as e:
+            data, cut = e.data, True
         before = self.ctx.skipped["record"]
         out = parse(data, self.ctx)
         if cut and self.ctx.skipped["record"] == before:
@@ -145,12 +166,13 @@ class _Reader(Scopes):
         except ValueError:  # not deflate at all: an item marked compressed but stored, kept as rhwp and dochan keep it
             return raw if len(raw) >= 16 and sniff(raw) else None
 
-    def section_names(self) -> list:
-        """The declared section count together with the BodyText/Section<N> streams found, N under 1000, in order."""
+    def section_names(self, storage) -> list:
+        """(N, stream name) for the declared section count together with the <storage>/Section<N> streams found
+        (storage BodyText or ViewText), N under 1000, in order."""
         found, over = {}, 0
         for name in self.cf.names():
-            if m := _SECTION.fullmatch(name):
-                n = int(m.group(1))
+            if (m := _SECTION.fullmatch(name)) and m.group(1).lower() == storage.lower():
+                n = int(m.group(2))
                 if n < _SECTIONS:
                     found.setdefault(n, name)
                 else:
@@ -158,7 +180,21 @@ class _Reader(Scopes):
         if over:
             self.ctx.skipped["section"] += over
         nums = sorted(set(range(min(self.info.sections, _SECTIONS))) | set(found))
-        return [found.get(n, f"BodyText/Section{n}") for n in nums]
+        return [(n, found.get(n, f"{storage}/Section{n}")) for n in nums]
+
+    def tracked(self, n, name) -> list:
+        """A track-changes section (rhwp parser/mod.rs; dochan hwp/revisions.py): ViewText/Section<n>, not encrypted,
+        holds the text with its insertions and deletions marked, BodyText the result. ViewText is read when it
+        inflates whole to a stream that starts with a paragraph; otherwise BodyText is, and nothing is counted."""
+        try:
+            data = self.cf.read(f"ViewText/Section{n}")
+            if self.head.compressed:
+                data = flate.inflate(data, self.budget)
+            if first_tag(data) != PARA_HEADER:
+                raise ValueError("not a paragraph stream")
+        except (KeyError, ValueError):  # missing, a broken chain, bad or cut deflate (Truncated), not paragraphs
+            return self.load(name, records)
+        return records(data, self.ctx)
 
     def run(self):
         try:
@@ -174,9 +210,15 @@ class _Reader(Scopes):
         except (KeyError, ValueError):
             self.ctx.skipped["styles"] += 1  # DocInfo holds the style, shape and numbering tables
         good = 0
-        for name in self.section_names():
+        # a distribution document's text is only in ViewText, encrypted with the key it carries (no BodyText fallback)
+        for n, name in self.section_names("ViewText" if h.distribution else "BodyText"):
             with self.ctx.guard("section"):
-                recs = self.load(name, records)
+                if h.distribution:
+                    recs = self.load(name, records, lambda raw: view_text(raw, h.compressed, self.budget))
+                elif h.track_changes:
+                    recs = self.tracked(n, name)
+                else:
+                    recs = self.load(name, records)
                 blocks = self.paras(recs, 0, len(recs), 0, False)
                 self.doc.blocks.extend(blocks)
                 good += 1
@@ -240,7 +282,7 @@ class _Reader(Scopes):
     def para(self, recs, i, d, nohead) -> list:
         head, end = recs[i], self.end(recs, i)
         lvl = head.level + 1
-        text, pairs = [], []
+        text, pairs, tags = [], [], []
         j = i + 1
         while j < end:
             r = recs[j]
@@ -249,9 +291,12 @@ class _Reader(Scopes):
                     text.append(r.data[:len(r.data) // 2 * 2])
                 elif r.tag == PARA_CHAR_SHAPE:
                     pairs.append(r.data[:len(r.data) // 8 * 8])
+                elif r.tag == PARA_RANGE_TAG:
+                    tags.append(r.data[:len(r.data) // 12 * 12])
             j = self.end(recs, j)
         st = State(nohead)
-        self.walk(b"".join(text), self.bold_runs(b"".join(pairs)), st, recs, i + 1, end, lvl, d)
+        runs, edges = self.bold_runs(b"".join(pairs)), _deleted(b"".join(tags))
+        self.walk(b"".join(text), runs, edges, st, recs, i + 1, end, lvl, d)
         self.close_to(st, 1)
         return self.blocks(head, st)
 
@@ -260,12 +305,20 @@ class _Reader(Scopes):
         runs = sorted((p, 0 <= s < len(bold) and bold[s]) for p, s in struct.iter_unpack("<II", pairs))
         return [p for p, _ in runs], [b for _, b in runs]
 
-    def walk(self, data, runs, st, recs, cur, end, lvl, d):
-        """PARA_TEXT units into inlines; the k-th extended control character runs the k-th CTRL_HEADER."""
+    def walk(self, data, runs, edges, st, recs, cur, end, lvl, d):
+        """PARA_TEXT units into inlines; the k-th extended control character runs the k-th CTRL_HEADER. What a
+        tracked deletion covers (`edges`, from _deleted) goes into a deleted scope, so it is hidden."""
         cur = self.next_ctrl(recs, cur, end, lvl)
         n, p = len(data), 0
+        k, scope, stop = 0, None, n  # edges passed, the open deleted scope, where a plain run must stop
         while p + 1 < n:
-            if m := _PLAIN.match(data, p):
+            if edges:
+                u = p // 2
+                while k < len(edges) and edges[k] <= u:
+                    k += 1
+                scope = self.deleting(st, k % 2, scope)
+                stop = min(n, 2 * edges[k]) if k < len(edges) else n  # endpos, so no run is matched twice
+            if m := _PLAIN.match(data, p, stop):
                 self.chunk(data[p:m.end()].decode("utf-16-le"), p // 2, runs, st)
                 p = m.end()
                 continue
@@ -301,6 +354,23 @@ class _Reader(Scopes):
             p += 2  # 0 and 24-29 are dropped
         while cur < end:  # controls the text never reached still give their content
             cur = self.next_ctrl(recs, self.control(recs, cur, st, d), end, lvl)
+
+    def deleting(self, st, inside, scope):
+        """Keep a deleted scope open exactly while the walk is inside a tracked deletion. `scope` is (index, Frame) of
+        the one this paragraph opened, or None; the new value is returned. A field end that closes a field opened
+        before the deletion closes it too, and the next deleted unit opens another. Past MAX_DEPTH open scopes none
+        opens and the text stays visible."""
+        if scope and (len(st.frames) <= scope[0] or st.frames[scope[0]] is not scope[1]):
+            scope = None
+        if inside and not scope:
+            f = Frame("deleted")
+            self.push(st, f)
+            if st.frames[-1] is f:
+                scope = (len(st.frames) - 1, f)
+        elif scope and not inside:
+            self.close_to(st, scope[0])
+            scope = None
+        return scope
 
     def chunk(self, s, u, runs, st):
         """Text starting at unit u, split where PARA_CHAR_SHAPE changes boldness."""
@@ -554,6 +624,8 @@ class _Reader(Scopes):
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
         head = f.read(32)
+    if any(mark in head for mark in _DRM):  # a DRM container is not a compound file: sniffed before one opens
+        raise ReadError("drm")
     if head.startswith(_ZIP):
         return hwpx.parse(path, ctx)
     if head.startswith(_V3):

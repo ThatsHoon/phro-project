@@ -1,12 +1,14 @@
-"""HWP 5.0 records, FileHeader and DocInfo.
+"""HWP 5.0 records, FileHeader, DocInfo and distribution-document sections.
 
 Offsets follow reverse/hwp.md and were checked against dochan hwp/doc_info.py, hwp/records/char_shape.py and
-hwp/records/style.py and kordoc hwp5/record.ts (NUMBERING, BULLET, PARA_SHAPE).
+hwp/records/style.py and kordoc hwp5/record.ts (NUMBERING, BULLET, PARA_SHAPE). ViewText decoding follows dochan
+hwp/distdoc.py and rhwp parser/crypto.rs.
 """
 import struct
 from dataclasses import dataclass
 
 from .. import limits
+from ..containers import crypto, flate
 from ..containers.cfb import Compound
 from ..limits import ReadError
 from .hancom import NUM_KINDS
@@ -36,6 +38,8 @@ SHAPE_CONTAINER = 86
 EQEDIT = 88
 
 SIGNATURE = b"HWP Document File"
+_DIST_DATA = 256       # bytes of the DISTRIBUTE_DOC_DATA payload
+_AES_CHUNK = 1 << 20   # bytes per decrypt call: crypto turns its whole input into Python ints at once
 
 
 @dataclass
@@ -45,12 +49,33 @@ class Record:
     data: bytes
 
 
+def _zero_tail(data: bytes) -> int:
+    """Where the run of zero bytes that ends `data` starts: len(data) when the last byte is not zero. O(that run)."""
+    end = len(data)
+    while end:
+        start = max(0, end - 4096)
+        kept = len(data[start:end].rstrip(b"\0"))
+        if kept:
+            return start + kept
+        end = start
+    return 0
+
+
 def records(data: bytes, ctx) -> list[Record]:
+    """The records of a stream. A cut last record counts one damaged record; zero bytes that end the stream (the
+    AES padding after a distribution section) are not records and are not counted."""
     out: list[Record] = []
     n = len(data)
     pos = 0
+    pad = None  # where the zero tail starts, found the first time a header word is zero or cut
     unpack = struct.unpack_from
     while pos < n:
+        w = unpack("<I", data, pos)[0] if pos + 4 <= n else 0
+        if not w:
+            if pad is None:
+                pad = _zero_tail(data)
+            if pos >= pad:
+                break
         if len(out) >= limits.HWP_RECORDS:
             ctx.skipped["record"] += 1
             ctx.warnings.append(f"record: more than {limits.HWP_RECORDS} records, the rest is dropped")
@@ -58,7 +83,6 @@ def records(data: bytes, ctx) -> list[Record]:
         if pos + 4 > n:
             ctx.skipped["record"] += 1
             break
-        w = unpack("<I", data, pos)[0]
         pos += 4
         size = w >> 20
         if size == 0xFFF:
@@ -72,6 +96,60 @@ def records(data: bytes, ctx) -> list[Record]:
             break
         out.append(Record(w & 0x3FF, (w >> 10) & 0x3FF, data[pos:pos + size]))
         pos += size
+    return out
+
+
+def first_tag(data: bytes) -> int:
+    """The tag of the record `data` starts with; -1 when it is too short for a record header."""
+    return struct.unpack_from("<I", data)[0] & 0x3FF if len(data) >= 4 else -1
+
+
+def view_text(data: bytes, compressed: bool, budget: flate.Budget) -> bytes:
+    """A distribution document's ViewText/Section<N> stream as its plain record stream (dochan hwp/distdoc.py).
+
+    The stream opens with DISTRIBUTE_DOC_DATA (tag 28, 256 bytes). Its bytes 0-3 are a u32 LE seed for the MSVC
+    rand stream, which is XORed over the payload run by run from byte 0 (key = rand() & 0xFF, n = (rand() & 0xF) +
+    1, then the next n bytes); the seed's own four bytes stay as they are, as rhwp decodes them. The AES-128 key is
+    the 16 decoded bytes at 4 + (decoded[0] & 0xF). Everything after the record is AES-128-ECB ciphertext in whole
+    blocks, decrypted a megabyte at a time and inflated with `budget` when `compressed`.
+
+    Raises ValueError for any other layout, or when the result does not start with a PARA_HEADER (a wrong key or
+    damaged ciphertext decrypts to garbage). A cut deflate stream that does start with one raises flate.Truncated
+    with what inflated, as inflate does.
+    """
+    if len(data) < 4:
+        raise ValueError("no DISTRIBUTE_DOC_DATA record")
+    w = struct.unpack_from("<I", data)[0]
+    size, start = w >> 20, 4
+    if size == 0xFFF:
+        if len(data) < 8:
+            raise ValueError("cut DISTRIBUTE_DOC_DATA header")
+        size, start = struct.unpack_from("<I", data, 4)[0], 8
+    if w & 0x3FF != DISTRIBUTE_DOC_DATA or size != _DIST_DATA or len(data) < start + _DIST_DATA:
+        raise ValueError("no 256-byte DISTRIBUTE_DOC_DATA record")
+    head = data[start:start + _DIST_DATA]
+    rand = crypto.MsvcRand(struct.unpack_from("<I", head)[0])
+    mask = bytearray()
+    while len(mask) < _DIST_DATA:
+        key = rand() & 0xFF
+        mask += bytes((key,)) * ((rand() & 0xF) + 1)
+    decoded = head[:4] + bytes(b ^ m for b, m in zip(head[4:], mask[4:]))
+    at = 4 + (decoded[0] & 0xF)
+    key = decoded[at:at + 16]
+    body = memoryview(data)[start + _DIST_DATA:]
+    if not body or len(body) % 16:
+        raise ValueError("distribution ciphertext is not whole AES blocks")
+    out = b"".join([crypto.aes128_ecb_decrypt(key, bytes(body[i:i + _AES_CHUNK]))
+                    for i in range(0, len(body), _AES_CHUNK)])
+    if compressed:
+        try:
+            out = flate.inflate(out, budget)
+        except flate.Truncated as e:
+            if first_tag(e.data) != PARA_HEADER:
+                raise ValueError("distribution section does not start with a paragraph") from None
+            raise
+    if first_tag(out) != PARA_HEADER:
+        raise ValueError("distribution section does not start with a paragraph")
     return out
 
 
