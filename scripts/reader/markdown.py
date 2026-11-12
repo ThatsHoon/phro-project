@@ -45,6 +45,7 @@ LOST = (
     (("chart_cut",), "chart cut short", "charts cut short"),
     (("cells",), "table cut short", "tables cut short"),
     (("repeat",), "repeated row or cell cut short", "repeated rows or cells cut short"),
+    (("record",), "damaged record", "damaged records"),
     (("depth",), "place nested too deeply", "places nested too deeply"),
 )
 # counted too, but they only change formatting or reading order, so they are not reported

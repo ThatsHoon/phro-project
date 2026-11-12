@@ -126,3 +126,36 @@ def make_cfb(path, streams, sector_size=512):
         f.write(bytes(hdr))
         f.write(b"".join(sectors))
     return {"fat": fat_ids, "dir": dirs, "chains": chains, "mini": mini_of}
+
+
+def hwp_record(tag, level, data):
+    """One HWP record: u32 header (tag 10 bits, level 10 bits, size 12 bits), extended size from 0xFFF bytes."""
+    import struct
+    data = bytes(data)
+    if len(data) >= 0xFFF:
+        return struct.pack("<II", tag | (level << 10) | (0xFFF << 20), len(data)) + data
+    return struct.pack("<I", tag | (level << 10) | (len(data) << 20)) + data
+
+
+def make_hwp(path, sections, doc_info=b"", bins=None, flags=1, extra=None):
+    """Write an HWP 5.0.3.0 compound file: FileHeader, DocInfo, BodyText/Section<N> (raw-deflated when flags & 1),
+    BinData/<name> and any extra streams as given."""
+    import struct
+    import zlib
+
+    def pack(raw):
+        if not flags & 1:
+            return bytes(raw)
+        c = zlib.compressobj(wbits=-15)
+        return c.compress(bytes(raw)) + c.flush()
+
+    header = b"HWP Document File".ljust(32, b"\0") + struct.pack("<II", 0x05000300, flags)
+    streams = {"FileHeader": header.ljust(256, b"\0"), "DocInfo": pack(doc_info)}
+    for i, body in enumerate(sections):
+        streams[f"BodyText/Section{i}"] = pack(body)
+    for name, data in (bins or {}).items():
+        streams[f"BinData/{name}"] = bytes(data)
+    streams.update(extra or {})
+    path = Path(path)
+    make_cfb(path, streams)
+    return path
