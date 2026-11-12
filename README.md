@@ -439,7 +439,7 @@ python -I -X utf8 <copy>/scripts/daily.py run --force [--date YYYY-MM-DD]
 
 A `PreToolUse` hook on `Read` (`scripts/read.py hook`) catches a read of a document the model cannot open as text, converts it to Markdown with images extracted to files, and hands Claude the Markdown path to read instead. `pdf`, `docx`, `pptx`, `xlsx` and `xlsm` are never touched; they belong to the `anthropic-skills:*` skills.
 
-Built formats: `hwpx`, `hwp`, `odt`, `ods`, `odp`, `docm`, `pptm`, `ppsx`, `epub`, `xps`, `oxps`, `vsdx`. Every other in-scope extension (doc, xls, ppt, xlsb, rtf, wpd, mobi, azw3, pages, numbers, key, djvu, mdb, accdb, pub, vsd, mpp) is denied as "unsupported" until its phase is built; a plain-text file that only carries one of these extensions passes through unchanged. Standard library only; budgets: input 512 MiB, output 20 MB, 45 seconds per conversion.
+Built formats: `hwpx`, `hwp`, `doc`, `odt`, `ods`, `odp`, `docm`, `pptm`, `ppsx`, `epub`, `xps`, `oxps`, `vsdx`. Every other in-scope extension (xls, ppt, xlsb, rtf, wpd, mobi, azw3, pages, numbers, key, djvu, mdb, accdb, pub, vsd, mpp) is denied as "unsupported" until its phase is built; a plain-text file that only carries one of these extensions passes through unchanged. Standard library only; budgets: input 512 MiB, output 20 MB, 45 seconds per conversion.
 
 Always-on cost: for any file outside the 29 in-scope extensions the hook prints nothing, and each Read costs one Python start. Measured with `Measure-Command` over 20 runs of `read.py hook` on a `.py` event, the median is 84 ms.
 

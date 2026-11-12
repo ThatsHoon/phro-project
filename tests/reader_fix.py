@@ -271,3 +271,67 @@ def make_dist_section(section: bytes, key: bytes, seed: int, compressed: bool = 
         body = c.compress(body) + c.flush()
     body += bytes(-len(body) % 16)
     return hwp_record(28, 0, payload) + aes128_ecb_encrypt(bytes(key), body)
+
+
+DOC_EXTRA = 0x400  # where make_doc puts word_extra in WordDocument; the piece text follows it
+DOC_STORIES = ("text", "footnote", "header", "macro", "annotation", "endnote", "textbox", "header_textbox")
+
+
+def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, fc=None, word_extra=b"",
+             streams=None, lid_fe=None):
+    """Write a Word 97 .doc compound file.
+
+    WordDocument holds the FIB (FibBase with `lid`, `nfib` and `flags`; 14 FibRgW words, lidFE at 13, `lid_fe` or
+    `lid`; 22 FibRgLw longs, the story lengths at 3-10; 93 FibRgFcLcb97 pairs; cswNew 0), `word_extra` at DOC_EXTRA,
+    then the text of `pieces`, (text, compressed) in CP order: compressed text is encoded in codepage(lid), one CP a
+    byte, the rest is UTF-16LE from an even offset. The table stream (1Table when flags has 0x0200, else 0Table)
+    holds each `fc` entry (FibRgFcLcb97 index -> bytes) in index order with its (fc, lcb) set in the FIB, then the
+    Clx (one Pcdt, no Prc) at index 33 unless `fc` gives it. `ccp` sets story lengths by DOC_STORIES name; "text"
+    takes the CPs the others leave. `streams` adds streams and replaces a built one of the same name. Needs the
+    reader's scripts folder on sys.path, as the tests set it.
+    """
+    import struct
+    from reader.text import codepage
+    body = bytearray(bytes(word_extra))
+    cps, pcds = [0], []
+    for text, compressed in pieces:
+        if compressed:
+            raw = text.encode(codepage(lid))
+            at, n = DOC_EXTRA + len(body), len(raw)
+            fcv = at * 2 | 0x40000000
+        else:
+            body += bytes(len(body) % 2)
+            raw = text.encode("utf-16-le")
+            at, n = DOC_EXTRA + len(body), len(raw) // 2
+            fcv = at
+        body += raw
+        cps.append(cps[-1] + n)
+        pcds.append(struct.pack("<HIH", 0, fcv, 0))
+    lengths = dict(ccp or {})
+    if "text" not in lengths:
+        lengths["text"] = max(0, cps[-1] - sum(lengths.values()))
+    entries = dict(fc or {})
+    if 33 not in entries:
+        plc = struct.pack("<%dI" % len(cps), *cps) + b"".join(pcds)
+        entries[33] = b"\x02" + struct.pack("<I", len(plc)) + plc
+    pairs, table = [(0, 0)] * 93, bytearray()
+    for i in sorted(entries):
+        data = bytes(entries[i])
+        pairs[i] = (len(table), len(data))
+        table += data
+    rgw = [0] * 14
+    rgw[13] = lid if lid_fe is None else lid_fe
+    rglw = [0] * 22
+    rglw[0] = DOC_EXTRA + len(body)  # cbMac
+    for k, name in enumerate(DOC_STORIES):
+        rglw[3 + k] = lengths.get(name, 0)
+    fib = (struct.pack("<7HI2B2H2I", 0xA5EC, nfib, 0, lid, 0, flags, 0x00BF, 0, 0, 0, 0, 0, 0, 0)
+           + struct.pack("<15H", 14, *rgw) + struct.pack("<H22I", 22, *rglw)
+           + struct.pack("<H", 93) + b"".join(struct.pack("<II", *p) for p in pairs) + struct.pack("<H", 0))
+    assert len(fib) <= DOC_EXTRA
+    out = {"WordDocument": fib.ljust(DOC_EXTRA, b"\0") + bytes(body),
+           "1Table" if flags & 0x0200 else "0Table": bytes(table)}
+    out.update(streams or {})
+    path = Path(path)
+    make_cfb(path, out)
+    return path
