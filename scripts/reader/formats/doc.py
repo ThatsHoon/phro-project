@@ -22,16 +22,29 @@ Paragraphs with a table depth (sprmPFInTable, sprmPItap) are grouped into tables
 nested table's cells and rows end at marks with sprmPFInnerTableCell and sprmPFInnerTtp. The row mark's TDefTable
 puts the cells on the grid of all the table's boundaries and gives the merges, the colspan and rowspan the docx
 reader gives w:gridSpan and w:vMerge.
+
+The other stories are cut into entries by their PLCs (MS-DOC 2.2.2: n + 1 CPs, then n data elements; logic after
+dochan doc_stories.py: the PLC pairs, PlcfHdd's layout), each entry walked as the main story is, so bold, hidden text,
+fields, lists and tables work in them too. Footnotes, endnotes and comments are Ref and Txt PLC pairs: Ref entry i is
+the CP of its reference character (\\x02 for a note, \\x05 for a comment) and Txt range i its text, relative to its
+story; each becomes doc.notes[id] and the reference a NoteRef where the walk meets that very CP. A comment reads as
+the docx reader's do, "Comment by <author>: " first, the author from GrpXstAtnOwners. Headers and footers are the
+PlcfHdd stories after the six separators, six a section, each one line of doc.headers or doc.footers. Text boxes
+(PlcftxbxTxt) follow the main text in story order; header text boxes (PlcfHdrtxbxTxt) are header lines.
 """
 import re
 import struct
 from bisect import bisect_right
+from itertools import islice
+from operator import gt
 
 from .. import limits
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
-from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Link, ListItem, Para, Table, Text
+from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Link, ListItem, NoteRef, Para, Table, Text
 from . import doc_fib, ooxml
+from .hancom import flat
+from .ooxml_word import MAX_NAME
 from .word_fields import MAX_INSTR, hyperlink_url
 
 _ZIP = b"PK\x03\x04"
@@ -40,8 +53,60 @@ _BOM = b"\xef\xbb\xbf"
 _CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f]")  # the characters the walk hands to a handler; a tab is text
 _MARK = re.compile(r"[\r\x07\x0c]")  # the characters that end a paragraph and own its PAPX
 _SURROGATE = re.compile("[\ud800-\udfff]")
+_C0 = re.compile(r"[\x00-\x1f]")
 _HUGE_PAPX = 0x6646
 _PLAIN = doc_fib.RunProps()
+
+# FibRgFcLcb97 indices of the stories' PLCs (MS-DOC 2.5.6) and GrpXstAtnOwners
+_HDD, _ATN_OWNERS, _TXBX, _HDR_TXBX = 11, 36, 56, 58
+# the note stories: story, id prefix, Ref and Txt PLC indices (PlcffndRef/Txt, PlcfendRef/Txt, PlcfandRef/Txt), the
+# size of a Ref data element (an FRD, or an ATRDPre10: xstUsrInitl, then ibst u16 at 20) and the kind a loss counts as
+_NOTES = (("footnote", "fn", 2, 3, 2, "footnotes"), ("endnote", "en", 46, 47, 2, "footnotes"),
+          ("annotation", "cm", 4, 5, 30, "comments"))
+_FTXBXS = 22      # bytes of an FTXBXS: reusable01, reusable02, fReusable i16 at 8, itxbxsDest, lid, txidUndo
+_SEPARATORS = 6   # PlcfHdd stories before the first section's: the footnote and endnote separators and notices
+_SECTION = 6      # PlcfHdd stories a section: even header, odd header, even footer, odd footer, first header, footer
+_FOOTERS = frozenset((2, 3, 5))  # their places among a section's six
+_OWNERS = 0x10000  # GrpXstAtnOwners names an ibst (u16) can index
+PLC_MAX = 1_000_000  # entries one story PLC may hold; past it the PLC is not read and its story is counted
+
+
+def _plc(data: bytes, cb: int) -> tuple[list[int], list[bytes]]:
+    """A PLC: n + 1 u32 CPs, then n cb-byte data elements, n = (lcb - 4) / (4 + cb). ValueError when n is not whole
+    or past PLC_MAX, or the CPs decrease; no CPs when there is no PLC."""
+    if not data:
+        return [], []
+    if len(data) < 4:
+        raise ValueError("PLC size")
+    n, rest = divmod(len(data) - 4, 4 + cb)
+    if rest or n > PLC_MAX:
+        raise ValueError("PLC size")
+    cps = list(struct.unpack_from("<%dI" % (n + 1), data))
+    if any(map(gt, cps, islice(cps, 1, None))):
+        raise ValueError("PLC CPs decrease")
+    at = 4 * (n + 1)
+    return cps, [data[at + cb * i:at + cb * (i + 1)] for i in range(n)] if cb else []
+
+
+def _author(atrd: bytes, owners: list[str]) -> str:
+    """A comment's author: GrpXstAtnOwners[ibst], else (ibst past the list, or the name empty) the initials of the
+    ATRDPre10's xstUsrInitl (u16 count, at most 9 UTF-16 units). Control characters become spaces."""
+    ibst = struct.unpack_from("<H", atrd, 20)[0]
+    name = owners[ibst] if ibst < len(owners) else ""
+    if not name:
+        name = atrd[2:2 + 2 * min(struct.unpack_from("<H", atrd)[0], 9)].decode("utf-16-le", "replace")
+    return _C0.sub(" ", name)
+
+
+def _comment(blocks: list, author: str) -> list:
+    """A comment's blocks as the docx reader gives them (ooxml_word's load_comments): "Comment by <author>: " before
+    the first paragraph's text, or as a paragraph of its own when the comment does not start with one."""
+    lead = Text(f"Comment by {author[:MAX_NAME]}: ")
+    if blocks and isinstance(blocks[0], Para):
+        blocks[0].inlines.insert(0, lead)
+    else:
+        blocks.insert(0, Para([lead]))
+    return blocks
 
 
 def _joined(s: str) -> str:
@@ -179,11 +244,12 @@ class _State:
 
 class _Reader:
     # a control character -> its handler (st, cp), cp being the character's CP; one not listed is dropped. Tasks
-    # 12-14 give \x01 (picture), \x02 (note reference), \x05 (comment reference) and \x08 (drawn object) handlers. A
-    # cell or row mark (\x07) ends its paragraph too; place() gives it its table meaning.
+    # 13-14 give \x01 (picture) and \x08 (drawn object) handlers. A cell or row mark (\x07) ends its paragraph too;
+    # place() gives it its table meaning.
     SPECIAL: dict[str, str] = {
         "\r": "para_end", "\x07": "para_end", "\x0c": "para_end",
         "\x0a": "line_break", "\x0b": "line_break",
+        "\x02": "note_ref", "\x05": "comment_ref",
         "\x13": "field_begin", "\x14": "field_separator", "\x15": "field_end",
         "\x1e": "hyphen",
     }
@@ -197,6 +263,9 @@ class _Reader:
         self.pieces = []
         self.lid = 0x0409  # the language of compressed text (doc_fib.compressed_codepage)
         self.ranges = {}   # story name -> (cp0, cp1), clamped to the CPs the pieces hold
+        self.base = {}     # story name -> its first CP, unclamped: a story PLC's CPs count from it
+        self.note_at = {}     # CP -> the id of the footnote or endnote whose reference (\x02) is there
+        self.comment_at = {}  # CP -> the id of the comment whose reference (\x05) is there
         self.on = {ch: getattr(self, name) for ch, name in self.SPECIAL.items()}
         self.styles = doc_fib.Styles()
         self.lists = doc_fib.Lists()
@@ -236,12 +305,130 @@ class _Reader:
             self.ctx.skipped["text"] += cut
         self.lid = f.lid_fe if f.far_east and f.lid_fe else f.lid
         self.ranges = doc_fib.story_ranges(f.ccp, self.pieces[-1].cp_end if self.pieces else 0)
+        at = 0
+        for name in doc_fib.STORIES:
+            self.base[name] = at
+            at += f.ccp[name]
         self.props()
+        self.notes()
+        self.headers()
         with self.ctx.guard("document"):
             self.doc.blocks.extend(self.story("text"))
+        for blocks in self.boxes("textbox", _TXBX, "block"):
+            self.doc.blocks.extend(blocks)
         if self.styles.bad:
             self.ctx.skipped["styles"] += self.styles.bad
         return self.doc
+
+    # ---- the other stories
+    def story_plc(self, index, cb) -> tuple[list[int], list[bytes]]:
+        """The PLC at FibRgFcLcb97 entry `index` (see _plc); ValueError when it is outside the table stream."""
+        fc, lcb = self.fib.pair(index)
+        if not lcb:
+            return [], []
+        if fc + lcb > len(self.table):
+            raise ValueError("PLC outside the table stream")
+        return _plc(self.table[fc:fc + lcb], cb)
+
+    def owners(self) -> list[str]:
+        """GrpXstAtnOwners: the comment authors, an Xst (u16 count, UTF-16 units) each. The list ends where an Xst does
+        not fit, or at as many names as an ibst can index; it is empty when it is outside the table stream."""
+        fc, lcb = self.fib.pair(_ATN_OWNERS)
+        if not lcb or fc + lcb > len(self.table):
+            return []
+        raw, out, pos = self.table[fc:fc + lcb], [], 0
+        while pos + 2 <= lcb and len(out) < _OWNERS:
+            end = pos + 2 + 2 * struct.unpack_from("<H", raw, pos)[0]
+            if end > lcb:
+                break
+            out.append(raw[pos + 2:end].decode("utf-16-le", "replace"))
+            pos = end
+        return out
+
+    def notes(self):
+        """Footnotes, endnotes and comments (_NOTES). A story's Ref and Txt PLCs are read under guard(kind): one that
+        is not a whole PLC, whose CPs decrease or whose texts run past the story's ccp loses that story, counted once.
+        Ref entry i owns Txt range i: a reference without a range, and a range past the Ref entries other than the
+        last (the story's guard paragraph mark, MS-DOC: Txt holds one CP more than Ref), are counted under kind. An
+        empty range is no note. Every note's slot in doc.notes is reserved before any text is read, its id unique to
+        its PLC entry, so a reference in a note's own text (to itself, to a note read later, across stories) is a
+        NoteRef to that slot and nothing is read twice or recursively; then each text is read in PLC order under
+        guard(kind), and one that fails gives up its slot."""
+        pending = []
+        for name, prefix, ref_index, txt_index, cb, kind in _NOTES:
+            with self.ctx.guard(kind):
+                refs, data = self.story_plc(ref_index, cb)
+                txt, _ = self.story_plc(txt_index, 0)
+                n, have = len(data), max(len(txt) - 1, 0)
+                k = min(n, have)
+                if k and txt[k] > self.fib.ccp[name]:
+                    raise ValueError("note text past its story")
+                comment = name == "annotation"
+                owners = self.owners() if comment and k else []
+                found = [(refs[i], (f"{prefix}-{i + 1}", name, txt[i], txt[i + 1], kind,
+                                    _author(data[i], owners) if comment else None))
+                         for i in range(k) if txt[i] < txt[i + 1]]
+                at = self.comment_at if comment else self.note_at
+                for cp, note in found:
+                    at.setdefault(cp, note[0])
+                    self.doc.notes[note[0]] = []
+                    pending.append(note)
+                lost = n - k + max(have - n - 1, 0)
+                if lost:
+                    self.ctx.skipped[kind] += lost
+        for nid, name, cp0, cp1, kind, author in pending:
+            done = False
+            with self.ctx.guard(kind):
+                blocks = self.read(name, cp0, cp1)
+                self.doc.notes[nid] = blocks if author is None else _comment(blocks, author)
+                done = True
+            if not done:
+                del self.doc.notes[nid]
+
+    def headers(self):
+        """PlcfHdd: a header story a range, relative to the header story, read under guard("header"): the separators
+        are skipped, then each section's six stories (_SECTION) give one line each to doc.headers or doc.footers, read
+        under guard("header") or guard("footer"). An empty range is no story; a last range left over past whole
+        sections is the story's guard paragraph mark. A PLC that is not whole, whose CPs decrease or whose stories run
+        past the header story's ccp loses the headers, counted once. Then the header text boxes, one line each."""
+        spans = []
+        with self.ctx.guard("header"):
+            cps, _ = self.story_plc(_HDD, 0)
+            end = len(cps) - 1
+            if end > _SEPARATORS and (end - _SEPARATORS) % _SECTION == 1:
+                end -= 1
+            if end > _SEPARATORS and cps[end] > self.fib.ccp["header"]:
+                raise ValueError("header past its story")
+            spans = [(k, cps[k], cps[k + 1]) for k in range(_SEPARATORS, end) if cps[k] < cps[k + 1]]
+        for k, a, b in spans:
+            footer = (k - _SEPARATORS) % _SECTION in _FOOTERS
+            with self.ctx.guard("footer" if footer else "header"):
+                text = flat(self.read("header", a, b))
+                if text:
+                    (self.doc.footers if footer else self.doc.headers).append(text)
+        for blocks in self.boxes("header_textbox", _HDR_TXBX, "header"):
+            text = flat(blocks)
+            if text:
+                self.doc.headers.append(text)
+
+    def boxes(self, name, index, kind) -> list[list]:
+        """The blocks of each text box of PlcftxbxTxt or PlcfHdrtxbxTxt, in story order: a range a text box, relative
+        to story `name`, with a 22-byte FTXBXS; the last FTXBXS is a dummy for the story's guard paragraph mark, and a
+        reusable one (fReusable) is a text box no longer in use, so neither is read. The PLC is read under
+        guard(kind), each text box too; a PLC that is not whole, whose CPs decrease or whose boxes run past the
+        story's ccp loses the story, counted once."""
+        spans, out = [], []
+        with self.ctx.guard(kind):
+            cps, data = self.story_plc(index, _FTXBXS)
+            m = len(data) - 1
+            if m > 0 and cps[m] > self.fib.ccp[name]:
+                raise ValueError("text box past its story")
+            spans = [(cps[i], cps[i + 1]) for i in range(max(m, 0))
+                     if cps[i] < cps[i + 1] and not struct.unpack_from("<h", data[i], 8)[0]]
+        for a, b in spans:
+            with self.ctx.guard(kind):
+                out.append(self.read(name, a, b))
+        return out
 
     # ---- formatting
     def plc(self, index) -> bytes:
@@ -392,6 +579,14 @@ class _Reader:
     def story(self, name) -> list:
         cp0, cp1 = self.ranges[name]
         s = doc_fib.story(self.word, self.pieces, cp0, cp1, self.lid)
+        return self.walk(_State(name, s))
+
+    def read(self, name, cp0, cp1) -> list:
+        """The blocks of CPs [cp0, cp1) of story `name`, counted from its start and clamped to the story's CPs the
+        pieces hold."""
+        a, b = self.ranges[name]
+        base = self.base[name]
+        s = doc_fib.story(self.word, self.pieces, min(max(base + cp0, a), b), min(max(base + cp1, a), b), self.lid)
         return self.walk(_State(name, s))
 
     def walk(self, st) -> list:
@@ -562,6 +757,22 @@ class _Reader:
     def hyphen(self, st, cp):
         """A non-breaking hyphen."""
         self.text(st, "-")
+
+    def note_ref(self, st, cp):
+        """A footnote or endnote reference: the note whose PlcffndRef or PlcfendRef entry is this very CP. Any other
+        \\x02 (a note's own number, at the start of its text) is dropped."""
+        self.ref(st, self.note_at.get(cp))
+
+    def comment_ref(self, st, cp):
+        """A comment reference: the comment whose PlcfandRef entry is this very CP; any other \\x05 is dropped."""
+        self.ref(st, self.comment_at.get(cp))
+
+    def ref(self, st, nid):
+        """A NoteRef to note `nid` while it has a slot, through add(): in vanished or deleted text it is in a Hidden
+        and its note still follows, as the docx reader gives a w:footnoteReference in a w:vanish run or in w:del. In
+        a field instruction it is dropped, as text there is."""
+        if nid in self.doc.notes and self.live(st):
+            self.add(st, NoteRef(nid))
 
     def field_begin(self, st, cp):
         """A field's instruction follows. Past MAX_DEPTH open fields the field, up to its end, is skipped and counted

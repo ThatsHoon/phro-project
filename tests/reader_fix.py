@@ -434,6 +434,72 @@ def doc_lists(lists, lfos=()):
     return {73: (bytes(head), bytes(lvls)), 74: (bytes(lfo), bytes(data))}
 
 
+def doc_plc(cps, data=b""):
+    """A PLC for make_doc's fc: the CPs as u32, then the data elements, already joined."""
+    import struct
+    return struct.pack("<%dI" % len(cps), *cps) + bytes(data)
+
+
+def doc_stories(main, *, footnotes=(), endnotes=(), comments=(), authors=(), headers=(), textboxes=(),
+                header_textboxes=()):
+    """make_doc's pieces, ccp and fc for a main story and the stories after it, laid out as Word writes them: every
+    story but the main one ends with one more "\\r" that no entry owns (its guard), and a story's text PLC holds the
+    start of each entry, then the end of the last one and the guard's end (the story's length), relative to the story.
+
+    - footnotes, endnotes: (ref_cp, text). PlcffndRef/PlcfendRef (2/46) hold ref_cp, a CP in the whole text, with a
+      2-byte FRD (nAuto 1) each and, last, a CP past every reference; PlcffndTxt/PlcfendTxt (3/47) the texts' CPs.
+    - comments: (ref_cp, ibst, text[, initials]): PlcfandRef (4) with a 30-byte ATRDPre10 each (xstUsrInitl: u16
+      count and 9 UTF-16 units; ibst u16 at 20; bitsNotUsed, grfNotUsed, ITagBkmk -1), PlcfandTxt (5) as above.
+      authors: GrpXstAtnOwners (36), an Xst (u16 count, UTF-16) a name; none when empty.
+    - headers: the PlcfHdd (11) stories in order, the 6 separators first, then 6 a section (even header, odd header,
+      even footer, odd footer, first header, first footer); "" for one that is not there.
+    - textboxes, header_textboxes: PlcftxbxTxt (56) and PlcfHdrtxbxTxt (58), a 22-byte FTXBXS each (cTxbx 1, fReusable
+      0, the shape id) and a dummy one, all zero, for the guard.
+
+    The text is one Unicode piece; a CP is a UTF-16 unit. Returns {"pieces", "ccp", "fc"} for make_doc(path, **it).
+    """
+    import struct
+
+    def units(s):
+        return len(s.encode("utf-16-le")) // 2
+
+    def story(texts):
+        """The texts and their guard as one story, and its text PLC."""
+        cps, at = [], 0
+        for t in texts:
+            cps.append(at)
+            at += units(t)
+        return "".join(texts) + "\r", doc_plc(cps + [at, at + 1])
+
+    def refs(cps, data):
+        return doc_plc(list(cps) + [max([*cps, units(main)]) + 1], b"".join(data))
+
+    out, fc = {"text": main}, {}
+    for name, ref, txt, notes in (("footnote", 2, 3, footnotes), ("endnote", 46, 47, endnotes)):
+        if notes:
+            out[name], fc[txt] = story([t for _, t in notes])
+            fc[ref] = refs([r for r, _ in notes], [struct.pack("<h", 1)] * len(notes))
+    if comments:
+        out["annotation"], fc[5] = story([c[2] for c in comments])
+        atrd = []
+        for c in comments:
+            initials = (c[3] if len(c) > 3 else "").encode("utf-16-le")[:18]
+            atrd.append(struct.pack("<H", len(initials) // 2) + initials.ljust(18, b"\0")
+                        + struct.pack("<HHHi", c[1], 0, 0, -1))
+        fc[4] = refs([c[0] for c in comments], atrd)
+    if authors:
+        fc[36] = b"".join(struct.pack("<H", units(n)) + n.encode("utf-16-le") for n in authors)
+    if headers:
+        out["header"], fc[11] = story(list(headers))
+    for name, index, boxes in (("textbox", 56, textboxes), ("header_textbox", 58, header_textboxes)):
+        if boxes:
+            out[name], plc = story(list(boxes))
+            fc[index] = plc + b"".join(struct.pack("<iihiii", 1, 0, 0, -1, k + 1, 0) for k in range(len(boxes)))
+            fc[index] += bytes(22)
+    text = "".join(out.get(name, "") for name in DOC_STORIES)
+    return {"pieces": [(text, False)], "ccp": {name: units(out.get(name, "")) for name in DOC_STORIES}, "fc": fc}
+
+
 def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, fc=None, word_extra=b"",
              streams=None, lid_fe=None, chpx=None, papx=None):
     """Write a Word 97 .doc compound file.
