@@ -26,6 +26,9 @@ def sniff(data: bytes) -> str | None:
         return "wmf"
     if h.startswith(b"\x01\x00\x00\x00") and data[40:44] == b" EMF":
         return "emf"
+    # a PICT file: a 512-byte zero head, picSize and picFrame, then the version opcode (PICT 1: 11 01; 2: 00 11 02 FF)
+    if (data[522:524] == b"\x11\x01" or data[522:526] == b"\x00\x11\x02\xff") and data[:512].count(0) == 512:
+        return "pict"
     head = data[:512].lstrip(b"\xef\xbb\xbf \t\r\n")
     if head.startswith(b"<?xml"):
         head = data[:512]

@@ -500,6 +500,104 @@ def doc_stories(main, *, footnotes=(), endnotes=(), comments=(), authors=(), hea
     return {"pieces": [(text, False)], "ccp": {name: units(out.get(name, "")) for name in DOC_STORIES}, "fc": fc}
 
 
+def oa_record(typ, body=b"", *, ver=0, inst=0):
+    """One OfficeArt record (MS-ODRAW 2.2.1): u16 ver (low 4 bits) | inst << 4, u16 type, u32 length, then body."""
+    import struct
+    return struct.pack("<HHI", ver | inst << 4, typ, len(body)) + bytes(body)
+
+
+def oa_container(typ, *children, inst=0):
+    """An OfficeArt container (ver 0xF) holding the records `children`, already built."""
+    return oa_record(typ, b"".join(children), ver=0xF, inst=inst)
+
+
+def blip_bitmap(typ, inst, data):
+    """A bitmap BLIP (JPEG 0xF01D, PNG 0xF01E, DIB 0xF01F, TIFF 0xF029): one 16-byte UID, two when inst is odd, the
+    tag byte 0xFF, then the image bytes."""
+    return oa_record(typ, bytes(range(16)) * (1 + (inst & 1)) + b"\xff" + bytes(data), inst=inst)
+
+
+def blip_png(data):
+    """A PNG BLIP (0xF01E, instance 0x6E0) of the PNG bytes `data`."""
+    return blip_bitmap(0xF01E, 0x6E0, data)
+
+
+def blip_metafile(typ, inst, data, deflate=True, cb_save=None):
+    """A metafile BLIP (EMF 0xF01A/0x3D4, WMF 0xF01B/0x216, PICT 0xF01C/0x542; inst + 1 has two UIDs): the UIDs, the
+    34-byte OfficeArtMetafileHeader (cbSize, rcBounds, ptSize, cbSave, compression 0 deflate or 0xFE none, filter
+    0xFE), then `data`, zlib-deflated when `deflate`. cb_save overrides cbSave."""
+    import struct
+    import zlib
+    packed = zlib.compress(bytes(data)) if deflate else bytes(data)
+    save = len(packed) if cb_save is None else cb_save
+    head = struct.pack("<I16s8sIBB", len(data), bytes(16), bytes(8), save, 0 if deflate else 0xFE, 0xFE)
+    return oa_record(typ, bytes(range(16)) * (1 + (inst & 1)) + head + packed, inst=inst)
+
+
+def oa_fbse(blip=b"", delay=0xFFFFFFFF, *, name=b"", cref=1):
+    """An FBSE (0xF007): btWin32, btMacOS, rgbUid, tag, size, cRef, foDelay, unused1, cbName, unused2, unused3, the
+    name, then the BLIP record `blip` embedded; b"" for one delay-loaded from WordDocument at `delay`."""
+    import struct
+    body = struct.pack("<BB16sHIIIBBBB", 6, 6, bytes(16), 0xFF, len(blip), cref, delay, 0, len(name), 0, 0)
+    return oa_record(0xF007, body + bytes(name) + bytes(blip), ver=2, inst=6)
+
+
+def oa_shape(spid, pib=None):
+    """An SpContainer (0xF004): its FSP (0xF00A: spid, grfPersistent) and, when `pib` is given, an FOPT (0xF00B)
+    whose one property is pib (0x4104)."""
+    import struct
+    out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75)
+    if pib is not None:
+        out += oa_record(0xF00B, struct.pack("<HI", 0x4104, pib), ver=3, inst=1)
+    return oa_container(0xF004, out)
+
+
+def picf_inline(blip, mm=0x64, *, name=b"", pib=None, fbses=None):
+    """A PICFAndOfficeArtData for the Data stream: the 68-byte PICF (lcb, cbHeader 0x44, mfpf.mm at offset 6); for mm
+    0x66 cchPicName and the name; then the inline SpContainer (spid 1025, `pib` when given) and one FBSE embedding
+    the BLIP record `blip` (none when `blip` is b""), or the FBSE records `fbses` as given. For mm 8 `blip` is the
+    raw WMF that follows the PICF."""
+    import struct
+    if mm == 8:
+        rest = bytes(blip)
+    else:
+        rest = (bytes([len(name)]) + bytes(name) if mm == 0x66 else b"") + oa_shape(1025, pib)
+        rest += (oa_fbse(blip) if blip else b"") if fbses is None else bytes(fbses)
+    return struct.pack("<IHH", 68 + len(rest), 0x44, mm).ljust(68, b"\0") + rest
+
+
+def dgg_with_bstore(blips, shapes=None, header_shapes=None):
+    """A DggInfo (FibRgFcLcb97 50, OfficeArtContent) for make_doc's fc: the DggContainer (an FDGG, then a
+    BStoreContainer with an FBSE a blip: bytes embed that BLIP record, an int is the foDelay of a BLIP in
+    WordDocument), then the main document's drawing (dgglbl 0, a DgContainer whose SpgrContainer holds the shapes)
+    and, when header_shapes is given, the header document's (dgglbl 1). A shape is (spid, pib), pib None for one
+    without a pib (a text box, a line); `shapes` defaults to spid 1025 + k showing pib k + 1."""
+    import struct
+    store = [oa_fbse(b) if isinstance(b, (bytes, bytearray)) else oa_fbse(delay=b) for b in blips]
+    dgg = oa_container(0xF000, oa_record(0xF006, struct.pack("<4I", 1026, 2, 1, 1)),
+                       oa_container(0xF001, *store, inst=len(store)))
+
+    def drawing(label, shapes):
+        group = oa_container(0xF003, oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", 1024, 5), ver=2)),
+                             *(oa_shape(spid, pib) for spid, pib in shapes))
+        return bytes([label]) + oa_container(0xF002, oa_record(0xF008, struct.pack("<II", len(shapes), 1024)), group)
+
+    if shapes is None:
+        shapes = [(1025 + k, k + 1) for k in range(len(blips))]
+    out = dgg + drawing(0, shapes)
+    if header_shapes is not None:
+        out += drawing(1, header_shapes)
+    return out
+
+
+def doc_spa(anchors):
+    """A PlcfSpa (PlcSpaMom 40, PlcSpaHdr 41) for make_doc's fc: (cp, spid) anchors, then a last CP past them, and a
+    26-byte FSPA each, spid first."""
+    import struct
+    cps = [cp for cp, _ in anchors]
+    return doc_plc(cps + [max(cps, default=0) + 1], b"".join(struct.pack("<I", s).ljust(26, b"\0") for _, s in anchors))
+
+
 def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, fc=None, word_extra=b"",
              streams=None, lid_fe=None, chpx=None, papx=None):
     """Write a Word 97 .doc compound file.

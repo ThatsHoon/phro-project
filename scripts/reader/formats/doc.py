@@ -32,6 +32,13 @@ word_fields.comment_note's, as in the docx reader, the author from GrpXstAtnOwne
 PlcfHdd stories after the six separators, six a section, each one line of doc.headers or doc.footers. Text boxes
 (PlcftxbxTxt) follow the main text in story order; header text boxes (PlcfHdrtxbxTxt) are header lines. A story
 with text (ccp > 0) whose PLCs hold no entry, left out or empty, is counted once under its kind.
+
+Pictures go through officeart.py (logic after dochan office_binary/doc_images.py). An inline picture is a \\x01 with
+fSpec whose PicLocation is a PICF in the Data stream; a floating one is a \\x08 with fSpec whose CP has an FSPA in
+PlcSpaMom (main story) or PlcSpaHdr (header story), naming a shape of the DggInfo's drawings, its pib a BStore entry.
+A picture is an Image block after its paragraph, in that paragraph's story, cell or note, as the docx reader puts
+pictures in st.extras; in vanished or deleted text it is hidden as the text is. Each is read under guard("image") and
+one that cannot be read is counted there; every deflated BLIP shares the document's flate.Budget.
 """
 import re
 import struct
@@ -39,10 +46,11 @@ from bisect import bisect_right
 from itertools import islice
 from operator import gt
 
-from .. import limits
+from .. import images, limits, officeart
+from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
-from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Link, ListItem, NoteRef, Para, Table, Text
+from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
 from . import doc_fib, ooxml
 from .hancom import flat
 from .word_fields import MAX_INSTR, comment_note, hyperlink_url
@@ -69,6 +77,14 @@ _SECTION = 6      # PlcfHdd stories a section: even header, odd header, even foo
 _FOOTERS = frozenset((2, 3, 5))  # their places among a section's six
 _OWNERS = 0x10000  # GrpXstAtnOwners names an ibst (u16) can index
 PLC_MAX = 1_000_000  # entries one story PLC may hold; past it the PLC is not read and its story is counted
+IMAGE_BYTES = 256 * 2**20  # image bytes one document may emit, copies counted
+# the stories MS-DOC gives a PlcfSpa (PlcSpaMom, PlcSpaHdr), each one's CPs counted from that story's start
+_SPA = {"text": 40, "header": 41}
+_FSPA = 26          # bytes of an FSPA: spid u32 first
+_DGG_INFO = 50      # the FibRgFcLcb97 index of the OfficeArtContent
+_DG_CONTAINER = 0xF002
+_MM_WMF, _MM_SHAPE, _MM_SHAPEFILE = 8, 0x64, 0x66  # PICF mfpf.mm: a raw WMF, an inline shape, one with a name
+_MISS = object()
 
 
 def _plc(data: bytes, cb: int) -> tuple[list[int], list[bytes]]:
@@ -212,7 +228,8 @@ class _State:
     run and seg are the properties and the CHPX run of the segment being walked; hid is the Hidden last opened, which
     the rest of its segment (or of a deletion) joins while it is still the last inline of its scope. tables are the
     tables open around the paragraph, outermost first (tables[k] at depth k + 1); overflow is set while paragraphs nest
-    past MAX_DEPTH, so one overflowing subtree is counted once."""
+    past MAX_DEPTH, so one overflowing subtree is counted once. extras are the blocks (pictures) that follow the open
+    paragraph where it goes."""
 
     def __init__(self, name, story=None):
         self.name = name
@@ -229,22 +246,40 @@ class _State:
         self.codes = 0  # open fields still in their instruction: text goes to the innermost one, never out
         self.over = 0   # fields opened past MAX_DEPTH: everything up to their ends is skipped
         self.hid, self.hid_seg = None, -1
+        self.extras = []
+
+
+class _Drawing:
+    """The document's drawings (_Reader.drawing): the anchors of each story of _SPA ({CP from the story's start:
+    spid}), the SpContainers by spid, the pib of each spid looked up so far, the BStore's file blocks and the DggInfo
+    bytes they are offsets in."""
+
+    def __init__(self):
+        self.anchors = {name: {} for name in _SPA}
+        self.shapes = officeart.Shapes()
+        self.pibs = {}
+        self.store = []
+        self.dgg = b""
 
 
 class _Reader:
-    # a control character -> its handler (st, cp), cp being the character's CP; one not listed is dropped. Tasks
-    # 13-14 give \x01 (picture) and \x08 (drawn object) handlers. A cell or row mark (\x07) ends its paragraph too;
-    # place() gives it its table meaning.
+    # a control character -> its handler (st, cp), cp being the character's CP; one not listed is dropped. A cell or
+    # row mark (\x07) ends its paragraph too; place() gives it its table meaning.
     SPECIAL: dict[str, str] = {
         "\r": "para_end", "\x07": "para_end", "\x0c": "para_end",
         "\x0a": "line_break", "\x0b": "line_break",
         "\x02": "note_ref", "\x05": "comment_ref",
         "\x13": "field_begin", "\x14": "field_separator", "\x15": "field_end",
         "\x1e": "hyphen",
+        "\x01": "picture", "\x08": "drawn",
     }
 
-    def __init__(self, cf, ctx):
+    def __init__(self, cf, ctx, budget=None):
         self.cf, self.ctx = cf, ctx
+        self.budget = budget or flate.Budget()  # the one flate.Budget every deflated BLIP of the document shares
+        self.image_bytes = 0  # image bytes placed so far, copies counted (IMAGE_BYTES)
+        self._inline, self._stored = {}, {}  # memos: Data offset -> picture; pib -> picture (bytes or None)
+        self._drawing = None  # the _Drawing once read
         self.doc = Doc()
         self.word = b""
         self.table = b""
@@ -674,20 +709,20 @@ class _Reader:
 
     def para_end(self, st, cp, last=False):
         """A paragraph mark, a cell or row mark or a page or section break: the open paragraph becomes a block (see
-        block()) that place() puts in the story or in a table cell. A deleted paragraph mark (\\r) joins its
-        paragraph to the next one. `last` ends a story's last paragraph, whose properties are those of its last
-        character's paragraph mark, and closes the tables still open."""
+        block()) that place() puts in the story or in a table cell, its extras (pictures) after it. A deleted
+        paragraph mark (\\r) joins its paragraph, extras too, to the next one. `last` ends a story's last paragraph,
+        whose properties are those of its last character's paragraph mark, and closes the tables still open."""
         story = st.story
         mark = "" if last else story.text[story.index_of(cp)]
         if mark == "\r" and st.run.deleted:
             return
         self.close_to(st, 1)
-        inl = st.frames[0].inl
-        if not (last and not inl):
+        inl, extras = st.frames[0].inl, st.extras
+        if inl or extras or not last:
             p = self.para_props(cp - 1 if last else cp)
             block = self.block(p, inl)
             st.reset()
-            self.place(st, p, mark, block)
+            self.place(st, p, mark, extras if block is None else [block, *extras])
         if last:
             self.close_tables(st, 0)
 
@@ -707,8 +742,8 @@ class _Reader:
             return ListItem(min(p.ilvl, doc_fib.LEVELS - 1), mark, inl)
         return Para(inl)
 
-    def place(self, st, p, mark, block):
-        """A paragraph's block into the story, or into the open cell of the table its depth puts it in: max(itap, 1)
+    def place(self, st, p, mark, blocks):
+        """A paragraph's blocks into the story, or into the open cell of the table its depth puts it in: max(itap, 1)
         with sprmPFInTable, else 0. The tables deeper than that close and the missing ones open. At depth 1 a \\x07
         ends the cell and, with sprmPFTtp, the row (its TDefTable defining the row's cells); deeper, a mark with
         sprmPFInnerTableCell ends the cell and one with sprmPFInnerTtp the row. Past MAX_DEPTH the paragraph stays a
@@ -728,14 +763,12 @@ class _Reader:
             cell_end = mark == "\x07" or (depth > 1 and p.inner_cell)
         self.close_tables(st, depth)
         if not depth:
-            if block is not None:
-                st.out.append(block)
+            st.out.extend(blocks)
             return
         while len(tables) < depth:
             tables.append(_Table())
         t = tables[-1]
-        if block is not None:
-            t.cell.append(block)
+        t.cell.extend(blocks)
         if row_end:
             t.end_row(p.tdef)
         elif cell_end:
@@ -810,6 +843,156 @@ class _Reader:
         if f.frame is not None:
             self.close_to(st, f.frame)
 
+    # ---- pictures
+    def picture(self, st, cp):
+        """An inline picture: a \\x01 with fSpec, its PICF at its PicLocation in the Data stream (0, the CHP's
+        default, without sprmCPicLocation), read once a location. An OLE object's \\x01 (fOle2) is not a picture
+        here; one in a field instruction (a form field's data) is not shown, as text there is not."""
+        run = st.run
+        if not run.special or run.ole or not self.live(st):
+            return
+        with self.ctx.guard("image"):
+            at = run.pic or 0
+            hit = self._inline.get(at, _MISS)
+            if hit is _MISS:
+                hit = self._inline[at] = self.picf(at)
+            self.put_image(st, hit)
+
+    def drawn(self, st, cp):
+        """A floating object: a \\x08 with fSpec, the FSPA at its CP in its story's PlcfSpa (_SPA: PlcSpaMom for the
+        main story, PlcSpaHdr for the header story, whose CPs count from the header story's start as MS-DOC
+        FibRgFcLcb97 says), the SpContainer of the FSPA's spid, its pib (looked up once a spid), the BStore entry and
+        its BLIP. MS-DOC gives the other stories no PlcfSpa, so a \\x08 there is not resolved. No FSPA at the CP, a
+        spid no drawing holds, or a shape without a pib (a text box, whose text boxes() reads, a line, a drawing) is
+        no picture and no loss; a pib whose BStore entry or BLIP cannot be read is counted under image."""
+        if not st.run.special or not self.live(st) or st.name not in _SPA:
+            return
+        with self.ctx.guard("image"):
+            d = self.drawing()
+            spid = d.anchors[st.name].get(cp - self.base[st.name])
+            if spid is None:
+                return
+            pib = d.pibs.get(spid, _MISS)
+            if pib is _MISS:
+                at = d.shapes.at.get(spid)
+                pib = d.pibs[spid] = officeart.shape_pib(d.dgg, at) if at is not None else None
+            if pib:
+                self.put_image(st, self.stored(pib))
+
+    def put_image(self, st, data):
+        """A picture into st.extras, hidden as its run is: deleted, else vanished. It is counted under image instead
+        when it could not be read, when Assets would not keep its bytes (under 16, or no kind images.sniff knows), or
+        past IMAGE_BYTES placed, every copy counted."""
+        if data is None or len(data) < 16 or images.sniff(data) is None:
+            self.ctx.skipped["image"] += 1
+            return
+        self.image_bytes += len(data)
+        if self.image_bytes > IMAGE_BYTES:
+            self.ctx.skipped["image"] += 1
+            return
+        run = st.run
+        st.extras.append(Image(data, hidden="deleted" if run.deleted else "hidden" if run.vanish else ""))
+
+    def decode(self, read, *args) -> bytes | None:
+        """read(*args, self.budget), officeart's fbse_blip or blip. A BLIP that inflates past the ratio cap or the
+        document's total, or is damaged (ReadError too_large or damaged), is None, so it costs that picture alone, as
+        hwp's load_bin; another ReadError ends the document."""
+        try:
+            return read(*args, self.budget)
+        except ReadError as e:
+            if e.kind not in ("damaged", "too_large"):
+                raise
+            return None
+
+    def picf(self, at) -> bytes | None:
+        """The picture of the PICFAndOfficeArtData at Data offset `at`: the PICF (lcb u32, cbHeader u16, mfpf.mm u16
+        at 6), for mm 0x66 (MM_SHAPEFILE) cchPicName u8 and the name, then the inline SpContainer and its FBSEs, the
+        first FBSE giving the picture; with no FBSE, the shape's pib in the document's BStore (dochan). mm 8 is a raw
+        WMF after the PICF. None without a Data stream, for a length that passes the stream or the PICF (cbHeader past
+        lcb), or another mm."""
+        data = self.data_stream()
+        if data is None or at + 8 > len(data):
+            return None
+        lcb, cb, mm = struct.unpack_from("<IHH", data, at)
+        end = at + lcb
+        if end > len(data) or not 8 <= cb <= lcb:
+            return None
+        pos = at + cb
+        if mm == _MM_WMF:
+            return data[pos:end]
+        if mm not in (_MM_SHAPE, _MM_SHAPEFILE):
+            return None
+        if mm == _MM_SHAPEFILE:
+            if pos >= end:
+                return None
+            pos += 1 + data[pos]
+        sp = None
+        for _, _, typ, body, _ in officeart.records(data, pos, end):
+            if typ == officeart.FBSE:
+                return self.decode(officeart.fbse_blip, data, body - 8, self.word)
+            if typ == officeart.SP_CONTAINER and sp is None:
+                sp = body - 8
+        pib = officeart.shape_pib(data, sp) if sp is not None else None
+        return self.stored(pib) if pib else None
+
+    def stored(self, pib) -> bytes | None:
+        """BStore entry `pib` (1-based) as image bytes, read once a pib; None past the BStore or when its FBSE or BLIP
+        cannot be read. A delay-loaded BLIP is in WordDocument (MS-DOC OfficeArtContent)."""
+        hit = self._stored.get(pib, _MISS)
+        if hit is _MISS:
+            d = self.drawing()
+            ok = 0 < pib <= len(d.store)
+            hit = self.decode(officeart.fbse_blip, d.dgg, d.store[pib - 1], self.word) if ok else None
+            self._stored[pib] = hit
+        return hit
+
+    def drawing(self) -> _Drawing:
+        """The drawings, read once, at the first picture that needs them: the anchors of PlcSpaMom and PlcSpaHdr
+        (26-byte FSPAs, spid first; the first FSPA at a CP wins), then the DggInfo (MS-DOC OfficeArtContent): a
+        DggContainer holding the BStore, then an OfficeArtWordDrawing each (dgglbl u8, a DgContainer), the main
+        document's and the header document's, whose shapes go into one spid index; the content ends at anything else.
+        Damage that loses shapes is counted once under shape: a PlcfSpa or DggInfo outside the table stream or not
+        whole, a DggInfo that does not start with a whole DggContainer, a DgContainer cut short (its shapes before
+        the cut are kept), records past officeart.MAX_RECORDS; containers nested past MAX_DEPTH once under depth."""
+        d = self._drawing
+        if d is not None:
+            return d
+        d = self._drawing = _Drawing()
+        for name, index in _SPA.items():
+            with self.ctx.guard("shape"):
+                cps, fspas = self.story_plc(index, _FSPA)
+                at = d.anchors[name]
+                for cp, fspa in zip(cps, fspas):
+                    at.setdefault(cp, struct.unpack_from("<I", fspa)[0])
+        with self.ctx.guard("shape"):
+            fc, lcb = self.fib.pair(_DGG_INFO)
+            if not lcb:
+                return d
+            if fc + lcb > len(self.table):
+                raise ValueError("DggInfo outside the table stream")
+            d.dgg = dgg = self.table[fc:fc + lcb]
+            h = officeart.header(dgg, 0)
+            if h is None or h[2] != officeart.DGG_CONTAINER or h[3] > lcb - 8:
+                raise ValueError("no DggContainer")
+            d.store = officeart.bstore(dgg)
+            pos = 8 + h[3]
+            while pos + 9 <= lcb:
+                h = officeart.header(dgg, pos + 1)
+                if h[2] != _DG_CONTAINER:
+                    break
+                body = pos + 9
+                end = body + h[3]
+                if end > lcb:
+                    self.ctx.skipped["shape"] += 1
+                    end = lcb
+                d.shapes.add(dgg, body, end)
+                pos = end
+            if d.shapes.deep:
+                self.deep()
+            if d.shapes.cut:
+                self.ctx.skipped["shape"] += 1
+        return d
+
 
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
@@ -821,4 +1004,4 @@ def parse(path, ctx) -> Doc:
     if not is_cfb(head):
         raise ReadError("damaged", "not a Word document")
     with Compound(path) as cf:
-        return _Reader(cf, ctx).run()
+        return _Reader(cf, ctx, flate.Budget()).run()  # one inflate budget a document
