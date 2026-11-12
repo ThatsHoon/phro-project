@@ -441,6 +441,8 @@ A `PreToolUse` hook on `Read` (`scripts/read.py hook`) catches a read of a docum
 
 Built formats: `hwpx`, `hwp`, `doc`, `odt`, `ods`, `odp`, `docm`, `pptm`, `ppsx`, `epub`, `xps`, `oxps`, `vsdx`. Every other in-scope extension (xls, ppt, xlsb, rtf, wpd, mobi, azw3, pages, numbers, key, djvu, mdb, accdb, pub, vsd, mpp) is denied as "unsupported" until its phase is built; a plain-text file that only carries one of these extensions passes through unchanged. Standard library only; budgets: input 512 MiB, output 20 MB, 45 seconds per conversion.
 
+HWP protection: a distribution document is decrypted with the key the file itself carries and read like any other `.hwp`. One locked with a password or a certificate is denied with "the file is encrypted and needs a password", and one under DRM (the FileHeader DRM flags, or a Fasoo or SoftCamp container) with "the file is DRM-protected"; no password is tried and DRM is not removed. An encrypted or obfuscated `.doc` is denied as encrypted too.
+
 Always-on cost: for any file outside the 29 in-scope extensions the hook prints nothing, and each Read costs one Python start. Measured with `Measure-Command` over 20 runs of `read.py hook` on a `.py` event, the median is 84 ms.
 
 Converted output is cached by a hash of the document's bytes and the reader's own source at `%LOCALAPPDATA%\phro-project\reader\` on Windows and `~/.cache/phro-project/reader/` elsewhere, as `<sha1[:2]>/<sha1>/` holding `out.md`, `assets/` and `meta.json`. `python -I -X utf8 scripts/read.py prune [--days 30]` deletes entries not used for N days.
@@ -462,6 +464,8 @@ Result against the routing pick on the bench corpus, one line per extension:
 - `ppsx`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
 - `pptm`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
 - `ods`: MISS on fidelity (0.868 against 1.000), mostly a peer-agreement artifact on one public document.
+- `hwp`: MISS on fidelity (0.695 against 0.706) and tokens. The fidelity gap is peer agreement: the reader writes list paragraphs in table cells as marked items, where dochan and hwp-mcp both join them into one line without bullets, so their shared lines set the reference. Tokens: bitmaps become viewable PNGs and are counted, and tables with merged cells are HTML, which also puts text-only tokens above the pick.
+- `doc`: MISS on two failures the pick does not share: a Word 6/95 file, denied as "unsupported", and a hand-made test file without the table stream MS-DOC requires. On the generated document fidelity is above the pick (0.903 against 0.869) and tokens are 13% over, mostly an HTML table with merged cells.
 - `oxps`: NODATA, no corpus files; it goes through the `xps` module.
 - `vsdx`: NODATA, no routing pick to compare with; 3 of 3 corpus files converted without failure.
 
@@ -472,7 +476,7 @@ Result against the routing pick on the bench corpus, one line per extension:
 - `restructure` start to finish with a person choosing the structure. Only its script has met real projects, on scratch copies.
 - Routing test of this plugin's own skills with `tests/route_cases.json`, 28 cases, about $4. The cases are written by the author, which inflates the rate, so it waits for prompts really typed.
 - A hook at write time that enforces folder rules, a search over the documents, signal hook, local search and compliance grading. Each waits for a measured failure.
-- Phases 2-4 of the document reader (hwp, legacy Office, rtf, wpd, ebooks, iWork, djvu, Access, Publisher, Visio binary, Project).
+- Phases 2b-4 of the document reader (xls, ppt, xlsb, rtf, wpd, ebooks, iWork, djvu, Access, Publisher, Visio binary, Project). Phase 2a (hwp, doc) is built.
 
 ## When to delete it
 

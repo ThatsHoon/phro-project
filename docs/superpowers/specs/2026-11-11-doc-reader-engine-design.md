@@ -136,7 +136,8 @@ The gate ships in phase 1. A format whose phase is not built yet is denied with 
 | Phase | Formats | Containers and shared parts |
 |---|---|---|
 | 1 | hwpx, odt, ods, odp, docm, pptm, ppsx, epub, xps, vsdx | model, renderer, images, cache, gate, `zipx`, `html` |
-| 2 | hwp, doc, xls, ppt, xlsb, rtf | `cfb`, `crypto`, `text` code pages |
+| 2a | hwp, doc | cfb, crypto (AES-128, MSVC rand), text code pages, officeart, mtef |
+| 2b | xls, ppt, xlsb, rtf | RC4, AES CFB-1, BIFF charts |
 | 3 | wpd, mobi, azw3, pages, numbers, key | `palmdb`, `snappy`, `pbwire` |
 | 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp | `iff`; each starts with a reverse-engineering note like phase 1-3's |
 

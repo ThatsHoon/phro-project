@@ -1,7 +1,7 @@
 """Stdlib-only document reader. Heavier imports happen inside functions."""
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # extension -> module name under reader.formats
 FORMATS = {
