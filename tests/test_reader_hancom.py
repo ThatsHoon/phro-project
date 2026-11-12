@@ -79,6 +79,19 @@ def test_lone_equations_leave_at_any_depth():
     assert hancom.lone_equations([Text("y")], []) == []
 
 
+def test_lone_equations_skip_hidden():
+    # an equation inside Hidden (a tracked deletion) is not visible: it is neither shown as a display equation nor
+    # moved out of its Hidden, even when it is the only equation of the paragraph
+    a, b = Math("a"), Math("b")
+    inl = [Hidden([a], "deleted")]
+    assert hancom.lone_equations(inl, [a]) == [] and inl == [Hidden([Math("a")], "deleted")], inl
+    assert inl[0].inlines[0] is a
+    # a visible one beside it still leaves, the hidden one stays where it is
+    inl = [Hidden([Bold([Text(" ")]), a], "deleted"), Link("u", [b])]
+    assert hancom.lone_equations(inl, [a, b]) == [Equation("b")]
+    assert inl == [Hidden([Bold([Text(" ")]), a], "deleted"), Link("u", [])], inl
+
+
 def test_lone_equations_one_pass():
     eqs = [Math("x") for _ in range(300_000)]
     inl = list(eqs)

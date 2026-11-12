@@ -282,13 +282,27 @@ def heading_level(level: int, text: str) -> int:
     return level
 
 
+def _shown(inlines, ids, out) -> None:
+    """Add to `out` the id() of every inline in `ids` that is visible: inside Bold and Link, not inside Hidden."""
+    for it in inlines:
+        if id(it) in ids:
+            out.add(id(it))
+        elif isinstance(it, (Bold, Link)):
+            _shown(it.inlines, ids, out)
+
+
 def lone_equations(inlines, eqs) -> list:
-    """A paragraph holding nothing visible but its inline equations shows them as display equations: they leave
-    the inlines (one pass) and come back as Equation blocks. Otherwise nothing changes and the list is empty."""
+    """A paragraph holding nothing visible but its inline equations shows them as display equations: the visible
+    ones leave the inlines (one pass) and come back as Equation blocks. An equation inside Hidden (a tracked
+    deletion) is not visible and stays where it is. Otherwise nothing changes and the list is empty."""
     if not eqs or itext(inlines).strip():
         return []
-    remove(inlines, {id(o) for o in eqs})
-    return [Equation(o.tex, True) for o in eqs]
+    ids = set()
+    _shown(inlines, {id(o) for o in eqs}, ids)
+    if not ids:
+        return []
+    remove(inlines, ids)
+    return [Equation(o.tex, True) for o in eqs if id(o) in ids]
 
 
 def comment_note(blocks) -> list:

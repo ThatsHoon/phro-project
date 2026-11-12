@@ -267,6 +267,36 @@ def test_tracked_deletion_inside_runs_and_fields():
     assert out == "(1 hidden places left out)\n\n앞[링](https://e.com)뒤\n", out
 
 
+def test_body_text_ranges_ignored():
+    # BodyText already holds the accepted final text (dochan): a delete range left in it hides nothing
+    body = hwp_para("FINAL BODY", ranges=((0, 5, DELETE | 2),))
+    for p in (tracked_file(body, None),                # track changes, no ViewText: BodyText is read
+              tracked_file(body, b"\xff" * 64),        # track changes, ViewText that does not inflate
+              tracked_file(body, None, flags=1),       # no track-changes flag
+              tracked_file(body, None, flags=0)):      # nor compression
+        doc, ctx = parse(p)
+        out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+        assert out == "FINAL BODY\n" and not ctx.skipped, (out, ctx.skipped)
+    # the same records read from ViewText do mark a deletion
+    assert md(tracked_file(hwp_para("x"), deflate(body))).startswith("(1 hidden places left out)\n")
+    assert md(dist_file(make_dist_section(body, KEY, 4))).startswith("(1 hidden places left out)\n")
+
+
+def test_deleted_equation_paragraph():
+    # a deleted paragraph that holds an inline equation, and a deleted equation alone in its paragraph: neither shows
+    # as a display equation; with --hidden the equation is inside the hidden marker
+    script = "a over b"
+    eqedit = hwp_record(hr.EQEDIT, 2, struct.pack("<IH", 0, len(script)) + script.encode("utf-16-le"))
+    eq = (11, b"eqed" + struct.pack("<I", 1), eqedit)  # common attr bit 0: like a character (inline)
+    whole = hwp_para("값은 ￼ 이다", controls=(eq,), ranges=((0, 14, DELETE | 1),))
+    alone = hwp_para("￼", controls=(eq,), ranges=((0, 8, DELETE | 1),))
+    p = tracked_file(hwp_para("앞"), deflate(hwp_para("앞") + whole + alone))
+    out = md(p)
+    assert out == "(2 hidden places left out)\n\n앞\n", out
+    shown = md(p, hidden=True)
+    assert shown == "앞\n\n(hidden: 값은 $\\frac{a}{b}$ 이다)\n\n(hidden: $\\frac{a}{b}$)\n", shown
+
+
 def test_tracked_hostile_ranges():
     # backwards, empty, past the end, overlapping, and a cut 12-byte entry: deletions are their union, clamped
     ranges = ((5, 2, DELETE), (0, 0, DELETE), (3, 0xFFFFFFFF, DELETE), (1, 3, DELETE | 7), (2, 4, DELETE),

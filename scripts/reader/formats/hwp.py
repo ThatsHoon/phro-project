@@ -103,6 +103,9 @@ class _Reader(Scopes):
         self.numbers = {}   # numbering id -> {level: counter}
         self.outline = 0    # the outline numbering id of the current section's secd
         self.blobs = {}     # (BinData stream name, inflated?) -> its bytes, or None when it cannot be read
+        # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
+        # holds the accepted text (dochan reader.py), so a range left in it hides nothing
+        self.view = False
         self._ends_of, self._ends = None, []
 
     # ---- streams
@@ -182,10 +185,11 @@ class _Reader(Scopes):
         nums = sorted(set(range(min(self.info.sections, _SECTIONS))) | set(found))
         return [(n, found.get(n, f"{storage}/Section{n}")) for n in nums]
 
-    def tracked(self, n, name) -> list:
+    def tracked(self, n, name) -> tuple:
         """A track-changes section (rhwp parser/mod.rs; dochan hwp/revisions.py): ViewText/Section<n>, not encrypted,
         holds the text with its insertions and deletions marked, BodyText the result. ViewText is read when it
-        inflates whole to a stream that starts with a paragraph; otherwise BodyText is, and nothing is counted."""
+        inflates whole to a stream that starts with a paragraph; otherwise BodyText is, and nothing is counted.
+        Returns (records, read from ViewText?)."""
         try:
             data = self.cf.read(f"ViewText/Section{n}")
             if self.head.compressed:
@@ -193,8 +197,8 @@ class _Reader(Scopes):
             if first_tag(data) != PARA_HEADER:
                 raise ValueError("not a paragraph stream")
         except (KeyError, ValueError):  # missing, a broken chain, bad or cut deflate (Truncated), not paragraphs
-            return self.load(name, records)
-        return records(data, self.ctx)
+            return self.load(name, records), False
+        return records(data, self.ctx), True
 
     def run(self):
         try:
@@ -213,10 +217,12 @@ class _Reader(Scopes):
         # a distribution document's text is only in ViewText, encrypted with the key it carries (no BodyText fallback)
         for n, name in self.section_names("ViewText" if h.distribution else "BodyText"):
             with self.ctx.guard("section"):
+                self.view = False
                 if h.distribution:
                     recs = self.load(name, records, lambda raw: view_text(raw, h.compressed, self.budget))
+                    self.view = True
                 elif h.track_changes:
-                    recs = self.tracked(n, name)
+                    recs, self.view = self.tracked(n, name)
                 else:
                     recs = self.load(name, records)
                 blocks = self.paras(recs, 0, len(recs), 0, False)
@@ -291,7 +297,7 @@ class _Reader(Scopes):
                     text.append(r.data[:len(r.data) // 2 * 2])
                 elif r.tag == PARA_CHAR_SHAPE:
                     pairs.append(r.data[:len(r.data) // 8 * 8])
-                elif r.tag == PARA_RANGE_TAG:
+                elif r.tag == PARA_RANGE_TAG and self.view:
                     tags.append(r.data[:len(r.data) // 12 * 12])
             j = self.end(recs, j)
         st = State(nohead)
