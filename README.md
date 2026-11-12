@@ -22,7 +22,7 @@ Always-on cost, in every session of every project where the plugin is enabled:
 3. 영역 제안을 확인합니다. 최종 목표는 사용자의 말로만 적으니, 없으면 물을 때 한두 문장으로 답합니다.
 4. 매일 갱신 예약을 물으면 답합니다. 예약 작업은 프로젝트마다 하나입니다.
 5. 평소에는 그대로 일합니다. `/compact`나 자동 압축이 일어나면 그 세션이 압축 요약을 핵심 문서와 대조해 바뀐 결정을 반영합니다. 프로젝트 폴더의 세션과 포크 모두 같습니다. `/compact` 뒤에는 다음 메시지를 보낼 때 진행됩니다.
-6. 원본이 새 판이 되면 세션 시작 때 알려 줍니다. `clone.py sync`를 돌리면 원본에서 바뀐 파일만 가져오고, 프로젝트가 더하거나 고친 파일은 그대로 둡니다.
+6. 원본에 새 커밋이나 새 판이 생기면 세션 시작 때 알려 줍니다. `phro-project_<프로젝트> update`라고 하면 바뀔 목록을 먼저 보여 주고, 원본에서 바뀐 파일만 가져옵니다. 프로젝트가 더하거나 고친 파일은 그대로 둡니다. 반영은 원본에서 사본 쪽으로만 갑니다. 사본에 더한 프로젝트 기능은 원본으로 올라가지 않습니다.
 
 | 언제 | 무엇을 |
 |---|---|
@@ -51,6 +51,7 @@ phro-project/
     route-test/SKILL.md        whether skills get called on real prompts, and who takes each miss
     audit/SKILL.md             after growth: merge, delete and repair proposals
     compass/SKILL.md           build and refresh docs/core
+    update/SKILL.md            take a newer original into this project's copy, one way
     restructure/SKILL.md       reorganize a whole project
       references/test_structure.py   copied into the project: enforces its folder rules
   scripts/
@@ -117,7 +118,7 @@ Say what the project should be able to do, and from when: "make this method a sk
    | Hook | It must react to an event the model does not act on, and a miss was measured |
    | MCP | It needs a connection or shared state that running a script cannot give |
 
-6. A project's skill goes in that project's copy of this plugin, never in the original, so no other project receives it and a sync cannot overwrite it.
+6. A project's skill goes in that project's copy of this plugin, never in the original, so no other project receives it and a sync cannot overwrite it. Updates flow one way, from the original into copies; nothing in a copy goes back.
 7. Write down the session token cost of a new skill and the descriptions it would overlap.
 8. Write how it fires before the code. From a prompt: about 8 that should fire and about 8 close misses, in the copy's `tests/route_cases.json`. From a step in the work: cases with `after` and `rule`.
 9. Write the description last, in the words users really type.
@@ -130,14 +131,14 @@ Say what the project should be able to do, and from when: "make this method a sk
 2. Collect competitors (`catalog`). Real misses come from the other installed skills.
 3. Build the test on a scratch copy (`build`). The plugin itself is not touched.
 4. State the estimate, get approval, then run `claude plugin eval`. A case costs about $0.15 at 55 skills on Opus.
-5. Tally (`tally`): hits, other skill, unresolved, no skill, wrong order, false fires. A run that ended abnormally with no skill called, by turn limit, timeout or API error, is unresolved, not a miss. A skill meant to fire after a step is graded by `tool_order`, so a call at the wrong moment is not a hit. An eval reads no project configuration, so its standing rule arrives through `append_system_prompt`.
+5. Tally (`tally`): hits, other skill, unresolved, no skill, wrong order, false fires. A run that ended abnormally with no skill called, by turn limit, timeout or API error, is unresolved, not a miss; `tally` names its kind and prints one rerun instruction per kind. `--save` keeps an accepted run's outcome per case with the model, Claude Code version and skill descriptions it ran on, and `--accepted` reports later runs against it, with a `stale` line when the model or a description changed. A case may name an MCP tool (`"tool"`) instead of a skill. A skill meant to fire after a step is graded by `tool_order`, so a call at the wrong moment is not a hit. An eval reads no project configuration, so its standing rule arrives through `append_system_prompt`.
 6. Act on the result:
 
    | Result | Next |
    |---|---|
    | Another skill took it | Read both descriptions, fix the overlap or merge |
    | No skill fired | Try the description, then `paths`, then a hook |
-   | Unresolved | Rerun, with a higher `--max-turns` if the turn limit ended it |
+   | Unresolved | Follow the `rerun` line for its kind: a higher `--max-turns`, one more try, a rerun as is, or read the error first |
    | Wrong order | Sharpen the wording of the standing rule |
    | False fire | Narrow the description |
    | All pass | Stop. Add nothing |
@@ -256,14 +257,14 @@ Run as `python -I -X utf8 scripts/project.py <command>`. `<plugin>` is a plugin 
 
 | Command | Does |
 |---|---|
-| `summary <plugin> [--usage DIR]` | Node counts, tokens per skill, uses, eval cases, calls in transcripts |
+| `summary <plugin> [--usage DIR]` | Node counts, tokens per skill, uses, eval cases, calls in transcripts, and Reads of each skill's reference files |
 | `check <plugin> [--usage DIR]` | Deterministic findings, one per line |
 | `impact <plugin> <node>` | What breaks if it is removed, and what only it uses |
 | `sql <plugin> "<select>"` | Read-only query on `node` and `edge` |
 | `mine <transcripts_dir> <cases.json> [--alias a=b] [--only a,b]` | Labeled prompts from typed commands |
 | `catalog <out.json> <skills_dir>... [--only a,b]` | Competitor skill descriptions |
-| `build <plugin> <cases.json> <out_dir> [--stub] [--also out.json] [--history f.jsonl] [--max-turns N]` | A scratch copy with eval cases. A case may add `after` and `rule` for a skill that fires from a step |
-| `tally <result.json>...` | Hits, misses by cause, wrong order, false fires |
+| `build <plugin> <cases.json> <out_dir> [--stub] [--also out.json] [--history f.jsonl] [--max-turns N]` | A scratch copy with eval cases, in a new folder; it refuses one that holds files. A case may add `after` and `rule` for a skill that fires from a step |
+| `tally <result.json>... [--cases f] [--save f] [--accepted f]` | Hits, misses by cause, wrong order, false fires, a rerun instruction per kind of abnormal end; outcomes saved or compared per case; with `--cases`, cases marked `"split": "test"` scored apart from the ones the description was written from |
 
 Findings from `check` are candidates, not verdicts:
 
@@ -273,8 +274,12 @@ Findings from `check` are candidates, not verdicts:
 | `duplicate-file`, `shared-lines` | A whole file repeated, or lines copied between instructions |
 | `orphan` | A script or doc nothing points at |
 | `no-eval`, `never-called`, `unmeasured` | No eval case or `tests/route_cases.json` entry grades it, or no call in the transcripts, or no transcripts to count in. A skill only the user invokes needs no eval |
+| `never-read` | A skill's reference file no Read in the transcripts opened, subagents included: a candidate to fold in or drop |
 | `no-description`, `long-description`, `long-body` | No description, over 1,536 characters, over about 5,000 tokens, where a compaction cuts a skill |
 | `overlap-candidate` | Descriptions share many words. `audit` judges the meaning |
+| `unknown-frontmatter` | A skill key Claude Code does not read, such as `disable_model_invocation`. It is ignored without an error |
+| `hook-config` | An event name `hooks.json` does not have, or a command hook with no `timeout`, which can hold a session for the default |
+| `mcp-unpinned` | An MCP server fetched at start by `npx`, `uvx`, `bunx` or `pipx` with no exact version, so it runs whatever is newest |
 
 On real plugins, `broken-ref` was often an example path in a skill about writing skills, and `duplicate-file` was often deliberate. That is why `audit` opens each file.
 
@@ -298,7 +303,7 @@ Run as `python -I -X utf8 scripts/clone.py <command>`.
 | Command | Does |
 |---|---|
 | `ensure <root> [--dest dir] [--no-register]` | Prints `CREATED`, `EXISTS`, `THIS`, `ORIGINAL`, `WRONG-PROJECT` or `NO-PROJECT`, and what to do. Every skill runs it first |
-| `sync [--from dir]` | Run from a copy. Takes a newer original: files the project did not touch are updated, new ones added, dropped ones removed. Files the project added stay, and files it changed stay and print as `kept` |
+| `sync [--from dir] [--dry-run]` | Run from a copy. Takes a newer original: files the project did not touch are updated, new ones added, dropped ones removed. Files the project added stay, and files it changed stay and print as `kept`. An original in a git checkout is taken from its published ref (`origin/main`, else `main`) by `git archive`, never from a worktree; a session hears of a new commit or a changed folder, not only a new version. `--dry-run` lists the changes and writes nothing. `.git` files, `.superpowers`, `.worktrees` and Claude Code's `.in_use` marks never reach a copy |
 
 ## `restructure.py` commands
 
@@ -320,8 +325,8 @@ Run as `python -I -X utf8 scripts/restructure.py <command>`. State stays in `<ro
 python -I -X utf8 scripts/project.py mine <transcripts_dir> cases.json --only search,review
 python -I -X utf8 scripts/project.py catalog catalog.json <skills_dir>
 python -I -X utf8 scripts/project.py build <plugin> cases.json <out_dir> --stub --also catalog.json --history fixtures/midwork.jsonl
-claude plugin eval "<out_dir>" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --model <model> -j 1 --json result.json
-python -I -X utf8 scripts/project.py tally result.json
+claude plugin eval "<out_dir>" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --model <model> -j 1 --json <run>/result.json
+python -I -X utf8 scripts/project.py tally <run>/result.json
 ```
 
 Always pass `--no-publish`. The cost ceiling is checked only before each run starts, so spend can pass it by as many runs as `-j` allows.

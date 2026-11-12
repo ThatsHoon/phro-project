@@ -1,5 +1,6 @@
 """A tiny two-bundle project: allowed imports pass, a cross-bundle and an escaping relative import are caught,
-the copy test passes for an isolated feature and fails for one that reaches outside, contracts report gaps.
+the copy test passes for an isolated feature and fails for one that reaches outside, contracts report gaps
+(including examples that name no schema or a schema file that is not there).
 
 Run: python -I -X utf8 tests/test_modularize.py
 """
@@ -27,9 +28,12 @@ FILES = {
     "control/bad/__init__.py": "from app.stt import run\nfrom ...outside import x\nimport json\n",
     "control/bad/test_bad.py": "import control.bad\n\ndef test_bad():\n    assert control.bad\n",
     "control/hazard/contract/schema/in.json": "{}",
-    "control/hazard/contract/examples/one.json": "{}",
+    "control/hazard/contract/examples/one.json": '{"schema": {"input": "in.json"}, "input": {}}',
+    "control/geo/contract/schema/out.json": "{}",
+    "control/geo/contract/examples/a.json": "{}",
+    "control/geo/contract/examples/b.json": '{"schema": "gone.json"}',
     "training/train.py": "from control.hazard import h\n",
-    "contracts/README.md": "See control/hazard/contract.\n",
+    "contracts/README.md": "See control/hazard/contract and control/geo/contract.\n",
 }
 RULES = {"features": {"shared/msg": [], "app/stt": ["shared"], "control/geo": [],
                       "control/hazard": ["shared", "control/geo"], "control/bad": ["shared", "control/geo"]},
@@ -72,6 +76,8 @@ def main():
         assert code == 1, out
         assert any(l.startswith("OK\tcontrol/hazard") for l in out.splitlines()), out
         assert "MISSING\tapp/stt" in out and "not linked" in out, out
+        geo = next(l for l in out.splitlines() if "\tcontrol/geo\t" in l)  # each example names a schema file that exists
+        assert geo.startswith("MISSING") and "a.json names no schema" in geo and "b.json names missing gone.json" in geo, out
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("pass")

@@ -9,6 +9,7 @@ import argparse
 import collections
 import fnmatch
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -305,15 +306,16 @@ def stamp(root, names, accept_goal=False, drift=None):
 
 
 def newer_original():
-    """For a project's copy of this plugin: the newest installed original, when it is ahead of the copy."""
+    """For a project's copy of this plugin: what of the original is ahead of the copy (a commit or a version), by clone.py's own test."""
     try:
         record = json.loads((PLUGIN / "origin.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        spec = importlib.util.spec_from_file_location("phro_clone", PLUGIN / "scripts/clone.py")
+        clone = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(clone)
+        found = clone.newer(record)
+    except (OSError, ValueError, KeyError, SystemExit):
         return None
-    key = lambda version: tuple(int(n) for n in version.split("."))
-    versions = [p.name for p in Path(record["origin_dir"]).parent.glob("*") if re.fullmatch(r"\d+\.\d+\.\d+", p.name)]
-    newest = max(versions, key=key, default=None)
-    return (record["origin"], newest) if newest and key(newest) > key(record["version"]) else None
+    return (record["origin"], found) if found else None
 
 
 def session_text(root, source=None):
@@ -348,7 +350,9 @@ def session_text(root, source=None):
             parts.append(f"Last drift report: {manifest['drift']}")
         newer = newer_original()
         if newer:
-            parts.append(f"{newer[0]} {newer[1]} is newer than this project's copy. Tell the user, or at a stopping point run: python -I -X utf8 {PLUGIN.as_posix()}/scripts/clone.py sync")
+            copy = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))["name"]
+            parts.append(f"{newer[0]} {newer[1]} is newer than this project's copy. Tell the user, who can say \"{copy} update\" to take it; "
+                         f"the project's own files stay as they are.")
     except (OSError, ValueError):
         pass
     if source == "compact":  # the summary is in this session's context, and no hook on this event can call a model, so the session itself does the update

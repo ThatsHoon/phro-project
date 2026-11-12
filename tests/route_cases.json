@@ -34,5 +34,12 @@
  {"id": "r01", "skill": "lean-review", "prompt": "이 diff 과설계 리뷰해줘, 지울 수 있는 것만 뽑아"},
  {"id": "r02", "skill": "lean-review", "prompt": "review this PR for over-engineering, what can we delete"},
  {"id": "s01", "skill": "show", "prompt": "phro-project show"},
- {"id": "s02", "skill": "show", "prompt": "핵심 문서들이 어떻게 짜여 있는지 보드로 보여줘"}
+ {"id": "s02", "skill": "show", "prompt": "핵심 문서들이 어떻게 짜여 있는지 보드로 보여줘"},
+ {"id": "u01", "skill": "update", "prompt": "phro-project_e-call update"},
+ {"id": "u02", "skill": "update", "prompt": "원본 phro-project가 업데이트됐으니 사본에 반영해줘"},
+ {"id": "u03", "skill": "update", "prompt": "플러그인 업데이트 반영해"},
+ {"id": "u04", "skill": "update", "prompt": "take the latest phro-project original into this project's copy"},
+ {"id": "n_u1", "skill": null, "prompt": "사본에서 고친 스킬을 원본 phro-project에 올려줘"},
+ {"id": "n_u2", "skill": null, "prompt": "claude code 자체를 최신 버전으로 업데이트하는 방법 알려줘"},
+ {"id": "n_u3", "skill": null, "prompt": "e-call 핵심 문서 업데이트해줘"}
 ]

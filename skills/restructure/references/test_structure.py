@@ -21,7 +21,7 @@ CODE = {".py", ".js", ".ts", ".tsx", ".jsx", ".cjs", ".mjs", ".sh", ".ps1"}
 def walk(start=ROOT):
     for path in start.iterdir():
         if path.is_dir():
-            if path.name not in SKIP and not (path / "pyvenv.cfg").exists():
+            if path.name not in SKIP and not path.name.startswith(".") and not (path / "pyvenv.cfg").exists():
                 yield from walk(path)
         else:
             yield path

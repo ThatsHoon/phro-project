@@ -3,7 +3,7 @@
 <plugin> is a plugin folder, or a project root, which means the skills in its .claude.
 
 Structure, rebuilt from the plugin's files on every call (the files are the source, the database is a throwaway copy):
-  project.py summary <plugin> [--usage DIR]     nodes, and per skill its token cost, tests and use
+  project.py summary <plugin> [--usage DIR]     nodes, and per skill its token cost, tests and use; with --usage, reads of each reference
   project.py check   <plugin> [--usage DIR]     deterministic findings, one per line
   project.py impact  <plugin> <node>            what depends on it, and what only it uses
   project.py sql     <plugin> "<select>"        read-only query: node(id, kind, path, description, desc_tokens, body_tokens), edge(src, dst, how)
@@ -12,7 +12,10 @@ Routing, on a scratch copy so the plugin itself is never edited:
   project.py mine    <transcripts_dir> <cases.json> [--alias a=b ...] [--only a,b]   prompts labelled by the command the user typed
   project.py catalog <out.json> <skills_dir> [<skills_dir> ...] [--only a,b]         competing descriptions from installed skills
   project.py build   <plugin> <cases.json> <out_dir> [--history f.jsonl] [--stub] [--also out.json] [--max-turns N]
-  project.py tally   <result.json> [<result.json> ...]                              hits, misses, and which skill took each miss
+  project.py tally   <result.json> [<result.json> ...] [--cases cases.json]         hits, misses, which skill took each miss; held-out cases apart
+
+Output quality, from a `claude plugin eval --ablation with-without` run (graders named b-* are boundaries):
+  project.py quality <result.json> [--accepted accepted.json] [--save accepted.json]  per-grader pass rate in each arm, breaks, gained and broken, and a stale line when the model or the skill changed since
 """
 import argparse
 import collections
@@ -40,6 +43,15 @@ ROUTE_CASES = "tests/route_cases.json"  # routing cases that live in the plugin 
 PROJECT_PARTS = ("skills", "agents", "commands", "tests")  # a project's .claude also holds settings and worktrees, which are not capabilities
 STEP_TOOLS = "[Read, Glob, Grep, WebSearch, Write, Edit, Skill]"
 STEP_TURNS = 10  # a step-triggered case has to do the step first
+FETCHERS = {"npx", "bunx", "uvx", "pipx"}  # lean: docker images and npm exec are not read | when: a project runs an MCP server that way | fix: parse their image or package argument
+PINNED = re.compile(r"(?:@|==)v?\d[\w.+-]*$")
+# From code.claude.com/docs/en/skills and /hooks, read 2026-11-11. A key or event Claude Code does not know is ignored without an error.
+SKILL_KEYS = set("name description when_to_use argument-hint arguments disable-model-invocation user-invocable allowed-tools "
+                 "disallowed-tools model effort context agent background hooks paths shell metadata license compatibility version".split())
+HOOK_EVENTS = set("SessionStart Setup UserPromptSubmit UserPromptExpansion PreToolUse PermissionRequest PermissionDenied PostToolUse "
+                  "PostToolUseFailure PostToolBatch Notification MessageDisplay SubagentStart SubagentStop TaskCreated TaskCompleted "
+                  "Stop StopFailure TeammateIdle InstructionsLoaded ConfigChange CwdChanged DirectoryAdded FileChanged WorktreeCreate "
+                  "WorktreeRemove PreCompact PostCompact PreModelSwitch PostModelSwitch Elicitation ElicitationResult SessionEnd".split())
 SKILL_CALL = '"skill"\\s*:\\s*"(?:[\\w-]+:)?{}"'
 
 
@@ -174,23 +186,29 @@ def add_edges(db, plugin, kinds, texts, sources):
 
 def usage(directory, plugin):
     """Typed commands and model Skill calls per skill, or None without any transcript, which is not a count of zero. Forked sessions copy lines, so every event counts once by uuid. Counts only, no text."""
-    typed, model, seen = collections.Counter(), collections.Counter(), set()
+    typed, model, reads, seen = collections.Counter(), collections.Counter(), collections.Counter(), set()
     paths = list(Path(directory).rglob("*.jsonl"))
     if not paths:
         return None
     for path in paths:
         for line in path.open(encoding="utf-8", errors="replace"):
-            if '"Skill"' not in line and "<command-name>" not in line:
+            if '"Skill"' not in line and "<command-name>" not in line and not ('"Read"' in line and "skills" in line):
                 continue
             try:
                 e = json.loads(line)
             except ValueError:
                 continue
             uid = e.get("uuid")
-            if uid in seen or e.get("isSidechain"):
+            if uid in seen:
                 continue
             seen.add(uid)
             content = (e.get("message") or {}).get("content")
+            if e.get("type") == "assistant" and isinstance(content, list):  # a subagent reading a reference uses it too
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Read":
+                        reads[str((b.get("input") or {}).get("file_path", "")).replace("\\", "/")] += 1
+            if e.get("isSidechain"):
+                continue
             if e.get("type") == "user":
                 text = content if isinstance(content, str) else " ".join(b.get("text", "") for b in content or [] if isinstance(b, dict))
                 m = re.search(r"<command-name>/?([^<\s]+)</command-name>", text[:3000])
@@ -203,7 +221,50 @@ def usage(directory, plugin):
 
     def count(counter, name):
         return counter[name] + counter[f"{plugin}:{name}"]
-    return lambda name: (count(typed, name), count(model, name))
+
+    def used(name):
+        return count(typed, name), count(model, name)
+    # lean: matched by the path inside the plugin, so another plugin's file at the same path counts too | when: two installed plugins share a skill and reference name | fix: match the plugin's folder name as well
+    used.reads = lambda rel: sum(n for path, n in reads.items() if path.endswith("/" + rel))
+    return used
+
+
+def references(sources, kinds):
+    """A skill's own documents other than SKILL.md: read on demand, so a reference nobody reads costs upkeep for nothing."""
+    return sorted(rel for node, files in sources.items() if kinds.get(node) == "doc" for rel in files
+                  if rel.startswith("skills/") and rel.endswith(".md") and Path(rel).name not in ("SKILL.md", "CONTRACT.md"))
+
+
+def fetched_package(entry):
+    """The package an MCP server entry fetches from a registry at start, or None for a local command."""
+    command = re.sub(r"\.(?:cmd|exe)$", "", Path(str(entry.get("command", ""))).name.lower())
+    args = [str(x) for x in entry.get("args") or []]
+    if command not in FETCHERS:
+        return None
+    for flag in ("--from", "--package", "-p", "--spec"):
+        if flag in args[:-1]:
+            return args[args.index(flag) + 1]
+    return next((x for x in args if not x.startswith("-") and x != "run"), None)
+
+
+def hook_findings(root):
+    """hooks/hooks.json entries Claude Code would skip, or that can hold a session for the default timeout."""
+    path = root / "hooks/hooks.json"
+    if not path.exists():
+        return []
+    try:
+        events = json.loads(path.read_text(encoding="utf-8")).get("hooks") or {}
+    except (ValueError, AttributeError):
+        return [("hook-config", "hooks/hooks.json", "not a JSON object with a hooks map")]
+    out = []
+    for event, groups in events.items():
+        if event not in HOOK_EVENTS:
+            out.append(("hook-config", "hooks/hooks.json", f"{event} is not a hook event"))
+            continue
+        for hook in (h for g in groups for h in g.get("hooks") or []):
+            if hook.get("type") == "command" and "timeout" not in hook and not hook.get("async"):
+                out.append(("hook-config", "hooks/hooks.json", f"{event} command has no timeout, so it can hold the session for the default"))
+    return out
 
 
 def findings(root, usage_dir=None):
@@ -253,14 +314,21 @@ def findings(root, usage_dir=None):
     for node, kind in kinds.items():
         path = sources[node][0] if sources[node] else ""
         runs = path.startswith(("skills/", "scripts/", "hooks/")) and (kind == "script" or (kind == "doc" and path.endswith(".md")))
-        if runs and node not in reached and Path(path).name not in ("__init__.py", "README.md"):
+        if runs and node not in reached and Path(path).name not in ("__init__.py", "README.md", "CONTRACT.md"):
             out.append(("orphan", node, "no file refers to it"))
+    # An MCP server fetched by name runs whatever version is newest at each start, not the one that was reviewed.
+    for node, kind in kinds.items():
+        package = fetched_package(json.loads(texts[node])) if kind == "mcp" else None
+        if package and not PINNED.search(package):
+            out.append(("mcp-unpinned", node, package))
+    out += hook_findings(root)
     tested = {r[0] for r in db.execute("select e.dst from edge e join node n on n.id = e.src where n.kind = 'eval'")}
     words = {}
     for node, kind, description, _ in nodes:
         if kind != "skill":
             continue
         fields = frontmatter(texts[node])[0]
+        out += [("unknown-frontmatter", node, key) for key in sorted(fields) if key not in SKILL_KEYS]
         if node not in tested and not user_only(fields):
             out.append(("no-eval", node, "no eval case grades it"))
         if not description:
@@ -282,6 +350,7 @@ def findings(root, usage_dir=None):
         used = usage(usage_dir, plugin)
         if used:
             out += [("never-called", n[0], "0 typed, 0 model calls in these transcripts") for n in nodes if n[1] == "skill" and used(n[0].split(":", 1)[1]) == (0, 0)]
+            out += [("never-read", rel, "0 Reads in these transcripts") for rel in references(sources, kinds) if not used.reads(rel)]
         else:
             out.append(("unmeasured", str(usage_dir), "no transcripts here, so use is unknown"))
     return out
@@ -295,7 +364,7 @@ def resolve(db, name):
 
 
 def cmd_summary(a):
-    db, plugin, _, _ = scan(a.plugin)
+    db, plugin, _, sources = scan(a.plugin)
     print(f"plugin\t{plugin}")
     for kind, n in db.execute("select kind, count(*) from node group by kind order by 2 desc"):
         print(f"{kind}\t{n}")
@@ -308,6 +377,11 @@ def cmd_summary(a):
     for row in db.execute(query):
         extra = "\t%d\t%d" % used(row[0].split(":", 1)[1]) if used else ""
         print("\t".join(map(str, row)) + extra)
+    if used:
+        kinds = dict(db.execute("select id, kind from node"))
+        print("reference\treads")
+        for rel in references(sources, kinds):
+            print(f"{rel}\t{used.reads(rel)}")
 
 
 def cmd_check(a):
@@ -390,15 +464,21 @@ def grader(name_pattern=None, none=False):
     return f"---\ntype: tool_used\ntool: Skill\n{match}{limit}---\n\nGraded from the transcript.\n"
 
 
-def order_grader(step, name):
-    return f"---\ntype: tool_order\nbefore: {step}\nafter: {{ tool: Skill, input_match: '{SKILL_CALL.format(name)}' }}\n---\n\nGraded from the transcript.\n"
+def tool_grader(tool):
+    return f"---\ntype: tool_used\ntool: {tool}\n---\n\nGraded from the transcript.\n"
+
+
+def order_grader(step, name, tool=None):
+    after = f"{{ tool: {tool} }}" if tool else f"{{ tool: Skill, input_match: '{SKILL_CALL.format(name)}' }}"
+    return f"---\ntype: tool_order\nbefore: {step}\nafter: {after}\n---\n\nGraded from the transcript.\n"
 
 
 def cmd_build(a):
     src, out = Path(a.plugin).resolve(), Path(a.out).resolve()
     if out == src or src in out.parents:
         sys.exit("out_dir must be outside the plugin")
-    shutil.rmtree(out, ignore_errors=True)
+    if out.exists() and any(out.iterdir()):
+        sys.exit(f"{out} exists and may hold an earlier run's results; give a new folder")
     ignore = shutil.ignore_patterns(*SKIP, "evals", "tests")
     if src.name == ".claude":
         for part in parts_of(src):
@@ -425,12 +505,15 @@ def cmd_build(a):
         (d / "graders").mkdir(parents=True)
         step = case.get("after")  # a skill meant to fire after this tool, not on the prompt itself
         rule = f"append_system_prompt: {json.dumps(case['rule'], ensure_ascii=False)}\n" if case.get("rule") else ""  # stands in for the core index: an eval reads no project configuration
-        head = f"max_turns: {max(a.max_turns, STEP_TURNS)}\ntimeout_seconds: 240\nallowed_tools: {STEP_TOOLS}\n" if step else f"max_turns: {a.max_turns}\ntimeout_seconds: 180\nallowed_tools: {TOOLS}\n"
+        tool = case.get("tool")  # an MCP tool, by its full mcp__plugin_<plugin>_<server>__<tool> name, instead of a skill
+        tools = STEP_TOOLS if step else TOOLS
+        tools = tools[:-1] + f", {tool}]" if tool else tools
+        head = f"max_turns: {max(a.max_turns, STEP_TURNS)}\ntimeout_seconds: 240\nallowed_tools: {tools}\n" if step else f"max_turns: {a.max_turns}\ntimeout_seconds: 180\nallowed_tools: {tools}\n"
         (d / "prompt.md").write_text(f"---\n{head}{rule}---\n\n{case['prompt']}\n", encoding="utf-8")
         target = case.get("skill")
-        (d / "graders/target.md").write_text(grader(target) if target else grader(none=True), encoding="utf-8")
+        (d / "graders/target.md").write_text(tool_grader(tool) if tool else grader(target) if target else grader(none=True), encoding="utf-8")
         if step:
-            (d / "graders/order.md").write_text(order_grader(step, target), encoding="utf-8")
+            (d / "graders/order.md").write_text(order_grader(step, target, tool), encoding="utf-8")
         for name in skills:  # free graders, so a miss shows which skill took it
             (d / f"graders/to-{name}.md").write_text(grader(name), encoding="utf-8")
         if a.history:
@@ -441,25 +524,108 @@ def cmd_build(a):
     print(f'next\tclaude plugin eval "{out}" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --json <result.json>{grant}')
 
 
+# Why a run ended abnormally decides what to do with it. First match wins.
+ERROR_KINDS = (
+    ("turn_limit", r"maximum number of turns", "rerun these cases after build with a higher --max-turns"),
+    ("timeout", r"timed out|timeout", "rerun once; if it repeats, raise timeout_seconds in the case"),
+    ("api_error", r"api error|overloaded|rate.?limit|\b(?:429|5\d\d)\b", "rerun as is; the service failed, not the skill"),
+    ("other", r"", "read the error before any rerun"),
+)
+
+
+def error_kind(error):
+    return next(kind for kind, pattern, _ in ERROR_KINDS if re.search(pattern, error, re.I))
+
+
+def fingerprint(root, whole):
+    """What a run measured: each skill's listing text for routing, or each SKILL.md and CONTRACT.md in full for output quality."""
+    out = {}
+    for path in sorted(Path(root).glob("skills/*/*.md")) if root and Path(root).is_dir() else []:
+        rel, text = path.relative_to(root).as_posix(), path.read_text(encoding="utf-8", errors="replace")
+        if whole and path.name in ("SKILL.md", "CONTRACT.md"):
+            out[rel] = hashlib.sha256(text.encode()).hexdigest()[:16]
+        elif not whole and path.name == "SKILL.md":
+            fields = frontmatter(text)[0]
+            listing = " ".join(filter(None, [fields.get("description"), fields.get("when_to_use")]))
+            out[f"skill:{fields.get('name', path.parent.name)}"] = hashlib.sha256(listing.encode()).hexdigest()[:16]
+    return out
+
+
+def run_meta(data, whole):
+    suite = data.get("suite") or {}
+    return {"model": suite.get("modelOverride") or "default", "claude": data.get("claudeVersion"), "files": fingerprint(suite.get("root"), whole)}
+
+
+def stale(now, then):
+    """Why an accepted baseline may not compare: another model, another Claude Code, or skills changed since. Silent for an old file with no record."""
+    if not then:
+        return
+    if then.get("model") != now["model"]:
+        print(f"stale\tmodel\t{then.get('model')} -> {now['model']}\toutcomes are not comparable")
+    if then.get("claude") != now["claude"]:
+        print(f"stale\tclaude\t{then.get('claude')} -> {now['claude']}")
+    old, new = then.get("files") or {}, now["files"]
+    for key in sorted(set(old) | set(new)):
+        if new and old.get(key) != new.get(key):
+            print(f"stale\tchanged\t{key}")
+
+
+def compare(now, accepted):
+    """Case outcomes against an accepted run. An unresolved run on either side shows no change."""
+    good = ("hit", "ok")
+    for key, outcome in now.items():
+        before = accepted.get(key)
+        if before is None:
+            print(f"new\t{key}\t{outcome}")
+        elif "unresolved" in (before, outcome):
+            if before != outcome:
+                print(f"not compared\t{key}\t{before} -> {outcome}")
+        elif before != outcome:
+            verdict = "gained" if outcome in good else "broken" if before in good else "changed"
+            print(f"{verdict}\t{key}\t{before} -> {outcome}")
+
+
+def by_split(outcomes, cases):
+    """Hits and false fires per split, so cases kept away from the description's writer show whether it was fitted to the rest."""
+    split = {c["id"]: c.get("split", "write") for c in cases}
+    if "test" not in split.values():
+        return
+    for name in ("write", "test"):
+        mine = [o for key, o in outcomes.items() if split.get(key.split("#")[0], "write") == name and o != "unresolved"]
+        positives = [o for o in mine if not (o == "ok" or o.startswith("false_fire"))]
+        negatives = [o for o in mine if o == "ok" or o.startswith("false_fire")]
+        fired = sum(o.startswith("false_fire") for o in negatives)
+        print(f"split\t{name}\ttarget\t{positives.count('hit')}/{len(positives)}\tfalse_fires\t{fired}/{len(negatives)}")
+
+
 def cmd_tally(a):
+    outcomes = {}
     for file in a.results:
         data = json.loads(Path(file).read_text(encoding="utf-8"))
         per = collections.defaultdict(lambda: [0, 0, 0, 0, 0])
         false_fires, misses, runs, negatives = [], [], 0, 0
+        reruns = collections.Counter()
         for case in data["cases"]:
-            for run in case["arms"]["with"]:
+            arm = case["arms"]["with"]
+            for i, run in enumerate(arm):
+                key = case["name"] if len(arm) == 1 else f"{case['name']}#{i + 1}"
                 runs += 1
                 graders = {g["name"]: g["passed"] for g in run["graders"]}
                 took = sorted(n[3:] for n, ok in graders.items() if n.startswith("to-") and ok)
-                pattern = next((g["config"].get("input_match", "") for g in case["graders"] if g["name"] == "target"), "")
-                expected = m.group(1) if (m := re.search(r'\?([\w-]+)"$', pattern)) else None
+                spec = next((g.get("config") or {} for g in case["graders"] if g["name"] == "target"), {})
+                m = re.search(r'\?([\w-]+)"$', spec.get("input_match", ""))
+                expected = m.group(1) if m else spec["tool"] if spec.get("tool") not in (None, "Skill") else None
                 # A run that ended abnormally with no skill yet, by turn limit, timeout or API error, has shown nothing; it is unresolved.
                 error = str(run.get("error") or "")[:60]
+                kind = error_kind(error) if error else ""
                 if expected is None:
                     if error and not took:
-                        misses.append(f"{case['name']} no skill expected -> unresolved, {error}")
+                        reruns[kind] += 1
+                        outcomes[key] = "unresolved"
+                        misses.append(f"{case['name']} no skill expected -> unresolved {kind}, {error}")
                         continue
                     negatives += 1
+                    outcomes[key] = f"false_fire:{','.join(took)}" if took else "ok"
                     if took:
                         false_fires.append(f"{case['name']} -> {','.join(took)}")
                     continue
@@ -467,16 +633,22 @@ def cmd_tally(a):
                 row[0] += 1
                 if graders.get("target") and graders.get("order", True):
                     row[1] += 1
+                    outcomes[key] = "hit"
                 elif graders.get("target"):
                     row[4] += 1
+                    outcomes[key] = "wrong_order"
                     misses.append(f"{case['name']} {expected} -> called, but not after the step")
                 elif took:
                     row[2] += 1
+                    outcomes[key] = f"other:{','.join(took)}"
                     misses.append(f"{case['name']} {expected} -> {','.join(took)}")
                 elif error:
                     row[3] += 1
-                    misses.append(f"{case['name']} {expected} -> unresolved, {error}")
+                    reruns[kind] += 1
+                    outcomes[key] = "unresolved"
+                    misses.append(f"{case['name']} {expected} -> unresolved {kind}, {error}")
                 else:
+                    outcomes[key] = "none"
                     misses.append(f"{case['name']} {expected} -> none")
         total, hit = sum(r[0] for r in per.values()), sum(r[1] for r in per.values())
         print(f"file\t{file}\truns\t{runs}\tcost\t{data.get('costUsd', 0):.2f}\tpartial\t{data.get('partial')}")
@@ -488,6 +660,91 @@ def cmd_tally(a):
             print(f"miss\t{line}")
         for line in false_fires:
             print(f"false_fire\t{line}")
+        for kind, _, action in ERROR_KINDS:
+            if reruns[kind]:
+                print(f"rerun\t{kind}\t{reruns[kind]}\t{action}")
+    if a.cases:
+        by_split(outcomes, json.loads(Path(a.cases).read_text(encoding="utf-8")))
+    meta = run_meta(data, whole=False)
+    if a.accepted:
+        old = json.loads(Path(a.accepted).read_text(encoding="utf-8"))
+        stale(meta, old.pop("_meta", None))
+        compare(outcomes, old)
+    if a.save:
+        Path(a.save).write_text(json.dumps({**outcomes, "_meta": meta}, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"saved\t{a.save}")
+
+
+NOISE = 0.34  # one run in three moving is noise, two is a change
+
+
+def cmd_quality(a):
+    """Output quality of a with-without run: per case and grader, pass rate in each arm and what it proves."""
+    data = json.loads(Path(a.result).read_text(encoding="utf-8"))
+    rows, breaks, cost, reruns = [], [], collections.Counter(), collections.Counter()
+    for case in data["cases"]:
+        defs = {g["name"]: g for g in case.get("graders", [])}
+        withs, withouts = case["arms"].get("with", []), case["arms"].get("without", [])
+        for arm, runs in (("with", withs), ("without", withouts)):
+            cost[arm] += sum(r.get("costUsd") or 0 for r in runs)
+        # A run that ended abnormally never produced its output, so it neither passes nor fails a grader.
+        aborted = [r for r in withs + withouts if r.get("error")]
+        for r in aborted:
+            reruns[error_kind(str(r["error"]))] += 1
+        withs, withouts = [r for r in withs if not r.get("error")], [r for r in withouts if not r.get("error")]
+        indicator = {n for n, g in defs.items() if g.get("type") == "tool_used" and g.get("config", {}).get("tool") == "Skill"}
+
+        def rate(runs, name):
+            seen = [g["passed"] for r in runs for g in r["graders"] if g["name"] == name]
+            return sum(seen) / len(seen) if seen else None
+        fired = sum(any(g["passed"] for g in r["graders"] if g["name"] in indicator) for r in withs)
+        fired = f"{fired}/{len(withs)}" if indicator else "-"  # no indicator grader: firing unknown, not 0
+        print(f"case\t{case['name']}\tfired\t{fired}\tunresolved\t{len(aborted)}")
+        for name in sorted(defs):
+            if name in indicator:
+                continue
+            w, wo = rate(withs, name), rate(withouts, name)
+            if w is None:
+                continue
+            flags = []
+            if name.startswith("b-") and w < 1:
+                flags.append("BOUNDARY")
+                breaks.append(f"{case['name']}\t{name}\t{w:.2f}")
+            if wo is not None and w == 1 and wo == 1:
+                flags.append("nondiscriminating")
+            if 0 < w < 1:
+                flags.append("flaky")
+            rows.append((case["name"], name, w, wo, flags))
+    print(f"file\t{a.result}\tcost_with\t{cost['with']:.2f}\tcost_without\t{cost['without']:.2f}\tpartial\t{data.get('partial')}")
+    for line in breaks:
+        print(f"break\t{line}")
+    for kind, _, action in ERROR_KINDS:
+        if reruns[kind]:
+            print(f"rerun\t{kind}\t{reruns[kind]}\t{action}")
+    print("case\tgrader\twith\twithout\tdelta\tflags")
+    for name, grader_name, w, wo, flags in rows:
+        delta = "" if wo is None else f"{w - wo:+.2f}"
+        print(f"{name}\t{grader_name}\t{w:.2f}\t{'' if wo is None else f'{wo:.2f}'}\t{delta}\t{','.join(flags)}")
+    deltas = [w - wo for _, _, w, wo, _ in rows if wo is not None]
+    print(f"summary\tgraders\t{len(rows)}\tboundary_breaks\t{len(breaks)}\tnondiscriminating\t{sum('nondiscriminating' in r[4] for r in rows)}"
+          f"\tflaky\t{sum('flaky' in r[4] for r in rows)}\tmean_delta\t{sum(deltas) / len(deltas) if deltas else 0:+.2f}")
+    now = {}
+    for name, grader_name, w, _, _ in rows:
+        now.setdefault(name, {})[grader_name] = w
+    meta = run_meta(data, whole=True)
+    if a.accepted:
+        old = json.loads(Path(a.accepted).read_text(encoding="utf-8"))
+        stale(meta, old.pop("_meta", None))
+        for name, graders in now.items():
+            for grader_name, w in graders.items():
+                before = old.get(name, {}).get(grader_name)
+                if before is None:
+                    print(f"new\t{name}\t{grader_name}\t{w:.2f}")
+                elif abs(w - before) > NOISE:
+                    print(f"{'gained' if w > before else 'broken'}\t{name}\t{grader_name}\t{before:.2f} -> {w:.2f}")
+    if a.save:
+        Path(a.save).write_text(json.dumps({**now, "_meta": meta}, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"saved\t{a.save}")
 
 
 def main():
@@ -529,7 +786,15 @@ def main():
     p.set_defaults(fn=cmd_build)
     p = sub.add_parser("tally")
     p.add_argument("results", nargs="+")
+    p.add_argument("--cases", help="the cases.json the run was built from; cases with \"split\": \"test\" are scored apart")
+    p.add_argument("--accepted", help="case outcomes saved from an accepted run, to report gained and broken")
+    p.add_argument("--save", help="write this run's case outcomes, to accept it")
     p.set_defaults(fn=cmd_tally)
+    p = sub.add_parser("quality")
+    p.add_argument("result")
+    p.add_argument("--accepted")
+    p.add_argument("--save")
+    p.set_defaults(fn=cmd_quality)
     a = parser.parse_args()
     a.fn(a)
 

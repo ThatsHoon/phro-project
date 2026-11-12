@@ -14,7 +14,7 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
 
 ## 1. Cases
 
-Write `cases.json`: `[{"id": "c01", "skill": "name", "prompt": "..."}, {"id": "n01", "skill": null, "prompt": "..."}]`.
+Write `cases.json`: `[{"id": "c01", "skill": "name", "prompt": "..."}, {"id": "n01", "skill": null, "prompt": "..."}]`. For an MCP tool, use `"tool": "mcp__plugin_<plugin>_<server>__<tool>"` in place of `"skill"`: `build` grades the call of that tool and lets the run make it. The eval must load the plugin's server for such a case to mean anything; an `unresolved` or all-miss result there points at the server first.
 
 Use these sources, best first:
 1. Typed commands: `project.py mine <transcripts_dir> cases.json --only a,b`, with this project's own transcripts folder only. Keep `cases.json` with this project too. The user's own command is the label. The script drops anything pasted. Read the file and drop bare topics, which were arguments and not requests. Do this by a stated rule, and sample with a fixed seed.
@@ -28,6 +28,7 @@ Include negatives: close misses that share words with the skill and should fire 
 `project.py build <plugin> cases.json <out_dir> [--stub] [--also catalog.json] [--history fixtures/midwork.jsonl]`
 
 - Keep `out_dir` outside the plugin. The plugin stays untouched.
+- Give each run a new folder, such as `<runs>/<UTC time>/copy`, with its `result.json` beside it. `build` refuses a folder that holds files, so an earlier run's evidence is never wiped.
 - `--stub` replaces bodies, which is right when measuring selection only. Leave it off to measure what happens after the skill loads.
 - `--also` adds competing skills. Real misses come from what else is installed: `project.py catalog catalog.json <dirs> --only a,b`.
 - `--history` resumes a mid-task conversation. Run both with and without it, since a fresh session flatters the result.
@@ -35,13 +36,15 @@ Include negatives: close misses that share words with the skill and should fire 
 ## 3. Run and read
 
 ```
-claude plugin eval "<out_dir>" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --model <model> -j 4 --json result.json
-project.py tally result.json
+claude plugin eval "<out_dir>" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --model <model> -j 4 --json <run>/result.json
+project.py tally <run>/result.json --cases cases.json
 ```
+
+`--cases` scores cases marked `"split": "test"` apart from the rest. They were kept from whoever wrote the description, so a clearly lower score there means the description was fitted to its cases.
 
 Always pass `--no-publish`. Pin the model, since firing rates differ widely between models. The cost ceiling is only checked before each run starts, so with `-j 4` spend can pass it by several runs: set it below what the user approved.
 
-`unresolved` runs ended abnormally with no skill called yet, and each `miss` line gives the reason. They are not misses. Rerun them before drawing a conclusion, with a higher `--max-turns` when the turn limit ended them.
+`unresolved` runs ended abnormally with no skill called yet. They are not misses. Each such `miss` line names the kind (`turn_limit`, `timeout`, `api_error`, `other`), and one `rerun` line per kind says what to do: a higher `--max-turns`, one more try, a rerun as is, or reading the error first. Rerun them before drawing a conclusion.
 
 One run per case moves a rate by a whole case, so a difference of one or two cases is noise. Rerun the disputed cases with `--runs 3` before acting on them.
 
@@ -58,12 +61,14 @@ A label can be wrong: when the other skill also fits the request, say so and fix
 
 For any change, run the same cases on both versions and report what was gained and what broke, not only the net. A change that gains one case and breaks another needs the user's call.
 
+When the user accepts a result, `project.py tally <run>/result.json --save <plugin>/tests/route_accepted.json` keeps each case's outcome. Later runs pass `--accepted` with that file and print `gained`, `broken` and `changed` per case; an unresolved run on either side is `not compared`, not a change. The file also records the model, the Claude Code version and each skill's description. A `stale model` line means the two runs are not comparable: rerun the accepted side on this model first. `stale changed` names the skills whose description moved since then, which should be exactly the ones the change touched.
+
 A loaded skill can still be ignored. When following its procedure matters, drop `--stub`, raise `--max-turns`, and add a grader for a step of the procedure.
 
 ## 5. A skill that fires from a step
 
-Some skills should fire partway through the work, such as after a draft and before the report. To a case, add `"after": "Write"`, the tool that marks the step, and `"rule": "<the standing rule's text>"`. `build` adds a `tool_order` grader and prints the `--allow-tools` the run needs, and `tally` counts a call at the wrong moment as `wrong_order`. Write the prompt so the step really happens, and add the same prompt without `rule` as a control.
+Some skills should fire partway through the work, such as after a draft and before the report. To a case, add `"after": "Write"`, the tool that marks the step, and `"rule": "<the standing rule's text>"`. `build` adds a `tool_order` grader and prints the `--allow-tools` the run needs, and `tally` counts a call at the wrong moment as `wrong_order`. Write the prompt so the step really happens, and add the same prompt without `rule` as a control. Add one more with `rule` and a push to skip it ("급하니까 바로 보고해"), since a standing rule matters most when the work is rushed.
 
 An eval reads no project configuration, so `rule` reaches the run through `append_system_prompt`, standing in for the core index. A pass says the wording works, not that the hook delivered it.
 
-Report in the user's language with the model, cases, runs and cost, and say which prompts were real.
+Report in the user's language with the model, cases, runs and cost, and say which prompts were real, which parts were stand-ins (`--stub` bodies, a `rule` passed by `append_system_prompt`, a `--history` fixture), and what was not run.
