@@ -126,7 +126,8 @@ def test_special_characters():
 
 
 def test_cell_mark_ends_a_paragraph():
-    # Task 11 reads tables; until then each cell is a paragraph and no control character reaches the output
+    # without sprmPFInTable a cell mark ends a plain paragraph (tables: test_reader_doc_tables) and no control
+    # character reaches the output
     assert md(doc_file([("a\x07b\x07\x07c\r", False)])) == "a\n\nb\n\nc\n"
 
 

@@ -384,6 +384,56 @@ def doc_stsh(styles, base=18):
     return bytes(out)
 
 
+def _doc_lvl(level):
+    """One LVL from (nfc, text[, start[, papx, chpx]]): the 28-byte LVLF (iStartAt, nfc, rgbxchNums,
+    cbGrpprlChpx at 24, cbGrpprlPapx at 25), grpprlPapx, grpprlChpx, then the number text xst (u16 count, UTF-16).
+    "%N" (N 1-9) in text is a placeholder for level N's number: the unit N - 1, its 1-based offset in rgbxchNums."""
+    import struct
+    nfc, text, *rest = level
+    start = rest[0] if rest else 1
+    papx, chpx = (bytes(rest[1]), bytes(rest[2])) if len(rest) > 2 else (b"", b"")
+    units, nums, i = bytearray(), [], 0
+    while i < len(text):
+        if text[i] == "%" and text[i + 1:i + 2] in tuple("123456789"):
+            units += struct.pack("<H", int(text[i + 1]) - 1)
+            nums.append(len(units) // 2)
+            i += 2
+        else:
+            units += text[i].encode("utf-16-le")
+            i += 1
+    lvlf = struct.pack("<iBB9sBiiBBBB", start, nfc, 0, bytes(nums[:9]), 0, 0, 0, len(chpx), len(papx), 0, 0)
+    return lvlf + papx + chpx + struct.pack("<H", len(units) // 2) + bytes(units)
+
+
+def doc_lists(lists, lfos=()):
+    """FibRgFcLcb97 entries 73 (PlfLst) and 74 (PlfLfo) for make_doc's `fc`, each as (data, trailing): the LVLs
+    follow the PlfLst past its lcb, and the LFOData follow the LFOs.
+
+    `lists` are (lsid, levels): one level makes an fSimpleList; more are padded to nine with decimal "%N." levels.
+    A level is _doc_lvl's (nfc, text[, start[, papx, chpx]]). `lfos` are (lsid, overrides), ilfo k + 1 being lfos[k];
+    an override is (ilvl, start) for a start-at override (LFOLVL fStartAt), or (ilvl, start, level) for an LVL that
+    replaces the level (fFormatting; fStartAt too unless start is None). Each LFOData has cp 0xFFFFFFFF.
+    """
+    import struct
+    head, lvls = bytearray(struct.pack("<h", len(lists))), bytearray()
+    for lsid, levels in lists:
+        levels = list(levels)
+        simple = len(levels) == 1
+        if not simple:
+            levels += [(0, f"%{k + 1}.") for k in range(len(levels), 9)]
+        head += struct.pack("<iI9HBB", lsid, 0, *([0x0FFF] * 9), 1 if simple else 0, 0)
+        lvls += b"".join(_doc_lvl(lv) for lv in levels)
+    lfo, data = bytearray(struct.pack("<I", len(lfos))), bytearray()
+    for lsid, overrides in lfos:
+        lfo += struct.pack("<iIIBBBB", lsid, 0, 0, len(overrides), 0, 0, 0)
+        data += struct.pack("<I", 0xFFFFFFFF)
+        for ov in overrides:
+            ilvl, start, level = (*ov, None) if len(ov) == 2 else ov
+            bits = ilvl | (0x10 if start is not None else 0) | (0x20 if level is not None else 0)
+            data += struct.pack("<iI", start or 0, bits) + (_doc_lvl(level) if level is not None else b"")
+    return {73: (bytes(head), bytes(lvls)), 74: (bytes(lfo), bytes(data))}
+
+
 def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, fc=None, word_extra=b"",
              streams=None, lid_fe=None, chpx=None, papx=None):
     """Write a Word 97 .doc compound file.
@@ -393,8 +443,9 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
     then the text of `pieces`, (text, compressed) in CP order: compressed text is one CP a byte, in the code page of
     the document's language (lidFE when flags has fFarEast 0x4000 and lidFE is set, else `lid`) when that code page is
     single-byte, else cp1252; the rest is UTF-16LE from an even offset. The table stream (1Table when flags has
-    0x0200, else 0Table) holds each `fc` entry (FibRgFcLcb97 index -> bytes) in index order with its (fc, lcb) set in
-    the FIB, then the Clx (one Pcdt, no Prc) at index 33 unless `fc` gives it. `ccp` sets story lengths by DOC_STORIES
+    0x0200, else 0Table) holds each `fc` entry (FibRgFcLcb97 index -> bytes, or (data, trailing): lcb covers data and
+    trailing follows it, as the LVLs follow a PlfLst) in index order with its (fc, lcb) set in the FIB, then the Clx
+    (one Pcdt, no Prc) at index 33 unless `fc` gives it. `ccp` sets story lengths by DOC_STORIES
     name; "text" takes the CPs the others leave. `streams` adds streams and replaces a built one of the same name.
     `chpx` and `papx` are (cp0, cp1, bytes) spans in CPs, a CHPX grpprl or a PAPX (istd u16 + grpprl): they are mapped
     to FCs through the piece table at index 33 (built or given), written as FKP pages after the text, from the next
@@ -432,7 +483,8 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
     pages = b""
     if chpx or papx:
         first = -(-(DOC_EXTRA + len(body)) // 512)  # the page number of the first FKP
-        pcd = _doc_pcds(bytes(entries[33]))
+        clx = entries[33]
+        pcd = _doc_pcds(bytes(clx[0] if isinstance(clx, tuple) else clx))
         for index, spans in ((12, chpx), (13, papx)):
             if spans and index not in entries:
                 blob, bte = _doc_fkp(spans, pcd, index == 13, first + len(pages) // 512)
@@ -442,9 +494,9 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
             pages = bytes(first * 512 - DOC_EXTRA - len(body)) + pages
     pairs, table = [(0, 0)] * 93, bytearray()
     for i in sorted(entries):
-        data = bytes(entries[i])
+        data, trailing = entries[i] if isinstance(entries[i], tuple) else (entries[i], b"")
         pairs[i] = (len(table), len(data))
-        table += data
+        table += bytes(data) + bytes(trailing)
     rgw = [0] * 14
     rgw[13] = fe
     rglw = [0] * 22

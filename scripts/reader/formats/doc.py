@@ -15,6 +15,13 @@ segments of constant character properties: st.run is the segment's RunProps, so 
 the properties of their own CP. A paragraph's properties are its mark's: the PAPX whose FC range holds the mark's FC.
 Bold text is Bold; vanished and deleted text are Hidden(..., "hidden") and Hidden(..., "deleted"), the shapes the docx
 reader gives w:vanish runs and w:del. Damaged formatting is counted under styles and never costs text.
+
+A paragraph in a list (sprmPIlfo) is a ListItem with doc_fib.Lists' marker, as the docx reader makes w:numPr ones.
+Paragraphs with a table depth (sprmPFInTable, sprmPItap) are grouped into tables as their marks come (MS-DOC
+"Overview of Tables", logic after dochan doc_tables.py): at depth 1 a cell ends at \\x07 and a row at its TTP mark; a
+nested table's cells and rows end at marks with sprmPFInnerTableCell and sprmPFInnerTtp. The row mark's TDefTable
+puts the cells on the grid of all the table's boundaries and gives the merges, the colspan and rowspan the docx
+reader gives w:gridSpan and w:vMerge.
 """
 import re
 import struct
@@ -23,7 +30,7 @@ from bisect import bisect_right
 from .. import limits
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
-from ..model import Bold, Break, Doc, Heading, Hidden, Link, Para, Text
+from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Link, ListItem, Para, Table, Text
 from . import doc_fib, ooxml
 from .word_fields import MAX_INSTR, hyperlink_url
 
@@ -69,17 +76,94 @@ class _Field:
         self.instr, self.size, self.result, self.frame = [], 0, False, None
 
 
+class _Table:
+    """A table being grouped: its rows so far as (cells, the row mark's TDefTable operand or None), a cell being its
+    blocks, then the cells of the open row and the blocks of the open cell."""
+
+    def __init__(self):
+        self.rows, self.cells, self.cell = [], [], []
+
+    def end_cell(self):
+        self.cells.append(self.cell)
+        self.cell = []
+
+    def end_row(self, tdef):
+        """A row mark: blocks after the last cell mark make one more cell (the row mark's own text, in a damaged
+        file); a row without cells is left out."""
+        if self.cell:
+            self.end_cell()
+        if self.cells:
+            self.rows.append((self.cells, tdef))
+        self.cells = []
+
+    def finish(self) -> list:
+        """The rows, cells after the last row mark making one more row without a TDefTable."""
+        self.end_row(None)
+        return self.rows
+
+
+def _table(rows) -> tuple[Table | None, int]:
+    """Rows of (cells, TDefTable operand or None) as a Table, and how many operands were damaged (doc_fib.table_def
+    None). The cells sit on the grid of every row's boundaries (their union, as Word's own tblGrid): a cell spans the
+    grid columns between its two boundaries, a row starting right of the grid's left edge starts with an empty cell
+    over the gap, and a row without a usable TDefTable has a column a cell, as do cells past those it defines. Then the
+    TCGRF merges (MS-DOC 2.9.328): horzMerge 2 or 3 starts a set the next cells with horzMerge 1 join; vertMerge 3
+    (bit 0x40) starts one that the cell over the same grid columns in each next row with vertMerge 1 joins. A joined
+    cell is left out and its blocks go to the set's first cell, which takes its colspan or one more rowspan. O(cells +
+    boundaries log boundaries); the spans go through the renderer's GRID_COLS and GRID_SLOTS budgets."""
+    defs, bad = [], 0
+    for _, arg in rows:
+        d = doc_fib.table_def(arg) if arg is not None else None
+        bad += arg is not None and d is None
+        defs.append(d)
+    col_of = {e: i for i, e in enumerate(sorted({e for d in defs if d for e in d[0]}))}
+    out, above = [], {}
+    for (cells, _), d in zip(rows, defs):
+        bounds, grf = d or ((), ())
+        col = col_of[bounds[0]] if bounds else 0
+        row = [Cell([], colspan=col)] if col else []
+        sets = []  # [col, span, TCGRF, blocks, open to horzMerge 1] once the horizontal merges are made
+        for k, blocks in enumerate(cells):
+            span = col_of[bounds[k + 1]] - col_of[bounds[k]] if k + 1 < len(bounds) else 1
+            g = grf[k] if k < len(grf) else 0
+            if (g & 3) == 1 and sets and sets[-1][4]:
+                sets[-1][1] += span
+                sets[-1][3].extend(blocks)
+            else:
+                sets.append([col, span, g, blocks, bool(g & 2)])
+            col += span
+        below = {}
+        for c, span, g, blocks, _ in sets:
+            key = (c, span)
+            if (g & 0x60) == 0x20 and key in above:
+                origin = below[key] = above[key]
+                origin.rowspan += 1
+                origin.blocks.extend(blocks)
+                continue
+            cell = Cell(blocks, colspan=span)
+            row.append(cell)
+            if g & 0x40:
+                below[key] = cell
+        above = below
+        out.append(row)
+    return (Table(out) if out else None), bad
+
+
 class _State:
     """A story being walked: its name, its blocks so far, and the open paragraph's inline scopes and fields. Fields
     live with the paragraph: one still open at a paragraph mark ends there, so a broken field costs one paragraph.
     run and seg are the properties and the CHPX run of the segment being walked; hid is the Hidden last opened, which
-    the rest of its segment (or of a deletion) joins while it is still the last inline of its scope."""
+    the rest of its segment (or of a deletion) joins while it is still the last inline of its scope. tables are the
+    tables open around the paragraph, outermost first (tables[k] at depth k + 1); overflow is set while paragraphs nest
+    past MAX_DEPTH, so one overflowing subtree is counted once."""
 
     def __init__(self, name, story=None):
         self.name = name
         self.story = story  # the doc_fib.Story walked: CP <-> text index
         self.out = []
         self.run, self.seg = _PLAIN, -1
+        self.tables: list[_Table] = []
+        self.overflow = False
         self.reset()
 
     def reset(self):
@@ -92,8 +176,8 @@ class _State:
 
 class _Reader:
     # a control character -> its handler (st, cp), cp being the character's CP; one not listed is dropped. Tasks
-    # 10-13 give \x01 (picture), \x02 (note reference), \x05 (comment reference) and \x08 (drawn object) handlers, and
-    # Task 11 gives \x07 (cell mark) its own; until then a cell is a paragraph.
+    # 12-14 give \x01 (picture), \x02 (note reference), \x05 (comment reference) and \x08 (drawn object) handlers. A
+    # cell or row mark (\x07) ends its paragraph too; place() gives it its table meaning.
     SPECIAL: dict[str, str] = {
         "\r": "para_end", "\x07": "para_end", "\x0c": "para_end",
         "\x0a": "line_break", "\x0b": "line_break",
@@ -112,6 +196,7 @@ class _Reader:
         self.ranges = {}   # story name -> (cp0, cp1), clamped to the CPs the pieces hold
         self.on = {ch: getattr(self, name) for ch, name in self.SPECIAL.items()}
         self.styles = doc_fib.Styles()
+        self.lists = doc_fib.Lists()
         self.prc = []                # the Clx Prc grpprls a Prm1 indexes
         self.chp, self.chp_at = [], []  # (cp0, cp1, CHPX grpprl, prm) in CP order, and their cp0s
         self.pap, self.pap_at = [], []  # (cp0, cp1, PAPX, prm) in CP order, and their cp0s
@@ -167,10 +252,15 @@ class _Reader:
         return self.table[fc:fc + lcb]
 
     def props(self):
-        """The style sheet, the Prc list and the CHPX and PAPX runs by CP. Each is read under guard("styles"): a
-        damaged one leaves its default (no styles, no runs) and costs formatting only."""
+        """The style sheet, the lists, the Prc list and the CHPX and PAPX runs by CP. Each is read under
+        guard("styles") (the lists under guard("numbering")): a damaged one leaves its default (no styles, no lists, no
+        runs) and costs formatting only."""
         with self.ctx.guard("styles"):
             self.styles = doc_fib.Styles(self.plc(doc_fib.STSH))
+        with self.ctx.guard("numbering"):
+            self.lists = doc_fib.Lists(self.table, self.fib.pair(doc_fib.PLF_LST), self.fib.pair(doc_fib.PLF_LFO))
+        if self.lists.bad:
+            self.ctx.skipped["numbering"] += self.lists.bad
         with self.ctx.guard("styles"):
             self.prc = doc_fib.prcs(self.table, *self.fib.pair(doc_fib.CLX))
         with self.ctx.guard("styles"):
@@ -384,19 +474,83 @@ class _Reader:
         """A control character with no meaning here."""
 
     def para_end(self, st, cp, last=False):
-        """A paragraph mark, a cell mark or a page or section break: the open paragraph becomes a block, a Heading
-        when its style is a built-in heading or its outline level is 0-8 and it shows text, else a Para. A deleted
-        paragraph mark (\\r) joins its paragraph to the next one. `last` ends a story's last paragraph, whose
-        properties are those of its last character's paragraph mark."""
-        if not last and st.run.deleted and st.story.text[st.story.index_of(cp)] == "\r":
+        """A paragraph mark, a cell or row mark or a page or section break: the open paragraph becomes a block (see
+        block()) that place() puts in the story or in a table cell. A deleted paragraph mark (\\r) joins its
+        paragraph to the next one. `last` ends a story's last paragraph, whose properties are those of its last
+        character's paragraph mark, and closes the tables still open."""
+        story = st.story
+        mark = "" if last else story.text[story.index_of(cp)]
+        if mark == "\r" and st.run.deleted:
             return
         self.close_to(st, 1)
         inl = st.frames[0].inl
-        if inl:
+        if not (last and not inl):
             p = self.para_props(cp - 1 if last else cp)
-            level = self.styles.heading(p.istd) or (p.outline + 1 if p.outline < 9 else 0)
-            st.out.append(Heading(level, inl) if level and _shown(inl) else Para(inl))
-        st.reset()
+            block = self.block(p, inl)
+            st.reset()
+            self.place(st, p, mark, block)
+        if last:
+            self.close_tables(st, 0)
+
+    def block(self, p, inl):
+        """A paragraph of properties p as a block: a Heading when its style is a built-in heading or its outline level
+        is 0-8 and it shows text (a list number before its text), a ListItem when it is in a list, else a Para; None
+        when it has no inlines. The list marker is taken even then, as Word numbers an empty list paragraph."""
+        mark = self.lists.marker(p.ilfo, p.ilvl) if p.ilfo else None
+        if not inl:
+            return None
+        level = self.styles.heading(p.istd) or (p.outline + 1 if p.outline < 9 else 0)
+        if level and _shown(inl):
+            if mark and mark != "-":
+                inl.insert(0, Text(mark + " "))
+            return Heading(level, inl)
+        if mark:
+            return ListItem(min(p.ilvl, doc_fib.LEVELS - 1), mark, inl)
+        return Para(inl)
+
+    def place(self, st, p, mark, block):
+        """A paragraph's block into the story, or into the open cell of the table its depth puts it in: max(itap, 1)
+        with sprmPFInTable, else 0. The tables deeper than that close and the missing ones open. At depth 1 a \\x07
+        ends the cell and, with sprmPFTtp, the row (its TDefTable defining the row's cells); deeper, a mark with
+        sprmPFInnerTableCell ends the cell and one with sprmPFInnerTtp the row. Past MAX_DEPTH the paragraph stays a
+        paragraph of the innermost open cell, its marks ending nothing, and each overflowing subtree is counted once
+        under depth. A \\x07 outside a table ends a paragraph only. O(1) a paragraph past the tables it opens."""
+        depth = max(p.itap, 1) if p.in_table else 0
+        tables = st.tables
+        if depth > limits.MAX_DEPTH:
+            if not st.overflow:
+                st.overflow = True
+                self.deep()
+            depth = max(len(tables), 1)
+            row_end = cell_end = False
+        else:
+            st.overflow = False
+            row_end = p.ttp or (depth > 1 and p.inner_row)
+            cell_end = mark == "\x07" or (depth > 1 and p.inner_cell)
+        self.close_tables(st, depth)
+        if not depth:
+            if block is not None:
+                st.out.append(block)
+            return
+        while len(tables) < depth:
+            tables.append(_Table())
+        t = tables[-1]
+        if block is not None:
+            t.cell.append(block)
+        if row_end:
+            t.end_row(p.tdef)
+        elif cell_end:
+            t.end_cell()
+
+    def close_tables(self, st, depth):
+        """Close the tables deeper than `depth`, innermost first: each goes into the open cell of the table around it,
+        the outermost into the story. Damaged TDefTable operands are counted under styles."""
+        while len(st.tables) > depth:
+            table, bad = _table(st.tables.pop().finish())
+            if bad:
+                self.ctx.skipped["styles"] += bad
+            if table is not None:
+                (st.tables[-1].cell if st.tables else st.out).append(table)
 
     def line_break(self, st, cp):
         if self.live(st):

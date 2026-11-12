@@ -1,11 +1,13 @@
-"""Word 97-2003 binary structures: the FIB, the piece table, the text of a story's CP range, and the formatting:
-sprms, CHPX and PAPX FKPs, piece Prms and the style sheet.
+"""Word 97-2003 binary structures: the FIB, the piece table, the text of a story's CP range, the formatting (sprms,
+CHPX and PAPX FKPs, piece Prms and the style sheet), a table row's TDefTable, and the lists with their numbers.
 
 Written from MS-DOC (2.5.1 Fib, 2.9.38 Clx, 2.9.177 PlcPcd, 2.9.73 FcCompressed, 2.4.1 retrieving text, 2.2.5 Sprm
-and Prm, 2.9.33/2.9.175 ChpxFkp/PapxFkp, 2.9.271 STSH, 2.4.6 applying properties); logic follows dochan
+and Prm, 2.9.33/2.9.175 ChpxFkp/PapxFkp, 2.9.271 STSH, 2.4.6 applying properties, TDefTableOperand and TCGRF, PlfLst,
+LVL, PlfLfo and LFOData, determining the level number of a paragraph); logic follows dochan
 office_binary/doc_binary.py (FIB walk, Clx, piece CPs, cumulative story ranges, decode_grpprl operand sizes, _fkps,
-_read_styles) and anydoc formats/doc (Prm0 isprm table, STD walk, toggles against the style's value). Every count
-and offset is checked against the stream it is read from.
+_read_styles) and doc_tables.py (the TDefTable checks), and anydoc formats/doc (Prm0 isprm table, STD walk, toggles
+against the style's value; lists.rs: the PlfLst and PlfLfo walk, numbers shared per lsid). Every count and offset is
+checked against the stream it is read from.
 
 FibRgFcLcb97 indices this reader uses (MS-DOC 2.5.6; dochan reads all but 73/74 at these indices, anydoc reads 1,
 2/3, 12/13, 33, 46/47 and 73/74 at the matching absolute offsets): 1 STSH, 2/3 PlcffndRef/Txt, 4/5
@@ -18,6 +20,7 @@ from dataclasses import dataclass, replace
 
 from ..limits import ReadError
 from ..text import codepage
+from .hancom import number
 
 CLX = 33  # the FibRgFcLcb97 index of the Clx
 STSH, BTE_CHPX, BTE_PAPX = 1, 12, 13  # FibRgFcLcb97 indices of the style sheet and the two PlcBte
@@ -454,60 +457,60 @@ def _toggle(arg: bytes, now: bool, style: bool) -> bool:
     return False if v == 0 else True if v == 1 else style if v == 0x80 else (not style) if v == 0x81 else now
 
 
+def _u8(arg: bytes) -> int:
+    return arg[0]
+
+
+def _flag(arg: bytes) -> bool:
+    return arg[0] != 0
+
+
+def _uint(arg: bytes) -> int:
+    return int.from_bytes(arg, "little")
+
+
+def _depth(arg: bytes) -> int:
+    return max(0, int.from_bytes(arg, "little", signed=True))
+
+
+# The sprms the reader handles, each table the only place its handler looks an op up, so _READ (what last_sprms
+# keeps) is derived from them and cannot drift: a character toggle (ToggleOperand) -> its RunProps field; a
+# character value (u32) -> its field; a paragraph sprm -> (its ParaProps field, operand -> value).
+RUN_TOGGLES = {0x0835: "bold", 0x083C: "vanish", 0x0800: "deleted", 0x0855: "special", 0x080A: "ole"}
+RUN_VALUES = {0x6A03: "pic", 0x680E: "obj"}
+PARA_SPRMS = {0x2640: ("outline", _u8), 0x2416: ("in_table", _flag), 0x2417: ("ttp", _flag),
+              0x244B: ("inner_cell", _flag), 0x244C: ("inner_row", _flag), 0x6649: ("itap", _depth),
+              0x260A: ("ilvl", _u8), 0x460B: ("ilfo", _uint), 0xD608: ("tdef", bytes)}
+
+
 def _apply_run(props: RunProps, ops, style: RunProps) -> RunProps:
     """props with the character sprms `ops` applied, toggles against `style`."""
-    bold, vanish, deleted, special = props.bold, props.vanish, props.deleted, props.special
-    pic, ole, obj = props.pic, props.ole, props.obj
+    p = replace(props)
     for op, arg in ops:
-        if op == 0x0835:
-            bold = _toggle(arg, bold, style.bold)
-        elif op == 0x083C:
-            vanish = _toggle(arg, vanish, style.vanish)
-        elif op == 0x0800:
-            deleted = _toggle(arg, deleted, style.deleted)
-        elif op == 0x0855:
-            special = _toggle(arg, special, style.special)
-        elif op == 0x080A:
-            ole = _toggle(arg, ole, style.ole)
-        elif op == 0x6A03:
-            pic = int.from_bytes(arg, "little")
-        elif op == 0x680E:
-            obj = int.from_bytes(arg, "little")
-    return RunProps(bold, vanish, deleted, special, pic, ole, obj)
+        name = RUN_TOGGLES.get(op)
+        if name is not None:
+            setattr(p, name, _toggle(arg, getattr(p, name), getattr(style, name)))
+        elif op in RUN_VALUES:
+            setattr(p, RUN_VALUES[op], _uint(arg))
+    return p
 
 
 def _apply_para(props: ParaProps, ops) -> ParaProps:
     """props with the paragraph sprms `ops` applied; sprmPIstd and sprmPHugePapx are the caller's."""
     p = replace(props)
     for op, arg in ops:
-        if op == 0x2640:
-            p.outline = arg[0]
-        elif op == 0x2416:
-            p.in_table = arg[0] != 0
-        elif op == 0x2417:
-            p.ttp = arg[0] != 0
-        elif op == 0x244B:
-            p.inner_cell = arg[0] != 0
-        elif op == 0x244C:
-            p.inner_row = arg[0] != 0
-        elif op == 0x6649:
-            p.itap = max(0, int.from_bytes(arg, "little", signed=True))
-        elif op == 0x260A:
-            p.ilvl = arg[0]
-        elif op == 0x460B:
-            p.ilfo = int.from_bytes(arg, "little")
-        elif op == 0xD608:
-            p.tdef = arg
+        h = PARA_SPRMS.get(op)
+        if h is not None:
+            setattr(p, h[0], h[1](arg))
     return p
 
 
 ISTD_NIL = 0x0FFF   # no base style
 STYLE_DEPTH = 32    # istdBase links one style chain may follow
-_CHAR_ISTD, _PARA_ISTD = 0x4A30, 0x4600  # sprmCIstd (character style), sprmPIstd (paragraph style)
-_TOGGLES = frozenset((0x0835, 0x083C, 0x0800, 0x0855, 0x080A))
-# every sprm _apply_run, _apply_para and Styles read; one they come to read must be added here, or last_sprms drops it
-_READ = _TOGGLES | frozenset((0x6A03, 0x680E, _CHAR_ISTD, _PARA_ISTD, 0x2640, 0x2416, 0x2417, 0x244B, 0x244C,
-                              0x6649, 0x260A, 0x460B, 0xD608, 0x6646))
+_CHAR_ISTD, _PARA_ISTD = 0x4A30, 0x4600  # sprmCIstd (character style), sprmPIstd (paragraph style): Styles reads them
+_HUGE_PAPX = 0x6646  # sprmPHugePapx: doc.py replaces it by the grpprl it points at
+_TOGGLES = frozenset(RUN_TOGGLES)
+_READ = _TOGGLES | frozenset(RUN_VALUES) | frozenset(PARA_SPRMS) | {_CHAR_ISTD, _PARA_ISTD, _HUGE_PAPX}
 
 
 def last_sprms(ops: list) -> list:
@@ -664,3 +667,202 @@ class Styles:
             base.istd = istd
             self._paras[istd] = base
         return _apply_para(base, ops) if ops else base
+
+
+# ---- tables: the TDefTable operand
+TC80 = 20  # bytes of one TC80 cell definition; its first u16 is the TCGRF (MS-DOC 2.9.328)
+MAX_CELLS = 63  # cells one row may define
+
+
+def table_def(arg: bytes) -> tuple[list[int], list[int]] | None:
+    """A sprmTDefTable operand after its cb (MS-DOC 2.9.307 TDefTableOperand): itcMac u8, itcMac + 1 i16 cell
+    boundaries (rgdxaCenter), then up to itcMac 20-byte TC80s. Returns the boundaries and each cell's TCGRF, 0 for a
+    cell whose TC80 the operand does not hold whole; None when itcMac is 0 or past 63, or the boundaries do not fit
+    the operand or do not increase."""
+    if not arg:
+        return None
+    k = arg[0]
+    head = 1 + 2 * (k + 1)
+    if not 0 < k <= MAX_CELLS or len(arg) < head:
+        return None
+    edges = list(struct.unpack_from("<%dh" % (k + 1), arg, 1))
+    if any(a >= b for a, b in zip(edges, edges[1:])):
+        return None
+    have = min(k, (len(arg) - head) // TC80)
+    return edges, [struct.unpack_from("<H", arg, head + TC80 * i)[0] for i in range(have)] + [0] * (k - have)
+
+
+# ---- lists: PlfLst, its LVLs, PlfLfo and its LFOData
+PLF_LST, PLF_LFO = 73, 74  # FibRgFcLcb97 indices of the list definitions and of their overrides
+LEVELS = 9
+MAX_MARKER = 64  # characters of one marker
+_LSTF, _LVLF, _LFO, _LFOLVL = 28, 28, 16, 8  # fixed sizes of an LSTF, LVLF, LFO and LFOLVL
+_XST = 256       # number-text units read: rgbxchNums offsets are u8, and a marker is cut to MAX_MARKER anyway
+_BULLET, _NO_NUMBER = 23, 255  # nfc of a bullet level (its number text is the bullet) and of a level without one
+_SUPPRESSED = 0xF801  # an ilfo that takes the paragraph out of its style's list
+_NFC = {0: "DIGIT", 1: "ROMAN_CAPITAL", 2: "ROMAN_SMALL", 3: "LATIN_CAPITAL", 4: "LATIN_SMALL"}  # hancom.number
+
+
+@dataclass(slots=True)
+class Level:
+    """One list level: its iStartAt, nfc, and number text as literal str parts and placeholder level indices."""
+    start: int
+    nfc: int
+    text: tuple
+
+
+def _lvl(table: bytes, pos: int) -> tuple[Level, int, int] | None:
+    """The LVL at table[pos:] (MS-DOC 2.9.150): the 28-byte LVLF (iStartAt i32, nfc u8, flags, rgbxchNums 9 u8 at 6,
+    ixchFollow, dxaIndentSav, unused, cbGrpprlChpx u8 at 24, cbGrpprlPapx u8 at 25, ilvlRestartLim, grfhic), then
+    grpprlPapx and grpprlChpx, then the number text xst (u16 count, UTF-16 units). rgbxchNums are the 1-based offsets
+    of the placeholders in xst, zero-terminated unless all nine are used; a placeholder unit 0-8 is that level's
+    number. Returns the Level, where the LVL ends, and 1 when an offset points past xst (read as no placeholder), else
+    0; None when the LVL does not fit the stream. Control characters in the number text are left out."""
+    n = len(table)
+    if pos + _LVLF + 2 > n:
+        return None
+    start, nfc = struct.unpack_from("<iB", table, pos)
+    nums = table[pos + 6:pos + 15].split(b"\0", 1)[0]
+    at = pos + _LVLF + table[pos + 24] + table[pos + 25]
+    if at + 2 > n:
+        return None
+    cch = struct.unpack_from("<H", table, at)[0]
+    end = at + 2 + 2 * cch
+    if end > n:
+        return None
+    places = {k - 1 for k in nums}
+    parts, lit = [], []
+    for i, ch in enumerate(_units(table[at + 2:at + 2 + 2 * min(cch, _XST)])):
+        if i in places and ord(ch) < LEVELS:
+            if lit:
+                parts.append("".join(lit))
+                lit = []
+            parts.append(ord(ch))
+        elif ch >= " ":
+            lit.append(ch)
+    if lit:
+        parts.append("".join(lit))
+    text = tuple(p.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace") if isinstance(p, str) else p
+                 for p in parts)
+    return Level(start, nfc, text), end, int(any(k > cch for k in nums))
+
+
+class Lists:
+    """The list definitions (PlfLst, MS-DOC 2.9.191: cLst i16, then 28-byte LSTFs, lsid i32 and fSimpleList bit 0 of
+    byte 26; each list's LVLs, one for a simple list else nine, follow the PlfLst past its lcb) and their overrides
+    (PlfLfo 2.9.183: lfoMac u32, 16-byte LFOs, lsid i32 and clfolvl u8 at 12; then an LFOData for each LFO, cp u32
+    and clfolvl 8-byte LFOLVLs, iStartAt i32 then iLvl bits 0-3, fStartAt 0x10 and fFormatting 0x20, an LVL following
+    when fFormatting is set). The LSTF count is bounded by the PlfLst's lcb, the LFO count and the LFOData by the
+    table stream, and every LVL walk moves on; what does not fit is left out and counted in `bad`, which the caller
+    adds to ctx.skipped["numbering"]. Logic follows anydoc formats/doc/lists.rs (numbers shared per lsid, start-at
+    overrides on first use) and MS-DOC "Determining Level Number of a Paragraph"."""
+
+    def __init__(self, table: bytes = b"", plf_lst: tuple[int, int] = (0, 0), plf_lfo: tuple[int, int] = (0, 0)):
+        self.bad = 0
+        self.lists: dict[int, list[Level]] = {}       # lsid -> its levels
+        self.lfos: list[tuple[int, dict, dict]] = []  # ilfo - 1 -> (lsid, {ilvl: start-at}, {ilvl: Level})
+        self.counters: dict[int, dict[int, int]] = {}  # lsid -> {ilvl: the number last given}, nine at most
+        self.used: set[tuple[int, int]] = set()      # (ilfo, ilvl) whose start-at override has applied
+        if plf_lst[1]:
+            self._read_lists(table, *plf_lst)
+        if plf_lfo[1]:
+            self._read_lfos(table, *plf_lfo)
+
+    def _read_lists(self, table, fc, lcb):
+        n = len(table)
+        if lcb < 2 or fc + lcb > n:
+            self.bad += 1
+            return
+        clst = struct.unpack_from("<h", table, fc)[0]
+        k = min(max(clst, 0), (lcb - 2) // _LSTF)
+        if k != clst:
+            self.bad += 1
+        heads = [(struct.unpack_from("<i", table, at)[0], table[at + 26] & 1)
+                 for at in range(fc + 2, fc + 2 + _LSTF * k, _LSTF)]
+        pos = fc + lcb
+        for lsid, simple in heads:
+            levels = []
+            for _ in range(1 if simple else LEVELS):
+                got = _lvl(table, pos)
+                if got is None:  # the LVLs after this one cannot be found
+                    self.bad += 1
+                    return
+                level, pos, off = got
+                self.bad += off
+                levels.append(level)
+            self.lists.setdefault(lsid, levels)
+
+    def _read_lfos(self, table, fc, lcb):
+        n = len(table)
+        if lcb < 4 or fc + lcb > n:
+            self.bad += 1
+            return
+        mac = struct.unpack_from("<I", table, fc)[0]
+        k = min(mac, (n - fc - 4) // _LFO)
+        if k < mac:
+            self.bad += 1
+        heads = [(struct.unpack_from("<i", table, at)[0], table[at + 12])
+                 for at in range(fc + 4, fc + 4 + _LFO * k, _LFO)]
+        pos, ok = fc + 4 + _LFO * k, True
+        for lsid, count in heads:
+            starts, formats = {}, {}
+            if ok and pos + 4 > n:
+                ok = False
+                self.bad += 1
+            if ok:
+                pos += 4  # cp: where the list's first paragraph is, or 0xFFFFFFFF
+                for _ in range(count):
+                    if pos + _LFOLVL > n:
+                        ok = False
+                        self.bad += 1
+                        break
+                    at, bits = struct.unpack_from("<iI", table, pos)
+                    pos += _LFOLVL
+                    ilvl = bits & 0xF
+                    if bits & 0x20:
+                        got = _lvl(table, pos)
+                        if got is None:
+                            ok = False
+                            self.bad += 1
+                            break
+                        level, pos, off = got
+                        self.bad += off
+                        if ilvl < LEVELS:
+                            formats[ilvl] = level
+                    if bits & 0x10 and ilvl < LEVELS:
+                        starts[ilvl] = at
+            self.lfos.append((lsid, starts, formats))
+
+    def marker(self, ilfo: int, ilvl: int) -> str | None:
+        """The marker of the next paragraph in list `ilfo` (1-based into the LFOs; 0 is no list, 0xF801 suppressed)
+        at level `ilvl` (0-8, a larger one the last level; a simple list has level 0 only), its level being the LFO's
+        override LVL or the list's. The numbers are shared by every LFO naming the same lsid: the level's number goes
+        up by one from iStartAt, or is the LFO's start-at override the first time that LFO numbers the level, and the
+        deeper levels start again. A bullet level (nfc 23) is "-" and a level without numbers (nfc 255) "", neither
+        numbered; None when ilfo names no list read. At most MAX_MARKER characters."""
+        if ilfo == _SUPPRESSED or not 0 < ilfo <= len(self.lfos):
+            return None
+        lsid, starts, formats = self.lfos[ilfo - 1]
+        levels = self.lists.get(lsid)
+        if levels is None:
+            return None
+        ilvl = min(ilvl, len(levels) - 1)
+        level = formats.get(ilvl) or levels[ilvl]
+        cnt = self.counters.setdefault(lsid, {})
+        for k in [k for k in cnt if k > ilvl]:
+            del cnt[k]
+        if level.nfc in (_BULLET, _NO_NUMBER):
+            return "-" if level.nfc == _BULLET else ""
+        if ilvl in starts and (ilfo, ilvl) not in self.used:
+            self.used.add((ilfo, ilvl))
+            cnt[ilvl] = starts[ilvl]
+        else:
+            cnt[ilvl] = cnt.get(ilvl, level.start - 1) + 1
+        out = []
+        for part in level.text:
+            if isinstance(part, str):
+                out.append(part)
+            else:
+                lv = formats.get(part) or (levels[part] if part < len(levels) else level)
+                out.append(number(cnt.get(part, lv.start), _NFC.get(lv.nfc, "DIGIT")))
+        return "".join(out)[:MAX_MARKER].strip()
