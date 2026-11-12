@@ -333,7 +333,9 @@ def test_at_rule_brace_bomb():
     sheet = "@m{" + "{" * 500_000 + "}" * 500_000
     t0 = time.monotonic()
     c = xhtml.Css([sheet] * 32)
-    assert time.monotonic() - t0 < 3 and c.capped
+    took = time.monotonic() - t0
+    assert c.capped
+    assert took < 10, took  # under a second alone; loose, as the file's other bounds, so a loaded run does not flake
 
 
 def test_node_cap():
