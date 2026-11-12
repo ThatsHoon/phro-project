@@ -108,6 +108,21 @@ def test_inflate_garbage_is_not_a_readerror():
         pass
 
 
+def test_inflate_truncated_raises_with_prefix():
+    payload = bytes(range(256)) * 800
+    c = zlib.compressobj(level=0, wbits=-15)  # stored blocks: a cut leaves an exact prefix
+    packed = c.compress(payload) + c.flush()
+    for whole in (packed, zlib.compress(payload, 0)):
+        cut = whole[:len(whole) // 2]
+        try:
+            flate.inflate(cut, flate.Budget())
+            raise AssertionError("expected Truncated")
+        except flate.Truncated as e:
+            assert isinstance(e, ValueError) and not isinstance(e, ReadError)
+            assert 0 < len(e.data) < len(payload) and payload.startswith(e.data)
+    assert flate.inflate(packed, flate.Budget()) == payload
+
+
 def header_of(path):
     with Compound(path) as cf:
         return hr.file_header(cf)
@@ -194,6 +209,9 @@ def test_doc_info_numbering_and_bullet():
     assert n.kinds[0] == "DIGIT" and n.kinds[1] == "CIRCLED_DIGIT"
     assert n.starts == [1, 2, 3, 4, 5, 6, 7]
     assert info.bullets == ["●", "•"]
+    sur = hr.doc_info(hwp_record(hr.BULLET, 0, bytes(12) + u16(0xD800)), Context()).bullets
+    assert sur == ["□"]
+    sur[0].encode("utf-8")
     assert not ctx.skipped
 
 

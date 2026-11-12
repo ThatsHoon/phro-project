@@ -38,20 +38,34 @@ def _run(data: bytes, wbits: int, budget: Budget) -> bytes:
             buf = d.unconsumed_tail
             if d.eof or (not buf and len(chunk) < _CHUNK):
                 break
-    if not out and not d.eof:
-        raise ValueError("empty or truncated deflate stream")
-    budget.used += size
-    return b"".join(out)
+    return b"".join(out), d.eof
+
+
+class Truncated(ValueError):
+    """The stream ended before the deflate end-of-stream marker; `data` is what could be inflated."""
+
+    def __init__(self, data: bytes):
+        super().__init__(f"truncated deflate stream ({len(data)} bytes inflated)")
+        self.data = data
 
 
 def inflate(data: bytes, budget: Budget) -> bytes:
     """Raw deflate first, then the zlib wrapper. A too_large ReadError is final; a corrupt stream raises
-    ValueError so ctx.guard counts it."""
-    try:
-        return _run(data, -15, budget)
-    except zlib.error:
-        pass
-    try:
-        return _run(data, 15, budget)
-    except zlib.error as e:
-        raise ValueError(f"bad deflate stream: {e}")
+    ValueError and a cut one Truncated (a ValueError carrying the partial output), so ctx.guard counts either."""
+    best = None
+    error = None
+    for wbits in (-15, 15):
+        try:
+            out, complete = _run(data, wbits, budget)
+        except zlib.error as e:
+            error = e
+            continue
+        if complete:
+            budget.used += len(out)
+            return out
+        if best is None or len(out) > len(best):
+            best = out
+    if best is not None:
+        budget.used += len(best)
+        raise Truncated(best)
+    raise ValueError(f"bad deflate stream: {error}")

@@ -236,5 +236,6 @@ def doc_info(data: bytes, ctx) -> DocInfo:
                 info.bullets.append("•")
                 code = struct.unpack_from("<H", d, 12)[0]
                 if code:
-                    info.bullets[-1] = chr(code)
+                    # a lone surrogate cannot be written as UTF-8, so it becomes the replacement box
+                    info.bullets[-1] = "□" if 0xD800 <= code <= 0xDFFF else chr(code)
     return info
