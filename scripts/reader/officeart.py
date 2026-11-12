@@ -115,6 +115,22 @@ def blip(data, off: int, budget: flate.Budget) -> bytes | None:
     return _dib(raw) if kind == "dib" else raw
 
 
+def fbse_delay(data, off: int) -> int | None:
+    """The foDelay of the FBSE at `off` when its BLIP is delay-loaded: the FBSE is whole and in use (cRef > 0), and no
+    BLIP header fits after its name. None for any other block, which fbse_blip reads without a delay stream; a caller
+    reads the delay BLIP itself, so it can budget and memoize that read (fbse_blip's delay argument reads it each
+    call)."""
+    h = header(data, off)
+    if h is None or h[2] != FBSE or h[3] < 36 or off + 8 + h[3] > len(data):
+        return None
+    body, end = off + 8, off + 8 + h[3]
+    cref, at = struct.unpack_from("<II", data, body + 24)
+    pos = body + 36 + data[body + 33]
+    if not cref or pos > end or pos + 8 <= end or at == _NO_DELAY:
+        return None
+    return at
+
+
 def fbse_blip(data, off: int, delay, budget: flate.Budget) -> bytes | None:
     """The image of the BStore file block at `off`. An FBSE (0xF007) has a 36-byte head (cRef u32 at 24, foDelay u32
     at 28, cbName u8 at 33), the name, then the BLIP embedded; without one the BLIP is the one at delay[foDelay:]
@@ -160,46 +176,85 @@ def shape_pib(data, sp_off: int) -> int | None:
         return None
     for _, inst, typ, body, size in records(data, sp_off + 8, sp_off + 8 + h[3]):
         if typ == FOPT:
-            n = min(inst, size // 6)
-            for opid, op in struct.iter_unpack("<HI", data[body:body + 6 * n]):
-                if opid & 0x3FFF == _PIB and not opid & 0x8000:
-                    return op
+            return _fopt_pib(data, inst, body, size)
+    return None
+
+
+def _fopt_pib(data, inst: int, body: int, size: int) -> int | None:
+    """The pib of the FOPT whose body is data[body:body + size]: inst properties of 6 bytes (opid u16, op u32), as
+    many as fit; a complex one (fComplex) is not a pib."""
+    n = min(inst, size // 6)
+    for opid, op in struct.iter_unpack("<HI", data[body:body + 6 * n]):
+        if opid & 0x3FFF == _PIB and not opid & 0x8000:
+            return op
     return None
 
 
 class Shapes:
-    """The SpContainers of OfficeArt drawings by the spid of their FSP (0xF00A), the first one a spid names winning.
-    One walk over the records: containers (ver 0xF) are entered, an SpContainer's children read up to its FSP. A
-    container past limits.MAX_DEPTH is not entered and counted in `deep`; `cut` is set when the walks of this index
-    pass MAX_RECORDS records together. O(records)."""
+    """The shapes of OfficeArt drawings, one walk over their records (O(records)):
+
+    - `at`: spid -> the offset of the SpContainer whose FSP (0xF00A) names it, the first one winning;
+    - `pib`: SpContainer offset -> its pib (the first FOPT's 0x4104), for each shape with one that is not 0;
+    - `pics`: those pibs in record order;
+    - `groups`: the offset of each group shape (MS-ODRAW: the first SpContainer of an SpgrContainer) -> (i, j), its
+      members' pictures being pics[i:j], those of nested groups included.
+
+    Containers (ver 0xF) are entered; an SpContainer's own children are read, not entered. A container past
+    limits.MAX_DEPTH is not entered and counted in `deep`, its shapes left out of every group; `cut` is set when the
+    walks of this index pass MAX_RECORDS records together, the groups still open ending there."""
 
     def __init__(self):
         self.at: dict[int, int] = {}
+        self.pib: dict[int, int] = {}
+        self.pics: list[int] = []
+        self.groups: dict[int, tuple[int, int]] = {}
         self.deep = 0
         self.cut = False
         self._n = 0
 
     def add(self, data, start: int, end: int):
         """Index the records in data[start:end]."""
-        stack = [records(data, start, end)]
+        # a level: its walk, and for an SpgrContainer's walk its group shape's offset (-1 until that shape is met)
+        stack = [[records(data, start, end), None]]
         while stack:
-            rec = next(stack[-1], None)
+            level = stack[-1]
+            rec = next(level[0], None)
             if rec is None:
-                stack.pop()
+                self._close(stack.pop())
                 continue
             self._n += 1
             if self._n > MAX_RECORDS:
                 self.cut = True
-                return
+                break
             ver, _, typ, body, size = rec
             if typ == SP_CONTAINER:
-                for _, _, t, b, s in records(data, body, body + size):
-                    self._n += 1
-                    if t == FSP and s >= 4:
-                        self.at.setdefault(struct.unpack_from("<I", data, b)[0], body - 8)
-                        break
+                self._shape(data, body, size)
+                if level[1] == -1:
+                    level[1] = body - 8
+                    self.groups[body - 8] = (len(self.pics), len(self.pics))
             elif ver == 0xF:
                 if len(stack) >= limits.MAX_DEPTH:
                     self.deep += 1
                 else:
-                    stack.append(records(data, body, body + size))
+                    stack.append([records(data, body, body + size), -1 if typ == SPGR_CONTAINER else None])
+        while stack:
+            self._close(stack.pop())
+
+    def _close(self, level):
+        """An SpgrContainer's walk ends: its group's members are the pictures met since its group shape."""
+        if level[1] is not None and level[1] >= 0:
+            self.groups[level[1]] = (self.groups[level[1]][0], len(self.pics))
+
+    def _shape(self, data, body: int, size: int):
+        """The SpContainer whose body is data[body:body + size]: its first FSP's spid and its first FOPT's pib."""
+        spid = pib = None
+        for _, inst, t, b, s in records(data, body, body + size):
+            self._n += 1
+            if t == FSP and spid is None and s >= 4:
+                spid = struct.unpack_from("<I", data, b)[0]
+                self.at.setdefault(spid, body - 8)
+            elif t == FOPT and pib is None:
+                pib = _fopt_pib(data, inst, b, s) or 0
+                if pib:
+                    self.pib[body - 8] = pib
+                    self.pics.append(pib)

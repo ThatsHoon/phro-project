@@ -3,14 +3,13 @@ import re
 
 from .. import limits
 from ..containers.zipx import attr, kids, local
-from ..limits import ReadError
+from ..limits import IMAGE_BYTES, ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
 from . import ooxml_base
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
 from .word_fields import MAX_INSTR, MAX_URL, comment_note, hyperlink_url
 
-IMAGE_BYTES = 256 * 2**20  # image bytes one document may emit, copies counted
 CHART_CELLS = 200_000      # chart table cells one document may emit, copies counted
 MAX_COLS = 1_000
 MAX_ALT = 200

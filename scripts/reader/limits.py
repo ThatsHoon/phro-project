@@ -22,6 +22,7 @@ CFB_ENTRIES = 131_072     # directory entries
 CFB_DEPTH = 128           # storage nesting
 CFB_CHAIN = 4_000_000     # steps of one sector chain
 HWP_RECORDS = 1_000_000   # records of one HWP stream
+IMAGE_BYTES = 256 * 2**20  # image bytes one Word document (docx, doc) may emit, copies counted
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 # a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
 BIG_INPUT = "input"  # the file is over MAX_INPUT

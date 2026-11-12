@@ -16,10 +16,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown, officeart  # noqa: E402
 from reader.containers import flate  # noqa: E402
+from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import doc  # noqa: E402
 from reader.model import Cell, Context, Image, Para, Table, Text  # noqa: E402
 from reader_fix import (DOC_EXTRA, blip_bitmap, blip_metafile, blip_png, dgg_with_bstore, doc_spa,  # noqa: E402
-                        doc_stories, make_doc, oa_container, oa_fbse, oa_record, oa_shape, picf_inline)
+                        doc_stories, make_doc, oa_container, oa_fbse, oa_group, oa_record, oa_shape, picf_inline)
 
 SPEC, PIC, VANISH, DELETED, OLE = 0x0855, 0x6A03, 0x083C, 0x0800, 0x080A
 IN_TABLE, TTP = 0x2416, 0x2417
@@ -174,11 +175,63 @@ def test_textbox_anchor_not_counted():
     p = float_doc("a\x08\r", dgg_with_bstore([], shapes=[(1025, None)]))
     d, ctx = parse(p)
     assert md(p) == "a\n" and not ctx.skipped, ctx.skipped
-    # a \x08 with no FSPA at its CP, a shape no drawing holds, a \x08 without fSpec: no picture, no loss
-    for anchors, props in (([(5, 1025)], b""), ([(1, 4000)], b""), (None, sp(SPEC, 0))):
+    # a \x08 with no FSPA at its CP, a \x08 without fSpec: no picture, no loss
+    for anchors, props in (([(5, 1025)], b""), (None, sp(SPEC, 0))):
         p = float_doc("a\x08\r", dgg_with_bstore([blip_png(PNG)]), anchors=anchors, props=props)
         d, ctx = parse(p)
         assert md(p) == "a\n" and not ctx.skipped, (anchors, ctx.skipped)
+
+
+def test_unresolvable_anchor_counted():
+    """An FSPA whose spid no drawing holds is a lost shape, counted once an FSPA under shape; so is every FSPA of a
+    document with anchors and no DggInfo."""
+    got = md(float_doc("a\x08\r", dgg_with_bstore([blip_png(PNG)]), anchors=[(1, 4000)]))
+    assert got == "(could not read: 1 shape)\n\na\n", got
+    got = md(float_doc("a\x08\x08\r", b""))
+    assert got == "(could not read: 2 shapes)\n\na\n", got
+
+
+def test_inline_shape_without_picture_not_counted():
+    """Word keeps every inline drawing object (a horizontal rule, inline WordArt, an AutoShape) as an MM_SHAPE PICF:
+    an SpContainer with no FBSE after it and no pib (or pib 0) is no picture and no loss."""
+    for picf in (picf_inline(b""), picf_inline(b"", pib=0), picf_inline(b"", 0x66, name=b"x")):
+        d, ctx = parse(inline_doc(picf, "a\x01\r"))
+        assert d.blocks == [Para([Text("a")])] and not ctx.skipped, ctx.skipped
+    # still lost: a pib the BStore does not hold, and a PICF with no SpContainer at all
+    p = inline_doc(picf_inline(b"", pib=3), "a\x01\r", fc={50: dgg_with_bstore([blip_png(PNG)], shapes=[])})
+    assert md(p) == "(could not read: 1 image)\n\na\n", md(p)
+    bare = struct.pack("<IHH", 68, 0x44, 0x64).ljust(68, b"\0")
+    assert md(inline_doc(bare, "a\x01\r")) == "(could not read: 1 image)\n\na\n"
+
+
+def test_group_members_in_record_order():
+    """An anchor naming a group shows its members' pictures in record order, nested groups' too; a member without a
+    pib is skipped, one whose pib, BStore entry or BLIP fails is counted under image."""
+    png, jpeg = blip_png(PNG), blip_bitmap(0xF01D, 0x46A, JPEG)
+    group = oa_group(1025, oa_shape(1026, 2), oa_shape(1027), oa_group(1028, oa_shape(1029, 1)))
+    dgg = dgg_with_bstore([png, jpeg], shapes=[group])
+    d, ctx = parse(float_doc("a\x08\r", dgg))
+    assert d.blocks == [Para([Text("a")]), Image(JPEG), Image(PNG)] and not ctx.skipped, (d.blocks, ctx.skipped)
+    # a member anchored itself is that member's picture
+    d, ctx = parse(float_doc("a\x08\r", dgg, anchors=[(1, 1029)]))
+    assert d.blocks == [Para([Text("a")]), Image(PNG)] and not ctx.skipped, (d.blocks, ctx.skipped)
+    # one bad member: the other is shown, the bad one counted
+    group = oa_group(1025, oa_shape(1026, 1), oa_shape(1027, 9))
+    got = md(float_doc("a\x08\r", dgg_with_bstore([png], shapes=[group])))
+    assert got == "(could not read: 1 image)\n\na\n\n![](assets/img-001.png)\n", got
+
+
+def test_group_anchored_again_bounded():
+    """A group's members are placed once a member in all: anchors past that (no Word file has them) count the
+    group's pictures under image instead of placing them again, so n anchors cost n, not n x members."""
+    m, n = 400, 400
+    group = oa_group(1025, *(oa_shape(1026 + k, 1) for k in range(m)))
+    p = float_doc("\x08" * n + "\r", dgg_with_bstore([blip_png(PNG)], shapes=[group]),
+                  anchors=[(k, 1025) for k in range(n)], chpx=[(0, n, sp(SPEC))])
+    t0 = time.monotonic()
+    d, ctx = parse(p)
+    assert len(d.blocks) == m and ctx.skipped == {"image": (n - 1) * m}, (len(d.blocks), ctx.skipped)
+    assert time.monotonic() - t0 < 10
 
 
 def test_pib_out_of_range_counted():
@@ -192,19 +245,29 @@ def test_pib_out_of_range_counted():
         assert md(float_doc("a\x08\r", dgg)) == "(could not read: 1 image)\n\na\n"
 
 
-def test_header_anchor_relative_to_header_story():
-    """PlcSpaHdr CPs count from the header story's start (MS-DOC FibRgFcLcb97.fcPlcSpaHdr). The header line is
-    text, so a header picture that reads is not output (as in the docx reader); one whose pib fails is counted."""
-    s = doc_stories("m\r", headers=[""] * 7 + ["h\x08"])
-    pic = s["ccp"]["text"] + 1  # the header's \x08, at CP 1 of the header story
-    dgg = dgg_with_bstore([blip_png(PNG)], shapes=[], header_shapes=[(1025, 5)])
+def test_header_pictures_skipped():
+    """A header is a line of text, so its pictures (\\x01 and \\x08) are not read at all, as the docx reader drops
+    them: a large header picture does not use up the image budget the body's pictures need, and a broken one is not
+    counted."""
+    big = b"\x89PNG\r\n\x1a\n" + bytes(4096)
+    s = doc_stories("m\x08\r", headers=[""] * 7 + ["h\x01\x08"])
+    h = s["ccp"]["text"]  # the header story's first CP: its \x01 is at h + 1, its \x08 at h + 2
 
-    def run(cp):
-        fc = {**s["fc"], 41: doc_spa([(cp, 1025)]), 50: dgg}
-        p = make_doc(tmp() / "a.doc", s["pieces"], ccp=s["ccp"], fc=fc, chpx=[(pic, pic + 1, sp(SPEC))])
-        return md(p)
-    assert run(1) == "(could not read: 1 image)\n\nHeader: h\n\nm\n", run(1)
-    assert run(pic) == "Header: h\n\nm\n", run(pic)  # an absolute CP is not the header's anchor
+    def run(picf, header_pib):
+        dgg = dgg_with_bstore([blip_png(PNG), blip_png(big)], shapes=[(1025, 1)], header_shapes=[(1026, header_pib)])
+        fc = {**s["fc"], 40: doc_spa([(1, 1025)]), 41: doc_spa([(2, 1026)]), 50: dgg}
+        chpx = [(1, 2, sp(SPEC)), (h + 1, h + 2, sp(SPEC) + sp(PIC, AT)), (h + 2, h + 3, sp(SPEC))]
+        return make_doc(tmp() / "a.doc", s["pieces"], ccp=s["ccp"], fc=fc, chpx=chpx,
+                        streams={"Data": bytes(AT) + picf})
+    old = doc.IMAGE_BYTES
+    doc.IMAGE_BYTES = len(big)
+    try:
+        for p in (run(picf_inline(blip_png(big)), 2), run(b"\x01\x02", 9)):
+            d, ctx = parse(p)
+            assert d.headers == ["h"] and d.blocks == [Para([Text("m")]), Image(PNG)], (d.headers, d.blocks)
+            assert not ctx.skipped, ctx.skipped
+    finally:
+        doc.IMAGE_BYTES = old
 
 
 # ---- more kinds and layouts
@@ -342,7 +405,82 @@ def test_shape_nesting_depth():
     dgg = dgg_with_bstore([blip_png(PNG)], shapes=[]) + bytes([0]) + oa_container(0xF002, shape)
     p = float_doc("a\x08\r", dgg)
     d, ctx = parse(p)
-    assert d.blocks == [Para([Text("a")])] and ctx.skipped["depth"] == 1 and not ctx.skipped["image"], ctx.skipped
+    # the shape past MAX_DEPTH is counted under depth once, not again as an anchor whose shape is not found
+    assert d.blocks == [Para([Text("a")])] and ctx.skipped == {"depth": 1}, ctx.skipped
+
+
+def test_shapes_index_groups():
+    """officeart.Shapes: spid -> SpContainer, the pib of each shape with one, the pictures (pibs) in record order and,
+    for each group shape (the first SpContainer of an SpgrContainer), its members' slice of them, nested groups'
+    members included."""
+    patriarch = oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", 1024, 5), ver=2))
+    data = oa_container(0xF003, patriarch, oa_shape(1025, 2), oa_group(1026, oa_shape(1027, 1), oa_shape(1028)),
+                        oa_shape(1029, 3))
+    sh = officeart.Shapes()
+    sh.add(data, 0, len(data))
+    assert sorted(sh.at) == list(range(1024, 1030)) and sh.pics == [2, 1, 3], (sh.at, sh.pics)
+    assert sh.pib == {sh.at[1025]: 2, sh.at[1027]: 1, sh.at[1029]: 3}, sh.pib
+    assert sh.groups == {sh.at[1024]: (0, 3), sh.at[1026]: (1, 2)}, sh.groups
+
+
+def test_delay_blips_read_once_within_budget():
+    """FBSEs that delay-load one BLIP read it once and hold one copy (the read is memoized by stream and offset),
+    and a document's delay BLIPs read at most len(WordDocument) bytes in all, so overlapping ones past that are
+    counted under image (the review's probe: 96 FBSEs on one 4 MiB BLIP held 384 MiB)."""
+    n, big = 64, b"\x89PNG\r\n\x1a\n" + bytes(1 << 20)
+    reads, real = [], officeart.blip
+
+    def spy(data, off, budget):
+        h = officeart.header(data, off)
+        reads.append(8 + h[3] if h else 0)
+        return real(data, off, budget)
+
+    def run(p):
+        reads.clear()
+        officeart.blip = spy
+        try:
+            return parse(p)
+        finally:
+            officeart.blip = real
+    d, ctx = run(float_doc("\x08" * n + "\r", dgg_with_bstore([DOC_EXTRA] * n), chpx=[(0, n, sp(SPEC))],
+                           word_extra=blip_png(big)))
+    assert len(reads) == 1 and not ctx.skipped, (len(reads), ctx.skipped)
+    assert len(d.blocks) == n and len({id(b.data) for b in d.blocks}) == 1
+    # n offsets whose BLIP records overlap, each running to the end of one shared BLIP
+    inner = blip_png(big)
+    heads = b"".join(struct.pack("<HHI", 0x6E0 << 4, 0xF01E, 8 * (n - 1 - j) + len(inner)) for j in range(n))
+    p = float_doc("\x08" * n + "\r", dgg_with_bstore([DOC_EXTRA + 8 * j for j in range(n)]),
+                  chpx=[(0, n, sp(SPEC))], word_extra=heads + inner)
+    with Compound(p) as cf:
+        word = len(cf.read("WordDocument"))
+    t0 = time.monotonic()
+    d, ctx = run(p)
+    assert sum(reads) <= word and ctx.skipped == {"image": n}, (len(reads), sum(reads), word, ctx.skipped)
+    assert time.monotonic() - t0 < 10
+
+
+def test_overlapping_picfs_read_within_budget():
+    """Distinct PicLocations whose PICFs overlap one region read at most len(Data) bytes of PICFs in all, the rest
+    counted under image (the review's probe: 400 PICFs over 64K zero-length records took 5 s, growing as n^2)."""
+    n, zone = 200, 8 * 1024
+    z = 8 * n  # the zone starts after n 8-byte PICF heads, each PICF running from its head to the zone's end
+    data = b"".join(struct.pack("<IHH", z + 8 * zone - 8 * j, z - 8 * j, 0x64) for j in range(n)) + bytes(8 * zone)
+    p = make_doc(tmp() / "a.doc", [("\x01" * n + "\r", False)], streams={"Data": data},
+                 chpx=[(j, j + 1, sp(SPEC) + sp(PIC, 8 * j)) for j in range(n)])
+    walked, real = [0], officeart.records
+
+    def spy(*args):
+        for rec in real(*args):
+            walked[0] += 1
+            yield rec
+    officeart.records = spy
+    t0 = time.monotonic()
+    try:
+        d, ctx = parse(p)
+    finally:
+        officeart.records = real
+    assert ctx.skipped == {"image": n} and walked[0] <= len(data) // 8, (walked, ctx.skipped)
+    assert time.monotonic() - t0 < 10
 
 
 def test_many_shapes_linear():

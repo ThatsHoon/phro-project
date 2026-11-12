@@ -552,6 +552,14 @@ def oa_shape(spid, pib=None):
     return oa_container(0xF004, out)
 
 
+def oa_group(spid, *members):
+    """An SpgrContainer (0xF003): its group shape first (an SpContainer whose FSP has fGroup 0x1), then the members,
+    records already built (oa_shape, oa_group), in order."""
+    import struct
+    shape = oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", spid, 0x201), ver=2))
+    return oa_container(0xF003, shape, *members)
+
+
 def picf_inline(blip, mm=0x64, *, name=b"", pib=None, fbses=None):
     """A PICFAndOfficeArtData for the Data stream: the 68-byte PICF (lcb, cbHeader 0x44, mfpf.mm at offset 6); for mm
     0x66 cchPicName and the name; then the inline SpContainer (spid 1025, `pib` when given) and one FBSE embedding
@@ -571,7 +579,8 @@ def dgg_with_bstore(blips, shapes=None, header_shapes=None):
     BStoreContainer with an FBSE a blip: bytes embed that BLIP record, an int is the foDelay of a BLIP in
     WordDocument), then the main document's drawing (dgglbl 0, a DgContainer whose SpgrContainer holds the shapes)
     and, when header_shapes is given, the header document's (dgglbl 1). A shape is (spid, pib), pib None for one
-    without a pib (a text box, a line); `shapes` defaults to spid 1025 + k showing pib k + 1."""
+    without a pib (a text box, a line), or bytes: records already built (oa_shape, oa_group); `shapes` defaults to
+    spid 1025 + k showing pib k + 1."""
     import struct
     store = [oa_fbse(b) if isinstance(b, (bytes, bytearray)) else oa_fbse(delay=b) for b in blips]
     dgg = oa_container(0xF000, oa_record(0xF006, struct.pack("<4I", 1026, 2, 1, 1)),
@@ -579,7 +588,7 @@ def dgg_with_bstore(blips, shapes=None, header_shapes=None):
 
     def drawing(label, shapes):
         group = oa_container(0xF003, oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", 1024, 5), ver=2)),
-                             *(oa_shape(spid, pib) for spid, pib in shapes))
+                             *(s if isinstance(s, (bytes, bytearray)) else oa_shape(*s) for s in shapes))
         return bytes([label]) + oa_container(0xF002, oa_record(0xF008, struct.pack("<II", len(shapes), 1024)), group)
 
     if shapes is None:
