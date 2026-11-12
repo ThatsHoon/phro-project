@@ -28,7 +28,7 @@ _SIBLINGS = (b"VtBackdrop\0", b"VtBackDrop\0", b"VtChartSection\0", b"VtFootnote
              b"VtPrintInformation\0", b"VtChartTitle\0", b"VtTitle\0")
 _TITLES = (b"VtChartTitle\0", b"VtTitle\0")
 _TITLE_SCAN = 4096   # bytes after a title marker searched for its text (a title sits right after its class)
-_ECHO_SCAN = 1 << 27  # bytes the label echo search may cover, labels times the stream after the grid
+_ECHO_FACTOR = 16    # bytes the label echo searches may scan together, per byte of the stream
 # VtChChartType, MSChart's documented constants (3D and 2D bar, drawn vertical, line, area, step, combination, 2D
 # pie, XY), with 10 and 11 (horizontal bar) and 13 (3D pie) from the 27-type table VtSeries' painter selectors index
 # (rhwp legacy_presentation.rs reads 27 of them); anything else is unknown, as rhwp's OleChartType
@@ -318,22 +318,46 @@ def _series_rows(data: bytes, g: _Grid) -> bool:
     """orientation.rs decide_series_axis: the series' names are repeated, record for record, in the series and
     legend objects after the grid, the categories' are not. Rows are the series when every row label is repeated
     and not every column label is; columns when it is the other way round; rows otherwise, as writers do. The
-    evidence counts only with two or more of each (a pie's legend repeats its slices)."""
+    evidence counts only with two or more of each (a pie's legend repeats its slices).
+    Each distinct record is searched for once (a label that refers back to another is its record), the column
+    labels first, and the search stops at the first label that settles it. Each search may scan the whole tail, and
+    together they may scan _ECHO_FACTOR bytes per byte of the stream; past that, rows."""
     rows, cols = g.rows - g.label_rows, g.cols - g.label_cols
-    tail = len(data) - g.end
-    if rows < 2 or cols < 2 or (rows + cols) * tail > _ECHO_SCAN:
+    if rows < 2 or cols < 2:
         return True
+    tail, budget = len(data) - g.end, _ECHO_FACTOR * len(data)
+    spans, records = {}, {}  # a record's place -> echoed; its bytes -> echoed
 
     def echoed(cell):
+        """Whether the label's record is repeated after the grid; None when its search would pass the budget."""
+        nonlocal budget
         v = g.cells.get(cell)
         if not isinstance(v, _Text):
             return False
-        record = data[v.start:v.end]
-        return 0 < len(record) <= tail and data.find(record, g.end) >= 0
+        span = v.start, v.end
+        if span not in spans:  # each place is sliced once, so the slices add up to at most the stream
+            record = data[v.start:v.end]
+            if record not in records:
+                if not 0 < len(record) <= tail:
+                    records[record] = False
+                elif tail > budget:
+                    return None
+                else:
+                    budget -= tail
+                    records[record] = data.find(record, g.end) >= 0
+            spans[span] = records[record]
+        return spans[span]
 
-    all_rows = all(echoed((g.label_rows + i, 0)) for i in range(rows))
-    all_cols = all(echoed((0, g.label_cols + i)) for i in range(cols))
-    return not (all_cols and not all_rows)
+    for i in range(cols):
+        if not echoed((0, g.label_cols + i)):  # a column label not repeated, or no budget left: rows
+            return True
+    for i in range(rows):
+        e = echoed((g.label_rows + i, 0))
+        if e is None:
+            return True
+        if not e:  # every column label repeated, this row label not: columns
+            return False
+    return True
 
 
 def _title(data: bytes) -> str:

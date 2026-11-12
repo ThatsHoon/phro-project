@@ -57,6 +57,20 @@ def envelope(streams):
     return struct.pack("<I", len(data)) + data
 
 
+class Record(bytes):
+    """A VtString cell whose record payload is these bytes, as they are."""
+
+
+class Spy(bytes):
+    """A stream that counts the substring searches made in it and the bytes each may scan."""
+    calls = scanned = 0
+
+    def find(self, sub, start=0, *rest):
+        self.calls += 1
+        self.scanned += len(self) - start
+        return super().find(sub, start, *rest)
+
+
 class Archive:
     """Writes the VtArchive grammar rhwp's grid.rs reads (its tests' synth_grid): an object is an i32 id and, the
     first time, its class (an i32 type id, the first time followed by a u16 length, the name and a u16 version),
@@ -89,6 +103,12 @@ class Archive:
     def cell(self, value):
         if value is None:
             self.out += i32(-1)
+        elif isinstance(value, Record):
+            self.out += i32(self.next_object)
+            self.next_object += 1
+            self.ty(b"VtString\0")
+            self.out += i16(len(value)) + value + b"\0"
+            self.value_base()
         elif isinstance(value, bytes):  # raw slot bytes
             self.out += value
         elif isinstance(value, str):
@@ -120,11 +140,11 @@ class Archive:
         self.out += u16(lr) + u16(lc) + u16(cols - lc) + u16(rows - lr)
 
 
-def contents(rows, cols, cells, *, title="Sales 2024", kind=1, echo=(), labels=(1, 1)):
+def contents(rows, cols, cells, *, title="Sales 2024", kind=1, echo=(), labels=(1, 1), filler=b""):
     """A Hancom-native chart Contents stream: a 40-byte head (0x00010000, two sizes, the object start), the
     VtChart (version 6) class, its data grid, a title object, the label records in `echo` repeated in a legend
-    after the grid, then the VtChart tail: ChartType i16, four bytes, the VtWindow (version 2) base declared there,
-    its VtObject base and two bytes."""
+    after the grid, the `filler` bytes, then the VtChart tail: ChartType i16, four bytes, the VtWindow (version 2)
+    base declared there, its VtObject base and two bytes."""
     a = Archive()
     a.out += i32(0) + u16(8) + b"VtChart\0" + u16(6)  # the VtChart class at offset 40, type id 0
     a.grid(rows, cols, cells, labels)
@@ -140,6 +160,7 @@ def contents(rows, cols, cells, *, title="Sales 2024", kind=1, echo=(), labels=(
         for s in echo:
             payload = s.encode("cp949") + b"\0\0" + s.encode("utf-16-le") + b"\0\0"
             a.out += i16(len(payload)) + payload + bytes(3)
+    a.out += filler
     a.out += i16(kind) + bytes(4)
     a.ty(b"VtWindow\0", 2)
     a.ty(b"VtObject\0")
@@ -287,6 +308,48 @@ def test_native_grid_is_bounded():
     assert took < 2, took
     assert sum(len(r) for r in table.rows) <= limits.CHART_CELLS and ctx.skipped == {"chart_cut": 1}, ctx.skipped
     assert table.caption == f"Chart: column — Sales 2024 (first {len(table.rows) - 1} points)", table.caption
+
+
+def test_label_echo_search_is_bounded():
+    # 4,471 labels that all refer back to one record, repeated only at the end of a tail (under 30,000 bytes, where
+    # CPython's find is quadratic) of near-copies of it, each alignment matching 96 of its 98 bytes: the record is
+    # searched for once, within the budget of _ECHO_FACTOR bytes scanned per byte of the stream
+    rows, cols = 3, 4_470
+    record = Record(bytes((96, 0)) * 47 + bytes((97, 0)))  # with its length in front: (96, 0) x 48, then (97, 0)
+    filler = bytes((96, 0)) * 14_500 + i16(len(record)) + record
+    first = 1001  # the grid is object 1000, so the first label is 1001
+    refs = {k: i32(first) for k in range(3, cols + 1)} | {2: record, cols + 1: i32(first), 2 * cols + 1: i32(first)}
+    # the same record written out again for every label rather than referred to is one search as well
+    copies = {k: record for k in range(2, cols + 1)} | {cols + 1: record, 2 * cols + 1: record}
+    for cells in (refs, copies):
+        data = contents(rows, cols, cells, filler=filler)
+        g = hwp_chart._grid(data)
+        spy = Spy(data)
+        assert hwp_chart._series_rows(spy, g) is True
+        assert spy.calls == 1, spy.calls
+        assert spy.scanned <= hwp_chart._ECHO_FACTOR * len(data), (spy.scanned, len(data))
+
+
+def test_label_echo_search_budget():
+    # forty column labels, each repeated after the grid, and row labels that are not: the columns are the series.
+    # With a tail this long, a search for every label would pass the budget, so the searches stop within it and the
+    # rows are the series, by the writers' convention
+    names = [f"c{k}" for k in range(40)]
+    cols = len(names) + 1
+    cells = {k + 2: name for k, name in enumerate(names)} | {cols + 1: "r1", 2 * cols + 1: "r2"}
+    data = contents(3, cols, cells, echo=names, filler=bytes(20_000))
+    g = hwp_chart._grid(data)
+    budget = hwp_chart._ECHO_FACTOR * len(data)
+    assert len(names) * (len(data) - g.end) > budget  # the fixture's searches would pass it
+    spy = Spy(data)
+    assert hwp_chart._series_rows(spy, g) is True
+    assert 0 < spy.scanned <= budget, (spy.scanned, budget)
+    old = hwp_chart._ECHO_FACTOR
+    hwp_chart._ECHO_FACTOR = 10 ** 6
+    try:
+        assert hwp_chart._series_rows(data, g) is False  # given room, the echo makes the columns the series
+    finally:
+        hwp_chart._ECHO_FACTOR = old
 
 
 def test_malformed_native_chart_counted():
