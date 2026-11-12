@@ -435,6 +435,36 @@ A project's copy writes `docs/daily/<YYYY-MM-DD>(<요일>).md` on each weekday: 
 python -I -X utf8 <copy>/scripts/daily.py run --force [--date YYYY-MM-DD]
 ```
 
+## Document reader
+
+A `PreToolUse` hook on `Read` (`scripts/read.py hook`) catches a read of a document the model cannot open as text, converts it to Markdown with images extracted to files, and hands Claude the Markdown path to read instead. `pdf`, `docx`, `pptx`, `xlsx` and `xlsm` are never touched; they belong to the `anthropic-skills:*` skills.
+
+Built formats: `hwpx`, `odt`, `ods`, `odp`, `docm`, `pptm`, `ppsx`, `epub`, `xps`, `oxps`, `vsdx`. Every other in-scope extension (hwp, doc, xls, ppt, xlsb, rtf, wpd, mobi, azw3, pages, numbers, key, djvu, mdb, accdb, pub, vsd, mpp) is denied as "unsupported" until its phase is built; a plain-text file that only carries one of these extensions passes through unchanged. Standard library only; budgets: input 512 MiB, output 20 MB, 45 seconds per conversion.
+
+Always-on cost: for any file outside the 29 in-scope extensions the hook prints nothing, and each Read costs one Python start. Measured with `Measure-Command` over 20 runs of `read.py hook` on a `.py` event, the median is 84 ms.
+
+Converted output is cached by a hash of the document's bytes and the reader's own source at `%LOCALAPPDATA%\phro-project\reader\` on Windows and `~/.cache/phro-project/reader/` elsewhere, as `<sha1[:2]>/<sha1>/` holding `out.md`, `assets/` and `meta.json`. `python -I -X utf8 scripts/read.py prune [--days 30]` deletes entries not used for N days.
+
+Hidden content (hidden sheets, slides, rows and text) is left out and marked. To get it in full:
+
+```bash
+python -I -X utf8 scripts/read.py convert <file> [--out DIR] --hidden
+```
+
+Result against the routing pick on the bench corpus, one line per extension:
+
+- `docm`: PASS.
+- `odt`: PASS.
+- `xps`: PASS, though its two public documents are scored only against engines that include this reader.
+- `epub`: MISS on tokens only; the bench counts linked images as viewed, text-only tokens are below the pick.
+- `hwpx`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
+- `odp`: MISS on tokens only; linked images are counted, text-only tokens are below the pick.
+- `ppsx`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
+- `pptm`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
+- `ods`: MISS on fidelity (0.868 against 1.000), mostly a peer-agreement artifact on one public document.
+- `oxps`: NODATA, no corpus files; it goes through the `xps` module.
+- `vsdx`: NODATA, no routing pick to compare with; 3 of 3 corpus files converted without failure.
+
 ## Not done yet
 
 - Use of the design, route-test and audit skills in real work. A capability built on request and a step-triggered skill have only passed scripted checks, not a run with a model.
@@ -442,6 +472,7 @@ python -I -X utf8 <copy>/scripts/daily.py run --force [--date YYYY-MM-DD]
 - `restructure` start to finish with a person choosing the structure. Only its script has met real projects, on scratch copies.
 - Routing test of this plugin's own skills with `tests/route_cases.json`, 28 cases, about $4. The cases are written by the author, which inflates the rate, so it waits for prompts really typed.
 - A hook at write time that enforces folder rules, a search over the documents, signal hook, local search and compliance grading. Each waits for a measured failure.
+- Phases 2-4 of the document reader (hwp, legacy Office, rtf, wpd, ebooks, iWork, djvu, Access, Publisher, Visio binary, Project).
 
 ## When to delete it
 

@@ -81,6 +81,18 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^Read$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I -X utf8 \"${CLAUDE_PLUGIN_ROOT}/scripts/read.py\" hook",
+            "timeout": 60
+          }
+        ]
+      }
     ]
   }
 }
