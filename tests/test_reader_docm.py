@@ -16,7 +16,7 @@ from reader import markdown  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
 from reader.formats import ooxml  # noqa: E402
-from reader_fix import make_zip  # noqa: E402
+from reader_fix import make_cfb, make_zip  # noqa: E402
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 WS = "http://purl.oclc.org/ooxml/wordprocessingml/main"
@@ -97,8 +97,7 @@ def test_strict_namespace():
 
 def test_encrypted_cfb():
     p = tmp() / "e.docm"
-    blob = bytes.fromhex("d0cf11e0a1b11ae1") + b"\x00" * 600 + "EncryptedPackage".encode("utf-16-le") + b"\x00" * 100
-    p.write_bytes(blob)
+    make_cfb(p, {"EncryptionInfo": b"info", "EncryptedPackage": b"data"})
     try:
         parse(p)
         assert False
@@ -106,19 +105,10 @@ def test_encrypted_cfb():
         assert e.kind == "encrypted"
 
 
-def test_encrypted_cfb_directory_past_64k():
+def test_garbage_cfb_headers_are_damaged():
     import struct
     hdr = bytearray(bytes.fromhex("d0cf11e0a1b11ae1") + b"\x00" * 504)
-    struct.pack_into("<H", hdr, 0x1E, 9)
-    struct.pack_into("<I", hdr, 0x30, 400)  # directory sector 400 -> offset 401 * 512 > 64 KiB
-    blob = bytes(hdr) + b"\x00" * (401 * 512 - 512) + "EncryptedPackage".encode("utf-16-le") + b"\x00" * 100
     p = tmp() / "e.docm"
-    p.write_bytes(blob)
-    try:
-        parse(p)
-        assert False
-    except ReadError as e:
-        assert e.kind == "encrypted"
     for shift, sid in ((0, 5), (9, 0xFFFFFFFE), (60000, 1), (9, 10**9)):  # garbage header values
         hdr2 = bytearray(hdr)
         struct.pack_into("<H", hdr2, 0x1E, shift % 65536)

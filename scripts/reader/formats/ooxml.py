@@ -5,36 +5,28 @@ and elements match by local name, so Transitional and Strict files take the same
 The shared helpers live in ooxml_base and are re-exported here; the body parsers import ooxml_base
 and this module imports them only inside parse(), so there is no import cycle.
 """
-import struct
 from pathlib import Path
 
+from ..containers import cfb
 from ..containers.zipx import Package, local
 from ..limits import ReadError
 from .ooxml_base import UNDERSTOOD, alternate, chart, image, load, rels  # noqa: F401 (re-exported)
-
-_CFB_MAGIC = bytes.fromhex("d0cf11e0")
-_ENCRYPTED = "EncryptedPackage".encode("utf-16-le")
-_CFB_SCAN = 64 * 1024
 
 
 # ---- entry
 def _check_cfb(path):
     """An OLE file is an encrypted package or not an OOXML package; anything else falls through.
 
-    EncryptedPackage is looked for in the first 64 KiB and in the first directory sector the header names.
+    EncryptedPackage is looked for among every stream of the compound file.
     """
     with open(path, "rb") as f:
-        head = f.read(8)
-        if head[:4] != _CFB_MAGIC:
+        if f.read(8) != cfb.MAGIC:
             return
-        head += f.read(_CFB_SCAN - 8)
-        found = _ENCRYPTED in head
-        if not found and len(head) >= 0x34:
-            shift = struct.unpack_from("<H", head, 0x1E)[0]
-            sid = struct.unpack_from("<I", head, 0x30)[0]
-            if 7 <= shift <= 16 and sid < 0xFFFFFFFA:
-                f.seek((sid + 1) << shift)
-                found = _ENCRYPTED in f.read(1 << shift)
+    try:
+        with cfb.Compound(path) as c:
+            found = any(n.upper() == "ENCRYPTEDPACKAGE" for n in c.names())
+    except ReadError:
+        found = False
     if found:
         raise ReadError("encrypted")
     raise ReadError("damaged", "not an OOXML package (OLE file)")

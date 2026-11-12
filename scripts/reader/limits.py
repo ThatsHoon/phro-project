@@ -16,6 +16,11 @@ SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one documen
 GRID_COLS = 1_000        # columns a span may reach in a rendered table
 GRID_SLOTS = 2_000_000    # grid slots all spans of one rendered table may cover
 CHART_CELLS = 100_000     # cells one chart table may hold, header row included (series x rows)
+CFB_STREAM = 256 * 2**20  # bytes of one compound-file stream
+CFB_SECTORS = 1_000_000
+CFB_ENTRIES = 131_072     # directory entries
+CFB_DEPTH = 128           # storage nesting
+CFB_CHAIN = 4_000_000     # steps of one sector chain
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 # a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
 BIG_INPUT = "input"  # the file is over MAX_INPUT
