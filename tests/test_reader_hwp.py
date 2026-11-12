@@ -1,4 +1,5 @@
-"""HWP 5.0 parser: body text, control characters, bold, headings, numbering, notes, fields, equations, sections.
+"""HWP 5.0 parser: body text, control characters, bold, headings, numbering, notes, fields, equations, tables,
+drawing objects and pictures, sections.
 
 Run: python -I -X utf8 tests/test_reader_hwp.py
 """
@@ -18,10 +19,12 @@ from reader import markdown  # noqa: E402
 from reader.formats import hancom, hwp  # noqa: E402
 from reader.formats import hwp_records as hr  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
-from reader_fix import hwp_para, hwp_record, make_cfb, make_hwp, make_zip  # noqa: E402
+from reader.model import Context, Table  # noqa: E402
+from reader_fix import hwp_para, hwp_picture, hwp_record, hwp_table, make_cfb, make_hwp, make_zip  # noqa: E402
 
 FFFC = "\ufffc"
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+RECT = 79  # SHAPE_COMPONENT_RECTANGLE
 
 
 def tmp():
@@ -45,9 +48,16 @@ def deflate(b):
     return c.compress(b) + c.flush()
 
 
-def info(sections=0, bold=(), shapes=(), styles=(), numberings=(), bullets=()):
-    """DocInfo records. shapes: (head, level, ref); numberings: lists of (format, code) per level."""
+def info(sections=0, bold=(), shapes=(), styles=(), numberings=(), bullets=(), bins=()):
+    """DocInfo records. shapes: (head, level, ref); numberings: lists of (format, code) per level; bins: (extension,
+    compress[, storage id]) per BinData item, the k-th (1-based) embedding storage k unless given, an extension of
+    None writing a link item."""
     out = hwp_record(hr.DOCUMENT_PROPERTIES, 0, u16(sections) + bytes(24))
+    for k, (ext, compress, *sid) in enumerate(bins, 1):
+        if ext is None:
+            out += hwp_record(hr.BIN_DATA, 1, u16(compress << 4) + wstr("C:/x.png") + wstr(""))
+        else:
+            out += hwp_record(hr.BIN_DATA, 1, u16(1 | compress << 4) + u16(sid[0] if sid else k) + wstr(ext))
     for b in bold:
         cs = bytearray(72)
         struct.pack_into("<I", cs, 46, 2 if b else 0)
@@ -68,8 +78,8 @@ def info(sections=0, bold=(), shapes=(), styles=(), numberings=(), bullets=()):
     return out
 
 
-def hwp_file(*sections, doc_info=b"", flags=1, extra=None, name="a.hwp"):
-    return make_hwp(tmp() / name, list(sections), doc_info=doc_info, flags=flags, extra=extra)
+def hwp_file(*sections, doc_info=b"", flags=1, extra=None, bins=None, name="a.hwp"):
+    return make_hwp(tmp() / name, list(sections), doc_info=doc_info, flags=flags, extra=extra, bins=bins)
 
 
 def parse(path):
@@ -300,6 +310,170 @@ def test_equation():
     assert md(hwp_file(hwp_para("값 " + FFFC, controls=(eqed("a over b", 1),)))) == f"값 ${tex}$\n"
     # an inline equation alone in its paragraph is shown on its own, as hwpx does
     assert md(hwp_file(hwp_para(FFFC, controls=(eqed("a over b", 1),)))) == f"$${tex}$$\n"
+
+
+# ---- tables
+def table_md(rows, **kw):
+    return md(hwp_file(hwp_para(FFFC, controls=(hwp_table(rows, **kw),))))
+
+
+def test_table_simple():
+    assert table_md([["a", "b"], ["c", "d"]]) == "|a|b|\n|---|---|\n|c|d|\n"
+    # the table follows its paragraph's text
+    p = hwp_file(hwp_para("앞" + FFFC, controls=(hwp_table([["a", "b"], ["c", "d"]]),)))
+    assert md(p) == "앞\n\n|a|b|\n|---|---|\n|c|d|\n"
+
+
+def test_table_merged():
+    out = table_md([[("합", 2, 1)], ["c", "d"]])
+    assert '<td colspan="2">합</td>' in out and "<tr><td>c</td><td>d</td></tr>" in out, out
+
+
+def test_table_caption():
+    out = table_md([["a", "b"], ["c", "d"]], caption="표 1")
+    assert out == "|a|b|\n|---|---|\n|c|d|\n\n표 1\n", out
+
+
+def test_table_cell_paragraphs():
+    out = table_md([[["가", "나"], "다"], ["라", "마"]])
+    assert out == "|가<br>나|다|\n|---|---|\n|라|마|\n", out
+
+
+def test_nested_table():
+    inner = hwp_para(FFFC, level=2, controls=(hwp_table([["1", "2"], ["3", "4"]], level=4),))
+    p = hwp_file(hwp_para(FFFC, controls=(hwp_table([[inner, "z"], ["y", "w"]]),)))
+    doc, _ = parse(p)
+    nested = doc.blocks[0].rows[0][0].blocks
+    assert len(nested) == 1 and isinstance(nested[0], Table) and len(nested[0].rows) == 2, nested
+    # the renderer writes a table inside a cell on one line
+    out = md(p)
+    assert out == "|1 / 2 ; 3 / 4|z|\n|---|---|\n|y|w|\n", out
+
+
+def test_nested_table_depth_cap():
+    def nest(k, level):  # the k-th table, its records at `level`
+        cell = (hwp_para("바닥", level=level) if k == 70
+                else hwp_para(FFFC, level=level, controls=(nest(k + 1, level + 2),)))
+        return hwp_table([[cell, str(k)]], level=level)
+    doc, ctx = parse(hwp_file(hwp_para(FFFC, controls=(nest(0, 2),))))
+    assert ctx.skipped["depth"] == 1, ctx.skipped
+    assert "바닥" not in markdown.render(doc, tmp() / "a", False, ctx.skipped)
+
+
+# ---- pictures and drawing objects
+def pic_file(*controls, bins=(("png", 2),), streams=None, flags=1):
+    """One paragraph per control; `bins` are the DocInfo items, `streams` the BinData streams by name."""
+    body = b"".join(hwp_para(FFFC, controls=(c,)) for c in controls)
+    return hwp_file(body, doc_info=info(bins=bins), bins=streams, flags=flags)
+
+
+def test_picture_png():
+    # compress 0 follows the document, which is compressed
+    p = pic_file(hwp_picture(1), bins=(("png", 0),), streams={"BIN0001.png": deflate(PNG)})
+    assert md(p) == "![](assets/img-001.png)\n"
+
+
+def test_picture_bmp_to_png():
+    pixels = b"\x00\x00\xff\x00"  # one red pixel, the row padded to four bytes
+    head = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, len(pixels), 0, 0, 0, 0)
+    bmp = b"BM" + struct.pack("<IHHI", 54 + len(pixels), 0, 0, 54) + head + pixels
+    # compress 2 is stored, though the document is compressed
+    doc, ctx = parse(pic_file(hwp_picture(1), bins=(("bmp", 2),), streams={"BIN0001.bmp": bmp}))
+    out_dir = tmp()
+    out = markdown.render(doc, out_dir / "assets", False, ctx.skipped)
+    assert out == "![](assets/img-001.png)\n", out
+    assert (out_dir / "assets" / "img-001.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_picture_compressed_item():
+    # compress 1 inflates in an uncompressed document; a second picture, or a second item naming the same stream,
+    # reads and inflates nothing again
+    packed = deflate(PNG)
+    seen = []
+    old = hwp.flate.inflate
+
+    def spy(data, budget):
+        seen.append(data)
+        return old(data, budget)
+    hwp.flate.inflate = spy
+    try:
+        p = pic_file(hwp_picture(1), hwp_picture(1), hwp_picture(2), bins=(("png", 1), ("PNG", 1, 1)),
+                     streams={"BIN0001.png": packed}, flags=0)
+        out = md(p)
+    finally:
+        hwp.flate.inflate = old
+    assert out == "![](assets/img-001.png)\n\n" * 2 + "![](assets/img-001.png)\n", out
+    assert seen == [packed], seen
+
+
+def test_picture_missing_stream():
+    p = pic_file(hwp_picture(2), hwp_picture(1), bins=(("png", 2), ("png", 2)), streams={"BIN0001.png": PNG})
+    out = md(p)
+    assert out == "(could not read: 1 image)\n\n![](assets/img-001.png)\n", out
+
+
+def test_broken_pictures_counted():
+    # a link item, a corrupt deflate stream, a cut one, an empty one, an id past the table and a SHAPE_PICTURE too
+    # short for its id each cost one image, and the section goes on
+    packed = deflate(bytes(range(256)) * 64)
+    short = (11, b"gso ", hwp_record(hr.SHAPE_COMPONENT, 2, b"cip$cip$") + hwp_record(hr.SHAPE_PICTURE, 3, bytes(40)))
+    bins = ((None, 0), ("png", 1), ("png", 1), ("png", 2), ("png", 2))
+    streams = {"BIN0002.png": b"\xff" * 64, "BIN0003.png": packed[:len(packed) // 2], "BIN0004.png": b"",
+               "BIN0005.png": PNG}
+    pics = (hwp_picture(1), hwp_picture(2), hwp_picture(3), hwp_picture(4), hwp_picture(9), short, hwp_picture(5))
+    doc, ctx = parse(pic_file(*pics, bins=bins, streams=streams))
+    assert ctx.skipped["image"] == 6 and not ctx.skipped["section"], ctx.skipped
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert out == "(could not read: 6 images)\n\n![](assets/img-001.png)\n", out
+
+
+def test_auto_alt_dropped():
+    streams = {"BIN0001.png": PNG}
+    assert md(pic_file(hwp_picture(1, "그림입니다."), streams=streams)) == "![](assets/img-001.png)\n"
+    assert md(pic_file(hwp_picture(1, "회사 로고"), streams=streams)) == "![회사 로고](assets/img-001.png)\n"
+
+
+def test_picture_caption():
+    p = pic_file(hwp_picture(1, caption="그림 1"), streams={"BIN0001.png": PNG})
+    assert md(p) == "![](assets/img-001.png)\n\n그림 1\n"
+
+
+def text_box(text, level):
+    """A rectangle SHAPE_COMPONENT at `level` whose text box holds one paragraph, as Hancom writes it: the
+    LIST_HEADER and its paragraph, then the rectangle record, all one level deeper."""
+    return (hwp_record(hr.SHAPE_COMPONENT, level, b"cer$cer$")
+            + sub_list(hwp_para(text, level=level + 1), level=level + 1) + hwp_record(RECT, level + 1, bytes(20)))
+
+
+def group(*members, level):
+    """A container SHAPE_COMPONENT at `level`: SHAPE_CONTAINER, then the members, written at level + 1."""
+    return (hwp_record(hr.SHAPE_COMPONENT, level, b"noc$noc$")
+            + hwp_record(hr.SHAPE_CONTAINER, level + 1, u16(len(members))) + b"".join(members))
+
+
+def gso(records, alt=""):
+    return 11, b"gso " + bytes(40) + wstr(alt), records
+
+
+def test_group_shape_text():
+    shape = gso(group(text_box("가", 3), text_box("나", 3), level=2), "묶음 개체입니다.")
+    assert md(hwp_file(hwp_para("앞" + FFFC, controls=(shape,)))) == "앞\n\n가\n\n나\n"
+    assert md(hwp_file(hwp_para(FFFC, controls=(gso(text_box("글", 2)),)))) == "글\n"
+    # a picture inside a group does not take the group's comment as its alt text
+    member = hwp_record(hr.SHAPE_COMPONENT, 3, b"cip$") + hwp_record(hr.SHAPE_PICTURE, 4, bytes(71) + u16(1))
+    p = pic_file(gso(group(member, level=2), "묶음 개체입니다."), streams={"BIN0001.png": PNG})
+    assert md(p) == "![](assets/img-001.png)\n"
+
+
+def test_group_depth_cap():
+    def nest(k, level):  # the k-th container, at group depth k
+        inner = text_box("바닥", level + 1) if k == 40 else nest(k + 1, level + 1)
+        return group(inner, level=level)
+    shape = gso(group(text_box("얕음", 3), nest(2, 3), level=2))
+    doc, ctx = parse(hwp_file(hwp_para(FFFC, controls=(shape,))))
+    assert ctx.skipped["depth"] == 1, ctx.skipped
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert out == "(could not read: 1 place nested too deeply)\n\n얕음\n", out
 
 
 # ---- sections

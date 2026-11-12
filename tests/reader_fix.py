@@ -151,7 +151,7 @@ def hwp_para(text, *, shape=0, style=0, chars=((0, 0),), level=0, controls=()):
     `chars` are the PARA_CHAR_SHAPE (position, char shape id) pairs.
     """
     import struct
-    units, ctrls = bytearray(), b""
+    units, ctrls = bytearray(), []
     pending = iter(controls)
     for ch in text:
         if ch != "\ufffc":
@@ -161,12 +161,61 @@ def hwp_para(text, *, shape=0, style=0, chars=((0, 0),), level=0, controls=()):
         raw = bytes(cid[:4]).ljust(4, b"\0")[::-1]
         units += struct.pack("<H", code) + raw + bytes(8) + struct.pack("<H", code)
         if code in _HWP_EXTENDED:
-            ctrls += hwp_record(71, level + 1, raw + bytes(cid[4:])) + bytes(children)
+            ctrls += [hwp_record(71, level + 1, raw + bytes(cid[4:])), bytes(children)]
     units += struct.pack("<H", 13)
     header = struct.pack("<IIHBBHHHI", len(units) // 2, 0, shape, style, 0, len(chars), 0, 0, 0)
     pairs = b"".join(struct.pack("<II", pos, sid) for pos, sid in chars)
     return (hwp_record(66, level, header) + hwp_record(67, level + 1, bytes(units))
-            + hwp_record(68, level + 1, pairs) + ctrls)
+            + hwp_record(68, level + 1, pairs) + b"".join(ctrls))
+
+
+def _hwp_caption(caption, level):
+    """A caption list: its LIST_HEADER and one paragraph, both at `level`."""
+    import struct
+    return [hwp_record(72, level, struct.pack("<HIH", 1, 0, 0)), hwp_para(caption, level=level)]
+
+
+def hwp_table(rows, *, level=2, caption=None):
+    """A table for hwp_para's `controls`: (11, b"tbl ", records), the records written at `level` (the paragraph's
+    level + 2): an optional caption list, TABLE, then a LIST_HEADER per cell with the cell's paragraphs beside it.
+
+    `rows` lists rows of cells. A cell is text (one paragraph), a list of texts (one paragraph each), bytes (paragraph
+    records already written at `level`) or a tuple (cell, colspan, rowspan). A cell's column is the sum of the
+    colspans before it in its row.
+    """
+    import struct
+    out = _hwp_caption(caption, level) if caption is not None else []
+    cells, ncols = [], 0
+    for r, row in enumerate(rows):
+        c = 0
+        for cell in row:
+            body, cs, rs = cell if isinstance(cell, tuple) else (cell, 1, 1)
+            if isinstance(body, (bytes, bytearray)):
+                n, paras = 1, bytes(body)
+            else:
+                texts = [body] if isinstance(body, str) else list(body)
+                n, paras = len(texts), b"".join(hwp_para(t, level=level) for t in texts)
+            # paragraph count, attr, width ref, then col, row, colspan, rowspan, size, margins, border fill
+            cells += [hwp_record(72, level, struct.pack("<HIH4H", n, 0, 0, c, r, cs, rs) + bytes(18)), paras]
+            c += cs
+        ncols = max(ncols, c)
+    # attr, rows, cols, spacing, margins, a row size per row, border fill
+    out.append(hwp_record(77, level, struct.pack("<I2H", 0, len(rows), ncols) + bytes(10 + 2 * len(rows) + 2)))
+    return 11, b"tbl ", b"".join(out + cells)
+
+
+def hwp_picture(bin_id, alt="", *, level=2, caption=None):
+    """A picture for hwp_para's `controls`: (11, b"gso " + its object attributes, records at `level`).
+
+    The CTRL_HEADER holds the shape comment `alt` at offset 44 (u16 length, UTF-16LE); an optional caption list comes
+    first, then SHAPE_COMPONENT, with SHAPE_PICTURE one level deeper holding the 1-based `bin_id` at offset 71.
+    """
+    import struct
+    cid = b"gso " + bytes(40) + struct.pack("<H", len(alt)) + alt.encode("utf-16-le")
+    out = _hwp_caption(caption, level) if caption is not None else []
+    out += [hwp_record(76, level, b"cip$cip$" + bytes(32)),
+            hwp_record(85, level + 1, bytes(71) + struct.pack("<H", bin_id) + bytes(9))]
+    return 11, cid, b"".join(out)
 
 
 def make_hwp(path, sections, doc_info=b"", bins=None, flags=1, extra=None):

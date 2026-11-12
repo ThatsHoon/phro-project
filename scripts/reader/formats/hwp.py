@@ -1,10 +1,11 @@
 """HWP 5.0 (Hancom Office binary) to the document model.
 
 The body is a flat list of records per section; a record's children are the records after it with a deeper level.
-Logic follows dochan hwp/section.py and records/ctrl_header.py (paragraph walk, controls, field commands), kordoc
-hwp5/body.ts, record.ts and numbering.ts (secd outline numbering, note numbers, %clk placeholders, EQEDIT script) and
-rhwp parser/body_text.rs (control-character classes). The inline model and paragraph rules are hancom.py's, shared
-with hwpx.py.
+Logic follows dochan hwp/section.py and records/ctrl_header.py (paragraph walk, controls, field commands, tables,
+drawing objects and their captions), dochan hwp/bin_data.py and rhwp parser/mod.rs (BinData streams and the per-item
+compression bit), kordoc hwp5/body.ts, record.ts and numbering.ts (secd outline numbering, note numbers, %clk
+placeholders, EQEDIT script) and rhwp parser/body_text.rs (control-character classes). The inline model, paragraph
+rules and cell grid are hancom.py's, shared with hwpx.py.
 """
 import re
 import struct
@@ -14,15 +15,15 @@ from .. import limits
 from ..containers import flate
 from ..containers.cfb import Compound, is_cfb
 from ..limits import ReadError
-from ..model import Bold, Break, Doc, Equation, Heading, ListItem, Math, NoteRef, Para, Text
+from ..model import Bold, Break, Cell, Doc, Equation, Heading, Image, ListItem, Math, NoteRef, Para, Table, Text
 from . import hwpx
 from .hancom import (
-    Frame, Scopes, State, comment_note, cut_command, flat, heading_level, lone_equations, next_marker, plain,
-    strip_marker, style_name_level, tex as _tex,
+    AUTO_ALT, Frame, Scopes, State, comment_note, cut_command, flat, heading_level, lone_equations, next_marker,
+    place, plain, strip_marker, style_name_level, tex as _tex,
 )
 from .hwp_records import (
-    CTRL_HEADER, EQEDIT, PARA_CHAR_SHAPE, PARA_HEADER, PARA_TEXT, DocInfo, ParaShape, doc_info, file_header,
-    records,
+    CTRL_HEADER, EQEDIT, LIST_HEADER, PARA_CHAR_SHAPE, PARA_HEADER, PARA_TEXT, SHAPE_COMPONENT, SHAPE_PICTURE, TABLE,
+    DocInfo, ParaShape, doc_info, file_header, records,
 )
 
 _ZIP = b"PK\x03\x04"
@@ -36,6 +37,7 @@ _FIELD_END, _TAB, _LINE, _PARA_END, _NBSP, _FIXED = 4, 9, 10, 13, 30, 31
 # from an even offset: UTF-16LE units that are neither control characters (below 0x20) nor surrogates
 _PLAIN = re.compile(rb"(?:[\x20-\xff][^\xd8-\xdf]|[\x00-\x1f][^\x00\xd8-\xdf])+")
 _NO_SHAPE = ParaShape(0, 0, 0)
+_GROUPS = 32  # shape groups nested deeper than this are counted under depth
 
 
 def _wstr(data: bytes, pos: int) -> str:
@@ -64,6 +66,12 @@ class _Reader(Scopes):
         b"secd": "section_def", b"cold": "skip", b"pgnp": "skip", b"atno": "skip", b"nwno": "skip",
         b"bokm": "skip", b"head": "header", b"foot": "footer", b"fn  ": "note", b"en  ": "note",
         b"tcmt": "comment", b"eqed": "equation", b"%hlk": "field", b"%clk": "field",
+        b"tbl ": "table", b"gso ": "drawing",
+    }
+    # a SHAPE_COMPONENT's child record tag -> handler (recs, j, st, d, g, alt) -> the index after what it read; g is
+    # the component's group depth (1 for the drawing object itself) and alt the shape comment its picture takes
+    SHAPES: dict[int, str] = {
+        SHAPE_COMPONENT: "member", SHAPE_PICTURE: "picture", LIST_HEADER: "text_box", PARA_HEADER: "text_box",
     }
 
     def __init__(self, cf, ctx):
@@ -75,6 +83,7 @@ class _Reader(Scopes):
         self.counts = {"fn": 0, "en": 0, "cm": 0}
         self.numbers = {}   # numbering id -> {level: counter}
         self.outline = 0    # the outline numbering id of the current section's secd
+        self.blobs = {}     # (BinData stream name, inflated?) -> its bytes, or None when it cannot be read
         self._ends_of, self._ends = None, []
 
     # ---- streams
@@ -93,6 +102,35 @@ class _Reader(Scopes):
         if cut and self.ctx.skipped["record"] == before:
             self.ctx.skipped["record"] += 1
         return out
+
+    def bin_data(self, bid):
+        """The bytes of BinData item `bid` (1-based, as DocInfo lists them); None, counted under image for every
+        picture that wanted it, for a link item or a missing, empty or broken stream. A stream is read and inflated
+        once however many items and pictures name it."""
+        item = self.info.bins.get(bid)
+        data = None
+        if item is not None and item.kind != "link":
+            name = f"BinData/BIN{item.id:04X}.{item.ext}"
+            # the item's own bit decides (rhwp): 1 compressed, 2 stored, anything else as the document is
+            packed = item.compress == 1 or (item.compress != 2 and self.head.compressed)
+            key = (name.upper(), packed)  # stream names match without case
+            if key not in self.blobs:
+                self.blobs[key] = self.load_bin(name, packed)
+            data = self.blobs[key]
+        if data is None:
+            self.ctx.skipped["image"] += 1
+        return data
+
+    def load_bin(self, name, packed):
+        try:
+            data = self.cf.read(name)
+            return (flate.inflate(data, self.budget) if packed else data) or None
+        except ReadError as e:
+            if e.kind not in ("damaged", "too_large"):  # a picture over a limit is skipped, as hwpx skips one
+                raise
+        except (KeyError, ValueError):  # no such stream, a broken chain, a corrupt or cut deflate stream
+            pass
+        return None
 
     def section_names(self) -> list:
         """The declared section count together with the BodyText/Section<N> streams found, N under 1000, in order."""
@@ -167,6 +205,17 @@ class _Reader(Scopes):
         while j < end and not (recs[j].tag == CTRL_HEADER and recs[j].level == lvl):
             j = self.end(recs, j)
         return j
+
+    def list_end(self, recs, j, cell=False) -> int:
+        """The end of the list that starts at recs[j], its LIST_HEADER (or, in a shape, a bare first paragraph). Its
+        paragraphs follow at that record's level (deeper records are theirs) up to a lower level, and up to the next
+        same-level LIST_HEADER for a table cell or the first same-level record that is not a PARA_HEADER for any
+        other list. O(paragraphs)."""
+        lvl, n = recs[j].level, len(recs)
+        k = self.end(recs, j)
+        while k < n and recs[k].level == lvl and (recs[k].tag != LIST_HEADER if cell else recs[k].tag == PARA_HEADER):
+            k = self.end(recs, k)
+        return k
 
     def control(self, recs, i, st, d) -> int:
         data = recs[i].data
@@ -390,6 +439,100 @@ class _Reader(Scopes):
         else:
             self.push(st, Frame("pass"))
         return self.end(recs, i)
+
+    def table(self, recs, i, st, d):
+        """An optional caption list, TABLE, then a LIST_HEADER per cell with the cell's paragraphs beside it. The
+        table, then its caption as paragraphs, follow the paragraph that holds it."""
+        end = self.end(recs, i)
+        if d + 1 > limits.MAX_DEPTH:
+            self.deep()
+            return end
+        raw, caption = [], []  # raw: (row, col, rowspan, colspan, Cell)
+        cols, seen = 0, False
+        j = i + 1
+        while j < end:
+            r = recs[j]
+            if r.tag == TABLE and not seen:
+                seen = True
+                cols = struct.unpack_from("<H", r.data, 6)[0] if len(r.data) >= 8 else 0
+                j = self.end(recs, j)
+            elif r.tag == LIST_HEADER and not seen:
+                k = self.list_end(recs, j)
+                caption.extend(self.paras(recs, j + 1, k, d + 1, True))
+                j = k
+            elif r.tag == LIST_HEADER:
+                k = self.list_end(recs, j, cell=True)
+                row, col, rs, cs = self.cell_at(r.data, len(raw), cols)
+                raw.append((row, col, rs, cs, Cell(self.paras(recs, j + 1, k, d + 1, True))))
+                j = k
+            else:
+                j = self.end(recs, j)
+        if raw:
+            st.extras.append(Table(place(raw)))
+        st.extras.extend(caption)
+        return end
+
+    @staticmethod
+    def cell_at(data, n, cols):
+        """(row, col, rowspan, colspan) of the n-th cell; a LIST_HEADER too short for them takes the next slot."""
+        if len(data) >= 16:
+            col, row, cs, rs = struct.unpack_from("<4H", data, 8)
+            return row, col, max(rs, 1), max(cs, 1)
+        row, col = divmod(n, cols) if cols else (0, n)
+        return row, col, 1, 1
+
+    def drawing(self, recs, i, st, d):
+        """A drawing object (gso): an optional caption list, then its SHAPE_COMPONENT. What the shape holds, then its
+        caption as paragraphs, follow the paragraph. The shape comment (offset 44) is its picture's alt text."""
+        end = self.end(recs, i)
+        alt = re.sub(r"\s+", " ", _wstr(recs[i].data, 44).replace("\0", "")).strip()
+        caption = []
+        j = i + 1
+        while j < end:
+            r = recs[j]
+            if r.tag == LIST_HEADER:
+                k = self.list_end(recs, j)
+                caption.extend(self.paras(recs, j + 1, k, d + 1, True))
+                j = k
+            elif r.tag == SHAPE_COMPONENT:
+                j = self.component(recs, j, st, d, 1, alt)
+            else:
+                j = self.end(recs, j)
+        st.extras.extend(caption)
+        return end
+
+    # ---- the SHAPE_COMPONENT walk: SHAPES handlers (recs, j, st, d, g, alt) -> the index after what they read
+    def component(self, recs, k, st, d, g, alt) -> int:
+        """A SHAPE_COMPONENT's child records in order. A group's members sit beside its SHAPE_CONTAINER, each one
+        group and one depth level deeper; past _GROUPS groups or MAX_DEPTH the component is counted under depth."""
+        end = self.end(recs, k)
+        if g > _GROUPS or d > limits.MAX_DEPTH:
+            self.deep()
+            return end
+        j = k + 1
+        while j < end:
+            name = self.SHAPES.get(recs[j].tag)
+            j = max(getattr(self, name)(recs, j, st, d, g, alt), j + 1) if name else self.end(recs, j)
+        return end
+
+    def member(self, recs, j, st, d, g, alt):
+        """A shape inside a group. The group's comment describes the group, so it is not the member's alt text."""
+        return self.component(recs, j, st, d + 1, g + 1, "")
+
+    def text_box(self, recs, j, st, d, g, alt):
+        """A text box: its LIST_HEADER (or a bare paragraph) and the paragraphs beside it."""
+        k = self.list_end(recs, j)
+        st.extras.extend(self.paras(recs, j, k, d + 1, st.nohead))
+        return k
+
+    def picture(self, recs, j, st, d, g, alt):
+        """SHAPE_PICTURE: the BinData item at offset 71."""
+        data = recs[j].data
+        bid = struct.unpack_from("<H", data, 71)[0] if len(data) >= 73 else 0
+        img = self.bin_data(bid)
+        if img is not None:
+            st.extras.append(Image(img, "" if AUTO_ALT.match(alt) else alt))
+        return self.end(recs, j)
 
 
 def parse(path, ctx) -> Doc:
