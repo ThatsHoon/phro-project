@@ -1,7 +1,6 @@
 """HWPX (Hancom Office, zip + XML) to the document model. Elements match by local name."""
 import fnmatch
 import re
-from bisect import bisect_left
 
 from .. import limits
 from ..charts import chart_table
@@ -11,23 +10,12 @@ from ..model import (
     Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem,
     Math, NoteRef, Para, Table, Text,
 )
+from .hancom import AUTO_ALT, STYLE_HEAD, number, place, tex as _tex
 
 HPF = "Contents/content.hpf"
 _MIME = "application/hwp+zip"
 _CASE_NS = {"http://www.hancom.co.kr/hwpml/2016/paragraph", "http://www.hancom.co.kr/hwpml/2016/ooxmlchart"}
-_AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다\.?$")
-_STYLE_HEAD = re.compile(r"^(?:개요|outline|heading)\s*(\d+)$", re.I)
 _BORDERS = ("leftBorder", "rightBorder", "topBorder", "bottomBorder")
-_SYLLABLE = "가나다라마바사아자차카타파하"
-_JAMO = "ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎ"
-_ROMAN = ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
-          (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"))
-_GREEK = ("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi pi rho sigma "
-          "tau upsilon phi chi psi omega").split()
-_GREEK_CAP = ("Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon", "Phi", "Psi", "Omega")
-_WORDS = {"times": "\\times", "le": "\\le", "ge": "\\ge",
-          **{g: "\\" + g for g in _GREEK}, **{g: "\\" + g for g in _GREEK_CAP}}
-_TEX_DEPTH = 32
 
 
 def _int(s, default=0):
@@ -35,97 +23,6 @@ def _int(s, default=0):
         return int(s)
     except (TypeError, ValueError):
         return default
-
-
-# ---- equation script to TeX
-def _operand(toks, i, depth):
-    """One operand starting at toks[i]: ((text, inner-or-None), next index)."""
-    if i >= len(toks):
-        return ("", None), i
-    if toks[i] == "{" and depth < _TEX_DEPTH:
-        items, j = _group(toks, i + 1, depth + 1)
-        inner = _join(items)
-        return ("{" + inner + "}", inner), j
-    t = toks[i]
-    return (_WORDS.get(t, t), None), i + 1
-
-
-def _group(toks, i, depth):
-    out = []
-    while i < len(toks):
-        t = toks[i]
-        i += 1
-        if t == "}":
-            if depth:
-                return out, i
-            continue
-        if t == "{" and depth < _TEX_DEPTH:
-            items, i = _group(toks, i, depth + 1)
-            inner = _join(items)
-            out.append(("{" + inner + "}", inner))
-        elif t == "over" and out and i < len(toks):
-            (den, dinner), i = _operand(toks, i, depth)
-            s, inner = out.pop()
-            out.append((f"\\frac{{{inner if inner is not None else s}}}{{{dinner if dinner is not None else den}}}", None))
-        elif t == "sqrt" and i < len(toks):
-            (s, inner), i = _operand(toks, i, depth)
-            out.append((f"\\sqrt{{{inner if inner is not None else s}}}", None))
-        else:
-            out.append((_WORDS.get(t, t), None))
-    return out, i
-
-
-def _join(items):
-    out = ""
-    for s, _ in items:
-        out += s if not out or s in "^_" or out[-1] in "^_" else " " + s
-    return out
-
-
-def _tex(script: str) -> str:
-    toks = re.findall(r"[{}^_]|[^\s{}^_]+", script or "")
-    items, _ = _group(toks, 0, 0)
-    return _join(items)
-
-
-# ---- numbering markers
-def _roman(n):
-    if not 0 < n < 4000:
-        return str(n)
-    out = ""
-    for v, s in _ROMAN:
-        while n >= v:
-            out += s
-            n -= v
-    return out
-
-
-def _bijective(n, alphabet):
-    out = ""
-    while n > 0:
-        n, r = divmod(n - 1, len(alphabet))
-        out = alphabet[r] + out
-    return out or str(n)
-
-
-def _fmt(n, kind):
-    if n < 1:
-        return str(n)
-    if kind == "CIRCLED_DIGIT":
-        return chr(0x2460 + n - 1) if n <= 20 else str(n)
-    if kind == "ROMAN_CAPITAL":
-        return _roman(n)
-    if kind == "ROMAN_SMALL":
-        return _roman(n).lower()
-    if kind == "LATIN_CAPITAL":
-        return _bijective(n, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    if kind == "LATIN_SMALL":
-        return _bijective(n, "abcdefghijklmnopqrstuvwxyz")
-    if kind == "HANGUL_SYLLABLE":
-        return _bijective(n, _SYLLABLE)
-    if kind == "HANGUL_JAMO":
-        return _bijective(n, _JAMO)
-    return str(n)
 
 
 # ---- inline helpers
@@ -374,7 +271,7 @@ class _Reader:
 
     def style_level(self, sid):
         name = self.hdr.style.get(sid, ("", None))[0]
-        if m := _STYLE_HEAD.match(name):
+        if m := STYLE_HEAD.match(name):
             return min(max(int(m.group(1)), 1), 6)
         low = name.lower()
         if low in ("제목", "title"):
@@ -394,7 +291,7 @@ class _Reader:
         def sub(m):
             n = int(m.group(1))
             h = levels.get(n)
-            return _fmt(cnt.get(n - 1, h[2] if h else 1), h[1] if h else "DIGIT")
+            return number(cnt.get(n - 1, h[2] if h else 1), h[1] if h else "DIGIT")
 
         fmt = head[0] if head and head[0] else f"^{lvl + 1}."
         return re.sub(r"\^(\d)", sub, fmt).strip()[:64] or "-"
@@ -527,7 +424,7 @@ class _Reader:
             return
         sc = first(pic, "shapeComment")
         alt = re.sub(r"\s+", " ", sc.text or "").strip() if sc is not None else ""
-        st.extras.append(Image(data, "" if _AUTO_ALT.match(alt) else alt))
+        st.extras.append(Image(data, "" if AUTO_ALT.match(alt) else alt))
 
     def chart(self, el, st):
         href = attr(el, "chartIDRef")
@@ -567,18 +464,8 @@ class _Reader:
                 plain = plain and self.hdr.plain.get(attr(tc, "borderFillIDRef"), False)
         if not raw:
             return []
-        # the grid keeps only rows and columns where a cell starts; a span counts the kept ones it covers
-        rows_at, cols_at = sorted({x[0] for x in raw}), sorted({x[1] for x in raw})
-        ri = {v: i for i, v in enumerate(rows_at)}
-        ci = {v: i for i, v in enumerate(cols_at)}
-        grid = [[] for _ in range(len(rows_at))]
-        for row, col, rs, cs, cell in raw:
-            r, c = ri[row], ci[col]
-            cell.rowspan = bisect_left(rows_at, row + rs) - r
-            cell.colspan = bisect_left(cols_at, col + cs) - c
-            grid[r].append((c, cell))
-        nrows, ncols = len(rows_at), len(cols_at)
-        rows = [[cell for _, cell in sorted(g, key=lambda x: x[0])] for g in grid]
+        nrows, ncols = len({x[0] for x in raw}), len({x[1] for x in raw})
+        rows = place(raw)
         if plain and (nrows == 1 or ncols == 1):
             return [b for row in rows for c in row for b in c.blocks]
         return [Table(rows)]
