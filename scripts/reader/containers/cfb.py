@@ -13,7 +13,7 @@ from pathlib import Path
 from ..limits import BIG_PART, CFB_CHAIN, CFB_DEPTH, CFB_ENTRIES, CFB_SECTORS, CFB_STREAM, ReadError
 
 MAGIC = bytes.fromhex("d0cf11e0a1b11ae1")
-FREESECT = NOSTREAM = 0xFFFFFFFF
+FREESECT = 0xFFFFFFFF
 ENDOFCHAIN = 0xFFFFFFFE
 MAXREG = 0xFFFFFFFA   # sector ids from here up are markers, never sectors
 _STORAGE, _STREAM, _ROOT = 1, 2, 5
@@ -99,7 +99,7 @@ class Compound:
         if self._nsec > CFB_SECTORS:
             raise ReadError("damaged", "compound file header")
         self._owner = array("i", bytes(4 * self._nsec))  # sector id -> id of the chain that claimed it
-        self._next_key = 1
+        self._chains = {}  # owner key -> its chain, once walked
         self._mini_owner = {}
         try:
             self._load_fat(head, n_fat, first_difat, n_difat)
@@ -114,50 +114,65 @@ class Compound:
             raise ReadError("damaged", "compound file directory") from None
 
     def _load_fat(self, head, n_fat, first_difat, n_difat):
-        ids = [s for s in struct.unpack_from("<109I", head, 0x4C) if s != FREESECT]
+        """The FAT, read only as far as it covers the physical sectors; every count is bounded first."""
+        if not 1 <= n_fat <= self._nsec:
+            raise CfbError("fat count")
+        ids = [s for s in struct.unpack_from("<109I", head, 0x4C) if s != FREESECT][:n_fat]
         per = self._ss // 4 - 1
         sid, seen = first_difat, set()
         for _ in range(min(n_difat, self._nsec)):
-            if sid >= MAXREG:
+            if len(ids) >= n_fat or sid >= MAXREG:
                 break
             if sid >= self._nsec or sid in seen:
                 raise CfbError("difat")
             seen.add(sid)
             words = _words(self._sector(sid))
-            ids.extend(w for w in words[:per] if w != FREESECT)
-            sid = words[per] if len(words) > per else ENDOFCHAIN
-        ids = ids[:n_fat]
-        if len(ids) > self._nsec:
-            raise CfbError("fat")
+            if len(words) <= per:
+                raise CfbError("short difat sector")
+            ids.extend([w for w in words[:per] if w != FREESECT][:n_fat - len(ids)])
+            sid = words[per]
         fat = array("I")
-        for s in ids:
+        for i, s in enumerate(ids):
+            if len(fat) >= self._nsec:
+                break  # the FAT already addresses every physical sector
             if s >= self._nsec:
                 raise CfbError("fat sector out of range")
-            fat.extend(_words(self._sector(s)))
-        self._fat = fat
+            raw = self._sector(s)
+            if len(raw) < self._ss and i + 1 < len(ids):
+                raise CfbError("short fat sector")
+            fat.extend(_words(raw))
+        self._fat = fat[:self._nsec]
 
     def _chain(self, start: int, fat, nmax: int, owners, key: int) -> list:
-        """The sector ids from start to ENDOFCHAIN; raises on a loop, a bad id or a cross-link."""
+        """The sector ids from start to ENDOFCHAIN. A bad chain poisons its sectors (-1), so no later
+        walk that reaches them costs more than a step."""
         out, seen = [], set()
         sid = start
-        while sid != ENDOFCHAIN:
-            if sid >= nmax or sid >= len(fat) or sid in seen:
-                raise CfbError("chain")
-            if len(out) >= CFB_CHAIN:
-                raise CfbError("chain too long")
-            if owners[sid] not in (0, key):
-                raise CfbError("cross-linked chain")
-            seen.add(sid)
-            out.append(sid)
-            sid = fat[sid]
+        try:
+            while sid != ENDOFCHAIN:
+                if sid >= nmax or sid >= len(fat) or sid in seen:
+                    raise CfbError("chain")
+                if len(out) >= CFB_CHAIN:
+                    raise CfbError("chain too long")
+                if owners[sid] not in (0, key):
+                    raise CfbError("cross-linked chain")
+                seen.add(sid)
+                out.append(sid)
+                sid = fat[sid]
+        except CfbError:
+            for s in out:
+                owners[s] = -1
+            raise
         for s in out:
             owners[s] = key
         return out
 
-    def _claim(self, start: int) -> list:
-        key = self._next_key
-        self._next_key += 1
-        return self._chain(start, self._fat, self._nsec, self._owner, key)
+    def _claim(self, start: int, key: int) -> list:
+        """The chain of one owner (1 directory, 2 mini FAT, 3 mini stream, entry id + 4 a stream), walked once."""
+        chain = self._chains.get(key)
+        if chain is None:
+            chain = self._chains[key] = self._chain(start, self._fat, self._nsec, self._owner, key)
+        return chain
 
     def _gather(self, chain: list, size: int) -> bytes:
         ss, parts, i = self._ss, [], 0
@@ -173,7 +188,7 @@ class Compound:
         return data[:size]
 
     def _load_dir(self, first_dir: int):
-        chain = self._claim(first_dir)
+        chain = self._claim(first_dir, 1)
         if len(chain) * (self._ss // 128) > CFB_ENTRIES + self._ss // 128:
             raise CfbError("too many directory entries")
         raw = self._gather(chain, len(chain) * self._ss)
@@ -242,10 +257,11 @@ class Compound:
             return b""
         if size < _MINI_CUTOFF:
             return self._read_mini(start, size, eid)
-        chain = self._claim(start)
-        if len(chain) * self._ss < size:
+        chain = self._claim(start, eid + 4)
+        need = -(-size // self._ss)
+        if len(chain) < need:
             raise CfbError("short chain")
-        return self._gather(chain, size)
+        return self._gather(chain[:need], size)
 
     # ---- mini stream
     def _load_mini(self):
@@ -253,28 +269,29 @@ class Compound:
             return
         mf = array("I")
         if self._n_mini and self._first_mini < MAXREG:
-            for s in self._claim(self._first_mini):
+            for s in self._claim(self._first_mini, 2):
                 mf.extend(_words(self._sector(s)))
         root_start = self._root[5]
-        self._root_chain = self._claim(root_start) if root_start < MAXREG else []
+        self._root_chain = self._claim(root_start, 3) if root_start < MAXREG else []
         self._minifat = mf
 
     def _read_mini(self, start: int, size: int, eid: int) -> bytes:
-        try:
-            self._load_mini()
-        except CfbError:
-            self._minifat = None
-            raise
+        self._load_mini()
         mf = self._minifat
         out, seen, sid = [], set(), start
-        while sid != ENDOFCHAIN:
-            if sid >= len(mf) or sid in seen or len(out) > _MINI_CUTOFF // _MINI_SECTOR + 1:
-                raise CfbError("mini chain")
-            if self._mini_owner.setdefault(sid, eid) != eid:
-                raise CfbError("cross-linked mini chain")
-            seen.add(sid)
-            out.append(sid)
-            sid = mf[sid]
+        try:
+            while sid != ENDOFCHAIN:
+                if sid >= len(mf) or sid in seen or len(out) > _MINI_CUTOFF // _MINI_SECTOR + 1:
+                    raise CfbError("mini chain")
+                if self._mini_owner.setdefault(sid, eid) != eid:
+                    raise CfbError("cross-linked mini chain")
+                seen.add(sid)
+                out.append(sid)
+                sid = mf[sid]
+        except CfbError:
+            for m in out:
+                self._mini_owner[m] = -1
+            raise
         need = -(-size // _MINI_SECTOR)
         if len(out) < need:
             raise CfbError("short mini chain")

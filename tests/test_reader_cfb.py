@@ -140,6 +140,58 @@ def test_cross_link():
         raises(CfbError, c.read, "B")
 
 
+def test_reread_big_stream():
+    big = bytes(i % 253 for i in range(5000))
+    p, _ = build({"Big": big, "Small": b"abc"})
+    with Compound(p) as c:
+        for name in ("Small", "Small", "Big", "Big", "big", "BIG"):
+            assert c.read(name) == (b"abc" if name == "Small" else big), name
+
+
+def test_fat_count_and_difat_are_bounded():
+    p, info = build({"X": bytes(5000)})
+    good = p.read_bytes()
+    nsec = len(good) // 512 - 1
+    patch(p, 0x2C, "<I", nsec + 1)  # more FAT sectors than the file has sectors
+    e = raises(ReadError, Compound, p)
+    assert e.kind == "damaged" and e.detail == "compound file header"
+    p.write_bytes(good)
+    patch(p, 0x2C, "<I", 0)
+    assert raises(ReadError, Compound, p).detail == "compound file header"
+    # a DIFAT chain of non-free sectors: the FAT must stay within the physical sector count
+    p.write_bytes(good)
+    chain = info["chains"]["X"]
+    for i in range(3):
+        nxt = chain[i + 1] if i < 2 else 0xFFFFFFFE
+        patch(p, (chain[i] + 1) * 512, "<128I", *([info["fat"][0]] * 127 + [nxt]))
+    patch(p, 0x44, "<II", chain[0], 3)
+    patch(p, 0x2C, "<I", nsec)
+    with Compound(p) as c:
+        assert len(c._fat) <= nsec
+        assert c.exists("X")
+
+
+def test_shared_looping_chain_is_fast():
+    import time
+    streams = {"Filler": bytes(2000000)}
+    for i in range(5000):
+        streams[f"S{i}"] = b"x"
+    p, info = build(streams)
+    chain = info["chains"]["Filler"]
+    patch(p, fat_slot(info, chain[-1]), "<I", chain[0])  # the chain loops
+    b = bytearray(p.read_bytes())
+    for k in range(2, 5002):  # every other entry claims the looping chain
+        struct.pack_into("<I", b, entry_off(info, k) + 116, chain[0])
+        struct.pack_into("<I", b, entry_off(info, k) + 120, 5000)
+    p.write_bytes(bytes(b))
+    t0 = time.monotonic()
+    with Compound(p) as c:
+        for k in range(5000):
+            raises(CfbError, c.read, f"S{k}")
+        raises(CfbError, c.read, "Filler")
+    assert time.monotonic() - t0 < 2.0
+
+
 def test_directory_loop():
     p, info = build()
     patch(p, entry_off(info, 1) + 72, "<I", 1)  # entry 1 is its own right sibling
