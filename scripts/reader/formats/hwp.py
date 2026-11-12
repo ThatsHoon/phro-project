@@ -115,6 +115,7 @@ class _Reader(Scopes):
         self.blobs = {}     # (BinData stream name, inflated?, kind) -> its bytes, or None when it cannot be read
         self.tables = {}    # an OLE item's bytes -> its chart table, or None
         self.opened = 0     # tables opened so far (TABLE_NODES)
+        self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
         # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
         # holds the accepted text (dochan reader.py), so a range left in it hides nothing
         self.view = False
@@ -634,12 +635,17 @@ class _Reader(Scopes):
         return k
 
     def picture(self, recs, j, st, d, g, alt):
-        """SHAPE_PICTURE: the BinData item at offset 71."""
+        """SHAPE_PICTURE: the BinData item at offset 71. Every placement is charged against IMAGE_BYTES, as in the Word
+        readers; one past it is counted under image instead."""
         data = recs[j].data
         bid = struct.unpack_from("<H", data, 71)[0] if len(data) >= 73 else 0
         img = self.bin_data(bid)
         if img is not None:
-            st.extras.append(Image(img, "" if AUTO_ALT.match(alt) else alt))
+            self.image_bytes += len(img)
+            if self.image_bytes > limits.IMAGE_BYTES:
+                self.ctx.skipped["image"] += 1
+            else:
+                st.extras.append(Image(img, "" if AUTO_ALT.match(alt) else alt))
         return self.end(recs, j)
 
     def ole(self, recs, j, st, d, g, alt):

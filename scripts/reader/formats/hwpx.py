@@ -65,6 +65,7 @@ class _Reader(Scopes):
         self.cache = {}
         self.charts = {}
         self.opened = 0  # tables opened so far (TABLE_NODES)
+        self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
 
     # ---- package
     def find(self, href):
@@ -293,9 +294,15 @@ class _Reader(Scopes):
                 self.node(c, st, d + 1)
 
     def picture(self, pic, st):
+        """Every placement is charged against IMAGE_BYTES, as in the Word readers; one past it is counted under image
+        instead."""
         img = first(pic, "img")
         data = self.part_bytes(self.images.get(attr(img, "binaryItemIDRef")), "image") if img is not None else None
         if not data:
+            return
+        self.image_bytes += len(data)
+        if self.image_bytes > limits.IMAGE_BYTES:
+            self.ctx.skipped["image"] += 1
             return
         sc = first(pic, "shapeComment")
         alt = re.sub(r"\s+", " ", sc.text or "").strip() if sc is not None else ""

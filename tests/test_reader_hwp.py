@@ -417,6 +417,19 @@ def test_picture_compressed_item():
     assert seen == [packed], seen
 
 
+def test_picture_placements_charged():
+    # every placement is charged against IMAGE_BYTES, as in docx and doc: one 4 MiB picture placed 100 times is placed
+    # while the total stays under the cap, each one past it is counted under image, and the render stays bounded
+    big = PNG + bytes(4 * 2**20 - len(PNG))
+    n, keep = 100, limits.IMAGE_BYTES // (4 * 2**20)
+    p = pic_file(*[hwp_picture(1)] * n, streams={"BIN0001.png": big})
+    t0 = time.monotonic()
+    doc, ctx = parse(p)
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert time.monotonic() - t0 < 10
+    assert ctx.skipped["image"] == n - keep and out.count("![") == keep, (ctx.skipped, out.count("!["))
+
+
 def test_picture_missing_stream():
     p = pic_file(hwp_picture(2), hwp_picture(1), bins=(("png", 2), ("png", 2)), streams={"BIN0001.png": PNG})
     out = md(p)

@@ -367,6 +367,23 @@ def test_duplicate_sections_and_parts():
     assert ctx.skipped["image"] == 2
 
 
+def test_picture_placements_charged():
+    # every placement is charged against IMAGE_BYTES, as in docx and doc: one 4 MiB picture placed 100 times is placed
+    # while the total stays under the cap, each one past it is counted under image, and the render stays bounded
+    import random
+    import time
+    big = PNG + random.Random(7).randbytes(4 * 2**20 - len(PNG))  # does not deflate past ZIP_RATIO
+    n, keep = 100, limits.IMAGE_BYTES // (4 * 2**20)
+    pic = '<hp:p><hp:run><hp:pic><hc:img binaryItemIDRef="image1"/></hp:pic></hp:run></hp:p>'
+    p = hwpx_doc(pic * n, hpf_items='<opf:item id="image1" href="BinData/image1.png"/>',
+                 extra={"BinData/image1.png": big})
+    t0 = time.monotonic()
+    doc, ctx = parse(p)
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert time.monotonic() - t0 < 10
+    assert ctx.skipped["image"] == n - keep and out.count("![") == keep, (ctx.skipped, out.count("!["))
+
+
 def test_huge_and_negative_addresses():
     import time
     t0 = time.monotonic()
