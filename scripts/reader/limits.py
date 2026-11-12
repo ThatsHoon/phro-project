@@ -23,6 +23,11 @@ CFB_DEPTH = 128           # storage nesting
 CFB_CHAIN = 4_000_000     # steps of one sector chain
 HWP_RECORDS = 1_000_000   # records of one HWP stream
 IMAGE_BYTES = 256 * 2**20  # image bytes one Word document (docx, doc) may emit, copies counted
+# tables one doc, docx, hwp or hwpx document may open, nested ones counted. A .doc paragraph opens up to 63 with one
+# 3-byte sprmPItap, and a deflated docx part or hwp section holds one in about a byte; each costs the model about
+# 600 bytes. A real document has thousands at most (a thousand-page form with ten tables a page has ten thousand);
+# ten times that is past any, and holds the tables to about 60 MB and a second or two of parse and render
+TABLE_NODES = 100_000
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 # a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
 BIG_INPUT = "input"  # the file is over MAX_INPUT

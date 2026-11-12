@@ -64,6 +64,7 @@ class _Reader(Scopes):
         self.numbers = {}
         self.cache = {}
         self.charts = {}
+        self.opened = 0  # tables opened so far (TABLE_NODES)
 
     # ---- package
     def find(self, href):
@@ -319,6 +320,10 @@ class _Reader(Scopes):
 
     # ---- tables
     def table(self, tbl, d):
+        if self.opened >= limits.TABLE_NODES:  # left out as past MAX_DEPTH
+            self.deep()
+            return []
+        self.opened += 1
         raw = []  # (row, col, rowspan, colspan, Cell)
         plain = True
         seen = {}

@@ -11,7 +11,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
-from reader import markdown  # noqa: E402
+from reader import limits, markdown  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
 from reader.formats import hwpx  # noqa: E402
@@ -167,6 +167,18 @@ def test_header_cell_pipe_table():
     doc, _ = parse(hwpx_doc(sec))
     assert doc.blocks[0].rows[0][0].header and not doc.blocks[0].rows[1][0].header
     assert "|머|리|\n|---|---|\n|값|둘|" in md(hwpx_doc(sec))
+
+
+def test_table_budget():
+    # a table past the document's TABLE_NODES is left out as one past MAX_DEPTH is, each counted under depth
+    sec = "".join(_tbl(_tc(str(k), 0, 0) + _tc("x", 1, 0)) for k in range(4))
+    old, limits.TABLE_NODES = limits.TABLE_NODES, 2
+    try:
+        doc, ctx = parse(hwpx_doc(sec))
+    finally:
+        limits.TABLE_NODES = old
+    assert ctx.skipped["depth"] == 2 and len(doc.blocks) == 2, (ctx.skipped, doc.blocks)
+    assert [b.rows[0][0].blocks[0].inlines[0].text for b in doc.blocks] == ["0", "1"], doc.blocks
 
 
 def test_layout_table_unwrapped():

@@ -427,7 +427,38 @@ def test_tables_linear():
     spans += [(8_000, 8_001, u16(0) + sp(IN_TABLE, 1)), (8_001, 8_002, u16(0) + sp(IN_TABLE, 1) + sp(TTP, 1))]
     t0 = time.monotonic()
     d, ctx = parse(doc_file([(text, False)], papx=spans))
+    out = markdown.render(d, tmp() / "a", False, ctx.skipped)
     assert len(d.blocks) == 1 and time.monotonic() - t0 < 10 and not ctx.skipped, ctx.skipped
+    assert out == "p\n\n" * 3_999 + "p\n", out[:200]
+
+
+def test_depth_flip_table_budget():
+    # depth flipping between 1 and MAX_DEPTH at each paragraph opens 63 tables a paragraph for one 3-byte sprm: past
+    # TABLE_NODES tables none open, the paragraph stays in the innermost open cell and each overflowing one is
+    # counted under depth; every paragraph is kept, and parse and render stay linear
+    n = 20_000
+    text = "p\r" * n + "\x07\x07"
+    deep = [u16(0) + sp(IN_TABLE, 1) + sp(ITAP, itap) for itap in (1, limits.MAX_DEPTH)]
+    spans = [(2 * k, 2 * k + 2, deep[k % 2]) for k in range(n)]
+    spans += [(2 * n, 2 * n + 1, deep[0]), (2 * n + 1, 2 * n + 2, deep[0] + sp(TTP, 1))]
+    p = doc_file([(text, False)], papx=spans)
+    t0 = time.monotonic()
+    d, ctx = parse(p)
+    out = markdown.render(d, tmp() / "a", False, ctx.skipped)
+    took = time.monotonic() - t0
+    tables = paras = 0
+    todo = list(d.blocks)
+    while todo:
+        b = todo.pop()
+        if isinstance(b, Table):
+            tables += 1
+            todo.extend(x for row in b.rows for cell in row for x in cell.blocks)
+        elif isinstance(b, Para):
+            paras += 1
+    assert took < 10, took
+    assert ctx.skipped["depth"], ctx.skipped
+    assert ctx.skipped["depth"] == n // 2 - (limits.TABLE_NODES - 1) // (limits.MAX_DEPTH - 1), ctx.skipped
+    assert tables <= limits.TABLE_NODES and paras == n and "p" in out, (tables, paras)
 
 
 def main():

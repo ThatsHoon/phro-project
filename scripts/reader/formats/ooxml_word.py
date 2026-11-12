@@ -74,6 +74,7 @@ class _Reader:
         self.scope = None
         self.image_bytes = 0
         self.chart_cells = 0
+        self.opened = 0  # tables opened so far (TABLE_NODES)
 
     # ---- packages and parts
     def deep(self):
@@ -416,9 +417,10 @@ class _Reader:
 
     # ---- tables
     def table(self, tbl, d):
-        if d > limits.MAX_DEPTH:
+        if d > limits.MAX_DEPTH or self.opened >= limits.TABLE_NODES:
             self.deep()
             return []
+        self.opened += 1
         rows = []  # (tr, [tc, ...])
         for ch in tbl:
             n = local(ch.tag)

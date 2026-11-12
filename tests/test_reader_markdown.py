@@ -251,6 +251,43 @@ def test_deep_nesting_is_fast():
     assert time.time() - t0 < 1 and "leaf" in out
 
 
+def test_has_text_scanned_once_a_render():
+    # a chain of one-cell tables, each cell holding only the next table: every table's grid asks whether its cell has
+    # text, a scan of the chain below it. One memo for the whole render scans each cell once, so the scans grow with
+    # the chain's depth, not with its square
+    calls = []
+    old = markdown._Render._block_has_text
+
+    def spy(self, b):
+        calls.append(b)
+        return old(self, b)
+
+    def chain(d):
+        tb = Table([[c("leaf")]])
+        for _ in range(d):
+            tb = Table([[Cell([tb])]])
+        return Doc(blocks=[tb])
+    counts = {}
+    markdown._Render._block_has_text = spy
+    try:
+        for d in (20, 40):
+            calls.clear()
+            assert R(chain(d)) == "leaf\n"
+            counts[d] = len(calls)
+    finally:
+        markdown._Render._block_has_text = old
+    assert counts[40] <= 2 * counts[20] + 4, counts
+    # a list met again where its scan would pass MAX_DEPTH is scanned again: the answer and the count are a fresh
+    # scan's
+    r = markdown._Render(Doc(), Path(tempfile.mkdtemp()), False)
+    blocks = [Table([[Cell([P("s")])]])]
+    assert r._has_text(blocks) and not r.too_deep
+    r.depth = limits.MAX_DEPTH - 1
+    assert not r._has_text(blocks) and r.too_deep == 1
+    r.depth = 0
+    assert r._has_text(blocks) and r.too_deep == 1
+
+
 def test_nested_hidden_rows():
     inner = Table([[c("a")], [c("SECRET")], [c("b")]], hidden_rows=frozenset({1}))
     doc = Doc(blocks=[Table([[Cell([inner]), c("z")]])])

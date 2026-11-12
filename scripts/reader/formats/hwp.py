@@ -114,6 +114,7 @@ class _Reader(Scopes):
         self.outline = 0    # the outline numbering id of the current section's secd
         self.blobs = {}     # (BinData stream name, inflated?, kind) -> its bytes, or None when it cannot be read
         self.tables = {}    # an OLE item's bytes -> its chart table, or None
+        self.opened = 0     # tables opened so far (TABLE_NODES)
         # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
         # holds the accepted text (dochan reader.py), so a range left in it hides nothing
         self.view = False
@@ -544,11 +545,13 @@ class _Reader(Scopes):
 
     def table(self, recs, i, st, d):
         """An optional caption list, TABLE, then a LIST_HEADER per cell with the cell's paragraphs beside it. The
-        table, then its caption as paragraphs, follow the paragraph that holds it."""
+        table, then its caption as paragraphs, follow the paragraph that holds it. Past MAX_DEPTH or the document's
+        TABLE_NODES the table is left out and counted under depth."""
         end = self.end(recs, i)
-        if d + 1 > limits.MAX_DEPTH:
+        if d + 1 > limits.MAX_DEPTH or self.opened >= limits.TABLE_NODES:
             self.deep()
             return end
+        self.opened += 1
         raw, caption = [], []  # raw: (row, col, rowspan, colspan, Cell)
         cols, seen = 0, False
         j = i + 1

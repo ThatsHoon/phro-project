@@ -229,8 +229,8 @@ class _State:
     run and seg are the properties and the CHPX run of the segment being walked; hid is the Hidden last opened, which
     the rest of its segment (or of a deletion) joins while it is still the last inline of its scope. tables are the
     tables open around the paragraph, outermost first (tables[k] at depth k + 1); overflow is set while paragraphs nest
-    past MAX_DEPTH, so one overflowing subtree is counted once. extras are the blocks (pictures) that follow the open
-    paragraph where it goes, eqs its equations (Math)."""
+    past MAX_DEPTH or TABLE_NODES, so one overflowing subtree is counted once. extras are the blocks (pictures) that
+    follow the open paragraph where it goes, eqs its equations (Math)."""
 
     def __init__(self, name, story=None):
         self.name = name
@@ -266,6 +266,7 @@ class _Reader:
         self.cf, self.ctx = cf, ctx
         self.budget = budget or flate.Budget()  # the one flate.Budget every deflated BLIP of the document shares
         self.image_bytes = 0  # image bytes placed so far, copies counted (IMAGE_BYTES)
+        self.opened = 0  # tables opened so far in every story (TABLE_NODES)
         self.pictures = doc_pictures.Pictures(self)
         self.objects = doc_objects.Objects(self)
         self.doc = Doc()
@@ -740,16 +741,19 @@ class _Reader:
         """A paragraph's blocks into the story, or into the open cell of the table its depth puts it in: max(itap, 1)
         with sprmPFInTable, else 0. The tables deeper than that close and the missing ones open. At depth 1 a \\x07
         ends the cell and, with sprmPFTtp, the row (its TDefTable defining the row's cells); deeper, a mark with
-        sprmPFInnerTableCell ends the cell and one with sprmPFInnerTtp the row. Past MAX_DEPTH the paragraph stays a
-        paragraph of the innermost open cell, its marks ending nothing, and each overflowing subtree is counted once
-        under depth. A \\x07 outside a table ends a paragraph only. O(1) a paragraph past the tables it opens."""
+        sprmPFInnerTableCell ends the cell and one with sprmPFInnerTtp the row. Past MAX_DEPTH, or when the tables it
+        would open pass the document's TABLE_NODES, the paragraph stays a paragraph of the innermost open cell (of the
+        story when none is open and no table may open), its marks ending nothing, and each overflowing subtree is
+        counted once under depth. A \\x07 outside a table ends a paragraph only. O(1) a paragraph past the tables it
+        opens."""
         depth = max(p.itap, 1) if p.in_table else 0
         tables = st.tables
-        if depth > limits.MAX_DEPTH:
+        room = limits.TABLE_NODES - self.opened
+        if depth > limits.MAX_DEPTH or depth - len(tables) > room:
             if not st.overflow:
                 st.overflow = True
                 self.deep()
-            depth = max(len(tables), 1)
+            depth = max(len(tables), min(room, 1))
             row_end = cell_end = False
         else:
             st.overflow = False
@@ -759,6 +763,7 @@ class _Reader:
         if not depth:
             st.out.extend(blocks)
             return
+        self.opened += max(depth - len(tables), 0)
         while len(tables) < depth:
             tables.append(_Table())
         t = tables[-1]

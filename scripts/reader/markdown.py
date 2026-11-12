@@ -126,6 +126,8 @@ class _Render:
         self.unviewable: list[str] = []
         self.linked: set[str] = set()  # viewable images the output links to
         self.size = 0  # characters emitted so far by leaf blocks; building stops past MAX_OUTPUT
+        self.memo = {}  # id(blocks) -> (has text, levels its scan went below the call, blocks): see _has_text
+        self.reach = 0  # the deepest level the has-text scan under way has called _enter at
 
     # ---- hidden handling
     def _skip(self, node) -> bool:
@@ -349,13 +351,27 @@ class _Render:
         return m.br.join(x for x in (self._flat(b, m) for b in cell.blocks) if x)
 
     def _has_text(self, blocks) -> bool:
-        """Whether blocks would render to something, decided without rendering."""
-        if not self._enter():
-            return False
-        try:
-            return any(self._block_has_text(b) for b in blocks)
-        finally:
-            self.depth -= 1
+        """Whether blocks would render to something, decided without rendering. The answer is kept for the whole
+        render by identity (the entry holds the list, so its id is never reused) with how many levels below the call
+        its scan went: a call deep enough for that scan to pass MAX_DEPTH scans again, and a scan the cap cut is not
+        kept, so every answer and too_deep count is a fresh scan's. A chain of one-cell tables is scanned once, not
+        once a table."""
+        d = self.depth
+        hit = self.memo.get(id(blocks))
+        if hit is not None and d + hit[1] < limits.MAX_DEPTH:
+            self.reach = max(self.reach, d + hit[1])
+            return hit[0]
+        outer, self.reach = self.reach, d
+        found = False
+        if self._enter():
+            try:
+                found = any(self._block_has_text(b) for b in blocks)
+            finally:
+                self.depth -= 1
+            if self.reach < limits.MAX_DEPTH:
+                self.memo[id(blocks)] = (found, self.reach - d, blocks)
+        self.reach = max(outer, self.reach)
+        return found
 
     def _inl_has_text(self, items) -> bool:
         for it in items:

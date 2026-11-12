@@ -15,7 +15,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
-from reader import markdown  # noqa: E402
+from reader import limits, markdown  # noqa: E402
 from reader.formats import hancom, hwp  # noqa: E402
 from reader.formats import hwp_records as hr  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
@@ -358,6 +358,17 @@ def test_nested_table_depth_cap():
     doc, ctx = parse(hwp_file(hwp_para(FFFC, controls=(nest(0, 2),))))
     assert ctx.skipped["depth"] == 1, ctx.skipped
     assert "바닥" not in markdown.render(doc, tmp() / "a", False, ctx.skipped)
+
+
+def test_table_budget():
+    # a table past the document's TABLE_NODES is left out as one past MAX_DEPTH is, each counted under depth
+    old, limits.TABLE_NODES = limits.TABLE_NODES, 2
+    try:
+        doc, ctx = parse(hwp_file(b"".join(hwp_para(FFFC, controls=(hwp_table([[str(k)]]),)) for k in range(4))))
+    finally:
+        limits.TABLE_NODES = old
+    assert ctx.skipped["depth"] == 2 and len(doc.blocks) == 2, (ctx.skipped, doc.blocks)
+    assert [b.rows[0][0].blocks[0].inlines[0].text for b in doc.blocks] == ["0", "1"], doc.blocks
 
 
 # ---- pictures and drawing objects

@@ -12,7 +12,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
-from reader import markdown  # noqa: E402
+from reader import limits, markdown  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
 from reader.formats import ooxml  # noqa: E402
@@ -411,6 +411,18 @@ def test_field_begin_without_end_and_deep_fields():
     assert time.time() - t0 < 5 and "끝없는" in out and "다음" in out
     out = md(docm('<w:p><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t>고아</w:t></w:r></w:p>'))
     assert "고아" in out
+
+
+def test_table_budget():
+    # a table past the document's TABLE_NODES is left out as one past MAX_DEPTH is, each counted under depth
+    body = "".join(f"<w:tbl><w:tr>{tc(str(k))}{tc('x')}</w:tr></w:tbl>" for k in range(4))
+    old, limits.TABLE_NODES = limits.TABLE_NODES, 2
+    try:
+        doc, ctx = parse(docm(body))
+    finally:
+        limits.TABLE_NODES = old
+    assert ctx.skipped["depth"] == 2 and len(doc.blocks) == 2, (ctx.skipped, doc.blocks)
+    assert [b.rows[0][0].blocks[0].inlines[0].text for b in doc.blocks] == ["0", "1"], doc.blocks
 
 
 def test_deep_nesting_tables_sdt_and_textbox():
