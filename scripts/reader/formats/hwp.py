@@ -14,6 +14,7 @@ from bisect import bisect_right
 from .. import limits
 from ..containers import flate
 from ..containers.cfb import Compound, is_cfb
+from ..images import sniff
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Equation, Heading, Image, ListItem, Math, NoteRef, Para, Table, Text
 from . import hwpx
@@ -122,15 +123,27 @@ class _Reader(Scopes):
         return data
 
     def load_bin(self, name, packed):
+        """A picture over a limit (ReadError damaged or too_large), missing, broken or cut is None, as hwpx skips one."""
         try:
-            data = self.cf.read(name)
-            return (flate.inflate(data, self.budget) if packed else data) or None
+            raw = self.cf.read(name)
         except ReadError as e:
-            if e.kind not in ("damaged", "too_large"):  # a picture over a limit is skipped, as hwpx skips one
+            if e.kind not in ("damaged", "too_large"):
                 raise
-        except (KeyError, ValueError):  # no such stream, a broken chain, a corrupt or cut deflate stream
-            pass
-        return None
+            return None
+        except (KeyError, ValueError):  # no such stream, a broken chain
+            return None
+        if not packed:
+            return raw or None
+        try:
+            return flate.inflate(raw, self.budget) or None
+        except ReadError as e:
+            if e.kind not in ("damaged", "too_large"):
+                raise
+            return None
+        except flate.Truncated:  # a cut picture is a broken one
+            return None
+        except ValueError:  # not deflate at all: an item marked compressed but stored, kept as rhwp and dochan keep it
+            return raw if len(raw) >= 16 and sniff(raw) else None
 
     def section_names(self) -> list:
         """The declared section count together with the BodyText/Section<N> streams found, N under 1000, in order."""
@@ -482,8 +495,9 @@ class _Reader(Scopes):
         return row, col, 1, 1
 
     def drawing(self, recs, i, st, d):
-        """A drawing object (gso): an optional caption list, then its SHAPE_COMPONENT. What the shape holds, then its
-        caption as paragraphs, follow the paragraph. The shape comment (offset 44) is its picture's alt text."""
+        """A drawing object (gso): an optional caption list, then its SHAPE_COMPONENT, or in an older layout the shape
+        record (SHAPE_PICTURE) right under the control, read through SHAPES. What the shape holds, then its caption as
+        paragraphs, follow the paragraph. The shape comment (offset 44) is its picture's alt text."""
         end = self.end(recs, i)
         alt = re.sub(r"\s+", " ", _wstr(recs[i].data, 44).replace("\0", "")).strip()
         caption = []
@@ -496,6 +510,8 @@ class _Reader(Scopes):
                 j = k
             elif r.tag == SHAPE_COMPONENT:
                 j = self.component(recs, j, st, d, 1, alt)
+            elif name := self.SHAPES.get(r.tag):
+                j = max(getattr(self, name)(recs, j, st, d, 1, alt), j + 1)
             else:
                 j = self.end(recs, j)
         st.extras.extend(caption)

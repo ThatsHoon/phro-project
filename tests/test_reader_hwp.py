@@ -427,6 +427,21 @@ def test_broken_pictures_counted():
     assert out == "(could not read: 6 images)\n\n![](assets/img-001.png)\n", out
 
 
+def test_stored_picture_marked_compressed():
+    # an item marked compressed whose stream is not deflate at all is shown from its raw bytes when they are an image
+    doc, ctx = parse(pic_file(hwp_picture(1), bins=(("png", 1),), streams={"BIN0001.png": PNG}))
+    assert not ctx.skipped["image"], ctx.skipped
+    assert markdown.render(doc, tmp() / "a", False, ctx.skipped) == "![](assets/img-001.png)\n"
+
+
+def test_picture_old_layout():
+    # the SHAPE_PICTURE right under the control, with no SHAPE_COMPONENT, is read through the same walk
+    old = (11, b"gso " + bytes(40) + wstr("로고"), hwp_record(hr.SHAPE_PICTURE, 2, bytes(71) + u16(1) + bytes(9)))
+    doc, ctx = parse(pic_file(old, streams={"BIN0001.png": PNG}))
+    assert not ctx.skipped["image"], ctx.skipped
+    assert markdown.render(doc, tmp() / "a", False, ctx.skipped) == "![로고](assets/img-001.png)\n"
+
+
 def test_auto_alt_dropped():
     streams = {"BIN0001.png": PNG}
     assert md(pic_file(hwp_picture(1, "그림입니다."), streams=streams)) == "![](assets/img-001.png)\n"
