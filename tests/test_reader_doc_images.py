@@ -291,12 +291,13 @@ def test_inline_variants():
 
 def test_field_instruction_and_ole_not_pictures():
     """A \\x01 in a field instruction (a form field's data) is not shown, as text there is not; an OLE object's \\x01
-    (fOle2) is Task 14's. Neither is a lost picture."""
+    (fOle2) is an embedded object (test_reader_doc_objects.py), here one with no ObjectPool storage. Neither is a
+    lost picture."""
     p = inline_doc(b"", "\x13FORMTEXT \x01\x14x\x15\r", data=False)
     d, ctx = parse(p)
     assert md(p) == "x\n" and not ctx.skipped, ctx.skipped
     d, ctx = parse(inline_doc(b"", "a\x01\r", props=sp(OLE), data=False))
-    assert d.blocks == [Para([Text("a")])] and not ctx.skipped, ctx.skipped
+    assert d.blocks == [Para([Text("a")])] and ctx.skipped == {"object": 1}, ctx.skipped
 
 
 def test_duplicates_parsed_once_copies_counted():

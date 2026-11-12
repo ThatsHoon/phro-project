@@ -40,6 +40,12 @@ after its paragraph, in that paragraph's story, cell or note, as the docx reader
 vanished or deleted text it is hidden as the text is. Each is read under guard("image") and one that cannot be read is
 counted there; every deflated BLIP shares the document's flate.Budget. Header pictures are not read: a header is a
 line of text, and the docx reader drops its pictures too.
+
+Embedded objects are doc_objects.py's. An EMBED (or LINK) field whose separator has fSpec and fOle2 names an
+ObjectPool storage; the object goes where the field's result has its \\x01 (the preview), else at the field's end or
+at a paragraph mark that cuts the field. A \\x01 with fOle2 outside such a field names one itself. An equation is Math
+in its paragraph, or an Equation block when it is all the paragraph shows (hancom.lone_equations, as in hwp); a
+header's objects are not read.
 """
 import re
 import struct
@@ -52,8 +58,8 @@ from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
-from . import doc_fib, doc_pictures, ooxml
-from .hancom import flat
+from . import doc_fib, doc_objects, doc_pictures, ooxml
+from .hancom import flat, lone_equations
 from .word_fields import MAX_INSTR, comment_note, hyperlink_url
 
 _ZIP = b"PK\x03\x04"
@@ -134,10 +140,11 @@ class _Frame:
 
 
 class _Field:
-    """An open field: its instruction so far, whether its result has begun, the index of the link frame it opened."""
+    """An open field: its instruction so far, whether its result has begun, the index of the link frame it opened, the
+    ObjectPool id its separator names until the object is placed."""
 
     def __init__(self):
-        self.instr, self.size, self.result, self.frame = [], 0, False, None
+        self.instr, self.size, self.result, self.frame, self.obj = [], 0, False, None, None
 
 
 class _Table:
@@ -223,7 +230,7 @@ class _State:
     the rest of its segment (or of a deletion) joins while it is still the last inline of its scope. tables are the
     tables open around the paragraph, outermost first (tables[k] at depth k + 1); overflow is set while paragraphs nest
     past MAX_DEPTH, so one overflowing subtree is counted once. extras are the blocks (pictures) that follow the open
-    paragraph where it goes."""
+    paragraph where it goes, eqs its equations (Math)."""
 
     def __init__(self, name, story=None):
         self.name = name
@@ -240,7 +247,7 @@ class _State:
         self.codes = 0  # open fields still in their instruction: text goes to the innermost one, never out
         self.over = 0   # fields opened past MAX_DEPTH: everything up to their ends is skipped
         self.hid, self.hid_seg = None, -1
-        self.extras = []
+        self.extras, self.eqs = [], []
 
 
 class _Reader:
@@ -260,6 +267,7 @@ class _Reader:
         self.budget = budget or flate.Budget()  # the one flate.Budget every deflated BLIP of the document shares
         self.image_bytes = 0  # image bytes placed so far, copies counted (IMAGE_BYTES)
         self.pictures = doc_pictures.Pictures(self)
+        self.objects = doc_objects.Objects(self)
         self.doc = Doc()
         self.word = b""
         self.table = b""
@@ -689,20 +697,26 @@ class _Reader:
 
     def para_end(self, st, cp, last=False):
         """A paragraph mark, a cell or row mark or a page or section break: the open paragraph becomes a block (see
-        block()) that place() puts in the story or in a table cell, its extras (pictures) after it. A deleted
-        paragraph mark (\\r) joins its paragraph, extras too, to the next one. `last` ends a story's last paragraph,
-        whose properties are those of its last character's paragraph mark, and closes the tables still open."""
+        block()) that place() puts in the story or in a table cell, its lone equations (hancom.lone_equations) and
+        extras (pictures) after it. An object a field still open names is placed first. A deleted paragraph mark
+        (\\r) joins its paragraph, extras too, to the next one. `last` ends a story's last paragraph, whose properties
+        are those of its last character's paragraph mark, and closes the tables still open."""
         story = st.story
         mark = "" if last else story.text[story.index_of(cp)]
         if mark == "\r" and st.run.deleted:
             return
+        for f in st.fields:
+            if f.obj is not None:
+                self.objects.place(st, f.obj, None)
+                f.obj = None
         self.close_to(st, 1)
         inl, extras = st.frames[0].inl, st.extras
-        if inl or extras or not last:
+        eqs = lone_equations(inl, st.eqs)
+        if inl or extras or eqs or not last:
             p = self.para_props(cp - 1 if last else cp)
             block = self.block(p, inl)
             st.reset()
-            self.place(st, p, mark, extras if block is None else [block, *extras])
+            self.place(st, p, mark, eqs + extras if block is None else [block, *eqs, *extras])
         if last:
             self.close_tables(st, 0)
 
@@ -800,18 +814,24 @@ class _Reader:
         st.codes += 1
 
     def field_separator(self, st, cp):
-        """The instruction ends and the result, which is shown, begins; a HYPERLINK to a URL makes it a link."""
+        """The instruction ends and the result, which is shown, begins; a HYPERLINK to a URL makes it a link. A shown
+        separator with fSpec and fOle2 (an EMBED or LINK field's, outside a header) names the field's object: its
+        ObjLocation, else its PicLocation."""
         if st.over or not st.fields or st.fields[-1].result:
             return
         f = st.fields[-1]
         f.result = True
         st.codes -= 1
+        run = st.run
+        if run.ole and run.special and not st.codes and st.name not in _HEADER_STORIES:
+            f.obj = run.obj if run.obj is not None else run.pic or 0
         url = "" if st.codes else hyperlink_url(_joined("".join(f.instr)))
         if url and self.push(st, _Frame("link", url)):
             f.frame = len(st.frames) - 1
 
     def field_end(self, st, cp):
-        """The innermost field ends: its link, if its result opened one, closes. A stray end is dropped."""
+        """The innermost field ends: its object, if no \\x01 of its result put it out, is placed, and its link, if its
+        result opened one, closes. A stray end is dropped."""
         if st.over:
             st.over -= 1
             return
@@ -820,17 +840,29 @@ class _Reader:
         f = st.fields.pop()
         if not f.result:
             st.codes -= 1
+        if f.obj is not None:
+            self.objects.place(st, f.obj, None)
         if f.frame is not None:
             self.close_to(st, f.frame)
 
     # ---- pictures (doc_pictures.py reads them)
     def picture(self, st, cp):
         """An inline picture: a \\x01 with fSpec, its PICF at its PicLocation in the Data stream (0, the CHP's
-        default, without sprmCPicLocation). An OLE object's \\x01 (fOle2) is not a picture here; one in a field
-        instruction (a form field's data) is not shown, as text there is not; one in a header is not read (a header
-        is a line of text, as in the docx reader). An inline drawing object without a picture is no loss."""
+        default, without sprmCPicLocation). In the result of a field that names an object it is that object, the
+        PICF its preview (none with fOle2, which Word sets when the \\x01 shares the separator's run); elsewhere a
+        \\x01 with fOle2 is the object its ObjLocation, else PicLocation, names. One in a field instruction (a form
+        field's data) is not shown, as text there is not; one in a header is not read (a header is a line of text, as
+        in the docx reader). An inline drawing object without a picture is no loss."""
         run = st.run
-        if not run.special or run.ole or st.name in _HEADER_STORIES or not self.live(st):
+        if not run.special or st.name in _HEADER_STORIES or not self.live(st):
+            return
+        f = st.fields[-1] if st.fields else None
+        if f is not None and f.obj is not None:
+            oid, f.obj = f.obj, None
+            self.objects.place(st, oid, None if run.ole else run.pic or 0)
+            return
+        if run.ole:
+            self.objects.place(st, run.obj if run.obj is not None else run.pic or 0, None)
             return
         with self.ctx.guard("image"):
             hit = self.pictures.inline(run.pic or 0)

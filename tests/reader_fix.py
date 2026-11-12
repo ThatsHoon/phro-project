@@ -607,6 +607,43 @@ def doc_spa(anchors):
     return doc_plc(cps + [max(cps, default=0) + 1], b"".join(struct.pack("<I", s).ljust(26, b"\0") for _, s in anchors))
 
 
+def mtef_v3(body):
+    """MTEF v3 data, as Equation Editor 3.0 writes it: the 5-byte header (version 3, Windows, Equation Editor, 3.0),
+    then the records `body`, already built, and the END of the top-level list."""
+    return b"\x03\x01\x01\x03\x00" + bytes(body) + b"\x00"
+
+
+def mtef_v5(body):
+    """MTEF v5 data, as MathType writes it: the header (version 5, Windows, MathType, 6.0), the application key
+    "DSMT6" and the equation options byte, then the records `body` and the END of the top-level list."""
+    return b"\x05\x01\x00\x06\x00DSMT6\x00\x00" + bytes(body) + b"\x00"
+
+
+def eq_native(mtef, cb=28):
+    """An Equation Native stream: the 28-byte EQNOLEFILEHDR (cbHdr u16, version u32 0x00020000, cf u16, cbObject
+    u32, four reserved u32), its cbHdr `cb` and the header padded or cut to it, then the MTEF bytes."""
+    import struct
+    head = struct.pack("<HIHI", cb, 0x00020000, 0, len(mtef)).ljust(28, b"\0")
+    return head[:cb].ljust(cb, b"\0") + bytes(mtef)
+
+
+def comp_obj(prog, user=b"Object"):
+    """A \\x01CompObj stream (MS-OLEDS CompObjStream): the 28-byte header, the AnsiUserType, no clipboard format,
+    then the ProgID `prog`, each string a u32 length with its terminating zero."""
+    import struct
+
+    def ansi(s):
+        return struct.pack("<I", len(s) + 1) + bytes(s) + b"\0"
+    return struct.pack("<II", 0xFFFE0001, 0xA03).ljust(28, b"\xff") + ansi(user) + bytes(4) + ansi(prog)
+
+
+def object_pool(objects):
+    """make_doc streams for the ObjectPool storage: {id: {stream name: bytes}} -> {"ObjectPool/_<id>/<name>": bytes},
+    one storage an object."""
+    return {f"ObjectPool/_{oid}/{name}": bytes(data) for oid, streams in objects.items()
+            for name, data in streams.items()}
+
+
 def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, fc=None, word_extra=b"",
              streams=None, lid_fe=None, chpx=None, papx=None):
     """Write a Word 97 .doc compound file.
