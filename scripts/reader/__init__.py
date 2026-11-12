@@ -19,7 +19,7 @@ FORMATS = {
 }
 
 # extensions with a working parser; each format task adds its own
-BUILT = {"hwpx", "odt", "ods", "odp", "docm", "pptm", "ppsx", "vsdx", "epub", "xps", "oxps"}
+BUILT = {"hwpx", "hwp", "odt", "ods", "odp", "docm", "pptm", "ppsx", "vsdx", "epub", "xps", "oxps"}
 
 # handled by anthropic-skills:*, never touched here
 SKILL_EXTS = frozenset({"pdf", "docx", "pptx", "xlsx", "xlsm"})

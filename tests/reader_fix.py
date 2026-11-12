@@ -137,6 +137,38 @@ def hwp_record(tag, level, data):
     return struct.pack("<I", tag | (level << 10) | (len(data) << 20)) + data
 
 
+_HWP_EXTENDED = (1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23)  # control characters that own a CTRL_HEADER
+
+
+def hwp_para(text, *, shape=0, style=0, chars=((0, 0),), level=0, controls=()):
+    """One HWP paragraph: PARA_HEADER at `level`, then PARA_TEXT and PARA_CHAR_SHAPE one level deeper.
+
+    `text` is written as UTF-16LE units and ends with unit 13. Each U+FFFC takes the next (code, ctrl_id, children)
+    of `controls` and becomes the eight-unit control character: code, the id, four units of padding, code. `ctrl_id`
+    is big-endian ASCII such as b"tbl " (stored byte-reversed); bytes past its first four are the CTRL_HEADER's own
+    fields after the id. For an extended code the builder then appends that CTRL_HEADER at level + 1 and `children`
+    as given (records the caller wrote at level + 2); an inline code such as 4 (field end) or 9 (tab) has none.
+    `chars` are the PARA_CHAR_SHAPE (position, char shape id) pairs.
+    """
+    import struct
+    units, ctrls = bytearray(), b""
+    pending = iter(controls)
+    for ch in text:
+        if ch != "\ufffc":
+            units += ch.encode("utf-16-le")
+            continue
+        code, cid, children = next(pending)
+        raw = bytes(cid[:4]).ljust(4, b"\0")[::-1]
+        units += struct.pack("<H", code) + raw + bytes(8) + struct.pack("<H", code)
+        if code in _HWP_EXTENDED:
+            ctrls += hwp_record(71, level + 1, raw + bytes(cid[4:])) + bytes(children)
+    units += struct.pack("<H", 13)
+    header = struct.pack("<IIHBBHHHI", len(units) // 2, 0, shape, style, 0, len(chars), 0, 0, 0)
+    pairs = b"".join(struct.pack("<II", pos, sid) for pos, sid in chars)
+    return (hwp_record(66, level, header) + hwp_record(67, level + 1, bytes(units))
+            + hwp_record(68, level + 1, pairs) + ctrls)
+
+
 def make_hwp(path, sections, doc_info=b"", bins=None, flags=1, extra=None):
     """Write an HWP 5.0.3.0 compound file: FileHeader, DocInfo, BodyText/Section<N> (raw-deflated when flags & 1),
     BinData/<name> and any extra streams as given."""

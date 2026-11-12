@@ -85,7 +85,7 @@ def test_convert_writes_out_meta():
 
 def test_unsupported_ext():
     try:
-        reader.parse(Path("x.hwp"), Context())
+        reader.parse(Path("x.vsd"), Context())
     except ReadError as e:
         assert e.kind == "unsupported"
         return
@@ -251,7 +251,7 @@ def run_cli(*args, env_extra=None):
 
 
 def test_cli_convert_and_fail():
-    f = tmp() / "x.hwp"
+    f = tmp() / "x.vsd"
     f.write_bytes(b"x")
     r = run_cli("convert", str(f))
     assert r.returncode == 1
@@ -366,7 +366,7 @@ def test_prune_stale_tmp():
 
 def test_precheck():
     try:
-        reader.precheck(Path("x.hwp"))
+        reader.precheck(Path("x.vsd"))
     except ReadError as e:
         assert e.kind == "unsupported"
         return

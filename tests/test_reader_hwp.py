@@ -1,0 +1,472 @@
+"""HWP 5.0 parser: body text, control characters, bold, headings, numbering, notes, fields, equations, sections.
+
+Run: python -I -X utf8 tests/test_reader_hwp.py
+"""
+import struct
+import sys
+import tempfile
+import time
+import zlib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HERE / "scripts"))
+sys.path.insert(0, str(Path(__file__).parent))
+
+import reader  # noqa: E402
+from reader import markdown  # noqa: E402
+from reader.formats import hancom, hwp  # noqa: E402
+from reader.formats import hwp_records as hr  # noqa: E402
+from reader.limits import ReadError  # noqa: E402
+from reader.model import Context  # noqa: E402
+from reader_fix import hwp_para, hwp_record, make_cfb, make_hwp, make_zip  # noqa: E402
+
+FFFC = "\ufffc"
+
+
+def tmp():
+    return Path(tempfile.mkdtemp())
+
+
+def u16(n):
+    return struct.pack("<H", n)
+
+
+def u32(n):
+    return struct.pack("<I", n)
+
+
+def wstr(s):
+    return u16(len(s)) + s.encode("utf-16-le")
+
+
+def deflate(b):
+    c = zlib.compressobj(wbits=-15)
+    return c.compress(b) + c.flush()
+
+
+def info(sections=0, bold=(), shapes=(), styles=(), numberings=(), bullets=()):
+    """DocInfo records. shapes: (head, level, ref); numberings: lists of (format, code) per level."""
+    out = hwp_record(hr.DOCUMENT_PROPERTIES, 0, u16(sections) + bytes(24))
+    for b in bold:
+        cs = bytearray(72)
+        struct.pack_into("<I", cs, 46, 2 if b else 0)
+        out += hwp_record(hr.CHAR_SHAPE, 1, bytes(cs))
+    for head, level, ref in shapes:
+        ps = bytearray(54)
+        struct.pack_into("<I", ps, 0, (head << 23) | (level << 25))
+        struct.pack_into("<H", ps, 30, ref)
+        out += hwp_record(hr.PARA_SHAPE, 1, bytes(ps))
+    for name in styles:
+        out += hwp_record(hr.STYLE, 1, wstr(name) + wstr("") + bytes(2) + struct.pack("<hHH", 0, 0, 0))
+    for levels in numberings:
+        levels = list(levels) + [("", 0)] * (7 - len(levels))
+        body = b"".join(struct.pack("<IhhI", code << 5, 0, 0, 0) + wstr(fmt) for fmt, code in levels)
+        out += hwp_record(hr.NUMBERING, 1, body + u16(1) + u32(1) * 7)
+    for ch in bullets:
+        out += hwp_record(hr.BULLET, 1, bytes(12) + u16(ord(ch)))
+    return out
+
+
+def hwp_file(*sections, doc_info=b"", flags=1, extra=None, name="a.hwp"):
+    return make_hwp(tmp() / name, list(sections), doc_info=doc_info, flags=flags, extra=extra)
+
+
+def parse(path):
+    ctx = Context()
+    return hwp.parse(Path(path), ctx), ctx
+
+
+def md(path, hidden=False):
+    doc, ctx = parse(path)
+    return markdown.render(doc, tmp() / "assets", hidden, ctx.skipped)
+
+
+def denied(path, kind):
+    try:
+        parse(path)
+    except ReadError as e:
+        assert e.kind == kind, e
+        return e
+    raise AssertionError(f"expected ReadError {kind}")
+
+
+def sub_list(*paras, level=2):
+    """A LIST_HEADER and its paragraphs, all at `level` as Hancom writes them."""
+    return hwp_record(hr.LIST_HEADER, level, u16(len(paras)) + bytes(6)) + b"".join(paras)
+
+
+def field(cid, command="", attr=0):
+    return cid + u32(attr) + b"\0" + wstr(command)
+
+
+def raw_para(units: bytes, level=0):
+    return (hwp_record(hr.PARA_HEADER, level, struct.pack("<IIHBB", len(units) // 2, 0, 0, 0, 0))
+            + hwp_record(hr.PARA_TEXT, level + 1, units))
+
+
+def unit(code):
+    return u16(code)
+
+
+def ctl(code, cid=b"\0\0\0\0"):
+    return u16(code) + cid[::-1] + bytes(8) + u16(code)
+
+
+# ---- registration and plain text
+def test_registered():
+    assert "hwp" in reader.BUILT and reader.FORMATS["hwp"] == "hwp"
+
+
+def test_plain_paragraphs():
+    assert md(hwp_file(hwp_para("가나다") + hwp_para("abc"))) == "가나다\n\nabc\n"
+
+
+def test_uncompressed():
+    p = hwp_file(hwp_para("가나다") + hwp_para("abc"), doc_info=info(sections=1), flags=0)
+    assert md(p) == "가나다\n\nabc\n"
+
+
+def test_line_break():
+    doc, _ = parse(hwp_file(hwp_para("a\nb")))
+    assert len(doc.blocks) == 1
+    assert md(hwp_file(hwp_para("a\nb"))) == "a\nb\n"
+
+
+def test_extended_control_skipped():
+    p = hwp_file(hwp_para("x" + FFFC + "y", controls=((11, b"zzzz", b""),)))
+    out = md(p)
+    assert out == "xy\n", repr(out)
+
+
+def test_char_classes():
+    a, b, c, d, e, f, g, h, z = (s.encode("utf-16-le") for s in "abcdefghz")
+    units = (a + unit(0) + b + unit(24) + c + unit(30) + d + unit(31) + e + ctl(9) + f + ctl(5) + g
+             + unit(0xD800) + h + "😀".encode("utf-16-le") + unit(13) + z)
+    assert md(hwp_file(raw_para(units))) == "abc\u00a0d e fg□h😀\n"
+    # a lone low surrogate, and a high one at the very end, become the box too; an odd tail byte is ignored
+    assert md(hwp_file(raw_para(a + unit(0xDC00) + b + unit(0xDBFF) + b"\x00"))) == "a□b□\n"
+
+
+def test_bold_runs():
+    p = hwp_file(hwp_para("abcde", chars=((0, 0), (2, 1), (4, 0))), doc_info=info(bold=(False, True)))
+    assert md(p) == "ab**cd**e\n"
+    # ids past the char shape table are not bold; a pair list with a cut tail keeps its whole pairs
+    p = hwp_file(hwp_para("abcde", chars=((0, 7), (3, 99))), doc_info=info(bold=(False, True)))
+    assert md(p) == "abcde\n"
+    cut = (hwp_record(hr.PARA_HEADER, 0, bytes(12)) + hwp_record(hr.PARA_TEXT, 1, "abcde".encode("utf-16-le"))
+           + hwp_record(hr.PARA_CHAR_SHAPE, 1, u32(0) + u32(1) + u32(3) + u32(0) + b"\x01\x02\x03"))
+    assert md(hwp_file(cut, doc_info=info(bold=(False, True)))) == "**abc**de\n"
+
+
+# ---- headings
+def test_outline_heading():
+    p = hwp_file(hwp_para("제목"), doc_info=info(shapes=((1, 0, 0),)))
+    assert md(p) == "# 제목\n"
+    p = hwp_file(hwp_para("깊음"), doc_info=info(shapes=((1, 7, 0),)))
+    assert md(p) == "###### 깊음\n"
+
+
+def test_style_heading():
+    p = hwp_file(hwp_para("본문 제목"), doc_info=info(styles=("개요 3",)))
+    assert md(p) == "### 본문 제목\n"
+    p = hwp_file(hwp_para("가", style=0) + hwp_para("나", style=1) + hwp_para("다", style=2),
+                 doc_info=info(styles=("제목", "부제목", "바탕글")))
+    assert md(p) == "# 가\n\n## 나\n\n다\n"
+
+
+def test_long_heading_demoted():
+    di = info(shapes=((1, 0, 0),))
+    out = md(hwp_file(hwp_para("가" * 121), doc_info=di))
+    assert "#" not in out and out.startswith("가")
+    assert md(hwp_file(hwp_para("가" * 120), doc_info=di)).startswith("# ")
+    assert "#" not in md(hwp_file(hwp_para("가" * 41 + "."), doc_info=di))
+
+
+def test_no_heading_in_note():
+    note = sub_list(hwp_para("주석 제목", level=2))
+    p = hwp_file(hwp_para("본" + FFFC, controls=((17, b"fn  " + u32(1), note),)), doc_info=info(shapes=((1, 0, 0),)))
+    out = md(p)
+    assert out == "# 본[^1]\n\n[^1]: 주석 제목\n", repr(out)
+
+
+# ---- numbering and bullets
+def test_numbering():
+    di = info(shapes=((2, 0, 1), (2, 1, 1)), numberings=([("^1.", 0), ("^1.^2", 0)],))
+    p = hwp_file(hwp_para("a") + hwp_para("b") + hwp_para("c"), doc_info=di)
+    assert md(p) == "1. a\n2. b\n3. c\n"
+    p = hwp_file(hwp_para("x") + hwp_para("y", shape=1), doc_info=di)
+    assert md(p) == "1. x\n  1.1 y\n"
+
+
+def test_numbering_kinds_and_missing_table():
+    di = info(shapes=((2, 0, 1), (2, 0, 9)), numberings=([("^1)", 8)],))
+    p = hwp_file(hwp_para("a") + hwp_para("b") + hwp_para("c", shape=1), doc_info=di)
+    assert md(p) == "가) a\n나) b\n1. c\n"
+    # a format code outside the known kinds counts in digits
+    di = info(shapes=((2, 0, 1),), numberings=([("^1.", 15)],))
+    assert md(hwp_file(hwp_para("a"), doc_info=di)) == "1. a\n"
+
+
+def test_outline_numbering_from_secd():
+    secd = b"secd" + bytes(14) + u16(1) + bytes(20)
+    first = hwp_para(FFFC + "개요", shape=0, controls=((2, secd, b""),))
+    di = info(shapes=((1, 0, 0), (1, 1, 0)), numberings=([("^1.", 0), ("^2)", 10)],))
+    p = hwp_file(first + hwp_para("둘째", shape=1) + hwp_para("셋째", shape=0), doc_info=di)
+    assert md(p) == "# 1. 개요\n\n## ㄱ) 둘째\n\n# 2. 셋째\n"
+
+
+def test_bullet():
+    di = info(shapes=((3, 0, 1),), bullets=("●",))
+    p = hwp_file(hwp_para("점") + hwp_para("● 둘") + hwp_para("-5도"), doc_info=di)
+    assert md(p) == "- 점\n- 둘\n- -5도\n"
+
+
+# ---- notes, header and footer, comments
+def test_footnote():
+    note = sub_list(hwp_para("주석", level=2))
+    p = hwp_file(hwp_para("본문" + FFFC, controls=((17, b"fn  " + u32(1), note),)))
+    assert md(p) == "본문[^1]\n\n[^1]: 주석\n"
+    doc, _ = parse(p)
+    assert list(doc.notes) == ["fn-1"]
+
+
+def test_endnote_and_repeated_numbers():
+    fn = sub_list(hwp_para("각주", level=2))
+    en = sub_list(hwp_para("미주", level=2))
+    s0 = hwp_para("가" + FFFC + FFFC, controls=((17, b"fn  " + u32(1), fn), (17, b"en  " + u32(1), en)))
+    s1 = hwp_para("나" + FFFC, controls=((17, b"fn  " + u32(1), sub_list(hwp_para("다시 1", level=2))),))
+    doc, _ = parse(hwp_file(s0, s1))
+    assert len(doc.notes) == 3 and "fn-1" in doc.notes and "en-1" in doc.notes
+    out = markdown.render(doc, tmp() / "a")
+    assert "[^1]: 각주" in out and "[^2]: 미주" in out and "[^3]: 다시 1" in out, out
+
+
+def test_header_footer():
+    head = sub_list(hwp_para("머리말", level=2))
+    foot = sub_list(hwp_para("꼬리말", level=2))
+    p = hwp_file(hwp_para(FFFC + FFFC + "본문", controls=((16, b"head" + u32(0), head), (16, b"foot" + u32(0), foot))))
+    doc, _ = parse(p)
+    assert doc.headers == ["머리말"] and doc.footers == ["꼬리말"]
+    assert md(p) == "Header: 머리말\nFooter: 꼬리말\n\n본문\n"
+
+
+def test_hidden_comment():
+    cm = sub_list(hwp_para("숨은 설명", level=2))
+    p = hwp_file(hwp_para("글" + FFFC, controls=((15, b"tcmt", cm),)))
+    assert md(p) == "글[^1]\n\n[^1]: Comment: 숨은 설명\n"
+
+
+# ---- fields
+def test_hyperlink_field():
+    def link(cmd):
+        return hwp_para("앞 " + FFFC + "링크" + FFFC + " 뒤",
+                        controls=((3, field(b"%hlk", cmd), b""), (4, b"%hlk", b"")))
+    assert md(hwp_file(link("https://example.com;1;0;0;"))) == "앞 [링크](https://example.com) 뒤\n"
+    assert "(http://a.b/x;y)" in md(hwp_file(link(r"http\://a.b/x\;y;1")))
+    assert md(hwp_file(link(""))) == "앞 링크 뒤\n"
+
+
+def test_placeholder_field():
+    def clk(attr):
+        return hwp_para(FFFC + "여기에 입력" + FFFC + "남음", controls=((3, field(b"%clk", "", attr), b""),
+                                                                (4, b"%clk", b"")))
+    assert md(hwp_file(clk(0))) == "남음\n"
+    assert md(hwp_file(clk(1 << 15))) == "여기에 입력남음\n"
+
+
+def test_other_field_keeps_text():
+    p = hwp_para("[" + FFFC + "2026" + FFFC + "]" + FFFC + "x",
+                 controls=((3, field(b"%dte", "date"), b""), (4, b"%dte", b""), (11, b"zzzz", b"")))
+    assert md(hwp_file(p)) == "[2026]x\n"
+
+
+def test_nested_fields():
+    p = hwp_para(FFFC + "a" + FFFC + "b" + FFFC + "c" + FFFC,
+                 controls=((3, field(b"%hlk", "https://e.com;1"), b""), (3, field(b"%dte"), b""),
+                           (4, b"%dte", b""), (4, b"%hlk", b"")))
+    assert md(hwp_file(p)) == "[abc](https://e.com)\n"
+
+
+# ---- equations
+def eqed(script, attr=0):
+    return (11, b"eqed" + u32(attr), hwp_record(hr.EQEDIT, 2, u32(0) + wstr(script) + bytes(8)))
+
+
+def test_equation():
+    tex = hancom.tex("a over b")
+    assert tex == r"\frac{a}{b}"
+    assert md(hwp_file(hwp_para(FFFC, controls=(eqed("a over b"),)))) == f"$${tex}$$\n"
+    assert md(hwp_file(hwp_para("값 " + FFFC, controls=(eqed("a over b", 1),)))) == f"값 ${tex}$\n"
+    # an inline equation alone in its paragraph is shown on its own, as hwpx does
+    assert md(hwp_file(hwp_para(FFFC, controls=(eqed("a over b", 1),)))) == f"$${tex}$$\n"
+
+
+# ---- sections
+def test_two_sections_one_bad():
+    p = hwp_file(hwp_para("하나"), doc_info=info(sections=2), extra={"BodyText/Section1": b"\xff" * 64})
+    out = md(p)
+    assert out.splitlines()[0] == "(could not read: 1 section)", out
+    assert "하나" in out
+
+
+def test_all_sections_bad():
+    e = denied(hwp_file(extra={"BodyText/Section0": b"\xff" * 64}), "damaged")
+    assert e.detail == "no readable section", e
+
+
+def test_declared_section_missing():
+    out = md(hwp_file(hwp_para("하나"), doc_info=info(sections=2)))
+    assert out == "(could not read: 1 section)\n\n하나\n", out
+
+
+def test_section_number_order():
+    extra = {"BodyText/Section10": deflate(hwp_para("10")), "BodyText/Section2": deflate(hwp_para("2")),
+             "BodyText/Section1000": deflate(hwp_para("천"))}
+    out = md(hwp_file(hwp_para("0"), hwp_para("1"), extra=extra))
+    assert out == "(could not read: 1 section)\n\n0\n\n1\n\n2\n\n10\n", out
+
+
+def test_truncated_section_counted():
+    body = hwp_para("앞부분") + hwp_para("x" * 3000)
+    c = zlib.compressobj(level=0, wbits=-15)  # stored blocks: a cut keeps an exact prefix
+    packed = c.compress(body) + c.flush()
+    p = hwp_file(extra={"BodyText/Section0": packed[:len(packed) * 3 // 5]})
+    doc, ctx = parse(p)
+    assert ctx.skipped["record"] == 1 and not ctx.skipped["section"], ctx.skipped
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert out.startswith("(could not read: 1 damaged record)\n\n앞부분"), out
+
+
+def test_one_budget_per_document():
+    seen = []
+    old = hwp.flate.inflate
+
+    def spy(data, budget):
+        seen.append(budget)
+        return old(data, budget)
+    hwp.flate.inflate = spy
+    try:
+        parse(hwp_file(hwp_para("a"), hwp_para("b"), doc_info=info(sections=2)))
+    finally:
+        hwp.flate.inflate = old
+    assert len(seen) == 3 and seen[0] is seen[1] is seen[2], seen
+
+
+# ---- what is not an HWP 5 body
+NS = ('xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" '
+      'xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"')
+
+
+def test_hwp_zip_is_hwpx():
+    members = {"mimetype": "application/hwp+zip",
+               "Contents/section0.xml": f'<hs:sec {NS}><hp:p><hp:run><hp:t>하나</hp:t></hp:run></hp:p></hs:sec>'}
+    p = make_zip(tmp() / "x.hwp", members)
+    assert md(p) == "하나\n"
+    out = tmp() / "out"
+    reader.convert(p, out)
+    assert (out / "out.md").read_text(encoding="utf-8") == "하나\n"
+
+
+def test_hwp3():
+    p = tmp() / "old.hwp"
+    p.write_bytes(b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05" + bytes(200))
+    e = denied(p, "unsupported")
+    assert e.detail == "hwp 3.x"
+
+
+def test_password():
+    denied(hwp_file(hwp_para("x"), flags=1 | 2), "encrypted")
+    denied(hwp_file(hwp_para("x"), flags=1 | (1 << 8)), "encrypted")
+
+
+def test_drm_flag():
+    denied(hwp_file(hwp_para("x"), flags=1 | 16), "drm")
+    denied(hwp_file(hwp_para("x"), flags=1 | (1 << 10)), "drm")
+
+
+def test_not_hwp():
+    p = tmp() / "m.hwp"
+    make_cfb(p, {"Other": b"x"})
+    denied(p, "damaged")
+    for data in (b"", b"just some text", bytes(600)):
+        q = tmp() / "n.hwp"
+        q.write_bytes(data)
+        e = denied(q, "damaged")
+        assert e.detail == "not an HWP file", e
+
+
+def test_convert_end_to_end():
+    out = tmp() / "out"
+    meta = reader.convert(hwp_file(hwp_para("본문"), doc_info=info(sections=1)), out)
+    assert (out / "out.md").read_text(encoding="utf-8") == "본문\n"
+    assert meta["lines"] > 0 and meta["unread"] == [], meta
+
+
+# ---- the handler interface Tasks 6-8 extend, and hostile input
+def test_controls_table_and_handler_end():
+    for name in hwp._Reader.CONTROLS.values():
+        assert callable(getattr(hwp._Reader, name, None)), name
+    ctx = Context()
+    data = hwp_para("x" + FFFC + "y", controls=((16, b"head" + u32(0), sub_list(hwp_para("h", level=2))),))
+    recs = hr.records(data, ctx)
+    r = hwp._Reader(None, ctx)
+    i = next(k for k, rec in enumerate(recs) if rec.tag == hr.CTRL_HEADER)
+    assert r.header(recs, i, None, 0) == len(recs) and r.doc.headers == ["h"]
+    assert r.skip(recs, i, None, 0) == len(recs)
+
+
+def test_hostile_fields_do_not_fail():
+    short = (hwp_record(hr.PARA_HEADER, 0, b"\x01")  # too short for shape and style ids
+             + hwp_record(hr.PARA_TEXT, 1, "짧은".encode("utf-16-le")))
+    p = hwp_para("a" + FFFC + "b" + FFFC + "c" + FFFC + "d" + FFFC + FFFC + "e", shape=50, style=200,
+                 controls=((3, b"%hlk" + u32(0) + b"\0" + u16(60000) + "ab".encode("utf-16-le"), b""),
+                           (4, b"%hlk", b""),
+                           (17, b"fn  ", b""),                       # no number, no paragraphs
+                           (11, b"eqed", hwp_record(hr.EQEDIT, 2, u32(0) + u16(9999) + b"x\0")),
+                           (16, b"he", b"")))                        # a CTRL_HEADER shorter than its id
+    numbered = hwp_para("번호", shape=0)  # a numbering id past the numbering table
+    di = info(shapes=((2, 0, 300),), numberings=())
+    doc, ctx = parse(hwp_file(short + p + hwp_record(hr.CTRL_HEADER, 1, b"x") + numbered, doc_info=di))
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert "짧은" in out and "a[b](ab)c" in out and "e" in out and "1. 번호" in out, out
+
+
+def test_depth_counted_not_recursion_error():
+    def nest(k):
+        lvl = 2 * k
+        if k == 80:
+            return hwp_para("바닥", level=lvl)
+        note = hwp_record(hr.LIST_HEADER, lvl + 2, bytes(8)) + nest(k + 1)
+        return hwp_para(str(k) + FFFC, level=lvl, controls=((17, b"fn  " + u32(1), note),))
+    doc, ctx = parse(hwp_file(nest(0)))
+    assert ctx.skipped["depth"] >= 1 and any(w.startswith("depth") for w in ctx.warnings)
+    assert "바닥" not in markdown.render(doc, tmp() / "a")
+
+
+def test_field_stack_capped():
+    n = 3000
+    ctrls = tuple((3, field(b"%hlk", "https://e.com;1"), b"") for _ in range(n))
+    p = hwp_para(FFFC * n + "남음", controls=ctrls)
+    assert "남음" in md(hwp_file(p))
+
+
+def test_large_section_is_linear():
+    paras = b"".join(hwp_para("문단 %d" % k, chars=((0, 0), (2, 1), (3, 0))) for k in range(20_000))
+    long = hwp_para("가나다라" * 50_000, chars=tuple((k, (k // 4) % 2) for k in range(0, 200_000, 4)))
+    p = hwp_file(paras + long, doc_info=info(bold=(False, True)))
+    t0 = time.monotonic()
+    doc, _ = parse(p)
+    took = time.monotonic() - t0
+    assert len(doc.blocks) == 20_001 and took < 10, took
+
+
+def main():
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+    print("pass")
+
+
+if __name__ == "__main__":
+    main()

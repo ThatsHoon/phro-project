@@ -121,7 +121,7 @@ def test_plain_text_passes_through():
 
 def test_binary_and_rtf_still_denied():
     for name, data in (("a.rtf", b"{\\rtf1\\ansi hi}"), ("b.rtf", b"\xef\xbb\xbf{\\rtf1 hi}"),
-                       ("a.hwp", bytes.fromhex("D0CF11E0A1B11AE1") + bytes(100))):
+                       ("a.vsd", bytes.fromhex("D0CF11E0A1B11AE1") + bytes(100))):
         o = out(gate.decide(ev(put(name, data))))
         assert "not supported yet" in o["permissionDecisionReason"], name
 
@@ -158,11 +158,11 @@ def test_name_is_flattened():
 
 
 def test_unsupported_phase():
-    p = tmp() / "x.hwp"
+    p = tmp() / "x.vsd"
     p.write_bytes(b"\xd0\xcf\x11\xe0\x00")
     o = out(gate.decide(ev(p)))
     assert o["permissionDecision"] == "deny"
-    assert o["permissionDecisionReason"] == "x.hwp: this format is not supported yet.", o
+    assert o["permissionDecisionReason"] == "x.vsd: this format is not supported yet.", o
 
 
 def test_retry_by_hand_only_where_it_can_help():
