@@ -7,7 +7,8 @@ compression bit), kordoc hwp5/body.ts, record.ts and numbering.ts (secd outline 
 placeholders, EQEDIT script) and rhwp parser/body_text.rs (control-character classes). Distribution documents read
 ViewText through hwp_records.view_text (dochan hwp/distdoc.py); the DRM sniff and the track-changes ViewText
 preference follow rhwp parser/mod.rs, the PARA_RANGE_TAG kinds rhwp parser/tracked_viewtext.rs and dochan
-hwp/revisions.py. The inline model, paragraph rules and cell grid are hancom.py's, shared with hwpx.py.
+hwp/revisions.py. The inline model, paragraph rules and cell grid are hancom.py's, shared with hwpx.py. The chart
+in an OLE object is hwp_chart.py's.
 """
 import re
 import struct
@@ -24,9 +25,10 @@ from .hancom import (
     AUTO_ALT, Frame, Scopes, State, comment_note, cut_command, flat, heading_level, lone_equations, next_marker,
     place, plain, strip_marker, style_name_level, tex as _tex,
 )
+from .hwp_chart import ole_table
 from .hwp_records import (
     CTRL_HEADER, EQEDIT, LIST_HEADER, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT, SHAPE_COMPONENT,
-    SHAPE_PICTURE, TABLE, DocInfo, ParaShape, doc_info, file_header, first_tag, records, view_text,
+    SHAPE_OLE, SHAPE_PICTURE, TABLE, DocInfo, ParaShape, doc_info, file_header, first_tag, records, view_text,
 )
 
 _ZIP = b"PK\x03\x04"
@@ -43,6 +45,13 @@ _FIELD_END, _TAB, _LINE, _PARA_END, _NBSP, _FIXED = 4, 9, 10, 13, 30, 31
 _PLAIN = re.compile(rb"(?:[\x20-\xff][^\xd8-\xdf]|[\x00-\x1f][^\x00\xd8-\xdf])+")
 _NO_SHAPE = ParaShape(0, 0, 0)
 _GROUPS = 32  # shape groups nested deeper than this are counted under depth
+# a BinData item read for a picture (image) or an OLE object (object): the extension of a storage item's stream
+# (rhwp names an OLE storage BIN%04X.OLE), and the test that keeps the stored bytes of an item marked compressed
+# that is not deflate at all (rhwp and dochan keep them)
+_MEDIA = {
+    "image": ("", lambda raw: len(raw) >= 16 and sniff(raw) is not None),
+    "object": ("OLE", lambda raw: is_cfb(raw[4:12])),  # the OLE item: a 4-byte length, then a compound file
+}
 
 
 def _wstr(data: bytes, pos: int) -> str:
@@ -90,7 +99,8 @@ class _Reader(Scopes):
     # a SHAPE_COMPONENT's child record tag -> handler (recs, j, st, d, g, alt) -> the index after what it read; g is
     # the component's group depth (1 for the drawing object itself) and alt the shape comment its picture takes
     SHAPES: dict[int, str] = {
-        SHAPE_COMPONENT: "member", SHAPE_PICTURE: "picture", LIST_HEADER: "text_box", PARA_HEADER: "text_box",
+        SHAPE_COMPONENT: "member", SHAPE_PICTURE: "picture", SHAPE_OLE: "ole", LIST_HEADER: "text_box",
+        PARA_HEADER: "text_box",
     }
 
     def __init__(self, cf, ctx):
@@ -102,7 +112,8 @@ class _Reader(Scopes):
         self.counts = {"fn": 0, "en": 0, "cm": 0}
         self.numbers = {}   # numbering id -> {level: counter}
         self.outline = 0    # the outline numbering id of the current section's secd
-        self.blobs = {}     # (BinData stream name, inflated?) -> its bytes, or None when it cannot be read
+        self.blobs = {}     # (BinData stream name, inflated?, kind) -> its bytes, or None when it cannot be read
+        self.tables = {}    # an OLE item's bytes -> its chart table, or None
         # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
         # holds the accepted text (dochan reader.py), so a range left in it hides nothing
         self.view = False
@@ -128,26 +139,28 @@ class _Reader(Scopes):
             self.ctx.skipped["record"] += 1
         return out
 
-    def bin_data(self, bid):
-        """The bytes of BinData item `bid` (1-based, as DocInfo lists them); None, counted under image for every
-        picture that wanted it, for a link item or a missing, empty or broken stream. A stream is read and inflated
-        once however many items and pictures name it."""
+    def bin_data(self, bid, kind="image"):
+        """The bytes of BinData item `bid` (1-based, as DocInfo lists them) for a picture (kind image) or an OLE object
+        (kind object); None, counted under that kind for every shape that wanted it, for a link item or a missing,
+        empty or broken stream. A stream is read and inflated once however many items and shapes of a kind name it."""
         item = self.info.bins.get(bid)
         data = None
         if item is not None and item.kind != "link":
-            name = f"BinData/BIN{item.id:04X}.{item.ext}"
+            ext, keep = _MEDIA[kind]
+            name = f"BinData/BIN{item.id:04X}.{item.ext or (ext if item.kind == 'storage' else '')}"
             # the item's own bit decides (rhwp): 1 compressed, 2 stored, anything else as the document is
             packed = item.compress == 1 or (item.compress != 2 and self.head.compressed)
-            key = (name.upper(), packed)  # stream names match without case
+            key = (name.upper(), packed, kind)  # stream names match without case
             if key not in self.blobs:
-                self.blobs[key] = self.load_bin(name, packed)
+                self.blobs[key] = self.load_bin(name, packed, keep)
             data = self.blobs[key]
         if data is None:
-            self.ctx.skipped["image"] += 1
+            self.ctx.skipped[kind] += 1
         return data
 
-    def load_bin(self, name, packed):
-        """A picture over a limit (ReadError damaged or too_large), missing, broken or cut is None, as hwpx skips one."""
+    def load_bin(self, name, packed, keep):
+        """A stream over a limit (ReadError damaged or too_large), missing, broken or cut is None, as hwpx skips one;
+        `keep` says whether the stored bytes of an item marked compressed that is not deflate at all are kept."""
         try:
             raw = self.cf.read(name)
         except ReadError as e:
@@ -164,10 +177,10 @@ class _Reader(Scopes):
             if e.kind not in ("damaged", "too_large"):
                 raise
             return None
-        except flate.Truncated:  # a cut picture is a broken one
+        except flate.Truncated:  # a cut stream is a broken one
             return None
         except ValueError:  # not deflate at all: an item marked compressed but stored, kept as rhwp and dochan keep it
-            return raw if len(raw) >= 16 and sniff(raw) else None
+            return raw if keep(raw) else None
 
     def section_names(self, storage) -> list:
         """(N, stream name) for the declared section count together with the <storage>/Section<N> streams found
@@ -572,8 +585,8 @@ class _Reader(Scopes):
 
     def drawing(self, recs, i, st, d):
         """A drawing object (gso): an optional caption list, then its SHAPE_COMPONENT, or in an older layout the shape
-        record (SHAPE_PICTURE) right under the control, read through SHAPES. What the shape holds, then its caption as
-        paragraphs, follow the paragraph. The shape comment (offset 44) is its picture's alt text."""
+        record (SHAPE_PICTURE or SHAPE_OLE) right under the control, read through SHAPES. What the shape holds, then
+        its caption as paragraphs, follow the paragraph. The shape comment (offset 44) is its picture's alt text."""
         end = self.end(recs, i)
         alt = re.sub(r"\s+", " ", _wstr(recs[i].data, 44).replace("\0", "")).strip()
         caption = []
@@ -624,6 +637,19 @@ class _Reader(Scopes):
         img = self.bin_data(bid)
         if img is not None:
             st.extras.append(Image(img, "" if AUTO_ALT.match(alt) else alt))
+        return self.end(recs, j)
+
+    def ole(self, recs, j, st, d, g, alt):
+        """SHAPE_OLE: the BinData item at offset 12, an OLE object. The chart in it (hwp_chart.ole_table) is a table
+        where a picture would be; an item two shapes name is read once."""
+        data = recs[j].data
+        bid = struct.unpack_from("<H", data, 12)[0] if len(data) >= 14 else 0
+        item = self.bin_data(bid, "object")
+        if item is not None:
+            if item not in self.tables:
+                self.tables[item] = ole_table(item, self.ctx)
+            if self.tables[item] is not None:
+                st.extras.append(self.tables[item])
         return self.end(recs, j)
 
 
