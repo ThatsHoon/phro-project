@@ -127,7 +127,7 @@ The hook must also run correctly when Claude reads the converted file or an asse
 - Errors are isolated per record, part, sheet and slide: a bad record is skipped and counted, never the whole file. Only a container that cannot be opened fails the file.
 - Encryption: detected for every format and reported. Default passwords are tried where the format has one (xls `VelvetSweatshop`, ppt default, HWP distribution documents). User passwords and DRM are out of scope.
 - Garble check: if more than 5% of output characters are replacement or control characters, the warning goes into `additionalContext`.
-- Crypto in `containers/crypto.py`: RC4, AES-128 (ECB, CFB-1) and the MSVC `rand()` stream, pure Python (AES ported from dochan, MIT).
+- Crypto in `containers/crypto.py`: RC4, AES-128 (ECB, CFB-1) and the MSVC `rand()` stream, pure Python (AES written from FIPS-197).
 
 ## Phases
 
