@@ -483,6 +483,22 @@ def test_readme_formats_match():
     assert "read.py prune" in sec
 
 
+def test_notices_credit_port_sources():
+    # a reader module whose docstring names a project it follows is on that project's Ported: line in the notices
+    import ast
+    import fnmatch
+    import re
+    text = (HERE / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    docs = {f.relative_to(HERE).as_posix(): ast.get_docstring(ast.parse(f.read_text(encoding="utf-8"))) or ""
+            for f in sorted((HERE / "scripts" / "reader").rglob("*.py"))}
+    for proj in ("dochan", "kordoc", "rhwp", "anydoc", "docling", "xberg"):
+        sec = text.split(f"## {proj}\n", 1)[1].split("\n## ", 1)[0]
+        paths = re.findall(r"`(scripts/[^`]+)`", next(ln for ln in sec.splitlines() if ln.startswith("Ported:")))
+        for rel, doc in docs.items():
+            if re.search(rf"\b{proj}\b", doc, re.I):
+                assert any(fnmatch.fnmatch(rel, p) for p in paths), (proj, rel)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
