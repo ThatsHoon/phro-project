@@ -14,7 +14,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 
 from ..limits import ReadError
-from ..text import decode_8bit
+from ..text import codepage
 
 CLX = 33  # the FibRgFcLcb97 index of the Clx
 # the stories in CP order, from FibRgLw97 entries 3-10; "macro" (reserved3, formerly ccpMcr) keeps its place in the
@@ -157,11 +157,57 @@ def _cp(p: Piece) -> int:
     return p.cp
 
 
-def story_text(word: bytes, pcs: list[Piece], cp0: int, cp1: int, lid: int) -> str:
-    """The text of CPs [cp0, cp1): compressed pieces in the code page of `lid`, the rest UTF-16LE (an unpaired
-    surrogate, or a unit cut off by the stream's end, is U+FFFD or left out). Pieces are in CP order; the parts are
-    joined once."""
-    parts = []
+_DBCS = frozenset(("cp932", "cp936", "cp949", "cp950"))
+
+
+def compressed_codepage(lid: int) -> str:
+    """The codec of a compressed piece: one byte is one CP (MS-DOC 2.9.73), so the code page of `lid` only when it is
+    single-byte; under a double-byte one (Japanese, Chinese, Korean) the bytes are cp1252."""
+    cp = codepage(lid)
+    return "cp1252" if cp in _DBCS else cp
+
+
+@dataclass
+class Story:
+    """The text of CPs [cp0, cp1), one str unit a CP: a surrogate pair stays two units until a Text is built. A part
+    is the run of one piece inside the range; part k starts at text index idx[k] and CP cps[k]."""
+    text: str
+    idx: list[int]
+    cps: list[int]
+    cp0: int
+    cp1: int
+
+    def cp_of(self, i: int) -> int:
+        """The CP of text index i; len(text) is the CP after the last part."""
+        k = bisect_right(self.idx, i) - 1
+        return self.cp0 if k < 0 else self.cps[k] + i - self.idx[k]
+
+    def index_of(self, cp: int) -> int:
+        """The text index of `cp`; a CP no piece holds maps to the index of the next CP that one does."""
+        k = bisect_right(self.cps, cp) - 1
+        if k < 0:
+            return 0
+        n = (self.idx[k + 1] if k + 1 < len(self.idx) else len(self.text)) - self.idx[k]
+        return self.idx[k] + min(cp - self.cps[k], n)
+
+
+def _units(raw: bytes) -> str:
+    """UTF-16LE code units, one str unit each: a pair stays two surrogates (utf-16 with surrogatepass joins them,
+    so the units are widened to UTF-32 first); a unit cut off by the stream's end is left out."""
+    raw = raw[:len(raw) // 2 * 2]
+    s = raw.decode("utf-16-le", "surrogatepass")
+    if len(s) * 2 == len(raw):
+        return s
+    w = bytearray(len(raw) * 2)
+    w[0::4], w[1::4] = raw[0::2], raw[1::2]
+    return w.decode("utf-32-le", "surrogatepass")
+
+
+def story(word: bytes, pcs: list[Piece], cp0: int, cp1: int, lid: int) -> Story:
+    """The Story of CPs [cp0, cp1): compressed pieces in compressed_codepage(lid), the rest UTF-16LE units. Pieces
+    are in CP order; the parts are joined once."""
+    parts, idx, cps, n = [], [], [], 0
+    codec = compressed_codepage(lid)
     for i in range(max(bisect_right(pcs, cp0, key=_cp) - 1, 0), len(pcs)):
         p = pcs[i]
         if p.cp >= cp1:
@@ -170,8 +216,17 @@ def story_text(word: bytes, pcs: list[Piece], cp0: int, cp1: int, lid: int) -> s
         if a >= b:
             continue
         if p.compressed:
-            parts.append(decode_8bit(word[p.fc + a - p.cp:p.fc + b - p.cp], lid))
+            s = bytes(word[p.fc + a - p.cp:p.fc + b - p.cp]).decode(codec, "replace")
         else:
-            raw = word[p.fc + 2 * (a - p.cp):p.fc + 2 * (b - p.cp)]
-            parts.append(raw[:len(raw) // 2 * 2].decode("utf-16-le", "replace"))
-    return "".join(parts)
+            s = _units(word[p.fc + 2 * (a - p.cp):p.fc + 2 * (b - p.cp)])
+        if s:
+            parts.append(s)
+            idx.append(n)
+            cps.append(a)
+            n += len(s)
+    return Story("".join(parts), idx, cps, cp0, cp1)
+
+
+def story_text(word: bytes, pcs: list[Piece], cp0: int, cp1: int, lid: int) -> str:
+    """The text of story(); its surrogates are still unpaired units."""
+    return story(word, pcs, cp0, cp1, lid).text

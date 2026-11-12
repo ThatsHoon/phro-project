@@ -3,8 +3,12 @@
 The text is one CP stream cut into stories (doc_fib.STORIES). A story is walked once: plain runs are text, and every
 character below 0x20 other than a tab goes to its handler in _Reader.SPECIAL, paragraph marks included. Logic follows
 dochan office_binary/doc_binary.py (stream checks, the table stream, story ranges) and doc_stories.py (field begin,
-separator and end; the HYPERLINK target), and anydoc formats/doc/mod.rs (compressed text is in the code page of
-lidFE in a Far East document, else of lid). The FIB, the piece table and the story text are doc_fib.py's.
+separator and end), and anydoc formats/doc/mod.rs (the language is lidFE in a Far East document, else lid). The FIB,
+the piece table and the story text are doc_fib.py's; the HYPERLINK rule is word_fields.py's, shared with the docx
+reader.
+
+The walk keeps one str unit a CP: a surrogate pair is two units, so a handler's CP is the Story's cp_of its index,
+and the pair is joined only when a Text is built.
 """
 import re
 
@@ -13,18 +17,20 @@ from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Break, Doc, Link, Para, Text
 from . import doc_fib, ooxml
+from .word_fields import MAX_INSTR, hyperlink_url
 
 _ZIP = b"PK\x03\x04"
 _RTF = b"{\\rtf"
 _BOM = b"\xef\xbb\xbf"
 _CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f]")  # the characters the walk hands to a handler; a tab is text
-_HYPERLINK = re.compile(r'^\s*HYPERLINK\s+(?:"([^"]*)"|([^\s"\\]+))', re.I)  # as ooxml_word: a \l bookmark is no URL
-MAX_URL, MAX_INSTR = 1000, 300  # as ooxml_word
+_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
-def _url(instr: str) -> str:
-    m = _HYPERLINK.match(instr)
-    return ((m.group(1) if m.group(1) is not None else m.group(2)) or "")[:MAX_URL] if m else ""
+def _joined(s: str) -> str:
+    """UTF-16 units as characters: a pair becomes one, an unpaired surrogate U+FFFD."""
+    if _SURROGATE.search(s):
+        return s.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return s
 
 
 class _Frame:
@@ -45,8 +51,9 @@ class _State:
     """A story being walked: its name, its blocks so far, and the open paragraph's inline scopes and fields. Fields
     live with the paragraph: one still open at a paragraph mark ends there, so a broken field costs one paragraph."""
 
-    def __init__(self, name):
+    def __init__(self, name, story=None):
         self.name = name
+        self.story = story  # the doc_fib.Story walked: CP <-> text index
         self.out = []
         self.reset()
 
@@ -75,7 +82,7 @@ class _Reader:
         self.table = b""
         self.fib = None
         self.pieces = []
-        self.lid = 0x0409  # the language whose code page compressed text is in
+        self.lid = 0x0409  # the language of compressed text (doc_fib.compressed_codepage)
         self.ranges = {}   # story name -> (cp0, cp1), clamped to the CPs the pieces hold
         self.on = {ch: getattr(self, name) for ch, name in self.SPECIAL.items()}
 
@@ -120,24 +127,26 @@ class _Reader:
     # ---- the walk
     def story(self, name) -> list:
         cp0, cp1 = self.ranges[name]
-        return self.walk(doc_fib.story_text(self.word, self.pieces, cp0, cp1, self.lid), cp0, _State(name))
+        s = doc_fib.story(self.word, self.pieces, cp0, cp1, self.lid)
+        return self.walk(_State(name, s))
 
-    def walk(self, text, cp0, st) -> list:
-        """A story's text into blocks: plain runs are text and each control character runs its handler. A
-        character's CP is cp0 plus its index, exact while every character before it is one CP (UTF-16 text inside the
-        BMP, single-byte code pages). A story that does not end with a paragraph mark still ends its last paragraph.
-        O(len(text))."""
+    def walk(self, st) -> list:
+        """The text of st.story into blocks: plain runs are text and each control character runs its handler with
+        its CP (story.cp_of its index: exact past surrogate pairs and pieces cut short). A story that does not end with
+        a paragraph mark still ends its last paragraph. O(len(text) + controls * log(pieces))."""
+        story = st.story
+        text, cp_of = story.text, story.cp_of
         on, drop = self.on, self.drop
         pos = 0
         for m in _CONTROL.finditer(text):
             i = m.start()
             if i > pos:
                 self.text(st, text[pos:i])
-            on.get(text[i], drop)(st, cp0 + i)
+            on.get(text[i], drop)(st, cp_of(i))
             pos = i + 1
         if pos < len(text):
             self.text(st, text[pos:])
-        self.para_end(st, cp0 + len(text))
+        self.para_end(st, cp_of(len(text)))
         return st.out
 
     # ---- inline scopes
@@ -150,8 +159,8 @@ class _Reader:
         st.frames[-1].inl.append(inline)
 
     def text(self, st, s):
-        """Shown text, or the instruction of the field it is in (up to MAX_INSTR characters), or nothing past the
-        depth cap or inside a field nested in an instruction."""
+        """Shown text, or the instruction of the field it is in (up to MAX_INSTR units), or nothing past the depth
+        cap or inside a field nested in an instruction. Surrogate pairs are joined here, as the Text is built."""
         if st.over:
             return
         if st.codes:
@@ -161,7 +170,7 @@ class _Reader:
                 f.instr.append(s)
                 f.size += len(s)
             return
-        self.add(st, Text(s))
+        self.add(st, Text(_joined(s)))
 
     def push(self, st, frame) -> bool:
         if len(st.frames) < limits.MAX_DEPTH:
@@ -219,7 +228,7 @@ class _Reader:
         f = st.fields[-1]
         f.result = True
         st.codes -= 1
-        url = "" if st.codes else _url("".join(f.instr))
+        url = "" if st.codes else hyperlink_url(_joined("".join(f.instr)))
         if url and self.push(st, _Frame("link", url)):
             f.frame = len(st.frames) - 1
 

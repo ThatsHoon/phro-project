@@ -283,20 +283,25 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
 
     WordDocument holds the FIB (FibBase with `lid`, `nfib` and `flags`; 14 FibRgW words, lidFE at 13, `lid_fe` or
     `lid`; 22 FibRgLw longs, the story lengths at 3-10; 93 FibRgFcLcb97 pairs; cswNew 0), `word_extra` at DOC_EXTRA,
-    then the text of `pieces`, (text, compressed) in CP order: compressed text is encoded in codepage(lid), one CP a
-    byte, the rest is UTF-16LE from an even offset. The table stream (1Table when flags has 0x0200, else 0Table)
-    holds each `fc` entry (FibRgFcLcb97 index -> bytes) in index order with its (fc, lcb) set in the FIB, then the
-    Clx (one Pcdt, no Prc) at index 33 unless `fc` gives it. `ccp` sets story lengths by DOC_STORIES name; "text"
-    takes the CPs the others leave. `streams` adds streams and replaces a built one of the same name. Needs the
-    reader's scripts folder on sys.path, as the tests set it.
+    then the text of `pieces`, (text, compressed) in CP order: compressed text is one CP a byte, in the code page of
+    the document's language (lidFE when flags has fFarEast 0x4000 and lidFE is set, else `lid`) when that code page is
+    single-byte, else cp1252; the rest is UTF-16LE from an even offset. The table stream (1Table when flags has
+    0x0200, else 0Table) holds each `fc` entry (FibRgFcLcb97 index -> bytes) in index order with its (fc, lcb) set in
+    the FIB, then the Clx (one Pcdt, no Prc) at index 33 unless `fc` gives it. `ccp` sets story lengths by DOC_STORIES
+    name; "text" takes the CPs the others leave. `streams` adds streams and replaces a built one of the same name.
+    Needs the reader's scripts folder on sys.path, as the tests set it.
     """
     import struct
     from reader.text import codepage
+    fe = lid if lid_fe is None else lid_fe
+    eight = codepage(fe if flags & 0x4000 and fe else lid)
+    if eight in ("cp932", "cp936", "cp949", "cp950"):  # one byte a CP: a double-byte code page is not used
+        eight = "cp1252"
     body = bytearray(bytes(word_extra))
     cps, pcds = [0], []
     for text, compressed in pieces:
         if compressed:
-            raw = text.encode(codepage(lid))
+            raw = text.encode(eight)
             at, n = DOC_EXTRA + len(body), len(raw)
             fcv = at * 2 | 0x40000000
         else:
@@ -320,7 +325,7 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
         pairs[i] = (len(table), len(data))
         table += data
     rgw = [0] * 14
-    rgw[13] = lid if lid_fe is None else lid_fe
+    rgw[13] = fe
     rglw = [0] * 22
     rglw[0] = DOC_EXTRA + len(body)  # cbMac
     for k, name in enumerate(DOC_STORIES):

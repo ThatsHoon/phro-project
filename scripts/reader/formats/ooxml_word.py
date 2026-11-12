@@ -8,13 +8,13 @@ from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListIt
 from . import ooxml_base
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
+from .word_fields import MAX_INSTR, MAX_URL, hyperlink_url
 
 IMAGE_BYTES = 256 * 2**20  # image bytes one document may emit, copies counted
 CHART_CELLS = 200_000      # chart table cells one document may emit, copies counted
 MAX_COLS = 1_000
-MAX_URL, MAX_ALT, MAX_NAME, MAX_INSTR = 1000, 200, 64, 300
+MAX_ALT, MAX_NAME = 200, 64
 
-_HYPERLINK = re.compile(r'^\s*HYPERLINK\s+(?:"([^"]*)"|([^\s"\\]+))', re.I)
 _NOTE_SKIP = frozenset({"separator", "continuationSeparator", "continuationNotice"})
 _NOTE_REFS = {"footnoteReference": "fn-", "endnoteReference": "en-", "commentReference": "cm-"}
 _SKIP = frozenset({"pPr", "rPr", "sectPr", "tblPr", "trPr", "tcPr", "proofErr", "bookmarkStart", "bookmarkEnd",
@@ -293,7 +293,7 @@ class _Reader:
         elif kind == "separate" and st.fields:
             f = st.fields[-1]
             f[1] = "result"
-            url = self.hyperlink_url("".join(f[0]))
+            url = hyperlink_url("".join(f[0]))
             if url:
                 idx = len(st.frames)
                 if self.push(st, _Frame("link", url)):
@@ -302,11 +302,6 @@ class _Reader:
             f = st.fields.pop()
             if f[2] is not None:
                 self.close_to(st, f[2])
-
-    @staticmethod
-    def hyperlink_url(instr):
-        m = _HYPERLINK.match(instr or "")
-        return ((m.group(1) if m.group(1) is not None else m.group(2)) or "")[:MAX_URL] if m else ""
 
     def run_props(self, r):
         bold = vanish = rstyle = None
@@ -355,7 +350,7 @@ class _Reader:
         elif n == "noBreakHyphen":
             self.text("-", st)
         elif n == "fldSimple":
-            url = self.hyperlink_url(attr(el, "instr"))
+            url = hyperlink_url(attr(el, "instr"))
             if url:
                 self.scoped(st, el, d, _Frame("link", url))
             else:

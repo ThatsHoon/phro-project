@@ -87,15 +87,25 @@ def test_compressed_cyrillic_lid():
 
 
 def test_far_east_lid():
-    # a Far East document records lid as American: the code page comes from lidFE (anydoc)
-    p = doc_file([("한글\r", True)], lid=0x0412, flags=0x0200 | 0x4000)
-    q = make_doc(tmp() / "b.doc", [("한글\r", True)], lid=0x0412, lid_fe=0x0412, flags=0x0200 | 0x4000)
-    assert md(p) == md(q) == "한글\n"
-    raw = "한글\r".encode("cp949").decode("cp1252")  # the cp949 bytes, written as if the lid were American
-    r = make_doc(tmp() / "c.doc", [(raw, True)], lid=0x0409, lid_fe=0x0412, flags=0x0200 | 0x4000)
-    assert md(r) == "한글\n"
-    s = make_doc(tmp() / "d.doc", [(raw, True)], lid=0x0409, lid_fe=0x0412, flags=0x0200)  # not Far East: lid
-    assert "한글" not in md(s)
+    # a Far East document records lid as American: the language is lidFE's (anydoc), when it is single-byte
+    p = doc_file([("Привет\r", True)], lid=0x0409, lid_fe=0x0419, flags=0x0200 | 0x4000)
+    assert md(p) == "Привет\n"
+    same = "Привет\r".encode("cp1251").decode("cp1252")  # the cp1251 bytes, in a document that is not Far East
+    q = doc_file([(same, True)], lid=0x0409, lid_fe=0x0419, flags=0x0200)
+    assert md(q) == same.strip() + "\n"
+
+
+def test_compressed_under_double_byte_lid_is_cp1252():
+    # compressed text is one byte a character (MS-DOC 2.9.73): under a double-byte code page it is cp1252 (dochan)
+    text = "“Hello” – a café…\r"
+    p = doc_file([(text, True)], lid=0x0409, lid_fe=0x0412, flags=0x0200 | 0x4000)  # English typed in Korean Word
+    assert md(p) == "“Hello” – a café…\n"
+    for lid in (0x0412, 0x0411, 0x0404, 0x0804):
+        assert md(doc_file([(text, True)], lid=lid, flags=0x0200 | 0x4000)) == "“Hello” – a café…\n", hex(lid)
+    raw = "한글\r".encode("cp949").decode("cp1252")  # cp949 bytes in a compressed piece are cp1252 characters
+    r = doc_file([(raw, True)], lid=0x0409, lid_fe=0x0412, flags=0x0200 | 0x4000)
+    assert md(r) == raw.strip() + "\n"
+    assert doc_fib.compressed_codepage(0x0412) == "cp1252" and doc_fib.compressed_codepage(0x0419) == "cp1251"
 
 
 def test_mixed_pieces():
@@ -361,6 +371,75 @@ def test_story_text_slices():
 
 
 # ---- the walk Tasks 10-14 extend
+class _Marks(doc._Reader):
+    """The reader with a \\x02 handler that records the CP it is given and the index Story maps it back to."""
+    SPECIAL = {**doc._Reader.SPECIAL, "\x02": "mark"}
+
+    def mark(self, st, cp):
+        self.marks.append((cp, st.story.index_of(cp), st.story.cp_of(st.story.index_of(cp))))
+
+
+def marks(path):
+    with Compound(path) as cf:
+        r = _Marks(cf, Context())
+        r.marks = []
+        r.run()
+    for cp, _, back in r.marks:
+        assert back == cp, r.marks
+    return [cp for cp, _, _ in r.marks]
+
+
+def test_handler_cp_after_emoji():
+    assert marks(doc_file([("😀\x02\r", False)])) == [2]  # a surrogate pair is two CPs
+    assert marks(doc_file([("a😀\x02😀😀b\x02\r", False)])) == [3, 9]
+
+
+def test_handler_cp_after_compressed_piece():
+    assert marks(doc_file([("ab", True), ("y\x02\r", False)])) == [3]
+    # two bytes that would be one cp949 character are two CPs, as two cp1252 characters
+    p = doc_file([("ÇÑ", True), ("y\x02\r", False)], lid=0x0409, lid_fe=0x0412, flags=0x0200 | 0x4000)
+    assert marks(p) == [3]
+
+
+def test_handler_cp_after_cut_piece():
+    # CPs 3-99 are a piece wholly past the stream: the \x02 after the gap is still CP 100
+    word_extra = "abc\x02\r".encode("utf-16-le")
+    table = clx([0, 3, 100, 102], [(DOC_EXTRA, 0), (10**6, 0), (DOC_EXTRA + 6, 0)])
+    assert marks(doc_file([], fc={33: table}, word_extra=word_extra, ccp={"text": 102})) == [100]
+
+
+def test_emoji_renders_as_one_character():
+    assert md(doc_file([("a😀b 𠀀\r", False)])) == "a😀b 𠀀\n"
+    link = "\x13 HYPERLINK \"https://e.example/😀\" \x14go 😀\x15\r"
+    assert md(doc_file([(link, False)])) == "[go 😀](https://e.example/😀)\n"
+    lone = u16(0xD800) + "x\r".encode("utf-16-le")  # an unpaired surrogate becomes U+FFFD
+    p = doc_file([], fc={33: clx([0, 3], [(DOC_EXTRA, 0)])}, word_extra=lone, ccp={"text": 3})
+    assert md(p) == "�x\n"
+
+
+def test_story_maps_index_and_cp():
+    hi, lo = chr(0xD83D), chr(0xDE00)  # 😀 as the two UTF-16 units Story keeps
+    word = "a😀".encode("utf-16-le") + b"xyz"
+    pcs = [doc_fib.Piece(0, 3, 0, False, 0), doc_fib.Piece(10, 13, 6, True, 0)]
+    s = doc_fib.story(word, pcs, 0, 13, 0x0409)
+    assert s.text == "a" + hi + lo + "xyz" and doc_fib.story_text(word, pcs, 0, 13, 0x0409) == s.text
+    assert [s.cp_of(i) for i in range(7)] == [0, 1, 2, 10, 11, 12, 13]
+    assert [s.index_of(cp) for cp in (0, 2, 3, 5, 10, 12, 13, 99)] == [0, 2, 3, 3, 3, 5, 6, 6]
+    part = doc_fib.story(word, pcs, 2, 12, 0x0409)  # starts inside the pair: one unit per CP still
+    assert part.text == lo + "xy" and part.cp_of(0) == 2 and part.cp_of(1) == 10 and part.index_of(11) == 2
+    empty = doc_fib.story(word, pcs, 4, 9, 0x0409)  # all in the gap
+    assert empty.text == "" and empty.cp_of(0) == 4 and empty.index_of(7) == 0
+
+
+def test_hyperlink_rule_shared():
+    from reader.formats import ooxml_word, word_fields
+    assert doc.hyperlink_url is word_fields.hyperlink_url and ooxml_word.hyperlink_url is word_fields.hyperlink_url
+    assert word_fields.hyperlink_url(' HYPERLINK "https://a.example" \\o "tip"') == "https://a.example"
+    assert word_fields.hyperlink_url("HYPERLINK https://b.example") == "https://b.example"
+    assert word_fields.hyperlink_url(' HYPERLINK \\l "_Toc1"') == "" and word_fields.hyperlink_url(" PAGE ") == ""
+    assert len(word_fields.hyperlink_url('HYPERLINK "' + "u" * 5000 + '"')) == word_fields.MAX_URL
+
+
 def test_special_handlers_exist():
     for ch, name in doc._Reader.SPECIAL.items():
         assert len(ch) == 1 and ord(ch) < 0x20 and callable(getattr(doc._Reader, name, None)), (ch, name)
