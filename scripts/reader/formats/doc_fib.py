@@ -1,8 +1,11 @@
-"""Word 97-2003 binary structures: the FIB, the piece table and the text of a story's CP range.
+"""Word 97-2003 binary structures: the FIB, the piece table, the text of a story's CP range, and the formatting:
+sprms, CHPX and PAPX FKPs, piece Prms and the style sheet.
 
-Written from MS-DOC (2.5.1 Fib, 2.9.38 Clx, 2.9.177 PlcPcd, 2.9.73 FcCompressed, 2.4.1 retrieving text); logic follows
-dochan office_binary/doc_binary.py (FIB walk, Clx, piece CPs, cumulative story ranges). Every count and offset is
-checked against the stream it is read from.
+Written from MS-DOC (2.5.1 Fib, 2.9.38 Clx, 2.9.177 PlcPcd, 2.9.73 FcCompressed, 2.4.1 retrieving text, 2.2.5 Sprm
+and Prm, 2.9.33/2.9.175 ChpxFkp/PapxFkp, 2.9.271 STSH, 2.4.6 applying properties); logic follows dochan
+office_binary/doc_binary.py (FIB walk, Clx, piece CPs, cumulative story ranges, decode_grpprl operand sizes, _fkps,
+_read_styles) and anydoc formats/doc (Prm0 isprm table, STD walk, toggles against the style's value). Every count
+and offset is checked against the stream it is read from.
 
 FibRgFcLcb97 indices this reader uses (MS-DOC 2.5.6; dochan reads all but 73/74 at these indices, anydoc reads 1,
 2/3, 12/13, 33, 46/47 and 73/74 at the matching absolute offsets): 1 STSH, 2/3 PlcffndRef/Txt, 4/5
@@ -11,12 +14,13 @@ PlcfendRef/Txt, 50 DggInfo, 56 PlcftxbxTxt, 58 PlcfHdrtxbxTxt, 73 PlfLst, 74 Plf
 """
 import struct
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..limits import ReadError
 from ..text import codepage
 
 CLX = 33  # the FibRgFcLcb97 index of the Clx
+STSH, BTE_CHPX, BTE_PAPX = 1, 12, 13  # FibRgFcLcb97 indices of the style sheet and the two PlcBte
 # the stories in CP order, from FibRgLw97 entries 3-10; "macro" (reserved3, formerly ccpMcr) keeps its place in the
 # sum as the Word 97 layout gives it; MS-DOC says it is 0
 STORIES = ("text", "footnote", "header", "macro", "annotation", "endnote", "textbox", "header_textbox")
@@ -90,6 +94,25 @@ def fib(word: bytes) -> Fib:
     return out
 
 
+def _prc_walk(clx) -> tuple[list[tuple[int, int]], int]:
+    """The (start, end) of each Prc grpprl (clxt 1, u16 cb, grpprl) at the head of a Clx, cut to the Clx, and where
+    the Prcs end. Each Prc moves on by at least 3 bytes."""
+    spans, pos, n = [], 0, len(clx)
+    while pos + 3 <= n and clx[pos] == 1:
+        end = pos + 3 + struct.unpack_from("<H", clx, pos + 1)[0]
+        spans.append((pos + 3, min(end, n)))
+        pos = end
+    return spans, pos
+
+
+def prcs(table: bytes, fc: int, lcb: int) -> list[bytes]:
+    """The grpprls of the Clx's Prc records, the list a Prm1 indexes; empty when the Clx is outside the stream."""
+    if fc + lcb > len(table):
+        return []
+    clx = table[fc:fc + lcb]
+    return [clx[a:b] for a, b in _prc_walk(clx)[0]]
+
+
 def pieces(table: bytes, fc: int, lcb: int) -> list[Piece]:
     """The pieces of the Clx at table[fc:fc + lcb]: Prc records (clxt 1, u16 cb, grpprl) are skipped, then the Pcdt
     (clxt 2, u32 lcb) holds the PlcPcd, n + 1 CPs and n 8-byte PCDs (fc u32 at 2, prm u16 at 6). A Clx outside the
@@ -99,9 +122,7 @@ def pieces(table: bytes, fc: int, lcb: int) -> list[Piece]:
     if fc + lcb > len(table):
         raise ReadError("damaged", "piece table outside the table stream")
     clx = memoryview(table)[fc:fc + lcb]
-    pos = 0
-    while pos + 3 <= lcb and clx[pos] == 1:  # each Prc moves on by at least 3 bytes
-        pos += 3 + struct.unpack_from("<H", clx, pos + 1)[0]
+    pos = _prc_walk(clx)[1]
     if pos + 5 > lcb or clx[pos] != 2:
         raise ReadError("damaged", "no piece table")
     size = struct.unpack_from("<I", clx, pos + 1)[0]
@@ -230,3 +251,416 @@ def story(word: bytes, pcs: list[Piece], cp0: int, cp1: int, lid: int) -> Story:
 def story_text(word: bytes, pcs: list[Piece], cp0: int, cp1: int, lid: int) -> str:
     """The text of story(); its surrogates are still unpaired units."""
     return story(word, pcs, cp0, cp1, lid).text
+
+
+# ---- formatting: sprms, FKPs, Prms and the style sheet
+_FIXED = (1, 1, 2, 4, 2, 2, 0, 3)  # operand bytes by spra (op >> 13); 6 is variable
+_WIDE = (0xD606, 0xD608)           # sprmTDefTable10 and sprmTDefTable: u16 cb, cb - 1 operand bytes
+_CHG_TABS = 0xC615                 # sprmPChgTabs: u8 cb, 255 a sentinel
+
+
+def sprms(grpprl: bytes) -> list[tuple[int, bytes]]:
+    """The (op, operand) pairs of a grpprl. The operand size comes from op >> 13 (MS-DOC 2.2.5.1); a variable one is
+    a u8 length, except sprmTDefTable and sprmTDefTable10, whose u16 cb counts the operand plus one, and
+    sprmPChgTabs with cb 255, sized by its deleted (4 bytes each) and added (3 bytes each) tab counts. A truncated
+    tail stops the list; every sprm moves on by at least 3 bytes."""
+    out, pos, n = [], 0, len(grpprl)
+    while pos + 2 <= n:
+        op = grpprl[pos] | grpprl[pos + 1] << 8
+        pos += 2
+        size = _FIXED[op >> 13]
+        if not size:
+            if op in _WIDE:
+                if pos + 2 > n:
+                    break
+                size = max(0, (grpprl[pos] | grpprl[pos + 1] << 8) - 1)
+                pos += 2
+            else:
+                if pos >= n:
+                    break
+                size = grpprl[pos]
+                pos += 1
+                if op == _CHG_TABS and size == 255:
+                    if pos >= n or pos + 1 + 4 * grpprl[pos] >= n:
+                        break
+                    size = 2 + 4 * grpprl[pos] + 3 * grpprl[pos + 1 + 4 * grpprl[pos]]
+        if pos + size > n:
+            break
+        out.append((op, bytes(grpprl[pos:pos + size])))
+        pos += size
+    return out
+
+
+_PAGE = 512
+_PN = 0x3FFFFF  # PnFkpChpx / PnFkpPapx: the page number is the low 22 bits
+
+
+def fkp_runs(word: bytes, bte: bytes, kind: str, ctx) -> list[tuple[int, int, bytes]]:
+    """The (fc0, fc1, data) runs of the FKP pages a PlcBteChpx or PlcBtePapx (`bte`: n + 1 FCs, n PnFkp u32) names;
+    `kind` is "chpx" (data: the CHPX grpprl) or "papx" (data: GrpPrlAndIstd, istd u16 then the grpprl). A page is
+    512 bytes at (pn & 0x3FFFFF) * 512 in WordDocument, crun at byte 511, then crun + 1 FCs and crun one-byte
+    offsets (CHPX) or 13-byte BXs (PAPX); an offset times 2 is where the CHPX (cb u8, grpprl) or PapxInFkp (cb u8:
+    2cb - 1 bytes, or 0 then cb' u8: 2cb' bytes) starts, 0 being no properties. A page named twice is read once.
+    A BTE whose size is not 4 + 8n, a page past the stream, a crun whose tables pass byte 511, and a run with
+    decreasing FCs or whose offset points into the tables or past byte 511 are skipped and counted under styles;
+    so are the entries of a BTE naming more pages than WordDocument holds, past that many."""
+    if not bte:
+        return []
+    if len(bte) < 12 or (len(bte) - 4) % 8:
+        ctx.skipped["styles"] += 1
+        return []
+    n = (len(bte) - 4) // 8
+    k = min(n, len(word) // _PAGE)  # every page is a different 512 bytes of WordDocument
+    if k < n:
+        ctx.skipped["styles"] += 1
+    papx = kind == "papx"
+    width = 13 if papx else 1
+    out, seen = [], set()
+    for pn in struct.unpack_from("<%dI" % k, bte, 4 * (n + 1)):
+        pn &= _PN
+        if pn in seen:
+            continue
+        seen.add(pn)
+        at = pn * _PAGE
+        if at + _PAGE > len(word):
+            ctx.skipped["styles"] += 1
+            continue
+        page = word[at:at + _PAGE]
+        crun = page[511]
+        head = 4 * (crun + 1) + width * crun
+        if head > 511:
+            ctx.skipped["styles"] += 1
+            continue
+        fcs = struct.unpack_from("<%dI" % (crun + 1), page)
+        for j in range(crun):
+            f0, f1 = fcs[j], fcs[j + 1]
+            if f1 <= f0:
+                if f1 < f0:
+                    ctx.skipped["styles"] += 1
+                continue
+            off = page[4 * (crun + 1) + width * j] * 2
+            if not off:
+                out.append((f0, f1, b""))
+                continue
+            if off < head:
+                ctx.skipped["styles"] += 1
+                continue
+            cb = page[off]
+            if not papx:
+                start, size = off + 1, cb
+            elif cb:
+                start, size = off + 1, 2 * cb - 1
+            else:
+                start, size = off + 2, 2 * page[off + 1]
+            if start + size > 511 or (papx and size < 2):
+                ctx.skipped["styles"] += 1
+                continue
+            out.append((f0, f1, bytes(page[start:start + size])))
+    return out
+
+
+def cp_runs(runs: list[tuple[int, int, bytes]], pcs: list[Piece]) -> list[tuple[int, int, bytes, int]]:
+    """FKP runs in FCs as (cp0, cp1, data, prm) runs over the pieces (in CP order, as fit() leaves them): each piece's
+    FC range is intersected with the runs, so a fast-saved file whose pieces are out of FC order maps right, and
+    the CPs a piece holds that no run covers are runs without data; every run carries its piece's Prm. A character
+    belongs to the run holding its first byte. Overlapping runs are cut to the first. O((runs + pieces) log runs)
+    plus the runs inside each piece, which never share bytes in a well-formed file."""
+    flat, end = [], -1
+    for f0, f1, data in sorted(runs, key=lambda r: r[0]):
+        f0 = max(f0, end)
+        if f0 < f1:
+            flat.append((f0, f1, data))
+            end = f1
+    starts = [r[0] for r in flat]
+    out = []
+    for p in pcs:
+        w = 1 if p.compressed else 2
+        lo, hi, cp = p.fc, p.fc + (p.cp_end - p.cp) * w, p.cp
+        i = max(bisect_right(starts, lo) - 1, 0)
+        while i < len(flat) and flat[i][0] < hi:
+            f0, f1, data = flat[i]
+            i += 1
+            c0 = p.cp - (lo - max(f0, lo)) // w  # ceil: the first character starting at or after f0
+            c1 = p.cp - (lo - min(f1, hi)) // w
+            if c1 <= max(c0, cp):
+                continue
+            if c0 > cp:
+                out.append((cp, c0, b"", p.prm))
+            out.append((max(c0, cp), c1, data, p.prm))
+            cp = c1
+        if cp < p.cp_end:
+            out.append((cp, p.cp_end, b"", p.prm))
+    return out
+
+
+# MS-DOC 2.2.5.4 Prm0: the isprm of a one-sprm Prm -> its sprm, for the sprms this reader reads (0x0C, 0x18, 0x19,
+# 0x55 and 0x78 as anydoc has them)
+_ISPRM = {0x0C: 0x260A, 0x18: 0x2416, 0x19: 0x2417, 0x41: 0x0800, 0x4B: 0x080A, 0x55: 0x0835, 0x5C: 0x083C,
+          0x75: 0x0855, 0x78: 0x2640}
+
+
+def prm_sprms(prm: int, prc: list[bytes]) -> list[tuple[int, bytes]] | None:
+    """The sprms a piece's Prm adds: bit 0 clear is Prm0, isprm (bits 1-7) and a one-byte val (bits 8-15); bit 0 set
+    is Prm1, igrpprl (bits 1-15) indexing the Clx Prc list, its sprms cut to last_sprms. None when that index is past
+    the list."""
+    if prm & 1:
+        k = prm >> 1
+        return last_sprms(sprms(prc[k])) if k < len(prc) else None
+    op = _ISPRM.get(prm >> 1 & 0x7F)
+    return [(op, bytes((prm >> 8,)))] if op else []
+
+
+def huge_papx(data: bytes, at: int) -> bytes | None:
+    """The grpprl of the PrcData a sprmPHugePapx points at in the Data stream: u16 cb, then cb bytes; None when it
+    is not all inside the stream."""
+    if at + 2 > len(data):
+        return None
+    end = at + 2 + struct.unpack_from("<H", data, at)[0]
+    return data[at + 2:end] if end <= len(data) else None
+
+
+@dataclass(slots=True)
+class RunProps:
+    """Character properties: bold, vanish (hidden), deleted (a tracked deletion), special (fSpec: \\x01 and \\x08
+    are objects), pic (PicLocation: a Data stream offset), ole (fOle2) and obj (ObjLocation)."""
+    bold: bool = False
+    vanish: bool = False
+    deleted: bool = False
+    special: bool = False
+    pic: int | None = None
+    ole: bool = False
+    obj: int | None = None
+
+
+@dataclass(slots=True)
+class ParaProps:
+    """Paragraph properties: the style, the outline level (0-8, 9 body text), the table marks (in table, TTP, inner
+    cell and row mark, itap depth), the list (ilvl, ilfo) and the TDefTable operand."""
+    istd: int = 0
+    outline: int = 9
+    in_table: bool = False
+    ttp: bool = False
+    inner_cell: bool = False
+    inner_row: bool = False
+    itap: int = 0
+    ilvl: int = 0
+    ilfo: int = 0
+    tdef: bytes | None = None
+
+
+def _toggle(arg: bytes, now: bool, style: bool) -> bool:
+    """A ToggleOperand: 0 off, 1 on, 0x80 the style's value, 0x81 its opposite; anything else leaves it."""
+    v = arg[0]
+    return False if v == 0 else True if v == 1 else style if v == 0x80 else (not style) if v == 0x81 else now
+
+
+def _apply_run(props: RunProps, ops, style: RunProps) -> RunProps:
+    """props with the character sprms `ops` applied, toggles against `style`."""
+    bold, vanish, deleted, special = props.bold, props.vanish, props.deleted, props.special
+    pic, ole, obj = props.pic, props.ole, props.obj
+    for op, arg in ops:
+        if op == 0x0835:
+            bold = _toggle(arg, bold, style.bold)
+        elif op == 0x083C:
+            vanish = _toggle(arg, vanish, style.vanish)
+        elif op == 0x0800:
+            deleted = _toggle(arg, deleted, style.deleted)
+        elif op == 0x0855:
+            special = _toggle(arg, special, style.special)
+        elif op == 0x080A:
+            ole = _toggle(arg, ole, style.ole)
+        elif op == 0x6A03:
+            pic = int.from_bytes(arg, "little")
+        elif op == 0x680E:
+            obj = int.from_bytes(arg, "little")
+    return RunProps(bold, vanish, deleted, special, pic, ole, obj)
+
+
+def _apply_para(props: ParaProps, ops) -> ParaProps:
+    """props with the paragraph sprms `ops` applied; sprmPIstd and sprmPHugePapx are the caller's."""
+    p = replace(props)
+    for op, arg in ops:
+        if op == 0x2640:
+            p.outline = arg[0]
+        elif op == 0x2416:
+            p.in_table = arg[0] != 0
+        elif op == 0x2417:
+            p.ttp = arg[0] != 0
+        elif op == 0x244B:
+            p.inner_cell = arg[0] != 0
+        elif op == 0x244C:
+            p.inner_row = arg[0] != 0
+        elif op == 0x6649:
+            p.itap = max(0, int.from_bytes(arg, "little", signed=True))
+        elif op == 0x260A:
+            p.ilvl = arg[0]
+        elif op == 0x460B:
+            p.ilfo = int.from_bytes(arg, "little")
+        elif op == 0xD608:
+            p.tdef = arg
+    return p
+
+
+ISTD_NIL = 0x0FFF   # no base style
+STYLE_DEPTH = 32    # istdBase links one style chain may follow
+_CHAR_ISTD, _PARA_ISTD = 0x4A30, 0x4600  # sprmCIstd (character style), sprmPIstd (paragraph style)
+_TOGGLES = frozenset((0x0835, 0x083C, 0x0800, 0x0855, 0x080A))
+# every sprm _apply_run, _apply_para and Styles read; one they come to read must be added here, or last_sprms drops it
+_READ = _TOGGLES | frozenset((0x6A03, 0x680E, _CHAR_ISTD, _PARA_ISTD, 0x2640, 0x2416, 0x2417, 0x244B, 0x244C,
+                              0x6649, 0x260A, 0x460B, 0xD608, 0x6646))
+
+
+def last_sprms(ops: list) -> list:
+    """The sprms of `ops` this reader reads, only the last of each op. Every property they set is its own and is set
+    outright (a toggle against a style value that does not change while one grpprl applies), so the last one decides
+    it; a toggle operand other than 0, 1, 0x80 and 0x81 changes nothing and is dropped first. A grpprl of up to
+    64 KiB (a Prc, a huge PAPX, a style's UPX) so becomes at most len(_READ) sprms, however often it is applied."""
+    last = {}
+    for op, arg in ops:
+        if op in _READ and (op not in _TOGGLES or arg[0] in (0, 1, 0x80, 0x81)):
+            last[op] = arg
+    return list(last.items())
+
+
+@dataclass(slots=True)
+class _Std:
+    sti: int
+    base: int
+    name: str
+    papx: list  # the sprms of the UpxPapx after its istd
+    chpx: list  # the sprms of the UpxChpx
+
+
+class Styles:
+    """The style sheet (STSH) and the properties its istdBase chains give. `bad` counts the damage met: a cut STSH or
+    STD, a chain cut at STYLE_DEPTH links or by a cycle; the caller adds it to ctx.skipped["styles"]."""
+
+    def __init__(self, stsh: bytes = b""):
+        self.stds: dict[int, _Std] = {}
+        self.bad = 0
+        self._chains: dict[int, list] = {}
+        self._runs: dict[tuple, RunProps] = {}
+        self._paras: dict[int, ParaProps] = {}
+        if stsh:
+            self._read(stsh)
+
+    def _read(self, stsh: bytes):
+        """cbStshi u16 and the Stshi (cstd u16, cbSTDBaseInFile u16, ...), then cstd LPStds (cbStd u16, the STD; 0 is
+        an empty slot), all inside the STSH's own lcb."""
+        n = len(stsh)
+        if n < 6:
+            self.bad += 1
+            return
+        cb, cstd, base = struct.unpack_from("<3H", stsh)
+        if cb < 4 or 2 + cb > n or base < 10:
+            self.bad += 1
+            return
+        pos = 2 + cb
+        for istd in range(cstd):
+            if pos + 2 > n:
+                self.bad += 1
+                break
+            size = struct.unpack_from("<H", stsh, pos)[0]
+            pos += 2
+            if not size:
+                continue
+            if pos + size > n:
+                self.bad += 1
+                break
+            std = self._std(stsh[pos:pos + size], base)
+            pos += size
+            if std is not None:
+                self.stds[istd] = std
+
+    def _std(self, raw: bytes, base: int) -> "_Std | None":
+        """One STD: StdfBase (sti in the low 12 bits; stk and istdBase; cupx), the rest of the cbSTDBaseInFile-byte
+        Stdf, the name (u16 count, UTF-16, u16 0), then cupx UPXs (cbUpx u16 and its bytes), each from an even
+        offset. A paragraph style (stk 1) has UpxPapx (istd + grpprl) and UpxChpx; a character style (2) UpxChpx; a
+        table style (3) UpxTapx, UpxPapx and UpxChpx; a numbering style (4) UpxPapx. A cut STD is counted: its
+        name cut, it is left out; its UPXs cut, it keeps those read."""
+        n = len(raw)
+        if n < base + 2:
+            self.bad += 1
+            return None
+        w0, w1, w2 = struct.unpack_from("<3H", raw)
+        stk, cupx = w1 & 0xF, w2 & 0xF
+        at = base + 2 + 2 * struct.unpack_from("<H", raw, base)[0]
+        if at > n:
+            self.bad += 1
+            return None
+        name = raw[base + 2:at].decode("utf-16-le", "replace")
+        at += 2
+        upx = []
+        for _ in range(cupx):
+            at += at & 1
+            end = at + 2 + struct.unpack_from("<H", raw, at)[0] if at + 2 <= n else n + 1
+            if end > n:
+                self.bad += 1
+                break
+            upx.append(raw[at + 2:end])
+            at = end
+        papx_at = {1: 0, 3: 1, 4: 0}.get(stk)
+        chpx_at = {1: 1, 2: 0, 3: 2}.get(stk)
+        papx = upx[papx_at][2:] if papx_at is not None and papx_at < len(upx) else b""
+        chpx = upx[chpx_at] if chpx_at is not None and chpx_at < len(upx) else b""
+        return _Std(w0 & 0xFFF, w1 >> 4, name, last_sprms(sprms(papx)), last_sprms(sprms(chpx)))
+
+    def chain(self, istd: int) -> list:
+        """The STDs from the root of istd's istdBase chain down to istd's own: at most STYLE_DEPTH, a cycle cut
+        where it closes; both counted."""
+        hit = self._chains.get(istd)
+        if hit is not None:
+            return hit
+        out, seen, cur = [], set(), istd
+        while cur != ISTD_NIL and cur in self.stds:
+            if cur in seen or len(out) == STYLE_DEPTH:
+                self.bad += 1
+                break
+            seen.add(cur)
+            out.append(self.stds[cur])
+            cur = out[-1].base
+        out.reverse()
+        self._chains[istd] = out
+        return out
+
+    def heading(self, istd: int) -> int:
+        """1-9 for a style whose sti is 1-9 (the built-in "heading 1" to "heading 9"), else 0."""
+        s = self.stds.get(istd)
+        return s.sti if s is not None and 1 <= s.sti <= 9 else 0
+
+    def _style_run(self, istd: int, cstyle: int | None) -> RunProps:
+        """The character properties of paragraph style istd, then of character style cstyle on top, each chain
+        applied from its root, a style's toggles against what it is based on."""
+        key = (istd, cstyle)
+        hit = self._runs.get(key)
+        if hit is None:
+            hit = RunProps()
+            for s in self.chain(istd) + (self.chain(cstyle) if cstyle is not None else []):
+                hit = _apply_run(hit, s.chpx, hit)
+            self._runs[key] = hit
+        return hit
+
+    def run(self, istd: int, ops: list) -> RunProps:
+        """A run's properties: paragraph style istd's, the character style the run's sprmCIstd names, then the run's
+        own sprms, whose toggles 128 and 129 take the value of those styles and its opposite."""
+        cstyle = None
+        for op, arg in ops:
+            if op == _CHAR_ISTD and len(arg) == 2:
+                cstyle = arg[0] | arg[1] << 8
+        style = self._style_run(istd, cstyle)
+        return _apply_run(style, ops, style) if ops else style
+
+    def para(self, istd: int, ops: list) -> ParaProps:
+        """A paragraph's properties: the style (istd, or the last sprmPIstd among `ops`) resolved down its chain,
+        then `ops`."""
+        for op, arg in ops:
+            if op == _PARA_ISTD and len(arg) == 2:
+                istd = arg[0] | arg[1] << 8
+        base = self._paras.get(istd)
+        if base is None:
+            base = ParaProps()
+            for s in self.chain(istd):
+                base = _apply_para(base, s.papx)
+            base.istd = istd
+            self._paras[istd] = base
+        return _apply_para(base, ops) if ops else base

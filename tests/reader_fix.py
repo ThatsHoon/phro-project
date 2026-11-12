@@ -277,8 +277,115 @@ DOC_EXTRA = 0x400  # where make_doc puts word_extra in WordDocument; the piece t
 DOC_STORIES = ("text", "footnote", "header", "macro", "annotation", "endnote", "textbox", "header_textbox")
 
 
+def _doc_pcds(clx):
+    """(cp0, cp1, fc, bytes a CP) of each piece of a Clx: Prc records skipped, then the Pcdt's PlcPcd."""
+    import struct
+    pos = 0
+    while clx[pos] == 1:
+        pos += 3 + struct.unpack_from("<H", clx, pos + 1)[0]
+    size = struct.unpack_from("<I", clx, pos + 1)[0]
+    plc = clx[pos + 5:pos + 5 + size]
+    n = (size - 4) // 12
+    cps = struct.unpack_from("<%dI" % (n + 1), plc)
+    out = []
+    for i in range(n):
+        raw = struct.unpack_from("<I", plc, 4 * (n + 1) + 8 * i + 2)[0]
+        packed = bool(raw & 0x40000000)
+        at = raw & 0x3FFFFFFF
+        out.append((cps[i], cps[i + 1], at // 2 if packed else at, 1 if packed else 2))
+    return out
+
+
+def _doc_fkp(spans, pcds, papx, pn):
+    """FKP pages and their PlcBte for (cp0, cp1, bytes) spans: each span is mapped to FCs through the pieces (split
+    where a piece ends), the runs are sorted by FC and the gaps between them filled with runs without properties, so
+    each page's runs are contiguous. A CHPX is cb u8 + grpprl; a PAPX (bytes: istd u16 + grpprl) is cb u8 with size
+    2cb - 1 for an odd size, else 0 and cb' u8 with size 2cb'. Pages are numbered from `pn`."""
+    import struct
+    from bisect import bisect_right
+    starts = [p[0] for p in pcds]
+    runs = []
+    for c0, c1, data in spans:
+        k = max(bisect_right(starts, c0) - 1, 0)
+        while k < len(pcds) and pcds[k][0] < c1:
+            p0, p1, f, w = pcds[k]
+            a, b = max(c0, p0), min(c1, p1)
+            if a < b:
+                runs.append((f + (a - p0) * w, f + (b - p0) * w, bytes(data)))
+            k += 1
+    runs.sort(key=lambda r: r[0])
+    filled = []
+    for r in runs:
+        if filled and filled[-1][1] < r[0]:
+            filled.append((filled[-1][1], r[0], b""))
+        filled.append(r)
+    width = 13 if papx else 1
+
+    def blob(data):
+        if not data:
+            return b""
+        if not papx:
+            return bytes([len(data)]) + data
+        return bytes([(len(data) + 1) // 2]) + data if len(data) % 2 else bytes([0, len(data) // 2]) + data
+
+    pages, fcs, pns, i = [], [], [], 0
+    while i < len(filled):
+        page, top, chosen = bytearray(512), 511, []
+        while i < len(filled) and len(chosen) < 255:
+            b = blob(filled[i][2])
+            c = len(chosen) + 1
+            off = (top - len(b)) & ~1 if b else 0
+            if (c + 1) * 4 + c * width > (off if b else top):
+                break
+            if b:
+                page[off:off + len(b)] = b
+                top = off
+            chosen.append((filled[i], off))
+            i += 1
+        assert chosen, "a run too large for one FKP page"
+        c = len(chosen)
+        for j, ((f0, _, _), off) in enumerate(chosen):
+            struct.pack_into("<I", page, 4 * j, f0)
+            page[(c + 1) * 4 + j * width] = off // 2
+        struct.pack_into("<I", page, 4 * c, chosen[-1][0][1])
+        page[511] = c
+        fcs.append(chosen[0][0][0])
+        pns.append(pn + len(pages))
+        pages.append(bytes(page))
+    if not pages:
+        return b"", b""
+    fcs.append(filled[-1][1])
+    return b"".join(pages), struct.pack("<%dI" % (2 * len(pages) + 1), *fcs, *pns)
+
+
+def doc_stsh(styles, base=18):
+    """An STSH for make_doc's fc={1: ...}. `styles` lists the istd slots: None for an empty one, else (sti, stk,
+    istd_base, name, papx, chpx), stk 1 a paragraph style (UpxPapx: its istd + papx, then UpxChpx: chpx) and 2 a
+    character style (UpxChpx only); papx and chpx are grpprls. The Stshi is the 18-byte Stshif plus ftcBi;
+    cbSTDBaseInFile is `base`: 10 (Word 97) or 18 (with StdfPost2000). Each UPX is padded to an even size."""
+    import struct
+
+    def upx(data):
+        return struct.pack("<H", len(data)) + data + bytes(len(data) % 2)
+
+    stshi = struct.pack("<10H", len(styles), base, 1, 0x5B, 15, 0, 0, 0, 0, 0)
+    out = bytearray(struct.pack("<H", len(stshi)) + stshi)
+    for istd, s in enumerate(styles):
+        if s is None:
+            out += struct.pack("<H", 0)
+            continue
+        sti, stk, based, name, papx, chpx = s
+        std = struct.pack("<5H", sti & 0xFFF, stk | based << 4, 2 if stk == 1 else 1, 0, 0).ljust(base, b"\0")
+        std += struct.pack("<H", len(name)) + name.encode("utf-16-le") + b"\0\0"
+        if stk == 1:
+            std += upx(struct.pack("<H", istd) + bytes(papx))
+        std += upx(bytes(chpx))
+        out += struct.pack("<H", len(std)) + std
+    return bytes(out)
+
+
 def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, fc=None, word_extra=b"",
-             streams=None, lid_fe=None):
+             streams=None, lid_fe=None, chpx=None, papx=None):
     """Write a Word 97 .doc compound file.
 
     WordDocument holds the FIB (FibBase with `lid`, `nfib` and `flags`; 14 FibRgW words, lidFE at 13, `lid_fe` or
@@ -289,6 +396,9 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
     0x0200, else 0Table) holds each `fc` entry (FibRgFcLcb97 index -> bytes) in index order with its (fc, lcb) set in
     the FIB, then the Clx (one Pcdt, no Prc) at index 33 unless `fc` gives it. `ccp` sets story lengths by DOC_STORIES
     name; "text" takes the CPs the others leave. `streams` adds streams and replaces a built one of the same name.
+    `chpx` and `papx` are (cp0, cp1, bytes) spans in CPs, a CHPX grpprl or a PAPX (istd u16 + grpprl): they are mapped
+    to FCs through the piece table at index 33 (built or given), written as FKP pages after the text, from the next
+    512-byte boundary, and their PlcBteChpx (12) and PlcBtePapx (13) join the table stream unless `fc` gives them.
     Needs the reader's scripts folder on sys.path, as the tests set it.
     """
     import struct
@@ -319,6 +429,17 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
     if 33 not in entries:
         plc = struct.pack("<%dI" % len(cps), *cps) + b"".join(pcds)
         entries[33] = b"\x02" + struct.pack("<I", len(plc)) + plc
+    pages = b""
+    if chpx or papx:
+        first = -(-(DOC_EXTRA + len(body)) // 512)  # the page number of the first FKP
+        pcd = _doc_pcds(bytes(entries[33]))
+        for index, spans in ((12, chpx), (13, papx)):
+            if spans and index not in entries:
+                blob, bte = _doc_fkp(spans, pcd, index == 13, first + len(pages) // 512)
+                pages += blob
+                entries[index] = bte
+        if pages:
+            pages = bytes(first * 512 - DOC_EXTRA - len(body)) + pages
     pairs, table = [(0, 0)] * 93, bytearray()
     for i in sorted(entries):
         data = bytes(entries[i])
@@ -334,7 +455,7 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
            + struct.pack("<15H", 14, *rgw) + struct.pack("<H22I", 22, *rglw)
            + struct.pack("<H", 93) + b"".join(struct.pack("<II", *p) for p in pairs) + struct.pack("<H", 0))
     assert len(fib) <= DOC_EXTRA
-    out = {"WordDocument": fib.ljust(DOC_EXTRA, b"\0") + bytes(body),
+    out = {"WordDocument": fib.ljust(DOC_EXTRA, b"\0") + bytes(body) + pages,
            "1Table" if flags & 0x0200 else "0Table": bytes(table)}
     out.update(streams or {})
     path = Path(path)
