@@ -461,6 +461,30 @@ def test_large_section_is_linear():
     assert len(doc.blocks) == 20_001 and took < 10, took
 
 
+def test_many_char_shape_records_are_linear():
+    # one paragraph, 200,000 PARA_CHAR_SHAPE records (2.4 MB): about half a minute while the pairs were concatenated
+    n = 200_000
+    shapes = b"".join(hwp_record(hr.PARA_CHAR_SHAPE, 1, u32(k) + u32(k % 2)) for k in range(n))
+    p = hwp_file(raw_para("abc".encode("utf-16-le") + unit(13)) + shapes, doc_info=info(bold=(False, True)))
+    t0 = time.monotonic()
+    doc, ctx = parse(p)
+    took = time.monotonic() - t0
+    assert markdown.render(doc, tmp() / "a") == "a**b**c\n" and took < 5, took
+
+
+def test_many_inline_equations_are_linear():
+    # one paragraph of nothing but 150,000 inline equations: each one used to be removed by its own list scan
+    n = 150_000
+    eq = hwp_record(hr.CTRL_HEADER, 1, b"deqe" + u32(1)) + hwp_record(hr.EQEDIT, 2, u32(0) + wstr("x"))
+    # stored, as it deflates past the ratio cap; 6 MB, inside what make_cfb writes
+    p = hwp_file(raw_para(ctl(11, b"eqed") * n + unit(13)) + eq * n, flags=0)
+    t0 = time.monotonic()
+    doc, _ = parse(p)
+    took = time.monotonic() - t0
+    assert len(doc.blocks) == n and all(type(b).__name__ == "Equation" and b.tex == "x" for b in doc.blocks)
+    assert took < 5, took
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

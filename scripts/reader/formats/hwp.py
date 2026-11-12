@@ -3,7 +3,8 @@
 The body is a flat list of records per section; a record's children are the records after it with a deeper level.
 Logic follows dochan hwp/section.py and records/ctrl_header.py (paragraph walk, controls, field commands), kordoc
 hwp5/body.ts, record.ts and numbering.ts (secd outline numbering, note numbers, %clk placeholders, EQEDIT script) and
-rhwp parser/body_text.rs (control-character classes). The inline model matches hwpx.py, whose helpers it reuses.
+rhwp parser/body_text.rs (control-character classes). The inline model and paragraph rules are hancom.py's, shared
+with hwpx.py.
 """
 import re
 import struct
@@ -13,14 +14,16 @@ from .. import limits
 from ..containers import flate
 from ..containers.cfb import Compound, is_cfb
 from ..limits import ReadError
-from ..model import Bold, Break, Doc, Equation, Heading, Link, ListItem, Math, NoteRef, Para, Text
+from ..model import Bold, Break, Doc, Equation, Heading, ListItem, Math, NoteRef, Para, Text
 from . import hwpx
-from .hancom import STYLE_HEAD, number, tex as _tex
+from .hancom import (
+    Frame, Scopes, State, comment_note, cut_command, flat, heading_level, lone_equations, next_marker, plain,
+    strip_marker, style_name_level, tex as _tex,
+)
 from .hwp_records import (
     CTRL_HEADER, EQEDIT, PARA_CHAR_SHAPE, PARA_HEADER, PARA_TEXT, DocInfo, ParaShape, doc_info, file_header,
     records,
 )
-from .hwpx import _cut_command, _flat, _Frame, _itext, _remove, _State, _strip_marker
 
 _ZIP = b"PK\x03\x04"
 _V3 = b"HWP Document File V3"
@@ -33,18 +36,6 @@ _FIELD_END, _TAB, _LINE, _PARA_END, _NBSP, _FIXED = 4, 9, 10, 13, 30, 31
 # from an even offset: UTF-16LE units that are neither control characters (below 0x20) nor surrogates
 _PLAIN = re.compile(rb"(?:[\x20-\xff][^\xd8-\xdf]|[\x00-\x1f][^\x00\xd8-\xdf])+")
 _NO_SHAPE = ParaShape(0, 0, 0)
-
-
-def _style_level(name: str) -> int:
-    """hwpx's style-name heading rule."""
-    if m := STYLE_HEAD.match(name):
-        return min(max(int(m.group(1)), 1), 6)
-    low = name.lower()
-    if low in ("제목", "title"):
-        return 1
-    if low in ("부제목", "subtitle"):
-        return 2
-    return 0
 
 
 def _wstr(data: bytes, pos: int) -> str:
@@ -67,7 +58,7 @@ def _ends(recs) -> list:
     return out
 
 
-class _Reader:
+class _Reader(Scopes):
     # control id (big-endian ASCII) -> handler name; an unlisted id starting with "%" is a field, any other is skipped
     CONTROLS: dict[bytes, str] = {
         b"secd": "section_def", b"cold": "skip", b"pgnp": "skip", b"atno": "skip", b"nwno": "skip",
@@ -187,7 +178,7 @@ class _Reader:
     def para(self, recs, i, d, nohead) -> list:
         head, end = recs[i], self.end(recs, i)
         lvl = head.level + 1
-        text, pairs = [], b""
+        text, pairs = [], []
         j = i + 1
         while j < end:
             r = recs[j]
@@ -195,10 +186,10 @@ class _Reader:
                 if r.tag == PARA_TEXT:
                     text.append(r.data[:len(r.data) // 2 * 2])
                 elif r.tag == PARA_CHAR_SHAPE:
-                    pairs += r.data[:len(r.data) // 8 * 8]
+                    pairs.append(r.data[:len(r.data) // 8 * 8])
             j = self.end(recs, j)
-        st = _State(nohead)
-        self.walk(b"".join(text), self.bold_runs(pairs), st, recs, i + 1, end, lvl, d)
+        st = State(nohead)
+        self.walk(b"".join(text), self.bold_runs(b"".join(pairs)), st, recs, i + 1, end, lvl, d)
         self.close_to(st, 1)
         return self.blocks(head, st)
 
@@ -234,7 +225,7 @@ class _Reader:
                 continue
             if c in _INLINE:
                 if c == _FIELD_END:
-                    self.field_end(st)
+                    self.close_field(st)
                 elif c == _TAB:
                     self.chunk(" ", p // 2, runs, st)
                 p += 16
@@ -278,39 +269,34 @@ class _Reader:
         if not 0 <= sid < len(self.info.styles):
             return 0
         style = self.info.styles[sid]
-        return _style_level(style.name) or _style_level(style.local)
+        return style_name_level(style.name) or style_name_level(style.local)
 
     def blocks(self, head, st) -> list:
-        """hwpx's paragraph rules: lone equations shown on their own, headings, list items, then the extras."""
+        """The Hancom paragraph rules (shared with hwpx): lone equations shown on their own, headings, list items,
+        then the extras."""
         inl = st.frames[0].inl
-        out = []
-        if st.eqs and not _itext(inl).strip():
-            for obj in st.eqs:
-                _remove(inl, obj)
-            out.extend(Equation(o.tex, True) for o in st.eqs)
-        text = re.sub(r"\s+", " ", _itext(inl)).strip()
+        out = lone_equations(inl, st.eqs)
+        text = plain(inl)
         shape = self.shape(head)
         lvl = min(shape.level, 6)
         level = 0
         if not st.nohead:
-            level = min(shape.level + 1, 6) if shape.head == 1 else self.style_level(head)
-            if level and (len(text) > 120 or (len(text) > 40 and text[-1] in ".?!")):
-                level = 0
+            level = heading_level(min(shape.level + 1, 6) if shape.head == 1 else self.style_level(head), text)
         outline = self.outline_marker(shape, lvl) if shape.head == 1 else None
         main = None
         if level and text:
             if outline:
-                _strip_marker(inl, outline)
+                strip_marker(inl, outline)
                 inl.insert(0, Text(outline + " "))
             main = Heading(level, inl)
         elif shape.head in (2, 3):
             if shape.head == 2:
                 marker = self.marker(shape.ref, lvl)
-                _strip_marker(inl, marker)
+                strip_marker(inl, marker)
             else:  # a Markdown bullet; a copy of the BULLET character typed into the text is dropped
                 marker = "-"
                 if 1 <= shape.ref <= len(self.info.bullets):
-                    _strip_marker(inl, self.info.bullets[shape.ref - 1])
+                    strip_marker(inl, self.info.bullets[shape.ref - 1])
             if inl:
                 main = ListItem(lvl, marker, inl)
         elif inl:
@@ -319,23 +305,11 @@ class _Reader:
 
     # ---- numbering
     def marker(self, nid, lvl) -> str:
-        """hwpx's marker: per-numbering-id counters, ^N expanded in each level's number kind."""
+        """The shared marker rule over this numbering's levels, in hwpx's {level: (format, kind, start)} shape."""
         nums = self.info.numberings
         num = nums[nid - 1] if 1 <= nid <= len(nums) else None
         levels = {k + 1: (num.formats[k], num.kinds[k], num.starts[k]) for k in range(7)} if num else {}
-        cnt = self.numbers.setdefault(nid, {})
-        head = levels.get(lvl + 1)
-        cnt[lvl] = cnt.get(lvl, (head[2] if head else 1) - 1) + 1
-        for k in [k for k in cnt if k > lvl]:
-            del cnt[k]
-
-        def sub(m):
-            n = int(m.group(1))
-            h = levels.get(n)
-            return number(cnt.get(n - 1, h[2] if h else 1), h[1] if h else "DIGIT")
-
-        fmt = head[0] if head and head[0] else f"^{lvl + 1}."
-        return re.sub(r"\^(\d)", sub, fmt).strip()[:64] or "-"
+        return next_marker(levels, self.numbers.setdefault(nid, {}), lvl)
 
     def outline_marker(self, shape, lvl):
         """An outline paragraph's number: its own numbering id, else the section's (kordoc); None without one."""
@@ -345,29 +319,6 @@ class _Reader:
             return None
         mk = self.marker(nid, lvl)
         return mk if mk != "-" else None
-
-    # ---- inline scopes (hwpx's frames)
-    def add(self, st, inline):
-        st.frames[-1].inl.append(inline)
-
-    def push(self, st, frame):
-        if len(st.frames) < limits.MAX_DEPTH:
-            st.frames.append(frame)
-
-    def close_to(self, st, n):
-        while len(st.frames) > n:
-            f = st.frames.pop()
-            parent = st.frames[-1].inl
-            if f.kind == "link" and f.inl:
-                parent.append(Link(f.url, f.inl))
-            elif f.kind == "pass":
-                parent.extend(f.inl)
-
-    def field_end(self, st):
-        for k in range(len(st.frames) - 1, 0, -1):
-            if st.frames[k].kind in ("link", "pass", "drop"):
-                self.close_to(st, k)
-                return
 
     # ---- control handlers: (recs, i, st, d) -> the index of the first record after the control
     def skip(self, recs, i, st, d):
@@ -386,7 +337,7 @@ class _Reader:
         return self.margin(recs, i, d, self.doc.footers)
 
     def margin(self, recs, i, d, into):
-        text = _flat(self.sub(recs, i, d))
+        text = flat(self.sub(recs, i, d))
         if text:
             into.append(text)
         return self.end(recs, i)
@@ -406,12 +357,7 @@ class _Reader:
     def comment(self, recs, i, st, d):
         self.counts["cm"] += 1
         nid = f"cm-{self.counts['cm']}"
-        blocks = self.sub(recs, i, d)
-        if blocks and isinstance(blocks[0], Para):
-            blocks[0].inlines.insert(0, Text("Comment: "))
-        else:
-            blocks.insert(0, Para([Text("Comment:")]))
-        self.doc.notes[nid] = blocks
+        self.doc.notes[nid] = comment_note(self.sub(recs, i, d))
         self.add(st, NoteRef(nid))
         return self.end(recs, i)
 
@@ -437,12 +383,12 @@ class _Reader:
         cid = data[3::-1]
         attr = struct.unpack_from("<I", data, 4)[0] if len(data) >= 8 else 0
         if cid == b"%hlk":
-            url = _cut_command(_wstr(data, 9))  # id, attr u32, one byte, then the command
-            self.push(st, _Frame("link" if url else "pass", None, url))
+            url = cut_command(_wstr(data, 9))  # id, attr u32, one byte, then the command
+            self.push(st, Frame("link" if url else "pass", None, url))
         elif cid == b"%clk" and not attr & 0x8000:
-            self.push(st, _Frame("drop"))
+            self.push(st, Frame("drop"))
         else:
-            self.push(st, _Frame("pass"))
+            self.push(st, Frame("pass"))
         return self.end(recs, i)
 
 

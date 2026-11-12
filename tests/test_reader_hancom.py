@@ -1,12 +1,13 @@
-"""Shared Hancom helpers: equation script to TeX, numbering markers and the table cell grid.
+"""Shared Hancom helpers: equation script to TeX, numbering markers, the table cell grid and the paragraph rules.
 """
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from reader.formats import hancom  # noqa: E402
-from reader.model import Cell  # noqa: E402
+from reader.model import Bold, Break, Cell, Equation, Hidden, Link, Math, Para, Text  # noqa: E402
 
 
 def test_number_kinds():
@@ -65,6 +66,48 @@ def test_place_moved():
     assert [len(r) for r in rows] == [2, 3] and rows[1][2] is e and rows[0][1] is b
     assert [x.colspan for x in rows[0]] == [2, 1] and [x.colspan for x in rows[1]] == [1, 1, 1]
     assert hancom.place([]) == []
+
+
+def test_lone_equations_leave_at_any_depth():
+    a, b, c, d = Math("a"), Math("b"), Math("c"), Math("d")
+    inl = [Text(" "), a, Bold([b, Text(" ")]), Link("u", [c]), Hidden([d]), Break()]
+    assert hancom.lone_equations(inl, [a, b, c]) == [Equation("a"), Equation("b"), Equation("c")]
+    assert inl == [Text(" "), Bold([Text(" ")]), Link("u", []), Hidden([d]), Break()], inl
+    # any visible text keeps them inline
+    inl = [a, Bold([Text("x")])]
+    assert hancom.lone_equations(inl, [a]) == [] and inl == [a, Bold([Text("x")])]
+    assert hancom.lone_equations([Text("y")], []) == []
+
+
+def test_lone_equations_one_pass():
+    eqs = [Math("x") for _ in range(300_000)]
+    inl = list(eqs)
+    t0 = time.monotonic()
+    out = hancom.lone_equations(inl, eqs)
+    took = time.monotonic() - t0
+    assert inl == [] and len(out) == 300_000 and took < 2, took
+
+
+def test_paragraph_rules():
+    lv = hancom.style_name_level
+    assert (lv("개요 3"), lv("Heading 9"), lv("제목"), lv("Subtitle"), lv("본문")) == (3, 6, 1, 2, 0)
+    hl = hancom.heading_level
+    assert hl(2, "짧은 제목") == 2 and hl(2, "x" * 121) == 0 and hl(2, "x" * 41 + ".") == 0 and hl(0, "") == 0
+    assert hl(1, "x" * 39 + ".") == 1
+    assert hancom.comment_note([Para([Text("a")])]) == [Para([Text("Comment: "), Text("a")])]
+    assert hancom.comment_note([]) == [Para([Text("Comment:")])]
+    assert hancom.cut_command(r"https://e.com/a\;b;1;0") == "https://e.com/a;b"
+    assert hancom.plain([Text(" a \n"), Bold([Text("b")]), Break(), Text("c ")]) == "a b c"
+
+
+def test_next_marker():
+    levels = {1: ("^1.", "DIGIT", 1), 2: ("^1.^2)", "HANGUL_SYLLABLE", 3)}
+    cnt = {}
+    got = [hancom.next_marker(levels, cnt, lvl) for lvl in (0, 1, 1, 0, 1, 2)]
+    # a level without a format falls back to ^N. with digits and start 1
+    assert got == ["1.", "1.다)", "1.라)", "2.", "2.다)", "1."], got
+    assert hancom.next_marker({1: ("", "DIGIT", 5)}, {}, 0) == "5." and hancom.next_marker({}, {}, 0) == "1."
+    assert hancom.next_marker({1: ("  ", "DIGIT", 1)}, {}, 0) == "-"  # a format of blanks gives no number
 
 
 def main():

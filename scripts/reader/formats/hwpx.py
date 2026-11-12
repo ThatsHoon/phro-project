@@ -6,11 +6,11 @@ from .. import limits
 from ..charts import chart_table
 from ..containers.zipx import Package, attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
-from ..model import (
-    Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem,
-    Math, NoteRef, Para, Table, Text,
+from ..model import Bold, Break, Cell, Doc, Heading, Image, ListItem, Math, NoteRef, Para, Table, Text
+from .hancom import (
+    AUTO_ALT, Frame, Scopes, State, comment_note, cut_command, flat, heading_level, lone_equations, next_marker,
+    place, plain, strip_marker, style_name_level, tex as _tex,
 )
-from .hancom import AUTO_ALT, STYLE_HEAD, number, place, tex as _tex
 
 HPF = "Contents/content.hpf"
 _MIME = "application/hwp+zip"
@@ -23,59 +23,6 @@ def _int(s, default=0):
         return int(s)
     except (TypeError, ValueError):
         return default
-
-
-# ---- inline helpers
-def _itext(inlines) -> str:
-    out = ""
-    for it in inlines:
-        if isinstance(it, Text):
-            out += it.text
-        elif isinstance(it, (Bold, Link)):
-            out += _itext(it.inlines)
-        elif isinstance(it, Break):
-            out += " "
-    return out
-
-
-def _remove(inlines, obj) -> bool:
-    for i, it in enumerate(inlines):
-        if it is obj:
-            del inlines[i]
-            return True
-        if isinstance(it, (Bold, Link, Hidden)) and _remove(it.inlines, obj):
-            return True
-    return False
-
-
-def _strip_marker(inlines, marker) -> bool:
-    """Drop a leading `marker` from the first text; True when the first text was found."""
-    for it in inlines:
-        if isinstance(it, Text):
-            t = it.text.lstrip()
-            if t.startswith(marker):
-                it.text = t[len(marker):].lstrip()
-            return True
-        if isinstance(it, Bold) and _strip_marker(it.inlines, marker):
-            return True
-        if isinstance(it, (Link, Hidden, Math, NoteRef, Break)):
-            return True
-    return False
-
-
-def _flat(blocks) -> str:
-    parts = []
-    for b in blocks:
-        if isinstance(b, (Para, Heading, ListItem)):
-            parts.append(_itext(b.inlines))
-        elif isinstance(b, Table):
-            parts.extend(_flat(c.blocks) for row in b.rows for c in row)
-    return " ".join(re.sub(r"\s+", " ", p).strip() for p in parts if p.strip())
-
-
-def _cut_command(s: str) -> str:
-    m = re.search(r"(?<!\\);", s)
-    return re.sub(r"\\([;:])", r"\1", s[:m.start()] if m else s).strip()
 
 
 class _Header:
@@ -107,23 +54,7 @@ class _Header:
                 self.bold.add(eid)
 
 
-class _Frame:
-    """One open inline scope inside a paragraph: root, link, pass, drop or deleted."""
-
-    def __init__(self, kind, fid=None, url=""):
-        self.kind, self.id, self.url, self.inl = kind, fid, url, []
-
-
-class _State:
-    def __init__(self, nohead):
-        self.nohead = nohead
-        self.frames = [_Frame("root")]
-        self.bold = False
-        self.extras = []
-        self.eqs = []
-
-
-class _Reader:
+class _Reader(Scopes):
     def __init__(self, pkg, ctx):
         self.pkg, self.ctx = pkg, ctx
         self.doc = Doc()
@@ -237,17 +168,13 @@ class _Reader:
         return out
 
     def para(self, p, d, nohead):
-        st = _State(nohead)
+        st = State(nohead)
         for c in p:
             self.node(c, st, d + 1)
         self.close_to(st, 1)
         inl = st.frames[0].inl
-        out = []
-        if st.eqs and not _itext(inl).strip():
-            for obj in st.eqs:
-                _remove(inl, obj)
-            out.extend(Equation(o.tex, True) for o in st.eqs)
-        text = re.sub(r"\s+", " ", _itext(inl)).strip()
+        out = lone_equations(inl, st.eqs)
+        text = plain(inl)
         htype, hid, hlvl = self.hdr.para.get(attr(p, "paraPrIDRef"), ("NONE", "0", 0))
         level = 0
         if not nohead:
@@ -255,14 +182,13 @@ class _Reader:
                 level = min(hlvl + 1, 6)
             else:
                 level = self.style_level(attr(p, "styleIDRef"))
-            if level and (len(text) > 120 or (len(text) > 40 and text[-1] in ".?!")):
-                level = 0
+            level = heading_level(level, text)
         main = None
         if level and text:
             main = Heading(level, inl)
         elif htype in ("NUMBER", "BULLET"):
             marker = self.marker(hid, hlvl) if htype == "NUMBER" else "-"
-            _strip_marker(inl, marker)
+            strip_marker(inl, marker)
             if inl:
                 main = ListItem(min(hlvl, 6), marker, inl)
         elif inl:
@@ -270,73 +196,26 @@ class _Reader:
         return ([main] if main else []) + out + st.extras
 
     def style_level(self, sid):
-        name = self.hdr.style.get(sid, ("", None))[0]
-        if m := STYLE_HEAD.match(name):
-            return min(max(int(m.group(1)), 1), 6)
-        low = name.lower()
-        if low in ("제목", "title"):
-            return 1
-        if low in ("부제목", "subtitle"):
-            return 2
-        return 0
+        return style_name_level(self.hdr.style.get(sid, ("", None))[0])
 
     def marker(self, nid, lvl):
-        levels = self.hdr.numbering.get(nid, {})
-        cnt = self.numbers.setdefault(nid, {})
-        head = levels.get(lvl + 1)
-        cnt[lvl] = cnt.get(lvl, (head[2] if head else 1) - 1) + 1
-        for k in [k for k in cnt if k > lvl]:
-            del cnt[k]
+        return next_marker(self.hdr.numbering.get(nid, {}), self.numbers.setdefault(nid, {}), lvl)
 
-        def sub(m):
-            n = int(m.group(1))
-            h = levels.get(n)
-            return number(cnt.get(n - 1, h[2] if h else 1), h[1] if h else "DIGIT")
-
-        fmt = head[0] if head and head[0] else f"^{lvl + 1}."
-        return re.sub(r"\^(\d)", sub, fmt).strip()[:64] or "-"
-
-    # ---- inline scopes
-    def add(self, st, inline):
-        st.frames[-1].inl.append(inline)
-
+    # ---- inline scopes (add, push, close_to and close_field come from hancom.Scopes)
     def text(self, s, st):
         if s:
             t = Text(s)
             self.add(st, Bold([t]) if st.bold else t)
-
-    def close_to(self, st, n):
-        while len(st.frames) > n:
-            f = st.frames.pop()
-            parent = st.frames[-1].inl
-            if f.kind == "link" and f.inl:
-                parent.append(Link(f.url, f.inl))
-            elif f.kind == "deleted" and f.inl:
-                parent.append(Hidden(f.inl, "deleted"))
-            elif f.kind == "pass":
-                parent.extend(f.inl)
-
-    def push(self, st, frame):
-        if len(st.frames) < limits.MAX_DEPTH:
-            st.frames.append(frame)
 
     def field_begin(self, el, st):
         kind = (attr(el, "type") or "").upper()
         fid = attr(el, "id")
         if kind == "HYPERLINK":
             params = {attr(p, "name"): (p.text or "") for p in el.iter() if local(p.tag) == "stringParam"}
-            url = _cut_command(params["Command"]) if params.get("Command") else (params.get("Path") or "").strip()
-            self.push(st, _Frame("link" if url else "pass", fid, url))
+            url = cut_command(params["Command"]) if params.get("Command") else (params.get("Path") or "").strip()
+            self.push(st, Frame("link" if url else "pass", fid, url))
         elif kind == "CLICK_HERE":
-            self.push(st, _Frame("drop", fid))
-
-    def field_end(self, el, st):
-        ref = attr(el, "beginIDRef")
-        for i in range(len(st.frames) - 1, 0, -1):
-            f = st.frames[i]
-            if f.kind in ("link", "pass", "drop") and (ref is None or f.id == ref):
-                self.close_to(st, i)
-                return
+            self.push(st, Frame("drop", fid))
 
     def delete_end(self, st):
         for i in range(len(st.frames) - 1, 0, -1):
@@ -369,9 +248,9 @@ class _Reader:
         elif n == "fieldBegin":
             self.field_begin(el, st)
         elif n == "fieldEnd":
-            self.field_end(el, st)
+            self.close_field(st, attr(el, "beginIDRef"))
         elif n == "deleteBegin":
-            self.push(st, _Frame("deleted"))
+            self.push(st, Frame("deleted"))
         elif n == "deleteEnd":
             self.delete_end(st)
         elif n == "switch":
@@ -400,15 +279,10 @@ class _Reader:
         elif n == "hiddenComment":
             self.counts["cm"] += 1
             nid = f"cm-{self.counts['cm']}"
-            blocks = self.sub(el, d)
-            if blocks and isinstance(blocks[0], Para):
-                blocks[0].inlines.insert(0, Text("Comment: "))
-            else:
-                blocks.insert(0, Para([Text("Comment:")]))
-            self.doc.notes[nid] = blocks
+            self.doc.notes[nid] = comment_note(self.sub(el, d))
             self.add(st, NoteRef(nid))
         elif n in ("header", "footer"):
-            text = _flat(self.sub(el, d))
+            text = flat(self.sub(el, d))
             if text:
                 (self.doc.headers if n == "header" else self.doc.footers).append(text)
         elif n == "drawText":
