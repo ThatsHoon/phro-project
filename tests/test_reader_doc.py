@@ -301,7 +301,7 @@ def test_overlapping_pieces_bounded():
 def test_story_ranges():
     # the main story is the first ccpText CPs; later stories follow it, macro included (Word 97 order)
     p = doc_file([("main\rnote\r", False)], ccp={"text": 5, "footnote": 5})
-    assert md(p) == "main\n"
+    assert md(p) == "(could not read: 1 footnotes part)\n\nmain\n", md(p)  # footnote text without its PLCs
     ranges = doc_fib.story_ranges({"text": 5, "footnote": 2, "header": 3, "macro": 1, "annotation": 4}, 100)
     assert ranges["text"] == (0, 5) and ranges["header"] == (7, 10) and ranges["annotation"] == (11, 15)
     assert ranges["header_textbox"] == (15, 15)

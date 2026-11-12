@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import markdown  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
-from reader.formats import doc  # noqa: E402
+from reader.formats import doc, ooxml_word, word_fields  # noqa: E402
 from reader.model import Context, NoteRef, Para, Text  # noqa: E402
 from reader_fix import doc_plc, doc_stories, make_cfb, make_doc, make_zip  # noqa: E402
 
@@ -303,6 +303,38 @@ def test_unmatched_entries_counted():
     # nor is a reference inside a field instruction, which is never shown
     f = story_doc("\x13 X\x02 \x14r\x15\r", footnotes=[(3, "\x02 주석\r")])
     assert md(f) == "r\n\n[^1]: 주석\n", md(f)
+
+
+def test_storyless_text_counted():
+    # a story with text (ccp > 0) that no PLC entry addresses, its PLCs left out or empty, is counted once
+    cases = [
+        (dict(footnotes=[(2, "\x02 주석\r")]), (2, 3), "footnotes"),
+        (dict(endnotes=[(2, "\x02 끝\r")]), (46, 47), "footnotes"),
+        (dict(comments=[(3, 0, "\x05말\r")], authors=["Kim"]), (4, 5), "comments"),
+        (dict(headers=SEP + ["", "머리\r", "", "바닥\r", "", ""]), (11,), "header"),
+        (dict(textboxes=["상자\r"]), (56,), "block"),
+        (dict(header_textboxes=["위\r"]), (58,), "header"),
+    ]
+    for kw, indices, kind in cases:
+        d, ctx = parse(story_doc("본문\x02\x05\r", **kw))
+        assert not ctx.skipped and (d.notes or d.headers or d.footers or len(d.blocks) == 2), (kind, ctx.skipped)
+        for fc in ({i: None for i in indices}, {i: doc_plc([0]) for i in indices}):
+            d, ctx = parse(story_doc("본문\x02\x05\r", fc=fc, **kw))
+            out = markdown.render(d, tmp() / "a", False, ctx.skipped)
+            assert ctx.skipped == {kind: 1} and d.blocks == [Para([Text("본문")])], (kind, fc, ctx.skipped, out)
+            assert not (d.notes or d.headers or d.footers), (kind, fc, d.notes, d.headers, d.footers)
+    # a story of ccp 0 is not counted, PLCs or none
+    d, ctx = parse(story_doc("본문\r"))
+    assert not ctx.skipped and d.blocks == [Para([Text("본문")])], ctx.skipped
+    d, ctx = parse(story_doc("본문\r", fc={3: doc_plc([0]), 11: doc_plc([0]), 56: doc_plc([0])}))
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_comment_format_shared():
+    # one builder, word_fields', makes the comment notes of the doc and docx readers
+    assert doc.comment_note is word_fields.comment_note and ooxml_word.comment_note is word_fields.comment_note
+    assert word_fields.comment_note([Para([Text("말")])], "Kim") == [Para([Text("Comment by Kim: "), Text("말")])]
+    assert word_fields.comment_note([], "N" * 70) == [Para([Text(f"Comment by {'N' * 64}: ")])]
 
 
 def test_comment_author_bounds():

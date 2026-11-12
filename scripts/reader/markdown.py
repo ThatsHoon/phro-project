@@ -121,6 +121,7 @@ class _Render:
         self.depth = 0
         self.too_deep = 0  # subtrees left out for nesting past MAX_DEPTH
         self.note_no: dict[str, int] = {}
+        self.note_order: list[str] = []  # the ids of note_no in numbering order
         self.assets = Assets(assets_dir)
         self.unviewable: list[str] = []
         self.linked: set[str] = set()  # viewable images the output links to
@@ -199,6 +200,7 @@ class _Render:
     def _note_number(self, nid):
         if nid not in self.note_no:
             self.note_no[nid] = len(self.note_no) + 1
+            self.note_order.append(nid)
         return self.note_no[nid]
 
     # ---- blocks
@@ -584,8 +586,8 @@ class _Render:
         i = 0
         referenced_done = False
         while True:
-            while i < len(self.note_no):  # rendering a note may reference more notes
-                nid = list(self.note_no)[i]
+            while i < len(self.note_order):  # rendering a note may reference more notes
+                nid = self.note_order[i]
                 i += 1
                 if nid in notes:
                     s = " ".join(x for x in (self._flat(b, LINES) for b in notes[nid]) if x)

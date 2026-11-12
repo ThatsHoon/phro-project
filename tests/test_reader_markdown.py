@@ -189,6 +189,18 @@ def test_footnotes_numbered_by_use():
     assert R(doc) == "t[^1][^2]\n\n[^1]: A\n[^2]: B\n[^3]: U\n"
 
 
+def test_many_notes_render_fast():
+    # numbering is linear in the notes: every other one referenced, the rest numbered after them in insertion order
+    import time
+    n = 60_000
+    doc = Doc(blocks=[Para([NoteRef(f"n{i}") for i in range(0, n, 2)])],
+              notes={f"n{i}": [P(f"x{i}")] for i in range(n)})
+    t0 = time.monotonic()
+    lines = R(doc).splitlines()
+    assert time.monotonic() - t0 < 10, time.monotonic() - t0
+    assert lines[2:4] == ["[^1]: x0", "[^2]: x2"] and lines[-1] == f"[^{n}]: x{n - 1}" and len(lines) == n + 2
+
+
 def test_chart_caption():
     out = R(t([["a", "b"], ["1", "2"]], caption="Chart: bar — 매출"))
     assert out == "Chart: bar — 매출\n|a|b|\n|---|---|\n|1|2|\n"

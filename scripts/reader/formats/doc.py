@@ -4,8 +4,8 @@ The text is one CP stream cut into stories (doc_fib.STORIES). A story is walked 
 character below 0x20 other than a tab goes to its handler in _Reader.SPECIAL, paragraph marks included. Logic follows
 dochan office_binary/doc_binary.py (stream checks, the table stream, story ranges) and doc_stories.py (field begin,
 separator and end), and anydoc formats/doc/mod.rs (the language is lidFE in a Far East document, else lid). The FIB,
-the piece table and the story text are doc_fib.py's; the HYPERLINK rule is word_fields.py's, shared with the docx
-reader.
+the piece table and the story text are doc_fib.py's; the HYPERLINK rule and the comment note are word_fields.py's,
+shared with the docx reader.
 
 The walk keeps one str unit a CP: a surrogate pair is two units, so a handler's CP is the Story's cp_of its index,
 and the pair is joined only when a Text is built.
@@ -27,10 +27,11 @@ The other stories are cut into entries by their PLCs (MS-DOC 2.2.2: n + 1 CPs, t
 dochan doc_stories.py: the PLC pairs, PlcfHdd's layout), each entry walked as the main story is, so bold, hidden text,
 fields, lists and tables work in them too. Footnotes, endnotes and comments are Ref and Txt PLC pairs: Ref entry i is
 the CP of its reference character (\\x02 for a note, \\x05 for a comment) and Txt range i its text, relative to its
-story; each becomes doc.notes[id] and the reference a NoteRef where the walk meets that very CP. A comment reads as
-the docx reader's do, "Comment by <author>: " first, the author from GrpXstAtnOwners. Headers and footers are the
+story; each becomes doc.notes[id] and the reference a NoteRef where the walk meets that very CP. A comment is
+word_fields.comment_note's, as in the docx reader, the author from GrpXstAtnOwners. Headers and footers are the
 PlcfHdd stories after the six separators, six a section, each one line of doc.headers or doc.footers. Text boxes
-(PlcftxbxTxt) follow the main text in story order; header text boxes (PlcfHdrtxbxTxt) are header lines.
+(PlcftxbxTxt) follow the main text in story order; header text boxes (PlcfHdrtxbxTxt) are header lines. A story
+with text (ccp > 0) whose PLCs hold no entry, left out or empty, is counted once under its kind.
 """
 import re
 import struct
@@ -44,8 +45,7 @@ from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Link, ListItem, NoteRef, Para, Table, Text
 from . import doc_fib, ooxml
 from .hancom import flat
-from .ooxml_word import MAX_NAME
-from .word_fields import MAX_INSTR, hyperlink_url
+from .word_fields import MAX_INSTR, comment_note, hyperlink_url
 
 _ZIP = b"PK\x03\x04"
 _RTF = b"{\\rtf"
@@ -96,17 +96,6 @@ def _author(atrd: bytes, owners: list[str]) -> str:
     if not name:
         name = atrd[2:2 + 2 * min(struct.unpack_from("<H", atrd)[0], 9)].decode("utf-16-le", "replace")
     return _C0.sub(" ", name)
-
-
-def _comment(blocks: list, author: str) -> list:
-    """A comment's blocks as the docx reader gives them (ooxml_word's load_comments): "Comment by <author>: " before
-    the first paragraph's text, or as a paragraph of its own when the comment does not start with one."""
-    lead = Text(f"Comment by {author[:MAX_NAME]}: ")
-    if blocks and isinstance(blocks[0], Para):
-        blocks[0].inlines.insert(0, lead)
-    else:
-        blocks.insert(0, Para([lead]))
-    return blocks
 
 
 def _joined(s: str) -> str:
@@ -345,6 +334,13 @@ class _Reader:
             pos = end
         return out
 
+    def storyless(self, name, kind, entries):
+        """Story `name` has text (ccp > 0) but its PLCs hold no entry (`entries` false: left out, lcb 0, or empty), so
+        nothing addresses its text: it is counted once under kind. A story with entries is not: its last range, the
+        guard paragraph mark, is no loss."""
+        if not entries and self.fib.ccp[name] > 0:
+            self.ctx.skipped[kind] += 1
+
     def notes(self):
         """Footnotes, endnotes and comments (_NOTES). A story's Ref and Txt PLCs are read under guard(kind): one that
         is not a whole PLC, whose CPs decrease or whose texts run past the story's ccp loses that story, counted once.
@@ -353,13 +349,15 @@ class _Reader:
         empty range is no note. Every note's slot in doc.notes is reserved before any text is read, its id unique to
         its PLC entry, so a reference in a note's own text (to itself, to a note read later, across stories) is a
         NoteRef to that slot and nothing is read twice or recursively; then each text is read in PLC order under
-        guard(kind), and one that fails gives up its slot."""
+        guard(kind), and one that fails gives up its slot. A story with text and neither Ref nor Txt entries is
+        counted once (storyless)."""
         pending = []
         for name, prefix, ref_index, txt_index, cb, kind in _NOTES:
             with self.ctx.guard(kind):
                 refs, data = self.story_plc(ref_index, cb)
                 txt, _ = self.story_plc(txt_index, 0)
                 n, have = len(data), max(len(txt) - 1, 0)
+                self.storyless(name, kind, n or have)
                 k = min(n, have)
                 if k and txt[k] > self.fib.ccp[name]:
                     raise ValueError("note text past its story")
@@ -380,7 +378,7 @@ class _Reader:
             done = False
             with self.ctx.guard(kind):
                 blocks = self.read(name, cp0, cp1)
-                self.doc.notes[nid] = blocks if author is None else _comment(blocks, author)
+                self.doc.notes[nid] = blocks if author is None else comment_note(blocks, author)
                 done = True
             if not done:
                 del self.doc.notes[nid]
@@ -390,11 +388,13 @@ class _Reader:
         are skipped, then each section's six stories (_SECTION) give one line each to doc.headers or doc.footers, read
         under guard("header") or guard("footer"). An empty range is no story; a last range left over past whole
         sections is the story's guard paragraph mark. A PLC that is not whole, whose CPs decrease or whose stories run
-        past the header story's ccp loses the headers, counted once. Then the header text boxes, one line each."""
+        past the header story's ccp loses the headers, counted once, and so does header text without a PlcfHdd entry
+        (storyless). Then the header text boxes, one line each."""
         spans = []
         with self.ctx.guard("header"):
             cps, _ = self.story_plc(_HDD, 0)
             end = len(cps) - 1
+            self.storyless("header", "header", end > 0)
             if end > _SEPARATORS and (end - _SEPARATORS) % _SECTION == 1:
                 end -= 1
             if end > _SEPARATORS and cps[end] > self.fib.ccp["header"]:
@@ -416,10 +416,11 @@ class _Reader:
         to story `name`, with a 22-byte FTXBXS; the last FTXBXS is a dummy for the story's guard paragraph mark, and a
         reusable one (fReusable) is a text box no longer in use, so neither is read. The PLC is read under
         guard(kind), each text box too; a PLC that is not whole, whose CPs decrease or whose boxes run past the
-        story's ccp loses the story, counted once."""
+        story's ccp loses the story, counted once, and so does story text without a PLC entry (storyless)."""
         spans, out = [], []
         with self.ctx.guard(kind):
             cps, data = self.story_plc(index, _FTXBXS)
+            self.storyless(name, kind, data)
             m = len(data) - 1
             if m > 0 and cps[m] > self.fib.ccp[name]:
                 raise ValueError("text box past its story")

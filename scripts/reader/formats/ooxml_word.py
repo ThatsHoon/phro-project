@@ -8,12 +8,12 @@ from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListIt
 from . import ooxml_base
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
-from .word_fields import MAX_INSTR, MAX_URL, hyperlink_url
+from .word_fields import MAX_INSTR, MAX_URL, comment_note, hyperlink_url
 
 IMAGE_BYTES = 256 * 2**20  # image bytes one document may emit, copies counted
 CHART_CELLS = 200_000      # chart table cells one document may emit, copies counted
 MAX_COLS = 1_000
-MAX_ALT, MAX_NAME = 200, 64
+MAX_ALT = 200
 
 _NOTE_SKIP = frozenset({"separator", "continuationSeparator", "continuationNotice"})
 _NOTE_REFS = {"footnoteReference": "fn-", "endnoteReference": "en-", "commentReference": "cm-"}
@@ -157,13 +157,7 @@ class _Reader:
             with self.ctx.guard("note"):
                 if nid is None:
                     continue
-                blocks = self.blocks(cm, 0)
-                lead = Text(f"Comment by {(attr(cm, 'author') or '')[:MAX_NAME]}: ")
-                if blocks and isinstance(blocks[0], Para):
-                    blocks[0].inlines.insert(0, lead)
-                else:
-                    blocks.insert(0, Para([lead]))
-                self.doc.notes["cm-" + nid] = blocks
+                self.doc.notes["cm-" + nid] = comment_note(self.blocks(cm, 0), attr(cm, "author") or "")
 
     # ---- blocks
     def blocks(self, container, d):
