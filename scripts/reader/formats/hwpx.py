@@ -66,6 +66,7 @@ class _Reader(Scopes):
         self.charts = {}
         self.opened = 0  # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
+        self.margins = False  # walking a header or footer, whose pictures and charts are skipped
 
     # ---- package
     def find(self, href):
@@ -283,8 +284,12 @@ class _Reader(Scopes):
             nid = f"cm-{self.counts['cm']}"
             self.doc.notes[nid] = comment_note(self.sub(el, d))
             self.add(st, NoteRef(nid))
-        elif n in ("header", "footer"):
-            text = flat(self.sub(el, d))
+        elif n in ("header", "footer"):  # a line of text, as in doc and hwp: pictures and charts are skipped unread
+            outer, self.margins = self.margins, True
+            try:
+                text = flat(self.sub(el, d))
+            finally:
+                self.margins = outer
             if text:
                 (self.doc.headers if n == "header" else self.doc.footers).append(text)
         elif n == "drawText":
@@ -295,7 +300,9 @@ class _Reader(Scopes):
 
     def picture(self, pic, st):
         """Every placement is charged against IMAGE_BYTES, as in the Word readers; one past it is counted under image
-        instead."""
+        instead. In a header or footer the picture is skipped, neither read nor counted."""
+        if self.margins:
+            return
         img = first(pic, "img")
         data = self.part_bytes(self.images.get(attr(img, "binaryItemIDRef")), "image") if img is not None else None
         if not data:
@@ -309,6 +316,8 @@ class _Reader(Scopes):
         st.extras.append(Image(data, "" if AUTO_ALT.match(alt) else alt))
 
     def chart(self, el, st):
+        if self.margins:  # in a header or footer: skipped, neither read nor counted
+            return
         href = attr(el, "chartIDRef")
         name = self.find(href)
         if name not in self.charts:

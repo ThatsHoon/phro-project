@@ -116,6 +116,7 @@ class _Reader(Scopes):
         self.tables = {}    # an OLE item's bytes -> its chart table, or None
         self.opened = 0     # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
+        self.margins = False  # walking a header or footer, whose pictures and objects are skipped
         # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
         # holds the accepted text (dochan reader.py), so a range left in it hides nothing
         self.view = False
@@ -490,7 +491,13 @@ class _Reader(Scopes):
         return self.margin(recs, i, d, self.doc.footers)
 
     def margin(self, recs, i, d, into):
-        text = flat(self.sub(recs, i, d))
+        """A header or footer as one line of text, its text boxes' too. A header is a line of text, as in doc: its
+        pictures and OLE objects are skipped, neither read nor counted."""
+        outer, self.margins = self.margins, True
+        try:
+            text = flat(self.sub(recs, i, d))
+        finally:
+            self.margins = outer
         if text:
             into.append(text)
         return self.end(recs, i)
@@ -636,7 +643,9 @@ class _Reader(Scopes):
 
     def picture(self, recs, j, st, d, g, alt):
         """SHAPE_PICTURE: the BinData item at offset 71. Every placement is charged against IMAGE_BYTES, as in the Word
-        readers; one past it is counted under image instead."""
+        readers; one past it is counted under image instead. In a header or footer it is skipped (margin)."""
+        if self.margins:
+            return self.end(recs, j)
         data = recs[j].data
         bid = struct.unpack_from("<H", data, 71)[0] if len(data) >= 73 else 0
         img = self.bin_data(bid)
@@ -650,7 +659,9 @@ class _Reader(Scopes):
 
     def ole(self, recs, j, st, d, g, alt):
         """SHAPE_OLE: the BinData item at offset 12, an OLE object. The chart in it (hwp_chart.ole_table) is a table
-        where a picture would be; an item two shapes name is read once."""
+        where a picture would be; an item two shapes name is read once. In a header or footer it is skipped (margin)."""
+        if self.margins:
+            return self.end(recs, j)
         data = recs[j].data
         bid = struct.unpack_from("<H", data, 12)[0] if len(data) >= 14 else 0
         item = self.bin_data(bid, "object")

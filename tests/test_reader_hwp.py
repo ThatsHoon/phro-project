@@ -504,6 +504,38 @@ def test_group_shape_text():
     assert md(p) == "![](assets/img-001.png)\n"
 
 
+def test_header_pictures_and_objects_skipped():
+    # a header is a line of text, as in doc: its pictures (one deflated and large, one with no stream) and its OLE chart
+    # are skipped without being read or counted, its text and a text box's are kept, and the body picture is read
+    chart = ('<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea>'
+             '<c:barChart><c:ser><c:val><c:numRef><c:numCache><c:ptCount val="1"/><c:pt idx="0"><c:v>5</c:v>'
+             '</c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>')
+    ole_path = tmp() / "ole.cfb"
+    make_cfb(ole_path, {"OOXMLChartContents": chart.encode()})
+    ole_item = u32(ole_path.stat().st_size) + ole_path.read_bytes()
+    ole = (11, b"gso " + bytes(40) + u16(0), hwp_record(hr.SHAPE_COMPONENT, 4, b"elo$elo$" + bytes(32))
+           + hwp_record(hr.SHAPE_OLE, 5, bytes(12) + u16(3) + bytes(10)))
+    controls = (hwp_picture(1, level=4), hwp_picture(4, level=4), ole, gso(text_box("상자", 4)))
+    head = sub_list(hwp_para("머리말" + FFFC * 4, level=2, controls=controls))
+    body = hwp_para(FFFC + FFFC, controls=((16, b"head" + u32(0), head), hwp_picture(2)))
+    bins = info(bins=(("png", 1), ("png", 2), ("OLE", 2), ("png", 2)))
+    streams = {"BIN0001.png": deflate(PNG + bytes(2**20 - len(PNG))), "BIN0002.png": PNG, "BIN0003.OLE": ole_item}
+    read = []
+    old = hwp._Reader.load_bin
+
+    def spy(self, name, packed, keep):
+        read.append(name)
+        return old(self, name, packed, keep)
+    hwp._Reader.load_bin = spy
+    try:
+        doc, ctx = parse(hwp_file(body, doc_info=bins, bins=streams))
+    finally:
+        hwp._Reader.load_bin = old
+    assert doc.headers == ["머리말 상자"] and not ctx.skipped, (doc.headers, ctx.skipped)
+    assert read == ["BinData/BIN0002.png"], read
+    assert markdown.render(doc, tmp() / "a", False, ctx.skipped) == "Header: 머리말 상자\n\n![](assets/img-001.png)\n"
+
+
 def test_group_depth_cap():
     def nest(k, level):  # the k-th container, at group depth k
         inner = text_box("바닥", level + 1) if k == 40 else nest(k + 1, level + 1)

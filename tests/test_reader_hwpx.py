@@ -279,6 +279,35 @@ def test_chart():
     assert "Chart: bar" in out and "대체" not in out and "|A|5|" in out
 
 
+def test_header_pictures_and_charts_skipped():
+    # a header is a line of text, as in doc and hwp: its pictures (one with no part) and its chart are skipped without
+    # being read or counted, its text and a text box's are kept, and the body picture is read
+    pic = '<hp:pic><hc:img binaryItemIDRef="%s"/></hp:pic>'
+    head = ('<hp:p><hp:run><hp:t>머리말</hp:t>' + pic % "image1" + pic % "image9"
+            + '<hp:chart chartIDRef="Chart/chart1.xml"/><hp:rect><hp:drawText><hp:subList>' + P("상자")
+            + '</hp:subList></hp:drawText></hp:rect></hp:run></hp:p>')
+    sec = (f'<hp:p><hp:run><hp:ctrl><hp:header><hp:subList>{head}</hp:subList></hp:header></hp:ctrl></hp:run></hp:p>'
+           f'<hp:p><hp:run>{pic % "image2"}</hp:run></hp:p>')
+    items = ('<opf:item id="image1" href="BinData/image1.png"/><opf:item id="image2" href="BinData/image2.png"/>'
+             '<opf:item id="image9" href="BinData/image9.png"/>')
+    p = hwpx_doc(sec, hpf_items=items, extra={"BinData/image1.png": PNG + bytes(2**19), "BinData/image2.png": PNG,
+                                              "Chart/chart1.xml": CHART})
+    read = []
+    old = hwpx._Reader.part_bytes
+
+    def spy(self, href, kind):
+        read.append(href)
+        return old(self, href, kind)
+    hwpx._Reader.part_bytes = spy
+    try:
+        doc, ctx = parse(p)
+    finally:
+        hwpx._Reader.part_bytes = old
+    assert doc.headers == ["머리말 상자"] and not ctx.skipped, (doc.headers, ctx.skipped)
+    assert read == ["BinData/image2.png"], read
+    assert markdown.render(doc, tmp() / "a", False, ctx.skipped) == "Header: 머리말 상자\n\n![](assets/img-001.png)\n"
+
+
 def _wide_chart(series, labels=0):
     cat = ""
     if labels:
