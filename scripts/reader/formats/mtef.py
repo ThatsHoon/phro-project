@@ -17,16 +17,19 @@ looks and are skipped.
 Bounds: every field is read through take(), which stops at the data's end, and a string takes at most _STRING bytes.
 Object lists nested more than DEPTH below the top one are walked without being built, their content reported lost as
 "depth". A record of an unknown type or with options whose fields are not known here (a LINE's xfLSPACE, a v5 CHAR
-without MTCode), a template with no TeX here, or data cut short stops the conversion: the TeX built so far is kept
-and reported lost as "stop". Each record costs O(its bytes), and the TeX it adds is bounded by them, so the walk and
-the TeX are linear in the input (a nested list's TeX is copied once a level, at most DEPTH times).
+without MTCode), a template with no TeX here (a v3 fence of another variation than 0, 1 or 2 too), or data cut short
+stops the conversion: the TeX built so far is kept and reported lost as "stop". A private-use character and an
+embellishment with no TeX here are left out, the TeX balanced, and reported lost as "symbol". Each record costs O(its
+bytes), and the TeX it adds is bounded by them, so the walk and the TeX are linear in the input (a nested list's TeX
+is copied once a level, at most DEPTH times).
 
-Where dochan differs: it reads only v5 fractions and fences (here v5's roots, bars and scripts too), rejects
-embellishments, rulers and characters outside its table, raises past 64 levels, and rejects bytes after the last END;
-here embellishments and rulers are read, other printable characters are kept, deeper lists are dropped and counted,
-and bytes after the top END are ignored.
+Where dochan differs: it reads only v5 fractions and fences (here v5's roots, bars and scripts too) and v3 fences of
+variation 0 (here 1 and 2, one-sided, too), rejects embellishments, rulers and characters outside its table, raises
+past 64 levels, and rejects bytes after the last END; here embellishments and rulers are read, other printable
+characters are kept, deeper lists are dropped and counted, and bytes after the top END are ignored.
 """
 import struct
+import unicodedata
 
 DEPTH = 32           # object lists below the top one that are built; deeper ones are walked and reported ("depth")
 MAX_BYTES = 1 << 20  # MTEF bytes to_tex reads; more is a ValueError
@@ -46,6 +49,8 @@ _TEMPLATES = {3: {13: "root", 14: "fraction", 15: "script", 16: "under", 17: "ov
 _FENCES = {0: (r"\langle ", r"\rangle "), 1: ("(", ")"), 2: (r"\{", r"\}"), 3: ("[", "]"), 4: ("|", "|"),
            5: (r"\| ", r"\| "), 6: (r"\lfloor ", r"\rfloor "), 7: (r"\lceil ", r"\rceil ")}
 _DELIMITERS = frozenset(d for pair in _FENCES.values() for d in pair) | {"/", "."}
+_CLOSERS = frozenset((")", "]", r"\}", r"\rangle ", r"\rfloor ", r"\rceil "))  # a fence CHAR on the right side
+_MT_SPACES = ("", "", "")  # MathType's space glyphs (dochan's)
 # EMBELL type -> TeX before and after its character (MTEF v3 and v5 share 2-18); another is left out
 _EMBELLISH = {2: (r"\dot{", "}"), 3: (r"\ddot{", "}"), 4: (r"\dddot{", "}"), 5: ("", "'"), 6: ("", "''"),
               8: (r"\tilde{", "}"), 9: (r"\hat{", "}"), 10: (r"\not{", "}"), 11: (r"\vec{", "}"),
@@ -126,7 +131,7 @@ def _join(nodes) -> str:
 class _Reader:
     def __init__(self, data: bytes):
         self.data, self.pos = data, 0
-        self.dropped = self.stopped = False
+        self.dropped = self.stopped = self.missing = False  # what to_tex reports lost: depth, stop, symbol
         try:
             self.v = self.byte()
             if self.v not in (3, 5):
@@ -330,7 +335,7 @@ class _Reader:
         if kind == _TMPL:
             sel, var = value
             name = self.templates.get(sel) or ("fence" if sel in _FENCES else None)
-            if name is None:
+            if name is None or (name == "fence" and self.v == 3 and var > 2):  # v3 fences: 0 both, 1 left, 2 right
                 raise _Stop
             return self.template(name, sel, var, self.sub(depth))
         if kind == _PILE:
@@ -349,26 +354,40 @@ class _Reader:
         return None
 
     # ---- TeX
-    @staticmethod
-    def char(face, code) -> _Node:
+    def char(self, face, code) -> _Node:
         """A character: text style (typeface 0x81) escaped for \\text; else dochan's symbols, other printable
-        characters as they are. Control, surrogate and private-use characters (MathType's own glyphs) are left out."""
+        characters as they are. A space isprintable rejects (Unicode Zs other than U+0020, a line or paragraph
+        separator) and MathType's space glyphs are a space in text and {\\ } in math. A private-use (MathType's own
+        glyphs), surrogate or unassigned character is a lost symbol; control and format characters (an invisible
+        operator such as U+2061) are left out, no loss."""
         ch = chr(code)
-        if face == _TEXT_FACE:
-            return _Node(_CHAR, _TEXT_ESCAPES.get(ch, ch) if ch.isprintable() else "", True)
-        tex = _SYMBOLS.get(ch)
+        text = face == _TEXT_FACE
+        if text and ch.isprintable():
+            return _Node(_CHAR, _TEXT_ESCAPES.get(ch, ch), True)
+        tex = None if text else _SYMBOLS.get(ch)
         if tex is None:
-            tex = ch if ch.isprintable() else ""
-        return _Node(_CHAR, tex)
+            cat = unicodedata.category(ch)
+            if not text and ch.isprintable():
+                tex = ch
+            elif cat[0] == "Z" or ch in _MT_SPACES:
+                tex = " " if text else r"{\ }"
+            else:
+                self.missing |= cat in ("Co", "Cs", "Cn")
+                tex = ""
+        return _Node(_CHAR, tex, text)
 
-    @staticmethod
-    def embellish(node, kids) -> _Node:
+    def embellish(self, node, kids) -> _Node:
         """A character under its embellishments, each over what the ones before it made: TeX before the character
-        and after it, in lists, so many cost linear time."""
+        and after it, in lists, so many cost linear time. An embellishment with no TeX here is a lost symbol, its
+        character kept."""
         before, after = [], []
         for k in kids:
-            e = _EMBELLISH.get(k.code) if k.kind == _EMBELL else None
-            if e:
+            if k.kind != _EMBELL:
+                continue
+            e = _EMBELLISH.get(k.code)
+            if e is None:
+                self.missing = True
+            else:
                 before.append(e[0])
                 after.append(e[1])
         if not before:
@@ -395,25 +414,27 @@ class _Reader:
         return _Node(_SCRIPT, scripts=(a, b))
 
     def fence(self, sel, var, body, chars) -> str:
-        """Delimiters around a body: the template's CHARs, else its own; v5's variation says which sides are there
-        (tvFENCE_L 1, tvFENCE_R 2), the absent one a '.'. A CHAR that is no delimiter is a '.'."""
+        """Delimiters around a body. The variation says which sides are there (v5: tvFENCE_L 1, tvFENCE_R 2; v3: 0
+        both, 1 the left, 2 the right, as record() checked), an absent side a '.'. The template's CHARs give the
+        sides that are there in order; with fewer CHARs than sides, a CHAR goes to the side it opens or closes and
+        the other keeps the template's own. A CHAR that is no delimiter is a '.'."""
         sides = list(_FENCES[sel])
-        if self.v == 5:
-            present = [i for i in (0, 1) if var & (1 << i)]
-            for i in (0, 1):
-                if i not in present:
-                    sides[i] = "."
-        else:
-            present = [0, 1]
-        for i, ch in zip(present, chars):
+        bits = var if self.v == 5 else var or 3
+        present = [i for i in (0, 1) if bits & (1 << i)]
+        for i in (0, 1):
+            if i not in present:
+                sides[i] = "."
+        pairs = zip(present, chars) if len(chars) >= len(present) else [(int(ch in _CLOSERS), ch) for ch in chars]
+        for i, ch in pairs:
             sides[i] = ch if ch in _DELIMITERS else "."
         return r"\left" + sides[0] + body + r"\right" + sides[1]
 
 
 def to_tex(data: bytes, lost: set | None = None) -> str:
     """MTEF v3 or v5 `data` as TeX, without math delimiters. What could not be read is added to `lost`, when given:
-    "depth" for lists dropped past DEPTH, "stop" when the conversion stopped before the end. ValueError for data past
-    MAX_BYTES, another version, a header cut short, or no TeX at all."""
+    "depth" for lists dropped past DEPTH, "stop" when the conversion stopped before the end, "symbol" for characters
+    and embellishments left out (char(), embellish()). ValueError for data past MAX_BYTES, another version, a header
+    cut short, or no TeX at all."""
     if len(data) > MAX_BYTES:
         raise ValueError("MTEF data too large")
     r = _Reader(bytes(data))
@@ -421,8 +442,7 @@ def to_tex(data: bytes, lost: set | None = None) -> str:
     if not tex:
         raise ValueError("no equation")
     if lost is not None:
-        if r.dropped:
-            lost.add("depth")
-        if r.stopped:
-            lost.add("stop")
+        for marker, hit in (("depth", r.dropped), ("stop", r.stopped), ("symbol", r.missing)):
+            if hit:
+                lost.add(marker)
     return tex

@@ -388,18 +388,82 @@ def test_bad_streams_counted():
 
 
 def test_partial_equation_kept_and_counted():
-    """An unknown record or an unmapped template stops the conversion: what was built is kept, and the object is
-    counted, as its rest is lost."""
+    """An unknown record or an unmapped template stops the conversion: what was built is kept, as its text is real,
+    and the preview follows it, as a failed equation's does; the object is counted once."""
     body = l5(c5("a") + bytes((99, 0)) + c5("b"))
     assert tex_of(mtef_v5(body)) == ("a", {"stop"})
     assert tex_of(mtef_v5(l5(c5("a") + t5(15, l5(c5("x")), NULL5, NULL5) + c5("b")))) == ("a", {"stop"})
     assert tex_of(mtef_v5(l5(c5("a=") + t5(11, l5(c5("1")))[:-1]))) == (r"a=\frac{1}{}", {"stop"})  # cut short
     p = embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}, preview=PNG_PREVIEW)
     d, ctx = parse(p)
+    assert d.blocks == [Equation("a"), Image(PNG)] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+    assert md(p) == "(could not read: 1 embedded object)\n\n$$a$$\n\n![](assets/img-001.png)\n", md(p)
+    # beside text: inline Math, the preview after the paragraph; hidden, both hidden and nothing counted
+    d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}, text="z" + EMBED + "\r",
+                             preview=PNG_PREVIEW))
+    assert d.blocks == [Para([Text("z"), Math("a")]), Image(PNG)] and ctx.skipped == {"object": 1}, d.blocks
+    d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}, text="z" + EMBED + "\r",
+                             preview=PNG_PREVIEW, props=sp(VANISH)))
+    assert d.blocks == [Para([Text("z"), Hidden([Math("a")], "hidden")]), Image(PNG, hidden="hidden")], d.blocks
+    assert not ctx.skipped, ctx.skipped
+    # no preview: the partial equation alone, still counted once
+    d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}))
     assert d.blocks == [Equation("a")] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
-    # nothing built: the equation failed, so its preview shows
+    # nothing built: the equation failed, so only its preview shows
     assert md(embed_doc({1: {"Equation Native": eq_native(mtef_v5(bytes((99, 0))))}}, preview=PNG_PREVIEW)) == \
         "(could not read: 1 embedded object)\n\n![](assets/img-001.png)\n"
+
+
+def test_template_first_equation_preview_only():
+    """An unmapped template before anything was built (a v3 sum first) leaves no TeX: a ValueError, then the preview
+    alone, counted once."""
+    sum_first = mtef_v3(l3(t3(20, l3(c3("x")), NULL3, NULL3, c3("∑")) + c3("=1")))
+    try:
+        to_tex(sum_first)
+        raise AssertionError("no TeX before the template")
+    except ValueError:
+        pass
+    d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(sum_first)}}, preview=PNG_PREVIEW))
+    assert d.blocks == [Image(PNG)] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+
+
+def test_v3_fence_sides():
+    """v3 fence variations: 0 both sides, 1 the left alone, 2 the right alone (the absent side a '.'); another
+    stops the conversion. With fewer characters than sides, a character goes to the side it opens or closes, the
+    other keeps the template's own."""
+    x = l3(c3("x"))
+    assert tex_of(mtef_v3(t3(1, x, c3("("), c3(")")))) == (r"\left(x\right)", set())
+    assert tex_of(mtef_v3(t3(2, x, c3("{"), var=1))) == (r"\left\{x\right.", set())
+    assert tex_of(mtef_v3(t3(1, x, c3(")"), var=2))) == (r"\left.x\right)", set())
+    assert tex_of(mtef_v3(t3(3, x, var=1))) == (r"\left[x\right.", set())
+    assert tex_of(mtef_v3(t3(1, x, c3(")")))) == (r"\left(x\right)", set())
+    assert tex_of(mtef_v3(t3(1, x, c3("[")))) == (r"\left[x\right)", set())
+    assert tex_of(mtef_v5(t5(1, l5(c5("x")), c5(")"), var=3))) == (r"\left(x\right)", set())
+    assert tex_of(mtef_v3(l3(c3("a") + t3(1, x, c3("("), c3(")"), var=3) + c3("b")))) == ("a", {"stop"})
+    # the stop takes the partial path: the TeX and the preview, counted once
+    p = embed_doc({1: {"Equation Native": eq_native(mtef_v3(l3(c3("a") + t3(1, x, c3("("), var=7))))}},
+                  preview=PNG_PREVIEW)
+    d, ctx = parse(p)
+    assert d.blocks == [Equation("a"), Image(PNG)] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+
+
+def test_symbol_loss_counted():
+    """A private-use character and an embellishment with no TeX here are lost symbols: the conversion goes on, the
+    TeX stays balanced, and the object is counted with its preview. A space that isprintable rejects (U+00A0,
+    U+2009) is spacing, no loss."""
+    assert tex_of(mtef_v3(c3("ab"))) == ("ab", {"symbol"})
+    assert tex_of(mtef_v3(c3("ab", 0x81))) == (r"\text{ab}", {"symbol"})
+    assert tex_of(mtef_v5(c5("x", opts=1) + b"\x06\x00\x63\x00" + c5("y"))) == ("xy", {"symbol"})
+    assert tex_of(mtef_v3(c3("x", opts=2) + b"\x06\x09\x06\x07\x00")) == (r"\hat{x}", {"symbol"})  # back prime
+    assert tex_of(mtef_v3(t3(14, l3(c3("a")), l3(c3("b"))))) == (r"\frac{a}{b}", {"symbol"})
+    for sp_ in (" ", " "):
+        assert tex_of(mtef_v3(c3("a" + sp_ + "b"))) == (r"a{\ }b", set()), sp_
+        assert tex_of(mtef_v3(c3("a" + sp_ + "b", 0x81))) == (r"\text{a b}", set()), sp_
+    p = embed_doc({1: {"Equation Native": eq_native(mtef_v3(c3("ab")))}}, preview=PNG_PREVIEW)
+    d, ctx = parse(p)
+    assert d.blocks == [Equation("ab"), Image(PNG)] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+    d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v3(c3("a b")))}}, preview=PNG_PREVIEW))
+    assert d.blocks == [Equation(r"a{\ }b")] and not ctx.skipped, (d.blocks, ctx.skipped)
 
 
 def test_mtef_records():

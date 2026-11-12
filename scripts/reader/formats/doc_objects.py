@@ -7,7 +7,8 @@ PicLocation in the Data stream. An object is read once an id: an Equation Native
 its EQNOLEFILEHDR (cbHdr bytes, a u16 first), and the equation replaces the preview, which is not read; a Workbook or
 Book stream, or a CompObj naming MS Graph, is a chart; anything else is another object. A storage that is not there,
 an equation that does not convert and a stream that cannot be read (missing, a broken chain, damaged or too large:
-ReadError's other kinds end the document) keep the preview. What is not read is counted where the object is shown:
+ReadError's other kinds end the document) keep the preview; so does an equation converted in part (stopped early,
+symbols left out), after its TeX. What is not read is counted where the object is shown:
 a chart under chart, the rest under object (another object only when its preview is missing or not viewable: Assets'
 VIEWABLE kinds, a BMP when bmp_to_png reads it). An object in vanished or deleted text is hidden as its text is and
 never counted.
@@ -106,9 +107,9 @@ class Objects:
         """Object `oid` where its \\x01 or its field's end is, `at` the Data offset of its preview's PICF (None when
         it has none): read under guard("object"), placed under guard("chart") for a chart, else guard("object"). An
         equation is Math, through reader.add (a Hidden in vanished or deleted text) and into st.eqs for
-        hancom.lone_equations; a conversion that dropped lists past mtef.DEPTH is counted under depth, one that
-        stopped early under object. Any other object puts out its preview as a picture of its run (reader.put_image),
-        then is counted."""
+        hancom.lone_equations; a conversion that dropped lists past mtef.DEPTH is counted under depth. Any other
+        object, and an equation whose conversion lost more (it stopped early or left symbols out: its text is kept,
+        as real content), puts out its preview as a picture of its run (reader.put_image), then is counted once."""
         r = self.r
         obj = None
         with r.ctx.guard("object"):
@@ -124,9 +125,8 @@ class Objects:
                 st.eqs.append(m)
                 if shown and "depth" in lost:
                     r.deep()
-                if shown and "stop" in lost:
-                    r.ctx.skipped["object"] += 1
-                return
+                if lost <= {"depth"}:
+                    return
             preview = self.preview(at)
             if preview is not None:
                 r.put_image(st, preview)
