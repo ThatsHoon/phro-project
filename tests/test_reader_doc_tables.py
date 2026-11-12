@@ -21,9 +21,10 @@ from reader_fix import doc_lists, doc_stsh, make_doc  # noqa: E402
 
 IN_TABLE, TTP, INNER_CELL, INNER_ROW, ITAP = 0x2416, 0x2417, 0x244B, 0x244C, 0x6649
 ILVL, ILFO, TDEF, OUTLINE, ISTD = 0x260A, 0x460B, 0xD608, 0x2640, 0x4600
-# TCGRF (MS-DOC 2.9.328): horzMerge 2 is the first cell of a merged set, 1 a cell merged into it; vertMerge (bits 5-6)
-# 3 starts a vertical set, 1 continues it
-FIRST_MERGED, MERGED, VERT_MERGE, VERT_RESTART = 0x0002, 0x0001, 0x0020, 0x0040
+# TCGRF as Word writes it and LibreOffice reads it (ww8par2.cxx): 0x0001 fFirstMerged opens a horizontal set, 0x0002
+# fMerged without it joins the set (MS-DOC 2.9.328's horzMerge table reads the two bits the other way); fVertMerge
+# 0x0020 with fVertRestart 0x0040 starts a vertical set, fVertMerge alone continues it
+FIRST_MERGED, MERGED, VERT_MERGE, VERT_RESTART = 0x0001, 0x0002, 0x0020, 0x0040
 NORMAL = (0, 1, 0xFFF, "Normal", b"", b"")
 
 
@@ -160,13 +161,22 @@ def test_table_horizontal_merge():
     want = ('<table>\n<tr><td colspan="2">ab</td><td>c</td></tr>\n'
             "<tr><td>d</td><td>e</td><td>f</td></tr>\n</table>\n")
     assert md(table_doc([["ab", "", "c"], ["d", "e", "f"]], defs)) == want
-    # horzMerge 3 is a first cell too; a merged cell that holds text gives it to the first cell
+    # both bits (3) make a first cell too; a merged cell that holds text gives it to the first cell
     defs = [tdef([0, 1, 2, 3], [FIRST_MERGED | MERGED, MERGED, 0]), tdef([0, 1, 2, 3])]
     out = md(table_doc([["a", "b", "c"], ["d", "e", "f"]], defs))
     assert '<td colspan="2">a<br>b</td><td>c</td>' in out, out
-    # horzMerge 1 with no set open is a plain cell
+    # fMerged with no set open is a plain cell
     out = md(table_doc([["a", "b"], ["c", "d"]], [tdef([0, 1, 2], [MERGED, 0])]))
     assert out == "|a|b|\n|---|---|\n|c|d|\n", out
+    # adjacent merged pairs: a first cell closes the set before it and opens its own
+    pair = '<tr><td colspan="2">a</td><td colspan="2">c</td></tr>'
+    for grf in ([FIRST_MERGED, MERGED, FIRST_MERGED, MERGED], [FIRST_MERGED, MERGED, FIRST_MERGED | MERGED, MERGED]):
+        defs = [tdef([0, 1, 2, 3, 4], grf), tdef([0, 1, 2, 3, 4])]
+        out = md(table_doc([["a", "", "c", ""], ["d", "e", "f", "g"]], defs))
+        assert pair in out, (grf, out)
+    # a set goes on through every fMerged cell
+    defs = [tdef([0, 1, 2, 3], [FIRST_MERGED, MERGED, MERGED]), tdef([0, 1, 2, 3])]
+    assert '<tr><td colspan="3">a</td></tr>' in md(table_doc([["a", "", ""], ["d", "e", "f"]], defs))
 
 
 def test_table_vertical_merge():
@@ -242,9 +252,12 @@ def test_list_lvl_walk():
     # an LFOLVL fFormatting override replaces the level; its LVL is stepped over to the next LFO's data
     lfos = [(7, [(0, None, (3, "<%1>", 4))]), (8, [(0, 5)])]
     assert md(list_doc(items, lists, lfos)) == "<D> a\n(e) b\n"
-    # fStartAt with fFormatting: the LFOLVL's iStartAt is the start (MS-DOC), not the LVL's
+    # fStartAt with fFormatting: MS-DOC makes the LFOLVL's iStartAt (2 here) undefined, so the start is the override
+    # LVL's (4), restarting the list's numbers
     lfos = [(7, [(0, 2, (3, "<%1>", 4))]), (8, ())]
-    assert md(list_doc([("a", 1, 0), ("c", 1, 0)], lists, lfos)) == "<B> a\n<C> c\n"
+    assert md(list_doc([("a", 1, 0), ("c", 1, 0)], lists, lfos)) == "<D> a\n<E> c\n"
+    lfos = [(7, ()), (7, [(0, 2, (3, "<%1>", 4))])]
+    assert md(list_doc([("a", 1, 0), ("b", 1, 0), ("c", 2, 0)], lists, lfos)) == "1. a\n2. b\n<D> c\n"
 
 
 def test_lfo_data_inside_lcb():

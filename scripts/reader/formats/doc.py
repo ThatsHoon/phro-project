@@ -107,10 +107,13 @@ def _table(rows) -> tuple[Table | None, int]:
     None). The cells sit on the grid of every row's boundaries (their union, as Word's own tblGrid): a cell spans the
     grid columns between its two boundaries, a row starting right of the grid's left edge starts with an empty cell
     over the gap, and a row without a usable TDefTable has a column a cell, as do cells past those it defines. Then the
-    TCGRF merges (MS-DOC 2.9.328): horzMerge 2 or 3 starts a set the next cells with horzMerge 1 join; vertMerge 3
-    (bit 0x40) starts one that the cell over the same grid columns in each next row with vertMerge 1 joins. A joined
-    cell is left out and its blocks go to the set's first cell, which takes its colspan or one more rowspan. O(cells +
-    boundaries log boundaries); the spans go through the renderer's GRID_COLS and GRID_SLOTS budgets."""
+    TCGRF merges, read as Word writes them and LibreOffice reads them (ww8par2.cxx; the brief and dochan agree):
+    fFirstMerged 0x0001 starts a horizontal set (with or without 0x0002) that the next cells with fMerged 0x0002 alone
+    join, so adjacent merged pairs stay two sets. MS-DOC 2.9.328's horzMerge table reads the two bits the other way
+    round (1 merged, 2 or 3 first), which real files contradict. fVertRestart 0x0040 starts a vertical set that the
+    cell over the same grid columns in each next row with fVertMerge 0x0020 alone joins. A joined cell is left out and
+    its blocks go to the set's first cell, which takes its colspan or one more rowspan. O(cells + boundaries log
+    boundaries); the spans go through the renderer's GRID_COLS and GRID_SLOTS budgets."""
     defs, bad = [], 0
     for _, arg in rows:
         d = doc_fib.table_def(arg) if arg is not None else None
@@ -122,15 +125,15 @@ def _table(rows) -> tuple[Table | None, int]:
         bounds, grf = d or ((), ())
         col = col_of[bounds[0]] if bounds else 0
         row = [Cell([], colspan=col)] if col else []
-        sets = []  # [col, span, TCGRF, blocks, open to horzMerge 1] once the horizontal merges are made
+        sets = []  # [col, span, TCGRF, blocks, open to fMerged] once the horizontal merges are made
         for k, blocks in enumerate(cells):
             span = col_of[bounds[k + 1]] - col_of[bounds[k]] if k + 1 < len(bounds) else 1
             g = grf[k] if k < len(grf) else 0
-            if (g & 3) == 1 and sets and sets[-1][4]:
+            if (g & 3) == 2 and sets and sets[-1][4]:
                 sets[-1][1] += span
                 sets[-1][3].extend(blocks)
             else:
-                sets.append([col, span, g, blocks, bool(g & 2)])
+                sets.append([col, span, g, blocks, bool(g & 1)])
             col += span
         below = {}
         for c, span, g, blocks, _ in sets:

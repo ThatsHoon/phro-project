@@ -752,7 +752,9 @@ class Lists:
     byte 26; each list's LVLs, one for a simple list else nine, follow the PlfLst past its lcb) and their overrides
     (PlfLfo 2.9.183: lfoMac u32, 16-byte LFOs, lsid i32 and clfolvl u8 at 12; then an LFOData for each LFO, cp u32
     and clfolvl 8-byte LFOLVLs, iStartAt i32 then iLvl bits 0-3, fStartAt 0x10 and fFormatting 0x20, an LVL following
-    when fFormatting is set). The LSTF count is bounded by the PlfLst's lcb, the LFO count and the LFOData by the
+    when fFormatting is set). A start-at override (fStartAt) starts at the LFOLVL's iStartAt, or at that LVL's
+    iStartAt when fFormatting is set too: MS-DOC says iStartAt is then undefined and MUST be ignored, and anydoc
+    takes the LVL's. The LSTF count is bounded by the PlfLst's lcb, the LFO count and the LFOData by the
     table stream, and every LVL walk moves on; what does not fit is left out and counted in `bad`, which the caller
     adds to ctx.skipped["numbering"]. Logic follows anydoc formats/doc/lists.rs (numbers shared per lsid, start-at
     overrides on first use) and MS-DOC "Determining Level Number of a Paragraph"."""
@@ -829,8 +831,8 @@ class Lists:
                         self.bad += off
                         if ilvl < LEVELS:
                             formats[ilvl] = level
-                    if bits & 0x10 and ilvl < LEVELS:
-                        starts[ilvl] = at
+                    if bits & 0x10 and ilvl < LEVELS:  # with fFormatting the LFOLVL's iStartAt is undefined
+                        starts[ilvl] = level.start if bits & 0x20 else at
             self.lfos.append((lsid, starts, formats))
 
     def marker(self, ilfo: int, ilvl: int) -> str | None:
