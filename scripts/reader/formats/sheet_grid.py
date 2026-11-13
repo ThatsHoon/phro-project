@@ -6,15 +6,14 @@ shrinks, and hidden rows and columns and merged ranges are kept as sorted interv
 whose origin is hidden keeps its text at its first visible slot; its extent counts toward the table) follows anydoc.
 One `Budget` is shared by every sheet of a document.
 """
-from bisect import bisect_right
+import heapq
+from bisect import bisect_left, bisect_right
 
 from .. import limits
 from ..model import Break, Cell, Para, Table, Text
 
 _GAP = 64            # empty rows kept between two rows that hold values
 _MERGES = 100_000    # merged ranges one sheet may keep
-_BUCKET = 256        # rows per merge-index bucket
-_TALL = 64           # a merge touching more buckets than this is checked against every probe
 
 
 class Budget:
@@ -90,7 +89,6 @@ class Grid:
         self.name, self.budget, self.ctx = name, budget, ctx
         self.cells = {}
         self.merges = []
-        self._buckets, self._tall = {}, []
         self.rows_h, self.cols_h = _Ranges(), _Ranges()
         self.cut = False
         self._merges_cut = False
@@ -121,18 +119,8 @@ class Grid:
         self.cells[(row, col)] = text
         return True
 
-    def _near(self, r1, r2):
-        """Merges that may touch rows r1..r2: those in the row buckets, plus the tall ones."""
-        seen = set()
-        for k in range(r1 // _BUCKET, r2 // _BUCKET + 1):
-            for i in self._buckets.get(k, ()):
-                if i not in seen:
-                    seen.add(i)
-                    yield self.merges[i]
-        for i in self._tall:
-            yield self.merges[i]
-
     def merge(self, r1: int, r2: int, c1: int, c2: int):
+        """Merges are only checked here; overlaps are resolved in blocks()'s row sweep."""
         if r1 > r2 or c1 > c2 or r1 < 0 or c1 < 0:
             return
         r2, c2 = min(r2, limits.SHEET_ROWS - 1), min(c2, limits.SHEET_COLS - 1)
@@ -143,21 +131,7 @@ class Grid:
                 self._merges_cut = True
                 self._stop_merges()
             return
-        lo, hi = r1 // _BUCKET, r2 // _BUCKET
-        if hi - lo < _TALL:
-            near = self._near(r1, r2)
-        else:
-            near = iter(self.merges)  # rare; bounded by the merge cap
-        for a1, a2, b1, b2 in near:
-            if a1 <= r2 and r1 <= a2 and b1 <= c2 and c1 <= b2:
-                return
-        i = len(self.merges)
         self.merges.append((r1, r2, c1, c2))
-        if hi - lo >= _TALL:
-            self._tall.append(i)
-        else:
-            for k in range(lo, hi + 1):
-                self._buckets.setdefault(k, []).append(i)
 
     def _stop_merges(self):
         self.ctx.warnings.append(f"sheet {self.name} cut at {_MERGES} merged ranges")
@@ -172,17 +146,40 @@ class Grid:
         if c1 <= c2:
             self.cols_h.add(c1, c2)
 
-    def _covering(self, r, c):
-        for m in self._near(r, r):
-            if m[0] <= r <= m[1] and m[2] <= c <= m[3]:
-                return m
-        return None
-
     # ---- output
+    def _sweep(self):
+        """Yield ((row, col), text, merge covering it or None) in reading order, in one row sweep.
+        Merges are taken in reading order of their first cell; one that overlaps an earlier one is dropped.
+        Active merges never overlap, so they are disjoint in columns and one bisect finds the one over a column."""
+        merges = sorted(self.merges)
+        mi, starts, act, heap = 0, [], [], []  # act: merges by first column; heap: (last row, first column)
+
+        def expire(row):
+            while heap and heap[0][0] < row:
+                _, c1 = heapq.heappop(heap)
+                i = bisect_left(starts, c1)
+                del starts[i], act[i]
+
+        for r, c in sorted(self.cells):
+            while mi < len(merges) and merges[mi][0] <= r:
+                m = merges[mi]
+                mi += 1
+                expire(m[0])
+                i = bisect_right(starts, m[3]) - 1  # the last active merge starting at or before this one's end
+                if i >= 0 and act[i][3] >= m[2]:
+                    continue
+                j = bisect_left(starts, m[2])
+                starts.insert(j, m[2])
+                act.insert(j, m)
+                heapq.heappush(heap, (m[1], m[2]))
+            expire(r)
+            i = bisect_right(starts, c) - 1
+            hit = act[i] if i >= 0 and act[i][3] >= c else None
+            yield (r, c), self.cells[(r, c)], hit
+
     def blocks(self) -> list:
         origins = {}  # (row, col) -> (text, last row, last col)
-        for (r, c), text in self.cells.items():
-            m = self._covering(r, c) if self.merges else None
+        for (r, c), text, m in self._sweep():
             if m is None:
                 origins[(r, c)] = (text, r, c)
             elif (r, c) == (m[0], m[2]):  # a covered cell's own text is dropped

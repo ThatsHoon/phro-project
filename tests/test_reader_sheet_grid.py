@@ -196,6 +196,58 @@ def test_merge_cap():
     assert ctx.skipped["sheet_cut"] == 1
 
 
+def test_dense_merges_are_fast():
+    g, _ = mk()
+    t0 = time.monotonic()
+    for r in range(40):  # 20,000 1x2 merges packed into the first rows
+        for k in range(500):
+            g.merge(r, r, 2 * k, 2 * k + 1)
+            g.put(r, 2 * k, "x")
+            g.put(r, 2 * k + 1, "covered")
+    g.put(5, 999, "tail")
+    t = table(g)
+    assert time.monotonic() - t0 < 3
+    assert t.rows[0][0].colspan == 2 and txt(t.rows[0][1]) == "x"
+    assert not any("covered" in txt(c) for row in t.rows for c in row)
+
+
+def test_tall_merges_are_fast():
+    g, _ = mk()
+    t0 = time.monotonic()
+    for k in range(900):  # tall 1-column merges, stacked twice
+        g.merge(0, 40_000, k, k)
+        g.merge(40_001, 99_999, k, k)
+        g.put(0, k, "a")
+        g.put(40_001, k, "b")
+        g.put(20_000, k, "covered")
+    t = table(g)
+    assert time.monotonic() - t0 < 3
+    assert len(t.rows) <= 140 and t.rows[0][0].rowspan > 1
+
+
+def test_merge_cap_dense():
+    g, ctx = mk()
+    t0 = time.monotonic()
+    for i in range(100_001):
+        g.merge(i // 500, i // 500, 2 * (i % 500), 2 * (i % 500) + 1)
+    for r in range(200):
+        for c in range(0, 1000, 2):
+            g.put(r, c, "v")
+    g.blocks()
+    assert time.monotonic() - t0 < 6
+    assert ctx.skipped["sheet_cut"] == 1
+
+
+def test_overlap_in_sweep_drops_later():
+    g, _ = mk()
+    g.put(0, 0, "a")
+    g.put(1, 1, "b")
+    g.merge(0, 1, 0, 1)
+    g.merge(1, 2, 1, 2)
+    t = table(g)
+    assert (t.rows[0][0].rowspan, t.rows[0][0].colspan) == (2, 2) and len(t.rows) == 2
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
