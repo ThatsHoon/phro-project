@@ -8,12 +8,12 @@ An embedded Excel object is a storage (or, in hwp, a nested compound file) with 
   * a worksheet as the active sheet gives its grid blocks (xls.Workbook.sheet_blocks) over the document's one
     sheet_grid.Budget; only its tables are kept, never its pictures. A chart reads the cached values it carries, so
     the other sheets are not walked.
-The CompObj only routes MSGraph: Excel.Chart and Excel.Sheet objects are both read by their active sheet, unlike
-dochan, which reads an Excel.Chart object's worksheet as a chart; the object's preview shows the active sheet, so the
-grid is what a reader of the document saw.
-An MS Graph object (`MSGraph.Chart`, whose Workbook is a datasheet) is not read here yet: it is counted under chart,
-as a stream over EMBED_BYTES, a FILEPASS the default password does not open (xls.Workbook), BIFF5 or a stream that
-does not parse are. All of those give [].
+The CompObj only routes MSGraph, to biff_chart.graph: Excel.Chart and Excel.Sheet objects are both read by their
+active sheet, unlike dochan, which reads an Excel.Chart object's worksheet as a chart; the object's preview shows the
+active sheet, so the grid is what a reader of the document saw.
+An MS Graph object (`MSGraph.Chart`, whose Workbook is a datasheet and a chart in one substream) is one chart, read by
+biff_chart.graph. A stream over EMBED_BYTES, a FILEPASS the default password does not open (xls.Workbook), BIFF5, a
+Graph stream that does not parse, or a chart that gives no table is counted under chart. All of those give [].
 """
 import re
 import struct
@@ -59,9 +59,10 @@ def blocks(cf, ctx, budget: sheet_grid.Budget) -> list | None:
 def _read(cf, name, ctx, budget):
     if cf.size(name) > limits.EMBED_BYTES:
         return None
-    if _prog(cf, _GRAPH_PROG):
-        return None
     data = cf.read(name)
+    if _prog(cf, _GRAPH_PROG):  # an MS Graph object: its Workbook is a datasheet, not a worksheet
+        tbl = biff_chart.graph(data, ctx)
+        return [tbl] if tbl is not None else None
     st = biff.Stream(data, ctx)
     first = next(st.records(0), None)
     if first is None or first[0] != biff.BOF or first[2] < 4:

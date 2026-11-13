@@ -13,8 +13,12 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
-from reader import limits  # noqa: E402
-from reader_fix import area3d, biff_chart, biff_workbook, externsheet, make_xls  # noqa: E402
+from reader import limits, markdown  # noqa: E402
+from reader.containers.cfb import Compound  # noqa: E402
+from reader.formats import sheet_grid, xls_embedded  # noqa: E402
+from reader.model import Context  # noqa: E402
+from reader_fix import area3d, biff_chart, biff_workbook, externsheet, make_xls, msgraph_object  # noqa: E402
+import test_reader_doc_objects as dobj  # noqa: E402
 
 AB = [{"name": "A", "vals": [1, 2, 3], "cats": ["Q1", "Q2", "Q3"]},
       {"name": "B", "vals": [4, 5, 6], "cats": ["Q1", "Q2", "Q3"]}]
@@ -147,6 +151,66 @@ def test_shared_record_budget():
         limits.BIN_RECORDS = old
     names = [s.title for s in secs]
     assert names == ["Data", "C1"] and ctx.skipped["chart"] == 1, (names, ctx.skipped)
+
+
+# ---- MS Graph 97 datasheet charts
+GRAPH = (["Q1", "Q2"], [("East", [1, 2]), ("West", [3, 4])])
+
+
+def graph_streams(obj):
+    path = Path(tempfile.mkdtemp()) / "g.cfb"
+    path.write_bytes(obj)
+    with Compound(path) as cf:
+        return {n: cf.read(n) for n in ("Workbook", "CompObj")}
+
+
+def graph_blocks(obj):
+    from reader_fix import make_cfb
+    path = Path(tempfile.mkdtemp()) / "g.cfb"
+    make_cfb(path, graph_streams(obj))
+    ctx = Context()
+    with Compound(path) as cf:
+        return xls_embedded.blocks(cf, ctx, sheet_grid.Budget()), ctx
+
+
+def render(blocks, ctx):
+    from reader.model import Doc
+    return markdown.render(Doc(blocks=blocks), Path(tempfile.mkdtemp()) / "a", False, ctx.skipped)
+
+
+def test_graph_datasheet():
+    for by_rows in (False, True):
+        out, ctx = graph_blocks(msgraph_object(*GRAPH, by_rows=by_rows))
+        assert render(out, ctx) == "Chart: bar\n||East|West|\n|---|---|---|\n|Q1|1|3|\n|Q2|2|4|\n", (by_rows, out)
+        assert not ctx.skipped, ctx.skipped
+
+
+def test_graph_title_kind():
+    out, ctx = graph_blocks(msgraph_object(*GRAPH, kind="pie", title="Share"))
+    assert len(out) == 1 and out[0].caption == "Chart: pie — Share", out
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_graph_in_doc():
+    p = dobj.embed_doc({1: graph_streams(msgraph_object(*GRAPH))}, preview=dobj.PNG_PREVIEW)
+    d, ctx = dobj.parse(p)
+    out = markdown.render(d, Path(tempfile.mkdtemp()) / "assets", False, ctx.skipped)
+    assert "Chart: bar\n||East|West|\n|---|---|---|\n|Q1|1|3|\n|Q2|2|4|\n" in out, out
+    assert "could not read" not in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_graph_bad_counted():
+    obj = graph_streams(msgraph_object(*GRAPH))
+    wb = obj["Workbook"]
+    i = wb.index(struct.pack("<HH", 3, 15))  # the first NUMBER cell, cut to 8 bytes
+    obj["Workbook"] = wb[:i] + struct.pack("<HH", 3, 8) + wb[i + 4:i + 12] + wb[i + 19:]
+    from reader_fix import make_cfb
+    path = Path(tempfile.mkdtemp()) / "g.cfb"
+    make_cfb(path, obj)
+    ctx = Context()
+    with Compound(path) as cf:
+        out = xls_embedded.blocks(cf, ctx, sheet_grid.Budget())
+    assert out == [] and ctx.skipped["chart"] == 1, (out, ctx.skipped)
 
 
 def main():

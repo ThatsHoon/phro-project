@@ -985,6 +985,51 @@ def excel_object(sheets, prog=b"Excel.Sheet.8", **kw):
         return path.read_bytes()
 
 
+def msgraph_object(cats, series, kind="bar", title="", *, by_rows=False):
+    """The compound file of an embedded MS Graph 97 object: a Workbook stream (BOF vers 0x0680 dt 0x8000) holding the
+    chart records and the datasheet, and a \\x01CompObj naming MSGraph.Chart.8, as bytes.
+
+    `series` is a list of (name, values). The datasheet's row 0 (column 0 with by_rows) holds the series names, its
+    first column (row) the categories and the cells use Graph's own ids, NUMBER 3 and LABEL 4: row, col, 3 attribute
+    bytes, then the f64 or a u16-sized narrow string. Selections 0x1053 / 0x1054 stop after the rows / columns, 0x1055
+    says whether the series are in rows; each Series' BRAIs end in the datasheet index of their row or column."""
+    import struct
+    import tempfile
+    n = len(series)
+    head = [biff(0x0809, struct.pack("<HHHHII", 0x0680, 0x8000, 0, 0, 0, 0)), biff(0x0042, struct.pack("<H", 1252)),
+            biff(0x1055, bytes([1 if by_rows else 0]) + bytes(5)),
+            biff(0x1053, struct.pack("<HH", 0, (n if by_rows else len(cats)) + 1)),
+            biff(0x1054, struct.pack("<HH", 0, (len(cats) if by_rows else n) + 1)), biff(0x1033)]
+
+    def brai(role, idx):
+        return biff(0x1051, struct.pack("<BBHHH", role, 1, 0, 0, idx))
+    for k, (_, vals) in enumerate(series):
+        head += [biff(0x1003, struct.pack("<6H", 1, 1, len(cats), len(vals), 0, 0)), biff(0x1033),
+                 brai(0, k + 1), brai(1, k + 1), brai(2, 0), biff(0x1034)]
+    ids = {"bar": (0x1017, bytes(6)), "line": (0x1018, bytes(2)), "pie": (0x1019, bytes(6)),
+           "area": (0x101A, bytes(2))}
+    head.append(biff(*ids[kind]))
+    if title:
+        head += [biff(0x1025, bytes(32)), biff(0x1033), biff(0x1027, struct.pack("<HHH", 1, 0, 0)),
+                 biff(0x100D, struct.pack("<H", 0) + _xl_string(title, short=True)), biff(0x1034)]
+    head.append(biff(0x1034))
+
+    def cell(point, axis, value):
+        row, col = (axis, point) if by_rows else (point, axis)
+        if isinstance(value, str):
+            raw = value.encode("latin-1")
+            return biff(4, struct.pack("<HH", row, col) + bytes(3) + struct.pack("<H", len(raw)) + raw)
+        return biff(3, struct.pack("<HH", row, col) + bytes(3) + struct.pack("<d", float(value)))
+    cells = [cell(0, k + 1, name) for k, (name, _) in enumerate(series)]
+    cells += [cell(i + 1, 0, c) for i, c in enumerate(cats)]
+    cells += [cell(i + 1, k + 1, v) for k, (_, vals) in enumerate(series) for i, v in enumerate(vals)]
+    data = b"".join(head + cells + [biff(0x000A)])
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "obj.cfb"
+        make_cfb(path, {"Workbook": data, "CompObj": comp_obj(b"MSGraph.Chart.8", b"Microsoft Graph Chart")})
+        return path.read_bytes()
+
+
 def encrypt_xls(sheets, password, kind, **kw):
     """A Workbook stream encrypted with `password`: kind "xor", "rc4", "cryptoapi" (128-bit) or "cryptoapi40".
 

@@ -7,6 +7,12 @@ displayed cells of its sheet; a series with cache points reads those instead, fo
 Every count from the file is capped: 256 series, 100,000 points, nesting 64 deep, point rows `charts.CHART_ROWS`.
 A reference visits at most min(area, cells of its sheet) cells, so a whole-sheet area costs nothing extra.
 A substream that has no EOF, or holds a worksheet-only record, is one chart counted under `chart`.
+`graph` reads an MS Graph 97 Workbook stream (BOF vers 0x0680, dt 0x8000) with the same record handling: its chart
+records give the series, the kind and the title, but their numbers are not cached: the datasheet cells of the same
+substream (NUMBER 3 and LABEL 4, Graph's own ids) hold them, a BRAI's last word being the datasheet row or column.
+The orientation after dochan `office_binary/ole_objects.py` `_graph_chart`: 0x1055 says whether the series are in rows,
+a series' name is the datasheet cell at point 0 of its axis, its values the points after that, and the categories
+the points of the axis a role 2 BRAI names; selections 0x1053 / 0x1054 stop the rows and columns that count.
 """
 import struct
 
@@ -24,6 +30,8 @@ _SERIES, _TEXT, _SERIES_TEXT, _OBJECT_LINK, _BRAI, _SIINDEX = 0x1003, 0x1025, 0x
 _NUMBER, _LABEL, _BOOLERR = 0x0203, 0x0204, 0x0205
 _BAR, _PIE, _SCATTER, _CHART3D = 0x1017, 0x1019, 0x101B, 0x103A
 _SER_PARENT = 0x104A
+_DS_NUMBER, _DS_LABEL, _DS_ORIENT, _DS_ROWS, _DS_COLS = 0x0003, 0x0004, 0x1055, 0x1053, 0x1054
+_GRAPH_BOF = 0x8000
 _KINDS = {0x1018: "line", 0x101A: "area", 0x103E: "radar", 0x103F: "surface", 0x1040: "radar"}
 # these cannot belong to a chart: BLANK is not here, real charts hold it after SIIndex
 _SHEET_ONLY = frozenset({0x00FD, 0x027E, 0x00BD, 0x0006, 0x0208, 0x00BE})
@@ -34,6 +42,7 @@ class _Series:
         self.name = None
         self.refs = {}  # BRAI role -> (source, tokens, ifmt)
         self.aux = False  # carries SerParent: a trendline or error bar, not a data series
+        self.idx = {}  # graph only: BRAI role -> datasheet row or column
 
 
 class _Text:
@@ -43,12 +52,58 @@ class _Text:
         self.tokens = None  # a BRAI reference to a cell
 
 
+class _Datasheet:
+    """What an MS Graph substream holds beside its chart records."""
+
+    def __init__(self):
+        self.cells = {}      # (row, col) -> float | str
+        self.by_rows = None  # 0x1055: the series are in rows
+        self.stop = {}       # 0x1053 / 0x1054 -> the rows / columns that count
+
+
+class _Found:
+    """What one walk over a chart substream collected."""
+    series: list
+    texts: list
+    kinds: list
+    cache: dict
+    points: int = 0
+    cut_series = cut_points = three_d = False
+    end = None
+    stop = 0
+
+
 def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.Stream | None = None):
     """The chart substream whose BOF is at `start`: (its Table or None, the offset after its EOF). `cells` maps a
     sheet index to {(row, col): displayed text}; a sheet it lacks has no cells. A substream that cannot be read is
     counted under `chart` and the offset is where the walk stopped. `st` is the workbook's Stream over `data`, so
     worksheets and charts share one `limits.BIN_RECORDS`; without it the chart gets a Stream of its own."""
     st = biff.Stream(data, ctx) if st is None else st
+    f = _scan(data, start, st, ctx, _CHART_BOF)
+    if f.end is None:
+        ctx.skipped["chart"] += 1
+        return None, f.stop
+    series, texts, kinds, cache, end = f.series, f.texts, f.kinds, f.cache, f.end
+    left = [MAX_POINTS - f.points]
+    cuts = [f.cut_points]
+    out, cats = [], {}
+    for k, s in enumerate(series):
+        got = {r: _values(s, r, (k, r) in cache and cache[k, r], g, cells, left, cuts) for r in (0, 1, 2)}
+        if not cats and got[2]:
+            cats = got[2]
+        name = s.name or (got[0][min(got[0])] if got[0] else "") or f"Series {k + 1}"
+        if not s.aux:  # k stays the cache column of the series after it
+            out.append((name, got[1]))
+    n = max([max(d) + 1 for d in [cats] + [v for _, v in out] if d] + [0])
+    table = series_table(_caption(kinds, f.three_d, _title(texts, g, cells, left, cuts)),
+                         [cats.get(i, "") for i in range(n)],
+                         [(name, [v.get(i, "") for i in range(n)]) for name, v in out], f.cut_series, cuts[0], ctx)
+    return table, end
+
+
+def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet | None = None) -> _Found:
+    """One walk over the substream whose BOF (of type `dt`) is at `start`. With `ds` (MS Graph) the datasheet cells,
+    orientation and selections go to it and each BRAI keeps its index. A damaged datasheet record is a ReadError."""
     series, texts, kinds = [], [], []
     stack = [None]       # the context (a _Series or a _Text) in force at each Begin depth
     pending = None
@@ -59,7 +114,7 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
     for rec in st.records(start):
         rid, off, size = rec[0], rec[1], rec[2]
         if rid == biff.BOF:
-            if depth == 0 and (size < 4 or struct.unpack_from("<H", data, off + 2)[0] != _CHART_BOF):
+            if depth == 0 and (size < 4 or struct.unpack_from("<H", data, off + 2)[0] != dt):
                 stop = off - 4
                 break
             depth += 1
@@ -115,6 +170,8 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
                 here.link = struct.unpack_from("<H", data, off)[0]
             elif rid == _BRAI and size >= 8:
                 brole, source, _flags, ifmt, cce = struct.unpack_from("<BBHHH", data, off)
+                if ds is not None and isinstance(here, _Series):
+                    here.idx[brole] = cce  # not a formula length: the datasheet row or column
                 if cce <= size - 8:
                     tokens = data[off + 8:off + 8 + cce]
                     if isinstance(here, _Series):
@@ -139,6 +196,15 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
                 if value is not None:
                     cache.setdefault((col, role), {})[row] = value
                     points += 1
+            elif ds is not None and rid in (_DS_NUMBER, _DS_LABEL):
+                if len(ds.cells) >= MAX_POINTS:
+                    cut_points = True
+                else:
+                    _datasheet_cell(ds, rid, data, off, size)
+            elif ds is not None and rid == _DS_ORIENT and size >= 6:
+                ds.by_rows = bool(data[off])
+            elif ds is not None and rid in (_DS_ROWS, _DS_COLS) and size == 4:
+                ds.stop[rid] = struct.unpack_from("<HH", data, off)[1]
             elif rid == _SER_PARENT:
                 if isinstance(here, _Series):
                     here.aux = True
@@ -150,24 +216,83 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
                     kinds.append(kind)
         except (ValueError, struct.error):
             ctx.skipped["record"] += 1
-    if end is None:
-        ctx.skipped["chart"] += 1
-        return None, stop
-    left = [MAX_POINTS - points]
-    cuts = [cut_points]
+    found = _Found()
+    found.series, found.texts, found.kinds, found.cache, found.points = series, texts, kinds, cache, points
+    found.cut_series, found.cut_points, found.three_d = cut_series, cut_points, three_d
+    found.end, found.stop = end, stop
+    return found
+
+
+def _datasheet_cell(ds: _Datasheet, rid: int, data: bytes, off: int, size: int) -> None:
+    """A NUMBER (row, col, 3 attribute bytes, f64) or LABEL (the same, a u16 size, a narrow string) cell of the
+    datasheet. The codepage is Windows-1252, the narrow strings of Graph's own datasheet."""
+    if size < (15 if rid == _DS_NUMBER else 9):
+        raise limits.ReadError("damaged", "truncated MS Graph datasheet cell")
+    row, col = struct.unpack_from("<HH", data, off)
+    if rid == _DS_NUMBER:
+        ds.cells[row, col] = struct.unpack_from("<d", data, off + 7)[0]
+        return
+    n = struct.unpack_from("<H", data, off + 7)[0]
+    if size != 9 + n:
+        raise limits.ReadError("damaged", "MS Graph datasheet label size")
+    ds.cells[row, col] = data[off + 9:off + 9 + n].decode("cp1252", "replace")
+
+
+def graph(data: bytes, ctx):
+    """The Table of an MS Graph 97 `Workbook` stream, or None when it has no series. A stream that is not BOF vers
+    0x0680, has no dt 0x8000 substream, no EOF or no orientation, or whose datasheet cell is cut short, is a
+    ReadError (damaged or unsupported), counted as one chart by the caller."""
+    st = biff.Stream(data, ctx)
+    start = None
+    for rec in st.records(0):
+        if rec[0] == biff.BOF and rec[2] >= 4:
+            vers, dt = struct.unpack_from("<HH", data, rec[1])
+            if vers != 0x0680:
+                raise limits.ReadError("unsupported", "not an MS Graph workbook")
+            if dt == _GRAPH_BOF:
+                start = rec[1] - 4
+                break
+    if start is None:
+        raise limits.ReadError("damaged", "no MS Graph datasheet substream")
+    ds = _Datasheet()
+    f = _scan(data, start, st, ctx, _GRAPH_BOF, ds)
+    if f.end is None:
+        raise limits.ReadError("damaged", "unterminated MS Graph substream")
+    if ds.by_rows is None:
+        raise limits.ReadError("damaged", "MS Graph datasheet orientation missing")
+    rows_stop, cols_stop = ds.stop.get(_DS_ROWS), ds.stop.get(_DS_COLS)
+    series_stop = rows_stop if ds.by_rows else cols_stop
+    indexed, heads = {}, {}  # axis -> {point: value}; axis -> its point 0, the label
+    cuts = [f.cut_points]
+    for (row, col), value in ds.cells.items():
+        if (rows_stop is not None and row >= rows_stop) or (cols_stop is not None and col >= cols_stop):
+            continue
+        axis, point = (row, col) if ds.by_rows else (col, row)
+        if point == 0:
+            heads[axis] = value
+        elif point > CHART_ROWS:
+            cuts[0] = True
+        else:
+            indexed.setdefault(axis, {})[point - 1] = value
+    code = code_for(0, {})
+
+    def text(v):
+        return display(v, code) if isinstance(v, float) else v
+
     out, cats = [], {}
-    for k, s in enumerate(series):
-        got = {r: _values(s, r, (k, r) in cache and cache[k, r], g, cells, left, cuts) for r in (0, 1, 2)}
-        if not cats and got[2]:
-            cats = got[2]
-        name = s.name or (got[0][min(got[0])] if got[0] else "") or f"Series {k + 1}"
-        if not s.aux:  # k stays the cache column of the series after it
-            out.append((name, got[1]))
+    for k, s in enumerate(f.series):
+        axis = s.idx.get(1)
+        if s.aux or axis is None or (series_stop is not None and axis >= series_stop):
+            continue  # a Series left over after its axis was deselected, or a trendline
+        if not cats and s.idx.get(2) is not None:
+            cats = {i: text(v) for i, v in indexed.get(s.idx[2], {}).items()}
+        label = heads.get(s.idx.get(0, axis), heads.get(axis, ""))
+        out.append((s.name or text(label) or f"Series {k + 1}", {i: text(v) for i, v in indexed.get(axis, {}).items()}))
     n = max([max(d) + 1 for d in [cats] + [v for _, v in out] if d] + [0])
-    table = series_table(_caption(kinds, three_d, _title(texts, g, cells, left, cuts)),
-                         [cats.get(i, "") for i in range(n)],
-                         [(name, [v.get(i, "") for i in range(n)]) for name, v in out], cut_series, cuts[0], ctx)
-    return table, end
+    left = [MAX_POINTS - f.points]
+    return series_table(_caption(f.kinds, f.three_d, _title(f.texts, biff.Globals(), {}, left, cuts)),
+                        [cats.get(i, "") for i in range(n)],
+                        [(name, [v.get(i, "") for i in range(n)]) for name, v in out], f.cut_series, cuts[0], ctx)
 
 
 def _kind(rid: int, data: bytes, off: int, size: int) -> str:
