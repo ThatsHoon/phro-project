@@ -439,6 +439,41 @@ def test_over_deep_nesting_is_left_out():
     assert "lead" in out and "places nested too deeply left out)" in out.split(chr(10) * 2)[0], out[:200]
 
 
+def test_hidden_cols_left_out():
+    out = R(t([["a", "SECRET", "b"], ["c", "SECRET2", "d"]], hidden_cols=frozenset({1})))
+    assert "SECRET" not in out and out.splitlines()[0] == "(1 hidden places left out)", out
+    assert "|a|b|" in out and "|c|d|" in out, out
+
+
+def test_hidden_cols_shown():
+    out = R(t([["a", "SECRET", "b"], ["c", "SECRET2", "d"]], hidden_cols=frozenset({1})), hidden=True)
+    assert "|a|(hidden) SECRET|b|" in out and "|c|SECRET2|d|" in out and "hidden places" not in out, out
+
+
+def test_span_over_hidden_col():
+    tb = Table([[Cell([P("wide")], colspan=3)], [c("a"), c("b"), c("d")]], hidden_cols=frozenset({1}))
+    out = R(Doc(blocks=[tb]))
+    assert 'colspan="2"' in out and "wide" in out and "<td>b</td>" not in out, out
+
+
+def test_hidden_empty_col_quiet():
+    out = R(t([["a", "", "b"], ["c", "", "d"]], hidden_cols=frozenset({1})))
+    assert "hidden" not in out and "|a|b|" in out, out
+
+
+def test_nested_hidden_cols():
+    inner = Table([[c("a"), c("SECRET"), c("b")]], hidden_cols=frozenset({1}))
+    doc = Doc(blocks=[Table([[Cell([inner]), c("z")]])])
+    out = R(doc)
+    assert "SECRET" not in out and out.splitlines()[0] == "(1 hidden places left out)" and "|a / b|z|" in out, out
+    assert "(hidden) SECRET" in R(doc, hidden=True)
+
+
+def test_all_hidden_cols_cell_dropped():
+    out = R(t([["a", "S", "b"]], hidden_cols=frozenset({0, 1, 2})))
+    assert "S" not in out and out.splitlines()[0] == "(3 hidden places left out)", out
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

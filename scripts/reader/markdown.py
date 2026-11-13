@@ -1,6 +1,7 @@
 """The one Markdown renderer: every output format and token rule lives here."""
 import collections
 import re
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 
 from . import limits
@@ -403,12 +404,18 @@ class _Render:
         if isinstance(b, (Quote, Section)):
             return self._has_text(b.blocks)
         if isinstance(b, Table):
+            if b.hidden_cols and not self.show:  # a cell's column is known only on the laid-out grid
+                origins = self._grid(b, False)[0]
+                return any(self._has_text(cell.blocks) for (r, _), (cell, _, _) in origins.items()
+                           if r not in b.hidden_rows)
             return any(self._has_text(c.blocks) for r, row in enumerate(b.rows)
                        if self.show or r not in b.hidden_rows for c in row)
         return False
 
-    def _grid(self, t: Table):
-        """Origin cells by (row, col) on the reconstructed grid, trimmed: (origins, nrows, ncols)."""
+    def _grid(self, t: Table, count=True):
+        """Origin cells by (row, col) on the reconstructed grid, trimmed: (origins, nrows, ncols).
+        Unless hidden content is shown, hidden columns are left out here: a span loses the ones it covers,
+        a cell whose columns are all hidden is dropped, and each hidden column with such text counts one place."""
         covered = set()
         origins = {}
         texty = {}  # id(blocks) -> has text; a cell shared by many slots is scanned once
@@ -438,6 +445,22 @@ class _Render:
                     for dc in range(cs):
                         covered.add((r + dr, c + dc))
                 c += cs
+        hc = sorted(x for x in t.hidden_cols if 0 <= x < width) if t.hidden_cols and not self.show else ()
+        if hc:
+            mapped, lost = {}, set()
+            for (r, c), (cell, rs, cs) in origins.items():
+                n = bisect_right(hc, c + cs - 1) - bisect_left(hc, c)
+                if n < cs:
+                    mapped[(r, c - bisect_left(hc, c))] = (cell, rs, cs - n)
+                    continue
+                k = id(cell.blocks)
+                if k not in texty:
+                    texty[k] = self._has_text(cell.blocks)
+                if texty[k] and r not in t.hidden_rows:
+                    lost.update(range(c, c + cs))
+            origins = mapped
+            if count:
+                self.hidden_count += len(lost)
         nrows = ncols = 0
         for (r, c), (cell, rs, cs) in origins.items():
             k = id(cell.blocks)
@@ -451,6 +474,7 @@ class _Render:
 
     def _nested(self, t: Table, m) -> str:
         origins, nrows, _ = self._grid(t)
+        hcs, marked = (t.hidden_cols if self.show else ()), set()
         rows, used = [], 0
         for r in range(nrows):
             if self.size + used > limits.MAX_OUTPUT:
@@ -458,10 +482,17 @@ class _Render:
             if r in t.hidden_rows and not self.show:  # before the cells are built, so their images are not written
                 self.hidden_count += 1
                 continue
-            cells = [self._cell_text(origins[k][0], m) for k in sorted(origins) if k[0] == r]
+            cells = []
+            for k in sorted(origins):
+                if k[0] == r:
+                    x = self._cell_text(origins[k][0], m)
+                    if x and k[1] in hcs and k[1] not in marked:
+                        marked.add(k[1])
+                        x = "(hidden) " + x
+                    cells.append(x)
             cells = [x for x in cells if x]
             used += sum(len(x) + 3 for x in cells)
-            if r in t.hidden_rows and cells:
+            if r in t.hidden_rows and cells and not cells[0].startswith("(hidden) "):
                 cells[0] = "(hidden) " + cells[0]
             if cells:
                 rows.append(" / ".join(cells))
@@ -470,6 +501,13 @@ class _Render:
     def _table(self, t: Table) -> list:
         origins, nrows, ncols = self._grid(t)
         cap = [t.caption] if t.caption else []
+        hcs, marked = (t.hidden_cols if self.show else ()), set()
+
+        def mark(c, s):  # a hidden column shown: its first non-empty cell says so
+            if s and c in hcs and c not in marked:
+                marked.add(c)
+                return "(hidden) " + s
+            return s
 
         def hid(r):
             if r in t.hidden_rows:
@@ -495,8 +533,11 @@ class _Render:
             if h is None:
                 return finish("")
             out = self.blocks(cell.blocks)
-            if h and out:
-                out[0] = (out[0][0], "(hidden) " + out[0][1])
+            if out:
+                s = mark(0, out[0][1])
+                if h and not s.startswith("(hidden) "):
+                    s = "(hidden) " + s
+                out[0] = (out[0][0], s)
             return ([("p", c) for c in cap]) + out
         if ncols == 1:
             lines, used = [], 0
@@ -508,9 +549,9 @@ class _Render:
                 h = hid(r)
                 if h is None:
                     continue
-                s = self._cell_text(origins[(r, 0)][0], LINES)
+                s = mark(0, self._cell_text(origins[(r, 0)][0], LINES))
                 if s:
-                    lines.append(("(hidden) " if h else "") + s)
+                    lines.append(("(hidden) " if h and not s.startswith("(hidden) ") else "") + s)
                     used += len(lines[-1]) + 1
             return finish("\n".join(lines))
         spans = any(rs > 1 or cs > 1 for _, rs, cs in origins.values())
@@ -533,10 +574,10 @@ class _Render:
                         cells.append(("", None))
                     continue
                 cell, rs, cs = origins[(r, c)]
-                s = self._cell_text(cell, m)
+                s = mark(c, self._cell_text(cell, m))
                 row_used += len(s) + 1
                 cells.append((s, (cell, rs, cs)))
-            if h and cells:
+            if h and cells and not cells[0][0].startswith("(hidden) "):
                 cells[0] = ("(hidden) " + cells[0][0], cells[0][1])
             before = len(lines)
             if spans:

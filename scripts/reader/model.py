@@ -97,6 +97,7 @@ class Table:
     rows: list  # list[list[Cell]], origin cells only
     caption: str = ""
     hidden_rows: frozenset = frozenset()
+    hidden_cols: frozenset = frozenset()
     hidden: str = _hid()
 
 
