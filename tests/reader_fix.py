@@ -906,6 +906,66 @@ def biff_workbook(sheets, *, formats=None, date1904=False, active=0, filepass=No
     return b"".join(head) + b"".join(bounds) + globals_extra + tail + b"".join(subs)
 
 
+def biff_chart(series, *, title=None, kinds=((0x1017, bytes(6)),), cache=True, eof=True, extra=()):
+    """A chart substream (BOF dt 0x20 ... EOF), as a chart sheet's `raw` or inside a worksheet's `records`.
+
+    `series` is a list of dicts: name, vals and cats (lists), ifmt (BRAI number format id) and ref ((role,
+    tokens) pairs that replace the cache for that role). With `cache` the values and categories follow as SIIndex
+    caches (NUMBER for a number, LABEL for a string, col = the series), else each series has only its BRAIs.
+    `kinds` are (id, body) records; `extra` raw records go before the EOF."""
+    import struct
+    short = lambda t: _xl_string(t, short=True)
+
+    def brai(role, source, tokens=b"", ifmt=0):
+        return biff(0x1051, struct.pack("<BBHHH", role, source, 1 if ifmt else 0, ifmt, len(tokens)) + tokens)
+
+    out = [biff(0x0809, struct.pack("<HHHHII", 0x0600, 0x0020, 0x0DBB, 0x07CC, 0, 6))]
+    out += [biff(0x1002, bytes(16)), biff(0x1033)]
+    for s in series:
+        refs = dict(s.get("ref", ()))
+        out += [biff(0x1003, struct.pack("<6H", 1, 1, len(s.get("vals", ())), len(s.get("cats", ())), 0, 0)),
+                biff(0x1033)]
+        out.append(brai(0, 1))
+        if s.get("name") is not None:
+            out.append(biff(0x100D, struct.pack("<H", 0) + short(s["name"])))
+        out.append(brai(1, 2 if 1 in refs else 1, refs.get(1, b""), s.get("ifmt", 0)))
+        out.append(brai(2, 2 if 2 in refs else 1, refs.get(2, b"")))
+        out.append(biff(0x1034))
+    for rid, body in kinds:
+        out.append(biff(rid, body))
+    if title is not None:
+        out += [biff(0x1025, bytes(32)), biff(0x1033), biff(0x1027, struct.pack("<HHH", 1, 0, 0)),
+                biff(0x100D, struct.pack("<H", 0) + short(title)), biff(0x1034)]
+    if cache:
+        out.append(biff(0x1006, bytes(16)))
+        for role, key in ((1, "vals"), (2, "cats")):
+            out.append(biff(0x1065, struct.pack("<H", role) + bytes(2)))
+            for col, s in enumerate(series):
+                for row, v in enumerate(s.get(key, ())):
+                    if isinstance(v, str):
+                        out.append(biff(0x0204, struct.pack("<HHH", row, col, 0) + _xl_string(v)))
+                    else:
+                        out.append(biff(0x0203, struct.pack("<HHH", row, col, 0) + struct.pack("<d", float(v))))
+    out += [e if isinstance(e, bytes) else biff(*e) for e in extra]
+    out.append(biff(0x1034))
+    if eof:
+        out.append(biff(0x000A))
+    return b"".join(out)
+
+
+def area3d(sheet_xti, r1, r2, c1, c2):
+    """A BRAI Area3d token: ptg 0x3B, the XTI index, then the rows and columns."""
+    import struct
+    return struct.pack("<BHHHHH", 0x3B, sheet_xti, r1, r2, c1, c2)
+
+
+def externsheet(*sheets):
+    """SUPBOOK (this workbook, `len(sheets)` sheets) and an EXTERNSHEET with one XTI per sheet index given."""
+    import struct
+    xti = b"".join(struct.pack("<Hhh", 0, i, i) for i in sheets)
+    return biff(0x01AE, struct.pack("<HH", max(sheets, default=0) + 1, 0x0401))         + biff(0x0017, struct.pack("<H", len(sheets)) + xti)
+
+
 def make_xls(path, sheets, **kw):
     """Write a compound file whose Workbook stream is biff_workbook(sheets, **kw); returns that stream."""
     data = biff_workbook(sheets, **kw)

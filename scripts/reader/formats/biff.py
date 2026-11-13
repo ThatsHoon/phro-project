@@ -22,6 +22,8 @@ FORMAT = 0x041E
 XF = 0x00E0
 SST = 0x00FC
 MSODRAWINGGROUP = 0x00EB
+SUPBOOK = 0x01AE
+EXTERNSHEET = 0x0017
 
 Rec = tuple  # (record id, body offset, body size, ((offset, size) of each CONTINUE body right after it,))
 
@@ -226,6 +228,8 @@ class Globals:
     active: int = 0
     filepass: tuple | None = None
     drawing: bytes = b""
+    supbooks: list = field(default_factory=list)  # one flag per SUPBOOK: this workbook itself
+    externs: list = field(default_factory=list)  # one sheet index per XTI (EXTERNSHEET), -1 when not a sheet here
 
 
 def _cursor(st: Stream, rec: Rec, skip: int = 0) -> Cursor:
@@ -276,6 +280,14 @@ def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
         g.active = struct.unpack_from("<H", data, off + 10)[0]
     elif rid == SST and not g.sst:
         g.sst = sst(_cursor(st, rec))
+    elif rid == SUPBOOK and size >= 4:
+        g.supbooks.append(struct.unpack_from("<H", data, off + 2)[0] == 0x0401)
+    elif rid == EXTERNSHEET and size >= 2 and not g.externs:
+        body = data[off:off + size] + b"".join(data[o:o + n] for o, n in rec[3])
+        n = min(struct.unpack_from("<H", body)[0], (len(body) - 2) // 6)
+        for book, first, _last in struct.iter_unpack("<Hhh", body[2:2 + n * 6]):
+            internal = book < len(g.supbooks) and g.supbooks[book]
+            g.externs.append(first if internal and first >= 0 else -1)
     elif rid == MSODRAWINGGROUP:
         drawing.append(data[off:off + size])
         drawing.extend(data[o:o + n] for o, n in rec[3])

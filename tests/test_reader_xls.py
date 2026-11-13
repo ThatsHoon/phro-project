@@ -18,7 +18,7 @@ from reader.formats import biff, sheet_grid, xls  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
 from reader.formats import xls_drawing  # noqa: E402
-from reader_fix import (biff as rec, biff_workbook, blip_png, make_cfb, make_xls, oa_container, oa_fbse,  # noqa: E402
+from reader_fix import (biff as rec, biff_chart, biff_workbook, blip_png, make_cfb, make_xls, oa_container, oa_fbse,  # noqa: E402
                         oa_group, oa_shape)
 
 
@@ -176,10 +176,11 @@ def test_macro_sheet_quiet():
     assert "## Sheet: Real" in md
 
 
-def test_chart_sheet_counted():
-    md, _ = run([{"name": "Real", "cells": {(0, 0): "data"}}, {"name": "Chart1", "kind": 2}])
-    assert "(could not read: 1 chart)" in md, md
-    assert "## Sheet: Chart1" not in md
+def test_chart_sheet_table():
+    chart = biff_chart([{"name": "A", "vals": [1, 2], "cats": ["x", "y"]}], title="T")
+    md, _ = run([{"name": "Real", "cells": {(0, 0): "data"}}, {"name": "Chart1", "kind": 2, "raw": chart}])
+    assert "## Sheet: Chart1\n\nChart: bar — T\n||A|\n|---|---|\n|x|1|\n|y|2|\n" in md, md
+    assert "could not read" not in md, md
 
 
 def test_filepass_encrypted():

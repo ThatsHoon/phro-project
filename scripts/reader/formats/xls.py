@@ -6,7 +6,9 @@ dochan `office_binary/xls.py` and anydoc `sheet/xls.rs`. Cells go through `numfm
 Every count from the file is bounded by the record it sits in: MULRK uses its own length, nested BOF and EOF pairs are
 skipped by depth, and BOUNDSHEET offsets are checked against the stream. A FILEPASS workbook is decrypted by `xls_crypt`
 when its default password verifies, else it is `encrypted`. A sheet that cannot be read is counted under
-`sheet` and the others still come out.
+`sheet` and the others still come out. Charts (a chart sheet, or a substream nested in a worksheet) are read by
+`biff_chart` after every worksheet, so a reference to a later sheet resolves; each table goes back into its sheet's
+section after its pictures, charged against `CHART_TOTAL` like the other formats' charts.
 """
 import copy
 import struct
@@ -17,7 +19,7 @@ from ..containers import flate
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import display
-from . import biff, sheet_grid, xls_alike, xls_crypt, xls_drawing
+from . import biff, biff_chart, sheet_grid, xls_alike, xls_crypt, xls_drawing
 
 _ROW, _COLINFO, _MERGED = 0x0208, 0x007D, 0x00E5
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
@@ -27,6 +29,8 @@ _AFTER_FORMULA = frozenset({0x04BC, 0x0221, 0x0236})  # SHRFMLA, ARRAY, TABLE: m
 _CELLS = frozenset({_LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR, _FORMULA})
 _ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!", 0x2A: "#N/A"}
 _WORKSHEET, _MACRO, _CHART, _VBA = 0, 1, 2, 6
+_CHART_BOF = 0x0020
+MAX_CHARTS = 256  # chart substreams one workbook reads
 
 
 class Workbook:
@@ -53,34 +57,64 @@ class Workbook:
         self._fmt: dict[int, str] = {}
         self.flate = flate.Budget()  # one inflate budget and one image byte count for the whole document's pictures
         self.spent = [0, 0]  # image bytes placed, picture placements read
+        self._starts: dict[int, list] = {}  # sheet index -> offsets of the chart substreams nested in it
+        self.charts = 0       # chart substreams read
+        self.chart_cells = 0  # chart table cells placed so far (CHART_TOTAL)
 
     # ---- sheets
     def sections(self) -> list:
-        out, seen = [], set()
+        seen, shown = set(), []
         for i, ref in enumerate(self.g.sheets):
             if ref.kind in (_MACRO, _VBA):
                 continue
-            if ref.kind == _CHART:  # Task 10 turns chart sheets into tables
-                self.ctx.skipped["chart"] += 1
-                continue
-            blocks = None
-            try:
-                with self.ctx.guard("sheet"):
-                    if ref.offset in seen:
-                        raise ReadError("damaged", "sheet offset used twice")
-                    seen.add(ref.offset)
-                    blocks = self.sheet_blocks(i)
-            except ReadError as e:
-                if e.kind != "damaged":
-                    raise
-                self.ctx.skipped["sheet"] += 1
-                continue
-            if blocks is None:  # guard counted a failure
+            blocks = []
+            if ref.kind != _CHART:
+                try:
+                    with self.ctx.guard("sheet"):
+                        if ref.offset in seen:
+                            raise ReadError("damaged", "sheet offset used twice")
+                        seen.add(ref.offset)
+                        blocks = self.sheet_blocks(i)
+                except ReadError as e:
+                    if e.kind != "damaged":
+                        raise
+                    self.ctx.skipped["sheet"] += 1
+                    continue
+                if blocks is None:  # guard counted a failure
+                    continue
+            shown.append((i, ref, blocks))
+        tables = self._charts(shown)
+        out = []
+        for i, ref, blocks in shown:
+            blocks = blocks + tables.get(i, [])
+            if ref.kind == _CHART and not blocks:
                 continue
             if ref.state:
                 out.append(Section("sheet", ref.name, blocks=_hide(blocks), hidden="hidden"))
             else:
                 out.append(Section("sheet", ref.name, blocks=blocks))
+        return out
+
+    def _charts(self, shown: list) -> dict:
+        """Every chart of the shown sheets, in sheet then stream order: {sheet index: [Table]}. Each placement is
+        charged against CHART_TOTAL, and one past it, or past MAX_CHARTS, is counted under chart."""
+        out, seen = {}, set()
+        for i, ref, _ in shown:
+            for start in [ref.offset] if ref.kind == _CHART else self._starts.get(i, ()):
+                if start in seen or self.charts >= MAX_CHARTS:
+                    self.ctx.skipped["chart"] += 1
+                    continue
+                seen.add(start)
+                self.charts += 1
+                with self.ctx.guard("chart"):
+                    tbl, _ = biff_chart.chart(self.data, start, self.g, self.cells, self.ctx)
+                    if tbl is None:
+                        continue
+                    self.chart_cells += sum(len(r) for r in tbl.rows)
+                    if self.chart_cells > limits.CHART_TOTAL:
+                        self.ctx.skipped["chart"] += 1
+                    else:
+                        out.setdefault(i, []).append(tbl)
         return out
 
     def sheet_blocks(self, i: int) -> list:
@@ -92,7 +126,13 @@ class Workbook:
         grid = sheet_grid.Grid(ref.name, self.budget, self.ctx)
         self.cells[i] = grid.cells
         draw: list = []
-        self._walk(ref.offset, grid, draw)
+        starts: list = []
+        try:
+            self._walk(ref.offset, grid, draw, starts)
+        except Exception:
+            del self.cells[i]  # a sheet that fails leaves no half-read cells for a chart to use
+            raise
+        self._starts[i] = starts
         blocks = grid.blocks()
         if draw:
             blocks = blocks + xls_drawing.pictures(self.g, b"".join(draw), self.flate, self.spent, self.ctx)
@@ -111,9 +151,10 @@ class Workbook:
             return value
         return display(value, code, self.g.date1904)
 
-    def _walk(self, offset: int, grid: sheet_grid.Grid, draw: list) -> None:
+    def _walk(self, offset: int, grid: sheet_grid.Grid, draw: list, starts: list) -> None:
         """Walk sheet substream `offset` into `grid`; the sheet's MSODRAWING bodies, CONTINUEs joined, go into `draw`
-        (a TXO or OBJ is another record, and a TXO's CONTINUEs belong to it)."""
+        (a TXO or OBJ is another record, and a TXO's CONTINUEs belong to it); the offset of each chart substream nested
+        in it goes into `starts`."""
         data, g = self.data, self.g
         if not 0 <= offset < len(data):
             raise ReadError("damaged", "sheet offset outside the stream")
@@ -126,6 +167,11 @@ class Workbook:
                     raise ReadError("damaged", "sheet nested too deep")
                 if depth == 1 and (size < 4 or struct.unpack_from("<H", data, off + 2)[0] != 0x0010):
                     raise ReadError("damaged", "not a worksheet")
+                if depth == 2 and size >= 4 and struct.unpack_from("<H", data, off + 2)[0] == _CHART_BOF:
+                    if len(starts) < MAX_CHARTS:
+                        starts.append(off - 4)
+                    else:
+                        self.ctx.skipped["chart"] += 1
                 continue
             if depth == 0:
                 raise ReadError("damaged", "sheet does not start with a BOF")

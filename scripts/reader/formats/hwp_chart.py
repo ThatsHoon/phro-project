@@ -13,11 +13,11 @@ import struct
 from dataclasses import dataclass
 
 from .. import limits
-from ..charts import chart_table
+from ..charts import chart_table, series_table
 from ..containers.cfb import Compound, is_cfb
 from ..containers.zipx import parse_xml
 from ..limits import ReadError
-from ..model import Cell, Para, Table, Text
+from ..model import Table
 
 # grid.rs: the classes a data grid is made of; any other name in it means the shape cannot be trusted
 _GRID, _MATRIX, _COLLECTION, _OBJECT = b"VtDataGrid\0", b"VtMatrix\0", b"VtCollection\0", b"VtObject\0"
@@ -134,42 +134,7 @@ def _native(data: bytes, ctx) -> Table | None:
     title = _title(data)
     kind = _kind(data)
     caption = f"Chart: {kind} — {title}" if title else f"Chart: {kind}"
-    return _table(caption, cats, series, g.cut and by_rows, g.cut and not by_rows, ctx)
-
-
-def _table(caption, cats, series, series_cut, points_cut, ctx) -> Table | None:
-    """charts.chart_table's cut: at most GRID_COLS - 1 series, parsed points kept near CHART_CELLS, rows to what
-    CHART_CELLS leaves with the header row; one chart_cut for any cut, including a grid read only in part."""
-    if not series:
-        if series_cut or points_cut:
-            ctx.skipped["chart_cut"] += 1
-        return None
-    names, cols, points, more = [""], [], len(cats), series_cut
-    for n, (name, values) in enumerate(series, 1):
-        if n >= limits.GRID_COLS or points > limits.CHART_CELLS:
-            more = True
-            break
-        names.append(name)
-        cols.append(values)
-        points += len(values)
-    room = max(limits.CHART_CELLS // len(names) - 1, 0)
-    top = min(len(cats), room)
-    notes = []
-    if len(cats) > room or points_cut:
-        notes.append(f"first {top} points")
-    if more:
-        notes.append(f"first {len(cols)} series")
-    if notes:
-        caption += " (" + ", ".join(notes) + ")"
-        ctx.skipped["chart_cut"] += 1
-    rows = [[_cell(n, True) for n in names]]
-    for i in range(top):
-        rows.append([_cell(cats[i])] + [_cell(c[i]) for c in cols])
-    return Table(rows, caption)
-
-
-def _cell(text: str, header=False) -> Cell:
-    return Cell([Para([Text(text)])] if text else [], header=header)
+    return series_table(caption, cats, series, g.cut and by_rows, g.cut and not by_rows, ctx)
 
 
 def _num(v: float) -> str:

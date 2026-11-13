@@ -143,3 +143,34 @@ def chart_table(space, ctx=None):
     for i in range(top):
         rows.append([_cell(label.get(i, ""))] + [_cell(c.get(i, "")) for c in cols])
     return Table(rows, caption)
+
+
+def series_table(caption, cats, series, series_cut, points_cut, ctx) -> Table | None:
+    """charts.chart_table's cut: at most GRID_COLS - 1 series, parsed points kept near CHART_CELLS, rows to what
+    CHART_CELLS leaves with the header row; one chart_cut for any cut, including a grid read only in part."""
+    if not series:
+        if series_cut or points_cut:
+            ctx.skipped["chart_cut"] += 1
+        return None
+    names, cols, points, more = [""], [], len(cats), series_cut
+    for n, (name, values) in enumerate(series, 1):
+        if n >= limits.GRID_COLS or points > limits.CHART_CELLS:
+            more = True
+            break
+        names.append(name)
+        cols.append(values)
+        points += len(values)
+    room = max(limits.CHART_CELLS // len(names) - 1, 0)
+    top = min(len(cats), room)
+    notes = []
+    if len(cats) > room or points_cut:
+        notes.append(f"first {top} points")
+    if more:
+        notes.append(f"first {len(cols)} series")
+    if notes:
+        caption += " (" + ", ".join(notes) + ")"
+        ctx.skipped["chart_cut"] += 1
+    rows = [[_cell(n, True) for n in names]]
+    for i in range(top):
+        rows.append([_cell(cats[i])] + [_cell(c[i]) for c in cols])
+    return Table(rows, caption)
