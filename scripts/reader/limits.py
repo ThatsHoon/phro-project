@@ -23,6 +23,7 @@ CFB_ENTRIES = 131_072     # directory entries
 CFB_DEPTH = 128           # storage nesting
 CFB_CHAIN = 4_000_000     # steps of one sector chain
 HWP_RECORDS = 1_000_000   # records of one HWP stream
+DECRYPT_BYTES = 32 * 2**20  # bytes one xls or ppt stream may decrypt
 IMAGE_BYTES = 256 * 2**20  # image bytes one docx, doc, hwp or hwpx document may emit, copies counted
 # tables one doc, docx, hwp or hwpx document may open, nested ones counted. A .doc paragraph opens up to 63 with one
 # 3-byte sprmPItap, and a deflated docx part or hwp section holds one in about a byte; each costs the model about

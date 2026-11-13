@@ -723,3 +723,24 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
     path = Path(path)
     make_cfb(path, out)
     return path
+
+
+def rc4_header(password, *, cryptoapi=True, key_bits=128, salt=bytes(range(16))):
+    """The bytes officecrypt.parse_rc4 reads at offset 0: an RC4 or RC4 CryptoAPI header for `password`."""
+    import hashlib
+    import struct
+    from reader.containers.crypto import rc4
+    pw = password.encode("utf-16le")
+    verifier = bytes(range(100, 116))
+    if cryptoapi:
+        base = hashlib.sha1(salt + pw).digest()
+        key = hashlib.sha1(base + bytes(4)).digest()[:key_bits // 8]
+        key = key + bytes(11) if key_bits == 40 else key
+        enc = rc4(key, verifier + hashlib.sha1(verifier).digest())
+        header = struct.pack("<8I", 0x24, 0, 0x6801, 0x8004, 0 if key_bits == 40 else key_bits, 1, 0, 0) + b"\0\0"
+        return (struct.pack("<HHII", 3, 2, 0x24, len(header)) + header + struct.pack("<I", 16) + salt
+                + enc[:16] + struct.pack("<I", 20) + enc[16:])
+    h0 = hashlib.md5(pw).digest()[:5]
+    base = hashlib.md5((h0 + salt) * 16).digest()[:5]
+    enc = rc4(hashlib.md5(base + bytes(4)).digest(), verifier + hashlib.md5(verifier).digest())
+    return struct.pack("<HH", 1, 1) + salt + enc

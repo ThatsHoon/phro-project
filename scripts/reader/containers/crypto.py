@@ -1,4 +1,4 @@
-"""AES-128 in ECB mode and the MSVC rand stream, standard library only.
+"""AES-128 in ECB mode, RC4 and the MSVC rand stream, standard library only.
 
 HWP distribution documents decrypt whole sections with these two, so the
 block loop is table-driven: four 32-bit lookups per column per round, the key
@@ -169,3 +169,27 @@ class MsvcRand:
     def __call__(self) -> int:
         self.state = (self.state * 214013 + 2531011) & _M
         return (self.state >> 16) & 0x7FFF
+
+
+def rc4(key: bytes, data: bytes, skip: int = 0) -> bytes:
+    """RC4 keystream XOR; the keystream drops its first `skip` bytes."""
+    if not key:
+        raise ValueError("RC4 needs a key")
+    s = list(range(256))
+    j = 0
+    klen = len(key)
+    for i in range(256):
+        j = (j + s[i] + key[i % klen]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    i = j = 0
+    ks = bytearray(skip + len(data))
+    for n in range(len(ks)):
+        i = (i + 1) & 0xFF
+        a = s[i]
+        j = (j + a) & 0xFF
+        b = s[j]
+        s[i] = b
+        s[j] = a
+        ks[n] = s[(a + b) & 0xFF]
+    n = len(data)
+    return (int.from_bytes(data, "little") ^ int.from_bytes(ks[skip:], "little")).to_bytes(n, "little")
