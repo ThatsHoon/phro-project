@@ -16,7 +16,7 @@ from reader import limits, markdown  # noqa: E402
 from reader.formats import hwp, hwp_chart  # noqa: E402
 from reader.formats import hwp_records as hr  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader_fix import hwp_para, hwp_record, make_cfb, make_hwp  # noqa: E402
+from reader_fix import biff_chart, hwp_para, hwp_record, make_cfb, make_hwp  # noqa: E402
 
 FFFC = "￼"
 CHART_XML = ('<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea>'
@@ -258,7 +258,13 @@ def test_native_chart_kinds():
         assert table.caption == f"Chart: {name} — Sales 2024" and len(table.rows) == 4, (name, table.caption)
 
 
-def test_biff_chart_counted():
+def test_biff_chart_read():
+    # an Excel chart in the nested file is a Chart: table where the object is, and nothing is counted
+    item = envelope({"Workbook": biff_chart([{"name": "S", "vals": [5], "cats": ["A"]}], title="Sales 2024")})
+    out, ctx = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(item)}))
+    assert out == "앞\n\nChart: bar — Sales 2024\n||S|\n|---|---|\n|A|5|\n\n뒤\n", out
+    assert "could not read" not in out and not ctx.skipped, (out, ctx.skipped)
+    # a Workbook that holds no chart is still one chart counted
     item = envelope({"Workbook": b"\x09\x08" + bytes(30)})
     out, ctx = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(item)}))
     assert out == "(could not read: 1 chart)\n\n앞\n\n뒤\n", out
@@ -397,9 +403,9 @@ def test_ole_named_twice_read_once():
     calls = []
     old = hwp.ole_table
 
-    def spy(data, ctx):
+    def spy(data, ctx, **kw):
         calls.append(len(data))
-        return old(data, ctx)
+        return old(data, ctx, **kw)
     hwp.ole_table = spy
     try:
         out, ctx = read(doc(ole_shape(1), ole_shape(2), bins=items((2, 0, 1), (2, 0, 1)),

@@ -975,6 +975,16 @@ def make_xls(path, sheets, **kw):
     return data
 
 
+def excel_object(sheets, prog=b"Excel.Sheet.8", **kw):
+    """The compound file of an embedded Excel object (an OLE storage's streams): a Workbook stream that is
+    biff_workbook(sheets, **kw) and a \\x01CompObj naming `prog`, as bytes."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "obj.cfb"
+        make_cfb(path, {"Workbook": biff_workbook(sheets, **kw), "\x01CompObj": comp_obj(prog)})
+        return path.read_bytes()
+
+
 def encrypt_xls(sheets, password, kind, **kw):
     """A Workbook stream encrypted with `password`: kind "xor", "rc4", "cryptoapi" (128-bit) or "cryptoapi40".
 

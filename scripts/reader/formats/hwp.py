@@ -20,7 +20,7 @@ from ..containers.cfb import Compound, is_cfb
 from ..images import sniff
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Equation, Heading, Image, ListItem, Math, NoteRef, Para, Table, Text
-from . import hwpx
+from . import hwpx, sheet_grid
 from .hancom import (
     AUTO_ALT, Frame, Scopes, State, comment_note, cut_command, flat, heading_level, lone_equations, next_marker,
     place, plain, strip_marker, style_name_level, tex as _tex,
@@ -36,6 +36,7 @@ _V3 = b"HWP Document File V3"
 _DRM = (b"SCDSA", b"\x9b DRMONE")  # SoftCamp and Fasoo DRM containers (rhwp parser/mod.rs)
 _SECTION = re.compile(r"(bodytext|viewtext)/section(\d+)", re.I)
 _SECTIONS = 1000
+MAX_OBJECTS = 256  # OLE items one document reads (the rest are counted under object)
 _DELETE = 0x11  # the PARA_RANGE_TAG kind (top byte of its tag) of a tracked deletion; 0x10, an insertion, stays
 # control characters: one unit (char class) unless listed here; these take eight units
 _EXTENDED = frozenset((1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23))  # the k-th one owns the k-th CTRL_HEADER
@@ -117,6 +118,8 @@ class _Reader(Scopes):
         self.opened = 0     # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
         self.chart_cells = 0  # chart table cells placed so far, copies counted (CHART_TOTAL)
+        self.sheets = sheet_grid.Budget()  # one for the document: the sheets of every embedded workbook share it
+        self.objects = 0      # OLE items read so far (MAX_OBJECTS)
         self.margins = False  # walking a header or footer, whose pictures and objects are skipped
         # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
         # holds the accepted text (dochan reader.py), so a range left in it hides nothing
@@ -670,7 +673,11 @@ class _Reader(Scopes):
         item = self.bin_data(bid, "object")
         if item is not None:
             if item not in self.tables:
-                tbl = ole_table(item, self.ctx)
+                self.objects += 1
+                if self.objects > MAX_OBJECTS:  # past the cap: counted under object, not read
+                    self.ctx.skipped["object"] += 1
+                    return self.end(recs, j)
+                tbl = ole_table(item, self.ctx, sheets=self.sheets)
                 self.tables[item] = tbl, sum(len(r) for r in tbl.rows) if tbl is not None else 0
             tbl, cells = self.tables[item]
             if tbl is not None:

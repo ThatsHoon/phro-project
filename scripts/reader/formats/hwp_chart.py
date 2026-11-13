@@ -5,7 +5,8 @@ hwp/charts.py). In it, OOXMLChartContents is a DrawingML chart read by charts.ch
 chart (ChartOBJ revision 1.2), ported from rhwp src/ole_chart: the probe (parser.rs), the VtDataGrid read in
 archive slot order (grid.rs), the series axis from label records repeated after the grid (orientation.rs), the
 title (parser.rs) and the chart type at the end of the VtChart archive (the field order of legacy_presentation.rs
-parse_inner, whose whole object graph is not walked); a BIFF Workbook is a chart counted for phase 2b.
+parse_inner, whose whole object graph is not walked); a BIFF Workbook or Book is an embedded Excel object, read by
+xls_embedded (its first table is the item's).
 """
 import math
 import re
@@ -18,6 +19,7 @@ from ..containers.cfb import Compound, is_cfb
 from ..containers.zipx import parse_xml
 from ..limits import ReadError
 from ..model import Table
+from . import sheet_grid, xls_embedded
 
 # grid.rs: the classes a data grid is made of; any other name in it means the shape cannot be trusted
 _GRID, _MATRIX, _COLLECTION, _OBJECT = b"VtDataGrid\0", b"VtMatrix\0", b"VtCollection\0", b"VtObject\0"
@@ -66,10 +68,11 @@ class _Grid:
         return v.text if isinstance(v, _Text) else None
 
 
-def ole_table(data: bytes, ctx) -> Table | None:
+def ole_table(data: bytes, ctx, *, sheets: sheet_grid.Budget | None = None) -> Table | None:
     """The chart in an OLE item as a Table. None, counted under object, for an item that is not a 4-byte length
-    and the compound file it gives, or that holds no chart; counted under chart for a BIFF Workbook or a chart
-    that does not parse. A chart without series is None, not counted, as charts.chart_table has it."""
+    and the compound file it gives, or that holds no chart; counted under chart for a BIFF Workbook with no table to
+    show or a chart that does not parse. A chart without series is None, not counted, as charts.chart_table has it.
+    A Workbook's sheets draw on `sheets`, the document's sheet_grid.Budget (a fresh one when None)."""
     if len(data) < 12 or struct.unpack_from("<I", data)[0] != len(data) - 4 or not is_cfb(data[4:12]):
         ctx.skipped["object"] += 1
         return None
@@ -80,8 +83,12 @@ def ole_table(data: bytes, ctx) -> Table | None:
             elif cf.exists("Contents") and _probe(native := cf.read("Contents")):
                 xml = None
             elif cf.exists("Workbook") or cf.exists("Book"):
-                ctx.skipped["chart"] += 1
-                return None
+                before = ctx.skipped["chart"]
+                found = xls_embedded.blocks(cf, ctx, sheet_grid.Budget() if sheets is None else sheets)
+                table = next((b for b in found if isinstance(b, Table)), None)
+                if table is None and ctx.skipped["chart"] == before:
+                    ctx.skipped["chart"] += 1
+                return table
             else:
                 ctx.skipped["object"] += 1
                 return None

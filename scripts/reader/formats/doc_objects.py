@@ -5,7 +5,9 @@ Word writes an object as an EMBED field: the separator has fSpec and fOle2 and n
 (sprmCObjLocation, else sprmCPicLocation, a u32), and the result's \\x01 has fSpec and the preview's PICF at its
 PicLocation in the Data stream. An object is read once an id: an Equation Native is converted by mtef.to_tex after
 its EQNOLEFILEHDR (cbHdr bytes, a u16 first), and the equation replaces the preview, which is not read; a Workbook or
-Book stream, or a CompObj naming MS Graph, is a chart; anything else is another object. A storage that is not there,
+Book stream is read by xls_embedded (its tables are placed after the paragraph, as a picture is; one it cannot
+read is a chart, counted), and a CompObj naming MS Graph is a chart; anything else is another object. A document reads
+256 objects at most, the rest counted under object. A storage that is not there,
 an equation that does not convert and a stream that cannot be read (missing, a broken chain, damaged or too large:
 ReadError's other kinds end the document) keep the preview; so does an equation converted in part (stopped early,
 symbols left out), after its TeX. What is not read is counted where the object is shown:
@@ -15,11 +17,11 @@ never counted.
 """
 import struct
 
-from .. import images
+from .. import images, limits
 from ..containers.cfb import CfbError
 from ..limits import ReadError
 from ..model import Math
-from . import mtef
+from . import mtef, sheet_grid, xls_embedded
 
 _POOL = "OBJECTPOOL"
 _NATIVE = "EQUATION NATIVE"
@@ -27,6 +29,7 @@ _BOOKS = ("WORKBOOK", "BOOK")
 _COMP_OBJ = "\x01COMPOBJ"
 _COMP_OBJ_MAX = 4096  # bytes of a CompObj stream read to find MS Graph's ProgID
 _HEADER_MAX = 0xFFFF  # an EQNOLEFILEHDR's cbHdr is a u16
+MAX_OBJECTS = 256     # objects one document reads (the rest are counted under object)
 
 # an object read: (kind, TeX, what the conversion lost)
 _MISSING = ("missing", "", frozenset())
@@ -44,6 +47,8 @@ class Objects:
         self._pool = None    # storage name (upper case) -> {stream name (upper case): path}
         self._objects = {}   # id -> an object read
         self._viewable = {}  # Data offset -> whether its preview shows as an image
+        self.sheets = sheet_grid.Budget()  # one for the document: the sheets of every embedded workbook share it
+        self.chart_cells = 0  # table cells placed from embedded workbooks, copies counted (CHART_TOTAL)
 
     def pool(self) -> dict:
         """The ObjectPool's storages and their streams, from the compound file's paths, once."""
@@ -59,6 +64,8 @@ class Objects:
         """Object `oid`, read once; one whose reading raised stays bad."""
         hit = self._objects.get(oid)
         if hit is None:
+            if len(self._objects) >= MAX_OBJECTS:
+                return _BAD  # past the cap: not read, counted under object where it is placed, never remembered
             self._objects[oid] = _BAD
             hit = self._objects[oid] = self.load(oid)
         return hit
@@ -82,11 +89,26 @@ class Objects:
                 return _BAD
             return ("equation", tex, frozenset(lost))
         if any(name in streams for name in _BOOKS):
-            return _CHART
+            return self.workbook(streams)
         comp = streams.get(_COMP_OBJ)
         if comp is not None and b"MSGraph" in (self.stream(comp, _COMP_OBJ_MAX) or b""):
             return _CHART
         return _OTHER
+
+    def workbook(self, streams):
+        """A Workbook or Book object: ("table", its tables, none lost) through xls_embedded, else a chart left
+        unread (the preview and the count stay). The reads of a failed workbook are not counted here, place() counts
+        the chart where it is shown."""
+        ctx = self.r.ctx
+        before = ctx.skipped["chart"]
+        out = xls_embedded.blocks(_Storage(self, streams), ctx, self.sheets)
+        if out:
+            return ("table", out, frozenset())
+        if before:
+            ctx.skipped["chart"] = before
+        else:
+            ctx.skipped.pop("chart", None)
+        return _CHART
 
     def stream(self, path, cap) -> bytes | None:
         """Stream `path`, or None when it is over `cap` bytes or cannot be read. A ReadError other than damaged or
@@ -118,6 +140,11 @@ class Objects:
             return
         kind, tex, lost = obj
         shown = not (st.run.vanish or st.run.deleted)
+        if kind == "table":
+            with r.ctx.guard("chart"):
+                if shown:
+                    self.tables(st, tex)
+            return
         with r.ctx.guard("chart" if kind == "chart" else "object"):
             if kind == "equation":
                 m = Math(tex)
@@ -136,6 +163,16 @@ class Objects:
                 r.ctx.skipped["chart"] += 1
             elif kind != "other" or preview is None or not self.viewable(at, preview):
                 r.ctx.skipped["object"] += 1
+
+    def tables(self, st, tables):
+        """An embedded workbook's tables after the open paragraph, as a picture goes (st.extras). Each placement is
+        charged against CHART_TOTAL, and one past it is counted under chart instead."""
+        for t in tables:
+            self.chart_cells += sum(len(row) for row in t.rows)
+            if self.chart_cells > limits.CHART_TOTAL:
+                self.r.ctx.skipped["chart"] += 1
+            else:
+                st.extras.append(t)
 
     def preview(self, at) -> bytes | None:
         """The picture of the PICF at Data offset `at` (doc_pictures, its read budgets), or None when there is none,
@@ -156,3 +193,24 @@ class Objects:
             hit = kind in images.VIEWABLE or (kind == "bmp" and images.bmp_to_png(data) is not None)
             self._viewable[at] = hit
         return hit
+
+
+class _Storage:
+    """One ObjectPool storage as xls_embedded.blocks reads it: exists, size and read by stream name, through
+    Objects.stream so a stream is read under the same cap and ReadError rules (one that cannot be read is a KeyError,
+    which blocks counts as a failed chart)."""
+
+    def __init__(self, objects, streams):
+        self.objects, self.streams = objects, streams
+
+    def exists(self, name) -> bool:
+        return name.upper() in self.streams
+
+    def size(self, name) -> int:
+        return self.objects.r.cf.size(self.streams[name.upper()])
+
+    def read(self, name) -> bytes:
+        data = self.objects.stream(self.streams[name.upper()], limits.EMBED_BYTES)
+        if data is None:
+            raise KeyError(name)
+        return data
