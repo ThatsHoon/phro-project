@@ -16,7 +16,7 @@ SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one documen
 GRID_COLS = 1_000        # columns a span may reach in a rendered table
 GRID_SLOTS = 2_000_000    # grid slots all spans of one rendered table may cover
 CHART_CELLS = 100_000     # cells one chart table may hold, header row included (series x rows)
-CHART_TOTAL = 200_000     # chart and embedded sheet table cells one docx, doc, pptx, hwp, hwpx or xls document may emit, copies counted
+CHART_TOTAL = 200_000     # chart and embedded sheet table cells one docx, doc, pptx, hwp, hwpx, xls or xlsb document may emit, copies counted
 CFB_STREAM = 256 * 2**20  # bytes of one compound-file stream
 CFB_SECTORS = 1_000_000
 CFB_ENTRIES = 131_072     # directory entries
@@ -26,7 +26,7 @@ HWP_RECORDS = 1_000_000   # records of one HWP stream
 BIN_RECORDS = 2_000_000    # records of one BIFF stream, one BIFF12 part or one PowerPoint Document stream
 DECRYPT_BYTES = 32 * 2**20  # bytes one xls or ppt stream may decrypt
 EMBED_BYTES = 16 * 2**20    # bytes of one Excel workbook stream embedded in an hwp or doc object
-IMAGE_BYTES = 256 * 2**20  # image bytes one docx, doc, hwp or hwpx document may emit, copies counted
+IMAGE_BYTES = 256 * 2**20  # image bytes one docx, doc, hwp, hwpx or xlsb document may emit, copies counted
 # tables one doc, docx, hwp or hwpx document may open, nested ones counted. A .doc paragraph opens up to 63 with one
 # 3-byte sprmPItap, and a deflated docx part or hwp section holds one in about a byte; each costs the model about
 # 600 bytes. A real document has thousands at most (a thousand-page form with ten tables a page has ten thousand);

@@ -877,7 +877,9 @@ def biff_workbook(sheets, *, formats=None, date1904=False, active=0, filepass=No
                                if isinstance(v, tuple) and v[0] == "fmt"))
     by_code = {code: fid for fid, code in formats.items()}
     for code in codes:
-        if code not in by_code:
+        if isinstance(code, int):
+            by_code[code] = code
+        elif code not in by_code:
             by_code[code] = max([163, *formats]) + 1
             formats[by_code[code]] = code
     fmt_xf = {code: 16 + i for i, code in enumerate(codes)}
@@ -1120,13 +1122,27 @@ def xlsb_bundle(name, rid, state=0, tab=1, extra=b""):
     return biff12(156, struct.pack("<II", state, tab) + extra + xlsb_wide(rid) + xlsb_wide(name))
 
 
+def xlsb_row(r, hidden=False):
+    """A BrtRowHdr: the row, seven filler bytes, then the flag byte (0x10 is hidden)."""
+    import struct
+    return biff12(0, struct.pack("<I", r) + bytes(7) + bytes([0x10 if hidden else 0]))
+
+
+def xlsb_cell(rid, col, style, body=b""):
+    """A cell record: column, style (a cellXfs index), then `body`."""
+    import struct
+    return biff12(rid, struct.pack("<II", col, style) + bytes(body))
+
+
 def make_xlsb(path, sheets, *, formats=None, date1904=False, workbook_records=None, extra_parts=None):
     """Write an .xlsb package: content types, rels, workbook.bin, styles.bin, sharedStrings.bin, one sheet part per dict.
 
     A sheet dict has Task 5's keys (name, state, cells, ...) and `records`, raw BIFF12 records (bytes) for the sheet
     part. Shared strings come from the str cells; each ("fmt", number, code) cell format gets a cell XF after the
-    General one. `workbook_records` replaces the generated BrtBundleSh records. `extra_parts` adds parts or
-    replaces generated ones ({name: bytes}); a None value leaves a part out.
+    General one (a str code is a custom format, an int a built-in format id). The `cells` of a sheet are also written
+    as records before `records`: a row header per row, then BrtCellIsst for a str, BrtCellBool for a bool, BrtCellReal
+    for a number and BrtCellReal in the format's XF for a ("fmt", number, code). `workbook_records` replaces the generated BrtBundleSh records. `extra_parts` adds
+    parts or replaces generated ones ({name: bytes}); a None value leaves a part out.
     """
     import struct
     formats = dict(formats or {})
@@ -1135,7 +1151,9 @@ def make_xlsb(path, sheets, *, formats=None, date1904=False, workbook_records=No
                                if isinstance(v, tuple) and v[0] == "fmt"))
     by_code = {code: fid for fid, code in formats.items()}
     for code in codes:
-        if code not in by_code:
+        if isinstance(code, int):
+            by_code[code] = code
+        elif code not in by_code:
             by_code[code] = max([163, *formats]) + 1
             formats[by_code[code]] = code
     wb = [biff12(153, struct.pack("<I", int(date1904)) + bytes(4)), biff12(143)]
@@ -1181,7 +1199,21 @@ def make_xlsb(path, sheets, *, formats=None, date1904=False, workbook_records=No
         "xl/sharedStrings.bin": b"".join(sst),
     }
     for i, sh in enumerate(sheets):
-        members[f"xl/worksheets/sheet{i + 1}.bin"] = biff12(129) + b"".join(sh.get("records", ())) + biff12(130)
+        recs, last = [], None
+        for (r, c), v in sorted(sh.get("cells", {}).items()):
+            if r != last:
+                recs.append(xlsb_row(r))
+                last = r
+            if isinstance(v, str):
+                recs.append(xlsb_cell(7, c, 0, struct.pack("<I", strings.index(v))))
+            elif isinstance(v, bool):
+                recs.append(xlsb_cell(4, c, 0, bytes([int(v)])))
+            elif isinstance(v, tuple):
+                recs.append(xlsb_cell(5, c, 1 + codes.index(v[2]), struct.pack("<d", v[1])))
+            else:
+                recs.append(xlsb_cell(5, c, 0, struct.pack("<d", v)))
+        members[f"xl/worksheets/sheet{i + 1}.bin"] = (
+            biff12(129) + b"".join(recs) + b"".join(sh.get("records", ())) + biff12(130))
     for name, data in (extra_parts or {}).items():
         if data is None:
             members.pop(name, None)

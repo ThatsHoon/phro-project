@@ -1,18 +1,37 @@
-"""Excel binary workbooks (.xlsb): the container check, the sheet list, number formats, cell XFs and shared strings.
+"""Excel binary workbooks (.xlsb): one sheet section per worksheet, with displayed values, merges and hidden parts.
 
 The record layouts were checked against anydoc `sheet/xlsb.rs` (BrtWbProp, BrtBundleSh, the cell XF block of
-styles.bin and BrtSSTItem) and the framing in `containers/biff12.py`. Parts are found through the package
-relationships, with the conventional names only when a relationship is absent. Every handler runs per record:
-the record size gives an exact step, so a bad record is counted under `record` and the walk goes on. The sheets
-themselves are read in a later step.
+styles.bin, BrtSSTItem, the row, cell, column and merge records) and `sheet/xlsx.rs` (drawing anchors), and the
+framing in `containers/biff12.py`. Parts are found through the package relationships, with the conventional names
+only when a relationship is absent; a part no relationship reaches is never read. Every handler runs per record:
+the record size gives an exact step, so a bad record is counted under `record` and the walk goes on. Cells go
+through `numfmt.display`; a formula shows its cached value and its expression is never read. A sheet that cannot
+be read, or whose workbook entry names no readable part, is counted under `sheet` and the others still come out.
+A sheet's drawing part is XML: its charts (cached values as a table, charged against `CHART_TOTAL`) and pictures
+(charged against `IMAGE_BYTES`) follow the sheet's table in anchor order.
 """
 import re
 import struct
 from pathlib import Path
 
+from .. import limits
 from ..containers import biff12, cfb
-from ..containers.zipx import Package
+from ..containers.zipx import Package, attr, local, first
 from ..limits import ReadError
+from ..model import Doc, Section
+from ..numfmt import code_for, display
+from . import biff, ooxml_base, sheet_grid
+from .xls import _hide
+
+BRT_ROW_HDR = 0
+BRT_CELL_RK, BRT_CELL_ERROR, BRT_CELL_BOOL, BRT_CELL_REAL, BRT_CELL_ST, BRT_CELL_ISST = 2, 3, 4, 5, 6, 7
+BRT_FMLA_STRING, BRT_FMLA_NUM, BRT_FMLA_BOOL, BRT_FMLA_ERROR = 8, 9, 10, 11
+BRT_COL_INFO = 60
+BRT_CELL_RSTRING = 62
+BRT_MERGE_CELL = 176
+_ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!",
+           0x2A: "#N/A", 0x2B: "#GETTING_DATA"}
+MAX_ANCHORS = 10_000  # drawing anchors one drawing part reads
 
 BRT_SST_ITEM = 19
 BRT_FMT = 44
@@ -98,11 +117,11 @@ def _workbook(pkg, part, rels, wb, ctx):
             if rid == BRT_WB_PROP:
                 wb.date1904 = biff12.Fields(data, off, size).u32() & 1 != 0
             elif rid == BRT_BUNDLE_SH:
+                n = index  # a short body must still use up its place, or every later fallback name slips
+                index += 1
                 f = biff12.Fields(data, off, size)
                 state = f.u32()
                 f.u32()  # iTabID
-                n = index
-                index += 1
                 pair = None
                 for at in (8, 12):  # some writers put an extra zero dword before strRelID
                     try:
@@ -185,10 +204,186 @@ def read_workbook(pkg, ctx) -> _Wb:
     return wb
 
 
-def parse(path, ctx):
+class _Sheets:
+    """The sheets of one workbook, sharing one cell budget, one image byte count and one chart cell count."""
+
+    def __init__(self, pkg, wb, ctx):
+        self.pkg, self.wb, self.ctx = pkg, wb, ctx
+        self.budget = sheet_grid.Budget()
+        self.used: set[str] = set()      # sheet parts read
+        self.drawings: set[str] = set()  # drawing parts read
+        self.image_bytes = 0             # image bytes placed (IMAGE_BYTES)
+        self.chart_cells = 0             # chart table cells placed (CHART_TOTAL)
+        self._code: dict[int, str] = {}
+
+    def sections(self) -> list:
+        out = []
+        for name, part, state in self.wb.sheets:
+            try:
+                with self.ctx.guard("sheet"):
+                    blocks = self.sheet(name, part)
+            except ReadError as e:
+                if e.kind != "damaged":
+                    raise
+                self.ctx.skipped["sheet"] += 1
+                continue
+            if blocks is None:  # the guard counted a failure
+                continue
+            if state in (1, 2):
+                out.append(Section("sheet", name, blocks=_hide(blocks), hidden="hidden"))
+            else:
+                out.append(Section("sheet", name, blocks=blocks))
+        return out
+
+    def show(self, value, style: int) -> str:
+        code = self._code.get(style)
+        if code is None:
+            xf = self.wb.xf_fmt
+            code = self._code[style] = code_for(xf[style], self.wb.formats) if style < len(xf) else "General"
+        if isinstance(value, str) and code == "General":
+            return value
+        return display(value, code, self.wb.date1904)
+
+    def sheet(self, name: str, part: str) -> list:
+        if not part or not self.pkg.has(part):
+            raise ReadError("damaged", "sheet part missing")
+        if part in self.used:
+            raise ReadError("damaged", "sheet part used twice")
+        self.used.add(part)
+        grid = sheet_grid.Grid(name, self.budget, self.ctx)
+        row = None
+        for rid, data, off, size in _walk(self.pkg, part, self.ctx):
+            try:
+                if rid == BRT_ROW_HDR:
+                    row = None
+                    f = biff12.Fields(data, off, size)
+                    row = f.u32()
+                    f.skip(7)
+                    if f.u8() & 0x10:
+                        grid.hide_row(row)
+                elif rid in _CELLS:
+                    if grid.cut:
+                        continue
+                    if row is None:  # a cell before any row header has no row
+                        self.ctx.skipped["record"] += 1
+                        continue
+                    f = biff12.Fields(data, off, size)
+                    col = f.u32()
+                    style = f.u32() & 0xFFFFFF
+                    grid.put(row, col, self._cell(rid, f, style))
+                elif rid == BRT_COL_INFO:
+                    f = biff12.Fields(data, off, size)
+                    first_col, last_col = f.u32(), f.u32()
+                    f.skip(8)
+                    if f.u16() & 1:
+                        grid.hide_cols(first_col, last_col)
+                elif rid == BRT_MERGE_CELL:
+                    f = biff12.Fields(data, off, size)
+                    r1, r2, c1, c2 = f.u32(), f.u32(), f.u32(), f.u32()
+                    grid.merge(r1, r2, c1, c2)
+            except (ValueError, struct.error):
+                self.ctx.skipped["record"] += 1
+        return grid.blocks() + self.drawing(part)
+
+    def _cell(self, rid: int, f, style: int) -> str:
+        """The displayed value of one cell record whose header has been read. A formula shows its cached value."""
+        if rid == BRT_CELL_RK:
+            return self.show(biff.rk(f.u32()), style)
+        if rid in (BRT_CELL_ERROR, BRT_FMLA_ERROR):
+            return _ERRORS.get(f.u8(), "#N/A")
+        if rid in (BRT_CELL_BOOL, BRT_FMLA_BOOL):
+            return self.show(bool(f.u8()), style)
+        if rid in (BRT_CELL_REAL, BRT_FMLA_NUM):
+            return self.show(f.f64(), style)
+        if rid == BRT_CELL_ISST:
+            idx = f.u32()
+            if idx >= len(self.wb.sst):
+                raise ValueError("shared string index")
+            return self.show(self.wb.sst[idx], style)
+        return self.show(f.wide() or "", style)  # BrtCellSt, BrtCellRString, BrtFmlaString
+
+    # ---- drawings
+    def drawing(self, part: str) -> list:
+        """The charts and pictures of the drawing parts that the sheet relationships name, in anchor order."""
+        out = []
+        for rel in ooxml_base.rels(self.pkg, part, self.ctx).values():
+            if rel.external or not rel.type.endswith("/drawing"):
+                continue
+            if rel.target in self.drawings:
+                self.ctx.skipped["object"] += 1
+                continue
+            self.drawings.add(rel.target)
+            try:
+                root, _ = ooxml_base.load(self.pkg, rel.target)
+            except ReadError as e:
+                if e.kind not in ("damaged", "too_large"):
+                    raise
+                self.ctx.skipped["object"] += 1
+                continue
+            out += self.anchors(rel.target, root)
+        return out
+
+    def anchors(self, part: str, root) -> list:
+        found = []
+        for a in root:
+            if local(a.tag) not in ("twoCellAnchor", "oneCellAnchor"):
+                continue
+            if len(found) >= MAX_ANCHORS:
+                self.ctx.skipped["object"] += 1
+                break
+            at = first(a, "from")
+            r = ooxml_base.int_of(_text(first(at, "row")) if at is not None else "")
+            c = ooxml_base.int_of(_text(first(at, "col")) if at is not None else "")
+            found.append((r, c, len(found), a))
+        found.sort(key=lambda t: t[:3])
+        out = []
+        for _, _, _, a in found:
+            for el in a.iter():
+                name = local(el.tag)
+                if name == "chart":
+                    self.chart(part, attr(el, "id"), out)
+                elif name == "pic":
+                    blip = first(el, "blip")
+                    self.picture(part, attr(blip, "embed") if blip is not None else None, out)
+        return out
+
+    def chart(self, part: str, rid, out: list) -> None:
+        tbl = ooxml_base.chart(self.pkg, part, rid, self.ctx)
+        if tbl is None:
+            return
+        self.chart_cells += sum(len(r) for r in tbl.rows)
+        if self.chart_cells > limits.CHART_TOTAL:
+            self.ctx.skipped["chart"] += 1
+        else:
+            out.append(tbl)
+
+    def picture(self, part: str, rid, out: list) -> None:
+        img = ooxml_base.image(self.pkg, part, rid)
+        if img is None:
+            self.ctx.skipped["image"] += 1
+            return
+        self.image_bytes += len(img.data)
+        if self.image_bytes > limits.IMAGE_BYTES:
+            self.ctx.skipped["image"] += 1
+        else:
+            out.append(img)
+
+
+_CELLS = frozenset({BRT_CELL_RK, BRT_CELL_ERROR, BRT_CELL_BOOL, BRT_CELL_REAL, BRT_CELL_ST, BRT_CELL_ISST,
+                    BRT_CELL_RSTRING, BRT_FMLA_STRING, BRT_FMLA_NUM, BRT_FMLA_BOOL, BRT_FMLA_ERROR})
+
+
+def _text(el) -> str:
+    return (el.text or "").strip() if el is not None else ""
+
+
+def parse(path, ctx) -> Doc:
     _check_container(Path(path))
     with Package(path) as pkg:
         wb = read_workbook(pkg, ctx)
         if not wb.sheets:
             raise ReadError("damaged", "no readable sheets")
-        raise ReadError("unsupported", "xlsb sheets are not read yet")
+        secs = _Sheets(pkg, wb, ctx).sections()
+    if not secs:
+        raise ReadError("damaged", "no readable sheets")
+    return Doc(blocks=secs)

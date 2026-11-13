@@ -1,4 +1,4 @@
-"""xlsb records, the workbook sheet list, styles and shared strings, and the container checks.
+"""xlsb records, the workbook, styles and shared strings, sheets, drawings and the container checks.
 
 Run: python -I -X utf8 tests/test_reader_xlsb.py
 """
@@ -11,12 +11,17 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
+from reader import markdown  # noqa: E402
 from reader.containers import biff12 as b12  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
 from reader.formats import xlsb  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader_fix import biff12, make_cfb, make_xlsb, make_zip, xlsb_bundle, xlsb_wide  # noqa: E402
+from reader_fix import (biff12, make_cfb, make_xlsb, make_zip, xlsb_bundle, xlsb_cell, xlsb_row,  # noqa: E402
+                        xlsb_wide)
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
 
 
 def read(sheets, **kw):
@@ -138,6 +143,163 @@ def test_xlsx_saved_as_xlsb():
         make_zip(path, {"_rels/.rels": rel, "xl/workbook.xml": "<workbook/>"}, stored=())
         got = denied(lambda: xlsb.parse(path, Context()))
     assert got == ("unsupported", "xlsx workbook saved as .xlsb"), got
+
+
+def md(sheets, hidden=False, **kw):
+    """Build an .xlsb, parse it, render it: (markdown, ctx)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "a.xlsb"
+        make_xlsb(path, sheets, **kw)
+        ctx = Context()
+        doc = xlsb.parse(path, ctx)
+        return markdown.render(doc, Path(d) / "assets", hidden, ctx.skipped), ctx
+
+
+def rels_xml(*items):
+    body = "".join(f'<Relationship Id="{i}" Type="{REL}{t}" Target="{g}"/>' for i, t, g in items)
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{body}</Relationships>')
+
+
+def anchor(row, inner, col=0, kind="twoCellAnchor"):
+    return (f'<xdr:{kind}><xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row}</xdr:row>'
+            f'<xdr:rowOff>0</xdr:rowOff></xdr:from>{inner}<xdr:clientData/></xdr:{kind}>')
+
+
+def chart_frame(rid):
+    return ('<xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="%s"/></a:graphicData></a:graphic>'
+            '</xdr:graphicFrame>' % rid)
+
+
+def pic(rid):
+    return f'<xdr:pic><xdr:blipFill><a:blip r:embed="{rid}"/></xdr:blipFill></xdr:pic>'
+
+
+def drawing_xml(*anchors):
+    return ('<?xml version="1.0" encoding="UTF-8"?><xdr:wsDr '
+            'xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+            'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            'xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+            f'xmlns:r="{REL[:-1]}">' + "".join(anchors) + "</xdr:wsDr>")
+
+
+BAR = ('<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea>'
+       '<c:barChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>S</c:v></c:pt></c:strCache></c:strRef></c:tx>'
+       '<c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>Q1</c:v></c:pt></c:strCache></c:strRef></c:cat>'
+       '<c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>7</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>'
+       '</c:barChart></c:plotArea></c:chart></c:chartSpace>')
+
+
+def with_drawing(*anchors, rels=(), extra=None):
+    """extra_parts for a drawing on sheet 1; `rels` are the drawing's own (id, type, target) relationships."""
+    parts = {
+        "xl/worksheets/_rels/sheet1.bin.rels": rels_xml(("rId1", "drawing", "../drawings/drawing1.xml")),
+        "xl/drawings/drawing1.xml": drawing_xml(*anchors),
+        "xl/drawings/_rels/drawing1.xml.rels": rels_xml(*rels),
+    }
+    parts.update(extra or {})
+    return parts
+
+
+def test_cells_displayed():
+    records = [xlsb_cell(6, 1, 0, xlsb_wide("beta")),
+               xlsb_cell(2, 3, 0, struct.pack("<I", (5 << 2) | 2)),
+               xlsb_cell(4, 4, 0, b"\x01"),
+               xlsb_cell(3, 5, 0, b"\x2a")]
+    cells = {(0, 0): "alpha", (0, 2): ("fmt", 0.125, "0.00%"), (0, 6): ("fmt", 45000, 14)}
+    out, ctx = md([{"name": "S", "cells": cells, "records": records}])
+    assert "## Sheet: S" in out, out
+    for want in ("alpha", "beta", "12.50%", "#N/A", "2023-03-15"):
+        assert want in out, (want, out)
+    assert "|5|" in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_formula_cached():
+    tail = bytes([0, 0, 0xFF, 0xFF, 1, 2, 3])  # flags and formula bytes: never read
+    records = [xlsb_row(0),
+               xlsb_cell(8, 0, 0, xlsb_wide("cached") + tail),
+               xlsb_cell(9, 1, 0, struct.pack("<d", 2.5) + tail),
+               xlsb_cell(10, 2, 0, b"\x01" + tail),
+               xlsb_cell(11, 3, 0, b"\x07" + tail)]
+    out, ctx = md([{"name": "S", "records": records}])
+    for want in ("cached", "2.5", "#DIV/0!"):
+        assert want in out, (want, out)
+    assert "TRUE" in out.upper() and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_hidden_row_col_sheet():
+    cells = {(0, 0): "a", (0, 1): "b", (1, 0): "c", (1, 1): "d"}
+    colinfo = biff12(60, struct.pack("<II", 1, 1) + bytes(8) + struct.pack("<H", 1))
+    out, _ = md([{"name": "S", "cells": cells, "records": [colinfo, xlsb_row(1, hidden=True)]},
+                 {"name": "H", "state": 2, "cells": {(0, 0): "secret"}}])
+    assert "(3 hidden places left out)" in out and "secret" not in out, out
+    shown, _ = md([{"name": "H", "state": 1, "cells": {(0, 0): "secret"}}, {"name": "S", "cells": {(0, 0): "x"}}],
+                  hidden=True)
+    assert "secret" in shown, shown
+
+
+def test_merge():
+    out, _ = md([{"name": "S", "cells": {(0, 0): "wide", (1, 0): "x", (1, 1): "y"},
+                  "records": [biff12(176, struct.pack("<IIII", 0, 0, 0, 1))]}])
+    assert 'colspan="2"' in out and "wide" in out, out
+
+
+def test_bad_cell_record_recovery():
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "first", (0, 2): "third"},
+                    "records": [biff12(7, b"\x00\x00"), xlsb_cell(6, 1, 0, xlsb_wide("mid"))]}])
+    assert "first" in out and "third" in out and "mid" in out, out
+    assert "(could not read: 1 damaged record)" in out and ctx.skipped["record"] == 1, (out, ctx.skipped)
+
+
+def test_framing_break_keeps_rows():
+    cells = {(0, 0): "r0", (1, 0): "r1", (2, 0): "r2"}
+    out, ctx = md([{"name": "S", "cells": cells, "records": [bytes([5, 50])]}])
+    assert "r0" in out and "r1" in out and "r2" in out, out
+    assert "1 damaged record" in out and ctx.skipped["record"] == 1, (out, ctx.skipped)
+
+
+def test_chart_in_xlsb():
+    parts = with_drawing(anchor(4, pic("rId2")), anchor(1, chart_frame("rId1")),
+                         rels=[("rId1", "chart", "../charts/chart1.xml"), ("rId2", "image", "../media/image1.png")],
+                         extra={"xl/charts/chart1.xml": BAR, "xl/media/image1.png": PNG})
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "top"}}], extra_parts=parts)
+    assert "Chart: bar" in out and "|Q1|7|" in out, out
+    assert out.index("top") < out.index("Chart: bar") < out.index("assets/img-001.png"), out  # anchor order
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_picture_in_xlsb():
+    parts = with_drawing(anchor(0, pic("rId1"), kind="oneCellAnchor"),
+                         rels=[("rId1", "image", "../media/image1.png")], extra={"xl/media/image1.png": PNG})
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
+    assert "assets/img-001.png" in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_unlisted_bin_ignored():
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "ok"}}],
+                  extra_parts={"xl/printerSettings/printerSettings1.bin": bytes(range(256)) * 4})
+    assert "ok" in out and not ctx.skipped and "could not read" not in out, (out, ctx.skipped)
+
+
+def test_two_sheets_one_bad():
+    out, ctx = md([{"name": "A", "cells": {(0, 0): "fine"}}, {"name": "B"}],
+                  extra_parts={"xl/worksheets/sheet2.bin": None})
+    assert "fine" in out and "(could not read: 1 sheet)" in out and ctx.skipped["sheet"] == 1, (out, ctx.skipped)
+
+
+def test_bundlesh_short_record_keeps_index():
+    short = biff12(156, b"\x00\x00\x00\x00")
+    odd = biff12(156, struct.pack("<III", 0, 1, 900))
+    wb, ctx = read([{"name": "x"}, {"name": "y"}], workbook_records=[short, odd])
+    assert wb.sheets == [("Sheet 2", "xl/worksheets/sheet2.bin", 0)], wb.sheets
+    assert ctx.skipped["record"] == 2, ctx.skipped
+
+
+def test_sheet_without_readable_part():
+    out, ctx = md([{"name": "A", "cells": {(0, 0): "fine"}}, {"name": "B", "cells": {(0, 0): "unused"}}],
+                  workbook_records=[xlsb_bundle("A", "rId1"), xlsb_bundle("Lost", "rId9")])
+    assert "fine" in out and "Lost" not in out and "(could not read: 1 sheet)" in out, out
+    assert ctx.skipped["sheet"] == 1, ctx.skipped
 
 
 def main():
