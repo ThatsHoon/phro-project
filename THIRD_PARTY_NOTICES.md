@@ -146,7 +146,7 @@ SOFTWARE.
 
 ## anydoc
 
-Ported: the style chain, span grid, row templates and display text in `scripts/reader/formats/odf*.py`; relationship discovery, style cascade, numbering, `Requires`-aware AlternateContent and grid in `scripts/reader/formats/ooxml*.py`; the CSS `display:none` cascade and span grid in `scripts/reader/formats/epub.py`, `scripts/reader/css.py` and `scripts/reader/html.py`; the Windows code page of a language id in `scripts/reader/text.py` and the Far East language choice and the fallback table stream in `scripts/reader/formats/doc.py`; the Prm0 sprm table, style walk, toggle properties, and the PlfLst and PlfLfo walk with its list counters in `scripts/reader/formats/doc_fib.py`; the hidden-row and hidden-column merge rule of the sheet grid in `scripts/reader/formats/sheet_grid.py`; the BIFF8 record walk and CONTINUE string rule in `scripts/reader/formats/biff.py`; the xls sheet walk, ROW and COLINFO hidden flags and cached formula values in `scripts/reader/formats/xls.py`.
+Ported: the style chain, span grid, row templates and display text in `scripts/reader/formats/odf*.py`; relationship discovery, style cascade, numbering, `Requires`-aware AlternateContent and grid in `scripts/reader/formats/ooxml*.py`; the CSS `display:none` cascade and span grid in `scripts/reader/formats/epub.py`, `scripts/reader/css.py` and `scripts/reader/html.py`; the Windows code page of a language id in `scripts/reader/text.py` and the Far East language choice and the fallback table stream in `scripts/reader/formats/doc.py`; the Prm0 sprm table, style walk, toggle properties, and the PlfLst and PlfLfo walk with its list counters in `scripts/reader/formats/doc_fib.py`; the hidden-row and hidden-column merge rule of the sheet grid in `scripts/reader/formats/sheet_grid.py`; the BIFF8 record walk and CONTINUE string rule in `scripts/reader/formats/biff.py`; the xls sheet walk, ROW and COLINFO hidden flags and cached formula values in `scripts/reader/formats/xls.py`; the BIFF12 record framing in `scripts/reader/containers/biff12.py`; the xlsb workbook, styles and shared strings in `scripts/reader/formats/xlsb.py`.
 
 ```
 MIT License
@@ -202,7 +202,7 @@ SOFTWARE.
 
 ## xberg
 
-Ported: group recursion, master pages and the hidden sheet marker in `scripts/reader/formats/odf*.py`; SDT placeholder drop in `scripts/reader/formats/ooxml*.py`; DRM skip, fallback chains and nav/TOC removal in `scripts/reader/formats/epub.py`.
+Ported: group recursion, master pages and the hidden sheet marker in `scripts/reader/formats/odf*.py`; SDT placeholder drop in `scripts/reader/formats/ooxml*.py`; DRM skip, fallback chains and nav/TOC removal in `scripts/reader/formats/epub.py`; the BIFF12 record size framing in `scripts/reader/containers/biff12.py`.
 
 ```
 MIT License

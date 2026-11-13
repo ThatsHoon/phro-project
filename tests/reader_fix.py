@@ -1091,3 +1091,100 @@ def encrypt_xls(sheets, password, kind, **kw):
         if p >= start and rid == 0x0085:
             out[p + 4:p + 8] = data[p + 4:p + 8]
     return bytes(out)
+
+
+def biff12(rid: int, body: bytes = b"") -> bytes:
+    """One BIFF12 record: a 1 or 2 byte id and a size of 1 to 4 bytes, 7 bits each."""
+    def seven(n):
+        out = bytearray()
+        while True:
+            b = n & 0x7F
+            n >>= 7
+            out.append(b | (0x80 if n else 0))
+            if not n:
+                return bytes(out)
+    return (seven(rid) if rid >= 0x80 else bytes([rid])) + seven(len(body)) + bytes(body)
+
+
+def xlsb_wide(text):
+    """An XLWideString (u32 cch, UTF-16LE), or the null string for None."""
+    import struct
+    if text is None:
+        return struct.pack("<I", 0xFFFFFFFF)
+    return struct.pack("<I", len(text)) + text.encode("utf-16-le")
+
+
+def xlsb_bundle(name, rid, state=0, tab=1, extra=b""):
+    """A BrtBundleSh record; `extra` goes before strRelID."""
+    import struct
+    return biff12(156, struct.pack("<II", state, tab) + extra + xlsb_wide(rid) + xlsb_wide(name))
+
+
+def make_xlsb(path, sheets, *, formats=None, date1904=False, workbook_records=None, extra_parts=None):
+    """Write an .xlsb package: content types, rels, workbook.bin, styles.bin, sharedStrings.bin, one sheet part per dict.
+
+    A sheet dict has Task 5's keys (name, state, cells, ...) and `records`, raw BIFF12 records (bytes) for the sheet
+    part. Shared strings come from the str cells; each ("fmt", number, code) cell format gets a cell XF after the
+    General one. `workbook_records` replaces the generated BrtBundleSh records. `extra_parts` adds parts or
+    replaces generated ones ({name: bytes}); a None value leaves a part out.
+    """
+    import struct
+    formats = dict(formats or {})
+    strings = list(dict.fromkeys(v for sh in sheets for v in sh.get("cells", {}).values() if isinstance(v, str)))
+    codes = list(dict.fromkeys(v[2] for sh in sheets for v in sh.get("cells", {}).values()
+                               if isinstance(v, tuple) and v[0] == "fmt"))
+    by_code = {code: fid for fid, code in formats.items()}
+    for code in codes:
+        if code not in by_code:
+            by_code[code] = max([163, *formats]) + 1
+            formats[by_code[code]] = code
+    wb = [biff12(153, struct.pack("<I", int(date1904)) + bytes(4)), biff12(143)]
+    if workbook_records is None:
+        wb += [xlsb_bundle(sh["name"], f"rId{i + 1}", sh.get("state", 0), i + 1) for i, sh in enumerate(sheets)]
+    else:
+        wb += list(workbook_records)
+    wb.append(biff12(144))
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
+    wb_rels = "".join(f'<Relationship Id="rId{i + 1}" Type="{rel}worksheet" Target="worksheets/sheet{i + 1}.bin"/>'
+                      for i in range(len(sheets)))
+    wb_rels += (f'<Relationship Id="rId{len(sheets) + 1}" Type="{rel}styles" Target="styles.bin"/>'
+                f'<Relationship Id="rId{len(sheets) + 2}" Type="{rel}sharedStrings" Target="sharedStrings.bin"/>')
+
+    def xf(parent, fid):
+        return biff12(47, struct.pack("<HH", parent, fid) + bytes(8))
+    styles = [biff12(278)]
+    if formats:
+        styles += [biff12(615, struct.pack("<I", len(formats)))]
+        styles += [biff12(44, struct.pack("<H", fid) + xlsb_wide(code)) for fid, code in formats.items()]
+        styles += [biff12(616)]
+    styles += [biff12(626, struct.pack("<I", 1)), xf(0xFFFF, 0), biff12(627)]
+    styles += [biff12(617, struct.pack("<I", 1 + len(codes))), xf(0, 0)]
+    styles += [xf(0, by_code[code]) for code in codes] + [biff12(618), biff12(279)]
+    sst = [biff12(159, struct.pack("<II", len(strings), len(strings)))]
+    sst += [biff12(19, b"\0" + xlsb_wide(s)) for s in strings] + [biff12(160)]
+    members = {
+        "[Content_Types].xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="bin" ContentType="application/vnd.ms-excel.sheet.binary.macroEnabled.main"/></Types>'),
+        "_rels/.rels": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{rel}officeDocument" Target="xl/workbook.bin"/></Relationships>'),
+        "xl/workbook.bin": b"".join(wb),
+        "xl/_rels/workbook.bin.rels": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{wb_rels}'
+            '</Relationships>'),
+        "xl/styles.bin": b"".join(styles),
+        "xl/sharedStrings.bin": b"".join(sst),
+    }
+    for i, sh in enumerate(sheets):
+        members[f"xl/worksheets/sheet{i + 1}.bin"] = biff12(129) + b"".join(sh.get("records", ())) + biff12(130)
+    for name, data in (extra_parts or {}).items():
+        if data is None:
+            members.pop(name, None)
+        else:
+            members[name] = data
+    make_zip(path, members, stored=())
