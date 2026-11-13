@@ -59,7 +59,7 @@ class _Datasheet:
     def __init__(self):
         self.cells = {}      # (row, col) -> float | str
         self.by_rows = None  # 0x1055: the series are in rows
-        self.codepage = 1252  # CODEPAGE 0x0042, the encoding of the narrow labels
+        self.codepage = None  # the first CODEPAGE 0x0042 of the stream: the encoding of the narrow labels
         self.stop = {}       # 0x1053 / 0x1054 -> the rows / columns that count
 
 
@@ -204,7 +204,8 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
                 else:
                     _datasheet_cell(ds, rid, data, off, size)
             elif ds is not None and rid == _CODEPAGE and size >= 2:
-                ds.codepage = struct.unpack_from("<H", data, off)[0]
+                if ds.codepage is None:
+                    ds.codepage = struct.unpack_from("<H", data, off)[0]
             elif ds is not None and rid == _DS_ORIENT and size >= 6:
                 ds.by_rows = bool(data[off])
             elif ds is not None and rid in (_DS_ROWS, _DS_COLS) and size == 4:
@@ -239,12 +240,15 @@ def _datasheet_cell(ds: _Datasheet, rid: int, data: bytes, off: int, size: int) 
     n = struct.unpack_from("<H", data, off + 7)[0]
     if size != 9 + n:
         raise limits.ReadError("damaged", "MS Graph datasheet label size")
-    raw = data[off + 9:off + 9 + n]
-    # as dochan: ASCII as it is, 65001 as UTF-8, else the Windows page cp<N>; a page Python has no codec for, or
-    # bytes that do not decode, are unsupported (the caller counts the chart once)
-    codec = "ascii" if raw.isascii() else "utf-8" if ds.codepage == 65001 else f"cp{ds.codepage}"
+    ds.cells[row, col] = bytes(data[off + 9:off + 9 + n])  # decoded once the walk has found the codepage
+
+
+def _label(raw: bytes, codepage: int) -> str:
+    """A narrow label as dochan: ASCII as it is, 65001 as UTF-8, else the Windows page cp<N>; a page Python has no
+    codec for, or bytes that do not decode, are unsupported (the caller counts the chart once)."""
+    codec = "ascii" if raw.isascii() else "utf-8" if codepage == 65001 else f"cp{codepage}"
     try:
-        ds.cells[row, col] = raw.decode(codec)
+        return raw.decode(codec)
     except (LookupError, UnicodeError):
         raise limits.ReadError("unsupported", "MS Graph label codepage") from None
 
@@ -255,8 +259,11 @@ def graph(data: bytes, ctx):
     ReadError (damaged or unsupported), counted as one chart by the caller."""
     st = biff.Stream(data, ctx)
     start = None
+    ds = _Datasheet()
     for rec in st.records(0):
-        if rec[0] == biff.BOF and rec[2] >= 4:
+        if rec[0] == _CODEPAGE and rec[2] >= 2 and ds.codepage is None:  # the first one anywhere wins, as dochan
+            ds.codepage = struct.unpack_from("<H", data, rec[1])[0]
+        elif rec[0] == biff.BOF and rec[2] >= 4:
             vers, dt = struct.unpack_from("<HH", data, rec[1])
             if vers != 0x0680:
                 raise limits.ReadError("unsupported", "not an MS Graph workbook")
@@ -265,7 +272,6 @@ def graph(data: bytes, ctx):
                 break
     if start is None:
         raise limits.ReadError("damaged", "no MS Graph datasheet substream")
-    ds = _Datasheet()
     f = _scan(data, start, st, ctx, _GRAPH_BOF, ds)
     if f.end is None:
         raise limits.ReadError("damaged", "unterminated MS Graph substream")
@@ -276,6 +282,8 @@ def graph(data: bytes, ctx):
     indexed, heads = {}, {}  # axis -> {point: value}; axis -> its point 0, the label
     cuts = [f.cut_points]
     for (row, col), value in ds.cells.items():
+        if isinstance(value, bytes):
+            value = _label(value, 1252 if ds.codepage is None else ds.codepage)
         if (rows_stop is not None and row >= rows_stop) or (cols_stop is not None and col >= cols_stop):
             continue
         axis, point = (row, col) if ds.by_rows else (col, row)

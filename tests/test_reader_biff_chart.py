@@ -230,6 +230,15 @@ def test_graph_codepage_labels():
     assert not ctx.skipped, ctx.skipped
 
 
+def test_graph_codepage_before_bof_and_late():
+    cats, series = ["한글", "둘"], [("이름", [1, 2])]
+    want = "Chart: bar@||이름|@|---|---|@|한글|1|@|둘|2|@".replace("@", "\n")
+    for at in ("before", "late"):
+        out, ctx = graph_blocks(msgraph_object(cats, series, codepage=949, codepage_at=at))
+        assert render(out, ctx) == want, (at, render(out, ctx))
+        assert not ctx.skipped, (at, ctx.skipped)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
