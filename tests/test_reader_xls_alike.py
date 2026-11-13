@@ -11,6 +11,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
+from reader import limits  # noqa: E402
 from reader.formats import xls_alike  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 
@@ -51,6 +52,32 @@ def test_tsv_named_xls():
 
 def test_zip_named_xls():
     assert denied(b"PK\x03\x04" + b"\0" * 100) == ("unsupported", "xlsx workbook saved as .xls")
+
+
+def test_cut_inside_multibyte_char():
+    rows = "".join("a,가" + chr(10) for _ in range(40))
+    for cap in range(40, 46):  # the read is cap*4+4 bytes, so one of these cuts mid-character
+        old, limits.SHEET_CHARS = limits.SHEET_CHARS, cap
+        try:
+            md = run(rows.encode("utf-8"))
+        finally:
+            limits.SHEET_CHARS = old
+        assert "|a|가|" in md, (cap, md)
+    for cap in range(40, 46):
+        old, limits.SHEET_CHARS = limits.SHEET_CHARS, cap
+        try:
+            md = run(rows.encode("cp949"))
+        finally:
+            limits.SHEET_CHARS = old
+        assert "|a|가|" in md, (cap, md)
+
+
+def test_long_field_keeps_other_rows():
+    md = run(("a,b" + chr(10) + "x" * 200_000 + ",c" + chr(10) + "last,row" + chr(10)).encode("utf-8"))
+    assert "|last|row|" in md and "|a|b|" in md, md[:200]
+    assert limits.SHEET_CHARS > 200_000
+    import csv
+    assert csv.field_size_limit() == 131072
 
 
 def test_other_damaged():

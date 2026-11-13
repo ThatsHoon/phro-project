@@ -4,6 +4,7 @@
 text (tab before comma, by the first line) goes through `csv` and a `sheet_grid.Grid`, bounded by the document's
 `Budget` like any sheet. Nothing is ported.
 """
+import codecs
 import csv
 import io
 
@@ -50,10 +51,11 @@ def parse_html(path, ctx) -> Doc:
     return Doc(blocks=[Section("sheet", name or "Sheet1", blocks=blocks)])
 
 
-def _decode(data: bytes) -> str:
+def _decode(data: bytes, cut: bool) -> str:
+    """`cut`: the read stopped at its cap, so an incomplete trailing sequence is dropped, not taken as bad bytes."""
     for enc in ("utf-8-sig", "cp949"):
         try:
-            return data.decode(enc)
+            return codecs.getincrementaldecoder(enc)().decode(data, final=not cut)
         except UnicodeDecodeError:
             pass
     return data.decode("cp1252", errors="replace")
@@ -61,12 +63,15 @@ def _decode(data: bytes) -> str:
 
 def parse_text(path, ctx) -> Doc:
     budget = sheet_grid.Budget()
+    cap = budget.cap_chars * 4 + 4  # a text longer than the character budget is cut by the grid anyway
     with open(path, "rb") as f:
-        data = f.read(budget.cap_chars * 4 + 4)  # a text longer than the character budget is cut by the grid anyway
-    text = _decode(data)
-    first = text.split("\n", 1)[0]
-    delim = "\t" if "\t" in first else ","
+        data = f.read(cap)
+    text = _decode(data, len(data) >= cap)
+    first = text.split(chr(10), 1)[0]
+    delim = chr(9) if chr(9) in first else ","
     grid = sheet_grid.Grid("Sheet1", budget, ctx)
+    # a field may be as long as the whole character budget; the process-wide limit is raised only while reading
+    old = csv.field_size_limit(max(csv.field_size_limit(), budget.cap_chars + 1))
     try:
         for r, row in enumerate(csv.reader(io.StringIO(text, newline=""), delimiter=delim)):
             for c, cell in enumerate(row):
@@ -76,4 +81,6 @@ def parse_text(path, ctx) -> Doc:
                 break
     except csv.Error:
         ctx.skipped["record"] += 1
+    finally:
+        csv.field_size_limit(old)
     return Doc(blocks=[Section("sheet", "Sheet1", blocks=grid.blocks())])
