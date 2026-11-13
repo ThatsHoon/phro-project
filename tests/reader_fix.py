@@ -985,7 +985,7 @@ def excel_object(sheets, prog=b"Excel.Sheet.8", **kw):
         return path.read_bytes()
 
 
-def msgraph_object(cats, series, kind="bar", title="", *, by_rows=False):
+def msgraph_object(cats, series, kind="bar", title="", *, by_rows=False, codepage=1252):
     """The compound file of an embedded MS Graph 97 object: a Workbook stream (BOF vers 0x0680 dt 0x8000) holding the
     chart records and the datasheet, and a \\x01CompObj naming MSGraph.Chart.8, as bytes.
 
@@ -996,7 +996,7 @@ def msgraph_object(cats, series, kind="bar", title="", *, by_rows=False):
     import struct
     import tempfile
     n = len(series)
-    head = [biff(0x0809, struct.pack("<HHHHII", 0x0680, 0x8000, 0, 0, 0, 0)), biff(0x0042, struct.pack("<H", 1252)),
+    head = [biff(0x0809, struct.pack("<HHHHII", 0x0680, 0x8000, 0, 0, 0, 0)), biff(0x0042, struct.pack("<H", codepage)),
             biff(0x1055, bytes([1 if by_rows else 0]) + bytes(5)),
             biff(0x1053, struct.pack("<HH", 0, (n if by_rows else len(cats)) + 1)),
             biff(0x1054, struct.pack("<HH", 0, (len(cats) if by_rows else n) + 1)), biff(0x1033)]
@@ -1017,7 +1017,7 @@ def msgraph_object(cats, series, kind="bar", title="", *, by_rows=False):
     def cell(point, axis, value):
         row, col = (axis, point) if by_rows else (point, axis)
         if isinstance(value, str):
-            raw = value.encode("latin-1")
+            raw = value.encode(f"cp{codepage}")
             return biff(4, struct.pack("<HH", row, col) + bytes(3) + struct.pack("<H", len(raw)) + raw)
         return biff(3, struct.pack("<HH", row, col) + bytes(3) + struct.pack("<d", float(value)))
     cells = [cell(0, k + 1, name) for k, (name, _) in enumerate(series)]

@@ -32,6 +32,7 @@ _BAR, _PIE, _SCATTER, _CHART3D = 0x1017, 0x1019, 0x101B, 0x103A
 _SER_PARENT = 0x104A
 _DS_NUMBER, _DS_LABEL, _DS_ORIENT, _DS_ROWS, _DS_COLS = 0x0003, 0x0004, 0x1055, 0x1053, 0x1054
 _GRAPH_BOF = 0x8000
+_CODEPAGE = 0x0042
 _KINDS = {0x1018: "line", 0x101A: "area", 0x103E: "radar", 0x103F: "surface", 0x1040: "radar"}
 # these cannot belong to a chart: BLANK is not here, real charts hold it after SIIndex
 _SHEET_ONLY = frozenset({0x00FD, 0x027E, 0x00BD, 0x0006, 0x0208, 0x00BE})
@@ -58,6 +59,7 @@ class _Datasheet:
     def __init__(self):
         self.cells = {}      # (row, col) -> float | str
         self.by_rows = None  # 0x1055: the series are in rows
+        self.codepage = 1252  # CODEPAGE 0x0042, the encoding of the narrow labels
         self.stop = {}       # 0x1053 / 0x1054 -> the rows / columns that count
 
 
@@ -201,6 +203,8 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
                     cut_points = True
                 else:
                     _datasheet_cell(ds, rid, data, off, size)
+            elif ds is not None and rid == _CODEPAGE and size >= 2:
+                ds.codepage = struct.unpack_from("<H", data, off)[0]
             elif ds is not None and rid == _DS_ORIENT and size >= 6:
                 ds.by_rows = bool(data[off])
             elif ds is not None and rid in (_DS_ROWS, _DS_COLS) and size == 4:
@@ -225,7 +229,7 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
 
 def _datasheet_cell(ds: _Datasheet, rid: int, data: bytes, off: int, size: int) -> None:
     """A NUMBER (row, col, 3 attribute bytes, f64) or LABEL (the same, a u16 size, a narrow string) cell of the
-    datasheet. The codepage is Windows-1252, the narrow strings of Graph's own datasheet."""
+    datasheet. The narrow strings use the datasheet's codepage."""
     if size < (15 if rid == _DS_NUMBER else 9):
         raise limits.ReadError("damaged", "truncated MS Graph datasheet cell")
     row, col = struct.unpack_from("<HH", data, off)
@@ -235,7 +239,14 @@ def _datasheet_cell(ds: _Datasheet, rid: int, data: bytes, off: int, size: int) 
     n = struct.unpack_from("<H", data, off + 7)[0]
     if size != 9 + n:
         raise limits.ReadError("damaged", "MS Graph datasheet label size")
-    ds.cells[row, col] = data[off + 9:off + 9 + n].decode("cp1252", "replace")
+    raw = data[off + 9:off + 9 + n]
+    # as dochan: ASCII as it is, 65001 as UTF-8, else the Windows page cp<N>; a page Python has no codec for, or
+    # bytes that do not decode, are unsupported (the caller counts the chart once)
+    codec = "ascii" if raw.isascii() else "utf-8" if ds.codepage == 65001 else f"cp{ds.codepage}"
+    try:
+        ds.cells[row, col] = raw.decode(codec)
+    except (LookupError, UnicodeError):
+        raise limits.ReadError("unsupported", "MS Graph label codepage") from None
 
 
 def graph(data: bytes, ctx):

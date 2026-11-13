@@ -213,6 +213,23 @@ def test_graph_bad_counted():
     assert out == [] and ctx.skipped["chart"] == 1, (out, ctx.skipped)
 
 
+def test_graph_orientation_non_square():
+    cats, series = ["a", "b", "c"], [("X", [1, 2, 3]), ("Y", [4, 5, 6])]
+    want = "Chart: bar@||X|Y|@|---|---|---|@|a|1|4|@|b|2|5|@|c|3|6|@".replace("@", "\n")
+    for by_rows in (False, True):
+        out, ctx = graph_blocks(msgraph_object(cats, series, by_rows=by_rows))
+        assert render(out, ctx) == want, (by_rows, render(out, ctx))
+        assert not ctx.skipped, ctx.skipped
+
+
+def test_graph_codepage_labels():
+    cats, series = ["한글", "둘"], [("이름", [1, 2])]
+    want = "Chart: bar@||이름|@|---|---|@|한글|1|@|둘|2|@".replace("@", "\n")
+    out, ctx = graph_blocks(msgraph_object(cats, series, codepage=949))
+    assert render(out, ctx) == want, render(out, ctx)
+    assert not ctx.skipped, ctx.skipped
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
