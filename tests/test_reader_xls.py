@@ -280,6 +280,18 @@ def test_image_budget():
     assert len(assets) == 1 and "(could not read: 1 image)" in text, (assets, text)
 
 
+def test_placement_cap_per_workbook():
+    two = dg(oa_shape(1025, 1, anchor(0)), oa_shape(1026, 1, anchor(1)))
+    sheets = [{"name": "One", "drawing": two}, {"name": "Two", "drawing": two}]
+    old = xls_drawing.MAX_PLACEMENTS
+    xls_drawing.MAX_PLACEMENTS = 3  # each sheet is under it alone, the two together are not
+    try:
+        text, meta, assets = pics(sheets, drawing=dgg(PNG_A))
+    finally:
+        xls_drawing.MAX_PLACEMENTS = old
+    assert text.count("![](assets/") == 3 and "(could not read: 1 image)" in text, text
+
+
 def test_drawing_continue_joined():
     body = dg(oa_shape(1025, 1, anchor(0)))
     sheet = {"name": "S", "cells": {(0, 0): "cell"}, "drawing": body, "drawing_split": len(body) - 20}

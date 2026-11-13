@@ -52,7 +52,7 @@ class Workbook:
         self._blocks: dict[int, list] = {}
         self._fmt: dict[int, str] = {}
         self.flate = flate.Budget()  # one inflate budget and one image byte count for the whole document's pictures
-        self.spent = [0]
+        self.spent = [0, 0]  # image bytes placed, picture placements read
 
     # ---- sheets
     def sections(self) -> list:

@@ -7,7 +7,7 @@ and OBJ records between them. Each shape with a pib is one placement of that BSt
 ordered by its anchor's first cell (row1, then col1; an OfficeArtClientAnchorSheet is flags u16, col1 u16, dx1 u16,
 row1 u16, ...), the unanchored ones after, in record order. A placement is counted under `image` when its pib is
 outside the BStore, its BLIP cannot be read or is not a kind Assets keeps, past IMAGE_BYTES placed (copies counted),
-and past MAX_PLACEMENTS in a sheet.
+and past MAX_PLACEMENTS in the workbook.
 """
 import struct
 
@@ -17,13 +17,14 @@ from ..images import sniff
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import Image
 
-MAX_PLACEMENTS = 10_000  # pictures one sheet places
+MAX_PLACEMENTS = 10_000  # pictures one workbook places, all its sheets together
 _UNANCHORED = (1 << 32, 0)
 
 
 def pictures(g, drawing: bytes, budget: flate.Budget, spent: list, ctx) -> list:
     """The pictures of one sheet: `drawing` is its MSODRAWING bodies joined, `g` the globals whose `drawing` holds the
-    BStore, `budget` the document's flate budget and `spent[0]` the image bytes placed so far in the document."""
+    BStore, `budget` the document's flate budget and `spent[0]` the image bytes placed so far in the
+    document and `spent[1]` the placements read so far in it (the workbook's cap, MAX_PLACEMENTS)."""
     shapes = officeart.Shapes()
     shapes.add(drawing, 0, len(drawing))
     if shapes.deep:
@@ -31,9 +32,11 @@ def pictures(g, drawing: bytes, budget: flate.Budget, spent: list, ctx) -> list:
     if shapes.cut:
         ctx.skipped["record"] += 1
     placed = list(shapes.pib.items())
-    if len(placed) > MAX_PLACEMENTS:
-        ctx.skipped["image"] += len(placed) - MAX_PLACEMENTS
-        placed = placed[:MAX_PLACEMENTS]
+    room = max(MAX_PLACEMENTS - spent[1], 0)
+    if len(placed) > room:
+        ctx.skipped["image"] += len(placed) - room
+        placed = placed[:room]
+    spent[1] += len(placed)
     placed.sort(key=lambda item: _position(drawing, shapes.anchors.get(item[0])))  # stable: record order within a cell
     store = officeart.bstore(g.drawing)
     blips: dict[int, bytes | None] = {}
