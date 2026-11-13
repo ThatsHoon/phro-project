@@ -8,17 +8,20 @@ notes masters and handouts are not read. A slide's text comes in shape order: an
 text block it names there, a ClientTextbox brings its own, and outline blocks nothing refers to follow. The shapes
 come in reading order from `ppt_shapes` (groups, tables and placeholders; date, number, footer and header placeholders
 are left out) and a title placeholder gives the slide its title. A slide that
-cannot be read is counted under `slide` and the others still come out. Every walk spends one budget of
+cannot be read is counted under `slide` and the others still come out. A picture shape becomes the Image of its pib
+(`ppt_pictures`: the BStore of the DocumentContainer's PPDrawingGroup, the BLIPs in the `Pictures` stream) at its
+place; one that cannot be placed is counted under `image`. Every walk spends one budget of
 `BIN_RECORDS` records, and the text emitted is capped at `MAX_OUTPUT` characters.
 """
 import struct
 
 from .. import officeart
+from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Section
 from . import ppt_records as rec
-from . import ppt_shapes
+from . import ppt_pictures, ppt_shapes
 from .ppt_shapes import Walk as _Walk
 from .ppt_shapes import text_blocks as _text_blocks
 from .ppt_shapes import texts as _texts
@@ -26,15 +29,27 @@ from .ppt_shapes import texts as _texts
 MAX_TITLE = 300
 _TITLES = (0, 6)
 _TITLE_SHAPE = -1  # the kind of a run in a title placeholder whose text atom says otherwise
+_PICTURE = -2      # the kind of a picture's run
 
 
 class Presentation:
-    def __init__(self, doc: bytes, current_user, ctx):
+    def __init__(self, doc: bytes, current_user, ctx, pictures: bytes | None = None):
         self.doc, self.ctx = doc, ctx
         self.persist = rec.Persist(doc, current_user, ctx)
         if self.persist.encrypted:
             raise ReadError("encrypted")
         self.walk = _Walk(ctx)
+        self.pictures = ppt_pictures.Pictures(doc, self._dgg(), pictures, flate.Budget(), ctx)
+
+    def _dgg(self):
+        """(start, end) of the DggContainer inside the DocumentContainer's PPDrawingGroup; None without one."""
+        span = self._container(self.persist.doc_ref, rec.DOCUMENT_CONTAINER)
+        if span is None:
+            return None
+        for _, _, typ, body, size in officeart.records(self.doc, *span):
+            if typ == rec.PP_DRAWING_GROUP:
+                return body, body + size
+        return None
 
     def _container(self, pid, typ):
         got = self.persist.obj(pid)
@@ -88,6 +103,11 @@ class Presentation:
             if ref is not None and ref < len(outline) and ref not in used:
                 used.add(ref)
                 runs.insert(0, outline[ref])
+            if shape.kind == "picture":
+                image = self.pictures.image(shape.pib)
+                if image is not None:
+                    out.append((_PICTURE, [image], ""))
+                continue
             if shape.placeholder in skip:
                 continue
             title = shape.placeholder in ppt_shapes.TITLES
@@ -131,7 +151,7 @@ class Presentation:
                 drawing = (body, body + sz)
         blocks = []
         for kind, bl, _ in self._drawn(drawing, [], ppt_shapes.SKIPPED | {5})[0]:
-            if kind == 2:
+            if kind in (2, _PICTURE):
                 blocks.extend(bl)
         return ref, blocks
 
@@ -168,9 +188,10 @@ def parse(path, ctx) -> Doc:
                 raise ReadError("damaged", "no PowerPoint Document stream")
             data = cf.read("PowerPoint Document")
             current = cf.read("Current User") if cf.exists("Current User") else None
+            pictures = cf.read("Pictures") if cf.exists("Pictures") else None
     except (KeyError, CfbError):
         raise ReadError("damaged", "PowerPoint Document stream") from None
-    secs = Presentation(data, current, ctx).sections()
+    secs = Presentation(data, current, ctx, pictures).sections()
     if not secs:
         raise ReadError("damaged", "no readable slides")
     return Doc(blocks=secs)

@@ -1306,14 +1306,15 @@ def ppt_shape(spec, ids, *, inside=False):
     holding the next spid. See make_ppt for the keys."""
     import struct
     kind = spec.get("kind", "text")
-    if kind == "picture":
-        raise NotImplementedError("picture shapes: added by Task 18")
     if kind == "object":
         raise NotImplementedError("object shapes: added by Task 20")
     spid = spec.get("spid", ids[0])
     ids[0] = max(ids[0], spid) + 1
     box = spec.get("box")
     anchor = ppt_anchor(box, child=inside and not spec.get("client"), wide=bool(spec.get("wide"))) if box else b""
+    if kind == "picture":
+        return oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75),
+                            oa_record(0xF00B, struct.pack("<HI", 0x4104, spec["pib"]), ver=3, inst=1), anchor)
     if kind == "group":
         flags = 0x201 | spec.get("flags", 0)
         head = oa_record(0xF00A, struct.pack("<II", spid, flags), ver=2)
@@ -1391,7 +1392,7 @@ def ppt_current_user(edit_offset, *, encrypted=False, name=b"user"):
 
 
 def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=(), objects=(), encrypt=None,
-             edits=1, raw_shapes=None):
+             edits=1, raw_shapes=None, no_pictures_stream=False):
     """Write a .ppt compound file with PowerPoint Document, Current User and Pictures streams.
 
     slides: dicts with title (str), body (list of str paragraphs, or (text, indent) bulleted ones), bold (substrings
@@ -1407,15 +1408,18 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     encrypt (any string): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist object and
     the UserEditAtom's encryptSessionPersistIdRef; the streams themselves are not encrypted.
     shapes: a list of dicts that replaces the slide's own text shapes in its PPDrawing (the SLWT is unchanged). A dict
-    is a text shape, or kind "group". Keys: kind ("text" by default, or "group"; "picture" raises NotImplementedError
-    for Task 18 and "object" for Task 20), spid, box ((left, top, right, bottom): a ClientAnchor at the top level, a
+    is a text shape, kind "group" or kind "picture" (keys pib, the 1-based BStore index, and box; no text); kind
+    "object" raises NotImplementedError for Task 20. Keys: kind ("text" by default), spid, box ((left, top, right, bottom): a ClientAnchor at the top level, a
     ChildAnchor inside a group, unless client is true; wide makes the ClientAnchor 16 bytes), text and text_kind (a
     text run of TextHeaderAtom type text_kind, 1 by default), placeholder (an OEPlaceholderAtom of that type in the
     ClientData), ref (an OutlineTextRefAtom index in the ClientData), link (the text carries an InteractiveInfo and a
     TextInteractiveInfoAtom). A group also has children (the shape dicts inside it), rect (its FSPGR rectangle, left,
     top, right, bottom), table (FOPT property 0x039F = 1) and flags (extra FSP flag bits, 0x40 flipH, 0x80 flipV).
     raw_shapes: {slide number from 1: OfficeArt record bytes} appended to that slide's DgContainer after its
-    SpgrContainer. pictures (Task 18) and objects (Task 20) raise NotImplementedError.
+    SpgrContainer. pictures: a list of BLIP records (blip_png, blip_bitmap, blip_metafile), written one after
+    another into the Pictures stream; the DocumentContainer gains a PPDrawingGroup (0x040B) whose DggContainer holds a
+    BStore with one FBSE per picture, its foDelay that BLIP's offset in Pictures. no_pictures_stream (true) leaves the
+    Pictures stream out of the compound file, the BStore as it is. objects (Task 20) raises NotImplementedError.
 
     Returns a dict: doc, master (persist ids), slides (persist ids in order), slide_ids, notes ({slide number:
     persist id}), crypt (persist id or None), offsets ({persist id: offset} as the newest edit sees them),
@@ -1423,8 +1427,6 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     offset in the newest directory naming it; patch it to move or break one object}), user_edits and directories (offsets in the PowerPoint Document
     stream, oldest first), doc_stream and current_user (the stream bytes)."""
     import struct
-    if pictures:
-        raise NotImplementedError("pictures: added by Task 18")
     if objects:
         raise NotImplementedError("objects: added by Task 20")
     raw_shapes = dict(raw_shapes or {})
@@ -1481,6 +1483,14 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         slwt.extend(outline)
     doc_parts = [oa_record(0x03E9, bytes(40), ver=1), slide_list(0, slwt),
                  slide_list(1, [ppt_slide_persist(pid_master, master_slide_id)])]
+    pic_stream, store = bytearray(), []
+    for blip in pictures:
+        store.append(oa_fbse(delay=len(pic_stream)))
+        pic_stream.extend(blip)
+    if pictures:
+        dgg = oa_container(0xF000, oa_record(0xF006, struct.pack("<4I", 1026, 2, 1, 1)),
+                           oa_container(0xF001, *store, inst=len(store)))
+        doc_parts.append(oa_container(0x040B, dgg))
     if notes:
         doc_parts.append(slide_list(2, [ppt_slide_persist(pid_notes[num], notes_slide_id[num]) for num in sorted(notes)]))
     stream, offsets = bytearray(), {}
@@ -1513,7 +1523,10 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         last = put(None, ppt_user_edit(last, directories[-1], pid_doc, seed, pid_crypt))
         user_edits.append(last)
     cu = ppt_current_user(last, encrypted=encrypt is not None)
-    make_cfb(path, {"PowerPoint Document": bytes(stream), "Current User": cu, "Pictures": b""})
+    streams = {"PowerPoint Document": bytes(stream), "Current User": cu}
+    if not no_pictures_stream:
+        streams["Pictures"] = bytes(pic_stream)
+    make_cfb(path, streams)
     return {"doc": pid_doc, "master": pid_master, "slides": pid_slides, "slide_ids": slide_ids, "notes": pid_notes,
             "crypt": pid_crypt, "offsets": offsets, "slide1_offsets": (first_slide, offsets.get(pid_slides[0])),
             "slots": slots, "user_edits": user_edits, "directories": directories, "doc_stream": bytes(stream), "current_user": cu}

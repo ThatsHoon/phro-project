@@ -169,7 +169,7 @@ def test_hyperlink_keeps_text_only():
 
 
 def test_unbuilt_kinds_named():
-    for kind, task in (("picture", "Task 18"), ("object", "Task 20")):
+    for kind, task in (("object", "Task 20"),):
         try:
             md([{"shapes": [{"kind": kind}]}])
         except NotImplementedError as e:
