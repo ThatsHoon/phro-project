@@ -11,6 +11,7 @@ ids show `yyyy-mm-dd`, and the currency ids show no currency sign.
 """
 import math
 import re
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
 
@@ -89,6 +90,8 @@ def _display(value, code: str, date1904: bool) -> str:
     if "dt" in kinds or "ampm" in kinds or "elapsed" in kinds:
         shown = _datetime(v, section, date1904)
         return _general(v) if shown is None else shown
+    section = [("lit", "a" * t[1] if t[0] == "wd" else t[1]) if t[0] in ("yr", "era", "wd") else t
+               for t in section if t[0] != "locale"]
     return _render(abs(v), section, minus, v)
 
 
@@ -178,8 +181,10 @@ def _sections(code: str):
 
 def _bracket(body: str):
     if body.startswith("$"):
-        text = body[1:].partition("-")[0]
-        return ("lit", text) if text else None
+        text, _, locale = body[1:].partition("-")
+        if text:
+            return ("lit", text)
+        return ("locale", locale.strip().lower()) if locale else None
     m = _COND.fullmatch(body.strip())
     if m:
         return ("cond", m.group(1), float(m.group(2)))
@@ -230,9 +235,21 @@ def _tokenize(sec: str):
         elif c in "Aa" and sec[i:i + 3].lower() == "a/p":
             out.append(("ampm", sec[i:i + 3]))
             i += 3
+        elif c in "Aa" and sec[i:i + 3].lower() == "aaa":
+            j = i
+            while j < n and sec[j] in "Aa":
+                j += 1
+            out.append(("wd", j - i))
+            i = j
         elif c in "Ee" and sec[i + 1:i + 2] in ("+", "-"):
             out.append(("exp", sec[i:i + 2]))
             i += 2
+        elif c in "Ee":
+            out.append(("yr", c))
+            i += 1
+        elif c in "Gg":
+            out.append(("era", c))
+            i += 1
         elif c in "ydhmsYDHMS":
             out.append(("dt", c))
             i += 1
@@ -271,9 +288,143 @@ def _holds(op: str, v: float, bound: float) -> bool:
             "=": v == bound, "<>": v != bound}[op]
 
 
+# ---- dates and times (dochan :459-640 for the 1900 bug, rounding and elapsed forms)
+
+_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+           "October", "November", "December")
+_DAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+_KO_DAYS = "일월화수목금토"
+_MAX_SERIAL = 2958466  # 10000-01-01 in the 1900 system
+
+
+def _items(section):
+    """Date tokens as lists: ('unit', letter, count), ('elapsed', letter, width), ('ampm', text),
+    ('wd', count), ('yr',), ('sub', digits), ('text', str); plus the locale id of the section."""
+    items, locale, i, n = [], "", 0, len(section)
+    while i < n:
+        t = section[i]
+        k = t[0]
+        last = items[-1] if items else None
+        if k == "dt":
+            letter = t[1].lower()
+            if last and last[0] == "unit" and last[1] == letter:
+                last[2] += 1
+            else:
+                items.append(["unit", letter, 1])
+        elif k == "elapsed":
+            items.append(["elapsed", t[1][0], len(t[1])])
+        elif k == "ampm":
+            items.append(["ampm", t[1]])
+        elif k == "wd":
+            items.append(["wd", t[1]])
+        elif k == "yr":
+            if not (last and last[0] == "yr"):
+                items.append(["yr"])
+        elif k == "locale":
+            locale = t[1]
+        elif k == "dot" and last and last[0] in ("unit", "elapsed") and last[1] == "s" \
+                and i + 1 < n and section[i + 1] == ("ph", "0"):
+            j = i + 1
+            while j < n and section[j] == ("ph", "0"):
+                j += 1
+            items.append(["sub", min(j - i - 1, 3)])
+            i = j
+            continue
+        elif k in ("lit", "digit", "dot", "comma", "slash", "pct", "ph", "exp"):
+            items.append(["text", t[1]])
+        i += 1
+    return items, locale
+
+
+def _ymd(day: int, date1904: bool):
+    """(year, month, day, weekday index from Sunday) of a serial; the 1900 system keeps Excel's phantom 02-29."""
+    if date1904:
+        d = date(1904, 1, 1) + timedelta(days=day)
+        return d.year, d.month, d.day, (d.weekday() + 1) % 7
+    weekday = (day - 1) % 7
+    if day == 0:
+        return 1900, 1, 0, weekday
+    if day == 60:
+        return 1900, 2, 29, weekday
+    d = (date(1899, 12, 31) if day < 60 else date(1899, 12, 30)) + timedelta(days=day)
+    return d.year, d.month, d.day, weekday
+
+
 def _datetime(v: float, section, date1904: bool):
     """The date and time branch: the text for a section that holds date or time tokens, or None for General."""
-    return None
+    if v < 0 or v >= _MAX_SERIAL:
+        return None
+    items, locale = _items(section)
+    units = [it for it in items if it[0] in ("unit", "elapsed")]
+    for idx, it in enumerate(units):  # m is a minute after an hour or before a second, else a month
+        if it[0] == "unit" and it[1] == "m" and it[2] <= 2:
+            if (idx > 0 and units[idx - 1][1] == "h") or (idx + 1 < len(units) and units[idx + 1][1] == "s"):
+                it[1] = "i"
+    precision = next((it[1] for it in items if it[0] == "sub"), 0)
+    elapsed = any(it[0] == "elapsed" for it in items)
+    has_time = elapsed or any(it[0] == "ampm" or (it[0] == "unit" and it[1] in "his") for it in items)
+    scale = 10 ** precision
+    if has_time:
+        seconds = Decimal(format(v * 86400, ".15g"))
+        with localcontext() as ctx:
+            ctx.prec = 60
+            ticks = int((seconds * scale).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+        day, rest = divmod(ticks, 86400 * scale)
+        total = ticks // scale
+        clock = rest // scale
+        sub = ticks % scale
+    else:
+        day, total, clock, sub = math.floor(v), 0, 0, 0
+    if day >= _MAX_SERIAL:
+        return None
+    secs = total if elapsed else clock
+    need_date = any(it[0] in ("wd", "yr") or (it[0] == "unit" and it[1] in "ymd") for it in items)
+    try:
+        year, month, dom, wday = _ymd(day, date1904) if need_date else (0, 0, 0, 0)
+    except OverflowError:
+        return None
+    hour24 = (secs // 3600) % 24
+    has_ampm = any(it[0] == "ampm" for it in items)
+    out = []
+    for it in items:
+        k = it[0]
+        if k == "text":
+            out.append(it[1])
+        elif k == "yr":
+            out.append(f"{year:04d}")
+        elif k == "wd":
+            out.append(_KO_DAYS[wday] if it[1] == 3 else _KO_DAYS[wday] + "요일")
+        elif k == "sub":
+            out.append("." + str(sub).zfill(precision) if precision else "")
+        elif k == "ampm":
+            pm = hour24 >= 12
+            text = it[1]
+            if locale == "412":
+                out.append("오후" if pm else "오전")
+            elif len(text) == 3:
+                out.append(("p" if pm else "a") if text.islower() else ("P" if pm else "A"))
+            else:
+                out.append("PM" if pm else "AM")
+        elif k == "elapsed":
+            size = {"h": 3600, "m": 60, "s": 1}[it[1]]
+            out.append(str(total // size).zfill(it[2]))
+        else:
+            letter, count = it[1], it[2]
+            if letter == "y":
+                out.append(f"{year % 100:02d}" if count <= 2 else f"{year:04d}")
+            elif letter == "m":
+                name = _MONTHS[month - 1] if month else ""
+                out.append(str(month).zfill(count) if count <= 2 else name[:3] if count == 3
+                           else name if count == 4 else name[:1])
+            elif letter == "d":
+                out.append(str(dom).zfill(count) if count <= 2 else _DAYS[wday][:3] if count == 3 else _DAYS[wday])
+            elif letter == "h":
+                out.append(str(hour24 % 12 or 12 if has_ampm else hour24).zfill(count))
+            elif letter == "i":
+                out.append(str((secs // 60) % 60).zfill(count))
+            else:
+                out.append(str(secs % 60).zfill(count))
+    return "".join(out)
 
 
 # ---- numbers (dochan :263-300), scientific (:670-782), fractions (:784-1040), literals (:1184-1225)

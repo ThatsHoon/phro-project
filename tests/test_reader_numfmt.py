@@ -114,8 +114,69 @@ def test_bad_code():
     assert display(1.5, "0" * 300) == "1.5"
 
 
-def test_date_code_falls_back_for_now():
-    assert display(1.5, "yyyy-mm-dd") == "1.5"
+def test_iso_and_builtin():
+    assert display(45000, "yyyy-mm-dd") == "2023-03-15"
+    assert display(45000, code_for(14, {})) == "2023-03-15"
+
+
+def test_month_names():
+    assert display(45000, "d-mmm-yy") == "15-Mar-23"
+    assert display(45000, "mmmm d, yyyy") == "March 15, 2023"
+
+
+def test_weekday():
+    assert display(45000, "dddd") == "Wednesday"
+    assert display(45000, "ddd") == "Wed"
+
+
+def test_korean_date_tokens():
+    assert display(45000.75, 'yyyy"년" m"월" d"일"') == "2023년 3월 15일"
+    assert display(45000, "yyyy-mm-dd(aaa)") == "2023-03-15(수)"
+    assert display(45000, "yyyy aaaa") == "2023 수요일"
+    assert display(45000.75, "[$-412]AM/PM h:mm") == "오후 6:00"
+
+
+def test_twelve_hour():
+    assert display(45000.75, "h:mm AM/PM") == "6:00 PM"
+    assert display(45000.25, "h:mm AM/PM") == "6:00 AM"
+    assert display(45000, "h:mm AM/PM") == "12:00 AM"
+    assert display(45000.75, "h:mm A/P") == "6:00 P"
+
+
+def test_minutes_vs_months():
+    assert display(0.5, "h:mm") == "12:00"
+    assert display(45000.5, "yyyy-mm-dd hh:mm:ss") == "2023-03-15 12:00:00"
+    assert display(0.5, "mm:ss") == "00:00"
+    assert display(0.50069444, "mm:ss.0") == "01:00.0"
+
+
+def test_elapsed():
+    assert display(1.5, "[h]:mm") == "36:00"
+    assert display(1.5, "[h]:mm:ss") == "36:00:00"
+    assert display(0.5, "[m]") == "720"
+
+
+def test_leap_bug_and_1904():
+    assert display(60, "yyyy-mm-dd") == "1900-02-29"
+    assert display(59, "yyyy-mm-dd") == "1900-02-28"
+    assert display(61, "yyyy-mm-dd") == "1900-03-01"
+    assert display(0, "yyyy-mm-dd", date1904=True) == "1904-01-01"
+
+
+def test_second_rounding():
+    assert display(0.99999999, "h:mm:ss") == "0:00:00"
+    assert display(0.5000058, "h:mm:ss.00") == "12:00:00.50"
+
+
+def test_out_of_range():
+    assert display(-1, "yyyy-mm-dd") == "-1"
+    assert display(2958466, "yyyy-mm-dd") == "2958466"
+    assert display(2958465, "yyyy-mm-dd") == "9999-12-31"
+    assert display(2958465, "yyyy-mm-dd", date1904=True) == "2958465"
+
+
+def test_numeric_letters_unchanged():
+    assert display(5, '0 "e"') == "5 e"
 
 
 def test_code_for():
