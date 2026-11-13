@@ -744,3 +744,154 @@ def rc4_header(password, *, cryptoapi=True, key_bits=128, salt=bytes(range(16)))
     base = hashlib.md5((h0 + salt) * 16).digest()[:5]
     enc = rc4(hashlib.md5(base + bytes(4)).digest(), verifier + hashlib.md5(verifier).digest())
     return struct.pack("<HH", 1, 1) + salt + enc
+
+
+def biff(rid, body=b""):
+    """One BIFF record: id, size, body."""
+    import struct
+    return struct.pack("<HH", rid, len(body)) + body
+
+
+def _xl_string(text, short=False):
+    import struct
+    wide = any(ord(ch) > 255 for ch in text)
+    raw = text.encode("utf-16-le" if wide else "latin-1")
+    return struct.pack("<B" if short else "<H", len(text)) + bytes([1 if wide else 0]) + raw
+
+
+def _biff_sst(strings, split):
+    """The SST record and its CONTINUEs; with `split` each body holds at most that many bytes and a string cut
+    by a boundary restarts with a flags byte, as BIFF8 writes it."""
+    import struct
+    head = struct.pack("<II", len(strings), len(strings))
+    if not split:
+        return biff(0x00FC, head + b"".join(_xl_string(s) for s in strings))
+    assert split >= 12
+    bodies, cur = [], bytearray(head)
+    for s in strings:
+        wide = any(ord(ch) > 255 for ch in s)
+        unit = 2 if wide else 1
+        raw = s.encode("utf-16-le" if wide else "latin-1")
+        if len(cur) + 3 + (unit if raw else 0) > split:
+            bodies.append(bytes(cur))
+            cur = bytearray()
+        cur += struct.pack("<HB", len(s), 1 if wide else 0)
+        while raw:
+            take = min(len(raw) // unit, (split - len(cur)) // unit) * unit
+            cur += raw[:take]
+            raw = raw[take:]
+            if raw:
+                bodies.append(bytes(cur))
+                cur = bytearray([1 if wide else 0])
+    bodies.append(bytes(cur))
+    return biff(0x00FC, bodies[0]) + b"".join(biff(0x003C, b) for b in bodies[1:])
+
+
+def _biff_cell(r, c, v, sst, fmt_xf):
+    import struct
+    pre = struct.pack("<HHH", r, c, 15)
+    if isinstance(v, tuple) and v[0] == "fmt":
+        return biff(0x0203, struct.pack("<HHH", r, c, fmt_xf[v[2]]) + struct.pack("<d", v[1]))
+    if isinstance(v, tuple) and v[0] == "err":
+        return biff(0x0205, pre + bytes([v[1], 1]))
+    if isinstance(v, tuple) and v[0] == "f":
+        cached, extra = v[1], b""
+        if isinstance(cached, tuple):
+            res = bytes([2, 0, cached[1], 0, 0, 0, 0xFF, 0xFF])
+        elif isinstance(cached, bool):
+            res = bytes([1, 0, int(cached), 0, 0, 0, 0xFF, 0xFF])
+        elif isinstance(cached, str):
+            res, extra = bytes([0, 0, 0, 0, 0, 0, 0xFF, 0xFF]), biff(0x0207, _xl_string(cached))
+        else:
+            res = struct.pack("<d", float(cached))
+        return biff(0x0006, pre + res + struct.pack("<HIH", 0, 0, 0)) + extra
+    if isinstance(v, bool):
+        return biff(0x0205, pre + bytes([int(v), 0]))
+    if isinstance(v, str):
+        return biff(0x00FD, pre + struct.pack("<I", sst[v]))
+    if isinstance(v, int) and -(1 << 29) <= v < (1 << 29):
+        return biff(0x027E, pre + struct.pack("<I", ((v << 2) & 0xFFFFFFFF) | 2))
+    return biff(0x0203, pre + struct.pack("<d", float(v)))
+
+
+def _biff_sheet(sh, sst, fmt_xf):
+    """One worksheet (or chart, macro, VBA) substream. Merges are (first row, first col, last row, last col)."""
+    import struct
+    if "raw" in sh:
+        return sh["raw"]
+    kind = sh.get("kind", 0)
+    dt = {0: 0x0010, 1: 0x0040, 2: 0x0020, 6: 0x0006}.get(kind, 0x0010)
+    out = [biff(0x0809, struct.pack("<HHHHII", 0x0600, dt, 0x0DBB, 0x07CC, 0, 6))]
+    cells = dict(sorted(sh.get("cells", {}).items()))
+    hidden_rows, hidden_cols = set(sh.get("hidden_rows", ())), sorted(set(sh.get("hidden_cols", ())))
+    rows = sorted({r for r, _ in cells} | hidden_rows)
+    if kind == 0:
+        top = max((r for r, _ in cells), default=-1) + 1
+        wide = max((c for _, c in cells), default=-1) + 1
+        out.append(biff(0x0200, struct.pack("<IIHHH", 0, top, 0, wide, 0)))
+        out += [biff(0x007D, struct.pack("<HHHHHH", c, c, 2560, 15, 1, 0)) for c in hidden_cols]
+        for r in rows:
+            out.append(biff(0x0208, struct.pack("<HHHHHHHH", r, 0, 0, 255, 0, 0, 0x20 if r in hidden_rows else 0, 15)))
+        out += [_biff_cell(r, c, v, sst, fmt_xf) for (r, c), v in cells.items()]
+        merges = list(sh.get("merges", ()))
+        for i in range(0, len(merges), 1000):
+            part = merges[i:i + 1000]
+            out.append(biff(0x00E5, struct.pack("<H", len(part))
+                            + b"".join(struct.pack("<HHHH", m[0], m[2], m[1], m[3]) for m in part)))
+    for extra in sh.get("records", ()):
+        out.append(extra if isinstance(extra, bytes) else biff(*extra))
+    out.append(biff(0x000A))
+    return b"".join(out)
+
+
+def biff_workbook(sheets, *, formats=None, date1904=False, active=0, filepass=None, sst_split=None,
+                  globals_extra=b""):
+    """A BIFF8 Workbook stream: globals, then one substream per sheet dict.
+
+    A sheet dict: name, state (0 visible, 1 hidden, 2 very hidden), kind (0 sheet, 1 macro, 2 chart, 6 VBA);
+    cells {(row, col): value} with str (LABELSST), float (NUMBER), int (RK), bool (BOOLERR), ("err", code),
+    ("f", cached) (FORMULA, plus STRING for text) and ("fmt", number, code) (NUMBER in a cell XF of that format);
+    merges [(r1, c1, r2, c2)], hidden_rows, hidden_cols, records (raw records before EOF: framed bytes or
+    (id, body)) and raw (the whole substream). Cell XFs start at index 16, one per format code the cells use, in
+    order of first use; every other cell uses XF 15.
+    """
+    import struct
+    formats = dict(formats or {})
+    strings = list(dict.fromkeys(v for sh in sheets for v in sh.get("cells", {}).values() if isinstance(v, str)))
+    sst = {s: i for i, s in enumerate(strings)}
+    codes = list(dict.fromkeys(v[2] for sh in sheets for v in sh.get("cells", {}).values()
+                               if isinstance(v, tuple) and v[0] == "fmt"))
+    by_code = {code: fid for fid, code in formats.items()}
+    for code in codes:
+        if code not in by_code:
+            by_code[code] = max([163, *formats]) + 1
+            formats[by_code[code]] = code
+    fmt_xf = {code: 16 + i for i, code in enumerate(codes)}
+    head = [biff(0x0809, struct.pack("<HHHHII", 0x0600, 0x0005, 0x0DBB, 0x07CC, 0, 6))]
+    if filepass is not None:
+        head.append(biff(0x002F, filepass))
+    head.append(biff(0x0042, struct.pack("<H", 1200)))
+    head.append(biff(0x0022, struct.pack("<H", int(date1904))))
+    head.append(biff(0x003D, struct.pack("<9H", 0, 0, 0x4000, 0x2000, 0x38, active, 0, 1, 600)))
+    head += [biff(0x041E, struct.pack("<H", fid) + _xl_string(code)) for fid, code in formats.items()]
+    xf = struct.pack("<HHH", 0, 0, 0xFFF5) + bytes(14)
+    head += [biff(0x00E0, xf)] * 16
+    head += [biff(0x00E0, struct.pack("<HHH", 0, by_code[code], 1) + bytes(14)) for code in codes]
+    head.append(_biff_sst(strings, sst_split))
+    names = [biff(0x0085, struct.pack("<IBB", 0, sh.get("state", 0), sh.get("kind", 0))
+                  + _xl_string(sh["name"], short=True)) for sh in sheets]
+    tail = biff(0x000A)
+    base = sum(map(len, head)) + sum(map(len, names)) + len(globals_extra) + len(tail)
+    subs = [_biff_sheet(sh, sst, fmt_xf) for sh in sheets]
+    pos, bounds = base, []
+    for n, sub in zip(names, subs):
+        bounds.append(n[:4] + struct.pack("<I", pos) + n[8:])
+        pos += len(sub)
+    return b"".join(head) + b"".join(bounds) + globals_extra + tail + b"".join(subs)
+
+
+def make_xls(path, sheets, **kw):
+    """Write a compound file whose Workbook stream is biff_workbook(sheets, **kw); returns that stream."""
+    data = biff_workbook(sheets, **kw)
+    make_cfb(path, {"Workbook": data})
+    return data
