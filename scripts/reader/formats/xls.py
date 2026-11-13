@@ -12,12 +12,12 @@ import copy
 import struct
 
 from .. import limits
-from ..containers.cfb import CfbError, Compound, is_cfb
+from ..containers.cfb import CfbError, Compound
 from ..containers import flate
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import display
-from . import biff, sheet_grid, xls_crypt, xls_drawing
+from . import biff, sheet_grid, xls_alike, xls_crypt, xls_drawing
 
 _ROW, _COLINFO, _MERGED = 0x0208, 0x007D, 0x00E5
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
@@ -226,8 +226,15 @@ def _hide(blocks: list) -> list:
 
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
-        head = f.read(16)
-    if not is_cfb(head):  # other heads are read by a later task
+        head = f.read(xls_alike.HEAD)
+    what = xls_alike.kind(head)
+    if what == "html":
+        return xls_alike.parse_html(path, ctx)
+    if what == "text":
+        return xls_alike.parse_text(path, ctx)
+    if what == "zip":
+        raise ReadError("unsupported", "xlsx workbook saved as .xls")
+    if what != "cfb":
         raise ReadError("damaged", "not an Excel workbook")
     try:
         with Compound(path) as cf:
