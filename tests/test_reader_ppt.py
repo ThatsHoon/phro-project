@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader import markdown  # noqa: E402
+from reader.formats import ppt_text  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
 from reader_fix import make_cfb, make_ppt  # noqa: E402
@@ -57,12 +58,67 @@ def test_titles_and_body():
         assert "first line" in out and "second line" in out and "step one" in out, out
         assert out.index("Intro") < out.index("first line") < out.index("Plan") < out.index("step one"), out
         assert not ctx.skipped, ctx.skipped
+        for line in ("Intro", "Plan", "first line", "second line", "step one"):
+            assert out.count(line) == 1, (outline, line, out)
 
 
 def test_notes():
     out, _ = md([{"title": "Intro", "body": ["text"]}, {"title": "Plan"}], notes={1: "speak slowly"})
     assert "> Notes: speak slowly" in out, out
     assert out.index("> Notes") < out.index("## Slide 2"), out
+
+
+def test_notes_second_slide_only():
+    out, _ = md([{"title": "One"}, {"title": "Two"}], notes={2: "only here"})
+    assert out.count("only here") == 1 and out.index("## Slide 2") < out.index("only here"), out
+
+
+def prun(count, indent=0, mask=0, extra=b""):
+    return struct.pack("<IHI", count, indent, mask) + extra
+
+
+def crun(count, mask=0, extra=b""):
+    return struct.pack("<II", count, mask) + extra
+
+
+def texts(blocks):
+    return [(type(b).__name__, [type(i).__name__ + ":" + getattr(i, "text", "") for i in b.inlines]) for b in blocks]
+
+
+def test_control_char_keeps_bold_boundary():
+    # raw text a, control, b, c: the bold run covers the control character and b
+    style = prun(5) + crun(1) + crun(2, 1, struct.pack("<H", 1)) + crun(2)
+    got = ppt_text.blocks("a\x01bc", style, 1, Context())
+    assert texts(got) == [("Para", ["Text:a", "Bold:", "Text:c"])], texts(got)
+    assert got[0].inlines[1].inlines[0].text == "b", got
+
+
+def test_control_char_keeps_bullet_level():
+    # paragraph 1 is "a\x01" + "b" (4 chars with its end), paragraph 2 "cd" is bulleted at level 1
+    style = prun(4) + prun(3, 1, 1, struct.pack("<H", 1)) + crun(7)
+    got = ppt_text.blocks("a\x01b\rcd", style, 1, Context())
+    assert [type(b).__name__ for b in got] == ["Para", "ListItem"] and got[1].level == 1, got
+
+
+def test_zero_run_count_plain():
+    ctx = Context()
+    got = ppt_text.blocks("ab", prun(0) + crun(3), 1, ctx)
+    assert texts(got) == [("Para", ["Text:ab"])] and ctx.skipped["record"] == 1, (got, ctx.skipped)
+
+
+def test_too_many_runs_plain():
+    ctx = Context()
+    style = prun(1) * 100_001
+    got = ppt_text.blocks("a" * 100_002, style, 1, ctx)
+    assert len(got) == 1 and type(got[0]).__name__ == "Para" and ctx.skipped["record"] == 1, ctx.skipped
+
+
+def test_run_count_past_text_clamped():
+    ctx = Context()
+    style = prun(1000, 0, 1, struct.pack("<H", 1)) + crun(1000, 1, struct.pack("<H", 1))
+    got = ppt_text.blocks("abc", style, 1, ctx)
+    assert len(got) == 1 and type(got[0]).__name__ == "ListItem" and not ctx.skipped, (got, ctx.skipped)
+    assert type(got[0].inlines[0]).__name__ == "Bold" and got[0].inlines[0].inlines[0].text == "abc", got
 
 
 def test_hidden_slide():

@@ -4,7 +4,8 @@ The StyleTextPropAtom layout (paragraph runs: count u32, indent u16, mask u32 an
 character runs: count u32, mask u32 and the optional fields) follows dochan office_binary/ppt_styles.py and anydoc
 ppt/styletext.rs. Both kinds of run cover len(text) + 1 characters; counts past the text are clamped. A run list that
 cannot be read (a zero count, more than MAX_RUNS runs, a field past the atom) leaves the text plain and counts a
-`record`. Control characters other than the paragraph end (\r), the line break (\x0b) and the tab are dropped.
+`record`. The runs index the raw text; control characters are dropped from each piece afterwards, except the
+paragraph end, the line break and the tab.
 """
 import bisect
 import struct
@@ -103,6 +104,7 @@ def _inlines(text: str, lo: int, hi: int, bold: list) -> list:
         for k, piece in enumerate(text[at:stop].split("\x0b")):
             if k:
                 run.append(Break())
+            piece = piece.translate(_CONTROL)
             if piece:
                 run.append(Text(piece))
         if run:
@@ -117,7 +119,6 @@ def _inlines(text: str, lo: int, hi: int, bold: list) -> list:
 def blocks(text: str, style: bytes | None, kind: int, ctx=None) -> list:
     """Paragraphs and list items of one text atom. `kind` is the TextHeaderAtom type (kept for callers; the layout of
     the style runs does not depend on it)."""
-    text = text.translate(_CONTROL)
     starts, props, bold = [0], [(False, 0)], []
     if style is not None:
         try:
