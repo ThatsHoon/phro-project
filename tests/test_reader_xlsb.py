@@ -337,6 +337,14 @@ def test_grouped_pictures():
     assert not ctx.skipped, ctx.skipped
 
 
+def test_unreadable_chart_counted():
+    parts = with_drawing(anchor(0, chart_frame("rId9")), anchor(1, chart_frame("rId1")),
+                         rels=[("rId1", "chart", "../charts/missing.xml")])
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
+    assert "t" in out and "Chart:" not in out, out
+    assert "(could not read: 2 charts)" in out and ctx.skipped["chart"] == 2, (out, ctx.skipped)
+
+
 def test_chartsheet_chart():
     parts = with_drawing('<xdr:absoluteAnchor><xdr:pos x="0" y="0"/>' + chart_frame("rId1")
                          + "<xdr:clientData/></xdr:absoluteAnchor>",

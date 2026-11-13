@@ -380,6 +380,7 @@ class _Sheets:
     def chart(self, part: str, rid, out: list) -> None:
         tbl = ooxml_base.chart(self.pkg, part, rid, self.ctx)
         if tbl is None:
+            self.ctx.skipped["chart"] += 1
             return
         self.chart_cells += sum(len(r) for r in tbl.rows)
         if self.chart_cells > limits.CHART_TOTAL:
