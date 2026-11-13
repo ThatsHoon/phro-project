@@ -4,7 +4,8 @@ The container check, the BOUNDSHEET-ordered sheet walk, the ROW and COLINFO hidd
 (a string result comes from the STRING record after FORMULA, past any SHRFMLA, ARRAY or TABLE) were checked against
 dochan `office_binary/xls.py` and anydoc `sheet/xls.rs`. Cells go through `numfmt.display`; formulas are never shown.
 Every count from the file is bounded by the record it sits in: MULRK uses its own length, nested BOF and EOF pairs are
-skipped by depth, and BOUNDSHEET offsets are checked against the stream. A sheet that cannot be read is counted under
+skipped by depth, and BOUNDSHEET offsets are checked against the stream. A FILEPASS workbook is decrypted by `xls_crypt`
+when its default password verifies, else it is `encrypted`. A sheet that cannot be read is counted under
 `sheet` and the others still come out.
 """
 import copy
@@ -15,7 +16,7 @@ from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import display
-from . import biff, sheet_grid
+from . import biff, sheet_grid, xls_crypt
 
 _ROW, _COLINFO, _MERGED = 0x0208, 0x007D, 0x00E5
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
@@ -34,7 +35,17 @@ class Workbook:
         self.st = biff.Stream(data, ctx)
         self.g = biff.read_globals(self.st)
         if self.g.filepass is not None:
-            raise ReadError("encrypted")
+            # only the default password is tried; the clear stream keeps its FILEPASS record, so its id is blanked
+            clear = xls_crypt.decrypt(data, self.g.filepass)
+            if clear is None:
+                raise ReadError("encrypted")
+            patched = bytearray(clear)
+            patched[self.g.filepass[1] - 4:self.g.filepass[1] - 2] = b"\0\0"
+            self.data = data = bytes(patched)
+            self.st = biff.Stream(data, ctx)
+            self.g = biff.read_globals(self.st)
+            if self.g.filepass is not None:
+                raise ReadError("encrypted")
         self.cells: dict[int, dict] = {}
         self._blocks: dict[int, list] = {}
         self._fmt: dict[int, str] = {}

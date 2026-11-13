@@ -895,3 +895,58 @@ def make_xls(path, sheets, **kw):
     data = biff_workbook(sheets, **kw)
     make_cfb(path, {"Workbook": data})
     return data
+
+
+def encrypt_xls(sheets, password, kind, **kw):
+    """A Workbook stream encrypted with `password`: kind "xor", "rc4", "cryptoapi" (128-bit) or "cryptoapi40".
+
+    Built from biff_workbook(sheets, filepass=..., **kw). Everything up to and including FILEPASS stays clear, as do
+    every record header, the BOF/INTERFACEHDR-style records and the first 4 bytes of each BOUNDSHEET ([MS-XLS] 2.2.10).
+    XOR: per record body, rotate right by 3 and XOR with the array from index (record end offset) % 16.
+    RC4: the stream is encrypted in 1024-byte blocks, block key = key(offset // 1024).
+    """
+    import struct
+    from reader.containers import officecrypt
+    from reader.containers.crypto import rc4
+    from reader.formats import xls_crypt
+    clear = {0x0809, 0x0009, 0x0209, 0x0409, 0x002F, 0x0194, 0x0195, 0x00E1, 0x0196, 0x0138}
+    if kind == "xor":
+        key = xls_crypt.xor_key(password)
+        filepass = struct.pack("<HHH", 0, key, xls_crypt.xor_verifier(password))
+    else:
+        assert kind in ("rc4", "cryptoapi", "cryptoapi40"), kind
+        filepass = struct.pack("<H", 1) + rc4_header(password, cryptoapi=kind != "rc4",
+                                                    key_bits=40 if kind == "cryptoapi40" else 128)
+    data = biff_workbook(sheets, filepass=filepass, **kw)
+    recs, pos = [], 0
+    while pos + 4 <= len(data):
+        rid, size = struct.unpack_from("<HH", data, pos)
+        recs.append((rid, pos, pos + 4 + size))
+        pos += 4 + size
+    start = next(e for rid, _, e in recs if rid == 0x002F)
+    out = bytearray(data)
+    if kind == "xor":
+        arr = xls_crypt.xor_array(password, key)
+        rot_right = bytes(((v >> 3) | (v << 5)) & 0xFF for v in range(256))
+        for rid, p, e in recs:
+            if p < start or rid in clear or e == p + 4:
+                continue
+            n = e - p - 4
+            ks = (arr * (n // 16 + 2))[e % 16:e % 16 + n]
+            x = int.from_bytes(data[p + 4:e].translate(rot_right), "little") ^ int.from_bytes(ks, "little")
+            out[p + 4:e] = x.to_bytes(n, "little")
+    else:
+        keys = officecrypt.block_keys(officecrypt.parse_rc4(filepass, 2), password)
+        assert keys is not None
+        for b in range(start // 1024, (len(data) - 1) // 1024 + 1):
+            lo, hi = max(b * 1024, start), min((b + 1) * 1024, len(data))
+            out[lo:hi] = rc4(keys(b), data[lo:hi], skip=lo - b * 1024)
+        for rid, p, e in recs:
+            if p >= start:
+                out[p:p + 4] = data[p:p + 4]
+                if rid in clear:
+                    out[p + 4:e] = data[p + 4:e]
+    for rid, p, e in recs:
+        if p >= start and rid == 0x0085:
+            out[p + 4:p + 8] = data[p + 4:p + 8]
+    return bytes(out)
