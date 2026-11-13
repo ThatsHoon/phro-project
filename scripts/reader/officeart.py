@@ -182,11 +182,16 @@ def shape_pib(data, sp_off: int) -> int | None:
 
 
 def _fopt_pib(data, inst: int, body: int, size: int) -> int | None:
-    """The pib of the FOPT whose body is data[body:body + size]: inst properties of 6 bytes (opid u16, op u32), as
-    many as fit; a complex one (fComplex) is not a pib."""
+    """The pib of the FOPT whose body is data[body:body + size]; a complex one (fComplex) is not a pib."""
+    return fopt_property(data, inst, body, size, _PIB)
+
+
+def fopt_property(data, inst: int, body: int, size: int, prop: int) -> int | None:
+    """The value of property `prop` (opid & 0x3FFF) in the FOPT whose body is data[body:body + size]: inst properties
+    of 6 bytes (opid u16, op u32), as many as fit. The first one wins; None when it is absent or complex (fComplex)."""
     n = min(inst, size // 6)
     for opid, op in struct.iter_unpack("<HI", data[body:body + 6 * n]):
-        if opid & 0x3FFF == _PIB and not opid & 0x8000:
+        if opid & 0x3FFF == prop and not opid & 0x8000:
             return op
     return None
 

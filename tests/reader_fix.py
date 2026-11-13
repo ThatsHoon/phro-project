@@ -1282,11 +1282,65 @@ def ppt_outline_ref(spid, index):
                         oa_container(0xF011, oa_record(0x0F9E, struct.pack("<I", index))))
 
 
-def ppt_drawing(*shapes):
-    """A PPDrawing (0x040C) holding a DgContainer whose SpgrContainer holds the shapes, records already built."""
+def ppt_drawing(*shapes, raw=b""):
+    """A PPDrawing (0x040C) holding a DgContainer whose SpgrContainer holds the shapes, records already built; the
+    bytes `raw` follow the SpgrContainer inside the DgContainer."""
     import struct
     group = oa_group(1024, *shapes)
-    return oa_container(0x040C, oa_container(0xF002, oa_record(0xF008, struct.pack("<II", len(shapes), 1024)), group))
+    return oa_container(0x040C, oa_container(0xF002, oa_record(0xF008, struct.pack("<II", len(shapes), 1024)), group,
+                                             raw))
+
+
+def ppt_anchor(box, *, child=False, wide=False):
+    """An anchor record for `box` = (left, top, right, bottom): a ChildAnchor (0xF00F, four i32 left, top, right,
+    bottom) when `child`, else a ClientAnchor (0xF010, top, left, right, bottom as four i16, or i32 when `wide`)."""
+    import struct
+    left, top, right, bottom = box
+    if child:
+        return oa_record(0xF00F, struct.pack("<4i", left, top, right, bottom))
+    return oa_record(0xF010, struct.pack("<4i" if wide else "<4h", top, left, right, bottom))
+
+
+def ppt_shape(spec, ids, *, inside=False):
+    """The SpContainer (or, for a group, SpgrContainer) bytes of one make_ppt `shapes` dict; `ids` is a one-item list
+    holding the next spid. See make_ppt for the keys."""
+    import struct
+    kind = spec.get("kind", "text")
+    if kind == "picture":
+        raise NotImplementedError("picture shapes: added by Task 18")
+    if kind == "object":
+        raise NotImplementedError("object shapes: added by Task 20")
+    spid = spec.get("spid", ids[0])
+    ids[0] = max(ids[0], spid) + 1
+    box = spec.get("box")
+    anchor = ppt_anchor(box, child=inside and not spec.get("client"), wide=bool(spec.get("wide"))) if box else b""
+    if kind == "group":
+        flags = 0x201 | spec.get("flags", 0)
+        head = oa_record(0xF00A, struct.pack("<II", spid, flags), ver=2)
+        if spec.get("table"):
+            head += oa_record(0xF00B, struct.pack("<HI", 0x039F, 1), ver=3, inst=1)
+        if spec.get("rect"):
+            head += oa_record(0xF009, struct.pack("<4i", *spec["rect"]))
+        head += anchor
+        members = [ppt_shape(c, ids, inside=True) for c in spec.get("children", ())]
+        return oa_container(0xF003, oa_container(0xF004, head), *members)
+    out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=202)
+    out += anchor
+    data = b""
+    if spec.get("placeholder") is not None:
+        data += oa_record(0x0BC3, struct.pack("<IBBH", 0, spec["placeholder"], 0, 0))
+    if spec.get("ref") is not None:
+        data += oa_record(0x0F9E, struct.pack("<I", spec["ref"]))
+    if spec.get("link"):
+        data += oa_container(0x0FF2, oa_record(0x0FF3, bytes(16)))
+    if data:
+        out += oa_container(0xF011, data)
+    if spec.get("text") is not None:
+        text = ppt_text(spec.get("text_kind", 1), spec["text"])
+        if spec.get("link"):
+            text += oa_record(0x0FDF, struct.pack("<III", 0, len(spec["text"]), 0))
+        out += oa_container(0xF00D, text)
+    return oa_container(0xF004, out)
 
 
 def ppt_slide_persist(pid, slide_id, texts=0):
@@ -1344,14 +1398,24 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     given a bold character run in the slide's text), hidden (a SlideShowSlideInfoAtom with fHidden 0x0004 at +10),
     outline (the text sits in the SlideListWithText after the slide's SlidePersistAtom and the slide's shapes hold
     OutlineTextRefAtoms with the run's index in that list; otherwise a ClientTextbox in the slide's PPDrawing),
-    text_bytes (TextBytesAtom, Latin-1, instead of TextCharsAtom) and shapes (Task 17). Paragraphs are joined with \\r;
+    text_bytes (TextBytesAtom, Latin-1, instead of TextCharsAtom), extra (a list of (TextHeaderAtom type, text) runs
+    added to the SLWT after the body, when outline is true) and shapes (below). Paragraphs are joined with \\r;
     \\x0b stays as written. notes: {slide number from 1: text}, NotesContainers listed in SlideListWithText instance 2
     (SlidePersistAtom slideId = the slide's slideId + 0x1000, which the SlideAtom's notesIdRef carries; NotesAtom
     slideIdRef = the slide's slideId). master_text goes in the MainMaster. edits > 1 appends edits - 1 more
     PersistDirectoryAtom + UserEditAtom pairs chained through lastEdit; each remaps slide 1 to a fresh copy.
     encrypt (any string): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist object and
     the UserEditAtom's encryptSessionPersistIdRef; the streams themselves are not encrypted.
-    pictures (Task 18), objects (Task 20), raw_shapes and slide shapes (Task 17) raise NotImplementedError.
+    shapes: a list of dicts that replaces the slide's own text shapes in its PPDrawing (the SLWT is unchanged). A dict
+    is a text shape, or kind "group". Keys: kind ("text" by default, or "group"; "picture" raises NotImplementedError
+    for Task 18 and "object" for Task 20), spid, box ((left, top, right, bottom): a ClientAnchor at the top level, a
+    ChildAnchor inside a group, unless client is true; wide makes the ClientAnchor 16 bytes), text and text_kind (a
+    text run of TextHeaderAtom type text_kind, 1 by default), placeholder (an OEPlaceholderAtom of that type in the
+    ClientData), ref (an OutlineTextRefAtom index in the ClientData), link (the text carries an InteractiveInfo and a
+    TextInteractiveInfoAtom). A group also has children (the shape dicts inside it), rect (its FSPGR rectangle, left,
+    top, right, bottom), table (FOPT property 0x039F = 1) and flags (extra FSP flag bits, 0x40 flipH, 0x80 flipV).
+    raw_shapes: {slide number from 1: OfficeArt record bytes} appended to that slide's DgContainer after its
+    SpgrContainer. pictures (Task 18) and objects (Task 20) raise NotImplementedError.
 
     Returns a dict: doc, master (persist ids), slides (persist ids in order), slide_ids, notes ({slide number:
     persist id}), crypt (persist id or None), offsets ({persist id: offset} as the newest edit sees them),
@@ -1363,8 +1427,7 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         raise NotImplementedError("pictures: added by Task 18")
     if objects:
         raise NotImplementedError("objects: added by Task 20")
-    if raw_shapes or any(s.get("shapes") for s in slides):
-        raise NotImplementedError("shapes and raw_shapes: added by Task 17")
+    raw_shapes = dict(raw_shapes or {})
     notes = dict(notes or {})
     n = len(slides)
     pid_doc, pid_master = 1, 2
@@ -1386,6 +1449,8 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
             texts = [b if isinstance(b, str) else b[0] for b in body]
             indents = [None if isinstance(b, str) else b[1] for b in body]
             out.append(ppt_text(1, "\r".join(texts), indents=indents, bold=bold, as_bytes=as_bytes))
+        if slide.get("outline"):
+            out.extend(ppt_text(kind, text) for kind, text in slide.get("extra", ()))
         return out
 
     def slide_record(k):
@@ -1393,11 +1458,14 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         parts = [ppt_slide_atom(master_slide_id, notes_slide_id.get(k + 1, 0))]
         if slide.get("hidden"):
             parts.append(oa_record(0x03F9, struct.pack("<iIBBHB3x", 0, 0, 0, 0, 0x0004, 0)))
-        if slide.get("outline"):
+        if slide.get("shapes"):
+            ids = [1025]
+            shapes = [ppt_shape(spec, ids) for spec in slide["shapes"]]
+        elif slide.get("outline"):
             shapes = [ppt_outline_ref(1025 + i, i) for i in range(len(runs(slide)))]
         else:
             shapes = [ppt_textbox(1025 + i, rec) for i, rec in enumerate(runs(slide))]
-        return oa_container(0x03EE, *parts, ppt_drawing(*shapes))
+        return oa_container(0x03EE, *parts, ppt_drawing(*shapes, raw=raw_shapes.get(k + 1, b"")))
 
     def notes_record(num):
         return oa_container(0x03F0, oa_record(0x03F1, struct.pack("<IHH", slide_ids[num - 1], 0, 0)),

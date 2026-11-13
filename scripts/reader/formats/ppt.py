@@ -5,89 +5,27 @@ slideIdRef, the SlideShowSlideInfoAtom hidden flag and the text atoms (TextHeade
 StyleTextPropAtom) were checked against dochan `office_binary/ppt.py`, `ppt_structure.py` and `ppt_text.py` and anydoc
 `formats/ppt/mod.rs`. Slides are found through the persist chain of `ppt_records`, never by scanning the stream; masters,
 notes masters and handouts are not read. A slide's text comes in shape order: an OutlineTextRefAtom puts the outline
-text block it names there, a ClientTextbox brings its own, and outline blocks nothing refers to follow. A slide that
+text block it names there, a ClientTextbox brings its own, and outline blocks nothing refers to follow. The shapes
+come in reading order from `ppt_shapes` (groups, tables and placeholders; date, number, footer and header placeholders
+are left out) and a title placeholder gives the slide its title. A slide that
 cannot be read is counted under `slide` and the others still come out. Every walk spends one budget of
 `BIN_RECORDS` records, and the text emitted is capped at `MAX_OUTPUT` characters.
 """
 import struct
 
-from .. import limits, officeart
+from .. import officeart
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Section
 from . import ppt_records as rec
-from . import ppt_text
+from . import ppt_shapes
+from .ppt_shapes import Walk as _Walk
+from .ppt_shapes import text_blocks as _text_blocks
+from .ppt_shapes import texts as _texts
 
 MAX_TITLE = 300
 _TITLES = (0, 6)
-
-
-class _Walk:
-    """Shared budgets of one presentation: records walked, and text characters emitted."""
-
-    def __init__(self, ctx):
-        self.ctx = ctx
-        self.records = limits.BIN_RECORDS
-        self.chars = limits.MAX_OUTPUT
-
-    def spend(self) -> bool:
-        self.records -= 1
-        if self.records < 0:
-            if self.records == -1:
-                self.ctx.skipped["record"] += 1
-            return False
-        return True
-
-
-def _decode(data, start, size, typ) -> str:
-    raw = bytes(data[start:start + size])
-    if typ == rec.TEXT_CHARS_ATOM:
-        return raw[:len(raw) // 2 * 2].decode("utf-16-le", "replace")
-    return raw.decode("latin-1")
-
-
-def _texts(data, start, end, walk):
-    """The text in data[start:end] in document order, containers entered, as ["text", kind, text, style] and
-    ["ref", index] items."""
-    items = []
-    stack = [(officeart.records(data, start, end), 4, None)]
-    while stack:
-        it, kind, last = stack.pop()
-        for ver, inst, typ, body, size in it:
-            if not walk.spend():
-                return items
-            if typ == rec.TEXT_HEADER_ATOM and size >= 4:
-                kind = struct.unpack_from("<I", data, body)[0]
-            elif typ in (rec.TEXT_CHARS_ATOM, rec.TEXT_BYTES_ATOM):
-                last = ["text", kind, _decode(data, body, size, typ), None]
-                items.append(last)
-                kind = 4
-            elif typ == rec.STYLE_TEXT_PROP_ATOM and last is not None and last[3] is None:
-                last[3] = bytes(data[body:body + size])
-            elif typ == rec.OUTLINE_TEXT_REF_ATOM and size >= 4:
-                items.append(["ref", struct.unpack_from("<I", data, body)[0]])
-            elif ver == 0xF:
-                if len(stack) >= limits.MAX_DEPTH:
-                    walk.ctx.skipped["record"] += 1
-                    continue
-                stack.append((it, kind, last))
-                stack.append((officeart.records(data, body, body + size), 4, None))
-                break
-    return items
-
-
-def _text_blocks(items, walk):
-    """[(kind, blocks, plain text)] of the "text" items."""
-    out = []
-    for item in items:
-        if item[0] != "text":
-            continue
-        walk.chars -= len(item[2])
-        if walk.chars < 0:
-            raise ValueError("text budget")
-        blocks = ppt_text.blocks(item[2], item[3], item[1], walk.ctx)
-        out.append((item[1], blocks, " ".join(item[2].replace("\x0b", " ").replace("\r", " ").split())))
-    return out
+_TITLE_SHAPE = -1  # the kind of a run in a title placeholder whose text atom says otherwise
 
 
 class Presentation:
@@ -127,31 +65,54 @@ class Presentation:
             out[inst] = entries
         return out
 
+    def _drawn(self, span, outline, skip=ppt_shapes.SKIPPED):
+        """([(kind, blocks, plain text)] of a PPDrawing's shapes in reading order, the outline indexes they took).
+        A shape's OutlineTextRefAtom takes its outline block once; a skipped placeholder takes its block and drops it.
+        A drawing the shape walk finds nothing in is read as plain text atoms in record order."""
+        if span is None:
+            return [], set()
+        shapes = ppt_shapes.walk(self.doc, *span, self.ctx, self.walk)
+        out, used = [], set()
+        if not shapes:
+            for item in _texts(self.doc, *span, self.walk):
+                if item[0] == "ref":
+                    if item[1] < len(outline) and item[1] not in used:
+                        used.add(item[1])
+                        out.append(outline[item[1]])
+                else:
+                    out.extend(_text_blocks([item], self.walk))
+            return out, used
+        for shape in ppt_shapes.flatten(ppt_shapes.ordered(shapes)):
+            ref = shape.text_ref
+            runs = list(shape.runs)
+            if ref is not None and ref < len(outline) and ref not in used:
+                used.add(ref)
+                runs.insert(0, outline[ref])
+            if shape.placeholder in skip:
+                continue
+            title = shape.placeholder in ppt_shapes.TITLES
+            out.extend((_TITLE_SHAPE if title and kind not in _TITLES else kind, blocks, plain)
+                       for kind, blocks, plain in runs)
+        return out, used
+
     def _slide(self, pid, number, outline_span):
         got = self.persist.obj(pid)
         if got is None or got[0] != rec.SLIDE_CONTAINER:
             raise ValueError("slide record")
         start, size = got[2], got[3]
         outline = _text_blocks(_texts(self.doc, *outline_span, self.walk), self.walk)
-        hidden, drawing = False, []
+        hidden, drawing = False, None
         for _, _, typ, body, sz in officeart.records(self.doc, start, start + size):
             if typ == rec.SLIDE_SHOW_SLIDE_INFO_ATOM and sz >= 12:
                 hidden = bool(struct.unpack_from("<H", self.doc, body + 10)[0] & 0x0004)
-            elif typ == rec.PP_DRAWING and not drawing:
-                drawing = _texts(self.doc, body, body + sz, self.walk)
-        ordered, used = [], set()
-        for item in drawing:
-            if item[0] == "ref":
-                if item[1] < len(outline) and item[1] not in used:
-                    used.add(item[1])
-                    ordered.append(outline[item[1]])
-            else:
-                ordered.extend(_text_blocks([item], self.walk))
+            elif typ == rec.PP_DRAWING and drawing is None:
+                drawing = (body, body + sz)
+        ordered, used = self._drawn(drawing, outline)
         ordered.extend(o for i, o in enumerate(outline) if i not in used)
         sec = Section("slide", number=number, hidden="hidden" if hidden else "")
         titled = False
         for kind, blocks, plain in ordered:
-            if not titled and kind in _TITLES and plain:
+            if not titled and (kind in _TITLES or kind == _TITLE_SHAPE) and plain:
                 sec.title, titled = plain[:MAX_TITLE], True
             else:
                 sec.blocks.extend(blocks)
@@ -162,14 +123,14 @@ class Presentation:
         span = self._container(pid, rec.NOTES_CONTAINER)
         if span is None:
             return None
-        ref, items = None, []
+        ref, drawing = None, None
         for _, _, typ, body, sz in officeart.records(self.doc, *span):
             if typ == rec.NOTES_ATOM and sz >= 4:
                 ref = struct.unpack_from("<I", self.doc, body)[0]
-            elif typ == rec.PP_DRAWING and not items:
-                items = _texts(self.doc, body, body + sz, self.walk)
+            elif typ == rec.PP_DRAWING and drawing is None:
+                drawing = (body, body + sz)
         blocks = []
-        for kind, bl, _ in _text_blocks(items, self.walk):
+        for kind, bl, _ in self._drawn(drawing, [], ppt_shapes.SKIPPED | {5})[0]:
             if kind == 2:
                 blocks.extend(bl)
         return ref, blocks
