@@ -1220,3 +1220,226 @@ def make_xlsb(path, sheets, *, formats=None, date1904=False, workbook_records=No
         else:
             members[name] = data
     make_zip(path, members, stored=())
+
+
+# ---- ppt ----
+
+def _ppt_chars(text, as_bytes):
+    """A TextCharsAtom (0x0FA0, UTF-16LE) or, when `as_bytes`, a TextBytesAtom (0x0FA8, Latin-1) of `text`."""
+    if as_bytes:
+        return oa_record(0x0FA8, text.encode("latin-1"))
+    return oa_record(0x0FA0, text.encode("utf-16-le"))
+
+
+def _ppt_style(text, indents, bold):
+    """A StyleTextPropAtom (0x0FA1) for `text`, split into paragraphs at \\r: one paragraph run each (count u32, indent
+    u16, mask u32; a bulleted paragraph, indents[i] not None, has mask 0x1 and a bulletFlags u16 of 1), then character
+    runs (count u32, mask u32, style u16 when the mask is set; bold is mask and style 0x1) over every occurrence of the
+    `bold` substrings. Each kind of run covers len(text) + 1 characters."""
+    import itertools
+    import struct
+    out = b""
+    for para, indent in zip(text.split("\r"), indents):
+        if indent is None:
+            out += struct.pack("<IHI", len(para) + 1, 0, 0)
+        else:
+            out += struct.pack("<IHIH", len(para) + 1, indent, 1, 1)
+    marks = [0] * (len(text) + 1)
+    for word in bold:
+        at = text.find(word) if word else -1
+        while at >= 0:
+            marks[at:at + len(word)] = [1] * len(word)
+            at = text.find(word, at + len(word))
+    for flag, run in itertools.groupby(marks):
+        size = len(list(run))
+        out += struct.pack("<IIH", size, 1, 1) if flag else struct.pack("<II", size, 0)
+    return oa_record(0x0FA1, out)
+
+
+def ppt_text(kind, text, *, indents=None, bold=(), as_bytes=False):
+    """The records of one text run: TextHeaderAtom (0x0F9F, kind 0 title, 1 body, 2 notes), the text atom and, when a
+    paragraph is bulleted (`indents` holds an indent level or None per \\r-separated paragraph) or a `bold` substring
+    occurs, a StyleTextPropAtom."""
+    import struct
+    out = oa_record(0x0F9F, struct.pack("<I", kind)) + _ppt_chars(text, as_bytes)
+    indents = list(indents) if indents is not None else [None] * (text.count("\r") + 1)
+    if any(i is not None for i in indents) or any(w and w in text for w in bold):
+        out += _ppt_style(text, indents, bold)
+    return out
+
+
+def ppt_textbox(spid, *children):
+    """An SpContainer holding a text-box FSP and a ClientTextbox (0xF00D) of the records `children`."""
+    import struct
+    return oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=202),
+                        oa_container(0xF00D, *children))
+
+
+def ppt_outline_ref(spid, index):
+    """An SpContainer whose ClientData (0xF011) holds an OutlineTextRefAtom (0x0F9E) for text run `index` of the slide."""
+    import struct
+    return oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=202),
+                        oa_container(0xF011, oa_record(0x0F9E, struct.pack("<I", index))))
+
+
+def ppt_drawing(*shapes):
+    """A PPDrawing (0x040C) holding a DgContainer whose SpgrContainer holds the shapes, records already built."""
+    import struct
+    group = oa_group(1024, *shapes)
+    return oa_container(0x040C, oa_container(0xF002, oa_record(0xF008, struct.pack("<II", len(shapes), 1024)), group))
+
+
+def ppt_slide_persist(pid, slide_id, texts=0):
+    """A SlidePersistAtom (0x03F3): persistIdRef at +0, flags, numberTexts at +8, slideId at +12, reserved."""
+    import struct
+    return oa_record(0x03F3, struct.pack("<IIiII", pid, 0, texts, slide_id, 0))
+
+
+def ppt_slide_atom(master_id, notes_id):
+    """A SlideAtom (0x03EF): geometry, 8 placeholder bytes, masterIdRef, notesIdRef, flags, unused."""
+    import struct
+    return oa_record(0x03EF, struct.pack("<I8sIIHH", 0, bytes(8), master_id, notes_id, 0x0007, 0), ver=2)
+
+
+def ppt_user_edit(last, directory, doc_ref, seed, crypt=None):
+    """A UserEditAtom (0x0FF5): body lastSlideIdRef, version/minor/major, lastEdit at 8, directory offset at 12,
+    docPersistIdRef at 16, persistIdSeed, lastView, unused; encryptSessionPersistIdRef at 28 when `crypt` is given."""
+    import struct
+    body = struct.pack("<IHBBIIIIHH", 0x100, 0, 0, 3, last, directory, doc_ref, seed, 1, 0)
+    return oa_record(0x0FF5, body + (struct.pack("<I", crypt) if crypt is not None else b""))
+
+
+def ppt_directory(entries):
+    """A PersistDirectoryAtom (0x1772) of {persist id: offset}: one run (id | count << 20, then count offsets) per
+    stretch of consecutive ids."""
+    import struct
+    out, ids, i = b"", sorted(entries), 0
+    while i < len(ids):
+        j = i
+        while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1 and j + 1 - i < 0xFFF:
+            j += 1
+        out += struct.pack("<I", ids[i] | (j - i + 1) << 20)
+        out += b"".join(struct.pack("<I", entries[p]) for p in ids[i:j + 1])
+        i = j + 1
+    return oa_record(0x1772, out)
+
+
+def ppt_current_user(edit_offset, *, encrypted=False, name=b"user"):
+    """A Current User stream: a CurrentUserAtom (0x0FF6) with size 20 at +8, headerToken at +12 (0xE391C05F, or
+    0xF3D1C4DF when encrypted), offsetToCurrentEdit at +16, lenUserName, docFileVersion 0x03F4, version 3.0, the
+    ANSI name and relVersion 8."""
+    import struct
+    body = struct.pack("<IIIHHBBH", 20, 0xF3D1C4DF if encrypted else 0xE391C05F, edit_offset, len(name), 0x03F4, 3, 0, 0)
+    return oa_record(0x0FF6, body + bytes(name) + struct.pack("<I", 8))
+
+
+def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=(), objects=(), encrypt=None,
+             edits=1, raw_shapes=None):
+    """Write a .ppt compound file with PowerPoint Document, Current User and Pictures streams.
+
+    slides: dicts with title (str), body (list of str paragraphs, or (text, indent) bulleted ones), bold (substrings
+    given a bold character run in the slide's text), hidden (a SlideShowSlideInfoAtom with fHidden 0x0004 at +10),
+    outline (the text sits in the SlideListWithText after the slide's SlidePersistAtom and the slide's shapes hold
+    OutlineTextRefAtoms with the run's index in that list; otherwise a ClientTextbox in the slide's PPDrawing),
+    text_bytes (TextBytesAtom, Latin-1, instead of TextCharsAtom) and shapes (Task 17). Paragraphs are joined with \\r;
+    \\x0b stays as written. notes: {slide number from 1: text}, NotesContainers listed in SlideListWithText instance 2
+    (SlidePersistAtom slideId = the slide's slideId + 0x1000, which the SlideAtom's notesIdRef carries; NotesAtom
+    slideIdRef = the slide's slideId). master_text goes in the MainMaster. edits > 1 appends edits - 1 more
+    PersistDirectoryAtom + UserEditAtom pairs chained through lastEdit; each remaps slide 1 to a fresh copy.
+    encrypt (any string): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist object and
+    the UserEditAtom's encryptSessionPersistIdRef; the streams themselves are not encrypted.
+    pictures (Task 18), objects (Task 20), raw_shapes and slide shapes (Task 17) raise NotImplementedError.
+
+    Returns a dict: doc, master (persist ids), slides (persist ids in order), slide_ids, notes ({slide number:
+    persist id}), crypt (persist id or None), offsets ({persist id: offset} as the newest edit sees them),
+    slide1_offsets ((first, last) offset of slide 1), user_edits and directories (offsets in the PowerPoint Document
+    stream, oldest first), doc_stream and current_user (the stream bytes)."""
+    import struct
+    if pictures:
+        raise NotImplementedError("pictures: added by Task 18")
+    if objects:
+        raise NotImplementedError("objects: added by Task 20")
+    if raw_shapes or any(s.get("shapes") for s in slides):
+        raise NotImplementedError("shapes and raw_shapes: added by Task 17")
+    notes = dict(notes or {})
+    n = len(slides)
+    pid_doc, pid_master = 1, 2
+    pid_slides = [3 + k for k in range(n)]
+    pid_notes = {num: 3 + n + i for i, num in enumerate(sorted(notes))}
+    pid_crypt = 3 + n + len(notes) if encrypt is not None else None
+    slide_ids = [256 + k for k in range(n)]
+    notes_slide_id = {num: slide_ids[num - 1] + 0x1000 for num in notes}
+    master_slide_id = 0x80000000
+
+    def runs(slide):
+        """The slide's text runs as record bytes: the title (kind 0), then the body (kind 1)."""
+        bold, as_bytes = slide.get("bold", ()), bool(slide.get("text_bytes"))
+        out = []
+        if slide.get("title"):
+            out.append(ppt_text(0, slide["title"], bold=bold, as_bytes=as_bytes))
+        body = slide.get("body") or []
+        if body:
+            texts = [b if isinstance(b, str) else b[0] for b in body]
+            indents = [None if isinstance(b, str) else b[1] for b in body]
+            out.append(ppt_text(1, "\r".join(texts), indents=indents, bold=bold, as_bytes=as_bytes))
+        return out
+
+    def slide_record(k):
+        slide = slides[k]
+        parts = [ppt_slide_atom(master_slide_id, notes_slide_id.get(k + 1, 0))]
+        if slide.get("hidden"):
+            parts.append(oa_record(0x03F9, struct.pack("<iIBBHB3x", 0, 0, 0, 0, 0x0004, 0)))
+        if slide.get("outline"):
+            shapes = [ppt_outline_ref(1025 + i, i) for i in range(len(runs(slide)))]
+        else:
+            shapes = [ppt_textbox(1025 + i, rec) for i, rec in enumerate(runs(slide))]
+        return oa_container(0x03EE, *parts, ppt_drawing(*shapes))
+
+    def notes_record(num):
+        return oa_container(0x03F0, oa_record(0x03F1, struct.pack("<IHH", slide_ids[num - 1], 0, 0)),
+                            ppt_drawing(ppt_textbox(1025, ppt_text(2, notes[num]))))
+
+    def slide_list(inst, atoms):
+        return oa_container(0x0FF0, *atoms, inst=inst)
+
+    slwt = []
+    for k in range(n):
+        outline = runs(slides[k]) if slides[k].get("outline") else []
+        slwt.append(ppt_slide_persist(pid_slides[k], slide_ids[k], len(outline)))
+        slwt.extend(outline)
+    doc_parts = [oa_record(0x03E9, bytes(40), ver=1), slide_list(0, slwt),
+                 slide_list(1, [ppt_slide_persist(pid_master, master_slide_id)])]
+    if notes:
+        doc_parts.append(slide_list(2, [ppt_slide_persist(pid_notes[num], notes_slide_id[num]) for num in sorted(notes)]))
+    stream, offsets = bytearray(), {}
+
+    def put(pid, record):
+        at = len(stream)
+        if pid is not None:
+            offsets[pid] = at
+        stream.extend(record)
+        return at
+
+    put(pid_doc, oa_container(0x03E8, *doc_parts))
+    put(pid_master, oa_container(0x03F8, ppt_slide_atom(0, 0), ppt_drawing(ppt_textbox(1025, ppt_text(0, master_text)))))
+    for k in range(n):
+        put(pid_slides[k], slide_record(k))
+    for num in sorted(notes):
+        put(pid_notes[num], notes_record(num))
+    if pid_crypt is not None:
+        put(pid_crypt, oa_container(0x2F14, oa_record(0x0001, bytes(8))))
+    first_slide = offsets.get(pid_slides[0]) if n else None
+    user_edits, directories, last = [], [], 0
+    seed = 3 + n + len(notes) + (pid_crypt is not None)
+    for e in range(max(edits, 1)):
+        changed = dict(offsets) if e == 0 else {}
+        if e and n:
+            offsets[pid_slides[0]] = changed[pid_slides[0]] = put(None, slide_record(0))
+        directories.append(put(None, ppt_directory(changed)))
+        last = put(None, ppt_user_edit(last, directories[-1], pid_doc, seed, pid_crypt))
+        user_edits.append(last)
+    cu = ppt_current_user(last, encrypted=encrypt is not None)
+    make_cfb(path, {"PowerPoint Document": bytes(stream), "Current User": cu, "Pictures": b""})
+    return {"doc": pid_doc, "master": pid_master, "slides": pid_slides, "slide_ids": slide_ids, "notes": pid_notes,
+            "crypt": pid_crypt, "offsets": offsets, "slide1_offsets": (first_slide, offsets.get(pid_slides[0])),
+            "user_edits": user_edits, "directories": directories, "doc_stream": bytes(stream), "current_user": cu}
