@@ -104,13 +104,13 @@ def test_doc_embedded_chart():
 
 
 def test_doc_text_order():
-    # the chart follows the paragraph its object is in, and the text after it stays after it
+    # the paragraph's text stays in order, the chart follows that paragraph, and the next paragraph follows the chart
     obj = object_streams(excel_object([CHART], b"Excel.Chart.8"))
-    text = "before " + dobj.EMBED + " after\r"
+    text = "before " + dobj.EMBED + " after\rnext\r"
     p = dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW)
     d, ctx = dobj.parse(p)
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
-    assert out.index("before") < out.index("Chart: bar") and out.index("after") > out.index("before"), out
+    assert out.index("before") < out.index("after") < out.index("Chart: bar") < out.index("next"), out
     assert "![" not in out and "could not read" not in out, out
 
 
