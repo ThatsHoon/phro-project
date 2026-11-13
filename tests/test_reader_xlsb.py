@@ -327,6 +327,16 @@ def test_alternate_anchor_places_one_image():
     assert out.count("assets/img-") == 1, out
 
 
+def test_grouped_pictures():
+    inner = ("<xdr:grpSp>" + pic("rId1") + "<xdr:grpSp>" + pic("rId2") + "</xdr:grpSp></xdr:grpSp>")
+    parts = with_drawing(anchor(0, inner), rels=[("rId1", "image", "../media/image1.png"),
+                                                 ("rId2", "image", "../media/image2.png")],
+                         extra={"xl/media/image1.png": PNG + b"1", "xl/media/image2.png": PNG + b"2"})
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
+    assert out.index("assets/img-001.png") < out.index("assets/img-002.png") and "img-003" not in out, out
+    assert not ctx.skipped, ctx.skipped
+
+
 def test_chartsheet_chart():
     parts = with_drawing('<xdr:absoluteAnchor><xdr:pos x="0" y="0"/>' + chart_frame("rId1")
                          + "<xdr:clientData/></xdr:absoluteAnchor>",

@@ -330,7 +330,7 @@ class _Sheets:
         return out
 
     def anchors(self, part: str, root, nsmap) -> list:
-        """Each anchor places its first chart or picture. Positioned anchors come in (row, column) order, then
+        """Each anchor places every chart and picture it holds, group members included. Positioned anchors come in (row, column) order, then
         absolute ones in file order. An AlternateContent is replaced by the branch the reader understands."""
         found = []
         for a in self._descend(root, nsmap, _ANCHORS):
@@ -353,7 +353,6 @@ class _Sheets:
                 else:
                     blip = first(el, "blip")
                     self.picture(part, attr(blip, "embed") if blip is not None else None, out)
-                break
         return out
 
     def _descend(self, root, nsmap, names):
