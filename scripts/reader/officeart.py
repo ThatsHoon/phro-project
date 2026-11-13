@@ -18,6 +18,7 @@ from .containers import flate
 MAX_RECORDS = 1_000_000  # records one walk visits
 SP_CONTAINER, SPGR_CONTAINER, FSP, FOPT = 0xF004, 0xF003, 0xF00A, 0xF00B
 DGG_CONTAINER, BSTORE, FBSE = 0xF000, 0xF001, 0xF007
+CLIENT_ANCHOR = 0xF010
 _PIB = 0x0104          # the pib property's id (opid & 0x3FFF; fBid is 0x4000, fComplex 0x8000)
 _NO_DELAY = 0xFFFFFFFF  # an FBSE foDelay with no delay-loaded BLIP
 _DEFLATE, _STORED = 0, 0xFE  # OfficeArtMetafileHeader compression
@@ -196,6 +197,8 @@ class Shapes:
     - `at`: spid -> the offset of the SpContainer whose FSP (0xF00A) names it, the first one winning;
     - `pib`: SpContainer offset -> its pib (the first FOPT's 0x4104), for each shape with one that is not 0;
     - `pics`: those pibs in record order;
+    - `anchors`: SpContainer offset -> the body offset and size of its first ClientAnchor (0xF010), each host reading
+      that body itself (xls: an OfficeArtClientAnchorSheet);
     - `groups`: the offset of each group shape (MS-ODRAW: the first SpContainer of an SpgrContainer) -> (i, j), its
       members' pictures being pics[i:j], those of nested groups included.
 
@@ -207,6 +210,7 @@ class Shapes:
         self.at: dict[int, int] = {}
         self.pib: dict[int, int] = {}
         self.pics: list[int] = []
+        self.anchors: dict[int, tuple[int, int]] = {}
         self.groups: dict[int, tuple[int, int]] = {}
         self.deep = 0
         self.cut = False
@@ -246,7 +250,8 @@ class Shapes:
             self.groups[level[1]] = (self.groups[level[1]][0], len(self.pics))
 
     def _shape(self, data, body: int, size: int):
-        """The SpContainer whose body is data[body:body + size]: its first FSP's spid and its first FOPT's pib."""
+        """The SpContainer whose body is data[body:body + size]: its first FSP's spid, first FOPT's pib and first
+        ClientAnchor."""
         spid = pib = None
         for _, inst, t, b, s in records(data, body, body + size):
             self._n += 1
@@ -258,3 +263,5 @@ class Shapes:
                 if pib:
                     self.pib[body - 8] = pib
                     self.pics.append(pib)
+            elif t == CLIENT_ANCHOR:
+                self.anchors.setdefault(body - 8, (b, s))

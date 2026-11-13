@@ -542,13 +542,15 @@ def oa_fbse(blip=b"", delay=0xFFFFFFFF, *, name=b"", cref=1):
     return oa_record(0xF007, body + bytes(name) + bytes(blip), ver=2, inst=6)
 
 
-def oa_shape(spid, pib=None):
+def oa_shape(spid, pib=None, anchor: bytes | None = None):
     """An SpContainer (0xF004): its FSP (0xF00A: spid, grfPersistent) and, when `pib` is given, an FOPT (0xF00B)
-    whose one property is pib (0x4104)."""
+    whose one property is pib (0x4104); when `anchor` is given, a ClientAnchor (0xF010) with that body."""
     import struct
     out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75)
     if pib is not None:
         out += oa_record(0xF00B, struct.pack("<HI", 0x4104, pib), ver=3, inst=1)
+    if anchor is not None:
+        out += oa_record(0xF010, anchor)
     return oa_container(0xF004, out)
 
 
@@ -815,7 +817,8 @@ def _biff_cell(r, c, v, sst, fmt_xf):
 
 
 def _biff_sheet(sh, sst, fmt_xf):
-    """One worksheet (or chart, macro, VBA) substream. Merges are (first row, first col, last row, last col)."""
+    """One worksheet (or chart, macro, VBA) substream. Merges are (first row, first col, last row, last col). A
+    `drawing` (bytes) is the MSODRAWING 0x00EC body, cut after `drawing_split` bytes into a CONTINUE when that is set."""
     import struct
     if "raw" in sh:
         return sh["raw"]
@@ -840,12 +843,21 @@ def _biff_sheet(sh, sst, fmt_xf):
                             + b"".join(struct.pack("<HHHH", m[0], m[2], m[1], m[3]) for m in part)))
     for extra in sh.get("records", ()):
         out.append(extra if isinstance(extra, bytes) else biff(*extra))
+    if sh.get("drawing") is not None:
+        out += _biff_drawing(0x00EC, sh["drawing"], sh.get("drawing_split"))
     out.append(biff(0x000A))
     return b"".join(out)
 
 
+def _biff_drawing(rid, body, split=None):
+    """An MSODRAWINGGROUP or MSODRAWING record of `body`, its tail from byte `split` on in a CONTINUE."""
+    if split is None:
+        return [biff(rid, body)]
+    return [biff(rid, body[:split]), biff(0x003C, body[split:])]
+
+
 def biff_workbook(sheets, *, formats=None, date1904=False, active=0, filepass=None, sst_split=None,
-                  globals_extra=b""):
+                  globals_extra=b"", drawing=None, drawing_split=None):
     """A BIFF8 Workbook stream: globals, then one substream per sheet dict.
 
     A sheet dict: name, state (0 visible, 1 hidden, 2 very hidden), kind (0 sheet, 1 macro, 2 chart, 6 VBA);
@@ -853,7 +865,9 @@ def biff_workbook(sheets, *, formats=None, date1904=False, active=0, filepass=No
     ("f", cached) (FORMULA, plus STRING for text) and ("fmt", number, code) (NUMBER in a cell XF of that format);
     merges [(r1, c1, r2, c2)], hidden_rows, hidden_cols, records (raw records before EOF: framed bytes or
     (id, body)) and raw (the whole substream). Cell XFs start at index 16, one per format code the cells use, in
-    order of first use; every other cell uses XF 15.
+    order of first use; every other cell uses XF 15. `drawing` (bytes, a DggContainer) is the globals' MSODRAWINGGROUP,
+    cut after `drawing_split` bytes into a CONTINUE; a sheet's `drawing` and `drawing_split` do the same for its
+    MSODRAWING.
     """
     import struct
     formats = dict(formats or {})
@@ -880,6 +894,8 @@ def biff_workbook(sheets, *, formats=None, date1904=False, active=0, filepass=No
     head.append(_biff_sst(strings, sst_split))
     names = [biff(0x0085, struct.pack("<IBB", 0, sh.get("state", 0), sh.get("kind", 0))
                   + _xl_string(sh["name"], short=True)) for sh in sheets]
+    if drawing is not None:
+        globals_extra += b"".join(_biff_drawing(0x00EB, drawing, drawing_split))
     tail = biff(0x000A)
     base = sum(map(len, head)) + sum(map(len, names)) + len(globals_extra) + len(tail)
     subs = [_biff_sheet(sh, sst, fmt_xf) for sh in sheets]

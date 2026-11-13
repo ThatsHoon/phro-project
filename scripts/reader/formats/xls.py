@@ -13,14 +13,16 @@ import struct
 
 from .. import limits
 from ..containers.cfb import CfbError, Compound, is_cfb
+from ..containers import flate
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import display
-from . import biff, sheet_grid, xls_crypt
+from . import biff, sheet_grid, xls_crypt, xls_drawing
 
 _ROW, _COLINFO, _MERGED = 0x0208, 0x007D, 0x00E5
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
 _FORMULA, _STRING = 0x0006, 0x0207
+_MSODRAWING = 0x00EC
 _AFTER_FORMULA = frozenset({0x04BC, 0x0221, 0x0236})  # SHRFMLA, ARRAY, TABLE: may sit between FORMULA and STRING
 _CELLS = frozenset({_LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR, _FORMULA})
 _ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!", 0x2A: "#N/A"}
@@ -49,6 +51,8 @@ class Workbook:
         self.cells: dict[int, dict] = {}
         self._blocks: dict[int, list] = {}
         self._fmt: dict[int, str] = {}
+        self.flate = flate.Budget()  # one inflate budget and one image byte count for the whole document's pictures
+        self.spent = [0]
 
     # ---- sheets
     def sections(self) -> list:
@@ -87,8 +91,12 @@ class Workbook:
             return []
         grid = sheet_grid.Grid(ref.name, self.budget, self.ctx)
         self.cells[i] = grid.cells
-        self._walk(ref.offset, grid)
-        self._blocks[i] = blocks = grid.blocks()
+        draw: list = []
+        self._walk(ref.offset, grid, draw)
+        blocks = grid.blocks()
+        if draw:
+            blocks = blocks + xls_drawing.pictures(self.g, b"".join(draw), self.flate, self.spent, self.ctx)
+        self._blocks[i] = blocks
         return blocks
 
     def _code(self, ixfe: int) -> str:
@@ -103,7 +111,9 @@ class Workbook:
             return value
         return display(value, code, self.g.date1904)
 
-    def _walk(self, offset: int, grid: sheet_grid.Grid) -> None:
+    def _walk(self, offset: int, grid: sheet_grid.Grid, draw: list) -> None:
+        """Walk sheet substream `offset` into `grid`; the sheet's MSODRAWING bodies, CONTINUEs joined, go into `draw`
+        (a TXO or OBJ is another record, and a TXO's CONTINUEs belong to it)."""
         data, g = self.data, self.g
         if not 0 <= offset < len(data):
             raise ReadError("damaged", "sheet offset outside the stream")
@@ -145,6 +155,9 @@ class Workbook:
                         self.ctx.skipped["record"] += 1
                         continue
                     grid.put(r, c, self._show(text, ixfe))
+            elif rid == _MSODRAWING:
+                draw.append(data[off:off + size])
+                draw.extend(data[o:o + n] for o, n in rec[3])
             elif rid == _ROW:
                 if size >= 14 and struct.unpack_from("<H", data, off + 12)[0] & 0x20:
                     grid.hide_row(struct.unpack_from("<H", data, off)[0])

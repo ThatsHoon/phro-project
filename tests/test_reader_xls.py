@@ -17,7 +17,9 @@ from reader import limits  # noqa: E402
 from reader.formats import biff, sheet_grid, xls  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader_fix import biff as rec, biff_workbook, make_cfb, make_xls  # noqa: E402
+from reader.formats import xls_drawing  # noqa: E402
+from reader_fix import (biff as rec, biff_workbook, blip_png, make_cfb, make_xls, oa_container, oa_fbse,  # noqa: E402
+                        oa_group, oa_shape)
 
 
 def run(sheets, hidden=False, **kw):
@@ -211,6 +213,81 @@ def test_nested_bof_skipped():
         rec(0x0203, struct.pack("<HHH", 0, 0, 15) + struct.pack("<d", 987.0)) + rec(0x000A)
     md, _ = run([{"name": "S", "cells": {(1, 0): "outer"}, "records": [inner]}])
     assert "outer" in md and "987" not in md, md
+
+
+PNG_A = bytes.fromhex("89504e470d0a1a0a") + b"A" * 24
+PNG_B = bytes.fromhex("89504e470d0a1a0a") + b"B" * 24
+
+
+def dgg(*pngs):
+    """The globals' DggContainer: a BStoreContainer with one FBSE embedding each PNG."""
+    return oa_container(0xF000, oa_container(0xF001, *(oa_fbse(blip_png(p)) for p in pngs)))
+
+
+def anchor(row, col=0):
+    return struct.pack("<9H", 0, col, 0, row, 0, col + 1, 0, row + 1, 0)
+
+
+def dg(*shapes):
+    """A sheet's DgContainer holding its shapes in an SpgrContainer."""
+    return oa_container(0xF002, oa_group(1024, *shapes))
+
+
+def pics(sheets, **kw):
+    """Convert a workbook; returns (out.md text, meta, {asset name: bytes})."""
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "a.xls"
+        make_xls(src, sheets, **kw)
+        meta = reader.convert(src, Path(d) / "out", hidden=False)
+        text = (Path(d) / "out" / "out.md").read_text(encoding="utf-8")
+        assets = {f.name: f.read_bytes() for f in (Path(d) / "out" / "assets").glob("*")}             if (Path(d) / "out" / "assets").exists() else {}
+        return text, meta, assets
+
+
+def test_picture_in_sheet():
+    sheet = {"name": "S", "cells": {(0, 0): "cell"}, "drawing": dg(oa_shape(1025, 1, anchor(2)))}
+    text, meta, assets = pics([sheet], drawing=dgg(PNG_A))
+    assert assets == {"img-001.png": PNG_A}, assets
+    assert text.index("cell") < text.index("![](assets/img-001.png)"), text
+    assert "could not read" not in text, text
+
+
+def test_pictures_anchor_order():
+    sheet = {"name": "S", "cells": {(0, 0): "cell"},
+             "drawing": dg(oa_shape(1025, 1, anchor(5)), oa_shape(1026, 2, anchor(1)))}
+    text, meta, assets = pics([sheet], drawing=dgg(PNG_A, PNG_B))
+    assert assets["img-001.png"] == PNG_B and assets["img-002.png"] == PNG_A, assets
+    unanchored = {"name": "S", "drawing": dg(oa_shape(1025, 1), oa_shape(1026, 2, anchor(9)))}
+    _, _, assets = pics([unanchored], drawing=dgg(PNG_A, PNG_B))
+    assert assets["img-001.png"] == PNG_B and assets["img-002.png"] == PNG_A, assets
+
+
+def test_missing_blip_counted():
+    sheet = {"name": "S", "cells": {(0, 0): "cell"}, "drawing": dg(oa_shape(1025, 3, anchor(0)))}
+    text, meta, assets = pics([sheet], drawing=dgg(PNG_A))
+    assert not assets, assets
+    assert "(could not read: 1 image)" in text, text
+
+
+def test_image_budget():
+    sheet = {"name": "S", "drawing": dg(oa_shape(1025, 1, anchor(0)), oa_shape(1026, 1, anchor(1)))}
+    old = xls_drawing.IMAGE_BYTES
+    xls_drawing.IMAGE_BYTES = len(PNG_A) + 1
+    try:
+        text, meta, assets = pics([sheet], drawing=dgg(PNG_A))
+    finally:
+        xls_drawing.IMAGE_BYTES = old
+    assert len(assets) == 1 and "(could not read: 1 image)" in text, (assets, text)
+
+
+def test_drawing_continue_joined():
+    body = dg(oa_shape(1025, 1, anchor(0)))
+    sheet = {"name": "S", "cells": {(0, 0): "cell"}, "drawing": body, "drawing_split": len(body) - 20}
+    text, meta, assets = pics([sheet], drawing=dgg(PNG_A))
+    assert assets == {"img-001.png": PNG_A}, assets
+    both = dgg(PNG_A)
+    text, meta, assets = pics([sheet], drawing=both, drawing_split=len(both) - 7)
+    assert assets == {"img-001.png": PNG_A}, assets
 
 
 def main():
