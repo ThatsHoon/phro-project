@@ -80,7 +80,7 @@ def test_bad_sst_item_skipped():
         ctx = Context()
         with Package(path) as pkg:
             wb = xlsb.read_workbook(pkg, ctx)
-    assert wb.sst == ["first", "third"] and ctx.skipped["record"] == 1, (wb.sst, ctx.skipped)
+    assert wb.sst == ["first", "", "third"] and ctx.skipped["record"] == 1, (wb.sst, ctx.skipped)
 
 
 def test_bundlesh_extra_dword():

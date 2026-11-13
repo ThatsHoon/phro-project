@@ -157,6 +157,7 @@ def _strings(pkg, part, wb, ctx):
             wb.sst.append(text)
         except (ValueError, struct.error):
             ctx.skipped["record"] += 1
+            wb.sst.append("")  # keep every later index pointing at its own string
 
 
 def read_workbook(pkg, ctx) -> _Wb:
