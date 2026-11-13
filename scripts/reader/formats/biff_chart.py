@@ -23,6 +23,7 @@ _CHART_BOF = 0x0020
 _SERIES, _TEXT, _SERIES_TEXT, _OBJECT_LINK, _BRAI, _SIINDEX = 0x1003, 0x1025, 0x100D, 0x1027, 0x1051, 0x1065
 _NUMBER, _LABEL, _BOOLERR = 0x0203, 0x0204, 0x0205
 _BAR, _PIE, _SCATTER, _CHART3D = 0x1017, 0x1019, 0x101B, 0x103A
+_SER_PARENT = 0x104A
 _KINDS = {0x1018: "line", 0x101A: "area", 0x103E: "radar", 0x103F: "surface", 0x1040: "radar"}
 # these cannot belong to a chart: BLANK is not here, real charts hold it after SIIndex
 _SHEET_ONLY = frozenset({0x00FD, 0x027E, 0x00BD, 0x0006, 0x0208, 0x00BE})
@@ -32,6 +33,7 @@ class _Series:
     def __init__(self):
         self.name = None
         self.refs = {}  # BRAI role -> (source, tokens, ifmt)
+        self.aux = False  # carries SerParent: a trendline or error bar, not a data series
 
 
 class _Text:
@@ -41,11 +43,12 @@ class _Text:
         self.tokens = None  # a BRAI reference to a cell
 
 
-def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx):
+def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.Stream | None = None):
     """The chart substream whose BOF is at `start`: (its Table or None, the offset after its EOF). `cells` maps a
     sheet index to {(row, col): displayed text}; a sheet it lacks has no cells. A substream that cannot be read is
-    counted under `chart` and the offset is where the walk stopped."""
-    st = biff.Stream(data, ctx)
+    counted under `chart` and the offset is where the walk stopped. `st` is the workbook's Stream over `data`, so
+    worksheets and charts share one `limits.BIN_RECORDS`; without it the chart gets a Stream of its own."""
+    st = biff.Stream(data, ctx) if st is None else st
     series, texts, kinds = [], [], []
     stack = [None]       # the context (a _Series or a _Text) in force at each Begin depth
     pending = None
@@ -136,6 +139,9 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx):
                 if value is not None:
                     cache.setdefault((col, role), {})[row] = value
                     points += 1
+            elif rid == _SER_PARENT:
+                if isinstance(here, _Series):
+                    here.aux = True
             elif rid == _CHART3D:
                 three_d = True
             else:
@@ -155,7 +161,8 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx):
         if not cats and got[2]:
             cats = got[2]
         name = s.name or (got[0][min(got[0])] if got[0] else "") or f"Series {k + 1}"
-        out.append((name, got[1]))
+        if not s.aux:  # k stays the cache column of the series after it
+            out.append((name, got[1]))
     n = max([max(d) + 1 for d in [cats] + [v for _, v in out] if d] + [0])
     table = series_table(_caption(kinds, three_d, _title(texts, g, cells, left, cuts)),
                          [cats.get(i, "") for i in range(n)],

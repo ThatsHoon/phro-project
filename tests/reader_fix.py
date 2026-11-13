@@ -909,7 +909,7 @@ def biff_workbook(sheets, *, formats=None, date1904=False, active=0, filepass=No
 def biff_chart(series, *, title=None, kinds=((0x1017, bytes(6)),), cache=True, eof=True, extra=()):
     """A chart substream (BOF dt 0x20 ... EOF), as a chart sheet's `raw` or inside a worksheet's `records`.
 
-    `series` is a list of dicts: name, vals and cats (lists), ifmt (BRAI number format id) and ref ((role,
+    `series` is a list of dicts: name, vals and cats (lists), ifmt (BRAI number format id), aux (carries SerParent 0x104A) and ref ((role,
     tokens) pairs that replace the cache for that role). With `cache` the values and categories follow as SIIndex
     caches (NUMBER for a number, LABEL for a string, col = the series), else each series has only its BRAIs.
     `kinds` are (id, body) records; `extra` raw records go before the EOF."""
@@ -930,6 +930,8 @@ def biff_chart(series, *, title=None, kinds=((0x1017, bytes(6)),), cache=True, e
             out.append(biff(0x100D, struct.pack("<H", 0) + short(s["name"])))
         out.append(brai(1, 2 if 1 in refs else 1, refs.get(1, b""), s.get("ifmt", 0)))
         out.append(brai(2, 2 if 2 in refs else 1, refs.get(2, b"")))
+        if s.get("aux"):  # a trendline or error-bar series carries SerParent
+            out.append(biff(0x104A, bytes(2)))
         out.append(biff(0x1034))
     for rid, body in kinds:
         out.append(biff(rid, body))

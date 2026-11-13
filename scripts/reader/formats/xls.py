@@ -107,7 +107,7 @@ class Workbook:
                 seen.add(start)
                 self.charts += 1
                 with self.ctx.guard("chart"):
-                    tbl, _ = biff_chart.chart(self.data, start, self.g, self.cells, self.ctx)
+                    tbl, _ = biff_chart.chart(self.data, start, self.g, self.cells, self.ctx, self.st)
                     if tbl is None:
                         continue
                     self.chart_cells += sum(len(r) for r in tbl.rows)

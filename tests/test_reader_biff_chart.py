@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader import limits  # noqa: E402
-from reader_fix import area3d, biff_chart, externsheet, make_xls  # noqa: E402
+from reader_fix import area3d, biff_chart, biff_workbook, externsheet, make_xls  # noqa: E402
 
 AB = [{"name": "A", "vals": [1, 2, 3], "cats": ["Q1", "Q2", "Q3"]},
       {"name": "B", "vals": [4, 5, 6], "cats": ["Q1", "Q2", "Q3"]}]
@@ -115,6 +115,38 @@ def test_chart_total():
         limits.CHART_TOTAL = old
     assert md.count("Chart: bar") == 1 and "Chart: bar — One" in md, md
     assert "(could not read: 1 chart)" in md, md
+
+
+def test_auxiliary_series_skipped():
+    # a Series carrying SerParent (a trendline) is no column; the series after it keep their own cache column
+    real = [{"name": "A", "vals": [1, 2], "cats": ["x", "y"]}, {"name": "T", "aux": True},
+            {"name": "B", "vals": [3, 4], "cats": ["x", "y"]}]
+    md = run([DATA, chart_sheet(biff_chart(real))])
+    assert "Chart: bar\n||A|B|\n|---|---|---|\n|x|1|3|\n|y|2|4|\n" in md, md
+
+
+def test_shared_record_budget():
+    # worksheets and charts draw on one BIN_RECORDS: a later chart is cut off (counted under chart), not read afresh
+    from reader.formats import sheet_grid, xls
+    from reader.model import Context
+    from reader.formats import biff
+    one, two = biff_chart(AB, title="One"), biff_chart(AB, title="Two")
+    data = biff_workbook([DATA, chart_sheet(one, "C1"), chart_sheet(two, "C2")])
+    bare = xls.Workbook(biff_workbook([DATA, chart_sheet(b"", "C1"), chart_sheet(b"", "C2")]), Context(),
+                        sheet_grid.Budget())
+    bare.sections()
+    alone = biff.Stream(one, Context())
+    list(alone.records(0))
+    limit = bare.st.count + alone.count + 3  # the worksheet and the first chart fit, the second does not
+    old = limits.BIN_RECORDS
+    limits.BIN_RECORDS = limit
+    try:
+        ctx = Context()
+        secs = xls.Workbook(data, ctx, sheet_grid.Budget()).sections()
+    finally:
+        limits.BIN_RECORDS = old
+    names = [s.title for s in secs]
+    assert names == ["Data", "C1"] and ctx.skipped["chart"] == 1, (names, ctx.skipped)
 
 
 def main():
