@@ -1309,9 +1309,9 @@ def ppt_user_edit(last, directory, doc_ref, seed, crypt=None):
     return oa_record(0x0FF5, body + (struct.pack("<I", crypt) if crypt is not None else b""))
 
 
-def ppt_directory(entries):
+def ppt_directory(entries, slots=None):
     """A PersistDirectoryAtom (0x1772) of {persist id: offset}: one run (id | count << 20, then count offsets) per
-    stretch of consecutive ids."""
+    stretch of consecutive ids. A `slots` dict is filled with {persist id: offset of its u32 inside the atom}."""
     import struct
     out, ids, i = b"", sorted(entries), 0
     while i < len(ids):
@@ -1319,7 +1319,10 @@ def ppt_directory(entries):
         while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1 and j + 1 - i < 0xFFF:
             j += 1
         out += struct.pack("<I", ids[i] | (j - i + 1) << 20)
-        out += b"".join(struct.pack("<I", entries[p]) for p in ids[i:j + 1])
+        for p in ids[i:j + 1]:
+            if slots is not None:
+                slots[p] = 8 + len(out)
+            out += struct.pack("<I", entries[p])
         i = j + 1
     return oa_record(0x1772, out)
 
@@ -1352,7 +1355,8 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
 
     Returns a dict: doc, master (persist ids), slides (persist ids in order), slide_ids, notes ({slide number:
     persist id}), crypt (persist id or None), offsets ({persist id: offset} as the newest edit sees them),
-    slide1_offsets ((first, last) offset of slide 1), user_edits and directories (offsets in the PowerPoint Document
+    slide1_offsets ((first, last) offset of slide 1), slots ({persist id: stream offset of the u32 holding that id's
+    offset in the newest directory naming it; patch it to move or break one object}), user_edits and directories (offsets in the PowerPoint Document
     stream, oldest first), doc_stream and current_user (the stream bytes)."""
     import struct
     if pictures:
@@ -1429,17 +1433,19 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     if pid_crypt is not None:
         put(pid_crypt, oa_container(0x2F14, oa_record(0x0001, bytes(8))))
     first_slide = offsets.get(pid_slides[0]) if n else None
-    user_edits, directories, last = [], [], 0
+    user_edits, directories, last, slots = [], [], 0, {}
     seed = 3 + n + len(notes) + (pid_crypt is not None)
     for e in range(max(edits, 1)):
         changed = dict(offsets) if e == 0 else {}
         if e and n:
             offsets[pid_slides[0]] = changed[pid_slides[0]] = put(None, slide_record(0))
-        directories.append(put(None, ppt_directory(changed)))
+        rel = {}
+        directories.append(put(None, ppt_directory(changed, rel)))
+        slots.update({p: directories[-1] + r for p, r in rel.items()})
         last = put(None, ppt_user_edit(last, directories[-1], pid_doc, seed, pid_crypt))
         user_edits.append(last)
     cu = ppt_current_user(last, encrypted=encrypt is not None)
     make_cfb(path, {"PowerPoint Document": bytes(stream), "Current User": cu, "Pictures": b""})
     return {"doc": pid_doc, "master": pid_master, "slides": pid_slides, "slide_ids": slide_ids, "notes": pid_notes,
             "crypt": pid_crypt, "offsets": offsets, "slide1_offsets": (first_slide, offsets.get(pid_slides[0])),
-            "user_edits": user_edits, "directories": directories, "doc_stream": bytes(stream), "current_user": cu}
+            "slots": slots, "user_edits": user_edits, "directories": directories, "doc_stream": bytes(stream), "current_user": cu}

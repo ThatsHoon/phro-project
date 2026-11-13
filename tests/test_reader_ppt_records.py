@@ -98,6 +98,40 @@ def test_no_directory():
             raise AssertionError("expected ReadError")
 
 
+def test_directory_work_budget():
+    info, doc, cu = build(edits=60)  # 59 later directories repeat slide 1's id: no new id, still work
+    assert pr.Persist(doc, cu, Context()).obj(info["doc"]) is not None
+    saved = pr.limits.BIN_RECORDS
+    pr.limits.BIN_RECORDS = 40
+    try:
+        ctx = Context()
+        pr.Persist(doc, cu, ctx)
+    finally:
+        pr.limits.BIN_RECORDS = saved
+    assert ctx.skipped["record"] == 1, ctx.skipped
+
+
+def test_doc_ref_missing_from_directory():
+    info, doc, cu = build()
+    doc = bytearray(doc)
+    at = info["directories"][0]
+    entry = struct.unpack_from("<I", doc, at + 8)[0]
+    struct.pack_into("<I", doc, at + 8, entry + 1)  # ids 2.. instead of 1..: the document id is gone
+    p = pr.Persist(bytes(doc), cu, Context())
+    assert p.doc_ref == info["doc"] and p.obj(p.doc_ref) is None
+
+
+def test_slots_patch_one_offset():
+    info, doc, cu = build([{"title": "A"}, {"title": "B"}, {"title": "C"}])
+    pids = info["slides"]
+    assert struct.unpack_from("<I", doc, info["slots"][pids[1]])[0] == info["offsets"][pids[1]]
+    doc = bytearray(doc)
+    struct.pack_into("<I", doc, info["slots"][pids[1]], len(doc) + 100)
+    p = pr.Persist(bytes(doc), cu, Context())
+    assert p.obj(pids[1]) is None
+    assert p.obj(pids[0])[0] == pr.SLIDE_CONTAINER and p.obj(pids[2])[0] == pr.SLIDE_CONTAINER
+
+
 def test_every_persist_id_resolves():
     info, doc, cu = build(notes={1: "n1", 2: "n2"})
     p = pr.Persist(doc, cu, Context())

@@ -30,7 +30,8 @@ class Persist:
     """The persistent objects of a PowerPoint Document stream: `objects` maps a persist id to the offset of its record
     (the newest edit's entry wins), `doc_ref` is the DocumentContainer's id, `crypt_ref` the CryptSession10Container's
     (None when the newest edit names none), `encrypted` whether the CurrentUserAtom headerToken says the streams are
-    encrypted. Raises ReadError("damaged") when no UserEditAtom or no document container can be found."""
+    encrypted. Raises ReadError("damaged") only when no UserEditAtom can be found. A doc_ref the directories do not
+    list is kept as read: obj(doc_ref) is then None and the caller decides what a missing document container means."""
 
     def __init__(self, doc: bytes, current_user: bytes | None, ctx):
         self.doc, self.ctx = doc, ctx
@@ -42,9 +43,8 @@ class Persist:
             first = self._last_edit()
         if first is None:
             raise limits.ReadError("damaged", "no persist directory")
+        self.work = limits.BIN_RECORDS  # directory entries all edits may read, repeated ids counted
         self.doc_ref, self.crypt_ref = self._walk(first)
-        if self.doc_ref not in self.objects:
-            raise limits.ReadError("damaged", "no persist directory")
 
     def _edit(self, off: int) -> tuple[int, int] | None:
         """The UserEditAtom at `off` as (body offset, body size); None when there is none that fits."""
@@ -90,7 +90,8 @@ class Persist:
                     crypt_ref = struct.unpack_from("<I", self.doc, body + 28)[0] or None
             if directory not in dirs:
                 dirs.add(directory)
-                self._directory(directory)
+                if not self._directory(directory):
+                    break
             if not last:
                 break
             off = last
@@ -98,22 +99,28 @@ class Persist:
             self.ctx.skipped["record"] += 1
         return doc_ref, crypt_ref
 
-    def _directory(self, off: int) -> None:
+    def _directory(self, off: int) -> bool:
+        """Merge the directory at `off` into `objects`; False when the walk must stop (budget spent)."""
         head = officeart.header(self.doc, off)
         if head is None or head[2] != PERSIST_DIRECTORY_ATOM or head[3] > len(self.doc) - off - 8:
             self.ctx.skipped["record"] += 1
-            return
+            return True
         pos, end = off + 8, off + 8 + head[3]
         while pos + 4 <= end:
             entry = struct.unpack_from("<I", self.doc, pos)[0]
             start, count = entry & 0xFFFFF, entry >> 20
             pos += 4
-            if count * 4 > end - pos or len(self.objects) + count > limits.BIN_RECORDS:
+            if count * 4 > end - pos:
                 self.ctx.skipped["record"] += 1
-                return
+                return True
+            self.work -= count + 1  # work, not new ids: edits repeating the same ids must not escape the budget
+            if self.work < 0:
+                self.ctx.skipped["record"] += 1
+                return False
             for k, value in enumerate(struct.unpack_from(f"<{count}I", self.doc, pos)):
                 self.objects.setdefault(start + k, value)
             pos += count * 4
+        return True
 
     def obj(self, pid: int) -> tuple[int, int, int, int] | None:
         """The record persist id `pid` names, as (type, instance, body offset, body size); None when the id is
