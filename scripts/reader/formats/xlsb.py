@@ -53,6 +53,7 @@ class _Wb:
         self.sst: list[str] = []
         self.xf_fmt: list[int] = []
         self.formats: dict[int, str] = {}
+        self.chartsheets: set[str] = set()  # sheet parts whose relationship is a chartsheet
 
 
 def _check_container(path):
@@ -111,6 +112,7 @@ def _sheet_pair(data, off, size, at):
 def _workbook(pkg, part, rels, wb, ctx):
     fallback = sorted((r for r in rels.values() if r.type.endswith("/worksheet") and not r.external),
                       key=lambda r: _rid_key(r.id))
+    wb.chartsheets = {r.target for r in rels.values() if r.type.endswith("/chartsheet") and not r.external}
     index = 0
     for rid, data, off, size in _walk(pkg, part, ctx):
         try:
@@ -229,6 +231,8 @@ class _Sheets:
                 continue
             if blocks is None:  # the guard counted a failure
                 continue
+            if not blocks and part in self.wb.chartsheets:  # a chartsheet with nothing drawn has no section
+                continue
             if state in (1, 2):
                 out.append(Section("sheet", name, blocks=_hide(blocks), hidden="hidden"))
             else:
@@ -250,6 +254,8 @@ class _Sheets:
         if part in self.used:
             raise ReadError("damaged", "sheet part used twice")
         self.used.add(part)
+        if part in self.wb.chartsheets:  # a chartsheet has no cell records: its drawing is all there is
+            return self.drawing(part)
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         row = None
         for rid, data, off, size in _walk(self.pkg, part, self.ctx):
@@ -314,38 +320,63 @@ class _Sheets:
                 continue
             self.drawings.add(rel.target)
             try:
-                root, _ = ooxml_base.load(self.pkg, rel.target)
+                root, nsmap = ooxml_base.load(self.pkg, rel.target)
             except ReadError as e:
                 if e.kind not in ("damaged", "too_large"):
                     raise
                 self.ctx.skipped["object"] += 1
                 continue
-            out += self.anchors(rel.target, root)
+            out += self.anchors(rel.target, root, nsmap)
         return out
 
-    def anchors(self, part: str, root) -> list:
+    def anchors(self, part: str, root, nsmap) -> list:
+        """Each anchor places its first chart or picture. Positioned anchors come in (row, column) order, then
+        absolute ones in file order. An AlternateContent is replaced by the branch the reader understands."""
         found = []
-        for a in root:
-            if local(a.tag) not in ("twoCellAnchor", "oneCellAnchor"):
-                continue
+        for a in self._descend(root, nsmap, _ANCHORS):
             if len(found) >= MAX_ANCHORS:
                 self.ctx.skipped["object"] += 1
                 break
             at = first(a, "from")
-            r = ooxml_base.int_of(_text(first(at, "row")) if at is not None else "")
-            c = ooxml_base.int_of(_text(first(at, "col")) if at is not None else "")
-            found.append((r, c, len(found), a))
-        found.sort(key=lambda t: t[:3])
+            if at is None:
+                found.append((1, 0, 0, len(found), a))
+            else:
+                r = ooxml_base.int_of(_text(first(at, "row")))
+                c = ooxml_base.int_of(_text(first(at, "col")))
+                found.append((0, r, c, len(found), a))
+        found.sort(key=lambda t: t[:4])
         out = []
-        for _, _, _, a in found:
-            for el in a.iter():
-                name = local(el.tag)
-                if name == "chart":
+        for *_, a in found:
+            for el in self._descend(a, nsmap, ("chart", "pic")):
+                if local(el.tag) == "chart":
                     self.chart(part, attr(el, "id"), out)
-                elif name == "pic":
+                else:
                     blip = first(el, "blip")
                     self.picture(part, attr(blip, "embed") if blip is not None else None, out)
+                break
         return out
+
+    def _descend(self, root, nsmap, names):
+        """The elements under `root` named in `names`, in document order, not entered once found; an
+        AlternateContent is replaced by its chosen branch (counted under alternate when there is none)."""
+        stack = [iter(root)]
+        while stack:
+            for el in stack[-1]:
+                name = local(el.tag)
+                if name in names:
+                    yield el
+                elif name == "AlternateContent":
+                    chosen = ooxml_base.alternate(el, nsmap)
+                    if chosen is None:
+                        self.ctx.skipped["alternate"] += 1
+                    else:
+                        stack.append(iter(chosen))
+                        break
+                else:
+                    stack.append(iter(el))
+                    break
+            else:
+                stack.pop()
 
     def chart(self, part: str, rid, out: list) -> None:
         tbl = ooxml_base.chart(self.pkg, part, rid, self.ctx)
@@ -369,6 +400,7 @@ class _Sheets:
             out.append(img)
 
 
+_ANCHORS = ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor")
 _CELLS = frozenset({BRT_CELL_RK, BRT_CELL_ERROR, BRT_CELL_BOOL, BRT_CELL_REAL, BRT_CELL_ST, BRT_CELL_ISST,
                     BRT_CELL_RSTRING, BRT_FMLA_STRING, BRT_FMLA_NUM, BRT_FMLA_BOOL, BRT_FMLA_ERROR})
 

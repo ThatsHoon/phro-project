@@ -180,6 +180,8 @@ def drawing_xml(*anchors):
             'xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
             'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
             'xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+            'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+            'xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main" '
             f'xmlns:r="{REL[:-1]}">' + "".join(anchors) + "</xdr:wsDr>")
 
 
@@ -300,6 +302,39 @@ def test_sheet_without_readable_part():
                   workbook_records=[xlsb_bundle("A", "rId1"), xlsb_bundle("Lost", "rId9")])
     assert "fine" in out and "Lost" not in out and "(could not read: 1 sheet)" in out, out
     assert ctx.skipped["sheet"] == 1, ctx.skipped
+
+
+def test_absolute_anchor_chart():
+    parts = with_drawing('<xdr:absoluteAnchor><xdr:pos x="0" y="0"/>' + chart_frame("rId1")
+                         + "<xdr:clientData/></xdr:absoluteAnchor>",
+                         rels=[("rId1", "chart", "../charts/chart1.xml")], extra={"xl/charts/chart1.xml": BAR})
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
+    assert "Chart: bar" in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_alternate_anchor_places_one_image():
+    inner = ('<mc:AlternateContent><mc:Choice Requires="a14">' + pic("rId1") + "</mc:Choice><mc:Fallback>"
+             + pic("rId1") + "</mc:Fallback></mc:AlternateContent>")
+    wrapped = ('<mc:AlternateContent><mc:Choice Requires="a14">' + anchor(0, pic("rId1"))
+               + "</mc:Choice></mc:AlternateContent>")
+    parts = with_drawing(wrapped, anchor(3, inner), rels=[("rId1", "image", "../media/image1.png")],
+                         extra={"xl/media/image1.png": PNG})
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
+    assert out.count("assets/img-") == 2 and "img-003" not in out and not ctx.skipped, (out, ctx.skipped)
+    one = with_drawing(anchor(0, inner), rels=[("rId1", "image", "../media/image1.png")],
+                       extra={"xl/media/image1.png": PNG})
+    out, _ = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=one)
+    assert out.count("assets/img-") == 1, out
+
+
+def test_chartsheet_chart():
+    parts = with_drawing('<xdr:absoluteAnchor><xdr:pos x="0" y="0"/>' + chart_frame("rId1")
+                         + "<xdr:clientData/></xdr:absoluteAnchor>",
+                         rels=[("rId1", "chart", "../charts/chart1.xml")], extra={"xl/charts/chart1.xml": BAR})
+    out, ctx = md([{"name": "Graph", "chartsheet": True}, {"name": "B", "cells": {(0, 0): "x"}}], extra_parts=parts)
+    assert "## Sheet: Graph" in out and "Chart: bar" in out and not ctx.skipped, (out, ctx.skipped)
+    out, ctx = md([{"name": "Empty", "chartsheet": True}, {"name": "B", "cells": {(0, 0): "x"}}])
+    assert "Empty" not in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def main():

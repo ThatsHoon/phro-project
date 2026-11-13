@@ -1137,7 +1137,7 @@ def xlsb_cell(rid, col, style, body=b""):
 def make_xlsb(path, sheets, *, formats=None, date1904=False, workbook_records=None, extra_parts=None):
     """Write an .xlsb package: content types, rels, workbook.bin, styles.bin, sharedStrings.bin, one sheet part per dict.
 
-    A sheet dict has Task 5's keys (name, state, cells, ...) and `records`, raw BIFF12 records (bytes) for the sheet
+    A sheet dict has Task 5's keys (name, state, cells, ...), `chartsheet` (its relationship is a chartsheet) and `records`, raw BIFF12 records (bytes) for the sheet
     part. Shared strings come from the str cells; each ("fmt", number, code) cell format gets a cell XF after the
     General one (a str code is a custom format, an int a built-in format id). The `cells` of a sheet are also written
     as records before `records`: a row header per row, then BrtCellIsst for a str, BrtCellBool for a bool, BrtCellReal
@@ -1163,8 +1163,8 @@ def make_xlsb(path, sheets, *, formats=None, date1904=False, workbook_records=No
         wb += list(workbook_records)
     wb.append(biff12(144))
     rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
-    wb_rels = "".join(f'<Relationship Id="rId{i + 1}" Type="{rel}worksheet" Target="worksheets/sheet{i + 1}.bin"/>'
-                      for i in range(len(sheets)))
+    wb_rels = "".join(f'<Relationship Id="rId{i + 1}" Type="{rel}{"chartsheet" if sh.get("chartsheet") else "worksheet"}" '
+                      f'Target="worksheets/sheet{i + 1}.bin"/>' for i, sh in enumerate(sheets))
     wb_rels += (f'<Relationship Id="rId{len(sheets) + 1}" Type="{rel}styles" Target="styles.bin"/>'
                 f'<Relationship Id="rId{len(sheets) + 2}" Type="{rel}sharedStrings" Target="sharedStrings.bin"/>')
 
