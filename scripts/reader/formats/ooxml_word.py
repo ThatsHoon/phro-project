@@ -10,7 +10,6 @@ from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
 from .word_fields import MAX_INSTR, MAX_URL, comment_note, hyperlink_url
 
-CHART_CELLS = 200_000      # chart table cells one document may emit, copies counted
 MAX_COLS = 1_000
 MAX_ALT = 200
 
@@ -410,7 +409,7 @@ class _Reader:
         tbl = ooxml_base.chart(self.pkg, self.scope.part, rid, self.ctx)
         if tbl is not None:
             self.chart_cells += sum(len(r) for r in tbl.rows)
-        if tbl is None or self.chart_cells > CHART_CELLS:
+        if tbl is None or self.chart_cells > limits.CHART_TOTAL:
             self.ctx.skipped["chart"] += 1
             return
         st.extras.append(tbl)

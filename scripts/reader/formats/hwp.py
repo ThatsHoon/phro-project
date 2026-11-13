@@ -113,9 +113,10 @@ class _Reader(Scopes):
         self.numbers = {}   # numbering id -> {level: counter}
         self.outline = 0    # the outline numbering id of the current section's secd
         self.blobs = {}     # (BinData stream name, inflated?, kind) -> its bytes, or None when it cannot be read
-        self.tables = {}    # an OLE item's bytes -> its chart table, or None
+        self.tables = {}    # an OLE item's bytes -> (its chart table or None, the table's cells)
         self.opened = 0     # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
+        self.chart_cells = 0  # chart table cells placed so far, copies counted (CHART_TOTAL)
         self.margins = False  # walking a header or footer, whose pictures and objects are skipped
         # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
         # holds the accepted text (dochan reader.py), so a range left in it hides nothing
@@ -659,7 +660,9 @@ class _Reader(Scopes):
 
     def ole(self, recs, j, st, d, g, alt):
         """SHAPE_OLE: the BinData item at offset 12, an OLE object. The chart in it (hwp_chart.ole_table) is a table
-        where a picture would be; an item two shapes name is read once. In a header or footer it is skipped (margin)."""
+        where a picture would be; an item two shapes name is read once, but every placement is charged against
+        CHART_TOTAL, as in the Word and slide readers, and one past it is counted under chart instead. In a header or
+        footer it is skipped (margin)."""
         if self.margins:
             return self.end(recs, j)
         data = recs[j].data
@@ -667,9 +670,15 @@ class _Reader(Scopes):
         item = self.bin_data(bid, "object")
         if item is not None:
             if item not in self.tables:
-                self.tables[item] = ole_table(item, self.ctx)
-            if self.tables[item] is not None:
-                st.extras.append(self.tables[item])
+                tbl = ole_table(item, self.ctx)
+                self.tables[item] = tbl, sum(len(r) for r in tbl.rows) if tbl is not None else 0
+            tbl, cells = self.tables[item]
+            if tbl is not None:
+                self.chart_cells += cells
+                if self.chart_cells > limits.CHART_TOTAL:
+                    self.ctx.skipped["chart"] += 1
+                else:
+                    st.extras.append(tbl)
         return self.end(recs, j)
 
 

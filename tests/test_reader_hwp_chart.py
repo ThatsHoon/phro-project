@@ -410,6 +410,23 @@ def test_ole_named_twice_read_once():
     assert len(calls) == 1, calls
 
 
+def test_chart_placements_charged():
+    # every placement of one chart is charged against CHART_TOTAL, as in docx and pptx: a chart near CHART_CELLS placed
+    # 50 times is placed while the cells stay under the cap, each one past it is counted under chart, and the render
+    # stays bounded
+    import time
+    rows, cols, n = 3, 40_000, 50
+    cells = {k: float(k) for k in range(cols + 2, rows * cols + 1) if (k - 1) % cols}
+    item = envelope({"Contents": contents(rows, cols, cells)})
+    size = sum(len(r) for r in hwp_chart.ole_table(item, Context()).rows)
+    t0 = time.monotonic()
+    out, ctx = read(doc(*[ole_shape(1)] * n, bins=items((2, 0, 1)), streams={"BIN0001.OLE": deflate(item)},
+                        before="", after=""))
+    assert time.monotonic() - t0 < 10, time.monotonic() - t0
+    keep = limits.CHART_TOTAL // size
+    assert ctx.skipped["chart"] == n - keep and out.count("Chart: column") == keep, (ctx.skipped, out.count("Chart:"))
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

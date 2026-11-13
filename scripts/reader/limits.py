@@ -16,6 +16,7 @@ SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one documen
 GRID_COLS = 1_000        # columns a span may reach in a rendered table
 GRID_SLOTS = 2_000_000    # grid slots all spans of one rendered table may cover
 CHART_CELLS = 100_000     # cells one chart table may hold, header row included (series x rows)
+CHART_TOTAL = 200_000     # chart table cells one docx, pptx, hwp or hwpx document may emit, copies counted
 CFB_STREAM = 256 * 2**20  # bytes of one compound-file stream
 CFB_SECTORS = 1_000_000
 CFB_ENTRIES = 131_072     # directory entries

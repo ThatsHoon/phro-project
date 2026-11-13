@@ -63,9 +63,10 @@ class _Reader(Scopes):
         self.counts = {"fn": 0, "en": 0, "cm": 0}
         self.numbers = {}
         self.cache = {}
-        self.charts = {}
+        self.charts = {}  # a chart part's name -> (its table or None, the table's cells)
         self.opened = 0  # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
+        self.chart_cells = 0  # chart table cells placed so far, copies counted (CHART_TOTAL)
         self.margins = False  # walking a header or footer, whose pictures and charts are skipped
 
     # ---- package
@@ -316,6 +317,8 @@ class _Reader(Scopes):
         st.extras.append(Image(data, "" if AUTO_ALT.match(alt) else alt))
 
     def chart(self, el, st):
+        """A part two charts name is read once, but every placement is charged against CHART_TOTAL, as in the Word
+        and slide readers; one past it is counted under chart instead."""
         if self.margins:  # in a header or footer: skipped, neither read nor counted
             return
         href = attr(el, "chartIDRef")
@@ -330,9 +333,15 @@ class _Reader(Scopes):
                     if e.kind != "damaged":
                         raise
                     self.ctx.skipped["chart"] += 1
-            self.charts[name] = tbl
-        if self.charts[name] is not None:
-            st.extras.append(self.charts[name])
+            self.charts[name] = tbl, sum(len(r) for r in tbl.rows) if tbl is not None else 0
+        tbl, cells = self.charts[name]
+        if tbl is None:
+            return
+        self.chart_cells += cells
+        if self.chart_cells > limits.CHART_TOTAL:
+            self.ctx.skipped["chart"] += 1
+            return
+        st.extras.append(tbl)
 
     # ---- tables
     def table(self, tbl, d):

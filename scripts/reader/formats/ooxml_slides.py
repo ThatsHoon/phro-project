@@ -12,7 +12,6 @@ from . import ooxml_base
 from .ooxml_base import int_of as _int
 
 IMAGE_BYTES = 256 * 2**20  # image bytes one deck may emit, copies counted
-CHART_CELLS = 200_000      # chart table cells one deck may emit, copies counted
 SPAN_CELLS = 500_000       # grid slots all spans of one table may cover; past it spans become 1
 MAX_ALT, MAX_TITLE = 200, 200
 COORD = 10**13
@@ -322,7 +321,7 @@ class _Reader:
                 tbl = ooxml_base.chart(self.pkg, self.scope.part, attr(e, "id"), self.ctx)
                 if tbl is not None:
                     self.chart_cells += sum(len(r) for r in tbl.rows)
-                if tbl is None or self.chart_cells > CHART_CELLS:
+                if tbl is None or self.chart_cells > limits.CHART_TOTAL:
                     self.ctx.skipped["chart"] += 1
                     return []
                 return [tbl]

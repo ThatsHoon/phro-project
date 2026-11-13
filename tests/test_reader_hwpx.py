@@ -334,6 +334,22 @@ def test_wide_chart_is_bounded():
     assert len(tbl.rows) == limits.CHART_CELLS // 301 and tbl.caption.endswith(f"(first {len(tbl.rows) - 1} points)")
 
 
+def test_chart_placements_charged():
+    # every placement of one chart is charged against CHART_TOTAL, as in docx and pptx: a chart near CHART_CELLS placed
+    # 50 times is placed while the cells stay under the cap, each one past it is counted under chart, and the render
+    # stays bounded
+    import time
+    n = 50
+    sec = '<hp:p><hp:run><hp:chart chartIDRef="Chart/chart1.xml"/></hp:run></hp:p>' * n
+    path = hwpx_doc(sec, extra={"Chart/chart1.xml": _wide_chart(300, 10_000)})
+    t0 = time.monotonic()
+    doc, ctx = parse(path)
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert time.monotonic() - t0 < 10, time.monotonic() - t0
+    keep = limits.CHART_TOTAL // sum(len(r) for r in next(b for b in doc.blocks if hasattr(b, "rows")).rows)
+    assert ctx.skipped["chart"] == n - keep and out.count("Chart: bar") == keep, (ctx.skipped, out.count("Chart:"))
+
+
 def test_equation():
     eq = '<hp:p><hp:run><hp:equation><hp:script>%s</hp:script></hp:equation>%s</hp:run></hp:p>'
     assert md(hwpx_doc(eq % ("a over b", ""))) == "$$\\frac{a}{b}$$\n"
