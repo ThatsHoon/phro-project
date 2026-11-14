@@ -379,17 +379,74 @@ def _make_line(frags, chars, vertical=False):
                 min(f.order for f in frags), vertical)
 
 
+def _glyphs(f, urls):
+    """[(start, end, char, url, size)] of a fragment's glyphs along the reading axis: glyph k
+    starts at its char offset and ends where the next one starts, less the next one's gap."""
+    n = len(f.text)
+    s = along(f)
+    offs = f.char_offsets if len(f.char_offsets) == n + 1 else tuple(
+        f.width * k / n for k in range(n + 1))
+    gaps = f.char_gaps if len(f.char_gaps) == n else (0.0,) * n
+    out = []
+    for k, ch in enumerate(f.text):
+        end = offs[k + 1] - (gaps[k + 1] if k + 1 < n else 0.0)
+        out.append((s + offs[k], s + max(offs[k], end), ch, urls[k] if urls else "", f.size))
+    return out
+
+
+def _overprints(f, g) -> bool:
+    """Whether a glyph of `f` covers over half of a glyph of `g` (text drawn twice over itself,
+    as a fake bold does). Spaces are passed over."""
+    a = sorted((g0, g1) for g0, g1, ch, _, _ in _glyphs(f, None) if not ch.isspace())
+    b = sorted((g0, g1) for g0, g1, ch, _, _ in _glyphs(g, None) if not ch.isspace())
+    i = j = 0
+    while i < len(a) and j < len(b):
+        (a0, a1), (b0, b1) = a[i], b[j]
+        over = min(a1, b1) - max(a0, b0)
+        if over > 0 and over > 0.5 * min(a1 - a0, b1 - b0):
+            return True
+        if a1 < b1:
+            i += 1
+        else:
+            j += 1
+    return False
+
+
+def _positioned_chars(parts):
+    """[(char, url)] of a line whose fragments were drawn out of reading order: every glyph sorted
+    by its start, a space where the gap to the glyph before is over GAP x its size and neither
+    side is a space. `parts` is [(fragment, urls)] in content order."""
+    glyphs = sorted((g for f, urls in parts for g in _glyphs(f, urls)), key=lambda g: g[0])
+    out, end = [], None
+    for start, stop, ch, url, size in glyphs:
+        if end is not None and start - end > GAP * size and ch != " " and out[-1][0] != " ":
+            out.append((" ", url if out[-1][1] == url else ""))
+        out.append((ch, url))
+        end = stop if end is None else max(end, stop)
+    return out
+
+
 def lines(fragments, links=()) -> List[Line]:
-    """Lines in content order: fragments of one direction on one baseline, each starting where
-    the last ended, are one line. A space goes between two glyphs when the gap is over GAP x the
-    size and neither side is a space. Vertical text comes last, as `vertical_lines`.
+    """Lines in content order: consecutive fragments of one direction on one baseline are one
+    line. A space goes between two glyphs when the gap is over GAP x the size and neither side
+    is a space. A fragment that starts before the last one ended joins the line too when no glyph
+    of it covers a glyph of the last (a row whose cells are drawn right cell first, or words drawn
+    into the gaps a later string leaves); the line's glyphs are then put in order by position.
+    One that does cover the last (text drawn twice over itself) starts a new line. Vertical text
+    comes last, as `vertical_lines`.
 
     `links` is [(box, url)]; a character whose centre lies in a link box carries its url.
     """
     frags = sorted((f for f in fragments if f.text and not f.hidden), key=lambda f: f.order)
     grid = _LinkGrid(links) if links else None
     out, vertical = [], []
-    cur, chars, direction, anchor, end = [], [], "", 0.0, 0.0
+    cur, parts, chars, direction, anchor, end = [], [], [], "", 0.0, 0.0
+    backward = False
+
+    def flush():
+        got = _positioned_chars(parts) if backward else chars
+        if cur and any(not c[0].isspace() for c in got):
+            out.append(_make_line(cur, got))
 
     for f in frags:
         d = writing_direction(f)
@@ -398,21 +455,25 @@ def lines(fragments, links=()) -> List[Line]:
             continue
         a, s = across(f), along(f)
         urls = _glyph_urls(f, grid)
-        if (cur and d == direction
-                and abs(a - anchor) <= LINE_TOLERANCE * max(f.size, cur[-1].size)
-                and s >= end - LINE_TOLERANCE * f.size):
+        same_line = (cur and d == direction
+                     and abs(a - anchor) <= LINE_TOLERANCE * max(f.size, cur[-1].size))
+        if same_line and s >= end - LINE_TOLERANCE * f.size:
             if (s - end > GAP * f.size and chars[-1][0] != " " and not f.text[0].isspace()):
                 same = chars[-1][1] == (urls[0] if urls else "")
                 chars.append((" ", chars[-1][1] if same else ""))
             cur.append(f)
+            parts.append((f, urls))
             chars.extend(_chars_of(f, urls))
+        elif same_line and not _overprints(f, cur[-1]):
+            backward = True
+            cur.append(f)
+            parts.append((f, urls))
         else:
-            if cur and any(not c[0].isspace() for c in chars):
-                out.append(_make_line(cur, chars))
-            cur, chars, direction, anchor = [f], _chars_of(f, urls), d, a
+            flush()
+            cur, parts, chars, direction, anchor = [f], [(f, urls)], _chars_of(f, urls), d, a
+            backward = False
         end = s + f.width
-    if cur and any(not c[0].isspace() for c in chars):
-        out.append(_make_line(cur, chars))
+    flush()
     return out + vertical_lines(vertical, links)
 
 

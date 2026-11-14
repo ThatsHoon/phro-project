@@ -342,6 +342,23 @@ def test_rotated_page():
     assert not ctx.skipped, ctx.skipped
 
 
+def test_baseline_drawn_out_of_order():
+    # a table row whose cells the content stream draws right cell first: one line, left to right
+    row = [text_ops("9.50", 400, 700), text_ops("0001", 72, 700), text_ops("PLAN", 120, 700),
+           text_ops("19.00", 480, 700), text_ops("LUMP", 300, 700)]
+    text, _, _ = md(simple_pdf([b" ".join(row)]))
+    assert "0001 PLAN LUMP 9.50 19.00" in text, text
+    # words drawn first into the gaps a later TJ string leaves: the glyphs interleave by position
+    # (IMPORT is 46.668 wide at 12 pt Helvetica; -2250 moves TABLE 27 pt past its end)
+    gaps = [text_ops("and", 121.668, 650),
+            b"BT /F1 12 Tf 72 650 Td [(IMPORT) -2250 (TABLE)] TJ ET"]
+    text, _, _ = md(simple_pdf([b" ".join(gaps)]))
+    assert "IMPORT and TABLE" in text, text
+    # the same text drawn twice over itself (fake bold) is not interleaved glyph by glyph
+    text, _, _ = md(simple_pdf([text_ops("Bold", 72, 600) + b" " + text_ops("Bold", 72.3, 600)]))
+    assert "BBoolldd" not in text and text.count("Bold") == 2, text
+
+
 def test_page_seconds_part():
     now = [0.0]
     real = pdf_layout.lines
