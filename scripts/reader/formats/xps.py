@@ -96,6 +96,19 @@ def _paras(lines, out):
         out.append(Para([Text(" ".join(buf))]))
 
 
+def _columns(runs, width):
+    """[runs] in reading order: [left, right] for a clean two-column page, else [all]."""
+    if width > 0 and len(runs) >= 6:
+        mid, band = width / 2, width * 0.05
+        lo, hi = mid - band, mid + band
+        if not any(r[1] < hi and r[1] + _extent(r[3], r[2]) > lo for r in runs):
+            left = [r for r in runs if r[1] < mid]
+            right = [r for r in runs if r[1] >= mid]
+            if len(_lines(left)) >= 3 and len(_lines(right)) >= 3:
+                return [left, right]
+    return [runs]
+
+
 class _Reader:
     def __init__(self, pkg, ctx):
         self.pkg, self.ctx = pkg, ctx
@@ -323,16 +336,7 @@ class _Reader:
             _paras(_lines(stream), blocks)
 
     def columns(self, runs, width):
-        """[runs] in reading order: [left, right] for a clean two-column page, else [all]."""
-        if width > 0 and len(runs) >= 6:
-            mid, band = width / 2, width * 0.05
-            lo, hi = mid - band, mid + band
-            if not any(r[1] < hi and r[1] + _extent(r[3], r[2]) > lo for r in runs):
-                left = [r for r in runs if r[1] < mid]
-                right = [r for r in runs if r[1] >= mid]
-                if len(_lines(left)) >= 3 and len(_lines(right)) >= 3:
-                    return [left, right]
-        return [runs]
+        return _columns(runs, width)
 
     def story_parts(self, owners):
         out, seen = [], set()
