@@ -41,6 +41,7 @@ def parse_rc4(data: bytes, off: int = 0) -> Rc4Header:
         if not 32 <= size <= 4096 or 12 + size + 60 > len(data) - off:
             raise ValueError("bad CryptoAPI header size")
         _f, _extra, alg, halg, bits = struct.unpack_from("<5I", data, off + 12)
+        # Office writes algID 0 and algIDHash 0 for RC4 CryptoAPI (the type is implied by the version), so 0 is valid.
         if alg not in (0, 0x6801) or halg not in (0, 0x8004):
             raise ValueError("not RC4 CryptoAPI")
         bits = bits or 40

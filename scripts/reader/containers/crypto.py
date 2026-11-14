@@ -6,6 +6,8 @@ schedule once per call, and one struct call each way for the whole buffer.
 """
 import struct
 
+from .. import limits
+
 _M = 0xFFFFFFFF
 
 
@@ -172,7 +174,12 @@ class MsvcRand:
 
 
 def rc4(key: bytes, data: bytes, skip: int = 0) -> bytes:
-    """RC4 keystream XOR; the keystream drops its first `skip` bytes."""
+    """RC4 keystream XOR; the keystream drops its first `skip` bytes.
+
+    Raises ReadError("too_large") over `limits.DECRYPT_BYTES`; callers keep their own earlier checks.
+    """
+    if len(data) > limits.DECRYPT_BYTES:
+        raise limits.ReadError("too_large", "part: RC4 data")
     if not key:
         raise ValueError("RC4 needs a key")
     s = list(range(256))

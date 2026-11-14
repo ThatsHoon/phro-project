@@ -739,8 +739,8 @@ def rc4_header(password, *, cryptoapi=True, key_bits=128, salt=bytes(range(16)))
         key = hashlib.sha1(base + bytes(4)).digest()[:key_bits // 8]
         key = key + bytes(11) if key_bits == 40 else key
         enc = rc4(key, verifier + hashlib.sha1(verifier).digest())
-        header = struct.pack("<8I", 0x24, 0, 0x6801, 0x8004, 0 if key_bits == 40 else key_bits, 1, 0, 0) + b"\0\0"
-        return (struct.pack("<HHII", 3, 2, 0x24, len(header)) + header + struct.pack("<I", 16) + salt
+        header = struct.pack("<8I", 0x04, 0, 0x6801, 0x8004, 0 if key_bits == 40 else key_bits, 1, 0, 0) + b"\0\0"
+        return (struct.pack("<HHII", 3, 2, 0x04, len(header)) + header + struct.pack("<I", 16) + salt
                 + enc[:16] + struct.pack("<I", 20) + enc[16:])
     h0 = hashlib.md5(pw).digest()[:5]
     base = hashlib.md5((h0 + salt) * 16).digest()[:5]

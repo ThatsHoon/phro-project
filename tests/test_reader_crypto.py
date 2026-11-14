@@ -117,6 +117,43 @@ def test_not_rc4():
         raise AssertionError("must raise ValueError")
 
 
+def test_rc4_size_cap():
+    from unittest import mock
+    from reader import limits
+    from reader.limits import ReadError
+    with mock.patch.object(limits, "DECRYPT_BYTES", 100):
+        assert rc4(b"k", bytes(100)) == rc4(b"k", bytes(100))
+        try:
+            rc4(b"k", bytes(101))
+        except ReadError as e:
+            assert e.kind == "too_large", e.kind
+        else:
+            raise AssertionError("over DECRYPT_BYTES must raise ReadError too_large")
+
+
+def test_cryptoapi_header_flags_and_bad_branches():
+    raw = rc4_header("pw")
+    assert struct.unpack_from("<I", raw, 4)[0] == 0x04          # outer flags: fCryptoAPI only, no fAES
+    for off, val in ((8, 31), (8, 4097), (8, 10**6)):            # header size below 32, over 4096, past the data
+        bad = bytearray(raw)
+        struct.pack_into("<I", bad, off, val)
+        try:
+            parse_rc4(bytes(bad))
+        except ValueError:
+            continue
+        raise AssertionError(f"header size {val} must raise ValueError")
+    size = struct.unpack_from("<I", raw, 8)[0]
+    for name, off, val in (("key size 32", 12 + 16, 32), ("key size 129", 12 + 16, 129), ("key size 44", 12 + 16, 44),
+                           ("salt size", 12 + size, 8), ("hash size", 12 + size + 36, 16)):
+        bad = bytearray(raw)
+        struct.pack_into("<I", bad, off, val)
+        try:
+            parse_rc4(bytes(bad))
+        except ValueError:
+            continue
+        raise AssertionError(name + " must raise ValueError")
+
+
 def test_rc4_throughput():
     data = bytes(range(256)) * 16384         # 4 MiB
     start = time.perf_counter()
