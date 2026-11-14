@@ -69,6 +69,19 @@ def test_record_cap():
         limits.BIN_RECORDS = old
 
 
+def test_record_cap_counts_continues_without_overshoot():
+    old = limits.BIN_RECORDS
+    limits.BIN_RECORDS = 4
+    try:
+        ctx = Context()
+        st = biff.Stream(rec(1, b"") + b"".join(rec(CONT, b"x") for _ in range(6)), ctx)
+        recs = list(st.records(0))
+        assert st.count <= 4, st.count
+        assert len(recs) == 1 and len(recs[0][3]) == 3 and ctx.skipped["record"] == 1, (len(recs), ctx.skipped)
+    finally:
+        limits.BIN_RECORDS = old
+
+
 def test_sst_width_switch():
     first = u32(2) + u32(1) + u16(5) + b"\x00" + b"ab"  # 5 chars, 8-bit, 2 present
     cont = b"\x01" + "c한글".encode("utf-16-le")  # the rest is 16-bit

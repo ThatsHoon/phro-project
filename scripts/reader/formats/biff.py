@@ -49,6 +49,7 @@ class Stream:
                 self.ctx.skipped["record"] += 1
                 return
             rid, off, size = rec
+            self.count += 1  # the record itself first, so its CONTINUEs cannot take the last place and leave it over
             nxt = off + size
             conts = []
             cut = False
@@ -61,7 +62,6 @@ class Stream:
                 self.count += 1
                 conts.append((c[1], c[2]))
                 nxt = c[1] + c[2]
-            self.count += 1
             yield (rid, off, size, tuple(conts))
             if cut:
                 self.ctx.skipped["record"] += 1
