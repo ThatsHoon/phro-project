@@ -25,6 +25,12 @@ LOST = (
     (("slide",), "slide", "slides"),
     (("sheet",), "sheet", "sheets"),
     (("page",), "page", "pages"),
+    (("page_cut",), "page past the time or page limit", "pages past the time or page limit"),
+    (("page_part",), "page read in part", "pages read in part"),
+    (("scan",), "scanned page not shown", "scanned pages not shown"),
+    (("figure",), "vector figure not shown", "vector figures not shown"),
+    (("field",), "form field", "form fields"),
+    (("annotation",), "annotation", "annotations"),
     (("document",), "document part", "document parts"),
     (("master",), "master slide", "master slides"),
     (("notes",), "notes page", "notes pages"),
@@ -54,7 +60,7 @@ LOST = (
     (("depth",), "place nested too deeply", "places nested too deeply"),
 )
 # Named items: reported after the counted ones, by name only (a flag, not a count).
-NAMED = (("vba", "VBA macros"),)
+NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"))
 # counted too, but they only change formatting or reading order, so they are not reported
 INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story"})
 
@@ -348,6 +354,8 @@ class _Render:
             head = "## Slide" + (f" {s.number}" if s.number is not None else "") + (f": {s.title}" if s.title else "")
         elif s.kind == "sheet":
             head = f"## Sheet: {s.title}"
+        elif s.kind == "page" and s.number is not None:
+            head = f"## Page {s.number}" + (f": {s.title}" if s.title else "")
         elif s.kind == "page" and s.title:
             head = f"## Page: {s.title}"
         if head:
@@ -783,4 +791,5 @@ def stats(md: str) -> dict:
             deepest = lvl
             break
     heads = [(i, t) for i, lvl, t in heads if lvl <= deepest]
-    return {"lines": len(lines), "hidden": n_hidden, "headings": heads}
+    pages = [[int(mo.group(1)), i] for i, ln in enumerate(lines, 1) if (mo := re.match(r"^## Page (\d+)(?::|$)", ln))]
+    return {"lines": len(lines), "hidden": n_hidden, "headings": heads, "pages": pages}

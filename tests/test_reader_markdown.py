@@ -362,7 +362,7 @@ def test_cell_heading_and_alt_escaped():
 
 
 def test_stats():
-    assert markdown.stats("# A\n\nx\n\n# B\n") == {"lines": 5, "hidden": 0, "headings": [(1, "A"), (5, "B")]}
+    assert markdown.stats("# A\n\nx\n\n# B\n") == {"lines": 5, "hidden": 0, "headings": [(1, "A"), (5, "B")], "pages": []}
     s = markdown.stats("(3 hidden places left out)\n\n## A\n\n### b\n")
     assert s["hidden"] == 3 and s["headings"] == [(3, "A"), (5, "b")]  # no level has 3: every level
 
@@ -525,6 +525,35 @@ def test_nested_hidden_cols():
 def test_all_hidden_cols_cell_dropped():
     out = R(t([["a", "S", "b"]], hidden_cols=frozenset({0, 1, 2})))
     assert "S" not in out and out.splitlines()[0] == "(3 hidden places left out)", out
+
+
+def test_page_heading_numbered():
+    out = R(Doc(blocks=[Section("page", number=3, blocks=[Para([Text("x")])]), Section("page", number=4)]))
+    assert "## Page 3" + chr(10)*2 + "x" + chr(10)*2 + "## Page 4" in out, out
+    assert "## Page 2: T" in R(Doc(blocks=[Section("page", number=2, title="T")]))
+
+
+def test_page_heading_xps_unchanged():
+    assert "## Page: T" in R(Doc(blocks=[Section("page", title="T")]))
+    assert "## Page" not in R(Doc(blocks=[Section("page", blocks=[P("a")])]))
+
+
+def test_stats_pages():
+    md = "x" + chr(10) + "## Page 1" + chr(10) + "a" + chr(10) + "## Page 2: T" + chr(10) + chr(92) + "## Page 9" + chr(10)
+    assert markdown.stats(md)["pages"] == [[1, 2], [2, 4]]
+
+
+def test_lost_pdf_kinds():
+    from collections import Counter
+    sk = Counter(page_cut=2, page_part=1, scan=1, figure=3, field=1, annotation=2)
+    assert markdown.unread(sk) == ["2 pages past the time or page limit", "1 page read in part",
+                                   "1 scanned page not shown", "3 vector figures not shown", "1 form field",
+                                   "2 annotations"]
+
+
+def test_named_pdf_items():
+    from collections import Counter
+    assert markdown.unread(Counter(xfa=1, attachment=1)) == ["XFA form", "attached files"]
 
 
 def main():
