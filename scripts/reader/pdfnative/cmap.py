@@ -96,10 +96,14 @@ class EncodingCMap:
                  for size, lo, hi in self.codespaces}
         if parent is not None:
             boxes |= parent._boxes
+        # A chain counts the trim once: when the parent already dropped code spaces, the
+        # merged set is the same drop, not a new one.
+        inherited = parent is not None and any(k == "codespace_ranges" for k, _m in parent.cut_notes)
         if len(boxes) > MAX_CODESPACE_RANGES:
             boxes = set(sorted(boxes)[:MAX_CODESPACE_RANGES])
-            self.cut_notes.append(("codespace_ranges",
-                                   "WARN: Encoding CMap passed the code space range cap (100); some ranges are dropped"))
+            if not inherited:
+                self.cut_notes.append(("codespace_ranges",
+                                       "WARN: Encoding CMap passed the code space range cap (100); some ranges are dropped"))
         self._boxes = frozenset(boxes)
         self._lengths = sorted({size for size, _lo, _hi in self._boxes})
         self._spaces = {length: {} for length in (1, 2, 3, 4)}
@@ -237,7 +241,12 @@ def parse_encoding_cmap(data, warnings=None, parents=None, _seen=None, parent_cm
     cmap = EncodingCMap(spaces, ranges, notdef, parent, fields[b"Registry"],
                         fields[b"Ordering"], int(supplement.group(1)) if supplement else 0,
                         int(mode.group(1)) if mode else (parent.wmode if parent else 0), warnings)
-    cmap.cut_notes[:0] = notes
+    # one count per kind per CMap chain: a parent's note and the child's own are the same drop
+    kept = []
+    for note in notes + cmap.cut_notes:
+        if note[0] not in [k for k, _m in kept]:
+            kept.append(note)
+    cmap.cut_notes[:] = kept
     if warnings is not None:
         for _key, message in cmap.cut_notes:
             if message not in warnings:

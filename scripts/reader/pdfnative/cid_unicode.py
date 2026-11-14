@@ -129,7 +129,10 @@ def _reverse_format12(data, offset, limit, reverse, budget, note):
         return
     for i in range(groups):
         first, last, base = struct.unpack_from(">III", data, offset + 16 + 12 * i)
-        if first > last or last > 0x10ffff or last - first > MAX_CMAP_ENTRIES:
+        if first > last or last > 0x10ffff:
+            continue
+        if last - first > MAX_CMAP_ENTRIES:
+            note("truetype_cmap", "WARN: TrueType cmap format 12 group passed the entry cap; the group is dropped")
             continue
         for code in range(first, last + 1):
             budget[0] -= 1
@@ -149,6 +152,8 @@ def reverse_truetype_cmap(data, note=None):
         return {}
     tables = _u16(data, 4)
     if tables > 256 or 12 + tables * 16 > len(data):
+        if tables > 256:
+            note("truetype_cmap", "WARN: TrueType font passed the table cap (256); its cmap is not read")
         return {}
     cmap_offset = cmap_end = None
     for i in range(tables):
@@ -162,6 +167,8 @@ def reverse_truetype_cmap(data, note=None):
         return {}
     records = _u16(data, cmap_offset + 2)
     if records > 256 or cmap_offset + 4 + records * 8 > cmap_end:
+        if records > 256:
+            note("truetype_cmap", "WARN: TrueType cmap passed the record cap (256); it is not read")
         return {}
     subtables = []
     for i in range(records):

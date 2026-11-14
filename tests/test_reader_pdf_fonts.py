@@ -11,7 +11,9 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from pdf_fix import Name, Ref, Stream, font_type0, simple_pdf, text_ops, truetype_cmap_font  # noqa: E402
-from reader.pdfnative import cmap  # noqa: E402
+import struct  # noqa: E402
+
+from reader.pdfnative import cmap, fonts  # noqa: E402
 from reader.pdfnative.cid_unicode import adobe_cid, reverse_truetype_cmap  # noqa: E402
 from reader.pdfnative.fonts import font_infos  # noqa: E402
 from reader.pdfnative.structure import PDFFile  # noqa: E402
@@ -121,6 +123,80 @@ def test_font_cache_by_ref():
     resources, cache = pf.pages()[0][1]["Resources"], {}
     first = font_infos(pf, resources, cache)["F2"]
     assert font_infos(pf, resources, cache)["F2"] is first and len(cache) == 1
+
+
+def test_encoding_range_cap_counted():
+    # codespace + 2 cidranges fit under the patched cap of 3; the third range is dropped
+    a = next(c for c in range(1, 65536) if adobe_cid("Korea1", c) == "가")
+    b = next(c for c in range(1, 65536) if adobe_cid("Korea1", c) == "나")
+    data = (b"/CIDSystemInfo << /Registry (Adobe) /Ordering (Korea1) /Supplement 0 >> def\n"
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+            b"3 begincidrange <0001> <0001> %d <0002> <0002> %d <0003> <0003> %d endcidrange\n"
+            % (a, b, a))
+    objects = font_type0(tounicode=None, ordering="Korea1")
+    objects[100]["Encoding"] = Ref(105)
+    objects[105] = Stream({"Type": Name("CMap"),
+                           "CIDSystemInfo": {"Registry": b"Adobe", "Ordering": b"Korea1"}}, data)
+    old = cmap.MAX_ENCODING_RANGES
+    cmap.MAX_ENCODING_RANGES = 3
+    try:
+        pf, info = load(objects)
+    finally:
+        cmap.MAX_ENCODING_RANGES = old
+    assert info.decode(b"\x00\x01\x00\x02\x00\x03") == "가나"
+    assert pf.cuts["encoding_ranges"] == 1, pf.cuts
+
+
+def test_truetype_font_bytes_cap_counted():
+    objects = font_type0(tounicode=None, ordering="Identity", embedded_cmap={5: 0xD55C})
+    old = fonts.MAX_FONT_BYTES
+    fonts.MAX_FONT_BYTES = 10
+    try:
+        pf, info = load(objects)
+    finally:
+        fonts.MAX_FONT_BYTES = old
+    assert info.decode(b"\x00\x05") == "" and info.unmapped
+    assert pf.cuts["truetype_font_bytes"] == 1, pf.cuts
+
+
+def test_truetype_fonts_cut_counts_once_per_font():
+    objects = font_type0(tounicode=None, ordering="Identity", embedded_cmap={5: 0xD55C})
+    old = fonts.MAX_TRUETYPE_CMAP_FONTS
+    fonts.MAX_TRUETYPE_CMAP_FONTS = 0
+    try:
+        pf = PDFFile(simple_pdf([text_ops("x")], resources=F2, extra_objects=objects))
+        resources = pf.pages()[0][1]["Resources"]
+        for _ in range(3):  # the same font read again with a fresh cache
+            assert font_infos(pf, resources, {})["F2"].decode(b"\x00\x05") == ""
+    finally:
+        fonts.MAX_TRUETYPE_CMAP_FONTS = old
+    assert pf.cuts["truetype_fonts"] == 1, pf.cuts
+
+
+def _cmap_sfnt(subtable, cmap_records=1):
+    cmap_table = struct.pack(">HH", 0, cmap_records) + struct.pack(">HHI", 3, 10, 12) + subtable
+    return (struct.pack(">IHHHH", 0x00010000, 1, 0, 0, 0) + b"cmap"
+            + struct.pack(">III", 0, 28, len(cmap_table)) + cmap_table)
+
+
+def test_truetype_cmap_caps_noted():
+    notes = []
+
+    def note(kind, message):
+        notes.append(kind)
+
+    # a format 12 group wider than MAX_CMAP_ENTRIES
+    group = struct.pack(">III", 0x20000, 0x20000 + 100001, 1)
+    sub = struct.pack(">HHIII", 12, 0, 16 + 12, 0, 1) + group
+    assert reverse_truetype_cmap(_cmap_sfnt(sub), note) == {}
+    assert notes == ["truetype_cmap"], notes
+    # more than 256 sfnt tables, and more than 256 cmap records
+    notes.clear()
+    assert reverse_truetype_cmap(struct.pack(">IHHHH", 0x00010000, 300, 0, 0, 0) + bytes(16 * 300), note) == {}
+    assert notes == ["truetype_cmap"], notes
+    notes.clear()
+    assert reverse_truetype_cmap(_cmap_sfnt(sub, cmap_records=300), note) == {}
+    assert notes == ["truetype_cmap"], notes
 
 
 def main():

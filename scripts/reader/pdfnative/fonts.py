@@ -478,7 +478,16 @@ def cid_fallback_decoder(pdf: PDFFile, name: str, font: dict, encoding_cmap=None
         return None
     if not isinstance(descriptor, dict):
         return None
-    if not isinstance(font_stream, PDFStream) or len(font_stream.raw) > MAX_FONT_BYTES:
+    if not isinstance(font_stream, PDFStream):
+        return None
+    dropped = getattr(pdf, "_cid_font_dropped", None)
+    if dropped is None:
+        dropped = pdf._cid_font_dropped = set()
+    if len(font_stream.raw) > MAX_FONT_BYTES:
+        if id(font_stream) not in dropped:
+            dropped.add(id(font_stream))
+            pdf._cut("truetype_font_bytes",
+                     "WARN: embedded TrueType font passed the size cap; CID recovery is withheld")
         return None
     cache = getattr(pdf, "_cid_cmap_cache", None)
     if cache is None:
@@ -490,8 +499,10 @@ def cid_fallback_decoder(pdf: PDFFile, name: str, font: dict, encoding_cmap=None
         reverse = entry[1]
     else:
         if len(cache) >= MAX_TRUETYPE_CMAP_FONTS:
-            pdf._cut("truetype_fonts",
-                     "WARN: the document's TrueType cmap scan cap passed; CID recovery is withheld")
+            if id(font_stream) not in dropped:  # once per font, however often it is read
+                dropped.add(id(font_stream))
+                pdf._cut("truetype_fonts",
+                         "WARN: the document's TrueType cmap scan cap passed; CID recovery is withheld")
             return None
         warning_count = len(pdf.warnings)
         font_bytes = pdf.decode_stream_bytes(font_stream)
@@ -503,8 +514,10 @@ def cid_fallback_decoder(pdf: PDFFile, name: str, font: dict, encoding_cmap=None
             cache[cache_key] = (font_stream, {})
             return None
         if len(font_bytes) > MAX_FONT_BYTES:
-            pdf._cut("truetype_font_bytes",
-                     "WARN: embedded TrueType font passed the size cap; CID recovery is withheld")
+            if id(font_stream) not in dropped:
+                dropped.add(id(font_stream))
+                pdf._cut("truetype_font_bytes",
+                         "WARN: embedded TrueType font passed the size cap; CID recovery is withheld")
             return None
         reverse = reverse_truetype_cmap(font_bytes, pdf._cut)
         cache[cache_key] = (font_stream, reverse)
