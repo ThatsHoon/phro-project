@@ -42,6 +42,7 @@ LOST = (
     (("smartart_cut",), "SmartArt diagram cut short", "SmartArt diagrams cut short"),
     (("object",), "embedded object", "embedded objects"),
     (("link",), "link", "links"),
+    (("links_cut",), "hyperlink list cut short", "hyperlink lists cut short"),
     (("glyphs",), "text run without Unicode", "text runs without Unicode"),
     (("text",), "text run cut short", "text runs cut short"),
     (("truncated", "node", "parse"), "chapter cut short", "chapters cut short"),

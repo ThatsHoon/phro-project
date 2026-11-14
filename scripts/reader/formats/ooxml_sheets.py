@@ -337,6 +337,7 @@ class _Sheets:
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         cap = limits.SHEET_SCAN
         row, col, cells, rows_seen = -1, -1, 0, False  # cells: the `c` elements open
+        relmap = []  # the sheet's relationships, read once: [dict] after the first hyperlink
         links = []  # (r1, r2, c1, c2, url) of the external hyperlinks, applied after the stream
         stack, done, names = [], [], {}  # the open path, and the ended children each open element still holds
         try:
@@ -375,7 +376,7 @@ class _Sheets:
                             break  # the grid is cut: nothing more can be put
                     elif tag in _SHEET_TAGS and not cells and stack and names.get(stack[-1].tag) == _PARENT[tag]:
                         if tag == "hyperlink":
-                            self._collect(el, part, links, grid)
+                            self._collect(el, part, links, grid, relmap)
                         elif tag == "mergeCell":
                             rng = _range(el.get("ref"))
                             if rng is not None:
@@ -399,7 +400,7 @@ class _Sheets:
         self._link(grid, links)
         return grid.blocks()
 
-    def _collect(self, el, part, links, grid):
+    def _collect(self, el, part, links, grid, relmap):
         """Keep the range and URL of a `hyperlink` that names an external hyperlink relationship; an `r:id` that
         names none counts `link`. Past _LINKS the rest are cut, counted once."""
         rid = attr(el, "id")
@@ -409,17 +410,18 @@ class _Sheets:
             if len(links) == _LINKS:
                 links.append(None)  # the cut is counted once
                 self.ctx.warnings.append(f"sheet {grid.name} cut at {_LINKS} hyperlinks")
-                self.ctx.skipped["sheet_cut"] += 1
+                self.ctx.skipped["links_cut"] += 1
             return
         rng = _range(el.get("ref"))
         if rng is None:
             return
-        try:
-            rels = ooxml_base.rels(self.pkg, part, self.ctx)
-        except ReadError as e:
-            _skip(self.ctx, "rels", e)
-            rels = {}
-        rel = rels.get(rid)
+        if not relmap:  # read once per sheet, whether it succeeds or fails
+            try:
+                relmap.append(ooxml_base.rels(self.pkg, part, self.ctx))
+            except ReadError as e:
+                _skip(self.ctx, "rels", e)
+                relmap.append({})
+        rel = relmap[0].get(rid)
         if rel is None or not rel.external or not rel.type.endswith("/hyperlink") or not rel.target:
             self.ctx.skipped["link"] += 1
             return

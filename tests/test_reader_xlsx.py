@@ -462,7 +462,73 @@ def test_hyperlink_count_cap():
     rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
     with patched("_LINKS", 5, ooxml_sheets):
         out, ctx = linked(rows, ['<hyperlink ref="A1" r:id="rL"/>'] * 20)
-    assert f"[go]({LINK})" in out and ctx.skipped["sheet_cut"] == 1 and warned(ctx, "hyperlinks"), (out, ctx.skipped)
+    assert f"[go]({LINK})" in out and ctx.skipped["links_cut"] == 1 and warned(ctx, "hyperlinks"), (out, ctx.skipped)
+    assert not ctx.skipped["sheet_cut"] and "hyperlink list cut short" in out, (out, ctx.skipped)
+
+
+def test_hyperlink_rels_read_once():
+    rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
+    calls = []
+    real = ooxml_sheets.ooxml_base.rels
+
+    def counting(pkg, part, ctx=None):
+        if part.endswith("sheet1.xml"):
+            calls.append(part)
+        return real(pkg, part, ctx)
+
+    links = ['<hyperlink ref="A1" r:id="rL"/>'] * 3
+    with patched("rels", counting, ooxml_sheets.ooxml_base):
+        out, ctx = md([sheet(rows, after="<hyperlinks>" + "".join(links) + "</hyperlinks>")],
+                      extra_parts={"xl/worksheets/_rels/sheet1.xml.rels": b"<not xml"})
+    assert "go" in out and "](" not in out, out
+    assert ctx.skipped["link"] == 3 and ctx.skipped["rels"] == 1 and len(calls) == 1, (ctx.skipped, calls)
+
+
+def test_hyperlink_rels_failure_read_once():
+    rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
+    calls = []
+
+    real = ooxml_sheets.ooxml_base.rels
+
+    def failing(pkg, part, ctx=None):
+        calls.append(part)
+        if not part.endswith("sheet1.xml"):
+            return real(pkg, part, ctx)
+        raise ReadError("unsupported", "no")
+
+    links = ['<hyperlink ref="A1" r:id="rL"/>'] * 3
+    with patched("rels", failing, ooxml_sheets.ooxml_base):
+        _, ctx = md([sheet(rows, after="<hyperlinks>" + "".join(links) + "</hyperlinks>")])
+    sheet_calls = [c for c in calls if c.endswith("sheet1.xml")]
+    assert ctx.skipped["link"] == 3 and ctx.skipped["rels"] == 1 and len(sheet_calls) == 1, (ctx.skipped, calls)
+
+
+def test_hyperlink_first_wins():
+    rows = "".join(xlsx_row(r, xlsx_cell(f"A{r}", f"v{r}", t="str")) for r in (1, 2))
+    sh = sheet(rows, after='<hyperlinks><hyperlink ref="A1" r:id="rL"/><hyperlink ref="A1:A2" r:id="rM"/></hyperlinks>',
+               rels=[("rL", "hyperlink", LINK, True), ("rM", "hyperlink", "https://example.com/b", True)])
+    out, _ = md([sh])
+    assert f"[v1]({LINK})" in out and "[v2](https://example.com/b)" in out and "[v1](https://example.com/b)" not in out, out
+
+
+def test_hyperlink_noteref_after_link():
+    from reader.model import Link, NoteRef, Text
+    ctx = Context()
+    grid = ooxml_sheets.sheet_grid.Grid("S", ooxml_sheets.sheet_grid.Budget(), ctx)
+    grid.put(0, 0, [NoteRef("n1"), Text("a"), NoteRef("n2"), Text("b")])
+    me = ooxml_sheets._Sheets.__new__(ooxml_sheets._Sheets)
+    me.ctx, me.scan = ctx, 0
+    me._link(grid, [(0, 0, 0, 0, LINK)])
+    assert grid.get(0, 0) == [Link(LINK, [Text("a"), Text("b")]), NoteRef("n1"), NoteRef("n2")], grid.get(0, 0)
+
+
+def test_hidden_in_merge():
+    # the merge's origin row is hidden: its text moves to the first visible row of the merge
+    rows = (xlsx_row(1, xlsx_cell("A1", "mm", t="str"), attrs='hidden="1"')
+            + xlsx_row(3, xlsx_cell("A3", "zz", t="str")))
+    sh = sheet(rows, after='<mergeCells><mergeCell ref="A1:A2"/></mergeCells>')
+    out, _ = md([sh])
+    assert "mm" in out and "zz" in out, out
 
 
 def worst():
