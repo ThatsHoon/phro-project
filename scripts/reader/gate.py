@@ -36,8 +36,8 @@ EDIT_HINT = " Read-only view (no XML, cell addresses or formulas); to edit the f
 PDF_HINT = ' Pages start at "## Page N" lines. Read-only view; to edit or create a pdf, use the pdf skill.'
 OFFER = (' Built-in parser used; pypdfium2 (PyPI, 4 MB) reads tables, scans and forms better. Ask the user; only on'
          ' yes run: python -I -X utf8 "{read_py}" setup --venv "{dir}" (--decline instead if they never want it).')
-REPAIR = (' Read by the built-in parser because the pdf engine in "{dir}" failed its file check; to repair it, ask the'
-          ' user and only on their yes run: python -I -X utf8 "{read_py}" setup --venv "{dir}".')
+REPAIR = (' The pdf engine failed its file check, so the built-in parser was used; to repair it, ask the user and only'
+          ' on their yes run: python -I -X utf8 "{read_py}" setup --venv "{dir}".')
 PAST_END = ' The pdf has {n} pages; pages="{a}-{b}" starts past its end.'
 PASS_TEXT = "phro-project could not convert {name} ({why}); Claude's own Read is used."
 DENY_KINDS = ("encrypted", "drm", "too_large")  # a pdf failing any other way goes to Claude's own Read
@@ -261,13 +261,19 @@ def _context(name, meta, out_md, *, past_end="", offer=""):
         tail = " Warning: the text may be garbled."
     if pdf:
         head += PDF_HINT + past_end
-        if offer and len(head) + len(offer) + len(tail) <= CONTEXT_MAX - 1:
-            head += offer
         runs = _runs(_ints(meta.get("unrendered")))
-        if runs:
+
+        def unrendered(used):
+            if not runs:
+                return ""
             a, b = runs[0]
             end = f'; Read the pdf with pages="{a}-{min(b, a + SUGGEST_PAGES - 1)}" to see them.'
-            head += _clause(" Pages not shown as images: ", [_span(*r) for r in runs], end, len(head) + len(tail))
+            return _clause(" Pages not shown as images: ", [_span(*r) for r in runs], end, used)
+        if offer and len(head) + len(offer) + len(tail) <= CONTEXT_MAX - 1:
+            # the offer comes again on a later Read; pages Claude cannot see here would be lost for good
+            if unrendered(len(head) + len(offer) + len(tail)) or not unrendered(len(head) + len(tail)):
+                head += offer
+        head += unrendered(len(head) + len(tail))
         runs = _runs(_ints(meta.get("figures")))
         if runs:
             head += _clause(" Vector figures on pages ", [_span(*r) for r in runs], " are linked as images.",
@@ -373,13 +379,14 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
 
 
 def parse_pages(v):
-    """Read's `pages` value as (A, B): `N` or `A-B`, spaces allowed around the dash, 1 <= A <= B; else None."""
+    """Read's `pages` value as (A, B): `N` or `A-B` (up to 18 digits each), spaces allowed around the dash,
+    1 <= A <= B; else None."""
     if not isinstance(v, str):
         return None
     nums = []
     for part in v.split("-"):
         part = part.strip()
-        if not (part.isascii() and part.isdigit()) or len(part) > 9:
+        if not (part.isascii() and part.isdigit()) or len(part) > 18:
             return None
         nums.append(int(part))
     if len(nums) > 2:
@@ -418,20 +425,30 @@ def _all_unrendered(meta, a, b):
     return sum(1 for p in unr if a <= p <= b) == b - a + 1
 
 
+class _Unverified(Exception):
+    """The pdf venv failed its file check before a pdfium child was started."""
+
+
 def _pdf(event, path, start, timeout, command):
     """decide() for pdf: the engine id in the key, Read's pages mapped onto the page index, failures passed
     through to Claude's own Read (remembered for a day) and the pypdfium2 setup offer once a session."""
-    import hashlib
-    from reader import cache, pdfenv
+    from reader import pdfenv
     venv = pdfenv.venv_dir()
     engine = pdfenv.engine(venv)
+    if engine != "native":
+        try:
+            return _pdf_read(event, path, start, timeout, command, venv, engine, False)
+        except _Unverified:  # read natively under the native key, and offer the repair
+            pass
+    return _pdf_read(event, path, start, timeout, command, venv, "native", engine != "native")
+
+
+def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
+    import hashlib
+    from reader import cache, pdfenv
     k = cache.key(path, engine)
     entry = cache.lookup(k)
-    repair = False
-    if entry is None and engine != "native" and not pdfenv.verify(venv):
-        engine, repair = "native", True
-        k = cache.key(path, engine)
-        entry = cache.lookup(k)
+    verified = []  # the venv's file check runs once, before the first pdfium child of this call
 
     def convert(key, pages=None):
         """(entry, None), or (None, the hook's output: a deny or a pass-through)."""
@@ -441,6 +458,10 @@ def _pdf(event, path, start, timeout, command):
         fail = _failed(cache.root() / "failed" / key)
         if fail is not None:
             return None, _pass(path, fail)
+        if engine != "native" and not verified:
+            verified.append(True)
+            if not pdfenv.verify(venv):
+                raise _Unverified
         if command is not None:
             cmd = list(command)
         else:
@@ -458,7 +479,8 @@ def _pdf(event, path, start, timeout, command):
         if kind in DENY_KINDS:
             return None, _deny(path, kind, detail)
         why = _why(kind, detail)
-        _touch(cache.root() / "failed" / key, why)
+        if not (kind == "timeout" and detail == LATE):  # the next Read has its full budget: let it try again
+            _touch(cache.root() / "failed" / key, why)
         return None, _pass(path, why)
 
     if entry is None:

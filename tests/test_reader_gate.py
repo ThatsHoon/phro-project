@@ -728,16 +728,77 @@ def test_verify_fail_repairs():
         assert o["permissionDecision"] == "allow", o
         assert Path(o["updatedInput"]["file_path"]).parent.name == cache.key(p, "native"), o
         c = o["additionalContext"]
-        assert f'Read by the built-in parser because the pdf engine in "{v}" failed its file check' in c, c
-        assert OFFER_START not in c, c
+        assert " The pdf engine failed its file check, so the built-in parser was used;" in c, c
+        assert f'setup --venv "{v}".' in c and OFFER_START not in c, c
         assert len(c) < 600
+
+
+def test_range_miss_verifies_first():
+    """A whole entry cached under the pdfium key and a range past its cut: verify runs (once) before any venv child;
+    a tampered venv reads natively with the repair sentence."""
+    import pdf_fix
+    from reader import cache, pdfenv
+    v = pdf_fix.fake_venv(tmp() / "venv")
+    rec = next(v.rglob("RECORD"))
+    rec.write_bytes(rec.read_bytes() + b"tampered,,\n")
+    with pdf_env(v):
+        p = four_pages()
+        k = cache.key(p, pdfenv.engine())
+        d = cache.store(k, p, engine="native")
+        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        meta.update(pages=[[1, 1], [2, 5]], pages_total=4)
+        (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        calls, real_verify = [], pdfenv.verify
+        seen, real_run = [], gate.subprocess.run
+        pdfenv.verify = lambda venv: calls.append(venv) or real_verify(venv)
+        gate.subprocess.run = lambda cmd, **kw: seen.append(cmd) or real_run(cmd, **kw)
+        try:
+            o = out(gate.decide(ev(p, pages="3-4")))
+        finally:
+            pdfenv.verify, gate.subprocess.run = real_verify, real_run
+        assert len(calls) == 1, calls
+        venv_py = str(pdfenv.interpreter(v))
+        assert seen and all(c[0] != venv_py for c in seen), seen
+        assert o["permissionDecision"] == "allow", o
+        assert "failed its file check" in o["additionalContext"], o
+        assert Path(o["updatedInput"]["file_path"]).parent.name.startswith(cache.key(p, "native")), o
+
+
+def test_late_writes_no_marker():
+    """The hook's own budget spent before a child: pass through, but no failure marker, so the next Read retries."""
+    from reader import cache
+    with pdf_env():
+        p = four_pages()
+        k = cache.key(p, "native")
+        d = cache.store(k, p, engine="native")
+        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        meta.update(pages=[[1, 1], [2, 5]], pages_total=4)
+        (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        with clock(0.0, 52.0):
+            o = out(gate.decide(ev(p, pages="3-4")))
+        assert "permissionDecision" not in o and "hook's time limit" in o["additionalContext"], o
+        assert not (cache.root() / "failed" / f"{k}-p3-4").exists()
+        seen, real_run = [], gate.subprocess.run
+        gate.subprocess.run = lambda cmd, **kw: seen.append(cmd) or real_run(cmd, **kw)
+        try:
+            o = out(gate.decide(ev(p, pages="3-4")))
+        finally:
+            gate.subprocess.run = real_run
+        assert len(seen) == 1 and o["permissionDecision"] == "allow", (seen, o)
+        assert Path(o["updatedInput"]["file_path"]).parent.name == f"{k}-p3-4", o
 
 
 def test_pages_values_parsed():
     assert gate.parse_pages(" 3 - 5 ") == (3, 5)
     assert gate.parse_pages("7") == (7, 7)
-    for bad in ("5-3", "0", "3,5", "x", 7, "", "-3", "3-", "1-2-3", "+3", "٣", None):
+    for bad in ("5-3", "0", "3,5", "x", 7, "", "-3", "3-", "1-2-3", "+3", "٣", None, "1" * 19, "0-0"):
         assert gate.parse_pages(bad) is None, bad
+    big = 10**17
+    assert gate.parse_pages("1234567890") == (1234567890, 1234567890)
+    assert gate.parse_pages(f"3-{big}") == (3, big) and gate.parse_pages("9" * 18) == (10**18 - 1, 10**18 - 1)
+    with pdf_env():
+        o = out(gate.decide(ev(four_pages(), pages="1234567890")))
+        assert ' The pdf has 4 pages; pages="1234567890-1234567890" starts past its end.' in o["additionalContext"], o
 
 
 def test_pages_offset_limit():
@@ -897,6 +958,43 @@ def test_offer_fits_with_hint():
     c = gate._context("n" * 24 + ".pdf", meta, md, offer=offer)
     assert c.index(PDF_HINT) == 149 and len(PDF_HINT) == 94, c
     assert offer in c and len(c) < 600, (len(c), c)
+    # the repair sentence fits the same way
+    gate.READ_PY = read_py
+    try:
+        repair = gate.offer_text(venv, repair=True)
+    finally:
+        gate.READ_PY = old
+    assert repair == (' The pdf engine failed its file check, so the built-in parser was used; to repair it, ask the user '
+                      f'and only on their yes run: python -I -X utf8 "{read_py}" setup --venv "{venv}".'), repair
+    c = gate._context("n" * 24 + ".pdf", meta, md, offer=repair)
+    assert repair in c and len(c) < 600, (len(c), c)
+    # an unrendered page whose sentence does not fit beside the offer: the sentence stays, the offer goes
+    c = gate._context("n" * 24 + ".pdf", dict(meta, unrendered=[2]), md, offer=offer)
+    assert offer not in c and ' Pages not shown as images: 2; Read the pdf with pages="2-2" to see them.' in c, c
+
+
+def test_offer_yields_to_unrendered():
+    """Through decide: with no room for both, the unrendered sentence wins and no offer marker is written, so the
+    offer comes on a later Read that has room."""
+    from pdf_fix import text_ops
+    from reader import cache
+    read_py = "C:/Users/someone/.claude/plugins/cache/phro-markt/phro-project/0.16.0/scripts/read.py"
+    venv = "C:/Users/someone/.claude/plugins/data/phro-project-phro/pdf-venv-xyz"
+    old = gate.READ_PY
+    gate.READ_PY = read_py
+    try:
+        with pdf_env(venv) as base:  # READ_PY is fake here: the stub prefix converts
+            p = pdf_file([text_ops("Hi")], name="n" * 50 + ".pdf")
+            assert OFFER_START in ctx_of(gate.decide(sev(p), command=base))  # room for the offer alone
+            _edit_meta(p, unrendered=[1])
+            c = ctx_of(gate.decide(sev(p, "s1"), command=base))
+            assert OFFER_START not in c and "Pages not shown as images: 1;" in c and len(c) < 600, c
+            offers = cache.root() / "offers"
+            assert not offers.exists() or not any(offers.iterdir())
+            _edit_meta(p, unrendered=[])
+            assert OFFER_START in ctx_of(gate.decide(sev(p, "s1"), command=base))
+    finally:
+        gate.READ_PY = old
 
 
 def test_offer_dropped_when_long():
