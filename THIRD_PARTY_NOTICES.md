@@ -255,3 +255,202 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Adobe
+
+Data: `scripts/reader/pdfnative/cid_unicode_data.py` (the Adobe CID to Unicode tables of mapping-resources-pdf), `scripts/reader/pdfnative/predefined_cmap_data.py` (the predefined Encoding CMap ranges of cmap-resources) and `scripts/reader/pdfnative/core14_metrics.py` (the Core 14 AFM metrics and the Adobe Glyph List). The three modules are copied byte for byte from dochan 1.21.0 (commit 29bb52be2cf40750e0dab25b24d87e33d0fcedd7, `src/dochan/pdf/`), each with one added docstring line; dochan's NOTICE reproduces Adobe's notices as follows. The original Adobe CMap and AFM files are not distributed.
+
+```
+Adobe mapping-resources-pdf/pdf2unicode CID to Unicode data
+Source: https://github.com/adobe-type-tools/mapping-resources-pdf/tree/master/pdf2unicode
+Modified: scripts/generate_pdf_cid2unicode.py extracts mappings, excludes
+U+FFFD replacement characters, and compresses the CID tables into
+dochan/pdf/cid_unicode_data.py. Runtime filtering excludes control,
+surrogate, private-use, and noncharacter mappings and strips variation
+selectors, keeping the base character.
+The original CMap files are not distributed with dochan.
+SHA-256 Adobe-CNS1-UCS2: 8375afd535e153a7e3bcf448be93e5012b26229547a20d52520e46e3c386351f
+SHA-256 Adobe-GB1-UCS2: 368b40ec05568faf323cfbbddf23c60d566bbc88e366981eb6541b026381a3b8
+SHA-256 Adobe-Japan1-UCS2: 6a9693361647a37996312cc57071bb79f8c06411207be7c730a83fda1254cd82
+SHA-256 Adobe-KR-UCS2: 6861a3208f331ecd73369c5d51eacf3b72c820fe3c87524f79c9ac1bb16830ec
+SHA-256 Adobe-Korea1-UCS2: 45bcf869acdcec2507f75836919e589e7137b9f9dbaa8e4975747035024248ef
+SHA-256 LICENSE.txt: feb8b068a417681821823ef2e8995072aa111121fa11f8664038f78717f4497c
+
+Copyright lines as they appear in the source files:
+  Adobe-CNS1-UCS2:   Copyright 1990-2020 Adobe. All rights reserved.
+  Adobe-GB1-UCS2:    Copyright 1990-2020 Adobe. All rights reserved.
+  Adobe-Japan1-UCS2: Copyright 1990-2023 Adobe. All rights reserved.
+  Adobe-KR-UCS2:     Copyright 1990-2020 Adobe. All rights reserved.
+  Adobe-Korea1-UCS2: Copyright 1990-2019 Adobe. All rights reserved.
+  LICENSE.txt:       Copyright 1990-2019 Adobe. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+Redistributions of source code must retain the above copyright notice, this list
+of conditions and the following disclaimer.
+
+Redistributions in binary form must reproduce the above copyright notice, this
+list of conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.
+
+Neither the name of Adobe nor the names of its contributors may be used to
+endorse or promote products derived from this software without specific prior
+written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Adobe Core 14 AFM metrics and Adobe Glyph List
+
+Copyright (c) 1985, 1987, 1988, 1989, 1997 Adobe Systems Incorporated. All Rights Reserved.
+Copyright (c) 1985, 1987, 1988, 1989, 1997 Adobe Systems Incorporated. All Rights Reserved.ITC Zapf Dingbats is a registered trademark of International Typeface Corporation.
+Copyright (c) 1985, 1987, 1989, 1990, 1993, 1997 Adobe Systems Incorporated.  All Rights Reserved.
+Copyright (c) 1985, 1987, 1989, 1990, 1993, 1997 Adobe Systems Incorporated.  All Rights Reserved.Times is a trademark of Linotype-Hell AG and/or its subsidiaries.
+Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems Incorporated.  All Rights Reserved.
+Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems Incorporated.  All Rights Reserved.Helvetica is a trademark of Linotype-Hell AG and/or its subsidiaries.
+Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems Incorporated. All rights reserved.
+Copyright (c) 1989, 1990, 1991, 1992, 1993, 1997 Adobe Systems Incorporated.  All Rights Reserved.
+Copyright (c) 1989, 1990, 1991, 1993, 1997 Adobe Systems Incorporated.  All Rights Reserved.
+
+This file and the 14 PostScript(R) AFM files it accompanies may be used, copied, and distributed for any purpose and without charge, with or without modification, provided that all copyright notices are retained; that the AFM files are not distributed without this file; that all modifications to this file or any of the AFM files are prominently noted in the modified file(s); and that this paragraph is not modified. Adobe Systems has no responsibility or obligation to support the use of the AFM files.
+
+Modified: dochan extracts only glyph names, advance widths (WX) and built-in encoding codes from the AFM files, adds a Unicode mapping using the Adobe Glyph List, and rebuilds the WinAnsi and MacRoman tables from Python codecs. The original AFM files are not distributed with dochan.
+(AFM 에서 글리프 이름·폭·내장 인코딩 코드만 추출하고 Adobe Glyph List 로 유니코드 대응표를 더한 수정본이며, 원본 AFM 은 배포하지 않습니다.)
+
+Adobe Glyph List and ITC Zapf Dingbats Glyph List (BSD-3-Clause):
+
+Copyright 2002-2019 Adobe (http://www.adobe.com/).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+
+Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+Neither the name of Adobe nor the names of its contributors may be
+used to endorse or promote products derived from this software without
+specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Adobe cmap-resources predefined PDF Encoding CMap factual ranges
+Source: https://github.com/adobe-type-tools/cmap-resources
+Modified: scripts/generate_pdf_predefined_cmaps.py parses and compresses
+codespace, CID and notdef ranges; parent CMaps remain references.
+Original CMap files are not distributed with dochan.
+SHA-256 Adobe-CNS1-7/B5pc-H: 7a2af623d66158fd9b2eae590d3b0373b2e73125f008befda26c40a6c5d396fb; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/B5pc-V: f1b09f3752437a802f0992297a18361fd3bceed8e208cfbb97f2e6c035a29d2e; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/CNS-EUC-H: 61a5163ddf2dcbeed5efc4c8e9a612c7b3c5a0c062df75b2b3d73e3e46e7a299; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/CNS-EUC-V: 91faeda86c64df62c57b434a5b1322e1a6236c8520db3d4ee58b6ae5fee4c01e; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/ETen-B5-H: b6e5e42d94f6642842f6a42445c1df29d3874c6d1a91a38a05c9d7e4b57f0ce6; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/ETen-B5-V: 0e6f041edd60516e92c9470254c4d45522b4cf079f1809b82862d43a3f1e1663; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/ETenms-B5-H: 051a38392481d6069608f41962ef9393e142797a8977d7f7fbd534b051a6e231; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/ETenms-B5-V: 477e42501dd0c27301b992ab004d6044bf5406277ee7a353d3b04cc08092a9e0; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/HKscs-B5-H: 46b4d44a0d38cf188a88f42688f10a03aed8d67be80c141a1404abacc01ee191; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/HKscs-B5-V: 1f6f7f06216987d973c18e23d1a8c79044d9f1b301e01c738867ca1fdf50e237; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/UniCNS-UCS2-H: fe9c7f1557d58875bc4a16edf377ee0d8c579eaee778135adefbbed1f868c017; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/UniCNS-UCS2-V: 745fd7a922bedd2d124006a4b5e6a909aaaa9f11eebefbb0477c22a01439a3a8; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/UniCNS-UTF16-H: 074d175c8c6827184d064f2c48cbe0ba4957bd525fd864184717518acf4db970; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-CNS1-7/UniCNS-UTF16-V: d21175d1f8a083b606a9a1e17fa98d1cb901a0e833e19d47a6c08fb452c91c11; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GB-EUC-H: 9c2b268c5fbcc9a23aa76d2f199c97fa9fbfcc0ef43f9f320bb367a6b0a47b20; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GB-EUC-V: 5acf07ba8e65be8aad1c7a4535574e41cb326abd295e9e5c1eb3e96037260397; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GBK-EUC-H: 6c88b308f122966de14696d819800bc89be2538fa14fa41f474e36b20cea11c6; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GBK-EUC-V: 73381a5bc2d0aacbf6b2ec211f34e042e7c74895342fcee073b0f9be2dbc8703; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GBK2K-H: 7d945768331212eadca4a9c35390405efa72cf1be7f064cef170aa68cdab0be9; Copyright 1990-2023 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GBK2K-V: 49e81ae0d4b7b35901fbaeff63558bb133d9d0398ac2d0e33fab75404ea71cd2; Copyright 1990-2023 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GBKp-EUC-H: d6ef0e6c393bd065f5b646b7dc87fe8df88f3608a9264fb5727b552418352d5a; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GBKp-EUC-V: 43c8fa12dcef0b1b584fdd077996fff388fc0e9a9d332e08556640ceefa9fa0e; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GBpc-EUC-H: ec6132762b28650eb0c8483ea9387af39acb9d8aca432cb1e4f79a1058e1cd40; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/GBpc-EUC-V: 5fec79fd4f5f95d7638a150eec9b551268b8c29103446f0eee26866769ff384f; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/UniGB-UCS2-H: d2b100a68c016190347c6e0ecee3e7d6d1accd7395d7e803bf88b7ffef156725; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/UniGB-UCS2-V: d94d2e56a9a5cb89e0a68c31eba1ff40aa604b3a504be844c67de64af64eec96; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/UniGB-UTF16-H: 3750279409a96fb3a8ce1fbc25eb95bab4ff7ade023e4e0df6bd33258a3a8726; Copyright 1990-2023 Adobe. All rights reserved.
+SHA-256 Adobe-GB1-6/UniGB-UTF16-V: cc9608b7c8c11133c1148eda883c10433e1d0dc2c964f41744eae89fe75f77d3; Copyright 1990-2023 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/83pv-RKSJ-H: 77f7a0f11fe2ee160baa6446b47b8a66cda41aac4ab777fb92c192198a521377; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/90ms-RKSJ-H: e0b104bcc8dfb3c2d3e025e12c59182d7e0ee1b5df6f55bc8550d4b3fc83ecd3; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/90ms-RKSJ-V: a588f7d20d0c8dbf09693480e62bf3ab80b7453858e4425d4b47650d48e7757b; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/90msp-RKSJ-H: 10b15c3b208d35f9b2764b0dd00e52de59170aa3f102387e7c388dfaa2290fc0; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/90msp-RKSJ-V: 05b5adf56096c0f1baeb267ec63f4018c85e3c3cff01f3457ffa10672a225c09; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/90pv-RKSJ-H: bda3f87262c61ef5a34097737f7306fb160d769f357b72ad251d11384a3848d2; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/90pv-RKSJ-V: 36ab76110635e300971cfeaaa9bc049e28ba3214d2a880dd3b97cf1a041cbca2; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/Add-RKSJ-H: 630d4689f3d17000208452c855d9360dc1f769f102b7d29c17ea11973b28aaa7; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/Add-RKSJ-V: 5664073e91e61009d72d5f007207f29bb8561c05939f3b185909ab92424bf039; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/EUC-H: 5cceeaf017e9f813079bbc17d8e750072e50042a01e521c9f9c18efabd596cba; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/EUC-V: d35c5ce976385980244040037152d92d321b738bca885ad0976c10658cd0acab; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/Ext-RKSJ-H: 00cd02206daf64e633d1c13b979fb20652a554d87fd9f2f0ca94065156ea8b71; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/Ext-RKSJ-V: 8a84926990144b043f2e5ebda194bf3560cc5f29096cafab8a6079a9d86e2d6b; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/H: f90323c3fd16e107b02c888167739f210af7144beba1bda83949069535db3346; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/UniJIS-UCS2-H: 05d064e6b373edf83890e26d7d2a2339482fad265eaf0a2b92ab528af33b5a54; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/UniJIS-UCS2-HW-H: 782f9d14dffa2a538302c8aa02b7d4650ff41d3bbe49215546c66a786be92bed; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/UniJIS-UCS2-HW-V: eb1fe9bd104770efb0fda13b211fee88cc5487a653e5cdf6d89bb782336e7673; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/UniJIS-UCS2-V: b487b2602348ef9c69222fd1a82cd45eea4f756d98e974b94183390c9bd8b6c3; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/UniJIS-UTF16-H: 5cf77ed38c25262dba845676738a887afe45e44425c3dd2489334c4d8c510fcb; Copyright 1990-2022 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/UniJIS-UTF16-V: 03bfb4e91452da537f347b8676e52adfa5dd10f8b920fa2cc34d343580354056; Copyright 1990-2022 Adobe. All rights reserved.
+SHA-256 Adobe-Japan1-7/V: 1ccdbf3451794ddb929a9e2e43f562b20a8d9de5ec44174317c8a149ab498aa1; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/KSC-EUC-H: 90e9250027a7a84fc7a2542f91fe61e3a71299214aaa75c617e12a55dfaa0943; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/KSC-EUC-V: a51f69ff435ff83b3c200b2043572492be05ac08e98f4662f3938b3f6a1b9a6c; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/KSCms-UHC-H: f3e3719b2db01f1c27e5f8b85cfec0d6f018239fb999cd03bbe10084a9f4645a; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/KSCms-UHC-HW-H: 129c4892d7d21a5f188af469d06673994c9395bd61c33987a0652261d27a7f7b; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/KSCms-UHC-HW-V: b6052023250b12413fe7ac8552d64362720374df3c0d1beb2406922856a504fa; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/KSCms-UHC-V: 1ca4c9a90aa3079ffdc8ceb7e288f034d0afbc7142a7fae705416368fc581186; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/KSCpc-EUC-H: 6d2ec35d3aad68c4cba6d93849d8b7b9b8c34572c50b7361ccb6bf338c36f330; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/KSCpc-EUC-V: 2fc9b120724cea591b2ffd2bb4206a31329a085815e45d73e2b93ab5c1ac9f5a; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/UniKS-UCS2-H: bb28e3e84154f49c311128a5700cc0187ce4957b10f18dee88089002db7e5501; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/UniKS-UCS2-V: 76c08c4aace48d92a252e686f9d748ebde009337b59361ec286c4bdc037e5933; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/UniKS-UTF16-H: 0a1dc38d8dd4e1f55b5a3ab978a2b091109f88f4d08587bbb7864370cda8cfd5; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 Adobe-Korea1-2/UniKS-UTF16-V: 681aecd86956265504f7875af43eae3985ab263175aa782baa884b0f514f2aa6; Copyright 1990-2019 Adobe. All rights reserved.
+SHA-256 LICENSE.md: 742665db9c8e1bc72603c6d319ca3e90b83bd6d95202f0cd4ef11068a07a9c29
+
+Copyright 1990-2023 Adobe. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+
+Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+Neither the name of Adobe nor the names of its contributors may be
+used to endorse or promote products derived from this software without
+specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```

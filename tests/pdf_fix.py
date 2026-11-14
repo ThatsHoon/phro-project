@@ -377,12 +377,13 @@ def text_ops(text, x=72, y=720, size=12, font="F1", extra=b""):
 
 
 def simple_pdf(pages, *, resources=None, media=(0, 0, 612, 792), catalog=None,
-               page_extra=None, **kw):
+               page_extra=None, extra_objects=None, **kw):
     """A pdf with one page per content stream in `pages`.
 
     Object 1 is the catalog, 2 the page tree (it holds /Resources and /MediaBox for the pages
     to inherit), 3 the Helvetica font F1; then each page and its content stream. page_extra is
-    a dict merged into every page, or a list of dicts, one per page.
+    a dict merged into every page, or a list of dicts, one per page. extra_objects is a dict
+    of further objects (font_type0 gives some, from number 100 up).
     """
     if resources is None:
         resources = {"Font": {"F1": Ref(3)}}
@@ -402,6 +403,70 @@ def simple_pdf(pages, *, resources=None, media=(0, 0, 612, 792), catalog=None,
         objects[page_num] = page
         objects[content_num] = Stream({}, content)
         kids.append(Ref(page_num))
+    objects.update(extra_objects or {})
     objects[2] = {"Type": Name("Pages"), "Kids": kids, "Count": len(kids),
                   "Resources": resources, "MediaBox": list(media)}
     return make_pdf(objects, root=1, **kw)
+
+
+def _hex_utf16(text):
+    return text.encode("utf-16-be").hex().upper()
+
+
+def font_type0(name="F2", *, tounicode, ordering="Korea1", embedded_cmap=None, vertical=False):
+    """The objects of an Identity-H (or Identity-V) Type0 font, as {number: object}.
+
+    The Type0 font is object 100 (`name` is its BaseFont), its CIDFontType2 descendant 101 with
+    CIDSystemInfo Adobe/`ordering`, the FontDescriptor 102, the ToUnicode stream 103 (when
+    `tounicode`, a {code: text} dict, is not None, written as bfchar entries) and the
+    embedded font stream 104 (when `embedded_cmap`, a {gid: code} dict, is not None, built by
+    truetype_cmap_font). Pass extra_objects=font_type0(...) to simple_pdf with
+    resources={"Font": {"F2": Ref(100)}}; tests edit the returned dicts to vary the font.
+    """
+    objects = {
+        100: {"Type": Name("Font"), "Subtype": Name("Type0"), "BaseFont": Name(name),
+              "Encoding": Name("Identity-V" if vertical else "Identity-H"),
+              "DescendantFonts": [Ref(101)]},
+        101: {"Type": Name("Font"), "Subtype": Name("CIDFontType2"), "BaseFont": Name(name),
+              "CIDSystemInfo": {"Registry": b"Adobe", "Ordering": ordering.encode("ascii"),
+                                "Supplement": 0},
+              "DW": 1000},
+    }
+    if embedded_cmap is not None:
+        objects[101]["FontDescriptor"] = Ref(102)
+        objects[102] = {"Type": Name("FontDescriptor"), "FontName": Name(name), "Flags": 4,
+                        "FontFile2": Ref(104)}
+        objects[104] = Stream({}, truetype_cmap_font(embedded_cmap), flate=True)
+    if tounicode is not None:
+        entries = "".join("<%04X> <%s>\n" % (code, _hex_utf16(text))
+                          for code, text in sorted(tounicode.items()))
+        cmap = ("/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
+                "1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+                "%d beginbfchar\n%sendbfchar\nendcmap end end\n" % (len(tounicode), entries))
+        objects[100]["ToUnicode"] = Ref(103)
+        objects[103] = Stream({}, cmap.encode("ascii"))
+    return objects
+
+
+def truetype_cmap_font(gid_to_code):
+    """A minimal sfnt with a `head` table and a Unicode (3, 1) format 4 `cmap` that maps each
+    code in `gid_to_code.values()` to its glyph id (one segment per glyph)."""
+    pairs = sorted((code, gid) for gid, code in gid_to_code.items())
+    segments = [(code, code, (gid - code) & 0xFFFF) for code, gid in pairs] + [(0xFFFF, 0xFFFF, 1)]
+    count = len(segments)
+    sub = struct.pack(">HHHHHHH", 4, 16 + 8 * count, 0, 2 * count, 0, 0, 0)
+    sub += b"".join(struct.pack(">H", end) for _s, end, _d in segments) + b"\0\0"
+    sub += b"".join(struct.pack(">H", start) for start, _e, _d in segments)
+    sub += b"".join(struct.pack(">H", delta) for _s, _e, delta in segments)
+    sub += b"\0\0" * count
+    cmap = struct.pack(">HHHHI", 0, 1, 3, 1, 12) + sub
+    head = bytes(18) + struct.pack(">H", 1000) + bytes(34)
+    tables = [(b"cmap", cmap), (b"head", head)]
+    out = bytearray(struct.pack(">IHHHH", 0x00010000, len(tables), 0, 0, 0))
+    offset = 12 + 16 * len(tables)
+    for tag, body in tables:
+        out += tag + struct.pack(">III", 0, offset, len(body))
+        offset += (len(body) + 3) // 4 * 4
+    for _tag, body in tables:
+        out += body + bytes(-len(body) % 4)
+    return bytes(out)
