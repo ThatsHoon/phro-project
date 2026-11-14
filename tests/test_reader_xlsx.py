@@ -376,6 +376,94 @@ def test_read_error_kinds():
         out, ctx = md(sheets)
     assert "one" in out and "two" not in out and "next" in out and ctx.skipped["sheet_cut"] == 1, (out, ctx.skipped)
 
+LINK = "https://example.com/a"
+
+
+def linked(rows, links, rels=True, **kw):
+    """md of a sheet whose `after` holds a `hyperlinks` element of raw `hyperlink` XML strings."""
+    sh = sheet(rows, after="<hyperlinks>" + "".join(links) + "</hyperlinks>")
+    if rels:
+        sh["rels"] = [("rL", "hyperlink", LINK, True)]
+    return md([sh], **kw)
+
+
+def test_hidden_rows_cols():
+    rows = (xlsx_row(1, xlsx_cell("A1", "shown", t="str"), xlsx_cell("B1", "hc", t="str"))
+            + xlsx_row(2, xlsx_cell("A2", "hr", t="str"), attrs='hidden="1"'))
+    sh = sheet(rows, before='<cols><col min="2" max="2" width="9" hidden="1"/></cols>')
+    out, _ = md([sh])
+    assert "shown" in out and "hr" not in out and "hc" not in out and "hidden places left out" in out, out
+    out, _ = md([sh], hidden=True)
+    assert "hr" in out and "hc" in out, out
+
+
+def test_merge():
+    rows = xlsx_row(1, xlsx_cell("A1", "m", t="str"))
+    out, _ = md([sheet(rows, after='<mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>')])
+    assert 'colspan="2"' in out, out
+    out, ctx = md([sheet(rows, after='<mergeCells><mergeCell ref="bad"/><mergeCell ref="A1:B1"/></mergeCells>')])
+    assert 'colspan="2"' in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_hyperlink_external():
+    rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
+    out, ctx = linked(rows, ['<hyperlink ref="A1" r:id="rL"/>'])
+    assert f"[go]({LINK})" in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_hyperlink_location():
+    rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
+    out, ctx = linked(rows, ['<hyperlink ref="A1" location="Sheet2!A1"/>'])
+    assert "go" in out and "](" not in out and ctx.skipped["link"] == 0, (out, ctx.skipped)
+
+
+def test_hyperlink_range():
+    rows = "".join(xlsx_row(r, xlsx_cell(f"A{r}", f"v{r}", t="str")) for r in (1, 2, 3))
+    out, _ = linked(rows, ['<hyperlink ref="A1:A3" r:id="rL"/>'])
+    assert out.count(f"]({LINK})") == 3, out
+
+
+def test_hyperlink_missing_rel():
+    rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
+    out, ctx = linked(rows, ['<hyperlink ref="A1" r:id="rX"/>'])
+    assert "go" in out and "](" not in out and ctx.skipped["link"] == 1, (out, ctx.skipped)
+    out, ctx = linked(rows, ['<hyperlink ref="A1" r:id="rL"/>'], rels=False)
+    assert ctx.skipped["link"] == 1, ctx.skipped
+
+
+def test_hyperlink_empty_cell():
+    rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
+    out, ctx = linked(rows, ['<hyperlink ref="C5" r:id="rL"/>'])
+    assert "](" not in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_hyperlink_huge_range():
+    rows = xlsx_row(1, xlsx_cell("A1", "a", t="str")) + xlsx_row(90000, xlsx_cell("C90000", "b", t="str"))
+    t0 = time.perf_counter()
+    out, _ = linked(rows, ['<hyperlink ref="A1:XFD1048576" r:id="rL"/>'])
+    assert out.count(f"]({LINK})") == 2 and time.perf_counter() - t0 < 1, out
+
+
+def test_hyperlink_flood():
+    # many links over the whole sheet of valued cells: the held cost is charged to the scan count, and the links
+    # past it are counted, not walked
+    n = 3000
+    rows = "".join(xlsx_row(r, xlsx_cell(f"A{r}", "x", t="str")) for r in range(1, n + 1))
+    links = ['<hyperlink ref="A1:ZZ1048576" r:id="rL"/>'] * 500
+    with patched("SHEET_SCAN", 4 * n + 3 * n // 2):
+        t0 = time.perf_counter()
+        out, ctx = linked(rows, links)
+        spent = time.perf_counter() - t0
+    assert out.count(f"]({LINK})") == n and spent < 3, (out.count("]("), spent)
+    assert 0 < ctx.skipped["link"] < 500 and ctx.skipped["sheet_cut"] == 0, ctx.skipped
+
+
+def test_hyperlink_count_cap():
+    rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
+    with patched("_LINKS", 5, ooxml_sheets):
+        out, ctx = linked(rows, ['<hyperlink ref="A1" r:id="rL"/>'] * 20)
+    assert f"[go]({LINK})" in out and ctx.skipped["sheet_cut"] == 1 and warned(ctx, "hyperlinks"), (out, ctx.skipped)
+
 
 def worst():
     """The slowest workbook the caps allow: a styles flood and a shared-strings run flood past their caps, and a

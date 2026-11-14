@@ -12,6 +12,11 @@ under a closed-element cap (SST_ELEMENTS, STYLE_ELEMENTS); one that is named but
 sheet part is streamed, and every element it closes is charged to the workbook's scan count, capped at `SHEET_SCAN`.
 A cell shows its cached value; a formula without one shows `=` and its text. A sheet that cannot be read is counted
 under `sheet` and the others still come out; one whose XML breaks after its first row keeps the rows read.
+Hidden rows and columns and merged ranges go to the grid as they are read. Hyperlinks follow the cells, so they are
+collected (at most _LINKS a sheet) and applied after the stream: an external one wraps the cells in its range that
+hold a value in a link, at a cost of min(area, cells held) charged to the scan count; past SHEET_SCAN each link left
+is counted under `link`. A `location` alone changes nothing; an `r:id` without an external hyperlink relationship
+counts `link`.
 """
 import math
 import posixpath
@@ -21,9 +26,10 @@ from datetime import datetime
 from .. import limits
 from ..containers.zipx import attr, iterparse, local
 from ..limits import ReadError
-from ..model import Doc, Section
+from ..model import Doc, Link, NoteRef, Section
 from ..numfmt import code_for, display
 from . import ooxml_base, sheet_grid
+from .word_fields import MAX_URL
 from .xls import _hide
 
 _REF = re.compile(r"([A-Za-z]{1,3})([0-9]{1,7})")  # used with fullmatch
@@ -35,6 +41,9 @@ STYLE_ELEMENTS = 100_000  # elements a styles part may close; a real one closes 
 # the most raw characters one unescaped character can take: a surrogate pair (_xD83D__xDE00_) or an escaped CRLF
 # (_x000D__x000A_), each two 7-character escapes for one character
 _RAW_PER_CHAR = 14
+_LINKS = 100_000  # hyperlink elements one sheet may collect; the rest are cut, counted once
+_SHEET_TAGS = frozenset({"col", "mergeCell", "hyperlink"})
+_PARENT = {"col": "cols", "mergeCell": "mergeCells", "hyperlink": "hyperlinks"}
 _BATCH = 256  # ended siblings a streamed element keeps before they are dropped together
 
 
@@ -72,6 +81,18 @@ def _col(ref) -> int | None:
     for ch in m.group(1).upper():
         n = n * 26 + ord(ch) - 64
     return n - 1
+
+
+def _range(ref):
+    """(r1, r2, c1, c2), zero-based and inclusive, of an `A1` or `A1:B2` reference; None when it is not one."""
+    a, _, b = (ref or "").strip().partition(":")
+    ma, mb = _REF.fullmatch(a), _REF.fullmatch(b or a)
+    if ma is None or mb is None:
+        return None
+    r1, r2, c1, c2 = int(ma.group(2)) - 1, int(mb.group(2)) - 1, _col(a), _col(b or a)
+    if min(r1, r2) < 0:
+        return None
+    return min(r1, r2), max(r1, r2), min(c1, c2), max(c1, c2)
 
 
 def _int(s, default=None):
@@ -316,6 +337,7 @@ class _Sheets:
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         cap = limits.SHEET_SCAN
         row, col, cells, rows_seen = -1, -1, 0, False  # cells: the `c` elements open
+        links = []  # (r1, r2, c1, c2, url) of the external hyperlinks, applied after the stream
         stack, done, names = [], [], {}  # the open path, and the ended children each open element still holds
         try:
             with self.pkg.open(part) as f:
@@ -335,6 +357,8 @@ class _Sheets:
                             r = _int(el.get("r"))
                             row = r - 1 if r is not None and r >= 1 else row + 1
                             col, rows_seen = -1, True
+                            if (el.get("hidden") or "").strip().lower() in ("1", "true"):
+                                grid.hide_row(row)
                         continue
                     stack.pop()
                     kids = done.pop()
@@ -349,6 +373,17 @@ class _Sheets:
                         value = self._cell(el)
                         if value and not grid.put(max(row, 0), col, value):
                             break  # the grid is cut: nothing more can be put
+                    elif tag in _SHEET_TAGS and not cells and stack and names.get(stack[-1].tag) == _PARENT[tag]:
+                        if tag == "hyperlink":
+                            self._collect(el, part, links, grid)
+                        elif tag == "mergeCell":
+                            rng = _range(el.get("ref"))
+                            if rng is not None:
+                                grid.merge(*rng)
+                        elif (el.get("hidden") or "").strip().lower() in ("1", "true"):
+                            lo, hi = _int(el.get("min")), _int(el.get("max"))
+                            if lo is not None and hi is not None and lo >= 1:
+                                grid.hide_cols(lo - 1, hi - 1)
                     if not cells:  # outside a cell an ended element is let go, as `_drop` does (inlined for speed)
                         if kids or tag == "c":  # a cell's subtree goes once the cell is read
                             del el[:]
@@ -361,7 +396,56 @@ class _Sheets:
             if e.kind != "damaged" or not rows_seen:
                 raise
             grid.stop("XML error", 1)  # decision 12: the rows read are kept
+        self._link(grid, links)
         return grid.blocks()
+
+    def _collect(self, el, part, links, grid):
+        """Keep the range and URL of a `hyperlink` that names an external hyperlink relationship; an `r:id` that
+        names none counts `link`. Past _LINKS the rest are cut, counted once."""
+        rid = attr(el, "id")
+        if not rid:  # a `location` alone points inside the workbook
+            return
+        if len(links) >= _LINKS:
+            if len(links) == _LINKS:
+                links.append(None)  # the cut is counted once
+                self.ctx.warnings.append(f"sheet {grid.name} cut at {_LINKS} hyperlinks")
+                self.ctx.skipped["sheet_cut"] += 1
+            return
+        rng = _range(el.get("ref"))
+        if rng is None:
+            return
+        try:
+            rels = ooxml_base.rels(self.pkg, part, self.ctx)
+        except ReadError as e:
+            _skip(self.ctx, "rels", e)
+            rels = {}
+        rel = rels.get(rid)
+        if rel is None or not rel.external or not rel.type.endswith("/hyperlink") or not rel.target:
+            self.ctx.skipped["link"] += 1
+            return
+        links.append((*rng, rel.target[:MAX_URL]))
+
+    def _link(self, grid, links):
+        """Decision 9: wrap the valued cells of each range in a Link. The cost min(area, cells held) is charged to
+        the scan count before the range is walked; a link that no longer fits is counted under `link`."""
+        cap = limits.SHEET_SCAN
+        for item in links:
+            if item is None or grid.cut:
+                continue
+            r1, r2, c1, c2, url = item
+            if self.scan + min((r2 - r1 + 1) * (c2 - c1 + 1), len(grid.cells)) > cap:
+                self.ctx.skipped["link"] += 1
+                continue
+            found, cost = grid.held(r1, r2, c1, c2)
+            self.scan += cost
+            for r, c in found:
+                value = grid.get(r, c)
+                inl = sheet_grid.text_inlines(value) if isinstance(value, str) else list(value)
+                body = [x for x in inl if not isinstance(x, NoteRef)]
+                if not body or any(isinstance(x, Link) for x in body):  # nothing to link, or already linked
+                    continue
+                if not grid.put(r, c, [Link(url, body)] + [x for x in inl if isinstance(x, NoteRef)]):
+                    break  # the budget is gone; the cell keeps its old value
 
     def _cell(self, el) -> str:
         """The displayed value of a `c` element by its type: the cached value first, then `=` and the formula."""
