@@ -15,8 +15,7 @@ import struct
 
 from .. import officeart
 from ..containers import flate
-from ..images import sniff
-from ..limits import IMAGE_BYTES, ReadError
+from ..limits import IMAGE_BYTES
 from ..model import Image
 
 MAX_PLACEMENTS = 10_000  # pictures one workbook places, all its sheets together
@@ -50,9 +49,9 @@ def pictures(g, drawing: bytes, budget: flate.Budget, spent: list, ctx, blips: d
             ctx.skipped["image"] += 1
             continue
         if pib not in blips:  # one inflate per picture for the workbook, not per placement or per sheet
-            blips[pib] = _blip(g.drawing, store[pib - 1], budget)
+            blips[pib] = officeart.blip_image(g.drawing, store[pib - 1], None, budget)
         data = blips[pib]
-        if data is None or len(data) < 16 or sniff(data) is None:
+        if data is None:
             ctx.skipped["image"] += 1
             continue
         spent[0] += len(data)
@@ -97,14 +96,3 @@ def _position(drawing: bytes, anchor, inherited=None) -> tuple:
         return _UNANCHORED
     _, col, _, row = struct.unpack_from("<4H", drawing, anchor[0])
     return row, col
-
-
-def _blip(dgg: bytes, off: int, budget: flate.Budget) -> bytes | None:
-    """The image of the BStore block at `off`; None when it is unreadable, a BLIP that inflates past the ratio cap or
-    the document's total included (that costs the one picture)."""
-    try:
-        return officeart.fbse_blip(dgg, off, None, budget)
-    except ReadError as e:
-        if e.kind not in ("damaged", "too_large"):
-            raise
-        return None

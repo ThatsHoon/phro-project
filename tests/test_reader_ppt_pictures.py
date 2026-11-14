@@ -88,6 +88,31 @@ def test_skipped_placeholder_picture():
     assert not assets and not ctx.skipped, (assets, dict(ctx.skipped))
 
 
+def test_unreadable_or_unknown_blip_counted():
+    from reader_fix import oa_record
+    junk = [oa_record(0xF01E, b"short"),                  # a PNG BLIP cut inside its UID
+            blip_bitmap(0xF01E, 0x6E0, b"")]              # a BLIP with no image bytes (under 16)
+    unknown = blip_png(b"this is not an image at all")   # long enough, but images.sniff has no name for it
+    for blip in (*junk, unknown):
+        slide = {"shapes": [{"text": "kept", "box": (0, 10, 400, 50)}, pic()]}
+        out, ctx, assets = build([slide], pictures=[blip])
+        assert not assets and "kept" in out and "(could not read: 1 image)" in out, (out, dict(ctx.skipped))
+        assert ctx.skipped["image"] == 1 and sum(ctx.skipped.values()) == 1, dict(ctx.skipped)
+
+
+def test_picture_in_notes_is_placed():
+    notes = {1: {"shapes": [{"text": "spoken", "box": (0, 10, 400, 50), "text_kind": 2}, pic()]}}
+    out, ctx, assets = build([{"title": "T"}], pictures=[blip_png(PNG)], notes=notes)
+    assert assets == {"img-001.png": PNG} and "spoken" in out and "![](assets/img-001.png)" in out, (out, assets)
+    assert out.index("## Slide 1") < out.index("spoken") and not ctx.skipped, (out, dict(ctx.skipped))
+
+
+def test_picture_free_slide_counts_nothing():
+    out, ctx, assets = build([{"title": "T", "body": ["words"]}], pictures=[blip_png(PNG)])
+    assert not assets and not ctx.skipped, (assets, dict(ctx.skipped))
+    assert "![](" not in out, out
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

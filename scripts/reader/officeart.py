@@ -14,6 +14,7 @@ from collections.abc import Iterator
 
 from . import limits
 from .containers import flate
+from .images import sniff
 
 MAX_RECORDS = 1_000_000  # records one walk visits
 SP_CONTAINER, SPGR_CONTAINER, FSP, FOPT = 0xF004, 0xF003, 0xF00A, 0xF00B
@@ -155,6 +156,20 @@ def fbse_blip(data, off: int, delay, budget: flate.Budget) -> bytes | None:
     if delay is None or at == _NO_DELAY or at >= len(delay):
         return None
     return blip(delay, at, budget)
+
+
+def blip_image(data, off: int, delay, budget: flate.Budget) -> bytes | None:
+    """The image bytes of the BStore file block at `off` as xls and ppt place them: fbse_blip's, or None when the block
+    is unreadable (a damaged or oversize BLIP, or one that inflates past the ratio cap or the document's total: that
+    costs the one picture) or is not a kind Assets keeps (under 16 bytes, or images.sniff does not know it). `delay` is
+    the stream a delay-loaded BLIP is read from (None when the host has none)."""
+    try:
+        got = fbse_blip(data, off, delay, budget)
+    except limits.ReadError as e:
+        if e.kind not in ("damaged", "too_large"):
+            raise
+        return None
+    return got if got is not None and len(got) >= 16 and sniff(got) is not None else None
 
 
 def bstore(dgg) -> list[int]:

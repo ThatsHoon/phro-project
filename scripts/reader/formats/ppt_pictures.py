@@ -8,8 +8,7 @@ stream, or it passes IMAGE_BYTES.
 """
 from .. import officeart
 from ..containers import flate
-from ..images import sniff
-from ..limits import IMAGE_BYTES, ReadError
+from ..limits import IMAGE_BYTES
 from ..model import Image
 
 
@@ -27,13 +26,7 @@ class Pictures:
     def _decode(self, pib: int) -> bytes | None:
         if not 0 < pib <= len(self.store):
             return None
-        try:
-            data = officeart.fbse_blip(self.dgg, self.store[pib - 1], self.pictures, self.budget)
-        except ReadError as e:
-            if e.kind not in ("damaged", "too_large"):
-                raise
-            return None
-        return data if data is not None and len(data) >= 16 and sniff(data) is not None else None
+        return officeart.blip_image(self.dgg, self.store[pib - 1], self.pictures, self.budget)
 
     def image(self, pib: int | None) -> Image | None:
         """One placement of picture `pib`: its Image, or None after counting `image`."""
