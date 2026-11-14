@@ -10,10 +10,39 @@ import heapq
 from bisect import bisect_left, bisect_right, insort
 
 from .. import limits
-from ..model import Break, Cell, Para, Table, Text
+from ..model import Bold, Break, Cell, Link, Para, Table, Text
 
 _GAP = 64            # empty rows kept between two rows that hold values
 _MERGES = 100_000    # merged ranges one sheet may keep
+
+
+def _chars(value) -> int:
+    """The characters a cell value is charged: a str's length; for inlines, every Text inside (Link and Bold
+    contents included) plus each Link URL's length."""
+    if isinstance(value, str):
+        return len(value)
+    n, stack = 0, [value]
+    while stack:
+        for x in stack.pop():
+            if isinstance(x, Text):
+                n += len(x.text)
+            elif isinstance(x, Link):
+                n += len(x.url)
+                stack.append(x.inlines)
+            elif isinstance(x, Bold):
+                stack.append(x.inlines)
+    return n
+
+
+def text_inlines(text: str) -> list:
+    """The Text and Break pieces of a text, split on newlines."""
+    inl = []
+    for i, part in enumerate(text.split("\n")):
+        if i:
+            inl.append(Break())
+        if part:
+            inl.append(Text(part))
+    return inl
 
 
 class Budget:
@@ -141,24 +170,43 @@ class Grid:
         self.ctx.skipped["sheet_cut"] += 1
         return False
 
-    def put(self, row: int, col: int, text: str) -> bool:
+    def put(self, row: int, col: int, value) -> bool:
+        """Put a str, or a list of inlines (Text, Break, Bold, Link, NoteRef), at a cell. A value put over another
+        replaces it, and the replaced value's cell and characters are refunded."""
         if self.cut:
             return False
-        if not text or row < 0 or col < 0:
+        if not value or row < 0 or col < 0:
             return True
         b = self.budget
         if row >= limits.SHEET_ROWS:
             return self.stop("rows", limits.SHEET_ROWS)
         if col >= limits.SHEET_COLS:
             return self.stop("columns", limits.SHEET_COLS)
-        if b.cells <= 0:
+        old = self.cells.get((row, col))
+        cells = b.cells + (old is not None)
+        chars = b.chars + (_chars(old) if old is not None else 0)
+        n = _chars(value)
+        if cells <= 0:
             return self.stop("cells", b.cap_cells)
-        if b.chars < len(text):
+        if chars < n:
             return self.stop("characters", b.cap_chars)
-        b.cells -= 1
-        b.chars -= len(text)
-        self.cells[(row, col)] = text
+        b.cells, b.chars = cells - 1, chars - n
+        self.cells[(row, col)] = value
         return True
+
+    def get(self, row: int, col: int):
+        """The value put at a cell (str or list), or None."""
+        return self.cells.get((row, col))
+
+    def held(self, r1: int, r2: int, c1: int, c2: int):
+        """The positions holding a value inside the inclusive range, in reading order, and the cost
+        min(area, cells held): the range is walked, or the held cells are, whichever is fewer."""
+        area = max(r2 - r1 + 1, 0) * max(c2 - c1 + 1, 0)
+        if area <= len(self.cells):
+            found = [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1) if (r, c) in self.cells]
+            return found, area
+        found = sorted(p for p in self.cells if r1 <= p[0] <= r2 and c1 <= p[1] <= c2)
+        return found, len(self.cells)
 
     def merge(self, r1: int, r2: int, c1: int, c2: int):
         """Merges are only checked here; overlaps are resolved in blocks()'s row sweep."""
@@ -286,11 +334,5 @@ class Grid:
         return [Table(out, hidden_rows=hidden_rows, hidden_cols=hidden_cols)]
 
     @staticmethod
-    def _para(text):
-        inl = []
-        for i, part in enumerate(text.split("\n")):
-            if i:
-                inl.append(Break())
-            if part:
-                inl.append(Text(part))
-        return Para(inl)
+    def _para(value):
+        return Para(list(value)) if isinstance(value, list) else Para(text_inlines(value))

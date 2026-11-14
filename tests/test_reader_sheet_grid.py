@@ -12,8 +12,8 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
-from reader.formats.sheet_grid import Budget, Grid  # noqa: E402
-from reader.model import Break, Context, Doc, Para, Table, Text  # noqa: E402
+from reader.formats.sheet_grid import Budget, Grid, text_inlines  # noqa: E402
+from reader.model import Break, Context, Doc, Link, NoteRef, Para, Table, Text  # noqa: E402
 
 
 def mk(name="S", budget=None):
@@ -315,6 +315,51 @@ def test_duplicate_merges_do_not_count_toward_the_cap():
     for _ in range(100_005):
         g.merge(0, 1, 0, 1)
     assert not ctx.skipped and len(g.merges) == 1, (dict(ctx.skipped), len(g.merges))
+
+
+def test_put_inlines():
+    g, _ = mk()
+    inl = [Link("https://e.x", [Text("site")]), NoteRef("n1")]
+    assert g.put(0, 0, inl)
+    assert g.blocks() == [Para(inl)]
+
+
+def test_inlines_in_table():
+    g, _ = mk()
+    inl = [Link("https://e.x", [Text("site")]), NoteRef("n1")]
+    g.put(0, 0, inl)
+    g.put(0, 1, "b")
+    t = table(g)
+    assert t.rows[0][0].blocks[0].inlines == inl and txt(t.rows[0][1]) == "b"
+
+
+def test_inline_charge():
+    b = Budget(cells=10, chars=12)
+    g, _ = mk("S", b)
+    assert g.put(0, 0, [Link("u" * 4, [Text("abcd")])])
+    assert b.chars == 4 and b.cells == 9, (b.chars, b.cells)
+
+
+def test_replace_refunds():
+    b = Budget(cells=1, chars=5)
+    g, _ = mk("S", b)
+    assert g.put(0, 0, "abc")
+    assert g.put(0, 0, "abcde") is True
+    assert b.chars == 0 and b.cells == 0, (b.chars, b.cells)
+
+
+def test_get_and_held():
+    g, _ = mk()
+    for p in ((0, 0), (5, 5), (9, 9)):
+        g.put(*p, "v%d" % p[0])
+    assert g.held(0, 9, 0, 9)[0] == [(0, 0), (5, 5), (9, 9)]
+    assert g.held(0, 1048575, 0, 16383)[1] == 3
+    assert g.held(4, 6, 4, 6) == ([(5, 5)], 3)
+    assert g.get(5, 5) == "v5" and g.get(1, 1) is None
+
+
+def test_text_inlines():
+    assert text_inlines("a\nb") == [Text("a"), Break(), Text("b")]
 
 
 def main():
