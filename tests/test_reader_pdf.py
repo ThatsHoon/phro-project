@@ -1,0 +1,392 @@
+"""pdf format module: each page a "## Page N" section with its lines, headings, paragraphs,
+tables, images, fields and comments; hidden text, scanned pages, vector figures and the caps.
+
+Run: python -I -X utf8 tests/test_reader_pdf.py
+"""
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HERE / "scripts"))
+sys.path.insert(0, str(Path(__file__).parent))
+
+from pdf_fix import (JPEG, EncryptSpec, Name, Ref, acroform, image_xobject,  # noqa: E402
+                     link_annot, ocg_catalog, outline_items, rule_ops, simple_pdf, text_annot,
+                     text_ops, widget)
+
+import reader  # noqa: E402
+from reader import markdown  # noqa: E402
+from reader.formats import pdf  # noqa: E402
+from reader.formats import pdf_layout, pdf_tables  # noqa: E402
+from reader.limits import ReadError  # noqa: E402
+from reader.model import Context  # noqa: E402
+from reader.pdfnative import crypto  # noqa: E402
+from reader.pdfnative import document as dm  # noqa: E402
+
+F1 = {"Font": {"F1": Ref(3)}}
+OCG = {"Type": Name("OCG"), "Name": "Layer"}
+FULL = b"q 612 0 0 792 0 0 cm /Im1 Do Q "
+
+
+def md(data, hidden=False, **kw):
+    ctx = Context()
+    doc = pdf.parse_bytes(data, ctx, **kw)
+    with tempfile.TemporaryDirectory() as tmp:
+        text = markdown.render(doc, Path(tmp) / "assets", hidden, ctx.skipped)
+    return text, ctx, doc
+
+
+def with_image(content, image, **kw):
+    res = dict(F1, XObject={"Im1": Ref(30)})
+    return simple_pdf([content], resources=res, extra_objects={30: image}, **kw)
+
+
+def patched(obj, name, value):
+    """A context manager setting obj.name to value for its body."""
+    class _Patch:
+        def __enter__(self):
+            self.saved = getattr(obj, name)
+            setattr(obj, name, value)
+
+        def __exit__(self, *exc):
+            setattr(obj, name, self.saved)
+    return _Patch()
+
+
+def heads(text):
+    return re.findall(r"^## Page \d+$", text, re.M)
+
+
+def test_pages_numbered():
+    text, _, doc = md(simple_pdf([text_ops("One"), b"", text_ops("Three")]))
+    assert heads(text) == ["## Page 1", "## Page 2", "## Page 3"], text
+    assert text.index("One") < text.index("## Page 2") < text.index("Three")
+    assert markdown.stats(text)["pages"] == [[1, 1], [2, 5], [3, 7]], markdown.stats(text)
+    assert doc.meta["engine"] == "native" and doc.meta["pages_total"] == 3
+
+
+def _hidden_pdf():
+    body = b" ".join([
+        text_ops("Visible", y=700),
+        text_ops("Offcrop", x=700, y=900),
+        text_ops("Tiny", y=600, size=0.5),
+        text_ops("Ghost", y=500, extra=b"3 Tr"),
+        b"/OC /L1 BDC " + text_ops("Secret", y=400) + b" EMC",
+    ])
+    return simple_pdf([body], resources=dict(F1, Properties={"L1": Ref(50)}),
+                      extra_objects={50: OCG}, catalog=ocg_catalog(off=[50]))
+
+
+def test_hidden_rules():
+    text, _, _ = md(_hidden_pdf())
+    assert text.splitlines()[0] == "(4 hidden places left out)", text
+    assert "Visible" in text
+    for word in ("Offcrop", "Tiny", "Ghost", "Secret"):
+        assert word not in text, (word, text)
+    text, _, _ = md(_hidden_pdf(), hidden=True)
+    for word in ("Offcrop", "Tiny", "Ghost", "Secret"):
+        assert f"(hidden) {word}" in text, (word, text)
+    assert "hidden places" not in text
+
+
+def test_hidden_per_text_object():
+    body = b"BT /F1 12 Tf 3 Tr 72 700 Td (one) Tj 0 -14 Td (two) Tj 0 -14 Td (three) Tj ET"
+    text, _, _ = md(simple_pdf([text_ops("Seen", y=720) + b" " + body]))
+    assert text.splitlines()[0] == "(1 hidden places left out)", text
+    assert "two" not in text
+
+
+def test_ocr_layer():
+    content = FULL + text_ops("Scanned words", y=400, extra=b"3 Tr")
+    text, ctx, doc = md(with_image(content, image_xobject(64, 64)))
+    assert "Scanned words" in text and "![" not in text, text
+    assert "hidden" not in text and not ctx.skipped, (text, ctx.skipped)
+    assert doc.meta["unrendered"] == []
+
+
+def test_scan_native_jpeg():
+    text, ctx, doc = md(with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode")))
+    assert "![Scanned page 1](assets/img-001.jpg)" in text, text
+    assert doc.meta["unrendered"] == [] and not ctx.skipped
+
+
+def test_scan_native_undecodable():
+    image = image_xobject(100, 100, data=bytes(64), filter="CCITTFaxDecode")
+    text, ctx, doc = md(with_image(FULL, image))
+    assert doc.meta["unrendered"] == [1] and ctx.skipped["scan"] == 1, (doc.meta, ctx.skipped)
+    assert ctx.skipped["image"] == 0 and "scanned page not shown" in text
+
+
+def test_figure_native_unrendered():
+    # 40 filled 5 x 5 squares over a 230 x 275 box: about 13% of the page
+    body = b"".join(b"%d %d 5 5 re f " % (100 + 45 * (i % 6), 100 + 45 * (i // 6)) for i in range(40))
+    text, ctx, doc = md(simple_pdf([text_ops("Caption", y=720) + b" " + body]))
+    assert doc.meta["unrendered"] == [1] and doc.meta["figures"] == [], doc.meta
+    assert ctx.skipped["figure"] == 1 and "Caption" in text, ctx.skipped
+
+
+def test_renders_cap_unrendered():
+    image = image_xobject(8, 8, data=JPEG, filter="DCTDecode")
+    data = simple_pdf([FULL] * 5, resources=dict(F1, XObject={"Im1": Ref(30)}),
+                      extra_objects={30: image})
+    with patched(pdf, "PDF_RENDERS", 2):
+        text, ctx, doc = md(data)
+    assert text.count("![Scanned page") == 2, text
+    assert doc.meta["unrendered"] == [3, 4, 5] and ctx.skipped["scan"] == 3, (doc.meta, ctx.skipped)
+
+
+def test_image_floor_dedup():
+    res = dict(F1, XObject={"Small": Ref(30), "Big": Ref(31)})
+    body = (text_ops("Words", y=750) + b" q 100 0 0 100 72 500 cm /Small Do Q"
+            b" q 10 0 0 100 200 500 cm /Big Do Q"
+            b" q 100 0 0 100 72 300 cm /Big Do Q q 100 0 0 100 300 300 cm /Big Do Q")
+    big = image_xobject(64, 64, data=bytes(range(256)) * 16)
+    data = simple_pdf([body], resources=res,
+                      extra_objects={30: image_xobject(20, 20), 31: big})
+    ctx = Context()
+    doc = pdf.parse_bytes(data, ctx)
+    with tempfile.TemporaryDirectory() as tmp:
+        text = markdown.render(doc, Path(tmp) / "assets", False, ctx.skipped)
+        files = sorted(p.name for p in (Path(tmp) / "assets").iterdir())
+    assert files == ["img-001.png"], files
+    assert text.count("](assets/img-001.png)") == 2 and not ctx.skipped, (text, ctx.skipped)
+
+
+def _form_pdf(flags=0):
+    fields = acroform([widget((72, 600, 200, 620), Ref(4), T="Name", FT=Name("Tx"), V="Kim")])
+    objects = dict(fields)
+    objects[100] = text_annot((10, 10, 20, 20), "note", author="Ann", flags=flags)
+    return simple_pdf([text_ops("Body text")], catalog={"AcroForm": Ref(200)},
+                      extra_objects=objects, page_extra={"Annots": [Ref(100)]})
+
+
+def test_fields_comments_end():
+    text, _, _ = md(_form_pdf())
+    assert "> Field Name: Kim\n> Comment by Ann: note" in text, text
+    assert text.index("Body text") < text.index("> Field Name")
+
+
+def test_hidden_comment():
+    text, _, _ = md(_form_pdf(flags=2))
+    assert "note" not in text and text.splitlines()[0] == "(1 hidden places left out)", text
+    assert "> Field Name: Kim" in text
+
+
+def test_links_inline():
+    data = simple_pdf([text_ops("here")], extra_objects={100: link_annot((70, 715, 100, 735), "https://ex.org")},
+                      page_extra={"Annots": [Ref(100)]})
+    text, _, _ = md(data)
+    assert "[here](https://ex.org)" in text, text
+
+
+def _grid_ops():
+    ops = [rule_ops(100, y, 300, y) for y in (500, 530, 560)]
+    ops += [rule_ops(x, 500, x, 560) for x in (100, 200, 300)]
+    return b" ".join(ops)
+
+
+def _table_page():
+    cells = [("Alpha", 110, 540), ("Beta", 210, 540), ("Gamma", 110, 510), ("Delta", 210, 510)]
+    words = b" ".join(text_ops(t, x=x, y=y, size=10) for t, x, y in cells)
+    return text_ops("Before", y=700) + b" " + _grid_ops() + b" " + words + b" " + text_ops("After", y=400)
+
+
+def test_table_on_page():
+    text, ctx, _ = md(simple_pdf([_table_page()]))
+    assert "|Alpha|Beta|" in text and "|Gamma|Delta|" in text, text
+    assert text.count("Alpha") == 1 and text.count("Delta") == 1, text
+    assert text.index("Before") < text.index("|Alpha") < text.index("After"), text
+    assert not ctx.skipped
+
+
+def test_outline_headings():
+    data = simple_pdf([text_ops("Intro", y=720) + b" " + text_ops("Body line one", y=700)
+                       + b" " + text_ops("Body line two", y=686)],
+                      catalog={"Outlines": Ref(300)}, extra_objects=outline_items([(1, "Intro", 0)]))
+    text, _, _ = md(data)
+    assert "### Intro" in text and text.count("Intro") == 1, text
+
+
+def test_size_heading():
+    body = b" ".join([text_ops("Big Title", y=740, size=16)]
+                     + [text_ops(f"Body line {i}", y=700 - 12 * i, size=10) for i in range(4)])
+    text, _, _ = md(simple_pdf([body]))
+    assert "### Big Title" in text, text
+    assert "### Body" not in text
+
+
+def test_running_headers():
+    pages = [text_ops("Annual Report", y=770, size=10) + b" " + text_ops(f"Body of page {n}", y=600)
+             for n in (1, 2, 3)]
+    text, _, doc = md(simple_pdf(pages))
+    assert doc.headers == ["Annual Report"], doc.headers
+    assert text.count("Annual Report") == 1 and text.splitlines()[0] == "Header: Annual Report", text
+    assert "Body of page 3" in text
+
+
+def test_page_cap():
+    with patched(pdf, "PDF_PAGES", 3):
+        text, ctx, _ = md(simple_pdf([text_ops(f"P{n}") for n in range(1, 6)]))
+    assert heads(text) == ["## Page 1", "## Page 2", "## Page 3"], text
+    assert ctx.skipped["page_cut"] == 2, ctx.skipped
+
+
+def test_deadline_page_cut():
+    now = [0.0]
+
+    def clock():
+        now[0] += 10.0
+        return now[0]
+
+    text, ctx, _ = md(simple_pdf([text_ops(f"P{n}") for n in range(1, 6)]), clock=clock, started=0.0)
+    read = len(heads(text))
+    assert read >= 1 and ctx.skipped["page_cut"] >= 1, (text, ctx.skipped)
+    assert read + ctx.skipped["page_cut"] == 5, (read, ctx.skipped)
+
+
+def test_page_seconds_part():
+    now = [0.0]
+    real = pdf_layout.lines
+
+    def slow_lines(*a, **kw):
+        now[0] += 5.0
+        return real(*a, **kw)
+
+    content = _table_page() + b" q 100 0 0 100 350 600 cm /Im1 Do Q"
+    data = with_image(content, image_xobject(64, 64, data=bytes(range(256)) * 16))
+    with patched(pdf_layout, "lines", slow_lines):
+        text, ctx, _ = md(data, clock=lambda: now[0], started=0.0)
+    assert "Before" in text and "After" in text, text
+    assert "|" not in text and "![" not in text, text
+    assert ctx.skipped["page_part"] == 1, ctx.skipped
+
+
+def test_page_chars_cap():
+    body = b" ".join(text_ops(c * 10, y=700 - 14 * i) for i, c in enumerate("abcde"))
+    with patched(pdf, "PDF_PAGE_CHARS", 10):
+        text, ctx, _ = md(simple_pdf([body]))
+    assert ctx.skipped["text"] == 1, ctx.skipped
+    assert "aaaaaaaaaa" in text and "eeeeeeeeee" not in text, text
+
+
+def test_page_raises_skipped():
+    real = dm.NativeDoc.page
+
+    def page(self, index):
+        if index == 1:
+            raise ValueError("broken page")
+        return real(self, index)
+
+    with patched(dm.NativeDoc, "page", page):
+        text, ctx, _ = md(simple_pdf([text_ops("P1"), text_ops("P2"), text_ops("P3")]))
+    assert heads(text) == ["## Page 1", "## Page 3"] and "P3" in text, text
+    assert ctx.skipped["page"] == 1, ctx.skipped
+
+
+def test_member_readerror():
+    pages = [text_ops("First"), text_ops("Second " * 150), text_ops("Third")]
+    data = simple_pdf(pages, encrypt=EncryptSpec(4))
+    with patched(crypto, "DECRYPT_TOTAL", 400):
+        text, ctx, _ = md(data)
+    assert "First" in text and "Third" in text and "Second" not in text, text
+    assert ctx.skipped["page_part"] == 1, ctx.skipped
+
+    def timeout(*a, **kw):
+        raise ReadError("timeout", "page step")
+
+    with patched(pdf_tables, "tables", timeout):
+        try:
+            md(simple_pdf([text_ops("A")]))
+        except ReadError as e:
+            assert e.kind == "timeout", e
+        else:
+            raise AssertionError("expected the timeout to propagate")
+
+
+def test_started_default():
+    text, ctx, _ = md(simple_pdf([text_ops(f"P{n}") for n in range(1, 4)]),
+                      clock=lambda: reader.STARTED + 100)
+    assert len(heads(text)) == 3 and not ctx.skipped["page_cut"], (text, ctx.skipped)
+
+
+def test_no_readable_page():
+    def page(self, index):
+        raise ValueError("broken page")
+
+    with patched(dm.NativeDoc, "page", page):
+        try:
+            md(simple_pdf([text_ops("A"), text_ops("B")]))
+        except ReadError as e:
+            assert (e.kind, e.detail) == ("damaged", "no readable pages"), e
+        else:
+            raise AssertionError("expected ReadError")
+
+
+def test_pages_range():
+    text, _, doc = md(simple_pdf([text_ops(f"P{n}") for n in range(1, 6)]), pages=(2, 3))
+    assert heads(text) == ["## Page 2", "## Page 3"], text
+    assert "P1" not in text and "P4" not in text and doc.meta["pages_total"] == 5
+
+
+def test_xfa_attachment_named():
+    catalog = {"AcroForm": {"Fields": [], "XFA": []}, "Names": {"EmbeddedFiles": {"Names": []}}}
+    text, ctx, _ = md(simple_pdf([text_ops("A")], catalog=catalog))
+    line = next(ln for ln in text.splitlines() if ln.startswith("(could not read:"))
+    assert "XFA form" in line and "attached files" in line, line
+    assert ctx.skipped["xfa"] == 1 and ctx.skipped["attachment"] == 1
+
+
+def test_encrypted_kinds():
+    for spec, kind in ((EncryptSpec(4, user=b"secret"), "encrypted"),
+                       (EncryptSpec(4, filter="FOPN_foweb"), "drm")):
+        try:
+            md(simple_pdf([text_ops("Hi")], encrypt=spec))
+        except ReadError as e:
+            assert e.kind == kind, (e, kind)
+        else:
+            raise AssertionError(f"expected ReadError {kind}")
+
+
+def test_broken_xref_read():
+    text, _, _ = md(simple_pdf([text_ops("Recovered")], shift=7))
+    assert "Recovered" in text, text
+
+
+def test_caps():
+    assert (pdf.PDF_PAGES, pdf.PDF_DEADLINE, pdf.PDF_PAGE_SECONDS) == (5_000, 36.0, 4.0)
+    assert (pdf.PDF_PAGE_CHARS, pdf.PDF_RENDERS) == (200_000, 100)
+    assert (pdf.RENDER_DPI, pdf.CROP_DPI, pdf.RENDER_LONG) == (110, 150, 1_568)
+    assert (pdf.SCAN_COVER, pdf.OCR_COVER, pdf.FIGURE_PATHS, pdf.FIGURE_COVER) == (0.5, 0.8, 32, 0.04)
+    assert (pdf.FIGURE_PAD, pdf.FIGURE_WHOLE, pdf.TINY_PT) == (6.0, 0.7, 1.0)
+    assert (pdf.IMAGE_MIN_PX, pdf.IMAGE_MIN_PT) == (32, 16.0)
+    assert (pdf.PDF_PAGE_OBJECTS, pdf.PDF_PAGE_IMAGES) == (100_000, 64)
+
+
+def test_engine_unknown():
+    try:
+        pdf.parse_bytes(simple_pdf([text_ops("A")]), Context(), engine="pdfium")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_parse_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "clean.pdf"
+        path.write_bytes(simple_pdf([text_ops("From a file")]))
+        doc = pdf.parse(path, Context())
+    assert doc.blocks and doc.blocks[0].number == 1
+
+
+def main():
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+    print("pass")
+
+
+if __name__ == "__main__":
+    main()

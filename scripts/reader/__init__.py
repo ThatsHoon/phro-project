@@ -1,7 +1,11 @@
 """Stdlib-only document reader. Heavier imports happen inside functions."""
+import time
 from pathlib import Path
 
 VERSION = "0.4.0"
+
+# when the reader was imported: the CLI child passes it to the pdf page loop's deadline
+STARTED = time.monotonic()
 
 # extension -> module name under reader.formats
 FORMATS = {
