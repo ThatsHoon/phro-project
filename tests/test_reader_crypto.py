@@ -13,7 +13,9 @@ sys.path.insert(0, str(HERE / "scripts"))
 
 sys.path.insert(0, str(HERE / "tests"))
 
-from reader.containers.crypto import MsvcRand, aes128_ecb_decrypt, aes128_ecb_encrypt, rc4  # noqa: E402
+from reader.containers.crypto import (  # noqa: E402
+    MsvcRand, aes128_ecb_decrypt, aes128_ecb_encrypt, aes_cbc_decrypt, aes_cbc_encrypt,
+    aes_ecb_decrypt, aes_ecb_encrypt, rc4)
 from reader.containers.officecrypt import XLS_DEFAULT, block_keys, parse_rc4  # noqa: E402
 from reader_fix import rc4_header  # noqa: E402
 
@@ -43,6 +45,70 @@ def test_bad_key():
         except ValueError:
             continue
         raise AssertionError("a 15-byte key must raise ValueError")
+
+
+def test_aes256_fips197():
+    pt = bytes.fromhex("00112233445566778899aabbccddeeff")
+    ct = aes_ecb_encrypt(bytes(range(32)), pt)
+    assert ct.hex() == "8ea2b7ca516745bfeafc49904b496089", ct.hex()
+    assert aes_ecb_decrypt(bytes(range(32)), ct) == pt
+    ct = aes_ecb_encrypt(bytes(range(24)), pt)
+    assert ct.hex() == "dda97ca4864cdfe06eaf70a0ec0d7191", ct.hex()
+    assert aes_ecb_decrypt(bytes(range(24)), ct) == pt
+
+
+def test_aes128_fips197_kept():
+    assert aes128_ecb_encrypt(bytes(range(16)), PLAIN).hex() == "69c4e0d86a7b0430d8cdb78070b4c55a"
+
+
+def test_cbc_sp800_38a():
+    iv = bytes(range(16))
+    pt = bytes.fromhex("6bc1bee22e409f96e93d7e117393172a")
+    cases = (("2b7e151628aed2a6abf7158809cf4f3c", "7649abac8119b246cee98e9b12e9197d"),
+             ("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4",
+              "f58c4c04d6e5f1ba779eabfb5f7bfbd6"))
+    for k, c in cases:
+        key = bytes.fromhex(k)
+        assert aes_cbc_encrypt(key, iv, pt).hex() == c
+        assert aes_cbc_decrypt(key, iv, bytes.fromhex(c)) == pt
+        four = bytes(range(64))
+        assert aes_cbc_decrypt(key, iv, aes_cbc_encrypt(key, iv, four)) == four
+
+
+def test_cbc_rejects_bad_sizes():
+    key = bytes(16)
+    for fn in (aes_cbc_encrypt, aes_cbc_decrypt):
+        for args in ((key, bytes(8), bytes(16)), (key, bytes(16), bytes(17)), (bytes(20), bytes(16), bytes(16))):
+            try:
+                fn(*args)
+            except ValueError:
+                continue
+            raise AssertionError("bad sizes must raise ValueError")
+
+
+def test_cbc_cap():
+    from unittest import mock
+    from reader import limits
+    from reader.limits import ReadError
+    with mock.patch.object(limits, "DECRYPT_BYTES", 32):
+        for fn in (aes_cbc_encrypt, aes_cbc_decrypt):
+            try:
+                fn(bytes(16), bytes(16), bytes(48))
+            except ReadError as e:
+                assert e.kind == "too_large", e.kind
+            else:
+                raise AssertionError("over DECRYPT_BYTES must raise ReadError too_large")
+
+
+def test_cbc_decrypt_speed():
+    key, iv = bytes(range(32)), bytes(16)
+    data = bytes(range(256)) * 4096
+    start = time.perf_counter()
+    out = aes_cbc_decrypt(key, iv, data)
+    took = time.perf_counter() - start
+    assert len(out) == len(data)
+    print(f"aes256 cbc decrypt {took:.2f} s per MiB")
+    assert took < 2.0, took
 
 
 def test_msvc_rand():

@@ -1,5 +1,7 @@
 """AES-128 in ECB mode, RC4 and the MSVC rand stream, standard library only.
 
+AES-192 and AES-256 and CBC mode for the pdf standard security handler.
+
 HWP distribution documents decrypt whole sections with these two, so the
 block loop is table-driven: four 32-bit lookups per column per round, the key
 schedule once per call, and one struct call each way for the whole buffer.
@@ -58,43 +60,49 @@ _SBOX, _ISBOX, _TE, _TD = _build()
 
 
 def _round_keys(key):
-    if len(key) != 16:
-        raise ValueError("AES-128 needs a 16-byte key")
-    w = list(struct.unpack(">4I", key))
+    nk = len(key) // 4
+    if len(key) not in (16, 24, 32):
+        raise ValueError("AES needs a 16-, 24- or 32-byte key")
+    rounds = nk + 6
+    w = list(struct.unpack(f">{nk}I", key))
     rcon = 1
-    for i in range(4, 44):
+    for i in range(nk, 4 * (rounds + 1)):
         t = w[i - 1]
-        if i % 4 == 0:
+        if i % nk == 0:
             t = ((t << 8) | (t >> 24)) & _M
             t = (_SBOX[t >> 24] << 24 | _SBOX[(t >> 16) & 255] << 16
                  | _SBOX[(t >> 8) & 255] << 8 | _SBOX[t & 255])
             t ^= rcon << 24
             rcon = _xtime(rcon)
-        w.append(w[i - 4] ^ t)
+        elif nk > 6 and i % nk == 4:
+            t = (_SBOX[t >> 24] << 24 | _SBOX[(t >> 16) & 255] << 16
+                 | _SBOX[(t >> 8) & 255] << 8 | _SBOX[t & 255])
+        w.append(w[i - nk] ^ t)
     return w
 
 
-def _inverse_keys(w):
+def _inverse_keys(w, rounds=10):
     """Round keys for the equivalent inverse cipher (middle rounds InvMixColumns'd)."""
     td0, td1, td2, td3 = _TD
     out = []
-    for r in range(10, -1, -1):
+    for r in range(rounds, -1, -1):
         rk = w[4 * r:4 * r + 4]
-        if 0 < r < 10:
+        if 0 < r < rounds:
             rk = [td0[_SBOX[x >> 24]] ^ td1[_SBOX[(x >> 16) & 255]]
                   ^ td2[_SBOX[(x >> 8) & 255]] ^ td3[_SBOX[x & 255]] for x in rk]
         out.extend(rk)
     return out
 
 
-def _quads(rk):
-    return [tuple(rk[i:i + 4]) for i in range(4, 40, 4)], rk[0:4], rk[40:44]
+def _quads(rk, rounds=10):
+    end = 4 * rounds
+    return [tuple(rk[i:i + 4]) for i in range(4, end, 4)], rk[0:4], rk[end:end + 4]
 
 
-def _encrypt_words(words, rk):
+def _encrypt_words(words, rk, rounds=10):
     t0, t1, t2, t3 = _TE
     sb = _SBOX
-    mid, (k0, k1, k2, k3), (f0, f1, f2, f3) = _quads(rk)
+    mid, (k0, k1, k2, k3), (f0, f1, f2, f3) = _quads(rk, rounds)
     out = []
     add = out.extend
     for i in range(0, len(words), 4):
@@ -116,10 +124,10 @@ def _encrypt_words(words, rk):
     return out
 
 
-def _decrypt_words(words, rk):
+def _decrypt_words(words, rk, rounds=10):
     t0, t1, t2, t3 = _TD
     sb = _ISBOX
-    mid, (k0, k1, k2, k3), (f0, f1, f2, f3) = _quads(rk)
+    mid, (k0, k1, k2, k3), (f0, f1, f2, f3) = _quads(rk, rounds)
     out = []
     add = out.extend
     for i in range(0, len(words), 4):
@@ -143,23 +151,63 @@ def _decrypt_words(words, rk):
 
 def _crypt(key, data, transform):
     rk = _round_keys(key)
+    rounds = len(key) // 4 + 6
     if transform is _decrypt_words:
-        rk = _inverse_keys(rk)
+        rk = _inverse_keys(rk, rounds)
     n = len(data) // 16
     if not n:
         return bytes(data)
     words = struct.unpack(f">{n * 4}I", data[:n * 16])
-    return struct.pack(f">{n * 4}I", *transform(words, rk)) + bytes(data[n * 16:])
+    return struct.pack(f">{n * 4}I", *transform(words, rk, rounds)) + bytes(data[n * 16:])
 
 
-def aes128_ecb_encrypt(key: bytes, data: bytes) -> bytes:
-    """Encrypt whole 16-byte blocks; a trailing partial block is returned as is."""
+def aes_ecb_encrypt(key: bytes, data: bytes) -> bytes:
+    """Encrypt whole 16-byte blocks with a 16-, 24- or 32-byte key; a trailing partial block is returned as is."""
     return _crypt(key, data, _encrypt_words)
 
 
-def aes128_ecb_decrypt(key: bytes, data: bytes) -> bytes:
-    """Decrypt whole 16-byte blocks; a trailing partial block is returned as is."""
+def aes_ecb_decrypt(key: bytes, data: bytes) -> bytes:
+    """Decrypt whole 16-byte blocks with a 16-, 24- or 32-byte key; a trailing partial block is returned as is."""
     return _crypt(key, data, _decrypt_words)
+
+
+aes128_ecb_encrypt = aes_ecb_encrypt
+aes128_ecb_decrypt = aes_ecb_decrypt
+
+
+def _cbc_check(key, iv, data):
+    if len(key) not in (16, 24, 32):
+        raise ValueError("AES needs a 16-, 24- or 32-byte key")
+    if len(iv) != 16:
+        raise ValueError("CBC needs a 16-byte iv")
+    if len(data) % 16:
+        raise ValueError("CBC data must be whole 16-byte blocks")
+    if len(data) > limits.DECRYPT_BYTES:
+        raise limits.ReadError("too_large", "part: AES data")
+
+
+def aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """CBC decrypt without padding removal; the caller strips PKCS#7."""
+    _cbc_check(key, iv, data)
+    if not data:
+        return b""
+    raw = aes_ecb_decrypt(key, data)
+    prev = bytes(iv) + bytes(data[:-16])
+    n = len(data)
+    return (int.from_bytes(raw, "big") ^ int.from_bytes(prev, "big")).to_bytes(n, "big")
+
+
+def aes_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    """CBC encrypt without padding; blocks chain, so they run one at a time."""
+    _cbc_check(key, iv, data)
+    prev = int.from_bytes(iv, "big")
+    out = []
+    for i in range(0, len(data), 16):
+        x = int.from_bytes(data[i:i + 16], "big") ^ prev
+        c = aes_ecb_encrypt(key, x.to_bytes(16, "big"))
+        out.append(c)
+        prev = int.from_bytes(c, "big")
+    return b"".join(out)
 
 
 class MsvcRand:
