@@ -165,6 +165,19 @@ def test_budget_shared():
     assert not c1.skipped
 
 
+def test_append_and_covers():
+    g, ctx = mk("S", Budget(cells=2, chars=100))
+    assert g.put(0, 0, "a") and g.put(0, 1, "b")
+    assert g.put(0, 2, "c") is False and g.cut
+    assert g.append(0, 0, [NoteRef("n")]) and g.get(0, 0) == [Text("a"), NoteRef("n")]  # works on a cut grid
+    assert g.append(5, 5, [NoteRef("n")]) is False  # a cell that holds nothing
+    assert g.budget.cells == 0
+    g2, _ = mk("T")
+    g2.merge(0, 0, 0, 1)
+    g2.merge(0, 1, 0, 2)  # overlaps the first, so it does not render
+    assert g2.covers([(0, 0), (0, 1), (0, 2), (3, 3)]) == {(0, 1): (0, 0)}
+
+
 def test_chars_budget():
     g, ctx = mk("S", Budget(chars=5))
     assert g.put(0, 0, "abc") and not g.put(0, 1, "def")

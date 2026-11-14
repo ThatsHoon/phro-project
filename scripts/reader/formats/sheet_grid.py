@@ -194,6 +194,25 @@ class Grid:
         self.cells[(row, col)] = value
         return True
 
+    def append(self, row: int, col: int, inlines: list) -> bool:
+        """Add inlines (a note mark) to the end of a cell that already holds a value. Unlike `put` it works on a cut
+        grid, as it adds no cell; it charges only the added characters. False when the cell holds nothing or the
+        characters are gone."""
+        old = self.cells.get((row, col))
+        if old is None or not inlines:
+            return False
+        n = _chars(inlines)
+        if self.budget.chars < n:
+            return False
+        self.cells[(row, col)] = (text_inlines(old) if isinstance(old, str) else list(old)) + list(inlines)
+        self.budget.chars -= n
+        return True
+
+    def covers(self, positions) -> dict:
+        """position -> (row, col) of the origin of the merge that renders over it, for the positions that lie in
+        such a merge but are not its origin. The merges are resolved as `blocks()` resolves them."""
+        return {p: (m[0], m[1]) for p, m in self._cover(sorted(set(positions))) if m is not None and p != (m[0], m[1])}
+
     def get(self, row: int, col: int):
         """The value put at a cell (str or list), or None."""
         return self.cells.get((row, col))
@@ -241,7 +260,12 @@ class Grid:
 
     # ---- output
     def _sweep(self):
-        """Yield ((row, col), text, merge covering it or None) in reading order, in one row sweep.
+        """Yield ((row, col), text, merge covering it or None) in reading order, in one row sweep."""
+        for p, m in self._cover(sorted(self.cells)):
+            yield p, self.cells[p], m
+
+    def _cover(self, positions):
+        """Yield ((row, col), merge covering it or None) for the sorted positions, in one row sweep.
         Merges are taken in reading order of their first cell (stored as (r1, c1, r2, c2)); one that overlaps an
         earlier one is dropped.
         Active merges never overlap, so they are disjoint in columns and one bisect finds the one over a column."""
@@ -254,7 +278,7 @@ class Grid:
                 i = bisect_left(starts, c1)
                 del starts[i], act[i]
 
-        for r, c in sorted(self.cells):
+        for r, c in positions:
             while mi < len(merges) and merges[mi][0] <= r:
                 m = merges[mi]
                 mi += 1
@@ -269,7 +293,7 @@ class Grid:
             expire(r)
             i = bisect_right(starts, c) - 1
             hit = act[i] if i >= 0 and act[i][3] >= c else None
-            yield (r, c), self.cells[(r, c)], hit
+            yield (r, c), hit
 
     def blocks(self) -> list:
         origins = {}  # (row, col) -> (text, last row, last col)

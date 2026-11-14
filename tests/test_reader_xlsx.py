@@ -701,7 +701,35 @@ def test_comment_on_merged_away_cell():
     assert "m[^1]" in out and "[^1]: Comment by Ann: kept" in out, out
     hid = xlsx_row(1, xlsx_cell("A1", "m", t="str"), attrs='hidden="1"') + xlsx_row(2, xlsx_cell("A2", "z", t="str"))
     out, _ = commented(hid, leg=legacy_xml(("B1", 0, "kept")), sheet_kw=dict(merge))
-    assert orphans(out) == [], out
+    assert orphans(out) == [] and "kept" not in out and "hidden places left out" in out, out
+    out, _ = commented(hid, leg=legacy_xml(("B1", 0, "kept")), sheet_kw=dict(merge), hidden=True)
+    assert "Comment by Ann: kept" in out and orphans(out) == [], out
+
+
+def test_comment_merge_chain():
+    # A1:B1 renders; B1:C1 overlaps it and is dropped, so C1 is an ordinary cell and keeps its own comment
+    rows = xlsx_row(1, xlsx_cell("A1", "a", t="str"))
+    merges = {"after": '<mergeCells><mergeCell ref="A1:B1"/><mergeCell ref="B1:C1"/></mergeCells>'}
+    leg = legacy_xml(("A1", 0, "ca"), ("B1", 0, "cb"), ("C1", 0, "cc"))
+    out, ctx = commented(rows, leg=leg, sheet_kw=merges)
+    assert "a[^1][^2]" in out and "Comment by Ann: ca" in out and "Comment by Ann: cb" in out, out
+    assert "Comment by Ann: cc" in out and orphans(out) == [] and not ctx.skipped["comments_cut"], (out, ctx.skipped)
+
+
+def test_comment_origin_first():
+    rows = xlsx_row(1, xlsx_cell("A1", "m", t="str"))
+    merge = {"after": '<mergeCells><mergeCell ref="A1:B1"/></mergeCells>'}
+    out, _ = commented(rows, leg=legacy_xml(("B1", 0, "second"), ("A1", 0, "first")), sheet_kw=merge)
+    assert "m[^1][^2]" in out and out.index("first") < out.index("second"), out
+
+
+def test_comment_kept_on_cut_sheet():
+    rows = "".join(xlsx_row(r, xlsx_cell(f"A{r}", f"v{r}", t="str")) for r in range(1, 31))
+    leg = legacy_xml(("A2", 0, "kept"), ("A30", 0, "unread"))
+    with patched("SHEET_SCAN", 40):
+        out, ctx = commented(rows, leg=leg)
+    assert "v2[^1]" in out and "[^1]: Comment by Ann: kept" in out and "unread" not in out, out
+    assert orphans(out) == [] and ctx.skipped["comments_cut"] == 1, (out, ctx.skipped)
 
 
 def test_comment_cells_before_notes():
@@ -709,7 +737,9 @@ def test_comment_cells_before_notes():
     leg = legacy_xml(*[(f"A{r}", 0, f"c{r}") for r in range(1, 5)], ("D9", 0, "empty"))
     with patched("SHEET_CELLS", 2):
         out, ctx = commented(rows, leg=leg)
-    assert orphans(out) == [] and "c4" not in out and "empty" not in out, out
+    assert orphans(out) == [] and "x[^1]" in out and "x[^2]" in out, out
+    assert "Comment by Ann: c1" in out and "Comment by Ann: c2" in out, out
+    assert "c3" not in out and "c4" not in out and "empty" not in out, out
     assert ctx.skipped["comments_cut"] == 1, ctx.skipped
 
 

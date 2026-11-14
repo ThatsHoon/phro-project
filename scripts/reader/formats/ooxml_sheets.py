@@ -31,7 +31,6 @@ with it.
 import math
 import posixpath
 import re
-from bisect import bisect_left, bisect_right
 from datetime import datetime
 
 from .. import limits
@@ -628,61 +627,55 @@ class _Sheets:
                 sizes[pos] = sizes.get(pos, 0) + len(t)
                 stack.extend(reversed(kids[n]))
 
-    def _origins(self, grid, marks) -> dict:
-        """Marked cells inside a merge but not its origin -> that origin (the first merge in reading order wins).
-        The cells each merge looks at are charged to the scan count; past SHEET_SCAN the rest stay where they are."""
-        if not grid.merges or not marks:
-            return {}
-        order = sorted(marks)
-        rows = [p[0] for p in order]
-        out = {}
-        for r1, c1, r2, c2 in sorted(grid.merges):
-            lo, hi = bisect_left(rows, r1), bisect_right(rows, r2)
-            self.scan += hi - lo
-            if self.scan > limits.SHEET_SCAN:
-                break
-            for p in order[lo:hi]:
-                if c1 <= p[1] <= c2 and p != (r1, c1) and p not in out:
-                    out[p] = (r1, c1)
-        return out
-
     def _place(self, grid, marks, hidden):
-        """Put the marks after the cells: first on the cells that hold nothing, then appended to the valued ones. A
-        note is kept only if its put succeeds and its text fits the character budget; otherwise it is dropped and
-        `comments_cut` counted. A note on a hidden row or column (or sheet) is hidden with its place."""
+        """Put the marks after the cells. A mark on a cell that holds a value is appended to it (`Grid.append`, which
+        still works once the sheet is cut); a cell that holds nothing gets the mark alone, which needs an uncut grid.
+        A note is kept only if its mark is placed and its text fits the character budget; otherwise it is dropped
+        and `comments_cut` counted. A comment on a merged-away cell goes to the origin of the merge that renders
+        (the origin's own comment first), as `Grid.covers` resolves it. A note on a hidden row or column (its own
+        or its mark's), or on a hidden sheet, is hidden with its place."""
         if not marks:
             return
-        moved = self._origins(grid, marks)
+        moved = grid.covers(marks)
         targets: dict = {}
-        for pos, item in marks.items():
-            targets.setdefault(moved.get(pos, pos), []).append(item)
+        for pos, (key, size) in marks.items():
+            t = moved.get(pos, pos)
+            targets.setdefault(t, [])
+            targets[t].insert(0 if t == pos else len(targets[t]), (key, size, pos))
         order = [t for t in targets if grid.get(*t) is None] + [t for t in targets if grid.get(*t) is not None]
         b = grid.budget
+
+        def hides(pos):
+            return pos[0] in grid.rows_h or pos[1] in grid.cols_h
+
         for t in order:
             fit, total = [], 0
-            for key, size in targets[t]:
+            for key, size, pos in targets[t]:
                 if b.chars - total >= size:
-                    fit.append(key)
+                    fit.append((key, pos))
                     total += size
                 else:
                     self.notes.pop(key, None)
                     self._cut_comments()
             if not fit:
                 continue
-            value = grid.get(*t)
-            inl = [] if value is None else sheet_grid.text_inlines(value) if isinstance(value, str) else list(value)
-            if grid.put(t[0], t[1], inl + [NoteRef(k) for k in fit]):
+            refs = [NoteRef(k) for k, _ in fit]
+            if grid.get(*t) is not None:
+                ok = grid.append(t[0], t[1], refs)
+            else:
+                ok = grid.put(t[0], t[1], refs)
+            if ok:
                 b.chars -= total
-                if hidden or t[0] in grid.rows_h or t[1] in grid.cols_h:
-                    for k in fit:
+                for k, pos in fit:
+                    if hidden or hides(t) or hides(pos):
                         self.notes[k] = _hide(self.notes[k])
             else:
-                for k in fit:
+                for k, _ in fit:
                     self.notes.pop(k, None)
                 self._cut_comments()
 
     def _sweep(self, blocks, keys):
-        """Drop this sheet's notes whose mark did not reach the output (a merged-away cell, a cut sheet)."""
+        """Drop this sheet's notes whose mark did not reach the output; that is counted as `comments_cut`."""
         if not keys:
             return
         live, stack = set(), list(blocks)
@@ -696,8 +689,8 @@ class _Sheets:
             for row in getattr(x, "rows", ()):
                 stack.extend(row)
         for k in keys:
-            if k not in live:
-                self.notes.pop(k, None)
+            if k not in live and self.notes.pop(k, None) is not None:
+                self._cut_comments()
 
     def _link(self, grid, links):
         """Decision 9: wrap the valued cells of each range in a Link. The cost min(area, cells held) is charged to
