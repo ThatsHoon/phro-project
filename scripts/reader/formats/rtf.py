@@ -38,7 +38,11 @@ paragraph being built and its own open fields, so a note or a header never ends 
 * Fields: a HYPERLINK instruction wraps the field's result in a Link; any other field gives its result. Fields nest
   32 deep; a field past that keeps its result text and is counted under `depth`.
 * Depth: groups past 1,000 deep are skipped to their matching close, counted once under `depth` for each run.
-* Text past the root group's close is ignored. The input must start, after an optional byte-order mark and
+* Text past the root group's close is ignored, but a stray close is not that close: a first pass counts the braces,
+  and a `}` that would close the root while more closes than opens remain after it is ignored, the root staying open.
+  So an extra `}` mid-body is skipped and the rest read; `{\\rtf1 one}\\r\\n trailing {\\b junk}` still ends at the
+  first `}`. A `}` with no open group is ignored. The last paragraph, written without `\\par`, ends under the state
+  it was written in. The input must start, after an optional byte-order mark and
   whitespace, with `{\\rtf`; a compound file goes to `doc.parse`, a zip to `ooxml.parse`.
 * Code pages: `\\ansicpg`, `\\deff`, the font table's `\\fN \\fcharsetN \\cpgN` and `\\fN` per group, through
   `rtf_lex.codec`.
@@ -153,28 +157,34 @@ def _plain(inlines) -> str:
 
 
 def _edge(inlines, first):
-    """Trim the whitespace and line breaks at the start (first) or the end of a paragraph's inlines."""
-    i = 0 if first else -1
-    while inlines:
-        it = inlines[i]
+    """Trim the whitespace and line breaks at the start (first) or the end of a paragraph's inlines: one slice
+    deletion, so a long run of breaks costs O(n)."""
+    n = len(inlines)
+    k = 0  # items dropped from the edge
+    while k < n:
+        it = inlines[k if first else n - 1 - k]
         if isinstance(it, Break):
-            inlines.pop(i)
+            k += 1
             continue
-        holder, t = inlines, it
+        t = it
         if isinstance(it, Bold):
-            holder = it.inlines
-            t = holder[i] if holder else None
-            if t is None:
-                inlines.pop(i)
+            if not it.inlines:
+                k += 1
                 continue
+            t = it.inlines[0 if first else -1]
         if isinstance(t, Text):
             t.text = t.text.lstrip() if first else t.text.rstrip()
             if not t.text:
-                holder.pop(i)
-                if holder is not inlines and not holder:
-                    inlines.pop(i)
+                if t is not it:
+                    it.inlines.pop(0 if first else -1)  # a Bold holds one run; it is now empty
+                k += 1
                 continue
-        return
+        break
+    if k:
+        if first:
+            del inlines[:k]
+        else:
+            del inlines[n - k:]
 
 
 def _build(items) -> list:
@@ -243,8 +253,22 @@ class _Reader:
     # ---- the walk
     def run(self, data):
         skipped = self.ctx.skipped
+        # the totals of braces, to tell a stray close from the root's real one
+        total_open = total_close = 0
         for t in tokens(data):
             k = t[0]
+            if k == OPEN:
+                total_open += 1
+            elif k == CLOSE:
+                total_close += 1
+        seen_open = seen_close = 0
+        leaf = None  # the group state in force when the root closed
+        for t in tokens(data):
+            k = t[0]
+            if k == OPEN:
+                seen_open += 1
+            elif k == CLOSE:
+                seen_close += 1
             if self.over:
                 if k == OPEN:
                     self.over += 1
@@ -288,6 +312,9 @@ class _Reader:
             elif k == CLOSE:
                 if self.pend:
                     self.flush()
+                if len(self.stack) == 1 and total_close - seen_close > total_open - seen_open:
+                    continue  # a stray: more closes than opens remain, so this one does not end the root
+                leaf = g
                 if self.close_group():
                     break
             elif k == SYM:
@@ -299,8 +326,11 @@ class _Reader:
             self.flush()
         if self.hi is not None:
             self.drop_high()
+        if leaf is None:
+            leaf = self.g
         while self.stack:
             self.close_group()
+        self.g = leaf  # the last paragraph ends under the state it was written in: its heading, bold, hidden
         self.end_paragraph(self.body)
 
     def open_group(self):
@@ -540,23 +570,40 @@ class _Reader:
         return self.style_level(g.sty) if g.sty is not None else 0
 
     def style_level(self, sid) -> int:
-        levels = self.levels
-        if sid in levels:
-            return levels[sid]
-        path, seen, cur, level = [], set(), sid, 0
-        while cur is not None and cur not in seen and len(path) < STYLE_CHAIN:
-            if cur in levels:
-                level = levels[cur]
+        """The heading level of style sid, 0 for none. The chain of \\sbasedon is walked iteratively; a heading
+        counts when the style's own walk reaches it within STYLE_CHAIN steps. The memo holds (level, steps to the
+        heading) so a style never gets what only another style's walk proved."""
+        memo = self.levels
+        if sid in memo:
+            return memo[sid][0]
+        path, seen, cur = [], set(), sid
+        level, found, definite = 0, None, True  # found: the path index of the heading style
+        while cur is not None and cur not in seen:
+            hit = memo.get(cur)
+            if hit is not None:
+                if hit[0] and len(path) + hit[1] < STYLE_CHAIN:
+                    level, found = hit[0], len(path) + hit[1]
+                elif hit[0]:
+                    definite = False
+                break
+            if len(path) >= STYLE_CHAIN:
+                definite = False
                 break
             seen.add(cur)
             path.append(cur)
             m = _HEADING.match(self.names.get(cur, ""))
             if m:
-                level = int(m.group(1))
+                level, found = int(m.group(1)), len(path) - 1
                 break
             cur = self.based.get(cur)
-        for s in path:
-            levels[s] = level
+        if found is not None:
+            for i, st in enumerate(path):
+                memo[st] = (level, found - i)
+        elif definite:
+            for st in path:
+                memo[st] = (0, 0)
+        else:
+            memo[sid] = (0, 0)  # only its own walk is proven
         return level
 
     def end_paragraph(self, story):
@@ -672,21 +719,21 @@ class _Reader:
 
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
-        head = f.read(16)
-        if head.startswith(_ZIP):  # a Word package saved as .rtf
-            from . import ooxml
-            return ooxml.parse(path, ctx)
-        if is_cfb(head):  # a Word binary document saved as .rtf
-            from . import doc
-            return doc.parse(path, ctx)
-        data = head + f.read()
-    if data.startswith(_BOM):
-        data = data[len(_BOM):]
-    data = data.lstrip(_SPACE)
-    if not data.startswith(_RTF):
+        data = f.read()  # read once; the BOM and blanks are skipped by a view, not a copy
+    head = data[:16]
+    if head.startswith(_ZIP):  # a Word package saved as .rtf
+        from . import ooxml
+        return ooxml.parse(path, ctx)
+    if is_cfb(head):  # a Word binary document saved as .rtf
+        from . import doc
+        return doc.parse(path, ctx)
+    i = len(_BOM) if data.startswith(_BOM) else 0
+    while i < len(data) and data[i] in _SPACE:
+        i += 1
+    if not data.startswith(_RTF, i):
         raise ReadError("damaged", "not an RTF file")
     r = _Reader(ctx)
-    r.run(data)
+    r.run(memoryview(data)[i:] if i else data)
     result = r.doc
     result.blocks = r.body.blocks
     result.title = " ".join("".join(r.title).split())[:MAX_TITLE]

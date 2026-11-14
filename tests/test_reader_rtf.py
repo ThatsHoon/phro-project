@@ -16,7 +16,7 @@ from reader import markdown  # noqa: E402
 from reader.formats import rtf  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader_fix import make_doc  # noqa: E402
+from reader_fix import make_doc, make_zip  # noqa: E402
 
 
 def uword(n, fallback=b"?"):
@@ -170,8 +170,10 @@ def test_group_depth():
 def test_unbalanced_close():
     # a missing close is repaired at the end of the input
     assert md(rb"{\rtf1 one {\b two") == "one **two**\n"
-    # a close that ends the root group ends the reading: what follows is not text of the document
-    assert md(rb"{\rtf1 one}} two}") == "one\n"
+    # an extra close mid-body is a stray: ignored, the rest is read
+    assert md(rb"{\rtf1 one} two\par three}") == "one two\n\nthree\n"
+    assert md(rb"{\rtf1 one}} two}") == "one two\n"
+    assert md(rb"{\rtf1 a {\b b}} c\par d}") == "a **b** c\n\nd\n"
     # an empty group and a nested extra group are fine
     assert md(rb"{\rtf1 one {\i x}{} y}") == "one x y\n"
 
@@ -321,6 +323,57 @@ def test_pntext_and_unknown_star_group():
 def test_shape_text_is_read():
     out = md(rb"{\rtf1 {\shp{\*\shpinst Keep out {\shptxt\pard Inside\par}}}after}")
     assert "Inside" in out and "Keep out" not in out and "after" in out, out
+
+
+def test_many_line_breaks_are_fast():
+    for body in (b"\\line " * 200_000, b"\\line  \\line " * 100_000):
+        t0 = time.monotonic()
+        out = md(b"{\\rtf1 " + body + b"a}")
+        took = time.monotonic() - t0
+        assert out == "a\n" and took < 3, (out[:20], took)
+        assert md(b"{\\rtf1 a" + body + b"}") == "a\n"
+
+
+def test_zip_head_is_handed_to_ooxml():
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    members = {
+        "[Content_Types].xml": '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        "_rels/.rels": ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                        f'<Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/>'
+                        '</Relationships>'),
+        "word/document.xml": (f'<w:document xmlns:w="{W}"><w:body><w:p><w:r><w:t>zip body</w:t></w:r></w:p>'
+                              '</w:body></w:document>'),
+    }
+    p = make_zip(tmp() / "z.rtf", members, stored=())
+    assert md(p.read_bytes(), name="z.rtf") == "zip body\n"
+
+
+def test_hyperlink_switches():
+    data = rb'{\rtf1 {\field{\*\fldinst HYPERLINK "http://x" \\o "tip"}{\fldrslt text}}}'
+    assert md(data) == "[text](http://x)\n"
+
+
+def test_last_paragraph_without_par():
+    ss = rb"{\stylesheet{\s1 heading 1;}}"
+    assert md(rb"{\rtf1" + ss + rb"\pard\s1 x}") == "# x\n"
+    assert md(rb"{\rtf1" + ss + rb"\pard\s1 x {\b y} {\v h}}") .startswith("(1 hidden places left out)")
+    assert md(rb"{\rtf1" + ss + rb"\pard\s1 x {\b y} {\v h}}").endswith("# x y\n")
+    assert md(rb"{\rtf1 a\par b {\b c}}") == "a\n\nb **c**\n"
+    assert "h" in md(rb"{\rtf1 a {\v h}}", hidden=True)
+
+
+def test_style_chain_cut_keeps_near_styles():
+    # style 1 is "heading 2"; style k is based on k-1, up to 41. Within 32 steps of the root: level 2.
+    styles = b"{\\s1 heading 2;}" + b"".join(b"{\\s%d\\sbasedon%d S;}" % (i, i - 1) for i in range(2, 42))
+    body = b"".join(b"\\pard\\s%d p%d\\par" % (i, i) for i in (30, 32, 33, 41))
+    out = md(b"{\\rtf1{\\stylesheet" + styles + b"}" + body + b"}")
+    # the chain of style 30 reaches the root in 30 steps, 32 in 32; 33 and 41 are further than the cap
+    assert out == "## p30\n\n## p32\n\np33\n\np41\n", out
+    # the order of the paragraphs must not change what each style gets
+    body = b"".join(b"\\pard\\s%d p%d\\par" % (i, i) for i in (41, 33, 32, 30))
+    out = md(b"{\\rtf1{\\stylesheet" + styles + b"}" + body + b"}")
+    assert out == "p41\n\np33\n\n## p32\n\n## p30\n", out
 
 
 def main():
