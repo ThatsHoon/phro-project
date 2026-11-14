@@ -161,8 +161,10 @@ class Objects:
                 r.ctx.skipped["object"] += 1
 
     def tables(self, st, tables):
-        """An embedded workbook's tables after the open paragraph, as a picture goes (st.extras). Each placement is
-        charged against CHART_TOTAL, and one past it is counted under chart instead."""
+        """An embedded workbook's tables after the open paragraph, not at the object's place inside it, as a picture
+        goes (st.extras): a Markdown table is a block and cannot sit in the middle of a line of text, and doc pictures
+        follow the same rule (test_doc_text_order pins it). Each placement is charged against CHART_TOTAL, and one
+        past it is counted under chart instead."""
         for t in tables:
             self.chart_cells += sum(len(row) for row in t.rows)
             if self.chart_cells > limits.CHART_TOTAL:
