@@ -212,11 +212,12 @@ def test_text_after_root_close_ignored():
 
 def test_cell_and_row_separate_text():
     data = rb"{\rtf1\trowd\cellx1000\cellx2000 \pard\intbl A\cell B\cell\row\trowd\cellx1000 C\cell\row D}"
-    assert md(data) == "A\n\nB\n\nC\n\nD\n"
+    assert md(data) == "|A|B|\n|---|---|\n|C||\n\nD\n"  # Task 23: a table, and the D outside a row ends it
 
 
-def test_listtext_stays_a_prefix():
-    assert md(rb"{\rtf1 {\*\listtext\pard\plain 1.\tab}one\par {\listtext 2.\tab}two\par}") == "1\\. one\n\n2\\. two\n"  # the renderer escapes the dot
+def test_listtext_is_the_marker():
+    # Task 23: the list text is the ListItem's marker, no longer a prefix of a paragraph
+    assert md(rb"{\rtf1 {\*\listtext\pard\plain 1.\tab}one\par {\listtext 2.\tab}two\par}") == "1. one\n2. two\n"
 
 
 def test_sbasedon_cycle_does_not_loop():
@@ -306,6 +307,7 @@ def test_bin_is_skipped():
 
 
 def test_pict_counted_once_each():
+    # none of these can be read (too short, or no format word), so each is counted once; the nonshppict one is skipped
     data = (rb"{\rtf1 a{\pict\pngblip 89504e47}b"
             rb"{\*\shppict{\pict\jpegblip ffd8}}{\nonshppict{\pict\wmetafile8 0102}}"
             rb"{\pict\bin4 \}\{}c}")

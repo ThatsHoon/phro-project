@@ -1,8 +1,9 @@
-"""RTF reader: text, destinations, Unicode, code pages, hidden runs, headings, notes, fields, headers and footers.
+"""RTF reader: text, destinations, Unicode, code pages, hidden runs, headings, notes, fields, headers, footers,
+tables, lists and pictures.
 
 Ported from MIT sources. The state machine (group state, destinations, paragraphs, notes, fields, the `\\*` rule and
-the special characters) follows anydoc (`rtf/mod.rs`; the HYPERLINK instruction through `word_fields`, after
-`shared/fields.rs`); the `\\v` hidden runs, the `\\uc` stack and the end of the `\\u` fallback skip follow xberg
+the special characters) follows anydoc (`rtf/mod.rs`, including its list text and pictures; the HYPERLINK instruction through
+`word_fields`, after `shared/fields.rs`; tables are `rtf_table`); the `\\v` hidden runs, the `\\uc` stack and the end of the `\\u` fallback skip follow xberg
 (`extractors/rtf/parser`). The destination list is anydoc's list of destinations whose content is left out. Stdlib only.
 
 The tokens come from `rtf_lex`; this module walks them once, O(input), with an explicit stack of group states: no
@@ -11,13 +12,27 @@ are gathered in one `Pending` and decoded together when anything else arrives.
 
 Group state (`_Group`). Every `{` clones the state of its parent and every `}` restores it. The fields are the
 font, `\\uc`, bold, hidden, the destination name, whether text is left out (`suppress`), where text is captured to
-(`cap`: a field instruction, the info title, a style name), and the paragraph's outline level and style number.
-Task 23 adds the table, list and picture fields here: add each one to `__slots__`, `__init__` and `clone`, and read
-it where the three INTERIM comments below stand (`\\cell` and `\\row`, `\\listtext`, `\\pict`).
+(`cap`: a field instruction, the info title, a style name, list text, a picture's data), the paragraph's outline
+level and style number, and its table and list state (`in_table`, `itap`, `ls`, `ilvl`).
 
 Output. Text goes to the current story (`_Story`): the body, a note, or a header or footer. A story keeps its own
 paragraph being built and its own open fields, so a note or a header never ends the body's paragraph.
 
+* Tables: `\\trowd`, `\\cellx`, `\\clmgf` `\\clmrg` `\\clvmgf` `\\clvmrg`, `\\trhdr`, `\\cell` and `\\row` (and `\\nestcell` and
+  `\\nestrow`, with `{\\*\\nesttableprops ...}`, at `\\itap` 2 and up) drive one `rtf_table.Tables` per table, kept on the
+  story. A paragraph is in the table when it has `\\intbl` or an `\\itap`; the first paragraph that is not ends the table
+  at its place in the story, as does the end of the story or of the input. A table in a note or header stays there; a
+  header's line holds the text of its cells.
+* Lists: the text of a `\\listtext` or `\\pntext` group, without tabs, is the marker of the paragraph's ListItem, its
+  level `\\ilvlN` clamped to 0..8 (0 first, as every format here). A paragraph with `\\lsN` and no list text has the
+  marker `-`. `\\pard` resets `\\ls`, `\\ilvl`, `\\intbl` and `\\itap`. A heading stays a Heading.
+* Pictures: `{\\pict ...}` with `\\pngblip`, `\\jpegblip`, `\\emfblip`, `\\wmetafile` or `\\dibitmap` is one Image after the
+  paragraph it is in (a table cell's blocks, in a table). Its hex digits (cleaned in one `re.sub`, an odd last digit
+  dropped) or `\\bin` bytes are charged against `IMAGE_BYTES`, the document's earlier pictures included, as they are
+  collected: past it collection stops, `image` is counted once and nothing is emitted. A DIB becomes a BMP through
+  `officeart._dib`, then a PNG. `\\macpict` and any other format are counted under `image`. A group inside `\\pict` is
+  skipped; `{\\*\\shppict{\\pict ...}}` is read and `\\nonshppict` skipped, so the pair is one image; an `\\object` keeps
+  its `\\result` and skips `\\objdata`.
 * Paragraphs: `\\par` and `\\sect` end one; `\\line`, `\\lbr`, `\\page` and `\\column` are a Break; `\\tab` is a space;
   `\\pard` resets the paragraph's outline and style. A paragraph with no text is dropped.
 * Headings: `\\outlinelevelN` (0..8) gives level N+1; so does a paragraph style `\\sN` named `heading N` or
@@ -49,10 +64,13 @@ paragraph being built and its own open fields, so a note or a header never ends 
 """
 import re
 
+from .. import images, limits
 from ..containers.cfb import is_cfb
 from ..limits import ReadError
-from ..model import Bold, Break, Doc, Heading, Hidden, Link, NoteRef, Para, Text
-from .rtf_lex import CLOSE, HEX, OPEN, SYM, TEXT, WORD, Pending, codec, tokens
+from ..model import Bold, Break, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
+from ..officeart import _dib
+from .rtf_lex import BIN, CLOSE, HEX, OPEN, SYM, TEXT, WORD, Pending, codec, tokens
+from .rtf_table import Tables
 from .word_fields import MAX_INSTR, hyperlink_url
 
 MAX_GROUPS = 1_000      # groups nested deeper than this are skipped to their close
@@ -62,6 +80,7 @@ MAX_LINES = 10_000      # header and footer lines kept, each
 MAX_STYLES = 10_000     # style definitions and fonts kept (a table past this is read no further)
 STYLE_CHAIN = 32        # \sbasedon steps followed to find a heading
 MAX_TITLE = 500         # characters kept of the info title
+MAX_MARK = 64           # characters kept of a list marker
 
 _ZIP = b"PK\x03\x04"
 _BOM = b"\xef\xbb\xbf"
@@ -69,6 +88,7 @@ _RTF = b"{\\rtf"
 _SPACE = b" \t\r\n\x0b\x0c\x00"
 _HEADING = re.compile(r"(?:heading|제목)\s*([1-9])$", re.I)
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_NONHEX = re.compile(rb"[^0-9a-fA-F]")
 
 # Destinations whose content is left out (anydoc's list), except the headers and footers, which fill Doc.headers and
 # Doc.footers, and the info title, which fills Doc.title. A bookmark start is added: anydoc captures its name, here
@@ -94,14 +114,16 @@ _CHARS = {
 _SYMS = {"{": "{", "}": "}", "\\": "\\", "~": " ", "_": "-", "-": ""}
 _CODEPAGES = {"mac": 10000, "pc": 437, "pca": 850}  # the charset words that stand in for \ansicpg
 _LINE_WORDS = frozenset(("line", "lbr", "page", "column"))
-# INTERIM (Task 23): a cell or row end only ends the paragraph, so table text does not run together
-_PAR_WORDS = frozenset(("par", "sect", "cell", "row", "nestcell", "nestrow"))
+_PAR_WORDS = frozenset(("par", "sect"))
+# picture format words: the ones read (what _pict_data decodes), and the ones that are counted instead
+_BLIPS = {"pngblip": "png", "jpegblip": "jpeg", "emfblip": "emf", "wmetafile": "wmf", "dibitmap": "dib"}
+_UNREAD = ("macpict", "wbitmap", "pmmetafile")
 
 
 class _Group:
-    """The state a `{` copies and a `}` restores. Task 23: add table, list and picture fields here, in __init__ and
-    in clone()."""
-    __slots__ = ("font", "uc", "bold", "hidden", "dest", "suppress", "cap", "sty", "outline")
+    """The state a `{` copies and a `}` restores."""
+    __slots__ = ("font", "uc", "bold", "hidden", "dest", "suppress", "cap", "sty", "outline",
+                 "in_table", "itap", "ilvl", "ls")
 
     def __init__(self):
         self.font = None      # \fN, None until set (the \deff font then)
@@ -110,15 +132,32 @@ class _Group:
         self.hidden = False   # \v
         self.dest = ""        # the last destination word seen here or in a parent
         self.suppress = False  # text is left out
-        self.cap = ""         # "fldinst", "title" or "style": text is captured there, even when suppressed
+        self.cap = ""         # "fldinst", "title", "style", "list" or "pict": text is captured there, even when suppressed
         self.sty = None       # \sN of the paragraph
         self.outline = None   # \outlinelevelN of the paragraph
+        self.in_table = False  # \intbl
+        self.itap = 0         # \itapN, 0..9 (9 stands for anything deeper than 8)
+        self.ilvl = 0         # \ilvlN
+        self.ls = None        # \lsN: the paragraph is in a list
 
     def clone(self):
         n = _Group.__new__(_Group)
         n.font, n.uc, n.bold, n.hidden = self.font, self.uc, self.bold, self.hidden
         n.dest, n.suppress, n.cap, n.sty, n.outline = self.dest, self.suppress, self.cap, self.sty, self.outline
+        n.in_table, n.itap, n.ilvl, n.ls = self.in_table, self.itap, self.ilvl, self.ls
         return n
+
+
+class _Pic:
+    """A picture being collected: its format, the hex chunks or raw bytes so far, and what they are charged."""
+    __slots__ = ("depth", "fmt", "hex", "raw", "chars", "nraw", "dead")
+
+    def __init__(self, depth):
+        self.depth = depth    # the group depth of the \pict group
+        self.fmt = None
+        self.hex, self.raw = [], []
+        self.chars = self.nraw = 0  # hex characters and raw bytes collected
+        self.dead = False     # over the budget or not readable: counted, nothing more is collected
 
 
 class _Field:
@@ -131,7 +170,8 @@ class _Field:
 
 class _Story:
     """Where text goes: the body, a note, a header or a footer, with its paragraph under way and its open fields."""
-    __slots__ = ("kind", "depth", "cur", "has", "pars", "fields", "blocks", "ref", "alt")
+    __slots__ = ("kind", "depth", "cur", "has", "pars", "fields", "blocks", "ref", "alt", "tbl", "mark", "mark_len",
+                 "extras")
 
     def __init__(self, kind, depth):
         self.kind, self.depth = kind, depth
@@ -142,6 +182,10 @@ class _Story:
         self.blocks = []
         self.ref = None      # a note's NoteRef in the story it came from
         self.alt = False     # a note that is an endnote
+        self.tbl = None      # the rtf_table.Tables open in this story
+        self.mark = []       # list text of the paragraph under way
+        self.mark_len = 0
+        self.extras = []     # Images of the paragraph under way
 
 
 def _plain(inlines) -> str:
@@ -154,6 +198,14 @@ def _plain(inlines) -> str:
         elif isinstance(it, Break):
             out.append(" ")
     return "".join(out)
+
+
+def _text(block) -> str:
+    """The text of a header's or footer's block: a table's cells one after another."""
+    if isinstance(block, Table):
+        return " ".join(t for row in block.rows for c in row for b in c.blocks for t in (_text(b),) if t)
+    inl = getattr(block, "inlines", None)
+    return _plain(inl).strip() if inl is not None else ""
 
 
 def _edge(inlines, first):
@@ -244,6 +296,10 @@ class _Reader:
         self.ss_depth = -10    # depth of the stylesheet group, while inside it
         self.sty = None        # [style number, based on, name parts] of the stylesheet entry being read
         self.title = []
+        self.data = b""        # the input the BIN tokens point into
+        self.pic = None        # the picture being collected
+        self.img_total = 0     # bytes of the pictures emitted so far (IMAGE_BYTES)
+        self.budget = [limits.TABLE_NODES]  # cells the tables of the document may still take
         self.n_notes = {"fn": 0, "en": 0}
         self.body = _Story("body", 0)
         self.stories = [self.body]
@@ -253,6 +309,7 @@ class _Reader:
     # ---- the walk
     def run(self, data):
         skipped = self.ctx.skipped
+        self.data = data
         # the totals of braces, to tell a stray close from the root's real one
         total_open = total_close = 0
         for t in tokens(data):
@@ -295,7 +352,11 @@ class _Reader:
                 self.fresh = 0
             g = self.g
             if k == TEXT or k == HEX:
-                if not g.suppress or g.cap:
+                cap = g.cap
+                if cap == "pict":
+                    if k == TEXT:
+                        self.pict_text(t[1])
+                elif not g.suppress or cap:
                     self.pend.push(t[1])
             elif k == WORD:
                 if self.pend:
@@ -321,7 +382,9 @@ class _Reader:
                 if self.pend:
                     self.flush()
                 self.symbol(t[1], fresh)
-            # BIN: the raw bytes are skipped
+            elif k == BIN:
+                if g.cap == "pict":
+                    self.pict_bin(t[1], t[2])  # anywhere else the raw bytes are skipped
         if self.pend:
             self.flush()
         if self.hi is not None:
@@ -332,11 +395,14 @@ class _Reader:
             self.close_group()
         self.g = leaf  # the last paragraph ends under the state it was written in: its heading, bold, hidden
         self.end_paragraph(self.body)
+        self.end_table(self.body)
 
     def open_group(self):
         self.stack.append(self.g)
         g = self.g = self.g.clone()
-        if g.cap == "style" and len(self.stack) != self.ss_depth + 1:
+        if g.cap == "pict":
+            g.cap, g.suppress = "", True  # a group inside a picture (its uid, its properties) is not data
+        elif g.cap == "style" and len(self.stack) != self.ss_depth + 1:
             g.cap = ""
         elif g.dest == "stylesheet" and len(self.stack) == self.ss_depth + 1:
             g.cap = "style"
@@ -352,6 +418,9 @@ class _Reader:
             self.finish_style()
         elif depth == self.ss_depth:
             self.ss_depth = -10
+        closing = self.g
+        if self.pic is not None and depth == self.pic.depth:
+            self.finish_pict(closing)
         self.g = self.stack.pop()
         depth -= 1
         while True:
@@ -359,7 +428,7 @@ class _Reader:
             while story.fields and story.fields[-1].depth > depth:
                 self.close_field(story)
             if story is not self.body and story.depth > depth:
-                self.close_story(story)
+                self.close_story(story, closing)
                 continue
             break
         return depth == 0
@@ -388,6 +457,11 @@ class _Reader:
             elif cap == "title":
                 if sum(map(len, self.title)) < MAX_TITLE:
                     self.title.append(s)
+            elif cap == "list":
+                story = self.story
+                if story.mark_len < MAX_MARK:
+                    story.mark.append(s[:MAX_MARK])
+                    story.mark_len += len(s)
             elif self.sty is not None:
                 self.sty[2].append(s)
         elif not g.suppress:
@@ -456,6 +530,13 @@ class _Reader:
             "footnote": self.w_footnote, "ftnalt": self.w_ftnalt,
             "pict": self.w_pict, "shppict": self.w_shppict, "shptxt": self.w_on, "nesttableprops": self.w_on,
             "result": self.w_on, "listtext": self.w_listtext, "pntext": self.w_listtext,
+            "intbl": self.w_intbl, "itap": self.w_itap, "ls": self.w_ls, "ilvl": self.w_ilvl,
+            "trowd": self.w_trowd, "cellx": self.w_cellx, "trhdr": self.w_trhdr,
+            "clmgf": self.w_merge("first"), "clmrg": self.w_merge("cont"),
+            "clvmgf": self.w_merge("vfirst"), "clvmrg": self.w_merge("vcont"),
+            "cell": self.w_cell, "row": self.w_row, "nestcell": self.w_nestcell, "nestrow": self.w_nestrow,
+            **{name: self.w_blip(kind) for name, kind in _BLIPS.items()},
+            **{name: self.w_blip(None) for name in _UNREAD},
         }
 
     def w_u(self, p, fresh):
@@ -501,7 +582,9 @@ class _Reader:
 
     def w_pard(self, p, fresh):
         g = self.g
-        g.sty = g.outline = None
+        g.sty = g.outline = g.ls = None
+        g.ilvl = g.itap = 0
+        g.in_table = False
 
     def w_s(self, p, fresh):
         g = self.g
@@ -546,16 +629,167 @@ class _Reader:
             self.g.suppress = False
 
     def w_listtext(self, p, fresh):
-        # INTERIM (Task 23): list text stays a plain prefix of its paragraph; Task 23 reads it as the list marker
+        g = self.g
         if fresh == 2:
-            self.g.suppress = self.stack[-1].suppress if self.stack else False
+            g.suppress = self.stack[-1].suppress if self.stack else False
+        if not g.suppress and not g.cap:
+            g.cap, g.suppress = "list", True  # its text is the marker of the paragraph, not part of it
 
+    def w_ls(self, p, fresh):
+        if p and self.g.cap != "style":
+            self.g.ls = p
+
+    def w_ilvl(self, p, fresh):
+        self.g.ilvl = min(max(p or 0, 0), 8)
+
+    # ---- tables
+    def table_of(self, story):
+        if story.tbl is None:
+            story.tbl = Tables(self.ctx, self.budget)
+        return story.tbl
+
+    def tbl_at(self, level):
+        tb = self.table_of(self.story)
+        tb.nest(level)
+        return tb
+
+    def end_table(self, story):
+        tb, story.tbl = story.tbl, None
+        if tb is not None:
+            table = tb.finish()
+            if table is not None:
+                story.blocks.append(table)
+
+    def live(self):
+        g = self.g
+        return not g.suppress and not g.cap
+
+    def w_intbl(self, p, fresh):
+        if self.live():
+            self.g.in_table = True
+
+    def w_itap(self, p, fresh):
+        if self.live():
+            g = self.g
+            g.itap = min(max(p or 0, 0), 9)
+            g.in_table = g.in_table or g.itap > 0
+
+    def w_trowd(self, p, fresh):
+        if self.live():
+            self.g.in_table = True
+            self.tbl_at(max(self.g.itap, 1)).trowd()
+
+    def w_cellx(self, p, fresh):
+        if self.live():
+            self.tbl_at(max(self.g.itap, 1)).cellx(p or 0)
+
+    def w_trhdr(self, p, fresh):
+        if self.live():
+            self.tbl_at(max(self.g.itap, 1)).header_row()
+
+    def w_merge(self, kind):
+        def merge(p, fresh):
+            if self.live():
+                self.tbl_at(max(self.g.itap, 1)).merge(kind)
+        return merge
+
+    def w_cell(self, p, fresh):
+        if self.live():
+            self.g.in_table = True
+            self.end_paragraph(self.story)
+            self.tbl_at(1).cell()
+
+    def w_nestcell(self, p, fresh):
+        if self.live():
+            g = self.g
+            g.in_table = True
+            self.end_paragraph(self.story)
+            self.tbl_at(max(g.itap, 2)).cell()
+
+    def w_row(self, p, fresh):
+        if self.live():
+            g = self.g
+            g.in_table = True
+            self.end_paragraph(self.story)
+            self.tbl_at(1).row()
+            g.in_table, g.itap = False, 0  # what follows is a table paragraph only if it says so
+
+    def w_nestrow(self, p, fresh):
+        if self.live():
+            g = self.g
+            g.in_table = True
+            self.end_paragraph(self.story)
+            self.tbl_at(max(g.itap, 2)).row()
+
+    # ---- pictures
     def w_pict(self, p, fresh):
         g = self.g
-        if not g.suppress and not g.cap:
-            # INTERIM (Task 23): a picture is skipped and counted, once; Task 23 reads its bytes
+        if g.suppress or g.cap or self.pic is not None:
+            return
+        self.pic = _Pic(len(self.stack))
+        g.cap, g.suppress = "pict", True
+
+    def w_blip(self, kind):
+        def blip(p, fresh):
+            pic = self.pic
+            if pic is None or self.g.cap != "pict" or pic.fmt is not None or pic.dead:
+                return
+            pic.fmt = kind or "unread"
+            if kind is None:
+                self.pict_fail(pic)
+        return blip
+
+    def pict_fail(self, pic):
+        """The picture is counted under image, once, and no more of it is collected."""
+        pic.dead = True
+        pic.hex, pic.raw = [], []
+        self.ctx.skipped["image"] += 1
+
+    def pict_text(self, raw):
+        pic = self.pic
+        if pic is None or pic.dead:
+            return
+        pic.chars += len(raw)
+        if self.img_total + pic.chars // 2 + pic.nraw > limits.IMAGE_BYTES:
+            self.pict_fail(pic)
+        else:
+            pic.hex.append(raw)
+
+    def pict_bin(self, off, n):
+        pic = self.pic
+        if pic is None or pic.dead:
+            return
+        pic.nraw += n
+        if self.img_total + pic.chars // 2 + pic.nraw > limits.IMAGE_BYTES:
+            self.pict_fail(pic)
+        else:
+            pic.raw.append(bytes(self.data[off:off + n]))
+
+    def finish_pict(self, g):
+        """The pict group closes: its Image goes after the paragraph under way (before the next cell, in a table)."""
+        pic, self.pic = self.pic, None
+        if pic.dead:
+            return
+        data = None
+        if pic.fmt in ("png", "jpeg", "emf", "wmf", "dib"):
+            try:
+                if pic.raw:
+                    data = b"".join(pic.raw)
+                else:
+                    digits = _NONHEX.sub(b"", b"".join(pic.hex))
+                    data = bytes.fromhex(digits[:len(digits) & ~1].decode("ascii"))
+                if pic.fmt == "dib":  # a DIB is a BMP without its file header
+                    bmp = _dib(data)
+                    data = images.bmp_to_png(bmp) if bmp is not None else None
+            except Exception:
+                data = None
+        pic.hex, pic.raw = [], []
+        if data is None or len(data) < 16 or images.sniff(data) is None or \
+                self.img_total + len(data) > limits.IMAGE_BYTES:
             self.ctx.skipped["image"] += 1
-            g.suppress = True
+            return
+        self.img_total += len(data)
+        self.story.extras.append(Image(data, hidden="hidden" if g.hidden else ""))
 
     # ---- paragraphs
     def par(self):
@@ -563,8 +797,7 @@ class _Reader:
         if not g.suppress and not g.cap:
             self.end_paragraph(self.story)
 
-    def heading_level(self) -> int:
-        g = self.g
+    def heading_level(self, g) -> int:
         if g.outline is not None:
             return g.outline + 1
         return self.style_level(g.sty) if g.sty is not None else 0
@@ -606,23 +839,44 @@ class _Reader:
             memo[sid] = (0, 0)  # only its own walk is proven
         return level
 
-    def end_paragraph(self, story):
-        cur, has = story.cur, story.has
+    def end_paragraph(self, story, g=None):
+        """End the paragraph under way in `story`, its properties those of `g` (the current group by default): a
+        Heading, a ListItem or a Para, then its pictures, into the cell of the table it is in or the story's blocks.
+        A paragraph that is not in a table ends the story's open table, even an empty one."""
+        g = g or self.g
+        cur, has, extras, mark = story.cur, story.has, story.extras, story.mark
         story.cur, story.has = [], False
         story.pars += 1
-        if not has:
-            return
-        inlines = _build(cur)
-        _edge(inlines, True)
-        _edge(inlines, False)
-        if not inlines:
-            return
-        level = self.heading_level() if story is self.body else 0
+        blocks = []
+        if has:
+            inlines = _build(cur)
+            _edge(inlines, True)
+            _edge(inlines, False)
+            if inlines:
+                level = self.heading_level(g) if story is self.body else 0
+                label = _CTRL.sub("", "".join(mark)).strip() if mark else ""
+                if level:
+                    inlines = [x for it in inlines for x in (it.inlines if isinstance(it, Bold) else (it,))]
+                    blocks.append(Heading(level, inlines))
+                elif label or g.ls:
+                    blocks.append(ListItem(g.ilvl, label or "-", inlines))
+                else:
+                    blocks.append(Para(inlines))
+        if mark:
+            story.mark, story.mark_len = [], 0
+        if extras:
+            story.extras = []
+            blocks.extend(extras)
+        level = g.itap or (1 if g.in_table else 0)
         if level:
-            inlines = [x for it in inlines for x in (it.inlines if isinstance(it, Bold) else (it,))]
-            story.blocks.append(Heading(level, inlines))
+            tb = self.table_of(story)
+            tb.nest(level)
+            for b in blocks:
+                tb.put(b)
         else:
-            story.blocks.append(Para(inlines))
+            if story.tbl is not None:
+                self.end_table(story)
+            story.blocks.extend(blocks)
 
     # ---- stylesheet
     def finish_style(self):
@@ -693,8 +947,9 @@ class _Reader:
         self.stories.append(story)
         self.story = story
 
-    def close_story(self, story):
-        self.end_paragraph(story)
+    def close_story(self, story, g):
+        self.end_paragraph(story, g)
+        self.end_table(story)
         self.stories.pop()
         self.story = self.stories[-1]
         if story.kind == "note":
@@ -708,7 +963,7 @@ class _Reader:
             ref.id = f"{prefix}-{self.n_notes[prefix]}"
             self.doc.notes[ref.id] = story.blocks
             return
-        text = " ".join(t for t in (_plain(b.inlines).strip() for b in story.blocks) if t)
+        text = " ".join(t for t in map(_text, story.blocks) if t)
         lines = self.doc.headers if story.kind == "header" else self.doc.footers
         if text:
             if len(lines) < MAX_LINES:
