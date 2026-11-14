@@ -3,9 +3,11 @@
 The slide list (SlidePersistAtom, then the outline text atoms up to the next one), the notes mapping through NotesAtom
 slideIdRef, the SlideShowSlideInfoAtom hidden flag and the text atoms (TextHeaderAtom, TextCharsAtom, TextBytesAtom,
 StyleTextPropAtom) were checked against dochan `office_binary/ppt.py`, `ppt_structure.py` and `ppt_text.py` and anydoc
-`formats/ppt/mod.rs`. Slides are found through the persist chain of `ppt_records`, never by scanning the stream; masters,
-notes masters and handouts are not read. A slide's text comes in shape order: an OutlineTextRefAtom puts the outline
-text block it names there, a ClientTextbox brings its own, and outline blocks nothing refers to follow. The shapes
+`formats/ppt/mod.rs`. Slides are found through the persist chain of `ppt_records`; only a clear stream whose chain is
+unusable (no persist directory) is read by walking its top-level records, each SlideContainer in stream order, with
+its notes counted, not placed. Masters, notes masters and handouts are not read. A slide's text comes in shape
+order: an OutlineTextRefAtom puts the outline text block it names there, a ClientTextbox brings its own, and outline
+blocks nothing refers to follow. The shapes
 come in reading order from `ppt_shapes` (groups, tables and placeholders; date, number, footer and header placeholders
 are left out) and a title placeholder gives the slide its title. A slide that
 cannot be read is counted under `slide` and the others still come out. An object shape places the blocks `ppt_objects`
@@ -40,7 +42,13 @@ _PICTURE = -2      # the kind of a picture's run
 class Presentation:
     def __init__(self, doc: bytes, current_user, ctx, pictures: bytes | None = None):
         self.doc, self.ctx = doc, ctx
-        self.persist = rec.Persist(doc, current_user, ctx)
+        self.broken = None  # the chain's error when a clear stream has no usable persist chain
+        try:
+            self.persist = rec.Persist(doc, current_user, ctx)
+        except ReadError as e:
+            if e.kind != "damaged" or rec.encrypted(current_user):  # an encrypted stream needs its chain
+                raise
+            self.persist, self.broken = rec.Unchained(doc), e
         if self.persist.encrypted:
             # the chain was read from the clear edit records; the same offsets then point into the decrypted copy
             unlocked = ppt_crypt.unlock(doc, self.persist, pictures)
@@ -53,8 +61,13 @@ class Presentation:
         self.objects = ppt_objects.Objects(self.doc, self.persist, flate.Budget(), sheet_grid.Budget(), ctx)
 
     def _dgg(self):
-        """(start, end) of the DggContainer inside the DocumentContainer's PPDrawingGroup; None without one."""
-        span = self._container(self.persist.doc_ref, rec.DOCUMENT_CONTAINER)
+        """(start, end) of the DggContainer inside the DocumentContainer's PPDrawingGroup; None without one. With no
+        chain the DocumentContainer is the first one among the top-level records."""
+        if self.broken is None:
+            span = self._container(self.persist.doc_ref, rec.DOCUMENT_CONTAINER)
+        else:
+            span = next(((body, body + size) for _, _, typ, body, size in officeart.records(self.doc)
+                         if typ == rec.DOCUMENT_CONTAINER), None)
         if span is None:
             return None
         for _, _, typ, body, size in officeart.records(self.doc, *span):
@@ -142,7 +155,10 @@ class Presentation:
         got = self.persist.obj(pid)
         if got is None or got[0] != rec.SLIDE_CONTAINER:
             raise ValueError("slide record")
-        start, size = got[2], got[3]
+        return self._slide_at(got[2], got[3], number, outline_span)
+
+    def _slide_at(self, start, size, number, outline_span):
+        """The slide section of the SlideContainer whose body is `size` bytes at `start`."""
         outline = _text_blocks(_texts(self.doc, *outline_span, self.walk), self.walk)
         hidden, drawing = False, None
         for _, _, typ, body, sz in officeart.records(self.doc, start, start + size):
@@ -185,7 +201,31 @@ class Presentation:
                 blocks.extend(bl)
         return ref, blocks
 
+    def _unchained(self) -> list:
+        """The slides of a clear stream with no usable persist chain: each SlideContainer among the top-level records,
+        in stream order, read by the per-slide code with no outline text (the slide list ties it to a slide through
+        the chain). Each NotesContainer is counted under note and the broken chain once under record; the chain's own
+        error is raised when no slide reads."""
+        secs, number, notes = [], 0, 0
+        for _, _, typ, body, size in officeart.records(self.doc):
+            if not self.walk.spend():
+                break
+            if typ == rec.SLIDE_CONTAINER:
+                number += 1
+                with self.ctx.guard("slide"):
+                    secs.append(self._slide_at(body, size, number, (body, body)))
+            elif typ == rec.NOTES_CONTAINER:
+                notes += 1
+        if not secs:
+            raise self.broken
+        self.ctx.skipped["record"] += 1
+        if notes:
+            self.ctx.skipped["note"] += notes
+        return secs
+
     def sections(self) -> list:
+        if self.broken is not None:
+            return self._unchained()
         lists = self._lists()
         secs, by_id = [], {}
         for number, (pid, sid, a, b) in enumerate(lists.get(0, []), 1):

@@ -26,6 +26,12 @@ MAX_EDITS = 10_000
 ENCRYPTED_TOKEN = 0xF3D1C4DF
 
 
+def encrypted(current_user: bytes | None) -> bool:
+    """Whether the CurrentUserAtom headerToken says the streams are encrypted."""
+    return bool(current_user and len(current_user) >= 16
+                and struct.unpack_from("<I", current_user, 12)[0] == ENCRYPTED_TOKEN)
+
+
 class Persist:
     """The persistent objects of a PowerPoint Document stream: `objects` maps a persist id to the offset of its record
     (the newest edit's entry wins), `doc_ref` is the DocumentContainer's id, `crypt_ref` the CryptSession10Container's
@@ -36,8 +42,7 @@ class Persist:
     def __init__(self, doc: bytes, current_user: bytes | None, ctx):
         self.doc, self.ctx = doc, ctx
         self.objects: dict[int, int] = {}
-        self.encrypted = bool(current_user and len(current_user) >= 16
-                              and struct.unpack_from("<I", current_user, 12)[0] == ENCRYPTED_TOKEN)
+        self.encrypted = encrypted(current_user)
         first = self._current_edit(current_user)
         if first is None:
             first = self._last_edit()
@@ -130,3 +135,18 @@ class Persist:
         if head is None or head[3] > len(self.doc) - off - 8:
             return None
         return head[2], head[1], off + 8, head[3]
+
+
+class Unchained:
+    """The stand-in for a Persist when a clear stream has no usable chain: no persist id resolves, so the slides come
+    from a walk of the top-level records and anything reached only through a persist id (an embedded object's
+    storage) is not read."""
+    encrypted = False
+    doc_ref = crypt_ref = None
+
+    def __init__(self, doc: bytes):
+        self.doc = doc
+        self.objects: dict[int, int] = {}
+
+    def obj(self, pid: int) -> None:
+        return None

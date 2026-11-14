@@ -198,6 +198,40 @@ def test_no_slides_damaged():
     assert got == ("damaged", "no readable slides"), got
 
 
+def test_cut_stream_reads_slides_before_the_cut():
+    """A Document stream cut inside slide 2 keeps no persist directory: the top-level records are walked instead,
+    slide 1 reads and the broken chain is counted."""
+    d, path, info = build([{"title": "One", "body": ["first body"]}, {"title": "Two", "body": ["second body"]}])
+    cut = info["offsets"][info["slides"][1]] + 20
+    rewrite(path, info, info["doc_stream"][:cut])
+    out, ctx = render(d, path)
+    assert "## Slide 1: One" in out and "first body" in out and "Two" not in out, out
+    assert "(could not read: 1 damaged record)" in out and dict(ctx.skipped) == {"record": 1}, (out, ctx.skipped)
+
+
+def test_lost_directory_reads_every_slide():
+    """Only the persist directory and the edit are lost: every slide reads in stream order and the notes, which the
+    chain alone ties to their slides, are counted."""
+    d, path, info = build([{"title": "One", "body": ["a"]}, {"title": "Two", "body": ["b"], "hidden": True}],
+                          notes={1: "the note"})
+    rewrite(path, info, info["doc_stream"][:info["directories"][0]])
+    out, ctx = render(d, path, hidden=True)
+    assert "## Slide 1: One" in out and "Slide 2: Two" in out and "the note" not in out, out
+    assert dict(ctx.skipped) == {"record": 1, "note": 1}, ctx.skipped
+
+
+def test_cut_stream_without_slides_damaged():
+    d, path, info = build([{"title": "One"}])
+    rewrite(path, info, info["doc_stream"][:info["offsets"][info["slides"][0]]])
+    got = denied(lambda: reader.parse(path, Context()))
+    assert got == ("damaged", "no persist directory"), got
+    # an encrypted stream needs its chain: no records are walked
+    d, path, info = build([{"title": "One"}], encrypt="/01Hannes Ruescher/01")
+    rewrite(path, info, info["doc_stream"][:info["directories"][0]])
+    got = denied(lambda: reader.parse(path, Context()))
+    assert got == ("damaged", "no persist directory"), got
+
+
 def test_encrypted_package_named_ppt():
     """A password-protected pptx (EncryptionInfo + EncryptedPackage) renamed .ppt is encrypted, not damaged."""
     d = Path(tempfile.mkdtemp())
