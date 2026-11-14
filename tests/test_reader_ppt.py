@@ -168,9 +168,9 @@ def test_text_bytes():
 
 def test_line_break():
     out, _ = md([{"title": "T", "body": ["a\x0bb"]}])
-    body = out.split("## Slide 1: T", 1)[1]
-    assert "ab" not in body and "a" in body and "b" in body, out
-    assert body.strip().count("\n") >= 1 or "<br>" in body, out
+    assert out == "## Slide 1: T\n\na\nb\n", repr(out)  # one paragraph, the Break a newline between the two texts
+    got = ppt_text.blocks("a\x0bb", None, Context())
+    assert texts(got) == [("Para", ["Text:a", "Break:", "Text:b"])], texts(got)
 
 
 def test_master_text_quiet():
