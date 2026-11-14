@@ -6,8 +6,8 @@ An embedded Excel object is a storage (or, in hwp, a nested compound file) with 
   * a stream whose first BOF is a chart substream (dt 0x20) is one chart, read by biff_chart.chart;
   * a chart sheet (kind 2) as the active sheet is one chart;
   * a worksheet as the active sheet gives its grid blocks (xls.Workbook.sheet_blocks) over the document's one
-    sheet_grid.Budget; only its tables are kept, never its pictures. A chart reads the cached values it carries, so
-    the other sheets are not walked.
+    sheet_grid.Budget; only its tables are kept, never its pictures, and a sheet of one cell (a Para from the grid)
+    is a 1x1 Table. A chart reads the cached values it carries, so the other sheets are not walked.
 The CompObj only routes MSGraph, to biff_chart.graph: Excel.Chart and Excel.Sheet objects are both read by their
 active sheet, unlike dochan, which reads an Excel.Chart object's worksheet as a chart; the object's preview shows the
 active sheet, so the grid is what a reader of the document saw.
@@ -21,7 +21,7 @@ import struct
 from .. import limits
 from ..containers.cfb import CfbError
 from ..limits import ReadError
-from ..model import Table
+from ..model import Cell, Para, Table
 from . import biff, biff_chart, sheet_grid, xls
 
 _BOOKS = ("Workbook", "Book")
@@ -92,8 +92,9 @@ def _read(cf, name, ctx, budget):
         return [tbl] if tbl is not None else None
     if ref.kind != xls._WORKSHEET:
         return None
-    tables = [b for b in wb.sheet_blocks(wb.g.active) if isinstance(b, Table)]
-    return tables
+    # a lone cell comes from the grid as a Para: it is kept as a 1x1 Table, which the placement code counts and places
+    return [b if isinstance(b, Table) else Table([[Cell([b])]])
+            for b in wb.sheet_blocks(wb.g.active) if isinstance(b, (Table, Para))]
 
 
 def _prog(cf, pattern) -> bool:

@@ -122,6 +122,20 @@ def test_hwp_embedded_sheet():
     assert not ctx.skipped, ctx.skipped
 
 
+def test_one_cell_sheet_placed():
+    """A worksheet holding one cell, which the grid gives as a lone paragraph, is placed in doc and hwp, never
+    dropped."""
+    one = object_streams(excel_object([{"name": "S", "cells": {(0, 0): "only cell"}}], b"Excel.Sheet.8"))
+    p = dobj.embed_doc({1: one}, preview=dobj.PNG_PREVIEW)
+    d, ctx = dobj.parse(p)
+    out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
+    assert out == "only cell\n", (out, ctx.skipped)
+    assert not ctx.skipped, ctx.skipped
+    path = hchart.doc(hchart.ole_shape(1), streams={"BIN0001.OLE": hchart.deflate(hchart.envelope(one))})
+    out, ctx = hchart.read(path)
+    assert out == "앞\n\nonly cell\n\n뒤\n" and not ctx.skipped, (out, ctx.skipped)
+
+
 def test_ole_table_shares_budget():
     # ole_table's sheets keyword is the document's budget: the embedded sheet's cells are drawn from it
     from reader.formats import hwp_chart
