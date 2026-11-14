@@ -17,6 +17,13 @@ collected (at most _LINKS a sheet) and applied after the stream: an external one
 hold a value in a link, at a cost of min(area, cells held) charged to the scan count; past SHEET_SCAN each link left
 is counted under `link`. A `location` alone changes nothing; an `r:id` without an external hyperlink relationship
 counts `link`.
+Cell comments become notes (legacy `comments` parts ported from dochan, threaded ones new). A thread is its root and
+then its replies, each a "Comment by <name>:" paragraph of one note, the names from the workbook's persons part; a
+legacy comment on a cell a thread covers is its placeholder and is dropped. The note's mark follows the cell's text
+(and its link); a commented cell with no value holds the mark alone. At most MAX_COMMENTS comments are read a
+workbook (the rest counted once as `comments_cut`), and their text is charged to the same character budget as the
+cells. A missing or damaged comments, threaded or persons part counts `comments`. A hidden sheet's notes are hidden
+with it.
 """
 import math
 import posixpath
@@ -26,10 +33,10 @@ from datetime import datetime
 from .. import limits
 from ..containers.zipx import attr, iterparse, local
 from ..limits import ReadError
-from ..model import Doc, Link, NoteRef, Section
+from ..model import Doc, Link, NoteRef, Para, Section, Text
 from ..numfmt import code_for, display
 from . import ooxml_base, sheet_grid
-from .word_fields import MAX_URL
+from .word_fields import MAX_URL, comment_note
 from .xls import _hide
 
 _REF = re.compile(r"([A-Za-z]{1,3})([0-9]{1,7})")  # used with fullmatch
@@ -44,6 +51,8 @@ _RAW_PER_CHAR = 14
 _LINKS = 100_000  # hyperlink elements one sheet may collect; the rest are cut, counted once
 _SHEET_TAGS = frozenset({"col", "mergeCell", "hyperlink"})
 _PARENT = {"col": "cols", "mergeCell": "mergeCells", "hyperlink": "hyperlinks"}
+MAX_COMMENTS = 10_000  # comments one workbook may turn into notes; the rest are cut, counted once as `comments_cut`
+_PERSONS = 100_000  # person elements the persons part may be read for
 _BATCH = 256  # ended siblings a streamed element keeps before they are dropped together
 
 
@@ -112,6 +121,7 @@ class _Wb:
         self.xf_fmt: list[int] = []
         self.formats: dict[int, str] = {}
         self.chartsheets: set[str] = set()  # sheet parts whose relationship is a chartsheet
+        self.part = ""  # the workbook part
 
 
 def _skip(ctx, kind, e):
@@ -263,6 +273,7 @@ def read_workbook(pkg, part, ctx) -> _Wb:
     root, _ = ooxml_base.load(pkg, part)
     rels = ooxml_base.rels(pkg, part, ctx)
     wb = _Wb()
+    wb.part = part
     _workbook(root, rels, wb, ctx)
     for kind, default, read, reset in (("styles", "styles.xml", _styles, _no_styles),
                                        ("sharedStrings", "sharedStrings.xml", _strings, _no_strings)):
@@ -289,15 +300,19 @@ class _Sheets:
         self.budget = sheet_grid.Budget()
         self.scan = 0                    # elements the sheet parts have closed, all sheets together
         self.used: set[str] = set()      # sheet parts read
+        self.notes: dict = {}            # note key -> blocks, for Doc.notes
+        self.comment_count = 0           # comments turned into notes, all sheets together
+        self.comments_cut = False
+        self.persons = None              # person id -> display name, read when a threaded part first needs it
         self._code: dict[int, str] = {}
 
     def sections(self) -> list:
         out = []
-        for name, part, state in self.wb.sheets:
+        for no, (name, part, state) in enumerate(self.wb.sheets, 1):
             blocks = None  # stays None when the guard swallows an error, so the check below is real
             try:
                 with self.ctx.guard("sheet"):
-                    blocks = self.sheet(name, part)
+                    blocks = self.sheet(name, part, no, state in _HIDDEN)
             except ReadError as e:
                 _skip(self.ctx, "sheet", e)
                 continue
@@ -326,7 +341,16 @@ class _Sheets:
             return value
         return display(value, code, self.wb.date1904)
 
-    def sheet(self, name: str, part: str) -> list:
+    def sheet(self, name: str, part: str, no: int = 0, hidden: bool = False) -> list:
+        keys = []  # the note keys this sheet made
+        try:
+            return self._sheet(name, part, no, hidden, keys)
+        except BaseException:  # a sheet that is lost takes its notes with it
+            for k in keys:
+                self.notes.pop(k, None)
+            raise
+
+    def _sheet(self, name, part, no, hidden, keys) -> list:
         if not part or not self.pkg.has(part):
             raise ReadError("damaged", "sheet part missing")
         if part in self.used:
@@ -337,9 +361,11 @@ class _Sheets:
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         cap = limits.SHEET_SCAN
         row, col, cells, rows_seen = -1, -1, 0, False  # cells: the `c` elements open
-        relmap = []  # the sheet's relationships, read once: [dict] after the first hyperlink
+        relmap = []  # the sheet's relationships, read once: [dict]
         links = []  # (r1, r2, c1, c2, url) of the external hyperlinks, applied after the stream
         stack, done, names = [], [], {}  # the open path, and the ended children each open element still holds
+        marks = self._comments(part, no, relmap, hidden, keys)  # (row, col) -> note key
+        placed = set()
         try:
             with self.pkg.open(part) as f:
                 for ev, el in iterparse(f, ("start", "end")):
@@ -372,6 +398,10 @@ class _Sheets:
                         c = _col(el.get("r"))
                         col = c if c is not None else col + 1
                         value = self._cell(el)
+                        key = marks.get((max(row, 0), col)) if marks and value else None
+                        if key is not None:
+                            placed.add((max(row, 0), col))
+                            value = sheet_grid.text_inlines(value) + [NoteRef(key)]
                         if value and not grid.put(max(row, 0), col, value):
                             break  # the grid is cut: nothing more can be put
                     elif tag in _SHEET_TAGS and not cells and stack and names.get(stack[-1].tag) == _PARENT[tag]:
@@ -397,6 +427,12 @@ class _Sheets:
             if e.kind != "damaged" or not rows_seen:
                 raise
             grid.stop("XML error", 1)  # decision 12: the rows read are kept
+        for pos, key in marks.items():  # a commented cell with no value holds the mark alone
+            if pos not in placed and grid.put(pos[0], pos[1], [NoteRef(key)]):
+                placed.add(pos)
+        for pos, key in marks.items():  # a note whose mark was never placed (a cut sheet) is not kept
+            if pos not in placed:
+                self.notes.pop(key, None)
         self._link(grid, links)
         return grid.blocks()
 
@@ -415,17 +451,160 @@ class _Sheets:
         rng = _range(el.get("ref"))
         if rng is None:
             return
-        if not relmap:  # read once per sheet, whether it succeeds or fails
+        rel = self._sheet_rels(part, relmap).get(rid)
+        if rel is None or not rel.external or not rel.type.endswith("/hyperlink") or not rel.target:
+            self.ctx.skipped["link"] += 1
+            return
+        links.append((*rng, rel.target[:MAX_URL]))
+
+    def _sheet_rels(self, part, relmap) -> dict:
+        """The sheet's relationships, read once whether that succeeds or fails."""
+        if not relmap:
             try:
                 relmap.append(ooxml_base.rels(self.pkg, part, self.ctx))
             except ReadError as e:
                 _skip(self.ctx, "rels", e)
                 relmap.append({})
-        rel = relmap[0].get(rid)
-        if rel is None or not rel.external or not rel.type.endswith("/hyperlink") or not rel.target:
-            self.ctx.skipped["link"] += 1
-            return
-        links.append((*rng, rel.target[:MAX_URL]))
+        return relmap[0]
+
+    # ---- comments
+    def _people(self) -> dict:
+        """Person id -> display name from the workbook's persons part, read once; one missing or damaged counts
+        `comments`."""
+        if self.persons is None:
+            self.persons = {}
+            try:
+                with self.ctx.guard("comments"):
+                    for rel in ooxml_base.rels(self.pkg, self.wb.part, self.ctx).values():
+                        if rel.external or not rel.type.endswith("/person"):
+                            continue
+                        if not self.pkg.has(rel.target):
+                            self.ctx.skipped["comments"] += 1
+                            continue
+                        root, _ = ooxml_base.load(self.pkg, rel.target)
+                        for n, p in enumerate(root):
+                            if n >= _PERSONS:
+                                self.ctx.skipped["comments"] += 1
+                                break
+                            pid = attr(p, "id")
+                            if local(p.tag) == "person" and pid is not None:
+                                self.persons[pid] = attr(p, "displayName") or ""
+            except ReadError as e:
+                _skip(self.ctx, "comments", e)
+        return self.persons
+
+    def _comments(self, part, no, relmap, hidden, keys) -> dict:
+        """Read the sheet's threaded and legacy comments into `self.notes`; the cells (row, col) they sit on map to
+        their note keys `xc<sheet>-<row>-<col>`. Threads come first and cover their cells; a legacy comment on a
+        covered cell is dropped. The sheet's relationships are read once, into `relmap`."""
+        rels = self._sheet_rels(part, relmap)
+        per_cell: dict = {}  # (row, col) -> the note's blocks
+        covered: set = set()
+        for suffix, read in (("/threadedComment", self._threaded), ("/comments", self._legacy)):
+            for rel in rels.values():
+                if rel.external or not rel.type.endswith(suffix):
+                    continue
+                try:
+                    with self.ctx.guard("comments"):
+                        if not self.pkg.has(rel.target):
+                            self.ctx.skipped["comments"] += 1
+                            continue
+                        root, _ = ooxml_base.load(self.pkg, rel.target)
+                        read(root, per_cell, covered)
+                except ReadError as e:
+                    _skip(self.ctx, "comments", e)
+            covered = set(per_cell)  # after the threads, the cells they cover
+        marks = {}
+        for pos, blocks in per_cell.items():
+            key = f"xc{no}-{pos[0]}-{pos[1]}"
+            self.notes[key] = _hide(blocks) if hidden else blocks
+            keys.append(key)
+            marks[pos] = key
+        return marks
+
+    def _take(self, text) -> bool:
+        """Count a comment against the caps; False once MAX_COMMENTS or the cell character budget is gone (the cut
+        is counted once)."""
+        b = self.budget
+        if self.comments_cut:
+            return False
+        if self.comment_count >= MAX_COMMENTS or b.chars < len(text):
+            self.comments_cut = True
+            self.ctx.skipped["comments_cut"] += 1
+            return False
+        self.comment_count += 1
+        b.chars -= len(text)
+        return True
+
+    def _cell_of(self, ref):
+        """(row, col) of a comment's `ref`; a bad or out-of-grid one counts `comments` and gives None."""
+        rng = _range(ref)
+        if rng is None or rng[0] >= limits.SHEET_ROWS or rng[2] >= limits.SHEET_COLS:
+            self.ctx.skipped["comments"] += 1
+            return None
+        return rng[0], rng[2]
+
+    def _legacy(self, root, per_cell, covered):
+        authors = []
+        for el in root:
+            if local(el.tag) == "authors":
+                authors = [_unescape(a.text or "") for a in el if local(a.tag) == "author"]
+        for el in root:
+            if local(el.tag) != "commentList":
+                continue
+            for cm in el:
+                if local(cm.tag) != "comment":
+                    continue
+                text = next((_rich(t) for t in cm if local(t.tag) == "text"), "")
+                text = re.sub(r"\s+", " ", text).strip()
+                if not text:
+                    continue
+                pos = self._cell_of(cm.get("ref"))
+                if pos is None or pos in covered:
+                    continue
+                i = _int(cm.get("authorId"))
+                author = authors[i] if i is not None and 0 <= i < len(authors) else ""
+                if not self._take(text):
+                    return
+                per_cell.setdefault(pos, []).extend(comment_note([Para([Text(text)])], author))
+
+    def _threaded(self, root, per_cell, covered):
+        """Each thread is its root then its replies in file order (a reply of a reply follows its parent); a reply
+        whose parent is unknown starts a thread. A visited set lists each comment once, so a parent cycle ends; the
+        comments no walk reaches follow in file order."""
+        items = []  # (id, parentId, cell, person, text)
+        for tc in root:
+            if local(tc.tag) != "threadedComment":
+                continue
+            text = next((t.text or "" for t in tc if local(t.tag) == "text"), "")
+            text = re.sub(r"\s+", " ", text).strip()
+            if not text:
+                continue
+            pos = self._cell_of(tc.get("ref"))
+            if pos is not None:
+                items.append((tc.get("id"), tc.get("parentId"), pos, tc.get("personId"), text))
+        index = {}
+        for n, it in enumerate(items):
+            if it[0] and it[0] not in index:
+                index[it[0]] = n
+        kids = [[] for _ in items]
+        roots = []
+        for n, it in enumerate(items):
+            up = index.get(it[1]) if it[1] else None
+            (kids[up] if up is not None and up != n else roots).append(n)
+        seen = set()
+        for start in roots + list(range(len(items))):  # then the ones a cycle hid
+            stack = [start]
+            while stack:
+                n = stack.pop()
+                if n in seen:
+                    continue
+                seen.add(n)
+                pos, who, text = items[n][2], items[n][3], items[n][4]
+                if not self._take(text):
+                    return
+                per_cell.setdefault(pos, []).extend(comment_note([Para([Text(text)])], self._people().get(who or "", "")))
+                stack.extend(reversed(kids[n]))
 
     def _link(self, grid, links):
         """Decision 9: wrap the valued cells of each range in a Link. The cost min(area, cells held) is charged to
@@ -510,7 +689,8 @@ class _Sheets:
 
 def parse_sheets(pkg, part, ctx) -> Doc:
     wb = read_workbook(pkg, part, ctx)
-    secs = _Sheets(pkg, wb, ctx).sections() if wb.sheets else []
+    sheets = _Sheets(pkg, wb, ctx)
+    secs = sheets.sections() if wb.sheets else []
     if not secs:
         raise ReadError("damaged", "no readable sheets")
-    return Doc(blocks=secs)
+    return Doc(blocks=secs, notes=sheets.notes)
