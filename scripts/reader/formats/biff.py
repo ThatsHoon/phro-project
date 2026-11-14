@@ -14,6 +14,7 @@ from ..numfmt import code_for
 
 CONTINUE = 0x003C
 BOF = 0x0809
+CHART_BOF = 0x0020  # the BOF substream type (dt) of a chart
 EOF = 0x000A
 FILEPASS = 0x002F
 DATEMODE = 0x0022

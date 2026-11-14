@@ -32,7 +32,6 @@ _AFTER_FORMULA = frozenset({0x04BC, 0x0221, 0x0236})  # SHRFMLA, ARRAY, TABLE: m
 _CELLS = frozenset({_LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR, _FORMULA})
 _ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!", 0x2A: "#N/A"}
 _WORKSHEET, _MACRO, _CHART, _VBA = 0, 1, 2, 6
-_CHART_BOF = 0x0020
 MAX_CHARTS = 256  # chart substreams one workbook reads
 
 
@@ -62,8 +61,6 @@ class Workbook:
         self.spent = [0, 0]  # image bytes placed, picture placements read
         self.blips: dict[int, bytes | None] = {}  # BStore entries read (pib -> image), shared by every sheet
         self._starts: dict[int, list] = {}  # sheet index -> offsets of the chart substreams nested in it
-        self.charts = 0       # chart substreams read
-        self.chart_cells = 0  # chart table cells placed so far (CHART_TOTAL)
 
     # ---- sheets
     def sections(self) -> list:
@@ -104,19 +101,20 @@ class Workbook:
         """Every chart of the shown sheets, in sheet then stream order: {sheet index: [Table]}. Each placement is
         charged against CHART_TOTAL, and one past it, or past MAX_CHARTS, is counted under chart."""
         out, seen = {}, set()
+        charts = chart_cells = 0  # per call, so a second sections() counts what the first did
         for i, ref, _ in shown:
             for start in [ref.offset] if ref.kind == _CHART else self._starts.get(i, ()):
-                if start in seen or self.charts >= MAX_CHARTS:
+                if start in seen or charts >= MAX_CHARTS:
                     self.ctx.skipped["chart"] += 1
                     continue
                 seen.add(start)
-                self.charts += 1
+                charts += 1
                 with self.ctx.guard("chart"):
                     tbl, _ = biff_chart.chart(self.data, start, self.g, self.cells, self.ctx, self.st)
                     if tbl is None:
                         continue
-                    self.chart_cells += sum(len(r) for r in tbl.rows)
-                    if self.chart_cells > limits.CHART_TOTAL:
+                    chart_cells += sum(len(r) for r in tbl.rows)
+                    if chart_cells > limits.CHART_TOTAL:
                         self.ctx.skipped["chart"] += 1
                     else:
                         out.setdefault(i, []).append(tbl)
@@ -173,11 +171,8 @@ class Workbook:
                     raise ReadError("damaged", "sheet nested too deep")
                 if depth == 1 and (size < 4 or struct.unpack_from("<H", data, off + 2)[0] != 0x0010):
                     raise ReadError("damaged", "not a worksheet")
-                if depth == 2 and size >= 4 and struct.unpack_from("<H", data, off + 2)[0] == _CHART_BOF:
-                    if len(starts) < MAX_CHARTS:
-                        starts.append(off - 4)
-                    else:
-                        self.ctx.skipped["chart"] += 1
+                if depth == 2 and size >= 4 and struct.unpack_from("<H", data, off + 2)[0] == biff.CHART_BOF:
+                    starts.append(off - 4)  # _charts reads MAX_CHARTS of them and counts the rest, every call
                 continue
             if depth == 0:
                 raise ReadError("damaged", "sheet does not start with a BOF")

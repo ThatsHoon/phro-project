@@ -72,7 +72,7 @@ def _read(cf, name, ctx, budget):
         raise ReadError("unsupported", "Excel 5.0/95 workbook")
     if vers != 0x0600:
         raise ReadError("damaged", "not a BIFF8 workbook")
-    if dt == xls._CHART_BOF:  # the stream is one chart; a FILEPASS before its first EOF is a protected one
+    if dt == biff.CHART_BOF:  # the stream is one chart; a FILEPASS before its first EOF is a protected one
         for rec in st.records(0):
             if rec[0] == biff.FILEPASS:
                 raise ReadError("encrypted")

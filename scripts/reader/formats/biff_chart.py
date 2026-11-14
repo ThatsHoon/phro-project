@@ -25,7 +25,6 @@ BEGIN, END = 0x1033, 0x1034
 MAX_SERIES = 256
 MAX_POINTS = 100_000
 MAX_TEXTS = 256
-_CHART_BOF = 0x0020
 _SERIES, _TEXT, _SERIES_TEXT, _OBJECT_LINK, _BRAI, _SIINDEX = 0x1003, 0x1025, 0x100D, 0x1027, 0x1051, 0x1065
 _NUMBER, _LABEL, _BOOLERR = 0x0203, 0x0204, 0x0205
 _BAR, _PIE, _SCATTER, _CHART3D = 0x1017, 0x1019, 0x101B, 0x103A
@@ -81,7 +80,7 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
     counted under `chart` and the offset is where the walk stopped. `st` is the workbook's Stream over `data`, so
     worksheets and charts share one `limits.BIN_RECORDS`; without it the chart gets a Stream of its own."""
     st = biff.Stream(data, ctx) if st is None else st
-    f = _scan(data, start, st, ctx, _CHART_BOF)
+    f = _scan(data, start, st, ctx, biff.CHART_BOF)
     if f.end is None:
         ctx.skipped["chart"] += 1
         return None, f.stop
@@ -163,7 +162,9 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
                     texts.append(item)
                 pending = item
             elif rid == _SERIES_TEXT and size >= 4:
-                value = biff.short_string(data[off + 2:off + size], 0)[0]
+                cur = biff.Cursor(data, [(off + 2, size - 2)] + list(rec[3]))  # a CONTINUE carries the rest
+                n, flags = cur.u8(), cur.u8()
+                value = cur.chars(n, bool(flags & 1))
                 if isinstance(here, _Series):
                     here.name = value
                 elif isinstance(here, _Text):

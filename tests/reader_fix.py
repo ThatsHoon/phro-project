@@ -1,6 +1,11 @@
 """Test helpers for the document reader tests."""
+import hashlib
+import itertools
 import struct
+import tempfile
 import zipfile
+import zlib
+from bisect import bisect_right
 from pathlib import Path
 
 
@@ -25,7 +30,6 @@ def make_cfb(path, streams, sector_size=512):
     the mini stream. Returns {"fat": [sid], "dir": [sid], "chains": {name: [sid]}, "mini": {name: [mini sid]}},
     so a test can patch bytes at (sid + 1) * sector_size.
     """
-    import struct
     ss = sector_size
     assert ss in (512, 4096)
     END, FREE, FATSECT = 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFD
@@ -131,7 +135,6 @@ def make_cfb(path, streams, sector_size=512):
 
 def hwp_record(tag, level, data):
     """One HWP record: u32 header (tag 10 bits, level 10 bits, size 12 bits), extended size from 0xFFF bytes."""
-    import struct
     data = bytes(data)
     if len(data) >= 0xFFF:
         return struct.pack("<II", tag | (level << 10) | (0xFFF << 20), len(data)) + data
@@ -152,7 +155,6 @@ def hwp_para(text, *, shape=0, style=0, chars=((0, 0),), level=0, controls=(), r
     `chars` are the PARA_CHAR_SHAPE (position, char shape id) pairs. `ranges` are PARA_RANGE_TAG (start, end, tag)
     triples in units, written after PARA_CHAR_SHAPE; a tag's top byte is its kind (0x10 insert, 0x11 delete).
     """
-    import struct
     units, ctrls = bytearray(), []
     pending = iter(controls)
     for ch in text:
@@ -174,7 +176,6 @@ def hwp_para(text, *, shape=0, style=0, chars=((0, 0),), level=0, controls=(), r
 
 def _hwp_caption(caption, level):
     """A caption list: its LIST_HEADER and one paragraph, both at `level`."""
-    import struct
     return [hwp_record(72, level, struct.pack("<HIH", 1, 0, 0)), hwp_para(caption, level=level)]
 
 
@@ -186,7 +187,6 @@ def hwp_table(rows, *, level=2, caption=None):
     records already written at `level`) or a tuple (cell, colspan, rowspan). A cell's column is the sum of the
     colspans before it in its row.
     """
-    import struct
     out = _hwp_caption(caption, level) if caption is not None else []
     cells, ncols = [], 0
     for r, row in enumerate(rows):
@@ -213,7 +213,6 @@ def hwp_picture(bin_id, alt="", *, level=2, caption=None):
     The CTRL_HEADER holds the shape comment `alt` at offset 44 (u16 length, UTF-16LE); an optional caption list comes
     first, then SHAPE_COMPONENT, with SHAPE_PICTURE one level deeper holding the 1-based `bin_id` at offset 71.
     """
-    import struct
     cid = b"gso " + bytes(40) + struct.pack("<H", len(alt)) + alt.encode("utf-16-le")
     out = _hwp_caption(caption, level) if caption is not None else []
     out += [hwp_record(76, level, b"cip$cip$" + bytes(32)),
@@ -224,8 +223,6 @@ def hwp_picture(bin_id, alt="", *, level=2, caption=None):
 def make_hwp(path, sections, doc_info=b"", bins=None, flags=1, extra=None):
     """Write an HWP 5.0.3.0 compound file: FileHeader, DocInfo, BodyText/Section<N> (raw-deflated when flags & 1),
     BinData/<name> and any extra streams as given."""
-    import struct
-    import zlib
 
     def pack(raw):
         if not flags & 1:
@@ -253,8 +250,6 @@ def make_dist_section(section: bytes, key: bytes, seed: int, compressed: bool = 
     4 + (seed & 0xF). After it comes `section` (raw-deflated when `compressed`), zero-padded to whole blocks and
     encrypted with AES-128-ECB under `key`. Needs the reader's scripts folder on sys.path, as the tests set it.
     """
-    import struct
-    import zlib
     from reader.containers.crypto import MsvcRand, aes128_ecb_encrypt
     rand = MsvcRand(seed)
     mask = bytearray()
@@ -280,7 +275,6 @@ DOC_STORIES = ("text", "footnote", "header", "macro", "annotation", "endnote", "
 
 def _doc_pcds(clx):
     """(cp0, cp1, fc, bytes a CP) of each piece of a Clx: Prc records skipped, then the Pcdt's PlcPcd."""
-    import struct
     pos = 0
     while clx[pos] == 1:
         pos += 3 + struct.unpack_from("<H", clx, pos + 1)[0]
@@ -302,8 +296,6 @@ def _doc_fkp(spans, pcds, papx, pn):
     where a piece ends), the runs are sorted by FC and the gaps between them filled with runs without properties, so
     each page's runs are contiguous. A CHPX is cb u8 + grpprl; a PAPX (bytes: istd u16 + grpprl) is cb u8 with size
     2cb - 1 for an odd size, else 0 and cb' u8 with size 2cb'. Pages are numbered from `pn`."""
-    import struct
-    from bisect import bisect_right
     starts = [p[0] for p in pcds]
     runs = []
     for c0, c1, data in spans:
@@ -364,7 +356,6 @@ def doc_stsh(styles, base=18):
     istd_base, name, papx, chpx), stk 1 a paragraph style (UpxPapx: its istd + papx, then UpxChpx: chpx) and 2 a
     character style (UpxChpx only); papx and chpx are grpprls. The Stshi is the 18-byte Stshif plus ftcBi;
     cbSTDBaseInFile is `base`: 10 (Word 97) or 18 (with StdfPost2000). Each UPX is padded to an even size."""
-    import struct
 
     def upx(data):
         return struct.pack("<H", len(data)) + data + bytes(len(data) % 2)
@@ -389,7 +380,6 @@ def _doc_lvl(level):
     """One LVL from (nfc, text[, start[, papx, chpx]]): the 28-byte LVLF (iStartAt, nfc, rgbxchNums,
     cbGrpprlChpx at 24, cbGrpprlPapx at 25), grpprlPapx, grpprlChpx, then the number text xst (u16 count, UTF-16).
     "%N" (N 1-9) in text is a placeholder for level N's number: the unit N - 1, its 1-based offset in rgbxchNums."""
-    import struct
     nfc, text, *rest = level
     start = rest[0] if rest else 1
     papx, chpx = (bytes(rest[1]), bytes(rest[2])) if len(rest) > 2 else (b"", b"")
@@ -415,7 +405,6 @@ def doc_lists(lists, lfos=()):
     an override is (ilvl, start) for a start-at override (LFOLVL fStartAt), or (ilvl, start, level) for an LVL that
     replaces the level (fFormatting; fStartAt too unless start is None). Each LFOData has cp 0xFFFFFFFF.
     """
-    import struct
     head, lvls = bytearray(struct.pack("<h", len(lists))), bytearray()
     for lsid, levels in lists:
         levels = list(levels)
@@ -437,7 +426,6 @@ def doc_lists(lists, lfos=()):
 
 def doc_plc(cps, data=b""):
     """A PLC for make_doc's fc: the CPs as u32, then the data elements, already joined."""
-    import struct
     return struct.pack("<%dI" % len(cps), *cps) + bytes(data)
 
 
@@ -459,7 +447,6 @@ def doc_stories(main, *, footnotes=(), endnotes=(), comments=(), authors=(), hea
 
     The text is one Unicode piece; a CP is a UTF-16 unit. Returns {"pieces", "ccp", "fc"} for make_doc(path, **it).
     """
-    import struct
 
     def units(s):
         return len(s.encode("utf-16-le")) // 2
@@ -503,7 +490,6 @@ def doc_stories(main, *, footnotes=(), endnotes=(), comments=(), authors=(), hea
 
 def oa_record(typ, body=b"", *, ver=0, inst=0):
     """One OfficeArt record (MS-ODRAW 2.2.1): u16 ver (low 4 bits) | inst << 4, u16 type, u32 length, then body."""
-    import struct
     return struct.pack("<HHI", ver | inst << 4, typ, len(body)) + bytes(body)
 
 
@@ -527,8 +513,6 @@ def blip_metafile(typ, inst, data, deflate=True, cb_save=None):
     """A metafile BLIP (EMF 0xF01A/0x3D4, WMF 0xF01B/0x216, PICT 0xF01C/0x542; inst + 1 has two UIDs): the UIDs, the
     34-byte OfficeArtMetafileHeader (cbSize, rcBounds, ptSize, cbSave, compression 0 deflate or 0xFE none, filter
     0xFE), then `data`, zlib-deflated when `deflate`. cb_save overrides cbSave."""
-    import struct
-    import zlib
     packed = zlib.compress(bytes(data)) if deflate else bytes(data)
     save = len(packed) if cb_save is None else cb_save
     head = struct.pack("<I16s8sIBB", len(data), bytes(16), bytes(8), save, 0 if deflate else 0xFE, 0xFE)
@@ -538,7 +522,6 @@ def blip_metafile(typ, inst, data, deflate=True, cb_save=None):
 def oa_fbse(blip=b"", delay=0xFFFFFFFF, *, name=b"", cref=1):
     """An FBSE (0xF007): btWin32, btMacOS, rgbUid, tag, size, cRef, foDelay, unused1, cbName, unused2, unused3, the
     name, then the BLIP record `blip` embedded; b"" for one delay-loaded from WordDocument at `delay`."""
-    import struct
     body = struct.pack("<BB16sHIIIBBBB", 6, 6, bytes(16), 0xFF, len(blip), cref, delay, 0, len(name), 0, 0)
     return oa_record(0xF007, body + bytes(name) + bytes(blip), ver=2, inst=6)
 
@@ -546,7 +529,6 @@ def oa_fbse(blip=b"", delay=0xFFFFFFFF, *, name=b"", cref=1):
 def oa_shape(spid, pib=None, anchor: bytes | None = None):
     """An SpContainer (0xF004): its FSP (0xF00A: spid, grfPersistent) and, when `pib` is given, an FOPT (0xF00B)
     whose one property is pib (0x4104); when `anchor` is given, a ClientAnchor (0xF010) with that body."""
-    import struct
     out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75)
     if pib is not None:
         out += oa_record(0xF00B, struct.pack("<HI", 0x4104, pib), ver=3, inst=1)
@@ -559,7 +541,6 @@ def oa_group(spid, *members, anchor: bytes | None = None):
     """An SpgrContainer (0xF003): its group shape first (an SpContainer whose FSP has fGroup 0x1, and a ClientAnchor
     (0xF010) with the body `anchor` when that is given), then the members, records already built (oa_shape,
     oa_group), in order."""
-    import struct
     shape = oa_record(0xF00A, struct.pack("<II", spid, 0x201), ver=2)
     if anchor is not None:
         shape += oa_record(0xF010, anchor)
@@ -572,7 +553,6 @@ def picf_inline(blip, mm=0x64, *, name=b"", pib=None, fbses=None):
     0x66 cchPicName and the name; then the inline SpContainer (spid 1025, `pib` when given) and one FBSE embedding
     the BLIP record `blip` (none when `blip` is b""), or the FBSE records `fbses` as given. For mm 8 `blip` is the
     raw WMF that follows the PICF."""
-    import struct
     if mm == 8:
         rest = bytes(blip)
     else:
@@ -588,7 +568,6 @@ def dgg_with_bstore(blips, shapes=None, header_shapes=None):
     and, when header_shapes is given, the header document's (dgglbl 1). A shape is (spid, pib), pib None for one
     without a pib (a text box, a line), or bytes: records already built (oa_shape, oa_group); `shapes` defaults to
     spid 1025 + k showing pib k + 1."""
-    import struct
     store = [oa_fbse(b) if isinstance(b, (bytes, bytearray)) else oa_fbse(delay=b) for b in blips]
     dgg = oa_container(0xF000, oa_record(0xF006, struct.pack("<4I", 1026, 2, 1, 1)),
                        oa_container(0xF001, *store, inst=len(store)))
@@ -609,7 +588,6 @@ def dgg_with_bstore(blips, shapes=None, header_shapes=None):
 def doc_spa(anchors):
     """A PlcfSpa (PlcSpaMom 40, PlcSpaHdr 41) for make_doc's fc: (cp, spid) anchors, then a last CP past them, and a
     26-byte FSPA each, spid first."""
-    import struct
     cps = [cp for cp, _ in anchors]
     return doc_plc(cps + [max(cps, default=0) + 1], b"".join(struct.pack("<I", s).ljust(26, b"\0") for _, s in anchors))
 
@@ -629,7 +607,6 @@ def mtef_v5(body):
 def eq_native(mtef, cb=28):
     """An Equation Native stream: the 28-byte EQNOLEFILEHDR (cbHdr u16, version u32 0x00020000, cf u16, cbObject
     u32, four reserved u32), its cbHdr `cb` and the header padded or cut to it, then the MTEF bytes."""
-    import struct
     head = struct.pack("<HIHI", cb, 0x00020000, 0, len(mtef)).ljust(28, b"\0")
     return head[:cb].ljust(cb, b"\0") + bytes(mtef)
 
@@ -637,7 +614,6 @@ def eq_native(mtef, cb=28):
 def comp_obj(prog, user=b"Object"):
     """A \\x01CompObj stream (MS-OLEDS CompObjStream): the 28-byte header, the AnsiUserType, no clipboard format,
     then the ProgID `prog`, each string a u32 length with its terminating zero."""
-    import struct
 
     def ansi(s):
         return struct.pack("<I", len(s) + 1) + bytes(s) + b"\0"
@@ -669,7 +645,6 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
     512-byte boundary, and their PlcBteChpx (12) and PlcBtePapx (13) join the table stream unless `fc` gives them.
     Needs the reader's scripts folder on sys.path, as the tests set it.
     """
-    import struct
     from reader.text import codepage
     fe = lid if lid_fe is None else lid_fe
     eight = codepage(fe if flags & 0x4000 and fe else lid)
@@ -734,8 +709,6 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
 
 def rc4_header(password, *, cryptoapi=True, key_bits=128, salt=bytes(range(16))):
     """The bytes officecrypt.parse_rc4 reads at offset 0: an RC4 or RC4 CryptoAPI header for `password`."""
-    import hashlib
-    import struct
     from reader.containers.crypto import rc4
     pw = password.encode("utf-16le")
     verifier = bytes(range(100, 116))
@@ -755,12 +728,10 @@ def rc4_header(password, *, cryptoapi=True, key_bits=128, salt=bytes(range(16)))
 
 def biff(rid, body=b""):
     """One BIFF record: id, size, body."""
-    import struct
     return struct.pack("<HH", rid, len(body)) + body
 
 
 def _xl_string(text, short=False):
-    import struct
     wide = any(ord(ch) > 255 for ch in text)
     raw = text.encode("utf-16-le" if wide else "latin-1")
     return struct.pack("<B" if short else "<H", len(text)) + bytes([1 if wide else 0]) + raw
@@ -769,7 +740,6 @@ def _xl_string(text, short=False):
 def _biff_sst(strings, split):
     """The SST record and its CONTINUEs; with `split` (8224 when the SST is longer than that) each body holds at most that many bytes and a string cut
     by a boundary restarts with a flags byte, as BIFF8 writes it."""
-    import struct
     head = struct.pack("<II", len(strings), len(strings))
     if not split:
         whole = head + b"".join(_xl_string(s) for s in strings)
@@ -798,7 +768,6 @@ def _biff_sst(strings, split):
 
 
 def _biff_cell(r, c, v, sst, fmt_xf):
-    import struct
     pre = struct.pack("<HHH", r, c, 15)
     if isinstance(v, tuple) and v[0] == "fmt":
         return biff(0x0203, struct.pack("<HHH", r, c, fmt_xf[v[2]]) + struct.pack("<d", v[1]))
@@ -827,7 +796,6 @@ def _biff_cell(r, c, v, sst, fmt_xf):
 def _biff_sheet(sh, sst, fmt_xf):
     """One worksheet (or chart, macro, VBA) substream. Merges are (first row, first col, last row, last col). A
     `drawing` (bytes) is the MSODRAWING 0x00EC body, cut after `drawing_split` bytes into a CONTINUE when that is set."""
-    import struct
     if "raw" in sh:
         return sh["raw"]
     kind = sh.get("kind", 0)
@@ -879,7 +847,6 @@ def biff_workbook(sheets, *, formats=None, date1904=False, active=0, filepass=No
     cut after `drawing_split` bytes into a CONTINUE; a sheet's `drawing` and `drawing_split` do the same for its
     MSODRAWING.
     """
-    import struct
     formats = dict(formats or {})
     strings = list(dict.fromkeys(v for sh in sheets for v in sh.get("cells", {}).values() if isinstance(v, str)))
     sst = {s: i for i, s in enumerate(strings)}
@@ -925,7 +892,6 @@ def biff_chart(series, *, title=None, kinds=((0x1017, bytes(6)),), cache=True, e
     tokens) pairs that replace the cache for that role). With `cache` the values and categories follow as SIIndex
     caches (NUMBER for a number, LABEL for a string, col = the series), else each series has only its BRAIs.
     `kinds` are (id, body) records; `extra` raw records go before the EOF."""
-    import struct
     short = lambda t: _xl_string(t, short=True)
 
     def brai(role, source, tokens=b"", ifmt=0):
@@ -969,15 +935,14 @@ def biff_chart(series, *, title=None, kinds=((0x1017, bytes(6)),), cache=True, e
 
 def area3d(sheet_xti, r1, r2, c1, c2):
     """A BRAI Area3d token: ptg 0x3B, the XTI index, then the rows and columns."""
-    import struct
     return struct.pack("<BHHHHH", 0x3B, sheet_xti, r1, r2, c1, c2)
 
 
 def externsheet(*sheets):
     """SUPBOOK (this workbook, `len(sheets)` sheets) and an EXTERNSHEET with one XTI per sheet index given."""
-    import struct
     xti = b"".join(struct.pack("<Hhh", 0, i, i) for i in sheets)
-    return biff(0x01AE, struct.pack("<HH", max(sheets, default=0) + 1, 0x0401))         + biff(0x0017, struct.pack("<H", len(sheets)) + xti)
+    return (biff(0x01AE, struct.pack("<HH", max(sheets, default=0) + 1, 0x0401))
+            + biff(0x0017, struct.pack("<H", len(sheets)) + xti))
 
 
 def make_xls(path, sheets, **kw):
@@ -990,7 +955,6 @@ def make_xls(path, sheets, **kw):
 def excel_object(sheets, prog=b"Excel.Sheet.8", **kw):
     """The compound file of an embedded Excel object (an OLE storage's streams): a Workbook stream that is
     biff_workbook(sheets, **kw) and a \\x01CompObj naming `prog`, as bytes."""
-    import tempfile
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "obj.cfb"
         make_cfb(path, {"Workbook": biff_workbook(sheets, **kw), "\x01CompObj": comp_obj(prog)})
@@ -1006,8 +970,6 @@ def msgraph_object(cats, series, kind="bar", title="", *, by_rows=False, codepag
     first column (row) the categories and the cells use Graph's own ids, NUMBER 3 and LABEL 4: row, col, 3 attribute
     bytes, then the f64 or a u16-sized narrow string. Selections 0x1053 / 0x1054 stop after the rows / columns, 0x1055
     says whether the series are in rows; each Series' BRAIs end in the datasheet index of their row or column."""
-    import struct
-    import tempfile
     n = len(series)
     head = [biff(0x0809, struct.pack("<HHHHII", 0x0680, 0x8000, 0, 0, 0, 0)),
             biff(0x1055, bytes([1 if by_rows else 0]) + bytes(5)),
@@ -1058,7 +1020,6 @@ def encrypt_xls(sheets, password, kind, **kw):
     XOR: per record body, rotate right by 3 and XOR with the array from index (record end offset) % 16.
     RC4: the stream is encrypted in 1024-byte blocks, block key = key(offset // 1024).
     """
-    import struct
     from reader.containers import officecrypt
     from reader.containers.crypto import rc4
     from reader.formats import xls_crypt
@@ -1245,8 +1206,6 @@ def _ppt_style(text, indents, bold):
     u16, mask u32; a bulleted paragraph, indents[i] not None, has mask 0x1 and a bulletFlags u16 of 1), then character
     runs (count u32, mask u32, style u16 when the mask is set; bold is mask and style 0x1) over every occurrence of the
     `bold` substrings. Each kind of run covers len(text) + 1 characters."""
-    import itertools
-    import struct
     out = b""
     for para, indent in zip(text.split("\r"), indents):
         if indent is None:
@@ -1269,7 +1228,6 @@ def ppt_text(kind, text, *, indents=None, bold=(), as_bytes=False):
     """The records of one text run: TextHeaderAtom (0x0F9F, kind 0 title, 1 body, 2 notes), the text atom and, when a
     paragraph is bulleted (`indents` holds an indent level or None per \\r-separated paragraph) or a `bold` substring
     occurs, a StyleTextPropAtom."""
-    import struct
     out = oa_record(0x0F9F, struct.pack("<I", kind)) + _ppt_chars(text, as_bytes)
     indents = list(indents) if indents is not None else [None] * (text.count("\r") + 1)
     if any(i is not None for i in indents) or any(w and w in text for w in bold):
@@ -1279,14 +1237,12 @@ def ppt_text(kind, text, *, indents=None, bold=(), as_bytes=False):
 
 def ppt_textbox(spid, *children):
     """An SpContainer holding a text-box FSP and a ClientTextbox (0xF00D) of the records `children`."""
-    import struct
     return oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=202),
                         oa_container(0xF00D, *children))
 
 
 def ppt_outline_ref(spid, index):
     """An SpContainer whose ClientData (0xF011) holds an OutlineTextRefAtom (0x0F9E) for text run `index` of the slide."""
-    import struct
     return oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=202),
                         oa_container(0xF011, oa_record(0x0F9E, struct.pack("<I", index))))
 
@@ -1294,7 +1250,6 @@ def ppt_outline_ref(spid, index):
 def ppt_drawing(*shapes, raw=b""):
     """A PPDrawing (0x040C) holding a DgContainer whose SpgrContainer holds the shapes, records already built; the
     bytes `raw` follow the SpgrContainer inside the DgContainer."""
-    import struct
     group = oa_group(1024, *shapes)
     return oa_container(0x040C, oa_container(0xF002, oa_record(0xF008, struct.pack("<II", len(shapes), 1024)), group,
                                              raw))
@@ -1303,7 +1258,6 @@ def ppt_drawing(*shapes, raw=b""):
 def ppt_anchor(box, *, child=False, wide=False):
     """An anchor record for `box` = (left, top, right, bottom): a ChildAnchor (0xF00F, four i32 left, top, right,
     bottom) when `child`, else a ClientAnchor (0xF010, top, left, right, bottom as four i16, or i32 when `wide`)."""
-    import struct
     left, top, right, bottom = box
     if child:
         return oa_record(0xF00F, struct.pack("<4i", left, top, right, bottom))
@@ -1313,7 +1267,6 @@ def ppt_anchor(box, *, child=False, wide=False):
 def ppt_shape(spec, ids, *, inside=False):
     """The SpContainer (or, for a group, SpgrContainer) bytes of one make_ppt `shapes` dict; `ids` is a one-item list
     holding the next spid. See make_ppt for the keys."""
-    import struct
     kind = spec.get("kind", "text")
     spid = spec.get("spid", ids[0])
     ids[0] = max(ids[0], spid) + 1
@@ -1358,20 +1311,17 @@ def ppt_shape(spec, ids, *, inside=False):
 
 def ppt_slide_persist(pid, slide_id, texts=0):
     """A SlidePersistAtom (0x03F3): persistIdRef at +0, flags, numberTexts at +8, slideId at +12, reserved."""
-    import struct
     return oa_record(0x03F3, struct.pack("<IIiII", pid, 0, texts, slide_id, 0))
 
 
 def ppt_slide_atom(master_id, notes_id):
     """A SlideAtom (0x03EF): geometry, 8 placeholder bytes, masterIdRef, notesIdRef, flags, unused."""
-    import struct
     return oa_record(0x03EF, struct.pack("<I8sIIHH", 0, bytes(8), master_id, notes_id, 0x0007, 0), ver=2)
 
 
 def ppt_user_edit(last, directory, doc_ref, seed, crypt=None):
     """A UserEditAtom (0x0FF5): body lastSlideIdRef, version/minor/major, lastEdit at 8, directory offset at 12,
     docPersistIdRef at 16, persistIdSeed, lastView, unused; encryptSessionPersistIdRef at 28 when `crypt` is given."""
-    import struct
     body = struct.pack("<IHBBIIIIHH", 0x100, 0, 0, 3, last, directory, doc_ref, seed, 1, 0)
     return oa_record(0x0FF5, body + (struct.pack("<I", crypt) if crypt is not None else b""))
 
@@ -1379,7 +1329,6 @@ def ppt_user_edit(last, directory, doc_ref, seed, crypt=None):
 def ppt_directory(entries, slots=None):
     """A PersistDirectoryAtom (0x1772) of {persist id: offset}: one run (id | count << 20, then count offsets) per
     stretch of consecutive ids. A `slots` dict is filled with {persist id: offset of its u32 inside the atom}."""
-    import struct
     out, ids, i = b"", sorted(entries), 0
     while i < len(ids):
         j = i
@@ -1398,7 +1347,6 @@ def ppt_current_user(edit_offset, *, encrypted=False, name=b"user"):
     """A Current User stream: a CurrentUserAtom (0x0FF6) with size 20 at +8, headerToken at +12 (0xE391C05F, or
     0xF3D1C4DF when encrypted), offsetToCurrentEdit at +16, lenUserName, docFileVersion 0x03F4, version 3.0, the
     ANSI name and relVersion 8."""
-    import struct
     body = struct.pack("<IIIHHBBH", 20, 0xF3D1C4DF if encrypted else 0xE391C05F, edit_offset, len(name), 0x03F4, 3, 0, 0)
     return oa_record(0x0FF6, body + bytes(name) + struct.pack("<I", 8))
 
@@ -1406,8 +1354,6 @@ def ppt_current_user(edit_offset, *, encrypted=False, name=b"user"):
 def _ppt_encrypt(stream, pic_stream, offsets, pid_crypt, password):
     """(PowerPoint Document, Pictures) with the persist objects and BLIPs RC4 CryptoAPI encrypted, 128-bit keys:
     key(block) = SHA-1(SHA-1(salt + UTF-16LE password) + block as u32)[:16], salt = bytes(range(16)) as in rc4_header."""
-    import hashlib
-    import struct
     from reader.containers.crypto import rc4
     base = hashlib.sha1(bytes(range(16)) + password.encode("utf-16le")).digest()
 
@@ -1435,8 +1381,6 @@ def _ppt_encrypt(stream, pic_stream, offsets, pid_crypt, password):
 
 def _ppt_object(item, k):
     """One make_ppt `objects` item as {"id", "compressed", "body"}: the ExOleObjStg body."""
-    import struct
-    import zlib
     if isinstance(item, (bytes, bytearray)):
         item = {"data": bytes(item)}
     elif isinstance(item, tuple):
@@ -1500,7 +1444,6 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     slide1_offsets ((first, last) offset of slide 1), slots ({persist id: stream offset of the u32 holding that id's
     offset in the newest directory naming it; patch it to move or break one object}), user_edits and directories (offsets in the PowerPoint Document
     stream, oldest first), doc_stream and current_user (the stream bytes)."""
-    import struct
     raw_shapes = dict(raw_shapes or {})
     notes = dict(notes or {})
     n = len(slides)

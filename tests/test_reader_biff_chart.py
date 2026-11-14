@@ -15,9 +15,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 import reader  # noqa: E402
 from reader import limits, markdown  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
-from reader.formats import sheet_grid, xls_embedded  # noqa: E402
+from reader.formats import biff_chart as bcm, sheet_grid, xls, xls_embedded  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader_fix import area3d, biff_chart, biff_workbook, externsheet, make_xls, msgraph_object  # noqa: E402
+from reader_fix import area3d, biff, biff_chart, biff_workbook, externsheet, make_xls, msgraph_object  # noqa: E402
 import test_reader_doc_objects as dobj  # noqa: E402
 
 AB = [{"name": "A", "vals": [1, 2, 3], "cats": ["Q1", "Q2", "Q3"]},
@@ -142,6 +142,116 @@ def test_ser_parent_binds_to_the_series_it_follows():
     bare = [(0x1003, struct.pack("<6H", 1, 1, 0, 0, 0, 0)), (0x104A, bytes(2))]
     md = run([DATA, chart_sheet(biff_chart(AB[:1], extra=bare))])
     assert "Chart: bar\n||A|\n|---|---|\n|Q1|1|\n|Q2|2|\n|Q3|3|\n" in md, md
+
+
+def patched(module, **names):
+    """Run a callable with module constants replaced: patched(m, X=1)(fn) -> fn()'s result."""
+    def call(fn):
+        old = {n: getattr(module, n) for n in names}
+        for n, v in names.items():
+            setattr(module, n, v)
+        try:
+            return fn()
+        finally:
+            for n, v in old.items():
+                setattr(module, n, v)
+    return call
+
+
+def test_series_cap():
+    four = [{"name": n, "vals": [1], "cats": ["x"]} for n in "ABCD"]
+    md = patched(bcm, MAX_SERIES=2)(lambda: run([DATA, chart_sheet(biff_chart(four))]))
+    assert "Chart: bar (first 2 series)\n||A|B|\n|---|---|---|\n|x|1|1|\n" in md and "|C|" not in md, md
+    assert "(could not read: 1 chart cut short)" in md, md
+
+
+def test_point_cap():
+    two = [{"name": "A", "vals": [1, 2, 3], "cats": ["x", "y", "z"]}, {"name": "B", "vals": [4, 5, 6]}]
+    md = patched(bcm, MAX_POINTS=4)(lambda: run([DATA, chart_sheet(biff_chart(two))]))
+    assert "Chart: bar (first 3 points)\n||A|B|\n|---|---|---|\n||1|4|\n||2||\n||3||\n" in md, md
+    assert "(could not read: 1 chart cut short)" in md, md
+
+
+def test_nesting_cap():
+    # Begin records, or BOFs, nested past limits.MAX_DEPTH leave the chart unreadable, and it is counted
+    begins = [(0x1033, b"")] * (limits.MAX_DEPTH + 2)
+    md = run([DATA, chart_sheet(biff_chart(AB, extra=begins))])
+    assert "(could not read: 1 chart)" in md and "Chart:" not in md, md
+    bofs = [(0x0809, struct.pack("<HHHHII", 0x0600, 0x0010, 0, 0, 0, 0))] * (limits.MAX_DEPTH + 2)
+    md = run([DATA, chart_sheet(biff_chart(AB, extra=bofs))])
+    assert "(could not read: 1 chart)" in md and "Chart:" not in md, md
+
+
+def test_chart_count_cap():
+    sheet = {"name": "S", "cells": {(0, 0): "cell"},
+             "records": [biff_chart(AB, title=t) for t in ("One", "Two", "Three")]}
+    md = patched(xls, MAX_CHARTS=2)(lambda: run([sheet]))
+    assert "Chart: bar — One" in md and "Chart: bar — Two" in md and "Three" not in md, md
+    assert "(could not read: 1 chart)" in md, md
+
+
+def test_second_sections_call_gives_the_same_counts():
+    sheet = {"name": "S", "cells": {(0, 0): "cell"},
+             "records": [biff_chart(AB, title=t) for t in ("One", "Two", "Three")]}
+    data = biff_workbook([sheet])
+
+    def twice():
+        ctx = Context()
+        wb = xls.Workbook(data, ctx, sheet_grid.Budget())
+        first = wb.sections()
+        before = dict(ctx.skipped)
+        second = wb.sections()
+        return first, second, before, ctx.skipped
+
+    def count(cap_charts, total):
+        return patched(xls, MAX_CHARTS=cap_charts)(lambda: patched(limits, CHART_TOTAL=total)(twice))
+    for cap, total in ((2, limits.CHART_TOTAL), (256, 9)):
+        first, second, before, after = count(cap, total)
+        shown = lambda secs: [(s.title, len([b for b in s.blocks if getattr(b, "caption", None)])) for s in secs]
+        assert shown(first) == shown(second), (cap, total, shown(first), shown(second))
+        assert after["chart"] == 2 * before["chart"], (cap, total, dict(before), dict(after))
+
+
+def test_boolerr_cache():
+    rows = [(0, bytes([1, 0])), (1, bytes([0, 0])), (2, bytes([0x2A, 1]))]
+    extra = [(0x1065, struct.pack("<H", 1) + bytes(2))]
+    extra += [(0x0205, struct.pack("<HHH", r, 0, 0) + v) for r, v in rows]
+    md = run([DATA, chart_sheet(biff_chart([{"name": "A"}], cache=False, extra=extra))])
+    assert "Chart: bar\n||A|\n|---|---|\n||TRUE|\n||FALSE|\n||#N/A|\n" in md, md
+
+
+def test_failed_sheet_leaves_no_cells():
+    bad = biff(0x0809, struct.pack("<HHHHII", 0x0600, 0x0040, 0, 0, 0, 0)) + biff(0x000A)
+    sheets = [{"name": "Bad", "raw": bad}, DATA,
+              chart_sheet(biff_chart([{"name": "V", "ref": [(1, area3d(0, 0, 2, 1, 1)), (2, area3d(1, 0, 0, 0, 0))]}],
+                                     cache=False))]
+    ctx = Context()
+    data = biff_workbook(sheets, globals_extra=externsheet(0, 1))
+    secs = xls.Workbook(data, ctx, sheet_grid.Budget()).sections()
+    assert [s.title for s in secs] == ["Data", "Chart1"] and ctx.skipped["sheet"] == 1, (secs, ctx.skipped)
+    table = secs[1].blocks[0]
+    texts = [[c.blocks[0].inlines[0].text if c.blocks else "" for c in row] for row in table.rows]
+    assert texts == [["", "V"], ["top", ""]], texts  # sheet 0 failed: no values; sheet 1 gives the category
+
+
+def test_extern_minus_one_and_short_externsheet():
+    # a reference through an XTI of sheet -1 has no cells; one past a short EXTERNSHEET has none either, while an
+    # XTI the record does hold still resolves
+    sheet = {"name": "Sheet1", "cells": {(0, 0): "a"}}
+    chart = biff_chart([{"name": "V", "ref": [(1, area3d(0, 0, 0, 0, 0)), (2, area3d(3, 0, 0, 0, 0))]}], cache=False)
+    md = run([sheet, chart_sheet(chart)], globals_extra=externsheet(-1))
+    assert "could not read" not in md and "Chart: bar\n||V|\n|---|---|\n" in md and "|a|" not in md, md
+    short = biff(0x01AE, struct.pack("<HH", 1, 0x0401)) + biff(0x0017, struct.pack("<H", 5) + struct.pack("<Hhh", 0, 0, 0))
+    md = run([sheet, chart_sheet(chart)], globals_extra=short)
+    assert "could not read" not in md and "Chart: bar\n||V|\n|---|---|\n||a|\n" in md, md
+
+
+def test_series_text_split_by_continue():
+    body = struct.pack("<H", 0) + bytes([6, 0]) + b"Alp"
+    split = [(0x1003, struct.pack("<6H", 1, 1, 0, 0, 0, 0)), (0x1033, b""), (0x100D, body),
+             (0x003C, bytes([0]) + b"ha1"), (0x1034, b"")]
+    md = run([DATA, chart_sheet(biff_chart(AB[:1], extra=split))])
+    assert "||A|Alpha1|" in md, md
 
 
 def test_shared_record_budget():
