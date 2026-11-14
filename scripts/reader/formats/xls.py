@@ -298,15 +298,24 @@ def parse(path, ctx) -> Doc:
         raise ReadError("unsupported", _zip_detail(path))
     if what != "cfb":
         raise ReadError("damaged", "not an Excel workbook")
+    got = parse_compound(path, ctx)
+    if isinstance(got, str):  # another format's compound file named .xls
+        return cfb_route.parse(got, path, ctx)
+    return got
+
+
+def parse_compound(src, ctx) -> Doc | str:
+    """Read the compound file `src` (a path or its bytes, nothing is written): the Doc, or the name of the other
+    parser `cfb_route` picks for a compound file that holds no Workbook stream. `parse` ends in it."""
     try:
-        with Compound(path) as cf:
+        with Compound(src) as cf:
             other = cfb_route.route(cf, "xls", "no Workbook stream")
             if other is None:
                 data = cf.read("Workbook")
     except (KeyError, CfbError):
         raise ReadError("damaged", "Workbook stream") from None
-    if other is not None:  # another format's compound file named .xls
-        return cfb_route.parse(other, path, ctx)
+    if other is not None:
+        return other
     secs = Workbook(data, ctx, sheet_grid.Budget()).sections()
     if not secs:
         raise ReadError("damaged", "no readable sheets")

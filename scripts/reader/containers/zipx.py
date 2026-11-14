@@ -1,4 +1,5 @@
 """Safe zip package access and namespace-agnostic XML helpers."""
+import io
 import posixpath
 import zipfile
 import xml.etree.ElementTree as ET
@@ -119,6 +120,9 @@ class Rel:
 
 class Package:
     def __init__(self, path: Path):
+        """`path` is a path, or the package's bytes (read in memory; every check below is the same)."""
+        if isinstance(path, (bytes, bytearray, memoryview)):
+            path = io.BytesIO(bytes(path))
         try:
             self._zip = zipfile.ZipFile(path)
         except zipfile.BadZipFile as e:

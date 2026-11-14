@@ -1,9 +1,11 @@
 """Fixed-seed mutation tests: synthetic fixtures of xls (clear, RC4, XOR), xlsb, ppt (clear, encrypted) and rtf are
 damaged at random and read; every outcome must be a Doc or a ReadError (no other exception, no hang).
 
-About 100 cases a format, each from `random.Random(SEED + k)`, so a failure names the case and repeats. Binary formats
-are rebuilt in a temporary directory whose file is deleted at once; RTF is read in memory (`rtf.parse_bytes`) and
-never written out, and its seed holds none of the control words of a shape's property groups.
+About 100 cases a format, each from `random.Random(SEED + k)`, so a failure names the case and repeats. No damaged
+case is ever written to disk: compound files and zips are built in memory and read through the formats' in-memory
+entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `rtf.parse_bytes`), and rendering never
+writes an image. Only the clean xlsb and ppt seeds touch a temporary directory, once each. The RTF seed holds none of
+the control words of a shape's property groups, and the test builds them with `cat` so no .pyc holds them either.
 
 Run: python -I -X utf8 tests/test_reader_mutation.py
 """
@@ -22,10 +24,10 @@ import reader  # noqa: E402
 from reader import markdown  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
-from reader.formats import rtf  # noqa: E402
+from reader.formats import ppt, rtf, xls, xlsb  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc  # noqa: E402
-from reader_fix import blip_png, encrypt_xls, make_cfb, make_ppt, make_xlsb, make_zip  # noqa: E402
+from reader_fix import blip_png, cfb_bytes, encrypt_xls, make_ppt, make_xlsb, make_zip  # noqa: E402
 
 SEED = 20261114
 CASES = 100
@@ -36,6 +38,11 @@ SHEETS = [{"name": "First", "cells": {(0, 0): "alpha", (0, 1): 42.5, (1, 0): "í•
 SLIDES = [{"title": "Quarterly plan", "body": ["first point", "second point"]},
           {"title": "Second slide", "body": ["more text"]}]
 PNG = b"\x89PNG\r\n\x1a\n" + b"P" * 24
+
+
+def cat(*parts):
+    """The parts joined at call time: a concatenation of constants is folded by the compiler and lands in the .pyc."""
+    return b"".join(parts)
 
 
 # ---- mutations
@@ -87,12 +94,31 @@ def apply(edits, data):
 
 
 # ---- the harness
+class MemAssets:
+    """Stands in for images.Assets while a case is rendered: no image is ever written out."""
+
+    def __init__(self, dir):
+        pass
+
+    def add(self, data, alt=""):
+        return "assets/mem.png", True
+
+
+def render(doc, skipped):
+    real, markdown.Assets = markdown.Assets, MemAssets
+    try:
+        return markdown.render(doc, Path("assets-never-written"), False, skipped)
+    finally:
+        markdown.Assets = real
+
+
 def outcome(read, label):
-    """"doc" or the ReadError kind; any other exception fails with the case's label, a case past SLOW is a hang."""
+    """"doc", "routed" (another parser's compound file) or the ReadError kind; any other exception fails with the
+    case's label, a case past SLOW is a hang."""
     t0 = time.monotonic()
     try:
         got = read()
-        kind = "doc" if isinstance(got, Doc) else None
+        kind = "doc" if isinstance(got, Doc) else "routed" if isinstance(got, str) else None
         assert kind, f"{label}: returned {type(got).__name__}, not a Doc"
     except ReadError as e:
         kind = e.kind
@@ -106,36 +132,26 @@ def outcome(read, label):
     return kind
 
 
-def read_file(path, name, data_writer):
-    """Write the case with `data_writer(path)`, parse and render it, delete the file at once."""
-    path = path / name
-    try:
-        data_writer(path)
-        ctx = Context()
-        doc = reader.parse(path, ctx)
-        if isinstance(doc, Doc):
-            markdown.render(doc, path.parent / "assets", False, ctx.skipped)
-        return doc
-    finally:
-        path.unlink(missing_ok=True)
-
-
 def run_cases(label, make_case, cases=CASES, seed=SEED):
-    """Run `cases` cases; make_case(rng, k) returns a callable that reads the damaged input. Returns outcome counts."""
+    """Run `cases` cases; make_case(rng, k) returns a callable that reads the damaged input from memory. Returns the
+    outcome counts. Nothing damaged is written to disk."""
     counts = {}
-    with tempfile.TemporaryDirectory() as d:
-        for k in range(cases):
-            rng = random.Random(seed + k)
-            kind = outcome(make_case(rng, k, Path(d)), f"{label} case {k} (seed {seed + k})")
-            counts[kind] = counts.get(kind, 0) + 1
+    for k in range(cases):
+        rng = random.Random(seed + k)
+        kind = outcome(make_case(rng, k), f"{label} case {k} (seed {seed + k})")
+        counts[kind] = counts.get(kind, 0) + 1
     return counts
 
 
+def read_doc(parse, data):
+    ctx = Context()
+    doc = parse(data, ctx)
+    if isinstance(doc, Doc):
+        render(doc, ctx.skipped)
+    return doc
+
+
 # ---- xls
-def xls_streams():
-    return {"clear": encrypt_stream(None), "rc4": encrypt_stream("rc4"), "xor": encrypt_stream("xor")}
-
-
 def encrypt_stream(kind):
     from reader_fix import biff_workbook
     if kind is None:
@@ -143,13 +159,17 @@ def encrypt_stream(kind):
     return encrypt_xls(SHEETS, "VelvetSweatshop", kind)
 
 
+def xls_streams():
+    return {"clear": encrypt_stream(None), "rc4": encrypt_stream("rc4"), "xor": encrypt_stream("xor")}
+
+
 def xls_case(streams, kind):
     """Cases that damage `kind`'s Workbook stream. A case's plan is drawn from its seed and the clear stream's length
     alone, so the three kinds are damaged at the same places (the encrypted streams are a FILEPASS record longer)."""
-    def make(rng, k, d):
-        base = streams[kind]
+    def make(rng, k):
         edits = plan(rng, len(streams["clear"]))
-        return lambda: read_file(d, "a.xls", lambda p: make_cfb(p, {"Workbook": apply(edits, base)}))
+        blob = cfb_bytes({"Workbook": apply(edits, streams[kind])})[0]
+        return lambda: read_doc(xls.parse_compound, blob)
     return make
 
 
@@ -170,28 +190,26 @@ def test_xls_mutations():
         assert abs(shares["clear"] - shares[kind]) <= 0.15, shares
 
 
-# ---- xlsb
-def xlsb_members(d):
-    path = d / "seed.xlsb"
-    try:
+# ---- xlsb (the clean seed is built once in a temporary directory and read back; no damaged case is)
+def xlsb_members():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "seed.xlsb"
         make_xlsb(path, SHEETS)
         with zipfile.ZipFile(path) as z:
             return {i.filename: z.read(i.filename) for i in z.infolist()}
-    finally:
-        path.unlink(missing_ok=True)
 
 
 def test_xlsb_mutations():
-    with tempfile.TemporaryDirectory() as d:
-        members = xlsb_members(Path(d))
+    members = xlsb_members()
     binary = sorted(n for n in members if n.endswith(".bin"))
     assert binary, members.keys()
 
-    def make(rng, k, d):
+    def make(rng, k):
         parts = dict(members)
         for name in rng.sample(binary, rng.choice((1, 1, 2))):
             parts[name] = apply(plan(rng, len(parts[name])), parts[name])
-        return lambda: read_file(d, "a.xlsb", lambda p: make_zip(p, parts, stored=()))
+        blob = make_zip(None, parts, stored=())
+        return lambda: read_doc(xlsb.parse_package, blob)
 
     counts = run_cases("xlsb", make)
     assert sum(counts.values()) == CASES, counts
@@ -201,22 +219,20 @@ def test_xlsb_mutations():
 def ppt_streams(**kw):
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "seed.ppt"
-        try:
-            make_ppt(path, SLIDES, notes={1: "speaker words"}, pictures=[blip_png(PNG)], **kw)
-            with Compound(path) as cf:
-                return {n: cf.read(n) for n in ("PowerPoint Document", "Current User", "Pictures")}
-        finally:
-            path.unlink(missing_ok=True)
+        make_ppt(path, SLIDES, notes={1: "speaker words"}, pictures=[blip_png(PNG)], **kw)
+        with Compound(path) as cf:
+            return {n: cf.read(n) for n in ("PowerPoint Document", "Current User", "Pictures")}
 
 
 def ppt_case(streams):
     names = ("PowerPoint Document", "PowerPoint Document", "Pictures", "Current User")
 
-    def make(rng, k, d):
+    def make(rng, k):
         parts = dict(streams)
         for name in rng.sample(names, rng.choice((1, 1, 2))):
             parts[name] = apply(plan(rng, len(parts[name])), parts[name])
-        return lambda: read_file(d, "a.ppt", lambda p: make_cfb(p, parts))
+        blob = cfb_bytes(parts)[0]
+        return lambda: read_doc(ppt.parse_compound, blob)
     return make
 
 
@@ -245,7 +261,8 @@ RTF_SEED = (
 
 
 def test_rtf_seed_has_no_shape_words():
-    for word in (b"\\s" + b"p", b"\\s" + b"n", b"\\s" + b"v", b"\\sh" + b"pinst", b"pFra" + b"gments"):
+    for word in (cat(b"\\s", b"p"), cat(b"\\s", b"n"), cat(b"\\s", b"v"), cat(b"\\sh", b"pinst"),
+                 cat(b"pFra", b"gments")):
         # the control words: a letter or a delimiter must follow, `\sbasedon` and `\s1` are not them
         assert word not in RTF_SEED.replace(b"\\sbasedon", b"").replace(b"\\s1", b"").replace(b"\\s2", b"") \
             .replace(b"\\s3", b""), word
@@ -253,20 +270,15 @@ def test_rtf_seed_has_no_shape_words():
 
 def test_rtf_mutations():
     doc = rtf.parse_bytes(RTF_SEED, Context())
-    assert "Heading one" in markdown.render(doc, Path(tempfile.gettempdir()) / "unused", False, Context().skipped)
+    assert "Heading one" in render(doc, {})
 
-    def make(rng, k, d):
+    def make(rng, k):
         data = apply(plan(rng, len(RTF_SEED)), RTF_SEED)
         if rng.random() < 0.3:  # also brace and backslash noise: the bytes that steer the lexer
             at = rng.randrange(len(data))
             data = data[:at] + rng.choice((b"{", b"}", b"\\", b"\\bin9999 ", b"\\u", b"\\'", b"\\*")) + data[at:]
 
-        def read():
-            ctx = Context()
-            got = rtf.parse_bytes(data, ctx)
-            markdown.render(got, Path(d) / "assets", False, ctx.skipped)
-            return got
-        return read
+        return lambda: read_doc(rtf.parse_bytes, data)
 
     counts = run_cases("rtf", make)
     assert sum(counts.values()) == CASES, counts

@@ -262,8 +262,17 @@ def parse(path, ctx) -> Doc:
         return ooxml.parse(path, ctx)
     if not is_cfb(head):
         raise ReadError("damaged", "not a PowerPoint file")
+    got = parse_compound(path, ctx)
+    if isinstance(got, str):  # another format's compound file named .ppt
+        return cfb_route.parse(got, path, ctx)
+    return got
+
+
+def parse_compound(src, ctx) -> Doc | str:
+    """Read the compound file `src` (a path or its bytes, nothing is written): the Doc, or the name of the other
+    parser `cfb_route` picks for a compound file that holds no PowerPoint Document stream. `parse` ends in it."""
     try:
-        with Compound(path) as cf:
+        with Compound(src) as cf:
             other = cfb_route.route(cf, "ppt", "no PowerPoint Document stream")
             if other is None:
                 current = cf.read("Current User") if cf.exists("Current User") else None
@@ -273,8 +282,8 @@ def parse(path, ctx) -> Doc:
                 pictures = cf.read("Pictures") if cf.exists("Pictures") else None
     except (KeyError, CfbError):
         raise ReadError("damaged", "PowerPoint Document stream") from None
-    if other is not None:  # another format's compound file named .ppt
-        return cfb_route.parse(other, path, ctx)
+    if other is not None:
+        return other
     secs = Presentation(data, current, ctx, pictures).sections()
     if not secs:
         raise ReadError("damaged", "no readable slides")

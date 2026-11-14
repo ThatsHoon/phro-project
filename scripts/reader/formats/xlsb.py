@@ -419,7 +419,12 @@ def parse(path, ctx) -> Doc:
     other = _check_container(Path(path))
     if other is not None:
         return cfb_route.parse(other, path, ctx)
-    with Package(path) as pkg:
+    return parse_package(path, ctx)
+
+
+def parse_package(src, ctx) -> Doc:
+    """Read the xlsb package `src` (a path or its bytes, nothing is written). `parse` ends in it."""
+    with Package(src) as pkg:
         wb = read_workbook(pkg, ctx)
         if not wb.sheets:
             raise ReadError("damaged", "no readable sheets")

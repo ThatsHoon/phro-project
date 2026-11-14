@@ -1,5 +1,6 @@
 """Test helpers for the document reader tests."""
 import hashlib
+import io
 import itertools
 import struct
 import tempfile
@@ -10,9 +11,10 @@ from pathlib import Path
 
 
 def make_zip(path, members, stored=("mimetype",)):
-    """Write a zip from {name: str | bytes}; names in `stored` go first, uncompressed."""
-    path = Path(path)
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+    """Write a zip from {name: str | bytes}; names in `stored` go first, uncompressed. With path None nothing is
+    written and the zip's bytes are returned."""
+    target = io.BytesIO() if path is None else Path(path)
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as z:
         names = [n for n in stored if n in members] + [n for n in members if n not in stored]
         for name in names:
             data = members[name]
@@ -20,14 +22,22 @@ def make_zip(path, members, stored=("mimetype",)):
                 data = data.encode("utf-8")
             method = zipfile.ZIP_STORED if name in stored else zipfile.ZIP_DEFLATED
             z.writestr(zipfile.ZipInfo(name), data, compress_type=method)
-    return path
+    return target.getvalue() if path is None else target
 
 
 def make_cfb(path, streams, sector_size=512):
-    """Write a compound file (v3 for 512-byte sectors, v4 for 4096) from {"Storage/Name": bytes}.
+    """Write a compound file (see cfb_bytes) to `path`; returns the same info dict."""
+    blob, info = cfb_bytes(streams, sector_size)
+    with open(path, "wb") as f:
+        f.write(blob)
+    return info
+
+
+def cfb_bytes(streams, sector_size=512):
+    """A compound file (v3 for 512-byte sectors, v4 for 4096) from {"Storage/Name": bytes}.
 
     Storages come from the "/" parts; siblings are chained through right links. Streams under 4096 bytes go in
-    the mini stream. Returns {"fat": [sid], "dir": [sid], "chains": {name: [sid]}, "mini": {name: [mini sid]}},
+    the mini stream. Returns (bytes, {"fat": [sid], "dir": [sid], "chains": {name: [sid]}, "mini": {name: [mini sid]}}),
     so a test can patch bytes at (sid + 1) * sector_size.
     """
     ss = sector_size
@@ -127,10 +137,7 @@ def make_cfb(path, streams, sector_size=512):
     struct.pack_into("<IIIIIIIII", hdr, 0x28, len(dirs) if ss == 4096 else 0, nfat, dirs[0], 0, 4096,
                      mini_first, mini_count, END, 0)
     struct.pack_into("<109I", hdr, 0x4C, *(fat_ids + [FREE] * (109 - nfat)))
-    with open(path, "wb") as f:
-        f.write(bytes(hdr))
-        f.write(b"".join(sectors))
-    return {"fat": fat_ids, "dir": dirs, "chains": chains, "mini": mini_of}
+    return bytes(hdr) + b"".join(sectors), {"fat": fat_ids, "dir": dirs, "chains": chains, "mini": mini_of}
 
 
 def hwp_record(tag, level, data):
