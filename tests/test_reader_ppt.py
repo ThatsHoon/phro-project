@@ -178,6 +178,22 @@ def test_master_text_quiet():
     assert "Click to edit" not in out, out
 
 
+def test_master_without_text():
+    out, ctx = md([{"title": "T", "body": ["x"]}], master_text=None)
+    assert "## Slide 1: T" in out and "x" in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_unknown_text_header_type_is_body_text():
+    # TextHeaderAtom types are 0..8; any other value is read as body text: never a title, never dropped
+    out, ctx = md([{"title": "Head", "body": ["real body"], "outline": True, "extra": [(99, "odd words")]},
+                   {"body": ["only"], "outline": True, "extra": [(0xFFFF, "stray")]}])
+    first, second = out.split("## Slide 2", 1)
+    assert "## Slide 1: Head" in first and "real body" in first and "odd words" in first, out
+    assert first.index("real body") < first.index("odd words"), out
+    assert "only" in second and "stray" in second and "## Slide 2:" not in out, out
+    assert not ctx.skipped, ctx.skipped
+
+
 def test_bad_slide_counted():
     d, path, info = build([{"title": "One"}, {"title": "Two"}, {"title": "Three"}])
     data = bytearray(info["doc_stream"])
@@ -257,6 +273,16 @@ def test_powerpoint95_pp40():
     make_cfb(path, {"PP40": bytes(4096)})
     got = denied(lambda: reader.parse(path, Context()))
     assert got == ("unsupported", "PowerPoint 95 presentation"), got
+
+
+def test_dual_format_pp40_beside_full_current_user_reads_as_ppt():
+    # a 97/95 file keeps PowerPoint 95's PP40 stream beside the 97 streams and a full Current User: it is read as ppt
+    d, path, info = build([{"title": "Dual", "body": ["both formats"]}])
+    make_cfb(path, {"PowerPoint Document": info["doc_stream"], "Current User": info["current_user"],
+                    "Pictures": b"", "PP40": bytes(4096)})
+    assert len(info["current_user"]) >= 28
+    out, ctx = render(d, path)
+    assert "## Slide 1: Dual" in out and "both formats" in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def test_powerpoint95_current_user():

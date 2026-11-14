@@ -245,8 +245,10 @@ class Presentation:
 
 def _pp95(cf, current) -> bool:
     """A PowerPoint 95 file: its Current User stream is under 28 bytes, and the file holds a PP40 stream or that stream
-    has PowerPoint 95's shape, a u32 size and then that many bytes."""
-    if current is None or len(current) >= 28:
+    has PowerPoint 95's shape, a u32 size and then that many bytes. A PP40 stream beside a PowerPoint Document and a full
+    Current User (28 bytes or more) is the 97/95 dual format, which PowerPoint 97 and later read as a 97 file: it is
+    read as ppt here too, and only the two shapes above are unsupported."""
+    if current is None or len(current) >= 28:  # a full Current User: PP40 or not, a PowerPoint 97 file
         return False
     if cf.exists("PP40"):
         return True

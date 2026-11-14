@@ -67,6 +67,8 @@ def texts(data, start, end, walk):
             if not walk.spend():
                 return items
             if typ == rec.TEXT_HEADER_ATOM and size >= 4:
+                # not validated: only 0 and 6 (titles) and 2 (notes) change what is done with a run, so a type outside
+                # 0..8 reads as body text (test_unknown_text_header_type_is_body_text pins it)
                 kind = struct.unpack_from("<I", data, body)[0]
             elif typ in (rec.TEXT_CHARS_ATOM, rec.TEXT_BYTES_ATOM):
                 last = ["text", kind, _decode(data, body, size, typ), None]
