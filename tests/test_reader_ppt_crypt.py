@@ -209,6 +209,18 @@ def test_object_cap_is_too_large():
     assert ppt_crypt.unlock(doc, persist, pics) is not None
 
 
+def test_bad_blip_keeps_later_pictures():
+    first = len(blip_png(PNG))
+
+    def patch(info, streams):
+        streams["Pictures"][first + 2] ^= 0xFF  # the second record's type, enciphered
+    shapes = [{"kind": "picture", "pib": k, "box": (0, 100 * k, 400, 100 * k + 50)} for k in (1, 2, 3)]
+    out, ctx, assets = build_patched([{"shapes": shapes}], patch, encrypt=PPT_DEFAULT,
+                                     pictures=[blip_png(PNG), blip_png(PNG + b"Q"), blip_png(PNG + b"R")])
+    assert sorted(assets.values()) == [PNG, PNG + b"R"], (assets, out)
+    assert "(could not read: 1 image)" in out and ctx.skipped["image"] == 1, (out, dict(ctx.skipped))
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -7,9 +7,10 @@ laid out by persist ids: each BLIP's header, UIDs, tag or metafile header and im
 restarts the keystream at block 0. The object rules and the BLIP field table follow dochan `crypto/ppt.py`
 (`decrypt_presentation`, `_decrypt_pictures`); the check against overlapping objects and the byte budget are done here.
 """
+import bisect
 import struct
 
-from .. import limits
+from .. import limits, officeart
 from ..containers import crypto, officecrypt
 from ..limits import ReadError
 from . import ppt_records as rec
@@ -29,8 +30,9 @@ def unlock(doc: bytes, persist: rec.Persist, pictures: bytes | None) -> tuple[by
     cause). A persist entry that leaves the stream or overlaps an object already taken is skipped and removed from
     `persist.objects`, so that persist id is missing as it would be for an id the directory never listed: the reader
     never reads a record out of another object's bytes through it, and the object it stood for is counted where it is
-    wanted (a slide under `slide`). A Pictures stream comes back decrypted up to the first record that is not a clean
-    BLIP; the images behind it are counted rather than lost whole.
+    wanted (a slide under `slide`). A Pictures stream is decrypted record by record; a record that is not a clean BLIP
+    stays as it was (its picture is counted under `image`) and the walk goes on at the next BLIP the BStore names
+    (an FBSE's foDelay), so the pictures behind it are read.
     """
     for name, stream in (("PowerPoint Document", doc), ("Pictures", pictures)):
         if stream and len(stream) > limits.DECRYPT_BYTES:
@@ -45,7 +47,22 @@ def unlock(doc: bytes, persist: rec.Persist, pictures: bytes | None) -> tuple[by
     keys = officecrypt.block_keys(header, officecrypt.PPT_DEFAULT)
     if keys is None:
         return None
-    return _objects(doc, persist, keys), _blips(pictures, keys(0)) if pictures else pictures
+    clear = _objects(doc, persist, keys)
+    return clear, _blips(pictures, keys(0), _delays(clear, persist)) if pictures else pictures
+
+
+def _delays(doc: bytes, persist: rec.Persist) -> list[int]:
+    """The foDelay offsets, sorted, of the delay-loaded BLIPs the BStore of the (decrypted) `doc` names."""
+    off = persist.objects.get(persist.doc_ref)
+    head = officeart.header(doc, off) if off is not None else None
+    if head is None or head[2] != rec.DOCUMENT_CONTAINER or head[3] > len(doc) - off - 8:
+        return []
+    for _, _, typ, body, size in officeart.records(doc, off + 8, off + 8 + head[3]):
+        if typ == rec.PP_DRAWING_GROUP:
+            dgg = bytes(doc[body:body + size])
+            found = (officeart.fbse_delay(dgg, at) for at in officeart.bstore(dgg))
+            return sorted({at for at in found if at is not None})
+    return []
 
 
 def _objects(doc: bytes, persist: rec.Persist, keys) -> bytes:
@@ -73,28 +90,43 @@ def _objects(doc: bytes, persist: rec.Persist, keys) -> bytes:
     return bytes(out)
 
 
-def _blips(pictures: bytes, key: bytes) -> bytes:
-    """The stream decrypted up to the first record that does not frame cleanly (cut off there)."""
+def _blips(pictures: bytes, key: bytes, resume: list[int]) -> bytes:
+    """The stream decrypted record by record. A record that does not frame cleanly stays as it was (it fails to read
+    later and is counted there) and the walk goes on at the first offset of `resume` (the BStore's foDelay values, the
+    only starts a bad record's size cannot be trusted to give) after the bad record's start; with none the rest of the
+    stream stays as it was."""
     out = bytearray(pictures)
     pos, count = 0, 0
     while pos < len(pictures):
         start = pos
         count += 1
-        if count > MAX_OBJECTS or len(pictures) - pos < 8:
-            return bytes(out[:start])
-        options, kind, size = struct.unpack("<HHI", crypto.rc4(key, pictures[pos:pos + 8]))
-        if kind not in _BLIPS or size > len(pictures) - pos - 8:
-            return bytes(out[:start])
-        out[pos:pos + 8] = struct.pack("<HHI", options, kind, size)
-        end, pos = pos + 8 + size, pos + 8
-        instance = options >> 4
-        uids = next((1 + instance - base for base in _BLIPS[kind] if instance in (base, base + 1)), 0)
-        if not uids:
-            return bytes(out[:start])
-        tag = 34 if kind in _METAFILE else 1
-        for n in [16] * uids + [tag, end - pos - 16 * uids - tag]:
-            if n < 0 or pos + n > end:
-                return bytes(out[:start])
-            out[pos:pos + n] = crypto.rc4(key, pictures[pos:pos + n])
-            pos += n
+        if count > MAX_OBJECTS:
+            break
+        pos = _blip(pictures, out, start, key)
+        if pos is None:
+            i = bisect.bisect_right(resume, start)
+            if i == len(resume):
+                break
+            pos = resume[i]
     return bytes(out)
+
+
+def _blip(pictures: bytes, out: bytearray, start: int, key: bytes) -> int | None:
+    """Decrypt the BLIP at `start` into `out`; the offset after it, or None (nothing written) when it does not frame."""
+    if len(pictures) - start < 8:
+        return None
+    options, kind, size = struct.unpack("<HHI", crypto.rc4(key, pictures[start:start + 8]))
+    if kind not in _BLIPS or size > len(pictures) - start - 8:
+        return None
+    instance = options >> 4
+    uids = next((1 + instance - base for base in _BLIPS[kind] if instance in (base, base + 1)), 0)
+    end, pos = start + 8 + size, start + 8
+    tag = 34 if kind in _METAFILE else 1
+    fields = [16] * uids + [tag, end - pos - 16 * uids - tag]
+    if not uids or min(fields) < 0:
+        return None
+    out[start:start + 8] = struct.pack("<HHI", options, kind, size)
+    for n in fields:
+        out[pos:pos + n] = crypto.rc4(key, pictures[pos:pos + n])
+        pos += n
+    return end
