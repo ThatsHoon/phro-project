@@ -4,8 +4,9 @@ import re
 from .. import limits
 from ..containers.zipx import attr, kids, local
 from ..limits import IMAGE_BYTES, ReadError
-from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
-from . import ooxml_base
+from ..model import (Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math, NoteRef, Para,
+                     Table, Text)
+from . import omml, ooxml_base
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
 from .word_fields import MAX_INSTR, MAX_URL, comment_note, hyperlink_url
@@ -170,6 +171,11 @@ class _Reader:
         return out
 
     def block(self, c, d):
+        if omml.is_math(c, "oMathPara"):
+            return [Equation(t, display=True) for t in omml.lines(c)]
+        if omml.is_math(c, "oMath"):
+            t = omml.tex(c)
+            return [Para([Math(t)])] if t else []
         n = local(c.tag)
         if n == "p":
             return self.para(c, d)
@@ -316,6 +322,16 @@ class _Reader:
     def node(self, el, st, d):
         if d > limits.MAX_DEPTH:
             self.deep()
+            return
+        if omml.is_math(el, "oMath"):
+            t = omml.tex(el)
+            if t:
+                self.add(st, Math(t))
+            return
+        if omml.is_math(el, "oMathPara"):  # display lines follow the paragraph, hidden as the scope they sit in
+            kinds = {f.kind for f in st.frames}
+            hidden = "deleted" if "deleted" in kinds else "hidden" if "hidden" in kinds else ""
+            st.extras.extend(Equation(t, display=True, hidden=hidden) for t in omml.lines(el))
             return
         n = local(el.tag)
         if n == "r":
