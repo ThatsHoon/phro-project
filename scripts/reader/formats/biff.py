@@ -141,12 +141,22 @@ class Cursor:
             self.off += take
             n -= take
 
+    def _hop(self) -> bool:
+        """Move to the next segment that has bytes (an empty CONTINUE has none, so no flags byte); False if none."""
+        while self._next_seg():
+            if self.off < self.end:
+                return True
+        return False
+
     def chars(self, n: int, wide: bool) -> str:
-        """`n` characters; a segment boundary inside them starts with a flags byte that picks the width again."""
+        """`n` characters; a segment boundary inside them starts with a flags byte that picks the width again
+        (MS-XLS: the fHighByte byte of the CONTINUE). An empty CONTINUE is passed over. A 16-bit character whose
+        low byte ends one segment takes its high byte from the byte after the next segment's flags byte; if that
+        flags byte says 8-bit the character cannot be finished, and the read fails."""
         out = []
         while n > 0:
             if self.off >= self.end:
-                if not self._next_seg() or self.off >= self.end:
+                if not self._hop():
                     raise ValueError("past the end of the record")
                 wide = bool(self.data[self.off] & 1)
                 self.off += 1
@@ -154,7 +164,17 @@ class Cursor:
             unit = 2 if wide else 1
             take = min(n, (self.end - self.off) // unit)
             if take == 0:
-                raise ValueError("a character split by a segment")
+                low = self.data[self.off]
+                self.off += 1
+                if not self._hop() or not self.data[self.off] & 1:
+                    raise ValueError("a character split by a segment")
+                self.off += 1
+                if self.off >= self.end:
+                    raise ValueError("a character split by a segment")
+                out.append(bytes([low, self.data[self.off]]))
+                self.off += 1
+                n -= 1
+                continue
             chunk = self.data[self.off:self.off + take * unit]
             self.off += take * unit
             n -= take
@@ -285,7 +305,7 @@ def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
         g.date1904 = bool(struct.unpack_from("<H", data, off)[0])
     elif rid == WINDOW1 and size >= 12:
         g.active = struct.unpack_from("<H", data, off + 10)[0]
-    elif rid == SST and not g.sst:
+    elif rid == SST and not g.sst:  # kept: a later SST fills an empty first one (a damaged first must not hide it)
         g.sst = sst(_cursor(st, rec))
     elif rid == SUPBOOK and size >= 4:
         g.supbooks.append(struct.unpack_from("<H", data, off + 2)[0] == 0x0401)

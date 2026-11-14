@@ -109,6 +109,59 @@ def test_sst_rich_phonetic():
     assert cur.at_end()
 
 
+def sst_of(*bodies):
+    """The strings an SST read gives when its record body and CONTINUE bodies are `bodies`."""
+    data = b"".join(bodies)
+    segs, at = [], 0
+    for b in bodies:
+        segs.append((at, len(b)))
+        at += len(b)
+    return biff.sst(biff.Cursor(data, segs))
+
+
+def test_sst_empty_continue_in_characters():
+    # an empty CONTINUE has no flags byte: the next one with bytes starts with it
+    head = u32(2) + u32(2) + u16(4) + b"\x00ab"
+    tail = b"\x00cd" + u16(2) + b"\x00ef"
+    assert sst_of(head, b"", tail) == ["abcd", "ef"]
+    assert sst_of(head, b"", b"", tail) == ["abcd", "ef"]
+    # and after a string that ends the record: the empty CONTINUE and the next string
+    whole = u32(2) + u32(2) + u16(2) + b"\x00ab"
+    assert sst_of(whole, b"", u16(2) + b"\x00cd") == ["ab", "cd"]
+
+
+def test_sst_sixteen_bit_char_split_at_a_continue():
+    # the low byte ends one body, the flags byte and the high byte start the next
+    head = u32(1) + u32(1) + u16(2) + b"\x01" + "A".encode("utf-16-le") + b"\x4b"
+    assert sst_of(head, b"\x01" + b"\xac") == ["A\uac4b"]
+    # a continuation that turns 8-bit cannot finish the character: the strings before it are kept
+    first = u16(1) + b"\x00a"
+    body = u32(2) + u32(2) + first + u16(2) + b"\x01" + "A".encode("utf-16-le") + b"\x4b"
+    assert sst_of(body, b"\x00" + b"\xac") == ["a"]
+
+
+def test_sst_header_at_a_continue_boundary():
+    one = u16(1) + b"\x00a"
+    # cch split between the bodies, then flags and characters
+    assert sst_of(u32(2) + u32(2) + one + b"\x02", b"\x00" + b"\x00xy") == ["a", "xy"]
+    # cch and flags end the body; the characters start the next one, with their own flags byte
+    assert sst_of(u32(2) + u32(2) + one + u16(2) + b"\x00", b"\x01" + "한글".encode("utf-16-le")) == ["a", "한글"]
+    # a string that starts the next body has no flags byte before its cch
+    assert sst_of(u32(2) + u32(2) + one, u16(2) + b"\x00bc") == ["a", "bc"]
+
+
+def test_sst_runs_split_mid_run():
+    # four runs of four bytes, cut inside the second one; the next string follows in the same CONTINUE
+    string = u16(2) + b"\x08" + u16(4) + b"hi"
+    runs = b"\1\2\3\4" * 4
+    body = u32(2) + u32(2) + string + runs[:6]
+    assert sst_of(body, runs[6:] + u16(2) + b"\x00ok") == ["hi", "ok"]
+    # phonetic bytes split the same way
+    string = u16(2) + b"\x04" + u32(7) + b"hi"
+    body = u32(2) + u32(2) + string + b"PPP"
+    assert sst_of(body, b"PPPP" + u16(2) + b"\x00ok") == ["hi", "ok"]
+
+
 def test_sst_count_lies():
     body = u32(9) + u32(0xFFFFFFFF) + u16(1) + b"\x00a" + u16(1) + b"\x00b"
     t = time.perf_counter()
@@ -179,6 +232,18 @@ def test_globals_extras():
     data = biff_workbook(sheets(), filepass=b"\x01\x00" + bytes(50))
     g = biff.read_globals(biff.Stream(data, Context()))
     assert g.filepass is not None and g.filepass[0] == 0x002F and g.sheets == []
+
+
+def test_second_sst_fills_an_empty_first_only():
+    # kept on purpose: the first SST that parses to strings wins; a later one is read only while none has
+    def one(text):
+        return rec(0x00FC, u32(1) + u32(1) + u16(len(text)) + b"\x00" + text.encode("latin-1"))
+    empty = [{"name": "S", "cells": {(0, 0): 1.5}}]  # no strings: the writer's own SST holds none
+    g = biff.read_globals(biff.Stream(biff_workbook(empty, globals_extra=one("late") + one("later")), Context()))
+    assert g.sst == ["late"], g.sst
+    full = [{"name": "S", "cells": {(0, 0): "first"}}]
+    g = biff.read_globals(biff.Stream(biff_workbook(full, globals_extra=one("late")), Context()))
+    assert g.sst == ["first"], g.sst
 
 
 def test_workbook_in_cfb():
