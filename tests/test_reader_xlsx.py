@@ -153,14 +153,27 @@ def test_sheet_order():
 
 
 def test_styled_empty_cells_cut():
+    # styled empties past SHEET_ROWS end their sheet at the first row it cannot hold: the scan count is kept for S2
     empty = "".join(xlsx_row(r, *['<c s="1"/>'] * 100) for r in range(1, 51))
     sheets = [sheet(empty + xlsx_row(51, xlsx_cell("A51", 0, t="s")), name="S1"),
               sheet(xlsx_row(1, xlsx_cell("A1", 1, t="s")), name="S2")]
-    with patched("SHEET_SCAN", 1000):
+    with patched("SHEET_SCAN", 1000), patched("SHEET_ROWS", 5):
         out, ctx = md(sheets, shared=["<t>late</t>", "<t>two</t>"], xfs=[0, 0])
-    assert "late" not in out and "two" not in out, out
-    assert warned(ctx, "cut at 1000 scanned XML elements") and ctx.skipped["sheet_cut"] == 2, (ctx.warnings,
-                                                                                             ctx.skipped)
+    assert "late" not in out and "two" in out, out
+    assert warned(ctx, "sheet S1 cut at 5 rows") and not warned(ctx, "scanned XML elements"), ctx.warnings
+    assert dict(+ctx.skipped) == {"sheet_cut": 1}, ctx.skipped
+
+
+def test_styled_rows_past_the_last_row_keep_later_sheets():
+    # one value, then one styled empty column down far past SHEET_ROWS, then a sheet of data
+    tail = "".join(f'<row r="{r}"><c r="B{r}" s="1"/></row>' for r in range(2, 3001))
+    sheets = [sheet(xlsx_row(1, xlsx_cell("A1", "first", t="str")) + tail, name="A"),
+              sheet(xlsx_row(1, xlsx_cell("A1", "data", t="str")), name="B")]
+    with patched("SHEET_SCAN", 2000), patched("SHEET_ROWS", 100):
+        out, ctx = md(sheets, xfs=[0, 0])
+    assert "first" in out and "## Sheet: B\n\ndata" in out, out
+    assert warned(ctx, "sheet A cut at 100 rows") and dict(+ctx.skipped) == {"sheet_cut": 1}, (ctx.warnings,
+                                                                                               ctx.skipped)
 
 
 def test_styled_empty_cells_fast():

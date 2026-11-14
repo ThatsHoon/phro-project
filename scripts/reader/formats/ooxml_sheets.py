@@ -401,6 +401,11 @@ class _Sheets:
                             r = _int(el.get("r"))
                             row = r - 1 if r is not None and r >= 1 else row + 1
                             col, rows_seen = -1, True
+                            if row >= limits.SHEET_ROWS:
+                                # no row from here on can be put: end the sheet now, as `put` would at its first
+                                # value, so styled empties down to the last row leave the scan count to later sheets
+                                grid.stop("rows", limits.SHEET_ROWS)
+                                break
                             if (el.get("hidden") or "").strip().lower() in ("1", "true"):
                                 grid.hide_row(row)
                         continue
