@@ -37,6 +37,8 @@ LOST = (
     (("shape", "alternate"), "shape", "shapes"),
     (("image",), "image", "images"),
     (("chart",), "chart", "charts"),
+    (("smartart",), "SmartArt diagram", "SmartArt diagrams"),
+    (("smartart_cut",), "SmartArt diagram cut short", "SmartArt diagrams cut short"),
     (("object",), "embedded object", "embedded objects"),
     (("link",), "link", "links"),
     (("glyphs",), "text run without Unicode", "text runs without Unicode"),

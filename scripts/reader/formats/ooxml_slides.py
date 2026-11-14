@@ -9,7 +9,7 @@ from .. import limits
 from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Equation, Link, ListItem, Math, Para, Section, Table, Text, Image
-from . import omml, ooxml_base
+from . import omml, ooxml_base, smartart
 from .ooxml_base import int_of as _int
 from .word_fields import MAX_URL
 
@@ -127,6 +127,7 @@ class _Reader:
         self.scope = None
         self.image_bytes = 0
         self.chart_cells = 0
+        self.smartart_nodes = 0
         self.ph_maps = {}  # layout or master part -> {("idx", i) | ("type", t): (y, x)}
         self.inherit = []  # the current slide's layout and master maps, in lookup order
 
@@ -333,6 +334,11 @@ class _Reader:
                     self.ctx.skipped["chart"] += 1
                     return []
                 return [tbl]
+            if n == "relIds":
+                got = smartart.items(self.pkg, self.scope.part, attr(e, "dm"), self.ctx,
+                                     limits.SMARTART_NODES - self.smartart_nodes)
+                self.smartart_nodes += len(got)
+                return got
         return []
 
     # ---- text

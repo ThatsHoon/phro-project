@@ -6,7 +6,7 @@ from ..containers.zipx import attr, kids, local
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import (Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math, NoteRef, Para,
                      Table, Text)
-from . import omml, ooxml_base
+from . import omml, ooxml_base, smartart
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
 from .word_fields import MAX_INSTR, MAX_URL, comment_note, hyperlink_url
@@ -74,6 +74,7 @@ class _Reader:
         self.scope = None
         self.image_bytes = 0
         self.chart_cells = 0
+        self.smartart_nodes = 0
         self.opened = 0  # tables opened so far (TABLE_NODES)
 
     # ---- packages and parts
@@ -406,6 +407,8 @@ class _Reader:
             self.picture(st, attr(el, "id"), re.sub(r"\s+", " ", attr(el, "title") or "").strip()[:MAX_ALT])
         elif n == "chart":
             self.chart(st, attr(el, "id"))
+        elif n == "relIds":
+            st.extras.extend(self.smartart(attr(el, "dm")))
         elif n == "txbxContent":
             st.extras.extend(self.blocks(el, d + 1))
         elif n not in _SKIP:
@@ -429,6 +432,11 @@ class _Reader:
             self.ctx.skipped["chart"] += 1
             return
         st.extras.append(tbl)
+
+    def smartart(self, rid):
+        got = smartart.items(self.pkg, self.scope.part, rid, self.ctx, limits.SMARTART_NODES - self.smartart_nodes)
+        self.smartart_nodes += len(got)
+        return got
 
     # ---- tables
     def table(self, tbl, d):
