@@ -495,3 +495,128 @@ def form_xobject(content, *, oc=None, matrix=None):
 def rule_ops(x0, y0, x1, y1, w=0.5):
     """A stroked line from (x0, y0) to (x1, y1) with line width `w`."""
     return b"%s w %s %s m %s %s l S" % tuple(_num(v).encode() for v in (w, x0, y0, x1, y1))
+
+
+# -- annotations, form fields, outlines and images --
+
+def link_annot(rect, uri):
+    """A /Link annotation whose action is a /URI."""
+    return {"Type": Name("Annot"), "Subtype": Name("Link"), "Rect": list(rect),
+            "A": {"S": Name("URI"), "URI": uri}}
+
+
+def text_annot(rect, contents, *, author=None, subtype="Text", irt=None, flags=0):
+    """A markup annotation with /Contents; `irt` is the parent's Ref (a reply), `flags` is /F."""
+    d = {"Type": Name("Annot"), "Subtype": Name(subtype), "Rect": list(rect), "Contents": contents}
+    if author is not None:
+        d["T"] = author
+    if irt is not None:
+        d["IRT"] = irt
+    if flags:
+        d["F"] = flags
+    return d
+
+
+def popup(parent):
+    """The /Popup annotation of `parent` (a Ref)."""
+    return {"Type": Name("Annot"), "Subtype": Name("Popup"), "Rect": [100, 100, 200, 200],
+            "Parent": parent}
+
+
+def widget(rect, page_ref, **field):
+    """A /Widget annotation that is also a form field: `field` holds T, TU, V, FT, Ff and so on.
+    page_ref None leaves out /P."""
+    d = {"Type": Name("Annot"), "Subtype": Name("Widget"), "Rect": list(rect)}
+    if page_ref is not None:
+        d["P"] = page_ref
+    d.update(field)
+    return d
+
+
+def acroform(fields, *, first=200):
+    """The objects of an AcroForm: {number: object}. Object `first` is the AcroForm dictionary
+    (use catalog={"AcroForm": Ref(200)}); `fields` follow from first + 1 in depth-first order.
+    A field dict's /Kids may hold dicts, which become objects of their own with /Parent set; a
+    Ref stays as it is. Pass the objects as extra_objects."""
+    objects = {}
+    counter = [first]
+
+    def add(field, parent):
+        counter[0] += 1
+        num = counter[0]
+        field = dict(field)
+        if parent is not None:
+            field["Parent"] = Ref(parent)
+        objects[num] = field
+        kids = field.get("Kids")
+        if kids:
+            field["Kids"] = [Ref(add(k, num)) if isinstance(k, dict) else k for k in kids]
+        return num
+
+    refs = [Ref(add(f, None)) for f in fields]
+    objects[first] = {"Fields": refs}
+    return objects
+
+
+def outline_items(items, *, first=300):
+    """The objects of an outline: {number: object}. Object `first` is the /Outlines root and the
+    items follow in order. `items` is [(depth from 1, title, 0-based page)] and each item's
+    /Dest points at the page object simple_pdf makes (4 + 2 * page)."""
+    objects = {first: {"Type": Name("Outlines")}}
+    parents = {0: first}
+    last = {}
+    for i, (depth, title, page) in enumerate(items):
+        num = first + 1 + i
+        parent = parents[depth - 1]
+        objects[num] = {"Title": title, "Parent": Ref(parent),
+                        "Dest": [Ref(4 + 2 * page), Name("Fit")]}
+        if parent in last:
+            objects[last[parent]]["Next"] = Ref(num)
+            objects[num]["Prev"] = Ref(last[parent])
+        else:
+            objects[parent]["First"] = Ref(num)
+        last[parent] = num
+        objects[parent]["Last"] = Ref(num)
+        parents[depth] = num
+        for deeper in [d for d in parents if d > depth]:
+            del parents[deeper]
+    return objects
+
+
+def image_xobject(w, h, *, cs="DeviceGray", bpc=8, data=None, filter="FlateDecode",
+                  palette=None, parms=None):
+    """An image XObject stream. `cs` is a colour space name, or "Indexed" (over DeviceRGB, with
+    `palette` bytes), or a ready list. `data` defaults to zero samples. filter "FlateDecode"
+    compresses the data, None leaves it as is, any other name only labels it (DCTDecode,
+    JPXDecode, CCITTFaxDecode, JBIG2Decode). `parms` becomes /DecodeParms."""
+    if cs == "Indexed":
+        space = [Name("Indexed"), Name("DeviceRGB"), len(palette) // 3 - 1, bytes(palette)]
+    elif isinstance(cs, str):
+        space = Name(cs)
+    else:
+        space = cs
+    comps = {"DeviceGray": 1, "DeviceRGB": 3, "DeviceCMYK": 4}.get(cs, 1) if isinstance(cs, str) else 1
+    if data is None:
+        data = bytes(((w * comps * bpc + 7) // 8) * h)
+    d = {"Type": Name("XObject"), "Subtype": Name("Image"), "Width": w, "Height": h,
+         "ColorSpace": space, "BitsPerComponent": bpc}
+    if parms is not None:
+        d["DecodeParms"] = parms
+    if filter == "FlateDecode":
+        return Stream(d, data, flate=True)
+    if filter is not None:
+        d["Filter"] = Name(filter)
+    return Stream(d, data)
+
+
+# An 8 x 8 baseline grey JPEG (JFIF, one DQT, SOF0, the standard DHT tables, SOS, EOI), made once
+# with an encoder and kept as bytes: the tests only need a stream that starts ff d8 ff.
+JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb004300100b0c0e0c0a100e0d0e1211101318281a1816"
+    "16183123251d283a333d3c3933383740485c4e404457453738506d51575f626768673e4d71797064785c6567"
+    "63ffc0000b080008000801011100ffc4001f0000010501010101010100000000000000000102030405060708"
+    "090a0bffc400b5100002010303020403050504040000017d01020300041105122131410613516107227114"
+    "328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748"
+    "494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2"
+    "a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9"
+    "eaf1f2f3f4f5f6f7f8f9faffda0008010100003f002bffd9")
