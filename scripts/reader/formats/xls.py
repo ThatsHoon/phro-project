@@ -5,7 +5,8 @@ The container check, the BOUNDSHEET-ordered sheet walk, the ROW and COLINFO hidd
 dochan `office_binary/xls.py` and anydoc `sheet/xls.rs`. Cells go through `numfmt.display`; formulas are never shown.
 Every count from the file is bounded by the record it sits in: MULRK uses its own length, nested BOF and EOF pairs are
 skipped by depth, and BOUNDSHEET offsets are checked against the stream. A FILEPASS workbook is decrypted by `xls_crypt`
-when its default password verifies, else it is `encrypted`. A sheet that cannot be read is counted under
+when its default password verifies, else it is `encrypted`. A compound file with no Workbook stream goes to
+`cfb_route`: another format's file named .xls is read by its own parser. A sheet that cannot be read is counted under
 `sheet` and the others still come out. Charts (a chart sheet, or a substream nested in a worksheet) are read by
 `biff_chart` after every worksheet, so a reference to a later sheet resolves; each table goes back into its sheet's
 section after its pictures, charged against `CHART_TOTAL` like the other formats' charts.
@@ -19,7 +20,7 @@ from ..containers import flate
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import display
-from . import biff, biff_chart, sheet_grid, xls_alike, xls_crypt, xls_drawing
+from . import biff, biff_chart, cfb_route, sheet_grid, xls_alike, xls_crypt, xls_drawing
 
 _ROW, _COLINFO, _MERGED = 0x0208, 0x007D, 0x00E5
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
@@ -284,14 +285,13 @@ def parse(path, ctx) -> Doc:
         raise ReadError("damaged", "not an Excel workbook")
     try:
         with Compound(path) as cf:
-            if cf.exists("Workbook"):
+            other = cfb_route.route(cf, "xls", "no Workbook stream")
+            if other is None:
                 data = cf.read("Workbook")
-            elif cf.exists("Book"):
-                raise ReadError("unsupported", "Excel 5.0/95 workbook")
-            else:
-                raise ReadError("damaged", "no Workbook stream")
     except (KeyError, CfbError):
         raise ReadError("damaged", "Workbook stream") from None
+    if other is not None:  # another format's compound file named .xls
+        return cfb_route.parse(other, path, ctx)
     secs = Workbook(data, ctx, sheet_grid.Budget()).sections()
     if not secs:
         raise ReadError("damaged", "no readable sheets")

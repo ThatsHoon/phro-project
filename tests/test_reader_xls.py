@@ -208,6 +208,26 @@ def test_container_denials():
         assert got == ("damaged", "not an Excel workbook"), got
 
 
+def test_encrypted_package_named_xls():
+    """A password-protected xlsx (EncryptionInfo + EncryptedPackage) renamed .xls is encrypted, not damaged."""
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "a.xls"
+        make_cfb(src, {"EncryptionInfo": b"\x04\x00\x04\x00" + bytes(60), "EncryptedPackage": bytes(4096)})
+        got = denied(lambda: reader.convert(src, Path(d) / "out"))
+    assert got == ("encrypted", ""), got
+
+
+def test_ppt_named_xls():
+    """A PowerPoint compound file named .xls is read by the ppt parser, as slides."""
+    from reader_fix import make_ppt
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "a.xls"
+        make_ppt(src, [{"title": "Deck title", "body": ["slide text"]}])
+        reader.convert(src, Path(d) / "out")
+        out = (Path(d) / "out" / "out.md").read_text(encoding="utf-8")
+    assert "## Slide 1: Deck title" in out and "slide text" in out, out
+
+
 def test_nested_bof_skipped():
     # a chart substream inside a worksheet: its records are not cells, and the sheet's own EOF ends the sheet
     inner = rec(0x0809, struct.pack("<HHHHII", 0x0600, 0x0020, 0, 0, 0, 6)) + \

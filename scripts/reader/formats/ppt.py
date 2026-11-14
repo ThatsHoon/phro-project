@@ -14,7 +14,9 @@ preview picture and is counted under `object`, a workbook with no table under `c
 (`ppt_pictures`: the BStore of the DocumentContainer's PPDrawingGroup, the BLIPs in the `Pictures` stream) at its
 place; one that cannot be placed is counted under `image`. Every walk spends one budget of
 `BIN_RECORDS` records, and the text emitted is capped at `MAX_OUTPUT` characters. A file saved with the default
-password is decrypted first (`ppt_crypt`); the Persist keeps its offsets and reads the decrypted copy.
+password is decrypted first (`ppt_crypt`); the Persist keeps its offsets and reads the decrypted copy. A compound
+file with no PowerPoint Document stream goes to `cfb_route` (another format's file named .ppt is read by its own
+parser), and a PowerPoint 95 file (a PP40 stream, or PowerPoint 95's short Current User) is `unsupported`.
 """
 import struct
 
@@ -24,7 +26,7 @@ from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Section
 from . import ppt_records as rec
-from . import ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, sheet_grid
+from . import cfb_route, ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, sheet_grid
 from .ppt_shapes import Walk as _Walk
 from .ppt_shapes import text_blocks as _text_blocks
 from .ppt_shapes import texts as _texts
@@ -202,6 +204,16 @@ class Presentation:
         return secs
 
 
+def _pp95(cf, current) -> bool:
+    """A PowerPoint 95 file: its Current User stream is under 28 bytes, and the file holds a PP40 stream or that stream
+    has PowerPoint 95's shape, a u32 size and then that many bytes."""
+    if current is None or len(current) >= 28:
+        return False
+    if cf.exists("PP40"):
+        return True
+    return len(current) >= 4 and struct.unpack_from("<I", current)[0] + 4 == len(current)
+
+
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
         head = f.read(16)
@@ -212,13 +224,17 @@ def parse(path, ctx) -> Doc:
         raise ReadError("damaged", "not a PowerPoint file")
     try:
         with Compound(path) as cf:
-            if not cf.exists("PowerPoint Document"):
-                raise ReadError("damaged", "no PowerPoint Document stream")
-            data = cf.read("PowerPoint Document")
-            current = cf.read("Current User") if cf.exists("Current User") else None
-            pictures = cf.read("Pictures") if cf.exists("Pictures") else None
+            other = cfb_route.route(cf, "ppt", "no PowerPoint Document stream")
+            if other is None:
+                current = cf.read("Current User") if cf.exists("Current User") else None
+                if _pp95(cf, current):
+                    raise ReadError("unsupported", cfb_route.PP95)
+                data = cf.read("PowerPoint Document")
+                pictures = cf.read("Pictures") if cf.exists("Pictures") else None
     except (KeyError, CfbError):
         raise ReadError("damaged", "PowerPoint Document stream") from None
+    if other is not None:  # another format's compound file named .ppt
+        return cfb_route.parse(other, path, ctx)
     secs = Presentation(data, current, ctx, pictures).sections()
     if not secs:
         raise ReadError("damaged", "no readable slides")

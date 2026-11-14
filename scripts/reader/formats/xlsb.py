@@ -8,7 +8,8 @@ the record size gives an exact step, so a bad record is counted under `record` a
 through `numfmt.display`; a formula shows its cached value and its expression is never read. A sheet that cannot
 be read, or whose workbook entry names no readable part, is counted under `sheet` and the others still come out.
 A sheet's drawing part is XML: its charts (cached values as a table, charged against `CHART_TOTAL`) and pictures
-(charged against `IMAGE_BYTES`) follow the sheet's table in anchor order.
+(charged against `IMAGE_BYTES`) follow the sheet's table in anchor order. A compound file named .xlsb goes to
+`cfb_route`: an encrypted package is `encrypted`, and another format's file is read by its own parser.
 """
 import re
 import struct
@@ -20,7 +21,7 @@ from ..containers.zipx import Package, attr, local, first
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import code_for, display
-from . import biff, ooxml_base, sheet_grid
+from . import biff, cfb_route, ooxml_base, sheet_grid
 from .xls import _hide
 
 BRT_ROW_HDR = 0
@@ -56,19 +57,20 @@ class _Wb:
         self.chartsheets: set[str] = set()  # sheet parts whose relationship is a chartsheet
 
 
-def _check_container(path):
+def _check_container(path) -> str | None:
+    """None for a file that is not a compound file. A compound file is never an xlsb package: an encrypted one is
+    `encrypted`, and another format's (an .xls saved as .xlsb) returns the parser `cfb_route` names."""
     with open(path, "rb") as f:
         head = f.read(8)
     if head != cfb.MAGIC:
-        return
+        return None
+    damaged = "not an xlsb package (OLE file)"
     try:
-        with cfb.Compound(path) as c:
-            found = any(n.upper() == "ENCRYPTEDPACKAGE" for n in c.names())
+        c = cfb.Compound(path)
     except ReadError:
-        found = False
-    if found:
-        raise ReadError("encrypted")
-    raise ReadError("damaged", "not an xlsb package (OLE file)")
+        raise ReadError("damaged", damaged) from None
+    with c:
+        return cfb_route.route(c, "xlsb", damaged)
 
 
 def _walk(pkg, name, ctx):
@@ -412,7 +414,9 @@ def _text(el) -> str:
 
 
 def parse(path, ctx) -> Doc:
-    _check_container(Path(path))
+    other = _check_container(Path(path))
+    if other is not None:
+        return cfb_route.parse(other, path, ctx)
     with Package(path) as pkg:
         wb = read_workbook(pkg, ctx)
         if not wb.sheets:

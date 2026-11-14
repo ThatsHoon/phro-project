@@ -58,7 +58,7 @@ from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
-from . import doc_fib, doc_objects, doc_pictures, ooxml
+from . import cfb_route, doc_fib, doc_objects, doc_pictures, ooxml
 from .hancom import flat, lone_equations
 from .word_fields import MAX_INSTR, comment_note, hyperlink_url
 
@@ -913,4 +913,7 @@ def parse(path, ctx) -> Doc:
     if not is_cfb(head):
         raise ReadError("damaged", "not a Word document")
     with Compound(path) as cf:
-        return _Reader(cf, ctx, flate.Budget()).run()  # one inflate budget a document
+        other = cfb_route.route(cf, "doc", "no WordDocument stream")
+        if other is None:
+            return _Reader(cf, ctx, flate.Budget()).run()  # one inflate budget a document
+    return cfb_route.parse(other, path, ctx)  # another format's compound file named .doc

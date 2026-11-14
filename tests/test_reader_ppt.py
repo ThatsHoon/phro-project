@@ -198,6 +198,45 @@ def test_no_slides_damaged():
     assert got == ("damaged", "no readable slides"), got
 
 
+def test_encrypted_package_named_ppt():
+    """A password-protected pptx (EncryptionInfo + EncryptedPackage) renamed .ppt is encrypted, not damaged."""
+    d = Path(tempfile.mkdtemp())
+    path = d / "a.ppt"
+    make_cfb(path, {"EncryptionInfo": b"\x04\x00\x04\x00" + bytes(60), "EncryptedPackage": bytes(4096)})
+    got = denied(lambda: reader.parse(path, Context()))
+    assert got == ("encrypted", ""), got
+
+
+def test_xls_named_ppt():
+    """An Excel compound file named .ppt is read by the xls parser, as sheets."""
+    from reader_fix import make_xls
+    d = Path(tempfile.mkdtemp())
+    path = d / "a.ppt"
+    make_xls(path, [{"name": "Data", "cells": {(0, 0): "a", (0, 1): "b"}}])
+    out, ctx = render(d, path)
+    assert "## Sheet: Data" in out and "|a|b|" in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_powerpoint95_pp40():
+    d = Path(tempfile.mkdtemp())
+    path = d / "a.ppt"
+    make_cfb(path, {"PP40": bytes(4096)})
+    got = denied(lambda: reader.parse(path, Context()))
+    assert got == ("unsupported", "PowerPoint 95 presentation"), got
+
+
+def test_powerpoint95_current_user():
+    """The PowerPoint 95 Current User stream: under 28 bytes, a u32 size and then that many bytes."""
+    d = Path(tempfile.mkdtemp())
+    path = d / "a.ppt"
+    make_cfb(path, {"PowerPoint Document": bytes(4096), "Current User": struct.pack("<I", 8) + b"user\0\0\0\0"})
+    got = denied(lambda: reader.parse(path, Context()))
+    assert got == ("unsupported", "PowerPoint 95 presentation"), got
+    make_cfb(path, {"PowerPoint Document": bytes(4096), "Current User": struct.pack("<I", 9) + b"user\0\0\0\0"})
+    got = denied(lambda: reader.parse(path, Context()))
+    assert got[0] == "damaged", got  # short, but not the PowerPoint 95 form
+
+
 def test_pptx_saved_as_ppt():
     from test_reader_slides import deck, sp
     src = deck([sp("Renamed title", ph="title")], kind="pptm")

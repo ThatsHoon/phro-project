@@ -134,6 +134,17 @@ def test_encrypted_xlsb():
         assert denied(lambda: xlsb.parse(junk, Context()))[0] == "damaged"
 
 
+def test_xls_saved_as_xlsb():
+    """An Excel 97-2003 compound file named .xlsb is read by the xls parser, as sheets."""
+    from reader_fix import make_xls
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "a.xlsb"
+        make_xls(path, [{"name": "Data", "cells": {(0, 0): "a", (0, 1): "b"}}])
+        ctx = Context()
+        out = markdown.render(xlsb.parse(path, ctx), Path(d) / "assets", False, ctx.skipped)
+    assert "## Sheet: Data" in out and "|a|b|" in out and not ctx.skipped, (out, ctx.skipped)
+
+
 def test_xlsx_saved_as_xlsb():
     rel = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" '
            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '

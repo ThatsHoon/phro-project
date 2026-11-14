@@ -208,6 +208,19 @@ def test_encrypted_package_saved_as_doc():
     denied(p, "encrypted")
 
 
+def test_other_compound_saved_as_doc():
+    """An Excel or HWP compound file named .doc is read by its own parser."""
+    from reader_fix import hwp_para, make_hwp, make_xls
+    p = tmp() / "x.doc"
+    make_xls(p, [{"name": "Data", "cells": {(0, 0): "cell text"}}])
+    d, _ = parse(p)
+    assert [s.title for s in d.blocks] == ["Data"], d.blocks
+    q = tmp() / "h.doc"
+    make_hwp(q, [hwp_para("hwp body text")])
+    d, _ = parse(q)
+    assert "hwp body text" in str(d.blocks), d.blocks
+
+
 def test_rtf_saved_as_doc():
     for name, data in (("r.doc", b"{\\rtf1\\ansi hello}"), ("b.doc", b"\xef\xbb\xbf{\\rtf1\\ansi hello}"),
                        ("s.doc", b"\xef\xbb\xbf \r\n{\\rtf1 hello}")):
