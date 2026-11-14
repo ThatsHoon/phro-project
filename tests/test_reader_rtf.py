@@ -437,7 +437,7 @@ def test_footnote_in_hidden_text_is_not_an_empty_definition():
     assert "[^" not in out, out
     # a visible note next to a hidden one keeps its number and text
     out = md_mem(rb"{\rtf1 a {\v b{\footnote hid}} c{\footnote seen}}")
-    assert "[^1]: seen" in out and "HIDNOTE" not in out, out
+    assert out == "(2 hidden places left out)\n\na  c[^1]\n\n[^1]: seen\n", out  # the hidden note's text is not there
 
 
 def test_hidden_note_is_one_hidden_place():

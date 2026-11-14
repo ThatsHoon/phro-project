@@ -365,6 +365,7 @@ def test_table_header_footer_text():
     d, ctx = parse(rtf_file(data))
     assert d.headers == ["h1 h2"], d.headers
 
+
 def lrow(left, cells, extra=b""):
     """A row with an optional trleft (None for none): cells are (text, edge) pairs."""
     head = b"\\trowd" + (b"\\trleft%d" % left if left is not None else b"") + extra
@@ -421,6 +422,7 @@ def test_nested_row_with_its_own_trleft():
     inner_t = only_table(d).rows[0][0].blocks[0]
     assert spans(inner_t) == [[("", 1), ("i1", 1)], [("i2", 1), ("i3", 1)]], spans(inner_t)
 
+
 def grid_of(*row_specs):
     data = b"{\\rtf1 " + b"".join(lrow(left, cells) for left, cells in row_specs) + b"}"
     d, ctx = parse(rtf_file(data))
@@ -439,7 +441,8 @@ def test_trleft_minus_108_mixed_with_other_left_edges():
     got = grid_of((-108, ab), (None, [(b"c", 1000), (b"d", 2000)]))
     assert got == [[("a", 1), ("b", 1)], [("c", 1), ("d", 1)]], got
     # 0 and -108 are 108 twips apart, far past a cluster: the row at 0 starts one column in, as doc.py's rows do,
-    # and the row at -108 (the table's edge) has its first cell over that column too
+    # and the row at -108 (the table's edge) has its first cell over that column too. This one-column gap cell is
+    # the controller's ruling: it matches doc.py and keeps both rows' cells on one grid
     got = grid_of((0, ab), (-108, ab))
     assert got == [[("", 1), ("a", 1), ("b", 1)], [("a", 2), ("b", 1)]], got
 
