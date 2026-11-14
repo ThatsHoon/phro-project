@@ -7,7 +7,9 @@ An embedded Excel object is a storage (or, in hwp, a nested compound file) with 
   * a chart sheet (kind 2) as the active sheet is one chart;
   * a worksheet as the active sheet gives its grid blocks (xls.Workbook.sheet_blocks) over the document's one
     sheet_grid.Budget; only its tables are kept, never its pictures, and a sheet of one cell (a Para from the grid)
-    is a 1x1 Table. A chart reads the cached values it carries, so the other sheets are not walked.
+    is a 1x1 Table. A chart reads the cached values it carries; one without them reads the cells its series point at,
+    in this workbook's own worksheets (each walked, over the same Budget, the first time a reference names it, and
+    only then). A reference that leaves the workbook, or a chart with neither, gives a table of what it holds.
 The CompObj only routes MSGraph, to biff_chart.graph: Excel.Chart and Excel.Sheet objects are both read by their
 active sheet, unlike dochan, which reads an Excel.Chart object's worksheet as a chart; the object's preview shows the
 active sheet, so the grid is what a reader of the document saw.
@@ -26,8 +28,7 @@ from . import biff, biff_chart, sheet_grid, xls
 
 _BOOKS = ("Workbook", "Book")
 _COMP_OBJ = "\x01CompObj"
-_COMP_OBJ_HEAD = 4096   # bytes of a CompObj read for its ProgID
-_COMP_OBJ_MAX = 2**20   # a CompObj stream over this is not read
+_COMP_OBJ_HEAD = 4096   # a CompObj stream over this many bytes is not read for its ProgID
 _GRAPH_PROG = re.compile(rb"MSGraph\.Chart(?:\.|\x00)")
 _READ_KINDS = ("damaged", "too_large", "unsupported", "encrypted")  # a ReadError that skips the one object
 
@@ -80,7 +81,8 @@ def _read(cf, name, ctx, budget):
                 break
         tbl, _ = biff_chart.chart(data, 0, biff.Globals(), {}, ctx, st)
         return [tbl] if tbl is not None else None
-    wb = xls.Workbook(data, ctx, budget)  # decrypts a FILEPASS the default password opens, else raises encrypted
+    # decrypts a FILEPASS the default password opens, else raises encrypted; pictures are dropped, so not decoded
+    wb = xls.Workbook(data, ctx, budget, pictures=False)
     sheets = wb.g.sheets
     if wb.g.active >= len(sheets):
         raise ReadError("damaged", "active sheet outside the workbook")
@@ -88,7 +90,7 @@ def _read(cf, name, ctx, budget):
     if ref.kind == xls._CHART:
         if not 0 <= ref.offset < len(wb.data):
             raise ReadError("damaged", "chart sheet offset outside the stream")
-        tbl, _ = biff_chart.chart(wb.data, ref.offset, wb.g, wb.cells, ctx, wb.st)
+        tbl, _ = biff_chart.chart(wb.data, ref.offset, wb.g, _OwnCells(wb), ctx, wb.st)
         return [tbl] if tbl is not None else None
     if ref.kind != xls._WORKSHEET:
         return None
@@ -97,12 +99,31 @@ def _read(cf, name, ctx, budget):
             for b in wb.sheet_blocks(wb.g.active) if isinstance(b, (Table, Para))]
 
 
+class _OwnCells:
+    """The cells a chart's references can reach: those of the embedded workbook's own sheets. A worksheet is read (by
+    sheet_blocks, over the document's one sheet budget) the first time a reference names it, so a chart that carries
+    its values, or whose references leave the workbook, reads none. It has the `get` of the dict that
+    biff_chart.chart takes."""
+
+    def __init__(self, wb):
+        self.wb = wb
+        self._tried = set()
+
+    def get(self, i, default=None):
+        sheets = self.wb.g.sheets
+        if i not in self._tried and 0 <= i < len(sheets):
+            self._tried.add(i)
+            if sheets[i].kind == xls._WORKSHEET:
+                self.wb.sheet_blocks(i)  # a failure makes the chart unreadable: blocks counts it once
+        return self.wb.cells.get(i, default)
+
+
 def _prog(cf, pattern) -> bool:
-    """Whether the first _COMP_OBJ_HEAD bytes of the \\x01CompObj stream match `pattern`; a missing, oversize or
-    unreadable one does not."""
+    """Whether the \\x01CompObj stream matches `pattern`. A missing or unreadable one does not, and one over
+    _COMP_OBJ_HEAD bytes (a real CompObj is a few dozen) is not read at all."""
     try:
-        if not cf.exists(_COMP_OBJ) or cf.size(_COMP_OBJ) > _COMP_OBJ_MAX:
+        if not cf.exists(_COMP_OBJ) or cf.size(_COMP_OBJ) > _COMP_OBJ_HEAD:
             return False
-        return pattern.search(cf.read(_COMP_OBJ)[:_COMP_OBJ_HEAD]) is not None
+        return pattern.search(cf.read(_COMP_OBJ)) is not None
     except (KeyError, CfbError):
         return False

@@ -15,7 +15,7 @@ from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import sheet_grid  # noqa: E402
 from reader.formats import xls_embedded  # noqa: E402  (ModuleNotFoundError before xls_embedded.py exists)
 from reader.model import Context, Doc, Table  # noqa: E402
-from reader_fix import biff, biff_chart, biff_workbook, comp_obj, excel_object, make_cfb  # noqa: E402
+from reader_fix import area3d, biff, biff_chart, biff_workbook, comp_obj, excel_object, externsheet, make_cfb  # noqa: E402
 import test_reader_doc_objects as dobj  # noqa: E402
 import test_reader_hwp_chart as hchart  # noqa: E402
 
@@ -56,6 +56,86 @@ def test_excel_sheet_object():
     text = markdown.render(Doc(blocks=out), tmp() / "a", False, {})
     assert text == "|1|2|\n|---|---|\n|3|4|\n", text
     assert not ctx.skipped, ctx.skipped
+
+
+REFS = [{"name": "V", "ref": [(1, area3d(0, 0, 1, 1, 1)), (2, area3d(0, 0, 1, 0, 0))]}]
+CELLS = {"name": "Data", "cells": {(0, 0): "Q1", (1, 0): "Q2", (0, 1): 5, (1, 1): 6}}
+
+
+def cacheless_object(refs=REFS, extra=None, sheets=None):
+    """An Excel.Chart object whose active sheet (the second) is a chart with no cached values, series pointing at the
+    object's own first sheet."""
+    sheets = sheets or [CELLS, {"name": "Chart1", "kind": 2, "raw": biff_chart(refs, cache=False)}]
+    return object_streams(excel_object(sheets, b"Excel.Chart.8", active=1, globals_extra=externsheet(0)))
+
+
+def test_cacheless_chart_reads_its_own_sheet():
+    budget = sheet_grid.Budget()
+    path = tmp() / "o.cfb"
+    make_cfb(path, cacheless_object())
+    ctx = Context()
+    with Compound(path) as cf:
+        out = xls_embedded.blocks(cf, ctx, budget)
+    assert len(out) == 1 and render(out) == "Chart: bar\n||V|\n|---|---|\n|Q1|5|\n|Q2|6|\n", render(out)
+    assert not ctx.skipped, ctx.skipped
+    assert budget.cells < budget.cap_cells, "the sheet's cells are charged to the document's budget"
+
+
+def test_cached_chart_does_not_walk_sheets():
+    cached = [{"name": "V", "vals": [7], "cats": ["z"]}]
+    sheets = [CELLS, {"name": "Chart1", "kind": 2, "raw": biff_chart(cached)}]
+    budget = sheet_grid.Budget()
+    path = tmp() / "o.cfb"
+    make_cfb(path, cacheless_object(sheets=sheets))
+    with Compound(path) as cf:
+        out = xls_embedded.blocks(cf, Context(), budget)
+    assert render(out) == "Chart: bar\n||V|\n|---|---|\n|z|7|\n", render(out)
+    assert budget.cells == budget.cap_cells, "a chart with cached values reads no sheet"
+
+
+def test_reference_outside_the_workbook_stays_empty():
+    # an XTI of sheet -1 (another workbook) has no cells to read; the chart is still the table of what it holds
+    refs = [{"name": "V", "ref": [(1, area3d(0, 0, 1, 1, 1))]}]
+    sheets = [CELLS, {"name": "Chart1", "kind": 2, "raw": biff_chart(refs, cache=False)}]
+    streams = object_streams(excel_object(sheets, b"Excel.Chart.8", active=1, globals_extra=externsheet(-1)))
+    budget = sheet_grid.Budget()
+    path = tmp() / "o.cfb"
+    make_cfb(path, streams)
+    with Compound(path) as cf:
+        out = xls_embedded.blocks(cf, Context(), budget)
+    assert render(out) == "Chart: bar\n||V|\n|---|---|\n", render(out)
+    assert budget.cells == budget.cap_cells
+
+
+def test_embedded_worksheet_pictures_not_decoded():
+    # the pictures of an embedded worksheet are dropped, so they are not decoded (and charge no flate or image budget)
+    from reader.formats import xls, xls_drawing
+    calls = []
+    old = xls_drawing.pictures
+    xls_drawing.pictures = lambda *a, **k: calls.append(a) or []
+    try:
+        sheet = dict(GRID, drawing=b"\x00" * 16)
+        out, ctx = blocks_of(object_streams(excel_object([sheet], b"Excel.Sheet.8")))
+        assert len(out) == 1 and not ctx.skipped, (out, ctx.skipped)
+        assert calls == [], "an embedded worksheet's pictures were decoded"
+        wb = xls.Workbook(biff_workbook([sheet]), Context(), sheet_grid.Budget())  # a workbook of its own still does
+        wb.sheet_blocks(0)
+        assert len(calls) == 1, calls
+    finally:
+        xls_drawing.pictures = old
+
+
+def test_comp_obj_over_4096_bytes_is_not_read():
+    from reader_fix import msgraph_object
+    streams = object_streams(msgraph_object(["a"], [("S", [1])]))
+    assert render(blocks_of(streams)[0]).startswith("Chart: bar"), streams.keys()
+    big = dict(streams, **{"\x01CompObj": streams["\x01CompObj"] + bytes(5000)})
+    out, ctx = blocks_of(big)  # not routed to MS Graph: the 0x0680 stream is no worksheet, counted under chart
+    assert out == [] and ctx.skipped["chart"] == 1, (out, ctx.skipped)
+
+
+def render(blocks):
+    return markdown.render(Doc(blocks=blocks), tmp() / "a", False, {})
 
 
 def test_whole_stream_chart():

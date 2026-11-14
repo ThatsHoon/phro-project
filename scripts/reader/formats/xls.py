@@ -38,8 +38,8 @@ MAX_CHARTS = 256  # chart substreams one workbook reads
 class Workbook:
     """One BIFF8 workbook stream. `g` holds its globals; `cells[i]` the displayed values of sheet i (BOUNDSHEET order)."""
 
-    def __init__(self, data: bytes, ctx, budget: sheet_grid.Budget):
-        self.data, self.ctx, self.budget = data, ctx, budget
+    def __init__(self, data: bytes, ctx, budget: sheet_grid.Budget, pictures: bool = True):
+        self.data, self.ctx, self.budget, self.pictures = data, ctx, budget, pictures
         self.st = biff.Stream(data, ctx)
         self.g = biff.read_globals(self.st)
         if self.g.filepass is not None:
@@ -137,7 +137,7 @@ class Workbook:
             raise
         self._starts[i] = starts
         blocks = grid.blocks()
-        if draw:
+        if draw and self.pictures:  # an embedded workbook drops its pictures, so they are not decoded
             blocks = blocks + xls_drawing.pictures(self.g, b"".join(draw), self.flate, self.spent, self.ctx,
                                                        self.blips)
         self._blocks[i] = blocks
