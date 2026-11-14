@@ -7,14 +7,13 @@ StyleTextPropAtom) were checked against dochan `office_binary/ppt.py`, `ppt_stru
 unusable (no persist directory) is read by walking its top-level records, each SlideContainer in stream order, with
 its notes counted, not placed. Masters, notes masters and handouts are not read. A slide's text comes in shape
 order: an OutlineTextRefAtom puts the outline text block it names there, a ClientTextbox brings its own, and outline
-blocks nothing refers to follow. The shapes
-come in reading order from `ppt_shapes` (groups, tables and placeholders; date, number, footer and header placeholders
-are left out) and a title placeholder gives the slide its title. A slide that
-cannot be read is counted under `slide` and the others still come out. An object shape places the blocks `ppt_objects`
-reads from its OLE storage (an Excel chart or sheet, an MS Graph chart, an equation); one it cannot read shows its
-preview picture and is counted under `object`, a workbook with no table under `chart`. A picture shape becomes the Image of its pib
-(`ppt_pictures`: the BStore of the DocumentContainer's PPDrawingGroup, the BLIPs in the `Pictures` stream) at its
-place; one that cannot be placed is counted under `image`. Every walk spends one budget of
+blocks nothing refers to follow. The shapes come in reading order from `ppt_shapes` (groups, tables and placeholders;
+date, number, footer and header placeholders are left out) and a title placeholder gives the slide its title. A slide
+that cannot be read is counted under `slide` and the others still come out. An object shape places the blocks
+`ppt_objects` reads from its OLE storage (an Excel chart or sheet, an MS Graph chart, an equation); one it cannot read
+shows its preview picture and is counted under `object`, a workbook with no table under `chart`. A picture shape
+becomes the Image of its pib (`ppt_pictures`: the BStore of the DocumentContainer's PPDrawingGroup, the BLIPs in the
+`Pictures` stream) at its place; one that cannot be placed is counted under `image`. Every walk spends one budget of
 `BIN_RECORDS` records, and the text emitted is capped at `MAX_OUTPUT` characters. A file saved with the default
 password is decrypted first (`ppt_crypt`); the Persist keeps its offsets and reads the decrypted copy. A compound
 file with no PowerPoint Document stream goes to `cfb_route` (another format's file named .ppt is read by its own

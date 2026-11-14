@@ -167,15 +167,64 @@ def test_embed_bytes_cap():
         ppt_objects.limits.EMBED_BYTES = old
 
 
+def test_compressed_storage_inflates_only_to_embed_bytes():
+    # the size the body claims is small, the zlib data is not: inflation stops at EMBED_BYTES, not after the bomb
+    import struct
+    import zlib
+    from reader.containers import flate
+    from reader.limits import ReadError
+    bomb = zlib.compress(bytes(500_000))
+    old, real = ppt_objects.limits.EMBED_BYTES, flate.inflate
+    sizes = []
+
+    def spy(data, budget, limit=None):
+        try:
+            out = real(data, budget, limit)
+        except ReadError:
+            sizes.append(-1)
+            raise
+        sizes.append(len(out))
+        return out
+    ppt_objects.limits.EMBED_BYTES = 100_000
+    ppt_objects.flate.inflate = spy
+    try:
+        body = struct.pack("<I", 10) + bomb
+        out, ctx, _ = build([{"shapes": [obj()]}], objects=[{"data": b"", "compressed": True, "body": body}])
+    finally:
+        ppt_objects.limits.EMBED_BYTES = old
+        ppt_objects.flate.inflate = real
+    assert "(could not read: 1 embedded object)" in out, out
+    assert sizes and max(sizes) <= 100_000, sizes  # -1: stopped on the limit; never a 500,000-byte result
+
+
+def test_flate_limit():
+    import zlib
+    from reader.containers import flate
+    from reader.limits import ReadError
+    bomb = zlib.compress(bytes(500_000))
+    budget = flate.Budget()
+    try:
+        flate.inflate(bomb, budget, 1000)
+    except ReadError as e:
+        assert e.kind == "too_large", e.kind
+    else:
+        raise AssertionError("inflated past the limit")
+    assert budget.used == 0, budget.used
+    assert len(flate.inflate(bomb, budget, 500_000)) == 500_000  # exactly the limit is allowed
+
+
 def test_chart_total_charged():
     old = ppt_objects.limits.CHART_TOTAL
     ppt_objects.limits.CHART_TOTAL = 6  # the grid holds 4 cells
     try:
-        slides = [{"shapes": [obj()]}, {"shapes": [obj()]}]
-        out, ctx, _ = build(slides, objects=[excel_object([GRID], b"Excel.Sheet.8")])
+        slides = [{"shapes": [obj(pib=1)]}, {"shapes": [obj(pib=1)]}]
+        out, ctx, assets = build(slides, objects=[excel_object([GRID], b"Excel.Sheet.8")], pictures=[blip_png(PNG)])
     finally:
         ppt_objects.limits.CHART_TOTAL = old
+    # the placement past CHART_TOTAL shows the shape's preview and is counted under chart, as an unread workbook is
     assert out.count("|1|2|") == 1 and "(could not read: 1 chart)" in out, out
+    assert assets == {"img-001.png": PNG} and out.count("![](assets/") == 1, (out, assets)
+    assert ctx.skipped["chart"] == 1 and ctx.skipped["object"] == 0, dict(ctx.skipped)
 
 
 def test_failed_workbook_leaves_no_warning():

@@ -15,8 +15,10 @@ class Budget:
         self.used = 0
 
 
-def _run(data: bytes, wbits: int, budget: Budget) -> bytes:
+def _run(data: bytes, wbits: int, budget: Budget, limit: int | None = None) -> bytes:
     cap = min(limits.CFB_STREAM, max(limits.ZIP_RATIO * len(data), limits.ZIP_RATIO_FLOOR))
+    if limit is not None:
+        cap = min(cap, limit)
     d = zlib.decompressobj(wbits)
     out: list[bytes] = []
     size = 0
@@ -49,14 +51,15 @@ class Truncated(ValueError):
         self.data = data
 
 
-def inflate(data: bytes, budget: Budget) -> bytes:
-    """Raw deflate first, then the zlib wrapper. A too_large ReadError is final; a corrupt stream raises
-    ValueError and a cut one Truncated (a ValueError carrying the partial output), so ctx.guard counts either."""
+def inflate(data: bytes, budget: Budget, limit: int | None = None) -> bytes:
+    """Raw deflate first, then the zlib wrapper. A too_large ReadError is final, and so is output past `limit` bytes
+    when it is given (inflation stops there); a corrupt stream raises ValueError and a cut one Truncated (a
+    ValueError carrying the partial output), so ctx.guard counts either."""
     best = None
     error = None
     for wbits in (-15, 15):
         try:
-            out, complete = _run(data, wbits, budget)
+            out, complete = _run(data, wbits, budget, limit)
         except zlib.error as e:
             error = e
             continue

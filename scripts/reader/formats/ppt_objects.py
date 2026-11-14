@@ -9,7 +9,7 @@ The storage is opened as a compound file and read once an exObjId:
   * an `Equation Native` stream is converted by mtef.native_tex and placed as an Equation;
   * a Workbook or Book stream (Excel.Chart, Excel.Sheet, MSGraph.Chart) is read by xls_embedded.blocks over one
     sheet_grid.Budget for the presentation; each placement of its tables is charged against CHART_TOTAL (copies
-    counted), and one past it is counted under chart instead;
+    counted), and one past it shows the shape's preview and is counted under chart, as an unread workbook is;
   * anything else, and anything that cannot be read (a persist id with no ExOleObjStg, bad zlib, a body that is not a
     compound file, past EMBED_BYTES, an equation that does not convert), gives None: the caller shows the shape's
     preview picture and counts it under object. At most MAX_OBJECTS objects are read; the rest give None too.
@@ -44,7 +44,7 @@ class Objects:
         self._index = None   # exObjId -> persistIdRef
         self._read = {}      # exObjId -> an object read: (kind, blocks, lost) or None
         self.partial = set()  # exObjIds of equations converted in part
-        self._unread = set()  # exObjIds of workbooks that gave no table
+        self._unread = None   # the exObjId of the last placement blocks() gave no table for (an unread chart)
         self.chart_cells = 0  # table cells placed from embedded workbooks, copies counted (CHART_TOTAL)
 
     def _ids(self) -> dict:
@@ -88,14 +88,14 @@ class Objects:
         if claimed > limits.EMBED_BYTES:
             return None
         try:
-            data = flate.inflate(self.doc[body + 4:body + size], self.budget)
+            data = flate.inflate(self.doc[body + 4:body + size], self.budget, limits.EMBED_BYTES)
         except ReadError as e:
             if e.kind not in _SKIP:
                 raise
             return None
         except ValueError:  # corrupt or cut zlib data
             return None
-        return data if len(data) <= limits.EMBED_BYTES else None
+        return data
 
     def _load(self, pid):
         """(kind, blocks, lost) of the object stored under persist id `pid`, or None when it is not read."""
@@ -131,12 +131,14 @@ class Objects:
             return None
 
     def unread_chart(self, ex_obj_id) -> bool:
-        """Whether `ex_obj_id` is a workbook that gave no table (set by blocks, which gives [] for it)."""
-        return ex_obj_id in self._unread
+        """Whether the placement blocks() was last asked for, of `ex_obj_id`, is an unread chart: a workbook that gave
+        no table, or whose tables would take the presentation past CHART_TOTAL (blocks gives [] for either)."""
+        return self._unread is not None and ex_obj_id == self._unread
 
     def blocks(self, ex_obj_id: int | None) -> list | None:
         """The blocks of object `ex_obj_id` for one placement, or None when it is not read (the caller shows the
         preview and counts it under object). An object is read once; its blocks may be placed again."""
+        self._unread = None
         pid = self._ids().get(ex_obj_id)
         if pid is None:
             return None
@@ -153,7 +155,7 @@ class Objects:
             return None
         kind, blocks, lost = got
         if kind == "chart":
-            self._unread.add(ex_obj_id)
+            self._unread = ex_obj_id
             return []
         if kind == "equation":
             if "depth" in lost:
@@ -163,6 +165,6 @@ class Objects:
             if isinstance(t, Table):
                 self.chart_cells += sum(len(row) for row in t.rows)
         if self.chart_cells > limits.CHART_TOTAL and blocks:
-            self.ctx.skipped["chart"] += 1
+            self._unread = ex_obj_id  # the caller shows the preview and counts the chart, as for an unread workbook
             return []
         return list(blocks)

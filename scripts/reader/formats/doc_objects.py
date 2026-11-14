@@ -6,15 +6,19 @@ Word writes an object as an EMBED field: the separator has fSpec and fOle2 and n
 PicLocation in the Data stream. An object is read once an id: an Equation Native is converted by mtef.to_tex after
 its EQNOLEFILEHDR (cbHdr bytes, a u16 first), and the equation replaces the preview, which is not read; a Workbook or
 Book stream is read by xls_embedded (its tables are placed after the paragraph, as a picture is; one it cannot
-read is a chart, counted), and a CompObj naming MS Graph is a chart; anything else is another object. A document reads
+read, or whose placement would pass CHART_TOTAL, is a chart: its preview stays, counted), and a CompObj naming
+MS Graph is a chart; anything else is another object. A document reads
 256 objects at most, the rest counted under object. A storage that is not there,
 an equation that does not convert and a stream that cannot be read (missing, a broken chain, damaged or too large:
 ReadError's other kinds end the document) keep the preview; so does an equation converted in part (stopped early,
 symbols left out), after its TeX. What is not read is counted where the object is shown:
 a chart under chart, the rest under object (another object only when its preview is missing or not viewable: Assets'
 VIEWABLE kinds, a BMP when bmp_to_png reads it). An object in vanished or deleted text is hidden as its text is and
-never counted.
+never counted (a workbook's tables are Hidden copies in vanished text, which --hidden shows; in tracked-deleted text
+they are dropped).
 """
+import dataclasses
+
 from .. import images, limits
 from ..containers.cfb import CfbError
 from ..limits import ReadError
@@ -138,8 +142,15 @@ class Objects:
         shown = not (st.run.vanish or st.run.deleted)
         if kind == "table":
             with r.ctx.guard("chart"):
-                if shown:
-                    self.tables(st, tex)
+                if st.run.deleted:  # tracked-deleted text stays dropped
+                    return
+                if not self.tables(st, tex, "" if shown else "hidden"):
+                    # past CHART_TOTAL: as a workbook that gave no table, the preview shows and a shown one is counted
+                    preview = self.preview(at)
+                    if preview is not None:
+                        r.put_image(st, preview)
+                    if shown:
+                        r.ctx.skipped["chart"] += 1
             return
         with r.ctx.guard("chart" if kind == "chart" else "object"):
             if kind == "equation":
@@ -160,17 +171,19 @@ class Objects:
             elif kind != "other" or preview is None or not self.viewable(at, preview):
                 r.ctx.skipped["object"] += 1
 
-    def tables(self, st, tables):
+    def tables(self, st, tables, hidden="") -> bool:
         """An embedded workbook's tables after the open paragraph, not at the object's place inside it, as a picture
         goes (st.extras): a Markdown table is a block and cannot sit in the middle of a line of text, and doc pictures
-        follow the same rule (test_doc_text_order pins it). Each placement is charged against CHART_TOTAL, and one
-        past it is counted under chart instead."""
-        for t in tables:
-            self.chart_cells += sum(len(row) for row in t.rows)
-            if self.chart_cells > limits.CHART_TOTAL:
-                self.r.ctx.skipped["chart"] += 1
-            else:
-                st.extras.append(t)
+        follow the same rule (test_doc_text_order pins it). Each placement is charged, copies counted, against
+        CHART_TOTAL; past it none of the placement's tables is placed (False) and the caller shows the preview and
+        counts the chart, as for a workbook that gave no table. `hidden` marks the tables placed in vanished text."""
+        cells = sum(len(row) for t in tables for row in t.rows)
+        self.chart_cells += cells
+        if self.chart_cells > limits.CHART_TOTAL:
+            return False
+        # in vanished text the tables are Hidden copies, which --hidden shows
+        st.extras.extend(dataclasses.replace(t, hidden=hidden) if hidden else t for t in tables)
+        return True
 
     def preview(self, at) -> bytes | None:
         """The picture of the PICF at Data offset `at` (doc_pictures, its read budgets), or None when there is none,

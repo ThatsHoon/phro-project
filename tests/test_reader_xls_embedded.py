@@ -159,6 +159,17 @@ def test_encrypted_object():
     assert out == [] and ctx.skipped["chart"] == 1, (out, ctx.skipped)
 
 
+def test_junk_workbook_counts_only_the_chart():
+    # bytes that are no BIFF stream at all are one chart, not also a damaged record
+    for junk in (b"x" * 40, b"", b"\x09\x08", biff(0x0809, bytes(2)) + b"junk", biff(0x1234, bytes(8))):
+        out, ctx = blocks_of({"Workbook": junk})
+        assert out == [] and ctx.skipped == {"chart": 1}, (junk, out, ctx.skipped)
+        d, ctx = dobj.parse(dobj.embed_doc({1: {"Workbook": junk}}, preview=dobj.PNG_PREVIEW))
+        assert ctx.skipped == {"chart": 1}, (junk, ctx.skipped)
+        out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
+        assert out == "(could not read: 1 chart)\n\n![](assets/img-001.png)\n", (junk, out)
+
+
 def test_rejected_streams():
     # over EMBED_BYTES, BIFF5, and MS Graph (Task 12's) are counted under chart
     old = limits.EMBED_BYTES
@@ -291,6 +302,39 @@ def test_failed_workbook_leaves_no_warning():
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
     assert out == "(could not read: 1 chart)\n\n![](assets/img-001.png)\n", out
     assert ctx.skipped == {"chart": 1} and ctx.warnings == [], (ctx.skipped, ctx.warnings)
+
+
+def test_doc_workbook_past_chart_total_shows_preview():
+    # the second placement of a 4-cell workbook passes CHART_TOTAL: its preview shows and the chart is counted, as
+    # for a workbook that gave no table (ppt does the same)
+    obj = object_streams(excel_object([GRID], b"Excel.Sheet.8"))
+    text = "a" + dobj.EMBED + "b" + dobj.EMBED + "\r"
+    old = limits.CHART_TOTAL
+    limits.CHART_TOTAL = 6
+    try:
+        d, ctx = dobj.parse(dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW))
+    finally:
+        limits.CHART_TOTAL = old
+    out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
+    assert out.count("|1|2|") == 1 and out.count("![](") == 1, out
+    assert "(could not read: 1 chart)" in out and ctx.skipped == {"chart": 1}, (out, ctx.skipped)
+
+
+def test_doc_workbook_in_vanished_text_is_hidden():
+    # vanished text goes through the Hidden path, so --hidden shows the table; tracked-deleted text stays dropped
+    obj = object_streams(excel_object([GRID], b"Excel.Sheet.8"))
+    text = "a" + dobj.EMBED + "\r"
+    p = dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW, props=dobj.sp(dobj.VANISH))
+    shown = dobj.md(p, hidden=True)
+    assert "|1|2|\n|---|---|\n|3|4|" in shown, shown
+    plain = dobj.md(p)
+    assert "|1|2|" not in plain and "hidden places left out" in plain, plain
+    d, ctx = dobj.parse(p)
+    assert not ctx.skipped, ctx.skipped
+    p = dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW, props=dobj.sp(dobj.DELETED))
+    d, ctx = dobj.parse(p)
+    assert not any(isinstance(b, Table) for b in d.blocks) and not ctx.skipped, (d.blocks, ctx.skipped)
+    assert "|1|2|" not in dobj.md(p, hidden=True), dobj.md(p, hidden=True)
 
 
 def test_ole_table_shares_budget():

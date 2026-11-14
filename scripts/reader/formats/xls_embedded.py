@@ -64,11 +64,12 @@ def _read(cf, name, ctx, budget):
     if _prog(cf, _GRAPH_PROG):  # an MS Graph object: its Workbook is a datasheet, not a worksheet
         tbl = biff_chart.graph(data, ctx)
         return [tbl] if tbl is not None else None
-    st = biff.Stream(data, ctx)
-    first = next(st.records(0), None)
-    if first is None or first[0] != biff.BOF or first[2] < 4:
+    # the first record is looked at by hand: bytes that are no record at all are one chart, not also a damaged record
+    rid, size = struct.unpack_from("<HH", data, 0) if len(data) >= 4 else (0, 0)
+    if rid != biff.BOF or size < 4 or len(data) < 4 + size:
         raise ReadError("damaged", "not a BIFF8 workbook")
-    vers, dt = struct.unpack_from("<HH", data, first[1])
+    st = biff.Stream(data, ctx)
+    vers, dt = struct.unpack_from("<HH", data, 4)
     if vers == 0x0500:
         raise ReadError("unsupported", "Excel 5.0/95 workbook")
     if vers != 0x0600:
