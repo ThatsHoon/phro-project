@@ -94,7 +94,7 @@ def out(d):
 
 def test_pass_through():
     d = tmp()
-    for n in ("a.py", "a.md", "a.png", "a.pdf"):
+    for n in ("a.py", "a.md", "a.png"):
         (d / n).write_text("x")
         assert gate.decide(ev(d / n)) is None
     (d / "w.hwp").write_text("x")
@@ -580,7 +580,7 @@ def test_ooxml_four_converted():
         "a.xlsx": (make_xlsx(None, [{"name": "S", "rows": rows}]), "xlsx"),
         "a.xlsm": (make_xlsx(None, [{"name": "S", "rows": rows}]), "xlsx"),
     }
-    with stub() as base:
+    with pdf_env() as base:
         for name, (data, skill) in files.items():
             (d / name).write_bytes(data)
             r = run(d / name, base)
@@ -589,8 +589,9 @@ def test_ooxml_four_converted():
             assert ctx.startswith(name + " was converted to Markdown by phro-project"), ctx
             assert ctx.endswith(f"to edit the file, use the {skill} skill."), (name, ctx)
         (d / "a.pdf").write_bytes(b"%PDF-1.7\n" + bytes(64))
-        r = gate.decide(ev(d / "a.pdf"))  # pdf is built: a damaged one denies (Task 16 changes this to pass-through)
-        assert r is not None and out(r)["permissionDecision"] == "deny", r
+        r = gate.decide(ev(d / "a.pdf"))  # a damaged pdf passes through to Claude's own Read
+        assert r is not None and "permissionDecision" not in out(r), r
+        assert out(r)["additionalContext"].startswith("phro-project could not convert a.pdf ("), r
 
 
 def test_readme_formats_match():
@@ -615,6 +616,369 @@ def test_notices_credit_port_sources():
         for rel, doc in docs.items():
             if re.search(rf"\b{proj}\b", doc, re.I):
                 assert any(fnmatch.fnmatch(rel, p) for p in paths), (proj, rel)
+
+
+# -- pdf: every pdf test pins PHRO_READER_PYENV (off, a missing folder or a fake venv) so a real venv never runs
+
+PDF_HINT = ' Pages start at "## Page N" lines. Read-only view; to edit or create a pdf, use the pdf skill.'
+OFFER_START = " Built-in parser used; pypdfium2 (PyPI, 4 MB) reads tables, scans and forms better."
+EXIT3 = [sys.executable, "-c", "import sys; sys.exit(3)"]
+
+# a child CLI whose pdf reader stops after 2 pages
+CUT_READ = '''import sys
+sys.path.insert(0, {scripts!r})
+from reader.formats import pdf
+pdf.PDF_PAGES = 2
+import read
+sys.exit(read.main(sys.argv[1:]))
+'''
+
+
+@contextmanager
+def envs(**values):
+    """Set (or, for None, unset) environment variables; restore them after."""
+    old = {k: os.environ.get(k) for k in values}
+    try:
+        for k, v in values.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = str(v)
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+@contextmanager
+def pdf_env(pyenv="off"):
+    """stub()'s throwaway cache and child, with PHRO_READER_PYENV pinned: "off" (native, no offer), a missing
+    folder (native with the offer) or a fake venv."""
+    with stub() as base, envs(PHRO_READER_PYENV=pyenv):
+        yield base
+
+
+def pdf_file(pages, name="a.pdf", **kw):
+    import pdf_fix
+    p = tmp() / name
+    with open(gate.long_path(p), "wb") as f:  # a long name needs the \\?\ form on Windows
+        f.write(pdf_fix.simple_pdf(pages, **kw))
+    return p
+
+
+def four_pages():
+    from pdf_fix import text_ops
+    return pdf_file([text_ops(f"Body{i}") for i in range(1, 5)])
+
+
+def sev(p, sid=None, **extra):
+    e = ev(p, **extra)
+    if sid is not None:
+        e["session_id"] = sid
+    return e
+
+
+def ctx_of(d):
+    return out(d)["additionalContext"]
+
+
+def md_lines(o):
+    return Path(o["updatedInput"]["file_path"]).read_text(encoding="utf-8").splitlines()
+
+
+def test_pdf_converts_native():
+    from pdf_fix import text_ops
+    with pdf_env(tmp() / "no-venv"):
+        p = pdf_file([text_ops("Hi")])
+        o = out(gate.decide(ev(p)))
+        assert o["permissionDecision"] == "allow", o
+        c = o["additionalContext"]
+        assert c.startswith("a.pdf was converted to Markdown by phro-project (3 lines)." + PDF_HINT), c
+        assert OFFER_START in c and "Read-only view (no XML" not in c, c
+        assert "Hi" in md_lines(o) and "## Page 1" in md_lines(o)
+
+
+def test_engine_in_key():
+    import pdf_fix
+    from reader import cache, pdfenv
+    v = pdf_fix.fake_venv(tmp() / "venv")
+    with pdf_env(v):
+        assert pdfenv.engine() == "pdfium-5.15.2-7000"
+        p = pdf_file([pdf_fix.text_ops("Hi")])
+        k = cache.key(p, "pdfium-5.15.2-7000")
+        d = cache.store(k, p, engine="native")
+        o = out(gate.decide(ev(p), command=EXIT3))  # a cache hit: the child would exit 3
+        assert o["permissionDecision"] == "allow", o
+        assert Path(o["updatedInput"]["file_path"]) == d / "out.md", o
+        assert OFFER_START not in o["additionalContext"], o
+
+
+def test_verify_fail_repairs():
+    import pdf_fix
+    from reader import cache
+    v = pdf_fix.fake_venv(tmp() / "venv")
+    rec = next(v.rglob("RECORD"))
+    rec.write_bytes(rec.read_bytes() + b"extra,,\n")
+    with pdf_env(v):
+        p = pdf_file([pdf_fix.text_ops("Hi")])
+        o = out(gate.decide(ev(p)))
+        assert o["permissionDecision"] == "allow", o
+        assert Path(o["updatedInput"]["file_path"]).parent.name == cache.key(p, "native"), o
+        c = o["additionalContext"]
+        assert f'Read by the built-in parser because the pdf engine in "{v}" failed its file check' in c, c
+        assert OFFER_START not in c, c
+        assert len(c) < 600
+
+
+def test_pages_values_parsed():
+    assert gate.parse_pages(" 3 - 5 ") == (3, 5)
+    assert gate.parse_pages("7") == (7, 7)
+    for bad in ("5-3", "0", "3,5", "x", 7, "", "-3", "3-", "1-2-3", "+3", "٣", None):
+        assert gate.parse_pages(bad) is None, bad
+
+
+def test_pages_offset_limit():
+    with pdf_env():
+        p = four_pages()
+        o = out(gate.decide(ev(p, pages="2-3", offset=1, limit=9)))
+        lines = md_lines(o)
+        first, after = lines.index("## Page 2") + 1, lines.index("## Page 4") + 1
+        u = o["updatedInput"]
+        assert u["offset"] == first and u["limit"] == after - first and "pages" not in u, u
+        o = out(gate.decide(ev(p, pages="4", limit=9)))
+        u = o["updatedInput"]
+        assert u["offset"] == md_lines(o).index("## Page 4") + 1 and "limit" not in u and "pages" not in u, u
+        u = out(gate.decide(ev(p, pages="3,4")))["updatedInput"]  # not a pages value: dropped, the whole read
+        assert "pages" not in u and "offset" not in u, u
+
+
+def test_pages_past_cut_range():
+    with pdf_env():
+        cut = tmp() / "cut_read.py"
+        cut.write_text(CUT_READ.format(scripts=str(HERE / "scripts")), encoding="utf-8")
+        base = [sys.executable, "-I", "-X", "utf8", str(cut), "convert"]
+        p = four_pages()
+        seen, real = [], gate.subprocess.run
+
+        def spy(cmd, **kw):
+            seen.append(cmd)
+            return real(cmd, **kw)
+        gate.subprocess.run = spy
+        try:
+            o = out(gate.decide(ev(p, pages="3-4"), command=base))
+        finally:
+            gate.subprocess.run = real
+        assert o["permissionDecision"] == "allow", o
+        assert seen[-1][-2:] == ["--pages", "3-4"] and seen[-1][-4:-2] == ["--engine", "native"], seen
+        assert "--pages" not in seen[0], seen
+        got = Path(o["updatedInput"]["file_path"])
+        assert got.parent.name.endswith("-p3-4"), got
+        assert "## Page 3" in md_lines(o) and "## Page 1" not in md_lines(o)
+        assert "pages" not in o["updatedInput"] and "offset" not in o["updatedInput"], o
+
+
+def _edit_meta(p, engine="native", **changes):
+    from reader import cache
+    d = cache.lookup(cache.key(p, engine))
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    meta.update(changes)
+    (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_pages_unrendered_pass_through():
+    with pdf_env():
+        p = four_pages()
+        assert out(gate.decide(ev(p)))["permissionDecision"] == "allow"
+        _edit_meta(p, unrendered=[2, 3])
+        assert gate.decide(ev(p, pages="2-3")) is None
+        assert gate.decide(ev(p, pages="3")) is None
+        o = out(gate.decide(ev(p, pages="1-3")))
+        assert o["permissionDecision"] == "allow" and o["updatedInput"]["offset"] == 1, o
+        assert "Pages not shown as images: 2-3; Read the pdf with pages=\"2-3\" to see them." in o["additionalContext"]
+
+
+def test_pages_past_end():
+    with pdf_env():
+        o = out(gate.decide(ev(four_pages(), pages="9", offset=3)))
+        assert o["permissionDecision"] == "allow", o
+        assert "pages" not in o["updatedInput"], o
+        assert ' The pdf has 4 pages; pages="9-9" starts past its end.' in o["additionalContext"], o
+
+
+def test_pdf_damaged_pass_through():
+    from reader import cache
+    with pdf_env():
+        p = put("a.pdf", b"%PDF-1.7\n" + bytes(64))
+        r = gate.decide(ev(p))
+        o = out(r)
+        assert set(o) == {"hookEventName", "additionalContext"} and o["hookEventName"] == "PreToolUse", o
+        c = o["additionalContext"]
+        assert c.startswith("phro-project could not convert a.pdf (the file looks damaged ("), c
+        assert c.endswith("); Claude's own Read is used."), c
+        assert (cache.root() / "failed" / cache.key(p, "native")).is_file()
+        seen, real = [], gate.subprocess.run
+        gate.subprocess.run = lambda cmd, **kw: seen.append(cmd) or real(cmd, **kw)
+        try:
+            assert gate.decide(ev(p), command=EXIT3) == r
+        finally:
+            gate.subprocess.run = real
+        assert seen == [], seen
+
+
+def test_pdf_timeout_pass_through():
+    from pdf_fix import text_ops
+    from reader import cache
+    with pdf_env():
+        p = pdf_file([text_ops("Hi")])
+        r = gate.decide(ev(p), command=[sys.executable, "-c", "import time; time.sleep(5)"], timeout=1)
+        o = out(r)
+        assert "permissionDecision" not in o, o
+        assert o["additionalContext"] == ("phro-project could not convert a.pdf (conversion took over 45 seconds); "
+                                          "Claude's own Read is used."), o
+        assert (cache.root() / "failed" / cache.key(p, "native")).is_file()
+
+
+def test_pdf_encrypted_denies():
+    import pdf_fix
+    with pdf_env():
+        p = pdf_file([pdf_fix.text_ops("Hi")], encrypt=pdf_fix.EncryptSpec(4, user=b"pw"))
+        o = out(gate.decide(ev(p)))
+        assert o["permissionDecision"] == "deny", o
+        assert o["permissionDecisionReason"] == (
+            "a.pdf: the file is encrypted and needs a password. Read it with the pdf skill instead."), o
+
+
+def test_offer_once_per_session():
+    from pdf_fix import text_ops
+    with pdf_env(tmp() / "no-venv"):
+        p = pdf_file([text_ops("Hi")])
+        assert OFFER_START in ctx_of(gate.decide(sev(p, "s1")))
+        assert OFFER_START not in ctx_of(gate.decide(sev(p, "s1")))
+        assert OFFER_START in ctx_of(gate.decide(sev(p, "s2")))
+        assert OFFER_START in ctx_of(gate.decide(sev(p)))
+        assert OFFER_START in ctx_of(gate.decide(sev(p)))
+
+
+def test_offer_never_after_decline():
+    from pdf_fix import text_ops
+    from reader import cache
+    with pdf_env(tmp() / "no-venv"):
+        (cache.root() / "pdf-declined").write_text("", encoding="utf-8")
+        c = ctx_of(gate.decide(sev(pdf_file([text_ops("Hi")]), "s1")))
+        assert PDF_HINT in c and OFFER_START not in c, c
+
+
+def test_offer_not_when_off():
+    from pdf_fix import text_ops
+    with pdf_env("off"):
+        c = ctx_of(gate.decide(sev(pdf_file([text_ops("Hi")]), "s1")))
+        assert PDF_HINT in c and OFFER_START not in c, c
+
+
+def test_offer_fits_with_hint():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    read_py = "C:/Users/someone/.claude/plugins/cache/phro-markt/phro-project/0.16.0/scripts/read.py"
+    venv = "C:/Users/someone/.claude/plugins/data/phro-project-phro/pdf-venv-xyz"
+    assert len(read_py) == 85 and len(venv) == 68, (len(read_py), len(venv))
+    old = gate.READ_PY
+    gate.READ_PY = read_py
+    try:
+        offer = gate.offer_text(venv)
+    finally:
+        gate.READ_PY = old
+    assert len(offer) == 194 + 85 + 68 and offer.startswith(OFFER_START), offer
+    assert f'python -I -X utf8 "{read_py}" setup --venv "{venv}" (--decline' in offer, offer
+    meta = {"lines": 120, "images": 3, "hidden": 3,
+            "unread": ["1 slide", "2 charts", "3 form fields", "4 annotations", "5 links"]}
+    c = gate._context("n" * 24 + ".pdf", meta, md, offer=offer)
+    assert c.index(PDF_HINT) == 149 and len(PDF_HINT) == 94, c
+    assert offer in c and len(c) < 600, (len(c), c)
+
+
+def test_offer_dropped_when_long():
+    from pdf_fix import text_ops
+    from reader import cache
+    with pdf_env(tmp() / "no-venv"):
+        p = pdf_file([text_ops("Hi")], name="n" * 250 + ".pdf")
+        o = out(gate.decide(sev(p, "s1")))
+        assert o["permissionDecision"] == "allow", o
+        c = o["additionalContext"]
+        assert PDF_HINT in c and OFFER_START not in c and len(c) < 600, c
+        offers = cache.root() / "offers"
+        assert not offers.exists() or not any(offers.iterdir())
+
+
+def _pdf_meta(pages=300, per=10, **extra):
+    meta = {"lines": pages * per, "pages_total": pages, "unrendered": [], "figures": [],
+            "pages": [[i, per * (i - 1) + 1] for i in range(1, pages + 1)],
+            "headings": [[per * (i - 1) + 1, f"Page {i}"] for i in range(1, pages + 1)]}
+    meta.update(extra)
+    return meta
+
+
+def test_many_unrendered_fit():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = _pdf_meta(unrendered=list(range(1, 301, 2)), figures=list(range(1, 51)))
+    c = gate._context("a.pdf", meta, md)
+    assert len(c) < 600, (len(c), c)
+    assert " Pages not shown as images: 1, 3, 5, " in c and ', …; Read the pdf with pages="1-1" to see them.' in c, c
+    meta = _pdf_meta(unrendered=list(range(5, 60)) + [70])
+    c = gate._context("a.pdf", meta, md)
+    assert ' Pages not shown as images: 5-59, 70; Read the pdf with pages="5-24" to see them.' in c, c
+
+
+def test_pdf_context_order():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = _pdf_meta(hidden=2, unrendered=[3, 5], figures=[4, 7], unread=["1 image"], warnings=["garbled"])
+    old = gate.CONTEXT_MAX
+    gate.CONTEXT_MAX = 5000  # room for every item at once
+    try:
+        c = gate._context("a.pdf", meta, md, past_end=' The pdf has 300 pages; pages="400-400" starts past its end.',
+                          offer=gate.offer_text("v"))
+    finally:
+        gate.CONTEXT_MAX = old
+    marks = [PDF_HINT, "starts past its end", OFFER_START, "Pages not shown", " Vector figures on pages 4, 7 are linked",
+             "Some parts", "Pages at lines: 1:1, ", "garbled"]
+    at = [c.index(m) for m in marks]
+    assert at == sorted(at), (at, c)
+    assert c.startswith("a.pdf was converted to Markdown by phro-project (3000 lines). 2 hidden places left out."), c
+
+
+def test_page_index_long():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    c = gate._context("a.pdf", _pdf_meta(), md)
+    assert " Pages at lines: 1:1, " in c and "Sections at lines" not in c and len(c) < 600, c
+    shown = [int(x.split(":")[0]) for x in c.split(" Pages at lines: ")[1].split(", ") if x != "…"]
+    step = shown[1] - shown[0]
+    assert step > 1 and shown == list(range(1, 301, step))[:len(shown)], shown  # every k-th page, smallest k
+    longer = ", ".join(f"{p}:{10 * (p - 1) + 1}" for p in range(1, 301, step - 1))
+    assert len(c) - len(c.split(" Pages at lines: ")[1]) + len(longer) > 599, step
+    c = gate._context("a.pdf", _pdf_meta(pages=5, per=500), md)
+    assert c.endswith(" Pages at lines: 1:1, 2:501, 3:1001, 4:1501, 5:2001"), c
+
+
+def test_pdf_reader_off():
+    from pdf_fix import text_ops
+    with pdf_env(), off_env("pdf"):
+        assert gate.decide(ev(pdf_file([text_ops("Hi")]))) is None
+
+
+def test_ascii_pdf_not_text():
+    import pdf_fix
+    data = pdf_fix.simple_pdf([pdf_fix.text_ops("Hi")]).replace(b"\n%\xe2\xe3\xcf\xd3\n", b"\n%abcd\n", 1)
+    assert data.isascii()
+    with pdf_env():
+        p = put("a.pdf", data)
+        assert not gate.looks_like_text(p)
+        o = out(gate.decide(ev(p)))
+        assert o["permissionDecision"] == "allow" and "Hi" in md_lines(o), o
 
 
 def main():

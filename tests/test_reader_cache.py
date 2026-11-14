@@ -245,6 +245,7 @@ def run_cli(*args, env_extra=None):
     env = dict(os.environ)
     env["PHRO_READER_CACHE"] = str(tmp())
     env["PYTHONUTF8"] = "1"
+    env["PHRO_READER_PYENV"] = "off"  # a pdf convert must not re-run in the user's own pdf venv
     r = subprocess.run([sys.executable, "-I", "-X", "utf8", str(READ), *args],
                        capture_output=True, text=True, encoding="utf-8", env=env)
     return r
