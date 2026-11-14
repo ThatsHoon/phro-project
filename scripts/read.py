@@ -19,6 +19,23 @@ def _is_key(k) -> bool:
     return isinstance(k, str) and len(k) == 40 and all(ch in "0123456789abcdef" for ch in k)
 
 
+def _pages(text):
+    """`A-B` with 1 <= A <= B, as (A, B)."""
+    try:
+        first, last = (int(x) for x in text.split("-"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected A-B, got {text!r}") from None
+    if not 1 <= first <= last:
+        raise argparse.ArgumentTypeError(f"expected A-B with 1 <= A <= B, got {text!r}")
+    return first, last
+
+
+def _engine_id(wanted) -> str:
+    """The engine id a pdf is read with. Task 14 fills this: pdfium when asked for and its venv imports,
+    with pdfenv.engine_id_from_module() as the id; until then the answer is always native."""
+    return "native"
+
+
 def cmd_convert(a) -> int:
     from reader import cache
     src = Path(a.file)
@@ -26,14 +43,22 @@ def cmd_convert(a) -> int:
         # a stray print in a format module must not reach the protocol stream
         with contextlib.redirect_stdout(sys.stderr):
             reader.precheck(src)
+            opts, engine = {}, ""
+            if reader.ext_of(src) == "pdf":
+                engine = _engine_id(a.engine)
+                opts["engine"] = "native" if engine == "native" else "pdfium"
+                if a.pages:
+                    opts["pages"] = a.pages
             if a.out:
                 out = Path(a.out)
-                reader.convert(src, out, a.hidden)
+                reader.convert(src, out, a.hidden, **opts)
             else:
-                k = a.key if _is_key(a.key) else cache.key(src)  # the gate passes the key it already worked out
+                k = a.key if _is_key(a.key) else cache.key(src, engine)  # the gate passes the key it already worked out
+                if "pages" in opts:
+                    k += f"-p{a.pages[0]}-{a.pages[1]}"
                 if a.hidden:
                     k += "-hidden"
-                out = cache.lookup(k) or cache.store(k, src, a.hidden)
+                out = cache.lookup(k) or cache.store(k, src, a.hidden, **opts)
         print(out / "out.md")
     except ReadError as e:
         print(f"FAIL	{e.kind}	{_flat(e.detail)}")
@@ -83,6 +108,8 @@ def main(argv=None) -> int:
     c.add_argument("--out")
     c.add_argument("--hidden", action="store_true")
     c.add_argument("--key", help=argparse.SUPPRESS)
+    c.add_argument("--engine", choices=("pdfium", "native"))
+    c.add_argument("--pages", type=_pages, metavar="A-B")
     c.set_defaults(fn=cmd_convert)
     sub.add_parser("formats").set_defaults(fn=cmd_formats)
     pr = sub.add_parser("prune")

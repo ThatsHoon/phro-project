@@ -197,8 +197,10 @@ class _Reader:
         if pages is None:
             indices = range(count)
         else:
-            first, last = pages
-            indices = range(max(0, int(first) - 1), min(count, int(last)))
+            first, last = int(pages[0]), int(pages[1])
+            if first > count:
+                raise ReadError("damaged", f"pages {first}-{last} past the end ({count} pages)")
+            indices = range(max(0, first - 1), min(count, last))
         kept, stopped = [], False
         for n, index in enumerate(indices):
             if n >= PDF_PAGES or self.clock() - self.started > PDF_DEADLINE:

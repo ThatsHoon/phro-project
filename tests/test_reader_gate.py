@@ -589,7 +589,8 @@ def test_ooxml_four_converted():
             assert ctx.startswith(name + " was converted to Markdown by phro-project"), ctx
             assert ctx.endswith(f"to edit the file, use the {skill} skill."), (name, ctx)
         (d / "a.pdf").write_bytes(b"%PDF-1.7\n" + bytes(64))
-        assert gate.decide(ev(d / "a.pdf")) is None
+        r = gate.decide(ev(d / "a.pdf"))  # pdf is built: a damaged one denies (Task 16 changes this to pass-through)
+        assert r is not None and out(r)["permissionDecision"] == "deny", r
 
 
 def test_readme_formats_match():

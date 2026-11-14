@@ -256,16 +256,12 @@ def test_cli_convert_and_fail():
     r = run_cli("convert", str(f))
     assert r.returncode == 1
     assert r.stdout.startswith("FAIL\tunsupported\t"), r.stdout
-    g = tmp() / "x.pdf"
-    g.write_bytes(b"x")
-    r = run_cli("convert", str(g))
-    assert r.returncode == 1 and r.stdout.startswith("FAIL\tunsupported\t")
 
 
 def test_cli_formats():
     r = run_cli("formats")
     lines = r.stdout.splitlines()
-    assert r.returncode == 0 and len(lines) == 40
+    assert r.returncode == 0 and len(lines) == 41
     assert any(ln.startswith("hwpx\thwpx\t") for ln in lines)
     assert lines == sorted(lines)
     assert all(ln.split("\t")[2] in ("built", "unsupported") for ln in lines)
@@ -362,6 +358,97 @@ def test_prune_stale_tmp():
         os.utime(old, (t, t))
         assert cache.prune(30) == 1
         assert not old.exists() and new.exists()
+
+
+def test_key_engine():
+    p = sample()
+    k0 = cache.key(p)
+    kn = cache.key(p, "native")
+    kp = cache.key(p, "pdfium-5.15.2-7000")
+    assert kn != k0 and kp not in (k0, kn)
+    assert cache.key(p, "") == k0
+
+
+def test_code_digest_json():
+    base = tmp()
+    (base / "a.py").write_text("x = 1\n")
+    d0 = cache.code_digest(base)
+    (base / "data.json").write_text("{}")
+    d1 = cache.code_digest(base)
+    assert d1 != d0
+    (base / "data.json").write_text('{"a": 1}')
+    assert cache.code_digest(base) != d1
+    (base / "note.txt").write_text("x")
+    d2 = cache.code_digest(base)
+    (base / "note.txt").write_text("changed")
+    assert cache.code_digest(base) == d2
+
+
+def test_prune_markers():
+    with stub():
+        r = cache.root()
+        for sub in ("offers", "failed", "pdf-declined"):
+            (r / sub).mkdir()
+        old = time.time() - 2 * 86400
+        recent = time.time() - 3600
+        files = {r / "offers" / "x": old, r / "failed" / "y": old, r / "offers" / "new": recent,
+                 r / "failed" / "new": recent, r / "pdf-declined" / "z": old}
+        for f, t in files.items():
+            f.write_text("1")
+            os.utime(f, (t, t))
+        (r / "pdf-venv.json").write_text("{}")
+        os.utime(r / "pdf-venv.json", (old, old))
+        cache.prune(30)
+        assert not (r / "offers" / "x").exists() and not (r / "failed" / "y").exists()
+        assert (r / "offers" / "new").exists() and (r / "failed" / "new").exists()
+        assert (r / "pdf-declined" / "z").exists() and (r / "pdf-venv.json").exists()
+
+
+def _pdf_file(pages):
+    from pdf_fix import simple_pdf
+    f = tmp() / "x.pdf"
+    f.write_bytes(simple_pdf(pages))
+    return f
+
+
+def test_cli_convert_pdf():
+    import json
+    from pdf_fix import text_ops
+    f = _pdf_file([text_ops("Hi")])
+    r = run_cli("convert", str(f))
+    assert r.returncode == 0, r.stdout
+    d = Path(r.stdout.strip()).parent
+    text = (d / "out.md").read_text(encoding="utf-8")
+    assert "## Page 1" in text and "Hi" in text
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    assert meta["engine"] == "native" and meta["pages_total"] == 1, meta
+    assert len(meta["pages"]) == 1 and meta["pages"][0][0] == 1, meta
+
+
+def test_cli_pages_range():
+    from pdf_fix import text_ops
+    f = _pdf_file([text_ops(f"Body{i}") for i in range(1, 5)])
+    r = run_cli("convert", str(f), "--pages", "2-3")
+    assert r.returncode == 0, r.stdout
+    d = Path(r.stdout.strip()).parent
+    text = (d / "out.md").read_text(encoding="utf-8")
+    assert "## Page 2" in text and "## Page 3" in text
+    assert "## Page 1" not in text and "## Page 4" not in text
+    assert d.name.endswith("-p2-3"), d.name
+    for bad in ("0-2", "3-2", "x", "2"):
+        assert run_cli("convert", str(f), "--pages", bad).returncode == 2, bad
+
+
+def test_cli_pdfium_without_module():
+    import json
+    from pdf_fix import text_ops
+    f = _pdf_file([text_ops("Hi")])
+    r = run_cli("convert", str(f), "--engine", "pdfium")
+    assert r.returncode == 0, r.stdout
+    d = Path(r.stdout.strip()).parent
+    assert d.name == cache.key(f, "native"), d.name
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    assert meta["engine"] == "native", meta
 
 
 def test_precheck():

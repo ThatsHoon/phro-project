@@ -66,7 +66,8 @@ def code_digest(base=None) -> str:
         return _code
     top = Path(base) if base is not None else Path(__file__).resolve().parent
     h = hashlib.sha1()
-    for f in sorted(top.rglob("*.py"), key=lambda q: q.relative_to(top).as_posix()):
+    files = [f for f in top.rglob("*") if f.suffix in (".py", ".json") and f.is_file()]
+    for f in sorted(files, key=lambda q: q.relative_to(top).as_posix()):
         h.update(f.relative_to(top).as_posix().encode("utf-8") + b"\0")
         h.update(f.read_bytes().replace(b"\r\n", b"\n") + b"\0")
     if base is None:
@@ -74,8 +75,10 @@ def code_digest(base=None) -> str:
     return h.hexdigest()
 
 
-def key(path) -> str:
+def key(path, engine: str = "") -> str:
     h = hashlib.sha1(VERSION.encode() + b"\0" + code_digest().encode() + b"\0")
+    if engine:  # only pdf has one; every other format's key is unchanged
+        h.update(engine.encode() + b"\0")
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
             h.update(chunk)
@@ -97,7 +100,7 @@ def _complete(d: Path) -> bool:
     return (d / "out.md").is_file() and (d / "meta.json").is_file()
 
 
-def store(k: str, src, hidden: bool = False) -> Path:
+def store(k: str, src, hidden: bool = False, **opts) -> Path:
     bucket = root() / k[:2]
     target = bucket / k
     if _complete(target):
@@ -106,7 +109,7 @@ def store(k: str, src, hidden: bool = False) -> Path:
         n = next(_counter)
     tmp = bucket / f".tmp-{k}-{os.getpid()}-{n}"
     try:
-        convert(src, tmp, hidden)
+        convert(src, tmp, hidden, **opts)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -130,8 +133,18 @@ def prune(days: int = 30) -> int:
     cutoff = time.time() - days * 86400
     n = 0
     base = root()
+    for name in ("offers", "failed"):  # markers of the pdf venv offer and of failed installs: a day is enough
+        marks = base / name
+        if not marks.is_dir():
+            continue
+        for f in marks.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < time.time() - 86400:
+                    f.unlink()
+            except OSError:
+                pass
     for bucket in base.iterdir():
-        if not bucket.is_dir():
+        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined"):
             continue
         for d in bucket.iterdir():
             if d.name.startswith(".tmp-"):

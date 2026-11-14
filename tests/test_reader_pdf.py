@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pdf_fix import (JPEG, EncryptSpec, Name, Ref, acroform, image_xobject,  # noqa: E402
+from pdf_fix import (JPEG, EncryptSpec, Name, Ref, acroform, font_type0, image_xobject,  # noqa: E402
                      link_annot, ocg_catalog, outline_items, rule_ops, simple_pdf, text_annot,
                      text_ops, widget)
 
@@ -424,6 +424,37 @@ def test_pages_range():
     text, _, doc = md(simple_pdf([text_ops(f"P{n}") for n in range(1, 6)]), pages=(2, 3))
     assert heads(text) == ["## Page 2", "## Page 3"], text
     assert "P1" not in text and "P4" not in text and doc.meta["pages_total"] == 5
+
+
+def test_pages_past_end():
+    data = simple_pdf([text_ops(f"P{n}") for n in range(1, 6)])
+    text, _, doc = md(data, pages=(4, 9))
+    assert heads(text) == ["## Page 4", "## Page 5"], text
+    try:
+        md(data, pages=(7, 9))
+    except ReadError as e:
+        assert e.kind == "damaged" and e.detail == "pages 7-9 past the end (5 pages)", (e.kind, e.detail)
+    else:
+        raise AssertionError("expected ReadError")
+
+
+def test_unmapped_font_garble_warning():
+    import json
+    res = {"Font": {"F1": Ref(3), "F2": Ref(100)}}
+    body = text_ops("Plain") + b" BT /F2 12 Tf 72 650 Td <0001> Tj ET"
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "a.pdf"
+        src.write_bytes(simple_pdf([body], resources=res,
+                                   extra_objects=font_type0(tounicode=None, ordering="Identity")))
+        meta = reader.convert(src, Path(tmp) / "o1")
+        assert "1 text run without Unicode" in meta["unread"], meta
+        assert "garbled" not in meta["warnings"], meta
+        src2 = Path(tmp) / "b.pdf"
+        src2.write_bytes(simple_pdf([b"BT /F2 12 Tf 72 700 Td <0001> Tj ET"], resources=res,
+                                    extra_objects=font_type0(tounicode={1: "�" * 12})))
+        meta = reader.convert(src2, Path(tmp) / "o2")
+        assert "garbled" in meta["warnings"], meta
+        assert json.loads((Path(tmp) / "o2" / "meta.json").read_text(encoding="utf-8"))["warnings"] == meta["warnings"]
 
 
 def test_xfa_attachment_named():

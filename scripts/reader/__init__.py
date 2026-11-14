@@ -2,7 +2,7 @@
 import time
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # when the reader was imported: the CLI child passes it to the pdf page loop's deadline
 STARTED = time.monotonic()
@@ -23,14 +23,12 @@ FORMATS = {
     "djvu": "djvu",
     "mdb": "jet", "accdb": "jet",
     "pub": "pub", "vsd": "vsd", "mpp": "mpp",
+    "pdf": "pdf",
 }
 
 # extensions with a working parser; each format task adds its own
 BUILT = {"hwpx", "hwp", "doc", "xls", "odt", "ods", "odp", "docm", "pptm", "ppsx", "vsdx", "epub", "xps", "oxps", "xlsb", "ppt", "rtf",
-         "docx", "dotx", "dotm", "pptx", "potx", "potm", "ppsm", "xlsx", "xlsm", "xltx", "xltm"}
-
-# handled by anthropic-skills:*, never touched here
-SKILL_EXTS = frozenset({"pdf"})
+         "docx", "dotx", "dotm", "pptx", "potx", "potm", "ppsm", "xlsx", "xlsm", "xltx", "xltm", "pdf"}
 
 
 def ext_of(path) -> str:
@@ -49,16 +47,17 @@ def precheck(path) -> None:
         raise ReadError("too_large", f"{BIG_INPUT}: {size} bytes")
 
 
-def parse(path, ctx):
-    """Dispatch to the format module for path's extension."""
+def parse(path, ctx, **opts):
+    """Dispatch to the format module for path's extension; opts (engine, pages, ...) go to its parse when given."""
     import importlib
     path = Path(path)
     precheck(path)
-    mod = importlib.import_module("reader.formats." + FORMATS[ext_of(path)])
-    return mod.parse(path, ctx)
+    ext = ext_of(path)
+    mod = importlib.import_module("reader.formats." + FORMATS[ext])
+    return mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
 
 
-def convert(src, out_dir, hidden=False) -> dict:
+def convert(src, out_dir, hidden=False, **opts) -> dict:
     """Convert src into out_dir/out.md, out_dir/assets/ and out_dir/meta.json."""
     import json
     import time
@@ -69,7 +68,9 @@ def convert(src, out_dir, hidden=False) -> dict:
     t0 = time.monotonic()
     src, out_dir = Path(src), Path(out_dir)
     ctx = Context()
-    doc = parse(src, ctx)
+    if ext_of(src) == "pdf":  # the page loop's deadline runs from the process start
+        opts.setdefault("started", STARTED)
+    doc = parse(src, ctx, **opts)
     out_dir.mkdir(parents=True, exist_ok=True)
     assets = out_dir / "assets"
     info = {}
@@ -93,5 +94,8 @@ def convert(src, out_dir, hidden=False) -> dict:
         "unread": info["unread"],
         "warnings": warnings,
     }
+    if doc.meta and "engine" in doc.meta:
+        meta.update(engine=doc.meta["engine"], pages_total=doc.meta.get("pages_total"),
+                    unrendered=doc.meta.get("unrendered"), figures=doc.meta.get("figures"), pages=st["pages"])
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     return meta
