@@ -506,6 +506,31 @@ def test_href_escape_is_missing():
     assert ctx.skipped["header"] >= 1 and ctx.skipped["styles"] >= 1
 
 
+def md_lost(path):
+    doc, ctx = parse(path)
+    return markdown.render(doc, tmp() / "assets", False, ctx.skipped)
+
+
+def test_vba_listed():
+    out = md_lost(docm(P("Hi"), parts={"word/vbaProject.bin": b"x"}))
+    assert out.startswith("(could not read: VBA macros)") and "Hi" in out, out
+
+
+def test_empty_macro_template():
+    from reader import convert
+    p = docm("", parts={"word/vbaProject.bin": b"x"})
+    out = tmp() / "o"
+    meta = convert(p, out)
+    assert (out / "out.md").exists() and meta["unread"] == ["VBA macros"], meta
+
+
+def test_vba_with_other_losses():
+    body = ('<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rX"/>'
+            '</pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>' + P("Hi"))
+    out = md_lost(docm(body, {"word/vbaProject.bin": b"x"}))
+    assert out.startswith("(could not read: 1 image, VBA macros)"), out
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

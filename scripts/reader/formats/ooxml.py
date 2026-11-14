@@ -43,6 +43,8 @@ def _main_part(pkg) -> str:
 
 def read_package(pkg, ctx):
     """The Doc of an open package, by the root of its main part: a Word document, a presentation or a workbook."""
+    if any(n.rsplit("/", 1)[-1].lower() == "vbaproject.bin" for n in pkg.names):
+        ctx.skipped["vba"] = 1  # macros are never read; listed by name, however many projects there are
     part = _main_part(pkg)
     root, _ = load(pkg, part)
     kind = local(root.tag)

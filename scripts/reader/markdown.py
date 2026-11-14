@@ -53,18 +53,25 @@ LOST = (
     (("record",), "damaged record", "damaged records"),
     (("depth",), "place nested too deeply", "places nested too deeply"),
 )
+# Named items: reported after the counted ones, by name only (a flag, not a count).
+NAMED = (("vba", "VBA macros"),)
 # counted too, but they only change formatting or reading order, so they are not reported
 INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story"})
 
 
-def unread(skipped) -> list:
-    """Plain-word counts of what the parsers could not read, e.g. ["1 slide", "2 images"]."""
+def lost(skipped) -> list:
+    """The counted items of unread(): content that was in the file and is missing from the output."""
     out = []
     for kinds, one, many in LOST:
         n = sum(max(0, skipped.get(k, 0)) for k in kinds)
         if n:
             out.append(f"{n} {one if n == 1 else many}")
     return out
+
+
+def unread(skipped) -> list:
+    """Plain-word counts of what the parsers could not read, e.g. ["1 slide", "2 images"], then the named items."""
+    return lost(skipped) + [name for k, name in NAMED if skipped.get(k, 0) > 0]
 
 
 class _Mode:
@@ -125,6 +132,7 @@ class _Render:
         self.hidden_marks: set[str] = set()  # ids of notes whose mark was left out as hidden (and counted)
         self.dangling: set[str] = set()  # ids of hidden-only notes whose mark was shown: render() renders again
         self.unread = unread(skipped or {})
+        self.lost = lost(skipped or {})
         self.empty = True  # nothing but status lines was rendered
         self.hidden_count = 0
         self.depth = 0
@@ -742,7 +750,7 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     """Render a Doc to Markdown. The Doc is not modified.
 
     `skipped` is the parse context's skip counter; what it says was lost becomes a "(could not read: ...)" line.
-    A dict passed as `info` receives "unread" (that line's items), "empty" (no content rendered at all) and
+    A dict passed as `info` receives "unread" (that line's items), "lost" (the counted ones among them), "empty" (no content rendered at all) and
     "images" (how many viewable images the output links to).
     """
     r = _Render(doc, Path(assets_dir), hidden, skipped)
@@ -755,7 +763,7 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     text = _normalize(text)  # rebound, so the raw text is not held while _cap runs
     md = _cap(text)
     if info is not None:
-        info.update(unread=r.unread, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked))
+        info.update(unread=r.unread, lost=r.lost, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked))
     return md
 
 

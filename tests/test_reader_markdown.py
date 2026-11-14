@@ -389,8 +389,14 @@ def test_unread_line_words_and_order():
         src = f.read_text(encoding="utf-8")
         kinds |= set(re.findall(r'skipped\["(\w+)"\]', src)) | set(re.findall(r'guard\("(\w+)"\)', src))
         kinds |= set(re.findall(r'self\.(?:warn|count|part_bytes|data|related|open)\([^)]*?"([a-z_]+)"', src))
-    known = {k for ks, _, _ in markdown.LOST for k in ks} | markdown.INTERNAL
+    known = {k for ks, _, _ in markdown.LOST for k in ks} | markdown.INTERNAL | {k for k, _ in markdown.NAMED}
     assert kinds - known == set(), kinds - known
+
+
+def test_unread_named_after_counted():
+    sk = {"vba": 1, "slide": 2}
+    assert markdown.unread(sk) == ["2 slides", "VBA macros"] and markdown.lost(sk) == ["2 slides"]
+    assert markdown.unread({"vba": 0}) == [] and markdown.lost({"vba": 1}) == []
 
 
 def test_guard_isolates():

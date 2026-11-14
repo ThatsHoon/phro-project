@@ -66,8 +66,8 @@ def convert(src, out_dir, hidden=False) -> dict:
     assets = out_dir / "assets"
     info = {}
     md = markdown.render(doc, assets, hidden, ctx.skipped, info)
-    if info["empty"] and info["unread"]:  # every content part failed: nothing was read
-        raise ReadError("damaged", "nothing readable (could not read: " + ", ".join(info["unread"]) + ")")
+    if info["empty"] and info["lost"]:  # every content part failed: nothing was read
+        raise ReadError("damaged", "nothing readable (could not read: " + ", ".join(info["lost"]) + ")")
     (out_dir / "out.md").write_text(md, encoding="utf-8", newline="\n")
     st = markdown.stats(md)
     warnings = list(ctx.warnings) + [w for w in doc.warnings if w not in ctx.warnings]
