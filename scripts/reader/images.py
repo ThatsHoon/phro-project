@@ -43,11 +43,11 @@ def _chunk(tag: bytes, body: bytes) -> bytes:
     return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
 
 
-def _png(width: int, height: int, rows: list, alpha: bool) -> bytes:
+def _png(width: int, height: int, rows: list, alpha: bool, level: int = -1) -> bytes:
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 6 if alpha else 2, 0, 0, 0)
     raw = b"".join(b"\x00" + r for r in rows)
     return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
-            + _chunk(b"IDAT", zlib.compress(raw)) + _chunk(b"IEND", b""))
+            + _chunk(b"IDAT", zlib.compress(raw, level)) + _chunk(b"IEND", b""))
 
 
 def _shift(mask: int):

@@ -39,9 +39,10 @@ PDF_PAGE_SECONDS = 4.0      # seconds for one page, checked between its steps
 PDF_PAGE_CHARS = 200_000    # chars on one page; past it the rest of its text counts `text`
 # renders per conversion, scans and figures together. Measured (test_reader_pdf measure renders, 100 Letter
 # scans of 1700x2200 gray Flate with 16-level paper grain, pypdfium2 5.15.2): 100 renders took 27.2-28.2 s, over
-# the 10 s budget, so it is lowered to the largest multiple of 10 that fits: 30 took 6.9-7.3 s (40: 10.4-10.8 s).
-# A flat page costs a tenth (2.9 s for 100), white noise a third more (31.7-33.1 s for 100).
-PDF_RENDERS = 30
+# the 10 s budget with zlib level 6 for the PNG (0.19 s of each 0.21 s render: pdfium 0.023, rows 0.002). Renders
+# now compress at level 1: 100 took 6.1-6.4 s (white noise 6.9-7.0 s), so the cap stays 100. (Level 6 would have
+# needed 30: 6.9-7.3 s; 40: 10.4-10.8 s.) A flat page costs 2.9 s for 100.
+PDF_RENDERS = 100
 RENDER_DPI, CROP_DPI, RENDER_LONG = 110, 150, 1_568
 # pdfium: image pixels decoded per page; a page whose images total more has no render, and its
 # images past the budget are not decoded (each counts `image`)

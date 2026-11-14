@@ -782,7 +782,8 @@ class PdfiumDoc:
         finally:
             bitmap.close()
         got = _rgb_rows_rev(data, width, height, stride, channels)
-        return reader_images._png(width, height, got, False)
+        # zlib level 1: the default level took 0.19 s of a 0.21 s render of a grained scan (Task 19)
+        return reader_images._png(width, height, got, False, 1)
 
     # -- annotations
 
