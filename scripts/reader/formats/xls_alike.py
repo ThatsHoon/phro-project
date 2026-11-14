@@ -59,11 +59,13 @@ def _plain(head: bytes) -> bool:
 
 
 def kind(head: bytes) -> str:
-    """cfb, zip, html, text or other, from the first 64 KiB."""
+    """cfb, zip, rtf, html, text or other, from the first 64 KiB."""
     if is_cfb(head[:16]):
         return "cfb"
     if head[:2] == b"PK":
         return "zip"
+    if head.removeprefix(codecs.BOM_UTF8).lstrip(b" \t\r\n\x0b\x0c\x00").startswith(b"{\\rtf"):  # as doc.py
+        return "rtf"
     enc = utf16(head)
     if enc is not None:
         head = _decode16(head, enc, cut=True).encode("utf-8")

@@ -71,6 +71,14 @@ def test_one_column_csv_named_xls():
     assert xls_alike.kind(b"\x01\x02" * 100 + b"\n") == "other"  # control bytes are not text
 
 
+def test_rtf_named_xls():
+    """An RTF head goes to the RTF reader, as doc.py does, never to the text sheet as raw markup."""
+    for data in (b"{\\rtf1\\ansi hello\\par\n}\n", b"\xef\xbb\xbf{\\rtf1\\ansi hello\\par\n}\n",
+                 b" \r\n{\\rtf1\\ansi hello\\par\n}\n", b"{\\rtf1\\ansi a,hello\\par\n}\n"):
+        md = run(data)
+        assert "hello" in md and "\\rtf" not in md and "## Sheet" not in md, (data[:12], md)
+
+
 def test_tsv_named_xls():
     md = run("a\tb\n1\t2\n".encode("cp1252"))
     assert "|a|b|" in md and "|1|2|" in md, md

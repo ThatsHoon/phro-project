@@ -275,6 +275,9 @@ def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
         head = f.read(xls_alike.HEAD)
     what = xls_alike.kind(head)
+    if what == "rtf":  # RTF saved as .xls: rtf.parse sends only compound-file and zip heads on, so no loop
+        from . import rtf
+        return rtf.parse(path, ctx)
     if what == "html":
         return xls_alike.parse_html(path, ctx)
     if what == "text":
