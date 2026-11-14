@@ -33,8 +33,10 @@ def tmp():
 
 
 def rels_xml(items):
+    """items: (id, type, target[, True]); a fourth item True marks the target External."""
     return (f'<Relationships xmlns="{PKG}">'
-            + "".join(f'<Relationship Id="{i}" Type="{REL}/{t}" Target="{tg}"/>' for i, t, tg in items)
+            + "".join(f'<Relationship Id="{i[0]}" Type="{REL}/{i[1]}" Target="{i[2]}"'
+                      + (' TargetMode="External"' if len(i) > 3 and i[3] else "") + "/>" for i in items)
             + "</Relationships>")
 
 
@@ -97,6 +99,45 @@ def parse(path):
 def md(path, hidden=False):
     doc, _ = parse(path)
     return markdown.render(doc, tmp() / "assets", hidden)
+
+
+def link_deck(paras):
+    return deck([sp(paras=paras)], srels={1: [("rL", "hyperlink", "https://example.com/x", True),
+                                              ("rS", "slide", "slide2.xml")]})
+
+
+def run_link(text, rid="rL", action=""):
+    a = f' action="{action}"' if action else ""
+    return f'<a:r><a:rPr><a:hlinkClick r:id="{rid}"{a}/></a:rPr><a:t>{text}</a:t></a:r>'
+
+
+def test_slide_hyperlink_external():
+    out = md(link_deck(f"<a:p>{run_link('site')}</a:p>"))
+    assert "[site](https://example.com/x)" in out, out
+
+
+def test_slide_hyperlink_internal():
+    path = link_deck(f'<a:p>{run_link("next", "rS", "ppaction://hlinksldjump")}</a:p>')
+    doc, ctx = parse(path)
+    out = markdown.render(doc, tmp() / "assets", False)
+    assert "next" in out and "](" not in out and ctx.skipped["link"] == 0, out
+
+
+def test_slide_hyperlink_missing_rel():
+    doc, ctx = parse(link_deck(f'<a:p>{run_link("text", "rNone")}</a:p>'))
+    out = markdown.render(doc, tmp() / "assets", False)
+    assert "text" in out and "](" not in out and ctx.skipped["link"] == 1, (out, ctx.skipped)
+
+
+def test_slide_link_runs_join():
+    out = md(link_deck(f"<a:p>{run_link('a')}{run_link('b')}</a:p>"))
+    assert "[ab](https://example.com/x)" in out, out
+
+
+def test_shape_link_ignored():
+    s = sp("plain").replace('name="s"/>', 'name="s"><a:hlinkClick r:id="rL"/></p:cNvPr>')
+    out = md(deck([s], srels={1: [("rL", "hyperlink", "https://example.com/x", True)]}))
+    assert "plain" in out and "](" not in out, out
 
 
 def test_order_by_sldIdLst():

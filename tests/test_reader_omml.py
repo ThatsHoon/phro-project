@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from reader.formats import omml  # noqa: E402
 import test_reader_docm as dm  # noqa: E402
+import test_reader_slides as sl  # noqa: E402
 
 M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
@@ -189,6 +190,42 @@ def test_math_not_flat_text():
     sup = f"<m:sSup>{e(r('a'))}{e(r('2'), 'sup')}</m:sSup>"
     out = md(f'<w:p><w:r><w:t>Area </w:t></w:r><m:oMath xmlns:m="{M}">{sup}</m:oMath></w:p>')
     assert "a2" not in out, out
+
+
+A14 = "http://schemas.microsoft.com/office/drawing/2010/main"
+MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+PNS = f'xmlns:m="{M}" xmlns:a14="{A14}"'
+
+
+def sup(base, exp):
+    return f"<m:sSup><m:e>{r(base)}</m:e><m:sup>{r(exp)}</m:sup></m:sSup>"
+
+
+def test_slide_math_replaces_fallback():
+    p = f'<a:p {PNS}><a14:m><m:oMathPara><m:oMath>{sup("x", "2")}</m:oMath></m:oMathPara></a14:m></a:p>'
+    pic = ('<p:pic><p:nvPicPr><p:cNvPr id="9" name="p"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>'
+           '<p:blipFill><a:blip r:embed="rI"/></p:blipFill><p:spPr/></p:pic>')
+    alt = (f'<mc:AlternateContent xmlns:mc="{MC}" xmlns:a14="{A14}"><mc:Choice Requires="a14">{sl.sp(paras=p)}'
+           f'</mc:Choice><mc:Fallback>{pic}</mc:Fallback></mc:AlternateContent>')
+    path = sl.deck([alt], srels={1: [("rI", "image", "../media/i.png")]}, extra={"ppt/media/i.png": sl.PNG})
+    out = sl.md(path)
+    assert "$$x^{2}$$" in out and "assets/" not in out, out
+
+
+def test_slide_inline_math():
+    p = f'<a:p {PNS}><a:r><a:t>E = </a:t></a:r><a14:m><m:oMath><m:sSup><m:e>{r("m")}{r("c")}</m:e><m:sup>{r("2")}</m:sup></m:sSup></m:oMath></a14:m></a:p>'
+    out = sl.md(sl.deck([sl.sp(paras=p)]))
+    assert "E = ${mc}^{2}$" in out, out  # omml braces a multi-letter base
+
+
+def test_slide_math_in_table_cell():
+    cell = (f'<a:tc><a:txBody><a:bodyPr/><a:p {PNS}><a14:m><m:oMathPara><m:oMath>{r("x")}'
+            '</m:oMath></m:oMathPara></a14:m></a:p></a:txBody></a:tc>')
+    frame = ('<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="4" name="t"/><p:cNvGraphicFramePr/><p:nvPr/>'
+             '</p:nvGraphicFramePr><a:graphic><a:graphicData><a:tbl><a:tblGrid><a:gridCol/></a:tblGrid>'
+             f'<a:tr>{cell}</a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>')
+    out = sl.md(sl.deck([frame]))
+    assert "$x$" in out and "$$" not in out, out
 
 
 def main():

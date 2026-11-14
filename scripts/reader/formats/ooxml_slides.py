@@ -1,5 +1,6 @@
 """PresentationML (pptm, ppsx) to the document model. Elements match by local name.
 
+Run hyperlinks are ported from dochan (`ooxml/pptx.py`); a14 math goes through `omml`.
 Layouts and masters are read only for the position of a placeholder that has none of its own.
 """
 import re
@@ -7,14 +8,16 @@ import re
 from .. import limits
 from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
-from ..model import Bold, Break, Cell, Doc, ListItem, Para, Section, Table, Text, Image
-from . import ooxml_base
+from ..model import Bold, Break, Cell, Doc, Equation, Link, ListItem, Math, Para, Section, Table, Text, Image
+from . import omml, ooxml_base
 from .ooxml_base import int_of as _int
+from .word_fields import MAX_URL
 
 IMAGE_BYTES = 256 * 2**20  # image bytes one deck may emit, copies counted
 SPAN_CELLS = 500_000       # grid slots all spans of one table may cover; past it spans become 1
 MAX_ALT, MAX_TITLE = 200, 200
 COORD = 10**13
+A14_M = "{http://schemas.microsoft.com/office/drawing/2010/main}m"
 
 _TITLES = frozenset({"title", "ctrTitle"})
 _PH_ALIAS = {"ctrTitle": ("title",), "subTitle": ("body",), "obj": ("body",)}  # inherited from these on a master
@@ -49,8 +52,10 @@ def _flat(inlines) -> str:
     for it in inlines:
         if isinstance(it, Text):
             out += it.text
-        elif isinstance(it, Bold):
+        elif isinstance(it, (Bold, Link)):
             out += _flat(it.inlines)
+        elif isinstance(it, Math):
+            out += it.tex
         elif isinstance(it, Break):
             out += " "
     return out
@@ -285,7 +290,7 @@ class _Reader:
             body = _kid(el, "txBody")
             blocks = self.text_blocks(body)
             if ptype in _TITLES and not hid:
-                text = " ".join(_flat(b.inlines) for b in blocks)
+                text = " ".join(_flat(getattr(b, "inlines", [])) for b in blocks)
                 if text.strip():
                     titles.append(text)
                 return
@@ -328,29 +333,87 @@ class _Reader:
         return []
 
     # ---- text
-    @staticmethod
-    def inlines(p):
-        out = []
+    def para_children(self, p, d=0):
+        """The children of a paragraph; a chosen mc:AlternateContent branch's children stand in as its own."""
         for c in p:
+            if local(c.tag) != "AlternateContent":
+                yield c
+            elif d >= limits.MAX_DEPTH:
+                self.deep()
+            else:
+                chosen = ooxml_base.alternate(c, self.scope.nsmap)
+                if chosen is None:
+                    self.ctx.skipped["alternate"] += 1
+                else:
+                    yield from self.para_children(chosen, d + 1)
+
+    def run_url(self, r):
+        """The external URL of a run's hyperlink, or "" (text only: no link, an action, an internal target)."""
+        pr = _kid(r, "rPr")
+        h = _kid(pr, "hlinkClick") if pr is not None else None
+        rid = _rid(h) if h is not None else None
+        if rid is None or (attr(h, "action") or "").startswith("ppaction://"):
+            return ""
+        rel = ooxml_base.rels(self.pkg, self.scope.part, self.ctx).get(rid)
+        if rel is None:
+            self.ctx.skipped["link"] += 1
+            return ""
+        if rel.external and rel.type.endswith("/hyperlink"):
+            return rel.target[:MAX_URL]
+        return ""
+
+    def inlines(self, p, eqs=None):
+        out, link, url = [], None, ""
+        for c in self.para_children(p):
             n = local(c.tag)
             if n == "br":
                 out.append(Break())
+                link = None
             elif n in ("r", "fld"):
                 t = "".join(x.text or "" for x in kids(c, "t"))
                 if not t:
                     continue
                 pr = _kid(c, "rPr")
                 bold = pr is not None and attr(pr, "b") in ("1", "true")
-                out.append(Bold([Text(t)]) if bold else Text(t))
+                it = Bold([Text(t)]) if bold else Text(t)
+                u = self.run_url(c)
+                if not u:
+                    out.append(it)
+                    link = None
+                elif link is not None and u == url:
+                    link.inlines.append(it)
+                else:
+                    link, url = Link(u, [it]), u
+                    out.append(link)
+            elif c.tag == A14_M:
+                link = None
+                for m in c:
+                    if omml.is_math(m, "oMathPara"):
+                        for t in omml.lines(m):
+                            if eqs is not None:
+                                eqs.append(Equation(t, display=True))
+                            else:
+                                out.append(Math(t))
+                    elif omml.is_math(m, "oMath"):
+                        t = omml.tex(m)
+                        if t:
+                            out.append(Math(t))
+            elif omml.is_math(c, "oMath"):
+                link = None
+                t = omml.tex(c)
+                if t:
+                    out.append(Math(t))
         return out
 
-    def text_blocks(self, body):
+    def text_blocks(self, body, cell=False):
         out, counters = [], {}
         if body is None:
             return out
         for p in kids(body, "p"):
-            inl = self.inlines(p)
+            eqs = None if cell else []
+            inl = self.inlines(p, eqs)
             if not _flat(inl).strip():
+                out.extend(eqs or [])
                 continue
             ppr = _kid(p, "pPr")
             lvl = min(max(_int(attr(ppr, "lvl")), 0), 8) if ppr is not None else 0
@@ -367,6 +430,7 @@ class _Reader:
             for k in [k for k in counters if k > lvl or (k == lvl and not numbered)]:
                 del counters[k]
             out.append(ListItem(lvl, marker, inl) if marker else Para(inl))
+            out.extend(eqs or [])
         return out
 
     # ---- tables
@@ -389,7 +453,7 @@ class _Reader:
                 if covered:
                     continue
                 budget -= span * rspan
-                row.append(Cell(self.text_blocks(_kid(tc, "txBody")), rspan, span))
+                row.append(Cell(self.text_blocks(_kid(tc, "txBody"), True), rspan, span))
             out.append(row)
         return [Table(out)] if out else []
 
