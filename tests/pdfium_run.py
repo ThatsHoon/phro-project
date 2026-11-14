@@ -63,7 +63,8 @@ def main():
     pages = opts.get("pages")
     ctx = Context()
     try:
-        doc = pdf.parse_bytes(data, ctx, engine="pdfium", pages=tuple(pages) if pages else None)
+        doc = pdf.parse_bytes(data, ctx, engine=opts.get("engine") or "pdfium",
+                              pages=tuple(pages) if pages else None)
     except ReadError as e:
         print(json.dumps({"error": [e.kind, e.detail]}))
         return

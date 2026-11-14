@@ -9,8 +9,10 @@ What the spike learned is kept. `init_forms()` is called before any page is load
 - Chars come from the `PdfTextPage`. Surrogate pairs are joined; pdfium's line-end hyphen (0x02,
   0xFFFE) becomes `-` for the hyphen rule; generated chars are dropped (the spaces come from the
   char boxes, through `char_gaps`) and a generated line break ends the run. Consecutive chars of
-  one text object on one line make one `Fragment`; its size is the loose char box height across
-  the text direction, and its `char_offsets` and `char_gaps` come from the loose boxes along it.
+  one text object on one line make one `Fragment`. Its size is native's: the font size
+  (`FPDFText_GetFontSize`, the Tf operand) times the length of the char matrix's second row,
+  which Tz leaves alone; the loose box height stands in only when there is no usable size. Its
+  `char_offsets` and `char_gaps` come from the loose boxes along the text direction.
   The text object's render mode (3 or 7) sets `invisible`.
 - Page objects are walked iteratively in content order, form XObjects included to FORM_DEPTH
   levels, each object's matrix composed with its forms' (pdfium gives a nested object's matrix
@@ -20,8 +22,10 @@ What the spike learned is kept. `init_forms()` is called before any page is load
   its box; anything else a PNG of `FPDFImageObj_GetBitmap` through `images._png`.
 - `render(box, dpi)` renders the page (box None) or a page-space box, long side capped at
   RENDER_LONG pixels.
-- Links are `FPDFLink_*` URI actions of `annotations.SCHEMES`; comments and fields come from the
-  page's annotations, through `annotations.order_comments` and `annotations.field_entry`.
+- Links are `FPDFLink_*` URI actions of `annotations.SCHEMES`; comments come from the page's
+  annotations, through `annotations.order_comments`. Fields are native's (`/AcroForm /Fields`, by
+  page, a field with no widget on page 1); only when native could not open the file are they read
+  from the page's widgets, through `annotations.field_entry`.
 - On a page whose resources name an off optional-content group (decision 3), pdfium cannot tell
   which marked text the group covers: that page's fragments come from the native interpreter.
 
@@ -29,7 +33,7 @@ Counts, as in `pdfnative.document`: `.cut` is the document total, each `PageData
 its page added (a page is added once). The object walk past `pdf.PDF_PAGE_OBJECTS`, a form past
 FORM_DEPTH and a char scan past CHAR_SCAN count `page_part`; images past `pdf.PDF_PAGE_IMAGES`
 count `image` once; annotations past `annotations.PDF_ANNOTS` and a comment cut at ANNOT_CHARS
-count `annotation`; a field value cut by `field_entry` counts `field`. Path points past
+count `annotation`; native's field cuts, or a widget's value cut by `field_entry`, count `field`. Path points past
 PATH_POINTS are ignored and not counted, like rules past `pdf_tables.PDF_SEGMENTS`.
 """
 import ctypes
@@ -179,6 +183,10 @@ class PdfiumDoc:
         self.page_count = len(self._pdf)
         if native is not None:
             self.xfa, self.attachments = native.xfa, native.attachments
+            # fields are native's, read from /AcroForm /Fields (a field with no widget too), and
+            # what native's walk of them cut is counted once here
+            if native.cut["field"]:
+                self.cut["field"] += native.cut["field"]
         else:
             self.xfa = raw.FPDF_GetFormType(self._pdf.raw) in (raw.FORMTYPE_XFA_FULL,
                                                                raw.FORMTYPE_XFA_FOREGROUND)
@@ -292,7 +300,7 @@ class PdfiumDoc:
             count = limit
         rect, fsm = raw.FS_RECTF(), raw.FS_MATRIX()
         ox, oy = ctypes.c_double(), ctypes.c_double()
-        frags, objects, modes, fonts, axes = [], {}, {}, {}, {}
+        frags, objects, modes, fonts, axes, sizes = [], {}, {}, {}, {}, {}
         run = None  # the fragment being built: a dict
         seen = 0    # non-space chars kept
         bad = False
@@ -346,20 +354,33 @@ class PdfiumDoc:
                 objects[addr] = len(objects)
                 modes[addr] = raw.FPDFTextObj_GetTextRenderMode(handle) in (3, 7) if handle else False
                 fonts[addr] = self._font(handle)
+                fs = raw.FPDFText_GetFontSize(tp, at)
                 if raw.FPDFText_GetMatrix(tp, at, fsm) and _finite(fsm.a, fsm.b, fsm.c, fsm.d):
                     dx, dy = _unit(fsm.a, fsm.b, (1.0, 0.0))
                     axes[addr] = (dx, dy, *_unit(fsm.c, fsm.d, (-dy, dx)))
+                    # GetFontSize is the Tf operand alone, and the char matrix is Th x Tm x CTM.
+                    # Th scales only its first row, so the second row's length is the Tm x CTM
+                    # scale native multiplies Tf by (equal to native's sqrt|det| for any matrix
+                    # whose x and y scales agree, Tz or not)
+                    scale = math.hypot(fsm.c, fsm.d)
                 else:
                     axes[addr] = (1.0, 0.0, 0.0, 1.0)
+                    scale = 1.0
+                size = fs * scale if _finite(fs) else 0.0
+                if not size or abs(size) > _COORD:
+                    # no usable font size: the loose box's extent across the line stands in
+                    ux, uy = axes[addr][2:]
+                    size = (right - left) * abs(ux) + (top - bottom) * abs(uy)
+                sizes[addr] = size
             dx, dy, ux, uy = axes[addr]
-            # the loose box projected on the text direction (where the advance ends) and on the
-            # glyph's up (the size)
+            size = sizes[addr]
+            # the loose box gives the geometry only: projected on the text direction, where the
+            # advance ends
             start = x * dx + y * dy
             end = (right * dx if dx >= 0 else left * dx) + (top * dy if dy >= 0 else bottom * dy)
             base = x * ux + y * uy
-            size = (right - left) * abs(ux) + (top - bottom) * abs(uy)
             if run is not None:
-                tol = LINE_TOLERANCE * max(size, run["size"])
+                tol = LINE_TOLERANCE * max(abs(size), abs(run["size"]))
                 if run["addr"] != addr or abs(base - run["base"]) > tol or start < run["end"] - tol:
                     flush()
             if run is None:
@@ -370,7 +391,6 @@ class PdfiumDoc:
             run["offsets"].append(start - run["start"])
             run["text"].append(ch)
             run["end"] = max(end, start)
-            run["size"] = max(run["size"], size)
             run["obj"], run["invisible"], run["font"] = objects[addr], modes[addr], fonts[addr]
             if not ch.isspace():
                 seen += 1
@@ -386,7 +406,7 @@ class PdfiumDoc:
         text = "".join(run["text"])
         width = max(0.0, run["end"] - run["start"])
         return Fragment(x=run["x"], y=run["y"], width=width, size=run["size"], text=text,
-                        space_width=0.25 * run["size"], order=order, dir_x=run["dx"],
+                        space_width=0.25 * abs(run["size"]), order=order, dir_x=run["dx"],
                         dir_y=run["dy"], up_x=run["ux"], up_y=run["uy"],
                         char_offsets=tuple(run["offsets"]) + (width,), char_gaps=tuple(run["gaps"]),
                         invisible=run["invisible"], font=run["font"], obj=run["obj"])
@@ -607,8 +627,11 @@ class PdfiumDoc:
         if total > annotations.PDF_ANNOTS:
             cut["annotation"] += 1
             total = annotations.PDF_ANNOTS
-        form = self._pdf.formenv.raw if self._pdf.formenv else None
-        items, fields, done = [], [], set()
+        # the widget walk reads fields only when native could not open the file
+        native = self.native
+        form = self._pdf.formenv.raw if self._pdf.formenv and native is None else None
+        items, done = [], set()
+        fields = list(native.fields.get(index, [])) if native is not None else []
         for k in range(max(0, total)):
             annot = raw.FPDFPage_GetAnnot(handle, k)
             if not annot:

@@ -36,9 +36,9 @@ PY = _interpreter()
 
 
 def run(data, **opts):
-    """The child's JSON line for the pdf `data`; opts are patch, pages and hidden."""
+    """The child's JSON line for the pdf `data`; opts are patch, pages, hidden and engine (pdfium)."""
     arg = json.dumps({"patch": opts.get("patch", {}), "pages": opts.get("pages"),
-                      "hidden": bool(opts.get("hidden"))})
+                      "hidden": bool(opts.get("hidden")), "engine": opts.get("engine")})
     r = subprocess.run([str(PY), "-I", "-X", "utf8", str(RUN), arg], input=data,
                        capture_output=True, timeout=300)
     err = r.stderr.decode("utf-8", "replace")
@@ -203,6 +203,40 @@ def test_pdfium_fields():
     assert "> Field Name: Kim" in md and "> Field Agree: Yes" in md, md
     assert "Empty" not in md and md.index("Body text") < md.index("> Field Name"), md
     assert not got["skipped"], got["skipped"]
+
+
+def test_pdfium_field_without_widget():
+    # a field with no widget is in /AcroForm /Fields only: native lists it on page 1, and so must pdfium
+    objects = acroform([{"T": "Lonely", "FT": Name("Tx"), "V": "Solo"}])
+    data = simple_pdf([text_ops("First page"), text_ops("Second page")], catalog={"AcroForm": Ref(200)},
+                      extra_objects=objects)
+    got, native = run(data), run(data, engine="native")
+    assert native["md"].count("> Field Lonely: Solo") == 1, native["md"]
+    assert got["md"] == native["md"], (got["md"], native["md"])
+    md = got["md"]
+    assert md.index("First page") < md.index("> Field Lonely") < md.index("## Page 2"), md
+    assert got["meta"]["engine"] == "pdfium", got["meta"]
+
+
+def _sizes_page():
+    return b" ".join([text_ops("Line one", y=700), text_ops("Line two", y=680), text_ops("Line three", y=660),
+                      text_ops("Small", y=600, size=0.5),
+                      b"BT /F1 1 Tf 12 0 0 12 72 560 Tm (Matrix words) Tj ET",
+                      text_ops("Narrow words", y=520, extra=b"50 Tz")])
+
+
+def test_pdfium_font_size():
+    # Fragment.size is the font size in device units, as native has it: 12 pt lines 20 pt apart are
+    # three paragraphs, a 0.5 pt line is tiny, and a 1 Tf line under a 12 Tm (or a 50 Tz line) is not
+    data = simple_pdf([_sizes_page()])
+    got, native = run(data), run(data, engine="native")
+    assert got["md"] == native["md"], (got["md"], native["md"])
+    md = got["md"]
+    assert md.splitlines()[0] == "(1 hidden places left out)", md
+    paras = [p.strip() for p in md.split("\n\n") if p.strip()]
+    for line in ("Line one", "Line two", "Line three", "Matrix words", "Narrow words"):
+        assert line in paras, (line, paras)
+    assert "Small" not in md and "(hidden) Small" in run(data, hidden=True)["md"], md
 
 
 def test_pdfium_comments():
