@@ -1360,8 +1360,9 @@ def ppt_current_user(edit_offset, *, encrypted=False, name=b"user"):
     return oa_record(0x0FF6, body + bytes(name) + struct.pack("<I", 8))
 
 
-def _ppt_encrypt(stream, pic_stream, offsets, pid_crypt, password):
-    """(PowerPoint Document, Pictures) with the persist objects and BLIPs RC4 CryptoAPI encrypted, 128-bit keys:
+def _ppt_encrypt(stream, pic_stream, objects, pid_crypt, password):
+    """(PowerPoint Document, Pictures) with the persist objects and BLIPs RC4 CryptoAPI encrypted, 128-bit keys;
+    `objects` is every (persist id, offset) written, the older edits' copies too (they keep their id as the block):
     key(block) = SHA-1(SHA-1(salt + UTF-16LE password) + block as u32)[:16], salt = bytes(range(16)) as in rc4_header."""
     from reader.containers.crypto import rc4
     base = hashlib.sha1(bytes(range(16)) + password.encode("utf-16le")).digest()
@@ -1370,7 +1371,7 @@ def _ppt_encrypt(stream, pic_stream, offsets, pid_crypt, password):
         return hashlib.sha1(base + struct.pack("<I", block)).digest()[:16]
 
     out = bytearray(stream)
-    for pid, at in offsets.items():
+    for pid, at in objects:
         if pid == pid_crypt:
             continue
         size = 8 + struct.unpack_from("<I", stream, at + 4)[0]
@@ -1414,12 +1415,12 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     added to the SLWT after the body, when outline is true) and shapes (below). Paragraphs are joined with \\r;
     \\x0b stays as written. notes: {slide number from 1: text}, NotesContainers listed in SlideListWithText instance 2
     (SlidePersistAtom slideId = the slide's slideId + 0x1000, which the SlideAtom's notesIdRef carries; NotesAtom
-    slideIdRef = the slide's slideId). master_text goes in the MainMaster. edits > 1 appends edits - 1 more
+    slideIdRef = the slide's slideId). master_text goes in the MainMaster (None: a master with no text). edits > 1 appends edits - 1 more
     PersistDirectoryAtom + UserEditAtom pairs chained through lastEdit; each remaps slide 1 to a fresh copy.
     encrypt (any string, the password): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist
     object holding an RC4 CryptoAPI EncryptionVersionInfo (rc4_header(password), 128-bit; clear) and the UserEditAtom's
-    encryptSessionPersistIdRef. Every other persist object of the newest edit is RC4-encrypted whole (header and body)
-    with block = its persist id; the CryptSession, UserEditAtom, PersistDirectoryAtom and Current User stay clear. The
+    encryptSessionPersistIdRef. Every other persist object, the older edits' copies too, is RC4-encrypted whole (header
+    and body) with block = its persist id; the CryptSession, UserEditAtom, PersistDirectoryAtom and Current User stay clear. The
     Pictures stream is encrypted BLIP by BLIP: the 8-byte header, each UID, the tag or metafile header and the image
     data are separate fields, each restarting the keystream at block 0 ([MS-OFFCRYPTO] / dochan crypto/ppt.py). The
     encryption here is written out on its own (its own key derivation), not by running the reader's unlock backwards.
@@ -1450,9 +1451,10 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
 
     Returns a dict: doc, master (persist ids), slides (persist ids in order), slide_ids, notes ({slide number:
     persist id}), crypt (persist id or None), offsets ({persist id: offset} as the newest edit sees them),
-    slide1_offsets ((first, last) offset of slide 1), slots ({persist id: stream offset of the u32 holding that id's
-    offset in the newest directory naming it; patch it to move or break one object}), user_edits and directories (offsets in the PowerPoint Document
-    stream, oldest first), doc_stream and current_user (the stream bytes)."""
+    slide1_offsets ((first, last) offset of slide 1), slots ({persist id: stream offset of the u32 holding that
+    id's offset in the newest directory naming it; patch it to move or break one object}), user_edits and
+    directories (offsets in the PowerPoint Document stream, oldest first), doc_stream and current_user (the stream
+    bytes)."""
     raw_shapes = dict(raw_shapes or {})
     notes = dict(notes or {})
     n = len(slides)
@@ -1531,15 +1533,19 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         doc_parts.append(slide_list(2, [ppt_slide_persist(pid_notes[num], notes_slide_id[num]) for num in sorted(notes)]))
     stream, offsets = bytearray(), {}
 
+    written = []  # (persist id, offset) of every persist object, older edits' copies included
+
     def put(pid, record):
         at = len(stream)
         if pid is not None:
             offsets[pid] = at
+            written.append((pid, at))
         stream.extend(record)
         return at
 
     put(pid_doc, oa_container(0x03E8, *doc_parts))
-    put(pid_master, oa_container(0x03F8, ppt_slide_atom(0, 0), ppt_drawing(ppt_textbox(1025, ppt_text(0, master_text)))))
+    master = [ppt_drawing(ppt_textbox(1025, ppt_text(0, master_text)))] if master_text is not None else []
+    put(pid_master, oa_container(0x03F8, ppt_slide_atom(0, 0), *master))
     for k in range(n):
         put(pid_slides[k], slide_record(k))
     for num in sorted(notes):
@@ -1555,6 +1561,7 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         changed = dict(offsets) if e == 0 else {}
         if e and n:
             offsets[pid_slides[0]] = changed[pid_slides[0]] = put(None, slide_record(0))
+            written.append((pid_slides[0], offsets[pid_slides[0]]))
         rel = {}
         directories.append(put(None, ppt_directory(changed, rel)))
         slots.update({p: directories[-1] + r for p, r in rel.items()})
@@ -1562,7 +1569,7 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         user_edits.append(last)
     cu = ppt_current_user(last, encrypted=encrypt is not None)
     if encrypt is not None:
-        stream, pic_stream = _ppt_encrypt(stream, pic_stream, offsets, pid_crypt, encrypt)
+        stream, pic_stream = _ppt_encrypt(stream, pic_stream, written, pid_crypt, encrypt)
     streams = {"PowerPoint Document": bytes(stream), "Current User": cu}
     if not no_pictures_stream:
         streams["Pictures"] = bytes(pic_stream)

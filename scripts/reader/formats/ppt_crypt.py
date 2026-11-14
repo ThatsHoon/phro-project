@@ -14,7 +14,7 @@ from ..containers import crypto, officecrypt
 from ..limits import ReadError
 from . import ppt_records as rec
 
-MAX_OBJECTS = 100_000
+MAX_OBJECTS = 100_000  # over it the file is `too_large`, named: a ReadError beats dochan's silent failure
 # BLIP record type -> the instance values that carry one UID (and +1 two), as in [MS-ODRAW]
 _BLIPS = {0xF01A: (0x3D4,), 0xF01B: (0x216,), 0xF01C: (0x542,), 0xF01D: (0x46A, 0x6E2), 0xF01E: (0x6E0,),
           0xF01F: (0x7A8,), 0xF029: (0x6E4,), 0xF02A: (0x6E2,)}
@@ -25,9 +25,12 @@ def unlock(doc: bytes, persist: rec.Persist, pictures: bytes | None) -> tuple[by
     """(Document stream, Pictures stream) decrypted with the default password; None when it does not verify.
 
     Raises ReadError("encrypted") for a missing or unknown (non-RC4) CryptSession and ReadError("too_large") over
-    `limits.DECRYPT_BYTES`. A persist entry that leaves the stream or overlaps an object already taken is skipped and
-    its bytes stay as they were, so its record fails to parse later and is counted there. A Pictures stream comes back
-    decrypted up to the first record that is not a clean BLIP; the images behind it are counted rather than lost whole.
+    `limits.DECRYPT_BYTES`, or over MAX_OBJECTS persist objects (dochan fails on such a file; this reader names the
+    cause). A persist entry that leaves the stream or overlaps an object already taken is skipped and removed from
+    `persist.objects`, so that persist id is missing as it would be for an id the directory never listed: the reader
+    never reads a record out of another object's bytes through it, and the object it stood for is counted where it is
+    wanted (a slide under `slide`). A Pictures stream comes back decrypted up to the first record that is not a clean
+    BLIP; the images behind it are counted rather than lost whole.
     """
     for name, stream in (("PowerPoint Document", doc), ("Pictures", pictures)):
         if stream and len(stream) > limits.DECRYPT_BYTES:
@@ -46,16 +49,21 @@ def unlock(doc: bytes, persist: rec.Persist, pictures: bytes | None) -> tuple[by
 
 
 def _objects(doc: bytes, persist: rec.Persist, keys) -> bytes:
+    """`doc` with every persist object decrypted; the entries of `persist.objects` that cannot be are removed."""
     if len(persist.objects) > MAX_OBJECTS:
         raise ReadError("too_large", "persist objects")
     out = bytearray(doc)
     taken, total = 0, 0  # end of the last object taken: entries go by offset, so an overlap starts before it
     for at, pid in sorted((at, pid) for pid, at in persist.objects.items()):
-        if pid == persist.crypt_ref or at < taken or at + 8 > len(doc):
+        if pid == persist.crypt_ref:
+            continue
+        if at < taken or at + 8 > len(doc):
+            del persist.objects[pid]
             continue
         key = keys(pid)
         size = struct.unpack_from("<I", crypto.rc4(key, doc[at:at + 8]), 4)[0] + 8
         if size > len(doc) - at:
+            del persist.objects[pid]
             continue
         total += size
         if total > limits.DECRYPT_BYTES:
