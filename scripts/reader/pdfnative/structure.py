@@ -6,7 +6,7 @@ header, is rebuilt by scanning for `N G obj`.
 """
 import bisect
 import re
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..limits import ReadError
@@ -21,9 +21,6 @@ MAX_RESOLVE_DEPTH = 32
 MAX_TREE_DEPTH = 64
 HEADER_WINDOW = 1024  # the %PDF- header may sit this far into the file
 _SCAN_ROOT_LIMIT = 10_000
-# Form XObjects decode under their own budget, so a big drawing form does not use up the
-# body budget and lose the pages after it.
-MAX_FORM_TOTAL_DECODED = 200 * 1024 * 1024
 # Image samples must not consume the body budget or pile up in its cache.
 MAX_IMAGE_DECODED_CACHE = 50 * 1024 * 1024
 MAX_IMAGE_CACHE_ENTRIES = 128
@@ -42,16 +39,23 @@ class PDFFile:
     def __init__(self, data: bytes, password: str = ""):
         self.password = password
         header = data.find(b"%PDF-", 0, HEADER_WINDOW + 5)
-        if header > 0:
-            data = data[header:]  # offsets in the file count from the header
+        self._whole = data
+        self._junk = header > 0
+        if self._junk:
+            # Offsets count from the header first (what PDFium and pdf.js do); ISO 32000
+            # counts from byte 0, which _parse_structure tries when the first reading fails.
+            data = data[header:]
         self.data = data
+        # Content that a cap dropped, by cap: collection, tree_depth, pages, objects,
+        # xref_sections, objstm.
+        self.cuts: Counter = Counter()
         self.warnings: List[str] = []
         self.trailer: Dict[str, Any] = {}
         self.xref: Dict[int, Optional[int]] = {}  # object number -> offset (None = deleted)
         self.recovered = False  # the xref was rebuilt by scanning for objects
         self.budget = DecodeBudget()
-        self._form_budget = DecodeBudget(MAX_FORM_TOTAL_DECODED)
-        self._image_budget = DecodeBudget()
+        self._nest = 0
+        self._pages: Optional[list] = None
         self._cache: Dict[int, Any] = {}
         self._rescanned = False
         self._decoded_cache: Dict[int, Tuple[PDFStream, bytes]] = {}
@@ -66,7 +70,7 @@ class PDFFile:
         self._parse_structure()
         if self.trailer.get("Encrypt") is not None:
             raise ReadError("encrypted", "not supported yet")
-        if "Root" not in self.trailer:
+        if not self.catalog:
             raise ReadError("damaged", "no catalog")
 
     # -- structure --
@@ -74,9 +78,34 @@ class PDFFile:
     def _parse_structure(self) -> None:
         start = self._find_startxref()
         ok = start is not None and self._parse_xref_chain(start)
+        if (not ok or "Root" not in self.trailer) and self._junk:
+            stripped = self.data
+            self._reset()
+            self.data = self._whole
+            start = self._find_startxref()
+            ok = start is not None and self._parse_xref_chain(start)
+            if not ok or "Root" not in self.trailer:
+                self._reset()
+                self.data = stripped
+                ok = False
         if not ok or "Root" not in self.trailer:
             self._rescanned = True  # a file recovered by scanning is not scanned again
             self._scan_objects()
+
+    def _reset(self) -> None:
+        self.trailer = {}
+        self.xref = {}
+        self._compressed = {}
+        self._cache = {}
+        self._objstm_cache = {}
+
+    def _cut(self, key: str, message: str) -> None:
+        self.cuts[key] += 1
+        self._warn_once(message)
+
+    def _warn_once(self, message: str) -> None:
+        if message not in self.warnings:
+            self.warnings.append(message)
 
     def _find_startxref(self) -> Optional[int]:
         tail = self.data[-2048:]
@@ -118,8 +147,8 @@ class PDFFile:
             prev = trailer.get("Prev")
             current = prev if isinstance(prev, int) and prev >= 0 else None
         if current is not None and current not in seen:
-            self.warnings.append(
-                f"WARN: more than {MAX_XREF_SECTIONS} xref sections; older revisions are ignored")
+            self._cut("xref_sections",
+                      f"WARN: more than {MAX_XREF_SECTIONS} xref sections; older revisions are ignored")
         return True
 
     def _parse_xref_table(self, lexer: PDFLexer) -> Optional[dict]:
@@ -221,7 +250,7 @@ class PDFFile:
             self.xref[int(match.group(1))] = match.start()
             count += 1
             if count > MAX_OBJECTS:
-                self.warnings.append("WARN: object count passed the cap; parsing part of the file")
+                self._cut("objects", "WARN: object count passed the cap; parsing part of the file")
                 break
         self._recover_trailers()
         objstm_warning = ("WARN: scan recovery does not find objects inside object streams "
@@ -302,6 +331,16 @@ class PDFFile:
     def get_object(self, ref: PDFRef) -> Any:
         if ref.num in self._cache:
             return self._cache[ref.num]
+        # A stream /Length that names another stream nests get_object once per object.
+        if self._nest >= MAX_RESOLVE_DEPTH:
+            return None
+        self._nest += 1
+        try:
+            return self._get_object(ref)
+        finally:
+            self._nest -= 1
+
+    def _get_object(self, ref: PDFRef) -> Any:
         offset = self.xref.get(ref.num)
         if offset is None:
             if ref.num in self._compressed:
@@ -313,7 +352,8 @@ class PDFFile:
         recovered = []
         try:
             num, _gen, obj = parse_indirect_object(
-                self.data, offset, resolve=self.resolve, recovered=recovered)
+                self.data, offset, resolve=self.resolve, recovered=recovered,
+                cuts=self.cuts)
         except PDFSyntaxError as e:
             if not self._rescanned and not _HEADER_AT_RE.match(self.data, offset):
                 # A stale offset that lands on no object header gets the same scan recovery
@@ -332,6 +372,8 @@ class PDFFile:
                 return self.get_object(ref)
             self.warnings.append(f"WARN: object {ref.num} offset names object {num}")
             return None
+        if self.cuts["collection"]:
+            self._warn_once("WARN: a collection passed its item cap or nesting cap; content was dropped")
         if recovered:
             self.warnings.append(f"WARN: object {ref.num}: skipped an unbalanced ')' after a string")
         self._cache[ref.num] = obj
@@ -375,7 +417,9 @@ class PDFFile:
         if not data or not isinstance(n, int) or not isinstance(first, int) \
                 or n < 0 or n > MAX_OBJECTS or first < 0:
             return empty
-        pairs = parse_object_stream(data, n, first)
+        pairs = parse_object_stream(data, n, first, self.cuts)
+        if self.cuts["collection"] or self.cuts["objstm"]:
+            self._warn_once("WARN: an object stream passed a cap; content was dropped")
         result = (pairs, {num: obj for num, obj in reversed(pairs)})
         self._objstm_cache[objstm_num] = result
         return result
@@ -398,7 +442,7 @@ class PDFFile:
         return out
 
     def decode_image_bytes(self, stream: PDFStream) -> bytes:
-        """Decode image samples under their own budget, with a small bounded cache."""
+        """Decode image samples under the document budget, with a small bounded cache."""
         key = id(stream)
         cached = self._image_decoded_cache.get(key)
         if cached is not None:
@@ -406,7 +450,7 @@ class PDFFile:
                 self._image_decoded_cache.move_to_end(key)
                 return cached[1]
             self._image_cached_bytes -= len(self._image_decoded_cache.pop(key)[1])
-        out = decode_stream(stream.dictionary, stream.raw, self.warnings, self._image_budget)
+        out = decode_stream(stream.dictionary, stream.raw, self.warnings, self.budget)
         # Repeated small images stay cheap without keeping every page's pixels.
         if out and len(out) <= MAX_IMAGE_DECODED_CACHE:
             while self._image_decoded_cache and (
@@ -419,16 +463,16 @@ class PDFFile:
         return out
 
     def decode_form_bytes(self, stream: PDFStream) -> Optional[bytes]:
-        """Decode a Form XObject under its own budget; None when it is spent or the form was cut.
+        """Decode a Form XObject under the document budget; None when it is spent or the form was cut.
 
         A content stream cut in the middle breaks its operators, so a form that hits a cap
         is skipped whole. The caller asks once per stream, so nothing is cached here.
         """
-        if self._form_budget.total <= 0:
+        if self.budget.total <= 0:
             return None
-        cuts = self._form_budget.cuts
-        out = decode_stream(stream.dictionary, stream.raw, self.warnings, self._form_budget)
-        if self._form_budget.cuts != cuts:
+        cuts = self.budget.cuts
+        out = decode_stream(stream.dictionary, stream.raw, self.warnings, self.budget)
+        if self.budget.cuts != cuts:
             return None
         return out
 
@@ -448,11 +492,18 @@ class PDFFile:
                 if getattr(self.trailer.get("Root"), "num", None) != getattr(declared, "num", None):
                     self.warnings.append("WARN: trailer Root is not a catalog; using a scanned catalog")
                     root = self.resolve(self.trailer.get("Root"))
+                else:
+                    root = None  # no catalog anywhere
             self._catalog = root if isinstance(root, dict) else {}
         return self._catalog
 
     def pages(self) -> List[Tuple[dict, dict]]:
         """The pages in document order: (page dict, inherited Resources/MediaBox/CropBox/Rotate)."""
+        if self._pages is None:
+            self._pages = self._collect_pages()
+        return self._pages
+
+    def _collect_pages(self) -> List[Tuple[dict, dict]]:
         root = self.catalog
         if not root:
             self.warnings.append("WARN: pdf catalog (Root) not found")
@@ -465,12 +516,11 @@ class PDFFile:
         self._walk_pages(pages_root, {}, result, set(), 0)
         if not result:
             self.warnings.append("WARN: no pages found")
-        elif len(result) >= MAX_PAGES:
-            self.warnings.append(f"WARN: page count passed the cap ({MAX_PAGES}); parsing part of the file")
         return result
 
     def _walk_pages(self, node: dict, inherited: dict, result, visited, depth) -> None:
-        if depth > MAX_TREE_DEPTH or len(result) >= MAX_PAGES:
+        if depth > MAX_TREE_DEPTH:
+            self._cut("tree_depth", f"WARN: page tree is deeper than {MAX_TREE_DEPTH}; pages below are dropped")
             return
         node_id = id(node)
         if node_id in visited:
@@ -492,5 +542,8 @@ class PDFFile:
                 kid = self.resolve(kid_ref)
                 if isinstance(kid, dict):
                     self._walk_pages(kid, effective, result, visited, depth + 1)
+            return
+        if len(result) >= MAX_PAGES:
+            self._cut("pages", f"WARN: page count passed the cap ({MAX_PAGES}); the rest are dropped")
             return
         result.append((node, effective))

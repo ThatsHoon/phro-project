@@ -111,8 +111,9 @@ def make_pdf(objects, *, root=1, xref="table", objstm=False, trailer=None,
     """Serialize `objects` ({number: value}) to a pdf.
 
     xref: "table" (classic), "stream" (a cross-reference stream) or "none" (no xref and no
-    trailer, so a reader must scan). Offsets are true and count from the header, as the
-    format says, unless `shift` moves every xref entry by that many bytes. `junk` goes before
+    trailer, so a reader must scan). Offsets are true and count from the header (readers try
+    that first; ISO 32000 counts from byte 0, which differs only when `junk` precedes the
+    header) unless `shift` moves every xref entry by that many bytes. `junk` goes before
     the header. With objstm=True every object other than streams and the root goes into one
     object stream; that needs xref="stream".
     """

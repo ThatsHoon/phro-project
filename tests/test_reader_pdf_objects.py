@@ -350,6 +350,90 @@ def test_pdf_obj_round_trip():
     assert back == {"A": [1, 2.5, True, None, b"\x00\xff", b"a(b)\\"], "N": PDFName("x y"),
                     "R": PDFRef(4, 0)}
 
+def test_length_chain_no_recursion():
+    objs = {1: {"Type": Name("Catalog"), "Pages": Ref(2)},
+            2: {"Type": Name("Pages"), "Kids": [], "Count": 0}}
+    for n in range(3, 3003):
+        objs[n] = Stream({"Length": Ref(n + 1)}, b"x")
+    objs[3003] = 1
+    pf = PDFFile(make_pdf(objs))
+    pf.get_object(PDFRef(3, 0))  # no RecursionError
+
+
+def deep_tree(levels):
+    objs = {1: {"Type": Name("Catalog"), "Pages": Ref(2)}}
+    for n in range(2, 2 + levels):
+        objs[n] = {"Type": Name("Pages"), "Kids": [Ref(n + 1)], "Count": 1}
+    objs[2 + levels] = {"Type": Name("Page")}
+    return make_pdf(objs)
+
+
+def test_caps_are_counted():
+    pf = PDFFile(simple_pdf([text_ops("Hi")]))
+    assert not pf.cuts and not any("cap" in w for w in pf.warnings)
+    # a collection past the item cap, in a plain object and inside an object stream
+    big = [1] * (MAX_COLLECTION_ITEMS + 1)
+    pf = PDFFile(simple_pdf([text_ops("Hi")], page_extra={"Big": big}))
+    pf.pages()
+    assert pf.cuts["collection"] == 1 and any("cap" in w for w in pf.warnings)
+    pf = PDFFile(simple_pdf([text_ops("Hi")], xref="stream", objstm=True, page_extra={"Big": big}))
+    pf.pages()
+    assert pf.cuts["collection"] == 1
+    # a page tree deeper than MAX_TREE_DEPTH drops its page
+    pf = PDFFile(deep_tree(structure.MAX_TREE_DEPTH + 5))
+    assert pf.pages() == [] and pf.cuts["tree_depth"] == 1
+    assert len(PDFFile(deep_tree(10)).pages()) == 1
+
+
+def test_pages_cap_only_when_dropped():
+    old = structure.MAX_PAGES
+    structure.MAX_PAGES = 3
+    try:
+        pf = PDFFile(simple_pdf([b"", b"", b""]))
+        assert len(pf.pages()) == 3 and not pf.cuts["pages"]
+        assert not any("page count" in w for w in pf.warnings)
+        pf = PDFFile(simple_pdf([b"", b"", b"", b""]))
+        assert len(pf.pages()) == 3 and pf.cuts["pages"] == 1
+        assert any("page count" in w for w in pf.warnings)
+    finally:
+        structure.MAX_PAGES = old
+
+
+def test_one_budget_for_content_form_and_image():
+    pf = PDFFile(simple_pdf([text_ops("Hi")]))
+    pf.budget.total = 1500
+    body = pf.decode_stream_bytes(PDFStream(flate(), zlib.compress(bytes(1000))))
+    image = pf.decode_image_bytes(PDFStream(flate(), zlib.compress(bytes(1000))))
+    assert len(body) == 1000 and len(image) == 500 and pf.budget.cuts == 1
+    assert pf.decode_form_bytes(PDFStream(flate(), zlib.compress(bytes(10)))) is None
+
+
+def byte0_junk_pdf(**kw):
+    d = simple_pdf([text_ops("Hi")], shift=100, **kw)
+    i = d.rfind(b"startxref") + 10
+    j = d.index(b"\n", i)
+    return b"x" * 100 + d[:i] + str(int(d[i:j]) + 100).encode() + d[j:]
+
+
+def test_junk_with_byte0_offsets():
+    pf = PDFFile(byte0_junk_pdf(xref="stream", objstm=True))
+    assert len(pf.pages()) == 1 and pf.recovered is False
+    assert page_text(pf) == text_ops("Hi")
+    pf = PDFFile(byte0_junk_pdf())
+    assert len(pf.pages()) == 1 and pf.recovered is False
+
+
+def test_root_not_a_catalog_is_damaged():
+    objs = {1: {"Type": Name("Catalog"), "Pages": Ref(2)}, 2: {"Type": Name("Pages"), "Kids": []}}
+    pdf = make_pdf(objs, root=2)
+    pdf = pdf.replace(b"/Type /Catalog", b"/Type /Other  ")
+    try:
+        PDFFile(pdf)
+    except ReadError as e:
+        assert (e.kind, e.detail) == ("damaged", "no catalog")
+    else:
+        raise AssertionError("expected ReadError")
+
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 

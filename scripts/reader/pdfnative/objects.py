@@ -6,6 +6,7 @@ Differences from dochan: collections past MAX_COLLECTION_ITEMS drop their extra 
 set the lexer's `cut` flag instead of failing; nesting is capped at limits.MAX_DEPTH;
 parse_object_stream returns the parsed objects.
 """
+from collections import Counter
 from dataclasses import dataclass
 import re
 from typing import Any, Callable, List, Optional, Tuple
@@ -329,12 +330,14 @@ def parse_indirect_object(
     offset: int,
     resolve: Optional[Callable[[PDFRef], Any]] = None,
     recovered: Optional[list] = None,
+    cuts: Optional[Counter] = None,
 ) -> Tuple[int, int, Any]:
     """Parse `num gen obj ... endobj`.
 
     resolve: turns an indirect stream /Length into an int. A wrong or missing /Length is
     corrected by searching for `endstream`.
     recovered: gets the count of skipped unbalanced ")" appended when there are any.
+    cuts: a Counter; `collection` grows by 1 when the object dropped items or nesting.
     """
     lexer = PDFLexer(data, offset)
     lexer.skip_whitespace()
@@ -345,7 +348,11 @@ def parse_indirect_object(
     obj_tok = lexer.read_token()
     if not num_tok.isdigit() or not gen_tok.isdigit() or obj_tok != b"obj":
         raise PDFSyntaxError(f"offset {offset}: not an indirect object header")
-    obj = lexer.parse_object()
+    try:
+        obj = lexer.parse_object()
+    finally:
+        if cuts is not None and lexer.cut:
+            cuts["collection"] += 1
     if recovered is not None and lexer.stray_closers:
         recovered.append(lexer.stray_closers)
     lexer.skip_whitespace()
@@ -366,13 +373,16 @@ def parse_indirect_object(
     return int(num_tok), int(gen_tok), obj
 
 
-def parse_object_stream(data: bytes, n: int, first: int) -> List[Tuple[int, Any]]:
+def parse_object_stream(data: bytes, n: int, first: int,
+                        cuts: Optional[Counter] = None) -> List[Tuple[int, Any]]:
     """The `(object number, object)` pairs of an object stream's decoded bytes.
 
     The header holds n pairs of (object number, offset from `first`). An object that fails
     to parse is left out. Objects of an honest stream do not overlap, so the bytes parsed
     in total are capped at twice the stream plus a small floor: offsets that all name one
     big object cannot multiply the work.
+    cuts: a Counter; `collection` counts objects that dropped items, `objstm` the objects
+    left unparsed by the work cap.
     """
     header = PDFLexer(data)
     pairs = []
@@ -388,14 +398,22 @@ def parse_object_stream(data: bytes, n: int, first: int) -> List[Tuple[int, Any]
     result = []
     for num, off in pairs:
         start = first + off
-        if start >= len(data) or work <= 0:
+        if start >= len(data):
+            continue
+        if work <= 0:
+            if cuts is not None:
+                cuts["objstm"] += 1
             continue
         lexer = PDFLexer(data, start)
         try:
             obj = lexer.parse_object()
         except PDFSyntaxError:
             work -= max(lexer.pos - start, 1)
+            if cuts is not None and lexer.cut:
+                cuts["collection"] += 1
             continue
         work -= max(lexer.pos - start, 1)
+        if cuts is not None and lexer.cut:
+            cuts["collection"] += 1
         result.append((num, obj))
     return result
