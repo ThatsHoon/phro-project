@@ -260,14 +260,41 @@ def test_shared_strings_element_cap():
 
 
 def test_styles_element_cap():
-    flood = "<xf/>" * 100_000  # with the two xf above, past the styles cap of 100,000 closed elements
+    flood = "<xf/>" * 100_000  # with the two xf above, past a styles cap of 100,000 closed elements
     styles = (f'<styleSheet xmlns="{XLSX_SML}"><cellXfs><xf numFmtId="0"/><xf numFmtId="10"/>{flood}</cellXfs>'
               "</styleSheet>")
     rows = xlsx_row(1, xlsx_cell("A1", 0.5, s=1), xlsx_cell("B1", 2))
-    doc, ctx, secs = parsed([sheet(rows)], xfs=[0], extra_parts={"xl/styles.xml": styles})
+    with patched("STYLE_ELEMENTS", 100_000, ooxml_sheets):
+        doc, ctx, secs = parsed([sheet(rows)], xfs=[0], extra_parts={"xl/styles.xml": styles})
     out = markdown.render(doc, Path(tempfile.gettempdir()) / "unused-assets", False, ctx.skipped)
     assert "|50.00%|2|" in out and ctx.skipped["document"] == 1 and secs < 2.0, (out, ctx.skipped, secs)
     assert "(could not read: 1 document part)" in out, out
+
+
+def bloated_styles(n, after=""):
+    """A styles part whose `cellStyleXfs` holds n style xfs (three closes each) ahead of `cellXfs`; xf 1 is yyyy-mm-dd."""
+    style_xfs = "".join(f'<xf numFmtId="0" fontId="{i % 977}" applyAlignment="1"><alignment vertical="center"/>'
+                        f'<protection locked="{i % 2}"/></xf>' for i in range(n))
+    return (f'<styleSheet xmlns="{XLSX_SML}"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd"/>'
+            f'</numFmts><cellStyleXfs count="{n}">{style_xfs}</cellStyleXfs>'
+            f'<cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="164" applyNumberFormat="1"/></cellXfs>{after}'
+            '</styleSheet>')
+
+
+def test_bloated_cell_style_xfs_keep_formats():
+    # 64,000 style xfs (about Excel's format limit) close 192,000 elements before `cellXfs` is reached
+    rows = xlsx_row(1, xlsx_cell("A1", 45231, s=1))
+    out, ctx = md([sheet(rows)], extra_parts={"xl/styles.xml": bloated_styles(64_000)})
+    assert "2023-11-01" in out and "45231" not in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_styles_stop_after_cell_xfs():
+    # what follows `cellXfs` is never used: it is not read, so it cannot reach the cap
+    rows = xlsx_row(1, xlsx_cell("A1", 45231, s=1))
+    tail = "<dxfs>" + "<dxf/>" * 500 + "</dxfs>"
+    with patched("STYLE_ELEMENTS", 100, ooxml_sheets):
+        out, ctx = md([sheet(rows)], extra_parts={"xl/styles.xml": bloated_styles(10, tail)})
+    assert "2023-11-01" in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def test_styles_damaged_counts_document():

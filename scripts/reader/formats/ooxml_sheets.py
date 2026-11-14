@@ -53,7 +53,9 @@ _ESC = re.compile(r"_x([0-9A-Fa-f]{4})_")
 _SURROGATE = re.compile("[\ud800-\udfff]")
 _HIDDEN = frozenset({"hidden", "veryHidden"})
 SST_ELEMENTS = 2  # times SHEET_SCAN: the elements a shared-strings part may close (SHEET_SCAN plain si/t entries fit)
-STYLE_ELEMENTS = 100_000  # elements a styles part may close; a real one closes tens of thousands at most
+# elements a styles part may close before `cellXfs` ends (the read stops there): a style-bloated workbook near Excel's
+# format limit (about 64,000 xfs of up to three closes in `cellStyleXfs` and again in `cellXfs`) fits with room
+STYLE_ELEMENTS = 1_000_000
 # the most raw characters one unescaped character can take: a surrogate pair (_xD83D__xDE00_) or an escaped CRLF
 # (_x000D__x000A_), each two 7-character escapes for one character
 _RAW_PER_CHAR = 14
@@ -188,8 +190,9 @@ def _workbook(root, rels, wb, ctx):
 
 
 def _styles(pkg, part, wb, ctx):
-    """`numFmts/numFmt` codes and the `cellXfs/xf` format ids, streamed; `cellStyleXfs` is not read. Past
-    STYLE_ELEMENTS closed elements the part stops, counted under `document`, and what was read is kept."""
+    """`numFmts/numFmt` codes and the `cellXfs/xf` format ids, streamed; `cellStyleXfs` is not read. The read ends
+    with `cellXfs` (by schema order `numFmts` comes before it, and nothing after it is used). Past STYLE_ELEMENTS
+    closed elements the part stops, counted under `document`, and what was read is kept."""
     seen, els, tags, done, names = 0, [], [], [], {}
     with pkg.open(part) as f:
         for ev, el in iterparse(f, ("start", "end")):
@@ -214,6 +217,8 @@ def _styles(pkg, part, wb, ctx):
                         wb.formats[fid] = attr(el, "formatCode") or ""
                 elif name == "xf" and tags[-1] == "cellXfs":
                     wb.xf_fmt.append(_int(attr(el, "numFmtId"), 0))
+                elif name == "cellXfs" and tags[-1] == "styleSheet":
+                    return
             _drop(el, els, done)
 
 

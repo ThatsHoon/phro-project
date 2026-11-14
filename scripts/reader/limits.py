@@ -15,8 +15,8 @@ SHEET_CELLS = 500_000     # cells one document's sheets may materialize
 SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one document's sheets may materialize
 # XML elements one xlsx workbook's sheet parts may close, styled empty cells included, and the entries its shared-string
 # table may hold. ooxml_sheets caps the other streamed parts: the shared strings at SST_ELEMENTS (2) times this many
-# closed elements, the styles at STYLE_ELEMENTS (100,000). Measured: 2,000,000 cells stream in 1.4 s, the whole xlsx
-# reader takes 3.2 s over them, and 6.0 s over the worst case all three caps allow together (test_reader_xlsx measure)
+# closed elements, the styles at STYLE_ELEMENTS (1,000,000). Measured: 2,000,000 cells stream in 1.4 s, the whole xlsx
+# reader takes 3.2 s over them, and 7.1 s over the worst case all three caps allow together (test_reader_xlsx measure)
 SHEET_SCAN = 2_000_000
 GRID_COLS = 1_000        # columns a span may reach in a rendered table
 GRID_SLOTS = 2_000_000    # grid slots all spans of one rendered table may cover
