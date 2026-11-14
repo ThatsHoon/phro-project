@@ -510,6 +510,25 @@ def test_odf_zip_named_rtf_or_doc_goes_to_the_odt_reader():
     assert markdown.render(rtf.parse(p, ctx), tmp() / "assets", False, ctx.skipped) == "odt body\n"
 
 
+def test_long_mimetype_is_not_read_to_route():
+    """A `mimetype` member over 128 bytes is no ODF mimetype, so route never inflates it to pick a parser."""
+    from reader.containers import zipx
+    from reader.formats import zip_route
+    members = {"mimetype": "application/vnd.oasis.opendocument.text" + " " * 200, "[Content_Types].xml": "<Types/>"}
+    reads, real = [], zipx.Package.read
+
+    def spy(pkg, name):
+        reads.append(name)
+        return real(pkg, name)
+    zipx.Package.read = spy
+    try:
+        got = zip_route.route(make_zip(None, members))  # in memory
+        short = zip_route.route(make_zip(None, {"mimetype": "application/vnd.oasis.opendocument.text"}))
+    finally:
+        zipx.Package.read = real
+    assert (got, short, reads) == ("ooxml", "odf", ["mimetype"]), (got, short, reads)
+
+
 def test_zip_and_compound_heads_never_loop_back_to_rtf():
     # a package with neither a Word nor an ODF body, and a compound file of no known format, are refused whatever
     # the extension; neither comes back to rtf.parse

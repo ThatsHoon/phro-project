@@ -156,6 +156,13 @@ class Package:
     def has(self, name) -> bool:
         return self._find(name) is not None
 
+    def size(self, name) -> int:
+        """The uncompressed size the directory gives the member `name`, read without inflating it."""
+        real = self._find(name)
+        if real is None:
+            raise KeyError(name)
+        return self._zip.getinfo(real).file_size
+
     def read(self, name) -> bytes:
         real = self._find(name)
         if real is None:

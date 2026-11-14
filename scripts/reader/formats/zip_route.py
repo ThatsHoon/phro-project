@@ -11,14 +11,15 @@ from ..containers.zipx import Package
 from ..limits import ReadError
 
 _MIME = "application/vnd.oasis.opendocument."
+_MIME_MAX = 128  # bytes; a longer `mimetype` member is no ODF mimetype, and is not inflated to find that out
 
 
 def route(path) -> str:
     """"odf" or "ooxml" for the zip at `path` (a ReadError for a file that is no zip)."""
     with Package(path) as pkg:
-        if pkg.has("mimetype"):
+        if pkg.has("mimetype") and pkg.size("mimetype") <= _MIME_MAX:
             try:
-                mime = pkg.read("mimetype")[:128].decode("utf-8", "replace").strip()
+                mime = pkg.read("mimetype")[:_MIME_MAX].decode("utf-8", "replace").strip()
             except ReadError as e:
                 if e.kind != "damaged":
                     raise  # an encrypted ODF stays encrypted
