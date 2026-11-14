@@ -17,7 +17,8 @@ from reader import limits, markdown  # noqa: E402
 from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader_fix import blip_png, make_ppt  # noqa: E402
+from reader.containers.cfb import Compound  # noqa: E402
+from reader_fix import blip_png, make_cfb, make_ppt  # noqa: E402
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"P" * 24
 SLIDES = [{"title": "Quarterly plan", "body": ["first point", "second point"]},
@@ -43,6 +44,25 @@ def denied(slides=SLIDES, **kw):
     except ReadError as e:
         return e.kind
     raise AssertionError("expected a ReadError")
+
+
+def build_patched(slides, patch, **kw):
+    """Like build, but `patch(info, streams)` edits the stream bytes ({name: bytearray}) before parsing."""
+    d = Path(tempfile.mkdtemp())
+    path = d / "a.ppt"
+    info = make_ppt(path, slides, **kw)
+    with Compound(path) as cf:
+        streams = {n: bytearray(cf.read(n)) for n in ("PowerPoint Document", "Current User", "Pictures")}
+    patch(info, streams)
+    make_cfb(path, streams)
+    ctx = Context()
+    doc = reader.parse(path, ctx)
+    out = markdown.render(doc, d / "assets", False, ctx.skipped)
+    assets = {p.name: p.read_bytes() for p in (d / "assets").glob("*")} if (d / "assets").exists() else {}
+    return out, ctx, assets
+
+
+THREE = [{"title": f"Slide {n}", "body": [f"text {n}"]} for n in (1, 2, 3)]
 
 
 def test_default_password_reads():
@@ -76,6 +96,36 @@ def test_decrypt_cap():
     build(slides, encrypt=PPT_DEFAULT)  # fits the default cap
     with mock.patch.object(limits, "DECRYPT_BYTES", 1000):
         assert denied(slides, encrypt=PPT_DEFAULT) == "too_large"
+
+
+def test_bad_persist_offset_loses_one_slide():
+    def patch(info, streams):
+        struct.pack_into("<I", streams["PowerPoint Document"], info["slots"][info["slides"][1]], 10**7)
+    out, ctx, _ = build_patched(THREE, patch, encrypt=PPT_DEFAULT)
+    assert "Slide 1" in out and "Slide 3" in out and "Slide 2" not in out, out
+    assert "(could not read: 1 slide)" in out, out
+
+
+def test_overlapping_persist_entry_loses_one_slide():
+    def patch(info, streams):
+        at = info["offsets"][info["slides"][2]] + 8
+        struct.pack_into("<I", streams["PowerPoint Document"], info["slots"][info["slides"][1]], at)
+    out, ctx, _ = build_patched(THREE, patch, encrypt=PPT_DEFAULT)
+    assert "Slide 1" in out and "Slide 3" in out and "Slide 2" not in out, out
+    assert "(could not read: 1 slide)" in out, out
+
+
+def test_bad_blip_keeps_earlier_pictures():
+    first = len(blip_png(PNG))
+
+    def patch(info, streams):
+        streams["Pictures"][first + 2] ^= 0xFF  # the second record's type, enciphered
+    shapes = [{"kind": "picture", "pib": 1, "box": (0, 10, 400, 50)},
+              {"kind": "picture", "pib": 2, "box": (0, 200, 400, 300)}]
+    out, ctx, assets = build_patched([{"shapes": shapes}], patch, pictures=[blip_png(PNG), blip_png(PNG + b"Q")],
+                                     encrypt=PPT_DEFAULT)
+    assert assets == {"img-001.png": PNG}, (assets, out)
+    assert "(could not read: 1 image)" in out, out
 
 
 def main():

@@ -24,12 +24,14 @@ _METAFILE = (0xF01A, 0xF01B, 0xF01C)  # their 34-byte metafile header follows th
 def unlock(doc: bytes, persist: rec.Persist, pictures: bytes | None) -> tuple[bytes, bytes | None] | None:
     """(Document stream, Pictures stream) decrypted with the default password; None when it does not verify.
 
-    Raises ReadError("encrypted") for a missing or unknown (non-RC4) CryptSession, ReadError("too_large") over
-    `limits.DECRYPT_BYTES` and ReadError("damaged") for persist objects that leave the stream or overlap. A Pictures
-    stream that is not a run of BLIP records comes back as None, so its images are counted rather than the file lost.
+    Raises ReadError("encrypted") for a missing or unknown (non-RC4) CryptSession and ReadError("too_large") over
+    `limits.DECRYPT_BYTES`. A persist entry that leaves the stream or overlaps an object already taken is skipped and
+    its bytes stay as they were, so its record fails to parse later and is counted there. A Pictures stream comes back
+    decrypted up to the first record that is not a clean BLIP; the images behind it are counted rather than lost whole.
     """
-    if max(len(doc), len(pictures or b"")) > limits.DECRYPT_BYTES:
-        raise ReadError("too_large", "part: PowerPoint Document")
+    for name, stream in (("PowerPoint Document", doc), ("Pictures", pictures)):
+        if stream and len(stream) > limits.DECRYPT_BYTES:
+            raise ReadError("too_large", "part: " + name)
     got = persist.obj(persist.crypt_ref) if persist.crypt_ref else None
     if got is None or got[0] != rec.CRYPT_SESSION10_CONTAINER:
         raise ReadError("encrypted")
@@ -47,44 +49,44 @@ def _objects(doc: bytes, persist: rec.Persist, keys) -> bytes:
     if len(persist.objects) > MAX_OBJECTS:
         raise ReadError("too_large", "persist objects")
     out = bytearray(doc)
-    spans, total = [], 0
-    for pid, at in persist.objects.items():
-        if pid == persist.crypt_ref:
+    taken, total = 0, 0  # end of the last object taken: entries go by offset, so an overlap starts before it
+    for at, pid in sorted((at, pid) for pid, at in persist.objects.items()):
+        if pid == persist.crypt_ref or at < taken or at + 8 > len(doc):
             continue
-        if at < 0 or at + 8 > len(doc):
-            raise ReadError("damaged", "persist object outside the stream")
         key = keys(pid)
         size = struct.unpack_from("<I", crypto.rc4(key, doc[at:at + 8]), 4)[0] + 8
+        if size > len(doc) - at:
+            continue
         total += size
-        if size > len(doc) - at or total > limits.DECRYPT_BYTES:
-            raise ReadError("too_large" if total > limits.DECRYPT_BYTES else "damaged", "persist object size")
-        spans.append((at, at + size))
+        if total > limits.DECRYPT_BYTES:
+            raise ReadError("too_large", "part: PowerPoint Document")
         out[at:at + size] = crypto.rc4(key, doc[at:at + size])
-    spans.sort()
-    if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
-        raise ReadError("damaged", "overlapping persist objects")
+        taken = at + size
     return bytes(out)
 
 
-def _blips(pictures: bytes, key: bytes) -> bytes | None:
+def _blips(pictures: bytes, key: bytes) -> bytes:
+    """The stream decrypted up to the first record that does not frame cleanly (cut off there)."""
     out = bytearray(pictures)
     pos, count = 0, 0
     while pos < len(pictures):
+        start = pos
         count += 1
         if count > MAX_OBJECTS or len(pictures) - pos < 8:
-            return None
+            return bytes(out[:start])
         options, kind, size = struct.unpack("<HHI", crypto.rc4(key, pictures[pos:pos + 8]))
         if kind not in _BLIPS or size > len(pictures) - pos - 8:
-            return None
+            return bytes(out[:start])
         out[pos:pos + 8] = struct.pack("<HHI", options, kind, size)
         end, pos = pos + 8 + size, pos + 8
         instance = options >> 4
         uids = next((1 + instance - base for base in _BLIPS[kind] if instance in (base, base + 1)), 0)
         if not uids:
-            return None
-        for n in [16] * uids + [34 if kind in _METAFILE else 1, end - pos - 16 * uids - (34 if kind in _METAFILE else 1)]:
+            return bytes(out[:start])
+        tag = 34 if kind in _METAFILE else 1
+        for n in [16] * uids + [tag, end - pos - 16 * uids - tag]:
             if n < 0 or pos + n > end:
-                return None
+                return bytes(out[:start])
             out[pos:pos + n] = crypto.rc4(key, pictures[pos:pos + n])
             pos += n
     return bytes(out)
