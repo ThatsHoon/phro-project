@@ -34,10 +34,10 @@
   - `cmap.py` 554, `cid_unicode.py` 203, `widths.py` 77, `core14.py` 119;
   - `content.py` 1,257, `_show_table.py` 227, `annotations.py` 678, `images.py` 75.
 - **Into `pdfnative/fonts.py` and `pdfnative/document.py` (about 600):** `reader.py`'s outline walk (:568-624), link paragraphs (:625-650), form-extractor configuration (:651-767), content parts (:768-793), font assembly (:794-1183) and page images (:1184-1220).
-- **Into `formats/pdf_layout.py` (624):** `layout.py` 178, `spacing.py` 77, `running.py` 175, `headings.py` 194, and `reader.py:85-100` (the size rule).
+- **Into `formats/pdf_layout.py` (430):** `layout.py` 178, `spacing.py` 77, `running.py` 175, and `reader.py:85-100` (the size rule).
 - **Into `formats/pdf_tables.py` (1,179):** `paths.py` 206, `tables.py` 723, `connected_tables.py` 250.
 - **Data (8,002 lines plus 512 KB):** `cid_unicode_data.py` 3,503, `predefined_cmap_data.py` 4,263, `core14_metrics.py` 236, and `korean_spacing.json` (523,906 bytes), which becomes `formats/pdf_spacing.json`.
-- **Not ported:** `notes`, `formulas`, `mathml`, `pagination`, `text_tables`, the rest of `reader.py`, and every `_c*.c`/`.h` accelerator. Each `*_BACKEND`/accelerator switch is dropped; only the Python path is ported.
+- **Not ported:** `notes`, `formulas`, `mathml`, `pagination`, `headings` (it imports `utils.heading_font` and `pagination`; the size rule is `reader.py:85-100` alone), `text_tables`, the rest of `reader.py`, and every `_c*.c`/`.h` accelerator. Each `*_BACKEND`/accelerator switch is dropped; only the Python path is ported.
 
 **Background, read-only:**
 - `C:/Users/hunje/research/ai-document-reader-plugins/notes/pdf-survey.md` (gate places, pypdfium2 call names, token costs).
@@ -79,9 +79,10 @@
 14. **Rotated pages.** Fragments are mapped through the page's `/Rotate` (0, 90, 180, 270) into viewer space before directions are classified. This keeps a landscape page's Latin text from being read as vertical CJK. The spec is silent; see Review Focus 1.
 15. **JPX under test.** A JPEG 2000 file cannot be built with the standard library. The pdfium image path is tested with a Flate CMYK image, which native cannot make viewable and pdfium can. The bench's JPX files (spike id 19ea94d72d) cover JPX itself.
 16. **Where the work happens.**
-    - Branch `doc-reader-phase2d`, already checked out in the worktree `C:/Users/hunje/phro-project/.claude/worktrees/doc-reader-phase2a` at 6a48a07.
+    - Branch `doc-reader-phase2d`, already checked out in the worktree `C:/Users/hunje/phro-project/.claude/worktrees/doc-reader-phase2a` at 5b49c66 (the plan commit), or any descendant of 6a48a07.
     - The main checkout `C:/Users/hunje/phro-project` is never touched.
 17. **Versions:** `VERSION = "0.5.0"`, and `.claude-plugin/plugin.json` `"version": "0.16.0"`.
+18. Pre-flight rulings R1-R39 (2026-11-15) are folded into the tasks below; the ledger records them.
 
 ## Global Constraints
 
@@ -100,6 +101,7 @@
 - **Disk:**
   - Never write RTF that holds the RTF shape control words to disk.
   - Never write mutated, fuzzed or otherwise hostile bytes to disk: build them in memory.
+  - The one exception is the benign damaged pdf `b"%PDF-1.7\n" + bytes(64)`, written to a temporary dir for the gate's pass-through tests, since the gate needs a path.
 - **Built after this plan:** every phase 1-2c extension plus `pdf`. `FORMATS` has 41 extensions, and `SKILL_EXTS` is gone.
 - **Output rules** are phase 1's:
   - Parsers never write Markdown.
@@ -155,7 +157,7 @@
 
    Tests:
    - Task 6: `test_cid_korea1_without_tounicode`, `test_truetype_cmap_reverse`, `test_unmapped_cid_counts_glyphs`
-   - Task 12: `test_unmapped_font_garble_warning`
+   - Task 13: `test_unmapped_font_garble_warning`
 3. **A scanned pdf of 150 pages.**
    - Pages 1-100 are images, and pages 101-150 are `unrendered`, counted `scan` once each.
    - The context sentence still fits in 600 characters.
@@ -179,13 +181,14 @@
 
 ### Setup (before Task 1)
 
-- The worktree is on branch `doc-reader-phase2d` at 6a48a07:
+- The worktree is on branch `doc-reader-phase2d` at 5b49c66 or any descendant of 6a48a07:
 
   ```bash
   git -C C:/Users/hunje/phro-project/.claude/worktrees/doc-reader-phase2a log --oneline -1
+  git -C C:/Users/hunje/phro-project/.claude/worktrees/doc-reader-phase2a merge-base --is-ancestor 6a48a07 HEAD
   ```
 
-  Expected: `6a48a07 spec: phase 2d reads pdf …`. `git status --short` shows only ` M scripts/reader/formats/rtf_lex.py`.
+  Expected: `5b49c66 plan: phase 2d pdf in 22 tasks …` (or a later commit), and the second command exits 0. `git status --short` shows only ` M scripts/reader/formats/rtf_lex.py`.
 - Run the full-suite check once and write down every `FAIL` line. Only those may appear in later runs.
 
 ### Task 1: Hook-platform facts
@@ -272,6 +275,7 @@ def test_named_pdf_items():         # unread(Counter(xfa=1, attachment=1)) == ["
 **Interfaces:**
 - **Produces, `crypto.py`:**
   - `_round_keys(key)` takes 16-, 24- or 32-byte keys (10, 12 or 14 rounds). Any other length raises `ValueError`.
+  - `_inverse_keys(w, rounds)` and `_quads(rk, rounds)` take the round count too: today they assume 10 rounds (`range(10, -1, -1)`, `0 < r < 10`, `rk[4:40]`, `rk[40:44]`).
   - `aes_ecb_encrypt(key, data) -> bytes` and `aes_ecb_decrypt(key, data) -> bytes` work on whole blocks. A trailing partial block is returned as is. `aes128_ecb_encrypt` and `aes128_ecb_decrypt` stay as wrappers, so every existing caller is unchanged.
   - `aes_cbc_encrypt(key, iv, data) -> bytes` and `aes_cbc_decrypt(key, iv, data) -> bytes`.
     - `len(iv) == 16` and `len(data) % 16 == 0`, else `ValueError`. There is no padding: callers strip PKCS#7.
@@ -332,7 +336,8 @@ def test_cbc_decrypt_speed():     # 1 MiB with a 32-byte key -> under 2.0 s
 - **Produces, `tests/pdf_fix.py`:**
   - `Name(str)`, `Ref(int)` and `Stream(dict, data: bytes, flate=False)`.
   - `pdf_obj(value) -> bytes` serializes dict, list, `Name`, `Ref`, str (a literal, escaped), bytes (hex), int, float, bool and None.
-  - `make_pdf(objects: dict[int, object], *, root=1, xref="table"|"stream"|"none", trailer=None, header=b"%PDF-1.7", junk=b"", shift=0) -> bytes`. Offsets are true unless `shift` moves every xref offset by that many bytes. `junk` goes before the header.
+  - The module inserts `Path(__file__).resolve().parents[1] / "scripts"` into `sys.path` itself, so a caller that loads it by file path (the bench, Task 21) can import `reader`.
+  - `make_pdf(objects: dict[int, object], *, root=1, xref="table"|"stream"|"none", objstm=False, trailer=None, header=b"%PDF-1.7", junk=b"", shift=0) -> bytes`. Offsets are true unless `shift` moves every xref offset by that many bytes. `junk` goes before the header. With `objstm=True`, every object other than the streams, the root and the xref goes into one object stream; it requires `xref="stream"`.
   - `text_ops(text, x=72, y=720, size=12, font="F1", extra=b"") -> bytes` gives `BT /F1 12 Tf 72 720 Td (text) Tj ET`.
   - `simple_pdf(pages: list[bytes], *, resources=None, media=(0, 0, 612, 792), catalog=None, page_extra=None, **kw) -> bytes`. It builds the catalog, the page tree and Helvetica `F1`, with each page's content as one stream.
 - **Produces, notices:** dochan's `Ported:` line gains "the pdf parser of dochan 1.21.0 (commit 29bb52b) in `scripts/reader/pdfnative/*.py`".
@@ -343,7 +348,7 @@ def test_cbc_decrypt_speed():     # 1 MiB with a 32-byte key -> under 2.0 s
 def test_lexer_objects():          # << /A 1 /B [true null 2.5 (a\)b) <414243> /N#20x] /R 3 0 R >> -> {"A": 1, "B": [True, None, 2.5, b"a)b",
                                    # b"ABC", PDFName("N x")], "R": PDFRef(3, 0)}
 def test_classic_xref():           # simple_pdf([text_ops("Hi")]) -> len(PDFFile(data).pages()) == 1, recovered False
-def test_xref_stream_and_objstm(): # xref="stream" with the page objects in an object stream -> one page, its content decodes to the text ops
+def test_xref_stream_and_objstm(): # xref="stream", objstm=True (the page objects in an object stream) -> one page, its content decodes to the text ops
 def test_header_after_junk():      # junk=b"x" * 100 -> one page
 def test_broken_offsets_recovered():  # shift=7 -> one page, recovered True
 def test_no_xref_recovered():      # xref="none" -> one page, recovered True
@@ -379,7 +384,7 @@ def test_deep_nesting():           # "[" * 10_000 -> no RecursionError, value cu
     - `ReadError("encrypted", "user password")` when the empty user password fails.
   - It covers V1, V2, V4 (`/CF`, `/StmF`, `/StrF`, `/V2`, `/AESV2` and `/Identity`) and V5 with R5 and R6 (`/AESV3`, Algorithm 2.B), and `/EncryptMetadata false`.
   - `StandardSecurityHandler.decrypt(num, gen, data, string=False) -> bytes`. An AES IV comes first, and PKCS#7 padding is stripped when valid.
-  - `DECRYPT_TOTAL = 16 * 2**20` bytes per handler (decision 4; Task 19 measures it). Past it, `decrypt` raises `ReadError("too_large", "part: decrypt budget")`.
+  - `DECRYPT_TOTAL = 16 * 2**20` bytes per handler (decision 4; Task 19 measures it). Past it, `decrypt` raises `ReadError("too_large", "part: decrypt budget")`. A stream or string refused this way consumes none of the budget, so a smaller one after it still decrypts.
 - **Produces, `structure.py`:** `PDFFile` opens the handler from `/Encrypt` and the trailer's `/ID`. It decrypts strings and streams of every object except the xref stream and the `/Encrypt` dictionary itself.
 - **Produces, `pdf_fix.py`:**
   - `make_pdf(..., encrypt=EncryptSpec(revision, user=b"", owner=b"owner", aes=True|False, metadata=True, filter="Standard"))`.
@@ -398,7 +403,8 @@ def test_metadata_unencrypted(): # /EncryptMetadata false, a /Metadata stream le
 def test_user_password():        # EncryptSpec(4, user=b"secret") -> ReadError ("encrypted", "user password")
 def test_pubsec():               # filter="Adobe.PubSec" -> ReadError ("encrypted", "public-key handler")
 def test_other_handler_drm():    # filter="FOPN_foweb" -> ReadError kind "drm"
-def test_decrypt_budget():       # DECRYPT_TOTAL patched to 64, R4, content of 200 bytes -> handler.decrypt raises ReadError "too_large"
+def test_decrypt_budget():       # DECRYPT_TOTAL patched to 64, R4, content of 200 bytes -> handler.decrypt raises ReadError "too_large";
+                                 # a 48-byte stream after it still decrypts (the refused one consumed nothing)
 ```
 
 - [ ] **Step 2: Run the tests to see them fail.** Run `python -I -X utf8 tests/test_reader_pdf_crypt.py`. Expected: FAIL with `ReadError: encrypted: not supported yet`.
@@ -428,7 +434,7 @@ def test_decrypt_budget():       # DECRYPT_TOTAL patched to 64, R4, content of 2
   - `truetype_cmap_font(gid_to_code: dict[int, int]) -> bytes`, a minimal sfnt with `head` and a format-4 `cmap`.
 - **Produces, notices:**
   - dochan's `Ported:` line is already covered by Task 4's `pdfnative/*.py` glob.
-  - A new `## Adobe` section reproduces from `<dochan>/../NOTICE`:
+  - A new `## Adobe` section reproduces from `<dochan>/../../NOTICE`:
     - the mapping-resources-pdf notice and the cmap-resources notice (BSD-3-Clause);
     - the Core 14 AFM notice;
     - the Adobe Glyph List notice (BSD-3-Clause);
@@ -458,7 +464,7 @@ def test_vertical_wmode():            # Identity-V -> FontInfo.wmode == 1
 ### Task 7: Content and text show, rule segments, OCG state
 
 **Files:**
-- Create: `scripts/reader/pdfnative/content.py`, `show_table.py`, `ocg.py`, `scripts/reader/formats/pdf_layout.py` (the types only), `scripts/reader/formats/pdf_tables.py` (the types and `PathCollector` only), `tests/test_reader_pdf_content.py`
+- Create: `scripts/reader/pdfnative/content.py`, `show_table.py`, `ocg.py`, `scripts/reader/formats/pdf_layout.py` (the types only), `scripts/reader/formats/pdf_tables.py` (the types and `PathCollector` only), `scripts/reader/formats/pdf.py` (the caps `PDF_PAGE_OBJECTS` and `PDF_PAGE_IMAGES` only), `tests/test_reader_pdf_content.py`
 - Modify: `tests/pdf_fix.py`, `THIRD_PARTY_NOTICES.md`
 
 **Interfaces:**
@@ -471,28 +477,30 @@ def test_vertical_wmode():            # Identity-V -> FontInfo.wmode == 1
     `invisible: bool` (render mode 3 or 7) stays. `writing_direction`, `along` and `across` come with it.
   - `PageImage(box, data: bytes | None, px: tuple[int, int], kind: str)`, where `kind` is `"jpg"`, `"png"`, `"jpx"`, `"ccitt"`, `"jbig2"` or `"raw"`.
   - `Comment(author: str, text: str, hidden: bool)`.
-  - `PageData(number, box, rotate, fragments, segments, images, figure, links, fields, comments, chars, cut, render)`:
+  - `PageData(number, box, rotate, fragments, segments, short, images, figure, links, fields, comments, chars, cut, render)`:
     - `box` is the crop box in page space;
+    - `short` is `PathCollector.short_segments`, the sub-1-unit pieces dochan keeps for its short-dash supplement (Task 10);
     - `figure` is `(union box or None, non-rule path count)`;
     - `links` is `[(box, url)]`, `fields` is `[(label, value)]`, and `cut` is a `Counter`;
     - `render` is `Callable[[box, dpi], bytes | None] | None`.
 - **Produces, `pdf_tables.py`:**
   - `Segment` and `PathCollector`, from `<dochan>/paths.py`, with `MAX_SEGMENTS` renamed `PDF_SEGMENTS = 20_000` and dochan's `_THIN = 2.0` and `_STRAIGHT = 1.0`.
   - `PathCollector.figure` gives the union box and the count of painted paths that gave no rule segment.
+  - `PathCollector.short_segments` keeps the pieces under 1 unit apart from `segments`, as dochan does (`paths.py:87`, `127-136`, `200`).
+- **Produces, `formats/pdf.py`:** only `PDF_PAGE_OBJECTS = 100_000` and `PDF_PAGE_IMAGES = 64` (the spec puts pdf caps in `formats/pdf.py`). Task 12 fills the rest of the module. `pdfnative` and `pdf_pdfium` read them as `pdf.<NAME>` at call time, so a test patches `reader.formats.pdf` alone.
 - **Produces, `ocg.py`:**
   - `OCState.from_catalog(pdf) -> OCState` reads `/OCProperties /D` (`/BaseState`, `/ON`, `/OFF`).
   - `.hidden(props) -> bool` takes an OCG or OCMD dictionary or ref. An OCMD follows its `/P` policy (`AnyOn` by default, `AllOn`, `AnyOff`, `AllOff`). A `/VE` counts as visible.
   - `.any_off(resources) -> bool` is true when the page's `/Properties`, or a form XObject's `/OC`, names an off group. The pdfium front end uses it (decision 3).
 - **Produces, `content.py`** (from `<dochan>/content.py`) and `show_table.py` (from `<dochan>/_show_table.py`):
-  - `interpret(pdf, content: bytes, resources, fonts_cache, oc: OCState, *, box) -> PageContent`, where `PageContent(fragments, segments, figure, image_draws, objects, cut)`.
+  - `interpret(pdf, content: bytes, resources, fonts_cache, oc: OCState, *, box) -> PageContent`, where `PageContent(fragments, segments, short, figure, image_draws, objects, cut)` and `short` is `PathCollector.short_segments`.
     - `image_draws` is `[(name, box)]` in content order.
     - `objects` counts the page objects walked, form XObjects included.
   - Text spacing comes from glyph geometry. TJ numbers move the glyphs (`char_offsets`) but never insert spaces: Task 9's gap rule decides spaces (spec fault 1).
   - A fragment inside `/OC /x BDC`, or inside a form whose `/OC` is off, gets `hidden = "ocg"`. Render mode 3 or 7 sets `invisible`.
   - Caps, each counted once on `cut`:
     - `MAX_FORM_DEPTH = 16`, the form seen-set and `MAX_FORM_OPERATORS = 32_768`, under `page_part`;
-    - 256 content parts and 64 MiB of content a page, under `page_part`;
-    - `PDF_PAGE_OBJECTS = 100_000`, under `page_part`;
+    - `pdf.PDF_PAGE_OBJECTS`, read at call time, under `page_part`;
     - `PDF_SEGMENTS`, with the rest of the rules ignored and not counted (the spec's row).
 - **Produces, `pdf_fix.py`:** `ocg_catalog(off: list[int], on: list[int] = ()) -> dict`, `form_xobject(content: bytes, *, oc=None, matrix=None) -> Stream` and `rule_ops(x0, y0, x1, y1, w=0.5) -> bytes`.
 
@@ -509,8 +517,9 @@ def test_form_xobject():         # a form with text, /Matrix [1 0 0 1 100 0] -> 
 def test_form_oc_off():          # a form with /OC naming an off group -> its text hidden "ocg"
 def test_form_self_reference():  # a form that Do's itself -> stops at depth 16, cut["page_part"] == 1, under 1 s
 def test_form_operator_cap():    # 32,769 "q Q" in one form -> cut["page_part"] == 1
-def test_page_objects_cap():     # PDF_PAGE_OBJECTS patched to 50, 100 text objects -> 50 fragments, cut["page_part"] == 1
-def test_rule_segments():        # a horizontal line, a thin filled rect, a diagonal and a flat curve -> 3 Segments (no diagonal)
+def test_page_objects_cap():     # reader.formats.pdf.PDF_PAGE_OBJECTS patched to 50, 100 text objects -> 50 fragments, cut["page_part"] == 1
+def test_rule_segments():        # a horizontal line, a thin filled rect, a diagonal and a flat curve -> 4 Segments (the thin rect gives
+                                 # both long edges, as dochan's _paint does; no diagonal)
 def test_segment_cap():          # PDF_SEGMENTS patched to 10, 20 lines -> 10 segments, nothing counted
 def test_figure_paths():         # 40 small filled circles -> figure count 40, union box over them
 def test_image_draws():          # "q 100 0 0 50 72 600 cm /Im1 Do Q" -> image_draws == [("Im1", (72, 600, 172, 650))]
@@ -518,9 +527,9 @@ def test_vertical_text():        # an Identity-V font -> writing_direction(frag)
 ```
 
 - [ ] **Step 2: Run the tests to see them fail.** Run `python -I -X utf8 tests/test_reader_pdf_content.py`. Expected: FAIL with `ModuleNotFoundError`.
-- [ ] **Step 3: Implement** after `<dochan>/content.py`, `_show_table.py` and `paths.py`. Leave out dochan's line assembly (`assemble_lines`, `_Line`): it moves to `pdf_layout` in Task 9. The notices line gains `scripts/reader/formats/pdf_tables.py`.
+- [ ] **Step 3: Implement** after `<dochan>/content.py`, `_show_table.py` and `paths.py`. Leave out dochan's line assembly (`assemble_lines`, `_Line`): it moves to `pdf_layout` in Task 9. The notices line gains `scripts/reader/formats/pdf_tables.py` and `scripts/reader/formats/pdf_layout.py` (it holds dochan's `Fragment`).
 - [ ] **Step 4: Run the tests to see them pass**, then the full-suite check.
-- [ ] **Step 5: Commit** the five created modules, the test file, `tests/pdf_fix.py` and `THIRD_PARTY_NOTICES.md` with the message `reader: pdfnative interprets content streams into fragments, rule segments and figure paths, with OCG and OCMD visibility and dochan's operator caps`.
+- [ ] **Step 5: Commit** the six created modules, the test file, `tests/pdf_fix.py` and `THIRD_PARTY_NOTICES.md` with the message `reader: pdfnative interprets content streams into fragments, rule segments and figure paths, with OCG and OCMD visibility and dochan's operator caps`.
 
 ### Task 8: Annotations, fields, outline and images
 
@@ -533,12 +542,14 @@ def test_vertical_text():        # an Identity-V font -> writing_direction(frag)
   - `SCHEMES = ("http", "https", "mailto", "ftp")`.
   - `page_annots(pdf, page) -> tuple[list[tuple[box, str]], list[Comment], Counter]`.
     - Links are `/Link` with a `/URI` action of an allowed scheme. Anything else (GoTo, Launch, JavaScript, `javascript:`) gives no link and no count.
-    - Comments are Text, FreeText, and the markup kinds with `/Contents`, in file order. A reply (`/IRT`) follows its parent. `/Popup` is skipped. `/F` bit 2 gives `hidden=True`.
+    - Comments are Text, FreeText, and the markup kinds with `/Contents`, in file order. A reply (`/IRT`) follows its parent, through `order_comments`. `/Popup` is skipped. `/F` bit 2 gives `hidden=True`.
     - `PDF_ANNOTS = 256` a page and 65,536 characters each. Past either, the rest are dropped and `annotation` is counted once.
-  - `fields(pdf) -> dict[int, list[tuple[str, str]]]`, by 0-based page index (spec fault 4: values come from `/AcroForm /Fields`, not the widgets alone).
+  - `order_comments(items) -> list[Comment]`, a pure helper: `items` is `[(key, irt_key or None, Comment)]` in file order, and each reply comes right after its parent. Task 15 calls it.
+  - `field_entry(label_tu, name, value, kind) -> tuple[str, str, bool] | None`, a pure helper holding the field rules below; it returns `(label, value, cut)`, or None for an entry left out. `kind` is `text`, `choice`, `check`, `radio`, `sig` or `push`, and a choice `value` may be a list. Task 15 calls it.
+  - `fields(pdf, cut: Counter) -> dict[int, list[tuple[str, str]]]`, by 0-based page index (spec fault 4: values come from `/AcroForm /Fields`, not the widgets alone). Each field goes through `field_entry`.
     - The tree walk keeps a seen-set and is capped at depth 32.
     - The label is `/TU`, else the last dot-part of the full name.
-    - Text and choice values: newlines become ` / `, a value is cut at 2,000 characters (counted `field`), and a list joins with `, `.
+    - Text and choice values: newlines become ` / `, a value is cut at 2,000 characters (counted `field` on `cut`), and a list joins with `, `.
     - A check box or radio gives its `/V` name unless `Off`.
     - `/Sig` and push buttons (Ff bit 17) are skipped. Empty values are skipped.
     - The page comes from the widget's `/P`, else from a scan of each page's `/Annots`.
@@ -569,7 +580,11 @@ def test_field_tu_label():       # /T "f1_01[0]" under parents "topmostSubform[0
 def test_field_partial_name():   # no /TU -> label "f1_01[0]"
 def test_checkbox_radio():       # Btn /V /Yes -> ("Agree", "Yes"); /V /Off -> no entry; radio parent /V /Two -> ("Pick", "Two")
 def test_empty_sig_button():     # empty /V, a /Sig field, a push button -> no entries
-def test_field_newlines_and_cut():  # /V "a\nb" -> "a / b"; 2,500 chars -> 2,000 kept, counted field once
+def test_field_newlines_and_cut():  # /V "a\nb" -> "a / b"; 2,500 chars -> 2,000 kept, cut["field"] == 1
+def test_field_entry_pure():     # field_entry("Name", "a.b", "Kim", "text") == ("Name", "Kim", False); (None, "a.b", "x", "text") -> label "b";
+                                 # (None, "c", "Off", "check"), (None, "s", "v", "sig"), (None, "p", "v", "push"), (None, "e", "", "text") -> None;
+                                 # (None, "l", ["x", "y"], "choice") -> value "x, y"; 2,500 chars -> cut True
+def test_order_comments_pure():  # [("r", "p", reply), ("p", None, parent)] -> [parent, reply]
 def test_field_tree_cycle():     # a /Kids cycle -> each field once, under 1 s
 def test_xfa_attachment():       # /AcroForm /XFA [] -> has_xfa True; /Names /EmbeddedFiles -> has_attachments True
 def test_outline():              # items (1, "Intro", 0), (2, "Part", 1) -> the same list; a /Next cycle -> listed once
@@ -588,12 +603,13 @@ def test_image_not_viewable():   # JPX, CCITTFax, JBIG2, DeviceCMYK, and 5000x50
 ### Task 9: Layout — lines, spacing, joins, order, headings, running headers
 
 **Files:**
-- Modify: `scripts/reader/formats/pdf_layout.py`, `THIRD_PARTY_NOTICES.md`
+- Modify: `scripts/reader/formats/pdf_layout.py`, `scripts/reader/formats/xps.py` (`columns` lifted to a module function), `THIRD_PARTY_NOTICES.md`
 - Create: `scripts/reader/formats/pdf_spacing.json` (a copy of `<dochan>/korean_spacing.json`), `tests/test_reader_pdf_layout.py`
 
 **Interfaces:**
-- **Consumes:** Task 7's `Fragment`; `xps._lines` and `xps._paras`.
-- **Produces, `pdf_layout.py`** (docstring names dochan `layout.py`, `spacing.py`, `running.py`, `headings.py` and `reader.py:85-100`):
+- **Consumes:** Task 7's `Fragment`; `xps._columns`, which this task lifts out of `_Reader.columns`.
+- **Produces, `xps.py`:** `_columns(runs, width) -> list[list[run]]` is the body of `_Reader.columns` as a module function, and the method calls it. XPS output is unchanged.
+- **Produces, `pdf_layout.py`** (docstring names dochan `layout.py`, `spacing.py`, `running.py` and `reader.py:85-100`):
   - `SpacingModel` and `load_model(path=None) -> SpacingModel`. The model loads `pdf_spacing.json` once per process, and `joins_with_space(last, first) -> bool` is dochan's.
   - `rotate_into_view(fragments, rotate, box)` maps each fragment's position and direction through `/Rotate` (decision 14).
   - `Line(text, runs: list[tuple[str, str]], box, size, order, vertical: bool)`, where a run is `(text, url)`.
@@ -601,18 +617,18 @@ def test_image_not_viewable():   # JPX, CCITTFax, JBIG2, DeviceCMYK, and 5000x50
     - A space goes between two glyphs when the gap is over `0.2 * size` and neither side is a space already. `GAP = 0.2`.
     - A run whose glyph centres lie in a link box carries its url.
   - `vertical_lines(fragments) -> list[Line]`: columns right to left, characters top to bottom, and one `Line` per column (spec fault 3).
-  - `reading_order(lines) -> list[Line]`. Content order stays, unless more than 30% (`UPWARD = 0.3`) of line-to-line steps go up by more than one line height. Then the lines are re-sorted through `xps._lines` and `xps._paras`, as XPS runs `(box_top_from_top, x, size, text, "")`.
+  - `reading_order(lines, width) -> list[Line]`, where `width` is the page box width. Content order stays, unless more than 30% (`UPWARD = 0.3`) of line-to-line steps go up by more than one line height. Then the lines go to `xps._columns` as XPS runs `(box_top_from_top, x, size, text, i)`, with the line's index `i` in the name slot. Each column comes back sorted by (top, x) and is mapped back to its `Line`s by index, so links and runs are kept. `xps._paras` is not used.
   - `join_break(left: str, right: str, model) -> str` applies, in order:
     1. a line-end `-` after a letter, followed by a lowercase letter, is dropped and the word joined;
     2. Han or Kana on both sides: no space;
     3. Hangul on both sides: `model.joins_with_space(left[-1], right[0])`;
     4. otherwise one space.
-  - `paragraphs(lines, model) -> list[Para]` breaks on a vertical gap over 1.5 × the line height, as dochan `merge_lines` does. Lines join through `join_break`, links become `Link` inlines, and nothing is bold.
+  - `paragraphs(lines, model) -> list[Para]` breaks on a vertical gap over 1.5 × the line height, with no full-line rule. Lines join through `join_break`, links become `Link` inlines, and nothing is bold.
   - `body_size(all_lines) -> float` is the median line size.
   - `heading_level(text, size, body) -> int | None`: 3 when `size >= 1.5 * body`, 4 when `>= 1.25 * body`, and None past 120 characters or with fewer than 2 letters.
   - `outline_level(depth) -> int` is `min(6, depth + 2)`.
   - `running(pages: list[list[Line]], boxes) -> tuple[list[str], list[str], list[set[int]]]` (headers, footers, the line indexes to drop on each page), after dochan `detect_running`. Page-number-only lines are dropped without becoming a header.
-- **Produces, notices:** the Ported line gains `scripts/reader/formats/pdf_layout.py` and `pdf_spacing.json`.
+- **Produces, notices:** the Ported line gains `pdf_spacing.json` (Task 7 already added `scripts/reader/formats/pdf_layout.py`).
 
 - [ ] **Step 1: Write the failing tests.** Fragments are built directly with a helper `frag(text, x, y, size=12, **kw)`:
 
@@ -627,7 +643,8 @@ def test_spacing_table_loads():  # load_model(): 0 < prior < 1 and len(pairs) > 
 def test_hyphen_join():          # ("inter-", "national") -> "international"; ("well-", "Known") -> "well- Known"; ("1-", "2") -> "1- 2"
 def test_paragraph_break():      # three lines 14 apart then one 40 below -> two Paras
 def test_content_order_kept():   # a left column then a right column, in content order -> left text first
-def test_column_fallback():      # lines drawn alternating left and right rows (every step goes up) -> left column's text, then the right's
+def test_column_fallback():      # lines drawn alternating left and right rows, three a side (every step goes up), reading_order(lines, 612) ->
+                                 # left column's text, then the right's
 def test_vertical_cjk():         # two vertical columns at x 500 and 480 -> the x-500 column's text first, each column one line, no spaces
 def test_rotated_page_order():   # a /Rotate 90 page whose three Latin lines are drawn rotated -> lines in reading order, words whole
 def test_heading_by_size():      # body 10: a 15 line -> 3; 12.5 -> 4; 12 -> None; a 130-char 15 line -> None
@@ -639,8 +656,8 @@ def test_link_runs():            # a link box over "here" in "see here now" -> r
 
 - [ ] **Step 2: Run the tests to see them fail.** Run `python -I -X utf8 tests/test_reader_pdf_layout.py`. Expected: FAIL with `AttributeError` for `lines`.
 - [ ] **Step 3: Implement** after the named dochan files. Copy the json byte for byte. `code_digest` picks it up in Task 13.
-- [ ] **Step 4: Run the tests to see them pass**, then the full-suite check.
-- [ ] **Step 5: Commit** `scripts/reader/formats/pdf_layout.py scripts/reader/formats/pdf_spacing.json tests/test_reader_pdf_layout.py THIRD_PARTY_NOTICES.md` with the message `reader: pdf layout joins glyphs by geometry, lines by script (dochan's Korean spacing table), sorts columns only when content order runs backwards, and finds headings and running headers`.
+- [ ] **Step 4: Run the tests to see them pass**, then the full-suite check. `test_reader_xps.py` must still pass unchanged.
+- [ ] **Step 5: Commit** `scripts/reader/formats/pdf_layout.py scripts/reader/formats/xps.py scripts/reader/formats/pdf_spacing.json tests/test_reader_pdf_layout.py THIRD_PARTY_NOTICES.md` with the message `reader: pdf layout joins glyphs by geometry, lines by script (dochan's Korean spacing table), sorts columns only when content order runs backwards, and finds headings and running headers`.
 
 ### Task 10: Tables from rule segments
 
@@ -649,14 +666,14 @@ def test_link_runs():            # a link box over "here" in "see here now" -> r
 - Create: `tests/test_reader_pdf_tables.py`
 
 **Interfaces:**
-- **Consumes:** Task 7's `Segment` and Task 9's `lines`, `paragraphs` and `load_model`.
+- **Consumes:** Task 7's `Segment` and `PathCollector.short_segments` (`PageData.short`), and Task 9's `lines`, `paragraphs` and `load_model`.
 - **Produces, `pdf_tables.py`** (docstring names dochan `paths.py`, `tables.py` and `connected_tables.py`):
   - `TableBudget(remaining=MAX_DOCUMENT_CELLS)`.
-  - `tables(segments, fragments, page_number, budget, cut: Counter) -> list[Found]`, where `Found(table: model.Table, bbox, used: set[int])` and `used` holds the `order` of the fragments the table took.
+  - `tables(segments, fragments, page_number, budget, cut: Counter, short=()) -> list[Found]`, where `short` feeds dochan's short-dash supplement (`tables.py:442-451`, `473`, `501`, `524`), and `Found(table: model.Table, bbox, used: set[int])` and `used` holds the `order` of the fragments the table took.
     - Each cell is `Cell([Para…], rowspan, colspan)`. Its text goes through `pdf_layout.lines` and `paragraphs`, so a Korean cell joins by the table.
     - A nested table is a `Table` inside its cell's blocks, as in dochan.
     - A grid with fewer than 2 rows or 2 columns is not a table.
-  - Caps, each counted once under `cells`: dochan's `MAX_PAGE_CELLS = 50_000`, `MAX_DOCUMENT_CELLS = 200_000`, `MAX_INTERSECTION_CHECKS = 2_000_000`, `MAX_PAGE_COMPONENTS = 1_000`, `MAX_NESTED_DEPTH = 32` and `MAX_SPLIT_CHECKS = 2_000_000`, plus `limits.TABLE_NODES` charged per table node.
+  - Caps, each counted once under `cells`: dochan's `MAX_PAGE_CELLS = 50_000`, `MAX_DOCUMENT_CELLS = 200_000`, `MAX_INTERSECTION_CHECKS = 2_000_000`, `MAX_PAGE_COMPONENTS = 1_000`, `MAX_COMPONENT_LINES = 2_000`, `MAX_NESTED_DEPTH = 32` and `MAX_SPLIT_CHECKS = 2_000_000`, plus `limits.TABLE_NODES` charged per table node.
 
 - [ ] **Step 1: Write the failing tests**, with segments and fragments built directly:
 
@@ -668,8 +685,10 @@ def test_nested_table():         # a 2x2 grid inside cell (0,0) of a 2x2 grid ->
 def test_rule_light_stays_text():  # horizontal rules only -> []
 def test_cell_korean_join():     # one cell with lines "가나" and "다라", m from load_model() -> the cell text follows join_break with that model
 def test_page_cell_cap():        # MAX_PAGE_CELLS patched to 3, a 2x2 grid -> no table, cut["cells"] == 1
-def test_intersection_cap():     # 1,000 horizontal and 1,000 vertical rules -> returns under 3 s, cut["cells"] == 1
-def test_dash_rules():           # a grid drawn in 2-unit dashes -> one Table (dochan's short-dash supplement)
+def test_intersection_cap():     # MAX_PAGE_CELLS raised to 10**7, 1,500 horizontal and 1,500 vertical rules (2.25 M checks) ->
+                                 # returns under 3 s, cut["cells"] == 1
+def test_component_lines_cap():  # MAX_COMPONENT_LINES patched to 4, a 3x3 grid (8 rules) -> no table, cut["cells"] == 1
+def test_dash_rules():           # a grid drawn in 0.5-unit dashes, passed as short= -> one Table (dochan's short-dash supplement)
 ```
 
 - [ ] **Step 2: Run the tests to see them fail.** Expected: FAIL with `AttributeError` for `tables`.
@@ -683,22 +702,23 @@ def test_dash_rules():           # a grid drawn in 2-unit dashes -> one Table (d
 - Create: `scripts/reader/pdfnative/document.py`, `tests/test_reader_pdf_native.py`
 
 **Interfaces:**
-- **Consumes:** Tasks 4-8.
-- **Produces, `document.py`** (docstring names dochan `reader.py:169-452`, `651-793` and `1184-1220`):
-  - `NativeDoc(data: bytes)` raises the structure and crypto `ReadError`s. It has:
+- **Consumes:** Tasks 4-8: Task 7's `PDF_PAGE_IMAGES` in `formats/pdf.py`, and Task 8's `fields(pdf, cut)`.
+- **Produces, `document.py`** (docstring names dochan `reader.py:651-793` and `1184-1220`; the page loop is `formats/pdf.py`'s):
+  - `NativeDoc(data: bytes)` raises the structure and crypto `ReadError`s. A decrypt-budget `too_large` met while opening (object streams, strings) is re-raised as `ReadError("damaged", "decrypt budget")`, so the gate passes it through. It has:
     - `.page_count`;
     - `.oc: OCState`;
+    - `.resources(index) -> dict`, the page's inherited `Resources` (from `pdf.pages()[index][1]`). Task 15 uses it for decision 3;
     - `.outline() -> list[tuple[int, str, int]]`;
-    - `.fields: dict[int, list]`, read once;
+    - `.fields: dict[int, list]`, read once through `fields(pdf, self.cut)`;
     - `.xfa: bool` and `.attachments: bool`.
   - `.page(index: int) -> PageData` fills:
-    - `fragments` from `content.interpret` over the page's content parts;
-    - `segments` and `figure`;
-    - `images`, one per `image_draws` entry, through `images.image`, with the draw box. At most `PDF_PAGE_IMAGES = 64`; the rest count `image`.
+    - `fragments` from `content.interpret` over the page's content parts. The part walk follows `reader.py:768-793`: at most `MAX_CONTENT_PARTS = 256` parts and `MAX_PAGE_CONTENT_BYTES = 64 * 2**20` bytes of decoded content a page; past either the rest are dropped and `page_part` counted once;
+    - `segments`, `short` and `figure`;
+    - `images`, one per `image_draws` entry, through `images.image`, with the draw box. At most `pdf.PDF_PAGE_IMAGES`, read at call time; the rest count `image`.
     - `links` and `comments` from `annotations.page_annots`, and `fields` from `self.fields`;
     - `chars` as the count of non-space chars;
     - `rotate` and `box` as the crop box (defaulting to the media box, inherited), and `render = None`.
-  - `.cut` gathers the page's counts: `page_part`, `image`, `annotation`, and `glyphs` (once per unmapped font ref per document).
+  - `.cut` gathers the page's counts: `page_part`, `image`, `annotation`, `field`, and `glyphs` (once per unmapped font ref per document).
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -708,7 +728,13 @@ def test_native_crop_inherited():  # /CropBox on the Pages node -> page(0).box =
 def test_native_rotate():        # /Rotate 90 -> page(0).rotate == 90
 def test_native_images():        # one Im1 draw of a gray Flate image -> images == [PageImage(draw box, png bytes, (40, 40), "png")]
 def test_native_image_cap():     # 70 draws of one image -> 64 images, cut["image"] == 1
-def test_native_fields_comments():  # an AcroForm field on page 1 and a Text annot -> page(0).fields and .comments filled
+def test_native_content_parts_cap():  # /Contents of 300 parts -> the first 256 read, cut["page_part"] == 1; MAX_PAGE_CONTENT_BYTES patched
+                                      # to 100, two 80-byte parts -> the first read, cut["page_part"] == 1
+def test_native_resources():     # /Resources on the Pages node -> resources(0) is that dict
+def test_native_open_decrypt_budget():  # DECRYPT_TOTAL patched to 64, R4 with objstm=True (an object stream over 64 bytes) ->
+                                        # ReadError ("damaged", "decrypt budget")
+def test_native_fields_comments():  # an AcroForm field on page 1 and a Text annot -> page(0).fields and .comments filled;
+                                    # a 2,500-char value -> cut["field"] == 1
 def test_native_glyphs_once():   # an unmapped Type0 font used on two pages -> cut["glyphs"] totals 1
 def test_native_outline():       # outline_items on pages 0 and 1 -> outline() as built
 ```
@@ -721,12 +747,14 @@ def test_native_outline():       # outline_items on pages 0 and 1 -> outline() a
 ### Task 12: `formats/pdf.py` — the page loop, hidden rules, scans, figures and caps
 
 **Files:**
-- Create: `scripts/reader/formats/pdf.py`, `tests/test_reader_pdf.py`
+- Modify: `scripts/reader/formats/pdf.py` (Task 7 created it with two caps), `scripts/reader/__init__.py` (`STARTED` only)
+- Create: `tests/test_reader_pdf.py`
 
 **Interfaces:**
 - **Consumes:** Tasks 2 and 7-11.
+- **Produces, `__init__.py`:** `STARTED = time.monotonic()` at import, nothing else. Task 13's `convert` passes it.
 - **Produces, `pdf.py`:**
-  - The caps:
+  - The caps, after Task 7's `PDF_PAGE_OBJECTS = 100_000` and `PDF_PAGE_IMAGES = 64`, which stay here:
 
     ```python
     PDF_PAGES = 5_000
@@ -746,11 +774,12 @@ def test_native_outline():       # outline_items on pages 0 and 1 -> outline() a
     IMAGE_MIN_PT = 16.0
     ```
 
-  - `parse(path, ctx, *, engine="native", pages=None, clock=time.monotonic, started=None) -> Doc` reads the file and calls `parse_bytes`. `started` defaults to `reader.STARTED`, which Task 13 adds.
+  - `parse(path, ctx, *, engine="native", pages=None, clock=time.monotonic, started=None) -> Doc` reads the file and calls `parse_bytes`.
   - `parse_bytes(data, ctx, *, engine="native", pages=None, clock=time.monotonic, started=None) -> Doc`.
+    - When `started` is None, it takes `clock()` at entry. Only `reader.convert` (the CLI child, Task 13) passes `reader.STARTED`, so an in-process caller never inherits a stale clock.
     - `pages=(A, B)` reads those pages alone, numbered as in the file.
     - `engine="pdfium"` is wired in Task 15. Until then, any other engine raises `ValueError`.
-  - **Open:** `NativeDoc(data)`. Its `encrypted`, `drm` and `too_large` errors propagate. A `damaged` error is final for native. Task 15 lets pdfium try first.
+  - **Open:** `NativeDoc(data)`. Its `encrypted`, `drm` and `too_large` errors propagate; a decrypt budget spent while opening arrives as `damaged` (Task 11). A `damaged` error is final for native. Task 15 lets pdfium try first.
   - **Page loop**, for index in range:
     - Past `PDF_PAGES`, or when `clock() - started > PDF_DEADLINE`, the rest count `page_cut` (one per page) and the loop ends with the output kept.
     - Each page runs under `_page_guard("page")` (decision 5).
@@ -772,12 +801,13 @@ def test_native_outline():       # outline_items on pages 0 and 1 -> outline() a
     - With no render, the page goes on `unrendered`, counted `figure` (decision 7).
   - **Render budget:** a render past `PDF_RENDERS`, or past `limits.IMAGE_BYTES` with the images, puts the page on `unrendered` with `scan` or `figure`.
   - **Images:** under `IMAGE_MIN_PX` pixels or `IMAGE_MIN_PT` points on a side, left out uncounted. A `None` data counts `image`. The rest become `Image` blocks in reading order (`Assets` dedups).
-  - **Tables:** `pdf_tables.tables`, then the fragments in `used` leave layout.
-  - **Blocks:** `pdf_layout` lines, `reading_order` and `paragraphs`, with tables and images placed by their top.
+  - **Tables:** `pdf_tables.tables(…, short=page.short)`, then the fragments in `used` leave layout.
+  - **Lines:** `pdf_layout` lines and `reading_order(lines, box width)`. Each page's `Line`s are kept, with its tables and images, for the pass after the loop; paragraphs are not built inside the loop.
   - **Section:** `Section("page", number=N, blocks=…, comments=[Para([Text(f"Field {l}: {v}")]) …] + [Para([Text(f"Comment by {a}: {t}" if a else f"Comment: {t}")], hidden="hidden" if h else "") …])`.
-  - **After the loop:**
-    - `running` fills `Doc.headers` and `Doc.footers` and drops their lines.
-    - Outline titles on their page promote the first matching line (case-folded, spaces squashed) to `Heading(outline_level(depth))`. Other lines get `heading_level(text, size, body_size)`.
+  - **After the loop**, in this order:
+    1. `running` over the kept lines fills `Doc.headers` and `Doc.footers` and drops their lines.
+    2. Outline titles on their page promote the first matching line (case-folded, spaces squashed) to `Heading(outline_level(depth))`. Other lines get `heading_level(text, size, body_size)`. A heading line is split out of the page's lines here, before paragraphs merge it.
+    3. `paragraphs` per page over the lines between headings. The page's blocks are its headings, paragraphs, tables and images placed by their top, then the hidden `Para`s (decision 6), filling the `Section`.
     - The outline is never printed.
   - **Named items:** `xfa` and `attachment` are counted 1 when present.
   - **No page read:** `ReadError("damaged", "no readable pages")`.
@@ -808,32 +838,34 @@ def test_page_cap():             # PDF_PAGES patched to 3, 5 pages -> pages 1-3,
 def test_deadline_page_cut():    # clock advancing 10 s per call, started 0 -> the pages read before 36 s kept, the rest page_cut, no ReadError
 def test_page_seconds_part():    # clock jumping 5 s inside the text step -> text kept, tables and images skipped, skipped["page_part"] == 1
 def test_page_chars_cap():       # PDF_PAGE_CHARS patched to 10, 50 chars -> skipped["text"] == 1
-def test_page_raises_skipped():  # page 2's content stream references a missing object that raises -> pages 1 and 3 read, skipped["page"] == 1
-def test_member_readerror():     # DECRYPT_TOTAL patched so page 2's stream passes it -> skipped counts it, page 3 read;
-                                 # a page step raising ReadError("timeout") -> it propagates
+def test_page_raises_skipped():  # NativeDoc.page patched to raise for index 1 -> pages 1 and 3 read, skipped["page"] == 1
+def test_member_readerror():     # R4, DECRYPT_TOTAL patched below page 2's stream and above pages 1 and 3's (a refused stream consumes
+                                 # nothing) -> skipped counts it, page 3 read; a page step raising ReadError("timeout") -> it propagates
+def test_started_default():      # started=None, clock always reader.STARTED + 100 -> every page read, no page_cut (the deadline runs from
+                                 # parse_bytes' entry, not from import)
 def test_no_readable_page():     # every page raises -> ReadError ("damaged", "no readable pages")
 def test_pages_range():          # pages=(2, 3) of 5 -> only "## Page 2" and "## Page 3", meta pages_total 5
 def test_xfa_attachment_named(): # both present -> "XFA form" and "attached files" in the could-not-read line
 def test_encrypted_kinds():      # user password -> ReadError "encrypted"; a FOPN handler -> "drm"
 def test_broken_xref_read():     # shift=7 -> the text is read
-def test_unmapped_font_garble_warning():  # through reader.convert into a temp dir: an unmapped Type0 font -> "1 text run without Unicode"
-                                          # in unread, and "garbled" in meta warnings when its output is U+FFFD
 ```
 
-- [ ] **Step 2: Run the tests to see them fail.** Expected: FAIL with `ModuleNotFoundError: reader.formats.pdf`.
+  `test_unmapped_font_garble_warning` goes through `reader.convert`, which needs pdf in `BUILT`, so it is written in Task 13.
+
+- [ ] **Step 2: Run the tests to see them fail.** Expected: FAIL with `AttributeError` for `parse_bytes` (Task 7's `pdf.py` holds only two caps).
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run the tests to see them pass**, then the full-suite check.
-- [ ] **Step 5: Commit** `scripts/reader/formats/pdf.py tests/test_reader_pdf.py` with the message `reader: pdf pages become "## Page N" sections with tables, images, fields and comments; hidden text, scans, figures and every cap counted`.
+- [ ] **Step 5: Commit** `scripts/reader/formats/pdf.py scripts/reader/__init__.py tests/test_reader_pdf.py` with the message `reader: pdf pages become "## Page N" sections with tables, images, fields and comments; hidden text, scans, figures and every cap counted`.
 
 ### Task 13: pdf is built — the format table, convert, cache key and CLI
 
 **Files:**
-- Modify: `scripts/reader/__init__.py`, `scripts/reader/cache.py`, `scripts/read.py`, `tests/test_reader_cache.py`, `tests/test_reader_hwpx.py`, `tests/test_reader_zipx.py`
+- Modify: `scripts/reader/__init__.py`, `scripts/reader/cache.py`, `scripts/read.py`, `README.md` (the built list only), `tests/test_reader_cache.py`, `tests/test_reader_hwpx.py`, `tests/test_reader_zipx.py`, `tests/test_reader_gate.py` (`:591-592` only), `tests/test_reader_pdf.py` (`test_unmapped_font_garble_warning`, moved here from Task 12)
 
 **Interfaces:**
 - **Produces, `__init__.py`:**
   - `FORMATS["pdf"] = "pdf"` and `"pdf" in BUILT`, for 41. `SKILL_EXTS` is deleted. `VERSION = "0.5.0"`.
-  - `STARTED = time.monotonic()` at import.
+  - `STARTED = time.monotonic()` at import is already there (Task 12). `convert` passes `started=STARTED` to pdf's `parse`; no other caller does, and `pdf.parse_bytes` takes `clock()` at entry when `started` is None.
   - `parse(path, ctx, **opts)` passes `opts` to the format's `parse` only when given.
   - `convert(src, out_dir, hidden=False, **opts)`. When `doc.meta` has an `engine`, `meta.json` gains:
     - `engine`, `pages_total`, `unrendered` and `figures` from it;
@@ -850,12 +882,14 @@ def test_unmapped_font_garble_warning():  # through reader.convert into a temp d
     - the key is `cache.key(src, engine_id)`, where `engine_id` is `pdfenv.engine_id_from_module()` for pdfium (Task 14) and `"native"` otherwise;
     - `-p{A}-{B}` is added for a range, and then `-hidden`.
   - Until Task 14 lands, pdfium is never chosen: the engine is native.
+- **Produces, `README.md`:** `` `pdf` `` joins the "Built formats:" list. Task 17 writes the pdf paragraph.
 
 - [ ] **Step 1: Write the failing tests:**
   - `test_reader_cache.py:259-262` loses the `x.pdf` unsupported case.
   - `test_cli_formats` expects 41.
   - `test_reader_zipx.py:35` becomes `assert len(reader.FORMATS) == 41 and not hasattr(reader, "SKILL_EXTS")`.
   - `test_reader_hwpx.py:64` expects 41.
+  - `test_reader_gate.py:591-592`: the damaged `b"%PDF-1.7\n" + bytes(64)` file now expects a deny (pdf is built). Task 16 changes it again, to pass-through.
   - Add:
 
 ```python
@@ -863,23 +897,26 @@ def test_unmapped_font_garble_warning():  # through reader.convert into a temp d
 def test_key_engine():           # k0 = key(p); key(p, "native") != k0; key(p, "pdfium-5.15.2-7000") not in (k0, key(p, "native"))
 def test_code_digest_json():     # code_digest(base) changes when a .json file under base changes, not when a .txt does
 def test_prune_markers():        # offers/x and failed/y aged 2 days -> removed; aged 1 hour -> kept; pdf-declined aged 2 days -> kept
-def test_cli_convert_pdf():      # simple_pdf("Hi") saved as x.pdf -> returncode 0; out.md has "## Page 1" and "Hi"; meta engine "native",
+def test_cli_convert_pdf():      # simple_pdf([text_ops("Hi")]) saved as x.pdf -> returncode 0; out.md has "## Page 1" and "Hi"; meta engine "native",
                                  # pages [[1, n]], pages_total 1
 def test_cli_pages_range():      # 4 pages, --pages 2-3 -> "## Page 2" and "## Page 3" only; the entry's folder name ends "-p2-3"
 def test_cli_pdfium_without_module():  # --engine pdfium under sys.executable (no pypdfium2) -> native output, meta engine "native",
                                        # entry == cache.key(src, "native")
+# tests/test_reader_pdf.py (moved from Task 12)
+def test_unmapped_font_garble_warning():  # through reader.convert into a temp dir: an unmapped Type0 font -> "1 text run without Unicode"
+                                          # in unread, and "garbled" in meta warnings when its output is U+FFFD
 ```
 
-- [ ] **Step 2: Run the tests to see them fail.** Run the three files. Expected: FAIL, with `len(FORMATS) == 40`.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run the tests to see them pass**, then the full-suite check. `test_reader_gate.py` may now fail where it expects pdf to pass through; Task 16 updates those tests.
-- [ ] **Step 5: Commit** `scripts/reader/__init__.py scripts/reader/cache.py scripts/read.py tests/test_reader_cache.py tests/test_reader_hwpx.py tests/test_reader_zipx.py` with the message `reader: pdf is built (41 formats); convert takes --engine and --pages, the cache key holds the engine id, and the code digest covers json data; version 0.5.0`.
+- [ ] **Step 2: Run the tests to see them fail.** Run the three files and `tests/test_reader_pdf.py`. Expected: FAIL, with `len(FORMATS) == 40`.
+- [ ] **Step 3: Implement**, and add `` `pdf` `` to the README's built list.
+- [ ] **Step 4: Run the tests to see them pass**, then the full-suite check. `test_reader_gate.py` must pass too: the damaged pdf now denies, and `test_readme_formats_match` finds `` `pdf` ``.
+- [ ] **Step 5: Commit** `scripts/reader/__init__.py scripts/reader/cache.py scripts/read.py README.md tests/test_reader_cache.py tests/test_reader_hwpx.py tests/test_reader_zipx.py tests/test_reader_gate.py tests/test_reader_pdf.py` with the message `reader: pdf is built (41 formats); convert takes --engine and --pages, the cache key holds the engine id, and the code digest covers json data; version 0.5.0`.
 
 ### Task 14: `pdfenv`, `read.py setup` and the pinned requirements
 
 **Files:**
 - Create: `scripts/reader/pdfenv.py`, `scripts/reader/pdfsetup.py`, `scripts/reader/requirements-pdf.txt`, `tests/test_reader_pdfenv.py`
-- Modify: `scripts/read.py`
+- Modify: `scripts/read.py`, `tests/pdf_fix.py`
 
 **Interfaces:**
 - **Produces, `requirements-pdf.txt`:**
@@ -920,14 +957,15 @@ def test_cli_pdfium_without_module():  # --engine pdfium under sys.executable (n
   - `convert` of a `.pdf` with no `--engine`:
     - when `pdfenv.state(venv_dir()) == "READY"` and `sys.executable` is not that interpreter, it re-runs itself as `[interpreter, "-I", "-X", "utf8", READ_PY, "convert", …, "--engine", "pdfium"]` and relays the output and exit code;
     - otherwise it uses native.
+- **Produces, `tests/pdf_fix.py`:** `fake_venv(dir, *, build=7000) -> Path`, a fake READY venv for this file's tests and Task 16's: an interpreter file, `pyvenv.cfg` whose `home` is an existing dir, `RECORD` files for `pypdfium2` and `pypdfium2_raw` listing one file each with its digest, and `ready.json` (the current requirements hash, 5.15.2, `build`, the two `RECORD` digests). `state` is READY and `verify` is True on it.
 
 - [ ] **Step 1: Write the failing tests.** Each builds its folders in a temporary dir, with `PHRO_READER_CACHE`, `PHRO_READER_PYENV` and `CLAUDE_PLUGIN_DATA` set and restored by a context manager:
 
 ```python
 def test_venv_dir_order():       # PYENV=X -> X; unset + PLUGIN_DATA=D -> D/pdf-venv; both unset + pointer {"venv": P} -> P; none -> cache base/pdf-venv
 def test_off_forces_native():    # PYENV=off -> forced_native() and engine() == "native" even with a READY venv at the default place
-def test_ready_engine_id():      # fake venv: interpreter file, pyvenv.cfg home = an existing dir, ready.json (current hash, 5.15.2, build 7000)
-                                 # -> state READY, engine() == "pdfium-5.15.2-7000"
+def test_ready_engine_id():      # pdf_fix.fake_venv(DIR) (interpreter file, pyvenv.cfg home = an existing dir, ready.json with the current
+                                 # hash, 5.15.2, build 7000) -> state READY, verify True, engine() == "pdfium-5.15.2-7000"
 def test_stale_after_pin_change():  # ready.json requirements "0" * 64 -> STALE, engine native
 def test_broken_home():          # pyvenv.cfg home = a missing dir -> BROKEN, engine native
 def test_missing():              # no folder -> MISSING
@@ -953,7 +991,7 @@ def test_pdfenv_import_light():  # a child imports reader.pdfenv -> no reader.fo
 - [ ] **Step 3: Read the wheel digests** from PyPI's JSON (a web read) and write `requirements-pdf.txt`.
 - [ ] **Step 4: Implement** `pdfenv.py`, `pdfsetup.py` and the `read.py` commands. No test may run the real `Steps`.
 - [ ] **Step 5: Run the tests to see them pass**, then the full-suite check.
-- [ ] **Step 6: Commit** `scripts/reader/pdfenv.py scripts/reader/pdfsetup.py scripts/reader/requirements-pdf.txt scripts/read.py tests/test_reader_pdfenv.py` with the message `reader: read.py setup creates the pinned, hash-checked pypdfium2 venv only when run, with a ready marker, a pointer file and check, decline and remove modes`.
+- [ ] **Step 6: Commit** `scripts/reader/pdfenv.py scripts/reader/pdfsetup.py scripts/reader/requirements-pdf.txt scripts/read.py tests/pdf_fix.py tests/test_reader_pdfenv.py` with the message `reader: read.py setup creates the pinned, hash-checked pypdfium2 venv only when run, with a ready marker, a pointer file and check, decline and remove modes`.
 
 ### Task 15: The pdfium front end
 
@@ -962,7 +1000,7 @@ def test_pdfenv_import_light():  # a child imports reader.pdfenv -> no reader.fo
 - Modify: `scripts/reader/formats/pdf.py`
 
 **Interfaces:**
-- **Consumes:** Task 7's types, Task 11's `NativeDoc`, Task 12's caps.
+- **Consumes:** Task 7's types (`PageData.short` included), Task 8's `field_entry` and `order_comments`, Task 11's `NativeDoc` (`.resources(index)` included), Task 12's caps, and `PDF_PAGE_OBJECTS` and `PDF_PAGE_IMAGES` in `formats/pdf.py`, read as `pdf.<NAME>` at call time.
 - **Produces, `pdf_pdfium.py`:**
   - `PdfiumDoc(data: bytes, native: NativeDoc | None)` raises:
     - `ReadError("encrypted", "user password")` on pdfium's password error;
@@ -975,16 +1013,16 @@ def test_pdfenv_import_light():  # a child imports reader.pdfenv -> no reader.fo
       - The size is the loose char box height.
       - Consecutive chars of one text object (`FPDFText_GetTextObject`) on one line form one `Fragment`, with `char_offsets` from the char boxes.
       - The render mode from `FPDFTextObj_GetTextRenderMode` sets `invisible`.
-    - **Paths:** `get_objects(filter=[FPDF_PAGEOBJ_PATH], max_depth=16)`. Each segment point goes through the object's matrix into `PathCollector`, with dochan's thin-fill and straight-curve rules. The walk stops at `PDF_PAGE_OBJECTS`, counted `page_part`.
-    - **Images:** `FPDF_PAGEOBJ_IMAGE` objects, with their bounds and `get_px_size()`.
+    - **Paths:** `get_objects(filter=[FPDF_PAGEOBJ_PATH], max_depth=16)`. Each segment point goes through the object's matrix into `PathCollector`, with dochan's thin-fill and straight-curve rules; its `segments` and `short_segments` fill `PageData.segments` and `.short`. The walk stops at `pdf.PDF_PAGE_OBJECTS`, counted `page_part`.
+    - **Images:** `FPDF_PAGEOBJ_IMAGE` objects, with their bounds and `get_px_size()`. At most `pdf.PDF_PAGE_IMAGES` a page; the rest count `image`.
       - DCT keeps its raw data.
       - Over `images._MAX_PIXELS` pixels, the box is rendered at `CROP_DPI` instead.
       - Anything else becomes a PNG from `get_bitmap(render=False)`, through `images._png`.
     - **Render:** `render(box, dpi)` calls `page.render(scale=dpi / 72, crop=…, rev_byteorder=True)` with the long side capped at `RENDER_LONG`. A page over 200 inches renders at the cap. RGB rows go to `images._png`.
     - **Links:** `FPDFLink_Enumerate`, `FPDFLink_GetAnnotRect`, `FPDFLink_GetAction`, `FPDFAction_GetType` and `FPDFAction_GetURIPath`, with `annotations.SCHEMES` only.
-    - **Comments:** `FPDFAnnot_GetSubtype`, `GetStringValue("T" / "Contents")`, `FPDFAnnot_GetFlags` and the `IRT` link, under `PDF_ANNOTS`.
-    - **Fields:** `FPDFAnnot_GetFormFieldName`, `…AlternateName`, `…Value` and `…Type`, with check boxes through `FPDFAnnot_IsChecked` and the export value. UTF-16LE buffers have the NUL stripped. The labels and rules are Task 8's.
-  - **OCG pages:** when `native` is given and `native.oc.any_off(page resources)`, that page's fragments come from `native.page(index).fragments` (decision 3).
+    - **Comments:** `FPDFAnnot_GetSubtype`, `GetStringValue("T" / "Contents")`, `FPDFAnnot_GetFlags` and the `IRT` link, under `PDF_ANNOTS`. The reply order comes from `annotations.order_comments`.
+    - **Fields:** `FPDFAnnot_GetFormFieldName`, `…AlternateName`, `…Value` and `…Type`, with check boxes through `FPDFAnnot_IsChecked` and the export value. UTF-16LE buffers have the NUL stripped. Each field goes through `annotations.field_entry`, and a returned `cut` counts `field`.
+  - **OCG pages:** when `native` is given and `native.oc.any_off(native.resources(index))`, that page's fragments come from `native.page(index).fragments` (decision 3).
   - The module docstring says: pypdfium2's pdfium has no V8 or XFA, so no JavaScript runs.
 - **Produces, `pdf.py`:**
   - `parse_bytes(engine="pdfium")` opens the native structure first. Its `encrypted` and `drm` errors propagate, and its `damaged` error is kept for later.
@@ -994,12 +1032,13 @@ def test_pdfenv_import_light():  # a child imports reader.pdfenv -> no reader.fo
   - It reads pdf bytes on stdin and a JSON option object from `argv[1]`: `{"patch": {name: value}, "pages": [a, b] | null, "hidden": bool}`.
   - It patches `reader.formats.pdf` constants and runs `parse_bytes(data, ctx, engine="pdfium")` with `markdown.render` into a temporary dir.
   - It prints one JSON line: `{"md", "skipped", "meta", "assets": [[name, size, sniffed width, height]], "modules": sorted(sys.modules)}`.
+  - On a `ReadError` it prints `{"error": [kind, detail]}` instead.
 - **Produces, `test_reader_pdfium.py`:** `run(data, **opts)` calls `subprocess.run([interpreter, "-I", "-X", "utf8", "tests/pdfium_run.py", json], input=data)`. `main()` prints `skip: no pdf venv` and `pass` when there is no venv.
 
 - [ ] **Step 1: Write the failing tests:**
 
 ```python
-def test_pdfium_text():          # simple_pdf("Hello world") -> "Hello world" under "## Page 1", meta engine "pdfium"
+def test_pdfium_text():          # simple_pdf([text_ops("Hello world")]) -> "Hello world" under "## Page 1", meta engine "pdfium"
 def test_pdfium_surrogates():    # a ToUnicode mapping one code to U+1F600 -> "😀" once, no U+FFFD
 def test_pdfium_spacing():       # one-glyph TJ text with 0.5 gaps and one 4.0 gap -> "WORD ONE"
 def test_pdfium_table():         # a ruled 2x2 grid with text -> a pipe table
@@ -1008,12 +1047,13 @@ def test_pdfium_scan_rendered(): # a Letter page with no text and a full-page gr
 def test_pdfium_figure_crop():   # 40 filled paths over 10% of the page -> one png linked, meta figures [1]
 def test_pdfium_renders_cap():   # patch PDF_RENDERS 2, 4 scanned pages -> 2 images, unrendered [3, 4], skipped scan 2
 def test_pdfium_pixel_cap():     # a 5000x5000 gray image -> the asset is a CROP_DPI render of its box (long side <= 1568), not 5000 px
+def test_pdfium_image_cap():     # patch PDF_PAGE_IMAGES 2, three distinct 64x64 images on one page -> 2 assets, skipped image 1
 def test_pdfium_fields():        # text with /TU, a checked box, an empty field -> "> Field Name: Kim", "> Field Agree: Yes", nothing for the empty one
 def test_pdfium_comments():      # a Text annot by Ann and its reply -> two "> Comment by" lines, the parent first
 def test_pdfium_link_schemes():  # https and javascript: links -> one "[…](https://…)", the other text only
 def test_pdfium_hidden_rules():  # Tr 3 with no image, off-crop and 0.5 pt text -> 3 hidden places
 def test_pdfium_ocg_via_native():  # an OCG-off text object -> left out and counted hidden; visible text on the same page read
-def test_pdfium_encrypted():     # R6 with the empty password -> text read; user password -> skipped is empty and the child prints a ReadError "encrypted"
+def test_pdfium_encrypted():     # R6 with the empty password -> text read; user password -> the child prints {"error": ["encrypted", …]}
 def test_pdfium_no_xref_falls_back():  # make_pdf(xref="none") -> text read, meta engine "native"
 def test_pdfium_outline_headings():    # outline (1, "Intro", 0) -> "### Intro"
 def test_pdfium_rotated_page():  # /Rotate 90 with three rotated Latin lines -> lines in order, words whole
@@ -1031,18 +1071,19 @@ def test_pdfium_imports_only():  # "PIL" and "pdfplumber" not in modules
 - Modify: `scripts/reader/gate.py`, `scripts/read.py` (only `hook --data`, if Task 1 takes that branch), `hooks/hooks.json` (the same branch), `tests/test_reader_gate.py`
 
 **Interfaces:**
-- **Consumes:** Task 1's F1, F1b, F2, F4a and F4b; Task 13's `cache.key(path, engine)` and `convert --engine/--pages`; Task 14's `pdfenv`.
+- **Consumes:** Task 1's F1, F1b, F2, F4a and F4b; Task 13's `cache.key(path, engine)` and `convert --engine/--pages`; Task 14's `pdfenv` and `pdf_fix.fake_venv(dir, *, build=7000)`.
 - **Produces, `gate.py`:**
   - **Text check:** `looks_like_text` returns False when `b"%PDF-"` is in the first 1,024 bytes.
   - **Skill:** `SKILL_OF["pdf"] = "pdf"`. `EDIT_HINT` stays OOXML-only.
   - **Hint:** `PDF_HINT = ' Pages start at "## Page N" lines. Read-only view; to edit or create a pdf, use the pdf skill.'`
-  - **Offer:** `OFFER = ' Read by the built-in parser; pypdfium2 5.15.2 (PyPI, about 4 MB) reads tables, scans and forms better. Ask the user whether to install it, and only on their yes run: python -I -X utf8 "{read_py}" setup --venv "{dir}" (or the same with --decline if they never want it).'` and `REPAIR` (decision 11).
+  - **Offer:** `OFFER = ' Built-in parser used; pypdfium2 (PyPI, 4 MB) reads tables, scans and forms better. Ask the user; only on yes run: python -I -X utf8 "{read_py}" setup --venv "{dir}" (--decline instead if they never want it).'` (194 characters without the two paths; `CONTEXT_MAX` stays 600) and `REPAIR` (decision 11).
   - `parse_pages(v) -> tuple[int, int] | None` (decision 13).
   - `_pdf(event, path, start, timeout, command) -> dict | None`, which `decide` calls for pdf:
     - **Engine:**
       - `pdfenv.engine()` gives the id.
       - On a cache miss with pdfium, `pdfenv.verify(venv)` runs. A False makes the engine native and the offer the repair one.
-      - The child is `[pdfenv.interpreter(venv), …, "--engine", "pdfium"]` for pdfium and `[sys.executable, …, "--engine", "native"]` otherwise. `command=` still replaces it in tests.
+      - The child is `[pdfenv.interpreter(venv), …, "--engine", "pdfium"]` for pdfium and `[sys.executable, …, "--engine", "native"]` otherwise.
+      - For pdf, `command` is a prefix: the default `[<interpreter>, "-I", "-X", "utf8", READ_PY, "convert"]`, or `command=` in tests. The gate appends `[path, "--engine", e]`, plus `["--pages", "A-B"]` for a range. Other formats keep `command=` as the full argv.
     - **Failure marker:** `cache.root() / "failed" / k` younger than 86,400 s passes through at once.
     - **Pass-through:** `damaged`, `timeout` (including the hook's own budget) and an internal error write the marker and pass through.
       - With F2 TRUE they return `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": f"phro-project could not convert {name} ({why}); Claude's own Read is used."}}`, where `why` is the deny text's reason.
@@ -1061,14 +1102,15 @@ def test_pdfium_imports_only():  # "PIL" and "pdfplumber" not in modules
   - **`_context` for pdf** fits, in order:
     1. the head with the hidden count;
     2. `PDF_HINT`;
-    3. the offer, whole or not at all;
-    4. ` Pages not shown as images: <ranges>; Read the pdf with pages="<first range, at most 20 pages>" to see them.`;
-    5. ` Vector figures on pages <list> are linked as images.`;
-    6. the unread list;
-    7. for long outputs, ` Pages at lines: <n>:<line>, …` with every k-th page for the smallest k that fits, replacing the heading index;
-    8. the garble warning.
+    3. the past-the-end sentence (decision 11), when `A > pages_total`;
+    4. the offer, whole or not at all;
+    5. ` Pages not shown as images: <ranges>; Read the pdf with pages="<first range, at most 20 pages>" to see them.`;
+    6. ` Vector figures on pages <list> are linked as images.`;
+    7. the unread list;
+    8. for long outputs, ` Pages at lines: <n>:<line>, …` with every k-th page for the smallest k that fits, replacing the heading index;
+    9. the garble warning.
 
-    The garble tail is reserved first, as now. Lists 4-7 are cut with `…` by `_fit`.
+    The garble tail is reserved first, as now. Lists 5-8 are cut with `…` by `_fit`.
 - **Produces, F1 branch:** when Task 1 found F1 FALSE and F1b TRUE:
   - `hooks.json`'s Read command gains ` --data "${CLAUDE_PLUGIN_DATA}"`.
   - `read.py hook --data D` sets `os.environ["CLAUDE_PLUGIN_DATA"] = D` when `D` is non-empty and not literally `${CLAUDE_PLUGIN_DATA}`.
@@ -1076,16 +1118,19 @@ def test_pdfium_imports_only():  # "PIL" and "pdfplumber" not in modules
 
 - [ ] **Step 1: Write the failing tests:**
   - `test_pass_through` drops `"a.pdf"`.
-  - The `%PDF-1.7` lines at `:591-592` now expect the F2 pass-through result for a damaged pdf.
+  - The `%PDF-1.7` lines at `:591-592` now expect the F2 pass-through result for a damaged pdf (Task 13 made them expect a deny).
+  - `test_offer_fits_with_hint` uses install-length paths (`read.py` about 85 characters, the venv dir about 68): the head, `PDF_HINT` and the offer must fit in 600 together.
   - Add, using `stub()`'s cache env and `pdf_fix` files written to a temp dir:
 
 ```python
-def test_pdf_converts_native():  # simple_pdf("Hi") -> "allow"; context starts with the head, has PDF_HINT and the offer
-def test_engine_in_key():        # a fake READY venv (Task 14's helper) and command= the native CLI -> the stored entry == cache.key(p, engine id)
+def test_pdf_converts_native():  # simple_pdf([text_ops("Hi")]) -> "allow"; context starts with the head, has PDF_HINT and the offer
+def test_engine_in_key():        # pdf_fix.fake_venv(DIR) READY with PYENV=DIR; an entry pre-stored under cache.key(p, "pdfium-5.15.2-7000");
+                                 # command= a script that exits 3 -> "allow" served from that entry, the child never run
 def test_verify_fail_repairs():  # the fake venv's RECORD file altered -> converted native, context has "failed its file check"
 def test_pages_values_parsed():  # parse_pages(" 3 - 5 ") == (3, 5); "7" -> (7, 7); "5-3", "0", "3,5", "x", 7 -> None
 def test_pages_offset_limit():   # 4 pages read, pages="2-3" -> offset == line of "## Page 2", limit == line of "## Page 4" - offset; "pages" per F4a
-def test_pages_past_cut_range(): # PDF_PAGES patched to 2 in the child (a stub CLI), pages="3-4" -> served out.md under "-p3-4" holds "## Page 3"
+def test_pages_past_cut_range(): # PDF_PAGES patched to 2 in the child (a stub CLI given as the command= prefix), pages="3-4" -> the child gets
+                                 # "--pages", "3-4" appended; served out.md under "-p3-4" holds "## Page 3"
 def test_pages_unrendered_pass_through():  # meta unrendered [2, 3], pages="2-3" -> None; pages="1-3" -> allow
 def test_pages_past_end():       # 4 pages, pages="9" -> allow, no "pages" in updatedInput, context has 'The pdf has 4 pages; pages="9-9" starts past its end.'
 def test_pdf_damaged_pass_through():  # b"%PDF-1.7\n" + bytes(64) -> F2 output (or None); failed/<key> exists; a second decide never runs
@@ -1095,17 +1140,21 @@ def test_pdf_encrypted_denies(): # a user-password pdf -> "deny", the reason end
 def test_offer_once_per_session():  # session_id "s1": the first decide has the offer, the second not; "s2" has it; no session_id -> every time
 def test_offer_never_after_decline():  # pdf-declined exists -> no offer
 def test_offer_not_when_off():   # PHRO_READER_PYENV=off -> no offer
-def test_offer_fits_with_hint(): # name "n" * 40 + ".pdf", hidden 3, unread 5 kinds -> len < 600, the hint and the offer whole
+def test_offer_fits_with_hint(): # install-length paths: READ_PY patched to an 85-character path, the venv dir 68 characters; name "n" * 24 +
+                                 # ".pdf", 120 lines, 3 images, hidden 3, unread 5 kinds -> head 149 + PDF_HINT 94 + offer 347 = 590 fit in
+                                 # 600 (at most 599); len < 600, the hint and the offer whole, the unread list left to _fit
 def test_offer_dropped_when_long():  # name "n" * 250 + ".pdf" -> no offer, no offers/ marker written
 def test_many_unrendered_fit():  # meta unrendered = every odd page of 1..300, figures 1..50 -> len < 600, the unrendered sentence present with
                                  # "…" and pages="1-1"
-def test_pdf_context_order():    # all items present -> index order: hint < offer < "Pages not shown" < "Vector figures" < "Some parts" <
-                                 # "Pages at lines" < "garbled"
+def test_pdf_context_order():    # all items present -> index order: hint < "starts past its end" < offer < "Pages not shown" < "Vector figures" <
+                                 # "Some parts" < "Pages at lines" < "garbled"
 def test_page_index_long():      # 3,000 lines over 300 pages -> "Pages at lines: 1:" in context, no "Sections at lines"
 def test_pdf_reader_off():       # PHRO_READER_OFF=pdf -> None
 def test_ascii_pdf_not_text():   # simple_pdf written with no binary comment line (pure ASCII) -> converted, not None
-def test_hook_data_arg():        # only on the F1 branch: read.py hook --data D sets the env for pdfenv
+def test_hook_data_arg():        # read.py hook --data D sets the env for pdfenv
 ```
+
+  `test_hook_data_arg` is defined only when Task 1 took the F1 branch; otherwise it is not written.
 
 - [ ] **Step 2: Run the tests to see them fail.** Run `python -I -X utf8 tests/test_reader_gate.py`. Expected: FAIL in `test_pdf_converts_native`.
 - [ ] **Step 3: Implement.** `test_import_is_light` must still hold: `pdfenv` and `cache` are imported inside `_pdf`.
@@ -1125,13 +1174,13 @@ def test_hook_data_arg():        # only on the F1 branch: read.py hook --data D 
     - scanned pages as images with no OCR, fields and comments, hidden layers and hidden text, and `pages`;
     - editing and creating with `anthropic-skills:pdf`;
     - pypdfium2's licence (Apache-2.0 or BSD-3-Clause; it is installed, not copied).
-  - `` `pdf` `` joins the built list.
+  - `` `pdf` `` is already in the built list (Task 13); this task keeps it there.
   - "Standard library only" gains "except the optional pdf engine in its own venv".
   - "40 in-scope extensions" becomes 41.
   - "Not done yet" reads "Phases 1, 2a, 2b, 2c and 2d (…, pdf) are built".
 - **Produces, `plugin.json`:** `"version": "0.16.0"`.
 
-- [ ] **Step 1: Run** `python -I -X utf8 tests/test_reader_gate.py test_readme_formats_match`. Expected: FAIL on `pdf`.
+- [ ] **Step 1: Run** the whole file, `python -I -X utf8 tests/test_reader_gate.py` (its `main()` ignores arguments, so no single test can be named). Expected: `pass`, `test_readme_formats_match` included, since Task 13 already put `` `pdf` `` in the built list; the README edit below has no failing test of its own.
 - [ ] **Step 2: Edit** the README and `plugin.json`.
 - [ ] **Step 3: Run the full-suite check.** It includes `test_readme_formats_match` and `test_notices_credit_port_sources`.
 - [ ] **Step 4: Commit** `README.md .claude-plugin/plugin.json` with the message `reader: the README describes pdf reading, the optional pypdfium2 venv and read.py setup; plugin 0.16.0`.
@@ -1142,13 +1191,14 @@ def test_hook_data_arg():        # only on the F1 branch: read.py hook --data D 
 - Modify: `tests/test_reader_mutation.py`
 
 **Interfaces:**
-- **Consumes:** `pdf.parse_bytes`, `pdf_fix`.
+- **Consumes:** `pdf.parse_bytes` (with `started` left None, so each case's deadline runs from its own entry; Task 12), `pdf_fix` (`make_pdf`'s `objstm`, Task 4).
 - **Produces:**
   - `pdf_seeds() -> list[bytes]`, each built in memory:
     - a two-page pdf with Helvetica text, a CID font with ToUnicode, a ruled table, a gray Flate image, a link, a comment, a filled field and an outline;
-    - the same with an xref stream and object streams;
+    - the same with an xref stream and object streams (`make_pdf(…, xref="stream", objstm=True)`);
     - the same under R4 AES.
   - Each seed is damaged with `plan(rng, size)` and read through `pdf.parse_bytes(data, Context(), engine="native")` and `markdown.render` with no image written. Every outcome is a `Doc` or a `ReadError`, under `SLOW`.
+  - `outcome`'s accepted kinds gain `"drm"`: a mutated R4 seed (`/Standard` to `/Stbndard`) is a non-Standard handler.
   - The module docstring names pdf among the formats.
 
 - [ ] **Step 1: Write the test** `test_pdf_mutations`, `CASES` cases per seed, as the other formats do.
@@ -1159,7 +1209,7 @@ def test_hook_data_arg():        # only on the F1 branch: read.py hook --data D 
 ### Task 19: Measure the caps
 
 **Files:**
-- Modify: `tests/test_reader_pdf.py` (`measure`), `scripts/reader/formats/pdf.py`, `scripts/reader/pdfnative/crypto.py` (cap values and comments only)
+- Modify: `tests/test_reader_pdf.py` (`measure`), `tests/pdfium_run.py` (the `"measure": "tables"` option), `scripts/reader/formats/pdf.py`, `scripts/reader/formats/pdf_tables.py`, `scripts/reader/pdfnative/crypto.py` (cap values and comments only)
 
 **Interfaces:**
 - **Produces, `tests/test_reader_pdf.py measure <what> [path]`:**
@@ -1167,6 +1217,7 @@ def test_hook_data_arg():        # only on the F1 branch: read.py hook --data D 
   - `tables <path>`: the 384-page file's pages through `NativeDoc.page` and `pdf_tables.tables`, timing the table assembly alone. It prints `TABLES <pages> <s>`, then the same under pdfium through `pdfium_run.py` with `{"measure": "tables"}`.
   - `native <path>`: the whole native conversion of the same file. It prints `NATIVE <pages read> <s>`.
   - `decrypt`: `DECRYPT_TOTAL` bytes of AES-256-CBC through `StandardSecurityHandler.decrypt`. It prints `DECRYPT <bytes> <s>`.
+- **Produces, `tests/pdfium_run.py`:** the option `"measure": "tables"` runs each page's `PageData` through `pdf_tables.tables` alone and prints `{"tables": [<pages>, <s>]}` instead of the usual line.
 - **The 384-page file:** spike id `e4bc4dca33`, where the id is sha1 of the absolute forward-slash path, first 10 hex. Find it with:
 
   ```bash
@@ -1201,7 +1252,7 @@ In this task and the next two, `<bench>` is `C:/Users/hunje/research/ai-document
   - The docstring says so.
 - **Produces, `phro_read.py`:**
   - `phro-read` gains `"pdf"` and `env_extra={"PHRO_READER_PYENV": "off"}` (native).
-  - A second `register(Adapter(name="phro-read-pdfium", kind="engine", formats=frozenset({"pdf"}), env="phro-read", env_extra={"PHRO_READER_PYENV": str(common.BENCH / "engines" / "phro-read-pdf" / "venv")}, convert=convert, version_cmd=…))`. Its version command prints `VERSION` and `pdfenv.engine()`.
+  - A second `register(Adapter(name="phro-read-pdfium", kind="engine", formats=frozenset({"pdf"}), env="phro-read", env_extra={"PHRO_READER_PYENV": str(common.BENCH / "engines" / "phro-read-pdf" / "venv")}, repo=<the phro-read adapter's repo>, install=[], install_alt=[], convert=convert, version_cmd=…))`. `repo`, `install` and `install_alt` have no defaults (`adapters/base.py:15-31`), so `repo` is copied from the existing phro-read adapter. Its version command prints `VERSION` and `pdfenv.engine()`.
 - **Produces, peers:**
   - dochan, xberg, anydoc and markitdown gain `"pdf"` where their README names PDF, each with a `README.md:<line>` citation beside `formats=`.
   - docling is left out: the spec makes it optional, and it is heavy.
@@ -1245,7 +1296,7 @@ def test_no_builtin_line():        # with BUILTIN {} the pages family section ha
   - The generated pdfs under `corpus/generated/pdf/` are indexed with `expect` set to their `<name>.expect.json`.
   - `corpus/generated/word/seed.pdf` is indexed with the word family's `truth.json`.
 - **Produces, `gen/pdfs.py`:**
-  - `pdf_fix()` loads `Path(PHRO_READ_SCRIPTS).parent / "tests" / "pdf_fix.py"` with `importlib.util.spec_from_file_location`.
+  - `pdf_fix()` loads `Path(PHRO_READ_SCRIPTS).parent / "tests" / "pdf_fix.py"` with `importlib.util.spec_from_file_location`. `pdf_fix.py` puts its own `scripts/` on `sys.path` when loaded (phro-project Task 4), so its `reader` imports work here.
   - `build() -> list[Path]` writes four clean pdfs, each with an expect list of the strings that must appear:
     - `comments.pdf`: a Text comment, a FreeText comment and a reply;
     - `off-layer.pdf`: visible text plus OCG-off text, whose expect holds only the visible text;
@@ -1291,7 +1342,7 @@ def test_pdf_bar_whole_with_parts():  # pick builtin>pdf 2,000 whole, engine 1,9
   - If Task 19's pdfium measures were deferred, run them now with `PHRO_READER_PYENV` set to this venv, and commit their figures in phro-project as Task 19 says.
 - [ ] **Step 2: Seeds and corpus.** Run:
   - `PHRO_READ_SCRIPTS=… python -I -X utf8 <bench>/harness/bench.py gen --only pdf`. Expected: four `GEN corpus/generated/pdf/…` lines.
-  - `python -I -X utf8 <bench>/harness/bench.py corpus --only pdf --no-scan --no-fetch`. Expected: a `COVERAGE` line for pdf with generated 5 and public 24 or more, Tika's 42 included.
+  - `python -I -X utf8 <bench>/harness/bench.py corpus --only pdf --no-scan --no-fetch`. Expected: a `COVERAGE` line for pdf with generated 5 and public at least 45 (the pdf rows already in `corpus/index.tsv`, Tika's 42 among them) plus the rows of `corpus/pdf_picks.tsv`.
   - `git -C <bench> diff --unified=0 corpus/index.tsv`. No removed row may show an old doc_id.
 - [ ] **Step 3: Run.** Use the doc_ids whose ext is pdf in `corpus/index.tsv`.
   - `PHRO_READ_SCRIPTS=C:/Users/hunje/phro-project/.claude/worktrees/doc-reader-phase2a/scripts python -I -X utf8 <bench>/harness/bench.py run --doc <id> [--doc <id> …]` runs every engine.

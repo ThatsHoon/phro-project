@@ -213,7 +213,7 @@ Note: no `UNKNOWN` remains. F2 and F4a rest on docs and binary text, not a live 
 - **Context.** These are fitted in order under `CONTEXT_MAX` (600):
   1. The existing head, with the hidden count.
   2. ` Pages start at "## Page N" lines. Read-only view; to edit or create a pdf, use the pdf skill.` This is `PDF_HINT`; `EDIT_HINT` stays OOXML-only.
-  3. The offer, in native mode only: ` Read by the built-in parser; pypdfium2 5.15.2 (PyPI, about 4 MB) reads tables, scans and forms better. Ask the user whether to install it, and only on their yes run: python -I -X utf8 "<READ_PY>" setup --venv "<DIR>" (or the same with --decline if they never want it).`
+  3. The offer, in native mode only: ` Built-in parser used; pypdfium2 (PyPI, 4 MB) reads tables, scans and forms better. Ask the user; only on yes run: python -I -X utf8 "<READ_PY>" setup --venv "<DIR>" (--decline instead if they never want it).` (Shortened at plan pre-flight so that, with real install paths, the head, `PDF_HINT` and the offer fit in 600.)
   4. ` Pages not shown as images: 3-9; Read the pdf with pages="3-9" to see them.`
   5. ` Vector figures on pages 4, 7 are linked as images.`
   6. The unread list.
