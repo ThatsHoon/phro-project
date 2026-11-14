@@ -47,7 +47,7 @@ class PDFFile:
             data = data[header:]
         self.data = data
         # Content that a cap dropped, by cap: collection, tree_depth, pages, objects,
-        # xref_sections, objstm.
+        # xref_sections, objstm, resolve_depth.
         self.cuts: Counter = Counter()
         self.warnings: List[str] = []
         self.trailer: Dict[str, Any] = {}
@@ -76,6 +76,7 @@ class PDFFile:
     # -- structure --
 
     def _parse_structure(self) -> None:
+        warnings, cuts = list(self.warnings), self.cuts.copy()  # before the first attempt
         start = self._find_startxref()
         ok = start is not None and self._parse_xref_chain(start)
         if (not ok or "Root" not in self.trailer) and self._junk:
@@ -88,6 +89,11 @@ class PDFFile:
                 self._reset()
                 self.data = stripped
                 ok = False
+            else:
+                # The byte-0 reading parsed: the failed first attempt leaves nothing behind.
+                self.warnings[:] = warnings
+                self.cuts.clear()
+                self.cuts.update(cuts)
         if not ok or "Root" not in self.trailer:
             self._rescanned = True  # a file recovered by scanning is not scanned again
             self._scan_objects()
@@ -333,6 +339,7 @@ class PDFFile:
             return self._cache[ref.num]
         # A stream /Length that names another stream nests get_object once per object.
         if self._nest >= MAX_RESOLVE_DEPTH:
+            self._cut("resolve_depth", "WARN: object references nest too deep; some are dropped")
             return None
         self._nest += 1
         try:

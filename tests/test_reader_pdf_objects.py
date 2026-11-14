@@ -358,6 +358,7 @@ def test_length_chain_no_recursion():
     objs[3003] = 1
     pf = PDFFile(make_pdf(objs))
     pf.get_object(PDFRef(3, 0))  # no RecursionError
+    assert pf.cuts["resolve_depth"] >= 1 and any("nest" in w for w in pf.warnings)
 
 
 def deep_tree(levels):
@@ -418,6 +419,7 @@ def byte0_junk_pdf(**kw):
 def test_junk_with_byte0_offsets():
     pf = PDFFile(byte0_junk_pdf(xref="stream", objstm=True))
     assert len(pf.pages()) == 1 and pf.recovered is False
+    assert pf.warnings == [] and not pf.cuts  # the failed first attempt leaves nothing
     assert page_text(pf) == text_ops("Hi")
     pf = PDFFile(byte0_junk_pdf())
     assert len(pf.pages()) == 1 and pf.recovered is False
