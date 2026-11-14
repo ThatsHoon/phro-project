@@ -174,6 +174,76 @@ def test_fixture_encodings_round_trip():
     assert got[(5 + 1799, 0)] == words[1799]
 
 
+def test_failed_sheet_leaves_no_cells():
+    bof = rec(0x0809, struct.pack("<HHHHII", 0x0600, 0x0010, 0, 0, 0, 6))
+    deep = {"name": "Deep", "cells": {(0, 0): "kept?"}, "records": [bof] * (limits.MAX_DEPTH + 2)}
+    ok = {"name": "Ok", "cells": {(0, 0): "fine"}}
+    ctx = Context()
+    wb = xls.Workbook(biff_workbook([deep, ok]), ctx, sheet_grid.Budget())
+    secs = wb.sections()
+    assert [s.title for s in secs] == ["Ok"] and ctx.skipped["sheet"] == 1, (secs, dict(ctx.skipped))
+    assert 0 not in wb.cells and wb.cells[1] == {(0, 0): "fine"}, wb.cells
+
+
+def cells_of(sheet, **kw):
+    """(the Workbook's cells of sheet 0, its context) for a one-sheet workbook."""
+    ctx = Context()
+    wb = xls.Workbook(biff_workbook([dict(sheet, name="S")], **kw), ctx, sheet_grid.Budget())
+    wb.sections()
+    return wb.cells[0], ctx
+
+
+def test_colinfo_last_column_0x100():
+    info = rec(0x007D, struct.pack("<HHHHHH", 1, 0x100, 2560, 15, 1, 0))
+    wb = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, 1): "a", (0, 300): "c"},
+                                      "records": [info]}]), Context(), sheet_grid.Budget())
+    (t,) = wb.sheet_blocks(0)
+    assert t.hidden_cols == frozenset(range(256)), sorted(t.hidden_cols)[-3:]  # columns 1..256 of 1..300
+
+
+def test_labelsst_out_of_range_is_dropped():
+    pre = struct.pack("<HHH", 0, 1, 15)
+    bad = rec(0x00FD, pre + struct.pack("<I", 99))
+    got, ctx = cells_of({"cells": {(0, 0): "ok"}, "records": [bad]})
+    assert got == {(0, 0): "ok"} and not ctx.skipped, (got, dict(ctx.skipped))
+
+
+def test_formula_bool_and_error_results():
+    got, _ = cells_of({"cells": {(0, 0): ("f", True), (0, 1): ("f", ("err", 0x07)), (0, 2): ("f", ("err", 0x63))}})
+    assert got == {(0, 0): "TRUE", (0, 1): "#DIV/0!", (0, 2): "#N/A"}, got
+
+
+def test_lost_string_after_formula():
+    pre = struct.pack("<HHH", 0, 0, 15)
+    formula = rec(0x0006, pre + bytes([0, 0, 0, 0, 0, 0, 0xFF, 0xFF]) + struct.pack("<HIH", 0, 0, 0))
+    number = rec(0x0203, struct.pack("<HHH", 1, 0, 15) + struct.pack("<d", 5.0))
+    stray = rec(0x0207, struct.pack("<HB", 3, 0) + b"abc")  # a STRING with no FORMULA before it
+    got, ctx = cells_of({"records": [formula + number + stray]})
+    assert got == {(1, 0): "5"} and not ctx.skipped, (got, dict(ctx.skipped))
+
+
+def test_very_hidden_sheet():
+    sheets = [{"name": "Open", "cells": {(0, 0): "shown"}}, {"name": "Deep", "state": 2, "cells": {(0, 0): "buried"}}]
+    md, _ = run(sheets)
+    assert "shown" in md and "buried" not in md and "(1 hidden places left out)" in md, md
+    md, _ = run(sheets, hidden=True)
+    assert "buried" in md, md
+
+
+def test_ixfe_out_of_range_is_general():
+    num = rec(0x0203, struct.pack("<HHH", 0, 0, 999) + struct.pack("<d", 1234.5))
+    got, ctx = cells_of({"records": [num]})
+    assert got == {(0, 0): "1234.5"} and not ctx.skipped, (got, dict(ctx.skipped))
+
+
+def test_sheet_without_eof_is_read():
+    data = biff_workbook([{"name": "S", "cells": {(0, 0): "last"}}])
+    assert data.endswith(rec(0x000A))
+    wb = xls.Workbook(data[:-4], Context(), sheet_grid.Budget())
+    wb.sections()
+    assert wb.cells[0] == {(0, 0): "last"}, wb.cells
+
+
 def test_all_sheets_bad():
     data = biff_workbook([{"name": "One", "cells": {(0, 0): "first"}}])
     got = denied(lambda: convert_bytes(patch_offsets(data, {0: len(data) + 500})))
