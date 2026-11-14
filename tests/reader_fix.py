@@ -1312,9 +1312,6 @@ def ppt_shape(spec, ids, *, inside=False):
     ids[0] = max(ids[0], spid) + 1
     box = spec.get("box")
     anchor = ppt_anchor(box, child=inside and not spec.get("client"), wide=bool(spec.get("wide"))) if box else b""
-    if kind == "picture":
-        return oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75),
-                            oa_record(0xF00B, struct.pack("<HI", 0x4104, spec["pib"]), ver=3, inst=1), anchor)
     if kind == "group":
         flags = 0x201 | spec.get("flags", 0)
         head = oa_record(0xF00A, struct.pack("<II", spid, flags), ver=2)
@@ -1325,7 +1322,9 @@ def ppt_shape(spec, ids, *, inside=False):
         head += anchor
         members = [ppt_shape(c, ids, inside=True) for c in spec.get("children", ())]
         return oa_container(0xF003, oa_container(0xF004, head), *members)
-    out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=202)
+    out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75 if kind == "picture" else 202)
+    if kind == "picture":
+        out += oa_record(0xF00B, struct.pack("<HI", 0x4104, spec["pib"]), ver=3, inst=1)
     out += anchor
     data = b""
     if spec.get("placeholder") is not None:
@@ -1408,7 +1407,7 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     encrypt (any string): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist object and
     the UserEditAtom's encryptSessionPersistIdRef; the streams themselves are not encrypted.
     shapes: a list of dicts that replaces the slide's own text shapes in its PPDrawing (the SLWT is unchanged). A dict
-    is a text shape, kind "group" or kind "picture" (keys pib, the 1-based BStore index, and box; no text); kind
+    is a text shape, kind "group" or kind "picture" (key pib, the 1-based BStore index; box, text, placeholder and ref as for a text shape); kind
     "object" raises NotImplementedError for Task 20. Keys: kind ("text" by default), spid, box ((left, top, right, bottom): a ClientAnchor at the top level, a
     ChildAnchor inside a group, unless client is true; wide makes the ClientAnchor 16 bytes), text and text_kind (a
     text run of TextHeaderAtom type text_kind, 1 by default), placeholder (an OEPlaceholderAtom of that type in the

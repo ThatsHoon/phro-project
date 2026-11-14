@@ -103,13 +103,12 @@ class Presentation:
             if ref is not None and ref < len(outline) and ref not in used:
                 used.add(ref)
                 runs.insert(0, outline[ref])
+            if shape.placeholder in skip:
+                continue
             if shape.kind == "picture":
                 image = self.pictures.image(shape.pib)
                 if image is not None:
                     out.append((_PICTURE, [image], ""))
-                continue
-            if shape.placeholder in skip:
-                continue
             title = shape.placeholder in ppt_shapes.TITLES
             out.extend((_TITLE_SHAPE if title and kind not in _TITLES else kind, blocks, plain)
                        for kind, blocks, plain in runs)

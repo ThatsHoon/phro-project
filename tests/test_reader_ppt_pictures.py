@@ -71,6 +71,23 @@ def test_dib_to_png():
     assert list(assets) == ["img-001.png"] and assets["img-001.png"].startswith(b"\x89PNG"), (out, assets)
 
 
+def test_picture_keeps_its_text():
+    shape = dict(pic(), text="caption text")
+    out, ctx, assets = build([{"shapes": [shape]}], pictures=[blip_png(PNG)])
+    assert len(assets) == 1 and out.count("caption text") == 1, out
+    assert out.index("![](assets/img-001.png)") < out.index("caption text"), out
+    slide = {"title": "T", "body": ["outline caption"], "outline": True,
+             "shapes": [dict(pic(), ref=1), {"placeholder": 13, "ref": 0, "box": (0, 10, 400, 50)}]}
+    out, ctx, assets = build([slide], pictures=[blip_png(PNG)])
+    assert len(assets) == 1 and out.count("outline caption") == 1, out
+    assert out.index("![](assets/img-001.png)") < out.index("outline caption"), out
+
+
+def test_skipped_placeholder_picture():
+    out, ctx, assets = build([{"shapes": [dict(pic(), placeholder=9)]}], pictures=[blip_png(PNG)])
+    assert not assets and not ctx.skipped, (assets, dict(ctx.skipped))
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
