@@ -11,7 +11,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import markdown  # noqa: E402
+from reader import limits, markdown  # noqa: E402
 from reader.containers import biff12 as b12  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
 from reader.formats import xlsb  # noqa: E402
@@ -75,6 +75,31 @@ def test_fields_wide():
     raise AssertionError("expected ValueError")
 
 
+def test_record_cap():
+    old = limits.BIN_RECORDS
+    limits.BIN_RECORDS = 5
+    try:
+        ctx = Context()
+        got = list(b12.records(b"".join(biff12(5, b"x") for _ in range(9)), ctx))
+        assert len(got) == 5 and ctx.skipped["record"] == 1, (len(got), dict(ctx.skipped))
+        ctx = Context()  # exactly the cap is no overrun
+        assert len(list(b12.records(b"".join(biff12(5, b"x") for _ in range(5)), ctx))) == 5 and not ctx.skipped
+    finally:
+        limits.BIN_RECORDS = old
+
+
+def test_wide_does_not_run_into_the_next_record():
+    first = struct.pack("<I", 4) + "ab".encode("utf-16-le")  # says 4 characters, holds 2
+    data = first + biff12(6, "cdef".encode("utf-16-le"))
+    f = b12.Fields(data, 0, len(first))
+    try:
+        f.wide()
+    except ValueError:
+        assert f.pos == 4, f.pos  # only the length was taken
+        return
+    raise AssertionError("expected ValueError")
+
+
 def test_bad_sst_item_skipped():
     def good(s):
         return biff12(19, b"\0" + xlsb_wide(s))
@@ -101,6 +126,16 @@ def test_bundlesh_fallback():
     wb, ctx = read([{"name": "x"}], workbook_records=[rec])
     assert wb.sheets == [("Sheet 1", "xl/worksheets/sheet1.bin", 0)], wb.sheets
     assert ctx.skipped["record"] == 1, ctx.skipped
+
+
+def test_bundlesh_fallback_orders_rids_by_number():
+    # rId10 sorts after rId9: the tenth short record falls back to the tenth worksheet, not to rId10's string place
+    sheets = [{"name": f"s{i}", "cells": {(0, 0): f"v{i}"}} for i in range(1, 12)]
+    records = [xlsb_bundle(f"s{i}", f"rId{i}", 0, i) for i in range(1, 12)]
+    records[9] = biff12(156, struct.pack("<II", 0, 10))  # no strings: the tenth sheet gets its fallback name
+    wb, ctx = read(sheets, workbook_records=records)
+    assert wb.sheets[9] == ("Sheet 10", "xl/worksheets/sheet10.bin", 0), wb.sheets[9]
+    assert ctx.skipped["record"] == 1, dict(ctx.skipped)
 
 
 def test_cell_xfs_only():
@@ -275,6 +310,22 @@ def test_bad_cell_record_recovery():
     assert "(could not read: 1 damaged record)" in out and ctx.skipped["record"] == 1, (out, ctx.skipped)
 
 
+def test_bad_row_header_counts_its_row_once():
+    # a BrtRowHdr too short to hold its row: the cells of that row go with it, counted once; the next row is read
+    records = [xlsb_row(0), xlsb_cell(5, 0, 0, struct.pack("<d", 1.0)),
+               biff12(0, b"\x01"), xlsb_cell(5, 0, 0, struct.pack("<d", 2.0)),
+               xlsb_cell(5, 1, 0, struct.pack("<d", 3.0)), xlsb_cell(5, 2, 0, struct.pack("<d", 4.0)),
+               xlsb_row(2), xlsb_cell(6, 0, 0, xlsb_wide("after"))]
+    out, ctx = md([{"name": "S", "records": records}])
+    lines = out.splitlines()
+    assert "after" in lines and "1" in lines and "2" not in lines, out
+    assert ctx.skipped["record"] == 1, dict(ctx.skipped)
+    # a cell before any row header has no row, and is counted on its own
+    out, ctx = md([{"name": "S", "records": [xlsb_cell(5, 0, 0, struct.pack("<d", 1.0)), xlsb_row(1),
+                                              xlsb_cell(6, 0, 0, xlsb_wide("ok"))]}])
+    assert "ok" in out and ctx.skipped["record"] == 1, (out, dict(ctx.skipped))
+
+
 def test_framing_break_keeps_rows():
     cells = {(0, 0): "r0", (1, 0): "r1", (2, 0): "r2"}
     out, ctx = md([{"name": "S", "cells": cells, "records": [bytes([5, 50])]}])
@@ -365,6 +416,49 @@ def test_unreadable_chart_counted():
     out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
     assert "t" in out and "Chart:" not in out, out
     assert "(could not read: 2 charts)" in out and ctx.skipped["chart"] == 2, (out, ctx.skipped)
+
+
+def test_chart_past_chart_total():
+    parts = with_drawing(anchor(0, chart_frame("rId1")), anchor(1, chart_frame("rId2")),
+                         rels=[("rId1", "chart", "../charts/chart1.xml"), ("rId2", "chart", "../charts/chart1.xml")],
+                         extra={"xl/charts/chart1.xml": BAR})
+    old, limits.CHART_TOTAL = limits.CHART_TOTAL, 6  # one BAR table is 4 cells
+    try:
+        out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
+    finally:
+        limits.CHART_TOTAL = old
+    assert out.count("Chart: bar") == 1 and ctx.skipped["chart"] == 1, (out, dict(ctx.skipped))
+    assert "(could not read: 1 chart)" in out, out
+
+
+def test_pictures_past_image_bytes():
+    parts = with_drawing(anchor(0, pic("rId1")), anchor(1, pic("rId1")),
+                         rels=[("rId1", "image", "../media/image1.png")], extra={"xl/media/image1.png": PNG})
+    old, limits.IMAGE_BYTES = limits.IMAGE_BYTES, len(PNG) + 1  # copies are counted: the second does not fit
+    try:
+        out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
+    finally:
+        limits.IMAGE_BYTES = old
+    assert out.count("assets/img-") == 1 and ctx.skipped["image"] == 1, (out, dict(ctx.skipped))
+
+
+def test_drawing_part_named_twice():
+    again = rels_xml(("rId1", "drawing", "../drawings/drawing1.xml"))
+    parts = with_drawing(anchor(0, pic("rId1")), rels=[("rId1", "image", "../media/image1.png")],
+                         extra={"xl/media/image1.png": PNG, "xl/worksheets/_rels/sheet2.bin.rels": again})
+    out, ctx = md([{"name": "A", "cells": {(0, 0): "a"}}, {"name": "B", "cells": {(0, 0): "b"}}], extra_parts=parts)
+    assert out.count("assets/img-") == 1 and ctx.skipped["object"] == 1, (out, dict(ctx.skipped))
+    assert "(could not read: 1 embedded object)" in out, out
+
+
+def test_chart_without_series_is_unread():
+    # kept: a chart part with no series reads as "could not read", as in the slide and Word readers
+    bare = ('<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea>'
+            '<c:barChart/></c:plotArea></c:chart></c:chartSpace>')
+    parts = with_drawing(anchor(0, chart_frame("rId1")), rels=[("rId1", "chart", "../charts/chart1.xml")],
+                         extra={"xl/charts/chart1.xml": bare})
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
+    assert "Chart:" not in out and ctx.skipped["chart"] == 1, (out, dict(ctx.skipped))
 
 
 def test_chartsheet_chart():

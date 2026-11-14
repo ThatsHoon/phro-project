@@ -1,4 +1,5 @@
 """Test helpers for the document reader tests."""
+import struct
 import zipfile
 from pathlib import Path
 
@@ -1121,7 +1122,6 @@ def biff12(rid: int, body: bytes = b"") -> bytes:
 
 def xlsb_wide(text):
     """An XLWideString (u32 cch, UTF-16LE), or the null string for None."""
-    import struct
     if text is None:
         return struct.pack("<I", 0xFFFFFFFF)
     return struct.pack("<I", len(text)) + text.encode("utf-16-le")
@@ -1129,33 +1129,31 @@ def xlsb_wide(text):
 
 def xlsb_bundle(name, rid, state=0, tab=1, extra=b""):
     """A BrtBundleSh record; `extra` goes before strRelID."""
-    import struct
     return biff12(156, struct.pack("<II", state, tab) + extra + xlsb_wide(rid) + xlsb_wide(name))
 
 
 def xlsb_row(r, hidden=False):
     """A BrtRowHdr: the row, seven filler bytes, then the flag byte (0x10 is hidden)."""
-    import struct
     return biff12(0, struct.pack("<I", r) + bytes(7) + bytes([0x10 if hidden else 0]))
 
 
 def xlsb_cell(rid, col, style, body=b""):
     """A cell record: column, style (a cellXfs index), then `body`."""
-    import struct
     return biff12(rid, struct.pack("<II", col, style) + bytes(body))
 
 
 def make_xlsb(path, sheets, *, formats=None, date1904=False, workbook_records=None, extra_parts=None):
-    """Write an .xlsb package: content types, rels, workbook.bin, styles.bin, sharedStrings.bin, one sheet part per dict.
+    """Write an .xlsb package: content types, rels, workbook.bin, styles.bin, sharedStrings.bin, one sheet part per
+    dict.
 
-    A sheet dict has Task 5's keys (name, state, cells, ...), `chartsheet` (its relationship is a chartsheet) and `records`, raw BIFF12 records (bytes) for the sheet
-    part. Shared strings come from the str cells; each ("fmt", number, code) cell format gets a cell XF after the
-    General one (a str code is a custom format, an int a built-in format id). The `cells` of a sheet are also written
-    as records before `records`: a row header per row, then BrtCellIsst for a str, BrtCellBool for a bool, BrtCellReal
-    for a number and BrtCellReal in the format's XF for a ("fmt", number, code). `workbook_records` replaces the generated BrtBundleSh records. `extra_parts` adds
+    A sheet dict has Task 5's keys (name, state, cells, ...), `chartsheet` (its relationship is a chartsheet) and
+    `records`, raw BIFF12 records (bytes) for the sheet part. Shared strings come from the str cells; each
+    ("fmt", number, code) cell format gets a cell XF after the General one (a str code is a custom format, an int a
+    built-in format id). The `cells` of a sheet are also written as records before `records`: a row header per row,
+    then BrtCellIsst for a str, BrtCellBool for a bool, BrtCellReal for a number and BrtCellReal in the format's XF
+    for a ("fmt", number, code). `workbook_records` replaces the generated BrtBundleSh records. `extra_parts` adds
     parts or replaces generated ones ({name: bytes}); a None value leaves a part out.
     """
-    import struct
     formats = dict(formats or {})
     strings = list(dict.fromkeys(v for sh in sheets for v in sh.get("cells", {}).values() if isinstance(v, str)))
     codes = list(dict.fromkeys(v[2] for sh in sheets for v in sh.get("cells", {}).values()

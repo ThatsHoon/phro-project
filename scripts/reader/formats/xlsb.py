@@ -259,18 +259,19 @@ class _Sheets:
         if part in self.wb.chartsheets:  # a chartsheet has no cell records: its drawing is all there is
             return self.drawing(part)
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
-        row = None
+        row, lost = None, False  # lost: the row header was bad, so its row is counted (once) and its cells go with it
         for rid, data, off, size in _walk(self.pkg, part, self.ctx):
             try:
                 if rid == BRT_ROW_HDR:
-                    row = None
+                    row, lost = None, True
                     f = biff12.Fields(data, off, size)
                     row = f.u32()
+                    lost = False
                     f.skip(7)
                     if f.u8() & 0x10:
                         grid.hide_row(row)
                 elif rid in _CELLS:
-                    if grid.cut:
+                    if grid.cut or lost:
                         continue
                     if row is None:  # a cell before any row header has no row
                         self.ctx.skipped["record"] += 1
@@ -383,7 +384,7 @@ class _Sheets:
 
     def chart(self, part: str, rid, out: list) -> None:
         tbl = ooxml_base.chart(self.pkg, part, rid, self.ctx)
-        if tbl is None:
+        if tbl is None:  # kept: a chart part with no series is "could not read" too, as in the slide and Word readers
             self.ctx.skipped["chart"] += 1
             return
         self.chart_cells += sum(len(r) for r in tbl.rows)
