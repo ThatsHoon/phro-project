@@ -460,6 +460,10 @@ Result against the routing pick on the bench corpus, one line per extension:
 - `docm`: PASS.
 - `odt`: PASS.
 - `xps`: PASS, though its two public documents are scored only against engines that include this reader.
+- `docx`: PASS (fidelity 0.832 against 0.625). For the native four the bar compares text-only tokens, since linked images are opened only when needed; the pick also loads the skill's SKILL.md once a session, which is not counted.
+- `pptx`: PASS (fidelity 0.861 against 0.680); text-only tokens are 2% over the pick, inside the bar.
+- `xlsx`: PASS (fidelity 0.714 against 0.705) after one fix: SmartArt anchored on a sheet was dropped without a count and is now read.
+- `xlsm`: PASS (fidelity 0.841 against 0.687). markitdown, the xlsx skill's command, read all three files; none of them holds VBA.
 - `epub`: MISS on tokens only; the bench counts linked images as viewed, text-only tokens are below the pick.
 - `hwpx`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
 - `odp`: MISS on tokens only; linked images are counted, text-only tokens are below the pick.
