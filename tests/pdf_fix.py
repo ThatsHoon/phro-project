@@ -470,3 +470,28 @@ def truetype_cmap_font(gid_to_code):
     for _tag, body in tables:
         out += body + bytes(-len(body) % 4)
     return bytes(out)
+
+
+def ocg_catalog(off, on=()):
+    """Catalog entries for optional content: `OCProperties` listing the groups with the given
+    object numbers, those in `off` switched off in the default configuration and those in `on`
+    on. Pass it as simple_pdf(catalog=...); the tests define the group objects themselves."""
+    return {"OCProperties": {"OCGs": [Ref(n) for n in (*off, *on)],
+                             "D": {"BaseState": Name("ON"), "ON": [Ref(n) for n in on],
+                                   "OFF": [Ref(n) for n in off]}}}
+
+
+def form_xobject(content, *, oc=None, matrix=None):
+    """A Form XObject stream with a 612 x 792 /BBox and no /Resources of its own (it uses the
+    caller's). `oc` is the object number (or Ref) of a group or membership dictionary."""
+    d = {"Type": Name("XObject"), "Subtype": Name("Form"), "BBox": [0, 0, 612, 792]}
+    if matrix is not None:
+        d["Matrix"] = list(matrix)
+    if oc is not None:
+        d["OC"] = oc if isinstance(oc, Ref) else Ref(oc)
+    return Stream(d, content)
+
+
+def rule_ops(x0, y0, x1, y1, w=0.5):
+    """A stroked line from (x0, y0) to (x1, y1) with line width `w`."""
+    return b"%s w %s %s m %s %s l S" % tuple(_num(v).encode() for v in (w, x0, y0, x1, y1))
