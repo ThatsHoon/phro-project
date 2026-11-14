@@ -619,6 +619,24 @@ def test_read_py_does_not_shadow_stdlib():
     assert r.returncode == 0 and "ok" in r.stdout, r.stderr
 
 
+def test_stale_outlasts_pip_timeout():
+    from reader import pdfsetup
+    assert pdfsetup.STALE_SECONDS > pdfsetup.PIP_TIMEOUT
+
+
+def test_read_py_before_site_packages():
+    code = ("import sys; sys.path.insert(0, %r); import read; "
+            "here = read._HERE; "
+            "p = read._place(['/x/lib/python3.12', here, '/x/lib/site-packages', '/y'], here); "
+            "assert p == ['/x/lib/python3.12', here, '/x/lib/site-packages', '/y'], p; "
+            "p = read._place([here, '/x/lib', '/x/lib/site-packages'], here); "
+            "assert p == ['/x/lib', here, '/x/lib/site-packages'], p; "
+            "assert read._place(['/x/lib'], here) == ['/x/lib', here]; print('ok')" % str(HERE / "scripts"))
+    r = subprocess.run([sys.executable, "-X", "utf8", "-c", code], capture_output=True, text=True,
+                       cwd=tempfile.gettempdir())
+    assert r.stdout.strip() == "ok", r.stdout + r.stderr
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -2,11 +2,22 @@
 import os
 import sys
 
-# This folder holds project CLIs named like stdlib modules (queue.py): it must come last on sys.path so the
-# standard library wins, while `reader` (only here) still imports.
+# This folder holds project CLIs named like stdlib modules (queue.py): it must come after the standard library
+# on sys.path, and before site-packages, so an installed package named `reader` cannot take our place.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path[:] = [p for p in sys.path if os.path.normcase(os.path.abspath(p or ".")) != os.path.normcase(_HERE)]
-sys.path.append(_HERE)
+
+
+def _place(paths: list, here: str) -> list:
+    """`paths` without `here`, then `here` put just before the first site-packages entry (else last)."""
+    key = os.path.normcase(here)
+    rest = [p for p in paths if os.path.normcase(os.path.abspath(p or ".")) != key]
+    for i, p in enumerate(rest):
+        if os.path.basename(os.path.normpath(p)).lower() in ("site-packages", "dist-packages"):
+            return rest[:i] + [here] + rest[i:]
+    return rest + [here]
+
+
+sys.path[:] = _place(sys.path, _HERE)
 
 import argparse  # noqa: E402
 import contextlib  # noqa: E402

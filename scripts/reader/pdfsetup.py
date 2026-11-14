@@ -13,8 +13,8 @@ from pathlib import Path
 
 from . import cache, pdfenv
 
-STALE_SECONDS = 600
 PIP_TIMEOUT = 900
+STALE_SECONDS = 1080  # past PIP_TIMEOUT, so a slow but live pip never loses its lock or its tmp folder
 READ_PY = Path(__file__).resolve().parents[1] / "read.py"
 PIP_ARGS = ["-I", "-m", "pip", "install", "--isolated", "--no-input", "--disable-pip-version-check",
             "--only-binary", ":all:", "--no-deps", "--require-hashes", "-r"]
