@@ -1,14 +1,15 @@
-"""Charts and pictures anchored on a sheet, shared by the xlsb and xlsx readers.
+"""Charts, pictures and SmartArt anchored on a sheet, shared by the xlsb and xlsx readers.
 
 The drawing anchors were checked against anydoc `sheet/xlsx.rs` (drawing anchors). A sheet's drawing part is XML: its
-charts (cached values as a table, charged against `CHART_TOTAL`) and pictures (charged against `IMAGE_BYTES`) come in
-anchor order. One `Drawings` serves all the sheets of a workbook, so the image byte count, the chart cell count and the
-set of drawing parts already read are shared by them.
+charts (cached values as a table, charged against `CHART_TOTAL`), pictures (charged against `IMAGE_BYTES`) and SmartArt
+text (a nested list, charged against `SMARTART_NODES`) come in anchor order. One `Drawings` serves all the sheets of a
+workbook, so the image byte count, the chart cell count, the SmartArt item count and the set of drawing parts already
+read are shared by them.
 """
 from .. import limits
 from ..containers.zipx import attr, local, first
 from ..limits import ReadError
-from . import ooxml_base
+from . import ooxml_base, smartart
 
 MAX_ANCHORS = 10_000  # drawing anchors one drawing part reads
 _ANCHORS = ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor")
@@ -26,6 +27,7 @@ class Drawings:
         self.seen: set[str] = set()  # drawing parts read
         self.image_bytes = 0         # image bytes placed (IMAGE_BYTES)
         self.chart_cells = 0         # chart table cells placed (CHART_TOTAL)
+        self.smartart_nodes = 0      # SmartArt items placed (SMARTART_NODES)
 
     def blocks(self, part: str, rels: dict | None = None) -> list:
         """The charts and pictures of the drawing parts that the sheet relationships name, in anchor order. `rels` is
@@ -66,9 +68,14 @@ class Drawings:
         found.sort(key=lambda t: t[:4])
         out = []
         for *_, a in found:
-            for el in self._descend(a, nsmap, ("chart", "pic")):
+            for el in self._descend(a, nsmap, ("chart", "pic", "relIds")):
                 if local(el.tag) == "chart":
                     self.chart(part, attr(el, "id"), out)
+                elif local(el.tag) == "relIds":
+                    got = smartart.items(self.pkg, part, attr(el, "dm"), self.ctx,
+                                         limits.SMARTART_NODES - self.smartart_nodes)
+                    self.smartart_nodes += len(got)
+                    out += got
                 else:
                     blip = first(el, "blip")
                     self.picture(part, attr(blip, "embed") if blip is not None else None, out)
