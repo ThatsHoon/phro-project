@@ -371,6 +371,7 @@ def test_vertical_text():
              font_type0(tounicode={1: "A"}, vertical=True))
     assert len(pc.fragments) == 1
     assert writing_direction(pc.fragments[0]) == "down" and pc.fragments[0].text == "A"
+    assert pc.fragments[0].vertical and not run(text_ops("A")).fragments[0].vertical
 
 
 def test_unmapped_font_counted():

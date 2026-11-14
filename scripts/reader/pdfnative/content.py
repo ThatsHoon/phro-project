@@ -630,7 +630,7 @@ class _Page:
             space_width=abs(metrics.metrics(32)[0]) / 1000.0 * fs * scale, order=len(frags),
             dir_x=-start_tm[2], dir_y=-start_tm[3], up_x=start_tm[0], up_y=start_tm[1],
             invisible=st.tr in (3, 7), font=st.fname, obj=max(self.text_object, 0),
-            hidden="ocg" if off else ""))
+            hidden="ocg" if off else "", vertical=True))
 
     @staticmethod
     def _skip_inline_image(data: bytes, pos: int) -> int:

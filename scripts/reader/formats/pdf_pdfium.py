@@ -418,6 +418,7 @@ class PdfiumDoc:
         checked = set()  # text objects whose second char was looked at for a vertical advance
         marks = self.native is None  # with native, an off layer's page is native's (decision 3)
         vertical = False
+        upright = set()  # text objects of a vertical font
         run = None  # the fragment being built: a dict
         seen = 0    # non-space chars kept
         bad = False
@@ -426,7 +427,7 @@ class PdfiumDoc:
         def begin(px, py, start, end, base, axis, size):
             return {"addr": addr, "x": px, "y": py, "dx": axis[0], "dy": axis[1], "ux": axis[2],
                     "uy": axis[3], "base": base, "start": start, "end": end, "size": size,
-                    "text": [], "offsets": [], "gaps": [], "first": None}
+                    "text": [], "offsets": [], "gaps": [], "first": None, "vertical": addr in upright}
 
         def flush():
             nonlocal run
@@ -506,6 +507,7 @@ class PdfiumDoc:
                         and abs(step_x * dx + step_y * dy) <= LINE_TOLERANCE * abs(size)):
                     # a vertical font: the run's first char is placed again on the vertical axes
                     vertical = True
+                    upright.add(addr)
                     axes[addr] = dx, dy, ux, uy = -ux, -uy, dx, dy
                     fx, fy, fl, fr, fb, ft = run["first"]
                     first = run["text"][0]
@@ -557,7 +559,7 @@ class PdfiumDoc:
                         dir_y=run["dy"], up_x=run["ux"], up_y=run["uy"],
                         char_offsets=tuple(run["offsets"]) + (width,), char_gaps=tuple(run["gaps"]),
                         invisible=run["invisible"], font=run["font"], obj=run["obj"],
-                        hidden=run["hidden"])
+                        hidden=run["hidden"], vertical=run["vertical"])
 
     @staticmethod
     def _font(handle) -> str:

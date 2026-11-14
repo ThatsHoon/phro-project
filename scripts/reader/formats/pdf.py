@@ -250,7 +250,7 @@ class _Reader:
             self.part = True  # pdfnative counted this page read in part already
         if pd.cut.get("bad_coord", 0) > 0:
             self._lost_text()
-        turn = _turn(pd.rotate)
+        turn = pdf_layout.upright_turn(pd.fragments, _turn(pd.rotate))
         view = _view_page(turn, pd.box)
         keep = _Kept(pd.number, view)
         keep.comments = ([Para([Text(f"Field {label}: {value}")]) for label, value in pd.fields]

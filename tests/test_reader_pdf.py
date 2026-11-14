@@ -342,6 +342,22 @@ def test_rotated_page():
     assert not ctx.skipped, ctx.skipped
 
 
+def test_sideways_page_read_upright():
+    # a /Rotate 90 page whose text the content draws left to right: the viewer shows it running
+    # down the page, Latin turned with the page, not vertical writing; it reads as lines with
+    # the glyph-gap spaces ("Apache" is 40.692 wide at 12 pt Helvetica)
+    ops = [text_ops("Apache", 72, 700), text_ops("Tika", 116, 700), text_ops("toolkit", 72, 686)]
+    text, _, _ = md(simple_pdf([b" ".join(ops)], page_extra={"Rotate": 90}))
+    assert "Apache Tika toolkit" in text, text
+    # vertical writing (an Identity-V font) on an upright page stays columns, right one first
+    objs = font_type0(tounicode={1: "縦", 2: "書", 3: "日", 4: "本"}, vertical=True)
+    cols = (b"BT /F2 12 Tf 500 700 Td <00030004> Tj ET BT /F2 12 Tf 480 700 Td <00010002> Tj ET")
+    text, _, _ = md(simple_pdf([cols], resources={"Font": {"F1": Ref(3), "F2": Ref(100)}},
+                               extra_objects=objs))
+    assert "日本" in text and "縦書" in text, text
+    assert text.index("日本") < text.index("縦書"), text
+
+
 def test_baseline_drawn_out_of_order():
     # a table row whose cells the content stream draws right cell first: one line, left to right
     row = [text_ops("9.50", 400, 700), text_ops("0001", 72, 700), text_ops("PLAN", 120, 700),

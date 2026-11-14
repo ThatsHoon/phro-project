@@ -59,6 +59,8 @@ class Fragment:
     # before), in device units along the text direction; a kern is negative. Same length as the
     # text and under the same cap as char_offsets; empty when positions were not tracked.
     char_gaps: tuple = ()
+    # Drawn with a vertical font (WMode 1): its glyphs stand upright and advance down the page.
+    vertical: bool = False
 
 
 def writing_direction(frag: Fragment) -> str:
@@ -159,6 +161,25 @@ def rotate_into_view(fragments, rotate, box):
             dx, dy, ux, uy = -f.dir_y, f.dir_x, -f.up_y, f.up_x
         out.append(replace(f, x=x, y=y, dir_x=dx, dir_y=dy, up_x=ux, up_y=uy))
     return out
+
+
+_UPRIGHT = {"ltr": 0, "up": 90, "rtl": 180, "down": 270}  # the turn that makes it read ltr
+
+
+def upright_turn(fragments, turn) -> int:
+    """The quarter turn (0, 90, 180 or 270) to lay a page out in: the page's /Rotate `turn`,
+    unless it leaves the page's text sideways, running up or down in the viewer. Then the turn
+    in which that text reads left to right: Latin turned with the page is read along its own
+    lines, not as vertical writing. The page's text is the writing direction of most of its
+    visible chars outside vertical fonts."""
+    counts = Counter()
+    for f in fragments:
+        if f.text and not f.hidden and not f.vertical:
+            counts[writing_direction(f)] += sum(1 for ch in f.text if not ch.isspace())
+    if not counts:
+        return turn
+    need = _UPRIGHT[max(counts, key=counts.get)]
+    return need if (need - turn) % 180 == 90 else turn
 
 
 # ---- the Korean spacing table
