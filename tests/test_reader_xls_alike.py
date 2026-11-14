@@ -14,6 +14,7 @@ import reader  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.formats import xls_alike  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
+from reader.model import Context  # noqa: E402
 
 
 def run(data):
@@ -112,6 +113,56 @@ def test_long_field_keeps_other_rows():
     assert limits.SHEET_CHARS > 200_000
     import csv
     assert csv.field_size_limit() == 131072
+
+
+def parse_text(data):
+    """(the Doc, the Context) of parse_text over a file holding `data`."""
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "a.xls"
+        src.write_bytes(data)
+        ctx = Context()
+        return xls_alike.parse_text(src, ctx), ctx
+
+
+def test_cr_only_lines():
+    # a CR-only file has lines: line 1 picks the delimiter, and kind() looks at line 1 only
+    md = run("a,b\rc\td\r".encode("utf-8"))
+    assert "|a|b|" in md and "|c\td|" in md, md
+    assert xls_alike.kind(b"head\rbin\x01a,b\r") == "other"  # the comma is on line 2, and the head is not text
+    assert xls_alike.kind(b"a\tb\rc\r") == "text"
+    md = run("a\tb\rc,d\r".encode("utf-8"))
+    assert "|a|b|" in md and "|c,d|" in md, md
+
+
+def test_utf8_and_bom_text_named_xls():
+    rows = "이름,값\n가,1\n"
+    for data in (rows.encode("utf-8"), b"\xef\xbb\xbf" + rows.encode("utf-8")):
+        md = run(data)
+        assert "|이름|값|" in md and "|가|1|" in md and "\ufeff" not in md, (data[:4], md)
+
+
+def test_field_over_the_budget_counts_characters():
+    old, limits.SHEET_CHARS = limits.SHEET_CHARS, 200_000
+    try:
+        doc, ctx = parse_text(b"a,b\n" + b"x" * 250_000 + b",c\nlast,row\n")
+    finally:
+        limits.SHEET_CHARS = old
+    assert ctx.skipped["sheet_cut"] == 1 and not ctx.skipped["record"], dict(ctx.skipped)
+    assert any("cut at 200000 characters" in w for w in ctx.warnings), ctx.warnings
+
+
+def test_file_of_exactly_the_cap_is_not_cut():
+    # 404 bytes is the read cap for a 100 character budget; this file ends in two bytes UTF-8 would take for the
+    # start of a longer sequence, so only a file that really was cut may drop them
+    old, limits.SHEET_CHARS = limits.SHEET_CHARS, 100
+    try:
+        data = b"a,b\n" + b" " * 398 + b"\xea\xb0"
+        assert len(data) == 100 * 4 + 4
+        doc, ctx = parse_text(data)
+    finally:
+        limits.SHEET_CHARS = old
+    text = repr(doc)
+    assert b"\xea\xb0".decode("cp949") in text, text[-200:]
 
 
 def test_other_damaged():

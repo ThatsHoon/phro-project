@@ -133,6 +133,10 @@ class Grid:
         self._merges_cut = False
 
     # ---- input
+    def stop(self, what, n):
+        """End the sheet here: the caller found a limit `put` cannot see (a field past the whole `what` budget)."""
+        return self._stop(what, n)
+
     def _stop(self, what, n):
         self.cut = True
         self.ctx.warnings.append(f"sheet {self.name} cut at {n} {what}")

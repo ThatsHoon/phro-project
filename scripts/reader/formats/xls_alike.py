@@ -21,6 +21,7 @@ from . import sheet_grid
 HEAD = 64 * 1024
 _HTML_MARKS = (b"<html", b"<table", b"<!doctype html")
 _CONTROLS = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")  # characters plain text does not hold
+_LINE_END = re.compile(rb"\r\n|\r|\n")  # an old Mac file ends its lines with CR alone
 
 
 def utf16(head: bytes) -> str | None:
@@ -74,7 +75,7 @@ def kind(head: bytes) -> str:
     if body[:1] == b"<" and any(m in head.lower() for m in _HTML_MARKS):
         return "html"
     if b"\0" not in head:
-        first = head.split(b"\n", 1)[0]
+        first = _LINE_END.split(head, 1)[0]
         if b"\t" in first or b"," in first:
             return "text"
         if (b"\n" in head or b"\r" in head) and _plain(head):
@@ -112,12 +113,14 @@ def parse_text(path, ctx) -> Doc:
     budget = sheet_grid.Budget()
     cap = budget.cap_chars * 4 + 4  # a text longer than the character budget is cut by the grid anyway
     with open(path, "rb") as f:
-        data = f.read(cap)
-    text = _decode(data, len(data) >= cap)
-    first = text.split(chr(10), 1)[0]
+        data = f.read(cap + 1)  # one byte more: a file of exactly `cap` bytes was not cut
+    text = _decode(data[:cap], len(data) > cap)
+    first = re.split(r"\r\n|\r|\n", text, maxsplit=1)[0]
     delim = chr(9) if chr(9) in first else ","
     grid = sheet_grid.Grid("Sheet1", budget, ctx)
-    # a field may be as long as the whole character budget; the process-wide limit is raised only while reading
+    # A field may be as long as the whole character budget, so the csv module's process-wide field limit is raised
+    # for the read and put back after. Nothing in the reader runs conversions in threads (the gate runs each in a
+    # subprocess, and queue.py's server never calls the reader), so nothing else can see the raised limit.
     old = csv.field_size_limit(max(csv.field_size_limit(), budget.cap_chars + 1))
     try:
         for r, row in enumerate(csv.reader(io.StringIO(text, newline=""), delimiter=delim)):
@@ -126,8 +129,11 @@ def parse_text(path, ctx) -> Doc:
                     break
             if grid.cut:
                 break
-    except csv.Error:
-        ctx.skipped["record"] += 1
+    except csv.Error as e:
+        if str(e).startswith("field larger than field limit"):  # a field past the whole budget: characters, as put()
+            grid.stop("characters", budget.cap_chars)
+        else:
+            ctx.skipped["record"] += 1
     finally:
         csv.field_size_limit(old)
     return Doc(blocks=[Section("sheet", "Sheet1", blocks=grid.blocks())])
