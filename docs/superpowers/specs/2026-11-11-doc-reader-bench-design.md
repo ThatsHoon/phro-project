@@ -38,6 +38,16 @@ Formats that Anthropic's built-in skills read directly are left to those skills 
 - Engines whose claimed formats are all built-in are cloned but not installed, and recorded as not testable with that reason.
 - Generated pdf, docx, xlsx and pptx files remain only as intermediates. Real documents in built-in formats are not used.
 
+### Scope change (user, 2026-11-14)
+
+The engine now reads docx, pptx, xlsx and xlsm (`2026-11-14-doc-reader-ooxml-four-design.md`), so the bench measures them too. pdf alone stays with its skill and out of the bench until its own phase.
+
+- `BUILTIN` keeps only pdf, and the generated docx, pptx and xlsx seeds become corpus documents, with a new xlsm seed from LibreOffice's macro-enabled Excel export.
+- Public files are chosen by feature (tables, images, charts, comments, equations, SmartArt, hidden content), not as the three smallest, and Tika's test documents are added.
+- The builtin route for these four runs the skill's own command on the original file, with no LibreOffice step: `pandoc -t markdown` without `--extract-media`, `slide_text.py`, `markitdown`.
+- Each skill's SKILL.md load is reported in its own column, once per format, not added to any document's tokens. Where the builtin route gives no images, the token bar compares text tokens and lists image tokens beside them.
+- Real documents in these formats are still not used.
+
 ## Machine
 
 Windows 11, no NVIDIA GPU, about 15 GB RAM, 131 GB free on C:. Present: Python 3.12, Node 24, uv, git, winget, poppler (`pdftoppm`), Tesseract. Absent: LibreOffice, Calibre, Java, Rust, Docker, WSL.

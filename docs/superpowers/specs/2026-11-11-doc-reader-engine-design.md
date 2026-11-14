@@ -2,26 +2,27 @@
 
 ## Goal
 
-phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all 28 formats in scope. It is written in the Python standard library only, like the rest of `scripts/`, and is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
+phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all formats in scope: the 28 of decision 1, and since decision 7 also docx, pptx, xlsx and xlsm with their template and macro variants. It is written in the Python standard library only, like the rest of `scripts/`, and is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
 
 This is stage 4 of the user's request. Stages 1 to 3 (clone, test, report) are done: `C:\Users\hunje\research\ai-document-reader-plugins\bench` and its reports.
 
 Success:
 
 - Every in-scope extension converts through the gate with no other software installed.
-- On the bench, for every format with scored documents, the engine's fidelity is at least the current recommended route's minus 0.01, and its calibrated tokens are at most that route's plus 5%. Where it misses, the format's report says why and what it would take.
+- On the bench, for every format with scored documents, the engine's fidelity is at least the current recommended route's minus 0.01, and its calibrated tokens are at most that route's plus 5%. Where it misses, the format's report says why and what it would take. For docx, pptx, xlsx and xlsm the route is the skill's own read command run on the original file, and the skill's own load is reported in its own column (decision 7).
 - A document never reaches Claude as raw binary: the gate either swaps in the Markdown or blocks the Read with a reason.
 - Nothing is printed into a session that does not read a document. The plugin's always-on token cost does not change.
 - No real document's name or content enters this repository.
 
 ## Decisions (user, 2026-11-11)
 
-1. Scope: the 28 extensions of the bench that are not read by Anthropic's built-in skills. pdf, docx, pptx, xlsx and xlsm stay with `anthropic-skills:*`; the gate leaves them alone.
+1. Scope: the 28 extensions of the bench that are not read by Anthropic's built-in skills. pdf, docx, pptx, xlsx and xlsm stay with `anthropic-skills:*`; the gate leaves them alone. (Narrowed by decision 7.)
 2. One engine for all of them, rebuilt from reverse engineering, not a router over the bench's engines. The bench stays as the yardstick.
 3. The gate is a `PreToolUse` hook on `Read` that converts and swaps the path (`updatedInput`). If it cannot convert, it blocks the Read and says why.
 4. Permission deny rules may be ignored: the hook does not re-check them against the original path. Personal use.
 5. REA (morluto/rea) was installed and run on the engines' binaries. Every engine on the routing table is open source with its source cloned, so the reverse engineering was done on source. Notes: `research\ai-document-reader-plugins\reverse\*.md`.
 6. Build order: the gate and the zip+XML formats first, then the rest in phases (see Phases).
+7. (User, 2026-11-14.) The engine also reads docx, pptx, xlsx and xlsm, and dotx, dotm, potx, potm, ppsm, xltx and xltm: phase 2c, specified in `2026-11-14-doc-reader-ooxml-four-design.md`. This moves reading only; creating and editing these files stays with `anthropic-skills:*`. pdf stays with its skill until phase 2d.
 
 ## Reverse-engineering findings that shape the design
 
@@ -32,11 +33,12 @@ No engine wins a format on every axis; each wins different items. The engine tak
 | hwpx | dochan (container, `hp:switch`, image map, charts, footnotes, fields, span grid) | kordoc: numbering, alt-text stripping, layout-table unwrapping, final-state track changes | body text in heading styles (demote long sentence paragraphs) |
 | hwp | dochan (CFB reader, distribution docs, OLE charts, budgets) | kordoc: numbering, equation→LaTeX, password; rhwp: control-char semantics, per-item BinData compression, ViewText track changes, DRM sniffing | Hancom-native chart streams, grouped-shape text, BMP images |
 | odt/ods/odp | anydoc (style chain, span grid, row templates, display text) | docling: hidden sections and slides, comments, notes fields, chart local table; xberg: group recursion, master pages, hidden sheet marker | hidden text/rows, hidden sheets via table style, odp custom shapes |
-| docm/pptm/ppsx | anydoc (relationship discovery, style cascade, numbering, `Requires`-aware AlternateContent, grid) | dochan: charts, group geometry; docling: `w:vanish`, hidden slides, outlineLvl first; xberg: SDT placeholder drop | none of the engines gates correctly on content types: accept by root element |
+| docx/docm/dotx/dotm, pptx/pptm/ppsx/potx/potm/ppsm | anydoc (relationship discovery, style cascade, numbering, `Requires`-aware AlternateContent, grid) | dochan: charts, group geometry; docling: `w:vanish`, hidden slides, outlineLvl first; xberg: SDT placeholder drop; anydoc: OMML → TeX | none of the engines gates correctly on content types: accept by root element; SmartArt text and slide comments, written from the OOXML spec |
 | epub | docling (spine merge, link rewrite) | xberg: DRM skip, fallback chains, nav/TOC removal; anydoc: CSS `display:none` cascade, span grid | `epub:type` footnotes, ruby, `linear="no"` |
 | xps | none (only AGPL MuPDF) | written from the XPS/OXPS spec | reading order, columns, tables |
 | doc/xls/ppt | dochan (FIB walk, piece table, sprms, BIFF8, persist chain, charts, ppt tables) | anydoc: lid code pages, lists, hidden rows/cols | `sprmCFVanish`, hidden slides |
 | xlsb | anydoc (record framing, cells) | | both engines abort on one bad record |
+| xlsx/xlsm/xltx/xltm | anydoc (phonetics dropped, hidden rows and columns, merges) | dochan: streamed sheets, comments and threaded comments, hyperlinks | formulas with no cached value; sheets of styled empty cells (a scan cap) |
 | rtf | anydoc (byte lexer, `\u` with surrogates, edge grid, merges) | xberg: `\v` hidden, `\uc` stack | `\*` mid-group dropping whole sentences |
 | wpd | libwpd behaviour (via xberg), reimplemented | | tables, images, footnotes untested |
 | mobi/azw3 | format knowledge (PalmDOC, HUFF/CDIC, KF8 skeleton/fragments) | | Calibre failed on 2 of 4 files: fall back KF8 → MOBI6 → stripped text |
@@ -95,9 +97,9 @@ From what cost tokens or lost content in the bench outputs:
 - LF line endings, one blank line between blocks, no trailing spaces.
 - Inline formatting: bold only. Escape Markdown characters only where they would change the structure.
 - Tables: GFM pipes with no padding. Only when a table has merged cells, a compact HTML table with `rowspan`/`colspan`. A merged cell's text is written once. Empty trailing rows and columns are trimmed. A 1×1 table becomes a paragraph; a one-column table becomes lines; an empty nested table is dropped.
-- Spreadsheet cells show the displayed value (`₩1,385.50`, dates as formatted), not raw numbers. Formulas are off.
-- Slides: `## Slide N: Title`, speaker notes as `> Notes: …`. Sheets: `## Sheet: name`. Master, date, footer and slide-number placeholders are skipped.
-- Footnotes and comments: `[^n]` in place, definitions at the end of the document.
+- Spreadsheet cells show the displayed value (`₩1,385.50`, dates as formatted), not raw numbers. Formulas are off, except that an xlsx formula cell with no cached value shows its formula (`=SUM(A1:A3)`).
+- Slides: `## Slide N: Title`, speaker notes as `> Notes: …`, then slide comments as `> Comment by Author: …`. Sheets: `## Sheet: name`. Master, date, footer and slide-number placeholders are skipped.
+- Footnotes and comments: `[^n]` in place, definitions at the end of the document. A spreadsheet cell's comment is a footnote on its cell, and an external hyperlink stays a link in the cell.
 - Headers and footers: deduplicated, one `Header:`/`Footer:` line at the top; page-number-only ones dropped.
 - Images: written to `assets/img-NNN.<ext>` and linked as `![alt](assets/img-NNN.png)`. Never base64. BMP is converted to PNG. WMF, EMF and other formats Claude cannot view are kept as files and listed once in a note.
 - Hidden content (hidden text, rows, sheets, slides, sections) and tracked deletions are left out. The first line says how many places were left out; `convert --hidden` includes them, marked `(hidden)`.
@@ -109,11 +111,11 @@ From what cost tokens or lost content in the bench outputs:
 
 `gate.decide(event) -> dict | None`:
 
-1. Not a `Read`, or the extension is not one of the 28: print nothing, exit 0. The built-in five pass through.
+1. Not a `Read`, the extension is not in `FORMATS`, or it is listed in `PHRO_READER_OFF` (comma-separated extensions): print nothing, exit 0. pdf passes through.
 2. Look the file up in the cache (key = SHA-1 of the bytes + `reader.VERSION`). A hit skips conversion.
 3. Otherwise convert in a child process with a 45-second budget, so a hang cannot reach the hook timeout (on a hook timeout Claude Code would read the original binary).
-4. Success: `permissionDecision: "allow"`, `updatedInput` = the original input with `file_path` set to `out.md` (offset and limit kept), and `additionalContext`, under 600 characters: `<name> was converted to Markdown by phro-project (N lines, M images in assets/; Read them to view). k hidden places left out.` For outputs over 2,000 lines it adds the line numbers of the first-level headings so Claude can read by range.
-5. Failure: `permissionDecision: "deny"` with a one-line reason: unsupported (phase not built yet), encrypted (needs a password), DRM, damaged, too large, or timed out, plus the `convert` command to retry by hand.
+4. Success: `permissionDecision: "allow"`, `updatedInput` = the original input with `file_path` set to `out.md` (offset and limit kept), and `additionalContext`, under 600 characters: `<name> was converted to Markdown by phro-project (N lines, M images in assets/; Read them to view). k hidden places left out.` For outputs over 2,000 lines it adds the line numbers of the first-level headings so Claude can read by range. For the OOXML family (docx, docm, dotx, dotm, pptx, pptm, ppsx, potx, potm, ppsm, xlsx, xlsm, xltx, xltm) it adds `Read-only view (no XML, cell addresses or formulas); to edit the file, use the <docx|pptx|xlsx> skill.`
+5. Failure: `permissionDecision: "deny"` with a one-line reason: unsupported (phase not built yet), encrypted (needs a password), DRM, damaged, too large, or timed out, plus the `convert` command to retry by hand. For the OOXML family the reason also names the skill as the other way to read the file.
 
 The hook must also run correctly when Claude reads the converted file or an asset: those are `.md` and image paths, so rule 1 passes them through.
 
@@ -123,7 +125,7 @@ The hook must also run correctly when Claude reads the converted file or an asse
 
 ### Safety and errors
 
-- Budgets in `limits.py`: input 512 MiB; zip total uncompressed 1 GiB and ratio 200; CFB limits as in dochan (sectors, entries, depth 128, chain steps); records per stream; recursion depth 64; output 20 MB.
+- Budgets in `limits.py`: input 512 MiB; zip total uncompressed 1 GiB and ratio 200; CFB limits as in dochan (sectors, entries, depth 128, chain steps); records per stream; recursion depth 64; output 20 MB; cells scanned per xlsx workbook `SHEET_SCAN` (2,000,000, styled empty cells included); SmartArt nodes `SMARTART_NODES` (5,000).
 - Errors are isolated per record, part, sheet and slide: a bad record is skipped and counted, never the whole file. Only a container that cannot be opened fails the file.
 - Encryption: detected for every format and reported. Default passwords are tried where the format has one (xls `VelvetSweatshop`, ppt default, HWP distribution documents). User passwords and DRM are out of scope.
 - Garble check: if more than 5% of output characters are replacement or control characters, the warning goes into `additionalContext`.
@@ -138,6 +140,8 @@ The gate ships in phase 1. A format whose phase is not built yet is denied with 
 | 1 | hwpx, odt, ods, odp, docm, pptm, ppsx, epub, xps, vsdx | model, renderer, images, cache, gate, `zipx`, `html` |
 | 2a | hwp, doc | cfb, crypto (AES-128, MSVC rand), text code pages, officeart, mtef |
 | 2b | xls, ppt, xlsb, rtf | RC4, number formats, BIFF charts |
+| 2c | docx, pptx, xlsx, xlsm, dotx, dotm, potx, potm, ppsm, xltx, xltm | `ooxml_sheets`, `sheet_drawing` (moved out of xlsb), `omml`, streamed zip parts |
+| 2d | pdf | starts with a reverse-engineering note (rea), like phase 1-3's |
 | 3 | wpd, mobi, azw3, pages, numbers, key | `palmdb`, `snappy`, `pbwire` |
 | 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp | `iff`; each starts with a reverse-engineering note like phase 1-3's |
 
@@ -147,9 +151,10 @@ Phase 4's formats were not reverse engineered yet. Their plans start with that s
 
 - Unit tests in `tests/test_reader_*.py`, in the style of the existing tests. Fixtures are built inside the tests from bytes and XML strings (tiny zips, CFBs, PalmDBs); no real documents.
 - Tests per format cover the gaps in the findings table: hidden content, merged cells, numbering, footnotes, charts from caches, content-type-agnostic OOXML, `\*` mid-group RTF, xlsb bad-record recovery, KF8 fallback, tile rows over 256.
-- The gate: allow with a swapped path, deny on failure, pass-through for other files, cache hit, timeout.
+- The gate: allow with a swapped path, deny on failure, pass-through for other files, cache hit, timeout; for the OOXML family, the edit sentence and `PHRO_READER_OFF`.
+- xlsx: streamed sheets against `SHEET_SCAN`, with styled empty cells built in memory.
 - Bench: a `phro-read` adapter in the bench harness, run with `python -I -X utf8 harness/bench.py run`. The success bar is checked per format against `reports/written/routing.tsv`, and each phase ends with a short addendum to the bench reports.
 
 ## Out of scope
 
-OCR of scanned pages or images; user passwords and DRM removal; editing or writing documents; the five built-in formats; rendering WMF/EMF.
+OCR of scanned pages or images; user passwords and DRM removal; editing or writing documents; pdf until phase 2d; rendering WMF/EMF.
