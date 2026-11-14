@@ -32,10 +32,16 @@ from . import pdf_layout, pdf_tables
 PDF_PAGE_OBJECTS = 100_000  # page objects (text, path, image, form) interpreted per page
 PDF_PAGE_IMAGES = 64        # images kept per page
 PDF_PAGES = 5_000           # pages read per conversion; the rest count page_cut
-PDF_DEADLINE = 36.0         # seconds from the start for the page loop; the rest count page_cut
+# seconds from the start for the page loop; the rest count page_cut. Measured on the 384-page spike file (id
+# e4bc4dca33): native 11.1 s for all 384 pages, pdfium 9.2-9.6 s in the child; both finish under it
+PDF_DEADLINE = 36.0
 PDF_PAGE_SECONDS = 4.0      # seconds for one page, checked between its steps
 PDF_PAGE_CHARS = 200_000    # chars on one page; past it the rest of its text counts `text`
-PDF_RENDERS = 100           # renders per conversion, scans and figures together
+# renders per conversion, scans and figures together. Measured (test_reader_pdf measure renders, 100 Letter
+# scans of 1700x2200 gray Flate with 16-level paper grain, pypdfium2 5.15.2): 100 renders took 27.2-28.2 s, over
+# the 10 s budget, so it is lowered to the largest multiple of 10 that fits: 30 took 6.9-7.3 s (40: 10.4-10.8 s).
+# A flat page costs a tenth (2.9 s for 100), white noise a third more (31.7-33.1 s for 100).
+PDF_RENDERS = 30
 RENDER_DPI, CROP_DPI, RENDER_LONG = 110, 150, 1_568
 # pdfium: image pixels decoded per page; a page whose images total more has no render, and its
 # images past the budget are not decoded (each counts `image`)

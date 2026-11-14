@@ -483,7 +483,7 @@ def test_broken_xref_read():
 
 def test_caps():
     assert (pdf.PDF_PAGES, pdf.PDF_DEADLINE, pdf.PDF_PAGE_SECONDS) == (5_000, 36.0, 4.0)
-    assert (pdf.PDF_PAGE_CHARS, pdf.PDF_RENDERS) == (200_000, 100)
+    assert (pdf.PDF_PAGE_CHARS, pdf.PDF_RENDERS) == (200_000, 30)
     assert (pdf.RENDER_DPI, pdf.CROP_DPI, pdf.RENDER_LONG) == (110, 150, 1_568)
     assert (pdf.SCAN_COVER, pdf.OCR_COVER, pdf.FIGURE_PATHS, pdf.FIGURE_COVER) == (0.5, 0.8, 32, 0.04)
     assert (pdf.FIGURE_PAD, pdf.FIGURE_WHOLE, pdf.TINY_PT) == (6.0, 0.7, 1.0)
@@ -508,7 +508,131 @@ def test_parse_path():
     assert doc.blocks and doc.blocks[0].number == 1
 
 
+# ---- measure (not a test): python -I -X utf8 tests/test_reader_pdf.py measure <what> [path]
+
+def _venv_python():
+    """The venv interpreter of the pdfium measurements (PHRO_READER_PYENV, else the ready venv)."""
+    from reader import pdfenv
+    py = pdfenv.interpreter(pdfenv.venv_dir())
+    if pdfenv.forced_native() or not py.is_file():
+        raise SystemExit("measure needs the pdf venv: set PHRO_READER_PYENV")
+    return py
+
+
+def _child(data, **opts):
+    """The JSON line of tests/pdfium_run.py under the venv interpreter, and the wall seconds."""
+    import json
+    import subprocess
+    import time
+    t0 = time.perf_counter()
+    r = subprocess.run([str(_venv_python()), "-I", "-X", "utf8", str(Path(__file__).parent / "pdfium_run.py"),
+                        json.dumps(opts)], input=data, capture_output=True, timeout=1800)
+    wall = time.perf_counter() - t0
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
+    return json.loads(r.stdout.decode("utf-8").strip().splitlines()[-1]), wall
+
+
+def _scans(n=100, grain=0x0F):
+    """n Letter pages, each a full-page 1700 x 2200 gray Flate scan, built in memory (one image
+    object shared by the pages). The samples are white paper with seeded grain: the low bits of
+    `grain` vary (0x0F is 16 levels; 0xFF is white noise, which neither Flate nor the PNG encoder
+    shrinks; 0 is a flat page, whose renders cost a tenth)."""
+    import random
+    noise = random.Random(19).randbytes(1700 * 2200)
+    samples = bytes(255 - (b & grain) for b in noise)
+    scan = image_xobject(1700, 2200, data=samples)
+    return simple_pdf([FULL] * n, resources=dict(F1, XObject={"Im1": Ref(9000)}),
+                      extra_objects={9000: scan})
+
+
+def measure_renders(n=100, grain=0x0F):
+    """RENDERS <pages> <s>: `n` scans with `PDF_RENDERS` raised to n, so every page renders."""
+    got, wall = _child(_scans(n, grain), engine="pdfium", measure="convert",
+                       patch={"PDF_RENDERS": max(n, pdf.PDF_RENDERS)})
+    pages, took, skipped = got["convert"]
+    print(f"RENDERS {pages} {took:.2f}")
+    print(f"  wall {wall:.2f} s with the interpreter start, skipped {skipped}")
+
+
+def measure_tables(path):
+    import time
+    from collections import Counter
+    data = Path(path).read_bytes()
+    native = dm.NativeDoc(data)
+    budget, cut, spent = pdf_tables.TableBudget(), Counter(), 0.0
+    for index in range(native.page_count):
+        pd = native.page(index)
+        segs = [pdf_tables.Segment(s.x0, s.y0, s.x1, s.y1) for s in pd.segments]
+        short = [pdf_tables.Segment(s.x0, s.y0, s.x1, s.y1) for s in pd.short]
+        frags = sorted(pd.fragments, key=lambda f: f.order)
+        t0 = time.perf_counter()
+        pdf_tables.tables(segs, frags, pd.number, budget, cut, short=short)
+        spent += time.perf_counter() - t0
+    print(f"TABLES {native.page_count} {spent:.2f}")
+    got, _ = _child(data, measure="tables", engine="pdfium")
+    print(f"TABLES {got['tables'][0]} {got['tables'][1]:.2f} (pdfium)")
+
+
+def _timed_convert(data, engine):
+    import time
+    ctx = Context()
+    t0 = time.perf_counter()
+    doc = pdf.parse_bytes(data, ctx, engine=engine)
+    return len(doc.blocks), time.perf_counter() - t0, dict(ctx.skipped)
+
+
+def measure_native(path):
+    pages, took, skipped = _timed_convert(Path(path).read_bytes(), "native")
+    print(f"NATIVE {pages} {took:.2f}")
+    print(f"  PDF_DEADLINE {pdf.PDF_DEADLINE}, skipped {skipped}")
+
+
+def measure_pdfium(path):
+    got, wall = _child(Path(path).read_bytes(), engine="pdfium", measure="convert")
+    pages, took, skipped = got["convert"]
+    print(f"PDFIUM {pages} {took:.2f}")
+    print(f"  PDF_DEADLINE {pdf.PDF_DEADLINE}, wall {wall:.2f} s with the interpreter start, skipped {skipped}")
+
+
+def measure_decrypt(mib=None):
+    """DECRYPT <bytes> <s>: `mib` MiB (default DECRYPT_TOTAL) of AES-256-CBC, and R6OPEN."""
+    import time
+    total = crypto.DECRYPT_TOTAL if mib is None else mib * 2**20
+    data = simple_pdf([text_ops("A")], encrypt=EncryptSpec(6))
+    handler = dm.NativeDoc(data).pdf._handler
+    assert handler is not None and handler._cipher == "aesv3"
+    step = 1 << 20
+    chunk = bytes(range(256)) * (step // 256)   # a stream's worth: IV, then blocks
+    t0 = time.perf_counter()
+    with patched(crypto, "DECRYPT_TOTAL", max(total, crypto.DECRYPT_TOTAL)):
+        while handler.used + step <= total:
+            handler.decrypt(4, 0, chunk)
+    took = time.perf_counter() - t0
+    print(f"DECRYPT {handler.used} {took:.2f}")
+    # an R6 open: the hash loop of algorithm 2.B once (the open runs it twice, check then key)
+    t0 = time.perf_counter()
+    handler._hash(b"", handler.u[32:40], b"")
+    print(f"R6OPEN {time.perf_counter() - t0:.4f}")
+
+
+def measure():
+    what = sys.argv[2] if len(sys.argv) > 2 else ""
+    path = sys.argv[3] if len(sys.argv) > 3 else None
+    if what == "renders":   # optional: the page count, then the grain mask
+        measure_renders(int(sys.argv[3]) if path else 100,
+                        int(sys.argv[4], 0) if len(sys.argv) > 4 else 0x0F)
+    elif what == "decrypt":
+        measure_decrypt(int(sys.argv[3]) if path else None)
+    elif what in ("tables", "native", "pdfium") and path:
+        {"tables": measure_tables, "native": measure_native, "pdfium": measure_pdfium}[what](path)
+    else:
+        raise SystemExit("usage: measure renders | decrypt | tables <path> | native <path> | pdfium <path>")
+
+
 def main():
+    if sys.argv[1:2] == ["measure"]:
+        measure()
+        return
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()

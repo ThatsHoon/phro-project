@@ -263,6 +263,8 @@ class PathCollector:
 
 # ---- tables from the rules
 
+# Measured on the 384-page spike file (id e4bc4dca33): pdf_tables.tables over all its pages took 0.46-0.53 s on
+# native's pages and 0.45-0.48 s on pdfium's, far under the 15 s budget, so the caps below are kept.
 MAX_PAGE_CELLS = 50_000
 MAX_DOCUMENT_CELLS = 200_000
 MAX_COMPONENT_LINES = 2_000

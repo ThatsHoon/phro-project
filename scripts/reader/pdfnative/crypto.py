@@ -14,8 +14,11 @@ from typing import Optional, Union
 from ..containers.crypto import aes_cbc_decrypt, aes_cbc_encrypt, rc4
 from ..limits import ReadError
 
-# decision 4: bytes one handler decrypts in all (Task 19 measures it)
-DECRYPT_TOTAL = 16 * 2**20
+# decision 4: bytes one handler decrypts in all. Measured (test_reader_pdf measure decrypt, AES-256-CBC
+# through StandardSecurityHandler.decrypt, pure Python): 16 MiB took 15.8 s, over the 10 s budget, so it is
+# lowered to the largest whole MiB that fits: 9 MiB took 8.8-8.9 s (10 MiB: 8.4 and 10.7 s). An R6 open's
+# hash loop (algorithm 2.B, once) took 0.29-0.31 s; the open runs it twice.
+DECRYPT_TOTAL = 9 * 2**20
 
 # The standard padding string (algorithm 2)
 _PAD = bytes([

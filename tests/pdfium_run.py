@@ -7,6 +7,10 @@ damaged ReadError, so PdfiumDoc opens with native None), runs parse_bytes and ma
 temporary dir, and prints one JSON line: {"md", "skipped", "meta", "assets": [[name, size, width,
 height]], "modules", "engine_id", "decoded": [pixels decoded by each PdfiumDoc], "closed": [bool]},
 or {"error": [kind, detail]} on a ReadError.
+
+Two measurements (test_reader_pdf.py measure) print one other line and nothing else: "measure":
+"tables" runs each page's PageData through pdf_tables.tables alone, {"tables": [pages, seconds]};
+"measure": "convert" times parse_bytes alone, {"convert": [pages read, seconds, skipped]}.
 """
 import os
 import sys
@@ -51,6 +55,28 @@ def _dims(data: bytes):
     return 0, 0
 
 
+def _measure_tables(data, pdf, pdf_pdfium):
+    """[pages, seconds spent in pdf_tables.tables] over every page of `data` under pdfium."""
+    import time
+    from collections import Counter
+    from reader.pdfnative.document import NativeDoc
+    tb = pdf.pdf_tables
+    doc = pdf_pdfium.PdfiumDoc(data, NativeDoc(data))
+    budget, cut, spent = tb.TableBudget(), Counter(), 0.0
+    try:
+        for index in range(doc.page_count):
+            pd = doc.page(index)
+            segs = [tb.Segment(s.x0, s.y0, s.x1, s.y1) for s in pd.segments]
+            short = [tb.Segment(s.x0, s.y0, s.x1, s.y1) for s in pd.short]
+            frags = sorted(pd.fragments, key=lambda f: f.order)
+            t0 = time.perf_counter()
+            tb.tables(segs, frags, pd.number, budget, cut, short=short)
+            spent += time.perf_counter() - t0
+    finally:
+        doc.close()
+    return [doc.page_count, spent]
+
+
 def main():
     opts = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
     data = sys.stdin.buffer.read()
@@ -79,6 +105,16 @@ def main():
     pdf_pdfium.PdfiumDoc = _Seen
     pages = opts.get("pages")
     ctx = Context()
+    if opts.get("measure") == "tables":
+        print(json.dumps({"tables": _measure_tables(data, pdf, pdf_pdfium)}))
+        return
+    if opts.get("measure") == "convert":
+        import time
+        t0 = time.perf_counter()
+        doc = pdf.parse_bytes(data, ctx, engine="pdfium")
+        took = time.perf_counter() - t0
+        print(json.dumps({"convert": [len(doc.blocks), took, dict(ctx.skipped)]}))
+        return
     try:
         doc = pdf.parse_bytes(data, ctx, engine=opts.get("engine") or "pdfium",
                               pages=tuple(pages) if pages else None)
