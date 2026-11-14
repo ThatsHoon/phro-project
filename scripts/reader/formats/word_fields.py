@@ -17,9 +17,9 @@ def hyperlink_url(instr: str) -> str:
 
 
 def comment_note(blocks: list, author: str) -> list:
-    """A comment's blocks as its note: "Comment by <author>: ", the author cut to MAX_NAME, before the first
+    """A comment's blocks as its note: "Comment by <author>: " ("Comment: " without an author), the author cut to MAX_NAME, before the first
     paragraph's text, or as a paragraph of its own when the comment does not start with one. Changes `blocks`."""
-    lead = Text(f"Comment by {author[:MAX_NAME]}: ")
+    lead = Text(f"Comment by {author[:MAX_NAME]}: " if author else "Comment: ")
     if blocks and isinstance(blocks[0], Para):
         blocks[0].inlines.insert(0, lead)
     else:

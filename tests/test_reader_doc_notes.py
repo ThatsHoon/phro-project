@@ -351,7 +351,7 @@ def test_comment_author_bounds():
     q = story_doc("a\x05\r", comments=[(1, 0, "\x05말\r")], authors=[long])
     assert md(q) == f"a[^1]\n\n[^1]: Comment by N  {'M' * 61}: 말\n", md(q)
     r = story_doc("a\x05\r", comments=[(1, 0xFFFF, "\x05말\r")], authors=["Kim"])
-    assert md(r) == "a[^1]\n\n[^1]: Comment by : 말\n", md(r)
+    assert md(r) == "a[^1]\n\n[^1]: Comment: 말\n", md(r)
 
 
 def test_ranges_clamped_to_the_story():

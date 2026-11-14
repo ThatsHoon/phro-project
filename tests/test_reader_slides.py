@@ -447,6 +447,7 @@ def test_comments_on_hidden_slide():
     d = _legacy_deck([(0, "c")], show="0")
     assert "Comment by" not in md(d)
     assert "Comment by Ann: c" in md(d, hidden=True)
+    assert "(1 hidden places left out)" in md(d), md(d)
 
 
 def test_comments_part_missing():
@@ -461,6 +462,69 @@ def test_comments_part_missing():
             zo.writestr(i.filename, b"<p:cmLst" if i.filename == "ppt/comments/comment1.xml" else zi.read(i.filename))
     doc, ctx = parse(out)
     assert ctx.skipped["comments"] == 1 and doc.blocks[0].title == "t"
+
+
+def test_comments_unknown_author_reads_plain():
+    out = md(_legacy_deck([(0, "q")], authors=False))
+    assert "> Comment: q" in out and "Comment by" not in out, out
+    d = _legacy_deck([(0, "q")])
+    import zipfile
+    bad = tmp() / "d.ppsx"
+    with zipfile.ZipFile(d) as zi, zipfile.ZipFile(bad, "w") as zo:
+        for i in zi.infolist():
+            zo.writestr(i.filename, b"<p:cmAuthorLst" if i.filename == "ppt/commentAuthors.xml" else zi.read(i.filename))
+    doc, ctx = parse(bad)
+    assert ctx.skipped["comments"] == 1 and "> Comment: q" in markdown.render(doc, tmp() / "assets")
+
+
+def test_empty_comment_skipped():
+    out = md(_legacy_deck([(0, "  "), (0, "kept")]))
+    assert out.count("Comment by") == 1 and "> Comment by Ann: kept" in out, out
+
+
+def test_comments_cut_counts_once():
+    from reader.formats import ooxml_slides
+    old = ooxml_slides.MAX_COMMENTS
+    ooxml_slides.MAX_COMMENTS = 2
+    try:
+        doc, ctx = parse(_legacy_deck([(0, "a"), (0, "b"), (0, "c"), (0, "d")]))
+    finally:
+        ooxml_slides.MAX_COMMENTS = old
+    out = markdown.render(doc, tmp() / "assets")
+    assert "Comment by Ann: b" in out and "Comment by Ann: c" not in out, out
+    assert ctx.skipped["comments_cut"] == 1 and ctx.skipped["comments"] == 0, dict(ctx.skipped)
+
+
+def _refusing(names):
+    """Make ooxml_base.load refuse the parts whose name contains one of `names` the way a size limit does."""
+    from reader.formats import ooxml_base
+    real = ooxml_base.load
+
+    def load(pkg, part):
+        if any(n in part for n in names):
+            raise ReadError("too_large", "part: " + part)
+        return real(pkg, part)
+    ooxml_base.load = load
+    return lambda: setattr(ooxml_base, "load", real)
+
+
+def test_too_large_comments_and_authors_skip_the_part():
+    for names in (("comments/comment1",), ("commentAuthors",)):
+        undo = _refusing(names)
+        try:
+            doc, ctx = parse(_legacy_deck([(0, "c")]))
+        finally:
+            undo()
+        assert ctx.skipped["comments"] == 1 and doc.blocks[0].title == "t", dict(ctx.skipped)
+
+
+def test_too_large_notes_skips_the_part():
+    undo = _refusing(("notesSlide",))
+    try:
+        doc, ctx = parse(deck([sp("t", "title")], notes={1: sp("m", "body")}))
+    finally:
+        undo()
+    assert ctx.skipped["notes"] == 1 and doc.blocks[0].title == "t", dict(ctx.skipped)
 
 
 def main():

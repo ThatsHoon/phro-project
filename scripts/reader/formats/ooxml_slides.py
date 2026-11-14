@@ -17,7 +17,7 @@ from .word_fields import MAX_URL, comment_note
 IMAGE_BYTES = 256 * 2**20  # image bytes one deck may emit, copies counted
 SPAN_CELLS = 500_000       # grid slots all spans of one table may cover; past it spans become 1
 MAX_ALT, MAX_TITLE = 200, 200
-MAX_COMMENTS = 10_000      # comments one deck may emit, replies counted; the rest are counted as `comments`
+MAX_COMMENTS = 10_000      # comments one deck may emit, replies counted; the rest are counted once as `comments_cut`
 COORD = 10**13
 A14_M = "{http://schemas.microsoft.com/office/drawing/2010/main}m"
 
@@ -132,6 +132,7 @@ class _Reader:
         self.smartart_nodes = 0
         self.authors = {}  # comment author id -> name, legacy and modern merged
         self.comment_count = 0
+        self.cut = False
         self.ph_maps = {}  # layout or master part -> {("idx", i) | ("type", t): (y, x)}
         self.inherit = []  # the current slide's layout and master maps, in lookup order
 
@@ -207,9 +208,7 @@ class _Reader:
                     for a in root:
                         if local(a.tag) in ("cmAuthor", "author") and attr(a, "id") is not None:
                             self.authors[attr(a, "id")] = attr(a, "name") or ""
-            except ReadError as e:
-                if e.kind != "damaged":
-                    raise
+            except ReadError:  # a member of an open package: any kind skips this part
                 self.ctx.skipped["comments"] += 1
 
     @staticmethod
@@ -252,13 +251,13 @@ class _Reader:
                         if not text:
                             continue
                         if self.comment_count >= MAX_COMMENTS:
-                            self.ctx.skipped["comments"] += 1
+                            if not self.cut:
+                                self.cut = True
+                                self.ctx.skipped["comments_cut"] += 1
                             break
                         self.comment_count += 1
                         out.append(comment_note([Para([Text(text)])], self.authors.get(aid or "", ""))[0])
-            except ReadError as e:
-                if e.kind != "damaged":
-                    raise
+            except ReadError:  # a member of an open package: any kind skips this part
                 self.ctx.skipped["comments"] += 1
         return out
 
@@ -325,9 +324,7 @@ class _Reader:
                         if ph is not None and (attr(ph, "type") or "body") == "body":
                             out.extend(self.text_blocks(_kid(sp, "txBody")))
                     return out
-            except ReadError as e:
-                if e.kind != "damaged":
-                    raise
+            except ReadError:  # a member of an open package: any kind skips this part
                 self.ctx.skipped["notes"] += 1
             return []
         return []

@@ -32,6 +32,7 @@ LOST = (
     (("footer",), "footer", "footers"),
     (("footnotes",), "footnotes part", "footnotes parts"),
     (("comments",), "comments part", "comments parts"),
+    (("comments_cut",), "comment list cut short", "comment lists cut short"),
     (("note",), "note", "notes"),
     (("block",), "text block", "text blocks"),
     (("shape", "alternate"), "shape", "shapes"),
