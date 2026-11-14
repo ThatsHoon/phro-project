@@ -464,6 +464,21 @@ def test_heading_paragraph_closed_by_its_own_group_keeps_its_heading():
     assert md_mem(b"{\\rtf1" + ss + rb"{\pard\s1 x}\par\pard after\par}") == "# x\n\nafter\n"
 
 
+def test_grouped_paragraph_state_reaches_only_its_own_paragraph():
+    # the heading or list state a closing group leaves is the paragraph's under way, never the parent group's
+    ss = rb"{\stylesheet{\s1 heading 1;}{\s2 heading 2;}}"
+    out = md_mem(b"{\\rtf1" + ss + rb"{\pard\s1 Title}\par{\pard Body one}\par{\pard Body two}\par}")
+    assert out == "# Title\n\nBody one\n\nBody two\n", out
+    # a later \s1 sets its own level: the first group's level does not win over it
+    out = md_mem(b"{\\rtf1" + ss + rb"{\pard\s2 Sub}\par{\pard\s1 Top}\par{\pard x}\par}")
+    assert out == "## Sub\n\n# Top\n\nx\n", out
+    out = md_mem(b"{\\rtf1" + ss + rb"{\pard\ls1 one}\par{\pard two}\par{\pard three}\par}")
+    assert out == "- one\n\ntwo\n\nthree\n", out
+    # mid-paragraph: the paragraph the group closed in keeps it, the next one does not
+    out = md_mem(b"{\\rtf1" + ss + rb"Lead {\pard\s1 h}\par tail\par}")
+    assert out == "# Lead h\n\ntail\n", out
+
+
 ODT_NS = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
           'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"')
 

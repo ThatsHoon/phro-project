@@ -174,7 +174,7 @@ class _Field:
 class _Story:
     """Where text goes: the body, a note, a header or a footer, with its paragraph under way and its open fields."""
     __slots__ = ("kind", "depth", "cur", "has", "pars", "fields", "blocks", "ref", "alt", "tbl", "mark", "mark_len",
-                 "extras")
+                 "extras", "kept")
 
     def __init__(self, kind, depth):
         self.kind, self.depth = kind, depth
@@ -189,6 +189,7 @@ class _Story:
         self.mark = []       # list text of the paragraph under way
         self.mark_len = 0
         self.extras = []     # Images of the paragraph under way
+        self.kept = None     # (sty, outline, ls, ilvl) a group closed inside the paragraph under way left to it
 
 
 def _plain(inlines) -> str:
@@ -436,7 +437,7 @@ class _Reader:
         self.g = self.stack.pop()
         story = self.story
         if story.has and story.depth < depth and not closing.suppress and not closing.cap:
-            self.keep_paragraph(closing, self.g)
+            self.keep_paragraph(story, closing, self.g)
         depth -= 1
         while True:
             story = self.story
@@ -449,14 +450,16 @@ class _Reader:
         return depth == 0
 
     @staticmethod
-    def keep_paragraph(closing, parent):
+    def keep_paragraph(story, closing, parent):
         """A paragraph whose properties were set inside a group that closes before its `\\par` (`{\\pard\\s1 x}`) keeps
-        them: the heading and list state the closing group set pass to the parent when the story holds text of the
-        paragraph under way. A group that already ended its paragraph leaves nothing under way, so nothing passes."""
-        if parent.sty is None and parent.outline is None and (closing.sty is not None or closing.outline is not None):
-            parent.sty, parent.outline = closing.sty, closing.outline
-        if parent.ls is None and closing.ls is not None:
-            parent.ls, parent.ilvl = closing.ls, closing.ilvl
+        them. When the story holds text of the paragraph under way and the closing group has a heading or list state
+        its parent lacks, that state is kept on the story for that paragraph only, a later closing group's replacing
+        it; end_paragraph takes it where the paragraph's own group has none and clears it, and a `\\pard` clears it.
+        The parent group's state is never written, so the next paragraph starts from its own. A group that already
+        ended its paragraph leaves nothing under way, so nothing is kept."""
+        props = (closing.sty, closing.outline, closing.ls, closing.ilvl)
+        if props[:3] != (None, None, None) and props != (parent.sty, parent.outline, parent.ls, parent.ilvl):
+            story.kept = props
 
     # ---- text
     def flush(self):
@@ -612,6 +615,8 @@ class _Reader:
         g.sty = g.outline = g.ls = None
         g.ilvl = g.itap = 0
         g.in_table = False
+        if self.live():
+            self.story.kept = None  # what a closed group left to the paragraph is reset with it
 
     def w_s(self, p, fresh):
         g = self.g
@@ -816,10 +821,10 @@ class _Reader:
         if not g.suppress and not g.cap:
             self.end_paragraph(self.story)
 
-    def heading_level(self, g) -> int:
-        if g.outline is not None:
-            return g.outline + 1
-        return self.style_level(g.sty) if g.sty is not None else 0
+    def heading_level(self, sty, outline) -> int:
+        if outline is not None:
+            return outline + 1
+        return self.style_level(sty) if sty is not None else 0
 
     def style_level(self, sid) -> int:
         """The heading level of style sid, 0 for none. The chain of \\sbasedon is walked iteratively; a heading
@@ -867,19 +872,26 @@ class _Reader:
         cur, has, extras, mark = story.cur, story.has, story.extras, story.mark
         story.cur, story.has = [], False
         story.pars += 1
+        sty, outline, ls, ilvl = g.sty, g.outline, g.ls, g.ilvl
+        kept, story.kept = story.kept, None
+        if kept is not None:  # what a group closed inside this paragraph left it, where g has none of its own
+            if sty is None and outline is None:
+                sty, outline = kept[0], kept[1]
+            if ls is None and kept[2] is not None:
+                ls, ilvl = kept[2], kept[3]
         blocks = []
         if has:
             inlines = _build(cur)
             _edge(inlines, True)
             _edge(inlines, False)
             if inlines:
-                level = self.heading_level(g) if story is self.body else 0
+                level = self.heading_level(sty, outline) if story is self.body else 0
                 label = _CTRL.sub("", "".join(mark)).strip() if mark else ""
                 if level:
                     inlines = [x for it in inlines for x in (it.inlines if isinstance(it, Bold) else (it,))]
                     blocks.append(Heading(level, inlines))
-                elif label or g.ls:
-                    blocks.append(ListItem(g.ilvl, label or "-", inlines))
+                elif label or ls:
+                    blocks.append(ListItem(ilvl, label or "-", inlines))
                 else:
                     blocks.append(Para(inlines))
         if mark:
