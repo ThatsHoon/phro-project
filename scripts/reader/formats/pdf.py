@@ -9,9 +9,12 @@ PDF_PAGE_SECONDS check between the steps. Paragraphs, headings and running heade
 the loop, over the lines every page kept.
 
 Counts. A page that raises counts `page` (`_page_guard`); a step that raises, or a page that
-runs out of time between steps, counts `page_part` once for that page. A `timeout` ReadError
-always propagates. The document totals of what pdfnative's caps dropped come from
-`NativeDoc.cut` alone, added once at the end.
+runs out of time between steps, counts `page_part` once for that page; a page whose headings,
+paragraphs or placement fail after the loop is left out and counts `page`. A render that fails
+puts the page on `unrendered` like one with no render. A `timeout` ReadError always propagates.
+The document totals of what pdfnative's caps dropped come from `NativeDoc.cut` alone, added once
+at the end, except `bad_coord` (fragments with coordinates out of range): text was lost, so the
+page counts `text`, once with the char cap.
 """
 import math
 import time
@@ -143,6 +146,7 @@ class _Reader:
         self.unrendered = []
         self.figures = []
         self.part = False   # page_part already counted for the page being read
+        self.text_cut = False  # text already counted for the page being read
 
     # -- counting
 
@@ -172,6 +176,13 @@ class _Reader:
             self.part = True
             self.ctx.skipped["page_part"] += 1
 
+    def _lost_text(self):
+        """Text of the page being read was dropped (the char cap, or fragments whose
+        coordinates were not finite): `text`, once for the page."""
+        if not self.text_cut:
+            self.text_cut = True
+            self.ctx.skipped["text"] += 1
+
     def _late(self, t0) -> bool:
         if self.clock() - t0 > PDF_PAGE_SECONDS:
             self._part()
@@ -200,7 +211,7 @@ class _Reader:
             if got:
                 kept.append(got[0])
         for kind, value in native.cut.items():
-            if value > 0:
+            if value > 0 and kind != "bad_coord":  # bad_coord is counted `text` per page
                 self.ctx.skipped[kind] += value
         if native.xfa:
             self.ctx.skipped["xfa"] = 1
@@ -209,7 +220,9 @@ class _Reader:
         if not kept and not stopped:
             raise ReadError("damaged", "no readable pages")
         doc = Doc()
-        doc.headers, doc.footers = self._after(kept)
+        doc.headers, doc.footers, kept = self._after(kept)
+        if not kept and not stopped:
+            raise ReadError("damaged", "no readable pages")
         doc.blocks = [Section("page", number=k.number, blocks=k.blocks, comments=k.comments)
                       for k in kept]
         doc.meta = {"engine": self.engine, "pages_total": count,
@@ -217,11 +230,13 @@ class _Reader:
         return doc
 
     def _page(self, index) -> _Kept:
-        self.part = False
+        self.part = self.text_cut = False
         t0 = self.clock()
         pd = self.native.page(index)
         if pd.cut.get("page_part", 0) > 0:
             self.part = True  # pdfnative counted this page read in part already
+        if pd.cut.get("bad_coord", 0) > 0:
+            self._lost_text()
         turn = _turn(pd.rotate)
         view = _view_page(turn, pd.box)
         keep = _Kept(pd.number, view)
@@ -279,7 +294,7 @@ class _Reader:
         for f in frags:
             kind = f.hidden
             if not kind:
-                fb = pdf_layout._box_of([f])
+                fb = pdf_layout.box_of([f])
                 if _outside(fb, box):
                     kind = "offcrop"
                 elif abs(f.size) < TINY_PT:
@@ -299,7 +314,7 @@ class _Reader:
         for k, f in enumerate(frags):
             total += sum(1 for ch in f.text if not ch.isspace())
             if total > PDF_PAGE_CHARS:
-                self.ctx.skipped["text"] += 1
+                self._lost_text()
                 return frags[:k]
         return frags
 
@@ -335,10 +350,18 @@ class _Reader:
         keep.items.extend(shown)
 
     def _render(self, make):
-        """Bytes of one render, or None past PDF_RENDERS or the image bytes cap."""
+        """Bytes of one render, or None past PDF_RENDERS or the image bytes cap, or when the
+        render fails (the page then goes on `unrendered` like one with no render)."""
         if self.renders >= PDF_RENDERS:
             return None
-        data = make()
+        try:
+            data = make()
+        except ReadError as e:
+            if e.kind == "timeout":
+                raise
+            return None
+        except Exception:
+            return None
         if not data or self.image_bytes + len(data) > limits.IMAGE_BYTES:
             return None
         self.renders += 1
@@ -393,20 +416,30 @@ class _Reader:
         except Exception:
             pass  # no outline: the size rule alone makes headings
         body = pdf_layout.body_size([ln for k in kept for ln in k.lines])
+        done = []
         for k in kept:
-            levels = {}
-            for depth, title in outline.get(k.number - 1, ()):
-                for i, ln in enumerate(k.lines):
-                    if i not in levels and _norm(ln.text) == title:
-                        levels[i] = pdf_layout.outline_level(depth)
-                        break
-            for i, ln in enumerate(k.lines):
-                if i not in levels:
-                    level = pdf_layout.heading_level(ln.text, ln.size, body)
-                    if level is not None:
-                        levels[i] = level
-            k.blocks = self._blocks(k, levels) + k.hidden
-        return headers, footers
+            # a page whose headings or paragraphs fail is lost alone (`page`), as in the loop
+            with self._page_guard("page"):
+                k.blocks = self._page_blocks(k, outline.get(k.number - 1, ()), body)
+                done.append(k)
+        return headers, footers, done
+
+    def _page_blocks(self, k, titles, body):
+        levels = {}
+        if titles:
+            at = defaultdict(list)  # normalized line text -> its line indexes, last first
+            for i in range(len(k.lines) - 1, -1, -1):
+                at[_norm(k.lines[i].text)].append(i)
+            for depth, title in titles:
+                found = at.get(title)
+                if found:
+                    levels[found.pop()] = pdf_layout.outline_level(depth)
+        for i, ln in enumerate(k.lines):
+            if i not in levels:
+                level = pdf_layout.heading_level(ln.text, ln.size, body)
+                if level is not None:
+                    levels[i] = level
+        return self._blocks(k, levels) + k.hidden
 
     def _blocks(self, k, levels):
         """Headings and paragraphs in line order, with each table, image and render placed

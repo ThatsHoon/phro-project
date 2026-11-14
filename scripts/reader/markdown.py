@@ -62,7 +62,8 @@ LOST = (
 # Named items: reported after the counted ones, by name only (a flag, not a count).
 NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"))
 # counted too, but they only change formatting or reading order, so they are not reported
-INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story"})
+INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story",
+                      "char_positions"})  # char_positions: pdf glyph positions dropped, the text kept
 
 
 def lost(skipped) -> list:

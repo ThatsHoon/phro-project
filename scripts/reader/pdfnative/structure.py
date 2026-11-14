@@ -393,6 +393,9 @@ class PDFFile:
                     raise
                 obj.raw = b""
                 self._cut("decrypt_budget", "WARN: the decryption budget is spent; streams are dropped")
+                if str(obj.dictionary.get("Subtype", "")) == "Image":
+                    # the part of decrypt_budget that was an image: its reader counts the image
+                    self.cuts["decrypt_image"] += 1
             return obj
         return self._decrypt_value(num, gen, obj)
 

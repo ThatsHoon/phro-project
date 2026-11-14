@@ -38,6 +38,21 @@ def _budget(error: ReadError) -> bool:
     return error.kind == "too_large" and "decrypt budget" in error.detail
 
 
+def _part_grew(before: Counter, now: Counter) -> bool:
+    """Did a structure cap fire between the two counts, other than by refusing an image
+    stream? A refused image (`decrypt_image`, the image part of `decrypt_budget`) comes out
+    without bytes and is counted `image` by the reader, so it is not `page_part` as well."""
+    for key in now:
+        if key == "decrypt_image":
+            continue
+        grown = now[key] - before[key]
+        if key == "decrypt_budget":
+            grown -= now["decrypt_image"] - before["decrypt_image"]
+        if grown > 0:
+            return True
+    return False
+
+
 def _box(value):
     """(x0, y0, x1, y1) of a rectangle with finite coordinates and an area, or None."""
     if not isinstance(value, list) or len(value) != 4:
@@ -170,7 +185,7 @@ class NativeDoc:
             got = images.image(pdf, stream)
             shown.append(PageImage(draw_box, got.data, got.px, got.kind))
 
-        if pdf.cuts != before and any(pdf.cuts[k] > before[k] for k in pdf.cuts):
+        if _part_grew(before, pdf.cuts):
             cut["page_part"] += 1  # a structure cap fired while this page was read: read in part
         links, comments, annot_cut = annotations.page_annots(pdf, page)
         cut.update(annot_cut)

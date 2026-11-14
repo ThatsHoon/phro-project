@@ -264,7 +264,8 @@ def _extent(f):
             (ex + vx * f.size, ey + vy * f.size)]
 
 
-def _box_of(frags):
+def box_of(frags):
+    """The (x0, y0, x1, y1) box, y up, of the fragments' glyph boxes."""
     pts = [p for f in frags for p in _extent(f)]
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
     return (min(xs), min(ys), max(xs), max(ys))
@@ -320,7 +321,7 @@ def _glyph_urls(f, grid):
     """The url of each character of a fragment (the link whose box holds the glyph centre), or
     None when no link lies near it."""
     n = len(f.text)
-    near = grid.near(_box_of([f])) if grid is not None else []
+    near = grid.near(box_of([f])) if grid is not None else []
     if not near:
         return None
     offs = f.char_offsets if len(f.char_offsets) == n + 1 else tuple(
@@ -374,7 +375,7 @@ def _runs(chars):
 def _make_line(frags, chars, vertical=False):
     runs = _runs(chars)
     main = max(frags, key=lambda f: len(f.text))
-    return Line("".join(t for t, _ in runs), runs, _box_of(frags), main.size,
+    return Line("".join(t for t, _ in runs), runs, box_of(frags), main.size,
                 min(f.order for f in frags), vertical)
 
 

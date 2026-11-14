@@ -241,9 +241,105 @@ def test_deadline_page_cut():
         return now[0]
 
     text, ctx, _ = md(simple_pdf([text_ops(f"P{n}") for n in range(1, 6)]), clock=clock, started=0.0)
-    read = len(heads(text))
-    assert read >= 1 and ctx.skipped["page_cut"] >= 1, (text, ctx.skipped)
-    assert read + ctx.skipped["page_cut"] == 5, (read, ctx.skipped)
+    # clock calls: 10 at the loop check of page 1 (under 36), 20 at its start, 30 before its
+    # tables (10 s on the page: read in part); 40 at the loop check of page 2 (past 36): cut
+    assert heads(text) == ["## Page 1"] and "P1" in text, text
+    assert ctx.skipped == {"page_cut": 4, "page_part": 1}, ctx.skipped
+
+
+def test_image_budget_counted_once():
+    import random
+    noise = random.Random(7).randbytes(64 * 64)  # incompressible: its stream stays over 1000 bytes
+    content = text_ops("Words", y=750) + b" q 100 0 0 100 72 500 cm /Im1 Do Q"
+    data = with_image(content, image_xobject(64, 64, data=noise), encrypt=EncryptSpec(4))
+    with patched(crypto, "DECRYPT_TOTAL", 1000):
+        text, ctx, _ = md(data)
+    assert "Words" in text and ctx.skipped == {"image": 1}, ctx.skipped
+
+
+def test_bad_coord_is_text():
+    far = b"BT /F1 12 Tf 1 0 0 1 2000000000 100 Tm (Far) Tj ET"
+    text, ctx, _ = md(simple_pdf([text_ops("Kept") + b" " + far + b" " + far]))
+    assert "Kept" in text and "Far" not in text, text
+    assert ctx.skipped == {"text": 1}, ctx.skipped
+    assert "char_positions" in markdown.INTERNAL
+
+
+def test_after_loop_page_isolated():
+    real = pdf_layout.paragraphs
+
+    def paragraphs(lns, model):
+        if any(ln.text == "P2" for ln in lns):
+            raise ValueError("broken paragraphs")
+        return real(lns, model)
+
+    with patched(pdf_layout, "paragraphs", paragraphs):
+        text, ctx, _ = md(simple_pdf([text_ops(f"P{n}") for n in range(1, 4)]))
+    assert "P1" in text and "P3" in text and "P2" not in text, text
+    assert ctx.skipped == {"page": 1}, ctx.skipped
+
+    def timeout(lns, model):
+        raise ReadError("timeout", "paragraphs")
+
+    with patched(pdf_layout, "paragraphs", timeout):
+        try:
+            md(simple_pdf([text_ops("A")]))
+        except ReadError as e:
+            assert e.kind == "timeout", e
+        else:
+            raise AssertionError("expected the timeout to propagate")
+
+
+def _render_raises(data):
+    real = dm.NativeDoc.page
+
+    def render(box, dpi):
+        raise ValueError("render failed")
+
+    def page(self, index):
+        got = real(self, index)
+        got.render = render
+        return got
+
+    with patched(dm.NativeDoc, "page", page):
+        return md(data)
+
+
+def test_render_raises_unrendered():
+    _, ctx, doc = _render_raises(with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode")))
+    assert doc.meta["unrendered"] == [1] and ctx.skipped == {"scan": 1}, (doc.meta, ctx.skipped)
+    body = b"".join(b"%d %d 5 5 re f " % (100 + 45 * (i % 6), 100 + 45 * (i // 6)) for i in range(40))
+    _, ctx, doc = _render_raises(simple_pdf([text_ops("Caption", y=720) + b" " + body]))
+    assert doc.meta["unrendered"] == [1] and ctx.skipped == {"figure": 1}, (doc.meta, ctx.skipped)
+
+
+def _turned(text, vx, vy, size=10):
+    """Text that reads left to right once a /Rotate 90 page (612 wide) is turned: the viewer's
+    (vx, vy) is the page's (612 - vy, vx), and the text runs up the page."""
+    return b"BT /F1 %d Tf 0 1 -1 0 %d %d Tm (%s) Tj ET" % (size, 612 - vy, vx, text.encode())
+
+
+def _turned_rule(vx0, vy0, vx1, vy1):
+    return rule_ops(612 - vy0, vx0, 612 - vy1, vx1)
+
+
+def test_rotated_page():
+    ops = [_turned("Report Title", 72, 560, size=18),
+           _turned("First body line", 72, 520), _turned("second body line", 72, 507),
+           _turned("third body line", 72, 494)]
+    ops += [_turned_rule(100, y, 300, y) for y in (300, 330, 360)]
+    ops += [_turned_rule(x, 300, x, 360) for x in (100, 200, 300)]
+    ops += [_turned(t, x, y) for t, x, y in
+            (("Alpha", 110, 340), ("Beta", 210, 340), ("Gamma", 110, 310), ("Delta", 210, 310))]
+    ops.append(_turned("Closing words", 72, 200))
+    text, ctx, _ = md(simple_pdf([b" ".join(ops)], page_extra={"Rotate": 90}))
+    assert "### Report Title" in text, text
+    assert "First body line second body line third body line" in text, text
+    assert "|Alpha|Beta|" in text and "|Gamma|Delta|" in text, text
+    order = [text.index(s) for s in ("### Report Title", "First body", "|Alpha|Beta|",
+                                     "|Gamma|Delta|", "Closing words")]
+    assert order == sorted(order) and text.count("Alpha") == 1, text
+    assert not ctx.skipped, ctx.skipped
 
 
 def test_page_seconds_part():
