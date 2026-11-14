@@ -45,6 +45,32 @@ def test_cp949_csv_named_xls():
     assert "|이름|값|" in md and "|가|1|" in md, md
 
 
+def test_utf16_text_named_xls():
+    """Excel's "Unicode Text" export: a UTF-16LE BOM, then tab-separated rows; a UTF-16BE copy reads the same."""
+    rows = "﻿이름\t금액\r\n가\t1\r\n"
+    for enc in ("utf-16-le", "utf-16-be"):
+        md = run(rows.encode(enc))
+        assert "## Sheet: Sheet1" in md, (enc, md)
+        assert "|이름|금액|" in md and "|가|1|" in md, (enc, md)
+    assert xls_alike.kind(rows.encode("utf-16-le")) == "text"
+
+
+def test_utf16_html_named_xls():
+    page = "<html><head><title>표</title></head><body><table><tr><td>이름</td><td>1</td></tr></table></body></html>"
+    for data in (("﻿" + page).encode("utf-16-le"), page.encode("utf-16-le")):  # with a BOM, and every other byte NUL
+        assert xls_alike.kind(data) == "html", data[:16]
+        md = run(data)
+        assert "## Sheet: 표" in md and "|이름|1|" in md, md
+
+
+def test_one_column_csv_named_xls():
+    """A head with no NUL that decodes as text and holds a line break is text, though line 1 has no delimiter."""
+    md = run("이름\n가\n나\n".encode("cp949"))
+    assert "## Sheet: Sheet1" in md, md
+    assert "이름\n가\n나" in md, md  # a one-column table is written as its lines
+    assert xls_alike.kind(b"\x01\x02" * 100 + b"\n") == "other"  # control bytes are not text
+
+
 def test_tsv_named_xls():
     md = run("a\tb\n1\t2\n".encode("cp1252"))
     assert "|a|b|" in md and "|1|2|" in md, md
