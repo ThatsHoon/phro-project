@@ -1,14 +1,18 @@
-"""Fixed-seed mutation tests: synthetic fixtures of xls (clear, RC4, XOR), xlsb, ppt (clear, encrypted) and rtf are
-damaged at random and read; every outcome must be a Doc or a ReadError (no other exception, no hang).
+"""Fixed-seed mutation tests: synthetic fixtures of xls (clear, RC4, XOR), xlsb, ppt (clear, encrypted), rtf, and the
+OOXML docx, pptx and xlsx packages are damaged at random and read; every outcome must be a Doc or a ReadError (no
+other exception, no hang).
 
 About 100 cases a format, each from `random.Random(SEED + k)`, so a failure names the case and repeats. No damaged
 case is ever written to disk: compound files and zips are built in memory and read through the formats' in-memory
-entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `rtf.parse_bytes`), and rendering never
-writes an image. Only the clean xlsb and ppt seeds touch a temporary directory, once each. The RTF seed holds none of
-the control words of a shape's property groups, and the test builds them with `cat` so no .pyc holds them either.
+entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `ooxml.parse_package`, `rtf.parse_bytes`),
+and rendering never writes an image. Only the clean xlsb, ppt, docx and pptx seeds touch a temporary directory, once
+each (the xlsx seed is built in memory). An OOXML case damages one or two of its seed's XML members. The RTF seed
+holds none of the control words of a shape's property groups, and the test builds them with `cat` so no .pyc holds
+them either.
 
 Run: python -I -X utf8 tests/test_reader_mutation.py
 """
+import io
 import random
 import sys
 import tempfile
@@ -24,10 +28,16 @@ import reader  # noqa: E402
 from reader import markdown  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
-from reader.formats import ppt, rtf, xls, xlsb  # noqa: E402
+from reader.formats import ooxml, ppt, rtf, xls, xlsb  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc  # noqa: E402
-from reader_fix import blip_png, cfb_bytes, encrypt_xls, make_ppt, make_xlsb, make_zip  # noqa: E402
+from reader_fix import (XLSX_SML, blip_png, cfb_bytes, encrypt_xls, make_ppt, make_xlsb, make_xlsx,  # noqa: E402
+                        make_zip, xlsx_cell, xlsx_row)
+import test_reader_docm as dm  # noqa: E402  (the seed builders and fixtures of the owning test files)
+import test_reader_omml as om  # noqa: E402
+import test_reader_slides as sl  # noqa: E402
+import test_reader_smartart as sa  # noqa: E402
+import test_reader_xlsb as xb  # noqa: E402
 
 SEED = 20261114
 CASES = 100
@@ -213,6 +223,96 @@ def test_xlsb_mutations():
 
     counts = run_cases("xlsb", make)
     assert sum(counts.values()) == CASES, counts
+
+
+# ---- OOXML: docx, pptx and xlsx packages; one or two XML members damaged, the zip rebuilt and read in memory
+def zip_members(src) -> dict:
+    """{name: bytes} of a clean zip, a path or its bytes."""
+    with zipfile.ZipFile(io.BytesIO(src) if isinstance(src, bytes) else src) as z:
+        return {i.filename: z.read(i.filename) for i in z.infolist()}
+
+
+def xlsx_seed() -> dict:
+    """Two sheets, shared strings (one rich), a legacy comment, an external hyperlink, a merge, a hidden row, and a
+    chart and a picture on the second sheet; built in memory."""
+    first = (xlsx_row(1, xlsx_cell("A1", 0, t="s"), xlsx_cell("B1", "42.5", s=1), xlsx_cell("C1", f="SUM(B1)"))
+             + xlsx_row(2, xlsx_cell("A2", 1, t="s"), attrs='hidden="1"')
+             + xlsx_row(3, xlsx_cell("A3", "true", t="b"), xlsx_cell("B3", inline="<t>inline</t>")))
+    after = ('<mergeCells count="1"><mergeCell ref="A3:B3"/></mergeCells>'
+             '<hyperlinks><hyperlink ref="A1" r:id="rL"/></hyperlinks>')
+    comments = (f'<comments xmlns="{XLSX_SML}"><authors><author>Ann</author></authors><commentList>'
+                '<comment ref="A1" authorId="0"><text><r><t>check this</t></r></text></comment>'
+                "</commentList></comments>")
+    sheets = [{"name": "First", "rows": first, "after": after,
+               "rels": [("rL", "hyperlink", "https://example.test/a", True),
+                        ("rC", "comments", "../comments1.xml", False)]},
+              {"name": "Second", "rows": xlsx_row(1, xlsx_cell("A1", "한글", t="str")),
+               "rels": [("rD", "drawing", "../drawings/drawing1.xml", False)]}]
+    extra = {"xl/comments1.xml": comments,
+             "xl/drawings/drawing1.xml": xb.drawing_xml(xb.anchor(0, xb.chart_frame("rId1")),
+                                                        xb.anchor(2, xb.pic("rId2"))),
+             "xl/drawings/_rels/drawing1.xml.rels": xb.rels_xml(("rId1", "chart", "../charts/chart1.xml"),
+                                                                ("rId2", "image", "../media/image1.png")),
+             "xl/charts/chart1.xml": xb.BAR, "xl/media/image1.png": PNG}
+    return zip_members(make_xlsx(None, sheets, shared=["<t>alpha</t>", "<r><t>rich</t></r><r><t> run</t></r>"],
+                                 numfmts={164: "0.00"}, xfs=[0, 164], extra_parts=extra))
+
+
+def docx_seed() -> dict:
+    """A docm package: paragraphs, an OMML paragraph and a SmartArt data part (`docm` writes it, clean, to a
+    temporary directory)."""
+    math = (f'<w:p><w:r><w:t>Area </w:t></w:r><m:oMath xmlns:m="{om.M}"><m:sSup>{om.e(om.r("a"))}'
+            f'{om.e(om.r("2"), "sup")}</m:sSup></m:oMath></w:p>')
+    art = ("<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData>" + sa.REF
+           + "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>")
+    data = sa.data_xml([sa.DOC, ("A", None, "first"), ("B", None, "second"), ("A1", None, "inner")],
+                       [("0", "A", 0, None), ("0", "B", 1, None), ("A", "A1", 0, None)])
+    return zip_members(dm.docm(dm.P("Intro text") + math + art + dm.P("After"), {"word/diagrams/data1.xml": data},
+                               sa.RELS_D))
+
+
+def pptx_seed() -> dict:
+    """A deck: a title, an `a14:m` equation, notes and a legacy comment with its author (`deck` writes it, clean, to
+    a temporary directory)."""
+    p = f'<a:p {om.PNS}><a:r><a:t>E = </a:t></a:r><a14:m><m:oMath>{om.sup("m", "2")}</m:oMath></a14:m></a:p>'
+    members = {"ppt/comments/comment1.xml": sl._legacy((0, "first comment")),
+               "ppt/commentAuthors.xml": sl._authors("Ann"),
+               sl.PRELS: sl._pres_rels(1, [("rA", "commentAuthors", "commentAuthors.xml")])}
+    path = sl.deck([sl.sp("Plan", "title") + sl.sp(paras=p)], notes={1: sl.sp("speaker", "body")},
+                   srels={1: [("rC", "comments", "../comments/comment1.xml")]}, extra=members)
+    return zip_members(path)
+
+
+def ooxml_case(members):
+    xml = sorted(n for n in members if n.endswith((".xml", ".rels")))
+
+    def make(rng, k):
+        parts = dict(members)
+        for name in rng.sample(xml, rng.choice((1, 1, 2))):
+            parts[name] = apply(plan(rng, len(parts[name])), parts[name])
+        blob = make_zip(None, parts, stored=())
+        return lambda: read_doc(ooxml.parse_package, blob)
+    return make
+
+
+def ooxml_mutations(label, members, probe):
+    ctx = Context()
+    out = render(ooxml.parse_package(make_zip(None, members, stored=()), ctx), ctx.skipped)
+    assert probe in out and not ctx.skipped, (label, out, ctx.skipped)  # the clean seed reads whole
+    counts = run_cases(label, ooxml_case(members))
+    assert sum(counts.values()) == CASES, counts
+
+
+def test_xlsx_mutations():
+    ooxml_mutations("xlsx", xlsx_seed(), "Chart: bar")
+
+
+def test_docx_mutations():
+    ooxml_mutations("docx", docx_seed(), "$a^{2}$")
+
+
+def test_pptx_mutations():
+    ooxml_mutations("pptx", pptx_seed(), "$m^{2}$")
 
 
 # ---- ppt

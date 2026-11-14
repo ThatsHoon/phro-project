@@ -313,6 +313,16 @@ def test_iterparse_bad_xml():
         assert e.kind == "damaged" and e.detail.startswith("XML parse error"), e.detail
 
 
+def test_bad_encoding_declaration_is_damaged():
+    # mutation case xlsx 27: expat raises LookupError for an unknown encoding name and ValueError (UnicodeError
+    # among them) for a multi-byte or unusable one; each is a damaged part, in all three parse paths
+    for enc in ("UTFe8", "rot13", "shift_jis", "utf-7", "idna"):
+        data = f'<?xml version="1.0" encoding="{enc}"?><a>b</a>'.encode()
+        raises_kind(lambda: zipx.parse_xml(data), "damaged")
+        raises_kind(lambda: zipx.parse_xml_ns(data), "damaged")
+        raises_kind(lambda: _it(data), "damaged")
+
+
 def test_iterparse_fast():
     cells, secs = _scan(200_000)
     assert cells == 200_000 and secs < 2.0, (cells, secs)

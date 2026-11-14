@@ -21,7 +21,9 @@ SHEET_SCAN = 2_000_000
 GRID_COLS = 1_000        # columns a span may reach in a rendered table
 GRID_SLOTS = 2_000_000    # grid slots all spans of one rendered table may cover
 CHART_CELLS = 100_000     # cells one chart table may hold, header row included (series x rows)
-CHART_TOTAL = 200_000     # chart and embedded sheet table cells one docx, doc, pptx, hwp, hwpx, xls or xlsb document may emit, copies counted
+# chart and embedded sheet table cells one docx, doc, pptx, hwp, hwpx, xls, xlsb or xlsx document may emit, copies
+# counted (each placement of a chart is charged)
+CHART_TOTAL = 200_000
 CFB_STREAM = 256 * 2**20  # bytes of one compound-file stream
 CFB_SECTORS = 1_000_000
 CFB_ENTRIES = 131_072     # directory entries
@@ -31,7 +33,9 @@ HWP_RECORDS = 1_000_000   # records of one HWP stream
 BIN_RECORDS = 2_000_000    # records of one BIFF stream, one BIFF12 part or one PowerPoint Document stream
 DECRYPT_BYTES = 32 * 2**20  # bytes one xls or ppt stream may decrypt
 EMBED_BYTES = 16 * 2**20    # bytes of one Excel workbook stream embedded in an hwp or doc object
-IMAGE_BYTES = 256 * 2**20  # image bytes one docx, doc, hwp, hwpx, ppt, xls, xlsb or rtf document may emit, copies counted
+# image bytes one docx, doc, pptx, hwp, hwpx, ppt, xls, xlsb, xlsx or rtf document may emit, copies counted (each
+# placement of a picture is charged)
+IMAGE_BYTES = 256 * 2**20
 # (an xls also caps the picture placements it reads, all its sheets together: xls_drawing.MAX_PLACEMENTS)
 # tables one doc, docx, hwp, hwpx or rtf document may open, nested ones counted (an rtf or ppt table's cells are what
 # it charges). A .doc paragraph opens up to 63 with one

@@ -41,12 +41,17 @@ def _declares_entities(data: bytes) -> bool:
     return "<!DOCTYPE" in text or "<!ENTITY" in text
 
 
+# what expat raises for XML it cannot read: a ParseError, a LookupError for an unknown encoding name, a ValueError
+# (UnicodeError among them) for a multi-byte or unusable one
+_XML_ERRORS = (ET.ParseError, LookupError, ValueError)
+
+
 def parse_xml(data: bytes):
     if _declares_entities(data):
         raise ReadError("damaged", "XML declares a DOCTYPE or ENTITY")
     try:
         return ET.fromstring(data)
-    except ET.ParseError as e:
+    except _XML_ERRORS as e:
         raise ReadError("damaged", f"XML parse error: {e}")
 
 
@@ -70,7 +75,7 @@ def parse_xml_ns(data: bytes):
         parser = ET.XMLParser(target=builder)
         parser.feed(data)
         root = parser.close()
-    except ET.ParseError as e:
+    except _XML_ERRORS as e:
         raise ReadError("damaged", f"XML parse error: {e}")
     return root, builder.ns
 
@@ -165,7 +170,7 @@ def iterparse(stream, events=("end",), chunk=65536):
         for ev, el in parser.read_events():
             if ev in want:
                 yield ev, el
-    except ET.ParseError as e:
+    except _XML_ERRORS as e:
         raise ReadError("damaged", f"XML parse error: {e}")
 
 

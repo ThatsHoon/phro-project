@@ -10,8 +10,14 @@ streamed, the shared strings under their own cap (`SHEET_CHARS` characters, `SHE
 under a closed-element cap (SST_ELEMENTS, STYLE_ELEMENTS); one that is named but missing, damaged or capped counts
 `document`. Text escapes (`_xHHHH_`) are undone in strings, str and error values, formulas and sheet names. Every
 sheet part is streamed, and every element it closes is charged to the workbook's scan count, capped at `SHEET_SCAN`.
+A sheet reached once the count is spent is cut without being opened, its comments unread (counted as `comments_cut`
+when it has some), so neither is charged to ZIP_TOTAL ahead of its drawings.
 A cell shows its cached value; a formula without one shows `=` and its text. A sheet that cannot be read is counted
 under `sheet` and the others still come out; one whose XML breaks after its first row keeps the rows read.
+Charts and pictures come from `sheet_drawing`, one `Drawings` a workbook (one CHART_TOTAL and IMAGE_BYTES count),
+through the relationships the sheet read once: a worksheet's follow its grid in anchor order, and a chartsheet's are
+all it holds (one with nothing drawn has no section). A drawing ReadError other than a timeout costs only the drawings,
+counted under `object`.
 Hidden rows and columns and merged ranges go to the grid as they are read. Hyperlinks follow the cells, so they are
 collected (at most _LINKS a sheet) and applied after the stream: an external one wraps the cells in its range that
 hold a value in a link, at a cost of min(area, cells held) charged to the scan count; past SHEET_SCAN each link left
@@ -38,7 +44,7 @@ from ..containers.zipx import attr, iterparse, local
 from ..limits import ReadError
 from ..model import Doc, Link, NoteRef, Para, Section, Text
 from ..numfmt import code_for, display
-from . import ooxml_base, sheet_grid
+from . import ooxml_base, sheet_drawing, sheet_grid
 from .word_fields import MAX_URL, comment_note
 from .xls import _hide
 
@@ -301,6 +307,7 @@ class _Sheets:
     def __init__(self, pkg, wb, ctx):
         self.pkg, self.wb, self.ctx = pkg, wb, ctx
         self.budget = sheet_grid.Budget()
+        self.draw = sheet_drawing.Drawings(pkg, ctx)  # charts and pictures; one image byte count and chart cell count
         self.scan = 0                    # elements the sheet parts have closed, all sheets together
         self.used: set[str] = set()      # sheet parts read
         self.notes: dict = {}            # note key -> blocks, for Doc.notes
@@ -359,12 +366,20 @@ class _Sheets:
         if part in self.used:
             raise ReadError("damaged", "sheet part used twice")
         self.used.add(part)
-        if part in self.wb.chartsheets:  # a chartsheet has no cells
-            return []
+        relmap = []  # the sheet's relationships, read once: [dict]
+        if part in self.wb.chartsheets:  # a chartsheet has no cells: its drawing is all there is
+            return self._drawn(part, relmap)
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         cap = limits.SHEET_SCAN
+        if self.scan >= cap:
+            # its first element could not close inside the cap: the sheet is cut as the stream would cut it, but its
+            # part and comments are not opened, so their bytes are not charged to ZIP_TOTAL ahead of its drawings
+            grid.stop("scanned XML elements", cap)
+            if any(not r.external and r.type.endswith(("/comments", "/threadedComment"))
+                   for r in self._sheet_rels(part, relmap).values()):
+                self._cut_comments()  # no mark could be placed on the cut grid
+            return self._drawn(part, relmap)
         row, col, cells, rows_seen = -1, -1, 0, False  # cells: the `c` elements open
-        relmap = []  # the sheet's relationships, read once: [dict]
         links = []  # (r1, r2, c1, c2, url) of the external hyperlinks, applied after the stream
         stack, done, names = [], [], {}  # the open path, and the ended children each open element still holds
         marks = self._comments(part, no, relmap, keys)  # (row, col) -> (note key, characters)
@@ -375,7 +390,7 @@ class _Sheets:
                     if tag is None:
                         tag = names[el.tag] = local(el.tag)
                     if ev == "start":
-                        if self.scan >= cap:  # this element cannot close inside the cap (a later sheet: its first)
+                        if self.scan >= cap:  # this element cannot close inside the cap
                             grid.stop("scanned XML elements", cap)
                             break
                         stack.append(el)
@@ -429,7 +444,16 @@ class _Sheets:
         self._link(grid, links)
         blocks = grid.blocks()
         self._sweep(blocks, keys)
-        return blocks
+        return blocks + self._drawn(part, relmap)
+
+    def _drawn(self, part, relmap) -> list:
+        """The sheet's charts and pictures in anchor order, from the relationships the sheet read once. A drawing
+        ReadError other than a timeout costs only the drawings, counted under `object`."""
+        try:
+            return self.draw.blocks(part, self._sheet_rels(part, relmap))
+        except ReadError as e:
+            _skip(self.ctx, "object", e)
+            return []
 
     def _collect(self, el, part, links, grid, relmap):
         """Keep the range and URL of a `hyperlink` that names an external hyperlink relationship; an `r:id` that

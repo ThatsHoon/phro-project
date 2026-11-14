@@ -27,10 +27,11 @@ class Drawings:
         self.image_bytes = 0         # image bytes placed (IMAGE_BYTES)
         self.chart_cells = 0         # chart table cells placed (CHART_TOTAL)
 
-    def blocks(self, part: str) -> list:
-        """The charts and pictures of the drawing parts that the sheet relationships name, in anchor order."""
+    def blocks(self, part: str, rels: dict | None = None) -> list:
+        """The charts and pictures of the drawing parts that the sheet relationships name, in anchor order. `rels` is
+        the sheet's relationships when the caller has read them already."""
         out = []
-        for rel in ooxml_base.rels(self.pkg, part, self.ctx).values():
+        for rel in (ooxml_base.rels(self.pkg, part, self.ctx) if rels is None else rels).values():
             if rel.external or not rel.type.endswith("/drawing"):
                 continue
             if rel.target in self.seen:

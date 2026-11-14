@@ -2,9 +2,11 @@
 
 Run: python -I -X utf8 tests/test_reader_xlsx.py
 """
+import io
 import sys
 import tempfile
 import time
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from reader.formats import ooxml, ooxml_sheets  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Link, NoteRef  # noqa: E402
 from reader_fix import XLSX_REL, XLSX_SML, make_xlsx, xlsx_cell, xlsx_row  # noqa: E402
+import test_reader_xlsb as xb  # noqa: E402  (the drawing, anchor and chart fixtures)
 
 MACROSHEET = "http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet"
 DOCTYPE = '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY e "boom">]>'
@@ -761,6 +764,108 @@ def test_comment_stream_cap():
         out, ctx = commented(B2, leg=part)
         secs = time.perf_counter() - t0
     assert "v" in out and ctx.skipped["comments_cut"] == 1 and secs < 1, (ctx.skipped, secs)
+
+
+# ---- drawings and chartsheets (Task 12)
+DRAWING = ("rD", "drawing", "../drawings/drawing1.xml", False)
+
+
+def drawn(n, *anchors, rels=()):
+    """extra_parts of drawing part n (its anchors and its own (id, type, target) relationships)."""
+    return {f"xl/drawings/drawing{n}.xml": xb.drawing_xml(*anchors),
+            f"xl/drawings/_rels/drawing{n}.xml.rels": xb.rels_xml(*rels)}
+
+
+def test_drawing_image_and_chart():
+    parts = drawn(1, xb.anchor(3, xb.chart_frame("rId1")), xb.anchor(0, xb.pic("rId2")),
+                  rels=[("rId1", "chart", "../charts/chart1.xml"), ("rId2", "image", "../media/image1.png")])
+    parts.update({"xl/charts/chart1.xml": xb.BAR, "xl/media/image1.png": xb.PNG})
+    rows = xlsx_row(1, xlsx_cell("A1", "top", t="str"), xlsx_cell("B1", "next", t="str"))
+    out, ctx = md([sheet(rows, rels=[DRAWING])], extra_parts=parts)
+    assert "|top|next|" in out and "Chart: bar" in out and "|Q1|7|" in out, out
+    assert out.index("|top|next|") < out.index("assets/img-001.png") < out.index("Chart: bar"), out  # anchor order
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_chartsheet():
+    parts = drawn(1, xb.anchor(0, xb.chart_frame("rId1")), rels=[("rId1", "chart", "../charts/chart1.xml")])
+    parts["xl/charts/chart1.xml"] = xb.BAR
+    sheets = [sheet(xlsx_row(1, xlsx_cell("A1", "cells", t="str")), name="W"),
+              {"name": "Graph", "chartsheet": True, "rels": [DRAWING]}]
+    out, ctx = md(sheets, extra_parts=parts)
+    assert "## Sheet: Graph" in out and "Chart: bar" in out and out.index("## Sheet: Graph") < out.index("Chart: bar")
+    assert not ctx.skipped, ctx.skipped
+    out, ctx = md([sheets[0], {"name": "Empty", "chartsheet": True}])
+    assert "cells" in out and "Empty" not in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_chart_total_shared():
+    parts = {}
+    for n in (1, 2):
+        parts.update(drawn(n, xb.anchor(0, xb.chart_frame("rId1")), rels=[("rId1", "chart", f"../charts/chart{n}.xml")]))
+        parts[f"xl/charts/chart{n}.xml"] = xb.BAR
+    sheets = [sheet(xlsx_row(1, xlsx_cell("A1", "a", t="str")), name="A", rels=[DRAWING]),
+              sheet(xlsx_row(1, xlsx_cell("A1", "b", t="str")), name="B",
+                    rels=[("rD", "drawing", "../drawings/drawing2.xml", False)])]
+    with patched("CHART_TOTAL", 6):  # one BAR table is 4 cells
+        out, ctx = md(sheets, extra_parts=parts)
+    assert out.count("Chart: bar") == 1 and ctx.skipped["chart"] == 1, (out, ctx.skipped)
+
+
+def test_cut_sheet_not_opened():
+    # N2: a sheet that would stop at its first element is not opened, so its bytes are not charged to ZIP_TOTAL and
+    # the drawing after it still reads; the counts and warnings are today's
+    import random
+    pad = "<!--" + random.Random(1).randbytes(100_000).hex() + "-->"
+    big = f'<worksheet xmlns="{XLSX_SML}">{pad}<sheetData>{xlsx_row(1, xlsx_cell("A1", "late", t="str"))}</sheetData></worksheet>'
+    parts = drawn(1, xb.anchor(0, xb.pic("rId1")), rels=[("rId1", "image", "../media/image1.png")])
+    image = xb.PNG + random.Random(2).randbytes(60_000)
+    parts["xl/media/image1.png"] = image
+    sheets = [sheet(xlsx_row(1, xlsx_cell("A1", 7)), name="A"), sheet("", name="B", part=big, rels=[DRAWING])]
+    data = make_xlsx(None, sheets, extra_parts=parts)
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        total = sum(i.file_size for i in z.infolist())
+    # B (200 KB) charged leaves no room for the 60 KB image; B left unread leaves plenty
+    with patched("SHEET_SCAN", 5), patched("ZIP_TOTAL", total - len(image) // 2):
+        out, ctx = md(sheets, extra_parts=parts)
+    assert "7" in out and "late" not in out and "## Sheet: B" in out and "assets/img-001.png" in out, out
+    assert dict(+ctx.skipped) == {"sheet_cut": 1} and warned(ctx, "sheet B cut at 5 scanned XML elements"), (
+        ctx.skipped, ctx.warnings)
+    with patched("ZIP_TOTAL", len(big) - 1):  # a sheet that is read is still charged in full
+        out, ctx = md(sheets, extra_parts=parts)
+    assert "late" not in out and ctx.skipped["sheet"] == 1, (out, ctx.skipped)
+
+
+def test_cut_sheet_comments_counted():
+    # the unopened sheet's comments are not read: the cut they would have met is counted, once
+    sheets = [sheet(xlsx_row(1, xlsx_cell("A1", 7)), name="A"),
+              sheet(B2, name="B", rels=[("rC", LEGACY, "../comments1.xml", False)])]
+    with patched("SHEET_SCAN", 5):
+        out, ctx = md(sheets, extra_parts={LEG_PART: legacy_xml(("B2", 0, "unread"))})
+    assert "unread" not in out and "[^" not in out, out
+    assert dict(+ctx.skipped) == {"sheet_cut": 1, "comments_cut": 1}, ctx.skipped
+
+
+def test_drawing_error_keeps_cells():
+    # a drawing part flagged encrypted: the ReadError costs the drawings (counted `object`), not the sheet's cells
+    parts = drawn(1, xb.anchor(0, xb.pic("rId1")), rels=[("rId1", "image", "../media/image1.png")])
+    parts["xl/media/image1.png"] = xb.PNG
+    members = zip_members(make_xlsx(None, [sheet(xlsx_row(1, xlsx_cell("A1", "kept", t="str")), rels=[DRAWING])],
+                                    extra_parts=parts))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+        z.getinfo("xl/drawings/drawing1.xml").flag_bits |= 1  # writestr resets it, so mark the central entry
+    ctx = Context()
+    doc = ooxml.parse_package(buf.getvalue(), ctx)
+    out = markdown.render(doc, Path(tempfile.gettempdir()) / "unused-assets", False, ctx.skipped)
+    assert "kept" in out and "assets/" not in out and dict(+ctx.skipped) == {"object": 1}, (out, ctx.skipped)
+
+
+def zip_members(data: bytes) -> dict:
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        return {i.filename: z.read(i.filename) for i in z.infolist()}
 
 
 def worst():
