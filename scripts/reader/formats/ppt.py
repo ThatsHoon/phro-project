@@ -8,9 +8,9 @@ notes masters and handouts are not read. A slide's text comes in shape order: an
 text block it names there, a ClientTextbox brings its own, and outline blocks nothing refers to follow. The shapes
 come in reading order from `ppt_shapes` (groups, tables and placeholders; date, number, footer and header placeholders
 are left out) and a title placeholder gives the slide its title. A slide that
-cannot be read is counted under `slide` and the others still come out. An object shape places the blocks `ppt_objects` reads from its OLE
-storage (an Excel chart or sheet, an MS Graph chart, an equation); one it cannot read shows its preview picture and is
-counted under `object`. A picture shape becomes the Image of its pib
+cannot be read is counted under `slide` and the others still come out. An object shape places the blocks `ppt_objects`
+reads from its OLE storage (an Excel chart or sheet, an MS Graph chart, an equation); one it cannot read shows its
+preview picture and is counted under `object`, a workbook with no table under `chart`. A picture shape becomes the Image of its pib
 (`ppt_pictures`: the BStore of the DocumentContainer's PPDrawingGroup, the BLIPs in the `Pictures` stream) at its
 place; one that cannot be placed is counted under `image`. Every walk spends one budget of
 `BIN_RECORDS` records, and the text emitted is capped at `MAX_OUTPUT` characters. A file saved with the default
@@ -122,9 +122,12 @@ class Presentation:
                 placed = self.objects.blocks(shape.ole_ref)
                 if placed:
                     out.append((_PICTURE, placed, ""))
+                unread = self.objects.unread_chart(shape.ole_ref)
                 if placed is None:
                     self.ctx.skipped["object"] += 1
-                if (placed is None or shape.ole_ref in self.objects.partial) and shape.pib:
+                elif unread:
+                    self.ctx.skipped["chart"] += 1
+                if (placed is None or unread or shape.ole_ref in self.objects.partial) and shape.pib:
                     image = self.pictures.image(shape.pib)
                     if image is not None:
                         out.append((_PICTURE, [image], ""))

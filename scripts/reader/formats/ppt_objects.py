@@ -15,13 +15,15 @@ The storage is opened as a compound file and read once an exObjId:
     preview picture and counts it under object. At most MAX_OBJECTS objects are read; the rest give None too.
 An equation converted in part (stopped early, symbols left out) keeps its TeX, is counted under object once, and
 `partial` says the caller may also show the preview; lists dropped past mtef.DEPTH are counted under depth at each
-placement. A workbook that fails inside xls_embedded is counted there, under chart, and gives [].
+placement. A workbook that fails inside xls_embedded (damaged, encrypted, a chart with no table) is read once and
+remembered as an unread chart, as in doc: `blocks` gives [], `unread_chart(id)` is true, its chart count is taken back
+and the caller shows the preview and counts one chart at each placement (never an object).
 """
 import struct
 
 from .. import limits, officeart
 from ..containers import flate
-from ..containers.cfb import Compound
+from ..containers.cfb import CfbError, Compound
 from ..limits import ReadError
 from ..model import Equation, Table
 from . import mtef, sheet_grid, xls_embedded
@@ -42,6 +44,7 @@ class Objects:
         self._index = None   # exObjId -> persistIdRef
         self._read = {}      # exObjId -> an object read: (kind, blocks, lost) or None
         self.partial = set()  # exObjIds of equations converted in part
+        self._unread = set()  # exObjIds of workbooks that gave no table
         self.chart_cells = 0  # table cells placed from embedded workbooks, copies counted (CHART_TOTAL)
 
     def _ids(self) -> dict:
@@ -107,14 +110,28 @@ class Objects:
                     lost = set()
                     tex = mtef.native_tex(cf.read(_NATIVE), lost)
                     return "equation", [Equation(tex, False)], frozenset(lost)
+                before = self.ctx.skipped["chart"]
                 out = xls_embedded.blocks(cf, self.ctx, self.sheets)
-                return None if out is None else ("table", out, frozenset())
+                if out is None:
+                    return None
+                if out:
+                    return "table", out, frozenset()
+                if before:  # the caller counts the chart where it is shown
+                    self.ctx.skipped["chart"] = before
+                else:
+                    self.ctx.skipped.pop("chart", None)
+                return "chart", [], frozenset()
         except ReadError as e:
             if e.kind not in _SKIP:
                 raise
             return None
-        except Exception:  # a storage that is not a compound file, a broken chain, an equation that does not convert
+        except (CfbError, KeyError, ValueError, struct.error):
+            # not a compound file or a broken chain, a stream that cannot be read, an equation that does not convert
             return None
+
+    def unread_chart(self, ex_obj_id) -> bool:
+        """Whether `ex_obj_id` is a workbook that gave no table (set by blocks, which gives [] for it)."""
+        return ex_obj_id in self._unread
 
     def blocks(self, ex_obj_id: int | None) -> list | None:
         """The blocks of object `ex_obj_id` for one placement, or None when it is not read (the caller shows the
@@ -134,6 +151,9 @@ class Objects:
         if got is None:
             return None
         kind, blocks, lost = got
+        if kind == "chart":
+            self._unread.add(ex_obj_id)
+            return []
         if kind == "equation":
             if "depth" in lost:
                 self.ctx.skipped["depth"] += 1

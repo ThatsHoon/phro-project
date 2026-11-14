@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import reader  # noqa: E402
 from reader import markdown  # noqa: E402
 from reader.formats import ppt_objects  # noqa: E402  (ModuleNotFoundError before ppt_objects.py exists)
+from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
 from reader.model import Context  # noqa: E402
 from reader_fix import (biff_chart, blip_png, eq_native, excel_object, make_cfb, make_ppt, msgraph_object,  # noqa: E402
                         mtef_v5)
@@ -101,6 +102,33 @@ def test_bad_zlib_counted():
     for body in (b"not a compound file at all", b"\x01"):
         out, ctx, _ = build([{"shapes": [{"text": "ok", "box": (0, 10, 4, 5)}, obj()]}], objects=[{"body": body}])
         assert "ok" in out and "(could not read: 1 embedded object)" in out, out
+
+
+def test_failed_workbook_shows_preview():
+    junk = cfb({"Workbook": b"junk", "CompObj": b"x"})
+    slide = {"shapes": [obj(pib=1)]}
+    out, ctx, assets = build([slide], objects=[junk], pictures=[blip_png(PNG)])
+    assert assets == {"img-001.png": PNG} and "could not read: 1 chart" in out, (out, assets)
+    assert ctx.skipped["object"] == 0 and ctx.skipped["chart"] == 1, dict(ctx.skipped)
+    # placed on two slides: read once, a preview and a chart count at each placement
+    out, ctx, assets = build([slide, slide], objects=[junk], pictures=[blip_png(PNG)])
+    assert out.count("![](assets/") == 2 and "could not read: 2 charts" in out, out
+    assert ctx.skipped["object"] == 0 and ctx.skipped["chart"] == 2, dict(ctx.skipped)
+    # no preview: the chart is still counted
+    out, ctx, assets = build([{"shapes": [obj()]}], objects=[junk])
+    assert not assets and ctx.skipped["chart"] == 1 and ctx.skipped["object"] == 0, dict(ctx.skipped)
+
+
+def test_truncated_storage_counted():
+    stg = excel_object([GRID], b"Excel.Sheet.8")[:600]
+    out, ctx, _ = build([{"shapes": [{"text": "ok", "box": (0, 10, 4, 5)}, obj()]}], objects=[stg])
+    assert "ok" in out and "(could not read: 1 embedded object)" in out, out
+
+
+def test_object_in_encrypted_ppt():
+    out, ctx, _ = build([{"shapes": [obj()]}], encrypt=PPT_DEFAULT,
+                        objects=[(excel_object([CHART], b"Excel.Chart.8"), {"compressed": True})])
+    assert "Chart: bar — Sales" in out and not ctx.skipped, (out, dict(ctx.skipped))
 
 
 def struct_size(n):
