@@ -106,7 +106,7 @@ def decrypt(data: bytes, filepass: biff.Rec, password: str = XLS_DEFAULT) -> byt
     """
     if len(data) > limits.DECRYPT_BYTES:
         raise ReadError("too_large", "part: Workbook")
-    off, size = filepass[1], filepass[2]
+    _, off, size, _ = filepass  # a Rec, or a plain 4-tuple
     if size < 2 or off + size > len(data):
         raise ReadError("encrypted")
     kind = struct.unpack_from("<H", data, off)[0]

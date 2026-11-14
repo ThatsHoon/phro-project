@@ -128,7 +128,7 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
     cut_series = cut_points = False
     three_d = False
     for rec in st.records(start):
-        rid, off, size = rec[0], rec[1], rec[2]
+        rid, off, size = rec.id, rec.off, rec.size
         if rid == biff.BOF:
             if depth == 0 and (size < 4 or struct.unpack_from("<H", data, off + 2)[0] != dt):
                 stop = off - 4
@@ -182,7 +182,7 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
                     texts.append(item)
                 pending = item
             elif rid == _SERIES_TEXT and size >= 4:
-                cur = biff.Cursor(data, [(off + 2, size - 2)] + list(rec[3]))  # a CONTINUE carries the rest
+                cur = biff.Cursor(data, [(off + 2, size - 2)] + list(rec.conts))  # a CONTINUE carries the rest
                 n, flags = cur.u8(), cur.u8()
                 value = cur.chars(n, bool(flags & 1))
                 if isinstance(here, _Series):
@@ -213,7 +213,7 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
                 if rid == _NUMBER:
                     value = struct.unpack_from("<d", data, off + 6)[0] if size >= 14 else None
                 elif rid == _LABEL:
-                    value = biff.Cursor(data, [(off + 6, size - 6)] + list(rec[3])).string()
+                    value = biff.Cursor(data, [(off + 6, size - 6)] + list(rec.conts)).string()
                 else:
                     value = None if size < 8 else "#N/A" if data[off + 7] else ("TRUE" if data[off + 6] else "FALSE")
                 if value is not None:
@@ -285,14 +285,14 @@ def graph(data: bytes, ctx):
     start = None
     ds = _Datasheet()
     for rec in st.records(0):
-        if rec[0] == _CODEPAGE and rec[2] >= 2 and ds.codepage is None:  # the first one anywhere wins, as dochan
-            ds.codepage = struct.unpack_from("<H", data, rec[1])[0]
-        elif rec[0] == biff.BOF and rec[2] >= 4:
-            vers, dt = struct.unpack_from("<HH", data, rec[1])
+        if rec.id == _CODEPAGE and rec.size >= 2 and ds.codepage is None:  # the first one anywhere wins, as dochan
+            ds.codepage = struct.unpack_from("<H", data, rec.off)[0]
+        elif rec.id == biff.BOF and rec.size >= 4:
+            vers, dt = struct.unpack_from("<HH", data, rec.off)
             if vers != 0x0680:
                 raise limits.ReadError("unsupported", "not an MS Graph workbook")
             if dt == _GRAPH_BOF:
-                start = rec[1] - 4
+                start = rec.off - 4
                 break
     if start is None:
         raise limits.ReadError("damaged", "no MS Graph datasheet substream")

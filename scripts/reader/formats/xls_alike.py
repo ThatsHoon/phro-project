@@ -121,6 +121,8 @@ def parse_text(path, ctx) -> Doc:
     # A field may be as long as the whole character budget, so the csv module's process-wide field limit is raised
     # for the read and put back after. Nothing in the reader runs conversions in threads (the gate runs each in a
     # subprocess, and queue.py's server never calls the reader), so nothing else can see the raised limit.
+    # cache.py's _lock (cache.py:105-106) does not cover this: it guards only the counter that names temp folders,
+    # and cache.store calls convert outside it, so a caller that ran store in threads would need its own lock here.
     old = csv.field_size_limit(max(csv.field_size_limit(), budget.cap_chars + 1))
     try:
         for r, row in enumerate(csv.reader(io.StringIO(text, newline=""), delimiter=delim)):
@@ -130,6 +132,8 @@ def parse_text(path, ctx) -> Doc:
             if grid.cut:
                 break
     except csv.Error as e:
+        # the csv module raises a bare csv.Error for every fault and keeps no record of the field it was reading,
+        # so its message text is the only signal that the field was past the limit
         if str(e).startswith("field larger than field limit"):  # a field past the whole budget: characters, as put()
             grid.stop("characters", budget.cap_chars)
         else:

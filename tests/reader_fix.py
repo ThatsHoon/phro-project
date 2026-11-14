@@ -757,8 +757,8 @@ def _xl_string(text, short=False):
 
 
 def _biff_sst(strings, split):
-    """The SST record and its CONTINUEs; with `split` (8224 when the SST is longer than that) each body holds at most that many bytes and a string cut
-    by a boundary restarts with a flags byte, as BIFF8 writes it."""
+    """The SST record and its CONTINUEs; with `split` (8224 when the SST is longer than that) each body holds at
+    most that many bytes and a string cut by a boundary restarts with a flags byte, as BIFF8 writes it."""
     head = struct.pack("<II", len(strings), len(strings))
     if not split:
         whole = head + b"".join(_xl_string(s) for s in strings)

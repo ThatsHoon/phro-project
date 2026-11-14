@@ -48,7 +48,7 @@ class Workbook:
             if clear is None:
                 raise ReadError("encrypted")
             patched = bytearray(clear)
-            patched[self.g.filepass[1] - 4:self.g.filepass[1] - 2] = b"\0\0"
+            patched[self.g.filepass.off - 4:self.g.filepass.off - 2] = b"\0\0"
             self.data = data = bytes(patched)
             self.st = biff.Stream(data, ctx)
             self.g = biff.read_globals(self.st)
@@ -164,7 +164,7 @@ class Workbook:
             raise ReadError("damaged", "sheet offset outside the stream")
         depth, pending = 0, None
         for rec in self.st.records(offset):
-            rid, off, size = rec[0], rec[1], rec[2]
+            rid, off, size = rec.id, rec.off, rec.size
             if rid == biff.BOF:
                 depth += 1
                 if depth > limits.MAX_DEPTH:
@@ -197,14 +197,14 @@ class Workbook:
                     r, c, ixfe = pending
                     pending = None
                     try:
-                        text = biff.Cursor(data, [(off, size)] + list(rec[3])).string()
+                        text = biff.Cursor(data, [(off, size)] + list(rec.conts)).string()
                     except ValueError:
                         self.ctx.skipped["record"] += 1
                         continue
                     grid.put(r, c, self._show(text, ixfe))
             elif rid == _MSODRAWING:
                 draw.append(data[off:off + size])
-                draw.extend(data[o:o + n] for o, n in rec[3])
+                draw.extend(data[o:o + n] for o, n in rec.conts)
             elif rid == _ROW:
                 if size >= 14 and struct.unpack_from("<H", data, off + 12)[0] & 0x20:
                     grid.hide_row(struct.unpack_from("<H", data, off)[0])
@@ -223,7 +223,7 @@ class Workbook:
         """Put one cell record's displayed value. A FORMULA with a string result returns (row, col, ixfe) to wait for
         its STRING record."""
         data, g = self.data, self.g
-        rid, off, size = rec[0], rec[1], rec[2]
+        rid, off, size = rec.id, rec.off, rec.size
         if rid == _MULRK:
             row, first = struct.unpack_from("<HH", data, off)
             n = max(size - 6, 0) // 6
@@ -237,7 +237,7 @@ class Workbook:
                 if idx < len(g.sst):
                     grid.put(row, col, self._show(g.sst[idx], ixfe))
         elif rid in (_LABEL, _RSTRING):
-            grid.put(row, col, self._show(biff.Cursor(data, [(off + 6, size - 6)] + list(rec[3])).string(), ixfe))
+            grid.put(row, col, self._show(biff.Cursor(data, [(off + 6, size - 6)] + list(rec.conts)).string(), ixfe))
         elif rid == _NUMBER:
             if size >= 14:
                 grid.put(row, col, self._show(struct.unpack_from("<d", data, off + 6)[0], ixfe))

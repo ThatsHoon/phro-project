@@ -253,23 +253,23 @@ class Globals:
     formats: dict = field(default_factory=dict)
     date1904: bool = False
     active: int = 0
-    filepass: tuple | None = None
+    filepass: Rec | None = None
     drawing: bytes = b""
     supbooks: list = field(default_factory=list)  # one flag per SUPBOOK: this workbook itself
     externs: list = field(default_factory=list)  # one sheet index per XTI (EXTERNSHEET), -1 when not a sheet here
 
 
 def _cursor(st: Stream, rec: Rec, skip: int = 0) -> Cursor:
-    return Cursor(st.data, [(rec[1] + skip, max(rec[2] - skip, 0))] + list(rec[3]))
+    return Cursor(st.data, [(rec.off + skip, max(rec.size - skip, 0))] + list(rec.conts))
 
 
 def read_globals(st: Stream) -> Globals:
     data = st.data
     it = st.records(0)
     first = next(it, None)
-    if first is None or first[0] != BOF or first[2] < 4:
+    if first is None or first.id != BOF or first.size < 4:
         raise ReadError("damaged", "not a BIFF8 workbook")
-    vers, dt = struct.unpack_from("<HH", data, first[1])
+    vers, dt = struct.unpack_from("<HH", data, first.off)
     if vers == 0x0500:
         raise ReadError("unsupported", "Excel 5.0/95 workbook")
     if vers != 0x0600 or dt != 0x0005:
@@ -291,7 +291,7 @@ def read_globals(st: Stream) -> Globals:
 
 def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
     data = st.data
-    rid, off, size = rec[0], rec[1], rec[2]
+    rid, off, size = rec.id, rec.off, rec.size
     if rid == BOUNDSHEET:
         try:
             if size < 8:
@@ -317,14 +317,14 @@ def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
     elif rid == SUPBOOK and size >= 4:
         g.supbooks.append(struct.unpack_from("<H", data, off + 2)[0] == 0x0401)
     elif rid == EXTERNSHEET and size >= 2 and not g.externs:
-        body = data[off:off + size] + b"".join(data[o:o + n] for o, n in rec[3])
+        body = data[off:off + size] + b"".join(data[o:o + n] for o, n in rec.conts)
         n = min(struct.unpack_from("<H", body)[0], (len(body) - 2) // 6)
         for book, first, _last in struct.iter_unpack("<Hhh", body[2:2 + n * 6]):
             internal = book < len(g.supbooks) and g.supbooks[book]
             g.externs.append(first if internal and first >= 0 else -1)
     elif rid == MSODRAWINGGROUP:
         drawing.append(data[off:off + size])
-        drawing.extend(data[o:o + n] for o, n in rec[3])
+        drawing.extend(data[o:o + n] for o, n in rec.conts)
 
 
 def fmt_code(g: Globals, ixfe: int) -> str:

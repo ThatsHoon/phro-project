@@ -134,10 +134,8 @@ class Grid:
 
     # ---- input
     def stop(self, what, n):
-        """End the sheet here: the caller found a limit `put` cannot see (a field past the whole `what` budget)."""
-        return self._stop(what, n)
-
-    def _stop(self, what, n):
+        """End the sheet at the limit of `n` `what`: one `put` or `blocks` reached, or one the caller found that `put`
+        cannot see (a field past the whole `what` budget). False, so `put` can return it."""
         self.cut = True
         self.ctx.warnings.append(f"sheet {self.name} cut at {n} {what}")
         self.ctx.skipped["sheet_cut"] += 1
@@ -150,13 +148,13 @@ class Grid:
             return True
         b = self.budget
         if row >= limits.SHEET_ROWS:
-            return self._stop("rows", limits.SHEET_ROWS)
+            return self.stop("rows", limits.SHEET_ROWS)
         if col >= limits.SHEET_COLS:
-            return self._stop("columns", limits.SHEET_COLS)
+            return self.stop("columns", limits.SHEET_COLS)
         if b.cells <= 0:
-            return self._stop("cells", b.cap_cells)
+            return self.stop("cells", b.cap_cells)
         if b.chars < len(text):
-            return self._stop("characters", b.cap_chars)
+            return self.stop("characters", b.cap_chars)
         b.cells -= 1
         b.chars -= len(text)
         self.cells[(row, col)] = text
@@ -196,7 +194,8 @@ class Grid:
     # ---- output
     def _sweep(self):
         """Yield ((row, col), text, merge covering it or None) in reading order, in one row sweep.
-        Merges are taken in reading order of their first cell (stored as (r1, c1, r2, c2)); one that overlaps an earlier one is dropped.
+        Merges are taken in reading order of their first cell (stored as (r1, c1, r2, c2)); one that overlaps an
+        earlier one is dropped.
         Active merges never overlap, so they are disjoint in columns and one bisect finds the one over a column."""
         merges = sorted(self.merges)
         mi, starts, act, heap = 0, [], [], []  # act: merges by first column; heap: (last row, first column)
@@ -281,7 +280,7 @@ class Grid:
                 spans.open(*span)
             slots += len(row)
             if slots > limits.GRID_SLOTS:
-                self._stop("grid slots", limits.GRID_SLOTS)
+                self.stop("grid slots", limits.GRID_SLOTS)
                 break
             out.append(row)
         return [Table(out, hidden_rows=hidden_rows, hidden_cols=hidden_cols)]

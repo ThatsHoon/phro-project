@@ -76,9 +76,9 @@ def _read(cf, name, ctx, budget):
         raise ReadError("damaged", "not a BIFF8 workbook")
     if dt == biff.CHART_BOF:  # the stream is one chart; a FILEPASS before its first EOF is a protected one
         for rec in st.records(0):
-            if rec[0] == biff.FILEPASS:
+            if rec.id == biff.FILEPASS:
                 raise ReadError("encrypted")
-            if rec[0] == biff.EOF:
+            if rec.id == biff.EOF:
                 break
         tbl, _ = biff_chart.chart(data, 0, biff.Globals(), {}, ctx, st)
         return [tbl] if tbl is not None else None
