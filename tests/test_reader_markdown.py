@@ -189,6 +189,33 @@ def test_footnotes_numbered_by_use():
     assert R(doc) == "t[^1][^2]\n\n[^1]: A\n[^2]: B\n[^3]: U\n"
 
 
+def test_hidden_only_note_drops_its_visible_mark():
+    # a note whose whole text is hidden has no definition to show, so its visible mark goes with it and the note is
+    # one hidden place; the next note takes number 1, and --hidden shows both mark and definition
+    doc = Doc(blocks=[Para([Text("a"), NoteRef("h"), Text(" b"), NoteRef("v")])],
+              notes={"h": [Para([Hidden([Text("secret")])])], "v": [P("seen")]})
+    assert R(doc) == "(1 hidden places left out)\n\na b[^1]\n\n[^1]: seen\n", R(doc)
+    assert R(doc, hidden=True) == "a[^1] b[^2]\n\n[^1]: (hidden: secret)\n[^2]: seen\n", R(doc, hidden=True)
+    # a mark inside another note's definition goes too
+    doc = Doc(blocks=[Para([Text("a"), NoteRef("v")])],
+              notes={"v": [Para([Text("seen"), NoteRef("h")])], "h": [Para([Hidden([Text("secret")])])]})
+    assert R(doc) == "(1 hidden places left out)\n\na[^1]\n\n[^1]: seen\n", R(doc)
+
+
+def test_hidden_note_is_counted_once():
+    # a hidden mark of a hidden-only note is the one hidden place; its skipped definition is not counted again
+    doc = Doc(blocks=[Para([Text("a"), NoteRef("h", hidden="hidden"), Text(" c")])],
+              notes={"h": [Para([Hidden([Text("note")])])]})
+    assert R(doc) == "(1 hidden places left out)\n\na c\n", R(doc)
+    # the same when the mark sits inside a hidden run
+    doc = Doc(blocks=[Para([Text("a"), Hidden([Text("b"), NoteRef("h")]), Text(" c")])],
+              notes={"h": [Para([Hidden([Text("note")])])]})
+    assert R(doc) == "(1 hidden places left out)\n\na c\n", R(doc)
+    # an unreferenced hidden-only note is still counted, once
+    doc = Doc(blocks=[P("a")], notes={"h": [Para([Hidden([Text("note")])])]})
+    assert R(doc) == "(1 hidden places left out)\n\na\n", R(doc)
+
+
 def test_many_notes_render_fast():
     # numbering is linear in the notes: every other one referenced, the rest numbered after them in insertion order
     import time

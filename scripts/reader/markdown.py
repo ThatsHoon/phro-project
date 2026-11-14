@@ -114,8 +114,12 @@ def blocks_len(blocks, d=0) -> int:
 
 
 class _Render:
-    def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool, skipped=None):
+    def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool, skipped=None, drop=frozenset()):
         self.doc, self.assets_dir, self.show = doc, assets_dir, show_hidden
+        self.drop = drop  # ids of hidden-only notes whose marks are left out with their definitions
+        self.marked: set[str] = set()  # ids of notes whose mark was shown
+        self.hidden_marks: set[str] = set()  # ids of notes whose mark was left out as hidden (and counted)
+        self.dangling: set[str] = set()  # ids of hidden-only notes whose mark was shown: render() renders again
         self.unread = unread(skipped or {})
         self.empty = True  # nothing but status lines was rendered
         self.hidden_count = 0
@@ -153,6 +157,8 @@ class _Render:
             if isinstance(it, Hidden) or it.hidden:
                 if not self.show:
                     self.hidden_count += 1
+                    if self.doc.notes:
+                        self._hidden_marks(it)
                     continue
                 inner = self._one(it, m, as_hidden=True)
                 parts.append(f"(hidden: {inner})")
@@ -197,8 +203,21 @@ class _Render:
         if isinstance(it, Math):
             return m.esc(f"${it.tex}$")
         if isinstance(it, NoteRef):
+            if it.id in self.drop:
+                return ""
+            self.marked.add(it.id)
             return f"[^{self._note_number(it.id)}]"
         return ""
+
+    def _hidden_marks(self, it):
+        """Note the ids of the marks inside an inline left out as hidden, so their notes are not counted twice."""
+        stack = [it]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, NoteRef):
+                self.hidden_marks.add(x.id)
+            else:
+                stack.extend(getattr(x, "inlines", ()))
 
     def _note_number(self, nid):
         if nid not in self.note_no:
@@ -655,7 +674,13 @@ class _Render:
                     left_out = self.hidden_count
                     s = " ".join(x for x in (self._flat(b, LINES) for b in notes[nid]) if x)
                     if not s and self.hidden_count > left_out:
-                        continue  # a note whose whole text is hidden has no definition to show
+                        # a note whose whole text is hidden has no definition to show, and no mark: one shown is
+                        # left out by a second render (render); one left out as hidden already counted the note
+                        if nid in self.marked:
+                            self.dangling.add(nid)
+                        if nid in self.hidden_marks:
+                            self.hidden_count = left_out
+                        continue
                     lines.append(f"[^{self.note_no[nid]}]: {s}".rstrip())
             if referenced_done:
                 break
@@ -697,7 +722,14 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     "images" (how many viewable images the output links to).
     """
     r = _Render(doc, Path(assets_dir), hidden, skipped)
-    md = _cap(_normalize(r.body()))
+    text = r.body()
+    if r.dangling:  # a hidden-only note's mark was shown: render again with those marks left out (and unnumbered)
+        drop = frozenset(r.dangling)
+        del text, r  # the first render is not kept while the second runs
+        r = _Render(doc, Path(assets_dir), hidden, skipped, drop=drop)
+        text = r.body()
+    text = _normalize(text)  # rebound, so the raw text is not held while _cap runs
+    md = _cap(text)
     if info is not None:
         info.update(unread=r.unread, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked))
     return md

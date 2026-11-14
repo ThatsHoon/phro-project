@@ -440,6 +440,14 @@ def test_footnote_in_hidden_text_is_not_an_empty_definition():
     assert "[^1]: seen" in out and "HIDNOTE" not in out, out
 
 
+def test_hidden_note_is_one_hidden_place():
+    # the hidden mark is counted; the definition it would have had is not counted again
+    out = md_mem(rb"{\rtf1 a {\footnote\v note} c}")
+    assert out == "(1 hidden places left out)\n\na  c\n", out
+    out = md_mem(rb"{\rtf1 a {\v b{\footnote note}} c}")
+    assert out == "(2 hidden places left out)\n\na  c\n", out  # the hidden b and the note
+
+
 def test_outlinelevel9_clears_the_level():
     out = md_mem(rb"{\rtf1\pard\outlinelevel1 Two\par\pard\outlinelevel1\outlinelevel9 Body\par}")
     assert out == "## Two\n\nBody\n", out
