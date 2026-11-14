@@ -211,6 +211,19 @@ def test_hidden_note_is_counted_once():
     doc = Doc(blocks=[Para([Text("a"), Hidden([Text("b"), NoteRef("h")]), Text(" c")])],
               notes={"h": [Para([Hidden([Text("note")])])]})
     assert R(doc) == "(1 hidden places left out)\n\na c\n", R(doc)
+    # the same when the mark sits in a hidden block, a hidden sheet's section, or a hidden table row or column
+    note = {"h": [Para([Hidden([Text("note")])])]}
+    marked = Para([Text("b"), NoteRef("h")])
+    for hidden_block in (Para([Text("b"), NoteRef("h")], hidden="hidden"),
+                         Section("sheet", "H", blocks=[marked], hidden="hidden"),
+                         Table([[Cell([P("x")])], [Cell([marked])]], hidden_rows=frozenset({1})),
+                         Table([[Cell([P("x")]), Cell([P("y")])], [Cell([P("z")]), Cell([marked])]],
+                               hidden_rows=frozenset({1})),
+                         Table([[Cell([P("x")]), Cell([marked])]], hidden_cols=frozenset({1}))):
+        doc = Doc(blocks=[P("a"), hidden_block], notes=dict(note))
+        out = R(doc)
+        assert out.startswith("(1 hidden places left out)\n\na\n"), (hidden_block, out)
+        assert "[^" not in out, out
     # an unreferenced hidden-only note is still counted, once
     doc = Doc(blocks=[P("a")], notes={"h": [Para([Hidden([Text("note")])])]})
     assert R(doc) == "(1 hidden places left out)\n\na\n", R(doc)

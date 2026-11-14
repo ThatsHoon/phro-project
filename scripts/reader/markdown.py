@@ -139,6 +139,8 @@ class _Render:
         """True when a hidden node is to be left out (and counted)."""
         if node.hidden and not self.show:
             self.hidden_count += 1
+            if self.doc.notes:
+                self._hidden_marks(node)
             return True
         return False
 
@@ -209,15 +211,25 @@ class _Render:
             return f"[^{self._note_number(it.id)}]"
         return ""
 
-    def _hidden_marks(self, it):
-        """Note the ids of the marks inside an inline left out as hidden, so their notes are not counted twice."""
-        stack = [it]
+    def _hidden_marks(self, node):
+        """Note the ids of the marks inside what is left out as hidden (an inline, a block, a section, the cells of a
+        hidden row or column), so their notes are not counted twice. Iterative: the subtree is walked once."""
+        stack = [node]
         while stack:
             x = stack.pop()
             if isinstance(x, NoteRef):
                 self.hidden_marks.add(x.id)
-            else:
-                stack.extend(getattr(x, "inlines", ()))
+                continue
+            for name in ("inlines", "blocks", "notes"):
+                stack.extend(getattr(x, name, ()))
+            for row in getattr(x, "rows", ()):
+                stack.extend(row)
+
+    def _hidden_row_marks(self, t: Table, r: int):
+        """The marks in the cells a hidden row `r` starts: grid row r is `t.rows[r]`, as `_grid` numbers it."""
+        if self.doc.notes and 0 <= r < len(t.rows):
+            for cell in t.rows[r]:
+                self._hidden_marks(cell)
 
     def _note_number(self, nid):
         if nid not in self.note_no:
@@ -340,6 +352,8 @@ class _Render:
         """A block as one run of text for a table cell or note."""
         if b.hidden and not self.show:
             self.hidden_count += 1
+            if self.doc.notes:
+                self._hidden_marks(b)
             return ""
         if not self._enter():
             return ""
@@ -482,6 +496,8 @@ class _Render:
                     texty[k] = self._has_text(cell.blocks)
                 if texty[k] and r not in t.hidden_rows:
                     lost.update(cols)
+                if n >= cs and self.doc.notes:  # the cell is dropped whole: its marks are left out as hidden
+                    self._hidden_marks(cell)
             origins = mapped
             if count:
                 self.hidden_count += len(lost)
@@ -505,6 +521,7 @@ class _Render:
                 break
             if r in t.hidden_rows and not self.show:  # before the cells are built, so their images are not written
                 self.hidden_count += 1
+                self._hidden_row_marks(t, r)
                 continue
             cells = []
             for k in sorted(origins):
@@ -537,6 +554,7 @@ class _Render:
             if r in t.hidden_rows:
                 if not self.show:
                     self.hidden_count += 1
+                    self._hidden_row_marks(t, r)
                     return None
                 return True
             return False
