@@ -21,6 +21,9 @@ from reader.pdfnative import document as dm  # noqa: E402
 from reader.pdfnative.ocg import OCState  # noqa: E402
 
 
+LATE = 100
+
+
 def test_native_page_text():
     doc = dm.NativeDoc(simple_pdf([text_ops("One"), text_ops("Two")]))
     assert doc.page_count == 2 and isinstance(doc.oc, OCState)
@@ -134,6 +137,38 @@ def test_native_outline():
     pdf = simple_pdf([text_ops("A"), text_ops("B")], catalog={"Outlines": Ref(300)},
                      extra_objects=outline_items(items))
     assert dm.NativeDoc(pdf).outline() == items
+
+
+def test_native_late_decrypt_budget():
+    saved = crypto.DECRYPT_TOTAL
+    crypto.DECRYPT_TOTAL = LATE
+    try:
+        doc = dm.NativeDoc(simple_pdf([text_ops("Hi" * 40)], encrypt=EncryptSpec(4)))
+        page = doc.page(0)
+    finally:
+        crypto.DECRYPT_TOTAL = saved
+    assert page.fragments == [] and doc.pdf.cuts["decrypt_budget"] >= 1
+    assert page.cut["page_part"] == 1 and doc.cut["page_part"] == 1, (page.cut, doc.cut)
+
+
+def test_native_glyphs_direct_font():
+    objects = font_type0(tounicode=None, ordering="Identity")
+    direct = objects.pop(100)
+    objects[101]  # descendant stays an object
+    body = b"BT /F2 12 Tf 72 720 Td <0001> Tj ET"
+    pdf = simple_pdf([body, body], resources={"Font": {"F2": direct}}, extra_objects=objects)
+    doc = dm.NativeDoc(pdf)
+    doc.page(0)
+    doc.page(1)
+    assert doc.cut["glyphs"] == 1, doc.cut
+
+
+def test_native_page_read_twice():
+    doc = dm.NativeDoc(simple_pdf([b"", b""], page_extra={"Contents": [Ref(500 + i) for i in range(300)]},
+                                  extra_objects={500 + i: Stream({}, b"") for i in range(300)}))
+    doc.page(0)
+    again = doc.page(0)
+    assert doc.cut["page_part"] == 1 and again.cut["page_part"] == 1, doc.cut
 
 
 def main():

@@ -22,6 +22,7 @@ from ..formats.pdf_layout import PageData, PageImage
 from ..limits import ReadError
 from . import annotations, images
 from .content import interpret
+from .fonts import font_infos
 from .objects import PDFStream
 from .ocg import OCState
 from .structure import PDFFile
@@ -80,6 +81,8 @@ class NativeDoc:
             raise
         self._fonts: dict = {}
         self._unmapped_seen: set = set()
+        self._direct_fonts: list = []  # keeps direct font dicts alive, so their ids stay theirs
+        self._read: set = set()
 
     @property
     def pdf(self) -> PDFFile:
@@ -118,16 +121,32 @@ class NativeDoc:
             parts.append(decoded)
         return b"\n".join(parts)
 
-    def _count_glyphs(self, cut: Counter) -> None:
+    def _count_glyphs(self, cut: Counter, resources: dict) -> None:
+        counted = 0
         for key, info in list(self._fonts.items()):
             if getattr(info, "unmapped", False) and key not in self._unmapped_seen:
                 self._unmapped_seen.add(key)
-                cut["glyphs"] += 1
+                counted += 1
+        # fonts given as direct dicts are not cached by reference: one per dict identity
+        table = self._pdf.resolve(resources.get("Font"))
+        for name, font in (table.items() if isinstance(table, dict) else ()):
+            if isinstance(font, dict) and id(font) not in self._unmapped_seen:
+                info = font_infos(self._pdf, {"Font": {name: font}}, {}).get(str(name))
+                if info is not None and info.unmapped:
+                    self._unmapped_seen.add(id(font))
+                    self._direct_fonts.append(font)
+                    counted += 1
+        if not counted and not self._unmapped_seen:
+            # the text came from a font no cache entry or page-level dict accounts for
+            self._unmapped_seen.add("unknown")
+            counted = 1
+        cut["glyphs"] += counted
 
     def page(self, index: int) -> PageData:
         pdf = self._pdf
         page, inherited = pdf.pages()[index]
         cut: Counter = Counter()
+        before = Counter(pdf.cuts)
         box = (_box(pdf.resolve(inherited.get("CropBox")))
                or _box(pdf.resolve(inherited.get("MediaBox"))) or _LETTER)
         rotate = pdf.resolve(inherited.get("Rotate"))
@@ -139,7 +158,7 @@ class NativeDoc:
         content = interpret(pdf, self._content(page, cut), resources, self._fonts, self.oc, box=box)
         cut.update(content.cut)
         if content.unmapped:
-            self._count_glyphs(cut)
+            self._count_glyphs(cut, resources)
 
         shown: List[PageImage] = []
         for _name, draw_box, stream in content.image_draws:
@@ -151,10 +170,14 @@ class NativeDoc:
             got = images.image(pdf, stream)
             shown.append(PageImage(draw_box, got.data, got.px, got.kind))
 
+        if pdf.cuts != before and any(pdf.cuts[k] > before[k] for k in pdf.cuts):
+            cut["page_part"] += 1  # a structure cap fired while this page was read: read in part
         links, comments, annot_cut = annotations.page_annots(pdf, page)
         cut.update(annot_cut)
         chars = sum(1 for f in content.fragments for ch in f.text if not ch.isspace())
-        self.cut.update(cut)
+        if index not in self._read:
+            self._read.add(index)
+            self.cut.update(cut)
         return PageData(number=index + 1, box=box, rotate=turn, fragments=content.fragments,
                         segments=content.segments, short=content.short, images=shown,
                         figure=content.figure, links=links, fields=self.fields.get(index, []),
