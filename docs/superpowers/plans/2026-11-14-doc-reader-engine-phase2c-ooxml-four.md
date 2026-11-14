@@ -150,7 +150,7 @@
   python -I -X utf8 -c "import sys; sys.path.insert(0, 'scripts'); from reader.formats import sheet_grid, xls, ppt, xlsb, rtf, zip_route; from reader.containers import zipx; assert hasattr(sheet_grid.Grid, 'stop') and not hasattr(sheet_grid.Grid, '_stop'); assert all(hasattr(m, n) for m, n in ((xls, 'parse_compound'), (ppt, 'parse_compound'), (xlsb, 'parse_package'), (rtf, 'parse_bytes'), (zip_route, 'route'))); print('ok')"
   ```
 
-  Expected: `ok`. `markdown._note_defs` also drops a mark together with its definition when the definition is hidden-only; Task 11's hidden-sheet test relies on it.
+  Expected: `ok`. `markdown._note_defs` also drops a mark together with its definition when the definition is hidden-only, and a mark inside any hidden place left out (a hidden section included) keeps its hidden-only note from being counted again (a2d5cf5). Task 11's hidden-sheet test relies on both.
 - Branch `doc-reader-phase2c` is cut from that commit (decision 16).
 - The full-suite check prints `done`.
 
@@ -622,6 +622,7 @@ def test_hyperlink_huge_range():   # ref="A1:XFD1048576" over two valued cells -
     - The note is one `comment_note([Para([Text(t)])], name)[0]` per comment.
   - **Legacy comments:** the type ending `/comments`, with `authors/author` by index and `commentList/comment@ref, authorId/text` (`t` plus `r/t`, `rPh` dropped, `_unescape`). A legacy comment on a cell that a thread covers is dropped.
   - **Placement:** the cell's put appends `NoteRef(key)` to its inlines. A commented cell that never gets a value is put after the stream as `[NoteRef(key)]`.
+  - **Hidden sheets:** `_note_defs` writes every note in `doc.notes`, unreferenced ones included, so a hidden sheet's notes would still show. On a hidden sheet each note's blocks go through `xls._hide`, so the note is hidden-only and is left out with its sheet, and counted once with it (shown under `--hidden`).
   - A missing or damaged comments, threaded comments or persons part counts `comments`, and the cells still read.
 - **Produces, `reader_fix.py`:** `make_xlsx` writes the parts named in `extra_parts` and the workbook relationships named in `wb_rels`, with full Type URIs allowed. No new builder is needed.
 - **Produces, notices:** dochan's xlsx phrase gains "and legacy comments".
@@ -635,7 +636,8 @@ def test_threaded_without_legacy(): # a thread on C3 and no legacy part at all -
 def test_legacy_kept_elsewhere():   # a thread on B2, a legacy comment on D4 -> both footnotes
 def test_thread_replies():          # root by Bo "q", reply (parentId) by Cy "a" -> "[^1]: Comment by Bo: q Comment by Cy: a"
 def test_comment_on_empty_cell():   # a comment on D4 with no value -> a cell holding "[^1]", and its definition
-def test_comment_on_hidden_sheet(): # a hidden sheet with a comment -> no "[^" in md by default; present with hidden=True
+def test_comment_on_hidden_sheet(): # a hidden sheet with a comment -> no "[^" and no "Comment by" in md by default, "(1 hidden places left out)" in md;
+                                    # with hidden=True the mark and its definition are present
 def test_comments_part_missing():   # the comments relationship's target absent -> cells read, skipped["comments"] == 1
 ```
 
