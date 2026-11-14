@@ -1463,6 +1463,7 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     encryption here is written out on its own (its own key derivation), not by running the reader's unlock backwards.
     encrypt_header (bytes) replaces the CryptSession10Container body, for example a (4, 4) AES EncryptionVersionInfo;
     the streams are still encrypted with the password's RC4 keys.
+    no_drawing (true) writes the title and body runs straight into the SlideContainer, without a PPDrawing, and the slide's notes likewise.
     shapes: a list of dicts that replaces the slide's own text shapes in its PPDrawing (the SLWT is unchanged). A dict
     is a text shape, kind "group" or kind "picture" (key pib, the 1-based BStore index; box, text, placeholder and ref as for a text shape); kind
     "object" (below). Keys: kind ("text" by default), spid, box ((left, top, right, bottom): a ClientAnchor at the top level, a
@@ -1524,6 +1525,8 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         parts = [ppt_slide_atom(master_slide_id, notes_slide_id.get(k + 1, 0))]
         if slide.get("hidden"):
             parts.append(oa_record(0x03F9, struct.pack("<iIBBHB3x", 0, 0, 0, 0, 0x0004, 0)))
+        if slide.get("no_drawing"):  # the text runs sit in the SlideContainer itself, with no PPDrawing
+            return oa_container(0x03EE, *parts, *runs(slide))
         if slide.get("shapes"):
             ids = [1025]
             shapes = [ppt_shape(spec, ids) for spec in slide["shapes"]]
@@ -1534,7 +1537,10 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         return oa_container(0x03EE, *parts, ppt_drawing(*shapes, raw=raw_shapes.get(k + 1, b"")))
 
     def notes_record(num):
-        return oa_container(0x03F0, oa_record(0x03F1, struct.pack("<IHH", slide_ids[num - 1], 0, 0)),
+        head = oa_record(0x03F1, struct.pack("<IHH", slide_ids[num - 1], 0, 0))
+        if slides[num - 1].get("no_drawing"):  # the notes text sits in the NotesContainer itself
+            return oa_container(0x03F0, head, ppt_text(2, notes[num]))
+        return oa_container(0x03F0, head,
                             ppt_drawing(ppt_textbox(1025, ppt_text(2, notes[num]))))
 
     def slide_list(inst, atoms):

@@ -62,6 +62,14 @@ def test_titles_and_body():
             assert out.count(line) == 1, (outline, line, out)
 
 
+def test_slide_text_without_drawing():
+    out, _ = md([{"title": "First", "body": ["alpha"], "no_drawing": True}, {"body": ["beta"], "no_drawing": True}])
+    assert "## Slide 1: First" in out and "alpha" in out, out
+    assert "## Slide 2" in out and "beta" in out, out
+    out, _ = md([{"title": "One", "no_drawing": True}], notes={1: "spoken"})
+    assert "> Notes: spoken" in out, out
+
+
 def test_notes():
     out, _ = md([{"title": "Intro", "body": ["text"]}, {"title": "Plan"}], notes={1: "speak slowly"})
     assert "> Notes: speak slowly" in out, out

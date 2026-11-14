@@ -148,6 +148,8 @@ class Presentation:
                 hidden = bool(struct.unpack_from("<H", self.doc, body + 10)[0] & 0x0004)
             elif typ == rec.PP_DRAWING and drawing is None:
                 drawing = (body, body + sz)
+        if drawing is None:  # no PPDrawing: the text atoms the slide holds itself, in record order
+            drawing = (start, start + size)
         ordered, used = self._drawn(drawing, outline)
         ordered.extend(o for i, o in enumerate(outline) if i not in used)
         sec = Section("slide", number=number, hidden="hidden" if hidden else "")
@@ -171,6 +173,8 @@ class Presentation:
             elif typ == rec.PP_DRAWING and drawing is None:
                 drawing = (body, body + sz)
         blocks = []
+        if drawing is None:  # no PPDrawing: the text atoms the notes page holds itself
+            drawing = span
         for kind, bl, _ in self._drawn(drawing, [], ppt_shapes.SKIPPED | {5})[0]:
             if kind in (2, _PICTURE):
                 blocks.extend(bl)
