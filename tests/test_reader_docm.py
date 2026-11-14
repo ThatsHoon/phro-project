@@ -85,6 +85,23 @@ def test_registered():
     assert "docm" in reader.BUILT
 
 
+def test_templates_read():
+    import shutil
+    import test_reader_slides as sl
+    from reader_fix import make_xlsx
+    d = tmp()
+    word = docm(P("templateword")).read_bytes()
+    deck_bytes = sl.deck(["<p:sp/>"], kind="ppsx").read_bytes()
+    sheet = make_xlsx(None, [{"name": "S", "rows": '<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>'}])
+    for name, data, want in (("a.dotx", word, "templateword"), ("a.dotm", word, "templateword"),
+                             ("a.potx", deck_bytes, "## Slide 1"), ("a.potm", deck_bytes, "## Slide 1"),
+                             ("a.ppsm", deck_bytes, "## Slide 1"),
+                             ("a.xltx", sheet, "## Sheet: S"), ("a.xltm", sheet, "## Sheet: S")):
+        (d / name).write_bytes(data)
+        assert want in md(d / name), name
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def test_macro_main_type_accepted():
     assert "Hello" in md(docm(P("Hello")))
 

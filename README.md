@@ -437,15 +437,15 @@ python -I -X utf8 <copy>/scripts/daily.py run --force [--date YYYY-MM-DD]
 
 ## Document reader
 
-A `PreToolUse` hook on `Read` (`scripts/read.py hook`) catches a read of a document the model cannot open as text, converts it to Markdown with images extracted to files, and hands Claude the Markdown path to read instead. `pdf`, `docx`, `pptx`, `xlsx` and `xlsm` are never touched; they belong to the `anthropic-skills:*` skills.
+A `PreToolUse` hook on `Read` (`scripts/read.py hook`) catches a read of a document the model cannot open as text, converts it to Markdown with images extracted to files, and hands Claude the Markdown path to read instead. `pdf` alone is never touched and belongs to `anthropic-skills:pdf` until its phase. Word, PowerPoint and Excel files are read here, while editing them stays with the `anthropic-skills:docx`, `:pptx` and `:xlsx` skills, as each converted Read says in one sentence. `PHRO_READER_OFF` (comma-separated extensions, case and a leading dot ignored) hands those extensions back to Claude's own Read, and `read.py convert` ignores it.
 
-Built formats: `hwpx`, `hwp`, `doc`, `xls`, `odt`, `ods`, `odp`, `docm`, `pptm`, `ppsx`, `epub`, `xps`, `oxps`, `vsdx`, `xlsb`, `ppt`, `rtf`. Every other in-scope extension (wpd, mobi, azw3, pages, numbers, key, djvu, mdb, accdb, pub, vsd, mpp) is denied as "unsupported" until its phase is built; a plain-text file that only carries one of these extensions passes through unchanged. Standard library only; budgets: input 512 MiB, output 20 MB, 45 seconds per conversion.
+Built formats: `hwpx`, `hwp`, `doc`, `xls`, `odt`, `ods`, `odp`, `docm`, `pptm`, `ppsx`, `epub`, `xps`, `oxps`, `vsdx`, `xlsb`, `ppt`, `rtf`, `docx`, `dotx`, `dotm`, `pptx`, `potx`, `potm`, `ppsm`, `xlsx`, `xlsm`, `xltx`, `xltm`. In a workbook a cell shows its cached value (a formula only when it has none); slide and cell comments, cell hyperlinks, OMML equations (as TeX) and SmartArt text are read. Every other in-scope extension (wpd, mobi, azw3, pages, numbers, key, djvu, mdb, accdb, pub, vsd, mpp) is denied as "unsupported" until its phase is built; a plain-text file that only carries one of these extensions passes through unchanged. Standard library only; budgets: input 512 MiB, output 20 MB, 45 seconds per conversion.
 
 HWP protection: a distribution document is decrypted with the key the file itself carries and read like any other `.hwp`. One locked with a password or a certificate is denied with "the file is encrypted and needs a password", and one under DRM (the FileHeader DRM flags, or a Fasoo or SoftCamp container) with "the file is DRM-protected"; no password is tried and DRM is not removed. An encrypted or obfuscated `.doc` is denied as encrypted too.
 
 Office protection: an `.xls` or `.ppt` that is encrypted with its format's default password (the Excel `VelvetSweatshop` password, the PowerPoint default) is decrypted and read; one locked with any other password is denied as encrypted. Every encrypted `.xlsb` is denied as encrypted. Excel charts and worksheets embedded in `.hwp`, `.doc` and `.ppt` files are read and placed where the object sits.
 
-Always-on cost: for any file outside the 29 in-scope extensions the hook prints nothing, and each Read costs one Python start. Measured with `Measure-Command` over 20 runs of `read.py hook` on a `.py` event, the median is 84 ms.
+Always-on cost: for any file outside the 40 in-scope extensions the hook prints nothing, and each Read costs one Python start. Measured with `Measure-Command` over 20 runs of `read.py hook` on a `.py` event, the median is 84 ms.
 
 Converted output is cached by a hash of the document's bytes and the reader's own source at `%LOCALAPPDATA%\phro-project\reader\` on Windows and `~/.cache/phro-project/reader/` elsewhere, as `<sha1[:2]>/<sha1>/` holding `out.md`, `assets/` and `meta.json`. `python -I -X utf8 scripts/read.py prune [--days 30]` deletes entries not used for N days.
 
@@ -478,7 +478,7 @@ Result against the routing pick on the bench corpus, one line per extension:
 - `restructure` start to finish with a person choosing the structure. Only its script has met real projects, on scratch copies.
 - Routing test of this plugin's own skills with `tests/route_cases.json`, 28 cases, about $4. The cases are written by the author, which inflates the rate, so it waits for prompts really typed.
 - A hook at write time that enforces folder rules, a search over the documents, signal hook, local search and compliance grading. Each waits for a measured failure.
-- Phases 3-4 of the document reader (wpd, ebooks, iWork, djvu, Access, Publisher, Visio binary, Project). Phases 1, 2a and 2b (hwpx, hwp, doc, xls, ppt, xlsb, rtf and the zip formats) are built.
+- Phases 3-4 of the document reader (wpd, ebooks, iWork, djvu, Access, Publisher, Visio binary, Project). Phases 1, 2a, 2b and 2c (hwpx, hwp, doc, xls, ppt, xlsb, rtf, the zip formats, docx, pptx, xlsx and their template and macro variants) are built; 2d (pdf) is next.
 
 ## When to delete it
 

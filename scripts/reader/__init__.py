@@ -1,13 +1,16 @@
 """Stdlib-only document reader. Heavier imports happen inside functions."""
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # extension -> module name under reader.formats
 FORMATS = {
     "hwpx": "hwpx", "hwp": "hwp",
     "odt": "odf", "ods": "odf", "odp": "odf",
     "docm": "ooxml", "pptm": "ooxml", "ppsx": "ooxml",
+    "docx": "ooxml", "dotx": "ooxml", "dotm": "ooxml",
+    "pptx": "ooxml", "potx": "ooxml", "potm": "ooxml", "ppsm": "ooxml",
+    "xlsx": "ooxml", "xlsm": "ooxml", "xltx": "ooxml", "xltm": "ooxml",
     "vsdx": "vsdx", "epub": "epub", "xps": "xps", "oxps": "xps",
     "doc": "doc", "xls": "xls", "ppt": "ppt", "xlsb": "xlsb",
     "rtf": "rtf", "wpd": "wpd",
@@ -19,10 +22,11 @@ FORMATS = {
 }
 
 # extensions with a working parser; each format task adds its own
-BUILT = {"hwpx", "hwp", "doc", "xls", "odt", "ods", "odp", "docm", "pptm", "ppsx", "vsdx", "epub", "xps", "oxps", "xlsb", "ppt", "rtf"}
+BUILT = {"hwpx", "hwp", "doc", "xls", "odt", "ods", "odp", "docm", "pptm", "ppsx", "vsdx", "epub", "xps", "oxps", "xlsb", "ppt", "rtf",
+         "docx", "dotx", "dotm", "pptx", "potx", "potm", "ppsm", "xlsx", "xlsm", "xltx", "xltm"}
 
 # handled by anthropic-skills:*, never touched here
-SKILL_EXTS = frozenset({"pdf", "docx", "pptx", "xlsx", "xlsm"})
+SKILL_EXTS = frozenset({"pdf"})
 
 
 def ext_of(path) -> str:

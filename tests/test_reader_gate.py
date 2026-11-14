@@ -94,7 +94,7 @@ def out(d):
 
 def test_pass_through():
     d = tmp()
-    for n in ("a.py", "a.md", "a.png", "a.pdf", "a.docx"):
+    for n in ("a.py", "a.md", "a.png", "a.pdf"):
         (d / n).write_text("x")
         assert gate.decide(ev(d / n)) is None
     (d / "w.hwp").write_text("x")
@@ -566,6 +566,30 @@ def test_hooks_json_entry():
     c = e["hooks"][0]
     assert c["type"] == "command" and c["command"].endswith('read.py" hook') and c["timeout"] == 60
     assert {"SessionStart", "SubagentStart", "UserPromptSubmit"} <= set(h)
+
+
+def test_ooxml_four_converted():
+    import test_reader_docm as dm
+    import test_reader_slides as sl
+    from reader_fix import make_xlsx
+    rows = '<row r="1"><c r="A1" t="inlineStr"><is><t>cellword</t></is></c></row>'
+    d = tmp()
+    files = {
+        "a.docx": (dm.docm(dm.P("wordword")).read_bytes(), "docx"),
+        "a.pptx": (sl.deck(["<p:sp/>"], kind="ppsx").read_bytes(), "pptx"),
+        "a.xlsx": (make_xlsx(None, [{"name": "S", "rows": rows}]), "xlsx"),
+        "a.xlsm": (make_xlsx(None, [{"name": "S", "rows": rows}]), "xlsx"),
+    }
+    with stub() as base:
+        for name, (data, skill) in files.items():
+            (d / name).write_bytes(data)
+            r = run(d / name, base)
+            assert r is not None and out(r)["permissionDecision"] == "allow", (name, r)
+            ctx = out(r)["additionalContext"]
+            assert ctx.startswith(name + " was converted to Markdown by phro-project"), ctx
+            assert ctx.endswith(f"to edit the file, use the {skill} skill."), (name, ctx)
+        (d / "a.pdf").write_bytes(b"%PDF-1.7\n" + bytes(64))
+        assert gate.decide(ev(d / "a.pdf")) is None
 
 
 def test_readme_formats_match():
