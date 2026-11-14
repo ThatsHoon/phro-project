@@ -230,6 +230,56 @@ def test_budget_spent_by_cells():
     assert T.tables(segs, frags, 1, budget, cut) == [] and cut["cells"] == 1
 
 
+def test_short_rule_drops_row_with_rowspan():
+    # the y=160 rule is a stub, so rows 0 and 1 merge in both columns; the e/f row keeps its place
+    segs = [s for s in grid(100, 100, 60, 30, 3, 2) if not (s.y0 == s.y1 == 160)]
+    segs += [Segment(100, 160, 105, 160)]
+    frags = [frag("a", 104, 168, 0), frag("b", 164, 168, 1), frag("c", 104, 138, 2),
+             frag("d", 164, 138, 3), frag("e", 104, 108, 4), frag("f", 164, 108, 5)]
+    found, _ = run(segs, frags)
+    rows = found[0].table.rows
+    covered = sum(c.rowspan for c in rows[0])
+    assert len(rows) == 2 and all(c.rowspan == 1 for c in rows[0]), [[c.rowspan for c in r] for r in rows]
+    assert [text_of(c) for c in rows[1]] == ["e", "f"]
+
+
+def test_cell_text_out_of_order():
+    segs = grid(100, 100, 200, 60, 2, 2)
+    frags = [frag("World", 140, 140, 0), frag("Hello", 104, 140, 1), frag("b", 304, 140, 2),
+             frag("second", 104, 108, 3), frag("first", 104, 120, 4), frag("d", 304, 108, 5)]
+    found, _ = run(segs, frags)
+    got = rows_of(found[0].table)
+    assert got[1][0] == "Hello World" + chr(10) + "first second", got
+
+
+def test_many_tall_boxes_fast():
+    n = 4999
+    segs = []
+    for k in range(n):
+        x = k * 11.0
+        segs += [Segment(x, 0, x + 8.5, 0), Segment(x, 5000, x + 8.5, 5000),
+                 Segment(x, 0, x, 5000), Segment(x + 8.5, 0, x + 8.5, 5000)]
+    frags = [frag("a", (i % n) * 11.0 + 2, 10 + (i // n) * 2.0, i, size=1) for i in range(20000)]
+    t0 = time.time()
+    run(segs[:20000], frags)
+    assert time.time() - t0 < 1, time.time() - t0
+
+
+def test_split_cap_counts_once():
+    S = Segment
+    outer = [S(0, 0, 300, 0), S(0, 200, 300, 200), S(0, 0, 0, 200), S(300, 0, 300, 200), S(150, 0, 150, 200)]
+    child = [S(0, y, 120, y) for y in (50, 80, 110, 140)] + [S(x, 50, x, 140) for x in (40, 80, 120)]
+    frags = [frag(t, 4 + 40 * (k % 3), 58 + 30 * (k // 3), k) for k, t in enumerate("abcdefghi")]
+    frags.append(frag("R", 160, 100, 9))
+    old = T.MAX_PAGE_CELLS
+    T.MAX_PAGE_CELLS = 5
+    try:
+        found, cut = run(outer + child, frags)
+    finally:
+        T.MAX_PAGE_CELLS = old
+    assert cut["cells"] == 1 and sum(cut.values()) == 1, dict(cut)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

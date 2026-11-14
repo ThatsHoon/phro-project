@@ -16,7 +16,7 @@ dochan's, under the same names, and each cut is counted once under `cells`.
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import hypot, isclose, isfinite
 from typing import List, Optional
 
@@ -485,19 +485,38 @@ def _fragment_index(fragments):
             previous_key = key
         points.append((_reference_point(frag, axes), frag))
     points.sort(key=lambda item: item[0][1])
-    return points, [point[1] for point, _ in points]
+    by_x = sorted(points, key=lambda item: item[0][0])
+    return points, [point[1] for point, _ in points], by_x, [point[0] for point, _ in by_x]
 
 
 def _fragments_inside(index, bbox):
-    points, ys = index
+    """The fragments whose reference point is in bbox; the narrower axis is cut by bisect."""
+    points, ys, by_x, xs = index
     lo, hi = bisect_left(ys, bbox[1]), bisect_right(ys, bbox[3])
-    return [frag for (x, _), frag in points[lo:hi] if bbox[0] <= x <= bbox[2]]
+    xlo, xhi = bisect_left(xs, bbox[0]), bisect_right(xs, bbox[2])
+    if hi - lo <= xhi - xlo:
+        return [frag for (x, _), frag in points[lo:hi] if bbox[0] <= x <= bbox[2]]
+    return [frag for (_, y), frag in by_x[xlo:xhi] if bbox[1] <= y <= bbox[3]]
 
 
 def _has_fragment_inside(index, bbox):
-    points, ys = index
+    points, ys, by_x, xs = index
     lo, hi = bisect_left(ys, bbox[1]), bisect_right(ys, bbox[3])
-    return any(bbox[0] <= x <= bbox[2] for (x, _), _ in points[lo:hi])
+    xlo, xhi = bisect_left(xs, bbox[0]), bisect_right(xs, bbox[2])
+    if hi - lo <= xhi - xlo:
+        return any(bbox[0] <= x <= bbox[2] for (x, _), _ in points[lo:hi])
+    return any(bbox[1] <= y <= bbox[3] for (_, y), _ in by_x[xlo:xhi])
+
+
+def _reading_key(frag):
+    direction = pdf_layout.writing_direction(frag)
+    if direction == "ltr":
+        return -frag.y, frag.x
+    if direction == "rtl":
+        return frag.y, -frag.x
+    if direction == "down":
+        return -frag.x, -frag.y
+    return frag.x, frag.y
 
 
 def _cell_lines(fragments, cache):
@@ -505,7 +524,10 @@ def _cell_lines(fragments, cache):
     key = tuple(id(frag) for frag in fragments)
     if cache is not None and key in cache:
         return cache[key]
-    out = pdf_layout.lines(fragments)
+    # in reading order (dochan's key), whatever order the page drew them in; lines() follows
+    # `order`, so the copies are numbered by that sort
+    ordered = sorted(fragments, key=_reading_key)
+    out = pdf_layout.lines([replace(f, order=i) for i, f in enumerate(ordered)])
     if cache is not None:
         cache[key] = out
     return out
@@ -932,8 +954,9 @@ def _split_connected(horizontal, vertical, tolerance, fragment_index, cut, split
             cx, cy = axes(hs, vs)
             child_cells = (len(cx) - 1) * (len(cy) - 1)
             grid_hs, grid_vs = _supplement_rules(hs, vs, cx, cy, dash_runs)
-            if (child_cells > cell_limit or not split_budget.spend(
-                    _grid_cost(grid_hs, grid_vs, cx, cy) + len(fragments))):
+            if child_cells > cell_limit:
+                return unchanged   # the cell caps count what they drop, in `tables`
+            if not split_budget.spend(_grid_cost(grid_hs, grid_vs, cx, cy) + len(fragments)):
                 return exhausted()
             _, owners, child_boxes = _make_grid(grid_hs, grid_vs, cx, cy, tolerance)
             filled = set()
@@ -955,8 +978,9 @@ def _split_connected(horizontal, vertical, tolerance, fragment_index, cut, split
             px, py = axes(parent_h, parent_v)
             cells = (len(px) - 1) * (len(py) - 1)
             grid_ph, grid_pv = _supplement_rules(parent_h, parent_v, px, py, dash_runs)
-            if (cells + child_cells > cell_limit or not split_budget.spend(
-                    _grid_cost(grid_ph, grid_pv, px, py))):
+            if cells + child_cells > cell_limit:
+                return unchanged
+            if not split_budget.spend(_grid_cost(grid_ph, grid_pv, px, py)):
                 return exhausted()
             _, _, boxes = _make_grid(grid_ph, grid_pv, px, py, tolerance)
             containers = [outer for outer in boxes.values() if _inside(box, outer)]
@@ -973,12 +997,16 @@ def _split_connected(horizontal, vertical, tolerance, fragment_index, cut, split
 
 def _to_table(grid) -> Table:
     """The origin cells of a grid, row by row."""
+    dropped = {r for r, row in enumerate(grid) if all(c.merged_away for c in row)}
     rows = []
-    for row in grid:
-        cells = [Cell(list(c.blocks), c.row_span, c.col_span) for c in row
-                 if not c.merged_away]
-        if cells:
-            rows.append(cells)
+    for r, row in enumerate(grid):
+        if r in dropped:
+            continue
+        # a row with no origin cell is left out, so a span over it shrinks by one
+        cells = [Cell(list(c.blocks),
+                      c.row_span - sum(1 for d in dropped if c.row < d < c.row + c.row_span),
+                      c.col_span) for c in row if not c.merged_away]
+        rows.append(cells)
     return Table(rows)
 
 
@@ -1056,15 +1084,21 @@ def tables(segments, fragments, page_number, budget, cut, short=(), model=None,
         _extend_to_rule_extents(xs, hs, tol)
         bbox = (xs[0], ys[-1], xs[-1], ys[0])
         if bbox[2] - bbox[0] >= 8 and bbox[3] - bbox[1] >= 8:
-            hs, ys = _numeric_row_rules(hs, vs, xs, ys, _fragments_inside(index, bbox), tol,
-                                        reference_points, line_cache)
+            if len(xs) >= 4:   # the numeric rule needs three columns
+                hs, ys = _numeric_row_rules(hs, vs, xs, ys, _fragments_inside(index, bbox), tol,
+                                            reference_points, line_cache)
             components.append((bbox, hs, vs, xs, ys))
     components.sort(key=lambda v: -_area(v[0]))
     remaining = MAX_PAGE_CELLS
     reserved = 0   # a provisional reservation; the real charge is made when a table is adopted
     reserved_nodes = 0
     nodes = []
+    examined = 0
     for bbox, hs, vs, xs, ys in components:
+        examined += 1
+        if examined > MAX_PAGE_COMPONENTS:   # the biggest are looked at first; the rest are given up
+            _count(cut)
+            break
         if len(hs) + len(vs) > MAX_COMPONENT_LINES:
             _count(cut)
             continue
