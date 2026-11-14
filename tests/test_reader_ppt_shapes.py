@@ -173,8 +173,89 @@ def test_anchor_16_bytes():
 
 
 def test_hyperlink_keeps_text_only():
-    out, _ = md([{"shapes": [text("click here", (0, 100, 100, 150), link=True)]}])
-    assert "click here" in out and "](" not in out and "http" not in out, out
+    url = "http://example.com/target"
+    d = Path(tempfile.mkdtemp())
+    path = d / "a.ppt"
+    info = make_ppt(path, [{"shapes": [text("click here", (0, 100, 100, 150), link=url)]}])
+    assert url.encode("utf-16le") in info["doc_stream"], "the fixture holds no URL"
+    ctx = Context()
+    out = markdown.render(reader.parse(path, ctx), d / "assets", False, ctx.skipped)
+    assert "click here" in out and "](" not in out and "example.com" not in out and "http" not in out, out
+    assert not ctx.skipped, ctx.skipped
+
+
+def slide_with_refs(*refs):
+    """A slide whose outline holds two runs (Alpha body, Beta tail) and whose shapes refer to the given indexes."""
+    return {"title": "Head", "body": ["Alpha body"], "extra": [(1, "Beta tail")], "outline": True,
+            "shapes": [{"placeholder": 14, "ref": r, "box": (0, 100 + 100 * k, 500, 150 + 100 * k)}
+                       for k, r in enumerate(refs)]}
+
+
+def test_bad_or_repeated_outline_ref_follows_unreferenced():
+    # the title run is index 0, Alpha body 1, Beta tail 2. A reference outside the list and a repeated one are ignored,
+    # uncounted; the blocks they did not take follow the shapes, so no text is lost
+    out, ctx = md([slide_with_refs(9, 1, 1)])
+    for t in ("Head", "Alpha body", "Beta tail"):
+        assert out.count(t) == 1, (t, out)
+    assert out.index("Alpha body") < out.index("Beta tail"), out
+    assert not ctx.skipped, ctx.skipped
+    out, _ = md([slide_with_refs(2, 2)])  # the second run comes first, the unreferenced ones after
+    assert out.index("Beta tail") < out.index("Alpha body"), out
+    assert out.count("Beta tail") == 1 and out.count("Alpha body") == 1, out
+
+
+def test_unanchored_shapes_sort_after_anchored_in_record_order():
+    shapes = [{"text": "free one"}, text("low", (0, 500, 100, 550)), {"text": "free two"},
+              text("high", (0, 100, 100, 150))]
+    out, _ = md([{"shapes": shapes}])
+    assert out.index("high") < out.index("low") < out.index("free one") < out.index("free two"), out
+
+
+def test_unanchored_member_does_not_pull_group_union():
+    group = {"kind": "group", "children": [{"text": "free member"}, text("g low", (0, 500, 100, 550)),
+                                           text("g high", (0, 400, 100, 450))]}
+    sibling = text("sibling", (0, 300, 100, 350))
+    shapes = ppt_shapes.ordered(walked([group, sibling]))
+    union = next(s for s in shapes if s.kind == "group")
+    assert (union.top, union.left, union.bottom, union.right) == (400, 0, 550, 100), vars(union)
+    out, _ = md([{"shapes": [group, sibling]}])
+    assert out.index("sibling") < out.index("g high") < out.index("g low") < out.index("free member"), out
+
+
+def test_table_edges_within_tolerance_are_one_line():
+    # the edges at 100 / 101 / 103 and 50 / 52 are one grid line each: a 2 x 2 table, no empty spanned column or row
+    cells = [text("a1", (0, 0, 100, 50)), text("b1", (101, 0, 200, 50)),
+             text("c1", (0, 52, 103, 100)), text("d1", (103, 50, 200, 100))]
+    t = walked([table(cells)])[0].blocks[0]
+    assert [len(r) for r in t.rows] == [2, 2] and all(c.colspan == c.rowspan == 1 for r in t.rows for c in r), t.rows
+    far = [text("a1", (0, 0, 100, 50)), text("b1", (110, 0, 200, 50)),
+           text("c1", (0, 50, 100, 100)), text("d1", (110, 50, 200, 100))]
+    assert len(walked([table(far)])[0].blocks[0].rows[0]) == 3  # 10 units apart: two lines, an empty column between
+
+
+def test_zero_size_fspgr_keeps_parent_coordinates():
+    group = {"kind": "group", "box": (100, 100, 300, 300), "rect": (5, 5, 5, 5), "client": True,
+             "children": [text("kid", (10, 20, 30, 40))]}
+    kid = walked([group])[0].children[0]
+    assert (kid.left, kid.top, kid.right, kid.bottom) == (10, 20, 30, 40), vars(kid)
+    out, ctx = md([{"shapes": [group]}])
+    assert "kid" in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_table_with_empty_cells():
+    cells = [text("a1", (0, 0, 100, 50)), {"box": (100, 0, 200, 50)},
+             text("", (0, 50, 100, 100)), text("d1", (100, 50, 200, 100))]
+    t = walked([table(cells)])[0].blocks[0]
+    assert [[bool(c.blocks) for c in r] for r in t.rows] == [[True, False], [False, True]], t.rows
+    out, _ = md([{"shapes": [table(cells)]}])
+    assert "|a1|" in out and "d1|" in out, out
+
+
+def test_placeholder_5_text_left_out_of_notes():
+    notes = {1: {"shapes": [text("image words", (0, 10, 100, 50), placeholder=5, text_kind=2),
+                            text("spoken words", (0, 100, 100, 150), placeholder=6, text_kind=2)]}}
+    out, ctx = md([{"title": "T"}], notes=notes)
+    assert "spoken words" in out and "image words" not in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def main():

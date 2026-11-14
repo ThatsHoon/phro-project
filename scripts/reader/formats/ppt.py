@@ -120,6 +120,8 @@ class Presentation:
         for shape in ppt_shapes.flatten(ppt_shapes.ordered(shapes)):
             ref = shape.text_ref
             runs = list(shape.runs)
+            # an index outside the list, or one an earlier shape took, is ignored and not counted: no text is lost,
+            # the block it did not take follows the slide's shapes as unreferenced (see _slide_at)
             if ref is not None and ref < len(outline) and ref not in used:
                 used.add(ref)
                 runs.insert(0, outline[ref])

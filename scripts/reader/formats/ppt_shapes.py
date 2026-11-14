@@ -20,6 +20,10 @@ from . import ppt_records as rec
 from . import ppt_text
 
 MAX_GROUPS = 32
+# Table cell edges within CLUSTER master units (576 per inch) are one grid line. A cell's edges are whole master units
+# that PowerPoint and the group map round one by one, so the cells of one grid line can differ by a unit or two;
+# 4 units is half a point (the same size as rtf_table's 10 twips), far under the width of any real column or row.
+CLUSTER = 4
 SKIPPED = frozenset((7, 8, 9, 10))  # placeholders: date, slide number, footer, header
 TITLES = frozenset((13, 15))        # placeholders: title, centered title
 CHILD_ANCHOR, FSPGR, CLIENT_TEXTBOX, CLIENT_DATA, DG_CONTAINER = 0xF00F, 0xF009, 0xF00D, 0xF011, 0xF002
@@ -106,7 +110,7 @@ def text_blocks(items, walk):
 class Shape:
     """One shape in slide coordinates. `runs` holds the shape's text as (TextHeaderAtom type, blocks, plain text);
     `blocks` is the blocks of those runs (or a table's one Table). `text_ref` is the OutlineTextRefAtom index, `pib`
-    the picture's BStore index and `ole_ref` the ExObjRefAtom id; `anchored` is false when the shape had no anchor."""
+    the picture's BStore index and `ole_ref` the ExObjRefAtom id; `anchored` is false when the shape had no anchor (a group with none gets it from `ordered` when a member has one)."""
     kind: str
     top: float = 0.0
     left: float = 0.0
@@ -321,8 +325,19 @@ def _close(f: _Frame, budget):
         _table(g, budget)
 
 
+def _lines(values) -> tuple[dict, list]:
+    """({value: grid line index}, [grid lines]) of the edge `values`: an edge within CLUSTER of the first of its
+    cluster is that cluster's line."""
+    index, lines = {}, []
+    for v in sorted(values):
+        if not lines or v - lines[-1] > CLUSTER:
+            lines.append(v)
+        index[v] = len(lines) - 1
+    return index, lines
+
+
 def _table(group: Shape, budget: Walk):
-    """Turn `group` into a table shape when its children are cells that share exact edges; otherwise it stays a
+    """Turn `group` into a table shape when its children are cells that share edges (within CLUSTER); otherwise it stays a
     plain group and its children's text stays in reading order. A grid past TABLE_NODES or GRID_SLOTS counts `cells`."""
     cells = []
     for child in group.children:
@@ -336,17 +351,19 @@ def _table(group: Shape, budget: Walk):
         cells.append(child)
     if not cells:
         return
-    xs = sorted({v for c in cells for v in (c.left, c.right)})
-    ys = sorted({v for c in cells for v in (c.top, c.bottom)})
+    xi, xs = _lines({v for c in cells for v in (c.left, c.right)})
+    yi, ys = _lines({v for c in cells for v in (c.top, c.bottom)})
     cols, rows = len(xs) - 1, len(ys) - 1
     if rows * cols > min(budget.nodes, budget.slots):
         budget.ctx.skipped["cells"] += 1
         return
-    xi = {v: i for i, v in enumerate(xs)}
-    yi = {v: i for i, v in enumerate(ys)}
     origin, covered = {}, set()
     for c in cells:
         r0, r1, c0, c1 = yi[c.top], yi[c.bottom], xi[c.left], xi[c.right]
+        if r1 <= r0 or c1 <= c0:  # thinner than CLUSTER: a line, not a cell
+            if c.blocks:
+                return
+            continue
         for r in range(r0, r1):
             for k in range(c0, c1):
                 if (r, k) in covered:  # overlapping cells: at most rows * cols slots were visited
@@ -372,15 +389,19 @@ def _table(group: Shape, budget: Walk):
 
 
 def ordered(shapes: list) -> list:
-    """`shapes` in reading order, by (top, left); a group sits where its own anchor puts it (the union of its members
-    when it has none) and its members are ordered inside it."""
+    """`shapes` in reading order, by (top, left); a group sits where its own anchor puts it (the union of its anchored
+    members when it has none) and its members are ordered inside it. A shape with no anchor, and a group with no anchor
+    and no anchored member, sorts after the anchored ones, in record order; it does not pull a group's union to 0."""
     for s in shapes:
         if s.kind == "group" and s.children:
             s.children = ordered(s.children)
             if not s.anchored:
-                s.top, s.left = min(c.top for c in s.children), min(c.left for c in s.children)
-                s.bottom, s.right = max(c.bottom for c in s.children), max(c.right for c in s.children)
-    return sorted(shapes, key=lambda s: (s.top, s.left))
+                placed = [c for c in s.children if c.anchored]
+                if placed:
+                    s.top, s.left = min(c.top for c in placed), min(c.left for c in placed)
+                    s.bottom, s.right = max(c.bottom for c in placed), max(c.right for c in placed)
+                    s.anchored = True
+    return sorted(shapes, key=lambda s: (0, s.top, s.left) if s.anchored else (1, 0, 0))
 
 
 def flatten(shapes: list):
