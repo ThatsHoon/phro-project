@@ -304,10 +304,8 @@ class _Reader:
         raise ReadError("damaged", "no table stream")
 
     def run(self):
-        if not self.cf.exists("WordDocument"):
-            if self.cf.exists("EncryptedPackage"):  # an encrypted OOXML package saved as .doc
-                raise ReadError("encrypted")
-            raise ReadError("damaged", "no WordDocument stream")
+        # parse() calls this only after cfb_route.route returned None, which it does only when WordDocument exists
+        # (a missing one is an encrypted package, another format or damaged there), so it is not checked again here.
         self.word = self.stream("WordDocument")
         self.fib = f = doc_fib.fib(self.word)
         if f.encrypted or f.obfuscated:
