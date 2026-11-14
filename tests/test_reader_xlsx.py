@@ -629,130 +629,6 @@ def test_comment_cap():
 
 def test_comment_with_link():
     rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
-    sh = sheet(rows, after='<hyperlinks><hyperlink ref="A1" r:id="rL"/><hyperlink ref="A1:A2" r:id="rM"/></hyperlinks>',
-               rels=[("rL", "hyperlink", LINK, True), ("rM", "hyperlink", "https://example.com/b", True)])
-    out, _ = md([sh])
-    assert f"[v1]({LINK})" in out and "[v2](https://example.com/b)" in out and "[v1](https://example.com/b)" not in out, out
-
-
-def test_hyperlink_noteref_after_link():
-    from reader.model import Link, NoteRef, Text
-    ctx = Context()
-    grid = ooxml_sheets.sheet_grid.Grid("S", ooxml_sheets.sheet_grid.Budget(), ctx)
-    grid.put(0, 0, [NoteRef("n1"), Text("a"), NoteRef("n2"), Text("b")])
-    me = ooxml_sheets._Sheets.__new__(ooxml_sheets._Sheets)
-    me.ctx, me.scan = ctx, 0
-    me._link(grid, [(0, 0, 0, 0, LINK)])
-    assert grid.get(0, 0) == [Link(LINK, [Text("a"), Text("b")]), NoteRef("n1"), NoteRef("n2")], grid.get(0, 0)
-
-
-def test_hidden_in_merge():
-    # the merge's origin row is hidden: its text moves to the first visible row of the merge
-    rows = (xlsx_row(1, xlsx_cell("A1", "mm", t="str"), attrs='hidden="1"')
-            + xlsx_row(3, xlsx_cell("A3", "zz", t="str")))
-    sh = sheet(rows, after='<mergeCells><mergeCell ref="A1:A2"/></mergeCells>')
-    out, _ = md([sh])
-    assert "mm" in out and "zz" in out, out
-
-
-LEGACY = f"{XLSX_REL}/comments"
-THREADED = "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment"
-PERSON = "http://schemas.microsoft.com/office/2017/10/relationships/person"
-TC_NS = "http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"
-LEG_PART, THR_PART, PER_PART = "xl/comments1.xml", "xl/threadedComments/threadedComment1.xml", "xl/persons/person.xml"
-
-
-def legacy_xml(*items, authors=("Ann",)):
-    """A legacy comments part from (ref, authorId, text) items."""
-    body = "".join(f'<comment ref="{r}" authorId="{a}"><text><r><t>{t}</t></r></text></comment>' for r, a, t in items)
-    return (f'<comments xmlns="{XLSX_SML}"><authors>' + "".join(f"<author>{a}</author>" for a in authors)
-            + f"</authors><commentList>{body}</commentList></comments>")
-
-
-def threaded_xml(*items):
-    """A threaded comments part from (ref, personId, id, parentId or None, text) items."""
-    body = "".join(f'<threadedComment ref="{r}" personId="{p}" id="{i}"' + (f' parentId="{q}"' if q else "")
-                   + f"><text>{t}</text></threadedComment>" for r, p, i, q, t in items)
-    return f'<ThreadedComments xmlns="{TC_NS}">{body}</ThreadedComments>'
-
-
-def persons_xml(**names):
-    return (f'<personList xmlns="{TC_NS}">'
-            + "".join(f'<person id="{k}" displayName="{v}"/>' for k, v in names.items()) + "</personList>")
-
-
-def commented(rows, leg=None, thr=None, people=None, **kw):
-    """md of a sheet with a legacy comments part and/or a threaded one (and the workbook's persons)."""
-    rels, extra, wb_rels = [], {}, []
-    if leg is not None:
-        rels.append(("rC", LEGACY, "../comments1.xml", False))
-        extra[LEG_PART] = leg
-    if thr is not None:
-        rels.append(("rT", THREADED, "../threadedComments/threadedComment1.xml", False))
-        extra[THR_PART] = thr
-    if people is not None:
-        wb_rels.append(("rP", PERSON, "persons/person.xml", False))
-        extra[PER_PART] = people
-    return md([sheet(rows, rels=rels, **kw.pop("sheet_kw", {}))], extra_parts=extra, wb_rels=wb_rels, **kw)
-
-
-B2 = xlsx_row(2, xlsx_cell("B2", "v", t="str"))
-BO = persons_xml(p1="Bo", p2="Cy")
-
-
-def test_legacy_comment():
-    out, ctx = commented(B2, leg=legacy_xml(("B2", 0, "check")))
-    assert "v[^1]" in out and "[^1]: Comment by Ann: check" in out and not ctx.skipped, (out, ctx.skipped)
-
-
-def test_threaded_wins():
-    out, _ = commented(B2, leg=legacy_xml(("B2", 0, "[Threaded comment] placeholder")),
-                       thr=threaded_xml(("B2", "p1", "t1", None, "real")), people=BO)
-    assert "Comment by Bo: real" in out and "placeholder" not in out and "[^2]" not in out, out
-
-
-def test_threaded_without_legacy():
-    rows = xlsx_row(3, xlsx_cell("C3", "w", t="str"))
-    out, _ = commented(rows, thr=threaded_xml(("C3", "p1", "t1", None, "real")), people=BO)
-    assert "[^1]: Comment by Bo: real" in out, out
-
-
-def test_legacy_kept_elsewhere():
-    rows = B2 + xlsx_row(4, xlsx_cell("D4", "z", t="str"))
-    out, _ = commented(rows, leg=legacy_xml(("B2", 0, "old"), ("D4", 0, "kept")),
-                       thr=threaded_xml(("B2", "p1", "t1", None, "real")), people=BO)
-    assert "Comment by Bo: real" in out and "Comment by Ann: kept" in out and "old" not in out, out
-
-
-def test_thread_replies():
-    out, _ = commented(B2, thr=threaded_xml(("B2", "p1", "t1", None, "q"), ("B2", "p2", "t2", "t1", "a")), people=BO)
-    assert "[^1]: Comment by Bo: q Comment by Cy: a" in out and "[^2]" not in out, out
-
-
-def test_reply_unknown_parent_own_thread():
-    out, _ = commented(B2, thr=threaded_xml(("B2", "p1", "t1", "gone", "orphan")), people=BO)
-    assert "[^1]: Comment by Bo: orphan" in out, out
-
-
-def test_thread_cycle():
-    thr = threaded_xml(("B2", "p1", "a", "b", "first"), ("B2", "p2", "b", "a", "second"),
-                       ("B2", "p1", "c", None, "root"))
-    out, ctx = commented(B2, thr=thr, people=BO)
-    for word in ("first", "second", "root"):
-        assert out.count(word) == 1, (word, out)
-    assert not ctx.skipped, ctx.skipped
-
-
-def test_comment_cap():
-    rows = "".join(xlsx_row(r, xlsx_cell(f"A{r}", "x", t="str")) for r in range(1, 6))
-    leg = legacy_xml(*[(f"A{r}", 0, f"n{r}") for r in range(1, 6)])
-    with patched("MAX_COMMENTS", 3, ooxml_sheets):
-        out, ctx = commented(rows, leg=leg)
-    assert "[^3]" in out and "[^4]" not in out and ctx.skipped["comments_cut"] == 1, (out, ctx.skipped)
-
-
-def test_comment_with_link():
-    rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
     out, _ = commented(rows, leg=legacy_xml(("A1", 0, "n")), sheet_kw={"after": '<hyperlinks><hyperlink ref="A1" r:id="rL"/></hyperlinks>'})
     assert out  # rendered; the exact order is checked on the model below
     sh = sheet(rows, after='<hyperlinks><hyperlink ref="A1" r:id="rL"/></hyperlinks>',
@@ -789,6 +665,72 @@ def test_comments_part_missing():
 def test_comments_part_damaged():
     out, ctx = commented(B2, leg="<comments")
     assert "v" in out and ctx.skipped["comments"] == 1, (out, ctx.skipped)
+
+
+def orphans(out):
+    """Footnote numbers defined in the output but marked nowhere."""
+    import re
+    return [n for n in re.findall(r"^\[\^(\d+)\]:", out, re.M) if out.count(f"[^{n}]") < 2]
+
+
+def test_comment_hidden_row():
+    rows = xlsx_row(1, xlsx_cell("A1", "keep", t="str")) + xlsx_row(2, xlsx_cell("B2", "v", t="str"), attrs='hidden="1"')
+    leg = legacy_xml(("B2", 0, "hush"))
+    out, _ = commented(rows, leg=leg)
+    assert "hush" not in out and "[^" not in out and "(1 hidden places left out)" in out, out
+    out, _ = commented(rows, leg=leg, hidden=True)
+    assert "[^1]: (hidden) Comment by Ann: hush" in out and "v[^1]" in out, out
+    out, _ = commented(xlsx_row(1, xlsx_cell("A1", "keep", t="str")) + xlsx_row(2, "", attrs='hidden="1"'), leg=leg)
+    assert "hush" not in out, out
+
+
+def test_comment_hidden_column():
+    rows = xlsx_row(1, xlsx_cell("A1", "keep", t="str"), xlsx_cell("B1", "v", t="str"))
+    leg = legacy_xml(("B1", 0, "hush"))
+    kw = {"before": '<cols><col min="2" max="2" width="9" hidden="1"/></cols>'}
+    out, _ = commented(rows, leg=leg, sheet_kw=dict(kw))
+    assert "hush" not in out and "[^" not in out and "(1 hidden places left out)" in out, out
+    out, _ = commented(rows, leg=leg, hidden=True, sheet_kw=dict(kw))
+    assert "[^1]: (hidden) Comment by Ann: hush" in out, out
+
+
+def test_comment_on_merged_away_cell():
+    rows = xlsx_row(1, xlsx_cell("A1", "m", t="str"), xlsx_cell("B1", "gone", t="str"))
+    merge = {"after": '<mergeCells><mergeCell ref="A1:B1"/></mergeCells>'}
+    out, _ = commented(rows, leg=legacy_xml(("B1", 0, "kept")), sheet_kw=merge)
+    assert "m[^1]" in out and "[^1]: Comment by Ann: kept" in out, out
+    hid = xlsx_row(1, xlsx_cell("A1", "m", t="str"), attrs='hidden="1"') + xlsx_row(2, xlsx_cell("A2", "z", t="str"))
+    out, _ = commented(hid, leg=legacy_xml(("B1", 0, "kept")), sheet_kw=dict(merge))
+    assert orphans(out) == [], out
+
+
+def test_comment_cells_before_notes():
+    rows = "".join(xlsx_row(r, xlsx_cell(f"A{r}", "x", t="str")) for r in range(1, 5))
+    leg = legacy_xml(*[(f"A{r}", 0, f"c{r}") for r in range(1, 5)], ("D9", 0, "empty"))
+    with patched("SHEET_CELLS", 2):
+        out, ctx = commented(rows, leg=leg)
+    assert orphans(out) == [] and "c4" not in out and "empty" not in out, out
+    assert ctx.skipped["comments_cut"] == 1, ctx.skipped
+
+
+def test_comment_text_past_chars():
+    rows = xlsx_row(1, xlsx_cell("A1", "abcd", t="str"), xlsx_cell("B1", "efgh", t="str"), xlsx_cell("C1", "ijkl", t="str"))
+    with patched("SHEET_CHARS", 12):
+        out, ctx = commented(rows, leg=legacy_xml(("B1", 0, "tiny")))
+    assert "abcd" in out and "efgh" in out and "ijkl" in out and "[^" not in out and "tiny" not in out, out
+    assert ctx.skipped["comments_cut"] == 1, ctx.skipped
+
+
+def test_comment_stream_cap():
+    import random
+    pad = "<!--" + random.Random(0).randbytes(900_000).hex() + "-->"  # keeps the part under ZIP_RATIO
+    body = "<comment/>" * 200_000
+    part = f'<comments xmlns="{XLSX_SML}">{pad}<authors><author>Ann</author></authors><commentList>{body}</commentList></comments>'
+    with patched("_COMMENT_ELEMENTS", 1000, ooxml_sheets):
+        t0 = time.perf_counter()
+        out, ctx = commented(B2, leg=part)
+        secs = time.perf_counter() - t0
+    assert "v" in out and ctx.skipped["comments_cut"] == 1 and secs < 1, (ctx.skipped, secs)
 
 
 def worst():
