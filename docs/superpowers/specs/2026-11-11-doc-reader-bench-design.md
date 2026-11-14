@@ -42,6 +42,8 @@ Formats that Anthropic's built-in skills read directly are left to those skills 
 
 The engine now reads docx, pptx, xlsx and xlsm (`2026-11-14-doc-reader-ooxml-four-design.md`), so the bench measures them too. pdf alone stays with its skill and out of the bench until its own phase.
 
+Phase 2d (`2026-11-14-doc-reader-pdf-design.md`) brings pdf in: `BUILTIN` becomes empty, `builtin>pdf` reads a pdf input as it is (the text layer plus page images, no Calibre step), and the corpus gains pdfs chosen by feature from the engines' test files and Tika's pdfs (downloaded with the user's yes on 2026-11-14).
+
 - `BUILTIN` keeps only pdf, and the generated docx, pptx and xlsx seeds become corpus documents, with a new xlsm seed from LibreOffice's macro-enabled Excel export.
 - Public files are chosen by feature (tables, images, charts, comments, equations, SmartArt, hidden content), not as the three smallest, and Tika's test documents are added.
 - The builtin route for these four runs the skill's own command on the original file, with no LibreOffice step: `pandoc -t markdown` without `--extract-media`, `slide_text.py`, `markitdown`.
