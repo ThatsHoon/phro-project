@@ -20,6 +20,7 @@ import struct
 
 from .. import limits
 from ..charts import CHART_ROWS, series_table
+from ..model import Context
 from ..numfmt import code_for, display
 from . import biff
 
@@ -299,9 +300,13 @@ def graph(data: bytes, ctx):
     if f.end is None:
         raise limits.ReadError("damaged", "unterminated MS Graph substream")
     if ds.codepage is None:  # the first CODEPAGE anywhere in the stream: one after the substream's EOF counts too
-        for rec in st.records(f.end):
-            if rec[0] == _CODEPAGE and rec[2] >= 2:
-                ds.codepage = struct.unpack_from("<H", data, rec[1])[0]
+        # a best-effort search: it walks a Stream over a throwaway Context, so pad bytes or a framing break past the
+        # EOF count nothing, and it starts from the records already walked, so BIN_RECORDS still bounds it
+        tail = biff.Stream(data, Context())
+        tail.count = st.count
+        for rec in tail.records(f.end):
+            if rec.id == _CODEPAGE and rec.size >= 2:
+                ds.codepage = struct.unpack_from("<H", data, rec.off)[0]
                 break
     if ds.by_rows is None:
         raise limits.ReadError("damaged", "MS Graph datasheet orientation missing")

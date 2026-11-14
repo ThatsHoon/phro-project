@@ -387,6 +387,16 @@ def test_graph_first_codepage_wins():
     assert render(out, ctx) == "Chart: bar\n||이름|\n|---|---|\n|한글|1|\n", render(out, ctx)
 
 
+def test_graph_codepage_search_after_eof_counts_nothing():
+    # no CODEPAGE: the best-effort search past the substream's EOF meets two pad bytes, which are not a damaged record
+    obj = graph_streams(msgraph_object(["a"], [("S", [1])]))
+    cp = biff(0x0042, struct.pack("<H", 1252))
+    assert obj["Workbook"].count(cp) == 1
+    ctx = Context()
+    tbl = bcm.graph(obj["Workbook"].replace(cp, b"") + b"\x00\x00", ctx)  # in memory only
+    assert tbl is not None and len(tbl.rows) == 2 and not ctx.skipped, (tbl, ctx.skipped)
+
+
 def test_graph_gaps_and_empty_head_cell():
     cats, series = ["a", "b", "c"], [("X", [1, 2, 3]), ("Y", [4, 5, 6])]
     # (2, 1) is series X at point 2, (0, 2) series Y's head: the value is an empty cell, the name "Series 2"
