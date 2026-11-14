@@ -32,7 +32,17 @@ Decisions that the parser relies on:
 * A parameter keeps its sign. A minus sign not followed by a digit is not part of the control
   word and lexes as text. More than 10 significant digits gives the i32 limit of the right
   sign without building a large int.
-* One space after a control word, or after its parameter, is eaten.
+* One space after a control word, or after its parameter, is eaten; a second space, a tab and a hex escape's following
+  space are text.
+* What the control symbols mean is the parser's business: `\\*` marks a destination the reader may leave out, `\\~` is
+  a no-break space, `\\-` an optional hyphen (dropped), `\\_` a no-break hyphen. The lexer gives each as (SYM, char).
+* `\\bin` is always (BIN, offset, n), never a (WORD, "bin", ...): the lexer takes the bytes itself, so the parser never
+  sees the word.
+* TEXT tokens may be adjacent: text split by a hex escape or a symbol is several TEXT tokens (and HEX) with nothing
+  between them, and the parser joins them (Pending) before decoding, so a DBCS pair split across a HEX and a TEXT token
+  is one character. A TEXT token never holds CR, LF, NUL, a brace or a backslash.
+* A SYM may be any single byte after a backslash except a letter, a quote and CR or LF: NUL, a tab, a space, a high
+  byte (as its latin-1 character), digits and punctuation. Symbols the parser does not know are dropped.
 * For the bin control: the space is eaten, then (BIN, offset, n) with n = max(0, N) clamped to
   the rest of the input. A missing N, zero and a negative N all give n == 0. Lexing resumes
   right after those n bytes; braces and backslashes inside them are not tokens.
@@ -44,6 +54,9 @@ OPEN, CLOSE, WORD, SYM, HEX, TEXT, BIN = "open", "close", "word", "sym", "hex", 
 
 I32_MIN, I32_MAX = -2**31, 2**31 - 1
 NAME_MAX = 32
+# A parameter's digits are all consumed; past this many significant digits the value is the i32 limit of its sign.
+# Kept as anydoc reads "at most 10 digits": the lexer never stops at the 10th digit, so `\fs12345678901` is one
+# word whose parameter clamps, not `\fs1234567890` followed by text `1`.
 PARAM_DIGITS = 10
 
 # One alternative per token kind; the groups are named so m.lastgroup (the outermost group
@@ -163,8 +176,11 @@ class Pending:
         return bool(self._parts)
 
     def push(self, b) -> None:
-        """Add the bytes of a TEXT token, or the int of a HEX token."""
-        self._parts.append(bytes((b,)) if isinstance(b, int) else bytes(b))
+        """Add the bytes of a TEXT token, or the int of a HEX token. Empty bytes are not added, so they never make
+        the pending truthy."""
+        b = bytes((b,)) if isinstance(b, int) else bytes(b)
+        if b:
+            self._parts.append(b)
 
     def flush(self, codec: str) -> str:
         """Decode and clear the gathered bytes (errors replaced). An unknown codec is cp1252."""

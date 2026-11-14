@@ -30,7 +30,7 @@ paragraph being built and its own open fields, so a note or a header never ends 
   paragraph it is in (a table cell's blocks, in a table). Its hex digits (cleaned in one `re.sub`, an odd last digit
   dropped) or `\\bin` bytes are charged against `IMAGE_BYTES`, the document's earlier pictures included, as they are
   collected: past it collection stops, `image` is counted once and nothing is emitted. A DIB becomes a BMP through
-  `officeart._dib`, then a PNG. `\\macpict` and any other format are counted under `image`. A group inside `\\pict` is
+  `officeart.dib_to_bmp`, then a PNG. `\\macpict` and any other format are counted under `image`. A group inside `\\pict` is
   skipped; `{\\*\\shppict{\\pict ...}}` is read and `\\nonshppict` skipped, so the pair is one image; an `\\object` keeps
   its `\\result` and skips `\\objdata`.
 * Paragraphs: `\\par` and `\\sect` end one; `\\line`, `\\lbr`, `\\page` and `\\column` are a Break; `\\tab` is a space;
@@ -68,7 +68,7 @@ from .. import images, limits
 from ..containers.cfb import is_cfb
 from ..limits import ReadError
 from ..model import Bold, Break, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
-from ..officeart import _dib
+from ..officeart import dib_to_bmp
 from .rtf_lex import BIN, CLOSE, HEX, OPEN, SYM, TEXT, WORD, Pending, codec, tokens
 from .rtf_table import Tables
 from .word_fields import MAX_INSTR, hyperlink_url
@@ -770,7 +770,7 @@ class _Reader:
                     digits = _NONHEX.sub(b"", b"".join(pic.hex))
                     data = bytes.fromhex(digits[:len(digits) & ~1].decode("ascii"))
                 if pic.fmt == "dib":  # a DIB is a BMP without its file header
-                    bmp = _dib(data)
+                    bmp = dib_to_bmp(data)
                     data = images.bmp_to_png(bmp) if bmp is not None else None
             except Exception:
                 data = None

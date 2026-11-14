@@ -139,6 +139,46 @@ def test_lexer_speed():
     assert took < 3.0, took
 
 
+def test_pending_empty_push_is_a_no_op():
+    p = Pending()
+    p.push(b"")
+    assert not p
+    p.push(b"")
+    p.push(b"a")
+    assert p and p.flush("cp1252") == "a" and not p
+
+
+def test_space_after_hex_escape_stays_text():
+    # only control words eat a following space; a hex escape does not
+    assert toks(rb"\'e9 x") == [(HEX, 0xE9), (TEXT, b" x")]
+    assert toks(rb"\'e9  x") == [(HEX, 0xE9), (TEXT, b"  x")]
+
+
+def test_one_space_only_is_eaten_and_delimiters_are_kept():
+    assert toks(rb"\b  x") == [(WORD, "b", None), (TEXT, b" x")]
+    assert toks(rb"\b12  x") == [(WORD, "b", 12), (TEXT, b" x")]
+    # a delimiter that is not a space stays: the next backslash, a brace, a letter after a digit run
+    assert toks(rb"\b\i{x}") == [(WORD, "b", None), (WORD, "i", None), (OPEN,), (TEXT, b"x"), (CLOSE,)]
+    assert toks(rb"\b12x") == [(WORD, "b", 12), (TEXT, b"x")]
+    # a tab is not the eaten space
+    assert toks(b"\\b\tx") == [(WORD, "b", None), (TEXT, b"\tx")]
+
+
+def test_dbcs_pair_split_across_hex_and_text():
+    # cp932 lead byte 0x82 as a hex escape, trail byte 0xA0 as plain text: one character
+    got = toks(b"\\'82\xa0")
+    assert got == [(HEX, 0x82), (TEXT, b"\xa0")], got
+    p = Pending()
+    for t in got:
+        p.push(t[1])
+    assert p.flush("cp932") == "\u3042"
+    # and the other way round: text lead, hex trail
+    p = Pending()
+    p.push(b"\x82")
+    p.push(0xA0)
+    assert p.flush("cp932") == "\u3042"
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

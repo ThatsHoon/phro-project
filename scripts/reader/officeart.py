@@ -56,7 +56,7 @@ def records(data, start: int = 0, end: int | None = None) -> Iterator[tuple[int,
         pos, n = body + size, n + 1
 
 
-def _dib(dib: bytes) -> bytes | None:
+def dib_to_bmp(dib: bytes) -> bytes | None:
     """A DIB as a BMP file: the 14-byte BITMAPFILEHEADER, its bfOffBits past the header, the palette and the masks
     (BI_BITFIELDS 12 bytes, BI_ALPHABITFIELDS 16, after a 40-byte header). None when those pass the DIB."""
     if len(dib) < 12:
@@ -114,7 +114,7 @@ def blip(data, off: int, budget: flate.Budget) -> bytes | None:
     if pos + 1 >= end:
         return None
     raw = bytes(data[pos + 1:end])
-    return _dib(raw) if kind == "dib" else raw
+    return dib_to_bmp(raw) if kind == "dib" else raw
 
 
 def fbse_delay(data, off: int) -> int | None:
