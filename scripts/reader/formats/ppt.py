@@ -28,9 +28,6 @@ from ..limits import ReadError
 from ..model import Doc, Section
 from . import ppt_records as rec
 from . import cfb_route, ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, sheet_grid
-from .ppt_shapes import Walk as _Walk
-from .ppt_shapes import text_blocks as _text_blocks
-from .ppt_shapes import texts as _texts
 
 MAX_TITLE = 300
 _TITLES = (0, 6)
@@ -55,7 +52,7 @@ class Presentation:
                 raise ReadError("encrypted")
             self.doc, pictures = unlocked
             self.persist.doc = self.doc
-        self.walk = _Walk(ctx)
+        self.walk = ppt_shapes.Walk(ctx)
         self.pictures = ppt_pictures.Pictures(self.doc, self._dgg(), pictures, flate.Budget(), ctx)
         self.objects = ppt_objects.Objects(self.doc, self.persist, flate.Budget(), sheet_grid.Budget(), ctx)
 
@@ -112,13 +109,13 @@ class Presentation:
         shapes = ppt_shapes.walk(self.doc, *span, self.ctx, self.walk)
         out, used = [], set()
         if not shapes:
-            for item in _texts(self.doc, *span, self.walk):
+            for item in ppt_shapes.texts(self.doc, *span, self.walk):
                 if item[0] == "ref":
                     if item[1] < len(outline) and item[1] not in used:
                         used.add(item[1])
                         out.append(outline[item[1]])
                 else:
-                    out.extend(_text_blocks([item], self.walk))
+                    out.extend(ppt_shapes.text_blocks([item], self.walk))
             return out, used
         for shape in ppt_shapes.flatten(ppt_shapes.ordered(shapes)):
             ref = shape.text_ref
@@ -158,7 +155,7 @@ class Presentation:
 
     def _slide_at(self, start, size, number, outline_span):
         """The slide section of the SlideContainer whose body is `size` bytes at `start`."""
-        outline = _text_blocks(_texts(self.doc, *outline_span, self.walk), self.walk)
+        outline = ppt_shapes.text_blocks(ppt_shapes.texts(self.doc, *outline_span, self.walk), self.walk)
         hidden, drawing = False, None
         for _, _, typ, body, sz in officeart.records(self.doc, start, start + size):
             if typ == rec.SLIDE_SHOW_SLIDE_INFO_ATOM and sz >= 12:

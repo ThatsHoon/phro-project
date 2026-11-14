@@ -23,7 +23,7 @@ MAX_GROUPS = 32
 SKIPPED = frozenset((7, 8, 9, 10))  # placeholders: date, slide number, footer, header
 TITLES = frozenset((13, 15))        # placeholders: title, centered title
 CHILD_ANCHOR, FSPGR, CLIENT_TEXTBOX, CLIENT_DATA, DG_CONTAINER = 0xF00F, 0xF009, 0xF00D, 0xF011, 0xF002
-_TABLE_PROP, _PIB_PROP = 0x039F, 0x0104
+_TABLE_PROP = 0x039F
 _EXTRA_FOPT = frozenset((0xF121, 0xF122))  # secondary and tertiary property tables
 _LINES = frozenset((20, 32, 33, 34, 38))  # connector and line shape types: table borders, never cells
 _BIG = 1e12
@@ -97,7 +97,7 @@ def text_blocks(items, walk):
         walk.chars -= len(item[2])
         if walk.chars < 0:
             raise ValueError("text budget")
-        blocks = ppt_text.blocks(item[2], item[3], item[1], walk.ctx)
+        blocks = ppt_text.blocks(item[2], item[3], walk.ctx)
         out.append((item[1], blocks, " ".join(item[2].replace("\x0b", " ").replace("\r", " ").split())))
     return out
 
@@ -160,7 +160,7 @@ def _shape(data, body, size, walk) -> _Raw:
             seen_opt = True
             prop = officeart.fopt_property(data, inst, b, s, _TABLE_PROP)
             raw.table = raw.table or bool(prop is not None and prop & 1)
-            raw.pib = officeart.fopt_property(data, inst, b, s, _PIB_PROP) or None
+            raw.pib = officeart.fopt_property(data, inst, b, s, officeart.PIB) or None
         elif typ in _EXTRA_FOPT:  # PowerPoint keeps the table flag in the tertiary properties
             prop = officeart.fopt_property(data, inst, b, s, _TABLE_PROP)
             raw.table = raw.table or bool(prop is not None and prop & 1)

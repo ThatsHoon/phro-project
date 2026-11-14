@@ -108,7 +108,7 @@ def texts(blocks):
 def test_control_char_keeps_bold_boundary():
     # raw text a, control, b, c: the bold run covers the control character and b
     style = prun(5) + crun(1) + crun(2, 1, struct.pack("<H", 1)) + crun(2)
-    got = ppt_text.blocks("a\x01bc", style, 1, Context())
+    got = ppt_text.blocks("a\x01bc", style, Context())
     assert texts(got) == [("Para", ["Text:a", "Bold:", "Text:c"])], texts(got)
     assert got[0].inlines[1].inlines[0].text == "b", got
 
@@ -116,27 +116,27 @@ def test_control_char_keeps_bold_boundary():
 def test_control_char_keeps_bullet_level():
     # paragraph 1 is "a\x01" + "b" (4 chars with its end), paragraph 2 "cd" is bulleted at level 1
     style = prun(4) + prun(3, 1, 1, struct.pack("<H", 1)) + crun(7)
-    got = ppt_text.blocks("a\x01b\rcd", style, 1, Context())
+    got = ppt_text.blocks("a\x01b\rcd", style, Context())
     assert [type(b).__name__ for b in got] == ["Para", "ListItem"] and got[1].level == 1, got
 
 
 def test_zero_run_count_plain():
     ctx = Context()
-    got = ppt_text.blocks("ab", prun(0) + crun(3), 1, ctx)
+    got = ppt_text.blocks("ab", prun(0) + crun(3), ctx)
     assert texts(got) == [("Para", ["Text:ab"])] and ctx.skipped["record"] == 1, (got, ctx.skipped)
 
 
 def test_too_many_runs_plain():
     ctx = Context()
     style = prun(1) * 100_001
-    got = ppt_text.blocks("a" * 100_002, style, 1, ctx)
+    got = ppt_text.blocks("a" * 100_002, style, ctx)
     assert len(got) == 1 and type(got[0]).__name__ == "Para" and ctx.skipped["record"] == 1, ctx.skipped
 
 
 def test_run_count_past_text_clamped():
     ctx = Context()
     style = prun(1000, 0, 1, struct.pack("<H", 1)) + crun(1000, 1, struct.pack("<H", 1))
-    got = ppt_text.blocks("abc", style, 1, ctx)
+    got = ppt_text.blocks("abc", style, ctx)
     assert len(got) == 1 and type(got[0]).__name__ == "ListItem" and not ctx.skipped, (got, ctx.skipped)
     assert type(got[0].inlines[0]).__name__ == "Bold" and got[0].inlines[0].inlines[0].text == "abc", got
 

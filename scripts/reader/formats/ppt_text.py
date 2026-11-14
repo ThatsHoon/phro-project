@@ -116,9 +116,9 @@ def _inlines(text: str, lo: int, hi: int, bold: list) -> list:
     return flat
 
 
-def blocks(text: str, style: bytes | None, kind: int, ctx=None) -> list:
-    """Paragraphs and list items of one text atom. `kind` is the TextHeaderAtom type (kept for callers; the layout of
-    the style runs does not depend on it)."""
+def blocks(text: str, style: bytes | None, ctx=None) -> list:
+    """Paragraphs and list items of one text atom. The layout of the style runs does not depend on the atom's
+    TextHeaderAtom type."""
     starts, props, bold = [0], [(False, 0)], []
     if style is not None:
         try:

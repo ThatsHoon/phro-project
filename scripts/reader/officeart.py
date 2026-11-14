@@ -19,7 +19,7 @@ MAX_RECORDS = 1_000_000  # records one walk visits
 SP_CONTAINER, SPGR_CONTAINER, FSP, FOPT = 0xF004, 0xF003, 0xF00A, 0xF00B
 DGG_CONTAINER, BSTORE, FBSE = 0xF000, 0xF001, 0xF007
 CLIENT_ANCHOR = 0xF010
-_PIB = 0x0104          # the pib property's id (opid & 0x3FFF; fBid is 0x4000, fComplex 0x8000)
+PIB = 0x0104           # the pib property's id (opid & 0x3FFF; fBid is 0x4000, fComplex 0x8000)
 _NO_DELAY = 0xFFFFFFFF  # an FBSE foDelay with no delay-loaded BLIP
 _DEFLATE, _STORED = 0, 0xFE  # OfficeArtMetafileHeader compression
 _PICT_HEAD = 512       # the zero head a PICT file starts with; a PICT BLIP holds the picture after it
@@ -183,7 +183,7 @@ def shape_pib(data, sp_off: int) -> int | None:
 
 def _fopt_pib(data, inst: int, body: int, size: int) -> int | None:
     """The pib of the FOPT whose body is data[body:body + size]; a complex one (fComplex) is not a pib."""
-    return fopt_property(data, inst, body, size, _PIB)
+    return fopt_property(data, inst, body, size, PIB)
 
 
 def fopt_property(data, inst: int, body: int, size: int, prop: int) -> int | None:
