@@ -87,11 +87,10 @@ def _display(value, code: str, date1904: bool) -> str:
     if not section:
         return ""
     kinds = {t[0] for t in section}
-    if "dt" in kinds or "ampm" in kinds or "elapsed" in kinds:
+    if kinds & {"dt", "ampm", "elapsed", "wd"}:  # the weekday alone (aaa, aaaa) is a date too
         shown = _datetime(v, section, date1904)
         return _general(v) if shown is None else shown
-    section = [("lit", "a" * t[1] if t[0] == "wd" else t[1]) if t[0] in ("yr", "era", "wd") else t
-               for t in section if t[0] != "locale"]
+    section = [("lit", t[1]) if t[0] in ("yr", "era") else t for t in section if t[0] != "locale"]
     return _render(abs(v), section, minus, v)
 
 

@@ -136,6 +136,14 @@ def test_korean_date_tokens():
     assert display(45000.75, "[$-412]AM/PM h:mm") == "오후 6:00"
 
 
+def test_weekday_only():
+    """A section whose only date token is the Korean weekday is still a date: 45000 is a Wednesday."""
+    assert display(45000, "aaa") == "수", display(45000, "aaa")
+    assert display(45000, "aaaa") == "수요일", display(45000, "aaaa")
+    assert display(45000, "(aaa)") == "(수)", display(45000, "(aaa)")
+    assert display(45000, "m/d aaa") == "3/15 수"
+
+
 def test_twelve_hour():
     assert display(45000.75, "h:mm AM/PM") == "6:00 PM"
     assert display(45000.25, "h:mm AM/PM") == "6:00 AM"
