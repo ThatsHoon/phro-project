@@ -15,6 +15,7 @@ from reader import limits  # noqa: E402
 from reader.formats import xls_alike  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
+from reader_fix import make_zip  # noqa: E402
 
 
 def run(data):
@@ -87,6 +88,23 @@ def test_tsv_named_xls():
 
 def test_zip_named_xls():
     assert denied(b"PK\x03\x04" + b"\0" * 100) == ("unsupported", "xlsx workbook saved as .xls")
+
+
+def test_zip_named_xls_is_named_by_what_it_holds():
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "a.xls"
+        for members, want in (({"xl/workbook.bin": b"x", "[Content_Types].xml": b"<Types/>"},
+                               "xlsb workbook saved as .xls"),
+                              ({"xl/workbook.xml": b"<workbook/>", "[Content_Types].xml": b"<Types/>"},
+                               "xlsx workbook saved as .xls"),
+                              ({"readme.txt": b"hi"}, "xlsx workbook saved as .xls")):
+            make_zip(src, members)
+            try:
+                reader.convert(src, Path(d) / "out")
+            except ReadError as e:
+                assert (e.kind, e.detail) == ("unsupported", want), (e.kind, e.detail)
+            else:
+                raise AssertionError("expected a ReadError")
 
 
 def test_cut_inside_multibyte_char():

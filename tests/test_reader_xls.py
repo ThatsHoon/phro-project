@@ -243,6 +243,27 @@ def test_sheet_without_eof_is_read():
     assert wb.cells[0] == {(0, 0): "last"}, wb.cells
 
 
+def test_swallowed_error_leaves_no_section():
+    # a non-ReadError out of a sheet is swallowed by ctx.guard (counted under `sheet`): the sheet has no section
+    # and does not take the blocks of the one before it
+    real = xls.Workbook.sheet_blocks
+
+    def flaky(self, i):
+        if i == 1:
+            raise RuntimeError("boom")
+        return real(self, i)
+
+    xls.Workbook.sheet_blocks = flaky
+    try:
+        ctx = Context()
+        data = biff_workbook([{"name": "A", "cells": {(0, 0): "a"}}, {"name": "B", "cells": {(0, 0): "b"}},
+                              {"name": "C", "cells": {(0, 0): "c"}}])
+        secs = xls.Workbook(data, ctx, sheet_grid.Budget()).sections()
+    finally:
+        xls.Workbook.sheet_blocks = real
+    assert [s.title for s in secs] == ["A", "C"] and ctx.skipped["sheet"] == 1, (secs, dict(ctx.skipped))
+
+
 def test_all_sheets_bad():
     data = biff_workbook([{"name": "One", "cells": {(0, 0): "first"}}])
     got = denied(lambda: convert_bytes(patch_offsets(data, {0: len(data) + 500})))

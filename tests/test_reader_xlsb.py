@@ -461,6 +461,24 @@ def test_chart_without_series_is_unread():
     assert "Chart:" not in out and ctx.skipped["chart"] == 1, (out, dict(ctx.skipped))
 
 
+def test_swallowed_error_leaves_no_section():
+    real = xlsb._Sheets.sheet
+
+    def flaky(self, name, part):
+        if name in ("A", "B"):
+            raise RuntimeError("boom")  # the first sheet too: nothing earlier to be mixed up with
+        return real(self, name, part)
+
+    xlsb._Sheets.sheet = flaky
+    try:
+        out, ctx = md([{"name": "A", "cells": {(0, 0): "a"}}, {"name": "B", "cells": {(0, 0): "b"}},
+                       {"name": "C", "cells": {(0, 0): "c"}}])
+    finally:
+        xlsb._Sheets.sheet = real
+    assert "## Sheet: C" in out and "## Sheet: A" not in out and "## Sheet: B" not in out, out
+    assert ctx.skipped["sheet"] == 2, dict(ctx.skipped)
+
+
 def test_chartsheet_chart():
     parts = with_drawing('<xdr:absoluteAnchor><xdr:pos x="0" y="0"/>' + chart_frame("rId1")
                          + "<xdr:clientData/></xdr:absoluteAnchor>",

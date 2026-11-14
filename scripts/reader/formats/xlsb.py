@@ -223,6 +223,7 @@ class _Sheets:
     def sections(self) -> list:
         out = []
         for name, part, state in self.wb.sheets:
+            blocks = None  # stays None when the guard swallows an error, so the check below is real
             try:
                 with self.ctx.guard("sheet"):
                     blocks = self.sheet(name, part)

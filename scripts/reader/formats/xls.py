@@ -18,6 +18,7 @@ import struct
 from .. import limits
 from ..containers.cfb import CfbError, Compound
 from ..containers import flate
+from ..containers.zipx import Package
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import display
@@ -72,6 +73,7 @@ class Workbook:
                 continue
             blocks = []
             if ref.kind != _CHART:
+                blocks = None  # stays None when the guard swallows an error, so the check below is real
                 try:
                     with self.ctx.guard("sheet"):
                         if ref.offset in seen:
@@ -274,6 +276,18 @@ def _hide(blocks: list) -> list:
     return out
 
 
+def _zip_detail(path) -> str:
+    """The format of a zip named .xls, by what it holds: an xlsb package has xl/workbook.bin; anything else (or a
+    zip that cannot be opened) is named as the xlsx it is most likely to be."""
+    try:
+        with Package(path) as pkg:
+            if pkg.has("xl/workbook.bin"):
+                return "xlsb workbook saved as .xls"
+    except (ReadError, OSError):
+        pass
+    return "xlsx workbook saved as .xls"
+
+
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
         head = f.read(xls_alike.HEAD)
@@ -286,7 +300,7 @@ def parse(path, ctx) -> Doc:
     if what == "text":
         return xls_alike.parse_text(path, ctx)
     if what == "zip":
-        raise ReadError("unsupported", "xlsx workbook saved as .xls")
+        raise ReadError("unsupported", _zip_detail(path))
     if what != "cfb":
         raise ReadError("damaged", "not an Excel workbook")
     try:
