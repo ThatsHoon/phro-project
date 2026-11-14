@@ -150,6 +150,30 @@ def test_damaged_boundsheet_keeps_its_place():
     assert [s.name for s in biff.read_globals(short).sheets] == [""]  # too short to hold a name: still a place
 
 
+def test_fixture_encodings_round_trip():
+    # the fixture writes what BIFF8 says: COLINFO before DIMENSIONS, a ROW's colMic and colMac, a long SST in CONTINUEs
+    words = [f"w{i:05d}" + "x" * 40 for i in range(1800)]  # over 65535 bytes of SST
+    cells = {(0, 0): "a", (0, 3): 2.5, (2, 1): 7, (2, 2): True, (3, 0): ("err", 0x07), (3, 1): ("f", "txt"),
+             (3, 2): ("f", 4.0), (4, 0): ("fmt", 0.5, "0%")}
+    cells.update({(5 + i, 0): w for i, w in enumerate(words)})
+    data = biff_workbook([{"name": "S", "cells": cells, "hidden_cols": [1]}])
+    st = biff.Stream(data, Context())
+    g = biff.read_globals(st)
+    assert g.sst[:2] == ["a", words[0]] and len(g.sst) == 1 + len(words) and len(set(g.sst)) == len(g.sst)
+    recs = list(st.records(g.sheets[0].offset))
+    ids = [r[0] for r in recs]
+    assert ids.index(0x007D) < ids.index(0x0200), ids[:6]
+    rows = {struct.unpack_from("<H", data, r[1])[0]: struct.unpack_from("<HH", data, r[1] + 2)
+            for r in recs if r[0] == 0x0208}
+    assert rows[0] == (0, 4) and rows[2] == (1, 3) and rows[3] == (0, 3), rows
+    wb = xls.Workbook(data, Context(), sheet_grid.Budget())
+    wb.sections()
+    got = wb.cells[0]
+    assert got[(0, 0)] == "a" and got[(0, 3)] == "2.5" and got[(2, 1)] == "7" and got[(2, 2)] == "TRUE", got
+    assert got[(3, 0)] == "#DIV/0!" and got[(3, 1)] == "txt" and got[(3, 2)] == "4" and got[(4, 0)] == "50%", got
+    assert got[(5 + 1799, 0)] == words[1799]
+
+
 def test_all_sheets_bad():
     data = biff_workbook([{"name": "One", "cells": {(0, 0): "first"}}])
     got = denied(lambda: convert_bytes(patch_offsets(data, {0: len(data) + 500})))

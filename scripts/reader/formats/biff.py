@@ -6,6 +6,7 @@ A record body stays an offset into the one stream `bytes`; only a string split b
 """
 import struct
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from .. import limits
 from ..limits import ReadError
@@ -25,7 +26,12 @@ MSODRAWINGGROUP = 0x00EB
 SUPBOOK = 0x01AE
 EXTERNSHEET = 0x0017
 
-Rec = tuple  # (record id, body offset, body size, ((offset, size) of each CONTINUE body right after it,))
+class Rec(NamedTuple):
+    """One record of a stream; a plain 4-tuple unpacks the same way."""
+    id: int
+    off: int       # body offset in the stream
+    size: int      # body size
+    conts: tuple   # (offset, size) of each CONTINUE body right after it
 
 
 class Stream:
@@ -62,7 +68,7 @@ class Stream:
                 self.count += 1
                 conts.append((c[1], c[2]))
                 nxt = c[1] + c[2]
-            yield (rid, off, size, tuple(conts))
+            yield Rec(rid, off, size, tuple(conts))
             if cut:
                 self.ctx.skipped["record"] += 1
                 return
@@ -270,7 +276,7 @@ def read_globals(st: Stream) -> Globals:
     g = Globals()
     drawing = []
     for rec in it:
-        rid, off, size = rec[0], rec[1], rec[2]
+        rid = rec.id
         if rid == EOF:
             break
         if rid == FILEPASS:

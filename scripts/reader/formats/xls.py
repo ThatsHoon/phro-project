@@ -156,7 +156,7 @@ class Workbook:
         """Walk sheet substream `offset` into `grid`; the sheet's MSODRAWING bodies, CONTINUEs joined, go into `draw`
         (a TXO or OBJ is another record, and a TXO's CONTINUEs belong to it); the offset of each chart substream nested
         in it goes into `starts`."""
-        data, g = self.data, self.g
+        data = self.data
         if not 0 <= offset < len(data):
             raise ReadError("damaged", "sheet offset outside the stream")
         depth, pending = 0, None

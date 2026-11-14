@@ -762,12 +762,15 @@ def _xl_string(text, short=False):
 
 
 def _biff_sst(strings, split):
-    """The SST record and its CONTINUEs; with `split` each body holds at most that many bytes and a string cut
+    """The SST record and its CONTINUEs; with `split` (8224 when the SST is longer than that) each body holds at most that many bytes and a string cut
     by a boundary restarts with a flags byte, as BIFF8 writes it."""
     import struct
     head = struct.pack("<II", len(strings), len(strings))
     if not split:
-        return biff(0x00FC, head + b"".join(_xl_string(s) for s in strings))
+        whole = head + b"".join(_xl_string(s) for s in strings)
+        if len(whole) <= 8224:
+            return biff(0x00FC, whole)
+        split = 8224  # a record body holds at most 8224 bytes (and a size field 65535): split as Excel does
     assert split >= 12
     bodies, cur = [], bytearray(head)
     for s in strings:
@@ -831,10 +834,12 @@ def _biff_sheet(sh, sst, fmt_xf):
     if kind == 0:
         top = max((r for r, _ in cells), default=-1) + 1
         wide = max((c for _, c in cells), default=-1) + 1
+        out += [biff(0x007D, struct.pack("<HHHHHH", c, c, 2560, 15, 1, 0)) for c in hidden_cols]  # before DIMENSIONS
         out.append(biff(0x0200, struct.pack("<IIHHH", 0, top, 0, wide, 0)))
-        out += [biff(0x007D, struct.pack("<HHHHHH", c, c, 2560, 15, 1, 0)) for c in hidden_cols]
         for r in rows:
-            out.append(biff(0x0208, struct.pack("<HHHHHHHH", r, 0, 0, 255, 0, 0, 0x20 if r in hidden_rows else 0, 15)))
+            used = [c for rr, c in cells if rr == r]  # colMic and colMac: the row's first column and one past its last
+            lo, hi = (min(used), max(used) + 1) if used else (0, 0)
+            out.append(biff(0x0208, struct.pack("<HHHHHHHH", r, lo, hi, 255, 0, 0, 0x20 if r in hidden_rows else 0, 15)))
         out += [_biff_cell(r, c, v, sst, fmt_xf) for (r, c), v in cells.items()]
         merges = list(sh.get("merges", ()))
         for i in range(0, len(merges), 1000):
