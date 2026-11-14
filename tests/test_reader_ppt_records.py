@@ -65,6 +65,51 @@ def test_directory_overrun():
     assert ctx.skipped["record"] == 1, ctx.skipped
 
 
+def test_directory_overrun_keeps_older_directory():
+    info, doc, cu = build(edits=2)
+    old, new = info["slide1_offsets"]
+    doc = bytearray(doc)
+    at = info["directories"][1]  # the newest edit's directory: slide 1's new offset
+    struct.pack_into("<I", doc, at + 8, info["slides"][0] | 0xFFF << 20)  # its only entry runs past the atom
+    ctx = Context()
+    p = pr.Persist(bytes(doc), cu, ctx)
+    assert ctx.skipped["record"] == 1, ctx.skipped
+    assert p.objects[info["slides"][0]] == old and p.obj(info["slides"][1])[0] == pr.SLIDE_CONTAINER, p.objects
+    assert p.obj(p.doc_ref)[0] == pr.DOCUMENT_CONTAINER
+
+
+def test_directory_overrun_keeps_entries_before_it():
+    # the entries before the overrunning one are kept; those after it have no length to trust and are lost
+    info, doc, cu = build()
+    doc = bytearray(doc)
+    at = info["directories"][0]
+    assert struct.unpack_from("<I", doc, at + 4)[0] == 4 + 4 * 4  # one run of the four ids
+    keep = [struct.unpack_from("<I", doc, at + 12 + 4 * k)[0] for k in range(2)]
+    struct.pack_into("<IIIII", doc, at + 8, 1 | 2 << 20, keep[0], keep[1], 3 | 0xFFF << 20, 0)
+    ctx = Context()
+    p = pr.Persist(bytes(doc), cu, ctx)
+    assert ctx.skipped["record"] == 1, ctx.skipped
+    assert p.obj(info["doc"])[0] == pr.DOCUMENT_CONTAINER and p.obj(info["master"])[0] == pr.MAIN_MASTER
+    assert p.obj(info["slides"][0]) is None and p.obj(info["slides"][1]) is None, p.objects
+
+
+def test_repeated_last_edit_counts_one_record():
+    info, doc, cu = build(edits=3)
+    doc = bytearray(doc)
+    oldest, middle, newest = info["user_edits"]
+    struct.pack_into("<I", doc, oldest + 8 + 8, newest)  # the oldest edit points back at the newest: a cycle
+    ctx = Context()
+    p = pr.Persist(bytes(doc), cu, ctx)
+    assert ctx.skipped["record"] == 1, ctx.skipped
+    assert p.obj(p.doc_ref)[0] == pr.DOCUMENT_CONTAINER
+    info, doc, cu = build()
+    doc = bytearray(doc)
+    struct.pack_into("<I", doc, info["user_edits"][0] + 8 + 8, info["user_edits"][0])  # points at itself
+    ctx = Context()
+    pr.Persist(bytes(doc), cu, ctx)
+    assert ctx.skipped["record"] == 1, ctx.skipped
+
+
 def test_encrypted_token():
     info, doc, cu = build(encrypt="x")
     p = pr.Persist(doc, cu, Context())

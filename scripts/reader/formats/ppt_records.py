@@ -37,7 +37,13 @@ class Persist:
     (the newest edit's entry wins), `doc_ref` is the DocumentContainer's id, `crypt_ref` the CryptSession10Container's
     (None when the newest edit names none), `encrypted` whether the CurrentUserAtom headerToken says the streams are
     encrypted. Raises ReadError("damaged") only when no UserEditAtom can be found. A doc_ref the directories do not
-    list is kept as read: obj(doc_ref) is then None and the caller decides what a missing document container means."""
+    list is kept as read: obj(doc_ref) is then None and the caller decides what a missing document container means.
+
+    The directory work budget (BIN_RECORDS entries, repeated ids counted) is spent across all the edits together, not
+    per edit: a file with very many edits that each re-list the same objects stops at the budget, the oldest
+    directories are not read and the stop is counted under `record`. A directory entry that runs past its atom ends
+    that directory there (the entries before it are kept, none after it can be trusted) and the older edits are still
+    read."""
 
     def __init__(self, doc: bytes, current_user: bytes | None, ctx):
         self.doc, self.ctx = doc, ctx
@@ -80,7 +86,8 @@ class Persist:
         doc_ref = crypt_ref = None
         seen, dirs = set(), set()
         for _ in range(MAX_EDITS):
-            if off in seen:
+            if off in seen:  # a lastEdit that points back at an edit already walked ends the chain
+                self.ctx.skipped["record"] += 1
                 break
             seen.add(off)
             edit = self._edit(off)
