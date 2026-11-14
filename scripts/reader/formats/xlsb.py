@@ -1,27 +1,25 @@
 """Excel binary workbooks (.xlsb): one sheet section per worksheet, with displayed values, merges and hidden parts.
 
 The record layouts were checked against anydoc `sheet/xlsb.rs` (BrtWbProp, BrtBundleSh, the cell XF block of
-styles.bin, BrtSSTItem, the row, cell, column and merge records) and `sheet/xlsx.rs` (drawing anchors), and the
+styles.bin, BrtSSTItem, the row, cell, column and merge records) and the
 framing in `containers/biff12.py`. Parts are found through the package relationships, with the conventional names
 only when a relationship is absent; a part no relationship reaches is never read. Every handler runs per record:
 the record size gives an exact step, so a bad record is counted under `record` and the walk goes on. Cells go
 through `numfmt.display`; a formula shows its cached value and its expression is never read. A sheet that cannot
 be read, or whose workbook entry names no readable part, is counted under `sheet` and the others still come out.
-A sheet's drawing part is XML: its charts (cached values as a table, charged against `CHART_TOTAL`) and pictures
-(charged against `IMAGE_BYTES`) follow the sheet's table in anchor order. A compound file named .xlsb goes to
+A sheet's charts and pictures come from `sheet_drawing` and follow the sheet's table in anchor order. A compound file named .xlsb goes to
 `cfb_route`: an encrypted package is `encrypted`, and another format's file is read by its own parser.
 """
 import re
 import struct
 from pathlib import Path
 
-from .. import limits
 from ..containers import biff12, cfb
-from ..containers.zipx import Package, attr, local, first
+from ..containers.zipx import Package
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import code_for, display
-from . import biff, cfb_route, ooxml_base, sheet_grid
+from . import biff, cfb_route, sheet_drawing, sheet_grid
 from .xls import _hide
 
 BRT_ROW_HDR = 0
@@ -32,7 +30,6 @@ BRT_CELL_RSTRING = 62
 BRT_MERGE_CELL = 176
 _ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!",
            0x2A: "#N/A", 0x2B: "#GETTING_DATA"}
-MAX_ANCHORS = 10_000  # drawing anchors one drawing part reads
 
 BRT_SST_ITEM = 19
 BRT_FMT = 44
@@ -215,9 +212,7 @@ class _Sheets:
         self.pkg, self.wb, self.ctx = pkg, wb, ctx
         self.budget = sheet_grid.Budget()
         self.used: set[str] = set()      # sheet parts read
-        self.drawings: set[str] = set()  # drawing parts read
-        self.image_bytes = 0             # image bytes placed (IMAGE_BYTES)
-        self.chart_cells = 0             # chart table cells placed (CHART_TOTAL)
+        self.draw = sheet_drawing.Drawings(pkg, ctx)  # charts and pictures; one image byte count and chart cell count
         self._code: dict[int, str] = {}
 
     def sections(self) -> list:
@@ -258,7 +253,7 @@ class _Sheets:
             raise ReadError("damaged", "sheet part used twice")
         self.used.add(part)
         if part in self.wb.chartsheets:  # a chartsheet has no cell records: its drawing is all there is
-            return self.drawing(part)
+            return self.draw.blocks(part)
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         row, lost = None, False  # lost: the row header was bad, so its row is counted (once) and its cells go with it
         for rid, data, off, size in _walk(self.pkg, part, self.ctx):
@@ -293,7 +288,7 @@ class _Sheets:
                     grid.merge(r1, r2, c1, c2)
             except (ValueError, struct.error):
                 self.ctx.skipped["record"] += 1
-        return grid.blocks() + self.drawing(part)
+        return grid.blocks() + self.draw.blocks(part)
 
     def _cell(self, rid: int, f, style: int) -> str:
         """The displayed value of one cell record whose header has been read. A formula shows its cached value."""
@@ -314,105 +309,9 @@ class _Sheets:
             f.u8()
         return self.show(f.wide() or "", style)  # BrtCellSt, BrtCellRString, BrtFmlaString
 
-    # ---- drawings
-    def drawing(self, part: str) -> list:
-        """The charts and pictures of the drawing parts that the sheet relationships name, in anchor order."""
-        out = []
-        for rel in ooxml_base.rels(self.pkg, part, self.ctx).values():
-            if rel.external or not rel.type.endswith("/drawing"):
-                continue
-            if rel.target in self.drawings:
-                self.ctx.skipped["object"] += 1
-                continue
-            self.drawings.add(rel.target)
-            try:
-                root, nsmap = ooxml_base.load(self.pkg, rel.target)
-            except ReadError as e:
-                if e.kind not in ("damaged", "too_large"):
-                    raise
-                self.ctx.skipped["object"] += 1
-                continue
-            out += self.anchors(rel.target, root, nsmap)
-        return out
 
-    def anchors(self, part: str, root, nsmap) -> list:
-        """Each anchor places every chart and picture it holds, group members included. Positioned anchors come in (row, column) order, then
-        absolute ones in file order. An AlternateContent is replaced by the branch the reader understands."""
-        found = []
-        for a in self._descend(root, nsmap, _ANCHORS):
-            if len(found) >= MAX_ANCHORS:
-                self.ctx.skipped["object"] += 1
-                break
-            at = first(a, "from")
-            if at is None:
-                found.append((1, 0, 0, len(found), a))
-            else:
-                r = ooxml_base.int_of(_text(first(at, "row")))
-                c = ooxml_base.int_of(_text(first(at, "col")))
-                found.append((0, r, c, len(found), a))
-        found.sort(key=lambda t: t[:4])
-        out = []
-        for *_, a in found:
-            for el in self._descend(a, nsmap, ("chart", "pic")):
-                if local(el.tag) == "chart":
-                    self.chart(part, attr(el, "id"), out)
-                else:
-                    blip = first(el, "blip")
-                    self.picture(part, attr(blip, "embed") if blip is not None else None, out)
-        return out
-
-    def _descend(self, root, nsmap, names):
-        """The elements under `root` named in `names`, in document order, not entered once found; an
-        AlternateContent is replaced by its chosen branch (counted under alternate when there is none)."""
-        stack = [iter(root)]
-        while stack:
-            for el in stack[-1]:
-                name = local(el.tag)
-                if name in names:
-                    yield el
-                elif name == "AlternateContent":
-                    chosen = ooxml_base.alternate(el, nsmap)
-                    if chosen is None:
-                        self.ctx.skipped["alternate"] += 1
-                    else:
-                        stack.append(iter(chosen))
-                        break
-                else:
-                    stack.append(iter(el))
-                    break
-            else:
-                stack.pop()
-
-    def chart(self, part: str, rid, out: list) -> None:
-        tbl = ooxml_base.chart(self.pkg, part, rid, self.ctx)
-        if tbl is None:  # kept: a chart part with no series is "could not read" too, as in the slide and Word readers
-            self.ctx.skipped["chart"] += 1
-            return
-        self.chart_cells += sum(len(r) for r in tbl.rows)
-        if self.chart_cells > limits.CHART_TOTAL:
-            self.ctx.skipped["chart"] += 1
-        else:
-            out.append(tbl)
-
-    def picture(self, part: str, rid, out: list) -> None:
-        img = ooxml_base.image(self.pkg, part, rid)
-        if img is None:
-            self.ctx.skipped["image"] += 1
-            return
-        self.image_bytes += len(img.data)
-        if self.image_bytes > limits.IMAGE_BYTES:
-            self.ctx.skipped["image"] += 1
-        else:
-            out.append(img)
-
-
-_ANCHORS = ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor")
 _CELLS = frozenset({BRT_CELL_RK, BRT_CELL_ERROR, BRT_CELL_BOOL, BRT_CELL_REAL, BRT_CELL_ST, BRT_CELL_ISST,
                     BRT_CELL_RSTRING, BRT_FMLA_STRING, BRT_FMLA_NUM, BRT_FMLA_BOOL, BRT_FMLA_ERROR})
-
-
-def _text(el) -> str:
-    return (el.text or "").strip() if el is not None else ""
 
 
 def parse(path, ctx) -> Doc:
