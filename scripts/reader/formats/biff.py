@@ -265,10 +265,17 @@ def read_globals(st: Stream) -> Globals:
 def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
     data = st.data
     rid, off, size = rec[0], rec[1], rec[2]
-    if rid == BOUNDSHEET and size >= 8:
-        pos, state, kind = struct.unpack_from("<IBB", data, off)
-        name, _ = short_string(data[off + 6:off + size], 0)
-        g.sheets.append(SheetRef(name, pos, state & 3, kind))
+    if rid == BOUNDSHEET:
+        try:
+            if size < 8:
+                raise ValueError("short BOUNDSHEET")
+            pos, state, kind = struct.unpack_from("<IBB", data, off)
+            name, _ = short_string(data[off + 6:off + size], 0)
+            g.sheets.append(SheetRef(name, pos, state & 3, kind))
+        except ValueError:
+            # a damaged one keeps its place, so the sheet indexes after it (itabCur, EXTERNSHEET) stay right; its
+            # offset is outside every stream, so the sheet walk counts it under `sheet`
+            g.sheets.append(SheetRef("", -1, 0, 0))
     elif rid == FORMAT and size >= 4:
         fid = struct.unpack_from("<H", data, off)[0]
         g.formats[fid] = _cursor(st, rec, 2).string()

@@ -127,6 +127,29 @@ def test_two_sheets_one_bad():
     assert "first" in md and "second" not in md and "could not read: 1 sheet" in md, md
 
 
+def test_damaged_boundsheet_keeps_its_place():
+    # a BOUNDSHEET whose name runs past its record is a placeholder, so the sheet indexes after it stay right
+    data = biff_workbook([{"name": "A", "cells": {(0, 0): "one"}}, {"name": "B", "cells": {(0, 0): "two"}},
+                          {"name": "C", "cells": {(0, 0): "three"}}])
+    buf = bytearray(data)
+    seen = 0
+    for rid, off, size, _ in biff.Stream(data, Context()).records(0):
+        if rid == biff.BOUNDSHEET:
+            seen += 1
+            if seen == 2:
+                buf[off + 6] = 250  # cch past the record
+    ctx = Context()
+    wb = xls.Workbook(bytes(buf), ctx, sheet_grid.Budget())
+    assert [s.name for s in wb.g.sheets] == ["A", "", "C"], [s.name for s in wb.g.sheets]
+    secs = wb.sections()
+    assert [s.title for s in secs] == ["A", "C"], [s.title for s in secs]
+    assert ctx.skipped["sheet"] == 1 and not ctx.skipped["record"], dict(ctx.skipped)
+    assert 2 in wb.cells and 1 not in wb.cells  # sheet C is still index 2
+    short = biff.Stream(rec(0x0809, struct.pack("<HHHHII", 0x0600, 5, 0, 0, 0, 6)) + rec(0x0085, b"\x00\x00\x00\x00")
+                        + rec(0x000A), Context())
+    assert [s.name for s in biff.read_globals(short).sheets] == [""]  # too short to hold a name: still a place
+
+
 def test_all_sheets_bad():
     data = biff_workbook([{"name": "One", "cells": {(0, 0): "first"}}])
     got = denied(lambda: convert_bytes(patch_offsets(data, {0: len(data) + 500})))
