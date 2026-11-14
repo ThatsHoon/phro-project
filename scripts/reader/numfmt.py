@@ -625,7 +625,8 @@ def _fraction(d: Decimal, toks, s: int, at_text: str) -> str:
     out = [_emit(toks[:w_start if has_whole else n_start], at_text)]
     if has_whole:
         w_kinds = [t[1] for t in toks[w_start:w_end + 1]]
-        wl, wcells = _fill_int(str(whole) if whole else "", w_kinds, False)
+        # a zero value shows 0 in the whole slot, as Excel does; a fraction part or a whole number leaves it as is
+        wl, wcells = _fill_int(str(whole) if whole or not p else "", w_kinds, False)
         whole_text = wl + "".join(wcells)
         out.append(whole_text)
         if whole_text.strip() or any(k != "#" for k in w_kinds):
@@ -641,5 +642,5 @@ def _pad_right(digits: str, kinds):
     """Denominator digits left-aligned under their placeholders, short ones padded by kind."""
     out = list(digits)
     for kind in kinds[len(digits):]:
-        out.append({"0": "0", "#": "", "?": " "}.get(kind, ""))
+        out.append(_PAD.get(kind, ""))
     return out

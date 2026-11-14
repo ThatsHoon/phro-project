@@ -81,6 +81,15 @@ def test_fraction():
     assert display(-1.5, "# ?/?") == "-1 1/2"
 
 
+def test_fraction_zero_shows_zero():
+    # Excel shows 0 for zero under a whole-plus-fraction code (dochan's _fraction_number gives "0"); the alignment
+    # spaces stay, as they do for 2 above
+    assert display(0, "# ?/?") == "0    "
+    assert display(0, "# ??/??") == "0      "
+    assert display(0, "0 ?/?") == "0    "
+    assert display(0, "?/?") == "0/1"
+
+
 def test_general():
     assert display(0.1 + 0.2, "General") == "0.3"
     assert display(123456789012, "General") == "123456789012"
