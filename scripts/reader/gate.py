@@ -26,6 +26,21 @@ TOO_LARGE = {  # by the start of a too_large detail
     limits.BIG_PART: "a part expands too much to read safely",
     limits.BIG_TOTAL: f"the file expands past the {limits.ZIP_TOTAL // 2**30} GiB safety limit",
 }
+SKILL_OF = {**dict.fromkeys(("docx", "docm", "dotx", "dotm"), "docx"),
+            **dict.fromkeys(("pptx", "pptm", "ppsx", "potx", "potm", "ppsm"), "pptx"),
+            **dict.fromkeys(("xlsx", "xlsm", "xltx", "xltm"), "xlsx")}
+EDIT_HINT = " Read-only view (no XML, cell addresses or formulas); to edit the file, use the {skill} skill."
+
+
+def off_exts():
+    """The extensions PHRO_READER_OFF hands back to Read: comma-separated, stripped, case-folded, one dot dropped."""
+    out = set()
+    for item in os.environ.get("PHRO_READER_OFF", "").split(","):
+        item = item.strip().casefold()
+        item = item[1:] if item.startswith(".") else item
+        if item:
+            out.add(item)
+    return frozenset(out)
 
 
 def scope(event):
@@ -36,7 +51,8 @@ def scope(event):
     fp = ti.get("file_path") if isinstance(ti, dict) else None
     if not isinstance(fp, str) or not fp:
         return None
-    if reader.ext_of(fp) not in reader.FORMATS:
+    ext = reader.ext_of(fp)
+    if ext not in reader.FORMATS or ext in off_exts():
         return None
     p = Path(fp)
     cwd = event.get("cwd")
@@ -88,8 +104,13 @@ def looks_like_text(path):
 def deny_text(path, why, retry=True):
     """A deny; with retry, the convert command too (only where running it by hand can help)."""
     reason = f"{_name(path)}: {why}."
+    skill = SKILL_OF.get(reader.ext_of(path))
     if retry:
         reason += f' Retry by hand: python -I -X utf8 "{READ_PY}" convert "{path}"'
+        if skill:
+            reason += f" or read it with the {skill} skill."
+    elif skill:
+        reason += f" Read it with the {skill} skill instead."
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
@@ -145,6 +166,9 @@ def _context(name, meta, out_md):
     head += ")."
     if k:
         head += f" {k} hidden places left out."
+    skill = SKILL_OF.get(reader.ext_of(name))
+    hint = EDIT_HINT.format(skill=skill) if skill else ""
+    head += hint
     tail = ""
     if "garbled" in (meta.get("warnings") or []):
         tail = " Warning: the text may be garbled."

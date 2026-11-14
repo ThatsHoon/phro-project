@@ -206,15 +206,98 @@ def test_context_unread_clause_fits():
     md = tmp() / "out.md"
     md.write_text("x\n", encoding="utf-8")
     meta = {"lines": 1, "unread": ["1 slide", "2 images"]}
-    assert gate._context("a.pptm", meta, md).endswith("(1 line). Some parts could not be read: 1 slide, 2 images.")
-    c = gate._context("a.pptm", {"lines": 2, "images": 1}, md)
+    assert gate._context("a.hwpx", meta, md).endswith("(1 line). Some parts could not be read: 1 slide, 2 images.")
+    c = gate._context("a.hwpx", {"lines": 2, "images": 1}, md)
     assert c.endswith("(2 lines, 1 image in assets/; Read it to view)."), c
-    c = gate._context("a.pptm", {"lines": 2, "images": 3}, md)
+    c = gate._context("a.hwpx", {"lines": 2, "images": 3}, md)
     assert c.endswith("(2 lines, 3 images in assets/; Read them to view)."), c
     meta = {"lines": 3000, "hidden": 4, "warnings": ["garbled"], "unread": [f"{i} kinds of thing" for i in range(60)],
             "headings": [(i, "h") for i in range(100)]}
-    c = gate._context("n" * 250 + ".pptm", meta, md)
+    c = gate._context("n" * 250 + ".hwpx", meta, md)
     assert len(c) < 600 and "0 kinds of thing" in c and "…." in c and c.endswith("may be garbled."), c
+
+
+def test_edit_hint_by_family():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    hint = " Read-only view (no XML, cell addresses or formulas); to edit the file, use the {} skill."
+    assert gate._context("a.docx", {"lines": 1}, md) == (
+        "a.docx was converted to Markdown by phro-project (1 line)." + hint.format("docx"))
+    assert gate._context("a.pptm", {"lines": 1}, md).endswith("use the pptx skill.")
+    assert gate._context("a.potx", {"lines": 1}, md).endswith("use the pptx skill.")
+    assert gate._context("a.xltm", {"lines": 1}, md).endswith("use the xlsx skill.")
+    for n in ("a.hwpx", "a.xlsb"):
+        assert "Read-only view" not in gate._context(n, {"lines": 1}, md)
+
+
+def test_edit_hint_fits():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = {"lines": 3000, "hidden": 4, "warnings": ["garbled"], "unread": [f"{i} kinds of thing" for i in range(60)],
+            "headings": [(i, "h") for i in range(100)]}
+    c = gate._context("n" * 250 + ".xlsm", meta, md)
+    assert len(c) < 600 and gate.EDIT_HINT.format(skill="xlsx") in c and "…." in c and c.endswith("may be garbled."), c
+
+
+def test_edit_hint_before_lists():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = {"lines": 3000, "unread": ["1 image"], "headings": [(1, "h"), (2, "g")]}
+    c = gate._context("a.docx", meta, md)
+    assert c.index("Read-only view") < c.index("Some parts") < c.index("Sections at"), c
+
+
+def test_deny_names_the_skill():
+    def r(d):
+        return d["hookSpecificOutput"]["permissionDecisionReason"]
+    t = r(gate._deny(Path("d/a.xlsx"), "damaged", "x"))
+    assert "Retry by hand: python -I -X utf8" in t and t.endswith(" or read it with the xlsx skill."), t
+    assert r(gate._deny(Path("d/a.docx"), "encrypted")) == (
+        "a.docx: the file is encrypted and needs a password. Read it with the docx skill instead.")
+    assert r(gate._deny(Path("d/a.hwp"), "encrypted")) == "a.hwp: the file is encrypted and needs a password."
+    assert r(gate.deny_text(Path("d/a.pptx"), "reading failed (internal error KeyError)")).endswith(
+        " or read it with the pptx skill.")
+
+
+@contextmanager
+def off_env(value):
+    old = os.environ.get("PHRO_READER_OFF")
+    try:
+        if value is None:
+            os.environ.pop("PHRO_READER_OFF", None)
+        else:
+            os.environ["PHRO_READER_OFF"] = value
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("PHRO_READER_OFF", None)
+        else:
+            os.environ["PHRO_READER_OFF"] = old
+
+
+def test_reader_off_switch():
+    d = tmp()
+    paths = {}
+    for n in ("a.docm", "a.hwp", "a.pptm"):
+        paths[n] = d / n
+        paths[n].write_bytes(b"PK\x03\x04")
+
+    def ev(n):
+        return {"tool_name": "Read", "tool_input": {"file_path": str(paths[n])}}
+    with off_env(" .DOCM, hwp ,,"):
+        assert gate.scope(ev("a.docm")) is None and gate.scope(ev("a.hwp")) is None
+        assert gate.scope(ev("a.pptm")) == paths["a.pptm"]
+    with off_env(None):
+        assert all(gate.scope(ev(n)) == paths[n] for n in paths)
+
+
+def test_reader_off_convert_ignores():
+    import test_reader_docm as dm
+    f = dm.docm(dm.P("Hi"))
+    env = dict(os.environ, PHRO_READER_OFF="docm", PHRO_READER_CACHE=str(tmp()))
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", str(READ), "convert", str(f)],
+                       capture_output=True, text=True, encoding="utf-8", env=env)
+    assert r.returncode == 0 and r.stdout.strip().endswith("out.md"), (r.stdout, r.stderr)
 
 
 def test_heading_index_long_output():
