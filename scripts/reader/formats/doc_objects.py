@@ -95,10 +95,11 @@ class Objects:
         unread (the preview and the count stay). The reads of a failed workbook are not counted here, place() counts
         the chart where it is shown."""
         ctx = self.r.ctx
-        before = ctx.skipped["chart"]
+        before, warned = ctx.skipped["chart"], len(ctx.warnings)
         out = xls_embedded.blocks(_Storage(self, streams), ctx, self.sheets)
         if out:
             return ("table", out, frozenset())
+        del ctx.warnings[warned:]  # the guard's warning goes with its count: place() counts the chart where it is shown
         if before:
             ctx.skipped["chart"] = before
         else:

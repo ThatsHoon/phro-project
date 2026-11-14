@@ -178,6 +178,18 @@ def test_chart_total_charged():
     assert out.count("|1|2|") == 1 and "(could not read: 1 chart)" in out, out
 
 
+def test_failed_workbook_leaves_no_warning():
+    # a failure the guard counts leaves a warning; the unread chart is counted where it is placed, with no warning
+    from reader.formats import xls_embedded
+    old = xls_embedded._read
+    xls_embedded._read = lambda *a: (_ for _ in ()).throw(ValueError("boom"))
+    try:
+        out, ctx, _ = build([{"shapes": [obj()]}], objects=[excel_object([GRID], b"Excel.Sheet.8")])
+    finally:
+        xls_embedded._read = old
+    assert dict(ctx.skipped) == {"chart": 1} and ctx.warnings == [], (dict(ctx.skipped), ctx.warnings)
+
+
 def test_shared_helper_with_doc():
     from reader.formats import doc_objects, mtef
     assert hasattr(mtef, "native_tex") and doc_objects.mtef is mtef

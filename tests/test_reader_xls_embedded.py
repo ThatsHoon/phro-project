@@ -216,6 +216,83 @@ def test_one_cell_sheet_placed():
     assert out == "앞\n\nonly cell\n\n뒤\n" and not ctx.skipped, (out, ctx.skipped)
 
 
+G1 = {"name": "S", "cells": {(0, 0): 1, (0, 1): 2, (1, 0): 3, (1, 1): 4}}
+G2 = {"name": "S", "cells": {(0, 0): 5, (0, 1): 6, (1, 0): 7, (1, 1): 8}}
+
+
+def doc_with_sheets(n):
+    """A .doc with n EMBED fields, the k-th naming ObjectPool/_k, a workbook of the 2x2 grid G1 (k odd) or G2."""
+    objs = {k + 1: object_streams(excel_object([(G1, G2)[k % 2]], b"Excel.Sheet.8")) for k in range(n)}
+    text = ("a" + dobj.EMBED) * n + "\r"
+    spans, k = [], 0
+    for i, ch in enumerate(text):
+        if ch == "\x14":
+            k += 1
+            spans.append((i, i + 1, dobj.sp(dobj.SPEC) + dobj.sp(dobj.OLE) + dobj.sp(dobj.PIC, k)))
+        elif ch == "\x01":
+            spans.append((i, i + 1, dobj.sp(dobj.SPEC) + dobj.sp(dobj.PIC, dobj.AT)))
+    return dobj.embed_doc(objs, text=text, preview=dobj.PNG_PREVIEW, chpx=spans)
+
+
+def test_doc_objects_share_one_sheet_budget():
+    # two 2x2 workbooks over a budget of 4 cells: the first is read whole, the second finds it spent, so it is an
+    # unread chart: its preview stays and it is counted
+    old = limits.SHEET_CELLS
+    limits.SHEET_CELLS = 4
+    try:
+        d, ctx = dobj.parse(doc_with_sheets(2))
+    finally:
+        limits.SHEET_CELLS = old
+    out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
+    assert out == ("(could not read: 1 chart, 1 sheet cut short)\n\naa\n\n|1|2|\n|---|---|\n|3|4|\n\n"
+                   "![](assets/img-001.png)\n"), out
+    assert "|5|" not in out and ctx.skipped["chart"] == 1, ctx.skipped
+
+
+def test_doc_object_cap():
+    from reader.formats import doc_objects
+    old = doc_objects.MAX_OBJECTS
+    doc_objects.MAX_OBJECTS = 2
+    try:
+        d, ctx = dobj.parse(doc_with_sheets(3))
+    finally:
+        doc_objects.MAX_OBJECTS = old
+    out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
+    assert out.count("|1|2|") == 1 and out.count("|5|6|") == 1 and ctx.skipped == {"object": 1}, (out, ctx.skipped)
+    assert "(could not read: 1 embedded object)" in out and out.count("![](") == 1, out
+
+
+def test_hwp_object_cap():
+    from reader.formats import hwp
+    items = [object_streams(excel_object([(G1, G2)[k % 2]], b"Excel.Sheet.8")) for k in range(3)]
+    items[2] = object_streams(excel_object([{"name": "S", "cells": {(0, 0): 9, (0, 1): 9}}], b"Excel.Sheet.8"))
+    shapes = [hchart.ole_shape(k) for k in (1, 2, 3)]
+    streams = {f"BIN000{k + 1}.OLE": hchart.deflate(hchart.envelope(s)) for k, s in enumerate(items)}
+    old = hwp.MAX_OBJECTS
+    hwp.MAX_OBJECTS = 2
+    try:
+        out, ctx = hchart.read(hchart.doc(*shapes, streams=streams))
+    finally:
+        hwp.MAX_OBJECTS = old
+    assert out.count("|1|2|") == 1 and out.count("|5|6|") == 1 and "|9|9|" not in out, out
+    assert ctx.skipped == {"object": 1}, ctx.skipped
+
+
+def test_failed_workbook_leaves_no_warning():
+    # a failure the guard counts leaves a warning; a workbook that is only an unread chart (counted where it is
+    # placed) leaves neither the count nor the warning behind
+    old = xls_embedded._read
+    xls_embedded._read = lambda *a: (_ for _ in ()).throw(ValueError("boom"))
+    try:
+        obj = object_streams(excel_object([GRID], b"Excel.Sheet.8"))
+        d, ctx = dobj.parse(dobj.embed_doc({1: obj}, preview=dobj.PNG_PREVIEW))
+    finally:
+        xls_embedded._read = old
+    out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
+    assert out == "(could not read: 1 chart)\n\n![](assets/img-001.png)\n", out
+    assert ctx.skipped == {"chart": 1} and ctx.warnings == [], (ctx.skipped, ctx.warnings)
+
+
 def test_ole_table_shares_budget():
     # ole_table's sheets keyword is the document's budget: the embedded sheet's cells are drawn from it
     from reader.formats import hwp_chart

@@ -110,12 +110,13 @@ class Objects:
                     lost = set()
                     tex = mtef.native_tex(cf.read(_NATIVE), lost)
                     return "equation", [Equation(tex, False)], frozenset(lost)
-                before = self.ctx.skipped["chart"]
+                before, warned = self.ctx.skipped["chart"], len(self.ctx.warnings)
                 out = xls_embedded.blocks(cf, self.ctx, self.sheets)
                 if out is None:
                     return None
                 if out:
                     return "table", out, frozenset()
+                del self.ctx.warnings[warned:]  # the guard's warning goes with its count
                 if before:  # the caller counts the chart where it is shown
                     self.ctx.skipped["chart"] = before
                 else:
