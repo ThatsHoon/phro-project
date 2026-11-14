@@ -58,18 +58,21 @@ paragraph being built and its own open fields, so a note or a header never ends 
   So an extra `}` mid-body is skipped and the rest read; `{\\rtf1 one}\\r\\n trailing {\\b junk}` still ends at the
   first `}`. A `}` with no open group is ignored. The last paragraph, written without `\\par`, ends under the state
   it was written in. The input must start, after an optional byte-order mark and
-  whitespace, with `{\\rtf`; a compound file goes to `doc.parse`, a zip to `ooxml.parse`.
+  whitespace, with `{\\rtf`; a compound file goes to `cfb_route` (Word's to `doc.parse`, another format's to its own
+  parser), a zip to `zip_route` (an OpenDocument package to `odf.parse`, any other to `ooxml.parse`). `parse_bytes`
+  reads RTF held in memory and is what `parse` ends in.
 * Code pages: `\\ansicpg`, `\\deff`, the font table's `\\fN \\fcharsetN \\cpgN` and `\\fN` per group, through
   `rtf_lex.codec`.
 """
 import re
 
 from .. import images, limits
-from ..containers.cfb import is_cfb
+from ..containers.cfb import Compound, is_cfb
 from ..limits import ReadError
 from ..model import Bold, Break, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
 from ..officeart import dib_to_bmp
 from .rtf_lex import BIN, CLOSE, HEX, OPEN, SYM, TEXT, WORD, Pending, codec, tokens
+from . import zip_route
 from .rtf_table import Tables
 from .word_fields import MAX_INSTR, hyperlink_url
 
@@ -200,6 +203,11 @@ def _plain(inlines) -> str:
     return "".join(out)
 
 
+def _all_hidden(blocks) -> bool:
+    """Whether every block is text made only of Hidden runs (a note whose body was written under `\v`)."""
+    return all(getattr(b, "inlines", None) and all(isinstance(i, Hidden) for i in b.inlines) for b in blocks)
+
+
 def _text(block) -> str:
     """The text of a header's or footer's block: a table's cells one after another."""
     if isinstance(block, Table):
@@ -299,7 +307,11 @@ class _Reader:
         self.data = b""        # the input the BIN tokens point into
         self.pic = None        # the picture being collected
         self.img_total = 0     # bytes of the pictures emitted so far (IMAGE_BYTES)
-        self.budget = [limits.TABLE_NODES]  # cells the tables of the document may still take
+        # Cells the tables of the document may still take: one budget for the whole document, shared by every table
+        # and charged per cell, as doc.py's is. It is the bound on hostile input (many tiny tables or one huge one
+        # cost the same), so one legitimate table of more than TABLE_NODES cells is cut and counted under "cells" once.
+        # Kept per document on purpose (ruled): a limit per table would let a file of many tables grow without bound.
+        self.budget = [limits.TABLE_NODES]
         self.n_notes = {"fn": 0, "en": 0}
         self.body = _Story("body", 0)
         self.stories = [self.body]
@@ -422,6 +434,9 @@ class _Reader:
         if self.pic is not None and depth == self.pic.depth:
             self.finish_pict(closing)
         self.g = self.stack.pop()
+        story = self.story
+        if story.has and story.depth < depth and not closing.suppress and not closing.cap:
+            self.keep_paragraph(closing, self.g)
         depth -= 1
         while True:
             story = self.story
@@ -432,6 +447,16 @@ class _Reader:
                 continue
             break
         return depth == 0
+
+    @staticmethod
+    def keep_paragraph(closing, parent):
+        """A paragraph whose properties were set inside a group that closes before its `\\par` (`{\\pard\\s1 x}`) keeps
+        them: the heading and list state the closing group set pass to the parent when the story holds text of the
+        paragraph under way. A group that already ended its paragraph leaves nothing under way, so nothing passes."""
+        if parent.sty is None and parent.outline is None and (closing.sty is not None or closing.outline is not None):
+            parent.sty, parent.outline = closing.sty, closing.outline
+        if parent.ls is None and closing.ls is not None:
+            parent.ls, parent.ilvl = closing.ls, closing.ilvl
 
     # ---- text
     def flush(self):
@@ -580,6 +605,7 @@ class _Reader:
     def w_plain(self, p, fresh):
         g = self.g
         g.bold = g.hidden = False
+        g.font = None  # the \deff font again
 
     def w_pard(self, p, fresh):
         g = self.g
@@ -602,6 +628,8 @@ class _Reader:
     def w_outline(self, p, fresh):
         if p is not None and 0 <= p <= 8:
             self.g.outline = p
+        elif p == 9:
+            self.g.outline = None  # level 9 is body text: it clears an earlier level
 
     def w_ansicpg(self, p, fresh):
         self.ansicpg = p
@@ -833,7 +861,8 @@ class _Reader:
     def end_paragraph(self, story, g=None):
         """End the paragraph under way in `story`, its properties those of `g` (the current group by default): a
         Heading, a ListItem or a Para, then its pictures, into the cell of the table it is in or the story's blocks.
-        A paragraph that is not in a table ends the story's open table, even an empty one."""
+        A paragraph with something to show that is not in a table ends the story's open table; an empty one does not,
+        so a blank line between `\row` and the next `\trowd` does not split the table."""
         g = g or self.g
         cur, has, extras, mark = story.cur, story.has, story.extras, story.mark
         story.cur, story.has = [], False
@@ -865,7 +894,7 @@ class _Reader:
             for b in blocks:
                 tb.put(b)
         else:
-            if story.tbl is not None:
+            if story.tbl is not None and blocks:  # an empty paragraph between rows and the next \trowd keeps the table
                 self.end_table(story)
             story.blocks.extend(blocks)
 
@@ -924,6 +953,7 @@ class _Reader:
         self.add(story.ref)
         self.stories.append(story)
         self.story = story
+        g.ls, g.ilvl = None, 0  # a note starts with no list state of the paragraph it follows
 
     def w_ftnalt(self, p, fresh):
         if self.story.kind == "note" and self.story.depth == len(self.stack):
@@ -949,6 +979,8 @@ class _Reader:
                 if self.story.cur and self.story.cur[-1] is ref:
                     self.story.cur.pop()
                 return
+            if not ref.hidden and _all_hidden(story.blocks):
+                ref.hidden = "hidden"  # a note whose whole text is hidden follows the hidden rule: so does its mark
             prefix = "en" if story.alt else "fn"
             self.n_notes[prefix] += 1
             ref.id = f"{prefix}-{self.n_notes[prefix]}"
@@ -967,12 +999,19 @@ def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
         data = f.read()  # read once; the BOM and blanks are skipped by a view, not a copy
     head = data[:16]
-    if head.startswith(_ZIP):  # a Word package saved as .rtf
-        from . import ooxml
-        return ooxml.parse(path, ctx)
-    if is_cfb(head):  # a Word binary document saved as .rtf
-        from . import doc
-        return doc.parse(path, ctx)
+    if head.startswith(_ZIP):  # a package saved as .rtf: an OpenDocument one or a Word one
+        return zip_route.parse(path, ctx)
+    if is_cfb(head):  # a compound file saved as .rtf: Word's, or another format's by its streams
+        from . import cfb_route
+        with Compound(path) as cf:
+            other = cfb_route.route(cf, "rtf", "not an RTF file")
+        return cfb_route.parse(other, path, ctx)
+    return parse_bytes(data, ctx)
+
+
+def parse_bytes(data, ctx) -> Doc:
+    """Read RTF held in memory: `parse` after it has sent the zip and compound-file heads on. Nothing touches the
+    disk, so a caller can read bytes it never writes out."""
     i = len(_BOM) if data.startswith(_BOM) else 0
     while i < len(data) and data[i] in _SPACE:
         i += 1

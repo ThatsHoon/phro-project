@@ -378,6 +378,127 @@ def test_style_chain_cut_keeps_near_styles():
     assert out == "p41\n\np33\n\n## p32\n\n## p30\n", out
 
 
+def md_mem(data, hidden=False):
+    """The markdown of RTF bytes read in memory (rtf.parse_bytes): nothing is written to disk."""
+    ctx = Context()
+    d = rtf.parse_bytes(data, ctx)
+    return markdown.render(d, tmp() / "assets", hidden, ctx.skipped)
+
+
+def test_parse_bytes_is_what_parse_reads():
+    data = rb"{\rtf1\ansi Hello {\b world}\par}"
+    assert md_mem(data) == md(data) == "Hello **world**\n"
+    try:
+        rtf.parse_bytes(b"plain", Context())
+        raise AssertionError("expected ReadError")
+    except ReadError as e:
+        assert e.kind == "damaged"
+
+
+def test_shape_property_groups_are_left_out_and_shape_text_is_read():
+    # The control words of a shape's property groups are put together here, in memory, from pieces: a file that
+    # holds them whole is deleted by Defender as an exploit (a false positive). No fixture on disk has them.
+    sp, sn, sv = b"\\s" + b"p", b"\\s" + b"n", b"\\s" + b"v"
+    inst = b"\\sh" + b"pinst"
+    props = b"{" + sp + b"{" + sn + b" pib}{" + sv + b" SECRET}}"
+    # a shape instance leaves its property groups out, and its text box (shptxt) is read
+    data = b"{\\rtf1 a {\\*" + inst + props + b"{\\shptxt shape text}} b}"
+    assert md_mem(data) == "a shape text b\n", md_mem(data)
+    data = b"{\\rtf1 a {" + inst + props + b"{\\shptxt shape text}} b}"
+    assert md_mem(data) == "a shape text b\n", md_mem(data)
+    # property groups on their own, outside any shape instance
+    data = b"{\\rtf1 a " + props + b"b}"
+    assert md_mem(data) == "a b\n", md_mem(data)
+    assert "SECRET" not in md_mem(data, hidden=True)
+    # an object's result is read, its objdata is not
+    data = b"{\\rtf1 x{\\object{\\*\\objdata 0102}{\\result shown}}y}"
+    assert md_mem(data) == "xshowny\n", md_mem(data)
+    # a shape's text found in its instruction group keeps the order of the text around it
+    data = b"{\\rtf1 one {\\*" + inst + props + b"{\\shptxt two}} three}"
+    assert md_mem(data) == "one two three\n"
+
+
+def test_footnote_in_hidden_text_is_not_an_empty_definition():
+    data = rb"{\rtf1 a {\v b{\footnote note}} c}"
+    out = md_mem(data)
+    assert "[^" not in out, out
+    # shown, the hidden note is there with its hidden text
+    out = md_mem(data, hidden=True)
+    assert "(hidden: note)" in out, out
+    # a note whose own text is hidden has no visible reference or definition either
+    out = md_mem(rb"{\rtf1 a {\footnote\v note} c}")
+    assert "[^" not in out, out
+    # a visible note next to a hidden one keeps its number and text
+    out = md_mem(rb"{\rtf1 a {\v b{\footnote hid}} c{\footnote seen}}")
+    assert "[^1]: seen" in out and "HIDNOTE" not in out, out
+
+
+def test_outlinelevel9_clears_the_level():
+    out = md_mem(rb"{\rtf1\pard\outlinelevel1 Two\par\pard\outlinelevel1\outlinelevel9 Body\par}")
+    assert out == "## Two\n\nBody\n", out
+    # 9 is body text; a later level still sets one
+    out = md_mem(rb"{\rtf1\pard\outlinelevel9\outlinelevel2 Three\par}")
+    assert out == "### Three\n", out
+
+
+def test_plain_resets_the_font():
+    # f1 is Cyrillic (charset 204), f0 the default font: the same byte E0 is a different letter
+    head = rb"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fcharset0 A;}{\f1\fcharset204 B;}}"
+    assert md_mem(head + rb"\f1 \'e0\plain\'e0}") == "аà\n"
+    assert md_mem(head + rb"\f1 \'e0\f0 \'e0}") == "аà\n"  # the control run: an explicit \f0
+
+
+def test_heading_paragraph_closed_by_its_own_group_keeps_its_heading():
+    ss = rb"{\stylesheet{\s1 heading 1;}}"
+    assert md_mem(b"{\\rtf1" + ss + rb"{\pard\s1 x}\par}") == "# x\n"
+    assert md_mem(b"{\\rtf1" + ss + rb"{\pard\outlinelevel1 x}\par}") == "## x\n"
+    # a group that ends its own paragraph does not hand the heading to the next one
+    assert md_mem(b"{\\rtf1" + ss + rb"{\pard\s1 x\par}after\par}") == "# x\n\nafter\n"
+    assert md_mem(b"{\\rtf1" + ss + rb"{\pard\s1 x}\par\pard after\par}") == "# x\n\nafter\n"
+
+
+ODT_NS = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+          'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"')
+
+
+def test_odf_zip_named_rtf_or_doc_goes_to_the_odt_reader():
+    from reader.formats import doc as doc_mod
+    members = {
+        "mimetype": "application/vnd.oasis.opendocument.text",
+        "content.xml": (f"<office:document-content {ODT_NS}><office:body><office:text><text:p>odt body</text:p>"
+                        "</office:text></office:body></office:document-content>"),
+    }
+    for name, mod in (("o.rtf", rtf), ("o.doc", doc_mod)):
+        p = make_zip(tmp() / name, members)
+        ctx = Context()
+        d = mod.parse(p, ctx)
+        assert markdown.render(d, tmp() / "assets", False, ctx.skipped) == "odt body\n", name
+    # no mimetype member: the ODF content.xml decides
+    del members["mimetype"]
+    p = make_zip(tmp() / "n.rtf", members, stored=())
+    ctx = Context()
+    assert markdown.render(rtf.parse(p, ctx), tmp() / "assets", False, ctx.skipped) == "odt body\n"
+
+
+def test_zip_and_compound_heads_never_loop_back_to_rtf():
+    # a package with neither a Word nor an ODF body, and a compound file of no known format, are refused whatever
+    # the extension; neither comes back to rtf.parse
+    p = make_zip(tmp() / "e.rtf", {"readme.txt": "x"}, stored=())
+    try:
+        rtf.parse(p, Context())
+        raise AssertionError("expected ReadError")
+    except ReadError as e:
+        assert e.kind == "damaged", e
+    from reader_fix import make_cfb
+    q = tmp() / "c.rtf"
+    make_cfb(q, {"Other": b"x" * 10})
+    try:
+        rtf.parse(q, Context())
+        raise AssertionError("expected ReadError")
+    except ReadError as e:
+        assert e.kind == "damaged", e
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

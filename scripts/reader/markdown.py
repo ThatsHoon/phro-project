@@ -652,7 +652,10 @@ class _Render:
                 nid = self.note_order[i]
                 i += 1
                 if nid in notes:
+                    left_out = self.hidden_count
                     s = " ".join(x for x in (self._flat(b, LINES) for b in notes[nid]) if x)
+                    if not s and self.hidden_count > left_out:
+                        continue  # a note whose whole text is hidden has no definition to show
                     lines.append(f"[^{self.note_no[nid]}]: {s}".rstrip())
             if referenced_done:
                 break

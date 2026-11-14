@@ -306,10 +306,38 @@ def test_text_after_table_is_not_in_it():
 
 
 def test_two_tables_apart():
+    # text between two tables splits them
+    data = (b"{\\rtf1 " + rows((b"A", 1000), (b"B", 2000)) + b"\\pard between\\par\n" + rows((b"C", 1000), (b"D", 2000))
+            + b"}")
+    d, ctx = parse(rtf_file(data))
+    assert [type(b).__name__ for b in d.blocks] == ["Table", "Para", "Table"], d.blocks
+
+
+def test_empty_paragraph_between_rows_does_not_split_the_table():
     data = (b"{\\rtf1 " + rows((b"A", 1000), (b"B", 2000)) + b"\\pard\\par\n" + rows((b"C", 1000), (b"D", 2000))
             + b"}")
     d, ctx = parse(rtf_file(data))
-    assert [type(b).__name__ for b in d.blocks] == ["Table", "Table"], d.blocks
+    t = only_table(d)
+    assert spans(t) == [[("A", 1), ("B", 1)], [("C", 1), ("D", 1)]], spans(t)
+    # several empty paragraphs, and one after the last row, change nothing
+    data = (b"{\\rtf1 " + rows((b"A", 1000)) + b"\\pard\\par\\pard\\par\n" + rows((b"C", 1000)) + b"\\pard\\par after\\par}")
+    d, ctx = parse(rtf_file(data))
+    assert [type(b).__name__ for b in d.blocks] == ["Table", "Para"], d.blocks
+    assert len(d.blocks[0].rows) == 2, d.blocks[0].rows
+
+
+def test_footnote_starts_with_no_list_state():
+    data = rb"{\rtf1 \pard\ls1\ilvl2 item{\footnote note text}\par}"
+    d, ctx = parse(rtf_file(data))
+    assert type(d.blocks[0]).__name__ == "ListItem", d.blocks
+    note = d.notes["fn-1"]
+    assert [type(b).__name__ for b in note] == ["Para"], note
+    # the paragraph after the note is still the list item
+    d, ctx = parse(rtf_file(rb"{\rtf1 \pard\ls1 a{\footnote n} b\par}"))
+    assert [type(b).__name__ for b in d.blocks] == ["ListItem"], d.blocks
+    # a note with its own list state keeps it
+    d, ctx = parse(rtf_file(rb"{\rtf1 a{\footnote\pard\ls1 n}\par}"))
+    assert [type(b).__name__ for b in d.notes["fn-1"]] == ["ListItem"], d.notes
 
 
 def test_cells_past_defined_edges_are_kept():
@@ -379,6 +407,45 @@ def test_nested_row_with_its_own_trleft():
     d, ctx = parse(rtf_file(data))
     inner_t = only_table(d).rows[0][0].blocks[0]
     assert spans(inner_t) == [[("", 1), ("i1", 1)], [("i2", 1), ("i3", 1)]], spans(inner_t)
+
+def grid_of(*row_specs):
+    data = b"{\\rtf1 " + b"".join(lrow(left, cells) for left, cells in row_specs) + b"}"
+    d, ctx = parse(rtf_file(data))
+    return spans(only_table(d))
+
+
+def test_trleft_minus_108_mixed_with_other_left_edges():
+    ab = [(b"a", 1000), (b"b", 2000)]
+    # -108 beside a row that starts right of the left edge: the gap is one column, the -108 rows add none
+    got = grid_of((-108, ab), (1000, [(b"c", 2000)]), (-108, [(b"d", 1000), (b"e", 2000)]))
+    assert got == [[("a", 1), ("b", 1)], [("", 1), ("c", 1)], [("d", 1), ("e", 1)]], got
+    # no \trleft on the first row, -108 after a row with another left edge
+    got = grid_of((None, ab), (1000, [(b"c", 2000)]), (-108, [(b"d", 1000), (b"e", 2000)]))
+    assert got == [[("a", 1), ("b", 1)], [("", 1), ("c", 1)], [("d", 1), ("e", 1)]], got
+    # a row without \trleft keeps the one before it (here -108): no gap invented by a default of 0
+    got = grid_of((-108, ab), (None, [(b"c", 1000), (b"d", 2000)]))
+    assert got == [[("a", 1), ("b", 1)], [("c", 1), ("d", 1)]], got
+    # 0 and -108 are 108 twips apart, far past a cluster: the row at 0 starts one column in, as doc.py's rows do,
+    # and the row at -108 (the table's edge) has its first cell over that column too
+    got = grid_of((0, ab), (-108, ab))
+    assert got == [[("", 1), ("a", 1), ("b", 1)], [("a", 2), ("b", 1)]], got
+
+
+def test_left_edge_clustered_with_or_clamped_to_the_first_edge_leaves_the_right_gap():
+    # row 1 has its left edge 5 twips before its first edge, which row 0 shares: clustered, so no gap before it
+    got = grid_of((None, [(b"a", 1000), (b"b", 2000), (b"c", 3000)]), (995, [(b"d", 1000), (b"e", 2000)]))
+    assert got[1] == [("d", 1), ("e", 1)], got
+    # a left edge past the first edge is clamped just below it: the gap is every column before that edge, however
+    # many, and the first cell takes one column
+    got = grid_of((None, [(b"a", 1000), (b"b", 2000), (b"c", 3000)]), (9000, [(b"d", 2000), (b"e", 3000)]))
+    assert got[1] == [("", 1), ("d", 1), ("e", 1)], got
+    got = grid_of((None, [(b"a", 1000), (b"b", 2000), (b"c", 3000), (b"z", 4000)]),
+                  (9000, [(b"d", 3000), (b"e", 4000)]))
+    assert got[1] == [("", 2), ("d", 1), ("e", 1)], got
+    # left exactly on the first edge
+    got = grid_of((None, [(b"a", 1000), (b"b", 2000), (b"c", 3000)]), (2000, [(b"d", 2000), (b"e", 3000)]))
+    assert got[1] == [("", 1), ("d", 1), ("e", 1)], got
+
 
 def main():
     for name, fn in sorted(globals().items()):

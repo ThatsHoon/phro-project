@@ -58,7 +58,7 @@ from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
-from . import cfb_route, doc_fib, doc_objects, doc_pictures, ooxml
+from . import cfb_route, doc_fib, doc_objects, doc_pictures, zip_route
 from .hancom import flat, lone_equations
 from .word_fields import MAX_INSTR, comment_note, hyperlink_url
 
@@ -905,10 +905,10 @@ class _Reader:
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
         head = f.read(16)
-    if head.startswith(_ZIP):  # a Word package saved as .doc
-        return ooxml.parse(path, ctx)
+    if head.startswith(_ZIP):  # a Word or OpenDocument package saved as .doc
+        return zip_route.parse(path, ctx)
     if head.removeprefix(_BOM).lstrip(b" \t\r\n\x0b\x0c\x00").startswith(_RTF):  # RTF saved as .doc
-        from . import rtf  # rtf.parse sends a compound-file or zip head back here or to ooxml: the heads differ, no loop
+        from . import rtf  # rtf.parse sends a compound-file or zip head to cfb_route or zip_route, never back to rtf: the heads differ, no loop
         return rtf.parse(path, ctx)
     if not is_cfb(head):
         raise ReadError("damaged", "not a Word document")
