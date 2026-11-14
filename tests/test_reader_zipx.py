@@ -199,7 +199,134 @@ def test_parse_xml_ns_finds_nested_declarations():
         assert e.kind == "damaged"
 
 
+def _stream_cells(n):
+    rows, per = 200, n // 200
+    body = "".join(
+        f'<row r="{r}">' + "".join(f'<c r="C{i}R{r}" s="{i % 7}"/>' for i in range(per)) + "</row>"
+        for r in range(1, rows + 1))
+    return make_zip(None, {"s.xml": f"<sheetData>{body}</sheetData>"})
+
+
+def _scan(n):
+    import time
+    data = _stream_cells(n)
+    t0, cells = time.perf_counter(), 0
+    with zipx.Package(data) as pkg, pkg.open("s.xml") as f:
+        for _, el in zipx.iterparse(f):
+            if el.tag == "c":
+                el.get("r"), el.get("s"), el.get("t")
+                cells += 1
+            el.clear()
+    return cells, time.perf_counter() - t0
+
+
+def test_open_streams_member():
+    data = b"<a>" + b"hello" * 1000 + b"</a>"
+    with zipx.Package(make_zip(None, {"x.xml": data})) as pkg, pkg.open("x.xml") as f:
+        assert f.read() == data
+
+
+def test_open_checks_like_read():
+    raw = make_zip(None, {"s.xml": b"<a/>"})
+    p = tmp() / "e.zip"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("s.xml", b"<a/>")
+        z.getinfo("s.xml").flag_bits |= 1
+    with zipx.Package(p) as pkg:
+        raises_kind(lambda: pkg.open("s.xml"), "encrypted")
+    old = limits.ZIP_RATIO_FLOOR
+    limits.ZIP_RATIO_FLOOR = 0
+    try:
+        with zipx.Package(make_zip(None, {"z.bin": bytes(4 * 2**20)})) as pkg:
+            raises_kind(lambda: pkg.open("z.bin"), "too_large")
+    finally:
+        limits.ZIP_RATIO_FLOOR = old
+    with zipx.Package(raw) as pkg:
+        try:
+            pkg.open("nope")
+            assert False
+        except KeyError:
+            pass
+
+
+def test_open_charges_total_once():
+    a, b = b"a" * 100, b"b" * 100
+    old = limits.ZIP_TOTAL
+    limits.ZIP_TOTAL = 100
+    try:
+        with zipx.Package(make_zip(None, {"a.xml": a, "b.xml": b})) as pkg:
+            assert pkg.read("a.xml") == a
+            with pkg.open("a.xml") as f:
+                assert f.read() == a
+            raises_kind(lambda: pkg.open("b.xml"), "too_large")
+    finally:
+        limits.ZIP_TOTAL = old
+
+
+def test_open_damaged_stream():
+    import random
+    rnd = random.Random(1)
+    data = bytes(rnd.randrange(256) for _ in range(4000))
+    raw = bytearray(make_zip(None, {"d.bin": data}))
+    start = 30 + len("d.bin") + 100
+    raw[start:start + 20] = bytes(20)
+    with zipx.Package(bytes(raw)) as pkg, pkg.open("d.bin") as f:
+        raises_kind(lambda: f.read(), "damaged")
+
+
+def _it(data, **kw):
+    import io
+    return list(zipx.iterparse(io.BytesIO(data), **kw))
+
+
+def test_iterparse_events():
+    got = [(e, zipx.local(el.tag)) for e, el in _it(b"<a><r>1</r><r>2</r></a>", events=("start", "end"))]
+    assert got == [("start", "a"), ("start", "r"), ("end", "r"), ("start", "r"), ("end", "r"), ("end", "a")]
+
+
+def test_iterparse_doctype():
+    raises_kind(lambda: _it(b'<!DOCTYPE a [<!ENTITY x "y">]><a>&x;</a>'), "damaged")
+
+
+def test_iterparse_doctype_utf16():
+    text = '<!DOCTYPE a [<!ENTITY x "y">]><a>&x;</a>'
+    raises_kind(lambda: _it(text.encode("utf-16")), "damaged")
+    raises_kind(lambda: _it(text.encode("utf-32-be")), "damaged")
+
+
+def test_doctype_across_chunks():
+    data = b"<?xml ve?>  <!DOCTYPE a><a/>"
+    assert data.index(b"<!DOCTYPE") == 12
+    raises_kind(lambda: _it(data, chunk=16), "damaged")
+
+
+def test_doctype_text_after_root():
+    got = _it(b"<a>" + b"x" * 64 + b"<![CDATA[<!DOCTYPE]]></a>", chunk=16)
+    assert [(e, zipx.local(el.tag)) for e, el in got] == [("end", "a")]
+
+
+def test_iterparse_bad_xml():
+    try:
+        _it(b"<a><b></a>")
+        assert False
+    except ReadError as e:
+        assert e.kind == "damaged" and e.detail.startswith("XML parse error"), e.detail
+
+
+def test_iterparse_fast():
+    cells, secs = _scan(200_000)
+    assert cells == 200_000 and secs < 2.0, (cells, secs)
+
+
+def measure(n=2_000_000):
+    cells, secs = _scan(n)
+    print(f"SCAN {cells} {secs:.2f}")
+
+
 def main():
+    if sys.argv[1:] == ["measure"]:
+        measure()
+        return
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()

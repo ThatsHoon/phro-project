@@ -118,6 +118,57 @@ class Rel:
     external: bool
 
 
+class _Stream:
+    """A zip member's stream whose read turns a damaged member into ReadError("damaged")."""
+
+    def __init__(self, f, real):
+        self._f, self._real = f, real
+
+    def read(self, n=-1):
+        try:
+            return self._f.read(n)
+        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, UnicodeDecodeError) as e:
+            raise ReadError("damaged", f"{self._real}: {e}")
+
+    def close(self):
+        self._f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def iterparse(stream, events=("end",), chunk=65536):
+    """(event, element) pairs from the binary `stream`, parsed incrementally; the caller removes the elements it is
+    done with, nothing is kept here. Until the root starts, a DOCTYPE or ENTITY is refused before its chunk is fed."""
+    want = set(events)
+    parser = ET.XMLPullParser(tuple(want | {"start"}))
+    tail, in_root = b"", False
+    try:
+        while True:
+            data = stream.read(chunk)
+            if not data:
+                break
+            if not in_root:
+                window = tail + data
+                if _declares_entities(window) or _declares_entities(window.replace(b"\x00", b"")):
+                    raise ReadError("damaged", "XML declares a DOCTYPE or ENTITY")
+                tail = window[-64:]
+            parser.feed(data)
+            for ev, el in parser.read_events():
+                in_root = True
+                if ev in want:
+                    yield ev, el
+        parser.close()
+        for ev, el in parser.read_events():
+            if ev in want:
+                yield ev, el
+    except ET.ParseError as e:
+        raise ReadError("damaged", f"XML parse error: {e}")
+
+
 class Package:
     def __init__(self, path: Path):
         """`path` is a path, or the package's bytes (read in memory; every check below is the same)."""
@@ -163,7 +214,8 @@ class Package:
             raise KeyError(name)
         return self._zip.getinfo(real).file_size
 
-    def read(self, name) -> bytes:
+    def _check(self, name) -> zipfile.ZipInfo:
+        """The directory entry of member `name`, after the checks `read` and `open` share; KeyError if absent."""
         real = self._find(name)
         if real is None:
             raise KeyError(name)
@@ -179,10 +231,22 @@ class Package:
                 raise ReadError("too_large", f"{limits.BIG_TOTAL}: zip uncompressed size")
             self._seen.add(real)
             self._total += info.file_size
+        return info
+
+    def read(self, name) -> bytes:
+        info = self._check(name)
         try:  # a UnicodeDecodeError is a local header whose name is flagged UTF-8 and is not
             return self._zip.read(info)
         except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, UnicodeDecodeError) as e:
-            raise ReadError("damaged", f"{real}: {e}")
+            raise ReadError("damaged", f"{info.filename}: {e}")
+
+    def open(self, name):
+        """A context-managed binary stream of member `name`, after the checks `read` makes."""
+        info = self._check(name)
+        try:
+            return _Stream(self._zip.open(info), info.filename)
+        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, UnicodeDecodeError) as e:
+            raise ReadError("damaged", f"{info.filename}: {e}")
 
     def xml(self, name):
         if not self.has(name):
