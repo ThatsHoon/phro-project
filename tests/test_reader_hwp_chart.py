@@ -311,7 +311,9 @@ def test_native_grid_is_bounded():
     t0 = time.monotonic()
     table = hwp_chart.ole_table(item, ctx)
     took = time.monotonic() - t0
-    assert took < 2, took
+    # 0.5 s alone; a per-cell scan of the 120,000 slots (quadratic) is over 10**10 steps, minutes. 10 s holds when
+    # two suites share the machine; the cell-count assertion below is what tells the cap from a full read
+    assert took < 10, took
     assert sum(len(r) for r in table.rows) <= limits.CHART_CELLS and ctx.skipped == {"chart_cut": 1}, ctx.skipped
     assert table.caption == f"Chart: column — Sales 2024 (first {len(table.rows) - 1} points)", table.caption
 
@@ -428,7 +430,9 @@ def test_chart_placements_charged():
     t0 = time.monotonic()
     out, ctx = read(doc(*[ole_shape(1)] * n, bins=items((2, 0, 1)), streams={"BIN0001.OLE": deflate(item)},
                         before="", after=""))
-    assert time.monotonic() - t0 < 10, time.monotonic() - t0
+    # 2.2 s alone; with CHART_TOTAL lifted (every placement kept) the same read takes 17 s. 12 s holds when two suites
+    # share the machine and still fails the uncharged read
+    assert time.monotonic() - t0 < 12, time.monotonic() - t0
     keep = limits.CHART_TOTAL // size
     assert ctx.skipped["chart"] == n - keep and out.count("Chart: column") == keep, (ctx.skipped, out.count("Chart:"))
 

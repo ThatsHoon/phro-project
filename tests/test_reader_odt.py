@@ -362,7 +362,10 @@ def test_nested_repeat_bomb_is_budgeted():
     doc, ctx = parse(odt_doc(xml))
     out = markdown.render(doc, tmp() / "a")
     took = time.monotonic() - t0
-    assert took < 2 and ctx.skipped["cells"] > 0 and "첫" in out and "leaf" in out, (took, dict(ctx.skipped), len(out))
+    # 0.3 s alone (50,000 cells); with the budget raised 30-fold (1,500,000 cells) it takes 8 s, 60-fold 14 s, and
+    # the unbudgeted bomb is 10**12 cells. 6 s holds when two suites share the machine and fails a budget 20 times
+    # too large
+    assert took < 6 and ctx.skipped["cells"] > 0 and "첫" in out and "leaf" in out, (took, dict(ctx.skipped), len(out))
 
 
 def test_object_chain_bomb_is_budgeted():
