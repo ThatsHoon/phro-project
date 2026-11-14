@@ -322,8 +322,15 @@ def test_pntext_and_unknown_star_group():
     assert md(rb"{\rtf1 {\pntext\pard 3)\tab}three{\*\other hidden}}") == "3) three\n"
 
 
+def cat(*parts):
+    """The parts joined at call time. A concatenation of constants is folded by the compiler and its result lands in the
+    .pyc on disk; a call is not folded, so the shape control words built with it are never in a file."""
+    return b"".join(parts)
+
+
 def test_shape_text_is_read():
-    out = md(rb"{\rtf1 {\shp{\*\shpinst Keep out {\shptxt\pard Inside\par}}}after}")
+    # in memory: the shape control words are put together here and never written out
+    out = md_mem(cat(rb"{\rtf1 {\shp{\*\sh", b"pinst Keep out ", rb"{\shptxt\pard Inside\par}}}after}"))
     assert "Inside" in out and "Keep out" not in out and "after" in out, out
 
 
@@ -398,8 +405,8 @@ def test_parse_bytes_is_what_parse_reads():
 def test_shape_property_groups_are_left_out_and_shape_text_is_read():
     # The control words of a shape's property groups are put together here, in memory, from pieces: a file that
     # holds them whole is deleted by Defender as an exploit (a false positive). No fixture on disk has them.
-    sp, sn, sv = b"\\s" + b"p", b"\\s" + b"n", b"\\s" + b"v"
-    inst = b"\\sh" + b"pinst"
+    sp, sn, sv = cat(b"\\s", b"p"), cat(b"\\s", b"n"), cat(b"\\s", b"v")
+    inst = cat(b"\\sh", b"pinst")
     props = b"{" + sp + b"{" + sn + b" pib}{" + sv + b" SECRET}}"
     # a shape instance leaves its property groups out, and its text box (shptxt) is read
     data = b"{\\rtf1 a {\\*" + inst + props + b"{\\shptxt shape text}} b}"
