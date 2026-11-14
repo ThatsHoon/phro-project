@@ -174,7 +174,7 @@ class _Field:
 class _Story:
     """Where text goes: the body, a note, a header or a footer, with its paragraph under way and its open fields."""
     __slots__ = ("kind", "depth", "cur", "has", "pars", "fields", "blocks", "ref", "alt", "tbl", "mark", "mark_len",
-                 "extras", "kept")
+                 "extras", "kept", "pard")
 
     def __init__(self, kind, depth):
         self.kind, self.depth = kind, depth
@@ -190,6 +190,7 @@ class _Story:
         self.mark_len = 0
         self.extras = []     # Images of the paragraph under way
         self.kept = None     # (sty, outline, ls, ilvl) a group closed inside the paragraph under way left to it
+        self.pard = False    # a \pard came after the story's last \row: an empty paragraph then ends the table
 
 
 def _plain(inlines) -> str:
@@ -616,7 +617,9 @@ class _Reader:
         g.ilvl = g.itap = 0
         g.in_table = False
         if self.live():
-            self.story.kept = None  # what a closed group left to the paragraph is reset with it
+            story = self.story
+            story.kept = None  # what a closed group left to the paragraph is reset with it
+            story.pard = True
 
     def w_s(self, p, fresh):
         g = self.g
@@ -739,6 +742,7 @@ class _Reader:
             getattr(self.tbl_at(max(g.itap, 2) if nested else 1), op)()
             if op == "row" and not nested:
                 g.in_table, g.itap = False, 0  # what follows is a table paragraph only if it says so
+                self.story.pard = False
         return end
 
     def w_trleft(self, p, fresh):
@@ -866,8 +870,9 @@ class _Reader:
     def end_paragraph(self, story, g=None):
         """End the paragraph under way in `story`, its properties those of `g` (the current group by default): a
         Heading, a ListItem or a Para, then its pictures, into the cell of the table it is in or the story's blocks.
-        A paragraph with something to show that is not in a table ends the story's open table; an empty one does not,
-        so a blank line between `\row` and the next `\trowd` does not split the table."""
+        A paragraph that is not in a table ends the story's open table when it has something to show, or when a
+        `\\pard` came after the last `\\row`: an empty `\\pard ...\\par` is how Word separates two tables. Only a bare
+        `\\par` between `\\row` and the next `\\trowd`, with no `\\pard`, is a stray break that keeps the table."""
         g = g or self.g
         cur, has, extras, mark = story.cur, story.has, story.extras, story.mark
         story.cur, story.has = [], False
@@ -906,7 +911,7 @@ class _Reader:
             for b in blocks:
                 tb.put(b)
         else:
-            if story.tbl is not None and blocks:  # an empty paragraph between rows and the next \trowd keeps the table
+            if story.tbl is not None and (blocks or story.pard):  # a bare \par after \row keeps the table
                 self.end_table(story)
             story.blocks.extend(blocks)
 

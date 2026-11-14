@@ -306,21 +306,34 @@ def test_text_after_table_is_not_in_it():
 
 
 def test_two_tables_apart():
-    # text between two tables splits them
+    # an empty paragraph after a \pard that follows \row is Word's separator between two tables
+    data = (b"{\\rtf1 " + rows((b"A", 1000), (b"B", 2000)) + b"\\pard\\par\n" + rows((b"C", 1000), (b"D", 2000))
+            + b"}")
+    d, ctx = parse(rtf_file(data))
+    assert [type(b).__name__ for b in d.blocks] == ["Table", "Table"], d.blocks
+    # text between two tables splits them too
     data = (b"{\\rtf1 " + rows((b"A", 1000), (b"B", 2000)) + b"\\pard between\\par\n" + rows((b"C", 1000), (b"D", 2000))
             + b"}")
     d, ctx = parse(rtf_file(data))
     assert [type(b).__name__ for b in d.blocks] == ["Table", "Para", "Table"], d.blocks
 
 
+def test_tables_of_other_edges_apart_are_two_gfm_tables():
+    data = (b"{\\rtf1 " + rows((b"A", 1000), (b"B", 2000)) + rows((b"C", 1000), (b"D", 2000)) + b"\\pard\\par\n"
+            + rows((b"E", 1500), (b"F", 3000)) + rows((b"G", 1500), (b"H", 3000)) + b"}")
+    out = md(data)
+    assert out == "|A|B|\n|---|---|\n|C|D|\n\n|E|F|\n|---|---|\n|G|H|\n", out
+
+
 def test_empty_paragraph_between_rows_does_not_split_the_table():
-    data = (b"{\\rtf1 " + rows((b"A", 1000), (b"B", 2000)) + b"\\pard\\par\n" + rows((b"C", 1000), (b"D", 2000))
+    # a bare \par between \row and the next \trowd, with no \pard, is a stray break inside the table
+    data = (b"{\\rtf1 " + rows((b"A", 1000), (b"B", 2000)) + b"\\par\n" + rows((b"C", 1000), (b"D", 2000))
             + b"}")
     d, ctx = parse(rtf_file(data))
     t = only_table(d)
     assert spans(t) == [[("A", 1), ("B", 1)], [("C", 1), ("D", 1)]], spans(t)
-    # several empty paragraphs, and one after the last row, change nothing
-    data = (b"{\\rtf1 " + rows((b"A", 1000)) + b"\\pard\\par\\pard\\par\n" + rows((b"C", 1000)) + b"\\pard\\par after\\par}")
+    # several bare ones, and one after the last row, change nothing
+    data = (b"{\\rtf1 " + rows((b"A", 1000)) + b"\\par\\par\n" + rows((b"C", 1000)) + b"\\par after\\par}")
     d, ctx = parse(rtf_file(data))
     assert [type(b).__name__ for b in d.blocks] == ["Table", "Para"], d.blocks
     assert len(d.blocks[0].rows) == 2, d.blocks[0].rows
