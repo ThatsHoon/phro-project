@@ -4,7 +4,9 @@ The XOR password check and array, the clear-record list and the per-record array
 `crypto/legacy.py` (`_xor_array_bytes`, `decrypt_xls_workbook`). The XOR pass works on whole record bodies: the body is
 rotated through a `bytes.translate` table and XORed with the array in one `int.from_bytes` operation, so no byte loop
 runs. RC4 keys one keystream per 1024-byte block of the stream (the block number is the stream offset // 1024), never
-per record. Offsets and record sizes stay the same, so BOUNDSHEET offsets still point at the right place.
+per record. Offsets and record sizes stay the same, so BOUNDSHEET offsets still point at the right place. Only whole
+records are decrypted: one that runs past the stream, and the bytes after it, pass through as they are, so the clear
+walk counts the short record exactly as it does in a clear workbook.
 """
 import struct
 
@@ -80,19 +82,21 @@ def xor_array(password: str, key: int) -> bytes:
 
 
 def _records(data: bytes, start: int):
-    """(id, header offset, body end) of each raw record from `start`; CONTINUE counts as a record of its own."""
+    """([(id, header offset, body end)] of each whole record from `start`, the offset where they stop). CONTINUE counts
+    as a record of its own. A record that runs past the stream ends the list: it and the bytes after it are the tail,
+    left as they are, so the clear walk meets the short record and counts it as it does in a clear workbook."""
     out = []
     pos, n = start, len(data)
     while pos + 4 <= n:
         rid, size = struct.unpack_from("<HH", data, pos)
         end = pos + 4 + size
         if end > n:
-            raise ReadError("damaged", "truncated record in an encrypted workbook")
+            break
         out.append((rid, pos, end))
         if len(out) > limits.BIN_RECORDS:
             raise ReadError("damaged", "too many records")
         pos = end
-    return out
+    return out, pos
 
 
 def decrypt(data: bytes, filepass: biff.Rec, password: str = XLS_DEFAULT) -> bytes | None:
@@ -134,7 +138,7 @@ def decrypt(data: bytes, filepass: biff.Rec, password: str = XLS_DEFAULT) -> byt
 def _xor(data: bytes, start: int, array: bytes) -> bytes:
     out = bytearray(data)
     rot = array.translate(_ROT_LEFT)
-    for rid, pos, end in _records(data, start):
+    for rid, pos, end in _records(data, start)[0]:  # the tail is left as it is
         body = pos + 4
         n = end - body
         if rid in CLEAR or not n:
@@ -158,10 +162,12 @@ def _rc4(data: bytes, start: int, keys) -> bytes:
         parts.append(crypto.rc4(keys(block), data[pos:stop], skip=pos - block * 1024))
         pos = stop
     out = bytearray(b"".join(parts))
-    for rid, p, end in _records(data, start):
+    whole, tail = _records(data, start)
+    for rid, p, end in whole:
         out[p:p + 4] = data[p:p + 4]
         if rid in CLEAR:
             out[p + 4:end] = data[p + 4:end]
         elif rid == _BOUNDSHEET:
             out[p + 4:min(p + 8, end)] = data[p + 4:min(p + 8, end)]
+    out[tail:] = data[tail:]  # a record cut short, and anything after it, passes through as it is
     return bytes(out)

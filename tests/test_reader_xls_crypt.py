@@ -61,6 +61,27 @@ def test_cryptoapi_velvet():
     check("cryptoapi40")
 
 
+def test_truncated_encrypted_like_clear():
+    """A stream cut inside its last record reads as the clear workbook cut the same way: the first sheet, and the
+    short record counted, never the whole file denied."""
+    from reader.formats import sheet_grid, xls
+    from reader.model import Context
+    from reader_fix import biff_workbook
+    sheets = [{"name": "A", "cells": {(0, 0): "alpha", (1, 0): 1.5}},
+              {"name": "B", "cells": {(0, 0): "beta", (1, 0): 2.5, (2, 0): "gamma"}}]
+
+    def read(data):
+        ctx = Context()
+        secs = xls.Workbook(data[:-7], ctx, sheet_grid.Budget()).sections()
+        return [(s.title, [str(b) for b in s.blocks]) for s in secs], dict(ctx.skipped)
+
+    clear = read(biff_workbook(sheets))
+    assert clear[0][0][0] == "A" and clear[1] == {"record": 1}, clear
+    for kind in ("cryptoapi", "xor"):
+        got = read(encrypt_xls(sheets, "VelvetSweatshop", kind))
+        assert got == clear, (kind, got, clear)
+
+
 def test_user_password():
     for kind in ("xor", "rc4", "cryptoapi", "cryptoapi40"):
         got = denied(lambda: convert(encrypt_xls(SHEETS, "secret", kind)))
