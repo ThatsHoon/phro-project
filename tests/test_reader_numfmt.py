@@ -145,6 +145,15 @@ def test_korean_date_tokens():
     assert display(45000.75, "[$-412]AM/PM h:mm") == "오후 6:00"
 
 
+def test_korean_locale_names():
+    # 45000 is 2023-03-15, a Wednesday; under [$-412] month and day names are Korean like AM/PM
+    assert display(45000, "[$-412]yyyy년 mmmm d일 dddd") == "2023년 3월 15일 수요일"
+    assert display(45000, "[$-412]mmm ddd") == "3월 수"
+    assert display(45000, "[$-412]mmmm") == "3월"
+    assert display(45000, "mmmm ddd") == "March Wed"          # no locale tag: English names stay
+    assert display(45000, "[$-409]mmm dddd") == "Mar Wednesday"
+
+
 def test_weekday_only():
     """A section whose only date token is the Korean weekday is still a date: 45000 is a Wednesday."""
     assert display(45000, "aaa") == "수", display(45000, "aaa")

@@ -413,10 +413,18 @@ def _datetime(v: float, section, date1904: bool):
                 out.append(f"{year % 100:02d}" if count <= 2 else f"{year:04d}")
             elif letter == "m":
                 name = _MONTHS[month - 1] if month else ""
-                out.append(str(month).zfill(count) if count <= 2 else name[:3] if count == 3
-                           else name if count == 4 else name[:1])
+                if locale == "412" and month and count in (3, 4):
+                    out.append(f"{month}월")  # Korean month names are the number and 월, short or long
+                else:
+                    out.append(str(month).zfill(count) if count <= 2 else name[:3] if count == 3
+                               else name if count == 4 else name[:1])
             elif letter == "d":
-                out.append(str(dom).zfill(count) if count <= 2 else _DAYS[wday][:3] if count == 3 else _DAYS[wday])
+                if count <= 2:
+                    out.append(str(dom).zfill(count))
+                elif locale == "412":
+                    out.append(_KO_DAYS[wday] if count == 3 else _KO_DAYS[wday] + "요일")
+                else:
+                    out.append(_DAYS[wday][:3] if count == 3 else _DAYS[wday])
             elif letter == "h":
                 out.append(str(hour24 % 12 or 12 if has_ampm else hour24).zfill(count))
             elif letter == "i":
