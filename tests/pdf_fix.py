@@ -5,12 +5,17 @@ loads it by file path can import `reader`.
 
     simple_pdf([text_ops("Hi")])                       a one-page pdf
     make_pdf({1: {...}, 2: ...}, xref="stream", objstm=True)
+    make_pdf(objects, encrypt=EncryptSpec(4))          # the standard security handler
 """
+import hashlib
+import struct
 import sys
 import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from reader.containers.crypto import aes_cbc_encrypt, aes_ecb_encrypt, rc4  # noqa: E402
 
 
 class Name(str):
@@ -92,22 +97,185 @@ def pdf_obj(value):
     raise TypeError(f"cannot serialize {type(value).__name__}")
 
 
-def _stream_bytes(stream):
+def _stream_bytes(stream, enc=None, num=0):
     data = stream.data
     dictionary = dict(stream.dictionary)
     if stream.flate:
         data = zlib.compress(data)
         dictionary["Filter"] = Name("FlateDecode")
+    if enc is not None:
+        dictionary = enc.value(dictionary, num)
+        if not enc.clear_stream(dictionary):
+            data = enc.data(num, data, enc.stream_cipher)
     dictionary.setdefault("Length", len(data))
     return pdf_obj(dictionary) + b"\nstream\n" + data + b"\nendstream"
 
 
-def _body(value):
-    return _stream_bytes(value) if isinstance(value, Stream) else pdf_obj(value)
+def _body(value, enc=None, num=0):
+    if isinstance(value, Stream):
+        return _stream_bytes(value, enc, num)
+    return pdf_obj(enc.value(value, num) if enc is not None else value)
+
+
+_PAD = bytes([
+    0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
+    0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A])
+_ID0 = b"phro-fixture-id-0"
+_PERMS = 0xFFFFF0C0 - 2**32  # a signed 32-bit /P
+
+
+class EncryptSpec:
+    """The standard security handler for make_pdf(encrypt=...).
+
+    revision 2 (RC4 40-bit), 3 (RC4 128-bit), 4 (V4: AESV2 when aes, else V2) or 6 (AESV3);
+    `user` and `owner` are the passwords; metadata=False writes /EncryptMetadata false and
+    leaves /Type /Metadata streams clear; `stream_filter="Identity"` (revision 4 or 6) leaves
+    every stream clear; `filter` is the /Filter name, and a handler other than Standard
+    encrypts nothing.
+    """
+
+    def __init__(self, revision, user=b"", owner=b"owner", aes=True, metadata=True,
+                 filter="Standard", stream_filter="StdCF"):
+        if revision not in (2, 3, 4, 6):
+            raise ValueError("revision must be 2, 3, 4 or 6")
+        self.revision, self.user, self.owner = revision, bytes(user), bytes(owner)
+        self.aes, self.metadata, self.filter = aes, metadata, filter
+        self.stream_filter = stream_filter
+        self.id0 = _ID0
+        self.cipher = "aesv3" if revision == 6 else "aesv2" if revision == 4 and aes else "rc4"
+        self.stream_cipher = "identity" if stream_filter == "Identity" else self.cipher
+        self.bits = 40 if revision == 2 else 128
+        self.key = self._file_key()
+
+    # -- algorithms 2-5 (R2-R4) and 8-10 (R6) --
+
+    def _file_key(self):
+        n = self.bits // 8
+        if self.revision == 6:
+            self.file_key = bytes(range(1, 33))
+            self._r6_entries()
+            return self.file_key
+        pad = lambda pw: (pw + _PAD)[:32]  # noqa: E731
+        key = hashlib.md5(pad(self.owner)).digest()
+        if self.revision >= 3:
+            for _ in range(50):
+                key = hashlib.md5(key).digest()
+        okey = key[:n]
+        o = rc4(okey, pad(self.user))
+        if self.revision >= 3:
+            for i in range(1, 20):
+                o = rc4(bytes(b ^ i for b in okey), o)
+        self.o = o
+        md = hashlib.md5(pad(self.user) + o + struct.pack("<i", _PERMS) + self.id0)
+        if self.revision >= 4 and not self.metadata:
+            md.update(b"\xff\xff\xff\xff")
+        key = md.digest()
+        if self.revision >= 3:
+            for _ in range(50):
+                key = hashlib.md5(key[:n]).digest()
+        key = key[:n]
+        if self.revision == 2:
+            self.u = rc4(key, _PAD)
+        else:
+            u = rc4(key, hashlib.md5(_PAD + self.id0).digest())
+            for i in range(1, 20):
+                u = rc4(bytes(b ^ i for b in key), u)
+            self.u = u + b"\0" * 16
+        return key
+
+    @staticmethod
+    def _hash2b(password, salt, udata):
+        k = hashlib.sha256(password + salt + udata).digest()
+        i = 0
+        while True:
+            e = aes_cbc_encrypt(k[:16], k[16:32], (password + k + udata) * 64)
+            k = (hashlib.sha256, hashlib.sha384,
+                 hashlib.sha512)[int.from_bytes(e[:16], "big") % 3](e).digest()
+            i += 1
+            if i >= 64 and i >= e[-1] + 32:
+                return k[:32]
+
+    def _r6_entries(self):
+        user, owner = self.user[:127], self.owner[:127]
+        uv, uk, ov, ok = b"uvalidat", b"ukeysalt", b"ovalidat", b"okeysalt"
+        self.u = self._hash2b(user, uv, b"") + uv + uk
+        self.ue = aes_cbc_encrypt(self._hash2b(user, uk, b""), b"\0" * 16, self.file_key)
+        self.o = self._hash2b(owner, ov, self.u) + ov + ok
+        self.oe = aes_cbc_encrypt(self._hash2b(owner, ok, self.u), b"\0" * 16, self.file_key)
+        perms = (struct.pack("<i", _PERMS) + b"\xff\xff\xff\xff"
+                 + (b"T" if self.metadata else b"F") + b"adb" + b"perm")
+        self.perms = aes_ecb_encrypt(self.file_key, perms)
+
+    # -- the /Encrypt dictionary --
+
+    def dictionary(self):
+        d = {"Filter": Name(self.filter), "P": _PERMS, "R": self.revision}
+        if self.revision == 2:
+            d.update(V=1, Length=40)
+        elif self.revision == 3:
+            d.update(V=2, Length=128)
+        elif self.revision == 4:
+            cfm = "AESV2" if self.aes else "V2"
+            d.update(V=4, Length=128, StmF=Name(self.stream_filter), StrF=Name("StdCF"),
+                     CF={"StdCF": {"CFM": Name(cfm), "AuthEvent": Name("DocOpen"), "Length": 16}})
+        else:
+            d.update(V=5, Length=256, StmF=Name(self.stream_filter), StrF=Name("StdCF"),
+                     CF={"StdCF": {"CFM": Name("AESV3"), "AuthEvent": Name("DocOpen"),
+                                   "Length": 32}},
+                     OE=self.oe, UE=self.ue, Perms=self.perms)
+        if not self.metadata:
+            d["EncryptMetadata"] = False
+        d.update(O=self.o, U=self.u)
+        return d
+
+    # -- encrypting objects (algorithm 1) --
+
+    def data(self, num, data, cipher, gen=0):
+        if cipher == "identity" or not data or self.filter != "Standard":
+            return data
+        if cipher == "aesv3":
+            key = self.key
+        else:
+            md = hashlib.md5(self.key + struct.pack("<I", num)[:3] + struct.pack("<I", gen)[:2]
+                             + (b"sAlT" if cipher == "aesv2" else b""))
+            key = md.digest()[:min(len(self.key) + 5, 16)]
+        if cipher == "rc4":
+            return rc4(key, data)
+        iv = hashlib.md5(b"iv" + data + struct.pack("<I", num)).digest()
+        pad = 16 - len(data) % 16
+        return iv + aes_cbc_encrypt(key, iv, data + bytes([pad]) * pad)
+
+    def value(self, value, num):
+        """`value` with every string encrypted for object `num` (names and references stay)."""
+        if isinstance(value, (Name, Ref)):
+            return value
+        if isinstance(value, str):
+            try:
+                raw = value.encode("ascii")
+            except UnicodeEncodeError:
+                raw = b"\xfe\xff" + value.encode("utf-16-be")
+            return self.data(num, raw, self.cipher)
+        if isinstance(value, (bytes, bytearray)):
+            return self.data(num, bytes(value), self.cipher)
+        if isinstance(value, dict):
+            return {k: self.value(v, num) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.value(v, num) for v in value]
+        return value
+
+    def clear_stream(self, dictionary):
+        if not self.metadata and str(dictionary.get("Type", "")) == "Metadata":
+            return True
+        filters, parms = dictionary.get("Filter"), dictionary.get("DecodeParms")
+        for i, name in enumerate(filters if isinstance(filters, list) else []):
+            if str(name) == "Crypt":  # the stream's own crypt filter, Identity here
+                parm = parms[i] if isinstance(parms, list) and i < len(parms) else {}
+                return str((parm or {}).get("Name", "Identity")) == "Identity"
+        return False
 
 
 def make_pdf(objects, *, root=1, xref="table", objstm=False, trailer=None,
-             header=b"%PDF-1.7", junk=b"", shift=0):
+             header=b"%PDF-1.7", junk=b"", shift=0, encrypt=None):
     """Serialize `objects` ({number: value}) to a pdf.
 
     xref: "table" (classic), "stream" (a cross-reference stream) or "none" (no xref and no
@@ -115,7 +283,9 @@ def make_pdf(objects, *, root=1, xref="table", objstm=False, trailer=None,
     that first; ISO 32000 counts from byte 0, which differs only when `junk` precedes the
     header) unless `shift` moves every xref entry by that many bytes. `junk` goes before
     the header. With objstm=True every object other than streams and the root goes into one
-    object stream; that needs xref="stream".
+    object stream; that needs xref="stream". With encrypt=EncryptSpec(...) every string and
+    stream is encrypted (objects inside the object stream are not: the stream is), /Encrypt
+    and /ID go in the trailer, and the xref stream stays clear.
     """
     if objstm and xref != "stream":
         raise ValueError("objstm=True needs xref='stream'")
@@ -126,11 +296,18 @@ def make_pdf(objects, *, root=1, xref="table", objstm=False, trailer=None,
         packed = [n for n in sorted(objects) if n != root and not isinstance(objects[n], Stream)]
     out = bytearray(header + b"\n%\xe2\xe3\xcf\xd3\n")
     offsets = {}
+    extra = dict(trailer or {})
+    if encrypt is not None:
+        enc_num = next_num
+        next_num += 1
+        extra.update(Encrypt=Ref(enc_num), ID=[encrypt.id0, encrypt.id0])
+        offsets[enc_num] = len(out)  # the /Encrypt dictionary is written in the clear
+        out += b"%d 0 obj\n" % enc_num + pdf_obj(encrypt.dictionary()) + b"\nendobj\n"
     for num in sorted(objects):
         if num in packed:
             continue
         offsets[num] = len(out)
-        out += b"%d 0 obj\n" % num + _body(objects[num]) + b"\nendobj\n"
+        out += b"%d 0 obj\n" % num + _body(objects[num], encrypt, num) + b"\nendobj\n"
     compressed = {}
     if packed:
         stm_num = next_num
@@ -146,9 +323,8 @@ def make_pdf(objects, *, root=1, xref="table", objstm=False, trailer=None,
         stm = Stream({"Type": Name("ObjStm"), "N": len(packed), "First": len(head_bytes)},
                      head_bytes + b"\n".join(bodies), flate=True)
         offsets[stm_num] = len(out)
-        out += b"%d 0 obj\n" % stm_num + _stream_bytes(stm) + b"\nendobj\n"
+        out += b"%d 0 obj\n" % stm_num + _stream_bytes(stm, encrypt, stm_num) + b"\nendobj\n"
     size = next_num
-    extra = dict(trailer or {})
     if xref == "table":
         start = len(out)
         entries = [b"0000000000 65535 f \n"]

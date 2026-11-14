@@ -1,8 +1,9 @@
 """pdf file structure: startxref, xref tables and streams, object streams, trailer, page tree.
 
-Port of dochan 1.21.0 pdf/structure.py (MIT), without its encryption setup (the standard
-security handler comes with crypto.py). A broken xref, or an offset that is not an object
-header, is rebuilt by scanning for `N G obj`.
+Port of dochan 1.21.0 pdf/structure.py (MIT). A broken xref, or an offset that is not an
+object header, is rebuilt by scanning for `N G obj`. An encrypted file opens its security
+handler (crypto.py) once the structure is read; objects fetched after that are decrypted.
+Strings inside an object stream come out of the stream's own decryption only.
 """
 import bisect
 import re
@@ -10,6 +11,7 @@ from collections import Counter, OrderedDict, deque
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..limits import ReadError
+from .crypto import StandardSecurityHandler, open_handler
 from .filters import DecodeBudget, decode_stream
 from .objects import (PDFLexer, PDFRef, PDFStream, PDFSyntaxError,
                       parse_indirect_object, parse_object_stream)
@@ -31,6 +33,20 @@ _OBJ_RE = re.compile(rb"(?<!\d)(\d{1,10})\s+(\d{1,5})\s+obj\b")
 _HEADER_AT_RE = re.compile(rb"[\x00\t\n\x0c\r ]*\d{1,10}\s+\d{1,5}\s+obj\b")
 _ENCRYPT_RE = re.compile(rb"/Encrypt\s+\d+\s+\d+\s+R")
 _CATALOG_RE = re.compile(rb"/Type\s*/Catalog(?![A-Za-z0-9])")
+
+
+def _identity_crypt(dictionary: dict) -> bool:
+    """True when the stream's own /Crypt filter names the Identity filter: it is not encrypted."""
+    filters = dictionary.get("Filter")
+    parms = dictionary.get("DecodeParms", dictionary.get("DP"))
+    if not isinstance(filters, list):
+        filters, parms = [filters], [parms]
+    elif not isinstance(parms, list):
+        parms = [parms] * len(filters)
+    for name, parm in zip(filters, parms):
+        if str(name) == "Crypt":
+            return not isinstance(parm, dict) or str(parm.get("Name", "Identity")) == "Identity"
+    return False
 
 
 class PDFFile:
@@ -65,11 +81,13 @@ class PDFFile:
         self._compressed: Dict[int, Tuple[int, int]] = {}
         self._objstm_cache: Dict[int, Tuple[list, Dict[int, Any]]] = {}
         self._catalog: Optional[dict] = None
+        # The security handler lives outside _reset: a junk-preamble retry keeps it.
+        self._handler: Optional[StandardSecurityHandler] = None
+        self._encrypt_num: Optional[int] = None
         if header < 0:
             self.warnings.append("WARN: no %PDF- header in the first 1024 bytes")
         self._parse_structure()
-        if self.trailer.get("Encrypt") is not None:
-            raise ReadError("encrypted", "not supported yet")
+        self._open_encryption()
         if not self.catalog:
             raise ReadError("damaged", "no catalog")
 
@@ -332,6 +350,69 @@ class PDFFile:
                 self.trailer["Root"] = PDFRef(num, 0)
                 return
 
+    # -- encryption --
+
+    def _open_encryption(self) -> None:
+        """Open the security handler named by the trailer's /Encrypt, with the trailer's /ID."""
+        entry = self.trailer.get("Encrypt")
+        if entry is None:
+            return
+        if isinstance(entry, PDFRef):
+            self._encrypt_num = entry.num
+        encrypt = self.resolve(entry)
+        if not isinstance(encrypt, dict):
+            raise ReadError("encrypted", "encryption dictionary not found")
+        ids = self.resolve(self.trailer.get("ID"))
+        id0 = ids[0] if isinstance(ids, list) and ids and isinstance(ids[0], bytes) else b""
+        # The dictionary's values may be indirect (/CF, the filter names); one level is read.
+        flat = {key: self.resolve(value) for key, value in encrypt.items()}
+        if isinstance(flat.get("CF"), dict):
+            flat["CF"] = {name: self.resolve(item) for name, item in flat["CF"].items()}
+        self._handler = open_handler(flat, id0, self.password)
+        # What was read before the handler existed is still ciphertext.
+        self._cache = {}
+        self._decoded_cache = {}
+        self._objstm_cache = {}
+
+    def _decrypt_object(self, num: int, gen: int, obj: Any) -> Any:
+        """Decrypt the strings and the stream bytes of one indirect object."""
+        handler = self._handler
+        if handler is None or num == self._encrypt_num:
+            return obj
+        if isinstance(obj, PDFStream):
+            kind = str(obj.dictionary.get("Type", ""))
+            if kind == "XRef":
+                return obj
+            obj.dictionary = self._decrypt_value(num, gen, obj.dictionary)
+            if (kind == "Metadata" and not handler.encrypt_metadata) or _identity_crypt(obj.dictionary):
+                return obj
+            try:
+                obj.raw = handler.decrypt(num, gen, obj.raw)
+            except ReadError as e:
+                if e.kind != "too_large":
+                    raise
+                obj.raw = b""
+                self._cut("decrypt_budget", "WARN: the decryption budget is spent; streams are dropped")
+            return obj
+        return self._decrypt_value(num, gen, obj)
+
+    def _decrypt_value(self, num: int, gen: int, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                obj[key] = self._decrypt_value(num, gen, value)
+            return obj
+        if isinstance(obj, list):
+            return [self._decrypt_value(num, gen, v) for v in obj]
+        if isinstance(obj, bytes):
+            try:
+                return self._handler.decrypt(num, gen, obj, string=True)
+            except ReadError as e:
+                if e.kind != "too_large":
+                    raise
+                self._cut("decrypt_budget", "WARN: the decryption budget is spent; strings are dropped")
+                return b""
+        return obj
+
     # -- objects --
 
     def get_object(self, ref: PDFRef) -> Any:
@@ -358,7 +439,7 @@ class PDFFile:
         self._cache[ref.num] = None  # guard against reference cycles
         recovered = []
         try:
-            num, _gen, obj = parse_indirect_object(
+            num, gen, obj = parse_indirect_object(
                 self.data, offset, resolve=self.resolve, recovered=recovered,
                 cuts=self.cuts)
         except PDFSyntaxError as e:
@@ -383,6 +464,8 @@ class PDFFile:
             self._warn_once("WARN: a collection passed its item cap or nesting cap; content was dropped")
         if recovered:
             self.warnings.append(f"WARN: object {ref.num}: skipped an unbalanced ')' after a string")
+        if self._handler is not None:
+            obj = self._decrypt_object(ref.num, gen, obj)
         self._cache[ref.num] = obj
         return obj
 

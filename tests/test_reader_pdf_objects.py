@@ -106,7 +106,7 @@ def test_encrypted_refused():
     try:
         PDFFile(data)
     except ReadError as e:
-        assert (e.kind, e.detail) == ("encrypted", "not supported yet")
+        assert (e.kind, e.detail) == ("encrypted", "encryption dictionary not found")
     else:
         raise AssertionError("expected ReadError")
 
