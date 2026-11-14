@@ -15,7 +15,7 @@ from reader import limits  # noqa: E402
 from reader.formats import xls_alike  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader_fix import make_zip  # noqa: E402
+from reader_fix import bad_name_zip, make_zip  # noqa: E402
 
 
 def run(data):
@@ -105,6 +105,11 @@ def test_zip_named_xls_is_named_by_what_it_holds():
                 assert (e.kind, e.detail) == ("unsupported", want), (e.kind, e.detail)
             else:
                 raise AssertionError("expected a ReadError")
+
+
+def test_zip_named_xls_with_a_name_that_is_not_utf8():
+    """A member name flagged UTF-8 that is not leaves the zip unread, so it is named as the xlsx it most likely is."""
+    assert denied(bad_name_zip()) == ("unsupported", "xlsx workbook saved as .xls")
 
 
 def test_cut_inside_multibyte_char():

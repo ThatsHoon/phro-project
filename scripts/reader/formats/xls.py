@@ -278,7 +278,7 @@ def _zip_detail(path) -> str:
         with Package(path) as pkg:
             if pkg.has("xl/workbook.bin"):
                 return "xlsb workbook saved as .xls"
-    except (ReadError, OSError):
+    except Exception:  # it only picks a message, so nothing a zip does escapes it
         pass
     return "xlsx workbook saved as .xls"
 

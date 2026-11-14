@@ -15,7 +15,7 @@ import reader  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.containers import zipx  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader_fix import make_zip  # noqa: E402
+from reader_fix import bad_name_zip, make_zip  # noqa: E402
 
 
 def tmp():
@@ -67,6 +67,15 @@ def test_not_a_zip_is_damaged():
     p = tmp() / "n.zip"
     p.write_bytes(b"hello")
     raises_kind(lambda: zipx.Package(p), "damaged")
+
+
+def test_name_flagged_utf8_that_is_not_is_damaged():
+    """zipfile raises a UnicodeDecodeError for a name flagged UTF-8 that is not, from the central directory when
+    the package opens or from a local header when its member is read; both are a damaged package."""
+    raises_kind(lambda: zipx.Package(bad_name_zip()), "damaged")
+    with zipx.Package(bad_name_zip(central=0)) as pkg:  # the central name is read as cp437, the local one as UTF-8
+        assert len(pkg.names) == 1, pkg.names
+        raises_kind(lambda: pkg.read(pkg.names[0]), "damaged")
 
 
 def test_ratio_bomb_is_too_large():

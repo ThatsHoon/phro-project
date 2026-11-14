@@ -25,6 +25,18 @@ def make_zip(path, members, stored=("mimetype",)):
     return target.getvalue() if path is None else target
 
 
+def bad_name_zip(central=0x800, local=0x800) -> bytes:
+    """The bytes of a stored zip of one member whose name, 0xFF then ".xml", is not UTF-8: `central` and `local`
+    are the general-purpose flags of its central-directory entry and of its local header (0x800 marks a UTF-8
+    name)."""
+    name, body = b"\xff.xml", b"x"
+    crc, n = zlib.crc32(body), len(body)
+    head = struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, local, 0, 0, 0, crc, n, n, len(name), 0) + name + body
+    entry = struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, central, 0, 0, 0, crc, n, n, len(name),
+                        0, 0, 0, 0, 0, 0) + name
+    return head + entry + struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, len(entry), len(head), 0)
+
+
 def make_cfb(path, streams, sector_size=512):
     """Write a compound file (see cfb_bytes) to `path`; returns the same info dict."""
     blob, info = cfb_bytes(streams, sector_size)

@@ -127,6 +127,8 @@ class Package:
             self._zip = zipfile.ZipFile(path)
         except zipfile.BadZipFile as e:
             raise ReadError("damaged", f"not a zip: {e}")
+        except UnicodeDecodeError as e:  # a member name flagged UTF-8 that is not
+            raise ReadError("damaged", f"zip member name: {e}")
         self.names = [i.filename for i in self._zip.infolist()]
         self._lower = {}
         for n in self.names:
@@ -170,9 +172,9 @@ class Package:
                 raise ReadError("too_large", f"{limits.BIG_TOTAL}: zip uncompressed size")
             self._seen.add(real)
             self._total += info.file_size
-        try:
+        try:  # a UnicodeDecodeError is a local header whose name is flagged UTF-8 and is not
             return self._zip.read(info)
-        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError) as e:
+        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, UnicodeDecodeError) as e:
             raise ReadError("damaged", f"{real}: {e}")
 
     def xml(self, name):
