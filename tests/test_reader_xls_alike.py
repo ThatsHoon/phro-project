@@ -107,6 +107,14 @@ def test_zip_named_xls_is_named_by_what_it_holds():
                 raise AssertionError("expected a ReadError")
 
 
+def test_ods_named_xls_is_read_by_odf():
+    """A zip named .xls that zip_route calls OpenDocument is read by odf; any other zip keeps the denial above."""
+    from test_reader_ods_odp import c, ods, row, sheet
+    src = ods(sheet("S", [row(c("a"), c("b")), row(c("1"), c("2"))]))
+    md = run(Path(src).read_bytes())
+    assert md == "## Sheet: S\n\n|a|b|\n|---|---|\n|1|2|\n", md
+
+
 def test_zip_named_xls_with_a_name_that_is_not_utf8():
     """A member name flagged UTF-8 that is not leaves the zip unread, so it is named as the xlsx it most likely is."""
     assert denied(bad_name_zip()) == ("unsupported", "xlsx workbook saved as .xls")

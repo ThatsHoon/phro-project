@@ -22,7 +22,7 @@ from ..containers.zipx import Package
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import display
-from . import biff, biff_chart, cfb_route, sheet_grid, xls_alike, xls_crypt, xls_drawing
+from . import biff, biff_chart, cfb_route, sheet_grid, xls_alike, xls_crypt, xls_drawing, zip_route
 
 _ROW, _COLINFO, _MERGED = 0x0208, 0x007D, 0x00E5
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
@@ -294,7 +294,14 @@ def parse(path, ctx) -> Doc:
         return xls_alike.parse_html(path, ctx)
     if what == "text":
         return xls_alike.parse_text(path, ctx)
-    if what == "zip":
+    if what == "zip":  # an OpenDocument package is read by odf, which never comes back here
+        try:
+            odf = zip_route.route(path) == "odf"
+        except ReadError:  # a zip that will not open is still named as the xlsx it most likely is
+            odf = False
+        if odf:
+            from . import odf as odf_parser
+            return odf_parser.parse(path, ctx)
         raise ReadError("unsupported", _zip_detail(path))
     if what != "cfb":
         raise ReadError("damaged", "not an Excel workbook")

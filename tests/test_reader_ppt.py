@@ -307,6 +307,17 @@ def test_pptx_saved_as_ppt():
     assert "Renamed title" in out, out
 
 
+def test_odp_saved_as_ppt():
+    """A zip named .ppt goes through zip_route, as one named .doc does: an OpenDocument presentation is read by odf."""
+    from test_reader_ods_odp import frame, odp, page
+    src = odp(page("p1", frame("Renamed odp", cls="title"), frame("odp body")))
+    d = Path(tempfile.mkdtemp())
+    path = d / "a.ppt"
+    path.write_bytes(Path(src).read_bytes())
+    out, _ = render(d, path)
+    assert out == "## Slide 1: Renamed odp\n\nodp body\n", out
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

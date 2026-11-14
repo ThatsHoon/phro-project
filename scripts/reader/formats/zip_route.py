@@ -1,10 +1,11 @@
 """Which parser a zip belongs to, so a package renamed between the zip formats is read by its own parser whichever
 extension it came with.
 
-A Word-family file (.doc, .rtf) whose head is a zip is an OpenDocument package or an OOXML one. It is OpenDocument when
+A .doc, .rtf or .ppt file whose head is a zip is an OpenDocument package or an OOXML one. It is OpenDocument when
 its `mimetype` member is `application/vnd.oasis.opendocument.*`, or when it has a `content.xml` and no
-`[Content_Types].xml`; anything else goes to `ooxml`, which refuses what is no Word or PowerPoint package. Neither
-parser comes back to the caller, so the routing cannot loop. Parsers are imported late.
+`[Content_Types].xml`; anything else goes to `ooxml`, which refuses what is no Word or PowerPoint package. A .xls
+file asks `route` only: an OpenDocument package goes to `odf`, any other zip is refused as the xlsx it most likely
+is. Neither parser comes back to the caller, so the routing cannot loop. Parsers are imported late.
 """
 from ..containers.zipx import Package
 from ..limits import ReadError

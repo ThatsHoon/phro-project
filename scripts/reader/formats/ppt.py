@@ -27,7 +27,7 @@ from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Section
 from . import ppt_records as rec
-from . import cfb_route, ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, sheet_grid
+from . import cfb_route, ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, sheet_grid, zip_route
 
 MAX_TITLE = 300
 _TITLES = (0, 6)
@@ -257,9 +257,8 @@ def _pp95(cf, current) -> bool:
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
         head = f.read(16)
-    if head[:2] == b"PK":
-        from . import ooxml
-        return ooxml.parse(path, ctx)
+    if head[:2] == b"PK":  # an OpenDocument package to odf, any other zip to ooxml; neither comes back here
+        return zip_route.parse(path, ctx)
     if not is_cfb(head):
         raise ReadError("damaged", "not a PowerPoint file")
     got = parse_compound(path, ctx)
