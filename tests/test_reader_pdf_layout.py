@@ -67,12 +67,33 @@ def test_letter_spaced():
     assert texts(L.lines(numbered(frags))) == ["WORD ONE"]
 
 
-def test_tj_gap_inside_a_fragment():
-    # the same glyph pair steps 6 apart twice and 10 apart once: the wide step is a gap
-    f = frag("abab", 72, 700, font="F", char_offsets=(0.0, 6.0, 12.0, 22.0, 28.0), width=28.0)
-    g = frag("ab", 200, 600, font="F", char_offsets=(0.0, 6.0, 12.0), width=12.0)
-    out = L.lines(numbered([f, g]))
-    assert texts(out) == ["aba b", "ab"]
+def gapped(text, gaps, x=72, y=700, size=12, **kw):
+    """A fragment whose char_gaps are {index: gap}."""
+    g = tuple(gaps.get(k, 0.0) for k in range(len(text)))
+    return frag(text, x, y, size=size, char_gaps=g, **kw)
+
+
+def test_tj_gap_end_of_word_punctuation():
+    # pdfTeX [(end.)-333(Next)]: "." always ends a word, so only the gap can say so
+    assert texts(L.lines(numbered([gapped("end.Next", {4: 4.0})]))) == ["end. Next"]
+
+
+def test_tj_gap_glyph_seen_once():
+    assert texts(L.lines(numbered([gapped("extab", {2: 3.0})]))) == ["ex tab"]
+
+
+def test_tj_gap_same_font_two_sizes():
+    big = gapped("abab", {}, size=24, font="F", char_offsets=(0.0, 12.0, 24.0, 36.0, 48.0))
+    small = gapped("abab", {}, y=600, size=12, font="F", char_offsets=(0.0, 6.0, 12.0, 18.0, 24.0))
+    assert texts(L.lines(numbered([big, small]))) == ["abab", "abab"]
+
+
+def test_tj_kerning_gives_no_space():
+    assert texts(L.lines(numbered([gapped("AVoid", {1: -1.5, 2: 1.0})]))) == ["AVoid"]
+
+
+def test_tj_gap_not_doubled_beside_space():
+    assert texts(L.lines(numbered([gapped("a b", {1: 4.0, 2: 4.0})]))) == ["a b"]
 
 
 def test_join_latin():
@@ -172,6 +193,15 @@ def test_rotate_into_view_directions():
         g = L.rotate_into_view([f], rot, box)[0]
         assert (g.x, g.y, g.dir_x, g.dir_y) == (x, y, dx, dy), rot
     assert f.x == 10
+    assert L.rotate_into_view([f], 90.0, box)[0].x == 20
+    assert L.rotate_into_view([f], True, box)[0].x == 10
+    assert L.rotate_into_view([f], 450, box)[0].x == 20
+
+
+def test_far_apart_runs_on_one_baseline():
+    # dochan's line builder is not in 1.21.0's layout.py; see the report for what it does
+    out = L.lines(numbered([frag("left", 72, 700), frag("right", 360, 700)]))
+    assert texts(out) == ["left right"]
 
 
 def test_heading_by_size():
@@ -244,7 +274,7 @@ def test_scale():
     lns = L.lines(numbered(fr))
     L.reading_order(lns, 612)
     L.paragraphs(lns, L.SpacingModel())
-    assert time.perf_counter() - t < 20
+    assert time.perf_counter() - t < 5
 
 
 def main():

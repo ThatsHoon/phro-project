@@ -3,7 +3,8 @@ image draws, from one page's operators.
 
 Port of dochan 1.21.0 pdf/content.py (MIT), Python path only, without line assembly (that is
 in the layout step). The text matrix (Tm/Td/TD/T*), the glyph widths and the CTM give each
-text piece its real x and y. A TJ number moves the glyphs after it (`char_offsets`) and never
+text piece its real x and y. A TJ number moves the glyphs after it (`char_offsets`, and `char_gaps` for the extra
+displacement before each glyph) and never
 adds a space: the gap rule decides spaces from the geometry. A Form XObject runs with its
 Matrix and its BBox clip; its text and figure paths join the page, its rule segments do not
 (art inside forms would build empty grids in unrelated drawings).
@@ -263,7 +264,8 @@ def _clip_form_fragments(fragments, bbox, ctm):
             kept.append(replace(
                 frag, text=frag.text[start:end], x=frag.x + ux * shift,
                 y=frag.y + uy * shift, width=offsets[end] - shift,
-                char_offsets=tuple(value - shift for value in offsets[start:end + 1])))
+                char_offsets=tuple(value - shift for value in offsets[start:end + 1]),
+                char_gaps=((0.0,) + frag.char_gaps[start + 1:end]) if frag.char_gaps else ()))
             start = end
     return kept
 
@@ -506,6 +508,8 @@ class _Page:
         pos = 0.0      # advance since then, in text space (Th included)
         pending = 0.0  # a TJ number not yet followed by a glyph
         starts: list = []
+        gaps: list = []  # the displacement before each character beyond its glyph's advance
+        extra = 0.0      # Tc and Tw of the glyph before, which move the next glyph
         pieces: list = []
         whole: list = []
         reliable = self.link_reliable and font.link_metrics_reliable
@@ -526,7 +530,10 @@ class _Page:
                 if origin is None:
                     origin = tm
                 pos += pending
+                gaps.append(extra + pending)
+                gaps.extend([0.0] * (len(piece) - 1))
                 pending = 0.0
+                extra = (tc + (tw if is_space else 0.0)) * th
                 disp = (w0 * fs + tc + (tw if is_space else 0.0)) * th
                 length = len(piece)
                 for index in range(length):
@@ -554,11 +561,13 @@ class _Page:
             space_w = 0.25 * fs * scale
         size = fs * (abs(start_tm[0] * start_tm[3] - start_tm[1] * start_tm[2]) ** 0.5 or 1.0)
         offsets = ()
+        char_gaps = ()
         if "".join(pieces) == text:
             if len(text) <= MAX_TRACKED_RUN and len(text) <= self.positions_left:
                 self.positions_left -= len(text)
                 starts.append(pos)
                 offsets = tuple(abs(v) * scale for v in starts)
+                char_gaps = tuple(v * scale for v in gaps)
             elif not self.positions_cut:
                 self.positions_cut = True
                 self._drop_positions()
@@ -566,7 +575,7 @@ class _Page:
             x=start_tm[4], y=start_tm[5], width=abs(pos) * scale, size=size,
             text=text, space_width=space_w, order=len(frags),
             dir_x=start_tm[0], dir_y=start_tm[1], up_x=start_tm[2], up_y=start_tm[3],
-            char_offsets=offsets, link_geometry_reliable=reliable,
+            char_offsets=offsets, char_gaps=char_gaps, link_geometry_reliable=reliable,
             invisible=st.tr in (3, 7), font=st.fname, obj=max(self.text_object, 0),
             hidden="ocg" if off else ""))
 

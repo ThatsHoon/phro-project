@@ -55,6 +55,10 @@ class Fragment:
     font: str = ""   # the BaseFont of the font, without its subset tag
     obj: int = 0     # index of its text object on the page
     hidden: str = ""  # "", "ocg", "invisible", "offcrop" or "tiny"
+    # The displacement before glyph k beyond its advance (a TJ number, Tc and Tw of the glyph
+    # before), in device units along the text direction; a kern is negative. Same length as the
+    # text and under the same cap as char_offsets; empty when positions were not tracked.
+    char_gaps: tuple = ()
 
 
 def writing_direction(frag: Fragment) -> str:
@@ -135,7 +139,9 @@ def rotate_into_view(fragments, rotate, box):
     """The fragments with position and direction mapped through the page's /Rotate (0, 90, 180
     or 270, clockwise) into the viewer's space, whose origin is the rotated crop box corner.
     Other angles leave the fragments alone."""
-    turn = rotate % 360 if isinstance(rotate, int) else 0
+    turn = 0
+    if isinstance(rotate, (int, float)) and not isinstance(rotate, bool) and math.isfinite(rotate):
+        turn = int(round(rotate)) % 360
     if turn not in (90, 180, 270):
         return list(fragments)
     x0, y0, x1, y1 = box
@@ -335,34 +341,17 @@ def _glyph_urls(f, grid):
     return out
 
 
-def _natural_steps(frags):
-    """The smallest step seen for each (font, glyph): what that glyph advances with no TJ
-    number after it. A larger step later is a gap."""
-    nat = {}
-    for f in frags:
-        n = len(f.text)
-        if n < 2 or len(f.char_offsets) != n + 1:
-            continue
-        o = f.char_offsets
-        for k in range(n):
-            key = (f.font, f.text[k])
-            step = o[k + 1] - o[k]
-            if key not in nat or step < nat[key]:
-                nat[key] = step
-    return nat
-
-
-def _chars_of(f, nat, urls, spaces=True):
-    """[(char, url)] of one fragment, with a space after each glyph that a TJ gap follows."""
+def _chars_of(f, urls, spaces=True):
+    """[(char, url)] of one fragment, with a space before each glyph whose `char_gaps` entry is
+    over GAP x the size, when neither side is a space."""
     n = len(f.text)
+    gaps = f.char_gaps if len(f.char_gaps) == n else ()
     out = []
-    offs = f.char_offsets if len(f.char_offsets) == n + 1 else ()
     for k, ch in enumerate(f.text):
+        if (spaces and gaps and k and gaps[k] > GAP * f.size
+                and ch != " " and f.text[k - 1] != " "):
+            out.append((" ", urls[k] if urls and urls[k] == urls[k - 1] else ""))
         out.append((ch, urls[k] if urls else ""))
-        if spaces and offs and k + 1 < n and ch != " " and f.text[k + 1] != " " \
-                and (f.font, ch) in nat \
-                and (offs[k + 1] - offs[k]) - nat[(f.font, ch)] > GAP * f.size:
-            out.append((" ", urls[k] if urls and urls[k] == urls[k + 1] else ""))
     return out
 
 
@@ -397,7 +386,6 @@ def lines(fragments, links=()) -> List[Line]:
     `links` is [(box, url)]; a character whose centre lies in a link box carries its url.
     """
     frags = sorted((f for f in fragments if f.text and not f.hidden), key=lambda f: f.order)
-    nat = _natural_steps(frags)
     grid = _LinkGrid(links) if links else None
     out, vertical = [], []
     cur, chars, direction, anchor, end = [], [], "", 0.0, 0.0
@@ -416,11 +404,11 @@ def lines(fragments, links=()) -> List[Line]:
                 same = chars[-1][1] == (urls[0] if urls else "")
                 chars.append((" ", chars[-1][1] if same else ""))
             cur.append(f)
-            chars.extend(_chars_of(f, nat, urls))
+            chars.extend(_chars_of(f, urls))
         else:
             if cur and any(not c[0].isspace() for c in chars):
                 out.append(_make_line(cur, chars))
-            cur, chars, direction, anchor = [f], _chars_of(f, nat, urls), d, a
+            cur, chars, direction, anchor = [f], _chars_of(f, urls), d, a
         end = s + f.width
     if cur and any(not c[0].isspace() for c in chars):
         out.append(_make_line(cur, chars))
@@ -443,7 +431,7 @@ def vertical_lines(fragments, links=()) -> List[Line]:
     out = []
     for col in columns:
         col.sort(key=lambda f: (-f.y, f.order))
-        chars = [c for f in col for c in _chars_of(f, {}, _glyph_urls(f, grid), spaces=False)]
+        chars = [c for f in col for c in _chars_of(f, _glyph_urls(f, grid), spaces=False)]
         if any(not c[0].isspace() for c in chars):
             out.append(_make_line(col, chars, vertical=True))
     return out

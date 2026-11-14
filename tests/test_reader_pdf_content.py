@@ -81,6 +81,20 @@ def test_tj_moves_not_spaces():
     assert abs(f.width - o[-1]) < 1e-9
 
 
+def test_char_gaps():
+    # [(He) -2000 (llo)]: 24 units before the first "l"; kerning (+30) is a small negative gap
+    f = run(b"BT /F1 12 Tf 72 720 Td [(He) -2000 (l) 30 (lo)] TJ ET").fragments[0]
+    g = f.char_gaps
+    assert len(g) == len(f.text) == 5 and g[0] == 0 and g[1] == 0
+    assert abs(g[2] - 24) < 1e-6 and abs(g[3] - (-0.36)) < 1e-6 and g[4] == 0
+    # Tc and Tw move the glyph after the one they follow
+    t = run(b"BT /F1 12 Tf 2 Tc 5 Tw 72 720 Td (a b) Tj ET").fragments[0]
+    assert t.char_gaps == (0.0, 2.0, 7.0)
+    # the CTM scales the gaps
+    d = run(b"2 0 0 2 0 0 cm BT /F1 12 Tf 72 720 Td [(a) -1000 (b)] TJ ET").fragments[0]
+    assert abs(d.char_gaps[1] - 24) < 1e-6
+
+
 def test_tj_edges():
     # a trailing number is not in the width, but the next text starts after it
     pc = run(b"BT /F1 12 Tf 72 720 Td [(ab) -1000] TJ (c) Tj ET")
