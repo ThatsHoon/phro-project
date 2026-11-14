@@ -8,7 +8,9 @@ notes masters and handouts are not read. A slide's text comes in shape order: an
 text block it names there, a ClientTextbox brings its own, and outline blocks nothing refers to follow. The shapes
 come in reading order from `ppt_shapes` (groups, tables and placeholders; date, number, footer and header placeholders
 are left out) and a title placeholder gives the slide its title. A slide that
-cannot be read is counted under `slide` and the others still come out. A picture shape becomes the Image of its pib
+cannot be read is counted under `slide` and the others still come out. An object shape places the blocks `ppt_objects` reads from its OLE
+storage (an Excel chart or sheet, an MS Graph chart, an equation); one it cannot read shows its preview picture and is
+counted under `object`. A picture shape becomes the Image of its pib
 (`ppt_pictures`: the BStore of the DocumentContainer's PPDrawingGroup, the BLIPs in the `Pictures` stream) at its
 place; one that cannot be placed is counted under `image`. Every walk spends one budget of
 `BIN_RECORDS` records, and the text emitted is capped at `MAX_OUTPUT` characters. A file saved with the default
@@ -22,7 +24,7 @@ from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Section
 from . import ppt_records as rec
-from . import ppt_crypt, ppt_pictures, ppt_shapes
+from . import ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, sheet_grid
 from .ppt_shapes import Walk as _Walk
 from .ppt_shapes import text_blocks as _text_blocks
 from .ppt_shapes import texts as _texts
@@ -46,6 +48,7 @@ class Presentation:
             self.persist.doc = self.doc
         self.walk = _Walk(ctx)
         self.pictures = ppt_pictures.Pictures(self.doc, self._dgg(), pictures, flate.Budget(), ctx)
+        self.objects = ppt_objects.Objects(self.doc, self.persist, flate.Budget(), sheet_grid.Budget(), ctx)
 
     def _dgg(self):
         """(start, end) of the DggContainer inside the DocumentContainer's PPDrawingGroup; None without one."""
@@ -115,6 +118,16 @@ class Presentation:
                 image = self.pictures.image(shape.pib)
                 if image is not None:
                     out.append((_PICTURE, [image], ""))
+            elif shape.kind == "object":
+                placed = self.objects.blocks(shape.ole_ref)
+                if placed:
+                    out.append((_PICTURE, placed, ""))
+                if placed is None:
+                    self.ctx.skipped["object"] += 1
+                if (placed is None or shape.ole_ref in self.objects.partial) and shape.pib:
+                    image = self.pictures.image(shape.pib)
+                    if image is not None:
+                        out.append((_PICTURE, [image], ""))
             title = shape.placeholder in ppt_shapes.TITLES
             out.extend((_TITLE_SHAPE if title and kind not in _TITLES else kind, blocks, plain)
                        for kind, blocks, plain in runs)

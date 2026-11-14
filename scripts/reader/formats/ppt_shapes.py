@@ -227,10 +227,10 @@ def _child_tf(raw: _Raw, box, tf):
 
 
 def _leaf(raw: _Raw, tf) -> Shape:
-    if raw.pib:
-        kind = "picture"
-    elif raw.ole_ref is not None:
+    if raw.ole_ref is not None:  # an OLE object's shape also carries its preview as a pib
         kind = "object"
+    elif raw.pib:
+        kind = "picture"
     else:
         kind = "text"
     shape = Shape(kind, text_ref=raw.text_ref, placeholder=raw.placeholder, pib=raw.pib, ole_ref=raw.ole_ref,

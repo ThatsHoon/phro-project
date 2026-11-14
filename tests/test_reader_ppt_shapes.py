@@ -168,16 +168,6 @@ def test_hyperlink_keeps_text_only():
     assert "click here" in out and "](" not in out and "http" not in out, out
 
 
-def test_unbuilt_kinds_named():
-    for kind, task in (("object", "Task 20"),):
-        try:
-            md([{"shapes": [{"kind": kind}]}])
-        except NotImplementedError as e:
-            assert task in str(e), e
-        else:
-            raise AssertionError(kind)
-
-
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

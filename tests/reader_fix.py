@@ -1306,8 +1306,6 @@ def ppt_shape(spec, ids, *, inside=False):
     holding the next spid. See make_ppt for the keys."""
     import struct
     kind = spec.get("kind", "text")
-    if kind == "object":
-        raise NotImplementedError("object shapes: added by Task 20")
     spid = spec.get("spid", ids[0])
     ids[0] = max(ids[0], spid) + 1
     box = spec.get("box")
@@ -1322,11 +1320,14 @@ def ppt_shape(spec, ids, *, inside=False):
         head += anchor
         members = [ppt_shape(c, ids, inside=True) for c in spec.get("children", ())]
         return oa_container(0xF003, oa_container(0xF004, head), *members)
-    out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75 if kind == "picture" else 202)
-    if kind == "picture":
-        out += oa_record(0xF00B, struct.pack("<HI", 0x4104, spec["pib"]), ver=3, inst=1)
+    pib = spec.get("pib")
+    out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75 if pib else 202)
+    if pib:
+        out += oa_record(0xF00B, struct.pack("<HI", 0x4104, pib), ver=3, inst=1)
     out += anchor
     data = b""
+    if kind == "object":
+        data += oa_record(0x0BC1, struct.pack("<I", spec["ex_obj_id"]))
     if spec.get("placeholder") is not None:
         data += oa_record(0x0BC3, struct.pack("<IBBH", 0, spec["placeholder"], 0, 0))
     if spec.get("ref") is not None:
@@ -1420,6 +1421,22 @@ def _ppt_encrypt(stream, pic_stream, offsets, pid_crypt, password):
     return out, pics
 
 
+def _ppt_object(item, k):
+    """One make_ppt `objects` item as {"id", "compressed", "body"}: the ExOleObjStg body."""
+    import struct
+    import zlib
+    if isinstance(item, (bytes, bytearray)):
+        item = {"data": bytes(item)}
+    elif isinstance(item, tuple):
+        item = {"data": bytes(item[0]), **item[1]}
+    compressed = bool(item.get("compressed"))
+    body = item.get("body")
+    if body is None:
+        data = item["data"]
+        body = struct.pack("<I", len(data)) + zlib.compress(data) if compressed else data
+    return {"id": item.get("ex_obj_id", k + 1), "compressed": compressed, "body": bytes(body)}
+
+
 def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=(), objects=(), encrypt=None,
              edits=1, raw_shapes=None, no_pictures_stream=False, encrypt_header=None):
     """Write a .ppt compound file with PowerPoint Document, Current User and Pictures streams.
@@ -1445,7 +1462,7 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     the streams are still encrypted with the password's RC4 keys.
     shapes: a list of dicts that replaces the slide's own text shapes in its PPDrawing (the SLWT is unchanged). A dict
     is a text shape, kind "group" or kind "picture" (key pib, the 1-based BStore index; box, text, placeholder and ref as for a text shape); kind
-    "object" raises NotImplementedError for Task 20. Keys: kind ("text" by default), spid, box ((left, top, right, bottom): a ClientAnchor at the top level, a
+    "object" (below). Keys: kind ("text" by default), spid, box ((left, top, right, bottom): a ClientAnchor at the top level, a
     ChildAnchor inside a group, unless client is true; wide makes the ClientAnchor 16 bytes), text and text_kind (a
     text run of TextHeaderAtom type text_kind, 1 by default), placeholder (an OEPlaceholderAtom of that type in the
     ClientData), ref (an OutlineTextRefAtom index in the ClientData), link (the text carries an InteractiveInfo and a
@@ -1455,7 +1472,15 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     SpgrContainer. pictures: a list of BLIP records (blip_png, blip_bitmap, blip_metafile), written one after
     another into the Pictures stream; the DocumentContainer gains a PPDrawingGroup (0x040B) whose DggContainer holds a
     BStore with one FBSE per picture, its foDelay that BLIP's offset in Pictures. no_pictures_stream (true) leaves the
-    Pictures stream out of the compound file, the BStore as it is. objects (Task 20) raises NotImplementedError.
+    Pictures stream out of the compound file, the BStore as it is.
+    objects: embedded OLE objects, each compound-file bytes, a tuple (bytes, options) or a dict. Each becomes an
+    ExOleObjStg persist object (0x1011) named by an ExEmbed (ExEmbedAtom, then an ExOleObjAtom with exObjId and
+    persistIdRef) in an ExObjList of the DocumentContainer. The dict keys are data (the compound file), compressed
+    (instance 1: a u32 size and zlib data; else instance 0, the raw bytes), ex_obj_id (k + 1 for the k-th object by
+    default) and body (bytes that replace the persist object's whole body as written, for example garbage zlib data;
+    with compressed it is written as given, size field included). A tuple's options are such a dict.
+    An object shape (kind "object") has ex_obj_id (an ExObjRefAtom in its ClientData), pib (its preview picture,
+    optional) and the box and text keys of a text shape.
 
     Returns a dict: doc, master (persist ids), slides (persist ids in order), slide_ids, notes ({slide number:
     persist id}), crypt (persist id or None), offsets ({persist id: offset} as the newest edit sees them),
@@ -1463,8 +1488,6 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     offset in the newest directory naming it; patch it to move or break one object}), user_edits and directories (offsets in the PowerPoint Document
     stream, oldest first), doc_stream and current_user (the stream bytes)."""
     import struct
-    if objects:
-        raise NotImplementedError("objects: added by Task 20")
     raw_shapes = dict(raw_shapes or {})
     notes = dict(notes or {})
     n = len(slides)
@@ -1472,6 +1495,8 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     pid_slides = [3 + k for k in range(n)]
     pid_notes = {num: 3 + n + i for i, num in enumerate(sorted(notes))}
     pid_crypt = 3 + n + len(notes) if encrypt is not None else None
+    objects = [_ppt_object(o, k) for k, o in enumerate(objects)]
+    pid_objects = [3 + n + len(notes) + (pid_crypt is not None) + k for k in range(len(objects))]
     slide_ids = [256 + k for k in range(n)]
     notes_slide_id = {num: slide_ids[num - 1] + 0x1000 for num in notes}
     master_slide_id = 0x80000000
@@ -1527,6 +1552,11 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         dgg = oa_container(0xF000, oa_record(0xF006, struct.pack("<4I", 1026, 2, 1, 1)),
                            oa_container(0xF001, *store, inst=len(store)))
         doc_parts.append(oa_container(0x040B, dgg))
+    if objects:
+        embeds = [oa_container(0x0FCC, oa_record(0x0FCD, bytes(8)),
+                               oa_record(0x0FC3, struct.pack("<5I", 1, 1, o["id"], 0, pid)))
+                  for o, pid in zip(objects, pid_objects)]
+        doc_parts.append(oa_container(0x0409, oa_record(0x040A, struct.pack("<I", len(objects) + 1)), *embeds))
     if notes:
         doc_parts.append(slide_list(2, [ppt_slide_persist(pid_notes[num], notes_slide_id[num]) for num in sorted(notes)]))
     stream, offsets = bytearray(), {}
@@ -1546,9 +1576,11 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         put(pid_notes[num], notes_record(num))
     if pid_crypt is not None:
         put(pid_crypt, oa_record(0x2F14, encrypt_header if encrypt_header is not None else rc4_header(encrypt)))
+    for o, pid in zip(objects, pid_objects):
+        put(pid, oa_record(0x1011, o["body"], inst=1 if o["compressed"] else 0))
     first_slide = offsets.get(pid_slides[0]) if n else None
     user_edits, directories, last, slots = [], [], 0, {}
-    seed = 3 + n + len(notes) + (pid_crypt is not None)
+    seed = 3 + n + len(notes) + (pid_crypt is not None) + len(objects)
     for e in range(max(edits, 1)):
         changed = dict(offsets) if e == 0 else {}
         if e and n:

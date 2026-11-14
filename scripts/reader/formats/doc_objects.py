@@ -15,8 +15,6 @@ a chart under chart, the rest under object (another object only when its preview
 VIEWABLE kinds, a BMP when bmp_to_png reads it). An object in vanished or deleted text is hidden as its text is and
 never counted.
 """
-import struct
-
 from .. import images, limits
 from ..containers.cfb import CfbError
 from ..limits import ReadError
@@ -77,14 +75,11 @@ class Objects:
         native = streams.get(_NATIVE)
         if native is not None:
             data = self.stream(native, _HEADER_MAX + mtef.MAX_BYTES)
-            if data is None or len(data) < 2:
-                return _BAD
-            cb = struct.unpack_from("<H", data)[0]
-            if cb > len(data):
+            if data is None:
                 return _BAD
             lost = set()
             try:
-                tex = mtef.to_tex(data[cb:], lost)
+                tex = mtef.native_tex(data, lost)
             except ValueError:
                 return _BAD
             return ("equation", tex, frozenset(lost))

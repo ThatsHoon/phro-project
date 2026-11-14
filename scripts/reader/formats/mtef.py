@@ -430,6 +430,18 @@ class _Reader:
         return r"\left" + sides[0] + body + r"\right" + sides[1]
 
 
+def native_tex(data: bytes, lost: set | None = None) -> str:
+    """The TeX of an Equation Native stream `data`: its EQNOLEFILEHDR (cbHdr, a u16 first, the header's length)
+    and then MTEF, converted by to_tex (which has `lost`). ValueError for a stream too short or a cbHdr past it, and
+    for what to_tex refuses."""
+    if len(data) < 2:
+        raise ValueError("Equation Native too short")
+    cb = struct.unpack_from("<H", data)[0]
+    if cb > len(data):
+        raise ValueError("Equation Native header past the stream")
+    return to_tex(data[cb:], lost)
+
+
 def to_tex(data: bytes, lost: set | None = None) -> str:
     """MTEF v3 or v5 `data` as TeX, without math delimiters. What could not be read is added to `lost`, when given:
     "depth" for lists dropped past DEPTH, "stop" when the conversion stopped before the end, "symbol" for characters
