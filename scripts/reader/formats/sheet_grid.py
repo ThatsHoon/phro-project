@@ -7,7 +7,7 @@ whose origin is hidden keeps its text at its first visible slot; its extent coun
 One `Budget` is shared by every sheet of a document.
 """
 import heapq
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left, bisect_right, insort
 
 from .. import limits
 from ..model import Break, Cell, Para, Table, Text
@@ -70,18 +70,56 @@ class _Ranges:
         return None
 
 
-def _uncovered(cov, ci, a, b):
-    """Columns in a..b-1 outside the sorted covered intervals cov (inclusive), scanning from index ci."""
-    n = b - a
-    while ci < len(cov) and cov[ci][1] < a:
-        ci += 1
-    j = ci
-    while j < len(cov) and cov[j][0] < b:
-        lo, hi = max(cov[j][0], a), min(cov[j][1], b - 1)
-        if hi >= lo:
-            n -= hi - lo + 1
-        j += 1
-    return n, ci
+class _Spans:
+    """The row spans still open in blocks()'s row walk: disjoint column intervals, each open until its last row.
+    A span's start and expiry cost a heap step, a list insert and a Fenwick update over the table's columns; counting
+    the covered columns of a range costs two bisects and two Fenwick sums, whatever the number of open spans."""
+
+    def __init__(self, ncols: int):
+        self.heap = []              # (last row, first column)
+        self.starts = []            # first columns, sorted
+        self.last = {}              # first column -> last column
+        self.tree = [0] * (ncols + 1)  # Fenwick tree: the widths of the spans, by first column
+
+    def _add(self, i: int, w: int):
+        i += 1
+        while i < len(self.tree):
+            self.tree[i] += w
+            i += i & -i
+
+    def _below(self, i: int) -> int:
+        """The widths of the spans whose first column is below i."""
+        s = 0
+        while i > 0:
+            s += self.tree[i]
+            i -= i & -i
+        return s
+
+    def open(self, last_row: int, c1: int, c2: int):
+        heapq.heappush(self.heap, (last_row, c1))
+        insort(self.starts, c1)
+        self.last[c1] = c2
+        self._add(c1, c2 - c1 + 1)
+
+    def expire(self, row: int):
+        """Close the spans whose last row is before `row`."""
+        while self.heap and self.heap[0][0] < row:
+            _, c1 = heapq.heappop(self.heap)
+            del self.starts[bisect_left(self.starts, c1)]
+            self._add(c1, c1 - self.last.pop(c1) - 1)
+
+    def uncovered(self, a: int, b: int) -> int:
+        """Columns in a..b-1 outside every open span (b - a when that is not positive, as nothing is covered)."""
+        if b <= a or not self.starts:
+            return b - a
+        n = self._below(b) - self._below(a)  # the spans starting in a..b-1, whole
+        i = bisect_left(self.starts, a) - 1   # one starting before a may reach into the range
+        if i >= 0 and self.last[self.starts[i]] >= a:
+            n += min(self.last[self.starts[i]], b - 1) - a + 1
+        j = bisect_left(self.starts, b) - 1   # the last one starting in the range may run past it
+        if j >= 0 and self.starts[j] >= a and self.last[self.starts[j]] >= b:
+            n -= self.last[self.starts[j]] - b + 1
+        return b - a - n
 
 
 class Grid:
@@ -214,23 +252,24 @@ class Grid:
         for (r, c), v in origins.items():
             by_row.setdefault(r, []).append((c, v))
         empty = Cell([])
-        out, active, slots = [], [], 0
+        out, slots = [], 0
+        spans = _Spans(c1 - c0 + 1)  # the row spans of earlier rows that are still open
         for r in rows:
             nr = new[r]
             while len(out) < nr:
                 out.append([])
-            active = [a for a in active if a[0] >= nr]
-            cov = sorted((a[1], a[2]) for a in active)
-            row, at, ci = [], 0, 0
+            spans.expire(nr)
+            row, at, opened = [], 0, []
             for c, (text, r2, c2) in sorted(by_row.get(r, ())):
                 nc = c - c0
-                n, ci = _uncovered(cov, ci, at, nc)
-                row.extend([empty] * n)
+                row.extend([empty] * spans.uncovered(at, nc))
                 rs, cs = new[r2] - nr + 1, c2 - c + 1
                 row.append(Cell([self._para(text)], rs, cs))
                 if rs > 1:
-                    active.append((new[r2], nc, nc + cs - 1))
+                    opened.append((new[r2], nc, nc + cs - 1))
                 at = nc + cs
+            for span in opened:  # a span covers the rows below its own, never the rest of its row
+                spans.open(*span)
             slots += len(row)
             if slots > limits.GRID_SLOTS:
                 self._stop("grid slots", limits.GRID_SLOTS)

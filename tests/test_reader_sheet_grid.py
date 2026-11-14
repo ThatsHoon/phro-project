@@ -225,6 +225,23 @@ def test_tall_merges_are_fast():
     assert len(t.rows) <= 140 and t.rows[0][0].rowspan > 1
 
 
+def test_open_merges_do_not_cost_every_row():
+    """999 full-height merges, each in its own column, over 100,000 one-cell rows: a row costs its own cells and the
+    merges that start or end there, not every merge still open."""
+    g, _ = mk()
+    for c in range(999):
+        g.merge(0, 99_999, c, c)
+        g.put(0, c, f"m{c}")
+    for r in range(100_000):
+        g.put(r, 999, str(r))
+    t0 = time.monotonic()
+    t = table(g)
+    took = time.monotonic() - t0
+    assert took < 5, took
+    assert len(t.rows) == 100_000 and len(t.rows[0]) == 1000 and t.rows[0][0].rowspan == 100_000
+    assert [txt(c) for c in t.rows[1]] == ["1"] and [txt(c) for c in t.rows[-1]] == ["99999"], (t.rows[1], t.rows[-1])
+
+
 def test_merge_cap_dense():
     g, ctx = mk()
     t0 = time.monotonic()
