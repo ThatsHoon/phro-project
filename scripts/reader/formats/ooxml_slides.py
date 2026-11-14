@@ -1,6 +1,7 @@
 """PresentationML (pptm, ppsx) to the document model. Elements match by local name.
 
-Run hyperlinks are ported from dochan (`ooxml/pptx.py`); a14 math goes through `omml`.
+Run hyperlinks and legacy slide comments are ported from dochan (`ooxml/pptx.py`); a14 math goes through `omml`.
+Comments (legacy `p:cm`, modern `p188:cm` with replies) become the Section's `comments`, one note line each.
 Layouts and masters are read only for the position of a placeholder that has none of its own.
 """
 import re
@@ -11,11 +12,12 @@ from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Equation, Link, ListItem, Math, Para, Section, Table, Text, Image
 from . import omml, ooxml_base, smartart
 from .ooxml_base import int_of as _int
-from .word_fields import MAX_URL
+from .word_fields import MAX_URL, comment_note
 
 IMAGE_BYTES = 256 * 2**20  # image bytes one deck may emit, copies counted
 SPAN_CELLS = 500_000       # grid slots all spans of one table may cover; past it spans become 1
 MAX_ALT, MAX_TITLE = 200, 200
+MAX_COMMENTS = 10_000      # comments one deck may emit, replies counted; the rest are counted as `comments`
 COORD = 10**13
 A14_M = "{http://schemas.microsoft.com/office/drawing/2010/main}m"
 
@@ -128,6 +130,8 @@ class _Reader:
         self.image_bytes = 0
         self.chart_cells = 0
         self.smartart_nodes = 0
+        self.authors = {}  # comment author id -> name, legacy and modern merged
+        self.comment_count = 0
         self.ph_maps = {}  # layout or master part -> {("idx", i) | ("type", t): (y, x)}
         self.inherit = []  # the current slide's layout and master maps, in lookup order
 
@@ -145,6 +149,7 @@ class _Reader:
     def run(self) -> Doc:
         root = self.open(self.part)
         rels = ooxml_base.rels(self.pkg, self.part, self.ctx)
+        self.load_authors(rels)
         lst = _kid(root, "sldIdLst")
         entries = kids(lst, "sldId") if lst is not None else []
         doc = Doc()
@@ -184,7 +189,78 @@ class _Reader:
         notes = self.notes_part(name)
         if notes:
             sec.notes = notes
+        sec.comments = self.comments_part(name)
         return sec
+
+    # ---- comments
+    def load_authors(self, rels):
+        """Fill `self.authors` from the presentation's commentAuthors (legacy) and authors (modern) parts."""
+        for rel in rels.values():
+            if rel.external or not (rel.type.endswith("/commentAuthors") or rel.type.endswith("/authors")):
+                continue
+            try:
+                with self.ctx.guard("comments"):
+                    if not self.pkg.has(rel.target):
+                        self.ctx.skipped["comments"] += 1
+                        continue
+                    root, _ = ooxml_base.load(self.pkg, rel.target)
+                    for a in root:
+                        if local(a.tag) in ("cmAuthor", "author") and attr(a, "id") is not None:
+                            self.authors[attr(a, "id")] = attr(a, "name") or ""
+            except ReadError as e:
+                if e.kind != "damaged":
+                    raise
+                self.ctx.skipped["comments"] += 1
+
+    @staticmethod
+    def _line(text):
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _body_text(self, tx):
+        """The text of a txBody's paragraphs, joined into one line."""
+        paras = []
+        for p in tx.iter():
+            if local(p.tag) == "p":
+                paras.append("".join(t.text or "" for t in p.iter() if local(t.tag) == "t"))
+        return self._line(" ".join(paras))
+
+    def comments_part(self, name):
+        """The comments of a slide as Para lines, in file order, a reply right after its comment."""
+        out = []
+        for rel in ooxml_base.rels(self.pkg, name, self.ctx).values():
+            if rel.external or not rel.type.endswith("/comments"):
+                continue
+            if not self.pkg.has(rel.target):
+                self.ctx.skipped["comments"] += 1
+                continue
+            try:
+                with self.ctx.guard("comments"):
+                    root, _ = ooxml_base.load(self.pkg, rel.target)
+                    found = []
+                    for cm in root:
+                        if local(cm.tag) != "cm":
+                            continue
+                        if _kid(cm, "text") is not None:  # legacy
+                            found.append((attr(cm, "authorId"), self._line(_kid(cm, "text").text or "")))
+                        elif _kid(cm, "txBody") is not None:  # modern, then its replies
+                            found.append((attr(cm, "authorId"), self._body_text(_kid(cm, "txBody"))))
+                            for lst in kids(cm, "replyLst"):
+                                for rp in kids(lst, "reply"):
+                                    if _kid(rp, "txBody") is not None:
+                                        found.append((attr(rp, "authorId"), self._body_text(_kid(rp, "txBody"))))
+                    for aid, text in found:
+                        if not text:
+                            continue
+                        if self.comment_count >= MAX_COMMENTS:
+                            self.ctx.skipped["comments"] += 1
+                            break
+                        self.comment_count += 1
+                        out.append(comment_note([Para([Text(text)])], self.authors.get(aid or "", ""))[0])
+            except ReadError as e:
+                if e.kind != "damaged":
+                    raise
+                self.ctx.skipped["comments"] += 1
+        return out
 
     # ---- inherited placeholder positions
     def related(self, part, suffix):

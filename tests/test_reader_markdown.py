@@ -176,6 +176,13 @@ def test_slide_and_notes():
     assert R(Doc(blocks=[Section("slide", "", number=4)])) == "## Slide 4\n"
 
 
+def test_section_comments_render():
+    doc = Doc(blocks=[Section("slide", number=1, notes=[P("n")], comments=[P("Comment by A: c")])])
+    assert "> Notes: n\n> Comment by A: c" in R(doc)
+    doc = Doc(blocks=[Section("slide", number=1, comments=[P("Comment by A: c"), P("Comment by B: d")])])
+    assert R(doc).endswith("> Comment by A: c\n> Comment by B: d\n"), R(doc)
+
+
 def test_sheet_page_chapter():
     assert R(Doc(blocks=[Section("sheet", "Q1", blocks=[P("x")])])) == "## Sheet: Q1\n\nx\n"
     assert R(Doc(blocks=[Section("page", "Page-1", blocks=[P("x")])])) == "## Page: Page-1\n\nx\n"

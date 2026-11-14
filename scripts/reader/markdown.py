@@ -344,8 +344,10 @@ class _Render:
             out.append(("h", head + tag))
         out.extend(self.blocks(s.blocks))
         notes = [t for t in (self._flat(n, LINES) for n in s.notes if not self._skip(n)) if t]
-        if notes:
-            lines = ("> Notes: " + notes[0], *("> " + n for n in notes[1:]))
+        comments = [t for t in (self._flat(c, LINES) for c in s.comments if not self._skip(c)) if t]
+        if notes or comments:
+            lines = (*(("> Notes: " + notes[0], *("> " + n for n in notes[1:])) if notes else ()),
+                     *("> " + c for c in comments))
             out.append(("q", "\n".join(lines)))
         return out
 

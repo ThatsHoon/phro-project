@@ -389,6 +389,80 @@ def test_notes_missing_and_damaged():
     assert ctx.skipped["notes"] == 1 and "body" in markdown.render(doc, tmp() / "assets")
 
 
+P14 = "http://schemas.microsoft.com/office/powerpoint/2018/8/main"
+PM = "http://schemas.openxmlformats.org/presentationml/2006/main"
+PRELS = "ppt/_rels/presentation.xml.rels"
+
+
+def _pres_rels(n, extra=()):
+    return rels_xml([(f"rS{i}", "slide", f"slides/slide{i}.xml") for i in range(1, n + 1)] + list(extra))
+
+
+def _legacy(*cms):
+    body = "".join(f'<p:cm authorId="{a}" dt="2020-01-01T00:00:00" idx="{i}"><p:pos x="0" y="0"/><p:text>{t}</p:text></p:cm>'
+                   for i, (a, t) in enumerate(cms, 1))
+    return f'<p:cmLst xmlns:p="{PM}">{body}</p:cmLst>'
+
+
+def _authors(name):
+    return f'<p:cmAuthorLst xmlns:p="{PM}"><p:cmAuthor id="0" name="{name}" initials="x" lastIdx="2" clrIdx="0"/></p:cmAuthorLst>'
+
+
+def _legacy_deck(cms, notes=None, show=None, authors=True):
+    members = {"ppt/comments/comment1.xml": _legacy(*cms)}
+    extra = [("rA", "commentAuthors", "commentAuthors.xml")] if authors else []
+    members[PRELS] = _pres_rels(1, extra)
+    if authors:
+        members["ppt/commentAuthors.xml"] = _authors("Ann")
+    slide = sld(sp("t", "title"), show) if show is not None else sp("t", "title")
+    return deck([slide], notes=notes, srels={1: [("rC", "comments", "../comments/comment1.xml")]}, extra=members)
+
+
+def test_legacy_comments():
+    out = md(_legacy_deck([(0, "first"), (0, "second")], notes={1: sp("n", "body")}))
+    assert "> Notes: n\n> Comment by Ann: first\n> Comment by Ann: second" in out, out
+
+
+def test_modern_comments_and_replies():
+    def tx(t):
+        return f"<p188:txBody><a:bodyPr/><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p188:txBody>"
+    cm = (f'<p188:cmLst xmlns:p188="{P14}" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+          f'<p188:cm id="{{C1}}" authorId="{{G1}}">{tx("q")}<p188:replyLst>'
+          f'<p188:reply id="{{R1}}" authorId="{{G2}}">{tx("a")}</p188:reply></p188:replyLst></p188:cm></p188:cmLst>')
+    au = (f'<p188:authorLst xmlns:p188="{P14}"><p188:author id="{{G1}}" name="Bo" initials="B"/>'
+          f'<p188:author id="{{G2}}" name="Cy" initials="C"/></p188:authorLst>')
+    members = {"ppt/comments/modernComment_1.xml": cm, "ppt/authors.xml": au,
+               PRELS: _pres_rels(1, [("rA", "authors", "authors.xml")])}
+    d = deck([sp("t", "title")], srels={1: [("rC", "comments", "../comments/modernComment_1.xml")]}, extra=members)
+    out = md(d)
+    assert "> Comment by Bo: q\n> Comment by Cy: a" in out, out
+
+
+def test_comments_without_notes():
+    out = md(_legacy_deck([(0, "only")]))
+    assert "> Comment by Ann: only" in out and "> Notes:" not in out, out
+
+
+def test_comments_on_hidden_slide():
+    d = _legacy_deck([(0, "c")], show="0")
+    assert "Comment by" not in md(d)
+    assert "Comment by Ann: c" in md(d, hidden=True)
+
+
+def test_comments_part_missing():
+    d = deck([sp("t", "title")], srels={1: [("rC", "comments", "../comments/none.xml")]})
+    doc, ctx = parse(d)
+    assert ctx.skipped["comments"] == 1 and doc.blocks[0].title == "t"
+    d = _legacy_deck([(0, "c")])
+    import zipfile
+    out = tmp() / "c.ppsx"
+    with zipfile.ZipFile(d) as zi, zipfile.ZipFile(out, "w") as zo:
+        for i in zi.infolist():
+            zo.writestr(i.filename, b"<p:cmLst" if i.filename == "ppt/comments/comment1.xml" else zi.read(i.filename))
+    doc, ctx = parse(out)
+    assert ctx.skipped["comments"] == 1 and doc.blocks[0].title == "t"
+
+
 def main():
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

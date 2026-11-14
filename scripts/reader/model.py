@@ -129,6 +129,7 @@ class Section:
     blocks: list = field(default_factory=list)
     notes: list = field(default_factory=list)
     hidden: str = _hid()
+    comments: list = field(default_factory=list)  # Para, one per comment, shown after the notes
 
 
 Block = Union[Heading, Para, ListItem, Table, Image, Equation, Quote, Section]
