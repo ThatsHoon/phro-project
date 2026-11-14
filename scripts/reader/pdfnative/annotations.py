@@ -24,7 +24,9 @@ ANNOT_CHARS = 65_536        # characters of one comment
 FIELD_CHARS = 2_000         # characters of one field value
 FIELD_DEPTH = 32            # levels of the field tree
 FIELD_NODES = 20_000        # field nodes read in all
-FIELD_SCAN = 100_000        # page /Annots entries scanned to place fields without /P
+FIELD_KIDS = 10_000         # /Kids entries read from one field (and /Fields entries read)
+FIELD_KID_TOTAL = 200_000   # /Kids entries read in all
+FIELD_SCAN =100_000        # page /Annots entries scanned to place fields without /P
 OUTLINE_ITEMS = 1_000
 OUTLINE_DEPTH = 32
 NAME_NODES = 10_000         # name tree nodes one destination lookup may visit
@@ -201,18 +203,10 @@ def page_index(pdf: PDFFile) -> Dict[PDFRef, int]:
     ids = {id(page): i for i, (page, _inherited) in enumerate(pdf.pages())}
     out: Dict[PDFRef, int] = {}
     stack = [pdf.catalog.get("Pages")]
-    seen = set()
-    steps = 0
+    seen = {_key(stack[0])}
+    steps = 0  # kids examined: shared /Kids arrays cost each time they are read
     while stack:
         ref = stack.pop()
-        steps += 1
-        if steps > 4 * MAX_PAGES:
-            pdf._cut("pages", "WARN: the page tree is larger than the cap; pages beyond it have no reference")
-            break
-        key = _key(ref)
-        if key in seen:
-            continue
-        seen.add(key)
         node = pdf.resolve(ref)
         if not isinstance(node, dict):
             continue
@@ -222,7 +216,16 @@ def page_index(pdf: PDFFile) -> Dict[PDFRef, int]:
             continue
         kids = pdf.resolve(node.get("Kids"))
         if isinstance(kids, list):
-            stack.extend(reversed(kids))
+            fresh = []
+            for kid in kids[:MAX_PAGES]:
+                steps += 1
+                if steps > 4 * MAX_PAGES:
+                    pdf._cut("pages", "WARN: the page tree is larger than the cap; pages beyond it have no reference")
+                    return out
+                if _key(kid) not in seen:
+                    seen.add(_key(kid))
+                    fresh.append(kid)
+            stack.extend(reversed(fresh))
     return out
 
 
@@ -290,18 +293,23 @@ def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str]]]:
         return None
 
     out: Dict[int, List[Tuple[str, str]]] = {}
-    stack = [(ref, "", {}, 1) for ref in reversed(roots)]
-    seen = set()
+    if len(roots) > FIELD_KIDS:
+        cut["field"] += 1
+        roots = roots[:FIELD_KIDS]
+    seen = set()  # a node is queued once, so the stack never holds a node twice
+    queued = []
+    for ref in roots:
+        if _key(ref) not in seen:
+            seen.add(_key(ref))
+            queued.append(ref)
+    stack = [(ref, "", {}, 1) for ref in reversed(queued)]
+    kid_budget = FIELD_KID_TOTAL
     nodes = 0
     while stack:
         ref, parent_name, inherited, depth = stack.pop()
         node = pdf.resolve(ref)
         if not isinstance(node, dict):
             continue
-        key = _key(ref)
-        if key in seen:
-            continue
-        seen.add(key)
         nodes += 1
         if nodes > FIELD_NODES:
             cut["field"] += 1
@@ -318,12 +326,18 @@ def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str]]]:
         kids = pdf.resolve(node.get("Kids"))
         kid_fields, widgets = [], []
         if isinstance(kids, list):
+            if len(kids) > FIELD_KIDS or len(kids) > kid_budget:
+                cut["field"] += 1
+                kids = kids[:min(FIELD_KIDS, kid_budget)]
+            kid_budget -= len(kids)
             for kid in kids:
                 kid_node = pdf.resolve(kid)
                 if not isinstance(kid_node, dict):
                     continue
                 if "T" in kid_node:
-                    kid_fields.append(kid)
+                    if _key(kid) not in seen:  # a node shared by many parents is queued once
+                        seen.add(_key(kid))
+                        kid_fields.append(kid)
                 else:
                     widgets.append((kid, kid_node))
         if kid_fields:
@@ -342,10 +356,8 @@ def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str]]]:
         if was_cut:
             cut["field"] += 1
         page = page_of([(ref, node)] + widgets)
-        if page is None:
-            cut["field"] += 1  # a field on no page: nothing shows it
-            continue
-        out.setdefault(page, []).append((label, value))
+        # A filled field on no page is still document data: it goes to the first page.
+        out.setdefault(page or 0, []).append((label, value))
     return out
 
 

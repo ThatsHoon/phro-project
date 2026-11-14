@@ -23,6 +23,7 @@ _CODECS = {"DCTDecode": "jpg", "DCT": "jpg", "JPXDecode": "jpx", "CCITTFaxDecode
 
 def image(pdf: PDFFile, stream: PDFStream) -> PageImage:
     """The image of an image XObject stream. `data` is None when it cannot be shown."""
+    stream = _direct(pdf, stream)
     d = stream.dictionary
     width, height = _int(pdf.resolve(d.get("Width"))), _int(pdf.resolve(d.get("Height")))
     px = (width, height)
@@ -41,11 +42,29 @@ def image(pdf: PDFFile, stream: PDFStream) -> PageImage:
     return PageImage(_BOX, data, px, "png" if data is not None else "raw")
 
 
+def _direct(pdf: PDFFile, stream: PDFStream) -> PDFStream:
+    """The stream with an indirect /Filter and /DecodeParms (and their entries) resolved: the
+    filter chain reads them as they stand."""
+    d = stream.dictionary
+    changed = {}
+    for key in ("Filter", "DecodeParms", "DP"):
+        value = d.get(key)
+        if value is None:
+            continue
+        direct = pdf.resolve(value)
+        if isinstance(direct, list):
+            items = [pdf.resolve(v) for v in direct]
+            direct = direct if all(a is b for a, b in zip(items, direct)) else items
+        if direct is not value:
+            changed[key] = direct
+    return PDFStream({**d, **changed}, stream.raw) if changed else stream
+
+
 def _int(value) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _space(pdf: PDFFile, cs):
+def _space(pdf: PDFFile, cs, base: bool = False):
     """(kind, components, palette) of a colour space: kind "gray", "rgb" or "indexed"; None when
     the space is not one of those. palette is [(r, g, b)] for indexed."""
     cs = pdf.resolve(cs)
@@ -60,16 +79,16 @@ def _space(pdf: PDFFile, cs):
         profile = pdf.resolve(args[0])
         n = pdf.resolve(profile.dictionary.get("N")) if isinstance(profile, PDFStream) else None
         return {1: ("gray", 1, None), 3: ("rgb", 3, None)}.get(n, (None, 0, None))
-    if name in ("Indexed", "I") and len(args) >= 3:
-        base = _space(pdf, args[0])
+    if name in ("Indexed", "I") and len(args) >= 3 and not base:  # a base is gray, RGB or ICC only
+        under = _space(pdf, args[0], True)
         hival = pdf.resolve(args[1])
         table = pdf.resolve(args[2])
         if isinstance(table, PDFStream):
             table = pdf.decode_stream_bytes(table)
-        if base[0] not in ("gray", "rgb") or not isinstance(table, bytes) \
+        if under[0] not in ("gray", "rgb") or not isinstance(table, bytes) \
                 or not isinstance(hival, int) or hival < 0:
             return None, 0, None
-        step = base[1]
+        step = under[1]
         count = min(hival, 255) + 1
         palette = []
         for i in range(count):

@@ -232,6 +232,14 @@ def test_field_page_scan():
     assert an.fields(pf, Counter()) == {1: [("t", "v")]}
 
 
+def test_field_on_no_page():
+    # a filled field that no page names still shows: on the first page, uncounted
+    w = widget(RECT, None, T="t", FT=Name("Tx"), V="v")
+    cut = Counter()
+    pf = PDFFile(simple_pdf([b"", b""], catalog={"AcroForm": Ref(200)}, extra_objects=acroform([w])))
+    assert an.fields(pf, cut) == {0: [("t", "v")]} and not cut
+
+
 def test_field_choice_list():
     ch = widget(RECT, PAGE, T="c", FT=Name("Ch"), V=["x", "y"])
     pf = with_form([ch])
@@ -405,6 +413,67 @@ def test_image_not_viewable():
     assert got.data is None
     got = decode(image_xobject(2, 2, filter="DCTDecode", data=b"not a jpeg"))
     assert got.data is None
+
+
+def test_image_indexed_base_loop():
+    # an Indexed base that is the same array: no recursion, no image
+    loop = [Name("Indexed"), Ref(101), 1, bytes(6)]
+    got = decode(image_xobject(2, 1, cs=Ref(101), data=bytes(2)), {101: loop})
+    assert got.data is None and got.kind == "raw"
+    # an Indexed base that is another Indexed space, or does not resolve, gives no image either
+    inner = [Name("Indexed"), Name("DeviceRGB"), 1, bytes(6)]
+    outer = [Name("Indexed"), Ref(102), 1, bytes(2)]
+    assert decode(image_xobject(2, 1, cs=Ref(101), data=bytes(2)), {101: outer, 102: inner}).data is None
+    assert decode(image_xobject(2, 1, cs=[Name("Indexed"), Ref(150), 1, bytes(6)], data=bytes(2))).data is None
+
+
+def test_image_indirect_filter():
+    s = image_xobject(8, 8, filter="DCTDecode", data=JPEG)
+    s.dictionary["Filter"] = Ref(101)
+    got = decode(s, {101: Name("DCTDecode")})
+    assert got.data == JPEG and got.kind == "jpg"
+    raw = zlib.compress(bytes([0, 255]))
+    s = image_xobject(2, 1, filter=None, data=raw)
+    s.dictionary["Filter"] = [Ref(101)]
+    got = decode(s, {101: Name("FlateDecode")})
+    assert [p[0] for p in png_pixels(got.data)[2][0]] == [0, 255]
+    rows = bytes([2, 7]) + bytes([2, 0])  # PNG Up filter: two rows of one gray pixel
+    s = image_xobject(1, 2, filter=None, data=zlib.compress(rows))
+    s.dictionary["Filter"] = Name("FlateDecode")
+    s.dictionary["DecodeParms"] = Ref(102)
+    got = decode(s, {102: {"Predictor": 15, "Columns": 1}})
+    assert [r[0][0] for r in png_pixels(got.data)[2]] == [7, 7]
+
+
+def test_field_kids_shared_array():
+    # many nodes share one 100,000-entry /Kids array: the work stays bounded
+    nodes = 1_000
+    objects = {200: {"Fields": [Ref(1000)]}, 450: [Ref(1000 + i % nodes) for i in range(100_000)]}
+    for i in range(nodes):
+        objects[1000 + i] = {"T": f"n{i}", "Kids": Ref(450)}
+    pf = PDFFile(simple_pdf([b""], catalog={"AcroForm": Ref(200)}, extra_objects=objects))
+    cut = Counter()
+    start = time.time()
+    assert an.fields(pf, cut) == {}
+    assert time.time() - start < 2 and cut["field"] >= 1
+    # a field with more widgets than the cap reads the first ones and counts the rest
+    objects = {200: {"Fields": [Ref(201)]}, 450: [Ref(202)] * 10_500,
+               201: {"T": "r", "FT": Name("Btn"), "Ff": 1 << 15, "V": Name("A"), "Kids": Ref(450)},
+               202: widget(RECT, PAGE)}
+    pf = PDFFile(simple_pdf([b""], catalog={"AcroForm": Ref(200)}, extra_objects=objects))
+    cut = Counter()
+    assert an.fields(pf, cut) == {0: [("r", "A")]} and cut["field"] == 1 and an.FIELD_KIDS == 10_000
+
+
+def test_page_index_shared_kids():
+    nodes = 1_000
+    objects = {450: [Ref(4)] + [Ref(2000 + i % nodes) for i in range(99_999)]}
+    for i in range(nodes):
+        objects[2000 + i] = {"Type": Name("Pages"), "Kids": Ref(450)}
+    pf = PDFFile(simple_pdf([b""], extra_objects=objects, catalog={"Pages": Ref(2000)}))
+    pf._pages = [(pf.resolve(PDFRef(4, 0)), {})]  # skip the page walk: it is another module's work
+    start = time.time()
+    assert an.page_index(pf) == {PDFRef(4, 0): 0} and time.time() - start < 2
 
 
 def main():
