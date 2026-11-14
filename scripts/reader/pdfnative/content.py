@@ -117,7 +117,10 @@ class PageContent:
     segments: Sequence[Segment]
     short: Sequence[Segment]
     figure: tuple  # (union box or None, count of painted paths that gave no rule)
-    image_draws: List[Tuple[str, tuple]]  # (resource name, box) in content order
+    # (resource name, box, stream) in content order. The name is from the resources of the
+    # stream that drew it (a form has its own), so the resolved image XObject `stream` is what
+    # to read; it is None when the name does not resolve to a stream.
+    image_draws: List[Tuple[str, tuple, Optional[PDFStream]]]
     objects: int  # page objects walked, forms included
     cut: Counter = field(default_factory=Counter)
     unmapped: int = 0  # text operators whose font could not be decoded (their text is gone)
@@ -164,12 +167,35 @@ def _sane(*values) -> bool:
     return all(math.isfinite(v) and abs(v) <= _COORD for v in values)
 
 
-def _clip_form_fragments(fragments, bbox, ctm):
-    """Keep the glyphs that overlap a form's transformed BBox, rotations included."""
+def _bbox_polygon(bbox, ctm):
     x0, y0, x1, y1 = bbox
     a, b, c, d, e, f = ctm
-    polygon = [(a * x + c * y + e, b * x + d * y + f)
-               for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+    return [(a * x + c * y + e, b * x + d * y + f)
+            for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+
+
+def _polygons_overlap(polygon, quad) -> bool:
+    """Separating-axis test of two convex quadrilaterals."""
+    if not all(math.isfinite(value) for point in quad for value in point):
+        return False
+    for shape in (polygon, quad):
+        for edge, (px, py) in enumerate(shape):
+            qx, qy = shape[(edge + 1) % 4]
+            axis_length = math.hypot(qy - py, qx - px)
+            if not axis_length:
+                continue
+            nx, ny = -(qy - py) / axis_length, (qx - px) / axis_length
+            clip_projection = [nx * x + ny * y for x, y in polygon]
+            glyph_projection = [nx * x + ny * y for x, y in quad]
+            if (max(clip_projection) < min(glyph_projection) - 1e-7 or
+                    max(glyph_projection) < min(clip_projection) - 1e-7):
+                return False
+    return True
+
+
+def _clip_form_fragments(fragments, bbox, ctm):
+    """Keep the glyphs that overlap a form's transformed BBox, rotations included."""
+    polygon = _bbox_polygon(bbox, ctm)
     if not all(math.isfinite(value) for point in polygon for value in point):
         return []
     signed_area = sum(polygon[i][0] * polygon[(i + 1) % 4][1] -
@@ -184,21 +210,7 @@ def _clip_form_fragments(fragments, bbox, ctm):
         return True
 
     def overlaps(quad):
-        if not all(math.isfinite(value) for point in quad for value in point):
-            return False
-        for shape in (polygon, quad):
-            for edge, (px, py) in enumerate(shape):
-                qx, qy = shape[(edge + 1) % 4]
-                axis_length = math.hypot(qy - py, qx - px)
-                if not axis_length:
-                    continue
-                nx, ny = -(qy - py) / axis_length, (qx - px) / axis_length
-                clip_projection = [nx * x + ny * y for x, y in polygon]
-                glyph_projection = [nx * x + ny * y for x, y in quad]
-                if (max(clip_projection) < min(glyph_projection) - 1e-7 or
-                        max(glyph_projection) < min(clip_projection) - 1e-7):
-                    return False
-        return True
+        return _polygons_overlap(polygon, quad)
 
     kept = []
     for frag in fragments:
@@ -288,10 +300,12 @@ class _Page:
         self.cut: Counter = Counter()
         self.objects = 0
         self.ops = 0
+        self.ops_cut = False
+        self.clips: list = []  # the transformed BBox polygons of the forms being run
         self.expanded = 0
         self.active = set()
         self.frags: List[Fragment] = []
-        self.image_draws: List[Tuple[str, tuple]] = []
+        self.image_draws: List[Tuple[str, tuple, Optional[PDFStream]]] = []
         self.text_object = -1
         self.positions_left = MAX_TRACKED_PAGE
         self.positions_cut = False
@@ -308,6 +322,17 @@ class _Page:
 
     def _drop(self) -> None:
         self.cut["page_part"] += 1
+
+    def _drop_ops(self) -> None:
+        """The form operator cap, counted once for the page."""
+        if not self.ops_cut:
+            self.ops_cut = True
+            self._drop()
+
+    def _in_clips(self, a, b, c, d, e, f) -> bool:
+        """Does the unit square under (a..f) overlap every form BBox being run?"""
+        quad = [(e, f), (a + e, b + f), (a + c + e, b + d + f), (c + e, d + f)]
+        return all(_polygons_overlap(polygon, quad) for polygon in self.clips)
 
     def _object(self) -> None:
         if self.objects >= self.object_cap:
@@ -366,7 +391,7 @@ class _Page:
             if depth:
                 self.ops += 1
                 if self.ops > MAX_FORM_OPERATORS:
-                    self._drop()
+                    self._drop_ops()
                     return
             if op in (b"Tj", b"TJ", b"'", b'"'):
                 self._text_operator(op, operands, st, off or off_marks > 0, frags)
@@ -632,7 +657,8 @@ class _Page:
             xs, ys = [p[0] for p in corners], [p[1] for p in corners]
             box = (min(xs), min(ys), max(xs), max(ys))
             if _sane(*box) and box[2] > box[0] and box[3] > box[1]:
-                self.image_draws.append((name, box))
+                if self._in_clips(a, b, c, d, e, f):
+                    self.image_draws.append((name, box, stream))
         elif subtype == "Form":
             self._object()
             self._form(stream, resources, st, depth, off, frags, paths)
@@ -663,7 +689,10 @@ class _Page:
         if depth >= MAX_FORM_DEPTH or key in self.active:
             self._drop()
             return
-        if self.ops >= MAX_FORM_OPERATORS or self.expanded >= MAX_FORM_EXPANDED_BYTES:
+        if self.ops >= MAX_FORM_OPERATORS:
+            self._drop_ops()
+            return
+        if self.expanded >= MAX_FORM_EXPANDED_BYTES:
             self._drop()
             return
         data = self._form_bytes(stream)
@@ -697,12 +726,15 @@ class _Page:
         target = [] if bbox is not None else frags
         child_paths = PathCollector()
         self.active.add(key)
+        if bbox is not None:
+            self.clips.append(_bbox_polygon(bbox, form_ctm))
         try:
             self.run(data, form_resources, form_ctm, st.text_state(), depth + 1, form_off,
                      target, child_paths)
         finally:
             self.active.discard(key)
             if bbox is not None:
+                self.clips.pop()
                 for frag in _clip_form_fragments(target, bbox, form_ctm):
                     frag.order = len(frags)
                     frags.append(frag)

@@ -269,13 +269,87 @@ IMAGE = Stream({"Type": Name("XObject"), "Subtype": Name("Image"), "Width": 1, "
 
 
 def test_image_draws():
-    pc = run(b"q 100 0 0 50 72 600 cm /Im1 Do Q /Im2 Do", res(XObject={"Im1": Ref(30)}),
-             {30: IMAGE})
-    assert pc.image_draws == [("Im1", (72, 600, 172, 650))]
+    pf, resources = load(b"", res(XObject={"Im1": Ref(30)}), {30: IMAGE})
+    body = b"q 100 0 0 50 72 600 cm /Im1 Do Q /Im2 Do"
+    pc = cm.interpret(pf, body, resources, {}, OCState.from_catalog(pf), box=BOX)
+    assert [(n, b) for n, b, _s in pc.image_draws] == [("Im1", (72, 600, 172, 650))]
+    assert pc.image_draws[0][2] is pf.resolve(resources["XObject"]["Im1"])
     off = run(b"/OC /L1 BDC /Im1 Do EMC",
               res(XObject={"Im1": Ref(30)}, Properties={"L1": Ref(10)}),
               {30: IMAGE, 10: OCG}, ocg_catalog(off=[10]))
     assert off.image_draws == []
+
+
+def test_image_in_form_carries_its_own_stream():
+    other = Stream(dict(IMAGE.dictionary), b"")
+    form = form_xobject(b"q 10 0 0 10 20 20 cm /Im0 Do Q")
+    form.dictionary["Resources"] = {"XObject": {"Im0": Ref(31)}}
+    pf, resources = load(b"", res(XObject={"Im0": Ref(30), "Fm": Ref(20)}),
+                         {30: IMAGE, 31: other, 20: form})
+    body = b"q 50 0 0 50 0 0 cm /Im0 Do Q /Fm Do"
+    pc = cm.interpret(pf, body, resources, {}, OCState.from_catalog(pf), box=BOX)
+    assert [n for n, _b, _s in pc.image_draws] == ["Im0", "Im0"]
+    assert pc.image_draws[0][2] is pf.resolve(PDFRef(30, 0)) and pc.image_draws[1][2] is pf.resolve(PDFRef(31, 0))
+    assert pc.image_draws[0][2] is not pc.image_draws[1][2]
+
+
+def test_image_in_form_clipped_to_bbox():
+    form = form_xobject(b"q 10 0 0 10 20 20 cm /Im1 Do Q q 10 0 0 10 300 300 cm /Im1 Do Q")
+    form.dictionary["BBox"] = [0, 0, 100, 100]
+    pc = run(b"/Fm Do", res(XObject={"Fm": Ref(20), "Im1": Ref(30)}), {20: form, 30: IMAGE})
+    assert [b for _n, b, _s in pc.image_draws] == [(20, 20, 30, 30)]
+
+
+def test_form_operator_cap_counted_once():
+    inner = form_xobject(b"q Q " * 20000)
+    outer = form_xobject(b"/In Do /In Do /In Do")
+    outer.dictionary["Resources"] = {"XObject": {"In": Ref(21)}}
+    pc = run(b"/Out Do /Out Do /Out Do", res(XObject={"Out": Ref(20)}), {20: outer, 21: inner})
+    assert pc.cut["page_part"] == 1 and sum(pc.cut.values()) == 1, pc.cut
+
+
+def test_base_state_off_ignores_property_lists():
+    cat = ocg_catalog(off=[], on=[])
+    cat["OCProperties"]["D"]["BaseState"] = Name("OFF")
+    body = (b"/OC /P1 BDC " + text_ops("A") + b" EMC /OC /G1 BDC " + text_ops("B", y=600) + b" EMC")
+    props = res(Properties={"P1": Ref(40), "G1": Ref(10)})
+    pc = run(body, props, {40: {"MCID": 0}, 10: OCG}, cat)
+    assert [f.hidden for f in pc.fragments] == ["", "ocg"]
+    pf, resources = load(b"", res(Properties={"P1": Ref(40)}), {40: {"MCID": 0}}, cat)
+    assert OCState.from_catalog(pf).any_off(resources) is False
+
+
+def test_any_off_walks_nested_forms():
+    inner = form_xobject(b"", oc=10)
+    mid = form_xobject(b"")
+    mid.dictionary["Resources"] = {"XObject": {"In": Ref(21)}}
+    pf, resources = load(b"", res(XObject={"Mid": Ref(20)}), {10: OCG, 20: mid, 21: inner},
+                         ocg_catalog(off=[10]))
+    assert OCState.from_catalog(pf).any_off(resources) is True
+    prop = form_xobject(b"")
+    prop.dictionary["Resources"] = {"Properties": {"L": Ref(10)}}
+    pf, resources = load(b"", res(XObject={"Mid": Ref(20)}), {10: OCG, 20: prop},
+                         ocg_catalog(off=[10]))
+    assert OCState.from_catalog(pf).any_off(resources) is True
+    loop = form_xobject(b"")
+    loop.dictionary["Resources"] = {"XObject": {"Me": Ref(20)}}
+    pf, resources = load(b"", res(XObject={"Me": Ref(20)}), {20: loop}, ocg_catalog(off=[]))
+    assert OCState.from_catalog(pf).any_off(resources) is False
+
+
+def test_inline_image_keeps_following_text():
+    data = b"xEI \x00EIx\xffEI"
+    body = b"q 2 0 0 2 0 0 cm BI /W 2 /H 2 /BPC 8 /CS /G ID " + data + b"\nEI Q " + text_ops("after")
+    pc = run(body)
+    assert [f.text for f in pc.fragments] == ["after"] and pc.objects == 2
+
+
+def test_deep_q_nesting():
+    body = b"2 0 0 2 0 0 cm " + b"q " * 200000 + b"Q " * 300000 + text_ops("A")
+    start = time.time()
+    f = run(body).fragments[0]
+    assert f.size == 24 and f.x == 144
+    assert time.time() - start < 10
 
 
 def test_vertical_text():
