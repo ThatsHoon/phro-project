@@ -1,4 +1,4 @@
-"""OOXML entry (Word and PowerPoint packages) and the helpers both body parsers share.
+"""OOXML entry (Word, PowerPoint and Excel packages) and the helpers the body parsers share.
 
 The main part is found through the package relationships, never through [Content_Types].xml,
 and elements match by local name, so Transitional and Strict files take the same path.
@@ -41,16 +41,29 @@ def _main_part(pkg) -> str:
     raise ReadError("damaged", "not an OOXML package")
 
 
+def read_package(pkg, ctx):
+    """The Doc of an open package, by the root of its main part: a Word document, a presentation or a workbook."""
+    part = _main_part(pkg)
+    root, _ = load(pkg, part)
+    kind = local(root.tag)
+    if kind == "document":
+        from . import ooxml_word
+        return ooxml_word.parse_word(pkg, part, ctx)
+    if kind == "presentation":
+        from . import ooxml_slides
+        return ooxml_slides.parse_slides(pkg, part, ctx)
+    if kind == "workbook":
+        from . import ooxml_sheets
+        return ooxml_sheets.parse_sheets(pkg, part, ctx)
+    raise ReadError("damaged", "not a Word, PowerPoint or Excel package")
+
+
+def parse_package(src, ctx):
+    """Read the OOXML package `src` (a path or its bytes, nothing is written). `parse` ends in it."""
+    with Package(src) as pkg:
+        return read_package(pkg, ctx)
+
+
 def parse(path, ctx):
     _check_cfb(Path(path))
-    with Package(path) as pkg:
-        part = _main_part(pkg)
-        root, _ = load(pkg, part)
-        kind = local(root.tag)
-        if kind == "document":
-            from . import ooxml_word
-            return ooxml_word.parse_word(pkg, part, ctx)
-        if kind == "presentation":
-            from . import ooxml_slides
-            return ooxml_slides.parse_slides(pkg, part, ctx)
-        raise ReadError("damaged", "not a Word or PowerPoint package")
+    return parse_package(path, ctx)

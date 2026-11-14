@@ -1221,6 +1221,141 @@ def make_xlsb(path, sheets, *, formats=None, date1904=False, workbook_records=No
     make_zip(path, members, stored=())
 
 
+# ---- xlsx ----
+
+XLSX_SML = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XLSX_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+_XLSX_CT = "application/vnd.openxmlformats-officedocument.spreadsheetml."
+
+
+def _xml_text(s) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _xml_attr(s) -> str:
+    return _xml_text(s).replace('"', "&quot;")
+
+
+def xlsx_cell(ref, v=None, *, t=None, s=None, f=None, inline=None) -> str:
+    """One `c` element. `ref` None leaves out `r`; `v` is the value text (escaped); `f` is the formula text (escaped),
+    or a raw element when it starts with "<"; `inline` is raw `is` inner XML (and sets t="inlineStr" unless `t` is
+    given)."""
+    if inline is not None and t is None:
+        t = "inlineStr"
+    attrs = "".join(f' {k}="{_xml_attr(x)}"' for k, x in (("r", ref), ("s", s), ("t", t)) if x is not None)
+    body = ""
+    if f is not None:
+        body += f if str(f).startswith("<") else f"<f>{_xml_text(f)}</f>"
+    if v is not None:
+        body += f"<v>{_xml_text(v)}</v>"
+    if inline is not None:
+        body += f"<is>{inline}</is>"
+    return f"<c{attrs}>{body}</c>" if body else f"<c{attrs}/>"
+
+
+def xlsx_row(r, *cells, attrs="") -> str:
+    """One `row` element holding the `cells` XML; `r` None leaves out its `r`, `attrs` is raw attribute text."""
+    head = (f' r="{r}"' if r is not None else "") + (f" {attrs}" if attrs else "")
+    return f"<row{head}>{''.join(cells)}</row>"
+
+
+def _xlsx_rels(items) -> str:
+    """A relationships part from (id, type, target, external): a type without "://" gets the officeDocument
+    relationships prefix."""
+    body = ""
+    for rid, typ, target, ext in items:
+        typ = typ if "://" in typ else f"{XLSX_REL}/{typ}"
+        mode = ' TargetMode="External"' if ext else ""
+        body += f'<Relationship Id="{_xml_attr(rid)}" Type="{_xml_attr(typ)}" Target="{_xml_attr(target)}"{mode}/>'
+    return f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="{_PKG_REL}">{body}</Relationships>'
+
+
+def make_xlsx(path, sheets, *, shared=None, numfmts=None, xfs=None, date1904=False, wb_rels=(), extra_parts=None):
+    """Write an .xlsx package: content types, rels, workbook.xml, styles.xml, sharedStrings.xml and one part per sheet
+    dict; with path None nothing is written and the zip's bytes are returned.
+
+    A sheet dict has `name` (default "Sheet<n>"), `state`, `rows` (XML inside `sheetData`), `before` and `after` (XML
+    around it), `rels` ((id, type, target, external) for the sheet's own relationships part), `chartsheet` (True
+    writes `xl/chartsheets/sheet<n>.xml` holding `<drawing r:id="rId1"/>`), `rel_type` (the full Type URI of the
+    workbook's relationship to it), `part` (raw bytes or str for the part), `missing` (True writes no part) and
+    `number` (the n of the part name and of its workbook relationship id `rId<n>`, default its position + 1).
+    `shared` is a list of raw `si` inner XML strings. `numfmts` ({id: code}) and `xfs` (the `cellXfs` numFmtId list,
+    default [0]) write `xl/styles.xml`. `wb_rels` adds workbook relationships ((id, type, target, external), ids after
+    the generated ones). `extra_parts` adds or replaces parts ({name: bytes | str}); a None value leaves one out.
+    """
+    sheets = list(sheets)
+    nums = [sh.get("number", i + 1) for i, sh in enumerate(sheets)]
+    ns = f'xmlns="{XLSX_SML}" xmlns:r="{XLSX_REL}"'
+    entries, rels, overrides, members = [], [], [], {}
+    for i, (sh, n) in enumerate(zip(sheets, nums)):
+        name = sh.get("name", f"Sheet{i + 1}")
+        state = f' state="{_xml_attr(sh["state"])}"' if sh.get("state") else ""
+        entries.append(f'<sheet name="{_xml_attr(name)}" sheetId="{i + 1}"{state} r:id="rId{n}"/>')
+        chart = sh.get("chartsheet", False)
+        folder, kind = ("chartsheets", "chartsheet") if chart else ("worksheets", "worksheet")
+        part = f"xl/{folder}/sheet{n}.xml"
+        rels.append((f"rId{n}", sh.get("rel_type", kind), f"{folder}/sheet{n}.xml", False))
+        if sh.get("missing"):
+            continue
+        overrides.append((part, f"{_XLSX_CT}{kind}+xml"))
+        if "part" in sh:
+            members[part] = sh["part"]
+        elif chart:
+            members[part] = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><chartsheet {ns}>'
+                             f'{sh.get("before", "")}<drawing r:id="rId1"/>{sh.get("after", "")}</chartsheet>')
+        else:
+            members[part] = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet {ns}>'
+                             f'{sh.get("before", "")}<sheetData>{sh.get("rows", "")}</sheetData>'
+                             f'{sh.get("after", "")}</worksheet>')
+        if sh.get("rels"):
+            members[f"xl/{folder}/_rels/sheet{n}.xml.rels"] = _xlsx_rels(sh["rels"])
+    top = max(nums, default=0)
+    if numfmts is not None or xfs is not None:
+        rels.append((f"rId{top + 1}", "styles", "styles.xml", False))
+        overrides.append(("xl/styles.xml", f"{_XLSX_CT}styles+xml"))
+        fmts = "".join(f'<numFmt numFmtId="{fid}" formatCode="{_xml_attr(code)}"/>'
+                       for fid, code in (numfmts or {}).items())
+        fmts = f'<numFmts count="{len(numfmts)}">{fmts}</numFmts>' if numfmts else ""
+        cell_xfs = list(xfs) if xfs is not None else [0]
+        members["xl/styles.xml"] = (
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="{XLSX_SML}">{fmts}'
+            '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+            '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0"/></cellStyleXfs>'
+            f'<cellXfs count="{len(cell_xfs)}">'
+            + "".join(f'<xf numFmtId="{fid}" fontId="0" xfId="0" applyNumberFormat="1"/>' for fid in cell_xfs)
+            + '</cellXfs></styleSheet>')
+    if shared is not None:
+        rels.append((f"rId{top + 2}", "sharedStrings", "sharedStrings.xml", False))
+        overrides.append(("xl/sharedStrings.xml", f"{_XLSX_CT}sharedStrings+xml"))
+        members["xl/sharedStrings.xml"] = (
+            f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<sst xmlns="{XLSX_SML}" count="{len(shared)}" uniqueCount="{len(shared)}">'
+            + "".join(f"<si>{x}</si>" for x in shared) + "</sst>")
+    rels.extend(wb_rels)
+    pr = '<workbookPr date1904="1"/>' if date1904 else "<workbookPr/>"
+    members["xl/workbook.xml"] = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook {ns}>{pr}'
+                                  f'<sheets>{"".join(entries)}</sheets></workbook>')
+    members["xl/_rels/workbook.xml.rels"] = _xlsx_rels(rels)
+    members["_rels/.rels"] = _xlsx_rels([("rId1", "officeDocument", "xl/workbook.xml", False)])
+    overrides.insert(0, ("xl/workbook.xml", f"{_XLSX_CT}sheet.main+xml"))
+    members["[Content_Types].xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        + "".join(f'<Override PartName="/{p}" ContentType="{ct}"/>' for p, ct in overrides) + "</Types>")
+    order = ["[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels"]
+    members = {k: members[k] for k in order + sorted(set(members) - set(order))}
+    for name, data in (extra_parts or {}).items():
+        if data is None:
+            members.pop(name, None)
+        else:
+            members[name] = data
+    data = make_zip(path, members, stored=())
+    return data if path is None else None
+
+
 # ---- ppt ----
 
 def _ppt_chars(text, as_bytes):

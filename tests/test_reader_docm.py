@@ -152,10 +152,10 @@ def swap_main(path, data):
 
 def test_wrong_root_is_damaged():
     try:
-        parse(swap_main(docm(""), b"<workbook/>"))
+        parse(swap_main(docm(""), b"<drawing/>"))
         assert False
     except ReadError as e:
-        assert e.kind == "damaged" and "Word or PowerPoint" in e.detail
+        assert e.kind == "damaged" and "Word, PowerPoint or Excel" in e.detail, e.detail
 
 
 def test_presentation_root_goes_to_slides():
