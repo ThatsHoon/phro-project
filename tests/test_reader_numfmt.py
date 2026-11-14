@@ -161,6 +161,9 @@ def test_date_edges():
     assert display(0.0007, "m:ss") == "1:00"
     assert display(45000, "mmmmm") == "M"
     assert display(45000, "yyyy e") == "2023 2023"
+    # g (the era) prints nothing in a date section, as dochan; outside one it is a literal
+    assert display(45000, "gyyyy") == "2023" and display(45000, "ggg yyyy") == " 2023"
+    assert display(5, "0 g") == "5 g"
     assert display(44926.99999999, "yyyy-mm-dd hh:mm:ss") == "2023-01-01 00:00:00"   # rounds over midnight
     assert display(0.5, "[s]") == "43200"
     assert display(1, "[m]") == "1440"
@@ -176,6 +179,13 @@ def test_korean_locale_names():
     assert display(45000, "[$-412]mmmm") == "3월"
     assert display(45000, "mmmm ddd") == "March Wed"          # no locale tag: English names stay
     assert display(45000, "[$-409]mmm dddd") == "Mar Wednesday"
+    assert display(45000, "[$-412]mmmmm") == "3"  # the first character of the Korean month name, 3월
+    # a tag is Korean when its hex LCID's low 16 bits are 0x0412, for month and day names and AM/PM alike
+    for tag in ("412", "0412", "10412"):
+        got = display(45000.75, f"[$-{tag}]mmm dddd AM/PM h"), display(45000, f"[$-{tag}]mmmmm")
+        assert got == ("3월 수요일 오후 6", "3"), (tag, got)
+    got = display(45000.75, "[$-F412]mmm dddd AM/PM h"), display(45000, "[$-F412]mmmmm")
+    assert got == ("Mar Wednesday PM 6", "M"), got  # low word 0xF412: not Korean
 
 
 def test_weekday_only():

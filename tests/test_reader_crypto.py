@@ -122,7 +122,7 @@ def test_rc4_size_cap():
     from reader import limits
     from reader.limits import ReadError
     with mock.patch.object(limits, "DECRYPT_BYTES", 100):
-        assert rc4(b"k", bytes(100)) == rc4(b"k", bytes(100))
+        rc4(b"k", bytes(100))  # exactly the cap is read
         try:
             rc4(b"k", bytes(101))
         except ReadError as e:

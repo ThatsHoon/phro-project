@@ -351,11 +351,21 @@ def _ymd(day: int, date1904: bool):
     return d.year, d.month, d.day, weekday
 
 
+def _korean(locale: str) -> bool:
+    """A locale tag (the hex LCID after [$-) is Korean when its low 16 bits are 0x0412: 412, 0412 and 10412 are,
+    F412 is not."""
+    try:
+        return int(locale, 16) & 0xFFFF == 0x0412
+    except ValueError:
+        return False
+
+
 def _datetime(v: float, section, date1904: bool):
     """The date and time branch: the text for a section that holds date or time tokens, or None for General."""
     if v < 0 or v >= _MAX_SERIAL:
         return None
     items, locale = _items(section)
+    korean = _korean(locale)
     units = [it for it in items if it[0] in ("unit", "elapsed")]
     for idx, it in enumerate(units):  # m is a minute after an hour or before a second, else a month
         if it[0] == "unit" and it[1] == "m" and it[2] <= 2:
@@ -400,7 +410,7 @@ def _datetime(v: float, section, date1904: bool):
         elif k == "ampm":
             pm = hour24 >= 12
             text = it[1]
-            if locale == "412":
+            if korean:
                 out.append("오후" if pm else "오전")
             elif len(text) == 3:
                 out.append(("p" if pm else "a") if text.islower() else ("P" if pm else "A"))
@@ -415,15 +425,16 @@ def _datetime(v: float, section, date1904: bool):
                 out.append(f"{year % 100:02d}" if count <= 2 else f"{year:04d}")
             elif letter == "m":
                 name = _MONTHS[month - 1] if month else ""
-                if locale == "412" and month and count in (3, 4):
-                    out.append(f"{month}월")  # Korean month names are the number and 월, short or long
+                if korean and month and count >= 3:
+                    # Korean month names are the number and 월, short or long; mmmmm keeps the first character
+                    out.append(f"{month}월" if count <= 4 else f"{month}월"[:1])
                 else:
                     out.append(str(month).zfill(count) if count <= 2 else name[:3] if count == 3
                                else name if count == 4 else name[:1])
             elif letter == "d":
                 if count <= 2:
                     out.append(str(dom).zfill(count))
-                elif locale == "412":
+                elif korean:
                     out.append(_KO_DAYS[wday] if count == 3 else _KO_DAYS[wday] + "요일")
                 else:
                     out.append(_DAYS[wday][:3] if count == 3 else _DAYS[wday])
