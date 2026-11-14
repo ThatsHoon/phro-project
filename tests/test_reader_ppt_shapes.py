@@ -115,6 +115,15 @@ def test_table_group():
     assert shape.kind == "table" and isinstance(shape.blocks[0], Table), shape.kind
 
 
+def test_table_flag_in_tertiary_fopt():
+    cells = [text("a1", (0, 0, 100, 50)), text("b1", (100, 0, 200, 50)),
+             text("c1", (0, 50, 100, 100)), text("d1", (100, 50, 200, 100))]
+    shape = walked([table(cells, table="tertiary")])[0]
+    assert shape.kind == "table" and len(shape.blocks[0].rows) == 2, shape.kind
+    out, _ = md([{"shapes": [table(cells, table="tertiary")]}])
+    assert "|a1|b1|" in out and "|c1|d1|" in out, out
+
+
 def test_table_spans():
     cells = [text("wide", (0, 0, 200, 50)), text("c1", (0, 50, 100, 100)), text("d1", (100, 50, 200, 100))]
     t = walked([table(cells)])[0].blocks[0]

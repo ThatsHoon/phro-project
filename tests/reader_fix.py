@@ -1313,7 +1313,10 @@ def ppt_shape(spec, ids, *, inside=False):
     if kind == "group":
         flags = 0x201 | spec.get("flags", 0)
         head = oa_record(0xF00A, struct.pack("<II", spid, flags), ver=2)
-        if spec.get("table"):
+        if spec.get("table") == "tertiary":  # as PowerPoint writes it: the flag in an OfficeArtTertiaryFOPT
+            head += oa_record(0xF00B, struct.pack("<HI", 0x007F, 0x10001), ver=3, inst=1)
+            head += oa_record(0xF122, struct.pack("<HI", 0x039F, 1), ver=3, inst=1)
+        elif spec.get("table"):
             head += oa_record(0xF00B, struct.pack("<HI", 0x039F, 1), ver=3, inst=1)
         if spec.get("rect"):
             head += oa_record(0xF009, struct.pack("<4i", *spec["rect"]))
@@ -1467,7 +1470,7 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     text run of TextHeaderAtom type text_kind, 1 by default), placeholder (an OEPlaceholderAtom of that type in the
     ClientData), ref (an OutlineTextRefAtom index in the ClientData), link (the text carries an InteractiveInfo and a
     TextInteractiveInfoAtom). A group also has children (the shape dicts inside it), rect (its FSPGR rectangle, left,
-    top, right, bottom), table (FOPT property 0x039F = 1) and flags (extra FSP flag bits, 0x40 flipH, 0x80 flipV).
+    top, right, bottom), table (FOPT property 0x039F = 1; "tertiary" puts it in a tertiary FOPT, 0xF122) and flags (extra FSP flag bits, 0x40 flipH, 0x80 flipV).
     raw_shapes: {slide number from 1: OfficeArt record bytes} appended to that slide's DgContainer after its
     SpgrContainer. pictures: a list of BLIP records (blip_png, blip_bitmap, blip_metafile), written one after
     another into the Pictures stream; the DocumentContainer gains a PPDrawingGroup (0x040B) whose DggContainer holds a
