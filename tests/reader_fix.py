@@ -1052,6 +1052,8 @@ def encrypt_xls(sheets, password, kind, **kw):
     from reader.containers import officecrypt
     from reader.containers.crypto import rc4
     from reader.formats import xls_crypt
+    # The clear-record set and the rotate-right table below are spelled out here on purpose, not imported from
+    # xls_crypt: the fixture must stay an independent encoder, or a slip in the reader's copy would cancel out.
     clear = {0x0809, 0x0009, 0x0209, 0x0409, 0x002F, 0x0194, 0x0195, 0x00E1, 0x0196, 0x0138}
     if kind == "xor":
         key = xls_crypt.xor_key(password)

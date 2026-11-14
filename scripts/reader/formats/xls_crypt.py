@@ -12,15 +12,14 @@ import struct
 
 from .. import limits
 from ..containers import crypto, officecrypt
-from ..limits import ReadError
 from ..containers.officecrypt import XLS_DEFAULT
+from ..limits import ReadError
 from . import biff
 
 # Records whose bodies stay clear ([MS-XLS] 2.2.10), as in dochan's `clear_records`.
 CLEAR = frozenset({0x0809, 0x0009, 0x0209, 0x0409, 0x002F, 0x0194, 0x0195, 0x00E1, 0x0196, 0x0138})
 _BOUNDSHEET = 0x0085
 _ROT_LEFT = bytes(((v << 3) | (v >> 5)) & 0xFF for v in range(256))     # decrypting: rotate left by 3
-_ROT_RIGHT = bytes(((v >> 3) | (v << 5)) & 0xFF for v in range(256))    # encrypting (tests): rotate right by 3
 _INITIAL = (0xE1F0, 0x1D0F, 0xCC9C, 0x84C0, 0x110C, 0x0E10, 0xF1CE, 0x313E, 0x1872, 0xE139, 0xD40F, 0x84F9,
             0x280C, 0xA96A, 0x4EC3)
 _SEEDS = (0xAEFC, 0x7B61, 0x4563, 0x0375, 0xD849, 0x6F45, 0xEB23, 0x47D3, 0xB861, 0x45A0, 0xAA51, 0x76B4,

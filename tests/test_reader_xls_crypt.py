@@ -90,6 +90,8 @@ def test_user_password():
 
 def test_xor_known_answer():
     # computed once with dochan crypto/legacy.py (_xor_array_bytes accepts exactly these for "VelvetSweatshop")
+    # No Excel-made vector is at hand (ref/ holds no MS-OFFCRYPTO or MS-XLS text, and the POI sample is not kept), so
+    # the XOR index and RC4 block conventions rest on dochan's reading of the spec and the reviewer's cross-check.
     assert xls_crypt.xor_key("VelvetSweatshop") == 0xB359
     assert xls_crypt.xor_verifier("VelvetSweatshop") == 0x9A0A
     assert xls_crypt.xor_array("VelvetSweatshop", 0xB359).hex() == "876b9ae21ee305621e699660986e9404"
