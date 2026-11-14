@@ -449,15 +449,20 @@ class _Render:
         if hc:
             mapped, lost = {}, set()
             for (r, c), (cell, rs, cs) in origins.items():
-                n = bisect_right(hc, c + cs - 1) - bisect_left(hc, c)
+                lo, hi = bisect_left(hc, c), bisect_right(hc, c + cs - 1)
+                n = hi - lo
                 if n < cs:
-                    mapped[(r, c - bisect_left(hc, c))] = (cell, rs, cs - n)
-                    continue
+                    mapped[(r, c - lo)] = (cell, rs, cs - n)
+                    if n == 0:
+                        continue
+                    cols = hc[lo:hi]  # the hidden columns a wider span holds: its text is partly left out
+                else:
+                    cols = range(c, c + cs)
                 k = id(cell.blocks)
                 if k not in texty:
                     texty[k] = self._has_text(cell.blocks)
                 if texty[k] and r not in t.hidden_rows:
-                    lost.update(range(c, c + cs))
+                    lost.update(cols)
             origins = mapped
             if count:
                 self.hidden_count += len(lost)
