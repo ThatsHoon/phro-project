@@ -554,11 +554,15 @@ def oa_shape(spid, pib=None, anchor: bytes | None = None):
     return oa_container(0xF004, out)
 
 
-def oa_group(spid, *members):
-    """An SpgrContainer (0xF003): its group shape first (an SpContainer whose FSP has fGroup 0x1), then the members,
-    records already built (oa_shape, oa_group), in order."""
+def oa_group(spid, *members, anchor: bytes | None = None):
+    """An SpgrContainer (0xF003): its group shape first (an SpContainer whose FSP has fGroup 0x1, and a ClientAnchor
+    (0xF010) with the body `anchor` when that is given), then the members, records already built (oa_shape,
+    oa_group), in order."""
     import struct
-    shape = oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", spid, 0x201), ver=2))
+    shape = oa_record(0xF00A, struct.pack("<II", spid, 0x201), ver=2)
+    if anchor is not None:
+        shape += oa_record(0xF010, anchor)
+    shape = oa_container(0xF004, shape)
     return oa_container(0xF003, shape, *members)
 
 

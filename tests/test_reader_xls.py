@@ -14,12 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader import limits  # noqa: E402
-from reader.formats import biff, sheet_grid, xls  # noqa: E402
+from reader.formats import biff, sheet_grid, xls, xls_drawing  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader.formats import xls_drawing  # noqa: E402
-from reader_fix import (biff as rec, biff_chart, biff_workbook, blip_png, make_cfb, make_xls, oa_container, oa_fbse,  # noqa: E402
-                        oa_group, oa_shape)
+from reader_fix import (biff as rec, biff_chart, biff_workbook, blip_metafile, blip_png, make_cfb, make_xls,  # noqa: E402
+                        oa_container, oa_fbse, oa_group, oa_shape)
 
 
 def run(sheets, hidden=False, **kw):
@@ -355,6 +354,7 @@ def test_nested_bof_skipped():
 
 PNG_A = bytes.fromhex("89504e470d0a1a0a") + b"A" * 24
 PNG_B = bytes.fromhex("89504e470d0a1a0a") + b"B" * 24
+PNG_C = bytes.fromhex("89504e470d0a1a0a") + b"C" * 24
 
 
 def dgg(*pngs):
@@ -378,7 +378,8 @@ def pics(sheets, **kw):
         make_xls(src, sheets, **kw)
         meta = reader.convert(src, Path(d) / "out", hidden=False)
         text = (Path(d) / "out" / "out.md").read_text(encoding="utf-8")
-        assets = {f.name: f.read_bytes() for f in (Path(d) / "out" / "assets").glob("*")}             if (Path(d) / "out" / "assets").exists() else {}
+        folder = Path(d) / "out" / "assets"
+        assets = {f.name: f.read_bytes() for f in folder.glob("*")} if folder.exists() else {}
         return text, meta, assets
 
 
@@ -438,6 +439,64 @@ def test_drawing_continue_joined():
     both = dgg(PNG_A)
     text, meta, assets = pics([sheet], drawing=both, drawing_split=len(both) - 7)
     assert assets == {"img-001.png": PNG_A}, assets
+
+
+def test_blip_cache_is_per_workbook():
+    # one picture placed on three sheets is inflated once against the document's flate budget
+    emf = bytes(40) + b" EMF" + bytes(200)
+    store = oa_container(0xF000, oa_container(0xF001, oa_fbse(blip_metafile(0xF01A, 0x3D4, emf))))
+    draw = dg(oa_shape(1025, 1, anchor(0)))
+    sheets = [{"name": n, "drawing": draw} for n in "ABC"]
+    wb = xls.Workbook(biff_workbook(sheets, drawing=store), Context(), sheet_grid.Budget())
+    wb.sections()
+    assert wb.flate.used == len(emf), (wb.flate.used, len(emf))
+
+
+def test_group_anchor_is_inherited():
+    # a picture with no anchor of its own is placed where its group is, as dochan does; the nearest group wins
+    inner = oa_group(2001, oa_shape(1027, 3), anchor=anchor(2))
+    outer = oa_group(2000, oa_shape(1026, 2), inner, anchor=anchor(1))
+    sheet = {"name": "S", "drawing": dg(oa_shape(1025, 1, anchor(5)), outer)}
+    _, _, assets = pics([sheet], drawing=dgg(PNG_A, PNG_B, PNG_C))
+    assert [assets[f"img-00{i}.png"] for i in (1, 2, 3)] == [PNG_B, PNG_C, PNG_A], assets
+    # a group with no anchor, or a cut one, gives nothing: its pictures follow the anchored ones
+    bare = oa_group(2000, oa_shape(1026, 2), anchor=b"\0\0\0")
+    sheet = {"name": "S", "drawing": dg(bare, oa_shape(1025, 1, anchor(5)))}
+    _, _, assets = pics([sheet], drawing=dgg(PNG_A, PNG_B))
+    assert [assets[f"img-00{i}.png"] for i in (1, 2)] == [PNG_A, PNG_B], assets
+
+
+def test_placements_past_the_cap_are_cut_in_reading_order():
+    sheet = {"name": "S", "drawing": dg(oa_shape(1025, 1, anchor(5)), oa_shape(1026, 2, anchor(1)))}
+    old = xls_drawing.MAX_PLACEMENTS
+    xls_drawing.MAX_PLACEMENTS = 1
+    try:
+        text, _, assets = pics([sheet], drawing=dgg(PNG_A, PNG_B))
+    finally:
+        xls_drawing.MAX_PLACEMENTS = old
+    assert assets == {"img-001.png": PNG_B} and "(could not read: 1 image)" in text, (assets, text)
+
+
+def test_repeated_picture_is_placed_each_time():
+    sheet = {"name": "S", "drawing": dg(oa_shape(1025, 1, anchor(0)), oa_shape(1026, 1, anchor(1)))}
+    text, _, assets = pics([sheet], drawing=dgg(PNG_A))
+    assert text.count("![](assets/") == 2 and set(assets.values()) == {PNG_A}, (text, assets)
+
+
+def test_txo_and_obj_between_drawing_records():
+    body = dg(oa_shape(1025, 1, anchor(0)))
+    cut = len(body) // 2
+    records = [rec(0x00EC, body[:cut]) + rec(0x005D, b"obj") + rec(0x01B6, b"txo") + rec(0x003C, b"text")
+               + rec(0x00EC, body[cut:])]
+    text, _, assets = pics([{"name": "S", "records": records}], drawing=dgg(PNG_A))
+    assert assets == {"img-001.png": PNG_A} and "could not read" not in text, (assets, text)
+
+
+def test_short_anchor_is_unanchored():
+    sheet = {"name": "S", "drawing": dg(oa_shape(1025, 1, b"\0\0\0"), oa_shape(1026, 2, anchor(9)))}
+    text, _, assets = pics([sheet], drawing=dgg(PNG_A, PNG_B))
+    assert [assets[f"img-00{i}.png"] for i in (1, 2)] == [PNG_B, PNG_A], assets
+    assert "could not read" not in text, text
 
 
 def main():

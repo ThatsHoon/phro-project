@@ -26,7 +26,8 @@ HWP_RECORDS = 1_000_000   # records of one HWP stream
 BIN_RECORDS = 2_000_000    # records of one BIFF stream, one BIFF12 part or one PowerPoint Document stream
 DECRYPT_BYTES = 32 * 2**20  # bytes one xls or ppt stream may decrypt
 EMBED_BYTES = 16 * 2**20    # bytes of one Excel workbook stream embedded in an hwp or doc object
-IMAGE_BYTES = 256 * 2**20  # image bytes one docx, doc, hwp, hwpx, ppt, xlsb or rtf document may emit, copies counted
+IMAGE_BYTES = 256 * 2**20  # image bytes one docx, doc, hwp, hwpx, ppt, xls, xlsb or rtf document may emit, copies counted
+# (an xls also caps the picture placements it reads, all its sheets together: xls_drawing.MAX_PLACEMENTS)
 # tables one doc, docx, hwp, hwpx or rtf document may open, nested ones counted (an rtf or ppt table's cells are what
 # it charges). A .doc paragraph opens up to 63 with one
 # 3-byte sprmPItap, and a deflated docx part or hwp section holds one in about a byte; each costs the model about

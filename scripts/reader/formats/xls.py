@@ -9,7 +9,8 @@ when its default password verifies, else it is `encrypted`. A compound file with
 `cfb_route`: another format's file named .xls is read by its own parser. A sheet that cannot be read is counted under
 `sheet` and the others still come out. Charts (a chart sheet, or a substream nested in a worksheet) are read by
 `biff_chart` after every worksheet, so a reference to a later sheet resolves; each table goes back into its sheet's
-section after its pictures, charged against `CHART_TOTAL` like the other formats' charts.
+section after its pictures, charged against `CHART_TOTAL` like the other formats' charts. A sheet's pictures
+(`xls_drawing`) follow its table, charged against `IMAGE_BYTES` and the workbook's placement cap.
 """
 import copy
 import struct
@@ -25,7 +26,7 @@ from . import biff, biff_chart, cfb_route, sheet_grid, xls_alike, xls_crypt, xls
 _ROW, _COLINFO, _MERGED = 0x0208, 0x007D, 0x00E5
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
 _FORMULA, _STRING = 0x0006, 0x0207
-_MSODRAWING = 0x00EC
+_MSODRAWING = 0x00EC  # a sheet's drawing records, joined and read by xls_drawing
 _AFTER_FORMULA = frozenset({0x04BC, 0x0221, 0x0236})  # SHRFMLA, ARRAY, TABLE: may sit between FORMULA and STRING
 _CELLS = frozenset({_LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR, _FORMULA})
 _ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!", 0x2A: "#N/A"}
@@ -58,6 +59,7 @@ class Workbook:
         self._fmt: dict[int, str] = {}
         self.flate = flate.Budget()  # one inflate budget and one image byte count for the whole document's pictures
         self.spent = [0, 0]  # image bytes placed, picture placements read
+        self.blips: dict[int, bytes | None] = {}  # BStore entries read (pib -> image), shared by every sheet
         self._starts: dict[int, list] = {}  # sheet index -> offsets of the chart substreams nested in it
         self.charts = 0       # chart substreams read
         self.chart_cells = 0  # chart table cells placed so far (CHART_TOTAL)
@@ -136,7 +138,8 @@ class Workbook:
         self._starts[i] = starts
         blocks = grid.blocks()
         if draw:
-            blocks = blocks + xls_drawing.pictures(self.g, b"".join(draw), self.flate, self.spent, self.ctx)
+            blocks = blocks + xls_drawing.pictures(self.g, b"".join(draw), self.flate, self.spent, self.ctx,
+                                                       self.blips)
         self._blocks[i] = blocks
         return blocks
 
