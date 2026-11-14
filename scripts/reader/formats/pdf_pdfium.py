@@ -1,0 +1,721 @@
+"""pdf pages read by pypdfium2: one `PageData` per page, the same the native front end gives, so
+`formats/pdf.py`'s page loop serves both.
+
+This is the one module of the reader that imports a package outside the standard library. It is
+imported only in the pdf venv's interpreter, and `pdf.py` imports it inside a function.
+pypdfium2's pdfium has no V8 or XFA, so no JavaScript runs.
+
+What the spike learned is kept. `init_forms()` is called before any page is loaded.
+- Chars come from the `PdfTextPage`. Surrogate pairs are joined; pdfium's line-end hyphen (0x02,
+  0xFFFE) becomes `-` for the hyphen rule; generated chars are dropped (the spaces come from the
+  char boxes, through `char_gaps`) and a generated line break ends the run. Consecutive chars of
+  one text object on one line make one `Fragment`; its size is the loose char box height across
+  the text direction, and its `char_offsets` and `char_gaps` come from the loose boxes along it.
+  The text object's render mode (3 or 7) sets `invisible`.
+- Page objects are walked iteratively in content order, form XObjects included to FORM_DEPTH
+  levels, each object's matrix composed with its forms' (pdfium gives a nested object's matrix
+  in its form's space). Path points go through that matrix into `pdf_tables.PathCollector`, with
+  its thin-fill and straight-curve rules. Images keep their box and pixel size.
+- An image's bytes: DCT data as it is; over `images._MAX_PIXELS` pixels, a CROP_DPI render of
+  its box; anything else a PNG of `FPDFImageObj_GetBitmap` through `images._png`.
+- `render(box, dpi)` renders the page (box None) or a page-space box, long side capped at
+  RENDER_LONG pixels.
+- Links are `FPDFLink_*` URI actions of `annotations.SCHEMES`; comments and fields come from the
+  page's annotations, through `annotations.order_comments` and `annotations.field_entry`.
+- On a page whose resources name an off optional-content group (decision 3), pdfium cannot tell
+  which marked text the group covers: that page's fragments come from the native interpreter.
+
+Counts, as in `pdfnative.document`: `.cut` is the document total, each `PageData.cut` the part
+its page added (a page is added once). The object walk past `pdf.PDF_PAGE_OBJECTS`, a form past
+FORM_DEPTH and a char scan past CHAR_SCAN count `page_part`; images past `pdf.PDF_PAGE_IMAGES`
+count `image` once; annotations past `annotations.PDF_ANNOTS` and a comment cut at ANNOT_CHARS
+count `annotation`; a field value cut by `field_entry` counts `field`. Path points past
+PATH_POINTS are ignored and not counted, like rules past `pdf_tables.PDF_SEGMENTS`.
+"""
+import ctypes
+import math
+from collections import Counter
+
+import pypdfium2 as pdfium
+import pypdfium2.raw as raw
+
+from .. import images as reader_images
+from .. import limits
+from ..limits import ReadError
+from ..pdfnative import annotations
+from . import pdf as caps
+from .pdf_layout import LINE_TOLERANCE, Comment, Fragment, PageData, PageImage
+from .pdf_tables import PDF_SEGMENTS, PathCollector
+
+FORM_DEPTH = 16                  # form XObject levels walked (pypdfium2 get_objects max_depth)
+PATH_POINTS = 8 * PDF_SEGMENTS   # path points read per page; the rest are ignored
+CHAR_SCAN = 4                    # chars scanned per page: CHAR_SCAN x pdf.PDF_PAGE_CHARS
+IMAGE_FILTERS = 8                # filters read per image
+OPTION_LABELS = annotations.FIELD_KIDS  # list-box options read per field
+OUTLINE_SCAN = 4 * annotations.OUTLINE_ITEMS  # bookmarks visited for the outline
+
+_COORD = 1e9
+_LETTER = (0.0, 0.0, 612.0, 792.0)
+_IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+_HYPHENS = (0x02, 0xFFFE)
+_DCT = ("DCTDecode", "DCT")
+_SIMPLE = ("ASCIIHexDecode", "AHx", "ASCII85Decode", "A85", "RunLengthDecode", "RL",
+           "FlateDecode", "Fl", "LZWDecode", "LZW")
+_MARKUP = {getattr(raw, "FPDF_ANNOT_" + name) for name in (
+    "TEXT", "FREETEXT", "HIGHLIGHT", "UNDERLINE", "SQUIGGLY", "STRIKEOUT", "CARET", "STAMP", "INK",
+    "SQUARE", "CIRCLE", "LINE", "POLYGON", "POLYLINE", "FILEATTACHMENT", "SOUND", "REDACT")}
+_FIELD_KINDS = {raw.FPDF_FORMFIELD_PUSHBUTTON: "push", raw.FPDF_FORMFIELD_CHECKBOX: "check",
+                raw.FPDF_FORMFIELD_RADIOBUTTON: "radio", raw.FPDF_FORMFIELD_COMBOBOX: "choice",
+                raw.FPDF_FORMFIELD_LISTBOX: "choice", raw.FPDF_FORMFIELD_TEXTFIELD: "text",
+                raw.FPDF_FORMFIELD_SIGNATURE: "sig"}
+
+
+class PdfiumOpenError(Exception):
+    """pdfium could not open the file, for a reason other than a password."""
+
+
+# ---- small helpers
+
+def _finite(*values) -> bool:
+    return all(isinstance(v, (int, float)) and math.isfinite(v) and abs(v) <= _COORD for v in values)
+
+
+def _rect(x0, y0, x1, y1):
+    """A normalised box with finite coordinates and an area, or None."""
+    if not _finite(x0, y0, x1, y1):
+        return None
+    x0, x1 = sorted((float(x0), float(x1)))
+    y0, y1 = sorted((float(y0), float(y1)))
+    return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
+
+
+def _compose(m, n):
+    """m then n, in the pdf row-vector convention (a point is p x m x n)."""
+    a, b, c, d, e, f = m
+    a2, b2, c2, d2, e2, f2 = n
+    return (a * a2 + b * c2, a * b2 + b * d2, c * a2 + d * c2, c * b2 + d * d2,
+            e * a2 + f * c2 + e2, e * b2 + f * d2 + f2)
+
+
+def _apply(m, x, y):
+    return x * m[0] + y * m[2] + m[4], x * m[1] + y * m[3] + m[5]
+
+
+def _matrix(obj):
+    fs = raw.FS_MATRIX()
+    if not raw.FPDFPageObj_GetMatrix(obj, fs):
+        return _IDENTITY
+    return (fs.a, fs.b, fs.c, fs.d, fs.e, fs.f)
+
+
+def _unit(x, y, default):
+    n = math.hypot(x, y)
+    return (x / n, y / n) if n > 0 and math.isfinite(n) else default
+
+
+def _address(handle) -> int:
+    return ctypes.cast(handle, ctypes.c_void_p).value or 0
+
+
+def _wide(fn, *args) -> str:
+    """A UTF-16LE string from a pdfium getter that takes (buffer, length in bytes), the NUL
+    stripped."""
+    n = fn(*args, None, 0)
+    if n <= 2:
+        return ""
+    buf = (raw.FPDF_WCHAR * ((n + 1) // 2))()
+    fn(*args, buf, n)
+    return bytes(buf)[:n].decode("utf-16-le", "replace").rstrip("\x00")
+
+
+def _rgb_rows(data, width, height, stride, fmt):
+    """(rows, alpha) of a pdfium bitmap buffer as RGB (or RGBA) rows, or None."""
+    rows = []
+    if fmt == raw.FPDFBitmap_Gray:
+        for y in range(height):
+            line = data[y * stride:y * stride + width]
+            out = bytearray(width * 3)
+            out[0::3] = out[1::3] = out[2::3] = line
+            rows.append(bytes(out))
+        return rows, False
+    if fmt in (raw.FPDFBitmap_BGR, raw.FPDFBitmap_BGRx, raw.FPDFBitmap_BGRA, raw.FPDFBitmap_BGRA_Premul):
+        step = 3 if fmt == raw.FPDFBitmap_BGR else 4
+        alpha = fmt in (raw.FPDFBitmap_BGRA, raw.FPDFBitmap_BGRA_Premul)
+        span = 4 if alpha else 3
+        for y in range(height):
+            line = data[y * stride:y * stride + width * step]
+            out = bytearray(width * span)
+            out[0::span] = line[2::step]
+            out[1::span] = line[1::step]
+            out[2::span] = line[0::step]
+            if alpha:
+                out[3::span] = line[3::step]
+            rows.append(bytes(out))
+        return rows, alpha
+    return None
+
+
+# ---- the document
+
+class PdfiumDoc:
+    """An open pdf read by pdfium. `native` is the NativeDoc of the same bytes, or None when the
+    native parser could not open them."""
+
+    def __init__(self, data: bytes, native=None):
+        try:
+            self._pdf = pdfium.PdfDocument(data)
+        except pdfium.PdfiumError as e:
+            if getattr(e, "err_code", None) == raw.FPDF_ERR_PASSWORD:
+                raise ReadError("encrypted", "user password") from None
+            raise PdfiumOpenError(str(e)) from None
+        except Exception as e:  # noqa: BLE001 - any other open failure falls back to native
+            raise PdfiumOpenError(type(e).__name__) from None
+        try:
+            self._pdf.init_forms()  # before any page is loaded, so widgets have a form handle
+        except Exception:  # noqa: BLE001 - no form environment: fields are not read
+            pass
+        self.native = native
+        self.cut: Counter = Counter()
+        self.page_count = len(self._pdf)
+        if native is not None:
+            self.xfa, self.attachments = native.xfa, native.attachments
+        else:
+            self.xfa = raw.FPDF_GetFormType(self._pdf.raw) in (raw.FORMTYPE_XFA_FULL,
+                                                               raw.FORMTYPE_XFA_FOREGROUND)
+            self.attachments = raw.FPDFDoc_GetAttachmentCount(self._pdf.raw) > 0
+        self._read: set = set()
+        self._field_page: dict = {}  # full field name -> the page its entry goes on
+
+    def outline(self):
+        """[(depth from 1, title, 0-based page)] from get_toc(): the depth is level + 1 and the page
+        dest.get_index() (a GoTo action's destination when the item has no /Dest). At most
+        OUTLINE_ITEMS items, from at most OUTLINE_SCAN bookmarks."""
+        out = []
+        doc = self._pdf.raw
+        for visited, mark in enumerate(self._pdf.get_toc(max_depth=annotations.OUTLINE_DEPTH)):
+            if len(out) >= annotations.OUTLINE_ITEMS or visited >= OUTLINE_SCAN:
+                break
+            title = (mark.get_title() or "").strip()
+            if not title:
+                continue
+            dest = mark.get_dest()
+            page = dest.get_index() if dest is not None else None
+            if page is None:
+                action = raw.FPDFBookmark_GetAction(mark.raw)
+                if action and raw.FPDFAction_GetType(action) == raw.PDFACTION_GOTO:
+                    target = raw.FPDFAction_GetDest(doc, action)
+                    found = raw.FPDFDest_GetDestPageIndex(doc, target) if target else -1
+                    page = found if found >= 0 else None
+            if page is not None:
+                out.append((mark.level + 1, title[:1_000], page))
+        return out
+
+    # -- one page
+
+    def page(self, index: int) -> PageData:
+        page = self._pdf[index]
+        cut: Counter = Counter()
+        try:
+            box = _rect(*page.get_bbox()) or _LETTER
+        except Exception:  # noqa: BLE001
+            box = _LETTER
+        try:
+            turn = page.get_rotation()
+        except Exception:  # noqa: BLE001
+            turn = 0
+        textpage = page.get_textpage()
+        try:
+            fragments = self._chars(textpage, cut)
+        finally:
+            textpage.close()
+        native = self._native_fragments(index, cut)
+        if native is not None:
+            fragments = native
+        chars = sum(1 for f in fragments for ch in f.text if not ch.isspace())
+
+        def render(target, dpi):
+            return self._render(page, box, turn, target, dpi)
+
+        collector = PathCollector()
+        drawn = self._walk(page, collector, cut)
+        shown, capped = self._images(drawn, box, chars, render)
+        if capped:
+            cut["image"] += 1
+        links, comments, fields = self._annots(page, index, cut)
+        if index not in self._read:
+            self._read.add(index)
+            self.cut.update(cut)
+        return PageData(number=index + 1, box=box, rotate=turn, fragments=fragments,
+                        segments=collector.segments, short=collector.short_segments, images=shown,
+                        figure=collector.figure, links=links, fields=fields, comments=comments,
+                        chars=chars, cut=cut, render=render)
+
+    def _native_fragments(self, index, cut):
+        """Decision 3: on a page whose resources name an off group, the fragments of the native
+        interpreter (their hidden="ocg" marks the off text); None elsewhere. Should the native
+        page fail, its text is left out (counted page_part) rather than shown with the off
+        layer's text in it."""
+        native = self.native
+        if native is None or index >= native.page_count:
+            return None
+        try:
+            off = native.oc.any_off(native.resources(index))
+        except Exception:  # noqa: BLE001
+            return None
+        if not off:
+            return None
+        try:
+            got = native.page(index)
+        except ReadError as e:
+            if e.kind == "timeout":
+                raise
+            cut["page_part"] += 1
+            return []
+        except Exception:  # noqa: BLE001
+            cut["page_part"] += 1
+            return []
+        for kind, value in got.cut.items():
+            if kind not in ("image", "annotation", "field"):  # pdfium reads those itself
+                cut[kind] += value
+        return list(got.fragments)
+
+    # -- chars
+
+    def _chars(self, textpage, cut):
+        tp = textpage.raw
+        count = raw.FPDFText_CountChars(tp)
+        if count <= 0:
+            return []
+        limit = CHAR_SCAN * caps.PDF_PAGE_CHARS
+        if count > limit:
+            cut["page_part"] += 1
+            count = limit
+        rect, fsm = raw.FS_RECTF(), raw.FS_MATRIX()
+        ox, oy = ctypes.c_double(), ctypes.c_double()
+        frags, objects, modes, fonts, axes = [], {}, {}, {}, {}
+        run = None  # the fragment being built: a dict
+        seen = 0    # non-space chars kept
+        bad = False
+
+        def flush():
+            nonlocal run
+            if run is not None and run["text"]:
+                frags.append(self._fragment(run, len(frags)))
+            run = None
+
+        k = 0
+        while k < count:
+            c = raw.FPDFText_GetUnicode(tp, k)
+            generated = raw.FPDFText_IsGenerated(tp, k) == 1
+            at = k
+            k += 1
+            if generated:
+                if c in (0x0D, 0x0A):
+                    flush()
+                continue
+            if 0xDC00 <= c <= 0xDFFF:
+                continue  # a low surrogate with no high one before it
+            if 0xD800 <= c <= 0xDBFF:
+                low = raw.FPDFText_GetUnicode(tp, k) if k < count else 0
+                if 0xDC00 <= low <= 0xDFFF:
+                    c = 0x10000 + ((c - 0xD800) << 10) + (low - 0xDC00)
+                    k += 1
+                else:
+                    c = 0xFFFD
+            if c in _HYPHENS:
+                ch = "-"
+            elif c == 0:
+                continue
+            else:
+                ch = chr(c)
+            if ch in ("\r", "\n"):
+                flush()
+                continue
+            if not (raw.FPDFText_GetLooseCharBox(tp, at, rect) and raw.FPDFText_GetCharOrigin(tp, at, ox, oy)):
+                continue
+            left, right, bottom, top, x, y = rect.left, rect.right, rect.bottom, rect.top, ox.value, oy.value
+            # a NaN fails every comparison, so this also refuses NaN and infinities
+            if not (-_COORD <= left <= _COORD and -_COORD <= right <= _COORD and -_COORD <= bottom <= _COORD
+                    and -_COORD <= top <= _COORD and -_COORD <= x <= _COORD and -_COORD <= y <= _COORD):
+                bad = True
+                continue
+            handle = raw.FPDFText_GetTextObject(tp, at)
+            addr = _address(handle)
+            if addr not in objects:
+                # the text matrix, render mode and font are the text object's: read once
+                objects[addr] = len(objects)
+                modes[addr] = raw.FPDFTextObj_GetTextRenderMode(handle) in (3, 7) if handle else False
+                fonts[addr] = self._font(handle)
+                if raw.FPDFText_GetMatrix(tp, at, fsm) and _finite(fsm.a, fsm.b, fsm.c, fsm.d):
+                    dx, dy = _unit(fsm.a, fsm.b, (1.0, 0.0))
+                    axes[addr] = (dx, dy, *_unit(fsm.c, fsm.d, (-dy, dx)))
+                else:
+                    axes[addr] = (1.0, 0.0, 0.0, 1.0)
+            dx, dy, ux, uy = axes[addr]
+            # the loose box projected on the text direction (where the advance ends) and on the
+            # glyph's up (the size)
+            start = x * dx + y * dy
+            end = (right * dx if dx >= 0 else left * dx) + (top * dy if dy >= 0 else bottom * dy)
+            base = x * ux + y * uy
+            size = (right - left) * abs(ux) + (top - bottom) * abs(uy)
+            if run is not None:
+                tol = LINE_TOLERANCE * max(size, run["size"])
+                if run["addr"] != addr or abs(base - run["base"]) > tol or start < run["end"] - tol:
+                    flush()
+            if run is None:
+                run = {"addr": addr, "x": x, "y": y, "dx": dx, "dy": dy, "ux": ux,
+                       "uy": uy, "base": base, "start": start, "end": end, "size": size,
+                       "text": [], "offsets": [], "gaps": []}
+            run["gaps"].append(start - run["end"] if run["text"] else 0.0)
+            run["offsets"].append(start - run["start"])
+            run["text"].append(ch)
+            run["end"] = max(end, start)
+            run["size"] = max(run["size"], size)
+            run["obj"], run["invisible"], run["font"] = objects[addr], modes[addr], fonts[addr]
+            if not ch.isspace():
+                seen += 1
+                if seen > caps.PDF_PAGE_CHARS:
+                    break  # pdf.py counts the rest as `text`
+        flush()
+        if bad:
+            cut["bad_coord"] += 1
+        return frags
+
+    @staticmethod
+    def _fragment(run, order):
+        text = "".join(run["text"])
+        width = max(0.0, run["end"] - run["start"])
+        return Fragment(x=run["x"], y=run["y"], width=width, size=run["size"], text=text,
+                        space_width=0.25 * run["size"], order=order, dir_x=run["dx"],
+                        dir_y=run["dy"], up_x=run["ux"], up_y=run["uy"],
+                        char_offsets=tuple(run["offsets"]) + (width,), char_gaps=tuple(run["gaps"]),
+                        invisible=run["invisible"], font=run["font"], obj=run["obj"])
+
+    @staticmethod
+    def _font(handle) -> str:
+        if not handle:
+            return ""
+        font = raw.FPDFTextObj_GetFont(handle)
+        if not font:
+            return ""
+        n = raw.FPDFFont_GetBaseFontName(font, None, 0)
+        if n <= 1 or n > 1_024:
+            return ""
+        buf = ctypes.create_string_buffer(n)
+        raw.FPDFFont_GetBaseFontName(font, buf, n)
+        name = buf.value.decode("latin-1", "replace")
+        tag, plus, rest = name.partition("+")
+        return rest if plus and len(tag) == 6 and tag.isupper() else name
+
+    # -- page objects
+
+    def _walk(self, page, collector, cut):
+        """Paths into `collector`; [(image handle, matrix)] in content order. Iterative, to
+        FORM_DEPTH form levels and pdf.PDF_PAGE_OBJECTS objects."""
+        images = []
+        visited = 0
+        points = [PATH_POINTS]
+        deep = False
+        frames = [[page.raw, False, _IDENTITY, 0, 0, raw.FPDFPage_CountObjects(page.raw)]]
+        while frames:
+            frame = frames[-1]
+            parent, form, outer, depth, i, n = frame
+            if i >= n:
+                frames.pop()
+                continue
+            frame[4] += 1
+            visited += 1
+            if visited > caps.PDF_PAGE_OBJECTS:
+                cut["page_part"] += 1
+                break
+            obj = raw.FPDFFormObj_GetObject(parent, i) if form else raw.FPDFPage_GetObject(parent, i)
+            if not obj:
+                continue
+            kind = raw.FPDFPageObj_GetType(obj)
+            if kind not in (raw.FPDF_PAGEOBJ_PATH, raw.FPDF_PAGEOBJ_IMAGE, raw.FPDF_PAGEOBJ_FORM):
+                continue
+            m = _compose(_matrix(obj), outer)
+            if kind == raw.FPDF_PAGEOBJ_PATH:
+                self._path(obj, m, collector, points)
+            elif kind == raw.FPDF_PAGEOBJ_IMAGE:
+                images.append((obj, m))
+            elif depth + 1 < FORM_DEPTH:
+                frames.append([obj, True, m, depth + 1, 0, raw.FPDFFormObj_CountObjects(obj)])
+            elif not deep and raw.FPDFFormObj_CountObjects(obj) > 0:
+                deep = True
+                cut["page_part"] += 1
+        return images
+
+    @staticmethod
+    def _path(obj, m, collector, points):
+        n = raw.FPDFPath_CountSegments(obj)
+        if n <= 0 or points[0] <= 0:
+            return
+        if n > points[0]:
+            n = points[0]
+        points[0] -= n
+        x, y = ctypes.c_float(), ctypes.c_float()
+        curve = []
+        for k in range(n):
+            seg = raw.FPDFPath_GetPathSegment(obj, k)
+            if not seg or not raw.FPDFPathSegment_GetPoint(seg, x, y):
+                continue
+            kind = raw.FPDFPathSegment_GetType(seg)
+            if kind == raw.FPDF_SEGMENT_MOVETO:
+                curve = []
+                collector.operate(b"m", [x.value, y.value], m)
+            elif kind == raw.FPDF_SEGMENT_LINETO:
+                curve = []
+                collector.operate(b"l", [x.value, y.value], m)
+            elif kind == raw.FPDF_SEGMENT_BEZIERTO:
+                curve += [x.value, y.value]
+                if len(curve) == 6:
+                    collector.operate(b"c", curve, m)
+                    curve = []
+            if raw.FPDFPathSegment_GetClose(seg):
+                collector.operate(b"h", [], m)
+        fill, stroke = ctypes.c_int(), ctypes.c_int()
+        if not raw.FPDFPath_GetDrawMode(obj, fill, stroke):
+            collector.discard()
+            return
+        filled = fill.value != raw.FPDF_FILLMODE_NONE
+        op = b"B" if filled and stroke.value else b"f" if filled else b"S" if stroke.value else b"n"
+        collector.operate(op, [], m)
+
+    def _images(self, drawn, crop, chars, render):
+        """PageImages of the drawn images, at most pdf.PDF_PAGE_IMAGES (the rest count `image`
+        once). Bytes are not taken for images pdf.py leaves out anyway: under the size floor,
+        or the page's scan, which pdf.py renders whole."""
+        placed = []
+        capped = False
+        for obj, m in drawn:
+            if len(placed) >= caps.PDF_PAGE_IMAGES:
+                capped = True
+                break
+            corners = [_apply(m, u, v) for u in (0.0, 1.0) for v in (0.0, 1.0)]
+            box = _rect(min(p[0] for p in corners), min(p[1] for p in corners),
+                        max(p[0] for p in corners), max(p[1] for p in corners))
+            if box is None:
+                continue
+            w, h = ctypes.c_uint(), ctypes.c_uint()
+            if not raw.FPDFImageObj_GetImagePixelSize(obj, w, h):
+                w.value = h.value = 0
+            placed.append((obj, box, (w.value, h.value)))
+        scan = -1
+        if chars == 0:
+            covers = [(caps._cover(box, crop), i) for i, (_o, box, _px) in enumerate(placed)]
+            best = max(covers, default=(0.0, -1))
+            if best[0] >= caps.SCAN_COVER:
+                scan = best[1]
+        shown = []
+        for i, (obj, box, px) in enumerate(placed):
+            small = (min(px) < caps.IMAGE_MIN_PX
+                     or min(box[2] - box[0], box[3] - box[1]) < caps.IMAGE_MIN_PT)
+            if i == scan or small:
+                shown.append(PageImage(box, None, px, "raw"))
+                continue
+            data, kind = None, "raw"
+            try:
+                data, kind = self._image_bytes(obj, box, px, render)
+            except ReadError as e:
+                if e.kind == "timeout":
+                    raise
+            except Exception:  # noqa: BLE001 - an image that cannot be taken counts `image` in pdf.py
+                data, kind = None, "raw"
+            shown.append(PageImage(box, data, px, kind))
+        return shown, capped
+
+    @staticmethod
+    def _image_bytes(obj, box, px, render):
+        if px[0] * px[1] > reader_images._MAX_PIXELS:
+            return render(box, caps.CROP_DPI), "png"
+        filters = []
+        for k in range(min(raw.FPDFImageObj_GetImageFilterCount(obj), IMAGE_FILTERS)):
+            n = raw.FPDFImageObj_GetImageFilter(obj, k, None, 0)
+            buf = ctypes.create_string_buffer(max(n, 1))
+            raw.FPDFImageObj_GetImageFilter(obj, k, buf, n)
+            filters.append(buf.value.decode("latin-1", "replace"))
+        if filters and filters[-1] in _DCT and all(f in _SIMPLE for f in filters[:-1]):
+            get = raw.FPDFImageObj_GetImageDataDecoded if len(filters) > 1 else raw.FPDFImageObj_GetImageDataRaw
+            n = get(obj, None, 0)
+            if 0 < n <= limits.IMAGE_BYTES:
+                buf = ctypes.create_string_buffer(n)
+                get(obj, buf, n)
+                data = buf.raw[:n]
+                if reader_images.sniff(data) == "jpg":
+                    return data, "jpg"
+        bitmap = raw.FPDFImageObj_GetBitmap(obj)
+        if not bitmap:
+            return None, "raw"
+        try:
+            width, height = raw.FPDFBitmap_GetWidth(bitmap), raw.FPDFBitmap_GetHeight(bitmap)
+            stride, fmt = raw.FPDFBitmap_GetStride(bitmap), raw.FPDFBitmap_GetFormat(bitmap)
+            if width <= 0 or height <= 0 or width * height > reader_images._MAX_PIXELS or stride <= 0:
+                return None, "raw"
+            pointer = raw.FPDFBitmap_GetBuffer(bitmap)
+            if not pointer:
+                return None, "raw"
+            data = ctypes.string_at(pointer, stride * height)
+        finally:
+            raw.FPDFBitmap_Destroy(bitmap)
+        got = _rgb_rows(data, width, height, stride, fmt)
+        if got is None:
+            return None, "raw"
+        rows, alpha = got
+        return reader_images._png(width, height, rows, alpha), "png"
+
+    # -- renders
+
+    @staticmethod
+    def _render(page, crop, turn, target, dpi):
+        """PNG bytes of the page, or of `target` (a page-space box), at `dpi` lowered so the
+        long side is at most RENDER_LONG pixels (a page over 200 inches renders at that cap)."""
+        x0, y0, x1, y1 = crop
+        if target is not None:
+            target = _rect(max(target[0], x0), max(target[1], y0), min(target[2], x1), min(target[3], y1))
+            if target is None:
+                raise ValueError("render box outside the page")
+        else:
+            target = crop
+        if turn in (90, 180, 270):
+            vx0, vy0, vx1, vy1 = caps._view_box(target, turn, crop)
+            vw, vh = caps._view_page(turn, crop)[2:]
+        else:
+            vx0, vy0, vx1, vy1 = target[0] - x0, target[1] - y0, target[2] - x0, target[3] - y0
+            vw, vh = x1 - x0, y1 - y0
+        long_side = max(vx1 - vx0, vy1 - vy0)
+        if not dpi or dpi <= 0 or long_side <= 0:
+            raise ValueError("nothing to render")
+        # one pixel under the cap: pdfium rounds each edge up
+        scale = min(dpi / 72.0, (caps.RENDER_LONG - 1) / long_side)
+        bitmap = page.render(scale=scale, crop=(max(0.0, vx0), max(0.0, vy0), max(0.0, vw - vx1),
+                                                max(0.0, vh - vy1)), rev_byteorder=True)
+        width, height, stride = bitmap.width, bitmap.height, bitmap.stride
+        if max(width, height) > caps.RENDER_LONG:
+            raise ValueError("render past the long-side cap")
+        data = bytes(bitmap.buffer)
+        got = _rgb_rows_rev(data, width, height, stride, bitmap.n_channels)
+        return reader_images._png(width, height, got, False)
+
+    # -- annotations
+
+    def _annots(self, page, index, cut):
+        """(links, comments, fields) of one page."""
+        handle = page.raw
+        links = self._links(handle)
+        total = raw.FPDFPage_GetAnnotCount(handle)
+        if total > annotations.PDF_ANNOTS:
+            cut["annotation"] += 1
+            total = annotations.PDF_ANNOTS
+        form = self._pdf.formenv.raw if self._pdf.formenv else None
+        items, fields, done = [], [], set()
+        for k in range(max(0, total)):
+            annot = raw.FPDFPage_GetAnnot(handle, k)
+            if not annot:
+                continue
+            try:
+                subtype = raw.FPDFAnnot_GetSubtype(annot)
+                if subtype in _MARKUP:
+                    item = self._comment(handle, annot, k, cut)
+                    if item is not None:
+                        items.append(item)
+                elif subtype == raw.FPDF_ANNOT_WIDGET and form:
+                    self._field(form, annot, index, fields, done, cut)
+            finally:
+                raw.FPDFPage_CloseAnnot(annot)
+        return links, annotations.order_comments(items), fields
+
+    def _links(self, handle):
+        links = []
+        pos, link = ctypes.c_int(0), raw.FPDF_LINK()
+        rect = raw.FS_RECTF()
+        for _ in range(annotations.PDF_ANNOTS):  # past it the annotation count above counts
+            if not raw.FPDFLink_Enumerate(handle, pos, link):
+                break
+            action = raw.FPDFLink_GetAction(link)
+            if not action or raw.FPDFAction_GetType(action) != raw.PDFACTION_URI:
+                continue
+            n = raw.FPDFAction_GetURIPath(self._pdf.raw, action, None, 0)
+            if n <= 1 or n > annotations.ANNOT_CHARS:
+                continue
+            buf = ctypes.create_string_buffer(n)
+            raw.FPDFAction_GetURIPath(self._pdf.raw, action, buf, n)
+            url = buf.value.decode("latin-1").strip()
+            scheme, colon, _rest = url.partition(":")
+            if not colon or scheme.lower() not in annotations.SCHEMES:
+                continue
+            if not raw.FPDFLink_GetAnnotRect(link, rect):
+                continue
+            box = _rect(rect.left, rect.bottom, rect.right, rect.top)
+            if box is not None:
+                links.append((box, url))
+        return links
+
+    @staticmethod
+    def _comment(handle, annot, k, cut):
+        text = _wide(raw.FPDFAnnot_GetStringValue, annot, b"Contents")
+        if len(text) > annotations.ANNOT_CHARS:
+            cut["annotation"] += 1
+            text = text[:annotations.ANNOT_CHARS]
+        text = text.strip()
+        if not text:
+            return None
+        author = _wide(raw.FPDFAnnot_GetStringValue, annot, b"T")[:1_000].strip()
+        hidden = bool(raw.FPDFAnnot_GetFlags(annot) & raw.FPDF_ANNOT_FLAG_HIDDEN)
+        irt = None
+        parent = raw.FPDFAnnot_GetLinkedAnnot(annot, b"IRT")
+        if parent:
+            try:
+                found = raw.FPDFPage_GetAnnotIndex(handle, parent)
+                irt = found if found >= 0 else None
+            finally:
+                raw.FPDFPage_CloseAnnot(parent)
+        return k, irt, Comment(author, text, hidden)
+
+    def _field(self, form, annot, index, fields, done, cut):
+        kind = _FIELD_KINDS.get(raw.FPDFAnnot_GetFormFieldType(form, annot))
+        if kind is None:
+            return
+        name = _wide(raw.FPDFAnnot_GetFormFieldName, form, annot)
+        if name in done or self._field_page.get(name, index) != index:
+            return  # another widget of a field already read
+        if kind in ("check", "radio"):
+            if not raw.FPDFAnnot_IsChecked(form, annot):
+                return  # a radio group's checked kid may come later
+            value = (_wide(raw.FPDFAnnot_GetFormFieldExportValue, form, annot)
+                     or _wide(raw.FPDFAnnot_GetFormFieldValue, form, annot))
+        else:
+            value = _wide(raw.FPDFAnnot_GetFormFieldValue, form, annot)
+            if raw.FPDFAnnot_GetFormFieldType(form, annot) == raw.FPDF_FORMFIELD_LISTBOX:
+                picked = [_wide(raw.FPDFAnnot_GetOptionLabel, form, annot, i)
+                          for i in range(min(max(0, raw.FPDFAnnot_GetOptionCount(form, annot)), OPTION_LABELS))
+                          if raw.FPDFAnnot_IsOptionSelected(form, annot, i)]
+                if len(picked) > 1:
+                    value = picked
+        done.add(name)
+        self._field_page.setdefault(name, index)
+        tu = _wide(raw.FPDFAnnot_GetFormFieldAlternateName, form, annot).strip() or None
+        entry = annotations.field_entry(tu, name, value, kind)
+        if entry is None:
+            return
+        label, text, was_cut = entry
+        if was_cut:
+            cut["field"] += 1
+        fields.append((label, text))
+
+
+def _rgb_rows_rev(data, width, height, stride, channels):
+    """Rows of a page render made with rev_byteorder (RGB, RGBx or gray) as RGB rows."""
+    rows = []
+    for y in range(height):
+        line = data[y * stride:y * stride + width * channels]
+        if channels == 3:
+            rows.append(bytes(line))
+            continue
+        out = bytearray(width * 3)
+        if channels == 1:
+            out[0::3] = out[1::3] = out[2::3] = line
+        else:
+            out[0::3], out[1::3], out[2::3] = line[0::channels], line[1::channels], line[2::channels]
+        rows.append(bytes(out))
+    return rows

@@ -1,0 +1,83 @@
+"""Child of test_reader_pdfium.py, run under the pdf venv interpreter with -I.
+
+It reads pdf bytes on stdin and a JSON option object from argv[1]:
+{"patch": {name: value}, "pages": [a, b] | null, "hidden": bool}. It patches the caps of
+reader.formats.pdf, runs parse_bytes(engine="pdfium") and markdown.render into a temporary dir, and
+prints one JSON line: {"md", "skipped", "meta", "assets": [[name, size, width, height]], "modules"},
+or {"error": [kind, detail]} on a ReadError.
+"""
+import os
+import sys
+
+_SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+
+
+def _place(paths: list, here: str) -> list:
+    """read.py's rule: `here` after the standard library and before site-packages (scripts/ holds
+    queue.py, which must not shadow the stdlib queue)."""
+    key = os.path.normcase(here)
+    rest = [p for p in paths if os.path.normcase(os.path.abspath(p or ".")) != key]
+    for i, p in enumerate(rest):
+        if os.path.basename(os.path.normpath(p)).lower() in ("site-packages", "dist-packages"):
+            return rest[:i] + [here] + rest[i:]
+    return rest + [here]
+
+
+sys.path[:] = _place(sys.path, _SCRIPTS)
+
+import json  # noqa: E402
+import struct  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+
+def _dims(data: bytes):
+    """(width, height) of a PNG or JPEG, else (0, 0)."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h
+            i += 2 + struct.unpack(">H", data[i + 2:i + 4])[0]
+    return 0, 0
+
+
+def main():
+    opts = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
+    data = sys.stdin.buffer.read()
+    from reader import markdown
+    from reader.formats import pdf
+    from reader.limits import ReadError
+    from reader.model import Context
+    for name, value in (opts.get("patch") or {}).items():
+        if not name.isupper() or not hasattr(pdf, name):
+            raise SystemExit(f"unknown cap {name}")
+        setattr(pdf, name, value)
+    pages = opts.get("pages")
+    ctx = Context()
+    try:
+        doc = pdf.parse_bytes(data, ctx, engine="pdfium", pages=tuple(pages) if pages else None)
+    except ReadError as e:
+        print(json.dumps({"error": [e.kind, e.detail]}))
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        assets_dir = Path(tmp) / "assets"
+        text = markdown.render(doc, assets_dir, bool(opts.get("hidden")), ctx.skipped)
+        assets = []
+        if assets_dir.is_dir():
+            for p in sorted(assets_dir.iterdir()):
+                body = p.read_bytes()
+                assets.append([p.name, len(body), *_dims(body)])
+    print(json.dumps({"md": text, "skipped": dict(ctx.skipped), "meta": doc.meta, "assets": assets,
+                      "modules": sorted(sys.modules)}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

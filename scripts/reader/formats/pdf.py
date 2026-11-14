@@ -2,8 +2,9 @@
 tables, images, fields and comments.
 
 The caps of the pdf reader live here; callers read them as `pdf.<NAME>` at call time, so a test
-patches this module alone. `parse_bytes` opens the file with pdfnative (`NativeDoc`) and runs the
-page loop: each page's `PageData` goes through the hidden-text rules, the char cap, rotation into
+patches this module alone. `parse_bytes` opens the file with pdfnative (`NativeDoc`), or with
+pdfium (`pdf_pdfium.PdfiumDoc`, falling back to native), and runs the page loop over either:
+each page's `PageData` goes through the hidden-text rules, the char cap, rotation into
 viewer space, lines, tables, images and renders (scanned pages, vector figures), with a
 PDF_PAGE_SECONDS check between the steps. Paragraphs, headings and running headers are made after
 the loop, over the lines every page kept.
@@ -46,7 +47,7 @@ TINY_PT = 1.0               # text under this size is hidden ("tiny")
 IMAGE_MIN_PX = 32           # images under this many pixels a side are left out, uncounted
 IMAGE_MIN_PT = 16.0         # images drawn under this many points a side are left out, uncounted
 
-ENGINES = ("native",)
+ENGINES = ("native", "pdfium")  # pdfium only where pypdfium2 imports (the pdf venv)
 
 
 # ---- geometry
@@ -470,14 +471,41 @@ class _Reader:
 
 def parse_bytes(data, ctx, *, engine="native", pages=None, clock=time.monotonic, started=None) -> Doc:
     """The pdf in `data` as a Doc. `pages=(A, B)` reads pages A to B alone (1-based, numbered as
-    in the file). The deadline runs from `started`, which is `clock()` at entry unless given."""
+    in the file). The deadline runs from `started`, which is `clock()` at entry unless given.
+
+    engine="pdfium" needs pypdfium2 (the pdf venv); without it the engine is not available
+    (ValueError). It opens the native structure first: its `encrypted` and `drm` errors (and a
+    timeout) propagate, any other failure is kept. Then pdfium opens the bytes, with the native
+    document for off-layer pages (decision 3). When pdfium cannot open them (no password at
+    fault), the native document is read instead, or the kept error is raised when native failed
+    too. Doc.meta["engine"] says which engine read the pages."""
     if started is None:
         started = clock()
     if engine not in ENGINES:
         raise ValueError(f"pdf engine not available: {engine}")
     from ..pdfnative.document import NativeDoc
-    native = NativeDoc(data)
-    return _Reader(native, ctx, clock, started, engine).run(pages)
+    if engine == "native":
+        return _Reader(NativeDoc(data), ctx, clock, started, "native").run(pages)
+    try:
+        from . import pdf_pdfium
+    except ImportError:
+        raise ValueError(f"pdf engine not available: {engine}") from None
+    native, kept = None, None
+    try:
+        native = NativeDoc(data)
+    except ReadError as e:
+        if e.kind in ("encrypted", "drm", "timeout"):
+            raise
+        kept = e
+    except Exception as e:  # noqa: BLE001 - the native parser failed; pdfium may still read it
+        kept = ReadError("damaged", f"native parser: {type(e).__name__}")
+    try:
+        doc = pdf_pdfium.PdfiumDoc(data, native)
+    except pdf_pdfium.PdfiumOpenError:
+        if native is None:
+            raise kept from None
+        return _Reader(native, ctx, clock, started, "native").run(pages)
+    return _Reader(doc, ctx, clock, started, "pdfium").run(pages)
 
 
 def parse(path, ctx, *, engine="native", pages=None, clock=time.monotonic, started=None) -> Doc:

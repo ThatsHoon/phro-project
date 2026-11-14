@@ -50,9 +50,16 @@ def _pages(text):
 
 
 def _engine_id(wanted) -> str:
-    """The engine id a pdf is read with. Task 14 fills this: pdfium when asked for and its venv imports,
-    with pdfenv.engine_id_from_module() as the id; until then the answer is always native."""
-    return "native"
+    """The engine id a pdf is read with: for --engine pdfium, when pypdfium2 imports (the venv child),
+    pdfenv.engine_id_from_module(); otherwise native, so native output is never filed under a pdfium key."""
+    if wanted != "pdfium":
+        return "native"
+    try:
+        import pypdfium2  # noqa: F401
+        from reader import pdfenv
+        return pdfenv.engine_id_from_module()
+    except Exception:  # noqa: BLE001 - not importable, or a broken install: read natively
+        return "native"
 
 
 def _reexec(a):
