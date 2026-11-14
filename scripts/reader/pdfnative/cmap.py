@@ -17,8 +17,15 @@ from functools import lru_cache
 from typing import Dict, Set, Tuple
 
 _TO_UNICODE_BLOCK_TOKEN = re.compile(rb"(begin|end)(codespacerange|bfchar|bfrange)")
-_HEX_RE = re.compile(rb"<([0-9A-Fa-f]+)>")
-_TOKEN_RE = re.compile(rb"<([0-9A-Fa-f]+)>|(\[)|(\])")
+# White space inside a hex string is ignored (ISO 32000 7.3.4.3): `< 0020 00a0 >` is <002000a0>.
+_HEX_RE = re.compile(rb"<\s*([0-9A-Fa-f][0-9A-Fa-f\s]*)>")
+_TOKEN_RE = re.compile(rb"<\s*([0-9A-Fa-f][0-9A-Fa-f\s]*)>|(\[)|(\])")
+_WS = re.compile(rb"\s+")
+
+
+def _hex_tokens(block: bytes) -> list:
+    """The hex strings of a ToUnicode block, white space removed."""
+    return [_WS.sub(b"", t) for t in _HEX_RE.findall(block)]
 
 MAX_ENCODING_BYTES = 4 * 1024 * 1024
 MAX_TOUNICODE_BYTES = 16 * 1024 * 1024
@@ -429,7 +436,7 @@ class ToUnicodeCMap:
         tokens = []
         for m in _TOKEN_RE.finditer(block):
             if m.group(1) is not None:
-                tokens.append(m.group(1))
+                tokens.append(_WS.sub(b"", m.group(1)))
             elif m.group(2):
                 tokens.append(b"[")
             else:
@@ -489,10 +496,10 @@ def parse_tounicode(data: bytes, warnings=None) -> ToUnicodeCMap:
     for kind in (b"codespacerange", b"bfchar", b"bfrange"):
         for block in blocks[kind]:
             if kind == b"codespacerange":
-                for hex_tok in _HEX_RE.findall(block):
+                for hex_tok in _hex_tokens(block):
                     cmap.code_lengths.add(max(len(hex_tok) // 2, 1))
             elif kind == b"bfchar":
-                toks = _HEX_RE.findall(block)
+                toks = _hex_tokens(block)
                 for i in range(0, len(toks) - 1, 2):
                     if cmap._mapping_full():
                         break

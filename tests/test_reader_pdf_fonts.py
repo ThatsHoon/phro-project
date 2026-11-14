@@ -56,6 +56,20 @@ def test_tounicode_bfchar_bfrange():
     assert info.code_bytes == 2
 
 
+def test_tounicode_hex_with_whitespace():
+    # White space inside a hex string is ignored (ISO 32000 7.3.4.3): `< 0020 00a0 >` is two units,
+    # space and no-break space, as in a public Tika test file. Before, the code read as U+FFFD.
+    objects = font_type0(tounicode=None)
+    cmap_data = (b"1 begincodespacerange <0000> < FFFF > endcodespacerange\n"
+                 b"2 beginbfchar <0001>< 0020 00a0 >\n< 00 02 > <AE00> endbfchar\n"
+                 b"1 beginbfrange <0003> <00\n04> [ <D55C> < AE 00 > ] endbfrange\n")
+    objects[100]["ToUnicode"] = Ref(103)
+    objects[103] = Stream({}, cmap_data)
+    _, info = load(objects)
+    assert info.decode(b"\x00\x01\x00\x02\x00\x03\x00\x04") == "  글한글"
+    assert not info.unmapped
+
+
 def test_tounicode_entry_cap():
     objects = font_type0(tounicode=None)
     objects[100]["ToUnicode"] = Ref(103)
