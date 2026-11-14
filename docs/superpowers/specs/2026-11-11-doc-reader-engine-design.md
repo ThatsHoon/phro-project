@@ -80,7 +80,7 @@ Each format module exposes one function, `parse(path: Path, ctx: Context) -> Doc
 ```
 Doc(title, meta, blocks, notes, warnings, counts)
 Block = Heading(level, inlines) | Para(inlines) | ListItem(level, marker, inlines)
-      | Table(rows: list[list[Cell(inlines, rowspan, colspan, header)]], caption)
+      | Table(rows: list[list[Cell(inlines, rowspan, colspan, header)]], caption, hidden_rows, hidden_cols)
       | Image(asset, alt, viewable) | Equation(tex, display) | Quote(blocks)
       | Section(kind: slide|sheet|chapter|page, title, hidden, blocks, notes)
 Inline = Text | Bold | Link(url, inlines) | NoteRef(id) | Math(tex) | Break
@@ -127,7 +127,7 @@ The hook must also run correctly when Claude reads the converted file or an asse
 - Errors are isolated per record, part, sheet and slide: a bad record is skipped and counted, never the whole file. Only a container that cannot be opened fails the file.
 - Encryption: detected for every format and reported. Default passwords are tried where the format has one (xls `VelvetSweatshop`, ppt default, HWP distribution documents). User passwords and DRM are out of scope.
 - Garble check: if more than 5% of output characters are replacement or control characters, the warning goes into `additionalContext`.
-- Crypto in `containers/crypto.py`: RC4, AES-128 (ECB, CFB-1) and the MSVC `rand()` stream, pure Python (AES written from FIPS-197).
+- Crypto in `containers/crypto.py`: RC4, AES-128 (ECB) and the MSVC `rand()` stream, pure Python (AES written from FIPS-197). AES CFB-1 serves only user-password HWP, which is out of scope (decision 1), so it is not built.
 
 ## Phases
 
@@ -137,7 +137,7 @@ The gate ships in phase 1. A format whose phase is not built yet is denied with 
 |---|---|---|
 | 1 | hwpx, odt, ods, odp, docm, pptm, ppsx, epub, xps, vsdx | model, renderer, images, cache, gate, `zipx`, `html` |
 | 2a | hwp, doc | cfb, crypto (AES-128, MSVC rand), text code pages, officeart, mtef |
-| 2b | xls, ppt, xlsb, rtf | RC4, AES CFB-1, BIFF charts |
+| 2b | xls, ppt, xlsb, rtf | RC4, number formats, BIFF charts |
 | 3 | wpd, mobi, azw3, pages, numbers, key | `palmdb`, `snappy`, `pbwire` |
 | 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp | `iff`; each starts with a reverse-engineering note like phase 1-3's |
 
