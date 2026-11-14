@@ -620,3 +620,34 @@ JPEG = bytes.fromhex(
     "494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2"
     "a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9"
     "eaf1f2f3f4f5f6f7f8f9faffda0008010100003f002bffd9")
+
+
+def fake_venv(dir, *, build=7000):
+    """A fake READY pdf venv: an interpreter file, pyvenv.cfg with an existing home, a RECORD for pypdfium2 and
+    pypdfium2_raw listing one file each with its digest, and ready.json (current requirements hash, 5.15.2, build)."""
+    import base64
+    import json
+    from reader import pdfenv
+    d = Path(dir)
+    d.mkdir(parents=True, exist_ok=True)
+    py = pdfenv.interpreter(d)
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_bytes(b"")
+    (d / "pyvenv.cfg").write_text(f"home = {d}\nversion = 3.12.0\n", encoding="utf-8")
+    site = d / "Lib" / "site-packages"
+    records = {}
+    for name in pdfenv.PACKAGES:
+        (site / name).mkdir(parents=True, exist_ok=True)
+        data = f"# {name}\n".encode()
+        (site / name / "__init__.py").write_bytes(data)
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        info = site / f"{name}-5.15.2.dist-info"
+        info.mkdir(exist_ok=True)
+        rec = info / "RECORD"
+        rec.write_bytes((f"{name}/__init__.py,sha256={digest},{len(data)}\n"
+                         f"{name}-5.15.2.dist-info/RECORD,,\n").encode())
+        records[name] = hashlib.sha256(rec.read_bytes()).hexdigest()
+    ready = {"requirements": pdfenv.requirements_hash(), "python": {"version": "3.12.0", "home": str(d)},
+             "pypdfium2": "5.15.2", "pdfium": build, "records": records}
+    (d / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
+    return d

@@ -1,10 +1,12 @@
-"""CLI for the document reader: convert | formats | prune | hook."""
+"""CLI for the document reader: convert | setup | formats | prune | hook."""
 import argparse
 import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 
+READ_PY = Path(__file__).resolve()
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
@@ -36,9 +38,59 @@ def _engine_id(wanted) -> str:
     return "native"
 
 
+def _reexec(a):
+    """A pdf with no --engine, while a READY pdf venv exists and this is not its interpreter: run the same convert
+    there with --engine pdfium and relay its output. Returns the exit code, or None to read natively."""
+    if a.engine is not None or reader.ext_of(Path(a.file)) != "pdf":
+        return None
+    from reader import pdfenv
+    if pdfenv.forced_native():
+        return None
+    venv = pdfenv.venv_dir()
+    if pdfenv.state(venv) != "READY":
+        return None
+    py = pdfenv.interpreter(venv)
+    if os.path.normcase(os.path.abspath(sys.executable)) == os.path.normcase(os.path.abspath(py)):
+        return None
+    import subprocess
+    cmd = [str(py), "-I", "-X", "utf8", str(READ_PY), "convert", a.file]
+    if a.out:
+        cmd += ["--out", a.out]
+    if a.hidden:
+        cmd.append("--hidden")
+    if a.key:
+        cmd += ["--key", a.key]
+    if a.pages:
+        cmd += ["--pages", f"{a.pages[0]}-{a.pages[1]}"]
+    cmd += ["--engine", "pdfium"]
+    r = subprocess.run(cmd, capture_output=True)
+    sys.stdout.write(r.stdout.decode("utf-8", "replace"))
+    if r.stderr:
+        sys.stderr.write(r.stderr.decode("utf-8", "replace"))
+    return r.returncode
+
+
+def cmd_setup(a) -> int:
+    from reader import pdfenv, pdfsetup
+    venv = Path(a.venv) if a.venv else pdfenv.venv_dir()
+    if a.check:
+        line = pdfsetup.check(venv)
+    elif a.decline:
+        line = pdfsetup.decline()
+    elif a.remove:
+        line = pdfsetup.remove(venv)
+    else:
+        line = pdfsetup.setup(venv)
+    print(line)
+    return 1 if line.startswith("FAIL") else 0
+
+
 def cmd_convert(a) -> int:
     from reader import cache
     src = Path(a.file)
+    code = _reexec(a)
+    if code is not None:
+        return code
     try:
         # a stray print in a format module must not reach the protocol stream
         with contextlib.redirect_stdout(sys.stderr):
@@ -111,6 +163,13 @@ def main(argv=None) -> int:
     c.add_argument("--engine", choices=("pdfium", "native"))
     c.add_argument("--pages", type=_pages, metavar="A-B")
     c.set_defaults(fn=cmd_convert)
+    s = sub.add_parser("setup")
+    s.add_argument("--venv")
+    mode = s.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--decline", action="store_true")
+    mode.add_argument("--remove", action="store_true")
+    s.set_defaults(fn=cmd_setup)
     sub.add_parser("formats").set_defaults(fn=cmd_formats)
     pr = sub.add_parser("prune")
     pr.add_argument("--days", type=int, default=30)
