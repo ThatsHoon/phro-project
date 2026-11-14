@@ -11,7 +11,8 @@ are left out) and a title placeholder gives the slide its title. A slide that
 cannot be read is counted under `slide` and the others still come out. A picture shape becomes the Image of its pib
 (`ppt_pictures`: the BStore of the DocumentContainer's PPDrawingGroup, the BLIPs in the `Pictures` stream) at its
 place; one that cannot be placed is counted under `image`. Every walk spends one budget of
-`BIN_RECORDS` records, and the text emitted is capped at `MAX_OUTPUT` characters.
+`BIN_RECORDS` records, and the text emitted is capped at `MAX_OUTPUT` characters. A file saved with the default
+password is decrypted first (`ppt_crypt`); the Persist keeps its offsets and reads the decrypted copy.
 """
 import struct
 
@@ -21,7 +22,7 @@ from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Section
 from . import ppt_records as rec
-from . import ppt_pictures, ppt_shapes
+from . import ppt_crypt, ppt_pictures, ppt_shapes
 from .ppt_shapes import Walk as _Walk
 from .ppt_shapes import text_blocks as _text_blocks
 from .ppt_shapes import texts as _texts
@@ -37,9 +38,14 @@ class Presentation:
         self.doc, self.ctx = doc, ctx
         self.persist = rec.Persist(doc, current_user, ctx)
         if self.persist.encrypted:
-            raise ReadError("encrypted")
+            # the chain was read from the clear edit records; the same offsets then point into the decrypted copy
+            unlocked = ppt_crypt.unlock(doc, self.persist, pictures)
+            if unlocked is None:
+                raise ReadError("encrypted")
+            self.doc, pictures = unlocked
+            self.persist.doc = self.doc
         self.walk = _Walk(ctx)
-        self.pictures = ppt_pictures.Pictures(doc, self._dgg(), pictures, flate.Budget(), ctx)
+        self.pictures = ppt_pictures.Pictures(self.doc, self._dgg(), pictures, flate.Budget(), ctx)
 
     def _dgg(self):
         """(start, end) of the DggContainer inside the DocumentContainer's PPDrawingGroup; None without one."""

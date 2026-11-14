@@ -1390,8 +1390,38 @@ def ppt_current_user(edit_offset, *, encrypted=False, name=b"user"):
     return oa_record(0x0FF6, body + bytes(name) + struct.pack("<I", 8))
 
 
+def _ppt_encrypt(stream, pic_stream, offsets, pid_crypt, password):
+    """(PowerPoint Document, Pictures) with the persist objects and BLIPs RC4 CryptoAPI encrypted, 128-bit keys:
+    key(block) = SHA-1(SHA-1(salt + UTF-16LE password) + block as u32)[:16], salt = bytes(range(16)) as in rc4_header."""
+    import hashlib
+    import struct
+    from reader.containers.crypto import rc4
+    base = hashlib.sha1(bytes(range(16)) + password.encode("utf-16le")).digest()
+
+    def key(block):
+        return hashlib.sha1(base + struct.pack("<I", block)).digest()[:16]
+
+    out = bytearray(stream)
+    for pid, at in offsets.items():
+        if pid == pid_crypt:
+            continue
+        size = 8 + struct.unpack_from("<I", stream, at + 4)[0]
+        out[at:at + size] = rc4(key(pid), bytes(stream[at:at + size]))
+    pics, pos = bytearray(pic_stream), 0
+    while pos < len(pic_stream):
+        options, typ, size = struct.unpack_from("<HHI", pic_stream, pos)
+        end = pos + 8 + size
+        instance = options >> 4
+        fields = [8] + [16] * (2 if instance & 1 else 1) + [34 if typ in (0xF01A, 0xF01B, 0xF01C) else 1]
+        fields.append(end - pos - sum(fields))
+        for n in fields:
+            pics[pos:pos + n] = rc4(key(0), bytes(pic_stream[pos:pos + n]))
+            pos += n
+    return out, pics
+
+
 def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=(), objects=(), encrypt=None,
-             edits=1, raw_shapes=None, no_pictures_stream=False):
+             edits=1, raw_shapes=None, no_pictures_stream=False, encrypt_header=None):
     """Write a .ppt compound file with PowerPoint Document, Current User and Pictures streams.
 
     slides: dicts with title (str), body (list of str paragraphs, or (text, indent) bulleted ones), bold (substrings
@@ -1404,8 +1434,15 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     (SlidePersistAtom slideId = the slide's slideId + 0x1000, which the SlideAtom's notesIdRef carries; NotesAtom
     slideIdRef = the slide's slideId). master_text goes in the MainMaster. edits > 1 appends edits - 1 more
     PersistDirectoryAtom + UserEditAtom pairs chained through lastEdit; each remaps slide 1 to a fresh copy.
-    encrypt (any string): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist object and
-    the UserEditAtom's encryptSessionPersistIdRef; the streams themselves are not encrypted.
+    encrypt (any string, the password): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist
+    object holding an RC4 CryptoAPI EncryptionVersionInfo (rc4_header(password), 128-bit; clear) and the UserEditAtom's
+    encryptSessionPersistIdRef. Every other persist object of the newest edit is RC4-encrypted whole (header and body)
+    with block = its persist id; the CryptSession, UserEditAtom, PersistDirectoryAtom and Current User stay clear. The
+    Pictures stream is encrypted BLIP by BLIP: the 8-byte header, each UID, the tag or metafile header and the image
+    data are separate fields, each restarting the keystream at block 0 ([MS-OFFCRYPTO] / dochan crypto/ppt.py). The
+    encryption here is written out on its own (its own key derivation), not by running the reader's unlock backwards.
+    encrypt_header (bytes) replaces the CryptSession10Container body, for example a (4, 4) AES EncryptionVersionInfo;
+    the streams are still encrypted with the password's RC4 keys.
     shapes: a list of dicts that replaces the slide's own text shapes in its PPDrawing (the SLWT is unchanged). A dict
     is a text shape, kind "group" or kind "picture" (key pib, the 1-based BStore index; box, text, placeholder and ref as for a text shape); kind
     "object" raises NotImplementedError for Task 20. Keys: kind ("text" by default), spid, box ((left, top, right, bottom): a ClientAnchor at the top level, a
@@ -1508,7 +1545,7 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     for num in sorted(notes):
         put(pid_notes[num], notes_record(num))
     if pid_crypt is not None:
-        put(pid_crypt, oa_container(0x2F14, oa_record(0x0001, bytes(8))))
+        put(pid_crypt, oa_record(0x2F14, encrypt_header if encrypt_header is not None else rc4_header(encrypt)))
     first_slide = offsets.get(pid_slides[0]) if n else None
     user_edits, directories, last, slots = [], [], 0, {}
     seed = 3 + n + len(notes) + (pid_crypt is not None)
@@ -1522,6 +1559,8 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         last = put(None, ppt_user_edit(last, directories[-1], pid_doc, seed, pid_crypt))
         user_edits.append(last)
     cu = ppt_current_user(last, encrypted=encrypt is not None)
+    if encrypt is not None:
+        stream, pic_stream = _ppt_encrypt(stream, pic_stream, offsets, pid_crypt, encrypt)
     streams = {"PowerPoint Document": bytes(stream), "Current User": cu}
     if not no_pictures_stream:
         streams["Pictures"] = bytes(pic_stream)
