@@ -1,14 +1,14 @@
-# doc-reader engine: one stdlib parser for every document format, behind a Read gate
+# doc-reader engine: one parser for every document format, behind a Read gate
 
 ## Goal
 
-phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all formats in scope: the 28 of decision 1, and since decision 7 also docx, pptx, xlsx and xlsm with their template and macro variants. It is written in the Python standard library only, like the rest of `scripts/`, and is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
+phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all formats in scope: the 28 of decision 1, and since decision 7 also docx, pptx, xlsx and xlsm with their template and macro variants, and since decision 8 pdf (41 extensions). It is written in the Python standard library, like the rest of `scripts/`, except where a library adds capability the user wants (decision 8: pypdfium2 for pdf, in a plugin-managed venv created only with the user's yes, with a stdlib parser beside it). It is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
 
 This is stage 4 of the user's request. Stages 1 to 3 (clone, test, report) are done: `C:\Users\hunje\research\ai-document-reader-plugins\bench` and its reports.
 
 Success:
 
-- Every in-scope extension converts through the gate with no other software installed.
+- Every in-scope extension converts through the gate with no software outside the plugin-managed venv. pdf converts with none at all through its stdlib parser; the optional venv holds only pypdfium2 and is created only with the user's yes (phase 2d).
 - On the bench, for every format with scored documents, the engine's fidelity is at least the current recommended route's minus 0.01, and its calibrated tokens are at most that route's plus 5%. Where it misses, the format's report says why and what it would take. For docx, pptx, xlsx and xlsm the route is the skill's own read command run on the original file, and the skill's own load is reported in its own column (decision 7).
 - A document never reaches Claude as raw binary: the gate either swaps in the Markdown or blocks the Read with a reason.
 - Nothing is printed into a session that does not read a document. The plugin's always-on token cost does not change.
@@ -23,6 +23,7 @@ Success:
 5. REA (morluto/rea) was installed and run on the engines' binaries. Every engine on the routing table is open source with its source cloned, so the reverse engineering was done on source. Notes: `research\ai-document-reader-plugins\reverse\*.md`.
 6. Build order: the gate and the zip+XML formats first, then the rest in phases (see Phases).
 7. (User, 2026-11-14.) The engine also reads docx, pptx, xlsx and xlsm, and dotx, dotm, potx, potm, ppsm, xltx and xltm: phase 2c, specified in `2026-11-14-doc-reader-ooxml-four-design.md`. This moves reading only; creating and editing these files stays with `anthropic-skills:*`. pdf stays with its skill until phase 2d.
+8. (User, 2026-11-14.) pdf is read by the engine: phase 2d, specified in `2026-11-14-doc-reader-pdf-design.md`. Editing and creation stay with `anthropic-skills:pdf`. The stdlib-only rule is lifted where a library adds capability (the user, 2026-11-14); for pdf that library is pypdfium2 in a plugin-managed venv, installed only on the user's yes, with a stdlib port of dochan's parser when there is no venv.
 
 ## Reverse-engineering findings that shape the design
 
@@ -60,10 +61,13 @@ scripts/reader/
   gate.py                       PreToolUse decision
   text.py                       code pages, garble check, whitespace rules
   html.py                       XHTML walker with a small CSS cascade (epub, mobi)
-  containers/  zipx.py cfb.py palmdb.py snappy.py pbwire.py iff.py crypto.py
+  containers/  zipx.py cfb.py palmdb.py snappy.py pbwire.py bzz.py crypto.py
   formats/     hwpx.py hwp.py odf.py ooxml.py vsdx.py epub.py xps.py
                doc.py xls.py ppt.py xlsb.py rtf.py wpd.py mobi.py iwork.py
                djvu.py jet.py pub.py vsd.py mpp.py
+               pdf.py pdf_pdfium.py pdf_layout.py pdf_tables.py
+  pdfnative/                    stdlib pdf parser (dochan port)
+  pdfenv.py pdfsetup.py         the pdf venv: location, ready marker, setup
 ```
 
 Each format module exposes one function, `parse(path: Path, ctx: Context) -> Doc`. It reads through a container module and emits model blocks; it never writes Markdown. `markdown.render(doc, assets_dir) -> str` is the only place output format and token rules live, so every format gets the same rules.
@@ -76,6 +80,7 @@ Each format module exposes one function, `parse(path: Path, ctx: Context) -> Doc
 | `convert <file> [--out DIR] [--hidden]` | converts one file, prints the out.md path |
 | `formats` | lists extensions and their module |
 | `prune [--days 30]` | deletes cache entries not used for N days |
+| `setup [--venv DIR] [--check] [--decline] [--remove]` | creates, checks or removes the pdf venv; run only on the user's yes |
 
 ### Document model
 
@@ -111,25 +116,25 @@ From what cost tokens or lost content in the bench outputs:
 
 `gate.decide(event) -> dict | None`:
 
-1. Not a `Read`, the extension is not in `FORMATS`, or it is listed in `PHRO_READER_OFF` (comma-separated extensions): print nothing, exit 0. pdf passes through.
+1. Not a `Read`, the extension is not in `FORMATS`, or it is listed in `PHRO_READER_OFF` (comma-separated extensions): print nothing, exit 0.
 2. Look the file up in the cache (key = SHA-1 of the bytes + `reader.VERSION`). A hit skips conversion.
 3. Otherwise convert in a child process with a 45-second budget, so a hang cannot reach the hook timeout (on a hook timeout Claude Code would read the original binary).
-4. Success: `permissionDecision: "allow"`, `updatedInput` = the original input with `file_path` set to `out.md` (offset and limit kept), and `additionalContext`, under 600 characters: `<name> was converted to Markdown by phro-project (N lines, M images in assets/; Read them to view). k hidden places left out.` For outputs over 2,000 lines it adds the line numbers of the first-level headings so Claude can read by range. For the OOXML family (docx, docm, dotx, dotm, pptx, pptm, ppsx, potx, potm, ppsm, xlsx, xlsm, xltx, xltm) it adds `Read-only view (no XML, cell addresses or formulas); to edit the file, use the <docx|pptx|xlsx> skill.`
-5. Failure: `permissionDecision: "deny"` with a one-line reason: unsupported (phase not built yet), encrypted (needs a password), DRM, damaged, too large, or timed out, plus the `convert` command to retry by hand. For the OOXML family the reason also names the skill as the other way to read the file.
+4. Success: `permissionDecision: "allow"`, `updatedInput` = the original input with `file_path` set to `out.md` (offset and limit kept), and `additionalContext`, under 600 characters: `<name> was converted to Markdown by phro-project (N lines, M images in assets/; Read them to view). k hidden places left out.` For outputs over 2,000 lines it adds the line numbers of the first-level headings so Claude can read by range. For the OOXML family (docx, docm, dotx, dotm, pptx, pptm, ppsx, potx, potm, ppsm, xlsx, xlsm, xltx, xltm) it adds `Read-only view (no XML, cell addresses or formulas); to edit the file, use the <docx|pptx|xlsx> skill.` For pdf it adds the page-line hint, the setup offer when the stdlib parser was used, the unrendered pages and the page index (pdf spec).
+5. Failure: `permissionDecision: "deny"` with a one-line reason: unsupported (phase not built yet), encrypted (needs a password), DRM, damaged, too large, or timed out, plus the `convert` command to retry by hand. For the OOXML family the reason also names the skill as the other way to read the file. A pdf that fails as damaged or timed out passes through to Claude's own Read instead; a pdf denial names the pdf skill.
 
 The hook must also run correctly when Claude reads the converted file or an asset: those are `.md` and image paths, so rule 1 passes them through.
 
 ### Cache
 
-`%LOCALAPPDATA%\phro-project\reader\<sha1[:2]>\<sha1>\` on Windows, `~/.cache/phro-project/reader/...` elsewhere: `out.md`, `assets/`, `meta.json` (source path, size, version, seconds, warnings). Shared by every project and every clone of the plugin. A different version re-converts. `prune` is manual.
+`%LOCALAPPDATA%\phro-project\reader\<sha1[:2]>\<sha1>\` on Windows, `~/.cache/phro-project/reader/...` elsewhere: `out.md`, `assets/`, `meta.json` (source path, size, version, seconds, warnings). Shared by every project and every clone of the plugin. A different version re-converts. For pdf the key also holds the engine id (pypdfium2 and pdfium versions, or `native`). `prune` is manual.
 
 ### Safety and errors
 
-- Budgets in `limits.py`: input 512 MiB; zip total uncompressed 1 GiB and ratio 200; CFB limits as in dochan (sectors, entries, depth 128, chain steps); records per stream; recursion depth 64; output 20 MB; cells scanned per xlsx workbook `SHEET_SCAN` (2,000,000, styled empty cells included); SmartArt nodes `SMARTART_NODES` (5,000).
+- Budgets in `limits.py`: input 512 MiB; zip total uncompressed 1 GiB and ratio 200; CFB limits as in dochan (sectors, entries, depth 128, chain steps); records per stream; recursion depth 64; output 20 MB; cells scanned per xlsx workbook `SHEET_SCAN` (2,000,000, styled empty cells included); SmartArt nodes `SMARTART_NODES` (5,000); pdf pages, page-loop deadline and renders `PDF_PAGES` (5,000), `PDF_DEADLINE` (36 s), `PDF_RENDERS` (100).
 - Errors are isolated per record, part, sheet and slide: a bad record is skipped and counted, never the whole file. Only a container that cannot be opened fails the file.
 - Encryption: detected for every format and reported. Default passwords are tried where the format has one (xls `VelvetSweatshop`, ppt default, HWP distribution documents). User passwords and DRM are out of scope.
 - Garble check: if more than 5% of output characters are replacement or control characters, the warning goes into `additionalContext`.
-- Crypto in `containers/crypto.py`: RC4, AES-128 (ECB) and the MSVC `rand()` stream, pure Python (AES written from FIPS-197). AES CFB-1 serves only user-password HWP, which is out of scope (decision 1), so it is not built.
+- Crypto in `containers/crypto.py`: RC4, AES-128 (ECB) and the MSVC `rand()` stream, pure Python (AES written from FIPS-197). AES CFB-1 serves only user-password HWP, which is out of scope (decision 1), so it is not built. AES-256 and CBC are added for the pdf standard security handler (phase 2d).
 
 ## Phases
 
@@ -141,11 +146,11 @@ The gate ships in phase 1. A format whose phase is not built yet is denied with 
 | 2a | hwp, doc | cfb, crypto (AES-128, MSVC rand), text code pages, officeart, mtef |
 | 2b | xls, ppt, xlsb, rtf | RC4, number formats, BIFF charts |
 | 2c | docx, pptx, xlsx, xlsm, dotx, dotm, potx, potm, ppsm, xltx, xltm | `ooxml_sheets`, `sheet_drawing` (moved out of xlsb), `omml`, streamed zip parts |
-| 2d | pdf | starts with a reverse-engineering note (rea), like phase 1-3's |
+| 2d | pdf | `pdfenv` and `read.py setup` (the pypdfium2 venv), `pdfnative/` (dochan's parser), `pdf_layout`, `pdf_tables` (dochan's table assembly), AES-256 and CBC in `crypto`; specified in `2026-11-14-doc-reader-pdf-design.md` |
 | 3 | wpd, mobi, azw3, pages, numbers, key | `palmdb`, `snappy`, `pbwire` |
-| 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp | `iff`; each starts with a reverse-engineering note like phase 1-3's |
+| 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp | `bzz` (djvu's codec; no other phase 4 format is IFF, so `iff` is not a shared part) |
 
-Phase 4's formats were not reverse engineered yet. Their plans start with that step, and a format that cannot reach the success bar in pure Python stays "unsupported" with the reason recorded.
+Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-reader-plugins/notes/*-survey.md`, rulings in `rea-decisions.md`). A format that cannot reach the success bar stays "unsupported" with the reason recorded; mpp is one, read only through an opt-in mpxj path when Java and the user's install are present.
 
 ## Testing
 
@@ -153,8 +158,9 @@ Phase 4's formats were not reverse engineered yet. Their plans start with that s
 - Tests per format cover the gaps in the findings table: hidden content, merged cells, numbering, footnotes, charts from caches, content-type-agnostic OOXML, `\*` mid-group RTF, xlsb bad-record recovery, KF8 fallback, tile rows over 256.
 - The gate: allow with a swapped path, deny on failure, pass-through for other files, cache hit, timeout; for the OOXML family, the edit sentence and `PHRO_READER_OFF`.
 - xlsx: streamed sheets against `SHEET_SCAN`, with styled empty cells built in memory.
+- pdf: a stdlib fixture builder (`tests/pdf_fix.py`) writes tiny pdf bytes; tests that need pypdfium2 run under the venv and skip, saying so, without it.
 - Bench: a `phro-read` adapter in the bench harness, run with `python -I -X utf8 harness/bench.py run`. The success bar is checked per format against `reports/written/routing.tsv`, and each phase ends with a short addendum to the bench reports.
 
 ## Out of scope
 
-OCR of scanned pages or images; user passwords and DRM removal; editing or writing documents; pdf until phase 2d; rendering WMF/EMF.
+OCR of scanned pages or images (a scanned pdf page goes out as a page image); user passwords and DRM removal; editing or writing documents (pdf editing and creation stay with `anthropic-skills:pdf`); rendering WMF/EMF.
