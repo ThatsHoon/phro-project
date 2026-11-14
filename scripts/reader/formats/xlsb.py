@@ -306,6 +306,8 @@ class _Sheets:
             if idx >= len(self.wb.sst):
                 raise ValueError("shared string index")
             return self.show(self.wb.sst[idx], style)
+        if rid == BRT_CELL_RSTRING:  # a RichStr: fRichStr / fExtStr first; the runs after the string are not read
+            f.u8()
         return self.show(f.wide() or "", style)  # BrtCellSt, BrtCellRString, BrtFmlaString
 
     # ---- drawings

@@ -229,6 +229,17 @@ def test_formula_cached():
     assert "TRUE" in out.upper() and not ctx.skipped, (out, ctx.skipped)
 
 
+def test_rich_string_cell():
+    """BrtCellRString (62): a flags byte, the XLWideString, then (fRichStr) a run array that is never read."""
+    runs = struct.pack("<I", 2) + struct.pack("<HH", 0, 1) + struct.pack("<HH", 3, 2)
+    records = [xlsb_cell(62, 1, 0, b"\x00" + xlsb_wide("rich plain")),
+               xlsb_cell(62, 2, 0, b"\x01" + xlsb_wide("rich runs") + runs)]
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "plain"}, "records": records}])
+    for want in ("plain", "rich plain", "rich runs"):
+        assert want in out, (want, out)
+    assert not ctx.skipped and "could not read" not in out, (out, ctx.skipped)
+
+
 def test_hidden_row_col_sheet():
     cells = {(0, 0): "a", (0, 1): "b", (1, 0): "c", (1, 1): "d"}
     colinfo = biff12(60, struct.pack("<II", 1, 1) + bytes(8) + struct.pack("<H", 1))
