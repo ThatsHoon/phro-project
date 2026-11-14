@@ -148,10 +148,13 @@ class Presentation:
                 hidden = bool(struct.unpack_from("<H", self.doc, body + 10)[0] & 0x0004)
             elif typ == rec.PP_DRAWING and drawing is None:
                 drawing = (body, body + sz)
-        if drawing is None:  # no PPDrawing: the text atoms the slide holds itself, in record order
+        bare = drawing is None
+        if bare:  # no PPDrawing: the text atoms the slide holds itself, in record order
             drawing = (start, start + size)
         ordered, used = self._drawn(drawing, outline)
-        ordered.extend(o for i, o in enumerate(outline) if i not in used)
+        # a slide list run the slide's own atoms already gave is the same text: read it once
+        seen = {plain for _, _, plain in ordered} if bare else set()
+        ordered.extend(o for i, o in enumerate(outline) if i not in used and o[2] not in seen)
         sec = Section("slide", number=number, hidden="hidden" if hidden else "")
         titled = False
         for kind, blocks, plain in ordered:

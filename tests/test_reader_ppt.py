@@ -70,6 +70,18 @@ def test_slide_text_without_drawing():
     assert "> Notes: spoken" in out, out
 
 
+def test_slide_text_no_drawing_with_outline_once():
+    out, _ = md([{"title": "Heading", "body": ["bodyline"], "no_drawing": True, "outline": True}])
+    assert out.count("Heading") == 1 and out.count("bodyline") == 1, out
+
+
+def test_slide_text_no_drawing_outline_differs_kept():
+    # the slide list holds a run the container's own atoms do not: it is kept, not dropped
+    out, _ = md([{"title": "Heading", "body": ["bodyline"], "no_drawing": True, "outline": True,
+                  "extra": [(1, "only in the list")]}])
+    assert out.count("Heading") == 1 and out.count("bodyline") == 1 and "only in the list" in out, out
+
+
 def test_notes():
     out, _ = md([{"title": "Intro", "body": ["text"]}, {"title": "Plan"}], notes={1: "speak slowly"})
     assert "> Notes: speak slowly" in out, out
