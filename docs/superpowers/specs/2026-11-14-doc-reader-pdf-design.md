@@ -176,6 +176,21 @@ Nothing installs from a hook, at session start, or without that command.
 | 3. A SessionStart hook can run asynchronously | nothing | No change. 2d adds no SessionStart hook: install never runs from a hook, and a SessionStart hook would print into sessions that read no document. Recorded so that later work knows. |
 | 4. (From the rulings' `pages` item.) `updatedInput` replaces the whole input, and what Read does with `pages` on a `.md` file | `pages` mapping | If the key cannot be dropped and Read ignores `pages` on `.md`, the key stays and `offset`/`limit` still apply. If Read rejects it, a pdf Read with `pages` passes through to Claude's own Read. |
 
+## Hook-platform facts: results (plan Task 1)
+
+Checked 2026-11-15 against the hooks and plugins-reference docs, the installed `claude.exe` (read-only greps), and a direct Read call.
+
+| Fact | Result | Evidence | Branch taken |
+|---|---|---|---|
+| F1. `CLAUDE_PLUGIN_DATA` in the hook's environment | TRUE | https://code.claude.com/docs/en/hooks: hook processes get "`CLAUDE_PROJECT_DIR`, `CLAUDE_PLUGIN_ROOT`, and `CLAUDE_PLUGIN_DATA`". plugins-reference lists it as exported to hook commands. Binary: an env object holding `CLAUDE_PLUGIN_DATA:` next to `CLAUDE_PROJECT_DIR:`. | The venv lives under the variable. Task 16's `hooks.json` needs no `--data` for the environment. |
+| F1b. `${CLAUDE_PLUGIN_DATA}` expanded in a hook command string | TRUE | plugins-reference "Where each variable resolves": hook commands, "Anywhere in `command` and `args`". Binary: `CLAUDE_PLUGIN_DATA} are expanded in` and a `\$\{CLAUDE_PLUGIN_DATA\}` replace. | Task 16's `hooks.json` may also pass `--data "${CLAUDE_PLUGIN_DATA}"` as a second route; no "If false" fallback is needed. |
+| F2. PreToolUse `additionalContext` with no `permissionDecision` | TRUE | Docs: additionalContext is "Ignored when `permissionDecision` is `"defer"`", the only stated exclusion. Binary: the PreToolUse output builder spreads `permissionDecision` conditionally (`...y&&{permissionDecision`) and carries `additionalContext` on its own. Not run live. | The failure pass-through prints the one-line reason as context. |
+| F3. SessionStart hook can run asynchronously | TRUE (recorded only) | Binary: an `async_hook_response` schema with `hookEvent` SessionStart, and `Hooks: Registering async hook`. The doc excerpt read did not state it. | No change: 2d adds no SessionStart hook. |
+| F4a. `updatedInput` replaces the whole input | TRUE | Docs: "Replaces the entire input object" (PreToolUse and PermissionRequest). Binary: only an empty `updatedInput` falls back to the original; no merge found. | The `pages` key is dropped, and `offset`/`limit` are set. |
+| F4b. Read with `pages` on a `.md` file | IGNORES | Own Read on the 2d plan with `pages: "1-2"` gave the whole-file size error, the same as without `pages`. With `offset: 5`, `limit: 3` it returned lines 5-7. Neither call errored on `pages`. | Moot given F4a: the key is dropped; had F4a been false, the key would stay with `offset`/`limit`. |
+
+Note: no `UNKNOWN` remains. F2 and F4a rest on docs and binary text, not a live hook run.
+
 ### Gate
 
 `scripts/reader/__init__.py`:
