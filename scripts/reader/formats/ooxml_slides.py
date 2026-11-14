@@ -293,6 +293,9 @@ class _Reader:
                 text = " ".join(_flat(getattr(b, "inlines", [])) for b in blocks)
                 if text.strip():
                     titles.append(text)
+                eqs = [b for b in blocks if isinstance(b, Equation)]
+                if eqs:
+                    out.append((geom, eqs))
                 return
         elif n == "pic":
             blocks = self.picture(el, cnv)

@@ -228,6 +228,38 @@ def test_slide_math_in_table_cell():
     assert "$x$" in out and "$$" not in out, out
 
 
+def test_slide_title_equation_kept():
+    p = (f'<a:p {PNS}><a:r><a:t>T</a:t></a:r><a14:m><m:oMathPara><m:oMath>{sup("x", "2")}</m:oMath>'
+         '</m:oMathPara></a14:m></a:p>')
+    out = sl.md(sl.deck([sl.sp(paras=p, ph="title")]))
+    assert "## Slide 1: T" in out and "$$x^{2}$$" in out, out
+
+
+def para_alt(choice_attr, choice_body, fallback=None):
+    fb = f"<mc:Fallback>{fallback}</mc:Fallback>" if fallback else ""
+    return (f'<a:p {PNS} xmlns:mc="{MC}"><a:r><a:t>pre </a:t></a:r><mc:AlternateContent>'
+            f'<mc:Choice {choice_attr}>{choice_body}</mc:Choice>{fb}</mc:AlternateContent></a:p>')
+
+
+def slide_out(p):
+    doc, ctx = sl.parse(sl.deck([sl.sp(paras=p)]))
+    return sl.markdown.render(doc, sl.tmp() / "assets", False), ctx
+
+
+def test_slide_para_alternate_choice():
+    math = f'<a14:m><m:oMath>{sup("y", "3")}</m:oMath></a14:m>'
+    out, ctx = slide_out(para_alt('Requires="a14"', math, "<a:r><a:t>FALLBACK</a:t></a:r>"))
+    assert "pre $y^{3}$" in out and "FALLBACK" not in out and ctx.skipped["alternate"] == 0, (out, ctx.skipped)
+
+
+def test_slide_para_alternate_unusable():
+    math = f'<a14:m><m:oMath>{sup("y", "3")}</m:oMath></a14:m>'
+    out, ctx = slide_out(para_alt('Requires="zzz"', math, "<a:r><a:t>FALLBACK</a:t></a:r>"))
+    assert "FALLBACK" in out and "$y" not in out and ctx.skipped["alternate"] == 0, (out, ctx.skipped)
+    out, ctx = slide_out(para_alt('Requires="zzz"', math))
+    assert "pre" in out and "$y" not in out and ctx.skipped["alternate"] == 1, (out, ctx.skipped)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
