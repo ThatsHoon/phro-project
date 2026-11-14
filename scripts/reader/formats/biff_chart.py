@@ -12,7 +12,9 @@ records give the series, the kind and the title, but their numbers are not cache
 substream (NUMBER 3 and LABEL 4, Graph's own ids) hold them, a BRAI's last word being the datasheet row or column.
 The orientation after dochan `office_binary/ole_objects.py` `_graph_chart`: 0x1055 says whether the series are in rows,
 a series' name is the datasheet cell at point 0 of its axis, its values the points after that, and the categories
-the points of the axis a role 2 BRAI names; selections 0x1053 / 0x1054 stop the rows and columns that count.
+the points of the axis a role 2 BRAI names; selections 0x1053 / 0x1054 stop the rows and columns that count, and a
+Series whose point counts differ from them is a ReadError, as in dochan. The labels' codepage is the first CODEPAGE
+anywhere in the stream.
 """
 import struct
 
@@ -43,6 +45,7 @@ class _Series:
         self.refs = {}  # BRAI role -> (source, tokens, ifmt)
         self.aux = False  # carries SerParent: a trendline or error bar, not a data series
         self.idx = {}  # graph only: BRAI role -> datasheet row or column
+        self.counts = None  # graph only: the Series record's point counts (cValx, cValy)
 
 
 class _Text:
@@ -134,6 +137,9 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
         if rid in _SHEET_ONLY:
             stop = off - 4
             break
+        if ds is not None and rid == _CODEPAGE and size >= 2 and ds.codepage is None:
+            ds.codepage = struct.unpack_from("<H", data, off)[0]  # the first in the stream, at any nesting depth
+            continue
         if depth != 1:
             continue
         if rid == BEGIN:
@@ -151,6 +157,8 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
         try:
             if rid == _SERIES:
                 item = _Series()
+                if size >= 8:
+                    item.counts = struct.unpack_from("<HH", data, off + 4)
                 if len(series) < MAX_SERIES:
                     series.append(item)
                 else:
@@ -204,12 +212,13 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
                     cut_points = True
                 else:
                     _datasheet_cell(ds, rid, data, off, size)
-            elif ds is not None and rid == _CODEPAGE and size >= 2:
-                if ds.codepage is None:
-                    ds.codepage = struct.unpack_from("<H", data, off)[0]
             elif ds is not None and rid == _DS_ORIENT and size >= 6:
                 ds.by_rows = bool(data[off])
             elif ds is not None and rid in (_DS_ROWS, _DS_COLS) and size == 4:
+                # dochan refuses a selection whose first is not 0, whose stop is under 1 or that is given twice (the
+                # object is then unread). Looser here on purpose: the last one given counts as it stands, and a stop
+                # of 0 keeps no row or column; what a damaged selection does to the table is bounded by the point
+                # count check in graph(), which refuses a Series that disagrees with it as dochan does
                 ds.stop[rid] = struct.unpack_from("<HH", data, off)[1]
             elif rid == _SER_PARENT:
                 # it marks the Series it follows, one written without a Begin included, else the enclosing one
@@ -278,10 +287,15 @@ def graph(data: bytes, ctx):
     f = _scan(data, start, st, ctx, _GRAPH_BOF, ds)
     if f.end is None:
         raise limits.ReadError("damaged", "unterminated MS Graph substream")
+    if ds.codepage is None:  # the first CODEPAGE anywhere in the stream: one after the substream's EOF counts too
+        for rec in st.records(f.end):
+            if rec[0] == _CODEPAGE and rec[2] >= 2:
+                ds.codepage = struct.unpack_from("<H", data, rec[1])[0]
+                break
     if ds.by_rows is None:
         raise limits.ReadError("damaged", "MS Graph datasheet orientation missing")
     rows_stop, cols_stop = ds.stop.get(_DS_ROWS), ds.stop.get(_DS_COLS)
-    series_stop = rows_stop if ds.by_rows else cols_stop
+    series_stop, point_stop = (rows_stop, cols_stop) if ds.by_rows else (cols_stop, rows_stop)
     indexed, heads = {}, {}  # axis -> {point: value}; axis -> its point 0, the label
     cuts = [f.cut_points]
     for (row, col), value in ds.cells.items():
@@ -306,6 +320,8 @@ def graph(data: bytes, ctx):
         axis = s.idx.get(1)
         if s.aux or axis is None or (series_stop is not None and axis >= series_stop):
             continue  # a Series left over after its axis was deselected, or a trendline
+        if point_stop is not None and s.counts is not None and any(n != point_stop - 1 for n in s.counts):
+            raise limits.ReadError("damaged", "MS Graph Series point count does not match its selection")
         if not cats and s.idx.get(2) is not None:
             cats = {i: text(v) for i, v in indexed.get(s.idx[2], {}).items()}
         label = heads.get(s.idx.get(0, axis), heads.get(axis, ""))

@@ -364,6 +364,88 @@ def test_graph_codepage_before_bof_and_late():
         assert not ctx.skipped, (at, ctx.skipped)
 
 
+def test_graph_codepage_after_eof_and_nested():
+    # dochan takes the first CODEPAGE anywhere in the stream: after the datasheet's EOF, or inside a nested BOF/EOF
+    cats, series = ["한글", "둘"], [("이름", [1, 2])]
+    want = "Chart: bar@||이름|@|---|---|@|한글|1|@|둘|2|@".replace("@", "\n")
+    for at in ("after", "nested"):
+        out, ctx = graph_blocks(msgraph_object(cats, series, codepage=949, codepage_at=at))
+        assert render(out, ctx) == want, (at, render(out, ctx))
+        assert not ctx.skipped, (at, ctx.skipped)
+
+
+def test_graph_first_codepage_wins():
+    cats, series = ["한글"], [("이름", [1])]
+    obj = graph_streams(msgraph_object(cats, series, codepage=949))
+    obj["Workbook"] += biff(0x0042, struct.pack("<H", 1252))  # a second one, after the EOF, is not the page
+    from reader_fix import make_cfb
+    path = Path(tempfile.mkdtemp()) / "g.cfb"
+    make_cfb(path, obj)
+    with Compound(path) as cf:
+        ctx = Context()
+        out = xls_embedded.blocks(cf, ctx, sheet_grid.Budget())
+    assert render(out, ctx) == "Chart: bar\n||이름|\n|---|---|\n|한글|1|\n", render(out, ctx)
+
+
+def test_graph_gaps_and_empty_head_cell():
+    cats, series = ["a", "b", "c"], [("X", [1, 2, 3]), ("Y", [4, 5, 6])]
+    # (2, 1) is series X at point 2, (0, 2) series Y's head: the value is an empty cell, the name "Series 2"
+    out, ctx = graph_blocks(msgraph_object(cats, series, drop={(2, 1), (0, 2)}))
+    assert render(out, ctx) == "Chart: bar\n||X|Series 2|\n|---|---|---|\n|a|1|4|\n|b||5|\n|c|3|6|\n", render(out, ctx)
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_graph_series_and_point_caps():
+    cats, series = ["a", "b"], [("X", [1, 2]), ("Y", [3, 4]), ("Z", [5, 6])]
+    out, ctx = patched(bcm, MAX_SERIES=2)(lambda: graph_blocks(msgraph_object(cats, series)))
+    assert "Chart: bar (first 2 series)\n||X|Y|\n|---|---|---|\n|a|1|3|\n|b|2|4|\n" in render(out, ctx), render(out, ctx)
+    assert ctx.skipped == {"chart_cut": 1}, ctx.skipped
+    out, ctx = patched(bcm, MAX_POINTS=5)(lambda: graph_blocks(msgraph_object(cats, series)))
+    assert ctx.skipped == {"chart_cut": 1} and "points)" in render(out, ctx), (ctx.skipped, render(out, ctx))
+
+
+def test_graph_codepage_65001_and_unsupported():
+    cats, series = ["한글"], [("이름", [1])]
+    out, ctx = graph_blocks(msgraph_object(cats, series, codepage=65001, label_codec="utf-8"))
+    assert render(out, ctx) == "Chart: bar\n||이름|\n|---|---|\n|한글|1|\n", render(out, ctx)
+    # a page Python has no codec for: the chart is counted once, not shown with replacement characters
+    out, ctx = graph_blocks(msgraph_object(cats, series, codepage=60000, label_codec="cp949"))
+    assert out == [] and ctx.skipped["chart"] == 1, (out, ctx.skipped)
+    # ASCII labels need no codec
+    out, ctx = graph_blocks(msgraph_object(["a"], [("S", [1])], codepage=60000, label_codec="ascii"))
+    assert render(out, ctx) == "Chart: bar\n||S|\n|---|---|\n|a|1|\n", render(out, ctx)
+
+
+def test_graph_point_count_against_selection():
+    # a Series that says 3 points where the datasheet selection holds 2 is counted under chart (dochan: unsupported)
+    obj = graph_streams(msgraph_object(["a", "b"], [("X", [1, 2])]))
+    wb = obj["Workbook"]
+    series = biff(0x1003, struct.pack("<6H", 1, 1, 2, 2, 0, 0))
+    assert wb.count(series) == 1
+    obj["Workbook"] = wb.replace(series, biff(0x1003, struct.pack("<6H", 1, 1, 2, 3, 0, 0)))
+    from reader_fix import make_cfb
+    path = Path(tempfile.mkdtemp()) / "g.cfb"
+    make_cfb(path, obj)
+    ctx = Context()
+    with Compound(path) as cf:
+        out = xls_embedded.blocks(cf, ctx, sheet_grid.Budget())
+    assert out == [] and ctx.skipped["chart"] == 1, (out, ctx.skipped)
+
+
+def test_graph_errors_are_damaged():
+    from reader.limits import ReadError
+    obj = graph_streams(msgraph_object(*GRAPH))
+    wb = obj["Workbook"]
+    i = wb.index(struct.pack("<HH", 3, 15))
+    cut = wb[:i] + struct.pack("<HH", 3, 8) + wb[i + 4:i + 12] + wb[i + 19:]
+    try:
+        bcm.graph(cut, Context())
+    except ReadError as e:
+        assert e.kind == "damaged" and "truncated MS Graph datasheet cell" in e.detail, (e.kind, e.detail)
+    else:
+        raise AssertionError("a cut datasheet cell was read")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

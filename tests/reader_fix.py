@@ -961,15 +961,17 @@ def excel_object(sheets, prog=b"Excel.Sheet.8", **kw):
         return path.read_bytes()
 
 
-def msgraph_object(cats, series, kind="bar", title="", *, by_rows=False, codepage=1252, codepage_at="in"):
+def msgraph_object(cats, series, kind="bar", title="", *, by_rows=False, codepage=1252, codepage_at="in", drop=(),
+                   label_codec=None):
     """The compound file of an embedded MS Graph 97 object: a Workbook stream (BOF vers 0x0680 dt 0x8000) holding the
-    chart records and the datasheet (CODEPAGE `codepage_at` "in" the substream after its BOF, "before" the BOF or
-    "late", after the first cell), and a \\x01CompObj naming MSGraph.Chart.8, as bytes.
+    chart records and the datasheet (CODEPAGE `codepage_at` "in" the substream after its BOF, "before" the BOF,
+    "late", after the first cell, "nested", inside a nested BOF/EOF pair, or "after" the substream's EOF), and a \\x01CompObj naming MSGraph.Chart.8, as bytes.
 
     `series` is a list of (name, values). The datasheet's row 0 (column 0 with by_rows) holds the series names, its
     first column (row) the categories and the cells use Graph's own ids, NUMBER 3 and LABEL 4: row, col, 3 attribute
     bytes, then the f64 or a u16-sized narrow string. Selections 0x1053 / 0x1054 stop after the rows / columns, 0x1055
-    says whether the series are in rows; each Series' BRAIs end in the datasheet index of their row or column."""
+    says whether the series are in rows; each Series' BRAIs end in the datasheet index of their row or column. `drop` is a set of (row, col) datasheet cells
+    left out; `label_codec` is the codec the labels are written in when it differs from the CODEPAGE record."""
     n = len(series)
     head = [biff(0x0809, struct.pack("<HHHHII", 0x0680, 0x8000, 0, 0, 0, 0)),
             biff(0x1055, bytes([1 if by_rows else 0]) + bytes(5)),
@@ -992,20 +994,27 @@ def msgraph_object(cats, series, kind="bar", title="", *, by_rows=False, codepag
     def cell(point, axis, value):
         row, col = (axis, point) if by_rows else (point, axis)
         if isinstance(value, str):
-            raw = value.encode(f"cp{codepage}")
+            raw = value.encode(label_codec or f"cp{codepage}")
             return biff(4, struct.pack("<HH", row, col) + bytes(3) + struct.pack("<H", len(raw)) + raw)
         return biff(3, struct.pack("<HH", row, col) + bytes(3) + struct.pack("<d", float(value)))
     cells = [cell(0, k + 1, name) for k, (name, _) in enumerate(series)]
     cells += [cell(i + 1, 0, c) for i, c in enumerate(cats)]
     cells += [cell(i + 1, k + 1, v) for k, (_, vals) in enumerate(series) for i, v in enumerate(vals)]
+    where = {(row, col) for row, col in drop}
+    cells = [c for c in cells if struct.unpack_from("<HH", c, 4) not in where]
     cp = biff(0x0042, struct.pack("<H", codepage))
+    tail = []
     if codepage_at == "before":  # ahead of the dt 0x8000 BOF
         head.insert(0, cp)
     elif codepage_at == "late":  # after the first label cell
         cells.insert(1, cp)
+    elif codepage_at == "nested":  # inside a BOF/EOF pair within the substream
+        cells.insert(1, biff(0x0809, struct.pack("<HHHHII", 0x0600, 0x0010, 0, 0, 0, 0)) + cp + biff(0x000A))
+    elif codepage_at == "after":  # after the substream's EOF
+        tail.append(cp)
     else:
         head.insert(1, cp)
-    data = b"".join(head + cells + [biff(0x000A)])
+    data = b"".join(head + cells + [biff(0x000A)] + tail)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "obj.cfb"
         make_cfb(path, {"Workbook": data, "CompObj": comp_obj(b"MSGraph.Chart.8", b"Microsoft Graph Chart")})
