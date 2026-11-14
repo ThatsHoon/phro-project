@@ -907,8 +907,9 @@ def parse(path, ctx) -> Doc:
         head = f.read(16)
     if head.startswith(_ZIP):  # a Word package saved as .doc
         return ooxml.parse(path, ctx)
-    if head.removeprefix(_BOM).startswith(_RTF):  # RTF saved as .doc: read in phase 2b
-        raise ReadError("unsupported", "rtf")
+    if head.removeprefix(_BOM).lstrip(b" \t\r\n\x0b\x0c\x00").startswith(_RTF):  # RTF saved as .doc
+        from . import rtf  # rtf.parse sends a compound-file or zip head back here or to ooxml: the heads differ, no loop
+        return rtf.parse(path, ctx)
     if not is_cfb(head):
         raise ReadError("damaged", "not a Word document")
     with Compound(path) as cf:

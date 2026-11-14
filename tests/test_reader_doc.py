@@ -209,12 +209,11 @@ def test_encrypted_package_saved_as_doc():
 
 
 def test_rtf_saved_as_doc():
-    p = tmp() / "r.doc"
-    p.write_bytes(b"{\\rtf1\\ansi hello}")
-    assert denied(p, "unsupported").detail == "rtf"
-    q = tmp() / "b.doc"
-    q.write_bytes(b"\xef\xbb\xbf{\\rtf1 hi}")
-    assert denied(q, "unsupported").detail == "rtf"
+    for name, data in (("r.doc", b"{\\rtf1\\ansi hello}"), ("b.doc", b"\xef\xbb\xbf{\\rtf1\\ansi hello}"),
+                       ("s.doc", b"\xef\xbb\xbf \r\n{\\rtf1 hello}")):
+        p = tmp() / name
+        p.write_bytes(data)
+        assert md(p) == "hello\n", name
 
 
 def test_doc_zip_is_word():

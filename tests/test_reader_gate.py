@@ -119,11 +119,21 @@ def test_plain_text_passes_through():
         assert gate.decide(ev(put(name, data))) is None, name
 
 
-def test_binary_and_rtf_still_denied():
-    for name, data in (("a.rtf", b"{\\rtf1\\ansi hi}"), ("b.rtf", b"\xef\xbb\xbf{\\rtf1 hi}"),
-                       ("a.vsd", bytes.fromhex("D0CF11E0A1B11AE1") + bytes(100))):
+def test_binary_still_denied():
+    for name, data in (("a.vsd", bytes.fromhex("D0CF11E0A1B11AE1") + bytes(100)),):
         o = out(gate.decide(ev(put(name, data))))
         assert "not supported yet" in o["permissionDecisionReason"], name
+
+
+def test_rtf_converts():
+    """RTF is not plain text, so the gate converts it, with or without a byte-order mark."""
+    with stub():  # only for its throwaway cache root: the real read.py converts
+        for name, data in (("a.rtf", b"{\\rtf1\\ansi hi}"), ("b.rtf", b"\xef\xbb\xbf{\\rtf1\\ansi hi}")):
+            p = put(name, data)
+            o = out(gate.decide(ev(p)))
+            assert o["permissionDecision"] == "allow", (name, o)
+            text = Path(o["updatedInput"]["file_path"]).read_text(encoding="utf-8")
+            assert text.strip() == "hi", (name, text)
 
 
 def test_relative_path_uses_cwd():
