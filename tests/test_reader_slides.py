@@ -495,14 +495,14 @@ def test_comments_cut_counts_once():
     assert ctx.skipped["comments_cut"] == 1 and ctx.skipped["comments"] == 0, dict(ctx.skipped)
 
 
-def _refusing(names):
+def _refusing(names, kind="too_large"):
     """Make ooxml_base.load refuse the parts whose name contains one of `names` the way a size limit does."""
     from reader.formats import ooxml_base
     real = ooxml_base.load
 
     def load(pkg, part):
         if any(n in part for n in names):
-            raise ReadError("too_large", "part: " + part)
+            raise ReadError(kind, "part: " + part)
         return real(pkg, part)
     ooxml_base.load = load
     return lambda: setattr(ooxml_base, "load", real)
@@ -525,6 +525,19 @@ def test_too_large_notes_skips_the_part():
     finally:
         undo()
     assert ctx.skipped["notes"] == 1 and doc.blocks[0].title == "t", dict(ctx.skipped)
+
+def test_timeout_on_comments_authors_notes_aborts():
+    for names, d in ((("comments/comment1",), _legacy_deck([(0, "c")])), (("commentAuthors",), _legacy_deck([(0, "c")])),
+                     (("notesSlide",), deck([sp("t", "title")], notes={1: sp("m", "body")}))):
+        undo = _refusing(names, "timeout")
+        try:
+            parse(d)
+        except ReadError as e:
+            assert e.kind == "timeout", e.kind
+        else:
+            raise AssertionError(f"timeout on {names} was swallowed")
+        finally:
+            undo()
 
 
 def main():

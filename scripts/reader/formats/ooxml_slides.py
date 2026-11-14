@@ -208,7 +208,9 @@ class _Reader:
                     for a in root:
                         if local(a.tag) in ("cmAuthor", "author") and attr(a, "id") is not None:
                             self.authors[attr(a, "id")] = attr(a, "name") or ""
-            except ReadError:  # a member of an open package: any kind skips this part
+            except ReadError as e:  # a member of an open package: any kind but a timeout skips this part
+                if e.kind == "timeout":
+                    raise
                 self.ctx.skipped["comments"] += 1
 
     @staticmethod
@@ -257,7 +259,9 @@ class _Reader:
                             break
                         self.comment_count += 1
                         out.append(comment_note([Para([Text(text)])], self.authors.get(aid or "", ""))[0])
-            except ReadError:  # a member of an open package: any kind skips this part
+            except ReadError as e:  # a member of an open package: any kind but a timeout skips this part
+                if e.kind == "timeout":
+                    raise
                 self.ctx.skipped["comments"] += 1
         return out
 
@@ -324,7 +328,9 @@ class _Reader:
                         if ph is not None and (attr(ph, "type") or "body") == "body":
                             out.extend(self.text_blocks(_kid(sp, "txBody")))
                     return out
-            except ReadError:  # a member of an open package: any kind skips this part
+            except ReadError as e:  # a member of an open package: any kind but a timeout skips this part
+                if e.kind == "timeout":
+                    raise
                 self.ctx.skipped["notes"] += 1
             return []
         return []
