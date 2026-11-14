@@ -330,6 +330,8 @@ def _items(section):
             i = j
             continue
         elif k in ("lit", "digit", "dot", "comma", "slash", "pct", "ph", "exp"):
+            # A section that mixes date tokens with number placeholders ("0.0 h") is read as a date: the
+            # placeholders print as literal characters, never as a number.
             items.append(["text", t[1]])
         i += 1
     return items, locale

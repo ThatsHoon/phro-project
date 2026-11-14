@@ -145,6 +145,30 @@ def test_korean_date_tokens():
     assert display(45000.75, "[$-412]AM/PM h:mm") == "오후 6:00"
 
 
+def test_number_section_edges():
+    assert display(5, "[<0]0;0") == "5"
+    assert display(-5, "[<0]0;[>0]0;\"z\"") == "-5"
+    assert display(0, "[<0]0;[>0]0;\"z\"") == "z"
+    assert display(1234567, "#,###,") == "1,235"
+    assert display(1234567, "#,##0,,") == "1"
+    assert display(5, "[$ ]0") == " 5"
+    assert display(-0.001, "0.00") == "-0.00"       # Excel keeps the sign of a negative that rounds to zero
+    assert display(0.001, "0.00") == "0.00"
+
+
+def test_date_edges():
+    assert display(0.5, "m:ss") == "0:00"            # m before s without h is minutes
+    assert display(0.0007, "m:ss") == "1:00"
+    assert display(45000, "mmmmm") == "M"
+    assert display(45000, "yyyy e") == "2023 2023"
+    assert display(44926.99999999, "yyyy-mm-dd hh:mm:ss") == "2023-01-01 00:00:00"   # rounds over midnight
+    assert display(0.5, "[s]") == "43200"
+    assert display(1, "[m]") == "1440"
+    assert display(0, "dddd", True) == "Friday" and display(1462, "yyyy-mm-dd dddd", True) == "1908-01-02 Thursday"
+    # a section mixing date tokens and number placeholders prints the placeholders as literals
+    assert display(1.5, "0.0 h") == "0.0 12"
+
+
 def test_korean_locale_names():
     # 45000 is 2023-03-15, a Wednesday; under [$-412] month and day names are Korean like AM/PM
     assert display(45000, "[$-412]yyyy년 mmmm d일 dddd") == "2023년 3월 15일 수요일"
