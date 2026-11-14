@@ -285,6 +285,35 @@ def test_requirements_pinned():
     text = pdfenv.REQUIREMENTS.read_text(encoding="utf-8")
     assert "pypdfium2==5.15.2" in text
     assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", text)) == 7
+    lines = text.splitlines()
+    first = next(i for i, ln in enumerate(lines) if ln.startswith("pypdfium2==5.15.2"))
+    last = max(i for i, ln in enumerate(lines) if "--hash=sha256:" in ln)
+    cont = lines[first:last + 1]
+    assert len(cont) == 8, cont
+    assert not any(ln.lstrip().startswith("#") for ln in cont), "a comment inside the continuation"
+    assert all(ln.endswith("\\") for ln in cont[:-1]) and not cont[-1].endswith("\\")
+
+
+def test_requirements_pip_parse():
+    # a child, because the tests folder holds modules that shadow stdlib names pip imports
+    code = ("import json, sys\n"
+            "try:\n"
+            "    from pip._internal.network.session import PipSession\n"
+            "    from pip._internal.req.req_file import parse_requirements\n"
+            "except Exception:\n"
+            "    sys.exit(3)\n"
+            "reqs = list(parse_requirements(sys.argv[1], session=PipSession()))\n"
+            "print(json.dumps([[r.requirement, r.options.get('hashes', {}).get('sha256')] for r in reqs]))\n")
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, str(pdfenv.REQUIREMENTS)],
+                       capture_output=True, text=True, cwd=tempfile.gettempdir())
+    if r.returncode == 3:
+        print("note: pip not importable, pip parse check skipped")
+        return
+    assert r.returncode == 0, r.stderr
+    want = re.findall(r"--hash=sha256:([0-9a-f]{64})", pdfenv.REQUIREMENTS.read_text(encoding="utf-8"))
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert len(got) == 1, got
+    assert got[0][0].replace(" ", "") == "pypdfium2==5.15.2" and got[0][1] == want, got
 
 
 def test_smoke_pdf_reads():
