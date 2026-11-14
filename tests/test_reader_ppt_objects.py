@@ -179,7 +179,8 @@ def test_compressed_storage_inflates_only_to_embed_bytes():
 
     def spy(data, budget, limit=None):
         try:
-            out = real(data, budget, limit)
+            # the two-argument form when no limit is passed, so a reader without the limit fails on the size
+            out = real(data, budget) if limit is None else real(data, budget, limit)
         except ReadError:
             sizes.append(-1)
             raise

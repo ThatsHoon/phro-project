@@ -132,10 +132,9 @@ class Presentation:
                 if image is not None:
                     out.append((_PICTURE, [image], ""))
             elif shape.kind == "object":
-                placed = self.objects.blocks(shape.ole_ref)
+                placed, unread = self.objects.blocks(shape.ole_ref)
                 if placed:
                     out.append((_PICTURE, placed, ""))
-                unread = self.objects.unread_chart(shape.ole_ref)
                 if placed is None:
                     self.ctx.skipped["object"] += 1
                 elif unread:

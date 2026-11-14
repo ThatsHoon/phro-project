@@ -16,8 +16,8 @@ The storage is opened as a compound file and read once an exObjId:
 An equation converted in part (stopped early, symbols left out) keeps its TeX, is counted under object once, and
 `partial` says the caller may also show the preview; lists dropped past mtef.DEPTH are counted under depth at each
 placement. A workbook that fails inside xls_embedded (damaged, encrypted, a chart with no table) is read once and
-remembered as an unread chart, as in doc: `blocks` gives [], `unread_chart(id)` is true, its chart count is taken back
-and the caller shows the preview and counts one chart at each placement (never an object).
+remembered as an unread chart, as in doc: `blocks` gives ([], True), its chart count is taken back and the caller
+shows the preview and counts one chart at each placement (never an object).
 """
 import struct
 
@@ -44,7 +44,6 @@ class Objects:
         self._index = None   # exObjId -> persistIdRef
         self._read = {}      # exObjId -> an object read: (kind, blocks, lost) or None
         self.partial = set()  # exObjIds of equations converted in part
-        self._unread = None   # the exObjId of the last placement blocks() gave no table for (an unread chart)
         self.chart_cells = 0  # table cells placed from embedded workbooks, copies counted (CHART_TOTAL)
 
     def _ids(self) -> dict:
@@ -130,21 +129,17 @@ class Objects:
             # not a compound file or a broken chain, a stream that cannot be read, an equation that does not convert
             return None
 
-    def unread_chart(self, ex_obj_id) -> bool:
-        """Whether the placement blocks() was last asked for, of `ex_obj_id`, is an unread chart: a workbook that gave
-        no table, or whose tables would take the presentation past CHART_TOTAL (blocks gives [] for either)."""
-        return self._unread is not None and ex_obj_id == self._unread
-
-    def blocks(self, ex_obj_id: int | None) -> list | None:
-        """The blocks of object `ex_obj_id` for one placement, or None when it is not read (the caller shows the
-        preview and counts it under object). An object is read once; its blocks may be placed again."""
-        self._unread = None
+    def blocks(self, ex_obj_id: int | None) -> tuple[list | None, bool]:
+        """(blocks, unread) of object `ex_obj_id` for one placement. blocks is None when the object is not read (the
+        caller shows the preview and counts it under object). unread is true, with blocks [], for an unread chart:
+        a workbook that gave no table, or whose tables would take the presentation past CHART_TOTAL (the caller
+        shows the preview and counts it under chart). An object is read once; its blocks may be placed again."""
         pid = self._ids().get(ex_obj_id)
         if pid is None:
-            return None
+            return None, False
         if ex_obj_id not in self._read:
             if len(self._read) >= MAX_OBJECTS:
-                return None  # past the cap: not read, counted where it is placed, never remembered
+                return None, False  # past the cap: not read, counted where it is placed, never remembered
             self._read[ex_obj_id] = None
             got = self._read[ex_obj_id] = self._load(pid)
             if got is not None and got[0] == "equation" and got[2] - {"depth"}:
@@ -152,19 +147,17 @@ class Objects:
                 self.ctx.skipped["object"] += 1
         got = self._read[ex_obj_id]
         if got is None:
-            return None
+            return None, False
         kind, blocks, lost = got
         if kind == "chart":
-            self._unread = ex_obj_id
-            return []
+            return [], True
         if kind == "equation":
             if "depth" in lost:
                 self.ctx.skipped["depth"] += 1
-            return list(blocks)
+            return list(blocks), False
         for t in blocks:
             if isinstance(t, Table):
                 self.chart_cells += sum(len(row) for row in t.rows)
         if self.chart_cells > limits.CHART_TOTAL and blocks:
-            self._unread = ex_obj_id  # the caller shows the preview and counts the chart, as for an unread workbook
-            return []
-        return list(blocks)
+            return [], True  # the caller shows the preview and counts the chart, as for an unread workbook
+        return list(blocks), False

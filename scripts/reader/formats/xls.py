@@ -172,7 +172,9 @@ class Workbook:
                 if depth == 1 and (size < 4 or struct.unpack_from("<H", data, off + 2)[0] != 0x0010):
                     raise ReadError("damaged", "not a worksheet")
                 if depth == 2 and size >= 4 and struct.unpack_from("<H", data, off + 2)[0] == biff.CHART_BOF:
-                    starts.append(off - 4)  # _charts reads MAX_CHARTS of them and counts the rest, every call
+                    # one start per BOF record, and every walk of the stream draws on its one BIN_RECORDS, so
+                    # `starts` never outgrows that; _charts reads MAX_CHARTS of them and counts the rest, every call
+                    starts.append(off - 4)
                 continue
             if depth == 0:
                 raise ReadError("damaged", "sheet does not start with a BOF")

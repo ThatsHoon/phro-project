@@ -431,7 +431,8 @@ def test_chart_placements_charged():
     out, ctx = read(doc(*[ole_shape(1)] * n, bins=items((2, 0, 1)), streams={"BIN0001.OLE": deflate(item)},
                         before="", after=""))
     # 2.2 s alone; with CHART_TOTAL lifted (every placement kept) the same read takes 17 s. 12 s holds when two suites
-    # share the machine and still fails the uncharged read
+    # share the machine and still fails the uncharged read, but only 1.4x under it: the count assertions below are
+    # the real guard, the clock only a backstop
     assert time.monotonic() - t0 < 12, time.monotonic() - t0
     keep = limits.CHART_TOTAL // size
     assert ctx.skipped["chart"] == n - keep and out.count("Chart: column") == keep, (ctx.skipped, out.count("Chart:"))
