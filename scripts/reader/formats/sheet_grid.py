@@ -127,6 +127,7 @@ class Grid:
         self.name, self.budget, self.ctx = name, budget, ctx
         self.cells = {}
         self.merges = []
+        self._seen = set()  # the merges kept, so an exact duplicate is dropped before the cap counts it
         self.rows_h, self.cols_h = _Ranges(), _Ranges()
         self.cut = False
         self._merges_cut = False
@@ -164,12 +165,16 @@ class Grid:
         r2, c2 = min(r2, limits.SHEET_ROWS - 1), min(c2, limits.SHEET_COLS - 1)
         if r1 > r2 or c1 > c2 or (r1 == r2 and c1 == c2):
             return
+        m = (r1, c1, r2, c2)  # reading order of the first cell, then the extent
+        if m in self._seen:
+            return
         if len(self.merges) >= _MERGES:
             if not self._merges_cut:
                 self._merges_cut = True
                 self._stop_merges()
             return
-        self.merges.append((r1, r2, c1, c2))
+        self._seen.add(m)
+        self.merges.append(m)
 
     def _stop_merges(self):
         self.ctx.warnings.append(f"sheet {self.name} cut at {_MERGES} merged ranges")
@@ -187,7 +192,7 @@ class Grid:
     # ---- output
     def _sweep(self):
         """Yield ((row, col), text, merge covering it or None) in reading order, in one row sweep.
-        Merges are taken in reading order of their first cell; one that overlaps an earlier one is dropped.
+        Merges are taken in reading order of their first cell (stored as (r1, c1, r2, c2)); one that overlaps an earlier one is dropped.
         Active merges never overlap, so they are disjoint in columns and one bisect finds the one over a column."""
         merges = sorted(self.merges)
         mi, starts, act, heap = 0, [], [], []  # act: merges by first column; heap: (last row, first column)
@@ -204,12 +209,12 @@ class Grid:
                 mi += 1
                 expire(m[0])
                 i = bisect_right(starts, m[3]) - 1  # the last active merge starting at or before this one's end
-                if i >= 0 and act[i][3] >= m[2]:
+                if i >= 0 and act[i][3] >= m[1]:
                     continue
-                j = bisect_left(starts, m[2])
-                starts.insert(j, m[2])
+                j = bisect_left(starts, m[1])
+                starts.insert(j, m[1])
                 act.insert(j, m)
-                heapq.heappush(heap, (m[1], m[2]))
+                heapq.heappush(heap, (m[2], m[1]))
             expire(r)
             i = bisect_right(starts, c) - 1
             hit = act[i] if i >= 0 and act[i][3] >= c else None
@@ -220,12 +225,12 @@ class Grid:
         for (r, c), text, m in self._sweep():
             if m is None:
                 origins[(r, c)] = (text, r, c)
-            elif (r, c) == (m[0], m[2]):  # a covered cell's own text is dropped
-                vr = self.rows_h.first_free(m[0], m[1])
-                vc = self.cols_h.first_free(m[2], m[3])
+            elif (r, c) == (m[0], m[1]):  # a covered cell's own text is dropped
+                vr = self.rows_h.first_free(m[0], m[2])
+                vc = self.cols_h.first_free(m[1], m[3])
                 if vr is None or vc is None:
-                    vr, vc = m[0], m[2]
-                origins[(vr, vc)] = (text, m[1], m[3])
+                    vr, vc = m[0], m[1]
+                origins[(vr, vc)] = (text, m[2], m[3])
         if not origins:
             return []
         rows = sorted({r for r, _ in origins} | {v[1] for v in origins.values()})

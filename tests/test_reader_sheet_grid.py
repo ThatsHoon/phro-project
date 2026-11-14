@@ -265,6 +265,58 @@ def test_overlap_in_sweep_drops_later():
     assert (t.rows[0][0].rowspan, t.rows[0][0].colspan) == (2, 2) and len(t.rows) == 2
 
 
+def test_span_over_hidden_and_visible_counts_hidden_text():
+    # a merge over a hidden and a visible column loses the hidden column's share of its text: one place, counted
+    g, _ = mk()
+    g.put(0, 0, "wide")
+    g.put(1, 0, "x")
+    g.merge(0, 0, 0, 1)
+    g.hide_cols(1, 1)
+    out = markdown.render(Doc(blocks=g.blocks()), Path(tempfile.mkdtemp()))
+    assert "(1 hidden places left out)" in out, out
+    shown = markdown.render(Doc(blocks=g.blocks()), Path(tempfile.mkdtemp()), hidden=True)
+    assert "hidden places" not in shown, shown
+
+
+def test_merge_over_hidden_rows_or_cols_only():
+    # a merge whose rows are all hidden, or whose columns are all hidden, keeps its text at its first slot
+    g, _ = mk()
+    g.put(0, 0, "r")
+    g.put(2, 0, "z")
+    g.hide_row(0)
+    g.hide_row(1)
+    g.merge(0, 1, 0, 0)
+    t = table(g)
+    assert (t.rows[0][0].rowspan, t.hidden_rows) == (2, frozenset({0, 1})), (t.rows[0][0].rowspan, t.hidden_rows)
+    assert "r" in markdown.render(Doc(blocks=[t]), Path(tempfile.mkdtemp()), hidden=True)
+    g, _ = mk()
+    g.put(0, 0, "c")
+    g.put(1, 3, "z")
+    g.hide_cols(0, 1)
+    g.merge(0, 0, 0, 1)
+    t = table(g)
+    assert (t.rows[0][0].colspan, t.hidden_cols) == (2, frozenset({0, 1})), (t.rows[0][0].colspan, t.hidden_cols)
+
+
+def test_sweep_orders_merges_by_reading_order():
+    # the merge whose first cell is first in reading order wins an overlap, whatever its last row
+    g, _ = mk()
+    g.put(0, 0, "a")
+    g.put(0, 1, "b")
+    g.merge(0, 5, 0, 1)   # first cell (0, 0)
+    g.merge(0, 1, 1, 2)   # first cell (0, 1); ends on an earlier row
+    t = table(g)
+    assert (t.rows[0][0].rowspan, t.rows[0][0].colspan) == (6, 2), (t.rows[0][0].rowspan, t.rows[0][0].colspan)
+
+
+def test_duplicate_merges_do_not_count_toward_the_cap():
+    g, ctx = mk()
+    g.put(0, 0, "a")
+    for _ in range(100_005):
+        g.merge(0, 1, 0, 1)
+    assert not ctx.skipped and len(g.merges) == 1, (dict(ctx.skipped), len(g.merges))
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
