@@ -77,12 +77,18 @@ class _Found:
     stop = 0
 
 
-def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.Stream | None = None):
+def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.Stream | None = None,
+          seen: dict | None = None):
     """The chart substream whose BOF is at `start`: (its Table or None, the offset after its EOF). `cells` maps a
     sheet index to {(row, col): displayed text}; a sheet it lacks has no cells. A substream that cannot be read is
     counted under `chart` and the offset is where the walk stopped. `st` is the workbook's Stream over `data`, so
-    worksheets and charts share one `limits.BIN_RECORDS`; without it the chart gets a Stream of its own."""
+    worksheets and charts share one `limits.BIN_RECORDS`; without it the chart gets a Stream of its own.
+
+    A series name is its SeriesText, else its role 0 reference. For a series that carries cached values the reference
+    resolves only against `seen`, the sheets already read (`cells` by default): when `cells` reads a sheet the first
+    time a reference names it (an embedded workbook's), no sheet is read for a name alone."""
     st = biff.Stream(data, ctx) if st is None else st
+    seen = cells if seen is None else seen
     f = _scan(data, start, st, ctx, biff.CHART_BOF)
     if f.end is None:
         ctx.skipped["chart"] += 1
@@ -92,10 +98,15 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
     cuts = [f.cut_points]
     out, cats = [], {}
     for k, s in enumerate(series):
-        got = {r: _values(s, r, (k, r) in cache and cache[k, r], g, cells, left, cuts) for r in (0, 1, 2)}
+        name = s.name
+        if not name:  # role 0 is read only for a series without a SeriesText, ahead of its values as before
+            where = seen if (k, 1) in cache or (k, 2) in cache else cells
+            got = _values(s, 0, (k, 0) in cache and cache[k, 0], g, where, left, cuts)
+            name = got[min(got)] if got else ""
+        got = {r: _values(s, r, (k, r) in cache and cache[k, r], g, cells, left, cuts) for r in (1, 2)}
         if not cats and got[2] and not s.aux:  # a trendline's categories are not the chart's
             cats = got[2]
-        name = s.name or (got[0][min(got[0])] if got[0] else "") or f"Series {k + 1}"
+        name = name or f"Series {k + 1}"
         if not s.aux:  # k stays the cache column of the series after it
             out.append((name, got[1]))
     n = max([max(d) + 1 for d in [cats] + [v for _, v in out] if d] + [0])

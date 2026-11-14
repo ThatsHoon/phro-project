@@ -91,7 +91,7 @@ def _read(cf, name, ctx, budget):
     if ref.kind == xls._CHART:
         if not 0 <= ref.offset < len(wb.data):
             raise ReadError("damaged", "chart sheet offset outside the stream")
-        tbl, _ = biff_chart.chart(wb.data, ref.offset, wb.g, _OwnCells(wb), ctx, wb.st)
+        tbl, _ = biff_chart.chart(wb.data, ref.offset, wb.g, _OwnCells(wb), ctx, wb.st, seen=wb.cells)
         return [tbl] if tbl is not None else None
     if ref.kind != xls._WORKSHEET:
         return None
@@ -103,7 +103,8 @@ def _read(cf, name, ctx, budget):
 class _OwnCells:
     """The cells a chart's references can reach: those of the embedded workbook's own sheets. A worksheet is read (by
     sheet_blocks, over the document's one sheet budget) the first time a reference names it, so a chart that carries
-    its values, or whose references leave the workbook, reads none. It has the `get` of the dict that
+    its values, or whose references leave the workbook, reads none: a cached series' name reference goes to
+    `wb.cells`, the sheets already read (biff_chart.chart's `seen`), never here. It has the `get` of the dict that
     biff_chart.chart takes."""
 
     def __init__(self, wb):

@@ -895,8 +895,9 @@ def biff_workbook(sheets, *, formats=None, date1904=False, active=0, filepass=No
 def biff_chart(series, *, title=None, kinds=((0x1017, bytes(6)),), cache=True, eof=True, extra=()):
     """A chart substream (BOF dt 0x20 ... EOF), as a chart sheet's `raw` or inside a worksheet's `records`.
 
-    `series` is a list of dicts: name, vals and cats (lists), ifmt (BRAI number format id), aux (carries SerParent 0x104A) and ref ((role,
-    tokens) pairs that replace the cache for that role). With `cache` the values and categories follow as SIIndex
+    `series` is a list of dicts: name, vals and cats (lists), ifmt (BRAI number format id), aux (carries SerParent
+    0x104A) and ref ((role, tokens) pairs that make that role's BRAI a reference: role 0 is the name, 1 the values and 2
+    the categories). With `cache` the values and categories follow as SIIndex
     caches (NUMBER for a number, LABEL for a string, col = the series), else each series has only its BRAIs.
     `kinds` are (id, body) records; `extra` raw records go before the EOF."""
     short = lambda t: _xl_string(t, short=True)
@@ -910,7 +911,7 @@ def biff_chart(series, *, title=None, kinds=((0x1017, bytes(6)),), cache=True, e
         refs = dict(s.get("ref", ()))
         out += [biff(0x1003, struct.pack("<6H", 1, 1, len(s.get("vals", ())), len(s.get("cats", ())), 0, 0)),
                 biff(0x1033)]
-        out.append(brai(0, 1))
+        out.append(brai(0, 2 if 0 in refs else 1, refs.get(0, b"")))
         if s.get("name") is not None:
             out.append(biff(0x100D, struct.pack("<H", 0) + short(s["name"])))
         out.append(brai(1, 2 if 1 in refs else 1, refs.get(1, b""), s.get("ifmt", 0)))

@@ -93,6 +93,31 @@ def test_cached_chart_does_not_walk_sheets():
     assert budget.cells == budget.cap_cells, "a chart with cached values reads no sheet"
 
 
+def test_cached_chart_with_a_name_reference_reads_no_sheet():
+    # Excel links a series name to its header cell (a role 0 reference) beside the cached values: the name is the
+    # SeriesText's, or else only what cells were already read give, and the data sheet is never read for a name alone
+    head = (0, area3d(0, 0, 0, 1, 1))
+    for name, want in (("V", "V"), (None, "Series 1")):
+        cached = [{"name": name, "vals": [7], "cats": ["z"], "ref": [head]}]
+        sheets = [CELLS, {"name": "Chart1", "kind": 2, "raw": biff_chart(cached)}]
+        budget = sheet_grid.Budget()
+        path = tmp() / "o.cfb"
+        make_cfb(path, cacheless_object(sheets=sheets))
+        ctx = Context()
+        with Compound(path) as cf:
+            out = xls_embedded.blocks(cf, ctx, budget)
+        assert render(out) == f"Chart: bar\n||{want}|\n|---|---|\n|z|7|\n", render(out)
+        assert budget.cells == budget.cap_cells and budget.chars == budget.cap_chars, (name, budget.cells)
+        assert not ctx.skipped, ctx.skipped
+    # without a cache the name reference still reads the sheet it names
+    refs = [{"name": None, "ref": [head, *REFS[0]["ref"]]}]
+    path = tmp() / "o.cfb"
+    make_cfb(path, cacheless_object(refs=refs))
+    with Compound(path) as cf:
+        out = xls_embedded.blocks(cf, Context(), sheet_grid.Budget())
+    assert render(out) == "Chart: bar\n||5|\n|---|---|\n|Q1|5|\n|Q2|6|\n", render(out)
+
+
 def test_reference_outside_the_workbook_stays_empty():
     # an XTI of sheet -1 (another workbook) has no cells to read; the chart is still the table of what it holds
     refs = [{"name": "V", "ref": [(1, area3d(0, 0, 1, 1, 1))]}]
