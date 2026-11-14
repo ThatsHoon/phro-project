@@ -18,14 +18,24 @@ _code = None
 _private = None  # this process's own cache root when the shared fallback is unsafe
 
 
-def root() -> Path:
+def _configured() -> Path:
     env = os.environ.get("PHRO_READER_CACHE")
     if env:
-        base = Path(env)
-    elif sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "phro-project" / "reader"
-    else:
-        base = Path.home() / ".cache" / "phro-project" / "reader"
+        return Path(env)
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "phro-project" / "reader"
+    return Path.home() / ".cache" / "phro-project" / "reader"
+
+
+def venv_base() -> Path:
+    """The folder that holds `pdf-venv`: the parent of the configured cache root, or the root itself when the
+    cache fell back to the temp dir (its parent there is the shared temp dir)."""
+    r = root()
+    return r.parent if r == _configured() else r
+
+
+def root() -> Path:
+    base = _configured()
     try:
         base.mkdir(parents=True, exist_ok=True)
         return base

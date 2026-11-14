@@ -1,13 +1,19 @@
 """CLI for the document reader: convert | setup | formats | prune | hook."""
-import argparse
-import contextlib
-import json
 import os
 import sys
-from pathlib import Path
+
+# This folder holds project CLIs named like stdlib modules (queue.py): it must come last on sys.path so the
+# standard library wins, while `reader` (only here) still imports.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [p for p in sys.path if os.path.normcase(os.path.abspath(p or ".")) != os.path.normcase(_HERE)]
+sys.path.append(_HERE)
+
+import argparse  # noqa: E402
+import contextlib  # noqa: E402
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 READ_PY = Path(__file__).resolve()
-sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
@@ -63,7 +69,10 @@ def _reexec(a):
     if a.pages:
         cmd += ["--pages", f"{a.pages[0]}-{a.pages[1]}"]
     cmd += ["--engine", "pdfium"]
-    r = subprocess.run(cmd, capture_output=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True)
+    except OSError:  # the venv interpreter cannot be launched: read natively
+        return None
     sys.stdout.write(r.stdout.decode("utf-8", "replace"))
     if r.stderr:
         sys.stderr.write(r.stderr.decode("utf-8", "replace"))

@@ -201,7 +201,7 @@ def test_setup_success():
         ready = json.loads((dest / "ready.json").read_text(encoding="utf-8"))
         assert ready["requirements"] == pdfenv.requirements_hash()
         assert ready["pypdfium2"] == "5.15.2" and ready["pdfium"] == 7000
-        assert set(ready["records"]) == {"pypdfium2", "pypdfium2_raw"}
+        assert set(ready["records"]) == {"pypdfium2"}
         assert "version" in ready["python"] and "home" in ready["python"]
         assert pdfenv.state(dest) == "READY" and pdfenv.verify(dest)
         assert leftovers(dest) == []
@@ -213,6 +213,7 @@ def test_setup_replaces_old():
     with env() as d:
         dest = d / "pdf-venv"
         dest.mkdir()
+        (dest / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
         (dest / "marker").write_text("old", encoding="utf-8")
         assert pdfsetup.setup(dest, Stub()).startswith("READY\t")
         assert not (dest / "marker").exists()
@@ -366,6 +367,255 @@ def test_pdfenv_import_light():
             "bad = [m for m in sys.modules if m.startswith('reader.formats')]; "
             "assert not bad, bad; assert 'subprocess' not in sys.modules; print('ok')" % str(HERE / "scripts"))
     r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stderr
+
+
+class Shadow(Stub):
+    def __init__(self, hook, **kw):
+        super().__init__(**kw)
+        self.hook = hook
+
+    def make_venv(self, tmp):
+        super().make_venv(tmp)
+        self.hook()
+
+
+class Boom(Stub):
+    def __init__(self, step):
+        super().__init__()
+        self.step = step
+
+    def pip(self, python, requirements):
+        if self.step == "pip":
+            raise OSError("pip exploded")
+        return super().pip(python, requirements)
+
+    def versions(self, python):
+        if self.step == "versions":
+            raise OSError("no versions")
+        return super().versions(python)
+
+    def smoke(self, python):
+        if self.step == "smoke":
+            raise OSError("no smoke")
+        return super().smoke(python)
+
+
+def test_setup_refuses_foreign_dir():
+    with env() as d:
+        dest = d / "docs"
+        dest.mkdir()
+        (dest / "thesis.docx").write_text("precious", encoding="utf-8")
+        out = pdfsetup.setup(dest, Stub())
+        assert out == f"FAIL\tinstall\t{dest.resolve()} is not a pdf venv", out
+        assert (dest / "thesis.docx").read_text(encoding="utf-8") == "precious"
+        assert not Path(str(dest) + ".lock").exists()
+        assert leftovers(dest) == []
+        empty = d / "empty"  # an empty folder is fine to replace
+        empty.mkdir()
+        assert pdfsetup.setup(empty, Stub()).startswith("READY\t")
+
+
+def test_remove_refuses_foreign_dir():
+    with env() as d:
+        dest = d / "docs"
+        dest.mkdir()
+        (dest / "thesis.docx").write_text("precious", encoding="utf-8")
+        out = pdfsetup.remove(dest)
+        assert out == f"FAIL\tinstall\t{dest.resolve()} is not a pdf venv", out
+        assert (dest / "thesis.docx").is_file()
+
+
+def test_remove_keeps_other_pointer():
+    with env() as d:
+        from reader import cache
+        mine, other = d / "mine", d / "other"
+        pdf_fix.fake_venv(mine)
+        (cache.root() / "pdf-venv.json").write_text(json.dumps({"venv": str(other)}), encoding="utf-8")
+        assert pdfsetup.remove(mine).startswith("REMOVED")
+        assert not mine.exists()
+        assert (cache.root() / "pdf-venv.json").exists()
+
+
+def test_verify_layout():
+    import hashlib
+    with env() as d:
+        v = pdf_fix.fake_venv(d / "v")
+        site = v / "Lib" / "site-packages"
+        assert set(json.loads((v / "ready.json").read_text(encoding="utf-8"))["records"]) == {"pypdfium2"}
+        assert not list(site.glob("pypdfium2_raw-*"))
+        rec = next(site.glob("pypdfium2-*.dist-info")) / "RECORD"
+        text = rec.read_text(encoding="utf-8")
+        assert "pypdfium2_raw/" in text and "../../Scripts/" in text
+        # no pypdfium2_raw file listed: not a real install
+        rec.write_text("".join(ln for ln in text.splitlines(True) if "pypdfium2_raw/" not in ln), encoding="utf-8")
+        ready = json.loads((v / "ready.json").read_text(encoding="utf-8"))
+        ready["records"]["pypdfium2"] = hashlib.sha256(rec.read_bytes()).hexdigest()
+        (v / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
+        assert pdfenv.verify(v) is False
+        v2 = pdf_fix.fake_venv(d / "v2")  # two dist-infos
+        s2 = v2 / "Lib" / "site-packages"
+        shutil.copytree(next(s2.glob("pypdfium2-*.dist-info")), s2 / "pypdfium2-5.0.0.dist-info")
+        assert pdfenv.verify(v2) is False
+
+
+def test_step_isolation():
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append((list(cmd), kw))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with env() as d:
+        venv = d / "pdf-venv"
+        real = pdfsetup.subprocess.run
+        pdfsetup.subprocess.run = fake_run
+        try:
+            pdfsetup.Steps().make_venv(venv)
+            assert pdfsetup.Steps().pip(venv / "bin" / "python3", pdfenv.REQUIREMENTS) == (True, "")
+        finally:
+            pdfsetup.subprocess.run = real
+        mk, pip = seen
+        assert "-I" in mk[0] and Path(mk[1]["cwd"]) == d
+        assert "-I" in pip[0] and "--isolated" in pip[0] and pip[1]["timeout"] == 900 and Path(pip[1]["cwd"]) == d
+
+        def slow(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 900)
+
+        pdfsetup.subprocess.run = slow
+        try:
+            assert pdfsetup.Steps().pip(venv / "bin" / "python3", pdfenv.REQUIREMENTS) == (False, "timeout")
+        finally:
+            pdfsetup.subprocess.run = real
+
+
+def test_step_exceptions_are_fail_lines():
+    for step in ("pip", "versions", "smoke"):
+        with env() as d:
+            dest = d / "pdf-venv"
+            out = pdfsetup.setup(dest, Boom(step))
+            assert out.startswith(f"FAIL\t{step}\t"), out
+            _nothing_left(dest)
+    with env() as d:
+        from reader import cache
+        (cache.root() / "pdf-venv.json").mkdir()
+        out = pdfsetup.setup(d / "pdf-venv", Stub())
+        assert out.startswith("FAIL\tpointer\t"), out
+        assert not Path(str(d / "pdf-venv") + ".lock").exists()
+
+
+def test_convert_reexec_oserror_falls_back():
+    def broken(cmd, *a, **kw):
+        raise OSError("cannot launch")
+
+    with env() as d:
+        v = pdf_fix.fake_venv(d / "v")
+        src = d / "a.pdf"
+        src.write_bytes(pdf_fix.simple_pdf([pdf_fix.text_ops("hello")]))
+        os.environ["PHRO_READER_PYENV"] = str(v)
+        real = subprocess.run
+        subprocess.run = broken
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = read.main(["convert", str(src)])
+        finally:
+            subprocess.run = real
+        assert code == 0 and buf.getvalue().strip().endswith("out.md"), buf.getvalue()
+
+
+def test_tmp_cleanup_by_prefix():
+    with env() as d:
+        dest = d / "v[ab]"
+        keep = d / "va.tmp-keep"
+        mine_tmp = d / "v[ab].tmp-77"
+        mine_old = d / "v[ab].old-5"
+        fresh_old = d / "v[ab].old-6"
+        for p in (keep, mine_tmp, mine_old, fresh_old):
+            p.mkdir()
+        t = time.time() - 1200
+        for p in (keep, mine_tmp, mine_old):
+            os.utime(p, (t, t))
+        assert pdfsetup.setup(dest, Stub()).startswith("READY\t")
+        assert keep.exists() and not mine_tmp.exists() and not mine_old.exists() and fresh_old.exists()
+
+
+def test_paths_are_resolved():
+    with env() as d:
+        from reader import cache
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            out = pdfsetup.setup(Path("rel-venv"), Stub())
+            assert pdfsetup.check(Path("rel-venv")).startswith("READY\t")
+        finally:
+            os.chdir(cwd)
+        want = (d / "rel-venv").resolve()
+        assert out.split("\t")[1] == str(want)
+        assert json.loads((cache.root() / "pdf-venv.json").read_text(encoding="utf-8")) == {"venv": str(want)}
+
+
+def test_fallback_cache_default_venv():
+    with env() as d:
+        blocker = d / "afile"
+        blocker.write_text("x", encoding="utf-8")
+        os.environ["PHRO_READER_CACHE"] = str(blocker / "sub")
+        old_tmp = tempfile.tempdir
+        tempfile.tempdir = str(d)
+        try:
+            from reader import cache
+            root = cache.root()
+            assert root.parent == d, root
+            assert pdfenv.venv_dir() == root / "pdf-venv"
+        finally:
+            tempfile.tempdir = old_tmp
+
+
+def test_lock_token_ownership():
+    with env() as d:
+        dest = d / "pdf-venv"
+        lock = Path(str(dest) + ".lock")
+        out = pdfsetup.setup(dest, Shadow(lambda: lock.write_text("someone else", encoding="utf-8")))
+        assert out.startswith("READY\t")
+        assert lock.read_text(encoding="utf-8") == "someone else"
+
+
+def test_swap_restore_failure_names_both():
+    with env() as d:
+        dest = (d / "pdf-venv").resolve()
+        dest.mkdir()
+        (dest / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
+        real = os.replace
+        calls = []
+
+        def fake_replace(src, dst, *a, **kw):
+            calls.append((str(src), str(dst)))
+            if Path(dst) == dest and len(calls) >= 2:
+                raise OSError("denied")
+            return real(src, dst, *a, **kw)
+
+        os.replace = fake_replace
+        try:
+            out = pdfsetup.setup(dest, Stub())
+        finally:
+            os.replace = real
+        assert out.startswith("FAIL\tinstall\t") and str(dest) in out and ".old-" in out, out
+
+
+def test_engine_native_without_version():
+    with env() as d:
+        v = pdf_fix.fake_venv(d / "v")
+        ready = json.loads((v / "ready.json").read_text(encoding="utf-8"))
+        del ready["pdfium"]
+        (v / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
+        assert pdfenv.engine(v) == "native"
+
+
+def test_read_py_does_not_shadow_stdlib():
+    code = ("import sys; sys.path.insert(0, %r); import read; import queue; "
+            "assert hasattr(queue, 'Queue'), queue.__file__; print('ok')" % str(HERE / "scripts"))
+    r = subprocess.run([sys.executable, "-X", "utf8", "-c", code], capture_output=True, text=True,
+                       cwd=tempfile.gettempdir())
     assert r.returncode == 0 and "ok" in r.stdout, r.stderr
 
 
