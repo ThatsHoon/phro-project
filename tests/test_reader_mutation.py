@@ -1,10 +1,10 @@
-"""Fixed-seed mutation tests: synthetic fixtures of xls (clear, RC4, XOR), xlsb, ppt (clear, encrypted), rtf, and the
-OOXML docx, pptx and xlsx packages are damaged at random and read; every outcome must be a Doc or a ReadError (no
+"""Fixed-seed mutation tests: synthetic fixtures of xls (clear, RC4, XOR), xlsb, ppt (clear, encrypted), rtf, pdf (plain,
+xref and object streams, R4 AES), and the OOXML docx, pptx and xlsx packages are damaged at random and read; every outcome must be a Doc or a ReadError (no
 other exception, no hang).
 
 About 100 cases a format, each from `random.Random(SEED + k)`, so a failure names the case and repeats. No damaged
 case is ever written to disk: compound files and zips are built in memory and read through the formats' in-memory
-entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `ooxml.parse_package`, `rtf.parse_bytes`),
+entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `ooxml.parse_package`, `rtf.parse_bytes`, `pdf.parse_bytes`),
 and rendering never writes an image. Only the clean xlsb, ppt, docx and pptx seeds touch a temporary directory, once
 each (the xlsx seed is built in memory). An OOXML case damages one or two of its seed's XML members. The RTF seed
 holds none of the control words of a shape's property groups, and the test builds them with `cat` so no .pyc holds
@@ -28,9 +28,11 @@ import reader  # noqa: E402
 from reader import markdown  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
-from reader.formats import ooxml, ppt, rtf, xls, xlsb  # noqa: E402
+from reader.formats import ooxml, pdf, ppt, rtf, xls, xlsb  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc  # noqa: E402
+from pdf_fix import (EncryptSpec, Name, Ref, acroform, font_type0, image_xobject, link_annot,  # noqa: E402
+                     outline_items, rule_ops, simple_pdf, text_annot, text_ops, widget)
 from reader_fix import (XLSX_SML, blip_png, cfb_bytes, encrypt_xls, make_ppt, make_xlsb, make_xlsx,  # noqa: E402
                         make_zip, xlsx_cell, xlsx_row)
 import test_reader_docm as dm  # noqa: E402  (the seed builders and fixtures of the owning test files)
@@ -132,7 +134,7 @@ def outcome(read, label):
         assert kind, f"{label}: returned {type(got).__name__}, not a Doc"
     except ReadError as e:
         kind = e.kind
-        assert kind in ("damaged", "encrypted", "unsupported", "too_large"), f"{label}: ReadError kind {kind!r}"
+        assert kind in ("damaged", "encrypted", "unsupported", "too_large", "drm"), f"{label}: ReadError kind {kind!r}"
     except AssertionError:
         raise
     except BaseException as e:
@@ -382,6 +384,58 @@ def test_rtf_mutations():
 
     counts = run_cases("rtf", make)
     assert sum(counts.values()) == CASES, counts
+
+
+# ---- pdf: built and damaged in memory, read with the native engine
+def pdf_page1():
+    grid = b" ".join([rule_ops(72, 500, 272, 500), rule_ops(72, 480, 272, 480), rule_ops(72, 460, 272, 460),
+                      rule_ops(72, 500, 72, 460), rule_ops(172, 500, 172, 460), rule_ops(272, 500, 272, 460)])
+    cells = text_ops("cell a", 76, 485, 10) + b" " + text_ops("cell b", 176, 485, 10)
+    cid = b"BT /F2 12 Tf 72 600 Td <00010002> Tj ET"
+    return (text_ops("Seed heading text", 72, 720) + b" " + text_ops("Second line of body", 72, 700) + b" " + cid + b" "
+            + grid + b" " + cells + b" q 100 0 0 50 72 380 cm /Im1 Do Q")
+
+
+def pdf_seed(**kw):
+    """Two pages: Helvetica and CID text (ToUnicode), a ruled table, a gray Flate image, a link, a comment, a filled
+    field (object 201, a widget on page 1) and an outline."""
+    objects = {30: image_xobject(8, 8), 40: link_annot([72, 715, 172, 735], "https://example.test/a"),
+               41: text_annot([300, 700, 320, 720], "a comment", author="Ann")}
+    objects.update(font_type0(tounicode={1: "한", 2: "글"}))
+    objects.update(acroform([widget([72, 300, 172, 320], Ref(4), T="name", FT=Name("Tx"), V="filled value")]))
+    objects.update(outline_items([(1, "Part one", 0), (2, "Detail", 0), (1, "Part two", 1)]))
+    return simple_pdf([pdf_page1(), text_ops("Page two text", 72, 700)],
+                      resources={"Font": {"F1": Ref(3), "F2": Ref(100)}, "XObject": {"Im1": Ref(30)}},
+                      page_extra=[{"Annots": [Ref(40), Ref(41), Ref(201)]}, {}],
+                      catalog={"AcroForm": Ref(200), "Outlines": Ref(300)}, extra_objects=objects, **kw)
+
+
+def pdf_seeds():
+    """Three seeds, each built in memory: plain (xref table), an xref stream with object streams, and R4 AES."""
+    return [pdf_seed(), pdf_seed(xref="stream", objstm=True), pdf_seed(encrypt=EncryptSpec(4))]
+
+
+def read_pdf(data):
+    return read_doc(lambda b, ctx: pdf.parse_bytes(b, ctx, engine="native"), data)
+
+
+def test_pdf_mutations():
+    seeds = pdf_seeds()
+    for n, seed in enumerate(seeds):
+        ctx = Context()
+        out = render(pdf.parse_bytes(seed, ctx, engine="native"), ctx.skipped)
+        assert "Seed heading text" in out and "Page two text" in out, (n, out)  # the clean seed reads
+
+        def make(rng, k, seed=seed):
+            data = apply(plan(rng, len(seed)), seed)
+            return lambda: read_pdf(data)
+
+        counts = run_cases(f"pdf seed {n}", make)
+        assert sum(counts.values()) == CASES, counts
+    # a non-Standard handler is "drm": the R4 seed with /Standard damaged to /Stbndard
+    assert seeds[2].count(b"/Standard") == 1, seeds[2].count(b"/Standard")
+    data = seeds[2].replace(b"/Standard", b"/Stbndard")
+    assert outcome(lambda: read_pdf(data), "pdf non-standard handler") == "drm"
 
 
 def main():
