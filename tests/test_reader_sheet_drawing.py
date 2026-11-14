@@ -3,18 +3,20 @@
 Run: python -I -X utf8 tests/test_reader_sheet_drawing.py
 """
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import limits  # noqa: E402
+from reader import limits, markdown  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
+from reader.formats import ooxml, sheet_drawing  # noqa: E402
 from reader.formats.sheet_drawing import Drawings  # noqa: E402
 from reader.model import Context, Image, ListItem, Table  # noqa: E402
-from reader_fix import make_zip  # noqa: E402
-from test_reader_xlsb import BAR, PNG, anchor, chart_frame, drawing_xml, pic, rels_xml  # noqa: E402
+from reader_fix import make_xlsx, make_zip, xlsx_cell, xlsx_row  # noqa: E402
+from test_reader_xlsb import BAR, PNG, anchor, chart_frame, drawing_xml, md, pic, rels_xml, with_drawing  # noqa: E402
 
 SHEET = "xl/worksheets/sheet1.xml"
 
@@ -97,6 +99,64 @@ def test_smartart_cap_counted():
         limits.SMARTART_NODES = old
     assert sum(isinstance(b, ListItem) for b in blocks) == 1, blocks
     assert ctx.skipped["smartart_cut"] == 1, dict(ctx.skipped)
+
+
+def shape(text, hidden=False, n=2):
+    """A text box: one paragraph per `|`-separated piece of `text`; `a~b` is a run `a` then a field `b`."""
+    hid = ' hidden="1"' if hidden else ""
+    paras = ""
+    for t in text.split("|"):
+        run, _, fld = t.partition("~")
+        paras += f'<a:p><a:r><a:t>{run}</a:t></a:r>' + (f'<a:fld id="x"><a:t>{fld}</a:t></a:fld>' if fld else "") + "</a:p>"
+    return (f'<xdr:sp><xdr:nvSpPr><xdr:cNvPr id="{n}" name="TextBox {n}"{hid}/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr>'
+            f'<xdr:spPr/><xdr:txBody><a:bodyPr/>{paras}<a:p/></xdr:txBody></xdr:sp>')
+
+
+SHAPES = (anchor(5, shape("LATER-BOX")), anchor(0, shape("HOW TO FILL|step one ~and two")),
+          anchor(3, f'<xdr:grpSp><xdr:nvGrpSpPr/>{shape("SECRET-BOX", hidden=True, n=4)}</xdr:grpSp>'))
+
+
+def check_shapes(out, shown, ctx):
+    assert "HOW TO FILL" in out and "step one and two" in out and "LATER-BOX" in out, out
+    assert out.index("cell") < out.index("HOW TO FILL") < out.index("step one") < out.index("LATER-BOX"), out
+    assert ("SECRET-BOX" in out) == shown, out
+    if shown:
+        assert "(hidden) SECRET-BOX" in out, out
+        assert out.index("step one") < out.index("SECRET-BOX") < out.index("LATER-BOX"), out  # anchor order
+    else:
+        assert "(1 hidden places left out)" in out, out
+    assert not ctx.skipped, dict(ctx.skipped)
+
+
+def test_shape_text_xlsx():
+    parts = {"xl/drawings/drawing1.xml": drawing_xml(*SHAPES), "xl/drawings/_rels/drawing1.xml.rels": rels_xml()}
+    data = make_xlsx(None, [{"name": "S", "rows": xlsx_row(1, xlsx_cell("A1", "cell", t="str")),
+                             "rels": [("rD", "drawing", "../drawings/drawing1.xml", False)]}], extra_parts=parts)
+    for shown in (False, True):
+        ctx = Context()
+        doc = ooxml.parse_package(data, ctx)
+        with tempfile.TemporaryDirectory() as d:
+            out = markdown.render(doc, Path(d) / "assets", shown, ctx.skipped)
+        check_shapes(out, shown, ctx)
+
+
+def test_shape_text_xlsb():
+    for shown in (False, True):
+        out, ctx = md([{"name": "S", "cells": {(0, 0): "cell"}}], hidden=shown, extra_parts=with_drawing(*SHAPES))
+        check_shapes(out, shown, ctx)
+
+
+def test_shape_text_cap_counted_once():
+    members = {"xl/worksheets/_rels/sheet1.xml.rels": rels_xml(("rId1", "drawing", "../drawings/drawing1.xml")),
+               "xl/drawings/drawing1.xml": drawing_xml(*SHAPES), "xl/drawings/_rels/drawing1.xml.rels": rels_xml()}
+    old, sheet_drawing.SHAPE_CHARS = getattr(sheet_drawing, "SHAPE_CHARS", None), 12
+    try:
+        ctx = Context()
+        blocks = Drawings(Package(make_zip(None, members)), ctx).blocks(SHEET)
+    finally:
+        sheet_drawing.SHAPE_CHARS = old
+    assert [b.inlines[0].text for b in blocks] == ["HOW TO FILL"], blocks  # 11 chars fit, the rest does not
+    assert ctx.skipped["shape"] == 1, dict(ctx.skipped)  # past the cap, counted once
 
 
 def main():
