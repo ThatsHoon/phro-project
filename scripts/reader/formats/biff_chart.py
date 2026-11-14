@@ -91,7 +91,7 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
     out, cats = [], {}
     for k, s in enumerate(series):
         got = {r: _values(s, r, (k, r) in cache and cache[k, r], g, cells, left, cuts) for r in (0, 1, 2)}
-        if not cats and got[2]:
+        if not cats and got[2] and not s.aux:  # a trendline's categories are not the chart's
             cats = got[2]
         name = s.name or (got[0][min(got[0])] if got[0] else "") or f"Series {k + 1}"
         if not s.aux:  # k stays the cache column of the series after it
@@ -148,7 +148,7 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
                 stack.pop()
             pending = None
             continue
-        here, pending = stack[-1], None
+        here, follows, pending = stack[-1], pending, None
         try:
             if rid == _SERIES:
                 item = _Series()
@@ -211,8 +211,10 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
             elif ds is not None and rid in (_DS_ROWS, _DS_COLS) and size == 4:
                 ds.stop[rid] = struct.unpack_from("<HH", data, off)[1]
             elif rid == _SER_PARENT:
-                if isinstance(here, _Series):
-                    here.aux = True
+                # it marks the Series it follows, one written without a Begin included, else the enclosing one
+                owner = follows if isinstance(follows, _Series) else here
+                if isinstance(owner, _Series):
+                    owner.aux = True
             elif rid == _CHART3D:
                 three_d = True
             else:

@@ -129,6 +129,21 @@ def test_auxiliary_series_skipped():
     assert "Chart: bar\n||A|B|\n|---|---|---|\n|x|1|3|\n|y|2|4|\n" in md, md
 
 
+def test_auxiliary_series_gives_no_categories():
+    # a trendline listed before the real series carries categories of its own: they are not the chart's
+    real = [{"name": "T", "aux": True, "vals": [9, 9], "cats": ["z1", "z2", "z3"]},
+            {"name": "A", "vals": [1, 2], "cats": ["x", "y"]}]
+    md = run([DATA, chart_sheet(biff_chart(real))])
+    assert "Chart: bar\n||A|\n|---|---|\n|x|1|\n|y|2|\n" in md, md
+
+
+def test_ser_parent_binds_to_the_series_it_follows():
+    # a Series written without Begin, its SerParent right after: that Series is the auxiliary one
+    bare = [(0x1003, struct.pack("<6H", 1, 1, 0, 0, 0, 0)), (0x104A, bytes(2))]
+    md = run([DATA, chart_sheet(biff_chart(AB[:1], extra=bare))])
+    assert "Chart: bar\n||A|\n|---|---|\n|Q1|1|\n|Q2|2|\n|Q3|3|\n" in md, md
+
+
 def test_shared_record_budget():
     # worksheets and charts draw on one BIN_RECORDS: a later chart is cut off (counted under chart), not read afresh
     from reader.formats import sheet_grid, xls
