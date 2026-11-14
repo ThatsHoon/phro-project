@@ -4,8 +4,8 @@ extension it came with.
 A .doc, .rtf or .ppt file whose head is a zip is an OpenDocument package or an OOXML one. It is OpenDocument when
 its `mimetype` member is `application/vnd.oasis.opendocument.*`, or when it has a `content.xml` and no
 `[Content_Types].xml`; anything else goes to `ooxml`, which refuses what is no Word or PowerPoint package. A .xls
-file asks `route` only: an OpenDocument package goes to `odf`, any other zip is refused as the xlsx it most likely
-is. Neither parser comes back to the caller, so the routing cannot loop. Parsers are imported late.
+zip holding `xl/workbook.bin` goes to `xlsb`; any other goes through `parse` here, so an OpenDocument sheet is read by
+`odf` and the rest by `ooxml`. Neither parser comes back to the caller, so the routing cannot loop. Parsers are imported late.
 """
 from ..containers.zipx import Package
 from ..limits import ReadError

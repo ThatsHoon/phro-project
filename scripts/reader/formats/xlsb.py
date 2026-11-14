@@ -180,8 +180,8 @@ def _strings(pkg, part, wb, ctx):
             wb.sst.append("")  # keep every later index pointing at its own string
 
 
-def read_workbook(pkg, ctx) -> _Wb:
-    """Find the workbook part and read its sheet list, styles and shared strings."""
+def _workbook_part(pkg) -> str:
+    """The workbook part: the officeDocument relationship's target, else xl/workbook.bin."""
     root = pkg.rels("")
     named = [r for r in root.values() if r.type.endswith("/officeDocument") and not r.external]
     part = None
@@ -191,8 +191,12 @@ def read_workbook(pkg, ctx) -> _Wb:
         part = _PARTS["workbook"]
     if part is None:
         raise ReadError("damaged", "not an xlsb package")
-    if part.lower().endswith(".xml"):
-        raise ReadError("unsupported", "xlsx workbook saved as .xlsb")
+    return part
+
+
+def read_workbook(pkg, ctx) -> _Wb:
+    """Find the workbook part and read its sheet list, styles and shared strings."""
+    part = _workbook_part(pkg)
     rels = pkg.rels(part)
     wb = _Wb()
     _workbook(pkg, part, rels, wb, ctx)
@@ -324,6 +328,9 @@ def parse(path, ctx) -> Doc:
 def parse_package(src, ctx) -> Doc:
     """Read the xlsb package `src` (a path or its bytes, nothing is written). `parse` ends in it."""
     with Package(src) as pkg:
+        if _workbook_part(pkg).lower().endswith(".xml"):  # an xlsx saved as .xlsb; read_package never calls back here
+            from . import ooxml
+            return ooxml.read_package(pkg, ctx)
         wb = read_workbook(pkg, ctx)
         if not wb.sheets:
             raise ReadError("damaged", "no readable sheets")

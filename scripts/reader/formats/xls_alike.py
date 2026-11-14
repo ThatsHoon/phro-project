@@ -1,6 +1,6 @@
-"""Files named .xls that are not BIFF workbooks: HTML tables, delimited text and xlsx zips.
+"""Files named .xls that are not BIFF workbooks: HTML tables, delimited text and zips.
 
-`kind` sniffs the first 64 KiB. A UTF-16 head (a BOM, or every other byte NUL at its start) is decoded as UTF-16
+`kind` sniffs the first 64 KiB; a zip it names goes to the xlsx, xlsb or OpenDocument reader (`xls.parse`). A UTF-16 head (a BOM, or every other byte NUL at its start) is decoded as UTF-16
 before the tests, and the HTML and text readers decode the file with that same codec. HTML goes through `html.tree`
 and `html.blocks` into one sheet section; delimited text (tab before comma, by the first line) goes through `csv` and
 a `sheet_grid.Grid`, bounded by the document's `Budget` like any sheet. A head that decodes cleanly as text and holds a

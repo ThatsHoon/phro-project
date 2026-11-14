@@ -181,14 +181,15 @@ def test_xls_saved_as_xlsb():
 
 
 def test_xlsx_saved_as_xlsb():
-    rel = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" '
-           'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
-           'Target="xl/workbook.xml"/></Relationships>')
+    """A package whose workbook part is XML is read by ooxml, whatever the extension."""
+    from reader_fix import make_xlsx, xlsx_cell, xlsx_row
+    sheet = {"name": "S", "rows": xlsx_row(1, xlsx_cell("A1", inline="<t>a</t>"))}
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "a.xlsb"
-        make_zip(path, {"_rels/.rels": rel, "xl/workbook.xml": "<workbook/>"}, stored=())
-        got = denied(lambda: xlsb.parse(path, Context()))
-    assert got == ("unsupported", "xlsx workbook saved as .xlsb"), got
+        make_xlsx(path, [sheet])
+        ctx = Context()
+        out = markdown.render(xlsb.parse(path, ctx), Path(d) / "assets", False, ctx.skipped)
+    assert "## Sheet: S" in out and "a" in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def md(sheets, hidden=False, **kw):

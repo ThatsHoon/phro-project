@@ -273,18 +273,6 @@ def _hide(blocks: list) -> list:
     return out
 
 
-def _zip_detail(path) -> str:
-    """The format of a zip named .xls, by what it holds: an xlsb package has xl/workbook.bin; anything else (or a
-    zip that cannot be opened) is named as the xlsx it is most likely to be."""
-    try:
-        with Package(path) as pkg:
-            if pkg.has("xl/workbook.bin"):
-                return "xlsb workbook saved as .xls"
-    except Exception:  # it only picks a message, so nothing a zip does escapes it
-        pass
-    return "xlsx workbook saved as .xls"
-
-
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
         head = f.read(xls_alike.HEAD)
@@ -296,15 +284,13 @@ def parse(path, ctx) -> Doc:
         return xls_alike.parse_html(path, ctx)
     if what == "text":
         return xls_alike.parse_text(path, ctx)
-    if what == "zip":  # an OpenDocument package is read by odf, which never comes back here
-        try:
-            odf = zip_route.route(path) == "odf"
-        except ReadError:  # a zip that will not open is still named as the xlsx it most likely is
-            odf = False
-        if odf:
-            from . import odf as odf_parser
-            return odf_parser.parse(path, ctx)
-        raise ReadError("unsupported", _zip_detail(path))
+    if what == "zip":  # an xlsb package holds xl/workbook.bin; any other zip goes where its parts say
+        with Package(path) as pkg:  # a zip that cannot be opened is damaged
+            binary = pkg.has("xl/workbook.bin")
+        if binary:
+            from . import xlsb
+            return xlsb.parse_package(path, ctx)
+        return zip_route.parse(path, ctx)
     if what != "cfb":
         raise ReadError("damaged", "not an Excel workbook")
     got = parse_compound(path, ctx)
