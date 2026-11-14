@@ -14,6 +14,10 @@ Edges. A row's right edges are forced increasing (a non-increasing one becomes t
 every row's cells are collected into one set, sorted once, and clustered: an edge within 10 twips of the first of its
 cluster is that cluster's column. A cell spans the columns from the end of the one before it to its own edge's column,
 at least one, so two cells of one row never share a column. A cell past the row's defined edges is one column wide.
+A row's left edge (`\trleftN`; a row without one keeps the one before it, the first row has none) is in the same union.
+When it is right of the table's leftmost column the row starts with an empty cell over the gap, as `doc.py` does; the
+leftmost cluster, when a row's left edge is in it (Word's `\trleft-108`), is the table's edge and not a column. A left
+edge at or past the row's first edge is put just below it.
 
 Merges. `\\clmgf` opens a horizontal set that the `\\clmrg` cells right after it join; `\\clvmgf` starts a vertical set
 that the cell over the same columns (start and span) in each next row with `\\clvmrg` joins. A joined cell is left out
@@ -37,7 +41,7 @@ _FLAGS = {"first": FIRST, "cont": CONT, "vfirst": VFIRST, "vcont": VCONT}
 
 class _Level:
     """The row and cell state of one nesting level."""
-    __slots__ = ("rows", "edges", "eflags", "pend", "hdr", "cells", "blocks", "cut", "edgeset")
+    __slots__ = ("rows", "edges", "eflags", "pend", "hdr", "cells", "blocks", "cut", "edgeset", "left", "lefts")
 
     def __init__(self):
         self.rows = []        # finished rows: (cells, header) with cells a list of (blocks, right edge or None, flags)
@@ -48,7 +52,9 @@ class _Level:
         self.cells = []       # the blocks of each finished cell of the open row
         self.blocks = []      # the blocks of the cell under way
         self.cut = False      # this row was already counted as cut
-        self.edgeset = set()  # every right edge a stored cell uses
+        self.edgeset = set()  # every right edge a stored cell uses, and every row's left edge
+        self.left = None      # the left edge the open row has (kept by the rows after it until another is read)
+        self.lefts = set()    # the left edges of the stored rows
 
 
 class Tables:
@@ -102,6 +108,9 @@ class Tables:
         """`first` (\\clmgf), `cont` (\\clmrg), `vfirst` (\\clvmgf) or `vcont` (\\clvmrg): flags for the next \\cellx."""
         self.lv.pend |= _FLAGS.get(kind, 0)
 
+    def trleft(self, edge: int) -> None:
+        self.lv.left = edge
+
     def header_row(self) -> None:
         self.lv.hdr = True
 
@@ -148,7 +157,12 @@ class Tables:
                 if e is not None:
                     used.add(e)
                 row.append((blocks, e, eflags[k] if k < n_edges else 0))
-            lv.rows.append((row, lv.hdr))
+            left = lv.left
+            if left is not None:
+                if n_edges and left >= edges[0]:
+                    left = edges[0] - 1  # a left edge at or past the first edge is put just below it
+                lv.lefts.add(left)
+            lv.rows.append((row, lv.hdr, left))
         lv.cells = []
         lv.cut = False
 
@@ -175,13 +189,24 @@ class Tables:
         if not lv.rows:
             return None
         col_of, idx, base = {}, -1, None
-        for e in sorted(lv.edgeset):
+        for e in sorted(lv.edgeset | lv.lefts):
             if base is None or e - base > CLUSTER:
                 idx, base = idx + 1, e
             col_of[e] = idx
+        # the leftmost cluster is the table's left edge, not a column, when only left edges are in it: the columns
+        # then count from the next one, so rows at \trleft-108 add no column. Else column 0 ends at that cluster.
+        origin = 0
+        if lv.lefts and min(col_of[e] for e in lv.lefts) == 0 and min(col_of[e] for e in lv.edgeset) > 0:
+            origin = 1
+        if origin:
+            for e in col_of:
+                col_of[e] -= 1
         out, above = [], {}
-        for cells, hdr in lv.rows:
-            pos = 0
+        for cells, hdr, left in lv.rows:
+            pos = 0 if left is None else col_of[left] + 1
+            if cells[0][1] is not None:
+                pos = min(pos, col_of[cells[0][1]])  # a left edge clustered with the first edge leaves no gap
+            lead = [Cell([], colspan=pos)] if pos > 0 else []  # an empty cell over the gap before a row's left edge
             sets = []  # [column, span, flags, blocks, open to \clmrg]
             for blocks, e, f in cells:
                 span = 1 if e is None else max(col_of[e] + 1 - pos, 1)
@@ -192,7 +217,7 @@ class Tables:
                 else:
                     sets.append([pos, span, f, blocks, bool(f & FIRST)])
                 pos += span
-            below, row = {}, []
+            below, row = {}, lead
             for col, span, f, blocks, _ in sets:
                 key = (col, span)
                 if (f & (VFIRST | VCONT)) == VCONT and key in above:

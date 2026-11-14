@@ -534,7 +534,8 @@ class _Reader:
             "trowd": self.w_trowd, "cellx": self.w_cellx, "trhdr": self.w_trhdr,
             "clmgf": self.w_merge("first"), "clmrg": self.w_merge("cont"),
             "clvmgf": self.w_merge("vfirst"), "clvmrg": self.w_merge("vcont"),
-            "cell": self.w_cell, "row": self.w_row, "nestcell": self.w_nestcell, "nestrow": self.w_nestrow,
+            "cell": self.w_end(False, "cell"), "row": self.w_end(False, "row"),
+            "nestcell": self.w_end(True, "cell"), "nestrow": self.w_end(True, "row"), "trleft": self.w_trleft,
             **{name: self.w_blip(kind) for name, kind in _BLIPS.items()},
             **{name: self.w_blip(None) for name in _UNREAD},
         }
@@ -693,33 +694,23 @@ class _Reader:
                 self.tbl_at(max(self.g.itap, 1)).merge(kind)
         return merge
 
-    def w_cell(self, p, fresh):
-        if self.live():
-            self.g.in_table = True
-            self.end_paragraph(self.story)
-            self.tbl_at(1).cell()
-
-    def w_nestcell(self, p, fresh):
-        if self.live():
+    def w_end(self, nested, op):
+        """The handler of a cell or row end: the paragraph under way ends in the table, then `op` ("cell" or "row")
+        runs at level 1, or at the paragraph's level (2 at least) for \nestcell and \nestrow."""
+        def end(p, fresh):
+            if not self.live():
+                return
             g = self.g
             g.in_table = True
             self.end_paragraph(self.story)
-            self.tbl_at(max(g.itap, 2)).cell()
+            getattr(self.tbl_at(max(g.itap, 2) if nested else 1), op)()
+            if op == "row" and not nested:
+                g.in_table, g.itap = False, 0  # what follows is a table paragraph only if it says so
+        return end
 
-    def w_row(self, p, fresh):
+    def w_trleft(self, p, fresh):
         if self.live():
-            g = self.g
-            g.in_table = True
-            self.end_paragraph(self.story)
-            self.tbl_at(1).row()
-            g.in_table, g.itap = False, 0  # what follows is a table paragraph only if it says so
-
-    def w_nestrow(self, p, fresh):
-        if self.live():
-            g = self.g
-            g.in_table = True
-            self.end_paragraph(self.story)
-            self.tbl_at(max(g.itap, 2)).row()
+            self.tbl_at(max(self.g.itap, 1)).trleft(p or 0)
 
     # ---- pictures
     def w_pict(self, p, fresh):

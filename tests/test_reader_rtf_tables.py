@@ -324,6 +324,61 @@ def test_table_header_footer_text():
     d, ctx = parse(rtf_file(data))
     assert d.headers == ["h1 h2"], d.headers
 
+def lrow(left, cells, extra=b""):
+    """A row with an optional trleft (None for none): cells are (text, edge) pairs."""
+    head = b"\\trowd" + (b"\\trleft%d" % left if left is not None else b"") + extra
+    head += b"".join(b"\\cellx%d" % e for _, e in cells)
+    return head + b"\\pard\\intbl " + b"".join(t + b"\\cell " for t, _ in cells) + b"\\row\n"
+
+
+def spans(t):
+    return [[(c.blocks[0].inlines[0].text if c.blocks else "", c.colspan) for c in r] for r in t.rows]
+
+
+def test_trleft_gap_cell():
+    data = b"{\\rtf1 " + lrow(None, [(b"a", 1000), (b"b", 2000)]) + lrow(1000, [(b"c", 2000)]) + b"}"
+    d, ctx = parse(rtf_file(data))
+    assert spans(only_table(d)) == [[("a", 1), ("b", 1)], [("", 1), ("c", 1)]], spans(only_table(d))
+    assert md(data) == "|a|b|\n|---|---|\n||c|\n"
+
+
+def test_trleft_minus_108_adds_no_column():
+    data = (b"{\\rtf1 " + lrow(-108, [(b"a", 1000), (b"b", 2000)]) + lrow(-108, [(b"c", 1000), (b"d", 2000)])
+            + b"}")
+    d, ctx = parse(rtf_file(data))
+    assert spans(only_table(d)) == [[("a", 1), ("b", 1)], [("c", 1), ("d", 1)]]
+    # rows with and without it in one table: no gap either
+    data = b"{\\rtf1 " + lrow(None, [(b"a", 1000), (b"b", 2000)]) + lrow(-108, [(b"c", 1000), (b"d", 2000)]) + b"}"
+    d, ctx = parse(rtf_file(data))
+    assert spans(only_table(d)) == [[("a", 1), ("b", 1)], [("c", 1), ("d", 1)]]
+
+
+def test_trleft_kept_by_rows_without_it():
+    data = (b"{\\rtf1 " + lrow(None, [(b"a", 1000), (b"b", 2000)]) + lrow(1000, [(b"c", 2000)])
+            + lrow(None, [(b"d", 2000)]) + b"}")
+    d, ctx = parse(rtf_file(data))
+    assert spans(only_table(d))[2] == [("", 1), ("d", 1)], spans(only_table(d))
+
+
+def test_trleft_past_first_edge_is_clamped():
+    data = b"{\\rtf1 " + lrow(None, [(b"a", 1000), (b"b", 2000)]) + lrow(5000, [(b"c", 1500), (b"d", 2000)]) + b"}"
+    d, ctx = parse(rtf_file(data))
+    t = only_table(d)
+    # the left edge lands just below the first edge: the row keeps its cells and the grid's width
+    assert [sum(c.colspan for c in r) for r in t.rows] == [3, 3], spans(t)
+    assert [c.blocks[0].inlines[0].text for c in t.rows[1] if c.blocks] == ["c", "d"], spans(t)
+
+
+def test_nested_row_with_its_own_trleft():
+    inner = (b"\\pard\\intbl\\itap2 i1\\nestcell"
+             b"{\\*\\nesttableprops\\trowd\\trleft500\\cellx1000\\nestrow}")
+    inner2 = (b"\\pard\\intbl\\itap2 i2\\nestcell\\pard\\intbl\\itap2 i3\\nestcell"
+              b"{\\*\\nesttableprops\\trowd\\trleft0\\cellx500\\cellx1000\\nestrow}")
+    data = (b"{\\rtf1 \\trowd\\cellx2000\\pard\\intbl\\itap1 " + inner + inner2
+            + b"\\pard\\intbl\\itap1 \\cell\\row}")
+    d, ctx = parse(rtf_file(data))
+    inner_t = only_table(d).rows[0][0].blocks[0]
+    assert spans(inner_t) == [[("", 1), ("i1", 1)], [("i2", 1), ("i3", 1)]], spans(inner_t)
 
 def main():
     for name, fn in sorted(globals().items()):
