@@ -55,8 +55,7 @@ def _engine_id(wanted) -> str:
     if wanted != "pdfium":
         return "native"
     try:
-        import pypdfium2  # noqa: F401
-        from reader import pdfenv
+        from reader import pdfenv  # engine_id_from_module imports pypdfium2 itself
         return pdfenv.engine_id_from_module()
     except Exception:  # noqa: BLE001 - not importable, or a broken install: read natively
         return "native"

@@ -9,16 +9,17 @@ import os
 import subprocess
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pdf_fix import (JPEG, EncryptSpec, Name, Ref, Stream, acroform, image_xobject, link_annot,  # noqa: E402
-                     ocg_catalog, outline_items, rule_ops, simple_pdf, text_annot, text_ops, widget)
+from pdf_fix import (JPEG, EncryptSpec, Name, Ref, Stream, acroform, font_type0, image_xobject,  # noqa: E402
+                     link_annot, ocg_catalog, outline_items, rule_ops, simple_pdf, text_annot, text_ops, widget)
 
-from reader import cache, pdfenv  # noqa: E402
+from reader import cache, images, pdfenv  # noqa: E402
 
 RUN = HERE / "tests" / "pdfium_run.py"
 F1 = {"Font": {"F1": Ref(3)}}
@@ -36,16 +37,20 @@ PY = _interpreter()
 
 
 def run(data, **opts):
-    """The child's JSON line for the pdf `data`; opts are patch, pages, hidden and engine (pdfium)."""
+    """The child's JSON line for the pdf `data`, with its stderr as "_stderr"; opts are patch, pages,
+    hidden, engine (pdfium) and native_fails."""
     arg = json.dumps({"patch": opts.get("patch", {}), "pages": opts.get("pages"),
-                      "hidden": bool(opts.get("hidden")), "engine": opts.get("engine")})
+                      "hidden": bool(opts.get("hidden")), "engine": opts.get("engine"),
+                      "native_fails": bool(opts.get("native_fails"))})
     r = subprocess.run([str(PY), "-I", "-X", "utf8", str(RUN), arg], input=data,
                        capture_output=True, timeout=300)
     err = r.stderr.decode("utf-8", "replace")
     assert r.returncode == 0, err
     lines = r.stdout.decode("utf-8").strip().splitlines()
     assert lines, err
-    return json.loads(lines[-1])
+    got = json.loads(lines[-1])
+    got["_stderr"] = err
+    return got
 
 
 def with_image(content, image, **kw):
@@ -361,10 +366,119 @@ def test_pdfium_cli_engine():
         out = r.stdout.decode("utf-8").strip()
         assert r.returncode == 0, (out, r.stderr.decode("utf-8", "replace"))
         d = Path(out).parent
+        assert d.name == cache.key(src, run(simple_pdf([text_ops("id")]))["engine_id"]), d.name
         assert d.name != cache.key(src, "native"), d.name
         meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
         assert meta["engine"] == "pdfium", meta
         assert "From the CLI" in (d / "out.md").read_text(encoding="utf-8")
+
+
+def _vertical_pdf():
+    chars = sorted(set(RIGHT_COLUMN + LEFT_COLUMN))
+    codes = {ch: 0x100 + i for i, ch in enumerate(chars)}
+    objs = font_type0(tounicode={codes[c]: c for c in chars}, vertical=True)
+
+    def column(text, x):
+        hexs = "".join("%04X" % codes[c] for c in text)
+        return b"BT /F2 12 Tf %d 700 Td <%s> Tj ET" % (x, hexs.encode())
+
+    return simple_pdf([column(RIGHT_COLUMN, 500) + b" " + column(LEFT_COLUMN, 480)],
+                      resources=dict(F1, Font={"F1": Ref(3), "F2": Ref(100)}), extra_objects=objs)
+
+
+RIGHT_COLUMN = "\ubcf4\uace0\uc11c\ub294\uc138\uc9c0\uc5ed\uc744"
+LEFT_COLUMN = "\ub2e4\ub8e8\uc5c8\uace0\uac01\ud300\uc740"
+
+
+def test_pdfium_vertical():
+    # Identity-V columns: native's markdown, the right column first and no spaces, both with the native
+    # page as a backstop and from pdfium's own geometry (native failed)
+    data = _vertical_pdf()
+    native = run(data, engine="native")["md"]
+    assert RIGHT_COLUMN in native and native.index(RIGHT_COLUMN) < native.index(LEFT_COLUMN), native
+    got = run(data)
+    assert got["md"] == native, (got["md"], native)
+    alone = run(data, native_fails=True)
+    assert alone["md"] == native and alone["meta"]["engine"] == "pdfium", (alone["md"], native)
+
+
+def _bomb_pdf(n, side=5000):
+    objs, xo = {}, {}
+    for i in range(n):
+        packer = zlib.compressobj(9)
+        row = bytes([i * 3 % 256]) * side
+        body = b"".join(packer.compress(row) for _ in range(side)) + packer.flush()
+        objs[30 + i] = Stream({"Type": Name("XObject"), "Subtype": Name("Image"), "Width": side, "Height": side,
+                               "ColorSpace": Name("DeviceGray"), "BitsPerComponent": 8,
+                               "Filter": Name("FlateDecode")}, body)
+        xo[f"I{i}"] = Ref(30 + i)
+    page = text_ops("Words", y=780) + b"".join(
+        b" q 60 0 0 60 %d %d cm /I%d Do Q" % (10 + 70 * (i % 8), 10 + 70 * (i // 8), i) for i in range(n))
+    return simple_pdf([page], resources=dict(F1, XObject=xo), extra_objects=objs)
+
+
+def test_pdfium_decode_budget():
+    # 64 distinct 5000 x 5000 images on one page: past PDF_PAGE_DECODE_PIXELS nothing more is decoded or
+    # rendered, each such image counts `image`, and the page still reads
+    got = run(_bomb_pdf(64))
+    assert "Words" in got["md"] and not got["assets"], got
+    assert got["skipped"].get("image", 0) >= 1, got["skipped"]
+    assert got["decoded"] and got["decoded"][0] is not None, got["decoded"]
+    assert got["decoded"][0] <= 4 * images._MAX_PIXELS, got["decoded"]
+
+
+def test_pdfium_char_cap_once():
+    lines = b" ".join(text_ops("abcdefghij", y=700 - 14 * i) for i in range(10))
+    data = simple_pdf([lines])
+    got = run(data, patch={"PDF_PAGE_CHARS": 10})
+    native = run(data, patch={"PDF_PAGE_CHARS": 10}, engine="native")
+    assert got["skipped"] == native["skipped"] == {"text": 1}, (got["skipped"], native["skipped"])
+
+
+def test_pdfium_ocg_without_native():
+    # native failed: a text object in /OC marked content is hidden "ocg" from its own content mark
+    body = text_ops("Visible words", y=700) + b" /OC /L1 BDC " + text_ops("Secret", y=400) + b" EMC"
+    data = simple_pdf([body], resources=dict(F1, Properties={"L1": Ref(50)}),
+                      extra_objects={50: {"Type": Name("OCG"), "Name": "Layer"}}, catalog=ocg_catalog(off=[50]))
+    got = run(data, native_fails=True)
+    md = got["md"]
+    assert "Visible words" in md and "Secret" not in md and got["meta"]["engine"] == "pdfium", got
+    assert md.splitlines()[0] == "(1 hidden places left out)", md
+    assert "(hidden) Secret" in run(data, hidden=True, native_fails=True)["md"]
+
+
+def test_pdfium_xfa_quiet():
+    objs = dict(acroform([widget((72, 600, 200, 620), Ref(4), T="a", FT=Name("Tx"), V="v")]))
+    objs[200]["XFA"] = Ref(250)
+    objs[250] = Stream({}, b"<xdp:xdp xmlns:xdp='http://ns.adobe.com/xdp/'><template/></xdp:xdp>")
+    data = simple_pdf([text_ops("XFA host")], catalog={"AcroForm": Ref(200)}, extra_objects=objs,
+                      page_extra={"Annots": [Ref(201)]})
+    got = run(data)
+    assert "XFA host" in got["md"], got
+    assert "auto-v8" not in got["_stderr"] and "XFA support" not in got["_stderr"], got["_stderr"]
+
+
+def test_pdfium_closed():
+    assert run(simple_pdf([text_ops("Closed after")]))["closed"] == [True]
+
+
+def test_pdfium_own_password():
+    # native failed, so the user password is pdfium's own finding
+    got = run(simple_pdf([text_ops("Locked words")], encrypt=EncryptSpec(6, user=b"secret")), native_fails=True)
+    assert got.get("error") == ["encrypted", "user password"], got
+
+
+def test_pdfium_widget_walk():
+    # native failed: fields come from the page's widgets and match native's
+    data = _fields_pdf()
+    want = [ln for ln in run(data, engine="native")["md"].splitlines() if ln.startswith("> Field")]
+    got = run(data, native_fails=True)
+    assert want and [ln for ln in got["md"].splitlines() if ln.startswith("> Field")] == want, (got, want)
+
+
+def test_pdfium_native_damaged():
+    got = run(simple_pdf([text_ops("Only pdfium reads")]), native_fails=True)
+    assert "Only pdfium reads" in got["md"] and got["meta"]["engine"] == "pdfium", got
 
 
 def main():

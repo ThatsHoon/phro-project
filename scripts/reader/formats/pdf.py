@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
-from .. import limits
+from .. import images, limits
 from ..limits import ReadError
 from ..model import Doc, Heading, Image, Link, Para, Section, Text
 from . import pdf_layout, pdf_tables
@@ -37,6 +37,9 @@ PDF_PAGE_SECONDS = 4.0      # seconds for one page, checked between its steps
 PDF_PAGE_CHARS = 200_000    # chars on one page; past it the rest of its text counts `text`
 PDF_RENDERS = 100           # renders per conversion, scans and figures together
 RENDER_DPI, CROP_DPI, RENDER_LONG = 110, 150, 1_568
+# pdfium: image pixels decoded per page; a page whose images total more has no render, and its
+# images past the budget are not decoded (each counts `image`)
+PDF_PAGE_DECODE_PIXELS = 4 * images._MAX_PIXELS
 SCAN_COVER = 0.5            # no chars and one image covering this share of the page: a scan
 OCR_COVER = 0.8             # invisible text over an image this big is an OCR layer, read as text
 FIGURE_PATHS = 32           # non-rule paths that make a vector figure
@@ -505,7 +508,10 @@ def parse_bytes(data, ctx, *, engine="native", pages=None, clock=time.monotonic,
         if native is None:
             raise kept from None
         return _Reader(native, ctx, clock, started, "native").run(pages)
-    return _Reader(doc, ctx, clock, started, "pdfium").run(pages)
+    try:
+        return _Reader(doc, ctx, clock, started, "pdfium").run(pages)
+    finally:
+        doc.close()
 
 
 def parse(path, ctx, *, engine="native", pages=None, clock=time.monotonic, started=None) -> Doc:

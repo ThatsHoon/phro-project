@@ -1,9 +1,11 @@
 """Child of test_reader_pdfium.py, run under the pdf venv interpreter with -I.
 
 It reads pdf bytes on stdin and a JSON option object from argv[1]:
-{"patch": {name: value}, "pages": [a, b] | null, "hidden": bool}. It patches the caps of
-reader.formats.pdf, runs parse_bytes(engine="pdfium") and markdown.render into a temporary dir, and
-prints one JSON line: {"md", "skipped", "meta", "assets": [[name, size, width, height]], "modules"},
+{"patch": {name: value}, "pages": [a, b] | null, "hidden": bool, "engine": "pdfium" | "native",
+"native_fails": bool}. It patches the caps of reader.formats.pdf (native_fails makes NativeDoc raise a
+damaged ReadError, so PdfiumDoc opens with native None), runs parse_bytes and markdown.render into a
+temporary dir, and prints one JSON line: {"md", "skipped", "meta", "assets": [[name, size, width,
+height]], "modules", "engine_id", "decoded": [pixels decoded by each PdfiumDoc], "closed": [bool]},
 or {"error": [kind, detail]} on a ReadError.
 """
 import os
@@ -60,6 +62,21 @@ def main():
         if not name.isupper() or not hasattr(pdf, name):
             raise SystemExit(f"unknown cap {name}")
         setattr(pdf, name, value)
+    if opts.get("native_fails"):
+        def _fails(_data, *_a, **_k):
+            raise ReadError("damaged", "native made to fail by the test")
+        from reader.pdfnative import document
+        document.NativeDoc = _fails  # parse_bytes imports it from there at call time
+    from reader import pdfenv
+    from reader.formats import pdf_pdfium
+    made = []
+
+    class _Seen(pdf_pdfium.PdfiumDoc):
+        def __init__(self, *a, **k):
+            made.append(self)
+            super().__init__(*a, **k)
+
+    pdf_pdfium.PdfiumDoc = _Seen
     pages = opts.get("pages")
     ctx = Context()
     try:
@@ -77,7 +94,9 @@ def main():
                 body = p.read_bytes()
                 assets.append([p.name, len(body), *_dims(body)])
     print(json.dumps({"md": text, "skipped": dict(ctx.skipped), "meta": doc.meta, "assets": assets,
-                      "modules": sorted(sys.modules)}, ensure_ascii=False))
+                      "modules": sorted(sys.modules), "engine_id": pdfenv.engine_id_from_module(),
+                      "decoded": [getattr(d, "decoded", None) for d in made],
+                      "closed": [getattr(d, "_pdf", None) is None for d in made]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

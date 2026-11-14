@@ -5,7 +5,10 @@ This is the one module of the reader that imports a package outside the standard
 imported only in the pdf venv's interpreter, and `pdf.py` imports it inside a function.
 pypdfium2's pdfium has no V8 or XFA, so no JavaScript runs.
 
-What the spike learned is kept. `init_forms()` is called before any page is loaded.
+What the spike learned is kept. `init_forms()` is called before any page is loaded, with the
+"pypdfium2" logger raised to ERROR so its XFA install hint never reaches read.py's stderr. A page
+stays open until the next page() (pdf.py may still call its render) and `close()` closes the
+last page and the document; pdf.py calls it in a finally.
 - Chars come from the `PdfTextPage`. Surrogate pairs are joined; pdfium's line-end hyphen (0x02,
   0xFFFE) becomes `-` for the hyphen rule; generated chars are dropped (the spaces come from the
   char boxes, through `char_gaps`) and a generated line break ends the run. Consecutive chars of
@@ -13,7 +16,12 @@ What the spike learned is kept. `init_forms()` is called before any page is load
   (`FPDFText_GetFontSize`, the Tf operand) times the length of the char matrix's second row,
   which Tz leaves alone; the loose box height stands in only when there is no usable size. Its
   `char_offsets` and `char_gaps` come from the loose boxes along the text direction.
-  The text object's render mode (3 or 7) sets `invisible`.
+  The text object's render mode (3 or 7) sets `invisible`. A text object whose second char sits
+  below its first along the glyph's up is a vertical font's column: it takes native's vertical
+  axes (direction -up, up the char matrix's x axis). When native opened the file, such a page's
+  fragments are native's instead (below).
+  With native None, a text object with an /OC content mark is hidden "ocg" (the group's state is
+  native's to know; without native the marked text is taken as off).
 - Page objects are walked iteratively in content order, form XObjects included to FORM_DEPTH
   levels, each object's matrix composed with its forms' (pdfium gives a nested object's matrix
   in its form's space). Path points go through that matrix into `pdf_tables.PathCollector`, with
@@ -22,21 +30,30 @@ What the spike learned is kept. `init_forms()` is called before any page is load
   its box; anything else a PNG of `FPDFImageObj_GetBitmap` through `images._png`.
 - `render(box, dpi)` renders the page (box None) or a page-space box, long side capped at
   RENDER_LONG pixels.
+- Decode budget: every image object's pixel size is summed first (no decode). A render decodes
+  every image on the page, so a page whose images total more than `pdf.PDF_PAGE_DECODE_PIXELS`
+  (or whose walk was cut short) has no render: `render` raises and pdf.py puts its scan or figure
+  on `unrendered`. Images are decoded (a bitmap, or a render of an image's box) in order while
+  the running sum stays within the budget; the rest get no data, and pdf.py counts each `image`.
 - Links are `FPDFLink_*` URI actions of `annotations.SCHEMES`; comments come from the page's
   annotations, through `annotations.order_comments`. Fields are native's (`/AcroForm /Fields`, by
   page, a field with no widget on page 1); only when native could not open the file are they read
   from the page's widgets, through `annotations.field_entry`.
 - On a page whose resources name an off optional-content group (decision 3), pdfium cannot tell
   which marked text the group covers: that page's fragments come from the native interpreter.
+  So do they on a page with vertical text (a column pdfium saw, or a page font whose Encoding is a
+  vertical CMap): native's vertical fragments are the reference.
 
 Counts, as in `pdfnative.document`: `.cut` is the document total, each `PageData.cut` the part
 its page added (a page is added once). The object walk past `pdf.PDF_PAGE_OBJECTS`, a form past
-FORM_DEPTH and a char scan past CHAR_SCAN count `page_part`; images past `pdf.PDF_PAGE_IMAGES`
-count `image` once; annotations past `annotations.PDF_ANNOTS` and a comment cut at ANNOT_CHARS
-count `annotation`; native's field cuts, or a widget's value cut by `field_entry`, count `field`. Path points past
+FORM_DEPTH, and a char scan stopped at CHAR_SCAN before the char cap, count `page_part` (the
+char cap itself is pdf.py's `text`); images past `pdf.PDF_PAGE_IMAGES` count `image` once;
+annotations past `annotations.PDF_ANNOTS` and a comment cut at ANNOT_CHARS count `annotation`;
+native's field cuts, or a widget's value cut by `field_entry`, count `field`. Path points past
 PATH_POINTS are ignored and not counted, like rules past `pdf_tables.PDF_SEGMENTS`.
 """
 import ctypes
+import logging
 import math
 from collections import Counter
 
@@ -47,6 +64,8 @@ from .. import images as reader_images
 from .. import limits
 from ..limits import ReadError
 from ..pdfnative import annotations
+from ..pdfnative.cmap import encoding_wmode
+from ..pdfnative.objects import PDFStream
 from . import pdf as caps
 from .pdf_layout import LINE_TOLERANCE, Comment, Fragment, PageData, PageImage
 from .pdf_tables import PDF_SEGMENTS, PathCollector
@@ -57,6 +76,8 @@ CHAR_SCAN = 4                    # chars scanned per page: CHAR_SCAN x pdf.PDF_P
 IMAGE_FILTERS = 8                # filters read per image
 OPTION_LABELS = annotations.FIELD_KIDS  # list-box options read per field
 OUTLINE_SCAN = 4 * annotations.OUTLINE_ITEMS  # bookmarks visited for the outline
+PAGE_FONTS = 256                 # fonts of a page's /Resources looked at for a vertical CMap
+OBJECT_MARKS = 16                # content marks read per text object (for /OC, native None)
 
 _COORD = 1e9
 _LETTER = (0.0, 0.0, 612.0, 792.0)
@@ -78,7 +99,33 @@ class PdfiumOpenError(Exception):
     """pdfium could not open the file, for a reason other than a password."""
 
 
+class _Refused(Exception):
+    """An image the page's decode budget leaves undecoded."""
+
+
 # ---- small helpers
+
+def _vertical_fonts(native, resources) -> bool:
+    """Whether the page's own /Resources /Font names a Type0 font whose Encoding is a vertical
+    CMap, by name or by its stream's /WMode entry (an embedded CMap's body is not decoded here;
+    pdfium's geometry finds those columns). At most PAGE_FONTS fonts."""
+    pdf = native.pdf
+    fonts = pdf.resolve(resources.get("Font"))
+    if not isinstance(fonts, dict):
+        return False
+    for _name, ref in zip(range(PAGE_FONTS), fonts.values()):
+        font = pdf.resolve(ref)
+        if not isinstance(font, dict) or str(font.get("Subtype", "")) != "Type0":
+            continue
+        encoding = pdf.resolve(font.get("Encoding"))
+        if isinstance(encoding, PDFStream):
+            mode = pdf.resolve(encoding.dictionary.get("WMode"))
+            if mode == 1 and not isinstance(mode, bool):
+                return True
+        elif encoding is not None and encoding_wmode(str(encoding)) == 1:
+            return True
+    return False
+
 
 def _finite(*values) -> bool:
     return all(isinstance(v, (int, float)) and math.isfinite(v) and abs(v) <= _COORD for v in values)
@@ -115,6 +162,18 @@ def _matrix(obj):
 def _unit(x, y, default):
     n = math.hypot(x, y)
     return (x / n, y / n) if n > 0 and math.isfinite(n) else default
+
+
+def _oc_marked(handle) -> bool:
+    """Whether a page object carries an /OC content mark (at most OBJECT_MARKS marks read)."""
+    name = (raw.FPDF_WCHAR * 8)()
+    size = ctypes.c_ulong()
+    for i in range(min(max(raw.FPDFPageObj_CountMarks(handle), 0), OBJECT_MARKS)):
+        mark = raw.FPDFPageObj_GetMark(handle, i)
+        if (mark and raw.FPDFPageObjMark_GetName(mark, name, ctypes.sizeof(name), size)
+                and size.value == 6 and bytes(name)[:4] == b"O\x00C\x00"):
+            return True
+    return False
 
 
 def _address(handle) -> int:
@@ -174,12 +233,17 @@ class PdfiumDoc:
             raise PdfiumOpenError(str(e)) from None
         except Exception as e:  # noqa: BLE001 - any other open failure falls back to native
             raise PdfiumOpenError(type(e).__name__) from None
+        # init_forms logs a pip install hint on an XFA file, which read.py would relay: pypdfium2's
+        # warnings are not this reader's output (it reports XFA in its own words)
+        logging.getLogger("pypdfium2").setLevel(logging.ERROR)
         try:
             self._pdf.init_forms()  # before any page is loaded, so widgets have a form handle
         except Exception:  # noqa: BLE001 - no form environment: fields are not read
             pass
         self.native = native
         self.cut: Counter = Counter()
+        self._page = None   # the page last loaded: open while pdf.py may still call its render
+        self.decoded = 0    # pixels decoded or rendered from page images, all pages together
         self.page_count = len(self._pdf)
         if native is not None:
             self.xfa, self.attachments = native.xfa, native.attachments
@@ -193,6 +257,22 @@ class PdfiumDoc:
             self.attachments = raw.FPDFDoc_GetAttachmentCount(self._pdf.raw) > 0
         self._read: set = set()
         self._field_page: dict = {}  # full field name -> the page its entry goes on
+
+    def close(self):
+        """Close the open page, the form environment and the document (pdf.py calls it in a finally)."""
+        self._close_page()
+        if self._pdf is not None:
+            try:
+                self._pdf.close()  # closes the form environment and any page still tracked first
+            finally:
+                self._pdf = None
+
+    def _close_page(self):
+        if self._page is not None:
+            try:
+                self._page.close()
+            finally:
+                self._page = None
 
     def outline(self):
         """[(depth from 1, title, 0-based page)] from get_toc(): the depth is level + 1 and the page
@@ -221,7 +301,17 @@ class PdfiumDoc:
     # -- one page
 
     def page(self, index: int) -> PageData:
-        page = self._pdf[index]
+        # pdf.py is done with the page before (its renders included) when it asks for the next one:
+        # closing it frees the images pdfium cached for it
+        self._close_page()
+        page = self._page = self._pdf[index]
+        try:
+            return self._read_page(page, index)
+        except BaseException:
+            self._close_page()
+            raise
+
+    def _read_page(self, page, index):
         cut: Counter = Counter()
         try:
             box = _rect(*page.get_bbox()) or _LETTER
@@ -233,20 +323,32 @@ class PdfiumDoc:
             turn = 0
         textpage = page.get_textpage()
         try:
-            fragments = self._chars(textpage, cut)
+            fragments, vertical = self._chars(textpage, cut)
         finally:
             textpage.close()
-        native = self._native_fragments(index, cut)
+        native = self._native_fragments(index, cut, vertical)
         if native is not None:
             fragments = native
         chars = sum(1 for f in fragments for ch in f.text if not ch.isspace())
+        collector = PathCollector()
+        drawn, whole = self._walk(page, collector, cut)
+        # every image the page draws, by its pixel size (no decode): a render decodes all of them,
+        # so past PDF_PAGE_DECODE_PIXELS (or with the walk cut short, the total unknown) the page
+        # has no render at all, and its images are decoded one by one within the budget
+        budget = caps.PDF_PAGE_DECODE_PIXELS
+        total = sum(px[0] * px[1] for _obj, _m, px in drawn)
+        renders = whole and total <= budget
+        left = [budget]
 
         def render(target, dpi):
+            if not renders:
+                raise ReadError("too_large", "page images past the decode budget")
             return self._render(page, box, turn, target, dpi)
 
-        collector = PathCollector()
-        drawn = self._walk(page, collector, cut)
-        shown, capped = self._images(drawn, box, chars, render)
+        # an image the budget refused has no data, so pdf.py counts it `image` as it does any
+        # image it cannot take
+        shown, capped = self._images(drawn, box, chars, render, renders, left)
+        self.decoded += budget - left[0]
         if capped:
             cut["image"] += 1
         links, comments, fields = self._annots(page, index, cut)
@@ -258,28 +360,36 @@ class PdfiumDoc:
                         figure=collector.figure, links=links, fields=fields, comments=comments,
                         chars=chars, cut=cut, render=render)
 
-    def _native_fragments(self, index, cut):
-        """Decision 3: on a page whose resources name an off group, the fragments of the native
-        interpreter (their hidden="ocg" marks the off text); None elsewhere. Should the native
-        page fail, its text is left out (counted page_part) rather than shown with the off
-        layer's text in it."""
+    def _native_fragments(self, index, cut, vertical):
+        """The fragments of the native interpreter, on two kinds of page; None elsewhere.
+        - Decision 3: a page whose resources name an off group (their hidden="ocg" marks the off
+          text). Should the native page fail, its text is left out (counted page_part) rather
+          than shown with the off layer's text in it.
+        - A page with vertical text: pdfium saw a column (`vertical`), or the page's fonts name a
+          vertical CMap (`_vertical_fonts`, which also finds a one-glyph column). Native's
+          vertical fragments are the reference; should its page fail, pdfium's own stay."""
         native = self.native
         if native is None or index >= native.page_count:
             return None
         try:
-            off = native.oc.any_off(native.resources(index))
+            resources = native.resources(index)
+            off = native.oc.any_off(resources)
         except Exception:  # noqa: BLE001
             return None
-        if not off:
+        if not off and not vertical and not _vertical_fonts(native, resources):
             return None
         try:
             got = native.page(index)
         except ReadError as e:
             if e.kind == "timeout":
                 raise
+            if not off:
+                return None
             cut["page_part"] += 1
             return []
         except Exception:  # noqa: BLE001
+            if not off:
+                return None
             cut["page_part"] += 1
             return []
         for kind, value in got.cut.items():
@@ -290,20 +400,33 @@ class PdfiumDoc:
     # -- chars
 
     def _chars(self, textpage, cut):
+        """(fragments, whether a vertical column was seen). A text object's direction is its char
+        matrix's x axis, unless its second char sits below its first along the glyph's up: a
+        vertical font, whose glyphs advance down the up axis; the object then reads with native's
+        vertical axes (direction -up, up the x axis), which pdf_layout.vertical_lines takes."""
         tp = textpage.raw
         count = raw.FPDFText_CountChars(tp)
         if count <= 0:
-            return []
+            return [], False
         limit = CHAR_SCAN * caps.PDF_PAGE_CHARS
-        if count > limit:
-            cut["page_part"] += 1
+        scan_cut = count > limit  # counted page_part only when the scan, not the char cap, stops
+        if scan_cut:
             count = limit
         rect, fsm = raw.FS_RECTF(), raw.FS_MATRIX()
         ox, oy = ctypes.c_double(), ctypes.c_double()
-        frags, objects, modes, fonts, axes, sizes = [], {}, {}, {}, {}, {}
+        frags, objects, modes, fonts, axes, sizes, hidden = [], {}, {}, {}, {}, {}, {}
+        checked = set()  # text objects whose second char was looked at for a vertical advance
+        marks = self.native is None  # with native, an off layer's page is native's (decision 3)
+        vertical = False
         run = None  # the fragment being built: a dict
         seen = 0    # non-space chars kept
         bad = False
+        capped = False
+
+        def begin(px, py, start, end, base, axis, size):
+            return {"addr": addr, "x": px, "y": py, "dx": axis[0], "dy": axis[1], "ux": axis[2],
+                    "uy": axis[3], "base": base, "start": start, "end": end, "size": size,
+                    "text": [], "offsets": [], "gaps": [], "first": None}
 
         def flush():
             nonlocal run
@@ -354,6 +477,7 @@ class PdfiumDoc:
                 objects[addr] = len(objects)
                 modes[addr] = raw.FPDFTextObj_GetTextRenderMode(handle) in (3, 7) if handle else False
                 fonts[addr] = self._font(handle)
+                hidden[addr] = "ocg" if marks and handle and _oc_marked(handle) else ""
                 fs = raw.FPDFText_GetFontSize(tp, at)
                 if raw.FPDFText_GetMatrix(tp, at, fsm) and _finite(fsm.a, fsm.b, fsm.c, fsm.d):
                     dx, dy = _unit(fsm.a, fsm.b, (1.0, 0.0))
@@ -374,6 +498,26 @@ class PdfiumDoc:
                 sizes[addr] = size
             dx, dy, ux, uy = axes[addr]
             size = sizes[addr]
+            if (run is not None and run["addr"] == addr and len(run["text"]) == 1
+                    and addr not in checked):
+                checked.add(addr)
+                step_x, step_y = x - run["x"], y - run["y"]
+                if (step_x * ux + step_y * uy < -0.5 * abs(size)
+                        and abs(step_x * dx + step_y * dy) <= LINE_TOLERANCE * abs(size)):
+                    # a vertical font: the run's first char is placed again on the vertical axes
+                    vertical = True
+                    axes[addr] = dx, dy, ux, uy = -ux, -uy, dx, dy
+                    fx, fy, fl, fr, fb, ft = run["first"]
+                    first = run["text"][0]
+                    s0 = fx * dx + fy * dy
+                    e0 = (fr * dx if dx >= 0 else fl * dx) + (ft * dy if dy >= 0 else fb * dy)
+                    run = begin(fx, fy, s0, e0, fx * ux + fy * uy, axes[addr], size)
+                    run["gaps"].append(0.0)
+                    run["offsets"].append(0.0)
+                    run["text"].append(first)
+                    run["end"] = max(e0, s0)
+                    run["obj"], run["invisible"], run["font"] = objects[addr], modes[addr], fonts[addr]
+                    run["hidden"] = hidden[addr]
             # the loose box gives the geometry only: projected on the text direction, where the
             # advance ends
             start = x * dx + y * dy
@@ -384,22 +528,25 @@ class PdfiumDoc:
                 if run["addr"] != addr or abs(base - run["base"]) > tol or start < run["end"] - tol:
                     flush()
             if run is None:
-                run = {"addr": addr, "x": x, "y": y, "dx": dx, "dy": dy, "ux": ux,
-                       "uy": uy, "base": base, "start": start, "end": end, "size": size,
-                       "text": [], "offsets": [], "gaps": []}
+                run = begin(x, y, start, end, base, axes[addr], size)
+                run["first"] = (x, y, left, right, bottom, top)
             run["gaps"].append(start - run["end"] if run["text"] else 0.0)
             run["offsets"].append(start - run["start"])
             run["text"].append(ch)
             run["end"] = max(end, start)
             run["obj"], run["invisible"], run["font"] = objects[addr], modes[addr], fonts[addr]
+            run["hidden"] = hidden[addr]
             if not ch.isspace():
                 seen += 1
                 if seen > caps.PDF_PAGE_CHARS:
+                    capped = True
                     break  # pdf.py counts the rest as `text`
         flush()
         if bad:
             cut["bad_coord"] += 1
-        return frags
+        if scan_cut and not capped:
+            cut["page_part"] += 1
+        return frags, vertical
 
     @staticmethod
     def _fragment(run, order):
@@ -409,7 +556,8 @@ class PdfiumDoc:
                         space_width=0.25 * abs(run["size"]), order=order, dir_x=run["dx"],
                         dir_y=run["dy"], up_x=run["ux"], up_y=run["uy"],
                         char_offsets=tuple(run["offsets"]) + (width,), char_gaps=tuple(run["gaps"]),
-                        invisible=run["invisible"], font=run["font"], obj=run["obj"])
+                        invisible=run["invisible"], font=run["font"], obj=run["obj"],
+                        hidden=run["hidden"])
 
     @staticmethod
     def _font(handle) -> str:
@@ -430,9 +578,12 @@ class PdfiumDoc:
     # -- page objects
 
     def _walk(self, page, collector, cut):
-        """Paths into `collector`; [(image handle, matrix)] in content order. Iterative, to
-        FORM_DEPTH form levels and pdf.PDF_PAGE_OBJECTS objects."""
+        """Paths into `collector`; ([(image handle, matrix, (width, height) pixels)] in content
+        order, whether every object was visited). Iterative, to FORM_DEPTH form levels and
+        pdf.PDF_PAGE_OBJECTS objects. The pixel size is read without decoding."""
         images = []
+        whole = True
+        w, h = ctypes.c_uint(), ctypes.c_uint()
         visited = 0
         points = [PATH_POINTS]
         deep = False
@@ -447,6 +598,7 @@ class PdfiumDoc:
             visited += 1
             if visited > caps.PDF_PAGE_OBJECTS:
                 cut["page_part"] += 1
+                whole = False
                 break
             obj = raw.FPDFFormObj_GetObject(parent, i) if form else raw.FPDFPage_GetObject(parent, i)
             if not obj:
@@ -458,13 +610,16 @@ class PdfiumDoc:
             if kind == raw.FPDF_PAGEOBJ_PATH:
                 self._path(obj, m, collector, points)
             elif kind == raw.FPDF_PAGEOBJ_IMAGE:
-                images.append((obj, m))
+                if not raw.FPDFImageObj_GetImagePixelSize(obj, w, h):
+                    w.value = h.value = 0
+                images.append((obj, m, (w.value, h.value)))
             elif depth + 1 < FORM_DEPTH:
                 frames.append([obj, True, m, depth + 1, 0, raw.FPDFFormObj_CountObjects(obj)])
             elif not deep and raw.FPDFFormObj_CountObjects(obj) > 0:
                 deep = True
+                whole = False  # a render would still draw (and decode) what lies below
                 cut["page_part"] += 1
-        return images
+        return images, whole
 
     @staticmethod
     def _path(obj, m, collector, points):
@@ -502,13 +657,15 @@ class PdfiumDoc:
         op = b"B" if filled and stroke.value else b"f" if filled else b"S" if stroke.value else b"n"
         collector.operate(op, [], m)
 
-    def _images(self, drawn, crop, chars, render):
-        """PageImages of the drawn images, at most pdf.PDF_PAGE_IMAGES (the rest count `image`
+    def _images(self, drawn, crop, chars, render, renders, left):
+        """(PageImages of the drawn images, whether past pdf.PDF_PAGE_IMAGES). At most PDF_PAGE_IMAGES images (the rest count `image`
         once). Bytes are not taken for images pdf.py leaves out anyway: under the size floor,
-        or the page's scan, which pdf.py renders whole."""
+        or the page's scan, which pdf.py renders whole. A decode or a render takes its pixels
+        from `left` (a one-item list, the page's budget): an image that would take it below
+        zero, or that needs a render on a page with none (`renders` false), is not decoded."""
         placed = []
         capped = False
-        for obj, m in drawn:
+        for obj, m, px in drawn:
             if len(placed) >= caps.PDF_PAGE_IMAGES:
                 capped = True
                 break
@@ -517,10 +674,7 @@ class PdfiumDoc:
                         max(p[0] for p in corners), max(p[1] for p in corners))
             if box is None:
                 continue
-            w, h = ctypes.c_uint(), ctypes.c_uint()
-            if not raw.FPDFImageObj_GetImagePixelSize(obj, w, h):
-                w.value = h.value = 0
-            placed.append((obj, box, (w.value, h.value)))
+            placed.append((obj, box, px))
         scan = -1
         if chars == 0:
             covers = [(caps._cover(box, crop), i) for i, (_o, box, _px) in enumerate(placed)]
@@ -536,7 +690,9 @@ class PdfiumDoc:
                 continue
             data, kind = None, "raw"
             try:
-                data, kind = self._image_bytes(obj, box, px, render)
+                data, kind = self._image_bytes(obj, box, px, render, renders, left)
+            except _Refused:
+                data, kind = None, "raw"
             except ReadError as e:
                 if e.kind == "timeout":
                     raise
@@ -546,8 +702,12 @@ class PdfiumDoc:
         return shown, capped
 
     @staticmethod
-    def _image_bytes(obj, box, px, render):
-        if px[0] * px[1] > reader_images._MAX_PIXELS:
+    def _image_bytes(obj, box, px, render, renders, left):
+        pixels = px[0] * px[1]
+        if pixels > reader_images._MAX_PIXELS:
+            if not renders or pixels > left[0]:
+                raise _Refused
+            left[0] -= pixels
             return render(box, caps.CROP_DPI), "png"
         filters = []
         for k in range(min(raw.FPDFImageObj_GetImageFilterCount(obj), IMAGE_FILTERS)):
@@ -564,6 +724,9 @@ class PdfiumDoc:
                 data = buf.raw[:n]
                 if reader_images.sniff(data) == "jpg":
                     return data, "jpg"
+        if pixels > left[0]:
+            raise _Refused
+        left[0] -= pixels
         bitmap = raw.FPDFImageObj_GetBitmap(obj)
         if not bitmap:
             return None, "raw"
@@ -613,8 +776,12 @@ class PdfiumDoc:
         width, height, stride = bitmap.width, bitmap.height, bitmap.stride
         if max(width, height) > caps.RENDER_LONG:
             raise ValueError("render past the long-side cap")
-        data = bytes(bitmap.buffer)
-        got = _rgb_rows_rev(data, width, height, stride, bitmap.n_channels)
+        try:
+            data = bytes(bitmap.buffer)
+            channels = bitmap.n_channels
+        finally:
+            bitmap.close()
+        got = _rgb_rows_rev(data, width, height, stride, channels)
         return reader_images._png(width, height, got, False)
 
     # -- annotations
