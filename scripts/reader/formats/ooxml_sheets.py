@@ -6,10 +6,12 @@ types follow anydoc `sheet/xlsx.rs`; the streaming walk, which keeps one cell in
 
 The workbook part gives the sheets in file order. A relationship of type worksheet or chartsheet is read; any other
 type (a macro or dialog sheet) and a missing relationship are counted under `sheet`. Styles and shared strings are
-streamed, the shared strings under their own cap (`SHEET_CHARS` characters, `SHEET_SCAN` entries). Every sheet part
-is streamed, and every element it closes is charged to the workbook's scan count, capped at `SHEET_SCAN`. A cell
-shows its cached value; a formula without one shows `=` and its text. A sheet that cannot be read is counted under
-`sheet` and the others still come out; one whose XML breaks after its first row keeps the rows read.
+streamed, the shared strings under their own cap (`SHEET_CHARS` characters, `SHEET_SCAN` entries), and each part
+under a closed-element cap (SST_ELEMENTS, STYLE_ELEMENTS); one that is named but missing, damaged or capped counts
+`document`. Text escapes (`_xHHHH_`) are undone in strings, str and error values, formulas and sheet names. Every
+sheet part is streamed, and every element it closes is charged to the workbook's scan count, capped at `SHEET_SCAN`.
+A cell shows its cached value; a formula without one shows `=` and its text. A sheet that cannot be read is counted
+under `sheet` and the others still come out; one whose XML breaks after its first row keeps the rows read.
 """
 import math
 import posixpath
@@ -28,8 +30,12 @@ _REF = re.compile(r"([A-Za-z]{1,3})([0-9]{1,7})")  # used with fullmatch
 _ESC = re.compile(r"_x([0-9A-Fa-f]{4})_")
 _SURROGATE = re.compile("[\ud800-\udfff]")
 _HIDDEN = frozenset({"hidden", "veryHidden"})
-_SST_ELEMENTS = 4  # times SHEET_SCAN: the elements a shared-strings part may close (runs and their properties)
-_STYLE_ELEMENTS = 1  # times SHEET_SCAN: the elements a styles part may close
+SST_ELEMENTS = 2  # times SHEET_SCAN: the elements a shared-strings part may close (SHEET_SCAN plain si/t entries fit)
+STYLE_ELEMENTS = 100_000  # elements a styles part may close; a real one closes tens of thousands at most
+# the most raw characters one unescaped character can take: a surrogate pair (_xD83D__xDE00_) or an escaped CRLF
+# (_x000D__x000A_), each two 7-character escapes for one character
+_RAW_PER_CHAR = 14
+_BATCH = 256  # ended siblings a streamed element keeps before they are dropped together
 
 
 def _unescape(text: str) -> str:
@@ -95,39 +101,32 @@ def _skip(ctx, kind, e):
 
 
 def _find(pkg, part, rels, kind, default):
-    """The part a relationship of that type names; the conventional name beside the workbook only when there is
-    no such relationship."""
+    """(part, named): the part a relationship of that type names, and whether one names it at all; the conventional
+    name beside the workbook only when no relationship of that type exists. The part is None when there is none."""
     named = False
     for rel in rels.values():
         if rel.type.endswith("/" + kind) and not rel.external:
             named = True
             if pkg.has(rel.target):
-                return rel.target
+                return rel.target, True
     conventional = posixpath.join(posixpath.dirname(part), default)
     if not named and pkg.has(conventional):
-        return conventional
-    return None
+        return conventional, False
+    return None, named
 
 
-def _stream(pkg, part):
-    """(event, element, local name, open elements) over a part, for start and end events. After an end has been
-    handled the element is removed from its parent, so the tree holds only the open path; at an end the open list no
-    longer holds the element, so its last item is the parent."""
-    stack, names = [], {}
-    with pkg.open(part) as f:
-        for ev, el in iterparse(f, ("start", "end")):
-            tag = el.tag
-            name = names.get(tag)
-            if name is None:
-                name = names[tag] = local(tag)
-            if ev == "start":
-                stack.append(el)
-                yield ev, el, name, stack
-            else:
-                stack.pop()
-                yield ev, el, name, stack
-                if stack:
-                    stack[-1].remove(el)
+def _drop(el, els, done):
+    """Let go of an ended element in a streamed part. `els` is the open path (`el` already taken off) and `done` the
+    count of ended children each open element still holds, `el`'s own on top. Its children go now; it goes from its
+    parent with the next _BATCH ended siblings, in one slice. The parser has already added the children of a whole
+    fed chunk, so `remove`, which searches from the first child, would cost the chunk's width per element."""
+    if done.pop():
+        del el[:]
+    if els:
+        done[-1] += 1
+        if done[-1] >= _BATCH:
+            del els[-1][:done[-1]]
+            done[-1] = 0
 
 
 def _workbook(root, rels, wb, ctx):
@@ -145,58 +144,82 @@ def _workbook(root, rels, wb, ctx):
                     continue
                 if rel.type.endswith("/chartsheet"):
                     wb.chartsheets.add(rel.target)
-                wb.sheets.append((attr(sh, "name") or "", rel.target, attr(sh, "state") or ""))
+                wb.sheets.append((_unescape(attr(sh, "name") or ""), rel.target, attr(sh, "state") or ""))
 
 
 def _styles(pkg, part, wb, ctx):
-    """`numFmts/numFmt` codes and the `cellXfs/xf` format ids; `cellStyleXfs` is not read."""
-    cap, seen = _STYLE_ELEMENTS * limits.SHEET_SCAN, 0
-    for ev, el, name, stack in _stream(pkg, part):
-        if ev != "end":
-            continue
-        seen += 1
-        if seen > cap:
-            ctx.skipped["styles"] += 1
-            return
-        parent = local(stack[-1].tag) if stack else ""
-        if name == "numFmt" and parent == "numFmts":
-            fid = _int(attr(el, "numFmtId"))
-            if fid is not None:
-                wb.formats[fid] = attr(el, "formatCode") or ""
-        elif name == "xf" and parent == "cellXfs":
-            wb.xf_fmt.append(_int(attr(el, "numFmtId"), 0))
+    """`numFmts/numFmt` codes and the `cellXfs/xf` format ids, streamed; `cellStyleXfs` is not read. Past
+    STYLE_ELEMENTS closed elements the part stops, counted under `document`, and what was read is kept."""
+    seen, els, tags, done, names = 0, [], [], [], {}
+    with pkg.open(part) as f:
+        for ev, el in iterparse(f, ("start", "end")):
+            name = names.get(el.tag)
+            if name is None:
+                name = names[el.tag] = local(el.tag)
+            if ev == "start":
+                els.append(el)
+                tags.append(name)
+                done.append(0)
+                continue
+            els.pop()
+            tags.pop()
+            seen += 1
+            if seen > STYLE_ELEMENTS:
+                ctx.skipped["document"] += 1
+                return
+            if tags:
+                if name == "numFmt" and tags[-1] == "numFmts":
+                    fid = _int(attr(el, "numFmtId"))
+                    if fid is not None:
+                        wb.formats[fid] = attr(el, "formatCode") or ""
+                elif name == "xf" and tags[-1] == "cellXfs":
+                    wb.xf_fmt.append(_int(attr(el, "numFmtId"), 0))
+            _drop(el, els, done)
 
 
 def _strings(pkg, part, wb, ctx):
-    """The shared-string table, streamed; past its character or entry cap it stops, counted once (decision 2)."""
+    """The shared-string table, streamed; past its character or entry cap, or SST_ELEMENTS times SHEET_SCAN closed
+    elements, it stops, counted once (decision 2)."""
     chars_cap, entries_cap = limits.SHEET_CHARS, limits.SHEET_SCAN
-    cap, seen, total, parts, size = _SST_ELEMENTS * limits.SHEET_SCAN, 0, 0, [], 0
-    for ev, el, name, stack in _stream(pkg, part):
-        if ev == "start":
-            if name == "si":
-                parts, size = [], 0
-            continue
-        seen += 1
-        if seen > cap:
-            return _cut(ctx, f"{cap} XML elements")
-        depth = len(stack)
-        if name == "t" and depth >= 2:
-            up = local(stack[-1].tag)
-            if up == "si" or (up == "r" and depth >= 3 and local(stack[-2].tag) == "si"):
-                text = el.text or ""
-                size += len(text)
-                if size > 7 * (chars_cap - total):  # past the cap even unescaped (_xHHHH_ is 7 for 1): stop now
+    cap = SST_ELEMENTS * limits.SHEET_SCAN
+    seen, total, size, parts, els, tags, done, names = 0, 0, 0, [], [], [], [], {}
+    with pkg.open(part) as f:
+        for ev, el in iterparse(f, ("start", "end")):
+            name = names.get(el.tag)
+            if name is None:
+                name = names[el.tag] = local(el.tag)
+            if ev == "start":
+                els.append(el)
+                tags.append(name)
+                done.append(0)
+                if name == "si":
+                    parts, size = [], 0
+                continue
+            els.pop()
+            tags.pop()
+            seen += 1
+            if seen > cap:
+                return _cut(ctx, f"{cap} XML elements")
+            if name == "t" and tags:
+                up = tags[-1]
+                if up == "si" or (up == "r" and len(tags) >= 2 and tags[-2] == "si"):
+                    text = el.text or ""
+                    size += len(text)
+                    # past the cap even after unescaping, which shrinks a text by at most _RAW_PER_CHAR: stop now,
+                    # so one entry's raw text held here stays bounded
+                    if size > _RAW_PER_CHAR * (chars_cap - total):
+                        return _cut(ctx, f"{chars_cap} characters")
+                    parts.append(text)
+            elif name == "si":
+                if len(wb.sst) >= entries_cap:
+                    return _cut(ctx, f"{entries_cap} entries")
+                text = _unescape("".join(parts))
+                if total + len(text) > chars_cap:
                     return _cut(ctx, f"{chars_cap} characters")
-                parts.append(text)
-        elif name == "si":
-            if len(wb.sst) >= entries_cap:
-                return _cut(ctx, f"{entries_cap} entries")
-            text = _unescape("".join(parts))
-            if total + len(text) > chars_cap:
-                return _cut(ctx, f"{chars_cap} characters")
-            total += len(text)
-            wb.sst.append(text)
-            parts, size = [], 0
+                total += len(text)
+                wb.sst.append(text)
+                parts, size = [], 0
+            _drop(el, els, done)
 
 
 def _cut(ctx, what):
@@ -204,21 +227,36 @@ def _cut(ctx, what):
     ctx.skipped["sheet_cut"] += 1
 
 
+def _no_styles(wb):
+    wb.formats, wb.xf_fmt = {}, []
+
+
+def _no_strings(wb):
+    wb.sst = []
+
+
 def read_workbook(pkg, part, ctx) -> _Wb:
-    """The workbook part's sheet list and date system, then its styles and shared strings."""
+    """The workbook part's sheet list and date system, then its styles and shared strings. A styles or
+    shared-strings part that is named but missing, damaged or capped counts `document` and the sheets still read:
+    a ReadError keeps what was read before it, any other error leaves General formats or no shared strings."""
     root, _ = ooxml_base.load(pkg, part)
     rels = ooxml_base.rels(pkg, part, ctx)
     wb = _Wb()
     _workbook(root, rels, wb, ctx)
-    for kind, default, read, counted in (("styles", "styles.xml", _styles, "styles"),
-                                         ("sharedStrings", "sharedStrings.xml", _strings, "document")):
-        name = _find(pkg, part, rels, kind, default)
+    for kind, default, read, reset in (("styles", "styles.xml", _styles, _no_styles),
+                                       ("sharedStrings", "sharedStrings.xml", _strings, _no_strings)):
+        name, named = _find(pkg, part, rels, kind, default)
         if name is None:
+            if named:
+                ctx.skipped["document"] += 1
             continue
         try:
             read(pkg, name, wb, ctx)
-        except ReadError as e:  # what was read before the break is kept
-            _skip(ctx, counted, e)
+        except ReadError as e:
+            _skip(ctx, "document", e)
+        except Exception:
+            reset(wb)
+            ctx.skipped["document"] += 1
     return wb
 
 
@@ -277,11 +315,8 @@ class _Sheets:
             return []
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         cap = limits.SHEET_SCAN
-        if self.scan >= cap:  # the workbook's scan count is spent: this sheet stops at its first element
-            grid.stop("scanned XML elements", cap)
-            return grid.blocks()
         row, col, cells, rows_seen = -1, -1, 0, False  # cells: the `c` elements open
-        stack, names = [], {}
+        stack, done, names = [], [], {}  # the open path, and the ended children each open element still holds
         try:
             with self.pkg.open(part) as f:
                 for ev, el in iterparse(f, ("start", "end")):
@@ -289,7 +324,11 @@ class _Sheets:
                     if tag is None:
                         tag = names[el.tag] = local(el.tag)
                     if ev == "start":
+                        if self.scan >= cap:  # this element cannot close inside the cap (a later sheet: its first)
+                            grid.stop("scanned XML elements", cap)
+                            break
                         stack.append(el)
+                        done.append(0)
                         if tag == "c":
                             cells += 1
                         elif tag == "row":
@@ -298,8 +337,9 @@ class _Sheets:
                             col, rows_seen = -1, True
                         continue
                     stack.pop()
+                    kids = done.pop()
                     self.scan += 1
-                    if self.scan >= cap:
+                    if self.scan > cap:  # an element past the cap: exactly SHEET_SCAN closes are not a cut
                         grid.stop("scanned XML elements", cap)
                         break
                     if tag == "c":
@@ -309,8 +349,14 @@ class _Sheets:
                         value = self._cell(el)
                         if value and not grid.put(max(row, 0), col, value):
                             break  # the grid is cut: nothing more can be put
-                    if not cells and stack:  # memory holds the open path and one cell
-                        stack[-1].remove(el)
+                    if not cells:  # outside a cell an ended element is let go, as `_drop` does (inlined for speed)
+                        if kids or tag == "c":  # a cell's subtree goes once the cell is read
+                            del el[:]
+                        if stack:
+                            done[-1] += 1
+                            if done[-1] >= _BATCH:
+                                del stack[-1][:done[-1]]
+                                done[-1] = 0
         except ReadError as e:
             if e.kind != "damaged" or not rows_seen:
                 raise
@@ -333,18 +379,17 @@ class _Sheets:
         if t == "inlineStr" and inline is not None:
             return self.show(_rich(inline), style)
         if v is None:
-            return "=" + f.text if f is not None and f.text else ""
+            return "=" + _unescape(f.text) if f is not None and f.text else ""
         text = v.text or ""
         if t == "s":
             i = _int(text.strip())
             return self.show(self.wb.sst[i], style) if i is not None and 0 <= i < len(self.wb.sst) else ""
         if t in ("str", "inlineStr"):
-            return self.show(text, style)
+            return self.show(_unescape(text), style)
         if t == "e":
-            return text
+            return _unescape(text)
         if t == "b":
-            flag = text.strip().lower()
-            return self.show(flag in ("1", "true"), style) if flag in ("1", "true", "0", "false") else ""
+            return self._bool(text, style)
         if t == "d":
             return self._date(text, style)
         try:
@@ -352,6 +397,17 @@ class _Sheets:
         except ValueError:
             return text
         return self.show(number, style) if math.isfinite(number) else text
+
+    def _bool(self, text: str, style: int) -> str:
+        """TRUE for "true" in any case or any non-zero number, FALSE for "false" or zero; anything else as stored."""
+        word = text.strip().lower()
+        if word in ("true", "false"):
+            return self.show(word == "true", style)
+        try:
+            number = float(word)
+        except ValueError:
+            return text
+        return self.show(number != 0, style) if math.isfinite(number) else text
 
     def _date(self, text: str, style: int) -> str:
         """Decision 8: under General the stored ISO text; under another code its serial in the workbook's date

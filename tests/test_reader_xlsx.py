@@ -13,7 +13,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
-from reader.formats import ooxml  # noqa: E402
+from reader.formats import ooxml, ooxml_sheets  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
 from reader_fix import XLSX_REL, XLSX_SML, make_xlsx, xlsx_cell, xlsx_row  # noqa: E402
@@ -50,13 +50,13 @@ def denied(fn):
 
 
 @contextmanager
-def patched(name, value):
-    old = getattr(limits, name)
-    setattr(limits, name, value)
+def patched(name, value, module=limits):
+    old = getattr(module, name)
+    setattr(module, name, value)
     try:
         yield
     finally:
-        setattr(limits, name, old)
+        setattr(module, name, old)
 
 
 def col_name(i: int) -> str:
@@ -229,17 +229,188 @@ def test_macrosheet_counted():
     assert ctx.skipped["sheet"] == 1 and "ok" in out and "macro" not in out, (out, ctx.skipped)
 
 
+# ---- fix round 1
+
+
+def test_shared_strings_element_cap():
+    # 2 x SHEET_SCAN closed elements: a run flood inside one si stops the table there
+    shared = ["<t>a</t>", "<r/>" * 250, "<t>c</t>"]
+    rows = xlsx_row(1, xlsx_cell("A1", 0, t="s"), xlsx_cell("B1", 2, t="s"), xlsx_cell("C1", 3))
+    with patched("SHEET_SCAN", 100):
+        out, ctx = md([sheet(rows)], shared=shared)
+    assert "|a||3|" in out, out
+    assert warned(ctx, "shared strings cut at 200 XML elements") and ctx.skipped["sheet_cut"] == 1, (ctx.warnings,
+                                                                                                   ctx.skipped)
+
+
+def test_styles_element_cap():
+    flood = "<xf/>" * 100_000  # with the two xf above, past the styles cap of 100,000 closed elements
+    styles = (f'<styleSheet xmlns="{XLSX_SML}"><cellXfs><xf numFmtId="0"/><xf numFmtId="10"/>{flood}</cellXfs>'
+              "</styleSheet>")
+    rows = xlsx_row(1, xlsx_cell("A1", 0.5, s=1), xlsx_cell("B1", 2))
+    doc, ctx, secs = parsed([sheet(rows)], xfs=[0], extra_parts={"xl/styles.xml": styles})
+    out = markdown.render(doc, Path(tempfile.gettempdir()) / "unused-assets", False, ctx.skipped)
+    assert "|50.00%|2|" in out and ctx.skipped["document"] == 1 and secs < 2.0, (out, ctx.skipped, secs)
+    assert "(could not read: 1 document part)" in out, out
+
+
+def test_styles_damaged_counts_document():
+    rows = xlsx_row(1, xlsx_cell("A1", 45356, s=1), xlsx_cell("B1", 2))
+    bad = DOCTYPE + f'<styleSheet xmlns="{XLSX_SML}"/>'
+    out, ctx = md([sheet(rows)], xfs=[0, 14], extra_parts={"xl/styles.xml": bad})
+    assert "|45356|2|" in out and ctx.skipped["document"] == 1 and not ctx.skipped["styles"], (out, ctx.skipped)
+
+
+def test_named_part_missing_counts_document():
+    rows = xlsx_row(1, xlsx_cell("A1", 0, t="s"), xlsx_cell("B1", 2))
+    out, ctx = md([sheet(rows)], shared=["<t>hi</t>"], extra_parts={"xl/sharedStrings.xml": None})
+    assert "hi" not in out and ctx.skipped["document"] == 1, (out, ctx.skipped)
+    out, ctx = md([sheet(rows)], numfmts={}, extra_parts={"xl/styles.xml": None})
+    assert ctx.skipped["document"] == 1, ctx.skipped
+
+
+def test_shared_strings_damaged():
+    sst = f'<sst xmlns="{XLSX_SML}"><si><t>hi</t></si><si><t>lo'
+    rows = xlsx_row(1, xlsx_cell("A1", 0, t="s"), xlsx_cell("B1", 1, t="s"), xlsx_cell("C1", 3))
+    out, ctx = md([sheet(rows)], shared=[], extra_parts={"xl/sharedStrings.xml": sst})
+    assert "|hi||3|" in out and ctx.skipped["document"] == 1, (out, ctx.skipped)
+
+
+def test_scan_exact_cap_no_cut():
+    # worksheet, sheetData, row, c and v: five elements close
+    rows = xlsx_row(1, xlsx_cell("A1", 7))
+    with patched("SHEET_SCAN", 5):
+        out, ctx = md([sheet(rows)])
+    assert "7" in out and not ctx.skipped and not ctx.warnings, (out, ctx.skipped, ctx.warnings)
+    with patched("SHEET_SCAN", 5):
+        out, ctx = md([sheet(rows), sheet(xlsx_row(1, xlsx_cell("A1", 8)), name="T")])
+    assert "8" not in out and ctx.skipped["sheet_cut"] == 1 and warned(ctx, "sheet T cut at 5"), (out, ctx.skipped)
+    with patched("SHEET_SCAN", 4):
+        _, ctx = md([sheet(rows)])
+    assert ctx.skipped["sheet_cut"] == 1, ctx.skipped
+
+
+def test_shared_string_guard_factor():
+    # a surrogate pair is 14 raw characters for 1: the table still holds it right up to SHEET_CHARS
+    shared = ["<t>" + "a" * 45 + "</t>", "<t>" + "_xD83D__xDE00_" * 3 + "</t>", "<t>_x000D__x000A_</t>", "<t>q</t>"]
+    rows = xlsx_row(1, *(xlsx_cell(f"{col_name(i)}1", i, t="s") for i in range(4)))
+    with patched("SHEET_CHARS", 50):
+        out, ctx = md([sheet(rows)], shared=shared)
+    assert "\U0001F600" * 3 in out and "|q|" in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_unreadable_styles_and_strings_go_on():
+    def bad_styles(pkg, part, wb, ctx):
+        wb.xf_fmt.extend([0, 10])
+        raise ValueError("bug")
+
+    def bad_strings(pkg, part, wb, ctx):
+        wb.sst.append("hi")
+        raise ValueError("bug")
+    rows = xlsx_row(1, xlsx_cell("A1", 0.5, s=1), xlsx_cell("B1", 0, t="s"), xlsx_cell("C1", 3))
+    with patched("_styles", bad_styles, ooxml_sheets), patched("_strings", bad_strings, ooxml_sheets):
+        out, ctx = md([sheet(rows)], shared=["<t>hi</t>"], xfs=[0, 10])
+    assert "|0.5||3|" in out and ctx.skipped["document"] == 2, (out, ctx.skipped)
+
+
+def test_bool_values():
+    vals = ["2", "-0.5", "0", "0.0", "True", "FALSE", "maybe"]
+    rows = xlsx_row(1, *(xlsx_cell(f"{col_name(i)}1", v, t="b") for i, v in enumerate(vals)))
+    out, _ = md([sheet(rows)])
+    assert "|TRUE|TRUE|FALSE|FALSE|TRUE|FALSE|maybe|" in out, out
+
+
+def test_unescape_beyond_shared():
+    rows = xlsx_row(1, xlsx_cell("A1", "a_x000D_b", t="str"), xlsx_cell("B1", "_x0023_N/A", t="e"),
+                    xlsx_cell("C1", f='"_x0041_"'))
+    out, _ = md([sheet(rows, name="S_x0031_")])
+    assert "## Sheet: S1" in out and '|a<br>b|#N/A|="A"|' in out and "_x" not in out, out
+
+
+def test_ref_fallbacks():
+    rows = (xlsx_row(2, xlsx_cell("A2", "a", t="str"), xlsx_cell(None, "b", t="str"), xlsx_cell("1A", "c", t="str"))
+            + xlsx_row(None, xlsx_cell(None, "d", t="str"))
+            + xlsx_row("abc", xlsx_cell(None, "e", t="str"), xlsx_cell(None, "f", t="str"))
+            + xlsx_row(0, xlsx_cell("B9", "g", t="str")))
+    out, ctx = md([sheet(rows)])
+    assert "|a|b|c|\n|---|---|---|\n|d|||\n|e|f||\n||g||" in out and not ctx.skipped, out
+
+
+def test_huge_row_number():
+    sheets = [sheet(xlsx_row(99999999999, xlsx_cell("A1", 1)), name="A"), sheet(xlsx_row(1, xlsx_cell("A1", 2)))]
+    out, ctx = md(sheets)
+    assert warned(ctx, "sheet A cut at 100000 rows") and ctx.skipped["sheet_cut"] == 1 and "2" in out, (out, ctx)
+
+
+def test_missing_workbook_relationship():
+    rels = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId2" Type="{XLSX_REL}/worksheet" Target="worksheets/sheet2.xml"/></Relationships>')
+    sheets = [sheet(xlsx_row(1, xlsx_cell("A1", "gone", t="str")), name="A"),
+              sheet(xlsx_row(1, xlsx_cell("A1", "kept", t="str")), name="B")]
+    out, ctx = md(sheets, extra_parts={"xl/_rels/workbook.xml.rels": rels})
+    assert "kept" in out and "gone" not in out and ctx.skipped["sheet"] == 1, (out, ctx.skipped)
+
+
+def test_read_error_kinds():
+    real = ooxml_sheets.iterparse
+
+    def failing(kind):
+        state = {"done": False}
+
+        def it(stream, events=("end",), chunk=65536):
+            for ev, el in real(stream, events, chunk):
+                yield ev, el
+                if ev == "end" and el.tag.endswith("row") and not state["done"]:
+                    state["done"] = True
+                    raise ReadError(kind, "injected")
+        return it
+    sheets = [sheet(xlsx_row(1, xlsx_cell("A1", "one", t="str")) + xlsx_row(2, xlsx_cell("A2", "two", t="str")),
+                    name="A"), sheet(xlsx_row(1, xlsx_cell("A1", "next", t="str")), name="B")]
+    with patched("iterparse", failing("timeout"), ooxml_sheets):
+        assert denied(lambda: md(sheets))[0] == "timeout"
+    for kind in ("too_large", "encrypted", "unsupported"):
+        with patched("iterparse", failing(kind), ooxml_sheets):
+            out, ctx = md(sheets)
+        assert "one" not in out and "next" in out and ctx.skipped["sheet"] == 1, (kind, out, ctx.skipped)
+    with patched("iterparse", failing("damaged"), ooxml_sheets):
+        out, ctx = md(sheets)
+    assert "one" in out and "two" not in out and "next" in out and ctx.skipped["sheet_cut"] == 1, (out, ctx.skipped)
+
+
+def worst():
+    """The slowest workbook the caps allow: a styles flood and a shared-strings run flood past their caps, and a
+    sheet past SHEET_SCAN. Random padding keeps each flood part under ZIP_RATIO. (parse seconds, ctx)"""
+    import random
+    pad = "<!--" + random.Random(0).randbytes(900_000).hex() + "-->"
+    sst = (f'<sst xmlns="{XLSX_SML}">{pad}<si>' + "<r/>" * (2 * limits.SHEET_SCAN + 1000)
+           + "</si><si><t>z</t></si></sst>")
+    styles = (f'<styleSheet xmlns="{XLSX_SML}">{pad}<cellXfs>' + "<xf/>" * (ooxml_sheets.STYLE_ELEMENTS + 1000)
+              + "</cellXfs></styleSheet>")
+    rows = "".join(xlsx_row(r, *(f'<c r="{col_name(c)}{r}" s="1"/>' for c in range(1000)))
+                   for r in range(1, limits.SHEET_SCAN // 1000 + 2))
+    _, ctx, secs = parsed([sheet(rows)], shared=[], xfs=[0, 0],
+                          extra_parts={"xl/sharedStrings.xml": sst, "xl/styles.xml": styles})
+    return secs, ctx
+
+
 def measure(n=2_000_000):
     """Not a test: one sheet of n styled empty cells (1,000 a row) through the whole reader."""
     rows = "".join(xlsx_row(r, *(f'<c r="{col_name(c)}{r}" s="1"/>' for c in range(1000)))
                    for r in range(1, n // 1000 + 1))
     _, ctx, secs = parsed([sheet(rows)], xfs=[0, 0])
     print(f"SCAN {n} {secs:.2f}")
+    secs, ctx = worst()
+    print(f"WORST {secs:.2f}")
 
 
 def main():
     if sys.argv[1:] == ["measure"]:
         measure()
+        return
+    if sys.argv[1:]:  # the named tests only
+        for name in sys.argv[1:]:
+            globals()[name]()
+        print("pass")
         return
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
