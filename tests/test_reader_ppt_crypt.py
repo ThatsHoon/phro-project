@@ -193,7 +193,9 @@ def test_clear_records_stay_byte_identical():
              for at in info["user_edits"] + info["directories"] + [info["offsets"][info["crypt"]]]]
     for at, size in spans:
         assert out[at:at + size] == doc[at:at + size], at
-    assert out[:8] != doc[:8] and out[info["offsets"][info["slides"][0]]:][:2] != doc[info["offsets"][info["slides"][0]]:][:2]
+    assert out[:8] != doc[:8]  # the DocumentContainer's header was deciphered
+    slide = info["offsets"][info["slides"][0]]
+    assert out[slide:slide + 2] != doc[slide:slide + 2], slide  # and so was the first slide's
 
 
 def test_object_cap_is_too_large():
@@ -219,6 +221,27 @@ def test_bad_blip_keeps_later_pictures():
                                      pictures=[blip_png(PNG), blip_png(PNG + b"Q"), blip_png(PNG + b"R")])
     assert sorted(assets.values()) == [PNG, PNG + b"R"], (assets, out)
     assert "(could not read: 1 image)" in out and ctx.skipped["image"] == 1, (out, dict(ctx.skipped))
+
+
+def test_bad_blip_with_no_later_delay_leaves_the_tail_enciphered():
+    # the BStore names no foDelay after the bad record, so _blips has nowhere to go on: the records before it are
+    # deciphered and everything from it on stays as it was
+    first = len(blip_png(PNG))
+    info, persist, doc, pics = streams_of(encrypt=PPT_DEFAULT, pictures=[blip_png(PNG), blip_png(PNG + b"Q"),
+                                                                        blip_png(PNG + b"R")])
+    bad = bytearray(pics)  # in memory only
+    bad[first + 2] ^= 0xFF  # the second record's type, enciphered
+    real = ppt_crypt._delays
+    resume = []
+
+    def delays(clear, persist):
+        resume.extend(real(clear, persist))
+        return [at for at in resume if at <= first]  # none after the bad record's start
+    with mock.patch.object(ppt_crypt, "_delays", delays):
+        _, out = ppt_crypt.unlock(doc, persist, bytes(bad))
+    assert len(resume) == 3 and resume[1] == first, resume  # the BStore did name the later two
+    assert out[:first] == blip_png(PNG), out[:16]
+    assert out[first:] == bytes(bad[first:])
 
 
 def main():

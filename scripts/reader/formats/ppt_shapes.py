@@ -110,7 +110,8 @@ def text_blocks(items, walk):
 class Shape:
     """One shape in slide coordinates. `runs` holds the shape's text as (TextHeaderAtom type, blocks, plain text);
     `blocks` is the blocks of those runs (or a table's one Table). `text_ref` is the OutlineTextRefAtom index, `pib`
-    the picture's BStore index and `ole_ref` the ExObjRefAtom id; `anchored` is false when the shape had no anchor (a group with none gets it from `ordered` when a member has one)."""
+    the picture's BStore index and `ole_ref` the ExObjRefAtom id; `anchored` is false when the shape had no anchor
+    (a group with none gets it from `ordered` when a member has one)."""
     kind: str
     top: float = 0.0
     left: float = 0.0

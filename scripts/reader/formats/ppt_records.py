@@ -41,9 +41,9 @@ class Persist:
 
     The directory work budget (BIN_RECORDS entries, repeated ids counted) is spent across all the edits together, not
     per edit: a file with very many edits that each re-list the same objects stops at the budget, the oldest
-    directories are not read and the stop is counted under `record`. A directory entry that runs past its atom ends
-    that directory there (the entries before it are kept, none after it can be trusted) and the older edits are still
-    read."""
+    directories are not read and the stop is counted under `record`. A directory entry whose offsets run past its
+    atom is dropped whole and counted under `record`; the entries before it are kept, and since it overruns the atom
+    it is the last entry the atom holds, so no entry follows it. The older edits are still read."""
 
     def __init__(self, doc: bytes, current_user: bytes | None, ctx):
         self.doc, self.ctx = doc, ctx

@@ -79,7 +79,9 @@ def test_directory_overrun_keeps_older_directory():
 
 
 def test_directory_overrun_keeps_entries_before_it():
-    # the entries before the overrunning one are kept; those after it have no length to trust and are lost
+    # the entries before the overrunning one are kept and the overrunning one is dropped whole; it runs past the
+    # atom, so it is the last entry the atom holds and none follows it. The slides are missing because the rewritten
+    # directory lists only ids 1 and 2 before it, where the one run it replaces listed all four ids
     info, doc, cu = build()
     doc = bytearray(doc)
     at = info["directories"][0]

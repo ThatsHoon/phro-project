@@ -1449,27 +1449,32 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     added to the SLWT after the body, when outline is true) and shapes (below). Paragraphs are joined with \\r;
     \\x0b stays as written. notes: {slide number from 1: text}, NotesContainers listed in SlideListWithText instance 2
     (SlidePersistAtom slideId = the slide's slideId + 0x1000, which the SlideAtom's notesIdRef carries; NotesAtom
-    slideIdRef = the slide's slideId; a value may be a dict {"shapes": [...]} of shape dicts instead of text). master_text goes in the MainMaster (None: a master with no text). edits > 1 appends edits - 1 more
+    slideIdRef = the slide's slideId; a value may be a dict {"shapes": [...]} of shape dicts instead of text).
+    master_text goes in the MainMaster (None: a master with no text). edits > 1 appends edits - 1 more
     PersistDirectoryAtom + UserEditAtom pairs chained through lastEdit; each remaps slide 1 to a fresh copy.
     encrypt (any string, the password): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist
     object holding an RC4 CryptoAPI EncryptionVersionInfo (rc4_header(password), 128-bit; clear) and the UserEditAtom's
     encryptSessionPersistIdRef. Every other persist object, the older edits' copies too, is RC4-encrypted whole (header
-    and body) with block = its persist id; the CryptSession, UserEditAtom, PersistDirectoryAtom and Current User stay clear. The
-    Pictures stream is encrypted BLIP by BLIP: the 8-byte header, each UID, the tag or metafile header and the image
-    data are separate fields, each restarting the keystream at block 0 ([MS-OFFCRYPTO] / dochan crypto/ppt.py). The
-    encryption here is written out on its own (its own key derivation), not by running the reader's unlock backwards.
+    and body) with block = its persist id; the CryptSession, UserEditAtom, PersistDirectoryAtom and Current User stay
+    clear. The Pictures stream is encrypted BLIP by BLIP: the 8-byte header, each UID, the tag or metafile header and
+    the image data are separate fields, each restarting the keystream at block 0 ([MS-OFFCRYPTO] / dochan
+    crypto/ppt.py). The encryption here is written out on its own (its own key derivation), not by running the reader's
+    unlock backwards.
     encrypt_header (bytes) replaces the CryptSession10Container body, for example a (4, 4) AES EncryptionVersionInfo;
     the streams are still encrypted with the password's RC4 keys.
-    no_drawing (true) writes the title and body runs straight into the SlideContainer, without a PPDrawing, and the slide's notes likewise.
+    no_drawing (true) writes the title and body runs straight into the SlideContainer, without a PPDrawing, and the
+    slide's notes likewise.
     shapes: a list of dicts that replaces the slide's own text shapes in its PPDrawing (the SLWT is unchanged). A dict
-    is a text shape, kind "group" or kind "picture" (key pib, the 1-based BStore index; box, text, placeholder and ref as for a text shape); kind
-    "object" (below). Keys: kind ("text" by default), spid, box ((left, top, right, bottom): a ClientAnchor at the top level, a
-    ChildAnchor inside a group, unless client is true; wide makes the ClientAnchor 16 bytes), text and text_kind (a
-    text run of TextHeaderAtom type text_kind, 1 by default), placeholder (an OEPlaceholderAtom of that type in the
-    ClientData), ref (an OutlineTextRefAtom index in the ClientData), link (the text carries an InteractiveInfo and a
-    TextInteractiveInfoAtom; a string link is also a URL: an ExHyperlink (ExHyperlinkAtom, CString) in the ExObjList
-    of the DocumentContainer, named by the InteractiveInfoAtom). A group also has children (the shape dicts inside it), rect (its FSPGR rectangle, left,
-    top, right, bottom), table (FOPT property 0x039F = 1; "tertiary" puts it in a tertiary FOPT, 0xF122) and flags (extra FSP flag bits, 0x40 flipH, 0x80 flipV).
+    is a text shape, kind "group" or kind "picture" (key pib, the 1-based BStore index; box, text, placeholder and ref
+    as for a text shape); kind "object" (below). Keys: kind ("text" by default), spid, box ((left, top, right, bottom):
+    a ClientAnchor at the top level, a ChildAnchor inside a group, unless client is true; wide makes the ClientAnchor 16
+    bytes), text and text_kind (a text run of TextHeaderAtom type text_kind, 1 by default), placeholder (an
+    OEPlaceholderAtom of that type in the ClientData), ref (an OutlineTextRefAtom index in the ClientData), link (the
+    text carries an InteractiveInfo and a TextInteractiveInfoAtom; a string link is also a URL: an ExHyperlink
+    (ExHyperlinkAtom, CString) in the ExObjList of the DocumentContainer, named by the InteractiveInfoAtom). A group
+    also has children (the shape dicts inside it), rect (its FSPGR rectangle, left, top, right, bottom), table (FOPT
+    property 0x039F = 1; "tertiary" puts it in a tertiary FOPT, 0xF122) and flags (extra FSP flag bits, 0x40 flipH, 0x80
+    flipV).
     raw_shapes: {slide number from 1: OfficeArt record bytes} appended to that slide's DgContainer after its
     SpgrContainer. pictures: a list of BLIP records (blip_png, blip_bitmap, blip_metafile), written one after
     another into the Pictures stream; the DocumentContainer gains a PPDrawingGroup (0x040B) whose DggContainer holds a
