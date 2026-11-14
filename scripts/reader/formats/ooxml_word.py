@@ -320,6 +320,21 @@ class _Reader:
         return bool(bold), bool(vanish)
 
     # ---- paragraph content
+    @staticmethod
+    def scope_hidden(st) -> str:
+        """Why the run scope open now is hidden ("deleted" before "hidden"), or "": the blocks that follow the
+        paragraph (display math, SmartArt, charts, pictures, text boxes) are hidden as the scope they sit in."""
+        kinds = {f.kind for f in st.frames}
+        return "deleted" if "deleted" in kinds else "hidden" if "hidden" in kinds else ""
+
+    def extra(self, st, blocks) -> None:
+        """Add blocks after the paragraph, hidden as the scope they sit in; a block deleted on its own stays so."""
+        hidden = self.scope_hidden(st)
+        for b in blocks:
+            if hidden and b.hidden != "deleted":
+                b.hidden = hidden
+            st.extras.append(b)
+
     def node(self, el, st, d):
         if d > limits.MAX_DEPTH:
             self.deep()
@@ -330,9 +345,7 @@ class _Reader:
                 self.add(st, Math(t))
             return
         if omml.is_math(el, "oMathPara"):  # display lines follow the paragraph, hidden as the scope they sit in
-            kinds = {f.kind for f in st.frames}
-            hidden = "deleted" if "deleted" in kinds else "hidden" if "hidden" in kinds else ""
-            st.extras.extend(Equation(t, display=True, hidden=hidden) for t in omml.lines(el))
+            self.extra(st, [Equation(t, display=True) for t in omml.lines(el)])
             return
         n = local(el.tag)
         if n == "r":
@@ -408,9 +421,9 @@ class _Reader:
         elif n == "chart":
             self.chart(st, attr(el, "id"))
         elif n == "relIds":
-            st.extras.extend(self.smartart(attr(el, "dm")))
+            self.extra(st, self.smartart(attr(el, "dm")))
         elif n == "txbxContent":
-            st.extras.extend(self.blocks(el, d + 1))
+            self.extra(st, self.blocks(el, d + 1))
         elif n not in _SKIP:
             for c in el:
                 self.node(c, st, d + 1)
@@ -422,7 +435,7 @@ class _Reader:
         if img is None or self.image_bytes > IMAGE_BYTES:
             self.ctx.skipped["image"] += 1
             return
-        st.extras.append(Image(img.data, st.alt if alt is None else alt))
+        self.extra(st, [Image(img.data, st.alt if alt is None else alt)])
 
     def chart(self, st, rid):
         tbl = ooxml_base.chart(self.pkg, self.scope.part, rid, self.ctx)
@@ -431,7 +444,7 @@ class _Reader:
         if tbl is None or self.chart_cells > limits.CHART_TOTAL:
             self.ctx.skipped["chart"] += 1
             return
-        st.extras.append(tbl)
+        self.extra(st, [tbl])
 
     def smartart(self, rid):
         got = smartart.items(self.pkg, self.scope.part, rid, self.ctx, limits.SMARTART_NODES - self.smartart_nodes)

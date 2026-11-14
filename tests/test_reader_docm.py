@@ -548,6 +548,44 @@ def test_vba_with_other_losses():
     assert out.startswith("(could not read: 1 image, VBA macros)"), out
 
 
+DGM = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+SMARTART_DATA = (f'<dgm:dataModel xmlns:dgm="{DGM}" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                 '<dgm:ptLst><dgm:pt modelId="0" type="doc"/><dgm:pt modelId="A"><dgm:t><a:bodyPr/><a:p><a:r>'
+                 '<a:t>SECRET-NODE</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst><dgm:cxnLst>'
+                 '<dgm:cxn modelId="c0" srcId="0" destId="A" srcOrd="0"/></dgm:cxnLst></dgm:dataModel>')
+
+
+def _drawn(inner):
+    return f'<w:drawing><wp:inline><a:graphic><a:graphicData>{inner}</a:graphicData></a:graphic></wp:inline></w:drawing>'
+
+
+def test_objects_in_deleted_and_vanished_runs_are_hidden():
+    # SmartArt, a chart, a picture and a text box in a deleted run or a vanished one stay out unless --hidden
+    objects = {
+        "SECRET-NODE": _drawn(f'<dgm:relIds xmlns:dgm="{DGM}" r:dm="rD"/>'),
+        "Chart: line": _drawn('<c:chart r:id="rC"/>'),
+        "assets/img-001.png": _drawn('<pic:pic><pic:blipFill><a:blip r:embed="rI"/></pic:blipFill></pic:pic>'),
+        "BOXED-TEXT": ('<w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>BOXED-TEXT</w:t></w:r></w:p>'
+                       '</w:txbxContent></v:textbox></v:shape></w:pict>'),
+    }
+    parts = {"word/diagrams/data1.xml": SMARTART_DATA, "word/charts/c1.xml": chart_xml(), "word/media/i.png": PNG}
+    rels = (("rD", "diagramData", "diagrams/data1.xml", False), ("rC", "chart", "charts/c1.xml", False),
+            ("rI", "image", "media/i.png", False))
+    wraps = {"deleted": lambda o: f'<w:del w:id="1" w:author="x"><w:r><w:delText>gone</w:delText>{o}</w:r></w:del>',
+             "vanished": lambda o: f'<w:r><w:rPr><w:vanish/></w:rPr><w:t>hid</w:t>{o}</w:r>'}
+    for how, wrap in wraps.items():
+        for seen, obj in objects.items():
+            path = docm(f'<w:p><w:r><w:t>keep </w:t></w:r>{wrap(obj)}</w:p><w:p><w:r><w:t>after</w:t></w:r></w:p>',
+                        parts, rels)
+            doc, ctx = parse(path)
+            out = markdown.render(doc, tmp() / "assets", False, ctx.skipped)
+            assert "keep" in out and "after" in out and seen not in out, (how, seen, out)
+            assert "(2 hidden places left out)" in out, (how, seen, out)  # the run's text, then the object
+            assert not ctx.skipped, (how, seen, dict(ctx.skipped))
+            shown = markdown.render(doc, tmp() / "assets", True, ctx.skipped)
+            assert seen in shown and "(hidden)" in shown, (how, seen, shown)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
