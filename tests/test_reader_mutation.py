@@ -1,12 +1,15 @@
 """Fixed-seed mutation tests: synthetic fixtures of xls (clear, RC4, XOR), xlsb, ppt (clear, encrypted), rtf, pdf (plain,
-xref and object streams, R4 AES), and the OOXML docx, pptx and xlsx packages are damaged at random and read; every outcome must be a Doc or a ReadError (no
-other exception, no hang).
+xref and object streams, R4 AES), the OOXML docx, pptx and xlsx packages, mobi (MOBI 6, KF8 combo, HUFF/CDIC), wpd
+(WordPerfect 6 and 5) and iWork (IWA Pages, Numbers and Keynote, '09 Pages and Numbers) are damaged at random and read;
+every outcome must be a Doc or a ReadError (no other exception, no hang).
 
-About 100 cases a format, each from `random.Random(SEED + k)`, so a failure names the case and repeats. No damaged
+About 100 cases a seed, each from `random.Random(SEED + k)`, so a failure names the case and repeats. No damaged
 case is ever written to disk: compound files and zips are built in memory and read through the formats' in-memory
-entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `ooxml.parse_package`, `rtf.parse_bytes`, `pdf.parse_bytes`),
-and rendering never writes an image. Only the clean xlsb, ppt, docx and pptx seeds touch a temporary directory, once
-each (the xlsx seed is built in memory). An OOXML case damages one or two of its seed's XML members. The RTF seed
+entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `ooxml.parse_package`, `rtf.parse_bytes`, `pdf.parse_bytes`,
+`mobi.parse_bytes`, `wpd.parse_bytes`, `iwork.parse_bytes`), and rendering never writes an image. Only the clean xlsb,
+ppt, docx and pptx seeds touch a temporary directory, once each (the xlsx, mobi, wpd and iWork seeds are built in
+memory). An OOXML case damages one or two of its seed's XML members. An IWA case damages the archive bytes of one or two
+`.iwa` members after Snappy is undone, then stores them as type-1 chunks; a '09 case damages `index.xml`. The RTF seed
 holds none of the control words of a shape's property groups, and the test builds them with `cat` so no .pyc holds
 them either.
 
@@ -14,6 +17,8 @@ Run: python -I -X utf8 tests/test_reader_mutation.py
 """
 import io
 import random
+import re
+import struct
 import sys
 import tempfile
 import time
@@ -26,19 +31,24 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader import markdown  # noqa: E402
+from reader.containers import flate, snappy  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
-from reader.formats import ooxml, pdf, ppt, rtf, xls, xlsb  # noqa: E402
+from reader.formats import iwork, mobi, ooxml, pdf, ppt, rtf, wpd, xls, xlsb  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc  # noqa: E402
 from pdf_fix import (EncryptSpec, Name, Ref, acroform, font_type0, image_xobject, link_annot,  # noqa: E402
                      outline_items, rule_ops, simple_pdf, text_annot, text_ops, widget)
 from reader_fix import (XLSX_SML, blip_png, cfb_bytes, encrypt_xls, make_ppt, make_xlsb, make_xlsx,  # noqa: E402
                         make_zip, xlsx_cell, xlsx_row)
+import iwork_fix as iwf  # noqa: E402
 import test_reader_docm as dm  # noqa: E402  (the seed builders and fixtures of the owning test files)
+import test_reader_iwork as iw  # noqa: E402
+import test_reader_mobi as mb  # noqa: E402
 import test_reader_omml as om  # noqa: E402
 import test_reader_slides as sl  # noqa: E402
 import test_reader_smartart as sa  # noqa: E402
+import test_reader_wpd as wp  # noqa: E402
 import test_reader_xlsb as xb  # noqa: E402
 
 SEED = 20261114
@@ -436,6 +446,198 @@ def test_pdf_mutations():
     assert seeds[2].count(b"/Standard") == 1, seeds[2].count(b"/Standard")
     data = seeds[2].replace(b"/Standard", b"/Stbndard")
     assert outcome(lambda: read_pdf(data), "pdf non-standard handler") == "drm"
+
+
+# ---- mobi: three books built in memory, each damaged whole and read from bytes
+def mobi_seeds() -> dict:
+    """A MOBI 6 book (PalmDOC) with an image and a footnote, a KF8 combo with an NCX, and a HUFF/CDIC book."""
+    text = mb._fn_book(b"<a filepos=0000000000>1</a>", tail=b'<p><img recindex="00001"></p>')
+    chunks = -(-len(text) // 4096)
+    mobi6 = mb._mobi(text, compression=2, pack=mb._palmdoc_literal, first_image=1 + chunks, extra=[mb.PNG],
+                     exth={503: b"Seed book"})
+    files, _ = mb._two_files()
+    ncx_at = len(mb._kf8_recs(files))
+    cncx, rows = b"", []
+    for label, fid, off, depth in (("Beta", 1, 3, 0), ("Gamma", 2, 3, 1)):
+        rows.append((f"{len(rows):04d}", {1: [0], 3: [len(cncx)], 4: [depth], 6: [fid, off]}))
+        cncx += mb._vwi(len(label)) + label.encode()
+    ncx = mb._indx_records(mb.NCX6_TAGX, rows, cncx=cncx + bytes(4))
+    combo = mb._combo(mb.OLD, mb._kf8_recs(files, ncx=ncx_at) + ncx)
+    huff, cdics = mb._huff_tables([b"<html><body>", b"<p>he", b"llo</p>", b"</body></html>"])
+    rec0 = mb._rec0(compression=17480, text_length=40, text_records=1, huff_record=2, huff_count=2)
+    huffcdic = mb._pdb([rec0, bytes([0, 1, 2, 3]), huff] + cdics)
+    return {"mobi6": (mobi6, "The note text"), "kf8 combo": (combo, "gamma"), "huffcdic": (huffcdic, "hello")}
+
+
+def test_mobi_mutations():
+    for label, (seed, probe) in mobi_seeds().items():
+        ctx = Context()
+        out = render(mobi.parse_bytes(seed, ctx), ctx.skipped)
+        assert probe in out and not ctx.skipped, (label, out, ctx.skipped)  # the clean seed reads whole
+
+        def make(rng, k, seed=seed):
+            data = apply(plan(rng, len(seed)), seed)
+            return lambda: read_doc(mobi.parse_bytes, data)
+
+        counts = run_cases(f"mobi {label}", make)
+        assert sum(counts.values()) == CASES, counts
+
+
+# ---- wpd: a WP6 and a WP5 document built in memory, damaged whole and read from bytes (no LibreOffice switch)
+def wpd_seeds() -> dict:
+    """WP6: a footnote, a comment, an undo span, a graphics box (WPG picture) and a table. WP5: a header, notes, bold,
+    a comment and a table."""
+    comment = struct.pack("<HHB", 1, 2, 0)  # the comment's one prefix id: text packet 2
+    packets = [(0x08, wp._text(b"Note\x80", b"text")), (0x08, wp._text(b"A\x80remark")), (0x1B, comment),
+               (0x6F, wp._WPG), (0x40, struct.pack("<HH", 1, 4), 1), (0x41, wp._style(3))]
+    body = (b"Intro" + wp._note(1) + b"\x80said" + wp._grp(0xD4, 0x1D, [3]) + b"\xcc"
+            + b"Keep\x80" + wp._undo(0) + b"Gone" + wp._undo(1) + b"\x80Also\xcc"
+            + b"See" + wp._grp(0xDF, 0, [6, 5]) + b"this\xcc"
+            + wp._grp(0xD4, 0x2A) + b"\xc5a\xc6b\xc5c\xc6d\xbfafter")
+    wp6 = wp._wp6(body, packets)
+    cell = lambda span=1, rows=1: wp._var5(0xDC, 0, bytes((0, 0, span, rows)) + b"\x00" * 7)  # noqa: E731
+    body5 = (wp._hf5(0, b"Running\x0dhead") + b"Body " + wp._fixed5(0xC3, b"\x0c") + b"bold"
+             + wp._fixed5(0xC4, b"\x0c") + wp._fn5(b"Foot\x0dnote") + b" text\x0aNext"
+             + wp._var5(0xD9, 2, b"\x00\x00\x01" + b"A\x0dremark") + b"\x0a"
+             + wp._var5(0xD2, 0x0B, b"\x00" * 8) + wp._var5(0xDC, 1) + cell(rows=2) + b"A" + cell() + b"B"
+             + wp._var5(0xDC, 1) + cell(0x81) + b"A2" + cell() + b"C" + wp._var5(0xDC, 2) + b"After"
+             + wp._fn5(b"End", endnote=True) + b"Last")
+    return {"wp6": (wp6, "Note text"), "wp5": (wp._wp5(body5), "Foot note")}
+
+
+def test_wpd_mutations():
+    for label, (seed, probe) in wpd_seeds().items():
+        ctx = Context()
+        out = render(wpd.parse_bytes(seed, ctx), ctx.skipped)
+        assert probe in out and not ctx.skipped, (label, out, ctx.skipped)  # the clean seed reads whole
+
+        def make(rng, k, seed=seed):
+            data = apply(plan(rng, len(seed)), seed)
+            return lambda: read_doc(wpd.parse_bytes, data)
+
+        counts = run_cases(f"wpd {label}", make)
+        assert sum(counts.values()) == CASES, counts
+
+
+# ---- iWork: IWA members damaged after Snappy (re-chunked as stored chunks); '09 index.xml damaged; zips in memory
+def iwa_pages() -> bytes:
+    text = "Heading\nLook here link B\ufffc end\nKeep gone stay\nPic\ufffc after"
+    at = text.index
+    note, pic = at("\ufffc"), text.rindex("\ufffc")
+    archives = iwf.pages_doc(10, headers=[130]) + [
+        iwf.archive(10, 2001, iwf.storage(
+            text, para_styles=[(0, 20), (at("Look"), None)], links=[(at("link"), 80), (at("link") + 4, None)],
+            footnotes=[(note, 90)], comments=[(at("here"), 95), (at("here") + 4, None)],
+            deletions=[(at("gone"), 100), (at("gone") + 5, None)], attachments=[(pic, 110)],
+            sections=[(0, iwf.SECTION)])),
+        iwf.style(20, "Heading 1"), iwf.link(80, "https://example.test/a"), iwf.footnote(90, 91),
+        iwf.archive(91, 2001, iwf.storage("The note.")), iwf.highlight(95, 96),
+        iwf.comment(96, "Fix this", author=97), iwf.author(97, "Ann"), iwf.change(100, 2),
+        iwf.attachment(110, 111), iwf.image(111, 7), iwf.archive(130, 2001, iwf.storage("Head"))]
+    return iwf.iwork_zip({"Index/Document.iwa": iwf.iwa_member(*archives),
+                          "Index/Metadata.iwa": iwf.metadata_iwa([(7, "pic.png")]), "Data/pic.png": PNG})
+
+
+def iwa_numbers() -> bytes:
+    def text(key):
+        return iwf.cell_v5(3, string_id=key)
+    tiles = {0: iwf.tile({0: [text(1), iwf.cell_v5(2, value=42.5), iwf.cell_v5(6, value=1.0)],
+                          3: [iwf.cell_v5(5, value=86400.0), None, text(2)]}),
+             1: iwf.tile({2: [None, text(3), iwf.cell_v5(10, value=7, format_id=1)]})}
+    t = iwf.table("T", 8, 3, tiles=tiles, strings=[(1, "alpha"), (2, "beta"), (3, "past tile")], tile_size=4,
+                  merges=[(0, 0, 1, 2)], formats=[(1, iwf.fmt(10, decimals=2, currency="EUR"))])
+    archives = iwf.numbers_doc([("S", [600, 500])]) + t + iwf.chart(1, ["r"], ["A"], [[2]], "C")
+    return iwf.iwork_zip({"Index/Document.iwa": iwf.iwa_member(*archives)})
+
+
+def iwa_keynote() -> bytes:
+    slides = [{"title": "T", "body": "Body text", "notes": "speaker words", "drawables": [900], "z_order": [900]},
+              {"title": "U", "body": "Second", "skipped": True, "template": "Template title"}]
+    archives = iwf.keynote_doc(slides) + [iwf.shape(900, 901), iwf.archive(901, 2001, iwf.storage("Drawn box"))]
+    return iwf.iwork_zip({"Index/Document.iwa": iwf.iwa_member(*archives)})
+
+
+def pages09_seed() -> bytes:
+    notes = '<sf:p><sf:span><sf:footnote-mark sf:mark="1"/></sf:span> The note.<sf:footnotebr/></sf:p>'
+    styles = iw.BOLD_STYLE + '<sf:paragraphstyle sf:ident="t" sf:name="Title"/>'
+    body = (iw._p("Doc Title", "t") + iw._p('Body text<sf:footnote sf:autonumber="1" sf:index="0"/> more.')
+            + iw._p('See <sf:link href="https://example.test/x"><sf:span sf:style="b">bold link</sf:span></sf:link>'
+                    '<sf:lnbr/>end'))
+    return iwf.pages09(body, header=iw._p("Running head"), footnotes=notes, styles=styles)
+
+
+def numbers09_seed() -> bytes:
+    rows = [[iw._t("Name"), iw._n("4650"), iw._n("3.25")],
+            ['<sf:d sf:cell-date="0"/>', '<sf:t sf:col-span="2"><sf:ct sfa:s="Wide"/></sf:t>'],
+            ['<sf:f><sf:fo sf:fs="=SUM(B1)"/><sf:r><sf:rn sf:v="7"/></sf:r></sf:f>', '<sf:b sf:v="1"/>', "<sf:s/>"]]
+    sheets = iw._ws("A", iw._table09("Ta", rows, numcols=3)) + iw._ws("B", iw._table09("Tb", [[iw._t("beta")]]))
+    return iwf.numbers09(sheets)
+
+
+def iwork_seeds() -> dict:
+    """label: (zip bytes, app, probe)."""
+    return {"pages": (iwa_pages(), "pages", "The note."), "numbers": (iwa_numbers(), "numbers", "past tile"),
+            "key": (iwa_keynote(), "key", "Drawn box"), "pages09": (pages09_seed(), "pages", "The note."),
+            "numbers09": (numbers09_seed(), "numbers", "beta")}
+
+
+def rechunk(rng, raw: bytes) -> bytes:
+    """`raw` as one to three stored (type 1) IWA chunks, cut at places drawn from rng."""
+    cuts = sorted(rng.randrange(len(raw) + 1) for _ in range(rng.choice((0, 0, 1, 2))))
+    bounds = [0, *cuts, len(raw)]
+    return b"".join(iwf.chunk(raw[a:b], type=1) for a, b in zip(bounds, bounds[1:]))
+
+
+HOSTILE_VALUES = (b"", b"-1", b"0", b"99999999", b"4294967296", b"1e309", b"nan", b"x", b"-0.5")
+
+
+def damage_values(rng, xml: bytes) -> bytes:
+    """`xml` with one to four attribute values swapped for a hostile value or another value of the same file: the
+    file stays well formed, so the '09 walk reads the counts, spans, dates and ids it is given."""
+    spans = [x.span(1) for x in re.finditer(rb'="([^"<&]*)"', xml)]
+    values = [xml[a:b] for a, b in spans]
+    out = xml
+    for a, b in sorted(rng.sample(spans, min(len(spans), rng.choice((1, 2, 4)))), reverse=True):
+        new = rng.choice(HOSTILE_VALUES) if rng.random() < 0.6 else rng.choice(values)
+        out = out[:a] + new + out[b:]
+    return out
+
+
+def iwork_case(seed: bytes, app: str):
+    """Cases for one seed. An IWA seed damages one or two of its .iwa members' archive bytes (Snappy undone), and
+    re-chunks them stored; a '09 seed damages its index.xml, bytes in one case of two (the parser refuses most) and
+    attribute values in the other. The zip is rebuilt in memory, deflating as the seed did."""
+    members = zip_members(seed)
+    iwa = sorted(n for n in members if n.endswith(".iwa"))
+    if iwa:
+        raw = {n: snappy.iwa(members[n], flate.Budget(10**8)) for n in iwa}
+        methods = {}
+    else:
+        raw = {"index.xml": members["index.xml"]}
+        methods = {n: 8 for n in members}
+    names = sorted(raw)
+
+    def make(rng, k):
+        parts = dict(members)
+        for name in rng.sample(names, min(len(names), rng.choice((1, 1, 2)))):
+            if iwa:
+                parts[name] = rechunk(rng, apply(plan(rng, len(raw[name])), raw[name]))
+            elif k % 2:
+                parts[name] = damage_values(rng, raw[name])
+            else:
+                parts[name] = apply(plan(rng, len(raw[name])), raw[name])
+        blob = iwf.iwork_zip(parts, methods)
+        return lambda: read_doc(lambda b, ctx: iwork.parse_bytes(b, ctx, app), blob)
+    return make
+
+
+def test_iwork_mutations():
+    for label, (seed, app, probe) in iwork_seeds().items():
+        ctx = Context()
+        out = render(iwork.parse_bytes(seed, ctx, app), ctx.skipped)
+        assert probe in out and not ctx.skipped, (label, out, ctx.skipped)  # the clean seed reads whole
+        counts = run_cases(f"iwork {label}", iwork_case(seed, app))
+        assert sum(counts.values()) == CASES, counts
 
 
 def main():
