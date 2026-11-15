@@ -33,7 +33,7 @@ HWP_RECORDS = 1_000_000   # records of one HWP stream
 BIN_RECORDS = 2_000_000    # records of one BIFF stream, one BIFF12 part or one PowerPoint Document stream
 DECRYPT_BYTES = 32 * 2**20  # bytes one xls or ppt stream may decrypt
 EMBED_BYTES = 16 * 2**20    # bytes of one Excel workbook stream embedded in an hwp or doc object
-# image bytes one docx, doc, pptx, hwp, hwpx, ppt, xls, xlsb, xlsx, rtf or pdf document may emit, copies counted (each
+# image bytes one docx, doc, pptx, hwp, hwpx, ppt, xls, xlsb, xlsx, rtf, mobi, azw3 or pdf document may emit, copies counted (each
 # placement of a picture is charged; a pdf's renders are included)
 IMAGE_BYTES = 256 * 2**20
 # (an xls also caps the picture placements it reads, all its sheets together: xls_drawing.MAX_PLACEMENTS)

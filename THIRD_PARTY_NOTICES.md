@@ -258,7 +258,7 @@ SOFTWARE.
 
 ## tika
 
-Ported: the PalmDB record table, trailing entries, PalmDOC LZ77 and HUFF/CDIC decoding in `scripts/reader/containers/palmdb.py`, from `tika-parser-miscoffice-module/.../parser/mobi/` (`PalmDatabase.java`, `PalmDoc.java`, `HuffCdic.java`) at Apache Tika main commit a40d54f6.
+Ported: the PalmDB record table, trailing entries, PalmDOC LZ77 and HUFF/CDIC decoding in `scripts/reader/containers/palmdb.py`, from `tika-parser-miscoffice-module/.../parser/mobi/` (`PalmDatabase.java`, `PalmDoc.java`, `HuffCdic.java`) at Apache Tika main commit a40d54f6. The MOBI record 0 and EXTH head, the DRM, encryption, compression and encoding refusals and the EXTH caps in `scripts/reader/formats/mobi.py`, from `MobiHeader.java` and `MobiParser.java` at the same commit.
 
 Apache Tika NOTICE:
 

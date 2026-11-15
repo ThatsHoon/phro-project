@@ -11,7 +11,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from reader.containers import palmdb  # noqa: E402
 from reader.containers.palmdb import HuffCdic, Palm, palmdoc, record_cap, text_cap, trailing  # noqa: E402
+from reader.formats import mobi  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
+from reader.model import Context, Image, Para  # noqa: E402
 
 
 def _pdb(records, type_creator=b"BOOKMOBI"):
@@ -263,6 +265,293 @@ def test_caps():
     finally:
         palmdb.MOBI_TEXT = old
     assert text_cap(10**9) == 64 * 2**20
+
+
+# ---- the MOBI 6 reader
+PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 20
+
+
+def _rec0(*, version=6, compression=1, text_length=0, text_records=1, encryption=0, encoding=65001,
+          first_image=0xFFFFFFFF, exth=None, title=b"T", record_size=4096, drm_offset=0xFFFFFFFF, drm_count=0,
+          huff_record=0, huff_count=0, extra_flags=0, **indexes):
+    """Record 0: the PalmDOC head, a 264-byte MOBI head (fields at the offsets Tika's MobiHeader reads), EXTH, title.
+
+    indexes: fdst, ncx, frag, skel (default 0xFFFFFFFF)."""
+    r = bytearray(280)
+    r[0:2] = compression.to_bytes(2, "big")
+    r[4:8] = text_length.to_bytes(4, "big")
+    r[8:10] = text_records.to_bytes(2, "big")
+    r[10:12] = record_size.to_bytes(2, "big")
+    r[12:14] = encryption.to_bytes(2, "big")
+    r[16:20] = b"MOBI"
+    r[20:24] = (264).to_bytes(4, "big")
+    r[28:32] = encoding.to_bytes(4, "big")
+    r[36:40] = version.to_bytes(4, "big")
+    r[108:112] = first_image.to_bytes(4, "big")
+    r[112:116] = huff_record.to_bytes(4, "big")
+    r[116:120] = huff_count.to_bytes(4, "big")
+    r[168:172] = drm_offset.to_bytes(4, "big")
+    r[172:176] = drm_count.to_bytes(4, "big")
+    for name, at in (("fdst", 192), ("ncx", 244), ("frag", 248), ("skel", 252)):
+        r[at:at + 4] = indexes.pop(name, 0xFFFFFFFF).to_bytes(4, "big")
+    assert not indexes, indexes
+    r[240:244] = extra_flags.to_bytes(4, "big")
+    if exth:
+        items = [(k, v) for k, vs in exth.items() for v in (vs if isinstance(vs, list) else [vs])]
+        recs = b"".join(k.to_bytes(4, "big") + (8 + len(v)).to_bytes(4, "big") + v for k, v in items)
+        body = b"EXTH" + (12 + len(recs)).to_bytes(4, "big") + len(items).to_bytes(4, "big") + recs
+        r += body + bytes(-len(body) % 4)
+        r[128:132] = (0x40).to_bytes(4, "big")
+    r[84:88] = len(r).to_bytes(4, "big")
+    r[88:92] = len(title).to_bytes(4, "big")
+    return bytes(r) + title
+
+
+def _mobi(text, *, compression=1, extra=(), pack=None, **kw):
+    """A BOOKMOBI file: record 0, the text in 4096-byte records (compressed with pack), then extra records."""
+    chunks = [text[i:i + 4096] for i in range(0, len(text), 4096)] or [b""]
+    if pack:
+        chunks = [pack(c) for c in chunks]
+    rec0 = _rec0(compression=compression, text_length=len(text), text_records=len(chunks), **kw)
+    return _pdb([rec0] + chunks + list(extra))
+
+
+def _read(data):
+    ctx = Context()
+    return mobi.parse_bytes(data, ctx), ctx
+
+
+def _flat(o):
+    """Every string inside a document object, in order."""
+    out = []
+    if isinstance(o, str):
+        out.append(o)
+    elif isinstance(o, (list, tuple)):
+        for x in o:
+            out += _flat(x)
+    elif hasattr(o, "__dataclass_fields__"):
+        for f in o.__dataclass_fields__:
+            out += _flat(getattr(o, f))
+    return out
+
+
+def _text_of(o):
+    return "".join(_flat(o))
+
+
+BOOK = (b"<html><head></head><body><h1>One</h1><p>first para</p><mbp:pagebreak/>"
+        b"<p>second para</p><p>more</p></body></html>")
+
+
+def test_mobi6_book():
+    doc, ctx = _read(_mobi(BOOK, exth={503: b"Book"}, title=b"Other"))
+    assert doc.title == "Book"
+    assert [s.kind for s in doc.blocks] == ["chapter", "chapter"] and [s.number for s in doc.blocks] == [1, 2]
+    assert "first para" in _text_of(doc.blocks[0]) and "second para" in _text_of(doc.blocks[1])
+    assert "second" not in _text_of(doc.blocks[0])
+    assert not ctx.skipped
+
+
+def test_full_title_without_exth():
+    doc, _ = _read(_mobi(BOOK, title="가나 title".encode()))
+    assert doc.title == "가나 title"
+    doc, _ = _read(_mobi(BOOK, title=b"x" * 1000))
+    assert doc.title == "x" * mobi.MAX_TITLE
+
+
+def test_cp1252_text():
+    doc, _ = _read(_mobi(b"<html><body><p>\x93q\x94</p></body></html>", encoding=1252))
+    assert "“q”" in _text_of(doc.blocks)
+    # a <meta charset> cannot override the book's own encoding
+    doc, _ = _read(_mobi(b'<html><head><meta charset="utf-16"></head><body><p>\x93q\x94</p></body></html>', encoding=1252))
+    assert "“q”" in _text_of(doc.blocks)
+
+
+def test_recindex_image():
+    body = b'<html><body><p>x</p><img recindex="00001"><img recindex="00002"></body></html>'
+    data = _mobi(body, first_image=3, extra=[b"filler", PNG, b"not a picture"])
+    doc, ctx = _read(data)
+    imgs = [b for s in doc.blocks for b in s.blocks if isinstance(b, Image)]
+    assert len(imgs) == 1 and imgs[0].data == PNG
+    assert ctx.skipped["image"] == 1
+
+
+def test_kindle_embed_loader():
+    palm = Palm(_mobi(b"<p>x</p>", first_image=2, extra=[PNG, b"nope"]))
+    head = mobi._head(palm.record(0))
+    load = mobi._loader(palm, head, Context())
+    assert load("kindle:embed:0001?mime=image/png") == PNG
+    assert load("kindle:embed:0002") is None and load("recindex:0") is None and load("recindex:99") is None
+    assert load("kindle:embed:ZZZ") is None and load("http://x/y.png") is None
+
+
+def test_image_bytes_cap():
+    from reader import limits
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES = len(PNG) * 2 - 1
+    try:
+        body = b'<html><body><img recindex="1"><img recindex="1"></body></html>'
+        doc, ctx = _read(_mobi(body, first_image=2, extra=[PNG]))
+        assert sum(isinstance(b, Image) for s in doc.blocks for b in s.blocks) == 1 and ctx.skipped["image"] == 1
+    finally:
+        limits.IMAGE_BYTES = old
+
+
+def test_filepos_inside_tag():
+    text = b'<html><body><p>a <a filepos=0000000000>go</a></p><p class="x">target</p></body></html>'
+    pos = text.index(b"class")
+    text = text.replace(b"0000000000", f"{pos:010d}".encode())
+    assert text.index(b"class") == pos
+    out = mobi._anchor(text, {pos: "fp1"})
+    assert b'<a id="fp1"></a><p class="x">' in out
+    doc, _ = _read(_mobi(text))
+    assert "class=" not in _text_of(doc.blocks) and "target" in _text_of(doc.blocks)
+
+
+def test_anchor_edges():
+    t = b"<p>ab</p>"
+    assert mobi._anchor(t, {len(t) + 1: "z"}) == t                            # past the end: dropped
+    assert mobi._anchor(t, {3: "a"}) == b'<p><a id="a"></a>ab</p>'
+    assert mobi._anchor(t, {1: "a", 2: "b"}) == b'<a id="a"></a><a id="b"></a><p>ab</p>'   # both moved before the tag
+    old = mobi.MOBI_ANCHORS
+    mobi.MOBI_ANCHORS = 1
+    try:
+        assert mobi._anchor(t, {3: "a", 4: "b"}).count(b"<a id=") == 1
+    finally:
+        mobi.MOBI_ANCHORS = old
+
+
+def test_anchor_cap_counted():
+    old = mobi.MOBI_ANCHORS
+    mobi.MOBI_ANCHORS = 1
+    try:
+        body = b"<html><body><p><a filepos=0000000010>a</a><a filepos=0000000020>b</a></p></body></html>"
+        doc, ctx = _read(_mobi(body))
+        assert ctx.skipped["link"] == 1 and "a" in _text_of(doc.blocks) and "b" in _text_of(doc.blocks)
+    finally:
+        mobi.MOBI_ANCHORS = old
+
+
+def test_filepos_mid_utf8():
+    text = "<html><body><p>가나다</p></body></html>".encode()
+    pos = text.index("가".encode()) + 1
+    out = mobi._anchor(text, {pos: "fp"})
+    assert b'<a id="fp"></a>' + "가나다".encode() in out
+    body = "<html><body><p><a filepos=0000000000>go</a></p><p>가나다</p></body></html>".encode()
+    pos = body.index("가".encode()) + 1
+    body = body.replace(b"0000000000", f"{pos:010d}".encode())
+    assert body.index("가".encode()) + 1 == pos
+    doc, _ = _read(_mobi(body))
+    assert "가나다" in _text_of(doc.blocks) and "�" not in _text_of(doc.blocks)
+
+
+def test_huffcdic_book():
+    huff, cdics = _huff_tables([b"<html><body>", b"<p>he", b"llo</p>", b"</body></html>"])
+    rec0 = _rec0(compression=17480, text_length=40, text_records=1, huff_record=2, huff_count=2)
+    doc, ctx = _read(_pdb([rec0, bytes([0, 1, 2, 3]), huff] + cdics))
+    assert "hello" in _text_of(doc.blocks) and not ctx.skipped
+    rec0 = _rec0(compression=17480, text_length=40, text_records=1, huff_record=2, huff_count=9)   # outside the file
+    assert raises(ReadError, mobi.parse_bytes, _pdb([rec0, bytes([0]), huff] + cdics), Context()).kind == "damaged"
+
+
+def test_palmdoc_book():
+    doc, ctx = _read(_mobi(BOOK, compression=2, pack=_palmdoc_literal))
+    assert "first para" in _text_of(doc.blocks) and "second para" in _text_of(doc.blocks) and not ctx.skipped
+
+
+def test_trailing_entries_book():
+    text = b"<html><body><p>hello</p></body></html>"
+    rec0 = _rec0(version=6, text_length=len(text), text_records=1, extra_flags=2)
+    doc, _ = _read(_pdb([rec0, text + b"ab\x83"]))
+    assert "hello" in _text_of(doc.blocks) and "ab" not in _text_of(doc.blocks)
+
+
+def test_record_cap_counts_record():
+    text = b"<html><body><p>" + b"a" * 190 + b"</p></body></html>"
+    rec0 = _rec0(compression=2, text_length=len(text), text_records=1, record_size=100)
+    doc, ctx = _read(_pdb([rec0, _palmdoc_literal(text)]))
+    assert ctx.skipped["record"] == 1 and "a" * 50 in _text_of(doc.blocks)
+    bad = _rec0(compression=2, text_length=10, text_records=2)             # a failed record, a good one
+    good = b"<html><body><p>kept</p></body></html>"
+    doc, ctx = _read(_pdb([bad, b"abc" + bytes([0x80, 0x03]), _palmdoc_literal(good)]))
+    assert ctx.skipped["record"] == 1 and "kept" in _text_of(doc.blocks)
+
+
+def test_text_cap_truncated():
+    old = palmdb.MOBI_TEXT
+    palmdb.MOBI_TEXT = 100
+    try:
+        text = b"<html><body>" + b"<p>line</p>" * 30 + b"</body></html>"
+        doc, ctx = _read(_mobi(text))
+        assert ctx.skipped["truncated"] == 1
+        assert _text_of(doc.blocks).count("line") < 30
+    finally:
+        palmdb.MOBI_TEXT = old
+
+
+def test_stripped_text():
+    ctx = Context()
+    out = mobi._stripped(b"<p>a</p><div>b &amp; c</div>", ctx)
+    assert [_text_of(p) for p in out] == ["a", "b & c"] and all(isinstance(p, Para) for p in out)
+    assert ctx.skipped["plain_text"] == 1
+    out = mobi._stripped(b"<style>p{}</style><p>x</p><script>y</script>", Context())
+    assert [_text_of(p) for p in out] == ["x"]
+
+
+def test_kf8_only_is_stripped_for_now():
+    doc, ctx = _read(_mobi(b"<html><body><p>one</p><p>two</p></body></html>", version=8))
+    assert [_text_of(b) for b in doc.blocks[0].blocks] == ["one", "two"] and ctx.skipped["plain_text"] == 1
+    doc, ctx = _read(_mobi(BOOK, exth={121: (9).to_bytes(4, "big")}))      # a combo reads as MOBI 6
+    assert len(doc.blocks) == 2 and not ctx.skipped
+
+
+def test_head_fields():
+    h = mobi._head(_rec0(version=8, compression=17480, text_records=3, encoding=1252, first_image=5,
+                         huff_record=7, huff_count=4, ncx=11, frag=12, skel=13, fdst=14, extra_flags=3,
+                         exth={100: [b"a", b"b"], 503: b"t"}, title=b"Full"))
+    assert (h.version, h.compression, h.text_records, h.encoding, h.first_image) == (8, 17480, 3, 1252, 5)
+    assert (h.huff_record, h.huff_count, h.ncx, h.frag, h.skel, h.fdst, h.extra_flags) == (7, 4, 11, 12, 13, 14, 3)
+    assert h.exth == {100: [b"a", b"b"], 503: [b"t"]} and h.full_title == b"Full"
+    assert h.drm_offset == 0xFFFFFFFF and h.drm_count == 0 and h.record_size == 4096
+    assert mobi._head(_rec0(version=4, extra_flags=3)).extra_flags == 0         # flags are read from version 5
+    r = bytearray(_rec0())
+    r[20:24] = (4000).to_bytes(4, "big")
+    assert raises(ReadError, mobi._head, bytes(r)).kind == "damaged"
+    assert raises(ReadError, mobi._head, b"x" * 30).kind == "damaged"
+    r = bytearray(_rec0())
+    r[16:20] = b"XXXX"
+    assert raises(ReadError, mobi._head, bytes(r)).kind == "damaged"
+
+
+def test_refusals():
+    def kind(data):
+        return raises(ReadError, mobi.parse_bytes, data, Context()).kind
+    ok = b"<html><body><p>x</p></body></html>"
+    assert kind(_mobi(ok, encryption=2)) == "drm"
+    assert kind(_mobi(ok, encryption=1)) == "drm"
+    assert kind(_mobi(ok, drm_offset=0x100, drm_count=1)) == "drm"
+    assert kind(_mobi(ok, compression=3)) == "unsupported"
+    assert kind(_mobi(ok, encoding=1200)) == "unsupported"
+    assert kind(b"TPZ0" + bytes(200)) == "unsupported"
+    assert kind(b"CONT" + bytes(200)) == "unsupported"
+    assert kind(_pdb([_rec0(), b"x"], b"TEXtREAd")) == "unsupported"
+    assert kind(_pdb([_rec0(), b"x"], b"ABCDEFGH")) == "unsupported"
+    e = raises(ReadError, mobi.parse_bytes, b"PK\x03\x04" + bytes(100), Context())
+    assert e.kind == "unsupported" and "KFX or another zip container" in str(e)
+    d = bytearray(_mobi(ok))
+    d[78:82], d[86:90] = (200).to_bytes(4, "big"), (100).to_bytes(4, "big")
+    assert kind(bytes(d)) == "damaged"
+    assert kind(_mobi(b"<html><body></body></html>")) == "damaged"           # no readable chapter
+    assert kind(_mobi(b"")) == "damaged"
+    assert kind(_pdb([b"short"])) == "damaged"                                 # no MOBI head
+
+
+def test_parse_path():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "b.mobi"
+        p.write_bytes(_mobi(BOOK))
+        assert len(mobi.parse(p, Context()).blocks) == 2
 
 
 def main():
