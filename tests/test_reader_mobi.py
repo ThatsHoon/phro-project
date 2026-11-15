@@ -1096,7 +1096,8 @@ def test_ncx_marker_in_table_cell():
 def test_ncx_skipped_when_text_has_1e():
     text = NCX_BODY.replace(b"Intro", b"In\x1etro")
     doc, ctx = _read(_ncx_book(text, [(text.index(b"<p>Chapter A"), 0, "Chapter A")]))
-    assert _headings(doc) == [] and "Chapter A" in _text_of(doc.blocks) and "tro" in _text_of(doc.blocks)
+    assert _headings(doc) == [] and "Chapter A" in _text_of(doc.blocks)
+    assert "In tro" in _text_of(doc.blocks)   # the book's own byte is left as the html pass leaves it: white space
     assert not ctx.skipped
     doc, _ = _read(_ncx_book(NCX_BODY.replace(b"Intro", b"In\x0etro"), [(NCX_BODY.index(b"<p>Chapter A"), 0, "")]))
     assert _headings(doc) == []
@@ -1143,6 +1144,50 @@ def test_ncx_in_kf8():
     recs[0] = _rec0(version=8, text_length=len(flow0), text_records=1, fdst=2, ncx=ncx_at)
     doc, _ = _read(_pdb(recs))
     assert _headings(doc) == [(1, "Two")]
+
+
+NCX6_TAGX = [(1, 1, 0x01, 0), (3, 1, 0x02, 0), (4, 1, 0x04, 0), (6, 2, 0x08, 0), (0, 0, 0, 1)]
+
+
+def test_ncx_in_kf8_fragments():
+    """The NCX position (tag 6: fid, offset) lands in the assembled part wherever the fragment was inserted."""
+    files, want = _two_files()
+    recs = _kf8_recs(files)
+    ncx_at = len(recs)
+    cncx, rows = b"", []
+    for label, fid, off, depth in (("Beta", 1, 3, 0), ("Gamma", 2, 3, 1)):
+        rows.append((f"{len(rows):04d}", {1: [0], 3: [len(cncx)], 4: [depth], 6: [fid, off]}))
+        cncx += _vwi(len(label)) + label.encode()
+    ncx = _indx_records(NCX6_TAGX, rows, cncx=cncx + bytes(4))
+    recs = _kf8_recs(files, ncx=ncx_at) + ncx
+    doc, ctx = _read(_pdb(recs))
+    assert _headings(doc) == [(1, "beta"), (2, "gamma")] and not ctx.skipped
+    assert [type(b).__name__ for b in doc.blocks[0].blocks] == ["Para", "Heading"]
+
+
+def test_footnote_last_chapter_is_the_last_with_text():
+    pre = (b"<html><body><p>Intro<sup><a filepos=0000000000>1</a></sup> text.</p><mbp:pagebreak/>"
+           b"<p>Chapter two start</p><p>1. The note text</p>" + b"<p>filler filler filler</p>" * 60)
+    pre = pre.replace(b"filepos=0000000000", b"filepos=%010d" % pre.index(b"<p>1. The note"))
+    for tail in (b"</body></html>", b"<mbp:pagebreak/><html><body></body></html>"):
+        doc, ctx = _read(_mobi(pre + tail))
+        md = _md(doc, ctx)
+        assert "[^" in md and md.count("The note text") == 1
+
+
+def test_one_chapter_book_takes_an_early_sup_link_as_a_note():
+    """Spec-literal: the last chapter counts as a whole, so in a one-chapter book a short sup link to an early
+    paragraph is a note."""
+    doc, ctx = _read(_mobi(_fn_book(b"<a filepos=0000000000>1</a>", early=True)))
+    md = _md(doc, ctx)
+    assert "[^" in md and md.count("Start here") == 1
+
+
+def test_strip_alt_of_images():
+    from reader.model import Image as Img
+    img = Img(b"x", "a" + chr(14) + "1b")
+    mobi._strip([img])
+    assert img.alt == "ab"
 
 
 def _fn_book(link, *, early=False, sup=True, filler=40, body_note=b"<p>1. The note text</p>", tail=b""):

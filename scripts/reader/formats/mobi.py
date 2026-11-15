@@ -34,7 +34,7 @@ from .. import images, limits
 from ..containers import palmdb
 from ..containers.palmdb import HuffCdic, Palm, palmdoc, record_cap, text_cap, trailing
 from ..limits import ReadError
-from ..model import Break, Context, Doc, Heading, Para, Section, Table, Text
+from ..model import Break, Context, Doc, Heading, Image, Para, Section, Table, Text
 
 MOBI_ANCHORS = 100_000  # anchors one book may insert
 MAX_SHEETS = 32         # stylesheets one chapter may use
@@ -481,9 +481,11 @@ def _indx(palm, start: int, ctx) -> list:
 
 def _ncx(palm, head: Head, base: int, ctx) -> list:
     """The NCX of a book as (position, depth, label): tag 1 is the byte position in the text, tag 4 the depth, tag 3 the
-    CNCX offset of the label (cut at MAX_LABEL). At most NCX_ITEMS entries are read; an entry with no position is left
-    out. An index that cannot be read gives [] with no count, so the book reads as without one. `base` is the record
-    the KF8 indexes count from (0 for MOBI 6)."""
+    CNCX offset of the label (cut at MAX_LABEL). In a KF8 book (version 8) the position is (fid, offset) from tag 6
+    when it has both, as foliate-js `getNCX` and its TOC read it (the same pair as a `kindle:pos` link), else tag 1.
+    At most NCX_ITEMS entries are kept (the index itself is bounded by INDX_ENTRIES, which bounds the allocation); an
+    entry with no position is left out. An index that cannot be read gives [] with no count, so the book reads as
+    without one. `base` is the record the KF8 indexes count from (0 for MOBI 6)."""
     if head.ncx == NULL:
         return []
     try:
@@ -492,12 +494,13 @@ def _ncx(palm, head: Head, base: int, ctx) -> list:
         return []
     out = []
     for _, tags in itertools.islice(index, NCX_ITEMS):
-        pos = tags.get(1)
-        if not pos:
+        at = tags.get(6)
+        pos = (at[0], at[1]) if head.version >= 8 and at and len(at) >= 2 else (tags.get(1) or [None])[0]
+        if pos is None:
             continue
         depth = (tags.get(4) or [0])[0]
         label = index.cncx.get((tags.get(3) or [-1])[0], "")
-        out.append((pos[0], depth, label[:MAX_LABEL]))
+        out.append((pos, depth, label[:MAX_LABEL]))
     return out
 
 
@@ -595,14 +598,12 @@ def _pos_key(m) -> tuple:
 def _kindle_pos(parts: list, where: dict, starts: list, utf8: bool, ctx, marks=()) -> list:
     """The parts with each `kindle:pos:fid:F:off:O` target anchored (`kp` + its book position) and its link pointed
     there. A target outside its part, an unknown fid, or one past MOBI_ANCHORS (counted `link` once) leaves the link its
-    text only. marks (position, depth, label) are NCX entries in the book's text; each is inserted into the part that
-    holds it, the part's start counted off."""
+    text only. marks are NCX entries (position, depth, label), inserted into the part that holds them: a position
+    that is a (fid, offset) pair is resolved through `where` like a `kindle:pos` link, so it lands in the assembled part
+    wherever the fragment was inserted; a plain position (a book without a FRAG layout) is a byte offset in flow 0, in
+    the part whose start it follows."""
     targets = [{} for _ in parts]
     heads = [{} for _ in parts]
-    for pos, depth, _ in marks:
-        t = bisect.bisect_right(starts, pos) - 1
-        if t >= 0:
-            heads[t].setdefault(pos - starts[t], depth)
     names: dict = {}   # (fid, off) as written -> anchor name; never more than MOBI_ANCHORS, so neither are targets
     over = False
 
@@ -616,6 +617,15 @@ def _kindle_pos(parts: list, where: dict, starts: list, utf8: bool, ctx, marks=(
             return None
         return hit[0], hit[1] + off
 
+    for pos, depth, _ in marks:
+        if isinstance(pos, tuple):
+            hit = where.get(pos[0])
+            if hit is not None and hit[1] + pos[1] <= len(parts[hit[0]]):
+                heads[hit[0]].setdefault(hit[1] + pos[1], depth)
+        elif not where:
+            t = bisect.bisect_right(starts, pos) - 1
+            if t >= 0:
+                heads[t].setdefault(pos - starts[t], depth)
     for part in parts:
         for m in _KINDLE_POS.finditer(part):
             key = _pos_key(m)
@@ -864,6 +874,9 @@ def _strip(blocks):
             todo = [b]
             while todo:
                 o = todo.pop()
+                if isinstance(o, Image):
+                    o.alt = _MARK.sub("", o.alt)
+                    continue
                 if not hasattr(o, "inlines"):
                     continue
                 for it in o.inlines:
@@ -950,6 +963,21 @@ def _short(node) -> tuple:
     return (text if 1 <= len(text) <= 4 else None), sup
 
 
+def _has_content(root) -> bool:
+    """True when a tree holds text or an image, so its part yields blocks."""
+    stack = [root]
+    while stack:
+        for c in stack.pop().children:
+            if isinstance(c, str):
+                if c.strip():
+                    return True
+            elif c.tag in ("img", "image"):
+                return True
+            elif c.tag not in xhtml.DROP:
+                stack.append(c)
+    return False
+
+
 def _scan(root, part: int, anchors: dict, links: list):
     """Walk one tree once. anchors[id] = (part, the block a target anchor `<a id="fpN">` stands for, or None): the next
     block when the anchor is empty and that block follows it, or opens after it when it ends its parent; else the
@@ -1001,7 +1029,7 @@ def _scan(root, part: int, anchors: dict, links: list):
 def _mark_notes(roots: list, text_len: int):
     """Marks the notes the sup-link heuristic finds in the trees of a book's parts (None for a part that failed). A link
     to a position in the book is a note reference when its visible text is 1 to 4 characters, it is inside a <sup> or
-    holds one or has `epub:type`/`role` noteref or doc-noteref, and its target lies in the last part or in the last fifth
+    holds one or has `epub:type`/`role` noteref or doc-noteref, and its target lies in the last part that has text or an image, or in the last fifth
     of the text (the anchor ids `fpN` and `kpN` carry the position N). The note is the nearest block (p, div, li, aside,
     blockquote) of the target, never body or html, and gets `role="doc-footnote"` and the target's id, so `html.blocks`
     collects it as for epub; the link gets `epub:type="noteref"`. One walk of each tree and one pass over the links."""
@@ -1010,7 +1038,8 @@ def _mark_notes(roots: list, text_len: int):
     last = -1
     for n, root in enumerate(roots):
         if root is not None:
-            last = n
+            if _has_content(root):
+                last = n
             _scan(root, n, anchors, links)
     for a, _, marked in links:
         target = a.attrs["href"].strip()[1:]
