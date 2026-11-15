@@ -90,6 +90,7 @@ OBJECT_MARKS = 16                # content marks read per text object (for /OC, 
 ADVANCE_FLOOR = 0.5
 
 _COORD = 1e9
+_ROUNDING = 1e-3  # pdfium's float32 widths against its boxes; also the ink test's slack
 _LETTER = (0.0, 0.0, 612.0, 792.0)
 _IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 _HYPHENS = (0x02, 0xFFFE)
@@ -425,7 +426,12 @@ class PdfiumDoc:
         rect, fsm = raw.FS_RECTF(), raw.FS_MATRIX()
         ox, oy = ctypes.c_double(), ctypes.c_double()
         frags, objects, modes, fonts, axes, sizes, hidden = [], {}, {}, {}, {}, {}, {}
-        advances = {}  # text object: (font handle, Tf, the char matrix's x scale), or None
+        # text object: (font handle, Tf, the char matrix's x scale, the widths of its font at Tf
+        # by char (None where pdfium has none), whether its text runs along an axis), or None
+        advances = {}
+        # font address: (base font name, {Tf: {char: width or None}}); a page's fonts live while
+        # it is open, so their addresses are theirs for the page
+        fontinfo = {}
         tl, tr, tb, tt = (ctypes.c_double() for _ in range(4))
         glyph = ctypes.c_float()
         checked = set()  # text objects whose second char was looked at for a vertical advance
@@ -491,7 +497,11 @@ class PdfiumDoc:
                 # the text matrix, render mode and font are the text object's: read once
                 objects[addr] = len(objects)
                 modes[addr] = raw.FPDFTextObj_GetTextRenderMode(handle) in (3, 7) if handle else False
-                fonts[addr] = self._font(handle)
+                font = raw.FPDFTextObj_GetFont(handle) if handle else None
+                info = fontinfo.get(_address(font))
+                if info is None:
+                    info = fontinfo[_address(font)] = (self._font(font), {})
+                fonts[addr] = info[0]
                 hidden[addr] = "ocg" if marks and handle and _oc_marked(handle) else ""
                 fs = raw.FPDFText_GetFontSize(tp, at)
                 if raw.FPDFText_GetMatrix(tp, at, fsm) and _finite(fsm.a, fsm.b, fsm.c, fsm.d):
@@ -502,9 +512,9 @@ class PdfiumDoc:
                     # scale native multiplies Tf by (equal to native's sqrt|det| for any matrix
                     # whose x and y scales agree, Tz or not)
                     scale = math.hypot(fsm.c, fsm.d)
-                    font = raw.FPDFTextObj_GetFont(handle) if handle else None
-                    advances[addr] = ((font, fs, math.hypot(fsm.a, fsm.b))
-                                      if font and _finite(fs) and fs > 0 else None)
+                    advances[addr] = ((font, fs, math.hypot(fsm.a, fsm.b), info[1].setdefault(fs, {}),
+                                       abs(dx) < 1e-6 or abs(dy) < 1e-6)
+                                      if font and math.isfinite(fs) and fs > 0 else None)
                 else:
                     axes[addr] = (1.0, 0.0, 0.0, 1.0)
                     scale = 1.0
@@ -519,8 +529,9 @@ class PdfiumDoc:
             size = sizes[addr]
             # a char at the origin of the one before, in its text object: the next char of a
             # ligature glyph ("fi" from one code), which stays in the run
-            ligature = (run is not None and run["addr"] == addr and run["last"] is not None
-                        and abs(x - run["last"][0]) <= 1e-3 and abs(y - run["last"][1]) <= 1e-3)
+            last = run["last"] if run is not None and run["addr"] == addr else None
+            ligature = (last is not None and -1e-3 <= x - last[0] <= 1e-3
+                        and -1e-3 <= y - last[1] <= 1e-3)
             if (run is not None and run["addr"] == addr and len(run["text"]) == 1
                     and addr not in checked and not ligature):
                 checked.add(addr)
@@ -550,18 +561,25 @@ class PdfiumDoc:
             start = x * dx + y * dy
             end = (right * dx if dx >= 0 else left * dx) + (top * dy if dy >= 0 else bottom * dy)
             adv = advances[addr]
-            if (adv is not None and not ligature and addr not in upright and end > start
-                    and c <= 0xFFFF and c not in _HYPHENS):
-                straight = abs(dx) < 1e-6 or abs(dy) < 1e-6
-                if straight:
-                    ink = (raw.FPDFText_GetCharBox(tp, at, tl, tr, tb, tt)
-                           and (tr.value * dx if dx >= 0 else tl.value * dx)
-                           + (tt.value * dy if dy >= 0 else tb.value * dy) >= end - 1e-3)
-                if ((not straight or ink)
-                        and raw.FPDFFont_GetGlyphWidth(adv[0], c, adv[1], ctypes.byref(glyph))
-                        and _finite(glyph.value)):
-                    width = glyph.value * adv[2]
-                    if (ADVANCE_FLOOR * (end - start) if straight else 0.0) < width < end - start:
+            if adv is not None and not ligature and end > start and addr not in upright:
+                font_width = adv[3].get(c, False)
+                if font_width is False:
+                    font_width = (glyph.value if c <= 0xFFFF and c not in _HYPHENS
+                                  and raw.FPDFFont_GetGlyphWidth(adv[0], c, adv[1], ctypes.byref(glyph))
+                                  and math.isfinite(glyph.value) else None)
+                    adv[3][c] = font_width
+                if font_width is not None:
+                    width = font_width * adv[2]
+                    straight = adv[4]
+                    # the tight box is read only for a width narrower than the box: most glyphs'
+                    # loose box is their advance, which their font width fills to float rounding
+                    if ((ADVANCE_FLOOR * (end - start) if straight else 0.0) < width
+                            < end - start - _ROUNDING
+                            and (not straight or (
+                                raw.FPDFText_GetCharBox(tp, at, tl, tr, tb, tt)
+                                and (tr.value * dx if dx >= 0 else tl.value * dx)
+                                + (tt.value * dy if dy >= 0 else tb.value * dy)
+                                >= end - _ROUNDING))):
                         end = start + width
             base = x * ux + y * uy
             if ligature:
@@ -610,10 +628,8 @@ class PdfiumDoc:
                         hidden=run["hidden"], vertical=run["vertical"])
 
     @staticmethod
-    def _font(handle) -> str:
-        if not handle:
-            return ""
-        font = raw.FPDFTextObj_GetFont(handle)
+    def _font(font) -> str:
+        """The base font name of a font handle, its subset tag stripped."""
         if not font:
             return ""
         n = raw.FPDFFont_GetBaseFontName(font, None, 0)

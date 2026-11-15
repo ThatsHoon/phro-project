@@ -41,7 +41,7 @@ def run(data, **opts):
     hidden, engine (pdfium) and native_fails."""
     arg = json.dumps({"patch": opts.get("patch", {}), "pages": opts.get("pages"),
                       "hidden": bool(opts.get("hidden")), "engine": opts.get("engine"),
-                      "native_fails": bool(opts.get("native_fails"))})
+                      "native_fails": bool(opts.get("native_fails")), "count": opts.get("count")})
     r = subprocess.run([str(PY), "-I", "-X", "utf8", str(RUN), arg], input=data,
                        capture_output=True, timeout=300)
     err = r.stderr.decode("utf-8", "replace")
@@ -418,6 +418,20 @@ def test_pdfium_angled_text():
     for md in _both(simple_pdf([b" ".join(ops)])):
         for word in ("MOST", "IN-DEMAND", "ENGINEERING"):
             assert word in md, (word, md)
+
+
+def test_pdfium_advance_calls():
+    # 30 lines of plain Helvetica with no glyph narrower than its loose box (pdfium's stand-in
+    # font overhangs only a few, such as r): the tight box is not read, and the font's width is
+    # asked once per char, font and size, not once per glyph
+    lines = [text_ops("Quick lazy dogs vex a big town %d" % k, 72, 760 - 20 * k)
+             for k in range(30)]
+    got = run(simple_pdf([b" ".join(lines)]),
+              count=["FPDFText_GetCharBox", "FPDFFont_GetGlyphWidth"])
+    assert "Quick lazy dogs vex a big town 29" in got["md"], got["md"]
+    distinct = len(set("Quick lazy dogs vex a big town 0123456789"))
+    assert got["calls"]["FPDFText_GetCharBox"] <= 30, got["calls"]
+    assert got["calls"]["FPDFFont_GetGlyphWidth"] <= distinct, got["calls"]
 
 
 def test_pdfium_pages_range():

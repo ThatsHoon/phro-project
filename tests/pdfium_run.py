@@ -11,6 +11,7 @@ or {"error": [kind, detail]} on a ReadError.
 Two measurements (test_reader_pdf.py measure) print one other line and nothing else: "measure":
 "tables" runs each page's PageData through pdf_tables.tables alone, {"tables": [pages, seconds]};
 "measure": "convert" times parse_bytes alone, {"convert": [pages read, seconds, skipped]}.
+"count": [pdfium function names] counts each named pypdfium2.raw call, as "calls": {name: n}.
 """
 import os
 import sys
@@ -103,6 +104,16 @@ def main():
             super().__init__(*a, **k)
 
     pdf_pdfium.PdfiumDoc = _Seen
+    calls = {}
+    for name in opts.get("count") or ():
+        fn = getattr(pdf_pdfium.raw, name)
+
+        def counted(*a, _fn=fn, _name=name):
+            calls[_name] += 1
+            return _fn(*a)
+
+        calls[name] = 0
+        setattr(pdf_pdfium.raw, name, counted)
     pages = opts.get("pages")
     ctx = Context()
     if opts.get("measure") == "tables":
@@ -132,7 +143,8 @@ def main():
     print(json.dumps({"md": text, "skipped": dict(ctx.skipped), "meta": doc.meta, "assets": assets,
                       "modules": sorted(sys.modules), "engine_id": pdfenv.engine_id_from_module(),
                       "decoded": [getattr(d, "decoded", None) for d in made],
-                      "closed": [getattr(d, "_pdf", None) is None for d in made]}, ensure_ascii=False))
+                      "closed": [getattr(d, "_pdf", None) is None for d in made],
+                      "calls": calls}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
