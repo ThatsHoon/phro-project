@@ -1,6 +1,7 @@
 """The one Markdown renderer: every output format and token rule lives here."""
 import collections
 import re
+import secrets
 from bisect import bisect_left, bisect_right
 from pathlib import Path
 
@@ -16,8 +17,10 @@ _PAGE_ONLY = re.compile(r"^[\s\-–—]*(page\s*)?\d+(\s*(of|/)\s*\d+)?\s*(쪽)?
 _LINE_START = re.compile(r"^(#|>|[-*+] |\d+\. )")
 _HIDDEN_LINE = re.compile(r"^\((\d+) hidden places left out\)$")
 _TRUNC = "(output truncated at 20 MB)"
-# starts each page head while the document renders, so render() knows the lines it wrote (stats counts those
-# alone, so a "## Page N" line inside a comment is not a page); removed before the text is returned
+# with a random tail drawn per render (_Render.head_mark), starts each page head while the document renders,
+# so render() knows the lines it wrote (stats counts those alone, so a "## Page N" line inside a comment is
+# not a page); removed before the text is returned. The tail keeps the document's own text from matching it:
+# a U+10FFFD there stays as it is and never passes for a head
 _HEAD_MARK = "\U0010fffd"
 _PAGE_HEAD = re.compile(r"^## Page (\d+)(?::|$)")
 
@@ -146,7 +149,8 @@ class _Render:
         self.lost = lost(skipped or {})
         self.empty = True  # nothing but status lines was rendered
         self.hidden_count = 0
-        self.page_heads = 0  # page heads written, each starting with _HEAD_MARK
+        self.page_heads = 0  # page heads written, each starting with head_mark
+        self.head_mark = _HEAD_MARK + secrets.token_hex(8) + _HEAD_MARK
         self.depth = 0
         self.too_deep = 0  # subtrees left out for nesting past MAX_DEPTH
         self.note_no: dict[str, int] = {}
@@ -366,7 +370,7 @@ class _Render:
             head = f"## Page: {s.title}"
         if head and s.kind == "page":
             self.page_heads += 1
-            out.append(("h", _HEAD_MARK + head + tag))
+            out.append(("h", self.head_mark + head + tag))
         elif head:
             out.append(("h", head + tag))
         out.extend(self.blocks(s.blocks))
@@ -691,7 +695,7 @@ class _Render:
                 hf.append(f"{label}: " + " | ".join(kept))
         self.empty = not text and not hf and not self.unviewable
         if self.doc.title.strip():
-            first = pieces[0][1].replace(_HEAD_MARK, "") if pieces else ""
+            first = pieces[0][1].replace(self.head_mark, "") if pieces else ""
             first = _plain(re.sub(r"^#+\s*", "", first).replace("**", ""))
             if first != _plain(self.doc.title):
                 top.append("# " + self.doc.title.strip())
@@ -769,7 +773,7 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     `skipped` is the parse context's skip counter; what it says was lost becomes a "(could not read: ...)" line.
     A dict passed as `info` receives "unread" (that line's items), "lost" (the counted ones among them), "empty" (no content rendered at all),
     "images" (how many viewable images the output links to) and "pages" (the line numbers of the page heads it wrote, for stats; None
-    when it wrote none, or the document's own text holds _HEAD_MARK).
+    when it wrote none, or a head did not survive to the output).
     """
     r = _Render(doc, Path(assets_dir), hidden, skipped)
     text = r.body()
@@ -781,9 +785,9 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     text = _normalize(text)  # rebound, so the raw text is not held while _cap runs
     pages = None
     if r.page_heads:
-        if text.count(_HEAD_MARK) == r.page_heads:  # else the document's own text holds the mark
-            pages = [i for i, ln in enumerate(text.splitlines(), 1) if ln.startswith(_HEAD_MARK)]
-        text = text.replace(_HEAD_MARK, "")
+        if text.count(r.head_mark) == r.page_heads:  # else a head was cut or rewritten on its way out
+            pages = [i for i, ln in enumerate(text.splitlines(), 1) if ln.startswith(r.head_mark)]
+        text = text.replace(r.head_mark, "")
     md = _cap(text)
     if info is not None:
         info.update(unread=r.unread, lost=r.lost, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked),

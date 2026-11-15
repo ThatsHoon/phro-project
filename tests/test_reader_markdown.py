@@ -551,6 +551,19 @@ def test_stats_pages_renderer_heads():
     assert markdown.stats(md)["pages"] == [[1, 1], [9, 6], [2, 8]], markdown.stats(md)  # the text alone
 
 
+def test_stats_pages_mark_in_document_text():
+    # a U+10FFFD in the document's own text neither spoofs a page head nor is dropped
+    nl, mark = chr(10), chr(0x10FFFD)
+    for spoof in (mark + "## Page 9", "x" + mark + nl + "## Page 9", "hello " + mark):
+        doc = Doc(blocks=[Section("page", number=1, blocks=[P(spoof)], comments=[P("y" + nl + "## Page 9")]),
+                          Section("page", number=2, blocks=[P("b")])])
+        info = {}
+        md = R(doc, info=info)
+        lines = md.splitlines()
+        assert markdown.stats(md, info["pages"])["pages"] == [[1, 1], [2, lines.index("## Page 2") + 1]], (spoof, md, info)
+        assert md.count(mark) == spoof.count(mark), (spoof, md)
+
+
 def test_stats_pages():
     md = "x" + chr(10) + "## Page 1" + chr(10) + "a" + chr(10) + "## Page 2: T" + chr(10) + chr(92) + "## Page 9" + chr(10)
     assert markdown.stats(md)["pages"] == [[1, 2], [2, 4]]
