@@ -78,8 +78,9 @@ def test_packed_f32_f64_ref_one():
     assert pbwire.ref(pb_ref(42)) == 42
     assert pbwire.ref(pb((2, 1))) is None
     assert pbwire.ref(pb((1, b"x"))) is None
+    assert pbwire.ref(pb((1, 3), (1, 4))) == 4
     f = pbwire.fields(pb((1, 5), (1, 6)))
-    assert pbwire.one(f, 1) == 5
+    assert pbwire.one(f, 1) == 6                           # a repeated singular field: the last value
     assert pbwire.one(f, 2) is None
     assert pbwire.one(f, 2, 9) == 9
 
@@ -298,9 +299,19 @@ def test_should_merge():
     patch = pb((1, 7), (2, "b"))
     store, ctx = _load([("Index/Document.iwa", iwa_member(archive(4, 12026, base, patch, merge=True)))])
     f = store.get(4)
-    assert f[1][-1] == 7                                   # a single field: the later value wins
+    assert pbwire.one(f, 1) == 7                           # a single field: the later value wins
     assert [bytes(v) for v in f[2]] == [b"a", b"b"]        # a repeated field grows
     assert store.objects[4] == (12026, base + patch)
+    # a singular sub-message merges field by field through msg
+    base = pb((1, 5), (3, pb((1, 1), (2, "x"))))
+    patch = pb((3, pb((1, 2), (3, "y"))))
+    store, ctx = _load([("Index/Document.iwa", iwa_member(archive(4, 12026, base, patch, merge=True)))])
+    f = store.get(4)
+    sub = pbwire.msg(f, 3)
+    assert pbwire.one(sub, 1) == 2 and sub[1] == [1, 2]
+    assert bytes(pbwire.one(sub, 2)) == b"x" and bytes(pbwire.one(sub, 3)) == b"y"
+    assert pbwire.one(f, 1) == 5 and pbwire.msg(f, 9) == {}
+    _raises(ValueError, pbwire.msg, f, 1)
     # without should_merge the later messages are ignored
     store, ctx = _load([("Index/Document.iwa", iwa_member(archive(4, 12026, base, patch)))])
     assert store.objects[4] == (12026, base) and not ctx.skipped
@@ -372,6 +383,13 @@ def test_iwa_objects_cap():
         iwork_iwa.IWA_OBJECTS = 2
         store, ctx = _load([("Index/Document.iwa", iwa_member(*(archive(i, 1, b"") for i in (1, 2, 3))))])
         assert sorted(store.objects) == [1, 2] and ctx.skipped["record"] == 1
+        # several archives past the cap, in this member and the next: the parse stops, counted once
+        store, ctx = _load([("Index/A.iwa", iwa_member(*(archive(i, 1, b"") for i in range(1, 8)))),
+                            ("Index/B.iwa", iwa_member(*(archive(i, 1, b"") for i in range(10, 15))))])
+        assert sorted(store.objects) == [1, 2] and ctx.skipped["record"] == 1
+        # exactly at the cap nothing is lost
+        store, ctx = _load([("Index/A.iwa", iwa_member(archive(1, 1, b""), archive(2, 1, b"")))])
+        assert sorted(store.objects) == [1, 2] and not ctx.skipped
     finally:
         iwork_iwa.IWA_OBJECTS = old
 
@@ -395,6 +413,47 @@ def test_follow_self_cycle():
     calls = []
     store.follow([1], visit)
     assert len(calls) == limits.MAX_DEPTH and ctx.skipped["depth"] == 1
+
+
+def test_follow_dag_repeat():
+    # 1 -> 2, 3; 2 -> 4; 3 -> 4: object 4 is reached twice, entered once, and no depth is counted
+    refs = {1: (2, 3), 2: (4,), 3: (4,), 4: ()}
+    member = iwa_member(*(archive(i, 1, pb(*((1, pb_ref(r)) for r in rs))) for i, rs in refs.items()))
+    store, ctx = _load([("Index/Document.iwa", member)])
+    calls = []
+
+    def visit(i, depth):
+        calls.append(i)
+        store.follow([pbwire.ref(v) for v in store.get(i).get(1, [])], visit, depth + 1)
+        return i
+
+    assert store.follow([1], visit) == [1]
+    assert calls == [1, 2, 4, 3] and not ctx.skipped
+
+
+def test_walk_that_raises():
+    def bad(store, ctx):
+        raise IndexError("broken table")
+
+    def good(store, ctx):
+        return Doc(blocks=[Para([Text("numbers")])])
+
+    old = dict(iwork_iwa.WALKS)
+    try:
+        iwork_iwa.WALKS.update({"pages": bad, "numbers": good})
+        doc, ctx = _read({"Index/Document.iwa": _doc_member()})
+        assert doc.blocks[0].inlines[0].text == "numbers" and ctx.skipped["document"] == 1
+        # with no other walk, the preview stands in, and the body is counted once
+        iwork_iwa.WALKS.pop("numbers")
+        doc, ctx = _read({"Index/Document.iwa": _doc_member(), "preview.jpg": JPG})
+        assert [b.data for b in doc.blocks] == [JPG] and ctx.skipped["document"] == 1
+        assert _kind({"Index/Document.iwa": _doc_member()}) == "damaged"
+        # a ReadError is never swallowed
+        iwork_iwa.WALKS["pages"] = lambda store, ctx: (_ for _ in ()).throw(ReadError("timeout", "walk"))
+        assert _kind({"Index/Document.iwa": _doc_member(), "preview.jpg": JPG}) == "timeout"
+    finally:
+        iwork_iwa.WALKS.clear()
+        iwork_iwa.WALKS.update(old)
 
 
 def test_iwa_budget_shared():

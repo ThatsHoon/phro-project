@@ -47,6 +47,7 @@ class Store:
         self.visited: set[int] = set()    # objects a walk has entered, each entered once a walk
         self._path: set[int] = set()      # objects on the walk's current path, to tell a cycle from a repeat
         self.image_bytes = 0
+        self.failed = 0                   # walks that raised, each counted `document` by walk()
 
     def _count(self, kind: str):
         self.ctx.skipped[kind] += 1
@@ -114,12 +115,13 @@ class Store:
         return out
 
 
-def _archives(stream: bytes, objects: dict) -> tuple[dict, int, int, int]:
-    """(new objects, unread past IWA_OBJECTS, merges with fields_to_remove, duplicates) of one unpacked member.
-    ValueError for broken structure; the caller then drops the whole member."""
+def _archives(stream: bytes, objects: dict) -> tuple[dict, bool, int, int]:
+    """(new objects, whether IWA_OBJECTS stopped the parse, merges with fields_to_remove, duplicates) of one
+    unpacked member. ValueError for broken structure; the caller then drops the whole member."""
     view = memoryview(stream)
     pending: dict[int, tuple[int, bytes]] = {}
-    dropped = merges = duplicates = 0
+    capped = False
+    merges = duplicates = 0
     pos, end = 0, len(view)
     while pos < end:
         n, pos = pbwire.varint(view, pos)
@@ -144,10 +146,10 @@ def _archives(stream: bytes, objects: dict) -> tuple[dict, int, int, int]:
             pos += length
         if not parts:
             continue
-        # the cap is checked before the object is stored
+        # the cap is checked before the object is stored; past it nothing more is parsed
         if len(objects) + len(pending) >= IWA_OBJECTS:
-            dropped += 1
-            continue
+            capped = True
+            break
         if ident in objects or ident in pending:
             duplicates += 1
             continue
@@ -158,7 +160,7 @@ def _archives(stream: bytes, objects: dict) -> tuple[dict, int, int, int]:
         else:
             payload = bytes(parts[0][1])
         pending[ident] = (parts[0][0], payload)
-    return pending, dropped, merges, duplicates
+    return pending, capped, merges, duplicates
 
 
 def _datas(store: Store, payload: bytes):
@@ -189,38 +191,49 @@ def _datas(store: Store, payload: bytes):
 def load(members: Iterable[tuple[str, bytes]], ctx, budget: flate.Budget, pkg, prefix: str = "") -> Store:
     """Every .iwa member of `members` into one store. Each is unpacked by `snappy.iwa` against the shared `budget`
     (past it: ReadError too_large, total); an LZVN, unreadable or broken member counts `document` and adds nothing.
-    `Metadata.iwa`'s PackageMetadata gives the data file names, read later from `pkg` under `prefix`."""
+    The first object past IWA_OBJECTS stops the load: the rest, later members included, are unread, counted
+    `record` once. `Metadata.iwa`'s PackageMetadata gives the data file names, read later from `pkg` under `prefix`."""
     store = Store(ctx, pkg, prefix)
     for name, data in members:
         if not name.lower().endswith(".iwa"):
             continue
         try:
             stream = snappy.iwa(data, budget)
-            found, dropped, merges, duplicates = _archives(stream, store.objects)
+            found, capped, merges, duplicates = _archives(stream, store.objects)
         except ValueError:  # snappy.Lzvn is one
             ctx.skipped["document"] += 1
             continue
         del stream
         store.objects.update(found)
-        for kind, n in (("record", dropped), ("merge", merges), ("duplicate", duplicates)):
+        for kind, n in (("merge", merges), ("duplicate", duplicates)):
             if n:
                 ctx.skipped[kind] += n
         if posixpath.basename(name).lower() == "metadata.iwa" and not store.datas:
             meta = next((p for t, p in found.values() if t == PACKAGE_METADATA), None)
             if meta is not None:
                 _datas(store, meta)
+        if capped:
+            ctx.skipped["record"] += 1
+            break
     return store
 
 
 def walk(store: Store, app: str, ctx) -> Doc | None:
     """The document from `WALKS[app]`, else from the other two apps' walks in turn (a renamed file still reads);
-    None when no walk finds its root."""
+    None when no walk finds its root. A walk that raises (a ReadError excepted) counts `document` under
+    `ctx.guard`, adds one to `store.failed`, and the next app is tried."""
     for name in (app,) + tuple(a for a in APPS if a != app):
         fn = WALKS.get(name)
         if fn is None:
             continue
         store.visited.clear()
-        doc = fn(store, ctx)
-        if doc is not None:
+        store._path.clear()
+        doc, failed = None, True
+        with ctx.guard("document"):
+            doc = fn(store, ctx)
+            failed = False
+        if failed:
+            store.failed += 1
+        elif doc is not None:
             return doc
     return None

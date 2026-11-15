@@ -83,12 +83,25 @@ def f64(b) -> float:
 
 
 def ref(b) -> int | None:
-    """The target id of a TSP.Reference (its field 1), or None."""
+    """The target id of a TSP.Reference (its field 1, the last value as for any singular field), or None."""
     v = fields(b).get(1)
-    return v[0] if v and isinstance(v[0], int) else None
+    return v[-1] if v and isinstance(v[-1], int) else None
 
 
 def one(f: dict, n: int, default=None):
-    """The first value of field n, or default."""
+    """The value of singular field n, or default. A field the wire repeats (a merged message) takes its last
+    value, as protobuf parses it."""
     v = f.get(n)
-    return v[0] if v else default
+    return v[-1] if v else default
+
+
+def msg(f: dict, n: int) -> dict:
+    """Singular sub-message field n as `fields`, {} when absent. Every occurrence is joined before parsing, which is
+    protobuf's merge of an embedded message (its own singular fields take the later value, repeated ones grow).
+    ValueError when an occurrence is not length-delimited."""
+    v = f.get(n)
+    if not v:
+        return {}
+    if not all(isinstance(x, memoryview) for x in v):  # wire 2 only; wire 1 and 5 give bytes
+        raise ValueError(f"protobuf field {n} is not a message")
+    return fields(b"".join(bytes(x) for x in v))

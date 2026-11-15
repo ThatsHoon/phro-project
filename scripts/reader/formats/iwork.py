@@ -80,13 +80,14 @@ def _nested(pkg) -> str | None:
     return found[0] if found else None
 
 
-def _iwa(pkg, names: list, nested: str | None, prefix: str, app: str, ctx) -> Doc | None:
+def _iwa(pkg, names: list, nested: str | None, prefix: str, app: str, ctx) -> tuple[Doc | None, bool]:
+    """(the walked document or None, whether a walk raised and was already counted `document`)."""
     budget = flate.Budget(iwork_iwa.IWA_BYTES)  # one budget for every member's Snappy output
     if names:
         store = iwork_iwa.load(_members(pkg, names, ctx), ctx, budget, pkg)
-        return iwork_iwa.walk(store, app, ctx)
+        return iwork_iwa.walk(store, app, ctx), store.failed > 0
     if nested is None:
-        return None
+        return None, False
     with _open(iwork_iwa.read_member(pkg, nested)) as inner:
         if _locked(inner.names):
             raise ReadError("encrypted", "iWork password")
@@ -95,11 +96,12 @@ def _iwa(pkg, names: list, nested: str | None, prefix: str, app: str, ctx) -> Do
             ctx.skipped["document"] += deeper  # an Index.zip inside the index is never opened
         names = [n for n in inner.names if n.lower().endswith(".iwa")]
         store = iwork_iwa.load(_members(inner, names, ctx), ctx, budget, pkg, prefix=prefix)
-    return iwork_iwa.walk(store, app, ctx)
+    return iwork_iwa.walk(store, app, ctx), store.failed > 0
 
 
-def _preview(pkg, prefix: str, doc: Doc | None, failure: ReadError | None, ctx) -> Doc:
-    """The preview picture as the only block, counted `document`; `damaged` when there is none."""
+def _preview(pkg, prefix: str, doc: Doc | None, failure: ReadError | None, counted: bool, ctx) -> Doc:
+    """The preview picture as the only block, counted `document` unless a failed walk already counted the body;
+    `damaged` when there is none."""
     names = ["preview.jpg"] + ([prefix + "preview.jpg"] if prefix else []) + [THUMBNAIL]
     for name in names:
         if not pkg.has(name) or pkg.size(name) > limits.IMAGE_BYTES:
@@ -114,7 +116,8 @@ def _preview(pkg, prefix: str, doc: Doc | None, failure: ReadError | None, ctx) 
             continue
         doc = doc if doc is not None else Doc()
         doc.blocks = [Image(data)]
-        ctx.skipped["document"] += 1
+        if not counted:
+            ctx.skipped["document"] += 1
         return doc
     raise failure or ReadError("damaged", "no readable iWork part and no preview")
 
@@ -126,16 +129,19 @@ def _read(pkg, ctx, app: str) -> Doc:
     iwas = [] if index else [n for n in pkg.names if n.lower().startswith("index/") and n.lower().endswith(".iwa")]
     nested = None if index or iwas else _nested(pkg)
     prefix = nested[:-len(NESTED)] if nested else ""
-    doc, failure = None, None
+    doc, failure, counted = None, None, False
     try:
-        doc = _xml(pkg, index, app, ctx) if index else _iwa(pkg, iwas, nested, prefix, app, ctx)
+        if index:
+            doc = _xml(pkg, index, app, ctx)
+        else:
+            doc, counted = _iwa(pkg, iwas, nested, prefix, app, ctx)
     except ReadError as e:
         if e.kind != "damaged":
             raise
         failure = e
     if doc is not None and doc.blocks:
         return doc
-    return _preview(pkg, prefix, doc, failure, ctx)
+    return _preview(pkg, prefix, doc, failure, counted, ctx)
 
 
 def parse_bytes(data: bytes, ctx, app: str) -> Doc:
