@@ -10,15 +10,15 @@ import heapq
 from bisect import bisect_left, bisect_right, insort
 
 from .. import limits
-from ..model import Bold, Break, Cell, Link, Para, Table, Text
+from ..model import Bold, Break, Cell, Hidden, Link, Para, Table, Text
 
 _GAP = 64            # empty rows kept between two rows that hold values
 _MERGES = 100_000    # merged ranges one sheet may keep
 
 
 def _chars(value) -> int:
-    """The characters a cell value is charged: a str's length; for inlines, every Text inside (Link and Bold
-    contents included) plus each Link URL's length."""
+    """The characters a cell value is charged: a str's length; for inlines, every Text inside (Link, Bold and
+    Hidden contents included) plus each Link URL's length."""
     if isinstance(value, str):
         return len(value)
     n, stack = 0, [value]
@@ -29,7 +29,7 @@ def _chars(value) -> int:
             elif isinstance(x, Link):
                 n += len(x.url)
                 stack.append(x.inlines)
-            elif isinstance(x, Bold):
+            elif isinstance(x, (Bold, Hidden)):
                 stack.append(x.inlines)
     return n
 
@@ -171,8 +171,8 @@ class Grid:
         return False
 
     def put(self, row: int, col: int, value) -> bool:
-        """Put a str, or a list of inlines (Text, Break, Bold, Link, NoteRef), at a cell. A value put over another
-        replaces it, and the replaced value's cell and characters are refunded."""
+        """Put a str, or a list of inlines (Text, Break, Bold, Link, NoteRef, Hidden), at a cell. A value put over
+        another replaces it, and the replaced value's cell and characters are refunded."""
         if self.cut:
             return False
         if not value or row < 0 or col < 0:

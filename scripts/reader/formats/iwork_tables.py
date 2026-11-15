@@ -20,8 +20,9 @@ pre-BNC pair 3 and 4 is read only when 6 and 7 are absent. A cell is version 5 (
 values in numbers-parser's order) or version 4, read as docling reads it.
 
 Changes: rows are never allocated from a declared count (the model's 6 and 7 are not read); every value goes to
-`sheet_grid.Grid`, whose caps stop the table, with `SHEET_SCAN` charged per unpacked cell; value lists, tiles and
-header buckets are read once a document by id. Display follows the spec's table (decision 10): a number through its
+`sheet_grid.Grid`, whose caps stop the table, with `SHEET_SCAN` charged per unpacked cell; value lists, rich text
+payloads, tiles and header buckets are read once a document by id, a tileid given twice keeps its last tile, a tile
+is walked once a table and a row's offsets at most SHEET_COLS wide. Display follows the spec's table (decision 10): a number through its
 format's Excel code (`format_code`, then `numfmt.display`), a date as the serial `36892 + s / 86400`, a duration as
 `[h]:mm:ss`, a bool TRUE or FALSE, a formula error `#ERROR`; a format type numbers-parser renders otherwise (fraction,
 scientific, base, rating, custom) shows the raw value. A cell comment becomes a footnote through the text reader's
@@ -41,8 +42,8 @@ from .iwork_text import ref, refs
 TABLE_SEGMENTS = 100_000   # segments of one value table, with a visited set; the rest unread, counted `cells`
 TILE_SIZE, TILE_SIZE_MAX = 256, 65_536  # the tile size when absent, and the largest one read (1 at least)
 
-TABLE_INFO, PAGES_TABLE_INFO, MODEL, TILE, DATA_LIST, HEADERS, MERGES, RICH_PAYLOAD = (
-    6000, 6007, 6001, 6002, 6005, 6006, 6144, 6218)
+TABLE_INFO, PAGES_TABLE_INFO, MODEL, TILE, DATA_LIST, HEADERS, SEGMENT, MERGES, RICH_PAYLOAD = (
+    6000, 6007, 6001, 6002, 6005, 6006, 6011, 6144, 6218)
 
 # cell types (byte 1 of a packed cell)
 NUMBER, TEXT, DATE, BOOL, DURATION, ERROR, RICH, CURRENCY = 2, 3, 5, 6, 7, 8, 9, 10
@@ -71,6 +72,11 @@ _ICU = {"yyyy": "yyyy", "yy": "yy", "MMMM": "mmmm", "MMM": "mmm", "MM": "mm", "M
         "a": "AM/PM"}
 _SIGN = bytes(1 if b < 0x80 else 0 for b in range(256))  # high byte of an int16: 1 where the value is not negative
 _BROKEN = object()  # a cached part whose bytes could not be read
+_LOST = object()  # a cell's string or rich key that its list does not hold
+
+
+class _Cut(dict):
+    """A value list read only up to TABLE_SEGMENTS: a key it lacks is already counted `cells`."""
 
 
 def _str(v) -> str | None:
@@ -285,23 +291,24 @@ class _Reader:
         main = self.store.get(lid, DATA_LIST)
         if main is None:
             return {}
-        parts, seen = [main], {lid}
+        parts, seen, cut = [main], {lid}, False
         for s in refs(main, 4):
             if s in seen:
                 continue
             if len(seen) > TABLE_SEGMENTS:
                 self.ctx.skipped["cells"] += 1
+                cut = True
                 break
             seen.add(s)
             try:
-                f = self.store.get(s)
+                f = self.store.get(s, SEGMENT)
             except ValueError:
                 self.ctx.skipped["record"] += 1
                 continue
             if f:
                 parts.append(f)
         decode = getattr(self, "_" + kind)
-        out = {}
+        out = _Cut() if cut else {}
         for f in parts:
             for e in f.get(3, []):
                 if not isinstance(e, memoryview):
@@ -321,9 +328,20 @@ class _Reader:
         return _str(pbwire.one(ef, 3))
 
     def _rich(self, ef):
-        """A rich text entry: 9 -> TST.RichTextPayloadArchive (6218) 1 -> the storage id."""
+        """A rich text entry: 9 -> TST.RichTextPayloadArchive (6218) 1 -> the storage id; each payload read once a
+        document, however many entries name it."""
         pid = ref(ef, 9)
-        payload = self.store.get(pid, RICH_PAYLOAD) if pid is not None else None
+        if pid is None:
+            return None
+        return self._cached(("rich_payload", pid), lambda: self._payload(pid))
+
+    def _payload(self, pid):
+        """The storage id a payload names; None for a missing one, or a broken one (counted `record` once)."""
+        try:
+            payload = self.store.get(pid, RICH_PAYLOAD)
+        except ValueError:
+            self.ctx.skipped["record"] += 1
+            return None
         return ref(payload, 1) if payload is not None else None
 
     @staticmethod
@@ -335,7 +353,9 @@ class _Reader:
         return pbwire.msg(ef, 6) or None
 
     def rows(self, tile_id) -> list:
-        """(tile_row_index, buffer, offsets, scale) of each row of a tile, by index; [] for a missing tile."""
+        """(tile_row_index, buffer, offsets, scale, over) of each row of a tile, by index; [] for a missing tile. A
+        row's offsets are cut at SHEET_COLS columns, so a row costs at most that many offsets however often its tile is
+        placed; `over` says a cell is present past the cut (found once, at C speed), and the table stops `columns`."""
         def read():
             f = self.store.get(tile_id, TILE)
             if f is None:
@@ -355,16 +375,18 @@ class _Reader:
                 if not isinstance(buf, memoryview) or not isinstance(offs, memoryview):
                     buf, offs, scale = pbwire.one(r, 3), pbwire.one(r, 4), 1
                 if isinstance(buf, memoryview) and isinstance(offs, memoryview):
-                    out.append((index, buf, offs, scale))
+                    cut = limits.SHEET_COLS * 2
+                    over = len(offs) > cut and bytes(offs[cut + 1::2]).translate(_SIGN).find(1) >= 0
+                    out.append((index, buf, offs[:cut], scale, over))
             out.sort(key=lambda x: x[0])
             return out
         return self._cached(("tile", tile_id), read)
 
     def hidden(self, bucket_ids, limit: int) -> set:
         """The indexes below `limit` that a nonzero hidingState hides, from TST.HeaderStorageBucket (6006)
-        {2 headers {1 index, 3 hidingState}} objects."""
+        {2 headers {1 index, 3 hidingState}} objects; a bucket named twice is joined once."""
         out = set()
-        for b in bucket_ids:
+        for b in dict.fromkeys(bucket_ids):
             out |= self._cached(("hidden", b, limit), lambda b=b: self._bucket(b, limit))
         return out
 
@@ -411,14 +433,14 @@ class _Reader:
         size = pbwire.one(tiles, 2, TILE_SIZE)
         if not isinstance(size, int) or not 1 <= size <= TILE_SIZE_MAX:
             raise ValueError(f"tile size {size!r}")
-        entries = []
+        by_tid: dict = {}  # a tileid given twice keeps its last tile, as a repeated protobuf key does
         for v in tiles.get(1, []):
             if isinstance(v, memoryview):
                 e = pbwire.fields(v)
                 tid, target = pbwire.one(e, 1), ref(e, 2)
                 if isinstance(tid, int) and target is not None:
-                    entries.append((tid, target))
-        entries.sort(key=lambda e: e[0])
+                    by_tid[tid] = target
+        entries = sorted(by_tid.items())
 
         grid = sheet_grid.Grid(name or "table", self.budget, self.ctx)
         for r in self.hidden(refs(pbwire.msg(ds, 1), 2), limits.SHEET_ROWS):
@@ -461,8 +483,16 @@ class _Reader:
     def _cells(self, grid, entries, size, strings, rich, comments, formats, marks):
         store, cap = self.store, limits.SHEET_SCAN
         codes: dict = {}
+        walked: set = set()  # a tile placed under two tileids is read at the first only, counted `record` once
+        repeated = False
         for tid, tile_id in entries:
-            for index, buf, offs, scale in self.rows(tile_id):
+            if tile_id in walked:
+                if not repeated:
+                    repeated = True
+                    self.ctx.skipped["record"] += 1
+                continue
+            walked.add(tile_id)
+            for index, buf, offs, scale, over in self.rows(tile_id):
                 row = tid * size + index
                 if row >= limits.SHEET_ROWS:
                     grid.stop("rows", limits.SHEET_ROWS)
@@ -477,6 +507,9 @@ class _Reader:
                         marks.setdefault((row, col), []).append(comment)
                     if value and not grid.put(row, col, value):
                         return  # the grid is cut
+                if over:  # a cell past SHEET_COLS, as Grid.put would stop on it
+                    grid.stop("columns", limits.SHEET_COLS)
+                    return
 
     def _cell(self, buf, start, strings, rich, comments, formats, codes):
         """(the displayed value or None, the comment storage id or None) of the cell at `start`."""
@@ -499,45 +532,63 @@ class _Reader:
             self.ctx.skipped["record"] += 1
             return None, None
         comment = comments.get(v["comment"]) if "comment" in v else None
+        value = self._value(v, ctype, strings, rich, formats, codes)
+        lost = value is _LOST or ("comment" in v and comment is None and not isinstance(comments, _Cut))
+        if value is _LOST:
+            value = None
+        if lost and version == 5:  # a key absent from its list, counted once a cell (v4 stays silent, as docling)
+            self.ctx.skipped["record"] += 1
+        return value, comment
 
-        def code(key):
-            """(format type, Excel code) of a format key, computed once a table; (None, None) without one."""
-            if key is None:
-                return None, None
-            if key not in codes:
-                f = formats.get(key)
-                codes[key] = (pbwire.one(f, 1), format_code(f)) if f is not None else (None, None)
-            return codes[key]
+    @staticmethod
+    def _code(key, formats, codes):
+        """(format type, Excel code) of a format key, computed once a table; (None, None) without one."""
+        if key is None:
+            return None, None
+        if key not in codes:
+            f = formats.get(key)
+            codes[key] = (pbwire.one(f, 1), format_code(f)) if f is not None else (None, None)
+        return codes[key]
 
+    def _value(self, v, ctype, strings, rich, formats, codes):
+        """The displayed value of an unpacked cell, None, or _LOST when its string or rich key is not in its list."""
         if ctype in (NUMBER, CURRENCY):
             number = v.get("decimal", v.get("double"))
             if number is None:
-                return None, comment
-            return _apply(_float(number), code(v.get("currency_format", v.get("number_format")))[1]), comment
+                return None
+            return _apply(_float(number), self._code(v.get("currency_format", v.get("number_format")), formats,
+                                                     codes)[1])
         if ctype == TEXT:
-            return strings.get(v.get("string")), comment
+            if "string" not in v:
+                return None
+            got = strings.get(v["string"])
+            return _LOST if got is None and not isinstance(strings, _Cut) else got
         if ctype == RICH:
-            sid = rich.get(v.get("rich"))
-            return (list(self.rich_inlines(sid)) or None) if sid is not None else None, comment
+            if "rich" not in v:
+                return None
+            sid = rich.get(v["rich"])
+            if sid is None:
+                return None if isinstance(rich, _Cut) else _LOST
+            return list(self.rich_inlines(sid)) or None
         if ctype == DATE:
             s = v.get("seconds", v.get("double"))
             if s is None:
-                return None, comment
-            kind, c = code(v.get("date_format"))
+                return None
+            kind, c = self._code(v.get("date_format"), formats, codes)
             c = c if kind == F_DATE else ISO_DATE
             if c == ISO_DATE and s % 86400:
                 c = ISO_TIME
-            return display(EPOCH_SERIAL + s / 86400, c), comment
+            return display(EPOCH_SERIAL + s / 86400, c)
         if ctype == BOOL:
-            return ("TRUE" if (v.get("double") or 0) > 0 else "FALSE"), comment
+            return "TRUE" if (v.get("double") or 0) > 0 else "FALSE"
         if ctype == DURATION:
             s = v.get("double")
             if s is None:
-                return None, comment
-            return ("-" if s < 0 else "") + display(abs(s) / 86400, DURATION_CODE), comment
+                return None
+            return ("-" if s < 0 else "") + display(abs(s) / 86400, DURATION_CODE)
         if ctype == ERROR:
-            return ERROR_TEXT, comment
-        return None, comment  # empty (0) or a type not displayed
+            return ERROR_TEXT
+        return None  # empty (0) or a type not displayed
 
     def _place(self, grid, marks):
         """Each cell comment as a footnote mark after its cell's value (`Grid.append`, which works on a cut grid), or

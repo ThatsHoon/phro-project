@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
 from reader.formats.sheet_grid import Budget, Grid, text_inlines  # noqa: E402
-from reader.model import Break, Context, Doc, Link, NoteRef, Para, Table, Text  # noqa: E402
+from reader.model import Bold, Break, Context, Doc, Hidden, Link, NoteRef, Para, Table, Text  # noqa: E402
 
 
 def mk(name="S", budget=None):
@@ -351,6 +351,17 @@ def test_inline_charge():
     g, _ = mk("S", b)
     assert g.put(0, 0, [Link("u" * 4, [Text("abcd")])])
     assert b.chars == 4 and b.cells == 9, (b.chars, b.cells)
+
+
+def test_hidden_charge():
+    # hidden inlines (deleted text) are charged like the text around them
+    b = Budget(cells=10, chars=12)
+    g, _ = mk("S", b)
+    assert g.put(0, 0, [Text("ab"), Hidden([Bold([Text("cdef")])], "deleted")])
+    assert b.chars == 6, b.chars
+    g, ctx = mk("S", Budget(chars=5))
+    assert not g.put(0, 0, [Text("ab"), Hidden([Text("cdef")], "deleted")])
+    assert "sheet S cut at 5 characters" in ctx.warnings, ctx.warnings
 
 
 def test_replace_refunds():

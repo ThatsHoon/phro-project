@@ -15,7 +15,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from iwork_fix import (SECTION, archive, attachment, author, cell_v4, cell_v5, change, chunk, comment,  # noqa: E402
-                       decimal128_bytes, fmt, footnote, group, highlight, image, iwa_member, iwork_zip, link,
+                       data_list, decimal128_bytes, fmt, footnote, group, highlight, image, iwa_member, iwork_zip, link,
                        list_style, metadata_iwa, numbers_doc, pages_doc, pb, pb_ref, segment, shape, snappy_copy,
                        snappy_literal, sticky, storage, string_entry, style, table, tile)
 from reader import markdown  # noqa: E402
@@ -911,6 +911,7 @@ def test_v5_each_type():
     assert seen[(0, 3)] == [Link("https://example.com", [Text("see site")])], seen[(0, 3)]
     assert not ctx.skipped, ctx.skipped
     assert iwork_tables.decimal128(decimal128_bytes("-0.125")) == iwork_tables.Decimal("-0.125")
+    assert iwork_tables.decimal128(decimal128_bytes("0")) == 0 and iwork_tables.decimal128(b"\0" * 16) == 0
     assert iwork_tables.decimal128(decimal128_bytes("12345678901234567890123456789012")) == \
         iwork_tables.Decimal("12345678901234567890123456789012")
     _raises(ValueError, iwork_tables.decimal128, b"\0" * 15 + b"\x78")  # infinity / NaN
@@ -1102,7 +1103,7 @@ def test_numbers_sheet_and_table_failures():
 
 def test_broken_shared_parts():
     # one broken string list named by two tables: each table fails (`table`), the list is parsed once
-    shared = archive(5001, 6005, b"	ab")  # field 3 runs past the message
+    shared = archive(5001, 6005, b"\x1a\tab")  # field 3 claims 9 bytes and 2 follow
     a = table("A", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, string_list=5001, id=600)
     b = table("B", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, string_list=5001, id=800)
     parses = []
@@ -1128,9 +1129,10 @@ def test_broken_shared_parts():
     # a broken rich text storage leaves its cell empty (`record`); the table is kept
     cells = [cell_v5(9, rich_id=1), _text_cell(1)]
     doc, ctx = _numbers(*table("T", 1, 2, tiles={0: tile({0: cells})}, strings=[(1, "kept")], rich=[(1, 700)]),
-                        archive(700, 2001, b"	ab"))
+                        archive(700, 2001, b"\x1a\tab"))
     [tab] = _tables(doc)
-    assert [c.blocks for c in tab.rows[0]] == [[Para([Text("kept")])]] and ctx.skipped == {"record": 1},         (tab.rows, ctx.skipped)
+    assert [c.blocks for c in tab.rows[0]] == [[Para([Text("kept")])]], tab.rows
+    assert ctx.skipped == {"record": 1}, ctx.skipped
 
 
 def test_pages_table():
@@ -1167,6 +1169,144 @@ def test_table_linear():
     [tab] = _tables(doc)
     assert len(tab.rows) == n_rows and all(len(r) == n_cols for r in tab.rows) and not ctx.skipped, ctx.skipped
     assert took < 3, took
+
+
+def _tiled(entries, tiles, strings=(), *, size=1, row_buckets=None, rich_list=None, extra=()):
+    """Table 600 whose TileStorage lists `entries` ((tileid, tile object id)) over `tiles` ({object id: tile
+    payload}), tile size `size`, strings ((key, text)) in list 602, the row headers naming `row_buckets`, and the
+    rich text list `rich_list` (an id the caller adds in `extra`)."""
+    ent = [(1, pb((1, tid), (2, pb_ref(t)))) for tid, t in entries]
+    heads = [(1, pb((1, 1), *((2, pb_ref(b)) for b in row_buckets)))] if row_buckets else []
+    rich = [(17, pb_ref(rich_list))] if rich_list is not None else []
+    ds = pb(*heads, (3, pb(*ent, (2, size))), (4, pb_ref(602)), *rich)
+    return [archive(600, 6000, pb((1, b""), (2, pb_ref(601)))), archive(601, 6001, pb((4, ds), (8, "T"))),
+            data_list(602, [string_entry(k, t) for k, t in strings]),
+            *(archive(i, 6002, t) for i, t in tiles.items()), *extra]
+
+
+def _empty_rows(n_rows, n_cols):
+    """A tile payload of `n_rows` rows, each `n_cols` empty offsets."""
+    offs = struct.pack(f"<{n_cols}h", *([-1] * n_cols))
+    return pb(*((5, pb((1, i), (6, b"x"), (7, offs))) for i in range(n_rows)))
+
+
+def test_duplicate_tile_entries():
+    a, b = tile({0: [_text_cell(1)]}), tile({0: [_text_cell(2)]})
+    strings = [(1, "a"), (2, "b")]
+    # a tileid given twice keeps its last tile, as a repeated protobuf key does
+    with _puts() as seen:
+        doc, ctx = _numbers(*_tiled([(0, 620), (0, 621)], {620: a, 621: b}, strings))
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "b"} and not ctx.skipped, (seen, ctx.skipped)
+    # one tile under three tileids is read at the first only, counted `record` once
+    with _puts() as seen:
+        doc, ctx = _numbers(*_tiled([(0, 620), (1, 620), (2, 620)], {620: a}, strings))
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "a"}, seen
+    assert ctx.skipped == {"record": 1}, ctx.skipped
+    # thousands of entries on one tile of 100 rows of 1,000 empty offsets: the tile is walked once
+    tiles = {620: _empty_rows(100, 1000)}
+    for entries, skipped in (([(0, 620)] * 4000, {}), ([(i, 620) for i in range(4000)], {"record": 1})):
+        t0 = time.perf_counter()
+        doc, ctx = _numbers(*_tiled(entries, tiles, size=256))
+        took = time.perf_counter() - t0
+        assert took < 2 and _tables(doc) == [] and ctx.skipped == skipped, (took, ctx.skipped)
+
+
+def test_offsets_past_column_cap():
+    # a cell present past SHEET_COLS stops the table at its columns, though the offsets past the cap are not walked
+    cell = _text_cell(1)
+    offs = struct.pack("<1500h", *([0] + [-1] * 1199 + [0] + [-1] * 299))
+    row = pb((5, pb((1, 0), (6, cell), (7, offs))))
+    with _puts() as seen:
+        doc, ctx = _numbers(*_tiled([(0, 620)], {620: row}, [(1, "a")]))
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "a"}, seen
+    assert ctx.skipped == {"sheet_cut": 1} and "sheet T cut at 1000 columns" in ctx.warnings, ctx.warnings
+    # empty offsets past the cap are not a cut
+    offs = struct.pack("<1500h", *([0] + [-1] * 1499))
+    doc, ctx = _numbers(*_tiled([(0, 620)], {620: pb((5, pb((1, 0), (6, cell), (7, offs))))}, [(1, "a")]))
+    assert not ctx.skipped and len(_tables(doc)) == 1, ctx.skipped
+
+
+def test_duplicate_header_buckets():
+    # a bucket of 50,000 hidden rows named 4,000 times by the row headers is joined once
+    bucket = archive(630, 6006, pb((1, 1), *((2, pb((1, i), (3, 1))) for i in range(1, 50_001))))
+    rows = tile({0: [_text_cell(1)], 1: [_text_cell(1)], 2: [_text_cell(1)]})
+    joins = []
+    real = iwork_tables._Reader._cached
+
+    def count(self, key, fn):
+        if key[0] == "hidden":
+            joins.append(key[1])
+        return real(self, key, fn)
+
+    iwork_tables._Reader._cached = count
+    t0 = time.perf_counter()
+    try:
+        doc, ctx = _numbers(*_tiled([(0, 620)], {620: rows}, [(1, "a")], size=256, row_buckets=[630] * 4000,
+                                    extra=[bucket]))
+    finally:
+        iwork_tables._Reader._cached = real
+    took = time.perf_counter() - t0
+    [tab] = _tables(doc)
+    assert took < 2 and joins == [630] and tab.hidden_rows == frozenset({1, 2}), (took, joins, tab.hidden_rows)
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_shared_rich_payload():
+    # 4,000 rich-list entries naming one payload padded with 50,000 fields: the payload is parsed once
+    n = 4000
+    payload = archive(640, 6218, pb((1, pb_ref(700)), *([(7, 1)] * 50_000)))
+    lst = archive(641, 6005, pb((1, 8), *((3, pb((1, k), (2, 1), (9, pb_ref(640)))) for k in range(1, n + 1))))
+    cells = [cell_v5(9, rich_id=1), cell_v5(9, rich_id=n)]
+    gets = []
+    real = iwork_iwa.Store.get
+
+    def get(self, id, type=None):
+        if id == 640:
+            gets.append(id)
+        return real(self, id, type)
+
+    iwork_iwa.Store.get = get
+    t0 = time.perf_counter()
+    try:
+        with _puts() as seen:
+            doc, ctx = _numbers(*_tiled([(0, 620)], {620: tile({0: cells})}, size=256, rich_list=641,
+                                        extra=[payload, lst, archive(700, 2001, storage("shared"))]))
+    finally:
+        iwork_iwa.Store.get = real
+    took = time.perf_counter() - t0
+    assert took < 2 and gets == [640], (took, len(gets))
+    assert [_flat(seen[(0, c)]) for c in range(2)] == ["shared", "shared"] and not ctx.skipped, ctx.skipped
+
+
+def test_deleted_text_in_cell_counts_chars():
+    # a rich cell keeps its deleted text as Hidden; that text counts toward SHEET_CHARS ("Keep stay" is 9 shown,
+    # "gone " 5 more)
+    marks = [change(100, 2), change(101, 1)]
+    body = archive(700, 2001, storage("Keep gone stay", deletions=[(5, 100), (10, None)],
+                                      insertions=[(0, 101), (5, None)]))
+    t = table("T", 1, 1, tiles={0: tile({0: [cell_v5(9, rich_id=1)]})}, rich=[(1, 700)])
+    with _limit(limits, "SHEET_CHARS", 14):
+        with _puts() as seen:
+            doc, ctx = _numbers(*t, body, *marks)
+    assert seen[(0, 0)] == [Text("Keep "), Hidden([Text("gone ")], "deleted"), Text("stay")], seen
+    assert not ctx.skipped, ctx.skipped
+    with _limit(limits, "SHEET_CHARS", 13):
+        doc, ctx = _numbers(*t, body, *marks)
+    assert ctx.skipped == {"sheet_cut": 1} and "sheet T cut at 13 characters" in ctx.warnings, ctx.warnings
+
+
+def test_v5_key_missing_from_list():
+    # a version 5 string, rich or comment key its list lacks counts `record` once a cell; version 4 stays silent
+    cells = [_text_cell(9), cell_v5(9, rich_id=9), cell_v5(3, string_id=1, comment_id=9),
+             cell_v5(3, string_id=9, comment_id=9), _text_cell(1)]
+    t = table("T", 1, len(cells), tiles={0: tile({0: cells})}, strings=[(1, "a")], rich=[(1, 700)],
+              comments=[(1, 900)])
+    with _puts() as seen:
+        doc, ctx = _numbers(*t, archive(700, 2001, storage("r")))
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 2): "a", (0, 4): "a"}, seen
+    assert ctx.skipped == {"record": 4}, ctx.skipped
+    doc, ctx = _numbers(*table("T", 1, 1, tiles={0: tile({0: [cell_v4(3, string_id=9)]})}, strings=[(1, "a")]))
+    assert not ctx.skipped, ctx.skipped
 
 
 def main():
