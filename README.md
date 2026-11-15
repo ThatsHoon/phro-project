@@ -476,11 +476,17 @@ Result against the routing pick on the bench corpus, one line per extension:
 - `pptx`: PASS (fidelity 0.861 against 0.680); text-only tokens are 2% over the pick, inside the bar.
 - `xlsx`: PASS (fidelity 0.714 against 0.705) after one fix: SmartArt anchored on a sheet was dropped without a count and is now read.
 - `xlsm`: PASS (fidelity 0.841 against 0.687). markitdown, the xlsx skill's command, read all three files; none of them holds VBA.
+- `pages`: PASS (fidelity 0.846 against 0.446). LibreOffice, the pick's first step, cannot open five of the ten files; the reader reads four of them, and the fifth is password-protected.
 - `epub`: MISS on tokens only; the bench counts linked images as viewed, text-only tokens are below the pick.
 - `hwpx`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
 - `odp`: MISS on tokens only; linked images are counted, text-only tokens are below the pick.
 - `ppsx`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
 - `pptm`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
+- `mobi`: MISS on tokens only, from linked images the pick does not give; text-only tokens are below the pick (73,294 against 73,412) and fidelity is above it (0.606 against 0.575).
+- `azw3`: MISS on tokens only, from linked images; text-only tokens are below the pick (177,379 against 179,313) and fidelity is above it (0.930 against 0.868).
+- `wpd`: MISS on tokens (96 against 76) on the one scored file, with fidelity 1.000 for both. The gap is the "(1 hidden places left out)" line for WordPerfect undo text, which the reader leaves out and counts, and two doubled spaces kept from the file.
+- `key`: MISS on tokens (129 against 95), all of it the `## Slide N:` heads. Fidelity is above the pick (0.857 against 0.771), since speaker notes and comments are read.
+- `numbers`: MISS on tokens (1.12 times the pick) and one failure; fidelity is above the pick (0.534 against 0.453). The token gap is one file whose eleven charts the reader reads as tables (0.924 against 0.534); without it tokens are 1.02 times the pick. The failure is a table whose cells hold only picture fills and no values: the reader neither shows nor counts it.
 - `pdf`: MISS for both engines, only on ten blank one-page test files. The pick shows each one as a white page image; the reader renders only scans and figures, so it gives nothing. Otherwise fidelity is above the pick (native 0.916, pdfium 0.915, against 0.839), and tokens with images opened are 0.41 and 0.46 of the pick's.
 - `ods`: MISS on fidelity (0.868 against 1.000), mostly a peer-agreement artifact on one public document.
 - `hwp`: MISS on fidelity (0.695 against 0.706) and tokens. The fidelity gap is peer agreement: the reader writes list paragraphs in table cells as marked items, where dochan and hwp-mcp both join them into one line without bullets, so their shared lines set the reference. Tokens: bitmaps become viewable PNGs and are counted, and tables with merged cells are HTML, which also puts text-only tokens above the pick.
