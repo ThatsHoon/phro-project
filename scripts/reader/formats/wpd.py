@@ -160,12 +160,15 @@ size or closing byte. A fixed group with a wrong closing byte resyncs as for WP6
 walk, counted `record`.
 
 LibreOffice switch (`_switch`). Mac WordPerfect and a headerless file the 4.2 check refuses are read through
-LibreOffice only when `PHRO_READER_SOFFICE` is set (`soffice`); else they are `unsupported`, the detail naming the
-switch. `_via_soffice` runs `soffice --headless --norestore -env:UserInstallation=<tmp>/profile --convert-to docx
---outdir <tmp> <file>` in a process group of its own, with CONVERT_SECONDS - elapsed - 3 seconds from the reader's
-start; past them the tree is killed (`_kill_tree`) and the read is a `timeout`. The docx it writes is read by
-`ooxml.parse`; none is `damaged`. The temporary folder is removed whatever happens.
+LibreOffice only when `PHRO_READER_SOFFICE` is set (`soffice`; "1" walks the absolute PATH entries, never the
+current folder, `_on_path`); else they are `unsupported`, the detail naming the switch. `_via_soffice` runs `soffice
+--headless --norestore -env:UserInstallation=<tmp>/profile --convert-to docx --outdir <tmp> <absolute file>` in a
+process group of its own, with CONVERT_SECONDS - elapsed - 3 seconds from the reader's start and no later than 2
+seconds before the gate's `PHRO_READER_DEADLINE`; past them the tree is killed (`_kill_tree`) and the read is a
+`timeout`. The docx it writes is read by `ooxml.parse`; none is `damaged`. The temporary folder is removed whatever
+happens, a child still running killed first.
 """
+import math
 import os
 import shutil
 import signal
@@ -226,6 +229,9 @@ _EOL_SIZED = frozenset((0x81, 0x8E, 0x8F))
 _NEW = object()          # a packet id not walked yet
 _MAIN = "PerfectOffice_MAIN"
 _SWITCH = "PHRO_READER_SOFFICE"
+_DEADLINE = "PHRO_READER_DEADLINE"  # set by the gate for its child (gate._child)
+_SEP = chr(92)
+_LONG = _SEP * 2 + "?" + _SEP  # the Windows extended-length path prefix
 # WP5
 _BLOCK5 = 50             # an index block: [0xFFFB][5][50][u32 next] and four 10-byte packet indexes
 _GFX5 = 8                # the graphics information packet
@@ -562,7 +568,7 @@ class _State:
     """One WP6+ document's walk: the data and its packets (id -> (type, flags, offset, size)), the Doc its stories
     fill, and what every story of it shares."""
     __slots__ = ("data", "index", "doc", "ctx", "visited", "subdocs", "ids", "count", "seen", "img_total", "budget",
-                 "pics", "gfx")
+                 "pics", "gfx", "big")
 
     def __init__(self, data, index, doc, ctx):
         self.data = data
@@ -578,6 +584,7 @@ class _State:
         self.img_total = 0  # picture bytes emitted (IMAGE_BYTES)
         self.budget = [limits.TABLE_NODES]  # cells the document's tables may still take
         self.gfx = []       # WP5: the pictures of packet 8, (start, end) or None each
+        self.big = set()    # WP5: picture numbers refused as past IMAGE_BYTES (the total only grows)
 
 
 def _walk6(data, start, end, story, st, depth=0):
@@ -1254,12 +1261,16 @@ def _box5(data, pos, c, gend, sub, story, st):
     if num in st.pics:
         skipped["depth"] += 1
         return
-    pic = data[span[0]:span[1]]
-    if pic[:4] != _MAGIC:
-        pic = _WPG_HEAD + pic  # an embedded picture without its WPG head (libwpd adds the same one)
-    if st.img_total + len(pic) > limits.IMAGE_BYTES:
+    # the size is checked before any copy, and a picture once past the cap is never copied again; each reference
+    # past IMAGE_BYTES counts `image`, as in WP6
+    a, b = span
+    whole = data[a:min(a + 4, b)] == _MAGIC  # else an embedded picture without its WPG head (libwpd adds the same one)
+    need = b - a + (0 if whole else len(_WPG_HEAD))
+    if num in st.big or st.img_total + need > limits.IMAGE_BYTES:
+        st.big.add(num)
         skipped["image"] += 1
         return
+    pic = data[a:b] if whole else _WPG_HEAD + data[a:b]
     st.pics.add(num)
     st.img_total += len(pic)
     story.put([Image(pic)])
@@ -1415,15 +1426,32 @@ def _wp42(data, ctx) -> Doc:
 
 # ---- the LibreOffice switch
 
+def _on_path() -> str | None:
+    """`soffice` on PATH, walked here and not with `shutil.which`, which on Windows looks in the current folder first
+    and takes any PATHEXT name (a soffice.bat beside a document would run). Only absolute entries are searched (on
+    Windows with a drive or share), never the current folder; on Windows only soffice.exe and soffice.com are taken,
+    elsewhere only a regular file named soffice that is executable."""
+    nt = os.name == "nt"
+    names = ("soffice.exe", "soffice.com") if nt else ("soffice",)
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or not os.path.isabs(entry) or (nt and not os.path.splitdrive(entry)[0]):
+            continue
+        for name in names:
+            p = os.path.join(entry, name)
+            if os.path.isfile(p) and (nt or os.access(p, os.X_OK)):
+                return p
+    return None
+
+
 def soffice() -> str | None:
-    """The `soffice` PHRO_READER_SOFFICE names: "1" searches PATH and the standard install folders (None when none
-    is there), any other non-empty value is the path itself; unset or empty is None."""
+    """The `soffice` PHRO_READER_SOFFICE names: "1" searches PATH (`_on_path`) and the standard install folders (None
+    when none is there), any other non-empty value is the path itself; unset or empty is None."""
     value = os.environ.get(_SWITCH, "")
     if not value:
         return None
     if value != "1":
         return value
-    found = shutil.which("soffice")
+    found = _on_path()
     if found:
         return found
     places = [os.path.join(base, "LibreOffice", "program", "soffice.exe")
@@ -1433,15 +1461,23 @@ def soffice() -> str | None:
 
 
 def _kill_tree(proc):
-    """Kill the child and every process it started."""
+    """Kill the child and every process it started. When taskkill or killpg fails, the child itself is killed
+    (`proc.kill`); an error from that is raised."""
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            done = r.returncode == 0
         else:
             os.killpg(proc.pid, signal.SIGKILL)
+            done = True
     except (OSError, subprocess.SubprocessError):
-        pass
+        done = False
+    if not done:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass  # gone already
 
 
 def _switch(what, path, ctx):
@@ -1456,18 +1492,44 @@ def _switch(what, path, ctx):
     return _via_soffice(path, ctx, STARTED)
 
 
+def _deadline() -> float | None:
+    """The wall-clock deadline (epoch seconds) the gate gives its child in PHRO_READER_DEADLINE; None when it is
+    missing or unparsable."""
+    try:
+        value = float(os.environ.get(_DEADLINE, ""))
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _argument(path) -> str:
+    """`path` absolute, so neither a relative name nor one starting with `-` reads as a soffice option; without the
+    Windows extended-length prefix (`_LONG`) that resolve may put before it."""
+    s = str(Path(path).resolve())
+    if s.startswith(_LONG + "UNC" + _SEP):
+        return _SEP * 2 + s[len(_LONG) + 4:]
+    return s[len(_LONG):] if s.startswith(_LONG) else s
+
+
 def _via_soffice(path, ctx, started) -> Doc:
     """Convert `path` to docx with soffice in a temporary folder and read it with `ooxml.parse`. The child has
-    CONVERT_SECONDS - elapsed - 3 seconds from `started` (a `time.monotonic` reading); past it the process tree is
-    killed and the read is a `timeout`. No docx in the folder is `damaged`. The folder is removed in every case."""
+    CONVERT_SECONDS - elapsed - 3 seconds from `started` (a `time.monotonic` reading), and never past 2 seconds before
+    the gate's deadline (`_deadline`; one in the past leaves no time), so the tree is killed and the folder removed
+    before the gate gives up on this process; past it the process tree is killed and the read is a `timeout`. No
+    docx in the folder is `damaged`. The folder is removed in every case, the child killed first when it still runs
+    (an interrupt, another error)."""
     exe = soffice()
     left = limits.CONVERT_SECONDS - (time.monotonic() - started) - 3
+    deadline = _deadline()
+    if deadline is not None:
+        left = min(left, deadline - 2 - time.time())
     if left <= 0:
         raise ReadError("timeout")
     tmp = tempfile.mkdtemp(prefix="phro-soffice-")
+    proc, killed = None, False
     try:
         cmd = [exe, "--headless", "--norestore", "-env:UserInstallation=" + Path(tmp, "profile").as_uri(),
-               "--convert-to", "docx", "--outdir", tmp, str(path)]
+               "--convert-to", "docx", "--outdir", tmp, _argument(path)]
         group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
                  else {"start_new_session": True})
         try:
@@ -1478,6 +1540,7 @@ def _via_soffice(path, ctx, started) -> Doc:
         try:
             proc.wait(timeout=left)
         except subprocess.TimeoutExpired:
+            killed = True
             _kill_tree(proc)
             try:
                 proc.wait(timeout=5)
@@ -1490,7 +1553,11 @@ def _via_soffice(path, ctx, started) -> Doc:
         from . import ooxml
         return ooxml.parse(out[0], ctx)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            if proc is not None and not killed and proc.poll() is None:
+                _kill_tree(proc)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---- the entries

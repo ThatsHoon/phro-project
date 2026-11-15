@@ -316,9 +316,13 @@ def _child(cmd, start, timeout):
     if left < limits.HOOK_CHILD_MIN:
         return None, "timeout", LATE
     budget = min(timeout, left)
+    import time
+    # the child's own children (soffice, wpd._via_soffice) must be gone before this gives up on it: it reads the
+    # wall-clock deadline from PHRO_READER_DEADLINE
+    env = dict(os.environ, PHRO_READER_DEADLINE=repr(time.time() + budget))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=budget)
+                           errors="replace", timeout=budget, env=env)
     except subprocess.TimeoutExpired:
         return None, "timeout", LATE if budget < timeout else ""
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]

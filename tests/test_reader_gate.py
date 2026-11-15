@@ -444,6 +444,36 @@ def test_child_gets_what_is_left_of_the_budget():
         gate.subprocess.run = old
 
 
+def test_child_env_carries_the_deadline():
+    import subprocess as sp
+    import time
+    from reader import limits
+    seen, old = [], gate.subprocess.run
+
+    def fake(cmd, **kw):
+        seen.append((kw["timeout"], kw.get("env")))
+        raise sp.TimeoutExpired(cmd, kw["timeout"])
+
+    gate.subprocess.run = fake
+    try:
+        for ticks in ((0.0, 30.0), (0.0, 1.0)):
+            before = time.time()
+            with stub(), clock(*ticks):
+                gate.decide(ev(sample()), command=["x"])
+                ours = dict(os.environ)
+            after = time.time()
+            budget, env = seen[-1]
+            # a wall-clock epoch, the budget away, so the child's soffice is killed before the gate gives up
+            deadline = float(env["PHRO_READER_DEADLINE"])
+            assert before + budget <= deadline <= after + budget, (before, deadline, after, budget)
+            assert budget == min(limits.CONVERT_SECONDS, limits.HOOK_SECONDS - ticks[1]), budget
+            # the rest of the environment goes through unchanged
+            rest = {k: v for k, v in env.items() if k != "PHRO_READER_DEADLINE"}
+            assert rest == {k: v for k, v in ours.items() if k != "PHRO_READER_DEADLINE"}
+    finally:
+        gate.subprocess.run = old
+
+
 def test_child_fail_kind():
     with stub():
         cmd = [sys.executable, "-c", "print('FAIL\\tencrypted\\t')"]

@@ -168,7 +168,8 @@ def _read(data):
 
 
 def _md(doc, ctx, hidden=False):
-    return markdown.render(doc, Path(tempfile.mkdtemp()) / "assets", hidden, ctx.skipped)
+    with tempfile.TemporaryDirectory() as d:
+        return markdown.render(doc, Path(d) / "assets", hidden, ctx.skipped)
 
 
 def _refused(data, kind):
@@ -208,9 +209,10 @@ def test_wp6_paragraphs_and_bold():
     # parse(path) reads the file and gives the same document
     h = wpd.head(data)
     assert h == wpd.Head(pointer=len(data) - len(body), product=1, ftype=0x0A, major=2, minor=1, encryption=0)
-    path = Path(tempfile.mkdtemp()) / "a.wpd"
-    path.write_bytes(data)
-    assert wpd.parse(path, Context()).blocks == doc.blocks
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "a.wpd"
+        path.write_bytes(data)
+        assert wpd.parse(path, Context()).blocks == doc.blocks
     # soft EOLs are spaces; a D0 hard EOL and a page break end a paragraph
     body = (b"one\xcftwo" + _var(0xD0, 0x01) + b"three" + _var(0xD0, 0x04) + b"four\xc7five"
             + _var(0xD0, 0x17) + b"six")
@@ -909,6 +911,43 @@ def test_wp5_picture_gets_wpg_head():
     assert ctx.skipped["image"] == 1 and not any(isinstance(b, Image) for b in doc.blocks)
 
 
+def test_wp5_picture_cap_before_copy():
+    raw = bytes(range(1, 19))  # 18 bytes without a WPG head: 34 with the head put before it
+    real = limits.IMAGE_BYTES
+    try:
+        # the head counts toward the cap: 34 fits in 34, not in 33
+        limits.IMAGE_BYTES = 34
+        doc, ctx = _read(_wp5(b"A" + _figure5(0), [(8, _gfx5(raw))]))
+        assert [len(b.data) for b in doc.blocks if isinstance(b, Image)] == [34] and not ctx.skipped, ctx.skipped
+        limits.IMAGE_BYTES = 33
+        # each reference past the cap counts image, as in WP6; a smaller picture after it still fits
+        body = b"A" + _figure5(0) + b"B" + _figure5(0) + b"C" + _figure5(0) + b"D" + _figure5(1)
+        doc, ctx = _read(_wp5(body, [(8, _gfx5(raw, _WPG))]))
+        assert [b.data for b in doc.blocks if isinstance(b, Image)] == [_WPG], doc.blocks
+        assert ctx.skipped["image"] == 3 and set(ctx.skipped) == {"image"}, ctx.skipped
+        # a picture past the cap is never copied: not at its first reference, not at a later one
+        copies = []
+
+        class _Counted(bytes):
+            def __getitem__(self, key):
+                if isinstance(key, slice) and len(range(*key.indices(len(self)))) > 1_000:
+                    copies.append(key)
+                return bytes.__getitem__(self, key)
+
+        fig = _figure5(0)
+        data = _Counted(fig + bytes(100_000))
+        limits.IMAGE_BYTES = 50_000
+        ctx = Context()
+        st = wpd._State(data, {}, wpd.Doc(), ctx)
+        st.gfx = [(len(fig), len(data))]
+        story = wpd._Story("body")
+        for _ in range(5):
+            wpd._box5(data, 0, 4, len(fig) - 4, 0, story, st)
+        assert not copies and ctx.skipped["image"] == 5, (copies, ctx.skipped)
+    finally:
+        limits.IMAGE_BYTES = real
+
+
 def test_wp5_block_cycle():
     raw = b"\x01\x02picture records"
     doc, ctx = _read(_wp5(b"Body" + _figure5(0), [(8, _gfx5(raw))], last_next=16))
@@ -1051,6 +1090,7 @@ class _FakeProc:
 
     def __init__(self, cmd, make=None, hang=False, **kw):
         self.cmd, self.kw, self.hang, self.pid = cmd, kw, hang, 4242
+        self.waits, self.killed = [], 0
         self.outdir = Path(cmd[cmd.index("--outdir") + 1])
         _FakeProc.made.append(self)
         if make:
@@ -1058,9 +1098,18 @@ class _FakeProc:
 
     def wait(self, timeout=None):
         import subprocess
+        self.waits.append(timeout)
+        if isinstance(self.hang, BaseException):
+            raise self.hang
         if self.hang:
             raise subprocess.TimeoutExpired(self.cmd, timeout)
         return 0
+
+    def poll(self):
+        return None if self.hang else 0
+
+    def kill(self):
+        self.killed += 1
 
 
 def _docx(text):
@@ -1077,8 +1126,9 @@ def _docx(text):
     }, stored=())
 
 
-def _with_fake(make=None, hang=False):
-    """Run the Mac file through the switch with Popen faked; returns (doc or ReadError, the fake, kills)."""
+def _with_fake(make=None, hang=False, deadline=None):
+    """Run the Mac file through the switch with Popen faked; returns (doc or ReadError, the fake, kills). `hang` is
+    True (wait times out) or an exception wait raises; `deadline` is the PHRO_READER_DEADLINE value, None unset."""
     import reader
     kills = []
     real_popen, real_kill, real_started = wpd.subprocess.Popen, wpd._kill_tree, reader.STARTED
@@ -1092,17 +1142,120 @@ def _with_fake(make=None, hang=False):
         try:
             wpd.subprocess.Popen = lambda cmd, **kw: _FakeProc(cmd, make, hang, **kw)
             wpd._kill_tree = kills.append
-            with _Env(PHRO_READER_SOFFICE=str(exe)):
+            with _Env(PHRO_READER_SOFFICE=str(exe), PHRO_READER_DEADLINE=deadline):
                 try:
                     got = wpd.parse(src, Context())
-                except ReadError as e:
+                except (ReadError, KeyboardInterrupt) as e:
                     got = e
         finally:
             wpd.subprocess.Popen, wpd._kill_tree, reader.STARTED = real_popen, real_kill, real_started
         fake = _FakeProc.made[0] if _FakeProc.made else None
         if fake is not None:
-            assert fake.cmd[0] == str(exe) and fake.cmd[-1] == str(src), fake.cmd
+            assert fake.cmd[0] == str(exe) and fake.cmd[-1] == str(src.resolve()), fake.cmd
     return got, fake, kills
+
+
+def test_soffice_deadline():
+    # the gate's deadline, 2 seconds early, cuts the child's own budget
+    got, fake, kills = _with_fake(hang=True, deadline=str(time.time() + 6))
+    assert isinstance(got, ReadError) and got.kind == "timeout", got
+    assert kills == [fake] and not fake.outdir.exists()
+    assert 3 < fake.waits[0] <= 4, fake.waits
+    # a deadline in the past (or under 2 seconds away) is no time: no child at all
+    for gone in (time.time() - 100, time.time() + 1):
+        got, fake, kills = _with_fake(hang=True, deadline=str(gone))
+        assert isinstance(got, ReadError) and got.kind == "timeout" and fake is None and not kills, got
+    # a missing or unparsable deadline is ignored: the reader's own budget
+    for bad in (None, "", "soon", "nan", "inf"):
+        got, fake, kills = _with_fake(hang=True, deadline=bad)
+        assert got.kind == "timeout" and fake.waits[0] > limits.CONVERT_SECONDS - 5, (bad, fake.waits)
+
+
+def test_soffice_interrupt_kills_child():
+    # an interrupt while soffice runs: the tree is killed before the folder goes, the interrupt goes on
+    got, fake, kills = _with_fake(hang=KeyboardInterrupt())
+    assert isinstance(got, KeyboardInterrupt) and kills == [fake] and not fake.outdir.exists(), (got, kills)
+
+
+def test_soffice_argument_absolute():
+    import os
+    old = os.getcwd()
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            os.chdir(d)
+            arg = wpd._argument("-x.wpd")
+        finally:
+            os.chdir(old)
+    assert os.path.isabs(arg) and not arg.startswith("-") and arg.endswith("-x.wpd"), arg
+    # the Windows extended-length prefix resolve may add is taken off
+    sep = chr(92)
+    long = sep * 2 + "?" + sep
+
+    class _P:
+        def __init__(self, s):
+            self.s = s
+
+        def resolve(self):
+            return self.s
+
+    real = wpd.Path
+    try:
+        wpd.Path = _P
+        assert wpd._argument(long + "C:" + sep + "a.wpd") == "C:" + sep + "a.wpd"
+        assert wpd._argument(long + "UNC" + sep + "srv" + sep + "a.wpd") == sep * 2 + "srv" + sep + "a.wpd"
+        assert wpd._argument("C:" + sep + "b.wpd") == "C:" + sep + "b.wpd"
+    finally:
+        wpd.Path = real
+
+
+def test_kill_tree_falls_back():
+    import os
+
+    class _R:
+        def __init__(self, code):
+            self.returncode = code
+
+    class _Proc:
+        pid = 4242
+
+        def __init__(self, err=None):
+            self.err, self.killed = err, 0
+
+        def kill(self):
+            self.killed += 1
+            if self.err:
+                raise self.err
+
+    real_run = wpd.subprocess.run
+    real_killpg = getattr(wpd.os, "killpg", None)
+
+    def failing(*a, **k):
+        raise OSError("no tree kill")
+
+    try:
+        if os.name == "nt":
+            outcomes = (lambda *a, **k: _R(0), lambda *a, **k: _R(1), failing)
+        else:
+            outcomes = (lambda *a, **k: None, failing)
+        for i, kill in enumerate(outcomes):
+            if os.name == "nt":
+                wpd.subprocess.run = kill
+            else:
+                wpd.os.killpg = kill
+            p = _Proc()
+            wpd._kill_tree(p)
+            assert p.killed == (0 if i == 0 else 1), (i, p.killed)
+        # the fallback's own error is raised, except that the child is gone already
+        wpd._kill_tree(_Proc(ProcessLookupError()))
+        try:
+            wpd._kill_tree(_Proc(PermissionError("denied")))
+            raise AssertionError("expected PermissionError")
+        except PermissionError:
+            pass
+    finally:
+        wpd.subprocess.run = real_run
+        if real_killpg is not None:
+            wpd.os.killpg = real_killpg
 
 
 def test_mac_with_switch_stub():
@@ -1158,8 +1311,48 @@ def test_soffice_lookup():
             assert wpd.soffice() == str(exe)
         with _Env(PHRO_READER_SOFFICE=None):
             assert wpd.soffice() is None
-        with _Env(PHRO_READER_SOFFICE=""):
-            assert wpd.soffice() is None
+    # PATH is walked by hand: only absolute entries, never the current folder, only soffice.exe / .com on Windows
+    # and an executable regular file named soffice elsewhere
+    nt = os.name == "nt"
+    with tempfile.TemporaryDirectory() as d:
+        on = Path(d) / "on"
+        cwd = Path(d) / "cwd"
+        on.mkdir()
+        cwd.mkdir()
+        (on / "soffice.bat").write_bytes(b"")
+        (on / "soffice.cmd").write_bytes(b"")
+        (on / "soffice").write_bytes(b"")  # not executable: not taken on POSIX, not a name taken on Windows
+        (cwd / ("soffice.exe" if nt else "soffice")).write_bytes(b"")
+        (cwd / ("soffice.exe" if nt else "soffice")).chmod(0o755)
+        old = os.getcwd()
+        try:
+            os.chdir(cwd)
+            rel = os.path.join("..", "cwd")
+            for path in (str(on), "", ".", rel, os.pathsep.join((".", str(on))), str(on) + os.pathsep):
+                with _Env(PATH=path):
+                    assert wpd._on_path() is None, (path, wpd._on_path())
+            if nt:
+                with _Env(PATH=chr(92) + "cwd"):  # rooted on the current drive only: not taken
+                    assert wpd._on_path() is None
+        finally:
+            os.chdir(old)
+        exe = on / ("soffice.exe" if nt else "soffice")
+        if nt:
+            exe.write_bytes(b"")
+        else:
+            exe.chmod(0o755)
+        with _Env(PATH=os.pathsep.join((".", str(on)))):
+            assert wpd._on_path() == str(exe), wpd._on_path()
+        if nt:
+            exe.unlink()
+            (on / "soffice.com").write_bytes(b"")
+            with _Env(PATH=str(on)):
+                assert wpd._on_path() == str(on / "soffice.com"), wpd._on_path()
+        # "1" takes what PATH gives
+        with _Env(PHRO_READER_SOFFICE="1", PATH=str(on)):
+            assert wpd.soffice() == wpd._on_path() is not None
+    with _Env(PHRO_READER_SOFFICE=""):
+        assert wpd.soffice() is None
 
 
 def main():
