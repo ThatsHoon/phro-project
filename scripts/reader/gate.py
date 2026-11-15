@@ -118,7 +118,7 @@ def _is_zip(path):
     """True when the file starts with the zip local-header signature (every Keynote file is a zip)."""
     try:
         with open(path, "rb") as f:
-            return f.read(4) == b"PK"
+            return f.read(4) == b"PK\x03\x04"
     except OSError:
         return False
 

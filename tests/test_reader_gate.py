@@ -1141,7 +1141,7 @@ def test_phase3_formats_convert():
 
 
 def test_unsupported_mac_hint_fits():
-    detail = "WordPerfect for Mac; set PHRO_READER_SOFFICE=1 to read it through LibreOffice"
+    detail = "Mac WordPerfect; set PHRO_READER_SOFFICE=1 to read it through LibreOffice"
     child = [sys.executable, "-c", f"print('FAIL\tunsupported\t{detail}')"]
     with stub():
         p = put("a.wpd", bytes(8))
