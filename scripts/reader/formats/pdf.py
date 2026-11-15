@@ -260,6 +260,8 @@ class _Reader:
             self.part = True  # pdfnative counted this page read in part already
         if pd.cut.get("bad_coord", 0) > 0:
             self._lost_text()
+        if pd.cut.get("text", 0) > 0:
+            self.text_cut = True  # the interpreter's char cap counted `text` for this page
         turn = pdf_layout.upright_turn(pd.fragments, _turn(pd.rotate))
         view = _view_page(turn, pd.box)
         keep = _Kept(pd.number, view)

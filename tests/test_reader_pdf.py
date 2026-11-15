@@ -483,6 +483,32 @@ def test_page_chars_cap():
     assert "aaaaaaaaaa" in text and "eeeeeeeeee" not in text, text
 
 
+def test_page_chars_stop_the_interpreter():
+    # past 2 x PDF_PAGE_CHARS shown chars the native interpreter makes no more fragments and counts
+    # `text` once for the page; the show operators after that cost little (loose bounds: 300,000 Tj
+    # made 300,000 fragments, about 240 MB)
+    import time
+    import tracemalloc
+    # TJ arrays, Td and a nested string among the shows passed over; the rule after them is still read
+    shows = b"(A) Tj " * 300_000 + b"[(B) -20 <43>] TJ 0 -1 Td (x(y)z) Tj (C) ' 1 2 (D) \" "
+    data = simple_pdf([b"BT /F1 12 Tf 72 700 Td " + shows + b"ET " + rule_ops(72, 100, 540, 100)])
+    with patched(pdf, "PDF_PAGE_CHARS", 1_000):
+        doc = dm.NativeDoc(data)
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        try:
+            pd = doc.page(0)
+            took, peak = time.perf_counter() - t0, tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert len(pd.fragments) <= 2_001 and pd.cut["text"] == 1, (len(pd.fragments), pd.cut)
+        assert len(pd.segments) == 1, pd.segments
+        assert peak < 64 * 2 ** 20 and took < 60, (peak, took)
+        text, ctx, _ = md(data)
+    assert ctx.skipped == {"text": 1}, ctx.skipped
+    assert "AAAA" in text, text[:200]
+
+
 def test_page_raises_skipped():
     real = dm.NativeDoc.page
 

@@ -14,7 +14,9 @@ off; render mode 3 or 7 sets `invisible`. Caps, each counted once per dropped th
 page's `cut` under `page_part`: a form nested past MAX_FORM_DEPTH or referring to itself,
 MAX_FORM_OPERATORS operators in forms per page, MAX_FORM_EXPANDED_BYTES of form data per page,
 and `pdf.PDF_PAGE_OBJECTS` page objects (text objects, painted paths, images and forms). Rule
-segments stop at PDF_SEGMENTS, ignored and not counted.
+segments stop at PDF_SEGMENTS, ignored and not counted. Past 2 x `pdf.PDF_PAGE_CHARS` shown
+chars (spaces aside) the page makes no more fragments: its later show operators are passed over,
+and the page counts `text` once (pdf.py's own char cap, at 1 x, then counts nothing more).
 """
 import math
 import re
@@ -49,6 +51,17 @@ _CONTENT_TOKEN_RE = re.compile(
     rb"[\x00\t\n\x0c\r ]+|%[^\r\n]*|[^\x00\t\n\x0c\r ()<>\[\]{}/%]+|.", re.DOTALL)
 _CONTENT_GAP_RE = re.compile(rb"[\x00\t\n\x0c\r ]*(?:%[^\r\n]*[\x00\t\n\x0c\r ]*)*")
 _SUBSET_TAG_RE = re.compile(r"^[A-Z]{6}\+")
+# one text operator with its operands: a page past its char cap passes over these one at a time (a string
+# with nested parentheses, a comment or any other operator ends the run; the scanner reads on from there).
+# Matched once per operator: a repeat of the group in one match keeps a backtrack point per operator.
+_WS = rb"[\x00\t\n\x0c\r ]"
+_STRING = rb"(?:\([^()\\]*(?:\\.[^()\\]*)*\)|<[0-9A-Fa-f\x00\t\n\x0c\r ]*>)"
+_NUMBER = rb"[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?![-+.0-9])"
+_TEXT_OP_RE = re.compile(
+    _WS + rb"*(?:" + _STRING + _WS + rb"*(?:Tj|')"
+    rb"|(?:" + _NUMBER + _WS + rb"*)+(?:T[dDmcwzLsr]|" + _STRING + _WS + rb"*\")"
+    rb"|T\*|\[(?:" + _WS + rb"*(?:" + _STRING + rb"|" + _NUMBER + rb"))*" + _WS + rb"*\]" + _WS + rb"*TJ)"
+    rb"(?![^\x00\t\n\x0c\r ()<>\[\]{}/%])", re.DOTALL)
 _IDENTITY = (1, 0, 0, 1, 0, 0)
 
 
@@ -73,6 +86,16 @@ class ContentScanner:
         second = _CONTENT_GAP_RE.match(data, number.end()).end()
         return (second > number.end() and data[second:second + 1] == b"R"
                 and (second + 1 == len(data) or data[second + 1] in WHITESPACE + DELIMITERS))
+
+    def pass_text_run(self) -> None:
+        """Move past the text operators that follow, with their operands (_TEXT_OP_RE)."""
+        data, start = self.data, self.pos
+        match, pos = _TEXT_OP_RE.match, start
+        while (found := match(data, pos)) is not None:
+            pos = found.end()
+        if pos > start:
+            self.pos = pos
+            self._matches = _CONTENT_TOKEN_RE.finditer(data, pos)
 
     def next(self):
         data = self.data
@@ -295,7 +318,7 @@ class _State:
 class _Page:
     """One page's walk: its budgets, its output and the form stack."""
 
-    def __init__(self, pdf: PDFFile, fonts_cache: dict, oc: OCState, object_cap: int):
+    def __init__(self, pdf: PDFFile, fonts_cache: dict, oc: OCState, object_cap: int, char_cap: int):
         self.pdf = pdf
         self.fonts_cache = fonts_cache
         self.oc = oc
@@ -314,6 +337,8 @@ class _Page:
         self.positions_cut = False
         self.unmapped = 0
         self.unmapped_glyphs = 0
+        self.chars_left = char_cap  # shown chars before show operators are passed over
+        self.text_cut = False
         self.link_reliable = True
         self._fonts = {}   # id(resources) -> (resources, {name: FontInfo})
         self._labels = {}  # (id(resources), name) -> BaseFont
@@ -326,6 +351,12 @@ class _Page:
 
     def _drop(self) -> None:
         self.cut["page_part"] += 1
+
+    def _shown(self, text: str) -> None:
+        self.chars_left -= len(text) - text.count(" ")
+        if self.chars_left < 0 and not self.text_cut:
+            self.text_cut = True
+            self.cut["text"] += 1
 
     def _drop_ops(self) -> None:
         """The form operator cap, counted once for the page."""
@@ -398,7 +429,10 @@ class _Page:
                     self._drop_ops()
                     return
             if op in (b"Tj", b"TJ", b"'", b'"'):
-                self._text_operator(op, operands, st, off or off_marks > 0, frags)
+                if not self.text_cut:
+                    self._text_operator(op, operands, st, off or off_marks > 0, frags)
+                else:
+                    scanner.pass_text_run()  # past the char cap: no more fragments
             elif op in (b"Td", b"TD", b"Tm", b"T*"):
                 self.link_reliable = True
                 if op == b"Tm" and len(operands) >= 6:
@@ -583,6 +617,7 @@ class _Page:
             char_offsets=offsets, char_gaps=char_gaps, link_geometry_reliable=reliable,
             invisible=st.tr in (3, 7), font=st.fname, obj=max(self.text_object, 0),
             hidden="ocg" if off else ""))
+        self._shown(text)
 
     def _drop_positions(self) -> None:
         self.cut["char_positions"] += 1
@@ -636,6 +671,7 @@ class _Page:
             dir_x=-start_tm[2], dir_y=-start_tm[3], up_x=start_tm[0], up_y=start_tm[1],
             invisible=st.tr in (3, 7), font=st.fname, obj=max(self.text_object, 0),
             hidden="ocg" if off else "", vertical=True))
+        self._shown(text)
 
     @staticmethod
     def _skip_inline_image(data: bytes, pos: int) -> int:
@@ -762,7 +798,7 @@ def interpret(pdf: PDFFile, content: bytes, resources, fonts_cache: dict, oc: OC
     font_infos fills and `oc` the document's layer state. `box` is the crop box in page space;
     the flags that depend on it ("offcrop", "tiny") are set when the page is assembled."""
     from ..formats import pdf as caps  # read at call time: a test patches the module
-    page = _Page(pdf, fonts_cache, oc, caps.PDF_PAGE_OBJECTS)
+    page = _Page(pdf, fonts_cache, oc, caps.PDF_PAGE_OBJECTS, 2 * caps.PDF_PAGE_CHARS)
     paths = PathCollector()
     try:
         page.run(content, resources if isinstance(resources, dict) else {}, _IDENTITY, None, 0,
