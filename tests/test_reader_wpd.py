@@ -1,4 +1,5 @@
-"""WordPerfect reader: the Tika character sets, the head, the WP6+ prefix index and body walk.
+"""WordPerfect reader: the Tika character sets, the head, the WP6+ prefix index and body walk, and the WP6+
+sub-documents (notes, comments, headers, footers, watermarks, boxes), pictures and tables.
 
 Run: python -I -X utf8 tests/test_reader_wpd.py
 """
@@ -11,11 +12,11 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import markdown  # noqa: E402
+from reader import images, limits, markdown  # noqa: E402
 from reader.formats import wpd, wpd_charsets  # noqa: E402
 from reader.formats.wpd_charsets import WP5, WP6, char  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Bold, Context, Hidden, Para, Text  # noqa: E402
+from reader.model import Bold, Cell, Context, Hidden, Image, NoteRef, Para, Table, Text  # noqa: E402
 
 # Sizes of the Java arrays: Tika's own "(N chars)" comments, checked against the literals in the files.
 WP6_SIZES = (96, 242, 145, 88, 102, 255, 238, 229, 219, 123, 250, 63, 256, 196, 220)
@@ -136,13 +137,13 @@ def _ext(code, cset):
 
 def _wp6(body: bytes, packets=(), *, encryption=0, ftype=0x0A, major=2, product=1) -> bytes:
     """A WordPerfect 6+ file: the 16-byte head, the index header at 16 and its 14-byte entries from 16 + 14, the
-    packets, then the body the document pointer points at."""
+    packets, then the body the document pointer points at. Packet k of the list (from 0) has prefix id k + 1."""
     ih = 16
     index = 14 * (len(packets) + 1)
     entries, blobs = [], []
     at = ih + index
-    for ptype, blob in packets:
-        entries.append(struct.pack("<BBHHII", 0, ptype, 1, 0, len(blob), at))
+    for ptype, blob, *flags in packets:  # (type, bytes) or (type, bytes, entry flags)
+        entries.append(struct.pack("<BBHHII", flags[0] if flags else 0, ptype, 1, 0, len(blob), at))
         blobs.append(blob)
         at += len(blob)
     header = struct.pack("<BBH10s", 2, 0, len(packets) + 1, b"")
@@ -186,7 +187,7 @@ def _plain(doc):
             elif isinstance(it, (Bold, Hidden)):
                 out.append(flat(it.inlines))
         return "".join(out)
-    return [flat(b.inlines) for b in doc.blocks]
+    return [flat(b.inlines) if hasattr(b, "inlines") else type(b).__name__ for b in doc.blocks]
 
 
 # ---- the brief's tests
@@ -354,6 +355,312 @@ def test_refusals():
     assert _refused(_wp6(b""), "damaged")
     assert _refused(_wp6(b"\x80\x80\xcc"), "damaged")  # a body that gives no block
     assert _refused(b"\xffWPC\x10\x00", "damaged")  # a head cut short
+
+
+# ---- WP6+ sub-document, box and table fixtures
+
+def _grp(group, sub, pids=(), data=b"", flags=0):
+    """A variable group with its head: flags (0x80 added when there are prefix ids), [n][u16 id] * n, the u16
+    non-deletable size (all of `data` here), then `data`."""
+    head = bytes((flags | (0x80 if pids else 0),))
+    if pids:
+        head += bytes((len(pids),)) + b"".join(struct.pack("<H", p) for p in pids)
+    return _var(group, sub, head + struct.pack("<H", len(data)) + data)
+
+
+def _text(*parts):
+    """A 0x08 sub-document packet: u16 block count, 4 bytes, a u32 size a block, then the blocks."""
+    return (struct.pack("<H", len(parts)) + b"\x00" * 4 + b"".join(struct.pack("<I", len(p)) for p in parts)
+            + b"".join(parts))
+
+
+def _note(pid, endnote=False, number=b"1"):
+    """A footnote (or endnote) on, the number text the body shows, and the note off."""
+    return _grp(0xD7, 2 if endnote else 0, [pid]) + number + _grp(0xD7, 3 if endnote else 1)
+
+
+def _style(ctype, name=0):
+    """A 0x41 graphics box style packet: no children, the box data (name and library, counter, positioning and
+    content sections, each after its u16 size); `name` is the s16 name length, -4 an equation box."""
+    box = (struct.pack("<H", 4) + b"\x00\x00" + struct.pack("<h", name) + struct.pack("<H", 0) + struct.pack("<H", 0)
+           + struct.pack("<H", 3) + bytes((0, ctype, 0)))
+    return struct.pack("<H", 0) + struct.pack("<H", len(box)) + box
+
+
+def _override(ctype):
+    """A box group's own data overriding the content type: 14 reserved bytes, two sizes, the override flags (content
+    data only), then the content data: u16 size, u16 flags (0x4000: the type follows), the type."""
+    content = struct.pack("<H", 0x4000) + bytes((ctype,))
+    return b"\x00" * 18 + struct.pack("<H", 0x2000) + struct.pack("<H", len(content)) + content
+
+
+def _eol(*subs):
+    """EOL group data: the u16 deletable size (0), then the non-deletable sub-functions."""
+    return struct.pack("<H", 0) + b"".join(subs)
+
+
+def _span(cols, rows):
+    return bytes((0x85, cols, rows, 0x85))
+
+
+def _rowinfo(flags):
+    return bytes((0x80, flags, 0, 0, 0x80))
+
+
+_WPG = b"\xffWPC" + struct.pack("<I", 16) + bytes((1, 0x16, 1, 0)) + b"\x00" * 6 + b"picture"
+
+
+def _utf16(s):
+    return s.encode("utf-16-le") + b"\x00\x00"
+
+
+# ---- the brief's tests (Task 8)
+
+def test_footnote_packet():
+    body = b"Before" + _note(1) + b"\x80after"
+    doc, ctx = _read(_wp6(body, [(0x08, _text(b"Note\x80", b"text"))]))
+    assert doc.blocks[0].inlines == [Text("Before"), NoteRef("fn-1"), Text(" after")], doc.blocks[0].inlines
+    assert doc.notes == {"fn-1": [Para([Text("Note text")])]}, doc.notes
+    out = _md(doc, ctx)
+    assert "Before[^1] after" in out and "[^1]: Note text" in out, out
+    assert out.count("Note text") == 1 and "Before1" not in out
+    assert not ctx.skipped
+    # a note whose packet is missing, or not a text packet, keeps the body and counts the note
+    doc, ctx = _read(_wp6(b"A" + _note(5) + b"B" + _note(1) + b"C", [(0x12, b"")]))
+    assert _plain(doc) == ["ABC"] and not doc.notes and ctx.skipped["note"] == 2, ctx.skipped
+    # a note with no text gives no mark; one whose block table runs past its packet counts the note
+    doc, ctx = _read(_wp6(b"A" + _note(1) + b"B", [(0x08, _text())]))
+    assert _plain(doc) == ["AB"] and not doc.notes and not ctx.skipped
+    bad = struct.pack("<H", 2) + b"\x00" * 4 + struct.pack("<II", 1, 2**31) + b"x"
+    doc, ctx = _read(_wp6(b"A" + _note(1) + b"B", [(0x08, bad)]))
+    assert _plain(doc) == ["AB"] and ctx.skipped["note"] == 1
+    # the same note referred to twice is one note with two marks
+    doc, ctx = _read(_wp6(b"A" + _note(1) + b"B" + _note(1) + b"C", [(0x08, _text(b"N"))]))
+    assert doc.blocks[0].inlines == [Text("A"), NoteRef("fn-1"), Text("B"), NoteRef("fn-1"), Text("C")]
+    assert list(doc.notes) == ["fn-1"] and not ctx.skipped
+    # inside deleted text a note is left out with it, as libwpd does
+    doc, ctx = _read(_wp6(b"A" + _undo(0) + b"x" + _note(1) + _undo(1) + b"B", [(0x08, _text(b"N"))]))
+    assert not doc.notes and not ctx.skipped
+
+
+def test_endnote_is_footnote():
+    body = b"One" + _note(1, endnote=True, number=b"i") + b"\x80two" + _note(2)
+    doc, ctx = _read(_wp6(body, [(0x08, _text(b"End")), (0x08, _text(b"Foot"))]))
+    assert doc.blocks[0].inlines == [Text("One"), NoteRef("fn-1"), Text(" two"), NoteRef("fn-2")]
+    assert doc.notes == {"fn-1": [Para([Text("End")])], "fn-2": [Para([Text("Foot")])]}
+    out = _md(doc, ctx)
+    assert "One[^1] two[^2]" in out and "[^1]: End" in out and "[^2]: Foot" in out, out
+
+
+def test_comment_chain():
+    comment = struct.pack("<HHB", 1, 1, 0)  # one prefix id: the text packet 1, then the flags
+    body = b"Text" + _grp(0xD4, 0x1D, [2]) + b"\x80more"
+    doc, ctx = _read(_wp6(body, [(0x08, _text(b"A\x80remark")), (0x1B, comment)]))
+    assert doc.blocks[0].inlines == [Text("Text"), NoteRef("cm-1"), Text(" more")], doc.blocks[0].inlines
+    assert doc.notes["cm-1"] == [Para([Text("Comment: "), Text("A remark")])], doc.notes
+    out = _md(doc, ctx)
+    assert "Text[^1] more" in out and "[^1]: Comment: A remark" in out, out
+    assert not ctx.skipped
+    # a comment whose 0x1B packet is missing, or names no single text packet, counts a note
+    for packets in ([(0x08, _text(b"x"))], [(0x08, _text(b"x")), (0x1B, struct.pack("<HHB", 2, 1, 0))]):
+        doc, ctx = _read(_wp6(body, packets))
+        assert _plain(doc) == ["Text more"] and not doc.notes and ctx.skipped["note"] == 1, (packets, ctx.skipped)
+
+
+def test_note_in_note_cycle():
+    inner = b"Inner" + _note(1, number=b"x") + b"\x80end"  # packet 1 refers to itself
+    doc, ctx = _read(_wp6(b"Body" + _note(1) + b".", [(0x08, _text(inner))]))
+    assert doc.blocks[0].inlines == [Text("Body"), NoteRef("fn-1"), Text(".")], doc.blocks[0].inlines
+    assert doc.notes == {"fn-1": [Para([Text("Inner end")])]}, doc.notes
+    assert ctx.skipped["depth"] == 1 and set(ctx.skipped) == {"depth"}
+    # a note in a note is a note of its own; past MAX_DEPTH the deeper one is cut, counted depth, the outer kept
+    packets = [(0x08, _text(b"One" + _note(2))), (0x08, _text(b"Two" + _note(3))), (0x08, _text(b"Three"))]
+    doc, ctx = _read(_wp6(b"Body" + _note(1), packets))
+    assert len(doc.notes) == 3 and not ctx.skipped
+    out = _md(doc, ctx)
+    assert "Body[^1]" in out and "One[^2]" in out and "Two[^3]" in out and "[^3]: Three" in out, out
+    real = limits.MAX_DEPTH
+    try:
+        limits.MAX_DEPTH = 2
+        doc, ctx = _read(_wp6(b"Body" + _note(1), packets))
+    finally:
+        limits.MAX_DEPTH = real
+    assert ctx.skipped["depth"] == 1 and set(ctx.skipped) == {"depth"}, ctx.skipped
+    assert sorted(_flatnotes(doc).values()) == ["One", "Two"], doc.notes
+
+
+def _flatnotes(doc):
+    return {k: "".join(i.text for b in v for i in b.inlines if isinstance(i, Text)) for k, v in doc.notes.items()}
+
+
+def test_header_footer_watermark():
+    packets = [(0x08, _text(b"Head")), (0x08, _text(b"Foot")), (0x08, _text(b"Mark")), (0x08, _text(b"Head")),
+               (0x08, _text(b"Other\x80foot"))]
+    body = (_grp(0xD6, 0, [1], b"\x03") + _grp(0xD6, 2, [2], b"\x03") + _grp(0xD6, 4, [3], b"\x03")
+            + _grp(0xD6, 1, [4], b"\x03") + _grp(0xD6, 3, [5], b"\x03") + b"Body")
+    doc, ctx = _read(_wp6(body, packets))
+    assert doc.headers == ["Head", "Mark"] and doc.footers == ["Foot", "Other foot"], (doc.headers, doc.footers)
+    assert _plain(doc) == ["Body"] and not ctx.skipped
+    out = _md(doc, ctx)
+    assert "Header: Head | Mark" in out and "Footer: Foot | Other foot" in out, out
+    # a header without a prefix id, or whose packet is missing, is counted under its kind
+    doc, ctx = _read(_wp6(_grp(0xD6, 0, (), b"\x03") + _grp(0xD6, 2, [9], b"\x03") + b"Body", packets))
+    assert not doc.headers and not doc.footers
+    assert ctx.skipped["header"] == 1 and ctx.skipped["footer"] == 1, ctx.skipped
+    # a note in a header cannot be shown on the header line: it is counted, the header kept
+    packets = [(0x08, _text(b"Head" + _note(2))), (0x08, _text(b"Lost"))]
+    doc, ctx = _read(_wp6(_grp(0xD6, 0, [1], b"\x03") + b"Body", packets))
+    assert doc.headers == ["Head"] and not doc.notes and ctx.skipped["note"] == 1, (doc.headers, ctx.skipped)
+
+
+def test_text_box_in_place():
+    packets = [(0x08, _text(b"Boxed")), (0x41, _style(1))]
+    body = b"One" + _grp(0xDF, 0, [2, 1]) + b"Two"
+    doc, ctx = _read(_wp6(body, packets))
+    assert _plain(doc) == ["One", "Boxed", "Two"], _plain(doc)
+    assert not ctx.skipped
+    # the box's own content data overrides the style; a box flagged to be ignored, or a graphics rule, is nothing
+    doc, ctx = _read(_wp6(b"One" + _grp(0xDF, 1, [1], _override(1)) + b"Two", [(0x08, _text(b"Boxed"))]))
+    assert _plain(doc) == ["One", "Boxed", "Two"], _plain(doc)
+    for group in (_grp(0xDF, 0, [2, 1], flags=0x40), _grp(0xDF, 3, [2, 1])):
+        doc, ctx = _read(_wp6(b"One" + group + b"Two", packets))
+        assert _plain(doc) == ["OneTwo"] and not ctx.skipped
+    # a text box with no text packet counts a shape
+    doc, ctx = _read(_wp6(b"One" + _grp(0xDF, 0, [1]) + b"Two", [(0x41, _style(1))]))
+    assert _plain(doc) == ["OneTwo"] and ctx.skipped["shape"] == 1, (_plain(doc), ctx.skipped)
+
+
+def test_equation_box_object():
+    packets = [(0x08, _text(b"x\x80over\x80y")), (0x41, _style(1, name=-4))]
+    doc, ctx = _read(_wp6(b"Before" + _grp(0xDF, 0, [2, 1]) + b"After", packets))
+    assert _plain(doc) == ["BeforeAfter"], _plain(doc)
+    assert ctx.skipped["object"] == 1 and set(ctx.skipped) == {"object"}
+    assert "1 embedded object" in _md(doc, ctx)
+
+
+def test_box_hyperlink_link():
+    packets = [(0x6F, _WPG), (0x40, struct.pack("<HH", 1, 1), 1), (0x41, _style(3)), (0x07, _utf16("http://x"))]
+    doc, ctx = _read(_wp6(b"See" + _grp(0xDF, 0, [3, 2, 4]) + b"this", packets))
+    assert ctx.skipped["link"] == 1 and set(ctx.skipped) == {"link"}, ctx.skipped
+    assert [type(b) for b in doc.blocks] == [Para, Image, Para]
+
+
+def test_graphics_box_wpg():
+    packets = [(0x6F, _WPG), (0x40, struct.pack("<HH", 1, 1), 1), (0x41, _style(3))]
+    doc, ctx = _read(_wp6(b"See" + _grp(0xDF, 0, [3, 2]) + b"this", packets))
+    assert [type(b) for b in doc.blocks] == [Para, Image, Para], doc.blocks
+    pic = doc.blocks[1]
+    assert pic.data == _WPG and images.sniff(pic.data) == "wpg"
+    assert not ctx.skipped
+    out = _md(doc, ctx)
+    assert "Not viewable here: assets/" in out and ".wpg" in out, out
+    # bytes that are not WPG are still kept as the box's picture
+    doc, ctx = _read(_wp6(b"See" + _grp(0xDF, 0, [3, 2]) + b"this", [(0x6F, b"junk"), *packets[1:]]))
+    assert doc.blocks[1] == Image(b"junk") and not ctx.skipped
+    # a 0x40 packet without its child flag names no picture (libwpd): counted image
+    doc, ctx = _read(_wp6(b"See" + _grp(0xDF, 0, [3, 2]), [packets[0], (0x40, struct.pack("<HH", 1, 1)), packets[2]]))
+    assert [type(b) for b in doc.blocks] == [Para] and ctx.skipped["image"] == 1
+    # past IMAGE_BYTES a picture is counted image
+    real = limits.IMAGE_BYTES
+    try:
+        limits.IMAGE_BYTES = len(_WPG) + 1
+        doc, ctx = _read(_wp6(b"A" + _grp(0xDF, 0, [3, 2]) + b"B" + _grp(0xDF, 0, [3, 2]), packets))
+    finally:
+        limits.IMAGE_BYTES = real
+    assert [type(b) for b in doc.blocks] == [Para, Image, Para] and ctx.skipped["image"] == 1, doc.blocks
+
+
+def test_table_span_and_header():
+    def cell(*subs):
+        return _grp(0xD0, 0x0A, (), _eol(*subs))
+
+    def row(*subs):
+        return _grp(0xD0, 0x0B, (), _eol(*subs))
+
+    body = (b"Pre" + _grp(0xD4, 0x2A, (), b"\x00\x00\x00\x00") + _grp(0xD4, 0x2C) + _grp(0xD4, 0x2B)
+            + row(_rowinfo(0x04), _span(1, 2)) + b"A" + cell() + b"B"
+            + row(_span(128, 1)) + cell() + b"D" + _grp(0xD0, 0x11) + b"Post")
+    doc, ctx = _read(_wp6(body))
+    assert [type(b) for b in doc.blocks] == [Para, Table, Para], doc.blocks
+    t = doc.blocks[1]
+    assert t.rows == [[Cell([Para([Text("A")])], rowspan=2, header=True), Cell([Para([Text("B")])], header=True)],
+                      [Cell([Para([Text("D")])])]], t.rows
+    assert not ctx.skipped
+    out = _md(doc, ctx)
+    assert all(x in out for x in ("Pre", "A", "B", "D", "Post")), out
+    # the single-byte codes: a row, a cell, the table off
+    doc, ctx = _read(_wp6(_grp(0xD4, 0x2A) + b"\xc5x\xc6y\xc5z\xbfafter"))
+    assert doc.blocks[0].rows == [[Cell([Para([Text("x")])]), Cell([Para([Text("y")])])],
+                                  [Cell([Para([Text("z")])])]], doc.blocks
+    assert _plain(doc)[1:] == ["after"]
+    # text in a bound cell joins the cell above
+    body = _grp(0xD4, 0x2A) + row(_span(1, 2)) + b"top" + row(_span(129, 1)) + b"joined" + _grp(0xD0, 0x11)
+    doc, _ = _read(_wp6(body))
+    assert doc.blocks[0].rows == [[Cell([Para([Text("top")]), Para([Text("joined")])], rowspan=2)]], doc.blocks
+    # outside a table the cell and row codes end a paragraph, as before
+    doc, _ = _read(_wp6(b"one" + _grp(0xD0, 0x0A) + b"two\xc6three"))
+    assert _plain(doc) == ["one", "two", "three"]
+    # a table never closed ends with its story; one with no cell gives nothing
+    doc, _ = _read(_wp6(b"x" + _grp(0xD4, 0x2A) + b"\xc5a\xc6b"))
+    assert doc.blocks[1].rows == [[Cell([Para([Text("a")])]), Cell([Para([Text("b")])])]], doc.blocks
+    doc, _ = _read(_wp6(b"x" + _grp(0xD4, 0x2A) + _grp(0xD0, 0x11) + b"y"))
+    assert _plain(doc) == ["x", "y"]
+    # the document's cells are capped by TABLE_NODES: past it the rest are cut, counted once a table
+    real = limits.TABLE_NODES
+    try:
+        limits.TABLE_NODES = 2
+        doc, ctx = _read(_wp6(_grp(0xD4, 0x2A) + b"\xc5a\xc6b\xc5c\xc6d\xbfe"))
+    finally:
+        limits.TABLE_NODES = real
+    assert doc.blocks[0].rows == [[Cell([Para([Text("a")])]), Cell([Para([Text("b")])])]], doc.blocks
+    assert ctx.skipped["cells"] == 1 and _plain(doc)[1:] == ["e"]
+    # a table cell holds a text box in place
+    packets = [(0x08, _text(b"Boxed")), (0x41, _style(1))]
+    doc, _ = _read(_wp6(_grp(0xD4, 0x2A) + b"\xc5a" + _grp(0xDF, 0, [2, 1]) + b"b\xbf", packets))
+    assert doc.blocks[0].rows == [[Cell([Para([Text("a")]), Para([Text("Boxed")]), Para([Text("b")])])]], doc.blocks
+
+
+def test_subdocs_cap():
+    packets = [(0x08, _text(b"N1")), (0x08, _text(b"N2")), (0x08, _text(b"N3"))]
+    real = wpd.WPD_SUBDOCS
+    try:
+        wpd.WPD_SUBDOCS = 2
+        doc, ctx = _read(_wp6(b"a" + _note(1) + b"b" + _note(2) + b"c" + _note(3) + b"d", packets))
+    finally:
+        wpd.WPD_SUBDOCS = real
+    assert list(doc.notes) == ["fn-1", "fn-2"] and ctx.skipped["note"] == 1, (doc.notes, ctx.skipped)
+    assert _plain(doc) == ["abcd"]
+    assert wpd.WPD_SUBDOCS == 10_000
+
+
+# ---- carried over from the Task 7 review
+
+def test_del_byte_dropped():
+    doc, ctx = _read(_wp6(b"a\x7fb"))
+    assert _plain(doc) == ["ab"] and not ctx.skipped
+
+
+def test_cut_group_inside_failed_extent():
+    # a D4 group failing its closing byte declares 12 bytes; inside them a D5 claims 65,535 bytes, past the end:
+    # that cut group joins the failure run, so the walk goes on and one record is counted
+    bad = b"\xd4\x1c\x0c\x00" + b"\xd5\x00\xff\xff" + b"\x00" + b"\x0c\x00" + b"\x99"
+    doc, ctx = _read(_wp6(b"x" + bad + b"After"))
+    text = _plain(doc)[0]
+    assert text.startswith("x") and text.endswith("After"), text
+    assert ctx.skipped["record"] == 1 and set(ctx.skipped) == {"record"}, ctx.skipped
+
+
+def test_stray_group_ends_walk():
+    doc, ctx = _read(_wp6(b"Before" + b"\xd5\x00\xff\xff" + b"After"))
+    assert _plain(doc) == ["Before"], _plain(doc)
+    assert ctx.skipped["record"] == 1 and set(ctx.skipped) == {"record"}
+
+
+def test_hostile_index_count():
+    data = bytearray(_wp6(b"Body"))
+    struct.pack_into("<H", data, 16 + 2, 65535)
+    doc, ctx = _read(bytes(data))
+    assert _plain(doc) == ["Body"] and ctx.skipped["record"] == 1 and set(ctx.skipped) == {"record"}, ctx.skipped
 
 
 def main():

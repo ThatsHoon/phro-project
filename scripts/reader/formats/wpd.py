@@ -26,15 +26,20 @@ and counted `record`. The title is field 17 of the first summary packet (0x12): 
 bytes][name][value], name and value u16 characters ended by 0, each a code (low byte) in a set (high byte). It is
 cut at `MAX_TITLE` characters after its white space is collapsed.
 
-Body (`_walk6`), from the document pointer to the end of the file:
-* 0x00-0x7F are taken as whole runs (found with one `bytes.translate` of the body, no regex): 0x00 is nothing,
-  0x01-0x20 are the extended international characters, 0x21-0x7F are ASCII.
+Body (`_walk6`), from the document pointer to the end of the file (and each sub-document's stream):
+* 0x00-0x7F are taken as whole runs (found with one `bytes.translate` of the body, no regex): 0x00 and 0x7F (DEL) are
+  nothing, 0x01-0x20 are the extended international characters, 0x21-0x7E are ASCII.
 * Single bytes: 0x80, 0xBA-0xBC and 0xCD-0xCF (soft spaces and soft EOLs) are a space, 0x81 a no-break space, 0x84 a
-  hyphen. 0x87, 0xB4-0xB9 and 0xC7-0xCC (hard EOLs, column and page breaks) end a paragraph; so do the table codes
-  0xBD-0xC6 until tables are read. The others are nothing.
+  hyphen. 0x87, 0xB4-0xB9 and 0xC7-0xCC (hard EOLs, column and page breaks) end a paragraph. The table codes are
+  0xBD-0xBF (table off), 0xC0-0xC5 (row) and 0xC6 (cell); outside a table they end a paragraph. The others are
+  nothing.
 * Variable groups 0xD0-0xEF: [id][sub][u16 size] ... [u16 size][id], the size counting the whole group. A group passes
-  when its size is at least 7, it lies inside the data, and it ends with the same size and id. D0 (end of line):
-  subfunctions 1-3 and 0x14-0x16 are a space; 4-9, 0x0A-0x13 and 0x17-0x1C end a paragraph. E0 (tab) is a space.
+  when its size is at least 7, it lies inside the data, and it ends with the same size and id. Its head, read only
+  for the groups below, is [flags] ([n][u16 prefix id] * n when flags has 0x80) [u16 non-deletable size], then the
+  contents; a head that does not fit the group, or a non-deletable size past it (or with bit 0x8000), is no head.
+  D0 (end of line): subfunctions 1-3 and 0x14-0x16 are a space; 4-9 and 0x17-0x1C end a paragraph; 0x0A is a table
+  cell, 0x0B-0x10 a row and its first cell, 0x11-0x13 the table off (outside a table they end a paragraph). E0 (tab)
+  is a space.
 * Fixed groups 0xF0-0xFE have the sizes of `_FIXED` and end with their id. F0 [code][set] is an extended character
   (`wpd_charsets`; set 0 is ASCII from 0x20, as libwpd reads it); an unmapped one, set 12 included, is counted
   `glyphs` and gives nothing. F1 [type][u16 level] is undo: type 0 starts deleted text, type 1 ends it, and deleted
@@ -49,18 +54,64 @@ Body (`_walk6`), from the document pointer to the end of the file:
   bytes, read again as text and codes), is the same run. A group cut by the end of the data, outside such an
   extent, ends the walk: the text before it is kept and `record` is counted once.
 
-Stories. `_Story` keeps one story's paragraphs (the body here), the way `rtf.py` keeps one per story: text arrives
-in runs under the bold and hidden state, and a paragraph end turns them into a Para with its edges trimmed. A
-paragraph with no text is dropped.
+Stories. `_Story` keeps one story's paragraphs (the body, a note, a header or a text box), the way `rtf.py` keeps one
+per story: text arrives in runs under the bold and hidden state, and a paragraph end turns them into a Para with its
+edges trimmed. A paragraph with no text is dropped. Blocks put in place (a text box, a picture) end the paragraph
+they come in.
+
+Sub-documents (`_subdoc`). Notes, comments, headers, footers, watermarks and text boxes keep their text in a 0x08
+packet: [u16 block count][4 bytes][u32 size] * count, then the blocks, which follow one another, so the packet's
+stream is one range of the file, walked by `_walk6` as a story of its own (a count of 0 is a story with no text; a
+size table or a total past the packet is unreadable, counted under the reference's kind). Every reference walk of one
+document shares one map of packet ids: a packet being walked is a cycle, and a reference deeper than
+`limits.MAX_DEPTH`, are counted `depth` and give nothing, the outer text kept. A packet walked before gives the blocks
+it gave then (the same note keeps its one id). Past `WPD_SUBDOCS` references the rest are counted `note`, one each.
+Inside deleted text (undo) notes, comments, headers and boxes are left out with it, as libwpd does.
+* Footnotes and endnotes: D7 sub 0 or 2 (on), its first prefix id the text packet; endnotes are footnotes. The text
+  up to D7 sub 1 or 3 (off), or to the paragraph's end, is the number the body shows and is dropped. The note goes
+  into `Doc.notes` as `fn-N` with a `NoteRef` in place; a note with no text gives no mark.
+* Comments: D4 sub 0x1D, the first of its prefix ids that is a 0x1B packet, [u16 count, 1][u16 text packet id][flags],
+  read as a note through `word_fields.comment_note(blocks, "")` ("Comment: "), `cm-N`. Any other 0x1B, or none, counts
+  `note`.
+* Headers, footers and watermarks: D6 sub 0-5 (header A, B, footer A, B, watermark A, B), the first prefix id. Each
+  is one line of its blocks' text (a table's cells one after another), a watermark a header line, deduplicated.
+  A note or comment in one cannot stand on the line: it is counted `note`, and a picture `image`.
+* Boxes: DF sub 0-2 (anchored to a character, paragraph or page; a graphics rule, 3, is nothing; a box with flags bit
+  0x40 is ignored, as libwpd does). The content kind comes from the first 0x41 packet among its prefix ids ([u16 n]
+  [u16 id] * n [u16 box data size], then the name and library section [u16 size][byte][flags][s16 name length], the
+  counter and positioning sections skipped by their u16 sizes, and the content section [u16 size][byte][kind]); the
+  box's own content data overrides it (14 reserved bytes, two u16 sizes, u16 override flags, then the counter 0x8000
+  and positioning 0x4000 sections skipped by their sizes, and the content 0x2000 section [u16 size][u16 flags], its
+  kind after 2 bytes more when those flags have 0x8000, when they have 0x4000). A style whose name length is -4 is an
+  equation box: counted `object`. A box with a 0x07 (hyperlink) packet among its ids counts `link`. Kind 1 is a text
+  box: its first 0x08 packet's paragraphs in place (none: `shape`). Kind 3 is a picture: its first 0x40 packet, with
+  child ids ([u16 n][u16 id] * n) only when its index entry has flags bit 0x01, names 0x6F packets whose bytes are each
+  an `Image` in place, WPG or not, charged against `limits.IMAGE_BYTES` (past it, or a picture missing, `image`).
+
+Tables. D4 sub 0x2A (table definition on) opens a table in the story; 0x2B and 0x2C (definition off, columns) are
+nothing. Then each row code starts a row and each row or cell code a cell; the cell's paragraphs go into it; the
+table off code, the next table on, or the story's end, closes the table in place. A row or cell group's non-deletable
+data, after [u16 size] deletable bytes, is a list of sub-functions, each [id] and its bytes (0x80 5, 0x82 and 0x83 4,
+0x84 9, 0x85 4, 0x86 10, 0x87 and 0x88 6, 0x89 11, 0x8B and 0x8C 3, 0x8D 1; 0x81, 0x8E and 0x8F [u16 size]); an unknown
+one, or one past the group, ends the list. 0x80 [flags]: bit 0x04 makes the row a header row. 0x85 [columns][rows]:
+the cell's spans; 128 columns or more is a cell bound to the one above: it is no cell, its text joining the origin
+cell that covers its column (its width the low seven bits, at least 1); with no cell above it is a plain one. Rows
+are made on their first cell, and a row that gets none is left out. Cells are charged against the document's
+`limits.TABLE_NODES`, shared by every table, and a row stops at `limits.GRID_COLS` columns; the cells past either are
+dropped with their text and counted `cells` once a table. A table whose codes fail is dropped, counted `table`. In
+deleted text a table code ends a paragraph of the deleted text.
 """
 import struct
 from dataclasses import dataclass
 
+from .. import limits
 from ..limits import ReadError
-from ..model import Bold, Doc, Hidden, Para, Text
+from ..model import Bold, Cell, Doc, Hidden, Image, NoteRef, Para, Table, Text
 from .wpd_charsets import char
+from .word_fields import comment_note
 
 MAX_TITLE = 500          # characters of the wpd title
+WPD_SUBDOCS = 10_000     # sub-documents (notes, comments, headers, footers, watermarks, text boxes) read a document
 
 _MAGIC = b"\xffWPC"
 _HEAD = 16
@@ -74,7 +125,7 @@ _FIXED = (4, 5, 3, 3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 8, 8)
 _MIN_VAR = 7             # [id][sub][u16 size] ... [u16 size][id]
 # text bytes (0x00-0x7F) are 1, function bytes 0: `find(b"\0")` ends a run
 _CLASS = bytes(1 if i < 0x80 else 0 for i in range(256))
-_INTL = {0: None, **{i + 1: c for i, c in enumerate(
+_INTL = {0: None, 0x7F: None, **{i + 1: c for i, c in enumerate(
     "åÅæÆäÄáàâãÃçÇëéÉ"
     "èêíñÑøØõÕöÖüÜúùß")}}
 _SPACE_BYTES = frozenset((0x80, 0xBA, 0xBB, 0xBC, 0xCD, 0xCE, 0xCF))
@@ -83,6 +134,20 @@ _SINGLE = {**{b: " " for b in _SPACE_BYTES}, 0x81: " ", 0x84: "-"}
 _EOL_SPACE = frozenset((1, 2, 3, 0x14, 0x15, 0x16))
 _EOL_PARA = frozenset((*range(4, 0x14), *range(0x17, 0x1D)))
 _ATTR_WARNING = "attribute: unknown WordPerfect attribute number"
+# packet types
+_LINK, _TEXT, _COMMENT, _GFX_NAME, _BOX_STYLE, _GFX_DATA = 0x07, 0x08, 0x1B, 0x40, 0x41, 0x6F
+_PREFIX_BIT = 0x80       # a variable group's flags: prefix ids follow
+_IGNORE_BIT = 0x40       # a box's flags: the box is ignored
+_CHILD_BIT = 0x01        # an index entry's flags: the packet has child ids
+_EQUATION = -4           # a box style's name length for an equation box
+_TEXT_BOX, _PICTURE = 1, 3
+_BOUND = 128             # a column span this large binds the cell to the one above
+_NOSPAN = (1, 1, False)  # (columns, rows, header row)
+# the EOL group's non-deletable sub-functions: their sizes, id included; 0x81, 0x8E and 0x8F give theirs in a u16
+_EOL_SUBS = {0x80: 5, 0x82: 4, 0x83: 4, 0x84: 9, 0x85: 4, 0x86: 10, 0x87: 6, 0x88: 6, 0x89: 11, 0x8B: 3, 0x8C: 3,
+             0x8D: 1}
+_EOL_SIZED = frozenset((0x81, 0x8E, 0x8F))
+_NEW = object()          # a packet id not walked yet
 
 
 @dataclass(frozen=True)
@@ -105,20 +170,43 @@ def head(data: bytes) -> Head | None:
 
 # ---- stories
 
+class _Tab:
+    """The open table of a story: its rows of origin cells, the row being filled (None until its first cell), whether
+    it is a header row, the column the next cell takes, the origin cell covering each column, the cell its text goes
+    to, and whether its cells were cut."""
+    __slots__ = ("rows", "row", "hdr", "col", "owner", "cell", "cut")
+
+    def __init__(self):
+        self.rows = []
+        self.row = None
+        self.hdr = False
+        self.col = 0
+        self.owner = {}
+        self.cell = None
+        self.cut = False
+
+
 class _Story:
-    """One story's paragraphs: (hidden kind, bold, text) runs until a paragraph end makes them a Para."""
-    __slots__ = ("kind", "_bold", "_hid", "_runs", "_blocks")
+    """One story's paragraphs: (hidden kind, bold, text or NoteRef) runs until a paragraph end makes them a Para, in
+    the open table's cell when there is one."""
+    __slots__ = ("kind", "mute", "_bold", "_hid", "_runs", "_blocks", "_tab")
 
     def __init__(self, kind="body"):
         self.kind = kind
+        self.mute = False  # a note's number, between its on and off codes, is not text of the story
         self._bold = False
         self._hid = ""
         self._runs = []
         self._blocks = []
+        self._tab = None
 
     def text(self, s):
-        if s:
+        if s and not self.mute:
             self._runs.append((self._hid, self._bold, s))
+
+    def ref(self, mark):
+        """A NoteRef in the paragraph."""
+        self._runs.append(("", False, mark))
 
     def bold(self, on):
         self._bold = bool(on)
@@ -128,27 +216,104 @@ class _Story:
         self._hid = kind
 
     def end_para(self):
+        self.mute = False
         if self._hid:  # a paragraph end inside deleted text is deleted with it
             self.text(" ")
             return
         self._flush()
 
+    def put(self, blocks):
+        """Blocks in place (a text box, pictures): the paragraph they come in ends before them."""
+        self._flush()
+        self._target().extend(blocks)
+
     def blocks(self) -> list:
         self._flush()
+        if self._tab is not None:
+            self._close_table()
         return self._blocks
 
+    def _target(self) -> list:
+        t = self._tab
+        return t.cell.blocks if t is not None and t.cell is not None else self._blocks
+
     def _flush(self):
+        self.mute = False
         runs, self._runs = self._runs, []
         _trim(runs)
         if runs:
-            self._blocks.append(Para(_inlines(runs)))
+            self._target().append(Para(_inlines(runs)))
+
+    # ---- tables
+
+    def table(self, event, span, st):
+        """A table code: "on", "row", "cell" or "off"; `span` is (columns, rows, header row) from its group."""
+        if self._hid:
+            self.end_para()
+            return
+        if event == "on":
+            self._flush()
+            if self._tab is not None:
+                self._close_table()
+            self._tab = _Tab()
+            return
+        t = self._tab
+        if t is None:
+            self.end_para()
+            return
+        self._flush()
+        if event == "off":
+            self._close_table()
+            return
+        if event == "row":
+            t.row, t.hdr, t.col = None, span[2], 0
+        self._cell(t, span, st)
+
+    def drop_table(self):
+        self._runs = []
+        self._tab = None
+
+    def _cell(self, t, span, st):
+        cols, rows = span[0], span[1]
+        if cols >= _BOUND:
+            owner = t.owner.get(t.col)
+            t.col += max(1, cols & 0x7F)
+            if owner is not None:
+                t.cell = owner  # bound to the cell above: its text joins that cell
+                return
+            cols = rows = 1
+        cols, rows = max(1, cols), max(1, rows)
+        if t.col >= limits.GRID_COLS or st.budget[0] <= 0:
+            if not t.cut:
+                t.cut = True
+                st.ctx.skipped["cells"] += 1
+            t.cell = Cell([])  # in no row: its text is dropped with it
+            t.col += cols
+            return
+        st.budget[0] -= 1
+        cell = Cell([], rowspan=rows, colspan=cols, header=t.hdr)
+        if t.row is None:
+            t.row = []
+            t.rows.append(t.row)
+        t.row.append(cell)
+        for c in range(t.col, min(t.col + cols, limits.GRID_COLS)):
+            t.owner[c] = cell
+        t.col += cols
+        t.cell = cell
+
+    def _close_table(self):
+        t, self._tab = self._tab, None
+        if t.rows:
+            self._blocks.append(Table(t.rows))
 
 
 def _trim(runs):
-    """Strip the white space at the paragraph's two edges, in place."""
+    """Strip the white space at the paragraph's two edges, in place; a NoteRef is an edge that stays."""
     k = 0
     while k < len(runs):
         h, b, t = runs[k]
+        if not isinstance(t, str):
+            break
         t = t.lstrip()
         if t:
             runs[k] = (h, b, t)
@@ -158,6 +323,8 @@ def _trim(runs):
     k = len(runs)
     while k:
         h, b, t = runs[k - 1]
+        if not isinstance(t, str):
+            break
         t = t.rstrip()
         if t:
             runs[k - 1] = (h, b, t)
@@ -167,9 +334,15 @@ def _trim(runs):
 
 
 def _inlines(runs) -> list:
-    """Adjacent runs of one look merge; consecutive hidden runs of one kind are one Hidden."""
+    """Adjacent runs of one look merge; consecutive hidden runs of one kind are one Hidden; a NoteRef stands alone."""
     out, cur = [], None  # cur: [hidden, bold, parts]
     for h, b, t in runs:
+        if not isinstance(t, str):
+            if cur is not None:
+                _put(out, cur)
+                cur = None
+            out.append(t)
+            continue
         if cur is not None and cur[0] == h and cur[1] == b:
             cur[2].append(t)
             continue
@@ -211,8 +384,9 @@ def _attribute(ctx):
 
 # ---- the WP6+ prefix index
 
-def _prefix6(data, ctx) -> dict:
-    """Packet type -> [(id, offset, size)], ids counted from 1 as the index numbers them."""
+def _prefix6(data, ctx, index=None) -> dict:
+    """Packet type -> [(id, offset, size)], ids counted from 1 as the index numbers them; `index`, when given, is
+    filled with id -> (type, flags, offset, size)."""
     n = len(data)
     ih = struct.unpack_from("<H", data, 14)[0] if n >= _HEAD else 0
     ih = max(ih, 16)
@@ -226,11 +400,13 @@ def _prefix6(data, ctx) -> dict:
         if at + 14 > n:
             ctx.skipped["record"] += 1  # the index is cut by the end of the file
             break
-        _flags, ptype, _use, _hide, size, offset = struct.unpack_from("<BBHHII", data, at)
+        flags, ptype, _use, _hide, size, offset = struct.unpack_from("<BBHHII", data, at)
         if offset + size > n:
             ctx.skipped["record"] += 1
             continue
         out.setdefault(ptype, []).append((i, offset, size))
+        if index is not None:
+            index[i] = (ptype, flags, offset, size)
     return out
 
 
@@ -277,8 +453,29 @@ def _chars(data, j, end) -> str:
 
 # ---- the WP6+ body walk
 
-def _walk6(data, start, end, story, ctx):
-    """Walk the function codes of data[start:end] into `story` (see the module docstring)."""
+class _State:
+    """One WP6+ document's walk: the data and its packets (id -> (type, flags, offset, size)), the Doc its stories
+    fill, and what every story of it shares."""
+    __slots__ = ("data", "index", "doc", "ctx", "visited", "subdocs", "ids", "count", "seen", "img_total", "budget")
+
+    def __init__(self, data, index, doc, ctx):
+        self.data = data
+        self.index = index
+        self.doc = doc
+        self.ctx = ctx
+        self.visited = {}   # text packet id -> the blocks it gave, None while it is walked
+        self.subdocs = 0    # sub-document references read (WPD_SUBDOCS)
+        self.ids = {}       # text packet id -> its note id
+        self.count = {"fn": 0, "cm": 0}
+        self.seen = set()   # (kind, line) of the header and footer lines kept
+        self.img_total = 0  # picture bytes emitted (IMAGE_BYTES)
+        self.budget = [limits.TABLE_NODES]  # cells the document's tables may still take
+
+
+def _walk6(data, start, end, story, st, depth=0):
+    """Walk the function codes of data[start:end] into `story` (see the module docstring); `depth` is the story's
+    sub-document nesting, 0 for the body."""
+    ctx = st.ctx
     skipped = ctx.skipped
     cls = data[start:end].translate(_CLASS)
     pos = start
@@ -294,7 +491,9 @@ def _walk6(data, start, end, story, ctx):
             pos = stop
             continue
         if b < 0xD0:
-            if b in _PARA_BYTES:
+            if 0xBD <= b <= 0xC6:
+                _table(story, "off" if b < 0xC0 else "cell" if b == 0xC6 else "row", _NOSPAN, st)
+            elif b in _PARA_BYTES:
                 story.end_para()
             else:
                 story.text(_SINGLE.get(b, ""))
@@ -317,7 +516,7 @@ def _walk6(data, start, end, story, ctx):
             pos += 1
             continue
         if b < 0xF0:
-            _variable(b, data[pos + 1], story)
+            _variable(b, data, pos, size, story, undo, st, depth)
         else:
             undo = _fixed(b, data, pos, story, undo, ctx)
         pos += size
@@ -342,14 +541,341 @@ def _check(data, pos, end, b):
     return size, size
 
 
-def _variable(b, sub, story):
+def _variable(b, data, pos, size, story, undo, st, depth):
+    """One variable group that passed its check."""
+    sub = data[pos + 1]
     if b == 0xD0:
-        if sub in _EOL_SPACE:
+        if 0x0A <= sub <= 0x13:
+            event = "cell" if sub == 0x0A else "row" if sub <= 0x10 else "off"
+            _table(story, event, _NOSPAN if event == "off" else _cellinfo(data, pos, size), st)
+        elif sub in _EOL_SPACE:
             story.text(" ")
         elif sub in _EOL_PARA:
             story.end_para()
     elif b == 0xE0:
         story.text(" ")
+    elif b == 0xD4 and sub == 0x2A:
+        _table(story, "on", _NOSPAN, st)
+    elif undo:
+        return  # notes, comments, headers and boxes in deleted text are left out with it
+    elif b == 0xD7:
+        if sub in (0, 2):
+            _footnote(data, pos, size, story, st, depth)
+        elif sub in (1, 3):
+            story.mute = False
+    elif b == 0xD4 and sub == 0x1D:
+        _comment(data, pos, size, story, st, depth)
+    elif b == 0xD6 and sub <= 5:
+        _header(data, pos, size, sub, st, depth)
+    elif b == 0xDF and sub <= 2:
+        _box(data, pos, size, story, st, depth)
+
+
+def _ghead(data, pos, size):
+    """The head of the variable group at pos: (flags, prefix ids, contents start, non-deletable end, contents end),
+    or None when it does not fit the group."""
+    gend = pos + size - 3
+    q = pos + 4
+    if q >= gend:
+        return None
+    flags = data[q]
+    q += 1
+    pids = ()
+    if flags & _PREFIX_BIT:
+        if q >= gend:
+            return None
+        n = data[q]
+        q += 1
+        if q + 2 * n > gend:
+            return None
+        pids = struct.unpack_from(f"<{n}H", data, q)
+        q += 2 * n
+    if q + 2 > gend:
+        return None
+    nd = struct.unpack_from("<H", data, q)[0]
+    q += 2
+    if nd & 0x8000 or nd > size:
+        return None
+    return flags, pids, q, min(q + nd, gend), gend
+
+
+def _u16(data, q, end):
+    """The u16 at q, or None when it is not inside [.., end)."""
+    return struct.unpack_from("<H", data, q)[0] if q + 2 <= end else None
+
+
+def _kind(st, pid):
+    ent = st.index.get(pid)
+    return ent[0] if ent is not None else None
+
+
+# ---- tables
+
+def _table(story, event, span, st):
+    """A table code into `story`, under guard("table"): a table whose codes fail is dropped."""
+    done = False
+    with st.ctx.guard("table"):
+        story.table(event, span, st)
+        done = True
+    if not done:
+        story.drop_table()
+
+
+def _cellinfo(data, pos, size):
+    """(columns, rows, header row) from the non-deletable sub-functions of the EOL group at pos."""
+    h = _ghead(data, pos, size)
+    if h is None:
+        return _NOSPAN
+    _, _, c, nd_end, gend = h
+    skip = _u16(data, c, nd_end)
+    if skip is None:
+        return _NOSPAN
+    cols = rows = 1
+    hdr = False
+    q = c + 2 + skip
+    while q < nd_end:  # each sub-function moves q on by at least one byte
+        f = data[q]
+        if f in _EOL_SIZED:
+            n = _u16(data, q + 1, gend)
+            if n is None or n < 3:
+                break
+        else:
+            n = _EOL_SUBS.get(f)
+            if n is None:
+                break
+        if q + n > gend:
+            break
+        if f == 0x80:
+            hdr = bool(data[q + 1] & 0x04)
+        elif f == 0x85:
+            cols, rows = data[q + 1], data[q + 2]
+        q += n
+    return cols, rows, hdr
+
+
+# ---- sub-documents: notes, comments, headers, footers, watermarks, boxes
+
+def _text_span(data, off, size):
+    """The stream of the 0x08 packet at off: (start, end), empty for no text; None when its block table does not
+    fit the packet."""
+    end = off + size
+    n = _u16(data, off, end)
+    if n is None or off + 6 > end:
+        return None
+    q = off + 6
+    if not n:
+        return q, q
+    if q + 4 * n > end:
+        return None
+    a = q + 4 * n
+    total = sum(struct.unpack_from(f"<{n}I", data, q))
+    if a + total > end:
+        return None
+    return a, a + total
+
+
+def _subdoc(pid, kind, story_kind, visited, depth, st):
+    """The blocks of text packet `pid` walked as a story of `story_kind`, at nesting `depth`; None when it is not read:
+    past WPD_SUBDOCS (`note`), a cycle or past MAX_DEPTH (`depth`), or a packet missing or unreadable (`kind`). A
+    packet walked before gives its blocks again."""
+    skipped = st.ctx.skipped
+    if st.subdocs >= WPD_SUBDOCS:
+        skipped["note"] += 1
+        return None
+    got = visited.get(pid, _NEW)
+    if got is None or depth > limits.MAX_DEPTH:
+        skipped["depth"] += 1
+        return None
+    if got is not _NEW:
+        st.subdocs += 1
+        return got
+    ent = st.index.get(pid)
+    span = _text_span(st.data, ent[2], ent[3]) if ent is not None and ent[0] == _TEXT else None
+    if span is None:
+        skipped[kind] += 1
+        return None
+    st.subdocs += 1
+    visited[pid] = None
+    story = _Story(story_kind)
+    _walk6(st.data, span[0], span[1], story, st, depth)
+    blocks = visited[pid] = story.blocks()
+    return blocks
+
+
+def _footnote(data, pos, size, story, st, depth):
+    story.mute = True  # the number the body shows, up to the note off
+    h = _ghead(data, pos, size)
+    if story.kind == "header" or h is None or not h[1]:
+        st.ctx.skipped["note"] += 1
+        return
+    _mark(h[1][0], "fn", story, st, depth)
+
+
+def _comment(data, pos, size, story, st, depth):
+    h = _ghead(data, pos, size)
+    if story.kind != "header" and h is not None:
+        for pid in h[1]:
+            ent = st.index.get(pid)
+            if ent is not None and ent[0] == _COMMENT:
+                off, end = ent[2], ent[2] + ent[3]
+                text = _u16(data, off + 2, end)
+                if _u16(data, off, end) == 1 and text is not None:
+                    _mark(text, "cm", story, st, depth)
+                    return
+                break
+    st.ctx.skipped["note"] += 1
+
+
+def _mark(pid, prefix, story, st, depth):
+    """A note ("fn") or comment ("cm") of text packet `pid`: into Doc.notes once, its NoteRef into `story`."""
+    blocks = _subdoc(pid, "note", "note", st.visited, depth + 1, st)
+    if blocks is None:
+        return
+    nid = st.ids.get(pid)
+    if nid is None:
+        if not blocks:
+            return
+        st.count[prefix] += 1
+        nid = st.ids[pid] = f"{prefix}-{st.count[prefix]}"
+        st.doc.notes[nid] = comment_note(blocks, "") if prefix == "cm" else blocks
+    story.ref(NoteRef(nid))
+
+
+def _header(data, pos, size, sub, st, depth):
+    kind = "footer" if sub in (2, 3) else "header"  # 0-1 headers, 2-3 footers, 4-5 watermarks
+    h = _ghead(data, pos, size)
+    if h is None or not h[1]:
+        st.ctx.skipped[kind] += 1
+        return
+    blocks = _subdoc(h[1][0], kind, "header", st.visited, depth + 1, st)
+    line = _flat(blocks) if blocks else ""
+    if line and (kind, line) not in st.seen:
+        st.seen.add((kind, line))
+        (st.doc.footers if kind == "footer" else st.doc.headers).append(line)
+
+
+def _flat(blocks) -> str:
+    """A header's line: its paragraphs' text and its tables' cells, one after another; hidden text left out."""
+    out = []
+    for b in blocks:
+        if isinstance(b, Para):
+            t = " ".join(_plain(b.inlines).split())
+        elif isinstance(b, Table):
+            t = _flat([x for row in b.rows for cell in row for x in cell.blocks])
+        else:
+            continue
+        if t:
+            out.append(t)
+    return " ".join(out)
+
+
+def _plain(inlines) -> str:
+    return "".join(i.text if isinstance(i, Text) else _plain(i.inlines) if isinstance(i, Bold) else ""
+                   for i in inlines)
+
+
+def _box(data, pos, size, story, st, depth):
+    skipped = st.ctx.skipped
+    h = _ghead(data, pos, size)
+    if h is None:
+        skipped["shape"] += 1
+        return
+    flags, pids, c, _, gend = h
+    if flags & _IGNORE_BIT:
+        return
+    ctype, name = 0, None
+    for pid in pids:
+        ent = st.index.get(pid)
+        if ent is not None and ent[0] == _BOX_STYLE:
+            ctype, name = _style(data, ent[2], ent[2] + ent[3])
+            break
+    own = _override(data, c, gend)
+    if own is not None:
+        ctype = own
+    if any(_kind(st, p) == _LINK for p in pids):
+        skipped["link"] += 1
+    if name == _EQUATION:
+        skipped["object"] += 1
+    elif ctype == _TEXT_BOX:
+        pid = next((p for p in pids if _kind(st, p) == _TEXT), None)
+        if pid is None:
+            skipped["shape"] += 1
+            return
+        blocks = _subdoc(pid, "shape", "box", st.visited, depth + 1, st)
+        if blocks:
+            story.put(blocks)
+    elif ctype == _PICTURE:
+        _pictures(data, pids, story, st)
+
+
+def _style(data, q, end):
+    """(content kind, name length) of the 0x41 box style packet in data[q:end]; the kind 0, the name None, when the
+    packet is too short to give them."""
+    n = _u16(data, q, end)
+    if n is None:
+        return 0, None
+    q += 2 + 2 * n + 2  # the child ids, the box data size
+    size = _u16(data, q, end)  # the name and library section
+    if size is None:
+        return 0, None
+    name = struct.unpack_from("<h", data, q + 4)[0] if q + 6 <= end else None
+    q += 2 + size
+    for _ in range(2):  # the counter and positioning sections
+        size = _u16(data, q, end)
+        if size is None:
+            return 0, name
+        q += 2 + size
+    q += 2  # the content section's size, then a byte, then the kind
+    return (data[q + 1] if q + 2 <= end else 0), name
+
+
+def _override(data, q, end):
+    """The content kind a box group's own data in data[q:end] overrides, or None."""
+    q += 18  # 14 reserved bytes, two u16 sizes
+    flags = _u16(data, q, end)
+    if flags is None or not flags & 0x2000:
+        return None
+    q += 2
+    for bit in (0x8000, 0x4000):  # the counter and positioning sections
+        if flags & bit:
+            size = _u16(data, q, end)
+            if size is None:
+                return None
+            q += 2 + size
+    inner = _u16(data, q + 2, end)  # after the content section's size
+    if inner is None or not inner & 0x4000:
+        return None
+    q += 4 + (2 if inner & 0x8000 else 0)
+    return data[q] if q < end else None
+
+
+def _pictures(data, pids, story, st):
+    """A picture box: the 0x6F packets its first 0x40 packet names, each an Image in place."""
+    skipped = st.ctx.skipped
+    kids = ()
+    gid = next((p for p in pids if _kind(st, p) == _GFX_NAME), None)
+    if gid is not None:
+        _, flags, off, size = st.index[gid]
+        n = _u16(data, off, off + size) if flags & _CHILD_BIT else None
+        if n is not None:
+            fit = min(n, (size - 2) // 2)
+            if fit < n:
+                skipped["image"] += 1  # ids cut by the packet's end
+            kids = struct.unpack_from(f"<{fit}H", data, off + 2)
+    if not kids:
+        skipped["image"] += 1
+        return
+    pics = []
+    for k in kids:
+        ent = st.index.get(k)
+        if (ent is None or ent[0] != _GFX_DATA or not ent[3] or story.kind == "header"
+                or st.img_total + ent[3] > limits.IMAGE_BYTES):
+            skipped["image"] += 1
+            continue
+        st.img_total += ent[3]
+        pics.append(Image(data[ent[2]:ent[2] + ent[3]]))
+    if pics:
+        story.put(pics)
 
 
 def _fixed(b, data, pos, story, undo, ctx) -> bool:
@@ -400,12 +926,13 @@ def _wp6(data, h, ctx) -> Doc:
         raise ReadError("damaged", "the WordPerfect document pointer is inside the head")
     if h.pointer > n:
         raise ReadError("damaged", "the WordPerfect document pointer is past the end of the file")
-    packets = _prefix6(data, ctx)
+    index = {}
+    packets = _prefix6(data, ctx, index)
     doc = Doc()
     with ctx.guard("record"):
         doc.title = _title6(data, packets)
     story = _Story("body")
-    _walk6(data, h.pointer, n, story, ctx)
+    _walk6(data, h.pointer, n, story, _State(data, index, doc, ctx))
     doc.blocks = story.blocks()
     if not doc.blocks:
         raise ReadError("damaged", "no WordPerfect body")
