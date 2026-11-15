@@ -265,6 +265,12 @@ GAP = 0.2        # a gap over this many sizes between two glyphs is a space
 UPWARD = 0.3     # reading order is rebuilt when this share of line steps go up
 LINE_TOLERANCE = 0.5   # fragments within this many sizes of one baseline are one line
 PARA_GAP = 1.5   # a baseline step over this many line heights ends a paragraph
+# a table-of-contents entry's ending, matched on a line's last TOC_TAIL chars, its trailing
+# space stripped: a leader (3 of . · ‥ … _, or dots a single space apart) and a page label,
+# arabic or a well-formed roman numeral (so "...did" or "...civil" is no label)
+TOC_ENDING = re.compile(r"(?:[.·‥…_]{3}|\. \. \.) *(?:\d+|(?=[ivxlcdm])m{0,4}(?:cm|cd|d?c{0,3})"
+                        r"(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3}))\Z", re.IGNORECASE)
+TOC_TAIL = 64
 GRID = 64.0      # link grid cell, in page units
 GRID_SPAN = 32   # a link or fragment over this many cells a side skips the grid
 # A fragment drawn out of reading order on a line (see `lines`) joins from wholly before the line
@@ -700,12 +706,20 @@ def join_break(left: str, right: str, model) -> str:
     return (left[:-1] if drop else left) + sep + right
 
 
+def toc_entry(text: str) -> bool:
+    """Whether a line ends as a table-of-contents entry does: a leader run, then a page label
+    in arabic digits or roman numerals. Only the line's end is looked at, and only its last
+    TOC_TAIL chars, so a long line costs no more than a short one."""
+    return TOC_ENDING.search(text.rstrip()[-TOC_TAIL:]) is not None
+
+
 def paragraphs(lns, model) -> List[Para]:
     """Paragraphs: a baseline step over PARA_GAP x the line height (or a step that does not go
-    forward) starts a new one. Links become Link inlines; nothing is bold."""
+    forward) starts a new one, and a table-of-contents entry (`toc_entry`) ends its own. Links
+    become Link inlines; nothing is bold."""
     groups, cur, prev = [], [], None
     for ln in lns:
-        if prev is not None:
+        if prev is not None and cur:
             if ln.vertical != prev.vertical:
                 step = None
             elif ln.vertical:
@@ -717,6 +731,9 @@ def paragraphs(lns, model) -> List[Para]:
                 cur = []
         cur.append(ln)
         prev = ln
+        if toc_entry(ln.text):
+            groups.append(cur)
+            cur = []
     if cur:
         groups.append(cur)
     out = []

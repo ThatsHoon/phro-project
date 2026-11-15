@@ -135,6 +135,33 @@ def test_paragraph_break():
     assert para_text(out[1]) == "next para"
 
 
+def _paras(*lines):
+    """The paragraph texts of lines set 14 apart, one paragraph's spacing."""
+    fr = [frag(t, 72, 700 - 14 * k) for k, t in enumerate(lines)]
+    return [para_text(p) for p in L.paragraphs(L.lines(numbered(fr)), L.SpacingModel())]
+
+
+def test_toc_entry_ends_paragraph():
+    # evenly spaced table-of-contents entries: each one ends at its leader and page label
+    assert _paras("Introduction ........ 1", "Scope · · · ··········· 12",
+                  "Appendix . . . . iv") == ["Introduction ........ 1",
+                                             "Scope · · · ··········· 12", "Appendix . . . . iv"]
+    assert _paras("Terms ___ 3", "Index ‥‥…5", "Notes ... XII") == [
+        "Terms ___ 3", "Index ‥‥…5", "Notes ... XII"]
+    # the line after an entry starts its own paragraph, and it joins the lines after it
+    assert _paras("Contents ..... 9", "Body text goes", "on here.") == [
+        "Contents ..... 9", "Body text goes on here."]
+
+
+def test_toc_ending_needs_leader_and_label():
+    # dots with no page label, a number with no leader, or too short a leader: the lines join
+    assert _paras("and so on...", "the text goes on") == ["and so on... the text goes on"]
+    assert _paras("chapter 12", "the text goes on") == ["chapter 12 the text goes on"]
+    assert _paras("as in Fig.. 3", "the text goes on") == ["as in Fig.. 3 the text goes on"]
+    assert _paras("so . . 3", "the text goes on") == ["so . . 3 the text goes on"]
+    assert _paras("and then... did", "the text goes on") == ["and then... did the text goes on"]
+
+
 def test_content_order_kept():
     fr = [frag("left a", 72, 700), frag("left b", 72, 686), frag("left c", 72, 672),
           frag("right a", 360, 700), frag("right b", 360, 686), frag("right c", 360, 672)]
