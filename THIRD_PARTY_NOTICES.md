@@ -174,7 +174,7 @@ SOFTWARE.
 
 ## docling
 
-Ported: hidden sections and slides, comments, notes fields and the chart local table in `scripts/reader/formats/odf*.py`; `w:vanish`, hidden slides and outline level handling in `scripts/reader/formats/ooxml*.py`; spine merge and link rewrite in `scripts/reader/formats/epub.py`.
+Ported: hidden sections and slides, comments, notes fields and the chart local table in `scripts/reader/formats/odf*.py`; `w:vanish`, hidden slides and outline level handling in `scripts/reader/formats/ooxml*.py`; spine merge and link rewrite in `scripts/reader/formats/epub.py`; the raw Snappy block and IWA chunk stream in `scripts/reader/containers/snappy.py` and the protobuf wire reader in `scripts/reader/containers/pbwire.py`, from `docling/backend/iwork/iwa.py` at docling v2.150.0 (1ae470a1f4580881ed73853f64e0bf178f623c5e).
 
 ```
 MIT License
