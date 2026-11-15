@@ -66,7 +66,7 @@ Decisions 1 and 2 are the user's answers (`rea-decisions.md`, "사용자 결정"
 25. macOS bundle folders are not taken by the gate. Read keeps failing on a folder, and the README says so.
 26. LZVN (`bvxn`) members are counted and skipped. No decoder yet.
 27. An equation is counted as `object`.
-28. `character_index` is read in code points. Text outside the BMP gives a warning.
+28. `character_index` is read in UTF-16 code units (amended 2026-11-15, Task 12 ruling: real IWA storages count UTF-16 units). Text outside the BMP gives a warning.
 29. `preview.jpg` is output, as one image with the LOST line, only when the body could not be read.
 30. python-pages is read on the web (not downloaded) to check the Pages field numbers; this is a plan task.
 31. Samples with hidden rows, a skipped slide and an emoji paragraph come from the user if they make them. Without them, the addendum says those three are untested on real files.
@@ -271,7 +271,7 @@ Shared code they reuse, unchanged unless the edit is named:
 - Styles: field 5 paragraph styles (2022; name through `super` and `parent`, `STYLE_CHAIN` steps) give headings by name (Defaults). Field 6 gives list depth and field 7 (2023) the list label type, for `ListItem` with `-` or `1.`. Field 8 character styles give bold (property 1) through the same chain.
 - Links and notes: field 11 `HyperlinkField` (2032) url is a `Link` for http, https and mailto, else text. Field 16 footnotes (2008 → storage) give `NoteRef` and note blocks. Field 23 highlights (2013 → 3056 {1 text, 3 author → 212 name, 4 replies}) give a comment note.
 - Changes: field 22 deletions (2060 kind 2) are `Hidden` with kind `deleted`. Insertions are plain text.
-- Every run table is `{1 entries {1 character_index, 2 ref}}`, and an entry with no ref ends the run. Indexes are code points (decision 28).
+- Every run table is `{1 entries {1 character_index, 2 ref}}`, and an entry with no ref ends the run. Indexes are UTF-16 code units (decision 28).
 - An equation (2015) is counted `object`.
 
 **Tables (`iwork_tables`).**
@@ -336,7 +336,7 @@ Local caps in each module, unless `limits.py` is named:
 
 | Cap | Value | Past it |
 |---|---|---|
-| `MOBI_RECORD` (palmdb) | the record-size field (0 means 4,096) + 8 bytes unpacked per text record | the record is cut, counted `record` |
+| `MOBI_RECORD` (palmdb, `record_cap()`) | the record-size field (0 means 4,096) + 8 bytes unpacked per text record | the record is cut, counted `record` |
 | `MOBI_TEXT` (palmdb) | 64 MiB, and at most 32 × the file size | the text is cut, counted `truncated` |
 | HUFF/CDIC (palmdb, Tika's) | recursion 32; dictionary 16 MiB (64 bytes charged per phrase); one phrase 64 KiB; code lengths 1-32; index bits at most 16 | the record fails, counted `record`; a bad table fails the book (`damaged`) |
 | `INDX_ENTRIES` | 100,000 entries an index; TAGX at most 64 tags and 8 control bytes; varints at most 5 bytes; index records no more than the records left | the KF8 fallback |
@@ -354,7 +354,8 @@ Local caps in each module, unless `limits.py` is named:
 | `STYLE_CHAIN` | 8 style parents (docling) | the chain stops |
 | `TABLE_SEGMENTS` | 100,000 segments of one value table, with a visited set | the rest unread, counted `cells` |
 | tiles | tile size 1 to 65,536; rows to `SHEET_ROWS`, columns to `SHEET_COLS`; cells `SHEET_CELLS`, characters `SHEET_CHARS`, unpacked cells `SHEET_SCAN` (`limits.py`) | the sheet is cut, counted `sheet_cut` |
-| `IWORK_XML` | 100 MiB inflated '09 index (docling) | `too_large` |
+| `IWORK_XML` | 100 MiB inflated '09 index (docling); `flate` also caps output at `ZIP_RATIO` times the input | `too_large` |
+| `IWORK_NODES` | 2,000,000 elements of one '09 index (amended 2026-11-15, final review: about 80 B held per element) | `too_large` |
 | charts | `CHART_CELLS`, `CHART_TOTAL` (`limits.py`) | counted `chart_cut` |
 | `IMAGE_BYTES` (`limits.py`) | 256 MiB a document; mobi, wpd and iWork join its comment | counted `image` |
 
@@ -363,7 +364,7 @@ The plan's measure task runs `snappy.iwa` over 256 MiB and the wpd body walk ove
 ### Hostile input
 
 - **Length fields.** Every PalmDB offset, INDX position, FDST range, WordPerfect group size and packet range, protobuf length and cell offset is checked against its buffer before use.
-- **Bombs.** Snappy declares at most 21 times its input. The declared length is checked against `SNAPPY_BLOCK` and the budget before any output, and output past the declaration fails. PalmDOC and HUFF output stop at the record cap; HUFF recursion and the dictionary are capped. '09 gzip stops at `IWORK_XML`. An `Index.zip` keeps `zipx`'s own ratio and total checks.
+- **Bombs.** Snappy declares at most 21 times its input (`snappy._RATIO = 22` rounds 64/3 up). The declared length is checked against `SNAPPY_BLOCK` and the budget before any output, and output past the declaration fails. PalmDOC and HUFF output stop at the record cap; HUFF recursion and the dictionary are capped. '09 gzip stops at `IWORK_XML`. An `Index.zip` keeps `zipx`'s own ratio and total checks.
 - **Cycles.** CDIC self-reference, WordPerfect note → packet → note, WP5 index chains, iWork references, style parents and value-table segments are cut by visited sets and depth caps.
 - **Huge tables.** A false tileid or span is stopped by the row, column and slot caps. Rows are never allocated from a declared count.
 - **Planted text.** KF8 `display:none` and `hidden`, wpd undo and Pages (IWA) deletions are hidden by default. Pages '09 tracked changes are not read, so their deleted text shows as body text (amended 2026-11-15, Task 15: no public source names the '09 change elements). WP6+ hidden text is not detected (Hidden text in WordPerfect). Heading text in the context is cleaned by `gate._heading`, as now.
@@ -377,7 +378,7 @@ The plan's measure task runs `snappy.iwa` over 256 MiB and the wpd body walk ove
 | `encrypted` | a WordPerfect encryption word, a 4.2 password head, an iWork `.iwpv2` or `.iwph`, a '09 index with a non-standard zip method |
 | `unsupported` | mobi compression or encoding outside the specification, KFX, Topaz, PalmDOC; WPG files, Mac WordPerfect without the switch, an unknown WordPerfect version or product |
 | `damaged` | a PalmDB table out of order, no readable chapter, no WordPerfect body, an iWork file with no readable part and no preview |
-| `too_large` | `IWA_BYTES`, `IWORK_XML`, the zip checks |
+| `too_large` | `IWA_BYTES`, `IWORK_XML`, `IWORK_NODES`, the zip checks |
 | `timeout` | the LibreOffice child |
 
 New `LOST` entries:
