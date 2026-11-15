@@ -14,7 +14,7 @@ from reader.containers import palmdb  # noqa: E402
 from reader.containers.palmdb import HuffCdic, Palm, palmdoc, record_cap, text_cap, trailing  # noqa: E402
 from reader.formats import mobi  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Image, Para  # noqa: E402
+from reader.model import Context, Heading, Image, Para  # noqa: E402
 
 
 def _pdb(records, type_creator=b"BOOKMOBI"):
@@ -1031,6 +1031,215 @@ def test_refusals():
     assert kind(_mobi(b"<html><body></body></html>")) == "damaged"           # no readable chapter
     assert kind(_mobi(b"")) == "damaged"
     assert kind(_pdb([b"short"])) == "damaged"                                 # no MOBI head
+
+
+# ---- NCX headings and footnotes
+NCX_TAGX = [(1, 1, 0x01, 0), (3, 1, 0x02, 0), (4, 1, 0x04, 0), (0, 0, 0, 1)]
+
+
+def _ncx_recs(entries):
+    """The NCX index records of entries (position, depth, label)."""
+    cncx, rows = b"", []
+    for pos, depth, label in entries:
+        raw = label.encode()
+        rows.append((f"{len(rows):04d}", {1: [pos], 3: [len(cncx)], 4: [depth]}))
+        cncx += _vwi(len(raw)) + raw
+    return _indx_records(NCX_TAGX, rows, cncx=cncx + bytes(4))
+
+
+def _ncx_book(text, entries, **kw):
+    chunks = max(1, -(-len(text) // 4096))
+    return _mobi(text, extra=_ncx_recs(entries), ncx=1 + chunks, **kw)
+
+
+def _blocks(doc):
+    return [b for s in doc.blocks for b in s.blocks]
+
+
+def _headings(doc):
+    return [(b.level, _text_of(b.inlines)) for b in _blocks(doc) if isinstance(b, Heading)]
+
+
+NCX_BODY = b"<html><body><p>Intro</p><p>Chapter A</p><p>text</p><p>Sub B</p><p>body</p></body></html>"
+
+
+def test_ncx_headings():
+    entries = [(NCX_BODY.index(b"<p>Chapter A"), 0, "Chapter A"), (NCX_BODY.index(b"<p>Sub B"), 1, "Sub B")]
+    doc, ctx = _read(_ncx_book(NCX_BODY, entries))
+    assert _headings(doc) == [(1, "Chapter A"), (2, "Sub B")]
+    assert [type(b).__name__ for b in _blocks(doc)] == ["Para", "Heading", "Para", "Heading", "Para"]
+    assert not ctx.skipped
+    assert mobi._ncx(Palm(_ncx_book(NCX_BODY, entries)), mobi._head(Palm(_ncx_book(NCX_BODY, entries)).record(0)), 0,
+                     Context()) == [(e[0], e[1], e[2]) for e in entries]
+    deep = mobi._mark_headings(b"<p>a</p>", [(3, 9, "")])
+    assert deep == b"<p>\x1e5a</p>"
+
+
+def test_ncx_marker_inside_tag():
+    text = b'<html><body><p>x</p><p class="c">Title</p><p>y</p></body></html>'
+    pos = text.index(b"class")
+    assert mobi._mark_headings(text, [(pos, 0, "")]) == text.replace(b'class="c">', b'class="c">\x1e0')
+    doc, _ = _read(_ncx_book(text, [(pos, 1, "Title")]))
+    assert _headings(doc) == [(2, "Title")]
+
+
+def test_ncx_marker_in_table_cell():
+    text = b'<html><body><p>x</p><table><tr><td class="k">cell</td></tr></table></body></html>'
+    doc, ctx = _read(_ncx_book(text, [(text.index(b"class"), 0, "cell")]))
+    assert _headings(doc) == []
+    md = _md(doc, ctx)
+    assert "cell" in md and "\x1e" not in md and "\x0e" not in md
+    doc, ctx = _read(_ncx_book(NCX_BODY, [(NCX_BODY.index(b"<p>text"), 0, "")]))
+    assert "\x1e" not in _md(doc, ctx) and "\x0e" not in _md(doc, ctx)
+
+
+def test_ncx_skipped_when_text_has_1e():
+    text = NCX_BODY.replace(b"Intro", b"In\x1etro")
+    doc, ctx = _read(_ncx_book(text, [(text.index(b"<p>Chapter A"), 0, "Chapter A")]))
+    assert _headings(doc) == [] and "Chapter A" in _text_of(doc.blocks) and "tro" in _text_of(doc.blocks)
+    assert not ctx.skipped
+    doc, _ = _read(_ncx_book(NCX_BODY.replace(b"Intro", b"In\x0etro"), [(NCX_BODY.index(b"<p>Chapter A"), 0, "")]))
+    assert _headings(doc) == []
+
+
+def test_ncx_items_cap():
+    entries = [(NCX_BODY.index(b"<p>Chapter A"), 0, "A"), (NCX_BODY.index(b"<p>Sub B"), 1, "B")]
+    old = mobi.NCX_ITEMS
+    mobi.NCX_ITEMS = 1
+    try:
+        doc, ctx = _read(_ncx_book(NCX_BODY, entries))
+    finally:
+        mobi.NCX_ITEMS = old
+    assert _headings(doc) == [(1, "Chapter A")] and not ctx.skipped
+    long = _ncx_book(NCX_BODY, [(5, 0, "x" * 1000)])
+    assert len(mobi._ncx(Palm(long), mobi._head(Palm(long).record(0)), 0, Context())[0][2]) == mobi.MAX_LABEL
+
+
+def test_ncx_unreadable_gives_nothing():
+    book = _ncx_book(NCX_BODY, [(NCX_BODY.index(b"<p>Chapter A"), 0, "A")])
+    palm = Palm(book)
+    head = mobi._head(palm.record(0))
+    broken = _pdb([palm.record(i) if i != head.ncx else b"XXXX" + palm.record(i)[4:] for i in range(palm.count)])
+    ctx = Context()
+    assert mobi._ncx(Palm(broken), head, 0, ctx) == [] and not ctx.skipped and not ctx.warnings
+    doc, ctx = _read(broken)
+    assert _headings(doc) == [] and "Chapter A" in _text_of(doc.blocks) and not ctx.skipped
+
+
+def test_ncx_in_kf8():
+    for files in ([(b"<html><body><p>one</p><p>Two</p></body></html>", [])],):
+        flow0, _, _ = _kf8_text(files)
+        recs = _kf8_recs(files)
+        ncx_at = len(recs)
+        recs += _ncx_recs([(flow0.index(b"<p>Two"), 0, "Two")])
+        recs[0] = _rec0(version=8, text_length=len(flow0), text_records=1, fdst=2, skel=3, frag=5, ncx=ncx_at)
+        doc, ctx = _read(_pdb(recs))
+        assert _headings(doc) == [(1, "Two")] and not ctx.skipped
+    # no skeleton: two <html> parts, the second holds the position
+    flow0 = b"<html><body><p>one</p></body></html><html><body><p>Two</p></body></html>"
+    recs = _kf8_recs(flow0=flow0)
+    ncx_at = len(recs)
+    recs += _ncx_recs([(flow0.index(b"<p>Two"), 0, "Two")])
+    recs[0] = _rec0(version=8, text_length=len(flow0), text_records=1, fdst=2, ncx=ncx_at)
+    doc, _ = _read(_pdb(recs))
+    assert _headings(doc) == [(1, "Two")]
+
+
+def _fn_book(link, *, early=False, sup=True, filler=40, body_note=b"<p>1. The note text</p>", tail=b""):
+    """A book whose text holds a link, filler paragraphs and a note, with the link's filepos set to the note (or to the
+    first paragraph when early)."""
+    pre = b"<html><body><p>Start here</p>" + b"<p>Body text of the chapter." + b"</p><p>More.</p>" * 3
+    mid = b"<p>filler filler filler</p>" * filler
+    ref = b"<p>Claim" + (b"<sup>" + link + b"</sup>" if sup else link) + b" made.</p>"
+    head = pre + ref + mid
+    full = head + body_note + tail + b"</body></html>"
+    pos = full.index(b"<p>Start here") if early else full.index(body_note)
+    return full.replace(b"filepos=0000000000", b"filepos=%010d" % pos)
+
+
+def test_footnote_heuristic_links():
+    text = _fn_book(b"<a filepos=0000000000>1</a>")
+    doc, ctx = _read(_mobi(text))
+    md = _md(doc, ctx)
+    assert "[^" in md and md.count("The note text") == 1
+    body = "".join(_text_of(b) for s in doc.blocks for b in s.blocks)
+    assert "The note text" not in body
+    assert list(doc.notes) == ["#fp%d" % text.index(b"<p>1. The note")]
+
+
+def test_footnote_rejects_index_entry():
+    # a 2-character link in the last chapter to an early position of the body
+    text = _fn_book(b"<a filepos=0000000000>ab</a>", early=True)
+    text = text.replace(b"<p>Claim", b"<mbp:pagebreak/><p>Claim")
+    doc, ctx = _read(_mobi(text))
+    assert "[^" not in _md(doc, ctx) and not doc.notes
+    # a 5-character link to a note near the end
+    doc, ctx = _read(_mobi(_fn_book(b"<a filepos=0000000000>12345</a>")))
+    assert "[^" not in _md(doc, ctx) and "The note text" in _md(doc, ctx)
+    # a link with no sup and no noteref type
+    doc, ctx = _read(_mobi(_fn_book(b"<a filepos=0000000000>1</a>", sup=False)))
+    assert "[^" not in _md(doc, ctx)
+    # a target in the middle of the book, not in the last chapter
+    text = _fn_book(b"<a filepos=0000000000>1</a>", tail=b"<p>filler</p>" * 400)
+    mid = text.index(b"<p>filler filler filler</p>")
+    text = text.replace(b"filepos=%010d" % text.index(b"<p>1. The note"), b"filepos=%010d" % mid)
+    text = text.replace(b"<p>1. The note", b"<mbp:pagebreak/><p>1. The note")
+    doc, ctx = _read(_mobi(text))
+    assert "[^" not in _md(doc, ctx)
+
+
+def test_noteref_role_without_sup():
+    text = _fn_book(b'<a epub:type="noteref" filepos=0000000000>*</a>', sup=False)
+    doc, ctx = _read(_mobi(text))
+    assert "[^" in _md(doc, ctx) and len(doc.notes) == 1
+    text = _fn_book(b'<a role="doc-noteref" filepos=0000000000>*</a>', sup=False)
+    doc, ctx = _read(_mobi(text))
+    assert "[^" in _md(doc, ctx)
+
+
+def test_note_never_whole_chapter():
+    text = (b"<html><body><p>Start</p><p>See<sup><a filepos=0000000000>1</a></sup></p>" + b"<p>pad</p>" * 20
+            + b"<br/>tail text outside any block</body></html>")
+    text = text.replace(b"filepos=0000000000", b"filepos=%010d" % text.index(b"tail text"))
+    doc, ctx = _read(_mobi(text))
+    md = _md(doc, ctx)
+    assert "[^" not in md and "tail text outside any block" in md and not doc.notes
+
+
+def test_footnote_anchor_after_unclosed_paragraph():
+    # no </p> before the note: the anchor lands inside the paragraph before it; the note is still the next one
+    text = (b"<html><body><p>Claim<sup><a filepos=0000000000>1</a></sup> made." + b"<p>pad" * 30
+            + b"<p>1. The note text<p>end</body></html>")
+    text = text.replace(b"filepos=0000000000", b"filepos=%010d" % text.index(b"<p>1. The note"))
+    doc, ctx = _read(_mobi(text))
+    md = _md(doc, ctx)
+    assert "[^" in md and md.count("The note text") == 1
+
+
+def test_anchor_cap():
+    old = mobi.MOBI_ANCHORS
+    mobi.MOBI_ANCHORS = 1
+    try:
+        a = b"<p>Claim<sup><a filepos=0000000000>1</a></sup> and<sup><a filepos=1111111111>2</a></sup>.</p>"
+        text = b"<html><body>" + a + b"<p>pad</p>" * 30 + b"<p>1. first note</p><p>2. second note</p></body></html>"
+        text = text.replace(b"filepos=0000000000", b"filepos=%010d" % text.index(b"<p>1. first"))
+        text = text.replace(b"filepos=1111111111", b"filepos=%010d" % text.index(b"<p>2. second"))
+        doc, ctx = _read(_mobi(text))
+    finally:
+        mobi.MOBI_ANCHORS = old
+    md = _md(doc, ctx)
+    assert ctx.skipped["link"] == 1 and "[^" in md and "and2" in md and "second note" in md
+
+
+def test_footnote_heuristic_is_linear():
+    import time
+    n = 6000
+    links = b"".join(b"<p>c<sup><a filepos=0000000000>%d</a></sup></p>" % (i % 9 + 1) for i in range(n))
+    text = b"<html><body>" + links + b"<p>pad</p>" * 50 + b"<p>1. the note</p></body></html>"
+    text = text.replace(b"filepos=0000000000", b"filepos=%010d" % text.index(b"<p>1. the note"))
+    t0 = time.perf_counter()
+    doc, ctx = _read(_mobi(text))
+    assert time.perf_counter() - t0 < 10 and len(doc.notes) == 1
 
 
 def test_parse_path():

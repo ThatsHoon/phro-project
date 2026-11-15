@@ -15,6 +15,12 @@ links. Unlike foliate-js, a book whose SKEL index is 0xFFFFFFFF is read from flo
 `kindle:pos` target is an anchor inserted at its byte, as for `filepos`, not an `id`/`aid` lookup. A combo book
 (EXTH 121 and a BOUN record) is read from its KF8 half; a KF8 structure that cannot be read falls back to the MOBI 6
 copy of a combo, or to the stripped text of flow 0 in a KF8-only book.
+
+Headings come from the NCX index (tag 1 position, tag 4 depth, as foliate-js `getNCX` reads it): a marker, byte 0x1e and
+the depth digit, is inserted at each position in the same pass as the link anchors (both in the coordinates of the text
+before any insert, so neither shifts the other), and after `html.blocks` a paragraph that starts with one becomes a
+heading. Python counts 0x1e as white space (regex white space, `str.strip`), which html.py would turn into a space, so the parts
+carry byte 0x0e instead from the moment they are parsed. Footnotes follow the sup-link heuristic of `_mark_notes`.
 """
 import bisect
 import html as stdhtml
@@ -28,11 +34,13 @@ from .. import images, limits
 from ..containers import palmdb
 from ..containers.palmdb import HuffCdic, Palm, palmdoc, record_cap, text_cap, trailing
 from ..limits import ReadError
-from ..model import Context, Doc, Para, Section, Text
+from ..model import Break, Context, Doc, Heading, Para, Section, Table, Text
 
 MOBI_ANCHORS = 100_000  # anchors one book may insert
 MAX_SHEETS = 32         # stylesheets one chapter may use
 MAX_TITLE = 300
+NCX_ITEMS = 10_000      # NCX entries read; labels are cut at MAX_LABEL
+MAX_LABEL = 300
 MAX_EXTH = 1024         # EXTH records read
 MAX_EXTH_VALUES = 64    # values kept per EXTH type
 INDX_ENTRIES = 100_000  # entries (and CNCX strings) one index may hold
@@ -61,6 +69,10 @@ _BLOCK_TAG = re.compile(r"<\s*/?\s*(?:p|div|br|hr|h[1-6]|li|ul|ol|dl|dt|dd|tr|ta
 _DEAD = re.compile(r"<\s*(script|style)\b", re.I)
 _CLOSE = {"script": re.compile(r"</\s*script\b", re.I), "style": re.compile(r"</\s*style\b", re.I)}
 _TAG = re.compile(r"<[^<>]*>")
+_MARK = re.compile("\x0e([0-5])")
+_POSID = re.compile(r"(?:fp|kp)(\d{1,12})\Z")
+_NOTE_BLOCKS = frozenset(("p", "div", "li", "aside", "blockquote"))
+_NOTEREF = frozenset(("noteref", "doc-noteref"))
 
 
 @dataclass
@@ -206,10 +218,14 @@ def _utf8(text: bytes, encoding: int) -> bytes:
     return b"\xef\xbb\xbf" + text.decode(_CODECS.get(encoding, "utf-8"), errors="replace").encode("utf-8")
 
 
-def _anchor(text: bytes, targets: dict, utf8: bool = True) -> bytes:
+def _anchor(text: bytes, targets: dict, utf8: bool = True, marks: dict | None = None) -> bytes:
     """`<a id="..."></a>` inserted at the byte positions of `targets` (position -> id). A position inside a tag moves
     before that tag's `<`, one inside a UTF-8 sequence back to its lead byte, one past the end is dropped. At most
-    MOBI_ANCHORS are inserted."""
+    MOBI_ANCHORS are inserted.
+
+    marks (position -> depth) inserts the heading marker byte 0x1e + depth digit (0-5) at each position in the same pass, so
+    anchors and markers both count from the text as it was: a position inside a tag moves after that tag's `>` (one
+    with no `>` in reach is dropped), a position at the end of the text is dropped; the first mark at a spot wins."""
     n = len(text)
     spots: dict = {}
     for pos in sorted(p for p in targets if 0 <= p <= n)[:MOBI_ANCHORS]:
@@ -221,16 +237,46 @@ def _anchor(text: bytes, targets: dict, utf8: bool = True) -> bytes:
         lt = text.rfind(b"<", lo, p)
         if lt >= 0 and lt > text.rfind(b">", lo, p):
             p = lt
-        spots.setdefault(p, []).append(targets[pos])
+        spots.setdefault(p, []).append(b'<a id="' + str(targets[pos]).encode("ascii", "replace") + b'"></a>')
+    for pos, depth in sorted((marks or {}).items()):
+        if not 0 <= pos < n:
+            continue
+        p = pos
+        if utf8:
+            while 0 < p < n and text[p] & 0xC0 == 0x80 and pos - p < 3:
+                p -= 1
+        lo = max(0, p - _LOOK)
+        lt = text.rfind(b"<", lo, p)
+        if lt >= 0 and lt > text.rfind(b">", lo, p):
+            gt = text.find(b">", p, p + _LOOK)
+            if gt < 0:
+                continue
+            p = gt + 1
+        if not any(m[:1] == b"\x1e" for m in spots.get(p, ())):
+            spots.setdefault(p, []).append(b"\x1e" + str(min(max(depth, 0), 5)).encode())
     if not spots:
         return text
     out, last = [], 0
     for p in sorted(spots):
         out.append(text[last:p])
-        out.extend(b'<a id="' + str(i).encode("ascii", "replace") + b'"></a>' for i in spots[p])
+        out.extend(spots[p])
         last = p
     out.append(text[last:])
     return b"".join(out)
+
+
+def _mark_headings(text: bytes, entries, utf8: bool = True) -> bytes:
+    """The text with the heading marker byte 0x1e + depth digit (0-5, deeper clamped) inserted at each NCX position of
+    entries ((position, depth, label)); a position inside a tag moves after its `>`."""
+    marks: dict = {}
+    for pos, depth, _ in entries:
+        marks.setdefault(pos, depth)
+    return _anchor(text, {}, utf8, marks)
+
+
+def _tainted(text: bytes) -> bool:
+    """A text that already holds a marker byte (0x1e, or 0x0e, which the parts carry) is read without the NCX headings."""
+    return b"\x1e" in text or b"\x0e" in text
 
 
 # ---- images
@@ -433,6 +479,28 @@ def _indx(palm, start: int, ctx) -> list:
     return out
 
 
+def _ncx(palm, head: Head, base: int, ctx) -> list:
+    """The NCX of a book as (position, depth, label): tag 1 is the byte position in the text, tag 4 the depth, tag 3 the
+    CNCX offset of the label (cut at MAX_LABEL). At most NCX_ITEMS entries are read; an entry with no position is left
+    out. An index that cannot be read gives [] with no count, so the book reads as without one. `base` is the record
+    the KF8 indexes count from (0 for MOBI 6)."""
+    if head.ncx == NULL:
+        return []
+    try:
+        index = _indx(_View(palm, base) if base else palm, head.ncx, ctx)
+    except _STRUCTURAL:
+        return []
+    out = []
+    for _, tags in itertools.islice(index, NCX_ITEMS):
+        pos = tags.get(1)
+        if not pos:
+            continue
+        depth = (tags.get(4) or [0])[0]
+        label = index.cncx.get((tags.get(3) or [-1])[0], "")
+        out.append((pos[0], depth, label[:MAX_LABEL]))
+    return out
+
+
 def _fdst(palm, head: Head) -> list:
     """The (start, end) text ranges of the FDST flows; flow 0 is the XHTML. Raises _Fallback past FDST_FLOWS, or on a
     range outside the text, one that starts after its end, or one that starts before the previous one ends (so the
@@ -524,11 +592,17 @@ def _pos_key(m) -> tuple:
     return (m.group(2), m.group(3)) if m.group(2) is not None else (m.group(4), m.group(5))
 
 
-def _kindle_pos(parts: list, where: dict, starts: list, utf8: bool, ctx) -> list:
+def _kindle_pos(parts: list, where: dict, starts: list, utf8: bool, ctx, marks=()) -> list:
     """The parts with each `kindle:pos:fid:F:off:O` target anchored (`kp` + its book position) and its link pointed
     there. A target outside its part, an unknown fid, or one past MOBI_ANCHORS (counted `link` once) leaves the link its
-    text only."""
+    text only. marks (position, depth, label) are NCX entries in the book's text; each is inserted into the part that
+    holds it, the part's start counted off."""
     targets = [{} for _ in parts]
+    heads = [{} for _ in parts]
+    for pos, depth, _ in marks:
+        t = bisect.bisect_right(starts, pos) - 1
+        if t >= 0:
+            heads[t].setdefault(pos - starts[t], depth)
     names: dict = {}   # (fid, off) as written -> anchor name; never more than MOBI_ANCHORS, so neither are targets
     over = False
 
@@ -564,13 +638,13 @@ def _kindle_pos(parts: list, where: dict, starts: list, utf8: bool, ctx) -> list
     def href(m):
         name = names.get(_pos_key(m))
         return m.group(1) + (b'href="#' + name.encode("ascii") + b'"' if name else b"")
-    return [_KINDLE_POS.sub(href, _anchor(part, targets[t], utf8)) for t, part in enumerate(parts)]
+    return [_KINDLE_POS.sub(href, _anchor(part, targets[t], utf8, heads[t])) for t, part in enumerate(parts)]
 
 
-def _kf8_parts(palm, head: Head, base: int, ctx, text: bytes | None = None) -> tuple:
+def _kf8_parts(palm, head: Head, base: int, ctx, text: bytes | None = None, marks=()) -> tuple:
     """(XHTML parts, flows by FDST number) of a KF8 book whose record 0 is `base` (0, or the record after BOUN in a
     combo; the KF8 indexes count from it). A book without FDST is one flow; one without SKEL is flow 0 split at each
-    `<html`. Raises _Fallback (or ValueError, IndexError) on a structure that cannot be read."""
+    `<html`. marks are the NCX entries to insert (see _kindle_pos). Raises _Fallback (or ValueError, IndexError) on a structure that cannot be read."""
     view = _View(palm, base)
     if text is None:
         text = _text(view, head, len(palm._data), ctx)
@@ -579,7 +653,9 @@ def _kf8_parts(palm, head: Head, base: int, ctx, text: bytes | None = None) -> t
     if not flows[0].strip():
         raise _Fallback("flow 0 is empty")
     if head.skel == NULL:
-        return _kindle_pos(_split_html(flows[0]), {}, [], head.encoding == 65001, ctx), flows
+        parts = _split_html(flows[0])
+        starts = [0, *itertools.accumulate(len(p) for p in parts[:-1])]
+        return _kindle_pos(parts, {}, starts, head.encoding == 65001, ctx, marks), flows
     skels = [(_val(t, 1), _val(t, 6), _val(t, 6, 1)) for _, t in _indx(view, head.skel, ctx)]
     frags = []
     if head.frag != NULL:
@@ -588,7 +664,7 @@ def _kf8_parts(palm, head: Head, base: int, ctx, text: bytes | None = None) -> t
                 raise _Fallback("a FRAG label is not an insert position")
             frags.append((int(label), _val(t, 4) if t.get(4) else i, _val(t, 6), _val(t, 6, 1)))   # tag 3: file
     parts, where, starts = _assemble(flows[0], skels, frags)
-    return _kindle_pos(parts, where, starts, head.encoding == 65001, ctx), flows
+    return _kindle_pos(parts, where, starts, head.encoding == 65001, ctx, marks), flows
 
 
 def _kf8_head(palm: Palm, head: Head) -> tuple:
@@ -625,8 +701,9 @@ def _kf8(data: bytes, palm: Palm, head: Head, kf8: Head, base: int, ctx) -> tupl
     view = _View(palm, base)
     scratch = Context() if base else ctx   # a combo's KF8 text counts only if the KF8 half is read
     text = _text(view, kf8, len(data), scratch)
+    marks = [] if _tainted(text) else _ncx(palm, kf8, base, ctx)
     try:
-        parts, flows = _kf8_parts(palm, kf8, base, ctx, text=text)
+        parts, flows = _kf8_parts(palm, kf8, base, ctx, text=text, marks=marks)
     except _STRUCTURAL:
         if base:
             ctx.skipped["kf8_fallback"] = 1
@@ -650,7 +727,8 @@ def _kf8(data: bytes, palm: Palm, head: Head, kf8: Head, base: int, ctx) -> tupl
             sheets[i] = flows[i][:xhtml.MAX_SHEET * 4].decode(codec, errors="replace")
         return sheets[i]
     load = _loader(palm, _first_image(palm, kf8, base), ctx)
-    return _chapters(parts, load, lambda node: _css(node, ctx, sheet, len(flows)), kf8.encoding, ctx)
+    return _chapters(parts, load, lambda node: _css(node, ctx, sheet, len(flows)), kf8.encoding, ctx,
+                     bool(marks), len(flows[0]))
 
 
 # ---- book
@@ -691,6 +769,10 @@ def _css(node, ctx, sheet=None, flows: int = 0) -> xhtml.Css:
 def _mobi6(text: bytes, palm: Palm, head: Head, ctx) -> tuple:
     """(chapter sections, kept notes) of the MOBI 6 text."""
     utf8 = head.encoding == 65001
+    marks: dict = {}
+    for pos, depth, _ in [] if _tainted(text) else _ncx(palm, head, 0, ctx):
+        marks.setdefault(pos, depth)
+    size = len(text)
     targets, over = {}, False
     for m in _FILEPOS.finditer(text):  # the first MOBI_ANCHORS targets by occurrence
         pos = int(m.group(2))
@@ -704,27 +786,48 @@ def _mobi6(text: bytes, palm: Palm, head: Head, ctx) -> tuple:
     if over:
         ctx.skipped["link"] += 1
         ctx.warnings.append("link: links past the anchor limit keep their text only")
-    text = _anchor(text, targets, utf8)
+    text = _anchor(text, targets, utf8, marks)
 
     def href(m):  # a link whose target was not kept loses its filepos and stays plain text
         pos = int(m.group(2))
         return m.group(1) + (b'href="#fp' + str(pos).encode() + b'"' if pos in targets else b"")
     text = _FILEPOS.sub(href, text)
     text = _RECINDEX.sub(lambda m: m.group(1) + b'src="recindex:' + m.group(2) + b'"', text)
-    return _chapters(_PAGEBREAK.split(text), _loader(palm, head, ctx), lambda node: _css(node, ctx), head.encoding, ctx)
+    return _chapters(_PAGEBREAK.split(text), _loader(palm, head, ctx), lambda node: _css(node, ctx), head.encoding, ctx,
+                     bool(marks), size)
 
 
-def _chapters(pieces, load, css, encoding: int, ctx) -> tuple:
-    """(chapter sections, kept notes) of the text pieces, each parsed as one part under ctx.guard("chapter")."""
-    notes: dict = {}
-    sections = []
+def _chapters(pieces, load, css, encoding: int, ctx, headings: bool = False, text_len: int = 0) -> tuple:
+    """(chapter sections, kept notes) of the text pieces. Each piece is parsed as one part under ctx.guard("chapter");
+    notes are found over all the parts (_mark_notes) before any is read into blocks. headings: the pieces carry NCX
+    markers, which become headings (_promote) and are stripped; text_len is the length of the text the link targets
+    count in."""
+    trees = []
     for piece in pieces:
         if not piece.strip():
             continue
+        tree = None
         try:
             with ctx.guard("chapter"):
-                node = xhtml.tree(_utf8(piece, encoding))
+                if headings:
+                    piece = piece.replace(b"\x1e", b"\x0e")
+                tree = xhtml.tree(_utf8(piece, encoding))
+        except ReadError as e:
+            if e.kind != "damaged":
+                raise
+            ctx.skipped["chapter"] += 1
+        trees.append(tree)
+    _mark_notes(trees, text_len)
+    notes: dict = {}
+    sections = []
+    for node in trees:
+        if node is None:
+            continue
+        try:
+            with ctx.guard("chapter"):
                 blocks = xhtml.blocks(node, css=css(node), load=load, notes=notes, ctx=ctx)
+                if headings:
+                    blocks = _promote(blocks)
                 if blocks:
                     sections.append(Section("chapter", number=len(sections) + 1, blocks=blocks))
         except ReadError as e:
@@ -735,6 +838,8 @@ def _chapters(pieces, load, css, encoding: int, ctx) -> tuple:
     keep = xhtml.referenced(sections, notes)
     for k in keep:
         doc_notes[k] = notes[k]
+        if headings:
+            _strip(notes[k])
     if len(notes) > len(doc_notes):
         ctx.skipped["note"] += len(notes) - len(doc_notes)
     for s in sections:
@@ -742,6 +847,189 @@ def _chapters(pieces, load, css, encoding: int, ctx) -> tuple:
     for nb in doc_notes.values():
         xhtml.settle(nb, doc_notes)
     return sections, doc_notes
+
+
+# ---- headings from the NCX
+def _strip(blocks):
+    """Every heading marker removed from every text under blocks: paragraphs, headings, list items, quotes, table cells
+    and captions, and the inlines inside inlines."""
+    work = [blocks]
+    while work:
+        for b in work.pop():
+            if isinstance(b, Table):
+                b.caption = _MARK.sub("", b.caption)
+                work.extend(c.blocks for row in b.rows for c in row)
+            if hasattr(b, "blocks"):
+                work.append(b.blocks)
+            todo = [b]
+            while todo:
+                o = todo.pop()
+                if not hasattr(o, "inlines"):
+                    continue
+                for it in o.inlines:
+                    if isinstance(it, Text):
+                        it.text = _MARK.sub("", it.text)
+                    elif hasattr(it, "inlines"):
+                        todo.append(it)
+
+
+def _depth(inlines):
+    """The depth digit of the marker a run of inlines starts with, else None."""
+    while inlines:
+        first = inlines[0]
+        if isinstance(first, Text):
+            m = _MARK.match(first.text)
+            return int(m.group(1)) if m else None
+        if not hasattr(first, "inlines"):
+            return None
+        inlines = first.inlines
+    return None
+
+
+def _blank(inlines) -> bool:
+    todo = [inlines]
+    while todo:
+        for it in todo.pop():
+            if isinstance(it, Text):
+                if it.text.strip():
+                    return False
+            elif hasattr(it, "inlines"):
+                todo.append(it.inlines)
+            elif not isinstance(it, Break):
+                return False
+    return True
+
+
+def _promote(blocks: list) -> list:
+    """A Para whose text starts with a heading marker becomes Heading(depth + 1). A paragraph that is only a marker (the
+    position fell between two tags) gives its depth to the paragraph after it and goes. Every marker is then stripped
+    from every inline, headings and table cells included."""
+    out, pending = [], None
+    for b in blocks:
+        if isinstance(b, Para):
+            d = _depth(b.inlines)
+            _strip([b])
+            if d is not None and _blank(b.inlines):
+                pending = d
+                continue
+            if d is None:
+                d = pending
+            if d is not None:
+                while b.inlines and isinstance(b.inlines[0], Text) and not b.inlines[0].text.strip():
+                    del b.inlines[0]
+                if b.inlines and isinstance(b.inlines[0], Text):
+                    b.inlines[0].text = b.inlines[0].text.lstrip()
+                b = Heading(d + 1, b.inlines, hidden=b.hidden)
+        else:
+            _strip([b])
+        pending = None
+        out.append(b)
+    return out
+
+
+# ---- footnotes by the sup-link heuristic
+def _short(node) -> tuple:
+    """(visible text of a link when it is 1 to 4 characters, else None; True when a <sup> is inside it). Stops reading
+    once the text is too long."""
+    parts, size, sup = [], 0, False
+    stack = [iter(node.children)]
+    while stack:
+        for c in stack[-1]:
+            if isinstance(c, str):
+                parts.append(c)
+                size += len(c)
+                if size > 64:
+                    return None, sup
+            else:
+                sup = sup or c.tag == "sup"
+                stack.append(iter(c.children))
+                break
+        else:
+            stack.pop()
+    text = " ".join("".join(parts).split())
+    return (text if 1 <= len(text) <= 4 else None), sup
+
+
+def _scan(root, part: int, anchors: dict, links: list):
+    """Walk one tree once. anchors[id] = (part, the block a target anchor `<a id="fpN">` stands for, or None): the next
+    block when the anchor is empty and that block follows it, or opens after it when it ends its parent; else the
+    nearest block around it, counted only when it is a p, div, li, aside or blockquote. links gets (link, part, in a
+    <sup> or a noteref) for every `<a href="#...">`."""
+    pending = []
+    stack = [[root, 0, root, False]]
+    while stack:
+        fr = stack[-1]
+        node, i, block, sup = fr
+        if i >= len(node.children):
+            stack.pop()
+            continue
+        fr[1] += 1
+        c = node.children[i]
+        if isinstance(c, str):
+            if pending and c.strip():
+                for a in pending:
+                    anchors.setdefault(a, (part, None))
+                pending.clear()
+            continue
+        tag = c.tag
+        if pending:
+            hit = c if tag in _NOTE_BLOCKS else None
+            for a in pending:
+                anchors.setdefault(a, (part, hit if tag in xhtml.BLOCKS else None))
+            pending.clear()
+        if tag == "a":
+            aid = c.attrs.get("id") or ""
+            if _POSID.match(aid) and not c.children:
+                kids, j = node.children, i + 1
+                while j < len(kids) and isinstance(kids[j], str) and not kids[j].strip():
+                    j += 1
+                if j >= len(kids):
+                    pending.append(aid)
+                elif not isinstance(kids[j], str) and kids[j].tag in xhtml.BLOCKS:
+                    anchors.setdefault(aid, (part, kids[j] if kids[j].tag in _NOTE_BLOCKS else None))
+                else:
+                    anchors.setdefault(aid, (part, block if block.tag in _NOTE_BLOCKS else None))
+            href = (c.attrs.get("href") or "").strip()
+            if len(href) > 1 and href[0] == "#":
+                kinds = (c.attrs.get("epub:type") or c.attrs.get("role") or "").lower().split()
+                links.append((c, part, sup or bool(_NOTEREF.intersection(kinds))))
+        stack.append([c, 0, c if tag in xhtml.BLOCKS else block, sup or tag == "sup"])
+    for a in pending:
+        anchors.setdefault(a, (part, None))
+
+
+def _mark_notes(roots: list, text_len: int):
+    """Marks the notes the sup-link heuristic finds in the trees of a book's parts (None for a part that failed). A link
+    to a position in the book is a note reference when its visible text is 1 to 4 characters, it is inside a <sup> or
+    holds one or has `epub:type`/`role` noteref or doc-noteref, and its target lies in the last part or in the last fifth
+    of the text (the anchor ids `fpN` and `kpN` carry the position N). The note is the nearest block (p, div, li, aside,
+    blockquote) of the target, never body or html, and gets `role="doc-footnote"` and the target's id, so `html.blocks`
+    collects it as for epub; the link gets `epub:type="noteref"`. One walk of each tree and one pass over the links."""
+    anchors: dict = {}
+    links: list = []
+    last = -1
+    for n, root in enumerate(roots):
+        if root is not None:
+            last = n
+            _scan(root, n, anchors, links)
+    for a, _, marked in links:
+        target = a.attrs["href"].strip()[1:]
+        hit = anchors.get(target)
+        if hit is None or hit[1] is None:
+            continue
+        text, sup = _short(a)
+        if text is None or not (marked or sup):
+            continue
+        part, block = hit
+        if part != last and int(_POSID.match(target).group(1)) * 5 < text_len * 4:
+            continue
+        a.attrs["epub:type"] = "noteref"
+        key = block.attrs.get("id")
+        if not key:
+            key = block.attrs["id"] = target
+        a.attrs["href"] = "#" + key
+        block.attrs.pop("epub:type", None)
+        block.attrs["role"] = "doc-footnote"
 
 
 def parse_bytes(data: bytes, ctx) -> Doc:
