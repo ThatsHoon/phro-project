@@ -71,10 +71,14 @@ def packed(b) -> list[int]:
 
 
 def f32(b) -> float:
+    if len(b) != 4:
+        raise ValueError("protobuf float needs 4 bytes")
     return struct.unpack("<f", bytes(b))[0]
 
 
 def f64(b) -> float:
+    if len(b) != 8:
+        raise ValueError("protobuf double needs 8 bytes")
     return struct.unpack("<d", bytes(b))[0]
 
 

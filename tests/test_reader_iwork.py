@@ -65,6 +65,8 @@ def test_packed_f32_f64_ref_one():
     _raises(ValueError, pbwire.packed, b"\x80")
     assert pbwire.f32(struct.pack("<f", 2.5)) == 2.5
     assert pbwire.f64(struct.pack("<d", -3.25)) == -3.25
+    _raises(ValueError, pbwire.f32, b"ab")
+    _raises(ValueError, pbwire.f64, b"abc")
     assert pbwire.ref(pb_ref(42)) == 42
     assert pbwire.ref(pb((2, 1))) is None
     assert pbwire.ref(pb((1, b"x"))) is None
