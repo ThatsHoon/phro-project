@@ -384,6 +384,8 @@ def test_kindle_embed_loader():
     assert load("kindle:embed:0001?mime=image/png") == PNG
     assert load("kindle:embed:0002") is None and load("recindex:0") is None and load("recindex:99") is None
     assert load("kindle:embed:ZZZ") is None and load("http://x/y.png") is None
+    for src in ("kindle:embed:0_01", "kindle:embed:+1", "kindle:embed: 1", "kindle:embed:"):
+        assert load(src) is None, src
 
 
 def test_image_bytes_cap():
@@ -741,6 +743,9 @@ def test_fragment_work_cap():
     for bad in ((10 ** 6, b"<p>x</p>"),):
         doc, ctx = _read(_pdb(_kf8_recs([(files[0][0], files[0][1] + [bad])] + files[1:])))
         assert ctx.skipped == {"plain_text": 1}
+    # an insert before the second skeleton's start (insert < start): falls back, never placed
+    doc, ctx = _read(_pdb(_kf8_recs(files[:1] + [(files[1][0], [(-5, b"<p>x</p>")])])))
+    assert ctx.skipped == {"plain_text": 1} and "gamma" not in _text_of(doc.blocks)
 
 
 def test_kf8_no_skeleton_two_html():
@@ -807,10 +812,10 @@ def test_kindle_embed_image():
     assert [i.data for i in imgs] == [PNG] and not ctx.skipped
 
 
-def _pos_files(fid=b"0000", off=b"0000000009"):
+def _pos_files(fid=b"0000", off=b"0000000009", tail=b"?mime=text/html", quote=b'"'):
     s = b"<html><head></head><body><div></div></body></html>"
     a = b"<p>alpha target</p>"
-    link = b'<p><a href="kindle:pos:fid:' + fid + b":off:" + off + b'?mime=text/html">go</a></p>'
+    link = b"<p><a href=" + quote + b"kindle:pos:fid:" + fid + b":off:" + off + tail + quote + b' class="c">go</a></p>'
     at_a = s.index(b"</div>")
     built = s[:at_a] + a + s[at_a:]
     return [(s, [(at_a, a), (built.index(b"<p>alpha"), link)])]   # the link goes in before alpha and moves it
@@ -822,13 +827,23 @@ def test_kindle_pos_link():
     m = re.search(rb'<a id="(kp\d+)"></a>target', raw)
     assert m and b'href="#' + m.group(1) + b'"' in raw and b"kindle:pos" not in raw
     assert "go" in _text_of(doc.blocks) and "alpha target" in _text_of(doc.blocks) and not ctx.skipped
-    # a link to a fragment of the other file is anchored there
+    # a quoted tail past 200 characters, and an unquoted href: the whole attribute is rewritten, the rest kept
+    for tail, quote in ((b"?mime=text/html&" + b"x" * 300, b'"'), (b"", b"")):
+        doc, ctx, raw = _seen_trees(_pdb(_kf8_recs(_pos_files(tail=tail, quote=quote))))
+        m = re.search(rb'<a id="(kp\d+)"></a>target', raw)
+        assert m and b'<a href="#' + m.group(1) + b'" class="c">go' in raw and b"xxx" not in raw, raw
+    # links across files: kp<skeleton start + position in the part>
     files, _ = _two_files()
-    s2, ((at, c),) = files[1]
-    files[1] = (s2, [(at, c + b'<p><a href="kindle:pos:fid:0001:off:0000000003">b</a></p>')])
-    _, _, raw = _seen_trees(_pdb(_kf8_recs(files)))
-    m = re.search(rb'<a id="(kp\d+)"></a>beta', raw)
-    assert m and b'href="#' + m.group(1) + b'"' in raw
+    (s1, ((at_a, a), (at_b, b))), (s2, ((at, c),)) = files
+    to_gamma = b'<p><a href="kindle:pos:fid:0002:off:0000000003">g</a></p>'
+    files = [(s1, [(at_a, a), (at_b, b + to_gamma)]),
+             (s2, [(at, c + b'<p><a href="kindle:pos:fid:0001:off:0000000003">b</a></p>')])]
+    _, ctx, raw = _seen_trees(_pdb(_kf8_recs(files)))
+    beta = at_b + 3                                                      # skeleton 1 starts at 0
+    gamma = len(s1) + len(a) + len(b + to_gamma) + at + 3                # skeleton 2 starts after file 1's bytes
+    for kp, word in ((beta, b"beta"), (gamma, b"gamma")):
+        assert b'<a id="kp%d"></a>%s' % (kp, word) in raw and b'href="#kp%d"' % kp in raw, (kp, word)
+    assert not ctx.skipped
 
 
 def test_kindle_pos_past_end():
@@ -848,7 +863,8 @@ def test_kindle_pos_past_end():
 
 def test_combo_first_image_relative():
     flow0 = b'<html><body><p>x</p><img src="kindle:embed:0001?mime=image/png"/></body></html>'
-    doc, ctx = _read(_combo(OLD, _kf8_recs(flow0=flow0, images=[PNG])))     # absolute: KF8 record 0
+    # the absolute reading lands on KF8 record 0, not a picture; the relative one on the PNG
+    doc, ctx = _read(_combo(OLD, _kf8_recs(flow0=flow0, images=[PNG])))
     assert [b.data for s in doc.blocks for b in s.blocks if isinstance(b, Image)] == [PNG] and not ctx.skipped
     # images shared before the boundary: the absolute reading sniffs
     doc, ctx = _read(_combo(OLD, _kf8_recs(flow0=flow0, first_image=2), shared=[PNG]))
@@ -896,19 +912,72 @@ def test_indx_caps():
     big = _indx_records(tagx, [("a", {1: [2 ** 35 - 1]})])                           # a 5-byte varint
     assert mobi._indx(Palm(_pdb(big)), 0, Context())[0][1] == {1: [2 ** 35 - 1]}
     fails(_indx_records(tagx, [("a", {1: [1]})])[:1] + [rec[:60]])                  # an entry past its record
-    # FDST: 1,001 flows, a range past the text, a start after its end
+    # FDST: 1,001 flows, a range past the text, a start after its end, overlapping or out-of-order flows
     recs = _kf8_recs(files)
     at = mobi._head(recs[0]).fdst
     n = mobi._head(recs[0]).text_length
-    for flows in ([(0, n)] * 1001, [(0, n + 1)], [(5, 4)]):
+    for flows in ([(0, n)] + [(n, n)] * 1000, [(0, n + 1)], [(5, 4)], [(0, n), (0, n)], [(4, n), (0, 4)]):
         recs[at] = _fdst(flows)
         palm = Palm(_pdb(recs))
         raises(mobi._Fallback, mobi._fdst, palm, mobi._head(palm.record(0)))
         doc, ctx = _read(_pdb(recs))
         assert ctx.skipped == {"plain_text": 1} and "gamma" in _text_of(doc.blocks)
-    recs[at] = _fdst([(0, n)] * 1000)
+    recs[at] = _fdst([(0, n)] + [(n, n)] * 999)
     palm = Palm(_pdb(recs))
     assert len(mobi._fdst(palm, mobi._head(palm.record(0)))) == 1000
+
+
+def _peak(fn):
+    """fn's result and the peak bytes it allocated."""
+    import tracemalloc
+    tracemalloc.start()
+    try:
+        out = fn()
+        return out, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_repeated_index_entries_fall_back():
+    import time
+    tagx = [(1, 1, 0x03, 0), (0, 0, 0, 1)]                 # mask full: a byte count, then that many bytes of values
+    vals = b"\x80" * 20_000
+    entry = b"\x01a\x03" + _vwi(len(vals)) + vals
+
+    def index(copies):
+        rec = bytearray(56)
+        rec[0:4], rec[4:8], rec[20:24], rec[24:28] = b"INDX", _u32(56), _u32(56 + len(entry)), _u32(copies)
+        rec += entry + b"IDXT" + (56).to_bytes(2, "big") * copies
+        return Palm(_pdb(_indx_records(tagx, [])[:1] + [bytes(rec)]))
+    assert mobi._indx(index(1), 0, Context())[0][1] == {1: [0] * 20_000}
+    t = time.perf_counter()
+    raises(mobi._Fallback, mobi._indx, index(200), 0, Context())   # 200 offsets on one entry
+    assert time.perf_counter() - t < 1
+    three = Palm(_pdb(_indx_records([(1, 1, 0x01, 0), (0, 0, 0, 1)], [("a", {1: [1]}), ("b", {1: [2]}),
+                                                                     ("c", {1: [3]})])))
+    old = mobi.INDX_VALUES
+    mobi.INDX_VALUES = 2
+    try:
+        raises(mobi._Fallback, mobi._indx, three, 0, Context())
+    finally:
+        mobi.INDX_VALUES = old
+    assert len(mobi._indx(three, 0, Context())) == 3
+
+
+def test_overlapping_flows_and_skeletons_stay_bounded():
+    s = b"<html><body><p>" + b"x" * 200_000 + b"</p></body></html>"
+    recs = _kf8_recs([(s, [])])
+    head = mobi._head(recs[0])
+    flows = list(recs)
+    flows[head.fdst] = _fdst([(0, len(s))] * 1000)                 # 1,000 overlapping full-length flows
+    skels = list(recs)
+    skels[head.skel:head.skel + 2] = _indx_records(SKEL_TAGX, [(f"S{i:04d}", {1: [0, 0], 6: [0, len(s), 0, len(s)]})
+                                                               for i in range(1000)])  # 1,000 overlapping skeletons
+    for book in (flows, skels):
+        data = _pdb(book)
+        (doc, ctx), peak = _peak(lambda: _read(data))
+        assert ctx.skipped == {"plain_text": 1} and "x" * 1000 in _text_of(doc.blocks)
+        assert peak < 20 * len(s), peak
 
 
 def test_kf8_regexes_stay_linear():

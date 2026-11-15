@@ -36,6 +36,7 @@ MAX_TITLE = 300
 MAX_EXTH = 1024         # EXTH records read
 MAX_EXTH_VALUES = 64    # values kept per EXTH type
 INDX_ENTRIES = 100_000  # entries (and CNCX strings) one index may hold
+INDX_VALUES = INDX_ENTRIES * 64  # tag values one index may hold
 FDST_FLOWS = 1_000      # flows one FDST may hold
 MAX_TAGS = 64           # TAGX tag definitions
 MAX_CONTROL = 8         # TAGX control bytes
@@ -47,8 +48,10 @@ EXTH_TITLE = 503
 _LOOK = 8192            # bytes searched back for the `<` of the tag an anchor position falls in
 _CODECS = {1252: "cp1252", 65001: "utf-8"}
 _FILEPOS = re.compile(rb"(<a\b[^<>]{0,500}?)\bfilepos\s*=\s*[\"']?(\d{1,12})[\"']?", re.I)
-_KINDLE_POS = re.compile(rb"(<a\b[^<>]{0,500}?)\bhref\s*=\s*[\"']?kindle:pos:fid:(\w{1,8}):off:(\w{1,12})"
-                         rb"[^\"'<>\s]{0,200}[\"']?", re.I)
+# href="kindle:pos:fid:F:off:O...": quoted, its tail runs to the closing quote; unquoted, to whitespace
+_KINDLE_POS = re.compile(rb"(<a\b[^<>]{0,500}?)\bhref\s*=\s*(?:[\"']kindle:pos:fid:(\w{1,8}):off:(\w{1,12})"
+                         rb"[^\"'<>]{0,2000}[\"']?|kindle:pos:fid:(\w{1,8}):off:(\w{1,12})[^\"'<>\s]{0,2000})", re.I)
+_BASE32 = re.compile(r"[0-9A-Va-v]{1,8}")
 _KINDLE_FLOW = re.compile(r"kindle:flow:([0-9A-Va-v]{1,8})", re.I)
 _HTML = re.compile(rb"<html\b", re.I)
 _RECINDEX = re.compile(rb"(<img\b[^<>]{0,500}?)\brecindex\s*=\s*[\"']?(\d{1,12})[\"']?", re.I)
@@ -242,7 +245,10 @@ def _loader(palm: Palm, head: Head, ctx):
             if src.startswith("recindex:"):
                 n = int(src[9:])
             elif src.startswith("kindle:embed:"):
-                n = int(src[13:].split("?", 1)[0], 32)
+                digits = src[13:].split("?", 1)[0]
+                if not _BASE32.fullmatch(digits):
+                    return None
+                n = int(digits, 32)
             else:
                 return None
         except ValueError:
@@ -369,6 +375,7 @@ def _indx(palm, start: int, ctx) -> list:
             n, pos = _varint(rec, pos)
             cncx[i * 0x10000 + at] = rec[pos:pos + n].decode(codec, errors="replace")
             pos += n
+    nvalues = 0
     for i in range(nrec):
         rec = palm.record(start + 1 + i)
         if len(rec) < 28 or rec[:4] != b"INDX":
@@ -376,6 +383,7 @@ def _indx(palm, start: int, ctx) -> list:
         idxt, n = _u32(rec, 20), _u32(rec, 24)
         if n > INDX_ENTRIES - len(out):
             raise _Fallback(f"more than {INDX_ENTRIES} index entries")
+        end_of_last = 0   # entries follow one another, so no byte of a record is read twice
         for j in range(n):
             at = idxt + 4 + 2 * j
             if at + 2 > len(rec):
@@ -383,6 +391,8 @@ def _indx(palm, start: int, ctx) -> list:
             off = _u16(rec, at)
             if off >= len(rec):
                 raise _Fallback("an index entry starts past its record")
+            if off < end_of_last:
+                raise _Fallback("index entries overlap or are out of order")
             ctrl = off + 1 + rec[off]
             label = rec[off + 1:ctrl].decode(codec, errors="replace")
             pos = ctrl + nctrl
@@ -407,25 +417,26 @@ def _indx(palm, start: int, ctx) -> list:
             tagmap = {}
             for tag, count, size, nv in tags:
                 values = []
-                if count is not None:
-                    for _ in range(count * nv):
-                        x, pos = _varint(rec, pos)
-                        values.append(x)
-                else:
-                    used = 0
-                    while used < size:
-                        x, nxt = _varint(rec, pos)
-                        values.append(x)
-                        used += nxt - pos
-                        pos = nxt
+                want = count * nv if count is not None else None
+                used = 0
+                while (len(values) < want) if want is not None else (used < size):
+                    if nvalues >= INDX_VALUES:
+                        raise _Fallback(f"more than {INDX_VALUES} index values")
+                    x, nxt = _varint(rec, pos)
+                    values.append(x)
+                    nvalues += 1
+                    used += nxt - pos
+                    pos = nxt
                 tagmap[tag] = values
+            end_of_last = pos
             out.append((label, tagmap))
     return out
 
 
 def _fdst(palm, head: Head) -> list:
     """The (start, end) text ranges of the FDST flows; flow 0 is the XHTML. Raises _Fallback past FDST_FLOWS, or on a
-    range outside the text or one that starts after its end."""
+    range outside the text, one that starts after its end, or one that starts before the previous one ends (so the
+    flows together copy the text at most once)."""
     if not 0 <= head.fdst < palm.count:
         raise _Fallback("the FDST record is outside the file")
     r = palm.record(head.fdst)
@@ -436,12 +447,15 @@ def _fdst(palm, head: Head) -> list:
         raise _Fallback(f"{n} FDST flows")
     if 12 + 8 * n > len(r):
         raise _Fallback("the FDST table runs past its record")
-    flows = []
+    flows, last = [], 0
     for i in range(n):
         s, e = _u32(r, 12 + 8 * i), _u32(r, 16 + 8 * i)
         if s > e or e > head.text_length:
             raise _Fallback("an FDST flow outside the text")
+        if s < last:
+            raise _Fallback("FDST flows overlap or are out of order")
         flows.append((s, e))
+        last = e
     return flows
 
 
@@ -454,10 +468,11 @@ def _val(tags: dict, tag: int, i: int = 0) -> int:
 
 def _assemble(flow0: bytes, skels: list, frags: list) -> tuple:
     """(parts, where, starts): each skeleton cut from flow 0 with its fragments inserted in turn at `insert position −
-    skeleton start`, as foliate-js `loadText`; where[fid] = (part, byte position of that fragment in the part); starts
-    are the skeleton starts."""
+    skeleton start`, as foliate-js `loadText`. A skeleton that starts before the previous one ends, or an insert before
+    its skeleton's start or past its end, raises _Fallback. where[fid] = (part, byte position of that fragment in the
+    part); starts are the skeleton starts."""
     parts, where, starts = [], {}, []
-    nxt = work = 0
+    nxt = work = last = 0
     for count, start, length in skels:
         if count > len(frags) - nxt:
             raise _Fallback("a skeleton claims more fragments than are left")
@@ -466,6 +481,9 @@ def _assemble(flow0: bytes, skels: list, frags: list) -> tuple:
         size = length + sum(f[3] for f in mine)
         if start + size > len(flow0):
             raise _Fallback("a skeleton runs past flow 0")
+        if start < last:   # skeletons follow one another, so the parts together copy flow 0 at most once
+            raise _Fallback("skeletons overlap or are out of order")
+        last = start + size
         raw = flow0[start:start + size]
         buf = bytearray(raw[:length])
         at, fids = [], []   # fragment positions in buf, sorted, and their fids
@@ -501,6 +519,11 @@ def _split_html(flow0: bytes) -> list:
     return [flow0[a:b] for a, b in zip(cuts, cuts[1:] + [len(flow0)])]
 
 
+def _pos_key(m) -> tuple:
+    """(fid, off) as written in a _KINDLE_POS match, quoted or not."""
+    return (m.group(2), m.group(3)) if m.group(2) is not None else (m.group(4), m.group(5))
+
+
 def _kindle_pos(parts: list, where: dict, starts: list, utf8: bool, ctx) -> list:
     """The parts with each `kindle:pos:fid:F:off:O` target anchored (`kp` + its book position) and its link pointed
     there. A target outside its part, an unknown fid, or one past MOBI_ANCHORS (counted `link` once) leaves the link its
@@ -509,9 +532,9 @@ def _kindle_pos(parts: list, where: dict, starts: list, utf8: bool, ctx) -> list
     names: dict = {}   # (fid, off) as written -> anchor name; never more than MOBI_ANCHORS, so neither are targets
     over = False
 
-    def resolve(m):
+    def resolve(key):
         try:
-            fid, off = int(m.group(2), 32), int(m.group(3), 32)
+            fid, off = int(key[0], 32), int(key[1], 32)
         except ValueError:
             return None
         hit = where.get(fid)
@@ -521,10 +544,10 @@ def _kindle_pos(parts: list, where: dict, starts: list, utf8: bool, ctx) -> list
 
     for part in parts:
         for m in _KINDLE_POS.finditer(part):
-            key = (m.group(2), m.group(3))
+            key = _pos_key(m)
             if key in names:
                 continue
-            hit = resolve(m)
+            hit = resolve(key)
             if hit is None:
                 continue
             if len(names) >= MOBI_ANCHORS:
@@ -539,7 +562,7 @@ def _kindle_pos(parts: list, where: dict, starts: list, utf8: bool, ctx) -> list
         ctx.warnings.append("link: links past the anchor limit keep their text only")
 
     def href(m):
-        name = names.get((m.group(2), m.group(3)))
+        name = names.get(_pos_key(m))
         return m.group(1) + (b'href="#' + name.encode("ascii") + b'"' if name else b"")
     return [_KINDLE_POS.sub(href, _anchor(part, targets[t], utf8)) for t, part in enumerate(parts)]
 
