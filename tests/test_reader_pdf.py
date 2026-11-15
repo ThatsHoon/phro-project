@@ -358,6 +358,53 @@ def test_sideways_page_read_upright():
     assert text.index("日本") < text.index("縦書"), text
 
 
+def _apache(rotate):
+    ops = [text_ops("Apache", 72, 700), text_ops("Tika", 116, 700), text_ops("toolkit", 72, 686)]
+    return simple_pdf([b" ".join(ops)], page_extra={"Rotate": rotate})
+
+
+def test_turned_pages_read_upright():
+    # /Rotate 270 leaves the text running up the viewer, /Rotate 180 upside down: both read upright
+    for rotate in (270, 180):
+        text, _, _ = md(_apache(rotate))
+        assert "Apache Tika toolkit" in text, (rotate, text)
+
+
+_CJK = "縦書日本語文章"
+_CJK_CODES = {c: 0x100 + i for i, c in enumerate(_CJK)}
+
+
+def _column(text, x, y=700):
+    return b"BT /F2 12 Tf %d %d Td <%s> Tj ET" % (
+        x, y, "".join("%04X" % _CJK_CODES[c] for c in text).encode())
+
+
+def test_vertical_writing_outvotes_sideways_latin():
+    # Identity-V columns with Latin set clockwise inside them: the page keeps its turn, the
+    # columns read whole and right first, the Latin keeps its spaces
+    objs = font_type0(tounicode={code: c for c, code in _CJK_CODES.items()}, vertical=True)
+    latin = b"BT /F1 10 Tf 0 -1 1 0 %d %d Tm (%s) Tj ET"
+    body = [_column("縦書日本", 500), latin % (496, 640, b"Unicode"),
+            _column("語文章", 480), latin % (476, 650, b"OpenType")]
+    text, _, _ = md(simple_pdf([b" ".join(body)], resources={"Font": {"F1": Ref(3), "F2": Ref(100)}},
+                               extra_objects=objs))
+    assert "縦書日本" in text and "語文章" in text, text
+    assert text.index("縦書日本") < text.index("語文章"), text
+    assert pdf_layout.upright_turn(dm.NativeDoc(simple_pdf(
+        [b" ".join(body)], resources={"Font": {"F1": Ref(3), "F2": Ref(100)}},
+        extra_objects=objs)).page(0).fragments, 0) == 0
+
+
+def test_sideways_latin_is_not_vertical_writing():
+    # an unrotated page: a table set sideways (running up) turns the page; the upright footer,
+    # now running down the viewer, is Latin, not vertical writing, and keeps its spaces
+    up = b"BT /F1 10 Tf 0 1 -1 0 %d 100 Tm (Row %d of the sideways landscape table body) Tj ET"
+    rows = [up % (100 + 14 * k, k) for k in range(8)]
+    footer = [text_ops("Quarterly", 200, 40, size=10), text_ops("results", 248, 40, size=10)]
+    text, _, _ = md(simple_pdf([b" ".join(rows + footer)]))
+    assert "Row 3 of the sideways" in text and "Quarterly results" in text, text
+
+
 def test_line_drawn_twice_reads_once():
     # a line of two fragments drawn twice, 0.4 pt apart (a fake bold or a shadow): read once
     ops = [text_ops("Annual", 72, 700), text_ops("Report", 120, 700),

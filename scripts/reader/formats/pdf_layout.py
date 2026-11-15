@@ -165,22 +165,30 @@ def rotate_into_view(fragments, rotate, box):
 
 
 _UPRIGHT = {"ltr": 0, "up": 90, "rtl": 180, "down": 270}  # the turn that makes it read ltr
+_COLUMNS = {"down": 0, "ltr": 90, "up": 180, "rtl": 270}  # the turn that makes it run down
 
 
 def upright_turn(fragments, turn) -> int:
-    """The quarter turn (0, 90, 180 or 270) to lay a page out in: the page's /Rotate `turn`,
-    unless it leaves the page's text sideways, running up or down in the viewer. Then the turn
-    in which that text reads left to right: Latin turned with the page is read along its own
-    lines, not as vertical writing. The page's text is the writing direction of most of its
-    visible chars outside vertical fonts."""
-    counts = Counter()
+    """The quarter turn (0, 90, 180 or 270) to lay a page out in. Each visible char votes for
+    the turn in which it reads as written: left to right for horizontal fonts, down the page
+    for vertical writing, which is the chars of vertical fonts and, with them, the chars of
+    other fonts set along the same direction (Latin turned clockwise inside vertical text). The
+    page's /Rotate `turn` stays unless another turn has more votes: Latin turned with the page,
+    sideways or upside down, is then read along its own lines."""
+    counts, columns = Counter(), Counter()
     for f in fragments:
-        if f.text and not f.hidden and not f.vertical:
-            counts[writing_direction(f)] += sum(1 for ch in f.text if not ch.isspace())
-    if not counts:
+        if f.text and not f.hidden:
+            n = sum(1 for ch in f.text if not ch.isspace())
+            (columns if f.vertical else counts)[writing_direction(f)] += n
+    votes = Counter()
+    if columns:
+        along_columns = max(columns, key=columns.get)
+        votes[_COLUMNS[along_columns]] += sum(columns.values()) + counts.pop(along_columns, 0)
+    for d, n in counts.items():
+        votes[_UPRIGHT[d]] += n
+    if not votes:
         return turn
-    need = _UPRIGHT[max(counts, key=counts.get)]
-    return need if (need - turn) % 180 == 90 else turn
+    return max(votes, key=lambda t: (votes[t], t == turn))
 
 
 # ---- the Korean spacing table
@@ -564,7 +572,9 @@ class _Row:
 def lines(fragments, links=()) -> List[Line]:
     """Lines in content order: consecutive fragments of one direction on one baseline are one
     line. A space goes between two glyphs when the gap is over GAP x the size and neither side
-    is a space. Vertical text comes last, as `vertical_lines`.
+    is a space. Vertical writing comes last, as `vertical_lines`: the fragments of vertical fonts
+    that run down the page and, beside them, other fragments that do (Latin set inside vertical
+    text). Other text running down the page is read as lines like any other.
 
     A fragment that starts before the last one ended (a row whose cells are drawn right cell
     first, words drawn into the gaps a later string leaves) joins the line as `_Row.take_back`
@@ -578,6 +588,7 @@ def lines(fragments, links=()) -> List[Line]:
     grid = _LinkGrid(links) if links else None
     out, vertical = [], []
     row, last = None, None
+    columns = any(f.vertical and writing_direction(f) == "down" for f in frags)
 
     def flush(row, last):
         """Emit the row; returns it, or None when it holds no text."""
@@ -593,7 +604,7 @@ def lines(fragments, links=()) -> List[Line]:
 
     for f in frags:
         d = writing_direction(f)
-        if d == "down":
+        if d == "down" and (f.vertical or columns):
             vertical.append(f)
             continue
         a, s = across(f), along(f)

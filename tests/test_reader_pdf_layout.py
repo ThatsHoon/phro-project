@@ -161,13 +161,18 @@ def test_column_fallback_keeps_links():
 
 
 def test_vertical_cjk():
-    fr = [frag("縦", 480, 700, dir_x=0.0, dir_y=-1.0, up_x=1.0, up_y=0.0, width=12.0),
-          frag("書", 480, 688, dir_x=0.0, dir_y=-1.0, up_x=1.0, up_y=0.0, width=12.0),
-          frag("日", 500, 700, dir_x=0.0, dir_y=-1.0, up_x=1.0, up_y=0.0, width=12.0),
-          frag("本", 500, 688, dir_x=0.0, dir_y=-1.0, up_x=1.0, up_y=0.0, width=12.0)]
+    down = dict(dir_x=0.0, dir_y=-1.0, up_x=1.0, up_y=0.0, width=12.0, vertical=True)
+    fr = [frag("縦", 480, 700, **down), frag("書", 480, 688, **down),
+          frag("日", 500, 700, **down), frag("本", 500, 688, **down)]
     out = L.vertical_lines(numbered(fr))
     assert texts(out) == ["日本", "縦書"] and all(ln.vertical for ln in out)
     assert texts(L.lines(numbered(fr))) == ["日本", "縦書"]
+    # Latin running down the page in a horizontal font is a line of its own, spaced by its gaps
+    down["vertical"] = False
+    latin = [frag("Down", 300, 700, **dict(down, width=24.0)),
+             frag("page", 300, 673, **dict(down, width=24.0))]
+    out = L.lines(numbered(latin))
+    assert texts(out) == ["Down page"] and not out[0].vertical, texts(out)
 
 
 def test_rotated_page_order():

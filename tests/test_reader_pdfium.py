@@ -341,6 +341,44 @@ def test_pdfium_rotated_page():
     assert not got["skipped"], got["skipped"]
 
 
+def _both(data):
+    """pdfium's markdown, with the native page as a backstop and from pdfium's geometry alone."""
+    return run(data)["md"], run(data, native_fails=True)["md"]
+
+
+def test_pdfium_baseline_out_of_order():
+    row = [text_ops("9.50", 400, 700), text_ops("0001", 72, 700), text_ops("PLAN", 120, 700),
+           text_ops("19.00", 480, 700), text_ops("LUMP", 300, 700)]
+    gaps = [text_ops("and", 121.668, 650), b"BT /F1 12 Tf 72 650 Td [(IMPORT) -2250 (TABLE)] TJ ET"]
+    twice = [text_ops("Annual", 72, 600), text_ops("Report", 120, 600),
+             text_ops("Annual", 72.4, 600), text_ops("Report", 120.4, 600)]
+    # (boxes side by side are not tried: pdfium hands their chars over left box first)
+    for md in _both(simple_pdf([b" ".join(row + gaps + twice)])):
+        assert "0001 PLAN LUMP 9.50 19.00" in md and "IMPORT and TABLE" in md, md
+        assert "AAnn" not in md and md.count("Annual") == 1 and "Annual Report" in md, md
+
+
+def test_pdfium_sideways_page():
+    for rotate in (90, 180, 270):
+        ops = [text_ops("Apache", 72, 700), text_ops("Tika", 116, 700), text_ops("toolkit", 72, 686)]
+        for md in _both(simple_pdf([b" ".join(ops)], page_extra={"Rotate": rotate})):
+            assert "Apache Tika toolkit" in md, (rotate, md)
+    # Identity-V columns with Latin set clockwise inside them keep the page as it is
+    chars = "縦書日本語文章"
+    codes = {c: 0x100 + i for i, c in enumerate(chars)}
+
+    def column(text, x):
+        return b"BT /F2 12 Tf %d 700 Td <%s> Tj ET" % (x, "".join("%04X" % codes[c] for c in text).encode())
+
+    latin = b"BT /F1 10 Tf 0 -1 1 0 %d %d Tm (%s) Tj ET"
+    body = [column(chars[:4], 500), latin % (496, 640, b"Unicode"), column(chars[4:], 480),
+            latin % (476, 650, b"OpenType")]
+    data = simple_pdf([b" ".join(body)], resources=dict(F1, Font={"F1": Ref(3), "F2": Ref(100)}),
+                      extra_objects=font_type0(tounicode={code: c for c, code in codes.items()}, vertical=True))
+    for md in _both(data):
+        assert chars[:4] in md and chars[4:] in md and md.index(chars[:4]) < md.index(chars[4:]), md
+
+
 def test_pdfium_pages_range():
     got = run(simple_pdf([text_ops(f"P{n}") for n in range(1, 5)]), pages=[2, 3])
     md = got["md"]
