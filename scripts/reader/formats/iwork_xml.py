@@ -29,26 +29,32 @@ Limits caps); `sf:ghost-text` and `sf:ghost-text-ref` are the template's placeho
 Tables (`sf:tabular-info`, `sf:tabular-model`, in all three apps): the model (a child, or the one its `-ref` names;
 read once) gives one Table captioned with its `sf:name`, through `sheet_grid.Grid` with one `Budget` a document, so
 a table renders as xlsx does and the Grid caps stop it (`sheet_cut`). Its `sf:grid` `sf:datasource` holds the cells
-a row stores, in order and with no coordinates; each `sf:grid-row` `sf:nc` says how many are that row's, and the
-`sf:grid-column` counts, when they add up, pass over a column that stores no more cells (docling `place_row`). Cells:
-`sf:t` text (`sf:ct`: its `sfa:s`, else its text, a line a paragraph); `sf:n` the number `sf:v` as General; `sf:d`
-the seconds `sf:cell-date` from 2001-01-01 as an ISO date, plus the time when not midnight; `sf:b` and `sf:cb` TRUE
-or FALSE; `sf:pm` the value its `sf:proxied-cell-ref` names; `sf:f` its cached result `sf:r` (`sf:rn`, `sf:rt`,
-`sf:rd`, `sf:rb`), never its formula; `sf:g` empty; `sf:s` holds its column with no value; `sf:col-span` is one
-merged cell (a row does not say how far down a merge goes, so none spans rows, as in docling). Hidden rows are not
-read (Defaults "Numbers"), nor are header rows marked. Nothing is allocated from a declared count: the declared rows
-and columns only bound the walk, a span stops at them and at SHEET_COLS, rows are walked to SHEET_ROWS, and each
-entry is charged to the document's scan count, to SHEET_SCAN; entries past the declared grid, or that no row claims,
-count `record` once a table. A table fails (`table`) without a model, a grid, or the rows its values need; each is
-read under a guard of its own. A footnote its cells mark keeps its place in the pairing below as an unmarked note (a
-cell shows its text only). In a header or footer a table counts `table` and is not read.
+a row stores, in order and with no coordinates; each `sf:grid-row` `sf:nc` says how many are that row's. The
+`sf:grid-column` counts, when they add up, place a sparse row: the rows whose widths fill the declared columns are
+taken off the counts first, and a sparse row then passes over a column whose remaining count is spent (docling
+`place_row`, which spends the counts in row order and so pushes a row above the full ones, an empty top-left corner,
+to the left). '09 Numbers allows at most 256 columns, so only a crafted file passes SHEET_COLS and falls back to
+left-packed rows. Cells: `sf:t` text (`sf:ct`: its `sfa:s`, else its text, a line a paragraph; a cell, table or
+chart nested in it is not entered); `sf:n` the number `sf:v` as General; `sf:d` the seconds `sf:cell-date` from
+2001-01-01 as an ISO date, plus the time when not midnight; `sf:b` and `sf:cb` TRUE or FALSE; `sf:pm` the choice its
+`sf:proxied-cell-ref` names, looked up in its own `sf:menu-choices` first and then in the document's id index, once
+an id; `sf:f` its cached result `sf:r` (`sf:rn`, `sf:rt`, `sf:rd`, `sf:rb`), never its formula; `sf:g` empty; `sf:s`
+holds its column with no value; `sf:col-span` is one merged cell (a row does not say how far down a merge goes, so
+none spans rows, as in docling). Hidden rows are not read (Defaults "Numbers"), nor are header rows marked. Nothing
+is allocated from a declared count: the declared rows and columns only bound the walk, a span stops at them and at
+SHEET_COLS, rows are walked to SHEET_ROWS, and each entry, each choice looked at and each node of a cell's text is
+charged to the document's scan count, to SHEET_SCAN; entries past the declared grid, or that no row claims, count
+`record` once a table, also when a cut follows. A table fails (`table`) without a model, a grid, or the rows its
+values need; each is read under a guard of its own. A footnote its cells mark keeps its place in the pairing below
+as an unmarked note (a cell shows its text only). In a header or footer a table counts `table` and is not read.
 
 Pages (`sl:document`): the body is the document outside `sf:header`, `sf:footer`, `sf:footnotes`, `sf:annotations`
 and `sl:section-prototypes` (the templates of new sections, like ghost text), in document order, then the floating
 drawables of `sl:drawables` in their container's order (Defaults "Pages styles"), each under a guard of its own
-(`image`, `table` or `shape`, as `iwork_iwa` guards an IWA drawable), then the attachments no `sf:attachment-ref`
-placed (one that fails counts `object`). An `sf:attachment-ref` places its attachment after its paragraph, once; any
-other `-ref` (a text box chain's shape ref, say) is never followed, so nothing is read twice. Footnotes: the text of
+(`image`, `table`, `chart` or `shape`, as `iwork_iwa` guards an IWA drawable), then the attachments no
+`sf:attachment-ref` placed (one that fails counts `object`). An `sf:attachment-ref` places its attachment after its
+paragraph, once; any other `-ref` (a text box chain's shape ref, say) is never followed, so nothing is read twice.
+Footnotes: the text of
 `sf:footnotes` is split at each `sf:footnote-mark` and after each `sf:footnotebr`, inside a paragraph too (a storage
 with no marks opens a footnote at its next content), and paired in order with the body's `sf:footnote` marks
 (`[^n]`); a mark in an unread table takes its footnote too, kept unmarked; a mark past the last footnote counts
@@ -73,10 +79,14 @@ note, and an attachment no ref places counts `object`. The theme's master slides
 Numbers (`ls:document`): each `ls:workspace` (a workspace is not searched for more), under `ctx.guard("sheet")`, is
 `Section("sheet", ls:workspace-name)`: its tables, pictures and text boxes in order, each under its own guard as in
 Pages, its sticky notes as "Comment: …" lines in `Section.comments`. The template's parts outside the workspaces are
-never read; '09 charts (cached in `.chrtshr` property lists) are not read.
+never read, and nothing in them (an attachment, a comment) is indexed or counted.
+
+Charts: an `sf:chart-info`, in any app, is a leaf: it counts `chart` and is never entered ('09 charts keep their
+values in `.chrtshr` property lists, which are not read), so nothing under it reaches the output.
 
 Every walk is iterative (an explicit stack, so a deep tree never reaches Python's recursion limit) and enters each
-element at most once, so the work is bounded by the element count, which `iwork.IWORK_XML` bounds. Pictures are
+element at most once (a cell's text walk stops at a nested cell, and a pop-up's choice is looked up once an id), so
+the work is bounded by the element count, which `iwork.IWORK_XML` bounds. Pictures are
 charged against `limits.IMAGE_BYTES` per document, each placement (a member is read once); one missing or past it
 counts `image`.
 
@@ -84,8 +94,8 @@ Changes from docling: footnotes are paired with their marks rather than listed a
 where they apply; floating drawables follow the body; templates are left out; a character style that does not set
 bold keeps the bold in force; list ladders follow their `-ref`s; a sheet keeps its drawables in their order (docling
 sorts them by position); a table is read into a Grid rather than allocated from its declared size, and one past the
-caps is cut rather than dropped; a span spends only the columns whose counts are left; Pages and Keynote tables are
-read too.
+caps is cut rather than dropped; full rows are taken off the column counts before sparse rows are placed; a span
+spends only the columns whose counts are left; Pages and Keynote tables are read too; charts are counted.
 """
 import math
 from bisect import bisect_left
@@ -120,8 +130,9 @@ DATA = SF + "data"
 TABLES = frozenset({SF + "tabular-info", SF + "tabular-model"})
 STICKY = frozenset({SF + "sticky-note", KEY + "sticky-note"})
 SHAPES = frozenset({SF + "drawable-shape", SF + "shape", SF + "group"})
+CHART = SF + "chart-info"  # an '09 chart: a leaf, counted `chart`, never read
 # drawables written inside a paragraph are placed after it, as an anchored attachment is
-INLINE_BLOCKS = MEDIA | TABLES | STICKY | SHAPES
+INLINE_BLOCKS = MEDIA | TABLES | STICKY | SHAPES | {CHART}
 STYLESHEETS = frozenset({SL + "stylesheet", KEY + "stylesheet", SF + "stylesheet", SF + "styles", SF + "anon-styles"})
 PROTOTYPES, FLOATING = SL + "section-prototypes", SL + "drawables"
 PAGES_PRUNE = STYLESHEETS | {HEADER, FOOTER, FOOTNOTES, ANNOTATIONS, ANNOTATION, PROTOTYPES}
@@ -144,6 +155,10 @@ NUMBER_VALUES = frozenset({SF + "n", SF + "rn"})
 BOOL_VALUES = frozenset({SF + "b", SF + "cb", SF + "rb"})
 DATE_VALUES = frozenset({SF + "d", SF + "rd"})
 RESULTS = frozenset({SF + "rn", SF + "rt", SF + "rd", SF + "rb"})  # a formula's cached result, in sf:r
+MENU_CHOICES = SF + "menu-choices"
+# a cell's text walk enters none of these: cells, tables and charts nested in it, ghost text and note marks
+NOT_IN_TEXT = (TEXT_VALUES | NUMBER_VALUES | BOOL_VALUES | DATE_VALUES | TABLES | GHOST
+               | {FORMULA_CELL, POPUP_CELL, SPANNED, SF + "g", CHART, FOOTNOTE})
 
 PARA_STYLE, CHAR_STYLE, LIST_STYLE = SF + "paragraphstyle", SF + "characterstyle", SF + "liststyle"
 ID, IDREF, IDENT, PARENT = SFA + "ID", SFA + "IDREF", SF + "ident", SF + "parent-ident"
@@ -185,6 +200,10 @@ def _number(v) -> int | None:
         return int(float(v))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+class _ScanCut(Exception):
+    """The document's datasource walk reached limits.SHEET_SCAN."""
 
 
 def _count(v) -> int | None:
@@ -278,14 +297,18 @@ class Reader:
 
     # ---- the one pass
     def _index(self):
-        """Element ids, styles (anywhere), and in the body scope (outside templates, tables and ghost text) the
-        footnotes, comments, headers, footers and attachments."""
-        stack = [(self.root, True)]
+        """Element ids, styles (anywhere), and in the body scope (outside templates, tables, charts and ghost text;
+        in Numbers, only inside the first level of ls:workspace) the footnotes, comments, headers, footers and
+        attachments."""
+        numbers = self.app == "numbers"
+        stack = [(self.root, not numbers, False)]
         while stack:
-            el, body = stack.pop()
+            el, body, ws = stack.pop()
             tag = el.tag
             if not isinstance(tag, str):
                 continue
+            if numbers and tag == WORKSPACE and not ws:  # the walk reads these, and nothing outside them
+                body = ws = True
             i = el.get(ID)
             if i is not None:
                 self.ids.setdefault(i, el)
@@ -309,9 +332,9 @@ class Reader:
                     body = False
                 elif tag == ATTACHMENT:
                     self.attachments.append(el)
-                elif tag in (PROTOTYPES, THEMES) or tag in TABLES or tag in GHOST:
+                elif tag in (PROTOTYPES, THEMES, CHART) or tag in TABLES or tag in GHOST:
                     body = False
-            stack.extend((c, body) for c in reversed(el))
+            stack.extend((c, body, ws) for c in reversed(el))
 
     # ---- styles
     def _cached(self, key, fn):
@@ -657,7 +680,8 @@ class Reader:
         """(the columns whose count is not spent, sorted; each column's count) from the sf:grid-column `sf:nc`
         counts, or (None, None) when they cannot place cells (docling `column_quotas`): no sf:columns, no declared
         column count, more grid columns than SHEET_COLS, a number other than the declared one, or counts adding up
-        to more than the datasource holds."""
+        to more than the datasource holds. '09 Numbers allows at most 256 columns, so only a crafted file passes
+        SHEET_COLS and falls back to left-packed rows."""
         cols = el.find(COLUMNS)
         if cols is None or ncols is None:
             return None, None
@@ -670,15 +694,26 @@ class Reader:
             return None, None
         return [c for c, n in enumerate(q) if n > 0], q
 
+    @staticmethod
+    def _spend(avail: list, quotas: list, col: int, span: int):
+        """Each column in col..col+span-1 that still stores a cell stores one less; a spent column leaves `avail`.
+        The work is bounded by the counts, whatever the span."""
+        lo, hi = bisect_left(avail, col), bisect_left(avail, col + span)
+        keep = []
+        for c in avail[lo:hi]:
+            quotas[c] -= 1
+            if quotas[c] > 0:
+                keep.append(c)
+        avail[lo:hi] = keep
+
     def _cells(self, el, grid):
         """The datasource of sf:grid `el` put on `grid` (docling `read_cells`, `place_row`). The datasource holds
         only the cells a row stores, in row order, with no coordinates: each sf:grid-row's `sf:nc` says how many
-        are its own, and the columns' counts (`_quotas`) pass over a column that stores no more cells. An sf:s holds
-        its column with no value; `sf:col-span` spends every column it covers and is one merged cell. Nothing is
-        allocated from a declared count: rows are walked as they come, to SHEET_ROWS; each entry is charged to the
-        document's scan count, to SHEET_SCAN; a span stops at the declared columns and at SHEET_COLS. Past a cap the
-        sheet is cut (`Grid.stop`). Entries past the declared rows or columns, or that no row claims, are dropped,
-        counted `record` once a table."""
+        are its own. Rows are claimed first (`plan`, one entry per row that has cells, walked as they come to
+        SHEET_ROWS); the rows that fill the declared columns are taken off the column counts (`_full_rows`), then
+        each row is laid out (`_lay_out`). Nothing is allocated from a declared count. Past a cap the sheet is cut
+        (`Grid.stop`). Entries past the declared rows or columns, or that no row claims, are dropped, counted
+        `record` once a table, also when the sheet is cut later."""
         ds, rows = el.find(DATASOURCE), el.find(ROWS)
         entries = [e for e in ds if isinstance(e.tag, str)] if ds is not None else []
         if not entries:
@@ -687,57 +722,104 @@ class Reader:
             raise ValueError("no grid rows")
         ncols, nrows = _count(el.get(NUMCOLS)), _count(el.get(NUMROWS))
         avail, quotas = self._quotas(el, ncols, len(entries))
-        cap, k, total, dropped = limits.SHEET_SCAN, 0, len(entries), False
+        plan, k, total, rows_cut = [], 0, len(entries), False  # (row, first entry, end)
         for r, row in enumerate(rows.iter(GRID_ROW)):
             if k >= total:
                 break
             if r >= limits.SHEET_ROWS:
-                grid.stop("rows", limits.SHEET_ROWS)
-                return
+                rows_cut = True
+                break
             if nrows is not None and r >= nrows:
                 break
             n = _number(row.get(NC)) or 0
-            if n <= 0:
+            if n > 0:
+                plan.append((r, k, min(k + n, total)))
+                k += n
+        full = self._full_rows(entries, plan, ncols, avail, quotas) if avail is not None else set()
+        dropped = self._lay_out(grid, entries, plan, full, ncols, avail, quotas)
+        if rows_cut and not grid.cut:
+            grid.stop("rows", limits.SHEET_ROWS)
+        if dropped or (k < total and not rows_cut and not grid.cut):
+            self.ctx.skipped["record"] += 1
+
+    def _full_rows(self, entries, plan, ncols: int, avail: list, quotas: list) -> set:
+        """The indexes in `plan` of the rows whose widths (each entry's `sf:col-span`, an sf:s one column) fill the
+        declared columns, their cells taken off the column counts first (an sf:s was never counted). A sparse row
+        is then placed against what the full rows leave, so one above them (an empty top-left corner) is not pushed
+        left. A row is looked at only until its width passes the columns, and only as far as SHEET_SCAN leaves
+        entries to place, so the pass is linear in the entries."""
+        full, left = set(), limits.SHEET_SCAN - self.scan
+        for idx, (r, a, b) in enumerate(plan):
+            if left <= 0:
+                break
+            width = 0
+            for i in range(a, b):
+                left -= 1
+                e = entries[i]
+                width += 1 if e.tag == SPANNED else max(1, min(_number(e.get(COL_SPAN)) or 1, ncols))
+                if width > ncols:
+                    break
+            if width != ncols:
                 continue
+            full.add(idx)
             col = 0
-            for i in range(k, min(k + n, total)):
-                if self.scan >= cap:
-                    grid.stop("scanned cells", cap)
-                    return
-                self.scan += 1
+            for i in range(a, b):
                 e = entries[i]
                 if e.tag == SPANNED:
                     col += 1
                     continue
-                if avail is not None:  # the next column that still stores a cell
-                    j = bisect_left(avail, col)
-                    if j == len(avail):
+                span = max(1, min(_number(e.get(COL_SPAN)) or 1, ncols - col))
+                self._spend(avail, quotas, col, span)
+                col += span
+        return full
+
+    def _lay_out(self, grid, entries, plan, full, ncols, avail, quotas) -> bool:
+        """Each planned row's entries put on `grid`. A full row, or any row without usable column counts, is laid
+        out from its first column; a sparse row passes over a column whose count is spent and spends the columns it
+        covers. An sf:s holds its column with no value; `sf:col-span` (stopped at the declared columns and at
+        SHEET_COLS) is one merged cell. Each entry, and each node its value is read from, is charged to the
+        document's scan count; at SHEET_SCAN the sheet is cut. True when an entry was dropped before any cut: past
+        the declared columns, or with no column left."""
+        dropped = False
+        try:
+            for idx, (r, a, b) in enumerate(plan):
+                packed = avail is None or idx in full
+                col = 0
+                for i in range(a, b):
+                    self._charge()
+                    e = entries[i]
+                    if e.tag == SPANNED:
+                        col += 1
+                        continue
+                    if not packed:  # the next column that still stores a cell
+                        j = bisect_left(avail, col)
+                        if j == len(avail):
+                            dropped = True
+                            break
+                        col = avail[j]
+                    if ncols is not None and col >= ncols:
                         dropped = True
                         break
-                    col = avail[j]
-                if ncols is not None and col >= ncols:
-                    dropped = True
-                    break
-                span = _number(e.get(COL_SPAN)) or 1
-                span = max(1, min(span, limits.SHEET_COLS - col, (ncols - col) if ncols is not None else span))
-                if avail is not None:  # each column the cell covers stores one cell less; work bounded by the counts
-                    lo, hi = bisect_left(avail, col), bisect_left(avail, col + span)
-                    keep = []
-                    for c in avail[lo:hi]:
-                        quotas[c] -= 1
-                        if quotas[c] > 0:
-                            keep.append(c)
-                    avail[lo:hi] = keep
-                value = self._shown(e)
-                if value:
-                    if not grid.put(r, col, value):
-                        return  # the grid is cut
-                    if span > 1:
-                        grid.merge(r, r, col, col + span - 1)
-                col += span
-            k += n
-        if dropped or k < total:
-            self.ctx.skipped["record"] += 1
+                    span = _number(e.get(COL_SPAN)) or 1
+                    span = max(1, min(span, limits.SHEET_COLS - col, (ncols - col) if ncols is not None else span))
+                    if not packed:
+                        self._spend(avail, quotas, col, span)
+                    value = self._shown(e)
+                    if value:
+                        if not grid.put(r, col, value):
+                            return dropped  # the grid is cut
+                        if span > 1:
+                            grid.merge(r, r, col, col + span - 1)
+                    col += span
+        except _ScanCut:
+            grid.stop("scanned cells", limits.SHEET_SCAN)
+        return dropped
+
+    def _charge(self):
+        """One step of a datasource walk against limits.SHEET_SCAN; _ScanCut once it is spent."""
+        if self.scan >= limits.SHEET_SCAN:
+            raise _ScanCut
+        self.scan += 1
 
     def _shown(self, el) -> str | None:
         """The value a datasource entry shows: a formula's result (`sf:r`: the first `sf:rn`, `sf:rt`, `sf:rd` or
@@ -754,9 +836,9 @@ class Reader:
         return self._value(el)
 
     def _popup(self, el) -> str | None:
-        """A pop-up cell's shown value: the element its `sf:proxied-cell-ref` names (by id, the document's index),
-        followed through at most MAX_DEPTH pop-ups with a visited path; a cycle or a chain past it counts `depth`.
-        The answer is cached by id, so a choice shared by many cells is followed once."""
+        """A pop-up cell's shown value: the choice its `sf:proxied-cell-ref` names (`_choice`), followed through at
+        most MAX_DEPTH pop-ups with a visited path; a cycle or a chain past it counts `depth`. The answer is cached
+        by id, so a choice shared by many cells is looked up once."""
         path, value = [], None
         for _ in range(limits.MAX_DEPTH):
             if el.tag != POPUP_CELL:
@@ -773,7 +855,7 @@ class Reader:
                 self.ctx.skipped["depth"] += 1
                 break
             path.append(key)
-            el = self.ids.get(key)
+            el = self._choice(el, key)
             if el is None:
                 break
         else:
@@ -781,6 +863,17 @@ class Reader:
         for key in path:
             self._choices[key] = value
         return value
+
+    def _choice(self, pm, key: str):
+        """The element `key` names for pop-up `pm`: a child of its own sf:menu-choices with that id (docling
+        `popup_text` looks only inside the cell, and Numbers keeps the choices there), else the document's id index
+        (a choice kept elsewhere, named by the `-ref`). Each child looked at is charged to SHEET_SCAN."""
+        menu = pm.find(MENU_CHOICES)
+        for c in menu if menu is not None else ():
+            self._charge()
+            if c.get(ID) == key:
+                return c
+        return self.ids.get(key)
 
     def _value(self, el) -> str | None:
         """A cell or result element's value as shown: `sf:t`/`sf:rt` text (`sf:ct`), `sf:n`/`sf:rn` the number
@@ -804,10 +897,11 @@ class Reader:
             return display(EPOCH_SERIAL + s / 86400, ISO_TIME if s % 86400 else ISO_DATE)
         return None
 
-    @staticmethod
-    def _cell_text(ct) -> str | None:
+    def _cell_text(self, ct) -> str | None:
         """An sf:ct's text: its `sfa:s`, else its content's text, a line a paragraph or break, outer whitespace and
-        empty lines dropped; ghost text and note marks left out. Walked with an explicit stack."""
+        empty lines dropped. A cell's text holds paragraphs, not cells: a cell, table or chart nested in it is not
+        entered (`NOT_IN_TEXT`, with ghost text and note marks), so the text walks of different cells never overlap.
+        Walked with an explicit stack, each node charged to SHEET_SCAN."""
         s = ct.get(STRING)
         if s is not None:
             return s.strip() or None
@@ -820,8 +914,9 @@ class Reader:
                 continue
             if el is not ct:
                 tag = el.tag
-                if not isinstance(tag, str) or tag in GHOST or tag == FOOTNOTE:
+                if not isinstance(tag, str) or tag in NOT_IN_TEXT:
                     continue
+                self._charge()
                 if tag == P and out:
                     out.append("\n")
                 if tag in BREAKS:
@@ -935,8 +1030,8 @@ class Reader:
 
     def walk(self, top, out: list | None = None, inside: bool = True) -> list:
         """The blocks of `top`'s children (with `inside`, else of `top` itself) in document order: paragraphs,
-        pictures, tables, sticky notes (into the comments), each element once; the app's pruned parts,
-        ghost text and `-ref`s are not entered."""
+        pictures, tables, sticky notes (into the comments), each element once; a chart counts `chart` and is not
+        entered, nor are the app's pruned parts, ghost text and `-ref`s."""
         out = [] if out is None else out
         stack = list(reversed(top)) if inside else [top]
         while stack:
@@ -961,6 +1056,9 @@ class Reader:
             if tag in TABLES:
                 out.extend(self.table(el))
                 continue
+            if tag == CHART:  # '09 charts keep their values in .chrtshr property lists, which are not read
+                self.ctx.skipped["chart"] += 1
+                continue
             if tag in STICKY:
                 self._sticky(el)
                 continue
@@ -978,7 +1076,8 @@ class Reader:
 
     def _drawables(self, top, out: list):
         """Each drawable under `top` (descending through its layers, page groups and other containers) read under
-        a guard of its own: `image` for a picture, `table` for a table, else `shape`; one that fails adds nothing."""
+        a guard of its own: `image` for a picture, `table` for a table, `chart` for a chart, else `shape`; one that
+        fails adds nothing."""
         stack = list(reversed(top))
         while stack:
             el = stack.pop()
@@ -987,7 +1086,8 @@ class Reader:
                 continue
             if tag in INLINE_BLOCKS or tag == P:
                 got = []
-                with self.ctx.guard("image" if tag in MEDIA else "table" if tag in TABLES else "shape"):
+                kind = "image" if tag in MEDIA else "table" if tag in TABLES else "chart" if tag == CHART else "shape"
+                with self.ctx.guard(kind):
                     self.walk(el, got, inside=False)
                     out.extend(got)
                 continue
@@ -1036,7 +1136,7 @@ class Reader:
             tag = node.tag
             if not isinstance(tag, str) or tag in GHOST or tag == ATTACHMENTS or _ref(node):
                 continue
-            if tag in MEDIA or tag in TABLES or tag in STICKY:  # a drawable between paragraphs
+            if tag in MEDIA or tag in TABLES or tag in STICKY or tag == CHART:  # a drawable between paragraphs
                 self.walk(node, into(), inside=False)
                 continue
             if tag != P:

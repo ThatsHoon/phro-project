@@ -2105,7 +2105,9 @@ def test_09_numbers_two_sheets():
     sheets = (_ws("A", _table09("Ta", [[_t("alpha")]]))
               + _ws("B", _table09("Tb", [[_t("beta")]]) + '<sf:drawable-shape>' + _box(_p("box text"))
                     + '</sf:drawable-shape><sf:sticky-note>' + _box(_p("remember")) + '</sf:sticky-note>'))
-    doc, ctx = _x(numbers09(sheets, extra=f"<ls:template>{template}</ls:template>"), "numbers")
+    # a template attachment outside the workspaces is neither shown nor counted
+    loose = '<sf:attachments><sf:attachment sfa:ID="z">' + _p("TEMPLATE BOX") + '</sf:attachment></sf:attachments>'
+    doc, ctx = _x(numbers09(sheets, extra=f"<ls:template>{template}{loose}</ls:template>"), "numbers")
     assert [(s.kind, s.title) for s in doc.blocks] == [("sheet", "A"), ("sheet", "B")], doc.blocks
     md = _md(doc, ctx)
     assert "## Sheet: A" in md and "## Sheet: B" in md and md.find("## Sheet: A") < md.find("## Sheet: B"), md
@@ -2126,6 +2128,76 @@ def test_09_numbers_sheet_cap():
         doc, ctx = _x(numbers09(_ws("S", _table09("T", [["<sf:g/>"] * 3 + [_t("x")] * 3]))), "numbers")
     assert ctx.skipped == {"sheet_cut": 1} and ctx.warnings == ["sheet T cut at 5 scanned cells"], ctx.warnings
     assert [_cells(t) for t in _tables(doc)] == [[["x", "x"]]], _tables(doc)
+
+
+def test_09_numbers_full_rows_first():
+    # an empty top-left corner above full rows (the usual chart-data layout): row counts 4, 5, 5 and column counts
+    # 2, 3, 3, 3, 3 on a 3 x 5 grid; the full rows spend column 0's count, so row 0 lies in columns 1-4
+    rows = [[_t(h) for h in "ABCD"], [_t("r1")] + [_n(i) for i in range(4)], [_t("r2")] + [_n(i) for i in range(4)]]
+    with _puts() as seen:
+        doc, ctx = _x(numbers09(_ws("S", _table09("C", rows, numcols=5, quotas=[2, 3, 3, 3, 3]))), "numbers")
+    assert [k for k in seen if k[0] == 0] == [(0, 1), (0, 2), (0, 3), (0, 4)], seen
+    assert len(seen) == 14 and not ctx.skipped, (seen, ctx.skipped)
+    # a row is full when its spans and sf:s fill the declared columns
+    rows = [[_t("x")], ['<sf:t sf:col-span="2"><sf:ct sfa:s="w"/></sf:t>', "<sf:s/>"]]
+    with _puts() as seen:
+        doc, ctx = _x(numbers09(_ws("S", _table09("D", rows, numcols=3, quotas=[1, 1, 1]))), "numbers")
+    assert seen == {(0, 2): "x", (1, 0): "w"} and not ctx.skipped, (seen, ctx.skipped)
+
+
+def test_09_numbers_drop_then_cut():
+    # an entry dropped before a later cut still counts `record`, once
+    rows = [[_t("a"), _t("b"), _t("c")], [_t("d"), _t("e")]]
+    with _limit(limits, "SHEET_SCAN", 4):
+        doc, ctx = _x(numbers09(_ws("S", _table09("T", rows, numcols=2, nc=[3, 2]))), "numbers")
+    assert ctx.skipped == {"sheet_cut": 1, "record": 1}, ctx.skipped
+
+
+def test_09_charts_counted():
+    # an sf:chart-info is a leaf: counted `chart` once, never read, nothing under it reaches the output
+    chart = '<sf:chart-info sfa:ID="ch">' + _box(_p("CHART TEXT")) + _media("c.png") + '</sf:chart-info>'
+    files = {"c.png": PNG}
+    doc, ctx = _x(pages09(_p("Body") + chart + _p("x" + chart.replace('"ch"', '"ch2"')), files=files))
+    assert doc.blocks == [Para([Text("Body")]), Para([Text("x")])] and ctx.skipped == {"chart": 2}, ctx.skipped
+    doc, ctx = _x(keynote09(slide09(_p("T"), _p("B"), drawables=chart), files=files), "key")
+    assert doc.blocks[0].blocks == [Para([Text("B")])] and ctx.skipped == {"chart": 1}, ctx.skipped
+    doc, ctx = _x(numbers09(_ws("S", _table09("T", [[_t("v")]]) + chart), files=files), "numbers")
+    md = _md(doc, ctx)
+    assert "CHART" not in md and "v" in md and ctx.skipped == {"chart": 1}, (md, ctx.skipped)
+
+
+def test_09_popup_chain_linear():
+    # choices nested in a chain (sf:t > sf:ct > sf:t > ...), each named by a pop-up of its own: a cell's text walk
+    # stops at a nested cell, so the walks are disjoint and the time linear
+    n = 8000
+    chain = "".join(f'<sf:t sfa:ID="c{i}"><sf:ct>v{i}' for i in range(n)) + "</sf:ct></sf:t>" * n
+    first = f'<sf:pm><sf:menu-choices>{chain}</sf:menu-choices><sf:proxied-cell-ref sfa:IDREF="c0"/></sf:pm>'
+    rows = [[first]] + [[f'<sf:pm><sf:proxied-cell-ref sfa:IDREF="c{i}"/></sf:pm>'] for i in range(1, n)]
+    data = numbers09(_ws("S", _table09("P", rows)))
+    # 1,000 one-cell tables naming distinct choices in a 20,000-deep chain
+    deep = 20000
+    chain = "".join(f'<sf:t sfa:ID="d{i}"><sf:ct>w{i}' for i in range(deep)) + "</sf:ct></sf:t>" * deep
+    tables = _table09("Holder", [[f'<sf:pm><sf:menu-choices>{chain}</sf:menu-choices>'
+                                  '<sf:proxied-cell-ref sfa:IDREF="d0"/></sf:pm>']])
+    tables += "".join(_table09(f"T{i}", [[f'<sf:pm><sf:proxied-cell-ref sfa:IDREF="d{i * 20}"/></sf:pm>']])
+                      for i in range(1, 1000))
+    data2 = numbers09(_ws("S", tables))
+    got = []
+    for d in (data, data2):
+        ctx = Context()
+        t0 = time.perf_counter()
+        doc = iwork.parse_bytes(d, ctx, "numbers")
+        took = time.perf_counter() - t0
+        assert took < 1, took
+        assert not ctx.skipped, ctx.skipped
+        got.append([_cells(t) for t in _tables(doc)])
+    [one] = got[0]
+    assert len(one) == n and one[0] == ["v0"] and one[5] == ["v5"] and one[-1] == [f"v{n - 1}"], one[:3]
+    assert len(got[1]) == 1000 and got[1][0] == [["w0"]] and got[1][1] == [["w20"]], got[1][:3]
+    # past SHEET_SCAN the walk is cut, counted once a table
+    with _limit(limits, "SHEET_SCAN", 50):
+        doc, ctx = _x(data, "numbers")
+    assert ctx.skipped == {"sheet_cut": 1}, ctx.skipped
 
 
 def test_09_pages_table():
