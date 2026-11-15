@@ -52,8 +52,11 @@ def _palmdoc_literal(data):
     return bytes(out)
 
 
-def _huff_tables(phrases):
+def _huff_tables(phrases, wide=None):
     """A HUFF and one CDIC record with 8-bit codes: code i is phrases[i].
+
+    wide (three literals) adds codes that begin with the byte 0xFF, which is then not settled: a 9-bit 0x1FF and the
+    10-bit 0x3FC and 0x3FD, for wide[0], wide[1] and wide[2]. The 8-bit codes are then 0..254.
 
     A phrase is bytes (a literal) or (bytes, False), a packed phrase: a string of 8-bit codes.
     """
@@ -65,8 +68,15 @@ def _huff_tables(phrases):
     # every first byte is a settled 8-bit code; the index is 255 - code
     entry = (255 << 8) | 0x80 | 8
     huff += entry.to_bytes(4, "big") * 256
-    huff += bytes(32 * 8)
+    lengths = bytearray(32 * 8)
+    if wide:
+        huff[24 + 255 * 4:24 + 256 * 4] = ((0x1FF << 8) | 9).to_bytes(4, "big")   # 9 bits, not settled
+        lengths[8 * 8:8 * 8 + 8] = (0x1FF).to_bytes(4, "big") + (0x1FF).to_bytes(4, "big")      # length 9
+        lengths[9 * 8:9 * 8 + 8] = (0x3FC).to_bytes(4, "big") + (0x3FE).to_bytes(4, "big")      # length 10
+    huff += lengths
     slots = [(b"", True)] * 256
+    if wide:
+        slots[0], slots[2], slots[1] = (wide[0], True), (wide[1], True), (wide[2], True)
     for i, p in enumerate(phrases):
         lit, flag = (p, True) if isinstance(p, bytes) else p
         slots[255 - i] = (lit, flag)
@@ -106,6 +116,12 @@ def test_palm_offsets_backwards_damaged():
     assert raises(ReadError, Palm, bytes(d)).kind == "damaged"
     assert raises(ReadError, Palm, b"x" * 77).kind == "damaged"
     d = bytearray(_pdb([b"a"]))
+    d[76:78] = (0).to_bytes(2, "big")
+    assert raises(ReadError, Palm, bytes(d)).kind == "damaged"       # no records
+    d = bytearray(_pdb([b"a", b"b"]))
+    d[78:82] = (80).to_bytes(4, "big")                                # inside the record table
+    assert raises(ReadError, Palm, bytes(d)).kind == "damaged"
+    d = bytearray(_pdb([b"a"]))
     d[76:78] = (500).to_bytes(2, "big")
     assert raises(ReadError, Palm, bytes(d)).kind == "damaged"
 
@@ -118,6 +134,16 @@ def test_trailing_flags_3():
     assert trailing(body + entry, 2) == body
     assert trailing(body + b"\x01", 0) == body + b"\x01"
     assert trailing(b"ab", 2) == b""                          # an entry larger than the record
+
+
+def test_trailing_stacked_entries_and_clamp():
+    body = b"text"
+    a = b"ab\x83"         # size 3
+    b = b"x\x82"          # size 2
+    tail = b"\x00\x01"     # multibyte tail of 2
+    assert trailing(body + tail + b + a, 7) == body
+    assert trailing(b"ab\x03", 1) == b""                  # a tail of 4 on a record of 3: clamped
+    assert trailing(b"", 7) == b""
 
 
 def test_palmdoc_paths():
@@ -133,6 +159,20 @@ def test_palmdoc_bad_distance():
     raises(ValueError, palmdoc, b"abc" + bytes([0x80, 0x00 | 3]), 100)          # distance 0
     v = (9 << 3) | 0
     raises(ValueError, palmdoc, b"abc" + bytes([0x80 | v >> 8, v & 0xFF]), 100)  # past the output
+
+
+def test_palmdoc_distance_off_by_one():
+    v = (4 << 3) | 0
+    raises(ValueError, palmdoc, b"abc" + bytes([0x80 | v >> 8, v & 0xFF]), 100)   # len(out) + 1
+    v = (3 << 3) | 0
+    assert palmdoc(b"abc" + bytes([0x80 | v >> 8, v & 0xFF]), 100) == (b"abcabc", False)  # len(out)
+
+
+def test_palmdoc_limit_inside_copies():
+    v = (4 << 3) | 7                                     # distance 4, run 10
+    assert palmdoc(b"abcd" + bytes([0x80 | v >> 8, v & 0xFF]), 6) == (b"abcdab", True)
+    assert palmdoc(b"\x08abcdefgh", 3) == (b"abc", True)
+    assert palmdoc(b"\x08abcdefgh", 8) == (b"abcdefgh", False)
 
 
 def test_palmdoc_limit():
@@ -185,9 +225,14 @@ def test_huffcdic_bad_table_damaged():
 
 def test_huffcdic_dictionary_and_phrase_caps():
     huff, cdics = _huff_tables([b"a"])
+    # 256 phrases: 64 bytes charged each is 16385, 32 each would be 8193
     old = palmdb.HUFF_DICT
-    palmdb.HUFF_DICT = 1000
+    palmdb.HUFF_DICT = 12000
     try:
+        raises(ValueError, HuffCdic, huff, cdics)
+        palmdb.HUFF_DICT = 16385
+        HuffCdic(huff, cdics)
+        palmdb.HUFF_DICT = 16384
         raises(ValueError, HuffCdic, huff, cdics)
     finally:
         palmdb.HUFF_DICT = old
@@ -198,6 +243,14 @@ def test_huffcdic_dictionary_and_phrase_caps():
         raises(ValueError, h.unpack, bytes([1]), 100)
     finally:
         palmdb.HUFF_PHRASE = old
+
+
+def test_huffcdic_unsettled_long_codes():
+    h = HuffCdic(*_huff_tables([b"a"], wide=[b"N", b"T", b"E"]))
+    bits = "".join(format(c, f"0{n}b") for c, n in ((0x3FC, 10), (0x1FF, 9), (0x3FD, 10), (0, 8)))
+    bits += "0" * (-len(bits) % 8)
+    rec = int(bits, 2).to_bytes(len(bits) // 8, "big")
+    assert h.unpack(rec, 100) == (b"TNEa", False)
 
 
 def test_caps():

@@ -168,6 +168,7 @@ class HuffCdic:
             entry = _u32(huff, first_at + first * 4)
             length = entry & 0x1F
             settled = bool(entry & 0x80)
+            # `length > _MAX_CODE` is defensive: the 5-bit field cannot exceed 31
             if length == 0 or length > _MAX_CODE or (length <= 8 and not settled):
                 raise ReadError("damaged", f"the HUFF table has an invalid entry for first byte {first}")
             self._len[first] = length
