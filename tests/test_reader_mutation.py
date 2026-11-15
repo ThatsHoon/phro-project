@@ -9,7 +9,8 @@ entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `ooxm
 `mobi.parse_bytes`, `wpd.parse_bytes`, `iwork.parse_bytes`), and rendering never writes an image. Only the clean xlsb,
 ppt, docx and pptx seeds touch a temporary directory, once each (the xlsx, mobi, wpd and iWork seeds are built in
 memory). An OOXML case damages one or two of its seed's XML members. An IWA case damages the archive bytes of one or two
-`.iwa` members after Snappy is undone, then stores them as type-1 chunks; a '09 case damages `index.xml`. The RTF seed
+`.iwa` members after Snappy is undone (every other case only inside one object's payload, the framing kept), then
+stores them as type-1 chunks; a '09 case damages `index.xml`. The RTF seed
 holds none of the control words of a shape's property groups, and the test builds them with `cat` so no .pyc holds
 them either.
 
@@ -31,10 +32,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader import markdown  # noqa: E402
-from reader.containers import flate, snappy  # noqa: E402
+from reader.containers import flate, pbwire, snappy  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
-from reader.formats import iwork, mobi, ooxml, pdf, ppt, rtf, wpd, xls, xlsb  # noqa: E402
+from reader.formats import iwork, iwork_iwa, mobi, ooxml, pdf, ppt, rtf, wpd, xls, xlsb  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc  # noqa: E402
 from pdf_fix import (EncryptSpec, Name, Ref, acroform, font_type0, image_xobject, link_annot,  # noqa: E402
@@ -134,13 +135,13 @@ def render(doc, skipped):
         markdown.Assets = real
 
 
-def outcome(read, label):
-    """"doc", "routed" (another parser's compound file) or the ReadError kind; any other exception fails with the
-    case's label, a case past SLOW is a hang."""
+def outcome(read, label, routed=True):
+    """"doc", "routed" (another parser's compound file; only when `routed`) or the ReadError kind; any other
+    exception fails with the case's label, a case past SLOW is a hang."""
     t0 = time.monotonic()
     try:
         got = read()
-        kind = "doc" if isinstance(got, Doc) else "routed" if isinstance(got, str) else None
+        kind = "doc" if isinstance(got, Doc) else "routed" if routed and isinstance(got, str) else None
         assert kind, f"{label}: returned {type(got).__name__}, not a Doc"
     except ReadError as e:
         kind = e.kind
@@ -154,13 +155,13 @@ def outcome(read, label):
     return kind
 
 
-def run_cases(label, make_case, cases=CASES, seed=SEED):
+def run_cases(label, make_case, cases=CASES, seed=SEED, routed=True):
     """Run `cases` cases; make_case(rng, k) returns a callable that reads the damaged input from memory. Returns the
-    outcome counts. Nothing damaged is written to disk."""
+    outcome counts. Nothing damaged is written to disk. `routed=False`: a returned str fails the case."""
     counts = {}
     for k in range(cases):
         rng = random.Random(seed + k)
-        kind = outcome(make_case(rng, k), f"{label} case {k} (seed {seed + k})")
+        kind = outcome(make_case(rng, k), f"{label} case {k} (seed {seed + k})", routed)
         counts[kind] = counts.get(kind, 0) + 1
     return counts
 
@@ -469,6 +470,18 @@ def mobi_seeds() -> dict:
     return {"mobi6": (mobi6, "The note text"), "kf8 combo": (combo, "gamma"), "huffcdic": (huffcdic, "hello")}
 
 
+# The fewest Doc outcomes a seed's CASES cases may give: about half the rate measured at 100 cases (and at least 1),
+# so a regression that refuses every damaged case fails while the draw of 100 cases does not.
+DOC_FLOOR = {"mobi mobi6": 25, "mobi kf8 combo": 25, "mobi huffcdic": 10, "wpd wp6": 35, "wpd wp5": 40,
+             "iwork pages": CASES // 4, "iwork numbers": CASES // 4, "iwork key": CASES // 4,
+             "iwork pages09": 25, "iwork numbers09": 25}
+
+
+def check_floor(label, counts):
+    assert sum(counts.values()) == CASES, (label, counts)
+    assert counts.get("doc", 0) >= DOC_FLOOR[label], (label, counts, DOC_FLOOR[label])
+
+
 def test_mobi_mutations():
     for label, (seed, probe) in mobi_seeds().items():
         ctx = Context()
@@ -479,8 +492,7 @@ def test_mobi_mutations():
             data = apply(plan(rng, len(seed)), seed)
             return lambda: read_doc(mobi.parse_bytes, data)
 
-        counts = run_cases(f"mobi {label}", make)
-        assert sum(counts.values()) == CASES, counts
+        check_floor(f"mobi {label}", run_cases(f"mobi {label}", make, routed=False))
 
 
 # ---- wpd: a WP6 and a WP5 document built in memory, damaged whole and read from bytes (no LibreOffice switch)
@@ -515,8 +527,7 @@ def test_wpd_mutations():
             data = apply(plan(rng, len(seed)), seed)
             return lambda: read_doc(wpd.parse_bytes, data)
 
-        counts = run_cases(f"wpd {label}", make)
-        assert sum(counts.values()) == CASES, counts
+        check_floor(f"wpd {label}", run_cases(f"wpd {label}", make, routed=False))
 
 
 # ---- iWork: IWA members damaged after Snappy (re-chunked as stored chunks); '09 index.xml damaged; zips in memory
@@ -588,13 +599,44 @@ def rechunk(rng, raw: bytes) -> bytes:
     return b"".join(iwf.chunk(raw[a:b], type=1) for a, b in zip(bounds, bounds[1:]))
 
 
+def payload_spans(stream: bytes) -> list[tuple[int, int]]:
+    """(start, end) of every message payload in an unpacked .iwa stream, found by walking its framing ([varint n]
+    [ArchiveInfo] then the payloads its MessageInfo lengths give) with the pbwire helpers `iwork_iwa._archives`
+    reads it with."""
+    spans, pos = [], 0
+    while pos < len(stream):
+        n, pos = pbwire.varint(stream, pos)
+        info = pbwire.fields(stream[pos:pos + n])
+        pos += n
+        for mi in info.get(2, []):
+            length = pbwire.one(pbwire.fields(mi), 3, 0)
+            spans.append((pos, pos + length))
+            pos += length
+    return spans
+
+
+KEEP_LENGTH = ("flip", "set", "run", "word")
+
+
+def damage_payload(rng, stream: bytes, spans) -> bytes:
+    """`stream` with bytes inside one payload changed by length-preserving edits only, so every ArchiveInfo,
+    MessageInfo and length varint stays intact and the object walks read the damaged fields."""
+    a, b = rng.choice([s for s in spans if s[1] > s[0]])
+    body = stream[a:b]
+    edits = [e for e in plan(rng, len(body)) if e[0] in KEEP_LENGTH] or [("flip", rng.randrange(len(body)), 1)]
+    body = apply(edits, body)[:b - a]  # a word edit on the last byte would add one
+    return stream[:a] + body + stream[b:]
+
+
 HOSTILE_VALUES = (b"", b"-1", b"0", b"99999999", b"4294967296", b"1e309", b"nan", b"x", b"-0.5")
 
 
 def damage_values(rng, xml: bytes) -> bytes:
     """`xml` with one to four attribute values swapped for a hostile value or another value of the same file: the
-    file stays well formed, so the '09 walk reads the counts, spans, dates and ids it is given."""
-    spans = [x.span(1) for x in re.finditer(rb'="([^"<&]*)"', xml)]
+    file stays well formed, so the '09 walk reads the counts, spans, dates and ids it is given. Namespace
+    declarations and version attributes are left alone."""
+    spans = [x.span(2) for x in re.finditer(rb'([\w:.-]+)="([^"<&]*)"', xml)
+             if not x[1].startswith(b"xmlns") and not x[1].endswith(b"version")]
     values = [xml[a:b] for a, b in spans]
     out = xml
     for a, b in sorted(rng.sample(spans, min(len(spans), rng.choice((1, 2, 4)))), reverse=True):
@@ -605,12 +647,16 @@ def damage_values(rng, xml: bytes) -> bytes:
 
 def iwork_case(seed: bytes, app: str):
     """Cases for one seed. An IWA seed damages one or two of its .iwa members' archive bytes (Snappy undone), and
-    re-chunks them stored; a '09 seed damages its index.xml, bytes in one case of two (the parser refuses most) and
+    re-chunks them stored: even cases damage the whole stream, framing included; odd cases change bytes inside one
+    object's payload only (`damage_payload`), keeping the framing. A '09 seed damages its index.xml, bytes in one case of two (the parser refuses most) and
     attribute values in the other. The zip is rebuilt in memory, deflating as the seed did."""
     members = zip_members(seed)
     iwa = sorted(n for n in members if n.endswith(".iwa"))
     if iwa:
         raw = {n: snappy.iwa(members[n], flate.Budget(10**8)) for n in iwa}
+        spans = {n: payload_spans(raw[n]) for n in iwa}
+        for n in iwa:  # the walk finds one payload for every object the reader loads (no seed merges messages)
+            assert len(iwork_iwa._archives(raw[n], {})[0]) == len(spans[n]), n
         methods = {}
     else:
         raw = {"index.xml": members["index.xml"]}
@@ -619,6 +665,11 @@ def iwork_case(seed: bytes, app: str):
 
     def make(rng, k):
         parts = dict(members)
+        if iwa and k % 2:
+            name = rng.choice(names)
+            parts[name] = rechunk(rng, damage_payload(rng, raw[name], spans[name]))
+            blob = iwf.iwork_zip(parts, methods)
+            return lambda: read_doc(lambda b, ctx: iwork.parse_bytes(b, ctx, app), blob)
         for name in rng.sample(names, min(len(names), rng.choice((1, 1, 2)))):
             if iwa:
                 parts[name] = rechunk(rng, apply(plan(rng, len(raw[name])), raw[name]))
@@ -636,8 +687,7 @@ def test_iwork_mutations():
         ctx = Context()
         out = render(iwork.parse_bytes(seed, ctx, app), ctx.skipped)
         assert probe in out and not ctx.skipped, (label, out, ctx.skipped)  # the clean seed reads whole
-        counts = run_cases(f"iwork {label}", iwork_case(seed, app))
-        assert sum(counts.values()) == CASES, counts
+        check_floor(f"iwork {label}", run_cases(f"iwork {label}", iwork_case(seed, app), routed=False))
 
 
 def main():
