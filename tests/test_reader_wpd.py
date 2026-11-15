@@ -6,6 +6,7 @@ Run: python -I -X utf8 tests/test_reader_wpd.py
 import struct
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -560,14 +561,108 @@ def test_graphics_box_wpg():
     # a 0x40 packet without its child flag names no picture (libwpd): counted image
     doc, ctx = _read(_wp6(b"See" + _grp(0xDF, 0, [3, 2]), [packets[0], (0x40, struct.pack("<HH", 1, 1)), packets[2]]))
     assert [type(b) for b in doc.blocks] == [Para] and ctx.skipped["image"] == 1
-    # past IMAGE_BYTES a picture is counted image
+    # past IMAGE_BYTES a picture is counted image (two boxes, two pictures)
+    two = [*packets, (0x6F, _WPG), (0x40, struct.pack("<HH", 1, 4), 1)]
     real = limits.IMAGE_BYTES
     try:
         limits.IMAGE_BYTES = len(_WPG) + 1
-        doc, ctx = _read(_wp6(b"A" + _grp(0xDF, 0, [3, 2]) + b"B" + _grp(0xDF, 0, [3, 2]), packets))
+        doc, ctx = _read(_wp6(b"A" + _grp(0xDF, 0, [3, 2]) + b"B" + _grp(0xDF, 0, [3, 5]), two))
     finally:
         limits.IMAGE_BYTES = real
     assert [type(b) for b in doc.blocks] == [Para, Image, Para] and ctx.skipped["image"] == 1, doc.blocks
+    assert set(ctx.skipped) == {"image"}
+
+
+def test_picture_once():
+    # one picture packet referred to by two boxes is one Image; the second reference counts depth
+    packets = [(0x6F, _WPG), (0x40, struct.pack("<HH", 1, 1), 1), (0x41, _style(3))]
+    doc, ctx = _read(_wp6(b"A" + _grp(0xDF, 0, [3, 2]) + b"B" + _grp(0xDF, 0, [3, 2]) + b"C", packets))
+    assert [type(b) for b in doc.blocks] == [Para, Image, Para], doc.blocks
+    assert ctx.skipped["depth"] == 1 and set(ctx.skipped) == {"depth"}, ctx.skipped
+
+
+def test_doubling_chain_linear():
+    # each text packet holds two boxes to the next: emitted once a packet, so the output stays linear
+    levels = 20
+    packets = [(0x41, _style(1))]  # pid 1; text packets are pids 2 .. levels + 2
+    for k in range(levels):
+        nxt = k + 3
+        packets.append((0x08, _text(b"L%d" % k + _grp(0xDF, 0, [1, nxt]) + _grp(0xDF, 0, [1, nxt]))))
+    packets.append((0x08, _text(b"leaf")))
+    t0 = time.perf_counter()
+    doc, ctx = _read(_wp6(b"Body" + _grp(0xDF, 0, [1, 2]) + _grp(0xDF, 0, [1, 2]), packets))
+    took = time.perf_counter() - t0
+    assert _plain(doc) == ["Body", *("L%d" % k for k in range(levels)), "leaf"], _plain(doc)
+    assert ctx.skipped["depth"] == levels + 1 and set(ctx.skipped) == {"depth"}, ctx.skipped
+    assert took < 2, took
+
+
+def test_header_box_counts():
+    # a picture in a text box in a header counts image; a footnote there counts note and leaves no orphan note
+    pic = [(0x6F, _WPG), (0x40, struct.pack("<HH", 1, 1), 1), (0x41, _style(3)), (0x41, _style(1))]
+    packets = [*pic, (0x08, _text(b"Top\x80Head" + _grp(0xDF, 0, [4, 6]))),
+               (0x08, _text(b"In\x80box" + _grp(0xDF, 0, [3, 2]) + _note(7))), (0x08, _text(b"Lost"))]
+    doc, ctx = _read(_wp6(_grp(0xD6, 0, [5], b"\x03") + b"Body", packets))
+    assert doc.headers == ["Top Head In box"], doc.headers
+    assert not doc.notes and ctx.skipped["image"] == 1 and ctx.skipped["note"] == 1, ctx.skipped
+    assert set(ctx.skipped) == {"image", "note"}, ctx.skipped
+    # a header packet referred to again gives nothing, uncounted
+    doc, ctx = _read(_wp6(_grp(0xD6, 0, [1], b"\x03") * 2 + b"Body", [(0x08, _text(b"Head"))]))
+    assert doc.headers == ["Head"] and not ctx.skipped
+
+
+def test_bound_cell_without_owner():
+    # bound cells with nothing above are plain one-column cells, each at the column it is at
+    def row(*subs):
+        return _grp(0xD0, 0x0B, (), _eol(*subs))
+
+    def cell(*subs):
+        return _grp(0xD0, 0x0A, (), _eol(*subs))
+
+    body = _grp(0xD4, 0x2A) + row(_span(255, 1)) + b"a" + cell(_span(255, 1)) + b"b" + cell(_span(255, 1)) + b"c\xbf"
+    doc, ctx = _read(_wp6(body))
+    assert doc.blocks[0].rows == [[Cell([Para([Text(x)])]) for x in "abc"]], doc.blocks
+    assert not ctx.skipped
+    # a long row of them keeps a cell a column up to GRID_COLS, the rest cut once
+    body = _grp(0xD4, 0x2A) + row(_span(255, 1)) + (b"x" + cell(_span(255, 1))) * 1_200 + b"\xbf"
+    doc, ctx = _read(_wp6(body))
+    assert len(doc.blocks[0].rows[0]) == limits.GRID_COLS and ctx.skipped["cells"] == 1, ctx.skipped
+
+
+def test_other_box_with_text_counts_shape():
+    packets = [(0x08, _text(b"Unread")), (0x41, _style(2))]
+    doc, ctx = _read(_wp6(b"One" + _grp(0xDF, 0, [2, 1]) + b"Two", packets))
+    assert _plain(doc) == ["OneTwo"] and ctx.skipped["shape"] == 1 and set(ctx.skipped) == {"shape"}
+    # a box of kind 0 with no text packet is nothing, as in libwpd
+    doc, ctx = _read(_wp6(b"One" + _grp(0xDF, 0, [1]) + b"Two", [(0x41, _style(0))]))
+    assert _plain(doc) == ["OneTwo"] and not ctx.skipped
+
+
+def test_reference_loops_and_caps():
+    # two notes referring to each other: the inner reference back is a cycle, counted depth
+    packets = [(0x08, _text(b"One" + _note(2))), (0x08, _text(b"Two" + _note(1)))]
+    doc, ctx = _read(_wp6(b"Body" + _note(1), packets))
+    assert sorted(_flatnotes(doc).values()) == ["One", "Two"] and ctx.skipped["depth"] == 1, ctx.skipped
+    assert set(ctx.skipped) == {"depth"}
+    # a comment whose text holds a comment back to itself
+    comment = struct.pack("<HHB", 1, 1, 0)
+    packets = [(0x08, _text(b"Remark" + _grp(0xD4, 0x1D, [2]))), (0x1B, comment)]
+    doc, ctx = _read(_wp6(b"Body" + _grp(0xD4, 0x1D, [2]), packets))
+    assert list(doc.notes) == ["cm-1"] and ctx.skipped["depth"] == 1 and set(ctx.skipped) == {"depth"}
+    assert doc.blocks[0].inlines == [Text("Body"), NoteRef("cm-1")]
+    # repeated references count toward WPD_SUBDOCS
+    real = wpd.WPD_SUBDOCS
+    try:
+        wpd.WPD_SUBDOCS = 2
+        doc, ctx = _read(_wp6(b"a" + _note(1) + b"b" + _note(1) + b"c" + _note(1) + b"d", [(0x08, _text(b"N"))]))
+    finally:
+        wpd.WPD_SUBDOCS = real
+    assert doc.blocks[0].inlines == [Text("a"), NoteRef("fn-1"), Text("b"), NoteRef("fn-1"), Text("cd")]
+    assert ctx.skipped["note"] == 1 and set(ctx.skipped) == {"note"}, ctx.skipped
+    # a link on a text box (not a picture) counts link, the text in place
+    packets = [(0x08, _text(b"Boxed")), (0x41, _style(1)), (0x07, _utf16("http://x"))]
+    doc, ctx = _read(_wp6(b"One" + _grp(0xDF, 0, [2, 1, 3]) + b"Two", packets))
+    assert _plain(doc) == ["One", "Boxed", "Two"] and ctx.skipped["link"] == 1 and set(ctx.skipped) == {"link"}
 
 
 def test_table_span_and_header():

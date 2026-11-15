@@ -64,9 +64,14 @@ packet: [u16 block count][4 bytes][u32 size] * count, then the blocks, which fol
 stream is one range of the file, walked by `_walk6` as a story of its own (a count of 0 is a story with no text; a
 size table or a total past the packet is unreadable, counted under the reference's kind). Every reference walk of one
 document shares one map of packet ids: a packet being walked is a cycle, and a reference deeper than
-`limits.MAX_DEPTH`, are counted `depth` and give nothing, the outer text kept. A packet walked before gives the blocks
-it gave then (the same note keeps its one id). Past `WPD_SUBDOCS` references the rest are counted `note`, one each.
-Inside deleted text (undo) notes, comments, headers and boxes are left out with it, as libwpd does.
+`limits.MAX_DEPTH`, are counted `depth` and give nothing, the outer text kept. A packet's blocks are emitted at most
+once a document, so nested references cannot multiply the output: a later reference to a note's or comment's packet
+is a NoteRef to the same note (not counted), to a text box's packet, or to a picture's 0x6F packet, gives nothing and
+counts `depth`, and to a header's, footer's or watermark's packet gives nothing, uncounted (the line would be
+deduplicated anyway). Past `WPD_SUBDOCS` references, repeated ones included, the rest are counted `note`, one each.
+Inside deleted text (undo) notes, comments, headers and boxes are left out with it, as libwpd does. A story walked
+from a header, footer or watermark, at any depth (a text box in one), is inside the header: the line rules below hold
+in it.
 * Footnotes and endnotes: D7 sub 0 or 2 (on), its first prefix id the text packet; endnotes are footnotes. The text
   up to D7 sub 1 or 3 (off), or to the paragraph's end, is the number the body shows and is dropped. The note goes
   into `Doc.notes` as `fn-N` with a `NoteRef` in place; a note with no text gives no mark.
@@ -84,7 +89,8 @@ Inside deleted text (undo) notes, comments, headers and boxes are left out with 
   and positioning 0x4000 sections skipped by their sizes, and the content 0x2000 section [u16 size][u16 flags], its
   kind after 2 bytes more when those flags have 0x8000, when they have 0x4000). A style whose name length is -4 is an
   equation box: counted `object`. A box with a 0x07 (hyperlink) packet among its ids counts `link`. Kind 1 is a text
-  box: its first 0x08 packet's paragraphs in place (none: `shape`). Kind 3 is a picture: its first 0x40 packet, with
+  box: its first 0x08 packet's paragraphs in place (none: `shape`). A box of any other kind that names a 0x08 packet
+  counts `shape`, its text unread. Kind 3 is a picture: its first 0x40 packet, with
   child ids ([u16 n][u16 id] * n) only when its index entry has flags bit 0x01, names 0x6F packets whose bytes are each
   an `Image` in place, WPG or not, charged against `limits.IMAGE_BYTES` (past it, or a picture missing, `image`).
 
@@ -95,7 +101,8 @@ data, after [u16 size] deletable bytes, is a list of sub-functions, each [id] an
 0x84 9, 0x85 4, 0x86 10, 0x87 and 0x88 6, 0x89 11, 0x8B and 0x8C 3, 0x8D 1; 0x81, 0x8E and 0x8F [u16 size]); an unknown
 one, or one past the group, ends the list. 0x80 [flags]: bit 0x04 makes the row a header row. 0x85 [columns][rows]:
 the cell's spans; 128 columns or more is a cell bound to the one above: it is no cell, its text joining the origin
-cell that covers its column (its width the low seven bits, at least 1); with no cell above it is a plain one. Rows
+cell that covers its column (its width the low seven bits, at least 1); with no cell above it is a plain cell one
+column wide at the column it is at. Rows
 are made on their first cell, and a row that gets none is left out. Cells are charged against the document's
 `limits.TABLE_NODES`, shared by every table, and a row stops at `limits.GRID_COLS` columns; the cells past either are
 dropped with their text and counted `cells` once a table. A table whose codes fail is dropped, counted `table`. In
@@ -148,6 +155,7 @@ _EOL_SUBS = {0x80: 5, 0x82: 4, 0x83: 4, 0x84: 9, 0x85: 4, 0x86: 10, 0x87: 6, 0x8
              0x8D: 1}
 _EOL_SIZED = frozenset((0x81, 0x8E, 0x8F))
 _NEW = object()          # a packet id not walked yet
+_DONE = object()         # a packet whose blocks were emitted already
 
 
 @dataclass(frozen=True)
@@ -189,10 +197,11 @@ class _Tab:
 class _Story:
     """One story's paragraphs: (hidden kind, bold, text or NoteRef) runs until a paragraph end makes them a Para, in
     the open table's cell when there is one."""
-    __slots__ = ("kind", "mute", "_bold", "_hid", "_runs", "_blocks", "_tab")
+    __slots__ = ("kind", "inhead", "mute", "_bold", "_hid", "_runs", "_blocks", "_tab")
 
-    def __init__(self, kind="body"):
+    def __init__(self, kind="body", inhead=False):
         self.kind = kind
+        self.inhead = inhead or kind == "header"  # a header's story, or one walked from it: its text is a line
         self.mute = False  # a note's number, between its on and off codes, is not text of the story
         self._bold = False
         self._hid = ""
@@ -277,11 +286,11 @@ class _Story:
         cols, rows = span[0], span[1]
         if cols >= _BOUND:
             owner = t.owner.get(t.col)
-            t.col += max(1, cols & 0x7F)
             if owner is not None:
+                t.col += max(1, cols & 0x7F)
                 t.cell = owner  # bound to the cell above: its text joins that cell
                 return
-            cols = rows = 1
+            cols = rows = 1  # nothing above: a plain cell one column wide, at this column
         cols, rows = max(1, cols), max(1, rows)
         if t.col >= limits.GRID_COLS or st.budget[0] <= 0:
             if not t.cut:
@@ -456,14 +465,16 @@ def _chars(data, j, end) -> str:
 class _State:
     """One WP6+ document's walk: the data and its packets (id -> (type, flags, offset, size)), the Doc its stories
     fill, and what every story of it shares."""
-    __slots__ = ("data", "index", "doc", "ctx", "visited", "subdocs", "ids", "count", "seen", "img_total", "budget")
+    __slots__ = ("data", "index", "doc", "ctx", "visited", "subdocs", "ids", "count", "seen", "img_total", "budget",
+                 "pics")
 
     def __init__(self, data, index, doc, ctx):
         self.data = data
         self.index = index
         self.doc = doc
         self.ctx = ctx
-        self.visited = {}   # text packet id -> the blocks it gave, None while it is walked
+        self.visited = {}   # text packet id -> None while it is walked, _DONE once its blocks were emitted
+        self.pics = set()   # 0x6F packet ids emitted as pictures
         self.subdocs = 0    # sub-document references read (WPD_SUBDOCS)
         self.ids = {}       # text packet id -> its note id
         self.count = {"fn": 0, "cm": 0}
@@ -674,10 +685,11 @@ def _text_span(data, off, size):
     return a, a + total
 
 
-def _subdoc(pid, kind, story_kind, visited, depth, st):
-    """The blocks of text packet `pid` walked as a story of `story_kind`, at nesting `depth`; None when it is not read:
-    past WPD_SUBDOCS (`note`), a cycle or past MAX_DEPTH (`depth`), or a packet missing or unreadable (`kind`). A
-    packet walked before gives its blocks again."""
+def _subdoc(pid, kind, story_kind, visited, depth, st, inhead=False):
+    """The blocks of text packet `pid` walked as a story of `story_kind` (inside a header when `inhead`), at nesting
+    `depth`; None when it is not read: past WPD_SUBDOCS (`note`), a cycle or past MAX_DEPTH (`depth`), or a packet
+    missing or unreadable (`kind`). A packet walked before gives `_DONE`, counted toward WPD_SUBDOCS: its blocks were
+    emitted once and are not given again, so the caller decides what a repeat is."""
     skipped = st.ctx.skipped
     if st.subdocs >= WPD_SUBDOCS:
         skipped["note"] += 1
@@ -686,9 +698,9 @@ def _subdoc(pid, kind, story_kind, visited, depth, st):
     if got is None or depth > limits.MAX_DEPTH:
         skipped["depth"] += 1
         return None
-    if got is not _NEW:
+    if got is _DONE:
         st.subdocs += 1
-        return got
+        return _DONE
     ent = st.index.get(pid)
     span = _text_span(st.data, ent[2], ent[3]) if ent is not None and ent[0] == _TEXT else None
     if span is None:
@@ -696,16 +708,16 @@ def _subdoc(pid, kind, story_kind, visited, depth, st):
         return None
     st.subdocs += 1
     visited[pid] = None
-    story = _Story(story_kind)
+    story = _Story(story_kind, inhead)
     _walk6(st.data, span[0], span[1], story, st, depth)
-    blocks = visited[pid] = story.blocks()
-    return blocks
+    visited[pid] = _DONE
+    return story.blocks()
 
 
 def _footnote(data, pos, size, story, st, depth):
     story.mute = True  # the number the body shows, up to the note off
     h = _ghead(data, pos, size)
-    if story.kind == "header" or h is None or not h[1]:
+    if story.inhead or h is None or not h[1]:
         st.ctx.skipped["note"] += 1
         return
     _mark(h[1][0], "fn", story, st, depth)
@@ -713,7 +725,7 @@ def _footnote(data, pos, size, story, st, depth):
 
 def _comment(data, pos, size, story, st, depth):
     h = _ghead(data, pos, size)
-    if story.kind != "header" and h is not None:
+    if not story.inhead and h is not None:
         for pid in h[1]:
             ent = st.index.get(pid)
             if ent is not None and ent[0] == _COMMENT:
@@ -727,13 +739,14 @@ def _comment(data, pos, size, story, st, depth):
 
 
 def _mark(pid, prefix, story, st, depth):
-    """A note ("fn") or comment ("cm") of text packet `pid`: into Doc.notes once, its NoteRef into `story`."""
+    """A note ("fn") or comment ("cm") of text packet `pid`: into Doc.notes once, its NoteRef into `story`; a later
+    reference is a NoteRef to the same note (none when the packet gave no note)."""
     blocks = _subdoc(pid, "note", "note", st.visited, depth + 1, st)
     if blocks is None:
         return
     nid = st.ids.get(pid)
     if nid is None:
-        if not blocks:
+        if blocks is _DONE or not blocks:
             return
         st.count[prefix] += 1
         nid = st.ids[pid] = f"{prefix}-{st.count[prefix]}"
@@ -748,7 +761,7 @@ def _header(data, pos, size, sub, st, depth):
         st.ctx.skipped[kind] += 1
         return
     blocks = _subdoc(h[1][0], kind, "header", st.visited, depth + 1, st)
-    line = _flat(blocks) if blocks else ""
+    line = _flat(blocks) if blocks and blocks is not _DONE else ""  # a repeat's line is the one kept already
     if line and (kind, line) not in st.seen:
         st.seen.add((kind, line))
         (st.doc.footers if kind == "footer" else st.doc.headers).append(line)
@@ -794,18 +807,22 @@ def _box(data, pos, size, story, st, depth):
         ctype = own
     if any(_kind(st, p) == _LINK for p in pids):
         skipped["link"] += 1
+    text = next((p for p in pids if _kind(st, p) == _TEXT), None)
     if name == _EQUATION:
         skipped["object"] += 1
     elif ctype == _TEXT_BOX:
-        pid = next((p for p in pids if _kind(st, p) == _TEXT), None)
-        if pid is None:
+        if text is None:
             skipped["shape"] += 1
             return
-        blocks = _subdoc(pid, "shape", "box", st.visited, depth + 1, st)
-        if blocks:
+        blocks = _subdoc(text, "shape", "box", st.visited, depth + 1, st, story.inhead)
+        if blocks is _DONE:
+            skipped["depth"] += 1  # its paragraphs stand where the packet was first referenced
+        elif blocks:
             story.put(blocks)
     elif ctype == _PICTURE:
         _pictures(data, pids, story, st)
+    elif text is not None:
+        skipped["shape"] += 1  # a box of another kind with text: not read
 
 
 def _style(data, q, end):
@@ -850,7 +867,8 @@ def _override(data, q, end):
 
 
 def _pictures(data, pids, story, st):
-    """A picture box: the 0x6F packets its first 0x40 packet names, each an Image in place."""
+    """A picture box: the 0x6F packets its first 0x40 packet names, each an Image in place, once a document (a later
+    reference to one counts `depth`)."""
     skipped = st.ctx.skipped
     kids = ()
     gid = next((p for p in pids if _kind(st, p) == _GFX_NAME), None)
@@ -867,11 +885,15 @@ def _pictures(data, pids, story, st):
         return
     pics = []
     for k in kids:
+        if k in st.pics:
+            skipped["depth"] += 1
+            continue
         ent = st.index.get(k)
-        if (ent is None or ent[0] != _GFX_DATA or not ent[3] or story.kind == "header"
+        if (ent is None or ent[0] != _GFX_DATA or not ent[3] or story.inhead
                 or st.img_total + ent[3] > limits.IMAGE_BYTES):
             skipped["image"] += 1
             continue
+        st.pics.add(k)
         st.img_total += ent[3]
         pics.append(Image(data[ent[2]:ent[2] + ent[3]]))
     if pics:
