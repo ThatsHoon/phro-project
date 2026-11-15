@@ -1372,7 +1372,30 @@ def test_soffice_lookup():
         assert wpd.soffice() is None
 
 
+def measure(what):
+    """Not a test: `body` walks a 50 MB WP6 body (text runs, bold groups, hard returns) with `_walk6` and prints
+    `WPD <MB> <s>`. Built in memory."""
+    if what != "body":
+        raise SystemExit("measure body")
+    unit = b"Some running text of a paragraph " + _on(12) + b"bold words" + _off(12) + b" and more text" + bytes((0xCC,))
+    body = unit * (50_000_000 // len(unit))
+    data = _wp6(body)
+    h = wpd.head(data)
+    ctx = Context()
+    doc = wpd.Doc()
+    story = wpd._Story("body")
+    st = wpd._State(data, {}, doc, ctx)
+    t0 = time.perf_counter()
+    wpd._walk6(data, h.pointer, len(data), story, st)
+    took = time.perf_counter() - t0
+    assert len(story.blocks()) > 1000 and not ctx.skipped, ctx.skipped
+    print(f"WPD {len(body) / 1e6:.1f} {took:.2f}")
+
+
 def main():
+    if sys.argv[1:2] == ["measure"]:
+        measure(*sys.argv[2:3])
+        return
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()

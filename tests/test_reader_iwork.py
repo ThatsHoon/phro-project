@@ -2243,7 +2243,42 @@ def test_09_numbers_hostile_linear():
     assert took < 3, took
 
 
+def measure(what):
+    """Not a test: `snappy` unpacks 256 MiB of 64 KiB blocks (a 4 KiB literal, then copy-2 tags) and prints
+    `SNAPPY <MiB> <s>`; `archives` parses IWA_OBJECTS small objects in one unpacked stream and prints
+    `ARCHIVES <objects> <MiB> <s>`. Built in memory."""
+    if what == "snappy":
+        lit = bytes(range(256)) * 16
+        body = snappy_literal(lit)[2:]  # tags without the declared length
+        copies = b"".join(snappy_copy(4096, 64) for _ in range((65536 - 4096) // 64))
+        block = bytes([0x80, 0x80, 0x04]) + body + copies   # declared 65536
+        assert snappy.raw(block, 65536) is not None
+        data = chunk(block) * (limits_iwa_bytes() // 65536)
+        t0 = time.perf_counter()
+        out = snappy.iwa(data, flate.Budget(limits_iwa_bytes()))
+        took = time.perf_counter() - t0
+        print(f"SNAPPY {len(out) / 2**20:.0f} {took:.2f}")
+    elif what == "archives":
+        n = iwork_iwa.IWA_OBJECTS
+        stream = b"".join(archive(i, 1, b"payload-") for i in range(1, n + 1))
+        assert len(stream) <= iwork_iwa.IWA_BYTES, len(stream)
+        t0 = time.perf_counter()
+        found, capped, _, _ = iwork_iwa._archives(stream, {})
+        took = time.perf_counter() - t0
+        assert len(found) == n and not capped
+        print(f"ARCHIVES {n} {len(stream) / 2**20:.1f} {took:.2f}")
+    else:
+        raise SystemExit("measure snappy | archives")
+
+
+def limits_iwa_bytes():
+    return iwork_iwa.IWA_BYTES
+
+
 def main():
+    if sys.argv[1:2] == ["measure"]:
+        measure(*sys.argv[2:3])
+        return
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()

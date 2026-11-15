@@ -187,6 +187,8 @@ from .wpd_charsets import char
 from . import cfb_route
 from .word_fields import comment_note
 
+# The body walk has no cap of its own (CONVERT_SECONDS bounds it). Measured 2026-11-15 on the development machine
+# (`test_reader_wpd.py measure body`): `_walk6` over a 50.0 MB body of text runs, bold groups and hard returns takes 6.31 s.
 MAX_TITLE = 500          # characters of the wpd title
 WPD_SUBDOCS = 10_000     # sub-documents (notes, comments, headers, footers, watermarks, text boxes) read a document
 WP42_PROBE = 65_536      # bytes the 4.2 check scans

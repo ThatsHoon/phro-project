@@ -36,8 +36,12 @@ from ..limits import ReadError
 from ..model import Bold, Context, Doc, Hidden, Image, Link, NoteRef, Para, Section
 from . import iwork_tables, iwork_text, sheet_grid
 
-IWA_BYTES = 256 * 2**20     # unpacked bytes of all .iwa members of one document (the flate.Budget iwork builds)
-IWA_OBJECTS = 1_000_000     # objects one document's store may hold; the rest are unread, counted `record`
+# unpacked bytes of all .iwa members of one document (the flate.Budget iwork builds). Measured 2026-11-15 on the
+# development machine (`test_reader_iwork.py measure snappy`): 256 MiB of 64 KiB blocks unpack in 2.43 s, so no lowering.
+IWA_BYTES = 256 * 2**20
+# objects one document's store may hold; the rest are unread, counted `record`. Measured 2026-11-15 on the development
+# machine (`measure archives`): 1,000,000 small objects (18.1 MiB) parse in 3.39 s.
+IWA_OBJECTS = 1_000_000
 PACKAGE_METADATA = 11006    # TSP.PackageMetadata in Metadata.iwa: field 4 lists the TSP.DataInfo entries
 APPS = ("pages", "numbers", "key")
 SHAPE, EQUATION, IMAGE, GROUP = 2011, 2015, 3005, 3008   # TSWP.ShapeInfo, TSWP.EquationInfo, TSD.Image, TSD.Group
