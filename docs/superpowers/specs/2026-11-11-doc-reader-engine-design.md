@@ -2,7 +2,7 @@
 
 ## Goal
 
-phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all formats in scope: the 28 of decision 1, and since decision 7 also docx, pptx, xlsx and xlsm with their template and macro variants, and since decision 8 pdf (41 extensions). It is written in the Python standard library, like the rest of `scripts/`, except where a library adds capability the user wants (decision 8: pypdfium2 for pdf, in a plugin-managed venv created only with the user's yes, with a stdlib parser beside it). It is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
+phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all formats in scope: the 28 of decision 1, and since decision 7 also docx, pptx, xlsx and xlsm with their template and macro variants, since decision 8 pdf, and with phase 3 the WordPerfect variants wp, wp5, wp6, wp7 and wpt (46 extensions). It is written in the Python standard library, like the rest of `scripts/`, except where a library adds capability the user wants (decision 8: pypdfium2 for pdf, in a plugin-managed venv created only with the user's yes, with a stdlib parser beside it). It is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
 
 This is stage 4 of the user's request. Stages 1 to 3 (clone, test, report) are done: `C:\Users\hunje\research\ai-document-reader-plugins\bench` and its reports.
 
@@ -41,11 +41,11 @@ No engine wins a format on every axis; each wins different items. The engine tak
 | xlsb | anydoc (record framing, cells) | | both engines abort on one bad record |
 | xlsx/xlsm/xltx/xltm | anydoc (phonetics dropped, hidden rows and columns, merges) | dochan: streamed sheets, comments and threaded comments, hyperlinks | formulas with no cached value; sheets of styled empty cells (a scan cap) |
 | rtf | anydoc (byte lexer, `\u` with surrogates, edge grid, merges) | xberg: `\v` hidden, `\uc` stack | `\*` mid-group dropping whole sentences |
-| wpd | libwpd behaviour (via xberg), reimplemented | | tables, images, footnotes untested |
-| mobi/azw3 | format knowledge (PalmDOC, HUFF/CDIC, KF8 skeleton/fragments) | | Calibre failed on 2 of 4 files: fall back KF8 → MOBI6 → stripped text |
-| pages/numbers/key | docling (own Snappy, protobuf wire reader, IWA objects) | numbers-parser: field numbers, tile row = tileid × tile size, cell v5 | trailing empties, `None` in merges |
+| wpd | text-first reader from libwpd and Tika knowledge | Tika character sets, the Corel SDK 5.x reference | 6+ hidden text, Mac WordPerfect (LibreOffice opt-in) |
+| mobi/azw3 | Tika `parser/mobi` (PalmDB, PalmDOC, HUFF/CDIC) | foliate-js (KF8 assembly, links) | KFX, Topaz, skeleton-less KF8 read from flow 0; fall back KF8 → MOBI6 → stripped text |
+| pages/numbers/key | docling (own Snappy, protobuf wire reader, IWA objects) | numbers-parser: field numbers, tile row = tileid × tile size, cell v5; keynote-parser field numbers; an iWork '09 XML reader | trailing empties, `None` in merges, LZVN members, bundle folders |
 
-Licenses: dochan, kordoc, rhwp, anydoc, docling, xberg, markitdown and numbers-parser are MIT. Code ported from them is credited in `THIRD_PARTY_NOTICES.md`. MuPDF (AGPL), Calibre (GPL), libwpd/librevenge (MPL/LGPL) and numbers-parser's Apple-derived `.proto` files are used as format knowledge only, never copied.
+Licenses: dochan, kordoc, rhwp, anydoc, docling, xberg, markitdown, numbers-parser, foliate-js and keynote-parser are MIT, and Apache Tika is Apache-2.0. Code ported from them is credited in `THIRD_PARTY_NOTICES.md`. MuPDF (AGPL), Calibre (GPL), libwpd/librevenge (MPL/LGPL) and Apple's `.proto` files (numbers-parser's and keynote-parser's) are used as format knowledge only, never copied.
 
 ## Architecture
 
@@ -63,7 +63,8 @@ scripts/reader/
   html.py                       XHTML walker with a small CSS cascade (epub, mobi)
   containers/  zipx.py cfb.py palmdb.py snappy.py pbwire.py bzz.py crypto.py
   formats/     hwpx.py hwp.py odf.py ooxml.py vsdx.py epub.py xps.py
-               doc.py xls.py ppt.py xlsb.py rtf.py wpd.py mobi.py iwork.py
+               doc.py xls.py ppt.py xlsb.py rtf.py wpd.py wpd_charsets.py mobi.py
+               iwork.py iwork_iwa.py iwork_text.py iwork_tables.py iwork_xml.py
                djvu.py jet.py pub.py vsd.py mpp.py
                pdf.py pdf_pdfium.py pdf_layout.py pdf_tables.py
   pdfnative/                    stdlib pdf parser (dochan port)
@@ -130,7 +131,7 @@ The hook must also run correctly when Claude reads the converted file or an asse
 
 ### Safety and errors
 
-- Budgets in `limits.py`: input 512 MiB; zip total uncompressed 1 GiB and ratio 200; CFB limits as in dochan (sectors, entries, depth 128, chain steps); records per stream; recursion depth 64; output 20 MB; cells scanned per xlsx workbook `SHEET_SCAN` (2,000,000, styled empty cells included); SmartArt nodes `SMARTART_NODES` (5,000); pdf pages, page-loop deadline and renders `PDF_PAGES` (5,000), `PDF_DEADLINE` (36 s), `PDF_RENDERS` (100).
+- Budgets in `limits.py`: input 512 MiB; zip total uncompressed 1 GiB and ratio 200; CFB limits as in dochan (sectors, entries, depth 128, chain steps); records per stream; recursion depth 64; output 20 MB; cells scanned per xlsx workbook `SHEET_SCAN` (2,000,000, styled empty cells included); SmartArt nodes `SMARTART_NODES` (5,000); pdf pages, page-loop deadline and renders `PDF_PAGES` (5,000), `PDF_DEADLINE` (36 s), `PDF_RENDERS` (100); iWork unpacked bytes per document `IWA_BYTES` (256 MiB) and mobi text `MOBI_TEXT` (64 MiB, at most 32 × the file size).
 - Errors are isolated per record, part, sheet and slide: a bad record is skipped and counted, never the whole file. Only a container that cannot be opened fails the file.
 - Encryption: detected for every format and reported. Default passwords are tried where the format has one (xls `VelvetSweatshop`, ppt default, HWP distribution documents). User passwords and DRM are out of scope.
 - Garble check: if more than 5% of output characters are replacement or control characters, the warning goes into `additionalContext`.
@@ -147,7 +148,7 @@ The gate ships in phase 1. A format whose phase is not built yet is denied with 
 | 2b | xls, ppt, xlsb, rtf | RC4, number formats, BIFF charts |
 | 2c | docx, pptx, xlsx, xlsm, dotx, dotm, potx, potm, ppsm, xltx, xltm | `ooxml_sheets`, `sheet_drawing` (moved out of xlsb), `omml`, streamed zip parts |
 | 2d | pdf | `pdfenv` and `read.py setup` (the pypdfium2 venv), `pdfnative/` (dochan's parser), `pdf_layout`, `pdf_tables` (dochan's table assembly), AES-256 and CBC in `crypto`; specified in `2026-11-14-doc-reader-pdf-design.md` |
-| 3 | wpd, mobi, azw3, pages, numbers, key | `palmdb`, `snappy`, `pbwire` |
+| 3 | wpd (with wp, wp5, wp6, wp7, wpt), mobi, azw3, pages, numbers, key | `palmdb`, `snappy`, `pbwire`; specified in `2026-11-15-doc-reader-phase3-design.md` |
 | 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp | `bzz` (djvu's codec; no other phase 4 format is IFF, so `iff` is not a shared part) |
 
 Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-reader-plugins/notes/*-survey.md`, rulings in `rea-decisions.md`). A format that cannot reach the success bar stays "unsupported" with the reason recorded; mpp is one, read only through an opt-in mpxj path when Java and the user's install are present.
@@ -155,7 +156,7 @@ Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-read
 ## Testing
 
 - Unit tests in `tests/test_reader_*.py`, in the style of the existing tests. Fixtures are built inside the tests from bytes and XML strings (tiny zips, CFBs, PalmDBs); no real documents.
-- Tests per format cover the gaps in the findings table: hidden content, merged cells, numbering, footnotes, charts from caches, content-type-agnostic OOXML, `\*` mid-group RTF, xlsb bad-record recovery, KF8 fallback, tile rows over 256.
+- Tests per format cover the gaps in the findings table: hidden content, merged cells, numbering, footnotes, charts from caches, content-type-agnostic OOXML, `\*` mid-group RTF, xlsb bad-record recovery, the KF8 fallback (KF8 → MOBI 6 → stripped text), tile rows over 256, and the WordPerfect resync after a broken group.
 - The gate: allow with a swapped path, deny on failure, pass-through for other files, cache hit, timeout; for the OOXML family, the edit sentence and `PHRO_READER_OFF`.
 - xlsx: streamed sheets against `SHEET_SCAN`, with styled empty cells built in memory.
 - pdf: a stdlib fixture builder (`tests/pdf_fix.py`) writes tiny pdf bytes; tests that need pypdfium2 run under the venv and skip, saying so, without it.

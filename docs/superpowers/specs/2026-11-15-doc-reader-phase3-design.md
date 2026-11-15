@@ -1,6 +1,6 @@
 # doc-reader phase 3: the engine reads wpd, mobi, azw3, pages, numbers and key
 
-Draft, 2026-11-15, for the user's approval. It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec), whose phase table names these six formats and the shared parts `palmdb`, `snappy` and `pbwire`; the engine spec edits listed at the end are made in the same commit. It builds on phase 2d (`2026-11-14-doc-reader-pdf-design.md`): the counts below start from 2d's 41 extensions. Notes behind it, outside this repository: `research/ai-document-reader-plugins/notes/mobi-azw3-survey.md`, `notes/wpd-survey.md`, `notes/iwork-survey.md` (the surveys) and `notes/rea-decisions.md` (the rulings).
+Approved by the user, 2026-11-15. It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec), whose phase table names these six formats and the shared parts `palmdb`, `snappy` and `pbwire`; the engine spec edits listed at the end are made in the same commit. It builds on phase 2d (`2026-11-14-doc-reader-pdf-design.md`): the counts below start from 2d's 41 extensions. Notes behind it, outside this repository: `research/ai-document-reader-plugins/notes/mobi-azw3-survey.md`, `notes/wpd-survey.md`, `notes/iwork-survey.md` (the surveys) and `notes/rea-decisions.md` (the rulings).
 
 ## Goal
 
