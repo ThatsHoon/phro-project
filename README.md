@@ -479,6 +479,7 @@ Result against the routing pick on the bench corpus, one line per extension:
 - `odp`: MISS on tokens only; linked images are counted, text-only tokens are below the pick.
 - `ppsx`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
 - `pptm`: MISS on tokens only; linked images are counted, text-only tokens are within 1% of the pick.
+- `pdf`: MISS for both engines, only on ten blank one-page test files. The pick shows each one as a white page image; the reader renders only scans and figures, so it gives nothing. Otherwise fidelity is above the pick (native 0.916, pdfium 0.915, against 0.839), and tokens with images opened are 0.41 and 0.46 of the pick's.
 - `ods`: MISS on fidelity (0.868 against 1.000), mostly a peer-agreement artifact on one public document.
 - `hwp`: MISS on fidelity (0.695 against 0.706) and tokens. The fidelity gap is peer agreement: the reader writes list paragraphs in table cells as marked items, where dochan and hwp-mcp both join them into one line without bullets, so their shared lines set the reference. Tokens: bitmaps become viewable PNGs and are counted, and tables with merged cells are HTML, which also puts text-only tokens above the pick.
 - `doc`: MISS on two failures the pick does not share: a Word 6/95 file, denied as "unsupported", and a hand-made test file without the table stream MS-DOC requires. On the generated document fidelity is above the pick (0.903 against 0.869) and tokens are 13% over, mostly an HTML table with merged cells.
