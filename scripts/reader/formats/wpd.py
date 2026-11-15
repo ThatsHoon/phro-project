@@ -1541,11 +1541,7 @@ def _via_soffice(path, ctx, started) -> Doc:
             proc.wait(timeout=left)
         except subprocess.TimeoutExpired:
             killed = True
-            _kill_tree(proc)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            _reap(proc)
             raise ReadError("timeout") from None
         out = sorted(p for p in Path(tmp).glob("*.docx") if p.is_file())
         if not out:
@@ -1555,9 +1551,23 @@ def _via_soffice(path, ctx, started) -> Doc:
     finally:
         try:
             if proc is not None and not killed and proc.poll() is None:
-                _kill_tree(proc)
+                _reap(proc)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _reap(proc):
+    """Kill the tree and wait 1 second for the child (within the gate's 2-second margin), so Windows lets go of its
+    files before the folder is removed. A kill that fails is let pass: it never takes the place of the timeout or of
+    the exception on its way out."""
+    try:
+        _kill_tree(proc)
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 # ---- the entries

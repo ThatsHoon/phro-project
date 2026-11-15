@@ -1099,8 +1099,8 @@ class _FakeProc:
     def wait(self, timeout=None):
         import subprocess
         self.waits.append(timeout)
-        if isinstance(self.hang, BaseException):
-            raise self.hang
+        if isinstance(self.hang, BaseException) and len(self.waits) == 1:
+            raise self.hang  # the first wait only; later ones time out, the child still running
         if self.hang:
             raise subprocess.TimeoutExpired(self.cmd, timeout)
         return 0
@@ -1126,7 +1126,7 @@ def _docx(text):
     }, stored=())
 
 
-def _with_fake(make=None, hang=False, deadline=None):
+def _with_fake(make=None, hang=False, deadline=None, kill_error=None):
     """Run the Mac file through the switch with Popen faked; returns (doc or ReadError, the fake, kills). `hang` is
     True (wait times out) or an exception wait raises; `deadline` is the PHRO_READER_DEADLINE value, None unset."""
     import reader
@@ -1141,7 +1141,11 @@ def _with_fake(make=None, hang=False, deadline=None):
         src.write_bytes(_mac())
         try:
             wpd.subprocess.Popen = lambda cmd, **kw: _FakeProc(cmd, make, hang, **kw)
-            wpd._kill_tree = kills.append
+            def fake_kill(proc):
+                kills.append(proc)
+                if kill_error is not None:
+                    raise kill_error
+            wpd._kill_tree = fake_kill
             with _Env(PHRO_READER_SOFFICE=str(exe), PHRO_READER_DEADLINE=deadline):
                 try:
                     got = wpd.parse(src, Context())
@@ -1172,9 +1176,22 @@ def test_soffice_deadline():
 
 
 def test_soffice_interrupt_kills_child():
-    # an interrupt while soffice runs: the tree is killed before the folder goes, the interrupt goes on
+    # an interrupt while soffice runs: the tree is killed and the child reaped (1 s) before the folder goes, and the
+    # interrupt goes on
     got, fake, kills = _with_fake(hang=KeyboardInterrupt())
     assert isinstance(got, KeyboardInterrupt) and kills == [fake] and not fake.outdir.exists(), (got, kills)
+    assert fake.waits[1:] == [1], fake.waits
+    # a kill that fails never replaces the interrupt
+    got, fake, kills = _with_fake(hang=KeyboardInterrupt(), kill_error=PermissionError("denied"))
+    assert isinstance(got, KeyboardInterrupt) and kills == [fake] and not fake.outdir.exists(), (got, kills)
+
+
+def test_soffice_failed_kill_keeps_timeout():
+    # soffice never exits and the tree kill fails: still a timeout, the folder still removed, the reap 1 s
+    got, fake, kills = _with_fake(hang=True, kill_error=PermissionError("denied"))
+    assert isinstance(got, ReadError) and got.kind == "timeout", got
+    assert kills == [fake] and not fake.outdir.exists(), kills
+    assert fake.waits[1:] == [1], fake.waits
 
 
 def test_soffice_argument_absolute():
