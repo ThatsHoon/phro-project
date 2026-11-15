@@ -39,7 +39,7 @@ CHAR_STYLE, PARA_STYLE, LIST_STYLE, LINK, CHANGE = 2021, 2022, 2023, 2032, 2060
 COMMENT, AUTHOR = 3056, 212
 DELETION = 2  # TSWP.ChangeArchive kind
 LINK_SCHEMES = ("http://", "https://", "mailto:")
-OBJECT_REPLACEMENT = "￼"
+OBJECT_REPLACEMENT = "\ufffc"
 UTF16_WARNING = "utf16: text positions may be off after characters outside the BMP"
 _HEADING = re.compile(r"heading\s*(\d{1,3})?")
 
@@ -171,14 +171,17 @@ def _inlines(segs: list) -> list:
         for url, g2 in groupby(g, key=lambda s: s.url):
             styled = []
             for bold, g3 in groupby(g2, key=lambda s: s.bold):
-                items = []
+                items, texts = [], []
                 for s in g3:
-                    if s.note is not None:
-                        items.append(NoteRef(s.note))
-                    elif items and isinstance(items[-1], Text):
-                        items[-1] = Text(items[-1].text + s.text)
-                    else:
-                        items.append(Text(s.text))
+                    if s.note is None:
+                        texts.append(s.text)
+                        continue
+                    if texts:
+                        items.append(Text("".join(texts)))
+                        texts = []
+                    items.append(NoteRef(s.note))
+                if texts:
+                    items.append(Text("".join(texts)))  # joined once, however many runs it spans
                 styled.extend([Bold(items)] if bold else items)
             linked.extend([Link(url, styled)] if url else styled)
         out.extend([Hidden(linked, "deleted")] if deleted else linked)
@@ -200,19 +203,37 @@ class _Tables(NamedTuple):
 class TextReader:
     """Reads text storages into blocks. Footnotes and comments go into `notes` (Doc.notes) as `fn-N` and `cm-N`;
     `attach(drawable_id)` gives the blocks of a drawable anchored at U+FFFC, placed after its paragraph. Each
-    storage is entered through `Store.follow`, so one read twice or reached through itself is read once."""
+    storage is entered through `Store.follow`, so one read twice or reached through itself is read once. Each
+    comment is emitted at most once a document (`comment_thread`)."""
 
     def __init__(self, store, ctx, notes: dict, attach: Callable[[int], list]):
         self.store, self.ctx, self.notes, self.attach = store, ctx, notes, attach
         self._note_ids: dict[int, str | None] = {}   # footnote or highlight object id -> note id (None: no note)
+        self._thread_of: dict[int, str | None] = {}  # comment (3056) id -> the note id of the thread holding it
         self._next = {"fn": 0, "cm": 0}
-        self._cache: dict[tuple, object] = {}         # (lookup, style id[, depth]) -> value
+        self._cache: dict[tuple, object] = {}         # (lookup, style id) -> value
+        self._read: dict[int, list] = {}              # storage id -> its blocks, once read
+        self._head = 0                                # > 0 while a header or footer is read
 
-    def blocks(self, storage_id) -> list:
+    def blocks(self, storage_id, repeat: bool = False) -> list:
+        """The blocks of a storage. A storage already read gives [] (it was placed where it was first read), or with
+        `repeat` its blocks again, from the first read and never walked again (Numbers cells can share one rich
+        text storage)."""
+        if repeat and storage_id in self._read:
+            return list(self._read[storage_id])
         out = []
         for got in self.store.follow([storage_id], self._storage, self.store.depth):
             out.extend(got)
         return out
+
+    def header_lines(self, storage_id) -> list[str]:
+        """A header or footer storage as one line a paragraph. A footnote or comment there counts `note` and adds no
+        note, so no note is left without its mark (the WordPerfect header rule)."""
+        self._head += 1
+        try:
+            return plain(self.blocks(storage_id))
+        finally:
+            self._head -= 1
 
     # ---- objects
     def _get(self, id, type) -> dict | None:
@@ -266,17 +287,23 @@ class TextReader:
             return False
         return bool(self._cached(("b", sid), find))
 
-    def _marker(self, sid, depth: int) -> str | None:
+    def _label_types(self, sid) -> tuple:
+        """A list style's label types (field 11, packed or not), one per depth, from the first style of its chain
+        that has any; parsed once a style."""
         def find():
             for f in self._chain(sid, LIST_STYLE):
                 types = []
                 for v in f.get(11, []):
                     types.extend(pbwire.packed(v) if isinstance(v, memoryview) else [v] if isinstance(v, int) else [])
                 if types:
-                    t = types[depth] if depth < len(types) else 0
-                    return None if t == 0 else "1." if t == 3 else "-"
-            return None
-        return self._cached(("l", sid, depth), find)
+                    return tuple(types)
+            return ()
+        return self._cached(("l", sid), find) or ()
+
+    def _marker(self, sid, depth: int) -> str | None:
+        types = self._label_types(sid)
+        t = types[depth] if depth < len(types) else 0
+        return None if t == 0 else "1." if t == 3 else "-"
 
     def _url(self, lid) -> str | None:
         if lid is None:
@@ -313,7 +340,10 @@ class TextReader:
 
     def _footnote(self, fid) -> str | None:
         """The note id of footnote object `fid` (2008 -> 2 storage), its blocks into `notes` once; None when it holds
-        nothing. A footnote that cannot be read loses its note, counted `note`."""
+        nothing. A footnote that cannot be read loses its note, counted `note`, as does one in a header or footer."""
+        if self._head:
+            self.ctx.skipped["note"] += 1
+            return None
         if fid in self._note_ids:
             return self._note_ids[fid]
         self._note_ids[fid] = nid = None
@@ -330,28 +360,30 @@ class TextReader:
         self._note_ids[fid] = nid
         return nid
 
-    def _comment(self, hid) -> str | None:
-        """The note id of highlight `hid` (2013 -> 1 comment 3056 {1 text, 3 author -> 212 {1 name}, 4 replies}): the
-        comment, then its replies, each "Comment by <author>: …". A thread is walked once each, MAX_DEPTH replies
-        deep (past it counted `depth`)."""
-        if hid in self._note_ids:
-            return self._note_ids[hid]
-        self._note_ids[hid] = nid = None
+    def comment_thread(self, thread_id) -> str | None:
+        """The note id of the comment thread that starts at `thread_id` (TSD.CommentStorageArchive, 3056 {1 text,
+        3 author -> 212 {1 name}, 4 replies}): the comment, then its replies breadth first, each "Comment by
+        <author>: …" (`word_fields.comment_note`), into `notes` once. Each comment is emitted at most once a document:
+        one already in a thread gives that thread's note id, so a second highlight on a thread marks the same note and
+        the work never grows with the highlights. None when the thread holds no text. Replies are followed
+        MAX_DEPTH deep (past it counted `depth`); a thread that cannot be read counts `note`. Keynote's comments
+        (2014) call this too."""
+        if thread_id is None:
+            return None
+        if thread_id in self._thread_of:
+            return self._thread_of[thread_id]
+        walked, paras, failed = [], [], True
         with self.ctx.guard("note"):
-            f = self.store.get(hid, HIGHLIGHT)
-            if f is None:
-                self.ctx.skipped["note"] += 1
-                return None
-            paras, seen = [], set()
-            pending = deque([(ref(f, 1), 0)])
+            pending = deque([(thread_id, 0)])
             while pending:
                 cid, depth = pending.popleft()
-                if cid is None or cid in seen:
+                if cid is None or cid in self._thread_of:
                     continue
                 if depth > limits.MAX_DEPTH:
                     self.ctx.skipped["depth"] += 1
                     break
-                seen.add(cid)
+                self._thread_of[cid] = None  # entered: this comment is never walked again
+                walked.append(cid)
                 c = self.store.get(cid, COMMENT)
                 if c is None:
                     continue
@@ -359,10 +391,34 @@ class TextReader:
                 if body:
                     paras.extend(comment_note([Para([Text(body)])], self._author(c)))
                 pending.extend((r, depth + 1) for r in refs(c, 4))
-            if paras:
-                nid = self._new_id("cm")
-                self.notes[nid] = paras
-        self._note_ids[hid] = nid
+            failed = False
+        if failed:
+            self._thread_of[thread_id] = None
+        nid = None
+        if paras and not failed:
+            nid = self._new_id("cm")
+            self.notes[nid] = paras
+        for cid in walked:
+            self._thread_of[cid] = nid
+        return nid
+
+    def _comment(self, hid) -> str | None:
+        """The note id of highlight `hid` (2013 -> 1 the thread's first comment), through `comment_thread`. A
+        highlight that cannot be read, or one in a header or footer, counts `note`."""
+        if self._head:
+            self.ctx.skipped["note"] += 1
+            return None
+        if hid in self._note_ids:
+            return self._note_ids[hid]
+        self._note_ids[hid] = None
+        thread = None
+        with self.ctx.guard("note"):
+            f = self.store.get(hid, HIGHLIGHT)
+            if f is None:
+                self.ctx.skipped["note"] += 1
+                return None
+            thread = ref(f, 1)
+        self._note_ids[hid] = nid = self.comment_thread(thread)
         return nid
 
     def _author(self, c: dict) -> str:
@@ -417,10 +473,13 @@ class TextReader:
             end = start + len(line)
             out.extend(self._paragraph(text, start, end, t, closed))
             start = end + 1
+        self._read[sid] = out
         return out
 
     def _paragraph(self, text, start, end, t: _Tables, closed: set) -> list:
-        """The paragraph text[start:end] (end is its newline, or the text's end) and the drawables anchored in it."""
+        """The paragraph text[start:end] (end is its newline, or the text's end) and the drawables anchored in it.
+        A comment's mark follows the highlighted text where its highlight ends or changes; a highlight that runs
+        past the paragraph's end puts its mark at the end of the first paragraph it covers, and no later one."""
         lo = bisect_left(t.footnotes, (start,))
         hi = bisect_right(t.footnotes, (end, float("inf")))
         notes = t.footnotes[lo:hi]

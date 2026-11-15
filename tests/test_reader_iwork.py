@@ -6,6 +6,7 @@ import gzip
 import struct
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from reader import markdown  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.containers import flate, pbwire, snappy  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
-from reader.formats import iwork, iwork_iwa  # noqa: E402
+from reader.formats import iwork, iwork_iwa, iwork_text  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import (Bold, Context, Doc, Heading, Hidden, Image, Link, ListItem,  # noqa: E402
                           NoteRef, Para, Text)
@@ -576,14 +577,14 @@ def test_links():
 
 
 def test_footnote_noteref():
-    doc, ctx = _pages("Body￼ end", footnote(90, 91), archive(91, 2001, storage("The note.")),
+    doc, ctx = _pages("Body\ufffc end", footnote(90, 91), archive(91, 2001, storage("The note.")),
                       footnotes=[(4, 90)])
     assert doc.blocks == [Para([Text("Body"), NoteRef("fn-1"), Text(" end")])], doc.blocks
     assert doc.notes == {"fn-1": [Para([Text("The note.")])]}
     out = _md(doc, ctx)
     assert "Body[^1] end" in out and "[^1]: The note." in out, out
     # a footnote object that is missing loses its note: counted
-    doc, ctx = _pages("Body￼", footnotes=[(4, 92)])
+    doc, ctx = _pages("Body\ufffc", footnotes=[(4, 92)])
     assert doc.blocks == [Para([Text("Body")])] and ctx.skipped["note"] == 1
 
 
@@ -616,19 +617,19 @@ def test_tracked_deletion_hidden():
 
 
 def test_attachment_after_paragraph():
-    doc, ctx = _pages("Before￼ words\nAfter", attachment(110, 111), image(111, 7),
+    doc, ctx = _pages("Before\ufffc words\nAfter", attachment(110, 111), image(111, 7),
                       datas=[(7, "pic.png")], files={"Data/pic.png": PNG}, attachments=[(6, 110)])
     assert doc.blocks == [Para([Text("Before words")]), Image(PNG), Para([Text("After")])], doc.blocks
     assert not ctx.skipped
     # an image whose data is not in the package is counted once, even with several renditions named
-    doc, ctx = _pages("x￼", attachment(110, 111), archive(111, 3005, pb((15, pb_ref(8)), (11, pb_ref(9)))),
+    doc, ctx = _pages("x\ufffc", attachment(110, 111), archive(111, 3005, pb((15, pb_ref(8)), (11, pb_ref(9)))),
                       attachments=[(1, 110)])
     assert doc.blocks == [Para([Text("x")])] and ctx.skipped == {"image": 1}, ctx.skipped
 
 
 def test_outside_bmp_warning_text_intact():
     # UTF-16: a 0, the emoji 1-2, b 3, newline 4; c 5, the emoji 6-7, d 8. 7 falls inside the emoji's pair.
-    doc, ctx = _pages("a\U0001F600b\nc\U0001F600d￼", style(70, None, bold=True, type=2021),
+    doc, ctx = _pages("a\U0001F600b\nc\U0001F600d\ufffc", style(70, None, bold=True, type=2021),
                       footnote(90, 91), archive(91, 2001, storage("note \U0001F600")),
                       char_styles=[(3, 70), (4, None), (7, 70), (9, None), (999, 70)], footnotes=[(9, 90)])
     assert doc.blocks == [Para([Text("a\U0001F600"), Bold([Text("b")])]),
@@ -636,12 +637,12 @@ def test_outside_bmp_warning_text_intact():
     assert ctx.warnings.count(UTF16_WARNING) == 1 and ctx.warnings == [UTF16_WARNING]
     assert not ctx.skipped
     # BMP text adds no warning
-    doc, ctx = _pages("plain é", char_styles=[(1, None)])
+    doc, ctx = _pages("plain \u00e9", char_styles=[(1, None)])
     assert ctx.warnings == []
 
 
 def test_equation_object():
-    doc, ctx = _pages("x￼", attachment(120, 121), archive(121, 2015, b""), attachments=[(1, 120)])
+    doc, ctx = _pages("x\ufffc", attachment(120, 121), archive(121, 2015, b""), attachments=[(1, 120)])
     assert doc.blocks == [Para([Text("x")])] and ctx.skipped == {"object": 1}, ctx.skipped
 
 
@@ -655,7 +656,7 @@ def test_pages_headers_footers():
 
 
 def test_floating_drawables_after_body():
-    doc, ctx = _pages("Body￼", attachment(110, 140), image(140, 7), group(142, [141, 9999]),
+    doc, ctx = _pages("Body\ufffc", attachment(110, 140), image(140, 7), group(142, [141, 9999]),
                       shape(141, 150), archive(150, 2001, storage("Box text")), archive(143, 3005, b"\x0f"),
                       shape(144, 151, field=2), archive(151, 2001, storage("Old box")),
                       archive(9999, 4242, b""),
@@ -668,10 +669,149 @@ def test_floating_drawables_after_body():
 
 def test_shape_cycle():
     # a text box whose storage anchors the same text box: entered once, the cycle counted
-    doc, ctx = _pages("Body￼", attachment(110, 141), shape(141, 150), attachment(111, 141),
-                      archive(150, 2001, storage("Inner￼", attachments=[(5, 111)])), attachments=[(4, 110)])
+    doc, ctx = _pages("Body\ufffc", attachment(110, 141), shape(141, 150), attachment(111, 141),
+                      archive(150, 2001, storage("Inner\ufffc", attachments=[(5, 111)])), attachments=[(4, 110)])
     assert doc.blocks == [Para([Text("Body")]), Para([Text("Inner")])] and ctx.skipped == {"depth": 1}, \
         (doc.blocks, ctx.skipped)
+
+
+def test_inline_runs_linear():
+    # 50,000 run entries that change nothing in one paragraph: one Text, joined once
+    n, step = 50_000, 40
+    t0 = time.perf_counter()
+    doc, ctx = _pages("a" * (n * step), char_styles=[(i * step, None) for i in range(n)])
+    took = time.perf_counter() - t0
+    assert doc.blocks == [Para([Text("a" * (n * step))])] and not ctx.skipped
+    assert took < 2, took
+
+
+def test_comment_thread_once():
+    # 1,000 highlights on one thread of 1,000 replies: one note, every highlight marks it
+    h, r = 1000, 1000
+    replies = [comment(1000 + i, "r%d" % i) for i in range(r)]
+    marks = [highlight(100_000 + i, 999) for i in range(h)]
+    t0 = time.perf_counter()
+    doc, ctx = _pages("x" * h, comment(999, "root", replies=[1000 + i for i in range(r)]), *replies, *marks,
+                      comments=[(i, 100_000 + i) for i in range(h)])
+    took = time.perf_counter() - t0
+    assert list(doc.notes) == ["cm-1"] and len(doc.notes["cm-1"]) == r + 1
+    refs = [it for it in doc.blocks[0].inlines if isinstance(it, NoteRef)]
+    assert len(refs) == h and {x.id for x in refs} == {"cm-1"} and not ctx.skipped
+    assert took < 2, took
+    # a highlight on a reply already in a thread marks that thread's note
+    doc, ctx = _pages("a b", comment(999, "root", replies=[1000]), comment(1000, "reply"), highlight(95, 999),
+                      highlight(96, 1000), comments=[(0, 95), (1, None), (2, 96)])
+    assert list(doc.notes) == ["cm-1"] and doc.blocks[0].inlines == [Text("a"), NoteRef("cm-1"), Text(" b"),
+                                                                     NoteRef("cm-1")], doc.blocks[0].inlines
+
+
+def test_list_depths_parse_once():
+    depths = list(range(9)) * 20
+    text = "\n".join("i%d" % k for k in range(len(depths)))
+    starts, at = [], 0
+    for k in range(len(depths)):
+        starts.append(at)
+        at += len("i%d" % k) + 1
+    calls = []
+    real = iwork_text.TextReader._label_types
+
+    def counting(self, sid):
+        calls.append(sid)
+        return real(self, sid)
+
+    real_chain = iwork_text.TextReader._chain
+    chains = []
+
+    def chain(self, sid, type):
+        chains.append(type)
+        return real_chain(self, sid, type)
+
+    try:
+        iwork_text.TextReader._label_types = counting
+        iwork_text.TextReader._chain = chain
+        doc, ctx = _pages(text, list_style(60, [2, 3] * 4 + [0]), lists=[(s, d, 60) for s, d in zip(starts, depths)])
+    finally:
+        iwork_text.TextReader._label_types = real
+        iwork_text.TextReader._chain = real_chain
+    want = [ListItem(d, "-" if d % 2 == 0 else "1.", [Text("i%d" % k)]) if d < 8 else Para([Text("i%d" % k)])
+            for k, d in enumerate(depths)]
+    assert doc.blocks == want, doc.blocks[:10]
+    assert len(calls) == len(depths) and chains.count(2023) == 1, (len(calls), chains.count(2023))
+
+
+def test_body_failure_keeps_page():
+    # a body whose deletion table cannot be read counts `document` once; the floating image and the header stay
+    body = archive(BODY, 2001, pb((3, "secret"), (17, pb((1, pb((1, 0), (2, pb_ref(SECTION)))))), (22, b"\x0f")))
+    archives = pages_doc(BODY, floating=[140], headers=[130])
+    archives += [body, image(140, 7), archive(130, 2001, storage("Head"))]
+    members = {"Index/Document.iwa": iwa_member(*archives), "Index/Metadata.iwa": metadata_iwa([(7, "pic.png")]),
+               "Data/pic.png": PNG}
+    ctx = Context()
+    doc = iwork.parse_bytes(iwork_zip(members), ctx, "pages")
+    assert doc.blocks == [Image(PNG)] and ctx.skipped == {"document": 1}, (doc.blocks, ctx.skipped)
+    assert doc.headers == ["Head"] and "secret" not in _md(doc, ctx)
+    # with only a preview left, the body is still counted once
+    members = {"Index/Document.iwa": iwa_member(*pages_doc(BODY), archive(BODY, 2001, pb((3, "x"), (22, b"\x0f")))),
+               "preview.jpg": JPG}
+    ctx = Context()
+    doc = iwork.parse_bytes(iwork_zip(members), ctx, "pages")
+    assert [b.data for b in doc.blocks] == [JPG] and ctx.skipped == {"document": 1}, ctx.skipped
+
+
+def test_header_notes_counted():
+    # a footnote and a comment in a header count `note` and add no note: their marks are never shown
+    doc, ctx = _pages("Body", archive(130, 2001, storage("Head￼", footnotes=[(4, 90)])), footnote(90, 91),
+                      archive(91, 2001, storage("hidden note")),
+                      archive(131, 2001, storage("Foot", comments=[(0, 95)])), highlight(95, 96), comment(96, "c"),
+                      headers=[130], footers=[131], sections=[(0, SECTION)])
+    assert doc.headers == ["Head"] and doc.footers == ["Foot"] and doc.notes == {}, (doc.headers, doc.notes)
+    assert ctx.skipped == {"note": 2}, ctx.skipped
+
+
+def test_header_siblings_and_floating_ids():
+    # one broken template counts `header` once and its sibling is read; a floating id that names the header storage
+    # is not a drawable, so it never hides the header
+    archives = [archive(1, 10000, pb((4, pb_ref(BODY)), (20, pb_ref(5)))), archive(5, 10015, pb((1, pb_ref(130)))),
+                archive(BODY, 2001, storage("Body", sections=[(0, 3)])),
+                archive(3, 10011, pb((23, pb_ref(4)), (24, pb_ref(6)))), archive(4, 10143, b"\x0f"),
+                archive(6, 10143, pb((1, pb_ref(130)))), archive(130, 2001, storage("Head"))]
+    ctx = Context()
+    doc = iwork.parse_bytes(iwork_zip({"Index/Document.iwa": iwa_member(*archives)}), ctx, "pages")
+    assert doc.blocks == [Para([Text("Body")])] and doc.headers == ["Head"], (doc.blocks, doc.headers)
+    assert ctx.skipped == {"header": 1}, ctx.skipped
+
+
+def test_unordered_run_table():
+    # entries out of order are sorted stably: at an equal index the later entry wins
+    doc, ctx = _pages("ab cd\nef", style(70, None, bold=True, type=2021), style(71, None, bold=False, type=2021),
+                      style(20, "Heading 2"), char_styles=[(3, 71), (0, None), (3, 70), (5, None)],
+                      para_styles=[(6, 20), (0, None)])
+    assert doc.blocks == [Para([Text("ab "), Bold([Text("cd")])]), Heading(2, [Text("ef")])], doc.blocks
+    doc, ctx = _pages("ab cd", style(70, None, bold=True, type=2021), style(71, None, bold=False, type=2021),
+                      char_styles=[(3, 70), (0, None), (3, 71)])
+    assert doc.blocks == [Para([Text("ab cd")])], doc.blocks
+
+
+def test_repeat_blocks():
+    # one storage asked for again with repeat gives its blocks from the first read, never walking it again
+    store, ctx = _load([("Index/Document.iwa", iwa_member(archive(BODY, 2001, storage("shared"))))])
+    reader = iwork_text.TextReader(store, ctx, {}, lambda d: [])
+    walks = []
+    real = reader._storage
+    reader._storage = lambda i, d: walks.append(i) or real(i, d)
+    first = reader.blocks(BODY)
+    assert first == [Para([Text("shared")])]
+    assert reader.blocks(BODY) == []                      # once only, as before
+    again = [reader.blocks(BODY, repeat=True) for _ in range(1000)]
+    assert all(a == first for a in again) and walks == [BODY], walks
+    assert reader.blocks(999, repeat=True) == [] and not ctx.skipped
+    # comment_thread: one note a thread, the same id from any of its comments, None for an empty one
+    store, ctx = _load([("Index/Document.iwa", iwa_member(comment(1, "a", replies=[2]), comment(2, "b"),
+                                                         comment(3, "  ")))])
+    notes = {}
+    reader = iwork_text.TextReader(store, ctx, notes, lambda d: [])
+    assert [reader.comment_thread(i) for i in (1, 2, 1)] == ["cm-1"] * 3
+    assert reader.comment_thread(3) is None and reader.comment_thread(None) is None and list(notes) == ["cm-1"]
 
 
 def main():

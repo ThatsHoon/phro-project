@@ -29,6 +29,7 @@ IWA_OBJECTS = 1_000_000     # objects one document's store may hold; the rest ar
 PACKAGE_METADATA = 11006    # TSP.PackageMetadata in Metadata.iwa: field 4 lists the TSP.DataInfo entries
 APPS = ("pages", "numbers", "key")
 SHAPE, EQUATION, IMAGE, GROUP = 2011, 2015, 3005, 3008   # TSWP.ShapeInfo, TSWP.EquationInfo, TSD.Image, TSD.Group
+DRAWABLES = {SHAPE, EQUATION, IMAGE, GROUP}  # kinds drawable_blocks enters; Tasks 13 and 14 add tables and charts
 IMAGE_DATA = (15, 13, 11, 12)  # TSD.ImageArchive renditions: adjusted, original, placed, thumbnail (docling)
 FLOATING_DEPTH = 4          # embedded messages searched for references in the floating-drawable container (docling)
 PAGES_DOCUMENT, PAGES_SECTION, PAGES_TEMPLATE = 10000, 10011, 10143
@@ -57,7 +58,7 @@ class Store:
         self.visited: set[int] = set()    # objects a walk has entered, each entered once a walk
         self._path: set[int] = set()      # objects on the walk's current path, to tell a cycle from a repeat
         self.image_bytes = 0
-        self.failed = 0                   # walks that raised, each counted `document` by walk()
+        self.failed = 0                   # walks that raised (counted by walk()) or bodies that failed (by the walk)
 
     def _count(self, kind: str):
         self.ctx.skipped[kind] += 1
@@ -260,7 +261,11 @@ def drawable_blocks(store: Store, id: int, ctx, text, app: str) -> list:
     """The blocks of drawable `id`, entered through `Store.follow`: an image (3005) through `Store.data`, a shape or
     text box (2011) its storage (4 owned_storage, else 2) through `text` (an `iwork_text.TextReader`), a group (3008)
     its children (2) in order. An equation (2015) counts `object`. Other kinds are skipped uncounted (decision 10);
-    `app` is for the kinds Numbers and Keynote add. Each drawable is read under `ctx.guard` of what it loses."""
+    `app` is for the kinds Numbers and Keynote add. An id of a kind outside `DRAWABLES` is not entered, so it is never
+    marked visited for a later walk. Each drawable is read under `ctx.guard` of what it loses."""
+    def drawables(ids):
+        return [i for i in ids if store.objects.get(i, (None,))[0] in DRAWABLES]
+
     def visit(i, depth):
         kind = store.objects.get(i, (None,))[0]
         out = None
@@ -276,13 +281,13 @@ def drawable_blocks(store: Store, id: int, ctx, text, app: str) -> list:
                 out = text.blocks(sid) if sid is not None else None
         elif kind == GROUP:
             with ctx.guard("shape"):
-                children = iwork_text.refs(store.get(i, GROUP), 2)
+                children = drawables(iwork_text.refs(store.get(i, GROUP), 2))
                 out = [b for got in store.follow(children, visit, store.depth) for b in got]
         elif kind == EQUATION:
             store._count("object")
         return out
 
-    return [b for got in store.follow([id], visit, store.depth) for b in got]
+    return [b for got in store.follow(drawables([id]), visit, store.depth) for b in got]
 
 
 def _ordered_refs(f: dict, depth: int = 0, out: list | None = None) -> list[int]:
@@ -307,7 +312,8 @@ def _ordered_refs(f: dict, depth: int = 0, out: list | None = None) -> list[int]
 def _furniture(store: Store, body_fields: dict, text, doc: Doc, ctx):
     """Doc.headers and Doc.footers: the body storage's section table (17) -> TP.SectionArchive (10011; docling's
     PageMasterArchive) 23, 24, 25 (first, even, odd) -> TP.HeadersAndFootersArchive (10143) {1 headers, 2 footers},
-    each a list of storages, one line a paragraph. A section that cannot be read counts `header`."""
+    each a list of storages, one line a paragraph (`TextReader.header_lines`). A section table, section or template
+    that cannot be read counts `header` once, and its siblings are still read."""
     sections = []
     with ctx.guard("header"):
         sections = [r for _, r in iwork_text.run_table(body_fields, 17) if r is not None]
@@ -316,24 +322,29 @@ def _furniture(store: Store, body_fields: dict, text, doc: Doc, ctx):
         if sid in seen:
             continue
         seen.add(sid)
+        templates = []
         with ctx.guard("header"):
             section = store.get(sid, PAGES_SECTION)
-            if section is None:
+            if section is not None:
+                templates = [iwork_text.ref(section, n) for n in (23, 24, 25)]
+        for tid in templates:
+            if tid is None or tid in seen:
                 continue
-            for n in (23, 24, 25):
-                tid = iwork_text.ref(section, n)
-                template = store.get(tid, PAGES_TEMPLATE) if tid is not None and tid not in seen else None
+            seen.add(tid)
+            with ctx.guard("header"):
+                template = store.get(tid, PAGES_TEMPLATE)
                 if template is None:
                     continue
-                seen.add(tid)
                 for field, lines in ((1, doc.headers), (2, doc.footers)):
                     for storage in iwork_text.refs(template, field):
-                        lines.extend(iwork_text.plain(text.blocks(storage)))
+                        lines.extend(text.header_lines(storage))
 
 
 def _pages(store: Store, ctx) -> Doc | None:
-    """TP.DocumentArchive (10000, the lowest id when there are several): field 4 the body storage, then field 20's
-    floating drawables in their container's order, then the headers and footers. None without the root."""
+    """TP.DocumentArchive (10000, the lowest id when there are several): field 4 the body storage, the headers and
+    footers, then field 20's floating drawables, placed after the body in their container's order. A body that
+    fails counts `document` (once: `store.failed` tells the preview fallback) and the rest of the page is still
+    read. None without the root."""
     root = min((i for i, (t, _) in store.objects.items() if t == PAGES_DOCUMENT), default=None)
     if root is None:
         return None
@@ -341,8 +352,20 @@ def _pages(store: Store, ctx) -> Doc | None:
     doc = Doc()
     text = iwork_text.TextReader(store, ctx, doc.notes, lambda d: drawable_blocks(store, d, ctx, text, "pages"))
     body = iwork_text.ref(f, 4)
+    body_fields = None
     if body is not None:
-        doc.blocks = text.blocks(body)
+        failed = True
+        with ctx.guard("document"):
+            doc.blocks = text.blocks(body)
+            failed = False
+        if failed:
+            store.failed += 1
+        try:
+            body_fields = store.get(body, iwork_text.STORAGE)  # its section table names the headers and footers
+        except ValueError:
+            body_fields = None  # not a message: the body's failure above already counted it
+    if body_fields:
+        _furniture(store, body_fields, text, doc, ctx)
     container = iwork_text.ref(f, 20)
     if container is not None:
         drawables = []
@@ -350,9 +373,6 @@ def _pages(store: Store, ctx) -> Doc | None:
             drawables = _ordered_refs(store.get(container) or {})
         for d in drawables:
             doc.blocks.extend(drawable_blocks(store, d, ctx, text, "pages"))
-    body_fields = store.get(body, iwork_text.STORAGE) if body is not None else None
-    if body_fields:
-        _furniture(store, body_fields, text, doc, ctx)
     return doc
 
 
