@@ -16,16 +16,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from iwork_fix import (SECTION, archive, attachment, author, cell_v4, cell_v5, change, chart, chunk,  # noqa: E402
                        comment, data_list, decimal128_bytes, fmt, footnote, group, highlight, image, iwa_member,
-                       iwork_zip, keynote_doc, link, list_style, metadata_iwa, numbers_doc, pages_doc, pb, pb_ref,
-                       segment, shape, slide_ids, snappy_copy, snappy_literal, sticky, storage, string_entry, style,
-                       table, tile)
+                       iwork_zip, keynote09, keynote_doc, link, list_style, metadata_iwa, numbers_doc, pages09,
+                       pages_doc, pb, pb_ref, segment, shape, slide09, slide_ids, snappy_copy, snappy_literal, sticky,
+                       storage, string_entry, style, table, tile)
 from reader import markdown  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.containers import flate, pbwire, snappy  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
 from reader.formats import iwork, iwork_iwa, iwork_tables, iwork_text, sheet_grid  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import (Bold, Context, Doc, Heading, Hidden, Image, Link, ListItem,  # noqa: E402
+from reader.model import (Bold, Break, Context, Doc, Heading, Hidden, Image, Link, ListItem,  # noqa: E402
                           NoteRef, Para, Section, Table, Text)
 
 
@@ -1551,6 +1551,332 @@ def test_keynote_linear():
     doc = iwork.parse_bytes(data, ctx, "numbers")
     took = time.perf_counter() - t0
     assert len(doc.blocks) == 1000 and sum(len(s.comments) for s in doc.blocks) == 1 and not ctx.skipped, ctx.skipped
+    assert took < 2, took
+
+
+# -- iWork '09 XML (Task 15)
+
+def _x(data: bytes, app="pages"):
+    ctx = Context()
+    return iwork.parse_bytes(data, ctx, app), ctx
+
+
+def _p(text, style=None, **attrs) -> str:
+    """One sf:p, ended by the sf:br Pages writes at a paragraph's end."""
+    a = f' sf:style="{style}"' if style else ""
+    a += "".join(f' sf:{k.replace("_", "-")}="{v}"' for k, v in attrs.items())
+    return f"<sf:p{a}>{text}<sf:br/></sf:p>"
+
+
+def _box(xml) -> str:
+    return f"<sf:text><sf:text-storage><sf:text-body>{xml}</sf:text-body></sf:text-storage></sf:text>"
+
+
+def _media(path, attr="sf:path") -> str:
+    return (f'<sf:media><sf:content><sf:image-media><sf:filtered-image><sf:unfiltered>'
+            f'<sf:data {attr}="{path}"/></sf:unfiltered></sf:filtered-image></sf:image-media></sf:content></sf:media>')
+
+
+BOLD_STYLE = ('<sf:characterstyle sf:ident="b" sfa:ID="SFWPCharacterStyle-1"><sf:property-map><sf:bold>'
+              '<sf:number sfa:number="1" sfa:type="c"/></sf:bold></sf:property-map></sf:characterstyle>')
+
+
+def _labels(*types) -> str:
+    """An sf:liststyle ladder: "none", or a text-label type (bullet, decimal...) per rung."""
+    out = []
+    for t in types:
+        if t == "none":
+            out.append('<sf:list-label-typeinfo sf:type="none"/>')
+        else:
+            out.append(f'<sf:list-label-typeinfo sf:type="text"><sf:text-label sf:type="{t}" sf:format="x"/>'
+                       '</sf:list-label-typeinfo>')
+    return ('<sf:property-map><sf:listLabelTypes><sf:array>' + "".join(out)
+            + '</sf:array></sf:listLabelTypes></sf:property-map>')
+
+
+def test_09_pages_body_header_footnote():
+    body = _p('Body text<sf:footnote sf:autonumber="1" sf:index="0"/> more.') + _p("Second para")
+    notes = '<sf:p><sf:span><sf:footnote-mark sf:mark="1"/></sf:span> The note.<sf:footnotebr/></sf:p>'
+    doc, ctx = _x(pages09(body, header=_p("Running head"), footer=_p("Page foot"), footnotes=notes))
+    assert doc.blocks == [Para([Text("Body text"), NoteRef("fn-1"), Text(" more.")]), Para([Text("Second para")])], \
+        doc.blocks
+    assert doc.headers == ["Running head"] and doc.footers == ["Page foot"], (doc.headers, doc.footers)
+    md = _md(doc, ctx)
+    assert "Header: Running head" in md and "Footer: Page foot" in md, md
+    assert "Body text[^1] more." in md and "[^1]: The note." in md, md
+    assert not ctx.skipped and not ctx.warnings, ctx.skipped
+
+
+def test_09_pages_footnote_pairing():
+    # footnotes pair with the body's marks in order; a mark past the last note counts `note` and shows nothing;
+    # a footnote in a header counts `note`; a note continues over paragraphs until the next mark
+    body = _p('a<sf:footnote sf:autonumber="1"/> b<sf:footnote sf:autonumber="2"/> c<sf:footnote/>')
+    notes = ('<sf:p><sf:footnote-mark sf:mark="1"/>One</sf:p><sf:p>One more</sf:p>'
+             '<sf:p><sf:footnote-mark sf:mark="2"/>Two<sf:footnotebr/></sf:p>')
+    doc, ctx = _x(pages09(body, header=_p('Head<sf:footnote sf:autonumber="9"/>'), footnotes=notes))
+    assert doc.blocks == [Para([Text("a"), NoteRef("fn-1"), Text(" b"), NoteRef("fn-2"), Text(" c")])], doc.blocks
+    assert doc.notes == {"fn-1": [Para([Text("One")]), Para([Text("One more")])], "fn-2": [Para([Text("Two")])]}, \
+        doc.notes
+    assert doc.headers == ["Head"] and ctx.skipped == {"note": 2}, (doc.headers, ctx.skipped)
+    # a footnote no mark names is still kept, after the marked ones
+    doc, ctx = _x(pages09(_p("plain"), footnotes='<sf:p><sf:footnote-mark sf:mark="1"/>Orphan</sf:p>'))
+    md = _md(doc, ctx)
+    assert "Orphan" in md and not ctx.skipped, (md, ctx.skipped)
+
+
+def test_09_pages_ghost_text_dropped():
+    body = (_p('<sf:ghost-text sfa:ID="g1">Type the title<sf:br/></sf:ghost-text>')
+            + _p('Real <sf:ghost-text-ref sfa:IDREF="g1">Type the title</sf:ghost-text-ref>text')
+            + _p('<sf:span sf:style="b"><sf:ghost-text sfa:ID="g2">Template body</sf:ghost-text></sf:span>'))
+    doc, ctx = _x(pages09(body, styles=BOLD_STYLE))
+    md = _md(doc, ctx, hidden=True)
+    assert "Type the title" not in md and "Template body" not in md and "Real text" in md, md
+    assert doc.blocks == [Para([Text("Real text")])], doc.blocks
+    assert not ctx.skipped and not ctx.warnings, ctx.skipped
+
+
+def test_09_pages_headings_lists_links():
+    styles = (BOLD_STYLE + '<sf:paragraphstyle sf:ident="t" sf:name="Title"/>'
+              '<sf:paragraphstyle sf:ident="h2" sfa:ID="SFWPParagraphStyle-2" sf:name="Heading 2"/>'
+              '<sf:paragraphstyle sf:ident="h2b" sf:parent-ident="h2"/>'
+              '<sf:paragraphstyle sf:ident="c1" sf:parent-ident="c2"/><sf:paragraphstyle sf:ident="c2" '
+              'sf:parent-ident="c1"/>'
+              f'<sf:liststyle sf:ident="bul">{_labels("none", "bullet", "bullet")}</sf:liststyle>'
+              f'<sf:liststyle sf:ident="num">{_labels("none", "bullet", "decimal")}</sf:liststyle>'
+              '<sf:liststyle sf:ident="kid" sf:parent-ident="num"/>')
+    body = (_p("Doc Title", "t") + _p("Section", "h2b") + _p("Looping", "c1")
+            + _p("item one", list_style="bul", list_level=1) + _p("sub", list_style="kid", list_level=2)
+            + _p("rung zero", list_style="bul")
+            + _p('See <sf:link href="https://example.com/x"><sf:span sf:style="b">bold link</sf:span></sf:link> and '
+                 '<sf:span sf:style="SFWPCharacterStyle-1">strong</sf:span> <sf:link href="#bookmark">inner</sf:link>'
+                 '<sf:lnbr/>end'))
+    doc, ctx = _x(pages09(body, styles=styles))
+    assert doc.blocks == [
+        Heading(1, [Text("Doc Title")]), Heading(2, [Text("Section")]), Para([Text("Looping")]),
+        ListItem(0, "-", [Text("item one")]), ListItem(1, "1.", [Text("sub")]), Para([Text("rung zero")]),
+        Para([Text("See "), Link("https://example.com/x", [Bold([Text("bold link")])]), Text(" and "),
+              Bold([Text("strong")]), Text(" inner"), Break(), Text("end")])], doc.blocks
+    assert not ctx.skipped, ctx.skipped
+    md = _md(doc, ctx)
+    assert "# Doc Title" in md and "- item one\n  1. sub" in md and "[**bold link**](https://example.com/x)" in md, md
+
+
+def test_09_pages_comment():
+    body = (_p('Look <sf:annotation-field sfa:ID="af1">here</sf:annotation-field> now.')
+            + _p('Again <sf:annotation-field sfa:ID="af1">there</sf:annotation-field>'))
+    extra = ('<sf:annotations><sf:annotation sf:target="af1"><sf:text-storage><sf:text-body>'
+             + _p("Check this") + '</sf:text-body></sf:text-storage></sf:annotation>'
+             '<sf:annotation sf:target="nowhere"><sf:text-storage><sf:text-body>' + _p("Loose remark")
+             + '</sf:text-body></sf:text-storage></sf:annotation></sf:annotations>')
+    doc, ctx = _x(pages09(body, extra=extra))
+    assert doc.blocks[0] == Para([Text("Look here"), NoteRef("cm-1"), Text(" now.")]), doc.blocks
+    assert doc.blocks[1] == Para([Text("Again there"), NoteRef("cm-1")]), doc.blocks
+    md = _md(doc, ctx)
+    assert "Look here[^1] now." in md and "Again there[^1]" in md, md
+    assert "[^1]: Comment: Check this" in md and md.count("Check this") == 1, md
+    assert "Comment: Loose remark" in md and "Check this" not in md.split("[^1]:")[0], md  # kept, never in the body
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_09_pages_image():
+    body = _p("Before") + _media("Contents/pic.png") + _media("pic2.png", "path") + _media("gone.png") + _p("After")
+    doc, ctx = _x(pages09(body, files={"Contents/pic.png": PNG, "pic2.png": PNG + b"2"}))
+    assert doc.blocks == [Para([Text("Before")]), Image(PNG), Image(PNG + b"2"), Para([Text("After")])], doc.blocks
+    assert ctx.skipped == {"image": 1}, ctx.skipped
+    # a path that leaves the package counts `image`; a picture past IMAGE_BYTES for the document counts `image`
+    doc, ctx = _x(pages09(_p("x") + _media("../x.png") + _media("/x.png"), files={"x.png": PNG}))
+    assert doc.blocks == [Para([Text("x")])] and ctx.skipped == {"image": 2}, (doc.blocks, ctx.skipped)
+    old = limits.IMAGE_BYTES
+    try:
+        limits.IMAGE_BYTES = len(PNG) + 1
+        doc, ctx = _x(pages09(_p("x") + _media("a.png") + _media("a.png"), files={"a.png": PNG}))
+    finally:
+        limits.IMAGE_BYTES = old
+    assert [type(b) for b in doc.blocks] == [Para, Image] and ctx.skipped == {"image": 1}, (doc.blocks, ctx.skipped)
+
+
+def test_09_pages_drawables_attachments_prototypes():
+    extra = ('<sl:section-prototypes><sl:prototype><sf:text-storage><sf:text-body>' + _p("PROTOTYPE ONLY")
+             + '</sf:text-body></sf:text-storage></sl:prototype></sl:section-prototypes>'
+             '<sl:drawables><sl:page-group sl:page="1"><sf:drawable-shape sfa:ID="ds1">' + _box(_p("Floating"))
+             + '</sf:drawable-shape></sl:page-group><sl:textbox-chain><sf:drawable-shape-ref sfa:IDREF="ds1"/>'
+             '</sl:textbox-chain></sl:drawables>'
+             '<sf:attachments><sf:attachment sfa:ID="a1"><sf:drawable-shape>' + _box(_p("Anchored"))
+             + '</sf:drawable-shape></sf:attachment><sf:attachment sfa:ID="a2">' + _media("p.png")
+             + '</sf:attachment></sf:attachments>')
+    body = (_p('First<sf:attachment-ref sfa:IDREF="a1"/>') + _p('Second<sf:attachment-ref sfa:IDREF="a1"/>')
+            + _p("Last"))
+    doc, ctx = _x(pages09(body, extra=extra, files={"p.png": PNG}))
+    # the floating drawables follow the body, and an attachment no ref places comes last
+    assert doc.blocks == [Para([Text("First")]), Para([Text("Anchored")]), Para([Text("Second")]),
+                          Para([Text("Last")]), Para([Text("Floating")]), Image(PNG)], doc.blocks
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_09_pages_table_counted():
+    # tables are read by Task 16's reader; until then a table counts `table` and its cells stay out of the body
+    table = ('<sf:tabular-info><sf:tabular-model><sf:grid sf:numcols="1" sf:numrows="1"><sf:datasource><sf:t>'
+             '<sf:ct sfa:s="cell"/></sf:t></sf:datasource></sf:grid></sf:tabular-model></sf:tabular-info>')
+    cell_text = '<sf:tabular-info><sf:tabular-model>' + _p("CELL TEXT") + '</sf:tabular-model></sf:tabular-info>'
+    doc, ctx = _x(pages09(_p("Body") + table + cell_text))
+    assert doc.blocks == [Para([Text("Body")])] and ctx.skipped == {"table": 2}, (doc.blocks, ctx.skipped)
+    # a footnote marked in an unread cell keeps its place, so the marks after it pair with their own footnotes
+    in_cell = '<sf:tabular-info><sf:tabular-model>' + _p('cell<sf:footnote/>') + '</sf:tabular-model></sf:tabular-info>'
+    notes = "".join(f'<sf:p><sf:footnote-mark sf:mark="{i}"/>n{i}<sf:footnotebr/></sf:p>' for i in (1, 2, 3))
+    doc, ctx = _x(pages09(_p('a<sf:footnote/>') + in_cell + _p('b<sf:footnote/>'), footnotes=notes))
+    md = _md(doc, ctx)
+    assert "a[^1]" in md and "b[^2]" in md and "[^1]: n1" in md and "[^2]: n3" in md and "n2" in md, md
+    assert ctx.skipped == {"table": 1}, ctx.skipped
+
+
+def test_09_gz_index():
+    doc, ctx = _x(pages09(_p("Zipped body"), gz=True))
+    assert doc.blocks == [Para([Text("Zipped body")])] and not ctx.skipped, (doc.blocks, ctx.skipped)
+    doc, ctx = _x(keynote09(slide09(_p("T"), _p("B")), gz=True), "key")
+    assert [(s.title, s.blocks) for s in doc.blocks] == [("T", [Para([Text("B")])])], doc.blocks
+
+
+def test_09_keynote_slides_notes():
+    styles = ('<sf:paragraphstyle sf:ident="body" sf:parent-ident="base"/>'
+              '<sf:paragraphstyle sf:ident="base"><sf:property-map><sf:listStyle>'
+              '<sf:liststyle-ref sfa:IDREF="SFWPListStyle-1"/></sf:listStyle></sf:property-map></sf:paragraphstyle>'
+              f'<sf:liststyle sfa:ID="SFWPListStyle-1" sf:ident="bullets">{_labels("none", "bullet")}</sf:liststyle>'
+              '<sf:paragraphstyle sf:ident="named" sf:name="Title"/>')
+    drawables = ('<sf:shape sfa:ID="s1">' + _box(_p("Box text")) + '</sf:shape>' + _media("Shared/a.png")
+                 + '<sf:group><sf:shape>' + _box(_p("Grouped")) + '</sf:shape></sf:group>'
+                 + '<sf:sticky-note>' + _box(_p("Drawn note")) + '</sf:sticky-note>')
+    sticky = '<key:sticky-note>' + _box(_p("Fix it")) + '</key:sticky-note>'
+    master = ('<key:master-slide><key:title-placeholder>' + _box(_p("MASTER ONLY"))
+              + '</key:title-placeholder><key:page><sf:layers><sf:layer><sf:drawables><sf:shape>'
+              + _box(_p("MASTER SHAPE")) + '</sf:shape></sf:drawables></sf:layer></sf:layers></key:page>'
+              '</key:master-slide>')
+    slides = (slide09(_p("Title A"), _p("Point one", "body", list_level=1) + _p("Plain", "named"),
+                      drawables=drawables, notes=_p("Say this") + _p("Then that"), sticky=sticky, n=0)
+              + slide09(_p("Title B"), _p("Second body"), n=1))
+    doc, ctx = _x(keynote09(slides, styles=styles, masters=master, files={"Shared/a.png": PNG}), "key")
+    assert [(s.kind, s.title, s.number) for s in doc.blocks] == [("slide", "Title A", 1), ("slide", "Title B", 2)]
+    s = doc.blocks[0]
+    assert s.blocks == [ListItem(0, "-", [Text("Point one")]), Para([Text("Plain")]), Para([Text("Box text")]),
+                        Image(PNG), Para([Text("Grouped")])], s.blocks
+    assert s.notes == [Para([Text("Say this")]), Para([Text("Then that")])], s.notes
+    assert s.comments == [Para([Text("Comment: "), Text("Drawn note")]), Para([Text("Comment: "), Text("Fix it")])], \
+        s.comments
+    md = _md(doc, ctx)
+    order = ["## Slide 1: Title A", "- Point one", "Plain", "Box text", "Grouped", "> Notes: Say this", "> Then that",
+             "> Comment: Drawn note", "> Comment: Fix it", "## Slide 2: Title B", "Second body"]
+    at = [md.find(x) for x in order]
+    assert -1 not in at and at == sorted(at), (at, md)
+    assert "MASTER" not in md and md.count("Title A") == 1, md
+    assert not ctx.skipped and not ctx.warnings, ctx.skipped
+
+
+def test_09_keynote_slide_failure_and_title_note():
+    # a slide that cannot be read counts `slide` and keeps its number; a comment mark in a title moves its note
+    # into the slide's comments, since the title shows no mark
+    extra = ('<sf:annotations><sf:annotation sf:target="t1"><sf:text-storage><sf:text-body>' + _p("on the title")
+             + '</sf:text-body></sf:text-storage></sf:annotation></sf:annotations>')
+    title = _p('Head <sf:annotation-field sfa:ID="t1">line</sf:annotation-field>')
+    again = _p('<sf:annotation-field sfa:ID="t1">again</sf:annotation-field>')  # its note went to the title's slide
+    slides = slide09(title, _p("x"), n=0) + slide09(_p("Two"), _p("y"), n=1) + slide09(_p("Three"), again, n=2)
+    data = keynote09(slides + extra)
+    from reader.formats import iwork_xml
+    real = iwork_xml.Reader._slide
+
+    def broken(self, slide, number):
+        if number == 2:
+            raise ValueError("broken slide")
+        return real(self, slide, number)
+
+    iwork_xml.Reader._slide = broken
+    try:
+        doc, ctx = _x(data, "key")
+    finally:
+        iwork_xml.Reader._slide = real
+    assert [(s.title, s.number) for s in doc.blocks] == [("Head line", 1), ("Three", 3)], doc.blocks
+    assert doc.blocks[0].comments == [Para([Text("Comment: "), Text("on the title")])] and not doc.notes, doc.blocks
+    assert doc.blocks[1].blocks == [Para([Text("again")])], doc.blocks[1]
+    assert ctx.skipped == {"slide": 1}, ctx.skipped
+
+
+def test_09_root_picks_app():
+    # the root element names the app; the extension's app is used only when the root is unknown
+    doc, ctx = _x(pages09(_p("Pages body")), "key")
+    assert doc.blocks == [Para([Text("Pages body")])], doc.blocks
+    doc, ctx = _x(keynote09(slide09(_p("T"))), "pages")
+    assert [s.title for s in doc.blocks] == ["T"], doc.blocks
+    doc, ctx = _x(pages09(_p("Older body"), root="sl:other"), "pages")
+    assert doc.blocks == [Para([Text("Older body")])], doc.blocks
+    # an unknown root the extension's walk finds nothing in: no blocks, so the preview stands in
+    data = pages09(_p("text"), root="sl:other", files={"preview.jpg": JPG})
+    doc, ctx = _x(data, "key")
+    assert doc.blocks == [Image(JPG)] and ctx.skipped == {"document": 1}, (doc.blocks, ctx.skipped)
+
+
+def test_09_doctype_refused():
+    head = (f'<?xml version="1.0"?><!DOCTYPE sl:document [<!ENTITY e "boom">]><sl:document '
+            f'xmlns:sf="http://developer.apple.com/namespaces/sf" xmlns:sl="http://developer.apple.com/namespaces/sl">'
+            '<sf:p>&e;</sf:p></sl:document>').encode()
+    doc, ctx = _read({"index.xml": head, "preview.jpg": JPG})
+    assert doc.blocks == [Image(JPG)] and ctx.skipped == {"document": 1}, (doc.blocks, ctx.skipped)
+    assert _kind({"index.xml": head}) == "damaged"
+
+
+def test_09_deep_nesting():
+    # 30,000 nested spans and sections: walked without recursion
+    n = 30000
+    body = "<sf:p>" + '<sf:span sf:style="b">' * n + "deep" + "</sf:span>" * n + "</sf:p>"
+    wrap = "<sf:section>" * n + _p("inner") + "</sf:section>" * n
+    doc, ctx = _x(pages09(body + wrap, styles=BOLD_STYLE))
+    assert doc.blocks == [Para([Bold([Text("deep")])]), Para([Text("inner")])], doc.blocks
+
+
+def test_09_linear():
+    # 50,000 spans whose styles each run an 8-step parent chain over one shared tail, 20,000 marks on one comment,
+    # 20,000 paragraphs naming one list style through an 8-step chain, and 20,000 refs to one picture's data
+    n = 50000
+    chain = "".join(f'<sf:characterstyle sf:ident="c{i}" sf:parent-ident="c{i + 1}"/>' for i in range(8))
+    chain += ('<sf:characterstyle sf:ident="c8"><sf:property-map><sf:bold><sf:number sfa:number="1"/></sf:bold>'
+              '</sf:property-map></sf:characterstyle>')
+    spans = "".join(f'<sf:span sf:style="c{i % 8}">s{i} </sf:span>' for i in range(n))
+    marks = "".join('<sf:annotation-field sfa:ID="af">x</sf:annotation-field>' for _ in range(20000))
+    lists = ''.join(f'<sf:liststyle sf:ident="l{i}" sf:parent-ident="l{i + 1}"/>' for i in range(8))
+    lists += f'<sf:liststyle sf:ident="l8">{_labels("none", "bullet")}</sf:liststyle>'
+    items = "".join(_p(f"i{i}", list_style="l0", list_level=1) for i in range(20000))
+    pic = ('<sf:unfiltered sfa:ID="shared">' + "".join("<sf:pad/>" for _ in range(20000))
+           + '<sf:data sf:path="a.png"/></sf:unfiltered>')
+    refs = "".join('<sf:media><sf:unfiltered-ref sfa:IDREF="shared"/></sf:media>' for _ in range(20000))
+    extra = ('<sf:annotations><sf:annotation sf:target="af"><sf:text-storage><sf:text-body>' + _p("c")
+             + '</sf:text-body></sf:text-storage></sf:annotation></sf:annotations>'
+             '<sf:attachments><sf:attachment sfa:ID="z">' + pic + '</sf:attachment></sf:attachments>')
+    data = pages09(_p(spans) + _p(marks) + items + refs, styles=chain + lists, extra=extra,
+                   files={"a.png": PNG})
+    ctx = Context()
+    t0 = time.perf_counter()
+    doc = iwork.parse_bytes(data, ctx, "pages")
+    took = time.perf_counter() - t0
+    first = doc.blocks[0].inlines
+    assert len(first) == 1 and isinstance(first[0], Bold) and first[0].inlines[0].text.startswith("s0 s1 "), first[:2]
+    assert len(doc.notes) == 1 and sum(isinstance(b, ListItem) for b in doc.blocks) == 20000
+    assert sum(isinstance(b, Image) for b in doc.blocks) == 20000 and not ctx.skipped, ctx.skipped
+    assert took < 2, took
+    # 10,000 list styles sharing one 20,000-entry label array by ref, and 20,000 picture refs to targets nested in
+    # one another: each array and each target is read once, near itself
+    arr = '<sf:array sfa:ID="arr">' + '<sf:list-label-typeinfo sf:type="text"/>' * 20000 + "</sf:array>"
+    styles = "".join(f'<sf:liststyle sf:ident="s{i}"><sf:property-map><sf:listLabelTypes><sf:array-ref '
+                     f'sfa:IDREF="arr"/></sf:listLabelTypes></sf:property-map></sf:liststyle>' for i in range(10000))
+    items = "".join(_p(f"i{i}", list_style=f"s{i}", list_level=1) for i in range(10000))
+    nest = "".join(f'<sf:x sfa:ID="n{i}">' for i in range(20000)) + '<sf:data sf:path="a.png"/>' + "</sf:x>" * 20000
+    refs = "".join(f'<sf:media><sf:unfiltered-ref sfa:IDREF="n{i}"/></sf:media>' for i in range(20000))
+    data = pages09(items + refs, styles=styles + f'<sf:liststyle sf:ident="holder"><sf:x>{arr}</sf:x></sf:liststyle>',
+                   extra=f'<sf:attachments><sf:attachment>{nest}</sf:attachment></sf:attachments>',
+                   files={"a.png": PNG})
+    ctx = Context()
+    t0 = time.perf_counter()
+    doc = iwork.parse_bytes(data, ctx, "pages")
+    took = time.perf_counter() - t0
+    assert sum(isinstance(b, ListItem) for b in doc.blocks) == 10000, doc.blocks[:3]
+    # the ref targets more than REF_DEPTH levels above the data hold no picture near them: counted `image`
+    assert sum(isinstance(b, Image) for b in doc.blocks) == 3 and ctx.skipped == {"image": 19997}, ctx.skipped
     assert took < 2, took
 
 

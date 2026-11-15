@@ -1,4 +1,5 @@
 """In-memory builders for iWork fixtures: protobuf messages, Snappy blocks, IWA chunks, archives and zip containers."""
+import gzip
 import struct
 import zlib
 
@@ -481,3 +482,73 @@ def keynote_doc(slides: list[dict], tree=None) -> list[bytes]:
         out.append(archive(ids["slide"], 5, pb(*fields)))
     out.append(archive(THEME, 3, pb(*((2, pb_ref(t)) for t in templates))))
     return out
+
+
+# -- iWork '09 XML (Task 15): an index.xml (Pages) or index.apxl (Keynote) inside a zip, with the namespaces declared
+# as Pages and Keynote '09 declare them.
+
+SF = "http://developer.apple.com/namespaces/sf"
+SFA = "http://developer.apple.com/namespaces/sfa"
+SL = "http://developer.apple.com/namespaces/sl"
+KEY = "http://developer.apple.com/namespaces/keynote2"
+XSI = "http://www.w3.org/2001/XMLSchema-instance"
+_NS = f'xmlns:sfa="{SFA}" xmlns:sf="{SF}" xmlns:xsi="{XSI}"'
+
+
+def _xml_zip(name: str, xml: str, files: dict, gz: bool) -> bytes:
+    data = xml.encode("utf-8")
+    members = {name + ".gz": gzip.compress(data)} if gz else {name: data}
+    members.update(files)
+    # deflated as iWork writes them, except a member past zipx's ratio floor (a timing test's index) is stored
+    return iwork_zip(members, {n: 8 for n, d in members.items() if len(d) <= 2**20})
+
+
+def pages09(body_xml, *, header="", footnotes="", footer="", styles="", extra="", files={}, gz=False,
+            root=None) -> bytes:
+    """A Pages '09 file: `index.xml` holding sl:document {sl:stylesheet {sf:styles `styles`}, `extra` (sl:drawables,
+    sf:annotations, ...), sf:headers and sf:footers (one odd-page header or footer each), sf:text-storage (body)
+    {sf:text-body {sf:section {sf:layout `body_xml`}}, sf:footnotes {sf:text-storage {sf:text-body `footnotes`}}}}.
+    `files` are more zip members (image data); `gz` stores `index.xml.gz`; `root` replaces the root element's name."""
+    root = root or "sl:document"
+    hf = ""
+    for kind, xml in (("header", header), ("footer", footer)):
+        if xml:
+            hf += (f'<sf:{kind}s><sf:{kind} sf:name="SFWPDefaultOdd{kind.title()}Identifier">'
+                   f'<sf:text-storage sf:kind="{kind}"><sf:text-body>{xml}</sf:text-body></sf:text-storage>'
+                   f'</sf:{kind}></sf:{kind}s>')
+    notes = (f'<sf:footnotes><sf:text-storage sf:kind="footnote"><sf:text-body>{footnotes}</sf:text-body>'
+             f'</sf:text-storage></sf:footnotes>') if footnotes else ""
+    xml = (f'<?xml version="1.0"?>\n<{root} {_NS} xmlns:sl="{SL}" sl:version="92008102400">'
+           f'<sl:stylesheet sfa:ID="SFSStylesheet-1"><sf:styles>{styles}</sf:styles></sl:stylesheet>{extra}{hf}'
+           f'<sf:text-storage sf:kind="body" sfa:ID="SFWPStorage-1"><sf:text-body><sf:section><sf:layout>{body_xml}'
+           f'</sf:layout></sf:section></sf:text-body>{notes}</sf:text-storage></{root}>')
+    return _xml_zip("index.xml", xml, files, gz)
+
+
+def slide09(title="", body="", *, drawables="", notes="", sticky="", n=0) -> str:
+    """One key:slide: title and body placeholders (paragraph XML), key:page drawables (XML on the slide's own layer,
+    after refs to both placeholders; a master layer proxy is kept out), key:sticky-notes and key:notes."""
+    def box(tag, xml):
+        return (f'<key:{tag} sfa:ID="BG{tag}-{n}"><key:text><sf:text-storage sf:kind="textbox"><sf:text-body>{xml}'
+                f'</sf:text-body></sf:text-storage></key:text></key:{tag}>')
+    return (f'<key:slide sfa:ID="BGSlide-{n}" key:depth="0">'
+            + box("title-placeholder", title) + box("body-placeholder", body)
+            + '<key:page><sf:layers><sf:proxy-master-layer><sf:layer-ref sfa:IDREF="master"/></sf:proxy-master-layer>'
+              f'<sf:layer><sf:drawables><sf:title-placeholder-ref sfa:IDREF="BGtitle-placeholder-{n}"/>'
+              f'<sf:body-placeholder-ref sfa:IDREF="BGbody-placeholder-{n}"/>{drawables}</sf:drawables></sf:layer>'
+              '</sf:layers></key:page>'
+            + f'<key:sticky-notes>{sticky}</key:sticky-notes>'
+            + (f'<key:notes><sf:text-storage sf:kind="note"><sf:text-body>{notes}</sf:text-body></sf:text-storage>'
+               '</key:notes>' if notes else "")
+            + '</key:slide>')
+
+
+def keynote09(slides_xml, *, styles="", masters="", files={}, gz=False, root=None) -> bytes:
+    """A Keynote '09 file: `index.apxl` holding key:presentation {key:theme-list (`masters`, the theme's master
+    slides), key:stylesheet {sf:styles `styles`}, key:slide-list `slides_xml`}."""
+    root = root or "key:presentation"
+    xml = (f'<?xml version="1.0"?>\n<{root} {_NS} xmlns:key="{KEY}" key:version="92008102400">'
+           '<key:theme-list><key:theme><key:master-slides>' + masters + '</key:master-slides></key:theme>'
+           f'</key:theme-list><key:stylesheet><sf:styles>{styles}</sf:styles></key:stylesheet>'
+           f'<key:slide-list>{slides_xml}</key:slide-list></{root}>')
+    return _xml_zip("index.apxl", xml, files, gz)
