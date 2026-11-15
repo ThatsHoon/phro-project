@@ -222,3 +222,186 @@ def pages_doc(body_sid, *, floating=(), headers=(), footers=()) -> list[bytes]:
         out.append(archive(SECTION, 10011, pb((23, pb_ref(TEMPLATE)), (24, pb_ref(TEMPLATE)), (25, pb_ref(TEMPLATE)))))
         out.append(archive(TEMPLATE, 10143, pb(*((1, pb_ref(h)) for h in headers), *((2, pb_ref(f)) for f in footers))))
     return [archive(PAGES_ROOT, 10000, pb(*root))] + out
+
+
+# -- Numbers tables and documents (Task 13)
+
+V5_FLAG = {"decimal": 0x1, "double": 0x2, "seconds": 0x4, "string": 0x8, "rich": 0x10, "number_format": 0x2000,
+           "currency_format": 0x4000, "date_format": 0x8000, "duration_format": 0x10000, "text_format": 0x20000,
+           "bool_format": 0x40000, "comment": 0x80000}
+# the format flag a cell type's format_id goes under, as Numbers writes it (numbers-parser `_from_storage`)
+_FORMAT_FLAG = {2: "number_format", 10: "currency_format", 5: "date_format", 7: "duration_format", 6: "bool_format",
+                3: "text_format", 9: "text_format"}
+_V5_ORDER = ("decimal", "double", "seconds", "string", "rich", "number_format", "currency_format", "date_format",
+             "duration_format", "text_format", "bool_format", "comment")
+
+
+def fixed32(field: int, value: int) -> bytes:
+    """One protobuf fixed32 field (wire 5)."""
+    return _varint(field << 3 | 5) + struct.pack("<I", value)
+
+
+def decimal128_bytes(value) -> bytes:
+    """An IEEE 754-2008 decimal128 in the binary integer encoding: the coefficient in the low 113 bits, the exponent
+    biased by 6176 above it, the sign in bit 127."""
+    from decimal import Decimal
+    sign, digits, exp = Decimal(str(value)).as_tuple()
+    coeff = int("".join(map(str, digits)) or "0")
+    n = (sign << 127) | ((exp + 6176) << 113) | coeff
+    return n.to_bytes(16, "little")
+
+
+def cell_v5(type, *, value=None, string_id=None, rich_id=None, format_id=None, comment_id=None, format_flag=None,
+            raw_flags=None) -> bytes:
+    """A version 5 packed cell: 0 version, 1 type, 8-11 flags, then the flagged values in numbers-parser's order.
+    `value` is a decimal128 for a number (2) or currency (10), seconds for a date (5) and a double for a bool (6) or
+    duration (7). `format_id` goes under the type's format flag, or under `format_flag` (a V5_FLAG name)."""
+    vals = {}
+    if value is not None:
+        if type in (2, 10):
+            vals["decimal"] = decimal128_bytes(value)
+        elif type == 5:
+            vals["seconds"] = struct.pack("<d", float(value))
+        else:
+            vals["double"] = struct.pack("<d", float(value))
+    for name, v in (("string", string_id), ("rich", rich_id), ("comment", comment_id)):
+        if v is not None:
+            vals[name] = struct.pack("<I", v)
+    if format_id is not None:
+        vals[format_flag or _FORMAT_FLAG.get(type, "number_format")] = struct.pack("<I", format_id)
+    flags = sum(V5_FLAG[k] for k in vals) if raw_flags is None else raw_flags
+    body = b"".join(vals[k] for k in _V5_ORDER if k in vals)
+    return bytes([5, type, 0, 0, 0, 0, 0, 0]) + struct.pack("<I", flags) + body
+
+
+def cell_v4(type, *, value=None, string_id=None, ids: int = 1) -> bytes:
+    """A version 4 packed cell as docling's cells.py reads it: 12 header bytes (0 version, 1 type, 4-7 a bitmask of
+    `ids` bits), one 4-byte identifier a bit, an IEEE double before the last identifier for a numeric type, and a
+    text cell's string key as the last identifier."""
+    head = bytes([4, type, 0, 0]) + struct.pack("<I", (1 << ids) - 1) + b"\0" * 4
+    slots = b"\0\0\0\0" * (ids - 1)
+    if type == 3:
+        return head + slots + struct.pack("<I", string_id or 0)
+    return head + slots + struct.pack("<d", float(value or 0)) + b"\0\0\0\0"
+
+
+def tile(rows: dict, *, wide=False, pre_bnc=False) -> bytes:
+    """A TST.Tile (6002) payload: field 5 one TileRowInfo a row {1 tile_row_index, 2 cell_count, 6 buffer, 7 int16
+    offsets (-1 empty), 8 wide offsets (x4)}. `pre_bnc` writes the buffer and offsets as fields 3 and 4 only. A row's
+    list holds one cell (bytes) or None a column."""
+    infos = []
+    for index, cells in rows.items():
+        buf, offs = bytearray(), []
+        for c in cells:
+            if c is None:
+                offs.append(-1)
+                continue
+            if wide:
+                buf += b"\0" * (-len(buf) % 4)
+            offs.append(len(buf) // 4 if wide else len(buf))
+            buf += c
+        packed = struct.pack(f"<{len(offs)}h", *offs)
+        pairs = [(1, index), (2, sum(c is not None for c in cells))]
+        if pre_bnc:
+            pairs += [(3, bytes(buf)), (4, packed)]
+        else:
+            pairs += [(3, b""), (4, b""), (6, bytes(buf)), (7, packed)]
+            if wide:
+                pairs.append((8, 1))
+        infos.append((5, pb(*pairs)))
+    return pb(*infos)
+
+
+def fmt(type, *, decimals=None, currency=None, thousands=None, pattern=None) -> bytes:
+    """A TSK.FormatStructArchive {1 type, 2 decimal places, 3 currency code, 5 thousands, 14 ICU date pattern}."""
+    pairs = [(1, type)]
+    for field, v in ((2, decimals), (3, currency), (5, thousands), (14, pattern)):
+        if v is not None:
+            pairs.append((field, v))
+    return pb(*pairs)
+
+
+def data_list(id, entries, *, list_type=1, segments=()) -> bytes:
+    """A TST.TableDataList (6005) {1 list type, 2 next id, 3 entries, 4 segments}; `entries` are ListEntry payloads."""
+    return archive(id, 6005, pb((1, list_type), (2, 1), *((3, e) for e in entries),
+                                *((4, pb_ref(s)) for s in segments)))
+
+
+def segment(id, entries) -> bytes:
+    """A TST.TableDataListSegment (6011) {1 list type, 3 entries}."""
+    return archive(id, 6011, pb((1, 1), *((3, e) for e in entries)))
+
+
+def string_entry(key, text) -> bytes:
+    """A TableDataList.ListEntry {1 key, 2 refcount, 3 string}."""
+    return pb((1, key), (2, 1), (3, text))
+
+
+def table(name, rows, cols, *, tiles, strings=(), rich=(), merges=(), hidden_rows=(), hidden_cols=(), comments=(),
+          formats=(), id=600, tile_size=None, info_type=6000, hiding=1, string_segments=(),
+          string_list=None) -> list[bytes]:
+    """The archives of one table: TST.TableInfoArchive (`info_type`, id `id`) -> model (6001, id+1) {4 data store,
+    6 rows, 7 columns, 8 name}. The data store embeds 3 TileStorage {1 [{1 tileid, 2 tile}], 2 tile size} and
+    names 4 strings ((key, text); `string_segments` are the ids of 6011 segments the caller adds; `string_list` names
+    a list the caller adds instead), 17 rich text
+    ((key, storage id) through 6218), 19 comments ((key, 3056 id)), 22 formats ((key, `fmt` bytes)), 13 the merges
+    (6144; (row, col, rows, cols)) and 1/2 the row and column header buckets (6006), whose indexes get hidingState
+    `hiding`. `tiles` maps tileid -> `tile` bytes, object id+20+i in tileid order. With info_type 6007 (a Pages
+    table) the info nests the 6000 message in field 1. Value-list objects take ids id+2 to id+8, and the rich text
+    payloads 10**6 + id*1000 on."""
+    out, ds, entries = [], [], []
+    for i, (tid, payload) in enumerate(sorted(tiles.items())):
+        out.append(archive(id + 20 + i, 6002, payload))
+        entries.append((1, pb((1, tid), (2, pb_ref(id + 20 + i)))))
+    ds.append((3, pb(*entries, *([(2, tile_size)] if tile_size is not None else []))))
+    if string_list is not None:  # a list object the caller adds, perhaps shared with another table
+        ds.append((4, pb_ref(string_list)))
+    elif strings or string_segments:
+        out.append(data_list(id + 2, [string_entry(k, t) for k, t in strings], segments=string_segments))
+        ds.append((4, pb_ref(id + 2)))
+    if rich:
+        rich_entries = []
+        for i, (k, sid) in enumerate(rich):
+            pid = 10**6 + id * 1000 + i
+            out.append(archive(pid, 6218, pb((1, pb_ref(sid)))))
+            rich_entries.append(pb((1, k), (2, 1), (9, pb_ref(pid))))
+        out.append(data_list(id + 3, rich_entries, list_type=8))
+        ds.append((17, pb_ref(id + 3)))
+    if comments:
+        out.append(data_list(id + 4, [pb((1, k), (2, 1), (10, pb_ref(c))) for k, c in comments], list_type=10))
+        ds.append((19, pb_ref(id + 4)))
+    if formats:
+        out.append(data_list(id + 5, [pb((1, k), (2, 1), (6, f)) for k, f in formats], list_type=2))
+        ds.append((22, pb_ref(id + 5)))
+    if merges:
+        ranges = [pb((1, fixed32(1, c << 16 | r)), (2, fixed32(1, nc << 16 | nr))) for r, c, nr, nc in merges]
+        out.append(archive(id + 6, 6144, pb(*((1, x) for x in ranges))))
+        ds.append((13, pb_ref(id + 6)))
+
+    def bucket(idx):
+        return pb((1, 1), *((2, pb((1, i), (2, 20.0), (3, hiding), (4, 1))) for i in idx))
+
+    out.append(archive(id + 7, 6006, bucket(hidden_rows)))
+    out.append(archive(id + 8, 6006, bucket(hidden_cols)))
+    ds[:0] = [(1, pb((1, 1), (2, pb_ref(id + 7)))), (2, pb_ref(id + 8))]
+    out.append(archive(id + 1, 6001, pb((1, "t"), (4, pb(*ds)), (6, rows), (7, cols), (8, name))))
+    info = pb((1, b""), (2, pb_ref(id + 1)))
+    out.append(archive(id, info_type, pb((1, info)) if info_type == 6007 else info))
+    return out
+
+
+NUMBERS_ROOT = 1  # metadata_iwa takes id 2
+
+
+def sticky(id, comment_id) -> bytes:
+    """A TSWP.CommentInfoArchive (2014) placing a sticky note: field 2 the comment storage (3056)."""
+    return archive(id, 2014, pb((1, b""), (2, pb_ref(comment_id))))
+
+
+def numbers_doc(sheets) -> list[bytes]:
+    """TN.DocumentArchive (1, id 1) field 1 the sheets; each (name, drawable ids) is a TN.SheetArchive (2) at id 3,
+    4, ... {1 name, 2 drawables}."""
+    out = [archive(NUMBERS_ROOT, 1, pb(*((1, pb_ref(3 + i)) for i in range(len(sheets)))))]
+    for i, (name, drawables) in enumerate(sheets):
+        out.append(archive(3 + i, 2, pb((1, name), *((2, pb_ref(d)) for d in drawables))))
+    return out

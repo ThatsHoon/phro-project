@@ -174,7 +174,7 @@ SOFTWARE.
 
 ## docling
 
-Ported: hidden sections and slides, comments, notes fields and the chart local table in `scripts/reader/formats/odf*.py`; `w:vanish`, hidden slides and outline level handling in `scripts/reader/formats/ooxml*.py`; spine merge and link rewrite in `scripts/reader/formats/epub.py`; the raw Snappy block and IWA chunk stream in `scripts/reader/containers/snappy.py` and the protobuf wire reader in `scripts/reader/containers/pbwire.py`, from `docling/backend/iwork/iwa.py`; the iWork container and the IWA object store in `scripts/reader/formats/iwork*.py`, from `docling/backend/iwork_backend.py`, `docling/backend/iwork/iwa.py`, `archives.py` and `legacy.py`; the text storages (styles, lists, links, notes, comments) and the Pages walk in `scripts/reader/formats/iwork_text.py` and `scripts/reader/formats/iwork_iwa.py`, from `docling/backend/iwork/content.py`, `archives.py` and `pages_iwa.py`; all at docling v2.150.0 (1ae470a1f4580881ed73853f64e0bf178f623c5e).
+Ported: hidden sections and slides, comments, notes fields and the chart local table in `scripts/reader/formats/odf*.py`; `w:vanish`, hidden slides and outline level handling in `scripts/reader/formats/ooxml*.py`; spine merge and link rewrite in `scripts/reader/formats/epub.py`; the raw Snappy block and IWA chunk stream in `scripts/reader/containers/snappy.py` and the protobuf wire reader in `scripts/reader/containers/pbwire.py`, from `docling/backend/iwork/iwa.py`; the iWork container and the IWA object store in `scripts/reader/formats/iwork*.py`, from `docling/backend/iwork_backend.py`, `docling/backend/iwork/iwa.py`, `archives.py` and `legacy.py`; the text storages (styles, lists, links, notes, comments) and the Pages walk in `scripts/reader/formats/iwork_text.py` and `scripts/reader/formats/iwork_iwa.py`, from `docling/backend/iwork/content.py`, `archives.py` and `pages_iwa.py`; the table tiles, value lists and version 4 cells in `scripts/reader/formats/iwork_tables.py` and the Numbers walk in `scripts/reader/formats/iwork_iwa.py`, from `docling/backend/iwork/cells.py`, `archives.py` and `numbers_iwa.py`; all at docling v2.150.0 (1ae470a1f4580881ed73853f64e0bf178f623c5e).
 
 ```
 MIT License
@@ -808,6 +808,29 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+## numbers-parser
+
+Ported: `scripts/reader/formats/iwork_tables.py` (cell v5 order, decimal128, formats), from `numbers_parser/cell.py`, `numbers_parser/model.py` and `numbers_parser/constants.py` (the five currency symbols from `numbers_parser/currencies.py`) at numbers-parser v4.22.2 (commit f783064231a796df8ab5ef66daf7078c705df508). Apple's protobuf schemas in its `protos/` were read as format knowledge only and are not distributed.
+
+```
+Copyright 2021 Jon Connell
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+and associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 ```
 
 ## Adobe

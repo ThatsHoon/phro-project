@@ -13,7 +13,9 @@ any walk, because references cross members.
 The drawables (`drawable_blocks`) follow `IWAReader._drawable_blocks` and `_picture` of `archives.py`; the Pages
 walk follows `docling/backend/iwork/pages_iwa.py` (`read_content`, `floating_blocks`, `page_furniture`), with the
 floating drawables kept in their container's order rather than sorted by id, and every drawable and storage
-entered through `Store.follow`, so one reached twice is read once.
+entered through `Store.follow`, so one reached twice is read once. The Numbers walk follows
+`docling/backend/iwork/numbers_iwa.py` (`read_content`, `read_sheet`, `read_comment`), with the drawables kept in
+the sheet's order rather than sorted by position; tables are read by `iwork_tables`.
 """
 import posixpath
 from collections.abc import Callable, Iterable
@@ -21,15 +23,17 @@ from collections.abc import Callable, Iterable
 from .. import limits
 from ..containers import flate, pbwire, snappy
 from ..limits import ReadError
-from ..model import Context, Doc, Image
-from . import iwork_text
+from ..model import Context, Doc, Image, Section
+from . import iwork_tables, iwork_text, sheet_grid
 
 IWA_BYTES = 256 * 2**20     # unpacked bytes of all .iwa members of one document (the flate.Budget iwork builds)
 IWA_OBJECTS = 1_000_000     # objects one document's store may hold; the rest are unread, counted `record`
 PACKAGE_METADATA = 11006    # TSP.PackageMetadata in Metadata.iwa: field 4 lists the TSP.DataInfo entries
 APPS = ("pages", "numbers", "key")
 SHAPE, EQUATION, IMAGE, GROUP = 2011, 2015, 3005, 3008   # TSWP.ShapeInfo, TSWP.EquationInfo, TSD.Image, TSD.Group
-DRAWABLES = {SHAPE, EQUATION, IMAGE, GROUP}  # kinds drawable_blocks enters; Tasks 13 and 14 add tables and charts
+TABLE, PAGES_TABLE = iwork_tables.TABLE_INFO, iwork_tables.PAGES_TABLE_INFO  # TST.TableInfo, TST.WPTableInfo
+DRAWABLES = {SHAPE, EQUATION, IMAGE, GROUP, TABLE}  # kinds drawable_blocks enters (6007 in Pages); Task 14 adds charts
+NUMBERS_DOCUMENT, NUMBERS_SHEET, COMMENT_INFO = 1, 2, 2014  # TN.DocumentArchive, TN.SheetArchive, TSWP.CommentInfo
 IMAGE_DATA = (15, 13, 11, 12)  # TSD.ImageArchive renditions: adjusted, original, placed, thumbnail (docling)
 FLOATING_DEPTH = 4          # embedded messages searched for references in the floating-drawable container (docling)
 PAGES_DOCUMENT, PAGES_SECTION, PAGES_TEMPLATE = 10000, 10011, 10143
@@ -49,7 +53,9 @@ def read_member(pkg, name: str) -> bytes:
 
 class Store:
     """`objects` maps id -> (type, payload). `pkg` is the outer package and `prefix` the folder its `Data/` sits in
-    (that of the Index.zip, else empty)."""
+    (that of the Index.zip, else empty). `budget`, `scan` and `cache` are the document's table state: the cells and
+    characters all its tables share, the cells they have unpacked (against `limits.SHEET_SCAN`), and what
+    `iwork_tables` reads once by id."""
 
     def __init__(self, ctx, pkg, prefix: str = ""):
         self.ctx, self.pkg, self.prefix = ctx, pkg, prefix
@@ -59,6 +65,9 @@ class Store:
         self._path: set[int] = set()      # objects on the walk's current path, to tell a cycle from a repeat
         self.image_bytes = 0
         self.failed = 0                   # walks that raised (counted by walk()) or bodies that failed (by the walk)
+        self.budget = sheet_grid.Budget()
+        self.scan = 0
+        self.cache: dict = {}
 
     def _count(self, kind: str):
         self.ctx.skipped[kind] += 1
@@ -260,11 +269,14 @@ def _image(store: Store, id: int) -> list | None:
 def drawable_blocks(store: Store, id: int, ctx, text, app: str) -> list:
     """The blocks of drawable `id`, entered through `Store.follow`: an image (3005) through `Store.data`, a shape or
     text box (2011) its storage (4 owned_storage, else 2) through `text` (an `iwork_text.TextReader`), a group (3008)
-    its children (2) in order. An equation (2015) counts `object`. Other kinds are skipped uncounted (decision 10);
-    `app` is for the kinds Numbers and Keynote add. An id of a kind outside `DRAWABLES` is not entered, so it is never
-    marked visited for a later walk. Each drawable is read under `ctx.guard` of what it loses."""
+    its children (2) in order, a table (6000, and 6007 when `app` is pages) through `iwork_tables.table_blocks`. An
+    equation (2015) counts `object`. Other kinds, charts (5021) among them until Task 14, are skipped uncounted
+    (decision 10). An id of a kind not entered is never marked visited for a later walk. Each drawable is read under
+    `ctx.guard` of what it loses."""
+    kinds = DRAWABLES | {PAGES_TABLE} if app == "pages" else DRAWABLES
+
     def drawables(ids):
-        return [i for i in ids if store.objects.get(i, (None,))[0] in DRAWABLES]
+        return [i for i in ids if store.objects.get(i, (None,))[0] in kinds]
 
     def visit(i, depth):
         kind = store.objects.get(i, (None,))[0]
@@ -283,6 +295,8 @@ def drawable_blocks(store: Store, id: int, ctx, text, app: str) -> list:
             with ctx.guard("shape"):
                 children = drawables(iwork_text.refs(store.get(i, GROUP), 2))
                 out = [b for got in store.follow(children, visit, store.depth) for b in got]
+        elif kind in (TABLE, PAGES_TABLE):  # guarded (`table`) inside
+            out = iwork_tables.table_blocks(store, i, ctx, store.budget, text, text.notes)
         elif kind == EQUATION:
             store._count("object")
         return out
@@ -377,6 +391,56 @@ def _pages(store: Store, ctx) -> Doc | None:
 
 
 WALKS["pages"] = _pages
+
+
+def _sticky(store: Store, id: int, text, notes: dict, ctx) -> list:
+    """A sticky note (TSWP.CommentInfoArchive, 2014, 2 -> 3056) and its replies as `Section.comments` lines: the
+    thread is read by `TextReader.comment_thread`, so it is emitted once a document, and its note is moved out of
+    Doc.notes. One that cannot be read counts `note`."""
+    cid = None
+    with ctx.guard("note"):
+        cid = iwork_text.ref(store.get(id, COMMENT_INFO), 2)
+    nid = text.comment_thread(cid)
+    return notes.pop(nid, []) if nid is not None else []
+
+
+def _sheet(store: Store, sid: int, text, doc: Doc, ctx) -> Section | None:
+    """TN.SheetArchive (2) {1 name, 2 drawables} as `Section("sheet", name)`: tables, images, text boxes and groups
+    in the sheet's order (`drawable_blocks`), sticky notes into `Section.comments`. A sheet that fails counts
+    `sheet` and gives None."""
+    with ctx.guard("sheet"):
+        f = store.get(sid, NUMBERS_SHEET)
+        name = pbwire.one(f, 1)
+        sec = Section("sheet", (bytes(name).decode("utf-8", "replace") if isinstance(name, memoryview) else "").strip())
+        for d in iwork_text.refs(f, 2):
+            if store.objects.get(d, (None,))[0] == COMMENT_INFO:
+                sec.comments.extend(_sticky(store, d, text, doc.notes, ctx))
+            else:
+                sec.blocks.extend(drawable_blocks(store, d, ctx, text, "numbers"))
+        return sec
+    return None
+
+
+def _numbers(store: Store, ctx) -> Doc | None:
+    """TN.DocumentArchive (1, the lowest id when there are several) field 1: each TN.SheetArchive (2) once, under
+    `ctx.guard("sheet")`. None without the root, or when it names no sheet (so a renamed file tries the next app)."""
+    root = min((i for i, (t, _) in store.objects.items() if t == NUMBERS_DOCUMENT), default=None)
+    if root is None:
+        return None
+    f = store.get(root, NUMBERS_DOCUMENT)
+    sheets = [s for s in iwork_text.refs(f, 1) if store.objects.get(s, (None,))[0] == NUMBERS_SHEET]
+    if not sheets:
+        return None
+    doc = Doc()
+    text = iwork_text.TextReader(store, ctx, doc.notes, lambda d: drawable_blocks(store, d, ctx, text, "numbers"))
+    for sid in dict.fromkeys(sheets):
+        sec = _sheet(store, sid, text, doc, ctx)
+        if sec is not None:
+            doc.blocks.append(sec)
+    return doc
+
+
+WALKS["numbers"] = _numbers
 
 
 def walk(store: Store, app: str, ctx) -> Doc | None:

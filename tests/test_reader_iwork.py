@@ -14,17 +14,18 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from iwork_fix import (SECTION, archive, attachment, author, change, chunk, comment, footnote,  # noqa: E402
-                       group, highlight, image, iwa_member, iwork_zip, link, list_style, metadata_iwa, pages_doc, pb,
-                       pb_ref, shape, snappy_copy, snappy_literal, storage, style)
+from iwork_fix import (SECTION, archive, attachment, author, cell_v4, cell_v5, change, chunk, comment,  # noqa: E402
+                       decimal128_bytes, fmt, footnote, group, highlight, image, iwa_member, iwork_zip, link,
+                       list_style, metadata_iwa, numbers_doc, pages_doc, pb, pb_ref, segment, shape, snappy_copy,
+                       snappy_literal, sticky, storage, string_entry, style, table, tile)
 from reader import markdown  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.containers import flate, pbwire, snappy  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
-from reader.formats import iwork, iwork_iwa, iwork_text  # noqa: E402
+from reader.formats import iwork, iwork_iwa, iwork_tables, iwork_text, sheet_grid  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import (Bold, Context, Doc, Heading, Hidden, Image, Link, ListItem,  # noqa: E402
-                          NoteRef, Para, Text)
+                          NoteRef, Para, Section, Table, Text)
 
 
 def _raises(exc, fn, *a):
@@ -495,7 +496,7 @@ def test_app_by_extension():
     finally:
         iwork_iwa.WALKS.clear()
         iwork_iwa.WALKS.update(old)
-    assert set(iwork_iwa.WALKS) == {"pages"}
+    assert set(iwork_iwa.WALKS) == {"pages", "numbers"}
 
 
 # -- Pages text storages and the Pages walk
@@ -812,6 +813,360 @@ def test_repeat_blocks():
     reader = iwork_text.TextReader(store, ctx, notes, lambda d: [])
     assert [reader.comment_thread(i) for i in (1, 2, 1)] == ["cm-1"] * 3
     assert reader.comment_thread(3) is None and reader.comment_thread(None) is None and list(notes) == ["cm-1"]
+
+
+# -- Numbers tables and the Numbers walk
+
+def _numbers(*archives, sheets=None):
+    """A Numbers file: one sheet "S" holding table 600 unless `sheets` says otherwise, plus the archives."""
+    members = {"Index/Document.iwa": iwa_member(*numbers_doc(sheets or [("S", [600])]), *archives)}
+    ctx = Context()
+    return iwork.parse_bytes(iwork_zip(members), ctx, "numbers"), ctx
+
+
+def _flat(v) -> str:
+    """A cell value (str or inlines) as plain text, note marks as [^id]."""
+    if isinstance(v, str):
+        return v
+    out = []
+    for x in v:
+        if isinstance(x, Text):
+            out.append(x.text)
+        elif isinstance(x, NoteRef):
+            out.append(f"[^{x.id}]")
+        elif isinstance(x, (Bold, Link, Hidden)):
+            out.append(_flat(x.inlines))
+    return "".join(out)
+
+
+@contextmanager
+def _puts():
+    """Every value Grid.put is given, as {(row, col): text}: the table's own row numbers, before any layout."""
+    seen = {}
+    real = sheet_grid.Grid.put
+
+    def put(self, row, col, value):
+        seen[(row, col)] = value
+        return real(self, row, col, value)
+
+    sheet_grid.Grid.put = put
+    try:
+        yield seen
+    finally:
+        sheet_grid.Grid.put = real
+
+
+@contextmanager
+def _limit(mod, name, value):
+    old = getattr(mod, name)
+    setattr(mod, name, value)
+    try:
+        yield
+    finally:
+        setattr(mod, name, old)
+
+
+def _tables(doc) -> list:
+    return [b for s in doc.blocks for b in s.blocks if isinstance(b, Table)]
+
+
+def _text_cell(key):
+    return cell_v5(3, string_id=key)
+
+
+def test_two_tiles_row_past_256():
+    t = table("T", 300, 2, tiles={0: tile({3: [_text_cell(1), None]}), 1: tile({2: [None, _text_cell(2)]})},
+              strings=[(1, "a"), (2, "b")])
+    with _puts() as seen:
+        doc, ctx = _numbers(*t)
+    assert {k: _flat(v) for k, v in seen.items()} == {(3, 0): "a", (258, 1): "b"}, seen
+    [tab] = _tables(doc)
+    assert tab.caption == "T" and ctx.skipped == {"repeat": 1}, ctx.skipped  # Grid shrinks the 254 empty rows
+
+
+def test_tile_size_bounds():
+    for size in (0, 70_000):
+        doc, ctx = _numbers(*table("T", 10, 1, tiles={0: tile({0: [_text_cell(1)]})}, strings=[(1, "a")],
+                                   tile_size=size))
+        assert _tables(doc) == [] and ctx.skipped == {"table": 1}, (size, ctx.skipped)
+        assert [s.title for s in doc.blocks] == ["S"]
+    for size, row in ((None, 256), (65_536, 65_536), (1, 1)):
+        with _puts() as seen:
+            doc, ctx = _numbers(*table("T", 100_000, 1, tiles={1: tile({0: [_text_cell(1)]})}, strings=[(1, "a")],
+                                       tile_size=size))
+        assert list(seen) == [(row, 0)] and not ctx.skipped, (size, seen, ctx.skipped)
+
+
+def test_v5_each_type():
+    cells = [cell_v5(2, value="1.5"), cell_v5(10, value=3, format_id=1), _text_cell(1), cell_v5(9, rich_id=1),
+             cell_v5(5, value=86400), cell_v5(6, value=1.0), cell_v5(6, value=0.0), cell_v5(7, value=3725),
+             cell_v5(8), cell_v5(0)]
+    t = table("T", 1, len(cells), tiles={0: tile({0: cells})}, strings=[(1, "word")], rich=[(1, 700)],
+              formats=[(1, fmt(257, decimals=2, currency="USD"))])
+    with _puts() as seen:
+        doc, ctx = _numbers(*t, archive(700, 2001, storage("see site", links=[(0, 710), (8, None)])),
+                            link(710, "https://example.com"))
+    got = [_flat(seen.get((0, c), "")) for c in range(len(cells))]
+    assert got == ["1.5", "$3.00", "word", "see site", "2001-01-02", "TRUE", "FALSE", "1:02:05", "#ERROR", ""], got
+    assert seen[(0, 3)] == [Link("https://example.com", [Text("see site")])], seen[(0, 3)]
+    assert not ctx.skipped, ctx.skipped
+    assert iwork_tables.decimal128(decimal128_bytes("-0.125")) == iwork_tables.Decimal("-0.125")
+    assert iwork_tables.decimal128(decimal128_bytes("12345678901234567890123456789012")) == \
+        iwork_tables.Decimal("12345678901234567890123456789012")
+    _raises(ValueError, iwork_tables.decimal128, b"\0" * 15 + b"\x78")  # infinity / NaN
+    _raises(ValueError, iwork_tables.decimal128, b"\0" * 15)
+
+
+def test_v4_row():
+    # only fields 3 and 4: the version 4 cells, with docling's checks (a missing string key and a type the layout
+    # does not carry give nothing; a cell whose identifiers run past the buffer gives nothing)
+    cells = [cell_v4(3, string_id=1), cell_v4(2, value=2.5), cell_v4(3, string_id=99), cell_v4(9),
+             cell_v4(2, value=7.0, ids=3), cell_v4(3, string_id=1, ids=2)]
+    t = table("T", 2, 7, tiles={0: tile({0: cells, 1: [cell_v4(3, string_id=1)[:-2]]}, pre_bnc=True)},
+              strings=[(1, "a")])
+    with _puts() as seen:
+        doc, ctx = _numbers(*t)
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "a", (0, 1): "2.5", (0, 4): "7", (0, 5): "a"}, seen
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_v4_v5_side_by_side():
+    v4 = table("Old", 1, 2, tiles={0: tile({0: [cell_v4(3, string_id=1), cell_v4(2, value=4.0)]}, pre_bnc=True)},
+               strings=[(1, "old")], id=600)
+    v5 = table("New", 1, 2, tiles={0: tile({0: [cell_v5(3, string_id=1), cell_v5(2, value=5)]})},
+               strings=[(1, "new")], id=800)
+    doc, ctx = _numbers(*v4, *v5, sheets=[("S", [600, 800])])
+    md = _md(doc, ctx)
+    assert [t.caption for t in _tables(doc)] == ["Old", "New"] and not ctx.skipped, ctx.skipped
+    assert "Old\n|old|4|" in md and "New\n|new|5|" in md, md
+
+
+def test_wide_offsets():
+    # offsets x4 when field 8 is set: cells of 13 bytes are padded to 16, so only the x4 reading finds them
+    cells = [cell_v5(3, string_id=1), cell_v5(3, string_id=2), cell_v5(2, value=9)]
+    with _puts() as seen:
+        doc, ctx = _numbers(*table("T", 1, 3, tiles={0: tile({0: cells}, wide=True)}, strings=[(1, "x"), (2, "y")]))
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "x", (0, 1): "y", (0, 2): "9"} and not ctx.skipped
+
+
+def test_merges():
+    rows = {0: [_text_cell(1), _text_cell(2), _text_cell(2)], 1: [None, None, _text_cell(3)],
+            2: [_text_cell(3), _text_cell(3), _text_cell(3)]}
+    doc, ctx = _numbers(*table("T", 3, 3, tiles={0: tile(rows)}, strings=[(1, "big"), (2, "r"), (3, "z")],
+                               merges=[(0, 0, 2, 2)]))
+    [tab] = _tables(doc)
+    first = tab.rows[0][0]
+    assert (first.rowspan, first.colspan) == (2, 2) and first.blocks == [Para([Text("big")])], tab.rows
+    assert len(tab.rows[0]) == 2 and len(tab.rows[1]) == 1 and len(tab.rows[2]) == 3, tab.rows
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_hidden_row_col():
+    rows = {r: [cell_v5(3, string_id=1 + 3 * r + c) for c in range(3)] for r in range(3)}
+    strings = [(1 + i, "v%d" % i) for i in range(9)]
+    doc, ctx = _numbers(*table("T", 3, 3, tiles={0: tile(rows)}, strings=strings, hidden_rows=[1],
+                               hidden_cols=[2]))
+    [tab] = _tables(doc)
+    assert tab.hidden_rows == frozenset({1}) and tab.hidden_cols == frozenset({2}), tab
+    md = _md(doc, ctx)
+    assert "v0" in md and "v3" not in md and "v2" not in md and "v6" in md, md
+    shown = _md(doc, ctx, hidden=True)
+    assert "v3" in shown and "v2" in shown and "(hidden)" in shown, shown
+    # hidingState 0 hides nothing
+    doc, ctx = _numbers(*table("T", 3, 3, tiles={0: tile(rows)}, strings=strings, hidden_rows=[1], hiding=0))
+    assert _tables(doc)[0].hidden_rows == frozenset() and "v3" in _md(doc, ctx)
+
+
+def _code(type, **kw):
+    return iwork_tables.format_code(pbwire.fields(fmt(type, **kw)))
+
+
+def test_formats():
+    from reader.numfmt import display
+    assert _code(256, decimals=2) == "0.00" and display(1.5, _code(256, decimals=2)) == "1.50"
+    assert display(1234567, _code(256, decimals=0, thousands=True)) == "1,234,567"
+    assert _code(256, decimals=0, thousands=True) == "#,##0"
+    assert _code(256, decimals=253) == "General"
+    assert display(3, _code(257, decimals=2, currency="USD")) == "$3.00"
+    assert display(1000, _code(257, decimals=0, currency="KRW", thousands=True)) == "₩1,000"
+    assert display(3, _code(257, decimals=0, currency="CHF")) == "CHF 3"
+    assert display(0.255, _code(258, decimals=1)) == "25.5%"
+    assert display(36893.75, _code(261, pattern="yyyy-MM-dd")) == "2001-01-02"
+    assert display(36893.75, _code(261, pattern="EEEE, MMMM d, yyyy h:mm a")) == "Tuesday, January 2, 2001 6:00 PM"
+    assert display(36893.5, _code(261, pattern="dd/MM/yy HH:mm:ss 'at' EEE")) == "02/01/01 12:00:00 at Tue"
+    assert _code(261, pattern="QQQ yyyy") == "yyyy-mm-dd" and _code(261) == "yyyy-mm-dd"
+    assert _code(270) is None and _code(1) and _code(263)
+    # end to end: each format on a cell
+    formats = [(1, fmt(256, decimals=2)), (2, fmt(256, decimals=0, thousands=True)), (3, fmt(256, decimals=253)),
+               (4, fmt(257, decimals=0, currency="KRW", thousands=True)), (5, fmt(258, decimals=253)),
+               (6, fmt(261, pattern="yyyy-MM-dd")), (7, fmt(261, pattern="QQQ yyyy")), (8, fmt(1)), (9, fmt(263)),
+               (10, fmt(270)), (11, fmt(258, decimals=0))]
+    cells = [cell_v5(2, value="1.5", format_id=1), cell_v5(2, value=1234567, format_id=2),
+             cell_v5(2, value="0.1", format_id=3), cell_v5(10, value=1000, format_id=4),
+             cell_v5(2, value="0.255", format_id=5), cell_v5(5, value=86400 + 64800, format_id=6),
+             cell_v5(5, value=86400 + 64800, format_id=7), cell_v5(5, value=86400, format_id=7),
+             cell_v5(6, value=1.0, format_id=8), cell_v5(6, value=0.0, format_id=9),
+             cell_v5(2, value="1.25", format_id=10), cell_v5(2, value=1, format_id=8, format_flag="number_format"),
+             cell_v5(2, value="0.25", format_id=11)]
+    with _puts() as seen:
+        doc, ctx = _numbers(*table("T", 1, len(cells), tiles={0: tile({0: cells})}, formats=formats))
+    got = [_flat(seen.get((0, c), "")) for c in range(len(cells))]
+    assert got == ["1.50", "1,234,567", "0.1", "₩1,000", "25.5%", "2001-01-02", "2001-01-02 18:00:00",
+                   "2001-01-02", "TRUE", "FALSE", "1.25", "TRUE", "25%"], got
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_cell_comment_footnote():
+    cells = [cell_v5(3, string_id=1, comment_id=1), cell_v5(0, comment_id=2), _text_cell(1)]
+    doc, ctx = _numbers(*table("T", 1, 3, tiles={0: tile({0: cells})}, strings=[(1, "a")],
+                               comments=[(1, 900), (2, 902)]),
+                        comment(900, "check this", author=901, replies=[903]), author(901, "Ann"),
+                        comment(903, "done"), comment(902, "empty cell note"))
+    [tab] = _tables(doc)
+    row = tab.rows[0]
+    assert row[0].blocks == [Para([Text("a"), NoteRef("cm-1")])], row
+    assert row[1].blocks == [Para([NoteRef("cm-2")])], row
+    assert doc.notes["cm-1"] == [Para([Text("Comment by Ann: "), Text("check this")]),
+                                 Para([Text("Comment: "), Text("done")])], doc.notes
+    md = _md(doc, ctx)
+    assert "a[^1]" in md and "[^1]: Comment by Ann: check this" in md and "empty cell note" in md, md
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_false_tileid_rows():
+    t0 = time.perf_counter()
+    with _puts() as seen:
+        doc, ctx = _numbers(*table("T", 10, 1, tiles={0: tile({0: [_text_cell(1)]}), 10**6: tile({0: [_text_cell(2)]}),
+                                                       10**12: tile({5: [_text_cell(2)]})},
+                                   strings=[(1, "a"), (2, "b")]))
+    assert time.perf_counter() - t0 < 1
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "a"} and ctx.skipped == {"sheet_cut": 1}, ctx.skipped
+    assert _tables(doc)[0].rows[0][0].blocks == [Para([Text("a")])]
+
+
+def test_styled_empty_cells_scan():
+    rows = {0: [_text_cell(1), _text_cell(1)], 1: [cell_v5(0)] * 20, 2: [_text_cell(1)]}
+    with _limit(limits, "SHEET_SCAN", 10):
+        with _puts() as seen:
+            doc, ctx = _numbers(*table("T", 3, 20, tiles={0: tile(rows)}, strings=[(1, "a")]))
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "a", (0, 1): "a"}, seen
+    assert ctx.skipped == {"sheet_cut": 1} and any("unpacked cells" in w for w in ctx.warnings), ctx.warnings
+    # exactly SHEET_SCAN cells unpacked is not a cut
+    with _limit(limits, "SHEET_SCAN", 3):
+        doc, ctx = _numbers(*table("T", 3, 3, tiles={0: tile({0: [_text_cell(1)] * 3})}, strings=[(1, "a")]))
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_table_segments_cap():
+    cells = [_text_cell(1), _text_cell(2), _text_cell(3)]
+    segs = [segment(650, [string_entry(2, "two")]), segment(651, [string_entry(3, "three")])]
+    t = table("T", 1, 3, tiles={0: tile({0: cells})}, strings=[(1, "one")], string_segments=[650, 650, 651])
+    with _puts() as seen:
+        doc, ctx = _numbers(*t, *segs)
+    assert [_flat(seen[(0, c)]) for c in range(3)] == ["one", "two", "three"] and not ctx.skipped, ctx.skipped
+    with _limit(iwork_tables, "TABLE_SEGMENTS", 1):
+        with _puts() as seen:
+            doc, ctx = _numbers(*t, *segs)
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "one", (0, 1): "two"}, seen
+    assert ctx.skipped == {"cells": 1}, ctx.skipped
+
+
+def test_numbers_sheets():
+    a = table("Ta", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, strings=[(1, "alpha")], id=600)
+    b = table("Tb", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, strings=[(1, "beta")], id=800)
+    doc, ctx = _numbers(*a, *b, sticky(950, 951), comment(951, "remember", replies=[952]), comment(952, "ok"),
+                        archive(960, 5021, pb((1, b""))), shape(961, 962), archive(962, 2001, storage("box text")),
+                        sheets=[("A", [600]), ("B", [800, 950, 960, 961])])
+    assert [(s.kind, s.title) for s in doc.blocks] == [("sheet", "A"), ("sheet", "B")]
+    assert not doc.notes and len(doc.blocks[1].comments) == 2, (doc.notes, doc.blocks[1].comments)
+    md = _md(doc, ctx)
+    assert "## Sheet: A" in md and "## Sheet: B" in md and "alpha" in md and "beta" in md and "box text" in md, md
+    assert "> Comment: remember" in md and "> Comment: ok" in md, md
+    assert not ctx.skipped, ctx.skipped  # the chart (Task 14) is passed over uncounted
+
+
+def test_numbers_sheet_and_table_failures():
+    # a table whose model is missing counts `table`; a sheet that is not a message counts `sheet`; the rest is read
+    good = table("T", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, strings=[(1, "kept")], id=800)
+    members = {"Index/Document.iwa": iwa_member(*numbers_doc([("A", [600, 800]), ("B", [])]),
+                                                archive(600, 6000, pb((2, pb_ref(12345)))), *good)}
+    ctx = Context()
+    doc = iwork.parse_bytes(iwork_zip(members), ctx, "numbers")
+    assert [t.caption for t in _tables(doc)] == ["T"] and ctx.skipped == {"table": 1}, ctx.skipped
+    members = {"Index/Document.iwa": iwa_member(archive(1, 1, pb((1, pb_ref(3)), (1, pb_ref(4)))),
+                                                archive(3, 2, b"\x0a\x05ab"), archive(4, 2, pb((1, "B"))))}
+    ctx = Context()
+    doc = iwork.parse_bytes(iwork_zip(members), ctx, "numbers")
+    assert [s.title for s in doc.blocks] == ["B"] and ctx.skipped == {"sheet": 1}, ctx.skipped
+
+
+def test_broken_shared_parts():
+    # one broken string list named by two tables: each table fails (`table`), the list is parsed once
+    shared = archive(5001, 6005, b"	ab")  # field 3 runs past the message
+    a = table("A", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, string_list=5001, id=600)
+    b = table("B", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, string_list=5001, id=800)
+    parses = []
+    real = iwork_iwa.Store.get
+
+    def get(self, id, type=None):
+        if id == 5001:
+            parses.append(id)
+        return real(self, id, type)
+
+    iwork_iwa.Store.get = get
+    try:
+        doc, ctx = _numbers(*a, *b, shared, sheets=[("S", [600, 800])])
+    finally:
+        iwork_iwa.Store.get = real
+    assert _tables(doc) == [] and ctx.skipped == {"table": 2} and parses == [5001], (ctx.skipped, parses)
+    # a good list shared by two tables serves both
+    good = archive(5002, 6005, pb((1, 1), (3, string_entry(1, "x"))))
+    a = table("A", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, string_list=5002, id=600)
+    b = table("B", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, string_list=5002, id=800)
+    doc, ctx = _numbers(*a, *b, good, sheets=[("S", [600, 800])])
+    assert [t.rows[0][0].blocks for t in _tables(doc)] == [[Para([Text("x")])]] * 2 and not ctx.skipped
+    # a broken rich text storage leaves its cell empty (`record`); the table is kept
+    cells = [cell_v5(9, rich_id=1), _text_cell(1)]
+    doc, ctx = _numbers(*table("T", 1, 2, tiles={0: tile({0: cells})}, strings=[(1, "kept")], rich=[(1, 700)]),
+                        archive(700, 2001, b"	ab"))
+    [tab] = _tables(doc)
+    assert [c.blocks for c in tab.rows[0]] == [[Para([Text("kept")])]] and ctx.skipped == {"record": 1},         (tab.rows, ctx.skipped)
+
+
+def test_pages_table():
+    # a Pages table (6007, its 6000 message nested in field 1) anchored in the body
+    t = table("PT", 1, 2, tiles={0: tile({0: [_text_cell(1), _text_cell(2)]})}, strings=[(1, "p"), (2, "q")],
+              info_type=6007)
+    doc, ctx = _pages("Body￼", attachment(110, 600), *t, attachments=[(4, 110)])
+    assert doc.blocks[0] == Para([Text("Body")]) and isinstance(doc.blocks[1], Table), doc.blocks
+    assert doc.blocks[1].caption == "PT" and not ctx.skipped, ctx.skipped
+
+
+def test_shared_rich_storage():
+    # two cells on one rich-text storage (the TableDataList refcount) both show it
+    cells = [cell_v5(9, rich_id=1), cell_v5(9, rich_id=2)]
+    with _puts() as seen:
+        doc, ctx = _numbers(*table("T", 1, 2, tiles={0: tile({0: cells})}, rich=[(1, 700), (2, 700)]),
+                            archive(700, 2001, storage("shared")))
+    assert [_flat(seen[(0, c)]) for c in range(2)] == ["shared", "shared"] and not ctx.skipped, ctx.skipped
+
+
+def test_table_linear():
+    # 100,000 text cells in four tiles of 250 rows: read in linear time
+    n_rows, n_cols = 1000, 100
+    row = [cell_v5(3, string_id=1 + c) for c in range(n_cols)]
+    tiles = {t: tile({r: row for r in range(250)}) for t in range(n_rows // 250)}
+    strings = [(1 + c, "s%d" % c) for c in range(n_cols)]
+    t = table("Big", n_rows, n_cols, tiles=tiles, strings=strings, tile_size=250)
+    members = {"Index/Document.iwa": iwa_member(*numbers_doc([("S", [600])]), *t)}
+    data = iwork_zip(members)
+    ctx = Context()
+    t0 = time.perf_counter()
+    doc = iwork.parse_bytes(data, ctx, "numbers")
+    took = time.perf_counter() - t0
+    [tab] = _tables(doc)
+    assert len(tab.rows) == n_rows and all(len(r) == n_cols for r in tab.rows) and not ctx.skipped, ctx.skipped
+    assert took < 3, took
 
 
 def main():
