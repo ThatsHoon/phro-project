@@ -117,3 +117,108 @@ def iwork_zip(members: dict[str, bytes], methods: dict[str, int] = {}) -> bytes:
     n = len(members)
     eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, n, n, len(central), len(out), 0)
     return bytes(out + central + eocd)
+
+
+# -- Pages text storages and documents (Task 12). Run tables take (character index, object id or None) pairs; the
+# indexes are written as given (IWA counts them in UTF-16 code units).
+
+def _table(entries) -> bytes:
+    """A TSWP.ObjectAttributeTable: {1 entries {1 character_index, 2 TSP.Reference}}; a None ref ends the run."""
+    return pb(*((1, pb((1, i), *([(2, pb_ref(r))] if r is not None else []))) for i, r in entries))
+
+
+def storage(text, *, para_styles=(), char_styles=(), lists=(), links=(), footnotes=(), comments=(), deletions=(),
+            attachments=(), sections=(), insertions=()) -> bytes:
+    """A TSWP.StorageArchive (2001) payload. `text` is a string or a list of them (field 3 repeated). `lists` takes
+    (index, depth, list style id) triples, for field 6 (ParaData {1 index, 2 first, 3 second}) and field 7."""
+    parts = [(3, t) for t in ([text] if isinstance(text, str) else text)]
+    for field, entries in ((5, para_styles), (8, char_styles), (9, attachments), (11, links), (16, footnotes),
+                           (17, sections), (21, insertions), (22, deletions), (23, comments)):
+        if entries:
+            parts.append((field, _table(entries)))
+    if lists:
+        parts.append((6, pb(*((1, pb((1, i), (2, d), (3, 0))) for i, d, _ in lists))))
+        parts.append((7, _table((i, s) for i, _, s in lists)))
+    return pb(*parts)
+
+
+def style(id, name, *, parent=None, bold=None, type=2022) -> bytes:
+    """A style archive: TSWP.ParagraphStyleArchive (2022) by default, or `type` 2021 (character) or 2023 (list).
+    Field 1 is its TSS.StyleArchive super {1 name, 3 parent}; `bold` (True or False) sets character property 1."""
+    sup = pb(*([(1, name)] if name else []), *([(3, pb_ref(parent))] if parent is not None else []))
+    return archive(id, type, pb((1, sup), *([(11, pb((1, int(bold))))] if bold is not None else [])))
+
+
+def list_style(id, label_types, *, parent=None) -> bytes:
+    """A TSWP.ListStyleArchive (2023): field 11 one label type per depth (0 none, 2 string, 3 number)."""
+    sup = pb(*([(3, pb_ref(parent))] if parent is not None else []))
+    return archive(id, 2023, pb((1, sup), *((11, t) for t in label_types)))
+
+
+def link(id, url) -> bytes:
+    """A TSWP.HyperlinkFieldArchive (2032): field 2 the url."""
+    return archive(id, 2032, pb((2, url)))
+
+
+def change(id, kind) -> bytes:
+    """A TSWP.ChangeArchive (2060): field 1 kind, 1 insertion, 2 deletion."""
+    return archive(id, 2060, pb((1, kind)))
+
+
+def footnote(id, storage_id) -> bytes:
+    """A TSWP.FootnoteReferenceAttachmentArchive (2008): field 2 the note's storage."""
+    return archive(id, 2008, pb((2, pb_ref(storage_id))))
+
+
+def comment(id, text, *, author=None, replies=()) -> bytes:
+    """A TSD.CommentStorageArchive (3056) {1 text, 3 author, 4 replies}; `author` is a TSK.AnnotationAuthorArchive
+    (212) id."""
+    return archive(id, 3056, pb((1, text), *([(3, pb_ref(author))] if author is not None else []),
+                                *((4, pb_ref(r)) for r in replies)))
+
+
+def highlight(id, comment_id) -> bytes:
+    """A TSWP.HighlightArchive (2013): field 1 the comment storage."""
+    return archive(id, 2013, pb((1, pb_ref(comment_id))))
+
+
+def author(id, name) -> bytes:
+    return archive(id, 212, pb((1, name)))
+
+
+def attachment(id, drawable) -> bytes:
+    """A TSWP.DrawableAttachmentArchive (2003): field 1 the drawable."""
+    return archive(id, 2003, pb((1, pb_ref(drawable))))
+
+
+def image(id, data_id, field=11) -> bytes:
+    """A TSD.ImageArchive (3005) whose `field` (15, 13, 11 or 12) is a TSP.DataReference to `data_id`."""
+    return archive(id, 3005, pb((field, pb_ref(data_id))))
+
+
+def shape(id, storage_id, field=4) -> bytes:
+    """A TSWP.ShapeInfoArchive (2011): field 4 owned_storage (2, the older storage field, with `field=2`)."""
+    return archive(id, 2011, pb((1, b""), (field, pb_ref(storage_id))))
+
+
+def group(id, children) -> bytes:
+    """A TSD.GroupArchive (3008): field 2 the children."""
+    return archive(id, 3008, pb(*((2, pb_ref(c)) for c in children)))
+
+
+PAGES_ROOT, FLOATING, SECTION, TEMPLATE = 1, 5, 3, 4  # metadata_iwa takes id 2
+
+
+def pages_doc(body_sid, *, floating=(), headers=(), footers=()) -> list[bytes]:
+    """The archives of a Pages document: TP.DocumentArchive (10000, id 1) with 4 the body storage and 20 a container
+    (id 5) listing `floating`; with headers or footers, a section (10011, id 3) whose 23, 24 and 25 name one
+    HeadersAndFooters (10143, id 4) {1 headers, 2 footers}. The body storage needs `sections=[(0, SECTION)]`."""
+    root = [(4, pb_ref(body_sid))]
+    out = []
+    if floating:
+        root.append((20, pb_ref(FLOATING)))
+        out.append(archive(FLOATING, 10015, pb(*((1, pb_ref(d)) for d in floating))))
+    if headers or footers:
+        out.append(archive(SECTION, 10011, pb((23, pb_ref(TEMPLATE)), (24, pb_ref(TEMPLATE)), (25, pb_ref(TEMPLATE)))))
+        out.append(archive(TEMPLATE, 10143, pb(*((1, pb_ref(h)) for h in headers), *((2, pb_ref(f)) for f in footers))))
+    return [archive(PAGES_ROOT, 10000, pb(*root))] + out

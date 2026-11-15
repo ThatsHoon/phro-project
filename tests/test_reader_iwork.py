@@ -13,14 +13,17 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from iwork_fix import (archive, chunk, iwa_member, iwork_zip, metadata_iwa, pb, pb_ref,  # noqa: E402
-                       snappy_copy, snappy_literal)
+from iwork_fix import (SECTION, archive, attachment, author, change, chunk, comment, footnote,  # noqa: E402
+                       group, highlight, image, iwa_member, iwork_zip, link, list_style, metadata_iwa, pages_doc, pb,
+                       pb_ref, shape, snappy_copy, snappy_literal, storage, style)
+from reader import markdown  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.containers import flate, pbwire, snappy  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
 from reader.formats import iwork, iwork_iwa  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Doc, Image, Para, Text  # noqa: E402
+from reader.model import (Bold, Context, Doc, Heading, Hidden, Image, Link, ListItem,  # noqa: E402
+                          NoteRef, Para, Text)
 
 
 def _raises(exc, fn, *a):
@@ -491,7 +494,184 @@ def test_app_by_extension():
     finally:
         iwork_iwa.WALKS.clear()
         iwork_iwa.WALKS.update(old)
-    assert iwork_iwa.WALKS == {}
+    assert set(iwork_iwa.WALKS) == {"pages"}
+
+
+# -- Pages text storages and the Pages walk
+
+BODY = 10
+PNG = b"\x89PNG\r\n\x1a\n" + b"pixels"
+UTF16_WARNING = "utf16: text positions may be off after characters outside the BMP"
+
+
+def _pages(text, *more, datas=(), files=None, floating=(), headers=(), footers=(), **kw):
+    """A Pages file whose body storage is `text` with the storage keywords `kw`, plus the archives `more`."""
+    archives = pages_doc(BODY, floating=floating, headers=headers, footers=footers)
+    archives += [archive(BODY, 2001, storage(text, **kw)), *more]
+    members = {"Index/Document.iwa": iwa_member(*archives)}
+    if datas:
+        members["Index/Metadata.iwa"] = metadata_iwa(list(datas))
+    members.update(files or {})
+    ctx = Context()
+    return iwork.parse_bytes(iwork_zip(members), ctx, "pages"), ctx
+
+
+def _md(doc, ctx, hidden=False):
+    with tempfile.TemporaryDirectory() as d:
+        return markdown.render(doc, Path(d) / "assets", hidden, ctx.skipped)
+
+
+def test_headings_by_style_name():
+    text = "T\nS\nH\nC\nSub\nBare\nBig\nBody"
+    starts = [0, 2, 4, 6, 8, 12, 17, 21]
+    ids = [20, 21, 22, 24, 25, 26, 27, None]
+    doc, ctx = _pages(text, style(20, "Title"), style(21, "Subheading"), style(22, "Heading 4"),
+                      style(23, "Heading 2"), style(24, None, parent=23), style(25, "Subtitle"), style(26, "heading"),
+                      style(27, "Heading 9"), para_styles=list(zip(starts, ids)))
+    assert doc.blocks == [Heading(1, [Text("T")]), Heading(2, [Text("S")]), Heading(4, [Text("H")]),
+                          Heading(2, [Text("C")]), Heading(2, [Text("Sub")]), Heading(1, [Text("Bare")]),
+                          Heading(6, [Text("Big")]), Para([Text("Body")])], doc.blocks
+    assert not ctx.skipped and not ctx.warnings
+
+
+def test_style_chain_and_cycle():
+    # 100 has 8 parents (101..108), the named one last: reached. 200 has 9 (201..209): the chain stops first.
+    near = [style(100 + i, None, parent=101 + i) for i in range(8)] + [style(108, "Heading 3")]
+    far = [style(200 + i, None, parent=201 + i) for i in range(9)] + [style(209, "Heading 3")]
+    loops = [style(300, None, parent=300), style(301, None, parent=302), style(302, None, parent=301)]
+    doc, ctx = _pages("a\nb\nc\nd", *near, *far, *loops, para_styles=[(0, 100), (2, 200), (4, 300), (6, 301)])
+    assert doc.blocks == [Heading(3, [Text("a")]), Para([Text("b")]), Para([Text("c")]), Para([Text("d")])], doc.blocks
+    assert not ctx.skipped
+
+
+def test_list_items():
+    doc, ctx = _pages("one\ntwo\nthree\nplain", list_style(60, [2, 3]), list_style(61, [], parent=60),
+                      lists=[(0, 0, 60), (4, 1, 60), (8, 0, 61), (14, 0, None)])
+    assert doc.blocks == [ListItem(0, "-", [Text("one")]), ListItem(1, "1.", [Text("two")]),
+                          ListItem(0, "-", [Text("three")]), Para([Text("plain")])], doc.blocks
+    # label type 0 at a depth is plain text
+    doc, ctx = _pages("x", list_style(62, [0]), lists=[(0, 0, 62)])
+    assert doc.blocks == [Para([Text("x")])]
+    assert "- one\n  1. two" in _md(*_pages("one\ntwo", list_style(60, [2, 3]), lists=[(0, 0, 60), (4, 1, 60)]))
+
+
+def test_bold_from_char_style():
+    doc, ctx = _pages("plain bold end\ninherit not", style(70, None, bold=True, type=2021),
+                      style(71, None, parent=72, type=2021), style(72, "Strong", bold=True, type=2021),
+                      style(73, None, parent=72, bold=False, type=2021),
+                      char_styles=[(6, 70), (10, None), (15, 71), (22, 73)])
+    assert doc.blocks == [Para([Text("plain "), Bold([Text("bold")]), Text(" end")]),
+                          Para([Bold([Text("inherit")]), Text(" not")])], doc.blocks
+    assert "plain **bold** end" in _md(doc, ctx)
+
+
+def test_links():
+    doc, ctx = _pages("A B C D E", link(80, "https://x.test/"), link(81, "mailto:a@b.test"),
+                      link(82, "x-apple-data-detectors://3"), link(83, "HTTP://y.test"),
+                      links=[(2, 80), (3, None), (4, 81), (5, None), (6, 82), (7, None), (8, 83)])
+    assert doc.blocks[0].inlines == [Text("A "), Link("https://x.test/", [Text("B")]), Text(" "),
+                                     Link("mailto:a@b.test", [Text("C")]), Text(" D "),
+                                     Link("HTTP://y.test", [Text("E")])], doc.blocks[0].inlines
+    assert "[B](https://x.test/)" in _md(doc, ctx)
+
+
+def test_footnote_noteref():
+    doc, ctx = _pages("Body￼ end", footnote(90, 91), archive(91, 2001, storage("The note.")),
+                      footnotes=[(4, 90)])
+    assert doc.blocks == [Para([Text("Body"), NoteRef("fn-1"), Text(" end")])], doc.blocks
+    assert doc.notes == {"fn-1": [Para([Text("The note.")])]}
+    out = _md(doc, ctx)
+    assert "Body[^1] end" in out and "[^1]: The note." in out, out
+    # a footnote object that is missing loses its note: counted
+    doc, ctx = _pages("Body￼", footnotes=[(4, 92)])
+    assert doc.blocks == [Para([Text("Body")])] and ctx.skipped["note"] == 1
+
+
+def test_comment_note():
+    doc, ctx = _pages("Look here please", highlight(95, 96), comment(96, "Fix this", author=97, replies=[98]),
+                      author(97, "Ann"), comment(98, "Done", author=99), author(99, "Bo"),
+                      comments=[(5, 95), (9, None)])
+    assert doc.blocks[0].inlines == [Text("Look here"), NoteRef("cm-1"), Text(" please")], doc.blocks[0].inlines
+    assert doc.notes == {"cm-1": [Para([Text("Comment by Ann: "), Text("Fix this")]),
+                                  Para([Text("Comment by Bo: "), Text("Done")])]}, doc.notes
+    out = _md(doc, ctx)
+    assert "[^1]: Comment by Ann: Fix this Comment by Bo: Done" in out, out
+    # a reply that points back at its thread is read once
+    doc, ctx = _pages("x y", highlight(95, 96), comment(96, "Loop", replies=[96]), comments=[(0, 95)])
+    assert doc.notes == {"cm-1": [Para([Text("Comment: "), Text("Loop")])]}, doc.notes
+
+
+def test_tracked_deletion_hidden():
+    doc, ctx = _pages("Keep gone stay", change(100, 2), change(101, 1),
+                      deletions=[(5, 100), (10, None)], insertions=[(0, 101), (5, None)])
+    assert doc.blocks[0].inlines == [Text("Keep "), Hidden([Text("gone ")], "deleted"), Text("stay")], \
+        doc.blocks[0].inlines
+    out = _md(doc, ctx)
+    assert "gone" not in out and "Keep stay" in out and "(1 hidden places left out)" in out, out
+    shown = _md(doc, ctx, hidden=True)
+    assert "(hidden: gone )" in shown, shown
+    # a deletion table that cannot be read fails the storage rather than showing deleted text as body text
+    body = archive(BODY, 2001, pb((3, "secret"), (22, b"\x0f")))
+    assert _kind({"Index/Document.iwa": iwa_member(*pages_doc(BODY), body)}) == "damaged"
+
+
+def test_attachment_after_paragraph():
+    doc, ctx = _pages("Before￼ words\nAfter", attachment(110, 111), image(111, 7),
+                      datas=[(7, "pic.png")], files={"Data/pic.png": PNG}, attachments=[(6, 110)])
+    assert doc.blocks == [Para([Text("Before words")]), Image(PNG), Para([Text("After")])], doc.blocks
+    assert not ctx.skipped
+    # an image whose data is not in the package is counted once, even with several renditions named
+    doc, ctx = _pages("x￼", attachment(110, 111), archive(111, 3005, pb((15, pb_ref(8)), (11, pb_ref(9)))),
+                      attachments=[(1, 110)])
+    assert doc.blocks == [Para([Text("x")])] and ctx.skipped == {"image": 1}, ctx.skipped
+
+
+def test_outside_bmp_warning_text_intact():
+    # UTF-16: a 0, the emoji 1-2, b 3, newline 4; c 5, the emoji 6-7, d 8. 7 falls inside the emoji's pair.
+    doc, ctx = _pages("a\U0001F600b\nc\U0001F600d￼", style(70, None, bold=True, type=2021),
+                      footnote(90, 91), archive(91, 2001, storage("note \U0001F600")),
+                      char_styles=[(3, 70), (4, None), (7, 70), (9, None), (999, 70)], footnotes=[(9, 90)])
+    assert doc.blocks == [Para([Text("a\U0001F600"), Bold([Text("b")])]),
+                          Para([Text("c"), Bold([Text("\U0001F600d")]), NoteRef("fn-1")])], doc.blocks
+    assert ctx.warnings.count(UTF16_WARNING) == 1 and ctx.warnings == [UTF16_WARNING]
+    assert not ctx.skipped
+    # BMP text adds no warning
+    doc, ctx = _pages("plain é", char_styles=[(1, None)])
+    assert ctx.warnings == []
+
+
+def test_equation_object():
+    doc, ctx = _pages("x￼", attachment(120, 121), archive(121, 2015, b""), attachments=[(1, 120)])
+    assert doc.blocks == [Para([Text("x")])] and ctx.skipped == {"object": 1}, ctx.skipped
+
+
+def test_pages_headers_footers():
+    doc, ctx = _pages("Body", archive(130, 2001, storage("Head")), archive(131, 2001, storage(["Fo", "ot"])),
+                      headers=[130], footers=[131], sections=[(0, SECTION)])
+    assert doc.blocks == [Para([Text("Body")])]
+    assert doc.headers == ["Head"] and doc.footers == ["Foot"], (doc.headers, doc.footers)
+    out = _md(doc, ctx)
+    assert "Header: Head" in out and "Footer: Foot" in out, out
+
+
+def test_floating_drawables_after_body():
+    doc, ctx = _pages("Body￼", attachment(110, 140), image(140, 7), group(142, [141, 9999]),
+                      shape(141, 150), archive(150, 2001, storage("Box text")), archive(143, 3005, b"\x0f"),
+                      shape(144, 151, field=2), archive(151, 2001, storage("Old box")),
+                      archive(9999, 4242, b""),
+                      datas=[(7, "pic.png")], files={"Data/pic.png": PNG}, attachments=[(4, 110)],
+                      floating=[142, 143, 140, 144])
+    assert doc.blocks == [Para([Text("Body")]), Image(PNG), Para([Text("Box text")]), Para([Text("Old box")])], \
+        doc.blocks
+    assert ctx.skipped == {"image": 1}, ctx.skipped
+
+
+def test_shape_cycle():
+    # a text box whose storage anchors the same text box: entered once, the cycle counted
+    doc, ctx = _pages("Body￼", attachment(110, 141), shape(141, 150), attachment(111, 141),
+                      archive(150, 2001, storage("Inner￼", attachments=[(5, 111)])), attachments=[(4, 110)])
+    assert doc.blocks == [Para([Text("Body")]), Para([Text("Inner")])] and ctx.skipped == {"depth": 1}, \
+        (doc.blocks, ctx.skipped)
 
 
 def main():

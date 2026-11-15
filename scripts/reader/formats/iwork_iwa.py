@@ -9,6 +9,11 @@ its archive's first message, and with should_merge the later messages' bytes are
 protobuf's merge (a single field's later value comes last, a repeated field grows). fields_to_remove is not applied
 and is counted `merge`; a repeated id keeps the first object, counted `duplicate`. All members fill one map before
 any walk, because references cross members.
+
+The drawables (`drawable_blocks`) follow `IWAReader._drawable_blocks` and `_picture` of `archives.py`; the Pages
+walk follows `docling/backend/iwork/pages_iwa.py` (`read_content`, `floating_blocks`, `page_furniture`), with the
+floating drawables kept in their container's order rather than sorted by id, and every drawable and storage
+entered through `Store.follow`, so one reached twice is read once.
 """
 import posixpath
 from collections.abc import Callable, Iterable
@@ -16,12 +21,17 @@ from collections.abc import Callable, Iterable
 from .. import limits
 from ..containers import flate, pbwire, snappy
 from ..limits import ReadError
-from ..model import Context, Doc
+from ..model import Context, Doc, Image
+from . import iwork_text
 
 IWA_BYTES = 256 * 2**20     # unpacked bytes of all .iwa members of one document (the flate.Budget iwork builds)
 IWA_OBJECTS = 1_000_000     # objects one document's store may hold; the rest are unread, counted `record`
 PACKAGE_METADATA = 11006    # TSP.PackageMetadata in Metadata.iwa: field 4 lists the TSP.DataInfo entries
 APPS = ("pages", "numbers", "key")
+SHAPE, EQUATION, IMAGE, GROUP = 2011, 2015, 3005, 3008   # TSWP.ShapeInfo, TSWP.EquationInfo, TSD.Image, TSD.Group
+IMAGE_DATA = (15, 13, 11, 12)  # TSD.ImageArchive renditions: adjusted, original, placed, thumbnail (docling)
+FLOATING_DEPTH = 4          # embedded messages searched for references in the floating-drawable container (docling)
+PAGES_DOCUMENT, PAGES_SECTION, PAGES_TEMPLATE = 10000, 10011, 10143
 
 # app -> walk(store, ctx), returning None when the app's root object is not in the store (Tasks 12-14 fill it)
 WALKS: dict[str, Callable[["Store", Context], Doc | None]] = {}
@@ -51,6 +61,16 @@ class Store:
 
     def _count(self, kind: str):
         self.ctx.skipped[kind] += 1
+
+    @property
+    def depth(self) -> int:
+        """Objects on the walk's current path: the depth a nested `follow` passes on."""
+        return len(self._path)
+
+    def has_data(self, data_id: int) -> bool:
+        """Whether a data id names a member that is in the package (nothing is read or counted)."""
+        name = self.datas.get(data_id)
+        return bool(name) and self.pkg.has(self.prefix + "Data/" + name)
 
     def get(self, id: int, type: int | tuple | None = None) -> dict | None:
         """The object's fields (`pbwire.fields`), or None when the id is missing or its type is not `type` (one
@@ -216,6 +236,127 @@ def load(members: Iterable[tuple[str, bytes]], ctx, budget: flate.Budget, pkg, p
             ctx.skipped["record"] += 1
             break
     return store
+
+
+def _image(store: Store, id: int) -> list | None:
+    """A TSD.ImageArchive's picture: the first of its renditions 15, 13, 11, 12 (adjusted, original, placed,
+    thumbnail; docling's order) whose data is in the package. With none there, the picture is counted `image` once."""
+    f = store.get(id, IMAGE)
+    ids = [d for d in (iwork_text.ref(f, n) for n in IMAGE_DATA) if d is not None]
+    found = next((d for d in ids if store.has_data(d)), ids[0] if ids else None)
+    if found is None:
+        store._count("image")
+        return None
+    data = store.data(found)  # None is counted there
+    if data is None:
+        return None
+    if not data:
+        store._count("image")
+        return None
+    return [Image(data)]
+
+
+def drawable_blocks(store: Store, id: int, ctx, text, app: str) -> list:
+    """The blocks of drawable `id`, entered through `Store.follow`: an image (3005) through `Store.data`, a shape or
+    text box (2011) its storage (4 owned_storage, else 2) through `text` (an `iwork_text.TextReader`), a group (3008)
+    its children (2) in order. An equation (2015) counts `object`. Other kinds are skipped uncounted (decision 10);
+    `app` is for the kinds Numbers and Keynote add. Each drawable is read under `ctx.guard` of what it loses."""
+    def visit(i, depth):
+        kind = store.objects.get(i, (None,))[0]
+        out = None
+        if kind == IMAGE:
+            with ctx.guard("image"):
+                out = _image(store, i)
+        elif kind == SHAPE:
+            with ctx.guard("shape"):
+                f = store.get(i, SHAPE)
+                sid = iwork_text.ref(f, 4)
+                if sid is None:
+                    sid = iwork_text.ref(f, 2)
+                out = text.blocks(sid) if sid is not None else None
+        elif kind == GROUP:
+            with ctx.guard("shape"):
+                children = iwork_text.refs(store.get(i, GROUP), 2)
+                out = [b for got in store.follow(children, visit, store.depth) for b in got]
+        elif kind == EQUATION:
+            store._count("object")
+        return out
+
+    return [b for got in store.follow([id], visit, store.depth) for b in got]
+
+
+def _ordered_refs(f: dict, depth: int = 0, out: list | None = None) -> list[int]:
+    """Every TSP.Reference inside a message, in wire order, embedded messages searched FLOATING_DEPTH deep (docling's
+    `iwa_referenced_ids`, without its sort). A part that is not a message is passed over."""
+    out = [] if out is None else out
+    for values in f.values():
+        for v in values:
+            if not isinstance(v, memoryview):
+                continue
+            try:
+                sub = pbwire.fields(v)
+            except ValueError:
+                continue
+            if set(sub) == {1} and len(sub[1]) == 1 and isinstance(sub[1][0], int):
+                out.append(sub[1][0])
+            elif depth < FLOATING_DEPTH:
+                _ordered_refs(sub, depth + 1, out)
+    return out
+
+
+def _furniture(store: Store, body_fields: dict, text, doc: Doc, ctx):
+    """Doc.headers and Doc.footers: the body storage's section table (17) -> TP.SectionArchive (10011; docling's
+    PageMasterArchive) 23, 24, 25 (first, even, odd) -> TP.HeadersAndFootersArchive (10143) {1 headers, 2 footers},
+    each a list of storages, one line a paragraph. A section that cannot be read counts `header`."""
+    sections = []
+    with ctx.guard("header"):
+        sections = [r for _, r in iwork_text.run_table(body_fields, 17) if r is not None]
+    seen: set[int] = set()
+    for sid in sections:
+        if sid in seen:
+            continue
+        seen.add(sid)
+        with ctx.guard("header"):
+            section = store.get(sid, PAGES_SECTION)
+            if section is None:
+                continue
+            for n in (23, 24, 25):
+                tid = iwork_text.ref(section, n)
+                template = store.get(tid, PAGES_TEMPLATE) if tid is not None and tid not in seen else None
+                if template is None:
+                    continue
+                seen.add(tid)
+                for field, lines in ((1, doc.headers), (2, doc.footers)):
+                    for storage in iwork_text.refs(template, field):
+                        lines.extend(iwork_text.plain(text.blocks(storage)))
+
+
+def _pages(store: Store, ctx) -> Doc | None:
+    """TP.DocumentArchive (10000, the lowest id when there are several): field 4 the body storage, then field 20's
+    floating drawables in their container's order, then the headers and footers. None without the root."""
+    root = min((i for i, (t, _) in store.objects.items() if t == PAGES_DOCUMENT), default=None)
+    if root is None:
+        return None
+    f = store.get(root, PAGES_DOCUMENT)
+    doc = Doc()
+    text = iwork_text.TextReader(store, ctx, doc.notes, lambda d: drawable_blocks(store, d, ctx, text, "pages"))
+    body = iwork_text.ref(f, 4)
+    if body is not None:
+        doc.blocks = text.blocks(body)
+    container = iwork_text.ref(f, 20)
+    if container is not None:
+        drawables = []
+        with ctx.guard("shape"):
+            drawables = _ordered_refs(store.get(container) or {})
+        for d in drawables:
+            doc.blocks.extend(drawable_blocks(store, d, ctx, text, "pages"))
+    body_fields = store.get(body, iwork_text.STORAGE) if body is not None else None
+    if body_fields:
+        _furniture(store, body_fields, text, doc, ctx)
+    return doc
+
+
+WALKS["pages"] = _pages
 
 
 def walk(store: Store, app: str, ctx) -> Doc | None:
