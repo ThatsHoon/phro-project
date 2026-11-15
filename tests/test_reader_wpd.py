@@ -999,11 +999,70 @@ def test_wp42_text_and_footnote():
     assert not wpd.is_wp42(b"\xc0\x00\x00\x00\x00\xc0 and \xff")
     assert not wpd.is_wp42("café ok".encode("utf-8"))
     assert wpd.is_wp42(b"\xc0\x00\x00\x00\x00\xc0" + b"x" * wpd.WP42_PROBE + b"\xd1 open")  # past the probe
-    long = b"x" * (wpd.WP42_PROBE - 3) + b"\xd1\x00\x00\x00"  # a group cut by the probe, the file going on
+    long = b"\xc0\x00\x00\x00\x00\xc0" + b"x" * (wpd.WP42_PROBE - 9) + b"\xd1\x00\x00\x00"  # a group cut by the probe
     assert wpd.is_wp42(long + b"\xd1rest")
     # a footnote without its 0xFF delimiter counts note; a variable group cut by the end ends the walk
     doc, ctx = _read(b"\xc0\x00\x00\x00\x00\xc0A\xe2\x00\x00\x01\x00\x01\x00\xe2B")
     assert _plain(doc) == ["AB"] and ctx.skipped["note"] == 1, ctx.skipped
+
+
+def test_wp42_check_refuses_cp1252_text():
+    # plain cp1252 text whose only high bytes are paired "variable" codes (two é, two ü) is not 4.2: a fixed-size
+    # group must close by its size somewhere in the probe
+    note = ("The team meeting moved to Friday afternoon. Members who meet at the café will host the follow-up "
+            "meeting, and the café owner agreed. Bring your notes, and the agenda for review.")
+    for text in (note, "Grüße an alle, wir sehen uns über das Wochenende.", "x" * (wpd.WP42_PROBE - 3) + "é é"):
+        data = text.encode("cp1252")
+        assert not wpd.is_wp42(data), text[:40]
+        assert _refused(data, "unsupported")  # to the LibreOffice switch, as before phase 3: never part of its text
+    # a group cut by the probe's end passes only with a fixed group before it
+    assert not wpd.is_wp42(b"x" * (wpd.WP42_PROBE - 3) + b"\xd1\x00\x00\x00\xd1rest")
+
+
+def test_wp42_skipped_text_group_counted():
+    # a variable group the walk skips that holds words is counted `record`, so a misread is never silent; one
+    # without words (formatting) is not
+    fixed = b"\xc0\x00\x00\x00\x00\xc0"
+    doc, ctx = _read(fixed + b"Before \xdfthe words inside a group\xdf after")
+    assert _plain(doc) == ["Before  after"] and ctx.skipped["record"] == 1 and set(ctx.skipped) == {"record"}, \
+        (_plain(doc), ctx.skipped)
+    doc, ctx = _read(fixed + b"Before \xdf\x01\x02\x03\x00\xdf after")
+    assert _plain(doc) == ["Before  after"] and not ctx.skipped, ctx.skipped
+
+
+def test_kill_tree_taskkill_by_absolute_path():
+    import os
+    seen = []
+
+    class _R:
+        returncode = 0
+
+    class _Proc:
+        pid = 4242
+
+        def kill(self):
+            pass
+
+    def fake_run(cmd, **k):
+        seen.append((cmd, k))
+        return _R()
+
+    if os.name != "nt":
+        return  # taskkill is Windows only
+    real_run = wpd.subprocess.run
+    try:
+        wpd.subprocess.run = fake_run
+        for root in ("D:\\Win", None, ""):
+            with _Env(SystemRoot=root):
+                seen.clear()
+                wpd._kill_tree(_Proc())
+                (cmd, k), = seen
+                want = os.path.join(root or "C:\\Windows", "System32", "taskkill.exe")
+                assert cmd[0] == want and os.path.isabs(cmd[0]), cmd
+                assert cmd[1:] == ["/F", "/T", "/PID", "4242"], cmd
+                assert k["timeout"] <= 1, k  # within the 2-second deadline margin, with the 1-second reap wait
+    finally:
+        wpd.subprocess.run = real_run
 
 
 def test_wp42_password():

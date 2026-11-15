@@ -152,11 +152,11 @@ the document pointer to the end of the file:
 
 WordPerfect 4.2 (`is_wp42`, `_walk42`). No head. The check scans the first `WP42_PROBE` bytes: every byte 0xC0-0xFE
 is a group, closed by the byte its size (`_SIZE42`) puts at its end or, for a size of -1, by the next copy of itself;
-at least one group, and no 0xFF outside one. The walk takes 0x20-0x7E as text, 0x09, 0x0B and 0x0D as a space, 0x0A
+at least one fixed-size group (variable groups alone pair up in cp1252 text: two é), and no 0xFF outside one. The walk takes 0x20-0x7E as text, 0x09, 0x0B and 0x0D as a space, 0x0A
 and 0x0C as a paragraph end, 0x9D/0x9C as bold on and off; E1 [char] is a code page 437 character; E2 is a footnote
 or endnote: [def][a][b][c][d] and line and page counts up to 0xFF, the two margins, then the note's text up to the
 closing E2 (no 0xFF: counted `note`); D1 (a header or footer) is counted `header`; any other group is skipped by its
-size or closing byte. A fixed group with a wrong closing byte resyncs as for WP6+; a group cut by the end ends the
+size or closing byte, a variable group holding two words counted `record`. A fixed group with a wrong closing byte resyncs as for WP6+; a group cut by the end ends the
 walk, counted `record`.
 
 LibreOffice switch (`_switch`). Mac WordPerfect and a headerless file the 4.2 check refuses are read through
@@ -165,11 +165,12 @@ current folder, `_on_path`); else they are `unsupported`, the detail naming the 
 --headless --norestore -env:UserInstallation=<tmp>/profile --convert-to docx --outdir <tmp> <absolute file>` in a
 process group of its own, with CONVERT_SECONDS - elapsed - 3 seconds from the reader's start and no later than 2
 seconds before the gate's `PHRO_READER_DEADLINE`; past them the tree is killed (`_kill_tree`) and the read is a
-`timeout`. The docx it writes is read by `ooxml.parse`; none is `damaged`. The temporary folder is removed whatever
+`timeout` (taskkill by its absolute path under SystemRoot). The docx it writes is read by `ooxml.parse`; none is `damaged`. The temporary folder is removed whatever
 happens, a child still running killed first.
 """
 import math
 import os
+import re
 import shutil
 import signal
 import struct
@@ -193,6 +194,7 @@ MAX_TITLE = 500          # characters of the wpd title
 WPD_SUBDOCS = 10_000     # sub-documents (notes, comments, headers, footers, watermarks, text boxes) read a document
 WP42_PROBE = 65_536      # bytes the 4.2 check scans
 WP5_BLOCKS = 1_024       # WP5 0xFFFB index blocks read
+TASKKILL_SECONDS = 1     # the tree kill's wait; with `_reap`'s 1-second wait it stays in the 2-second deadline margin
 
 _MAGIC = b"\xffWPC"
 _HEAD = 16
@@ -253,6 +255,7 @@ _SIZE42 = (6, 4, 3, 5, 5, 6, 4, 6, 8, 42, 3, 6, 4, 3, 4, 3,
            4, 3, -1, 150, 6, 23, 11, 3, 3, -1, -1, -1, 4, -1, 44, 18,
            6, 106, -1, 100, 4, -1, 5, -1, -1, -1, -1, -1, -1, -1, -1)
 _PASSWORD42 = b"\xfe\xff\x61\x61"
+_WORDS42 = re.compile(rb"[\x21-\x7e]{2} [\x21-\x7e]{2}")  # two words in a skipped 4.2 group: text, not formatting
 _DONE = object()         # a packet whose blocks were emitted already
 
 
@@ -1299,15 +1302,16 @@ def _wp5(data, h, ctx, path):
 # ---- WordPerfect 4.2
 
 def is_wp42(data: bytes) -> bool:
-    """The 4.2 check over data[:WP42_PROBE]: a 4.2 password head, or at least one function group, every byte
-    0xC0-0xFE closing by its size (`_SIZE42`) or by its closing byte, and no stray 0xFF. A group the probe's end
-    cuts passes when the file goes on past the probe."""
+    """The 4.2 check over data[:WP42_PROBE]: a 4.2 password head, or every byte 0xC0-0xFE closing by its size
+    (`_SIZE42`) or by its closing byte, no stray 0xFF, and at least one fixed-size group closing by its size. A group
+    the probe's end cuts passes when the file goes on past the probe and a fixed-size group came before it. Variable
+    groups alone are not enough: plain cp1252 text with two é (0xE9) or two ü (0xFC) pairs up as variable groups."""
     if data[:4] == _PASSWORD42:
         return True
     probe = data[:WP42_PROBE]
     n = len(probe)
     more = len(data) > n
-    groups = 0
+    fixed = 0
     pos = 0
     while pos < n:
         b = probe[pos]
@@ -1320,21 +1324,22 @@ def is_wp42(data: bytes) -> bool:
         if size < 0:
             close = probe.find(bytes((b,)), pos + 1)
             if close < 0:
-                return more  # open at the probe's end: it passes only when the file goes on
+                return more and fixed > 0  # open at the probe's end: it passes only when the file goes on
             pos = close + 1
         else:
             if pos + size > n:
-                return more
+                return more and fixed > 0
             if probe[pos + size - 1] != b:
                 return False
             pos += size
-        groups += 1
-    return groups > 0
+            fixed += 1
+    return fixed > 0
 
 
 def _walk42(data, start, end, story, st, depth=0):
     """Walk the 4.2 codes of data[start:end] into `story`: text, tab, hard and soft new lines, bold, extended
-    characters and footnotes; any other group is skipped by its size or its closing byte."""
+    characters and footnotes; any other group is skipped by its size or its closing byte, a variable one holding words
+    (`_WORDS42`) counted `record`, so text the 4.2 check took for a group is never lost silently."""
     skipped = st.ctx.skipped
     cls = data[start:end].translate(_CLASS5)
     pos = start
@@ -1387,6 +1392,8 @@ def _walk42(data, start, end, story, st, depth=0):
             _note42(data, pos, pos + size - 1, story, st, depth)
         elif b == 0xD1:
             skipped["header"] += 1  # headers and footers are not read in 4.2
+        elif _SIZE42[b - 0xC0] < 0 and _WORDS42.search(data, pos + 1, pos + size - 1):
+            skipped["record"] += 1
         pos += size
 
 
@@ -1462,13 +1469,19 @@ def soffice() -> str | None:
     return next((p for p in places if os.path.isfile(p)), None)
 
 
+def _taskkill() -> str:
+    """taskkill.exe by its absolute path under %SystemRoot%\\System32 (C:\\Windows when SystemRoot is unset or
+    empty): CreateProcess looks for a bare name in the current folder too, where a planted taskkill.exe could sit."""
+    return os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "taskkill.exe")
+
+
 def _kill_tree(proc):
     """Kill the child and every process it started. When taskkill or killpg fails, the child itself is killed
     (`proc.kill`); an error from that is raised."""
     try:
         if os.name == "nt":
-            r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            r = subprocess.run([_taskkill(), "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=TASKKILL_SECONDS)
             done = r.returncode == 0
         else:
             os.killpg(proc.pid, signal.SIGKILL)
