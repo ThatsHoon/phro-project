@@ -422,6 +422,8 @@ def _pages(store: Store, ctx) -> Doc | None:
                                  headings=True)
     body = iwork_text.ref(f, 4)
     body_fields = None
+    if body is not None and store.objects.get(body, (None,))[0] != iwork_text.STORAGE:
+        body = None  # an id naming no object, or an object that is not a storage, is no body either
     if body is None:  # no body storage named: lost, not blank (counted once, as a body that fails)
         ctx.skipped["document"] += 1
         store.failed += 1

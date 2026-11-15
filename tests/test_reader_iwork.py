@@ -850,6 +850,19 @@ def test_blank_pages_document():
     assert doc.blocks == [] and not ctx.skipped, (doc.blocks, ctx.skipped)
 
 
+def test_pages_body_missing_or_wrong_type():
+    # a body id that names no object, or an object that is not a storage, is a lost body: counted `document` once,
+    # with the preview standing in when there is one and `damaged` when there is none
+    for extra in ([], [archive(BODY, 2002, pb((1, "x")))]):
+        members = {"Index/Document.iwa": iwa_member(*pages_doc(BODY)[:1], *extra), "preview.jpg": JPG}
+        ctx = Context()
+        doc = iwork.parse_bytes(iwork_zip(members), ctx, "pages")
+        assert [b.data for b in doc.blocks] == [JPG] and ctx.skipped == {"document": 1}, (extra, ctx.skipped)
+        del members["preview.jpg"]
+        e = _raises(ReadError, iwork.parse_bytes, iwork_zip(members), Context(), "pages")
+        assert e.kind == "damaged", (extra, e.kind)
+
+
 def test_header_notes_counted():
     # a footnote and a comment in a header count `note` and add no note: their marks are never shown
     doc, ctx = _pages("Body", archive(130, 2001, storage("Head￼", footnotes=[(4, 90)])), footnote(90, 91),
