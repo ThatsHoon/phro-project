@@ -174,6 +174,39 @@ def test_hidden_comment():
     assert "> Field Name: Kim" in text
 
 
+def _hidden_form_pdf():
+    """Fields whose one widget has /F 2 (Hidden) or 32 (NoView), a field with a hidden and a shown
+    widget, a shown field, and a comment with /F 32."""
+    fields = acroform([
+        widget((72, 600, 200, 620), Ref(4), T="Hid", FT=Name("Tx"), V="hidden value", F=2),
+        widget((72, 570, 200, 590), Ref(4), T="NoView", FT=Name("Tx"), V="noview value", F=32),
+        {"T": "Two", "FT": Name("Tx"), "V": "two value",
+         "Kids": [widget((72, 540, 200, 560), Ref(4), F=2), widget((72, 510, 200, 530), Ref(4))]},
+        widget((72, 480, 200, 500), Ref(4), T="Seen", FT=Name("Tx"), V="seen value"),
+    ])
+    objects = dict(fields)
+    objects[100] = text_annot((10, 10, 20, 20), "noview note", author="Ann", flags=32)
+    annots = [Ref(100)] + [Ref(n) for n, obj in sorted(fields.items()) if "Rect" in obj]
+    return simple_pdf([text_ops("Body text")], catalog={"AcroForm": Ref(200)}, extra_objects=objects,
+                      page_extra={"Annots": annots})
+
+
+HIDDEN_FORM_LINES = ("> (hidden) Field Hid: hidden value", "> (hidden) Field NoView: noview value",
+                     "> (hidden) Comment by Ann: noview note")
+
+
+def test_hidden_fields():
+    # a field all of whose widgets are Hidden or NoView, and a NoView comment, are hidden places
+    data = _hidden_form_pdf()
+    text, _, _ = md(data)
+    assert text.splitlines()[0] == "(3 hidden places left out)", text
+    assert "> Field Two: two value" in text and "> Field Seen: seen value" in text, text
+    assert not any(w in text for w in ("hidden value", "noview value", "noview note")), text
+    text, _, _ = md(data, hidden=True)
+    for line in HIDDEN_FORM_LINES:
+        assert line in text.splitlines(), (line, text)
+
+
 def test_links_inline():
     data = simple_pdf([text_ops("here")], extra_objects={100: link_annot((70, 715, 100, 735), "https://ex.org")},
                       page_extra={"Annots": [Ref(100)]})

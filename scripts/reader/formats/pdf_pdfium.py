@@ -47,7 +47,8 @@ last page and the document; pdf.py calls it in a finally.
 - Links are `FPDFLink_*` URI actions of `annotations.SCHEMES`; comments come from the page's
   annotations, through `annotations.order_comments`. Fields are native's (`/AcroForm /Fields`, by
   page, a field with no widget on page 1); only when native could not open the file are they read
-  from the page's widgets, through `annotations.field_entry`.
+  from the page's widgets, through `annotations.field_entry`, a field then hidden when each of its
+  widgets on the page is Hidden or NoView (as a comment with either flag is).
 - On a page whose resources name an off optional-content group (decision 3), pdfium cannot tell
   which marked text the group covers: that page's fragments come from the native interpreter.
   So do they on a page with vertical text (a column pdfium saw, or a page font whose Encoding is a
@@ -99,6 +100,7 @@ _ROUNDING = 1e-3  # pdfium's float32 widths against its boxes; also the ink test
 _LETTER = (0.0, 0.0, 612.0, 792.0)
 _IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 _HYPHENS = (0x02, 0xFFFE)
+_UNSEEN = raw.FPDF_ANNOT_FLAG_HIDDEN | raw.FPDF_ANNOT_FLAG_NOVIEW  # annotations.UNSEEN
 _DCT = ("DCTDecode", "DCT")
 _SIMPLE = ("ASCIIHexDecode", "AHx", "ASCII85Decode", "A85", "RunLengthDecode", "RL",
            "FlateDecode", "Fl", "LZWDecode", "LZW")
@@ -889,7 +891,7 @@ class PdfiumDoc:
         # the widget walk reads fields only when native could not open the file
         native = self.native
         form = self._pdf.formenv.raw if self._pdf.formenv and native is None else None
-        items, done = [], set()
+        items, done, shown, walked = [], set(), set(), []
         fields = list(native.fields.get(index, [])) if native is not None else []
         for k in range(max(0, total)):
             annot = raw.FPDFPage_GetAnnot(handle, k)
@@ -902,9 +904,10 @@ class PdfiumDoc:
                     if item is not None:
                         items.append(item)
                 elif subtype == raw.FPDF_ANNOT_WIDGET and form:
-                    self._field(form, annot, index, fields, done, cut)
+                    self._field(form, annot, index, walked, done, shown, cut)
             finally:
                 raw.FPDFPage_CloseAnnot(annot)
+        fields += [(label, text, name not in shown) for label, text, name in walked]
         return links, annotations.order_comments(items), fields
 
     def _links(self, handle):
@@ -943,7 +946,7 @@ class PdfiumDoc:
         if not text:
             return None
         author = _wide(raw.FPDFAnnot_GetStringValue, annot, b"T")[:1_000].strip()
-        hidden = bool(raw.FPDFAnnot_GetFlags(annot) & raw.FPDF_ANNOT_FLAG_HIDDEN)
+        hidden = bool(raw.FPDFAnnot_GetFlags(annot) & _UNSEEN)
         irt = None
         parent = raw.FPDFAnnot_GetLinkedAnnot(annot, b"IRT")
         if parent:
@@ -954,11 +957,15 @@ class PdfiumDoc:
                 raw.FPDFPage_CloseAnnot(parent)
         return k, irt, Comment(author, text, hidden)
 
-    def _field(self, form, annot, index, fields, done, cut):
+    def _field(self, form, annot, index, fields, done, shown, cut):
+        """Append (label, value, full name) of the widget's field, once per field; `shown` gets
+        the names of the fields with a widget that is neither Hidden nor NoView."""
         kind = _FIELD_KINDS.get(raw.FPDFAnnot_GetFormFieldType(form, annot))
         if kind is None:
             return
         name = _wide(raw.FPDFAnnot_GetFormFieldName, form, annot)
+        if not raw.FPDFAnnot_GetFlags(annot) & _UNSEEN:
+            shown.add(name)
         if name in done or self._field_page.get(name, index) != index:
             return  # another widget of a field already read
         if kind in ("check", "radio"):
@@ -983,7 +990,7 @@ class PdfiumDoc:
         label, text, was_cut = entry
         if was_cut:
             cut["field"] += 1
-        fields.append((label, text))
+        fields.append((label, text, name))
 
 
 def _rgb_rows_rev(data, width, height, stride, channels):

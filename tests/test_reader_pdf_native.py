@@ -116,7 +116,7 @@ def test_native_fields_comments():
                      page_extra={"Annots": [Ref(100)]})
     doc = dm.NativeDoc(pdf)
     page = doc.page(0)
-    assert page.fields[0] == ("Name", "Kim") and len(page.fields[1][1]) == 2_000
+    assert page.fields[0] == ("Name", "Kim", False) and len(page.fields[1][1]) == 2_000
     assert [(c.author, c.text) for c in page.comments] == [("Lee", "note")]
     assert page.links == [] and doc.cut["field"] == 1
     assert doc.fields == {0: page.fields} and doc.xfa is False and doc.attachments is False

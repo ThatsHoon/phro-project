@@ -7,7 +7,8 @@ URL, not paragraphs; comments are `Comment` records with replies placed after th
 alone, and go through `field_entry`; the outline is a flat list of (depth, title, page) and a
 named destination is resolved through the catalog's /Dests and the /Names /Dests tree. Every
 cap that drops content is counted: `annotation` and `field` on the Counter a function returns or
-is given, `outline` on `pdf.cuts`.
+is given, `outline` on `pdf.cuts`. A comment whose /F has bit 2 (Hidden) or bit 6 (NoView) is
+hidden, and so is a field all of whose widgets have one of them.
 
 `field_entry` and `order_comments` take no PDFFile: the pdfium front end calls them too.
 """
@@ -35,6 +36,8 @@ _MARKUP = {"Text", "FreeText", "Highlight", "Underline", "Squiggly", "StrikeOut"
            "Stamp", "Ink", "Square", "Circle", "Line", "Polygon", "PolyLine", "FileAttachment",
            "Sound", "Redact"}
 _HIDDEN = 2                 # /F bit 2
+_NOVIEW = 32                # /F bit 6
+UNSEEN = _HIDDEN | _NOVIEW  # an annotation with either bit is not shown by a viewer
 _FF_RADIO = 1 << 15         # /Ff bit 16
 _FF_PUSH = 1 << 16          # /Ff bit 17
 
@@ -139,11 +142,15 @@ def page_annots(pdf: PDFFile, page: dict) -> Tuple[List[tuple], List[Comment], C
                 continue
             author = text_string(pdf.resolve(annot.get("T")), 1_000)[:1_000].strip()
             flags = pdf.resolve(annot.get("F"))
-            hidden = isinstance(flags, int) and not isinstance(flags, bool) and bool(flags & _HIDDEN)
+            hidden = _unseen(flags)
             irt = annot.get("IRT")
             items.append((key, irt.num if isinstance(irt, PDFRef) else None,
                           Comment(author, text, hidden)))
     return links, order_comments(items), cut
+
+
+def _unseen(flags) -> bool:
+    return isinstance(flags, int) and not isinstance(flags, bool) and bool(flags & UNSEEN)
 
 
 def order_comments(items: List[tuple]) -> List[Comment]:
@@ -254,8 +261,10 @@ def _field_kind(ft: str, flags: int) -> Optional[str]:
     return None
 
 
-def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str]]]:
-    """{0-based page: [(label, value)]} of the filled fields in /AcroForm /Fields."""
+def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str, bool]]]:
+    """{0-based page: [(label, value, hidden)]} of the filled fields in /AcroForm /Fields. A field
+    is hidden when each of its widgets (its kids without /T, else the field itself) has /F bit 2
+    or 6."""
     form = pdf.resolve(pdf.catalog.get("AcroForm"))
     roots = pdf.resolve(form.get("Fields")) if isinstance(form, dict) else None
     if not isinstance(roots, list):
@@ -292,7 +301,7 @@ def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str]]]:
                 return index
         return None
 
-    out: Dict[int, List[Tuple[str, str]]] = {}
+    out: Dict[int, List[Tuple[str, str, bool]]] = {}
     if len(roots) > FIELD_KIDS:
         cut["field"] += 1
         roots = roots[:FIELD_KIDS]
@@ -356,8 +365,9 @@ def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str]]]:
         if was_cut:
             cut["field"] += 1
         page = page_of([(ref, node)] + widgets)
+        hidden = all(_unseen(pdf.resolve(widget.get("F"))) for _ref, widget in widgets or [(ref, node)])
         # A filled field on no page is still document data: it goes to the first page.
-        out.setdefault(page or 0, []).append((label, value))
+        out.setdefault(page or 0, []).append((label, value, hidden))
     return out
 
 

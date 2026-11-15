@@ -265,7 +265,8 @@ class _Reader:
         turn = pdf_layout.upright_turn(pd.fragments, _turn(pd.rotate))
         view = _view_page(turn, pd.box)
         keep = _Kept(pd.number, view)
-        keep.comments = ([Para([Text(f"Field {_one_line(label)}: {value}")]) for label, value in pd.fields]
+        keep.comments = ([Para([Text(f"Field {_one_line(label)}: {value}")], hidden="hidden" if hidden else "")
+                          for label, value, hidden in pd.fields]
                          + [Para([Text(f"Comment by {_one_line(c.author)}: {_one_line(c.text)}" if c.author
                                        else f"Comment: {_one_line(c.text)}")],
                                  hidden="hidden" if c.hidden else "") for c in pd.comments])

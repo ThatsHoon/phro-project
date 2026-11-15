@@ -156,13 +156,13 @@ def test_order_comments_pure():
 def test_field_tu_label():
     pf = with_form([{"T": "topmostSubform[0]", "Kids": [
         {"T": "Page1[0]", "Kids": [tx("Kim", "f1_01[0]", TU="Name")]}]}])
-    assert an.fields(pf, Counter()) == {0: [("Name", "Kim")]}
+    assert an.fields(pf, Counter()) == {0: [("Name", "Kim", False)]}
 
 
 def test_field_partial_name():
     pf = with_form([{"T": "topmostSubform[0]", "Kids": [
         {"T": "Page1[0]", "Kids": [tx("Kim", "f1_01[0]")]}]}])
-    assert an.fields(pf, Counter()) == {0: [("f1_01[0]", "Kim")]}
+    assert an.fields(pf, Counter()) == {0: [("f1_01[0]", "Kim", False)]}
 
 
 def test_checkbox_radio():
@@ -171,7 +171,7 @@ def test_checkbox_radio():
     radio = {"T": "Pick", "FT": Name("Btn"), "Ff": 1 << 15, "V": Name("Two"),
              "Kids": [widget(RECT, PAGE), widget(RECT, PAGE)]}
     pf = with_form([box, off, radio])
-    assert an.fields(pf, Counter()) == {0: [("Agree", "Yes"), ("Pick", "Two")]}
+    assert an.fields(pf, Counter()) == {0: [("Agree", "Yes", False), ("Pick", "Two", False)]}
 
 
 def test_empty_sig_button():
@@ -185,7 +185,7 @@ def test_field_newlines_and_cut():
     cut = Counter()
     pf = with_form([tx("a\nb", "n"), tx("c\r\nd", "m"), tx("x" * 2_500, "long")])
     got = an.fields(pf, cut)[0]
-    assert got[0] == ("n", "a / b") and got[1] == ("m", "c / d")
+    assert got[0] == ("n", "a / b", False) and got[1] == ("m", "c / d", False)
     assert len(got[2][1]) == 2_000 and cut["field"] == 1
 
 
@@ -211,7 +211,7 @@ def test_field_tree_cycle():
                203: widget(RECT, PAGE, T="v", FT=Name("Tx"), V="one", Parent=Ref(201))}
     pf = PDFFile(simple_pdf([b""], catalog={"AcroForm": Ref(200)}, extra_objects=objects))
     got = an.fields(pf, Counter())
-    assert got == {0: [("v", "one")]} and time.time() - start < 1
+    assert got == {0: [("v", "one", False)]} and time.time() - start < 1
 
 
 def test_field_depth_cap():
@@ -229,7 +229,7 @@ def test_field_page_scan():
     objects = acroform([w])
     pf = PDFFile(simple_pdf([b"", b""], catalog={"AcroForm": Ref(200)}, extra_objects=objects,
                             page_extra=[{}, {"Annots": [Ref(201)]}]))
-    assert an.fields(pf, Counter()) == {1: [("t", "v")]}
+    assert an.fields(pf, Counter()) == {1: [("t", "v", False)]}
 
 
 def test_field_on_no_page():
@@ -237,13 +237,13 @@ def test_field_on_no_page():
     w = widget(RECT, None, T="t", FT=Name("Tx"), V="v")
     cut = Counter()
     pf = PDFFile(simple_pdf([b"", b""], catalog={"AcroForm": Ref(200)}, extra_objects=acroform([w])))
-    assert an.fields(pf, cut) == {0: [("t", "v")]} and not cut
+    assert an.fields(pf, cut) == {0: [("t", "v", False)]} and not cut
 
 
 def test_field_choice_list():
     ch = widget(RECT, PAGE, T="c", FT=Name("Ch"), V=["x", "y"])
     pf = with_form([ch])
-    assert an.fields(pf, Counter()) == {0: [("c", "x, y")]}
+    assert an.fields(pf, Counter()) == {0: [("c", "x, y", False)]}
 
 
 def test_xfa_attachment():
@@ -462,7 +462,7 @@ def test_field_kids_shared_array():
                202: widget(RECT, PAGE)}
     pf = PDFFile(simple_pdf([b""], catalog={"AcroForm": Ref(200)}, extra_objects=objects))
     cut = Counter()
-    assert an.fields(pf, cut) == {0: [("r", "A")]} and cut["field"] == 1 and an.FIELD_KIDS == 10_000
+    assert an.fields(pf, cut) == {0: [("r", "A", False)]} and cut["field"] == 1 and an.FIELD_KIDS == 10_000
 
 
 def test_page_index_shared_kids():

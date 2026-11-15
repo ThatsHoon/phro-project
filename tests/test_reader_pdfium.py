@@ -561,6 +561,38 @@ def test_pdfium_own_password():
     assert got.get("error") == ["encrypted", "user password"], got
 
 
+def _hidden_form_pdf():
+    """Fields whose one widget has /F 2 (Hidden) or 32 (NoView), a field with a hidden and a shown
+    widget, a shown field, and a comment with /F 32."""
+    fields = acroform([
+        widget((72, 600, 200, 620), Ref(4), T="Hid", FT=Name("Tx"), V="hidden value", F=2),
+        widget((72, 570, 200, 590), Ref(4), T="NoView", FT=Name("Tx"), V="noview value", F=32),
+        {"T": "Two", "FT": Name("Tx"), "V": "two value",
+         "Kids": [widget((72, 540, 200, 560), Ref(4), F=2), widget((72, 510, 200, 530), Ref(4))]},
+        widget((72, 480, 200, 500), Ref(4), T="Seen", FT=Name("Tx"), V="seen value"),
+    ])
+    objects = dict(fields)
+    objects[100] = text_annot((10, 10, 20, 20), "noview note", author="Ann", flags=32)
+    annots = [Ref(100)] + [Ref(n) for n, obj in sorted(fields.items()) if "Rect" in obj]
+    return simple_pdf([text_ops("Body text")], catalog={"AcroForm": Ref(200)}, extra_objects=objects,
+                      page_extra={"Annots": annots})
+
+
+HIDDEN_FORM_LINES = ("> (hidden) Field Hid: hidden value", "> (hidden) Field NoView: noview value",
+                     "> (hidden) Comment by Ann: noview note")
+
+
+def test_pdfium_hidden_fields():
+    # native's fields and pdfium's own walk of the widgets (native failed) hide the same places
+    data = _hidden_form_pdf()
+    for opts in ({}, {"native_fails": True}):
+        md = run(data, **opts)["md"]
+        assert md.splitlines()[0] == "(3 hidden places left out)", (opts, md)
+        assert "> Field Two: two value" in md and "> Field Seen: seen value" in md, (opts, md)
+        shown = run(data, hidden=True, **opts)["md"].splitlines()
+        assert all(line in shown for line in HIDDEN_FORM_LINES), (opts, shown)
+
+
 def test_pdfium_widget_walk():
     # native failed: fields come from the page's widgets and match native's
     data = _fields_pdf()
