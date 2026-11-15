@@ -28,6 +28,9 @@ last page and the document; pdf.py calls it in a finally.
   fragments are native's instead (below).
   With native None, a text object with an /OC content mark is hidden "ocg" (the group's state is
   native's to know; without native the marked text is taken as off).
+  A char pdfium has no Unicode for (`FPDFText_HasUnicodeMapError`: a font with no ToUnicode and no
+  usable CID ordering, whose char pdfium gives as the raw code) is dropped, never shown; with
+  native None its font counts `glyphs` once per document, by base font name.
 - Page objects are walked iteratively in content order, form XObjects included to FORM_DEPTH
   levels, each object's matrix composed with its forms' (pdfium gives a nested object's matrix
   in its form's space). Path points go through that matrix into `pdf_tables.PathCollector`, with
@@ -48,7 +51,9 @@ last page and the document; pdf.py calls it in a finally.
 - On a page whose resources name an off optional-content group (decision 3), pdfium cannot tell
   which marked text the group covers: that page's fragments come from the native interpreter.
   So do they on a page with vertical text (a column pdfium saw, or a page font whose Encoding is a
-  vertical CMap): native's vertical fragments are the reference.
+  vertical CMap): native's vertical fragments are the reference. And on a page where pdfium
+  dropped a char it has no Unicode for: native reads such a font by reversing its embedded cmap,
+  or drops its text and counts `glyphs`.
 
 Counts, as in `pdfnative.document`: `.cut` is the document total, each `PageData.cut` the part
 its page added (a page is added once). The object walk past `pdf.PDF_PAGE_OBJECTS`, a form past
@@ -267,6 +272,7 @@ class PdfiumDoc:
                                                                raw.FORMTYPE_XFA_FOREGROUND)
             self.attachments = raw.FPDFDoc_GetAttachmentCount(self._pdf.raw) > 0
         self._read: set = set()
+        self._unmapped_seen: set = set()  # base font names counted `glyphs` (native None)
         self._field_page: dict = {}  # full field name -> the page its entry goes on
 
     def close(self):
@@ -334,12 +340,16 @@ class PdfiumDoc:
             turn = 0
         textpage = page.get_textpage()
         try:
-            fragments, vertical = self._chars(textpage, cut)
+            fragments, vertical, lost = self._chars(textpage, cut)
         finally:
             textpage.close()
-        native = self._native_fragments(index, cut, vertical)
+        native = self._native_fragments(index, cut, vertical, bool(lost))
         if native is not None:
             fragments = native
+        else:
+            for name in lost - self._unmapped_seen:
+                self._unmapped_seen.add(name)
+                cut["glyphs"] += 1
         chars = sum(1 for f in fragments for ch in f.text if not ch.isspace())
         collector = PathCollector()
         drawn, whole = self._walk(page, collector, cut)
@@ -371,14 +381,17 @@ class PdfiumDoc:
                         figure=collector.figure, links=links, fields=fields, comments=comments,
                         chars=chars, cut=cut, render=render)
 
-    def _native_fragments(self, index, cut, vertical):
-        """The fragments of the native interpreter, on two kinds of page; None elsewhere.
+    def _native_fragments(self, index, cut, vertical, unmapped):
+        """The fragments of the native interpreter, on three kinds of page; None elsewhere.
         - Decision 3: a page whose resources name an off group (their hidden="ocg" marks the off
           text). Should the native page fail, its text is left out (counted page_part) rather
           than shown with the off layer's text in it.
         - A page with vertical text: pdfium saw a column (`vertical`), or the page's fonts name a
           vertical CMap (`_vertical_fonts`, which also finds a one-glyph column). Native's
-          vertical fragments are the reference; should its page fail, pdfium's own stay."""
+          vertical fragments are the reference; should its page fail, pdfium's own stay.
+        - A page where pdfium dropped chars it has no Unicode for (`unmapped`): native reverses
+          the font's embedded cmap, or drops the text and counts `glyphs`; should its page fail,
+          pdfium's own stay, those chars dropped."""
         native = self.native
         if native is None or index >= native.page_count:
             return None
@@ -387,7 +400,7 @@ class PdfiumDoc:
             off = native.oc.any_off(resources)
         except Exception:  # noqa: BLE001
             return None
-        if not off and not vertical and not _vertical_fonts(native, resources):
+        if not off and not vertical and not unmapped and not _vertical_fonts(native, resources):
             return None
         try:
             got = native.page(index)
@@ -411,14 +424,15 @@ class PdfiumDoc:
     # -- chars
 
     def _chars(self, textpage, cut):
-        """(fragments, whether a vertical column was seen). A text object's direction is its char
+        """(fragments, whether a vertical column was seen, the base font names of the chars
+        dropped for having no Unicode). A text object's direction is its char
         matrix's x axis, unless its second char sits below its first along the glyph's up: a
         vertical font, whose glyphs advance down the up axis; the object then reads with native's
         vertical axes (direction -up, up the x axis), which pdf_layout.vertical_lines takes."""
         tp = textpage.raw
         count = raw.FPDFText_CountChars(tp)
         if count <= 0:
-            return [], False
+            return [], False, set()
         limit = CHAR_SCAN * caps.PDF_PAGE_CHARS
         scan_cut = count > limit  # counted page_part only when the scan, not the char cap, stops
         if scan_cut:
@@ -442,6 +456,7 @@ class PdfiumDoc:
         seen = 0    # non-space chars kept
         bad = False
         capped = False
+        lost = {}  # font address: handle, of the chars pdfium has no Unicode for
 
         def begin(px, py, start, end, base, axis, size):
             return {"addr": addr, "x": px, "y": py, "dx": axis[0], "dy": axis[1], "ux": axis[2],
@@ -464,6 +479,13 @@ class PdfiumDoc:
             if generated:
                 if c in (0x0D, 0x0A):
                     flush()
+                continue
+            if raw.FPDFText_HasUnicodeMapError(tp, at) == 1:
+                # no ToUnicode entry and no CID ordering for the code: pdfium's char is the raw
+                # code (a glyph id read as a code point), never shown as text
+                handle = raw.FPDFText_GetTextObject(tp, at)
+                font = raw.FPDFTextObj_GetFont(handle) if handle else None
+                lost.setdefault(_address(font), font)
                 continue
             if 0xDC00 <= c <= 0xDFFF:
                 continue  # a low surrogate with no high one before it
@@ -614,7 +636,7 @@ class PdfiumDoc:
             cut["bad_coord"] += 1
         if scan_cut and not capped:
             cut["page_part"] += 1
-        return frags, vertical
+        return frags, vertical, {self._font(font) for font in lost.values()}
 
     @staticmethod
     def _fragment(run, order):

@@ -569,6 +569,53 @@ def test_pdfium_widget_walk():
     assert want and [ln for ln in got["md"].splitlines() if ln.startswith("> Field")] == want, (got, want)
 
 
+ARIAL = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "Fonts" / "arial.ttf"
+NO_FONT_CODES = b"04101234 2F000C210D55"  # pdfium shows these CIDs as U+0410 U+1234 U+2F00 ...
+
+
+def _identity_pdf(codes, font_file=None):
+    """An Identity-H Type0 font with no ToUnicode and Ordering (Identity) showing `codes`, then a
+    line in the plain font; `font_file` (TrueType bytes) is embedded with CIDToGIDMap Identity."""
+    objs = font_type0(tounicode=None, ordering="Identity")
+    if font_file is not None:
+        objs[101]["FontDescriptor"] = Ref(102)
+        objs[101]["CIDToGIDMap"] = Name("Identity")
+        objs[102] = {"Type": Name("FontDescriptor"), "FontName": Name("F2"), "Flags": 4, "FontFile2": Ref(104),
+                     "FontBBox": [0, -200, 1000, 800], "Ascent": 800, "Descent": -200, "CapHeight": 700,
+                     "ItalicAngle": 0, "StemV": 80}
+        objs[104] = Stream({}, font_file, flate=True)
+    body = b"BT /F2 12 Tf 72 700 Td <" + codes + b"> Tj ET " + text_ops("plain words here", 72, 680)
+    return simple_pdf([body], resources=dict(F1, Font={"F1": Ref(3), "F2": Ref(100)}), extra_objects=objs)
+
+
+def _arial_pdf(text):
+    from reader.pdfnative import cid_unicode
+    font = ARIAL.read_bytes()
+    gid_of = {}
+    for gid, ch in sorted(cid_unicode.reverse_truetype_cmap(font).items()):
+        gid_of.setdefault(ch, gid)
+    return _identity_pdf("".join("%04X" % gid_of[c] for c in text).encode(), font)
+
+
+def test_pdfium_identity_without_tounicode():
+    # pdfium reads an Identity-H code with no ToUnicode as a code point: the page is native's (the
+    # embedded cmap reversed, or the text dropped and counted `glyphs`); with native failed, those
+    # chars are dropped and counted
+    cases = [(_identity_pdf(NO_FONT_CODES), None, "\u0410\u1234")]
+    if ARIAL.is_file():
+        cases.append((_arial_pdf("HelloWorld"), "HelloWorld", "+HOOR"))
+    for data, want, garbage in cases:
+        native = run(data, engine="native")
+        assert "plain words here" in native["md"] and (want is None or want in native["md"]), native
+        got = run(data)
+        assert (got["md"], got["skipped"]) == (native["md"], native["skipped"]), (got["md"], native["md"])
+        assert got["meta"]["engine"] == "pdfium", got["meta"]
+        alone = run(data, native_fails=True)
+        md = alone["md"]
+        assert "plain words here" in md and garbage not in md, md
+        assert alone["skipped"] == {"glyphs": 1}, alone["skipped"]
+
+
 def test_pdfium_native_damaged():
     got = run(simple_pdf([text_ops("Only pdfium reads")]), native_fails=True)
     assert "Only pdfium reads" in got["md"] and got["meta"]["engine"] == "pdfium", got
