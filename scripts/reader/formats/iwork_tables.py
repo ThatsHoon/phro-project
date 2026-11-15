@@ -1,8 +1,9 @@
 """iWork tables (`TST`) to one Table each, for Numbers sheets and for the tables Pages and Keynote place.
 
 Ported from docling (MIT) `docling/backend/iwork/cells.py` (`iwa_cell`, `iwa_legacy_cell` with its checks,
-`read_decimal128`) and `docling/backend/iwork/archives.py` (`iwa_placements`, `iwa_tile_placements`,
-`iwa_value_list`, `iwa_entry_string`, `iwa_entry_rich_text`), v2.150.0 (1ae470a1f4580881ed73853f64e0bf178f623c5e),
+`read_decimal128`, the version 5 cell's `style`), `docling/backend/iwork/archives.py` (`iwa_placements`,
+`iwa_tile_placements`, `iwa_value_list`, `iwa_entry_string`, `iwa_entry_rich_text`, `data_picture`) and
+`docling/backend/iwork/numbers_iwa.py` (`image_fill` and its use in `read_cells`), v2.150.0 (1ae470a1f4580881ed73853f64e0bf178f623c5e),
 and from numbers-parser (MIT) `numbers_parser/cell.py` (`_from_storage`: the version 5 field order and the value
 each cell type takes; `_unpack_decimal128`; `_custom_format`, `_format_decimal`, `_format_currency`),
 `numbers_parser/model.py` (`storage_buffers`, `get_storage_buffers_for_row`, `calculate_merges_using_region_map`,
@@ -28,6 +29,13 @@ format's Excel code (`format_code`, then `numfmt.display`), a date as the serial
 scientific, base, rating, custom) shows the raw value. A cell comment becomes a footnote through the text reader's
 `comment_thread`.
 
+A cell's picture fill takes docling's route: the version 5 cell's style key (flag 0x20) -> the data store's 5 style
+list (a `TableDataList`, entries {1 key, 4 -> TST.CellStyleArchive 6004}) -> 11 cell properties -> 1 fill -> 3 image
+fill -> 6 TSP.DataReference -> the data member. Each style is resolved once a document; each picture is read once a
+table through `Store.data` (charged against IMAGE_BYTES; a missing member counts `image`) and follows the table as an
+Image, in the order its cells first name it, as a picture anchored on an xlsx sheet follows the sheet's grid. A table
+whose cells hold only picture fills keeps its name as an empty Table's caption, then its pictures.
+
 Charts (`chart_block`) are ported from docling `docling/backend/iwork/charts.py` (`iwa_chart`, `iwa_chart_grid`,
 `iwa_chart_title`, `CHART_TYPES`) at the same pin: `TSCH.ChartDrawableArchive` (5021) extension 10000 ->
 `ChartArchive` {1 type, 5 series direction, 7 grid, 10 -> 5023 title}, to `charts.series_table`. Changes from docling:
@@ -42,7 +50,7 @@ from functools import lru_cache
 from .. import limits
 from ..charts import series_table
 from ..containers import pbwire
-from ..model import Break, Cell, Hidden, NoteRef, Table
+from ..model import Break, Cell, Hidden, Image, NoteRef, Table
 from ..numfmt import MAX_CODE, display
 from . import sheet_grid
 from .iwork_text import ref, refs
@@ -50,8 +58,9 @@ from .iwork_text import ref, refs
 TABLE_SEGMENTS = 100_000   # segments of one value table, with a visited set; the rest unread, counted `cells`
 TILE_SIZE, TILE_SIZE_MAX = 256, 65_536  # the tile size when absent, and the largest one read (1 at least)
 
-TABLE_INFO, PAGES_TABLE_INFO, MODEL, TILE, DATA_LIST, HEADERS, SEGMENT, MERGES, RICH_PAYLOAD = (
-    6000, 6007, 6001, 6002, 6005, 6006, 6011, 6144, 6218)
+TABLE_INFO, PAGES_TABLE_INFO, MODEL, TILE, DATA_LIST, HEADERS, SEGMENT, MERGES, RICH_PAYLOAD, CELL_STYLE = (
+    6000, 6007, 6001, 6002, 6005, 6006, 6011, 6144, 6218, 6004)
+FILL_PATH = (11, 1, 3)  # TST.CellStyleArchive -> cell properties -> fill -> image fill (docling `image_fill`)
 
 # cell types (byte 1 of a packed cell)
 NUMBER, TEXT, DATE, BOOL, DURATION, ERROR, RICH, CURRENCY = 2, 3, 5, 6, 7, 8, 9, 10
@@ -70,7 +79,7 @@ ERROR_TEXT = "#ERROR"
 
 # version 5: (flag, width, name or None) in storage order; nothing after the comment id is read
 _V5 = ((0x1, 16, "decimal"), (0x2, 8, "double"), (0x4, 8, "seconds"), (0x8, 4, "string"), (0x10, 4, "rich"),
-       (0x20, 4, None), (0x40, 4, None), (0x80, 4, None), (0x100, 4, None), (0x200, 4, None), (0x400, 4, None),
+       (0x20, 4, "style"), (0x40, 4, None), (0x80, 4, None), (0x100, 4, None), (0x200, 4, None), (0x400, 4, None),
        (0x800, 4, None), (0x1000, 4, None), (0x2000, 4, "number_format"), (0x4000, 4, "currency_format"),
        (0x8000, 4, "date_format"), (0x10000, 4, "duration_format"), (0x20000, 4, "text_format"),
        (0x40000, 4, "bool_format"), (0x80000, 4, "comment"))
@@ -352,6 +361,41 @@ class _Reader:
             return None
         return ref(payload, 1) if payload is not None else None
 
+    def _style(self, ef):
+        """A style list entry: 4 -> TST.CellStyleArchive (6004), as the data id of the picture it fills its cells
+        with (None without one); each style read once a document, however many lists and entries name it."""
+        sid = ref(ef, 4)
+        if sid is None:
+            return None
+        return self._cached(("fill", sid), lambda: self._fill(sid))
+
+    def _fill(self, sid):
+        """11 cell properties -> 1 fill -> 3 image fill -> 6 TSP.DataReference of a cell style; None for a missing
+        style or one without an image fill, or a broken one (counted `record` once)."""
+        try:
+            f = self.store.get(sid, CELL_STYLE)
+            for n in FILL_PATH:
+                f = pbwire.msg(f or {}, n)
+            return ref(f, 6) if f else None
+        except ValueError:
+            self.ctx.skipped["record"] += 1
+            return None
+
+    def pictures(self, data_ids) -> list:
+        """An Image for each data id a cell fill names, in the order the cells first name them, each read once a
+        table through `Store.data` (charged against IMAGE_BYTES; a missing or unreadable member counts `image` there,
+        an empty one here)."""
+        out = []
+        for d in data_ids:
+            raw = self.store.data(d)
+            if raw is None:
+                continue
+            if not raw:
+                self.ctx.skipped["image"] += 1
+                continue
+            out.append(Image(raw))
+        return out
+
     @staticmethod
     def _comment(ef):
         return ref(ef, 10)
@@ -461,16 +505,25 @@ class _Reader:
         rich = self.values(ds, 17, "rich")
         comments = self.values(ds, 19, "comment")
         formats = self.values(ds, 22, "format") if ref(ds, 22) is not None else self.values(ds, 11, "format")
+        try:
+            fills = self.values(ds, 5, "style")
+        except ValueError:  # a broken style list costs only the pictures, counted `record` once a document
+            fills = {}
+            if ("style_broken", ref(ds, 5)) not in self.cache:
+                self.cache[("style_broken", ref(ds, 5))] = True
+                self.ctx.skipped["record"] += 1
         marks: dict = {}
-        self._cells(grid, entries, size, strings, rich, comments, formats, marks)
+        filled: dict = {}  # data id -> None, in the order the cells first name it
+        self._cells(grid, entries, size, (strings, rich, comments, formats, fills), marks, filled)
         self._place(grid, marks)
         out = grid.blocks()
+        images = self.pictures(filled)
         if not out:
-            return []
+            return [Table([], caption=name), *images] if images else []
         if isinstance(out[0], Table):
             out[0].caption = name
-            return out[:1]
-        return [Table([[Cell(out[:1])]], caption=name)]  # one cell: Grid gives a paragraph
+            return [out[0], *images]
+        return [Table([[Cell(out[:1])]], caption=name), *images]  # one cell: Grid gives a paragraph
 
     def _merges(self, ds, grid):
         """13 -> TST.MergeRegionMapArchive (6144) {1 CellRange {1 origin {1 packed}, 2 size {1 packed}}}, each packed
@@ -488,8 +541,11 @@ class _Reader:
             if rows and cols:
                 grid.merge(row, row + rows - 1, col, col + cols - 1)
 
-    def _cells(self, grid, entries, size, strings, rich, comments, formats, marks):
+    def _cells(self, grid, entries, size, lists, marks, filled):
+        """Each cell's value into the grid; its comment storage into `marks` and the data id of the picture its style
+        fills it with into `filled` (a dict used as an ordered set)."""
         store, cap = self.store, limits.SHEET_SCAN
+        fills = lists[-1]
         codes: dict = {}
         walked: set = set()  # a tile placed under two tileids is read at the first only, counted `record` once
         repeated = False
@@ -510,9 +566,13 @@ class _Reader:
                         grid.stop("unpacked cells", cap)
                         return
                     store.scan += 1
-                    value, comment = self._cell(buf, start * scale, strings, rich, comments, formats, codes)
+                    value, comment, style = self._cell(buf, start * scale, *lists[:4], codes)
                     if comment is not None:
                         marks.setdefault((row, col), []).append(comment)
+                    if style is not None and fills:
+                        data = fills.get(style)
+                        if data is not None:
+                            filled[data] = None
                     if value and not grid.put(row, col, value):
                         return  # the grid is cut
                 if over:  # a cell past SHEET_COLS, as Grid.put would stop on it
@@ -520,10 +580,11 @@ class _Reader:
                     return
 
     def _cell(self, buf, start, strings, rich, comments, formats, codes):
-        """(the displayed value or None, the comment storage id or None) of the cell at `start`."""
+        """(the displayed value or None, the comment storage id or None, the style key or None) of the cell at
+        `start`; only a version 5 cell carries a style key (docling `iwa_current_cell`)."""
         if start >= len(buf):
             self.ctx.skipped["record"] += 1
-            return None, None
+            return None, None, None
         version, ctype = buf[start], buf[start + 1] if start + 1 < len(buf) else -1
         try:
             if version == 5:
@@ -531,14 +592,14 @@ class _Reader:
             elif version == 4:
                 v = _v4(buf, start, ctype)
                 if v is None:  # docling's checks: a layout that does not fit gives nothing
-                    return None, None
+                    return None, None, None
             else:
                 v = None
         except ValueError:
             v = None
         if v is None:
             self.ctx.skipped["record"] += 1
-            return None, None
+            return None, None, None
         comment = comments.get(v["comment"]) if "comment" in v else None
         value = self._value(v, ctype, strings, rich, formats, codes)
         lost = value is _LOST or ("comment" in v and comment is None and not isinstance(comments, _Cut))
@@ -546,7 +607,7 @@ class _Reader:
             value = None
         if lost and version == 5:  # a key absent from its list, counted once a cell (v4 stays silent, as docling)
             self.ctx.skipped["record"] += 1
-        return value, comment
+        return value, comment, v.get("style")
 
     @staticmethod
     def _code(key, formats, codes):
@@ -644,7 +705,7 @@ def _float(x) -> float:
 
 def table_blocks(store, table_id: int, ctx, budget: sheet_grid.Budget, text, notes: dict) -> list:
     """The table drawable `table_id` (6000, or a Pages 6007) as one Table, captioned with its name, through
-    `Grid.blocks()`; [] for a table with no values. Its model is entered through `Store.follow`, so one placed twice
+    `Grid.blocks()`, then the pictures its cells are filled with; [] for a table with neither. Its model is entered through `Store.follow`, so one placed twice
     is read once. A table that fails (not a table, no model, a tile size outside 1-65,536, broken bytes) is skipped
     and counts `table`. `text` is the document's `iwork_text.TextReader`, `notes` its Doc.notes."""
     out = []

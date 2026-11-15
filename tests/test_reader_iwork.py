@@ -14,8 +14,8 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from iwork_fix import (SECTION, archive, attachment, author, cell_v4, cell_v5, change, chart, chunk,  # noqa: E402
-                       comment, data_list, decimal128_bytes, fmt, footnote, group, highlight, image, iwa_member,
+from iwork_fix import (SECTION, archive, attachment, author, cell_style, cell_v4, cell_v5, change, chart,  # noqa: E402
+                       chunk, comment, data_list, decimal128_bytes, fmt, footnote, group, highlight, image, iwa_member,
                        iwork_zip, keynote09, keynote_doc, link, list_style, metadata_iwa, numbers09, numbers_doc,
                        pages09,
                        pages_doc, pb, pb_ref, segment, shape, slide09, slide_ids, snappy_copy, snappy_literal, sticky,
@@ -819,9 +819,13 @@ def test_repeat_blocks():
 
 # -- Numbers tables and the Numbers walk
 
-def _numbers(*archives, sheets=None):
-    """A Numbers file: one sheet "S" holding table 600 unless `sheets` says otherwise, plus the archives."""
+def _numbers(*archives, sheets=None, datas=(), files=None):
+    """A Numbers file: one sheet "S" holding table 600 unless `sheets` says otherwise, plus the archives; `datas`
+    are Metadata.iwa's (data id, file name) pairs and `files` the members added beside them."""
     members = {"Index/Document.iwa": iwa_member(*numbers_doc(sheets or [("S", [600])]), *archives)}
+    if datas:
+        members["Index/Metadata.iwa"] = metadata_iwa(list(datas))
+    members.update(files or {})
     ctx = Context()
     return iwork.parse_bytes(iwork_zip(members), ctx, "numbers"), ctx
 
@@ -884,6 +888,74 @@ def test_two_tiles_row_past_256():
     assert {k: _flat(v) for k, v in seen.items()} == {(3, 0): "a", (258, 1): "b"}, seen
     [tab] = _tables(doc)
     assert tab.caption == "T" and ctx.skipped == {"repeat": 1}, ctx.skipped  # Grid shrinks the 254 empty rows
+
+
+FILL_STYLE, PLAIN_STYLE, FILL_DATA = 700, 701, 40
+
+
+def _fill_table(name, rows, **kw):
+    """A table whose style key 7 fills its cells with data FILL_DATA and key 8 is a style without a fill."""
+    return [*table(name, len(rows), 2, tiles={0: tile(dict(enumerate(rows)))}, styles=[(7, FILL_STYLE),
+                                                                                      (8, PLAIN_STYLE)], **kw),
+            cell_style(FILL_STYLE, FILL_DATA), cell_style(PLAIN_STYLE)]
+
+
+def test_cell_picture_fill():
+    # a version 5 cell whose style fills it with a picture gives an Image after its table, as a picture anchored on
+    # an xlsx sheet follows the sheet's grid; a style without a fill gives nothing and counts nothing
+    t = _fill_table("T", [[cell_v5(3, string_id=1, style_id=7), cell_v5(3, string_id=2, style_id=8)]],
+                    strings=[(1, "a"), (2, "b")])
+    doc, ctx = _numbers(*t, datas=[(FILL_DATA, "fill.png")], files={"Data/fill.png": PNG})
+    [tab] = _tables(doc)
+    assert tab.caption == "T" and doc.blocks[0].blocks[1:] == [Image(PNG)], doc.blocks[0].blocks
+    assert not ctx.skipped, ctx.skipped
+    assert "a" in _md(doc, ctx) and "b" in _md(doc, ctx)
+
+
+def test_cell_picture_fill_read_once():
+    # the same picture filling three cells is read (and charged against IMAGE_BYTES) once
+    t = _fill_table("T", [[cell_v5(3, string_id=1, style_id=7), None], [cell_v5(0, style_id=7), None],
+                          [None, cell_v5(0, style_id=7)]], strings=[(1, "a")])
+    calls = []
+    real = iwork_iwa.Store.data
+
+    def data(self, data_id):
+        calls.append(data_id)
+        return real(self, data_id)
+
+    iwork_iwa.Store.data = data
+    try:
+        doc, ctx = _numbers(*t, datas=[(FILL_DATA, "fill.png")], files={"Data/fill.png": PNG})
+    finally:
+        iwork_iwa.Store.data = real
+    assert calls == [FILL_DATA] and doc.blocks[0].blocks[1:] == [Image(PNG)], (calls, doc.blocks[0].blocks)
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_cell_picture_fill_missing():
+    # a fill whose data member is not in the package counts `image` once; the table is still read
+    t = _fill_table("T", [[cell_v5(3, string_id=1, style_id=7), cell_v5(0, style_id=7)]], strings=[(1, "a")])
+    doc, ctx = _numbers(*t, datas=[(FILL_DATA, "gone.png")])
+    [tab] = _tables(doc)
+    assert tab.caption == "T" and len(doc.blocks[0].blocks) == 1 and ctx.skipped == {"image": 1}, \
+        (doc.blocks[0].blocks, ctx.skipped)
+    # a cell style whose properties are not a message counts `record` once, however many cells name it
+    t = t[:-2] + [archive(FILL_STYLE, 6004, pb((11, 5))), t[-1]]  # _fill_table ends with the two styles
+    doc, ctx = _numbers(*t, datas=[(FILL_DATA, "fill.png")], files={"Data/fill.png": PNG})
+    assert len(_tables(doc)) == 1 and len(doc.blocks[0].blocks) == 1 and ctx.skipped == {"record": 1}, \
+        (doc.blocks[0].blocks, ctx.skipped)
+
+
+def test_cell_picture_fill_only_table():
+    # a table whose cells hold only picture fills keeps its name and its picture
+    t = _fill_table("Pics", [[cell_v5(0, style_id=7), cell_v5(0, style_id=7)]])
+    doc, ctx = _numbers(*t, datas=[(FILL_DATA, "fill.png")], files={"Data/fill.png": PNG})
+    [tab] = _tables(doc)
+    assert tab.caption == "Pics" and doc.blocks[0].blocks[1:] == [Image(PNG)], doc.blocks[0].blocks
+    assert "Pics" in _md(doc, ctx) and not ctx.skipped, ctx.skipped
+    # without a picture a values-free table is still dropped
+    doc, ctx = _numbers(*_fill_table("Bare", [[cell_v5(0, style_id=8), None]]))
+    assert _tables(doc) == [] and not ctx.skipped, (doc.blocks, ctx.skipped)
 
 
 def test_tile_size_bounds():

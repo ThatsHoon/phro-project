@@ -227,14 +227,15 @@ def pages_doc(body_sid, *, floating=(), headers=(), footers=()) -> list[bytes]:
 
 # -- Numbers tables and documents (Task 13)
 
-V5_FLAG = {"decimal": 0x1, "double": 0x2, "seconds": 0x4, "string": 0x8, "rich": 0x10, "number_format": 0x2000,
+V5_FLAG = {"decimal": 0x1, "double": 0x2, "seconds": 0x4, "string": 0x8, "rich": 0x10, "style": 0x20,
+           "number_format": 0x2000,
            "currency_format": 0x4000, "date_format": 0x8000, "duration_format": 0x10000, "text_format": 0x20000,
            "bool_format": 0x40000, "comment": 0x80000}
 # the format flag a cell type's format_id goes under, as Numbers writes it (numbers-parser `_from_storage`)
 _FORMAT_FLAG = {2: "number_format", 10: "currency_format", 5: "date_format", 7: "duration_format", 6: "bool_format",
                 3: "text_format", 9: "text_format"}
-_V5_ORDER = ("decimal", "double", "seconds", "string", "rich", "number_format", "currency_format", "date_format",
-             "duration_format", "text_format", "bool_format", "comment")
+_V5_ORDER = ("decimal", "double", "seconds", "string", "rich", "style", "number_format", "currency_format",
+             "date_format", "duration_format", "text_format", "bool_format", "comment")
 
 
 def fixed32(field: int, value: int) -> bytes:
@@ -253,10 +254,11 @@ def decimal128_bytes(value) -> bytes:
 
 
 def cell_v5(type, *, value=None, string_id=None, rich_id=None, format_id=None, comment_id=None, format_flag=None,
-            raw_flags=None) -> bytes:
+            raw_flags=None, style_id=None) -> bytes:
     """A version 5 packed cell: 0 version, 1 type, 8-11 flags, then the flagged values in numbers-parser's order.
     `value` is a decimal128 for a number (2) or currency (10), seconds for a date (5) and a double for a bool (6) or
-    duration (7). `format_id` goes under the type's format flag, or under `format_flag` (a V5_FLAG name)."""
+    duration (7). `format_id` goes under the type's format flag, or under `format_flag` (a V5_FLAG name); `style_id`
+    is the key of the cell's style in the table's style list."""
     vals = {}
     if value is not None:
         if type in (2, 10):
@@ -265,7 +267,7 @@ def cell_v5(type, *, value=None, string_id=None, rich_id=None, format_id=None, c
             vals["seconds"] = struct.pack("<d", float(value))
         else:
             vals["double"] = struct.pack("<d", float(value))
-    for name, v in (("string", string_id), ("rich", rich_id), ("comment", comment_id)):
+    for name, v in (("string", string_id), ("rich", rich_id), ("style", style_id), ("comment", comment_id)):
         if v is not None:
             vals[name] = struct.pack("<I", v)
     if format_id is not None:
@@ -340,16 +342,16 @@ def string_entry(key, text) -> bytes:
 
 def table(name, rows, cols, *, tiles, strings=(), rich=(), merges=(), hidden_rows=(), hidden_cols=(), comments=(),
           formats=(), id=600, tile_size=None, info_type=6000, hiding=1, string_segments=(),
-          string_list=None) -> list[bytes]:
+          string_list=None, styles=()) -> list[bytes]:
     """The archives of one table: TST.TableInfoArchive (`info_type`, id `id`) -> model (6001, id+1) {4 data store,
     6 rows, 7 columns, 8 name}. The data store embeds 3 TileStorage {1 [{1 tileid, 2 tile}], 2 tile size} and
     names 4 strings ((key, text); `string_segments` are the ids of 6011 segments the caller adds; `string_list` names
     a list the caller adds instead), 17 rich text
     ((key, storage id) through 6218), 19 comments ((key, 3056 id)), 22 formats ((key, `fmt` bytes)), 13 the merges
-    (6144; (row, col, rows, cols)) and 1/2 the row and column header buckets (6006), whose indexes get hidingState
-    `hiding`. `tiles` maps tileid -> `tile` bytes, object id+20+i in tileid order. With info_type 6007 (a Pages
-    table) the info nests the 6000 message in field 1. Value-list objects take ids id+2 to id+8, and the rich text
-    payloads 10**6 + id*1000 on."""
+    (6144; (row, col, rows, cols)), 5 the cell styles ((key, 6004 id), entry field 4) and 1/2 the row and column
+    header buckets (6006), whose indexes get hidingState `hiding`. `tiles` maps tileid -> `tile` bytes, object
+    id+20+i in tileid order. With info_type 6007 (a Pages table) the info nests the 6000 message in field 1.
+    Value-list objects take ids id+2 to id+9, and the rich text payloads 10**6 + id*1000 on."""
     out, ds, entries = [], [], []
     for i, (tid, payload) in enumerate(sorted(tiles.items())):
         out.append(archive(id + 20 + i, 6002, payload))
@@ -378,6 +380,9 @@ def table(name, rows, cols, *, tiles, strings=(), rich=(), merges=(), hidden_row
         ranges = [pb((1, fixed32(1, c << 16 | r)), (2, fixed32(1, nc << 16 | nr))) for r, c, nr, nc in merges]
         out.append(archive(id + 6, 6144, pb(*((1, x) for x in ranges))))
         ds.append((13, pb_ref(id + 6)))
+    if styles:
+        out.append(data_list(id + 9, [pb((1, k), (2, 1), (4, pb_ref(s))) for k, s in styles], list_type=4))
+        ds.append((5, pb_ref(id + 9)))
 
     def bucket(idx):
         return pb((1, 1), *((2, pb((1, i), (2, 20.0), (3, hiding), (4, 1))) for i in idx))
@@ -389,6 +394,13 @@ def table(name, rows, cols, *, tiles, strings=(), rich=(), merges=(), hidden_row
     info = pb((1, b""), (2, pb_ref(id + 1)))
     out.append(archive(id, info_type, pb((1, info)) if info_type == 6007 else info))
     return out
+
+
+def cell_style(id, data_id=None) -> bytes:
+    """A TST.CellStyleArchive (6004) {11 cell properties {1 fill {3 image fill {6 TSP.DataReference}}}}; with no
+    `data_id` its properties hold no fill."""
+    props = pb((1, pb((3, pb((6, pb_ref(data_id))))))) if data_id is not None else b""
+    return archive(id, 6004, pb((1, b""), (11, props)))
 
 
 NUMBERS_ROOT = 1  # metadata_iwa takes id 2
