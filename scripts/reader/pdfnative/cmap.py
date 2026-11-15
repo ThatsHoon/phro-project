@@ -14,7 +14,7 @@ import heapq
 import re
 import zlib
 from functools import lru_cache
-from typing import Dict, Set, Tuple
+from typing import Callable, Dict, Optional, Set, Tuple
 
 _TO_UNICODE_BLOCK_TOKEN = re.compile(rb"(begin|end)(codespacerange|bfchar|bfrange)")
 # White space inside a hex string is ignored (ISO 32000 7.3.4.3): `< 0020 00a0 >` is <002000a0>.
@@ -394,6 +394,9 @@ class ToUnicodeCMap:
         self.cut = None  # the cut kind when a cap dropped content
         self._decode_lengths_key = None
         self._decode_sizes = [1]
+        # the font's reading of a code the CMap does not map (its code bytes in, "" for none),
+        # or None: such a code is U+FFFD
+        self.fallback: Optional[Callable[[bytes], str]] = None
 
     def _mapping_full(self) -> bool:
         if len(self.mapping) >= MAX_MAPPING_ENTRIES:
@@ -428,8 +431,9 @@ class ToUnicodeCMap:
             if not matched:
                 # Advance by the shortest length only: skipping the longest would swallow
                 # the characters after it.
-                out.append("�")
-                i += max(min(min_size, n - i), 1)
+                step = max(min(min_size, n - i), 1)
+                out.append(self.fallback and self.fallback(data[i:i + step]) or "�")
+                i += step
         return "".join(out)
 
     def _parse_bfrange_block(self, block: bytes) -> None:

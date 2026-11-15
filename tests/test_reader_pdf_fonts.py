@@ -70,8 +70,38 @@ def test_tounicode_hex_with_whitespace():
     assert not info.unmapped
 
 
+def test_partial_tounicode_simple_font_falls_back_to_encoding():
+    # a ToUnicode that maps only the ligature code: the other codes read through the font's
+    # encoding, as with no ToUnicode, not as U+FFFD. A code whose bare byte is a control char
+    # has no reading there either
+    cmap_data = (b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+                 b"1 beginbfchar\n<41> <006600660069>\nendbfchar\n")
+    font = {"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("Helvetica"),
+            "Encoding": {"BaseEncoding": Name("WinAnsiEncoding"), "Differences": [66, Name("Euro")]},
+            "ToUnicode": Ref(103)}
+    pf, info = load({100: font, 103: Stream({}, cmap_data)})
+    assert info.decode(b"oAce and suAx B\x01") == "office and suffix €�"
+    assert not info.unmapped and not pf.warnings, pf.warnings
+
+
+def test_partial_tounicode_cid_font_falls_back_to_cid_tables():
+    # an unmapped CID reads through the Adobe table of its collection, or the embedded TrueType
+    # cmap, as with no ToUnicode; only a CID nothing maps stays U+FFFD
+    ga = next(c for c in range(1, 65536) if adobe_cid("Korea1", c) == "가")
+    pf, info = load(font_type0(tounicode={1: "a"}))
+    assert info.decode(b"\x00\x01" + ga.to_bytes(2, "big")) == "a가"
+    assert not info.unmapped and not pf.warnings, pf.warnings
+    pf, info = load(font_type0(tounicode={1: "a"}, ordering="Identity", embedded_cmap={5: 0xD55C}))
+    assert info.decode(b"\x00\x01\x00\x05\x00\x06") == "a한�"
+    assert not info.unmapped and not pf.warnings, pf.warnings
+    pf, info = load(font_type0(tounicode={1: "a"}, ordering="Identity"))
+    assert info.decode(b"\x00\x01\x00\x05") == "a�"
+    assert not info.unmapped and not pf.warnings, pf.warnings
+
+
 def test_tounicode_entry_cap():
-    objects = font_type0(tounicode=None)
+    # Identity: no CID table reads the codes past the cap either
+    objects = font_type0(tounicode=None, ordering="Identity")
     objects[100]["ToUnicode"] = Ref(103)
     objects[103] = Stream({}, b"1 beginbfrange <0000> <0063> <AE00> endbfrange\n")
     old = cmap.MAX_MAPPING_ENTRIES

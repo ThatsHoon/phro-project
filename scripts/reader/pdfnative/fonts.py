@@ -4,8 +4,9 @@ Port of dochan 1.21.0 pdf/reader.py (font section, MIT) and of FontInfo, Vertica
 default_byte_decoder from pdf/content.py. `font_infos` reads a page's /Font resources into one
 FontInfo per name, cached by object reference. A font decodes through, in order: its ToUnicode
 CMap, the Adobe CID to Unicode table of its character collection, the reverse of its embedded
-TrueType cmap, the Core 14 glyph names, and last the bare bytes. A Type0 font that none of
-these reaches is `unmapped`.
+TrueType cmap, the Core 14 glyph names, and last the bare bytes. A code its ToUnicode CMap does
+not map reads the way the font would with no ToUnicode; it is U+FFFD only when nothing there
+maps it either. A Type0 font that none of these reaches is `unmapped`.
 
 A cap that drops content is counted on the PDFFile `cuts`, once, under one kind.
 """
@@ -410,6 +411,8 @@ def build_decoder(pdf: PDFFile, name: str, font: dict, encoding_cmap=None) -> Ca
             if cmap.cut:
                 pdf._cut(cmap.cut, local[-1])
             if cmap.mapping:
+                cmap.fallback = _Later(lambda: encoding_decoder(pdf, name, font, encoding_cmap,
+                                                                 quiet=True))
                 if encoding_cmap is not None:
                     def decode_encoded(raw):
                         return "".join(cmap.decode(chunk) for chunk, _cid in
@@ -419,9 +422,35 @@ def build_decoder(pdf: PDFFile, name: str, font: dict, encoding_cmap=None) -> Ca
                     decode_encoded.mapping = cmap.mapping
                     return decode_encoded
                 return cmap.decode
+    return encoding_decoder(pdf, name, font, encoding_cmap)
+
+
+class _Later:
+    """A decoder built when a code first needs it: ToUnicode leaves most codes to no fallback,
+    and building one reads the font's encoding or its embedded font. A control char, a bare
+    byte no encoding names, is no reading of a glyph: it gives U+FFFD as before."""
+
+    def __init__(self, build):
+        self._build = build
+        self._decode = None
+
+    def __call__(self, raw: bytes) -> str:
+        if self._build is not None:
+            self._decode, self._build = self._build(), None
+        if self._decode is None:
+            return ""
+        return "".join("\ufffd" if ch < " " or "\x7f" <= ch <= "\x9f" else ch
+                       for ch in self._decode(raw))
+
+
+def encoding_decoder(pdf: PDFFile, name: str, font: dict, encoding_cmap=None, quiet=False):
+    """The decoder of a font with no ToUnicode: for a Type0 font its CID recovery, for a simple
+    font its encoding. `quiet`, for the codes a ToUnicode CMap leaves out: a Type0 font with no
+    recovery gives None, and neither warns that the font has no ToUnicode."""
     if str(font.get("Subtype", "")) == "Type0":
         recovered = cid_fallback_decoder(pdf, name, font, encoding_cmap)
         if recovered is not None:
+            recovered.warned = recovered.warned or quiet
             if encoding_cmap is not None:
                 return lambda raw: "".join(recovered.decode(cid.to_bytes(2, "big"))
                                            for _chunk, cid in encoding_cmap.iter_codes(raw, pdf.warnings))
@@ -438,6 +467,8 @@ def build_decoder(pdf: PDFFile, name: str, font: dict, encoding_cmap=None) -> Ca
         fallback = (lambda raw: raw.decode("mac_roman", errors="replace")) if macroman else default_byte_decoder
         return Core14Decoder(names, fallback, preserve_undefined=macroman).decode
     if str(font.get("Subtype", "")) == "Type0" or encoding_name.startswith("Identity-"):
+        if quiet:
+            return None
         pdf._warn_once(f"WARN: font {name}: CID font without ToUnicode; its text cannot be extracted")
         return _drop_decoder
     if encoding_name == "MacRomanEncoding":
