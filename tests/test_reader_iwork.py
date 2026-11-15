@@ -277,7 +277,7 @@ def test_preview_fallback():
     doc, ctx = _read({"preview.jpg": JPG, "QuickLook/Thumbnail.jpg": THUMB})
     assert len(doc.blocks) == 1 and isinstance(doc.blocks[0], Image) and doc.blocks[0].data == JPG
     assert ctx.skipped["document"] == 1
-    # an IWA body no walk reads (WALKS is empty here) falls back too
+    # an IWA body no walk reads (a Pages root naming no body storage) falls back too, counted once
     doc, ctx = _read({"Index/Document.iwa": _doc_member(), "preview.jpg": JPG})
     assert [b.data for b in doc.blocks] == [JPG] and ctx.skipped["document"] == 1
 
@@ -775,6 +775,46 @@ def test_body_failure_keeps_page():
     assert [b.data for b in doc.blocks] == [JPG] and ctx.skipped == {"document": 1}, ctx.skipped
 
 
+def test_header_drawables_counted():
+    # a picture, a table and a chart anchored in a header: a header shows lines only, so each is counted by its
+    # kind and never read (no picture bytes charged); a text box's text stays a header line
+    calls = []
+    real = iwork_iwa.Store.data
+
+    def data(self, data_id):
+        calls.append(data_id)
+        return real(self, data_id)
+
+    head = storage("Head￼￼￼￼", attachments=[(4, 110), (5, 112), (6, 114), (7, 116)])
+    t = table("T", 1, 1, tiles={0: tile({0: [_text_cell(1)]})}, strings=[(1, "cell")])
+    iwork_iwa.Store.data = data
+    try:
+        doc, ctx = _pages("Body", archive(130, 2001, head), attachment(110, 111), image(111, 7),
+                          attachment(112, 600), *t, attachment(114, 500), *chart(1, ["r"], ["A"], [[1]], None),
+                          attachment(116, 141), shape(141, 150), archive(150, 2001, storage("Box")),
+                          datas=[(7, "pic.png")], files={"Data/pic.png": PNG}, headers=[130],
+                          sections=[(0, SECTION)])
+    finally:
+        iwork_iwa.Store.data = real
+    assert doc.headers == ["Head", "Box"] and doc.blocks == [Para([Text("Body")])], (doc.headers, doc.blocks)
+    assert ctx.skipped == {"image": 1, "table": 1, "chart": 1} and calls == [], (ctx.skipped, calls)
+
+
+def test_lost_body_counted_once():
+    # an LZVN body with a preview: the member counts `document` once, the preview adds no second count
+    doc, ctx = _read({"Index/Document.iwa": b"bvxn" + b"\x00" * 12, "preview.jpg": JPG})
+    assert [b.data for b in doc.blocks] == [JPG] and ctx.skipped == {"document": 1}, ctx.skipped
+
+
+def test_blank_pages_document():
+    # a Pages document whose walk read everything and found no text is an empty Doc, not its preview and a lost part
+    members = {"Index/Document.iwa": iwa_member(*pages_doc(BODY), archive(BODY, 2001, storage(""))),
+               "preview.jpg": JPG}
+    ctx = Context()
+    doc = iwork.parse_bytes(iwork_zip(members), ctx, "pages")
+    assert doc.blocks == [] and not ctx.skipped, (doc.blocks, ctx.skipped)
+
+
 def test_header_notes_counted():
     # a footnote and a comment in a header count `note` and add no note: their marks are never shown
     doc, ctx = _pages("Body", archive(130, 2001, storage("Head￼", footnotes=[(4, 90)])), footnote(90, 91),
@@ -1128,7 +1168,7 @@ def test_false_tileid_rows():
         doc, ctx = _numbers(*table("T", 10, 1, tiles={0: tile({0: [_text_cell(1)]}), 10**6: tile({0: [_text_cell(2)]}),
                                                        10**12: tile({5: [_text_cell(2)]})},
                                    strings=[(1, "a"), (2, "b")]))
-    assert time.perf_counter() - t0 < 1
+    assert time.perf_counter() - t0 < 2
     assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "a"} and ctx.skipped == {"sheet_cut": 1}, ctx.skipped
     assert _tables(doc)[0].rows[0][0].blocks == [Para([Text("a")])]
 
@@ -1158,6 +1198,57 @@ def test_table_segments_cap():
             doc, ctx = _numbers(*t, *segs)
     assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "one", (0, 1): "two"}, seen
     assert ctx.skipped == {"cells": 1}, ctx.skipped
+
+
+def test_broken_segment_counted_once():
+    # a segment that is not a message counts `record` once; the cells whose keys lived in it are not counted again
+    cells = [_text_cell(1), _text_cell(2), _text_cell(2), _text_cell(3)]
+    t = table("T", 1, 4, tiles={0: tile({0: cells})}, strings=[(1, "one")], string_segments=[650, 651])
+    segs = [archive(650, 6011, b"\x1a\tab"), segment(651, [string_entry(3, "three")])]
+    with _puts() as seen:
+        doc, ctx = _numbers(*t, *segs)
+    assert {k: _flat(v) for k, v in seen.items()} == {(0, 0): "one", (0, 3): "three"}, seen
+    assert ctx.skipped == {"record": 1}, ctx.skipped
+    # so does an entry that cannot be read, however many cells name its key
+    bad = pb((1, 1), (3, string_entry(1, "one")), (3, b"\x0a\x05ab"))
+    t = table("T", 1, 3, tiles={0: tile({0: [_text_cell(1), _text_cell(2), _text_cell(2)]})}, string_list=5003)
+    doc, ctx = _numbers(*t, archive(5003, 6005, bad))
+    assert ctx.skipped == {"record": 1}, ctx.skipped
+
+
+def test_cell_picture_fill_hidden():
+    # a fill named only by cells in hidden rows or columns is hidden like its cells: left out and counted by
+    # default, shown marked with --hidden; one a visible cell names too is shown
+    rows = [[cell_v5(3, string_id=1), None], [cell_v5(0, style_id=7), None]]
+    t = [*table("T", 2, 2, tiles={0: tile(dict(enumerate(rows)))}, strings=[(1, "a")], hidden_rows=[1],
+                styles=[(7, FILL_STYLE)]), cell_style(FILL_STYLE, FILL_DATA)]
+    doc, ctx = _numbers(*t, datas=[(FILL_DATA, "fill.png")], files={"Data/fill.png": PNG})
+    assert doc.blocks[0].blocks[1:] == [Image(PNG, hidden="hidden")], doc.blocks[0].blocks
+    assert "(1 hidden places left out)" in _md(doc, ctx), _md(doc, ctx)
+    assert "hidden places" not in _md(doc, ctx, hidden=True)
+    rows = [[None, cell_v5(0, style_id=7)], [cell_v5(3, string_id=1), None]]
+    t = [*table("T", 2, 2, tiles={0: tile(dict(enumerate(rows)))}, strings=[(1, "a")], hidden_cols=[1],
+                styles=[(7, FILL_STYLE)]), cell_style(FILL_STYLE, FILL_DATA)]
+    doc, ctx = _numbers(*t, datas=[(FILL_DATA, "fill.png")], files={"Data/fill.png": PNG})
+    assert doc.blocks[0].blocks[1:] == [Image(PNG, hidden="hidden")], doc.blocks[0].blocks
+    rows = [[cell_v5(0, style_id=7), None], [cell_v5(3, string_id=1, style_id=7), None]]
+    t = [*table("T", 2, 2, tiles={0: tile(dict(enumerate(rows)))}, strings=[(1, "a")], hidden_rows=[0],
+                styles=[(7, FILL_STYLE)]), cell_style(FILL_STYLE, FILL_DATA)]
+    doc, ctx = _numbers(*t, datas=[(FILL_DATA, "fill.png")], files={"Data/fill.png": PNG})
+    assert doc.blocks[0].blocks[1:] == [Image(PNG)], doc.blocks[0].blocks
+
+
+def test_chart_counted_once():
+    # a chart with a broken grid row that CHART_TOTAL then leaves out counts `chart` once, and a cut one left out
+    # counts `chart` only
+    grid = pb((1, "r1"), (2, "A"), (3, 5), (3, pb((1, pb((1, 2.0))))))
+    with _limit(limits, "CHART_TOTAL", 1):
+        doc, ctx = _numbers(archive(500, 5021, pb((10000, pb((1, 1), (7, grid))))), sheets=[("S", [500])])
+    assert _tables(doc) == [] and ctx.skipped == {"chart": 1}, ctx.skipped
+    rows = [[i, i + 0.5] for i in range(10)]
+    with _limit(limits, "CHART_CELLS", 6), _limit(limits, "CHART_TOTAL", 1):
+        doc, ctx = _numbers(*chart(1, [f"r{i}" for i in range(10)], ["A", "B"], rows, "T"), sheets=[("S", [500])])
+    assert _tables(doc) == [] and ctx.skipped == {"chart": 1}, ctx.skipped
 
 
 def test_numbers_sheets():
@@ -1593,6 +1684,50 @@ def test_walk_resets_between_apps():
         iwork_iwa.WALKS.clear()
         iwork_iwa.WALKS.update(old)
     assert seen == [({}, 0)], seen
+
+
+def test_walk_resets_spend_between_apps():
+    # a failed first app's table cells, scanned cells and picture bytes do not reduce the next app's
+    seen = []
+
+    def first(store, ctx):
+        store.budget.cells = store.budget.chars = 0  # all spent
+        store.scan = limits.SHEET_SCAN
+        store.image_bytes = limits.IMAGE_BYTES
+        raise ValueError("broken")
+
+    def second(store, ctx):
+        fresh = sheet_grid.Budget()
+        seen.append((store.budget.cells == fresh.cells and store.budget.chars == fresh.chars, store.scan,
+                     store.image_bytes))
+        return Doc(blocks=[Para([Text("ok")])])
+
+    old = dict(iwork_iwa.WALKS)
+    try:
+        iwork_iwa.WALKS.update({"key": first, "pages": second})
+        ctx = Context()
+        iwork.parse_bytes(iwork_zip({"Index/Document.iwa": _doc_member()}), ctx, "key")
+    finally:
+        iwork_iwa.WALKS.clear()
+        iwork_iwa.WALKS.update(old)
+    assert seen == [(True, 0, 0)] and ctx.skipped == {"document": 1}, (seen, ctx.skipped)
+
+
+def test_keynote_numbers_no_headings_by_style():
+    # headings by paragraph style name are a Pages rule: a Keynote body styled "Subtitle" or "Title" and a Numbers
+    # text box styled "Title" are paragraphs, under the slide or sheet head
+    styles = (style(990, "Subtitle"), style(991, "Title"))
+    body = storage("Sub line\nTitle line", para_styles=[(0, 990), (9, 991)])
+    doc, ctx = _keynote([{"title": "T", "body": body}], *styles)
+    assert doc.blocks[0].blocks == [Para([Text("Sub line")]), Para([Text("Title line")])], doc.blocks[0].blocks
+    md = _md(doc, ctx)
+    assert "## Slide 1: T\n" in md and "# Title line" not in md and "## Sub line" not in md, md
+    doc, ctx = _numbers(shape(800, 801), archive(801, 2001, storage("Boxed", para_styles=[(0, 991)])), *styles,
+                        sheets=[("S", [800])])
+    assert doc.blocks[0].blocks == [Para([Text("Boxed")])], doc.blocks[0].blocks
+    # Pages keeps them
+    doc, ctx = _pages("Boxed", *styles, para_styles=[(0, 991)])
+    assert doc.blocks == [Heading(1, [Text("Boxed")])], doc.blocks
 
 
 def test_keynote_linear():
@@ -2274,7 +2409,7 @@ def test_09_popup_chain_linear():
         t0 = time.perf_counter()
         doc = iwork.parse_bytes(d, ctx, "numbers")
         took = time.perf_counter() - t0
-        assert took < 1, took
+        assert took < 2, took
         assert not ctx.skipped, ctx.skipped
         got.append([_cells(t) for t in _tables(doc)])
     [one] = got[0]

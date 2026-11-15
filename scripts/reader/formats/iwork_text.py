@@ -7,7 +7,7 @@ Ported from docling (MIT) `docling/backend/iwork/content.py` (`split_paragraphs`
 
 The text is field 3's strings joined, split into paragraphs at `\\n`. Every run table has the shape
 `{1 entries {1 character_index, 2 TSP.Reference}}`; an entry without a reference ends the run before it. Read:
-5 paragraph styles (2022; headings by name), 6 paragraph data (list depth), 7 list styles (2023; `-` or `1.`),
+5 paragraph styles (2022; headings by name, in Pages only), 6 paragraph data (list depth), 7 list styles (2023; `-` or `1.`),
 8 character styles (2021; bold, property 1), 9 attachments (2003 -> a drawable, placed after its paragraph by the
 caller's `attach`), 11 smart fields (2032 hyperlinks), 16 footnotes (2008 -> a storage), 22 deletions (2060 kind 2,
 left out as `Hidden(kind="deleted")`) and 23 highlights (2013 -> 3056 comments with their replies). Insertions
@@ -204,10 +204,13 @@ class TextReader:
     """Reads text storages into blocks. Footnotes and comments go into `notes` (Doc.notes) as `fn-N` and `cm-N`;
     `attach(drawable_id)` gives the blocks of a drawable anchored at U+FFFC, placed after its paragraph. Each
     storage is entered through `Store.follow`, so one read twice or reached through itself is read once. Each
-    comment is emitted at most once a document (`comment_thread`)."""
+    comment is emitted at most once a document (`comment_thread`). `headings` turns paragraph style names into
+    headings (`level`), which is a Pages rule (Defaults "Pages styles", as iwork_xml's): Keynote and Numbers text
+    is body text under its slide or sheet head."""
 
-    def __init__(self, store, ctx, notes: dict, attach: Callable[[int], list]):
+    def __init__(self, store, ctx, notes: dict, attach: Callable[[int], list], headings: bool = False):
         self.store, self.ctx, self.notes, self.attach = store, ctx, notes, attach
+        self.headings = headings
         self._note_ids: dict[int, str | None] = {}   # footnote or highlight object id -> note id (None: no note)
         self._thread_of: dict[int, str | None] = {}  # comment (3056) id -> the note id of the thread holding it
         self._next = {"fn": 0, "cm": 0}
@@ -225,6 +228,11 @@ class TextReader:
         for got in self.store.follow([storage_id], self._storage, self.store.depth):
             out.extend(got)
         return out
+
+    @property
+    def in_head(self) -> bool:
+        """Whether a header or footer is being read (`header_lines`): its pictures and tables are counted, not read."""
+        return self._head > 0
 
     def header_lines(self, storage_id) -> list[str]:
         """A header or footer storage as one line a paragraph. A footnote or comment there counts `note` and adds no
@@ -455,7 +463,7 @@ class TextReader:
         except ValueError:
             depths = []
         t = _Tables(
-            heading=self._table(f, 5, pos, self._heading),
+            heading=self._table(f, 5, pos, self._heading) if self.headings else _Runs([]),
             depth=_Runs([(pos(i), d) for i, d in depths]),
             lists=self._table(f, 7, pos, lambda r: r),
             bold=self._table(f, 8, pos, self._bold),

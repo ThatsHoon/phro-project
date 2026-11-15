@@ -9,7 +9,9 @@ Ported from docling (MIT) `docling/backend/iwork_backend.py` (`_open_container`,
 3. IWA: root `Index/*.iwa`, or an `Index.zip` at the root or one folder down, opened in memory; an `Index.zip`
    inside that one counts `document` and is not opened. The app comes from the extension (`iwork_iwa.walk`);
 4. nothing readable, or a body with no block: `preview.jpg`, else `QuickLook/Thumbnail.jpg`, is the only block,
-   counted `document`. With neither, `damaged`.
+   counted `document` unless the lost part was counted already (a member, an Index.zip inside the index, a walk or
+   a body). With neither, `damaged`. An IWA walk that found its root, lost nothing and read no block is a blank
+   document: its empty Doc is the answer, without the preview.
 macOS bundle folders are not read: the gate takes files only.
 """
 import posixpath
@@ -81,11 +83,14 @@ def _nested(pkg) -> str | None:
 
 
 def _iwa(pkg, names: list, nested: str | None, prefix: str, app: str, ctx) -> tuple[Doc | None, bool]:
-    """(the walked document or None, whether a walk raised and was already counted `document`)."""
+    """(the walked document or None, whether a part was lost and already counted `document`: a member that could not
+    be read or unpacked, an Index.zip inside the index, or a walk or body that failed)."""
     budget = flate.Budget(iwork_iwa.IWA_BYTES)  # one budget for every member's Snappy output
+    before = ctx.skipped["document"]
     if names:
         store = iwork_iwa.load(_members(pkg, names, ctx), ctx, budget, pkg)
-        return iwork_iwa.walk(store, app, ctx), store.failed > 0
+        doc = iwork_iwa.walk(store, app, ctx)
+        return doc, store.failed > 0 or ctx.skipped["document"] > before
     if nested is None:
         return None, False
     with _open(iwork_iwa.read_member(pkg, nested)) as inner:
@@ -96,7 +101,8 @@ def _iwa(pkg, names: list, nested: str | None, prefix: str, app: str, ctx) -> tu
             ctx.skipped["document"] += deeper  # an Index.zip inside the index is never opened
         names = [n for n in inner.names if n.lower().endswith(".iwa")]
         store = iwork_iwa.load(_members(inner, names, ctx), ctx, budget, pkg, prefix=prefix)
-    return iwork_iwa.walk(store, app, ctx), store.failed > 0
+    doc = iwork_iwa.walk(store, app, ctx)
+    return doc, store.failed > 0 or ctx.skipped["document"] > before
 
 
 def _preview(pkg, prefix: str, doc: Doc | None, failure: ReadError | None, counted: bool, ctx) -> Doc:
@@ -130,6 +136,7 @@ def _read(pkg, ctx, app: str) -> Doc:
     nested = None if index or iwas else _nested(pkg)
     prefix = nested[:-len(NESTED)] if nested else ""
     doc, failure, counted = None, None, False
+    lost = sum(ctx.skipped.values())
     try:
         if index:
             doc = _xml(pkg, index, app, ctx)
@@ -141,6 +148,8 @@ def _read(pkg, ctx, app: str) -> Doc:
         failure = e
     if doc is not None and doc.blocks:
         return doc
+    if doc is not None and not index and sum(ctx.skipped.values()) == lost:
+        return doc  # a blank IWA document: its walk read everything and lost nothing, so no preview stands in
     return _preview(pkg, prefix, doc, failure, counted, ctx)
 
 

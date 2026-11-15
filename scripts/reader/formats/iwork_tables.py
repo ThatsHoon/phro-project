@@ -42,6 +42,7 @@ Charts (`chart_block`) are ported from docling `docling/backend/iwork/charts.py`
 a grid past CHART_CELLS is read in part and counted `chart_cut` (docling drops its data), a series without a name is
 "Series N" as in the other formats' charts, and a non-style archive is read once a document by id.
 """
+import collections
 import math
 import struct
 from decimal import Decimal
@@ -93,7 +94,8 @@ _LOST = object()  # a cell's string or rich key that its list does not hold
 
 
 class _Cut(dict):
-    """A value list read only up to TABLE_SEGMENTS: a key it lacks is already counted `cells`."""
+    """A value list read only in part (up to TABLE_SEGMENTS, or past a broken segment or entry): a key it lacks is
+    already counted, `cells` or `record`, once for the list."""
 
 
 def _str(v) -> str | None:
@@ -298,7 +300,8 @@ class _Reader:
 
     def values(self, ds: dict, field: int, kind: str) -> dict:
         """key -> value of the TableDataList data-store field `field` names, segments followed (at most
-        TABLE_SEGMENTS, each once; past it the rest unread, counted `cells` once). Missing: {}."""
+        TABLE_SEGMENTS, each once; past it the rest unread, counted `cells` once). A segment or entry that cannot be
+        read counts `record` once, and the list is then a `_Cut`, so its cells are not counted again. Missing: {}."""
         lid = ref(ds, field)
         if lid is None:
             return {}
@@ -321,11 +324,12 @@ class _Reader:
                 f = self.store.get(s, SEGMENT)
             except ValueError:
                 self.ctx.skipped["record"] += 1
+                cut = True  # the keys it held are counted here, not again at each cell
                 continue
             if f:
                 parts.append(f)
         decode = getattr(self, "_" + kind)
-        out = _Cut() if cut else {}
+        found: dict = {}
         for f in parts:
             for e in f.get(3, []):
                 if not isinstance(e, memoryview):
@@ -335,10 +339,11 @@ class _Reader:
                     key, value = pbwire.one(ef, 1), decode(ef)
                 except ValueError:
                     self.ctx.skipped["record"] += 1
+                    cut = True
                     continue
                 if isinstance(key, int) and value is not None:
-                    out[key] = value
-        return out
+                    found[key] = value
+        return _Cut(found) if cut else found
 
     @staticmethod
     def _string(ef):
@@ -381,19 +386,20 @@ class _Reader:
             self.ctx.skipped["record"] += 1
             return None
 
-    def pictures(self, data_ids) -> list:
-        """An Image for each data id a cell fill names, in the order the cells first name them, each read once a
-        table through `Store.data` (charged against IMAGE_BYTES; a missing or unreadable member counts `image` there,
-        an empty one here)."""
+    def pictures(self, filled: dict) -> list:
+        """An Image for each data id a cell fill names (`filled`: data id -> whether only hidden cells name it), in the
+        order the cells first name them, each read once a table through `Store.data` (charged against IMAGE_BYTES; a
+        missing or unreadable member counts `image` there, an empty one here). One only hidden rows or columns name is
+        `hidden="hidden"`, as its cells are: left out and counted by default, shown by --hidden."""
         out = []
-        for d in data_ids:
+        for d, hidden in filled.items():
             raw = self.store.data(d)
             if raw is None:
                 continue
             if not raw:
                 self.ctx.skipped["image"] += 1
                 continue
-            out.append(Image(raw))
+            out.append(Image(raw, hidden="hidden" if hidden else ""))
         return out
 
     @staticmethod
@@ -513,7 +519,7 @@ class _Reader:
                 self.cache[("style_broken", ref(ds, 5))] = True
                 self.ctx.skipped["record"] += 1
         marks: dict = {}
-        filled: dict = {}  # data id -> None, in the order the cells first name it
+        filled: dict = {}  # data id -> whether only hidden cells name it, in the order the cells first name it
         self._cells(grid, entries, size, (strings, rich, comments, formats, fills), marks, filled)
         self._place(grid, marks)
         out = grid.blocks()
@@ -543,7 +549,8 @@ class _Reader:
 
     def _cells(self, grid, entries, size, lists, marks, filled):
         """Each cell's value into the grid; its comment storage into `marks` and the data id of the picture its style
-        fills it with into `filled` (a dict used as an ordered set)."""
+        fills it with into `filled` (an ordered dict: data id -> True while only cells in hidden rows or columns name
+        it)."""
         store, cap = self.store, limits.SHEET_SCAN
         fills = lists[-1]
         codes: dict = {}
@@ -571,8 +578,8 @@ class _Reader:
                         marks.setdefault((row, col), []).append(comment)
                     if style is not None and fills:
                         data = fills.get(style)
-                        if data is not None:
-                            filled[data] = None
+                        if data is not None and filled.get(data, True):
+                            filled[data] = row in grid.rows_h or col in grid.cols_h
                     if value and not grid.put(row, col, value):
                         return  # the grid is cut
                 if over:  # a cell past SHEET_COLS, as Grid.put would stop on it
@@ -772,7 +779,15 @@ def _chart_title(store, nid, ctx) -> str:
     return store.cache[key]
 
 
-def _chart(store, chart_id, ctx) -> Table:
+class _Tally:
+    """What one chart would count (`skipped`), added to the document's counts only once the chart is placed, so a
+    chart CHART_TOTAL leaves out counts `chart` alone."""
+
+    def __init__(self):
+        self.skipped = collections.Counter()
+
+
+def _chart(store, chart_id, ctx, tally) -> Table:
     d = store.get(chart_id, CHART_DRAWABLE)
     if d is None or CHART_EXTENSION not in d:
         raise ValueError("no ChartArchive")
@@ -824,10 +839,10 @@ def _chart(store, chart_id, ctx) -> Table:
     if not series:
         raise ValueError("a chart with no values")
     if bad:  # the chart is shown without those rows: counted once (a chart with no values counted only that)
-        ctx.skipped["chart"] += 1
+        tally.skipped["chart"] += 1
     # by row a cut row list drops series and a cut row drops points; by column the other way round
     series_cut = len(series) < n_series or (rows_cut if by_row else values_cut)
-    return series_table(caption, cats, series, series_cut, values_cut if by_row else rows_cut, ctx)
+    return series_table(caption, cats, series, series_cut, values_cut if by_row else rows_cut, tally)
 
 
 def chart_block(store, chart_id: int, ctx) -> Table | None:
@@ -838,14 +853,16 @@ def chart_block(store, chart_id: int, ctx) -> Table | None:
     grid read only in part, or cut to CHART_CELLS, counts `chart_cut` once (in series_table), its caption naming
     the points or series cut. A chart that cannot be read or holds no values counts `chart`, as does one with a grid
     row that is not a message (once, the rest shown) and one that would take the document past CHART_TOTAL table
-    cells (each placement charged, as in the other formats)."""
-    table = None
+    cells (each placement charged, as in the other formats). One chart counts once: a chart left out by CHART_TOTAL
+    counts `chart` only, not also its bad row or its cut (`_Tally`)."""
+    table, tally = None, _Tally()
     with ctx.guard("chart"):
-        table = _chart(store, chart_id, ctx)
+        table = _chart(store, chart_id, ctx, tally)
     if table is None:
         return None
     store.chart_cells += sum(len(r) for r in table.rows)
     if store.chart_cells > limits.CHART_TOTAL:
         ctx.skipped["chart"] += 1
         return None
+    ctx.skipped.update(tally.skipped)
     return table

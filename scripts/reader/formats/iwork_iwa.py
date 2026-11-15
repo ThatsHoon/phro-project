@@ -51,6 +51,7 @@ CHART = iwork_tables.CHART_DRAWABLE  # TSCH.ChartDrawableArchive
 # KN.DocumentArchive, ShowArchive, SlideNodeArchive, SlideArchive, PlaceholderArchive, NoteArchive (keynote-parser)
 KN_DOCUMENT, KN_SHOW, KN_NODE, KN_SLIDE, KN_PLACEHOLDER, KN_NOTE = 1, 2, 4, 5, 7, 15
 DRAWABLES = {SHAPE, EQUATION, IMAGE, GROUP, TABLE, CHART}  # kinds drawable_blocks enters (+6007 Pages, +7 Keynote)
+HEAD_LOST = {IMAGE: "image", TABLE: "table", PAGES_TABLE: "table", CHART: "chart"}  # in a header: counted, not read
 MAX_TITLE = 200             # characters of a slide title (as ooxml_slides)
 NUMBERS_DOCUMENT, NUMBERS_SHEET, COMMENT_INFO = 1, 2, 2014  # TN.DocumentArchive, TN.SheetArchive, TSWP.CommentInfo
 IMAGE_DATA = (15, 13, 11, 12)  # TSD.ImageArchive renditions: adjusted, original, placed, thumbnail (docling)
@@ -316,7 +317,9 @@ def drawable_blocks(store: Store, id: int, ctx, text, app: str) -> list:
     its children (2) in order, a table (6000, and 6007 when `app` is pages) through `iwork_tables.table_blocks`, a
     chart (5021) through `iwork_tables.chart_block`, and in Keynote a placeholder (7) the storage of its ShapeInfo
     super (1). An equation (2015) counts `object`. Other kinds are skipped uncounted (decision 10). An id of a kind
-    not entered is never marked visited for a later walk. Each drawable is read under `ctx.guard` of what it loses."""
+    not entered is never marked visited for a later walk. Each drawable is read under `ctx.guard` of what it loses.
+    Inside a header or footer (`TextReader.in_head`), which shows lines only, a picture, table or chart is counted
+    (`HEAD_LOST`) and never read, as iWork '09 counts them; a text box's text stays a line."""
     kinds = DRAWABLES | {PAGES_TABLE} if app == "pages" else DRAWABLES | {KN_PLACEHOLDER} if app == "key" else DRAWABLES
 
     def drawables(ids):
@@ -325,7 +328,9 @@ def drawable_blocks(store: Store, id: int, ctx, text, app: str) -> list:
     def visit(i, depth):
         kind = store.objects.get(i, (None,))[0]
         out = None
-        if kind == IMAGE:
+        if text.in_head and kind in HEAD_LOST:  # a header shows lines only: counted by its kind, never read
+            store._count(HEAD_LOST[kind])
+        elif kind == IMAGE:
             with ctx.guard("image"):
                 out = _image(store, i)
         elif kind in (SHAPE, KN_PLACEHOLDER):
@@ -401,17 +406,21 @@ def _furniture(store: Store, body_fields: dict, text, doc: Doc, ctx):
 def _pages(store: Store, ctx) -> Doc | None:
     """TP.DocumentArchive (10000, the lowest id when there are several): field 4 the body storage, the headers and
     footers, then field 20's floating drawables, placed after the body in their container's order. A body that
-    fails counts `document` (once: `store.failed` tells the preview fallback) and the rest of the page is still
-    read. None without the root."""
+    fails or is not named counts `document` (once: `store.failed` tells the preview fallback) and the rest of the
+    page is still read. None without the root."""
     root = min((i for i, (t, _) in store.objects.items() if t == PAGES_DOCUMENT), default=None)
     if root is None:
         return None
     f = store.get(root, PAGES_DOCUMENT)
     doc = Doc()
-    text = iwork_text.TextReader(store, ctx, doc.notes, lambda d: drawable_blocks(store, d, ctx, text, "pages"))
+    text = iwork_text.TextReader(store, ctx, doc.notes, lambda d: drawable_blocks(store, d, ctx, text, "pages"),
+                                 headings=True)
     body = iwork_text.ref(f, 4)
     body_fields = None
-    if body is not None:
+    if body is None:  # no body storage named: lost, not blank (counted once, as a body that fails)
+        ctx.skipped["document"] += 1
+        store.failed += 1
+    else:
         failed = True
         with ctx.guard("document"):
             doc.blocks = text.blocks(body)
@@ -643,7 +652,8 @@ def walk(store: Store, app: str, ctx) -> Doc | None:
     """The document from `WALKS[app]`, else from the other two apps' walks in turn (a renamed file still reads);
     None when no walk finds its root. A walk that raises (a ReadError excepted) counts `document` under
     `ctx.guard`, adds one to `store.failed`, and the next app is tried. Each walk starts with an empty visited set,
-    an empty `store.cache` and no chart cells spent against CHART_TOTAL."""
+    an empty `store.cache`, no chart cells spent against CHART_TOTAL, and a fresh table budget, cell scan and
+    picture byte count, so a failed app's spend never reduces the next app's."""
     for name in (app,) + tuple(a for a in APPS if a != app):
         fn = WALKS.get(name)
         if fn is None:
@@ -652,6 +662,9 @@ def walk(store: Store, app: str, ctx) -> Doc | None:
         store._path.clear()
         store.cache.clear()  # each app reads with its own caches and its own CHART_TOTAL
         store.chart_cells = 0
+        store.budget = sheet_grid.Budget()
+        store.scan = 0
+        store.image_bytes = 0
         doc, failed = None, True
         with ctx.guard("document"):
             doc = fn(store, ctx)
