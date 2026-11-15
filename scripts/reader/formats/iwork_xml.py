@@ -21,37 +21,43 @@ theme's language, so its placeholders say what a paragraph is, as in docling); b
 (`sf:liststyle-ref` or an inline style), the rung `sf:list-level` (0 is body text) picking the ladder's
 `sf:list-label-typeinfo` (`none` plain, a numbering `sf:text-label` type "1.", any other "-"); `sf:media` and
 `sf:image` give `Image` from the first `sf:data` (`sf:path` or `path`) whose member is in the package, an `-ref`
-inside searched REF_DEPTH levels into its target, once by id; `sf:ghost-text` and `sf:ghost-text-ref` are the
-template's placeholder text
-and are dropped uncounted. A table (`sf:tabular-info`, `sf:tabular-model`) is not read here: it counts `table`
-(Task 16 reads '09 tables), its cells never reach the body, and a footnote its cells mark keeps its place in the
-pairing below, kept as an unmarked note.
+inside searched REF_DEPTH levels into its target, once by id (REF_DEPTH and MAX_RUNG are local lookup bounds, not
+Limits caps); `sf:ghost-text` and `sf:ghost-text-ref` are the template's placeholder text and are dropped uncounted.
+A table (`sf:tabular-info`, `sf:tabular-model`) is not read here: it counts `table` (Task 16 reads '09 tables), its
+cells never reach the body, and a footnote its cells mark keeps its place in the pairing below, kept as an unmarked
+note.
 
 Pages (`sl:document`): the body is the document outside `sf:header`, `sf:footer`, `sf:footnotes`, `sf:annotations`
-and `sl:section-prototypes` (the templates of new sections, like ghost text), in document order, then the
-floating drawables of `sl:drawables` in their container's order (Defaults "Pages styles"; one that fails counts
-`shape`), then the attachments no `sf:attachment-ref` placed (one that fails counts `object`). An
-`sf:attachment-ref` places its attachment after its paragraph, once; any other
-`-ref` (a text box chain's shape ref, say) is never followed, so nothing is read twice. Footnotes: the paragraphs
-of `sf:footnotes` split at each `sf:footnote-mark` and after each `sf:footnotebr`, paired in order with the body's
-`sf:footnote` marks (`[^n]`); a mark past the last footnote counts `note`, and a footnote no mark names is kept as
-an unmarked note. Comments: an `sf:annotation` names the `sf:annotation-field` it comments by `sf:target`; its
-paragraphs become a "Comment: …" note (`word_fields.comment_note`; '09 records no author), marked where the field
-ends and read once a document, so a field repeated gives the same mark; one no field names is kept unmarked.
-Headers and footers (every page variant; the renderer drops repeats) are one line a paragraph; a note mark there,
-in a footnote or in a comment counts `note` and adds no note. A body that cannot be read counts `document` and the
-rest of the page is still read.
+and `sl:section-prototypes` (the templates of new sections, like ghost text), in document order, then the floating
+drawables of `sl:drawables` in their container's order (Defaults "Pages styles"), each under a guard of its own
+(`image`, `table` or `shape`, as `iwork_iwa` guards an IWA drawable), then the attachments no `sf:attachment-ref`
+placed (one that fails counts `object`). An `sf:attachment-ref` places its attachment after its paragraph, once; any
+other `-ref` (a text box chain's shape ref, say) is never followed, so nothing is read twice. Footnotes: the text of
+`sf:footnotes` is split at each `sf:footnote-mark` and after each `sf:footnotebr`, inside a paragraph too (a storage
+with no marks opens a footnote at its next content), and paired in order with the body's `sf:footnote` marks
+(`[^n]`); a mark in an unread table takes its footnote too, kept unmarked; a mark past the last footnote counts
+`note`, and a footnote no mark names is kept as an unmarked note. Comments: an `sf:annotation` names the
+`sf:annotation-field` it comments by `sf:target`; its paragraphs become a "Comment: …" note
+(`word_fields.comment_note`; '09 records no author), marked where the field ends and read once a document, so a
+field repeated gives the same mark; one no field names is kept unmarked. Headers and footers (every page variant;
+the renderer drops repeats) are one line a paragraph, their pictures counted `image` and never read; a note mark
+there, in a footnote or in a comment counts `note` and adds no note. A body that cannot be read counts `document`
+and the rest of the page is still read. Tracked changes are not read: no public source names the '09 change elements
+(docling and libetonyek's token tables name none; Apple's iWork Programming Guide dates from 2005, before Pages
+tracked changes), so a tracked deletion shows as body text.
 
 Keynote (`key:presentation`): each `key:slide` of `key:slide-list`, under `ctx.guard("slide")` (a failed slide
 counts `slide` and keeps its number), is `Section("slide", title, number=n)`: the title placeholder gives the title
 (MAX_TITLE characters; a picture in it goes to the body, and the notes its marks name to the comments), then the
-body placeholder, then the drawables of `key:page` (the master's layer proxy is not followed, nor the placeholder
-refs), then `key:notes` as `Section.notes`; sticky notes, on the page or in `key:sticky-notes`, are "Comment: …"
-lines in `Section.comments`. The theme's master slides are never read.
+body placeholder, then the drawables of `key:page`, each under its own guard as in Pages (the master's layer proxy
+is not followed, nor the placeholder refs), then `key:notes` as `Section.notes`; sticky notes, on the page or in
+`key:sticky-notes`, are "Comment: …" lines in `Section.comments`. A comment no field names is kept as an unmarked
+note, and an attachment no ref places counts `object`. The theme's master slides are never read.
 
 Every walk is iterative (an explicit stack, so a deep tree never reaches Python's recursion limit) and enters each
 element at most once, so the work is bounded by the element count, which `iwork.IWORK_XML` bounds. Pictures are
-charged against `limits.IMAGE_BYTES` per document, each placement; one missing or past it counts `image`.
+charged against `limits.IMAGE_BYTES` per document, each placement (a member is read once); one missing or past it
+counts `image`.
 
 Changes from docling: footnotes are paired with their marks rather than listed as furniture; comments are marked
 where they apply; floating drawables follow the body; templates are left out; a character style that does not set
@@ -85,14 +91,16 @@ MEDIA = frozenset({SF + "media", SF + "image"})
 DATA = SF + "data"
 TABLES = frozenset({SF + "tabular-info", SF + "tabular-model"})
 STICKY = frozenset({SF + "sticky-note", KEY + "sticky-note"})
+SHAPES = frozenset({SF + "drawable-shape", SF + "shape", SF + "group"})
 # drawables written inside a paragraph are placed after it, as an anchored attachment is
-INLINE_BLOCKS = MEDIA | TABLES | STICKY | {SF + "drawable-shape", SF + "shape", SF + "group"}
+INLINE_BLOCKS = MEDIA | TABLES | STICKY | SHAPES
 STYLESHEETS = frozenset({SL + "stylesheet", KEY + "stylesheet", SF + "stylesheet", SF + "styles", SF + "anon-styles"})
 PROTOTYPES, FLOATING = SL + "section-prototypes", SL + "drawables"
 PAGES_PRUNE = STYLESHEETS | {HEADER, FOOTER, FOOTNOTES, ANNOTATIONS, ANNOTATION, PROTOTYPES}
 SLIDE_LIST, SLIDE, PAGE, NOTES = KEY + "slide-list", KEY + "slide", KEY + "page", KEY + "notes"
 TITLE_PH, BODY_PH, STICKIES = KEY + "title-placeholder", KEY + "body-placeholder", KEY + "sticky-notes"
 KEY_PRUNE = STYLESHEETS | {SF + "proxy-master-layer", ANNOTATIONS, ANNOTATION}
+THEMES = KEY + "theme-list"  # the theme's master slides
 
 PARA_STYLE, CHAR_STYLE, LIST_STYLE = SF + "paragraphstyle", SF + "characterstyle", SF + "liststyle"
 ID, IDREF, IDENT, PARENT = SFA + "ID", SFA + "IDREF", SF + "ident", SF + "parent-ident"
@@ -101,10 +109,12 @@ LIST_ATTR, LEVEL_ATTR = SF + "list-style", SF + "list-level"
 PROPERTY_MAP, BOLD, LIST_PROPERTY, LIST_REF = SF + "property-map", SF + "bold", SF + "listStyle", SF + "liststyle-ref"
 LABEL_TYPES, TYPEINFO, TEXT_LABEL = SF + "listLabelTypes", SF + "list-label-typeinfo", SF + "text-label"
 BULLET_LABELS = frozenset({"bullet", "image", "string", "text"})  # text-label types that draw a mark (docling)
+# local lookup bounds, not caps of the Limits table: no content is cut by them (a rung past MAX_RUNG is body text;
+# a picture whose data sits deeper than REF_DEPTH in a ref's target counts `image`, as a missing one does)
 MAX_RUNG = 99  # list rungs read; a real ladder has nine
 REF_DEPTH = 3  # levels searched for picture data inside a ref's target
 
-_TEXT, _NOTE, _BREAK = 0, 1, 2  # paragraph segment kinds
+_TEXT, _NOTE, _BREAK, _MARK, _FNBR = 0, 1, 2, 3, 4  # paragraph segment kinds (a footnote's mark and its end)
 _OPEN, _TAIL, _CLOSE = 0, 1, 2  # paragraph walk steps
 
 
@@ -189,6 +199,7 @@ class Reader:
         self.loose: list = []                   # annotations in document order
         self._cache: dict = {}                  # (lookup, key) -> answer
         self._ref_paths: dict[str, str | None] = {}
+        self._raw: dict[str, bytes | None] = {}  # picture member -> its bytes, read once
         self._fn_blocks: list[list] = []        # the footnotes, in order
         self._fn_used = 0                       # body marks paired so far
         self._cm: dict[str, str | None] = {}    # annotation field id -> note id
@@ -197,6 +208,7 @@ class Reader:
         self.placed: set[int] = set()           # attachments an attachment-ref placed
         self.entered: set[int] = set()          # attachments walked
         self._noted = 0                         # > 0 while a header, footer, footnote, comment or slide note is read
+        self._furniture = False                 # a header or footer is read (lines only: pictures are counted)
         self._next = {"fn": 0, "cm": 0}
         self.defer: list | None = None          # Pages: the floating drawables, read after the body
         self.sink: list | None = None           # Keynote: the current slide's comments
@@ -236,7 +248,7 @@ class Reader:
                     body = False
                 elif tag == ATTACHMENT:
                     self.attachments.append(el)
-                elif tag == PROTOTYPES or tag in TABLES or tag in GHOST:
+                elif tag in (PROTOTYPES, THEMES) or tag in TABLES or tag in GHOST:
                     body = False
             stack.extend((c, body) for c in reversed(el))
 
@@ -498,9 +510,9 @@ class Reader:
         return None
 
     def _image(self, el, out: list):
-        """`Image` from a media element's data, within `limits.IMAGE_BYTES` a document (each placement charged); a
-        missing, unreadable or empty member, or one past the cap, counts `image`. A media element naming no data at
-        all is passed over."""
+        """`Image` from a media element's data, within `limits.IMAGE_BYTES` a document (each placement charged, each
+        member read once); a missing, unreadable or empty member, or one past the cap, counts `image`. A media element
+        naming no data at all is passed over."""
         path, named = self._data_path(el)
         if path is None:
             if named:
@@ -509,13 +521,14 @@ class Reader:
         if self.image_bytes + self.pkg.size(path) > limits.IMAGE_BYTES:
             self.ctx.skipped["image"] += 1
             return
-        try:
-            raw = iwork_iwa.read_member(self.pkg, path)
-        except ReadError as e:
-            if e.kind == "timeout":
-                raise
-            self.ctx.skipped["image"] += 1
-            return
+        if path not in self._raw:
+            try:
+                self._raw[path] = iwork_iwa.read_member(self.pkg, path)
+            except ReadError as e:
+                if e.kind == "timeout":
+                    raise
+                self._raw[path] = None
+        raw = self._raw[path]
         if not raw:
             self.ctx.skipped["image"] += 1
             return
@@ -530,35 +543,35 @@ class Reader:
         return []
 
     def _unread_marks(self, el):
-        """The footnote marks under `el`, which is not read: each takes its footnote in order, kept as an unmarked
-        note, so the marks after it still pair with their own footnotes."""
-        if self._noted:
-            return
+        """The footnote marks under `el`, which is not read: each takes its footnote in order as a body mark does
+        (`_footnote_ref`, counted the same way), kept as an unmarked note since nothing shows the mark, so the marks
+        after it still pair with their own footnotes."""
         for _ in el.iter(FOOTNOTE):
-            k = self._fn_used
-            if k >= len(self._fn_blocks):
-                return
-            self._fn_used += 1
-            if self._fn_blocks[k]:
-                self.notes[self._new("fn")] = self._fn_blocks[k]
+            self._footnote_ref()
 
     # ---- text
-    def _place(self, el, after: list):
+    def _place(self, el):
+        """The attachment an sf:attachment-ref names, the first time it is named, else None."""
         a = self.ids.get(el.get(IDREF) or "")
         if a is not None and a.tag == ATTACHMENT and id(a) not in self.placed:
             self.placed.add(id(a))
-            after.append(a)
+            return a
+        return None
 
     def _href(self, el) -> str | None:
         url = (_attr(el, "href") or "").strip()
         return url[:MAX_URL] if url.lower().startswith(LINK_SCHEMES) else None
 
-    def paragraph(self, p) -> tuple[object | None, list, bool, bool]:
-        """(the block of sf:p `p` or None, the elements to place after it, whether it holds a footnote mark, whether
-        it holds a footnote break). Walked with an explicit stack: a span's style is in force inside it, a child's
-        tail outside it."""
+    def paragraph(self, p) -> tuple[object | None, list]:
+        """(the block of sf:p `p` or None, the elements to place after it)."""
+        segs, after = self._segments(p)
+        return self._block(p, segs), [el for _, el in after]
+
+    def _segments(self, p) -> tuple[list, list]:
+        """(the segments of sf:p `p`, with a footnote's mark and its end as segments; the elements to place after
+        it, each with the number of segments before it). Walked with an explicit stack: a span's style is in force
+        inside it, a child's tail outside it."""
         segs, after = [], []
-        mark = brk = False
         stack = [(_OPEN, p, False, None)]
         while stack:
             op, el, bold, url = stack.pop()
@@ -580,21 +593,25 @@ class Reader:
                     if nid is not None:
                         segs.append((_NOTE, nid, False, None))
                     continue
-                if tag in BREAKS or tag == FOOTNOTEBR:
-                    brk = brk or tag == FOOTNOTEBR
+                if tag in BREAKS:
                     segs.append((_BREAK, None, bold, url))
                     continue
+                if tag == FOOTNOTEBR:
+                    segs.append((_FNBR, None, bold, url))
+                    continue
                 if tag == FOOTNOTE_MARK:
-                    mark = True
+                    segs.append((_MARK, None, False, None))
                     continue
                 if tag == TAB:
                     segs.append((_TEXT, "\t", bold, url))
                     continue
                 if tag == ATTACHMENT_REF:
-                    self._place(el, after)
+                    a = self._place(el)
+                    if a is not None:
+                        after.append((len(segs), a))
                     continue
                 if tag in INLINE_BLOCKS:
-                    after.append(el)
+                    after.append((len(segs), el))
                     continue
                 if _ref(el):
                     continue
@@ -611,16 +628,21 @@ class Reader:
             for c in reversed(el):
                 stack.append((_TAIL, c, bold, url))
                 stack.append((_OPEN, c, bold, url))
+        return segs, after
+
+    def _block(self, p, segs: list):
+        """The block of segments of sf:p `p` (all of them, or one footnote's part), None when no text is left."""
+        segs = [(_BREAK, None, s[2], s[3]) if s[0] == _FNBR else s for s in segs if s[0] != _MARK]
         inl = _inlines(segs)
         if not inl:
-            return None, after, mark, brk
+            return None
         lvl = self._heading(p.get(STYLE))
         if lvl:
-            return Heading(lvl, inl), after, mark, brk
+            return Heading(lvl, inl)
         item = self._list(p)
         if item:
-            return ListItem(item[0], item[1], inl), after, mark, brk
-        return Para(inl), after, mark, brk
+            return ListItem(item[0], item[1], inl)
+        return Para(inl)
 
     def walk(self, top, out: list | None = None, inside: bool = True) -> list:
         """The blocks of `top`'s children (with `inside`, else of `top` itself) in document order: paragraphs,
@@ -634,13 +656,18 @@ class Reader:
             if not isinstance(tag, str):
                 continue
             if tag == P:
-                block, after, _, _ = self.paragraph(el)
+                block, after = self.paragraph(el)
                 if block is not None:
                     out.append(block)
                 stack.extend(reversed(after))
                 continue
             if tag in MEDIA:
-                self._image(el, out)
+                if self._furniture:  # a header's picture is not shown: counted, never read
+                    path, named = self._data_path(el)
+                    if path or named:
+                        self.ctx.skipped["image"] += 1
+                else:
+                    self._image(el, out)
                 continue
             if tag in TABLES:
                 out.extend(self.table(el))
@@ -660,41 +687,92 @@ class Reader:
             stack.extend(reversed(el))
         return out
 
+    def _drawables(self, top, out: list):
+        """Each drawable under `top` (descending through its layers, page groups and other containers) read under
+        a guard of its own: `image` for a picture, `table` for a table, else `shape`; one that fails adds nothing."""
+        stack = list(reversed(top))
+        while stack:
+            el = stack.pop()
+            tag = el.tag
+            if not isinstance(tag, str) or tag in self.prune or tag in GHOST or tag == ATTACHMENTS or _ref(el):
+                continue
+            if tag in INLINE_BLOCKS or tag == P:
+                got = []
+                with self.ctx.guard("image" if tag in MEDIA else "table" if tag in TABLES else "shape"):
+                    self.walk(el, got, inside=False)
+                    out.extend(got)
+                continue
+            stack.extend(reversed(el))
+
+    def _leftovers(self):
+        """The footnotes no mark names and the comments no field names, kept as unmarked notes."""
+        for blocks in self._fn_blocks[self._fn_used:]:
+            if blocks:
+                self.notes[self._new("fn")] = blocks
+        for ann in self.loose:
+            if id(ann) not in self._used:
+                with self.ctx.guard("note"):
+                    blocks = self._comment_blocks(ann)
+                    if blocks:
+                        self.notes[self._new("cm")] = blocks
+
     # ---- Pages
     def _read_footnotes(self):
-        """The footnotes, in order: a paragraph with a footnote mark starts one, a footnote break ends one."""
+        """The footnotes, in order, from each sf:footnotes storage (`_footnote_storage`)."""
         self._noted += 1
         try:
             for el in self.footnotes:
                 with self.ctx.guard("note"):
-                    cur = None
-                    stack = list(reversed(el))
-                    while stack:
-                        node = stack.pop()
-                        tag = node.tag
-                        if not isinstance(tag, str) or tag in GHOST or tag == ATTACHMENTS or _ref(node):
-                            continue
-                        if tag in MEDIA or tag in TABLES or tag in STICKY:  # a drawable between paragraphs
-                            if cur is None:
-                                cur = []
-                                self._fn_blocks.append(cur)
-                            self.walk(node, cur, inside=False)
-                            continue
-                        if tag != P:
-                            stack.extend(reversed(node))
-                            continue
-                        block, after, mark, brk = self.paragraph(node)
-                        if cur is None or mark:
-                            cur = []
-                            self._fn_blocks.append(cur)
-                        if block is not None:
-                            cur.append(block)
-                        for a in after:
-                            self.walk(a, cur, inside=False)
-                        if brk:
-                            cur = None
+                    self._footnote_storage(el)
         finally:
             self._noted -= 1
+
+    def _footnote_storage(self, el):
+        """A footnote mark opens a footnote and a footnote break closes it, inside one paragraph too. In a storage
+        with no marks, content after a close (or at the start) opens one. Content outside a footnote joins the last
+        one, or the first one when it comes before it, so no blank or stray paragraph shifts the pairing."""
+        fns, marked = self._fn_blocks, next(el.iter(FOOTNOTE_MARK), None) is not None
+        cur, lead = None, []
+
+        def into() -> list:
+            nonlocal cur
+            if cur is None and not marked:
+                cur = []
+                fns.append(cur)
+            return cur if cur is not None else fns[-1] if fns else lead
+
+        stack = list(reversed(el))
+        while stack:
+            node = stack.pop()
+            tag = node.tag
+            if not isinstance(tag, str) or tag in GHOST or tag == ATTACHMENTS or _ref(node):
+                continue
+            if tag in MEDIA or tag in TABLES or tag in STICKY:  # a drawable between paragraphs
+                self.walk(node, into(), inside=False)
+                continue
+            if tag != P:
+                stack.extend(reversed(node))
+                continue
+            segs, after = self._segments(node)
+            start = k = 0
+            for i in [i for i, s in enumerate(segs) if s[0] in (_MARK, _FNBR)] + [len(segs)]:
+                end = i + 1 if i < len(segs) and segs[i][0] == _FNBR else i
+                block = self._block(node, segs[start:end])
+                if block is not None:
+                    into().append(block)
+                while k < len(after) and (i == len(segs) or after[k][0] <= end):
+                    self.walk(after[k][1], into(), inside=False)
+                    k += 1
+                if i == len(segs):
+                    break
+                if segs[i][0] == _MARK:
+                    cur, lead = (lead or []), []
+                    fns.append(cur)
+                else:
+                    cur = None
+                start = end
+        if lead:  # a storage whose only marks were never reached
+            fns.append(lead)
 
     def pages(self) -> Doc:
         doc = self.doc
@@ -709,25 +787,20 @@ class Reader:
             failure = e
         floating, self.defer = self.defer, None
         for el in floating:
-            with self.ctx.guard("shape"):
-                self.walk(el, doc.blocks)
+            self._drawables(el, doc.blocks)
         for a in self.attachments:  # the ones no attachment-ref placed, last
             if id(a) not in self.placed and id(a) not in self.entered:
                 with self.ctx.guard("object"):
                     self.walk(a, doc.blocks, inside=False)
-        for elements, lines in ((self.headers, doc.headers), (self.footers, doc.footers)):
-            for el in elements:
-                with self.ctx.guard("header" if lines is doc.headers else "footer"):
-                    lines.extend(plain(self._noted_walk(el)))
-        for blocks in self._fn_blocks[self._fn_used:]:  # footnotes no mark names: kept unmarked
-            if blocks:
-                self.notes[self._new("fn")] = blocks
-        for ann in self.loose:  # comments no field names: kept unmarked
-            if id(ann) not in self._used:
-                with self.ctx.guard("note"):
-                    blocks = self._comment_blocks(ann)
-                    if blocks:
-                        self.notes[self._new("cm")] = blocks
+        self._furniture = True
+        try:
+            for elements, lines in ((self.headers, doc.headers), (self.footers, doc.footers)):
+                for el in elements:
+                    with self.ctx.guard("header" if lines is doc.headers else "footer"):
+                        lines.extend(plain(self._noted_walk(el)))
+        finally:
+            self._furniture = False
+        self._leftovers()
         if failure is not None:
             if not doc.blocks:
                 raise ReadError("damaged", f"iWork '09 body: {type(failure).__name__}")
@@ -767,15 +840,13 @@ class Reader:
             for c in kids:
                 if c.tag == TITLE_PH:
                     self.walk(c, title)
-            body = []
+            sec.title = self._title(title, sec)  # before the body, so a field it shares with the title shows no mark
             for c in kids:
                 if c.tag == BODY_PH:
-                    self.walk(c, body)
-            sec.title = self._title(title, sec)
-            sec.blocks.extend(body)
+                    self.walk(c, sec.blocks)
             for c in kids:
                 if c.tag == PAGE:
-                    self.walk(c, sec.blocks)
+                    self._drawables(c, sec.blocks)
             for c in kids:
                 if c.tag == STICKIES:
                     for note in c:
@@ -799,6 +870,10 @@ class Reader:
                 number += 1
                 with self.ctx.guard("slide"):
                     self.doc.blocks.append(self._slide(slide, number))
+        self._leftovers()
+        for a in self.attachments:  # no ref placed it: a slide has no place for it
+            if id(a) not in self.placed and id(a) not in self.entered:
+                self.ctx.skipped["object"] += 1
         return self.doc
 
 

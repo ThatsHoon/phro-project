@@ -1729,6 +1729,127 @@ def test_09_pages_table_counted():
     assert ctx.skipped == {"table": 1}, ctx.skipped
 
 
+def _boom(data, app, method="paragraph", word="boom"):
+    """`_x` with Reader.`method` failing on an element whose text holds `word`."""
+    from reader.formats import iwork_xml
+    real = getattr(iwork_xml.Reader, method)
+
+    def broken(self, el, *a):
+        if word in "".join(el.itertext()):
+            raise ValueError("broken part")
+        return real(self, el, *a)
+
+    setattr(iwork_xml.Reader, method, broken)
+    try:
+        return _x(data, app)
+    finally:
+        setattr(iwork_xml.Reader, method, real)
+
+
+def test_09_drawables_guarded_one_by_one():
+    # each floating drawable is read under its own guard: the second of three failing keeps the first and third
+    boxes = "".join(f'<sf:drawable-shape>{_box(_p(w))}</sf:drawable-shape>' for w in ("one", "boom", "three"))
+    extra = f'<sl:drawables><sl:page-group sl:page="1">{boxes}</sl:page-group></sl:drawables>'
+    doc, ctx = _boom(pages09(_p("Body"), extra=extra), "pages")
+    assert doc.blocks == [Para([Text("Body")]), Para([Text("one")]), Para([Text("three")])], doc.blocks
+    assert ctx.skipped == {"shape": 1}, ctx.skipped
+    # a picture that fails counts `image`, by its kind
+    extra = (f'<sl:drawables><sl:page-group>{_media("boom.png")}<sf:drawable-shape>{_box(_p("after"))}'
+             '</sf:drawable-shape></sl:page-group></sl:drawables>')
+    doc, ctx = _boom(pages09(_p("Body"), extra=extra, files={"boom.png": PNG}), "pages", "_image", "")
+    assert doc.blocks == [Para([Text("Body")]), Para([Text("after")])], doc.blocks
+    assert ctx.skipped == {"image": 1}, ctx.skipped
+    # Keynote: one bad drawable loses itself, not the slide
+    shapes = "".join(f'<sf:shape>{_box(_p(w))}</sf:shape>' for w in ("one", "boom", "three"))
+    doc, ctx = _boom(keynote09(slide09(_p("T"), _p("B"), drawables=shapes)), "key")
+    assert [(s.title, s.blocks) for s in doc.blocks] == [
+        ("T", [Para([Text("B")]), Para([Text("one")]), Para([Text("three")])])], doc.blocks
+    assert ctx.skipped == {"shape": 1}, ctx.skipped
+
+
+def _reads(data):
+    """`_x`, and the picture members read through `iwork_iwa.read_member` (the index is read through it too)."""
+    from reader.formats import iwork_iwa
+    real, calls = iwork_iwa.read_member, []
+
+    def spy(pkg, path):
+        if not path.startswith("index"):
+            calls.append(path)
+        return real(pkg, path)
+
+    iwork_iwa.read_member = spy
+    try:
+        return _x(data) + (calls,)
+    finally:
+        iwork_iwa.read_member = real
+
+
+def test_09_header_picture_counted():
+    # a header shows lines only: its picture counts `image`, and is not read
+    doc, ctx, calls = _reads(pages09(_p("Body"), header=_media("logo.png") + _p("Head"), footer=_media("logo.png"),
+                                     files={"logo.png": PNG}))
+    assert doc.headers == ["Head"] and ctx.skipped == {"image": 2} and not calls, (doc.headers, ctx.skipped, calls)
+
+
+def test_09_picture_read_once_per_member():
+    # three placements of one member: read once, each placement still charged
+    doc, ctx, calls = _reads(pages09(_p("x") + _media("a.png") * 3, files={"a.png": PNG}))
+    assert doc.blocks == [Para([Text("x")])] + [Image(PNG)] * 3 and calls == ["a.png"], (doc.blocks, calls)
+
+
+def test_09_keynote_loose_parts():
+    # Keynote keeps a comment no field names as an unmarked note, and counts an attachment no ref places; the
+    # theme's masters hold neither
+    loose = ('<sf:annotations><sf:annotation sf:target="nowhere"><sf:text-storage><sf:text-body>' + _p("Loose")
+             + '</sf:text-body></sf:text-storage></sf:annotation></sf:annotations>')
+    unplaced = '<sf:attachments><sf:attachment sfa:ID="a9">' + _media("p.png") + '</sf:attachment></sf:attachments>'
+    master = ('<key:master-slide><key:page><sf:layers><sf:layer><sf:drawables>' + loose.replace("Loose", "MASTER")
+              + unplaced.replace("a9", "m9") + '</sf:drawables></sf:layer></sf:layers></key:page></key:master-slide>')
+    doc, ctx = _x(keynote09(slide09(_p("T"), _p("B"), drawables=loose + unplaced), masters=master,
+                            files={"p.png": PNG}), "key")
+    assert list(doc.notes.values()) == [[Para([Text("Comment: "), Text("Loose")])]], doc.notes
+    assert ctx.skipped == {"object": 1}, ctx.skipped
+
+
+def test_09_footnote_split_at_marks():
+    # a leading blank paragraph opens no footnote, and two footnotes in one paragraph are split at the mark
+    body = _p('a<sf:footnote/> b<sf:footnote/> c<sf:footnote/>')
+    notes = ('<sf:p><sf:br/></sf:p><sf:p><sf:footnote-mark sf:mark="1"/>One<sf:footnotebr/>'
+             '<sf:span><sf:footnote-mark sf:mark="2"/></sf:span>Two<sf:footnotebr/></sf:p>'
+             '<sf:p><sf:footnote-mark sf:mark="3"/>Three</sf:p>')
+    doc, ctx = _x(pages09(body, footnotes=notes))
+    assert doc.notes == {"fn-1": [Para([Text("One")])], "fn-2": [Para([Text("Two")])],
+                         "fn-3": [Para([Text("Three")])]}, doc.notes
+    assert not ctx.skipped, ctx.skipped
+    # a storage with no marks: a content paragraph opens a footnote, a footnote break ends it
+    notes = '<sf:p><sf:br/></sf:p><sf:p>Alpha</sf:p><sf:p>Beta<sf:footnotebr/></sf:p><sf:p>Gamma</sf:p>'
+    doc, ctx = _x(pages09(_p('a<sf:footnote/> b<sf:footnote/>'), footnotes=notes))
+    assert doc.notes == {"fn-1": [Para([Text("Alpha")]), Para([Text("Beta")])], "fn-2": [Para([Text("Gamma")])]}, \
+        doc.notes
+
+
+def test_09_keynote_title_field_shared_with_body():
+    # a body field with the title field's id: the note moved to the comments, and the body shows no mark
+    extra = ('<sf:annotations><sf:annotation sf:target="t1"><sf:text-storage><sf:text-body>' + _p("on the title")
+             + '</sf:text-body></sf:text-storage></sf:annotation></sf:annotations>')
+    title = _p('Head <sf:annotation-field sfa:ID="t1">line</sf:annotation-field>')
+    body = _p('<sf:annotation-field sfa:ID="t1">again</sf:annotation-field>')
+    doc, ctx = _x(keynote09(slide09(title, body, drawables=extra)), "key")
+    s = doc.blocks[0]
+    assert s.blocks == [Para([Text("again")])] and not doc.notes, (s.blocks, doc.notes)
+    assert s.comments == [Para([Text("Comment: "), Text("on the title")])], s.comments
+
+
+def test_09_unread_marks_counted():
+    # a mark in an unread table past the last footnote counts `note`, as a body mark does; so does one in a header
+    in_cell = ('<sf:tabular-info><sf:tabular-model>' + _p('c<sf:footnote/> d<sf:footnote/>')
+               + '</sf:tabular-model></sf:tabular-info>')
+    doc, ctx = _x(pages09(_p("Body") + in_cell, footnotes='<sf:p><sf:footnote-mark sf:mark="1"/>n1</sf:p>'))
+    assert ctx.skipped == {"table": 1, "note": 1}, ctx.skipped
+    doc, ctx = _x(pages09(_p("Body"), header=in_cell + _p("Head")))
+    assert doc.headers == ["Head"] and ctx.skipped == {"table": 1, "note": 2}, ctx.skipped
+
+
 def test_09_gz_index():
     doc, ctx = _x(pages09(_p("Zipped body"), gz=True))
     assert doc.blocks == [Para([Text("Zipped body")])] and not ctx.skipped, (doc.blocks, ctx.skipped)
