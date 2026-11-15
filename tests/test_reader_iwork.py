@@ -14,10 +14,11 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from iwork_fix import (SECTION, archive, attachment, author, cell_v4, cell_v5, change, chunk, comment,  # noqa: E402
-                       data_list, decimal128_bytes, fmt, footnote, group, highlight, image, iwa_member, iwork_zip, link,
-                       list_style, metadata_iwa, numbers_doc, pages_doc, pb, pb_ref, segment, shape, snappy_copy,
-                       snappy_literal, sticky, storage, string_entry, style, table, tile)
+from iwork_fix import (SECTION, archive, attachment, author, cell_v4, cell_v5, change, chart, chunk,  # noqa: E402
+                       comment, data_list, decimal128_bytes, fmt, footnote, group, highlight, image, iwa_member,
+                       iwork_zip, keynote_doc, link, list_style, metadata_iwa, numbers_doc, pages_doc, pb, pb_ref,
+                       segment, shape, slide_ids, snappy_copy, snappy_literal, sticky, storage, string_entry, style,
+                       table, tile)
 from reader import markdown  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.containers import flate, pbwire, snappy  # noqa: E402
@@ -496,7 +497,7 @@ def test_app_by_extension():
     finally:
         iwork_iwa.WALKS.clear()
         iwork_iwa.WALKS.update(old)
-    assert set(iwork_iwa.WALKS) == {"pages", "numbers"}
+    assert set(iwork_iwa.WALKS) == {"pages", "numbers", "key"}
 
 
 # -- Pages text storages and the Pages walk
@@ -1083,7 +1084,7 @@ def test_numbers_sheets():
     md = _md(doc, ctx)
     assert "## Sheet: A" in md and "## Sheet: B" in md and "alpha" in md and "beta" in md and "box text" in md, md
     assert "> Comment: remember" in md and "> Comment: ok" in md, md
-    assert not ctx.skipped, ctx.skipped  # the chart (Task 14) is passed over uncounted
+    assert ctx.skipped == {"chart": 1}, ctx.skipped  # the chart holds no ChartArchive (extension 10000)
 
 
 def test_numbers_sheet_and_table_failures():
@@ -1307,6 +1308,172 @@ def test_v5_key_missing_from_list():
     assert ctx.skipped == {"record": 4}, ctx.skipped
     doc, ctx = _numbers(*table("T", 1, 1, tiles={0: tile({0: [cell_v4(3, string_id=9)]})}, strings=[(1, "a")]))
     assert not ctx.skipped, ctx.skipped
+
+
+# -- charts and the Keynote walk (Task 14)
+
+def _cells(t: Table) -> list[list[str]]:
+    return [[_flat(c.blocks[0].inlines) if c.blocks else "" for c in row] for row in t.rows]
+
+
+def test_chart_table_caption():
+    # by column (the default): a series a column, the row names are the categories; a missing number stays empty
+    doc, ctx = _numbers(*chart(1, ["r1", "r2"], ["A", "B"], [[1, 2], [3.5, None]], "Sales"), sheets=[("S", [500])])
+    [t] = _tables(doc)
+    assert t.caption.startswith("Chart: ") and t.caption == "Chart: column — Sales", t.caption
+    assert _cells(t) == [["", "A", "B"], ["r1", "1", "2"], ["r2", "3.5", ""]], _cells(t)
+    assert not ctx.skipped, ctx.skipped
+    # by row: a series a row; a title the chart does not show is left out; the kind follows docling's table
+    doc, ctx = _numbers(*chart(7, ["r1"], ["A", "B"], [[1, 2]], "Hidden", by_row=True, show_title=False),
+                        sheets=[("S", [500])])
+    [t] = _tables(doc)
+    assert t.caption == "Chart: bar" and _cells(t) == [["", "r1"], ["A", "1"], ["B", "2"]], (t.caption, _cells(t))
+    # an unknown kind is "other"; a series with no name is named by its place
+    doc, ctx = _numbers(*chart(99, [], [], [[4]], None), sheets=[("S", [500])])
+    [t] = _tables(doc)
+    assert t.caption == "Chart: other" and _cells(t) == [["", "Series 1"], ["", "4"]], (t.caption, _cells(t))
+    # a chart that cannot be read counts `chart`, once
+    doc, ctx = _numbers(archive(500, 5021, b"\x0a\x05ab"), sheets=[("S", [500])])
+    assert not _tables(doc) and ctx.skipped == {"chart": 1}, ctx.skipped
+
+
+def test_chart_cut():
+    rows = [[i, i + 0.5] for i in range(10)]
+    with _limit(limits, "CHART_CELLS", 6):
+        doc, ctx = _numbers(*chart(1, [f"r{i}" for i in range(10)], ["A", "B"], rows, "T"), sheets=[("S", [500])])
+    [t] = _tables(doc)
+    # four rows read (more than 6 values stops the grid); series_table keeps what 6 cells hold
+    assert t.caption == "Chart: column — T (first 2 points, first 1 series)", t.caption
+    assert _cells(t) == [["", "A"], ["r0", "0"], ["r1", "1"]], _cells(t)
+    assert ctx.skipped == {"chart_cut": 1}, ctx.skipped
+    # past CHART_TOTAL a whole chart is left out, counted `chart`
+    with _limit(limits, "CHART_TOTAL", 8):
+        doc, ctx = _numbers(*chart(1, ["r"], ["A"], [[1]], None, id=500), *chart(1, ["r"], ["A"], [[1]], None, id=510),
+                            *chart(1, ["r"], ["A"], [[1]], None, id=520), sheets=[("S", [500, 510, 520])])
+    assert len(_tables(doc)) == 2 and ctx.skipped == {"chart": 1}, ctx.skipped
+
+
+def _keynote(slides, *archives, tree=None):
+    members = {"Index/Document.iwa": iwa_member(*keynote_doc(slides, tree), *archives)}
+    ctx = Context()
+    return iwork.parse_bytes(iwork_zip(members), ctx, "key"), ctx
+
+
+def _swap(archives, id, new) -> list:
+    """`archives` with the one whose ArchiveInfo identifier is `id` replaced by `new`."""
+    out = []
+    for a in archives:
+        n, pos = pbwire.varint(a, 0)
+        out.append(new if pbwire.one(pbwire.fields(a[pos:pos + n]), 1) == id else a)
+    assert out != list(archives)
+    return out
+
+
+def test_slides_title_body_order():
+    doc, ctx = _keynote([{"title": "T", "body": "Body text", "drawables": [900, 902, 500], "z_order": [902, 500, 900]},
+                         {"title": "U", "body": "Second"}],
+                        shape(900, 901), archive(901, 2001, storage("Drawn first")),
+                        shape(902, 903), archive(903, 2001, storage("Drawn second")),
+                        *chart(1, ["r"], ["A"], [[2]], "C"))
+    assert [(s.kind, s.title, s.number) for s in doc.blocks] == [("slide", "T", 1), ("slide", "U", 2)], doc.blocks
+    md = _md(doc, ctx)
+    order = ["## Slide 1: T", "Body text", "Drawn second", "Chart: column — C", "Drawn first", "## Slide 2: U",
+             "Second"]
+    at = [md.find(x) for x in order]
+    assert -1 not in at and at == sorted(at), (at, md)
+    assert md.count("T\n") == 1, md  # the title is the heading only, not body text too
+    assert not ctx.skipped, ctx.skipped
+    # without a z-order the owned drawables keep their stored order
+    doc, ctx = _keynote([{"title": "T", "drawables": [902, 900]}], shape(900, 901),
+                        archive(901, 2001, storage("Drawn first")), shape(902, 903),
+                        archive(903, 2001, storage("Second")))
+    md = _md(doc, ctx)
+    assert md.find("Second") < md.find("Drawn first"), md
+
+
+def test_skipped_slide():
+    doc, ctx = _keynote([{"title": "A", "body": "one"}, {"title": "S", "body": "skipped body", "skipped": True},
+                         {"title": "C", "body": "three"}])
+    assert [s.hidden for s in doc.blocks] == ["", "hidden", ""], doc.blocks
+    md = _md(doc, ctx)
+    assert "skipped body" not in md and "## Slide 2" not in md and "## Slide 3: C" in md, md
+    md = _md(doc, ctx, hidden=True)
+    assert "## Slide 2: S (hidden)" in md and "skipped body" in md, md
+
+
+def test_slide_notes():
+    doc, ctx = _keynote([{"title": "T", "notes": "Say this\nThen that"}])
+    assert [n.inlines[0].text for n in doc.blocks[0].notes] == ["Say this", "Then that"], doc.blocks[0].notes
+    md = _md(doc, ctx)
+    assert "> Notes: Say this\n> Then that" in md and not ctx.skipped, (md, ctx.skipped)
+
+
+def test_slide_comment_author():
+    # a comment placed on two slides goes out once, on the first
+    doc, ctx = _keynote([{"title": "T", "drawables": [950]}, {"title": "U", "drawables": [950]}],
+                        sticky(950, 951), comment(951, "Fix this", author=952, replies=[953]), author(952, "Ann"),
+                        comment(953, "Done", author=952))
+    assert not doc.notes and len(doc.blocks[0].comments) == 2 and not doc.blocks[1].comments, doc.blocks
+    md = _md(doc, ctx)
+    assert "> Comment by Ann: Fix this\n> Comment by Ann: Done" in md and md.count("Fix this") == 1, md
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_templates_not_walked():
+    doc, ctx = _keynote([{"title": "T", "body": "real", "template": "TEMPLATE ONLY"}])
+    md = _md(doc, ctx, hidden=True)
+    assert "real" in md and "TEMPLATE ONLY" not in md and len(doc.blocks) == 1, md
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_slide_tree_cycle():
+    # slide 2 is a child of slide 1 and names slide 1 as its child: the loop is cut, counted `depth` once
+    doc, ctx = _keynote([{"title": "A", "children": [1]}, {"title": "B", "children": [0]}], tree=[0])
+    assert [(s.title, s.number) for s in doc.blocks] == [("A", 1), ("B", 2)] and ctx.skipped == {"depth": 1}, (
+        doc.blocks, ctx.skipped)
+    # a node listed twice is read once, uncounted
+    doc, ctx = _keynote([{"title": "A"}, {"title": "B"}], tree=[0, 1, 0, 1])
+    assert [(s.title, s.number) for s in doc.blocks] == [("A", 1), ("B", 2)] and not ctx.skipped, ctx.skipped
+
+
+def test_slide_failures():
+    # a slide that is not a message counts `slide` and keeps its number; the other slides are read
+    slides = [{"title": "A"}, {"title": "B"}, {"title": "C", "body": "kept"}]
+    broken = _swap(keynote_doc(slides), slide_ids(1)["slide"], archive(slide_ids(1)["slide"], 5, b"\x0a\x05ab"))
+    ctx = Context()
+    doc = iwork.parse_bytes(iwork_zip({"Index/Document.iwa": iwa_member(*broken)}), ctx, "key")
+    assert [(s.title, s.number) for s in doc.blocks] == [("A", 1), ("C", 3)] and ctx.skipped == {"slide": 1}, (
+        doc.blocks, ctx.skipped)
+    # a title placeholder that is not a message counts `shape`; the body is still read
+    ids = slide_ids(0)
+    broken = _swap(keynote_doc([{"title": "A", "body": "kept"}]), ids["title"], archive(ids["title"], 7, b"\x0a\x05ab"))
+    ctx = Context()
+    doc = iwork.parse_bytes(iwork_zip({"Index/Document.iwa": iwa_member(*broken)}), ctx, "key")
+    assert doc.blocks[0].title == "" and "kept" in _md(doc, ctx) and ctx.skipped == {"shape": 1}, ctx.skipped
+    # a show with no slide node is not a Keynote document: the other walks are tried, then the preview fallback
+    members = {"Index/Document.iwa": iwa_member(archive(1, 1, pb((2, pb_ref(3)))), archive(3, 2, pb((1, "x"))))}
+    _raises(ReadError, iwork.parse_bytes, iwork_zip(members), Context(), "key")
+
+
+def test_keynote_linear():
+    # 2,000 slides sharing one big drawable and one chart title part of 50,000 fields, one z-order list of 200,000
+    # copies of one id: every shared part is read once
+    n, BIG = 2000, 9_000_000  # ids clear of the slides' own
+    big = archive(BIG + 1, 2001, storage("\n".join(f"line {i}" for i in range(20000))))
+    ns = archive(BIG + 2, 5023, pb((10000, pb((21, 1), *((23, "t") for _ in range(50000))))))
+    grid = pb((1, "r"), (2, "A"), (3, pb((1, pb((1, 1.0))))))
+    charts = [archive(10**7 + i, 5021, pb((10000, pb((1, 1), (7, grid), (10, pb_ref(BIG + 2)))))) for i in range(n)]
+    slides = [{"title": f"S{i}", "drawables": [BIG, 10**7 + i], "z_order": [BIG] * (200000 if i == 0 else 1)}
+              for i in range(n)]
+    data = iwork_zip({"Index/Document.iwa": iwa_member(*keynote_doc(slides), shape(BIG, BIG + 1), big, ns, *charts)})
+    ctx = Context()
+    t0 = time.perf_counter()
+    doc = iwork.parse_bytes(data, ctx, "key")
+    took = time.perf_counter() - t0
+    assert len(doc.blocks) == n and not ctx.skipped, ctx.skipped
+    assert sum(isinstance(b, Table) for s in doc.blocks for b in s.blocks) == n
+    assert doc.blocks[1].blocks[0].caption == "Chart: column — t", doc.blocks[1].blocks
+    assert took < 2, took
 
 
 def main():

@@ -27,12 +27,20 @@ format's Excel code (`format_code`, then `numfmt.display`), a date as the serial
 `[h]:mm:ss`, a bool TRUE or FALSE, a formula error `#ERROR`; a format type numbers-parser renders otherwise (fraction,
 scientific, base, rating, custom) shows the raw value. A cell comment becomes a footnote through the text reader's
 `comment_thread`.
+
+Charts (`chart_block`) are ported from docling `docling/backend/iwork/charts.py` (`iwa_chart`, `iwa_chart_grid`,
+`iwa_chart_title`, `CHART_TYPES`) at the same pin: `TSCH.ChartDrawableArchive` (5021) extension 10000 ->
+`ChartArchive` {1 type, 5 series direction, 7 grid, 10 -> 5023 title}, to `charts.series_table`. Changes from docling:
+a grid past CHART_CELLS is read in part and counted `chart_cut` (docling drops its data), a series without a name is
+"Series N" as in the other formats' charts, and a non-style archive is read once a document by id.
 """
+import math
 import struct
 from decimal import Decimal
 from functools import lru_cache
 
 from .. import limits
+from ..charts import series_table
 from ..containers import pbwire
 from ..model import Break, Cell, Hidden, NoteRef, Table
 from ..numfmt import MAX_CODE, display
@@ -654,3 +662,123 @@ def table_blocks(store, table_id: int, ctx, budget: sheet_grid.Budget, text, not
         for got in store.follow([model_id], lambda i, d: reader.read(i), store.depth):
             out.extend(got)
     return out
+
+
+# ---- charts (TSCH), from docling `charts.py`
+CHART_DRAWABLE, CHART_NON_STYLE = 5021, 5023  # TSCH.ChartDrawableArchive, TSCH.ChartNonStyleArchive
+CHART_EXTENSION = 10000  # the drawable's ChartArchive, and the non-style archive's property map
+SERIES_BY_ROW = 1        # TSCH.SeriesDirection: each grid row a series (else each column)
+MAX_CHART_TITLE = 200    # characters of a chart title in its caption
+# TSCH.ChartType -> the kind docling's CHART_TYPES gives it (3D read as the flat kind); any other value is "other"
+CHART_KINDS = {1: "column", 2: "bar", 3: "line", 4: "area", 5: "pie", 6: "column", 7: "bar", 8: "area", 9: "scatter",
+               10: "mixed", 11: "mixed", 12: "column", 13: "bar", 14: "line", 15: "area", 16: "pie", 17: "column",
+               18: "bar", 19: "area", 20: "column", 21: "bar", 22: "bubble", 23: "scatter", 24: "bubble",
+               25: "donut", 26: "donut", 27: "radar"}
+
+
+def _chart_value(v) -> str:
+    """A TSCH.GridValue's numeric_value (field 1, a double) as text; "" when it has none or it is not finite."""
+    if not isinstance(v, memoryview):
+        return ""
+    x = pbwire.one(pbwire.fields(v), 1)
+    if not isinstance(x, bytes) or len(x) != 8:
+        return ""
+    x = pbwire.f64(x)
+    if not math.isfinite(x):
+        return ""
+    return str(int(x)) if x == int(x) and abs(x) < 1e16 else repr(x)
+
+
+def _name(raw: list, i: int) -> str:
+    return (_str(raw[i]) or "").strip() if i < len(raw) else ""
+
+
+def _chart_title(store, nid, ctx) -> str:
+    """The title a TSCH.ChartNonStyleArchive (5023) shows: its property map (10000) field 23 when field 21 (show
+    title) is 1, else "". Read once a document by id; one that cannot be read counts `record` once."""
+    key = ("chart_title", nid)
+    if key not in store.cache:
+        title = ""
+        try:
+            f = store.get(nid, CHART_NON_STYLE)
+            if f is not None:
+                props = pbwire.msg(f, CHART_EXTENSION)
+                if pbwire.one(props, 21) == 1:
+                    title = " ".join((_str(pbwire.one(props, 23)) or "").split())[:MAX_CHART_TITLE]
+        except ValueError:
+            ctx.skipped["record"] += 1
+        store.cache[key] = title
+    return store.cache[key]
+
+
+def _chart(store, chart_id, ctx) -> Table:
+    d = store.get(chart_id, CHART_DRAWABLE)
+    if d is None or CHART_EXTENSION not in d:
+        raise ValueError("no ChartArchive")
+    c = pbwire.msg(d, CHART_EXTENSION)
+    kind = pbwire.one(c, 1)
+    kind = CHART_KINDS.get(kind, "other") if isinstance(kind, int) else "other"
+    by_row = pbwire.one(c, 5) == SERIES_BY_ROW
+    grid = pbwire.msg(c, 7)
+    row_names, col_names = grid.get(1, []), grid.get(2, [])
+    # whole rows are read until more than CHART_CELLS values are (an empty row counts one), as hwp_chart reads its
+    # grid; one row is read to CHART_CELLS values
+    rows, width, read, cut = [], 0, 0, False
+    for row in grid.get(3, []):
+        if read > limits.CHART_CELLS:
+            cut = True
+            break
+        if not isinstance(row, memoryview):
+            continue
+        values = pbwire.fields(row).get(1, [])
+        if len(values) > limits.CHART_CELLS:
+            values, cut = values[:limits.CHART_CELLS], True
+        rows.append([_chart_value(v) for v in values])
+        width = max(width, len(rows[-1]))
+        read += max(len(rows[-1]), 1)
+    nid = ref(c, 10)
+    title = _chart_title(store, nid, ctx) if nid is not None else ""
+    caption = f"Chart: {kind} — {title}" if title else f"Chart: {kind}"
+    # series are built only as far as series_table places them (GRID_COLS - 1 of them, points near CHART_CELLS)
+    if by_row:
+        n_series, names = len(rows), row_names
+        cats = [_name(col_names, i) for i in range(width)]
+
+        def column(s):
+            return rows[s] + [""] * (width - len(rows[s]))
+    else:
+        n_series, names = width, col_names
+        cats = [_name(row_names, r) for r in range(len(rows))]
+
+        def column(s):
+            return [row[s] if s < len(row) else "" for row in rows]
+    series, points = [], len(cats)
+    for s in range(min(n_series, limits.GRID_COLS)):
+        if points > limits.CHART_CELLS:
+            break
+        values = column(s)
+        series.append((_name(names, s) or f"Series {s + 1}", values))
+        points += len(values)
+    if not series:
+        raise ValueError("a chart with no values")
+    return series_table(caption, cats, series, len(series) < n_series or (cut and by_row), cut and not by_row, ctx)
+
+
+def chart_block(store, chart_id: int, ctx) -> Table | None:
+    """A chart drawable (TSCH.ChartDrawableArchive, 5021) as one Table through `charts.series_table`: extension
+    10000 is the ChartArchive {1 type, 5 series direction, 7 grid {1 row names, 2 column names, 3 rows {1 values
+    {1 numeric}}}, 10 -> 5023 title}, captioned `Chart: <type> — <title>` (the type as docling's table names it).
+    By column, the default, each column is a series over the row names; by row, each row over the column names. A
+    grid read only in part, or cut to CHART_CELLS, counts `chart_cut` once (in series_table). A chart that cannot be
+    read or holds no values counts `chart`, as does one that would take the document past CHART_TOTAL table cells
+    (each placement charged, as in the other formats)."""
+    table = None
+    with ctx.guard("chart"):
+        table = _chart(store, chart_id, ctx)
+    if table is None:
+        return None
+    store.chart_cells += sum(len(r) for r in table.rows)
+    if store.chart_cells > limits.CHART_TOTAL:
+        ctx.skipped["chart"] += 1
+        return None
+    return table

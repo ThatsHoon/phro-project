@@ -405,3 +405,77 @@ def numbers_doc(sheets) -> list[bytes]:
     for i, (name, drawables) in enumerate(sheets):
         out.append(archive(3 + i, 2, pb((1, name), *((2, pb_ref(d)) for d in drawables))))
     return out
+
+
+# -- charts and Keynote documents (Task 14)
+
+def chart(type, rows, cols, values, title=None, *, id=500, by_row=False, show_title=True) -> list[bytes]:
+    """A TSCH.ChartDrawableArchive (5021, id `id`) whose extension 10000 is a ChartArchive {1 type, 5 series
+    direction (1 by row, when `by_row`), 7 grid {1 row names, 2 column names, 3 rows {1 values {1 numeric}}}, 10 ->
+    5023 at id+1}. `values` holds one list a row, None for a value with no number; with a `title` the non-style
+    archive's 10000 {21 show title, 23 title} holds it."""
+    grid_rows = [(3, pb(*((1, pb(*([(1, float(v))] if v is not None else []))) for v in row))) for row in values]
+    grid = pb(*((1, n) for n in rows), *((2, n) for n in cols), *grid_rows)
+    pairs = [(1, type), *([(5, 1)] if by_row else []), (7, grid)]
+    out = []
+    if title is not None:
+        pairs.append((10, pb_ref(id + 1)))
+        out.append(archive(id + 1, 5023, pb((10000, pb((21, int(show_title)), (23, title))))))
+    return [archive(id, 5021, pb((1, b""), (10000, pb(*pairs))))] + out
+
+
+KEYNOTE_ROOT, SHOW, THEME = 1, 3, 4  # metadata_iwa takes id 2
+
+
+def slide_ids(i: int) -> dict:
+    """The object ids `keynote_doc` gives slide i: node, slide, title and body placeholders and their storages, the
+    note and its storage, and a template slide with its title placeholder and storage."""
+    b = 100 + 20 * i
+    return dict(node=b, slide=b + 1, title=b + 2, title_text=b + 3, body=b + 4, body_text=b + 5, note=b + 6,
+                note_text=b + 7, template=b + 10, template_title=b + 11, template_text=b + 12)
+
+
+def placeholder(id, storage_id) -> bytes:
+    """A KN.PlaceholderArchive (7): field 1 its TSWP.ShapeInfoArchive super, whose 4 is the owned storage."""
+    return archive(id, 7, pb((1, pb((1, b""), (4, pb_ref(storage_id))))))
+
+
+def keynote_doc(slides: list[dict], tree=None) -> list[bytes]:
+    """A Keynote document: KN.DocumentArchive (1, id 1) {2 show} -> KN.ShowArchive (2, id 3) {2 theme, 3 slide tree
+    {2 nodes}} and a theme (id 4) {2 templates}. Slide i (ids from `slide_ids`) is a KN.SlideNodeArchive (4) {1
+    children, 2 slide, 4 isSkipped} -> KN.SlideArchive (5) {5 title, 6 body, 7 owned drawables, 17 template slide,
+    27 note, 42 drawables_z_order}. Keys: title, body, notes (text; each a placeholder or note with its storage),
+    drawables and z_order (ids the caller adds), skipped, children (slide indexes), template (text of a template
+    slide only the theme lists). `tree` lists the slide indexes in the slide tree, all by default."""
+    tree = range(len(slides)) if tree is None else tree
+    out = [archive(KEYNOTE_ROOT, 1, pb((2, pb_ref(SHOW)))),
+           archive(SHOW, 2, pb((2, pb_ref(THEME)), (3, pb(*((2, pb_ref(slide_ids(i)["node"])) for i in tree)))))]
+    templates = []
+    for i, s in enumerate(slides):
+        ids = slide_ids(i)
+        out.append(archive(ids["node"], 4, pb(*((1, pb_ref(slide_ids(c)["node"])) for c in s.get("children", ())),
+                                              (2, pb_ref(ids["slide"])), (4, int(bool(s.get("skipped")))))))
+        fields = []
+        if "title" in s:
+            fields.append((5, pb_ref(ids["title"])))
+            out += [placeholder(ids["title"], ids["title_text"]), archive(ids["title_text"], 2001, storage(s["title"]))]
+        if "body" in s:
+            fields.append((6, pb_ref(ids["body"])))
+            out += [placeholder(ids["body"], ids["body_text"]), archive(ids["body_text"], 2001, storage(s["body"]))]
+        # owned drawables repeat the placeholders, as Keynote writes them
+        owned = [ids[k] for k in ("title", "body") if k in s] + list(s.get("drawables", ()))
+        fields += [(7, pb_ref(d)) for d in owned]
+        if "template" in s:
+            fields.append((17, pb_ref(ids["template"])))
+            templates.append(ids["template"])
+            out += [archive(ids["template"], 5, pb((5, pb_ref(ids["template_title"])))),
+                    placeholder(ids["template_title"], ids["template_text"]),
+                    archive(ids["template_text"], 2001, storage(s["template"]))]
+        if "notes" in s:
+            fields.append((27, pb_ref(ids["note"])))
+            out += [archive(ids["note"], 15, pb((1, pb_ref(ids["note_text"])))),
+                    archive(ids["note_text"], 2001, storage(s["notes"]))]
+        fields += [(42, pb_ref(d)) for d in s.get("z_order", ())]
+        out.append(archive(ids["slide"], 5, pb(*fields)))
+    out.append(archive(THEME, 3, pb(*((2, pb_ref(t)) for t in templates))))
+    return out

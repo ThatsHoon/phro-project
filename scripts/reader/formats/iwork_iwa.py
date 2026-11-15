@@ -16,6 +16,16 @@ floating drawables kept in their container's order rather than sorted by id, and
 entered through `Store.follow`, so one reached twice is read once. The Numbers walk follows
 `docling/backend/iwork/numbers_iwa.py` (`read_content`, `read_sheet`, `read_comment`), with the drawables kept in
 the sheet's order rather than sorted by position; tables are read by `iwork_tables`.
+
+The Keynote walk follows `docling/backend/iwork/keynote_iwa.py` (`read_content`, `KeynoteReader.slides`, `_slide`,
+`_placed`, `_blocks`, `_placeholder_blocks`, `_comments`, `_notes`) and `keynote_content.py` (a slide's notes and
+comments kept apart from its blocks), with the KN field numbers of keynote-parser (MIT) v1.14.5.0 (commit 9f201c0,
+`protos/versions/14.5/KNArchives.proto`, read as facts): DocumentArchive 2 show; ShowArchive 3 slideTree {2 slides};
+SlideNodeArchive {1 children, 2 slide, 4 isSkipped}; SlideArchive {5 titlePlaceholder, 6 bodyPlaceholder, 7
+owned_drawables, 17 template_slide, 20 slideNumberPlaceholder, 27 note, 42 drawables_z_order}; NoteArchive 1
+containedStorage; PlaceholderArchive 1 its TSWP.ShapeInfoArchive super. Changes from docling: the title placeholder
+is the section title rather than a title block; the drawables follow `drawables_z_order` rather than docling's sort
+by position; isSkipped slides are kept as hidden (docling does not read it); a node's children are walked after it.
 """
 import posixpath
 from collections.abc import Callable, Iterable
@@ -32,7 +42,11 @@ PACKAGE_METADATA = 11006    # TSP.PackageMetadata in Metadata.iwa: field 4 lists
 APPS = ("pages", "numbers", "key")
 SHAPE, EQUATION, IMAGE, GROUP = 2011, 2015, 3005, 3008   # TSWP.ShapeInfo, TSWP.EquationInfo, TSD.Image, TSD.Group
 TABLE, PAGES_TABLE = iwork_tables.TABLE_INFO, iwork_tables.PAGES_TABLE_INFO  # TST.TableInfo, TST.WPTableInfo
-DRAWABLES = {SHAPE, EQUATION, IMAGE, GROUP, TABLE}  # kinds drawable_blocks enters (6007 in Pages); Task 14 adds charts
+CHART = iwork_tables.CHART_DRAWABLE  # TSCH.ChartDrawableArchive
+# KN.DocumentArchive, ShowArchive, SlideNodeArchive, SlideArchive, PlaceholderArchive, NoteArchive (keynote-parser)
+KN_DOCUMENT, KN_SHOW, KN_NODE, KN_SLIDE, KN_PLACEHOLDER, KN_NOTE = 1, 2, 4, 5, 7, 15
+DRAWABLES = {SHAPE, EQUATION, IMAGE, GROUP, TABLE, CHART}  # kinds drawable_blocks enters (+6007 Pages, +7 Keynote)
+MAX_TITLE = 200             # characters of a slide title (as ooxml_slides)
 NUMBERS_DOCUMENT, NUMBERS_SHEET, COMMENT_INFO = 1, 2, 2014  # TN.DocumentArchive, TN.SheetArchive, TSWP.CommentInfo
 IMAGE_DATA = (15, 13, 11, 12)  # TSD.ImageArchive renditions: adjusted, original, placed, thumbnail (docling)
 FLOATING_DEPTH = 4          # embedded messages searched for references in the floating-drawable container (docling)
@@ -68,6 +82,7 @@ class Store:
         self.budget = sheet_grid.Budget()
         self.scan = 0
         self.cache: dict = {}
+        self.chart_cells = 0              # chart table cells placed (limits.CHART_TOTAL)
 
     def _count(self, kind: str):
         self.ctx.skipped[kind] += 1
@@ -266,14 +281,27 @@ def _image(store: Store, id: int) -> list | None:
     return [Image(data)]
 
 
+def _shape_storage(store: Store, id: int) -> int | None:
+    """The storage of a text shape (2011: 4 owned_storage, else 2), or of a Keynote placeholder (7), whose field 1
+    is that shape as its super. ValueError on bad bytes."""
+    item = store.objects.get(id)
+    if item is None:
+        return None
+    f = store.get(id, item[0])
+    if item[0] == KN_PLACEHOLDER:
+        f = pbwire.msg(f, 1)
+    sid = iwork_text.ref(f, 4)
+    return sid if sid is not None else iwork_text.ref(f, 2)
+
+
 def drawable_blocks(store: Store, id: int, ctx, text, app: str) -> list:
     """The blocks of drawable `id`, entered through `Store.follow`: an image (3005) through `Store.data`, a shape or
     text box (2011) its storage (4 owned_storage, else 2) through `text` (an `iwork_text.TextReader`), a group (3008)
-    its children (2) in order, a table (6000, and 6007 when `app` is pages) through `iwork_tables.table_blocks`. An
-    equation (2015) counts `object`. Other kinds, charts (5021) among them until Task 14, are skipped uncounted
-    (decision 10). An id of a kind not entered is never marked visited for a later walk. Each drawable is read under
-    `ctx.guard` of what it loses."""
-    kinds = DRAWABLES | {PAGES_TABLE} if app == "pages" else DRAWABLES
+    its children (2) in order, a table (6000, and 6007 when `app` is pages) through `iwork_tables.table_blocks`, a
+    chart (5021) through `iwork_tables.chart_block`, and in Keynote a placeholder (7) the storage of its ShapeInfo
+    super (1). An equation (2015) counts `object`. Other kinds are skipped uncounted (decision 10). An id of a kind
+    not entered is never marked visited for a later walk. Each drawable is read under `ctx.guard` of what it loses."""
+    kinds = DRAWABLES | {PAGES_TABLE} if app == "pages" else DRAWABLES | {KN_PLACEHOLDER} if app == "key" else DRAWABLES
 
     def drawables(ids):
         return [i for i in ids if store.objects.get(i, (None,))[0] in kinds]
@@ -284,13 +312,13 @@ def drawable_blocks(store: Store, id: int, ctx, text, app: str) -> list:
         if kind == IMAGE:
             with ctx.guard("image"):
                 out = _image(store, i)
-        elif kind == SHAPE:
+        elif kind in (SHAPE, KN_PLACEHOLDER):
             with ctx.guard("shape"):
-                f = store.get(i, SHAPE)
-                sid = iwork_text.ref(f, 4)
-                if sid is None:
-                    sid = iwork_text.ref(f, 2)
+                sid = _shape_storage(store, i)
                 out = text.blocks(sid) if sid is not None else None
+        elif kind == CHART:  # guarded (`chart`) inside
+            got = iwork_tables.chart_block(store, i, ctx)
+            out = [got] if got is not None else None
         elif kind == GROUP:
             with ctx.guard("shape"):
                 children = drawables(iwork_text.refs(store.get(i, GROUP), 2))
@@ -441,6 +469,123 @@ def _numbers(store: Store, ctx) -> Doc | None:
 
 
 WALKS["numbers"] = _numbers
+
+
+def _kind(store: Store, id) -> int | None:
+    return store.objects.get(id, (None,))[0] if isinstance(id, int) else None
+
+
+def _slide_title(store: Store, pid: int, text, ctx) -> tuple[str, list]:
+    """(title, blocks that are not text) of a title placeholder: its paragraphs' visible text as one line, cut to
+    MAX_TITLE; a picture or table anchored in it goes to the slide's body. Read once a document by id (a placeholder
+    two slides share titles both); one that cannot be read counts `shape` and gives no title."""
+    key = ("kn_title", pid)
+    if key in store.cache:
+        return store.cache[key], []
+    store.cache[key] = ""
+    title, extra = "", []
+    with ctx.guard("shape"):
+        sid = _shape_storage(store, pid)
+        blocks = text.blocks(sid) if sid is not None else []
+        title = " ".join(" ".join(iwork_text.plain(blocks)).split())[:MAX_TITLE]
+        extra = [b for b in blocks if not hasattr(b, "inlines") or b.hidden]
+    store.cache[key] = title
+    return title, extra
+
+
+def _slide(store: Store, sid: int, number: int, skipped: bool, text, doc: Doc, ctx) -> Section | None:
+    """KN.SlideArchive (5) as `Section("slide", title, number=n)`: the title placeholder (5) gives the title; the
+    body placeholder (6), then the owned drawables (7) in `drawables_z_order` (42; those it does not list after, in
+    their stored order) follow, each once, the title, body and slide-number (20) placeholders left out of the owned
+    list. A comment (2014) goes to `Section.comments`, the note (27 -> 15 {1 storage}) to `Section.notes`. The
+    template slide (17) is never read. A skipped slide is `hidden="hidden"`. A slide that fails counts `slide`."""
+    sec, done = None, False
+    with ctx.guard("slide"):
+        f = store.get(sid, KN_SLIDE)
+        s = Section("slide", number=number, hidden="hidden" if skipped else "")
+        title, body, slide_number = (iwork_text.ref(f, n) for n in (5, 6, 20))
+        order = []
+        if _kind(store, title) == KN_PLACEHOLDER:
+            s.title, extra = _slide_title(store, title, text, ctx)
+            s.blocks.extend(extra)
+        elif title is not None:
+            order.append(title)  # not a placeholder: read as any drawable, first
+        if body is not None:
+            order.append(body)
+        # each list deduplicated, and kept to ids in the store (so at most IWA_OBJECTS)
+        left_out = {title, body, slide_number}
+        owned = [d for d in dict.fromkeys(iwork_text.refs(f, 7)) if d not in left_out and d in store.objects]
+        mine = set(owned)
+        drawn = [d for d in dict.fromkeys(iwork_text.refs(f, 42)) if d in mine]
+        placed = set(drawn)
+        order += drawn + [d for d in owned if d not in placed]
+        for d in dict.fromkeys(order):
+            if _kind(store, d) == COMMENT_INFO:
+                s.comments.extend(_sticky(store, d, text, doc.notes, ctx))
+            else:
+                s.blocks.extend(drawable_blocks(store, d, ctx, text, "key"))
+        note = iwork_text.ref(f, 27)
+        if note is not None:
+            with ctx.guard("note"):
+                nf = store.get(note, KN_NOTE)
+                storage = iwork_text.ref(nf, 1) if nf is not None else None
+                if storage is None:
+                    ctx.skipped["note"] += 1
+                else:
+                    s.notes = text.blocks(storage)
+        sec, done = s, True
+    return sec if done else None
+
+
+def _keynote(store: Store, ctx) -> Doc | None:
+    """KN.DocumentArchive (1, the lowest id when there are several) 2 -> KN.ShowArchive (2) 3 slide tree {2 nodes}:
+    each KN.SlideNodeArchive (4) {1 children, 2 slide, 4 isSkipped} once, through `Store.follow` (a node on its own
+    path counts `depth`), its slide under `ctx.guard("slide")` and then its children, numbered in that order. A node
+    whose slide is missing or broken counts `slide` and keeps its number; a slide two nodes name is read once. The
+    theme's templates and masters are never reached. None without the root, or when its show lists no slide node
+    (so a renamed file tries the next app)."""
+    root = min((i for i, (t, _) in store.objects.items() if t == KN_DOCUMENT), default=None)
+    if root is None:
+        return None
+    show = iwork_text.ref(store.get(root, KN_DOCUMENT), 2)
+    if _kind(store, show) != KN_SHOW:
+        return None
+    tree = pbwire.msg(store.get(show, KN_SHOW), 3)
+    nodes = [n for n in dict.fromkeys(iwork_text.refs(tree, 2)) if _kind(store, n) == KN_NODE]
+    if not nodes:
+        return None
+    doc = Doc()
+    text = iwork_text.TextReader(store, ctx, doc.notes, lambda d: drawable_blocks(store, d, ctx, text, "key"))
+    seen: set[int] = set()
+    number = 0
+
+    def visit(nid, depth):
+        nonlocal number
+        children, slide, skipped, read = [], None, False, False
+        with ctx.guard("slide"):
+            nf = store.get(nid, KN_NODE)
+            children = [c for c in dict.fromkeys(iwork_text.refs(nf, 1)) if _kind(store, c) == KN_NODE]
+            slide, skipped = iwork_text.ref(nf, 2), bool(pbwire.one(nf, 4, 0))
+            read = True
+        if not read:  # counted `slide` by the guard
+            number += 1
+        elif slide is None or slide not in seen:
+            seen.add(slide)
+            number += 1
+            if _kind(store, slide) != KN_SLIDE:
+                ctx.skipped["slide"] += 1
+            else:
+                sec = _slide(store, slide, number, skipped, text, doc, ctx)
+                if sec is not None:
+                    doc.blocks.append(sec)
+        store.follow(children, visit, depth + 1)
+        return None
+
+    store.follow(nodes, visit, 0)
+    return doc
+
+
+WALKS["key"] = _keynote
 
 
 def walk(store: Store, app: str, ctx) -> Doc | None:

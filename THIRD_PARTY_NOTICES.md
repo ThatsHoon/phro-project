@@ -174,7 +174,7 @@ SOFTWARE.
 
 ## docling
 
-Ported: hidden sections and slides, comments, notes fields and the chart local table in `scripts/reader/formats/odf*.py`; `w:vanish`, hidden slides and outline level handling in `scripts/reader/formats/ooxml*.py`; spine merge and link rewrite in `scripts/reader/formats/epub.py`; the raw Snappy block and IWA chunk stream in `scripts/reader/containers/snappy.py` and the protobuf wire reader in `scripts/reader/containers/pbwire.py`, from `docling/backend/iwork/iwa.py`; the iWork container and the IWA object store in `scripts/reader/formats/iwork*.py`, from `docling/backend/iwork_backend.py`, `docling/backend/iwork/iwa.py`, `archives.py` and `legacy.py`; the text storages (styles, lists, links, notes, comments) and the Pages walk in `scripts/reader/formats/iwork_text.py` and `scripts/reader/formats/iwork_iwa.py`, from `docling/backend/iwork/content.py`, `archives.py` and `pages_iwa.py`; the table tiles, value lists and version 4 cells in `scripts/reader/formats/iwork_tables.py` and the Numbers walk in `scripts/reader/formats/iwork_iwa.py`, from `docling/backend/iwork/cells.py`, `archives.py` and `numbers_iwa.py`; all at docling v2.150.0 (1ae470a1f4580881ed73853f64e0bf178f623c5e).
+Ported: hidden sections and slides, comments, notes fields and the chart local table in `scripts/reader/formats/odf*.py`; `w:vanish`, hidden slides and outline level handling in `scripts/reader/formats/ooxml*.py`; spine merge and link rewrite in `scripts/reader/formats/epub.py`; the raw Snappy block and IWA chunk stream in `scripts/reader/containers/snappy.py` and the protobuf wire reader in `scripts/reader/containers/pbwire.py`, from `docling/backend/iwork/iwa.py`; the iWork container and the IWA object store in `scripts/reader/formats/iwork*.py`, from `docling/backend/iwork_backend.py`, `docling/backend/iwork/iwa.py`, `archives.py` and `legacy.py`; the text storages (styles, lists, links, notes, comments) and the Pages walk in `scripts/reader/formats/iwork_text.py` and `scripts/reader/formats/iwork_iwa.py`, from `docling/backend/iwork/content.py`, `archives.py` and `pages_iwa.py`; the table tiles, value lists and version 4 cells in `scripts/reader/formats/iwork_tables.py` and the Numbers walk in `scripts/reader/formats/iwork_iwa.py`, from `docling/backend/iwork/cells.py`, `archives.py` and `numbers_iwa.py`; the charts in `scripts/reader/formats/iwork_tables.py` and the Keynote walk in `scripts/reader/formats/iwork_iwa.py`, from `docling/backend/iwork/charts.py`, `keynote_iwa.py` and `keynote_content.py`; all at docling v2.150.0 (1ae470a1f4580881ed73853f64e0bf178f623c5e).
 
 ```
 MIT License
@@ -831,6 +831,29 @@ BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR P
 NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+```
+
+## keynote-parser
+
+Ported: `scripts/reader/formats/iwork_iwa.py` (the Keynote field numbers of `KN.DocumentArchive`, `ShowArchive`, `SlideTreeArchive`, `SlideNodeArchive`, `SlideArchive`, `NoteArchive` and `PlaceholderArchive`, taken as facts), from `protos/versions/14.5/KNArchives.proto` at keynote-parser tag v1.14.5.0 (commit 9f201c0eaa3d3e80a88e00995ed17ce999888cc8), read on the web. Its protobuf schemas are Apple's; they were read as format knowledge only and are not distributed. The licence text is the copy numbers-parser ships (`licenses/keynote-parser.txt`).
+
+```
+Copyright 2019-2025 Peter Sobot
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+and associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 ## Adobe
