@@ -379,6 +379,21 @@ def test_pdfium_sideways_page():
         assert chars[:4] in md and chars[4:] in md and md.index(chars[:4]) < md.index(chars[4:]), md
 
 
+def test_pdfium_ligature_stays_in_word():
+    # code A is one glyph whose ToUnicode is "fi": pdfium gives both chars the glyph's origin and
+    # box, and the word must not break after the f
+    cmap = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+            b"1 beginbfchar\n<41> <00660069>\nendbfchar\nendcmap end end\n")
+    font = {"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("Helvetica"),
+            "Encoding": Name("WinAnsiEncoding"), "ToUnicode": Ref(60)}
+    ops = [text_ops("efAcient viewing", 72, 700), text_ops("Multiple Ales are bound", 72, 680, size=20)]
+    data = simple_pdf([b" ".join(ops)], resources={"Font": {"F1": Ref(61)}},
+                      extra_objects={60: Stream({}, cmap), 61: font})
+    for md in _both(data):
+        assert "efficient viewing" in md and "Multiple files are bound" in md, md
+
+
 def test_pdfium_pages_range():
     got = run(simple_pdf([text_ops(f"P{n}") for n in range(1, 5)]), pages=[2, 3])
     md = got["md"]

@@ -15,7 +15,9 @@ last page and the document; pdf.py calls it in a finally.
   one text object on one line make one `Fragment`. Its size is native's: the font size
   (`FPDFText_GetFontSize`, the Tf operand) times the length of the char matrix's second row,
   which Tz leaves alone; the loose box height stands in only when there is no usable size. Its
-  `char_offsets` and `char_gaps` come from the loose boxes along the text direction.
+  `char_offsets` and `char_gaps` come from the loose boxes along the text direction. The
+  chars of one ligature glyph ("fi" from one code) share its origin: they stay in the run,
+  with no gap between them.
   The text object's render mode (3 or 7) sets `invisible`. A text object whose second char sits
   below its first along the glyph's up is a vertical font's column: it takes native's vertical
   axes (direction -up, up the char matrix's x axis). When native opened the file, such a page's
@@ -427,7 +429,8 @@ class PdfiumDoc:
         def begin(px, py, start, end, base, axis, size):
             return {"addr": addr, "x": px, "y": py, "dx": axis[0], "dy": axis[1], "ux": axis[2],
                     "uy": axis[3], "base": base, "start": start, "end": end, "size": size,
-                    "text": [], "offsets": [], "gaps": [], "first": None, "vertical": addr in upright}
+                    "text": [], "offsets": [], "gaps": [], "first": None, "vertical": addr in upright,
+                    "last": None}
 
         def flush():
             nonlocal run
@@ -499,8 +502,12 @@ class PdfiumDoc:
                 sizes[addr] = size
             dx, dy, ux, uy = axes[addr]
             size = sizes[addr]
+            # a char at the origin of the one before, in its text object: the next char of a
+            # ligature glyph ("fi" from one code), which stays in the run
+            ligature = (run is not None and run["addr"] == addr and run["last"] is not None
+                        and abs(x - run["last"][0]) <= 1e-3 and abs(y - run["last"][1]) <= 1e-3)
             if (run is not None and run["addr"] == addr and len(run["text"]) == 1
-                    and addr not in checked):
+                    and addr not in checked and not ligature):
                 checked.add(addr)
                 step_x, step_y = x - run["x"], y - run["y"]
                 if (step_x * ux + step_y * uy < -0.5 * abs(size)
@@ -525,19 +532,28 @@ class PdfiumDoc:
             start = x * dx + y * dy
             end = (right * dx if dx >= 0 else left * dx) + (top * dy if dy >= 0 else bottom * dy)
             base = x * ux + y * uy
-            if run is not None:
-                tol = LINE_TOLERANCE * max(abs(size), abs(run["size"]))
-                if run["addr"] != addr or abs(base - run["base"]) > tol or start < run["end"] - tol:
-                    flush()
-            if run is None:
-                run = begin(x, y, start, end, base, axes[addr], size)
-                run["first"] = (x, y, left, right, bottom, top)
-            run["gaps"].append(start - run["end"] if run["text"] else 0.0)
-            run["offsets"].append(start - run["start"])
-            run["text"].append(ch)
-            run["end"] = max(end, start)
-            run["obj"], run["invisible"], run["font"] = objects[addr], modes[addr], fonts[addr]
-            run["hidden"] = hidden[addr]
+            if ligature:
+                # no gap and the glyph's offset; the run ends where the whole glyph does
+                run["gaps"].append(0.0)
+                run["offsets"].append(run["offsets"][-1])
+                run["text"].append(ch)
+                run["end"] = max(run["end"], end, start)
+            else:
+                if run is not None:
+                    tol = LINE_TOLERANCE * max(abs(size), abs(run["size"]))
+                    if (run["addr"] != addr or abs(base - run["base"]) > tol
+                            or start < run["end"] - tol):
+                        flush()
+                if run is None:
+                    run = begin(x, y, start, end, base, axes[addr], size)
+                    run["first"] = (x, y, left, right, bottom, top)
+                run["gaps"].append(start - run["end"] if run["text"] else 0.0)
+                run["offsets"].append(start - run["start"])
+                run["text"].append(ch)
+                run["end"] = max(end, start)
+                run["last"] = (x, y)
+                run["obj"], run["invisible"], run["font"] = objects[addr], modes[addr], fonts[addr]
+                run["hidden"] = hidden[addr]
             if not ch.isspace():
                 seen += 1
                 if seen > caps.PDF_PAGE_CHARS:
