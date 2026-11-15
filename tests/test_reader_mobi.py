@@ -424,12 +424,68 @@ def test_anchor_edges():
 def test_anchor_cap_counted():
     old = mobi.MOBI_ANCHORS
     mobi.MOBI_ANCHORS = 1
+    seen = []
+    real = mobi.xhtml.tree
+    mobi.xhtml.tree = lambda data: (seen.append(data), real(data))[1]
     try:
-        body = b"<html><body><p><a filepos=0000000010>a</a><a filepos=0000000020>b</a></p></body></html>"
+        body = b"<html><body><p><a filepos=0000000010>aaa</a> and <a filepos=0000000020>bbb</a></p></body></html>"
         doc, ctx = _read(_mobi(body))
-        assert ctx.skipped["link"] == 1 and "a" in _text_of(doc.blocks) and "b" in _text_of(doc.blocks)
     finally:
         mobi.MOBI_ANCHORS = old
+        mobi.xhtml.tree = real
+    assert ctx.skipped["link"] == 1
+    para = doc.blocks[0].blocks[0]
+    assert isinstance(para, Para) and _text_of(para) == "aaa and bbb"
+    raw = b"".join(seen)
+    assert b'href="#fp10"' in raw and b"fp20" not in raw and b"filepos" not in raw
+
+
+def test_exth_hostile():
+    base = bytearray(_rec0(exth={100: b"x"}))
+    base[288:292] = (1000).to_bytes(4, "big")                       # a count larger than the data
+    h = mobi._head(bytes(base))
+    assert h.exth == {100: [b"x"]}
+    base = bytearray(_rec0(exth={100: b"x"}))
+    base[296:300] = (4).to_bytes(4, "big")                          # a size below 8
+    assert mobi._head(bytes(base)).exth == {}
+    h = mobi._head(_rec0(exth={100: [b"v"] * 70}))
+    assert len(h.exth[100]) == mobi.MAX_EXTH_VALUES
+    doc, _ = _read(_mobi(BOOK, exth={100: [b"v"] * 70}))
+    assert len(doc.blocks) == 2
+
+
+def test_title_fallbacks():
+    doc, _ = _read(_mobi(BOOK, exth={503: b"  "}, title=b"Full"))
+    assert doc.title == "Full"
+    doc, _ = _read(_mobi(BOOK, exth={503: b""}, title=b"Full"))
+    assert doc.title == "Full"
+    d = bytearray(_mobi(BOOK, title=b"Full"))
+    rec0 = bytearray(_rec0(title=b"Full"))
+    rec0[84:88] = (10**6).to_bytes(4, "big")                         # a title offset past the record
+    doc, _ = _read(_pdb([bytes(rec0), BOOK]))
+    assert doc.title == ""
+    doc, _ = _read(_mobi(BOOK, exth={503: b"y" * 5000}))
+    assert doc.title == "y" * mobi.MAX_TITLE
+
+
+def test_text_records_past_the_file():
+    text = b"<html><body><p>before</p></body></html>"
+    rec0 = _rec0(text_records=5, text_length=len(text))
+    doc, ctx = _read(_pdb([rec0, text]))
+    assert ctx.skipped["record"] == 1 and "before" in _text_of(doc.blocks)
+
+
+def test_regexes_stay_linear():
+    import time
+    for unit in (b"<mbp:pagebreak ", b"<p", b"<script ", b"<a filepos=1 ", b"<img recindex=1 "):
+        data = unit * (300_000 // len(unit))
+        t = time.perf_counter()
+        try:
+            mobi.parse_bytes(_mobi(data), Context())
+        except ReadError:
+            pass
+        mobi._stripped(data, Context())
+        assert time.perf_counter() - t < 2, unit
 
 
 def test_filepos_mid_utf8():

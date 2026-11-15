@@ -29,13 +29,13 @@ EXTH_KF8_BOUNDARY = 121
 EXTH_TITLE = 503
 _LOOK = 8192            # bytes searched back for the `<` of the tag an anchor position falls in
 _CODECS = {1252: "cp1252", 65001: "utf-8"}
-_FILEPOS = re.compile(rb"(<a\b[^>]{0,500}?)\bfilepos\s*=\s*[\"']?(\d{1,12})[\"']?", re.I)
-_RECINDEX = re.compile(rb"(<img\b[^>]{0,500}?)\brecindex\s*=\s*[\"']?(\d{1,12})[\"']?", re.I)
-_PAGEBREAK = re.compile(rb"<mbp:pagebreak\b[^>]*>(?:\s*</mbp:pagebreak>)?", re.I)
+_FILEPOS = re.compile(rb"(<a\b[^<>]{0,500}?)\bfilepos\s*=\s*[\"']?(\d{1,12})[\"']?", re.I)
+_RECINDEX = re.compile(rb"(<img\b[^<>]{0,500}?)\brecindex\s*=\s*[\"']?(\d{1,12})[\"']?", re.I)
+_PAGEBREAK = re.compile(rb"<mbp:pagebreak\b[^<>]*>(?:\s*</mbp:pagebreak>)?", re.I)
 _BLOCK_TAG = re.compile(r"<\s*/?\s*(?:p|div|br|hr|h[1-6]|li|ul|ol|dl|dt|dd|tr|table|blockquote|pre|section|article|"
-                        r"mbp:pagebreak)\b[^>]*>", re.I)
-_DEAD = re.compile(r"<\s*(script|style)\b.*?<\s*/\s*\1\s*>", re.I | re.S)
-_TAG = re.compile(r"<[^>]*>")
+                        r"mbp:pagebreak)\b[^<>]*>", re.I)
+_DEAD = re.compile(r"<\s*(script|style)\b", re.I)
+_TAG = re.compile(r"<[^<>]*>")
 
 
 @dataclass
@@ -239,10 +239,31 @@ def _loader(palm: Palm, head: Head, ctx):
 
 
 # ---- stripped text
+def _drop_dead(s: str) -> str:
+    """The text without script and style elements; one with no close tag runs to the end. Linear: each close tag is found
+    with str.find, never by a pattern that could scan to the end from every start."""
+    low = s.lower()
+    out, pos = [], 0
+    while True:
+        m = _DEAD.search(s, pos)
+        if not m:
+            break
+        out.append(s[pos:m.start()])
+        close = low.find("</" + m.group(1).lower(), m.end())
+        if close < 0:
+            return "".join(out)
+        gt = s.find(">", close)
+        if gt < 0:
+            return "".join(out)
+        pos = gt + 1
+    out.append(s[pos:])
+    return "".join(out)
+
+
 def _stripped(text: bytes, ctx) -> list:
     """Paragraphs of a text with its tags removed, split at block tags. Counts `plain_text`."""
     s = text.decode("utf-8", errors="replace").lstrip("﻿")
-    s = _TAG.sub("", _BLOCK_TAG.sub("\0", _DEAD.sub("", s)))
+    s = _TAG.sub("", _BLOCK_TAG.sub("\0", _drop_dead(s)))
     paras = []
     for piece in stdhtml.unescape(s).split("\0"):
         line = " ".join(piece.split())
@@ -261,8 +282,11 @@ def _kf8_only(head: Head) -> bool:
 
 def _title(head: Head) -> str:
     codec = _CODECS.get(head.encoding, "utf-8")
-    raw = (head.exth.get(EXTH_TITLE) or [head.full_title])[0]
-    return " ".join(raw.decode(codec, errors="replace").split())[:MAX_TITLE]
+    for raw in (head.exth.get(EXTH_TITLE) or [b""])[:1] + [head.full_title]:
+        title = " ".join(raw[:MAX_TITLE * 4].decode(codec, errors="replace").split())[:MAX_TITLE]
+        if title:
+            return title
+    return ""
 
 
 def _css(node, ctx) -> xhtml.Css:
@@ -284,14 +308,25 @@ def _css(node, ctx) -> xhtml.Css:
 def _mobi6(text: bytes, palm: Palm, head: Head, ctx) -> tuple:
     """(chapter sections, kept notes) of the MOBI 6 text."""
     utf8 = head.encoding == 65001
-    targets = {}
-    for m in _FILEPOS.finditer(text):
-        targets[int(m.group(2))] = f"fp{int(m.group(2))}"
-    if len(targets) > MOBI_ANCHORS:
+    targets, over = {}, False
+    for m in _FILEPOS.finditer(text):  # the first MOBI_ANCHORS targets by occurrence
+        pos = int(m.group(2))
+        if pos in targets:
+            continue
+        if len(targets) >= MOBI_ANCHORS:
+            over = True
+            break
+        if pos <= len(text):
+            targets[pos] = f"fp{pos}"
+    if over:
         ctx.skipped["link"] += 1
         ctx.warnings.append("link: links past the anchor limit keep their text only")
     text = _anchor(text, targets, utf8)
-    text = _FILEPOS.sub(lambda m: m.group(1) + b'href="#fp' + str(int(m.group(2))).encode() + b'"', text)
+
+    def href(m):  # a link whose target was not kept loses its filepos and stays plain text
+        pos = int(m.group(2))
+        return m.group(1) + (b'href="#fp' + str(pos).encode() + b'"' if pos in targets else b"")
+    text = _FILEPOS.sub(href, text)
     text = _RECINDEX.sub(lambda m: m.group(1) + b'src="recindex:' + m.group(2) + b'"', text)
     load = _loader(palm, head, ctx)
     notes: dict = {}
