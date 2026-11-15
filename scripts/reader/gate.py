@@ -11,6 +11,7 @@ from reader import limits
 INDEX_LINES = 2000
 INDEX_CHARS = 10_000
 CONTEXT_MAX = 600
+DETAIL_MAX = 200  # characters of a failure detail in a deny reason (`_why`); the file controls some of it
 READ_PY = Path(__file__).resolve().parents[1] / "read.py"
 
 REASONS = {
@@ -141,7 +142,10 @@ def deny_text(path, why, retry=True):
 
 
 def _why(kind, detail=""):
-    """The reason a deny (or a pdf pass-through) gives for a failure kind and its detail."""
+    """The reason a deny (or a pdf pass-through) gives for a failure kind and its detail, the detail cut to
+    DETAIL_MAX characters (a zip member name in it is the file's, up to 64 KB)."""
+    if len(detail) > DETAIL_MAX:
+        detail = detail[:DETAIL_MAX - 1] + "…"
     if kind == "damaged" and detail.startswith("internal error"):
         return f"reading failed ({detail})"
     if kind == "damaged":

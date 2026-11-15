@@ -119,6 +119,22 @@ def test_plain_text_passes_through():
         assert gate.decide(ev(put(name, data))) is None, name
 
 
+def test_empty_key_passes_through():
+    # a 0-byte .key is plain text to the gate (nothing in it), so it passes through before the Keynote check
+    assert gate.decide(ev(put("empty.key", b""))) is None
+
+
+def test_deny_detail_capped():
+    # a detail the file controls (a zip member name of 64 KB) is cut to DETAIL_MAX characters with an ellipsis
+    long = "Index/" + "x" * 65_000 + ".iwa: ValueError"
+    for kind in ("damaged", "unsupported"):
+        why = gate._why(kind, long)
+        assert len(why) < gate.DETAIL_MAX + 40 and why.count("x") <= gate.DETAIL_MAX and "…" in why, (kind, len(why))
+    assert gate._why("damaged", "internal error " + "y" * 5000).count("y") <= gate.DETAIL_MAX
+    assert gate._why("damaged", "short") == "the file looks damaged (short)"
+    assert gate.DETAIL_MAX == 200
+
+
 def test_binary_still_denied():
     for name, data in (("a.vsd", bytes.fromhex("D0CF11E0A1B11AE1") + bytes(100)),):
         o = out(gate.decide(ev(put(name, data))))
