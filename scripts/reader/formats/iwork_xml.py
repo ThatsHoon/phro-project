@@ -1,15 +1,17 @@
-"""iWork '09 XML (Pages `index.xml`, Keynote `index.apxl`) to the document model.
+"""iWork '09 XML (Pages and Numbers `index.xml`, Keynote `index.apxl`) to the document model.
 
 Ported from docling (MIT) `docling/backend/iwork/legacy.py` (the `sf` vocabulary: `legacy_runs`, `legacy_styles`,
 `legacy_list_styles`, `legacy_inherited_lists`, `legacy_list_label`, `legacy_formatting`, `legacy_picture`,
 `sf_attr`), `docling/backend/iwork/pages_xml.py` (`read_content`, `iter_body_elements`, `legacy_furniture`,
-`legacy_comments`) and `docling/backend/iwork/keynote_xml.py` (`iter_slides`, `read_slide`, `slide_drawables`,
-`slide_placeholders`, `iter_drawables`, `drawable_blocks`, `sticky_note_text`, `slide_notes`), v2.150.0
+`legacy_comments`), `docling/backend/iwork/keynote_xml.py` (`iter_slides`, `read_slide`, `slide_drawables`,
+`slide_placeholders`, `iter_drawables`, `drawable_blocks`, `sticky_note_text`, `slide_notes`) and
+`docling/backend/iwork/numbers_xml.py` (`read_content`, `read_table`, `read_cells`, `place_row`, `column_quotas`,
+`cell_text`, `text_value`, `popup_text`, `formula_text`, `read_comment`), v2.150.0
 (1ae470a1f4580881ed73853f64e0bf178f623c5e).
 
 `iwork._xml` hands over the parsed root (`zipx.parse_xml_ns`: a DOCTYPE or entity is refused there). The root
-picks the app (`sl:document` Pages, `key:presentation` Keynote, `ls:document` Numbers, Task 16); an unknown root is
-read by the extension's app, and a root no walk reads gives a Doc with no blocks (the preview fallback).
+picks the app (`sl:document` Pages, `key:presentation` Keynote, `ls:document` Numbers); an unknown root is read by
+the extension's app, and a root no walk reads gives a Doc with no blocks (the preview fallback).
 
 The shared `sf` vocabulary: `sf:p` paragraphs of text, `sf:span` (character style), `sf:link` (`href`, http, https
 and mailto kept), `sf:br` and the other breaks (a line break inside a paragraph; none at its edges), `sf:tab`;
@@ -23,9 +25,23 @@ theme's language, so its placeholders say what a paragraph is, as in docling); b
 `sf:image` give `Image` from the first `sf:data` (`sf:path` or `path`) whose member is in the package, an `-ref`
 inside searched REF_DEPTH levels into its target, once by id (REF_DEPTH and MAX_RUNG are local lookup bounds, not
 Limits caps); `sf:ghost-text` and `sf:ghost-text-ref` are the template's placeholder text and are dropped uncounted.
-A table (`sf:tabular-info`, `sf:tabular-model`) is not read here: it counts `table` (Task 16 reads '09 tables), its
-cells never reach the body, and a footnote its cells mark keeps its place in the pairing below, kept as an unmarked
-note.
+
+Tables (`sf:tabular-info`, `sf:tabular-model`, in all three apps): the model (a child, or the one its `-ref` names;
+read once) gives one Table captioned with its `sf:name`, through `sheet_grid.Grid` with one `Budget` a document, so
+a table renders as xlsx does and the Grid caps stop it (`sheet_cut`). Its `sf:grid` `sf:datasource` holds the cells
+a row stores, in order and with no coordinates; each `sf:grid-row` `sf:nc` says how many are that row's, and the
+`sf:grid-column` counts, when they add up, pass over a column that stores no more cells (docling `place_row`). Cells:
+`sf:t` text (`sf:ct`: its `sfa:s`, else its text, a line a paragraph); `sf:n` the number `sf:v` as General; `sf:d`
+the seconds `sf:cell-date` from 2001-01-01 as an ISO date, plus the time when not midnight; `sf:b` and `sf:cb` TRUE
+or FALSE; `sf:pm` the value its `sf:proxied-cell-ref` names; `sf:f` its cached result `sf:r` (`sf:rn`, `sf:rt`,
+`sf:rd`, `sf:rb`), never its formula; `sf:g` empty; `sf:s` holds its column with no value; `sf:col-span` is one
+merged cell (a row does not say how far down a merge goes, so none spans rows, as in docling). Hidden rows are not
+read (Defaults "Numbers"), nor are header rows marked. Nothing is allocated from a declared count: the declared rows
+and columns only bound the walk, a span stops at them and at SHEET_COLS, rows are walked to SHEET_ROWS, and each
+entry is charged to the document's scan count, to SHEET_SCAN; entries past the declared grid, or that no row claims,
+count `record` once a table. A table fails (`table`) without a model, a grid, or the rows its values need; each is
+read under a guard of its own. A footnote its cells mark keeps its place in the pairing below as an unmarked note (a
+cell shows its text only). In a header or footer a table counts `table` and is not read.
 
 Pages (`sl:document`): the body is the document outside `sf:header`, `sf:footer`, `sf:footnotes`, `sf:annotations`
 and `sl:section-prototypes` (the templates of new sections, like ghost text), in document order, then the floating
@@ -54,6 +70,11 @@ is not followed, nor the placeholder refs), then `key:notes` as `Section.notes`;
 `key:sticky-notes`, are "Comment: …" lines in `Section.comments`. A comment no field names is kept as an unmarked
 note, and an attachment no ref places counts `object`. The theme's master slides are never read.
 
+Numbers (`ls:document`): each `ls:workspace` (a workspace is not searched for more), under `ctx.guard("sheet")`, is
+`Section("sheet", ls:workspace-name)`: its tables, pictures and text boxes in order, each under its own guard as in
+Pages, its sticky notes as "Comment: …" lines in `Section.comments`. The template's parts outside the workspaces are
+never read; '09 charts (cached in `.chrtshr` property lists) are not read.
+
 Every walk is iterative (an explicit stack, so a deep tree never reaches Python's recursion limit) and enters each
 element at most once, so the work is bounded by the element count, which `iwork.IWORK_XML` bounds. Pictures are
 charged against `limits.IMAGE_BYTES` per document, each placement (a member is read once); one missing or past it
@@ -61,14 +82,21 @@ counts `image`.
 
 Changes from docling: footnotes are paired with their marks rather than listed as furniture; comments are marked
 where they apply; floating drawables follow the body; templates are left out; a character style that does not set
-bold keeps the bold in force; list ladders follow their `-ref`s.
+bold keeps the bold in force; list ladders follow their `-ref`s; a sheet keeps its drawables in their order (docling
+sorts them by position); a table is read into a Grid rather than allocated from its declared size, and one past the
+caps is cut rather than dropped; a span spends only the columns whose counts are left; Pages and Keynote tables are
+read too.
 """
+import math
+from bisect import bisect_left
 from itertools import groupby
 
 from .. import limits
 from ..limits import ReadError
-from ..model import Bold, Break, Doc, Heading, Image, Link, ListItem, NoteRef, Para, Section, Text
-from . import iwork_iwa
+from ..model import Bold, Break, Cell, Doc, Heading, Image, Link, ListItem, NoteRef, Para, Section, Table, Text
+from ..numfmt import display
+from . import iwork_iwa, sheet_grid
+from .iwork_tables import EPOCH_SERIAL, ISO_DATE, ISO_TIME
 from .iwork_text import LINK_SCHEMES, OBJECT_REPLACEMENT, STYLE_CHAIN, level, plain
 from .word_fields import MAX_URL, comment_note
 
@@ -101,6 +129,21 @@ SLIDE_LIST, SLIDE, PAGE, NOTES = KEY + "slide-list", KEY + "slide", KEY + "page"
 TITLE_PH, BODY_PH, STICKIES = KEY + "title-placeholder", KEY + "body-placeholder", KEY + "sticky-notes"
 KEY_PRUNE = STYLESHEETS | {SF + "proxy-master-layer", ANNOTATIONS, ANNOTATION}
 THEMES = KEY + "theme-list"  # the theme's master slides
+WORKSPACE, WORKSPACE_NAME = LS + "workspace", LS + "workspace-name"
+
+# tables (docling `numbers_xml.py`, `legacy.py`)
+TABULAR_MODEL, TABULAR_MODEL_REF = SF + "tabular-model", SF + "tabular-model-ref"
+GRID, DATASOURCE, ROWS, GRID_ROW, COLUMNS, GRID_COLUMN = (
+    SF + "grid", SF + "datasource", SF + "rows", SF + "grid-row", SF + "columns", SF + "grid-column")
+NUMROWS, NUMCOLS, NC, COL_SPAN = SF + "numrows", SF + "numcols", SF + "nc", SF + "col-span"
+CELL_TEXT, STRING, VALUE, CELL_DATE = SF + "ct", SFA + "s", SF + "v", SF + "cell-date"
+FORMULA_CELL, POPUP_CELL, SPANNED, RESULT, PROXIED = (
+    SF + "f", SF + "pm", SF + "s", SF + "r", SF + "proxied-cell-ref")
+TEXT_VALUES = frozenset({SF + "t", SF + "rt"})
+NUMBER_VALUES = frozenset({SF + "n", SF + "rn"})
+BOOL_VALUES = frozenset({SF + "b", SF + "cb", SF + "rb"})
+DATE_VALUES = frozenset({SF + "d", SF + "rd"})
+RESULTS = frozenset({SF + "rn", SF + "rt", SF + "rd", SF + "rb"})  # a formula's cached result, in sf:r
 
 PARA_STYLE, CHAR_STYLE, LIST_STYLE = SF + "paragraphstyle", SF + "characterstyle", SF + "liststyle"
 ID, IDREF, IDENT, PARENT = SFA + "ID", SFA + "IDREF", SF + "ident", SF + "parent-ident"
@@ -142,6 +185,20 @@ def _number(v) -> int | None:
         return int(float(v))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _count(v) -> int | None:
+    """A declared positive count, None when absent, malformed or not positive."""
+    n = _number(v)
+    return n if n is not None and n > 0 else None
+
+
+def _finite(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _inlines(segs: list) -> list:
@@ -213,6 +270,10 @@ class Reader:
         self.defer: list | None = None          # Pages: the floating drawables, read after the body
         self.sink: list | None = None           # Keynote: the current slide's comments
         self.image_bytes = 0
+        self.budget = sheet_grid.Budget()       # the cells and characters all the document's tables share
+        self.scan = 0                           # datasource entries walked, against limits.SHEET_SCAN
+        self._tables: set[int] = set()          # table models read
+        self._choices: dict[str, str | None] = {}  # pop-up choice id -> the value it shows
         self._index()
 
     # ---- the one pass
@@ -536,18 +597,246 @@ class Reader:
         out.append(Image(raw))
 
     def table(self, el) -> list:
-        """The blocks of an '09 table. Task 16 reads the cells; here a table counts `table`, and the footnotes its
-        cells mark keep their places in the pairing (`_unread_marks`)."""
-        self.ctx.skipped["table"] += 1
+        """The blocks of an '09 table (`sf:tabular-info` or `sf:tabular-model`): one Table through `sheet_grid.Grid`
+        (`_table`), under a guard of its own, so a table that fails counts `table` and adds nothing. In a header or
+        footer, which shows lines only, a table counts `table` and is not read. Either way the footnotes its cells
+        mark keep their places in the pairing (`_unread_marks`)."""
         self._unread_marks(el)
-        return []
+        if self._furniture:
+            self.ctx.skipped["table"] += 1
+            return []
+        out = []
+        with self.ctx.guard("table"):
+            out = self._table(el)
+        return out
 
     def _unread_marks(self, el):
-        """The footnote marks under `el`, which is not read: each takes its footnote in order as a body mark does
-        (`_footnote_ref`, counted the same way), kept as an unmarked note since nothing shows the mark, so the marks
-        after it still pair with their own footnotes."""
+        """The footnote marks under `el`, whose marks are not shown (a cell shows its text only): each takes its
+        footnote in order as a body mark does (`_footnote_ref`, counted the same way), kept as an unmarked note, so
+        the marks after it still pair with their own footnotes."""
         for _ in el.iter(FOOTNOTE):
             self._footnote_ref()
+
+    def _model(self, el):
+        """The sf:tabular-model of a table element: itself, its child, or the one its `-ref` child names."""
+        if el.tag == TABULAR_MODEL:
+            return el
+        for c in el:
+            if c.tag == TABULAR_MODEL:
+                return c
+            if c.tag == TABULAR_MODEL_REF:
+                target = self.ids.get(c.get(IDREF) or "")
+                if target is not None and target.tag == TABULAR_MODEL:
+                    return target
+        return None
+
+    def _table(self, el) -> list:
+        """One Table captioned with the model's `sf:name`, [] for a table with no values or a model already read
+        (one placed twice is read once). ValueError without a model or a grid."""
+        model = self._model(el)
+        if model is None:
+            raise ValueError("no table model")
+        if id(model) in self._tables:
+            return []
+        self._tables.add(id(model))
+        grid_el = model.find(GRID)
+        if grid_el is None:
+            raise ValueError("no table grid")
+        name = (model.get(NAME) or "").strip()
+        grid = sheet_grid.Grid(name or "table", self.budget, self.ctx)
+        self._cells(grid_el, grid)
+        out = grid.blocks()
+        if not out:
+            return []
+        if isinstance(out[0], Table):
+            out[0].caption = name
+            return out[:1]
+        return [Table([[Cell(out[:1])]], caption=name)]  # one cell: Grid gives a paragraph
+
+    def _quotas(self, el, ncols: int | None, n_entries: int):
+        """(the columns whose count is not spent, sorted; each column's count) from the sf:grid-column `sf:nc`
+        counts, or (None, None) when they cannot place cells (docling `column_quotas`): no sf:columns, no declared
+        column count, more grid columns than SHEET_COLS, a number other than the declared one, or counts adding up
+        to more than the datasource holds."""
+        cols = el.find(COLUMNS)
+        if cols is None or ncols is None:
+            return None, None
+        q = []
+        for c in cols.iter(GRID_COLUMN):
+            if len(q) >= min(ncols, limits.SHEET_COLS):
+                return None, None
+            q.append(max(_number(c.get(NC)) or 0, 0))
+        if len(q) != ncols or sum(q) > n_entries:
+            return None, None
+        return [c for c, n in enumerate(q) if n > 0], q
+
+    def _cells(self, el, grid):
+        """The datasource of sf:grid `el` put on `grid` (docling `read_cells`, `place_row`). The datasource holds
+        only the cells a row stores, in row order, with no coordinates: each sf:grid-row's `sf:nc` says how many
+        are its own, and the columns' counts (`_quotas`) pass over a column that stores no more cells. An sf:s holds
+        its column with no value; `sf:col-span` spends every column it covers and is one merged cell. Nothing is
+        allocated from a declared count: rows are walked as they come, to SHEET_ROWS; each entry is charged to the
+        document's scan count, to SHEET_SCAN; a span stops at the declared columns and at SHEET_COLS. Past a cap the
+        sheet is cut (`Grid.stop`). Entries past the declared rows or columns, or that no row claims, are dropped,
+        counted `record` once a table."""
+        ds, rows = el.find(DATASOURCE), el.find(ROWS)
+        entries = [e for e in ds if isinstance(e.tag, str)] if ds is not None else []
+        if not entries:
+            return
+        if rows is None:
+            raise ValueError("no grid rows")
+        ncols, nrows = _count(el.get(NUMCOLS)), _count(el.get(NUMROWS))
+        avail, quotas = self._quotas(el, ncols, len(entries))
+        cap, k, total, dropped = limits.SHEET_SCAN, 0, len(entries), False
+        for r, row in enumerate(rows.iter(GRID_ROW)):
+            if k >= total:
+                break
+            if r >= limits.SHEET_ROWS:
+                grid.stop("rows", limits.SHEET_ROWS)
+                return
+            if nrows is not None and r >= nrows:
+                break
+            n = _number(row.get(NC)) or 0
+            if n <= 0:
+                continue
+            col = 0
+            for i in range(k, min(k + n, total)):
+                if self.scan >= cap:
+                    grid.stop("scanned cells", cap)
+                    return
+                self.scan += 1
+                e = entries[i]
+                if e.tag == SPANNED:
+                    col += 1
+                    continue
+                if avail is not None:  # the next column that still stores a cell
+                    j = bisect_left(avail, col)
+                    if j == len(avail):
+                        dropped = True
+                        break
+                    col = avail[j]
+                if ncols is not None and col >= ncols:
+                    dropped = True
+                    break
+                span = _number(e.get(COL_SPAN)) or 1
+                span = max(1, min(span, limits.SHEET_COLS - col, (ncols - col) if ncols is not None else span))
+                if avail is not None:  # each column the cell covers stores one cell less; work bounded by the counts
+                    lo, hi = bisect_left(avail, col), bisect_left(avail, col + span)
+                    keep = []
+                    for c in avail[lo:hi]:
+                        quotas[c] -= 1
+                        if quotas[c] > 0:
+                            keep.append(c)
+                    avail[lo:hi] = keep
+                value = self._shown(e)
+                if value:
+                    if not grid.put(r, col, value):
+                        return  # the grid is cut
+                    if span > 1:
+                        grid.merge(r, r, col, col + span - 1)
+                col += span
+            k += n
+        if dropped or k < total:
+            self.ctx.skipped["record"] += 1
+
+    def _shown(self, el) -> str | None:
+        """The value a datasource entry shows: a formula's result (`sf:r`: the first `sf:rn`, `sf:rt`, `sf:rd` or
+        `sf:rb`), never its formula; a pop-up's chosen value (`_popup`); else the cell's own (`_value`)."""
+        tag = el.tag
+        if tag == FORMULA_CELL:
+            result = el.find(RESULT)
+            for v in result if result is not None else ():
+                if v.tag in RESULTS:
+                    return self._value(v)
+            return None
+        if tag == POPUP_CELL:
+            return self._popup(el)
+        return self._value(el)
+
+    def _popup(self, el) -> str | None:
+        """A pop-up cell's shown value: the element its `sf:proxied-cell-ref` names (by id, the document's index),
+        followed through at most MAX_DEPTH pop-ups with a visited path; a cycle or a chain past it counts `depth`.
+        The answer is cached by id, so a choice shared by many cells is followed once."""
+        path, value = [], None
+        for _ in range(limits.MAX_DEPTH):
+            if el.tag != POPUP_CELL:
+                value = self._shown(el)
+                break
+            ref_el = el.find(PROXIED)
+            key = ref_el.get(IDREF) if ref_el is not None else None
+            if not key:
+                break
+            if key in self._choices:
+                value = self._choices[key]
+                break
+            if key in path:
+                self.ctx.skipped["depth"] += 1
+                break
+            path.append(key)
+            el = self.ids.get(key)
+            if el is None:
+                break
+        else:
+            self.ctx.skipped["depth"] += 1
+        for key in path:
+            self._choices[key] = value
+        return value
+
+    def _value(self, el) -> str | None:
+        """A cell or result element's value as shown: `sf:t`/`sf:rt` text (`sf:ct`), `sf:n`/`sf:rn` the number
+        `sf:v` as General, `sf:b`/`sf:cb`/`sf:rb` TRUE or FALSE (a value above 0 is TRUE), `sf:d`/`sf:rd` the
+        seconds `sf:cell-date` from 2001-01-01 as an ISO date, plus the time when it is not midnight. None for an
+        empty cell (`sf:g`), a missing or non-finite value, or any other element."""
+        tag = el.tag
+        if tag in TEXT_VALUES:
+            ct = el.find(CELL_TEXT)
+            return self._cell_text(ct) if ct is not None else None
+        if tag in NUMBER_VALUES:
+            v = _finite(el.get(VALUE))
+            return None if v is None else display(v, "General")
+        if tag in BOOL_VALUES:
+            v = _finite(el.get(VALUE))
+            return None if v is None else "TRUE" if v > 0 else "FALSE"
+        if tag in DATE_VALUES:
+            s = _finite(el.get(CELL_DATE))
+            if s is None:
+                return None
+            return display(EPOCH_SERIAL + s / 86400, ISO_TIME if s % 86400 else ISO_DATE)
+        return None
+
+    @staticmethod
+    def _cell_text(ct) -> str | None:
+        """An sf:ct's text: its `sfa:s`, else its content's text, a line a paragraph or break, outer whitespace and
+        empty lines dropped; ghost text and note marks left out. Walked with an explicit stack."""
+        s = ct.get(STRING)
+        if s is not None:
+            return s.strip() or None
+        out, stack = [], [(ct, False)]
+        while stack:
+            el, tail = stack.pop()
+            if tail:
+                if el.tail:
+                    out.append(el.tail)
+                continue
+            if el is not ct:
+                tag = el.tag
+                if not isinstance(tag, str) or tag in GHOST or tag == FOOTNOTE:
+                    continue
+                if tag == P and out:
+                    out.append("\n")
+                if tag in BREAKS:
+                    out.append("\n")
+                    continue
+                if tag == TAB:
+                    out.append("\t")
+                    continue
+            if el.text:
+                out.append(el.text)
+            for c in reversed(el):
+                stack.append((c, True))
+                stack.append((c, False))
+        lines = (ln.strip() for ln in "".join(out).replace(OBJECT_REPLACEMENT, "").split("\n"))
+        return "\n".join(ln for ln in lines if ln) or None
 
     # ---- text
     def _place(self, el):
@@ -646,7 +935,7 @@ class Reader:
 
     def walk(self, top, out: list | None = None, inside: bool = True) -> list:
         """The blocks of `top`'s children (with `inside`, else of `top` itself) in document order: paragraphs,
-        pictures, tables (counted), sticky notes (into the comments), each element once; the app's pruned parts,
+        pictures, tables, sticky notes (into the comments), each element once; the app's pruned parts,
         ghost text and `-ref`s are not entered."""
         out = [] if out is None else out
         stack = list(reversed(top)) if inside else [top]
@@ -876,9 +1165,44 @@ class Reader:
                 self.ctx.skipped["object"] += 1
         return self.doc
 
+    # ---- Numbers
+    def _workspaces(self) -> list:
+        """The ls:workspace elements in document order; one is not searched for more, nor are the stylesheets."""
+        found, stack = [], [self.root]
+        while stack:
+            el = stack.pop()
+            tag = el.tag
+            if not isinstance(tag, str) or tag in STYLESHEETS:
+                continue
+            if tag == WORKSPACE:
+                found.append(el)
+                continue
+            stack.extend(reversed(el))
+        return found
 
-# app -> the Reader method that walks it (Task 16 adds "numbers")
-WALKS = {"pages": Reader.pages, "key": Reader.keynote}
+    def numbers(self) -> Doc:
+        """Each ls:workspace, under `ctx.guard("sheet")`, as `Section("sheet", ls:workspace-name)`: its tables,
+        pictures and text boxes in order, each under its own guard (`_drawables`), and its sticky notes as "Comment:
+        …" lines in `Section.comments`. A sheet that fails counts `sheet` and adds nothing. The template's parts
+        outside the workspaces are never read."""
+        for ws in self._workspaces():
+            with self.ctx.guard("sheet"):
+                sec = Section("sheet", (ws.get(WORKSPACE_NAME) or "").strip())
+                self.sink = sec.comments
+                try:
+                    self._drawables(ws, sec.blocks)
+                finally:
+                    self.sink = None
+                self.doc.blocks.append(sec)
+        self._leftovers()
+        for a in self.attachments:  # no ref placed it: a sheet has no place for it
+            if id(a) not in self.placed and id(a) not in self.entered:
+                self.ctx.skipped["object"] += 1
+        return self.doc
+
+
+# app -> the Reader method that walks it
+WALKS = {"pages": Reader.pages, "key": Reader.keynote, "numbers": Reader.numbers}
 
 
 def parse(root, app: str, pkg, ctx) -> Doc:

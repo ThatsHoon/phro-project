@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from iwork_fix import (SECTION, archive, attachment, author, cell_v4, cell_v5, change, chart, chunk,  # noqa: E402
                        comment, data_list, decimal128_bytes, fmt, footnote, group, highlight, image, iwa_member,
-                       iwork_zip, keynote09, keynote_doc, link, list_style, metadata_iwa, numbers_doc, pages09,
+                       iwork_zip, keynote09, keynote_doc, link, list_style, metadata_iwa, numbers09, numbers_doc,
+                       pages09,
                        pages_doc, pb, pb_ref, segment, shape, slide09, slide_ids, snappy_copy, snappy_literal, sticky,
                        storage, string_entry, style, table, tile)
 from reader import markdown  # noqa: E402
@@ -1714,7 +1715,8 @@ def test_09_pages_drawables_attachments_prototypes():
 
 
 def test_09_pages_table_counted():
-    # tables are read by Task 16's reader; until then a table counts `table` and its cells stay out of the body
+    # a table that fails (values and no sf:rows to place them, a model with no grid) counts `table`, and its cells
+    # stay out of the body
     table = ('<sf:tabular-info><sf:tabular-model><sf:grid sf:numcols="1" sf:numrows="1"><sf:datasource><sf:t>'
              '<sf:ct sfa:s="cell"/></sf:t></sf:datasource></sf:grid></sf:tabular-model></sf:tabular-info>')
     cell_text = '<sf:tabular-info><sf:tabular-model>' + _p("CELL TEXT") + '</sf:tabular-model></sf:tabular-info>'
@@ -1999,6 +2001,174 @@ def test_09_linear():
     # the ref targets more than REF_DEPTH levels above the data hold no picture near them: counted `image`
     assert sum(isinstance(b, Image) for b in doc.blocks) == 3 and ctx.skipped == {"image": 19997}, ctx.skipped
     assert took < 2, took
+
+
+# -- iWork '09 Numbers and '09 tables (Task 16)
+
+def _grid09(rows, *, quotas=None, numcols=None, numrows=None, nc=None) -> str:
+    """An sf:grid: `rows` is a list of rows, each the XML of that row's datasource entries; `quotas` the
+    sf:grid-column counts (None leaves sf:columns out); `nc` overrides the sf:grid-row counts."""
+    ncols = numcols if numcols is not None else max((len(r) for r in rows), default=0)
+    nrows = numrows if numrows is not None else len(rows)
+    cols = ("<sf:columns>" + "".join(f'<sf:grid-column sf:nc="{n}"/>' for n in quotas) + "</sf:columns>"
+            if quotas is not None else "")
+    counts = nc if nc is not None else [len(r) for r in rows]
+    return (f'<sf:grid sf:numcols="{ncols}" sf:numrows="{nrows}">{cols}<sf:datasource>'
+            + "".join("".join(r) for r in rows) + "</sf:datasource><sf:rows>"
+            + "".join(f'<sf:grid-row sf:nc="{n}"/>' for n in counts) + "</sf:rows></sf:grid>")
+
+
+def _table09(name, rows, **kw) -> str:
+    return (f'<sf:tabular-info><sf:tabular-model sf:name="{name}" sf:num-header-rows="1">{_grid09(rows, **kw)}'
+            '</sf:tabular-model></sf:tabular-info>')
+
+
+def _ws(name, drawables) -> str:
+    return (f'<ls:workspace ls:workspace-name="{name}"><ls:page-info><sf:layers><sf:layer><sf:drawables>'
+            f'{drawables}</sf:drawables></sf:layer></sf:layers></ls:page-info></ls:workspace>')
+
+
+def _t(s) -> str:
+    return f'<sf:t><sf:ct sfa:s="{s}"/></sf:t>'
+
+
+def _n(v) -> str:
+    return f'<sf:n sf:v="{v}"/>'
+
+
+def test_09_numbers_cells():
+    rich = ('<sf:t><sf:ct><sf:so><sf:text-storage><sf:text-body><sf:p>Two<sf:br/>lines<sf:br/></sf:p>'
+            '</sf:text-body></sf:text-storage></sf:so></sf:ct></sf:t>')
+    popup = ('<sf:pm><sf:menu-choices><sf:t sfa:ID="c1"><sf:ct sfa:s="Low"/></sf:t><sf:t sfa:ID="c2">'
+             '<sf:ct sfa:s="High"/></sf:t></sf:menu-choices><sf:proxied-cell-ref sfa:IDREF="c2"/></sf:pm>')
+    rows = [[_t("Name"), _n("4650"), _n("3.25")],
+            ['<sf:d sf:cell-date="0"/>', '<sf:d sf:cell-date="43200"/>', '<sf:b sf:v="1"/>'],
+            ['<sf:cb sf:v="0"/>', popup, rich, "<sf:g/>"]]
+    with _puts() as seen:
+        doc, ctx = _x(numbers09(_ws("Sheet 1", _table09("Table 1", rows, numcols=4))), "numbers")
+    assert seen == {(0, 0): "Name", (0, 1): "4650", (0, 2): "3.25", (1, 0): "2001-01-01",
+                    (1, 1): "2001-01-01 12:00:00", (1, 2): "TRUE", (2, 0): "FALSE", (2, 1): "High",
+                    (2, 2): "Two\nlines"}, seen
+    [sec] = doc.blocks
+    assert (sec.kind, sec.title) == ("sheet", "Sheet 1") and [t.caption for t in _tables(doc)] == ["Table 1"]
+    assert not ctx.skipped and not ctx.warnings, (ctx.skipped, ctx.warnings)
+    # a pop-up whose choice is a pop-up naming the first: the cycle counts `depth` and the cell shows nothing; a
+    # choice shared by 3,000 cells is followed once
+    loop = ['<sf:pm sfa:ID="p1"><sf:proxied-cell-ref sfa:IDREF="p2"/></sf:pm>',
+            '<sf:pm sfa:ID="p2"><sf:proxied-cell-ref sfa:IDREF="p1"/></sf:pm>']
+    shared = '<sf:pm><sf:proxied-cell-ref sfa:IDREF="c2"/></sf:pm>'
+    with _puts() as seen:
+        doc, ctx = _x(numbers09(_ws("S", _table09("P", [[popup, *loop]] + [[shared]] * 3000))), "numbers")
+    assert seen == {(r, 0): "High" for r in range(3001)}, len(seen)
+    assert ctx.skipped == {"depth": 1}, ctx.skipped
+
+
+def test_09_numbers_formula_result():
+    cells = ['<sf:f><sf:fo sf:fs="=SUM(A1:A2)"/><sf:r><sf:rn sf:v="7"/></sf:r></sf:f>',
+             '<sf:f><sf:fo sf:fs="=CONCATENATE(B1)"/><sf:r><sf:rt><sf:ct sfa:s="joined"/></sf:rt></sf:r></sf:f>',
+             '<sf:f><sf:r><sf:rd sf:cell-date="86400"/></sf:r></sf:f>',
+             '<sf:f><sf:r><sf:rb sf:v="1"/></sf:r></sf:f>',
+             '<sf:f><sf:fo sf:fs="=NOW()"/></sf:f>']
+    with _puts() as seen:
+        doc, ctx = _x(numbers09(_ws("S", _table09("F", [cells]))), "numbers")
+    assert seen == {(0, 0): "7", (0, 1): "joined", (0, 2): "2001-01-02", (0, 3): "TRUE"}, seen
+    md = _md(doc, ctx)
+    assert "SUM" not in md and "CONCATENATE" not in md and "NOW" not in md and "joined" in md, md
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_09_numbers_spans():
+    # sf:col-span 2 makes one merged cell; an sf:s holds its column without a value
+    wide = '<sf:t sf:col-span="2"><sf:ct sfa:s="Wide"/></sf:t>'
+    rows = [[wide, _t("C")], [_t("a"), _t("b"), _t("c")], ["<sf:s/>", _t("q")]]
+    with _puts() as seen:
+        doc, ctx = _x(numbers09(_ws("S", _table09("M", rows, numcols=3))), "numbers")
+    assert seen == {(0, 0): "Wide", (0, 2): "C", (1, 0): "a", (1, 1): "b", (1, 2): "c", (2, 1): "q"}, seen
+    [tab] = _tables(doc)
+    assert [c.colspan for c in tab.rows[0]] == [2, 1], tab.rows[0]
+    md = _md(doc, ctx)
+    assert md.count('colspan="2"') == 1, md
+    assert not ctx.skipped, ctx.skipped
+    # the column counts place a sparse row: a column whose count is spent is passed over (docling `place_row`)
+    rows = [[_t("a"), _t("b")], [_t("y")], [_t("z")]]
+    with _puts() as seen:
+        doc, ctx = _x(numbers09(_ws("S", _table09("Q", rows, numcols=3, quotas=[1, 2, 1]))), "numbers")
+    assert seen == {(0, 0): "a", (0, 1): "b", (1, 1): "y", (2, 2): "z"} and not ctx.skipped, (seen, ctx.skipped)
+    # counts that do not add up are not used: each row starts at its first column
+    with _puts() as seen:
+        _x(numbers09(_ws("S", _table09("Q", rows, numcols=3, quotas=[1, 2, 9]))), "numbers")
+    assert seen == {(0, 0): "a", (0, 1): "b", (1, 0): "y", (2, 0): "z"}, seen
+
+
+def test_09_numbers_two_sheets():
+    template = _table09("TEMPLATE", [[_t("TEMPLATE CELL")]])  # outside the workspaces: never read
+    sheets = (_ws("A", _table09("Ta", [[_t("alpha")]]))
+              + _ws("B", _table09("Tb", [[_t("beta")]]) + '<sf:drawable-shape>' + _box(_p("box text"))
+                    + '</sf:drawable-shape><sf:sticky-note>' + _box(_p("remember")) + '</sf:sticky-note>'))
+    doc, ctx = _x(numbers09(sheets, extra=f"<ls:template>{template}</ls:template>"), "numbers")
+    assert [(s.kind, s.title) for s in doc.blocks] == [("sheet", "A"), ("sheet", "B")], doc.blocks
+    md = _md(doc, ctx)
+    assert "## Sheet: A" in md and "## Sheet: B" in md and md.find("## Sheet: A") < md.find("## Sheet: B"), md
+    assert "alpha" in md and "beta" in md and "box text" in md and "> Comment: remember" in md, md
+    assert "TEMPLATE" not in md and not ctx.skipped, (md, ctx.skipped)
+
+
+def test_09_numbers_sheet_cap():
+    rows = [[_t("a"), _t("b"), _t("c")], [_t("d"), _t("e"), _t("f")]]
+    with _limit(limits, "SHEET_CELLS", 4):
+        doc, ctx = _x(numbers09(_ws("S", _table09("T", rows)) + _ws("S2", _table09("T2", [[_t("g")]]))),
+                      "numbers")
+    assert ctx.skipped == {"sheet_cut": 2}, ctx.skipped
+    assert ctx.warnings == ["sheet T cut at 4 cells", "sheet T2 cut at 4 cells"], ctx.warnings
+    assert [s.title for s in doc.blocks] == ["S", "S2"], doc.blocks
+    # the datasource entries walked are charged to one scan count a document, empty ones too
+    with _limit(limits, "SHEET_SCAN", 5):
+        doc, ctx = _x(numbers09(_ws("S", _table09("T", [["<sf:g/>"] * 3 + [_t("x")] * 3]))), "numbers")
+    assert ctx.skipped == {"sheet_cut": 1} and ctx.warnings == ["sheet T cut at 5 scanned cells"], ctx.warnings
+    assert [_cells(t) for t in _tables(doc)] == [[["x", "x"]]], _tables(doc)
+
+
+def test_09_pages_table():
+    t = _table09("PT", [[_t("p"), _n("2")]])
+    doc, ctx = _x(pages09(_p("Before") + t + _p("After")))
+    assert [type(b).__name__ for b in doc.blocks] == ["Para", "Table", "Para"], doc.blocks
+    tab = doc.blocks[1]
+    assert tab.caption == "PT" and [[c.blocks for c in r] for r in tab.rows] == [
+        [[Para([Text("p")])], [Para([Text("2")])]]], tab.rows
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_09_keynote_table():
+    t = _table09("KT", [[_t("k"), _n("1")], [_t("l"), _n("2")]])
+    doc, ctx = _x(keynote09(slide09(_p("T"), _p("B"), drawables=t)), "key")
+    [s] = doc.blocks
+    assert s.title == "T" and isinstance(s.blocks[0], Para) and isinstance(s.blocks[1], Table), s.blocks
+    assert s.blocks[1].caption == "KT" and len(s.blocks[1].rows) == 2 and not ctx.skipped, (s.blocks, ctx.skipped)
+
+
+def test_09_numbers_hostile_linear():
+    # declared counts and spans far past the caps, and many cells: read in linear time, stopped at the caps
+    big = "1000000000000000"
+    spans = _table09("Spans", [[f'<sf:t sf:col-span="{big}"><sf:ct sfa:s="w"/></sf:t>', _n(1)]] * 2000,
+                     numcols=big, numrows=big)
+    # every row's first value spans every column, spending their counts; the rest of each row has no column left
+    quotas = _table09("Quotas", [[f'<sf:n sf:v="1" sf:col-span="{big}"/>'] + [_n(2)] * 999] * 100,
+                      numcols=1000, quotas=[100] * 1000)
+    rows = _table09("Rows", [[]] * 150_000 + [[_t("late")]])
+    many = _table09("Many", [[_n(c) for c in range(100)]] * 1000, numcols=big, nc=[big] + [100] * 999)
+    data = numbers09(_ws("A", spans) + _ws("B", quotas) + _ws("C", rows) + _ws("D", many))
+    assert len(data) > 5_000_000
+    ctx = Context()
+    t0 = time.perf_counter()
+    doc = iwork.parse_bytes(data, ctx, "numbers")
+    took = time.perf_counter() - t0
+    tabs = {s.title: [b for b in s.blocks if isinstance(b, Table)] for s in doc.blocks}
+    assert [len(t.rows) for t in tabs["A"]] == [1] and [len(t.rows) for t in tabs["B"]] == [100], tabs["A"]
+    assert tabs["C"] == [] and [len(t.rows) for t in tabs["D"]] == [1], tabs["D"]  # one row takes every value
+    assert ctx.skipped == {"sheet_cut": 3, "record": 1}, ctx.skipped
+    assert ctx.warnings == ["sheet Spans cut at 1000 columns", "sheet Rows cut at 100000 rows",
+                            "sheet Many cut at 1000 columns"], ctx.warnings
+    assert took < 3, took
 
 
 def main():

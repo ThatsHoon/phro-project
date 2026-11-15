@@ -552,3 +552,17 @@ def keynote09(slides_xml, *, styles="", masters="", files={}, gz=False, root=Non
            f'</key:theme-list><key:stylesheet><sf:styles>{styles}</sf:styles></key:stylesheet>'
            f'<key:slide-list>{slides_xml}</key:slide-list></{root}>')
     return _xml_zip("index.apxl", xml, files, gz)
+
+
+# -- iWork '09 Numbers (Task 16): an index.xml holding ls:document, its sheets in ls:workspace-array.
+
+LS = "http://developer.apple.com/namespaces/ls"
+
+
+def numbers09(workspaces_xml, *, extra="", files={}, gz=False) -> bytes:
+    """A Numbers '09 file: `index.xml` holding ls:document {ls:stylesheet, `extra` (template parts outside the
+    sheets), ls:workspace-array `workspaces_xml`}."""
+    xml = (f'<?xml version="1.0"?>\n<ls:document {_NS} xmlns:ls="{LS}" ls:version="92008102400">'
+           '<ls:stylesheet sfa:ID="SFSStylesheet-1"><sf:styles/></ls:stylesheet>'
+           f'{extra}<ls:workspace-array>{workspaces_xml}</ls:workspace-array></ls:document>')
+    return _xml_zip("index.xml", xml, files, gz)
