@@ -146,14 +146,30 @@ def test_toc_entry_ends_paragraph():
     assert _paras("Introduction ........ 1", "Scope · · · ··········· 12",
                   "Appendix . . . . iv") == ["Introduction ........ 1",
                                              "Scope · · · ··········· 12", "Appendix . . . . iv"]
-    assert _paras("Terms ___ 3", "Index ‥‥…5", "Notes ... XII") == [
-        "Terms ___ 3", "Index ‥‥…5", "Notes ... XII"]
+    assert _paras("Terms ____ 3", "Index ‥‥…5", "Notes .... XII") == [
+        "Terms ____ 3", "Index ‥‥…5", "Notes .... XII"]
     # the line after an entry starts its own paragraph, and it joins the lines after it
     assert _paras("Contents ..... 9", "Body text goes", "on here.") == [
         "Contents ..... 9", "Body text goes on here."]
 
 
+def test_toc_leader_forms():
+    # a leader counts dots, 4 or more (… is 3, ‥ is 2), its marks mixed or a single space
+    # apart; the page label may be a chapter page or set between hyphens
+    for entry in ("第一章 総則‥‥3", "序論・・・・3", "제1장 서론 …… 1", "．．．．5",
+                  "Scope · · · · 7", "Part … … 2", "Index ....\u30008", "Index ....\t\xa08",
+                  "Setup ...... 3-1", "Annex ...... A-1", "Preface ...... - 3 -",
+                  "Annex ...... -A-1-"):
+        assert _paras(entry, "the text goes on") == [entry, "the text goes on"], entry
+
+
 def test_toc_ending_needs_leader_and_label():
+    # a prose ellipsis is 3 dots, short of a leader: the lines join
+    assert _paras("Well... I", "the text goes on") == ["Well... I the text goes on"]
+    assert _paras("values 1, 2, ... 10", "the text goes on") == [
+        "values 1, 2, ... 10 the text goes on"]
+    assert _paras("and so on ... iv", "the text goes on") == ["and so on ... iv the text goes on"]
+    assert _paras("pages ‥. 4", "the text goes on") == ["pages ‥. 4 the text goes on"]
     # dots with no page label, a number with no leader, or too short a leader: the lines join
     assert _paras("and so on...", "the text goes on") == ["and so on... the text goes on"]
     assert _paras("chapter 12", "the text goes on") == ["chapter 12 the text goes on"]
