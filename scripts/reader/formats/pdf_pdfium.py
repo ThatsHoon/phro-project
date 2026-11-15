@@ -28,9 +28,12 @@ last page and the document; pdf.py calls it in a finally.
   fragments are native's instead (below).
   With native None, a text object with an /OC content mark is hidden "ocg" (the group's state is
   native's to know; without native the marked text is taken as off).
-  A char pdfium has no Unicode for (`FPDFText_HasUnicodeMapError`: a font with no ToUnicode and no
-  usable CID ordering, whose char pdfium gives as the raw code) is dropped, never shown; with
-  native None its font counts `glyphs` once per document, by base font name.
+  A char pdfium has no Unicode for (`FPDFText_HasUnicodeMapError`), whose char pdfium gives as the
+  raw code (a glyph id read as a code point, for a CID font), is dropped, never shown: when its
+  font is one native reads by guess or not at all where no ToUnicode entry maps a code
+  (`_guessed_cid_fonts`, by base font name), and with native None in any font, which then counts
+  `glyphs` once per document, by base font name. Elsewhere (a simple font's code with no glyph
+  name) it stays as pdfium gives it.
 - Page objects are walked iteratively in content order, form XObjects included to FORM_DEPTH
   levels, each object's matrix composed with its forms' (pdfium gives a nested object's matrix
   in its form's space). Path points go through that matrix into `pdf_tables.PathCollector`, with
@@ -53,8 +56,8 @@ last page and the document; pdf.py calls it in a finally.
   which marked text the group covers: that page's fragments come from the native interpreter.
   So do they on a page with vertical text (a column pdfium saw, or a page font whose Encoding is a
   vertical CMap): native's vertical fragments are the reference. And on a page where pdfium
-  dropped a char it has no Unicode for: native reads such a font by reversing its embedded cmap,
-  or drops its text and counts `glyphs`.
+  dropped such a char: native reads its font by reversing its embedded cmap, or drops its text and
+  counts `glyphs`.
 
 Counts, as in `pdfnative.document`: `.cut` is the document total, each `PageData.cut` the part
 its page added (a page is added once). The object walk past `pdf.PDF_PAGE_OBJECTS`, a form past
@@ -89,6 +92,7 @@ IMAGE_FILTERS = 8                # filters read per image
 OPTION_LABELS = annotations.FIELD_KIDS  # list-box options read per field
 OUTLINE_SCAN = 4 * annotations.OUTLINE_ITEMS  # bookmarks visited for the outline
 PAGE_FONTS = 256                 # fonts of a page's /Resources looked at for a vertical CMap
+_ADOBE_ORDERINGS = ("Japan1", "GB1", "CNS1", "Korea1", "KR")  # the CID tables fonts.cid_fallback_decoder has
 OBJECT_MARKS = 16                # content marks read per text object (for /OC, native None)
 # a font width under this share of the loose box is not taken for an upright glyph's advance: an
 # overhang is a fraction of the glyph (the bench's f is 0.87 of its box, an italic h 0.95), and
@@ -143,6 +147,69 @@ def _vertical_fonts(native, resources) -> bool:
         elif encoding is not None and encoding_wmode(str(encoding)) == 1:
             return True
     return False
+
+
+def _system_name(pdf, value) -> str:
+    value = pdf.resolve(value)
+    if isinstance(value, bytes) and len(value) <= 32:
+        return value.decode("ascii", "ignore")
+    return str(value) if isinstance(value, str) else ""
+
+
+def _base_name(pdf, value) -> str:
+    """A BaseFont without its subset tag, as PdfiumDoc._font gives it."""
+    name = pdf.resolve(value)
+    name = str(name) if isinstance(name, str) else ""
+    tag, plus, rest = name.partition("+")
+    return rest if plus and len(tag) == 6 and tag.isupper() else name
+
+
+def _guessed_cid_fonts(native, resources) -> frozenset:
+    """The base font names (Type0's and its CIDFont's) of the Type0 fonts in the page's /Resources
+    /Font, or a form XObject's the page holds (FORM_DEPTH levels), whose CIDs native cannot look up
+    in an Adobe ordering's table: where no ToUnicode entry maps a code, native reverses the font's
+    embedded TrueType cmap (as fonts.cid_fallback_decoder does for an embedded Identity-GID font
+    even of an Adobe ordering), or its text is lost. At most PAGE_FONTS fonts and PAGE_FONTS forms."""
+    pdf = native.pdf
+    found = set()
+    stack, seen, fonts_left, forms_left = [(resources, 0)], {id(resources)}, PAGE_FONTS, PAGE_FONTS
+    while stack:
+        res, depth = stack.pop()
+        table = pdf.resolve(res.get("Font"))
+        for ref in (table.values() if isinstance(table, dict) else ()):
+            fonts_left -= 1
+            if fonts_left < 0:
+                return frozenset(found)
+            font = pdf.resolve(ref)
+            if not isinstance(font, dict) or str(font.get("Subtype", "")) != "Type0":
+                continue
+            kids = pdf.resolve(font.get("DescendantFonts"))
+            cid = pdf.resolve(kids[0]) if isinstance(kids, list) and kids else None
+            cid = cid if isinstance(cid, dict) else {}
+            system = pdf.resolve(cid.get("CIDSystemInfo"))
+            system = system if isinstance(system, dict) else {}
+            descriptor = pdf.resolve(cid.get("FontDescriptor"))
+            embedded_gid = (str(pdf.resolve(cid.get("Subtype"))) == "CIDFontType2"
+                            and isinstance(descriptor, dict)
+                            and isinstance(pdf.resolve(descriptor.get("FontFile2")), PDFStream)
+                            and not isinstance(pdf.resolve(cid.get("CIDToGIDMap")), PDFStream))
+            if (embedded_gid or _system_name(pdf, system.get("Registry")) != "Adobe"
+                    or _system_name(pdf, system.get("Ordering")) not in _ADOBE_ORDERINGS):
+                found.update(n for n in (_base_name(pdf, font.get("BaseFont")),
+                                         _base_name(pdf, cid.get("BaseFont"))) if n)
+        if depth >= FORM_DEPTH:
+            continue
+        forms = pdf.resolve(res.get("XObject"))
+        for ref in (forms.values() if isinstance(forms, dict) else ()):
+            form = pdf.resolve(ref)
+            inner = pdf.resolve(form.dictionary.get("Resources")) if isinstance(form, PDFStream) else None
+            if isinstance(inner, dict) and id(inner) not in seen:
+                forms_left -= 1
+                if forms_left < 0:
+                    return frozenset(found)
+                seen.add(id(inner))
+                stack.append((inner, depth + 1))
+    return frozenset(found)
 
 
 def _finite(*values) -> bool:
@@ -340,9 +407,12 @@ class PdfiumDoc:
             turn = page.get_rotation()
         except Exception:  # noqa: BLE001
             turn = 0
+        # with native, a char pdfium has no Unicode for is dropped (and its page native's) only in a
+        # font native would guess: a simple font's code with no glyph name stays
+        drop = None if self.native is None else self._guessed(index)
         textpage = page.get_textpage()
         try:
-            fragments, vertical, (unmapped, lost) = self._chars(textpage, cut)
+            fragments, vertical, (unmapped, lost) = self._chars(textpage, cut, drop)
         finally:
             textpage.close()
         native = self._native_fragments(index, cut, vertical, bool(lost))
@@ -383,6 +453,15 @@ class PdfiumDoc:
                         figure=collector.figure, links=links, fields=fields, comments=comments,
                         chars=chars, cut=cut, render=render, unmapped=unmapped)
 
+    def _guessed(self, index) -> frozenset:
+        native = self.native
+        if index >= native.page_count:
+            return frozenset()
+        try:
+            return _guessed_cid_fonts(native, native.resources(index))
+        except Exception:  # noqa: BLE001
+            return frozenset()
+
     def _native_fragments(self, index, cut, vertical, unmapped):
         """(fragments, glyphs without Unicode) of the native interpreter, on three kinds of page;
         None elsewhere.
@@ -392,9 +471,9 @@ class PdfiumDoc:
         - A page with vertical text: pdfium saw a column (`vertical`), or the page's fonts name a
           vertical CMap (`_vertical_fonts`, which also finds a one-glyph column). Native's
           vertical fragments are the reference; should its page fail, pdfium's own stay.
-        - A page where pdfium dropped chars it has no Unicode for (`unmapped`): native reverses
-          the font's embedded cmap, or drops the text and counts `glyphs`; should its page fail,
-          pdfium's own stay, those chars dropped."""
+        - A page where pdfium dropped chars it has no Unicode for (`unmapped`, in a font of
+          `_guessed_cid_fonts`): native reverses the font's embedded cmap, or drops the text and
+          counts `glyphs`; should its page fail, pdfium's own stay, those chars dropped."""
         native = self.native
         if native is None or index >= native.page_count:
             return None
@@ -426,9 +505,10 @@ class PdfiumDoc:
 
     # -- chars
 
-    def _chars(self, textpage, cut):
+    def _chars(self, textpage, cut, drop):
         """(fragments, whether a vertical column was seen, (the chars dropped for having no
-        Unicode, the base font names they were in))). A text object's direction is its char
+        Unicode, the base font names they were in)); they are dropped in the fonts named in `drop`,
+        or in any font when it is None. A text object's direction is its char
         matrix's x axis, unless its second char sits below its first along the glyph's up: a
         vertical font, whose glyphs advance down the up axis; the object then reads with native's
         vertical axes (direction -up, up the x axis), which pdf_layout.vertical_lines takes."""
@@ -459,7 +539,8 @@ class PdfiumDoc:
         seen = 0    # non-space chars kept
         bad = False
         capped = False
-        lost = {}  # font address: handle, of the chars pdfium has no Unicode for
+        lost = set()  # base font names of the chars dropped for having no Unicode
+        names = {}    # font address: base font name, of the chars pdfium has no Unicode for
         dropped = 0
 
         def begin(px, py, start, end, base, axis, size):
@@ -484,14 +565,18 @@ class PdfiumDoc:
                 if c in (0x0D, 0x0A):
                     flush()
                 continue
-            if raw.FPDFText_HasUnicodeMapError(tp, at) == 1:
+            if drop != frozenset() and raw.FPDFText_HasUnicodeMapError(tp, at) == 1:
                 # no ToUnicode entry and no CID ordering for the code: pdfium's char is the raw
                 # code (a glyph id read as a code point), never shown as text
                 handle = raw.FPDFText_GetTextObject(tp, at)
                 font = raw.FPDFTextObj_GetFont(handle) if handle else None
-                lost.setdefault(_address(font), font)
-                dropped += 1
-                continue
+                key = _address(font)
+                if key not in names:
+                    names[key] = self._font(font)
+                if drop is None or names[key] in drop:
+                    lost.add(names[key])
+                    dropped += 1
+                    continue
             if 0xDC00 <= c <= 0xDFFF:
                 continue  # a low surrogate with no high one before it
             if 0xD800 <= c <= 0xDBFF:
@@ -641,7 +726,7 @@ class PdfiumDoc:
             cut["bad_coord"] += 1
         if scan_cut and not capped:
             cut["page_part"] += 1
-        return frags, vertical, (dropped, {self._font(font) for font in lost.values()})
+        return frags, vertical, (dropped, lost)
 
     @staticmethod
     def _fragment(run, order):

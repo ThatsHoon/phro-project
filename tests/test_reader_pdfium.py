@@ -605,10 +605,11 @@ ARIAL = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "Fonts" / "arial.ttf
 NO_FONT_CODES = b"04101234 2F000C210D55"  # pdfium shows these CIDs as U+0410 U+1234 U+2F00 ...
 
 
-def _identity_pdf(codes, font_file=None):
-    """An Identity-H Type0 font with no ToUnicode and Ordering (Identity) showing `codes`, then a
-    line in the plain font; `font_file` (TrueType bytes) is embedded with CIDToGIDMap Identity."""
-    objs = font_type0(tounicode=None, ordering="Identity")
+def _identity_pdf(codes, font_file=None, tounicode=None):
+    """An Identity-H Type0 font of Ordering (Identity) showing `codes`, with no ToUnicode or the
+    `tounicode` given, then a line in the plain font; `font_file` (TrueType bytes) is embedded with
+    CIDToGIDMap Identity."""
+    objs = font_type0(tounicode=tounicode, ordering="Identity")
     if font_file is not None:
         objs[101]["FontDescriptor"] = Ref(102)
         objs[101]["CIDToGIDMap"] = Name("Identity")
@@ -620,13 +621,13 @@ def _identity_pdf(codes, font_file=None):
     return simple_pdf([body], resources=dict(F1, Font={"F1": Ref(3), "F2": Ref(100)}), extra_objects=objs)
 
 
-def _arial_pdf(text):
+def _arial_pdf(text, tounicode=None):
     from reader.pdfnative import cid_unicode
     font = ARIAL.read_bytes()
     gid_of = {}
     for gid, ch in sorted(cid_unicode.reverse_truetype_cmap(font).items()):
         gid_of.setdefault(ch, gid)
-    return _identity_pdf("".join("%04X" % gid_of[c] for c in text).encode(), font)
+    return _identity_pdf("".join("%04X" % gid_of[c] for c in text).encode(), font, tounicode)
 
 
 def test_pdfium_identity_without_tounicode():
@@ -636,6 +637,8 @@ def test_pdfium_identity_without_tounicode():
     cases = [(_identity_pdf(NO_FONT_CODES), None, "\u0410\u1234")]
     if ARIAL.is_file():
         cases.append((_arial_pdf("HelloWorld"), "HelloWorld", "+HOOR"))
+        # a ToUnicode that maps none of the codes (seen in the bench): the same as none
+        cases.append((_arial_pdf("HelloWorld", tounicode={}), "HelloWorld", "+HOOR"))
     for data, want, garbage in cases:
         native = run(data, engine="native")
         assert "plain words here" in native["md"] and (want is None or want in native["md"]), native
@@ -646,6 +649,19 @@ def test_pdfium_identity_without_tounicode():
         md = alone["md"]
         assert "plain words here" in md and garbage not in md, md
         assert alone["skipped"] == {"glyphs": 1}, alone["skipped"]
+
+
+def test_pdfium_simple_font_code_stays():
+    # a simple font's code with no glyph name (0x1F) is flagged too, but native reads that font
+    # by its encoding: the page stays pdfium's (its "fi" glyph read as two letters, not native's U+FB01)
+    font = {"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("Helvetica"),
+            "Encoding": {"Type": Name("Encoding"), "BaseEncoding": Name("WinAnsiEncoding"),
+                         "Differences": [128, Name("fi")]}}
+    data = simple_pdf([b"BT /F3 12 Tf 72 700 Td (\\200nal \\037 word) Tj ET " + text_ops("plain words here", 72, 680)],
+                      resources=dict(F1, Font={"F1": Ref(3), "F3": Ref(100)}), extra_objects={100: font})
+    assert "ﬁnal" in run(data, engine="native")["md"]
+    got = run(data)
+    assert "final" in got["md"] and not got["skipped"], (got["md"], got["skipped"])
 
 
 def test_pdfium_unmapped_page_rendered():
