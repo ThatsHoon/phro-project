@@ -119,6 +119,7 @@ So hidden text in 6+ files is not detected and can reach the body. The README st
   - Formula text is never shown: every IWA formula cell has its value.
   - A sheet's sticky notes go into `Section.comments`.
   - '09 hidden rows are not read.
+  - '09 charts (`sf:chart-info`) are counted `chart`, not read (amended 2026-11-15, Task 16).
 - **Picture kinds.** `images.sniff` learns `wpg` (`FF 'WPC'` with file type 0x16), `heic` (`ftypheic`, `ftypheix`, `ftypmif1`) and `pdf` (`%PDF-`). All three are kept as files and listed as not viewable.
 - **App by extension.** The iWork app is taken from the extension. When its root is missing, the other two apps' roots are tried, so a renamed file still reads.
 - **obriensp's iWorkFileFormat** (MIT, documentation) is format knowledge. No code is ported, so it gets no notices section.
@@ -327,7 +328,7 @@ Shared code they reuse, unchanged unless the edit is named:
 | Numbers | `## Sheet: name`, then each table as a pipe or HTML table (caption = table name), charts, images, text boxes; sticky notes as `> Comment: …` |
 | Keynote | `## Slide N: Title`, the body, `> Notes: …`, `> Comment by Author: …` |
 | iWork image | `![](assets/img-NNN.png)`; heic, tiff and pdf data listed as not viewable |
-| Hidden | wpd undo, Pages deletions, Numbers hidden rows and columns, KF8 `display:none` and `hidden`, skipped slides: left out and counted; `--hidden` marks them `(hidden)` |
+| Hidden | wpd undo, Pages (IWA) deletions, Numbers hidden rows and columns, KF8 `display:none` and `hidden`, skipped slides: left out and counted; `--hidden` marks them `(hidden)` |
 
 ### Limits
 
@@ -365,7 +366,7 @@ The plan's measure task runs `snappy.iwa` over 256 MiB and the wpd body walk ove
 - **Bombs.** Snappy declares at most 21 times its input. The declared length is checked against `SNAPPY_BLOCK` and the budget before any output, and output past the declaration fails. PalmDOC and HUFF output stop at the record cap; HUFF recursion and the dictionary are capped. '09 gzip stops at `IWORK_XML`. An `Index.zip` keeps `zipx`'s own ratio and total checks.
 - **Cycles.** CDIC self-reference, WordPerfect note → packet → note, WP5 index chains, iWork references, style parents and value-table segments are cut by visited sets and depth caps.
 - **Huge tables.** A false tileid or span is stopped by the row, column and slot caps. Rows are never allocated from a declared count.
-- **Planted text.** KF8 `display:none` and `hidden`, wpd undo and Pages deletions are hidden by default. WP6+ hidden text is not detected (Hidden text in WordPerfect). Heading text in the context is cleaned by `gate._heading`, as now.
+- **Planted text.** KF8 `display:none` and `hidden`, wpd undo and Pages (IWA) deletions are hidden by default. Pages '09 tracked changes are not read, so their deleted text shows as body text (amended 2026-11-15, Task 15: no public source names the '09 change elements). WP6+ hidden text is not detected (Hidden text in WordPerfect). Heading text in the context is cleaned by `gate._heading`, as now.
 - **External programs.** Nothing is run, except `soffice` under the user's own `PHRO_READER_SOFFICE`.
 
 ### Errors and LOST counts
@@ -419,6 +420,8 @@ In "## Document reader":
   - Numbers number formats beyond the six kinds show raw values.
   - Text positions may be off after emoji in iWork.
   - WordPerfect 6+ hidden text may show as body text.
+  - Pages '09 tracked changes are not read: deleted text shows as body text.
+  - iWork '09 charts are counted, not read.
   - Mac WordPerfect needs `PHRO_READER_SOFFICE`.
   - WPG pictures are files only.
 - The phase 3 bench lines are added after the phase.
