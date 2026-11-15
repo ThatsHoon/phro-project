@@ -22,7 +22,8 @@ theme's language, so its placeholders say what a paragraph is, as in docling); b
 `sf:bold` property; lists from `sf:list-style` on the paragraph, else the paragraph style chain's `sf:listStyle`
 (`sf:liststyle-ref` or an inline style), the rung `sf:list-level` (0 is body text) picking the ladder's
 `sf:list-label-typeinfo` (`none` plain, a numbering `sf:text-label` type "1.", any other "-"); `sf:media` and
-`sf:image` give `Image` from the first `sf:data` (`sf:path` or `path`) whose member is in the package, an `-ref`
+`sf:image` give `Image` from the first `sf:data` (`sf:path` or `path`) whose member is in the package (a name that is
+not ASCII also under zipfile's code page 437 reading, as for IWA data), an `-ref`
 inside searched REF_DEPTH levels into its target, once by id (REF_DEPTH and MAX_RUNG are local lookup bounds, not
 Limits caps); `sf:ghost-text` and `sf:ghost-text-ref` are the template's placeholder text and are dropped uncounted.
 
@@ -555,6 +556,11 @@ class Reader:
             self._noted -= 1
 
     # ---- pictures and tables
+    def _found(self, path: str | None) -> str | None:
+        """A data path's member as the package lists it, its code page 437 reading tried second (Apple's zip leaves
+        the UTF-8 flag off, as for IWA data: `iwork_iwa.find_member`); None when neither is there."""
+        return iwork_iwa.find_member(self.pkg, path) if path else None
+
     def _data_path(self, el) -> tuple[str | None, bool]:
         """(the first data path under `el` whose member is in the package, whether any path or ref was named). Its
         own sf:data come first; then each `-ref` other than a style's is searched (`_near_data`), once by id."""
@@ -562,8 +568,8 @@ class Reader:
         for d in el.iter(DATA):
             raw = _attr(d, "path")
             named = named or bool(raw)
-            path = _member(raw)
-            if path and self.pkg.has(path):
+            path = self._found(_member(raw))
+            if path:
                 return path, True
         for d in el.iter():
             if not _ref(d) or d.tag.endswith("style-ref"):
@@ -586,8 +592,8 @@ class Reader:
             below = []
             for el in level_:
                 if el.tag == DATA:
-                    path = _member(_attr(el, "path"))
-                    if path and self.pkg.has(path):
+                    path = self._found(_member(_attr(el, "path")))
+                    if path:
                         return path
                 below.extend(el)
             level_ = below
@@ -1091,6 +1097,10 @@ class Reader:
                     self.walk(el, got, inside=False)
                     out.extend(got)
                 continue
+            if tag == ATTACHMENT:  # entered here: never read again as an unplaced attachment, nor counted `object`
+                if id(el) in self.entered:
+                    continue
+                self.entered.add(id(el))
             stack.extend(reversed(el))
 
     def _leftovers(self):
@@ -1119,7 +1129,9 @@ class Reader:
     def _footnote_storage(self, el):
         """A footnote mark opens a footnote and a footnote break closes it, inside one paragraph too. In a storage
         with no marks, content after a close (or at the start) opens one. Content outside a footnote joins the last
-        one, or the first one when it comes before it, so no blank or stray paragraph shifts the pairing."""
+        one, or the first one when it comes before it, so no blank or stray paragraph shifts the pairing. "The first
+        one" holds within the first storage only: a later storage's leading content joins the previous storage's last
+        footnote (a documented limit; a real storage starts at a mark)."""
         fns, marked = self._fn_blocks, next(el.iter(FOOTNOTE_MARK), None) is not None
         cur, lead = None, []
 

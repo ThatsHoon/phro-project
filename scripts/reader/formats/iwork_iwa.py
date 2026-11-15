@@ -71,6 +71,17 @@ def read_member(pkg, name: str) -> bytes:
         raise ReadError("damaged", f"{name}: {type(e).__name__}")
 
 
+def find_member(pkg, name: str, prefix: str = "") -> str | None:
+    """`prefix + name` as the package lists it, None when it is not there. Apple writes a member name in UTF-8
+    without the zip flag that says so, so zipfile lists a name that is not ASCII under its code page 437 reading,
+    which is tried second (docling `_read_data`); cp437 maps every byte, so that reading never fails. `prefix` is
+    taken from the listing already, so it is not read again."""
+    for n in dict.fromkeys((name, name.encode("utf-8").decode("cp437"))):
+        if pkg.has(prefix + n):
+            return prefix + n
+    return None
+
+
 class Store:
     """`objects` maps id -> (type, payload). `pkg` is the outer package and `prefix` the folder its `Data/` sits in
     (that of the Index.zip, else empty). `budget`, `scan` and `cache` are the document's table state: the cells and
@@ -99,17 +110,11 @@ class Store:
         return len(self._path)
 
     def _member(self, data_id: int) -> str | None:
-        """`Data/<file name>` of a data id as the package lists it, None when it is not there. Apple writes the name
-        in UTF-8 without the zip flag that says so, so zipfile lists a name that is not ASCII under its code page 437
-        reading, which is tried second (docling `_read_data`)."""
+        """`Data/<file name>` of a data id as the package lists it (`find_member`), None when it is not there."""
         name = self.datas.get(data_id)
         if not name:
             return None
-        for n in dict.fromkeys((name, name.encode("utf-8").decode("cp437"))):
-            member = self.prefix + "Data/" + n
-            if self.pkg.has(member):
-                return member
-        return None
+        return find_member(self.pkg, name, self.prefix + "Data/")
 
     def has_data(self, data_id: int) -> bool:
         """Whether a data id names a member that is in the package (nothing is read or counted)."""

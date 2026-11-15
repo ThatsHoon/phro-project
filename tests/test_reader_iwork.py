@@ -236,6 +236,41 @@ def test_09_gz_cap():
         iwork.IWORK_XML = old
 
 
+def test_09_gz_ratio_and_node_cap():
+    # a ~100 KB gzip index that would inflate to 100 MiB is cut by the inflaters' ratio rule (ZIP_RATIO x its size,
+    # at least ZIP_RATIO_FLOOR), well before IWORK_XML, so it is refused as too large without the 100 MiB
+    big = b"<sl:document>" + b"<a/>" * (100 * 2**20 // 4) + b"</sl:document>"
+    data = gzip.compress(big, 9)
+    assert len(data) < 200_000, len(data)
+    t0 = time.perf_counter()
+    e = _raises(ReadError, iwork.parse_bytes, iwork_zip({"index.xml.gz": data}), Context(), "pages")
+    assert e.kind == "too_large" and time.perf_counter() - t0 < 2, (e.kind, e.detail)
+    # an index of more than IWORK_NODES elements is refused before more are built, stored or inflated
+    assert iwork.IWORK_NODES == 2_000_000
+    xml = b"<r>" + b"<a/>" * 1001 + b"</r>"
+    with _limit(iwork, "IWORK_NODES", 1000):
+        for members in ({"index.xml": xml}, {"index.xml.gz": gzip.compress(xml)}):
+            e = _raises(ReadError, iwork.parse_bytes, iwork_zip(members), Context(), "pages")
+            assert e.kind == "too_large" and "1000 elements" in e.detail, (e.kind, e.detail)
+        doc, ctx = _x(pages09(_p("fits")))  # far fewer than 1000 elements
+    assert doc.blocks == [Para([Text("fits")])], doc.blocks
+
+
+def test_09_picture_utf8_name():
+    # an '09 picture whose file name is not ASCII: Apple's zip leaves the UTF-8 flag off, so zipfile lists the name
+    # under its code page 437 reading; the picture is found under either, directly and through a ref
+    body = _p("x") + _media("사진 1.png")
+    data = pages09(body, files={"사진 1.png": PNG})
+    assert "사진 1.png" not in Package(data).names
+    doc, ctx = _x(data)
+    assert doc.blocks == [Para([Text("x")]), Image(PNG)] and not ctx.skipped, (doc.blocks, ctx.skipped)
+    pic = '<sf:unfiltered sfa:ID="u1"><sf:data sf:path="그림.png"/></sf:unfiltered>'
+    extra = f'<sf:attachments><sf:attachment sfa:ID="z">{pic}</sf:attachment></sf:attachments>'
+    doc, ctx = _x(pages09(_p("y") + '<sf:media><sf:unfiltered-ref sfa:IDREF="u1"/></sf:media>', extra=extra,
+                          files={"그림.png": PNG}))
+    assert Image(PNG) in doc.blocks and "image" not in ctx.skipped, (doc.blocks, ctx.skipped)
+
+
 def test_index_zip_one_folder_down():
     inner = iwork_zip({"Index/Document.iwa": _doc_member(archive(7, 10000, pb((1, "body"))))})
     with _walk() as seen:
@@ -1990,6 +2025,18 @@ def test_09_drawables_guarded_one_by_one():
     assert ctx.skipped == {"shape": 1}, ctx.skipped
 
 
+def test_09_bare_attachment_in_drawables_once():
+    # an sf:attachment straight inside a drawables container is read there once: Pages does not read it again as an
+    # unplaced attachment, and Keynote does not count it `object`
+    att = f'<sf:attachment sfa:ID="a1"><sf:drawable-shape>{_box(_p("boxed"))}</sf:drawable-shape></sf:attachment>'
+    doc, ctx = _x(pages09(_p("Body"), extra=f'<sl:drawables><sl:page-group>{att}</sl:page-group></sl:drawables>'))
+    assert doc.blocks == [Para([Text("Body")]), Para([Text("boxed")])] and not ctx.skipped, (doc.blocks, ctx.skipped)
+    att = f'<sf:attachment sfa:ID="k1"><sf:shape>{_box(_p("in"))}</sf:shape></sf:attachment>'
+    doc, ctx = _x(keynote09(slide09(_p("T"), _p("B"), drawables=att)), "key")
+    assert [(s.title, s.blocks) for s in doc.blocks] == [("T", [Para([Text("B")]), Para([Text("in")])])], doc.blocks
+    assert not ctx.skipped, ctx.skipped
+
+
 def _reads(data):
     """`_x`, and the picture members read through `iwork_iwa.read_member` (the index is read through it too)."""
     from reader.formats import iwork_iwa
@@ -2467,7 +2514,8 @@ def test_09_numbers_hostile_linear():
 def measure(what):
     """Not a test: `snappy` unpacks 256 MiB of 64 KiB blocks (a 4 KiB literal, then copy-2 tags) and prints
     `SNAPPY <MiB> <s>`; `archives` parses IWA_OBJECTS small objects in one unpacked stream and prints
-    `ARCHIVES <objects> <MiB> <s>`. Built in memory."""
+    `ARCHIVES <objects> <MiB> <s>`; `nodes` parses an '09 index of IWORK_NODES bare elements and prints
+    `NODES <elements> <MiB> <s> <MiB held>`. Built in memory."""
     if what == "snappy":
         lit = bytes(range(256)) * 16
         body = snappy_literal(lit)[2:]  # tags without the declared length
@@ -2488,8 +2536,21 @@ def measure(what):
         took = time.perf_counter() - t0
         assert len(found) == n and not capped
         print(f"ARCHIVES {n} {len(stream) / 2**20:.1f} {took:.2f}")
+    elif what == "nodes":
+        import tracemalloc
+        from reader.containers.zipx import parse_xml_ns
+        n = iwork.IWORK_NODES
+        xml = b"<r>" + b"<a/>" * (n - 1) + b"</r>"
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        root, _ = parse_xml_ns(xml, n)
+        took = time.perf_counter() - t0
+        held = tracemalloc.get_traced_memory()[0]
+        tracemalloc.stop()
+        assert len(root) == n - 1
+        print(f"NODES {n} {len(xml) / 2**20:.1f} {took:.2f} {held / 2**20:.0f}")
     else:
-        raise SystemExit("measure snappy | archives")
+        raise SystemExit("measure snappy | archives | nodes")
 
 
 def limits_iwa_bytes():

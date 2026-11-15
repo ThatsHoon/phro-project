@@ -5,7 +5,8 @@ Ported from docling (MIT) `docling/backend/iwork_backend.py` (`_open_container`,
 `docling/backend/iwork/legacy.py` (the '09 gzip ceiling). The checks run in order:
 1. a `.iwpv2` or `.iwph` member at any depth is `encrypted` (an encrypted .iwa may start with 0x00 by chance);
 2. iWork '09: a root `index.xml`, `index.xml.gz`, `index.apxl` or `index.apxl.gz`, stored or deflated (any other
-   zip method is Pages' password marker, `encrypted`), `.gz` inflated within `IWORK_XML`, goes to `iwork_xml`;
+   zip method is Pages' password marker, `encrypted`), `.gz` inflated within `IWORK_XML` and flate's ratio rule,
+   parsed to at most `IWORK_NODES` elements (past either: too_large), goes to `iwork_xml`;
 3. IWA: root `Index/*.iwa`, or an `Index.zip` at the root or one folder down, opened in memory; an `Index.zip`
    inside that one counts `document` and is not opened. The app comes from the extension (`iwork_iwa.walk`);
 4. nothing readable, or a body with no block: `preview.jpg`, else `QuickLook/Thumbnail.jpg`, is the only block,
@@ -25,6 +26,12 @@ from ..model import Doc, Image
 from . import iwork_iwa
 
 IWORK_XML = 100 * 2**20  # bytes of an inflated '09 index (docling's ceiling)
+# elements of an '09 index (`zipx.parse_xml_ns`); past it the index is too_large. The gunzip also keeps flate's ratio
+# rule (at most ZIP_RATIO x the .gz size, ZIP_RATIO_FLOOR at least: a 100 KB .gz stops near 20 MB), and a deflated
+# index.xml zipx's, but even 20 MB of `<a/>` builds 5 million elements. Measured 2026-11-16 on the development machine
+# (`test_reader_iwork.py measure nodes`, under tracemalloc): 2,000,000 bare elements (7.6 MiB) parse in 2.18 s and
+# hold 154 MiB; a real index of 100 MiB at 52 bytes or more an element fits.
+IWORK_NODES = 2_000_000
 APPS = {".pages": "pages", ".numbers": "numbers", ".key": "key"}
 LOCKS = (".iwpv2", ".iwph")
 XML_INDEXES = ("index.xml", "index.xml.gz", "index.apxl", "index.apxl.gz")
@@ -71,7 +78,8 @@ def _xml(pkg, name: str, app: str, ctx) -> Doc | None:
             data = flate.gunzip(data, flate.Budget(), IWORK_XML)
         except ValueError as e:  # flate.Truncated is one
             raise ReadError("damaged", f"{name}: {e}")
-    root, _ = parse_xml_ns(data)
+    root, _ = parse_xml_ns(data, IWORK_NODES)
+    del data
     from . import iwork_xml  # the '09 reader; imported here so the IWA path never needs it
     return iwork_xml.parse(root, app, pkg, ctx)
 

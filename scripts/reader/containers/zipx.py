@@ -56,25 +56,42 @@ def parse_xml(data: bytes):
 
 
 class _NsBuilder(ET.TreeBuilder):
-    """TreeBuilder that also records every namespace declaration: prefix -> set of URIs."""
+    """TreeBuilder that also records every namespace declaration: prefix -> set of URIs. With `max_nodes`, the
+    element past it raises too_large before it is built."""
 
-    def __init__(self):
+    def __init__(self, max_nodes=None):
         super().__init__()
         self.ns = {}
+        self.left = max_nodes
 
     def start_ns(self, prefix, uri):
         self.ns.setdefault(prefix, set()).add(uri)
 
+    def start(self, tag, attrs):
+        if self.left is not None:
+            self.left -= 1
+            if self.left < 0:
+                raise _TooMany()
+        return super().start(tag, attrs)
 
-def parse_xml_ns(data: bytes):
-    """(root, {prefix: {uri, ...}}) with every declaration in the document; same refusals as parse_xml."""
+
+class _TooMany(Exception):
+    pass
+
+
+def parse_xml_ns(data: bytes, max_nodes: int | None = None):
+    """(root, {prefix: {uri, ...}}) with every declaration in the document; same refusals as parse_xml. With
+    `max_nodes`, a document of more elements is too_large (part), refused before the one past it is built, since
+    ElementTree holds about 80 bytes an element however small its text."""
     if _declares_entities(data):
         raise ReadError("damaged", "XML declares a DOCTYPE or ENTITY")
-    builder = _NsBuilder()
+    builder = _NsBuilder(max_nodes)
     try:
         parser = ET.XMLParser(target=builder)
         parser.feed(data)
         root = parser.close()
+    except _TooMany:
+        raise ReadError("too_large", f"{limits.BIG_PART}: XML of more than {max_nodes} elements") from None
     except _XML_ERRORS as e:
         raise ReadError("damaged", f"XML parse error: {e}")
     return root, builder.ns
