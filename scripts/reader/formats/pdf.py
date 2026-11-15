@@ -83,6 +83,12 @@ def _outside(b, page) -> bool:
     return b[2] <= page[0] or b[0] >= page[2] or b[3] <= page[1] or b[1] >= page[3]
 
 
+def _one_line(s: str) -> str:
+    """A comment's text, its author or a field label on one line, its line breaks as " / " (as a
+    field value's are): a line of it must not start a markdown line such as "## Page 9"."""
+    return " / ".join(part for part in (p.strip() for p in s.splitlines()) if part)
+
+
 def _turn(rotate) -> int:
     turn = 0
     if isinstance(rotate, (int, float)) and not isinstance(rotate, bool) and math.isfinite(rotate):
@@ -257,9 +263,9 @@ class _Reader:
         turn = pdf_layout.upright_turn(pd.fragments, _turn(pd.rotate))
         view = _view_page(turn, pd.box)
         keep = _Kept(pd.number, view)
-        keep.comments = ([Para([Text(f"Field {label}: {value}")]) for label, value in pd.fields]
-                         + [Para([Text(f"Comment by {c.author}: {c.text}" if c.author
-                                       else f"Comment: {c.text}")],
+        keep.comments = ([Para([Text(f"Field {_one_line(label)}: {value}")]) for label, value in pd.fields]
+                         + [Para([Text(f"Comment by {_one_line(c.author)}: {_one_line(c.text)}" if c.author
+                                       else f"Comment: {_one_line(c.text)}")],
                                  hidden="hidden" if c.hidden else "") for c in pd.comments])
         scan = None
         unmapped = pd.unmapped > pd.chars  # mostly glyphs without Unicode: an image, like a scan

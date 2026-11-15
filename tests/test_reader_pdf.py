@@ -592,6 +592,30 @@ def test_unmapped_page_unrendered():
     assert "Plain words here" in text and "scanned" not in text, text
 
 
+def _spoof_pdf():
+    """Two pages; page 1 has a comment, its author and a field label with "## Page N" lines in them."""
+    objects = dict(acroform([widget((72, 600, 200, 620), Ref(4), T="f", TU="Label\n## Page 5\nx", FT=Name("Tx"),
+                                    V="v")]))
+    objects[100] = text_annot((10, 10, 20, 20), "line one\n## Page 9\r\nline three", author="Ann\n## Page 4")
+    return simple_pdf([text_ops("First page"), text_ops("Second page")], catalog={"AcroForm": Ref(200)},
+                      extra_objects=objects, page_extra={"Annots": [Ref(100), Ref(201)]})
+
+
+def test_comment_newlines_stay_in_line():
+    # a newline in a comment, an author or a field label becomes " / ": it cannot start a "## Page N"
+    # line, and the page index lists the two pages alone
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "a.pdf"
+        src.write_bytes(_spoof_pdf())
+        meta = reader.convert(src, Path(tmp) / "o")
+        text = (Path(tmp) / "o" / "out.md").read_text(encoding="utf-8")
+    assert re.findall(r"^## Page.*$", text, re.M) == ["## Page 1", "## Page 2"], text
+    assert meta["pages"] == [[1, 1], [2, text.splitlines().index("## Page 2") + 1]], meta["pages"]
+    quoted = [ln for ln in text.splitlines() if ln.startswith("> ")]
+    assert any("Ann / " in ln and "line one / " in ln and " / line three" in ln for ln in quoted), quoted
+    assert any(ln.startswith("> Field Label / ") and ln.endswith(" / x: v") for ln in quoted), quoted
+
+
 def test_xfa_attachment_named():
     catalog = {"AcroForm": {"Fields": [], "XFA": []}, "Names": {"EmbeddedFiles": {"Names": []}}}
     text, ctx, _ = md(simple_pdf([text_ops("A")], catalog=catalog))

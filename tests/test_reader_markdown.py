@@ -538,6 +538,19 @@ def test_page_heading_xps_unchanged():
     assert "## Page" not in R(Doc(blocks=[Section("page", blocks=[P("a")])]))
 
 
+def test_stats_pages_renderer_heads():
+    # a "## Page N" line inside a comment is not a page head: stats counts the heads the renderer wrote
+    nl = chr(10)
+    doc = Doc(blocks=[Section("page", number=1, blocks=[P("a")], comments=[P("x" + nl + "## Page 9")]),
+                      Section("page", number=2, blocks=[P("b")])])
+    info = {}
+    md = R(doc, info=info)
+    assert "## Page 9" in md.splitlines(), md
+    lines = md.splitlines()
+    assert markdown.stats(md, info["pages"])["pages"] == [[1, 1], [2, lines.index("## Page 2") + 1]], (md, info)
+    assert markdown.stats(md)["pages"] == [[1, 1], [9, 6], [2, 8]], markdown.stats(md)  # the text alone
+
+
 def test_stats_pages():
     md = "x" + chr(10) + "## Page 1" + chr(10) + "a" + chr(10) + "## Page 2: T" + chr(10) + chr(92) + "## Page 9" + chr(10)
     assert markdown.stats(md)["pages"] == [[1, 2], [2, 4]]

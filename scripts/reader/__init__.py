@@ -78,7 +78,7 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
     if info["empty"] and info["lost"]:  # every content part failed: nothing was read
         raise ReadError("damaged", "nothing readable (could not read: " + ", ".join(info["lost"]) + ")")
     (out_dir / "out.md").write_text(md, encoding="utf-8", newline="\n")
-    st = markdown.stats(md)
+    st = markdown.stats(md, info["pages"])
     warnings = list(ctx.warnings) + [w for w in doc.warnings if w not in ctx.warnings]
     if garble_ratio(md) > 0.05:
         warnings.append("garbled")
