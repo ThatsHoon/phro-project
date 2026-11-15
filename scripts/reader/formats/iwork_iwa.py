@@ -33,7 +33,7 @@ from collections.abc import Callable, Iterable
 from .. import limits
 from ..containers import flate, pbwire, snappy
 from ..limits import ReadError
-from ..model import Context, Doc, Image, Section
+from ..model import Bold, Context, Doc, Hidden, Image, Link, NoteRef, Para, Section
 from . import iwork_tables, iwork_text, sheet_grid
 
 IWA_BYTES = 256 * 2**20     # unpacked bytes of all .iwa members of one document (the flate.Budget iwork builds)
@@ -424,10 +424,15 @@ WALKS["pages"] = _pages
 def _sticky(store: Store, id: int, text, notes: dict, ctx) -> list:
     """A sticky note (TSWP.CommentInfoArchive, 2014, 2 -> 3056) and its replies as `Section.comments` lines: the
     thread is read by `TextReader.comment_thread`, so it is emitted once a document, and its note is moved out of
-    Doc.notes. One that cannot be read counts `note`."""
-    cid = None
-    with ctx.guard("note"):
-        cid = iwork_text.ref(store.get(id, COMMENT_INFO), 2)
+    Doc.notes. Its comment id is read once a document (`store.cache`), so a note placed many times is parsed once.
+    One that cannot be read counts `note`, once."""
+    key = ("sticky", id)
+    if key in store.cache:
+        cid = store.cache[key]
+    else:
+        cid = store.cache[key] = None
+        with ctx.guard("note"):
+            cid = store.cache[key] = iwork_text.ref(store.get(id, COMMENT_INFO), 2)
     nid = text.comment_thread(cid)
     return notes.pop(nid, []) if nid is not None else []
 
@@ -440,7 +445,7 @@ def _sheet(store: Store, sid: int, text, doc: Doc, ctx) -> Section | None:
         f = store.get(sid, NUMBERS_SHEET)
         name = pbwire.one(f, 1)
         sec = Section("sheet", (bytes(name).decode("utf-8", "replace") if isinstance(name, memoryview) else "").strip())
-        for d in iwork_text.refs(f, 2):
+        for d in dict.fromkeys(iwork_text.refs(f, 2)):
             if store.objects.get(d, (None,))[0] == COMMENT_INFO:
                 sec.comments.extend(_sticky(store, d, text, doc.notes, ctx))
             else:
@@ -475,22 +480,50 @@ def _kind(store: Store, id) -> int | None:
     return store.objects.get(id, (None,))[0] if isinstance(id, int) else None
 
 
-def _slide_title(store: Store, pid: int, text, ctx) -> tuple[str, list]:
-    """(title, blocks that are not text) of a title placeholder: its paragraphs' visible text as one line, cut to
-    MAX_TITLE; a picture or table anchored in it goes to the slide's body. Read once a document by id (a placeholder
-    two slides share titles both); one that cannot be read counts `shape` and gives no title."""
+def _title_parts(items, refs: list, hidden: list):
+    """The note marks (`refs`, ids) and the hidden runs (`hidden`, the inlines themselves) of a title's inlines,
+    looking inside bold and link runs; a hidden run keeps its own marks, for the renderer's hidden-mark rule."""
+    stack = [iter(items)]
+    while stack:
+        it = next(stack[-1], None)
+        if it is None:
+            stack.pop()
+        elif isinstance(it, Hidden) or it.hidden:
+            hidden.append(it)
+        elif isinstance(it, NoteRef):
+            refs.append(it.id)
+        elif isinstance(it, (Bold, Link)):
+            stack.append(iter(it.inlines))
+
+
+def _slide_title(store: Store, pid: int, text, doc: Doc, ctx) -> tuple[str, list, list]:
+    """(title, body blocks, comments) of a title placeholder: its paragraphs' visible text as one line, cut to
+    MAX_TITLE. A picture, table or hidden paragraph anchored in it goes to the slide's body, and its hidden runs too,
+    as one paragraph of them (left out and counted by default, shown by --hidden). The notes its visible marks name
+    (comments, footnotes) are moved out of Doc.notes into the slide's comments, since a title shows no mark. Read once
+    a document by id (a placeholder two slides share titles both; its body blocks and notes go to the first); one
+    that cannot be read counts `shape` and gives no title. The text reader's blocks are shared: none is changed."""
     key = ("kn_title", pid)
     if key in store.cache:
-        return store.cache[key], []
+        return store.cache[key], [], []
     store.cache[key] = ""
-    title, extra = "", []
+    title, extra, comments = "", [], []
     with ctx.guard("shape"):
         sid = _shape_storage(store, pid)
         blocks = text.blocks(sid) if sid is not None else []
         title = " ".join(" ".join(iwork_text.plain(blocks)).split())[:MAX_TITLE]
-        extra = [b for b in blocks if not hasattr(b, "inlines") or b.hidden]
+        refs, hidden = [], []
+        for b in blocks:
+            if not hasattr(b, "inlines") or b.hidden:
+                extra.append(b)
+            else:
+                _title_parts(b.inlines, refs, hidden)
+        if hidden:
+            extra.append(Para(hidden))
+        for nid in dict.fromkeys(refs):
+            comments.extend(doc.notes.pop(nid, []))
     store.cache[key] = title
-    return title, extra
+    return title, extra, comments
 
 
 def _slide(store: Store, sid: int, number: int, skipped: bool, text, doc: Doc, ctx) -> Section | None:
@@ -506,7 +539,7 @@ def _slide(store: Store, sid: int, number: int, skipped: bool, text, doc: Doc, c
         title, body, slide_number = (iwork_text.ref(f, n) for n in (5, 6, 20))
         order = []
         if _kind(store, title) == KN_PLACEHOLDER:
-            s.title, extra = _slide_title(store, title, text, ctx)
+            s.title, extra, s.comments = _slide_title(store, title, text, doc, ctx)
             s.blocks.extend(extra)
         elif title is not None:
             order.append(title)  # not a placeholder: read as any drawable, first
@@ -525,7 +558,9 @@ def _slide(store: Store, sid: int, number: int, skipped: bool, text, doc: Doc, c
             else:
                 s.blocks.extend(drawable_blocks(store, d, ctx, text, "key"))
         note = iwork_text.ref(f, 27)
-        if note is not None:
+        if note is not None and ("kn_note", note) not in store.cache:
+            # a note two slides share is read once, on the first: its storage is placed there
+            store.cache[("kn_note", note)] = True
             with ctx.guard("note"):
                 nf = store.get(note, KN_NOTE)
                 storage = iwork_text.ref(nf, 1) if nf is not None else None
@@ -591,13 +626,16 @@ WALKS["key"] = _keynote
 def walk(store: Store, app: str, ctx) -> Doc | None:
     """The document from `WALKS[app]`, else from the other two apps' walks in turn (a renamed file still reads);
     None when no walk finds its root. A walk that raises (a ReadError excepted) counts `document` under
-    `ctx.guard`, adds one to `store.failed`, and the next app is tried."""
+    `ctx.guard`, adds one to `store.failed`, and the next app is tried. Each walk starts with an empty visited set,
+    an empty `store.cache` and no chart cells spent against CHART_TOTAL."""
     for name in (app,) + tuple(a for a in APPS if a != app):
         fn = WALKS.get(name)
         if fn is None:
             continue
         store.visited.clear()
         store._path.clear()
+        store.cache.clear()  # each app reads with its own caches and its own CHART_TOTAL
+        store.chart_cells = 0
         doc, failed = None, True
         with ctx.guard("document"):
             doc = fn(store, ctx)

@@ -722,17 +722,18 @@ def _chart(store, chart_id, ctx) -> Table:
     grid = pbwire.msg(c, 7)
     row_names, col_names = grid.get(1, []), grid.get(2, [])
     # whole rows are read until more than CHART_CELLS values are (an empty row counts one), as hwp_chart reads its
-    # grid; one row is read to CHART_CELLS values
-    rows, width, read, cut = [], 0, 0, False
+    # grid (rows_cut); one row is read to CHART_CELLS values (values_cut). A row that is not a message is passed over.
+    rows, width, read, rows_cut, values_cut, bad = [], 0, 0, False, False, False
     for row in grid.get(3, []):
         if read > limits.CHART_CELLS:
-            cut = True
+            rows_cut = True
             break
         if not isinstance(row, memoryview):
+            bad = True
             continue
         values = pbwire.fields(row).get(1, [])
         if len(values) > limits.CHART_CELLS:
-            values, cut = values[:limits.CHART_CELLS], True
+            values, values_cut = values[:limits.CHART_CELLS], True
         rows.append([_chart_value(v) for v in values])
         width = max(width, len(rows[-1]))
         read += max(len(rows[-1]), 1)
@@ -761,7 +762,11 @@ def _chart(store, chart_id, ctx) -> Table:
         points += len(values)
     if not series:
         raise ValueError("a chart with no values")
-    return series_table(caption, cats, series, len(series) < n_series or (cut and by_row), cut and not by_row, ctx)
+    if bad:  # the chart is shown without those rows: counted once (a chart with no values counted only that)
+        ctx.skipped["chart"] += 1
+    # by row a cut row list drops series and a cut row drops points; by column the other way round
+    series_cut = len(series) < n_series or (rows_cut if by_row else values_cut)
+    return series_table(caption, cats, series, series_cut, values_cut if by_row else rows_cut, ctx)
 
 
 def chart_block(store, chart_id: int, ctx) -> Table | None:
@@ -769,9 +774,10 @@ def chart_block(store, chart_id: int, ctx) -> Table | None:
     10000 is the ChartArchive {1 type, 5 series direction, 7 grid {1 row names, 2 column names, 3 rows {1 values
     {1 numeric}}}, 10 -> 5023 title}, captioned `Chart: <type> — <title>` (the type as docling's table names it).
     By column, the default, each column is a series over the row names; by row, each row over the column names. A
-    grid read only in part, or cut to CHART_CELLS, counts `chart_cut` once (in series_table). A chart that cannot be
-    read or holds no values counts `chart`, as does one that would take the document past CHART_TOTAL table cells
-    (each placement charged, as in the other formats)."""
+    grid read only in part, or cut to CHART_CELLS, counts `chart_cut` once (in series_table), its caption naming
+    the points or series cut. A chart that cannot be read or holds no values counts `chart`, as does one with a grid
+    row that is not a message (once, the rest shown) and one that would take the document past CHART_TOTAL table
+    cells (each placement charged, as in the other formats)."""
     table = None
     with ctx.guard("chart"):
         table = _chart(store, chart_id, ctx)

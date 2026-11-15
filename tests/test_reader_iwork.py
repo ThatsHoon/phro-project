@@ -1346,6 +1346,17 @@ def test_chart_cut():
     assert t.caption == "Chart: column — T (first 2 points, first 1 series)", t.caption
     assert _cells(t) == [["", "A"], ["r0", "0"], ["r1", "1"]], _cells(t)
     assert ctx.skipped == {"chart_cut": 1}, ctx.skipped
+    # by row, a row cut to CHART_CELLS values cuts points, not series
+    with _limit(limits, "CHART_CELLS", 4):
+        doc, ctx = _numbers(*chart(1, ["r"], [f"c{i}" for i in range(10)], [list(range(10))], None, by_row=True),
+                            sheets=[("S", [500])])
+    [t] = _tables(doc)
+    assert t.caption == "Chart: column (first 1 points)" and ctx.skipped == {"chart_cut": 1}, (t.caption, ctx.skipped)
+    # a grid row that is not a message is passed over, counted `chart` once; the rest is shown
+    grid = pb((1, "r1"), (1, "r2"), (2, "A"), (3, 5), (3, 6), (3, pb((1, pb((1, 2.0))))))
+    doc, ctx = _numbers(archive(500, 5021, pb((10000, pb((1, 1), (7, grid))))), sheets=[("S", [500])])
+    [t] = _tables(doc)
+    assert _cells(t) == [["", "A"], ["r1", "2"]] and ctx.skipped == {"chart": 1}, (_cells(t), ctx.skipped)
     # past CHART_TOTAL a whole chart is left out, counted `chart`
     with _limit(limits, "CHART_TOTAL", 8):
         doc, ctx = _numbers(*chart(1, ["r"], ["A"], [[1]], None, id=500), *chart(1, ["r"], ["A"], [[1]], None, id=510),
@@ -1397,6 +1408,7 @@ def test_skipped_slide():
     assert [s.hidden for s in doc.blocks] == ["", "hidden", ""], doc.blocks
     md = _md(doc, ctx)
     assert "skipped body" not in md and "## Slide 2" not in md and "## Slide 3: C" in md, md
+    assert "(1 hidden places left out)" in md, md  # decision 6: left out and counted
     md = _md(doc, ctx, hidden=True)
     assert "## Slide 2: S (hidden)" in md and "skipped body" in md, md
 
@@ -1455,6 +1467,47 @@ def test_slide_failures():
     _raises(ReadError, iwork.parse_bytes, iwork_zip(members), Context(), "key")
 
 
+def test_slide_title_notes_and_hidden():
+    # a comment on the title text: the title shows no mark, so its note moves to the slide's comments
+    title = storage("Title", comments=[(0, 960), (2, None)])
+    doc, ctx = _keynote([{"title": title, "body": "b"}], highlight(960, 961), comment(961, "on title"))
+    sec = doc.blocks[0]
+    assert sec.title == "Title" and not doc.notes and len(sec.comments) == 1, (sec.title, doc.notes, sec.comments)
+    md = _md(doc, ctx)
+    assert "## Slide 1: Title" in md and "> Comment: on title" in md and "[^" not in md and not ctx.skipped, md
+    # a deleted run in the title: left out of the title, counted by default, shown by --hidden in the body
+    title = storage("Kept gone", deletions=[(5, 970), (9, None)])
+    doc, ctx = _keynote([{"title": title}], archive(970, 2060, pb((1, 2))))
+    assert doc.blocks[0].title == "Kept", doc.blocks[0].title
+    md = _md(doc, ctx)
+    assert "gone" not in md and "(1 hidden places left out)" in md, md
+    md = _md(doc, ctx, hidden=True)
+    assert "(hidden: gone)" in md and "## Slide 1: Kept\n" in md, md
+
+
+def test_walk_resets_between_apps():
+    # the next app's walk starts with no cache and no chart cells spent
+    seen = []
+
+    def first(store, ctx):
+        store.cache["x"] = 1
+        store.chart_cells = limits.CHART_TOTAL
+        return None
+
+    def second(store, ctx):
+        seen.append((dict(store.cache), store.chart_cells))
+        return Doc(blocks=[Para([Text("ok")])])
+
+    old = dict(iwork_iwa.WALKS)
+    try:
+        iwork_iwa.WALKS.update({"key": first, "pages": second})
+        iwork.parse_bytes(iwork_zip({"Index/Document.iwa": _doc_member()}), Context(), "key")
+    finally:
+        iwork_iwa.WALKS.clear()
+        iwork_iwa.WALKS.update(old)
+    assert seen == [({}, 0)], seen
+
+
 def test_keynote_linear():
     # 2,000 slides sharing one big drawable and one chart title part of 50,000 fields, one z-order list of 200,000
     # copies of one id: every shared part is read once
@@ -1473,6 +1526,31 @@ def test_keynote_linear():
     assert len(doc.blocks) == n and not ctx.skipped, ctx.skipped
     assert sum(isinstance(b, Table) for s in doc.blocks for b in s.blocks) == n
     assert doc.blocks[1].blocks[0].caption == "Chart: column — t", doc.blocks[1].blocks
+    assert took < 2, took
+    # 1,000 slides sharing one comment (2014) and one note (15), each padded with 50,000 fields: each parsed once
+    junk = [(9, 1)] * 50000
+    slides = [{"title": f"S{i}", "drawables": [BIG + 3], "note": BIG + 5} for i in range(1000)]
+    data = iwork_zip({"Index/Document.iwa": iwa_member(
+        *keynote_doc(slides), archive(BIG + 3, 2014, pb((1, b""), (2, pb_ref(BIG + 4)), *junk)),
+        comment(BIG + 4, "c"), archive(BIG + 5, 15, pb((1, pb_ref(BIG + 6)), *junk)),
+        archive(BIG + 6, 2001, storage("the note")))})
+    ctx = Context()
+    t0 = time.perf_counter()
+    doc = iwork.parse_bytes(data, ctx, "key")
+    took = time.perf_counter() - t0
+    assert [bool(s.comments) for s in doc.blocks[:2]] == [True, False] and doc.blocks[0].notes, doc.blocks[:2]
+    assert sum(bool(s.notes) for s in doc.blocks) == 1 and not ctx.skipped, ctx.skipped
+    assert took < 2, took
+    # Numbers: 1,000 sheets sharing one padded sticky note, one sheet listing it 200,000 times
+    sheets = [("S%d" % i, [BIG + 3] * (200000 if i == 0 else 1)) for i in range(1000)]
+    data = iwork_zip({"Index/Document.iwa": iwa_member(
+        *numbers_doc(sheets), archive(BIG + 3, 2014, pb((1, b""), (2, pb_ref(BIG + 4)), *junk)),
+        comment(BIG + 4, "c"))})
+    ctx = Context()
+    t0 = time.perf_counter()
+    doc = iwork.parse_bytes(data, ctx, "numbers")
+    took = time.perf_counter() - t0
+    assert len(doc.blocks) == 1000 and sum(len(s.comments) for s in doc.blocks) == 1 and not ctx.skipped, ctx.skipped
     assert took < 2, took
 
 
