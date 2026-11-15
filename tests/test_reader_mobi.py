@@ -475,6 +475,15 @@ def test_text_records_past_the_file():
     assert ctx.skipped["record"] == 1 and "before" in _text_of(doc.blocks)
 
 
+def test_stripped_script_offsets_in_the_text_itself():
+    out = mobi._stripped("<p>İİİİ a</p><script>x()</script><p>after</p>".encode(), Context())
+    assert [_text_of(p) for p in out] == ["İİİİ a", "after"]
+    out = mobi._stripped(b"<p>a</p><script>x</scripts>y</script ><p>b</p>", Context())
+    assert [_text_of(p) for p in out] == ["a", "b"]
+    out = mobi._stripped(b"<p>a</p><style>x</ style><p>b</p>", Context())
+    assert [_text_of(p) for p in out] == ["a", "b"]
+
+
 def test_regexes_stay_linear():
     import time
     for unit in (b"<mbp:pagebreak ", b"<p", b"<script ", b"<a filepos=1 ", b"<img recindex=1 "):

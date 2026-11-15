@@ -35,6 +35,7 @@ _PAGEBREAK = re.compile(rb"<mbp:pagebreak\b[^<>]*>(?:\s*</mbp:pagebreak>)?", re.
 _BLOCK_TAG = re.compile(r"<\s*/?\s*(?:p|div|br|hr|h[1-6]|li|ul|ol|dl|dt|dd|tr|table|blockquote|pre|section|article|"
                         r"mbp:pagebreak)\b[^<>]*>", re.I)
 _DEAD = re.compile(r"<\s*(script|style)\b", re.I)
+_CLOSE = {"script": re.compile(r"</\s*script\b", re.I), "style": re.compile(r"</\s*style\b", re.I)}
 _TAG = re.compile(r"<[^<>]*>")
 
 
@@ -241,18 +242,17 @@ def _loader(palm: Palm, head: Head, ctx):
 # ---- stripped text
 def _drop_dead(s: str) -> str:
     """The text without script and style elements; one with no close tag runs to the end. Linear: each close tag is found
-    with str.find, never by a pattern that could scan to the end from every start."""
-    low = s.lower()
+    with a pattern of its own, never by a pattern that could scan to the end from every start."""
     out, pos = [], 0
     while True:
         m = _DEAD.search(s, pos)
         if not m:
             break
         out.append(s[pos:m.start()])
-        close = low.find("</" + m.group(1).lower(), m.end())
-        if close < 0:
+        c = _CLOSE[m.group(1).lower()].search(s, m.end())
+        if not c:
             return "".join(out)
-        gt = s.find(">", close)
+        gt = s.find(">", c.end())
         if gt < 0:
             return "".join(out)
         pos = gt + 1
