@@ -118,7 +118,7 @@ class PageData:
     `box` is the crop box in page space; `short` the sub-1-unit rule pieces kept for the
     short-dash supplement; `figure` is (union box or None, non-rule path count); `links` is
     [(box, url)], `fields` [(label, value)]; `cut` counts what a cap dropped; `render` is
-    (box, dpi) -> png bytes or None.
+    (box, dpi) -> png bytes or None; `unmapped` counts the glyphs dropped for having no Unicode.
     """
     number: int
     box: Tuple[float, float, float, float]
@@ -134,6 +134,7 @@ class PageData:
     chars: int = 0
     cut: Counter = field(default_factory=Counter)
     render: Optional[Callable] = None
+    unmapped: int = 0
 
 
 # ---- rotation

@@ -573,6 +573,25 @@ def test_unmapped_font_garble_warning():
         assert json.loads((Path(tmp) / "o2" / "meta.json").read_text(encoding="utf-8"))["warnings"] == meta["warnings"]
 
 
+def _unmapped_page(lines, plain):
+    """`lines` lines of four codes in an Identity font with no ToUnicode and no font file, then `plain`."""
+    body = b" ".join(b"BT /F2 12 Tf 72 %d Td <0001000200030004> Tj ET" % (750 - 20 * i) for i in range(lines))
+    return simple_pdf([body + b" " + text_ops(plain, y=100)], resources={"Font": {"F1": Ref(3), "F2": Ref(100)}},
+                      extra_objects=font_type0(tounicode=None, ordering="Identity"))
+
+
+def test_unmapped_page_unrendered():
+    # its glyphs without Unicode outnumber its chars: the page is offered as an image, like a scan;
+    # native has no render, so it goes on `unrendered` and counts `scan`
+    text, ctx, doc = md(_unmapped_page(30, "Title"))
+    assert doc.meta["unrendered"] == [1] and ctx.skipped == {"glyphs": 1, "scan": 1}, (doc.meta, ctx.skipped)
+    assert "Title" in text and "scanned page not shown" in text, text
+    # more chars than unmapped glyphs: the page reads as text
+    text, ctx, doc = md(_unmapped_page(1, "Plain words here"))
+    assert doc.meta["unrendered"] == [] and ctx.skipped == {"glyphs": 1}, (doc.meta, ctx.skipped)
+    assert "Plain words here" in text and "scanned" not in text, text
+
+
 def test_xfa_attachment_named():
     catalog = {"AcroForm": {"Fields": [], "XFA": []}, "Names": {"EmbeddedFiles": {"Names": []}}}
     text, ctx, _ = md(simple_pdf([text_ops("A")], catalog=catalog))

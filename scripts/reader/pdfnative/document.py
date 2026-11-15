@@ -196,4 +196,5 @@ class NativeDoc:
         return PageData(number=index + 1, box=box, rotate=turn, fragments=content.fragments,
                         segments=content.segments, short=content.short, images=shown,
                         figure=content.figure, links=links, fields=self.fields.get(index, []),
-                        comments=comments, chars=chars, cut=cut, render=None)
+                        comments=comments, chars=chars, cut=cut, render=None,
+                        unmapped=content.unmapped_glyphs)

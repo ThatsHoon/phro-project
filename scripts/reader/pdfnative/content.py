@@ -125,6 +125,7 @@ class PageContent:
     objects: int  # page objects walked, forms included
     cut: Counter = field(default_factory=Counter)
     unmapped: int = 0  # text operators whose font could not be decoded (their text is gone)
+    unmapped_glyphs: int = 0  # the codes those operators showed
 
 
 class _Stop(Exception):
@@ -312,6 +313,7 @@ class _Page:
         self.positions_left = MAX_TRACKED_PAGE
         self.positions_cut = False
         self.unmapped = 0
+        self.unmapped_glyphs = 0
         self.link_reliable = True
         self._fonts = {}   # id(resources) -> (resources, {name: FontInfo})
         self._labels = {}  # (id(resources), name) -> BaseFont
@@ -496,8 +498,11 @@ class _Page:
         if font is None:
             # no usable Tf: read the bytes plainly rather than lose the text
             font = FontInfo(decode=default_byte_decoder, widths=WidthMap({}, 500.0), code_bytes=1)
-        if font.unmapped and any(isinstance(item, bytes) and item for item in items):
-            self.unmapped += 1
+        if font.unmapped:
+            shown = sum(len(item) for item in items if isinstance(item, bytes))
+            if shown:
+                self.unmapped += 1
+                self.unmapped_glyphs += max(1, shown // max(1, font.code_bytes))
         if font.wmode == 1:
             self._show_vertical(items, st, font, off, frags)
             return
@@ -772,4 +777,4 @@ def interpret(pdf: PDFFile, content: bytes, resources, fonts_cache: dict, oc: OC
         else:
             page.cut["bad_coord"] += 1
     return PageContent(fragments, paths.segments, paths.short_segments, paths.figure,
-                       page.image_draws, page.objects, page.cut, page.unmapped)
+                       page.image_draws, page.objects, page.cut, page.unmapped, page.unmapped_glyphs)

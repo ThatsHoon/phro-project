@@ -340,12 +340,12 @@ class PdfiumDoc:
             turn = 0
         textpage = page.get_textpage()
         try:
-            fragments, vertical, lost = self._chars(textpage, cut)
+            fragments, vertical, (unmapped, lost) = self._chars(textpage, cut)
         finally:
             textpage.close()
         native = self._native_fragments(index, cut, vertical, bool(lost))
         if native is not None:
-            fragments = native
+            fragments, unmapped = native
         else:
             for name in lost - self._unmapped_seen:
                 self._unmapped_seen.add(name)
@@ -379,10 +379,11 @@ class PdfiumDoc:
         return PageData(number=index + 1, box=box, rotate=turn, fragments=fragments,
                         segments=collector.segments, short=collector.short_segments, images=shown,
                         figure=collector.figure, links=links, fields=fields, comments=comments,
-                        chars=chars, cut=cut, render=render)
+                        chars=chars, cut=cut, render=render, unmapped=unmapped)
 
     def _native_fragments(self, index, cut, vertical, unmapped):
-        """The fragments of the native interpreter, on three kinds of page; None elsewhere.
+        """(fragments, glyphs without Unicode) of the native interpreter, on three kinds of page;
+        None elsewhere.
         - Decision 3: a page whose resources name an off group (their hidden="ocg" marks the off
           text). Should the native page fail, its text is left out (counted page_part) rather
           than shown with the off layer's text in it.
@@ -410,29 +411,29 @@ class PdfiumDoc:
             if not off:
                 return None
             cut["page_part"] += 1
-            return []
+            return [], 0
         except Exception:  # noqa: BLE001
             if not off:
                 return None
             cut["page_part"] += 1
-            return []
+            return [], 0
         for kind, value in got.cut.items():
             if kind not in ("image", "annotation", "field"):  # pdfium reads those itself
                 cut[kind] += value
-        return list(got.fragments)
+        return list(got.fragments), got.unmapped
 
     # -- chars
 
     def _chars(self, textpage, cut):
-        """(fragments, whether a vertical column was seen, the base font names of the chars
-        dropped for having no Unicode). A text object's direction is its char
+        """(fragments, whether a vertical column was seen, (the chars dropped for having no
+        Unicode, the base font names they were in))). A text object's direction is its char
         matrix's x axis, unless its second char sits below its first along the glyph's up: a
         vertical font, whose glyphs advance down the up axis; the object then reads with native's
         vertical axes (direction -up, up the x axis), which pdf_layout.vertical_lines takes."""
         tp = textpage.raw
         count = raw.FPDFText_CountChars(tp)
         if count <= 0:
-            return [], False, set()
+            return [], False, (0, set())
         limit = CHAR_SCAN * caps.PDF_PAGE_CHARS
         scan_cut = count > limit  # counted page_part only when the scan, not the char cap, stops
         if scan_cut:
@@ -457,6 +458,7 @@ class PdfiumDoc:
         bad = False
         capped = False
         lost = {}  # font address: handle, of the chars pdfium has no Unicode for
+        dropped = 0
 
         def begin(px, py, start, end, base, axis, size):
             return {"addr": addr, "x": px, "y": py, "dx": axis[0], "dy": axis[1], "ux": axis[2],
@@ -486,6 +488,7 @@ class PdfiumDoc:
                 handle = raw.FPDFText_GetTextObject(tp, at)
                 font = raw.FPDFTextObj_GetFont(handle) if handle else None
                 lost.setdefault(_address(font), font)
+                dropped += 1
                 continue
             if 0xDC00 <= c <= 0xDFFF:
                 continue  # a low surrogate with no high one before it
@@ -636,7 +639,7 @@ class PdfiumDoc:
             cut["bad_coord"] += 1
         if scan_cut and not capped:
             cut["page_part"] += 1
-        return frags, vertical, {self._font(font) for font in lost.values()}
+        return frags, vertical, (dropped, {self._font(font) for font in lost.values()})
 
     @staticmethod
     def _fragment(run, order):

@@ -616,6 +616,17 @@ def test_pdfium_identity_without_tounicode():
         assert alone["skipped"] == {"glyphs": 1}, alone["skipped"]
 
 
+def test_pdfium_unmapped_page_rendered():
+    # its glyphs without Unicode outnumber its chars: pdfium renders the page, with the native page
+    # as a backstop and from pdfium's own chars
+    body = b" ".join(b"BT /F2 12 Tf 72 %d Td <0001000200030004> Tj ET" % (750 - 20 * i) for i in range(30))
+    data = simple_pdf([body + b" " + text_ops("Title", y=100)], resources=dict(F1, Font={"F1": Ref(3), "F2": Ref(100)}),
+                      extra_objects=font_type0(tounicode=None, ordering="Identity"))
+    for got in (run(data), run(data, native_fails=True)):
+        assert "Title" in got["md"] and "](assets/" in got["md"] and len(got["assets"]) == 1, got["md"]
+        assert got["skipped"] == {"glyphs": 1} and got["meta"]["unrendered"] == [], (got["skipped"], got["meta"])
+
+
 def test_pdfium_native_damaged():
     got = run(simple_pdf([text_ops("Only pdfium reads")]), native_fails=True)
     assert "Only pdfium reads" in got["md"] and got["meta"]["engine"] == "pdfium", got

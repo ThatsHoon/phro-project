@@ -16,6 +16,10 @@ puts the page on `unrendered` like one with no render. A `timeout` ReadError alw
 The document totals of what pdfnative's caps dropped come from `NativeDoc.cut` alone, added once
 at the end, except `bad_coord` (fragments with coordinates out of range): text was lost, so the
 page counts `text`, once with the char cap.
+
+A page whose glyphs without Unicode (dropped, counted `glyphs`) outnumber its chars is offered as
+an image, as a scan is: pdfium renders it; native, with no render, puts it on `unrendered` and
+counts `scan`.
 """
 import math
 import time
@@ -258,7 +262,8 @@ class _Reader:
                                        else f"Comment: {c.text}")],
                                  hidden="hidden" if c.hidden else "") for c in pd.comments])
         scan = None
-        if pd.chars == 0:
+        unmapped = pd.unmapped > pd.chars  # mostly glyphs without Unicode: an image, like a scan
+        if pd.chars == 0 or unmapped:
             covers = [(_cover(im.box, pd.box), i) for i, im in enumerate(pd.images)]
             best = max(covers, default=(0.0, -1))
             if best[0] >= SCAN_COVER:
@@ -267,7 +272,7 @@ class _Reader:
         steps = (lambda: self._text(pd, turn, keep, state),
                  lambda: self._tables(pd, turn, keep, state),
                  lambda: self._images(pd, turn, keep, state, scan),
-                 lambda: self._renders(pd, turn, keep, scan))
+                 lambda: self._renders(pd, turn, keep, scan, unmapped))
         for k, step in enumerate(steps):
             if k and self._late(t0):
                 break
@@ -381,14 +386,16 @@ class _Reader:
         self.image_bytes += len(data)
         return data
 
-    def _renders(self, pd, turn, keep, scan):
-        if scan is not None:
+    def _renders(self, pd, turn, keep, scan, unmapped=False):
+        if scan is not None or unmapped:
+            data = None
             if pd.render is not None:
                 data = self._render(lambda: pd.render(None, _dpi(pd.box, RENDER_DPI)))
-            else:
+            elif not unmapped:
                 data = self._render(lambda: scan.data)  # native: the page's own image
             if data:
-                keep.items.append((math.inf, 0.0, -1, Image(data, alt=f"Scanned page {pd.number}")))
+                alt = f"Page {pd.number}, text without Unicode" if unmapped else f"Scanned page {pd.number}"
+                keep.items.append((math.inf, 0.0, -1, Image(data, alt=alt)))
             else:
                 self.unrendered.append(pd.number)
                 self.ctx.skipped["scan"] += 1
