@@ -221,6 +221,40 @@ def test_other_compound_saved_as_doc():
     assert "hwp body text" in str(d.blocks), d.blocks
 
 
+def _wp6_bytes(body):
+    """A WordPerfect 6+ file with an empty prefix index: the head, the index header at 16 (one entry, itself), the
+    body from 30."""
+    head = b"\xffWPC" + u32(30) + bytes((1, 0x0A, 2, 1)) + u16(0) + u16(16)
+    return head + struct.pack("<BBH10s", 2, 0, 1, b"") + body
+
+
+def test_wpc_head_goes_to_wpd():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "w.doc"
+        p.write_bytes(_wp6_bytes(b"WordPerfect\x80body"))
+        assert md(p) == "WordPerfect body\n"
+
+
+def test_wp42_doc_goes_to_wpd():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "old.doc"
+        p.write_bytes(b"\xc0\x00\x00\x00\x00\xc0Four point two\x0asecond")
+        assert md(p) == "Four point two\n\nsecond\n", md(p)
+        q = Path(d) / "pw.doc"
+        q.write_bytes(b"\xfe\xff\x61\x61\x12\x34")
+        denied(q, "encrypted")
+        r = Path(d) / "plain.doc"
+        r.write_bytes(b"plain text, not a document")
+        assert denied(r, "damaged").detail == "not a Word document"
+
+
+def test_compound_with_perfectoffice_goes_to_wpd():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "c.doc"
+        make_cfb(p, {"PerfectOffice_MAIN": _wp6_bytes(b"Wrapped\x80text")})
+        assert md(p) == "Wrapped text\n"
+
+
 def test_rtf_saved_as_doc():
     for name, data in (("r.doc", b"{\\rtf1\\ansi hello}"), ("b.doc", b"\xef\xbb\xbf{\\rtf1\\ansi hello}"),
                        ("s.doc", b"\xef\xbb\xbf \r\n{\\rtf1 hello}")):

@@ -1,5 +1,6 @@
 """WordPerfect reader: the Tika character sets, the head, the WP6+ prefix index and body walk, and the WP6+
-sub-documents (notes, comments, headers, footers, watermarks, boxes), pictures and tables.
+sub-documents (notes, comments, headers, footers, watermarks, boxes), pictures and tables; WordPerfect 5.x and 4.2,
+the compound-file wrapper and the LibreOffice switch (Popen faked: no soffice is run).
 
 Run: python -I -X utf8 tests/test_reader_wpd.py
 """
@@ -756,6 +757,409 @@ def test_hostile_index_count():
     struct.pack_into("<H", data, 16 + 2, 65535)
     doc, ctx = _read(bytes(data))
     assert _plain(doc) == ["Body"] and ctx.skipped["record"] == 1 and set(ctx.skipped) == {"record"}, ctx.skipped
+
+
+# ---- WP5 fixtures, built in memory
+
+def _var5(group, sub, payload=b""):
+    """A WP5 variable group: [group][sub][u16 len] payload [u16 len][sub][group], len the whole size minus 4."""
+    n = len(payload) + 4
+    return bytes((group, sub)) + struct.pack("<H", n) + payload + struct.pack("<H", n) + bytes((sub, group))
+
+
+def _wp5(body: bytes, packets=(), *, encryption=0, last_next=0) -> bytes:
+    """A WordPerfect 5.x file: the 16-byte head (major 0, the encryption word in WP5's byte order), from 16 the
+    0xFFFB index blocks (each [0xFFFB][5][50][u32 next] and four 10-byte indexes [u16 type][u32 size][u32 offset]),
+    the packets, then the body. `last_next` is the last block's next pointer (0 ends the chain)."""
+    nb = max(1, -(-len(packets) // 4))
+    at = 16 + 50 * nb
+    blocks, blobs = [], []
+    for k in range(nb):
+        nxt = 16 + 50 * (k + 1) if k < nb - 1 else last_next
+        block = struct.pack("<HHHI", 0xFFFB, 5, 50, nxt)
+        for ptype, blob in packets[4 * k:4 * k + 4]:
+            block += struct.pack("<HII", ptype, len(blob), at)
+            blobs.append(blob)
+            at += len(blob)
+        blocks.append(block.ljust(50, b"\x00"))
+    head = b"\xffWPC" + struct.pack("<I", at) + bytes((1, 0x0A, 0, 1)) + struct.pack(">H", encryption) + b"\x00\x00"
+    return head + b"".join(blocks) + b"".join(blobs) + body
+
+
+def _fn5(text, endnote=False, pages=0):
+    """A WP5 footnote (D6 sub 0) or endnote (sub 1): flags, u16 number, then for a footnote the page count and
+    2 * (pages + 1) + 9 bytes, for an endnote 4 bytes, then the note's text."""
+    head = b"\x00" + struct.pack("<H", 1)
+    head += b"\x00" * 4 if endnote else bytes((pages,)) + b"\x00" * (2 * (pages + 1) + 9)
+    return _var5(0xD6, 1 if endnote else 0, head + text)
+
+
+def _hf5(sub, text, occurrence=1):
+    """A WP5 header or footer (D5 sub 0-3): 7 bytes, the occurrence byte, 10 bytes, the text."""
+    return _var5(0xD5, sub, b"\x00" * 7 + bytes((occurrence,)) + b"\x00" * 10 + text)
+
+
+def _figure5(n, box_type=0x80):
+    """A WP5 figure box (DA sub 0): 48 bytes, the box type, 60 bytes, the u16 picture number."""
+    return _var5(0xDA, 0, b"\x00" * 48 + bytes((box_type,)) + b"\x00" * 60 + struct.pack("<H", n))
+
+
+def _gfx5(*pictures):
+    """A WP5 graphics packet (8): u16 count, u32 sizes, the bytes."""
+    return (struct.pack("<H", len(pictures)) + b"".join(struct.pack("<I", len(p)) for p in pictures)
+            + b"".join(pictures))
+
+
+def _fixed5(code, payload):
+    return bytes((code,)) + payload + bytes((code,))
+
+
+def _cells(table):
+    class _D:
+        def __init__(self, blocks):
+            self.blocks = blocks
+    return [[" ".join(_plain(_D(c.blocks))) for c in row] for row in table.rows]
+
+
+# ---- the brief's tests (Task 9)
+
+def test_wp5_text_notes_headers():
+    body = (_hf5(0, b"Running\x0dhead") + b"Body " + _fixed5(0xC3, b"\x0c") + b"bold" + _fixed5(0xC4, b"\x0c")
+            + _fn5(b"Foot\x0dnote") + b" text\x0aNext" + _fixed5(0xC0, bytes((120, 1))) + b"\xa0end\x0c"
+            + _hf5(2, b"Page foot") + _fn5(b"End", endnote=True) + b"Last")
+    doc, ctx = _read(_wp5(body))
+    assert doc.headers == ["Running head"] and doc.footers == ["Page foot"], (doc.headers, doc.footers)
+    first = doc.blocks[0].inlines
+    assert first == [Text("Body "), Bold([Text("bold")]), NoteRef("fn-1"), Text(" text")], first
+    assert _plain(doc) == ["Body bold text", "NextĢ end", "Last"], _plain(doc)
+    assert doc.blocks[2].inlines == [NoteRef("fn-2"), Text("Last")], doc.blocks[2].inlines
+    assert doc.notes == {"fn-1": [Para([Text("Foot note")])], "fn-2": [Para([Text("End")])]}, doc.notes
+    assert not ctx.skipped, ctx.skipped
+    out = _md(doc, ctx)
+    assert "Body **bold**[^1] text" in out and "[^1]: Foot note" in out and "Running head" in out, out
+    # a footnote that skips its page counts, a header turned off (occurrence 0), a note in a header (counted note)
+    body = _fn5(b"Skip", pages=2) + b"x" + _hf5(1, b"Gone", occurrence=0) + _hf5(0, b"H" + _fn5(b"in head"))
+    doc, ctx = _read(_wp5(body))
+    assert _flatnotes(doc) == {"fn-1": "Skip"} and doc.headers == ["H"], (doc.notes, doc.headers)
+    assert ctx.skipped["note"] == 1 and set(ctx.skipped) == {"note"}, ctx.skipped
+    # notes nested past MAX_DEPTH are cut, counted depth, the outer kept; the version refusal still stands
+    nested = b"deep"
+    for _ in range(5):
+        nested = _fn5(b"n" + nested)
+    real = limits.MAX_DEPTH
+    try:
+        limits.MAX_DEPTH = 2
+        doc, ctx = _read(_wp5(b"Body" + nested))
+    finally:
+        limits.MAX_DEPTH = real
+    assert len(doc.notes) == 2 and ctx.skipped["depth"] == 1 and set(ctx.skipped) == {"depth"}, ctx.skipped
+    assert wpd.head(_wp5(b"x")).major == 0
+    # a broken group resyncs one byte (record once); a group cut by the end ends the walk, the text kept
+    bad = _var5(0xD4, 0, b"abc")[:-1] + b"\x9b"  # the closing id is wrong (0x9B is no code of its own)
+    doc, ctx = _read(_wp5(b"Before " + bad + b" After"))
+    assert _plain(doc)[0].startswith("Before") and _plain(doc)[0].endswith("After") and ctx.skipped["record"] == 1
+    doc, ctx = _read(_wp5(b"Kept\x0a\xd4\x00\xff\xffLost"))
+    assert _plain(doc) == ["Kept"] and ctx.skipped["record"] == 1 and set(ctx.skipped) == {"record"}, ctx.skipped
+    # a table: definition on, a row, cells (one bound to the cell above), off
+    cell = lambda span=1, rows=1: _var5(0xDC, 0, bytes((0, 0, span, rows)) + b"\x00" * 7)  # noqa: E731
+    body = (b"Before" + _var5(0xD2, 0x0B, b"\x00" * 8) + _var5(0xDC, 1) + cell(rows=2) + b"A" + cell() + b"B"
+            + _var5(0xDC, 1) + cell(0x81) + b"A2" + cell() + b"C" + _var5(0xDC, 2) + b"After")
+    doc, ctx = _read(_wp5(body))
+    assert [type(b) for b in doc.blocks] == [Para, Table, Para], doc.blocks
+    rows = doc.blocks[1].rows
+    assert _cells(doc.blocks[1]) == [["A A2", "B"], ["C"]], rows
+    assert rows[0][0].rowspan == 2 and not ctx.skipped
+
+
+def test_wp5_comment():
+    body = b"Text" + _var5(0xD9, 2, b"\x00\x00\x01" + b"A\x0dremark") + b" more" + _var5(0xD9, 7, b"conversion")
+    doc, ctx = _read(_wp5(body))
+    assert doc.blocks[0].inlines == [Text("Text"), NoteRef("cm-1"), Text(" more")], doc.blocks[0].inlines
+    assert doc.notes == {"cm-1": [Para([Text("Comment: "), Text("A remark")])]}, doc.notes
+    assert not ctx.skipped
+    out = _md(doc, ctx)
+    assert "Text[^1] more" in out and "[^1]: Comment: A remark" in out and "conversion" not in out, out
+
+
+def test_wp5_picture_gets_wpg_head():
+    raw = b"\x01\x02picture records"
+    doc, ctx = _read(_wp5(b"See" + _figure5(0) + b"this", [(8, _gfx5(raw))]))
+    assert [type(b) for b in doc.blocks] == [Para, Image, Para], doc.blocks
+    pic = doc.blocks[1].data
+    assert images.sniff(pic) == "wpg" and pic.endswith(raw) and len(pic) == 16 + len(raw), pic
+    assert not ctx.skipped
+    # a picture with its own WPG head is kept as it is; the second of two references to it counts depth
+    doc, ctx = _read(_wp5(b"A" + _figure5(1) + b"B" + _figure5(1) + b"C", [(8, _gfx5(raw, _WPG))]))
+    assert [b.data for b in doc.blocks if isinstance(b, Image)] == [_WPG] and ctx.skipped["depth"] == 1
+    # a picture number past the packet, no packet, a figure of another box type: counted image
+    for data in (_wp5(b"A" + _figure5(3), [(8, _gfx5(raw))]), _wp5(b"A" + _figure5(0)),
+                 _wp5(b"A" + _figure5(0, box_type=1), [(8, _gfx5(raw))])):
+        doc, ctx = _read(data)
+        assert _plain(doc) == ["A"] and ctx.skipped["image"] == 1 and set(ctx.skipped) == {"image"}, ctx.skipped
+    # sizes that run past the packet: the pictures are unreadable, counted image
+    doc, ctx = _read(_wp5(b"A" + _figure5(0), [(8, struct.pack("<HI", 1, 2**31) + b"x")]))
+    assert ctx.skipped["image"] == 1
+    # past IMAGE_BYTES a picture is counted image
+    real = limits.IMAGE_BYTES
+    try:
+        limits.IMAGE_BYTES = 20
+        doc, ctx = _read(_wp5(b"A" + _figure5(0), [(8, _gfx5(raw))]))
+    finally:
+        limits.IMAGE_BYTES = real
+    assert ctx.skipped["image"] == 1 and not any(isinstance(b, Image) for b in doc.blocks)
+
+
+def test_wp5_block_cycle():
+    raw = b"\x01\x02picture records"
+    doc, ctx = _read(_wp5(b"Body" + _figure5(0), [(8, _gfx5(raw))], last_next=16))
+    assert _plain(doc)[0] == "Body" and images.sniff(doc.blocks[1].data) == "wpg"
+    assert ctx.skipped["record"] == 1 and set(ctx.skipped) == {"record"}, ctx.skipped
+    # a next pointer past the end, or to a block that is not 0xFFFB, counts record once; the text kept
+    for nxt in (10**6, 16 + 50 + 1):
+        doc, ctx = _read(_wp5(b"Body", [(8, _gfx5(raw))], last_next=nxt))
+        assert _plain(doc) == ["Body"] and ctx.skipped["record"] == 1, (nxt, ctx.skipped)
+    # WP5_BLOCKS ends a long chain: counted record
+    real = wpd.WP5_BLOCKS
+    try:
+        wpd.WP5_BLOCKS = 2
+        doc, ctx = _read(_wp5(b"Body", [(1, b"")] * 12))
+    finally:
+        wpd.WP5_BLOCKS = real
+    assert _plain(doc) == ["Body"] and ctx.skipped["record"] == 1, ctx.skipped
+    assert wpd.WP5_BLOCKS == 1_024 and wpd.WP42_PROBE == 65_536
+
+
+def test_wp5_encryption():
+    data = _wp5(b"x", encryption=0x0102)
+    assert wpd.head(data).encryption == 0x0102  # read in WP5's byte order
+    assert _refused(data, "encrypted")
+    assert wpd.head(_wp5(b"x")).encryption == 0
+
+
+def _fn42(text, endnote=False):
+    """A 4.2 footnote (0xE2): def, a, b (number), c, d (lines), then for a footnote the old line count, one page's
+    line count and the page count, for an endnote a null; 0xFF, the margins, the text, the closing 0xE2."""
+    head = bytes((2 if endnote else 0, 0, 1, 0, 2)) + (b"\x00" if endnote else b"\x03\x02\x01")
+    return b"\xe2" + head + b"\xff\x0a\x46" + text + b"\xe2"
+
+
+def test_wp42_text_and_footnote():
+    data = (b"\xc0\x00\x00\x00\x00\xc0" + b"Hello\x09world\x0dagain" + b"\x9dBold\x9c"
+            + _fn42(b"Note\x0dtext") + b"\x0aNext" + b"\xe1\x82\xe1" + b"\xd1\x00\x00\xffhead\xff\x00\x01\xd1"
+            + b" end" + _fn42(b"End", endnote=True) + b"\x0cLast")
+    assert wpd.is_wp42(data)
+    doc, ctx = _read(data)
+    assert _plain(doc) == ["Hello world againBold", "Nexté end", "Last"], _plain(doc)
+    assert doc.blocks[0].inlines[-2:] == [Bold([Text("Bold")]), NoteRef("fn-1")], doc.blocks[0].inlines
+    assert doc.notes == {"fn-1": [Para([Text("Note text")])], "fn-2": [Para([Text("End")])]}, doc.notes
+    assert ctx.skipped["header"] == 1 and set(ctx.skipped) == {"header"}, ctx.skipped
+    # the 4.2 check: a group must occur, every group must close, no stray 0xFF
+    assert not wpd.is_wp42(b"just plain text\r\n")
+    assert not wpd.is_wp42(b"text \xc0\x00\x00\x00\x00\x99")  # a fixed group whose closing byte is wrong
+    assert not wpd.is_wp42(b"text \xd1 never closed")
+    assert not wpd.is_wp42(b"\xc0\x00\x00\x00\x00\xc0 and \xff")
+    assert not wpd.is_wp42("café ok".encode("utf-8"))
+    assert wpd.is_wp42(b"\xc0\x00\x00\x00\x00\xc0" + b"x" * wpd.WP42_PROBE + b"\xd1 open")  # past the probe
+    long = b"x" * (wpd.WP42_PROBE - 3) + b"\xd1\x00\x00\x00"  # a group cut by the probe, the file going on
+    assert wpd.is_wp42(long + b"\xd1rest")
+    # a footnote without its 0xFF delimiter counts note; a variable group cut by the end ends the walk
+    doc, ctx = _read(b"\xc0\x00\x00\x00\x00\xc0A\xe2\x00\x00\x01\x00\x01\x00\xe2B")
+    assert _plain(doc) == ["AB"] and ctx.skipped["note"] == 1, ctx.skipped
+
+
+def test_wp42_password():
+    assert _refused(b"\xfe\xff\x61\x61\x12\x34rest", "encrypted")
+    assert wpd.is_wp42(b"\xfe\xff\x61\x61\x00\x00")
+
+
+class _Env:
+    """Set environment variables for a test and restore them after; None removes one."""
+
+    def __init__(self, **values):
+        self.values = values
+        self.saved = {}
+
+    def __enter__(self):
+        import os
+        for k, v in self.values.items():
+            self.saved[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return self
+
+    def __exit__(self, *exc):
+        import os
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_ole_perfectoffice_main():
+    from reader_fix import make_cfb
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "a.wpd"
+        make_cfb(p, {"PerfectOffice_MAIN": _wp6(b"Inside\x80the\xccwrapper")})
+        doc = wpd.parse(p, Context())
+        assert _plain(doc) == ["Inside the", "wrapper"], _plain(doc)
+        # an encrypted stream in the wrapper is refused as the bare file would be
+        make_cfb(p, {"PerfectOffice_MAIN": _wp6(b"x", encryption=1)})
+        try:
+            wpd.parse(p, Context())
+            raise AssertionError("expected encrypted")
+        except ReadError as e:
+            assert e.kind == "encrypted"
+
+
+def test_ole_without_main():
+    from reader_fix import make_cfb, make_doc
+    with tempfile.TemporaryDirectory() as d:
+        p = make_doc(Path(d) / "w.wpd", [("word text\r", False)])
+        doc = wpd.parse(p, Context())
+        assert "word text" in str(doc.blocks), doc.blocks
+        q = Path(d) / "o.wpd"
+        make_cfb(q, {"Other": b"x" * 10})
+        try:
+            wpd.parse(q, Context())
+            raise AssertionError("expected damaged")
+        except ReadError as e:
+            assert e.kind == "damaged" and e.detail == "no PerfectOffice_MAIN stream", e
+
+
+def _mac():
+    return _wp6(b"Mac text", ftype=0x2C, major=3)
+
+
+def test_mac_without_switch():
+    with _Env(PHRO_READER_SOFFICE=None):
+        e = _refused(_mac(), "unsupported")
+        assert e.detail == "Mac WordPerfect; set PHRO_READER_SOFFICE=1 to read it through LibreOffice", e.detail
+        assert e.detail.endswith("LibreOffice")
+        e = _refused(b"\x00\x01plain words, no groups", "unsupported")
+        assert e.detail.startswith("not a WordPerfect 4.2 file") and e.detail.endswith("LibreOffice"), e.detail
+    with _Env(PHRO_READER_SOFFICE=""):
+        assert _refused(_mac(), "unsupported").detail.endswith("LibreOffice")
+
+
+class _FakeProc:
+    """A stand-in for the soffice child: `make` runs at start with the --outdir folder; wait() exits at once, or
+    never when `hang`."""
+    made = []
+
+    def __init__(self, cmd, make=None, hang=False, **kw):
+        self.cmd, self.kw, self.hang, self.pid = cmd, kw, hang, 4242
+        self.outdir = Path(cmd[cmd.index("--outdir") + 1])
+        _FakeProc.made.append(self)
+        if make:
+            make(self.outdir, Path(cmd[-1]))
+
+    def wait(self, timeout=None):
+        import subprocess
+        if self.hang:
+            raise subprocess.TimeoutExpired(self.cmd, timeout)
+        return 0
+
+
+def _docx(text):
+    from reader_fix import make_zip
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    return make_zip(None, {
+        "[Content_Types].xml": '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        "_rels/.rels": ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                        f'<Relationship Id="rId1" Type="{rel}/officeDocument" Target="word/document.xml"/>'
+                        '</Relationships>'),
+        "word/document.xml": (f'<w:document xmlns:w="{w}"><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p>'
+                              '</w:body></w:document>'),
+    }, stored=())
+
+
+def _with_fake(make=None, hang=False):
+    """Run the Mac file through the switch with Popen faked; returns (doc or ReadError, the fake, kills)."""
+    import reader
+    kills = []
+    real_popen, real_kill, real_started = wpd.subprocess.Popen, wpd._kill_tree, reader.STARTED
+    reader.STARTED = time.monotonic()  # the child's budget runs from the reader's start, as in a CLI child
+    _FakeProc.made = []
+    with tempfile.TemporaryDirectory() as d:
+        exe = Path(d) / "soffice-stub"
+        exe.write_bytes(b"")
+        src = Path(d) / "mac.wpd"
+        src.write_bytes(_mac())
+        try:
+            wpd.subprocess.Popen = lambda cmd, **kw: _FakeProc(cmd, make, hang, **kw)
+            wpd._kill_tree = kills.append
+            with _Env(PHRO_READER_SOFFICE=str(exe)):
+                try:
+                    got = wpd.parse(src, Context())
+                except ReadError as e:
+                    got = e
+        finally:
+            wpd.subprocess.Popen, wpd._kill_tree, reader.STARTED = real_popen, real_kill, real_started
+        fake = _FakeProc.made[0] if _FakeProc.made else None
+        if fake is not None:
+            assert fake.cmd[0] == str(exe) and fake.cmd[-1] == str(src), fake.cmd
+    return got, fake, kills
+
+
+def test_mac_with_switch_stub():
+    got, fake, kills = _with_fake(lambda out, src: (out / (src.stem + ".docx")).write_bytes(_docx("Converted text")))
+    assert not isinstance(got, ReadError), got
+    assert _plain(got) == ["Converted text"], _plain(got)
+    assert not fake.outdir.exists() and not kills
+    cmd = fake.cmd
+    assert cmd[1:3] == ["--headless", "--norestore"] and cmd[3].startswith("-env:UserInstallation=file:///"), cmd
+    assert cmd[3].endswith("/profile") and cmd[4:6] == ["--convert-to", "docx"], cmd
+    assert ("creationflags" in fake.kw) if wpd.os.name == "nt" else fake.kw.get("start_new_session"), fake.kw
+
+
+def test_soffice_timeout():
+    got, fake, kills = _with_fake(hang=True)
+    assert isinstance(got, ReadError) and got.kind == "timeout", got
+    assert kills == [fake] and not fake.outdir.exists()
+
+
+def test_soffice_no_docx():
+    got, fake, kills = _with_fake()
+    assert isinstance(got, ReadError) and got.kind == "damaged", got
+    assert not fake.outdir.exists() and not kills
+
+
+def test_soffice_lookup():
+    import os
+    with tempfile.TemporaryDirectory() as d:
+        name = "soffice.exe" if os.name == "nt" else "soffice"
+        exe = Path(d) / name
+        exe.write_bytes(b"")
+        exe.chmod(0o755)
+        empty = Path(d) / "none"
+        empty.mkdir()
+        with _Env(PHRO_READER_SOFFICE="1", PATH=d, ProgramFiles=str(empty), **{"ProgramFiles(x86)": str(empty)}):
+            got = wpd.soffice()
+            assert got is not None and Path(got).resolve() == exe.resolve(), got
+        with _Env(PHRO_READER_SOFFICE="1", PATH=str(empty), ProgramFiles=str(empty),
+                  **{"ProgramFiles(x86)": str(empty)}):
+            fixed = ("/usr/bin/soffice", "/Applications/LibreOffice.app/Contents/MacOS/soffice")
+            if not any(os.path.isfile(f) for f in fixed):
+                assert wpd.soffice() is None
+            # the switch on but no soffice found: the denial says so
+            if wpd.soffice() is None:
+                assert "no soffice" in _refused(_mac(), "unsupported").detail
+            # a Program Files install is found
+            prog = empty / "LibreOffice" / "program"
+            prog.mkdir(parents=True)
+            (prog / "soffice.exe").write_bytes(b"")
+            if os.name == "nt":
+                assert wpd.soffice() == str(prog / "soffice.exe"), wpd.soffice()
+        with _Env(PHRO_READER_SOFFICE=str(exe)):
+            assert wpd.soffice() == str(exe)
+        with _Env(PHRO_READER_SOFFICE=None):
+            assert wpd.soffice() is None
+        with _Env(PHRO_READER_SOFFICE=""):
+            assert wpd.soffice() is None
 
 
 def main():

@@ -1,24 +1,25 @@
 """Which parser a compound file belongs to, by its top-level streams, so a file renamed between the compound-file
 formats is read by its own parser whichever extension it came with.
 
-Each of xls, ppt, doc and xlsb asks `route` when its own main stream is missing. An encrypted OOXML package
+Each of xls, ppt, doc, xlsb and wpd asks `route` when its own main stream is missing. An encrypted OOXML package
 (EncryptedPackage) is `encrypted`; an Excel 5.0/95 workbook (Book) and a PowerPoint 95 presentation (PP40) are
-`unsupported`; a Workbook, PowerPoint Document, WordDocument or hwp FileHeader stream names the parser that reads the
-file, and the caller hands it on with `parse` once its own compound file is closed. Anything else keeps the caller's
-damaged detail. Parsers are imported late, since they import this module.
+`unsupported`; a Workbook, PowerPoint Document, WordDocument, hwp FileHeader or WordPerfect PerfectOffice_MAIN
+stream names the parser that reads the file, and the caller hands it on with `parse` once its own compound file is
+closed. Anything else keeps the caller's damaged detail. Parsers are imported late, since they import this module.
 """
 from ..limits import ReadError
 
 EXCEL95 = "Excel 5.0/95 workbook"
 PP95 = "PowerPoint 95 presentation"
-_OWN = {"xls": "Workbook", "ppt": "PowerPoint Document", "doc": "WordDocument", "hwp": "FileHeader"}
+_OWN = {"xls": "Workbook", "ppt": "PowerPoint Document", "doc": "WordDocument", "hwp": "FileHeader",
+        "wpd": "PerfectOffice_MAIN"}
 # in this order: a stream naming a parser, or an old format's refusal
 _STREAMS = (("Workbook", "xls"), ("Book", EXCEL95), ("PowerPoint Document", "ppt"), ("PP40", PP95),
-            ("WordDocument", "doc"), ("FileHeader", "hwp"))
+            ("WordDocument", "doc"), ("FileHeader", "hwp"), ("PerfectOffice_MAIN", "wpd"))
 
 
 def route(cf, own: str, damaged: str) -> str | None:
-    """The parser ("xls", "ppt", "doc" or "hwp") that reads the open compound file `cf`; None when that is `own`
+    """The parser ("xls", "ppt", "doc", "hwp" or "wpd") that reads the open compound file `cf`; None when that is `own`
     itself. Raises ReadError("encrypted") for an encrypted package, "unsupported" for an old format, and "damaged"
     with the detail `damaged` when no stream names a format."""
     if own in _OWN and cf.exists(_OWN[own]):

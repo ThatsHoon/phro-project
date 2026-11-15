@@ -901,14 +901,19 @@ class _Reader:
 
 
 def parse(path, ctx) -> Doc:
+    from . import wpd
     with open(path, "rb") as f:
-        head = f.read(16)
+        head = f.read(wpd.WP42_PROBE + 1)  # one byte more than the 4.2 check scans, so it knows the file goes on
     if head.startswith(_ZIP):  # a Word or OpenDocument package saved as .doc
         return zip_route.parse(path, ctx)
-    if head.removeprefix(_BOM).lstrip(b" \t\r\n\x0b\x0c\x00").startswith(_RTF):  # RTF saved as .doc
+    if head[:16].removeprefix(_BOM).lstrip(b" \t\r\n\x0b\x0c\x00").startswith(_RTF):  # RTF saved as .doc
         from . import rtf  # rtf.parse sends a compound-file or zip head to cfb_route or zip_route, never back to rtf: the heads differ, no loop
         return rtf.parse(path, ctx)
+    if head.startswith(b"\xffWPC"):  # a WordPerfect file saved as .doc
+        return wpd.parse(path, ctx)
     if not is_cfb(head):
+        if wpd.is_wp42(head):  # a WordPerfect 4.2 file, which has no head of its own
+            return wpd.parse(path, ctx)
         raise ReadError("damaged", "not a Word document")
     with Compound(path) as cf:
         other = cfb_route.route(cf, "doc", "no WordDocument stream")
