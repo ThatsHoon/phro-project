@@ -9,6 +9,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
+from reader import markdown  # noqa: E402
 from reader.containers import palmdb  # noqa: E402
 from reader.containers.palmdb import HuffCdic, Palm, palmdoc, record_cap, text_cap, trailing  # noqa: E402
 from reader.formats import mobi  # noqa: E402
@@ -563,11 +564,363 @@ def test_stripped_text():
     assert [_text_of(p) for p in out] == ["x"]
 
 
-def test_kf8_only_is_stripped_for_now():
+def test_kf8_without_fdst_or_skeleton():
+    # no FDST: the whole text is flow 0; no SKEL: it is read as XHTML, split at <html
     doc, ctx = _read(_mobi(b"<html><body><p>one</p><p>two</p></body></html>", version=8))
-    assert [_text_of(b) for b in doc.blocks[0].blocks] == ["one", "two"] and ctx.skipped["plain_text"] == 1
-    doc, ctx = _read(_mobi(BOOK, exth={121: (9).to_bytes(4, "big")}))      # a combo reads as MOBI 6
+    assert [_text_of(b) for b in doc.blocks[0].blocks] == ["one", "two"] and not ctx.skipped
+    doc, ctx = _read(_mobi(BOOK, exth={121: (9).to_bytes(4, "big")}))      # EXTH 121 past the file: MOBI 6
     assert len(doc.blocks) == 2 and not ctx.skipped
+
+
+# ---- KF8
+OLD = b"<html><body><p>old copy</p></body></html>"
+
+
+def _u32(v):
+    return v.to_bytes(4, "big")
+
+
+def _vwi(v):
+    """A forward varint: 7-bit groups, the high bit set on the last byte."""
+    out = [v & 0x7F | 0x80]
+    v >>= 7
+    while v:
+        out.append(v & 0x7F)
+        v >>= 7
+    return bytes(reversed(out))
+
+
+def _indx_records(tagx, entries, cncx=b""):
+    """An index: the INDX record with its TAGX, one INDX record of entries, then the CNCX record when given.
+
+    tagx: [(tag, values per group, mask, end flag)] over one control byte. entries: [(label, {tag: values})]; a tag
+    with k groups of values puts k in its mask bits."""
+    body, offsets = bytearray(), []
+    for label, tags in entries:
+        label = label.encode() if isinstance(label, str) else label
+        ctrl, vals = 0, b""
+        for tag, nv, mask, end in tagx:
+            if end or tag not in tags:
+                continue
+            ctrl |= len(tags[tag]) // max(nv, 1) << ((mask & -mask).bit_length() - 1)
+            vals += b"".join(_vwi(x) for x in tags[tag])
+        offsets.append(56 + len(body))
+        body += bytes([len(label)]) + label + bytes([ctrl & 0xFF]) + vals
+    rec = bytearray(56)
+    rec[0:4], rec[4:8], rec[20:24], rec[24:28] = b"INDX", _u32(56), _u32(56 + len(body)), _u32(len(entries))
+    rec += body + b"IDXT" + b"".join(o.to_bytes(2, "big") for o in offsets)
+    defs = b"".join(bytes(t) for t in tagx)
+    main = bytearray(56)
+    main[0:4], main[4:8], main[24:28], main[28:32] = b"INDX", _u32(56), _u32(1), _u32(65001)
+    main[36:40], main[52:56] = _u32(len(entries)), _u32(1 if cncx else 0)
+    main += b"TAGX" + _u32(12 + len(defs)) + _u32(1) + defs
+    return [bytes(main), bytes(rec)] + ([cncx] if cncx else [])
+
+
+def _fdst(flows):
+    return b"FDST" + _u32(12) + _u32(len(flows)) + b"".join(_u32(s) + _u32(e) for s, e in flows)
+
+
+# kindlegen writes SKEL values twice: tag 1 [n, n], tag 6 [start, length, start, length]
+SKEL_TAGX = [(1, 1, 0x03, 0), (6, 2, 0x0C, 0), (0, 0, 0, 1)]
+FRAG_TAGX = [(2, 1, 0x01, 0), (3, 1, 0x02, 0), (4, 1, 0x04, 0), (6, 2, 0x08, 0), (0, 0, 0, 1)]
+
+
+def _kf8_text(files):
+    """flow 0, SKEL rows (count, start, length) and FRAG rows (insert, file, seq, offset, length) of files given as
+    (skeleton, [(at, fragment)]), each `at` counted in the file as assembled so far."""
+    flow, skels, frags = b"", [], []
+    for n, (skel, fs) in enumerate(files):
+        start, off = len(flow), 0
+        for at, f in fs:
+            frags.append((start + at, n, len(frags), off, len(f)))
+            off += len(f)
+        skels.append((len(fs), start, len(skel)))
+        flow += skel + b"".join(f for _, f in fs)
+    return flow, skels, frags
+
+
+def _kf8_recs(files=None, flow0=None, sheets=(), images=(), *, skel_tagx=SKEL_TAGX, **kw):
+    """KF8 records from its record 0: record 0, text, FDST, the SKEL and FRAG indexes (when files are given), images.
+    The indexes and the first image are relative to record 0."""
+    if files is not None:
+        flow0, skels, frags = _kf8_text(files)
+    text, flows = flow0, [(0, len(flow0))]
+    for s in sheets:
+        flows.append((len(text), len(text) + len(s)))
+        text += s
+    chunks = [text[i:i + 4096] for i in range(0, len(text), 4096)] or [b""]
+    tail = [_fdst(flows)]
+    idx = {"fdst": 1 + len(chunks)}
+    if files is not None:
+        idx["skel"] = 1 + len(chunks) + len(tail)
+        tail += _indx_records(skel_tagx, [(f"SKEL{i:010d}", {1: [c, c], 6: [s, ln, s, ln]})
+                                          for i, (c, s, ln) in enumerate(skels)])
+        idx["frag"] = 1 + len(chunks) + len(tail)
+        tail += _indx_records(FRAG_TAGX, [(str(ins), {2: [0], 3: [f], 4: [q], 6: [o, ln]})
+                                          for ins, f, q, o, ln in frags], cncx=_vwi(3) + b"P-1" + bytes(4))
+    if images:
+        idx["first_image"] = 1 + len(chunks) + len(tail)
+    idx.update(kw)
+    return [_rec0(version=8, text_length=len(text), text_records=len(chunks), **idx)] + chunks + tail + list(images)
+
+
+def _combo(m6_text, kf8, shared=(), **kw):
+    """A combo book: MOBI 6 record 0 and text, shared records, a BOUN record, then the KF8 records. EXTH 121 names
+    KF8 record 0."""
+    chunks = [m6_text[i:i + 4096] for i in range(0, len(m6_text), 4096)] or [b""]
+    exth = {121: _u32(2 + len(chunks) + len(shared))}
+    exth.update(kw.pop("exth", {}))
+    rec0 = _rec0(version=6, text_length=len(m6_text), text_records=len(chunks), exth=exth, **kw)
+    return _pdb([rec0] + chunks + list(shared) + [b"BOUN" + bytes(4)] + kf8)
+
+
+def _two_files(out_of_order=False):
+    s1 = b"<html><head></head><body><div></div><div></div></body></html>"
+    a, b = b"<p>alpha</p>", b"<p>beta</p>"
+    at_a = s1.index(b"</div>")
+    built = s1[:at_a] + a + s1[at_a:]
+    at_b = built.index(b"<p>alpha") if out_of_order else built.index(b"</div></body>")
+    s2 = b"<html><head></head><body></body></html>"
+    c = b"<p>gamma</p>"
+    files = [(s1, [(at_a, a), (at_b, b)]), (s2, [(s2.index(b"</body>"), c)])]
+    return files, [built[:at_b] + b + built[at_b:], s2.replace(b"</body>", c + b"</body>")]
+
+
+def _seen_trees(data):
+    """The document and context of a book, and the bytes every part handed to html.tree."""
+    seen = []
+    real = mobi.xhtml.tree
+    mobi.xhtml.tree = lambda b: (seen.append(b), real(b))[1]
+    try:
+        doc, ctx = _read(data)
+    finally:
+        mobi.xhtml.tree = real
+    return doc, ctx, b"".join(seen)
+
+
+def _md(doc, ctx, hidden=False):
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        return markdown.render(doc, Path(d) / "assets", hidden, ctx.skipped)
+
+
+def _broken(recs, field):
+    """recs with the record a record-0 field names given a bad magic."""
+    at = getattr(mobi._head(recs[0]), field)
+    recs = list(recs)
+    recs[at] = b"XXXX" + recs[at][4:]
+    return recs
+
+
+def test_kf8_two_skeletons_three_fragments():
+    for order in (False, True):
+        files, want = _two_files(order)
+        data = _pdb(_kf8_recs(files))
+        palm = Palm(data)
+        parts, flows = mobi._kf8_parts(palm, mobi._head(palm.record(0)), 0, Context())
+        assert parts == want and flows[0] == _kf8_text(files)[0]
+        doc, ctx = _read(data)
+        assert [s.kind for s in doc.blocks] == ["chapter", "chapter"] and [s.number for s in doc.blocks] == [1, 2]
+        t1, t2 = _text_of(doc.blocks[0]), _text_of(doc.blocks[1])
+        assert (t1.index("alpha") < t1.index("beta")) != order and "gamma" in t2 and "gamma" not in t1
+        assert not ctx.skipped
+
+
+def test_fragment_work_cap():
+    files, _ = _two_files(True)
+    old = mobi.FRAG_WORK
+    mobi.FRAG_WORK = 10
+    try:
+        doc, ctx = _read(_pdb(_kf8_recs(files)))
+    finally:
+        mobi.FRAG_WORK = old
+    assert ctx.skipped == {"plain_text": 1} and "gamma" in _text_of(doc.blocks)
+    # fragments outside their skeleton, or past it
+    files, _ = _two_files()
+    for bad in ((10 ** 6, b"<p>x</p>"),):
+        doc, ctx = _read(_pdb(_kf8_recs([(files[0][0], files[0][1] + [bad])] + files[1:])))
+        assert ctx.skipped == {"plain_text": 1}
+
+
+def test_kf8_no_skeleton_two_html():
+    flow0 = b'<?xml version="1.0"?>' + b"<html><body><p>one</p></body></html><html><body><p>two</p></body></html>"
+    doc, ctx = _read(_pdb(_kf8_recs(flow0=flow0)))
+    assert len(doc.blocks) == 2 and _text_of(doc.blocks[0].blocks) == "one" and _text_of(doc.blocks[1].blocks) == "two"
+    assert not ctx.skipped
+
+
+def test_combo_reads_kf8():
+    files, _ = _two_files()
+    doc, ctx = _read(_combo(OLD, _kf8_recs(files)))
+    text = _text_of(doc.blocks)
+    assert "alpha" in text and "gamma" in text and "old copy" not in text and not ctx.skipped
+    # EXTH 121 on a record without BOUN before it, or on one without a KF8 head: MOBI 6, nothing counted
+    for at in (1, 2):
+        doc, ctx = _read(_combo(OLD, _kf8_recs(files), exth={121: _u32(at)}))
+        assert _text_of([c.blocks for c in doc.blocks]) == "old copy" and not ctx.skipped
+
+
+def test_kf8_failure_falls_to_mobi6():
+    files, _ = _two_files()
+    for field in ("skel", "frag", "fdst"):
+        doc, ctx = _read(_combo(OLD, _broken(_kf8_recs(files), field)))
+        assert _text_of([c.blocks for c in doc.blocks]) == "old copy"
+        assert ctx.skipped == {"kf8_fallback": 1}, ctx.skipped
+        assert "KF8 layout (the MOBI 6 copy was read)" in markdown.unread(ctx.skipped)
+
+
+def test_kf8_only_failure_stripped():
+    files, _ = _two_files()
+    doc, ctx = _read(_pdb(_broken(_kf8_recs(files, sheets=[b".x{color:red}"]), "skel")))
+    assert "book markup (read as plain text)" in markdown.unread(ctx.skipped) and "kf8_fallback" not in ctx.skipped
+    assert [_text_of(p) for p in doc.blocks[0].blocks] == ["alpha", "beta", "gamma"]    # flow 0, raw order
+    # an unreadable FDST: the whole text
+    doc, ctx = _read(_pdb(_broken(_kf8_recs(files, sheets=[b".x{color:red}"]), "fdst")))
+    assert [_text_of(p) for p in doc.blocks[0].blocks] == ["alpha", "beta", "gamma", ".x{color:red}"]
+    assert ctx.skipped == {"plain_text": 1}
+
+
+def test_kindle_flow_css_display_none():
+    link = b'<link rel="stylesheet" type="text/css" href="kindle:flow:0001?mime=text/css"/>'
+    s = b"<html><head>" + link + b"</head><body></body></html>"
+    frag = b'<p class="h">secret</p><p>shown</p>'
+    doc, ctx = _read(_pdb(_kf8_recs([(s, [(s.index(b"</body>"), frag)])], sheets=[b".h{display:none}"])))
+    out, shown = _md(doc, ctx), _md(doc, ctx, hidden=True)
+    assert "secret" not in out and "shown" in out and "secret" in shown and "shown" in shown
+    # a flow number past the FDST loads nothing
+    s2 = s.replace(b"0001", b"0009")
+    doc, ctx = _read(_pdb(_kf8_recs([(s2, [(s2.index(b"</body>"), frag)])], sheets=[b".h{display:none}"])))
+    assert "secret" in _md(doc, ctx)
+
+
+def test_hidden_attribute():
+    doc, ctx = _read(_pdb(_kf8_recs(flow0=b"<html><body><p hidden>gone</p><p>kept</p></body></html>")))
+    out = _md(doc, ctx)
+    assert "gone" not in out and "kept" in out and "gone" in _md(doc, ctx, hidden=True)
+
+
+def test_kindle_embed_image():
+    flow0 = b'<html><body><p>x</p><img src="kindle:embed:0002?mime=image/png"/></body></html>'
+    doc, ctx = _read(_pdb(_kf8_recs(flow0=flow0, images=[b"not a picture", PNG])))
+    imgs = [b for s in doc.blocks for b in s.blocks if isinstance(b, Image)]
+    assert [i.data for i in imgs] == [PNG] and not ctx.skipped
+
+
+def _pos_files(fid=b"0000", off=b"0000000009"):
+    s = b"<html><head></head><body><div></div></body></html>"
+    a = b"<p>alpha target</p>"
+    link = b'<p><a href="kindle:pos:fid:' + fid + b":off:" + off + b'?mime=text/html">go</a></p>'
+    at_a = s.index(b"</div>")
+    built = s[:at_a] + a + s[at_a:]
+    return [(s, [(at_a, a), (built.index(b"<p>alpha"), link)])]   # the link goes in before alpha and moves it
+
+
+def test_kindle_pos_link():
+    import re
+    doc, ctx, raw = _seen_trees(_pdb(_kf8_recs(_pos_files())))
+    m = re.search(rb'<a id="(kp\d+)"></a>target', raw)
+    assert m and b'href="#' + m.group(1) + b'"' in raw and b"kindle:pos" not in raw
+    assert "go" in _text_of(doc.blocks) and "alpha target" in _text_of(doc.blocks) and not ctx.skipped
+    # a link to a fragment of the other file is anchored there
+    files, _ = _two_files()
+    s2, ((at, c),) = files[1]
+    files[1] = (s2, [(at, c + b'<p><a href="kindle:pos:fid:0001:off:0000000003">b</a></p>')])
+    _, _, raw = _seen_trees(_pdb(_kf8_recs(files)))
+    m = re.search(rb'<a id="(kp\d+)"></a>beta', raw)
+    assert m and b'href="#' + m.group(1) + b'"' in raw
+
+
+def test_kindle_pos_past_end():
+    for fid, off in ((b"0000", b"00000000VV"), (b"0007", b"0000000001"), (b"00Z0", b"0000000001")):
+        doc, ctx, raw = _seen_trees(_pdb(_kf8_recs(_pos_files(fid, off))))
+        assert b'id="kp' not in raw and b"#kp" not in raw and b"kindle:pos" not in raw
+        assert "go" in _text_of(doc.blocks) and "alpha target" in _text_of(doc.blocks) and not ctx.skipped
+    # past the anchor cap: the link keeps its text, counted once
+    old = mobi.MOBI_ANCHORS
+    mobi.MOBI_ANCHORS = 0
+    try:
+        doc, ctx, raw = _seen_trees(_pdb(_kf8_recs(_pos_files())))
+    finally:
+        mobi.MOBI_ANCHORS = old
+    assert b"#kp" not in raw and "go" in _text_of(doc.blocks) and ctx.skipped == {"link": 1}
+
+
+def test_combo_first_image_relative():
+    flow0 = b'<html><body><p>x</p><img src="kindle:embed:0001?mime=image/png"/></body></html>'
+    doc, ctx = _read(_combo(OLD, _kf8_recs(flow0=flow0, images=[PNG])))     # absolute: KF8 record 0
+    assert [b.data for s in doc.blocks for b in s.blocks if isinstance(b, Image)] == [PNG] and not ctx.skipped
+    # images shared before the boundary: the absolute reading sniffs
+    doc, ctx = _read(_combo(OLD, _kf8_recs(flow0=flow0, first_image=2), shared=[PNG]))
+    assert [b.data for s in doc.blocks for b in s.blocks if isinstance(b, Image)] == [PNG] and not ctx.skipped
+
+
+def test_cncx_zero_padding():
+    cncx = _vwi(5) + b"first" + _vwi(6) + b"second" + bytes(7)
+    recs = _indx_records([(3, 1, 0x01, 0), (0, 0, 0, 1)], [("a", {3: [0]}), ("b", {3: [6]})], cncx)
+    idx = mobi._indx(Palm(_pdb(recs)), 0, Context())
+    assert list(idx) == [("a", {3: [0]}), ("b", {3: [6]})]
+    assert idx.cncx == {0: "first", 6: "second"}
+
+
+def test_indx_caps():
+    tagx = [(1, 1, 0x01, 0), (0, 0, 0, 1)]
+
+    def fails(recs):
+        raises(mobi._Fallback, mobi._indx, Palm(_pdb(recs)), 0, Context())
+
+    three = _indx_records(tagx, [("a", {1: [1]}), ("b", {1: [2]}), ("c", {1: [3]})])
+    assert len(mobi._indx(Palm(_pdb(three)), 0, Context())) == 3
+    files, _ = _two_files()
+    old = mobi.INDX_ENTRIES
+    mobi.INDX_ENTRIES = 2
+    try:
+        fails(three)
+        doc, ctx = _read(_pdb(_kf8_recs(files + files[1:])))         # three skeletons
+        assert ctx.skipped == {"plain_text": 1} and "gamma" in _text_of(doc.blocks)
+    finally:
+        mobi.INDX_ENTRIES = old
+    fails(_indx_records([(t, 1, 0x01, 0) for t in range(1, 66)], [("a", {})]))    # 65 tags
+    assert len(mobi._indx(Palm(_pdb(_indx_records([(t, 1, 0, 0) for t in range(1, 65)], []))), 0, Context())) == 0
+    wide = SKEL_TAGX[:2] + [(t, 1, 0, 0) for t in range(100, 162)] + SKEL_TAGX[2:]
+    doc, ctx = _read(_pdb(_kf8_recs(files, skel_tagx=wide)))
+    assert len(wide) == 65 and ctx.skipped == {"plain_text": 1}
+    main, rec = _indx_records(tagx, [("a", {1: [1]})])
+    m = bytearray(main)
+    m[56 + 8:56 + 12] = _u32(9)                                                      # 9 control bytes
+    fails([bytes(m), rec])
+    m = bytearray(main)
+    m[24:28] = _u32(2)                                                               # more records than left
+    fails([bytes(m), rec])
+    fails(_indx_records(tagx, [("a", {1: [2 ** 35]})]))                              # a 6-byte varint
+    big = _indx_records(tagx, [("a", {1: [2 ** 35 - 1]})])                           # a 5-byte varint
+    assert mobi._indx(Palm(_pdb(big)), 0, Context())[0][1] == {1: [2 ** 35 - 1]}
+    fails(_indx_records(tagx, [("a", {1: [1]})])[:1] + [rec[:60]])                  # an entry past its record
+    # FDST: 1,001 flows, a range past the text, a start after its end
+    recs = _kf8_recs(files)
+    at = mobi._head(recs[0]).fdst
+    n = mobi._head(recs[0]).text_length
+    for flows in ([(0, n)] * 1001, [(0, n + 1)], [(5, 4)]):
+        recs[at] = _fdst(flows)
+        palm = Palm(_pdb(recs))
+        raises(mobi._Fallback, mobi._fdst, palm, mobi._head(palm.record(0)))
+        doc, ctx = _read(_pdb(recs))
+        assert ctx.skipped == {"plain_text": 1} and "gamma" in _text_of(doc.blocks)
+    recs[at] = _fdst([(0, n)] * 1000)
+    palm = Palm(_pdb(recs))
+    assert len(mobi._fdst(palm, mobi._head(palm.record(0)))) == 1000
+
+
+def test_kf8_regexes_stay_linear():
+    import time
+    for unit in (b"<a href=kindle:pos:fid:0000:off:0000000000 ", b"<a ", b"<html "):
+        data = unit * (300_000 // len(unit))
+        t = time.perf_counter()
+        try:
+            mobi.parse_bytes(_pdb(_kf8_recs(flow0=data)), Context())
+        except ReadError:
+            pass
+        assert time.perf_counter() - t < 4, unit
 
 
 def test_head_fields():

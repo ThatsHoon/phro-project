@@ -782,6 +782,34 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## foliate-js
+
+Ported: the KF8 FDST flows, the INDX, TAGX and CNCX index reader, the SKEL and FRAG tables and their assembly, and the `kindle:flow`, `kindle:embed` and `kindle:pos` links in `scripts/reader/formats/mobi.py`, from `mobi.js` at foliate-js commit 78914aef4466eb960965702401634c2cb348e9b1.
+
+```
+MIT License
+
+Copyright (c) 2022 John Factotum
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Adobe
 
 Data: `scripts/reader/pdfnative/cid_unicode_data.py` (the Adobe CID to Unicode tables of mapping-resources-pdf), `scripts/reader/pdfnative/predefined_cmap_data.py` (the predefined Encoding CMap ranges of cmap-resources) and `scripts/reader/pdfnative/core14_metrics.py` (the Core 14 AFM metrics and the Adobe Glyph List). The three modules are copied byte for byte from dochan 1.21.0 (commit 29bb52be2cf40750e0dab25b24d87e33d0fcedd7, `src/dochan/pdf/`), each with one added docstring line; dochan's NOTICE reproduces Adobe's notices as follows. The original Adobe CMap and AFM files are not distributed.
