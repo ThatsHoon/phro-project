@@ -394,6 +394,32 @@ def test_pdfium_ligature_stays_in_word():
         assert "efficient viewing" in md and "Multiple files are bound" in md, md
 
 
+def test_pdfium_overhang_keeps_space():
+    # an f whose advance (/Widths 250) is narrower than its ink: the word after it starts 0.25 em
+    # past the advance, a word space, though under 0.2 em past the ink
+    narrow = {"Type": Name("Font"), "Subtype": Name("Type1"), "BaseFont": Name("Helvetica"),
+              "Encoding": Name("WinAnsiEncoding"), "FirstChar": 102, "LastChar": 102, "Widths": [250]}
+    o_end = 72 + 0.556 * 12
+    ops = [text_ops("o", 72, 700), b"BT /F4 12 Tf %.3f 700 Td (f) Tj ET" % o_end,
+           text_ops("Class", o_end + 3.0 + 3.0, 700)]
+    data = simple_pdf([b" ".join(ops)], resources={"Font": {"F1": Ref(3), "F4": Ref(60)}},
+                      extra_objects={60: narrow})
+    for md in _both(data):
+        assert "of Class" in md, md
+
+
+def test_pdfium_angled_text():
+    # words set at 19 degrees and kerned tight, Tf 1 and the size in the text matrix, as a poster's
+    # banner is: each word reads whole, not glyph by glyph
+    tm = b"BT /F1 1 Tf 12.292 4.232 -4.232 12.292 %d %d Tm [%s] TJ ET"
+    ops = [tm % (40, 440, b"(M) 50 (O) 50 (S) 200 (T)"),
+           tm % (44, 426, b"(IN) 80 (-) 80 (DE) 100 (MAND)"),
+           tm % (48, 412, b"(E) 60 (N) 60 (G) 60 (I) 60 (N) 60 (E) 60 (E) 60 (R) 60 (I) 60 (N) 60 (G)")]
+    for md in _both(simple_pdf([b" ".join(ops)])):
+        for word in ("MOST", "IN-DEMAND", "ENGINEERING"):
+            assert word in md, (word, md)
+
+
 def test_pdfium_pages_range():
     got = run(simple_pdf([text_ops(f"P{n}") for n in range(1, 5)]), pages=[2, 3])
     md = got["md"]

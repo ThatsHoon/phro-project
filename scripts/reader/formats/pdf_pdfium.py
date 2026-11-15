@@ -15,8 +15,12 @@ last page and the document; pdf.py calls it in a finally.
   one text object on one line make one `Fragment`. Its size is native's: the font size
   (`FPDFText_GetFontSize`, the Tf operand) times the length of the char matrix's second row,
   which Tz leaves alone; the loose box height stands in only when there is no usable size. Its
-  `char_offsets` and `char_gaps` come from the loose boxes along the text direction. The
-  chars of one ligature glyph ("fi" from one code) share its origin: they stay in the run,
+  `char_offsets` and `char_gaps` come from the loose boxes along the text direction. The loose
+  box holds the glyph's ink too: where the ink reaches the box's far edge (an f or an italic
+  letter overhanging its advance), or where the text runs at an angle (the box then stands
+  upright around the turned glyph), a char's advance ends at the font's width for it
+  (`FPDFFont_GetGlyphWidth` times the char matrix's x scale) when that width fits in the box.
+  The chars of one ligature glyph ("fi" from one code) share its origin: they stay in the run,
   with no gap between them.
   The text object's render mode (3 or 7) sets `invisible`. A text object whose second char sits
   below its first along the glyph's up is a vertical font's column: it takes native's vertical
@@ -80,6 +84,10 @@ OPTION_LABELS = annotations.FIELD_KIDS  # list-box options read per field
 OUTLINE_SCAN = 4 * annotations.OUTLINE_ITEMS  # bookmarks visited for the outline
 PAGE_FONTS = 256                 # fonts of a page's /Resources looked at for a vertical CMap
 OBJECT_MARKS = 16                # content marks read per text object (for /OC, native None)
+# a font width under this share of the loose box is not taken for an upright glyph's advance: an
+# overhang is a fraction of the glyph (the bench's f is 0.87 of its box, an italic h 0.95), and
+# a width that small is more likely the wrong glyph's
+ADVANCE_FLOOR = 0.5
 
 _COORD = 1e9
 _LETTER = (0.0, 0.0, 612.0, 792.0)
@@ -417,6 +425,9 @@ class PdfiumDoc:
         rect, fsm = raw.FS_RECTF(), raw.FS_MATRIX()
         ox, oy = ctypes.c_double(), ctypes.c_double()
         frags, objects, modes, fonts, axes, sizes, hidden = [], {}, {}, {}, {}, {}, {}
+        advances = {}  # text object: (font handle, Tf, the char matrix's x scale), or None
+        tl, tr, tb, tt = (ctypes.c_double() for _ in range(4))
+        glyph = ctypes.c_float()
         checked = set()  # text objects whose second char was looked at for a vertical advance
         marks = self.native is None  # with native, an off layer's page is native's (decision 3)
         vertical = False
@@ -491,9 +502,13 @@ class PdfiumDoc:
                     # scale native multiplies Tf by (equal to native's sqrt|det| for any matrix
                     # whose x and y scales agree, Tz or not)
                     scale = math.hypot(fsm.c, fsm.d)
+                    font = raw.FPDFTextObj_GetFont(handle) if handle else None
+                    advances[addr] = ((font, fs, math.hypot(fsm.a, fsm.b))
+                                      if font and _finite(fs) and fs > 0 else None)
                 else:
                     axes[addr] = (1.0, 0.0, 0.0, 1.0)
                     scale = 1.0
+                    advances[addr] = None
                 size = fs * scale if _finite(fs) else 0.0
                 if not size or abs(size) > _COORD:
                     # no usable font size: the loose box's extent across the line stands in
@@ -527,10 +542,27 @@ class PdfiumDoc:
                     run["end"] = max(e0, s0)
                     run["obj"], run["invisible"], run["font"] = objects[addr], modes[addr], fonts[addr]
                     run["hidden"] = hidden[addr]
-            # the loose box gives the geometry only: projected on the text direction, where the
-            # advance ends
+            # the loose box gives the geometry: projected on the text direction, where the
+            # advance ends. It also holds the glyph's ink, so where the ink reaches its far edge
+            # (an f or an italic letter overhanging its advance), or the text runs at an angle
+            # (the box is then upright around the turned glyph), the advance ends at the font's
+            # width for the char instead, when pdfium has one that fits inside the box
             start = x * dx + y * dy
             end = (right * dx if dx >= 0 else left * dx) + (top * dy if dy >= 0 else bottom * dy)
+            adv = advances[addr]
+            if (adv is not None and not ligature and addr not in upright and end > start
+                    and c <= 0xFFFF and c not in _HYPHENS):
+                straight = abs(dx) < 1e-6 or abs(dy) < 1e-6
+                if straight:
+                    ink = (raw.FPDFText_GetCharBox(tp, at, tl, tr, tb, tt)
+                           and (tr.value * dx if dx >= 0 else tl.value * dx)
+                           + (tt.value * dy if dy >= 0 else tb.value * dy) >= end - 1e-3)
+                if ((not straight or ink)
+                        and raw.FPDFFont_GetGlyphWidth(adv[0], c, adv[1], ctypes.byref(glyph))
+                        and _finite(glyph.value)):
+                    width = glyph.value * adv[2]
+                    if (ADVANCE_FLOOR * (end - start) if straight else 0.0) < width < end - start:
+                        end = start + width
             base = x * ux + y * uy
             if ligature:
                 # no gap and the glyph's offset; the run ends where the whole glyph does
