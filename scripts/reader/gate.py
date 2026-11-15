@@ -114,6 +114,15 @@ def looks_like_text(path):
     return not text.lstrip("﻿").startswith("{\\rtf")
 
 
+def _is_zip(path):
+    """True when the file starts with the zip local-header signature (every Keynote file is a zip)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"PK"
+    except OSError:
+        return False
+
+
 def deny_text(path, why, retry=True):
     """A deny; with retry, the convert command too (only where running it by hand can help)."""
     reason = f"{_name(path)}: {why}."
@@ -363,6 +372,8 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
         return None
     if looks_like_text(path):
         return None
+    if reader.ext_of(path) == "key" and not _is_zip(path):
+        return None  # a binary .key (a DER or PKCS key, say) is not a Keynote file
     if reader.ext_of(path) not in reader.BUILT:
         return _deny(path, "unsupported")
     if path.stat().st_size > limits.MAX_INPUT:

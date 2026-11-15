@@ -1115,6 +1115,62 @@ def test_unsupported_detail_reason():
     assert gate._why("unsupported") == "this format is not supported yet"
 
 
+def test_phase3_formats_convert():
+    """Each phase 3 extension converts through the real read.py: a tiny clean fixture, written to a temp dir."""
+    import test_reader_mobi as tm
+    import test_reader_wpd as tw
+    from iwork_fix import keynote09, numbers09, pages09, slide09
+    import test_reader_iwork as ti
+    wp = tw._wp6(b"Hello\x80" + b"World" + b"\xccNext")
+    mobi = tm._mobi(tm.BOOK)
+    iwork = {"pages": pages09(ti._p("wordword")),
+             "numbers": numbers09(ti._ws("Sheet 1", ti._table09("Table 1", [[ti._t("cellword"), ti._n("5")]]))),
+             "key": keynote09(slide09(ti._p("Title"), ti._p("slideword")))}
+    files = {f"a.{e}": (wp, "Hello") for e in ("wpd", "wp", "wp5", "wp6", "wp7", "wpt")}
+    files.update({f"a.{e}": (mobi, "first para") for e in ("mobi", "azw3")})
+    files.update({"a.pages": (iwork["pages"], "wordword"), "a.numbers": (iwork["numbers"], "cellword"),
+                  "a.key": (iwork["key"], "slideword")})
+    with stub():  # only for its throwaway cache root: the real read.py converts
+        for name, (data, word) in files.items():
+            p = put(name, data)
+            o = out(gate.decide(ev(p)))
+            assert o["permissionDecision"] == "allow", (name, o)
+            new_path = Path(o["updatedInput"]["file_path"])
+            assert new_path.name == "out.md" and new_path != p, name
+            assert word in new_path.read_text(encoding="utf-8"), (name, new_path.read_text(encoding="utf-8"))
+
+
+def test_unsupported_mac_hint_fits():
+    detail = "WordPerfect for Mac; set PHRO_READER_SOFFICE=1 to read it through LibreOffice"
+    child = [sys.executable, "-c", f"print('FAIL\tunsupported\t{detail}')"]
+    with stub():
+        p = put("a.wpd", bytes(8))
+        o = out(gate.decide(ev(p), command=child))
+    assert o["permissionDecision"] == "deny", o
+    assert "PHRO_READER_SOFFICE=1" in o["permissionDecisionReason"], o
+    assert "this file is not supported (" + detail + ")" in o["permissionDecisionReason"], o
+
+
+def test_bundle_folder_passes():
+    d = tmp() / "a.pages"
+    d.mkdir()
+    assert gate.decide(ev(d)) is None
+
+
+def test_binary_key_not_zip_passes_through():
+    der = bytes([0x30, 0x82, 0x04, 0xA2, 0x02, 0x01, 0x00, 0x02, 0x82]) + bytes(64)
+    assert gate.decide(ev(put("a.key", der))) is None
+    assert gate.decide(ev(put("b.key", b"PK\x03"))) is None
+
+
+def test_keynote_key_converts():
+    from iwork_fix import keynote09, slide09
+    import test_reader_iwork as ti
+    with stub():
+        o = out(gate.decide(ev(put("a.key", keynote09(slide09(ti._p("T"), ti._p("slideword")))))))
+    assert o["permissionDecision"] == "allow", o
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
