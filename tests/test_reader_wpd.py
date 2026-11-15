@@ -1,16 +1,21 @@
-"""WordPerfect reader: the Tika character sets, and (later tasks) the readers on top of them.
+"""WordPerfect reader: the Tika character sets, the head, the WP6+ prefix index and body walk.
 
 Run: python -I -X utf8 tests/test_reader_wpd.py
 """
+import struct
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader.formats import wpd_charsets  # noqa: E402
+from reader import markdown  # noqa: E402
+from reader.formats import wpd, wpd_charsets  # noqa: E402
 from reader.formats.wpd_charsets import WP5, WP6, char  # noqa: E402
+from reader.limits import ReadError  # noqa: E402
+from reader.model import Bold, Context, Hidden, Para, Text  # noqa: E402
 
 # Sizes of the Java arrays: Tika's own "(N chars)" comments, checked against the literals in the files.
 WP6_SIZES = (96, 242, 145, 88, 102, 255, 238, 229, 219, 123, 250, 63, 256, 196, 220)
@@ -97,6 +102,258 @@ def test_composite_entry():
         assert len(wpd_charsets.char(1, 1)) == 2
     finally:
         wpd_charsets.WP6 = real
+
+
+# ---- WP6+ fixtures, built in memory
+
+def _var(group, sub, payload=b"\x00\x00\x00"):
+    """A variable-length group: [group][sub][u16 size] payload [u16 size][group]. The payload is everything between
+    the two sizes (flags, prefix ids, the non-deletable size and the data); the default is flags 0, size 0."""
+    size = len(payload) + 7
+    return bytes((group, sub)) + struct.pack("<H", size) + payload + struct.pack("<H", size) + bytes((group,))
+
+
+def _fixed(code, payload):
+    """A fixed-length group: [code] payload [code]."""
+    return bytes((code,)) + payload + bytes((code,))
+
+
+def _on(attr):
+    return _fixed(0xF2, bytes((attr,)))
+
+
+def _off(attr):
+    return _fixed(0xF3, bytes((attr,)))
+
+
+def _undo(kind):
+    return _fixed(0xF1, bytes((kind,)) + b"\x00\x00")
+
+
+def _ext(code, cset):
+    return _fixed(0xF0, bytes((code, cset)))
+
+
+def _wp6(body: bytes, packets=(), *, encryption=0, ftype=0x0A, major=2, product=1) -> bytes:
+    """A WordPerfect 6+ file: the 16-byte head, the index header at 16 and its 14-byte entries from 16 + 14, the
+    packets, then the body the document pointer points at."""
+    ih = 16
+    index = 14 * (len(packets) + 1)
+    entries, blobs = [], []
+    at = ih + index
+    for ptype, blob in packets:
+        entries.append(struct.pack("<BBHHII", 0, ptype, 1, 0, len(blob), at))
+        blobs.append(blob)
+        at += len(blob)
+    header = struct.pack("<BBH10s", 2, 0, len(packets) + 1, b"")
+    head = b"\xffWPC" + struct.pack("<I", at) + bytes((product, ftype, major, 1)) + struct.pack("<HH", encryption, ih)
+    return head + header + b"".join(entries) + b"".join(blobs) + body
+
+
+def _summary(tag, text):
+    """One group of a 0x12 summary packet: [u16 length][u16 tag][2 bytes][name chars, 0][data chars, 0]; each char is
+    u16, low byte the code, high byte the set (set 0 is ASCII)."""
+    name = struct.pack("<H", 0)
+    data = b"".join(struct.pack("<BB", ord(c), 0) for c in text) + struct.pack("<H", 0)
+    rest = struct.pack("<H", tag) + b"\x00\x00" + name + data
+    return struct.pack("<H", len(rest) + 2) + rest
+
+
+def _read(data):
+    ctx = Context()
+    return wpd.parse_bytes(data, ctx), ctx
+
+
+def _md(doc, ctx, hidden=False):
+    return markdown.render(doc, Path(tempfile.mkdtemp()) / "assets", hidden, ctx.skipped)
+
+
+def _refused(data, kind):
+    try:
+        _read(data)
+    except ReadError as e:
+        assert e.kind == kind, e
+        return e
+    raise AssertionError(f"expected ReadError {kind}")
+
+
+def _plain(doc):
+    def flat(inl):
+        out = []
+        for it in inl:
+            if isinstance(it, Text):
+                out.append(it.text)
+            elif isinstance(it, (Bold, Hidden)):
+                out.append(flat(it.inlines))
+        return "".join(out)
+    return [flat(b.inlines) for b in doc.blocks]
+
+
+# ---- the brief's tests
+
+def test_wp6_paragraphs_and_bold():
+    body = b"Hello\x80" + _on(12) + b"World" + _off(12) + b"\xccNext"
+    data = _wp6(body)
+    doc, ctx = _read(data)
+    assert len(doc.blocks) == 2 and all(isinstance(b, Para) for b in doc.blocks)
+    first = doc.blocks[0].inlines
+    assert first[0] == Text("Hello ") and first[1] == Bold([Text("World")]), first
+    assert doc.blocks[1].inlines == [Text("Next")]
+    out = _md(doc, ctx)
+    assert "Hello **World**" in out and "Next" in out
+    assert not ctx.skipped
+    # parse(path) reads the file and gives the same document
+    h = wpd.head(data)
+    assert h == wpd.Head(pointer=len(data) - len(body), product=1, ftype=0x0A, major=2, minor=1, encryption=0)
+    path = Path(tempfile.mkdtemp()) / "a.wpd"
+    path.write_bytes(data)
+    assert wpd.parse(path, Context()).blocks == doc.blocks
+    # soft EOLs are spaces; a D0 hard EOL and a page break end a paragraph
+    body = (b"one\xcftwo" + _var(0xD0, 0x01) + b"three" + _var(0xD0, 0x04) + b"four\xc7five"
+            + _var(0xD0, 0x17) + b"six")
+    doc, _ = _read(_wp6(body))
+    assert _plain(doc) == ["one two three", "four", "five", "six"], _plain(doc)
+    # the extended international characters 0x01-0x20, a hard space and a hard hyphen
+    doc, _ = _read(_wp6(b"\x01\x20x\x81y\x84z"))
+    assert _plain(doc) == ["åßx y-z"], _plain(doc)
+
+
+def test_extended_chars():
+    body = b"a" + _ext(120, 1) + _ext(0x41, 0) + _ext(5, 12) + b"b"
+    doc, ctx = _read(_wp6(body))
+    assert _plain(doc) == ["aĢAb"], _plain(doc)
+    assert ctx.skipped["glyphs"] == 1
+    # a composite entry (one code, two code points) is put in whole
+    real = wpd_charsets.WP6
+    try:
+        wpd_charsets.WP6 = real[:1] + (("a", "é"),) + real[2:]
+        doc, ctx = _read(_wp6(b"x" + _ext(1, 1) + b"y"))
+    finally:
+        wpd_charsets.WP6 = real
+    assert _plain(doc) == ["xéy"] and not ctx.skipped
+
+
+def test_undo_hidden_and_shown():
+    body = b"Keep\x80" + _undo(0) + b"Gone" + _undo(1) + b"\x80Also"
+    doc, ctx = _read(_wp6(body))
+    inl = doc.blocks[0].inlines
+    assert inl == [Text("Keep "), Hidden([Text("Gone")], "deleted"), Text(" Also")], inl
+    out = _md(doc, ctx)
+    assert "Gone" not in out and "Keep" in out and "Also" in out
+    assert "(1 hidden places left out)" in out, out
+    shown = _md(doc, ctx, hidden=True)
+    assert "(hidden: Gone)" in shown, shown
+    # inside an undo span a paragraph end and a bold change are deleted too: the paragraph runs on
+    body = b"A\x80" + _undo(0) + b"x\xcc" + _on(12) + b"y" + _undo(1) + b"\x80B"
+    doc, _ = _read(_wp6(body))
+    assert len(doc.blocks) == 1
+    assert doc.blocks[0].inlines == [Text("A "), Hidden([Text("x y")], "deleted"), Text(" B")], doc.blocks[0].inlines
+
+
+def test_undo_without_end():
+    body = b"Start\xcc" + _undo(0) + b"Tail\xccMore"
+    doc, ctx = _read(_wp6(body))
+    assert _plain(doc)[0] == "Start"
+    assert all(isinstance(i, Hidden) and i.kind == "deleted" for i in doc.blocks[1].inlines)
+    out = _md(doc, ctx)
+    assert "Start" in out and "Tail" not in out and "More" not in out
+    shown = _md(doc, ctx, hidden=True)
+    assert "Tail" in shown and "More" in shown
+
+
+def test_resync_one_record():
+    good = _var(0xD4, 0x1C)
+    bad = good[:-1] + b"\x99"  # the closing byte is not the group's
+    doc, ctx = _read(_wp6(b"Before\x80" + bad + b"After"))
+    text = _plain(doc)[0]
+    assert text.startswith("Before") and text.endswith("After"), text
+    assert ctx.skipped["record"] == 1
+    # a wrong closing size fails too; two bad groups apart are two runs, two bad bytes in a row one run
+    bad_size = good[:-3] + b"\x00\x00" + good[-1:]
+    doc, ctx = _read(_wp6(b"x" + bad_size + b"y" + bad + b"z"))
+    assert ctx.skipped["record"] == 2, ctx.skipped
+    doc, ctx = _read(_wp6(b"x\xf2\xf2\x0cqz"))  # F2 fails, the next F2 fails at once: one run
+    assert ctx.skipped["record"] == 1 and _plain(doc)[0].endswith("qz"), (ctx.skipped, _plain(doc))
+    # a size too small to hold the group fails
+    doc, ctx = _read(_wp6(b"x\xd4\x00\x03\x00y"))
+    assert ctx.skipped["record"] == 1 and _plain(doc)[0].endswith("y")
+
+
+def test_truncated_body_keeps_text():
+    data = _wp6(b"Before\xccKept" + _var(0xD4, 0x1C, b"\x00\x00\x00" + b"\x00" * 20) + b"Lost")
+    cut = data[:len(data) - len("Lost") - 12]  # in the middle of the group
+    doc, ctx = _read(cut)
+    assert _plain(doc) == ["Before", "Kept"], _plain(doc)
+    assert ctx.skipped["record"] == 1 and set(ctx.skipped) == {"record"}
+    # a fixed group cut by the end, and a variable group cut inside its size field
+    for tail in (b"\xf0\x41", b"\xd4\x1c\x10"):
+        doc, ctx = _read(_wp6(b"Text" + tail))
+        assert _plain(doc) == ["Text"] and ctx.skipped["record"] == 1, (tail, ctx.skipped)
+
+
+def test_redline_strikeout_plain():
+    body = b"a\x80" + _on(10) + b"red" + _off(10) + b"\x80" + _on(13) + b"strike" + _off(13) + b"\x80b"
+    doc, ctx = _read(_wp6(body))
+    assert doc.blocks[0].inlines == [Text("a red strike b")], doc.blocks[0].inlines
+    assert not ctx.skipped and not ctx.warnings
+
+
+def test_attribute_above_16():
+    doc, ctx = _read(_wp6(b"x" + _on(17) + b"y"))
+    assert _plain(doc) == ["xy"]
+    assert ctx.skipped["attribute"] == 1
+    assert ctx.warnings == ["attribute: unknown WordPerfect attribute number"]
+    doc, ctx = _read(_wp6(_on(17) + b"y" + _off(17) + _on(200) + b"z" + _on(16)))
+    assert ctx.skipped["attribute"] == 3 and len(ctx.warnings) == 1
+    assert "attribute" in markdown.INTERNAL and not markdown.lost(ctx.skipped)
+
+
+def test_summary_title():
+    packet = _summary(5, "Author") + _summary(17, "  A   Title ")
+    doc, ctx = _read(_wp6(b"Body", [(0x01, b"\x00" * 4), (0x12, packet)]))
+    assert doc.title == "A Title", doc.title
+    assert _plain(doc) == ["Body"] and not ctx.skipped
+    doc, _ = _read(_wp6(b"Body", [(0x12, _summary(17, "t" * 600))]))
+    assert doc.title == "t" * 500
+    # the prefix index: type -> (id, offset, size), the ids counted from 1
+    data = _wp6(b"Body", [(0x01, b"abcd"), (0x12, packet), (0x01, b"")])
+    got = wpd._prefix6(data, Context())
+    assert sorted(got) == [0x01, 0x12]
+    assert [(i, s) for i, _, s in got[0x01]] == [(1, 4), (3, 0)]
+    _, off, size = got[0x12][0]
+    assert data[off:off + size] == packet
+    # an entry whose range is past the end of the file is skipped and counted
+    data = bytearray(_wp6(b"Body", [(0x12, packet)]))
+    struct.pack_into("<I", data, 16 + 14 + 10, len(data))  # the entry's offset
+    ctx = Context()
+    assert wpd._prefix6(bytes(data), ctx) == {} and ctx.skipped["record"] == 1
+    doc, ctx = _read(bytes(data))
+    assert doc.title == "" and _plain(doc) == ["Body"] and ctx.skipped["record"] == 1
+    # an index whose entries run past the end of the file: the ones inside are read, the cut counted once
+    data = bytearray(_wp6(b"Body", [(0x12, packet)]))
+    struct.pack_into("<H", data, 16 + 2, 60_000)
+    struct.pack_into("<II", data, 16 + 14 + 6, 4, 0)  # entry 1: the head's first 4 bytes
+    ctx = Context()
+    assert wpd._prefix6(bytes(data[:16 + 28 + 7]), ctx) == {0x12: [(1, 0, 4)]}  # cut inside entry 2
+    assert ctx.skipped["record"] == 1
+
+
+def test_refusals():
+    assert wpd.head(b"not a wpd file at all") is None
+    assert _refused(_wp6(b"x", encryption=1), "encrypted")
+    assert "WPG" in _refused(_wp6(b"x", ftype=0x16), "unsupported").detail
+    assert _refused(_wp6(b"x", ftype=0x2C), "unsupported")
+    assert "WordPerfect version" in _refused(_wp6(b"x", major=1), "unsupported").detail
+    assert "WordPerfect version" in _refused(_wp6(b"x", product=2), "unsupported").detail
+    # the order: the encryption word first, then WPG, then Mac, then the version
+    assert _refused(_wp6(b"x", encryption=1, ftype=0x16, major=1), "encrypted")
+    assert "WPG" in _refused(_wp6(b"x", ftype=0x16, major=1, product=2), "unsupported").detail
+    data = bytearray(_wp6(b"x"))
+    struct.pack_into("<I", data, 4, len(data) + 1)
+    assert _refused(bytes(data), "damaged")
+    assert _refused(_wp6(b""), "damaged")
+    assert _refused(_wp6(b"\x80\x80\xcc"), "damaged")  # a body that gives no block
+    assert _refused(b"\xffWPC\x10\x00", "damaged")  # a head cut short
 
 
 def main():
