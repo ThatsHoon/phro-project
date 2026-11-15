@@ -15,6 +15,7 @@ column fallback (`xps._columns`) are this reader's own.
 Page space is y up. Every loop here runs over the fragments and lines the caller holds, which
 are capped upstream. Sorts are O(n log n); line building, joins and `running` are linear.
 """
+import bisect
 import heapq
 import json
 import math
@@ -258,6 +259,15 @@ LINE_TOLERANCE = 0.5   # fragments within this many sizes of one baseline are on
 PARA_GAP = 1.5   # a baseline step over this many line heights ends a paragraph
 GRID = 64.0      # link grid cell, in page units
 GRID_SPAN = 32   # a link or fragment over this many cells a side skips the grid
+# A fragment drawn out of reading order on a line (see `lines`) joins from wholly before the line
+# only within GUTTER sizes of it and at a size within SIZE_TOLERANCE points. A word space is about
+# 0.25 em and the tab after a heading number 1-2 em; a column gutter or a box beside another is
+# wider (the bench's heading beside a box stands 4.8 em off), so 2 em keeps the first and splits
+# the second.
+GUTTER = 2.0
+SIZE_TOLERANCE = 1.0
+PIECE_OVERLAP = 0.1   # a piece overlapping a placed one by over this many sizes has no slot
+LINE_PIECES = 2_000   # word pieces one out-of-order line holds; past it a fragment starts a line
 
 
 @dataclass
@@ -415,59 +425,171 @@ def _glyphs(f, urls):
     return out
 
 
-def _overprints(f, g) -> bool:
-    """Whether a glyph of `f` covers over half of a glyph of `g` (text drawn twice over itself,
-    as a fake bold does). Spaces are passed over."""
-    a = sorted((g0, g1) for g0, g1, ch, _, _ in _glyphs(f, None) if not ch.isspace())
-    b = sorted((g0, g1) for g0, g1, ch, _, _ in _glyphs(g, None) if not ch.isspace())
-    i = j = 0
-    while i < len(a) and j < len(b):
-        (a0, a1), (b0, b1) = a[i], b[j]
-        over = min(a1, b1) - max(a0, b0)
-        if over > 0 and over > 0.5 * min(a1 - a0, b1 - b0):
-            return True
-        if a1 < b1:
-            i += 1
-        else:
-            j += 1
-    return False
+def _pieces(f, urls):
+    """[(start, end, [(char, url)], size)]: the fragment's words along the reading axis, split
+    where a glyph's gap is over GAP x the size, with the spaces at their edges trimmed."""
+    n = len(f.text)
+    gaps = f.char_gaps if len(f.char_gaps) == n else ()
+    out, cur = [], []
+    for k, g in enumerate(_glyphs(f, urls) + [None]):
+        if g is None or (k and gaps and gaps[k] > GAP * f.size):
+            while cur and cur[-1][2].isspace():
+                cur.pop()
+            if cur:
+                out.append((cur[0][0], max(c[1] for c in cur), [(c[2], c[3]) for c in cur], f.size))
+            cur = []
+        if g is not None and (cur or not g[2].isspace()):
+            cur.append(g)
+    return out
 
 
-def _positioned_chars(parts):
-    """[(char, url)] of a line whose fragments were drawn out of reading order: every glyph sorted
-    by its start, a space where the gap to the glyph before is over GAP x its size and neither
-    side is a space. `parts` is [(fragment, urls)] in content order."""
-    glyphs = sorted((g for f, urls in parts for g in _glyphs(f, urls)), key=lambda g: g[0])
+def _piece_chars(pieces):
+    """[(char, url)] of pieces sorted by start: a space between two where the gap is over GAP x
+    the later one's size."""
     out, end = [], None
-    for start, stop, ch, url, size in glyphs:
-        if end is not None and start - end > GAP * size and ch != " " and out[-1][0] != " ":
-            out.append((" ", url if out[-1][1] == url else ""))
-        out.append((ch, url))
+    for start, stop, chars, size in pieces:
+        if end is not None and start - end > GAP * size:
+            out.append((" ", chars[0][1] if out[-1][1] == chars[0][1] else ""))
+        out.extend(chars)
         end = stop if end is None else max(end, stop)
     return out
+
+
+class _Row:
+    """A line being built: its fragments in content order, its span along the reading axis and,
+    once a fragment was drawn out of reading order, the word pieces of all of them by start."""
+
+    def __init__(self, f, urls, direction, anchor):
+        s = along(f)
+        self.frags, self.parts, self.chars = [f], [(f, urls)], _chars_of(f, urls)
+        self.direction, self.anchor = direction, anchor
+        self.lo, self.hi, self.end = s, s + f.width, s + f.width
+        self.starts = None   # piece starts, sorted; None while the row is in reading order
+        self.pieces = None
+
+    def index(self):
+        if self.starts is None:
+            self.pieces = sorted((p for f, urls in self.parts for p in _pieces(f, urls)),
+                                 key=lambda p: p[0])
+            self.starts = [p[0] for p in self.pieces]
+
+    def free(self, pieces) -> bool:
+        """Whether no piece overlaps a placed one by over PIECE_OVERLAP x the size."""
+        for a, b, _, size in pieces:
+            i = bisect.bisect_left(self.starts, b)
+            for j in range(max(0, i - 4), i):
+                p0, p1, _, other = self.pieces[j]
+                if min(b, p1) - max(a, p0) > PIECE_OVERLAP * min(size, other):
+                    return False
+        return True
+
+    def repeats(self, pieces) -> bool:
+        """Whether every piece lies over a placed piece of the same text by over half its width:
+        text drawn again over itself (a fake bold, a shadow), read once."""
+        for a, b, chars, _ in pieces:
+            text = "".join(c for c, _ in chars)
+            i = bisect.bisect_left(self.starts, b)
+            if not any(min(b, p1) - max(a, p0) > 0.5 * (b - a) and "".join(c for c, _ in got) == text
+                       for p0, p1, got, _ in self.pieces[max(0, i - 4):i]):
+                return False
+        return True
+
+    def _place(self, pieces):
+        for p in pieces:
+            k = bisect.bisect_right(self.starts, p[0])
+            self.starts.insert(k, p[0])
+            self.pieces.insert(k, p)
+
+    def take_forward(self, f, urls) -> bool:
+        """Join a fragment that starts where the last one ended: always while the row is in
+        reading order, else only when its pieces find free slots. True also when it repeats
+        placed text over itself, which is then left out."""
+        if self.starts is None:
+            s = along(f)
+            if (s - self.end > GAP * f.size and self.chars[-1][0] != " "
+                    and not f.text[0].isspace()):
+                same = self.chars[-1][1] == (urls[0] if urls else "")
+                self.chars.append((" ", self.chars[-1][1] if same else ""))
+            self.chars.extend(_chars_of(f, urls))
+        else:
+            pieces = _pieces(f, urls)
+            if not self.free(pieces):
+                return self.repeats(pieces)
+            self._place(pieces)
+        self.frags.append(f)
+        self.parts.append((f, urls))
+        return True
+
+    def take_back(self, f, urls, s) -> bool:
+        """Join a fragment that starts before the last one ended: not when it lies wholly before
+        the line over GUTTER sizes away or at another size (a box or a heading beside it), nor
+        when one of its pieces overlaps a placed one. A fragment that repeats placed text over
+        itself (a fake bold, a shadow) is taken and left out."""
+        self.index()
+        if len(self.starts) >= LINE_PIECES:
+            return False
+        if s + f.width < self.lo:
+            near = self.pieces[0][3] if self.pieces else f.size
+            if (self.lo - (s + f.width) > GUTTER * max(f.size, near)
+                    or abs(f.size - near) > SIZE_TOLERANCE):
+                return False
+        pieces = _pieces(f, urls)
+        if not self.free(pieces):
+            return self.repeats(pieces)
+        self._place(pieces)
+        self.frags.append(f)
+        self.parts.append((f, urls))
+        return True
+
+    def take_row(self, other) -> bool:
+        """Take in the line built just before, on the same baseline, when it lies inside this
+        one's span with every piece in a free slot (a row's right cell drawn before the row)."""
+        if not (other.direction == self.direction and self.lo <= other.lo and other.hi <= self.hi
+                and abs(other.anchor - self.anchor)
+                <= LINE_TOLERANCE * max(other.frags[0].size, self.frags[0].size)):
+            return False
+        self.index()
+        pieces = [p for f, urls in other.parts for p in _pieces(f, urls)]
+        if len(self.starts) + len(pieces) > LINE_PIECES or not self.free(pieces):
+            return False
+        self._place(pieces)
+        self.frags = other.frags + self.frags
+        self.parts = other.parts + self.parts
+        return True
+
+    def line_chars(self):
+        return self.chars if self.starts is None else _piece_chars(self.pieces)
 
 
 def lines(fragments, links=()) -> List[Line]:
     """Lines in content order: consecutive fragments of one direction on one baseline are one
     line. A space goes between two glyphs when the gap is over GAP x the size and neither side
-    is a space. A fragment that starts before the last one ended joins the line too when no glyph
-    of it covers a glyph of the last (a row whose cells are drawn right cell first, or words drawn
-    into the gaps a later string leaves); the line's glyphs are then put in order by position.
-    One that does cover the last (text drawn twice over itself) starts a new line. Vertical text
-    comes last, as `vertical_lines`.
+    is a space. Vertical text comes last, as `vertical_lines`.
+
+    A fragment that starts before the last one ended (a row whose cells are drawn right cell
+    first, words drawn into the gaps a later string leaves) joins the line as `_Row.take_back`
+    allows. The line is then built from its word pieces in order of position, and each later
+    fragment joins only where its pieces find free slots. A line that lies inside the next
+    one's span, in free slots, is taken into it (`_Row.take_row`).
 
     `links` is [(box, url)]; a character whose centre lies in a link box carries its url.
     """
     frags = sorted((f for f in fragments if f.text and not f.hidden), key=lambda f: f.order)
     grid = _LinkGrid(links) if links else None
     out, vertical = [], []
-    cur, parts, chars, direction, anchor, end = [], [], [], "", 0.0, 0.0
-    backward = False
+    row, last = None, None
 
-    def flush():
-        got = _positioned_chars(parts) if backward else chars
-        if cur and any(not c[0].isspace() for c in got):
-            out.append(_make_line(cur, got))
+    def flush(row, last):
+        """Emit the row; returns it, or None when it holds no text."""
+        if row is None:
+            return last
+        if last is not None and row.take_row(last):
+            out.pop()
+        chars = row.line_chars()
+        if any(not c[0].isspace() for c in chars):
+            out.append(_make_line(row.frags, chars))
+            return row
+        return None
 
     for f in frags:
         d = writing_direction(f)
@@ -476,25 +598,18 @@ def lines(fragments, links=()) -> List[Line]:
             continue
         a, s = across(f), along(f)
         urls = _glyph_urls(f, grid)
-        same_line = (cur and d == direction
-                     and abs(a - anchor) <= LINE_TOLERANCE * max(f.size, cur[-1].size))
-        if same_line and s >= end - LINE_TOLERANCE * f.size:
-            if (s - end > GAP * f.size and chars[-1][0] != " " and not f.text[0].isspace()):
-                same = chars[-1][1] == (urls[0] if urls else "")
-                chars.append((" ", chars[-1][1] if same else ""))
-            cur.append(f)
-            parts.append((f, urls))
-            chars.extend(_chars_of(f, urls))
-        elif same_line and not _overprints(f, cur[-1]):
-            backward = True
-            cur.append(f)
-            parts.append((f, urls))
-        else:
-            flush()
-            cur, parts, chars, direction, anchor = [f], [(f, urls)], _chars_of(f, urls), d, a
-            backward = False
-        end = s + f.width
-    flush()
+        joined = False
+        if (row is not None and d == row.direction
+                and abs(a - row.anchor) <= LINE_TOLERANCE * max(f.size, row.frags[-1].size)):
+            if s >= row.end - LINE_TOLERANCE * f.size:
+                joined = row.take_forward(f, urls)
+            else:
+                joined = row.take_back(f, urls, s)
+        if not joined:
+            last = flush(row, last)
+            row = _Row(f, urls, d, a)
+        row.lo, row.hi, row.end = min(row.lo, s), max(row.hi, s + f.width), s + f.width
+    flush(row, last)
     return out + vertical_lines(vertical, links)
 
 

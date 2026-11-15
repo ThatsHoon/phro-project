@@ -358,6 +358,42 @@ def test_sideways_page_read_upright():
     assert text.index("日本") < text.index("縦書"), text
 
 
+def test_line_drawn_twice_reads_once():
+    # a line of two fragments drawn twice, 0.4 pt apart (a fake bold or a shadow): read once
+    ops = [text_ops("Annual", 72, 700), text_ops("Report", 120, 700),
+           text_ops("Annual", 72.4, 700), text_ops("Report", 120.4, 700)]
+    text, _, _ = md(simple_pdf([b" ".join(ops)]))
+    assert "AAnn" not in text and text.count("Annual") == 1 and "Annual Report" in text, text
+    # a stamp drawn five times over itself
+    stamp = [text_ops("Processed with", 72 + 0.2 * k, 600) + b" "
+             + text_ops("evaluation edition", 160 + 0.2 * k, 600) for k in range(5)]
+    text, _, _ = md(simple_pdf([b" ".join(stamp)]))
+    assert "PPPP" not in text and text.count("Processed") == 1, text
+    assert "Processed with evaluation edition" in text, text
+
+
+def test_overlapping_fragments_stay_words():
+    # a name drawn after a date, over its last glyph by under half a glyph (K over 5 by 2.7 pt),
+    # within the line's baseline tolerance: no free slot, so the name starts a line of its own
+    ops = [text_ops("Minister", 150, 700), text_ops("2025", 249, 703), text_ops("20.", 300, 703),
+           text_ops("Kim", 273, 698)]
+    text, _, _ = md(simple_pdf([b" ".join(ops)]))
+    assert "2025" in text and re.search(r"\bKim\b", text), text
+
+
+def test_boxes_side_by_side_stay_apart():
+    # two boxes on one baseline, the right one drawn first: no join across the gutter, and a
+    # larger heading to the left of a sentence stays out of it
+    ops = [text_ops("Send your order to:", 320, 700), text_ops("You can visit the site", 72, 700)]
+    text, _, _ = md(simple_pdf([b" ".join(ops)]))
+    assert "You can visit the site Send" not in text and "to: You" not in text, text
+    assert "Send your order to:" in text and "You can visit the site" in text, text
+    ops = [text_ops("See the notes in the introduction", 132, 600, size=10),
+           text_ops("Index", 42, 600, size=12)]
+    text, _, _ = md(simple_pdf([b" ".join(ops)]))
+    assert "Index See" not in text and "introduction Index" not in text, text
+
+
 def test_baseline_drawn_out_of_order():
     # a table row whose cells the content stream draws right cell first: one line, left to right
     row = [text_ops("9.50", 400, 700), text_ops("0001", 72, 700), text_ops("PLAN", 120, 700),
@@ -372,7 +408,7 @@ def test_baseline_drawn_out_of_order():
     assert "IMPORT and TABLE" in text, text
     # the same text drawn twice over itself (fake bold) is not interleaved glyph by glyph
     text, _, _ = md(simple_pdf([text_ops("Bold", 72, 600) + b" " + text_ops("Bold", 72.3, 600)]))
-    assert "BBoolldd" not in text and text.count("Bold") == 2, text
+    assert "BBoolldd" not in text and text.count("Bold") == 1, text
 
 
 def test_page_seconds_part():
