@@ -508,7 +508,7 @@ WP5: tuple[tuple[str, ...], ...] = (
 def char(charset: int, code: int, wp5: bool = False) -> str | None:
     """The text for a character in an extended set, or None when unmapped.
 
-    None for set 12, an empty slot, or any set or code outside the tables.
+    None for set 12, an empty slot, a NUL placeholder entry, or any set or code outside the tables.
     """
     table = WP5 if wp5 else WP6
     if not 0 <= charset < len(table):
@@ -516,4 +516,6 @@ def char(charset: int, code: int, wp5: bool = False) -> str | None:
     row = table[charset]
     if not 0 <= code < len(row):
         return None
-    return row[code] or None
+    text = row[code]
+    # an empty slot, or a NUL (Tika's placeholder for a glyph it has no character for), is unmapped
+    return None if text in ("", "\x00") else text

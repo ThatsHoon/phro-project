@@ -78,6 +78,10 @@ def test_unmapped_is_none():
     assert char(-1, 0) is None and char(1, -1) is None
     assert char(14, 220) is None  # one past the WP6 set 14 table
     assert char(13, 0, wp5=True) is None  # WP5 has no set 13
+    # WP5 set 10 codes 144-147 are '\u0000' placeholders in Tika (WP5Charsets.java line 123): kept in the table, unmapped
+    assert WP5[10][144:148] == ("\x00",) * 4
+    assert all(char(10, c, wp5=True) is None for c in (144, 145, 146, 147))
+    assert char(10, 148, wp5=True) == "́" and char(10, 149, wp5=True) == "̀"
     # a space Tika maps is mapped, not unmapped (WP6Charsets.java line 331)
     assert char(13, 0) == " "
 
