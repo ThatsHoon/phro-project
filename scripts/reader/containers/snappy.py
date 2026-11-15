@@ -12,7 +12,9 @@ from .flate import Budget
 
 SNAPPY_BLOCK = 16 * 2**20
 
-_RATIO = 22  # one 3-byte tag emits at most 64 bytes, so no valid block reaches 22 times its size
+# the spec's Limits "Snappy declares at most 21 times its input": one 3-byte copy tag emits at most 64 bytes, so a
+# valid block reaches 64/3 (about 21.3) times its size and never 22; 22 is the first whole number none reaches
+_RATIO = 22
 _HEADER = 4
 
 

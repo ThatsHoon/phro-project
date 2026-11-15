@@ -582,12 +582,14 @@ def _walk_blocks(blocks, visit):
 
 
 def referenced(blocks, notes) -> list:
-    """Keys of the notes reachable from `blocks` through Ref links, in first-use order."""
-    found, work = [], [blocks]
+    """Keys of the notes reachable from `blocks` through Ref links, in first-use order; a set beside the list keeps
+    it linear in the notes (mobi reaches it with up to MOBI_ANCHORS targets)."""
+    found, seen, work = [], set(), [blocks]
 
     def visit(o):
         for it in o.inlines:
-            if isinstance(it, Ref) and it.id in notes and it.id not in found:
+            if isinstance(it, Ref) and it.id in notes and it.id not in seen:
+                seen.add(it.id)
                 found.append(it.id)
                 work.append(notes[it.id])
     while work:

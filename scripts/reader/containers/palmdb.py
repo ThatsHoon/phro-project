@@ -19,6 +19,8 @@ _PHRASE_OVERHEAD = 64
 
 
 def record_cap(size_field: int) -> int:
+    """`MOBI_RECORD` of the spec's Limits table: the bytes one text record may unpack to, the record-size field (0
+    means 4,096) plus 8; past it the record is cut, counted `record`. A function, since it depends on the book."""
     return (size_field or 4096) + 8
 
 

@@ -38,7 +38,7 @@ from ..model import Break, Context, Doc, Heading, Image, Para, Section, Table, T
 
 MOBI_ANCHORS = 100_000  # anchors one book may insert
 MAX_SHEETS = 32         # stylesheets one chapter may use
-MAX_TITLE = 300
+MAX_TITLE = 300         # characters of the book title (EXTH 503, else record 0's full title); 4x as many bytes read
 NCX_ITEMS = 10_000      # NCX entries read; labels are cut at MAX_LABEL
 MAX_LABEL = 300
 MAX_EXTH = 1024         # EXTH records read

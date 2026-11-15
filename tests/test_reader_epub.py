@@ -400,6 +400,18 @@ def test_tolerant_html():
     assert xhtml.text_of(root).replace("\n", "") == "abcd"
 
 
+def test_referenced_linear():
+    # 60,000 notes each referenced from the body, and every note naming the next: one pass, in first-use order
+    from reader.model import Para, Text
+    n = 60_000
+    notes = {f"n{i}": [Para([xhtml.Ref(f"n{i + 1}", inlines=[Text("next")])])] for i in range(n)}
+    body = [Para([xhtml.Ref(f"n{i}", inlines=[Text(str(i))]) for i in range(n)])]
+    t0 = time.perf_counter()
+    keep = xhtml.referenced(body, notes)
+    took = time.perf_counter() - t0
+    assert keep == [f"n{i}" for i in range(n)] and took < 2, took
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
