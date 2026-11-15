@@ -1,7 +1,8 @@
 """The IWA object store of Pages, Numbers and Keynote: every archived object of a document, by identifier.
 
 Ported from docling (MIT) `docling/backend/iwork/iwa.py` (`iter_objects`) and `docling/backend/iwork/archives.py`
-(`read_objects`, `iwa_data_files`, the `IWAReader` data lookup and emitted set). An .iwa member unpacks through
+(`read_objects`, `iwa_data_files`, the `IWAReader` data lookup with `_read_data`'s code page 437 retry, and the
+emitted set). An .iwa member unpacks through
 `snappy.iwa` to `[varint n][TSP.ArchiveInfo][payloads...]` repeated; the archives are read from the joined chunks,
 since one may cross a chunk boundary. ArchiveInfo gives 1 identifier, 2 message infos (1 type, 3 length, 10
 fields_to_remove) and 3 should_merge. docling keeps the last message of each archive under its id; here an object is
@@ -96,10 +97,22 @@ class Store:
         """Objects on the walk's current path: the depth a nested `follow` passes on."""
         return len(self._path)
 
+    def _member(self, data_id: int) -> str | None:
+        """`Data/<file name>` of a data id as the package lists it, None when it is not there. Apple writes the name
+        in UTF-8 without the zip flag that says so, so zipfile lists a name that is not ASCII under its code page 437
+        reading, which is tried second (docling `_read_data`)."""
+        name = self.datas.get(data_id)
+        if not name:
+            return None
+        for n in dict.fromkeys((name, name.encode("utf-8").decode("cp437"))):
+            member = self.prefix + "Data/" + n
+            if self.pkg.has(member):
+                return member
+        return None
+
     def has_data(self, data_id: int) -> bool:
         """Whether a data id names a member that is in the package (nothing is read or counted)."""
-        name = self.datas.get(data_id)
-        return bool(name) and self.pkg.has(self.prefix + "Data/" + name)
+        return self._member(data_id) is not None
 
     def get(self, id: int, type: int | tuple | None = None) -> dict | None:
         """The object's fields (`pbwire.fields`), or None when the id is missing or its type is not `type` (one
@@ -114,10 +127,9 @@ class Store:
     def data(self, data_id: int) -> bytes | None:
         """The bytes of `Data/<file name>` for a data id. An id with no DataInfo, a name that leaves `Data/`, a
         missing or unreadable member, or bytes past `limits.IMAGE_BYTES` (each call is charged, so copies count)
-        give None and count `image`."""
-        name = self.datas.get(data_id)
-        member = self.prefix + "Data/" + name if name else None
-        if member is None or not self.pkg.has(member):
+        give None and count `image`. The member is found as `_member` finds it."""
+        member = self._member(data_id)
+        if member is None:
             self._count("image")
             return None
         if self.image_bytes + self.pkg.size(member) > limits.IMAGE_BYTES:

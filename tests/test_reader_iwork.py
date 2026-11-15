@@ -361,6 +361,20 @@ def test_data_reference():
     assert store.data(7) == b"img" and not ctx.skipped
 
 
+def test_data_reference_utf8_name():
+    # Apple writes a member name in UTF-8 without the flag that says so (iwork_zip writes it that way too), so zipfile
+    # lists a name that is not ASCII under its code page 437 reading; the data is found under either (docling
+    # `_read_data`), by `has_data` and `data` alike
+    members = [("Index/Metadata.iwa", metadata_iwa([(7, "사진 1.png")]))]
+    store, ctx = _load(members, {"Data/사진 1.png": PNG})
+    assert "Data/사진 1.png" not in store.pkg.names, store.pkg.names  # the listing really is the cp437 reading
+    assert store.has_data(7) and store.data(7) == PNG and not ctx.skipped, ctx.skipped
+    # a cell picture fill with such a name is read
+    t = _fill_table("T", [[cell_v5(0, style_id=7)]])
+    doc, ctx = _numbers(*t, datas=[(FILL_DATA, "그림.png")], files={"Data/그림.png": PNG})
+    assert doc.blocks[0].blocks[1:] == [Image(PNG)] and not ctx.skipped, (doc.blocks[0].blocks, ctx.skipped)
+
+
 class _BrokenHeader:
     """A package whose member reads fail as zipfile fails on a broken local header (a negative seek)."""
 
