@@ -139,6 +139,8 @@ def _why(kind, detail=""):
         return f"the file looks damaged ({detail})"
     if kind == "too_large":
         return TOO_LARGE.get(detail.split(":", 1)[0], REASONS["too_large"])
+    if kind == "unsupported" and detail:
+        return f"this file is not supported ({detail})"
     if kind == "timeout" and detail == LATE:
         return LATE_TEXT
     return REASONS.get(kind) or f"{kind} {detail}".strip()

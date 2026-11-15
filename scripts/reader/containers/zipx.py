@@ -219,6 +219,14 @@ class Package:
             raise KeyError(name)
         return self._zip.getinfo(real).file_size
 
+    def method(self, name) -> int:
+        """The compression method the directory gives the member `name` (0 stored, 8 deflated), read without
+        inflating it and without charging the zip total."""
+        real = self._find(name)
+        if real is None:
+            raise KeyError(name)
+        return self._zip.getinfo(real).compress_type
+
     def _check(self, name) -> zipfile.ZipInfo:
         """The directory entry of member `name`, after the checks `read` and `open` share; KeyError if absent."""
         real = self._find(name)

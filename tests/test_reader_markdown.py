@@ -582,6 +582,12 @@ def test_named_pdf_items():
     assert markdown.unread(Counter(xfa=1, attachment=1)) == ["XFA form", "attached files"]
 
 
+def test_phase3_skip_kinds():
+    assert markdown.unread({"table": 2, "kf8_fallback": 1, "plain_text": 1, "attribute": 3, "merge": 1,
+                            "duplicate": 1}) == ["2 tables", "KF8 layout (the MOBI 6 copy was read)",
+                                                 "book markup (read as plain text)"]
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

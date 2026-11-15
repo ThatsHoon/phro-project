@@ -72,3 +72,16 @@ def inflate(data: bytes, budget: Budget, limit: int | None = None) -> bytes:
         budget.used += len(best)
         raise Truncated(best)
     raise ValueError(f"bad deflate stream: {error}")
+
+
+def gunzip(data: bytes, budget: Budget, limit: int) -> bytes:
+    """A gzip stream inflated within `limit` bytes. Past it is a too_large ReadError ("part: ..."); a cut stream
+    raises Truncated and a corrupt one ValueError. The output is charged to `budget` as inflate does."""
+    try:
+        out, complete = _run(data, 31, budget, limit)
+    except zlib.error as e:
+        raise ValueError(f"bad gzip stream: {e}") from None
+    budget.used += len(out)
+    if not complete:
+        raise Truncated(out)
+    return out

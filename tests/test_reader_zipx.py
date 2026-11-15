@@ -333,6 +333,48 @@ def measure(n=2_000_000):
     print(f"SCAN {cells} {secs:.2f}")
 
 
+def test_package_method():
+    data = make_zip(None, {"mimetype": "x" * 50, "a.txt": "y" * 500})
+    with zipx.Package(data) as pkg:
+        assert pkg.method("mimetype") == 0 and pkg.method("a.txt") == 8
+        assert pkg._total == 0
+        assert pkg.read("mimetype") == b"x" * 50 and pkg.read("a.txt") == b"y" * 500
+        try:
+            pkg.method("nope")
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("missing member")
+
+
+def test_gunzip():
+    import gzip
+    from reader.containers import flate
+    assert flate.gunzip(gzip.compress(b"x" * 1000), flate.Budget(), 10_000) == b"x" * 1000
+    try:
+        flate.gunzip(gzip.compress(b"x" * 1000), flate.Budget(), 100)
+    except ReadError as e:
+        assert e.kind == "too_large" and e.detail.startswith("part:"), e.detail
+    else:
+        raise AssertionError("limit")
+    good = gzip.compress(bytes(range(256)) * 40)
+    try:
+        flate.gunzip(good[:10] + bytes([good[10] ^ 0xFF]) + b"\xff" * 40, flate.Budget(), 100_000)
+    except ValueError as e:
+        assert not isinstance(e, flate.Truncated)
+    else:
+        raise AssertionError("corrupt")
+    try:
+        flate.gunzip(good[:len(good) // 2], flate.Budget(), 100_000)
+    except flate.Truncated:
+        pass
+    else:
+        raise AssertionError("cut")
+    b = flate.Budget()
+    flate.gunzip(gzip.compress(b"x" * 1000), b, 10_000)
+    assert b.used == 1000
+
+
 def main():
     if sys.argv[1:] == ["measure"]:
         measure()

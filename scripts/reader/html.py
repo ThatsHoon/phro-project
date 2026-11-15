@@ -1,4 +1,4 @@
-"""Tolerant XHTML/HTML walker with a small CSS cascade; epub uses it and mobi will.
+"""Tolerant XHTML/HTML walker with a small CSS cascade; epub and mobi use it.
 
 `tree` builds a depth-limited Node tree with the stdlib HTMLParser, `Css` answers the two questions the
 reader cares about (is this hidden, is this bold), and `blocks` turns a tree into document-model blocks.
@@ -561,3 +561,50 @@ def blocks(root: Node, *, css: Css, load: Callable[[str], bytes | None], notes: 
             if ctx.skipped[kind] == int(n):
                 ctx.warnings.append(f"{kind}: {msg}")
     return out
+
+
+def _walk_blocks(blocks, visit):
+    """Call visit(inline_list, owner) for the inline list of every block under `blocks` and every inline
+    container inside those lists, without recursion."""
+    stack = [blocks]
+    while stack:
+        for b in stack.pop():
+            todo = [b]
+            while todo:
+                o = todo.pop()
+                if hasattr(o, "inlines"):
+                    visit(o)
+                    todo.extend(i for i in o.inlines if hasattr(i, "inlines"))
+            if hasattr(b, "blocks"):
+                stack.append(b.blocks)
+            if isinstance(b, Table):
+                stack.extend(c.blocks for row in b.rows for c in row)
+
+
+def referenced(blocks, notes) -> list:
+    """Keys of the notes reachable from `blocks` through Ref links, in first-use order."""
+    found, work = [], [blocks]
+
+    def visit(o):
+        for it in o.inlines:
+            if isinstance(it, Ref) and it.id in notes and it.id not in found:
+                found.append(it.id)
+                work.append(notes[it.id])
+    while work:
+        _walk_blocks(work.pop(), visit)
+    return found
+
+
+def settle(blocks, notes):
+    """Ref links that point at a kept note become note references; the rest go back to their link text."""
+    def visit(o):
+        out = []
+        for it in o.inlines:
+            if not isinstance(it, Ref):
+                out.append(it)
+            elif it.id in notes:
+                out.append(NoteRef(it.id, hidden=it.hidden))
+            else:
+                out.extend(it.inlines)
+        o.inlines[:] = out
+    _walk_blocks(blocks, visit)

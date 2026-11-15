@@ -8,7 +8,7 @@ import re
 from .. import html as xhtml
 from ..containers.zipx import Package, attr, first, kids, parse_xml, resolve, walk
 from ..limits import ReadError
-from ..model import Doc, NoteRef, Section, Table
+from ..model import Doc, Section
 
 IMAGE_BYTES = 256 * 2**20  # image bytes one book may emit, copies counted
 MAX_SHEETS = 32            # stylesheets one chapter may use
@@ -28,53 +28,6 @@ def _inside(base: str, href: str):
         return None
     name = resolve(base, href)
     return None if name == ".." or name.startswith("../") or not name else name
-
-
-def _walk(blocks, visit):
-    """Call visit(inline_list, owner) for the inline list of every block under `blocks` and every inline
-    container inside those lists, without recursion."""
-    stack = [blocks]
-    while stack:
-        for b in stack.pop():
-            todo = [b]
-            while todo:
-                o = todo.pop()
-                if hasattr(o, "inlines"):
-                    visit(o)
-                    todo.extend(i for i in o.inlines if hasattr(i, "inlines"))
-            if hasattr(b, "blocks"):
-                stack.append(b.blocks)
-            if isinstance(b, Table):
-                stack.extend(c.blocks for row in b.rows for c in row)
-
-
-def _referenced(blocks, notes) -> list:
-    """Keys of the notes reachable from `blocks` through Ref links, in first-use order."""
-    found, work = [], [blocks]
-
-    def visit(o):
-        for it in o.inlines:
-            if isinstance(it, xhtml.Ref) and it.id in notes and it.id not in found:
-                found.append(it.id)
-                work.append(notes[it.id])
-    while work:
-        _walk(work.pop(), visit)
-    return found
-
-
-def _settle(blocks, notes):
-    """Ref links that point at a kept note become note references; the rest go back to their link text."""
-    def visit(o):
-        out = []
-        for it in o.inlines:
-            if not isinstance(it, xhtml.Ref):
-                out.append(it)
-            elif it.id in notes:
-                out.append(NoteRef(it.id, hidden=it.hidden))
-            else:
-                out.extend(it.inlines)
-        o.inlines[:] = out
-    _walk(blocks, visit)
 
 
 class _Book:
@@ -167,12 +120,12 @@ class _Book:
                 self.warn("chapter", "skipped damaged part")
         if not doc.blocks:
             raise ReadError("damaged", "no readable chapter")
-        keep = _referenced(doc.blocks, self.notes)
+        keep = xhtml.referenced(doc.blocks, self.notes)
         doc.notes = {k: self.notes[k] for k in keep}
         self.ctx.skipped["note"] += len(self.notes) - len(doc.notes)
-        _settle(doc.blocks, doc.notes)
+        xhtml.settle(doc.blocks, doc.notes)
         for nb in doc.notes.values():
-            _settle(nb, doc.notes)
+            xhtml.settle(nb, doc.notes)
         return doc
 
     def chapter(self, part, number) -> Section:

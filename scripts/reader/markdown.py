@@ -51,6 +51,7 @@ LOST = (
     (("shape", "alternate"), "shape", "shapes"),
     (("image",), "image", "images"),
     (("chart",), "chart", "charts"),
+    (("table",), "table", "tables"),
     (("smartart",), "SmartArt diagram", "SmartArt diagrams"),
     (("smartart_cut",), "SmartArt diagram cut short", "SmartArt diagrams cut short"),
     (("object",), "embedded object", "embedded objects"),
@@ -67,10 +68,11 @@ LOST = (
     (("depth",), "place nested too deeply", "places nested too deeply"),
 )
 # Named items: reported after the counted ones, by name only (a flag, not a count).
-NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"))
+NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"),
+         ("kf8_fallback", "KF8 layout (the MOBI 6 copy was read)"), ("plain_text", "book markup (read as plain text)"))
 # counted too, but they only change formatting or reading order, so they are not reported
 INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story",
-                      "char_positions"})  # char_positions: pdf glyph positions dropped, the text kept
+                      "char_positions", "attribute", "merge", "duplicate"})  # char_positions: pdf glyph positions dropped, the text kept
 
 
 def lost(skipped) -> list:

@@ -207,6 +207,18 @@ def test_truncated_output_keeps_marker_last():
     assert "Not viewable" not in md
 
 
+def test_sniff_phase3_kinds():
+    wpg = b"\xffWPC" + (16).to_bytes(4, "little") + bytes([1, 0x16, 1, 0]) + bytes(20)
+    wpd = b"\xffWPC" + (16).to_bytes(4, "little") + bytes([1, 0x0A, 2, 1]) + bytes(20)
+    assert images.sniff(wpg) == "wpg" and images.sniff(wpd) is None
+    assert images.sniff(bytes(4) + b"ftypheic" + bytes(20)) == "heic" == images.sniff(bytes(4) + b"ftypmif1" + bytes(20))
+    assert images.sniff(bytes(4) + b"ftypheix" + bytes(20)) == "heic"
+    assert images.sniff(b"%PDF-1.4\n" + bytes(20)) == "pdf"
+    assert not {"wpg", "heic", "pdf"} & images.VIEWABLE
+    with tempfile.TemporaryDirectory() as d:
+        assert images.Assets(Path(d) / "assets").add(wpg) == ("assets/img-001.wpg", False)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

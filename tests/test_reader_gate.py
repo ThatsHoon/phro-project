@@ -1079,6 +1079,11 @@ def test_ascii_pdf_not_text():
         assert o["permissionDecision"] == "allow" and "Hi" in md_lines(o), o
 
 
+def test_unsupported_detail_reason():
+    assert gate._why("unsupported", "Excel 5.0/95 workbook") == "this file is not supported (Excel 5.0/95 workbook)"
+    assert gate._why("unsupported") == "this format is not supported yet"
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

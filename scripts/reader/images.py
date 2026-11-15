@@ -29,6 +29,12 @@ def sniff(data: bytes) -> str | None:
     # a PICT file: a 512-byte zero head, picSize and picFrame, then the version opcode (PICT 1: 11 01; 2: 00 11 02 FF)
     if (data[522:524] == b"\x11\x01" or data[522:526] == b"\x00\x11\x02\xff") and data[:512].count(0) == 512:
         return "pict"
+    if h.startswith(b"\xffWPC") and len(data) > 9 and data[9] == 0x16:  # a WordPerfect Graphic: file type 0x16
+        return "wpg"
+    if data[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1"):
+        return "heic"
+    if data.startswith(b"%PDF-"):
+        return "pdf"
     head = data[:512].lstrip(b"\xef\xbb\xbf \t\r\n")
     if head.startswith(b"<?xml"):
         head = data[:512]
