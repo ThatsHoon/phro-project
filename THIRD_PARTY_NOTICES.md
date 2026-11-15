@@ -258,7 +258,7 @@ SOFTWARE.
 
 ## tika
 
-Ported: the PalmDB record table, trailing entries, PalmDOC LZ77 and HUFF/CDIC decoding in `scripts/reader/containers/palmdb.py`, from `tika-parser-miscoffice-module/.../parser/mobi/` (`PalmDatabase.java`, `PalmDoc.java`, `HuffCdic.java`) at Apache Tika main commit a40d54f6. The MOBI record 0 and EXTH head, the DRM, encryption, compression and encoding refusals and the EXTH caps in `scripts/reader/formats/mobi.py`, from `MobiHeader.java` and `MobiParser.java` at the same commit.
+Ported: the PalmDB record table, trailing entries, PalmDOC LZ77 and HUFF/CDIC decoding in `scripts/reader/containers/palmdb.py`, from `tika-parser-miscoffice-module/.../parser/mobi/` (`PalmDatabase.java`, `PalmDoc.java`, `HuffCdic.java`) at Apache Tika main commit a40d54f6. The MOBI record 0 and EXTH head, the DRM, encryption, compression and encoding refusals and the EXTH caps in `scripts/reader/formats/mobi.py`, from `MobiHeader.java` and `MobiParser.java` at the same commit. The WordPerfect 5.x and 6+ extended character tables in `scripts/reader/formats/wpd_charsets.py`, from `tika-parser-miscoffice-module/.../parser/wordperfect/` (`WP6Charsets.java`, `WP5Charsets.java`) at Apache Tika tag 4.2.0 (a different pin from the mobi files above, which stay at main commit a40d54f6).
 
 Apache Tika NOTICE:
 
