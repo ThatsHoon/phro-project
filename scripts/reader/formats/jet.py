@@ -1564,17 +1564,18 @@ def _safe_value(value: str) -> str:
     """A value fit to show, showing less rather than a password: its authority's user part taken out, up to and with
     the authority's last "@" (`_AUTHORITY`: as browsers read it, so `u:p@w@h`, spaces, `http:\\` and `https:/`
     too); "" when it holds ";", "=" or a control character (what a value of a secret may spill into), when its
-    authority holds a ":" and an "@" follows it (`u:pa/ss@h`: the authority would end inside the password), or when
+    authority, before its user part is taken out, holds a ":" or an "@" and another "@" follows it (`u:pa/ss@h`,
+    `u:p@s3/cret@h`: the authority would end inside the password), or when
     a segment of it still has a ":" before an "@" (user info this reading did not place)."""
     value = value.strip()
     m = _AUTHORITY.match(value)
     authority, rest = m.group(2), value[m.end():]
-    if "@" in authority:
-        authority = authority.rpartition("@")[2]
-        value = (m.group(1) or "") + authority + rest
-    if ";" in value or "=" in value or _CONTROL.search(value):
+    # a user part (judged before it is taken out) holding "/", "?", "#" or "\": its tail would be the path
+    if ("@" in authority or ":" in authority) and "@" in rest:
         return ""
-    if ":" in authority and "@" in rest:  # a password holding "/", "?" or "#": its tail would be the path
+    if "@" in authority:
+        value = (m.group(1) or "") + authority.rpartition("@")[2] + rest
+    if ";" in value or "=" in value or _CONTROL.search(value):
         return ""
     if "@" in value and any(":" in s[:s.rfind("@")] for s in _SEGMENTS.split(value) if "@" in s):
         return ""

@@ -2036,6 +2036,13 @@ def test_linked_credentials():
         ("ODBC;DATABASE=https://u:s3c/ret@h/x", "", "ODBC"),
         ("ODBC;DATABASE=https://u:s3c?ret@h/x", "", "ODBC"),
         ("ODBC;DATABASE=https://u:s3c#ret@h/x", "", "ODBC"),
+        # a password holding "@" as well as "/", "?", "#" or "\" (or a user part alone holding them)
+        ("ODBC;DATABASE=https://u:p@s3/cret@h/x", "", "ODBC"),
+        ("ODBC;DATABASE=https://u:p@s3?cret@h/x", "", "ODBC"),
+        ("ODBC;DATABASE=https://u:p@s3#cret@h/x", "", "ODBC"),
+        ("ODBC;DATABASE=https://u:p@s3\\cret@h/x", "", "ODBC"),
+        ("ODBC;DATABASE=https://u@s3/cret@h", "", "ODBC"),
+        ("MS Access;PWD=s3cret", "https://u:p@s3/cret@h/x", "MS Access"),
         ("ODBC;DATABASE=https://h/x?a@b", "", "https://h/x?a@b"),
         ("ODBC;DATABASE=C:\\a\\b@c.mdb", "", "C:\\a\\b@c.mdb"),
     ]
