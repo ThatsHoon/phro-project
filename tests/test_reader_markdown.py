@@ -617,20 +617,32 @@ def test_hidden_code_and_lang():
     assert R(Doc(blocks=[Code("x", "s`q\nl")])) == "```sql\nx\n```\n"
 
 
-def test_render_joins_in_linear_time():
-    # about 18 MB in 9,000 blocks, then 15 MB in one paragraph of 300,000 runs: joining with `out += s` copies the
-    # text so far on each piece (measured 16 s for the first, 4 s for 10 MB of the second); collected and joined once it is well under a second
+def _render_time(doc, runs=3):
+    """The best of `runs` render times of `doc` (the least disturbed by load) and the output."""
     import time
-    doc = Doc(blocks=[P(f"{i:05d}" + "w" * 1995) for i in range(9_000)])
-    t0 = time.perf_counter()
-    out = R(doc)
-    took = time.perf_counter() - t0
-    assert len(out) == 9_000 * 2_002 - 1 and out.startswith("00000w") and took < 4, took
-    doc = Doc(blocks=[Para([Text(f"{i:06d}" + "v" * 44) for i in range(300_000)])])
-    t0 = time.perf_counter()
-    out = R(doc)
-    took = time.perf_counter() - t0
-    assert len(out) == 300_000 * 50 + 1 and took < 4, took
+    best, out = None, ""
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        out = R(doc)
+        took = time.perf_counter() - t0
+        best = took if best is None else min(best, took)
+    return best, out
+
+
+def test_render_joins_in_linear_time():
+    # Doubling the text must not much more than double the render time. Joined with `out += s`, where the platform's
+    # realloc moves the buffer, each piece copies the text so far: doubling quadruples the time (measured 3.3 s -> 13 s
+    # for the blocks, 2.3 s -> 8.9 s for the runs). Collected and joined once, it doubles (0.11 s -> 0.21 s).
+    for n in (4_500,):  # blocks: about 9 MB, then 18 MB
+        small, out = _render_time(Doc(blocks=[P(f"{i:05d}" + "w" * 1995) for i in range(n)]))
+        assert len(out) == n * 2_002 - 1 and out.startswith("00000w")
+        large, out = _render_time(Doc(blocks=[P(f"{i:05d}" + "w" * 1995) for i in range(2 * n)]))
+        assert len(out) == 2 * n * 2_002 - 1 and large < 3 * small, (small, large)
+    for n in (150_000,):  # runs of one paragraph: 7.5 MB, then 15 MB
+        small, out = _render_time(Doc(blocks=[Para([Text(f"{i:06d}" + "v" * 44) for i in range(n)])]))
+        assert len(out) == n * 50 + 1
+        large, out = _render_time(Doc(blocks=[Para([Text(f"{i:06d}" + "v" * 44) for i in range(2 * n)])]))
+        assert len(out) == 2 * n * 50 + 1 and large < 3 * small, (small, large)
 
 
 def main():

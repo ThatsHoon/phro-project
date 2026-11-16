@@ -3,7 +3,8 @@ shapes, then the page's connection list.
 
 Elements match by local name. A shape without a Text element takes its master's shape text (`visio/masters`, each
 master part loaded once, up to MASTERS parts); a HideText cell, the shape's own else its master shape's, makes the text
-hidden. Connectors glued at both ends are listed after the page's shapes as "A → B (label)", their shown text left out
+hidden. Shape text, own and each inherited copy, is charged to one MAX_OUTPUT room by its characters and LINE per
+line break. Connectors glued at both ends are listed after the page's shapes as "A → B (label)", their shown text left out
 of the shape flow; `name_of`, `connections` and `ConnectionBudget` are shared with the binary vsd reader. A vbaProject
 part is named, never read.
 """
@@ -22,6 +23,9 @@ COORD = 1e12
 MASTERS = 1_000            # master parts one vsdx may load; inherited text from the rest is counted `stencil`
 CONNECTIONS = 10_000       # connectors one document may list (vsd and vsdx); past it `connections_cut` per cut list
 NAME = 80                  # characters of a shape's name in a connection list
+# characters one line break of shape text is charged against the MAX_OUTPUT room, besides its own: a line is a Text
+# and a Break in the model however short, so "a\n" text would otherwise make two model objects per two characters
+LINE = 64
 
 
 def name_of(text: str, name_u: str, name: str, sid: str) -> str:
@@ -155,7 +159,7 @@ class _Reader:
         self.master_parts = None  # Master ID -> master part, read from masters.xml on first use
         self.masters = {}         # master part -> ({shape ID: element}, first top-level shape), or None: unreadable
         self.shapes = {}          # master shape element -> (text, hides it), so a shared shape is read once
-        self.chars = limits.MAX_OUTPUT  # inherited text the document may still emit, copies counted
+        self.room = limits.MAX_OUTPUT  # shape text the document may still emit, copies counted (see `spend`)
         self.budget = ConnectionBudget(ctx)
         self.glued = {}           # this page's connectors glued at both ends: ID -> (begin ID, end ID)
         self.info = {}            # this page's shapes by ID (first wins): (text, NameU, Name), kept when glued
@@ -223,7 +227,8 @@ class _Reader:
             placed = sorted((e for e in out if e[0] is not None), key=lambda e: e[0])
             for _, blocks in placed + [e for e in out if e[0] is None]:
                 sec.blocks.extend(blocks)
-        edges = [(b, e, self.info[c][0] if c in self.info else "") for c, (b, e) in self.glued.items()]
+        # a Connect row naming a connector that is not a shape on this page lists nothing
+        edges = [(b, e, self.info[c][0]) for c, (b, e) in self.glued.items() if c in self.info]
         edges = self.budget.take(edges)
         names = {}
         for b, e, _ in edges:
@@ -255,20 +260,24 @@ class _Reader:
         # the master shape this one inherits from: its text when it has none, its HideText when it sets none
         need = ref and not (has_text and hide is not None)
         inherited = self.master_shape(master, attr(el, "MasterShape")) if need else None
+        inlines = None  # an inherited text's lines are built once per master shape and shared by its copies
         if has_text:
             text = _text(el)
+            text = self.spend(text, "text") if text.strip() else ""
         elif ref and inherited is None:  # the master is not read: its text is lost
             self.ctx.skipped["stencil"] += 1
             text = ""
         else:
-            text = self.charge(inherited[0]) if inherited else ""
+            text = self.spend(inherited[0], "stencil") if inherited else ""
+            inlines = inherited[2] if text else None
         hidden = _on(hide) if hide is not None else bool(inherited and inherited[1])
         sid = attr(el, "ID")
         if self.glued and sid is not None and sid not in self.info:  # hidden text never names a shape
             self.info[sid] = ("" if hidden else text, attr(el, "NameU"), attr(el, "Name"))
         blocks = []
-        if text.strip() and (hidden or sid not in self.glued):  # a glued connector's shown text is in the list
-            blocks.append(Para(_inlines(text.strip("\n")), hidden="hidden" if hidden else ""))
+        if text and (hidden or sid not in self.glued):  # a glued connector's shown text is in the list
+            inlines = inlines if inlines is not None else _inlines(text.strip("\n"))
+            blocks.append(Para(inlines, hidden="hidden" if hidden else ""))
         blocks.extend(self.picture(el))
         if blocks:
             out.append((key, blocks))
@@ -279,18 +288,20 @@ class _Reader:
             self.walk(sub, ox, oy, d + 1, out, master)
 
     # ---- masters
-    def charge(self, text) -> str:
-        """Inherited `text`, charged to the document's MAX_OUTPUT room; past the room it is left out, counted
-        `stencil`."""
-        if len(text) > self.chars:
-            self.ctx.skipped["stencil"] += 1
+    def spend(self, text, kind) -> str:
+        """`text` (a shape's own, or each inherited copy) charged to the document's MAX_OUTPUT room: its characters
+        and LINE more for each line break, since a line is two model objects whatever its length. Past the room it is
+        left out and counted `kind` (`text` for own text, `stencil` for inherited)."""
+        cost = len(text) + LINE * (text.count("\n") + text.count("\r"))
+        if cost > self.room:
+            self.ctx.skipped[kind] += 1
             return ""
-        self.chars -= len(text)
+        self.room -= cost
         return text
 
     def master_shape(self, mid, sid):
-        """(text, hides its text) of master `mid`'s shape `sid` (sid None: the master's first top-level shape), text ""
-        when it has only blanks; ("", False) when the master has no such shape; None when the master is not read (not
+        """(text, hides its text, its inlines) of master `mid`'s shape `sid` (sid None: the master's first top-level
+        shape), text "" when it has only blanks; ("", False, []) when the master has no such shape; None when the master is not read (not
         listed, unreadable, or past MASTERS parts)."""
         if self.master_parts is None:
             self.master_parts = {}  # set first: an index that fails is not tried again
@@ -309,10 +320,11 @@ class _Reader:
         by_id, first = index
         el = first if sid is None else by_id.get(sid)
         if el is None:
-            return "", False
+            return "", False, []
         if el not in self.shapes:
             text = _text(el)
-            self.shapes[el] = (text if text.strip() else "", _on(_cells(el).get("HideText")))
+            text = text if text.strip() else ""
+            self.shapes[el] = (text, _on(_cells(el).get("HideText")), _inlines(text.strip("\n")) if text else [])
         return self.shapes[el]
 
     def master_index(self) -> dict:
@@ -324,13 +336,13 @@ class _Reader:
                 break
         if not self.pkg.has(listing):
             return {}
-        try:
+        try:  # a member the reader refuses (damaged, past ZIP_RATIO, ...) lists no master; only timeout stops
             root, _ = ooxml_base.load(self.pkg, listing)
+            rels = ooxml_base.rels(self.pkg, listing, self.ctx)
         except ReadError as e:
-            if e.kind != "damaged":
+            if e.kind == "timeout":
                 raise
             return {}
-        rels = ooxml_base.rels(self.pkg, listing, self.ctx)
         out = {}
         for m in kids(root, "Master"):
             mid, ref = attr(m, "ID"), _kid(m, "Rel")
@@ -344,10 +356,10 @@ class _Reader:
     def load_master(self, part):
         """({shape ID: element}, first top-level shape) of one master part, or None when it cannot be read. Shapes
         nested past MAX_DEPTH are not indexed (counted `depth` once for the part)."""
-        try:
+        try:  # a part the reader refuses (damaged, past ZIP_RATIO, ...) is unread; only timeout stops the document
             root, _ = ooxml_base.load(self.pkg, part)
         except ReadError as e:
-            if e.kind != "damaged":
+            if e.kind == "timeout":
                 raise
             return None
         if local(root.tag) != "MasterContents":

@@ -460,6 +460,75 @@ def test_deep_master_group():
     assert time.monotonic() - t0 < 10 and not page_text(doc) and ctx.skipped["depth"] >= 1, ctx.skipped
 
 
+def test_master_too_large_counted():
+    # a master part, or the masters list, past ZIP_RATIO loses only the text that would be inherited from it
+    big = "<MasterContents>" + " " * 3_000_000 + "</MasterContents>"
+    page = shape(1, "own", (0, 9), "", 'Master="1"') + shape(2, None, (0, 8), "", 'Master="1"')
+    doc, ctx = parse_mem(vsdx({"P": page}, masters={"1": shape(1, "M")}, mem=True,
+                              extra={"visio/masters/master1.xml": big}))
+    assert page_text(doc) == "own" and ctx.skipped["stencil"] == 1, (page_text(doc), ctx.skipped)
+    listing = f'<Masters xmlns:r="{REL}" {VNS}>' + " " * 3_000_000 + "</Masters>"
+    doc, ctx = parse_mem(vsdx({"P": page}, masters={"1": shape(1, "M")}, mem=True,
+                              extra={"visio/masters/masters.xml": listing}))
+    assert page_text(doc) == "own" and ctx.skipped["stencil"] == 1, (page_text(doc), ctx.skipped)
+
+
+def inline_items(doc):
+    """(inline items the renderer visits, distinct inline lists) over the doc's paragraphs."""
+    paras = [b for sec in doc.blocks for b in sec.blocks if isinstance(b, Para)]
+    return sum(len(p.inlines) for p in paras), len({id(p.inlines) for p in paras})
+
+
+def test_line_dense_text_charged_by_lines():
+    # "a\n" text makes two model objects every two characters: each line break is charged LINE characters, so a
+    # room of 1,000,000 holds one copy (20,000 + 10,000 x LINE) where characters alone would hold 50
+    dense = "a\n" * 10_000
+    cost = len(dense) + dense.count("\n") * VX.LINE
+    keep = 1_000_000 // cost
+    assert 1 <= keep < 5, keep
+    old = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 1_000_000
+    try:
+        refs = "".join(shape(i, None, (0, i), "", 'Master="1"') for i in range(1, 51))
+        doc, ctx = parse_mem(vsdx({"P": refs}, masters={"1": shape(1, dense)}, mem=True))
+        own = "".join(shape(i, dense, (0, i)) for i in range(1, 51))
+        doc2, ctx2 = parse_mem(vsdx({"P": own}, mem=True))
+    finally:
+        limits.MAX_OUTPUT = old
+    items, lists = inline_items(doc)
+    assert items == keep * 19_999 and lists == 1 and ctx.skipped["stencil"] == 50 - keep, (items, lists, ctx.skipped)
+    items, _ = inline_items(doc2)
+    assert items == keep * 19_999 and ctx2.skipped["text"] == 50 - keep, (items, ctx2.skipped)
+
+
+def test_line_dense_master_memory():
+    # 2,000 references to one master of "a\n" x 10,000 in a 13 KB file: measured 17 s and a 1.8 GB traced peak
+    # before lines were charged
+    import tracemalloc
+    refs = "".join(shape(i, None, (0, i), "", 'Master="1"') for i in range(1, 2_001))
+    data = vsdx({"P": refs}, masters={"1": shape(1, "a\n" * 10_000)}, mem=True)
+    tracemalloc.start()
+    try:
+        t0 = time.perf_counter()
+        ctx = Context()
+        out = markdown.render(VX.parse(data, ctx), tmp() / "assets")
+        took = time.perf_counter() - t0
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    kept = limits.MAX_OUTPUT // (20_000 + 10_000 * VX.LINE)  # copies the room holds
+    assert out.count("\n\na\na\n") == kept and ctx.skipped["stencil"] == 2_000 - kept, (kept, ctx.skipped)
+    assert peak < 200 * 2**20 and took < 20, (peak, took)
+
+
+def test_phantom_connector_not_listed():
+    # Connect rows naming a connector that is not a shape on the page list nothing
+    shapes = shape(1, "A", (0, 9)) + shape(2, "B", (0, 1)) + shape(3)
+    rows = "".join(glued(i, 1, 2) for i in range(90, 110)) + glued(3, 1, 2)
+    out, _ = md(vsdx({"P": page_xml(shapes, rows)}))
+    assert out.count(" → ") == 1 and "- A → B\n" in out, out
+
+
 def test_missing_image_counted():
     fd = '<ForeignData><Rel r:id="rId9"/></ForeignData>'
     out, ctx = md(vsdx({"P": shape(1, "t", (0, 0), fd)}))
@@ -483,6 +552,10 @@ def probes():
         deep = shape(i, None, (), f"<Shapes>{deep}</Shapes>")
     refs = "".join(shape(i, None, (0, i % 97), "", 'Master="1" MasterShape="1"') for i in range(1, n + 1))
     yield "deep master, missing shape", vsdx({"P": refs}, masters={"1": deep}, mem=True)
+    refs = "".join(shape(i, None, (0, i), "", 'Master="1"') for i in range(1, 2_001))
+    yield "line-dense master, 2,000 refs", vsdx({"P": refs}, masters={"1": shape(1, "a\n" * 10_000)}, mem=True)
+    own = "".join(shape(i, "a\n" * 10_000, (0, i)) for i in range(1, 50))
+    yield "line-dense own text, 20 pages x 49", vsdx({f"P{k}": own for k in range(20)}, mem=True)
     m = 30_000
     shapes = shape(1, "A" * 200) + shape(2, "B" * 200) + "".join(
         shape(i, None, (), "", 'Master="1"') for i in range(3, m + 3))
