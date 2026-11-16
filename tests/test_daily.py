@@ -182,9 +182,25 @@ def test_silent_where_it_must_be():
         assert out.returncode == 0 and out.stdout == "" and out.stderr == "", out.stderr
         assert not (plugin / "docs/daily").exists(), "no state, no run"
     assert daily(original, "run").stdout.startswith("SKIPPED\t"), "the original plugin writes no report"
+    assert daily(original, "on").stdout.startswith("SKIPPED\t"), "the original cannot be switched on"
     hooks = json.loads((HERE / "hooks/hooks.json").read_text(encoding="utf-8"))["hooks"]
     for event in ("SessionStart", "UserPromptSubmit"):
         assert any("daily.py" in h["command"] for g in hooks[event] for h in g["hooks"]), event
+
+
+def test_off_until_switched_on():
+    project = Path(tempfile.mkdtemp())
+    plugin = copy_of(project)
+    d = load(plugin)
+    assert not d.enabled(), "a new copy starts off"
+    d.due = lambda now: date(2026, 11, 10)  # due now, so only the switch keeps the hook quiet
+    d.hook()
+    assert not (plugin / "docs/daily").exists(), "off: the hook claims nothing"
+    assert daily(plugin, "on").stdout == "DAILY\ton\n"
+    data = json.loads((plugin / "origin.json").read_text(encoding="utf-8"))
+    assert data == {"project": str(project), "daily": True}, data
+    assert load(plugin).enabled()
+    assert daily(plugin, "off").stdout == "DAILY\toff\n" and not load(plugin).enabled()
 
 
 def main():

@@ -1,15 +1,16 @@
 ---
 name: daily
-description: The weekday morning report of a project's copy, written by itself into the copy's docs/daily as <date>(<weekday>).md with yesterday's finished work and today's work in short Korean list items. A hook starts it at the first session or prompt after 08:00 KST, Monday to Friday. Use this skill only when the user asks to see, rewrite or regenerate that report ("일일 정리 보여줘", "오늘 일일 문서 다시 써", "daily report").
+description: The weekday morning report of a project's copy, written by itself into the copy's docs/daily as <date>(<weekday>).md with yesterday's finished work and today's work in short Korean list items. Off by default; once turned on, a hook starts it at the first session or prompt after 08:00 KST, Monday to Friday. Use this skill only when the user asks to see, rewrite or regenerate that report, or to turn it on or off ("일일 정리 보여줘", "오늘 일일 문서 다시 써", "daily 켜줘", "daily report").
 ---
 
 # daily
 
 Output: `<copy>/docs/daily/<YYYY-MM-DD>(<요일>).md`, one per weekday.
 
-How it runs: `scripts/daily.py hook` runs at every session start and prompt in a project's copy (never in the original plugin). On a weekday after 08:00 KST, when today's file is missing and no other session is writing it, it starts `daily.py run` in the background and returns at once. `run` gathers, for the period since the previous weekday 00:00 KST until today 00:00 KST, every session of the project (each fork's typed prompts and last replies, read from the transcript tails), the project's commits, and the queue's closed and open tickets, then asks `claude -p` to write the report in the style below, checks the form and writes the file. A failure is kept in `docs/daily/.state/<date>.error`; the next session after 30 minutes tries again.
+How it runs: off until the user turns it on. `scripts/daily.py hook` runs at every session start and prompt in a project's copy (never in the original plugin) and returns at once unless `origin.json` holds `"daily": true`. When on, on a weekday after 08:00 KST, when today's file is missing and no other session is writing it, it starts `daily.py run` in the background and returns at once. `run` gathers, for the period since the previous weekday 00:00 KST until today 00:00 KST, every session of the project (each fork's typed prompts and last replies, read from the transcript tails), the project's commits, and the queue's closed and open tickets, then asks `claude -p` to write the report in the style below, checks the form and writes the file. A failure is kept in `docs/daily/.state/<date>.error`; the next session after 30 minutes tries again.
 
 When the user asks:
+- To turn it on or off: run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/daily.py on` (or `off`). The setting survives `update`.
 - To see it: read today's file (or the date they name) and show it as it is.
 - To rewrite it: run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/daily.py run --force [--date YYYY-MM-DD]` and show the new file.
 - To change the style: edit the Style section below; `run` reads it from this file.

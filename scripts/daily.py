@@ -4,8 +4,10 @@
   daily.py hook                                   SessionStart / UserPromptSubmit: start `run` in the background when today's report is due
   daily.py run [--date YYYY-MM-DD] [--force]      gather the period, ask `claude -p` for the report, check its form, write the file
   daily.py digest [--date YYYY-MM-DD]             print what `run` would send, for a look
+  daily.py on | off                               turn the morning hook on or off for this copy (off by default)
 
-Only a copy writes reports (origin.json names its project); the original plugin stays silent. Times are KST.
+Only a copy writes reports (origin.json names its project); the original plugin stays silent.
+The hook starts runs only after `daily.py on` set "daily": true in origin.json; `run` itself works either way. Times are KST.
 """
 import argparse
 import json
@@ -32,11 +34,32 @@ STAMP = re.compile(rb'"timestamp":\s*"(\d{4}-\d\d-\d\dT[\d:.]+Z?)"')
 SPOKEN = re.compile(rb'"type":\s*"(?:user|assistant)"')
 
 
-def project():
+def record():
     try:
-        return Path(json.loads((HERE / "origin.json").read_text(encoding="utf-8"))["project"])
-    except (OSError, ValueError, KeyError):
-        return None
+        return json.loads((HERE / "origin.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def project():
+    root = record().get("project")
+    return Path(root) if root else None
+
+
+def enabled():
+    return record().get("daily") is True
+
+
+def switch(on):
+    """Set "daily" in origin.json; sync keeps the other keys and this one."""
+    data = record()
+    if not data.get("project"):
+        print("SKIPPED\tthe original plugin writes no report")
+        return 1
+    data["daily"] = on
+    (HERE / "origin.json").write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    print(f"DAILY\t{'on' if on else 'off'}")
+    return 0
 
 
 def out_dir():
@@ -319,7 +342,7 @@ def start_background(day):
 
 
 def hook():
-    if os.environ.get(CHILD) or project() is None:
+    if os.environ.get(CHILD) or project() is None or not enabled():
         return
     day = due(datetime.now(KST))
     if day and claim(day):
@@ -329,7 +352,8 @@ def hook():
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("hook")
+    for name in ("hook", "on", "off"):
+        sub.add_parser(name)
     for name in ("run", "digest"):
         s = sub.add_parser(name)
         s.add_argument("--date", type=lambda v: datetime.strptime(v, "%Y-%m-%d").date(), default=datetime.now(KST).date())
@@ -343,6 +367,8 @@ def main():
         except Exception:  # a hook never breaks the session
             pass
         return 0
+    if a.command in ("on", "off"):
+        return switch(a.command == "on")
     if a.command == "digest":
         root = project()
         print(digest(root, a.date)[0] if root else "SKIPPED\tthe original plugin writes no report")
