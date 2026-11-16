@@ -24,8 +24,29 @@ keeps the text read before the cut and has no section without any. When every pa
 
 BZZ budget. Each BZZ chunk decodes with `min(BZZ_CHUNK, left)`, `left` being what remains of the document's
 `BZZ_TOTAL`. A Limit at BZZ_CHUNK, a Truncated stream or a damaged one counts the chunk `record`. A Limit at `left`
-spends the budget: that page and every later one count `textless` (but never make the file "no text layer"). Shared text repeated on a later page charges its
-size to `left` again, as if it were decoded again, so output stays bounded when one DJVI is included by every page.
+spends the budget: that page and every later one count `textless` (but never make the file "no text layer"). Shared
+text repeated on a later page charges its size to `left` again, as if decoded again, so output stays bounded when one
+DJVI is included by every page. Shared annotations are not charged again: each page's are bounded by DJVU_ANT and
+ANT_AREAS, and the page loop by DJVU_DEADLINE.
+
+Annotations. ANTa, or ANTz through BZZ: a page's annotation chunks and those of the DJVIs it includes, in chunk order,
+are read as one S-expression text (`_sexp`, iterative: at most DJVU_ANT characters, ANT_DEPTH open lists and
+ANT_STRING bytes per string; past a bound, or at an expression that never closes, the rest is ignored and counted
+`link` once). Up to ANT_AREAS mapareas a page (the rest counted `link` once): `(maparea URL COMMENT AREA ...)`, URL a
+string or `(url "href" "target")`. An http, https, mailto or ftp URL gives `Link: ` and a Link labelled with the
+comment (or the URL); any other URL, an internal one (`#12`, `#+1`) or none gives `Comment: <comment>` when there is a
+comment, else nothing. The lines are the page section's comments, rendered after its text. The first
+`(metadata (title "..."))` of the pages read is the document title.
+
+Bookmarks. A DJVM's NAVM (the chunk after DIRM), through BZZ: a BE16 count, then each bookmark in pre-order (a
+child-count byte, a BE24 length and the description, a BE24 length and the URL). Up to DJVU_BOOKMARKS are read and
+those deeper than BOOKMARK_DEPTH levels are walked past; the rest are unused. A bookmark whose URL names a page
+(`#<component id>` or `#<number>`) becomes `Heading(min(depth + 2, 6), text[:120])` at the start of that page. A
+NAVM that does not fit, cannot be decoded or ends early counts `record` once (the bookmarks read before are kept). A
+page counted textless keeps a section when it has a heading or annotation lines (it is still counted textless).
+
+Deadline. Before each page, `clock() - started` past DJVU_DEADLINE seconds: that page and the rest count `page_cut`,
+and the output so far is kept, as DJVU_PAGES does.
 """
 import re
 import struct
@@ -35,15 +56,30 @@ from pathlib import Path
 
 from ..containers import bzz
 from ..limits import ReadError
-from ..model import Doc, Para, Section, Text
+from ..model import Doc, Heading, Link, Para, Section, Text
 
-DJVU_PAGES = 5_000  # pages read per conversion; the rest count page_cut
+DJVU_PAGES = 5_000       # pages read per conversion; the rest count page_cut
+DJVU_DEADLINE = 36.0     # seconds for the page loop from `started`, as PDF_DEADLINE; the rest count page_cut
+DJVU_ANT = 2**20         # characters of annotation S-expression read per page; the rest ignored, counted link
+ANT_DEPTH = 64           # open lists in it
+ANT_STRING = 64 * 2**10  # bytes per string in it
+ANT_AREAS = 256          # mapareas per page; the rest counted link
+DJVU_BOOKMARKS = 1_000   # NAVM bookmarks read; the rest unused
+BOOKMARK_DEPTH = 32      # bookmark levels used; deeper ones are walked past
 
 IMAGE_CHUNKS = frozenset((b"BG44", b"FG44", b"Sjbz", b"BGjp", b"FGjp", b"Smmr"))
 TEXT_CHUNKS = frozenset((b"TXTa", b"TXTz"))
 _KINDS = {1: "page", 2: "thum"}  # DIRM type bits; 0 (include) and 3 (shared annotations) are DJVI components
 _FORM_OF = {"page": b"DJVU", "djvi": b"DJVI", "thum": b"THUM"}
 _PARAGRAPH = re.compile("[\x1d\x0b\x1f]")  # GS (region), VT (column), US (paragraph)
+ANT_CHUNKS = frozenset((b"ANTa", b"ANTz"))
+LINK_SCHEMES = frozenset(("http", "https", "mailto", "ftp"))
+HEADING_CHARS = 120
+# one token after optional space: "(", ")", the opening quote of a string, or a bare word; each branch starts with its
+# own characters, so a match never backtracks
+_TOKEN = re.compile(r'\s*(?:(\()|(\))|(")|([^\s()"]+))')
+_PLAIN = re.compile(r'[^"\\]*')  # a string's run up to its closing quote or a backslash
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "a": "\a"}
 
 
 @dataclass(frozen=True)
@@ -63,6 +99,9 @@ class _Part:
     images: bool = False  # an image chunk was there
     size: int = 0         # bytes of text layer read, charged again when shared text is repeated
     cut: bool = False     # the walk stopped at a chunk that ran past its FORM (or the file ended): counted `record`
+    ant: list = field(default_factory=list)    # annotation texts, in chunk order (shared ones where INCL stood)
+    lines: list = field(default_factory=list)  # Para per link or comment line, from the annotations
+    title: str = ""       # the first (metadata (title ...)) of the annotations
 
 
 def _chunks(data: bytes, start: int, end: int, ctx=None, dropped=None):
@@ -169,6 +208,139 @@ def _text(raw: str) -> list[Para]:
     return out
 
 
+def _one_line(s: str) -> str:
+    """A comment or title on one line, its line breaks as " / " (as pdf's comments): a line of it must not start a
+    markdown line."""
+    return " / ".join(part for part in (p.strip() for p in s.splitlines()) if part)
+
+
+class _Sym(str):
+    """A bare word of an annotation (a keyword, a number, a colour), told from a quoted string."""
+
+
+def _string(text: str, pos: int):
+    """The string whose body starts at text[pos] (after its quote), and the position after its closing quote; (None,
+    pos) when it passes ANT_STRING bytes or never closes. Escapes: backslash n t r b f v a, up to three octal digits
+    (one byte each: several make UTF-8), and a backslash before any other character keeps that character."""
+    cap = ANT_STRING
+    buf = bytearray()
+    n = len(text)
+    while True:
+        m = _PLAIN.match(text, pos)
+        buf += m.group().encode("utf-8")
+        pos = m.end()
+        if len(buf) > cap or pos >= n:
+            return None, pos
+        if text[pos] == '"':
+            return buf.decode("utf-8", "replace"), pos + 1
+        pos += 1  # a backslash
+        if pos >= n:
+            return None, pos
+        stop = pos
+        while stop < n and stop - pos < 3 and text[stop] in "01234567":
+            stop += 1
+        if stop > pos:
+            buf.append(int(text[pos:stop], 8) & 0xFF)
+            pos = stop
+        else:
+            buf += _ESCAPES.get(text[pos], text[pos]).encode("utf-8")
+            pos += 1
+
+
+def _sexp(text: str, ctx=None) -> list:
+    """The complete top-level lists of an annotation text, as nested lists of strings and `_Sym` words (bare words
+    outside a list and stray `)` are ignored). Bounded and iterative: at most DJVU_ANT characters, ANT_DEPTH open
+    lists and ANT_STRING bytes per string. Past a bound, or at a list or string that never closes, the rest
+    (including the unclosed top-level list) is ignored and counted `link` once (when ctx is given)."""
+    cut = len(text) > DJVU_ANT
+    text = text[:DJVU_ANT]
+    depth = ANT_DEPTH
+    out, stack = [], []
+    pos, n = 0, len(text)
+    while pos < n:
+        m = _TOKEN.match(text, pos)
+        if m is None:  # only space is left
+            break
+        pos = m.end()
+        if m.group(1):
+            if len(stack) >= depth:
+                cut = True
+                break
+            stack.append([])
+        elif m.group(2):
+            if stack:
+                done = stack.pop()
+                (stack[-1] if stack else out).append(done)
+        elif m.group(3):
+            value, pos = _string(text, pos)
+            if value is None:
+                cut = True
+                break
+            if stack:
+                stack[-1].append(value)
+        elif stack:
+            stack[-1].append(_Sym(m.group(4)))
+    if stack:
+        cut = True
+    if cut and ctx is not None:
+        ctx.skipped["link"] += 1
+    return out
+
+
+def _maparea(item: list):
+    """The comment line of one `(maparea URL COMMENT ...)`, or None."""
+    url = item[1] if len(item) > 1 else ""
+    if isinstance(url, list):  # (url "href" "target")
+        url = url[1] if len(url) > 1 and url[0] == "url" and isinstance(url[1], str) else ""
+    url = url.strip() if isinstance(url, str) else ""
+    comment = item[2] if len(item) > 2 and isinstance(item[2], str) else ""
+    comment = _one_line(comment)
+    scheme, colon, rest = url.partition(":")
+    if colon and rest and scheme.lower() in LINK_SCHEMES:
+        return Para([Text("Link: "), Link(url, [Text(comment or url)])])
+    if comment:
+        return Para([Text("Comment: " + comment)])
+    return None
+
+
+def _annotations(text: str, ctx) -> tuple[list, str]:
+    """(comment lines, metadata title) of one page's annotation text. Up to ANT_AREAS mapareas are used; the rest
+    count `link` once."""
+    lines, title = [], ""
+    areas = 0
+    for item in _sexp(text, ctx):
+        if not item or not isinstance(item[0], _Sym):
+            continue
+        if item[0] == "metadata" and not title:
+            for entry in item[1:]:
+                if (isinstance(entry, list) and len(entry) > 1 and entry[0] == "title"
+                        and isinstance(entry[1], str) and _one_line(entry[1])):
+                    title = _one_line(entry[1])
+                    break
+        elif item[0] == "maparea":
+            areas += 1
+            if areas > ANT_AREAS:
+                continue
+            line = _maparea(item)
+            if line is not None:
+                lines.append(line)
+    if areas > ANT_AREAS:
+        ctx.skipped["link"] += 1
+    return lines, title
+
+
+def _target(url: str, ids: dict, count: int):
+    """The page number a bookmark URL names (`#<component id>` or `#<number>`), or None."""
+    if not url.startswith("#"):
+        return None
+    name = url[1:]
+    if name in ids:
+        return ids[name]
+    if name.isascii() and name.isdigit() and len(name) <= 9 and 1 <= int(name) <= count:
+        return int(name)
+    return None
+
+
 class _Reader:
     def __init__(self, data: bytes, ctx, started, clock):
         self.data, self.ctx, self.started, self.clock = data, ctx, started, clock
@@ -177,6 +349,8 @@ class _Reader:
         self.djvi = {}             # component id -> (body start, end) of its FORM:DJVI
         self.shared = {}           # component id -> _Part, or None when the id names no DJVI
         self.used = set()          # shared ids already given to a page
+        self.marks = {}            # page number -> its bookmark Headings
+        self.title = ""            # the first metadata title of the pages read
 
     # -- BZZ under the document's budget
 
@@ -218,6 +392,21 @@ class _Reader:
         self.left -= len(out)
         return out
 
+    def _unpack_navm(self, packed: bytes):
+        """The NAVM decoded under the budget; None, counted `record`, when it cannot be."""
+        try:
+            out = bzz.decode(packed, min(bzz.BZZ_CHUNK, max(self.left, 0)))
+        except (bzz.Limit, bzz.Truncated):
+            self._record()
+            return None
+        except ReadError as e:
+            if e.kind != "damaged":
+                raise
+            self._record()
+            return None
+        self.left -= len(out)
+        return out
+
     # -- the container
 
     def bundle(self, start: int, end: int) -> list[tuple[int, str, int, int]]:
@@ -231,11 +420,15 @@ class _Reader:
         if cid != b"DIRM":
             raise ReadError("damaged", f"DJVM starts with {cid!r}, not DIRM")
         comps = _dirm(self.data[body:stop], self._decode)
+        navm = self._navm_chunk(stop + ((stop - body) & 1), end)
         placed = self._place(comps, stop, end)
         pages = []
+        ids = {}
         number = 0  # page components in DIRM order, dropped ones included, so later pages keep their numbers
         for i, comp in enumerate(comps):
             number += comp.kind == "page"
+            if comp.kind == "page":
+                ids.setdefault(comp.id, number)
             if i not in placed:
                 continue
             body, form_end = placed[i]
@@ -244,7 +437,70 @@ class _Reader:
                 pages.append((number, title, body, form_end))
             elif comp.kind == "djvi":
                 self.djvi.setdefault(comp.id, (body, form_end))
+        if navm is not None:
+            with self.ctx.guard("record"):
+                self._bookmarks(navm, ids, number)
         return pages
+
+    def _navm_chunk(self, pos: int, end: int):
+        """The body of the NAVM chunk at pos (the one after DIRM), or None; one that does not fit counts `record`."""
+        data = self.data
+        if end - pos < 8 or data[pos:pos + 4] != b"NAVM":
+            return None
+        size = int.from_bytes(data[pos + 4:pos + 8], "big")
+        if size > end - pos - 8:
+            self._record()
+            return None
+        return data[pos + 8:pos + 8 + size]
+
+    def _bookmarks(self, packed: bytes, ids: dict, count: int):
+        """self.marks from a NAVM body. The tree is walked in pre-order, its levels kept as a stack of children still
+        to come; at most DJVU_BOOKMARKS entries are read (each takes at least 7 bytes), so the walk is bounded by the
+        cap and by the bytes. A bookmark that runs past the data ends the walk, counted `record` once."""
+        raw = self._unpack_navm(packed)
+        if raw is None:
+            return
+        if len(raw) < 2:
+            self._record()
+            return
+        total = struct.unpack_from(">H", raw, 0)[0]
+        cap, deep = DJVU_BOOKMARKS, BOOKMARK_DEPTH
+        pos, n = 2, len(raw)
+        stack = []
+        read = 0
+        while read < total and read < cap:
+            if n - pos < 7:
+                self._record()
+                return
+            kids = raw[pos]
+            size = int.from_bytes(raw[pos + 1:pos + 4], "big")
+            pos += 4
+            if size > n - pos - 3:
+                self._record()
+                return
+            desc = raw[pos:pos + size]
+            pos += size
+            size = int.from_bytes(raw[pos:pos + 3], "big")
+            pos += 3
+            if size > n - pos:
+                self._record()
+                return
+            url = raw[pos:pos + size]
+            pos += size
+            read += 1
+            depth = len(stack)
+            if stack:
+                stack[-1] -= 1
+            if kids:
+                stack.append(kids)
+            while stack and stack[-1] <= 0:
+                stack.pop()
+            if depth >= deep:
+                continue
+            number = _target(url.decode("utf-8", "replace").strip(), ids, count)
+            text = " ".join(desc.decode("utf-8", "replace").split())[:HEADING_CHARS]
+            if number is not None and text:
+                self.marks.setdefault(number, []).append(Heading(min(depth + 2, 6), [Text(text)]))
 
     def _place(self, comps: list[Component], start: int, end: int) -> dict[int, tuple[int, int]]:
         """DIRM index -> (FORM body start, FORM end) of each component whose offset holds a FORM of its type within
@@ -284,6 +540,8 @@ class _Reader:
                 self._text_chunk(cid, data[body:stop], part)
             elif cid in IMAGE_CHUNKS:
                 part.images = True
+            elif cid in ANT_CHUNKS:
+                self._ant_chunk(cid, data[body:stop], part)
             elif cid == b"INCL" and not nested:
                 name = data[body:stop].decode("utf-8", "replace").strip("\x00 \t\r\n")
                 if name not in seen:
@@ -318,6 +576,13 @@ class _Reader:
         part.size += len(text)
         part.paras.extend(_text(text.decode("utf-8", "replace")))
 
+    def _ant_chunk(self, cid: bytes, raw: bytes, part: _Part):
+        if cid == b"ANTz":
+            raw = self._unpack(raw)
+            if raw is None:
+                return
+        part.ant.append(raw.decode("utf-8", "replace"))
+
     def _include(self, name: str, part: _Part):
         if name not in self.shared:
             where = self.djvi.get(name)
@@ -340,11 +605,18 @@ class _Reader:
             self.left -= got.size
         self.used.add(name)
         part.paras.extend(got.paras)
+        part.ant.extend(got.ant)
 
     def _page(self, start: int, end: int) -> _Part:
         part = _Part()
         self._read(start, end, part, nested=False)
+        if part.ant and not self.spent:
+            part.lines, part.title = _annotations("\n".join(part.ant), self.ctx)
         return part
+
+    def _late(self) -> bool:
+        """The page loop is past DJVU_DEADLINE seconds from `started`."""
+        return self.clock() - (self.started or self.clock()) > DJVU_DEADLINE
 
     def _fail(self):
         self.ctx.skipped["page"] += 1
@@ -355,7 +627,9 @@ class _Reader:
         """The page sections. `short`: the file ends before its FORM does, so the last page is cut short even when
         the walk ended on a chunk boundary. A cut page is counted `record` once; it keeps the text read before the
         cut, has no section when there was none, and is never `textless`. Pages counted `textless` because the BZZ
-        budget ran out (`starved`) never make the file "no text layer"."""
+        budget ran out (`starved`) never make the file "no text layer"; a page whose budget ran out is counted only
+        that way, even when it is also the cut last page. A page with no text keeps a section for its bookmark
+        headings and annotation lines. DJVU_PAGES and DJVU_DEADLINE count the pages left `page_cut`."""
         ctx = self.ctx
         if not pages:
             raise ReadError("damaged", "no pages")
@@ -363,14 +637,22 @@ class _Reader:
         textless = starved = images = read = 0
         capped = False
         for n, (number, title, start, end) in enumerate(pages):
-            if n >= DJVU_PAGES:
+            if n >= DJVU_PAGES or self._late():
                 ctx.skipped["page_cut"] += len(pages) - n
                 capped = True
                 break
             read += 1
+            heads = list(self.marks.get(number, ()))
+
+            def keep(blocks, lines, heads=heads, number=number, title=title):
+                if heads or blocks or lines:
+                    sections.append(Section("page", title=title, number=number, blocks=heads + blocks,
+                                            comments=lines))
+
             if self.spent:
                 textless += 1
                 starved += 1
+                keep([], [])
                 continue
             got = []
             try:
@@ -384,19 +666,25 @@ class _Reader:
                 continue
             part = got[0]
             images += part.images
+            if self.spent:  # this page's text passed the budget: it and the rest count textless, and only that
+                textless += 1
+                starved += 1
+                keep([], [])
+                continue
             if short and n == len(pages) - 1 and not part.cut:
                 part.cut = True
                 self._record()
-            if self.spent:  # this page's text passed the budget: it and the rest count textless
-                textless += 1
-                starved += 1
-                continue
+            if part.title and not self.title:
+                self.title = part.title
             if part.cut and not part.paras:  # counted record by the walk, never also textless
+                keep([], part.lines)
                 continue
             if not part.text:
                 textless += 1
+                keep([], part.lines)
                 continue
-            sections.append(Section("page", title=title, number=number, blocks=part.paras))
+            sections.append(Section("page", title=title, number=number, blocks=heads + part.paras,
+                                    comments=part.lines))
         if images:
             ctx.skipped["page_images"] = 1
         if textless and textless == read and not starved:
@@ -406,12 +694,12 @@ class _Reader:
             ctx.skipped["textless"] += textless
         if not sections and not capped and not textless:
             raise ReadError("damaged", "no readable pages")
-        return Doc(blocks=sections)
+        return Doc(title=self.title, blocks=sections)
 
 
 def parse_bytes(data, ctx, *, started=None, clock=time.monotonic) -> Doc:
-    """A DjVu file's text layer as one page section per page. `started` and `clock` are for the page loop's
-    deadline (`started` is clock() at entry unless given)."""
+    """A DjVu file's text layer as one page section per page, with its annotations and bookmarks. `started` and
+    `clock` are for the page loop's deadline, DJVU_DEADLINE (`started` is clock() at entry unless given)."""
     data = bytes(data)
     if started is None:
         started = clock()

@@ -1,5 +1,7 @@
 """DjVu text layers: one-page and bundled files, TXTa and TXTz, INCL, the paragraph and line rules, textless pages,
 indirect and NDIR files, and the hostile-container rules (an oversize chunk, overlapping offsets, the pad byte, BZZ_TOTAL).
+Annotations (links, comments, the metadata title), NAVM bookmarks as headings, the annotation and bookmark caps, the
+page cap and the page loop's deadline.
 
 Run: python -I -X utf8 tests/test_reader_djvu.py
 """
@@ -16,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from reader import markdown  # noqa: E402
 from reader.formats import djvu  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Para, Section, Text  # noqa: E402
-from djvu_fix import _text, bzz_encode, chunk, djvm, form, iff, page  # noqa: E402
+from reader.model import Context, Heading, Link, Para, Section, Text  # noqa: E402
+from djvu_fix import _text, bzz_encode, chunk, djvm, form, iff, navm, page  # noqa: E402
 
 INFO = chunk(b"INFO", struct.pack(">HHBB", 100, 100, 26, 0) + struct.pack("<HBB", 300, 22, 0))
 
@@ -358,6 +360,212 @@ def test_parse_path_and_started():
         p.write_bytes(iff(page("On disk")))  # a clean fixture
         doc = djvu.parse(p, Context(), started=0.0)
     assert texts(doc.blocks[0]) == ["On disk"]
+
+
+def test_short_and_spent_counted_once():
+    # a one-page file cut at its FORM's end whose page also spends the BZZ budget: one event, one kind (textless)
+    z = chunk(b"TXTz", bzz_encode(_text("a" * 400)))
+    data = iff(form(b"DJVU", [INFO, z, z, chunk(b"Sjbz", bytes(200))]))[:-208]  # the Sjbz chunk gone whole
+    saved = djvu.bzz.BZZ_TOTAL
+    djvu.bzz.BZZ_TOTAL = 500  # the first chunk fits, the second spends the budget
+    try:
+        doc, ctx = read(data)
+    finally:
+        djvu.bzz.BZZ_TOTAL = saved
+    assert doc.blocks == []
+    assert ctx.skipped["textless"] == 1 and ctx.skipped["record"] == 0, ctx.skipped
+
+
+def comments(section):
+    return [[(type(i).__name__, i.text if isinstance(i, Text) else (i.url, i.inlines[0].text)) for i in c.inlines]
+            for c in section.comments]
+
+
+def test_link_and_comment():
+    ant = ('(maparea "https://example.com/" "Example" (rect 0 0 9 9))\n'
+           '(maparea "" "Check this" (rect 0 0 9 9))')
+    doc, ctx = read(iff(page("Body text", ant=ant)))
+    sec = doc.blocks[0]
+    assert texts(sec) == ["Body text"]
+    assert comments(sec) == [[("Text", "Link: "), ("Link", ("https://example.com/", "Example"))],
+                             [("Text", "Comment: Check this")]], comments(sec)
+    out = md(doc, ctx)
+    assert "> Link: [Example](https://example.com/)" in out and "> Comment: Check this" in out, out
+    assert out.index("Body text") < out.index("> Link: ") < out.index("> Comment: "), out
+    # no comment: the url is the label; the (url "href" "target") form; mailto and ftp; another scheme is no link
+    ant = ('(maparea "http://a.example/" "" (rect 0 0 1 1)) (maparea (url "mailto:x@example.com" "_blank") "Mail")'
+           ' (maparea "ftp://f.example/x" "File") (maparea "javascript:alert(1)" "Script") (maparea "file:///c" "")')
+    doc, ctx = read(iff(page("x", ant=ant)))
+    assert comments(doc.blocks[0]) == [
+        [("Text", "Link: "), ("Link", ("http://a.example/", "http://a.example/"))],
+        [("Text", "Link: "), ("Link", ("mailto:x@example.com", "Mail"))],
+        [("Text", "Link: "), ("Link", ("ftp://f.example/x", "File"))],
+        [("Text", "Comment: Script")]], comments(doc.blocks[0])
+    assert ctx.skipped["link"] == 0
+    # a comment's line breaks do not start a markdown line; escapes in strings are read
+    doc, ctx = read(iff(page("x", ant='(maparea "" "## Page 9\\nnext \\"q\\" \\303\\251")')))
+    assert comments(doc.blocks[0]) == [[("Text", 'Comment: ## Page 9 / next "q" é')]], comments(doc.blocks[0])
+
+
+def test_internal_link_comment_only():
+    doc, ctx = read(djvm([page("One", ant='(maparea "#2" "Go on" (rect 0 0 1 1)) (maparea "#+1" "" (rect 0 0 1 1))'),
+                          page("Two")]))
+    assert comments(doc.blocks[0]) == [[("Text", "Comment: Go on")]], comments(doc.blocks[0])
+    assert "Link: " not in md(doc, ctx)
+
+
+def test_antz_and_shared():
+    shared = form(b"DJVI", [chunk(b"ANTa", b'(maparea "" "Shared note" (rect 0 0 1 1))')])
+    data = djvm([page("One", ant='(maparea "http://a.example/" "A" (rect 0 0 1 1))', antz=True),
+                 page("Two", incl="ann.djvi")], shared=[("ann.djvi", shared)])
+    doc, ctx = read(data)
+    assert comments(doc.blocks[0]) == [[("Text", "Link: "), ("Link", ("http://a.example/", "A"))]]
+    assert comments(doc.blocks[1]) == [[("Text", "Comment: Shared note")]], comments(doc.blocks[1])
+    # a page's own annotations and its shared ones are read together, in chunk order
+    one = form(b"DJVU", [INFO, chunk(b"INCL", b"ann.djvi"), chunk(b"TXTa", _text("Both")),
+                         chunk(b"ANTa", b'(maparea "" "Own")')])
+    doc, ctx = read(djvm([one], shared=[("ann.djvi", shared)]))
+    assert comments(doc.blocks[0]) == [[("Text", "Comment: Shared note")], [("Text", "Comment: Own")]]
+    # an ANTz that cannot be decoded (a cut stream) counts record; the page's text is kept
+    rng = random.Random(7)
+    body = bzz_encode(("(maparea \"\" \"" + "".join(rng.choice("abcdefghij ") for _ in range(3000)) + "\")").encode())
+    bad = form(b"DJVU", [INFO, chunk(b"TXTa", _text("Kept")), chunk(b"ANTz", body[:len(body) // 2])])
+    doc, ctx = read(iff(bad))
+    assert texts(doc.blocks[0]) == ["Kept"] and doc.blocks[0].comments == [] and ctx.skipped["record"] == 1
+
+
+def test_metadata_title():
+    doc, ctx = read(iff(page("x", ant='(metadata (title "A Book") (author "Someone"))')))
+    assert doc.title == "A Book"
+    assert md(doc, ctx).startswith("# A Book\n"), md(doc, ctx)
+    doc, ctx = read(djvm([page("x", ant='(metadata (author "Z"))'), page("y", ant='(metadata (title "First"))'),
+                          page("z", ant='(metadata (title "Second"))')]))
+    assert doc.title == "First"
+
+
+def test_navm_headings():
+    long = "L" * 130
+    data = djvm([page("one"), page("two"), page("three")],
+                navm=navm([("Part", "#1", [("Chapter", "#2", []), (long, "#p0003.djvu", [])]),
+                           ("Nowhere", "#9", []), ("Outside", "http://x.example/", [])]))
+    doc, ctx = read(data)
+    p1, p2, p3 = doc.blocks
+    assert isinstance(p1.blocks[0], Heading) and p1.blocks[0].level == 2 and p1.blocks[0].inlines[0].text == "Part"
+    assert isinstance(p2.blocks[0], Heading) and p2.blocks[0].level == 3 and p2.blocks[0].inlines[0].text == "Chapter"
+    assert p3.blocks[0].level == 3 and p3.blocks[0].inlines[0].text == "L" * 120
+    assert texts(p1) == ["one"] and texts(p2) == ["two"]
+    assert [len(p.blocks) for p in doc.blocks] == [2, 2, 2]
+    out = md(doc, ctx)
+    assert out.index("## Part") < out.index("one") < out.index("### Chapter") < out.index("two"), out
+    # depth + 2, at most 6
+    deep = ("d0", "#1", [])
+    for k in range(1, 7):
+        deep = (f"d{k}", "#1", [deep])
+    doc, ctx = read(djvm([page("one")], navm=navm([deep])))
+    assert [b.level for b in doc.blocks[0].blocks if isinstance(b, Heading)] == [2, 3, 4, 5, 6, 6, 6]
+    # a NAVM that cannot be decoded counts record; the pages are read
+    data = djvm([page("one")], navm=chunk(b"NAVM", b"\xff\xff\xff"))
+    doc, ctx = read(data)
+    assert texts(doc.blocks[0]) == ["one"] and ctx.skipped["record"] == 1
+    # a textless page keeps its heading (and is still counted textless)
+    doc, ctx = read(djvm([page("one"), page(None)], navm=navm([("Plate", "#2", [])])))
+    assert [s.number for s in doc.blocks] == [1, 2] and ctx.skipped["textless"] == 1
+    assert doc.blocks[1].blocks[0].inlines[0].text == "Plate"
+
+
+def test_sexp_caps():
+    got = djvu._sexp('(a "b\\"c" (d 1)) stray ) (e)')
+    assert got == [["a", 'b"c', ["d", "1"]], ["e"]], got
+    assert isinstance(got[0][0], djvu._Sym) and not isinstance(got[0][1], djvu._Sym)
+    two = '(maparea "" "One" (rect 0 0 1 1)) (maparea "" "Two" (rect 0 0 1 1))'
+    saved = djvu.ANT_AREAS
+    djvu.ANT_AREAS = 1
+    try:
+        doc, ctx = read(iff(page("x", ant=two)))
+    finally:
+        djvu.ANT_AREAS = saved
+    assert comments(doc.blocks[0]) == [[("Text", "Comment: One")]] and ctx.skipped["link"] == 1
+    # depth 65: the rest is ignored and counted link once
+    deep = '(maparea "" "Kept") ' + "(" * 65 + ")" * 65 + ' (maparea "" "Lost")'
+    doc, ctx = read(iff(page("x", ant=deep)))
+    assert comments(doc.blocks[0]) == [[("Text", "Comment: Kept")]] and ctx.skipped["link"] == 1, ctx.skipped
+    doc, ctx = read(iff(page("x", ant='(maparea "" "Kept") ' + "(" * 64 + ")" * 64)))
+    assert ctx.skipped["link"] == 0
+    # DJVU_ANT characters and ANT_STRING per string
+    for name, value in (("DJVU_ANT", 30), ("ANT_STRING", 10)):
+        saved = getattr(djvu, name)
+        setattr(djvu, name, value)
+        try:
+            doc, ctx = read(iff(page("x", ant='(maparea "" "Kept") (maparea "" "Lost, a long one")')))
+        finally:
+            setattr(djvu, name, saved)
+        assert comments(doc.blocks[0]) == [[("Text", "Comment: Kept")]] and ctx.skipped["link"] == 1, name
+    # an expression that never closes is dropped and counted once too
+    ctx = Context()
+    assert djvu._sexp('(a b) (c "d', ctx) == [["a", "b"]] and ctx.skipped["link"] == 1
+
+
+def test_bookmark_caps():
+    data = djvm([page("one"), page("two")], navm=navm([("First", "#1", [("Inner", "#1", [])]), ("Second", "#2", [])]))
+    saved = djvu.DJVU_BOOKMARKS
+    djvu.DJVU_BOOKMARKS = 1
+    try:
+        doc, ctx = read(data)
+    finally:
+        djvu.DJVU_BOOKMARKS = saved
+    assert [[b.inlines[0].text for b in s.blocks if isinstance(b, Heading)] for s in doc.blocks] == [["First"], []]
+    saved = djvu.BOOKMARK_DEPTH
+    djvu.BOOKMARK_DEPTH = 1  # the top level only; the deeper one is walked past, not used
+    try:
+        doc, ctx = read(data)
+    finally:
+        djvu.BOOKMARK_DEPTH = saved
+    assert [[b.inlines[0].text for b in s.blocks if isinstance(b, Heading)] for s in doc.blocks] == [["First"],
+                                                                                                    ["Second"]]
+
+
+def test_deadline_page_cut():
+    t = [0.0]
+
+    def clock():  # 20 s per call: started at 20, page 1 at 40 (20 s in), page 2 at 60 (40 s, past 36)
+        t[0] += 20.0
+        return t[0]
+
+    ctx = Context()
+    doc = djvu.parse_bytes(djvm([page("a"), page("b"), page("c")]), ctx, clock=clock)
+    assert [texts(s) for s in doc.blocks] == [["a"]]
+    assert ctx.skipped["page_cut"] == 2
+    # nothing read before the deadline: the output (empty) is kept, not refused
+    t[0] = 0.0
+    ctx = Context()
+    doc = djvu.parse_bytes(djvm([page("a"), page("b")]), ctx, started=-100.0, clock=clock)
+    assert doc.blocks == [] and ctx.skipped["page_cut"] == 2
+
+
+def test_convert_passes_started():
+    import reader
+    seen = {}
+    real = djvu.parse_bytes
+
+    def stub(data, ctx, **kw):
+        seen.update(kw)
+        return real(data, ctx, **kw)
+
+    had = "djvu" in reader.BUILT
+    reader.BUILT.add("djvu")
+    djvu.parse_bytes = stub
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "book.djvu"
+            p.write_bytes(iff(page("Converted")))  # a clean fixture
+            reader.convert(p, Path(d) / "out")
+            out = (Path(d) / "out" / "out.md").read_text(encoding="utf-8")
+    finally:
+        djvu.parse_bytes = real
+        if not had:
+            reader.BUILT.discard("djvu")
+    assert seen.get("started") == reader.STARTED, seen
+    assert "Converted" in out
 
 
 def main():

@@ -4,7 +4,7 @@ from pathlib import Path
 
 VERSION = "0.6.0"
 
-# when the reader was imported: the CLI child passes it to the pdf page loop's deadline
+# when the reader was imported: the CLI child passes it to the pdf and djvu page loops' deadlines
 STARTED = time.monotonic()
 
 # extension -> module name under reader.formats
@@ -69,7 +69,7 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
     t0 = time.monotonic()
     src, out_dir = Path(src), Path(out_dir)
     ctx = Context()
-    if ext_of(src) == "pdf":  # the page loop's deadline runs from the process start
+    if FORMATS.get(ext_of(src)) in ("pdf", "djvu"):  # the page loop's deadline runs from the process start
         opts.setdefault("started", STARTED)
     doc = parse(src, ctx, **opts)
     out_dir.mkdir(parents=True, exist_ok=True)
