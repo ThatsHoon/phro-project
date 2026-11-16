@@ -73,8 +73,8 @@ _BREAK = re.compile(r"[ \t\r\n\f\v&+,()=<>]")  # between runs, SQL that ends a c
 # where a URL's authority starts: after a special scheme's ":" (slashes or none; group 1, at a word's start), after ":"
 # and slashes, or after two or more slashes or backslashes
 _URL_START = re.compile(r"(?i)((?:https?|ftp|wss?|file):[/\\]*)|:[/\\]+|[/\\]{2,}")
-_AUTH_STOP = re.compile(r"[/\\?#]")  # what ends a special scheme's authority (a tab or line break never does)
-_OTHER_STOP = re.compile(r"[/?#]")  # ... any other's ("\\" too is the user part's: "smb://CORP\\bob:pw@srv")
+# what ends any scheme's authority ("\\" is the user part's: "smb://CORP\\bob:pw@srv"; a tab or line break never does)
+_OTHER_STOP = re.compile(r"[/?#]")
 _WORD = re.compile(r"\w")
 _JAVA_SPACE = "".join(map(chr, range(33)))  # what Java's trim() takes off
 _ROW = 32  # steps a row costs beyond its text: its getters, filters, quoting and separators
@@ -144,8 +144,8 @@ def withhold_urls(text: str):
     between them as they are (a stray "]" aside), each kept stretch mapped back to where it stands. Runs and stretches
     that touch make one chain; whitespace or one of & + , ( ) = < > in a stretch between runs is SQL and ends it.
     A URL starts in the view (`_URL_START`; a special scheme only where the text has no letter, digit or "_" right
-    before it); its authority runs to the next "/", "?" or "#" of its chain, or "\\" after a special scheme (http,
-    https, ftp, ws, wss, file: WHATWG's reading; any other scheme's user part may hold "\\", `smb://CORP\\bob:pw@srv`);
+    before it); its authority runs to the next "/", "?" or "#" of its chain, whatever the scheme (a user part may hold
+    "\\": `smb://CORP\\bob:pw@srv`, and `https://CORP\\bob:pw@h` too, where WHATWG would read CORP as the host);
     its user part to the authority's last "@", or, for a URL that does not start with ":" and one slash alone (a
     drive, "c:\\x"), its last "…" (what a connect position withheld may have held that "@"; so may the document's
     own "…": it hides more). An authority holding ":" and no such end, when its chain holds one later (`u:pa/ss@h`),
@@ -203,7 +203,7 @@ def withhold_urls(text: str):
         ends = breaks[k] if k < len(breaks) else size
         if ends != chain:  # a chain is read once: a later URL in it starts past the last one's authority
             chain, last_at, last_mark = ends, view.rfind("@", a, ends), view.rfind("…", a, ends)
-        stop = (_AUTH_STOP if special else _OTHER_STOP).search(view, a, ends)
+        stop = _OTHER_STOP.search(view, a, ends)
         b = ends if stop is None else stop.start()
         at = view.rfind("@", a, b)
         if len(m.group()) == 2 and m.group()[0] == ":":  # ":" and one slash alone (a drive, "c:\\x"): "@" only

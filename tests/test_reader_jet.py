@@ -2656,7 +2656,7 @@ def test_query_credential_positions():
             "SELECT a\nFROM [ODBC;DRIVER={x};…].T\nWHERE b IN (SELECT c FROM [ODBC;DRIVER={x};…].W);"], texts
         assert "s3cr3t" not in md and "bob" not in md and ctx.skipped == {"withheld": 4}, (md, ctx.skipped)
     # a URL's user part whose password holds a space, a doubled quote, a comma, a parenthesis, a bracket or "<", and
-    # a special scheme with no slash: the authority ends only at "/", "\\", "?", "#", a line break or its run's end
+    # a special scheme with no slash: the authority ends only at "/", "?", "#", a line break or its run's end
     lits = ["https://bob:my s3cr3t@h/x.mdb", "https://bob:it''ss3cr3t@h/x", "https://bob:a,s3cr3t@h/x",
             "https://bob:a(s3cr3t@h/x", "https://bob:a[s3cr3t@h/x", "https://bob:a<s3cr3t@h/x", "https:bob:s3cr3t@h/x",
             "https://bob:s3cr3t\r\n@h/x"]
