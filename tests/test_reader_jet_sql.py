@@ -380,8 +380,9 @@ def connect_cleaner(s):
 
 def url_cleaner(s):
     """A stand-in for jet.py's URL rule (idempotent), given one quoted or bracketed run's content or a stretch between
-    runs: a URL's user part withheld as "…", its authority running to "/", "\\", "?", "#", a line break or the end."""
-    return re.sub(r"(?i)(https?:/*|//)[^/\\?#\r\n]*@", r"\1…@", s)
+    runs: a URL's user part withheld as "…", its authority running to "/", "\\", "?", "#" or the end (a tab or line
+    break never ends it)."""
+    return re.sub(r"(?i)(https?:/*|//)[^/\\?#]*@", r"\1…@", s)
 
 
 def test_connect_hook():
@@ -456,6 +457,30 @@ def test_unbalanced_fails_closed():
     q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, "a IN (SELECT b FROM [ODBC;DSN=x;PWD=s3cr3t] .T)")]
     want = lines("SELECT a", "WHERE a IN (SELECT b FROM [ODBC;DSN=x;…] .T);")
     assert jet_sql.sql(q, connect=connect_cleaner) == want
+    # ... or a line break
+    q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, "a IN (SELECT b FROM [ODBC;DSN=x;PWD=s3cr3t]\r\n.T)")]
+    want = lines("SELECT a", "WHERE a IN (SELECT b FROM [ODBC;DSN=x;…]\r\n.T);")
+    assert jet_sql.sql(q, connect=connect_cleaner) == want
+
+
+def test_url_across_runs():
+    # a special scheme's authority that reaches the end of its run or stretch with no "/", "\\", "?" or "#", when
+    # the next run or stretch holds an "@" before any of them: withheld from the scheme through that "@"
+    cases = {"x = https://bob:s3cr3t'@h'": "x = https://…@h';", "[https://bob:s3cr3t]@h = 1": "[https://…@h = 1;",
+             "x = 'https://bob:s3cr3t'@h": "x = 'https://…@h;",
+             "x = \"https://bob:s3cr3t\"[@h]": "x = \"https://…@h];"}
+    for w, want in cases.items():
+        q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
+        got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+        assert "s3cr3t" not in got and got == lines("SELECT a", f"WHERE {want}"), (w, got)
+    q = [row(TYPE, "EXEC p 'https://bob:s3cr3t'@h", PASSTHROUGH, "ODBC;")]
+    assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == "EXEC p 'https://…@h"
+    # kept: the next stretch holds no "@", or a stop comes first, or the authority stopped inside its run
+    for w in ("x = 'https://h:8080' AND y = 'a@b'", "x = 'https://h:1'/'@b'", "x = 'https://h/'@b",
+              "x = 'https://h:1'/a@b",
+              "x = 'mailto:bob'@h"):
+        q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
+        assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == lines("SELECT a", f"WHERE {w};"), w
 
 
 def test_url_hook():
@@ -480,6 +505,11 @@ def test_url_hook():
     assert got == lines("SELECT 'see //…@h/x'", "FROM [https://…@h/x]", "WHERE a Like \"*key=1;*\";"), got
     q = [row(TYPE, "SELECT 1 FROM t WHERE u = '//bob:pw@h'\0", PASSTHROUGH, "ODBC;DSN=a")]
     assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == "SELECT 1 FROM t WHERE u = '//…@h'"
+    # a tab or line break never ends an authority (a browser drops them before it reads a URL)
+    w = "u = 'https://bob:s3cr3t\r\n@h/x' OR v = 'https://bob:s3\tcr3t@h/x'"
+    q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
+    got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+    assert got == lines("SELECT a", "WHERE u = 'https://…@h/x' OR v = 'https://…@h/x';"), got
 
 
 def test_unrebuildable():
@@ -527,6 +557,7 @@ def shapes():
         + [Row(TYPE, None, SELECT, None, None, 1, b"\0")],
         "scrub": [row(TYPE, None, SELECT), row(WHERE, "x IN  '' [a;b].[c;d]. " * 2000 + "IN" + " " * 20_000)],
         "runs": [row(TYPE, None, SELECT), row(WHERE, "'a'[b]\"c\"[d;{e]}] .:/" * 3000 + "IN [x;")],
+        "held": [row(TYPE, None, SELECT), row(WHERE, "'http:a'@b https:" * 4000 + "x [@" + "http://" * 2000)],
         "text": [row(TYPE, None, SELECT), row(COLUMN, "x" * 60000)],
     }
 

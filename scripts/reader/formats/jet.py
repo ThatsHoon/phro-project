@@ -251,8 +251,7 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 # where a URL's authority starts in query text (`_clean_urls`): after a special scheme's ":" (slashes or none), after
 # ":" and slashes, or after two or more slashes or backslashes
 _URL_START = re.compile(r"(?i)\b(?:https?|ftp|wss?|file):[/\\]*|:[/\\]+|[/\\]{2,}")
-_AUTH_STOP = re.compile(r"[/\\?#\r\n]")
-_LINE_STOP = re.compile(r"[\r\n]")
+_AUTH_STOP = re.compile(r"[/\\?#]")  # a tab or line break never ends one: WHATWG drops them first
 _SQL_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")  # shown as a space in a query's text
 _BAD = (ValueError, IndexError, struct.error, ArithmeticError)  # a row, cell or TDEF that cannot be read
 
@@ -1670,13 +1669,14 @@ def _clean_urls(db: _Db, s: str):
     """`s` (one quoted or bracketed run's content, or a stretch between runs, `jet_sql`'s `urls`) with each URL's user
     part taken out, put as "…" ("http://…@host/x"), and whether any was. A URL starts after a special scheme's ":"
     (http, https, ftp, ws, wss, file; slashes or none, as WHATWG reads one), after ":" and slashes, or after two or more
-    slashes or backslashes; its authority runs to the next "/", "\\", "?", "#", line break or the end of `s`, and its
-    user part to the authority's last "@", whatever it holds (a space, a quote, a comma, a bracket). When unsure it
-    withholds: an authority holding ":" and no "@" whose line holds one later (`u:pa/ss@h`) gives up to that "@".
-    Its characters and a `_PART` are charged first; one pass."""
+    slashes or backslashes; its authority runs to the next "/", "\\", "?", "#" or the end of `s` (a tab or line break
+    never ends it: a browser drops them before it reads a URL), and its user part to the authority's last "@",
+    whatever it holds (a space, a quote, a comma, a bracket, a line break). When unsure it withholds: an authority
+    holding ":" and no "@", when `s` holds one later (`u:pa/ss@h`), gives up to the last "@". Its characters and a
+    `_PART` are charged first; one pass."""
     db.charge(len(s) + _PART)
     out, last, dropped, seen = [], 0, False, -1
-    line_end, line_at = -1, -1
+    last_at = s.rfind("@")
     for m in _URL_START.finditer(s):
         a = m.end()
         if a <= last or a < seen:  # inside an authority already read: it holds no "@" past `last`
@@ -1684,13 +1684,9 @@ def _clean_urls(db: _Db, s: str):
         stop = _AUTH_STOP.search(s, a)
         b = len(s) if stop is None else stop.start()
         seen = b
-        if a >= line_end:
-            stop = _LINE_STOP.search(s, a)
-            line_end = len(s) if stop is None else stop.start()
-            line_at = s.rfind("@", a, line_end)
         at = s.rfind("@", a, b)
-        if at < 0 and line_at >= b and ":" in s[a:b]:
-            at = line_at
+        if at < 0 and last_at >= b and ":" in s[a:b]:
+            at = last_at
         if at < 0:
             continue
         if s[a:at] != "…":

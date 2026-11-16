@@ -22,15 +22,19 @@ Credentials, by position. With `connect`, every connect position is passed throu
 and type (`IN '<path>' [<type>]`) of a source or of a make-table or append target; a source's database qualifier
 (`[<qualifier>].<table>`); a source or target name holding ";", whole, before it is split at "."; and in the finished
 text (a union part, a derived table, a subquery, any expression) the quoted path after an IN keyword, the quoted or
-bracketed type right after that path, and a bracketed prefix holding ";" that a "." follows, spaces aside (a "{" in
-it reaches its "}", so a braced value holding "]" stays inside). Every other quoted literal or bracketed identifier
-is the document's content and is kept as stored. The scan fails closed: a quote or bracket left open, a bracket
+bracketed type right after that path, and a bracketed prefix holding ";" that a "." follows, spaces, tabs and line
+breaks aside (a "{" in it reaches its "}", so a braced value holding "]" stays inside). Every other quoted literal or
+bracketed identifier is the document's content and is kept as stored. The scan fails closed: a quote or bracket left open, a bracket
 holding "[", or a ";" between runs before the text's end (the parameter list is read on its own) means the runs are
 not as Access stores them, so the rest of the text is one run and a connect position. With `urls`, a URL's user part
 is taken out anywhere: `urls` is given each run's content and each stretch between runs (so a URL ends with its run),
 pass-through text included, and a name before it is split. A pass-through query's stored text has no connect
-position, and its connect string (the type row's Name1) is never written. The hooks are idempotent; what they
-withhold they mark ("…").
+position, and its connect string (the type row's Name1) is never written. A special scheme's authority (http, https,
+ftp, ws, wss, file) that reaches the end of its run or stretch with no "/", "\\", "?" or "#" while the next run or
+stretch holds an "@" before any of them is given to `urls` whole, from its stretch through that "@" and the quote or
+bracket between, so a URL split across runs (only in text Access would not store) is withheld too. A URL that an
+expression assembles from several literals (`'https://u:p' & '@h'`) exists only when the query runs; the reader shows
+the stored text and never evaluates it. The hooks are idempotent; what they withhold they mark ("…").
 
 Work. `work(rows)` is an upper bound on what `sql` does, in steps (a character of text, `_ROW` a row, a comparison of
 the sort, `_JOIN` a table source a join looks at, builds or walks); the caller charges it before `sql` runs.
@@ -61,6 +65,8 @@ _QUOTABLE = re.compile(r"[^A-Za-z0-9_]")  # Java's \W is ASCII
 _LINES = re.compile(r"[\r\n]+")
 _OPENS = re.compile(r"[\[\"']")
 _BRACKET_STOP = re.compile(r"[\]{]")
+_SPECIAL = re.compile(r"(?i)\b(?:https?|ftp|wss?|file):[/\\]*")  # a special scheme and its slashes
+_URL_STOP = re.compile(r"[/\\?#]")
 _JAVA_SPACE = "".join(map(chr, range(33)))  # what Java's trim() takes off
 _ROW = 32  # steps a row costs beyond its text: its getters, filters, quoting and separators
 _JOIN = 4  # steps a table source costs a join row: a look in the search, and one in each level a condition goes down
@@ -129,6 +135,23 @@ def _scrub(text: str, connect, urls) -> str:
     def bare(s):
         return urls(s) if urls is not None and s and (":" in s or "/" in s or "\\" in s) else s
 
+    held = None  # (where in `out`, the text) of the last piece when a special scheme's authority reaches its end
+
+    def piece(s):
+        """`s` (a run's content or a stretch, connect positions already cleaned) appended through `urls`."""
+        nonlocal held
+        if held is not None and s:
+            k, t = held
+            held = None
+            stop = _URL_STOP.search(s)
+            at = s.rfind("@", 0, len(s) if stop is None else stop.start())
+            if at >= 0:  # the URL runs on into `s`: from its piece through this "@", the delimiters between
+                out[k:] = [bare(t + "".join(out[k + 1:]) + s[:at + 1])]
+                s = s[at + 1:]
+        if urls is not None and ":" in s and _open_authority(s):
+            held = (len(out), s)
+        out.append(bare(s))
+
     out, i, gap, path = [], 0, 0, -1
     n = len(text)
     last = len(text.rstrip()) - 1  # where a closing ";" may stand
@@ -138,7 +161,7 @@ def _scrub(text: str, connect, urls) -> str:
         if connect is not None:
             semi = text.find(";", gap, o)
             if 0 <= semi < last:
-                out.append(bare(connect(text[gap:])))
+                piece(connect(text[gap:]))
                 return "".join(out)
         if m is None:
             break
@@ -152,16 +175,16 @@ def _scrub(text: str, connect, urls) -> str:
                 end = _bracket_end(text, o + 1)
                 if end >= 0:
                     k = end + 1
-                    while k < n and text[k] in " \t":
+                    while k < n and text[k] in " \t\r\n":
                         k += 1
                     prefix = text[k:k + 1] == "."
         else:
             end = _closing(text, o + 1, c)
-        out.append(bare(text[gap:o]))
+        piece(text[gap:o])
         out.append(c)
         if end < 0:
             rest = text[o + 1:]
-            out.append(bare(rest if connect is None else connect(rest)))
+            piece(rest if connect is None else connect(rest))
             return "".join(out)
         after_in = _after_in(text, o)
         typed = path >= 0 and not text[path:o].strip()
@@ -169,11 +192,20 @@ def _scrub(text: str, connect, urls) -> str:
         inner = text[o + 1:end]
         if connect is not None and (after_in or typed or prefix):
             inner = connect(inner)
-        out.append(bare(inner))
+        piece(inner)
         out.append(text[end])
         gap = i = end + 1
-    out.append(bare(text[gap:]))
+    piece(text[gap:])
     return "".join(out)
+
+
+def _open_authority(s: str) -> bool:
+    """Whether a special scheme's authority in `s` reaches the end of `s` (no "/", "\\", "?" or "#" after it)."""
+    stop = max(s.rfind("/"), s.rfind("\\"), s.rfind("?"), s.rfind("#"))
+    for m in _SPECIAL.finditer(s):
+        if m.end() > stop:
+            return True
+    return False
 
 
 def _after_in(text: str, o: int) -> bool:
