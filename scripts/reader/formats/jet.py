@@ -1,4 +1,5 @@
-"""Access databases (mdb, accdb): the catalog and the user tables, as one summary line and a section per table.
+"""Access databases (mdb, accdb): the catalog, the user tables and the saved queries, as one summary line, a section
+per table and a section per query.
 
 Ported from Jackcess 5.0.4 (Apache-2.0; the Maven Central sources jar), `com/healthmarketscience/jackcess/impl/`:
 `DatabaseImpl.java` (`getDatabasePassword` and `getPasswordMask`, the catalog's columns, object types and flags,
@@ -72,6 +73,17 @@ the content's length; the content, a header then the file) is read through `long
 raw or inflated (`flate.inflate`), come from one `flate.Budget(IMAGE_BYTES)` a document; past it, or a wrapper that
 cannot be read (an unknown type, a cut stream, a header past the data), counts `image` and the file name stays.
 
+Queries. After the tables, each saved query (catalog type 5, not a system object) is a section "Query: <name>"
+(hidden when flagged 0x08) holding its SQL text in an `sql` Code block: its MSysQueries rows, grouped by ObjectId
+in one walk of the table (`_query_rows`), rebuilt the way Jackcess writes them by `jet_sql` (never run). The connect
+strings and database paths a query names, and any bracketed or quoted run of its text holding ";" and "=", are
+cleaned as a linked table's connect string (`_clean_connect`), so no PWD=, UID= or URL user part shows; a
+pass-through query's stored text is shown as stored, its connect string never. A query whose rows are not kept (past
+`jet_sql.JET_QUERY_ROWS`, a cell that cannot be read, a Memo past eight times `jet_sql.JET_SQL` bytes, the queries'
+room of four times the file's bytes), whose SQL Jackcess cannot write or past `JET_SQL`, or past the meter keeps its
+heading alone, counted `query`; a row of MSysQueries that cannot be read names no query, so then no query has SQL. A
+control character other than a tab or line break shows as a space.
+
 Page type 8. A page of type 8 in a table's usage map holds no rows read here: skipped, counted `jet_page8` (internal).
 
 Key order. A table with a primary key shows its rows in key order: rows are held while they fit what the grid has
@@ -106,7 +118,8 @@ complex value joined (`_CPLX` and a unit a character), each attachment looked at
 picture read (`_ROW_COST`, its long value as any, and twice the most its inflation may produce, `_INFLATE` bytes a
 unit, charged before it runs, kept when it fails; a definition decoded once); each connect string's characters and
 marks (`_PART` a ";", "}" or quote); each name in the summary (`_NAME`); each character of a calculated column's
-expression.
+expression; MSysQueries' rows as any table's and `_QROW` each kept, each query (`_QUERY`) and its SQL, `_SQL` times
+`jet_sql.work` (an upper bound on its steps) through `Meter.afford` before it is written (past what is left, no SQL).
 In `jet_pages` each RC4 page, chain item and usage map byte. The prices are measured, each at least what its path
 costs. A real file is charged a few units a byte of itself. Past the total: the table being read stops with one
 `sheet_cut` (the grid's own cut, the rows held so far shown in page order); a table not yet started is not read at all
@@ -117,9 +130,9 @@ Kept values. A long value read whole, an overflow target's shown values (and its
 definition and properties, the relationships' targets, linked tables' targets and MSysComplexColumns' rows are kept,
 but only while their estimated size fits a room of the file's bytes (one room for all); a target that shows nothing
 is not kept. The flat tables' values (and a picture's FileData definition) have their own room, four times the
-file's bytes. Past the room a repeat is read
-again, charged like the first read (a definition or target past it is dropped, counted `record`). So what is kept
-stays within about the file's size, the page cache within the decoded pages of the file, and the rows held for the
+file's bytes, and so do the queries' rows (a row 128 bytes and its strings), held until the queries are written.
+Past the room a repeat is read again, charged like the first read (a definition or target past it is dropped,
+counted `record`). So what is kept stays within about the file's size, the page cache within the decoded pages of the file, and the rows held for the
 sort within the grid's caps.
 
 Long values. A MEMO is inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00). An LVAL value read whole is
@@ -129,7 +142,8 @@ empty row, the pages cap) shows what was read, counted `record` once.
 
 Caps. `JET_COLS` columns per TDEF (past it a user table counts `db_table`, the catalog is `damaged`), `JET_NAME`
 characters per name and `JET_CELL_CHARS` per cell (cut, counted `text`), `JET_LVAL_BYTES` read per long value,
-`JET_PROPS` bytes and `JET_PROP_CHUNKS` chunks per property blob, the work meter per file. Every cap is read at call
+`JET_PROPS` bytes and `JET_PROP_CHUNKS` chunks per property blob, `jet_sql.JET_QUERY_ROWS` rows and `jet_sql.JET_SQL`
+characters per query, the work meter per file. Every cap is read at call
 time, so a test can lower it.
 """
 import collections
@@ -148,8 +162,8 @@ from pathlib import Path
 from .. import html, limits
 from ..containers import flate
 from ..limits import ReadError
-from ..model import Break, Doc, Hidden, Image, Link, Para, Section, Text
-from . import jet_pages, sheet_grid
+from ..model import Break, Code, Doc, Hidden, Image, Link, Para, Section, Text
+from . import jet_pages, jet_sql, sheet_grid
 
 JET_CATALOG = 100_000
 JET_NAME = 64
@@ -201,6 +215,9 @@ _PART = 4      # a part of a linked table's connect string (and a unit a charact
 _NAME = 8      # an object or linked table named in the summary (a name of up to JET_NAME, its target already charged)
 _INFLATE = 64  # inflated bytes of an attachment a unit (charged before zlib's own loop, the most it may produce)
 _KEEP = 256    # the room a kept value takes beside its text (key, tuples, a dict slot)
+_QROW = 8      # an MSysQueries row of a query: its cells looked up, its `jet_sql.Row` made and kept
+_QUERY = 16    # a query: its section, `jet_sql.work` over its rows, the cleaner's closure
+_SQL = 1       # a step of `jet_sql.work` (the dearest shape measured, a parameter list, about 0.05 microseconds)
 _Spent = jet_pages.Spent
 _PK = 1  # IndexImpl.PRIMARY_KEY_INDEX_TYPE
 _AUTONUMBER = 0x04 | 0x40  # ColumnImpl.AUTO_NUMBER_FLAG_MASK, AUTO_NUMBER_GUID_FLAG_MASK
@@ -227,6 +244,7 @@ LINK_SCHEMES = frozenset(("http", "https", "mailto", "ftp"))
 _NUMBERS = frozenset((BYTE, INT, LONG, BIGINT, MONEY, FLOAT, DOUBLE, NUMERIC))
 _ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md; every real file read has 0)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_SQL_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")  # shown as a space in a query's text
 _BAD = (ValueError, IndexError, struct.error, ArithmeticError)  # a row, cell or TDEF that cannot be read
 
 
@@ -1606,6 +1624,123 @@ def _linked_target(db: _Db, connect: str, database: str) -> str:
     return ";".join(kept)
 
 
+# -- saved queries
+
+def _clean_connect(db: _Db, s: str) -> str:
+    """A connect string or database path a query names (`jet_sql`'s `connect`), showing less rather than a
+    credential, as a linked table's: its characters and marks charged first; kept are a bare first token (a path,
+    "ODBC"), later bare parts only when empty, and `_SAFE_KEYS` parts with a value, each only when `_safe_value`
+    leaves its value as it is; joined with ";". "" when it does not parse cleanly (`_connect_parts`). Cleaning it
+    again changes nothing, as `jet_sql`'s scrub of the finished text needs."""
+    marks = s.count(";") + s.count("}") + s.count('"') + s.count("'") + 1
+    db.charge(len(s) + _PART * marks)
+    parts, ok = _connect_parts(s)
+    if not ok:
+        return ""
+    kept = [text for i, (k, v, text) in enumerate(parts)
+            if (k is None and (i == 0 or not v) or k in _SAFE_KEYS and v.strip()) and _safe_value(v) == v.strip()]
+    return ";".join(kept)
+
+
+def _query_int(col: Column, raw):
+    """A Byte, Integer or Long cell of MSysQueries; None when null."""
+    if raw is None:
+        return None
+    fmt = {BYTE: "<B", INT: "<h", LONG: "<i"}.get(col.type)
+    if fmt is None:
+        raise ValueError(f"type {col.type} where a number was expected")
+    return struct.unpack(fmt, raw)[0]
+
+
+def _query_text(db: _Db, col: Column, raw):
+    """A Text or Memo cell of MSysQueries, whole (a Memo of at most eight times JET_SQL bytes, else ValueError), its
+    bytes charged as decoded; None when null."""
+    if raw is None:
+        return None
+    if col.type == TEXT:
+        return db.decode(raw, bool(col.ext & 0x01))
+    if col.type != MEMO:
+        raise ValueError(f"type {col.type} where text was expected")
+    data = db.long_bytes(raw, 8 * jet_sql.JET_SQL + 2)
+    if data is None:
+        raise ValueError("query text past its cap")
+    return db.decode(data, bool(col.ext & 0x01))
+
+
+def _query_rows(db: _Db, catalog: list, queries: list):
+    """{query id: its MSysQueries rows as `jet_sql.Row`s in table order, or None when they are not kept}, or None
+    when MSysQueries is missing or cannot be read (a row that cannot be read names no query, so none is trusted). Rows
+    are charged as any table's and `_QROW` each before they are made; a row of another object is skipped before its
+    text is read. A query's rows are not kept (None) past `jet_sql.JET_QUERY_ROWS`, when a cell of one cannot be read
+    or a Memo is past its cap, or past the queries' room, four times the file's bytes (a row 128 bytes and its
+    strings)."""
+    t = next((o for o in catalog if o.type == TABLE and o.flags & SYSTEM_FLAGS and o.name.lower() == "msysqueries"),
+             None)
+    if t is None or db.meter.over:
+        return None
+    ids = {o.id for o in queries}
+    out, room = {}, 4 * db.jet.pages * db.jet.page_size
+    before = db.ctx.skipped["record"]
+    try:
+        tdef = _tdef(db, t.id & 0xFFFFFF)
+        at = {c.name.lower(): i for i, c in reversed(list(enumerate(tdef.columns)))}
+        if "objectid" not in at or "attribute" not in at:
+            raise ValueError("MSysQueries has no ObjectId or Attribute column")
+        cols = tdef.columns
+
+        def cell(cells, key):
+            i = at.get(key)
+            return (None, None) if i is None else (cols[i], cells.get(i))
+
+        for _, cells in _rows(db, tdef):
+            oid = _long(*cell(cells, "objectid"))
+            rows = out.get(oid, [])
+            if oid not in ids or rows is None:
+                continue
+            db.charge(_QROW)
+            try:
+                texts = [_query_text(db, *cell(cells, k)) for k in ("expression", "name1", "name2")]
+                ints = [_query_int(*cell(cells, k)) for k in ("attribute", "flag", "lvextra")]
+                col, raw = cell(cells, "order")
+                if raw is not None and col.type != BINARY:
+                    raise ValueError(f"type {col.type} where Order's bytes were expected")
+                order = None if raw is None else bytes(raw)
+            except _BAD:
+                out[oid] = None
+                continue
+            size = 128 + sum(sys.getsizeof(v) for v in (*texts, order) if v is not None)
+            if len(rows) >= jet_sql.JET_QUERY_ROWS or size > room:
+                out[oid] = None
+                continue
+            room -= size
+            rows.append(jet_sql.Row(ints[0], texts[0], ints[1], texts[1], texts[2], oid, order, ints[2]))
+            out[oid] = rows
+    except (_Spent, *_BAD):
+        return None
+    return None if db.ctx.skipped["record"] > before else out
+
+
+def _query(db: _Db, obj: Obj, rows) -> Section:
+    """A query's section, "Query: <name>", holding its SQL (`jet_sql.sql`, its work charged first through
+    `Meter.afford`) as a Code block; with no SQL (rows not kept, Jackcess unable to write it, the meter) the heading
+    stays alone, counted `query`. A control character other than a tab or line break shows as a space."""
+    text = None
+    try:
+        db.charge(_QUERY)
+        if rows is not None and db.meter.afford(_SQL * jet_sql.work(rows)):
+            text = jet_sql.sql(rows, flags=obj.flags, connect=lambda s: _clean_connect(db, s))
+    except _Spent:
+        text = None
+    blocks = []
+    if text and text.strip():
+        blocks.append(Code(_SQL_CONTROL.sub(" ", text), "sql"))
+    else:
+        db.ctx.skipped["query"] += 1
+    if obj.flags & HIDDEN_FLAG:
+        return Section("query", obj.name, blocks=_hide(blocks), hidden="hidden")
+    return Section("query", obj.name, blocks=blocks)
+
+
 # -- output
 
 def _hide(blocks: list) -> list:
@@ -1893,6 +2028,13 @@ def parse_bytes(data, ctx) -> Doc:
         sec = None
         with ctx.guard("db_table"):
             sec = _table(db, o, budget, rels, catalog)
+        if sec is not None:
+            out.append(sec)
+    qrows = _query_rows(db, catalog, queries) if queries else None
+    for o in queries:
+        sec = None
+        with ctx.guard("query"):
+            sec = _query(db, o, None if qrows is None else qrows.get(o.id, []))
         if sec is not None:
             out.append(sec)
     if tables and not out and not (queries or linked or others) and not db.meter.over:

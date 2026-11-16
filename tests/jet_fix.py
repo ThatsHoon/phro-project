@@ -103,7 +103,8 @@ class Tbl:
 
 
 class Query:
-    """A saved query: `rows` its MSysQueries rows, each (Attribute, Expression, Flag, Name1, Name2[, Order]);
+    """A saved query: `rows` its MSysQueries rows, each (Attribute, Expression, Flag, Name1, Name2[, Order[,
+    LvExtra]]), written in that order (Name1 and Name2 Text, Expression Memo, LvExtra Long, as in real files);
     `flags` its MSysObjects flags (the query type)."""
 
     def __init__(self, name, rows, *, flags=0):
@@ -501,8 +502,8 @@ CATALOG = [("Id", LONG), ("ParentId", LONG), ("Name", TEXT), ("Type", INT), ("Fl
            ("DateUpdate", DATE), ("Owner", BINARY), ("Connect", MEMO), ("Database", MEMO), ("ForeignName", TEXT),
            ("RmtInfoShort", BINARY), ("RmtInfoLong", OLE), ("Lv", OLE), ("LvExtra", OLE), ("LvModule", OLE),
            ("LvProp", OLE)]
-QUERIES = [("Attribute", BYTE), ("Expression", MEMO), ("Flag", INT), ("LvExtra", OLE), ("Name1", MEMO),
-           ("Name2", MEMO), ("ObjectId", LONG), ("Order", BINARY)]
+QUERIES = [("Attribute", BYTE), ("Expression", MEMO), ("Flag", INT), ("LvExtra", LONG), ("Name1", TEXT),
+           ("Name2", TEXT), ("ObjectId", LONG), ("Order", BINARY)]
 CPLX = [("ColumnName", TEXT), ("ComplexTypeObjectID", LONG), ("FlatTableID", LONG), ("ConceptualTableID", LONG),
         ("ComplexID", LONG)]
 MULTI_NAMES = {BYTE: "UnsignedByte", INT: "Short", LONG: "Long", FLOAT: "IEEESingle", DOUBLE: "IEEEDouble",
@@ -615,8 +616,8 @@ def jet_db(version: int, tables=(), *, queries=(), objects=(), relationships=(),
         oid = 0x00100000 + i
         rows.append(cat(oid, TABLES, q.name, 5, q.flags))
         for r in q.rows:
-            r = list(r) + [None] * (6 - len(r))
-            qrows.append([r[0], r[1], r[2], None, r[3], r[4], oid, r[5]])
+            r = list(r) + [None] * (7 - len(r))
+            qrows.append([r[0], r[1], r[2], r[6], r[3], r[4], oid, r[5]])
     for i, (name, kind) in enumerate(objects):
         rows.append(cat(0x00200000 + i, CONTAINER_OF.get(kind, TABLES), name, kind))
     for i, link in enumerate(linked):

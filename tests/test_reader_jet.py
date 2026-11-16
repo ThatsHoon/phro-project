@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import html, limits, markdown  # noqa: E402
 from reader.containers import crypto, flate  # noqa: E402
-from reader.formats import jet, jet_pages, sheet_grid  # noqa: E402
+from reader.formats import jet, jet_pages, jet_sql, sheet_grid  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Break, Context, Hidden, Image, Link, Para, Section, Table, Text  # noqa: E402
 import jet_fix  # noqa: E402
@@ -254,7 +254,7 @@ def summary_lines(doc):
 
 
 def sections(doc):
-    return [b for b in doc.blocks if isinstance(b, Section)]
+    return [b for b in doc.blocks if isinstance(b, Section) and b.kind == "table"]
 
 
 def section(doc, name):
@@ -1076,14 +1076,14 @@ def test_rc4_total():
 # -- the work meter as the invariant
 
 class Loops:
-    """Counts the loop iterations (backward jumps) run in jet.py, jet_pages.py and crypto.py (the RC4 of db_key
-    pages) while open, through sys.monitoring; any other code location, and every forward jump, is switched off at its
-    first event."""
+    """Counts the loop iterations (backward jumps) run in jet.py, jet_pages.py, jet_sql.py and crypto.py (the RC4 of
+    db_key pages) while open, through sys.monitoring; any other code location, and every forward jump, is switched
+    off at its first event."""
     TOOL = 4
 
     def __enter__(self):
         mon = sys.monitoring
-        files = {jet.__file__, jet_pages.__file__, crypto.__file__}
+        files = {jet.__file__, jet_pages.__file__, jet_sql.__file__, crypto.__file__}
         self.n = 0
 
         def jump(code, src, dst):
@@ -1443,12 +1443,30 @@ def guard_fixtures():
                      Col("E", TEXT, calc=TEXT, props={"Expression": "[ID]"})],
                [[i, [("a.png", PNG, i % 2 == 0), ("b.txt", b"x" * (i * 30), True)], [f"v{k}" for k in range(i % 4)],
                  2 * i, f"t{i}"] for i in range(8)], pk="ID")
-    ace = jet_db(3, [cplx, other], objects=[("F", -32768), ("M", -32761)], linked=[("L", ";DATABASE=x;PWD=y", "T")])
-    return [jet_db(0, [Tbl("T", cols, rows(14)), other]), jet_db(1, [Tbl("T", cols, rows(14)), other]),
+    ace = jet_db(3, [cplx, other], objects=[("F", -32768), ("M", -32761)], linked=[("L", ";DATABASE=x;PWD=y", "T")],
+                 queries=guard_queries())
+    return [jet_db(0, [Tbl("T", cols, rows(14)), other], queries=guard_queries()),
+            jet_db(1, [Tbl("T", cols, rows(14)), other]),
             jet_db(1, [Tbl("T", cols, rows(10))], db_key=0x2468), jet_db(3, [Tbl("T", cols, rows(14), umap=1), other]),
             jet_db(1, [wide, Tbl("S", [Col("A", LONG)], [[i] for i in range(300)])]),
             jet_db(1, [Tbl("K", keyed, krows, pk="ID", props={"Description": "keyed"}), child], relationships=rels),
             jet_db(0, [Tbl("K", keyed[:4], [r[:4] for r in krows], pk="ID"), child], relationships=rels[:1]), ace]
+
+
+def guard_queries():
+    """Saved queries for the guard: a select with a parameter, joins and a remote database, a union, a pass-through
+    and a crosstab sorted by Order."""
+    sel = [(1, None, 1, None, None), (2, None, 10, "p", None, None, 20), (3, None, 0x12, "5", None),
+           (4, "ODBC;DSN=s;PWD=x", None, "d.mdb", None), (5, None, None, "A", "a"), (5, None, None, "B", None),
+           (5, None, None, "C", None), (6, "a.x", None, "X", None), (7, "a.k = B.k", 1, "a", "B"),
+           (7, "B.j = C.j", 2, "B", "C"), (8, "a.x > [p]", None, None, None), (11, "a.x", None, "D", None)]
+    union = [(1, None, 9, None, None), (3, None, 2, None, None),
+             (5, "SELECT 1 FROM A\r\n", None, None, UNION1), (5, "SELECT 2 FROM B", None, None, UNION2)]
+    cross = [(6, "Count(x)", 0, "N", None, b"\0\0\0\2"), (6, "y", 1, None, None, b"\0\0\0\1"),
+             (1, None, 6, None, None, b"\0\0\0\0"), (5, None, None, "T", None, b"\0\0\0\0"),
+             (6, "z", 2, None, None, b"\0\0\0\0"), (9, "z", 2, None, None, b"\0\0\0\0")]
+    return [Query("S", sel), Query("U", union, flags=0x80), Query("P", [(1, "SELECT 1\0", 8, "ODBC;", None)],
+                                                                  flags=0x70), Query("X", cross, flags=0x10)]
 
 
 def mutate(rng, data):
@@ -2525,6 +2543,266 @@ def test_expression_charged():
     spent = db.meter.charged - before
     assert "= [A]+[A]+" in "".join(x.text for x in line) and spent >= 12_000 and loops.n <= 2 * spent + 16, \
         (loops.n, spent)
+
+# -- saved queries (jet_sql)
+
+UNION1, UNION2 = "X7YZ_____1", "X7YZ_____2"
+
+
+def queries(doc):
+    return [b for b in doc.blocks if isinstance(b, Section) and b.kind == "query"]
+
+
+def select_rows(table="Orders", col="Name"):
+    return [(1, None, 1, None, None), (6, col, None, None, None), (5, None, None, table, None)]
+
+
+def test_query_sections():
+    # each saved query a section, "## Query: <name>", its SQL in an sql fence after the tables; Jet3, Jet4 and ACE
+    rows = [(1, None, 1, None, None), (2, None, 10, "Who", None, None, 50), (6, "Name", None, None, None),
+            (5, None, None, "Orders", None), (8, "Name = [Who]", None, None, None), (11, "ID", None, "D", None)]
+    for v in (0, 1, 3):
+        doc, ctx, md = convert(jet_db(v, [three()], queries=[Query("Q1", rows)]))
+        assert [q.title for q in queries(doc)] == ["Q1"] and doc.blocks[-1] is queries(doc)[0]
+        assert "## Query: Q1\n\n```sql\nPARAMETERS Who Text(50);\nSELECT Name\nFROM Orders\nWHERE Name = [Who]\n" \
+               "ORDER BY ID DESC;\n```" in md, md
+        assert "query" not in ctx.skipped and "not rebuilt" not in md, ctx.skipped
+    # every type Jackcess writes, from the catalog's flags
+    qs = [Query("Del", [(1, None, 5, None, None), (5, None, None, "Orders", None), (8, "ID = 1", None, None, None)],
+                flags=0x20),
+          Query("Upd", [(1, None, 4, None, None), (5, None, None, "Orders", None), (6, "'x'", None, None, "Name")],
+                flags=0x30),
+          Query("Uni", [(1, None, 9, None, None), (5, "SELECT 1\r\n\r\nFROM A", None, None, UNION1),
+                        (5, "SELECT 2", None, None, UNION2)], flags=0x80),
+          Query("Ddl", [(1, "CREATE TABLE X (A INT)\0\0", 7, None, None)], flags=0x60)]
+    doc, ctx, md = convert(jet_db(1, [three()], queries=qs))
+    assert [q.title for q in queries(doc)] == ["Del", "Upd", "Uni", "Ddl"] and "query" not in ctx.skipped
+    assert [q.blocks[0].text for q in queries(doc)] == [
+        "DELETE *\nFROM Orders\nWHERE ID = 1;", "UPDATE Orders\nSET Name = 'x';",
+        "SELECT 1\nFROM A\nUNION ALL SELECT 2;", "CREATE TABLE X (A INT)"]
+    assert summary(doc) == "Access 2000-2003 database (Jet 4): 1 table, 4 queries."
+
+
+def test_unrebuildable_counted():
+    # a query Jackcess cannot write keeps its heading with no fence, counted `query`
+    q2 = Query("Q2", [(1, None, 99, None, None)])
+    doc, ctx, md = convert(jet_db(1, [three()], queries=[Query("Q1", select_rows()), q2]))
+    assert "## Query: Q1\n\n```sql\nSELECT Name\nFROM Orders;\n```" in md, md
+    assert "## Query: Q2" in md and "```" not in md.split("## Query: Q2")[1], md
+    assert ctx.skipped["query"] == 1 and "1 query not rebuilt as SQL" in md, (ctx.skipped, md)
+    assert queries(doc)[1].blocks == []
+    # a query with no rows, or a row naming no type: the same
+    doc, ctx, md = convert(jet_db(1, [], queries=[Query("E", []), Query("C", [(6, "a", None, None, None)])]))
+    assert [q.blocks for q in queries(doc)] == [[], []] and ctx.skipped["query"] == 2
+    assert "2 queries not rebuilt as SQL" in md
+
+
+def test_hidden_query():
+    doc, ctx, md = convert(jet_db(1, [three()], queries=[Query("H", select_rows(), flags=0x08)]))
+    (q,) = queries(doc)
+    assert q.hidden == "hidden" and all(b.hidden == "hidden" for b in q.blocks) and len(q.blocks) == 1
+    assert "## Query: H" not in md and "SELECT" not in md
+    _, _, shown = convert(jet_db(1, [three()], queries=[Query("H", select_rows(), flags=0x08)]), hidden=True)
+    assert "## Query: H (hidden)" in shown and "SELECT Name" in shown
+
+
+def test_query_credentials():
+    # connect strings and paths a query names are cleaned as a linked table's: PWD=, UID=, a URL's user part and a
+    # {braced} password never show, in a remote database, a source's qualifier, a target, or the query's text
+    rows = [(1, None, 1, None, None),
+            (4, "ODBC;DSN=s;UID=u1;PWD=secret1", None, "https://user1:secret2@h/d.mdb", None),
+            (6, "A", None, None, None), (5, "DRIVER={SQL Server};SERVER=s;UID=u2;PWD={se;cret3}", None, "T", None),
+            (8, "B = 'ODBC;UID=u3;PWD=secret4' OR C = \"x;Password=secret5\"", None, None, None)]
+    union = [(1, None, 9, None, None), (5, "SELECT a FROM [ODBC;DSN=z;PWD=secret6].T", None, None, UNION1),
+             (5, "SELECT b FROM U IN '' [ODBC;UID=u4;PWD=secret7]", None, None, UNION2)]
+    make = [(1, "ODBC;DSN=m;PWD=secret8", 2, "New", "\\\\srv\\x.mdb"), (6, "A", None, None, None)]
+    append = [(1, None, 3, "T", "ftp://u5:secret9@h/x.mdb"), (6, "1", -0x8000, None, None)]
+    qs = [Query("R", rows), Query("U", union, flags=0x80), Query("M", make, flags=0x50),
+          Query("A", append, flags=0x40)]
+    for v in (0, 1, 3):
+        doc, ctx, md = convert(jet_db(v, [], queries=qs))
+        texts = [q.blocks[0].text for q in queries(doc)]
+        assert texts == [
+            "SELECT A\nFROM [DRIVER={SQL Server};SERVER=s].T IN '' [ODBC;DSN=s]\nWHERE B = 'ODBC' OR C = \"x\";",
+            "SELECT a FROM [ODBC;DSN=z].T\nUNION ALL SELECT b FROM U IN '' [ODBC];",
+            "SELECT A INTO New IN '\\\\srv\\x.mdb' [ODBC;DSN=m];",
+            "INSERT INTO T IN ''\nVALUES (1);"], texts
+        for secret in ("secret", "u1", "u2", "u3", "u4", "u5", "user1", "UID", "PWD", "Password"):
+            assert secret not in md, (secret, md)
+        assert "query" not in ctx.skipped
+
+
+def test_passthrough_shown_as_stored():
+    # a pass-through query's stored text is the document's content, shown as stored; its connect string is not
+    stored = "SELECT * FROM x WHERE n = 'PWD=p;UID=u'"
+    q = Query("P", [(1, stored + "\0", 8, "ODBC;DSN=a;UID=u9;PWD=secret1", None)], flags=0x70)
+    doc, ctx, md = convert(jet_db(1, [], queries=[q]))
+    assert queries(doc)[0].blocks[0].text == stored and "query" not in ctx.skipped
+    assert "secret1" not in md and "DSN=a" not in md and "u9" not in md
+
+
+def test_query_control_characters():
+    q = Query("Q", [(1, None, 1, None, None), (6, "'a\x01b\x7f'\tc", None, None, None),
+                    (8, "x\r\ny", None, None, None)])
+    doc, _, md = convert(jet_db(1, [], queries=[q]))
+    got = queries(doc)[0].blocks[0].text
+    assert got == "SELECT 'a b '\tc\nWHERE x\r\ny;" and "```sql\nSELECT 'a b '\tc\nWHERE x\ny;\n```" in md, repr(got)
+
+
+def test_query_rows_cut():
+    # past JET_QUERY_ROWS rows, a query's rows are not kept: its heading alone, counted `query`; the others read
+    many = [(1, None, 1, None, None)] + [(6, "a", None, None, None)] * 4
+    old = jet_sql.JET_QUERY_ROWS
+    try:
+        jet_sql.JET_QUERY_ROWS = 4
+        data = jet_db(1, [], queries=[Query("Many", many), Query("Few", many[:4])])
+        doc, ctx, _ = convert(data)
+        db = jet._Db(jet_pages.open(data), Context())
+        catalog = jet._catalog(db)
+        got = jet._query_rows(db, catalog, [o for o in catalog if o.type == jet.QUERY])
+        assert [None if r is None else len(r) for r in got.values()] == [None, 4]  # not held past the cap
+    finally:
+        jet_sql.JET_QUERY_ROWS = old
+    assert [len(q.blocks) for q in queries(doc)] == [0, 1] and ctx.skipped == {"query": 1}, ctx.skipped
+    # a Memo past eight times JET_SQL bytes is not read: its query's rows are not kept
+    old = jet_sql.JET_SQL
+    try:
+        jet_sql.JET_SQL = 100
+        big = [(1, None, 1, None, None), (6, "x" * 1_000, None, None, None)]
+        doc, ctx, _ = convert(jet_db(1, [], queries=[Query("Big", big), Query("S", select_rows())]))
+    finally:
+        jet_sql.JET_SQL = old
+    assert [len(q.blocks) for q in queries(doc)] == [0, 1] and ctx.skipped == {"query": 1}, ctx.skipped
+
+
+def test_query_room():
+    # the rows kept take a room of four times the file's bytes (a row 128 bytes and its strings): many small rows
+    # pass it, and that query's rows are dropped, counted `query`
+    n = 9_000
+    data = jet_db(1, [], queries=[Query("Big", [(1, None, 1, None, None)] + [(6, "a", None, "b", "c")] * n)])
+    assert n * (128 + 3 * sys.getsizeof("a")) > 4 * len(data), len(data)
+    doc, ctx, _ = convert(data)
+    assert [q.blocks for q in queries(doc)] == [[]] and ctx.skipped == {"query": 1}, ctx.skipped
+    db = jet._Db(jet_pages.open(data), Context())
+    catalog = jet._catalog(db)
+    got = jet._query_rows(db, catalog, [o for o in catalog if o.type == jet.QUERY])
+    assert list(got.values()) == [None]
+
+
+def broken_query_row(data):
+    """`data` with one MSysQueries row turned into a pointer to a page past the file (in memory)."""
+    data = bytearray(data)
+    pages = jet_pages.open(bytes(data))
+    pg = data_pages(pages, tdef_page(data, "MSysQueries"))[0]
+    at = pg * 4096 + 14
+    loc = struct.unpack_from("<H", data, at)[0]
+    struct.pack_into("<H", data, at, (loc & 0x1FFF) | 0x4000)
+    row = pg * 4096 + (loc & 0x1FFF)
+    data[row:row + 4] = bytes([0]) + (pages.pages + 9).to_bytes(3, "little")
+    return bytes(data)
+
+
+def test_unreadable_query_row():
+    # a row of MSysQueries that cannot be read names no query, so no query's SQL is trusted: every heading alone
+    data = broken_query_row(jet_db(1, [three()], queries=[Query("A", select_rows()), Query("B", select_rows())]))
+    doc, ctx, md = convert(data)
+    assert [q.blocks for q in queries(doc)] == [[], []] and ctx.skipped["query"] == 2, ctx.skipped
+    assert ctx.skipped["record"] == 1 and "## Table: Orders" in md
+
+
+def test_query_meter():
+    # the meter running out: no SQL is written, the headings stay, counted `query`; sql() never runs past it
+    data = jet_db(1, [], queries=[Query("A", select_rows()), Query("B", select_rows())])
+    db = jet._Db(jet_pages.open(data), Context())
+    catalog = jet._catalog(db)
+    qs = [o for o in catalog if o.type == jet.QUERY]
+    rows = jet._query_rows(db, catalog, qs)
+    db.meter.total = db.meter.spent + jet._QUERY + 2
+    sec = jet._query(db, qs[0], rows[qs[0].id])
+    assert sec.blocks == [] and db.ctx.skipped == {"query": 1} and not db.meter.over, db.ctx.skipped
+    sec = jet._query(db, qs[1], rows[qs[1].id])
+    assert sec.title == "B" and sec.blocks == [] and db.ctx.skipped == {"query": 2}
+    for total in (200, 2_000, 20_000):  # a small total for the whole file: whatever it reaches, it ends
+        old = limits.JET_WORK_TOTAL
+        try:
+            limits.JET_WORK_TOTAL = total
+            doc, ctx, _ = convert(data)
+        finally:
+            limits.JET_WORK_TOTAL = old
+        assert len(queries(doc)) + ctx.skipped["record"] >= 1
+
+
+def test_query_rows_charged():
+    # 3,000 rows of one query: each is charged (`_QROW`, its cells and text as any table's) before it is made
+    n = 3_000
+    data = jet_db(1, [], queries=[Query("Q", [(1, None, 1, None, None)] + [(6, "abc", None, "x", None)] * n)])
+    db = jet._Db(jet_pages.open(data), Context())
+    catalog = jet._catalog(db)
+    before = db.meter.charged
+    with Loops() as loops:
+        got = jet._query_rows(db, catalog, [o for o in catalog if o.type == jet.QUERY])
+    spent = db.meter.charged - before
+    assert [len(r) for r in got.values()] == [n + 1]
+    assert spent >= n * (jet._QROW + jet._ROW) and loops.n <= 2 * spent + 16, (loops.n, spent)
+    # a row of another object is skipped before its text is read: none of these is a query asked for
+    db = jet._Db(jet_pages.open(data), Context())
+    catalog = jet._catalog(db)
+    before = db.meter.charged
+    assert jet._query_rows(db, catalog, []) == {}
+    assert db.meter.charged - before < spent - n * jet._QROW
+
+
+def test_query_work_charged():
+    # a query's SQL is charged `_SQL` times `jet_sql.work` before it is written: 300 parameters, 200 tables joined
+    rows = [(1, None, 1, None, None)] + [(2, None, 4, "F!x" * 40, None)] * 300 \
+        + [(5, None, None, f"T{i}", None) for i in range(200)] \
+        + [(7, "c", 1, f"T{i}", f"T{i + 1}") for i in range(60)] + [(7, "d", 1, "T0", "T1")] * 500
+    data = jet_db(1, [], queries=[Query("Q", rows)])
+    db = jet._Db(jet_pages.open(data), Context())
+    catalog = jet._catalog(db)
+    (q,) = [o for o in catalog if o.type == jet.QUERY]
+    got = jet._query_rows(db, catalog, [q])[q.id]
+    db.meter.total = 10 ** 12
+    before = db.meter.charged
+    with Loops() as loops:
+        sec = jet._query(db, q, got)
+    spent = db.meter.charged - before
+    assert sec.blocks[0].text.startswith("PARAMETERS ") and "(d) AND (d)" in sec.blocks[0].text
+    assert spent >= jet._QUERY + jet._SQL * jet_sql.work(got) and loops.n <= 2 * spent + 16, (loops.n, spent)
+    # past what the meter has left the work is not done: the heading alone
+    db.meter.total = db.meter.spent + jet._SQL * jet_sql.work(got)
+    sec = jet._query(db, q, got)
+    assert sec.blocks == [] and db.ctx.skipped == {"query": 1}
+
+
+def test_query_connect_charged():
+    # a connect string of 20,000 parts in a query: its characters and parts are charged before it is split
+    db = jet._Db(jet_pages.open(jet_db(1)), Context())
+    s = "ODBC;" + "A=1;" * 20_000 + "PWD=x;DSN=d"
+    before = db.meter.charged
+    with Loops() as loops:
+        got = jet._clean_connect(db, s)
+    spent = db.meter.charged - before
+    assert got == "ODBC;DSN=d" and loops.n <= 2 * spent + 16, (loops.n, spent)
+    assert spent >= len(s) + jet._PART * s.count(";"), spent
+    # cleaning is idempotent (the scrub of the finished text cleans a bracketed group again), and showing less
+    for s in ("ODBC;DSN=a;UID=u;PWD=p", "\\\\h\\d.mdb", "DRIVER={x;y};SERVER=s", "https://u:p@h/d", "a;;DSN=b;",
+              "PWD={unclosed", "ODBC; DSN = x ;"):
+        once = jet._clean_connect(db, s)
+        assert jet._clean_connect(db, once) == once and "p@" not in once and "PWD" not in once, (s, once)
+    assert jet._clean_connect(db, "PWD={unclosed") == "" and jet._clean_connect(db, "a;;DSN=b;") == "a;;DSN=b;"
+    assert jet._clean_connect(db, "https://u:p@h/d") == ""
+
+
+def test_query_mutations_end():
+    # in-memory mutations of a file holding many query shapes: each parse ends, its loops bounded by its charges
+    rng = random.Random(20261117)
+    clean = [jet_db(v, [three()], queries=guard_queries()) for v in (0, 1, 3)]
+    for k in range(120):
+        data = mutate(rng, clean[k % 3])
+        ctx, w = metered(data)
+        assert isinstance(w.out, (jet.Doc, ReadError)), (k, w.out)
+        w.bounded(len(data))
 
 
 def main():
