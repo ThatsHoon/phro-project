@@ -21,6 +21,7 @@ from reader.containers import crypto, flate  # noqa: E402
 from reader.formats import jet, jet_pages, sheet_grid  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Break, Context, Hidden, Image, Link, Para, Section, Table, Text  # noqa: E402
+import jet_fix  # noqa: E402
 from jet_fix import (Col, Query, Row, Tbl, jet_db, BINARY, BIGINT, BOOL, BYTE, COMPLEX, DATE, DOUBLE,  # noqa: E402
                      EXTDATE, FLOAT, GUID, INT, LONG, MEMO, MONEY, NUMERIC, OLE, TEXT)
 
@@ -212,7 +213,12 @@ def test_text_forms():
     assert j4.text(b"\xff\xfeab\x00" + "한".encode("utf-16-le") + b"\x00c", True) == "ab한c"
     assert j4.text(b"\xff\xfeab\x00" + "dé".encode("utf-16-le"), True) == "abdé"  # 64 00: the 00 is the high byte
     assert j4.text(b"\xff\xfe", True) == "" and j4.text(b"\xff\xfe\x00\x00", True) == ""
-    assert j4.text(b"\xff\xfeab", False) == "﻿扡"  # not allowed the compressed form: plain UCS-2
+    # no flag: the FF FE header decides (Jackcess `decodeTextValue`), unless the compressed reading is not valid (a
+    # two-byte segment that is not UTF-16, a control character), then plain UCS-2; a name (None) is never compressed
+    assert j4.text(b"\xff\xfeab", False) == "ab"
+    assert j4.text(b"\xff\xfeab\x00" + "한".encode("utf-16-le"), False) == "ab한"
+    assert j4.text(b"\xff\xfe\x00\x01", False) == "\ufeff\u0100" and j4.text(b"\xff\xfe\x01a", False) == "\ufeff\u6101"
+    assert j4.text(b"\xff\xfeab", None) == "\ufeff\u6261"
     assert j4.text(b"a\x00b", False) == "a�"  # an odd byte left over
     assert jet_pages.open(jet_db(6)).text(b"\xff\xfeok", True) == "ok"
 
@@ -412,12 +418,24 @@ def test_system_tables_absent():
 
 
 def test_compressed_flag():
-    # a flagged column's FF FE value is the compressed form; an unflagged one is plain UCS-2 even when it starts FF FE
-    cols = [Col("Flagged", TEXT), Col("Plain", TEXT, compressed=False)]
-    data = jet_db(1, [Tbl("Flags", cols, [["abc", "﻿xy"]])])
-    assert b"\xff\xfeabc" in data and "﻿xy".encode("utf-16-le") in data
+    # a flagged column's FF FE value is the compressed form. So is an unflagged one's, as Access writes them and as
+    # Jackcess reads them (the header decides), in a Text cell and a Memo; a plain UCS-2 value whose compressed reading
+    # is not valid (U+FEFF U+0100: a one-byte two-byte segment) stays UCS-2
+    cols = [Col("Flagged", TEXT), Col("Plain", TEXT, compressed=False), Col("Bare", TEXT, compressed="unflagged"),
+            Col("Note", MEMO, compressed="unflagged")]
+    note = "note " * 49 + "end"
+    data = jet_db(1, [Tbl("Flags", cols, [["abc", "\ufeff\u0100", "def", note]])])
+    assert b"\xff\xfeabc" in data and b"\xff\xfedef" in data and b"\xff\xfenote" in data
+    db = jet._Db(jet_pages.open(data), Context())
+    tdef = jet._tdef(db, tdef_page(data, "Flags"))
+    assert [c.ext for c in tdef.columns] == [1, 0, 0, 0]
     doc, ctx, _ = convert(data)
-    assert grid(section(doc, "Flags"))[1] == ["abc", "﻿xy"]
+    assert grid(section(doc, "Flags"))[1] == ["abc", "\ufeff\u0100", "def", note] and not ctx.skipped
+    # the same in Jet3's neighbour ACE, and in a multi-value value (a flat table's cell)
+    t = Tbl("M", [Col("ID", LONG), Col("V", COMPLEX, multi=TEXT)], [[1, ["red", "blue"]]])
+    doc, _, _ = convert(jet_db(3, [Tbl("Flags", cols, [["abc", "\ufeff\u0100", "def", note]]), t]))
+    assert grid(section(doc, "Flags"))[1] == ["abc", "\ufeff\u0100", "def", note]
+    assert grid(section(doc, "M"))[1] == ["1", "red; blue"]
 
 
 def test_hidden_table():
@@ -1938,6 +1956,9 @@ def test_object_names():
     assert summary_lines(doc)[1:] == ["Reports: Sales, Q4 (names only)."] and not ctx.skipped
     doc, ctx, _ = convert(jet_db(1, [three()]))
     assert summary_lines(doc) == ["Access 2000-2003 database (Jet 4): 1 table."] and not ctx.skipped
+    # Access's temporary objects (names starting "~", hidden in its navigation pane) are left out
+    doc, ctx, _ = convert(jet_db(1, [three()], objects=[("~TMPCLP1", -32766), ("F", -32768), ("~m", -32761)]))
+    assert summary_lines(doc)[1:] == ["Forms: F (names only)."] and not ctx.skipped, (summary_lines(doc), ctx.skipped)
 
 
 def test_linked_table():
@@ -1967,6 +1988,44 @@ def test_linked_table():
     # forms and linked tables together: line 2, then line 3
     doc, _, _ = convert(jet_db(1, [three()], objects=[("F", -32768)], linked=linked[2:]))
     assert summary_lines(doc)[1:] == ["Forms: F (names only).", "Linked tables: T2 → Z:\\db\\other.accdb (Table1)"]
+
+
+def test_linked_credentials():
+    # no credential reaches the line, however the string is written: ODBC braces with }} escapes, quotes, keys with
+    # spaces, case, other secret keys, a Database cell or DATABASE value holding one, a URL's user part; a string
+    # that cannot be parsed cleanly shows only the file name of a DATABASE= read before the fault, or nothing
+    db = jet._Db(jet_pages.open(jet_db(1)), Context())
+    cases = [
+        ("ODBC;DRIVER={SQL Server};SERVER=s;UID=u;PWD={pa}}ss;wo}rd};APP=x", "", ""),
+        ("ODBC;DRIVER={SQL Server};SERVER=s;UID=u;PWD={pa}}ss;wo}}rd};APP=x", "",
+         "ODBC;DRIVER={SQL Server};SERVER=s;APP=x"),
+        ("ODBC;DATABASE=C:\\d\\a.mdb;PWD={x;s3cret", "", "a.mdb"),
+        ("MS Access;Jet OLEDB:Database Password=s3cret", "", "MS Access"),
+        ("ODBC;DSN=x;PASS=s3cret", "", "ODBC;DSN=x"),
+        ("ODBC;DSN=x; P W D =s3cret", "", "ODBC;DSN=x"),
+        ("ODBC;DSN=x;PWD=\"a;s3cret\"", "", "ODBC;DSN=x"),
+        ("ODBC;DSN=x;PWD='a;s3cret';APP=y", "", "ODBC;DSN=x;APP=y"),
+        ("ODBC;DSN=x;PWD=\"a;s3cret", "", ""),
+        ("MS Access;PWD=s3cret", "C:\\a.accdb;PWD=s3cret", "MS Access"),
+        ("MS Access;PWD=s3cret", "C:\\a.accdb", "C:\\a.accdb"),
+        ("ODBC;DATABASE={C:\\a;PWD=s3cret}", "", "ODBC"),
+        ("ODBC;DATABASE=https://u:s3cret@h/x", "", "https://h/x"),
+        ("ODBC;DSN=x;PWD\u00a0=s3cret", "", "ODBC;DSN=x"),
+        ("ODBC;DSN=x;\uff30\uff37\uff24=s3cret", "", "ODBC;DSN=x"),
+        ("ODBC;DSN=x;\tPWD=s3cret", "", "ODBC;DSN=x"),
+        ("ODBC;DSN=x\nPWD=s3cret", "", "ODBC"),
+        ("ODBC;DATABASE=;PWD=s3cret", "", "ODBC"),
+        (";PWD=s3cret", "", ""),
+        ("ODBC;DSN=x;Trusted_Connection=Yes;Token=s3cret;AccessToken=s3cret", "", "ODBC;DSN=x;Trusted_Connection=Yes"),
+        ("ODBC;DSN=x;s3cret", "", "ODBC;DSN=x"),
+    ]
+    for connect, database, want in cases:
+        got = jet._linked_target(db, connect, database)
+        assert got == want and "s3cret" not in got and "ss;" not in got and "rd}" not in got, (connect, got)
+    # a foreign name holding a connect string's marks is dropped
+    data = jet_db(1, [three()], linked=[("P", "ODBC;DSN=x", "dbo.T;PWD=s3cret")])
+    doc, _, md = convert(data)
+    assert summary_lines(doc)[1] == "Linked tables: P → ODBC;DSN=x" and "s3cret" not in md, summary_lines(doc)
 
 
 def test_linked_connect_as_text():
@@ -2283,15 +2342,103 @@ def test_attachment_rows_charged():
     data = jet_db(3, [docs([[1, [("big.png", big, True)]]])])
     db, tdef, objs = complex_spend(data, "Docs")
     info = jet._complex_info(db, objs, tdef, tdef.columns[1])
-    before = db.meter.charged
+    before, kept = db.meter.charged, db.meter.spent
     (pic,) = info.pictures(db, 1, "Docs 1", False)
-    spent = db.meter.charged - before
-    assert pic.data == big and spent >= len(big) // jet._INFLATE, spent
+    spent, kept = db.meter.charged - before, db.meter.spent - kept
+    # what it may produce is charged before, what it did not produce given back: kept, the output (and a pass)
+    assert pic.data == big and spent >= kept >= len(big) // jet._INFLATE, (spent, kept)
     # with less left on the meter than the picture costs, inflation stops there: no picture, counted `image`
     db, tdef, objs = complex_spend(data, "Docs")
     info = jet._complex_info(db, objs, tdef, tdef.columns[1])
     db.meter.spent = db.meter.total - 5_000
     assert info.pictures(db, 1, "Docs 1", False) == [] and db.ctx.skipped == {"image": 1}, db.ctx.skipped
+
+
+def shared_lvals():
+    """The fixture writer with one long value for equal bytes, as many flat rows naming one LVAL row look."""
+    orig = jet_fix._Writer.long_value
+    memo = {}
+
+    def lv(self, data):
+        k = bytes(data)
+        if k not in memo:
+            memo[k] = orig(self, data)
+        return memo[k]
+    return orig, lv
+
+
+def test_inflate_charged():
+    # a deflated bomb past ZIP_RATIO: the most inflation may produce is charged before it runs, kept when it fails
+    bomb = bytes(1_200_000)
+    data = jet_db(3, [docs([[1, [("b.png", bomb, True)]]])])
+    db, tdef, objs = complex_spend(data, "Docs")
+    info = jet._complex_info(db, objs, tdef, tdef.columns[1])
+    before = db.meter.charged
+    assert info.pictures(db, 1, "Docs 1", False) == [] and db.ctx.skipped == {"image": 1}
+    one = db.meter.charged - before
+    assert one >= limits.ZIP_RATIO_FLOOR // jet._INFLATE, one
+    # many attachments naming one LVAL row: the bomb is inflated (and paid) once, each repeat counted `image`
+    orig, lv = shared_lvals()
+    jet_fix._Writer.long_value = lv
+    try:
+        data = jet_db(3, [docs([[1, [(f"b{i}.png", bomb, True) for i in range(40)]]])])
+    finally:
+        jet_fix._Writer.long_value = orig
+    calls = []
+    real = flate.inflate
+
+    def spy(d, budget, limit=None):
+        calls.append(len(d))
+        return real(d, budget, limit)
+    db, tdef, objs = complex_spend(data, "Docs")
+    info = jet._complex_info(db, objs, tdef, tdef.columns[1])
+    before = db.meter.charged
+    flate.inflate = spy
+    try:
+        assert info.pictures(db, 1, "Docs 1", False) == []
+    finally:
+        flate.inflate = real
+    spent = db.meter.charged - before
+    assert len(calls) == 1 and db.ctx.skipped == {"image": 40}, (calls, db.ctx.skipped)
+    assert spent < one + 40 * (jet._CPLX + jet._ROW_COST) + 4_000, (spent, one)
+    # a good picture named by many rows: inflated once, each repeat shown and taking its bytes of the budget again
+    orig, lv = shared_lvals()
+    jet_fix._Writer.long_value = lv
+    try:
+        data = jet_db(3, [docs([[1, [(f"p{i}.png", PNG, True) for i in range(5)]]])])
+    finally:
+        jet_fix._Writer.long_value = orig
+    calls.clear()
+    flate.inflate = spy
+    try:
+        doc, ctx, _ = convert(data)
+    finally:
+        flate.inflate = real
+    pics = images(section(doc, "Docs"))
+    assert len(calls) == 1 and [p.data for p in pics] == [PNG] * 5 and not ctx.skipped, (calls, ctx.skipped)
+
+
+def test_pictures_kept_one_by_one():
+    # the meter running out in the middle of a row's pictures keeps those already made
+    data = jet_db(3, [docs([[1, [(f"p{i}.png", PNG, True) for i in range(3)]]])])
+    db, tdef, objs = complex_spend(data, "Docs")
+    info = jet._complex_info(db, objs, tdef, tdef.columns[1])
+    real, calls = jet._picture, []
+
+    def fake(db, definition):
+        calls.append(1)
+        if len(calls) == 2:
+            raise jet._Spent
+        return real(db, definition)
+    out = []
+    jet._picture = fake
+    try:
+        info.pictures(db, 1, "Docs 1", False, out)
+    except jet._Spent:
+        pass
+    finally:
+        jet._picture = real
+    assert [p.alt for p in out] == ["Docs 1: p0.png"], out
 
 
 def test_connect_charged():
@@ -2304,6 +2451,14 @@ def test_connect_charged():
     spent = db.meter.charged - before
     assert target == "d" and loops.n <= 2 * spent + 16, (loops.n, spent)
     assert spent >= len(s) + jet._PART * s.count(";"), spent
+    # a braced value of 20,000 escaped "}}": each brace is charged as a part before the value is scanned
+    s = "DSN=x;A={" + "}}" * 20_000 + "};DATABASE=d"
+    before = db.meter.charged
+    with Loops() as loops:
+        target = jet._linked_target(db, s, "")
+    spent = db.meter.charged - before
+    assert target == "d" and loops.n <= 2 * spent + 16, (loops.n, spent)
+    assert spent >= len(s) + jet._PART * s.count("}"), spent
     # kept within the room: past it the target is dropped, counted `record`
     data = jet_db(1, linked=[("P", ";DATABASE=" + "p" * 3_000, "P")])
     db = jet._Db(jet_pages.open(data), Context())

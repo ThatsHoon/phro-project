@@ -42,6 +42,7 @@ cheaper way out only when it fits. So the work of a file is at most a constant t
 work of the grid's cells, whatever its bytes say.
 """
 import codecs
+import re
 import struct
 from collections import OrderedDict
 
@@ -54,6 +55,8 @@ HEADER_KEY = b"\xc7\xda\x39\x6b"
 VERSIONS = {0: "Jet3", 1: "Jet4", 2: "ACE12", 3: "ACE14", 5: "ACE16", 6: "ACE17"}
 ENGINES = (b"Standard Jet DB", b"Standard ACE DB")
 MSISAM = b"MSISAM Database"
+# what a compressed reading of an unflagged value may not hold: an invalid two-byte segment, a control character
+_INVALID = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffd]")
 USAGE_PAGE = 0x05
 _MAP_INLINE, _MAP_REFERENCE = 0, 1
 _MAP_DATA = 4  # where the bitmap starts on a type 5 page (Jackcess OFFSET_USAGE_MAP_PAGE_DATA)
@@ -238,15 +241,26 @@ class Jet:
                         out.append(pg)
         return out
 
-    def text(self, raw: bytes, compressed: bool) -> str:
-        """A text value: Jet3 bytes in `codepage`; Jet4 and ACE UCS-2, or, when `compressed` (the column's
-        compressed unicode flag) and the value starts `FF FE`, the compressed form: one-byte mode first, every
-        0x00 at a character boundary switching between one-byte and two-byte mode (Jackcess `decodeTextValue`)."""
+    def text(self, raw: bytes, compressed) -> str:
+        """A text value: Jet3 bytes in `codepage`; Jet4 and ACE UCS-2, or, when the value starts `FF FE`, the
+        compressed form: one-byte mode first, every 0x00 at a character boundary switching between one-byte and
+        two-byte mode (Jackcess `decodeTextValue`, which decides by the header alone; Access writes unflagged columns
+        so too). `compressed` is the column's compressed unicode flag: when it is set the compressed reading stands;
+        when it is not, a compressed reading that is not valid (a two-byte segment that is not UTF-16, or a control
+        character other than tab, LF and CR) gives way to plain UCS-2. None is a name Jackcess reads uncompressed (a
+        TDEF's column names, a property blob's names): always UCS-2."""
         raw = bytes(raw)
         if self.version == 0:
             return raw.decode(self.codepage, "replace")
-        if not (compressed and raw[:2] == b"\xff\xfe"):
+        if compressed is None or raw[:2] != b"\xff\xfe":
             return raw.decode("utf-16-le", "replace")
+        s = self._compressed(raw)
+        if compressed or not _INVALID.search(s):
+            return s
+        return raw.decode("utf-16-le", "replace")
+
+    @staticmethod
+    def _compressed(raw: bytes) -> str:
         out = []
         start = 2
         one = True

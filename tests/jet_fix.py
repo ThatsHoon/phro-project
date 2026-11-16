@@ -18,7 +18,8 @@ Values by column type: None is null; BOOL any truth value (its null-mask bit); i
 COMPLEX, BIGINT and MONEY (raw units of 1/10,000); floats for FLOAT, DOUBLE and DATE (days since 1899-12-30); str
 for TEXT and MEMO (in Jet4 and ACE a column of a user table carries the compressed unicode flag, ext 0x01, unless
 `Col(compressed=False)`, and a flagged value of 1 to 1,024 characters all in U+0001-U+00FF is stored in the compressed
-form, as Jackcess does; the system tables' columns are unflagged plain UCS-2, as in real files); bytes for BINARY and
+form, as Jackcess does; `Col(compressed="unflagged")` stores that form with the flag unset, as Access does in some
+real files; the system tables' columns are unflagged plain UCS-2, as in real files); bytes for BINARY and
 OLE; for NUMERIC the unscaled integer (its sign byte and four little-endian u32 parts, the most significant first),
 with `Col(precision=, scale=)` in the column block. Bytes given for any other column are written as they are (fixed
 columns padded or cut to their size), so a test can store any raw value. A long value (MEMO, OLE) of at most 64
@@ -223,7 +224,8 @@ class _Writer:
             fixed = c.type in FIXED and c.calc is None
             length = c.length or FIXED.get(c.type) or {TEXT: 255 if self.j3 else 510, BINARY: 255}.get(c.type, 0)
             flags = (c.flags & ~0x01) | (0x01 if fixed else 0) | (0x10 if system else 0)
-            ext = 0x01 if (not self.j3 and not system and c.type in (TEXT, MEMO) and c.compressed is not False) else 0
+            ext = 0x01 if (not self.j3 and not system and c.type in (TEXT, MEMO)
+                           and c.compressed not in (False, "unflagged")) else 0
             if c.calc is not None:
                 ext = 0xC0
             if c.ext is not None:
@@ -261,7 +263,7 @@ class _Writer:
         if c.calc is not None:
             return self.calc_value(c, v)
         if isinstance(v, str):
-            v = self.text(v, bool(x["ext"] & 0x01))
+            v = self.text(v, bool(x["ext"] & 0x01) or c.compressed == "unflagged")
         if c.type in LONG_VALUES:
             return self.long_value(bytes(v))
         return bytes(v)

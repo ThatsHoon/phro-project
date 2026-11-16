@@ -103,9 +103,10 @@ character of a text key), the sort (`_SORT` times n times the bits of n, through
 the rows stay in page order) and each relationship target written (`_REF`); MSysRelationships', MSysComplexColumns'
 and the flat tables' rows as any table's; the catalog looked through for the type tables (a unit an object); each
 complex value joined (`_CPLX` and a unit a character), each attachment looked at for a picture (`_CPLX`) and each
-picture read (`_ROW_COST`, its long value as any, its inflated bytes `_INFLATE` a unit, inflation stopping at what
-the meter has left); each connect string's characters and parts (`_PART`); each name in the summary (`_NAME`); each
-character of a calculated column's expression.
+picture read (`_ROW_COST`, its long value as any, and twice the most its inflation may produce, `_INFLATE` bytes a
+unit, charged before it runs, kept when it fails; a definition decoded once); each connect string's characters and
+marks (`_PART` a ";", "}" or quote); each name in the summary (`_NAME`); each character of a calculated column's
+expression.
 In `jet_pages` each RC4 page, chain item and usage map byte. The prices are measured, each at least what its path
 costs. A real file is charged a few units a byte of itself. Past the total: the table being read stops with one
 `sheet_cut` (the grid's own cut, the rows held so far shown in page order); a table not yet started is not read at all
@@ -198,7 +199,7 @@ _REF = 8       # a relationship target written in the schema line (two names of 
 _CPLX = 8      # a value of a complex cell joined, or a file looked at for a picture (and a unit a character joined)
 _PART = 4      # a part of a linked table's connect string (and a unit a character)
 _NAME = 8      # an object or linked table named in the summary (a name of up to JET_NAME, its target already charged)
-_INFLATE = 64  # inflated bytes of an attachment a unit (zlib's own loop: the meter's room bounds its output)
+_INFLATE = 64  # inflated bytes of an attachment a unit (charged before zlib's own loop, the most it may produce)
 _KEEP = 256    # the room a kept value takes beside its text (key, tuples, a dict slot)
 _Spent = jet_pages.Spent
 _PK = 1  # IndexImpl.PRIMARY_KEY_INDEX_TYPE
@@ -211,7 +212,10 @@ _PAGE8 = 0x08              # a page type of ACE 14 and later that holds no rows 
 # Access's replication columns (`s_Generation` and the like), hidden; `Gen_X` too when X is a column of its table
 _REPLICATION = frozenset(("s_guid", "s_lineage", "s_generation", "s_collineage"))
 _CALC_TYPES = frozenset((BOOL, BYTE, INT, LONG, MONEY, FLOAT, DOUBLE, DATE, TEXT, MEMO, GUID, NUMERIC, BIGINT))
-_SECRETS = frozenset(("pwd", "uid", "password", "user id"))  # connect string parts never shown
+# the connect string keys shown when it names no DATABASE= (every other key, a credential's too, is left out)
+_SAFE_KEYS = frozenset(("dsn", "driver", "server", "dbq", "database", "data source", "provider", "host", "port", "app",
+                        "trusted_connection"))
+_USERINFO = re.compile(r"(?<=//)[^/@\s]*@")
 _PICTURES = frozenset(("jpg", "jpeg", "png", "gif"))
 _PROP_HEADS = (b"KKD\x00", b"MR2\x00")  # JetFormat.PROPERTY_MAP_TYPES: Jet3, then Jet4 and ACE
 _PROP_NAMES, _PROP_DEFAULT, _PROP_COLUMN, _PROP_INDEX = 0x80, 0x00, 0x01, 0x02  # PropertyMaps' chunk types
@@ -346,6 +350,7 @@ class _Db:
         self.images = flate.Budget(limits.IMAGE_BYTES)  # every attachment's picture bytes, one budget a document
         self.cplx = None  # MSysComplexColumns (`_complex_columns`), read once when a complex column is first met
         self.cplx_info = {}  # complex id -> its `_Complex` (False when it cannot be read)
+        self.pictures = {}  # an attachment's FileData definition -> its picture's bytes, or None (`_picture`)
 
     @property
     def spent(self) -> int:
@@ -619,7 +624,7 @@ def _tdef(db: _Db, page: int) -> Tdef:
         if pos + n > len(b):
             raise ValueError("column name past the table definition")
         db.charge(n)
-        names.append(db.name(jet.text(b[pos:pos + n], False)))
+        names.append(db.name(jet.text(b[pos:pos + n], None)))
         pos += n
     cols = []
     folded = {n.casefold() for n in names}
@@ -702,7 +707,7 @@ def _prop_name(db: _Db, blob: bytes, pos: int, stop: int):
     if n < 0 or pos + n > stop:
         raise ValueError(f"property name of {n} bytes")
     db.charge(n)
-    return db.jet.text(blob[pos:pos + n], False), pos + n
+    return db.jet.text(blob[pos:pos + n], None), pos + n
 
 
 def _prop_names(db: _Db, blob: bytes, pos: int, stop: int) -> list:
@@ -859,7 +864,9 @@ def _long(col: Column, raw):
 
 def _complex_kind(name):
     """The kind of complex column a type table's name says (`ComplexColumnSupport.create`): "attachment", "version",
-    "multi", "" for a name it does not know (the flat table's shape decides) or None when there is no such table."""
+    "multi", "" for a name it does not know (the flat table's shape decides) or None when there is no such table.
+    Jackcess judges by the type table's columns (`isAttachmentColumn`, `isVersionHistoryColumn`); the name is this
+    reader's departure, the shape in `_flat` its fallback."""
     if name is None:
         return None
     n = name.casefold()
@@ -946,10 +953,11 @@ class _Complex:
         out.fk, out.info = fk, self
         return out
 
-    def pictures(self, db: _Db, fk: int, alt: str, hidden: bool) -> list:
-        """The pictures (jpg, png, gif) of a row's attachments as Images, alt "<alt>: <file name>": each file charged
-        `_CPLX` before it is looked at, each picture `_ROW_COST` before it is read (`_picture`)."""
-        out = []
+    def pictures(self, db: _Db, fk: int, alt: str, hidden: bool, out=None) -> list:
+        """The pictures (jpg, png, gif) of a row's attachments as Images, alt "<alt>: <file name>", appended to `out`
+        one by one (so those made stay when the meter runs out on the next): each file charged `_CPLX` before it is
+        looked at, each picture `_ROW_COST` before it is read (`_picture`)."""
+        out = [] if out is None else out
         for name, definition in self.rows.get(fk, ()):
             db.charge(_CPLX)
             if definition is None:
@@ -1032,12 +1040,25 @@ def _flat(db: _Db, kind: str, page: int):
 
 def _picture(db: _Db, definition: bytes):
     """An attachment's file bytes (`AttachmentColumnInfoImpl.decodeData`): a u32 type (0 raw, 1 deflated), the
-    content's length, the content (a header: its length, then the extension; the file). The bytes come from the
+    content's length n, the content (a header: its length, then the extension; the file). The bytes come from the
     document's one `flate.Budget(IMAGE_BYTES)` (a raw file too), the deflated ones through `flate.inflate`, its output
-    no more than the meter has left (`_INFLATE` bytes a unit, charged after). None, counted `image`, past the budget or
-    when the wrapper cannot be read."""
+    no more than n (all Jackcess reads), than `flate`'s own cap, than the budget's room and than half of what the meter
+    has left at `_INFLATE` bytes a unit. That most, twice (`flate` may run two passes, raw deflate then zlib), is
+    charged before inflation: a failure keeps it all, a success gives back what its output fell short of that most
+    (keeping one whole pass and the output). A
+    definition is decoded once a document (`_Db.pictures`): a repeat takes its bytes of the budget again, or is counted
+    `image` again when it failed. None, counted `image`, past the budget or when the wrapper cannot be read."""
     budget = db.images
+    key = bytes(definition)
+    if key in db.pictures:
+        data = db.pictures[key]
+        if data is not None and len(data) <= budget.total - budget.used:
+            budget.used += len(data)
+            return data
+        db.ctx.skipped["image"] += 1
+        return None
     room = budget.total - budget.used
+    data = None
     try:
         if room <= 0:
             raise ReadError("too_large", "attachment pictures past IMAGE_BYTES")
@@ -1046,8 +1067,13 @@ def _picture(db: _Db, definition: bytes):
             raise ReadError("too_large", "attachment past IMAGE_BYTES")
         kind, n = struct.unpack_from("<iI", blob, 0)
         if kind == 1:
-            content = flate.inflate(blob[8:], budget, max(0, db.total - db.spent) * _INFLATE)
-            db.charge(len(content) // _INFLATE)
+            stream = blob[8:]
+            most = min(n, limits.CFB_STREAM, max(limits.ZIP_RATIO * len(stream), limits.ZIP_RATIO_FLOOR), room,
+                       max(0, db.total - db.spent - 1) * _INFLATE // 2)
+            reserved = 2 * most // _INFLATE + 1
+            db.charge(reserved)
+            content = flate.inflate(stream, budget, most)
+            db.meter.give((most - len(content)) // _INFLATE)  # the work: one pass of `most` at most, then the output
         elif kind == 0:
             content = blob[8:]
             if len(content) > room:
@@ -1058,10 +1084,12 @@ def _picture(db: _Db, definition: bytes):
         head = _u32(content, 0)
         if not 4 <= head <= n <= len(content):
             raise ValueError("attachment header past its data")
-        return bytes(content[head:n])
+        data = bytes(content[head:n])
     except (ReadError, *_BAD):
         db.ctx.skipped["image"] += 1
-        return None
+    if db.keep(len(key)):
+        db.pictures[key] = data
+    return data
 
 
 # -- rows
@@ -1478,6 +1506,8 @@ def _obj(db, cells, cell):
         connect, database, foreign = (_plain_text(db, *reversed(cell(cells, k, (None, None))))
                                       for k in ("connect", "database", "foreignname"))
         target, foreign = _linked_target(db, connect, database), db.name(foreign)
+        if ";" in foreign or "=" in foreign:  # a table name holding a connect string's marks: not shown
+            foreign = ""
         if db.keep(sys.getsizeof(target) + sys.getsizeof(foreign)):
             obj.connect, obj.foreign_name = target, foreign
         else:  # past the room: named without its target
@@ -1485,27 +1515,77 @@ def _obj(db, cells, cell):
     return obj
 
 
+def _connect_parts(s: str):
+    """A connect string's parts as (key, value, text), and whether it parsed cleanly. A part is `key=value` or a bare
+    token (key None); parts end at ";". A value may be {braced} (ODBC: it ends at a "}" not followed by "}", "}}" being
+    an escaped "}") or quoted with " or ' (a doubled quote escaped); either may hold ";" and "=", and only spaces may
+    follow it before the next ";". A brace or quote left open, or text after one, is not clean: the parts read before
+    it are returned with False. Keys are compared with their spaces collapsed, casefolded."""
+    parts, i, n = [], 0, len(s)
+    while i <= n:
+        j = s.find(";", i)
+        j = n if j < 0 else j
+        eq = s.find("=", i, j)
+        if eq < 0:
+            parts.append((None, s[i:j].strip(), s[i:j].strip()))
+            i = j + 1
+            continue
+        key = " ".join(s[i:eq].split()).casefold()
+        v = eq + 1
+        while v < j and s[v] in " \t":
+            v += 1
+        close = {"{": "}", '"': '"', "'": "'"}.get(s[v:v + 1]) if v < n else None
+        if close is None:
+            value = s[v:j].strip()
+        else:
+            pos = v + 1
+            while True:
+                k = s.find(close, pos)
+                if k < 0:
+                    return parts, False
+                if s[k + 1:k + 2] == close:  # an escaped "}}", or a doubled quote
+                    pos = k + 2
+                    continue
+                break
+            value = s[v:k + 1]
+            j = s.find(";", k + 1)
+            j = n if j < 0 else j
+            if s[k + 1:j].strip():
+                return parts, False
+        parts.append((key, value, f"{s[i:eq].strip()}={value}"))
+        i = j + 1
+    return parts, True
+
+
+def _safe_value(value: str) -> str:
+    """A value fit to show: its URL user part (`//user:password@`) taken out; "" when it holds ";", "=" or a
+    control character (what a value of a secret may spill into)."""
+    value = _USERINFO.sub("", value.strip())
+    return "" if ";" in value or "=" in value or _CONTROL.search(value) else value
+
+
 def _linked_target(db: _Db, connect: str, database: str) -> str:
-    """What a linked table's connect string names, on one line: its DATABASE= part, else the catalog's Database cell
-    (an Access link keeps its path there), else the string itself; PWD=, UID=, Password= and User ID= parts (any
-    case, a {braced} value whole) are never kept. Its characters and parts are charged before it is split."""
-    db.charge(len(connect) + _PART * connect.count(";"))
-    kept, target, braced = [], "", False
-    for part in connect.split(";"):
-        if braced:  # the rest of a secret's {braced} value
-            braced = "}" not in part
-            continue
-        key, eq, val = part.partition("=")
-        k = key.strip().casefold()
-        if eq and k in _SECRETS:
-            v = val.strip()
-            braced = v.startswith("{") and "}" not in v
-            continue
-        if eq and k == "database" and not target:
-            target = val.strip()
-        if part.strip():
-            kept.append(part)
-    return _CONTROL.sub(" ", target or database.strip() or ";".join(kept)).strip()
+    """What a linked table's connect string names, on one line, showing less rather than a credential: its DATABASE=
+    part, else the catalog's Database cell (an Access link keeps its path there; only when it holds no ";" or "="),
+    else the string's known safe parts (`_SAFE_KEYS`, and a bare first token such as "ODBC") joined with ";". Any other
+    key (PWD=, UID=, Jet OLEDB:Database Password=, Token= ...) is never shown, nor a value holding ";", "=" or a
+    control character, nor a URL's user part. A string that does not parse cleanly (`_connect_parts`) shows only the
+    file name of a DATABASE= read before the fault, or nothing. Its characters and marks are charged before it is
+    parsed."""
+    marks = connect.count(";") + connect.count("}") + connect.count('"') + connect.count("'") + 1
+    db.charge(len(connect) + _PART * marks)
+    parts, ok = _connect_parts(connect)
+    found = next((_safe_value(v) for k, v, _ in parts if k == "database"), "")
+    if not ok:
+        return _safe_value(re.split(r"[\\/]", found)[-1])
+    if found:
+        return found
+    cell = _safe_value(database)
+    if cell:
+        return cell
+    kept = [text for i, (k, v, text) in enumerate(parts)
+            if (k is None and i == 0 or k in _SAFE_KEYS) and _safe_value(v) == v.strip() and v.strip()]
+    return ";".join(kept)
 
 
 # -- output
@@ -1715,7 +1795,7 @@ def _table(db: _Db, obj: Obj, budget, rels: dict, objs=()):
             key = ", ".join(v for v in (got.get(k) for k in keys) if isinstance(v, str) and v) or str(r)
             try:
                 for i, v in files:
-                    pics.extend(v.info.pictures(db, v.fk, f"{obj.name} {key}", cols[i].hidden))
+                    v.info.pictures(db, v.fk, f"{obj.name} {key}", cols[i].hidden, pics)
             except _Spent:  # the rest of the table's pictures, counted once
                 pics_cut = True
                 db.ctx.skipped["image"] += 1
@@ -1805,14 +1885,15 @@ def parse_bytes(data, ctx) -> Doc:
 def _summary(db: _Db, catalog: list, line: str) -> list:
     """The summary paragraph's inlines: `line`; then, each on its own line, "Forms: … Reports: … Macros: … Modules: …
     (names only)." (each part only when it has names; a module counts `vba`) and "Linked tables: <name> → <target>
-    (<table>)" joined with "; " (counted `linked_data`). Each name is charged `_NAME` before it is written; the meter
-    running out (the catalog cut by it) ends the names there, counted `record` once."""
+    (<table>)" joined with "; " (counted `linked_data`). System objects and the temporary objects Access names with
+    a leading "~" (and hides in its navigation pane) are left out. Each name is charged `_NAME` before it is written;
+    the meter running out (the catalog cut by it) ends the names there, counted `record` once."""
     out = [Text(line)]
     groups = {FORM: [], REPORT: [], MACRO: [], MODULE: []}
     linked = []
     try:
         for o in catalog:
-            if o.flags & SYSTEM_FLAGS:
+            if o.flags & SYSTEM_FLAGS or o.name.startswith("~"):
                 continue
             if o.type in groups:
                 db.charge(_NAME)
