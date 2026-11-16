@@ -56,7 +56,8 @@ VERSIONS = {0: "Jet3", 1: "Jet4", 2: "ACE12", 3: "ACE14", 5: "ACE16", 6: "ACE17"
 ENGINES = (b"Standard Jet DB", b"Standard ACE DB")
 MSISAM = b"MSISAM Database"
 # what a compressed reading of an unflagged value may not hold: an invalid two-byte segment, a control character
-_INVALID = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffd]")
+# (tab, LF, VT, FF and CR are text a memo may hold)
+_INVALID = re.compile("[\x00-\x08\x0e-\x1f\x7f-\x9f\ufffd]")
 USAGE_PAGE = 0x05
 _MAP_INLINE, _MAP_REFERENCE = 0, 1
 _MAP_DATA = 4  # where the bitmap starts on a type 5 page (Jackcess OFFSET_USAGE_MAP_PAGE_DATA)
@@ -247,8 +248,8 @@ class Jet:
         two-byte mode (Jackcess `decodeTextValue`, which decides by the header alone; Access writes unflagged columns
         so too). `compressed` is the column's compressed unicode flag: when it is set the compressed reading stands;
         when it is not, a compressed reading that is not valid (a two-byte segment that is not UTF-16, or a control
-        character other than tab, LF and CR) gives way to plain UCS-2. None is a name Jackcess reads uncompressed (a
-        TDEF's column names, a property blob's names): always UCS-2."""
+        character other than tab, LF, VT, FF and CR) gives way to plain UCS-2. None is a name Jackcess reads
+        uncompressed (a TDEF's column names, a property blob's names): always UCS-2."""
         raw = bytes(raw)
         if self.version == 0:
             return raw.decode(self.codepage, "replace")

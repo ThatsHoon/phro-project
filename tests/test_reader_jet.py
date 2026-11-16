@@ -219,6 +219,8 @@ def test_text_forms():
     assert j4.text(b"\xff\xfeab\x00" + "한".encode("utf-16-le"), False) == "ab한"
     assert j4.text(b"\xff\xfe\x00\x01", False) == "\ufeff\u0100" and j4.text(b"\xff\xfe\x01a", False) == "\ufeff\u6101"
     assert j4.text(b"\xff\xfeab", None) == "\ufeff\u6261"
+    # VT and FF are text a memo may hold: the compressed reading stands
+    assert j4.text(b"\xff\xfea\x0bb\x0cc", False) == "a\x0bb\x0cc"
     assert j4.text(b"a\x00b", False) == "a�"  # an odd byte left over
     assert jet_pages.open(jet_db(6)).text(b"\xff\xfeok", True) == "ok"
 
@@ -2018,6 +2020,24 @@ def test_linked_credentials():
         (";PWD=s3cret", "", ""),
         ("ODBC;DSN=x;Trusted_Connection=Yes;Token=s3cret;AccessToken=s3cret", "", "ODBC;DSN=x;Trusted_Connection=Yes"),
         ("ODBC;DSN=x;s3cret", "", "ODBC;DSN=x"),
+        # URL user info as browsers read it (WHATWG): up to the authority's last "@", "\" as "/", any run of slashes
+        # after the scheme, spaces inside; bare user info in a safe key; a ":" before an "@" left anywhere
+        ("ODBC;DATABASE=https://u:p@s3cret@h/x", "", "https://h/x"),
+        ("MS Access;PWD=s3cret", "https://u:p@s3cret@h/x", "https://h/x"),
+        ("ODBC;DATABASE=https://u:p@s3cret@h/x;PWD={x", "", "x"),
+        ("ODBC;DATABASE=https://u:s3c ret@h/x", "", "https://h/x"),
+        ("ODBC;DATABASE=https://u:s3cr\u00a0et@h/x", "", "https://h/x"),
+        ("ODBC;DATABASE=http:\\\\u:s3cret@h", "", "http:\\\\h"),
+        ("ODBC;DATABASE=https:/u:s3cret@h/x", "", "https:/h/x"),
+        ("ODBC;DATABASE=\\\\u:s3cret@h\\d\\a.mdb", "", "\\\\h\\d\\a.mdb"),
+        ("ODBC;HOST=u:s3cret@h", "", "ODBC"),
+        ("ODBC;SERVER=u:s3cret@h;DSN=x", "", "ODBC;DSN=x"),
+        ("ODBC;DATABASE=https://h/u:s3cret@x", "", "ODBC"),
+        ("ODBC;DATABASE=https://u:s3c/ret@h/x", "", "ODBC"),
+        ("ODBC;DATABASE=https://u:s3c?ret@h/x", "", "ODBC"),
+        ("ODBC;DATABASE=https://u:s3c#ret@h/x", "", "ODBC"),
+        ("ODBC;DATABASE=https://h/x?a@b", "", "https://h/x?a@b"),
+        ("ODBC;DATABASE=C:\\a\\b@c.mdb", "", "C:\\a\\b@c.mdb"),
     ]
     for connect, database, want in cases:
         got = jet._linked_target(db, connect, database)

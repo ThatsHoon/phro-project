@@ -215,7 +215,10 @@ _CALC_TYPES = frozenset((BOOL, BYTE, INT, LONG, MONEY, FLOAT, DOUBLE, DATE, TEXT
 # the connect string keys shown when it names no DATABASE= (every other key, a credential's too, is left out)
 _SAFE_KEYS = frozenset(("dsn", "driver", "server", "dbq", "database", "data source", "provider", "host", "port", "app",
                         "trusted_connection"))
-_USERINFO = re.compile(r"(?<=//)[^/@\s]*@")
+# a URL's authority as browsers read it (WHATWG): after a scheme and a run of "/" or "\" (either, or the run alone),
+# up to the first "/", "\", "?" or "#"; a value with neither starts with its authority
+_AUTHORITY = re.compile(r"((?:[A-Za-z][A-Za-z0-9+.-]*:)?[/\\]+)?([^/\\?#]*)")
+_SEGMENTS = re.compile(r"[/\\?#]")
 _PICTURES = frozenset(("jpg", "jpeg", "png", "gif"))
 _PROP_HEADS = (b"KKD\x00", b"MR2\x00")  # JetFormat.PROPERTY_MAP_TYPES: Jet3, then Jet4 and ACE
 _PROP_NAMES, _PROP_DEFAULT, _PROP_COLUMN, _PROP_INDEX = 0x80, 0x00, 0x01, 0x02  # PropertyMaps' chunk types
@@ -1558,10 +1561,24 @@ def _connect_parts(s: str):
 
 
 def _safe_value(value: str) -> str:
-    """A value fit to show: its URL user part (`//user:password@`) taken out; "" when it holds ";", "=" or a
-    control character (what a value of a secret may spill into)."""
-    value = _USERINFO.sub("", value.strip())
-    return "" if ";" in value or "=" in value or _CONTROL.search(value) else value
+    """A value fit to show, showing less rather than a password: its authority's user part taken out, up to and with
+    the authority's last "@" (`_AUTHORITY`: as browsers read it, so `u:p@w@h`, spaces, `http:\\` and `https:/`
+    too); "" when it holds ";", "=" or a control character (what a value of a secret may spill into), when its
+    authority holds a ":" and an "@" follows it (`u:pa/ss@h`: the authority would end inside the password), or when
+    a segment of it still has a ":" before an "@" (user info this reading did not place)."""
+    value = value.strip()
+    m = _AUTHORITY.match(value)
+    authority, rest = m.group(2), value[m.end():]
+    if "@" in authority:
+        authority = authority.rpartition("@")[2]
+        value = (m.group(1) or "") + authority + rest
+    if ";" in value or "=" in value or _CONTROL.search(value):
+        return ""
+    if ":" in authority and "@" in rest:  # a password holding "/", "?" or "#": its tail would be the path
+        return ""
+    if "@" in value and any(":" in s[:s.rfind("@")] for s in _SEGMENTS.split(value) if "@" in s):
+        return ""
+    return value
 
 
 def _linked_target(db: _Db, connect: str, database: str) -> str:
