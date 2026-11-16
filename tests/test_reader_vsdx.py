@@ -1,6 +1,7 @@
-"""Visio (vsdx) parser: page order, text markers, groups, images, hostile input.
+"""Visio (vsdx) parser: page order, text markers, groups, images, master text, connections, macros, hostile input.
 
 Run: python -I -X utf8 tests/test_reader_vsdx.py
+     python -I -X utf8 tests/test_reader_vsdx.py measure   (times the hostile master and connection probes)
 """
 import sys
 import tempfile
@@ -13,8 +14,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader import markdown  # noqa: E402
+from reader import limits  # noqa: E402
+from reader.formats import vsdx as VX  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
+from reader.model import Context, ListItem, Para, Text  # noqa: E402
 from reader_fix import make_zip  # noqa: E402
 
 REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -46,18 +49,43 @@ def shape(i=1, text=None, pos=(), inner="", attrs=""):
     return f'<Shape ID="{i}" {attrs}>{cells(*pos)}{t}{inner}</Shape>'
 
 
-def page_xml(shapes):
-    return f'<PageContents xmlns:r="{REL}" {VNS}><Shapes>{shapes}</Shapes></PageContents>'
+def page_xml(shapes, connects=""):
+    c = f"<Connects>{connects}</Connects>" if connects else ""
+    return f'<PageContents xmlns:r="{REL}" {VNS}><Shapes>{shapes}</Shapes>{c}</PageContents>'
 
 
-def vsdx(pages, listed=None, extra=None, page_rels=None):
-    """pages: {name: shapes xml (or full xml)}, stored as page1.xml..; listed: [(Name, index)] for pages.xml."""
+def connect(sheet, cell, to):
+    return f'<Connect FromSheet="{sheet}" FromCell="{cell}" FromPart="9" ToSheet="{to}" ToCell="PinX" ToPart="3"/>'
+
+
+def glued(sheet, begin, end):
+    return connect(sheet, "BeginX", begin) + connect(sheet, "EndX", end)
+
+
+def master_members(masters):
+    """{Master ID: shapes xml} -> masters.xml, its rels and one masterN.xml part each (N counts from 1)."""
+    ids = list(masters)
+    out = {
+        "visio/masters/masters.xml": f'<Masters xmlns:r="{REL}" {VNS}>' + "".join(
+            f'<Master ID="{m}" NameU="M{m}"><Rel r:id="rId{n}"/></Master>' for n, m in enumerate(ids, 1)) + "</Masters>",
+        "visio/masters/_rels/masters.xml.rels": rels_xml(
+            [(f"rId{n}", "master", f"master{n}.xml") for n in range(1, len(ids) + 1)]),
+    }
+    for n, m in enumerate(ids, 1):
+        out[f"visio/masters/master{n}.xml"] = f"<MasterContents {VNS}><Shapes>{masters[m]}</Shapes></MasterContents>"
+    return out
+
+
+def vsdx(pages, listed=None, extra=None, page_rels=None, masters=None, mem=False):
+    """pages: {name: shapes xml (or full xml)}, stored as page1.xml..; listed: [(Name, index)] for pages.xml;
+    masters: {Master ID: shapes xml}; mem: return the zip's bytes (nothing written)."""
     names = list(pages)
     listed = listed if listed is not None else [(n, i + 1) for i, n in enumerate(names)]
+    doc_rels = [("rId1", "pages", "pages/pages.xml")] + ([("rId2", "masters", "masters/masters.xml")] if masters else [])
     members = {
         "_rels/.rels": rels_xml([("rId1", "document", "visio/document.xml")]),
         "visio/document.xml": f"<VisioDocument {VNS}/>",
-        "visio/_rels/document.xml.rels": rels_xml([("rId1", "pages", "pages/pages.xml")]),
+        "visio/_rels/document.xml.rels": rels_xml(doc_rels),
         "visio/pages/pages.xml": f'<Pages xmlns:r="{REL}" {VNS}>' + "".join(
             f'<Page ID="{i}" Name="{n}"><Rel r:id="rId{i}"/></Page>' for n, i in listed) + "</Pages>",
         "visio/pages/_rels/pages.xml.rels": rels_xml(
@@ -68,8 +96,9 @@ def vsdx(pages, listed=None, extra=None, page_rels=None):
         members[f"visio/pages/page{i}.xml"] = body if body.startswith("<PageContents") else page_xml(body)
     for i, r in (page_rels or {}).items():
         members[f"visio/pages/_rels/page{i}.xml.rels"] = rels_xml(r)
+    members.update(master_members(masters) if masters else {})
     members.update(extra or {})
-    return make_zip(tmp() / "a.vsdx", members, stored=())
+    return make_zip(None if mem else tmp() / "a.vsdx", members, stored=())
 
 
 def md(path):
@@ -213,16 +242,222 @@ def test_bad_numbers_mean_no_position():
     assert out.index("ok") < out.index("t0") and "kid" in out
 
 
-def test_shared_media_and_master_ignored():
+def test_shared_media_and_master_text():
     fd = '<ForeignData ForeignType="Bitmap"><Rel r:id="rId1"/></ForeignData>'
     many = "".join(shape(i, None, (i, 0), fd) for i in range(1, 300))
     many += shape(999, None, (0, 9), "", 'Master="2" MasterShape="3"')
     master = (f'<MasterContents {VNS}><Shapes><Shape ID="3"><Text>MASTERTEXT</Text></Shape></Shapes></MasterContents>')
     p = vsdx({"P": many}, extra={"visio/media/image1.png": PNG, "visio/masters/master1.xml": master,
-                                 "visio/masters/masters.xml": f"<Masters {VNS}><Master ID=\"2\"/></Masters>"},
+                                 "visio/masters/masters.xml": f'<Masters xmlns:r="{REL}" {VNS}><Master ID="2">'
+                                                              '<Rel r:id="rId1"/></Master></Masters>',
+                                 "visio/masters/_rels/masters.xml.rels": rels_xml([("rId1", "master", "master1.xml")])},
              page_rels={1: [("rId1", "image", "../media/image1.png")]})
     out, ctx = md(p)
-    assert out.count("![](") == 299 and not ctx.skipped["image"] and "MASTERTEXT" not in out
+    assert out.count("![](") == 299 and not ctx.skipped["image"] and out.count("MASTERTEXT") == 1, out[-300:]
+
+
+MASTER1 = (shape(5, "FIRST") + shape(6, "SIXTH")
+           + shape(8, None, (), "<Shapes>" + shape(9, None, (), "<Shapes>" + shape(7, "SEVENTH") + "</Shapes>")
+                   + "</Shapes>"))
+
+
+def test_master_text_top_and_sub_shape():
+    group = shape(3, None, (0, 7), "<Shapes>" + shape(4, None, (0, 0), "", 'MasterShape="7"') + "</Shapes>",
+                  'Master="1" MasterShape="8"')
+    page = (shape(1, None, (0, 9), "", 'Master="1"') + shape(2, None, (0, 8), "", 'Master="1" MasterShape="6"')
+            + group)
+    out, ctx = md(vsdx({"P": page}, masters={"1": MASTER1}))
+    assert out.index("FIRST") < out.index("SIXTH") < out.index("SEVENTH"), out
+    assert out.count("FIRST") == 1 and out.count("SIXTH") == 1 and out.count("SEVENTH") == 1
+    assert not ctx.skipped["stencil"], ctx.skipped
+
+
+def test_own_text_wins():
+    page = shape(1, "mine", (0, 9), "", 'Master="1"') + shape(2, "", (0, 8), "", 'Master="1"')
+    out, _ = md(vsdx({"P": page}, masters={"1": MASTER1}))
+    assert "mine" in out and "FIRST" not in out, out
+
+
+HIDE = '<Cell N="HideText" V="1"/>'
+SHOW = '<Cell N="HideText" V="0"/>'
+
+
+def test_hidden_text_own_and_inherited():
+    # a master's placeholder text hidden by the master's HideText stays hidden on its instances unless they show it
+    m = shape(5, None, (), HIDE + "<Text>PLACEHOLDER</Text>")
+    page = (shape(1, None, (0, 9), "", 'Master="1"') + shape(2, None, (0, 8), SHOW, 'Master="1"')
+            + shape(3, "OWNHIDDEN", (0, 7), HIDE) + shape(4, "shown", (0, 6)))
+    p = vsdx({"P": page}, masters={"1": m})
+    doc = reader.parse(p, Context())
+    out = markdown.render(doc, tmp() / "assets")
+    assert out.count("PLACEHOLDER") == 1 and "OWNHIDDEN" not in out and "shown" in out, out
+    assert out.startswith("(2 hidden places left out)"), out
+    shown = markdown.render(doc, tmp() / "assets", hidden=True)
+    assert shown.count("PLACEHOLDER") == 2 and "OWNHIDDEN" in shown, shown
+
+
+def test_hidden_connector_text_not_a_label():
+    shapes = (shape(1, "Start", (0, 9)) + shape(2, None, (0, 1), HIDE + "<Text>secret</Text>", 'NameU="End"')
+              + shape(3, None, (0, 5), HIDE + "<Text>quiet</Text>"))
+    out, _ = md(vsdx({"P": page_xml(shapes, glued(3, 1, 2))}))
+    assert "- Start → End\n" in out and "secret" not in out and "quiet" not in out, out
+
+
+def test_masters_cap():
+    old = VX.MASTERS
+    VX.MASTERS = 1
+    try:
+        page = shape(1, None, (0, 9), "", 'Master="1"') + shape(2, None, (0, 8), "", 'Master="2"')
+        out, ctx = md(vsdx({"P": page}, masters={"1": shape(1, "MONE"), "2": shape(1, "MTWO")}))
+    finally:
+        VX.MASTERS = old
+    assert "MONE" in out and "MTWO" not in out and ctx.skipped["stencil"] == 1, (out, ctx.skipped)
+
+
+def test_connections():
+    shapes = shape(1, "Start", (0, 9)) + shape(2, "End", (0, 1)) + shape(3, None, (0, 5)) + shape(4, "yes", (0, 4))
+    out, ctx = md(vsdx({"P": page_xml(shapes, glued(3, 1, 2) + glued(4, 1, 2))}))
+    assert "Connections:\n\n- Start → End\n- Start → End (yes)\n" in out, out
+    flow = out[:out.index("Connections:")]
+    assert "yes" not in flow and out.count("yes") == 1
+    assert out.index("Start") < out.index("End") < out.index("Connections:")
+
+
+def test_connection_list_after_pictures():
+    fd = '<ForeignData ForeignType="Bitmap"><Rel r:id="rId1"/></ForeignData>'
+    shapes = shape(1, "A", (0, 9)) + shape(2, "B", (0, 8)) + shape(3) + shape(5, None, (0, 1), fd)
+    p = vsdx({"P": page_xml(shapes, glued(3, 1, 2))}, extra={"visio/media/image1.png": PNG},
+             page_rels={1: [("rId1", "image", "../media/image1.png")]})
+    out, _ = md(p)
+    assert out.index("![](") < out.index("Connections:") and out.endswith("- A → B\n"), out
+
+
+def test_one_end_connector():
+    shapes = shape(1, "Start", (0, 9)) + shape(2, "End", (0, 1)) + shape(3, "dangle", (0, 5))
+    out, _ = md(vsdx({"P": page_xml(shapes, connect(3, "BeginX", 1))}))
+    assert "Connections:" not in out and "dangle" in out, out
+    out, _ = md(vsdx({"P": page_xml(shapes, connect(3, "EndX", 2) + connect(3, "PinX", 1))}))
+    assert "Connections:" not in out and "dangle" in out, out
+
+
+def test_connection_names():
+    shapes = (shape(1, None, (), "", 'NameU="Alpha" Name="Ignored"') + shape(2, None, (), "", 'Name="Beta"')
+              + shape(4) + shape(5, "x" * 100 + "\nsecond") + shape(6, "\n  lead \nmore", (), "", 'NameU="No"')
+              + shape(10) + shape(11) + shape(12))
+    out, _ = md(vsdx({"P": page_xml(shapes, glued(10, 1, 2) + glued(11, 4, 5) + glued(12, 6, 99))}))
+    assert "- Alpha → Beta\n" in out, out
+    assert "- shape 4 → " + "x" * 80 + "\n" in out, out
+    assert "- lead → shape 99\n" in out, out
+    assert VX.name_of("a\nb", "U", "N", "9") == "a"
+    assert VX.name_of("  ", "U", "N", "9") == "U"
+    assert VX.name_of("", "", "N", "9") == "N"
+    assert VX.name_of("", "", "", "9") == "shape 9"
+
+
+def test_connections_blocks():
+    assert VX.connections([], {}) == []
+    got = VX.connections([("1", "2", ""), ("2", "3", "a\n b")], {"1": "One", "2": "Two"})
+    assert got == [Para([Text("Connections:")]), ListItem(0, "-", [Text("One → Two")]),
+                   ListItem(0, "-", [Text("Two → shape 3 (a b)")])], got
+
+
+def test_connection_budget():
+    ctx = Context()
+    old = VX.CONNECTIONS
+    VX.CONNECTIONS = 3
+    try:
+        budget = VX.ConnectionBudget(ctx)
+    finally:
+        VX.CONNECTIONS = old
+    e = [(str(i), str(i + 1), "") for i in range(6)]
+    assert budget.take(e[:2]) == e[:2] and not ctx.skipped["connections_cut"]
+    assert budget.take(e[2:4]) == e[2:3] and ctx.skipped["connections_cut"] == 1
+    assert budget.take([]) == [] and ctx.skipped["connections_cut"] == 1
+    assert budget.take(e[4:]) == [] and ctx.skipped["connections_cut"] == 2
+
+
+def test_connections_cap():
+    old = VX.CONNECTIONS
+    VX.CONNECTIONS = 1
+    try:
+        shapes = shape(1, "Start", (0, 9)) + shape(2, "End", (0, 1)) + shape(3) + shape(4)
+        out, ctx = md(vsdx({"P": page_xml(shapes, glued(3, 1, 2) + glued(4, 2, 1))}))
+    finally:
+        VX.CONNECTIONS = old
+    assert out.count(" → ") == 1 and ctx.skipped["connections_cut"] == 1, (out, ctx.skipped)
+
+
+def test_vsdm_vba():
+    out, ctx = md(vsdx({"P": shape(1, "t")}, extra={"visio/vbaProject.bin": b"\xcc" * 16}))
+    assert "VBA macros" in markdown.unread(ctx.skipped) and "t" in out
+    _, ctx = md(vsdx({"P": shape(1, "t")}))
+    assert "VBA macros" not in markdown.unread(ctx.skipped)
+
+
+# ---- hostile masters and connections (in memory; nothing written)
+def parse_mem(data):
+    ctx = Context()
+    return VX.parse(data, ctx), ctx
+
+
+def page_text(doc):
+    return "".join(t.text for sec in doc.blocks for b in sec.blocks for t in getattr(b, "inlines", [])
+                   if isinstance(t, Text))
+
+
+def test_shared_master_loaded_once():
+    loads = []
+    real = VX.ooxml_base.load
+
+    def counting(pkg, part):
+        loads.append(part)
+        return real(pkg, part)
+    page = "".join(shape(i, None, (0, i), "", 'Master="1"') for i in range(1, 2001))
+    good = vsdx({"P": page}, masters={"1": shape(1, "M")}, mem=True)
+    bad = vsdx({"P": page}, masters={"1": shape(1, "M")}, mem=True, extra={"visio/masters/master1.xml": "<Master"})
+    VX.ooxml_base.load = counting
+    try:
+        doc, ctx = parse_mem(good)
+        n_good = loads.count("visio/masters/master1.xml")
+        loads.clear()
+        doc2, ctx2 = parse_mem(bad)
+        n_bad = loads.count("visio/masters/master1.xml")
+    finally:
+        VX.ooxml_base.load = real
+    assert page_text(doc) == "M" * 2000 and not ctx.skipped["stencil"] and n_good == 1, (n_good, ctx.skipped)
+    assert ctx2.skipped["stencil"] == 2000 and not page_text(doc2) and n_bad == 1, (n_bad, ctx2.skipped)
+
+
+def test_inherited_text_charged():
+    old = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 25
+    try:
+        page = "".join(shape(i, None, (0, 10 - i), "", 'Master="1"') for i in range(1, 6))
+        doc, ctx = parse_mem(vsdx({"P": page}, masters={"1": shape(1, "0123456789")}, mem=True))
+    finally:
+        limits.MAX_OUTPUT = old
+    assert page_text(doc) == "0123456789" * 2 and ctx.skipped["stencil"] == 3, (page_text(doc), ctx.skipped)
+
+
+def test_master_refs_do_not_loop():
+    # master shapes naming their own master, unknown masters and shape ids, then no masters part at all
+    m = shape(1, None, (), "", 'Master="1" MasterShape="1"') + shape(2, None, (), "", 'Master="1"')
+    page = (shape(1, None, (0, 3), "", 'Master="1"') + shape(2, None, (0, 2), "", 'Master="1" MasterShape="2"')
+            + shape(3, None, (0, 1), "", 'Master="7"') + shape(4, None, (0, 0), "", 'MasterShape="5"'))
+    doc, ctx = parse_mem(vsdx({"P": page}, masters={"1": m}, mem=True))
+    assert not page_text(doc) and ctx.skipped["stencil"] == 1, ctx.skipped  # Master="7" is not listed
+    doc, ctx = parse_mem(vsdx({"P": page}, mem=True))
+    assert not page_text(doc) and ctx.skipped["stencil"] == 3, ctx.skipped
+
+
+def test_deep_master_group():
+    xml = shape(1, "deepest")
+    for i in range(300):
+        xml = shape(i + 2, None, (), f"<Shapes>{xml}</Shapes>")
+    page = shape(1, None, (0, 0), "", 'Master="1" MasterShape="1"')
+    t0 = time.monotonic()
+    doc, ctx = parse_mem(vsdx({"P": page}, masters={"1": xml}, mem=True))
+    assert time.monotonic() - t0 < 10 and not page_text(doc) and ctx.skipped["depth"] >= 1, ctx.skipped
 
 
 def test_missing_image_counted():
@@ -231,7 +466,56 @@ def test_missing_image_counted():
     assert "t" in out and ctx.skipped["image"] == 1
 
 
+def probes():
+    """(name, zip bytes) of the dearest master and connection shapes, built in memory."""
+    n = 50_000
+    big = "w" * VX.MAX_TEXT
+    refs = "".join(shape(i, None, (0, i % 97), "", 'Master="1"') for i in range(1, n + 1))
+    yield "shared big master text", vsdx({"P": refs}, masters={"1": shape(1, big)}, mem=True)
+    bad = "<MasterContents>" + "<Shape>" * 100_000  # under 1 MiB, so ZIP_RATIO lets it be read
+    yield "shared damaged master", vsdx({"P": refs}, masters={"1": shape(1, "x")}, mem=True,
+                                        extra={"visio/masters/master1.xml": bad})
+    many = {str(i): shape(1, f"m{i}") for i in range(1, 5_001)}
+    refs = "".join(shape(i, None, (0, i % 97), "", f'Master="{i % 5_000 + 1}"') for i in range(1, n + 1))
+    yield "5,000 masters past MASTERS", vsdx({"P": refs}, masters=many, mem=True)
+    deep = shape(1, "deepest")
+    for i in range(2, 2_000):
+        deep = shape(i, None, (), f"<Shapes>{deep}</Shapes>")
+    refs = "".join(shape(i, None, (0, i % 97), "", 'Master="1" MasterShape="1"') for i in range(1, n + 1))
+    yield "deep master, missing shape", vsdx({"P": refs}, masters={"1": deep}, mem=True)
+    m = 30_000
+    shapes = shape(1, "A" * 200) + shape(2, "B" * 200) + "".join(
+        shape(i, None, (), "", 'Master="1"') for i in range(3, m + 3))
+    links = "".join(glued(i, 1, 2) for i in range(3, m + 3))
+    pages = {f"P{k}": page_xml(shapes, links) for k in range(2)}
+    yield "60,000 labelled connectors", vsdx(pages, masters={"1": shape(1, big)}, mem=True)
+
+
+def measure():
+    """Not a test: parse and render each probe; prints name, zip MiB, parse s, parse and render s, s/MiB, peak MiB,
+    output MiB, skipped."""
+    import tracemalloc
+    for name, data in probes():
+        t0 = time.perf_counter()
+        ctx = Context()
+        doc = VX.parse(data, ctx)
+        parsed = time.perf_counter() - t0
+        out = markdown.render(doc, tmp() / "assets")
+        took = time.perf_counter() - t0
+        tracemalloc.start()
+        markdown.render(VX.parse(data, Context()), tmp() / "assets")
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        mib = len(data) / 2**20
+        print(f"{name}: {mib:.2f} MiB, parse {parsed:.2f} s, with render {took:.2f} s, {took / mib:.1f} s/MiB, "
+              f"peak {peak / 2**20:.0f} MiB, "
+              f"output {len(out) / 2**20:.1f} MiB, {dict(ctx.skipped)}")
+
+
 def main():
+    if sys.argv[1:] == ["measure"]:
+        measure()
+        return
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()
