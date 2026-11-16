@@ -2196,12 +2196,12 @@ def pub_2k_contents(pages, shapes=(), *, text97=None) -> bytes:
     """A Publisher 2000 or 97 Contents stream (pub_contents version 0x22): the DOCUMENT chunk (0x15, seqnum
     PUB_2K_DOCUMENT), a PAGE chunk (0x14) for each page seqnum, whose parent is the document, and each shape, a
     dict: seq, type (the chunk's first u16), parent (its page or group), and its pub_2k_chunk keywords (box, text,
-    at, data). `text97`: the 8-bit text of Publisher 97, placed after the trailer with its header (14 bytes, the
+    at, data, size). `text97`: the 8-bit text of Publisher 97, placed after the trailer with its header (14 bytes, the
     text's start and end u32, four u16), whose offset the u32 at 0x12 holds."""
     chunks = [(PUB_2K_DOCUMENT, 0x15, None, bytes(0x20))]
     chunks += [(p, 0x14, PUB_2K_DOCUMENT, bytes(0x10)) for p in pages]
     for s in shapes:
-        kw = {k: s[k] for k in ("box", "text", "at", "data") if k in s}
+        kw = {k: s[k] for k in ("box", "text", "at", "data", "size") if k in s}
         chunks.append((s["seq"], s["type"], s.get("parent"), pub_2k_chunk(**kw)))
     body = bytearray(pub_contents(chunks, version=0x22))
     if text97 is not None:

@@ -23,8 +23,8 @@ from reader.formats.pub_contents import Block, ChunkRef  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Bold, Break, Context, Image, Link, Para, Section, Table, Text  # noqa: E402
 from reader_fix import (blip_bitmap, blip_metafile, blip_png, cfb_bytes, oa_container, oa_fbse,  # noqa: E402
-                        oa_record, pub_2k_contents, pub_2k_file, pub_block, pub_cells, pub_contents as contents_fix, pub_escher,
-                        pub_file, pub_group, pub_quill as quill_fix, pub_sp, pub_table)
+                        oa_record, pub_2k_contents, pub_2k_file, pub_block, pub_cells, pub_contents as contents_fix,
+                        pub_escher, pub_file, pub_group, pub_quill as quill_fix, pub_sp, pub_table)
 
 MIB = 2**20
 
@@ -1557,6 +1557,17 @@ def test_table_spans_clamped():
         [[(1, 1, ["Head"]), (1, 1, [])], [(1, 1, []), (1, 1, ["A"])]], {"record": 1})
 
 
+def test_table_tcd_past_story():
+    # a TCD cell end past the story (pub_quill.cell_spans) is cut to the story's end: the table is laid out, its text
+    # kept, nothing counted (before, an IndexError dropped the shape, counted shape)
+    def run(bounds):
+        doc, ctx = read_pub(table_file(MERGED, bounds=bounds))
+        return grid(page_blocks(doc)[0]), dict(ctx.skipped)
+    assert run([0, 4, 6, 50]) == ([[(1, 2, ["Head"])], [(1, 1, ["A"]), (1, 1, ["B"])]], {}), run([0, 4, 6, 50])
+    assert run([0, 4, 60, 9]) == ([[(1, 2, ["Head"])], [(1, 1, ["A", "B"]), (1, 1, [])]], {}), run([0, 4, 60, 9])
+    assert run([0, 40, 6, 9]) == ([[(1, 2, ["Head", "A", "B"])], [(1, 1, []), (1, 1, [])]], {}), run([0, 40, 6, 9])
+
+
 def test_table_layout_ticks():
     # each step of the layout ticks the meter once: 3 cells, 2 places checked for the span cut short, 5 places
     # marked, and 6 steps of the row scan (one of them a gap's place)
@@ -1910,6 +1921,11 @@ def text97(seq, tid, parent=PG, box=None):
     return dict(seq=seq, type=0x00, parent=parent, text=tid, at=0x46, box=box)
 
 
+def table2k(seq, tid, parent=PG, box=None):
+    """A Publisher 2000 table (type 0x0A, its text id at +0x66, so a chunk of 0x70 bytes)."""
+    return dict(seq=seq, type=0x0A, parent=parent, text=tid, at=0x66, size=0x70, box=box)
+
+
 def picture2k(seq, data, parent=PG, box=None, data_seq=None):
     """A picture shape (0x02) and its image data chunk (0x21) naming it as parent."""
     return [dict(seq=seq, type=0x02, parent=parent, box=box),
@@ -1999,6 +2015,50 @@ def test_pub97_pictures_counted():
                                                          dict(seq=0x34, type=0x21, parent=0x30, data=WMF)]
     doc, ctx = read_pub(file97(b"Text", shapes))
     assert outline(doc) == [("Page 1", ["Text"])] and ctx.skipped == {"image": 1}, (outline(doc), ctx.skipped)
+
+
+def test_pub2000_table_story():
+    # a 2000 table (0x0A) names its story by the u16 at +0x66 (seen in files; libmspub reads no 2000 table): the
+    # story's paragraphs in reading order, its structure not read, counted table once; a second chunk naming the
+    # story gives nothing more; a table naming no story (id 0 here) counts nothing
+    shapes = [text2k(0x30, 1, box=(0, 0, 9, 9)), table2k(0x31, 2, box=(0, 20, 9, 29)), table2k(0x32, 2),
+              table2k(0x33, 0)]
+    doc, ctx = read_pub(pub_2k_file([PG], shapes, [(1, "Body"), (2, "Cell one\rCell two")]))
+    assert outline(doc) == [("Page 1", ["Body", "Cell one", "Cell two"])] and ctx.skipped == {"table": 1}, (
+        outline(doc), ctx.skipped)
+    # the id's place goes by type: a table's +0x58 and a text box's +0x66 name nothing
+    shapes = [dict(seq=0x30, type=0x0A, parent=PG, text=1, size=0x70),
+              dict(seq=0x31, type=0x08, parent=PG, text=2, at=0x66, size=0x70)]
+    doc, ctx = read_pub(pub_2k_file([PG], shapes, [(1, "a"), (2, "b")]))
+    assert outline(doc) == [] and not ctx.skipped, (outline(doc), ctx.skipped)
+    # a table past the room: counted text, not table
+    with patched(limits, MAX_OUTPUT=10):
+        doc, ctx = read_pub(pub_2k_file([PG], [table2k(0x31, 2)], [(2, "Cell one\rCell two")]))
+    assert outline(doc) == [] and ctx.skipped == {"text": 1}, (outline(doc), ctx.skipped)
+    # Publisher 97 has no such table: a 0x0A chunk names no 97 text box
+    doc, ctx = read_pub(file97(b"one", [table2k(0x30, 0), dict(seq=0x31, type=0x0A, parent=PG, text=0, at=0x46)]))
+    assert outline(doc) == [] and not ctx.skipped, (outline(doc), ctx.skipped)
+
+
+def test_pub2000_errors_not_masked():
+    # parse_2000 takes the Quill stream's bytes; a reader bug (a KeyError past the stream reads) is not reported as a
+    # damaged Quill stream
+    blob = pub_2k_file([PG], [text2k(0x30, 1)], [(1, "t")])
+    with Compound(blob) as cf:
+        contents, quill = cf.read("Contents"), cf.read(pub.QUILL)
+    assert outline(pub_2k.parse_2000(quill, contents, Context())) == [("Page 1", ["t"])]
+
+    def bug(self, doc):
+        raise KeyError("bug")
+    with patched(pub_2k._Reader2000, _page_list=bug):
+        try:
+            read_pub(blob)
+        except ReadError as e:
+            raise AssertionError(f"masked as {e}") from None
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("no error")
 
 
 def test_pub2k_routes():
@@ -2255,6 +2315,16 @@ def test_convert_garbled_once():
             with patched(reader, parse=lambda path, ctx, **kw: doc):
                 meta = reader.convert(src, Path(tmp) / "out")
             assert meta["warnings"] == ["garbled"], meta["warnings"]
+        # one threshold, text.GARBLED, read at call time by both convert and the 97 reader
+        from reader import text as text_mod
+        contents = contents_of(file97(b"\x81\x8d\x8f" * 3 + b"x" * 40, [text97(0x30, 0)]))
+        doc = Doc(blocks=[Para([Text("�" * 5 + "x" * 45)])])
+        with patched(text_mod, GARBLED=0.5):
+            assert run97(contents)[2] == []
+            with patched(reader, parse=lambda path, ctx, **kw: doc):
+                assert reader.convert(src, Path(tmp) / "out")["warnings"] == []
+        with patched(reader, parse=lambda path, ctx, **kw: doc):
+            assert reader.convert(src, Path(tmp) / "out")["warnings"] == ["garbled"]
 
 
 # -- measure: hostile-input probes, in memory
@@ -2589,6 +2659,9 @@ def _pub_2k_probes():
     contents = pub_2k_contents([PG], [text2k(0x200 + k, 1) for k in range(n)])
     quill = quill_fix([(1, "x" * MIB + "\r")])
     _probe("pub2000: 65k text ids, one 1 Mi story", lambda: _run_2000(contents, quill), len(contents) + len(quill))
+    contents = pub_2k_contents([PG], [table2k(0x200 + k, k % 1000 + 1) for k in range(n)])
+    quill = quill_fix(stories)
+    _probe("pub2000: 65k tables, 1000 stories", lambda: _run_2000(contents, quill), len(contents) + len(quill))
     # Publisher 97: a text range ending at 2^32 - 1 over a 64 MiB stream of short lines; 8 MiB of 0x0C (box ends)
     contents = _text_head(pub_2k_contents([PG], [text97(0x30, 0)], text97=b"a") + b"line\r\n" * (64 * MIB // 6),
                           end=0xFFFFFFFF)

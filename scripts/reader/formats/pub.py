@@ -15,10 +15,12 @@ bold, table cells and links `pub_quill`'s, the BStore and BLIPs `officeart`'s.
 
 Version. The Contents stream starts `E8 AC xx 00`: 0x2C is 2002 and later, read here; 0x22 is Publisher 2000 (with a
 Quill stream) or 97/98 (without), read by `pub_2k` on this module's `_Pages`; any other byte is `unsupported`, and a
-stream not starting E8 AC is damaged. A compound file with no Contents stream goes to `cfb_route.route(cf, "pub", "no Contents stream")`. A
-2002+ file needs the Quill stream (`Quill/QuillSub/CONTENTS`) and a DOCUMENT chunk, as libmspub does; without
-either it is damaged. A stream the compound file cannot give (a broken sector chain) is damaged, the detail naming
-it ("Contents stream", "Quill/QuillSub/CONTENTS stream", "Escher/EscherStm stream", "Escher/EscherDelayStm stream").
+stream not starting E8 AC is damaged. A compound file with no Contents stream goes to
+`cfb_route.route(cf, "pub", "no Contents stream")`. A 2002+ file needs the Quill stream (`Quill/QuillSub/CONTENTS`)
+and a DOCUMENT chunk, as libmspub does; without either it is damaged. A stream the compound file cannot give (a broken
+sector chain) is damaged, the detail naming it ("Contents stream", "Quill/QuillSub/CONTENTS stream",
+"Escher/EscherStm stream", "Escher/EscherDelayStm stream"); the readers run once the streams are read, so their own
+errors are never taken for a damaged stream.
 
 Pages. The DOCUMENT chunk's page list (block 0x02, its entries of id 0) gives the order, each seqnum once; with no
 list, the PAGE chunks in seqnum order (libmspub's `go`). Of these, a PAGE chunk whose block 0x0E (THIS_MASTER_NAME)
@@ -353,6 +355,12 @@ class _Pages:
         self.deep = False
         self.img = 0         # image bytes placed so far (IMAGE_BYTES)
 
+    def _quill(self, quill):
+        """Read the Quill stream: its bits (kept), its stories (on the meter) and the links."""
+        self.bits = pub_quill.bits(quill, self.ctx)
+        self.stories = pub_quill.stories(self.bits, self.ctx, meter=self.meter)
+        self.urls = pub_quill.links(self.bits)
+
     def _span(self, at: int) -> int:
         """Where the chunk at `at` ends: the first chunk offset, trailer or stream end past it."""
         k = bisect_right(self.bounds, at)
@@ -494,9 +502,7 @@ class _Reader(_Pages):
 
     def __init__(self, contents, quill, escher, ctx, delay=b""):
         super().__init__(contents, ctx)
-        self.bits = pub_quill.bits(quill, ctx)
-        self.stories = pub_quill.stories(self.bits, ctx, meter=self.meter)
-        self.urls = pub_quill.links(self.bits)
+        self._quill(quill)
         self.tcd = None      # TCD bit id -> bit, made at the first table
         walk = _Boxes(escher, self.meter, ctx, self.meter.used + limits.BIN_RECORDS // 2)
         self.boxes = walk.walk() if escher else {}
@@ -785,7 +791,7 @@ def parse_compound(src, ctx) -> Doc | str:
     to `pub_2k`: Publisher 2000 with a Quill stream, 97/98 without (libmspub's `MSPUBDocument::parse`)."""
     from . import pub_2k  # it builds on this module, so it is imported once this one is
     part = "compound file"
-    older = False
+    older, quill = False, None
     try:
         with Compound(src) as cf:
             other = cfb_route.route(cf, "pub", "no Contents stream")
@@ -799,10 +805,10 @@ def parse_compound(src, ctx) -> Doc | str:
                 if any(_vba(n) for n in cf.names()):
                     ctx.skipped["vba"] = 1  # macros are never read; named once
                 if contents[2] == V2000:
+                    older = True
                     if cf.exists(QUILL):
                         part = f"{QUILL} stream"
-                        return pub_2k.parse_2000(cf, contents, ctx)
-                    older = True
+                        quill = cf.read(QUILL)
                 else:
                     if not cf.exists(QUILL):
                         raise ReadError("damaged", "no Quill stream")
@@ -816,6 +822,6 @@ def parse_compound(src, ctx) -> Doc | str:
         raise ReadError("damaged", part) from None
     if other is not None:
         return other
-    if older:
-        return pub_2k.parse_97(contents, ctx)
+    if older:  # read after the try, so a reader's own KeyError is not taken for a damaged stream
+        return pub_2k.parse_97(contents, ctx) if quill is None else pub_2k.parse_2000(quill, contents, ctx)
     return _Reader(contents, quill, escher, ctx, delay).run()

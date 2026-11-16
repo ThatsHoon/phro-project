@@ -16,9 +16,10 @@ layout (`trailer=pub_contents.TRAILER_2K`); the Quill stories, bold and links ar
 
 Chunks. The directory at the u32 at 0x16 gives each chunk's sequence number, parent and offset; its type is the
 chunk's first u16: 0x14 a page, 0x15 the document, 0x0F a group, 0x02 a picture, 0x21 a picture's data, and 0x00,
-0x04, 0x05, 0x06, 0x07 and 0x08 other shapes. A page's shapes are the chunks naming it as their parent, in directory
-order (2000 has no shape list); a group stands for its members, the chunks naming it, groups inside included. A file
-with no document chunk is damaged, as libmspub refuses it.
+0x04, 0x05, 0x06, 0x07 and 0x08 other shapes (and, in 2000, 0x0A a table: see Text). A page's shapes are the chunks
+naming it as their parent, in directory order (2000 has no shape list); a group stands for its members, the chunks
+naming it, groups inside included. A file with no document chunk is damaged, as libmspub refuses it. A picture
+inside a group is placed (libmspub's `parseGroup` walks only the shapes and groups in it, so draws none).
 
 Pages. In seqnum order (there is no page list); 0x109 is the master page, given after the others as
 `Section("master", title="Background")` (Publisher 2000 and 98 call it the background; it has no name), and the
@@ -30,15 +31,18 @@ shape whose box passes the stream last in list order. Group members carry their 
 are not compounded with the group's).
 
 Text, Publisher 2000. A text box (type 0x08) names a Quill story by the u16 at +0x58; the stories, their bold and
-the links are read as in 2002 and later (`pub_quill`). There are no tables.
+the links are read as in 2002 and later (`pub_quill`). A table (type 0x0A; libmspub reads none, an UNKNOWN_CHUNK)
+names its story by the u16 at +0x66, an offset seen in files, not ported: the story is given as paragraphs, its rows
+and cells not read, counted `table` once a table (as 2002's fallback for a table it cannot lay out).
 
 Text, Publisher 97/98 (`text_boxes`). The u32 at 0x12 is the offset of a text header whose u32s at +14 and +18 are the
 text's start and end in Contents; a text box (type 0x00) names a box by the u16 at +0x46, box k being the k-th run of
 the text ended by 0x0C (the end of the text ends the last; libmspub drops text after the last 0x0C). Its bytes are
 8-bit, decoded with `text.decode_8bit(data, 0x0409)`; CR LF ends a paragraph, a lone CR is dropped (libmspub), 0x0B
 and LF break the line and other control characters go (`pub_quill.paragraphs`). Character styles (bold) are not
-read. When more than 5% of the decoded text is U+FFFD or control characters (`text.garble_ratio`, the text's own
-breaks aside) the Doc carries the `garbled` warning, the one `reader.convert` gives from the Markdown; no skip kind.
+read. When more than `text.GARBLED` (5%) of the decoded text is U+FFFD or control characters (`text.garble_ratio`,
+the text's own breaks aside) the Doc carries the `garbled` warning, the one `reader.convert` gives from the Markdown;
+no skip kind.
 
 Pictures. A picture shape's data is the first 0x21 chunk naming it as parent (`assignShapeImgIndex`). In Publisher
 2000 its bytes, a u32 length at +4 then the bytes from +8, are the image (a WMF: an asset, not viewable), read once a
@@ -62,6 +66,7 @@ import struct
 
 from .. import images, limits
 from ..model import Doc
+from .. import text as text_mod
 from ..text import decode_8bit, garble_ratio
 from . import pub, pub_contents, pub_quill, vsdx
 from .pub_quill import Story
@@ -73,13 +78,15 @@ GROUP = 0x0F
 PICTURE = 0x02
 PICTURE_DATA = 0x21
 OTHER_SHAPES = (0x00, 0x04, 0x05, 0x06, 0x07, 0x08)
+TABLE = 0x0A                # a Publisher 2000 table: libmspub's UNKNOWN_CHUNK, read here for its story
 # getPageTypeBySeqNum
 MASTER_PAGE = 0x109
 DUMMY_PAGES = frozenset((0x108, 0x10B, 0x10D, 0x116, 0x119))
 BACKGROUND = "Background"   # the master page's title: Publisher 2000 and 98 name it the background
-# getTextMarker, getTextIdOffset: the text box's type and where its text id is
-TEXT_2000 = (0x08, 0x58)
-TEXT_97 = (0x00, 0x46)
+# getTextMarker, getTextIdOffset: {a text-holding chunk's type: where its text id is}; a 2000 table's +0x66 is seen
+# in files, not ported
+TEXT_2000 = {0x08: 0x58, TABLE: 0x66}
+TEXT_97 = {0x00: 0x46}
 BOX_AT = 6                  # parseShapeCoordinates: xs, ys, xe, ye (s32)
 # MSPUBParser97::parseContentsTextIfNecessary
 TEXT_HEAD = 0x12            # the u32 offset of the text header
@@ -87,7 +94,6 @@ TEXT_RANGE = 14             # the text's start and end u32 in that header
 BOX_END = 0x0C              # getTextInfo: ends a text box
 LID = 0x0409                # 97 text's code page (text.decode_8bit)
 BOXES = 0x10000             # 97 text boxes read: a u16 text id names no more
-GARBLED = 0.05              # reader.convert's garble threshold
 
 _U16 = struct.Struct("<H")
 _U32 = struct.Struct("<I")
@@ -129,23 +135,27 @@ class _Reader2k(pub._Pages):
         return min(ys, ye), min(xs, xe)
 
     def _tid(self, ref):
-        """The text id of a text box (TEXT: its type and the id's place), or None."""
-        marker, off = self.TEXT
-        at = ref.offset + off
-        if ref.type != marker or at + _U16.size > len(self.data):
+        """The text id of a text box or table (TEXT: the id's place by type), or None."""
+        off = self.TEXT.get(ref.type)
+        if off is None or ref.offset + off + _U16.size > len(self.data):
             return None
-        return _U16.unpack_from(self.data, at)[0]
+        return _U16.unpack_from(self.data, ref.offset + off)[0]
 
 
 class _Reader2000(_Reader2k):
-    """Publisher 2000: Quill stories and WMF pictures."""
+    """Publisher 2000: Quill stories, tables as their stories' paragraphs and WMF pictures."""
+    TABLE = TABLE
+    SHAPES = _Reader2k.SHAPES | {TABLE}
 
     def __init__(self, contents, quill, ctx):
         super().__init__(contents, ctx)
-        bits = pub_quill.bits(quill, ctx)
-        self.stories = pub_quill.stories(bits, ctx, meter=self.meter)
-        self.urls = pub_quill.links(bits)
+        self._quill(quill)
         self.wmfs = {}   # data chunk offset -> its image bytes or None
+
+    def _table(self, ref, story) -> list:
+        """A table's story as paragraphs, its structure not read: counted `table`."""
+        self.ctx.skipped["table"] += 1
+        return list(story.paras)
 
     def _picture(self, ref) -> list:
         data = self.pictures.get(ref.seqnum) if ref.type == PICTURE else None
@@ -232,12 +242,12 @@ def text_boxes(contents, ctx, meter) -> tuple:
         out[index] = Story(index, index, text, pub_quill.paragraphs(text))
         index += 1
         pos = stop + 1
-    return out, total > 0 and bad / total > GARBLED
+    return out, total > 0 and bad / total > text_mod.GARBLED
 
 
-def parse_2000(cf, contents, ctx) -> Doc:
-    """Publisher 2000: `contents` (the Contents stream) and the Quill stream of the open compound file `cf`."""
-    return _Reader2000(contents, cf.read(pub.QUILL), ctx).run()
+def parse_2000(quill, contents, ctx) -> Doc:
+    """Publisher 2000: `contents` (the Contents stream) and `quill` (the Quill stream's bytes)."""
+    return _Reader2000(contents, quill, ctx).run()
 
 
 def parse_97(contents, ctx) -> Doc:

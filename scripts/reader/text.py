@@ -2,6 +2,9 @@
 import re
 
 
+GARBLED = 0.05   # a garble_ratio past it makes the text "garbled" (reader.convert, pub_2k's 97 text)
+
+
 def garble_ratio(s: str) -> float:
     """Share of U+FFFD and control characters other than tab and newline."""
     if not s:

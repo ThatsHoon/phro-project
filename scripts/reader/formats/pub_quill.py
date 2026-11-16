@@ -56,10 +56,11 @@ not read. Every loop is linear in the bytes it reads.
 Cells (`cells(bits, story)`). The `TCD ` bit whose id is the story's index (the first such; `table_bits` maps the ids
 to them once a document): a u32 count less one, then from +0xC the count's u32 cell ends in characters. Each cell's
 end is the `\\r` closing it, which is left out, and the next cell starts past it; the last cell's end is the story's
-end and its closing `\\r` is dropped. An end before the cell's start gives an empty cell; at most one cell more than
-the story's characters is read. `cell_spans(bit, story)` gives them lazily as (start, end, next) offsets in the story,
-the cell's text `story.text[start:end]` and the next cell starting at `next`; `cell_paras(story, spans)` the
-paragraphs of each (start, end), with the story's bold (a run crossing a cell's end is cut there).
+end and its closing `\\r` is dropped. An end before the cell's start gives an empty cell, an end past the story's end
+ends there; at most one cell more than the story's characters is read. `cell_spans(bit, story)` gives them lazily as
+(start, end, next) offsets in the story, the cell's text `story.text[start:end]` and the next cell starting at
+`next`; `cell_paras(story, spans)` the paragraphs of each (start, end), with the story's bold (a run crossing a
+cell's end is cut there).
 
 Links (`links(bits)`). Each `PLC ` bit of type 12, read as POI's `QCPLCBit.Type12`: a 0x34-byte bit holds none;
 otherwise the count's entries start at 0x4C (one) or 0x68 + 22 per entry past two, each a u16 length and that many
@@ -372,7 +373,7 @@ def cell_spans(bit, story: Story):
     text = story.text
     pos = 0
     for end in _u32s(bit, 0xC, min(_U32.unpack_from(bit, 0)[0] + 1, len(text) + 1)):
-        end = max(pos, end)
+        end = min(max(pos, end), len(text))   # an end past the story is cut to it
         stop = end - 1 if end > pos and text[end - 1] == "\r" else end
         nxt = end + 1 if end < len(text) and text[end] == "\r" else end
         yield pos, stop, nxt

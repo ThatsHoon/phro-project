@@ -65,7 +65,7 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
     from . import markdown
     from .limits import ReadError
     from .model import Context
-    from .text import garble_ratio
+    from . import text
     t0 = time.monotonic()
     src, out_dir = Path(src), Path(out_dir)
     ctx = Context()
@@ -81,7 +81,7 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
     (out_dir / "out.md").write_text(md, encoding="utf-8", newline="\n")
     st = markdown.stats(md, info["pages"])
     warnings = list(ctx.warnings) + [w for w in doc.warnings if w not in ctx.warnings]
-    if "garbled" not in warnings and garble_ratio(md) > 0.05:  # a parser may have found it already (pub 97)
+    if "garbled" not in warnings and text.garble_ratio(md) > text.GARBLED:  # a parser may have found it (pub 97)
         warnings.append("garbled")
     meta = {
         "source": str(src),
