@@ -17,7 +17,8 @@ by their place among DIRM's page components, so a dropped page does not renumber
 Page text. TXTa, or TXTz through BZZ: a BE24 length, then UTF-8 (decoded with errors="replace"); the zone tree after
 it is never read. GS, VT and US end a paragraph, LF a line (`_text`). INCL brings in a shared DJVI's chunks, read once
 per document and one level deep (an INCL inside it is not followed). A page with no TXTa or TXTz is counted
-`textless` and gets no section; a text layer that is empty gives an empty section. A page cut short (a chunk that
+`textless` and has no section unless it has bookmark headings or annotation lines (see Bookmarks); a text layer that
+is empty gives an empty section. A page cut short (a chunk that
 runs past its FORM, or a one-page file that ends before its FORM) is counted `record` once and never `textless`: it
 keeps the text read before the cut and has no section without any. When every page read is textless, the file is
 `unsupported` ("no text layer: ..."), so a scan is not called damaged; a file whose pages are all cut is `damaged`.
@@ -26,17 +27,20 @@ BZZ budget. Each BZZ chunk decodes with `min(BZZ_CHUNK, left)`, `left` being wha
 `BZZ_TOTAL`. A Limit at BZZ_CHUNK, a Truncated stream or a damaged one counts the chunk `record`. A Limit at `left`
 spends the budget: that page and every later one count `textless` (but never make the file "no text layer"). Shared
 text repeated on a later page charges its size to `left` again, as if decoded again, so output stays bounded when one
-DJVI is included by every page. Shared annotations are not charged again: each page's are bounded by DJVU_ANT and
-ANT_AREAS, and the page loop by DJVU_DEADLINE.
+DJVI is included by every page. A shared DJVI's annotations are parsed once, and each repeat charges the size of
+the lines it gives to `left` the same way; a repeat that does not fit drops that page's shared annotation lines only,
+counted `link` once for the page (the budget is not spent, so the page's text is kept).
 
-Annotations. ANTa, or ANTz through BZZ: a page's annotation chunks and those of the DJVIs it includes, in chunk order,
-are read as one S-expression text (`_sexp`, iterative: at most DJVU_ANT characters, ANT_DEPTH open lists and
+Annotations. ANTa, or ANTz through BZZ. A page's own annotation chunks are read as one S-expression text, and so
+are a shared DJVI's, once per document (`_sexp`, iterative: at most DJVU_ANT characters, ANT_DEPTH open lists and
 ANT_STRING bytes per string; past a bound, or at an expression that never closes, the rest is ignored and counted
-`link` once). Up to ANT_AREAS mapareas a page (the rest counted `link` once): `(maparea URL COMMENT AREA ...)`, URL a
-string or `(url "href" "target")`. An http, https, mailto or ftp URL gives `Link: ` and a Link labelled with the
+`link` once). Up to ANT_AREAS mapareas per text (the rest counted `link` once): `(maparea URL COMMENT AREA ...)`, URL
+a string or `(url "href" "target")`. An http, https, mailto or ftp URL gives `Link: ` and a Link labelled with the
 comment (or the URL); any other URL, an internal one (`#12`, `#+1`) or none gives `Comment: <comment>` when there is a
-comment, else nothing. The lines are the page section's comments, rendered after its text. The first
-`(metadata (title "..."))` of the pages read is the document title.
+comment, else nothing. A URL holding a space or a control character is no link (it could end the markdown line): its
+comment is kept and it counts `link`. Comments and titles are put on one line. The lines are the page section's
+comments, rendered after its text: the included DJVIs' first (INCL chunks come before a page's own annotations), then
+the page's own. The first `(metadata (title "..."))` of the pages read is the document title.
 
 Bookmarks. A DJVM's NAVM (the chunk after DIRM), through BZZ: a BE16 count, then each bookmark in pre-order (a
 child-count byte, a BE24 length and the description, a BE24 length and the URL). Up to DJVU_BOOKMARKS are read and
@@ -102,6 +106,8 @@ class _Part:
     ant: list = field(default_factory=list)    # annotation texts, in chunk order (shared ones where INCL stood)
     lines: list = field(default_factory=list)  # Para per link or comment line, from the annotations
     title: str = ""       # the first (metadata (title ...)) of the annotations
+    weight: int = 0       # characters of `lines`, charged to `left` when shared lines are repeated
+    over: bool = False    # a repeat of shared lines did not fit `left`: counted `link` once for the page
 
 
 def _chunks(data: bytes, start: int, end: int, ctx=None, dropped=None):
@@ -287,8 +293,9 @@ def _sexp(text: str, ctx=None) -> list:
     return out
 
 
-def _maparea(item: list):
-    """The comment line of one `(maparea URL COMMENT ...)`, or None."""
+def _maparea(item: list, bad: list):
+    """The comment line of one `(maparea URL COMMENT ...)`, or None. A link URL holding a space or a control character
+    is appended to `bad` and gives no Link."""
     url = item[1] if len(item) > 1 else ""
     if isinstance(url, list):  # (url "href" "target")
         url = url[1] if len(url) > 1 and url[0] == "url" and isinstance(url[1], str) else ""
@@ -297,7 +304,9 @@ def _maparea(item: list):
     comment = _one_line(comment)
     scheme, colon, rest = url.partition(":")
     if colon and rest and scheme.lower() in LINK_SCHEMES:
-        return Para([Text("Link: "), Link(url, [Text(comment or url)])])
+        if not any(ch.isspace() or not ch.isprintable() for ch in url):
+            return Para([Text("Link: "), Link(url, [Text(comment or url)])])
+        bad.append(url)  # a line break in it would end the "> " line and start a markdown one
     if comment:
         return Para([Text("Comment: " + comment)])
     return None
@@ -308,6 +317,7 @@ def _annotations(text: str, ctx) -> tuple[list, str]:
     count `link` once."""
     lines, title = [], ""
     areas = 0
+    bad = []
     for item in _sexp(text, ctx):
         if not item or not isinstance(item[0], _Sym):
             continue
@@ -321,12 +331,25 @@ def _annotations(text: str, ctx) -> tuple[list, str]:
             areas += 1
             if areas > ANT_AREAS:
                 continue
-            line = _maparea(item)
+            line = _maparea(item, bad)
             if line is not None:
                 lines.append(line)
     if areas > ANT_AREAS:
         ctx.skipped["link"] += 1
+    ctx.skipped["link"] += len(bad)
     return lines, title
+
+
+def _weight(lines: list) -> int:
+    """Characters a list of comment lines holds: their texts, link URLs and labels."""
+    total = 0
+    for para in lines:
+        for it in para.inlines:
+            if isinstance(it, Link):
+                total += len(it.url) + sum(len(t.text) for t in it.inlines)
+            else:
+                total += len(it.text)
+    return total
 
 
 def _target(url: str, ids: dict, count: int):
@@ -592,26 +615,43 @@ class _Reader:
             else:
                 got = _Part()
                 self._read(where[0], where[1], got, nested=True)
+                if got.ant and not self.spent:  # parsed once per document, whatever includes it
+                    got.lines, got.title = _annotations("\n".join(got.ant), self.ctx)
+                    got.weight = _weight(got.lines)
+                got.ant = []
                 self.shared[name] = got
         got = self.shared[name]
         if got is None:
             return
         part.text = part.text or got.text
         part.images = part.images or got.images
-        if name in self.used and got.size:  # a repeat: charged as if decoded again
+        repeat = name in self.used
+        if repeat and got.size:  # a repeat: charged as if decoded again
             if got.size > self.left:
                 self.spent, self.left = True, 0
                 return
             self.left -= got.size
         self.used.add(name)
         part.paras.extend(got.paras)
-        part.ant.extend(got.ant)
+        part.title = part.title or got.title
+        if repeat and got.weight > self.left:  # these lines only are dropped; the budget is not spent
+            part.over = True
+            return
+        if repeat:
+            self.left -= got.weight
+        part.lines.extend(got.lines)
 
     def _page(self, start: int, end: int) -> _Part:
         part = _Part()
         self._read(start, end, part, nested=False)
-        if part.ant and not self.spent:
-            part.lines, part.title = _annotations("\n".join(part.ant), self.ctx)
+        if self.spent:
+            return part
+        if part.ant:
+            lines, title = _annotations("\n".join(part.ant), self.ctx)
+            part.lines.extend(lines)
+            part.title = part.title or title
+        if part.over:
+            self.ctx.skipped["link"] += 1
         return part
 
     def _late(self) -> bool:

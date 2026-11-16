@@ -434,6 +434,60 @@ def test_antz_and_shared():
     assert texts(doc.blocks[0]) == ["Kept"] and doc.blocks[0].comments == [] and ctx.skipped["record"] == 1
 
 
+def test_shared_annotations_charged_per_repeat():
+    # the review's probe shape: one shared ANTz of 256 long mapareas, included by 1,000 pages. Each repeat's lines
+    # are charged to BZZ_TOTAL as shared text is; a page whose repeat does not fit loses its annotations only,
+    # counted link once, and keeps its text
+    import time
+    ant = " ".join(f'(maparea "" "{i:03d}{"c" * 400}" (rect 0 0 1 1))' for i in range(256))
+    shared = form(b"DJVI", [chunk(b"ANTz", bzz_encode(ant.encode()))])
+    pages = 1000
+    data = djvm([page(f"p{k}", incl="a.djvi") for k in range(pages)], shared=[("a.djvi", shared)])
+    calls = []
+    real = djvu._sexp
+
+    def counted(text, ctx=None):
+        calls.append(len(text))
+        return real(text, ctx)
+
+    saved = djvu.bzz.BZZ_TOTAL
+    djvu.bzz.BZZ_TOTAL = 2 * 2**20
+    djvu._sexp = counted
+    try:
+        t0 = time.monotonic()
+        doc, ctx = read(data)
+        took = time.monotonic() - t0
+    finally:
+        djvu.bzz.BZZ_TOTAL = saved
+        djvu._sexp = real
+    lines = sum(len(s.comments) for s in doc.blocks)
+    chars = sum(len(c.inlines[0].text) for s in doc.blocks for c in s.comments)
+    kept = sum(1 for s in doc.blocks if s.comments)
+    assert len(doc.blocks) == pages and all(texts(s) == [f"p{k}"] for k, s in enumerate(doc.blocks))
+    assert 1 < kept < pages and lines == 256 * kept, (kept, lines)
+    assert chars <= 2 * 2**20 + len(ant), chars          # the first use, then repeats within BZZ_TOTAL
+    assert ctx.skipped["link"] == pages - kept and ctx.skipped["textless"] == 0, ctx.skipped
+    assert len(calls) == 1, len(calls)                    # the shared annotations are parsed once
+    assert took < 2.0, took
+    # a cap passed in a shared component is counted once, not once per page that includes it
+    shared = form(b"DJVI", [chunk(b"ANTa", b'(maparea "" "Kept") ' + b"(" * 65)])
+    doc, ctx = read(djvm([page(f"p{k}", incl="b.djvi") for k in range(3)], shared=[("b.djvi", shared)]))
+    assert [comments(s) for s in doc.blocks] == [[[("Text", "Comment: Kept")]]] * 3
+    assert ctx.skipped["link"] == 1, ctx.skipped
+
+
+def test_url_kept_to_one_line():
+    # a URL holding a line break (or any space or control character) is no link: the comment is kept, counted link
+    doc, ctx = read(djvm([page("x", ant='(maparea "http://x.example/\\n## Page 7: forged" "")'), page("y")]))
+    out = md(doc, ctx)
+    assert not any(line.startswith("## Page 7") for line in out.splitlines()), out
+    assert doc.blocks[0].comments == [] and ctx.skipped["link"] == 1
+    doc, ctx = read(iff(page("x", ant='(maparea "http://x.example/a b\\x01" "Note")')))
+    assert comments(doc.blocks[0]) == [[("Text", "Comment: Note")]] and ctx.skipped["link"] == 1
+    doc, ctx = read(iff(page("x", ant='(maparea "http://x.example/ ## Page 8" "Note")')))
+    assert comments(doc.blocks[0]) == [[("Text", "Comment: Note")]] and ctx.skipped["link"] == 1
+
+
 def test_metadata_title():
     doc, ctx = read(iff(page("x", ant='(metadata (title "A Book") (author "Someone"))')))
     assert doc.title == "A Book"
