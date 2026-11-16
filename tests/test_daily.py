@@ -28,7 +28,7 @@ def copy_of(project):
     (plugin / "skills/daily").mkdir(parents=True)
     shutil.copy(HERE / "scripts/daily.py", plugin / "scripts/daily.py")
     shutil.copy(HERE / "skills/daily/SKILL.md", plugin / "skills/daily/SKILL.md")
-    (plugin / "origin.json").write_text(json.dumps({"project": str(project)}), encoding="utf-8")
+    (plugin / "origin.json").write_text(json.dumps({"project": str(project), "daily": False}), encoding="utf-8")
     return plugin
 
 
@@ -193,6 +193,9 @@ def test_off_until_switched_on():
     plugin = copy_of(project)
     d = load(plugin)
     assert not d.enabled(), "a new copy starts off"
+    (plugin / "origin.json").write_text(json.dumps({"project": str(project)}), encoding="utf-8")
+    assert load(plugin).enabled(), "a copy made before the switch keeps running"
+    (plugin / "origin.json").write_text(json.dumps({"project": str(project), "daily": False}), encoding="utf-8")
     d.due = lambda now: date(2026, 11, 10)  # due now, so only the switch keeps the hook quiet
     d.hook()
     assert not (plugin / "docs/daily").exists(), "off: the hook claims nothing"

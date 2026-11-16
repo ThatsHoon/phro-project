@@ -131,7 +131,7 @@ def make(project, folder, source, where):
     write_json(temporary / MANIFEST, manifest)
     owner = manifest.get("author") or {"name": original}
     write_json(temporary / MARKET, {"name": folder.name, "owner": owner, "description": f"Holds this project's own copy of {original}.", "plugins": [{"name": folder.name, "source": "./", "description": manifest["description"]}]})
-    write_json(temporary / ORIGIN, {"origin": original, **where, "version": version, "project": str(project), "files": files})
+    write_json(temporary / ORIGIN, {"origin": original, **where, "version": version, "project": str(project), "daily": False, "files": files})  # a new copy starts with the daily report off
     temporary.rename(folder)
 
 

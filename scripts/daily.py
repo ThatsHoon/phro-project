@@ -7,7 +7,8 @@
   daily.py on | off                               turn the morning hook on or off for this copy (off by default)
 
 Only a copy writes reports (origin.json names its project); the original plugin stays silent.
-The hook starts runs only after `daily.py on` set "daily": true in origin.json; `run` itself works either way. Times are KST.
+`clone.py ensure` writes new copies with "daily": false, so the hook stays off until `daily.py on`; a copy without the key
+(made before the switch) keeps running. Sync never touches the key. `run` itself works either way. Times are KST.
 """
 import argparse
 import json
@@ -47,7 +48,8 @@ def project():
 
 
 def enabled():
-    return record().get("daily") is True
+    """The copy's own setting. New copies are written with "daily": false; a copy made before the switch has no key and keeps running."""
+    return record().get("daily", True) is True
 
 
 def switch(on):

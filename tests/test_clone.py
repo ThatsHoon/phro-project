@@ -75,7 +75,7 @@ def demo():
         market = json.loads((copy / clone.MARKET).read_text(encoding="utf-8"))
         assert market["name"] == manifest["name"] and market["plugins"] == [{"name": manifest["name"], "source": "./", "description": manifest["description"]}], market
         record = json.loads((copy / clone.ORIGIN).read_text(encoding="utf-8"))
-        assert Path(record["project"]) == app.resolve() and record["origin"] == "phro-project" and record["version"] == version, record
+        assert Path(record["project"]) == app.resolve() and record["origin"] == "phro-project" and record["version"] == version and record["daily"] is False, record
         assert not (copy / ".git").exists(), "a copy shares no history with the original"
         assert not (copy / "mods/.git").exists(), "a .git pointer file would make git in the copy act on the original's repository"
         assert not (copy / ".superpowers").exists() and not (copy / ".worktrees").exists(), "work logs and worktrees are not the plugin"
