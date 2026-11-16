@@ -657,7 +657,7 @@ def test_notices_credit_port_sources():
     docs = {f.relative_to(HERE).as_posix(): ast.get_docstring(ast.parse(f.read_text(encoding="utf-8"))) or ""
             for f in sorted((HERE / "scripts" / "reader").rglob("*.py"))}
     for proj in ("dochan", "kordoc", "rhwp", "anydoc", "docling", "xberg", "tika", "foliate-js", "numbers-parser",
-                 "keynote-parser", "djvu-rs"):
+                 "keynote-parser", "djvu-rs", "jackcess"):
         sec = text.split(f"## {proj}\n", 1)[1].split("\n## ", 1)[0]
         paths = re.findall(r"`(scripts/[^`]+)`", next(ln for ln in sec.splitlines() if ln.startswith("Ported:")))
         for rel, doc in docs.items():

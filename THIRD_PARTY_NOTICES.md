@@ -884,6 +884,28 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## jackcess
+
+Ported: the Jet and ACE page layer (page 0 and its header mask, the version codes and page sizes, the code page and encoding key, the db_key page codec, inline and reference usage maps, page chains and the compressed unicode text form) in `scripts/reader/formats/jet_pages.py`, from `com/healthmarketscience/jackcess/impl/` (`JetFormat.java`, `PageChannel.java`, `UsageMap.java`, `CodecHandler.java`, `DefaultCodecProvider.java`, `DatabaseImpl.java` and `ColumnImpl.java`) of Jackcess 5.0.4, read from its Maven Central sources jar (`jackcess-5.0.4-sources.jar`, SHA-1 bba7e080c838c4b77704e509efc9cf336d578d6a); the Jet writer of the test fixtures in `tests/jet_fix.py` follows the layouts of the same release (`TableImpl.java`, `ColumnImpl.java`, `IndexData.java`, `IndexImpl.java`, `LongValueColumnImpl.java`, `PropertyMaps.java`). mdbtools' `HACKING.md` (LGPL) was read as format knowledge only. Jackcess is licensed under the Apache License 2.0, whose text is reproduced under tika above. The sources jar carries no NOTICE file; the Jackcess repository's `NOTICE.txt` reads:
+
+```
+Many of the financial functions in the expression engine have been originally
+copied from the Apache POI project (Apache Software Foundation) and the
+UCanAccess Project.  They have been then modified and adapted so that they are
+integrated with Jackcess, in a consistent manner.  The Apache POI and
+UCanAccess projects are both licensed under Apache License, Version 2.0
+http://www.apache.org/licenses/LICENSE-2.0.
+```
+
+Copyright notices of the source files named above:
+
+```
+Copyright (c) 2005 Health Market Science, Inc.
+Copyright (c) 2010 James Ahlborn
+Copyright (c) 2011 James Ahlborn
+Copyright (c) 2014 James Ahlborn
+```
+
 ## Adobe
 
 Data: `scripts/reader/pdfnative/cid_unicode_data.py` (the Adobe CID to Unicode tables of mapping-resources-pdf), `scripts/reader/pdfnative/predefined_cmap_data.py` (the predefined Encoding CMap ranges of cmap-resources) and `scripts/reader/pdfnative/core14_metrics.py` (the Core 14 AFM metrics and the Adobe Glyph List). The three modules are copied byte for byte from dochan 1.21.0 (commit 29bb52be2cf40750e0dab25b24d87e33d0fcedd7, `src/dochan/pdf/`), each with one added docstring line; dochan's NOTICE reproduces Adobe's notices as follows. The original Adobe CMap and AFM files are not distributed.
