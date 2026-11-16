@@ -379,8 +379,9 @@ def connect_cleaner(s):
 
 
 def url_cleaner(s):
-    """A stand-in for jet.py's URL rule (idempotent): a URL's user part after "//" withheld, as "…"."""
-    return re.sub(r"//[^/@\s'\"]*@", "//…@", s).replace("//……@", "//…@")
+    """A stand-in for jet.py's URL rule (idempotent), given one quoted or bracketed run's content or a stretch between
+    runs: a URL's user part withheld as "…", its authority running to "/", "\\", "?", "#", a line break or the end."""
+    return re.sub(r"(?i)(https?:/*|//)[^/\\?#\r\n]*@", r"\1…@", s)
 
 
 def test_connect_hook():
@@ -417,7 +418,7 @@ def test_connect_hook():
         jet_sql.sql(q, connect=connect_cleaner)
     # any other literal or identifier is the document's content, kept as stored
     kept = ["[Notes] Like \"*key=1;*\"", "DLookUp(\"Name\",\"T\",\"[A]=1 AND [B]='x;PWD=y'\") Is Null",
-            "[a;PWD=b] = 'IN ''x;PWD=1'' z' AND [x;y=z]", "'a\nWHERE [ODBC;PWD=s"]
+            "[a;PWD=b] = 'IN ''x;PWD=1'' z' AND [x;y=z]"]
     for w in kept:
         q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
         assert jet_sql.sql(q, connect=connect_cleaner) == lines("SELECT a", f"WHERE {w};"), w
@@ -429,9 +430,50 @@ def test_connect_hook():
         lines("SELECT 'a;b=c'", "FROM [x;PWD=1].T;")
 
 
+def test_unbalanced_fails_closed():
+    # a quote or bracket left open, a bracket holding "[", or a ";" between runs before the text's end: the runs are
+    # not as Access stores them, so the rest of the text is one run, a connect position (and then the URL rule)
+    cases = {
+        "x = O'Neil AND y IN (SELECT b FROM T IN '' [ODBC;PWD=s3cr3t])": "x = O'Neil AND y IN (SELECT b FROM T IN '' "
+                                                                          "[ODBC;…",
+        "x = 5\" AND y IN (SELECT b FROM [ODBC;PWD=s3cr3t].T)": "x = 5\" AND y IN (SELECT b FROM [ODBC;…",
+        "x = [a AND y IN (SELECT b FROM T IN '' [ODBC;PWD=s3cr3t])": "x = [a AND y IN (SELECT b FROM T IN '' [ODBC;…",
+        "x IN (SELECT y FROM [ODBC;DSN=x;PWD=s3cr3t": "x IN (SELECT y FROM [ODBC;DSN=x;…",
+        "[ODBC;DSN=x;PWD=s3cr3t AND y = [z]": "[ODBC;DSN=x;…",
+        "a = 'x AND b IN 'c:\\db.mdb' ';PWD=s3cr3t'": "a = 'x AND b IN 'c:\\db.mdb' ';…",
+        "a = 'https://bob:s3cr3t@h": "a = 'https://…@h;",
+    }
+    for w, want in cases.items():
+        q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
+        got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+        assert "s3cr3t" not in got and got == lines("SELECT a", f"WHERE {want}"), (w, got)
+    # a parameter list's ";" is its own end; a pass-through query's runs are only read for URLs
+    q = [row(TYPE, None, SELECT), row(PARAMETER, None, 4, "p;q"), row(COLUMN, "a"), row(WHERE, "a = [p;q]")]
+    assert jet_sql.sql(q, connect=connect_cleaner) == lines("PARAMETERS [p;q] Long;", "SELECT a", "WHERE a = [p;q];")
+    q = [row(TYPE, "SELECT 1; SELECT 'https://bob:pw@h", PASSTHROUGH, "ODBC;")]
+    assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == "SELECT 1; SELECT 'https://…@h"
+    # a [connect] prefix with spaces before its "."
+    q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, "a IN (SELECT b FROM [ODBC;DSN=x;PWD=s3cr3t] .T)")]
+    want = lines("SELECT a", "WHERE a IN (SELECT b FROM [ODBC;DSN=x;…] .T);")
+    assert jet_sql.sql(q, connect=connect_cleaner) == want
+
+
 def test_url_hook():
     # `urls` takes a URL's user part out anywhere in the text, pass-through included, and from a name before it is
-    # split at "."
+    # split at "."; it is given each quoted or bracketed run's content and each stretch between runs, so a URL's
+    # authority ends with its run, whatever the run holds (a space, a doubled quote, a comma, a bracket)
+    w = ("u = 'https://bob:my s3cr3t@h/x' OR v = 'https://bob:it''ss3cr3t@h/x' OR w = 'https:bob:s3cr3t@h/x' "
+         "OR z = 'https://bob:pw' AND y = 'a@b'")
+    q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
+    got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+    assert got == lines("SELECT a", "WHERE u = 'https://…@h/x' OR v = 'https://…@h/x' OR w = 'https:…@h/x' "
+                        "OR z = 'https://bob:pw' AND y = 'a@b';"), got
+    # outside any run too: a stretch between runs, in a query's text and in a pass-through's
+    q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, "u = 'x' OR https://bob:s3cr3t@h/x = [y]")]
+    got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+    assert got == lines("SELECT a", "WHERE u = 'x' OR https://…@h/x = [y];"), got
+    q = [row(TYPE, "EXEC p 'a', http://bob:s3cr3t@h/x", PASSTHROUGH, "ODBC;")]
+    assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == "EXEC p 'a', http://…@h/x"
     q = [row(TYPE, None, SELECT), row(COLUMN, "'see //bob:pw@h/x'"), row(TABLE, None, None, "https://u:p.w@h/x"),
          row(WHERE, "a Like \"*key=1;*\"")]
     got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
@@ -484,6 +526,7 @@ def shapes():
         "sorted": [Row(COLUMN, "a", None, None, None, 1, bytes([i % 256, i // 256])) for i in range(n)]
         + [Row(TYPE, None, SELECT, None, None, 1, b"\0")],
         "scrub": [row(TYPE, None, SELECT), row(WHERE, "x IN  '' [a;b].[c;d]. " * 2000 + "IN" + " " * 20_000)],
+        "runs": [row(TYPE, None, SELECT), row(WHERE, "'a'[b]\"c\"[d;{e]}] .:/" * 3000 + "IN [x;")],
         "text": [row(TYPE, None, SELECT), row(COLUMN, "x" * 60000)],
     }
 

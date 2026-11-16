@@ -2655,6 +2655,30 @@ def test_query_credential_positions():
             "SELECT a INTO [ODBC;DSN=a;…];",
             "SELECT a\nFROM [ODBC;DRIVER={x};…].T\nWHERE b IN (SELECT c FROM [ODBC;DRIVER={x};…].W);"], texts
         assert "s3cr3t" not in md and "bob" not in md and ctx.skipped == {"withheld": 4}, (md, ctx.skipped)
+    # a URL's user part whose password holds a space, a doubled quote, a comma, a parenthesis, a bracket or "<", and
+    # a special scheme with no slash: the authority ends only at "/", "\\", "?", "#", a line break or its run's end
+    lits = ["https://bob:my s3cr3t@h/x.mdb", "https://bob:it''ss3cr3t@h/x", "https://bob:a,s3cr3t@h/x",
+            "https://bob:a(s3cr3t@h/x", "https://bob:a[s3cr3t@h/x", "https://bob:a<s3cr3t@h/x", "https:bob:s3cr3t@h/x"]
+    qs = [Query(f"W{k}", [(1, None, 1, None, None), (6, "a", None, None, None), (8, f"u = '{lit}'", None, None, None)])
+          for k, lit in enumerate(lits)]
+    doc, ctx, md = convert(jet_db(1, [], queries=qs))
+    assert [q.blocks[0].text for q in queries(doc)] == [
+        "SELECT a\nWHERE u = 'https://…@h/x.mdb';"] + ["SELECT a\nWHERE u = 'https://…@h/x';"] * 5 + [
+        "SELECT a\nWHERE u = 'https:…@h/x';"]
+    assert "s3cr3t" not in md and "bob" not in md and ctx.skipped == {"withheld": 7}, ctx.skipped
+    # unbalanced quotes and brackets fail closed: the rest of the text is one connect position
+    wheres = ["x = O'Neil AND y IN (SELECT b FROM T IN '' [ODBC;PWD=s3cr3t])",
+              "x = 5\" AND y IN (SELECT b FROM [ODBC;PWD=s3cr3t].T)",
+              "x = [a AND y IN (SELECT b FROM T IN '' [ODBC;PWD=s3cr3t])",
+              "x IN (SELECT y FROM [ODBC;DSN=x;PWD=s3cr3t", "[ODBC;DSN=x;PWD=s3cr3t AND y = [z]",
+              "a = 'x AND b IN 'c:\\db.mdb' ';PWD=s3cr3t'", "a = O'Neil AND b IN 'c:\\db.mdb' [;PWD=s3cr3t]",
+              "a IN (SELECT b FROM [ODBC;DSN=x;PWD=s3cr3t] .T)"]
+    qs = [Query(f"U{k}", [(1, None, 1, None, None), (6, "a", None, None, None), (8, w, None, None, None)])
+          for k, w in enumerate(wheres)]
+    for v in (0, 1, 3):
+        doc, ctx, md = convert(jet_db(v, [], queries=qs))
+        assert all(q.blocks for q in queries(doc)) and "s3cr3t" not in md, md
+        assert ctx.skipped == {"withheld": len(wheres)}, ctx.skipped
 
 
 def test_query_content_kept():
@@ -2812,8 +2836,8 @@ def test_query_work_charged():
         sec = jet._query(db, q, got)
     spent = db.meter.charged - before
     assert sec.blocks[0].text.startswith("PARAMETERS ") and "(d) AND (d)" in sec.blocks[0].text
-    # the query, its work, and its text's characters for the URL rule (no connect position here)
-    least = jet._QUERY + jet._SQL * jet_sql.work(got) + len(sec.blocks[0].text)
+    # the query and its work (no connect position here, and no ":", "/" or "\\" for the URL rule to read)
+    least = jet._QUERY + jet._SQL * jet_sql.work(got)
     assert spent >= least and loops.n <= 2 * spent + 16, (loops.n, spent, least)
     # a query whose rows were not kept costs `_QUERY` alone: its heading
     before = db.meter.charged
@@ -2857,6 +2881,9 @@ def test_query_urls_charged():
         spent = db.meter.charged - before
         assert spent >= len(s) and loops.n <= 2 * spent + 16, (s[:20], loops.n, spent)
     cases = {"see http://bob:pw@site/x and //ann@h": ("see http://…@site/x and //…@h", True),
+             "https://bob:my s3cr3t@h/x": ("https://…@h/x", True), "https:bob:a,b@h/x": ("https:…@h/x", True),
+             "HTTP:bob@h": ("HTTP:…@h", True), "news:bob@h": ("news:bob@h", False),
+             "//a b@c\nd@e": ("//…@c\nd@e", True), "see http://h/a@b": ("see http://h/a@b", False),
              "\\\\bob:pw@srv\\share": ("\\\\…@srv\\share", True), "u:pa/ss@h, ftp://u:pa/ss@h/x": (
                  "u:pa/ss@h, ftp://…@h/x", True), "C:\\a@b\\c": ("C:\\…@b\\c", True),
              "a/b@c x//y": ("a/b@c x//y", False),

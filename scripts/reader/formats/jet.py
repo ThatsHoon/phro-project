@@ -77,9 +77,10 @@ Queries. After the tables, each saved query (catalog type 5, not a system object
 (hidden when flagged 0x08) holding its SQL text in an `sql` Code block: its MSysQueries rows, grouped by ObjectId
 in one walk of the table (`_query_rows`), rebuilt the way Jackcess writes them by `jet_sql` (never run). The connect
 strings and database paths a query names, by position (`jet_sql`: a remote database, a source's qualifier, a
-target, an IN clause's path and type and a [connect]. prefix in its text), are cleaned as a linked table's connect
-string (`_clean_connect`), so no PWD=, UID= or URL user part shows there; any other literal or identifier is the
-document's content, kept as stored, except that a URL's user part is taken out anywhere (`_clean_urls`). What is
+target, an IN clause's path and type and a [connect]. prefix in its text, and the rest of a text whose quotes or
+brackets do not balance), are cleaned as a linked table's connect string (`_clean_connect`), so no PWD=, UID= or URL
+user part shows there; any other literal or identifier is the document's content, kept as stored, except that a URL's
+user part is taken out anywhere, its authority ending with its quoted or bracketed run (`_clean_urls`). What is
 withheld shows as "…", and each query showing one counts `withheld`. A pass-through query's stored text is shown as
 stored (a URL's user part aside), its connect string never. A query whose rows are not kept (past
 `jet_sql.JET_QUERY_ROWS`, a cell that cannot be read, a Memo past eight times `jet_sql.JET_SQL` bytes, the queries'
@@ -247,9 +248,11 @@ LINK_SCHEMES = frozenset(("http", "https", "mailto", "ftp"))
 _NUMBERS = frozenset((BYTE, INT, LONG, BIGINT, MONEY, FLOAT, DOUBLE, NUMERIC))
 _ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md; every real file read has 0)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
-_SLASHES = re.compile(r"[/\\]+")
-_WORD_STOP = re.compile(r"[\s'\"\[\]()<>,]")
-_AUTH_STOP = re.compile(r"[/\\?#]")
+# where a URL's authority starts in query text (`_clean_urls`): after a special scheme's ":" (slashes or none), after
+# ":" and slashes, or after two or more slashes or backslashes
+_URL_START = re.compile(r"(?i)\b(?:https?|ftp|wss?|file):[/\\]*|:[/\\]+|[/\\]{2,}")
+_AUTH_STOP = re.compile(r"[/\\?#\r\n]")
+_LINE_STOP = re.compile(r"[\r\n]")
 _SQL_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")  # shown as a space in a query's text
 _BAD = (ValueError, IndexError, struct.error, ArithmeticError)  # a row, cell or TDEF that cannot be read
 
@@ -1664,27 +1667,30 @@ def _clean_connect(db: _Db, s: str):
 
 
 def _clean_urls(db: _Db, s: str):
-    """`s` with each URL's user part taken out, as `_safe_value` reads one, put as "…" ("http://…@host/x"), and
-    whether any was. A URL here is a run of two or more slashes or backslashes, or one after a ":"; its authority runs
-    to the next "/", "\\", "?" or "#" (or the end of its word: a space, quote, bracket, parenthesis, "<", ">" or
-    ","). The user part is up to the authority's last "@"; an authority holding ":" and no "@" whose word holds one
-    later (`u:pa/ss@h`) gives up to that "@". Its characters are charged first; one pass."""
-    db.charge(len(s))
-    out, last, dropped = [], 0, False
-    word_end, word_at = -1, -1
-    for m in _SLASHES.finditer(s):
+    """`s` (one quoted or bracketed run's content, or a stretch between runs, `jet_sql`'s `urls`) with each URL's user
+    part taken out, put as "…" ("http://…@host/x"), and whether any was. A URL starts after a special scheme's ":"
+    (http, https, ftp, ws, wss, file; slashes or none, as WHATWG reads one), after ":" and slashes, or after two or more
+    slashes or backslashes; its authority runs to the next "/", "\\", "?", "#", line break or the end of `s`, and its
+    user part to the authority's last "@", whatever it holds (a space, a quote, a comma, a bracket). When unsure it
+    withholds: an authority holding ":" and no "@" whose line holds one later (`u:pa/ss@h`) gives up to that "@".
+    Its characters and a `_PART` are charged first; one pass."""
+    db.charge(len(s) + _PART)
+    out, last, dropped, seen = [], 0, False, -1
+    line_end, line_at = -1, -1
+    for m in _URL_START.finditer(s):
         a = m.end()
-        if a <= last or m.end() - m.start() < 2 and not (m.start() and s[m.start() - 1] == ":"):
+        if a <= last or a < seen:  # inside an authority already read: it holds no "@" past `last`
             continue
-        if a >= word_end:
-            stop = _WORD_STOP.search(s, a)
-            word_end = len(s) if stop is None else stop.start()
-            word_at = s.rfind("@", a, word_end)
-        stop = _AUTH_STOP.search(s, a, word_end)
-        b = word_end if stop is None else stop.start()
+        stop = _AUTH_STOP.search(s, a)
+        b = len(s) if stop is None else stop.start()
+        seen = b
+        if a >= line_end:
+            stop = _LINE_STOP.search(s, a)
+            line_end = len(s) if stop is None else stop.start()
+            line_at = s.rfind("@", a, line_end)
         at = s.rfind("@", a, b)
-        if at < 0 and word_at >= a and ":" in s[a:b]:
-            at = word_at
+        if at < 0 and line_at >= b and ":" in s[a:b]:
+            at = line_at
         if at < 0:
             continue
         if s[a:at] != "…":
@@ -1777,7 +1783,7 @@ def _query_rows(db: _Db, catalog: list, queries: list):
 def _query(db: _Db, obj: Obj, rows) -> Section:
     """A query's section, "Query: <name>", holding its SQL (`jet_sql.sql`, its work charged first through
     `Meter.afford`) as a Code block; with no SQL (rows not kept, Jackcess unable to write it, the meter) the heading
-    stays alone, counted `query`. Its connect positions go through `_clean_connect` and its text through
+    stays alone, counted `query`. Its connect positions go through `_clean_connect` and its text, run by run, through
     `_clean_urls`; a query whose SQL shows with anything withheld ("…") counts `withheld` once. A control character
     other than a tab or line break shows as a space."""
     text = None

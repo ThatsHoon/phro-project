@@ -22,12 +22,15 @@ Credentials, by position. With `connect`, every connect position is passed throu
 and type (`IN '<path>' [<type>]`) of a source or of a make-table or append target; a source's database qualifier
 (`[<qualifier>].<table>`); a source or target name holding ";", whole, before it is split at "."; and in the finished
 text (a union part, a derived table, a subquery, any expression) the quoted path after an IN keyword, the quoted or
-bracketed type right after that path, and a bracketed prefix holding ";" that a "." follows (a "{" in it reaches its
-"}", so a braced value holding "]" stays inside; one left open runs to the end of the text). Every other quoted
-literal or bracketed identifier is the document's content and is kept as stored. With `urls`, a URL's user part is
-taken out anywhere in the text (pass-through text included) and from a name before it is split. A pass-through
-query's stored text has no connect position, and its connect string (the type row's Name1) is never written. The
-hooks are idempotent; what they withhold they mark ("…").
+bracketed type right after that path, and a bracketed prefix holding ";" that a "." follows, spaces aside (a "{" in
+it reaches its "}", so a braced value holding "]" stays inside). Every other quoted literal or bracketed identifier
+is the document's content and is kept as stored. The scan fails closed: a quote or bracket left open, a bracket
+holding "[", or a ";" between runs before the text's end (the parameter list is read on its own) means the runs are
+not as Access stores them, so the rest of the text is one run and a connect position. With `urls`, a URL's user part
+is taken out anywhere: `urls` is given each run's content and each stretch between runs (so a URL ends with its run),
+pass-through text included, and a name before it is split. A pass-through query's stored text has no connect
+position, and its connect string (the type row's Name1) is never written. The hooks are idempotent; what they
+withhold they mark ("…").
 
 Work. `work(rows)` is an upper bound on what `sql` does, in steps (a character of text, `_ROW` a row, a comparison of
 the sort, `_JOIN` a table source a join looks at, builds or walks); the caller charges it before `sql` runs.
@@ -108,50 +111,68 @@ def sql(rows, *, flags: int = 0, connect=None, urls=None) -> str | None:
         return None
     try:
         q = _Query(rows, flags, connect, urls)
-        text = q.text()
+        head, body = q.text()
     except _Fail:
         return None
-    if connect is not None and q.kind != PASSTHROUGH:
-        text = _scrub(text, connect)
-    if urls is not None:
-        text = urls(text)
+    if connect is not None or urls is not None:
+        positions = None if q.kind == PASSTHROUGH else connect
+        head, body = _scrub(head, positions, urls), _scrub(body, positions, urls)
+    text = head + body
     return text if len(text) <= JET_SQL else None
 
 
-def _scrub(text: str, connect) -> str:
-    """`text` with each connect position's content passed through `connect` (see the module's docstring): the quoted
-    path after IN, the quoted or bracketed type right after it, a bracketed prefix holding ";" that a "." follows or
-    that is left open. Quoted and bracketed runs are read in one pass (a doubled quote is part of its run); any other
-    run is kept as it is, and a run left open ends the scan with the text."""
-    out, i, last, path = [], 0, 0, -1
+def _scrub(text: str, connect, urls) -> str:
+    """`text` with each connect position's content passed through `connect` (None: no position) and every run's
+    content and stretch between runs through `urls` (see the module's docstring). Quoted and bracketed runs are read
+    in one pass (a doubled quote is part of its run). It fails closed: a run left open, a bracket holding "[", or (with
+    `connect`) a ";" between runs before the text's last character make the rest of the text one connect position."""
+    def bare(s):
+        return urls(s) if urls is not None and s and (":" in s or "/" in s or "\\" in s) else s
+
+    out, i, gap, path = [], 0, 0, -1
     n = len(text)
+    last = len(text.rstrip()) - 1  # where a closing ";" may stand
     while True:
         m = _OPENS.search(text, i)
+        o = n if m is None else m.start()
+        if connect is not None:
+            semi = text.find(";", gap, o)
+            if 0 <= semi < last:
+                out.append(bare(connect(text[gap:])))
+                return "".join(out)
         if m is None:
             break
-        o = m.start()
         c = text[o]
         prefix = False
         if c == "[":
             end = text.find("]", o + 1)
-            if end >= 0 and ";" in text[o + 1:end]:
+            if end >= 0 and "[" in text[o + 1:end]:
+                end = -1
+            elif end >= 0 and ";" in text[o + 1:end]:
                 end = _bracket_end(text, o + 1)
-                prefix = end < 0 or text[end + 1:end + 2] == "."
+                if end >= 0:
+                    k = end + 1
+                    while k < n and text[k] in " \t":
+                        k += 1
+                    prefix = text[k:k + 1] == "."
         else:
             end = _closing(text, o + 1, c)
-        stop = n if end < 0 else end
+        out.append(bare(text[gap:o]))
+        out.append(c)
+        if end < 0:
+            rest = text[o + 1:]
+            out.append(bare(rest if connect is None else connect(rest)))
+            return "".join(out)
         after_in = _after_in(text, o)
         typed = path >= 0 and not text[path:o].strip()
-        position = after_in or typed or prefix
-        path = stop + 1 if after_in and c != "[" else -1
-        if position:
-            out.append(text[last:o + 1])
-            out.append(connect(text[o + 1:stop]))
-            last = stop
-        if end < 0:
-            break
-        i = end + 1
-    out.append(text[last:])
+        path = end + 1 if after_in and c != "[" else -1
+        inner = text[o + 1:end]
+        if connect is not None and (after_in or typed or prefix):
+            inner = connect(inner)
+        out.append(bare(inner))
+        out.append(text[end])
+        gap = i = end + 1
+    out.append(bare(text[gap:]))
     return "".join(out)
 
 
@@ -348,14 +369,14 @@ class _Query:
 
     # -- pieces
 
-    def text(self) -> str:
+    def text(self) -> tuple:
+        """The parameter list ("" when none) and the rest of the text."""
         kind = self.kind
         if kind in (DDL, PASSTHROUGH):
-            return self.type_text() or ""
+            return "", self.type_text() or ""
         out = []
         params = self.parameters()
-        if params:
-            out.append(f"PARAMETERS {', '.join(params)};\n")
+        head = f"PARAMETERS {', '.join(params)};\n" if params else ""
         if kind == UNION:
             self.union(out)
         elif kind == UPDATE:
@@ -373,7 +394,7 @@ class _Query:
         if self.has(_OWNER_ACCESS):
             out.append("\nWITH OWNERACCESS OPTION")
         out.append(";")
-        return "".join(out)
+        return head, "".join(out)
 
     def parameters(self) -> list:
         out = []
