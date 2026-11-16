@@ -69,12 +69,16 @@ Pictures. The Escher walk (below) records each ClientData shape seqnum's SpConta
 `officeart.shape_pib` reads its pib (0x4104), a 1-based index into the BStore of the stream's DggContainer
 (`officeart.bstore`). The BLIP is the FBSE's own, or the delay stream's (`Escher/EscherDelayStm`) at its foDelay
 (`officeart.fbse_delay`), read by `officeart.blip_image` under one `flate.Budget` of `limits.IMAGE_BYTES` a document.
-PNG and JPEG are `Image`s, a DIB (made a BMP by `officeart.dib_to_bmp`) becomes a PNG through `images.bmp_to_png`,
-WMF and EMF are kept as they are (assets, not viewable). Each BLIP is decoded once a document (by pib, and by its
-place, so FBSEs naming one delay BLIP share it). Each placement is charged to `limits.IMAGE_BYTES` (copies counted,
-the PNG's length after conversion); past it, or for a pib outside the BStore, an unreadable BLIP or a kind Assets
-does not keep, the placement is counted `image`. Once the budget is spent no BLIP is decoded or converted, and a
-BLIP whose bytes alone pass what is left is not converted.
+As doc's `delayed`, each delay record read is charged its 8 + length bytes against the delay stream's length before it
+is read: foDelay offsets naming records nested in one another share their bytes, so only the first that fits is read
+and the others are None, unread (each walk stays linear in the stream). PNG and JPEG are `Image`s, a DIB (made a BMP
+by `officeart.dib_to_bmp`) becomes a PNG through `images.bmp_to_png`, or stays a BMP when that refuses it (an RLE or
+16-bit DIB), and WMF and EMF are kept as they are (BMP, WMF and EMF are assets, not viewable). Each BLIP is decoded
+once a document (by pib, and by its place, so FBSEs naming one delay BLIP share it and charge it once). Each placement
+is charged to `limits.IMAGE_BYTES` (copies counted, the PNG's length after conversion); past it, or for a pib outside
+the BStore, an unreadable BLIP, a delay record past the delay read or a kind Assets does not keep, the placement is
+counted `image`. Once the budget is spent no BLIP is decoded or converted, and a BLIP whose bytes alone pass what is
+left is not converted.
 
 Order. Top, then left, by the shape's box as libmspub's `parseEscherShape` reads it (the Contents shape chunk holds
 only a width and height): the `Escher/EscherStm` DgContainers' SpgrContainers, walked as `parseShapeGroup`, each
@@ -158,7 +162,7 @@ _HEAD = struct.Struct("<HHI")
 _PAIR = struct.Struct("<HI")
 _BOX = struct.Struct("<4i")
 _U32 = struct.Struct("<I")
-_TOO_MANY = False       # a CELLS chunk holding more than limits.TABLE_NODES cells (cached as such)
+_TOO_MANY = object()    # a CELLS chunk holding more than limits.TABLE_NODES cells (cached as such)
 
 
 def _s32(v: int) -> int:
@@ -353,6 +357,7 @@ class _Reader:
         self.blips = {}      # pib -> its image bytes or None
         self.decoded = {}    # a BLIP's place (the delay offset or the FBSE's) -> its image bytes or None
         self.img = 0         # image bytes placed so far (IMAGE_BYTES)
+        self.delay_read = 0  # delay-stream bytes read so far, at most the stream's length
 
     def _chunk(self, ref):
         """The blocks of a chunk: a u32 length counting itself, then blocks, to offset + length as libmspub reads, but
@@ -480,7 +485,7 @@ class _Reader:
         defs = self._cells(cref)
         if self.meter.spent:
             return paras
-        if not defs or len(defs) > self.nodes:
+        if defs is _TOO_MANY or not defs or len(defs) > self.nodes:
             self.ctx.skipped["table"] += 1
             return paras
         self.nodes -= len(defs)
@@ -621,19 +626,31 @@ class _Reader:
                     at = officeart.fbse_delay(self.escher, off)
                     key = (True, at) if at is not None else (False, off)
                     if key not in self.decoded:
-                        self.decoded[key] = self._decode(off)
+                        self.decoded[key] = self._delayed(at) if at is not None else self._decode(self.escher, off)
                     data = self.decoded[key]
             self.blips[pib] = data
         return self.blips[pib]
 
-    def _decode(self, off: int):
-        """The image bytes of the FBSE at `off` (its own BLIP, or the delay stream's): a DIB made a PNG, any other kind
-        as it is; None when unreadable, or when its bytes alone pass what is left of IMAGE_BYTES."""
-        raw = officeart.blip_image(self.escher, off, self.delay, self.budget)
+    def _delayed(self, at: int):
+        """The image bytes of the delay stream's BLIP record at `at`, as doc's `delayed`: the record (8 + its length)
+        is charged to the delay read before it is read, and one that passes the stream, or what is left of the delay
+        read (records nested in one another), is None, unread."""
+        h = officeart.header(self.delay, at)
+        size = 8 + h[3] if h is not None else 0
+        if not size or at + size > len(self.delay) or self.delay_read + size > len(self.delay):
+            return None
+        self.delay_read += size
+        return self._decode(self.delay, at)
+
+    def _decode(self, data, off: int):
+        """The image bytes of the FBSE or BLIP at `off` in `data`: a DIB made a PNG (kept as its BMP, an asset, when
+        bmp_to_png refuses it), any other kind as it is; None when unreadable, or when its bytes alone pass what is
+        left of IMAGE_BYTES."""
+        raw = officeart.blip_image(data, off, None, self.budget)
         if raw is None or self.img + len(raw) > limits.IMAGE_BYTES:
             return None
         if images.sniff(raw) == "bmp":  # a DIB, given its file header by officeart.dib_to_bmp
-            raw = images.bmp_to_png(raw)
+            raw = images.bmp_to_png(raw) or raw
         return raw
 
     # ---- titles, links and the document

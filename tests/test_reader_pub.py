@@ -1270,6 +1270,12 @@ def test_broken_stream_named():
     chain, blob = info["chains"]["Escher/EscherDelayStm"], bytearray(raw)
     struct.pack_into("<I", blob, (info["fat"][chain[-1] // 128] + 1) * 512 + chain[-1] % 128 * 4, chain[0])
     refused(lambda: read_pub(bytes(blob)), "damaged", "Escher/EscherDelayStm stream")
+    raw, info = cfb_bytes({"Contents": contents, "Quill/QuillSub/CONTENTS": quill_fix([(1, "t")]),
+                           "Escher/EscherDelayStm": bytes(5000)})
+    chain, blob = info["chains"]["Escher/EscherDelayStm"], bytearray(raw)
+    struct.pack_into("<I", blob, (info["fat"][chain[-1] // 128] + 1) * 512 + chain[-1] % 128 * 4, chain[0])
+    doc, ctx = read_pub(bytes(blob))
+    assert outline(doc) == [("Page 1", ["t"])] and not ctx.skipped, (outline(doc), ctx.skipped)
 
 
 def _anchor(box):
@@ -1512,11 +1518,12 @@ def test_table_too_big():
         doc, ctx = read_pub(table_file(MERGED, tables=2))
     kinds = [type(b).__name__ for b in page_blocks(doc)]
     assert kinds == ["Table", "Para", "Para", "Para"] and ctx.skipped == {"table": 1}, (kinds, ctx.skipped)
-    # a declared grid of 2^32 x 2^32 slots: refused before anything is laid out
-    t = time.perf_counter()
-    doc, ctx = read_pub(table_file(MERGED, rows=0xFFFFFFFF, cols=0xFFFFFFFF))
-    assert outline(doc) == [("Page 1", ["Head", "A", "B"])] and ctx.skipped == {"table": 1}
-    assert time.perf_counter() - t < 1.0
+    # a declared grid of 2^32 x 2^32 slots: refused before anything is laid out (its CELLS chunk never read)
+    read = []
+    real = pub._Reader._cells
+    with patched(pub._Reader, _cells=lambda self, ref: read.append(ref) or real(self, ref)):
+        doc, ctx = read_pub(table_file(MERGED, rows=0xFFFFFFFF, cols=0xFFFFFFFF))
+    assert outline(doc) == [("Page 1", ["Head", "A", "B"])] and ctx.skipped == {"table": 1} and read == []
 
 
 def test_table_spans_clamped():
@@ -1586,6 +1593,7 @@ def test_cells_hostile_items():
     with patched(limits, TABLE_NODES=2):
         reader = pub._Reader(*streams, b"", Context())
         assert reader._cells(reader.refs[0x50]) is pub._TOO_MANY
+    assert type(pub._TOO_MANY) is object  # not a falsy value a caller could mistake for no cells
 
 
 def test_table_text_and_cells_disagree():
@@ -1805,6 +1813,36 @@ def test_picture_budget():
     doc, ctx = calls.read(picture_file([oa_fbse(blip_bitmap(0xF01F, 0x7A8, DIB + bytes(400)))], [(0x30, 1)]),
                           IMAGE_BYTES=png)
     assert images_of(doc) == [] and ctx.skipped == {"image": 1} and calls.converts == [], ctx.skipped
+
+
+def test_picture_delay_nested():
+    # FBSEs whose foDelay offsets name nested records sharing one body: each delay record is charged 8 + its length
+    # against the delay stream before it is read, so only the first that fits is decoded; the others are counted
+    # image, unread. An offset two FBSEs share is charged once (test_picture_budget)
+    inner = blip_png(PNG)
+    middle = oa_record(0xF01E, bytes(range(16)) + b"\xff" + inner, inst=0x6E0)
+    outer = oa_record(0xF01E, bytes(range(16)) + b"\xff" + middle, inst=0x6E0)
+    at = [len(outer) - len(inner), len(outer) - len(middle), 0]
+    calls = _calls()
+    doc, ctx = calls.read(picture_file([oa_fbse(delay=a) for a in at], [(0x30, 1), (0x31, 2), (0x32, 3)], delay=outer))
+    assert images_of(doc) == [PNG] and ctx.skipped == {"image": 2}, (images_of(doc), ctx.skipped)
+    assert calls.blips == [at[0]], calls.blips
+    # the outer first: it fits (and is no image), the two inside it are refused unread
+    doc, ctx = calls.read(picture_file([oa_fbse(delay=a) for a in at[::-1]], [(0x30, 1), (0x31, 2), (0x32, 3)],
+                                       delay=outer))
+    assert images_of(doc) == [] and ctx.skipped == {"image": 3} and calls.blips == [0], (ctx.skipped, calls.blips)
+    # a record running past the delay stream (though shorter than it) is refused unread
+    doc, ctx = calls.read(picture_file([oa_fbse(delay=8)], [(0x30, 1)], delay=bytes(8) + inner[:-1]))
+    assert ctx.skipped == {"image": 1} and calls.blips == [], (ctx.skipped, calls.blips)
+
+
+def test_picture_bmp_kept():
+    # a DIB that bmp_to_png refuses (16 bits a pixel) is kept as its BMP: an asset, not viewable, not lost
+    dib = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 16, 0, 4, 0, 0, 0, 0) + b"\x00\x7c\x00\x00"
+    doc, ctx = read_pub(picture_file([oa_fbse(blip_bitmap(0xF01F, 0x7A8, dib))], [(0x30, 1)]))
+    (got,) = images_of(doc)
+    assert got.startswith(b"BM") and got.endswith(dib) and not ctx.skipped, (got, ctx.skipped)
+    assert "Not viewable" in md(doc, ctx), md(doc, ctx)
 
 
 def test_picture_hostile():
@@ -2147,6 +2185,51 @@ def _picture_probes():
         dibs.append(oa_fbse(blip_bitmap(0xF01F, 0x7A8, dib)))
     escher = pub_escher(*(pub_sp(3 + k, pib=k + 1) for k in range(m)), store=dibs)
     _probe("pub: 1000 bogus DIBs", lambda: _run_reader(contents, quill, escher), len(escher))
+    # nested delay records (fix round 1): one FBSE and one shape each, the records sharing one body, so before the
+    # delay read was charged each decoded the shared bytes again
+    for n in (400, 1000):
+        delay = _nested_bombs(n)
+        escher = pub_escher(*(pub_sp(3 + k, pib=k + 1) for k in range(n)),
+                            store=[oa_fbse(delay=63 * k) for k in range(n)])
+        _probe(f"pub: {n} nested delay bombs", lambda: _run_reader(contents, quill, escher, delay),
+               len(escher) + len(delay))
+    for n in (8, 64):
+        delay = _nested_dibs(n)
+        escher = pub_escher(*(pub_sp(3 + k, pib=k + 1) for k in range(n)),
+                            store=[oa_fbse(delay=73 * k) for k in range(n)])
+        _probe(f"pub: {n} nested delay DIBs", lambda: _run_reader(contents, quill, escher, delay),
+               len(escher) + len(delay))
+
+
+def _nested_bombs(n):
+    """n WMF BLIP records 63 bytes apart, each running to the stream's end: a record's deflate data is a stored block
+    holding the next record's 58 head bytes, then the next one's data, the last one's a raw deflate of 64 MiB of zeros,
+    so every record inflates the one shared bomb."""
+    z = zlib.compressobj(9, zlib.DEFLATED, -15)
+    bomb = b"".join(z.compress(bytes(MIB)) for _ in range(64)) + z.flush()
+    total = 63 * (n - 1) + 58 + len(bomb)
+    out = bytearray()
+    for k in range(n):
+        at = 63 * k
+        save = total - (at + 58)
+        out += struct.pack("<HHI", 0x2160, 0xF01B, total - at - 8) + bytes(16)
+        out += struct.pack("<I16s8sIBB", 64 * MIB, bytes(16), bytes(8), save, 0, 0xFE)
+        if k < n - 1:
+            out += b"\x00" + struct.pack("<HH", 58, 58 ^ 0xFFFF)
+    return bytes(out + bomb)
+
+
+def _nested_dibs(n):
+    """n DIB BLIP records 73 bytes apart, each running to the stream's end over one 4096 x 4096 1-bit image: a
+    record's pixels start where the next record starts, so all share the 2 MiB of pixels."""
+    pixels = bytes(4096 // 8 * 4096)
+    total = 73 * n + len(pixels)
+    out = bytearray()
+    for k in range(n):
+        at = 73 * k
+        out += struct.pack("<HHI", 0x7A80, 0xF01F, total - at - 8) + bytes(16) + b"\xff"
+        out += struct.pack("<IiiHHIIiiII", 40, 4096, 4096, 1, 1, 0, 0, 0, 0, 2, 0) + bytes(8)
+    return bytes(out + pixels)
 
 
 def _v4(blob, streams):
