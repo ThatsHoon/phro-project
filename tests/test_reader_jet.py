@@ -2691,17 +2691,90 @@ def test_query_content_kept():
     q = [(1, None, 1, None, None), (6, "a", None, None, None), (8, where, None, None, None)]
     doc, ctx, md = convert(jet_db(1, [], queries=[Query("K", q)]))
     assert queries(doc)[0].blocks[0].text == f"SELECT a\nWHERE {where};" and ctx.skipped == {}, ctx.skipped
-    # a URL whose authority ends inside its run is not read on into the next ("…'@b" is an address, not user info)
-    where = "u = 'https://h:1/x'@b OR v = 'https://h:1'/a@b"
+    # a URL whose authority (no ":" in it) ends before an "@" is not read on to it ("…'@b" is an address)
+    where = "u = 'https://h/x'@b OR v = 'https://h'/a@b"
     q = [(1, None, 1, None, None), (6, "a", None, None, None), (8, where, None, None, None)]
     doc, ctx, md = convert(jet_db(1, [], queries=[Query("K", q)]))
     assert queries(doc)[0].blocks[0].text == f"SELECT a\nWHERE {where};" and ctx.skipped == {}, ctx.skipped
+    # an authority holding ":" (a port, or a password holding "/") runs to the text's last "@": hiding more
+    where = "u = 'https://h:1/x'@b OR v = 'https://h:1'/a@b"
+    q = [(1, None, 1, None, None), (6, "a", None, None, None), (8, where, None, None, None)]
+    doc, ctx, md = convert(jet_db(1, [], queries=[Query("K", q)]))
+    assert queries(doc)[0].blocks[0].text == "SELECT a\nWHERE u = 'https://…@b;" and ctx.skipped == {"withheld": 1}
     q = [(1, None, 1, None, None), (6, "'http://bob:pw@site/x' AS u", None, None, None)]
     p = [(1, "SELECT 1 FROM t WHERE u = 'https://ann:pw@h/x'\0", 8, "ODBC;", None)]
     doc, ctx, md = convert(jet_db(1, [], queries=[Query("L", q), Query("P", p, flags=0x70)]))
     assert [x.blocks[0].text for x in queries(doc)] == [
         "SELECT 'http://…@site/x' AS u;", "SELECT 1 FROM t WHERE u = 'https://…@h/x'"]
     assert "bob" not in md and "ann" not in md and ctx.skipped == {"withheld": 2}, ctx.skipped
+
+
+def test_query_url_structural():
+    # the URL rule reads the whole text with its quotes, brackets, tabs and line breaks dropped: a URL split over
+    # three or more runs, or starting "//" or "\\\\", is withheld from its user part through its "@", pass-through
+    # text included (Access stores that as typed); a bracketed IN path arms the type after it; a connect position
+    # that withholds an "@" still ends the user part before it
+    S, TAB = "s3cr3t", "\t"
+    texts = ["[https://bob:s3]'cr3t'[@h]", "'https://bob:s3'cr3t'@h'", "[https://bob:s]'3c'[r3]'t@h'",
+             "'https://bob:s3'\"cr3t\"[@h]", f"'//bob:{S}'@h", f"'\\\\bob:{S}'@srv", f"'ftp:{TAB}//bob:{S}'@h",
+             f"'https://bob:{S}' 'cr3t@h'"]
+    wheres = [f"x = {t}" for t in texts] + [
+        f"x IN (SELECT b FROM T IN [c:/x.mdb] [ODBC;PWD={S}])", f"T IN [] [ODBC;PWD={S}]",
+        f"T IN [c:/x.mdb] 'ODBC;PWD={S}'", f"x = 'https://bob:{S}'[@h", f"x = 'https://bob:{S}';@h",
+        f"x = 'https://bob:{S}'; y = '@h'", f"x IN 'https://bob:{S}' [@h]"]
+    qs = [Query(f"W{k}", [(1, None, 1, None, None), (6, "a", None, None, None), (8, w, None, None, None)])
+          for k, w in enumerate(wheres)]
+    qs += [Query(f"P{k}", [(1, f"EXEC p {t}", 8, "ODBC;DSN=x", None)], flags=0x70) for k, t in enumerate(texts)]
+    for v in (0, 1, 3):
+        doc, ctx, md = convert(jet_db(v, [], queries=qs))
+        for q in queries(doc):
+            got = q.blocks[0].text
+            flat = "".join(c for c in got if c not in "'\"[]\t\r\n ")
+            assert S not in flat and "bob" not in got and "cr3t" not in got, (q.title, got)
+        assert ctx.skipped == {"withheld": len(qs)}, ctx.skipped
+    texts = {q.title: q.blocks[0].text for q in queries(doc)}
+    assert texts["W0"] == "SELECT a\nWHERE x = [https://…@h];" and texts["P4"] == "EXEC p '//…@h", texts
+    assert texts["W8"] == "SELECT a\nWHERE x IN (SELECT b FROM T IN [c:/x.mdb] [ODBC;…]);", texts
+
+
+def test_query_url_property():
+    # seeded: a password in a URL's user part, the URL cut at random points into quoted, bracketed or bare pieces
+    # (a space between pieces after the scheme), with tabs and line breaks put anywhere; the password and the user
+    # never show, in a query's WHERE or a pass-through, through jet's own hooks
+    db = jet._Db(jet_pages.open(jet_db(1)), Context())
+    connect = lambda s: jet._clean_connect(db, s)[0]  # noqa: E731
+    urls = lambda s: jet._clean_urls(db, s)[0]  # noqa: E731
+    rng = random.Random(20261116)
+    schemes = ["https://", "http://", "HTTP://", "https:", "ftp:/", "ws://", "wss:", "file://", "//", "\\\\",
+               "http:\\\\", "x-y://"]
+    alnum = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    for k in range(600):
+        user = "U" + "".join(rng.choice(alnum) for _ in range(7))
+        pw = "P" + "".join(rng.choice(alnum + "!$%&*+,; ") for _ in range(9)) + "Q"
+        scheme = rng.choice(schemes)
+        url = scheme + user + rng.choice(["", ":" + pw]) + "@" + rng.choice(["h", "h.example", "h:80"]) + \
+            rng.choice(["", "/x", "?q", "#f", "\\y"])
+        cuts = sorted(rng.sample(range(1, len(url)), rng.randint(0, min(4, len(url) - 1))))
+        pieces = [url[i:j] for i, j in zip([0] + cuts, cuts + [len(url)])]
+        out = []
+        for i, p in enumerate(pieces):
+            p = "".join(c + rng.choice(["", "", "", "\t", "\r\n", "\n", "\r"]) for c in p)
+            kind = rng.choice(["'", '"', "[", ""])
+            if kind == "[" and "]" in p or kind and kind in p:
+                kind = ""
+            out.append(p if not kind else f"[{p}]" if kind == "[" else kind + p + kind)
+            if i + 1 < len(pieces) and cuts[i] >= len(scheme) and rng.random() < 0.2:
+                out.append(" ")
+        text = "".join(out)
+        for flags, rows in ((0, [jet_sql.Row(1, None, 1, None, None, 1, None),
+                                 jet_sql.Row(6, "a", None, None, None, 1, None),
+                                 jet_sql.Row(8, f"x = {text} AND y = 1", None, None, None, 1, None)]),
+                            (0x70, [jet_sql.Row(1, f"EXEC p {text}", 8, "ODBC;", None, 1, None)])):
+            got = jet_sql.sql(rows, flags=flags, connect=connect, urls=urls)
+            assert got is not None, (k, text)
+            flat = "".join(c for c in got if c not in "'\"[]\t\r\n")
+            assert pw not in flat and pw.replace(" ", "") not in flat.replace(" ", "") and user not in flat, \
+                (k, text, got)
 
 
 def test_passthrough_shown_as_stored():
@@ -2881,12 +2954,16 @@ def test_query_connect_charged():
 def test_query_urls_charged():
     # a URL's user part taken out anywhere: its characters charged first, one pass however many slashes there are
     db = jet._Db(jet_pages.open(jet_db(1)), Context())
-    for s in ("//a:b" * 20_000 + "@h", "x//" * 20_000, "'http://u:p@h/x' " * 5_000, "/" * 60_000 + "u@h"):
+    db.meter.total = 10 ** 12
+    # (the whole text's view too: many runs, schemes inside words, many user parts, tabs and brackets)
+    for s in ("//a:b" * 20_000 + "@h", "x//" * 20_000, "'http://u:p@h/x' " * 5_000, "/" * 60_000 + "u@h",
+              "'a" * 30_000, "'a'" * 10_000 + "https:" + "[b]" * 10_000 + "@h", "xhttps:" * 8_000, "'//a'@" * 10_000,
+              ":/" * 30_000, "https://a…/" * 5_000, "\t\r\n'[]\"" * 8_000 + "https://a@h"):
         before = db.meter.charged
         with Loops() as loops:
             got, _ = jet._clean_urls(db, s)
         spent = db.meter.charged - before
-        assert spent >= len(s) and loops.n <= 2 * spent + 16, (s[:20], loops.n, spent)
+        assert spent >= jet._URL * len(s) and loops.n <= 2 * spent + 16, (s[:20], loops.n, spent)
     cases = {"see http://bob:pw@site/x and //ann@h": ("see http://…@site/x and //…@h", True),
              "https://bob:my s3cr3t@h/x": ("https://…@h/x", True), "https:bob:a,b@h/x": ("https:…@h/x", True),
              "HTTP:bob@h": ("HTTP:…@h", True), "news:bob@h": ("news:bob@h", False),

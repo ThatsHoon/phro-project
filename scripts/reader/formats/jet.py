@@ -80,8 +80,9 @@ strings and database paths a query names, by position (`jet_sql`: a remote datab
 target, an IN clause's path and type and a [connect]. prefix in its text, and the rest of a text whose quotes or
 brackets do not balance), are cleaned as a linked table's connect string (`_clean_connect`), so no PWD=, UID= or URL
 user part shows there; any other literal or identifier is the document's content, kept as stored, except that a URL's
-user part is taken out anywhere, its authority ending with its quoted or bracketed run (`_clean_urls`). What is
-withheld shows as "…", and each query showing one counts `withheld`. A pass-through query's stored text is shown as
+user part is taken out anywhere: the finished text is read whole, without its quotes, brackets, tabs and line breaks,
+so a URL cut into several runs is withheld whole (`_clean_urls`). What is withheld shows as "…", and each query
+showing one counts `withheld`. A pass-through query's stored text is shown as
 stored (a URL's user part aside), its connect string never. A query whose rows are not kept (past
 `jet_sql.JET_QUERY_ROWS`, a cell that cannot be read, a Memo past eight times `jet_sql.JET_SQL` bytes, the queries'
 room of four times the file's bytes), whose SQL Jackcess cannot write or past `JET_SQL`, or past the meter keeps its
@@ -123,7 +124,8 @@ picture read (`_ROW_COST`, its long value as any, and twice the most its inflati
 unit, charged before it runs, kept when it fails; a definition decoded once); each connect string's characters and
 marks (`_PART` a ";", "}" or quote); each name in the summary (`_NAME`); each character of a calculated column's
 expression; MSysQueries' rows as any table's and `_QROW` each kept, each query (`_QUERY`) and its SQL, `_SQL` times
-`jet_sql.work` (an upper bound on its steps) through `Meter.afford` before it is written (past what is left, no SQL).
+`jet_sql.work` (an upper bound on its steps) through `Meter.afford` before it is written (past what is left, no SQL),
+and its text read for URLs (`_URL` a character).
 In `jet_pages` each RC4 page, chain item and usage map byte. The prices are measured, each at least what its path
 costs. A real file is charged a few units a byte of itself. Past the total: the table being read stops with one
 `sheet_cut` (the grid's own cut, the rows held so far shown in page order); a table not yet started is not read at all
@@ -222,6 +224,7 @@ _KEEP = 256    # the room a kept value takes beside its text (key, tuples, a dic
 _QROW = 8      # an MSysQueries row of a query: its cells looked up, its `jet_sql.Row` made and kept
 _QUERY = 16    # a query: its section, `jet_sql.work` over its rows, the cleaner's closure
 _SQL = 1       # a step of `jet_sql.work` (the dearest shape measured, a parameter list, about 0.05 microseconds)
+_URL = 2       # a character of a query's text read for URLs (`jet_sql.withhold_urls`)
 _Spent = jet_pages.Spent
 _PK = 1  # IndexImpl.PRIMARY_KEY_INDEX_TYPE
 _AUTONUMBER = 0x04 | 0x40  # ColumnImpl.AUTO_NUMBER_FLAG_MASK, AUTO_NUMBER_GUID_FLAG_MASK
@@ -248,10 +251,6 @@ LINK_SCHEMES = frozenset(("http", "https", "mailto", "ftp"))
 _NUMBERS = frozenset((BYTE, INT, LONG, BIGINT, MONEY, FLOAT, DOUBLE, NUMERIC))
 _ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md; every real file read has 0)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
-# where a URL's authority starts in query text (`_clean_urls`): after a special scheme's ":" (slashes or none), after
-# ":" and slashes, or after two or more slashes or backslashes
-_URL_START = re.compile(r"(?i)\b(?:https?|ftp|wss?|file):[/\\]*|:[/\\]+|[/\\]{2,}")
-_AUTH_STOP = re.compile(r"[/\\?#]")  # a tab or line break never ends one: WHATWG drops them first
 _SQL_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")  # shown as a space in a query's text
 _BAD = (ValueError, IndexError, struct.error, ArithmeticError)  # a row, cell or TDEF that cannot be read
 
@@ -1666,36 +1665,12 @@ def _clean_connect(db: _Db, s: str):
 
 
 def _clean_urls(db: _Db, s: str):
-    """`s` (one quoted or bracketed run's content, or a stretch between runs, `jet_sql`'s `urls`) with each URL's user
-    part taken out, put as "…" ("http://…@host/x"), and whether any was. A URL starts after a special scheme's ":"
-    (http, https, ftp, ws, wss, file; slashes or none, as WHATWG reads one), after ":" and slashes, or after two or more
-    slashes or backslashes; its authority runs to the next "/", "\\", "?", "#" or the end of `s` (a tab or line break
-    never ends it: a browser drops them before it reads a URL), and its user part to the authority's last "@",
-    whatever it holds (a space, a quote, a comma, a bracket, a line break). When unsure it withholds: an authority
-    holding ":" and no "@", when `s` holds one later (`u:pa/ss@h`), gives up to the last "@". Its characters and a
-    `_PART` are charged first; one pass."""
-    db.charge(len(s) + _PART)
-    out, last, dropped, seen = [], 0, False, -1
-    last_at = s.rfind("@")
-    for m in _URL_START.finditer(s):
-        a = m.end()
-        if a <= last or a < seen:  # inside an authority already read: it holds no "@" past `last`
-            continue
-        stop = _AUTH_STOP.search(s, a)
-        b = len(s) if stop is None else stop.start()
-        seen = b
-        at = s.rfind("@", a, b)
-        if at < 0 and last_at >= b and ":" in s[a:b]:
-            at = last_at
-        if at < 0:
-            continue
-        if s[a:at] != "…":
-            dropped = True
-        out.append(s[last:a])
-        out.append("…")
-        last = at
-    out.append(s[last:])
-    return "".join(out), dropped
+    """`s` (a query's whole text, `jet_sql`'s `urls`) with each URL's user part withheld as "…" ("http://…@host/x"),
+    and whether any was: `jet_sql.withhold_urls`, which reads one view of the text without its quotes, brackets, tabs
+    and line breaks, so a URL cut into several runs is withheld whole. `_URL` times its characters and a `_PART` are
+    charged first; one pass."""
+    db.charge(_URL * len(s) + _PART)
+    return jet_sql.withhold_urls(s)
 
 
 def _query_int(col: Column, raw):
@@ -1779,7 +1754,7 @@ def _query_rows(db: _Db, catalog: list, queries: list):
 def _query(db: _Db, obj: Obj, rows) -> Section:
     """A query's section, "Query: <name>", holding its SQL (`jet_sql.sql`, its work charged first through
     `Meter.afford`) as a Code block; with no SQL (rows not kept, Jackcess unable to write it, the meter) the heading
-    stays alone, counted `query`. Its connect positions go through `_clean_connect` and its text, run by run, through
+    stays alone, counted `query`. Its connect positions go through `_clean_connect` and its whole text, once, through
     `_clean_urls`; a query whose SQL shows with anything withheld ("…") counts `withheld` once. A control character
     other than a tab or line break shows as a space."""
     text = None

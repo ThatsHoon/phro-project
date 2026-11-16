@@ -21,25 +21,26 @@ time.
 Credentials, by position. With `connect`, every connect position is passed through it: a remote database's path
 and type (`IN '<path>' [<type>]`) of a source or of a make-table or append target; a source's database qualifier
 (`[<qualifier>].<table>`); a source or target name holding ";", whole, before it is split at "."; and in the finished
-text (a union part, a derived table, a subquery, any expression) the quoted path after an IN keyword, the quoted or
-bracketed type right after that path, and a bracketed prefix holding ";" that a "." follows, spaces, tabs and line
-breaks aside (a "{" in it reaches its "}", so a braced value holding "]" stays inside). Every other quoted literal or
-bracketed identifier is the document's content and is kept as stored. The scan fails closed: a quote or bracket left open, a bracket
-holding "[", or a ";" between runs before the text's end (the parameter list is read on its own) means the runs are
-not as Access stores them, so the rest of the text is one run and a connect position. With `urls`, a URL's user part
-is taken out anywhere: `urls` is given each run's content and each stretch between runs (so a URL ends with its run),
-pass-through text included, and a name before it is split. A pass-through query's stored text has no connect
-position, and its connect string (the type row's Name1) is never written. A special scheme's authority (http, https,
-ftp, ws, wss, file) that reaches the end of its run or stretch with no "/", "\\", "?" or "#" while the next run or
-stretch holds an "@" before any of them is given to `urls` whole, from its stretch through that "@" and the quote or
-bracket between, so a URL split across runs (only in text Access would not store) is withheld too. A URL that an
-expression assembles from several literals (`'https://u:p' & '@h'`) exists only when the query runs; the reader shows
-the stored text and never evaluates it. The hooks are idempotent; what they withhold they mark ("…").
+text (a union part, a derived table, a subquery, any expression) the quoted or bracketed path after an IN keyword,
+the quoted or bracketed type right after that path, and a bracketed prefix holding ";" that a "." follows, spaces,
+tabs and line breaks aside (a "{" in it reaches its "}", so a braced value holding "]" stays inside). Every other
+quoted literal or bracketed identifier is the document's content and is kept as stored. The scan fails closed: a
+quote or bracket left open, a bracket holding "[", or a ";" between runs before the text's end (the parameter list is
+read on its own) means the runs are not as Access stores them, so the rest of the text is one run and a connect
+position. A pass-through query's stored text has no connect position, and its connect string (the type row's Name1)
+is never written. With `urls`, a URL's user part is taken out anywhere: after the connect positions, `urls` is given
+the whole text once, pass-through text included (jet.py's hook is `withhold_urls`, which reads one view of the text
+without its quotes, brackets, tabs and line breaks, so a URL cut into several runs, or starting "//" or "\\\\", is
+withheld from its user part through its "@", whatever runs it crosses). A URL that an expression assembles from
+several literals (`'https://u:p' & '@h'`) exists only when the query runs; the reader shows the stored text and never
+evaluates it (literals side by side, `'https://u:p' '@h'`, are read as one URL all the same). The hooks are
+idempotent; what they withhold they mark ("…").
 
 Work. `work(rows)` is an upper bound on what `sql` does, in steps (a character of text, `_ROW` a row, a comparison of
 the sort, `_JOIN` a table source a join looks at, builds or walks); the caller charges it before `sql` runs.
 """
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 
 from .. import limits
@@ -65,8 +66,12 @@ _QUOTABLE = re.compile(r"[^A-Za-z0-9_]")  # Java's \W is ASCII
 _LINES = re.compile(r"[\r\n]+")
 _OPENS = re.compile(r"[\[\"']")
 _BRACKET_STOP = re.compile(r"[\]{]")
-_SPECIAL = re.compile(r"(?i)\b(?:https?|ftp|wss?|file):[/\\]*")  # a special scheme and its slashes
-_URL_STOP = re.compile(r"[/\\?#]")
+_VIEW = re.compile(r"[^'\"\[\]\t\r\n]+")  # what the URL rule reads: no quote, bracket, tab or line break
+# where a URL's authority starts: after a special scheme's ":" (slashes or none; group 1, at a word's start), after ":"
+# and slashes, or after two or more slashes or backslashes
+_URL_START = re.compile(r"(?i)((?:https?|ftp|wss?|file):[/\\]*)|:[/\\]+|[/\\]{2,}")
+_AUTH_STOP = re.compile(r"[/\\?#]")  # what ends an authority (a tab or line break never does: WHATWG drops them)
+_WORD = re.compile(r"\w")
 _JAVA_SPACE = "".join(map(chr, range(33)))  # what Java's trim() takes off
 _ROW = 32  # steps a row costs beyond its text: its getters, filters, quoting and separators
 _JOIN = 4  # steps a table source costs a join row: a look in the search, and one in each level a condition goes down
@@ -116,53 +121,98 @@ def sql(rows, *, flags: int = 0, connect=None, urls=None) -> str | None:
     if len(rows) > JET_QUERY_ROWS:
         return None
     try:
-        q = _Query(rows, flags, connect, urls)
+        q = _Query(rows, flags, connect)
         head, body = q.text()
     except _Fail:
         return None
-    if connect is not None or urls is not None:
-        positions = None if q.kind == PASSTHROUGH else connect
-        head, body = _scrub(head, positions, urls), _scrub(body, positions, urls)
+    if connect is not None and q.kind != PASSTHROUGH:
+        head, body = _scrub(head, connect), _scrub(body, connect)
     text = head + body
+    if urls is not None and (":" in text or "/" in text or "\\" in text):
+        text = urls(text)
     return text if len(text) <= JET_SQL else None
 
 
-def _scrub(text: str, connect, urls) -> str:
-    """`text` with each connect position's content passed through `connect` (None: no position) and every run's
-    content and stretch between runs through `urls` (see the module's docstring). Quoted and bracketed runs are read
-    in one pass (a doubled quote is part of its run). It fails closed: a run left open, a bracket holding "[", or (with
-    `connect`) a ";" between runs before the text's last character make the rest of the text one connect position."""
-    def bare(s):
-        return urls(s) if urls is not None and s and (":" in s or "/" in s or "\\" in s) else s
+def withhold_urls(text: str):
+    """`text` with every URL's user part withheld as one "…", and whether any was (`sql`'s `urls` hook uses it; see the
+    module's docstring). One view of the whole text is read: the text without its quotes, brackets, tabs and line
+    breaks, each kept stretch mapped back to where it stands. A URL starts in the view (`_URL_START`; a special scheme
+    only where the text has no letter, digit or "_" right before it); its authority runs to the next "/", "\\", "?" or
+    "#" of the view; its user part to the authority's last "@", or, for a URL that does not start with ":" and slashes
+    alone, its last "…" (what a connect position withheld may have held that "@"; so may the document's own "…": it
+    hides more). An authority holding ":" and no such end, when the view holds one later (`u:pa/ss@h`), runs to the
+    last. From the user part's first character through the character before its "@" (through the "…") the original
+    text is withheld, the quotes, brackets, tabs and line breaks between included: so a URL cut into several runs, or
+    split by a line break, is withheld whole. An empty user part, or one that is "…" already, is left. One pass:
+    each character of the view is read a bounded number of times."""
+    starts, at_text, parts = [], [], []
+    size = 0
+    for m in _VIEW.finditer(text):
+        starts.append(size)
+        at_text.append(m.start())
+        parts.append(m.group())
+        size += m.end() - m.start()
+    view = "".join(parts)
 
-    held = None  # (where in `out`, the text) of the last piece when a special scheme's authority reaches its end
+    def where(v):
+        """Where the view's character `v` stands in `text`."""
+        k = bisect_right(starts, v) - 1
+        return at_text[k] + v - starts[k]
 
-    def piece(s):
-        """`s` (a run's content or a stretch, connect positions already cleaned) appended through `urls`."""
-        nonlocal held
-        if held is not None and s:
-            k, t = held
-            held = None
-            stop = _URL_STOP.search(s)
-            at = s.rfind("@", 0, len(s) if stop is None else stop.start())
-            if at >= 0:  # the URL runs on into `s`: from its piece through this "@", the delimiters between
-                out[k:] = [bare(t + "".join(out[k + 1:]) + s[:at + 1])]
-                s = s[at + 1:]
-        if urls is not None and ":" in s and _open_authority(s):
-            held = (len(out), s)
-        out.append(bare(s))
+    last_at, last_mark = view.rfind("@"), view.rfind("…")
+    spans, pos = [], 0
+    while True:
+        m = _URL_START.search(view, pos)
+        if m is None:
+            break
+        if m.group(1):
+            o = where(m.start())
+            if o and _WORD.match(text, o - 1):  # a scheme inside a word ("news:"): not one
+                pos = m.start() + 1
+                continue
+        a = m.end()
+        stop = _AUTH_STOP.search(view, a)
+        b = size if stop is None else stop.start()
+        at = view.rfind("@", a, b)
+        if m.group().startswith(":") and not m.group(1):  # ":" and slashes alone (a drive, "c:\\x"): "@" only
+            mark, end_at = -1, last_at
+        else:
+            mark, end_at = view.rfind("…", a, b), max(last_at, last_mark)
+        at = max(at, mark)
+        if at < 0 and end_at >= b and view.find(":", a, b) >= 0:
+            at = end_at
+        pos = max(b, at + 1)
+        if at < 0:
+            continue
+        end = at + 1 if view[at] == "…" else at
+        if a < end and view[a:end] != "…":
+            spans.append((where(a), where(at) + (end - at)))
+    if not spans:
+        return text, False
+    out, last = [], 0
+    for s, e in spans:
+        out.append(text[last:s])
+        out.append("…")
+        last = e
+    out.append(text[last:])
+    return "".join(out), True
 
+
+def _scrub(text: str, connect) -> str:
+    """`text` with each connect position's content passed through `connect` (see the module's docstring). Quoted and
+    bracketed runs are read in one pass (a doubled quote is part of its run). It fails closed: a run left open, a
+    bracket holding "[", or a ";" between runs before the text's last character make the rest of the text one connect
+    position."""
     out, i, gap, path = [], 0, 0, -1
     n = len(text)
     last = len(text.rstrip()) - 1  # where a closing ";" may stand
     while True:
         m = _OPENS.search(text, i)
         o = n if m is None else m.start()
-        if connect is not None:
-            semi = text.find(";", gap, o)
-            if 0 <= semi < last:
-                piece(connect(text[gap:]))
-                return "".join(out)
+        semi = text.find(";", gap, o)
+        if 0 <= semi < last:
+            out.append(connect(text[gap:]))
+            return "".join(out)
         if m is None:
             break
         c = text[o]
@@ -180,32 +230,20 @@ def _scrub(text: str, connect, urls) -> str:
                     prefix = text[k:k + 1] == "."
         else:
             end = _closing(text, o + 1, c)
-        piece(text[gap:o])
+        out.append(text[gap:o])
         out.append(c)
         if end < 0:
-            rest = text[o + 1:]
-            piece(rest if connect is None else connect(rest))
+            out.append(connect(text[o + 1:]))
             return "".join(out)
         after_in = _after_in(text, o)
         typed = path >= 0 and not text[path:o].strip()
-        path = end + 1 if after_in and c != "[" else -1
+        path = end + 1 if after_in else -1  # a path, quoted or bracketed: a type may follow it
         inner = text[o + 1:end]
-        if connect is not None and (after_in or typed or prefix):
-            inner = connect(inner)
-        piece(inner)
+        out.append(connect(inner) if after_in or typed or prefix else inner)
         out.append(text[end])
         gap = i = end + 1
-    piece(text[gap:])
+    out.append(text[gap:])
     return "".join(out)
-
-
-def _open_authority(s: str) -> bool:
-    """Whether a special scheme's authority in `s` reaches the end of `s` (no "/", "\\", "?" or "#" after it)."""
-    stop = max(s.rfind("/"), s.rfind("\\"), s.rfind("?"), s.rfind("#"))
-    for m in _SPECIAL.finditer(s):
-        if m.end() > stop:
-            return True
-    return False
 
 
 def _after_in(text: str, o: int) -> bool:
@@ -351,7 +389,7 @@ def _render(ts, top: bool, out: list):
 
 
 class _Query:
-    def __init__(self, rows, flags: int, connect, urls):
+    def __init__(self, rows, flags: int, connect):
         if all(r.order is not None for r in rows):  # sortByOrder: by attribute (a Java byte), then Order, stable
             rows = sorted(rows, key=lambda r: (-1 if r.attribute is None else (r.attribute + 128 & 0xFF) - 128,
                                                r.order))
@@ -371,7 +409,6 @@ class _Query:
         if (self.kind if found is None else found) != self.kind:
             raise _Fail(f"unexpected query type {found}")
         self.connect = connect or (lambda s: s)
-        self.urls = urls or (lambda s: s)
 
     # -- rows
 
@@ -393,10 +430,10 @@ class _Query:
         return None if text is None else text.rstrip("\0")
 
     def ident(self, name, source: bool) -> str:
-        """`toOptionalQuotedExpr(name, true)`, the name cleaned first: a source or target name holding ";" through
-        `connect` (whole, before the split at "."), any other through `urls`."""
-        if name is not None:
-            name = self.connect(name) if source and ";" in name else self.urls(name)
+        """`toOptionalQuotedExpr(name, true)`, a source or target name holding ";" passed through `connect` first
+        (whole, before the split at ".")."""
+        if name is not None and source and ";" in name:
+            name = self.connect(name)
         return _opt_quoted(name, True)
 
     # -- pieces

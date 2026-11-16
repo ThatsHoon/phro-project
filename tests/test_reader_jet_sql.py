@@ -379,10 +379,8 @@ def connect_cleaner(s):
 
 
 def url_cleaner(s):
-    """A stand-in for jet.py's URL rule (idempotent), given one quoted or bracketed run's content or a stretch between
-    runs: a URL's user part withheld as "…", its authority running to "/", "\\", "?", "#" or the end (a tab or line
-    break never ends it)."""
-    return re.sub(r"(?i)(https?:/*|//)[^/\\?#]*@", r"\1…@", s)
+    """jet.py's URL hook without its charge and its count: `withhold_urls` over the whole text."""
+    return jet_sql.withhold_urls(s)[0]
 
 
 def test_connect_hook():
@@ -464,8 +462,8 @@ def test_unbalanced_fails_closed():
 
 
 def test_url_across_runs():
-    # a special scheme's authority that reaches the end of its run or stretch with no "/", "\\", "?" or "#", when
-    # the next run or stretch holds an "@" before any of them: withheld from the scheme through that "@"
+    # a URL whose authority runs past the end of its run or stretch (no "/", "\\", "?" or "#" first) into one holding
+    # an "@": withheld from its user part through that "@", the quote or bracket between included
     cases = {"x = https://bob:s3cr3t'@h'": "x = https://…@h';", "[https://bob:s3cr3t]@h = 1": "[https://…@h = 1;",
              "x = 'https://bob:s3cr3t'@h": "x = 'https://…@h;",
              "x = \"https://bob:s3cr3t\"[@h]": "x = \"https://…@h];"}
@@ -475,24 +473,87 @@ def test_url_across_runs():
         assert "s3cr3t" not in got and got == lines("SELECT a", f"WHERE {want}"), (w, got)
     q = [row(TYPE, "EXEC p 'https://bob:s3cr3t'@h", PASSTHROUGH, "ODBC;")]
     assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == "EXEC p 'https://…@h"
-    # kept: the next stretch holds no "@", or a stop comes first, or the authority stopped inside its run
-    for w in ("x = 'https://h:8080' AND y = 'a@b'", "x = 'https://h:1'/'@b'", "x = 'https://h/'@b",
-              "x = 'https://h:1'/a@b",
-              "x = 'mailto:bob'@h"):
+    # a space does not end an authority, and one holding ":" with an "@" later in the text runs to it (hiding more)
+    cases = {"x = 'https://h:8080' AND y = 'a@b'": "x = 'https://…@b'", "x = 'https://h:1'/'@b'": "x = 'https://…@b'",
+             "x = 'https://h:1'/a@b": "x = 'https://…@b"}
+    for w, want in cases.items():
+        q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
+        got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+        assert got == lines("SELECT a", f"WHERE {want};"), (w, got)
+    # kept: a stop comes before the "@" and the authority holds no ":", or the scheme is not special
+    for w in ("x = 'https://h/'@b", "x = 'https://h'/'@b'", "x = 'mailto:bob'@h"):
         q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
         assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == lines("SELECT a", f"WHERE {w};"), w
 
 
+def test_in_bracketed_path():
+    # a bracketed IN path is a connect position, and so is the type after it, quoted or bracketed
+    cases = {"x IN (SELECT b FROM T IN [c:/x.mdb] [ODBC;PWD=s3cr3t])": "x IN (SELECT b FROM T IN [c:/x.mdb] [ODBC;…])",
+             "T IN [] [ODBC;PWD=s3cr3t]": "T IN [] [ODBC;…]",
+             "T IN [c:/x.mdb] 'ODBC;PWD=s3cr3t'": "T IN [c:/x.mdb] 'ODBC;…'",
+             "T IN [x;PWD=s3cr3t] [y]": "T IN [x;…] [y]"}
+    for w, want in cases.items():
+        q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
+        got = jet_sql.sql(q, connect=connect_cleaner)
+        assert got == lines("SELECT a", f"WHERE {want};"), (w, got)
+
+
+def test_url_structural():
+    # the URL rule reads one view of the whole text: quotes, brackets, tabs and line breaks dropped. A URL starts at a
+    # special scheme (slashes or none), at ":" and slashes, or at two slashes or backslashes; its authority runs to
+    # "/", "\\", "?" or "#"; from its user part through its last "@" the original text is withheld as one "…", the
+    # quotes and brackets between included, in a query's text and in a pass-through's
+    S = "s3cr3t"
+    cases = {"[https://bob:s3]'cr3t'[@h]": "[https://…@h]", "'https://bob:s3'cr3t'@h'": "'https://…@h'",
+             "[https://bob:s]'3c'[r3]'t@h'": "[https://…@h'", "'https://bob:s3'\"cr3t\"[@h]": "'https://…@h]",
+             f"'//bob:{S}'@h": "'//…@h", f"'\\\\bob:{S}'@srv": "'\\\\…@srv", f"'ftp:\t//bob:{S}'@h": "'ftp:\t//…@h",
+             f"'https://bob:{S}' 'x@h'": "'https://…@h'", f"'ht'[tp]'s:bob:{S}'@h": "'ht'[tp]'s:…@h",
+             f"'https://bob:{S}\r\n@h/x'": "'https://…@h/x'"}
+    for t, want in cases.items():
+        q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, f"x = {t}")]
+        got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+        assert got == lines("SELECT a", f"WHERE x = {want};"), (t, got)
+        q = [row(TYPE, f"EXEC p {t}", PASSTHROUGH, "ODBC;")]
+        assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == f"EXEC p {want}", t
+    # the parameter list and the rest are one text: a URL in a parameter's name runs on into the body
+    q = [row(TYPE, None, SELECT), row(PARAMETER, None, 4, f"https://bob:{S}"), row(COLUMN, "a"), row(WHERE, "x = '@h'")]
+    got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+    assert got == "PARAMETERS [https://…@h';", got
+    # a connect position that withheld text ("…") may have held the "@": it ends a user part too
+    q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, f"x = 'https://bob:{S}'[PWD=1@h")]
+    got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+    assert got == lines("SELECT a", "WHERE x = 'https://…"), got
+    # what the rule leaves: a word before a scheme ("news:"), no "@" in the authority, a stop before the "@"
+    for t in ("'news:bob'@h", "'mailto:bob'@h", "'https://h/'@b", "'https://h' AND y = 1", "[x].[y] = '//h\\a@b'"):
+        q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, f"x = {t}")]
+        assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == lines("SELECT a", f"WHERE x = {t};"), t
+
+
+def test_withhold_urls():
+    # the rule alone: what it withholds, whether it did, and that it is idempotent
+    cases = {"see http://bob:pw@site/x and //ann@h": "see http://…@site/x and //…@h",
+             "HTTP:bob@h": "HTTP:…@h", "xhttps:bob@h": "xhttps:bob@h", "x'https:bob'@h": "x'https:…@h",
+             "xhttps://bob@h": "xhttps://…@h", "C:\\a@b\\c": "C:\\…@b\\c",
+             "u:pa/ss@h, ftp://u:pa/ss@h/x": "u:pa/ss@h, ftp://…@h/x", "https://@h": "https://@h",
+             "http://…@h": "http://…@h", "https://bob…": "https://…", "c:\\x.mdb' [ODBC;…]": "c:\\x.mdb' [ODBC;…]",
+             "": "", "[]''": "[]''", "'https://h:1' AND y = 'a@b'": "'https://…@b'",
+             "'https://h:1/x'@b": "'https://…@b"}
+    for s, want in cases.items():
+        got, dropped = jet_sql.withhold_urls(s)
+        assert got == want and dropped == (got != s), (s, got, dropped)
+        assert jet_sql.withhold_urls(got) == (got, False), (s, got)
+
+
 def test_url_hook():
-    # `urls` takes a URL's user part out anywhere in the text, pass-through included, and from a name before it is
-    # split at "."; it is given each quoted or bracketed run's content and each stretch between runs, so a URL's
-    # authority ends with its run, whatever the run holds (a space, a doubled quote, a comma, a bracket)
+    # `urls` takes a URL's user part out anywhere in the text, pass-through included, and from a name split at ".";
+    # it is given the whole text once, so a URL's authority ends only at "/", "\\", "?" or "#", whatever it holds (a
+    # space, a doubled quote, a comma, a bracket, the end of a run)
     w = ("u = 'https://bob:my s3cr3t@h/x' OR v = 'https://bob:it''ss3cr3t@h/x' OR w = 'https:bob:s3cr3t@h/x' "
          "OR z = 'https://bob:pw' AND y = 'a@b'")
     q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
     got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
     assert got == lines("SELECT a", "WHERE u = 'https://…@h/x' OR v = 'https://…@h/x' OR w = 'https:…@h/x' "
-                        "OR z = 'https://bob:pw' AND y = 'a@b';"), got
+                        "OR z = 'https://…@b';"), got
     # outside any run too: a stretch between runs, in a query's text and in a pass-through's
     q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, "u = 'x' OR https://bob:s3cr3t@h/x = [y]")]
     got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
