@@ -154,7 +154,7 @@ def prune(days: int = 30) -> int:
             except OSError:
                 pass
     for bucket in base.iterdir():
-        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined"):
+        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined"):
             continue
         for d in bucket.iterdir():
             if d.name.startswith(".tmp-"):

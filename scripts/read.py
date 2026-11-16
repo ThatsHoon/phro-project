@@ -97,9 +97,6 @@ def _reexec(a):
 
 
 def cmd_setup(a) -> int:
-    if a.kind == "mpp":  # Task 4 replaces this
-        print("FAIL	setup	mpp is not available yet")
-        return 1
     from reader import pyenv, pysetup
     kind = a.kind
     venv = Path(a.venv) if a.venv else pyenv.venv_dir(kind)

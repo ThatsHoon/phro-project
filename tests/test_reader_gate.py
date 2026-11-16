@@ -1189,12 +1189,22 @@ def test_keynote_key_converts():
 
 def test_setup_for_flag():
     import io
+    import tempfile
     from contextlib import redirect_stdout
     import read
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        code = read.main(["setup", "--for", "mpp", "--check"])
-    assert code == 1 and buf.getvalue().strip() == "FAIL	setup	mpp is not available yet", buf.getvalue()
+    nowhere = Path(tempfile.gettempdir()).resolve() / "phro-no-such-mpp-venv"
+    old = os.environ.get("PHRO_READER_MPPENV")
+    os.environ["PHRO_READER_MPPENV"] = str(nowhere)
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = read.main(["setup", "--for", "mpp", "--check"])
+        assert code == 0 and buf.getvalue().strip() == f"MISSING	{nowhere}", buf.getvalue()
+    finally:
+        if old is None:
+            os.environ.pop("PHRO_READER_MPPENV", None)
+        else:
+            os.environ["PHRO_READER_MPPENV"] = old
 
 
 def main():
