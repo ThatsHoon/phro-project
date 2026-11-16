@@ -17,11 +17,11 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import html, limits, markdown  # noqa: E402
-from reader.containers import crypto  # noqa: E402
+from reader.containers import crypto, flate  # noqa: E402
 from reader.formats import jet, jet_pages, sheet_grid  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Hidden, Link, Para, Section, Table, Text  # noqa: E402
-from jet_fix import (Col, Query, Row, Tbl, jet_db, BINARY, BIGINT, BOOL, BYTE, DATE, DOUBLE,  # noqa: E402
+from reader.model import Break, Context, Hidden, Image, Link, Para, Section, Table, Text  # noqa: E402
+from jet_fix import (Col, Query, Row, Tbl, jet_db, BINARY, BIGINT, BOOL, BYTE, COMPLEX, DATE, DOUBLE,  # noqa: E402
                      EXTDATE, FLOAT, GUID, INT, LONG, MEMO, MONEY, NUMERIC, OLE, TEXT)
 
 # the first bytes of Jackcess's JetFormat.BASE_HEADER_MASK, the RC4 keystream of C7 DA 39 6B
@@ -236,8 +236,13 @@ def jet_refused(data):
 
 
 def summary(doc):
+    """The summary paragraph's text, a line break as "\n"."""
     assert isinstance(doc.blocks[0], Para)
-    return "".join(x.text for x in doc.blocks[0].inlines)
+    return "".join("\n" if isinstance(x, Break) else x.text for x in doc.blocks[0].inlines)
+
+
+def summary_lines(doc):
+    return summary(doc).split("\n")
 
 
 def sections(doc):
@@ -291,7 +296,7 @@ def test_version_names():
     two = [three(), Tbl("Two", [Col("A", LONG)], [[1]])]
     q = [Query("Q1", []), Query("Q2", [])]
     linked = [("Prices", ";DATABASE=prices.accdb", "Prices")]
-    assert summary(convert(jet_db(1, two, queries=q, linked=linked))[0]) == \
+    assert summary_lines(convert(jet_db(1, two, queries=q, linked=linked))[0])[0] == \
         "Access 2000-2003 database (Jet 4): 2 tables, 2 queries, 1 linked table."
     one = "Access 2000-2003 database (Jet 4): 1 table, 1 query."
     assert summary(convert(jet_db(1, two[:1], queries=q[:1]))[0]) == one
@@ -1387,8 +1392,9 @@ def test_page_cache_bound():
 def guard_fixtures():
     """Clean files for the mutation guard: Jet3, Jet4 (also under a db_key) and ACE (type 1 maps), each with fixed
     and variable columns, Yes/No, long values (inline, one row, chained), deleted and overflow rows, a hidden table;
-    a 240-column table; and Jet4 and Jet3 tables with properties, hyperlinks, hidden columns, a primary key and
-    relationships."""
+    a 240-column table; Jet4 and Jet3 tables with properties, hyperlinks, hidden columns, a primary key and
+    relationships; and an ACE file with attachments (deflated and raw), a multi-value column, calculated columns,
+    object names and a linked table."""
     cols = [Col("ID", LONG), Col("Name", TEXT), Col("Notes", MEMO), Col("Flag", BOOL), Col("Price", MONEY),
             Col("When", DATE), Col("Pic", OLE), Col("Key", GUID)]
     key = uuid.UUID(int=0x0123456789ABCDEF0123456789ABCDEF).bytes_le
@@ -1412,11 +1418,17 @@ def guard_fixtures():
               str(uuid.UUID(int=i)), "x" * i] for i in range(13)]
     child = Tbl("C", [Col("ID", LONG), Col("KID", LONG)], [[i, i % 13] for i in range(20)], pk="ID")
     rels = [("CK", "C", "KID", "K", "ID"), ("KK", "K", "ID", "C", "ID")]
+    cplx = Tbl("X", [Col("ID", LONG), Col("F", COMPLEX, attachments=True), Col("V", COMPLEX, multi=TEXT),
+                     Col("C", LONG, calc=LONG, props={"Expression": "[ID]*2"}),
+                     Col("E", TEXT, calc=TEXT, props={"Expression": "[ID]"})],
+               [[i, [("a.png", PNG, i % 2 == 0), ("b.txt", b"x" * (i * 30), True)], [f"v{k}" for k in range(i % 4)],
+                 2 * i, f"t{i}"] for i in range(8)], pk="ID")
+    ace = jet_db(3, [cplx, other], objects=[("F", -32768), ("M", -32761)], linked=[("L", ";DATABASE=x;PWD=y", "T")])
     return [jet_db(0, [Tbl("T", cols, rows(14)), other]), jet_db(1, [Tbl("T", cols, rows(14)), other]),
             jet_db(1, [Tbl("T", cols, rows(10))], db_key=0x2468), jet_db(3, [Tbl("T", cols, rows(14), umap=1), other]),
             jet_db(1, [wide, Tbl("S", [Col("A", LONG)], [[i] for i in range(300)])]),
             jet_db(1, [Tbl("K", keyed, krows, pk="ID", props={"Description": "keyed"}), child], relationships=rels),
-            jet_db(0, [Tbl("K", keyed[:4], [r[:4] for r in krows], pk="ID"), child], relationships=rels[:1])]
+            jet_db(0, [Tbl("K", keyed[:4], [r[:4] for r in krows], pk="ID"), child], relationships=rels[:1]), ace]
 
 
 def mutate(rng, data):
@@ -1666,24 +1678,33 @@ def test_schema_line():
 
 
 def test_hidden_columns():
-    # a replication column (s_), a Gen_ column and a column flagged 0x10: Hidden inlines in the schema line (each
-    # holding its separator, so the visible line reads right) and hidden columns of the grid
+    # a replication column (s_GUID), a Gen_ column naming a column of its table (Gen_Notes) and a column flagged
+    # 0x10: Hidden inlines in the schema line (each holding its separator, so the visible line reads right) and
+    # hidden columns of the grid. A user column that only looks like one (s_total, Gen_Other with no Other) is shown
     guid = "01234567-89ab-cdef-0123-456789abcdef"
     cols = [Col("ID", LONG), Col("s_GUID", GUID), Col("Secret", TEXT, flags=0x10), Col("Name", TEXT),
-            Col("Gen_Notes", MEMO)]
-    data = jet_db(1, [Tbl("H", cols, [[1, guid, "classified", "Ann", "gen"]])])
+            Col("Gen_Notes", BINARY), Col("Notes", MEMO), Col("s_total", LONG), Col("Gen_Other", TEXT)]
+    data = jet_db(1, [Tbl("H", cols, [[1, guid, "classified", "Ann", b"\x01", "a note", 12, "gen"]])])
     doc, ctx, md = convert(data)
     sec = section(doc, "H")
     line = next(b for b in sec.blocks if isinstance(b, Para))
-    assert columns_line(sec) == "Columns: ID (Long) · Name (Text)"
+    assert columns_line(sec) == ("Columns: ID (Long) · Name (Text) · Notes (Memo) · s_total (Long) · "
+                                 "Gen_Other (Text)"), columns_line(sec)
     hidden = ["".join(t.text for t in x.inlines) for x in line.inlines if isinstance(x, Hidden)]
-    assert hidden == [" · s_GUID (GUID)", " · Secret (Text)", " · Gen_Notes (Memo)"], hidden
+    assert hidden == [" · s_GUID (GUID)", " · Secret (Text)", " · Gen_Notes (Binary)"], hidden
     table = next(b for b in sec.blocks if isinstance(b, Table))
     assert table.hidden_cols == frozenset({1, 2, 4}) and grid(sec)[1][2] == "classified"
-    assert "Columns: ID (Long) · Name (Text)\n" in md and "classified" not in md and "Secret" not in md, md
-    assert "s_GUID" not in md and "gen" not in md and not ctx.skipped
+    assert "classified" not in md and "Secret" not in md, md
+    assert "s_GUID" not in md and "Gen_Notes" not in md and not ctx.skipped
+    assert grid(sec)[1][5:] == ["a note", "12", "gen"] and "|12|gen|" in md, md
     _, _, shown = convert(data, hidden=True)
     assert "classified" in shown and "s_GUID (GUID)" in shown and "Gen_Notes" in shown
+    # the names are matched without case; flag 0x10 hides any column
+    cols = [Col("ID", LONG), Col("S_LINEAGE", BINARY), Col("gen_notes", BINARY), Col("NOTES", MEMO),
+            Col("Plain", TEXT, flags=0x10), Col("s_ColLineage", BINARY), Col("s_Generation", LONG)]
+    doc, _, _ = convert(jet_db(1, [Tbl("C", cols, [[1, b"\x01", b"\x02", "n", "p", b"\x03", 4]])]))
+    table = next(b for b in section(doc, "C").blocks if isinstance(b, Table))
+    assert table.hidden_cols == frozenset({1, 2, 4, 5, 6}), table.hidden_cols
     # a hidden first column carries the separator after it
     doc, _, md = convert(jet_db(1, [Tbl("F", [Col("s_Lineage", BINARY), Col("A", LONG)], [[b"\x01", 5]])]))
     line = next(b for b in section(doc, "F").blocks if isinstance(b, Para))
@@ -1890,6 +1911,438 @@ def test_text_forms_charged():
     keyed = metered(jet_db(1, [Tbl("S", [Col("K", TEXT)], rows, pk="K")]))[1].charged
     chars = sum(len(r[0]) for r in rows)
     assert keyed - plain == 2 * jet._IDX + 300 * jet._KEY + chars + jet._SORT * 300 * (300).bit_length(), keyed - plain
+
+
+# -- linked tables, object names, complex columns, attachments, calculated columns, page type 8
+
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(40))
+PNG2 = b"\x89PNG\r\n\x1a\n" + bytes(range(100, 160))
+
+
+def images(sec):
+    return [b for b in sec.blocks if isinstance(b, Image)]
+
+
+def test_object_names():
+    objs = [("Orders", -32768), ("Customers", -32768), ("Sales", -32764), ("AutoExec", -32766), ("Utils", -32761)]
+    for v in (0, 1, 3):
+        doc, ctx, md = convert(jet_db(v, [three()], objects=objs))
+        lines = summary_lines(doc)
+        assert lines[1] == "Forms: Orders, Customers. Reports: Sales. Macros: AutoExec. Modules: Utils (names only).", \
+            lines
+        assert len(lines) == 2 and ctx.skipped == {"vba": 1}, (lines, ctx.skipped)
+        assert "VBA macros" in markdown.unread(ctx.skipped)
+        assert "Forms: Orders, Customers. Reports: Sales." in md and "## Table: Orders (3 rows)" in md
+    # each part only when it has names; no module, no VBA
+    doc, ctx, _ = convert(jet_db(1, [three()], objects=[("Sales", -32764), ("Q4", -32764)]))
+    assert summary_lines(doc)[1:] == ["Reports: Sales, Q4 (names only)."] and not ctx.skipped
+    doc, ctx, _ = convert(jet_db(1, [three()]))
+    assert summary_lines(doc) == ["Access 2000-2003 database (Jet 4): 1 table."] and not ctx.skipped
+
+
+def test_linked_table():
+    linked = [("Prices", ";DATABASE=C:\\x\\prices.accdb;PWD=hunter2;UID=bob", "Prices")]
+    data = jet_db(1, [three()], linked=linked)
+    doc, ctx, md = convert(data)
+    lines = summary_lines(doc)
+    assert lines == ["Access 2000-2003 database (Jet 4): 1 table, 1 linked table.",
+                     "Linked tables: Prices → C:\\x\\prices.accdb (Prices)"], lines
+    assert "hunter2" not in md and "bob" not in md and "hunter2" not in repr(doc) and "bob" not in repr(doc)
+    assert ctx.skipped == {"linked_data": 1} and "linked tables' data (in other files)" in markdown.unread(ctx.skipped)
+    # what the catalog keeps holds no credentials either
+    db = jet._Db(jet_pages.open(data), Context())
+    kept = repr(jet._catalog(db))
+    assert "hunter2" not in kept and "bob" not in kept and "prices.accdb" in kept
+    # mixed case parts; an ODBC string's DATABASE; one with no DATABASE keeps the rest of the string; an Access link
+    # whose path is in the Database column (connect empty); several joined with "; "
+    linked = [("Orders", "ODBC;DSN=Sales;pwd=Secret1;Uid=Zqx1;DATABASE=sales;APP=x", "dbo.Orders", 4),
+              ("Stock", "ODBC;DSN=Inv;pWd=Secret2;uID=Zqx2;Password=Secret3;Trusted_Connection=No", "dbo.Stock", 4),
+              ("T2", "", "Table1", 6, "Z:\\db\\other.accdb")]
+    doc, ctx, md = convert(jet_db(3, [three()], linked=linked))
+    assert summary_lines(doc)[1] == ("Linked tables: Orders → sales (dbo.Orders); Stock → ODBC;DSN=Inv;"
+                                     "Trusted_Connection=No (dbo.Stock); T2 → Z:\\db\\other.accdb (Table1)"), \
+        summary_lines(doc)
+    for secret in ("Secret1", "Secret2", "Secret3", "Zqx1", "Zqx2", "pwd", "pWd", "Uid", "uID"):
+        assert secret not in md and secret not in repr(doc), secret
+    # forms and linked tables together: line 2, then line 3
+    doc, _, _ = convert(jet_db(1, [three()], objects=[("F", -32768)], linked=linked[2:]))
+    assert summary_lines(doc)[1:] == ["Forms: F (names only).", "Linked tables: T2 → Z:\\db\\other.accdb (Table1)"]
+
+
+def test_linked_connect_as_text():
+    # a hostile catalog whose Connect and ForeignName columns carry the hyperlink flag (0x80): they are read as plain
+    # text, so the line is a string and the credentials still go
+    data = bytearray(jet_db(1, [three()], linked=[("P", "a#;DATABASE=C:\\p.accdb;PWD=pw#", "Q#x#")]))
+    db = jet._Db(jet_pages.open(bytes(data)), Context())
+    td = jet._tdef(db, 2)
+    assert len(td.pages) == 1
+    f = db.f
+    b = db.jet.page(2)
+    col_at = f.idx_def + struct.unpack_from("<I", b, f.nidx)[0] * f.idx_def_size
+    for i in range(len(td.columns)):
+        o = col_at + i * f.col_size
+        num = struct.unpack_from("<H", b, o + f.col_num)[0]
+        if td.columns[num].name in ("Connect", "ForeignName"):
+            data[2 * 4096 + o + f.col_flags] |= 0x80
+    doc, ctx, md = convert(bytes(data))
+    assert summary_lines(doc)[1] == "Linked tables: P → C:\\p.accdb (Q#x#)", summary_lines(doc)
+    assert "pw" not in md and ctx.skipped == {"linked_data": 1}, ctx.skipped
+
+
+def docs(rows, **kw):
+    return Tbl("Docs", [Col("ID", LONG), Col("Files", COMPLEX, attachments=True)], rows, pk="ID", **kw)
+
+
+def test_attachments():
+    doc, ctx, md = convert(jet_db(3, [docs([[1, [("a.png", PNG, True), ("b.txt", b"hello", True)]]])]))
+    sec = section(doc, "Docs")
+    assert grid(sec)[1] == ["1", "a.png; b.txt"], grid(sec)
+    assert columns_line(sec) == "Columns: ID (Long, PK) · Files (Attachment)", columns_line(sec)
+    imgs = images(sec)
+    assert [(i.data, i.alt) for i in imgs] == [(PNG, "Docs 1: a.png")], imgs
+    assert sec.blocks.index(imgs[0]) > [type(b) for b in sec.blocks].index(Table)  # after the table
+    assert "![Docs 1: a.png](" in md and not ctx.skipped, ctx.skipped
+    # a raw (stored) file, rows in key order with their pictures, a row with no files, a null cell, a gif and a jpg
+    # whose type is upper case
+    gif, jpg = b"GIF89a" + bytes(30), b"\xff\xd8\xff\xe0" + bytes(30)
+    rows = [[3, [("c.png", PNG2, False)]], [1, [("a.png", PNG, True), ("b.txt", b"hello", True)]], [2, []],
+            [4, None], [5, [("x.gif", gif), ("Y.JPG", jpg, True), ("z.doc", b"d" * 100)]]]
+    doc, ctx, md = convert(jet_db(3, [docs(rows)]))
+    sec = section(doc, "Docs")
+    assert grid(sec)[1:] == [["1", "a.png; b.txt"], ["2", ""], ["3", "c.png"], ["4", ""],
+                             ["5", "x.gif; Y.JPG; z.doc"]], grid(sec)
+    assert [(i.data, i.alt) for i in images(sec)] == [(PNG, "Docs 1: a.png"), (PNG2, "Docs 3: c.png"),
+                                                      (gif, "Docs 5: x.gif"), (jpg, "Docs 5: Y.JPG")]
+    assert not ctx.skipped, ctx.skipped
+    # without a primary key the key is the row's number; a hidden table hides its pictures too
+    t = Tbl("Docs", [Col("Files", COMPLEX, attachments=True)], [[None], [[("a.png", PNG)]]], flags=0x08)
+    doc, ctx, md = convert(jet_db(3, [t]))
+    (img,) = images(section(doc, "Docs"))
+    assert img.alt == "Docs 2: a.png" and img.hidden == "hidden" and "Docs 2: a.png" not in md
+
+
+def test_attachments_share_budget():
+    # one flate.Budget(limits.IMAGE_BYTES) a document: every deflated attachment of every table goes through it
+    seen = []
+    orig = flate.inflate
+
+    def spy(data, budget, limit=None):
+        seen.append(budget)
+        return orig(data, budget, limit)
+    tables = [docs([[1, [("a.png", PNG, True)]], [2, [("b.png", PNG2, True)]]]),
+              Tbl("More", [Col("ID", LONG), Col("F", COMPLEX, attachments=True)], [[1, [("c.png", PNG, True)]]])]
+    data = jet_db(3, tables)
+    flate.inflate = spy
+    try:
+        doc, ctx, _ = convert(data)
+    finally:
+        flate.inflate = orig
+    assert len(seen) == 3 and len({id(b) for b in seen}) == 1, seen
+    assert seen[0].total == limits.IMAGE_BYTES and seen[0].used >= 2 * len(PNG) + len(PNG2)
+    assert len(images(section(doc, "Docs"))) == 2 and len(images(section(doc, "More"))) == 1 and not ctx.skipped
+    # the budget lowered so the first file fits and the second does not: the second is counted `image` (the budget
+    # is per document, so the third, in another table, is past it too); the text stays
+    head = len(jet_fix_head("png"))
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES = head + len(PNG) + 10
+    try:
+        doc, ctx, _ = convert(data)
+    finally:
+        limits.IMAGE_BYTES = old
+    assert [i.alt for i in images(section(doc, "Docs"))] == ["Docs 1: a.png"] and not images(section(doc, "More"))
+    assert ctx.skipped == {"image": 2}, ctx.skipped
+    assert grid(section(doc, "Docs"))[1:] == [["1", "a.png"], ["2", "b.png"]] and grid(section(doc, "More"))[1] == \
+        ["1", "c.png"]
+
+
+def jet_fix_head(ext):
+    """The content header Jackcess writes before a file's bytes (its length, 1, the extension's length, the
+    extension and NUL in UTF-16)."""
+    e = (ext + "\0").encode("utf-16-le")
+    return struct.pack("<III", 12 + len(e), 1, len(ext) + 1) + e
+
+
+def test_attachment_bomb():
+    # a deflated file past ZIP_RATIO: no picture, counted `image`; the row and its file name stay
+    bomb = bytes(2 * 2 ** 20)
+    doc, ctx, md = convert(jet_db(3, [docs([[1, [("bomb.png", bomb, True)]], [2, [("ok.png", PNG, True)]]])]))
+    sec = section(doc, "Docs")
+    assert grid(sec)[1:] == [["1", "bomb.png"], ["2", "ok.png"]]
+    assert [i.alt for i in images(sec)] == ["Docs 2: ok.png"] and ctx.skipped == {"image": 1}, ctx.skipped
+    # a wrapper that cannot be read (an unknown type, a cut stream, a header past the data) is counted `image` too
+    from jet_fix import attachment_blob
+    bad = [b"\x07\x00\x00\x00" + attachment_blob(PNG, "png", False)[4:],
+           attachment_blob(PNG, "png", True)[:-6],
+           attachment_blob(PNG, "png", False)[:8] + struct.pack("<I", 9999) + attachment_blob(PNG, "png", False)[12:]]
+    for blob in bad:
+        data = jet_db(3, [docs([[1, [("a.png", PNG, False)]]])])
+        good = attachment_blob(PNG, "png", False)
+        assert data.count(good) == 1
+        data = data.replace(good, (blob + bytes(len(good)))[:len(good)])
+        doc, ctx, _ = convert(data)
+        assert not images(section(doc, "Docs")) and ctx.skipped == {"image": 1}, ctx.skipped
+        assert grid(section(doc, "Docs"))[1] == ["1", "a.png"]
+
+
+def test_multivalue():
+    t = Tbl("M", [Col("ID", LONG), Col("Colors", COMPLEX, multi=TEXT), Col("Nums", COMPLEX, multi=LONG)],
+            [[1, ["red", "blue"], [3, 1]], [2, [], None], [3, None, [7]]], pk="ID")
+    doc, ctx, md = convert(jet_db(3, [t]))
+    sec = section(doc, "M")
+    assert grid(sec)[1:] == [["1", "red; blue", "3; 1"], ["2", "", ""], ["3", "", "7"]], grid(sec)
+    assert columns_line(sec) == "Columns: ID (Long, PK) · Colors (Complex) · Nums (Complex)"
+    assert not ctx.skipped and "f_" not in md and "MSysComplex" not in md, ctx.skipped
+    # values past JET_CELL_CHARS are cut, counted `text` once
+    t = Tbl("M", [Col("ID", LONG), Col("V", COMPLEX, multi=TEXT)], [[1, ["x" * 30] * 10]])
+    old = jet.JET_CELL_CHARS
+    jet.JET_CELL_CHARS = 100
+    try:
+        doc, ctx, _ = convert(jet_db(3, [t]))
+    finally:
+        jet.JET_CELL_CHARS = old
+    cell = grid(section(doc, "M"))[1][1]
+    assert cell == "; ".join(["x" * 30] * 4)[:100] + "…" and ctx.skipped == {"text": 1}, (cell, ctx.skipped)
+    # a complex id MSysComplexColumns does not hold, or one naming another table: empty cells, counted `record`
+    data = jet_db(3, [Tbl("M", [Col("ID", LONG), Col("V", COMPLEX, multi=TEXT)], [[1, ["red"]], [2, ["blue"]]])])
+    for bad in (struct.pack("<I", 99), struct.pack("<I", 1)):
+        d = bytearray(data)
+        db = jet._Db(jet_pages.open(bytes(d)), Context())
+        tp = tdef_page(data, "M")
+        f = db.f
+        b = db.jet.page(tp)
+        o = f.idx_def + struct.unpack_from("<I", b, f.nidx)[0] * f.idx_def_size + f.col_size  # the second column
+        assert b[o] == COMPLEX and b[o + 11:o + 15] == struct.pack("<I", 1)
+        if bad == struct.pack("<I", 1):  # MSysComplexColumns' row names another table
+            ct = tdef_page(data, "MSysComplexColumns")
+            assert d.count(struct.pack("<i", tp)) >= 1
+            pages = data_pages(jet_pages.open(bytes(d)), ct)
+            pg = bytearray(d[pages[0] * 4096:(pages[0] + 1) * 4096])
+            assert pg.count(struct.pack("<i", tp)) == 1
+            d[pages[0] * 4096:(pages[0] + 1) * 4096] = pg.replace(struct.pack("<i", tp), struct.pack("<i", tp + 1))
+        else:
+            d[tp * 4096 + o + 11:tp * 4096 + o + 15] = bad
+        doc, ctx, _ = convert(bytes(d))
+        assert grid(section(doc, "M"))[1:] == [["1", ""], ["2", ""]] and ctx.skipped == {"record": 1}, ctx.skipped
+
+
+def test_calculated():
+    scale4 = 12345678901234
+    be = scale4.to_bytes(12, "big")
+    numeric = struct.pack("<hBB", 14, 4, 0) + be[:4][::-1] + be[4:][::-1]  # CalculatedColumnUtil's numeric form
+    cols = [Col("A", LONG), Col("C", LONG, calc=LONG, props={"Expression": "[A]*2"}),
+            Col("M", DOUBLE, calc=MONEY, props={"Expression": "[A]/12"}),
+            Col("T", TEXT, calc=TEXT, props={"Expression": "\"n\" & [A]"}),
+            Col("B", INT, calc=BOOL, props={"Expression": "[A]>1"}),
+            Col("N", DOUBLE, calc=NUMERIC, props={"Expression": "[A]/7"}),
+            Col("L", TEXT, calc=MEMO, props={"Expression": "[T] & [T]"})]
+    rows = [[21, 42, 15000, "n21", True, numeric, "word " * 29 + "end"], [1, 2, 0, "n1", False, b"", None], [2]]
+    doc, ctx, md = convert(jet_db(3, [Tbl("K", cols, rows)]))
+    sec = section(doc, "K")
+    assert grid(sec)[1:] == [["21", "42", "1.5", "n21", "Yes", "1234567890.1234", "word " * 29 + "end"],
+                             ["1", "2", "0", "n1", "No", "", ""], ["2", "", "", "", "", "", ""]], grid(sec)
+    assert columns_line(sec) == (
+        "Columns: A (Long) · C (Long, = [A]*2) · M (Currency, = [A]/12) · T (Text, = \"n\" & [A]) · "
+        "B (Yes/No, = [A]>1) · N (Decimal, = [A]/7) · L (Memo, = [T] & [T])"), columns_line(sec)
+    assert not ctx.skipped, ctx.skipped
+    # the brief's case
+    doc, ctx, _ = convert(jet_db(3, [Tbl("K", [Col("A", LONG), Col("C", LONG, calc=LONG,
+                                                                     props={"Expression": "[A]*2"})], [[21, 42]])]))
+    assert grid(section(doc, "K"))[1] == ["21", "42"] and "= [A]*2" in columns_line(section(doc, "K"))
+    # an expression on one line, cut at JET_CELL_CHARS (counted `text`)
+    long_expr = "[A]\n+" + "1+" * 60
+    old = jet.JET_CELL_CHARS
+    jet.JET_CELL_CHARS = 40
+    try:
+        doc, ctx, _ = convert(jet_db(3, [Tbl("K", [Col("A", LONG), Col("C", LONG, calc=LONG,
+                                                                         props={"Expression": long_expr})], [[1, 2]])]))
+    finally:
+        jet.JET_CELL_CHARS = old
+    line = columns_line(section(doc, "K"))
+    assert line == "Columns: A (Long) · C (Long, = " + ("[A] +" + "1+" * 60)[:40] + "…)", line
+    assert ctx.skipped == {"text": 1}, ctx.skipped
+
+
+def test_page_type_8():
+    for v in (1, 3):
+        doc, ctx, md = convert(jet_db(v, [three()], page8=True))
+        assert grid(section(doc, "Orders"))[1:] == [["1", "Ann", "first"], ["2", "Bob", ""], ["3", "Cy", "third note"]]
+        assert ctx.skipped["jet_page8"] >= 1 and not markdown.unread(ctx.skipped), ctx.skipped
+        assert set(ctx.skipped) == {"jet_page8"}, ctx.skipped
+
+
+# -- the new loops, each charged before its work
+
+def complex_spend(data, name):
+    """(the db, the table's tdef, the catalog) just before the table's complex columns are resolved."""
+    db = jet._Db(jet_pages.open(data), Context())
+    objs = jet._catalog(db)
+    jet._relationships(db, objs)
+    return db, jet._tdef(db, tdef_page(data, name)), objs
+
+
+def test_complex_columns_charged():
+    # 150 complex columns: MSysComplexColumns' 150 rows are read through the charged row walk, each row's cells
+    # charged before they are read
+    t = Tbl("W", [Col(f"c{i}", COMPLEX, multi=TEXT) for i in range(150)], [[["v"]] * 150])
+    data = jet_db(3, [t])
+    db, tdef, objs = complex_spend(data, "W")
+    before = db.meter.charged
+    with Loops() as loops:
+        cols = jet._complex_columns(db, objs)
+    spent = db.meter.charged - before
+    assert len(cols) == 150 and loops.n <= 2 * spent + 16, (len(cols), loops.n, spent)
+    assert spent >= 150 * (jet._ROW + 5 * jet._CELL), spent
+    doc, ctx, _ = convert(data)
+    assert grid(section(doc, "W"))[1] == ["v"] * 150 and not ctx.skipped
+    # MSysComplexColumns' rows take the room: past it the rest are dropped, counted `record` once
+    db, tdef, objs = complex_spend(data, "W")
+    db.room = 50 * (64 + sys.getsizeof("c10") + jet._KEEP) + 10
+    cols = jet._complex_columns(db, objs)
+    assert len(cols) == 50 and db.ctx.skipped == {"record": 1}, (len(cols), db.ctx.skipped)
+    # a catalog of 20,000 objects: it is looked through once for the type tables' names, a unit an object first
+    data = jet_db(3, [Tbl("W", [Col("c", COMPLEX, multi=TEXT)], [[["v"]]])],
+                  objects=[(f"f{i}", -32768) for i in range(20_000)])
+    db, tdef, objs = complex_spend(data, "W")
+    before = db.meter.charged
+    with Loops() as loops:
+        cols = jet._complex_columns(db, objs)
+    spent = db.meter.charged - before
+    assert len(cols) == 1 and spent >= len(objs) > 20_000 and loops.n <= 2 * spent + 16, (loops.n, spent)
+
+
+def test_flat_walk_and_join_charged():
+    # one row whose multi-value cell names 3,000 values: the flat table's rows are charged as any table's, and the
+    # cell's join charges each value (and its characters) before it is added
+    t = Tbl("M", [Col("ID", LONG), Col("V", COMPLEX, multi=TEXT)], [[1, [f"v{i}" for i in range(3_000)]]])
+    data = jet_db(3, [t])
+    db, tdef, objs = complex_spend(data, "M")
+    col = tdef.columns[1]
+    before = db.meter.charged
+    with Loops() as loops:
+        info = jet._complex_info(db, objs, tdef, col)
+    spent = db.meter.charged - before
+    assert info is not None and loops.n <= 2 * spent + 16 and spent >= 3_000 * (jet._ROW + 3 * jet._CELL), \
+        (loops.n, spent)
+    raw = struct.pack("<i", 1)
+    before = db.meter.charged
+    with Loops() as loops:
+        cell = info.cell(db, raw)
+    spent = db.meter.charged - before
+    assert cell.startswith("v0; v1; ") and loops.n <= 2 * spent + 16, (loops.n, spent)
+    assert spent >= 3_000 * jet._CPLX + sum(len(f"v{i}") for i in range(3_000)), spent
+    # a cut cell stops the loop: about JET_CELL_CHARS of values are visited
+    old = jet.JET_CELL_CHARS
+    jet.JET_CELL_CHARS = 50
+    try:
+        with Loops() as loops:
+            cell = info.cell(db, raw)
+    finally:
+        jet.JET_CELL_CHARS = old
+    assert cell.endswith("…") and loops.n < 200, loops.n
+    # the values kept take the flat room (four times the file): past it the rest are dropped, counted `record` once
+    db, tdef, objs = complex_spend(data, "M")
+    db.flat_room = 10_000
+    info = jet._complex_info(db, objs, tdef, tdef.columns[1])
+    assert 100 < len(info.rows[1]) < 200 and db.ctx.skipped == {"record": 1}, (len(info.rows[1]), db.ctx.skipped)
+
+
+def test_attachment_rows_charged():
+    # 400 attachments on one row (one a picture each tenth): the flat rows are charged, and the pictures' rows (each
+    # one's long value read and a unit for its entry) before each is read
+    files = [(f"f{i}.png" if i % 10 == 0 else f"f{i}.txt", PNG if i % 10 == 0 else b"t", i % 20 == 0)
+             for i in range(400)]
+    data = jet_db(3, [docs([[1, files]])])
+    db, tdef, objs = complex_spend(data, "Docs")
+    before = db.meter.charged
+    with Loops() as loops:
+        info = jet._complex_info(db, objs, tdef, tdef.columns[1])
+    spent = db.meter.charged - before
+    assert loops.n <= 2 * spent + 16 and spent >= 400 * (jet._ROW + 6 * jet._CELL), (loops.n, spent)
+    before = db.meter.charged
+    with Loops() as loops:
+        pics = info.pictures(db, 1, "Docs 1", False)
+    spent = db.meter.charged - before
+    assert len(pics) == 40 and loops.n <= 2 * spent + 16 and spent >= 400 * jet._CPLX + 40 * jet._ROW_COST, \
+        (len(pics), loops.n, spent)
+    doc, ctx, _ = convert(data)
+    assert len(images(section(doc, "Docs"))) == 40 and not ctx.skipped, ctx.skipped
+    # 1,000 pictures past the image budget: each file is charged `_CPLX` and each picture `_ROW_COST` before it is
+    # looked at, though nothing more is read
+    data = jet_db(3, [docs([[1, [(f"p{i}.png", PNG) for i in range(1_000)]]])])
+    db, tdef, objs = complex_spend(data, "Docs")
+    info = jet._complex_info(db, objs, tdef, tdef.columns[1])
+    db.images.used = db.images.total
+    before = db.meter.charged
+    with Loops() as loops:
+        assert info.pictures(db, 1, "Docs 1", False) == []
+    spent = db.meter.charged - before
+    assert spent >= 1_000 * (jet._CPLX + jet._ROW_COST) and loops.n <= 2 * spent + 16, (loops.n, spent)
+    assert db.ctx.skipped == {"image": 1_000}, db.ctx.skipped
+    # a deflated picture of 1 MiB: its inflated bytes are charged, `_INFLATE` a unit
+    big = PNG + bytes(2 ** 20 - 100)
+    data = jet_db(3, [docs([[1, [("big.png", big, True)]]])])
+    db, tdef, objs = complex_spend(data, "Docs")
+    info = jet._complex_info(db, objs, tdef, tdef.columns[1])
+    before = db.meter.charged
+    (pic,) = info.pictures(db, 1, "Docs 1", False)
+    spent = db.meter.charged - before
+    assert pic.data == big and spent >= len(big) // jet._INFLATE, spent
+    # with less left on the meter than the picture costs, inflation stops there: no picture, counted `image`
+    db, tdef, objs = complex_spend(data, "Docs")
+    info = jet._complex_info(db, objs, tdef, tdef.columns[1])
+    db.meter.spent = db.meter.total - 5_000
+    assert info.pictures(db, 1, "Docs 1", False) == [] and db.ctx.skipped == {"image": 1}, db.ctx.skipped
+
+
+def test_connect_charged():
+    # a connect string of 20,000 parts: its characters and parts are charged before it is split
+    db = jet._Db(jet_pages.open(jet_db(1)), Context())
+    s = "A=1;" * 20_000 + "PWD=x;DATABASE=d"
+    before = db.meter.charged
+    with Loops() as loops:
+        target = jet._linked_target(db, s, "")
+    spent = db.meter.charged - before
+    assert target == "d" and loops.n <= 2 * spent + 16, (loops.n, spent)
+    assert spent >= len(s) + jet._PART * s.count(";"), spent
+    # kept within the room: past it the target is dropped, counted `record`
+    data = jet_db(1, linked=[("P", ";DATABASE=" + "p" * 3_000, "P")])
+    db = jet._Db(jet_pages.open(data), Context())
+    db.room = 100
+    objs = jet._catalog(db)
+    (p,) = [o for o in objs if o.name == "P"]
+    assert p.connect == "" and db.ctx.skipped == {"record": 1}, (p.connect, db.ctx.skipped)
+
+
+def test_object_names_charged():
+    # 5,000 forms and 1,000 linked tables: each name in the summary is charged before it is written
+    objs = [(f"form{i}", -32768) for i in range(5_000)]
+    linked = [(f"L{i}", f";DATABASE=d{i}", f"T{i}") for i in range(1_000)]
+    data = jet_db(1, [], objects=objs, linked=linked)
+    db = jet._Db(jet_pages.open(data), Context())
+    catalog = jet._catalog(db)
+    before = db.meter.charged
+    with Loops() as loops:
+        inl = jet._summary(db, catalog, "x")
+    spent = db.meter.charged - before
+    text = "".join(x.text for x in inl if isinstance(x, Text))
+    assert text.count("form") == 5_000 and text.count(" → d") == 1_000 and "record" not in db.ctx.skipped, text[:200]
+    assert loops.n <= 2 * spent + 16 and spent >= 6_000 * jet._NAME, (loops.n, spent)
+
+
+def test_expression_charged():
+    # a 12,000-character expression: its characters are charged before the schema line holds them
+    data = jet_db(3, [Tbl("K", [Col("A", LONG), Col("C", LONG, calc=LONG, props={"Expression": "[A]+" * 3_000})],
+                          [[1, 2]])])
+    db = jet._Db(jet_pages.open(data), Context())
+    objs = jet._catalog(db)
+    tdef = jet._tdef(db, tdef_page(data, "K"))
+    jet._apply_props(db, tdef, db.props_of(next(o for o in objs if o.name == "K")))
+    before = db.meter.charged
+    with Loops() as loops:
+        line = jet._schema(db, tdef, "K", {})
+    spent = db.meter.charged - before
+    assert "= [A]+[A]+" in "".join(x.text for x in line) and spent >= 12_000 and loops.n <= 2 * spent + 16, \
+        (loops.n, spent)
 
 
 def main():

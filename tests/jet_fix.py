@@ -3,9 +3,11 @@
 The layouts follow Jackcess 5.0.4 (Apache-2.0), `impl/JetFormat.java` (offsets per version), `TableImpl.java`
 (`createRow`, the row and data page layout), `ColumnImpl.java` (`writeDefinition`, the 18- and 25-byte column blocks;
 `encodeTextValue`, the compressed unicode form), `IndexData.java` and `IndexImpl.java` (index blocks),
-`LongValueColumnImpl.java` (inline, single-row and chained long values) and `PropertyMaps.java` (LvProp blobs); the
-Jet3 jump table is written the way `TableImpl.readJumpTableVarColOffsets` reads it. mdbtools' `HACKING.md` (LGPL) was
-read as format knowledge only. `scripts/reader/formats/jet_pages.py` reads what this writes.
+`LongValueColumnImpl.java` (inline, single-row and chained long values), `PropertyMaps.java` (LvProp blobs),
+`impl/complex/ComplexColumnInfoImpl.java` and `AttachmentColumnInfoImpl.java` (flat tables, the attachment wrapper),
+`ComplexColumnSupport.java` (MSysComplexColumns and the type tables) and `CalculatedColumnUtil.java` (the wrapped value
+of a calculated column); the Jet3 jump table is written the way `TableImpl.readJumpTableVarColOffsets` reads it.
+mdbtools' `HACKING.md` (LGPL) was read as format knowledge only. `scripts/reader/formats/jet_pages.py` reads what this writes.
 
 `jet_db(version, tables, ...)` returns the file's bytes: page 0 with its header RC4-masked (code page, db_key,
 password, creation date), page 1 holding the usage map rows, the MSysObjects TDEF at page 2, then the TDEFs of
@@ -27,7 +29,20 @@ A table's `rows` may hold `Row` markers: a deleted row (0x8000), an overflow row
 flagged 0x8000 on a page of its own, as Jackcess's `updateRow` writes it) or an overflow row pointing at itself. A
 `Col(deleted=True)` keeps its column number, fixed offset and variable slot, and its values are written into the rows,
 but the TDEF leaves it out (num_cols drops, max_cols does not), as rows written before a column was deleted look.
+
+Complex columns (ACE type 18): `Col(name, COMPLEX, attachments=True)` takes, per row, a list of files `(name, bytes[,
+deflated])`; `Col(name, COMPLEX, multi=TEXT)` (or another type) a list of values; None is null. Each gets a complex id
+(in the column block at offset 11), a flat table `f_<id>_<column>` (system flags 0x800A0000: the foreign key column
+`_<column>` with ext 0x08, the type columns, the autonumber `<table>_<column>`), the shared type table
+(`MSysComplexType_Attachment`, `MSysComplexType_Text`, ...) and a row of MSysComplexColumns (written only then); the
+cell holds the foreign key, the row's number from 1. A file is stored in Jackcess's wrapper: a u32 type (1 deflated, 0
+raw), the content's length, then the content (zlib-deflated when 1): a header (its length, 1, the extension's length
+with its NUL, the extension in UTF-16 and NUL) and the file's bytes. `Col(name, type, calc=result)` is a calculated
+column: ext 0xC0, variable, the property ResultType; each value is wrapped (16 zero bytes, a u32 length, the data, three
+zero bytes), from bytes as given, a bool (FF or 00), text (its compressed form) or the result type's fixed bytes; a MEMO
+result is then a long value. `Col(ext=)` sets the ext byte outright.
 """
+import zlib
 import struct
 import sys
 import uuid
@@ -59,9 +74,11 @@ class Col:
     the column flags, with 0x01 (fixed) set or cleared from the type; `props` its LvProp properties."""
 
     def __init__(self, name, type, *, length=0, flags=0x01, props=None, compressed=None, deleted=False, precision=0,
-                 scale=0):
+                 scale=0, ext=None, calc=None, attachments=False, multi=None):
         self.name, self.type, self.length, self.flags, self.props = name, type, length, flags, props or {}
         self.compressed, self.deleted, self.precision, self.scale = compressed, deleted, precision, scale
+        self.ext, self.calc, self.attachments, self.multi = ext, calc, attachments, multi
+        self.complex_id = 0
 
 
 class Row:
@@ -203,10 +220,14 @@ class _Writer:
         cols = []
         fixed_at = 0
         for i, c in enumerate(t.cols):
-            fixed = c.type in FIXED
+            fixed = c.type in FIXED and c.calc is None
             length = c.length or FIXED.get(c.type) or {TEXT: 255 if self.j3 else 510, BINARY: 255}.get(c.type, 0)
             flags = (c.flags & ~0x01) | (0x01 if fixed else 0) | (0x10 if system else 0)
             ext = 0x01 if (not self.j3 and not system and c.type in (TEXT, MEMO) and c.compressed is not False) else 0
+            if c.calc is not None:
+                ext = 0xC0
+            if c.ext is not None:
+                ext = c.ext
             col = {"c": c, "num": i, "fixed": fixed, "len": length, "flags": flags, "ext": ext, "off_f": 0,
                    "off_v": 0}
             if fixed and c.type != BOOL:
@@ -237,11 +258,27 @@ class _Writer:
 
     def var_value(self, x, v):
         c = x["c"]
+        if c.calc is not None:
+            return self.calc_value(c, v)
         if isinstance(v, str):
             v = self.text(v, bool(x["ext"] & 0x01))
         if c.type in LONG_VALUES:
             return self.long_value(bytes(v))
         return bytes(v)
+
+    def calc_value(self, c, v):
+        """A calculated column's value, wrapped (`CalculatedColumnUtil.wrapCalculatedValue`)."""
+        t = c.calc
+        if isinstance(v, (bytes, bytearray)):
+            inner = bytes(v)
+        elif t == BOOL:
+            inner = b"\xff" if v else b"\x00"
+        elif t in (TEXT, MEMO):
+            inner = self.text(v, True)
+        else:
+            inner = self.fixed_value(Col("", t), v)
+        wrapped = bytes(16) + struct.pack("<I", len(inner)) + inner + bytes(3)
+        return self.long_value(wrapped) if t == MEMO else wrapped
 
     def row(self, t, cols, var, fixed_size, values):
         n = len(cols)
@@ -250,7 +287,7 @@ class _Writer:
         datas = {}
         for x, v in zip(cols, list(values) + [None] * (n - len(values))):
             c = x["c"]
-            if c.type == BOOL:
+            if c.type == BOOL and c.calc is None:
                 if v:
                     mask[x["num"] // 8] |= 1 << x["num"] % 8
                 continue
@@ -323,6 +360,8 @@ class _Writer:
                 misc = struct.pack("<HH", 0x409, self.codepage & 0xFFFF) if j3 else struct.pack("<HH", 0x409, 0)
             elif c.type == NUMERIC:  # precision and scale at 11 and 12 of the column block
                 misc = bytes(2) + bytes([c.precision, c.scale]) if j3 else bytes([c.precision, c.scale]) + bytes(2)
+            elif c.type == COMPLEX and not j3:  # the complex id where a text column keeps its sort order
+                misc = struct.pack("<I", c.complex_id)
             else:
                 misc = bytes(4)
             length = 0 if c.type in LONG_VALUES else x["len"]
@@ -448,7 +487,7 @@ class _Writer:
         if isinstance(value, bool):
             return BOOL, b"\xff" if value else b"\x00"
         if isinstance(value, int):
-            return (BYTE, struct.pack("<B", value)) if key in ("TextFormat", "DecimalPlaces") else \
+            return (BYTE, struct.pack("<B", value)) if key in ("TextFormat", "DecimalPlaces", "ResultType") else \
                 (LONG, struct.pack("<i", value))
         if isinstance(value, (bytes, bytearray)):
             return BINARY, bytes(value)
@@ -462,6 +501,70 @@ CATALOG = [("Id", LONG), ("ParentId", LONG), ("Name", TEXT), ("Type", INT), ("Fl
            ("LvProp", OLE)]
 QUERIES = [("Attribute", BYTE), ("Expression", MEMO), ("Flag", INT), ("LvExtra", OLE), ("Name1", MEMO),
            ("Name2", MEMO), ("ObjectId", LONG), ("Order", BINARY)]
+CPLX = [("ColumnName", TEXT), ("ComplexTypeObjectID", LONG), ("FlatTableID", LONG), ("ConceptualTableID", LONG),
+        ("ComplexID", LONG)]
+MULTI_NAMES = {BYTE: "UnsignedByte", INT: "Short", LONG: "Long", FLOAT: "IEEESingle", DOUBLE: "IEEEDouble",
+               GUID: "GUID", NUMERIC: "Decimal", TEXT: "Text"}
+ATTACHMENT_TYPE = [("FileURL", MEMO), ("FileName", TEXT), ("FileType", TEXT), ("FileData", OLE),
+                   ("FileTimeStamp", DATE), ("FileFlags", LONG)]
+ATTACHMENT_FLAT = [("FileData", OLE), ("FileFlags", LONG), ("FileName", TEXT), ("FileTimeStamp", DATE),
+                   ("FileType", TEXT), ("FileURL", MEMO)]
+
+
+def attachment_blob(data: bytes, ext: str, deflated: bool) -> bytes:
+    """A file in Jackcess's attachment wrapper (`AttachmentColumnInfoImpl.encodeData`)."""
+    e = (ext + "\0").encode("utf-16-le")
+    head = struct.pack("<III", 12 + len(e), 1, len(ext) + 1) + e
+    body = head + bytes(data)
+    return struct.pack("<iI", 1 if deflated else 0, len(body)) + (zlib.compress(body) if deflated else body)
+
+
+def _complex(tables):
+    """The flat and type tables, the rows with each complex cell its foreign key (by table id), and the
+    MSysComplexColumns rows as (column, type table, flat table, table, complex id) names, for the complex columns."""
+    extra, specs, written, types = [], [], {}, {}
+    cid = 0
+    for t in tables:
+        found = [(k, c) for k, c in enumerate(t.cols) if c.type == COMPLEX and (c.attachments or c.multi is not None)]
+        if not found:
+            continue
+        rows = [Row(r.kind, r.values) if isinstance(r, Row) else list(r) for r in t.rows]
+        for k, c in found:
+            cid += 1
+            c.complex_id = cid
+            if c.attachments:
+                tname, tcols, fcols = "MSysComplexType_Attachment", ATTACHMENT_TYPE, ATTACHMENT_FLAT
+            else:
+                tname = "MSysComplexType_" + MULTI_NAMES.get(c.multi, str(c.multi))
+                tcols = fcols = [("Value", c.multi)]
+            if tname not in types:
+                types[tname] = Tbl(tname, [Col(n, ty) for n, ty in tcols], [], flags=0x80030000)
+                extra.append(types[tname])
+            cols = [Col("_" + c.name, LONG, ext=0x08)] + [Col(n, ty) for n, ty in fcols]
+            cols.append(Col(f"{t.name}_{c.name}", LONG, flags=0x05))
+            frows = []
+            for ri, r in enumerate(rows):
+                vals = r.values if isinstance(r, Row) else r
+                v = vals[k] if k < len(vals) else None
+                if v is None:
+                    continue
+                fk = ri + 1
+                for item in v:
+                    pk = len(frows) + 1
+                    if c.attachments:
+                        name, data, deflated = (tuple(item) + (False,))[:3]
+                        ext = name.rpartition(".")[2] if "." in name else ""
+                        frows.append([fk, attachment_blob(data, ext, deflated), 0, name, None, ext, None, pk])
+                    else:
+                        frows.append([fk, item, pk])
+                vals[k] = fk
+            flat = Tbl(f"f_{cid:032X}_{c.name}", cols, frows, flags=0x800A0000)
+            extra.append(flat)
+            specs.append((c.name, tname, flat.name, t.name, cid))
+        written[id(t)] = rows
+    return extra, specs, written
+
+
 RELS = [("ccolumn", LONG), ("grbit", LONG), ("icolumn", LONG), ("szColumn", TEXT), ("szObject", TEXT),
         ("szReferencedColumn", TEXT), ("szReferencedObject", TEXT), ("szRelationship", TEXT)]
 
@@ -471,13 +574,18 @@ def jet_db(version: int, tables=(), *, queries=(), objects=(), relationships=(),
     """A whole Jet (0, 1) or ACE (2, 3, 5, 6) file. `objects`: (name, type) for forms (-32768), reports (-32764),
     macros (-32766) and modules (-32761). `relationships`: (name, table, column, ref_table, ref_column), one
     MSysRelationships row each. `linked`: (name, connect, foreign_name[, type[, database]]), type 6 by default.
+    Complex columns add their flat and type tables and MSysComplexColumns (see the module's docstring).
     `page8` adds a page of type 8 to the first user table's owned pages. With `db_key`, every page but 0 is RC4
     keyed by `db_key XOR n` (in ACE too, which is how an encrypted ACE file looks to the page layer)."""
     w = _Writer(version, codepage)
     tables = list(tables)
+    extra, specs, written = _complex(tables)
+    tables += extra
     system = [Tbl("MSysObjects", [Col(n, t) for n, t in CATALOG], []),
               Tbl("MSysQueries", [Col(n, t) for n, t in QUERIES], []),
               Tbl("MSysRelationships", [Col(n, t) for n, t in RELS], [])]
+    if specs:
+        system.append(Tbl("MSysComplexColumns", [Col(n, t) for n, t in CPLX], []))
     everything = system + tables
     plans = []
     for k, t in enumerate(everything):
@@ -497,7 +605,8 @@ def jet_db(version: int, tables=(), *, queries=(), objects=(), relationships=(),
                                                  (REPORTS, "Reports"), (SCRIPTS, "Scripts"), (MODULES, "Modules"))]
     rows += [cat(tdef_of[t.name], TABLES, t.name, 1, SYSTEM) for t in system]
     for t in tables:
-        blob = w.props(t.props, [(c.name, c.props) for c in t.cols if not c.deleted])
+        blob = w.props(t.props, [(c.name, c.props if c.calc is None else {**c.props, "ResultType": c.calc})
+                                 for c in t.cols if not c.deleted])
         rows.append(cat(tdef_of[t.name], TABLES, t.name, 1, t.flags, props=blob))
     qrows = []
     for i, q in enumerate(queries):
@@ -517,12 +626,14 @@ def jet_db(version: int, tables=(), *, queries=(), objects=(), relationships=(),
         rows.append(cat(0x00400000 + i, RELATIONSHIPS, name, 8))
         rrows.append([1, 0, 0, column, table, ref_column, ref_table, name])
     plans[0]["t"].rows, plans[1]["t"].rows, plans[2]["t"].rows = rows, qrows, rrows
+    if specs:
+        plans[3]["t"].rows = [[n, tdef_of[tn], tdef_of[fn], tdef_of[on], cid] for n, tn, fn, on, cid in specs]
 
     for p in plans:
         t = p["t"]
         tdef4 = p["pages"][0].to_bytes(4, "little")
         encoded, extra = [], []
-        for r in t.rows:
+        for r in written.get(id(t), t.rows):
             if not isinstance(r, Row):
                 encoded.append(w.row(t, p["cols"], p["var"], p["fixed"], r))
             elif r.kind == "deleted":

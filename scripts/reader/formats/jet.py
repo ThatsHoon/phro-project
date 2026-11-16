@@ -9,7 +9,10 @@ hyperlink flags, and `read`: currency, dates, extended dates, numerics and GUIDs
 is a Memo), `NumericColumnImpl.java` (precision and scale), `IndexData.java` and `IndexImpl.java` (the real and
 logical index blocks, the primary key), `LongValueColumnImpl.java` (`readLongValue`: inline, one-row and chained long
 values), `PropertyMaps.java` (the LvProp blob), `UsageMap.java` (the map row a TDEF points at), `NullMask.java` and
-`JetFormat.java` (the offsets of each version). mdbtools' `HACKING.md` (LGPL) was read as format knowledge only (the
+`JetFormat.java` (the offsets of each version), `ComplexColumnSupport.java` (MSysComplexColumns, the type tables'
+names), `complex/ComplexColumnInfoImpl.java`, `complex/AttachmentColumnInfoImpl.java` (`decodeData`) and the other
+`complex/` classes (the flat tables), and `CalculatedColumnUtil.java` (the wrapped value of a calculated column, its
+Decimal form). mdbtools' `HACKING.md` (LGPL) was read as format knowledge only (the
 ACE encryption structure whose length is at 0x299); no code is taken from it. The page layer is `jet_pages`.
 
 Encryption. A password at 0x42 (20 bytes in Jet3; 40 in Jet4 and ACE, XOR the int part of the creation date at 0x72,
@@ -22,6 +25,13 @@ the catalog's included, go through `Jet.text` with the column's compressed-unico
 is read once with its TDEF. A user table's LvProp definition (12 bytes, or the inline value) is kept with its row,
 room allowing (past it the table is shown without properties, counted `record`).
 
+Summary. "<version>: N tables, N queries, N linked tables.", then on its own line "Forms: … Reports: … Macros: …
+Modules: … (names only)." (each part only when it has names; any module counts `vba`), then "Linked tables: <name> →
+<target> (<table>)" joined with "; " (counted `linked_data`). A linked table's Connect, Database and ForeignName cells
+are read as plain text (a hyperlink flag is not followed); the target is the connect string's DATABASE= part, else the
+Database cell (an Access link keeps its path there), else the string itself, and PWD=, UID=, Password= and User ID=
+parts (any case, a {braced} value whole) are dropped before anything is kept, so no credential is ever shown.
+
 Properties. A table's LvProp blob (`KKD\\0` or `MR2\\0`, then chunks: the property names, the table's own map, a map
 per column, index maps skipped) is read when the table is, once (`_props`), at most `JET_PROPS` bytes and
 `JET_PROP_CHUNKS` chunks; past either, or malformed, the properties are ignored and counted `record`. Of a column's
@@ -33,12 +43,36 @@ Relationships. MSysRelationships is read once, before any table: each row gives 
 and what it names (szReferencedObject, szReferencedColumn); a row naming a table the catalog does not hold is left
 out. The schema line shows the target after the column's type, "CustomerID (Long → Customers.ID)".
 
-Schema line. "Columns: " then each column as "name (type[ → targets][, PK][, autonumber][, required][, rich
-text])". A hidden column (flag 0x10, or a name starting `s_` or `Gen_`, Access's replication and generated columns)
-is a Hidden inline that holds its separator, and its grid column is hidden.
+Schema line. "Columns: " then each column as "name (type[ → targets][, = expression][, PK][, autonumber][,
+required][, rich text])"; an attachment column's type is "Attachment", another complex column's "Complex". A hidden
+column (flag 0x10; a replication column, `s_GUID`, `s_Lineage`, `s_Generation` or `s_ColLineage`; or `Gen_X` where X
+is a column of the same table; names without case) is a Hidden inline that holds its separator, and its grid column
+is hidden. A user column that only looks like one (`s_total`) is shown.
 
 Values. A Memo flagged 0x80 is a hyperlink, `display#address#subaddress#tip`: a Link when the address is http, https,
 mailto or ftp and holds no space or control character, else "display (address)".
+
+Calculated columns (ext 0xC0). The type is the ResultType property's (when it is a type read here), the value the
+stored one: 16 bytes, a u32 length, the data (shorter than 20 bytes, as it is). A Yes/No is its first byte, not a
+null-mask bit; text is in the compressed form whatever the ext byte; a Memo is a long value holding the wrapped data;
+a Decimal is its own form (an i16 length, scale, sign, at most 16 bytes in a swapped order). The Expression shows in
+the schema line on one line, cut at JET_CELL_CHARS.
+
+Complex columns (type 18; Jackcess `impl/complex`). The column block holds a complex id at 11; its MSysComplexColumns
+row (read once a document, its rows taking room) must name this table (ConceptualTableID) and, when it names one, this
+column, and gives the flat table and the type table, whose name says the kind: `MSysComplexType_Attachment`, a
+version history (`MSysComplexTypeVH_`) or a multi-value column (another `MSysComplexType_`); an unknown name leaves it
+to the flat table's shape. The flat table (foreign key: ext 0x08; the autonumber key left out) is read once, its
+values kept by key within their own room of four times the file's bytes (past it the rest are counted `record`). A
+cell is its row's values (a version's columns joined with ", ") or file names, joined with "; ", cut at
+JET_CELL_CHARS. A column that cannot be resolved shows empty cells, counted `record` once. An attachment that is a jpg,
+jpeg, png or gif (by its name) is also an Image after the table, alt "<table> <key>: <file name>" (the key the row's
+primary key values, else its row number), for the rows the grid shows: the wrapper (a u32 type, 0 raw or 1 deflated;
+the content's length; the content, a header then the file) is read through `long_bytes`, and every picture's bytes,
+raw or inflated (`flate.inflate`), come from one `flate.Budget(IMAGE_BYTES)` a document; past it, or a wrapper that
+cannot be read (an unknown type, a cut stream, a header past the data), counts `image` and the file name stays.
+
+Page type 8. A page of type 8 in a table's usage map holds no rows read here: skipped, counted `jet_page8` (internal).
 
 Key order. A table with a primary key shows its rows in key order: rows are held while they fit what the grid has
 left (SHEET_ROWS - 1 rows, the cells and characters the shared budget still holds), then sorted by their typed key
@@ -66,7 +100,12 @@ definition (`_COLDEF`) and its name's bytes, each index block (`_IDX`), each TDE
 LVAL row (its bytes and `_ROW_COST`), each property chunk, name and value (`_PROP`), each character of rich text fed
 to the HTML parser (`_HTML`) and of a hyperlink (`_LINK`), each key column of a held row (`_KEY`, and a unit a
 character of a text key), the sort (`_SORT` times n times the bits of n, through `Meter.afford`: past what is left
-the rows stay in page order) and each relationship target written (`_REF`); MSysRelationships' rows as any table's.
+the rows stay in page order) and each relationship target written (`_REF`); MSysRelationships', MSysComplexColumns'
+and the flat tables' rows as any table's; the catalog looked through for the type tables (a unit an object); each
+complex value joined (`_CPLX` and a unit a character), each attachment looked at for a picture (`_CPLX`) and each
+picture read (`_ROW_COST`, its long value as any, its inflated bytes `_INFLATE` a unit, inflation stopping at what
+the meter has left); each connect string's characters and parts (`_PART`); each name in the summary (`_NAME`); each
+character of a calculated column's expression.
 In `jet_pages` each RC4 page, chain item and usage map byte. The prices are measured, each at least what its path
 costs. A real file is charged a few units a byte of itself. Past the total: the table being read stops with one
 `sheet_cut` (the grid's own cut, the rows held so far shown in page order); a table not yet started is not read at all
@@ -74,8 +113,10 @@ costs. A real file is charged a few units a byte of itself. Past the total: the 
 `record` once.
 
 Kept values. A long value read whole, an overflow target's shown values (and its sort key), a table's LvProp
-definition and properties, and the relationships' targets are kept, but only while their estimated size fits a room
-of the file's bytes (one room for all); a target that shows nothing is not kept. Past the room a repeat is read
+definition and properties, the relationships' targets, linked tables' targets and MSysComplexColumns' rows are kept,
+but only while their estimated size fits a room of the file's bytes (one room for all); a target that shows nothing
+is not kept. The flat tables' values (and a picture's FileData definition) have their own room, four times the
+file's bytes. Past the room a repeat is read
 again, charged like the first read (a definition or target past it is dropped, counted `record`). So what is kept
 stays within about the file's size, the page cache within the decoded pages of the file, and the rows held for the
 sort within the grid's caps.
@@ -104,8 +145,9 @@ from operator import itemgetter
 from pathlib import Path
 
 from .. import html, limits
+from ..containers import flate
 from ..limits import ReadError
-from ..model import Doc, Hidden, Link, Para, Section, Text
+from ..model import Break, Doc, Hidden, Image, Link, Para, Section, Text
 from . import jet_pages, sheet_grid
 
 JET_CATALOG = 100_000
@@ -153,15 +195,27 @@ _LINK = 1      # a character of a hyperlink split and checked (about 0.25)
 _KEY = 8       # a key column of a row kept for the primary-key sort (a one-column Long key, about 4.6)
 _SORT = 4      # a step of that sort, n times the bits of n (ten Decimal columns, the last differing: about 2.2)
 _REF = 8       # a relationship target written in the schema line (two names of up to JET_NAME, about 3.2)
+_CPLX = 8      # a value of a complex cell joined, or a file looked at for a picture (and a unit a character joined)
+_PART = 4      # a part of a linked table's connect string (and a unit a character)
+_NAME = 8      # an object or linked table named in the summary (a name of up to JET_NAME, its target already charged)
+_INFLATE = 64  # inflated bytes of an attachment a unit (zlib's own loop: the meter's room bounds its output)
 _KEEP = 256    # the room a kept value takes beside its text (key, tuples, a dict slot)
 _Spent = jet_pages.Spent
 _PK = 1  # IndexImpl.PRIMARY_KEY_INDEX_TYPE
 _AUTONUMBER = 0x04 | 0x40  # ColumnImpl.AUTO_NUMBER_FLAG_MASK, AUTO_NUMBER_GUID_FLAG_MASK
 _HIDDEN_COLUMN = 0x10      # ColumnImpl.HIDDEN_FLAG_MASK: a column Access maintains and hides (replication too)
 _HYPERLINK = 0x80          # ColumnImpl.HYPERLINK_FLAG_MASK, on a Memo
+_CALCULATED = 0xC0         # ColumnImpl.CALCULATED_EXT_FLAG_MASK (the ext byte)
+_FOREIGN_KEY = 0x08        # the ext byte of a flat table's foreign key column (ComplexColumnInfoImpl)
+_PAGE8 = 0x08              # a page type of ACE 14 and later that holds no rows this reader reads
+# Access's replication columns (`s_Generation` and the like), hidden; `Gen_X` too when X is a column of its table
+_REPLICATION = frozenset(("s_guid", "s_lineage", "s_generation", "s_collineage"))
+_CALC_TYPES = frozenset((BOOL, BYTE, INT, LONG, MONEY, FLOAT, DOUBLE, DATE, TEXT, MEMO, GUID, NUMERIC, BIGINT))
+_SECRETS = frozenset(("pwd", "uid", "password", "user id"))  # connect string parts never shown
+_PICTURES = frozenset(("jpg", "jpeg", "png", "gif"))
 _PROP_HEADS = (b"KKD\x00", b"MR2\x00")  # JetFormat.PROPERTY_MAP_TYPES: Jet3, then Jet4 and ACE
 _PROP_NAMES, _PROP_DEFAULT, _PROP_COLUMN, _PROP_INDEX = 0x80, 0x00, 0x01, 0x02  # PropertyMaps' chunk types
-_WANTED = frozenset(("format", "description", "textformat", "expression", "required"))
+_WANTED = frozenset(("format", "description", "textformat", "expression", "required", "resulttype"))
 LINK_SCHEMES = frozenset(("http", "https", "mailto", "ftp"))
 _NUMBERS = frozenset((BYTE, INT, LONG, BIGINT, MONEY, FLOAT, DOUBLE, NUMERIC))
 _ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md; every real file read has 0)
@@ -192,7 +246,8 @@ class _Fmt:
 
 @dataclass(slots=True)
 class Obj:
-    """One MSysObjects row."""
+    """One MSysObjects row. A linked table's `connect` is the target its connect string names (credentials removed,
+    `_linked_target`), `foreign_name` the table there; both always strings."""
     id: int
     name: str
     type: int
@@ -207,8 +262,10 @@ class Obj:
 class Column:
     """One column block of a TDEF: `num` is the column number (the null-mask bit), `var` the variable offset slot
     (`offset_V`), `fixed_off` the fixed data offset (`offset_F`); flags 0x01 fixed, 0x04 and 0x40 autonumber, 0x10
-    hidden, 0x80 hyperlink; ext 0x01 compressed unicode. `fmt` (the Format property, lower case), `rich` (TextFormat
-    1) and `required` come from the table's properties."""
+    hidden, 0x80 hyperlink; ext 0x01 compressed unicode, 0xC0 calculated. `complex_id` is a complex column's id (at
+    11 of the block). `hidden` (`_tdef`): flagged 0x10, a replication column or a `Gen_` one naming a column of the
+    table. `fmt` (the Format property, lower case), `rich` (TextFormat 1), `required` and, of a calculated column,
+    `expr` (Expression) and its type (ResultType, which replaces the block's) come from the table's properties."""
     name: str
     type: int
     num: int
@@ -222,11 +279,9 @@ class Column:
     fmt: str = ""
     rich: bool = False
     required: bool = False
-
-    @property
-    def hidden(self) -> bool:
-        """A column Access hides: flagged 0x10, or a replication column (`s_GUID`, `s_Lineage`, ...) or a `Gen_` one."""
-        return bool(self.flags & _HIDDEN_COLUMN) or self.name.startswith(("s_", "Gen_"))
+    complex_id: int = 0
+    hidden: bool = False
+    expr: str = ""
 
 
 @dataclass
@@ -283,8 +338,14 @@ class _Db:
         self.lval_cache = {}  # (definition, compressed) -> (text, bytes read, charge) of a long value read whole
         self.props_cache = {}  # object id -> its properties (`_props`), room allowing
         # bytes the kept values (long values, overflow targets, LvProp definitions and properties, relationship
-        # targets) may take
+        # targets, linked tables' targets, MSysComplexColumns' rows and the flat tables' values) may take
         self.room = jet.pages * jet.page_size
+        # bytes the flat tables' values may take: a short value's str is up to about four times its row (Python's
+        # str head against a row of a few bytes), so four times the file
+        self.flat_room = 4 * self.room
+        self.images = flate.Budget(limits.IMAGE_BYTES)  # every attachment's picture bytes, one budget a document
+        self.cplx = None  # MSysComplexColumns (`_complex_columns`), read once when a complex column is first met
+        self.cplx_info = {}  # complex id -> its `_Complex` (False when it cannot be read)
 
     @property
     def spent(self) -> int:
@@ -299,6 +360,13 @@ class _Db:
         if size + _KEEP > self.room:
             return False
         self.room -= size + _KEEP
+        return True
+
+    def keep_flat(self, size: int) -> bool:
+        """Take `size` bytes of the flat tables' room (`flat_room`); False, taking nothing, past it."""
+        if size > self.flat_room:
+            return False
+        self.flat_room -= size
         return True
 
     # -- pages and rows
@@ -554,11 +622,15 @@ def _tdef(db: _Db, page: int) -> Tdef:
         names.append(db.name(jet.text(b[pos:pos + n], False)))
         pos += n
     cols = []
+    folded = {n.casefold() for n in names}
     for i, name in enumerate(names):
         o = col_at + i * f.col_size
-        cols.append(Column(name, b[o], _u16(b, o + f.col_num), _u16(b, o + f.col_var), _u16(b, o + f.col_fixed),
-                           _u16(b, o + f.col_len), b[o + f.col_flags], b[o + f.col_ext] if f.col_ext else 0,
-                           b[o + f.precision], b[o + f.scale]))
+        c = Column(name, b[o], _u16(b, o + f.col_num), _u16(b, o + f.col_var), _u16(b, o + f.col_fixed),
+                   _u16(b, o + f.col_len), b[o + f.col_flags], b[o + f.col_ext] if f.col_ext else 0,
+                   b[o + f.precision], b[o + f.scale], complex_id=0 if db.j3 else _u32(b, o + f.precision))
+        n = name.casefold()
+        c.hidden = bool(c.flags & _HIDDEN_COLUMN) or n in _REPLICATION or (n.startswith("gen_") and n[4:] in folded)
+        cols.append(c)
     cols.sort(key=lambda c: c.num)
     if pos + nidx * f.real_block > len(b):
         raise ValueError("index block past the table definition")
@@ -692,11 +764,18 @@ def _prop_value(db: _Db, dtype: int, data: bytes):
 
 
 def _apply_props(db: _Db, tdef: Tdef, props: dict):
-    """Format (lower case), TextFormat 1 (rich text, on Text and Memo) and Required onto the table's columns."""
+    """Format (lower case), TextFormat 1 (rich text, on Text and Memo) and Required onto the table's columns; of a
+    calculated column, its Expression and its ResultType (a type this reader reads), which is its type from here
+    (`ColumnImpl.create`)."""
     for c in tdef.columns:
         p = props.get(c.name.lower())
         if not p:
             continue
+        if c.ext & _CALCULATED:
+            result, expr = p.get("resulttype"), p.get("expression")
+            if type(result) is int and result in _CALC_TYPES:
+                c.type = result
+            c.expr = expr if isinstance(expr, str) else ""
         fmt = p.get("format")
         c.fmt = fmt.strip().lower() if isinstance(fmt, str) else ""
         c.rich = p.get("textformat") == 1 and c.type in (TEXT, MEMO)
@@ -754,8 +833,235 @@ def _name_cell(db: _Db, col: Column, raw):
     """A Text or Memo cell holding a name, on one line and cut at JET_NAME; None when null or of another type."""
     if raw is None or col.type not in (TEXT, MEMO):
         return None
-    v = value(db, col, raw)
-    return db.name(v) if isinstance(v, str) else None
+    return db.name(_plain_text(db, col, raw))
+
+
+def _plain_text(db: _Db, col: Column, raw) -> str:
+    """A Text or Memo cell's text whatever its flags (a hyperlink flag is not followed), cut at JET_CELL_CHARS; "" when
+    null or of another type."""
+    if raw is None or col.type not in (TEXT, MEMO):
+        return ""
+    if col.type == TEXT:
+        return db.cut(db.decode(raw, bool(col.ext & 0x01)))
+    return db.memo(raw, bool(col.ext & 0x01))
+
+
+# -- complex columns (attachments, multi-value, version history)
+
+def _long(col: Column, raw):
+    """A Long cell's value; None when null."""
+    if raw is None:
+        return None
+    if col.type != LONG:
+        raise ValueError(f"type {col.type} where a Long was expected")
+    return struct.unpack("<i", raw)[0]
+
+
+def _complex_kind(name):
+    """The kind of complex column a type table's name says (`ComplexColumnSupport.create`): "attachment", "version",
+    "multi", "" for a name it does not know (the flat table's shape decides) or None when there is no such table."""
+    if name is None:
+        return None
+    n = name.casefold()
+    if n == "msyscomplextype_attachment":
+        return "attachment"
+    if n.startswith("msyscomplextypevh_"):
+        return "version"
+    return "multi" if n.startswith("msyscomplextype_") else ""
+
+
+def _complex_columns(db: _Db, objs: list) -> dict:
+    """MSysComplexColumns as {complex id: [column name or None, kind (`_complex_kind` of the type table), flat table
+    page, table page]}, the first row of an id kept. Its rows are charged as any table's; each row kept takes room
+    (past it the rest are counted `record` once), and the catalog is looked through once (a unit an object) for the
+    type tables' names. A table that cannot be read is counted `record` once, keeping the rows read; the meter running
+    out raises `Spent` for the caller."""
+    t = next((o for o in objs if o.type == TABLE and o.flags & SYSTEM_FLAGS
+              and o.name.lower() == "msyscomplexcolumns"), None)
+    out = {}
+    if t is None:
+        return out
+    try:
+        tdef = _tdef(db, t.id & 0xFFFFFF)
+        at = {c.name.lower(): i for i, c in reversed(list(enumerate(tdef.columns)))}
+        want = ("columnname", "complextypeobjectid", "flattableid", "conceptualtableid", "complexid")
+        if not all(k in at for k in want):
+            raise ValueError("MSysComplexColumns lacks a column")
+        cols = [tdef.columns[at[k]] for k in want]
+        for _, cells in _rows(db, tdef):
+            try:
+                name = _name_cell(db, cols[0], cells.get(at[want[0]]))
+                kind, flat, table, cid = (_long(c, cells.get(at[k])) for c, k in zip(cols[1:], want[1:]))
+            except _BAD:
+                db.ctx.skipped["record"] += 1
+                continue
+            if None in (kind, flat, table, cid) or cid in out:
+                continue
+            if not db.keep(64 + sys.getsizeof(name)):
+                db.ctx.skipped["record"] += 1
+                break
+            out[cid] = [name, kind, flat, table]
+    except _BAD:
+        db.ctx.skipped["record"] += 1
+    pages = {r[1] for r in out.values()}
+    db.charge(len(objs))
+    names = {}
+    for o in objs:
+        if o.type == TABLE and o.id & 0xFFFFFF in pages:
+            names.setdefault(o.id & 0xFFFFFF, o.name)
+    for r in out.values():
+        r[1] = _complex_kind(names.get(r[1]))
+    return out
+
+
+class _Files(str):
+    """An attachment cell's text, the file names; `fk` is its row's key into the flat table, `info` its column's."""
+
+
+class _Complex:
+    """A complex column's flat table read once: `kind` ("attachment", "multi" or "version") and `rows`, {foreign key:
+    [entries]}: an attachment's (file name, its FileData definition when a picture, else None), another kind's text."""
+
+    def __init__(self, kind: str, rows: dict):
+        self.kind, self.rows = kind, rows
+
+    def cell(self, db: _Db, raw) -> str:
+        """The values (file names) of a row's cell joined with "; ", each charged `_CPLX` and its characters before it
+        is added; past JET_CELL_CHARS the join stops, cut with "…" and counted `text`."""
+        fk = struct.unpack("<i", raw)[0]
+        parts, size = [], -2
+        for e in self.rows.get(fk, ()):
+            s = e[0] if self.kind == "attachment" else e
+            db.charge(_CPLX + len(s))
+            if not s:
+                continue
+            parts.append(s)
+            size += len(s) + 2
+            if size > JET_CELL_CHARS:
+                break
+        text = db.cut("; ".join(parts), more=size > JET_CELL_CHARS)
+        if self.kind != "attachment":
+            return text
+        out = _Files(text)
+        out.fk, out.info = fk, self
+        return out
+
+    def pictures(self, db: _Db, fk: int, alt: str, hidden: bool) -> list:
+        """The pictures (jpg, png, gif) of a row's attachments as Images, alt "<alt>: <file name>": each file charged
+        `_CPLX` before it is looked at, each picture `_ROW_COST` before it is read (`_picture`)."""
+        out = []
+        for name, definition in self.rows.get(fk, ()):
+            db.charge(_CPLX)
+            if definition is None:
+                continue
+            db.charge(_ROW_COST)
+            data = _picture(db, definition)
+            if data:
+                out.append(Image(data, f"{alt}: {name}", hidden="hidden" if hidden else ""))
+        return out
+
+
+def _complex_info(db: _Db, objs: list, tdef: Tdef, col: Column):
+    """The `_Complex` of a complex column (`ComplexColumnSupport.create`): its MSysComplexColumns row (by the complex
+    id) must name this table and, when it names one, this column; its flat table is read once a document. None,
+    counted `record`, when it cannot be resolved or read."""
+    if db.cplx is None:
+        db.cplx = _complex_columns(db, objs)
+    row = db.cplx.get(col.complex_id)
+    if row is None or row[3] != tdef.page or row[1] is None or (row[0] and row[0].casefold() != col.name.casefold()):
+        db.ctx.skipped["record"] += 1
+        return None
+    info = db.cplx_info.get(col.complex_id)
+    if info is None:
+        try:
+            info = _flat(db, row[1], row[2])
+        except _BAD:
+            info = None
+        db.cplx_info[col.complex_id] = info or False
+    if not info:
+        db.ctx.skipped["record"] += 1
+        return None
+    return info
+
+
+def _flat(db: _Db, kind: str, page: int):
+    """A complex column's flat table (`ComplexColumnInfoImpl`): the foreign key column (ext 0x08), the autonumber key
+    (left out) and the type's columns. A kind the name did not give is taken from the shape: FileData and FileName
+    make an attachment, one value column a multi-value column, more a version history. Each row is read as any
+    table's (charged so); each entry kept takes its size of the flat room (`_Db.keep_flat`), past it the rest are
+    counted `record` once. None when the table has no foreign key (or an attachment table no FileData or FileName)."""
+    ft = _tdef(db, page)
+    cols = ft.columns
+    fk = next((i for i, c in enumerate(cols) if c.ext & _FOREIGN_KEY and c.type == LONG), None)
+    if fk is None:
+        return None
+    named = {c.name.casefold(): i for i, c in enumerate(cols)}
+    vals = {i for i, c in enumerate(cols) if i != fk and not c.flags & _AUTONUMBER}
+    if not kind:
+        kind = "attachment" if "filedata" in named and "filename" in named else "multi" if len(vals) == 1 else "version"
+    if kind == "attachment" and not ("filedata" in named and "filename" in named):
+        return None
+    iname, idata = named.get("filename"), named.get("filedata")
+    rows = {}
+    for _, cells in _rows(db, ft):
+        try:
+            key = _long(cols[fk], cells.get(fk))
+            if key is None:
+                continue
+            if kind == "attachment":
+                name = _CONTROL.sub(" ", _plain_text(db, cols[iname], cells.get(iname))).strip()
+                raw = cells.get(idata)
+                picture = name.rpartition(".")[2].casefold() in _PICTURES and "." in name and raw is not None
+                entry = (name, bytes(raw) if picture else None)
+                size = sys.getsizeof(name) + (len(entry[1]) if picture else 0)
+            else:
+                texts = [v for v in (value(db, cols[i], raw) for i, raw in cells.items() if i in vals)
+                         if isinstance(v, str) and v]
+                entry = ", ".join(texts)
+                size = sys.getsizeof(entry)
+        except _BAD:
+            db.ctx.skipped["record"] += 1
+            continue
+        # the entry and its list slot; a new key its list, int and dict slot
+        if not db.keep_flat(size + 8 + (0 if key in rows else 192)):
+            db.ctx.skipped["record"] += 1
+            break
+        rows.setdefault(key, []).append(entry)
+    return _Complex(kind, rows)
+
+
+def _picture(db: _Db, definition: bytes):
+    """An attachment's file bytes (`AttachmentColumnInfoImpl.decodeData`): a u32 type (0 raw, 1 deflated), the
+    content's length, the content (a header: its length, then the extension; the file). The bytes come from the
+    document's one `flate.Budget(IMAGE_BYTES)` (a raw file too), the deflated ones through `flate.inflate`, its output
+    no more than the meter has left (`_INFLATE` bytes a unit, charged after). None, counted `image`, past the budget or
+    when the wrapper cannot be read."""
+    budget = db.images
+    room = budget.total - budget.used
+    try:
+        if room <= 0:
+            raise ReadError("too_large", "attachment pictures past IMAGE_BYTES")
+        blob = db.long_bytes(definition, room + room // 1000 + 4096)  # a deflated file is a little longer
+        if blob is None:
+            raise ReadError("too_large", "attachment past IMAGE_BYTES")
+        kind, n = struct.unpack_from("<iI", blob, 0)
+        if kind == 1:
+            content = flate.inflate(blob[8:], budget, max(0, db.total - db.spent) * _INFLATE)
+            db.charge(len(content) // _INFLATE)
+        elif kind == 0:
+            content = blob[8:]
+            if len(content) > room:
+                raise ReadError("too_large", "attachment past IMAGE_BYTES")
+            budget.used += len(content)
+        else:
+            raise ValueError(f"attachment type {kind}")
+        head = _u32(content, 0)
+        if not 4 <= head <= n <= len(content):
+            raise ValueError("attachment header past its data")
+        return bytes(content[head:n])
+    except (ReadError, *_BAD):
+        db.ctx.skipped["image"] += 1
+        return None
 
 
 # -- rows
@@ -764,12 +1070,16 @@ def _rows(db: _Db, tdef: Tdef, kept=()):
     """Each live row of the table, in page order, as (key, {column index: raw cell}) (see `_cells`): key is None, or
     for an overflow row the (tdef page, page, row) its pointer names. When `kept` holds that key the row is not read
     again and its cells are None (the caller keeps what it made of it). Only data pages naming this TDEF are read, so
-    a map naming other tables' pages costs a page read each. Each page, slot and live row is charged first; a row that
-    cannot be read is counted `record`; a bad usage map raises ValueError for the caller."""
+    a map naming other tables' pages costs a page read each; a page of type 8 is skipped, counted `jet_page8`. Each
+    page, slot and live row is charged first; a row that cannot be read is counted `record`; a bad usage map raises
+    ValueError for the caller."""
     jet = db.jet
     for pg in jet.usage(tdef.owned):
         db.charge(_PAGE)
         page = jet.page(pg)
+        if page[0] == _PAGE8:
+            db.ctx.skipped["jet_page8"] += 1
+            continue
         if page[0] != _DATA_PAGE or _u32(page, 4) != tdef.page:
             continue
         n = db.rows_on(page)
@@ -828,7 +1138,7 @@ def _cells(db: _Db, tdef: Tdef, buf: bytes) -> dict:
             for i, c in named:
                 if i >= ncols:
                     break
-                if c.type == BOOL:
+                if c.type == BOOL and not c.ext & _CALCULATED:  # a calculated Yes/No is a wrapped value
                     out[i] = True
                 elif c.flags & 0x01:
                     a = head + c.fixed_off
@@ -897,9 +1207,11 @@ def value(db: _Db, col: Column, raw):
     """A cell as shown: Yes/No, integers, Currency, Single and Double, Date, extended date, Decimal, GUID, Text (cut at
     JET_CELL_CHARS, counted `text`), Memo, OLE (its length, counted `object`) and binary (its length). Of the Format
     property only Percent and Yes/No are applied, to numbers; rich text (TextFormat 1) is the text of its HTML; a
-    hyperlink Memo is a Link (a list of inlines) or "display (address)". Raw bytes that do not fit the type raise
-    ValueError (the caller counts `record`)."""
+    hyperlink Memo is a Link (a list of inlines) or "display (address)". A calculated column's value is its stored
+    one (`_calc_value`). Raw bytes that do not fit the type raise ValueError (the caller counts `record`)."""
     t = col.type
+    if col.ext & _CALCULATED:
+        return "" if raw is None else _calc_value(db, col, raw)
     if t == BOOL:
         return "Yes" if raw else "No"
     if raw is None:
@@ -926,6 +1238,68 @@ def value(db: _Db, col: Column, raw):
         db.ctx.skipped["object"] += 1
         return f"<OLE {_u32(raw, 0) & 0x3FFFFFFF} bytes>"
     return f"<binary {len(raw)} bytes>"
+
+
+def _unwrap(data) -> bytes:
+    """A calculated value's data (`CalculatedColumnUtil.unwrapCalculatedValue`): 16 bytes, a u32 length, the data (and
+    three bytes); shorter than 20 bytes, as it is."""
+    if len(data) < 20:
+        return bytes(data)
+    return bytes(data[20:20 + _u32(data, 16)])
+
+
+def _calc_value(db: _Db, col: Column, raw) -> str:
+    """A calculated column's stored value, of its result type: Yes/No is its first byte (none is "No"), text is in
+    the compressed form whatever the ext byte says, a Memo a long value read as `memo` reads one (at most
+    JET_LVAL_BYTES, a shorter read cut with "…"), Decimal its own form (`_calc_numeric`), the rest the type's bytes.
+    Empty data is ""."""
+    t, more = col.type, False
+    if t == MEMO:
+        if len(raw) < 12:
+            raise ValueError("long value definition shorter than 12 bytes")
+        head = _u32(raw, 0)
+        length, kind = head & 0x3FFFFFFF, head >> 30
+        want = min(length, JET_LVAL_BYTES)
+        if kind == 3:
+            raise ValueError("long value type 0xC0")
+        data = raw[12:12 + want] if kind == 2 else db._lval((int.from_bytes(raw[5:8], "little"), raw[4]), want,
+                                                             kind == 1)
+        data, more = _unwrap(data), length > want
+    else:
+        data = _unwrap(raw)
+    if t == BOOL:
+        return "Yes" if data and data[0] else "No"
+    if not data:
+        return ""
+    if t in (TEXT, MEMO):
+        return db.cut(db.decode(data, True), more, col.rich)
+    if t == NUMERIC:
+        s = _calc_numeric(data)
+        return _formatted(col.fmt, s) if col.fmt else s
+    plain = Column(col.name, t, col.num, scale=col.scale, fmt=col.fmt)
+    return value(db, plain, data[:FIXED_SIZE.get(t, len(data))])
+
+
+def _calc_numeric(data: bytes) -> str:
+    """A calculated Decimal (`CalcNumericColImpl.readCalcNumericValue`): an i16 length, a signed scale byte, a negate
+    byte and at most 16 bytes, the first four swapped when their count is not a multiple of 8, then each eight
+    reversed (`fixNumericByteOrder`); exact."""
+    total = struct.unpack_from("<h", data, 0)[0]
+    n = (total if total > 0 else len(data) - 2) - 2
+    n = min(int(n / 4) * 4, 16)
+    if n <= 0 or len(data) < 4 + n:
+        raise ValueError(f"calculated Decimal of {n} bytes")
+    scale = struct.unpack_from("<b", data, 2)[0]
+    b = bytearray(data[4:4 + n])
+    pos = 0
+    if n % 8:
+        b[0:4] = b[3::-1]
+        pos = 4
+    for k in range(pos, n, 8):
+        b[k:k + 8] = b[k:k + 8][::-1]
+    v = int.from_bytes(b, "big")
+    d = Decimal((1 if data[3] and v else 0, tuple(int(ch) for ch in str(v)), -scale))
+    return format(d, "f")
 
 
 def _number(t: int, raw, scale: int) -> str:
@@ -1101,13 +1475,37 @@ def _obj(db, cells, cell):
             else:  # past the room: the table is shown without its properties
                 db.ctx.skipped["record"] += 1
     if kind in (LINKED, LINKED_ODBC) and not flags & SYSTEM_FLAGS:
-        raw, ccol = cell(cells, "connect", (None, None))
-        if raw is not None:
-            obj.connect = value(db, ccol, raw) if ccol.type in (TEXT, MEMO) else ""
-        raw, fcol = cell(cells, "foreignname", (None, None))
-        if raw is not None and fcol.type in (TEXT, MEMO):
-            obj.foreign_name = value(db, fcol, raw)
+        connect, database, foreign = (_plain_text(db, *reversed(cell(cells, k, (None, None))))
+                                      for k in ("connect", "database", "foreignname"))
+        target, foreign = _linked_target(db, connect, database), db.name(foreign)
+        if db.keep(sys.getsizeof(target) + sys.getsizeof(foreign)):
+            obj.connect, obj.foreign_name = target, foreign
+        else:  # past the room: named without its target
+            db.ctx.skipped["record"] += 1
     return obj
+
+
+def _linked_target(db: _Db, connect: str, database: str) -> str:
+    """What a linked table's connect string names, on one line: its DATABASE= part, else the catalog's Database cell
+    (an Access link keeps its path there), else the string itself; PWD=, UID=, Password= and User ID= parts (any
+    case, a {braced} value whole) are never kept. Its characters and parts are charged before it is split."""
+    db.charge(len(connect) + _PART * connect.count(";"))
+    kept, target, braced = [], "", False
+    for part in connect.split(";"):
+        if braced:  # the rest of a secret's {braced} value
+            braced = "}" not in part
+            continue
+        key, eq, val = part.partition("=")
+        k = key.strip().casefold()
+        if eq and k in _SECRETS:
+            v = val.strip()
+            braced = v.startswith("{") and "}" not in v
+            continue
+        if eq and k == "database" and not target:
+            target = val.strip()
+        if part.strip():
+            kept.append(part)
+    return _CONTROL.sub(" ", target or database.strip() or ";".join(kept)).strip()
 
 
 # -- output
@@ -1126,13 +1524,18 @@ def _count(n: int, one: str, many: str) -> str:
     return f"{n:,} {one if n == 1 else many}"
 
 
-def _shown(db: _Db, cols: list, cells: dict, bools: list) -> list:
-    """A row's non-empty values as (column index, value); a Yes/No cell absent from the row is "No". A visited cell
-    that gives a value has its `_CELL` given back: the grid charges it from there."""
+def _shown(db: _Db, cols: list, cells: dict, bools: list, cplx=None) -> list:
+    """A row's non-empty values as (column index, value); a Yes/No cell absent from the row is "No"; a complex cell
+    is its column's `_Complex.cell` ("" when the column could not be resolved). A visited cell that gives a value has
+    its `_CELL` given back: the grid charges it from there."""
     out = []
     for i, raw in cells.items():
         try:
-            v = value(db, cols[i], raw)
+            if cplx and i in cplx:
+                info = cplx[i]
+                v = info.cell(db, raw) if info else ""
+            else:
+                v = value(db, cols[i], raw)
         except _BAD:
             db.ctx.skipped["record"] += 1
             continue
@@ -1145,21 +1548,27 @@ def _shown(db: _Db, cols: list, cells: dict, bools: list) -> list:
     return out
 
 
-def _schema(db: _Db, tdef: Tdef, name: str, rels: dict) -> list:
-    """The "Columns:" line as inlines: each column's name, type, the targets its relationships name (`_REF` each,
-    charged first), PK, autonumber, required and rich text. A hidden column is a Hidden inline holding its separator
-    (the one before it, or after it when no shown column comes first), so the shown line reads right either way."""
+def _schema(db: _Db, tdef: Tdef, name: str, rels: dict, cplx=None) -> list:
+    """The "Columns:" line as inlines: each column's name, type ("Attachment" for an attachment column), the targets
+    its relationships name (`_REF` each, charged first), a calculated column's "= expression" (on one line, cut at
+    JET_CELL_CHARS, counted `text`; its characters charged first), PK, autonumber, required and rich text. A hidden
+    column is a Hidden inline holding its separator (the one before it, or after it when no shown column comes
+    first), so the shown line reads right either way."""
     pk = set(tdef.pk)
     table = name.lower()
     cols = tdef.columns
     out, text, shown = [], ["Columns: "], False
     for k, c in enumerate(cols):
-        kind = TYPE_NAMES.get(c.type, f"type {c.type}")
+        info = cplx.get(k) if cplx else None
+        kind = "Attachment" if info and info.kind == "attachment" else TYPE_NAMES.get(c.type, f"type {c.type}")
         targets = rels.get((table, c.name.lower()))
         if targets:
             db.charge(_REF * len(targets))
             kind += "".join([f" → {t}" for t in targets])
         bits = [kind]
+        if c.ext & _CALCULATED and c.expr:
+            db.charge(len(c.expr))
+            bits.append("= " + db.cut(_CONTROL.sub(" ", c.expr).strip()))
         if c.num in pk:
             bits.append("PK")
         if c.flags & _AUTONUMBER:
@@ -1260,14 +1669,16 @@ class _Order:
         return True
 
 
-def _table(db: _Db, obj: Obj, budget, rels: dict):
-    """The table's Section; None when the meter runs out on its TDEF, its properties or its schema line (counted
-    `db_table`, as a table not read). A table with a primary key shows its rows in key order when they all fit the
-    grid and the meter affords the sort; else in page order."""
+def _table(db: _Db, obj: Obj, budget, rels: dict, objs=()):
+    """The table's Section; None when the meter runs out on its TDEF, its properties, its complex columns or its schema
+    line (counted `db_table`, as a table not read). A table with a primary key shows its rows in key order when they
+    all fit the grid and the meter affords the sort; else in page order. The pictures of the rows shown follow the
+    grid, in their order, alt "<table> <key>: <file name>" (the key the row's primary key values, or its row number)."""
     try:
         tdef = _tdef(db, obj.id & 0xFFFFFF)
         _apply_props(db, tdef, db.props_of(obj))
-        line = _schema(db, tdef, obj.name, rels)
+        cplx = {i: _complex_info(db, objs, tdef, c) for i, c in enumerate(tdef.columns) if c.type == COMPLEX}
+        line = _schema(db, tdef, obj.name, rels, cplx)
     except _Spent:
         db.ctx.skipped["db_table"] += 1
         return None
@@ -1280,18 +1691,34 @@ def _table(db: _Db, obj: Obj, budget, rels: dict):
     for i, c in enumerate(cols):
         if c.hidden:
             grid.hide_cols(i, i)
-    bools = [i for i, c in enumerate(cols) if c.type == BOOL]  # "No" past a row's count: each one a grid cell
+    # "No" past a row's count: each one a grid cell (a calculated Yes/No is a stored value)
+    bools = [i for i, c in enumerate(cols) if c.type == BOOL and not c.ext & _CALCULATED]
     keys = _key_columns(tdef)
     order = _Order(budget) if keys else None
     # an overflow target's key -> (its non-empty values, the counts making them added, its sort key); room allowing
     done = {}
     r = 1
+    pics, pics_cut = [], False
 
     def put(shown):
-        nonlocal r
+        nonlocal r, pics_cut
+        files = []
         for i, v in shown:
-            if not grid.put(r, i, v):
+            if isinstance(v, _Files):
+                if not grid.put(r, i, str(v)):
+                    break
+                files.append((i, v))
+            elif not grid.put(r, i, v):
                 break
+        if files and not pics_cut:
+            got = dict(shown)
+            key = ", ".join(v for v in (got.get(k) for k in keys) if isinstance(v, str) and v) or str(r)
+            try:
+                for i, v in files:
+                    pics.extend(v.info.pictures(db, v.fk, f"{obj.name} {key}", cols[i].hidden))
+            except _Spent:  # the rest of the table's pictures, counted once
+                pics_cut = True
+                db.ctx.skipped["image"] += 1
         r += 1
 
     def flush():
@@ -1311,7 +1738,7 @@ def _table(db: _Db, obj: Obj, budget, rels: dict):
                 db.ctx.skipped.update(made)
             else:
                 before = collections.Counter(db.ctx.skipped) if key is not None else None
-                shown = _shown(db, cols, cells, bools)
+                shown = _shown(db, cols, cells, bools, cplx)
                 sk = _sort_key(db, cols, keys, cells, shown) if order is not None else None
                 if key is not None and shown and db.keep(sum(64 + sys.getsizeof(v) for _, v in shown)):
                     done[key] = shown, db.ctx.skipped - before, sk  # nothing shown: read again
@@ -1330,7 +1757,7 @@ def _table(db: _Db, obj: Obj, budget, rels: dict):
         if db.meter.afford(_SORT * n * n.bit_length()):
             order.rows.sort(key=itemgetter(0))  # stable: equal keys keep their page order
         flush()
-    blocks = [Para(line)] + grid.blocks()
+    blocks = [Para(line)] + grid.blocks() + pics
     if obj.flags & HIDDEN_FLAG:
         return Section("table", title, blocks=_hide(blocks), hidden="hidden")
     return Section("table", title, blocks=blocks)
@@ -1348,6 +1775,12 @@ def parse_bytes(data, ctx) -> Doc:
     queries = [o for o in objs if o.type == QUERY]
     linked = [o for o in objs if o.type in (LINKED, LINKED_ODBC)]
     others = [o for o in objs if o.type in (FORM, REPORT, MACRO, MODULE)]
+    parts = [_count(len({o.id & 0xFFFFFF for o in tables}), "table", "tables")]
+    if queries:
+        parts.append(_count(len(queries), "query", "queries"))
+    if linked:
+        parts.append(_count(len(linked), "linked table", "linked tables"))
+    head = _summary(db, catalog, f"{VERSION_NAMES[jet.version]}: {', '.join(parts)}.")
     budget = sheet_grid.Budget(limits.SHEET_CELLS, limits.SHEET_CHARS)
     out, seen = [], set()
     for o in tables:
@@ -1361,18 +1794,46 @@ def parse_bytes(data, ctx) -> Doc:
             continue
         sec = None
         with ctx.guard("db_table"):
-            sec = _table(db, o, budget, rels)
+            sec = _table(db, o, budget, rels, catalog)
         if sec is not None:
             out.append(sec)
     if tables and not out and not (queries or linked or others) and not db.meter.over:
         raise ReadError("damaged", "no table could be read")
-    parts = [_count(len(seen), "table", "tables")]
-    if queries:
-        parts.append(_count(len(queries), "query", "queries"))
+    return Doc(blocks=[Para(head)] + out)
+
+
+def _summary(db: _Db, catalog: list, line: str) -> list:
+    """The summary paragraph's inlines: `line`; then, each on its own line, "Forms: … Reports: … Macros: … Modules: …
+    (names only)." (each part only when it has names; a module counts `vba`) and "Linked tables: <name> → <target>
+    (<table>)" joined with "; " (counted `linked_data`). Each name is charged `_NAME` before it is written; the meter
+    running out (the catalog cut by it) ends the names there, counted `record` once."""
+    out = [Text(line)]
+    groups = {FORM: [], REPORT: [], MACRO: [], MODULE: []}
+    linked = []
+    try:
+        for o in catalog:
+            if o.flags & SYSTEM_FLAGS:
+                continue
+            if o.type in groups:
+                db.charge(_NAME)
+                groups[o.type].append(o.name)
+            elif o.type in (LINKED, LINKED_ODBC):
+                db.charge(_NAME)
+                s = f"{o.name} → {o.connect}" if o.connect else o.name
+                linked.append(f"{s} ({o.foreign_name})" if o.foreign_name else s)
+    except _Spent:
+        db.ctx.skipped["record"] += 1
+    parts = [f"{label}: {', '.join(groups[kind])}" for label, kind in (("Forms", FORM), ("Reports", REPORT),
+                                                                       ("Macros", MACRO), ("Modules", MODULE))
+             if groups[kind]]
+    if parts:
+        out += [Break(), Text(". ".join(parts) + " (names only).")]
+    if groups[MODULE]:
+        db.ctx.skipped["vba"] += 1
     if linked:
-        parts.append(_count(len(linked), "linked table", "linked tables"))
-    line = f"{VERSION_NAMES[jet.version]}: {', '.join(parts)}."
-    return Doc(blocks=[Para([Text(line)])] + out)
+        out += [Break(), Text("Linked tables: " + "; ".join(linked))]
+        db.ctx.skipped["linked_data"] += 1
+    return out
 
 
 def parse(path, ctx) -> Doc:
