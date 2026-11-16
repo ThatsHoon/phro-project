@@ -21,7 +21,10 @@ db_key. A non-zero u32 at 0x3E in a Jet3 or Jet4 file means every page but 0 is 
 bytes, little-endian), Jackcess's Jet codec (the encoding holds no user secret). In ACE the same field means Office
 encryption, which is not decoded here: `page` returns those pages as stored and `jet.py` refuses the file. A decoded
 page is kept (at most `limits.JET_PAGE_CACHE`, the least recently read dropped first), so the many reads of one page
-in a pass (an overflow target, an LVAL row, a usage map) decode it once.
+in a pass (an overflow target, an LVAL row, a usage map) decode it once. The pages decoded in all are at most
+`max(limits.DECRYPT_BYTES, 2 x the file)` bytes, so a pattern the cache cannot hold (a cycle over more pages than
+it keeps) stops at that: past it `page` raises `too_large` ("part: RC4 pages"), as `crypto.rc4` does past
+DECRYPT_BYTES for one stream.
 
 Bounds. `page(n)` raises ValueError outside `0 <= n < pages`. A usage map drops every page id outside
 `1 <= id < pages`, reads each type 5 page once and stops at the pointer whose range starts past the file, so its
@@ -89,6 +92,7 @@ class Jet:
         self.codepage = _codec(struct.unpack_from("<H", self._page0, 0x3C)[0])
         self.db_key = struct.unpack_from("<I", self._page0, 0x3E)[0]
         self._cache = OrderedDict()  # page number -> decoded page (db_key only)
+        self._rc4_left = max(limits.DECRYPT_BYTES, 2 * len(data))  # page bytes RC4 may still decode
 
     def page(self, n: int) -> bytes:
         """Page `n`, decoded (page 0 with its header unmasked; with a Jet3/Jet4 db_key, the RC4 of the others)."""
@@ -103,6 +107,9 @@ class Jet:
             self._cache.move_to_end(n)
             return out
         raw = self._data[n * self.page_size:(n + 1) * self.page_size]
+        if len(raw) > self._rc4_left:
+            raise ReadError("too_large", "part: RC4 pages")
+        self._rc4_left -= len(raw)
         out = self._cache[n] = crypto.rc4(((self.db_key ^ n) & 0xFFFFFFFF).to_bytes(4, "little"), raw)
         while len(self._cache) > max(limits.JET_PAGE_CACHE, 1):
             self._cache.popitem(last=False)

@@ -17,26 +17,33 @@ a db_key or an encryption structure is `encrypted`, "ACE encryption". A Jet3 or 
 
 Catalog. MSysObjects (the TDEF at page 2) gives `Obj` rows, at most `JET_CATALOG` (the rest counted `record`).
 Objects flagged 0x80000000 or 0x2 are system objects, never shown or counted; 0x08 marks a hidden table. Text cells,
-the catalog's included, go through `Jet.text` with the column's compressed-unicode flag (ext 0x01).
+the catalog's included, go through `Jet.text` with the column's compressed-unicode flag (ext 0x01); a column name
+is read once with its TDEF.
 
 Rows. Each data page the table's usage map owns is read: a row flagged 0x8000 is deleted (skipped, not counted), one
-flagged 0x4000 is a pointer followed once, to a row that must not be a pointer again. Fixed columns are read at their
+flagged 0x4000 is a pointer followed once, to a row that must not be a pointer again; the row a pointer names is read
+once and its cells kept, so many pointers naming one row cost a lookup each. Fixed columns are read at their
 `offset_F`, variable ones through their `offset_V` slot (Jet4's two-byte offset table, Jet3's one-byte offsets and
 jump table), so rows written before a column was deleted read right. A Yes/No value is its null-mask bit. Every
 offset and length is clipped to the row; a row or cell that cannot be read is counted `record`. A row walks only the
-columns its own column count holds, so a short row costs its bytes, not the table's width.
+columns its own column count holds (at most eight a byte of its null mask), not the table's width. Var slices are
+clipped but may overlap, so the text they hold is charged as it is decoded (below).
 
-Long values. A MEMO is inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00). Each LVAL row read is charged its
-bytes and `_ROW_COST` against one total for the whole file, `limits.JET_LVAL_TOTAL` or twice the file's bytes and
-1 MiB if less (Access never shares a long value between cells, so a real file reads about its own size; a file
-naming one chain from many cells reads at most twice itself). Past it a cell ends with "…" and is counted `text`. A
-value read whole is decoded once and kept by its definition, so a repeat costs its charge but no read; definitions
-that differ but share a chain's tail are each charged, so the total bounds them too.
+Decode total. Every text decode of a cell is charged against one total for the whole file, `limits.JET_DECODE_TOTAL`
+or twice the file's bytes and 1 MiB if less: a Text or inline MEMO cell its bytes and `_CELL_COST` (the offset slot
+it takes in the file), each LVAL row read its bytes and `_ROW_COST`. A real file's cells and long values are disjoint
+bytes, so it reads about its own size; overlapping slices, or one chain named from many cells, read at most twice
+the file. Past the total a cell is "…", counted `text` (a catalog row, `record`).
+
+Long values. A MEMO is inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00). An LVAL value read whole is
+decoded once and kept by its definition, so a repeat costs its charge but no read; definitions that differ but share
+a chain's tail are each charged, so the total bounds them too.
 
 Caps. `JET_COLS` columns per TDEF (past it a user table counts `db_table`, the catalog is `damaged`), `JET_NAME`
 characters per name and `JET_CELL_CHARS` per cell (cut, counted `text`), `JET_LVAL_BYTES` read per long value,
 that total per file. Every cap is read at call time, so a test can lower it.
 """
+import collections
 import copy
 import datetime
 import math
@@ -79,6 +86,7 @@ _DATA_PAGE, _TDEF_PAGE = 0x01, 0x02
 _DELETED, _OVERFLOW, _OFFSET = 0x8000, 0x4000, 0x1FFF
 _UNUSED = 0xFFFF
 _ROW_COST = 256  # charged on top of each LVAL row's bytes, so a chain of tiny rows costs as its steps
+_CELL_COST = 2  # charged on top of a text cell's bytes: the offset slot each var cell takes, so empty ones cost too
 _PK = 1  # IndexImpl.PRIMARY_KEY_INDEX_TYPE
 _ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md; every real file read has 0)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
@@ -182,9 +190,10 @@ class _Db:
         self.j3 = jet.version == 0
         self.f = _Fmt(self.j3)
         self.tdef_pages = set()  # continuation pages already part of a TDEF: a chain reaching one ends there
-        self.lval_spent = 0  # charged against lval_total
-        self.lval_total = min(limits.JET_LVAL_TOTAL, 2 * jet.pages * jet.page_size + 2 ** 20)
+        self.spent = 0  # text decoded, charged against total
+        self.total = min(limits.JET_DECODE_TOTAL, 2 * jet.pages * jet.page_size + 2 ** 20)
         self.lval_cache = {}  # (definition, compressed) -> (text, bytes read, charge) of a long value read whole
+        self.targets = {}  # (tdef page, page, row) an overflow row names -> its cells, or None when unreadable
 
     # -- pages and rows
 
@@ -212,14 +221,17 @@ class _Db:
         start, end, _ = self.span(page, r)
         return page[start:end]
 
-    def row_data(self, page: bytes, r: int) -> bytes:
-        """A live row's bytes; an overflow row's pointer is followed once."""
+    def row_data(self, page: bytes, r: int):
+        """(bytes, None) for a live row; (None, (page, row)) for an overflow row, the row its pointer names."""
         start, end, flags = self.span(page, r)
         if not flags & _OVERFLOW:
-            return page[start:end]
+            return page[start:end], None
         if end - start < 4:
             raise ValueError("overflow row shorter than its pointer")
-        tr, tp = page[start], int.from_bytes(page[start + 1:start + 4], "little")
+        return None, (int.from_bytes(page[start + 1:start + 4], "little"), page[start])
+
+    def target(self, tp: int, tr: int) -> bytes:
+        """The bytes of the row an overflow pointer names, which must not be a pointer again."""
         target = self.jet.page(tp)
         if target[0] != _DATA_PAGE or tr >= self.rows_on(target):
             raise ValueError(f"overflow row points at no row ({tp}, {tr})")
@@ -257,13 +269,21 @@ class _Db:
             return s[:JET_CELL_CHARS] + "…"
         return s
 
+    def decode(self, raw: bytes, compressed: bool):
+        """A cell's text bytes decoded, charged their length and _CELL_COST against the file's total; None past it."""
+        charge = len(raw) + _CELL_COST
+        if self.spent + charge > self.total:
+            return None
+        self.spent += charge
+        return self.jet.text(raw, compressed)
+
     # -- long values
 
     def memo(self, raw: bytes, compressed: bool) -> str:
         """A MEMO cell's text: inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00), read up to JET_LVAL_BYTES
-        and no further than JET_CELL_CHARS characters can take, LVAL rows charged against the file's total. A
-        value shorter than its length is counted `record`; a cut (a cap or the total) ends with "…", counted
-        `text`."""
+        and no further than JET_CELL_CHARS characters can take, each charged against the file's total. A value
+        shorter than its length is counted `record` (and only that, however long its text); a cut (a cap or the
+        total) ends with "…", counted `text`."""
         if len(raw) < 12:
             raise ValueError("long value definition shorter than 12 bytes")
         head = _u32(raw, 0)
@@ -272,29 +292,30 @@ class _Db:
         want = min(length, JET_LVAL_BYTES, 4 * JET_CELL_CHARS + 4)
         if kind == 2:
             data = raw[12:12 + want]
-            return self._whole(self.jet.text(data, compressed), len(data), want, length)
+            s = self.decode(data, compressed)
+            return self.cut("", True) if s is None else self._whole(s, len(data), want, length)
         if kind == 3:
             raise ValueError("long value type 0xC0")
         key = (bytes(raw[:12]), compressed)
         hit = self.lval_cache.get(key)
         if hit is not None:
             s, n, charge = hit
-            if self.lval_spent + charge > self.lval_total:
+            if self.spent + charge > self.total:
                 return self.cut("", True)
-            self.lval_spent += charge
+            self.spent += charge
             return self._whole(s, n, want, length)
-        before = self.lval_spent
+        before = self.spent
         data, stopped = self._lval((int.from_bytes(raw[5:8], "little"), raw[4]), want, kind == 1)
         s = self.jet.text(data, compressed)
         if stopped:
             return self.cut(s, True)
-        self.lval_cache[key] = (s, len(data), self.lval_spent - before)
+        self.lval_cache[key] = (s, len(data), self.spent - before)
         return self._whole(s, len(data), want, length)
 
     def _whole(self, s: str, n: int, want: int, length: int) -> str:
-        if n < want:
+        if n < want:  # counted once, `record`: a cut of its text is not counted again
             self.ctx.skipped["record"] += 1
-            return self.cut(s)
+            return s if len(s) <= JET_CELL_CHARS else s[:JET_CELL_CHARS] + "…"
         return self.cut(s, length > want)
 
     def _lval(self, start, want: int, single: bool):
@@ -310,10 +331,10 @@ class _Db:
             return (nxt, b[0]) if nxt else None
 
         for item in [start] if single else self.jet.chain(start, step):
-            if self.lval_spent >= self.lval_total:
+            if self.spent >= self.total:
                 return bytes(out), True
             b = self.row_at(item[0], item[1])
-            self.lval_spent += len(b) + _ROW_COST
+            self.spent += len(b) + _ROW_COST
             if single:
                 return b[:want], False
             if len(b) <= 4:
@@ -405,9 +426,12 @@ def _tdef(db: _Db, page: int) -> Tdef:
 # -- rows
 
 def _rows(db: _Db, tdef: Tdef):
-    """Each live row of the table, in page order, as {column index: raw cell} (see `_cells`). Only data pages naming
+    """Each live row of the table, in page order, as (key, {column index: raw cell}) (see `_cells`): key is None, or
+    for an overflow row the (tdef page, page, row) its pointer names, so the caller can keep what it made of it. Only
+    data pages naming
     this TDEF are read, so a map naming other tables' pages costs nothing. A row that cannot be read is counted
-    `record`; a bad usage map raises ValueError for the caller."""
+    `record`; a bad usage map raises ValueError for the caller. The row an overflow pointer names is read once (its
+    cells, or that it cannot be read, kept), however many pointers name it."""
     jet = db.jet
     for pg in jet.usage(tdef.owned):
         page = jet.page(pg)
@@ -417,11 +441,21 @@ def _rows(db: _Db, tdef: Tdef):
             try:
                 if _u16(page, db.f.row_start + 2 * r) & _DELETED:
                     continue
-                cells = _cells(db, tdef, db.row_data(page, r))
+                buf, ptr = db.row_data(page, r)
+                if ptr is None:
+                    cells = _cells(db, tdef, buf)
+                else:
+                    key = (tdef.page,) + ptr
+                    if key not in db.targets:
+                        db.targets[key] = None
+                        db.targets[key] = _cells(db, tdef, db.target(*ptr))
+                    cells = db.targets[key]
+                    if cells is None:
+                        raise ValueError("overflow row names a row that cannot be read")
             except _BAD:
                 db.ctx.skipped["record"] += 1
                 continue
-            yield cells
+            yield (None if ptr is None else key), cells
 
 
 def _cells(db: _Db, tdef: Tdef, buf: bytes) -> dict:
@@ -536,7 +570,8 @@ def value(db: _Db, col: Column, raw):
     if t == GUID:
         return "{" + str(uuid.UUID(bytes_le=_need(raw, 16))).upper() + "}"
     if t == TEXT:
-        return db.cut(db.jet.text(raw, bool(col.ext & 0x01)))
+        s = db.decode(raw, bool(col.ext & 0x01))
+        return db.cut("", True) if s is None else db.cut(s)
     if t == MEMO:
         return db.memo(raw, bool(col.ext & 0x01))
     if t == OLE:
@@ -621,7 +656,7 @@ def _catalog(db: _Db) -> list:
 
     out, read = [], 0
     try:
-        for cells in _rows(db, tdef):
+        for _, cells in _rows(db, tdef):
             if read >= JET_CATALOG:
                 db.ctx.skipped["record"] += 1
                 break
@@ -645,7 +680,10 @@ def _obj(db, cells, cell):
     kind = struct.unpack("<h", kind)[0]
     flags = struct.unpack("<I", flags)[0]
     parent = cell(cells, "parentid", (None, None))[0]
-    obj = Obj(struct.unpack("<i", oid)[0], db.name(db.jet.text(name, bool(ncol.ext & 0x01))), kind, flags,
+    text = db.decode(name, bool(ncol.ext & 0x01))
+    if text is None:
+        raise ValueError("the decode total is spent")
+    obj = Obj(struct.unpack("<i", oid)[0], db.name(text), kind, flags,
               struct.unpack("<i", parent)[0] if parent is not None else None)
     if kind in (LINKED, LINKED_ODBC) and not flags & SYSTEM_FLAGS:
         raw, ccol = cell(cells, "connect", (None, None))
@@ -673,6 +711,24 @@ def _count(n: int, one: str, many: str) -> str:
     return f"{n:,} {one if n == 1 else many}"
 
 
+def _shown(db: _Db, cols: list, cells: dict, bools: list) -> list:
+    """A row's non-empty values as (column index, text); Yes/No past the row's count is "No"."""
+    if bools:
+        cells = dict(cells)  # a kept overflow target's cells are not changed
+        for i in bools:
+            cells.setdefault(i, False)
+    out = []
+    for i, raw in cells.items():
+        try:
+            v = value(db, cols[i], raw)
+        except _BAD:
+            db.ctx.skipped["record"] += 1
+            continue
+        if v:
+            out.append((i, v))
+    return out
+
+
 def _table(db: _Db, obj: Obj, budget) -> Section:
     tdef = _tdef(db, obj.id & 0xFFFFFF)
     title = f"{obj.name} ({_count(tdef.row_count, 'row', 'rows')})"
@@ -683,18 +739,22 @@ def _table(db: _Db, obj: Obj, budget) -> Section:
             break
     cols = tdef.columns
     bools = [i for i, c in enumerate(cols) if c.type == BOOL]  # "No" past a row's count: each one a grid cell
+    done = {}  # an overflow target's key -> (its non-empty values, the counts making them added)
     r = 1
-    for cells in _rows(db, tdef):
+    for key, cells in _rows(db, tdef):
         if grid.cut:
             break
-        for i in bools:
-            cells.setdefault(i, False)
-        for i, raw in cells.items():
-            try:
-                v = value(db, cols[i], raw)
-            except _BAD:
-                db.ctx.skipped["record"] += 1
-                continue
+        kept = done.get(key) if key is not None else None
+        if kept is not None:  # a row many pointers name: decoded once, its counts repeated for each
+            shown, made = kept
+            db.ctx.skipped.update(made)
+        elif key is not None:
+            before = collections.Counter(db.ctx.skipped)
+            shown = _shown(db, cols, cells, bools)
+            done[key] = shown, db.ctx.skipped - before
+        else:
+            shown = _shown(db, cols, cells, bools)
+        for i, v in shown:
             if not grid.put(r, i, v):
                 break
         r += 1
