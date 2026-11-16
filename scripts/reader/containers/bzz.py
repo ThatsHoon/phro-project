@@ -1,15 +1,18 @@
 """DjVu's BZZ codec (decoding): the ZP adaptive binary arithmetic decoder, the MTF stage and the inverse BWT.
 
 Ported from djvu-rs (MIT), the crates `djvu-bzz` 0.45.0 (`src/decode.rs`, `src/lib.rs`) and `djvu-zp` 0.45.0
-(`src/lib.rs`, `src/tables.rs`), commit a329e2ad3bd9f710fcfeb758939f58626a6eb69a. The ZP table is checked against
-the DjVu 3 specification's appendix table (Appendix 3, Table 9), as printed in DjVuLibre's `default_ztable` (format
-knowledge only; the test holds spot values).
+(`src/lib.rs`, `src/tables.rs`), commit a329e2ad3bd9f710fcfeb758939f58626a6eb69a. The ZP table is djvu-zp's
+`tables.rs`, rows 0-250 (its rows 251-255 are padding that no state reaches, left out); spot values were compared
+with DjVuLibre's `default_ztable` as format knowledge.
 
 A stream is a run of blocks, each a 24-bit size (0 ends the stream), two FSHIFT bits, then `size` MTF positions
 read through 262 ZP contexts that are never reset between blocks; position 256 is the BWT end-of-block marker. Added
 to djvu-bzz: the 16-byte read past the end is checked at every refill (djvu-bzz looks every 4,096 symbols), a block
 is checked against the caller's `limit` and the ZIP_RATIO rule before it is decoded, and MARKERPOS is range checked.
 """
+from array import array
+from collections import Counter
+
 from .. import limits
 from ..limits import ReadError
 
@@ -18,6 +21,7 @@ BZZ_CHUNK = 4 * 2**20   # output of one chunk, which the caller passes as `limit
 BZZ_TOTAL = 64 * 2**20  # output of one document, whose remainder the caller passes as `limit` when it is smaller
 TAIL = 16               # bytes the coder may read past the input's end: its look-ahead on a valid stream
 CONTEXTS = 262          # adaptive contexts of the MTF position tree (indexes 0-259 are used)
+_INDEX = "I" if array("I").itemsize >= 4 else "L"  # an unsigned type that holds a row index below 2^24
 
 # The ZP adaptation table: per state the probability p, the MPS adaptation threshold m, and the next state after an
 # MPS (up) or an LPS (dn). States 0-250; every up and dn stays within them.
@@ -290,27 +294,36 @@ def _block(zp: _Zp, ctx: bytearray, size: int, fshift: int) -> tuple[bytearray, 
     return out, marker
 
 
-def _unbwt(bwt: bytearray, marker: int) -> bytes:
+def _unbwt(bwt: bytearray, marker: int) -> bytearray:
     """The inverse BWT of one block (decode.rs `inverse_bwt`), the marker sorting before every byte. djvu-bzz walks
     the LF mapping backwards from row 0; this walks its inverse forwards from the marker's row: `order` lists the
-    rows by first symbol (the marker, then each byte's rows in order), so row j continues at row order[j]."""
+    rows by first symbol (the marker, then each byte's rows in order), so row j continues at row order[j]. `order`
+    is a typed array (4 bytes a row), so a BZZ_BLOCK block needs about 16 MiB for it."""
     total = len(bwt)
     if total <= 1:
-        return b""
-    rows = [[] for _ in range(256)]
-    add = [r.append for r in rows]
-    for i, b in enumerate(bwt):
-        add[b](i)
-    rows[0].remove(marker)
-    order = [marker]
-    for r in rows:
-        order += r
+        return bytearray()
+    counts = Counter(bwt)
+    counts[0] -= 1  # the marker's slot holds a 0 that is not a byte of the block
+    nxt = [0] * 256
+    row = 1
+    for b in range(256):
+        nxt[b] = row
+        row += counts[b]
+    order = array(_INDEX, [0]) * total
+    order[0] = marker
+    view = memoryview(bwt)
+    for start, stop in ((0, marker), (marker + 1, total)):
+        for i, b in enumerate(view[start:stop], start):
+            r = nxt[b]
+            order[r] = i
+            nxt[b] = r + 1
+    view.release()
     out = bytearray(total - 1)
     j = marker
     for t in range(total - 1):
         j = order[j]
         out[t] = bwt[j]
-    return bytes(out)
+    return out
 
 
 def decode(data: bytes, limit: int) -> bytes:

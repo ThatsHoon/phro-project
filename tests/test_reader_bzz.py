@@ -4,6 +4,7 @@ Run: python -I -X utf8 tests/test_reader_bzz.py
 """
 import random
 import sys
+import tracemalloc
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -52,9 +53,10 @@ def test_round_trips():
     for fshift in (0, 1, 2):
         assert bzz.decode(bzz_encode(text, fshift=fshift), bzz.BZZ_CHUNK) == text
     # 4 MiB of zeros codes to far under 1/200 of its size, so the ZIP_RATIO rule (chunks over 1 MiB of output) stops
-    # it at the default ratio; the round trip raises the ratio for this one call (pre-flight ruling F1)
+    # it at the default ratio; the round trip raises the ratio for this one call (pre-flight ruling F1). The first
+    # block is the largest allowed, BZZ_BLOCK symbols (its bytes and the marker); a 1-byte block follows
     zeros = bytes(4 * MIB)
-    packed = bzz_encode(zeros)
+    packed = bzz_encode(zeros, blocksize=bzz.BZZ_BLOCK - 1)
     raises(lambda: bzz.decode(packed, bzz.BZZ_CHUNK), bzz.Limit)
     saved = limits.ZIP_RATIO
     limits.ZIP_RATIO = 10**9
@@ -121,16 +123,32 @@ def test_oversize_block_damaged():
 def test_limit_and_ratio():
     raises(lambda: bzz.decode(bzz_encode(random.Random(3).randbytes(1000)), 100), bzz.Limit)
     zeros = bytes(2 * MIB)
-    packed = bzz_encode(zeros)
+    packed = bzz_encode(zeros, blocksize=len(zeros))
     assert len(packed) * limits.ZIP_RATIO < len(zeros)
     raises(lambda: bzz.decode(packed, bzz.BZZ_CHUNK), bzz.Limit)
     half = bytes(512 * 1024)
     assert bzz.decode(bzz_encode(half), bzz.BZZ_CHUNK) == half
 
 
+def test_unbwt_memory():
+    # the inverse BWT keeps its row links in a typed array: a block peaks under 6 bytes a row (4 for the links, 1 for
+    # the output), so a BZZ_BLOCK block stays near 24 MiB; the list-based walk this replaced peaked near 46 bytes a
+    # row. The block is 256 KiB because tracemalloc slows the walk several times over
+    size = 256 * 1024
+    bwt = bytearray(size)  # a block of zeros: its BWT is the bytes, then the marker
+    tracemalloc.start()
+    try:
+        out = bzz._unbwt(bwt, size - 1)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert out == bytes(size - 1)
+    assert peak < 6 * size, peak
+
+
 def test_zp_table_spot_values():
-    # (p, m, up, dn) rows of the ZP adaptation table, DjVu 3 spec Appendix 3 (Table 9); the values here were read from
-    # DjVuLibre's libdjvu/ZPCodec.cpp `default_ztable` (the reference coder that table comes from) on 2026-11-16
+    # (p, m, up, dn) rows of the ZP adaptation table (bzz.py holds djvu-zp's tables.rs); the values here were read from
+    # DjVuLibre's libdjvu/ZPCodec.cpp `default_ztable` on 2026-11-16, as format knowledge
     t = bzz.ZP_TABLE
     assert t[0] == (0x8000, 0x0000, 84, 145)
     assert t[3] == (0x6BBD, 0x10A5, 5, 1)

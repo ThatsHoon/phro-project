@@ -3,7 +3,8 @@
 The encoder is ported from djvu-rs (MIT), the crates `djvu-bzz` 0.45.0 (`src/encode.rs`) and `djvu-zp` 0.45.0
 (`src/encoder.rs`), commit a329e2ad3bd9f710fcfeb758939f58626a6eb69a; `scripts/reader/containers/bzz.py` decodes what
 it writes. The forward BWT sorts by prefix doubling as encode.rs does, with Python's sort for the radix passes and a
-closed form for a block of one repeated byte. Knobs that write damaged streams: `eob`, `markerpos`, `size`.
+closed form for a block of one repeated byte; a run of MTF position 0 in context 0 is one ZP run (encoder.rs
+`encode_run`), which writes the same bytes. Knobs that write damaged streams: `eob`, `markerpos`, `size`.
 """
 import struct
 import sys
@@ -32,22 +33,45 @@ class _ZpEncoder:
         st = ctx[i]
         z = self.a + PROB[st]
         if bit != st & 1:
-            d = 0x6000 + ((z + self.a) >> 2)
-            z = min(z, d)
-            ctx[i] = LPS_NEXT[st]
-            z = 0x10000 - z
-            self.subend += z
-            self.a += z
-            self._renormalize()
+            self._lps(ctx, i, z)
         elif z >= 0x8000:
-            d = 0x6000 + ((z + self.a) >> 2)
-            z = min(z, d)
-            if (self.a & 0xFFFF) >= THRESHOLD[st]:
-                ctx[i] = MPS_NEXT[st]
-            self.a = z
-            self._shift(1)
+            self._mps(ctx, i, z)
         else:
             self.a = z
+
+    def run(self, ctx: bytearray, i: int, bit: int, n: int):
+        """`n` copies of `bit` in context i: the same bytes and state as n calls to `bit` (encoder.rs `encode_run`).
+        MPS bits on the fast path only add p to a, so a run of them is one multiply-add."""
+        while n > 0:
+            st = ctx[i]
+            p = PROB[st]
+            if bit != st & 1:
+                self._lps(ctx, i, self.a + p)
+                n -= 1
+                continue
+            fast = max(0x7FFF - self.a, 0) // p
+            if fast >= n:
+                self.a += n * p
+                return
+            self.a += fast * p
+            self._mps(ctx, i, self.a + p)
+            n -= fast + 1
+
+    def _mps(self, ctx, i, z):
+        st = ctx[i]
+        z = min(z, 0x6000 + ((z + self.a) >> 2))
+        if (self.a & 0xFFFF) >= THRESHOLD[st]:
+            ctx[i] = MPS_NEXT[st]
+        self.a = z
+        self._shift(1)
+
+    def _lps(self, ctx, i, z):
+        z = min(z, 0x6000 + ((z + self.a) >> 2))
+        ctx[i] = LPS_NEXT[ctx[i]]
+        z = 0x10000 - z
+        self.subend += z
+        self.a += z
+        self._renormalize()
 
     def passthrough(self, bit: int):
         z = 0x8000 + (self.a >> 1)
@@ -192,6 +216,21 @@ def _position(enc: _ZpEncoder, ctx: bytearray, ctx_id: int, pos: int):
     # pos == 256, the marker: no more bits
 
 
+def _run(bwt: bytes, i: int, stop: int, byte: int) -> int:
+    """How many bytes from i (before `stop`) equal `byte`; windows double, so the cost follows the run's length."""
+    one = bytes([byte])
+    n = 0
+    width = 16
+    while i + n < stop:
+        seg = bwt[i + n:min(i + n + width, stop)]
+        same = len(seg) - len(seg.lstrip(one))
+        n += same
+        if same < len(seg):
+            break
+        width *= 2
+    return n
+
+
 def _block(enc, ctx, data, *, eob, markerpos, size, fshift):
     bwt, marker = _forward_bwt(data)
     if markerpos is not None:
@@ -205,8 +244,25 @@ def _block(enc, ctx, data, *, eob, markerpos, size, fshift):
     freq = [0, 0, 0, 0]
     fadd = 4
     last = 3
-    for i, byte in enumerate(bwt):
+    i = 0
+    total = len(bwt)
+    while i < total:
+        byte = bwt[i]
         pos = 256 if i == marker and eob else where[byte]
+        if pos == 0 and last == 0:
+            # a run of position 0 in context 0: one ZP run, and the MTF list does not change (only the frequencies)
+            stop = marker if i < marker < total and eob else total
+            r = _run(bwt, i, stop, byte)
+            enc.run(ctx, 0, 1, r)
+            for _ in range(r):
+                fadd += fadd >> fshift
+                if fadd > 0x10000000:
+                    fadd >>= 24
+                    freq = [f >> 24 for f in freq]
+                freq[0] += fadd
+            i += r
+            continue
+        i += 1
         _position(enc, ctx, min(last, 2), pos)
         last = pos
         if pos == 256:

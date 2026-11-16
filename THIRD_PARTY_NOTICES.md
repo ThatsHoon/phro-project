@@ -858,7 +858,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 ## djvu-rs
 
-Ported: the BZZ decoder (the ZP coder, its adaptation table, the MTF stage and the inverse BWT) in `scripts/reader/containers/bzz.py`, from `djvu-bzz` 0.45.0 (`src/decode.rs`, `src/lib.rs`) and `djvu-zp` 0.45.0 (`src/lib.rs`, `src/tables.rs`); the BZZ and ZP encoder of the test fixtures in `tests/djvu_fix.py`, from `djvu-bzz` 0.45.0 (`src/encode.rs`) and `djvu-zp` 0.45.0 (`src/encoder.rs`); both crates at commit a329e2ad3bd9f710fcfeb758939f58626a6eb69a. The ZP table is checked against the DjVu 3 specification's appendix.
+Ported: the BZZ decoder (the ZP coder, its adaptation table, the MTF stage and the inverse BWT) in `scripts/reader/containers/bzz.py`, from `djvu-bzz` 0.45.0 (`src/decode.rs`, `src/lib.rs`) and `djvu-zp` 0.45.0 (`src/lib.rs`, `src/tables.rs`); the BZZ and ZP encoder of the test fixtures in `tests/djvu_fix.py`, from `djvu-bzz` 0.45.0 (`src/encode.rs`) and `djvu-zp` 0.45.0 (`src/encoder.rs`); both crates at commit a329e2ad3bd9f710fcfeb758939f58626a6eb69a. The ZP table is djvu-zp's `src/tables.rs`, rows 0-250 (its rows 251-255 are padding and are left out); spot values were compared with DjVuLibre's `default_ztable` as format knowledge.
 
 ```
 MIT License
