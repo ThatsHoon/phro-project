@@ -10,8 +10,8 @@ Ported from libvisio (MPL-2.0) at a42aaff13e4a67afcd077c3abb3ef13bb6463025, `src
 `readName`, `readName2`, `readNameIDX`, `readNameIDX123`, `readFieldList`, `readTextField`, `readMisc`, `readFontIX`,
 `readForeignDataType`, `readForeignData`), `VSD6Parser.cpp` (the 8-bit `readText`, `readName`, `readName2`,
 `readTextField`, `readCharIX` and the v6 `readMisc`), `VSD5Parser.cpp` (`handleChunkRecords`, `readShape`,
-`readNameIDX`, `readTextField`, `readCharIX`, `readMisc`, the s16 `getUInt`), `VSDStencils.cpp` (`getStencilShape`:
-no master shape id is the stencil's first shape), `VSDFieldList.cpp` (`VSDFieldList::handle`'s order, the number and
+`readNameIDX`, `readTextField`, `readCharIX`, `readMisc`, the s16 `getUInt`), `VSDStencils.cpp` (`getStencilShape`,
+the stencil pages and their shapes by id), `VSDFieldList.cpp` (`VSDFieldList::handle`'s order, the number and
 date formats of `VSDNumericField::getString`) and `VSDContentCollector.cpp` (a field mark taking the next field's
 value, the character runs of 8-bit text). The walk of the VisioDocument stream is `vsd_stream`'s; this module reads
 one walk of it.
@@ -56,14 +56,19 @@ reading of later ones); each stencil page (0x1E) is keyed by its pointer index, 
 shapes by id (the last of an id wins; the first shape read is the page's first shape). A stencil shape's text is read
 as a page shape's, fields and runs included, once, and charged to a stencil room of `limits.MAX_OUTPUT` characters a
 document (past it the shape is lost, and the shapes that would inherit it count `stencil`). A shape naming a master
-page and shape (libvisio's getStencilShape: no master shape id is that page's first shape) takes its text when it has
-no text chunk of its own, and its hidden flag when it has no misc chunk of its own (v5 copies no misc, as libvisio).
-Only completed stencil pages are looked in, so a stencil shape naming its own page, itself, or a page read later
-inherits nothing and no lookup loops. A master page not read (past MASTERS, absent, or after the pages in the walk)
-gives nothing, and a shape that would have inherited its text counts `stencil`; a master page without that shape
-gives nothing, uncounted. libvisio adds a stencil shape when its stream ends; here every shape of a stencil page is
-added (a group master's sub-shapes too), so a stencil's first shape is the group, as vsdx's first top-level shape.
-Pictures are not inherited.
+page and shape (getStencilShape) takes its text when it has no text chunk of its own, its hidden flag when it has no
+misc chunk of its own, and its XForm (PinX, PinY, LocPinX, LocPinY) when it has none of its own; v5 copies the text
+only, as VSD5Parser::readShape. A master shape id of 0xFFFFFFFF names the master page's first shape: that is vsdx's
+rule (the master's first top-level shape) and libvisio's for vsdx (`m_firstShapeId` is set only by
+VSDXMLParserBase); libvisio's binary path never sets it, so there such an instance inherits nothing. Only completed
+stencil pages are looked in, so a stencil shape naming its own page, itself, or a page read later inherits nothing, as
+in libvisio, uncounted, and no lookup loops. A master page not read (past MASTERS, absent, or after the pages in the
+walk) gives nothing, and a page shape that would have inherited its text counts `stencil`; so does one inheriting
+through a stencil shape that would itself have inherited from a lost stencil shape or from a page past MASTERS (that
+stencil shape is lost too). A master page without that shape gives nothing, uncounted. libvisio adds a stencil shape
+when its stream ends; here every shape of a stencil page is added (a group master's sub-shapes too), so a stencil's
+first shape is the group, as vsdx's first top-level shape. Pictures are not inherited (vsdx parity; libvisio copies
+`m_foreign`).
 
 Output: `Section("page", title=name)`; the shapes, each its text `Para` (hidden="hidden" when its text is hidden) and
 its picture, sorted by (-PinY, PinX) on the page, a shape's PinY and PinX added to its group's origin (the group's own
@@ -280,11 +285,12 @@ class _Shape:
 
 
 class _Entry:
-    """A stencil shape as its inheritors see it: its text (fields resolved), cut, hidden flag; inlines built once."""
-    __slots__ = ("text", "cut", "hide", "_inlines")
+    """A stencil shape as its inheritors see it: its text (fields resolved), cut, hidden flag, XForm (or None);
+    inlines built once."""
+    __slots__ = ("text", "cut", "hide", "pin", "_inlines")
 
-    def __init__(self, text, cut, hide):
-        self.text, self.cut, self.hide, self._inlines = text, cut, hide, None
+    def __init__(self, text, cut, hide, pin=None):
+        self.text, self.cut, self.hide, self.pin, self._inlines = text, cut, hide, pin, None
 
     def inlines(self):
         if self._inlines is None:
@@ -292,8 +298,8 @@ class _Entry:
         return self._inlines
 
 
-_EMPTY = _Entry("", False, False)  # the master page has no such shape
-_LOST = _Entry("", False, False)   # the stencil room was spent on it
+_EMPTY = _Entry("", False, False)  # the master page has no such shape; also every blank, shown, unplaced stencil shape
+_LOST = _Entry("", False, False)   # the stencil room was spent on it, or it inherits from a lost one
 
 
 class _Stencil:
@@ -633,17 +639,26 @@ class _Reader:
         return None if e is _LOST else e
 
     def inherited(self, s):
-        """(entry, hidden) for shape `s`: the master shape when it may give the text or the hidden flag."""
+        """(entry, hidden) for shape `s`: the master shape when it may give the text, the hidden flag or the XForm."""
         entry = None
-        if s.master[0] != NONE and (s.text is None or not s.has_misc):
+        if s.master[0] != NONE and (s.text is None or not s.has_misc or (s.pin is None and self.v != 5)):
             entry = self.master_shape(*s.master)
         if s.has_misc:
             return entry, s.hide
         return entry, bool(entry is not None and self.v != 5 and entry.hide)  # v5 copies no misc
 
     def keep(self, s, spage):
-        """A stencil shape: its text resolved once and kept (charged to the stencil room) for its inheritors."""
+        """A stencil shape: its text resolved once and kept (charged to the stencil room) for its inheritors. One
+        that would inherit its text from a lost shape, or from a page past MASTERS, is lost too; one naming its own
+        page or a page not yet read inherits nothing, as in libvisio."""
         entry, hide = self.inherited(s)
+        if spage.first == NONE:
+            spage.first = s.sid
+        if s.text is None and entry is None and s.master[0] != NONE:
+            mp = s.master[0]
+            if mp in self.spages or (mp != spage.idx and self.masters_read >= vsdx.MASTERS):
+                spage.shapes[s.sid] = _LOST
+                return
         if s.text is not None:
             text, cut = self.text_of(s)
         elif entry is not None:
@@ -653,13 +668,14 @@ class _Reader:
         if not text.strip():
             text = ""
         cost = len(text) + vsdx.LINE * (text.count("\n") + text.count("\r"))
+        pin = s.pin if s.pin is not None or entry is None or self.v == 5 else entry.pin
         if cost > self.stencil_room:
             spage.shapes[s.sid] = _LOST
+        elif not (text or cut or hide or pin):
+            spage.shapes[s.sid] = _EMPTY  # shared: a blank stencil shape costs no entry of its own
         else:
             self.stencil_room -= cost
-            spage.shapes[s.sid] = _Entry(text, cut, hide)
-        if spage.first == NONE:
-            spage.first = s.sid
+            spage.shapes[s.sid] = _Entry(text, cut, hide, pin)
 
     def place(self, s, page):
         """A page shape: its text (its own, else its master's), hidden flag, glued ends and picture."""
@@ -700,6 +716,8 @@ class _Reader:
             blocks.append(Para(inlines if inlines is not None else vsdx._inlines(text.strip("\n")),
                                hidden="hidden" if hidden else ""))
         blocks.extend(self.picture(s))
+        if s.pin is None and entry is not None and self.v != 5:  # readShape copies the master's XForm (v6, v11)
+            s.pin = entry.pin
         pin = s.pin or (None, None, None, None)
         if s.sid not in page.ids and (s.pin is not None or s.parent not in (0, NONE)):
             page.ids[s.sid] = (s.parent, *pin)
@@ -912,21 +930,23 @@ class _Reader:
             if s.ftype is not None:
                 self.ctx.skipped["image"] += 1
             return []
+        if self.image_bytes >= limits.IMAGE_BYTES or vsdx.LINE > self.room:  # spent: no picture work at all
+            self.ctx.skipped["image"] += 1
+            return []
         if s.ftype == 1 and s.fformat == 0:
-            if self.image_bytes >= limits.IMAGE_BYTES:  # spent: not converted at all
+            data = officeart.dib_to_bmp(data)
+            if data is None:
                 self.ctx.skipped["image"] += 1
                 return []
-            bmp = officeart.dib_to_bmp(data)
-            if bmp is None:
-                self.ctx.skipped["image"] += 1
-                return []
-            data = images.bmp_to_png(bmp) or bmp
+            data = images.bmp_to_png(data) or data  # a BMP it cannot convert stays a BMP, not tried again
+        else:
+            kind = images.sniff(data) if len(data) >= 16 else None
+            if kind == "bmp":
+                data = images.bmp_to_png(data) or data
         kind = images.sniff(data) if len(data) >= 16 else None
         if kind is None:
             self.ctx.skipped["image"] += 1
             return []
-        if kind == "bmp":
-            data = images.bmp_to_png(data) or data
         self.image_bytes += len(data)
         if self.image_bytes > limits.IMAGE_BYTES or vsdx.LINE > self.room:
             self.ctx.skipped["image"] += 1

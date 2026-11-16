@@ -1193,6 +1193,170 @@ def test_number_fidelity():
     assert lines(doc.blocks[0]) == ["5000000000000000"], lines(doc.blocks[0])
 
 
+def test_edge_cap_per_page():
+    # (fix round 1) a page keeps at most the budget's room + 1 glued connectors, so the budget still sees its cut
+    seen, real = [], vsd._Reader.finish
+
+    def spy(self, page):
+        seen.append(len(page.edges))
+        return real(self, page)
+
+    shapes = [{"id": 1, "text": "A"}, {"id": 2, "text": "B"}] + [
+        {"id": k, "misc": misc(11, ends=(1, 2))} for k in (3, 4, 5)]
+    old = vsdx.CONNECTIONS
+    vsdx.CONNECTIONS, vsd._Reader.finish = 1, spy
+    try:
+        doc, ctx = read(drawing([{"shapes": shapes}]))
+    finally:
+        vsdx.CONNECTIONS, vsd._Reader.finish = old, real
+    assert seen == [2], seen
+    assert lines(doc.blocks[0]) == ["A", "B", "Connections:", "- A → B"] and ctx.skipped == {"connections_cut": 1}
+
+
+def test_misc_block_meter():
+    # (fix round 1) each readMisc block takes an item of the BIN_RECORDS meter: glue blocks past it are not read
+    glue = misc(11, ends=(1, 2))
+    filler = glue[:45] + struct.pack("<I", 4) * 500 + glue[45:]
+    shapes = [{"id": 1, "text": "A"}, {"id": 2, "text": "B"}, {"id": 3, "text": "c", "misc": filler}]
+    doc, ctx = read(drawing([{"shapes": shapes}]))
+    assert lines(doc.blocks[0])[-1] == "- A → B (c)" and not ctx.skipped  # the meter's room reaches the glue
+    old = limits.BIN_RECORDS
+    limits.BIN_RECORDS = 100
+    try:
+        doc, ctx = read(drawing([{"shapes": shapes}]))
+    finally:
+        limits.BIN_RECORDS = old
+    assert lines(doc.blocks[0]) == ["A", "B", "c"] and ctx.skipped == {"record": 1}, ctx.skipped
+
+
+def test_v5_name_index_meter():
+    # (fix round 1) the v5 name index (u16 count, u16 pairs) takes from the meter: 500 records, only the last naming
+    # page 0; past the meter the page is numbered, counted `record` once
+    lay = Layout(5)
+    names = lay.put(v5_records([(0x33, struct.pack("<h", 1) + b"Late\x00")]), 0x32, 0x40)
+    page = lay.put(page_stream([{"text": "t"}], 5), 0x15, 0xD1)
+    idx = lay.put(struct.pack("<H", 500) + struct.pack("<HH", 0, 9) * 499 + struct.pack("<HH", 0, 0), 0xC9, 0x40)
+    pages = lay.put(vsd_list([page, idx], version=5, ptype=0x27), 0x27, 0x50)
+    data = lay.done(lay.put(vsd_list([names, pages], version=5), 0x14, 0x50))
+    doc, ctx = read(data)
+    assert doc.blocks[0].title == "Late" and not ctx.skipped, (doc.blocks[0].title, ctx.skipped)
+    old = limits.BIN_RECORDS
+    limits.BIN_RECORDS = 100
+    try:
+        doc, ctx = read(data)
+    finally:
+        limits.BIN_RECORDS = old
+    assert doc.blocks[0].title == "1" and ctx.skipped == {"record": 1}, (doc.blocks[0].title, ctx.skipped)
+
+
+def test_stencil_room_and_lost_inheritance():
+    # (fix round 1) stencil text is charged to its own MAX_OUTPUT room: a stencil shape past it is lost and its
+    # inheritor counts `stencil`; so does one inheriting through a stencil shape that names the lost one, or a master
+    # page past MASTERS. A stencil shape naming its own page inherits nothing, uncounted (test_master_ids_resolve_once).
+    stencils = [[{"id": 1, "text": "a" * 120}, {"id": 2, "text": "b" * 120}, {"id": 3, "text": "ok"}],
+                [{"id": 4, "master": (0, 2)}]]
+    shapes = [{"master": (0, 2), "pin": (0.0, 9.0)}, {"master": (1, 4), "pin": (0.0, 8.0)},
+              {"master": (0, 3), "pin": (0.0, 7.0)}]
+    old = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 200
+    try:
+        doc, ctx = read(drawing([{"shapes": shapes}], stencils=stencils))
+    finally:
+        limits.MAX_OUTPUT = old
+    assert lines(doc.blocks[0]) == ["ok"] and ctx.skipped == {"stencil": 2}, (lines(doc.blocks[0]), ctx.skipped)
+    old = vsdx.MASTERS
+    vsdx.MASTERS = 1
+    try:
+        doc, ctx = read(drawing([{"shapes": [{"master": (0, 1)}]}], stencils=[[{"id": 1, "master": (1, 0)}],
+                                                                           [{"text": "far"}]]))
+    finally:
+        vsdx.MASTERS = old
+    assert lines(doc.blocks[0]) == [] and ctx.skipped == {"stencil": 1}, ctx.skipped
+
+
+def test_zip_route_visio_only():
+    # (fix round 1) zip_route sends a zip to vsdx on Visio's own root relationship type, or on a `/document` one
+    # whose target exists in a package without an `/officeDocument` one; any other zip keeps its old route
+    from reader.formats import zip_route
+    od = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    def rels(items):
+        return f'<Relationships xmlns="{pkg}">' + "".join(
+            f'<Relationship Id="r{i}" Type="{t}" Target="{tg}"/>' for i, (t, tg) in enumerate(items)) + \
+            "</Relationships>"
+
+    ct = {"[Content_Types].xml": "<Types/>"}
+    docx = {**ct, "word/document.xml": "<w/>"}
+    cases = [
+        ({**docx, "_rels/.rels": rels([(f"{od}/officeDocument", "word/document.xml"), (f"{od}/document", "x.xml")])},
+         "ooxml"),   # a dangling /document rel
+        ({**docx, "_rels/.rels": rels([(f"{od}/officeDocument", "word/document.xml"),
+                                       (f"{od}/document", "word/document.xml")])}, "ooxml"),  # an odd one
+        ({**ct, "ppt/presentation.xml": "<p/>",
+          "_rels/.rels": rels([(f"{od}/officeDocument", "ppt/presentation.xml")])}, "ooxml"),
+        ({**ct, "xl/workbook.xml": "<x/>", "_rels/.rels": rels([(f"{od}/officeDocument", "xl/workbook.xml")])},
+         "ooxml"),
+        ({"mimetype": "application/vnd.oasis.opendocument.text", "content.xml": "<c/>"}, "odf"),
+        ({**ct, "visio/document.xml": "<v/>",
+          "_rels/.rels": rels([("http://schemas.microsoft.com/visio/2010/relationships/document",
+                                "visio/document.xml")])}, "vsdx"),
+        ({**ct, "visio/document.xml": "<v/>", "_rels/.rels": rels([(f"{od}/document", "visio/document.xml")])},
+         "vsdx"),
+        ({**ct, "_rels/.rels": rels([(f"{od}/document", "visio/document.xml")])}, "ooxml"),  # no such part
+    ]
+    for members, want in cases:
+        assert zip_route.route(make_zip(None, members)) == want, (want, sorted(members))
+
+
+def test_no_picture_work_when_spent():
+    # (fix round 1) a spent image budget converts nothing; a DIB whose PNG conversion fails is tried once and kept
+    calls, real = [], vsd.images.bmp_to_png
+
+    def spy(data):
+        calls.append(len(data))
+        return real(data)
+
+    def pic(kind, fmt, data, y):
+        return {"type": 0x4E, "pin": (0.0, y), "chunks": [(0x98, foreign_type(kind, fmt), {"level": 3}),
+                                                           (0x0C, data, {"level": 3})]}
+
+    bmp = vsd.officeart.dib_to_bmp(dib(2, 2))
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES, vsd.images.bmp_to_png = len(PNG), spy
+    try:
+        doc, ctx = read(drawing([{"shapes": [pic(1, 4, PNG, 3.0), pic(1, 4, bmp, 2.0), pic(1, 0, dib(), 1.0)]}]))
+        assert lines(doc.blocks[0]) == ["image:png"] and ctx.skipped == {"image": 2} and calls == [], (calls, ctx)
+        limits.IMAGE_BYTES = old
+        rgb16 = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 16, 0, 4, 0, 0, 0, 0) + bytes(4)  # bmp_to_png refuses it
+        doc, ctx = read(drawing([{"shapes": [pic(1, 0, rgb16, 1.0)]}]))
+    finally:
+        limits.IMAGE_BYTES, vsd.images.bmp_to_png = old, real
+    assert lines(doc.blocks[0]) == ["image:bmp"] and len(calls) == 1 and not ctx.skipped, (calls, ctx.skipped)
+
+
+def test_master_first_shape_and_xform():
+    # (fix round 1) master shape 0xFFFFFFFF is the master page's first shape (vsdx's rule); a v11 shape without an
+    # XForm of its own is placed by its master shape's (readShape copies m_xform)
+    stencils = [[{"id": 5, "text": "first", "pin": (2.0, 4.0)}, {"id": 6, "text": "second"}]]
+    shapes = [{"text": "own", "pin": (0.0, 3.0)}, {"master": (0, 5)}, {"master": (0, NONE), "pin": (0.0, 1.0)}]
+    doc, ctx = read(drawing([{"shapes": shapes}], stencils=stencils))
+    assert lines(doc.blocks[0]) == ["first", "own", "first"] and not ctx.skipped, lines(doc.blocks[0])
+
+
+def test_run_and_cut_fidelity():
+    # (fix round 1) a zero-count run still covers one byte (the collector's loop); a UTF-16 unit past MAX_TEXT whose
+    # low byte is NUL but high byte is not is no blank, so the text is cut; v5 copies no hidden flag from its master
+    doc, _ = read(drawing([{"shapes": [{"raw": b"\xe9\xe9", "runs": [(0, 2), (1, 1)]}]}], version=6,
+                          extra=[fonts([(1, 0), (2, 204)])]))
+    assert lines(doc.blocks[0]) == ["й\xe9"], lines(doc.blocks[0])
+    doc, ctx = read(drawing([{"shapes": [{"text": "y" * vsdx.MAX_TEXT + "ऀ"}]}]))
+    assert ctx.skipped == {"text": 1}, ctx.skipped
+    stencils = [[{"id": 1, "text": "veil", "misc": misc(5, hide=True)}]]
+    doc, ctx = read(drawing([{"shapes": [{"master": (0, 1), "pin": (0.0, 1.0)}]}], version=5, stencils=stencils))
+    assert lines(doc.blocks[0]) == ["veil"] and not ctx.skipped, lines(doc.blocks[0])
+
+
 def test_no_page():
     try:
         read(vsd_document(11, []))
@@ -1357,6 +1521,43 @@ def measure_vsd16():
     names = [(0x2D, chr(0x41 + k % 26).encode("utf-16-le") * 10_000, {"cid": k, "level": 3}) for k in range(2_000)]
     fields = [(0xA1, text_field(k), {"cid": k}) for k in range(2_000)]
     _probe_doc("large names x2k", drawing([{"shapes": [{"text": "￼" * 2_000, "chunks": fields + names}]}]))
+    # (fix round 1) 1.9M bare shapes of distinct ids: parented page shapes (one page.ids entry each) and stencil
+    # shapes (one stencil dict entry each, the blank ones sharing one _Entry)
+    n = 1_900_000
+    lay = Layout()
+    page = lay.put(_coded_ids(vsd_chunk(0x15, bytes(0x30), cid=NONE), n, 1), 0x15, 0xD3)
+    pages = lay.put(vsd_list([page]), 0x27, 0x50)
+    _probe_doc("parented ids x1.9M", lay.done(lay.put(vsd_list([pages]), 0x14, 0x50)))
+    lay = Layout()
+    spage = lay.put(vsd_list([lay.put(_coded_ids(b"", n, 0), 0x48, 0xD2)]), 0x1E, 0x50)
+    sten = lay.put(vsd_list([spage]), 0x1D, 0x50)
+    pages = lay.put(vsd_list([lay.put(page_stream([{"text": "p"}], 11), 0x15, 0xD1)]), 0x27, 0x50)
+    _probe_doc("stencil ids x1.9M", lay.done(lay.put(vsd_list([sten, pages]), 0x14, 0x50)))
+
+
+def _coded_ids(head, n, parent):
+    """`head`, then `n` shape chunks (0x48, level 1, `parent`) of ids 2 .. n + 1, LZ77-coded by hand: each shape's
+    first four bytes and the rest after its id copied from the shape before it, its id four literals."""
+    def one(k):
+        return vsd_chunk(0x48, shape_data(parent=parent), cid=k, level=1)
+
+    unit = len(one(2))
+    first = head + bytes(-(len(head) + unit) % 8) + one(2)  # whole flag groups of literals before the references
+    rest, left = [], unit - 8
+    while left:
+        step = 18 if left - 18 >= 3 or left == 18 else min(left, 18) if left <= 18 else left - 3
+        rest.append(step)
+        left -= step
+    out, pos, batch, shapes = [_code(list(first))], len(first), [], 0
+    for k in range(3, n + 2):
+        batch += [(unit, 4)] + list(struct.pack("<I", k)) + [(unit, r) for r in rest]
+        shapes += 1
+        if len(batch) >= 4096 and len(batch) % 8 == 0:
+            out.append(_code(batch, pos=pos))
+            pos, batch, shapes = pos + shapes * unit, [], 0
+    if batch:
+        out.append(_code(batch, pos=pos))
+    return b"".join(out)
 
 
 def measure():
