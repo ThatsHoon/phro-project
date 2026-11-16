@@ -657,12 +657,43 @@ def test_notices_credit_port_sources():
     docs = {f.relative_to(HERE).as_posix(): ast.get_docstring(ast.parse(f.read_text(encoding="utf-8"))) or ""
             for f in sorted((HERE / "scripts" / "reader").rglob("*.py"))}
     for proj in ("dochan", "kordoc", "rhwp", "anydoc", "docling", "xberg", "tika", "foliate-js", "numbers-parser",
-                 "keynote-parser", "djvu-rs", "jackcess"):
+                 "keynote-parser", "djvu-rs", "jackcess", "libvisio", "poi"):
         sec = text.split(f"## {proj}\n", 1)[1].split("\n## ", 1)[0]
         paths = re.findall(r"`(scripts/[^`]+)`", next(ln for ln in sec.splitlines() if ln.startswith("Ported:")))
         for rel, doc in docs.items():
             if re.search(rf"\b{proj}\b", doc, re.I):
                 assert any(fnmatch.fnmatch(rel, p) for p in paths), (proj, rel)
+
+
+MPL_HEAD = ("# This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the"
+            " MPL was not", "# distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.")
+
+
+def _mpl_ok(source: str) -> bool:
+    """Whether a module's source starts with the three MPL lines: the licence's two and the port line naming the full
+    commit and the src/lib/ files."""
+    import re
+    lines = source.splitlines()[:3]
+    return (len(lines) == 3 and tuple(lines[:2]) == MPL_HEAD
+            and re.match(r"^# Ported from (libmspub|libvisio) [0-9a-f]{40}, src/lib/", lines[2]) is not None)
+
+
+def test_mpl_headers():
+    # every reader module whose docstring names libmspub or libvisio (MPL-2.0) starts with the MPL header
+    import ast
+    import re
+    ported = []
+    for f in sorted((HERE / "scripts" / "reader").rglob("*.py")):
+        source = f.read_text(encoding="utf-8")
+        if re.search(r"\b(libmspub|libvisio)\b", ast.get_docstring(ast.parse(source)) or "", re.I):
+            ported.append(f.relative_to(HERE).as_posix())
+            assert _mpl_ok(source), f
+    assert "scripts/reader/formats/vsd_stream.py" in ported, ported
+    head = "\n".join(MPL_HEAD) + "\n# Ported from libvisio " + "a" * 40 + ", src/lib/X.cpp.\n"
+    assert _mpl_ok(head + '"""From libvisio."""\n')
+    assert not _mpl_ok('"""From libvisio."""\n')
+    assert not _mpl_ok(head.replace("a" * 40, "a42aaff") + '"""From libvisio."""\n')
+    assert not _mpl_ok(head.replace("MPL/2.0/.", "MPL/2.0/") + '"""From libvisio."""\n')
 
 
 # -- pdf: every pdf test pins PHRO_READER_PYENV (off, a missing folder or a fake venv) so a real venv never runs

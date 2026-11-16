@@ -909,6 +909,55 @@ Copyright (c) 2013 James Ahlborn
 Copyright (c) 2014 James Ahlborn
 ```
 
+## poi
+
+Ported: the pointer cap of the Visio pointer tree (100,000 pointers a document, POI's `MAX_NUMBER_OF_POINTERS`) in `scripts/reader/formats/vsd_stream.py`, from `poi-scratchpad/src/main/java/org/apache/poi/hdgf/pointers/PointerFactory.java` of Apache POI at trunk commit 47dcff769bb395034dddfd59c4609659b6dbc6a4. Apache POI is licensed under the Apache License 2.0, whose text is reproduced under tika above. Its NOTICE (`legal/NOTICE` at the same commit) reads:
+
+```
+Apache POI
+Copyright 2003-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (https://www.apache.org/).
+
+This product contains parts that were originally based on software from BEA.
+Copyright (c) 2000-2003, BEA Systems, <http://www.bea.com/> (dead link),
+which was acquired by Oracle Corporation in 2008.
+<http://www.oracle.com/us/corporate/Acquisitions/bea/index.html>
+<https://en.wikipedia.org/wiki/BEA_Systems>
+Note: The ASF Secretary has on hand a Software Grant Agreement (SGA) from
+BEA Systems, Inc. dated 9 Sep 2003 for XMLBeans signed by their EVP/CFO.
+
+This product contains W3C XML Schema documents. Copyright 2001-2003 (c)
+World Wide Web Consortium (Massachusetts Institute of Technology, European
+Research Consortium for Informatics and Mathematics, Keio University)
+
+This product contains the chunks_parse_cmds.tbl file from the vsdump program.
+Copyright (C) 2006-2007 Valek Filippov (frob@df.ru)
+
+This product contains parts of the eID Applet project
+<http://eid-applet.googlecode.com> and <https://github.com/e-Contract/eid-applet>.
+Copyright (c) 2009-2018
+FedICT (federal ICT department of Belgium), e-Contract.be BVBA (https://www.e-contract.be),
+Bart Hanssens from FedICT
+
+ExceptionUtils is derived from `scala.util.control.NonFatal` in scala-library
+which was released under the Apache 2.0 license.
+
+Copyright (c) 2002-2023 EPFL
+Copyright (c) 2011-2023 Lightbend, Inc.
+
+Scala includes software developed at
+LAMP/EPFL (https://lamp.epfl.ch/) and
+Lightbend, Inc. (https://www.lightbend.com/).
+```
+
+## libvisio
+
+Ported: the VisioDocument header, the LZ77 inflate, the Visio 5, 2000 and 2002-2013 pointers, pointer lists and chunk headers with their trailer rules, and the walk of the pointer tree from the trailer in `scripts/reader/formats/vsd_stream.py`, from `src/lib/VSDInternalStream.cpp`, `src/lib/VSDParser.cpp`, `src/lib/VSD6Parser.cpp` and `src/lib/VSD5Parser.cpp` of libvisio at commit a42aaff13e4a67afcd077c3abb3ef13bb6463025. libvisio's later commits (2026-11-15) were read as knowledge only.
+
+The files on the Ported: line above are licensed under the Mozilla Public License, v. 2.0 (MPL-2.0), https://mozilla.org/MPL/2.0/, and each starts with the MPL's notice and the commit and files it was ported from. The MPL covers those files only: the rest of this plugin stays under its own licence. libvisio's source files carry no copyright line beyond "This file is part of the libvisio project."
+
 ## Adobe
 
 Data: `scripts/reader/pdfnative/cid_unicode_data.py` (the Adobe CID to Unicode tables of mapping-resources-pdf), `scripts/reader/pdfnative/predefined_cmap_data.py` (the predefined Encoding CMap ranges of cmap-resources) and `scripts/reader/pdfnative/core14_metrics.py` (the Core 14 AFM metrics and the Adobe Glyph List). The three modules are copied byte for byte from dochan 1.21.0 (commit 29bb52be2cf40750e0dab25b24d87e33d0fcedd7, `src/dochan/pdf/`), each with one added docstring line; dochan's NOTICE reproduces Adobe's notices as follows. The original Adobe CMap and AFM files are not distributed.

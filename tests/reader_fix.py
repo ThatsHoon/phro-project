@@ -1758,3 +1758,152 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     return {"doc": pid_doc, "master": pid_master, "slides": pid_slides, "slide_ids": slide_ids, "notes": pid_notes,
             "crypt": pid_crypt, "offsets": offsets, "slide1_offsets": (first_slide, offsets.get(pid_slides[0])),
             "slots": slots, "user_edits": user_edits, "directories": directories, "doc_stream": bytes(stream), "current_user": cu}
+
+
+# -- Visio binary (vsd): the VisioDocument stream, laid out as libvisio reads it (VSDParser, VSD6Parser, VSD5Parser)
+
+VSD_MAGIC = b"Visio (TM) Drawing\r\n"
+# where VSD5Parser::readPointerInfo finds a v5 list's s16 pointer count, by the list's pointer type
+_VSD5_COUNT = {0x14: 0x82, 0x15: 0x42, 0x18: 0x2E, 0x1A: 0x12, 0x1D: 0x1E, 0x4E: 0x1E, 0x1E: 0x36}
+
+
+def lz77(data: bytes) -> bytes:
+    """Visio's LZ77: a flag byte per eight items, low bit first; bit 1 is a literal byte, bit 0 a two-byte back
+    reference (12-bit window slot, 4-bit length - 3) into a 4,096-byte window. Greedy, one candidate per three-byte
+    key, so it is linear; a match may overlap the bytes it produces."""
+    items, last, i, n = [], {}, 0, len(data)
+    while i < n:
+        length = 0
+        j = last.get(data[i:i + 3]) if i + 3 <= n else None
+        if j is not None and i - j <= 4096:
+            while length < 18 and i + length < n and data[j + length] == data[i + length]:
+                length += 1
+        if length >= 3:
+            slot = (j - 18) & 4095  # the decoder maps slot s to s + 18 (s <= 4078) or s - 4078, which is j mod 4096
+            items.append(bytes([slot & 0xFF, (slot >> 8) << 4 | (length - 3)]))
+        else:
+            length = 1
+            items.append(data[i:i + 1])
+        for k in range(i, i + length):
+            if k + 3 <= n:
+                last[data[k:k + 3]] = k
+        i += length
+    out = bytearray()
+    for g in range(0, len(items), 8):
+        group = items[g:g + 8]
+        out.append(sum(1 << b for b, item in enumerate(group) if len(item) == 1))
+        out += b"".join(group)
+    return bytes(out)
+
+
+def vsd_trailer(ctype, lst, level, unknown, version) -> int:
+    """The trailer bytes after a chunk's data: VSDParser::getChunkHeader (v11) or VSD6Parser's (v6); v5 has none."""
+    if version == 5:
+        return 0
+    if version == 6:
+        eight = {0x76, 0x73, 0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x69, 0x68, 0x67, 0x66, 0x65, 0x64,
+                 0x2C, 0x0D}
+        return 0 if ctype in (0x1F, 0xC9) else 8 if lst or ctype in eight else 0
+    n = 8 if lst or ctype in (0x71, 0x70, 0x6B, 0x6A, 0x69, 0x66, 0x65, 0x2C) else 0
+    if lst or (level == 2 and unknown == 0x55) or (level == 2 and unknown == 0x54 and ctype == 0xAA) \
+            or (level == 3 and unknown not in (0x50, 0x54)):
+        n += 4
+    four = (0x64, 0x65, 0x66, 0x69, 0x6A, 0x6B, 0x6F, 0x71, 0x92, 0xA9, 0xB4, 0xB6, 0xB9, 0xC7)
+    if ctype in four and n not in (12, 4):
+        n += 4
+    return 0 if ctype in (0x1F, 0xC9, 0x2D, 0xD1) else n
+
+
+def vsd_chunk(ctype, data, *, version=11, cid=0, list_=0, level=0) -> bytes:
+    """One chunk: a 19-byte header (type, id, list, dataLength u32, level u16, unknown u8 = 0) or v5's 12-byte one
+    (type s16, id s16, level u8, unknown u8, list s16, dataLength u32), the data and the trailer, filled with 0xFF
+    (a reader skips zero bytes before a header, so a zero trailer would hide a trailer rule it gets wrong)."""
+    if version == 5:
+        head = struct.pack("<HHBBHI", ctype & 0xFFFF, cid & 0xFFFF, level, 0, list_ & 0xFFFF, len(data))
+    else:
+        head = struct.pack("<IIIIHB", ctype, cid, list_, len(data), level, 0)
+    return head + bytes(data) + b"\xff" * vsd_trailer(ctype, list_, level, 0, version)
+
+
+def vsd_pointer(ptype, offset, length, fmt, *, version=11) -> bytes:
+    """An 18-byte pointer (type u32, 4 skipped, offset u32, length u32, format u16) or v5's 16-byte one (type u16,
+    format u16, 4 skipped, offset u32, length u32)."""
+    if version == 5:
+        return struct.pack("<HHIII", ptype, fmt, 0, offset, length)
+    return struct.pack("<IIIIH", ptype, 0, offset, length, fmt)
+
+
+def vsd_list(pointers, *, version=11, ptype=0x14, blob=b"", order=(), count=None) -> bytes:
+    """A pointer list stream as readPointerInfo reads it (before any compression prefix). v6/v11: u32 at 0 = the
+    list's offset + 4, `blob` from 4, then listSize u32, pointerCount s32, 4 skipped, the pointers and `order` (u32
+    indexes; libvisio reads them only when there are two or more). v5: `blob` from 0, the s16 count at the type's
+    fixed place, then the pointers. `pointers` are `vsd_pointer` bytes or (type, offset, length, format) tuples;
+    `count` overrides the declared pointer count."""
+    raw = b"".join(p if isinstance(p, bytes) else vsd_pointer(*p, version=version) for p in pointers)
+    n = len(pointers) if count is None else count
+    if version == 5:
+        at = _VSD5_COUNT.get(ptype, 0x1E if ptype > 0x45 else 0x0A)
+        head = bytearray(at)
+        head[:len(blob)] = blob[:at]
+        return bytes(head) + struct.pack("<h", n) + raw
+    return (struct.pack("<I", 8 + len(blob)) + bytes(blob) + struct.pack("<IiI", len(order), n, 0) + raw
+            + b"".join(struct.pack("<I", k) for k in order))
+
+
+def vsd_document(version, pages, *, masters=(), trailer_extra=()) -> bytes:
+    """A VisioDocument stream: the header (version at 0x1A, size at 0x1C, the trailer pointer at 0x24) and its
+    pointer tree. The trailer list (type 0x14, format 0x50) holds the pages list (0x27), the stencils list (0x1D,
+    when `masters` is given) and `trailer_extra`. A page is a list of shape dicts or a dict with "shapes" and the
+    optional "background" (format bit 0 clear), "compressed" and "blob" (the bytes before its pointer list); a page
+    pointer is type 0x15, format 0x50 or 0x51. Each master is a list of shape dicts under a stencil page pointer
+    (0x1E). A shape dict gives its chunk stream (format 0xD0): "type" (0x48; 0x47 group, 0x4E foreign), "data" (the
+    shape chunk's data, 0x30 zero bytes), "cid" (its chunk id), "text" (a 0x0E chunk: 8 zero bytes, then UTF-16LE in
+    v11 or cp1252 in v5 and v6), "chunks" (more chunks: bytes, or (type, data) or (type, data, vsd_chunk keywords))
+    and "compressed" (the stream LZ77-coded, format bit 1 set). A coded list or blob holds four zero bytes before its
+    content (libvisio's shift 4); a coded chunk stream starts with its first chunk, as in real files.
+    `trailer_extra` items are (type, format, stream bytes), placed as given, or a (type, offset, length, format)
+    pointer used as it is."""
+    body = bytearray(0x40)
+
+    def put(raw, ptype, fmt, compressed=False):
+        if compressed:
+            raw, fmt = lz77(raw if fmt >> 4 in (0x8, 0xC, 0xD) else bytes(4) + raw), fmt | 2
+        body.extend(raw)
+        return ptype, len(body) - len(raw), len(raw), fmt
+
+    def shape(s):
+        typ = s.get("type", 0x48)
+        parts = [vsd_chunk(typ, s.get("data", bytes(0x30)), version=version, cid=s.get("cid", 0), level=1)]
+        if "text" in s:
+            text = s["text"].encode("utf-16-le" if version == 11 else "cp1252")
+            parts.append(vsd_chunk(0x0E, bytes(8) + text, version=version, level=2))
+        for c in s.get("chunks", ()):
+            parts.append(c if isinstance(c, bytes) else
+                         vsd_chunk(c[0], c[1], version=version, **{"level": 2, **(c[2] if len(c) > 2 else {})}))
+        return put(b"".join(parts), typ, 0xD0, s.get("compressed", False))
+
+    def listed(ptype, fmt, children, blob=b"", compressed=False):
+        return put(vsd_list(children, version=version, ptype=ptype, blob=blob), ptype, fmt, compressed)
+
+    page_ptrs = []
+    for page in pages:
+        page = {"shapes": page} if isinstance(page, (list, tuple)) else page
+        shapes = [shape(s) for s in page["shapes"]]
+        fmt = 0x50 if page.get("background") else 0x51
+        page_ptrs.append(listed(0x15, fmt, shapes, page.get("blob", bytes(8)), page.get("compressed", False)))
+    top = [listed(0x27, 0x50, page_ptrs)]
+    if masters:
+        stencils = [listed(0x1E, 0x50, [shape(s) for s in m]) for m in masters]
+        top.append(listed(0x1D, 0x50, stencils))
+    for item in trailer_extra:
+        top.append(tuple(item) if len(item) == 4 else put(item[2], item[0], item[1]))
+    trailer = listed(0x14, 0x50, top)
+    return vsd_head(version, trailer, body)
+
+
+def vsd_head(version, trailer, body) -> bytes:
+    """`body` (whose first 0x40 bytes are the header's room) with the header written over its start: the magic, the
+    version at 0x1A, the size at 0x1C and the `trailer` (type, offset, length, format) pointer at 0x24."""
+    head = VSD_MAGIC + bytes(0x1A - len(VSD_MAGIC)) + bytes([version, 0]) + struct.pack("<I", len(body))
+    head += bytes(0x24 - len(head)) + vsd_pointer(*trailer, version=version)
+    return head + bytes(body[len(head):])
