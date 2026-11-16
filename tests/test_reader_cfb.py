@@ -239,6 +239,19 @@ def test_ooxml_cfb_without_encryption_is_damaged():
     assert raises(ReadError, reader.parse, p, Context()).kind == "damaged"
 
 
+def test_visio_stream_routes():
+    # cfb_route: a compound file holding a VisioDocument stream belongs to vsd, whichever reader opened it
+    from reader.formats import cfb_route
+    from reader_fix import cfb_bytes
+    with Compound(cfb_bytes({"VisioDocument": b"Visio (TM) Drawing\r\n"})[0]) as cf:
+        assert cfb_route.route(cf, "doc", "no WordDocument stream") == "vsd"
+        assert cfb_route.route(cf, "ppt", "no PowerPoint Document stream") == "vsd"
+        assert cfb_route.route(cf, "vsd", "no VisioDocument stream") is None
+    with Compound(cfb_bytes({"Other": b"x"})[0]) as cf:
+        e = raises(ReadError, cfb_route.route, cf, "vsd", "no VisioDocument stream")
+        assert e.kind == "damaged" and e.detail == "no VisioDocument stream"
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -1,4 +1,5 @@
-"""Visio binary (vsd): the VisioDocument stream layer (header, LZ77, pointer lists, chunk streams, the trailer walk).
+"""Visio binary (vsd): the VisioDocument stream layer (header, LZ77, pointer lists, chunk streams, the trailer walk)
+and the drawing reader (pages, shapes, text, fields, pictures, routing).
 
 Run: python -I -X utf8 tests/test_reader_vsd.py
      python -I -X utf8 tests/test_reader_vsd.py measure   (the hostile-input probes, in memory: s/MiB and peak)
@@ -6,6 +7,7 @@ Run: python -I -X utf8 tests/test_reader_vsd.py
 import random
 import struct
 import sys
+import tempfile
 import time
 import tracemalloc
 from pathlib import Path
@@ -14,12 +16,12 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import limits  # noqa: E402
-from reader.formats import vsd_stream  # noqa: E402
+from reader import limits, markdown  # noqa: E402
+from reader.formats import vsd, vsd_stream, vsdx  # noqa: E402
 from reader.formats.vsd_stream import Chunk, Pointer  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
-from reader_fix import lz77, vsd_chunk, vsd_document, vsd_head, vsd_list, vsd_pointer  # noqa: E402
+from reader.model import Break, Context, Image, Para, Section, Text  # noqa: E402
+from reader_fix import cfb_bytes, lz77, vsd_chunk, vsd_document, vsd_head, vsd_list, vsd_pointer  # noqa: E402
 
 MIB = 2**20
 
@@ -451,6 +453,347 @@ def test_chunk_cap():
     assert len(chunk_types(steps)) == 4 and not ctx.skipped
 
 
+# -- vsd.py: the drawing (pages, shapes, text, fields, pictures)
+
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(24)
+EMF = struct.pack("<II", 1, 88) + bytes(32) + b" EMF" + bytes(44)
+NONE = 0xFFFFFFFF
+
+
+def xform(px, py, lx=0.0, ly=0.0):
+    """A 0x9B chunk's data: PinX, PinY, Width, Height, LocPinX, LocPinY, Angle, each a unit byte and a double, then
+    the two flip bytes."""
+    return b"".join(b"\x00" + struct.pack("<d", v) for v in (px, py, 1.0, 1.0, lx, ly, 0.0)) + b"\x00\x00"
+
+
+def shape_data(parent=0):
+    """A shape chunk's data: parent at 10 (readShape), the rest zero."""
+    d = bytearray(0x30)
+    struct.pack_into("<I", d, 10, parent)
+    return bytes(d)
+
+
+def encode(text, version):
+    return text.encode("utf-16-le" if version == 11 else "cp1252")
+
+
+def text_field(name_id):
+    """A 0xA1 chunk for a string field (cell type 232) showing name `name_id` of its shape's 0x2D names."""
+    return bytes(7) + bytes([232]) + struct.pack("<i", name_id) + bytes(6) + struct.pack("<i", -1)
+
+
+def number_field(value, fmt, cell=32, start=0x36):
+    """A 0xA1 chunk for a number field: the cell type at 7, the value at 8, and at `start` the block naming its
+    format (length, a byte, block index 2, a byte, the format u16, then 0x80 0xC2)."""
+    head = bytearray(start)
+    head[7] = cell
+    struct.pack_into("<d", head, 8, value)
+    return bytes(head) + struct.pack("<IBBBHBB", 11, 0, 2, 0, fmt, 0x80, 0xC2)
+
+
+def page_stream(shapes, version):
+    """A page as real files hold it: one chunk stream, the page chunk 0x15 then each shape's chunk (header level 1)
+    with its chunks (level 2; the XForm at level 3). A shape dict: "id", "type", "parent", "text", "pin" (PinX,
+    PinY[, LocPinX, LocPinY]) and "chunks" ((type, data[, keywords]))."""
+    parts = [vsd_chunk(0x15, bytes(0x30), version=version, cid=NONE)]
+    for s in shapes:
+        parts.append(vsd_chunk(s.get("type", 0x48), shape_data(s.get("parent", 0)), version=version,
+                               cid=s.get("id", NONE), level=1))
+        if "text" in s:
+            parts.append(vsd_chunk(0x0E, bytes(8) + encode(s["text"], version), version=version, level=2))
+        if "pin" in s:
+            parts.append(vsd_chunk(0x9B, xform(*s["pin"]), version=version, level=3))
+        for c in s.get("chunks", ()):
+            parts.append(vsd_chunk(c[0], c[1], version=version, **{"level": 2, **(c[2] if len(c) > 2 else {})}))
+    return b"".join(parts)
+
+
+def drawing(pages, version=11):
+    """A VisioDocument laid out as real files: the trailer list holds the name list (0x32: one 0x33 name per page)
+    and the pages list (0x27: each page a chunk stream, then the name index 0xC9 naming page k by name k). A page
+    is a dict: "name", "shapes", "background", "compressed" (the stream LZ77-coded, format bit 1)."""
+    lay = Layout(version)
+    unit = 2 if version == 11 else 1
+    names = [lay.put(struct.pack("<I", 1) + encode(p.get("name", ""), version) + bytes(unit), 0x33, 0x40)
+             for p in pages]
+    name_list = lay.put(vsd_list(names, version=version), 0x32, 0x50)
+    ptrs = []
+    for p in pages:
+        raw, fmt = page_stream(p["shapes"], version), 0xD0 if p.get("background") else 0xD1
+        if p.get("compressed"):
+            raw, fmt = lz77(raw), fmt | 2
+        ptrs.append(lay.put(raw, 0x15, fmt))
+    index = struct.pack("<I", len(pages)) + b"".join(struct.pack("<IIIB", k, k, k, 0) for k in range(len(pages)))
+    ptrs.append(lay.put(index, 0xC9, 0x40))
+    pages_list = lay.put(vsd_list(ptrs, version=version), 0x27, 0x50)
+    return lay.done(lay.put(vsd_list([name_list, pages_list], version=version), 0x14, 0x50))
+
+
+def read(data, streams=None):
+    ctx = Context()
+    got = vsd.parse_compound(cfb_bytes({"VisioDocument": data, **(streams or {})})[0], ctx)
+    return got, ctx
+
+
+def lines(sec):
+    """Each block of a section as text: a Para's inlines joined (Break as a newline), an Image as its kind."""
+    out = []
+    for b in sec.blocks:
+        if isinstance(b, Para):
+            out.append("".join(i.text if isinstance(i, Text) else "\n" for i in b.inlines))
+        elif isinstance(b, Image):
+            out.append("image:" + (vsd.images.sniff(b.data) or "?"))
+    return out
+
+
+def test_v11_page_and_shapes():
+    data = drawing([{"name": "Overview", "shapes": [
+        {"id": 1, "text": "low", "pin": (1.0, 5.0)},
+        {"id": 2, "text": "high", "pin": (1.0, 9.0)},
+        {"id": 3, "text": "right", "pin": (4.0, 9.0)},
+        {"id": 4, "text": "unplaced"},
+        {"id": 5, "text": "two\nlines", "pin": (0.0, 1.0)}]}])
+    doc, ctx = read(data)
+    assert len(doc.blocks) == 1 and isinstance(doc.blocks[0], Section)
+    sec = doc.blocks[0]
+    assert sec.kind == "page" and sec.title == "Overview", sec
+    # (-PinY, PinX): the PinY 9 shapes first, left to right, then PinY 5, then 1; a shape with no XForm last
+    assert lines(sec) == ["high", "right", "low", "two\nlines", "unplaced"], lines(sec)
+    assert sec.blocks[3].inlines == [Text("two"), Break(), Text("lines")]
+    assert not ctx.skipped, ctx.skipped
+    # the shapes as their own streams in the page's pointer list (vsd_document's layout) read the same
+    doc, ctx = read(vsd_document(11, [[{"text": "low", "chunks": [(0x9B, xform(1.0, 5.0), {"level": 3})]},
+                                       {"text": "high", "chunks": [(0x9B, xform(1.0, 9.0), {"level": 3})]}]]))
+    assert lines(doc.blocks[0]) == ["high", "low"] and doc.blocks[0].title == "1" and not ctx.skipped
+    # pages keep their order, each its own section; a page without a name is numbered
+    doc, _ = read(drawing([{"name": "A", "shapes": [{"text": "a"}]}, {"shapes": [{"text": "b"}]}]))
+    assert [(s.title, lines(s)) for s in doc.blocks] == [("A", ["a"]), ("2", ["b"])]
+
+
+def test_v6_text():
+    for data in (vsd_document(6, [[{"text": "Caf\xe9"}]]), drawing([{"name": "Caf\xe9", "shapes": [
+            {"text": "Caf\xe9", "pin": (1.0, 1.0)}]}], version=6)):
+        doc, ctx = read(data)
+        assert lines(doc.blocks[0]) == ["Caf\xe9"] and not ctx.skipped
+    assert doc.blocks[0].title == "Caf\xe9"
+
+
+def test_visio5_refused():
+    try:
+        read(vsd_document(5, [[{"text": "A"}]]))
+    except ReadError as e:
+        assert (e.kind, e.detail) == ("unsupported", "Visio 5 drawing")
+    else:
+        raise AssertionError("ReadError not raised")
+
+
+def test_group_offsets():
+    # a group at PinY 10 (LocPin 1, 2) with a child at local PinY 1: the child sits at 1 + 10 - 2 = 9 on the page,
+    # above a top-level shape at PinY 8.5, as vsdx places it
+    shapes = [{"id": 1, "type": 0x47, "text": "group", "pin": (5.0, 10.0, 1.0, 2.0)},
+              {"id": 7, "text": "free", "pin": (0.0, 8.5)},
+              {"id": 2, "parent": 1, "text": "child", "pin": (0.5, 1.0)},
+              {"id": 3, "parent": 2, "text": "grandchild", "pin": (0.0, 0.25)}]
+    doc, ctx = read(drawing([{"shapes": shapes}]))
+    # group 10; child 1 + (10 - 2) = 9; grandchild 0.25 + child's origin (8 + 1 - 0) = 9.25; free 8.5
+    assert lines(doc.blocks[0]) == ["group", "grandchild", "child", "free"], lines(doc.blocks[0])
+    assert not ctx.skipped
+    # a parent the page does not hold and a parent cycle place the shape at its own pin
+    shapes = [{"id": 1, "parent": 9, "text": "orphan", "pin": (0.0, 3.0)},
+              {"id": 2, "parent": 3, "text": "a", "pin": (0.0, 1.0)},
+              {"id": 3, "parent": 2, "text": "b", "pin": (0.0, 2.0)}]
+    doc, ctx = read(drawing([{"shapes": shapes}]))
+    assert sorted(lines(doc.blocks[0])) == ["a", "b", "orphan"]
+    assert not ctx.skipped
+
+
+def test_group_depth():
+    # a chain of groups deeper than MAX_DEPTH: shapes past it are left out, counted `depth` once for the page
+    n = limits.MAX_DEPTH + 3
+    shapes = [{"id": k + 1, "parent": k, "type": 0x47, "text": f"s{k}", "pin": (0.0, 1.0)} for k in range(n)]
+    doc, ctx = read(drawing([{"shapes": shapes}]))
+    assert len(lines(doc.blocks[0])) == limits.MAX_DEPTH + 1
+    assert ctx.skipped == {"depth": 1}, ctx.skipped
+
+
+def test_fields():
+    # a string field shows the shape's 0x2D name it points at; a number field its formatted value; the field list
+    # (0x66) gives their order; a mark with no field left shows nothing
+    order = struct.pack("<II", 0, 8) + struct.pack("<II", 4, 3)
+    chunks = [(0x66, order, {"list_": 2}), (0xA1, number_field(41.6, 2), {"cid": 3}), (0xA1, text_field(5), {"cid": 4}),
+              (0x2D, "Alice".encode("utf-16-le"), {"cid": 5, "level": 3})]
+    doc, ctx = read(drawing([{"shapes": [{"text": "By \ufffc, page \ufffc\ufffc.", "chunks": chunks}]}]))
+    assert lines(doc.blocks[0]) == ["By Alice, page 42."], lines(doc.blocks[0])
+    # no field list: the fields in id order; a date and a unit
+    chunks = [(0xA1, number_field(2.5, 3, cell=65), {"cid": 2}),
+              (0xA1, number_field(30060.0, 204, cell=40), {"cid": 1})]
+    doc, _ = read(drawing([{"shapes": [{"text": "\ufffc / \ufffc", "chunks": chunks}]}]))
+    assert lines(doc.blocks[0]) == ["1982-04-19 / 2 in"], lines(doc.blocks[0])
+    # Visio 2000: the 0x1E byte marks a field, the format block starts at 0x24, names are 8-bit
+    chunks = [(0xA1, text_field(1), {"cid": 0}), (0x2D, b"Bob", {"cid": 1, "level": 3}),
+              (0xA1, number_field(7.25, 6, start=0x24), {"cid": 1})]
+    data = drawing([{"shapes": [{"text": "\x1e:\x1e", "chunks": chunks}]}], version=6)
+    doc, _ = read(data)
+    assert lines(doc.blocks[0]) == ["Bob:7.25"], lines(doc.blocks[0])
+
+
+def dib(w=1, h=1):
+    """A 24-bit DIB (no file header), as Visio stores a bitmap's foreign data."""
+    row = b"\x00\x00\xff" * w
+    row += bytes(-len(row) % 4)
+    return struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, len(row) * h, 0, 0, 0, 0) + row * h
+
+
+def foreign_type(kind, fmt=0, mode=0):
+    """A 0x98 chunk: four unit/double pairs, the type u16, the map mode u16, 9 bytes, the format u32."""
+    return b"".join(b"\x00" + struct.pack("<d", 1.0) for _ in range(4)) + struct.pack("<HH", kind, mode) + bytes(9) \
+        + struct.pack("<I", fmt)
+
+
+def test_pictures():
+    out = Path(tempfile.mkdtemp())
+
+    def foreign(kind, fmt, data, pin, text=None):
+        s = {"type": 0x4E, "pin": pin, "chunks": [(0x98, foreign_type(kind, fmt), {"level": 3}),
+                                                  (0x0C, data, {"level": 3})]}
+        if text is not None:
+            s["text"] = text
+        return s
+
+    shapes = [foreign(1, 4, PNG, (0.0, 3.0), "caption"), foreign(4, 0, EMF, (0.0, 2.0)),
+              foreign(1, 0, dib(), (0.0, 1.0)), {"text": "top", "pin": (0.0, 9.0)}]
+    doc, ctx = read(drawing([{"shapes": shapes}]))
+    # a shape's text and picture stay together in reading order; the DIB gets its file header and becomes a PNG
+    assert lines(doc.blocks[0]) == ["top", "caption", "image:png", "image:emf", "image:png"], lines(doc.blocks[0])
+    assert not ctx.skipped
+    md = markdown.render(doc, out / "assets", False, ctx.skipped)
+    assert "![](assets/img-001.png)" in md and "Not viewable here: assets/img-002.emf" in md, md
+    assert (out / "assets" / "img-002.emf").read_bytes() == EMF
+    # an OLE object (type 2) is counted, not shown; a picture with no data or of no kind is counted
+    shapes = [foreign(2, 0, b"\x01" * 40, (0.0, 1.0)), foreign(1, 4, b"no picture here at all", (0.0, 2.0)),
+              {"type": 0x4E, "chunks": [(0x98, foreign_type(1, 4), {"level": 3})]}]
+    doc, ctx = read(drawing([{"shapes": shapes}]))
+    assert lines(doc.blocks[0]) == [] and ctx.skipped == {"object": 1, "image": 2}, ctx.skipped
+
+
+def test_image_bytes():
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES = len(PNG) * 2
+    try:
+        shapes = [{"type": 0x4E, "pin": (0.0, float(k)), "chunks": [(0x98, foreign_type(1, 4), {"level": 3}),
+                                                                   (0x0C, PNG, {"level": 3})]} for k in range(3)]
+        doc, ctx = read(drawing([{"shapes": shapes}]))
+    finally:
+        limits.IMAGE_BYTES = old
+    assert lines(doc.blocks[0]) == ["image:png", "image:png"] and ctx.skipped == {"image": 1}, ctx.skipped
+
+
+def test_background_page():
+    doc, ctx = read(drawing([{"name": "Front", "shapes": [{"text": "f"}]},
+                             {"name": "Back", "background": True, "shapes": [{"text": "b"}]}]))
+    assert [(s.title, lines(s), s.hidden) for s in doc.blocks] == [("Front", ["f"], ""), ("Back", ["b"], "")]
+    doc, _ = read(vsd_document(11, [{"shapes": [{"text": "x"}], "background": True}]))
+    assert lines(doc.blocks[0]) == ["x"]
+
+
+def test_inflated_stream():
+    pages = [{"name": "P", "shapes": [{"text": "one", "pin": (0.0, 2.0)}, {"text": "two", "pin": (0.0, 1.0)}]}]
+    stored, _ = read(drawing(pages))
+    packed, ctx = read(drawing([dict(pages[0], compressed=True)]))
+    assert packed == stored and lines(packed.blocks[0]) == ["one", "two"] and not ctx.skipped
+    # vsd_document's coded lists, blobs and shape streams
+    pages = [[{"text": "A", "compressed": True}]]
+    doc, ctx = read(vsd_document(11, [{"shapes": pages[0], "compressed": True}]))
+    assert lines(doc.blocks[0]) == ["A"] and not ctx.skipped
+
+
+def test_text_caps():
+    # a shape's text past MAX_TEXT is cut there, counted `text`; text past the document's MAX_OUTPUT room is left
+    # out, counted `text`, as vsdx charges it (its characters and LINE per break)
+    doc, ctx = read(drawing([{"shapes": [{"text": "x" * (vsdx.MAX_TEXT + 5)}]}]))
+    assert lines(doc.blocks[0]) == ["x" * vsdx.MAX_TEXT] and ctx.skipped == {"text": 1}, ctx.skipped
+    old = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 9 + vsdx.LINE
+    try:
+        doc, ctx = read(drawing([{"shapes": [{"text": "abcd\nefgh", "pin": (0.0, 3.0)},
+                                             {"text": "z", "pin": (0.0, 2.0)}, {"text": "y", "pin": (0.0, 1.0)}]}]))
+    finally:
+        limits.MAX_OUTPUT = old
+    assert lines(doc.blocks[0]) == ["abcd\nefgh"] and ctx.skipped == {"text": 2}, ctx.skipped
+
+
+def test_record_meter():
+    # the per-document item meter (BIN_RECORDS, read at call time) bounds the name index records; past it the rest
+    # is not read, counted `record` once
+    old = limits.BIN_RECORDS
+    limits.BIN_RECORDS = 100
+    try:
+        doc, ctx = read(drawing([{"name": "Named", "shapes": [{"text": "t"}]}]))
+        assert doc.blocks[0].title == "Named" and not ctx.skipped
+        # 500 records, only the last naming page 0
+        index = struct.pack("<I", 500) + struct.pack("<IIIB", 0, 0, 9, 0) * 499 + struct.pack("<IIIB", 0, 0, 0, 0)
+        lay = Layout()
+        name = lay.put(struct.pack("<I", 1) + encode("Late", 11) + bytes(2), 0x33, 0x40)
+        names = lay.put(vsd_list([name]), 0x32, 0x50)
+        page = lay.put(page_stream([{"text": "t"}], 11), 0x15, 0xD1)
+        idx = lay.put(index, 0xC9, 0x40)
+        pages = lay.put(vsd_list([page, idx]), 0x27, 0x50)
+        doc, ctx = read(lay.done(lay.put(vsd_list([names, pages]), 0x14, 0x50)))
+    finally:
+        limits.BIN_RECORDS = old
+    assert doc.blocks[0].title == "1" and ctx.skipped == {"record": 1}, ctx.skipped
+
+
+def test_shape_guard():
+    # a shape whose reading fails is left out, counted `shape` once; the page and the other shapes stay
+    real = vsd._Reader.xform
+
+    def boom(self, shape, data):
+        if data == xform(0.0, 7.0):
+            raise struct.error("bad")
+        return real(self, shape, data)
+
+    vsd._Reader.xform = boom
+    try:
+        doc, ctx = read(drawing([{"shapes": [{"text": "bad", "pin": (0.0, 7.0)},
+                                             {"text": "good", "pin": (0.0, 1.0)}]}]))
+    finally:
+        vsd._Reader.xform = real
+    assert lines(doc.blocks[0]) == ["good"] and ctx.skipped == {"shape": 1}, ctx.skipped
+
+
+def test_stencil_shapes_not_pages():
+    # stencil (master) shapes are not page content
+    doc, ctx = read(vsd_document(11, [[{"text": "page"}]], masters=[[{"text": "master"}]]))
+    assert [lines(s) for s in doc.blocks] == [["page"]] and not ctx.skipped
+
+
+def test_no_page():
+    try:
+        read(vsd_document(11, []))
+    except ReadError as e:
+        assert (e.kind, e.detail) == ("damaged", "no readable page")
+    else:
+        raise AssertionError("ReadError not raised")
+
+
+def test_no_visio_stream_routes():
+    ctx = Context()
+    assert vsd.parse_compound(cfb_bytes({"WordDocument": bytes(64)})[0], ctx) == "doc"
+    try:
+        vsd.parse_compound(cfb_bytes({"Other": bytes(64)})[0], ctx)
+    except ReadError as e:
+        assert (e.kind, e.detail) == ("damaged", "no VisioDocument stream")
+    else:
+        raise AssertionError("ReadError not raised")
+    # a clean fixture through the path entry and cfb_route.parse
+    from reader.formats import cfb_route
+    p = Path(tempfile.mkdtemp()) / "d.vsd"
+    p.write_bytes(cfb_bytes({"VisioDocument": drawing([{"name": "P", "shapes": [{"text": "hi"}]}])})[0])
+    for doc in (vsd.parse(p, Context()), cfb_route.parse("vsd", p, Context())):
+        assert lines(doc.blocks[0]) == ["hi"]
+
+
 # -- measure: the hostile-input probes, all in memory
 
 def _walk_all(data):
@@ -481,7 +824,56 @@ def _bomb(n_items):
     return (b"\x00" + b"\x00\x0f" * 8) * (n_items // 8)
 
 
+def _read_doc(data):
+    ctx = Context()
+    version, _ = vsd_stream.header(data)
+    try:
+        doc = vsd._Reader(data, version, ctx).run()
+    except ReadError as e:
+        return f"{e.kind}: {e.detail}", ctx
+    pages = [b for b in doc.blocks if isinstance(b, Section)]
+    return f"pages {len(pages):,} blocks {sum(len(b.blocks) for b in pages):,}", ctx
+
+
+def _probe_doc(name, data):
+    """vsd's reader over one VisioDocument stream: timed, then once more under tracemalloc for the peak."""
+    t0 = time.perf_counter()
+    what, ctx = _read_doc(data)
+    dt = time.perf_counter() - t0
+    tracemalloc.start()
+    _read_doc(data)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    mib = len(data) / MIB
+    print(f"vsd {name:<22} {mib:7.2f} MiB {dt:6.2f} s {dt / mib:6.2f} s/MiB  peak {peak / MIB:7.1f} MiB "
+          f"({peak / len(data):6.1f}x/file)  {what}  {dict(ctx.skipped)}", flush=True)
+
+
+def measure_vsd():
+    pic = [(0x98, foreign_type(1, 4), {"level": 3}), (0x0C, PNG + bytes(1000), {"level": 3})]
+    bmp = [(0x98, foreign_type(1, 0), {"level": 3}), (0x0C, dib(64, 64), {"level": 3})]
+    cases = [
+        ("pages x20k", [{"name": f"p{k}", "shapes": [{"text": "x", "pin": (1.0, 1.0)}]} for k in range(20_000)]),
+        ("shapes x200k", [{"shapes": [{"text": f"s{k}", "pin": (float(k % 50), float(k // 50))}
+                                      for k in range(200_000)]}]),
+        ("text chunk 16 MiB", [{"shapes": [{"text": ("abcdefg" + chr(10)) * MIB}]}]),
+        ("group chain x100k", [{"shapes": [{"id": k, "parent": k - 1 if k > 1 else 0, "text": "g",
+                                            "pin": (1.0, 1.0, 0.5, 0.5)} for k in range(1, 100_001)]}]),
+        ("group chain x100k rev", [{"shapes": [{"id": k, "parent": k - 1 if k > 1 else 0, "text": "g",
+                                                "pin": (1.0, 1.0, 0.5, 0.5)} for k in range(100_000, 0, -1)]}]),
+        ("png pictures x50k", [{"shapes": [{"type": 0x4E, "pin": (0.0, float(k)), "chunks": pic}
+                                           for k in range(50_000)]}]),
+        ("dib pictures x2k", [{"shapes": [{"type": 0x4E, "pin": (0.0, float(k)), "chunks": bmp}
+                                          for k in range(2_000)]}]),
+        ("field marks x1M", [{"shapes": [{"text": chr(0xFFFC) * 1_000_000,
+                                          "chunks": [(0xA1, number_field(1.5, 2), {"cid": k}) for k in range(50)]}]}]),
+    ]
+    for name, pages in cases:
+        _probe_doc(name, drawing(pages))
+
+
 def measure():
+    measure_vsd()
     # a pointer list pointing at itself, 100,000 times (the pointer cap and the visited set)
     lay = Layout()
     at = len(lay.body)
