@@ -22,7 +22,7 @@ def sniff(data: bytes) -> str | None:
         return "tiff"
     if h.startswith(b"RIFF") and h[8:12] == b"WEBP":
         return "webp"
-    if h.startswith((b"\xd7\xcd\xc6\x9a", b"\x01\x00\x09\x00")):
+    if h.startswith((b"\xd7\xcd\xc6\x9a", b"\x01\x00\x09\x00", b"\x02\x00\x09\x00")):  # placeable, memory, disk
         return "wmf"
     if h.startswith(b"\x01\x00\x00\x00") and data[40:44] == b" EMF":
         return "emf"

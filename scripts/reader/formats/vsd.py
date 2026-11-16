@@ -1,72 +1,132 @@
 # This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not
 # distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
-# Ported from libvisio a42aaff13e4a67afcd077c3abb3ef13bb6463025, src/lib/VSDParser.cpp, VSD6Parser.cpp, VSDFieldList.cpp, VSDContentCollector.cpp.
-"""Visio 2002-2013 (version 11) and Visio 2000 (version 6) drawings (vsd, vst) to the document model: one section per
-page, each shape's text and picture together in reading order, as vsdx gives them.
+# Ported from libvisio a42aaff13e4a67afcd077c3abb3ef13bb6463025, src/lib/VSDParser.cpp, VSD6Parser.cpp, VSD5Parser.cpp, VSDStencils.cpp, VSDFieldList.cpp, VSDContentCollector.cpp.
+"""Visio 2002-2013 (version 11), Visio 2000 (version 6) and Visio 5 drawings (vsd, vst) to the document model: one
+section per page, each shape's text and picture together in reading order, then the page's connection list, as vsdx
+gives them.
 
 Ported from libvisio (MPL-2.0) at a42aaff13e4a67afcd077c3abb3ef13bb6463025, `src/lib/`: `VSDParser.cpp`
-(`handleStream`'s page and shape context, `_handleLevelChange`, `readShape`, `readXFormData`, `readText`, `readName`,
-`readName2`, `readNameIDX`, `readNameIDX123`, `readFieldList`, `readTextField`, `readForeignDataType`,
-`readForeignData`), `VSD6Parser.cpp` (the 8-bit `readText`, `readName`, `readName2` and `readTextField`),
-`VSDFieldList.cpp` (`VSDFieldList::handle`'s order, the number and date formats of `VSDNumericField::getString`) and
-`VSDContentCollector.cpp` (a field mark taking the next field's value, `_handleForeignData`'s bitmap header and
-`computeBMPDataOffset`). The walk of the VisioDocument stream is `vsd_stream`'s; this module reads one walk of it.
+(`handleStream`'s page, stencil and shape context, `_handleLevelChange`, `readShape`, `readXFormData`, `readText`,
+`readName`, `readName2`, `readNameIDX`, `readNameIDX123`, `readFieldList`, `readTextField`, `readMisc`, `readFontIX`,
+`readForeignDataType`, `readForeignData`), `VSD6Parser.cpp` (the 8-bit `readText`, `readName`, `readName2`,
+`readTextField`, `readCharIX` and the v6 `readMisc`), `VSD5Parser.cpp` (`handleChunkRecords`, `readShape`,
+`readNameIDX`, `readTextField`, `readCharIX`, `readMisc`, the s16 `getUInt`), `VSDStencils.cpp` (`getStencilShape`:
+no master shape id is the stencil's first shape), `VSDFieldList.cpp` (`VSDFieldList::handle`'s order, the number and
+date formats of `VSDNumericField::getString`) and `VSDContentCollector.cpp` (a field mark taking the next field's
+value, the character runs of 8-bit text). The walk of the VisioDocument stream is `vsd_stream`'s; this module reads
+one walk of it.
 
 Context. As libvisio, by levels: a stream type 0x15 (outside the stencils, 0x1D) opens a page and its leave closes it,
-background pages (format bit 0 clear) included. A chunk 0x48, 0x47 or 0x4E in a page starts a shape; the chunks and
-streams deeper than it are the shape's, and the next step at its level or above ends it. Its id is the chunk's, else
-its stream's pointer index; its parent is the u32 at 10 of the shape chunk (0 or 0xFFFFFFFF: none).
+background pages (format bit 0 clear) included. A chunk 0x48, 0x47 or 0x4E in a page, or in a stencil page (0x1E),
+starts a shape; the chunks and streams deeper than it are the shape's, and the next step at its level or above ends
+it. Its id is the chunk's, else its stream's pointer index; readShape gives its parent and master: v6 and v11 the
+u32 at 10, the master page u32 at 18 and the master shape u32 at 26; v5 s16s at 2, 6 and 8, widened as getUInt does
+(0xFFFFFFFF: none).
+
+Visio 5 (VSD5Parser): 16-byte pointers and 12-byte chunks (`vsd_stream`); a list chunk (0x32, 0x65, 0x66, 0x68, 0x69,
+0x6A, 0x6B, 0x6C) holds records (handleChunkRecords: a record count u16 and the end offset u16 at its end, before them a
+table of (type u16, offset u16); a record runs from its offset, 4-aligned, to the previous one's offset), each read as
+a chunk of its type, id its place in offset order, one level deeper. Records that are shapes or lists themselves are
+not read (no recursion). A name list 0x32 starts a new name map, as in v6 (libvisio's v5 keeps adding to the old one).
+Then v5 is read as v6, with its own layouts: the name index 0xC9 (u16 count, then u16 name id and u16 element id),
+readName2's s16 skip, the text field (the cell type at 3, a name id s16 or a double at 4, its format unknown, so a
+number field shows nothing, as libvisio), the CharIX run (u16 count, u16 font) and readMisc (the flags only: no glued
+ends, so no v5 connector is listed).
 
 Content of a shape: 0x9B gives PinX, PinY, LocPinX and LocPinY (a unit byte before each double); 0x0E is the text, 8
-bytes skipped then UTF-16LE (v11) or 8-bit (v6, `text.decode_8bit` with 0x0409); 0x2C and 0x2D its names, 0x66 the
-field order and 0xA1 its fields (a string field shows the shape name it points at, a number field its value in its
-format, found from 0x36 (v11) or 0x24 (v6) of the chunk); each field mark (U+FFFC, or the byte 0x1E in 8-bit text)
-takes the next field's value. 0x98 gives the picture's type and format, 0x0C its bytes: a DIB (type 1, format 0) gets
-the file header libvisio writes for it and becomes a PNG through `images.bmp_to_png`; other bitmaps and metafiles
-(types 0 and 4: EMF, WMF) are kept as they are, so the renderer shows the PNG, JPEG and GIF and lists the rest as
-assets. An OLE object (type 2) is counted `object`.
+bytes skipped then UTF-16LE (v11) or 8-bit (v5, v6); 0x2C and 0x2D its names, 0x66 the field order and 0xA1 its fields
+(a string field shows the shape name it points at, a number field its value in its format, found from 0x36 (v11) or
+0x24 (v6) of the chunk); each field mark (U+FFFC, or the byte 0x1E in 8-bit text) takes the next field's value.
+readFieldList reads only when the chunk header has a trailer; `vsd_stream` gives 0x66 chunks a trailer in v6 and v11,
+so here it always reads. 8-bit text is decoded run by run (0x94 CharIX: its character count and font id; a count of
+0 still covers one character, as the collector's loop does; past the runs the last one goes on): a font (0x19
+FontIX, by chunk id, the last of an id winning) names its charset in the low byte at 2, and a charset of 0 is found
+from the font name's suffix (" CE", " Cyrillic", ...: readFontIX). CHARSET_LID maps the charset to a codec (decision
+8); any other charset, and text with no run, is 0x0409 (cp1252). libvisio decodes the bytes before a run boundary in
+the next run's charset; here each run's bytes are its own.
 
-Page names: 0x32 starts the name list, each 0x33 is one name (a u32, then text to a NUL); a name index 0xC9 (u32
-count, 13-byte records: name id, name id, element id, a byte) or 0x34 (u32 pairs) maps element ids to names for the
-streams one level above it, so a page takes the name its pointer index maps to at its level + 1. A page without one is
-numbered.
+0xA4 (readMisc) gives the hidden-text flag (0x20 of its first byte) and, from 45 (v11) or 23 (v6), blocks of a u32
+length: a glue block (type 2 at 4, 0x74 at 6, 0x6000004E at 7, the shape id at 11, 0x7A at 15, 0x40000073 at 16)
+gives the connector's begin id, the next one its end id. Probed on the bench samples: the glued connectors' misc
+chunks hold their blocks at these offsets, inside the chunk's data; libvisio may read into the chunk's trailer, here
+the blocks stop at the data's end.
 
-Output: `Section("page", title=name)`; the shapes, each its text `Para` (through `vsdx._inlines`) and its picture,
-sorted by (-PinY, PinX) on the page, a shape's PinY and PinX added to its group's origin (the group's own origin plus
-its Pin less its LocPin, as vsdx places sub-shapes); shapes without an XForm follow in walk order. Masters, connection
-lists, hidden text and macros are not read here. Visio 5 (version 5) is refused as `unsupported` ("Visio 5 drawing"):
-its shape, field and name-index layouts differ (VSD5Parser) and are not read.
+Masters. The first stencil list (0x1D) is read (libvisio's `m_stencils.count()`: one with a stencil page read ends the
+reading of later ones); each stencil page (0x1E) is keyed by its pointer index, up to `vsdx.MASTERS` pages, and its
+shapes by id (the last of an id wins; the first shape read is the page's first shape). A stencil shape's text is read
+as a page shape's, fields and runs included, once, and charged to a stencil room of `limits.MAX_OUTPUT` characters a
+document (past it the shape is lost, and the shapes that would inherit it count `stencil`). A shape naming a master
+page and shape (libvisio's getStencilShape: no master shape id is that page's first shape) takes its text when it has
+no text chunk of its own, and its hidden flag when it has no misc chunk of its own (v5 copies no misc, as libvisio).
+Only completed stencil pages are looked in, so a stencil shape naming its own page, itself, or a page read later
+inherits nothing and no lookup loops. A master page not read (past MASTERS, absent, or after the pages in the walk)
+gives nothing, and a shape that would have inherited its text counts `stencil`; a master page without that shape
+gives nothing, uncounted. libvisio adds a stencil shape when its stream ends; here every shape of a stencil page is
+added (a group master's sub-shapes too), so a stencil's first shape is the group, as vsdx's first top-level shape.
+Pictures are not inherited.
+
+Output: `Section("page", title=name)`; the shapes, each its text `Para` (hidden="hidden" when its text is hidden) and
+its picture, sorted by (-PinY, PinX) on the page, a shape's PinY and PinX added to its group's origin (the group's own
+origin plus its Pin less its LocPin, as vsdx places sub-shapes); shapes without an XForm follow in walk order. Then
+`vsdx.connections` of the connectors glued at both ends, in walk order, through the document's one
+`vsdx.ConnectionBudget`: "A → B (label)", A and B the ends' `vsdx.name_of` (their shown text; hidden text never names
+a shape), the label the connector's shown text, which leaves the shape flow (hidden connector text stays in the flow,
+hidden). A `_VBA_PROJECT_CUR` storage counts `vba` once; macros are never read.
+
+Page names: 0x32 starts the name list, each 0x33 is one name (a u32, s16 in v5, then text to a NUL); a name index
+0xC9 (u32 count, 13-byte records: name id, name id, element id, a byte) or 0x34 (u32 pairs) maps element ids to
+names for the streams one level above it, so a page takes the name its pointer index maps to at its level + 1. A page
+without one, or whose lookup fails (counted `page`), is numbered and keeps its shapes.
 
 Bounds (each read at call time): `vsd_stream`'s for the walk; `limits.BIN_RECORDS` items a document for the loops this
-module runs over chunk data (name index records, field order entries, field format blocks, field marks), the first
-refusal counted `record` once; `ctx.guard("page")` and `ctx.guard("shape")` around every page and shape, a failed
-one left out; a shape's text cut at `vsdx.MAX_TEXT` characters (counted `text`), then charged to the document's
-`limits.MAX_OUTPUT` room as vsdx charges it (its characters and `vsdx.LINE` for each line break; past it the text is
-left out, counted `text`); picture bytes charged to `limits.IMAGE_BYTES` a document, each placement (past it
-counted `image`); group chains deeper than `limits.MAX_DEPTH` left out, counted `depth` once a page. Text and names
-are cut to their caps before they are decoded, and nothing is allocated from a declared count.
+module runs over chunk data (v5 records, name index records, field order entries, field format blocks, misc blocks),
+the first refusal counted `record` once; `ctx.guard("page")` and `ctx.guard("shape")` around every page and shape, a
+failed one left out; a shape's text cut at `vsdx.MAX_TEXT` characters (only when the bytes past it hold more than NULs
+and blanks), its names kept up to MAX_TEXT characters in all (a field showing a name not kept marks its text cut), its
+character runs up to MAX_TEXT; then charged to the document's `limits.MAX_OUTPUT` room as vsdx charges it (its
+characters and `vsdx.LINE` for each line break) and LINE more for each block emitted, a picture LINE; past the room
+it is left out. Each cut or refusal counts once, `text` for own text, `stencil` for inherited, `image` for a
+picture; blank text never counts. Pictures: a DIB gets its file header from `officeart.dib_to_bmp` and becomes a PNG;
+each picture's emitted bytes are charged to `limits.IMAGE_BYTES` a document (past it counted `image`). Group chains
+deeper than `limits.MAX_DEPTH` are left out, counted `depth` once a page. Masters up to `vsdx.MASTERS` pages; edges
+kept per page up to the budget's room and one more. Text and names are cut to their caps before they are decoded, and
+nothing is allocated from a declared count.
 """
 import datetime
 import math
 import struct
 
-from .. import images, limits, text as textmod
+from .. import images, limits, officeart, text as textmod
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Image, Para, Section
-from . import cfb_route, vsd_stream, vsdx
+from . import cfb_route, vsd_stream, vsdx, zip_route
+from .vsd_stream import Chunk
 
 PAGE = 0x15
-STENCILS = 0x1D
+STENCILS, STENCIL_PAGE = 0x1D, 0x1E
 SHAPES = frozenset((0x47, 0x48, 0x4E))
 NAME_LIST2, NAME2 = 0x32, 0x33
 NAME_INDEXES = (0xC9, 0x34)
+FONT = 0x19
+V5_LISTS = frozenset((0x32, 0x65, 0x66, 0x68, 0x69, 0x6A, 0x6B, 0x6C))  # VSD5Parser's handleChunkRecords callers
 NONE = 0xFFFFFFFF          # libvisio's MINUS_ONE
-LID = 0x0409               # 8-bit text's code page (decision 8)
-MARK = "\ufffc"             # a field's place in UTF-16 text
+LID = 0x0409               # 8-bit text's code page without a font charset (decision 8)
+MARK = "￼"             # a field's place in UTF-16 text
 STRING_CELL, DATE_CELL = 232, 40
 UNKNOWN_FORMAT = 0xFFFF
+FONT_NAME = 256            # bytes of a FontIX name looked at for its charset suffix
 _D = struct.Struct("<d")
+_BLANKS = b"\x00 \t\r\n"
+_SCAN = 1 << 16
+
+# a font's charset to its codec (decision 8; N16: straight to a codec, rtf_lex untouched)
+CHARSET_LID = {128: "cp932", 129: "cp949", 134: "gbk", 136: "cp950", 161: "cp1253", 162: "cp1254", 163: "cp1258",
+               177: "cp1255", 178: "cp1256", 186: "cp1257", 204: "cp1251", 222: "cp874", 238: "cp1250"}
+# readFontIX: a charset of 0 from the name. " CE" must end the name; the others may stand anywhere in it after its
+# first character (std::string::rfind from length - n), and "GOST" anywhere
+_NAME_CHARSETS = ((b" Cyrillic", 0xCC), (b" Cyr", 0xCC), (b" CYR", 0xCC), (b" Baltic", 0xBA), (b" Greek", 0xA1),
+                  (b" Tur", 0xA2), (b" TUR", 0xA2), (b" Hebrew", 0xB1), (b" Arabic", 0xB2), (b" Thai", 0xDE))
 
 # VSDFieldList.cpp: unit strings and the factor from Visio's stored unit, by cell type
 _UNITS = {33: "%", 36: " acres", 37: " ha", 43: " ew.", 44: " ed.", 45: " eh.", 46: " em.", 47: " es.", 50: " pt",
@@ -95,15 +155,56 @@ _MONTHS = ("January", "February", "March", "April", "May", "June", "July", "Augu
 
 
 def _f64(data, at):
-    """The double at `at`, finite and clamped to vsdx.COORD, else None (also when it does not fit)."""
+    """The double at `at`, finite and clamped to vsdx.COORD, else None (also when it does not fit): a coordinate."""
+    v = _double(data, at)
+    return None if v is None else max(-vsdx.COORD, min(vsdx.COORD, v))
+
+
+def _double(data, at):
+    """The double at `at` when it fits and is finite, else None: a field's value, not clamped."""
     if at + 8 > len(data):
         return None
     v = _D.unpack_from(data, at)[0]
-    return max(-vsdx.COORD, min(vsdx.COORD, v)) if math.isfinite(v) else None
+    return v if math.isfinite(v) else None
 
 
 def _u32(data, at, default=0):
     return struct.unpack_from("<I", data, at)[0] if at + 4 <= len(data) else default
+
+
+def _s16w(data, at, default=0):
+    """VSD5Parser::getUInt: an s16 widened to unsigned 32 bits (-1 is 0xFFFFFFFF)."""
+    return struct.unpack_from("<h", data, at)[0] & NONE if at + 2 <= len(data) else default
+
+
+def _blank_after(data, at, wide) -> bool:
+    """True when the bytes of `data` from `at` hold only NULs and blanks (UTF-16 units when `wide`), so text cut
+    there loses nothing. Read in blocks of _SCAN bytes: the chunk is the walk's, nothing is copied whole."""
+    n = len(data)
+    if wide and at < n:
+        n -= (n - at) % 2
+    for i in range(at, n, _SCAN):
+        blk = bytes(data[i:min(i + _SCAN, n)])
+        if wide:
+            if blk[1::2].strip(b"\x00") or blk[0::2].translate(None, _BLANKS):
+                return False
+        elif blk.translate(None, _BLANKS):
+            return False
+    return True
+
+
+def _name_charset(name: bytes) -> int:
+    n = len(name)
+    if n > 3 and name.endswith(b" CE"):
+        return 0xEE
+    for suffix, charset in _NAME_CHARSETS:
+        if n > len(suffix) and suffix in name:
+            return charset
+    return 0xCC if n >= 4 and b"GOST" in name else 0
+
+
+def _decode(data, codec) -> str:
+    return bytes(data).decode(codec, "replace") if codec else textmod.decode_8bit(data, LID)
 
 
 def _fixed(value, places, unit=""):
@@ -125,14 +226,16 @@ def _date(fmt, value) -> str:
 
 
 def number(fmt: int, cell: int, value: float) -> str:
-    """A number field's shown value (VSDNumericField::getString); "" for an unknown format."""
+    """A number field's shown value (VSDNumericField::getString); "" for the unknown format 0xFFFF; a format the
+    switch does not name is the plain value with four decimals (RVNGDoubleProp)."""
     if fmt == UNKNOWN_FORMAT or not math.isfinite(value):
         return ""
+    own = cell
     if cell in (63, 64):  # drawing and page units: the drawing's unit, not read here
         cell = 0
     if cell == 80:        # angle units
         cell = 83 if fmt == 11 else 81 if fmt == 12 else 82
-    if cell == 82 and fmt == 1:
+    if own == 82 and fmt == 1:  # the cell's own type, as libvisio tests it
         fmt = 12
     scaled = value * _SCALE.get(cell, 1.0)
     unit = _UNITS.get(cell, "")
@@ -143,60 +246,74 @@ def number(fmt: int, cell: int, value: float) -> str:
         return _fixed(scaled, 4, unit)
     if fmt == 12:
         if cell == 82:
-            deg, frac = divmod(value * 57.2957795, 1.0) if value >= 0 else (math.trunc(value * 57.2957795),
-                                                                            math.fmod(value * 57.2957795, 1.0))
-            minutes = math.trunc(frac * 60)
-            return f"{deg:.0f} deg {minutes:.0f} min {60.0 * (frac * 60 - minutes):.0f} sec"
+            frac, deg = math.modf(value * 57.2957795)
+            mfrac, minutes = math.modf(frac * 60)
+            return f"{deg:.0f} deg {minutes:.0f} min {60.0 * mfrac:.0f} sec"
         return _fixed(scaled, 0, unit)
     if fmt in _DATES:
         return _date(_DATES[fmt], value)
-    return f"{value:g}"
-
-
-def bmp_file(dib) -> bytes:
-    """A DIB with the BITMAPFILEHEADER libvisio writes before it (computeBMPDataOffset): the pixel offset past the
-    info header and its palette; a BI_BITFIELDS header of 40 bytes also passes its three masks."""
-    n = len(dib)
-    head = _u32(dib, 0, 40)
-    if head > n:
-        head = 40
-    off = head
-    bpp = struct.unpack_from("<H", dib, 14)[0] if n >= 16 else 0
-    bpp = next((b for b in (1, 4, 8, 16, 24, 32) if b >= min(bpp, 32)), 32)
-    colors = _u32(dib, 32)
-    if bpp < 16 and colors == 0:
-        colors = 1 << bpp
-    if 0 < colors < (n - off) // 4:
-        off += 4 * colors
-    if head == 40 and _u32(dib, 16) == 3:
-        off += 12
-    return b"BM" + struct.pack("<IHHI", n + 14, 0, 0, off + 14) + bytes(dib)
+    return f"{value:.4f}"
 
 
 class _Shape:
-    __slots__ = ("sid", "level", "parent", "pin", "text", "cut", "names", "order", "fields", "ftype", "fformat",
-                 "data", "broken")
+    __slots__ = ("sid", "level", "parent", "master", "home", "pin", "text", "cut", "names", "names_size",
+                 "names_cut", "order", "fields", "ftype", "fformat", "data", "broken", "has_misc", "hide", "begin",
+                 "end", "runs")
 
-    def __init__(self, sid, level, parent):
-        self.sid, self.level, self.parent = sid, level, parent
+    def __init__(self, sid, level, parent, master, home):
+        self.sid, self.level, self.parent, self.master, self.home = sid, level, parent, master, home
         self.pin = None       # [PinX, PinY, LocPinX, LocPinY], each None when absent
-        self.text = None      # the text chunk's bytes, cut to MAX_TEXT characters
-        self.cut = False      # the text chunk held more
-        self.names = {}       # 0x2D: name id -> bytes
+        self.text = None      # the text chunk's bytes, cut to MAX_TEXT characters; None: no text chunk
+        self.cut = False      # the text chunk held more than blanks past the cut
+        self.names = {}       # 0x2D: name id -> bytes, MAX_TEXT characters in all
+        self.names_size = 0
+        self.names_cut = False
         self.order = None     # 0x66: field ids in order
         self.fields = {}      # 0xA1: field id -> ("s", name id) or ("n", format, cell, value)
         self.ftype = self.fformat = None
         self.data = None
         self.broken = False
+        self.has_misc = False  # a misc chunk of its own sets the hidden flag
+        self.hide = False
+        self.begin = self.end = None  # glued ends (readMisc)
+        self.runs = None      # 8-bit text's runs: [(count, codec)]
+
+
+class _Entry:
+    """A stencil shape as its inheritors see it: its text (fields resolved), cut, hidden flag; inlines built once."""
+    __slots__ = ("text", "cut", "hide", "_inlines")
+
+    def __init__(self, text, cut, hide):
+        self.text, self.cut, self.hide, self._inlines = text, cut, hide, None
+
+    def inlines(self):
+        if self._inlines is None:
+            self._inlines = vsdx._inlines(self.text.strip("\n"))
+        return self._inlines
+
+
+_EMPTY = _Entry("", False, False)  # the master page has no such shape
+_LOST = _Entry("", False, False)   # the stencil room was spent on it
+
+
+class _Stencil:
+    __slots__ = ("ptr", "idx", "shapes", "first")
+
+    def __init__(self, ptr, idx):
+        self.ptr, self.idx = ptr, idx
+        self.shapes = {}      # shape id -> _Entry
+        self.first = NONE
 
 
 class _Page:
-    __slots__ = ("ptr", "title", "entries", "ids", "broken")
+    __slots__ = ("ptr", "title", "entries", "ids", "names", "edges")
 
     def __init__(self, ptr):
-        self.ptr, self.title, self.broken = ptr, "", False
+        self.ptr, self.title = ptr, ""
         self.entries = []     # (parent, PinX, PinY, blocks) of the shapes that show something, in walk order
         self.ids = {}         # shape id -> (parent, PinX, PinY, LocPinX, LocPinY), the first shape of an id
+        self.names = {}       # shape id -> its shown text (the first shape of an id with some)
+        self.edges = []       # (begin id, end id, label) of the connectors glued at both ends
 
 
 class _Reader:
@@ -206,10 +323,17 @@ class _Reader:
         self.items = limits.BIN_RECORDS  # chunk-data items the document may still read (see `take`)
         self.items_cut = False
         self.room = limits.MAX_OUTPUT    # shape text the document may still emit (vsdx's charge)
+        self.stencil_room = limits.MAX_OUTPUT  # stencil shape text the document may keep
         self.image_bytes = 0
+        self.budget = vsdx.ConnectionBudget(ctx)
         self.names = {}       # libvisio's m_names: 0x33 id -> its bytes; a 0x32 starts a new one
         self.index = {}       # level -> [name index chunk data, its type, the names it maps to, parsed or None]
+        self.fonts = {}       # 0x19 id -> codec (None: LID)
         self.stencil = 0      # stencil (0x1D) streams entered and not left
+        self.collecting = False  # this stencil list is read (no stencil page read before it)
+        self.spage = None     # the stencil page being read
+        self.spages = {}      # completed stencil pages by pointer index
+        self.masters_read = 0
         self.pages = []       # pages open (nested pages close first)
         self.shape = None
         self.stream_sid = NONE  # the pointer index of the shape stream last entered (libvisio's m_currentShapeID)
@@ -251,6 +375,12 @@ class _Reader:
         t = step.pointer.type
         if t == STENCILS:
             self.stencil += 1
+            if self.stencil == 1:
+                self.collecting = not self.spages
+        elif t == STENCIL_PAGE:
+            if self.stencil and self.collecting and self.spage is None and self.masters_read < vsdx.MASTERS:
+                self.masters_read += 1
+                self.spage = _Stencil(step.pointer, step.index)
         elif t == PAGE and not self.stencil:
             self.start_page(step)
         elif t in SHAPES:
@@ -260,22 +390,46 @@ class _Reader:
         t = step.pointer.type
         if t == STENCILS:
             self.stencil -= 1
+        elif t == STENCIL_PAGE and self.spage is not None and self.spage.ptr is step.pointer:
+            if self.shape is not None:
+                self.flush()
+            self.spages[self.spage.idx] = self.spage
+            self.spage = None
         elif t == PAGE and self.pages and self.pages[-1].ptr is step.pointer:
             self.end_page()
 
+    def home(self):
+        """Where a shape starting now belongs: the stencil page being read, the open page, or None."""
+        if self.stencil:
+            return self.spage
+        return self.pages[-1] if self.pages else None
+
     def chunk(self, step):
         c = step.chunk
+        if self.v == 5 and c.type in V5_LISTS:
+            if c.type == NAME_LIST2:
+                self.names = {}
+            level = step.level + 1
+            for i, (t, data) in enumerate(self.records(c.data)):
+                if t not in SHAPES and t not in V5_LISTS:
+                    self.dispatch(Chunk(t, i, 0, level, data), level, None)
+            return
+        self.dispatch(c, step.level, step)
+
+    def dispatch(self, c, level, step):
         t = c.type
         if t == NAME_LIST2:
             self.names = {}
         elif t == NAME2:
             self.names[c.id] = bytes(c.data[:4 + 2 * vsdx.MAX_TITLE + 2])  # all name2 reads
         elif t in NAME_INDEXES:
-            self.index[step.level] = [bytes(c.data), t, self.names, None]
-        elif not self.pages or self.stencil:
-            return
+            self.index[level] = [bytes(c.data), t, self.names, None]
+        elif t == FONT:
+            if not self.wide:
+                self.font(c)
         elif t in SHAPES:
-            self.start_shape(step)
+            if step is not None and self.home() is not None:
+                self.start_shape(step)
         elif self.shape is not None and not self.shape.broken:
             handler = _HANDLERS.get(t)
             if handler is not None:
@@ -289,23 +443,51 @@ class _Reader:
         if not ok:
             s.broken = True
 
+    def records(self, data) -> list:
+        """VSD5Parser::handleChunkRecords: [(type, data)] of a v5 list chunk's records in offset order, each from its
+        4-aligned offset to the previous record's offset (the first to the end offset); a later record at the same
+        offset replaces the earlier. The table's entries take from the item meter."""
+        n = len(data)
+        if n < 4:
+            return []
+        num = struct.unpack_from("<H", data, n - 4)[0]
+        head = n - 4 * (num + 1)
+        if head <= 0:
+            return []
+        end = min(struct.unpack_from("<H", data, n - 2)[0], head)
+        found = {}
+        for i in range(self.take(num)):
+            t, off = struct.unpack_from("<HH", data, head + 4 * i)
+            start = (off + 3) // 4 * 4
+            if start < end:
+                found[start] = (t, end - start)
+                end = off
+        return [(t, data[at:at + length]) for at, (t, length) in sorted(found.items())]
+
+    def font(self, c):
+        """readFontIX: the charset in the low byte at 2 (of a u32; an s16 in v5); 0 is found from the name after it."""
+        d, at = c.data, (4 if self.v == 5 else 6)
+        if len(d) < at:
+            return
+        charset = d[2]
+        if not charset:
+            charset = _name_charset(bytes(d[at:at + FONT_NAME]).split(b"\x00", 1)[0])
+        self.fonts[c.id] = CHARSET_LID.get(charset)
+
     # ---- pages
     def start_page(self, step):
         page = _Page(step.pointer)
         self.pages.append(page)
         self.started += 1
-        ok = False
-        with self.ctx.guard("page"):
-            page.title = (self.page_name(step.index, step.level + 1).strip() or str(self.started))[:vsdx.MAX_TITLE]
-            ok = True
-        page.broken = not ok
+        title = ""
+        with self.ctx.guard("page"):  # a failed lookup numbers the page; its shapes stay
+            title = self.page_name(step.index, step.level + 1).strip()
+        page.title = (title or str(self.started))[:vsdx.MAX_TITLE]
 
     def end_page(self):
         if self.shape is not None:
             self.flush()
         page = self.pages.pop()
-        if page.broken:
-            return
         sec = None
         with self.ctx.guard("page"):
             sec = self.finish(page)
@@ -323,10 +505,17 @@ class _Reader:
         return self.name2(raw) if raw is not None else ""
 
     def parse_index(self, data, kind, names) -> dict:
-        """{element id: name bytes} of a name index (readNameIDX: u32 count and 13-byte records; readNameIDX123: u32
-        pairs to the end), the later record of an element winning."""
+        """{element id: name bytes} of a name index (readNameIDX: u32 count and 13-byte records, v5 u16 count and
+        (u16 name id, u16 element id); readNameIDX123: u32 pairs to the end), the later record of an element
+        winning."""
         out = {}
-        if kind == 0xC9:
+        if kind == 0xC9 and self.v == 5:
+            count = min(struct.unpack_from("<H", data, 0)[0] if len(data) >= 2 else 0, max(len(data) - 2, 0) // 4)
+            for i in range(self.take(count)):
+                name_id, element = struct.unpack_from("<HH", data, 2 + 4 * i)
+                if name_id in names:
+                    out[element] = names[name_id]
+        elif kind == 0xC9:
             count = min(_u32(data, 0), max(len(data) - 4, 0) // 13)
             for i in range(self.take(count)):
                 at = 4 + 13 * i
@@ -341,12 +530,13 @@ class _Reader:
         return out
 
     def name2(self, raw) -> str:
-        """A 0x33 name: a u32, then text to its NUL, cut to MAX_TITLE characters before it is decoded."""
+        """A 0x33 name: a u32 (v5 an s16), then text to its NUL, cut to MAX_TITLE characters before it is decoded."""
         if self.wide:
             body = bytes(raw[4:4 + 2 * vsdx.MAX_TITLE + 2])
             body = body[:len(body) // 2 * 2].decode("utf-16-le", "replace")
             return body.split("\x00", 1)[0]
-        body = bytes(raw[4:4 + vsdx.MAX_TITLE + 1]).split(b"\x00", 1)[0]
+        skip = 2 if self.v == 5 else 4
+        body = bytes(raw[skip:skip + vsdx.MAX_TITLE + 1]).split(b"\x00", 1)[0]
         return textmod.decode_8bit(body, LID)
 
     def finish(self, page) -> Section:
@@ -370,6 +560,10 @@ class _Reader:
             sec.blocks.extend(blocks)
         for blocks in loose:
             sec.blocks.extend(blocks)
+        edges = self.budget.take(page.edges)
+        names = {sid: vsdx.name_of(page.names[sid], "", "", sid)
+                 for b, e, _ in edges for sid in (b, e) if sid in page.names}
+        sec.blocks.extend(vsdx.connections(edges, names))
         return sec
 
     @staticmethod
@@ -410,23 +604,102 @@ class _Reader:
         c = step.chunk
         sid = c.id if c.id != NONE else self.stream_sid
         self.stream_sid = NONE
-        self.shape = _Shape(sid, step.level, _u32(c.data, 10))
+        d = c.data
+        if self.v == 5:
+            parent, master = _s16w(d, 2), (_s16w(d, 6, NONE), _s16w(d, 8, NONE))
+        else:
+            parent, master = _u32(d, 10), (_u32(d, 18, NONE), _u32(d, 26, NONE))
+        self.shape = _Shape(sid, step.level, parent, master, self.home())
 
     def flush(self):
         s, self.shape = self.shape, None
-        if s.broken or not self.pages:
+        if s.broken or s.home is None:
             return
-        page = self.pages[-1]
-        ok = False
         with self.ctx.guard("shape"):
-            blocks = []
-            text = self.text_of(s)
-            if text:
-                blocks.append(Para(vsdx._inlines(text.strip("\n"))))
-            blocks.extend(self.picture(s))
-            ok = True
-        if not ok:
-            return
+            if isinstance(s.home, _Page):
+                self.place(s, s.home)
+            else:
+                self.keep(s, s.home)
+
+    def master_shape(self, page_id, shape_id):
+        """The stencil shape a shape names (getStencilShape over completed stencil pages): its _Entry; _EMPTY when
+        the page lacks that shape; None when the page is not read or the shape was lost to the stencil room."""
+        page = self.spages.get(page_id)
+        if page is None:
+            return None
+        e = page.shapes.get(page.first if shape_id == NONE else shape_id)
+        if e is None:
+            return _EMPTY
+        return None if e is _LOST else e
+
+    def inherited(self, s):
+        """(entry, hidden) for shape `s`: the master shape when it may give the text or the hidden flag."""
+        entry = None
+        if s.master[0] != NONE and (s.text is None or not s.has_misc):
+            entry = self.master_shape(*s.master)
+        if s.has_misc:
+            return entry, s.hide
+        return entry, bool(entry is not None and self.v != 5 and entry.hide)  # v5 copies no misc
+
+    def keep(self, s, spage):
+        """A stencil shape: its text resolved once and kept (charged to the stencil room) for its inheritors."""
+        entry, hide = self.inherited(s)
+        if s.text is not None:
+            text, cut = self.text_of(s)
+        elif entry is not None:
+            text, cut = entry.text, entry.cut
+        else:
+            text, cut = "", False
+        if not text.strip():
+            text = ""
+        cost = len(text) + vsdx.LINE * (text.count("\n") + text.count("\r"))
+        if cost > self.stencil_room:
+            spage.shapes[s.sid] = _LOST
+        else:
+            self.stencil_room -= cost
+            spage.shapes[s.sid] = _Entry(text, cut, hide)
+        if spage.first == NONE:
+            spage.first = s.sid
+
+    def place(self, s, page):
+        """A page shape: its text (its own, else its master's), hidden flag, glued ends and picture."""
+        entry, hidden = self.inherited(s)
+        kind, inlines = "text", None
+        if s.text is not None:
+            text, cut = self.text_of(s)
+        elif s.master[0] == NONE:
+            text, cut = "", False
+        elif entry is None:  # the master is not read: its text is lost
+            self.ctx.skipped["stencil"] += 1
+            text, cut = "", False
+        else:
+            text, cut, kind = entry.text, entry.cut, "stencil"
+        glued = s.begin is not None and s.end is not None
+        show = hidden or not glued  # a glued connector's shown text is its label in the connection list
+        if text.strip():
+            cost = len(text) + vsdx.LINE * (text.count("\n") + text.count("\r") + show)
+            if cost > self.room:
+                self.ctx.skipped[kind] += 1
+                text = ""
+            else:
+                self.room -= cost
+                if cut:
+                    self.ctx.skipped[kind] += 1
+                if kind == "stencil":
+                    inlines = entry.inlines()
+        else:
+            text = ""
+            if cut:
+                self.ctx.skipped[kind] += 1
+        if text and not hidden and s.sid not in page.names:  # hidden text never names a shape
+            page.names[s.sid] = text
+        if glued and len(page.edges) <= self.budget.room:  # one past the room, so the budget sees the cut
+            page.edges.append((s.begin, s.end, "" if hidden else text))
+        blocks = []
+        if text and show:
+            blocks.append(Para(inlines if inlines is not None else vsdx._inlines(text.strip("\n")),
+                               hidden="hidden" if hidden else ""))
+        blocks.extend(self.picture(s))
         pin = s.pin or (None, None, None, None)
         if s.sid not in page.ids and (s.pin is not None or s.parent not in (0, NONE)):
             page.ids[s.sid] = (s.parent, *pin)
@@ -444,17 +717,26 @@ class _Reader:
         s.pin = pin
 
     def text(self, s, data):
-        """readText: 8 bytes skipped, the rest kept up to MAX_TEXT characters (the chunk's last wins)."""
+        """readText: 8 bytes skipped, the rest kept up to MAX_TEXT characters (the chunk's last wins); cut when the
+        bytes past that hold more than NULs and blanks."""
         cap = vsdx.MAX_TEXT * (2 if self.wide else 1)
         s.text = bytes(data[8:8 + cap])
-        s.cut = len(data) - 8 > cap
+        s.cut = not _blank_after(data, 8 + cap, self.wide)
 
     def name_list(self, s, data):
-        s.names = {}
+        s.names, s.names_size, s.names_cut = {}, 0, False
 
     def listed(self, s, c):
-        """readName (0x2D): a shape name a string field shows, kept up to MAX_TEXT characters."""
-        s.names[c.id] = bytes(c.data[:vsdx.MAX_TEXT * (2 if self.wide else 1)])
+        """readName (0x2D): a shape name a string field shows; the shape keeps MAX_TEXT characters of names in all,
+        a name past that is not kept (a field showing it marks the text cut)."""
+        unit = 2 if self.wide else 1
+        size = len(c.data) // unit
+        if c.id in s.names or s.names_size + size > vsdx.MAX_TEXT:
+            if c.id not in s.names:
+                s.names_cut = True
+            return
+        s.names[c.id] = bytes(c.data[:size * unit])
+        s.names_size += size
 
     def field_list(self, s, data):
         """readFieldList: a sub-header length, the children list length, the sub-header, then the field ids (u32);
@@ -469,6 +751,48 @@ class _Reader:
     def field(self, s, c):
         self.text_field(s, c.id, c.data)
 
+    def misc(self, s, data):
+        """readMisc: the hidden-text flag; v6 and v11 also the glue blocks giving the connector's begin, then end id
+        (each block one item of the meter, read until both ends are found or the data ends)."""
+        if not len(data):
+            return
+        s.has_misc = True
+        s.hide = bool(data[0] & 0x20)
+        if self.v == 5:
+            return
+        at, n = (45 if self.wide else 23), len(data)
+        while at + 4 <= n and (s.begin is None or s.end is None) and self.take(1):
+            length = struct.unpack_from("<I", data, at)[0]
+            if not length:
+                break
+            if (at + 20 <= n and data[at + 4] == 2 and data[at + 6] == 0x74
+                    and struct.unpack_from("<I", data, at + 7)[0] == 0x6000004E and data[at + 15] == 0x7A
+                    and struct.unpack_from("<I", data, at + 16)[0] == 0x40000073):
+                sid = struct.unpack_from("<I", data, at + 11)[0]
+                if s.begin is None:
+                    s.begin = sid
+                else:
+                    s.end = sid
+            at += length
+
+    def char_ix(self, s, data):
+        """readCharIX of 8-bit text: the run's character count (u32, v5 u16) and font id (u16), the font's codec as
+        it is when the run is read; MAX_TEXT runs a shape."""
+        if self.wide:
+            return
+        if self.v == 5:
+            if len(data) < 4:
+                return
+            count, font = struct.unpack_from("<HH", data, 0)
+        else:
+            if len(data) < 6:
+                return
+            count, font = struct.unpack_from("<IH", data, 0)
+        if s.runs is None:
+            s.runs = []
+        if len(s.runs) < vsdx.MAX_TEXT:
+            s.runs.append((count, self.fonts.get(font)))
+
     def foreign_type(self, s, data):
         """readForeignDataType: the type u16 at 36 (4 when the map mode u16 at 38 is 8), the format u32 at 49."""
         if len(data) < 40:
@@ -482,18 +806,27 @@ class _Reader:
 
     # ---- a shape's text and picture
     def text_field(self, s, cid, data):
-        """readTextField (v11 and v6): the cell type at 7; a string field's name id at 8, a number's value at 8 and
-        its format in the block (index 2, then 0x80 0xC2) found from 0x36 (v11) or 0x24 (v6); the first of an id
-        wins."""
-        if cid in s.fields or len(data) < 8:
+        """readTextField: v6 and v11 the cell type at 7, a string field's name id at 8, a number's value at 8 and
+        its format in the block (index 2, then 0x80 0xC2) found from 0x36 (v11) or 0x24 (v6); v5 the cell type at
+        3, the name id (s16) or value at 4, the format unknown. The first of an id wins."""
+        if cid in s.fields:
             return
-        cell = data[7]
+        cell_at = 3 if self.v == 5 else 7
+        if len(data) <= cell_at:
+            return
+        cell = data[cell_at]
         if cell == STRING_CELL:
-            if len(data) >= 12:
+            if self.v == 5:
+                if len(data) >= 6:
+                    s.fields[cid] = ("s", struct.unpack_from("<h", data, 4)[0])
+            elif len(data) >= 12:
                 s.fields[cid] = ("s", struct.unpack_from("<i", data, 8)[0])
             return
-        value = _f64(data, 8) if len(data) >= 16 else None
+        value = _double(data, cell_at + 1)
         if value is None:
+            return
+        if self.v == 5:
+            s.fields[cid] = ("n", UNKNOWN_FORMAT, cell, value)
             return
         at, fmt = (0x36 if self.wide else 0x24), None
         while at + 6 <= len(data) and self.take(1):
@@ -508,38 +841,57 @@ class _Reader:
             fmt = 200 if cell == DATE_CELL else UNKNOWN_FORMAT
         s.fields[cid] = ("n", fmt, cell, value)
 
-    def field_value(self, s, field) -> str:
-        if field[0] == "s":
-            raw = s.names.get(field[1])
+    def field_value(self, s, field, cache) -> tuple:
+        """(the field's shown text, whether it lost something): a string field's name, or "" and the shape's names
+        cut when the name was not kept; a number in its format."""
+        if field[0] != "s":
+            return number(field[1], field[2], field[3]), False
+        key = field[1]
+        if key not in cache:
+            raw = s.names.get(key)
             if raw is None:
-                return ""
-            if self.wide:
-                return raw[:len(raw) // 2 * 2].decode("utf-16-le", "replace").replace("\x00", "")
-            return textmod.decode_8bit(raw, LID).replace("\x00", "")
-        return number(field[1], field[2], field[3])
+                cache[key] = ("", s.names_cut)
+            elif self.wide:
+                cache[key] = (raw[:len(raw) // 2 * 2].decode("utf-16-le", "replace").replace("\x00", ""), False)
+            else:
+                cache[key] = (textmod.decode_8bit(raw, LID).replace("\x00", ""), False)
+        return cache[key]
 
-    def text_of(self, s) -> str:
-        """The shape's text with its fields' values, cut at MAX_TEXT (counted `text`), charged to the room."""
+    def decode8(self, raw, runs) -> str:
+        """8-bit text run by run: each run's bytes in its font's codec (a count of 0 covers one byte, as the
+        collector's loop), the rest in the last run's."""
+        if not runs:
+            return _decode(raw, None)
+        parts, pos, n, codec = [], 0, len(raw), None
+        for count, codec in runs:
+            if pos >= n:
+                break
+            step = max(count, 1)
+            parts.append(_decode(raw[pos:pos + step], codec))
+            pos += step
+        if pos < n:
+            parts.append(_decode(raw[pos:], codec))
+        return "".join(parts)
+
+    def text_of(self, s) -> tuple:
+        """(the shape's text with its fields' values, cut at MAX_TEXT; whether it was cut). Nothing is counted here."""
         raw = s.text
         if not raw:
-            return ""
-        if self.room <= 0:
-            self.ctx.skipped["text"] += 1
-            return ""
+            return "", s.cut
         if self.wide:
             pieces = raw[:len(raw) // 2 * 2].decode("utf-16-le", "replace").split(MARK)
         else:
-            pieces = [textmod.decode_8bit(p, LID) for p in raw.split(b"\x1e")]
-        marks = self.take(len(pieces) - 1)
+            pieces = self.decode8(raw, s.runs).split("\x1e")
         ids = s.order if s.order else sorted(s.fields)
         values = (s.fields[i] for i in ids if i in s.fields)
-        out, size, cut = [], 0, s.cut
+        out, size, cut, cache = [], 0, s.cut, {}
         for k, piece in enumerate(pieces):
             if k:
-                if k > marks:
-                    break
                 field = next(values, None)
-                piece = (self.field_value(s, field) if field is not None else "") + piece
+                if field is not None:
+                    shown, lost = self.field_value(s, field, cache)
+                    cut = cut or lost
+                    piece = shown + piece
             piece = piece.replace("\x00", "")
             if size + len(piece) > vsdx.MAX_TEXT:
                 out.append(piece[:vsdx.MAX_TEXT - size])
@@ -547,19 +899,11 @@ class _Reader:
                 break
             out.append(piece)
             size += len(piece)
-        text = "".join(out)
-        if cut:
-            self.ctx.skipped["text"] += 1
-        if not text.strip():
-            return ""
-        cost = len(text) + vsdx.LINE * (text.count("\n") + text.count("\r"))
-        if cost > self.room:
-            self.ctx.skipped["text"] += 1
-            return ""
-        self.room -= cost
-        return text
+        return "".join(out), cut
 
     def picture(self, s) -> list:
+        """The shape's picture: an OLE object counted `object`; a DIB through officeart.dib_to_bmp to a PNG; its
+        emitted bytes charged to IMAGE_BYTES and LINE to the room (past either counted `image`)."""
         if s.ftype == 2:
             self.ctx.skipped["object"] += 1
             return []
@@ -568,31 +912,40 @@ class _Reader:
             if s.ftype is not None:
                 self.ctx.skipped["image"] += 1
             return []
-        dib = s.ftype == 1 and s.fformat == 0
-        self.image_bytes += len(data) + (14 if dib else 0)
-        if self.image_bytes > limits.IMAGE_BYTES:
-            self.ctx.skipped["image"] += 1
-            return []
-        if dib:
-            data = bmp_file(data)
+        if s.ftype == 1 and s.fformat == 0:
+            if self.image_bytes >= limits.IMAGE_BYTES:  # spent: not converted at all
+                self.ctx.skipped["image"] += 1
+                return []
+            bmp = officeart.dib_to_bmp(data)
+            if bmp is None:
+                self.ctx.skipped["image"] += 1
+                return []
+            data = images.bmp_to_png(bmp) or bmp
         kind = images.sniff(data) if len(data) >= 16 else None
         if kind is None:
             self.ctx.skipped["image"] += 1
             return []
         if kind == "bmp":
             data = images.bmp_to_png(data) or data
+        self.image_bytes += len(data)
+        if self.image_bytes > limits.IMAGE_BYTES or vsdx.LINE > self.room:
+            self.ctx.skipped["image"] += 1
+            return []
+        self.room -= vsdx.LINE
         return [Image(data)]
 
 
 # chunk type -> the _Reader method that reads it (looked up per call); _BY_CHUNK's take the chunk, the rest its data
 _HANDLERS = {0x9B: "xform", 0x0E: "text", 0x2C: "name_list", 0x2D: "listed", 0x66: "field_list", 0xA1: "field",
-             0x98: "foreign_type", 0x0C: "foreign_data"}
+             0xA4: "misc", 0x94: "char_ix", 0x98: "foreign_type", 0x0C: "foreign_data"}
 _BY_CHUNK = frozenset((0x2D, 0xA1))
 
 
 def parse(path, ctx) -> Doc:
     with open(path, "rb") as f:
         head = f.read(8)
+    if head[:2] == b"PK":  # a zip named .vsd (a vsdx saved as .vsd): zip_route picks its parser, never this one
+        return zip_route.parse(path, ctx)
     if not is_cfb(head):
         raise ReadError("damaged", "not a Visio file")
     got = parse_compound(path, ctx)
@@ -604,15 +957,17 @@ def parse(path, ctx) -> Doc:
 def parse_compound(src, ctx) -> Doc | str:
     """Read the compound file `src` (a path or its bytes, nothing is written): the Doc, or the name of the other
     parser `cfb_route` picks for a compound file that holds no VisioDocument stream. `parse` ends in it."""
+    vba = False
     try:
         with Compound(src) as cf:
             other = cfb_route.route(cf, "vsd", "no VisioDocument stream")
             data = cf.read("VisioDocument") if other is None else None
+            vba = any(n.upper().startswith("_VBA_PROJECT_CUR/") for n in cf.names())
     except (KeyError, CfbError):
         raise ReadError("damaged", "VisioDocument stream") from None
     if other is not None:
         return other
+    if vba:
+        ctx.skipped["vba"] = 1  # macros are never read; named once
     version, _ = vsd_stream.header(data)
-    if version == 5:
-        raise ReadError("unsupported", "Visio 5 drawing")
     return _Reader(data, version, ctx).run()

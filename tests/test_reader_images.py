@@ -48,6 +48,7 @@ def test_sniff():
     assert images.sniff(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "webp"
     assert images.sniff(WMF) == "wmf"
     assert images.sniff(b"\x01\x00\x09\x00" + b"\x00" * 12) == "wmf"
+    assert images.sniff(b"\x02\x00\x09\x00" + b"\x00" * 12) == "wmf"  # a disk metafile (mtType 2)
     assert images.sniff(EMF) == "emf"
     assert images.sniff(b'<?xml version="1.0"?><svg xmlns="x"/>') == "svg"
     assert images.sniff(b"<svg xmlns='x'></svg>") == "svg"
