@@ -350,7 +350,7 @@ A VBA storage (`_VBA_PROJECT_CUR`) sets the named item "VBA macros".
 | `QUILL_BITS` | 1,000 bit directory entries | the rest ignored |
 | `PUB_CHUNKS` | 100,000 chunk references | the rest counted `record` |
 | `VSD_POINTERS` | 100,000 pointers per document (POI), and at most the remaining bytes ÷ 16 per list | the rest counted `record` |
-| `VSD_INFLATE` | 256 MiB inflated per document (`CFB_STREAM`) | the stream counted `record` |
+| `VSD_INFLATE` | 256 MiB of stream bytes read per document, inflated or stored, every reference charged (`CFB_STREAM`) | the stream counted `record` |
 | `MASTERS` (`vsdx.py`) | 1,000 master parts per vsdx | inherited text from the rest left out, counted `stencil` |
 | `CONNECTIONS` (`vsdx.py`) | 10,000 connectors per document, vsd and vsdx | counted `connections_cut` |
 | `MPP_NOTE` | 20,000 characters per task note | cut, counted `text` |
