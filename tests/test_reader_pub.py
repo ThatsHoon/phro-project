@@ -6,6 +6,7 @@ Run: python -I -X utf8 tests/test_reader_pub.py
 """
 import struct
 import sys
+import tempfile
 import time
 import tracemalloc
 from pathlib import Path
@@ -14,11 +15,14 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import limits  # noqa: E402
-from reader.formats import pub_contents, pub_quill  # noqa: E402
+from reader import limits, markdown  # noqa: E402
+from reader.containers.cfb import Compound  # noqa: E402
+from reader.formats import cfb_route, pub, pub_contents, pub_quill, vsdx, zip_route  # noqa: E402
 from reader.formats.pub_contents import Block, ChunkRef  # noqa: E402
-from reader.model import Bold, Break, Context, Para, Text  # noqa: E402
-from reader_fix import pub_block, pub_contents as contents_fix, pub_quill as quill_fix  # noqa: E402
+from reader.limits import ReadError  # noqa: E402
+from reader.model import Bold, Break, Context, Link, Para, Section, Text  # noqa: E402
+from reader_fix import (cfb_bytes, oa_container, oa_record, pub_block, pub_contents as contents_fix,  # noqa: E402
+                        pub_escher, pub_file, pub_group, pub_quill as quill_fix, pub_sp)
 
 MIB = 2**20
 
@@ -59,6 +63,8 @@ def text_of(para):
             out.append("**" + "".join(t.text for t in i.inlines) + "**")
         elif isinstance(i, Break):
             out.append("|")
+        elif isinstance(i, Link):
+            out.append("".join(t.text for t in i.inlines))
     return "".join(out)
 
 
@@ -318,6 +324,12 @@ def test_quill_default_bold():
     assert paras(fdpp=[(14, None)], stsh=(True,)) == (["**Hello**", "**World**"], ["**A**|**B**"])
     # an index past the defaults is not bold
     assert paras(bold=[(6, 11)], fdpp=[(14, 5)], stsh=(True,)) == (["Hello", "**World**"], ["A|B"])
+    # bold ranges that meet are one run: FDPC bold "lo" (3-5) against the bold default of "Hel" (0-3) is "Hello",
+    # never "**Hel****lo**" (the shared endpoint cancels in the XOR)
+    assert paras(bold=[(3, 5)], fdpp=[(3, 1), (14, 0)], stsh=(False, True)) == (["**Hello**", "World"], ["A|B"])
+    # the second STSH bit is the one read: the fixture writes three, as Publisher does, the third with no bold style
+    bits = pub_quill.bits(quill_fix(STORIES, fdpp=[(6, 1), (14, 0)], stsh=(False, True)))
+    assert len(bits["STSH"]) == 3 and not any(pub_quill._defaults(bits["STSH"][2:] * 2, pub_contents.Meter()))
     # a block 0x19 that is not a number leaves the index 0
     bits = pub_quill.bits(quill_fix(STORIES, fdpp=[(14, 1)], stsh=(True, False)))
     raw = bytes(bits["FDPP"][0])
@@ -688,6 +700,570 @@ def test_links_hostile():
     assert pub_quill.links({"TOKN": [pub_quill.Bit(bytes(good), 0, "TOKN", 0)]}) == []
 
 
+# -- pub.py: Publisher 2002 and later
+
+def read_pub(blob, ctx=None):
+    ctx = ctx if ctx is not None else Context()
+    return pub.parse_compound(blob, ctx), ctx
+
+
+def md(doc, ctx, hidden=False):
+    with tempfile.TemporaryDirectory() as tmp:
+        return markdown.render(doc, Path(tmp) / "assets", hidden, ctx.skipped)
+
+
+def outline(doc):
+    """[(heading or None, [para texts])] of the Doc's top-level blocks."""
+    out = []
+    for b in doc.blocks:
+        if isinstance(b, Section):
+            head = {"page": "Page", "master": "Master page"}[b.kind]
+            head += f" {b.number}" if b.number is not None else f": {b.title}"
+            out.append((head + (" (hidden)" if b.hidden else ""), [text_of(p) for p in b.blocks]))
+        else:
+            out.append((None, [text_of(b)]))
+    return out
+
+
+def page(seq, shapes=(), **kw):
+    return dict(seq=seq, shapes=list(shapes), **kw)
+
+
+def shape(seq, text=None, **kw):
+    return dict(seq=seq, text=text, **kw)
+
+
+def one_page(texts, **kw):
+    """A file of one page whose shapes 0x30, 0x31, ... hold the stories `texts` (text ids 1, 2, ...)."""
+    seqs = [0x30 + k for k in range(len(texts))]
+    return pub_file([page(0x20, seqs)], [shape(s, k + 1) for k, s in enumerate(seqs)],
+                    [(k + 1, t) for k, t in enumerate(texts)], **kw)
+
+
+def test_text_boxes_in_order():
+    # page 1, boxes at top 100 and top 50 -> the top-50 text first; at the same top the left one first (a negative
+    # left included); a box with no position last. The Escher stream's Dgg and Dg carry Publisher's 4-byte tails.
+    escher = pub_escher(pub_sp(0x30, (0, 100, 10, 110)), pub_sp(0x31, (0, 50, 10, 60)), pub_sp(0x33, (-5, 100, 0, 110)))
+    doc, ctx = read_pub(one_page(["Low", "High", "Free", "Left"], escher=escher))
+    assert outline(doc) == [("Page 1", ["High", "Left", "Low", "Free"])], outline(doc)
+    assert not ctx.skipped
+    # without the Escher stream the list order stays
+    doc, _ = read_pub(one_page(["Low", "High", "Free", "Left"]))
+    assert outline(doc) == [("Page 1", ["Low", "High", "Free", "Left"])], outline(doc)
+    # an anchor's corners in either order: the box is arranged, its top the smaller y
+    escher = pub_escher(pub_sp(0x30, (0, 100, 10, 90)), pub_sp(0x31, (0, 95, 10, 99)))
+    doc, _ = read_pub(one_page(["A", "B"], escher=escher))
+    assert outline(doc) == [("Page 1", ["A", "B"])], outline(doc)
+
+
+def test_group_boxes():
+    # a group (0x30) listed on the page brings its members (directory parent 0x40), placed by their child anchors in
+    # the group's coordinate system, mapped to the group's box as libmspub does: (child - cs) * box / cs + box
+    group = pub_group(pub_sp(0x40, (0, 200, 100, 300), group=(0, 0, 10, 10)),
+                      pub_sp(0x41, child=(0, 8, 10, 10)), pub_sp(0x42, child=(0, 0, 10, 2)))
+    escher = pub_escher(pub_sp(0x30, (0, 250, 10, 260)), group)
+    blob = pub_file([page(0x20, [0x40, 0x30])],
+                    [shape(0x30, 1), shape(0x40, type=0x30), shape(0x41, 2, parent=0x40), shape(0x42, 3, parent=0x40)],
+                    [(1, "Mid"), (2, "Bottom"), (3, "Top")], escher=escher)
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["Top", "Mid", "Bottom"])], outline(doc)
+    assert not ctx.skipped
+    # a nested group (0x31, LOGO) inside the group: the members in directory order (0x42 before 0x43's member)
+    blob = pub_file([page(0x20, [0x40, 0x42])],
+                    [shape(0x40, type=0x30), shape(0x43, type=0x31, parent=0x40),
+                     shape(0x41, 2, parent=0x43), shape(0x42, 3, parent=0x40)],
+                    [(2, "Inner"), (3, "Outer")])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["Outer", "Inner"])] and not ctx.skipped, outline(doc)
+    # two groups each the other's member (the directory cuts the link closing the cycle), and a group its own member:
+    # each shape once, no loop
+    blob = pub_file([page(0x20, [0x40, 0x43, 0x44, 0x41])],
+                    [shape(0x40, type=0x30, parent=0x43), shape(0x43, type=0x31, parent=0x40),
+                     shape(0x44, type=0x30, parent=0x44), shape(0x41, 2, parent=0x43), shape(0x42, 3, parent=0x40)],
+                    [(2, "Inner"), (3, "Outer")])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["Outer", "Inner"])] and not ctx.skipped, outline(doc)
+
+
+def test_group_depth():
+    # groups nested past limits.MAX_DEPTH: the deeper members are left out, counted depth once
+    shapes = [shape(0x40, type=0x30)] + [shape(0x41 + k, type=0x30, parent=0x40 + k) for k in range(5)]
+    shapes.append(shape(0x50, 1, parent=0x45))
+    shapes.append(shape(0x51, 2, parent=0x40))
+    blob = pub_file([page(0x20, [0x40])], shapes, [(1, "Deep"), (2, "Shallow")])
+    with patched(limits, MAX_DEPTH=3):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["Shallow"])] and ctx.skipped == {"depth": 1}, (outline(doc), ctx.skipped)
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["Deep", "Shallow"])] and not ctx.skipped, (outline(doc), ctx.skipped)
+
+
+def test_escher_depth():
+    # Escher groups nested past limits.MAX_DEPTH: the deeper boxes are not read (their shapes follow, unplaced),
+    # counted depth once
+    inner = pub_group(pub_sp(group=(0, 0, 10, 10)), pub_sp(0x30, (0, 1, 1, 2)))
+    for _ in range(4):
+        inner = pub_group(pub_sp(group=(0, 0, 10, 10)), inner)
+    escher = pub_escher(inner, pub_sp(0x31, (0, 5, 1, 6)))
+    with patched(limits, MAX_DEPTH=3):
+        doc, ctx = read_pub(one_page(["Deep", "Placed"], escher=escher))
+    assert outline(doc) == [("Page 1", ["Placed", "Deep"])] and ctx.skipped == {"depth": 1}, (outline(doc),
+                                                                                              ctx.skipped)
+    doc, ctx = read_pub(one_page(["Deep", "Placed"], escher=escher))
+    assert outline(doc) == [("Page 1", ["Deep", "Placed"])] and not ctx.skipped
+
+
+def test_escher_hostile():
+    # records that overrun, short anchors and FSPGRs, ClientData without a shape id, values cut mid-pair: no box,
+    # nothing counted, the text stays in list order
+    def order(escher):
+        doc, ctx = read_pub(one_page(["A", "B"], escher=escher))
+        assert not ctx.skipped, ctx.skipped
+        return outline(doc)[0][1]
+    good = pub_escher(pub_sp(0x30, (0, 9, 1, 10)), pub_sp(0x31, (0, 1, 1, 2)))
+    assert order(good) == ["B", "A"]
+    assert order(good[:-30]) == ["A", "B"]                      # the Dg overruns the stream
+    assert order(b"") == ["A", "B"]
+    bad = bytearray(good)
+    struct.pack_into("<I", bad, 4, 0xFFFFFFF0)                  # the Dgg's length passes the stream
+    assert order(bytes(bad)) == ["A", "B"]
+    # a ClientData with no 0x6801 value, and one cut after 3 bytes of its pair
+    nodata = oa_container(0xF004, oa_record(0xF010, bytes(4) + struct.pack("<HI", 0x2002, 1)),
+                          oa_record(0xF011, bytes(4) + struct.pack("<HI", 0x6802, 0x30)))
+    cut = oa_container(0xF004, oa_record(0xF010, bytes(4) + struct.pack("<HI", 0x2002, 1)),
+                       oa_record(0xF011, bytes(4) + struct.pack("<HI", 0x6801, 0x30)[:3]))
+    assert order(pub_escher(nodata, cut, pub_sp(0x31, (0, 5, 1, 6)))) == ["B", "A"]
+    # a ClientData with no anchor; a child anchor of 15 bytes; an FSPGR of 15 bytes (the coordinate system stays)
+    noanchor = oa_container(0xF004, oa_record(0xF011, bytes(4) + struct.pack("<HI", 0x6801, 0x30)))
+    short = oa_container(0xF004, oa_record(0xF00F, bytes(15)),
+                         oa_record(0xF011, bytes(4) + struct.pack("<HI", 0x6801, 0x30)))
+    assert order(pub_escher(noanchor, pub_sp(0x31, (0, 5, 1, 6)))) == ["B", "A"]
+    assert order(pub_escher(short, pub_sp(0x31, (0, 5, 1, 6)))) == ["B", "A"]
+    lead = oa_container(0xF004, oa_record(0xF009, bytes(15)),
+                        oa_record(0xF010, bytes(4) + struct.pack("<4HI", 0, 0, 0, 0x2002, 0)[6:]))
+    group = pub_group(lead, pub_sp(0x30, child=(0, 9, 1, 10)))
+    assert order(pub_escher(group, pub_sp(0x31, (0, 5, 1, 6)))) == ["A", "B"]
+
+
+def test_bold_runs():
+    # a FDPC run bold over the second paragraph -> **World**
+    doc, ctx = read_pub(one_page(["Hello\rWorld"], bold=[(6, 11)]))
+    assert outline(doc) == [("Page 1", ["Hello", "**World**"])], outline(doc)
+    assert "**World**" in md(doc, ctx) and "**Hello**" not in md(doc, ctx)
+
+
+def test_pages_in_document_order():
+    # page list [seq 2, seq 1] -> "## Page 1" holds seq 2's text
+    blob = pub_file([page(0x21, [0x30]), page(0x22, [0x31])], [shape(0x30, 1), shape(0x31, 2)],
+                    [(1, "first chunk"), (2, "second chunk")], order=[0x22, 0x21])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["second chunk"]), ("Page 2", ["first chunk"])], outline(doc)
+    text = md(doc, ctx)
+    assert text.index("## Page 1") < text.index("second chunk") < text.index("## Page 2") < text.index("first chunk")
+    # no page list: the pages in seqnum order; a page with no text takes its number and gives no section
+    blob = pub_file([page(0x22, [0x31]), page(0x21, [0x30]), page(0x23, [])], [shape(0x30, 1), shape(0x31, 2)],
+                    [(1, "a"), (2, "b")], order=[])
+    assert outline(read_pub(blob)[0]) == [("Page 1", ["a"]), ("Page 2", ["b"])]
+    blob = pub_file([page(0x21, [0x30]), page(0x22, []), page(0x23, [0x31])], [shape(0x30, 1), shape(0x31, 2)],
+                    [(1, "a"), (2, "b")])
+    assert outline(read_pub(blob)[0]) == [("Page 1", ["a"]), ("Page 3", ["b"])]
+
+
+def test_page_list_hostile():
+    # a page listed twice, a seqnum no chunk has, a shape's seqnum and the DOCUMENT's own: each page once, in order
+    blob = pub_file([page(0x21, [0x30]), page(0x22, [0x31])], [shape(0x30, 1), shape(0x31, 2)],
+                    [(1, "one"), (2, "two")], order=[0x21, 0x21, 0x99, 0x30, 1, 0x22, 0x21])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["one"]), ("Page 2", ["two"])] and not ctx.skipped, outline(doc)
+    # a page naming itself as its master, and its own seqnum among its shapes
+    blob = pub_file([page(0x21, [0x21, 0x30], applied=0x21)], [shape(0x30, 1)], [(1, "one")])
+    assert outline(read_pub(blob)[0]) == [("Page 1", ["one"])]
+
+
+def test_shapes_once():
+    # a shape on two pages, twice on one page, and two shapes naming one story: each text once, where first met
+    blob = pub_file([page(0x21, [0x30, 0x30, 0x31]), page(0x22, [0x30, 0x32])],
+                    [shape(0x30, 1), shape(0x31, 1), shape(0x32, 2)], [(1, "shared"), (2, "own")])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["shared"]), ("Page 2", ["own"])] and not ctx.skipped, outline(doc)
+    # a shape naming a text id no story has, and one with no text id: nothing, nothing counted
+    blob = pub_file([page(0x21, [0x30, 0x31, 0x32])], [shape(0x30, 9), shape(0x31), shape(0x32, 1)], [(1, "kept")])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["kept"])] and not ctx.skipped
+
+
+def test_master_page():
+    # master "Master A" with a footer box, two pages naming it -> one "## Master page: Master A" after the pages;
+    # the footer text appears once
+    blob = pub_file([page(0x25, [0x32], master="Master A"), page(0x21, [0x30], applied=0x25),
+                     page(0x22, [0x31], applied=0x25)],
+                    [shape(0x30, 1), shape(0x31, 2), shape(0x32, 3)], [(1, "one"), (2, "two"), (3, "Footer")])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["one"]), ("Page 2", ["two"]), ("Master page: Master A", ["Footer"])], \
+        outline(doc)
+    text = md(doc, ctx)
+    assert text.count("Footer") == 1 and "## Master page: Master A" in text, text
+    assert text.index("## Page 2") < text.index("## Master page: Master A")
+
+
+def test_master_cycle():
+    # masters naming themselves and each other, one not in the page list, one with no shapes: each once, no loop
+    blob = pub_file([page(0x25, [0x32], master="M1", applied=0x26), page(0x26, [0x33], master="M2", applied=0x25),
+                     page(0x27, [], master="M3", applied=0x27), page(0x28, [0x34], master="M4", applied=0x28),
+                     page(0x21, [0x30], applied=0x25)],
+                    [shape(0x30, 1), shape(0x32, 2), shape(0x33, 3), shape(0x34, 4)],
+                    [(1, "body"), (2, "m1"), (3, "m2"), (4, "m4")], order=[0x25, 0x26, 0x27, 0x21])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["body"]), ("Master page: M1", ["m1"]), ("Master page: M2", ["m2"]),
+                            ("Master page: M4", ["m4"])] and not ctx.skipped, outline(doc)
+
+
+def test_scratch_area_hidden():
+    # a DUMMY 0x10D shape -> absent by default, under "Scratch area" with --hidden; a DUMMY page with a master name
+    # is still the scratch area
+    blob = pub_file([page(0x21, [0x30]), page(0x10D, [0x31]), page(0x117, [0x32], master="X"), page(0x110, [])],
+                    [shape(0x30, 1), shape(0x31, 2), shape(0x32, 3)], [(1, "Body"), (2, "Secret"), (3, "Note")])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["Body"]), ("Page: Scratch area (hidden)", ["Secret", "Note"])], outline(doc)
+    left, shown = md(doc, ctx), md(doc, ctx, hidden=True)
+    assert "Secret" not in left and "Scratch area" not in left and "Body" in left, left
+    assert "Scratch area" in shown and "Secret" in shown and "Note" in shown, shown
+
+
+def test_links_line():
+    # two URLs -> the last block "Links: https://a.example/, https://b.example/"
+    doc, ctx = read_pub(one_page(["Body"], links=["https://a.example/", "https://b.example/"]))
+    last = doc.blocks[-1]
+    assert isinstance(last, Para) and last.inlines == [
+        Text("Links: "), Link("https://a.example/", [Text("https://a.example/")]), Text(", "),
+        Link("https://b.example/", [Text("https://b.example/")])], last
+    assert md(doc, ctx).rstrip().splitlines()[-1] == "Links: https://a.example/, https://b.example/"
+    doc, _ = read_pub(one_page(["Body"]))
+    assert not isinstance(doc.blocks[-1], Para)
+
+
+def test_output_room():
+    # each story emitted and each link is charged to the document's room (its characters, and vsdx.LINE for the story
+    # and each break and bold run, a link LINE): past it the story is left out, counted text, the rest of the links
+    # cut, counted link once
+    blob = one_page(["a" * 100, "b" * 10, "c\rd"], bold=[(0, 5)], links=["https://a.example/", "https://b.example/"])
+    with Compound(blob) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+    line = vsdx.LINE
+
+    def run(room):
+        ctx = Context()
+        reader = pub._Reader(*streams, b"", ctx)
+        reader.room = room
+        return outline(reader.run()), ctx.skipped
+    full = 100 + 2 * line + 10 + line + 3 + 2 * line + 2 * (len("https://a.example/") + line)
+    got, skipped = run(full)
+    assert got == [("Page 1", ["**aaaaa**" + "a" * 95, "b" * 10, "c", "d"]),
+                   (None, ["Links: https://a.example/, https://b.example/"])] and not skipped, (got, skipped)
+    got, skipped = run(full - 1)
+    assert got[-1] == (None, ["Links: https://a.example/"]) and skipped == {"link": 1}, (got, skipped)
+    got, skipped = run(10 + line + 3 + 2 * line - 1)  # the first and third stories do not fit, the second does
+    assert got == [("Page 1", ["b" * 10]), (None, ["Links: https://a.example/"])], got
+    assert skipped == {"text": 2, "link": 1}, skipped
+    # a master's name is charged too: past the room it is left out (text)
+    blob = pub_file([page(0x25, [0x30], master="N" * 50)], [shape(0x30, 1)], [(1, "x")])
+    with Compound(blob) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+    ctx = Context()
+    reader = pub._Reader(*streams, b"", ctx)
+    reader.room = 1 + line + 10
+    assert outline(reader.run()) == [("Master page: ", ["x"])] and ctx.skipped == {"text": 1}, ctx.skipped
+
+
+def test_guards():
+    # a shape that fails is left out (shape), the page's other shapes stay; a page that fails (page) and a master that
+    # fails (master_page) are left out, the others stay
+    blob = pub_file([page(0x25, [0x32], master="M"), page(0x21, [0x30, 0x31]), page(0x22, [0x33])],
+                    [shape(0x30, 1), shape(0x31, 2), shape(0x32, 3), shape(0x33, 4)],
+                    [(1, "a"), (2, "b"), (3, "m"), (4, "c")], order=[0x21, 0x22])
+    real_text, real_shapes = pub._Reader._text, pub._Reader._shapes
+
+    def bad_text(self, ref):
+        if ref.seqnum == 0x31:
+            raise ValueError("boom")
+        return real_text(self, ref)
+
+    def bad_shapes(self, seqs):
+        if 0x33 in seqs or 0x32 in seqs:
+            raise ValueError("boom")
+        return real_shapes(self, seqs)
+    with patched(pub._Reader, _text=bad_text):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["a"]), ("Page 2", ["c"]), ("Master page: M", ["m"])], outline(doc)
+    assert ctx.skipped == {"shape": 1}, ctx.skipped
+    with patched(pub._Reader, _shapes=bad_shapes):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["a", "b"])] and ctx.skipped == {"page": 1, "master_page": 1}, ctx.skipped
+    # a scratch page that fails is counted page; the other scratch pages stay
+    blob = pub_file([page(0x10D, [0x33]), page(0x110, [0x30])], [shape(0x30, 1), shape(0x33, 4)],
+                    [(1, "kept"), (4, "lost")])
+    with patched(pub._Reader, _shapes=bad_shapes):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page: Scratch area (hidden)", ["kept"])] and ctx.skipped == {"page": 1}, ctx.skipped
+
+
+def test_meter():
+    # one meter of limits.BIN_RECORDS for the document's Contents walks, its Escher records and its Quill styles: at
+    # any cap the read ends without error, record counted at most once; with room, nothing counted
+    escher = pub_escher(pub_sp(0x30, (0, 9, 1, 10)), pub_sp(0x31, (0, 1, 1, 2)))
+    blob = pub_file([page(0x25, [0x32], master="M"), page(0x21, [0x30, 0x31]), page(0x10D, [0x33])],
+                    [shape(0x30, 1), shape(0x31, 2), shape(0x32, 3), shape(0x33, 4)],
+                    [(1, "a"), (2, "b"), (3, "m"), (4, "s")], escher=escher, bold=[(0, 1)], order=[0x21])
+    seen = set()
+    for cap in range(0, 1200, 7):
+        with patched(limits, BIN_RECORDS=cap):
+            try:
+                doc, ctx = read_pub(blob)
+            except ReadError as e:
+                assert (e.kind, e.detail) == ("damaged", "no document chunk"), (cap, e.kind, e.detail)
+                continue
+        assert set(ctx.skipped) <= {"record"} and ctx.skipped["record"] <= 1, (cap, ctx.skipped)
+        seen.add(len(doc.blocks))
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["b", "**a**"]), ("Master page: M", ["m"]),
+                            ("Page: Scratch area (hidden)", ["s"])] and not ctx.skipped, outline(doc)
+    assert len(seen) > 2, seen
+    # the Escher walk ticks it: a cap that the Contents and Quill walks fit, but not the Escher records
+    ctx = Context()
+    with Compound(blob) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS", "Escher/EscherStm")]
+    meter = pub_contents.Meter(ctx)
+    assert pub.boxes(streams[2], meter, ctx) == {0x30: (9, 0), 0x31: (1, 0)} and meter.used > 10, meter.used
+    with patched(limits, BIN_RECORDS=3):
+        ctx = Context()
+        meter = pub_contents.Meter(ctx)
+        assert pub.boxes(streams[2], meter, ctx) == {} and ctx.skipped == {"record": 1}
+
+
+def test_vba():
+    # a VBA storage sets vba (named once); a stream merely named VBA does not
+    doc, ctx = read_pub(one_page(["t"], streams={"VBA/dir": b"\x01" * 16, "VBA/ThisDocument": b"x"}))
+    assert ctx.skipped == {"vba": 1}, ctx.skipped
+    assert "VBA macros" in md(doc, ctx)
+    doc, ctx = read_pub(one_page(["t"], streams={"Macros/VBA/dir": b"\x01" * 16}))
+    assert ctx.skipped == {"vba": 1}, ctx.skipped
+    doc, ctx = read_pub(one_page(["t"], streams={"VBA": b"\x01" * 16}))
+    assert not ctx.skipped
+
+
+def refused(fn, kind, detail):
+    try:
+        fn()
+    except ReadError as e:
+        assert (e.kind, e.detail) == (kind, detail), (e.kind, e.detail)
+        return
+    raise AssertionError("ReadError not raised")
+
+
+def test_unknown_version():
+    # byte 0x30 -> unsupported "unknown Publisher version (Contents byte 0x30)"; 0x22 is Publisher 2000 or 98, not
+    # read yet; a Contents stream not starting E8 AC is damaged
+    for byte, kind, detail in ((0x30, "unsupported", "unknown Publisher version (Contents byte 0x30)"),
+                               (0xA1, "unsupported", "unknown Publisher version (Contents byte 0xA1)"),
+                               (0x22, "unsupported", "Publisher 2000 or 98")):
+        refused(lambda: read_pub(one_page(["t"], version=byte)), kind, detail)
+    with Compound(one_page(["t"])) as cf:
+        quill = cf.read("Quill/QuillSub/CONTENTS")
+    for contents in (b"", b"\xE8\xAC\x2C", b"\xE8\xAD\x2C\x00" + bytes(60)):
+        blob = cfb_bytes({"Contents": contents, "Quill/QuillSub/CONTENTS": quill})[0]
+        refused(lambda: read_pub(blob), "damaged", "not a Publisher Contents stream")
+
+
+def test_no_quill_no_document():
+    # without a Quill stream, or without a DOCUMENT chunk, a 2002+ file is damaged
+    refused(lambda: read_pub(one_page(["t"], quill=False)), "damaged", "no Quill stream")
+    with Compound(one_page(["t"])) as cf:
+        quill = cf.read("Quill/QuillSub/CONTENTS")
+    contents = contents_fix([(2, pub_contents.PAGE, None, pub_block(0x02, 0xA0))])
+    refused(lambda: read_pub(cfb_bytes({"Contents": contents, "Quill/QuillSub/CONTENTS": quill})[0]),
+            "damaged", "no document chunk")
+
+
+def test_no_contents_routes():
+    # a .pub compound with only "WordDocument" -> routed to doc; one with neither Contents nor another format's stream
+    # (a Quill stream alone included) is damaged
+    assert read_pub(cfb_bytes({"WordDocument": bytes(64)})[0])[0] == "doc"
+    for streams in ({"Other": b"x"}, {"Quill/QuillSub/CONTENTS": b"CHNKINK "}):
+        refused(lambda: read_pub(cfb_bytes(streams)[0]), "damaged", "no Contents stream")
+    # parse: a file that is not a compound file is damaged; a clean one is read through parse_compound
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "a.pub"
+        p.write_bytes(b"not a compound file at all")
+        refused(lambda: pub.parse(p, Context()), "damaged", "not a Publisher file")
+        p.write_bytes(one_page(["hello"]))
+        assert outline(pub.parse(p, Context())) == [("Page 1", ["hello"])]
+        # a zip goes to zip_route; a compound file of another format to the parser cfb_route names
+        p.write_bytes(b"PK\x03\x04" + bytes(60))
+        with patched(zip_route, parse=lambda path, ctx: ("zip", path)):
+            assert pub.parse(p, Context()) == ("zip", p)
+        p.write_bytes(cfb_bytes({"VisioDocument": b"Visio (TM) Drawing\r\n"})[0])
+        with patched(cfb_route, parse=lambda fmt, path, ctx: ("routed", fmt)):
+            assert pub.parse(p, Context()) == ("routed", "vsd")
+    # a Contents stream whose sector chain loops: damaged "Contents stream"
+    with Compound(one_page(["t"])) as cf:
+        quill = cf.read("Quill/QuillSub/CONTENTS")
+    raw, info = cfb_bytes({"Contents": b"\xE8\xAC\x2C\x00" + bytes(5000), "Quill/QuillSub/CONTENTS": quill})
+    chain, blob = info["chains"]["Contents"], bytearray(raw)
+    struct.pack_into("<I", blob, (info["fat"][chain[-1] // 128] + 1) * 512 + chain[-1] % 128 * 4, chain[0])
+    refused(lambda: read_pub(bytes(blob)), "damaged", "Contents stream")
+
+
+def _anchor(box):
+    """A ClientAnchor record of the values 0x2001-0x2004 (xs, ys, xe, ye)."""
+    return oa_record(0xF010, bytes(4) + b"".join(struct.pack("<HI", k, v & 0xFFFFFFFF)
+                                                 for k, v in zip((0x2001, 0x2002, 0x2003, 0x2004), box)))
+
+
+def _data(seq):
+    """A ClientData record naming the Contents shape `seq`."""
+    return oa_record(0xF011, bytes(4) + struct.pack("<HI", 0x6801, seq))
+
+
+def test_escher_records():
+    # within an SpContainer the first anchor, ClientData and FSPGR count; a 15-byte FSPGR sets no coordinate system
+    # and no group box; outside the DgContainer no shape is placed
+    def order(escher, texts=("A", "B")):
+        doc, ctx = read_pub(one_page(list(texts), escher=escher))
+        assert not ctx.skipped, ctx.skipped
+        return outline(doc)[0][1]
+    ref = pub_sp(0x31, (0, 5, 1, 6))
+    assert order(pub_escher(oa_container(0xF004, _anchor((0, 1, 1, 2)), _anchor((0, 9, 1, 10)), _data(0x30)),
+                            ref)) == ["A", "B"]
+    assert order(pub_escher(oa_container(0xF004, _anchor((0, 1, 1, 2)), _data(0x30), _data(0x31)), ref)) == ["A", "B"]
+    lead = oa_container(0xF004, oa_record(0xF009, struct.pack("<4i", 0, 0, 10, 10)),
+                        oa_record(0xF009, struct.pack("<4i", 0, 0, 1000, 1000)), _anchor((0, 100, 10, 200)),
+                        _data(0x50))
+    group = pub_group(lead, pub_sp(0x30, child=(0, 5, 1, 6)))         # top 100 + 5 * 100 / 10 = 150
+    assert order(pub_escher(group, pub_sp(0x31, (0, 120, 1, 121)))) == ["B", "A"]
+    lead = oa_container(0xF004, oa_record(0xF009, bytes(15)), _anchor((0, 100, 10, 200)), _data(0x50))
+    group = pub_group(lead, pub_sp(0x30, child=(0, 9, 1, 10)))         # the box stays (0, 0, 0, 0): top 0
+    assert order(pub_escher(group, ref)) == ["A", "B"]
+    outside = oa_container(0xF001, pub_group(pub_sp(group=(0, 0, 10, 10)), pub_sp(0x30, (0, 1, 1, 2))))
+    assert order(outside + pub_escher(ref)) == ["B", "A"]
+    # a child anchor is taken relative to its group's coordinate system: x 105 in (100..110) maps to left 50
+    group = pub_group(pub_sp(0x50, (0, 200, 100, 300), group=(100, 0, 110, 10)),
+                      pub_sp(0x30, child=(105, 0, 106, 1)), pub_sp(0x31, child=(102, 0, 103, 1)))
+    assert order(pub_escher(group, pub_sp(0x32, (500, 200, 510, 210))), "ABC") == ["B", "A", "C"]
+    # a nested group's coordinate system is its own: the outer group's later members keep the outer one
+    inner = pub_group(pub_sp(0x51, child=(0, 0, 10, 10), group=(0, 0, 1000, 1000)),
+                      pub_sp(0x30, child=(0, 0, 1000, 100)))
+    outer = pub_group(pub_sp(0x50, (0, 200, 100, 300), group=(0, 0, 10, 10)), inner,
+                      pub_sp(0x32, child=(0, 5, 10, 6)))
+    assert order(pub_escher(outer, pub_sp(0x31, (0, 220, 10, 221))), "ABC") == ["A", "B", "C"]
+    # two Escher branches past limits.MAX_DEPTH: depth counted once
+    deep = pub_group(pub_sp(group=(0, 0, 10, 10)), pub_sp(0x30, (0, 1, 1, 2)))
+    for _ in range(4):
+        deep = pub_group(pub_sp(group=(0, 0, 10, 10)), deep)
+    with patched(limits, MAX_DEPTH=3):
+        _, ctx = read_pub(one_page(["A", "B"], escher=pub_escher(deep, deep, ref)))
+    assert ctx.skipped == {"depth": 1}, ctx.skipped
+
+
+def test_escher_values():
+    # the (id, value) pairs tick the meter, and a pair cut short is not read (the bytes past the record unread)
+    body = bytes(4) + b"".join(struct.pack("<HI", k, k) for k in range(10))
+    with patched(limits, BIN_RECORDS=3):
+        assert pub._values(body, 0, len(body), pub_contents.Meter()) == {0: 0, 1: 1, 2: 2}
+    body = bytes(4) + struct.pack("<HI", 1, 7) + struct.pack("<HI", 0x6801, 0x30)[:3] + bytes(8)
+    assert pub._values(body, 0, 13, pub_contents.Meter()) == {1: 7}
+
+
+def test_reads_once():
+    # each page chunk is read once (cached between the page, master and scratch passes); each shape is placed once a
+    # document (listed twice, or a group listed on two pages); a page's own seqnum, or another page's, is no shape
+    blob = pub_file([page(0x25, [0x32], master="M"), page(0x21, [0x30, 0x30, 0x40, 0x21, 0x22]),
+                     page(0x22, [0x40, 0x31]), page(0x10D, [0x33])],
+                    [shape(0x30, 1), shape(0x31, 2), shape(0x32, 3), shape(0x33, 4), shape(0x40, type=0x30),
+                     shape(0x41, 5, parent=0x40)],
+                    [(1, "a"), (2, "b"), (3, "m"), (4, "s"), (5, "g")], order=[0x21, 0x22])
+    chunks, texts = [], []
+    real_chunk, real_text = pub._Reader._chunk, pub._Reader._text
+
+    def chunk(self, ref):
+        chunks.append(ref.seqnum)
+        return real_chunk(self, ref)
+
+    def text(self, ref):
+        texts.append(ref.seqnum)
+        return real_text(self, ref)
+    with patched(pub._Reader, _chunk=chunk, _text=text):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["a", "g"]), ("Page 2", ["b"]), ("Master page: M", ["m"]),
+                            ("Page: Scratch area (hidden)", ["s"])] and not ctx.skipped, outline(doc)
+    pages = [s for s in chunks if s in (0x21, 0x22, 0x25, 0x10D)]
+    assert sorted(pages) == [0x21, 0x22, 0x25, 0x10D], pages
+    assert texts == [0x30, 0x41, 0x31, 0x32, 0x33], texts
+    # a spent meter: no page is read, no shape placed, record counted once
+    with Compound(blob) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+    ctx = Context()
+    reader = pub._Reader(*streams, b"", ctx)
+    read = []
+    real_page = pub._Reader._page
+
+    def page_of(self, ref):
+        read.append(ref.seqnum)
+        return real_page(self, ref)
+    with patched(limits, BIN_RECORDS=0), patched(pub._Reader, _page=page_of):
+        assert reader.run().blocks == [] and read == [] and ctx.skipped == {"record": 1}, (read, ctx.skipped)
+        assert reader._expand([0x30, 0x40]) == []
+    # a chunk whose offset leaves no room for its length has no blocks
+    assert list(reader._chunk(ChunkRef(pub_contents.PAGE, len(reader.data) - 3, 0, None, 99))) == []
+
+
+def test_group_depth_once():
+    # two members past limits.MAX_DEPTH (groups 0x40 > 0x41 > 0x42 > 0x43, then two text shapes): depth counted once
+    shapes = [shape(0x40, type=0x30)] + [shape(0x41 + k, type=0x30, parent=0x40 + k) for k in range(3)]
+    shapes += [shape(0x50, 1, parent=0x43), shape(0x51, 2, parent=0x43), shape(0x52, 3, parent=0x40)]
+    blob = pub_file([page(0x20, [0x40])], shapes, [(1, "a"), (2, "b"), (3, "kept")])
+    with patched(limits, MAX_DEPTH=3):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["kept"])] and ctx.skipped == {"depth": 1}, (outline(doc), ctx.skipped)
+
+
+def test_page_block_types():
+    # a 0x0E block of a fixed type names no master; a page's shape entry of a type other than 0x70 names no shape; a
+    # table shape gives its story
+    extra = pub_block(0x0E, 0x20, 5) + pub_block(0x02, 0xA0, pub_block(0, 0x68, 0x31))
+    blob = pub_file([page(0x21, [0x30, 0x32], extra=extra)],
+                    [shape(0x30, 1), shape(0x31, 2), shape(0x32, 3, type=pub_contents.TABLE)],
+                    [(1, "kept"), (2, "not listed"), (3, "cell")])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["kept", "cell"])] and not ctx.skipped, (outline(doc), ctx.skipped)
+
+
+def test_titles_and_links_room():
+    # a master name of an odd byte count loses its last byte; each name is charged in turn (past the room: left out,
+    # text); a link past the room ends the line (counted link once) though a later one would fit
+    line = vsdx.LINE
+    blob = pub_file([page(0x25, [0x30], master="A" * 20), page(0x26, [0x31], master="B")],
+                    [shape(0x30, 1), shape(0x31, 2)], [(1, "x"), (2, "y")])
+    with Compound(blob) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+
+    def run(room):
+        ctx = Context()
+        reader = pub._Reader(*streams, b"", ctx)
+        reader.room = room
+        return outline(reader.run()), ctx.skipped
+    full = (1 + line) + (20 + line) + (1 + line) + (1 + line)
+    assert run(full) == ([("Master page: " + "A" * 20, ["x"]), ("Master page: B", ["y"])], {})
+    assert run(full - 1) == ([("Master page: " + "A" * 20, ["x"]), ("Master page: ", ["y"])], {"text": 1})
+    assert pub._Reader(*streams, b"", Context())._title(b"A\x00B") == "A"
+    urls = ["https://a.example/", "https://" + "b" * 40 + ".example/", "https://c.example/"]
+    with Compound(one_page(["Body"], links=urls)) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+    ctx = Context()
+    reader = pub._Reader(*streams, b"", ctx)
+    reader.room = 4 + line + len(urls[0]) + line + len(urls[2]) + line
+    assert outline(reader.run())[-1] == (None, ["Links: https://a.example/"]) and ctx.skipped == {"link": 1}
+
+
 # -- measure: hostile-input probes, in memory
 
 def _probe(name, fn, size):
@@ -826,6 +1402,47 @@ def measure():
                         (b"SYID", b"SYID", 0, struct.pack("<III", 8, 1, 1))]
                        + [(b"FDPC", b"FDPC", k, f) for k, f in enumerate(fdpcs)])
     _probe("FDPC 250 bits x10k runs", lambda: _run_quill(data), len(data))
+    # pub.py, whole files (built in memory, read with parse_compound): seqnums are directory indexes, so the pages and
+    # shapes below stay under PUB_CHUNKS; the stories are 1,000 short ones unless named
+    stories = [(k + 1, f"story {k}\r") for k in range(1000)]
+    n = 45_000
+    blob = pub_file([page(2 + k, [2 + n + k]) for k in range(n)], [shape(2 + n + k, k % 1000 + 1) for k in range(n)],
+                    stories)
+    _probe("pub: 45k pages, a shape each", lambda: _run_pub(blob), len(blob))
+    n = 90_000
+    shapes = [shape(3 + k, k % 1000 + 1) for k in range(n)]
+    escher = pub_escher(*(pub_sp(3 + k, (k % 7, n - k, k % 7 + 1, n - k + 1)) for k in range(n)))
+    blob = _v4(pub_file([page(2, [3 + k for k in range(n)])], shapes, stories), {"Escher/EscherStm": escher})
+    _probe("pub: 90k boxed shapes on one page", lambda: _run_pub(blob), len(blob))
+    blob = pub_file([page(2, [3 + k for k in range(n)])], [shape(3 + k, 1) for k in range(n)],
+                    [(1, "x" * MIB + "\r")])
+    _probe("pub: one 1 Mi story x90k shapes", lambda: _run_pub(blob), len(blob))
+    n = 45_000
+    masters = [page(2 + k, [2 + n + k], master=f"M{k}", applied=2 + (k + 1) % n) for k in range(n)]
+    order = [2 + k for k in range(n)] * 2
+    blob = pub_file(masters, [shape(2 + n + k, k % 1000 + 1) for k in range(n)], stories, order=order)
+    _probe("pub: 45k masters in a cycle", lambda: _run_pub(blob), len(blob))
+    tokn = _tokn([f"https://h{k}.example/" + "p" * 40 for k in range(1000)])
+    quill = _quill_with([(b"TOKN", b"PLC ", k, tokn) for k in range(400)])
+    blob = _v4(pub_file([page(2, [])]), {"Quill/QuillSub/CONTENTS": quill})
+    _probe("pub: 400k links", lambda: _run_pub(blob), len(blob))
+
+
+def _v4(blob, streams):
+    """`blob`'s Contents and Quill streams with `streams` over them, in a compound file of 4096-byte sectors (the
+    512-byte one the fixture writes holds no more than about 7 MiB)."""
+    with Compound(blob) as cf:
+        out = {n: cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")}
+    return cfb_bytes({**out, **streams}, 4096)[0]
+
+
+def _run_pub(blob):
+    ctx = Context()
+    doc = pub.parse_compound(blob, ctx)
+    sections = [b for b in doc.blocks if isinstance(b, Section)]
+    paras = sum(len(s.blocks) for s in sections)
+    links = sum(isinstance(i, Link) for b in doc.blocks if isinstance(b, Para) for i in b.inlines)
+    return f"sections {len(sections)} paras {paras} links {links} {dict(ctx.skipped)}"
 
 
 def _plc_lengths(lengths):

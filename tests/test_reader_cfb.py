@@ -252,6 +252,23 @@ def test_visio_stream_routes():
         assert e.kind == "damaged" and e.detail == "no VisioDocument stream"
 
 
+def test_quill_routes():
+    # cfb_route: a .doc compound holding "Quill/QuillSub/CONTENTS" -> "pub"; pub's own stream is Contents, so a
+    # Quill stream without one is damaged for pub (never routed back to pub itself)
+    from reader.formats import cfb_route
+    from reader_fix import cfb_bytes
+    with Compound(cfb_bytes({"Quill/QuillSub/CONTENTS": b"CHNKINK "})[0]) as cf:
+        assert cfb_route.route(cf, "doc", "no WordDocument stream") == "pub"
+        assert cfb_route.route(cf, "vsd", "no VisioDocument stream") == "pub"
+        e = raises(ReadError, cfb_route.route, cf, "pub", "no Contents stream")
+        assert e.kind == "damaged" and e.detail == "no Contents stream"
+    with Compound(cfb_bytes({"Contents": b"\xE8\xAC\x2C\x00", "Quill/QuillSub/CONTENTS": b"CHNKINK "})[0]) as cf:
+        assert cfb_route.route(cf, "pub", "no Contents stream") is None
+        assert cfb_route.route(cf, "doc", "no WordDocument stream") == "pub"
+    with Compound(cfb_bytes({"WordDocument": bytes(64)})[0]) as cf:
+        assert cfb_route.route(cf, "pub", "no Contents stream") == "doc"
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

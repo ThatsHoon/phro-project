@@ -2033,7 +2033,8 @@ def pub_quill(stories, *, bold=(), tcd=None, links=(), fdpc=True, cycle=False, f
     {story index: cell boundaries} of `tcd`, written as the cell ends from +0xC (boundaries [0, 2, 5] are ends
     [2, 5]), and a TOKN PLC type 12 bit holding `links`. `cycle`: the directory is two lists, the second naming the
     first as next. `fdpp`: (end, default character style index or None) paragraph runs, as an FDPP bit; `stsh`: the
-    bold flags of the default character styles, as the second of two STSH bits (the first holds none)."""
+    bold flags of the default character styles, as the second of three STSH bits, as Publisher writes them (the
+    first holds none, the third as many styles as the second, none bold)."""
     text = "".join(t for _, t in stories).encode("utf-16-le")
     total = len(text) // 2
     data_at = 0x200
@@ -2049,6 +2050,7 @@ def pub_quill(stories, *, bold=(), tcd=None, links=(), fdpc=True, cycle=False, f
     if stsh is not None:
         bits.append(("STSH", "STSH", 0, _quill_stsh(())))
         bits.append(("STSH", "STSH", 1, _quill_stsh(stsh)))
+        bits.append(("STSH", "STSH", 2, _quill_stsh([False] * len(stsh))))
     for index, bounds in sorted((tcd or {}).items()):
         ends = list(bounds[1:])
         bits.append(("TCD ", "PLC ", index, _quill_plc(len(ends) - 1, 0, struct.pack("<I", 0xFF00), ends)))
@@ -2070,3 +2072,77 @@ def pub_quill(stories, *, bold=(), tcd=None, links=(), fdpc=True, cycle=False, f
         out += struct.pack("<HHI", 0, len(entries), 0xFFFFFFFF) + b"".join(entries)
     assert len(out) <= data_at, len(out)
     return bytes(out + bytes(data_at - len(out)) + data)
+
+
+def _pub_values(pairs) -> bytes:
+    """Publisher's Escher values (libmspub extractEscherValues): 4 bytes (the length once more), then (u16 id, u32
+    value) pairs."""
+    return bytes(4) + b"".join(struct.pack("<HI", k, v & 0xFFFFFFFF) for k, v in pairs)
+
+
+def pub_sp(seq=None, box=None, *, child=None, group=None) -> bytes:
+    """A Publisher SpContainer (0xF004): its FSP; an FSPGR (0xF009) with the child coordinate system `group` (xs, ys,
+    xe, ye) when given; a ClientAnchor (0xF010) of the `box` (xs, ys, xe, ye, as values 0x2001-0x2004), or a
+    ChildAnchor (0xF00F) of the `child` box in its group's coordinates; a ClientData (0xF011) naming the Contents shape
+    seqnum `seq` (value 0x6801)."""
+    rec = oa_record(0xF00A, struct.pack("<II", 0, 0x201 if group is not None else 0xA00), ver=2)
+    if group is not None:
+        rec += oa_record(0xF009, struct.pack("<4i", *group), ver=1)
+    if box is not None:
+        rec += oa_record(0xF010, _pub_values(zip((0x2001, 0x2002, 0x2003, 0x2004), box)))
+    if child is not None:
+        rec += oa_record(0xF00F, struct.pack("<4i", *child))
+    if seq is not None:
+        rec += oa_record(0xF011, _pub_values([(0x6801, seq)]))
+    return oa_container(0xF004, rec)
+
+
+def pub_group(leader, *members) -> bytes:
+    """A Publisher SpgrContainer (0xF003): the group's own shape `leader` (pub_sp with `group`), then `members`."""
+    return oa_container(0xF003, leader, *members)
+
+
+def pub_escher(*members) -> bytes:
+    """An Escher/EscherStm stream as Publisher writes it: a DggContainer and a DgContainer, each followed by 4 more
+    bytes (libmspub getEscherElementTailLength); the Dg holds one SpgrContainer, its patriarch shape and `members`
+    (pub_sp, pub_group)."""
+    dgg = oa_container(0xF000, oa_record(0xF006, bytes(16))) + bytes(4)
+    spgr = oa_container(0xF003, pub_sp(group=(0, 0, 0, 0)), *members)
+    return dgg + oa_container(0xF002, oa_record(0xF008, bytes(8)), spgr) + bytes(4)
+
+
+PUB_DOCUMENT = 1   # the DOCUMENT chunk's seqnum in pub_file
+
+
+def pub_file(pages, shapes=(), stories=(), *, order=None, escher=None, version=0x2C, quill=True, streams=None,
+             **quill_kw) -> bytes:
+    """A Publisher 2002+ compound file: Contents (pub_contents) with the DOCUMENT chunk (seqnum PUB_DOCUMENT) whose
+    page list (block 0x02, entries id 0) is `order` (the pages' seqnums in turn when None), a PAGE chunk for each page
+    and a shape chunk for each shape; the Quill stream of `stories` (pub_quill, with `quill_kw`) unless `quill` is
+    False; `escher` as Escher/EscherStm when given; `streams` added as they are.
+    A page is a dict: seq, shapes (the seqnums of block 0x02, type 0x70), master (its 0x0E name, a str; "" or None for
+    none), applied (its 0x0D master seqnum), extra (more blocks, already built, after those). A shape is a dict: seq,
+    type (0x01 SHAPE by default), text (its 0x27 text id), parent (its directory parent seqnum)."""
+    plist = [p["seq"] for p in pages] if order is None else list(order)
+    doc = pub_block(0x02, 0xA0, b"".join(pub_block(0, 0x70, s) for s in plist))
+    chunks = [(PUB_DOCUMENT, 0x44, None, doc)]
+    for p in pages:
+        blocks = pub_block(0x02, 0xA0, b"".join(pub_block(0, 0x70, s) for s in p.get("shapes", ())))
+        name = p.get("master") or ""
+        blocks += pub_block(0x0E, 0xC0, name.encode("utf-16-le") + (b"\0\0" if name else b""))
+        if p.get("applied") is not None:
+            blocks += pub_block(0x0D, 0x68, p["applied"])
+        blocks += p.get("extra", b"")
+        chunks.append((p["seq"], 0x43, p.get("parent"), blocks))
+    for s in shapes:
+        blocks = pub_block(0xAA, 0x20, 100) + pub_block(0xAB, 0x20, 100)
+        if s.get("text") is not None:
+            blocks += pub_block(0x27, 0x20, s["text"])
+        chunks.append((s["seq"], s.get("type", 0x01), s.get("parent"), blocks))
+    out = {"Contents": pub_contents(chunks, version=version)}
+    if quill:
+        out["Quill/QuillSub/CONTENTS"] = pub_quill(list(stories), **quill_kw)
+    if escher is not None:
+        out["Escher/EscherStm"] = escher
+    out.update(streams or {})
+    return cfb_bytes(out)[0]
