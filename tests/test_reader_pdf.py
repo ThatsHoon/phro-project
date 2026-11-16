@@ -730,9 +730,9 @@ def test_parse_path():
 
 def _venv_python():
     """The venv interpreter of the pdfium measurements (PHRO_READER_PYENV, else the ready venv)."""
-    from reader import pdfenv
-    py = pdfenv.interpreter(pdfenv.venv_dir())
-    if pdfenv.forced_native() or not py.is_file():
+    from reader import pyenv
+    py = pyenv.interpreter(pyenv.venv_dir())
+    if pyenv.forced_native() or not py.is_file():
         raise SystemExit("measure needs the pdf venv: set PHRO_READER_PYENV")
     return py
 

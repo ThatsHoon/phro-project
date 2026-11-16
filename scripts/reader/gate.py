@@ -453,9 +453,9 @@ class _Unverified(Exception):
 def _pdf(event, path, start, timeout, command):
     """decide() for pdf: the engine id in the key, Read's pages mapped onto the page index, failures passed
     through to Claude's own Read (remembered for a day) and the pypdfium2 setup offer once a session."""
-    from reader import pdfenv
-    venv = pdfenv.venv_dir()
-    engine = pdfenv.engine(venv)
+    from reader import pyenv
+    venv = pyenv.venv_dir()
+    engine = pyenv.engine(kind="pdf", venv=venv)
     if engine != "native":
         try:
             return _pdf_read(event, path, start, timeout, command, venv, engine, False)
@@ -466,7 +466,7 @@ def _pdf(event, path, start, timeout, command):
 
 def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
     import hashlib
-    from reader import cache, pdfenv
+    from reader import cache, pyenv
     k = cache.key(path, engine)
     entry = cache.lookup(k)
     verified = []  # the venv's file check runs once, before the first pdfium child of this call
@@ -481,12 +481,12 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
             return None, _pass(path, fail)
         if engine != "native" and not verified:
             verified.append(True)
-            if not pdfenv.verify(venv):
+            if not pyenv.verify(venv):
                 raise _Unverified
         if command is not None:
             cmd = list(command)
         else:
-            py = pdfenv.interpreter(venv) if engine != "native" else sys.executable
+            py = pyenv.interpreter(venv) if engine != "native" else sys.executable
             cmd = [str(py), "-I", "-X", "utf8", str(READ_PY), "convert"]
         cmd += [str(path), "--engine", "native" if engine == "native" else "pdfium"]
         if pages:
@@ -543,7 +543,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
                     at["limit"] = after - first[1]
     out_md = entry / "out.md"
     offer, mark = "", None
-    if engine == "native" and not pdfenv.forced_native() and not pdfenv.declined():
+    if engine == "native" and not pyenv.forced_native() and not pyenv.declined():
         sid = event.get("session_id")
         if isinstance(sid, str) and sid:
             mark = cache.root() / "offers" / hashlib.sha1(sid.encode("utf-8", "replace")).hexdigest()

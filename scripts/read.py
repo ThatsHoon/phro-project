@@ -51,12 +51,12 @@ def _pages(text):
 
 def _engine_id(wanted) -> str:
     """The engine id a pdf is read with: for --engine pdfium, when pypdfium2 imports (the venv child),
-    pdfenv.engine_id_from_module(); otherwise native, so native output is never filed under a pdfium key."""
+    pyenv.engine_id_from_module(); otherwise native, so native output is never filed under a pdfium key."""
     if wanted != "pdfium":
         return "native"
     try:
-        from reader import pdfenv  # engine_id_from_module imports pypdfium2 itself
-        return pdfenv.engine_id_from_module()
+        from reader import pyenv  # engine_id_from_module imports pypdfium2 itself
+        return pyenv.engine_id_from_module()
     except Exception:  # noqa: BLE001 - not importable, or a broken install: read natively
         return "native"
 
@@ -66,13 +66,13 @@ def _reexec(a):
     there with --engine pdfium and relay its output. Returns the exit code, or None to read natively."""
     if a.engine is not None or reader.ext_of(Path(a.file)) != "pdf":
         return None
-    from reader import pdfenv
-    if pdfenv.forced_native():
+    from reader import pyenv
+    if pyenv.forced_native():
         return None
-    venv = pdfenv.venv_dir()
-    if pdfenv.state(venv) != "READY":
+    venv = pyenv.venv_dir()
+    if pyenv.state(venv) != "READY":
         return None
-    py = pdfenv.interpreter(venv)
+    py = pyenv.interpreter(venv)
     if os.path.normcase(os.path.abspath(sys.executable)) == os.path.normcase(os.path.abspath(py)):
         return None
     import subprocess
@@ -97,16 +97,20 @@ def _reexec(a):
 
 
 def cmd_setup(a) -> int:
-    from reader import pdfenv, pdfsetup
-    venv = Path(a.venv) if a.venv else pdfenv.venv_dir()
+    if a.kind == "mpp":  # Task 4 replaces this
+        print("FAIL	setup	mpp is not available yet")
+        return 1
+    from reader import pyenv, pysetup
+    kind = a.kind
+    venv = Path(a.venv) if a.venv else pyenv.venv_dir(kind)
     if a.check:
-        line = pdfsetup.check(venv)
+        line = pysetup.check(venv, kind)
     elif a.decline:
-        line = pdfsetup.decline()
+        line = pysetup.decline(kind)
     elif a.remove:
-        line = pdfsetup.remove(venv)
+        line = pysetup.remove(venv, kind)
     else:
-        line = pdfsetup.setup(venv)
+        line = pysetup.setup(venv, kind=kind)
     print(line)
     return 1 if line.startswith("FAIL") else 0
 
@@ -190,6 +194,7 @@ def main(argv=None) -> int:
     c.add_argument("--pages", type=_pages, metavar="A-B")
     c.set_defaults(fn=cmd_convert)
     s = sub.add_parser("setup")
+    s.add_argument("--for", dest="kind", choices=("pdf", "mpp"), default="pdf")
     s.add_argument("--venv")
     mode = s.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true")

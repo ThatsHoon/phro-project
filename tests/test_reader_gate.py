@@ -750,10 +750,10 @@ def test_pdf_converts_native():
 
 def test_engine_in_key():
     import pdf_fix
-    from reader import cache, pdfenv
+    from reader import cache, pyenv
     v = pdf_fix.fake_venv(tmp() / "venv")
     with pdf_env(v):
-        assert pdfenv.engine() == "pdfium-5.15.2-7000"
+        assert pyenv.engine() == "pdfium-5.15.2-7000"
         p = pdf_file([pdf_fix.text_ops("Hi")])
         k = cache.key(p, "pdfium-5.15.2-7000")
         d = cache.store(k, p, engine="native")
@@ -784,27 +784,27 @@ def test_range_miss_verifies_first():
     """A whole entry cached under the pdfium key and a range past its cut: verify runs (once) before any venv child;
     a tampered venv reads natively with the repair sentence."""
     import pdf_fix
-    from reader import cache, pdfenv
+    from reader import cache, pyenv
     v = pdf_fix.fake_venv(tmp() / "venv")
     rec = next(v.rglob("RECORD"))
     rec.write_bytes(rec.read_bytes() + b"tampered,,\n")
     with pdf_env(v):
         p = four_pages()
-        k = cache.key(p, pdfenv.engine())
+        k = cache.key(p, pyenv.engine())
         d = cache.store(k, p, engine="native")
         meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
         meta.update(pages=[[1, 1], [2, 5]], pages_total=4)
         (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
-        calls, real_verify = [], pdfenv.verify
+        calls, real_verify = [], pyenv.verify
         seen, real_run = [], gate.subprocess.run
-        pdfenv.verify = lambda venv: calls.append(venv) or real_verify(venv)
+        pyenv.verify = lambda venv: calls.append(venv) or real_verify(venv)
         gate.subprocess.run = lambda cmd, **kw: seen.append(cmd) or real_run(cmd, **kw)
         try:
             o = out(gate.decide(ev(p, pages="3-4")))
         finally:
-            pdfenv.verify, gate.subprocess.run = real_verify, real_run
+            pyenv.verify, gate.subprocess.run = real_verify, real_run
         assert len(calls) == 1, calls
-        venv_py = str(pdfenv.interpreter(v))
+        venv_py = str(pyenv.interpreter(v))
         assert seen and all(c[0] != venv_py for c in seen), seen
         assert o["permissionDecision"] == "allow", o
         assert "failed its file check" in o["additionalContext"], o
@@ -1185,6 +1185,16 @@ def test_keynote_key_converts():
     with stub():
         o = out(gate.decide(ev(put("a.key", keynote09(slide09(ti._p("T"), ti._p("slideword")))))))
     assert o["permissionDecision"] == "allow", o
+
+
+def test_setup_for_flag():
+    import io
+    from contextlib import redirect_stdout
+    import read
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = read.main(["setup", "--for", "mpp", "--check"])
+    assert code == 1 and buf.getvalue().strip() == "FAIL	setup	mpp is not available yet", buf.getvalue()
 
 
 def main():

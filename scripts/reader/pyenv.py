@@ -1,7 +1,8 @@
-"""State of the optional pypdfium2 venv: cheap checks only (no subprocess, no format modules).
+"""State of the optional venvs (kind "pdf": pypdfium2; "mpp": added later): cheap checks only (no subprocess,
+no format modules).
 
-The venv is made only by `read.py setup` (see pdfsetup). Here: where it lives, whether it is usable, and
-the engine id a pdf is read with.
+A venv is made only by `read.py setup` (see pysetup). Here: where it lives, whether it is usable, and
+the engine id a file is read with.
 """
 import base64
 import hashlib
@@ -10,31 +11,45 @@ import os
 import sys
 from pathlib import Path
 
-REQUIREMENTS = Path(__file__).resolve().parent / "requirements-pdf.txt"
+KINDS = ("pdf", "mpp")
+REQUIREMENTS = {"pdf": Path(__file__).resolve().parent / "requirements-pdf.txt"}  # Task 4 adds mpp
+_ENV = {"pdf": "PHRO_READER_PYENV", "mpp": "PHRO_READER_MPPENV"}
 
 
+def _check(kind):
+    if kind not in KINDS:
+        raise ValueError(f"unknown kind {kind!r}")
+
+
+def _requirements(kind) -> Path:
+    _check(kind)
+    try:
+        return REQUIREMENTS[kind]
+    except KeyError:
+        raise ValueError(f"{kind} is not available yet") from None
 
 
 def forced_native() -> bool:
     return os.environ.get("PHRO_READER_PYENV") == "off"
 
 
-def venv_dir() -> Path:
-    env = os.environ.get("PHRO_READER_PYENV")
+def venv_dir(kind="pdf") -> Path:
+    _check(kind)
+    env = os.environ.get(_ENV[kind])
     if env and env != "off":
         return Path(env)
     data = os.environ.get("CLAUDE_PLUGIN_DATA")
     if data:
-        return Path(data) / "pdf-venv"
+        return Path(data) / f"{kind}-venv"
     from . import cache
     root = cache.root()
     try:
-        ptr = json.loads((root / "pdf-venv.json").read_text(encoding="utf-8"))
+        ptr = json.loads((root / f"{kind}-venv.json").read_text(encoding="utf-8"))
         if isinstance(ptr, dict) and isinstance(ptr.get("venv"), str) and ptr["venv"]:
             return Path(ptr["venv"])
     except (OSError, ValueError):
         pass
-    return cache.venv_base() / "pdf-venv"
+    return cache.venv_base() / f"{kind}-venv"
 
 
 def interpreter(venv) -> Path:
@@ -44,8 +59,8 @@ def interpreter(venv) -> Path:
     return venv / "bin" / "python3"
 
 
-def requirements_hash() -> str:
-    return hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest()
+def requirements_hash(kind="pdf") -> str:
+    return hashlib.sha256(_requirements(kind).read_bytes()).hexdigest()
 
 
 def _ready(venv):
@@ -67,7 +82,7 @@ def _home(venv):
     return None
 
 
-def state(venv) -> str:
+def state(venv, kind="pdf") -> str:
     venv = Path(venv)
     if not venv.is_dir():
         return "MISSING"
@@ -79,7 +94,7 @@ def state(venv) -> str:
     home = _home(venv)
     if not home or not Path(home).is_dir():
         return "BROKEN"
-    if ready.get("requirements") != requirements_hash():
+    if ready.get("requirements") != requirements_hash(kind):
         return "STALE"
     return "READY"
 
@@ -88,11 +103,12 @@ def engine_id(version, build) -> str:
     return f"pdfium-{version}-{build}"
 
 
-def engine(venv=None) -> str:
-    if forced_native():
+def engine(kind="pdf", venv=None) -> str:
+    _check(kind)
+    if kind == "pdf" and forced_native():
         return "native"
-    venv = Path(venv) if venv is not None else venv_dir()
-    if state(venv) != "READY":
+    venv = Path(venv) if venv is not None else venv_dir(kind)
+    if state(venv, kind) != "READY":
         return "native"
     ready = _ready(venv)
     if not ready.get("pypdfium2") or not ready.get("pdfium"):
@@ -100,7 +116,7 @@ def engine(venv=None) -> str:
     return engine_id(ready["pypdfium2"], ready["pdfium"])
 
 
-def engine_id_from_module() -> str:
+def engine_id_from_module(kind="pdf") -> str:
     """Used in the venv child, where pypdfium2 imports."""
     from pypdfium2 import version as v
     return engine_id(v.PYPDFIUM_INFO.version, v.PDFIUM_INFO.build)
@@ -124,7 +140,7 @@ def record_digests(venv) -> dict:
     return {"pypdfium2": hashlib.sha256(recs[0].read_bytes()).hexdigest()}
 
 
-def verify(venv) -> bool:
+def verify(venv, kind="pdf") -> bool:
     """The full check: the one RECORD matches ready.json, lists a pypdfium2_raw file, and every file it lists with
     a digest (paths are relative to site-packages, so `../../Scripts/...` counts) hashes to it."""
     ready = _ready(venv)
@@ -160,6 +176,7 @@ def verify(venv) -> bool:
     return raw
 
 
-def declined() -> bool:
+def declined(kind="pdf") -> bool:
+    _check(kind)
     from . import cache
-    return (cache.root() / "pdf-declined").exists()
+    return (cache.root() / f"{kind}-declined").exists()

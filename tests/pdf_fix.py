@@ -628,10 +628,10 @@ def fake_venv(dir, *, build=7000):
     with their digests, and ready.json (current requirements hash, 5.15.2, build, the RECORD digest)."""
     import base64
     import json
-    from reader import pdfenv
+    from reader import pyenv
     d = Path(dir)
     d.mkdir(parents=True, exist_ok=True)
-    py = pdfenv.interpreter(d)
+    py = pyenv.interpreter(d)
     py.parent.mkdir(parents=True, exist_ok=True)
     py.write_bytes(b"")
     (d / "pyvenv.cfg").write_text(f"home = {d}\nversion = 3.12.0\n", encoding="utf-8")
@@ -649,7 +649,7 @@ def fake_venv(dir, *, build=7000):
     lines.append("pypdfium2-5.15.2.dist-info/RECORD,,\n")
     rec = info / "RECORD"
     rec.write_bytes("".join(lines).encode())
-    ready = {"requirements": pdfenv.requirements_hash(), "python": {"version": "3.12.0", "home": str(d)},
+    ready = {"requirements": pyenv.requirements_hash(), "python": {"version": "3.12.0", "home": str(d)},
              "pypdfium2": "5.15.2", "pdfium": build,
              "records": {"pypdfium2": hashlib.sha256(rec.read_bytes()).hexdigest()}}
     (d / "ready.json").write_text(json.dumps(ready), encoding="utf-8")

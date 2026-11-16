@@ -1,4 +1,4 @@
-"""Creating the optional pypdfium2 venv. Runs only from `read.py setup`: nothing else in the reader imports it.
+"""Creating an optional venv (kind "pdf": pypdfium2). Runs only from `read.py setup`: nothing else imports it.
 
 Each step that touches the system sits in `Steps`, so tests replace them with stubs.
 """
@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import cache, pdfenv
+from . import cache, pyenv
 
 PIP_TIMEOUT = 900
 STALE_SECONDS = 1080  # past PIP_TIMEOUT, so a slow but live pip never loses its lock or its tmp folder
@@ -71,7 +71,7 @@ class Steps:
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout).strip())
         version, build = json.loads(r.stdout.strip().splitlines()[-1])
-        return version, build, pdfenv.record_digests(Path(python).parent.parent)
+        return version, build, pyenv.record_digests(Path(python).parent.parent)
 
     def smoke(self, python):
         work = Path(python).parent.parent
@@ -143,8 +143,8 @@ def _replaceable(path: Path) -> bool:
     return _is_venv(path) or not any(path.iterdir())
 
 
-def _not_venv(path) -> str:
-    return f"FAIL\tinstall\t{path} is not a pdf venv"
+def _not_venv(path, kind="pdf") -> str:
+    return f"FAIL\tinstall\t{path} is not a {kind} venv"
 
 
 def _python_info(tmp: Path) -> dict:
@@ -169,7 +169,8 @@ def _clean_leftovers(venv: Path, tmp: Path) -> None:
             shutil.rmtree(p, ignore_errors=True)
 
 
-def setup(venv, steps=None) -> str:
+def setup(venv, steps=None, kind="pdf") -> str:
+    pyenv._check(kind)
     steps = steps or Steps()
     venv = Path(venv).resolve()
     try:
@@ -183,11 +184,11 @@ def setup(venv, steps=None) -> str:
     tmp = _sibling(venv, f".tmp-{os.getpid()}")
     try:
         if not _replaceable(venv):
-            return _not_venv(venv)
+            return _not_venv(venv, kind)
         _clean_leftovers(venv, tmp)
         shutil.rmtree(tmp, ignore_errors=True)
         try:
-            return _build(venv, tmp, steps)
+            return _build(venv, tmp, steps, kind)
         except Exception as e:  # noqa: BLE001
             return f"FAIL\tinstall\t{_flat(e)}"
         finally:
@@ -196,14 +197,14 @@ def setup(venv, steps=None) -> str:
         _release(lock, token)
 
 
-def _build(venv: Path, tmp: Path, steps) -> str:
+def _build(venv: Path, tmp: Path, steps, kind="pdf") -> str:
     try:
         steps.make_venv(tmp)
     except Exception as e:  # noqa: BLE001
         return f"FAIL\tvenv\t{_flat(e)}"
-    python = pdfenv.interpreter(tmp)
+    python = pyenv.interpreter(tmp)
     try:
-        ok, output = steps.pip(python, pdfenv.REQUIREMENTS)
+        ok, output = steps.pip(python, pyenv.REQUIREMENTS[kind])
     except Exception as e:  # noqa: BLE001
         return f"FAIL\tpip\t{_flat(e)}"
     if not ok:
@@ -221,11 +222,11 @@ def _build(venv: Path, tmp: Path, steps) -> str:
         return f"FAIL\tsmoke\t{_flat(e)}"
     if not smoked:
         return "FAIL\tsmoke\tthe test page did not read with pdfium"
-    ready = {"requirements": pdfenv.requirements_hash(), "python": _python_info(tmp),
+    ready = {"requirements": pyenv.requirements_hash(kind), "python": _python_info(tmp),
              "pypdfium2": version, "pdfium": build, "records": records}
     (tmp / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
     if not _replaceable(venv):  # looked at again right before the swap
-        return _not_venv(venv)
+        return _not_venv(venv, kind)
     old = _sibling(venv, f".old-{os.getpid()}")
     shutil.rmtree(old, ignore_errors=True)
     moved = False
@@ -244,38 +245,39 @@ def _build(venv: Path, tmp: Path, steps) -> str:
     shutil.rmtree(old, ignore_errors=True)
     try:
         root = cache.root()
-        (root / "pdf-venv.json").write_text(json.dumps({"venv": str(venv)}), encoding="utf-8")
-        (root / "pdf-declined").unlink(missing_ok=True)
+        (root / f"{kind}-venv.json").write_text(json.dumps({"venv": str(venv)}), encoding="utf-8")
+        (root / f"{kind}-declined").unlink(missing_ok=True)
     except OSError as e:
         return f"FAIL\tpointer\t{_flat(e)}"
-    return f"READY\t{venv}\t{pdfenv.engine_id(version, build)}"
+    return f"READY\t{venv}\t{pyenv.engine_id(version, build)}"
 
 
-def check(venv) -> str:
+def check(venv, kind="pdf") -> str:
     venv = Path(venv).resolve()
-    st = pdfenv.state(venv)
+    st = pyenv.state(venv, kind)
     if st == "READY":
-        ready = pdfenv._ready(venv)
-        return f"READY\t{venv}\t{pdfenv.engine_id(ready.get('pypdfium2'), ready.get('pdfium'))}"
+        ready = pyenv._ready(venv)
+        return f"READY\t{venv}\t{pyenv.engine_id(ready.get('pypdfium2'), ready.get('pdfium'))}"
     return f"{st}\t{venv}"
 
 
-def decline() -> str:
-    (cache.root() / "pdf-declined").write_text("", encoding="utf-8")
+def decline(kind="pdf") -> str:
+    pyenv._check(kind)
+    (cache.root() / f"{kind}-declined").write_text("", encoding="utf-8")
     return "DECLINED"
 
 
-def remove(venv) -> str:
+def remove(venv, kind="pdf") -> str:
     """Delete the venv, only when it is one (holds pyvenv.cfg), and the pointer only when it names this venv."""
     venv = Path(venv).resolve()
     if venv.exists():
         if not (venv.is_dir() and _is_venv(venv)):
-            return _not_venv(venv)
+            return _not_venv(venv, kind)
         try:
             shutil.rmtree(venv)
         except OSError as e:
             return f"FAIL\tremove\t{_flat(e)}"
-    ptr = cache.root() / "pdf-venv.json"
+    ptr = cache.root() / f"{kind}-venv.json"
     try:
         named = json.loads(ptr.read_text(encoding="utf-8")).get("venv")
         if isinstance(named, str) and Path(named).resolve() == venv:

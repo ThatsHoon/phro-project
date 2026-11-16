@@ -1,7 +1,7 @@
-"""The optional pypdfium2 venv: pdfenv state checks, pdfsetup with stub steps, the pinned requirements and the
+"""The optional pypdfium2 venv: pyenv state checks, pysetup with stub steps, the pinned requirements and the
 convert re-exec. No test runs the real pip or venv steps.
 
-Run: python -I -X utf8 tests/test_reader_pdfenv.py
+Run: python -I -X utf8 tests/test_reader_pyenv.py
 """
 import io
 import json
@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import pdf_fix  # noqa: E402
 import read  # noqa: E402
-from reader import pdfenv, pdfsetup  # noqa: E402
+from reader import pyenv, pysetup  # noqa: E402
 from reader.model import Context  # noqa: E402
 
 KEYS = ("PHRO_READER_CACHE", "PHRO_READER_PYENV", "CLAUDE_PLUGIN_DATA")
@@ -71,7 +71,7 @@ class Stub:
 
     def versions(self, python):
         self.calls.append("versions")
-        return "5.15.2", self.build, pdfenv.record_digests(Path(python).parent.parent)
+        return "5.15.2", self.build, pyenv.record_digests(Path(python).parent.parent)
 
     def smoke(self, python):
         self.calls.append("smoke")
@@ -87,37 +87,37 @@ def test_venv_dir_order():
     with env() as d:
         os.environ["PHRO_READER_PYENV"] = str(d / "X")
         os.environ["CLAUDE_PLUGIN_DATA"] = str(d / "D")
-        assert pdfenv.venv_dir() == d / "X"
+        assert pyenv.venv_dir() == d / "X"
         del os.environ["PHRO_READER_PYENV"]
-        assert pdfenv.venv_dir() == d / "D" / "pdf-venv"
+        assert pyenv.venv_dir() == d / "D" / "pdf-venv"
         del os.environ["CLAUDE_PLUGIN_DATA"]
         from reader import cache
         (cache.root() / "pdf-venv.json").write_text(json.dumps({"venv": str(d / "P")}), encoding="utf-8")
-        assert pdfenv.venv_dir() == d / "P"
+        assert pyenv.venv_dir() == d / "P"
         (cache.root() / "pdf-venv.json").write_text("not json", encoding="utf-8")
-        assert pdfenv.venv_dir() == cache.root().parent / "pdf-venv"
+        assert pyenv.venv_dir() == cache.root().parent / "pdf-venv"
         (cache.root() / "pdf-venv.json").unlink()
-        assert pdfenv.venv_dir() == cache.root().parent / "pdf-venv"
+        assert pyenv.venv_dir() == cache.root().parent / "pdf-venv"
 
 
 def test_off_forces_native():
     with env() as d:
-        default = pdfenv.venv_dir()
+        default = pyenv.venv_dir()
         pdf_fix.fake_venv(default)
-        assert pdfenv.engine() == "pdfium-5.15.2-7000"
+        assert pyenv.engine() == "pdfium-5.15.2-7000"
         os.environ["PHRO_READER_PYENV"] = "off"
-        assert pdfenv.forced_native()
-        assert pdfenv.engine() == "native"
-        assert pdfenv.engine(default) == "native"
+        assert pyenv.forced_native()
+        assert pyenv.engine() == "native"
+        assert pyenv.engine(venv=default) == "native"
 
 
 def test_ready_engine_id():
     with env() as d:
         v = pdf_fix.fake_venv(d / "v")
-        assert pdfenv.state(v) == "READY"
-        assert pdfenv.verify(v) is True
-        assert pdfenv.engine(v) == "pdfium-5.15.2-7000"
-        assert pdfenv.engine_id("1", 2) == "pdfium-1-2"
+        assert pyenv.state(v) == "READY"
+        assert pyenv.verify(v) is True
+        assert pyenv.engine(venv=v) == "pdfium-5.15.2-7000"
+        assert pyenv.engine_id("1", 2) == "pdfium-1-2"
 
 
 def test_stale_after_pin_change():
@@ -126,28 +126,28 @@ def test_stale_after_pin_change():
         ready = json.loads((v / "ready.json").read_text(encoding="utf-8"))
         ready["requirements"] = "0" * 64
         (v / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
-        assert pdfenv.state(v) == "STALE"
-        assert pdfenv.engine(v) == "native"
+        assert pyenv.state(v) == "STALE"
+        assert pyenv.engine(venv=v) == "native"
 
 
 def test_broken_home():
     with env() as d:
         v = pdf_fix.fake_venv(d / "v")
         (v / "pyvenv.cfg").write_text(f"home = {d / 'nowhere'}\n", encoding="utf-8")
-        assert pdfenv.state(v) == "BROKEN"
-        assert pdfenv.engine(v) == "native"
+        assert pyenv.state(v) == "BROKEN"
+        assert pyenv.engine(venv=v) == "native"
         v2 = pdf_fix.fake_venv(d / "v2")
         (v2 / "ready.json").write_text("{", encoding="utf-8")
-        assert pdfenv.state(v2) == "BROKEN"
+        assert pyenv.state(v2) == "BROKEN"
         v3 = pdf_fix.fake_venv(d / "v3")
-        pdfenv.interpreter(v3).unlink()
-        assert pdfenv.state(v3) == "BROKEN"
+        pyenv.interpreter(v3).unlink()
+        assert pyenv.state(v3) == "BROKEN"
 
 
 def test_missing():
     with env() as d:
-        assert pdfenv.state(d / "nope") == "MISSING"
-        assert pdfenv.engine(d / "nope") == "native"
+        assert pyenv.state(d / "nope") == "MISSING"
+        assert pyenv.engine(venv=d / "nope") == "native"
 
 
 def test_verify_record_mismatch():
@@ -156,11 +156,11 @@ def test_verify_record_mismatch():
         a = v / "Lib" / "site-packages" / "pypdfium2" / "__init__.py"
         old = a.read_bytes()
         a.write_bytes(old + b"# changed\n")
-        assert pdfenv.verify(v) is False
+        assert pyenv.verify(v) is False
         a.write_bytes(old)
-        assert pdfenv.verify(v) is True
+        assert pyenv.verify(v) is True
         a.unlink()
-        assert pdfenv.verify(v) is False
+        assert pyenv.verify(v) is False
 
 
 def test_partial_install_ignored():
@@ -174,8 +174,8 @@ def test_partial_install_ignored():
         old = time.time() - 1200
         os.utime(part, (old, old))
         os.utime(lock, (old, old))
-        assert pdfenv.state(dest) == "MISSING"
-        out = pdfsetup.setup(dest, Stub())
+        assert pyenv.state(dest) == "MISSING"
+        out = pysetup.setup(dest, Stub())
         assert out.startswith("READY\t"), out
         assert not part.exists()
         assert not lock.exists()
@@ -184,10 +184,10 @@ def test_partial_install_ignored():
 def test_pointer_without_plugin_data():
     with env() as d:
         os.environ["CLAUDE_PLUGIN_DATA"] = str(d / "D")
-        dest = pdfenv.venv_dir()
-        assert pdfsetup.setup(dest, Stub()).startswith("READY\t")
+        dest = pyenv.venv_dir()
+        assert pysetup.setup(dest, Stub()).startswith("READY\t")
         del os.environ["CLAUDE_PLUGIN_DATA"]
-        assert pdfenv.venv_dir() == d / "D" / "pdf-venv"
+        assert pyenv.venv_dir() == d / "D" / "pdf-venv"
 
 
 def test_setup_success():
@@ -196,16 +196,16 @@ def test_setup_success():
         from reader import cache
         decl = cache.root() / "pdf-declined"
         decl.write_text("", encoding="utf-8")
-        out = pdfsetup.setup(dest, Stub())
+        out = pysetup.setup(dest, Stub())
         assert out == f"READY\t{dest}\tpdfium-5.15.2-7000", out
         ready = json.loads((dest / "ready.json").read_text(encoding="utf-8"))
-        assert ready["requirements"] == pdfenv.requirements_hash()
+        assert ready["requirements"] == pyenv.requirements_hash()
         assert ready["pypdfium2"] == "5.15.2" and ready["pdfium"] == 7000
         assert set(ready["records"]) == {"pypdfium2"}
         assert "version" in ready["python"] and "home" in ready["python"]
-        assert pdfenv.state(dest) == "READY" and pdfenv.verify(dest)
+        assert pyenv.state(dest) == "READY" and pyenv.verify(dest)
         assert leftovers(dest) == []
-        assert not decl.exists() and not pdfenv.declined()
+        assert not decl.exists() and not pyenv.declined()
         assert json.loads((cache.root() / "pdf-venv.json").read_text(encoding="utf-8")) == {"venv": str(dest)}
 
 
@@ -215,7 +215,7 @@ def test_setup_replaces_old():
         dest.mkdir()
         (dest / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
         (dest / "marker").write_text("old", encoding="utf-8")
-        assert pdfsetup.setup(dest, Stub()).startswith("READY\t")
+        assert pysetup.setup(dest, Stub()).startswith("READY\t")
         assert not (dest / "marker").exists()
         assert leftovers(dest) == []
 
@@ -230,7 +230,7 @@ def _nothing_left(dest):
 def test_setup_pip_fail():
     with env() as d:
         dest = d / "pdf-venv"
-        out = pdfsetup.setup(dest, Stub(pip=(False, "ERROR: boom\nsecond line")))
+        out = pysetup.setup(dest, Stub(pip=(False, "ERROR: boom\nsecond line")))
         assert out.startswith("FAIL\tpip\t") and "boom" in out and out.count("\n") == 0, out
         _nothing_left(dest)
 
@@ -238,7 +238,7 @@ def test_setup_pip_fail():
 def test_setup_no_wheel():
     with env() as d:
         dest = d / "pdf-venv"
-        out = pdfsetup.setup(dest, Stub(pip=(False, "ERROR: No matching distribution found for pypdfium2")))
+        out = pysetup.setup(dest, Stub(pip=(False, "ERROR: No matching distribution found for pypdfium2")))
         assert out == "FAIL\tpip\tno wheel for this platform", out
         _nothing_left(dest)
 
@@ -246,7 +246,7 @@ def test_setup_no_wheel():
 def test_setup_smoke_fail():
     with env() as d:
         dest = d / "pdf-venv"
-        out = pdfsetup.setup(dest, Stub(smoke=False))
+        out = pysetup.setup(dest, Stub(smoke=False))
         assert out.startswith("FAIL\tsmoke\t"), out
         _nothing_left(dest)
 
@@ -256,7 +256,7 @@ def test_setup_lock_busy():
         dest = d / "pdf-venv"
         lock = Path(str(dest) + ".lock")
         lock.write_text("1", encoding="utf-8")
-        out = pdfsetup.setup(dest, Stub())
+        out = pysetup.setup(dest, Stub())
         assert out == "FAIL\tlock\tanother setup is running", out
         assert lock.exists()
         assert not dest.exists()
@@ -265,25 +265,25 @@ def test_setup_lock_busy():
 def test_lock_released_after_fail():
     with env() as d:
         dest = d / "pdf-venv"
-        pdfsetup.setup(dest, Stub(smoke=False))
+        pysetup.setup(dest, Stub(smoke=False))
         assert not Path(str(dest) + ".lock").exists()
 
 
 def test_check_decline_remove():
     with env() as d:
         dest = d / "pdf-venv"
-        assert pdfsetup.check(dest) == f"MISSING\t{dest}"
-        assert not pdfenv.declined()
-        pdfsetup.decline()
-        assert pdfenv.declined()
-        assert pdfsetup.setup(dest, Stub()).startswith("READY\t")
-        assert pdfsetup.check(dest) == f"READY\t{dest}\tpdfium-5.15.2-7000"
-        pdfsetup.remove(dest)
+        assert pysetup.check(dest) == f"MISSING\t{dest}"
+        assert not pyenv.declined()
+        pysetup.decline()
+        assert pyenv.declined()
+        assert pysetup.setup(dest, Stub()).startswith("READY\t")
+        assert pysetup.check(dest) == f"READY\t{dest}\tpdfium-5.15.2-7000"
+        pysetup.remove(dest)
         _nothing_left(dest)
 
 
 def test_requirements_pinned():
-    text = pdfenv.REQUIREMENTS.read_text(encoding="utf-8")
+    text = pyenv.REQUIREMENTS["pdf"].read_text(encoding="utf-8")
     assert "pypdfium2==5.15.2" in text
     assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", text)) == 7
     lines = text.splitlines()
@@ -305,13 +305,13 @@ def test_requirements_pip_parse():
             "    sys.exit(3)\n"
             "reqs = list(parse_requirements(sys.argv[1], session=PipSession()))\n"
             "print(json.dumps([[r.requirement, r.options.get('hashes', {}).get('sha256')] for r in reqs]))\n")
-    r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, str(pdfenv.REQUIREMENTS)],
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, str(pyenv.REQUIREMENTS["pdf"])],
                        capture_output=True, text=True, cwd=tempfile.gettempdir())
     if r.returncode == 3:
         print("note: pip not importable, pip parse check skipped")
         return
     assert r.returncode == 0, r.stderr
-    want = re.findall(r"--hash=sha256:([0-9a-f]{64})", pdfenv.REQUIREMENTS.read_text(encoding="utf-8"))
+    want = re.findall(r"--hash=sha256:([0-9a-f]{64})", pyenv.REQUIREMENTS["pdf"].read_text(encoding="utf-8"))
     got = json.loads(r.stdout.strip().splitlines()[-1])
     assert len(got) == 1, got
     assert got[0][0].replace(" ", "") == "pypdfium2==5.15.2" and got[0][1] == want, got
@@ -321,7 +321,7 @@ def test_smoke_pdf_reads():
     from reader import markdown
     from reader.formats import pdf
     ctx = Context()
-    doc = pdf.parse_bytes(pdfsetup._smoke_pdf(), ctx)
+    doc = pdf.parse_bytes(pysetup._smoke_pdf(), ctx)
     with tempfile.TemporaryDirectory() as t:
         text = markdown.render(doc, Path(t) / "assets", False, ctx.skipped)
     assert "phro smoke" in text
@@ -348,7 +348,7 @@ def test_convert_reexec():
             assert code == 0 and "relayed" in buf.getvalue()
             assert len(calls) == 1
             cmd = calls[0]
-            assert Path(cmd[0]) == pdfenv.interpreter(v)
+            assert Path(cmd[0]) == pyenv.interpreter(v)
             assert cmd[1:4] == ["-I", "-X", "utf8"] and "convert" in cmd
             assert cmd[cmd.index("--engine") + 1] == "pdfium" and str(src) in cmd
             calls.clear()
@@ -362,8 +362,8 @@ def test_convert_reexec():
             subprocess.run = real
 
 
-def test_pdfenv_import_light():
-    code = ("import sys; sys.path.insert(0, %r); import reader.pdfenv as p; "
+def test_pyenv_import_light():
+    code = ("import sys; sys.path.insert(0, %r); import reader.pyenv as p; "
             "bad = [m for m in sys.modules if m.startswith('reader.formats')]; "
             "assert not bad, bad; assert 'subprocess' not in sys.modules; print('ok')" % str(HERE / "scripts"))
     r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code], capture_output=True, text=True)
@@ -406,14 +406,14 @@ def test_setup_refuses_foreign_dir():
         dest = d / "docs"
         dest.mkdir()
         (dest / "thesis.docx").write_text("precious", encoding="utf-8")
-        out = pdfsetup.setup(dest, Stub())
+        out = pysetup.setup(dest, Stub())
         assert out == f"FAIL\tinstall\t{dest.resolve()} is not a pdf venv", out
         assert (dest / "thesis.docx").read_text(encoding="utf-8") == "precious"
         assert not Path(str(dest) + ".lock").exists()
         assert leftovers(dest) == []
         empty = d / "empty"  # an empty folder is fine to replace
         empty.mkdir()
-        assert pdfsetup.setup(empty, Stub()).startswith("READY\t")
+        assert pysetup.setup(empty, Stub()).startswith("READY\t")
 
 
 def test_remove_refuses_foreign_dir():
@@ -421,7 +421,7 @@ def test_remove_refuses_foreign_dir():
         dest = d / "docs"
         dest.mkdir()
         (dest / "thesis.docx").write_text("precious", encoding="utf-8")
-        out = pdfsetup.remove(dest)
+        out = pysetup.remove(dest)
         assert out == f"FAIL\tinstall\t{dest.resolve()} is not a pdf venv", out
         assert (dest / "thesis.docx").is_file()
 
@@ -432,7 +432,7 @@ def test_remove_keeps_other_pointer():
         mine, other = d / "mine", d / "other"
         pdf_fix.fake_venv(mine)
         (cache.root() / "pdf-venv.json").write_text(json.dumps({"venv": str(other)}), encoding="utf-8")
-        assert pdfsetup.remove(mine).startswith("REMOVED")
+        assert pysetup.remove(mine).startswith("REMOVED")
         assert not mine.exists()
         assert (cache.root() / "pdf-venv.json").exists()
 
@@ -452,11 +452,11 @@ def test_verify_layout():
         ready = json.loads((v / "ready.json").read_text(encoding="utf-8"))
         ready["records"]["pypdfium2"] = hashlib.sha256(rec.read_bytes()).hexdigest()
         (v / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
-        assert pdfenv.verify(v) is False
+        assert pyenv.verify(v) is False
         v2 = pdf_fix.fake_venv(d / "v2")  # two dist-infos
         s2 = v2 / "Lib" / "site-packages"
         shutil.copytree(next(s2.glob("pypdfium2-*.dist-info")), s2 / "pypdfium2-5.0.0.dist-info")
-        assert pdfenv.verify(v2) is False
+        assert pyenv.verify(v2) is False
 
 
 def test_step_isolation():
@@ -468,13 +468,13 @@ def test_step_isolation():
 
     with env() as d:
         venv = d / "pdf-venv"
-        real = pdfsetup.subprocess.run
-        pdfsetup.subprocess.run = fake_run
+        real = pysetup.subprocess.run
+        pysetup.subprocess.run = fake_run
         try:
-            pdfsetup.Steps().make_venv(venv)
-            assert pdfsetup.Steps().pip(venv / "bin" / "python3", pdfenv.REQUIREMENTS) == (True, "")
+            pysetup.Steps().make_venv(venv)
+            assert pysetup.Steps().pip(venv / "bin" / "python3", pyenv.REQUIREMENTS["pdf"]) == (True, "")
         finally:
-            pdfsetup.subprocess.run = real
+            pysetup.subprocess.run = real
         mk, pip = seen
         assert "-I" in mk[0] and Path(mk[1]["cwd"]) == d
         assert "-I" in pip[0] and "--isolated" in pip[0] and pip[1]["timeout"] == 900 and Path(pip[1]["cwd"]) == d
@@ -482,24 +482,24 @@ def test_step_isolation():
         def slow(cmd, **kw):
             raise subprocess.TimeoutExpired(cmd, 900)
 
-        pdfsetup.subprocess.run = slow
+        pysetup.subprocess.run = slow
         try:
-            assert pdfsetup.Steps().pip(venv / "bin" / "python3", pdfenv.REQUIREMENTS) == (False, "timeout")
+            assert pysetup.Steps().pip(venv / "bin" / "python3", pyenv.REQUIREMENTS["pdf"]) == (False, "timeout")
         finally:
-            pdfsetup.subprocess.run = real
+            pysetup.subprocess.run = real
 
 
 def test_step_exceptions_are_fail_lines():
     for step in ("pip", "versions", "smoke"):
         with env() as d:
             dest = d / "pdf-venv"
-            out = pdfsetup.setup(dest, Boom(step))
+            out = pysetup.setup(dest, Boom(step))
             assert out.startswith(f"FAIL\t{step}\t"), out
             _nothing_left(dest)
     with env() as d:
         from reader import cache
         (cache.root() / "pdf-venv.json").mkdir()
-        out = pdfsetup.setup(d / "pdf-venv", Stub())
+        out = pysetup.setup(d / "pdf-venv", Stub())
         assert out.startswith("FAIL\tpointer\t"), out
         assert not Path(str(d / "pdf-venv") + ".lock").exists()
 
@@ -536,7 +536,7 @@ def test_tmp_cleanup_by_prefix():
         t = time.time() - 1200
         for p in (keep, mine_tmp, mine_old):
             os.utime(p, (t, t))
-        assert pdfsetup.setup(dest, Stub()).startswith("READY\t")
+        assert pysetup.setup(dest, Stub()).startswith("READY\t")
         assert keep.exists() and not mine_tmp.exists() and not mine_old.exists() and fresh_old.exists()
 
 
@@ -546,8 +546,8 @@ def test_paths_are_resolved():
         cwd = os.getcwd()
         os.chdir(d)
         try:
-            out = pdfsetup.setup(Path("rel-venv"), Stub())
-            assert pdfsetup.check(Path("rel-venv")).startswith("READY\t")
+            out = pysetup.setup(Path("rel-venv"), Stub())
+            assert pysetup.check(Path("rel-venv")).startswith("READY\t")
         finally:
             os.chdir(cwd)
         want = (d / "rel-venv").resolve()
@@ -566,7 +566,7 @@ def test_fallback_cache_default_venv():
             from reader import cache
             root = cache.root()
             assert root.parent == d, root
-            assert pdfenv.venv_dir() == root / "pdf-venv"
+            assert pyenv.venv_dir() == root / "pdf-venv"
         finally:
             tempfile.tempdir = old_tmp
 
@@ -575,7 +575,7 @@ def test_lock_token_ownership():
     with env() as d:
         dest = d / "pdf-venv"
         lock = Path(str(dest) + ".lock")
-        out = pdfsetup.setup(dest, Shadow(lambda: lock.write_text("someone else", encoding="utf-8")))
+        out = pysetup.setup(dest, Shadow(lambda: lock.write_text("someone else", encoding="utf-8")))
         assert out.startswith("READY\t")
         assert lock.read_text(encoding="utf-8") == "someone else"
 
@@ -596,7 +596,7 @@ def test_swap_restore_failure_names_both():
 
         os.replace = fake_replace
         try:
-            out = pdfsetup.setup(dest, Stub())
+            out = pysetup.setup(dest, Stub())
         finally:
             os.replace = real
         assert out.startswith("FAIL\tinstall\t") and str(dest) in out and ".old-" in out, out
@@ -608,7 +608,7 @@ def test_engine_native_without_version():
         ready = json.loads((v / "ready.json").read_text(encoding="utf-8"))
         del ready["pdfium"]
         (v / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
-        assert pdfenv.engine(v) == "native"
+        assert pyenv.engine(venv=v) == "native"
 
 
 def test_read_py_does_not_shadow_stdlib():
@@ -620,8 +620,8 @@ def test_read_py_does_not_shadow_stdlib():
 
 
 def test_stale_outlasts_pip_timeout():
-    from reader import pdfsetup
-    assert pdfsetup.STALE_SECONDS > pdfsetup.PIP_TIMEOUT
+    from reader import pysetup
+    assert pysetup.STALE_SECONDS > pysetup.PIP_TIMEOUT
 
 
 def test_read_py_before_site_packages():
@@ -635,6 +635,50 @@ def test_read_py_before_site_packages():
     r = subprocess.run([sys.executable, "-X", "utf8", "-c", code], capture_output=True, text=True,
                        cwd=tempfile.gettempdir())
     assert r.stdout.strip() == "ok", r.stdout + r.stderr
+
+
+def test_pdf_kind_default():
+    with env() as d:
+        assert pyenv.KINDS == ("pdf", "mpp")
+        assert pyenv.venv_dir() == pyenv.venv_dir("pdf")
+        assert pyenv.requirements_hash() == pyenv.requirements_hash("pdf")
+        assert pyenv.declined() == pyenv.declined("pdf") is False
+        assert pyenv.engine() == pyenv.engine("pdf") == "native"
+        v = d / "v"
+        pdf_fix.fake_venv(v)
+        assert pyenv.state(v) == pyenv.state(v, "pdf") == "READY"
+        assert pyenv.verify(v) == pyenv.verify(v, "pdf")
+        assert pyenv.engine(venv=v) == pyenv.engine("pdf", v) == "pdfium-5.15.2-7000"
+        assert pysetup.check(v) == pysetup.check(v, "pdf")
+
+
+def test_pointer_and_marker_names():
+    with env() as d:
+        from reader import cache
+        pysetup.decline()
+        assert (cache.root() / "pdf-declined").is_file()
+        assert pyenv.declined("pdf")
+        dest = d / "dest"
+        assert pysetup.setup(dest, Stub()).startswith("READY\t")
+        assert json.loads((cache.root() / "pdf-venv.json").read_text(encoding="utf-8")) == {"venv": str(dest.resolve())}
+        assert not (cache.root() / "pdf-declined").exists()
+
+
+def test_not_venv_names_kind():
+    with env() as d:
+        plain = d / "plain"
+        plain.mkdir()
+        (plain / "x.txt").write_text("x", encoding="utf-8")
+        assert pysetup.remove(plain, kind="pdf") == f"FAIL\tinstall\t{plain.resolve()} is not a pdf venv"
+
+
+def test_unknown_kind_refused():
+    for fn in (lambda: pyenv.venv_dir("zip"), lambda: pyenv.declined("zip"), lambda: pyenv.engine("zip")):
+        try:
+            fn()
+        except ValueError:
+            continue
+        raise AssertionError("an unknown kind was accepted")
 
 
 def main():

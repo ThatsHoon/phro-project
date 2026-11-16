@@ -94,7 +94,7 @@ def main():
             raise ReadError("damaged", "native made to fail by the test")
         from reader.pdfnative import document
         document.NativeDoc = _fails  # parse_bytes imports it from there at call time
-    from reader import pdfenv
+    from reader import pyenv
     from reader.formats import pdf_pdfium
     made = []
 
@@ -141,7 +141,7 @@ def main():
                 body = p.read_bytes()
                 assets.append([p.name, len(body), *_dims(body)])
     print(json.dumps({"md": text, "skipped": dict(ctx.skipped), "meta": doc.meta, "assets": assets,
-                      "modules": sorted(sys.modules), "engine_id": pdfenv.engine_id_from_module(),
+                      "modules": sorted(sys.modules), "engine_id": pyenv.engine_id_from_module(),
                       "decoded": [getattr(d, "decoded", None) for d in made],
                       "closed": [getattr(d, "_pdf", None) is None for d in made],
                       "calls": calls}, ensure_ascii=False))

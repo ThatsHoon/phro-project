@@ -1,5 +1,5 @@
 """pdf through the pdfium front end: each test runs tests/pdfium_run.py under the pdf venv's
-interpreter with the pdf on stdin. The venv is pdfenv.venv_dir() (PHRO_READER_PYENV first); the
+interpreter with the pdf on stdin. The venv is pyenv.venv_dir() (PHRO_READER_PYENV first); the
 tests run when its interpreter exists, else they print "skip: no pdf venv" and pass.
 
 Run: python -I -X utf8 tests/test_reader_pdfium.py
@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pdf_fix import (JPEG, EncryptSpec, Name, Ref, Stream, acroform, font_type0, image_xobject,  # noqa: E402
                      link_annot, ocg_catalog, outline_items, rule_ops, simple_pdf, text_annot, text_ops, widget)
 
-from reader import cache, images, pdfenv  # noqa: E402
+from reader import cache, images, pyenv  # noqa: E402
 
 RUN = HERE / "tests" / "pdfium_run.py"
 F1 = {"Font": {"F1": Ref(3)}}
@@ -27,9 +27,9 @@ FULL = b"q 612 0 0 792 0 0 cm /Im1 Do Q "
 
 
 def _interpreter():
-    if pdfenv.forced_native():
+    if pyenv.forced_native():
         return None
-    py = pdfenv.interpreter(pdfenv.venv_dir())
+    py = pyenv.interpreter(pyenv.venv_dir())
     return py if py.is_file() else None
 
 
