@@ -1,6 +1,6 @@
 # doc-reader phase 4: djvu, Access, Publisher, Visio binary and Project
 
-Draft, 2026-11-15, not yet approved. It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec); the engine spec edits listed at the end are made in the same commit. It builds on phase 2d (`2026-11-14-doc-reader-pdf-design.md`) and comes after phase 3. Notes behind it, outside this repository: `research/ai-document-reader-plugins/notes/djvu-access-survey.md` and `notes/pub-vsd-mpp-survey.md` (the surveys), `notes/rea-decisions.md` (the rulings) and `notes/sample-collection-report.md` (the downloads).
+Approved 2026-11-16, with its Defaults, on the user's go-ahead to run the remaining work ("남은 작업 계속 진행해라"). It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec); the engine spec edits listed at the end are made in the same commit. It builds on phase 2d (`2026-11-14-doc-reader-pdf-design.md`) and comes after phase 3. Notes behind it, outside this repository: `research/ai-document-reader-plugins/notes/djvu-access-survey.md` and `notes/pub-vsd-mpp-survey.md` (the surveys), `notes/rea-decisions.md` (the rulings) and `notes/sample-collection-report.md` (the downloads).
 
 ## Goal
 
