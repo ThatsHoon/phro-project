@@ -14,6 +14,7 @@ When the user asks:
 - To see it: read today's file (or the date they name) and show it as it is.
 - To rewrite it: run `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/daily.py run --force [--date YYYY-MM-DD]` and show the new file.
 - To change the style: edit the Style section below; `run` reads it from this file.
+- To keep a session out: add its id to `~/.claude/private-sessions.txt`, one line `<session id>` for the whole session or `<session id> <from> <to>` (ISO times, KST without a zone) for a stretch, `#` for comments. A session with a hidden stretch shows under its id, not its title.
 
 ## Style
 

@@ -9,6 +9,8 @@
 Only a copy writes reports (origin.json names its project); the original plugin stays silent.
 `clone.py ensure` writes new copies with "daily": false, so the hook stays off until `daily.py on`; a copy without the key
 (made before the switch) keeps running. Sync never touches the key. `run` itself works either way. Times are KST.
+
+Sessions listed in ~/.claude/private-sessions.txt never reach the report, or only outside the stretches listed there.
 """
 import argparse
 import json
@@ -33,6 +35,7 @@ DIGEST = 60000
 TAG = re.compile(r"<([a-zA-Z][\w-]*)[^>]*>.*?</\1>", re.S)
 STAMP = re.compile(rb'"timestamp":\s*"(\d{4}-\d\d-\d\dT[\d:.]+Z?)"')
 SPOKEN = re.compile(rb'"type":\s*"(?:user|assistant)"')
+PRIVATE = Path.home() / ".claude/private-sessions.txt"  # one line each: "<session id>" or "<session id> <from> <to>"; "#" starts a comment
 
 
 def record():
@@ -139,12 +142,41 @@ def title_of(path):
     return json.loads(f'"{titles[-1]}"') if titles else path.stem[:8]
 
 
-def session(path, start, end):
-    """One session's typed prompts and last replies inside the period, or None."""
+def private():
+    """Session id -> the stretches kept out of the report as (from, to) pairs, or None for the whole session.
+    Times are ISO; one without a zone is KST. A line that does not parse hides its whole session rather than leak it."""
+    hidden = {}
+    try:
+        lines = PRIVATE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return hidden
+    for line in lines:
+        parts = line.split("#")[0].split()
+        if not parts or hidden.get(parts[0], []) is None:
+            continue
+        if len(parts) == 3:
+            try:
+                a, b = (datetime.fromisoformat(x.replace("Z", "+00:00")) for x in parts[1:])
+                hidden.setdefault(parts[0], []).append(tuple(t if t.tzinfo else t.replace(tzinfo=KST) for t in (a, b)))
+                continue
+            except ValueError:
+                pass
+        hidden[parts[0]] = None
+    return hidden
+
+
+def session(path, start, end, hide=()):
+    """One session's typed prompts and last replies inside the period, leaving out the hidden stretches, or None."""
+    if hide is None:
+        return None
     asked, said = [], []
     for raw in entries(path, start, end):
         if not SPOKEN.search(raw):
             continue
+        if hide:
+            when = stamp(raw)
+            if when is None or any(a <= when < b for a, b in hide):
+                continue
         try:
             d = json.loads(raw)
         except ValueError:
@@ -157,7 +189,8 @@ def session(path, start, end):
         (asked if d.get("type") == "user" else said).append(text)
     if not asked and not said:
         return None
-    lines = [f"## {title_of(path)}", *(f"- asked: {a[:240]}" for a in asked[-12:]), *(f"- replied: {s[:700]}" for s in said[-3:])]
+    title = path.stem[:8] if hide else title_of(path)  # a title can name the private part
+    lines = [f"## {title}", *(f"- asked: {a[:240]}" for a in asked[-12:]), *(f"- replied: {s[:700]}" for s in said[-3:])]
     return "\n".join(lines)[:PER_SESSION]
 
 
@@ -202,7 +235,8 @@ def goals(root):
 def digest(root, day):
     start, end = period(day)
     parts = [f"# Period: {start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} KST, project {Path(root).name}"]
-    sessions = [s for s in (session(f, start, end) for f in transcript_files(root, start)) if s]
+    hidden = private()
+    sessions = [s for s in (session(f, start, end, hidden.get(f.stem, ())) for f in transcript_files(root, start)) if s]
     parts += ["# Sessions (titles, what the owner asked, the last replies)", *sessions] if sessions else ["# Sessions: none in the period"]
     found = commits(root, start, end)
     if found:

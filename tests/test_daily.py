@@ -108,6 +108,32 @@ def test_session_text():
     assert d.session(quiet, start, end) is None
 
 
+def test_private_sessions():
+    project = Path(tempfile.mkdtemp())
+    d = load(copy_of(project))
+    start, end = d.period(date(2026, 11, 10))
+    t = start + timedelta(hours=2)
+    whole = transcript(project, "aaaa1111", [line("user", t, "비공개 설계 작업")], title="비공개 설계")
+    part = transcript(project, "bbbb2222", [line("user", t, "공개 작업"), line("user", t + timedelta(hours=3), "비공개 부분")], title="비공개 섞인 제목")
+    open_ = transcript(project, "cccc3333", [line("user", t, "보통 작업")], title="보통")
+    d.PRIVATE = Path(tempfile.mkdtemp()) / "private-sessions.txt"
+    a, b = (t + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M"), (t + timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M")
+    d.PRIVATE.write_text(f"# private work\naaaa1111\nbbbb2222 {a} {b}  # a stretch, KST\nbroken1 x y\n", encoding="utf-8")
+    hidden = d.private()
+    assert hidden["aaaa1111"] is None and len(hidden["bbbb2222"]) == 1 and hidden["broken1"] is None, hidden
+    assert d.session(whole, start, end, hidden.get("aaaa1111", ())) is None, "a listed session never reaches the report"
+    s = d.session(part, start, end, hidden["bbbb2222"])
+    assert "공개 작업" in s and "비공개 부분" not in s and "비공개 섞인 제목" not in s, s
+    assert d.session(open_, start, end, hidden.get("cccc3333", ())).startswith("## 보통")
+    real = HOME / ".claude/private-sessions.txt"  # the digest command reads the file at its home, as a run does
+    shutil.copy(d.PRIVATE, real)
+    try:
+        text = daily(Path(d.__file__).parents[1], "digest", "--date", "2026-11-10").stdout
+    finally:
+        real.unlink()
+    assert "비공개" not in text and "보통 작업" in text and "공개 작업" in text, text
+
+
 def test_check():
     d = load(copy_of(Path(tempfile.mkdtemp())))
     assert d.check("```\n" + GOOD + "```") == GOOD
