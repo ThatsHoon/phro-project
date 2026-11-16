@@ -911,7 +911,7 @@ Copyright (c) 2014 James Ahlborn
 
 ## poi
 
-Ported: the pointer cap of the Visio pointer tree (100,000 pointers a document, POI's `MAX_NUMBER_OF_POINTERS`) in `scripts/reader/formats/vsd_stream.py`, from `poi-scratchpad/src/main/java/org/apache/poi/hdgf/pointers/PointerFactory.java` of Apache POI at trunk commit 47dcff769bb395034dddfd59c4609659b6dbc6a4. Apache POI is licensed under the Apache License 2.0, whose text is reproduced under tika above. Its NOTICE (`legal/NOTICE` at the same commit) reads:
+Ported: the pointer cap of the Visio pointer tree (100,000 pointers a document, POI's `MAX_NUMBER_OF_POINTERS`) in `scripts/reader/formats/vsd_stream.py`, from `poi-scratchpad/src/main/java/org/apache/poi/hdgf/pointers/PointerFactory.java`; the Quill bit layout (the `CHNKINK ` head, the bit directory entry fields, the PLC bits' count and type, and the type 12 hyperlink list with its 1,000-PLC cap) in `scripts/reader/formats/pub_quill.py`, from `poi-scratchpad/src/main/java/org/apache/poi/hpbf/model/QuillContents.java` and `poi-scratchpad/src/main/java/org/apache/poi/hpbf/model/qcbits/QCPLCBit.java`; both of Apache POI at trunk commit 47dcff769bb395034dddfd59c4609659b6dbc6a4. Apache POI is licensed under the Apache License 2.0, whose text is reproduced under tika above. Its NOTICE (`legal/NOTICE` at the same commit) reads:
 
 ```
 Apache POI
@@ -957,6 +957,12 @@ Lightbend, Inc. (https://www.lightbend.com/).
 Ported: the VisioDocument header, the LZ77 inflate, the Visio 5, 2000 and 2002-2013 pointers, pointer lists and chunk headers with their trailer rules, and the walk of the pointer tree from the trailer in `scripts/reader/formats/vsd_stream.py`, from `src/lib/VSDInternalStream.cpp`, `src/lib/VSDParser.cpp`, `src/lib/VSD6Parser.cpp` and `src/lib/VSD5Parser.cpp` of libvisio at commit a42aaff13e4a67afcd077c3abb3ef13bb6463025; the Visio 5, 2000 and 2002-2013 page, stencil and shape context by stream levels, the Visio 5 list chunk records, the page name lists and name indexes, the shape's XForm, text, names, field list and text fields (the number and date formats and a field mark taking the next value), its master (stencil) shape and the stencil shape lookup, its misc chunk (the hidden-text flag and the glued connector ends), the font charsets and character runs of 8-bit text, and the foreign data type and bytes in `scripts/reader/formats/vsd.py`, from `src/lib/VSDParser.cpp`, `src/lib/VSD6Parser.cpp`, `src/lib/VSD5Parser.cpp`, `src/lib/VSDStencils.cpp`, `src/lib/VSDFieldList.cpp` and `src/lib/VSDContentCollector.cpp` at the same commit. libvisio's later commits (2026-11-15) were read as knowledge only.
 
 The files on the Ported: line above are licensed under the Mozilla Public License, v. 2.0 (MPL-2.0), https://mozilla.org/MPL/2.0/, and each starts with the MPL's notice and the commit and files it was ported from. The MPL covers those files only: the rest of this plugin stays under its own licence. libvisio's source files carry no copyright line beyond "This file is part of the libvisio project."
+
+## libmspub
+
+Ported: the Contents blocks (the data length of each block type, variable blocks, the reading of a block), the trailer and its chunk directory (the trailer directory, the chunk references with their type, offset and parent sequence number, and the content chunk types) and the Publisher 2000 directory table in `scripts/reader/formats/pub_contents.py`, from `src/lib/MSPUBParser.cpp`, `src/lib/MSPUBBlockType.h`, `src/lib/MSPUBBlockID.h`, `src/lib/MSPUBContentChunkType.h` and `src/lib/MSPUBParser2k.cpp`; the Quill bit directory and its linked lists, the stories (TEXT cut by the STRS lengths and keyed by the SYID text ids), the FDPC character runs and the bold flag of their styles, and the table cell ends of the `TCD ` bits in `scripts/reader/formats/pub_quill.py`, from `src/lib/MSPUBParser.cpp`; both of libmspub at commit 0477b85184e02dc5276582d9cea969208d56c655.
+
+The files on the Ported: line above are licensed under the Mozilla Public License, v. 2.0 (MPL-2.0), https://mozilla.org/MPL/2.0/, and each starts with the MPL's notice and the commit and files it was ported from. The MPL covers those files only: the rest of this plugin stays under its own licence. libmspub's source files carry no copyright line beyond "This file is part of the libmspub project."
 
 ## Adobe
 

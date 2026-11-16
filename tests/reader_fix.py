@@ -1907,3 +1907,129 @@ def vsd_head(version, trailer, body) -> bytes:
     head = VSD_MAGIC + bytes(0x1A - len(VSD_MAGIC)) + bytes([version, 0]) + struct.pack("<I", len(body))
     head += bytes(0x24 - len(head)) + vsd_pointer(*trailer, version=version)
     return head + bytes(body[len(head):])
+
+
+# -- Publisher (pub): Contents blocks and directory, Quill bits (libmspub MSPUBParser layouts; POI QuillContents)
+
+_PUB_FIXED = {0x78: 0, 0x05: 0, 0x08: 0, 0x0A: 0, 0x10: 2, 0x12: 2, 0x18: 2, 0x1A: 2, 0x07: 2, 0x20: 4, 0x22: 4,
+              0x58: 4, 0x68: 4, 0x70: 4, 0xB8: 4, 0x28: 8, 0x38: 16, 0x48: 24}
+_PUB_VARIABLE = (0xC0, 0x80, 0x82, 0x88, 0x8A, 0x90, 0x98, 0xA0)
+
+
+def pub_block(bid, btype, data=b"") -> bytes:
+    """One Contents block: id, type and its data; a variable type's data gets its u32 length (counting itself), a
+    fixed type's int data is packed to the type's length."""
+    if btype in _PUB_VARIABLE:
+        return bytes([bid, btype]) + struct.pack("<I", len(data) + 4) + bytes(data)
+    n = _PUB_FIXED.get(btype, 0)
+    raw = data.to_bytes(n, "little") if isinstance(data, int) else bytes(data)
+    assert len(raw) == n, (btype, len(raw))
+    return bytes([bid, btype]) + raw
+
+
+def pub_contents(chunks, *, version=0x2C) -> bytes:
+    """A Contents stream: `E8 AC <version> 00`, each chunk of `chunks` ((seqnum, ctype, parent, blocks) tuples,
+    `blocks` the chunk's block bytes, parent None for none) written as a u32 length and its blocks, then the trailer.
+    Version 0x2C: the trailer offset at 0x1A, the trailer a u32 length and three blocks, the third a 0x90 directory
+    whose block k is sequence number k (0x88 references with sub-blocks 0x02 type, 0x04 offset, 0x05 parent; a
+    sequence number no chunk names is a DUMMY block). Version 0x22 (Publisher 2000): the trailer offset at 0x16, the
+    trailer a u16 count and 10-byte entries (2 bytes, seqnum, parent, offset), each chunk starting with its type u16
+    (parent None is 0xFFFF)."""
+    body = bytearray(b"\xE8\xAC" + bytes([version, 0]) + bytes(0x40 - 4))
+    placed = []
+    for seq, ctype, parent, blocks in chunks:
+        placed.append((seq, ctype, parent, len(body)))
+        if version == 0x22:
+            body += struct.pack("<H", ctype) + bytes(blocks)
+        else:
+            body += struct.pack("<I", len(blocks) + 4) + bytes(blocks)
+    toff = len(body)
+    if version == 0x22:
+        body += struct.pack("<H", len(placed))
+        for seq, ctype, parent, off in placed:
+            body += struct.pack("<HHHI", 0, seq, 0xFFFF if parent is None else parent, off)
+        struct.pack_into("<I", body, 0x16, toff)
+        return bytes(body)
+    by_seq = {p[0]: p for p in placed}
+    entries = bytearray()
+    for k in range(max(by_seq, default=-1) + 1):
+        if k not in by_seq:
+            entries += pub_block(0, 0x78)
+            continue
+        _, ctype, parent, off = by_seq[k]
+        subs = pub_block(0x02, 0x18, ctype) + pub_block(0x04, 0xB8, off)
+        if parent is not None:
+            subs += pub_block(0x05, 0x68, parent)
+        entries += pub_block(0, 0x88, subs)
+    trailer = pub_block(1, 0x20, 0) + pub_block(2, 0x20, 0) + pub_block(3, 0x90, bytes(entries))
+    body += struct.pack("<I", len(trailer) + 4) + trailer
+    struct.pack_into("<I", body, 0x1A, toff)
+    return bytes(body)
+
+
+def _quill_plc(count, ptype, pre, values) -> bytes:
+    return struct.pack("<II", count, ptype) + bytes(pre) + b"".join(struct.pack("<I", v) for v in values)
+
+
+def _quill_links(urls) -> bytes:
+    """POI's PLC type 12 (QCPLCBit.Type12): count, type, the starts, then the URL list where POI looks for it."""
+    n = len(urls)
+    head = struct.pack("<II", n, 12) + struct.pack(f"<{n + 2}I", 0x1FFFF, *range(0, 10 * n, 10), 10 * n)
+    until = 0x4C if n == 1 else 0x68 + (n - 2) * 22
+    head += bytes(until - len(head))
+    return head + b"".join(struct.pack("<H", len(u)) + u.encode("utf-16-le") for u in urls)
+
+
+def _quill_fdpc(text_off, total, bold) -> bytes:
+    """An FDPC bit: runs covering [0, total) characters, the `bold` (start, end) ranges bold, as libmspub's
+    parseCharacterStyles reads them (u16 count, 6 bytes, u32 run ends as stream offsets, u16 style offsets)."""
+    cuts = sorted({0, total, *(c for r in bold for c in r)})
+    runs = [(b, any(s <= a and b <= e for s, e in bold)) for a, b in zip(cuts, cuts[1:]) if b > a]
+    n = len(runs)
+    styles_at = 8 + 6 * n
+    plain, strong = styles_at, styles_at + 4
+    out = struct.pack("<H", n) + bytes(6)
+    out += b"".join(struct.pack("<I", text_off + 2 * end) for end, _ in runs)
+    out += b"".join(struct.pack("<H", strong if b else plain) for _, b in runs)
+    return out + struct.pack("<I", 4) + struct.pack("<I", 6) + bytes([0x02, 0x0A])
+
+
+def pub_quill(stories, *, bold=(), tcd=None, links=(), fdpc=True, cycle=False) -> bytes:
+    """A Quill/QuillSub/CONTENTS stream: `CHNKINK `, the bit directory at 0x18 (24-byte entries: 0x18, name, id,
+    two u16, kind, offset, length) and the bits from 0x200: TEXT (the `stories` texts, (text id, text) pairs, in
+    UTF-16LE), STRS (PLC type 8, lengths from +12), SYID (ids from +8), FDPC when `fdpc` (bold over the `bold`
+    (start, end) character ranges of the whole text), a `TCD ` bit (PLC type 0, id = the story index) for each
+    {story index: cell boundaries} of `tcd`, written as the cell ends from +0xC (boundaries [0, 2, 5] are ends
+    [2, 5]), and a TOKN PLC type 12 bit holding `links`. `cycle`: the directory is two lists, the second naming the
+    first as next."""
+    text = "".join(t for _, t in stories).encode("utf-16-le")
+    total = len(text) // 2
+    data_at = 0x200
+    bits = [("TEXT", "TEXT", 0, text)]
+    bits.append(("STRS", "PLC ", 0, _quill_plc(len(stories), 8, struct.pack("<I", 255),
+                                               [len(t) for _, t in stories])))
+    bits.append(("SYID", "SYID", 0, struct.pack("<II", 8, len(stories)) +
+                 b"".join(struct.pack("<I", i) for i, _ in stories)))
+    if fdpc:
+        bits.append(("FDPC", "FDPC", 0, _quill_fdpc(data_at, total, bold)))
+    for index, bounds in sorted((tcd or {}).items()):
+        ends = list(bounds[1:])
+        bits.append(("TCD ", "PLC ", index, _quill_plc(len(ends) - 1, 0, struct.pack("<I", 0xFF00), ends)))
+    if links:
+        bits.append(("TOKN", "PLC ", 0, _quill_links(links)))
+    data = bytearray()
+    entries = []
+    for name, kind, bid, raw in bits:
+        entries.append(struct.pack("<H4sHHH4sII", 0x18, name.encode("latin-1"), bid, 1, 0, kind.encode("latin-1"),
+                                   data_at + len(data), len(raw)))
+        data += raw
+    out = bytearray(b"CHNKINK " + bytes(0x18 - 8))
+    if cycle:
+        half = max(1, len(entries) // 2)
+        second = 0x18 + 8 + 24 * half
+        out += struct.pack("<HHI", 0, half, second) + b"".join(entries[:half])
+        out += struct.pack("<HHI", 0, len(entries) - half, 0x18) + b"".join(entries[half:])
+    else:
+        out += struct.pack("<HHI", 0, len(entries), 0xFFFFFFFF) + b"".join(entries)
+    assert len(out) <= data_at, len(out)
+    return bytes(out + bytes(data_at - len(out)) + data)
