@@ -111,6 +111,90 @@ def test_inflate():
     assert vsd_stream.inflate(lz77(noise), len(noise)) == noise
 
 
+def _window_inflate(data):
+    """VSDInternalStream's loop as written: a zeroed 4,096-byte window, every reference copied byte by byte."""
+    window, pos, off, n, out = bytearray(4096), 0, 0, len(data), bytearray()
+    if n < 2:
+        return out
+    while off < n:
+        flag = data[off]
+        off += 1
+        if off > n - 1:
+            break
+        for bit in range(8):
+            if off >= n:
+                break
+            if flag >> bit & 1:
+                window[pos & 4095] = data[off]
+                out.append(data[off])
+                off, pos = off + 1, pos + 1
+                continue
+            if off > n - 2:
+                break
+            a1, a2 = data[off], data[off + 1]
+            off += 2
+            length, slot = (a2 & 15) + 3, (a2 & 0xF0) << 4 | a1
+            slot = slot - 4078 if slot > 4078 else slot + 18
+            for j in range(length):
+                window[(pos + j) & 4095] = window[(slot + j) & 4095]
+                out.append(window[(slot + j) & 4095])
+            pos += length
+    return out
+
+
+def _code(items, pos=0):
+    """LZ77 bytes for `items`, `pos` bytes out: an int is a literal, (distance, length) a reference that far back."""
+    coded = bytearray()
+    for g in range(0, len(items), 8):
+        group = items[g:g + 8]
+        coded.append(sum(1 << i for i, item in enumerate(group) if isinstance(item, int)))
+        for item in group:
+            if isinstance(item, int):
+                coded.append(item)
+                pos += 1
+                continue
+            back, length = item
+            slot = (pos - back) & 4095            # the window slot `back` bytes from the end
+            s = slot - 18 if slot >= 18 else slot + 4078
+            coded += bytes((s & 0xFF, (s >> 8) << 4 | (length - 3)))
+            pos += length
+    return bytes(coded)
+
+
+def test_overlap_copies():
+    # an overlapping reference (distance under its length) repeats the last `distance` bytes; each distance and length
+    # gives the byte-by-byte window's output, before and after 4,096 bytes out, and reaching before the start
+    rng = random.Random(1414)
+    items = []
+    for _ in range(300):
+        items += [rng.randrange(1, 256) for _ in range(rng.randrange(1, 5))]
+        items.append((rng.choice((1, 2, 3, 17)), rng.choice((4, 5, 7, 10, 11, 13, 16, 18))))
+        items.append((rng.randrange(1, 18), rng.randrange(3, 19)))
+    head = [(5, 18), 65, (3, 10), (17, 18)]          # references before anything was written read zeros
+    for case in (items, head + items, head):
+        coded = _code(case)
+        assert vsd_stream.inflate(coded, 1 << 20) == _window_inflate(coded)
+    assert vsd_stream.inflate(_code([65, 66, 67, (3, 10)]), 100) == b"ABCABCABCABCA"
+    assert vsd_stream.inflate(_code([65, 66, (1, 7)]), 100) == b"ABBBBBBBB"
+    # the copy is in bulk: 16 MiB of distance-1 references inflate about as fast as 16 MiB of plain ones
+    def rate(back):
+        coded = _repeat(back, 16 * MIB // 36_864)
+        t0 = time.perf_counter()
+        out = vsd_stream.inflate(coded, 32 * MIB)
+        return time.perf_counter() - t0, out
+
+    plain, out = rate(18)
+    overlap, out1 = rate(1)
+    assert len(out) == len(out1) > 16 * MIB - 36_864 and out1 == bytes([66]) * len(out1)
+    assert overlap < 2 * plain + 0.1 and overlap / (len(out1) / MIB) < 0.2, (overlap, plain)
+
+
+def _repeat(back, blocks):
+    """16 literals, then `blocks` x 2,048 references of 18 bytes at `back`: 36,864 bytes out a block, the same bytes
+    each block since the window slots come round every 4,096 bytes out."""
+    return _code([66] * 16) + _code([(back, 18)] * 2048, pos=16) * blocks
+
+
 def test_pointer_sizes():
     pair = [(0x48, 100, 20, 0xD0), (0x15, 200, 30, 0x51)]
     want = [Pointer(*p) for p in pair]
@@ -211,8 +295,17 @@ def test_document_walk():
     assert next(s for s in steps if s.kind == "enter" and s.pointer.type == 0x15).pointer.format == 0x50
     # Tree.chunks() is the walk's chunks with their stream's pointer
     data = vsd_document(11, [[{"text": "Hi"}]])
-    pairs = list(vsd_stream.Tree(data, 11, Context()).chunks())
+    tree = vsd_stream.Tree(data, 11, Context())
+    pairs = list(tree.chunks())
     assert [(p.type, c.type) for p, c in pairs] == [(0x27, 0x27), (0x15, 0x15), (0x48, 0x48), (0x48, 0x0E)]
+    # a Tree is walked once: a second walk raises at the call instead of yielding nothing
+    for again in (tree.walk, tree.chunks):
+        try:
+            again()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("RuntimeError not raised")
 
 
 def test_compressed_streams():
@@ -421,6 +514,10 @@ def measure():
         lay = Layout()
         s = lay.put(_bomb(mib * MIB * 8 // 17), 0x46, 0x42)
         _probe(f"inflate bomb {mib} MiB", lay.done(lay.put(vsd_list([s]), 0x14, 0x50)))
+    # an overlap bomb: every reference 18 bytes at distance 1, 32 MiB (past VSD_INFLATE)
+    lay = Layout()
+    s = lay.put(_repeat(1, 32 * MIB // 4352), 0x46, 0x42)
+    _probe("overlap bomb 32 MiB", lay.done(lay.put(vsd_list([s]), 0x14, 0x50)))
     # inflate rates alone: coded text and noise (the fixture encoder is slow, so these are small), and hand-made
     # streams of single literals (flag 0x55: literal, reference, ...) and of eight literals a flag
     rng = random.Random(1)

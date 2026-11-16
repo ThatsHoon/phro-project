@@ -46,7 +46,10 @@ for its blob (the stream from its shift, typed by the pointer, id = the pointer'
 the inflated bytearray itself, its prefix dropped in place, so it is held once) or for each of its chunks,
 then the stream's pointer list's streams, then `Step("leave", ...)`. Levels are libvisio's: a stream one deeper than
 its list, its blob or its chunk stream one deeper again, a chunk adding its own header level. `Tree.chunks()` yields
-`(Pointer, Chunk)` for the chunk steps. A Tree is one document: its counters are spent across all its walks.
+`(Pointer, Chunk)` for the chunk steps. `Chunk.data` is read-only, bytes or (an inflated blob) the bytearray the walk
+goes on to read its pointer list from: a caller copies it with `bytes()` to keep, hash or change it. A Tree is one
+document and is walked once (libvisio's two passes collect from the one walk); a second `walk()` or `chunks()` raises
+RuntimeError.
 
 Bounds (each read from its constant at call time; each cut counted `record` once, for its list or stream):
 - every pointer's `(offset, length)` is followed once, for every type (libvisio tracks only list offsets), the
@@ -59,7 +62,9 @@ Bounds (each read from its constant at call time; each cut counted `record` once
   so the next coded stream is not inflated at all;
 - `limits.BIN_RECORDS` chunks (blobs included) per document; at the next one the walk stops, counted;
 - stored streams are memoryview slices of the document, so a pointer costs no copy until its stream fits the room.
-The work of a walk is linear in VSD_INFLATE, VSD_POINTERS and BIN_RECORDS together, whatever the file says.
+The work of a walk is linear in VSD_INFLATE, VSD_POINTERS and BIN_RECORDS together, whatever the file says, each step
+costing up to `limits.MAX_DEPTH` more for the nested generators it passes through (1M chunks: 1.5 s at depth 1, 3.1 s
+at depth 63). An overlapping LZ77 reference is copied as its repeating pattern, so inflate is about 0.025 s per MiB out.
 """
 import re
 import struct
@@ -165,7 +170,9 @@ def inflate(data, limit: int) -> bytearray:
                     start = pos - back
                     if start >= 0 and back >= length:
                         out += out[start:start + length]
-                    else:  # overlapping, or before the start (the zeroed window)
+                    elif start >= 0:  # overlapping: the last `back` bytes repeat, cut to length
+                        out += (out[start:pos] * (length // back + 1))[:length]
+                    else:  # before the start (the zeroed window), only in the first 4,096 bytes out
                         for k in range(start, start + length):
                             out.append(out[k] if k >= 0 else 0)
                 mask <<= 1
@@ -271,6 +278,7 @@ class Tree:
         self.opened = 0     # stream bytes opened (VSD_INFLATE)
         self.records = 0    # chunks yielded (BIN_RECORDS)
         self.stopped = False
+        self.walked = False
 
     def _cut(self):
         self.ctx.skipped["record"] += 1
@@ -310,7 +318,13 @@ class Tree:
         return True
 
     def walk(self) -> Iterator:
-        if self.trailer is None or self.stopped:
+        if self.walked:  # checked at the call, not at the first next()
+            raise RuntimeError("vsd: a Tree is walked once")
+        self.walked = True
+        return self._walk()
+
+    def _walk(self) -> Iterator:
+        if self.trailer is None:
             return
         self.seen.add((self.trailer.offset, self.trailer.length))
         opened = self._open(self.trailer)
@@ -318,9 +332,7 @@ class Tree:
             yield from self._list(opened[0], TRAILER, opened[1], 0, 0)
 
     def chunks(self) -> Iterator:
-        for step in self.walk():
-            if step.kind == "chunk":
-                yield step.pointer, step.chunk
+        return ((step.pointer, step.chunk) for step in self.walk() if step.kind == "chunk")
 
     def _list(self, stream, ptype, shift, level, depth):
         entries, order, read, cut = _read_list(stream, self.version, ptype, shift, VSD_POINTERS - self.pointers)
