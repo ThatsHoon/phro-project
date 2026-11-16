@@ -30,17 +30,18 @@ read on its own) means the runs are not as Access stores them, so the rest of th
 position. A pass-through query's stored text has no connect position, and its connect string (the type row's Name1)
 is never written. With `urls`, a URL's user part is taken out anywhere: after the connect positions, `urls` is given
 the whole text once, pass-through text included (jet.py's hook is `withhold_urls`, which reads one view of the text
-without its quotes, brackets, tabs and line breaks, so a URL cut into several runs, or starting "//" or "\\\\", is
-withheld from its user part through its "@", whatever runs it crosses). A URL that an expression assembles from
-several literals (`'https://u:p' & '@h'`) exists only when the query runs; the reader shows the stored text and never
-evaluates it (literals side by side, `'https://u:p' '@h'`, are read as one URL all the same). The hooks are
-idempotent; what they withhold they mark ("…").
+without its quotes, brackets, and the tabs and line breaks inside runs, so a URL cut into touching runs, or starting
+"//" or "\\\\", is withheld from its user part through its "@"; whitespace or & + , ( ) = < > between runs is SQL and
+ends it). A URL that an expression assembles from several literals (`'https://u:p' & '@h'`) exists only when the
+query runs; the reader shows the stored text and never evaluates it. Literals side by side (`'https://u:p' '@h'`)
+are the same: Access SQL does not join them, so no stored URL spans them. The hooks are idempotent; what they withhold
+they mark ("…").
 
 Work. `work(rows)` is an upper bound on what `sql` does, in steps (a character of text, `_ROW` a row, a comparison of
 the sort, `_JOIN` a table source a join looks at, builds or walks); the caller charges it before `sql` runs.
 """
 import re
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 
 from .. import limits
@@ -66,11 +67,14 @@ _QUOTABLE = re.compile(r"[^A-Za-z0-9_]")  # Java's \W is ASCII
 _LINES = re.compile(r"[\r\n]+")
 _OPENS = re.compile(r"[\[\"']")
 _BRACKET_STOP = re.compile(r"[\]{]")
-_VIEW = re.compile(r"[^'\"\[\]\t\r\n]+")  # what the URL rule reads: no quote, bracket, tab or line break
+_VIEW = re.compile(r"[^'\"\[\]\t\r\n]+")  # what the URL rule reads of a run: no quote, bracket, tab or line break
+_GAP_VIEW = re.compile(r"[^'\"\[\]]+")  # ... of a stretch between runs: no stray quote or bracket
+_BREAK = re.compile(r"[ \t\r\n\f\v&+,()=<>]")  # between runs, SQL that ends a chain of touching runs and stretches
 # where a URL's authority starts: after a special scheme's ":" (slashes or none; group 1, at a word's start), after ":"
 # and slashes, or after two or more slashes or backslashes
 _URL_START = re.compile(r"(?i)((?:https?|ftp|wss?|file):[/\\]*)|:[/\\]+|[/\\]{2,}")
-_AUTH_STOP = re.compile(r"[/\\?#]")  # what ends an authority (a tab or line break never does: WHATWG drops them)
+_AUTH_STOP = re.compile(r"[/\\?#]")  # what ends a special scheme's authority (a tab or line break never does)
+_OTHER_STOP = re.compile(r"[/?#]")  # ... any other's ("\\" too is the user part's: "smb://CORP\\bob:pw@srv")
 _WORD = re.compile(r"\w")
 _JAVA_SPACE = "".join(map(chr, range(33)))  # what Java's trim() takes off
 _ROW = 32  # steps a row costs beyond its text: its getters, filters, quoting and separators
@@ -135,23 +139,46 @@ def sql(rows, *, flags: int = 0, connect=None, urls=None) -> str | None:
 
 def withhold_urls(text: str):
     """`text` with every URL's user part withheld as one "…", and whether any was (`sql`'s `urls` hook uses it; see the
-    module's docstring). One view of the whole text is read: the text without its quotes, brackets, tabs and line
-    breaks, each kept stretch mapped back to where it stands. A URL starts in the view (`_URL_START`; a special scheme
-    only where the text has no letter, digit or "_" right before it); its authority runs to the next "/", "\\", "?" or
-    "#" of the view; its user part to the authority's last "@", or, for a URL that does not start with ":" and slashes
-    alone, its last "…" (what a connect position withheld may have held that "@"; so may the document's own "…": it
-    hides more). An authority holding ":" and no such end, when the view holds one later (`u:pa/ss@h`), runs to the
-    last. From the user part's first character through the character before its "@" (through the "…") the original
-    text is withheld, the quotes, brackets, tabs and line breaks between included: so a URL cut into several runs, or
-    split by a line break, is withheld whole. An empty user part, or one that is "…" already, is left. One pass:
+    module's docstring). One view of the whole text is read: its quoted and bracketed runs (a doubled quote inside
+    its run, one left open running to the end) without their quotes, brackets, tabs and line breaks, and the stretches
+    between them as they are (a stray "]" aside), each kept stretch mapped back to where it stands. Runs and stretches
+    that touch make one chain; whitespace or one of & + , ( ) = < > in a stretch between runs is SQL and ends it.
+    A URL starts in the view (`_URL_START`; a special scheme only where the text has no letter, digit or "_" right
+    before it); its authority runs to the next "/", "?" or "#" of its chain, or "\\" after a special scheme (http,
+    https, ftp, ws, wss, file: WHATWG's reading; any other scheme's user part may hold "\\", `smb://CORP\\bob:pw@srv`);
+    its user part to the authority's last "@", or, for a URL that does not start with ":" and one slash alone (a
+    drive, "c:\\x"), its last "…" (what a connect position withheld may have held that "@"; so may the document's
+    own "…": it hides more). An authority holding ":" and no such end, when its chain holds one later (`u:pa/ss@h`),
+    runs to the chain's last.
+    From the user part's first character through the character before its "@" (through the "…") the original text is
+    withheld, the quotes, brackets, tabs and line breaks between included: so a URL cut into touching runs, or split
+    by a line break inside one, is withheld whole. An empty user part, or one that is "…" already, is left. One pass:
     each character of the view is read a bounded number of times."""
-    starts, at_text, parts = [], [], []
-    size = 0
-    for m in _VIEW.finditer(text):
-        starts.append(size)
-        at_text.append(m.start())
-        parts.append(m.group())
-        size += m.end() - m.start()
+    starts, at_text, parts, breaks = [], [], [], []
+    size, i, n = 0, 0, len(text)
+
+    def keep(pattern, lo, hi, gap):
+        nonlocal size
+        for m in pattern.finditer(text, lo, hi):
+            if gap:
+                for k in _BREAK.finditer(text, m.start(), m.end()):
+                    breaks.append(size + k.start() - m.start())
+            starts.append(size)
+            at_text.append(m.start())
+            parts.append(m.group())
+            size += m.end() - m.start()
+
+    while True:
+        m = _OPENS.search(text, i)
+        o = n if m is None else m.start()
+        keep(_GAP_VIEW, i, o, True)
+        if m is None:
+            break
+        c = text[o]
+        end = text.find("]", o + 1) if c == "[" else _closing(text, o + 1, c)
+        end = n if end < 0 else end
+        keep(_VIEW, o + 1, end, False)
+        i = end + 1
     view = "".join(parts)
 
     def where(v):
@@ -159,22 +186,27 @@ def withhold_urls(text: str):
         k = bisect_right(starts, v) - 1
         return at_text[k] + v - starts[k]
 
-    last_at, last_mark = view.rfind("@"), view.rfind("…")
+    chain = last_at = last_mark = -1  # the chain last read (where it ends), its last "@" and "…"
     spans, pos = [], 0
     while True:
         m = _URL_START.search(view, pos)
         if m is None:
             break
-        if m.group(1):
+        special = bool(m.group(1))
+        if special:
             o = where(m.start())
             if o and _WORD.match(text, o - 1):  # a scheme inside a word ("news:"): not one
                 pos = m.start() + 1
                 continue
         a = m.end()
-        stop = _AUTH_STOP.search(view, a)
-        b = size if stop is None else stop.start()
+        k = bisect_left(breaks, a)
+        ends = breaks[k] if k < len(breaks) else size
+        if ends != chain:  # a chain is read once: a later URL in it starts past the last one's authority
+            chain, last_at, last_mark = ends, view.rfind("@", a, ends), view.rfind("…", a, ends)
+        stop = (_AUTH_STOP if special else _OTHER_STOP).search(view, a, ends)
+        b = ends if stop is None else stop.start()
         at = view.rfind("@", a, b)
-        if m.group().startswith(":") and not m.group(1):  # ":" and slashes alone (a drive, "c:\\x"): "@" only
+        if len(m.group()) == 2 and m.group()[0] == ":":  # ":" and one slash alone (a drive, "c:\\x"): "@" only
             mark, end_at = -1, last_at
         else:
             mark, end_at = view.rfind("…", a, b), max(last_at, last_mark)

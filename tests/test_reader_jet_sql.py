@@ -473,15 +473,15 @@ def test_url_across_runs():
         assert "s3cr3t" not in got and got == lines("SELECT a", f"WHERE {want}"), (w, got)
     q = [row(TYPE, "EXEC p 'https://bob:s3cr3t'@h", PASSTHROUGH, "ODBC;")]
     assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == "EXEC p 'https://…@h"
-    # a space does not end an authority, and one holding ":" with an "@" later in the text runs to it (hiding more)
-    cases = {"x = 'https://h:8080' AND y = 'a@b'": "x = 'https://…@b'", "x = 'https://h:1'/'@b'": "x = 'https://…@b'",
-             "x = 'https://h:1'/a@b": "x = 'https://…@b"}
+    # an authority holding ":" runs to the last "@" of its chain of touching runs and stretches (hiding more)
+    cases = {"x = 'https://h:1'/'@b'": "x = 'https://…@b'", "x = 'https://h:1'/a@b": "x = 'https://…@b"}
     for w, want in cases.items():
         q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
         got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
         assert got == lines("SELECT a", f"WHERE {want};"), (w, got)
     # kept: a stop comes before the "@" and the authority holds no ":", or the scheme is not special
-    for w in ("x = 'https://h/'@b", "x = 'https://h'/'@b'", "x = 'mailto:bob'@h"):
+    for w in ("x = 'https://h/'@b", "x = 'https://h'/'@b'", "x = 'mailto:bob'@h",
+              "x = 'https://h:8080' AND y = 'a@b'"):
         q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
         assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == lines("SELECT a", f"WHERE {w};"), w
 
@@ -507,7 +507,7 @@ def test_url_structural():
     cases = {"[https://bob:s3]'cr3t'[@h]": "[https://…@h]", "'https://bob:s3'cr3t'@h'": "'https://…@h'",
              "[https://bob:s]'3c'[r3]'t@h'": "[https://…@h'", "'https://bob:s3'\"cr3t\"[@h]": "'https://…@h]",
              f"'//bob:{S}'@h": "'//…@h", f"'\\\\bob:{S}'@srv": "'\\\\…@srv", f"'ftp:\t//bob:{S}'@h": "'ftp:\t//…@h",
-             f"'https://bob:{S}' 'x@h'": "'https://…@h'", f"'ht'[tp]'s:bob:{S}'@h": "'ht'[tp]'s:…@h",
+             f"'ht'[tp]'s:bob:{S}'@h": "'ht'[tp]'s:…@h",
              f"'https://bob:{S}\r\n@h/x'": "'https://…@h/x'"}
     for t, want in cases.items():
         q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, f"x = {t}")]
@@ -515,18 +515,52 @@ def test_url_structural():
         assert got == lines("SELECT a", f"WHERE x = {want};"), (t, got)
         q = [row(TYPE, f"EXEC p {t}", PASSTHROUGH, "ODBC;")]
         assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == f"EXEC p {want}", t
-    # the parameter list and the rest are one text: a URL in a parameter's name runs on into the body
-    q = [row(TYPE, None, SELECT), row(PARAMETER, None, 4, f"https://bob:{S}"), row(COLUMN, "a"), row(WHERE, "x = '@h'")]
+    # a parameter's name too
+    q = [row(TYPE, None, SELECT), row(PARAMETER, None, 4, f"https://bob:{S}@h"), row(COLUMN, "a")]
     got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
-    assert got == "PARAMETERS [https://…@h';", got
+    assert got == lines("PARAMETERS [https://…@h] Long;", "SELECT a;"), got
     # a connect position that withheld text ("…") may have held the "@": it ends a user part too
     q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, f"x = 'https://bob:{S}'[PWD=1@h")]
     got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
     assert got == lines("SELECT a", "WHERE x = 'https://…"), got
     # what the rule leaves: a word before a scheme ("news:"), no "@" in the authority, a stop before the "@"
-    for t in ("'news:bob'@h", "'mailto:bob'@h", "'https://h/'@b", "'https://h' AND y = 1", "[x].[y] = '//h\\a@b'"):
+    for t in ("'news:bob'@h", "'mailto:bob'@h", "'https://h/'@b", "'https://h' AND y = 1", "[x].[y] = '//h/a@b'",
+              "'https://h\\a@b'"):
         q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, f"x = {t}")]
         assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == lines("SELECT a", f"WHERE x = {t};"), t
+
+
+def test_url_bounded_by_sql():
+    # "\\" ends an authority after a special scheme only: a Windows domain user in any other URL is withheld
+    S = "s3cr3t"
+    for t, want in {f"'smb://CORP\\bob:{S}@srv/share'": "'smb://…@srv/share'",
+                    f"'sqlserver://CORP\\bob:{S}@db:1433'": "'sqlserver://…@db:1433'",
+                    f"'x-y://bob\\x:{S}@h/x'": "'x-y://…@h/x'", f"'\\\\CORP\\bob:{S}@srv'": "'\\\\…@srv'",
+                    "'c:\\docs\\a@b.txt'": "'c:\\…@b.txt'"}.items():
+        q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, f"x = {t}")]
+        got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+        assert got == lines("SELECT a", f"WHERE x = {want};"), (t, got)
+        q = [row(TYPE, f"EXEC p {t}", PASSTHROUGH, "ODBC;")]
+        assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == f"EXEC p {want}", t
+    # between runs, whitespace or one of & + , ( ) = < > ends an authority (and the chain an "@" is looked for in):
+    # ordinary queries keep their SQL; literals side by side are not one URL (Access SQL does not join them)
+    kept = ["SELECT * FROM T WHERE url = 'http://h:8080/x' AND mail = 'a@b'",
+            "SELECT Name, 'https://example.com' AS Site FROM T WHERE Email Like '*@example.com'",
+            "UPDATE T SET Link = 'https://intranet' WHERE Owner = 'ann@corp.com'",
+            "SELECT 'http://localhost:8080' AS Api, Email FROM Users WHERE Email Like '*@*' ORDER BY Email",
+            "SELECT 'https://' & Host & ':' & Port AS U, 'mailto:' & Mail AS M FROM S WHERE Mail Like '*@*'",
+            "SELECT IIf([Secure], 'https://', 'http://') & [Host] AS U, [Owner] & '@corp.com' AS Mail FROM Servers",
+            "SELECT * FROM Links WHERE Url Like 'http://*' OR Url Like 'https://*' AND Mail Like '*@*'",
+            "SELECT * FROM Files WHERE Path = 'C:\\Docs\\a.txt' AND Owner = 'bob@corp.com'",
+            "SELECT * FROM Files WHERE Path Like '\\\\srv\\share\\*' AND Owner = 'bob@corp.com'",
+            "SELECT C.Name, 'https://crm' AS Src, C.Phone, C.City, O.Total, O.Placed FROM Customers AS C INNER JOIN "
+            "Orders AS O ON C.ID = O.CustID WHERE O.Total > 100 AND C.Region IN ('N','S') AND C.Email Like "
+            "'*@example.com' ORDER BY O.Placed DESC",
+            "x = 'https://u:p' 'x@h'"] + [f"x = 'https://h:1'{c}'@b'" for c in " \t\r\n\f\v&+,()=<>"]
+    for t in kept:
+        assert jet_sql.withhold_urls(t) == (t, False), t
+    q = [row(TYPE, "EXEC p 'https://h:1' & '@h'", PASSTHROUGH, "ODBC;")]
+    assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == "EXEC p 'https://h:1' & '@h'"
 
 
 def test_withhold_urls():
@@ -536,8 +570,10 @@ def test_withhold_urls():
              "xhttps://bob@h": "xhttps://…@h", "C:\\a@b\\c": "C:\\…@b\\c",
              "u:pa/ss@h, ftp://u:pa/ss@h/x": "u:pa/ss@h, ftp://…@h/x", "https://@h": "https://@h",
              "http://…@h": "http://…@h", "https://bob…": "https://…", "c:\\x.mdb' [ODBC;…]": "c:\\x.mdb' [ODBC;…]",
-             "": "", "[]''": "[]''", "'https://h:1' AND y = 'a@b'": "'https://…@b'",
-             "'https://h:1/x'@b": "'https://…@b"}
+             "": "", "[]''": "[]''", "'https://h:1' AND y = 'a@b'": "'https://h:1' AND y = 'a@b'",
+             "'https://h:1/x'@b": "'https://…@b", "'s'mb://D\\u:p;…": "'s'mb://…", "c:\\u…": "c:\\u…",
+             "'c:\\u'@b": "'c:\\…@b", "x = 'https://bob:my pw@h": "x = 'https://…@h",
+             "x = [https://bob:my pw@h": "x = [https://…@h"}
     for s, want in cases.items():
         got, dropped = jet_sql.withhold_urls(s)
         assert got == want and dropped == (got != s), (s, got, dropped)
@@ -546,14 +582,14 @@ def test_withhold_urls():
 
 def test_url_hook():
     # `urls` takes a URL's user part out anywhere in the text, pass-through included, and from a name split at ".";
-    # it is given the whole text once, so a URL's authority ends only at "/", "\\", "?" or "#", whatever it holds (a
-    # space, a doubled quote, a comma, a bracket, the end of a run)
+    # it is given the whole text once: inside a quoted or bracketed run a URL's authority ends only at "/", "?", "#"
+    # (and "\\" after a special scheme), whatever the run holds (a space, a doubled quote, a comma, a bracket)
     w = ("u = 'https://bob:my s3cr3t@h/x' OR v = 'https://bob:it''ss3cr3t@h/x' OR w = 'https:bob:s3cr3t@h/x' "
          "OR z = 'https://bob:pw' AND y = 'a@b'")
     q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
     got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
     assert got == lines("SELECT a", "WHERE u = 'https://…@h/x' OR v = 'https://…@h/x' OR w = 'https:…@h/x' "
-                        "OR z = 'https://…@b';"), got
+                        "OR z = 'https://bob:pw' AND y = 'a@b';"), got
     # outside any run too: a stretch between runs, in a query's text and in a pass-through's
     q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, "u = 'x' OR https://bob:s3cr3t@h/x = [y]")]
     got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)

@@ -2696,11 +2696,13 @@ def test_query_content_kept():
     q = [(1, None, 1, None, None), (6, "a", None, None, None), (8, where, None, None, None)]
     doc, ctx, md = convert(jet_db(1, [], queries=[Query("K", q)]))
     assert queries(doc)[0].blocks[0].text == f"SELECT a\nWHERE {where};" and ctx.skipped == {}, ctx.skipped
-    # an authority holding ":" (a port, or a password holding "/") runs to the text's last "@": hiding more
-    where = "u = 'https://h:1/x'@b OR v = 'https://h:1'/a@b"
+    # an authority holding ":" (a port, or a password holding "/") runs to the last "@" of its chain of touching runs
+    # and stretches (hiding more); whitespace or & + , ( ) = < > between runs ends the chain
+    where = "u = 'https://h:1/x'@b OR v = 'https://h:1'/a@b OR w = 'http://h:8080/x' AND m = 'a@b'"
     q = [(1, None, 1, None, None), (6, "a", None, None, None), (8, where, None, None, None)]
     doc, ctx, md = convert(jet_db(1, [], queries=[Query("K", q)]))
-    assert queries(doc)[0].blocks[0].text == "SELECT a\nWHERE u = 'https://…@b;" and ctx.skipped == {"withheld": 1}
+    assert queries(doc)[0].blocks[0].text == "SELECT a\nWHERE u = 'https://…@b OR v = 'https://…@b OR " \
+        "w = 'http://h:8080/x' AND m = 'a@b';" and ctx.skipped == {"withheld": 1}, queries(doc)[0].blocks[0].text
     q = [(1, None, 1, None, None), (6, "'http://bob:pw@site/x' AS u", None, None, None)]
     p = [(1, "SELECT 1 FROM t WHERE u = 'https://ann:pw@h/x'\0", 8, "ODBC;", None)]
     doc, ctx, md = convert(jet_db(1, [], queries=[Query("L", q), Query("P", p, flags=0x70)]))
@@ -2717,11 +2719,11 @@ def test_query_url_structural():
     S, TAB = "s3cr3t", "\t"
     texts = ["[https://bob:s3]'cr3t'[@h]", "'https://bob:s3'cr3t'@h'", "[https://bob:s]'3c'[r3]'t@h'",
              "'https://bob:s3'\"cr3t\"[@h]", f"'//bob:{S}'@h", f"'\\\\bob:{S}'@srv", f"'ftp:{TAB}//bob:{S}'@h",
-             f"'https://bob:{S}' 'cr3t@h'"]
+             f"'smb://CORP\\bob:{S}@srv/share'", f"'sqlserver://CORP\\bob:{S}@db:1433'"]
     wheres = [f"x = {t}" for t in texts] + [
         f"x IN (SELECT b FROM T IN [c:/x.mdb] [ODBC;PWD={S}])", f"T IN [] [ODBC;PWD={S}]",
         f"T IN [c:/x.mdb] 'ODBC;PWD={S}'", f"x = 'https://bob:{S}'[@h", f"x = 'https://bob:{S}';@h",
-        f"x = 'https://bob:{S}'; y = '@h'", f"x IN 'https://bob:{S}' [@h]"]
+        f"x = 'https://bob:{S}'; y = '@h'"]
     qs = [Query(f"W{k}", [(1, None, 1, None, None), (6, "a", None, None, None), (8, w, None, None, None)])
           for k, w in enumerate(wheres)]
     qs += [Query(f"P{k}", [(1, f"EXEC p {t}", 8, "ODBC;DSN=x", None)], flags=0x70) for k, t in enumerate(texts)]
@@ -2734,19 +2736,22 @@ def test_query_url_structural():
         assert ctx.skipped == {"withheld": len(qs)}, ctx.skipped
     texts = {q.title: q.blocks[0].text for q in queries(doc)}
     assert texts["W0"] == "SELECT a\nWHERE x = [https://…@h];" and texts["P4"] == "EXEC p '//…@h", texts
-    assert texts["W8"] == "SELECT a\nWHERE x IN (SELECT b FROM T IN [c:/x.mdb] [ODBC;…]);", texts
+    assert texts["W9"] == "SELECT a\nWHERE x IN (SELECT b FROM T IN [c:/x.mdb] [ODBC;…]);", texts
+    assert texts["P7"] == "EXEC p 'smb://…@srv/share'", texts
 
 
 def test_query_url_property():
     # seeded: a password in a URL's user part, the URL cut at random points into quoted, bracketed or bare pieces
-    # (a space between pieces after the scheme), with tabs and line breaks put anywhere; the password and the user
-    # never show, in a query's WHERE or a pass-through, through jet's own hooks
+    # that touch (literals side by side are not one URL: Access SQL does not join them), with tabs and line breaks
+    # put anywhere inside a quoted or bracketed piece (a bare piece holding whitespace or & + , ( ) = < > is quoted:
+    # bare, those are SQL); the password and the user never show, in a query's WHERE or a pass-through, through
+    # jet's own hooks
     db = jet._Db(jet_pages.open(jet_db(1)), Context())
     connect = lambda s: jet._clean_connect(db, s)[0]  # noqa: E731
     urls = lambda s: jet._clean_urls(db, s)[0]  # noqa: E731
     rng = random.Random(20261116)
     schemes = ["https://", "http://", "HTTP://", "https:", "ftp:/", "ws://", "wss:", "file://", "//", "\\\\",
-               "http:\\\\", "x-y://"]
+               "http:\\\\", "x-y://", "smb://D\\", "sqlserver://CORP\\"]
     alnum = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     for k in range(600):
         user = "U" + "".join(rng.choice(alnum) for _ in range(7))
@@ -2757,14 +2762,13 @@ def test_query_url_property():
         cuts = sorted(rng.sample(range(1, len(url)), rng.randint(0, min(4, len(url) - 1))))
         pieces = [url[i:j] for i, j in zip([0] + cuts, cuts + [len(url)])]
         out = []
-        for i, p in enumerate(pieces):
-            p = "".join(c + rng.choice(["", "", "", "\t", "\r\n", "\n", "\r"]) for c in p)
+        for p in pieces:
             kind = rng.choice(["'", '"', "[", ""])
-            if kind == "[" and "]" in p or kind and kind in p:
-                kind = ""
+            if not kind and any(c in " &+,()=<>" for c in p):
+                kind = rng.choice(["'", '"', "["])
+            if kind:
+                p = "".join(c + rng.choice(["", "", "", "\t", "\r\n", "\n", "\r"]) for c in p)
             out.append(p if not kind else f"[{p}]" if kind == "[" else kind + p + kind)
-            if i + 1 < len(pieces) and cuts[i] >= len(scheme) and rng.random() < 0.2:
-                out.append(" ")
         text = "".join(out)
         for flags, rows in ((0, [jet_sql.Row(1, None, 1, None, None, 1, None),
                                  jet_sql.Row(6, "a", None, None, None, 1, None),
@@ -2958,17 +2962,19 @@ def test_query_urls_charged():
     # (the whole text's view too: many runs, schemes inside words, many user parts, tabs and brackets)
     for s in ("//a:b" * 20_000 + "@h", "x//" * 20_000, "'http://u:p@h/x' " * 5_000, "/" * 60_000 + "u@h",
               "'a" * 30_000, "'a'" * 10_000 + "https:" + "[b]" * 10_000 + "@h", "xhttps:" * 8_000, "'//a'@" * 10_000,
-              ":/" * 30_000, "https://a…/" * 5_000, "\t\r\n'[]\"" * 8_000 + "https://a@h"):
+              ":/" * 30_000, "https://a…/" * 5_000, "\t\r\n'[]\"" * 8_000 + "https://a@h", ",a" * 30_000,
+              "https://h:1/" + "'a'," * 15_000 + "@", "//a," * 15_000, "'a' " * 15_000):
         before = db.meter.charged
         with Loops() as loops:
             got, _ = jet._clean_urls(db, s)
         spent = db.meter.charged - before
         assert spent >= jet._URL * len(s) and loops.n <= 2 * spent + 16, (s[:20], loops.n, spent)
     cases = {"see http://bob:pw@site/x and //ann@h": ("see http://…@site/x and //…@h", True),
-             "https://bob:my s3cr3t@h/x": ("https://…@h/x", True), "https:bob:a,b@h/x": ("https:…@h/x", True),
+             "'https://bob:my s3cr3t@h/x'": ("'https://…@h/x'", True), "'https:bob:a,b@h/x'": ("'https:…@h/x'", True),
              "HTTP:bob@h": ("HTTP:…@h", True), "news:bob@h": ("news:bob@h", False),
-             "//a b@c\nd@e": ("//…@e", True), "https://bob:s3\r\ncr3t@h/x": ("https://…@h/x", True),
-             "//a\tb@c": ("//…@c", True), "see http://h/a@b": ("see http://h/a@b", False),
+             "'//a b@c\nd@e'": ("'//…@e'", True), "'https://bob:s3\r\ncr3t@h/x'": ("'https://…@h/x'", True),
+             "'//a\tb@c'": ("'//…@c'", True), "see http://h/a@b": ("see http://h/a@b", False),
+             "//a b@c": ("//a b@c", False), "https:bob:a,b@h": ("https:bob:a,b@h", False),
              "\\\\bob:pw@srv\\share": ("\\\\…@srv\\share", True), "u:pa/ss@h, ftp://u:pa/ss@h/x": (
                  "u:pa/ss@h, ftp://…@h/x", True), "C:\\a@b\\c": ("C:\\…@b\\c", True),
              "a/b@c x//y": ("a/b@c x//y", False),

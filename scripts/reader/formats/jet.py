@@ -80,8 +80,9 @@ strings and database paths a query names, by position (`jet_sql`: a remote datab
 target, an IN clause's path and type and a [connect]. prefix in its text, and the rest of a text whose quotes or
 brackets do not balance), are cleaned as a linked table's connect string (`_clean_connect`), so no PWD=, UID= or URL
 user part shows there; any other literal or identifier is the document's content, kept as stored, except that a URL's
-user part is taken out anywhere: the finished text is read whole, without its quotes, brackets, tabs and line breaks,
-so a URL cut into several runs is withheld whole (`_clean_urls`). What is withheld shows as "…", and each query
+user part is taken out anywhere: the finished text is read whole, without its quotes, brackets and the tabs and line
+breaks inside runs, so a URL cut into touching runs is withheld whole; whitespace or & + , ( ) = < > between runs ends
+one (`_clean_urls`). What is withheld shows as "…", and each query
 showing one counts `withheld`. A pass-through query's stored text is shown as
 stored (a URL's user part aside), its connect string never. A query whose rows are not kept (past
 `jet_sql.JET_QUERY_ROWS`, a cell that cannot be read, a Memo past eight times `jet_sql.JET_SQL` bytes, the queries'
@@ -224,7 +225,7 @@ _KEEP = 256    # the room a kept value takes beside its text (key, tuples, a dic
 _QROW = 8      # an MSysQueries row of a query: its cells looked up, its `jet_sql.Row` made and kept
 _QUERY = 16    # a query: its section, `jet_sql.work` over its rows, the cleaner's closure
 _SQL = 1       # a step of `jet_sql.work` (the dearest shape measured, a parameter list, about 0.05 microseconds)
-_URL = 2       # a character of a query's text read for URLs (`jet_sql.withhold_urls`)
+_URL = 3       # a character of a query's text read for URLs (`jet_sql.withhold_urls`; about 0.46 microseconds)
 _Spent = jet_pages.Spent
 _PK = 1  # IndexImpl.PRIMARY_KEY_INDEX_TYPE
 _AUTONUMBER = 0x04 | 0x40  # ColumnImpl.AUTO_NUMBER_FLAG_MASK, AUTO_NUMBER_GUID_FLAG_MASK
@@ -1666,9 +1667,9 @@ def _clean_connect(db: _Db, s: str):
 
 def _clean_urls(db: _Db, s: str):
     """`s` (a query's whole text, `jet_sql`'s `urls`) with each URL's user part withheld as "…" ("http://…@host/x"),
-    and whether any was: `jet_sql.withhold_urls`, which reads one view of the text without its quotes, brackets, tabs
-    and line breaks, so a URL cut into several runs is withheld whole. `_URL` times its characters and a `_PART` are
-    charged first; one pass."""
+    and whether any was: `jet_sql.withhold_urls`, which reads one view of the text without its quotes, brackets and
+    the tabs and line breaks inside runs, so a URL cut into touching runs is withheld whole. `_URL` times its
+    characters and a `_PART` are charged first; one pass."""
     db.charge(_URL * len(s) + _PART)
     return jet_sql.withhold_urls(s)
 
