@@ -14,7 +14,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import markdown  # noqa: E402
+from reader import limits, markdown  # noqa: E402
 from reader.containers import crypto  # noqa: E402
 from reader.formats import jet, jet_pages  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
@@ -473,10 +473,14 @@ def test_bad_tdef_counted():
 
 
 def test_cols_cap():
+    # the cap is set at the catalog's own width (every TDEF has it), so one more column refuses a user table
+    data = jet_db(1, [])
+    ncat = len(jet._tdef(jet._Db(jet_pages.open(data), Context()), 2).columns)
     old = jet.JET_COLS
-    jet.JET_COLS = 2
+    jet.JET_COLS = ncat
     try:
-        tables = [three(), Tbl("Pair", [Col("A", LONG), Col("B", TEXT)], [[1, "x"]])]
+        tables = [Tbl("Wide", [Col(f"c{i}", LONG) for i in range(ncat + 1)], [[1] * (ncat + 1)]),
+                  Tbl("Pair", [Col("A", LONG), Col("B", TEXT)], [[1, "x"]])]
         doc, ctx, _ = convert(jet_db(1, tables))
         assert [s.title for s in sections(doc)] == ["Pair (1 row)"] and ctx.skipped["db_table"] == 1
     finally:
@@ -529,6 +533,219 @@ def test_catalog_cap():
     assert ctx.skipped["record"] == 1 and ctx.skipped["text"] == 1
     doc, ctx, _ = convert(jet_db(1, tables))
     assert len(sections(doc)) == 2
+
+
+def shared_memo(n, size=20_000, *, distinct=False, long_by=0):
+    """A Jet4 table whose row 0 holds a memo of `size` a's (compressed up to 1,024 characters, else UCS-2; one LVAL row
+    up to 4,076 bytes, else an LVAL chain) and whose n other rows hold inline memo definitions patched in memory to
+    name it, as the review's probe. `distinct` gives each copy its own length (one byte less each), so no two
+    definitions are alike; `long_by` raises row 0's declared length past the bytes stored."""
+    tbl = Tbl("M", [Col("ID", LONG), Col("Notes", MEMO)], [[0, "a" * size]] + [[i, "zz"] for i in range(1, n + 1)])
+    data = bytearray(jet_db(1, [tbl]))
+    length = size + 2 if size <= 1024 else 2 * size
+    kind = 0 if length > 4076 else 0x40000000
+    at = data.find(struct.pack("<I", length | kind))
+    assert at > 0 and data.find(struct.pack("<I", length | kind), at + 1) < 0
+    head = bytes(data[at:at + 12])
+    if long_by:
+        data[at:at + 4] = struct.pack("<I", (length + long_by) | kind)
+    inline = struct.pack("<I", 4 | 0x80000000) + bytes(8) + b"\xff\xfezz"
+    spots = [i for i in range(len(data)) if data.startswith(inline, i)]
+    assert len(spots) == n, len(spots)
+    for k, i in enumerate(spots, 1):
+        data[i:i + 12] = (struct.pack("<I", (length - k) | kind) + head[4:]) if distinct else head
+    return bytes(data)
+
+
+class Count:
+    """Wraps a method or function for one block, counting the calls (`calls`) and the bytes they return (`bytes`);
+    `big` counts the calls whose first bytes argument is over 1,000 bytes."""
+
+    def __init__(self, owner, name):
+        self.owner, self.name = owner, name
+        self.calls = self.bytes = self.big = 0
+
+    def __enter__(self):
+        orig = self.orig = getattr(self.owner, self.name)
+
+        def wrapped(*a, **k):
+            self.calls += 1
+            if any(isinstance(x, (bytes, bytearray)) and len(x) > 1000 for x in a):
+                self.big += 1
+            out = orig(*a, **k)
+            if isinstance(out, (bytes, bytearray)):
+                self.bytes += len(out)
+            return out
+        setattr(self.owner, self.name, wrapped)
+        return self
+
+    def __exit__(self, *exc):
+        setattr(self.owner, self.name, self.orig)
+
+
+def memo_cost(data):
+    """What reading row 0's memo once charges against JET_LVAL_TOTAL."""
+    db = jet._Db(jet_pages.open(data), Context())
+    tdef = next(jet._tdef(db, o.id & 0xFFFFFF) for o in jet._catalog(db) if o.name == "M")
+    raw = next(c for c in jet._rows(db, tdef))
+    jet.value(db, tdef.columns[1], raw[1])
+    return db.lval_spent
+
+
+def test_long_value_budget():
+    # 200 cells naming one 40,000-byte chain: it is read and decoded once, each repeat costs its charge only
+    data = shared_memo(200)
+    with Count(jet_pages.Jet, "text") as text, Count(jet._Db, "row_at") as rows:
+        doc, ctx, _ = convert(data)
+    assert text.big == 1 and rows.calls == 10, (text.big, rows.calls)  # ten LVAL rows, read once
+    cost = memo_cost(data)
+    assert 40_000 < cost < 40_000 + 10 * 300, cost
+    # the file's total is twice its bytes and 1 MiB here (under JET_LVAL_TOTAL): the repeats past it are "…"
+    total = jet._Db(jet_pages.open(data), Context()).lval_total
+    assert total == 2 * len(data) + 2 ** 20 < limits.JET_LVAL_TOTAL, total
+    k = total // cost
+    shown = [r[1] for r in grid(section(doc, "M"))[1:]]
+    assert shown == ["a" * 20_000] * k + ["…"] * (201 - k) and ctx.skipped == {"text": 201 - k}, ctx.skipped
+    old = limits.JET_LVAL_TOTAL
+    try:
+        # the total, lowered to five reads: the other 196 cells are "…", each counted `text` once
+        limits.JET_LVAL_TOTAL = 5 * cost
+        doc, ctx, _ = convert(data)
+        shown = [r[1] for r in grid(section(doc, "M"))[1:]]
+        assert shown[5:] == ["…"] * 196 and "…" not in shown[:5] and ctx.skipped == {"text": 196}, ctx.skipped
+        # distinct definitions defeat the cache: the total still bounds the LVAL bytes read, the work stops
+        data = shared_memo(200, distinct=True)
+        with Count(jet._Db, "row_at") as rows:
+            doc, ctx, _ = convert(data)
+        assert rows.bytes <= 5 * cost + 4096 and rows.calls <= 5 * 10 + 1, (rows.bytes, rows.calls)
+        assert ctx.skipped["text"] >= 195 and set(ctx.skipped) == {"text"}, ctx.skipped
+    finally:
+        limits.JET_LVAL_TOTAL = old
+
+
+def test_long_value_forms():
+    # one LVAL row (0x40): its text, read once for 50 cells; a total of two reads cuts the rest
+    data = shared_memo(50, 500)
+    with Count(jet._Db, "row_at") as rows:
+        doc, ctx, _ = convert(data)
+    assert [r[1] for r in grid(section(doc, "M"))[1:]] == ["a" * 500] * 51 and not ctx.skipped
+    assert rows.calls == 1, rows.calls
+    old = limits.JET_LVAL_TOTAL
+    limits.JET_LVAL_TOTAL = 2 * memo_cost(data)
+    try:
+        doc, ctx, _ = convert(data)
+    finally:
+        limits.JET_LVAL_TOTAL = old
+    assert [r[1] for r in grid(section(doc, "M"))[1:]] == ["a" * 500] * 2 + ["…"] * 49 and ctx.skipped == {"text": 49}
+    # a chain shorter than its declared length: what is there is shown, counted `record` (each cell naming it)
+    doc, ctx, _ = convert(shared_memo(0, 5_000, long_by=1_000))
+    assert grid(section(doc, "M"))[1] == ["0", "a" * 5_000] and ctx.skipped == {"record": 1}, ctx.skipped
+    # a value over JET_LVAL_BYTES is read to the cap and cut, counted `text`
+    old = jet.JET_LVAL_BYTES
+    jet.JET_LVAL_BYTES = 1_000
+    try:
+        doc, ctx, _ = convert(shared_memo(3, 5_000))
+    finally:
+        jet.JET_LVAL_BYTES = old
+    assert [r[1] for r in grid(section(doc, "M"))[1:]] == ["a" * 500 + "…"] * 4 and ctx.skipped == {"text": 4}
+
+
+def null_rows(cols, n):
+    """A table of `cols` Text columns whose first data page is rewritten in memory to n two-byte rows (column count
+    0, no null mask: every cell null), as the review's probe."""
+    data = bytearray(jet_db(1, [Tbl("Wide", [Col(f"c{i}", TEXT) for i in range(cols)], [["x"] + [None] * (cols - 1)])]))
+    pages = jet_pages.open(bytes(data))
+    pg = data_pages(pages, tdef_page(data, "Wide"))[0]
+    page = bytearray(pages.page(pg)[:14]) + bytes(4096 - 14)
+    struct.pack_into("<H", page, 12, n)
+    for i in range(n):
+        struct.pack_into("<H", page, 14 + 2 * i, 4096 - 2 * (i + 1))
+    data[pg * 4096:(pg + 1) * 4096] = page
+    return bytes(data)
+
+
+class Walked(list):
+    """A column list counting the columns every walk over it reaches."""
+    n = 0
+
+    def __iter__(self):
+        for x in list.__iter__(self):
+            Walked.n += 1
+            yield x
+
+
+def test_null_rows_linear():
+    # 1,000 null rows under 1,000 columns: each row walks only the columns it holds (none), so the work is the
+    # header's, not rows x columns
+    data = null_rows(1_000, 1_000)
+    orig = jet._tdef
+
+    def counted(*a, **k):
+        t = orig(*a, **k)
+        t.columns = Walked(t.columns)
+        return t
+    Walked.n = 0
+    jet._tdef = counted
+    try:
+        with Count(jet, "value") as values:
+            doc, ctx, _ = convert(data)
+    finally:
+        jet._tdef = orig
+    assert section(doc, "Wide").title == "Wide (1 row)" and not ctx.skipped, ctx.skipped
+    assert values.calls == 0 and Walked.n < 6 * 1_000 + 2 * 1_000, (values.calls, Walked.n)
+    # Yes/No cells still read from the null mask, "No" included (each one a grid cell, so the grid's caps bound it)
+    doc, ctx, _ = convert(jet_db(1, [Tbl("B", [Col("A", LONG), Col("F", BOOL)], [[1, True], [2, False]])]))
+    assert grid(section(doc, "B"))[1:] == [["1", "Yes"], ["2", "No"]]
+
+
+def test_catalog_cols_cap():
+    data = jet_db(1, [Tbl("Pair", [Col("A", LONG), Col("B", TEXT)], [[1, "x"]])])
+    ncat = len(jet._tdef(jet._Db(jet_pages.open(data), Context()), 2).columns)
+    old = jet.JET_COLS
+    jet.JET_COLS = ncat - 1
+    try:
+        kind, detail = jet_refused(data)
+    finally:
+        jet.JET_COLS = old
+    assert kind == "damaged" and "past JET_COLS" in detail, detail
+
+
+def test_db_key_page_cache():
+    # 100 overflow rows patched to name one target row: under a db_key each page is decoded once
+    cols = [Col("ID", LONG), Col("Name", TEXT)]
+    data = bytearray(jet_db(1, [Tbl("T", cols, [Row("overflow", [i, f"r{i}"]) for i in range(100)])], db_key=0x1234))
+    pages = jet_pages.open(bytes(data))
+    first = None
+    for pg in data_pages(pages, tdef_page(data, "T")):
+        page = bytearray(pages.page(pg))
+        for r in range(struct.unpack_from("<H", page, 12)[0]):
+            loc = struct.unpack_from("<H", page, 14 + 2 * r)[0]
+            if loc & 0x4000 and not loc & 0x8000:
+                at = loc & 0x1FFF
+                first = first or bytes(page[at:at + 4])
+                page[at:at + 4] = first
+        key = ((0x1234 ^ pg) & 0xFFFFFFFF).to_bytes(4, "little")
+        data[pg * 4096:(pg + 1) * 4096] = crypto.rc4(key, bytes(page))
+    with Count(crypto, "rc4") as rc4:
+        doc, ctx, _ = convert(bytes(data))
+    assert grid(section(doc, "T"))[1:] == [["0", "r0"]] * 100 and not ctx.skipped, ctx.skipped
+    assert rc4.calls <= pages.pages, (rc4.calls, pages.pages)
+    # the cache holds at most JET_PAGE_CACHE pages, and what it gives back is the page
+    old = limits.JET_PAGE_CACHE
+    limits.JET_PAGE_CACHE = 2
+    try:
+        small = jet_pages.open(bytes(data))
+        got = [small.page(n) for n in (1, 2, 3, 1, 2, 3, 3)]
+        assert len(small._cache) == 2 and got == [pages.page(n) for n in (1, 2, 3, 1, 2, 3, 3)]
+    finally:
+        limits.JET_PAGE_CACHE = old
+
+
+def test_duplicate_catalog_row():
+    # two catalog rows naming one TDEF: one section, the second row counted, the summary counting the table once
+    doc, ctx, _ = convert(jet_db(1, [Tbl("T", [Col("A", LONG)], [[1]]), Tbl("T", [Col("A", LONG)], [[2]])]))
+    assert len(sections(doc)) == 1 and ctx.skipped == {"record": 1}, ctx.skipped
+    assert summary(doc).endswith(": 1 table."), summary(doc)
 
 
 def main():

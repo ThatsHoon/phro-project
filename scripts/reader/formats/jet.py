@@ -23,11 +23,19 @@ Rows. Each data page the table's usage map owns is read: a row flagged 0x8000 is
 flagged 0x4000 is a pointer followed once, to a row that must not be a pointer again. Fixed columns are read at their
 `offset_F`, variable ones through their `offset_V` slot (Jet4's two-byte offset table, Jet3's one-byte offsets and
 jump table), so rows written before a column was deleted read right. A Yes/No value is its null-mask bit. Every
-offset and length is clipped to the row; a row or cell that cannot be read is counted `record`.
+offset and length is clipped to the row; a row or cell that cannot be read is counted `record`. A row walks only the
+columns its own column count holds, so a short row costs its bytes, not the table's width.
 
-Caps. `JET_COLS` columns per user table (past it the table counts `db_table`; the catalog has its own fixed columns),
-`JET_NAME` characters per name and `JET_CELL_CHARS` per cell (cut, counted `text`), `JET_LVAL_BYTES` read per long
-value. Every cap is read at call time, so a test can lower it.
+Long values. A MEMO is inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00). Each LVAL row read is charged its
+bytes and `_ROW_COST` against one total for the whole file, `limits.JET_LVAL_TOTAL` or twice the file's bytes and
+1 MiB if less (Access never shares a long value between cells, so a real file reads about its own size; a file
+naming one chain from many cells reads at most twice itself). Past it a cell ends with "…" and is counted `text`. A
+value read whole is decoded once and kept by its definition, so a repeat costs its charge but no read; definitions
+that differ but share a chain's tail are each charged, so the total bounds them too.
+
+Caps. `JET_COLS` columns per TDEF (past it a user table counts `db_table`, the catalog is `damaged`), `JET_NAME`
+characters per name and `JET_CELL_CHARS` per cell (cut, counted `text`), `JET_LVAL_BYTES` read per long value,
+that total per file. Every cap is read at call time, so a test can lower it.
 """
 import copy
 import datetime
@@ -70,8 +78,9 @@ HIDDEN_FLAG = 0x08
 _DATA_PAGE, _TDEF_PAGE = 0x01, 0x02
 _DELETED, _OVERFLOW, _OFFSET = 0x8000, 0x4000, 0x1FFF
 _UNUSED = 0xFFFF
+_ROW_COST = 256  # charged on top of each LVAL row's bytes, so a chain of tiny rows costs as its steps
 _PK = 1  # IndexImpl.PRIMARY_KEY_INDEX_TYPE
-_ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md)
+_ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md; every real file read has 0)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 _BAD = (ValueError, IndexError, struct.error, ArithmeticError)  # a row, cell or TDEF that cannot be read
 
@@ -173,6 +182,9 @@ class _Db:
         self.j3 = jet.version == 0
         self.f = _Fmt(self.j3)
         self.tdef_pages = set()  # continuation pages already part of a TDEF: a chain reaching one ends there
+        self.lval_spent = 0  # charged against lval_total
+        self.lval_total = min(limits.JET_LVAL_TOTAL, 2 * jet.pages * jet.page_size + 2 ** 20)
+        self.lval_cache = {}  # (definition, compressed) -> (text, bytes read, charge) of a long value read whole
 
     # -- pages and rows
 
@@ -247,33 +259,48 @@ class _Db:
 
     # -- long values
 
-    def long_value(self, raw: bytes, text: bool):
-        """The bytes of a long value (MEMO, OLE): inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00), read up to
-        JET_LVAL_BYTES; for text also no further than JET_CELL_CHARS characters can take. Returns (data, more): more is
-        true when a cap stopped the read. A value shorter than its length is counted `record`."""
+    def memo(self, raw: bytes, compressed: bool) -> str:
+        """A MEMO cell's text: inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00), read up to JET_LVAL_BYTES
+        and no further than JET_CELL_CHARS characters can take, LVAL rows charged against the file's total. A
+        value shorter than its length is counted `record`; a cut (a cap or the total) ends with "…", counted
+        `text`."""
         if len(raw) < 12:
             raise ValueError("long value definition shorter than 12 bytes")
         head = _u32(raw, 0)
         length, kind = head & 0x3FFFFFFF, head >> 30
-        want = min(length, JET_LVAL_BYTES)
-        if text:
-            want = min(want, 4 * JET_CELL_CHARS + 4)  # two bytes a character, twice that for mode switches, FF FE
+        # two bytes a character, twice that for mode switches, FF FE
+        want = min(length, JET_LVAL_BYTES, 4 * JET_CELL_CHARS + 4)
         if kind == 2:
             data = raw[12:12 + want]
-        elif kind == 1:
-            data = self.row_at(int.from_bytes(raw[5:8], "little"), raw[4])[:want]
-        elif kind == 0:
-            data = self._lval_chain((int.from_bytes(raw[5:8], "little"), raw[4]), want)
-        else:
+            return self._whole(self.jet.text(data, compressed), len(data), want, length)
+        if kind == 3:
             raise ValueError("long value type 0xC0")
-        if len(data) < want:
-            self.ctx.skipped["record"] += 1
-            return data, False
-        return data, length > want
+        key = (bytes(raw[:12]), compressed)
+        hit = self.lval_cache.get(key)
+        if hit is not None:
+            s, n, charge = hit
+            if self.lval_spent + charge > self.lval_total:
+                return self.cut("", True)
+            self.lval_spent += charge
+            return self._whole(s, n, want, length)
+        before = self.lval_spent
+        data, stopped = self._lval((int.from_bytes(raw[5:8], "little"), raw[4]), want, kind == 1)
+        s = self.jet.text(data, compressed)
+        if stopped:
+            return self.cut(s, True)
+        self.lval_cache[key] = (s, len(data), self.lval_spent - before)
+        return self._whole(s, len(data), want, length)
 
-    def _lval_chain(self, start, want: int) -> bytes:
-        """An LVAL chain: each row starts with the (row, three-byte page) of the next, 0 ending it. `Jet.chain` keeps
-        the seen-set, so a loop ends the value; an empty chunk ends it too."""
+    def _whole(self, s: str, n: int, want: int, length: int) -> str:
+        if n < want:
+            self.ctx.skipped["record"] += 1
+            return self.cut(s)
+        return self.cut(s, length > want)
+
+    def _lval(self, start, want: int, single: bool):
+        """The bytes of one LVAL row or chain, each row charged; (data, stopped), stopped when the file's total ran
+        out first. A chain row starts with the (row, three-byte page) of the next, 0 ending it; `Jet.chain` keeps the
+        seen-set, so a loop ends the value, and an empty chunk ends it too."""
         out = bytearray()
         rows = {}
 
@@ -282,15 +309,20 @@ class _Db:
             nxt = int.from_bytes(b[1:4], "little")
             return (nxt, b[0]) if nxt else None
 
-        for item in self.jet.chain(start, step):
+        for item in [start] if single else self.jet.chain(start, step):
+            if self.lval_spent >= self.lval_total:
+                return bytes(out), True
             b = self.row_at(item[0], item[1])
+            self.lval_spent += len(b) + _ROW_COST
+            if single:
+                return b[:want], False
             if len(b) <= 4:
                 break
             rows[item] = b
             out += b[4:4 + want - len(out)]
             if len(out) >= want:
                 break
-        return bytes(out)
+        return bytes(out), False
 
 
 # -- encryption
@@ -309,9 +341,9 @@ def _refuse_encrypted(jet):
 
 # -- table definitions
 
-def _tdef(db: _Db, page: int, *, capped: bool = True) -> Tdef:
-    """The TDEF at `page` with its continuation pages. `capped`: past JET_COLS columns the table is refused
-    (ValueError, so the caller counts it); the catalog's own TDEF is read without that cap."""
+def _tdef(db: _Db, page: int) -> Tdef:
+    """The TDEF at `page` with its continuation pages. Past JET_COLS columns it is refused (ValueError, so the caller
+    counts it)."""
     jet, f = db.jet, db.f
     first = jet.page(page)
     if first[0] != _TDEF_PAGE:
@@ -329,7 +361,7 @@ def _tdef(db: _Db, page: int, *, capped: bool = True) -> Tdef:
     b = b"".join(parts)
     row_count = _u32(b, f.num_rows)
     ncols = _u16(b, f.num_cols)
-    if capped and ncols > JET_COLS:
+    if ncols > JET_COLS:
         raise ValueError(f"{ncols} columns, past JET_COLS")
     nlog, nidx = _u32(b, f.idx_slots), _u32(b, f.nidx)
     col_at = f.idx_def + nidx * f.idx_def_size
@@ -373,9 +405,9 @@ def _tdef(db: _Db, page: int, *, capped: bool = True) -> Tdef:
 # -- rows
 
 def _rows(db: _Db, tdef: Tdef):
-    """Each live row of the table, in page order, as one raw cell per column (bytes, None for null, a bool for
-    Yes/No). Only data pages naming this TDEF are read, so a map naming other tables' pages costs nothing. A row
-    that cannot be read is counted `record`; a bad usage map raises ValueError for the caller."""
+    """Each live row of the table, in page order, as {column index: raw cell} (see `_cells`). Only data pages naming
+    this TDEF are read, so a map naming other tables' pages costs nothing. A row that cannot be read is counted
+    `record`; a bad usage map raises ValueError for the caller."""
     jet = db.jet
     for pg in jet.usage(tdef.owned):
         page = jet.page(pg)
@@ -392,9 +424,11 @@ def _rows(db: _Db, tdef: Tdef):
             yield cells
 
 
-def _cells(db: _Db, tdef: Tdef, buf: bytes) -> list:
-    """One row's raw cells: the column count, the fixed data at offset_F, the variable data through offset_V, the
-    null mask at the end; offsets clipped to the row."""
+def _cells(db: _Db, tdef: Tdef, buf: bytes) -> dict:
+    """One row's raw cells as {column index: bytes, or a bool for Yes/No}: the column count, the fixed data at
+    offset_F, the variable data through offset_V, the null mask at the end; offsets clipped to the row. Only the
+    columns the row's count holds are walked (columns are sorted by number, and at most that count of them), so a
+    null cell or one past the count is simply absent."""
     head = 1 if db.j3 else 2
     n = len(buf)
     if n < head:
@@ -406,20 +440,24 @@ def _cells(db: _Db, tdef: Tdef, buf: bytes) -> list:
         raise ValueError("null mask past the row")
     mask = buf[end:]
     var = None
-    out = []
-    for c in tdef.columns:
-        present = c.num < ncols and mask[c.num >> 3] >> (c.num & 7) & 1
+    out = {}
+    for i, c in enumerate(tdef.columns):
+        if c.num >= ncols or i >= ncols:
+            break
+        present = mask[c.num >> 3] >> (c.num & 7) & 1
         if c.type == BOOL:
-            out.append(bool(present))
+            out[i] = bool(present)
         elif not present:
-            out.append(None)
+            continue
         elif c.flags & 0x01:
             a = head + c.fixed_off
-            out.append(buf[min(a, end):min(a + FIXED_SIZE.get(c.type, c.length), end)])
+            out[i] = buf[min(a, end):min(a + FIXED_SIZE.get(c.type, c.length), end)]
         else:
             if var is None:
                 var = (_jump_offsets if db.j3 else _var_offsets)(buf, head, end)
-            out.append(var(c.var))
+            v = var(c.var)
+            if v is not None:
+                out[i] = v
     return out
 
 
@@ -500,8 +538,7 @@ def value(db: _Db, col: Column, raw):
     if t == TEXT:
         return db.cut(db.jet.text(raw, bool(col.ext & 0x01)))
     if t == MEMO:
-        data, more = db.long_value(raw, True)
-        return db.cut(db.jet.text(data, bool(col.ext & 0x01)), more)
+        return db.memo(raw, bool(col.ext & 0x01))
     if t == OLE:
         if len(raw) < 4:
             raise ValueError("OLE definition shorter than its length")
@@ -570,7 +607,7 @@ def _numeric(raw: bytes, scale: int) -> str:
 def _catalog(db: _Db) -> list:
     """MSysObjects as `Obj` rows, at most JET_CATALOG (one more row counts `record` and ends the read)."""
     try:
-        tdef = _tdef(db, 2, capped=False)
+        tdef = _tdef(db, 2)
     except _BAD as e:
         raise ReadError("damaged", f"jet: no readable catalog ({e})") from None
     at = {c.name.lower(): i for i, c in reversed(list(enumerate(tdef.columns)))}
@@ -580,7 +617,7 @@ def _catalog(db: _Db) -> list:
 
     def cell(cells, key, default=None):
         i = at.get(key)
-        return default if i is None else (cells[i], cols[i])
+        return default if i is None else (cells.get(i), cols[i])
 
     out, read = [], 0
     try:
@@ -644,13 +681,17 @@ def _table(db: _Db, obj: Obj, budget) -> Section:
     for i, c in enumerate(tdef.columns):
         if not grid.put(0, i, c.name):
             break
+    cols = tdef.columns
+    bools = [i for i, c in enumerate(cols) if c.type == BOOL]  # "No" past a row's count: each one a grid cell
     r = 1
     for cells in _rows(db, tdef):
         if grid.cut:
             break
-        for i, (c, raw) in enumerate(zip(tdef.columns, cells)):
+        for i in bools:
+            cells.setdefault(i, False)
+        for i, raw in cells.items():
             try:
-                v = value(db, c, raw)
+                v = value(db, cols[i], raw)
             except _BAD:
                 db.ctx.skipped["record"] += 1
                 continue
@@ -688,7 +729,7 @@ def parse_bytes(data, ctx) -> Doc:
             out.append(sec)
     if tables and not out and not (queries or linked or others):
         raise ReadError("damaged", "no table could be read")
-    parts = [_count(len(tables), "table", "tables")]
+    parts = [_count(len(seen), "table", "tables")]
     if queries:
         parts.append(_count(len(queries), "query", "queries"))
     if linked:

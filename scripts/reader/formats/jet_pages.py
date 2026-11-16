@@ -19,7 +19,9 @@ The phase 4 spec named `text.codepage` here; that helper maps a language id, not
 
 db_key. A non-zero u32 at 0x3E in a Jet3 or Jet4 file means every page but 0 is RC4 keyed by `db_key XOR n` (four
 bytes, little-endian), Jackcess's Jet codec (the encoding holds no user secret). In ACE the same field means Office
-encryption, which is not decoded here: `page` returns those pages as stored and `jet.py` refuses the file.
+encryption, which is not decoded here: `page` returns those pages as stored and `jet.py` refuses the file. A decoded
+page is kept (at most `limits.JET_PAGE_CACHE`, the least recently read dropped first), so the many reads of one page
+in a pass (an overflow target, an LVAL row, a usage map) decode it once.
 
 Bounds. `page(n)` raises ValueError outside `0 <= n < pages`. A usage map drops every page id outside
 `1 <= id < pages`, reads each type 5 page once and stops at the pointer whose range starts past the file, so its
@@ -28,7 +30,9 @@ of range or a step giving None ends it. Malformed map bytes raise ValueError; ca
 """
 import codecs
 import struct
+from collections import OrderedDict
 
+from .. import limits
 from ..containers import crypto
 from ..limits import ReadError
 
@@ -84,6 +88,7 @@ class Jet:
         self._page0 = data[:HEADER_AT] + self.header + data[HEADER_AT + size:self.page_size]
         self.codepage = _codec(struct.unpack_from("<H", self._page0, 0x3C)[0])
         self.db_key = struct.unpack_from("<I", self._page0, 0x3E)[0]
+        self._cache = OrderedDict()  # page number -> decoded page (db_key only)
 
     def page(self, n: int) -> bytes:
         """Page `n`, decoded (page 0 with its header unmasked; with a Jet3/Jet4 db_key, the RC4 of the others)."""
@@ -91,10 +96,17 @@ class Jet:
             raise ValueError(f"page {n} outside 0..{self.pages - 1}")
         if n == 0:
             return self._page0
+        if not (self.db_key and self.version <= 1):
+            return self._data[n * self.page_size:(n + 1) * self.page_size]
+        out = self._cache.get(n)
+        if out is not None:
+            self._cache.move_to_end(n)
+            return out
         raw = self._data[n * self.page_size:(n + 1) * self.page_size]
-        if self.db_key and self.version <= 1:
-            return crypto.rc4(((self.db_key ^ n) & 0xFFFFFFFF).to_bytes(4, "little"), raw)
-        return raw
+        out = self._cache[n] = crypto.rc4(((self.db_key ^ n) & 0xFFFFFFFF).to_bytes(4, "little"), raw)
+        while len(self._cache) > max(limits.JET_PAGE_CACHE, 1):
+            self._cache.popitem(last=False)
+        return out
 
     def next_pg(self, n: int):
         """The `next_pg` step of TDEF and other page chains: the u32 at offset 4 of page `n`, None for 0."""
