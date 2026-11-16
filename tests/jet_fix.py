@@ -14,11 +14,19 @@ deterministic, so the same call with `db_key=0` gives the plain pages of a db_ke
 
 Values by column type: None is null; BOOL any truth value (its null-mask bit); integers for BYTE, INT, LONG,
 COMPLEX, BIGINT and MONEY (raw units of 1/10,000); floats for FLOAT, DOUBLE and DATE (days since 1899-12-30); str
-for TEXT and MEMO (Jet4 and ACE store a value of 1 to 1,024 characters all in U+0001-U+00FF in the compressed form,
-as Jackcess does); bytes for BINARY and OLE. Bytes given for any other column are written as they are (fixed
+for TEXT and MEMO (in Jet4 and ACE a column of a user table carries the compressed unicode flag, ext 0x01, unless
+`Col(compressed=False)`, and a flagged value of 1 to 1,024 characters all in U+0001-U+00FF is stored in the compressed
+form, as Jackcess does; the system tables' columns are unflagged plain UCS-2, as in real files); bytes for BINARY and
+OLE; for NUMERIC the unscaled integer (its sign byte and four little-endian u32 parts, the most significant first),
+with `Col(precision=, scale=)` in the column block. Bytes given for any other column are written as they are (fixed
 columns padded or cut to their size), so a test can store any raw value. A long value (MEMO, OLE) of at most 64
 bytes is inline (0x80), one of at most one LVAL row is a single row (0x40), anything longer an LVAL chain (0x00),
 one row per LVAL page.
+
+A table's `rows` may hold `Row` markers: a deleted row (0x8000), an overflow row (a 0x4000 pointer to its data, stored
+flagged 0x8000 on a page of its own, as Jackcess's `updateRow` writes it) or an overflow row pointing at itself. A
+`Col(deleted=True)` keeps its column number, fixed offset and variable slot, and its values are written into the rows,
+but the TDEF leaves it out (num_cols drops, max_cols does not), as rows written before a column was deleted look.
 """
 import struct
 import sys
@@ -50,8 +58,19 @@ class Col:
     """A column: `type` one of the type codes above; `length` the TDEF col_len (0: the type's default); `flags`
     the column flags, with 0x01 (fixed) set or cleared from the type; `props` its LvProp properties."""
 
-    def __init__(self, name, type, *, length=0, flags=0x01, props=None):
+    def __init__(self, name, type, *, length=0, flags=0x01, props=None, compressed=None, deleted=False, precision=0,
+                 scale=0):
         self.name, self.type, self.length, self.flags, self.props = name, type, length, flags, props or {}
+        self.compressed, self.deleted, self.precision, self.scale = compressed, deleted, precision, scale
+
+
+class Row:
+    """A row placed specially: `kind` "deleted" (flag 0x8000), "overflow" (a 0x4000 pointer to the data on a page of
+    its own) or "loop" (a 0x4000 pointer to itself, no data)."""
+
+    def __init__(self, kind, values=()):
+        assert kind in ("deleted", "overflow", "loop"), kind
+        self.kind, self.values = kind, list(values)
 
 
 class Tbl:
@@ -109,10 +128,10 @@ class _Writer:
         b = s.encode("utf-16-le")
         return struct.pack("<H", len(b)) + b
 
-    def text(self, s):
+    def text(self, s, compressed=True):
         if self.j3:
             return s.encode(self.cp, "replace")
-        if s and len(s) <= 1024 and all(1 <= ord(c) <= 0xFF for c in s):
+        if compressed and s and len(s) <= 1024 and all(1 <= ord(c) <= 0xFF for c in s):
             return b"\xff\xfe" + s.encode("latin-1")
         return s.encode("utf-16-le")
 
@@ -134,6 +153,10 @@ class _Writer:
         struct.pack_into("<H", page, 2, pos - (self.dp_rows + 2 + 2 * len(rows)))
         return bytes(page)
 
+    @staticmethod
+    def size(row):
+        return len(row[0] if isinstance(row, tuple) else row)
+
     def fits(self, sizes):
         return len(sizes) <= 255 and self.dp_rows + 2 + 2 * len(sizes) + sum(sizes) <= self.ps
 
@@ -141,9 +164,9 @@ class _Writer:
         """Data pages for `rows`; their page numbers."""
         out, batch = [], []
         for row in rows:
-            if not self.fits([len(row)]):
-                raise ValueError(f"row of {len(row)} bytes does not fit a page")
-            if not self.fits([len(r) for r in batch] + [len(row)]):
+            if not self.fits([self.size(row)]):
+                raise ValueError(f"row of {self.size(row)} bytes does not fit a page")
+            if not self.fits([self.size(r) for r in batch] + [self.size(row)]):
                 out.append(self.flush(tdef, batch))
                 batch = []
             batch.append(row)
@@ -183,7 +206,7 @@ class _Writer:
             fixed = c.type in FIXED
             length = c.length or FIXED.get(c.type) or {TEXT: 255 if self.j3 else 510, BINARY: 255}.get(c.type, 0)
             flags = (c.flags & ~0x01) | (0x01 if fixed else 0) | (0x10 if system else 0)
-            ext = 0x01 if (not self.j3 and c.type in (TEXT, MEMO)) else 0
+            ext = 0x01 if (not self.j3 and not system and c.type in (TEXT, MEMO) and c.compressed is not False) else 0
             col = {"c": c, "num": i, "fixed": fixed, "len": length, "flags": flags, "ext": ext, "off_f": 0,
                    "off_v": 0}
             if fixed and c.type != BOOL:
@@ -206,11 +229,16 @@ class _Writer:
             return struct.pack(_PACK[c.type], v)
         if c.type == GUID:
             return uuid.UUID(v).bytes_le
+        if c.type == NUMERIC:
+            m = abs(v)
+            return bytes([0x80 if v < 0 else 0]) + b"".join(
+                ((m >> 32 * k) & 0xFFFFFFFF).to_bytes(4, "little") for k in (3, 2, 1, 0))
         raise ValueError(f"no value encoder for type {c.type}")
 
-    def var_value(self, c, v):
+    def var_value(self, x, v):
+        c = x["c"]
         if isinstance(v, str):
-            v = self.text(v)
+            v = self.text(v, bool(x["ext"] & 0x01))
         if c.type in LONG_VALUES:
             return self.long_value(bytes(v))
         return bytes(v)
@@ -232,7 +260,7 @@ class _Writer:
             if x["fixed"]:
                 fixed[x["off_f"]:x["off_f"] + FIXED[c.type]] = self.fixed_value(c, v)
             else:
-                datas[x["off_v"]] = self.var_value(c, v)
+                datas[x["off_v"]] = self.var_value(x, v)
         head = bytes([n]) if self.j3 else struct.pack("<H", n)
         body = bytearray(head + fixed)
         if not var:
@@ -272,8 +300,9 @@ class _Writer:
     def ptr(self, page, row):
         return bytes([row]) + page.to_bytes(3, "little")
 
-    def tdef(self, t, cols, var, nrows, owned, empty, system):
+    def tdef(self, t, every, var, nrows, owned, empty, system):
         j3 = self.j3
+        cols = [x for x in every if not x["c"].deleted]
         idx = [x["num"] for x in cols if x["c"].name in t.pk]
         nidx = 1 if idx else 0
         longs = [x for x in cols if x["c"].type in LONG_VALUES]
@@ -284,7 +313,7 @@ class _Writer:
         b += struct.pack("<II", nrows, 0)
         if not j3:
             b += bytes(4) + bytes(4) + bytes(8)  # autonumber flag and zeros, complex autonumber, residue
-        b += bytes([0x53 if system else 0x4E]) + struct.pack("<HHH", len(cols), len(var), len(cols))
+        b += bytes([0x53 if system else 0x4E]) + struct.pack("<HHH", len(every), len(var), len(cols))
         b += struct.pack("<II", nidx, nidx) + owned + empty
         for _ in range(nidx):
             b += struct.pack("<II", nrows, nrows) + (b"" if j3 else bytes(4))
@@ -292,6 +321,8 @@ class _Writer:
             c = x["c"]
             if c.type in (TEXT, MEMO):
                 misc = struct.pack("<HH", 0x409, self.codepage & 0xFFFF) if j3 else struct.pack("<HH", 0x409, 0)
+            elif c.type == NUMERIC:  # precision and scale at 11 and 12 of the column block
+                misc = bytes(2) + bytes([c.precision, c.scale]) if j3 else bytes([c.precision, c.scale]) + bytes(2)
             else:
                 misc = bytes(4)
             length = 0 if c.type in LONG_VALUES else x["len"]
@@ -464,7 +495,7 @@ def jet_db(version: int, tables=(), *, queries=(), objects=(), relationships=(),
                                                  (REPORTS, "Reports"), (SCRIPTS, "Scripts"), (MODULES, "Modules"))]
     rows += [cat(tdef_of[t.name], TABLES, t.name, 1, SYSTEM) for t in system]
     for t in tables:
-        blob = w.props(t.props, [(c.name, c.props) for c in t.cols])
+        blob = w.props(t.props, [(c.name, c.props) for c in t.cols if not c.deleted])
         rows.append(cat(tdef_of[t.name], TABLES, t.name, 1, t.flags, props=blob))
     qrows = []
     for i, q in enumerate(queries):
@@ -487,8 +518,22 @@ def jet_db(version: int, tables=(), *, queries=(), objects=(), relationships=(),
 
     for p in plans:
         t = p["t"]
-        encoded = [w.row(t, p["cols"], p["var"], p["fixed"], r) for r in t.rows]
-        p["data"] = w.pack_rows(p["pages"][0], encoded)
+        tdef4 = p["pages"][0].to_bytes(4, "little")
+        encoded, extra = [], []
+        for r in t.rows:
+            if not isinstance(r, Row):
+                encoded.append(w.row(t, p["cols"], p["var"], p["fixed"], r))
+            elif r.kind == "deleted":
+                encoded.append((w.row(t, p["cols"], p["var"], p["fixed"], r.values), 0x8000))
+            else:
+                n = w.alloc()
+                if r.kind == "overflow":
+                    w.pages[n] = w.data_page(tdef4, [(w.row(t, p["cols"], p["var"], p["fixed"], r.values), 0x8000)])
+                    encoded.append((w.ptr(n, 0), 0x4000))
+                else:
+                    w.pages[n] = w.data_page(tdef4, [(w.ptr(n, 0), 0x4000)])
+                extra.append(n)
+        p["data"] = w.pack_rows(p["pages"][0], encoded) + extra
     if page8:
         target = plans[len(system)] if tables else plans[0]
         n = w.alloc()

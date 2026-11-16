@@ -1,19 +1,26 @@
-"""Access (Jet and ACE): the page layer in jet_pages (page 0, the header RC4, db_key pages, usage maps, chains, text).
+"""Access (Jet and ACE): the page layer in jet_pages (page 0, the header RC4, db_key pages, usage maps, chains, text)
+and the reader in jet (encryption, catalog, TDEFs, rows, scalar values, output).
 
 Run: python -I -X utf8 tests/test_reader_jet.py
 """
+import datetime
 import struct
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
+from reader import markdown  # noqa: E402
 from reader.containers import crypto  # noqa: E402
-from reader.formats import jet_pages  # noqa: E402
+from reader.formats import jet, jet_pages  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from jet_fix import Col, Tbl, jet_db, LONG, TEXT, MEMO  # noqa: E402
+from reader.model import Context, Para, Section, Table, Text  # noqa: E402
+from jet_fix import (Col, Query, Row, Tbl, jet_db, BINARY, BIGINT, BOOL, BYTE, DATE, DOUBLE,  # noqa: E402
+                     EXTDATE, FLOAT, GUID, INT, LONG, MEMO, MONEY, NUMERIC, TEXT)
 
 # the first bytes of Jackcess's JetFormat.BASE_HEADER_MASK, the RC4 keystream of C7 DA 39 6B
 JACKCESS_MASK = bytes.fromhex("B56F03626108C255")
@@ -206,6 +213,322 @@ def test_text_forms():
     assert j4.text(b"\xff\xfeab", False) == "﻿扡"  # not allowed the compressed form: plain UCS-2
     assert j4.text(b"a\x00b", False) == "a�"  # an odd byte left over
     assert jet_pages.open(jet_db(6)).text(b"\xff\xfeok", True) == "ok"
+
+
+# -- jet.py: the reader
+
+def convert(data, hidden=False):
+    ctx = Context()
+    doc = jet.parse_bytes(data, ctx)
+    with tempfile.TemporaryDirectory() as d:
+        md = markdown.render(doc, Path(d) / "assets", hidden, ctx.skipped)
+    return doc, ctx, md
+
+
+def jet_refused(data):
+    try:
+        jet.parse_bytes(data, Context())
+    except ReadError as e:
+        return e.kind, e.detail
+    raise AssertionError("ReadError not raised")
+
+
+def summary(doc):
+    assert isinstance(doc.blocks[0], Para)
+    return "".join(x.text for x in doc.blocks[0].inlines)
+
+
+def sections(doc):
+    return [b for b in doc.blocks if isinstance(b, Section)]
+
+
+def section(doc, name):
+    return next(s for s in sections(doc) if s.title.startswith(name + " ("))
+
+
+def para_text(p):
+    return "".join(x.text for x in p.inlines if isinstance(x, Text))
+
+
+def grid(sec):
+    """The table's cells as text, each row padded to the header's width (a Table keeps no trailing empty cells)."""
+    table = next(b for b in sec.blocks if isinstance(b, Table))
+    rows = [["".join(para_text(p) for p in cell.blocks) for cell in row] for row in table.rows]
+    return [r + [""] * (len(rows[0]) - len(r)) for r in rows]
+
+
+def columns_line(sec):
+    return para_text(next(b for b in sec.blocks if isinstance(b, Para)))
+
+
+def three():
+    cols = [Col("ID", LONG), Col("Name", TEXT), Col("Notes", MEMO)]
+    return Tbl("Orders", cols, [[1, "Ann", "first"], [2, "Bob", None], [3, "Cy", "third note"]], pk="ID")
+
+
+def test_jet4_table():
+    doc, ctx, md = convert(jet_db(1, [three()]))
+    assert summary(doc) == "Access 2000-2003 database (Jet 4): 1 table."
+    assert "## Table: Orders (3 rows)" in md
+    sec = section(doc, "Orders")
+    assert sec.kind == "table" and sec.title == "Orders (3 rows)" and not sec.hidden
+    assert columns_line(sec) == "Columns: ID (Long) · Name (Text) · Notes (Memo)"
+    assert grid(sec) == [["ID", "Name", "Notes"], ["1", "Ann", "first"], ["2", "Bob", ""], ["3", "Cy", "third note"]]
+    assert not ctx.skipped, ctx.skipped
+    for v in (0, 2, 3, 5, 6):  # the same table in every version
+        doc, ctx, _ = convert(jet_db(v, [three()]))
+        assert grid(section(doc, "Orders"))[1:] == [["1", "Ann", "first"], ["2", "Bob", ""], ["3", "Cy", "third note"]]
+
+
+def test_version_names():
+    names = {0: "Access 97 database (Jet 3)", 1: "Access 2000-2003 database (Jet 4)",
+             2: "Access 2007 database (ACE 12)", 3: "Access 2010 database (ACE 14)",
+             5: "Access 2016 database (ACE 16)", 6: "Access 2019 database (ACE 17)"}
+    for v, name in names.items():
+        assert summary(convert(jet_db(v))[0]) == f"{name}: 0 tables.", v
+    two = [three(), Tbl("Two", [Col("A", LONG)], [[1]])]
+    q = [Query("Q1", []), Query("Q2", [])]
+    linked = [("Prices", ";DATABASE=prices.accdb", "Prices")]
+    assert summary(convert(jet_db(1, two, queries=q, linked=linked))[0]) == \
+        "Access 2000-2003 database (Jet 4): 2 tables, 2 queries, 1 linked table."
+    one = "Access 2000-2003 database (Jet 4): 1 table, 1 query."
+    assert summary(convert(jet_db(1, two[:1], queries=q[:1]))[0]) == one
+
+
+def test_jet3_jump_table():
+    # Jet3 rows past 256 and 512 bytes: the one-byte variable offsets go through the jump table
+    cols = [Col("ID", LONG), Col("A", TEXT), Col("B", TEXT), Col("C", TEXT), Col("D", MEMO)]
+    rows = [[1, "a" * 200, None, "c" * 150, "d" * 100], [2, "x" * 255, "y" * 255, "z" * 10, None],
+            [3, None, None, "short", "m"]]
+    doc, ctx, _ = convert(jet_db(0, [Tbl("Wide", cols, rows)]))
+    want = [[str(r[0])] + ["" if v is None else v for v in r[1:]] for r in rows]
+    assert grid(section(doc, "Wide"))[1:] == want
+    assert not ctx.skipped, ctx.skipped
+    assert summary(doc) == "Access 97 database (Jet 3): 1 table."
+
+
+def ext_date(dt, frac7):
+    days = dt.date().toordinal() - 1
+    secs = dt.hour * 3600 + dt.minute * 60 + dt.second
+    return f"{days:019d}:{secs:012d}{frac7:07d}:7".encode("ascii") + b"\x00"
+
+
+def test_scalar_values():
+    when = datetime.datetime(2026, 11, 16, 10, 30, 0)
+    cols = [Col("Flag", BOOL), Col("B", BYTE), Col("I", INT), Col("L", LONG), Col("Big", BIGINT), Col("M", MONEY),
+            Col("S", FLOAT), Col("D", DOUBLE), Col("Dt", DATE), Col("X", EXTDATE),
+            Col("N", NUMERIC, precision=18, scale=2), Col("G", GUID), Col("Bin", BINARY)]
+    guid = "01234567-89ab-cdef-0123-456789abcdef"
+    rows = [[True, 7, -3, 70000, 2 ** 40, 12345678, 0.1, 0.1, 45000.0, ext_date(when, 5000000), -12345, guid,
+             bytes(range(12))],
+            [False, 255, 32767, -2 ** 31, -1, 15000, 3.0, 1e100, 45000.5, ext_date(when, 0), 12300, None, None],
+            [None, None, None, None, None, 10000, None, None, -1.25, None, None, None, None]]
+    doc, ctx, _ = convert(jet_db(6, [Tbl("Vals", cols, rows)]))
+    sec = section(doc, "Vals")
+    assert columns_line(sec) == ("Columns: Flag (Yes/No) · B (Byte) · I (Integer) · L (Long) · Big (BigInt) · "
+                                 "M (Currency) · S (Single) · D (Double) · Dt (Date) · X (Extended date) · "
+                                 "N (Decimal) · G (GUID) · Bin (Binary)")
+    assert grid(sec)[1:] == [
+        ["Yes", "7", "-3", "70000", "1099511627776", "1234.5678", "0.1", "0.1", "2023-03-15", "2026-11-16 10:30:00.5",
+         "-123.45", "{01234567-89AB-CDEF-0123-456789ABCDEF}", "<binary 12 bytes>"],
+        ["No", "255", "32767", "-2147483648", "-1", "1.5", "3", "1e+100", "2023-03-15 12:00:00",
+         "2026-11-16 10:30:00", "123.00", "", ""],
+        ["No", "", "", "", "", "1", "", "", "1899-12-29 06:00:00", "", "", "", ""]]
+    assert not ctx.skipped, ctx.skipped
+    # value() on raw bytes: the shortest Single that packs back, and the time fraction is a positive day part
+    db = jet._Db(jet_pages.open(jet_db(1)), Context())
+    single = jet.Column("S", FLOAT, 0)
+    for f in (0.1, 1 / 3, 16777216.0, -2.5e-7):
+        raw = struct.pack("<f", f)
+        s = jet.value(db, single, raw)
+        assert struct.pack("<f", float(s)) == raw and len(s) <= len(repr(struct.unpack("<f", raw)[0])), s
+    assert jet.value(db, jet.Column("D", DATE, 0), struct.pack("<d", 45000.99999999)) == "2023-03-16"
+    assert jet.value(db, jet.Column("D", DATE, 0), struct.pack("<d", -0.5)) == "1899-12-30 12:00:00"
+    assert jet.value(db, jet.Column("M", MONEY, 0), struct.pack("<q", -15000)) == "-1.5"
+    assert jet.value(db, jet.Column("M", MONEY, 0), struct.pack("<q", 0)) == "0"
+    assert uuid.UUID(guid).bytes_le != uuid.UUID(guid).bytes  # the GUID's first three fields are little-endian
+
+
+def test_memo_cut():
+    for v in (0, 1):
+        tbl = Tbl("Long", [Col("ID", LONG), Col("Notes", MEMO)], [[1, "x" * 40_000], [2, "short"]])
+        doc, ctx, _ = convert(jet_db(v, [tbl]))
+        cells = grid(section(doc, "Long"))
+        assert cells[1] == ["1", "x" * 32_768 + "…"] and cells[2] == ["2", "short"], v
+        assert ctx.skipped["text"] == 1 and set(ctx.skipped) == {"text"}, ctx.skipped
+    # a Text column over the cap is cut the same way
+    old = jet.JET_CELL_CHARS
+    jet.JET_CELL_CHARS = 5
+    try:
+        doc, ctx, _ = convert(jet_db(1, [Tbl("T", [Col("A", TEXT)], [["abcdefgh"], ["abc"]])]))
+        assert grid(section(doc, "T"))[1:] == [["abcde…"], ["abc"]] and ctx.skipped["text"] == 1
+    finally:
+        jet.JET_CELL_CHARS = old
+
+
+def test_deleted_and_overflow_rows():
+    cols = [Col("ID", LONG), Col("Name", TEXT)]
+    rows = [[1, "a"], Row("deleted", [2, "b"]), Row("overflow", [3, "c"]), [4, "d"]]
+    for v in (0, 1):
+        doc, ctx, _ = convert(jet_db(v, [Tbl("T", cols, rows)]))
+        assert grid(section(doc, "T"))[1:] == [["1", "a"], ["3", "c"], ["4", "d"]], v
+        assert not ctx.skipped, ctx.skipped  # the deleted row and the overflow's own flagged copy are not counted
+    # an overflow row pointing at itself is followed once: the row it names is again a pointer, so it is counted
+    doc, ctx, _ = convert(jet_db(1, [Tbl("T", cols, [[1, "a"], Row("loop"), [2, "b"]])]))
+    assert grid(section(doc, "T"))[1:] == [["1", "a"], ["2", "b"]]
+    assert ctx.skipped["record"] == 1 and "db_table" not in ctx.skipped
+
+
+def test_deleted_column_offsets():
+    cols = [Col("A", LONG), Col("B", LONG, deleted=True), Col("C", LONG), Col("D", TEXT, deleted=True), Col("E", TEXT)]
+    rows = [[1, 2, 3, "dd", "e"], [10, None, 30, None, "ee"], [100, 200, None, "d", None]]
+    for v in (0, 1, 3):
+        doc, ctx, _ = convert(jet_db(v, [Tbl("Old", cols, rows)]))
+        sec = section(doc, "Old")
+        assert columns_line(sec) == "Columns: A (Long) · C (Long) · E (Text)"
+        assert grid(sec) == [["A", "C", "E"], ["1", "3", "e"], ["10", "30", "ee"], ["100", "", ""]], v
+        assert not ctx.skipped
+
+
+def test_system_tables_absent():
+    doc, ctx, md = convert(jet_db(1, [three()], queries=[Query("Q", [])]))
+    assert [s.title for s in sections(doc)] == ["Orders (3 rows)"]
+    assert "MSys" not in md and "db_table" not in ctx.skipped
+    assert summary(doc) == "Access 2000-2003 database (Jet 4): 1 table, 1 query."
+    # the catalog's own columns carry no compressed flag (as in real files), user Text and Memo columns do
+    db = jet._Db(jet_pages.open(jet_db(1, [three()])), Context())
+    assert all(c.ext == 0 for c in jet._tdef(db, 2).columns)
+    objs = jet._catalog(db)
+    user = next(o for o in objs if o.name == "Orders")
+    assert [c.ext for c in jet._tdef(db, user.id & 0xFFFFFF).columns] == [0, 1, 1]
+    assert {o.name for o in objs if o.flags & 0x80000002} >= {"MSysObjects", "MSysQueries", "MSysRelationships"}
+
+
+def test_compressed_flag():
+    # a flagged column's FF FE value is the compressed form; an unflagged one is plain UCS-2 even when it starts FF FE
+    cols = [Col("Flagged", TEXT), Col("Plain", TEXT, compressed=False)]
+    data = jet_db(1, [Tbl("Flags", cols, [["abc", "﻿xy"]])])
+    assert b"\xff\xfeabc" in data and "﻿xy".encode("utf-16-le") in data
+    doc, ctx, _ = convert(data)
+    assert grid(section(doc, "Flags"))[1] == ["abc", "﻿xy"]
+
+
+def test_hidden_table():
+    secret = Tbl("Secret", [Col("A", TEXT)], [["classified"]], flags=0x08)
+    doc, ctx, md = convert(jet_db(1, [secret, three()]))
+    sec = section(doc, "Secret")
+    assert sec.hidden == "hidden" and sec.title == "Secret (1 row)"
+    assert "Secret" not in md and "classified" not in md and "## Table: Orders (3 rows)" in md
+    _, _, shown = convert(jet_db(1, [secret, three()]), hidden=True)
+    assert "## Table: Secret (1 row) (hidden)" in shown and "classified" in shown
+    assert summary(doc) == "Access 2000-2003 database (Jet 4): 2 tables."
+
+
+def test_password_encrypted():
+    assert jet_refused(jet_db(1, [three()], password="secret")) == ("encrypted", "database password set")
+    assert jet_refused(jet_db(0, [three()], password="pw")) == ("encrypted", "database password set")
+    assert jet_refused(jet_db(3, [three()], password="pw")) == ("encrypted", "database password set")
+    # Jet4's empty password is stored as the creation-date mask itself: unmasked it is zero, so the file reads
+    raw = jet_pages.open(jet_db(1)).page(0)[0x42:0x42 + 40]
+    assert any(raw)
+    assert summary(convert(jet_db(1, [three()]))[0]).endswith("1 table.")
+
+
+def test_db_key_decoded():
+    for v in (0, 1):
+        plain = convert(jet_db(v, [three()]))[2]
+        assert convert(jet_db(v, [three()], db_key=0x1234))[2] == plain, v
+
+
+def test_ace_encryption():
+    for v in (2, 3, 5, 6):
+        assert jet_refused(jet_db(v, [three()], db_key=0x1234)) == ("encrypted", "ACE encryption"), v
+    data = bytearray(jet_db(3, [three()]))
+    data[0x299:0x29B] = (0x50).to_bytes(2, "little")  # the length of an Office encryption structure
+    assert jet_refused(bytes(data)) == ("encrypted", "ACE encryption")
+    data = bytearray(jet_db(1, [three()]))
+    data[0x299:0x29B] = (0x50).to_bytes(2, "little")  # Jet4 has no such structure: not looked at
+    assert summary(convert(bytes(data))[0]).endswith("1 table.")
+
+
+def break_tdef(data, name):
+    data = bytearray(data)
+    db = jet._Db(jet_pages.open(bytes(data)), Context())
+    page = next(o for o in jet._catalog(db) if o.name == name).id & 0xFFFFFF
+    data[page * db.jet.page_size] = 0x01  # no longer a TDEF page
+    return bytes(data)
+
+
+def test_bad_tdef_counted():
+    tables = [three(), Tbl("Other", [Col("A", LONG)], [[5]])]
+    for v in (0, 1):
+        doc, ctx, _ = convert(break_tdef(jet_db(v, tables), "Orders"))
+        assert [s.title for s in sections(doc)] == ["Other (1 row)"]
+        assert ctx.skipped["db_table"] == 1
+        both = break_tdef(break_tdef(jet_db(v, tables), "Orders"), "Other")
+        assert jet_refused(both) == ("damaged", "no table could be read")
+    # a broken table beside a saved query: the file still reads
+    doc, ctx, _ = convert(break_tdef(jet_db(1, tables[:1], queries=[Query("Q", [])]), "Orders"))
+    assert not sections(doc) and ctx.skipped["db_table"] == 1
+
+
+def test_cols_cap():
+    old = jet.JET_COLS
+    jet.JET_COLS = 2
+    try:
+        tables = [three(), Tbl("Pair", [Col("A", LONG), Col("B", TEXT)], [[1, "x"]])]
+        doc, ctx, _ = convert(jet_db(1, tables))
+        assert [s.title for s in sections(doc)] == ["Pair (1 row)"] and ctx.skipped["db_table"] == 1
+    finally:
+        jet.JET_COLS = old
+
+
+def tdef_page(data, name):
+    db = jet._Db(jet_pages.open(bytes(data)), Context())
+    return next(o for o in jet._catalog(db) if o.name == name).id & 0xFFFFFF
+
+
+def test_pages_not_shared():
+    # a usage map naming another table's data pages reads none of them (each data page names its own TDEF)
+    a = Tbl("A", [Col("ID", LONG), Col("Name", TEXT)], [[i, f"a{i}"] for i in range(5)])
+    b = Tbl("B", [Col("ID", LONG), Col("Name", TEXT)], [[9, "b"]])
+    data = bytearray(jet_db(1, [a, b]))
+    ta, tb = tdef_page(data, "A"), tdef_page(data, "B")
+    pages = jet_pages.open(bytes(data))
+    ptr = data[tb * 4096 + 55:tb * 4096 + 59]
+    row, pg = ptr[0], int.from_bytes(ptr[1:4], "little")
+    start = struct.unpack_from("<H", pages.page(pg), 14 + 2 * row)[0] & 0x1FFF
+    mine = owned_map(pages, ta)
+    data[pg * 4096 + start:pg * 4096 + start + len(mine)] = mine
+    doc, ctx, _ = convert(bytes(data))
+    assert len(grid(section(doc, "A"))) == 6 and len(grid(section(doc, "B"))) == 1
+    # a TDEF chain reaching a page another TDEF already holds ends there
+    wide = Tbl("Wide", [Col(f"column number {i}", LONG) for i in range(200)], [[1] * 200])
+    data = bytearray(jet_db(1, [wide, Tbl("Small", [Col("A", LONG)], [[7]])]))
+    tw, ts = tdef_page(data, "Wide"), tdef_page(data, "Small")
+    db = jet._Db(jet_pages.open(bytes(data)), Context())
+    cont = jet._tdef(db, tw).pages[1:]
+    assert cont, "the wide TDEF spans more than one page"
+    data[ts * 4096 + 4:ts * 4096 + 8] = cont[0].to_bytes(4, "little")
+    db = jet._Db(jet_pages.open(bytes(data)), Context())
+    assert jet._tdef(db, tw).pages[1:] == cont and jet._tdef(db, ts).pages == [ts]
+    doc, ctx, _ = convert(bytes(data))
+    assert grid(section(doc, "Small"))[1:] == [["7"]] and len(grid(section(doc, "Wide"))[0]) == 200
+
+
+def test_catalog_cap():
+    # 7 containers and 3 system tables come first; a cap of 11 rows keeps the first user table only
+    tables = [Tbl("N" * 70, [Col("A", LONG)], [[1]]), Tbl("Second", [Col("A", LONG)], [[2]])]
+    old = jet.JET_CATALOG
+    jet.JET_CATALOG = 11
+    try:
+        doc, ctx, _ = convert(jet_db(1, tables))
+    finally:
+        jet.JET_CATALOG = old
+    assert [s.title for s in sections(doc)] == ["N" * 64 + " (1 row)"]
+    assert ctx.skipped["record"] == 1 and ctx.skipped["text"] == 1
+    doc, ctx, _ = convert(jet_db(1, tables))
+    assert len(sections(doc)) == 2
 
 
 def main():
