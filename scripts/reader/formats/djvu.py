@@ -17,12 +17,14 @@ by their place among DIRM's page components, so a dropped page does not renumber
 Page text. TXTa, or TXTz through BZZ: a BE24 length, then UTF-8 (decoded with errors="replace"); the zone tree after
 it is never read. GS, VT and US end a paragraph, LF a line (`_text`). INCL brings in a shared DJVI's chunks, read once
 per document and one level deep (an INCL inside it is not followed). A page with no TXTa or TXTz is counted
-`textless` and gets no section; a text layer that is empty gives an empty section. When every page read is textless,
-the file is `unsupported` ("no text layer: ..."), so a scan is not called damaged.
+`textless` and gets no section; a text layer that is empty gives an empty section. A page cut short (a chunk that
+runs past its FORM, or a one-page file that ends before its FORM) is counted `record` once and never `textless`: it
+keeps the text read before the cut and has no section without any. When every page read is textless, the file is
+`unsupported` ("no text layer: ..."), so a scan is not called damaged; a file whose pages are all cut is `damaged`.
 
 BZZ budget. Each BZZ chunk decodes with `min(BZZ_CHUNK, left)`, `left` being what remains of the document's
 `BZZ_TOTAL`. A Limit at BZZ_CHUNK, a Truncated stream or a damaged one counts the chunk `record`. A Limit at `left`
-spends the budget: that page and every later one count `textless`. Shared text repeated on a later page charges its
+spends the budget: that page and every later one count `textless` (but never make the file "no text layer"). Shared text repeated on a later page charges its
 size to `left` again, as if it were decoded again, so output stays bounded when one DJVI is included by every page.
 """
 import re
@@ -60,6 +62,7 @@ class _Part:
     text: bool = False    # a TXTa or TXTz chunk was there
     images: bool = False  # an image chunk was there
     size: int = 0         # bytes of text layer read, charged again when shared text is repeated
+    cut: bool = False     # the walk stopped at a chunk that ran past its FORM (or the file ended): counted `record`
 
 
 def _chunks(data: bytes, start: int, end: int, ctx=None, dropped=None):
@@ -291,11 +294,10 @@ class _Reader:
 
     @staticmethod
     def _dropped(cid: bytes, part: _Part):
-        """A chunk that did not fit (already counted `record`) still says what the page held: a dropped text layer
-        is not counted `textless` as well, and a dropped image chunk still names the page images."""
-        if cid in TEXT_CHUNKS:
-            part.text = True
-        elif cid in IMAGE_CHUNKS:
+        """A chunk that did not fit (already counted `record`) cuts the page short: whatever followed it is unknown,
+        so the page is never also counted `textless`. A dropped image chunk still names the page images."""
+        part.cut = True
+        if cid in IMAGE_CHUNKS:
             part.images = True
 
     def _text_chunk(self, cid: bytes, raw: bytes, part: _Part):
@@ -349,21 +351,26 @@ class _Reader:
         if self.ctx.skipped["page"] == 1:
             self.ctx.warnings.append("page: skipped damaged part")
 
-    def run(self, pages: list[tuple[int, str, int, int]]) -> Doc:
+    def run(self, pages: list[tuple[int, str, int, int]], short: bool = False) -> Doc:
+        """The page sections. `short`: the file ends before its FORM does, so the last page is cut short even when
+        the walk ended on a chunk boundary. A cut page is counted `record` once; it keeps the text read before the
+        cut, has no section when there was none, and is never `textless`. Pages counted `textless` because the BZZ
+        budget ran out (`starved`) never make the file "no text layer"."""
         ctx = self.ctx
         if not pages:
             raise ReadError("damaged", "no pages")
         sections = []
-        textless = images = read = 0
-        cut = False
+        textless = starved = images = read = 0
+        capped = False
         for n, (number, title, start, end) in enumerate(pages):
             if n >= DJVU_PAGES:
                 ctx.skipped["page_cut"] += len(pages) - n
-                cut = True
+                capped = True
                 break
             read += 1
             if self.spent:
                 textless += 1
+                starved += 1
                 continue
             got = []
             try:
@@ -377,18 +384,27 @@ class _Reader:
                 continue
             part = got[0]
             images += part.images
-            if self.spent or not part.text:
+            if short and n == len(pages) - 1 and not part.cut:
+                part.cut = True
+                self._record()
+            if self.spent:  # this page's text passed the budget: it and the rest count textless
+                textless += 1
+                starved += 1
+                continue
+            if part.cut and not part.paras:  # counted record by the walk, never also textless
+                continue
+            if not part.text:
                 textless += 1
                 continue
             sections.append(Section("page", title=title, number=number, blocks=part.paras))
         if images:
             ctx.skipped["page_images"] = 1
-        if textless and textless == read:
+        if textless and textless == read and not starved:
             noun = "page" if textless == 1 else "pages"
             raise ReadError("unsupported", f"no text layer: {textless} image-only {noun} (OCR is out of scope)")
         if textless:
             ctx.skipped["textless"] += textless
-        if not sections and not cut and not textless:
+        if not sections and not capped and not textless:
             raise ReadError("damaged", "no readable pages")
         return Doc(blocks=sections)
 
@@ -413,7 +429,8 @@ def parse_bytes(data, ctx, *, started=None, clock=time.monotonic) -> Doc:
         pages = reader.bundle(16, end)
     else:
         raise ReadError("damaged", f"FORM:{kind.decode('latin-1')} is not a DjVu page or document")
-    return reader.run(pages)
+    # a bundle's components that do not fit the cut file are dropped by _place; a single page is read as far as it goes
+    return reader.run(pages, short=kind == b"DJVU" and 12 + size > len(data))
 
 
 def parse(path, ctx, *, started=None) -> Doc:

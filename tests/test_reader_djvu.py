@@ -195,14 +195,77 @@ def test_oversize_chunk_record():
     at = p2.index(b"TXTa")
     p2[at + 4:at + 8] = struct.pack(">I", 0x7FFFFFFF)
     doc, ctx = read(djvm([page("One"), bytes(p2), page("Three")]))
-    # the dropped TXTa is counted once, as record: its page is an empty section, not also textless
+    # the page is cut short: counted once, as record, never also textless; with nothing read it has no section
     assert ctx.skipped["record"] == 1 and ctx.skipped["textless"] == 0
-    assert [texts(s) for s in doc.blocks] == [["One"], [], ["Three"]]
-    # a dropped image chunk still names the page images
+    assert [(s.number, texts(s)) for s in doc.blocks] == [(1, ["One"]), (3, ["Three"])]
+    # a dropped image chunk still names the page images; the text read before it is kept
     bad = form(b"DJVU", [INFO, chunk(b"TXTa", _text("Two")), b"Sjbz" + struct.pack(">I", 0x7FFFFFFF)])
     doc, ctx = read(djvm([page("One"), bad]))
     assert ctx.skipped["record"] == 1 and ctx.skipped["page_images"] > 0
     assert [texts(s) for s in doc.blocks] == [["One"], ["Two"]]
+    # an oversize image chunk before the text (text comes after the image chunks in real files): one count, record
+    bad = bytearray(form(b"DJVU", [INFO, chunk(b"BG44", bytes(10)), chunk(b"TXTa", _text("Lost"))]))
+    at = bad.index(b"BG44")
+    bad[at + 4:at + 8] = struct.pack(">I", 0x7FFFFFFF)
+    doc, ctx = read(djvm([page("One"), bytes(bad)]))
+    assert ctx.skipped["record"] == 1 and ctx.skipped["textless"] == 0 and ctx.skipped["page_images"] > 0
+    assert [s.number for s in doc.blocks] == [1]
+
+
+def test_cut_single_page_damaged():
+    # a one-page file cut inside its image data (a partial download) is damaged, not "no text layer"
+    txta = chunk(b"TXTa", _text("Words"))
+    data = iff(form(b"DJVU", [INFO, chunk(b"Sjbz", bytes(200)), txta]))
+    e = refused(data[:-60])
+    assert e.kind == "damaged", (e.kind, e.detail)
+    # cut on a chunk boundary (the FORM says more bytes follow than the file has): damaged too
+    e = refused(data[:-len(txta)])
+    assert e.kind == "damaged", (e.kind, e.detail)
+    # text read before the cut is kept, and the cut is counted once
+    data = iff(form(b"DJVU", [INFO, txta, chunk(b"Sjbz", bytes(200))]))
+    doc, ctx = read(data[:-60])
+    assert [texts(s) for s in doc.blocks] == [["Words"]] and ctx.skipped["record"] == 1
+    assert ctx.skipped["textless"] == 0
+    doc, ctx = read(data[:-208])  # the Sjbz chunk gone whole: the file still ends before its FORM
+    assert [texts(s) for s in doc.blocks] == [["Words"]] and ctx.skipped["record"] == 1
+    # a bundle whose every page is cut: damaged too
+    bad = bytearray(page("Gone", images=True))
+    at = bad.index(b"Sjbz")
+    bad[at + 4:at + 8] = struct.pack(">I", 0x7FFFFFFF)
+    e = refused(djvm([bytes(bad), bytes(bad)]))
+    assert e.kind == "damaged", (e.kind, e.detail)
+
+
+def test_over_cap_chunk_walk_goes_on():
+    # a chunk that fits its page but is over a cap is skipped (record) and the page's later chunks are still read
+    one = form(b"DJVU", [INFO, chunk(b"TXTz", bzz_encode(_text("y" * 3000))), chunk(b"TXTa", _text("after"))])
+    saved = djvu.bzz.BZZ_CHUNK
+    djvu.bzz.BZZ_CHUNK = 1000
+    try:
+        doc, ctx = read(iff(one))
+    finally:
+        djvu.bzz.BZZ_CHUNK = saved
+    assert [texts(s) for s in doc.blocks] == [["after"]]
+    assert ctx.skipped["record"] == 1 and ctx.skipped["textless"] == 0
+
+
+def test_budget_spent_not_unsupported():
+    # text dropped by BZZ_TOTAL is not "no text layer": the file is not refused as a scan
+    z = chunk(b"TXTz", bzz_encode(_text("a" * 400)))
+    saved = djvu.bzz.BZZ_TOTAL
+    djvu.bzz.BZZ_TOTAL = 500  # one 403-byte chunk fits, the second spends the budget
+    try:
+        doc, ctx = read(iff(form(b"DJVU", [INFO, z, z])))
+    finally:
+        djvu.bzz.BZZ_TOTAL = saved
+    assert doc.blocks == [] and ctx.skipped["textless"] == 1
+    # the review's probe: the budget spent on page 1 (three chunks), page 2 after it
+    djvu.bzz.BZZ_TOTAL = 1000
+    try:
+        doc, ctx = read(djvm([form(b"DJVU", [INFO, z, z, z]), page(None)]))
+    finally:
+        djvu.bzz.BZZ_TOTAL = saved
+    assert doc.blocks == [] and ctx.skipped["textless"] == 2
 
 
 def test_bzz_total():
