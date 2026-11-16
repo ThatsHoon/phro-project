@@ -572,12 +572,13 @@ def page_stream(shapes, version):
     return vsd_chunk(0x15, bytes(0x30), version=version, cid=NONE) + b"".join(shape_chunks(s, version) for s in shapes)
 
 
-def drawing(pages, version=11, stencils=(), extra=()):
+def drawing(pages, version=11, stencils=(), extra=(), more_stencils=()):
     """A VisioDocument laid out as real files: the trailer list holds the name list (0x32: one 0x33 name per page;
     Visio 5 one blob of 0x33 records), the stencils (0x1D: each stencil page 0x1E a list of shape streams, a shape's
     id its "id" else its index), `extra` ((type, format, stream bytes); real files hold their font list 0x18 before
     the pages), then the pages list (0x27: each page a chunk stream, then the name index 0xC9 naming page k by name
-    k). A page is a dict: "name", "shapes", "background", "compressed" (the stream LZ77-coded, format bit 1)."""
+    k). A page is a dict: "name", "shapes", "background", "compressed" (the stream LZ77-coded, format bit 1).
+    `more_stencils` is a second stencil list after the first."""
     lay = Layout(version)
     unit = 2 if version == 11 else 1
     if version == 5:  # readName2 skips an s16 (VSD5Parser::getInt), then 8-bit text to a NUL
@@ -587,9 +588,11 @@ def drawing(pages, version=11, stencils=(), extra=()):
         names = [lay.put(struct.pack("<I", 1) + encode(p.get("name", ""), version) + bytes(unit), 0x33, 0x40)
                  for p in pages]
         top = [lay.put(vsd_list(names, version=version), 0x32, 0x50)]
-    if stencils:
+    for stencil_list in (stencils, more_stencils):
+        if not stencil_list:
+            continue
         spages = []
-        for sp in stencils:
+        for sp in stencil_list:
             shapes = [lay.put(shape_chunks(s, version, level=0), s.get("type", 0x48), 0xD0) for s in sp]
             spages.append(lay.put(vsd_list(shapes, version=version, ptype=0x1E), 0x1E, 0x50))
         top.append(lay.put(vsd_list(spages, version=version, ptype=0x1D), 0x1D, 0x50))
@@ -1167,8 +1170,10 @@ def test_zip_saved_as_vsd():
         return f'<Relationships xmlns="{pkg}">' + "".join(
             f'<Relationship Id="{i}" Type="{rel}/{t}" Target="{tg}"/>' for i, t, tg in items) + "</Relationships>"
 
+    root = f'<Relationships xmlns="{pkg}"><Relationship Id="rId1" Target="visio/document.xml" ' \
+        'Type="http://schemas.microsoft.com/visio/2010/relationships/document"/></Relationships>'
     members = {
-        "_rels/.rels": rels([("rId1", "document", "visio/document.xml")]),
+        "_rels/.rels": root,  # Visio's own type, as every bench Visio package has it
         "visio/document.xml": f"<VisioDocument {ns}/>",
         "visio/_rels/document.xml.rels": rels([("rId1", "pages", "pages/pages.xml")]),
         "visio/pages/pages.xml": f'<Pages xmlns:r="{rel}" {ns}><Page ID="0" Name="Zipped"><Rel r:id="rId1"/></Page>'
@@ -1275,10 +1280,11 @@ def test_stencil_room_and_lost_inheritance():
 
 
 def test_zip_route_visio_only():
-    # (fix round 1) zip_route sends a zip to vsdx on Visio's own root relationship type, or on a `/document` one
-    # whose target exists in a package without an `/officeDocument` one; any other zip keeps its old route
+    # (fix rounds 1 and 2) zip_route sends a zip to vsdx only on an internal root relationship of Visio's own type
+    # whose target exists, in a package without an `/officeDocument` one; any other zip keeps its old route
     from reader.formats import zip_route
     od = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    vis = "http://schemas.microsoft.com/visio/2010/relationships/document"
     pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
 
     def rels(items):
@@ -1298,12 +1304,16 @@ def test_zip_route_visio_only():
         ({**ct, "xl/workbook.xml": "<x/>", "_rels/.rels": rels([(f"{od}/officeDocument", "xl/workbook.xml")])},
          "ooxml"),
         ({"mimetype": "application/vnd.oasis.opendocument.text", "content.xml": "<c/>"}, "odf"),
-        ({**ct, "visio/document.xml": "<v/>",
-          "_rels/.rels": rels([("http://schemas.microsoft.com/visio/2010/relationships/document",
-                                "visio/document.xml")])}, "vsdx"),
+        ({**ct, "visio/document.xml": "<v/>", "_rels/.rels": rels([(vis, "visio/document.xml")])}, "vsdx"),
         ({**ct, "visio/document.xml": "<v/>", "_rels/.rels": rels([(f"{od}/document", "visio/document.xml")])},
-         "vsdx"),
+         "ooxml"),  # a `/document` rel of another type
         ({**ct, "_rels/.rels": rels([(f"{od}/document", "visio/document.xml")])}, "ooxml"),  # no such part
+        ({**ct, "_rels/.rels": rels([(vis, "visio/document.xml")])}, "ooxml"),  # Visio's type, no such part
+        ({**docx, "_rels/.rels": rels([(f"{od}/officeDocument", "word/document.xml"), (vis, "visio/document.xml")])},
+         "ooxml"),  # (round 2) a docx with a dangling Visio-typed rel
+        ({**docx, "visio/document.xml": "<v/>",
+          "_rels/.rels": rels([(f"{od}/officeDocument", "word/document.xml"), (vis, "visio/document.xml")])},
+         "ooxml"),  # (round 2) a Word+Visio hybrid keeps its Word body
     ]
     for members, want in cases:
         assert zip_route.route(make_zip(None, members)) == want, (want, sorted(members))
@@ -1355,6 +1365,75 @@ def test_run_and_cut_fidelity():
     stencils = [[{"id": 1, "text": "veil", "misc": misc(5, hide=True)}]]
     doc, ctx = read(drawing([{"shapes": [{"master": (0, 1), "pin": (0.0, 1.0)}]}], version=5, stencils=stencils))
     assert lines(doc.blocks[0]) == ["veil"] and not ctx.skipped, lines(doc.blocks[0])
+
+
+def test_first_stencil_list_only():
+    # (fix round 2) only the first stencil list is read (`collecting`): a later list's page 0 does not replace the
+    # first one's, and its page 1 is unread, its inheritor counted `stencil`
+    pages = [{"shapes": [{"id": 1, "master": (0, 4), "pin": (0.0, 2.0)},
+                         {"id": 2, "master": (1, 4), "pin": (0.0, 1.0)}]}]
+    for version in (11, 6):
+        data = drawing(pages, version=version, stencils=[[{"id": 4, "text": "first"}]],
+                       more_stencils=[[{"id": 4, "text": "second"}], [{"id": 4, "text": "other"}]])
+        doc, ctx = read(data)
+        assert (lines(doc.blocks[0]), ctx.skipped) == (["first"], {"stencil": 1}), (version, lines(doc.blocks[0]),
+                                                                                     ctx.skipped)
+
+
+def _v5_names(*names, nested=False):
+    """A Visio 5 name list stream (an `extra`): one 0x33 record a name; `nested` adds a 0x32 record after them."""
+    recs = [(0x33, struct.pack("<h", 1) + n + b"\x00") for n in names]
+    return 0x32, 0x40, v5_records(recs + ([(0x32, bytes(4))] if nested else []))
+
+
+def test_v5_fresh_name_map():
+    # (fix round 2) a Visio 5 name list (0x32) starts a fresh name map: a later list of one name leaves page 2
+    # unnamed (numbered), where the old map would still name it
+    pages = [{"name": "A", "shapes": [{"text": "a"}]}, {"name": "B", "shapes": [{"text": "b"}]}]
+    doc, ctx = read(drawing(pages, version=5, extra=[_v5_names(b"Z")]))
+    assert [s.title for s in doc.blocks] == ["Z", "2"], [s.title for s in doc.blocks]
+
+
+def test_v5_no_nested_lists():
+    # (fix round 2) a Visio 5 list's records are not read as lists again: a 0x32 record inside a name list does not
+    # empty the name map it is part of
+    pages = [{"shapes": [{"text": "a"}]}]
+    doc, ctx = read(drawing(pages, version=5, extra=[_v5_names(b"A", nested=True)]))
+    assert [s.title for s in doc.blocks] == ["A"], [s.title for s in doc.blocks]
+
+
+def test_field_order_meter():
+    # (fix round 2, Task 15's guard) the field list's ids take from the item meter: past it the order is cut and
+    # `record` counted once
+    from types import SimpleNamespace
+    data = struct.pack("<II", 0, 12) + struct.pack("<III", 4, 3, 9)
+    old = limits.BIN_RECORDS
+    try:
+        for cap, want, skipped in ((100, [4, 3, 9], {}), (2, [4, 3], {"record": 1})):
+            limits.BIN_RECORDS = cap
+            r, s = vsd._Reader(b"", 11, Context()), SimpleNamespace(order=None)
+            r.field_list(s, data)
+            assert (s.order, r.ctx.skipped) == (want, skipped), (cap, s.order, r.ctx.skipped)
+    finally:
+        limits.BIN_RECORDS = old
+
+
+def test_format_block_meter():
+    # (fix round 2, Task 15's guard) each format block looked at takes one item: past the meter the number's format
+    # is unknown (shown as nothing) and `record` counted once
+    from types import SimpleNamespace
+    filler = struct.pack("<IBBBHBB", 11, 0, 1, 0, 5, 0, 0)  # block index 1: not the format block
+    data = number_field(41.6, 2)
+    data = data[:0x36] + filler + data[0x36:]
+    old = limits.BIN_RECORDS
+    try:
+        for cap, fmt, skipped in ((100, 2, {}), (1, vsd.UNKNOWN_FORMAT, {"record": 1})):
+            limits.BIN_RECORDS = cap
+            r, s = vsd._Reader(b"", 11, Context()), SimpleNamespace(fields={})
+            r.text_field(s, 3, data)
+            assert (s.fields[3][1], r.ctx.skipped) == (fmt, skipped), (cap, s.fields, r.ctx.skipped)
+    finally:
+        limits.BIN_RECORDS = old
 
 
 def test_no_page():

@@ -5,11 +5,11 @@ A .doc, .rtf or .ppt file whose head is a zip is an OpenDocument package or an O
 its `mimetype` member is `application/vnd.oasis.opendocument.*`, or when it has a `content.xml` and no
 `[Content_Types].xml`; anything else goes to `ooxml`, which refuses what is no Word or PowerPoint package. A .xls
 zip holding `xl/workbook.bin` goes to `xlsb`; any other goes through `parse` here, so an OpenDocument sheet is read by
-`odf` and the rest by `ooxml`. A Visio package goes to `vsdx`, so a vsdx saved as .vsd is read too: one with a root
-relationship of Visio's own type (`_VISIO`), or one with no `/officeDocument` root relationship and an internal
-`.../document` one whose target it holds (as `vsdx` finds its main part). A Word, PowerPoint or Excel package with a
-stray or dangling `/document` relationship still goes to `ooxml`. Neither parser comes back to the caller, so the
-routing cannot loop. Parsers are imported late.
+`odf` and the rest by `ooxml`. A Visio package goes to `vsdx`, so a vsdx saved as .vsd is read too: one with an
+internal root relationship of Visio's own type (`_VISIO`) whose target it holds, and no `/officeDocument` root
+relationship. A Word, PowerPoint or Excel package keeps its own body: with a stray, dangling or Visio-typed
+relationship beside its `/officeDocument` one it still goes to `ooxml`. Neither parser comes back to the caller, so
+the routing cannot loop. Parsers are imported late.
 """
 from ..containers.zipx import Package
 from ..limits import ReadError
@@ -40,10 +40,8 @@ def route(path) -> str:
                 raise
             root = {}
         rels = [r for r in root.values() if not r.external]
-        if any(r.type == _VISIO for r in rels):
-            return "vsdx"
         if not any(r.type.endswith("/officeDocument") for r in rels) and any(
-                r.type.endswith("/document") and pkg.has(r.target) for r in rels):
+                r.type == _VISIO and pkg.has(r.target) for r in rels):
             return "vsdx"
     return "ooxml"
 
