@@ -1,22 +1,24 @@
 # This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not
 # distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
-# Ported from libmspub 0477b85184e02dc5276582d9cea969208d56c655, src/lib/MSPUBParser.cpp, MSPUBCollector.cpp, EscherContainerType.h, EscherFieldIds.h.
+# Ported from libmspub 0477b85184e02dc5276582d9cea969208d56c655, src/lib/MSPUBParser.cpp, MSPUBCollector.cpp, EscherContainerType.h, EscherFieldIds.h, TableInfo.h.
 """Publisher 2002 and later (pub) to the document model: one section per page in the document's page order, each
-page's text boxes in reading order with their bold, then the master pages, the scratch area (hidden) and a links line.
+page's text boxes, tables and pictures in reading order with their bold, then the master pages, the scratch area
+(hidden) and a links line.
 
 Ported from libmspub (MPL-2.0) at 0477b85184e02dc5276582d9cea969208d56c655, `src/lib/`: `MSPUBParser.cpp` (`parse`,
-`parseContents`, `parseDocumentChunk`, `parsePageChunk`, `parsePageShapeList`, `parseShape`, `getPageTypeBySeqNum`,
-`parseEscher`, `parseShapeGroup`, `parseEscherShape`, `extractEscherValues`, `getEscherElementTailLength`,
-`getEscherElementAdditionalHeaderLength`), `MSPUBCollector.cpp` (`go`, `writePage`, `assignShapesToPages`,
-`designateMasterPage`), `EscherContainerType.h` and `EscherFieldIds.h`. The Contents blocks and chunk directory are
-`pub_contents`'s, the Quill stories, bold and links `pub_quill`'s.
+`parseContents`, `parseDocumentChunk`, `parsePageChunk`, `parsePageShapeList`, `parseShape` with its table branch,
+`getPageTypeBySeqNum`, `parseEscher`, `parseShapeGroup`, `parseEscherShape`, `extractEscherValues`,
+`getEscherElementTailLength`, `getEscherElementAdditionalHeaderLength`), `MSPUBCollector.cpp` (`go`, `writePage`,
+`assignShapesToPages`, `designateMasterPage`, `createTableLayout`, `mapTableTextToCells`), `EscherContainerType.h`,
+`EscherFieldIds.h` and `TableInfo.h`. The Contents blocks and chunk directory are `pub_contents`'s, the Quill stories,
+bold, table cells and links `pub_quill`'s, the BStore and BLIPs `officeart`'s.
 
 Version. The Contents stream starts `E8 AC xx 00`: 0x2C is 2002 and later, read here; 0x22 (Publisher 2000, 97 and
 98) is not read yet ("Publisher 2000 or 98"), any other byte is `unsupported`, and a stream not starting E8 AC is
 damaged. A compound file with no Contents stream goes to `cfb_route.route(cf, "pub", "no Contents stream")`. A
 2002+ file needs the Quill stream (`Quill/QuillSub/CONTENTS`) and a DOCUMENT chunk, as libmspub does; without
 either it is damaged. A stream the compound file cannot give (a broken sector chain) is damaged, the detail naming
-it ("Contents stream", "Quill/QuillSub/CONTENTS stream", "Escher/EscherStm stream").
+it ("Contents stream", "Quill/QuillSub/CONTENTS stream", "Escher/EscherStm stream", "Escher/EscherDelayStm stream").
 
 Pages. The DOCUMENT chunk's page list (block 0x02, its entries of id 0) gives the order, each seqnum once; with no
 list, the PAGE chunks in seqnum order (libmspub's `go`). Of these, a PAGE chunk whose block 0x0E (THIS_MASTER_NAME)
@@ -27,9 +29,16 @@ type 0x70). Block 0x0D, the master a page applies, is not followed: the master's
 section, never again on the pages naming it, so no master chain is walked. Masters follow the normal pages, in
 directory order, as `Section("master", title=name)` (the name UTF-16LE, charged to the room; past it the title is
 left out, counted `text`). Then the scratch area: the shapes of the DUMMY pages, in directory order, in one
-`Section("page", title="Scratch area", hidden="hidden")`. Each chunk offset is walked once a document, however many
-directory entries name it (their reads cached by offset), and a chunk ends at the next chunk's offset (or the trailer's
-or the stream's end): a declared length past that is cut there, counted `record` once.
+`Section("page", title="Scratch area", hidden="hidden")`. A chunk ends at the next chunk's offset (or the trailer's
+or the stream's end): a declared length past that is cut there, counted `record` once a document, and the walk of a
+chunk so cut is not counted again when a block runs past the cut.
+
+The offset cache. Each page, shape and CELLS chunk offset is walked once a document, however many directory entries
+name it: what a walk keeps (a page's master name and 0x70 shape entries, a shape's text id, a table's rows, columns
+and CELLS seqnum, a CELLS chunk's cells) is cached by offset. The DOCUMENT chunk's page list is walked once, apart.
+The cache holds at most one entry per directory offset (`pub_contents.PUB_CHUNKS`), and its lists one item per block
+walked, so at most `limits.BIN_RECORDS` items in all (each block ticks the meter); a CELLS chunk keeps at most
+`limits.TABLE_NODES` cells, and one listing more is kept as too many (its tables counted `table`).
 
 Shapes. A listed shape chunk (SHAPE, ALTSHAPE, TABLE; libmspub's `parseShape`) gives the Quill story its block 0x27
 (SHAPE_TEXT_ID) names, the last one winning; a GROUP or LOGO chunk has no text and stands for its members, the
@@ -37,8 +46,35 @@ chunks whose directory parent it is, in directory order, groups inside included.
 takes a group's members from the Escher SpgrContainer nesting (`beginGroup`, `setCurrentGroupSeqNum`); the two agree
 where Publisher writes a member's directory parent as its group, as on every bench file. Each shape is placed once
 in the document (where first met) and each story given once (a story two shapes name follows the first); a shape
-naming no story gives nothing, uncounted. The story's `Para`s carry its bold (`pub_quill`). Tables are given as their
-story's paragraphs.
+naming no story gives no text, uncounted. The story's `Para`s carry its bold (`pub_quill`). A shape's picture, when
+it has one, comes before its text.
+
+Tables. A TABLE chunk's blocks 0x66 and 0x67 give its rows and columns, 0x6B the seqnum of its CELLS chunk (0x63),
+whose block 0x02 lists one item (id 0) a cell: sub-blocks 0x01 and 0x02 its start and end row, 0x03 and 0x04 its
+start and end column (0 when absent). The story is cut into cells by its `TCD ` bit (`pub_quill.cell_spans`), the
+k-th cell text going to the k-th cell of the CELLS list, as libmspub's `mapTableTextToCells`; each cell's paragraphs
+keep the story's bold (`pub_quill.cell_paras`). The grid kept is the rows and columns where a cell starts (a span
+counts the kept ones it covers, as hancom's `place`), so the model holds no more places than cells. A cell's end
+past the grid is cut to it, an end before its start is a span of one; cells are laid out in grid order, and a cell
+whose start another covers adds its paragraphs to that cell, a span reaching into another cell is cut short there,
+and a kept place no cell covers is an empty cell (libmspub leaves such a place covered). Cell texts past the last
+cell, or text past the `TCD ` bit's last cell, follow the table as paragraphs. Any of these counts `record` once for
+the table; fewer texts than cells leave the last cells empty, uncounted. A table without rows, columns, a CELLS
+chunk, a cell or a `TCD ` bit, one whose rows x columns pass `limits.GRID_SLOTS`, or one whose cells pass what is
+left of `limits.TABLE_NODES` (the document's: each table charges its cells) gives its story as paragraphs, counted
+`table`; the grid is never allocated from the declared counts: the layout's one array is the kept places (kept rows
+x kept columns, no more than the declared rows x columns, so within `limits.GRID_SLOTS`, checked before), 4 bytes each.
+
+Pictures. The Escher walk (below) records each ClientData shape seqnum's SpContainer, with an anchor or without;
+`officeart.shape_pib` reads its pib (0x4104), a 1-based index into the BStore of the stream's DggContainer
+(`officeart.bstore`). The BLIP is the FBSE's own, or the delay stream's (`Escher/EscherDelayStm`) at its foDelay
+(`officeart.fbse_delay`), read by `officeart.blip_image` under one `flate.Budget` of `limits.IMAGE_BYTES` a document.
+PNG and JPEG are `Image`s, a DIB (made a BMP by `officeart.dib_to_bmp`) becomes a PNG through `images.bmp_to_png`,
+WMF and EMF are kept as they are (assets, not viewable). Each BLIP is decoded once a document (by pib, and by its
+place, so FBSEs naming one delay BLIP share it). Each placement is charged to `limits.IMAGE_BYTES` (copies counted,
+the PNG's length after conversion); past it, or for a pib outside the BStore, an unreadable BLIP or a kind Assets
+does not keep, the placement is counted `image`. Once the budget is spent no BLIP is decoded or converted, and a
+BLIP whose bytes alone pass what is left is not converted.
 
 Order. Top, then left, by the shape's box as libmspub's `parseEscherShape` reads it (the Contents shape chunk holds
 only a width and height): the `Escher/EscherStm` DgContainers' SpgrContainers, walked as `parseShapeGroup`, each
@@ -47,39 +83,46 @@ to 0x2004, signed) or ChildAnchor (0xF00F: four s32, mapped from the group's FSP
 box, as libmspub does). The DggContainer and DgContainers are followed by 4 more bytes, and a ClientAnchor's and
 ClientData's values start 4 bytes in (`getEscherElementTailLength`, `getEscherElementAdditionalHeaderLength`). The
 box is arranged (its top the smaller y); rotation is not read. A shape with no box follows the placed ones in list
-order.
+order. This walk is the one walk over Publisher's SpContainers.
 
 Links. `pub_quill.links` give one `Para([Text("Links: "), Link(u, [Text(u)]), Text(", "), ...])` at the end. VBA: a
 storage named VBA anywhere (Publisher's `VBA/`, Word's `Macros/VBA/`) counts `vba` once; macros are never read.
 
 Bounds (each read at call time). One `pub_contents.Meter` of `limits.BIN_RECORDS` a document: the directory, every
-Contents block walked (page list, page chunks, shape chunks), each page visited, each shape placed, each Escher
-record and value, and the Quill stories' styles tick it; the first refusal counts `record` once and every later walk
-stops. The Escher walk, which only orders text, may spend no more than half of `limits.BIN_RECORDS` (`_Share`): past
-that the boxes found so far are kept and the pages are still read, `record` counted once a document. The page list
-and the shapes are walked with seen-sets, so a page or shape listed twice, naming itself or a cycle of groups is read
-once; group members past `limits.MAX_DEPTH` levels, and Escher groups nested past it, are left out, counted `depth`
-once. `ctx.guard("page")` wraps each page and scratch page, `ctx.guard("master_page")` each master and
-`ctx.guard("shape")` each shape; a page's blocks are kept only when its guard succeeds. Each story
-given is charged to one room of `limits.MAX_OUTPUT` a document, as the stories are charged (`pub_quill`): its
-characters and `vsdx.LINE` for itself, each paragraph end or line break and each bold run; past the room it is left
-out, counted `text`. Each link is charged its characters and LINE; past the room the rest are left out, counted
-`link` once. Nothing is allocated from a declared count; loops over the directory's references are bounded by
-`pub_contents.PUB_CHUNKS`.
+Contents block walked (page list, page chunks, shape, table and CELLS chunks), each page visited, each shape placed,
+each Escher record and value, the Quill stories' styles and each step of a table's layout (a place checked or marked,
+a cell or gap of a row) tick it; the first refusal counts `record` once and every later walk stops (a table it cuts
+gives its story as paragraphs, uncounted again). The Escher walk, which only orders text and finds pictures, may spend
+no more than half of `limits.BIN_RECORDS` (`_Share`): past that the boxes found so far are kept and the pages are
+still read, `record` counted once a document. `officeart.shape_pib` re-reads only the children of an SpContainer the
+walk ticked, once (a seqnum names one), and `officeart.bstore` is walked once a document within
+`officeart.MAX_RECORDS`. The page list and the shapes are walked with seen-sets, so a page or shape listed twice,
+naming itself or a cycle of groups is read once; group members past `limits.MAX_DEPTH` levels, and Escher groups
+nested past it, are left out, counted `depth` once. `ctx.guard("page")` wraps each page and scratch page,
+`ctx.guard("master_page")` each master, `ctx.guard("shape")` each shape and `ctx.guard("image")` each picture; a
+page's blocks are kept only when its guard succeeds. Each story given is charged to one room of `limits.MAX_OUTPUT` a
+document, as the stories are charged (`pub_quill`): its characters and `vsdx.LINE` for itself, each paragraph end or
+line break and each bold run; past the room it is left out, counted `text`. Each link is charged its characters and
+LINE; past the room the rest are left out, counted `link` once. Nothing is allocated from a declared count; loops
+over the directory's references are bounded by `pub_contents.PUB_CHUNKS`.
 """
 import struct
-from bisect import bisect_right
+from array import array
+from bisect import bisect_left, bisect_right
+from itertools import islice
 
-from .. import limits
+from .. import images, limits, officeart
+from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
-from ..model import Bold, Doc, Link, Para, Section, Text
+from ..model import Bold, Cell, Doc, Image, Link, Para, Section, Table, Text
 from . import cfb_route, pub_contents, pub_quill, vsdx, zip_route
-from .pub_contents import ALTSHAPE, DOCUMENT, GROUP, LOGO, PAGE, SHAPE, STRING_CONTAINER, TABLE
+from .pub_contents import ALTSHAPE, CELLS, DOCUMENT, GROUP, LOGO, PAGE, SHAPE, STRING_CONTAINER, TABLE
 
 CONTENTS = "Contents"
 QUILL = "Quill/QuillSub/CONTENTS"
 ESCHER = "Escher/EscherStm"
+DELAY = "Escher/EscherDelayStm"
 HEAD = b"\xE8\xAC"
 V2002 = 0x2C
 V2000 = 0x22
@@ -92,6 +135,11 @@ PAGE_LIST = 0x02        # DOCUMENT_PAGE_LIST, in the DOCUMENT chunk
 PAGE_SHAPES = 0x02      # in a PAGE chunk
 THIS_MASTER_NAME = 0x0E
 SHAPE_TEXT_ID = 0x27
+TABLE_NUM_ROWS = 0x66
+TABLE_NUM_COLS = 0x67
+TABLE_CELLS_SEQNUM = 0x6B
+CELL_LIST = 0x02        # in a CELLS chunk: the cells, one item (id 0) each
+CELL_FIELDS = (0x01, 0x02, 0x03, 0x04)   # start row, end row, start column, end column
 SHAPE_SEQNUM = pub_contents.SHAPE_SEQNUM  # the block type of a page's shape list entries
 # EscherContainerType.h, EscherFieldIds.h
 DGG = 0xF000
@@ -110,6 +158,7 @@ _HEAD = struct.Struct("<HHI")
 _PAIR = struct.Struct("<HI")
 _BOX = struct.Struct("<4i")
 _U32 = struct.Struct("<I")
+_TOO_MANY = False       # a CELLS chunk holding more than limits.TABLE_NODES cells (cached as such)
 
 
 def _s32(v: int) -> int:
@@ -145,12 +194,14 @@ def _values(data, body: int, size: int, meter) -> dict:
 
 
 class _Boxes:
-    """The Escher walk of `boxes`: {Contents shape seqnum: (top, left)}."""
+    """The Escher walk of `boxes`: {Contents shape seqnum: (top, left)} in `out`, and in `sp` {Contents shape seqnum:
+    the offset of the SpContainer whose ClientData names it} for every shape, with an anchor or without."""
 
     def __init__(self, data, meter, ctx, limit=None):
         self.data, self.ctx = data, ctx
         self.meter = meter if limit is None else _Share(meter, limit)
         self.out = {}
+        self.sp = {}
         self.deep = False
 
     def walk(self):
@@ -178,8 +229,9 @@ class _Boxes:
                 self.shape(body, size, cs, box)
 
     def shape(self, body: int, size: int, cs: list, box: list):
-        """One SpContainer: an FSPGR sets the group's coordinate system; the ClientData's shape seqnum gets the box
-        of the first anchor, which becomes the group's box when this shape set the coordinate system."""
+        """One SpContainer: an FSPGR sets the group's coordinate system; the ClientData's shape seqnum gets this
+        SpContainer's offset, and the box of the first anchor, which becomes the group's box when this shape set the
+        coordinate system."""
         data = self.data
         parent = tuple(cs)
         fspgr = anchor = client = None
@@ -194,10 +246,13 @@ class _Boxes:
         if defines:
             xs, ys, xe, ye = _BOX.unpack_from(data, fspgr[0])
             cs[:] = [min(xs, xe), min(ys, ye), max(xs, xe), max(ys, ye)]
-        if client is None or anchor is None:
+        if client is None:
             return
         seq = _values(data, *client, self.meter).get(FIELD_SHAPE_ID)
         if seq is None:
+            return
+        self.sp[seq] = body - 8
+        if anchor is None:
             return
         typ, b, s = anchor
         if typ == CLIENT_ANCHOR:
@@ -231,6 +286,24 @@ class _Share:
         return self.meter.tick()
 
 
+class _Quiet:
+    """The document meter for the walk of a chunk whose span was cut (counted `record` already): it ticks the meter,
+    and a block running past the cut ends the walk without counting it again."""
+
+    def __init__(self, meter):
+        self.meter = meter
+
+    @property
+    def spent(self) -> bool:
+        return self.meter.spent
+
+    def tick(self) -> bool:
+        return self.meter.tick()
+
+    def cut(self):
+        pass
+
+
 def boxes(data, meter, ctx) -> dict:
     """{Contents shape seqnum: (top, left)} from an Escher/EscherStm stream (see the module docstring)."""
     return _Boxes(data, meter, ctx).walk()
@@ -246,7 +319,7 @@ def _cost(story) -> int:
 
 
 class _Reader:
-    def __init__(self, contents, quill, escher, ctx):
+    def __init__(self, contents, quill, escher, ctx, delay=b""):
         self.data, self.ctx = contents, ctx
         self.meter = pub_contents.Meter(ctx)
         self.refs = {}   # seqnum -> its reference (a 2002 seqnum is its directory index, so each is one chunk)
@@ -258,61 +331,80 @@ class _Reader:
             if ref.parent is not None:
                 self.kids.setdefault(ref.parent, []).append(ref.seqnum)
         self.bounds = sorted(bounds)  # every chunk offset, the trailer's and the stream's end: a chunk ends at the next
-        bits = pub_quill.bits(quill, ctx)
-        self.stories = pub_quill.stories(bits, ctx, meter=self.meter)
-        self.urls = pub_quill.links(bits)
+        self.bits = pub_quill.bits(quill, ctx)
+        self.stories = pub_quill.stories(self.bits, ctx, meter=self.meter)
+        self.urls = pub_quill.links(self.bits)
+        self.tcd = None      # TCD bit id -> bit, made at the first table
         walk = _Boxes(escher, self.meter, ctx, self.meter.used + limits.BIN_RECORDS // 2)
         self.boxes = walk.walk() if escher else {}
+        self.sps = walk.sp   # shape seqnum -> its SpContainer's offset in the Escher stream
         self.escher_cut = walk.meter.cut
+        self.escher, self.delay = escher, delay
         self.room = limits.MAX_OUTPUT
+        self.nodes = limits.TABLE_NODES   # table cells the document may still lay out
         self.chunks = {}     # chunk offset -> what `_read` found there
+        self.cell_defs = {}  # CELLS chunk offset -> its cells, or _TOO_MANY
         self.long = False    # a chunk length past its span was cut (counted once)
         self.placed = set()  # shapes placed
         self.told = set()    # text ids given
         self.deep = False
+        self.store = None    # the BStore's file block offsets, read at the first picture
+        self.budget = flate.Budget(limits.IMAGE_BYTES)
+        self.blips = {}      # pib -> its image bytes or None
+        self.decoded = {}    # a BLIP's place (the delay offset or the FBSE's) -> its image bytes or None
+        self.img = 0         # image bytes placed so far (IMAGE_BYTES)
 
     def _chunk(self, ref):
         """The blocks of a chunk: a u32 length counting itself, then blocks, to offset + length as libmspub reads, but
-        never past the next chunk's offset (a longer length is cut there, counted record once)."""
+        never past the next chunk's offset (a longer length is cut there, counted record once, and that walk's own
+        damage not counted again)."""
         at = ref.offset
         if at + 4 > len(self.data):
             return iter(())
         end = at + _U32.unpack_from(self.data, at)[0]
         k = bisect_right(self.bounds, at)
         span = self.bounds[k] if k < len(self.bounds) else len(self.data)
+        meter = self.meter
         if end > span:
             end = span
+            meter = _Quiet(meter)
             if not self.long:
                 self.long = True
                 self.meter.cut()
-        return pub_contents.blocks(self.data, at + 4, end, meter=self.meter)
+        return pub_contents.blocks(self.data, at + 4, end, meter=meter)
 
     def _read(self, ref) -> tuple:
-        """(the 0x0E master name's bytes or None, the 0x02 list's id-0 entries, its 0x70 entries, the last 0x27 text
-        id) of the chunk at `ref.offset`: walked once a document, however many directory entries name that offset."""
+        """(the 0x0E master name's bytes or None, the 0x02 list's 0x70 entries, the last 0x27 text id, the table's
+        (rows, columns, CELLS seqnum) or None) of the chunk at `ref.offset`: walked once a document, however many
+        directory entries name that offset."""
         got = self.chunks.get(ref.offset)
         if got is None:
-            master, listed, shapes, tid = None, [], [], None
+            master, shapes, tid, table = None, [], None, None
             for b in self._chunk(ref):
                 if b.id == THIS_MASTER_NAME and b.type == STRING_CONTAINER:
                     master = b.data if any(b.data) else None
-                elif b.id == PAGE_LIST:  # PAGE_SHAPES too; a fixed block has no children
-                    for s in pub_contents.children(self.data, b, meter=self.meter):
-                        if s.id == 0:
-                            listed.append(s.data)  # a non-int entry names no chunk
-                        if s.type == SHAPE_SEQNUM:
-                            shapes.append(s.data)
+                elif b.id == PAGE_SHAPES:  # a fixed block has no children
+                    shapes.extend(s.data for s in pub_contents.children(self.data, b, meter=self.meter)
+                                  if s.type == SHAPE_SEQNUM)
                 elif b.id == SHAPE_TEXT_ID:  # a non-int value names no story
                     tid = b.data
-            got = self.chunks[ref.offset] = (master, listed or (), shapes or (), tid)  # () shared: most chunks list none
+                elif b.id in (TABLE_NUM_ROWS, TABLE_NUM_COLS, TABLE_CELLS_SEQNUM) and isinstance(b.data, int):
+                    table = list(table or (None, None, None))
+                    table[(TABLE_NUM_ROWS, TABLE_NUM_COLS, TABLE_CELLS_SEQNUM).index(b.id)] = b.data
+            got = self.chunks[ref.offset] = (master, shapes or (), tid, tuple(table) if table else None)
         return got
 
     def _page_list(self, doc) -> list:
-        return self._read(doc)[1]
+        """The DOCUMENT chunk's page list, its 0x02 entries of id 0 (a non-int entry names no chunk); read once."""
+        out = []
+        for b in self._chunk(doc):
+            if b.id == PAGE_LIST:
+                out.extend(s.data for s in pub_contents.children(self.data, b, meter=self.meter) if s.id == 0)
+        return out
 
     def _page(self, ref) -> tuple:
         """(the master name's bytes, None for a normal page; its shape seqnums) of a PAGE chunk."""
-        master, _, shapes, _ = self._read(ref)
+        master, shapes, _, _ = self._read(ref)
         return master, shapes
 
     def _expand(self, seqs) -> list:
@@ -340,19 +432,21 @@ class _Reader:
         return flat
 
     def _shapes(self, seqs) -> list:
-        """The blocks of a page's shapes, in reading order."""
+        """The blocks of a page's shapes, in reading order: each shape's picture, then its text."""
         flat = self._expand(seqs)
         placed = sorted((self.boxes[r.seqnum], i) for i, r in enumerate(flat) if r.seqnum in self.boxes)
         order = [flat[i] for _, i in placed] + [r for r in flat if r.seqnum not in self.boxes]
         out = []
         for ref in order:
             with self.ctx.guard("shape"):
-                out.extend(self._text(ref))
+                got = self._picture(ref)
+                got.extend(self._text(ref))
+                out.extend(got)
         return out
 
     def _text(self, ref) -> list:
-        """The paragraphs of the story a shape names, once a document, charged to the room."""
-        tid = self._read(ref)[3]
+        """The paragraphs of the story a shape names, or its table, once a document, charged to the room."""
+        tid = self._read(ref)[2]
         story = self.stories.get(tid)
         if story is None or tid in self.told:
             return []
@@ -362,7 +456,187 @@ class _Reader:
             self.ctx.skipped["text"] += 1
             return []
         self.room -= cost
+        if ref.type == TABLE:
+            return self._table(ref, story)
         return list(story.paras)
+
+    # ---- tables
+
+    def _table(self, ref, story) -> list:
+        """A TABLE shape's blocks: its Table (and any text past its cells), or its story's paragraphs (see the module
+        docstring)."""
+        paras = list(story.paras)
+        if self.meter.spent:  # its walks were cut short: record counted once already
+            return paras
+        rows, cols, csn = self._read(ref)[3] or (None, None, None)
+        cref = self.refs.get(csn)
+        if self.tcd is None:
+            self.tcd = pub_quill.table_bits(self.bits)
+        bit = self.tcd.get(story.index)
+        if (not rows or not cols or cref is None or cref.type != CELLS or bit is None or len(bit) < 0xC
+                or rows * cols > limits.GRID_SLOTS):
+            self.ctx.skipped["table"] += 1
+            return paras
+        defs = self._cells(cref)
+        if self.meter.spent:
+            return paras
+        if not defs or len(defs) > self.nodes:
+            self.ctx.skipped["table"] += 1
+            return paras
+        self.nodes -= len(defs)
+        got = self._layout(defs, rows, cols, story, bit)
+        return paras if got is None else got
+
+    def _cells(self, ref):
+        """The (start row, end row, start column, end column) of each cell of a CELLS chunk, in order; _TOO_MANY past
+        limits.TABLE_NODES. Walked once a document per offset."""
+        got = self.cell_defs.get(ref.offset)
+        if got is None:
+            got, cap = [], limits.TABLE_NODES
+            for b in self._chunk(ref):
+                if b.id != CELL_LIST or got is _TOO_MANY:
+                    continue
+                for item in pub_contents.children(self.data, b, meter=self.meter):
+                    if item.id != 0:
+                        continue
+                    if len(got) >= cap:
+                        got = _TOO_MANY
+                        break
+                    v = [0, 0, 0, 0]
+                    for sub in pub_contents.children(self.data, item, 1, meter=self.meter):
+                        if sub.id in CELL_FIELDS and isinstance(sub.data, int):
+                            v[sub.id - 1] = sub.data
+                    got.append(tuple(v))
+            self.cell_defs[ref.offset] = got
+        return got
+
+    def _layout(self, defs, rows: int, cols: int, story, bit) -> list | None:
+        """[Table, paragraphs past its cells] of a table's cells and its story cut by `bit`; None when the meter runs
+        out (see the module docstring)."""
+        tick = self.meter.tick
+        damaged = False
+        spans = list(islice(pub_quill.cell_spans(bit, story), len(defs)))
+        texts = pub_quill.cell_paras(story, [(a, b) for a, b, _ in spans])
+        rest = spans[-1][2] if spans else 0   # where the text past the cells starts
+        boxes = []
+        for sr, er, sc, ec in defs:
+            box = (min(sr, rows - 1), 0, min(sc, cols - 1), 0)
+            box = (box[0], min(max(er, box[0]), rows - 1), box[2], min(max(ec, box[2]), cols - 1))
+            damaged |= box != (sr, er, sc, ec)
+            boxes.append(box)
+        rows_at = sorted({b[0] for b in boxes})
+        cols_at = sorted({b[2] for b in boxes})
+        ri = {v: i for i, v in enumerate(rows_at)}
+        ci = {v: i for i, v in enumerate(cols_at)}
+        width = len(cols_at)
+        # the cell covering each kept place (row-major), -1 for none: kept rows x columns <= rows x cols <= GRID_SLOTS
+        taken = array("i", [-1]) * (len(rows_at) * width)
+        made = []     # (Cell, kept row, kept column) of each cell laid out
+        for _, _, k in sorted((ri[b[0]], ci[b[2]], k) for k, b in enumerate(boxes)):
+            if not tick():
+                return None
+            sr, er, sc, ec = boxes[k]
+            r, c = ri[sr], ci[sc]
+            blocks = list(texts[k]) if k < len(texts) else []
+            owner = taken[r * width + c]
+            if owner >= 0:  # its start is covered: its text joins the covering cell
+                made[owner][0].blocks.extend(blocks)
+                damaged = True
+                continue
+            rs = bisect_left(rows_at, er + 1) - r
+            cs = bisect_left(cols_at, ec + 1) - c
+            w = 1
+            while w < cs:
+                if not tick():
+                    return None
+                if taken[r * width + c + w] >= 0:
+                    damaged = True
+                    break
+                w += 1
+            for dr in range(rs):
+                for dc in range(w):
+                    if not tick():
+                        return None
+                    taken[(r + dr) * width + c + dc] = len(made)
+            made.append((Cell(blocks, rs, w), r, c))
+        grid = []
+        for r in range(len(rows_at)):
+            row, c = [], 0
+            while c < width:
+                if not tick():
+                    return None
+                owner = taken[r * width + c]
+                if owner < 0:  # a place no cell covers: an empty cell over the run of such places
+                    g = c
+                    while c < width and taken[r * width + c] < 0:
+                        if not tick():
+                            return None
+                        c += 1
+                    row.append(Cell([], colspan=c - g))
+                    damaged = True
+                    continue
+                cell, r0, c0 = made[owner]
+                if r0 == r:
+                    row.append(cell)
+                c = c0 + cell.colspan
+            grid.append(row)
+        out = [Table(grid)]
+        if rest < len(story.text):
+            tail = list(pub_quill.cell_paras(story, [(rest, len(story.text))])[0])
+            if tail:
+                out.extend(tail)
+                damaged = True
+        if damaged:
+            self.ctx.skipped["record"] += 1
+        return out
+
+    # ---- pictures
+
+    def _picture(self, ref) -> list:
+        """The Image of a shape whose SpContainer has a pib, charged to IMAGE_BYTES; [] after counting `image` when it
+        cannot be given, and for a shape with no picture."""
+        at = self.sps.get(ref.seqnum)
+        if at is None:
+            return []
+        pib = officeart.shape_pib(self.escher, at)
+        if not pib:
+            return []
+        with self.ctx.guard("image"):
+            data = self._blip(pib)
+            if data is not None and self.img + len(data) <= limits.IMAGE_BYTES:
+                self.img += len(data)
+                return [Image(data)]
+            self.ctx.skipped["image"] += 1
+        return []
+
+    def _blip(self, pib: int):
+        """The image bytes of BStore entry `pib` (decoded once a document), or None."""
+        if pib not in self.blips:
+            data = None
+            if self.img < limits.IMAGE_BYTES:  # no work once the budget is spent
+                if self.store is None:
+                    self.store = officeart.bstore(self.escher)
+                if 0 < pib <= len(self.store):
+                    off = self.store[pib - 1]
+                    at = officeart.fbse_delay(self.escher, off)
+                    key = (True, at) if at is not None else (False, off)
+                    if key not in self.decoded:
+                        self.decoded[key] = self._decode(off)
+                    data = self.decoded[key]
+            self.blips[pib] = data
+        return self.blips[pib]
+
+    def _decode(self, off: int):
+        """The image bytes of the FBSE at `off` (its own BLIP, or the delay stream's): a DIB made a PNG, any other kind
+        as it is; None when unreadable, or when its bytes alone pass what is left of IMAGE_BYTES."""
+        raw = officeart.blip_image(self.escher, off, self.delay, self.budget)
+        if raw is None or self.img + len(raw) > limits.IMAGE_BYTES:
+            return None
+        if images.sniff(raw) == "bmp":  # a DIB, given its file header by officeart.dib_to_bmp
+            raw = images.bmp_to_png(raw)
+        return raw
+
+    # ---- titles, links and the document
 
     def _title(self, raw: bytes) -> str:
         name = str(memoryview(raw)[:len(raw) // 2 * 2], "utf-16-le", "replace").replace("\0", "").strip()
@@ -470,6 +744,8 @@ def parse_compound(src, ctx) -> Doc | str:
                 quill = cf.read(QUILL)
                 part = f"{ESCHER} stream"
                 escher = cf.read(ESCHER) if cf.exists(ESCHER) else b""
+                part = f"{DELAY} stream"
+                delay = cf.read(DELAY) if escher and cf.exists(DELAY) else b""
                 vba = any(_vba(n) for n in cf.names())
     except (KeyError, CfbError):
         raise ReadError("damaged", part) from None
@@ -477,4 +753,4 @@ def parse_compound(src, ctx) -> Doc | str:
         return other
     if vba:
         ctx.skipped["vba"] = 1  # macros are never read; named once
-    return _Reader(contents, quill, escher, ctx).run()
+    return _Reader(contents, quill, escher, ctx, delay).run()

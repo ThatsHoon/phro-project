@@ -38,9 +38,11 @@ Without FDPP, without a second STSH bit, or when either gives nothing (absent, t
 the default is not bold and FDPC alone decides. Only TEXT, STRS and SYID are needed: without FDPC the text stays and
 only bold is lost, where libmspub drops the text (it also waits for FDPP, STSH and FONT).
 
-`Story(id, index, text, paras)`: the SYID text id, the story's place in STRS order (a `TCD ` bit names its table
-story by it), the story's characters as stored and its paragraphs, `model.Para`s of `Text`, `Bold` and `Break`. The
-Paras are built once per document and shared: a caller copies one before changing it.
+`Story(id, index, text, paras, start, bold)`: the SYID text id, the story's place in STRS order (a `TCD ` bit names
+its table story by it), the story's characters as stored, its paragraphs (`model.Para`s of `Text`, `Bold` and
+`Break`), where it starts in the TEXT bit (characters) and the bold ranges that reach into it, `(start, end)` in TEXT
+characters, sorted and disjoint: a table's cells take their bold from these (`cell_paras`) without reading the styles
+again. The Paras are built once per document and shared: a caller copies one before changing it.
 
 Bounds. The FDPC and FDPP runs, the default styles and the blocks of every style (each style read once per bit)
 tick one `pub_contents.Meter` of `limits.BIN_RECORDS`: the caller's (`stories(..., meter=)`, so a document's Contents
@@ -51,10 +53,13 @@ break and each bold run in it (each is a model object however short). Past the r
 out, counted `text` once. A count past its bit reads what the bit holds; an FDPC whose count does not fit its bit is
 not read. Every loop is linear in the bytes it reads.
 
-Cells (`cells(bits, story)`). The `TCD ` bit whose id is the story's index: a u32 count less one, then from +0xC the
-count's u32 cell ends in characters. Each cell's end is the `\\r` closing it, which is left out, and the next cell
-starts past it; the last cell's end is the story's end and its closing `\\r` is dropped. An end before the cell's
-start gives an empty cell; at most one cell more than the story's characters is read.
+Cells (`cells(bits, story)`). The `TCD ` bit whose id is the story's index (the first such; `table_bits` maps the ids
+to them once a document): a u32 count less one, then from +0xC the count's u32 cell ends in characters. Each cell's
+end is the `\\r` closing it, which is left out, and the next cell starts past it; the last cell's end is the story's
+end and its closing `\\r` is dropped. An end before the cell's start gives an empty cell; at most one cell more than
+the story's characters is read. `cell_spans(bit, story)` gives them lazily as (start, end, next) offsets in the story,
+the cell's text `story.text[start:end]` and the next cell starting at `next`; `cell_paras(story, spans)` the
+paragraphs of each (start, end), with the story's bold (a run crossing a cell's end is cut there).
 
 Links (`links(bits)`). Each `PLC ` bit of type 12, read as POI's `QCPLCBit.Type12`: a 0x34-byte bit holds none;
 otherwise the count's entries start at 0x4C (one) or 0x68 + 22 per entry past two, each a u16 length and that many
@@ -103,11 +108,14 @@ class Bit(bytes):
 
 @dataclass(frozen=True)
 class Story:
-    """One Quill story (see the module docstring): text id, index in STRS order, stored text, `model.Para`s."""
+    """One Quill story (see the module docstring): text id, index in STRS order, stored text, `model.Para`s, where it
+    starts in TEXT and the bold ranges reaching into it."""
     id: int
     index: int
     text: str
     paras: tuple
+    start: int = 0
+    bold: tuple = ()
 
 
 def bits(data, ctx=None) -> dict:
@@ -326,7 +334,8 @@ def stories(bits_, ctx=None, *, meter=None) -> dict:
     for index, (tid, length) in enumerate(zip(_ids(bits_["SYID"]), _lengths(bits_["STRS"]))):
         start = pos
         pos = min(start + length, len(text))
-        runs = bisect.bisect_left(starts, pos) - bisect.bisect_right(ends, start)
+        first, last = bisect.bisect_right(ends, start), bisect.bisect_left(starts, pos)
+        runs = last - first
         breaks = text.count("\r", start, pos) + text.count("\n", start, pos) + text.count("\x0b", start, pos)
         cost = pos - start + line * (1 + breaks + max(0, runs))
         if cost > room:
@@ -337,24 +346,43 @@ def stories(bits_, ctx=None, *, meter=None) -> dict:
         piece = text[start:pos]
         if tid in out and ctx is not None:
             ctx.skipped["record"] += 1
-        out[tid] = Story(tid, index, piece, _paras(piece, start, bold, ends))
+        out[tid] = Story(tid, index, piece, _paras(piece, start, bold, ends), start,
+                         tuple(tuple(r) for r in bold[first:last]))  # its runs, already charged
     return out
+
+
+def table_bits(bits_) -> dict:
+    """{id: the first `TCD ` bit of that id}, so a document's tables find theirs in one lookup each."""
+    out = {}
+    for bit in bits_.get("TCD ", ()):
+        out.setdefault(bit.id, bit)
+    return out
+
+
+def cell_spans(bit, story: Story):
+    """The cells of a table story as (start, end, next) offsets in its text, cut as `cells` cuts them (see the module
+    docstring); none when `bit` (the story's `TCD ` bit) is None or too short. Lazy: a caller takes what it uses."""
+    if bit is None or len(bit) < 0xC:
+        return
+    text = story.text
+    pos = 0
+    for end in _u32s(bit, 0xC, min(_U32.unpack_from(bit, 0)[0] + 1, len(text) + 1)):
+        end = max(pos, end)
+        stop = end - 1 if end > pos and text[end - 1] == "\r" else end
+        nxt = end + 1 if end < len(text) and text[end] == "\r" else end
+        yield pos, stop, nxt
+        pos = nxt
 
 
 def cells(bits_, story: Story) -> list:
     """The cell texts of a table story (see the module docstring); [] when no `TCD ` bit names it."""
-    bit = next((b for b in bits_.get("TCD ", ()) if b.id == story.index), None)
-    if bit is None or len(bit) < 0xC:
-        return []
-    text = story.text
-    out = []
-    pos = 0
-    for end in _u32s(bit, 0xC, min(_U32.unpack_from(bit, 0)[0] + 1, len(text) + 1)):
-        end = max(pos, end)
-        cell = text[pos:end]
-        out.append(cell[:-1] if cell.endswith("\r") else cell)
-        pos = end + 1 if end < len(text) and text[end] == "\r" else end
-    return out
+    return [story.text[a:b] for a, b, _ in cell_spans(table_bits(bits_).get(story.index), story)]
+
+
+def cell_paras(story: Story, spans) -> list:
+    """The paragraphs (a tuple of `model.Para`) of each (start, end) cell of `story`, with the story's bold."""
+    ends = [e for _, e in story.bold]
+    return [_paras(story.text[a:b], story.start + a, story.bold, ends) for a, b in spans]
 
 
 def _links(bit) -> list:

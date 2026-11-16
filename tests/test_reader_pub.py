@@ -9,20 +9,22 @@ import sys
 import tempfile
 import time
 import tracemalloc
+import zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import limits, markdown  # noqa: E402
+from reader import images, limits, markdown, officeart  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import cfb_route, pub, pub_contents, pub_quill, vsdx, zip_route  # noqa: E402
 from reader.formats.pub_contents import Block, ChunkRef  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Bold, Break, Context, Link, Para, Section, Text  # noqa: E402
-from reader_fix import (cfb_bytes, oa_container, oa_record, pub_block, pub_contents as contents_fix,  # noqa: E402
-                        pub_escher, pub_file, pub_group, pub_quill as quill_fix, pub_sp)
+from reader.model import Bold, Break, Context, Image, Link, Para, Section, Table, Text  # noqa: E402
+from reader_fix import (blip_bitmap, blip_metafile, blip_png, cfb_bytes, oa_container, oa_fbse,  # noqa: E402
+                        oa_record, pub_block, pub_cells, pub_contents as contents_fix, pub_escher, pub_file,
+                        pub_group, pub_quill as quill_fix, pub_sp, pub_table)
 
 MIB = 2**20
 
@@ -1263,6 +1265,11 @@ def test_broken_stream_named():
     chain, blob = info["chains"]["Escher/EscherStm"], bytearray(raw)
     struct.pack_into("<I", blob, (info["fat"][chain[-1] // 128] + 1) * 512 + chain[-1] % 128 * 4, chain[0])
     refused(lambda: read_pub(bytes(blob)), "damaged", "Escher/EscherStm stream")
+    raw, info = cfb_bytes({"Contents": contents, "Quill/QuillSub/CONTENTS": b"CHNKINK ",
+                           "Escher/EscherStm": pub_escher(), "Escher/EscherDelayStm": bytes(5000)})
+    chain, blob = info["chains"]["Escher/EscherDelayStm"], bytearray(raw)
+    struct.pack_into("<I", blob, (info["fat"][chain[-1] // 128] + 1) * 512 + chain[-1] % 128 * 4, chain[0])
+    refused(lambda: read_pub(bytes(blob)), "damaged", "Escher/EscherDelayStm stream")
 
 
 def _anchor(box):
@@ -1380,13 +1387,13 @@ def test_group_depth_once():
 
 def test_page_block_types():
     # a 0x0E block of a fixed type names no master; a page's shape entry of a type other than 0x70 names no shape; a
-    # table shape gives its story
+    # table shape with no rows, columns or cells gives its story as paragraphs, counted table
     extra = pub_block(0x0E, 0x20, 5) + pub_block(0x02, 0xA0, pub_block(0, 0x68, 0x31))
     blob = pub_file([page(0x21, [0x30, 0x32], extra=extra)],
                     [shape(0x30, 1), shape(0x31, 2), shape(0x32, 3, type=pub_contents.TABLE)],
                     [(1, "kept"), (2, "not listed"), (3, "cell")])
     doc, ctx = read_pub(blob)
-    assert outline(doc) == [("Page 1", ["kept", "cell"])] and not ctx.skipped, (outline(doc), ctx.skipped)
+    assert outline(doc) == [("Page 1", ["kept", "cell"])] and ctx.skipped == {"table": 1}, (outline(doc), ctx.skipped)
 
 
 def test_titles_and_links_room():
@@ -1414,6 +1421,441 @@ def test_titles_and_links_room():
     reader = pub._Reader(*streams, b"", ctx)
     reader.room = 4 + line + len(urls[0]) + line + len(urls[2]) + line
     assert outline(reader.run())[-1] == (None, ["Links: https://a.example/"]) and ctx.skipped == {"link": 1}
+
+
+
+# -- Task 19: tables and pictures
+
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(24)
+JPEG = b"\xff\xd8\xff\xe0" + bytes(28)
+# a 1x1 24-bit DIB: BITMAPINFOHEADER, then one row of one red pixel padded to 4 bytes
+DIB = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0) + b"\x00\x00\xff\x00"
+WMF = struct.pack("<HHHIHIH", 1, 9, 0x300, 20, 0, 3, 0) + struct.pack("<IH", 3, 0) + bytes(16)
+TABLE_TEXT = "Head\rA\rB\r"   # cells end at the \r closing each: 4, 6 and the story's end, 9
+TABLE_BOUNDS = [0, 4, 6, 9]
+MERGED = [(0, 0, 0, 1), (1, 1, 0, 0), (1, 1, 1, 1)]   # a 2x2 table whose first row is one cell
+
+
+def table_file(cells, rows=2, cols=2, text=TABLE_TEXT, bounds=TABLE_BOUNDS, *, tables=1, csn=0x50, more=(), **kw):
+    """One page listing `tables` TABLE shapes (0x30, 0x31, ...: rows x cols, the CELLS chunk `csn` holding `cells`,
+    text ids 1, 2, ...), each story `text` cut at `bounds` (a TCD bit per story, none when None); `more` shapes added
+    to the page's list."""
+    shapes = [shape(0x30 + k, k + 1, type=pub_contents.TABLE, extra=pub_table(rows, cols, csn)) for k in range(tables)]
+    shapes.append(shape(0x50, type=pub_contents.CELLS, extra=pub_cells(cells)))
+    shapes += list(more)
+    stories = [(k + 1, text) for k in range(tables)]
+    tcd = {k: list(bounds) for k in range(tables)} if bounds is not None else None
+    return pub_file([page(0x20, [0x30 + k for k in range(tables)] + [s["seq"] for s in more])], shapes, stories,
+                    tcd=tcd, **kw)
+
+
+def grid(table):
+    """[[(rowspan, colspan, [cell paragraph texts])]] of a Table."""
+    return [[(c.rowspan, c.colspan, [text_of(p) for p in c.blocks]) for c in row] for row in table.rows]
+
+
+def page_blocks(doc):
+    return [b for s in doc.blocks if isinstance(s, Section) for b in s.blocks]
+
+
+def test_table_merged_cells():
+    # a 2x2 table whose first row is one cell (colspan 2): a Table, its cells cut from the story by the TCD bit, the
+    # bold of a cell kept (the story's bold ranges, not read again)
+    doc, ctx = read_pub(table_file(MERGED, bold=[(5, 6)]))
+    (table,) = page_blocks(doc)
+    assert isinstance(table, Table) and not ctx.skipped, (doc, ctx.skipped)
+    assert grid(table) == [[(1, 2, ["Head"])], [(1, 1, ["**A**"]), (1, 1, ["B"])]], grid(table)
+    got = md(doc, ctx)
+    assert "**A**" in got and "Head" in got and 'colspan="2"' in got, got
+    # a first column of one cell (rowspan 2)
+    doc, ctx = read_pub(table_file([(0, 1, 0, 0), (0, 0, 1, 1), (1, 1, 1, 1)]))
+    assert grid(page_blocks(doc)[0]) == [[(2, 1, ["Head"]), (1, 1, ["A"])], [(1, 1, ["B"])]] and not ctx.skipped
+    # cells listed out of grid order: the text goes by the CELLS order, the rows by the grid
+    doc, ctx = read_pub(table_file([(1, 1, 1, 1), (0, 0, 0, 1), (1, 1, 0, 0)]))
+    assert grid(page_blocks(doc)[0]) == [[(1, 2, ["A"])], [(1, 1, ["B"]), (1, 1, ["Head"])]] and not ctx.skipped
+    # a cell of two paragraphs (a \r inside it) and a line break
+    doc, ctx = read_pub(table_file(MERGED, text="H1\rH2\rA\va\rB\r", bounds=[0, 5, 9, 12]))
+    assert grid(page_blocks(doc)[0]) == [[(1, 2, ["H1", "H2"])], [(1, 1, ["A|a"]), (1, 1, ["B"])]], doc
+
+
+def test_cell_paras_bold():
+    # pub_quill: the story keeps its bold ranges and where it starts; a cell's paragraphs take them, a bold run that
+    # crosses a cell boundary is cut there
+    bits = pub_quill.bits(quill_fix([(1, "xy"), (2, "abc\rdef\r")], bold=[(0, 1), (3, 8)], tcd={1: [0, 3, 8]}))
+    story = pub_quill.stories(bits)[2]
+    assert (story.start, story.bold) == (2, ((3, 8),)), (story.start, story.bold)
+    spans = list(pub_quill.cell_spans(pub_quill.table_bits(bits)[1], story))
+    assert spans == [(0, 3, 4), (4, 7, 8)], spans
+    got = pub_quill.cell_paras(story, [(a, b) for a, b, _ in spans])
+    assert [[text_of(p) for p in c] for c in got] == [["a**bc**"], ["**de**f"]], got
+    assert pub_quill.cells(bits, story) == ["abc", "def"]
+    assert pub_quill.table_bits({}) == {} and list(pub_quill.cell_spans(None, story)) == []
+    two = [pub_quill.Bit(b"first", 1, "PLC "), pub_quill.Bit(b"second", 1, "PLC ")]
+    assert pub_quill.table_bits({"TCD ": two})[1] == b"first"
+
+
+def test_table_too_big():
+    # rows x columns over GRID_SLOTS, or cells over TABLE_NODES (the document's): no table, its story as paragraphs,
+    # counted table once each
+    blob = table_file(MERGED)
+    with patched(limits, GRID_SLOTS=3):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["Head", "A", "B"])] and ctx.skipped == {"table": 1}, (outline(doc), ctx.skipped)
+    with patched(limits, GRID_SLOTS=4):
+        doc, ctx = read_pub(blob)
+    assert isinstance(page_blocks(doc)[0], Table) and not ctx.skipped
+    with patched(limits, TABLE_NODES=2):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["Head", "A", "B"])] and ctx.skipped == {"table": 1}, (outline(doc), ctx.skipped)
+    # the node budget is the document's: two tables of 3 cells under 5 nodes, the second as paragraphs
+    with patched(limits, TABLE_NODES=5):
+        doc, ctx = read_pub(table_file(MERGED, tables=2))
+    kinds = [type(b).__name__ for b in page_blocks(doc)]
+    assert kinds == ["Table", "Para", "Para", "Para"] and ctx.skipped == {"table": 1}, (kinds, ctx.skipped)
+    # a declared grid of 2^32 x 2^32 slots: refused before anything is laid out
+    t = time.perf_counter()
+    doc, ctx = read_pub(table_file(MERGED, rows=0xFFFFFFFF, cols=0xFFFFFFFF))
+    assert outline(doc) == [("Page 1", ["Head", "A", "B"])] and ctx.skipped == {"table": 1}
+    assert time.perf_counter() - t < 1.0
+
+
+def test_table_spans_clamped():
+    # spans past the grid are cut to it; a cell whose origin another covers joins that cell's text; a span reaching
+    # into another cell is cut short; a place no cell covers is an empty cell: the text stays, record counted once
+    # for the table
+    def run(cells, **kw):
+        doc, ctx = read_pub(table_file(cells, **kw))
+        return grid(page_blocks(doc)[0]), dict(ctx.skipped)
+    assert run([(0, 0, 0, 9), (1, 7, 0, 0), (1, 1, 1, 1)]) == (
+        [[(1, 2, ["Head"])], [(1, 1, ["A"]), (1, 1, ["B"])]], {"record": 1})
+    assert run([(0, 0, 0, 1), (0, 1, 0, 0), (1, 1, 1, 1)]) == (
+        [[(1, 2, ["Head", "A"])], [(1, 1, []), (1, 1, ["B"])]], {"record": 1})
+    assert run([(0, 0, 0, 0), (0, 0, 1, 1), (0, 1, 0, 1)]) == (
+        [[(1, 1, ["Head", "B"]), (1, 1, ["A"])]], {"record": 1})
+    assert run([(0, 0, 0, 1), (1, 1, 0, 1), (0, 0, 1, 1)]) == (
+        [[(1, 2, ["Head", "B"])], [(1, 2, ["A"])]], {"record": 1})
+    assert run([(0, 0, 0, 0), (1, 1, 1, 1), (0, 1, 1, 1)]) == (
+        [[(1, 1, ["Head"]), (2, 1, ["B", "A"])], [(1, 1, [])]], {"record": 1})
+    # a start past its end is a span of one
+    assert run([(0, 0, 1, 0), (1, 1, 0, 0), (1, 1, 1, 1)]) == (
+        [[(1, 1, []), (1, 1, ["Head"])], [(1, 1, ["A"]), (1, 1, ["B"])]], {"record": 1})
+    # only a column end past the grid; a row end before its start; a start past the grid: as MERGED, record counted
+    for cells in ([(0, 0, 0, 9), (1, 1, 0, 0), (1, 1, 1, 1)], [(0, 0, 0, 1), (1, 0, 0, 0), (1, 1, 1, 1)],
+                  [(0, 0, 0, 1), (1, 1, 0, 0), (1, 1, 5, 5)]):
+        assert run(cells) == ([[(1, 2, ["Head"])], [(1, 1, ["A"]), (1, 1, ["B"])]], {"record": 1}), cells
+    # a row's span reaching a place a rowspan above covers is cut short there
+    assert run([(0, 0, 0, 0), (0, 1, 1, 1), (1, 1, 0, 1)]) == (
+        [[(1, 1, ["Head"]), (2, 1, ["A"])], [(1, 1, ["B"])]], {"record": 1})
+    # places no cell covers, and nothing else wrong: empty cells, record counted
+    assert run([(0, 0, 0, 0), (1, 1, 1, 1)], text="Head\rA\r", bounds=[0, 4, 6]) == (
+        [[(1, 1, ["Head"]), (1, 1, [])], [(1, 1, []), (1, 1, ["A"])]], {"record": 1})
+
+
+def test_table_layout_ticks():
+    # each step of the layout ticks the meter once: 3 cells, 2 places checked for the span cut short, 5 places
+    # marked, and 6 steps of the row scan (one of them a gap's place)
+    with Compound(table_file([(0, 1, 2, 2), (1, 1, 0, 2), (0, 0, 1, 1)], 2, 3)) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+
+    def run():
+        ctx = Context()
+        reader = pub._Reader(*streams, b"", ctx)
+        return reader.run(), reader.meter.used, ctx
+    doc, full, ctx = run()
+    assert grid(page_blocks(doc)[0]) == [[(1, 1, []), (1, 1, ["B"]), (2, 1, ["Head"])], [(1, 2, ["A"])]]
+    assert ctx.skipped == {"record": 1}, ctx.skipped
+    with patched(pub._Reader, _layout=lambda self, *a: None):
+        _, base, _ = run()
+    assert full - base == 16, full - base
+
+
+def test_cells_hostile_items():
+    # a CELLS list item of an id other than 0 is not a cell; a field that is not a number is 0; a CELLS chunk listing
+    # more than TABLE_NODES cells is kept as too many, its walk stopped there
+    def item(cell, extra=b""):
+        return pub_block(0, 0x88, b"".join(pub_block(k + 1, 0x20, v) for k, v in enumerate(cell) if v) + extra)
+    items = item(MERGED[0]) + pub_block(1, 0x88, b"") + item(MERGED[1], pub_block(3, 0x88, b"")) + item(MERGED[2])
+    cells = pub_block(0x01, 0x18, 3) + pub_block(0x02, 0xA0, items)
+    blob = pub_file([page(0x20, [0x30])], [shape(0x30, 1, type=pub_contents.TABLE, extra=pub_table(2, 2, 0x50)),
+                                           shape(0x50, type=pub_contents.CELLS, extra=cells)],
+                    [(1, TABLE_TEXT)], tcd={0: TABLE_BOUNDS})
+    doc, ctx = read_pub(blob)
+    assert grid(page_blocks(doc)[0]) == [[(1, 2, ["Head"])], [(1, 1, ["A"]), (1, 1, ["B"])]] and not ctx.skipped
+    with Compound(table_file(MERGED)) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+    with patched(limits, TABLE_NODES=2):
+        reader = pub._Reader(*streams, b"", Context())
+        assert reader._cells(reader.refs[0x50]) is pub._TOO_MANY
+
+
+def test_table_text_and_cells_disagree():
+    # more cell texts than cells: the rest follow the table as paragraphs, record counted; fewer: the last cells empty,
+    # nothing counted (no cell starts in the second column, so the grid kept is one column wide)
+    doc, ctx = read_pub(table_file([(0, 0, 0, 1), (1, 1, 0, 1)]))
+    got = page_blocks(doc)
+    assert grid(got[0]) == [[(1, 1, ["Head"])], [(1, 1, ["A"])]] and [text_of(p) for p in got[1:]] == ["B"]
+    assert ctx.skipped == {"record": 1}, ctx.skipped
+    doc, ctx = read_pub(table_file([(0, 0, 0, 0), (0, 0, 1, 1), (1, 1, 0, 0), (1, 1, 1, 1)]))
+    assert grid(page_blocks(doc)[0]) == [[(1, 1, ["Head"]), (1, 1, ["A"])], [(1, 1, ["B"]), (1, 1, [])]]
+    assert not ctx.skipped
+    # text past the TCD bit's last cell is kept after the table
+    doc, ctx = read_pub(table_file(MERGED, text="Head\rA\rB\rC\r"))
+    got = page_blocks(doc)
+    assert grid(got[0])[1][1] == (1, 1, ["B"]) and [text_of(p) for p in got[1:]] == ["C"]
+    assert ctx.skipped == {"record": 1}, ctx.skipped
+
+
+def test_table_damaged():
+    # a table with no rows, no columns, a CELLS seqnum naming nothing or another chunk (a shape, the page), no cells,
+    # rows that are not a number, or no TCD bit or a short one: its story as paragraphs, counted table
+    for kw in (dict(rows=None), dict(cols=None), dict(rows=0), dict(csn=0x51), dict(bounds=None),
+               dict(csn=0x40, more=[shape(0x40, 9)]), dict(csn=0x20)):
+        doc, ctx = read_pub(table_file(MERGED, **kw))
+        assert outline(doc)[0] == ("Page 1", ["Head", "A", "B"]) and ctx.skipped == {"table": 1}, (kw, ctx.skipped)
+    doc, ctx = read_pub(table_file([]))
+    assert outline(doc) == [("Page 1", ["Head", "A", "B"])] and ctx.skipped == {"table": 1}, ctx.skipped
+    rows = pub_block(0x66, 0xC0, b"ab") + pub_table(None, 2, 0x50)
+    blob = pub_file([page(0x20, [0x30])], [shape(0x30, 1, type=pub_contents.TABLE, extra=rows),
+                                           shape(0x50, type=pub_contents.CELLS, extra=pub_cells(MERGED))],
+                    [(1, TABLE_TEXT)], tcd={0: TABLE_BOUNDS})
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["Head", "A", "B"])] and ctx.skipped == {"table": 1}, ctx.skipped
+    with patched(pub_quill, table_bits=lambda bits: {0: pub_quill.Bit(bytes(8), 0, "PLC ")}):
+        doc, ctx = read_pub(table_file(MERGED))
+    assert outline(doc) == [("Page 1", ["Head", "A", "B"])] and ctx.skipped == {"table": 1}, ctx.skipped
+    # a table with no story gives nothing, uncounted
+    blob = pub_file([page(0x20, [0x30])], [shape(0x30, 9, type=pub_contents.TABLE, extra=pub_table(2, 2, 0x50)),
+                                           shape(0x50, type=pub_contents.CELLS, extra=pub_cells(MERGED))], [(1, "x")])
+    doc, ctx = read_pub(blob)
+    assert doc.blocks == [] and not ctx.skipped
+
+
+def test_cells_read_once():
+    # two tables naming one CELLS chunk: that chunk is walked once, and both are tables
+    blob = table_file(MERGED, tables=2)
+    walked = []
+    real = pub._Reader._chunk
+
+    def chunk(self, ref):
+        walked.append(ref.seqnum)
+        return real(self, ref)
+    with patched(pub._Reader, _chunk=chunk):
+        doc, ctx = read_pub(blob)
+    assert [type(b).__name__ for b in page_blocks(doc)] == ["Table", "Table"] and not ctx.skipped
+    assert walked.count(0x50) == 1, walked
+
+
+def test_table_meter():
+    # the layout ticks the document meter (each grid place marked and scanned): at any cap the read ends, record
+    # counted at most once, table never; a table the meter cuts gives its story as paragraphs
+    blob = table_file(MERGED)
+    kinds = set()
+    for cap in range(0, 400):
+        with patched(limits, BIN_RECORDS=cap):
+            try:
+                doc, ctx = read_pub(blob)
+            except ReadError as e:
+                assert e.kind == "damaged", e
+                continue
+        assert set(ctx.skipped) <= {"record"} and ctx.skipped["record"] <= 1, (cap, ctx.skipped)
+        got = page_blocks(doc)
+        kinds.add(tuple(type(b).__name__ for b in got))
+    assert ("Table",) in kinds and ("Para", "Para", "Para") in kinds, kinds
+    # the places are charged: a span of 1,000 columns costs the meter no more than one of 2 (the grid kept is the
+    # places where cells start), and a table whose places pass the meter is given as paragraphs
+    def used(cells, cols):
+        with Compound(table_file(cells, cols=cols)) as cf:
+            streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+        reader = pub._Reader(*streams, b"", Context())
+        reader.run()
+        return reader.meter.used
+    assert used([(0, 0, 0, 999), (1, 1, 0, 0), (1, 1, 1, 999)], 1000) == used(MERGED, 2)
+    cells = [(0, 0, k, k) for k in range(60)] + [(1, 1, 0, 59)]
+    base = used(cells[:1], 60)
+    with patched(limits, BIN_RECORDS=base + 200):
+        doc, ctx = read_pub(table_file(cells, cols=60, text="x\r" * 61, bounds=list(range(0, 123, 2))))
+    assert isinstance(page_blocks(doc)[0], Para) and ctx.skipped == {"record": 1}, ctx.skipped
+
+
+def picture_file(blips, shapes, *, delay=None, texts=(), boxes=None):
+    """One page listing `shapes` ((seq, pib or None) pairs: SHAPE chunks, the story `texts` gives the seq when it does)
+    placed in the Escher stream (ClientData naming seq, a box when `boxes` gives one), with the BStore of `blips` (FBSE
+    records) and the delay stream `delay`."""
+    boxes = boxes or {}
+    escher = pub_escher(*(pub_sp(seq, boxes.get(seq), pib=pib) for seq, pib in shapes), store=blips)
+    text = dict(texts)
+    stories = [(tid, f"text {tid}") for tid in text.values()]
+    streams = {"Escher/EscherDelayStm": delay} if delay is not None else None
+    return pub_file([page(0x20, [seq for seq, _ in shapes])], [shape(seq, text.get(seq)) for seq, _ in shapes],
+                    stories, escher=escher, streams=streams)
+
+
+def images_of(doc):
+    return [b.data for b in page_blocks(doc) if isinstance(b, Image)]
+
+
+def test_pictures():
+    # a PNG BLIP -> an Image; a DIB -> a PNG Image (dib_to_bmp, then bmp_to_png); a WMF (deflated) -> an asset, not
+    # viewable; a JPEG in the delay stream (its FBSE's foDelay) -> an Image
+    delay = bytes(8) + blip_bitmap(0xF01D, 0x46A, JPEG)
+    blips = [oa_fbse(blip_png(PNG)), oa_fbse(blip_bitmap(0xF01F, 0x7A8, DIB)), oa_fbse(blip_metafile(0xF01B, 0x216, WMF)),
+             oa_fbse(delay=8)]
+    doc, ctx = read_pub(picture_file(blips, [(0x30, 1), (0x31, 2), (0x32, 3), (0x33, 4)], delay=delay))
+    got = images_of(doc)
+    assert not ctx.skipped and len(got) == 4, (got, ctx.skipped)
+    assert got[0] == PNG and got[1].startswith(b"\x89PNG\r\n\x1a\n") and got[2] == WMF and got[3] == JPEG
+    with tempfile.TemporaryDirectory() as tmp:
+        out = markdown.render(doc, Path(tmp) / "assets", False, ctx.skipped)
+        assert (Path(tmp) / "assets" / "img-002.png").read_bytes() == got[1]
+    assert out.count("![](assets/img-") == 3 and "assets/img-003.wmf" in out and "Not viewable" in out, out
+    # a shape with a picture and a story: the picture first
+    got = page_blocks(read_pub(picture_file([oa_fbse(blip_png(PNG))], [(0x30, 1)], texts=[(0x30, 1)]))[0])
+    assert isinstance(got[0], Image) and text_of(got[1]) == "text 1", got
+
+
+def test_picture_joined_by_client_data():
+    # two shapes: the picture's ClientData id joins it to its Contents shape, so it takes that shape's place in the
+    # page order (top, then left); a ClientData naming no listed shape places nothing; an unanchored picture is placed
+    blips = [oa_fbse(blip_png(PNG)), oa_fbse(blip_bitmap(0xF01D, 0x46A, JPEG))]
+    blob = picture_file(blips, [(0x30, None), (0x31, 1)], texts=[(0x30, 1)],
+                        boxes={0x30: (0, 50, 10, 60), 0x31: (0, 10, 10, 20)})
+    doc, ctx = read_pub(blob)
+    got = page_blocks(doc)
+    assert isinstance(got[0], Image) and got[0].data == PNG and text_of(got[1]) == "text 1" and not ctx.skipped
+    blob = picture_file(blips, [(0x30, None), (0x31, 1)], texts=[(0x30, 1)],
+                        boxes={0x30: (0, 10, 10, 20), 0x31: (0, 50, 10, 60)})
+    got = page_blocks(read_pub(blob)[0])
+    assert text_of(got[0]) == "text 1" and got[1].data == PNG
+    escher = pub_escher(pub_sp(0x30, pib=1), pub_sp(0x77, (0, 0, 1, 1), pib=2), store=blips)
+    doc, ctx = read_pub(pub_file([page(0x20, [0x30])], [shape(0x30), shape(0x77)], [], escher=escher))
+    assert images_of(doc) == [PNG] and not ctx.skipped
+
+
+def test_client_data_index():
+    # pub's one Escher walker records each ClientData seqnum's SpContainer offset, for shapes with an anchor and
+    # without one; officeart.shape_pib reads the pib there
+    escher = pub_escher(pub_sp(0x30, (0, 1, 2, 3), pib=4), pub_sp(0x31, pib=5), pub_sp(0x32),
+                        pub_group(pub_sp(0x40, (0, 0, 9, 9), group=(0, 0, 9, 9)), pub_sp(0x41, child=(0, 0, 1, 1))))
+    walk = pub._Boxes(escher, pub_contents.Meter(), Context())
+    walk.walk()
+    assert sorted(walk.sp) == [0x30, 0x31, 0x32, 0x40, 0x41], walk.sp
+    for seq, off in walk.sp.items():
+        assert officeart.header(escher, off)[2] == officeart.SP_CONTAINER
+        assert pub._values(escher, *_client_body(escher, off), pub_contents.Meter())[pub.FIELD_SHAPE_ID] == seq
+    assert [officeart.shape_pib(escher, walk.sp[s]) for s in (0x30, 0x31, 0x32)] == [4, 5, None]
+    assert sorted(walk.out) == [0x30, 0x40, 0x41], walk.out
+
+
+def _client_body(data, sp_off):
+    for _, _, typ, body, size in officeart.records(data, sp_off + 8, sp_off + 8 + officeart.header(data, sp_off)[3]):
+        if typ == pub.CLIENT_DATA:
+            return body, size
+    raise AssertionError("no ClientData")
+
+
+class _calls:
+    """Count the calls of officeart.blip_image and images.bmp_to_png while patched in."""
+
+    def __init__(self):
+        self.blips, self.converts = [], []
+        self.real = officeart.blip_image, images.bmp_to_png
+
+    def blip_image(self, *a):
+        self.blips.append(a[1])
+        return self.real[0](*a)
+
+    def bmp_to_png(self, data):
+        self.converts.append(len(data))
+        return self.real[1](data)
+
+    def read(self, blob, **caps):
+        self.blips.clear(), self.converts.clear()
+        with patched(officeart, blip_image=self.blip_image), patched(images, bmp_to_png=self.bmp_to_png), \
+                patched(limits, **caps):
+            return read_pub(blob)
+
+
+def test_picture_budget():
+    # IMAGE_BYTES (the document's, copies counted): a placement past it is counted image; once spent no BLIP is
+    # decoded or converted; a pib many shapes share is decoded once, and FBSEs naming one delay BLIP too
+    blips = [oa_fbse(blip_bitmap(0xF01F, 0x7A8, DIB)), oa_fbse(delay=0), oa_fbse(delay=0)]
+    shapes = [(0x30 + k, 1) for k in range(5)] + [(0x40, 2), (0x41, 3), (0x42, 2)]
+    blob = picture_file(blips, shapes, delay=blip_png(PNG))
+    calls = _calls()
+    doc, ctx = calls.read(blob)
+    got = images_of(doc)
+    assert len(got) == 8 and got[-1] == PNG and not ctx.skipped, (len(got), ctx.skipped)
+    assert len(calls.blips) == 2 and len(calls.converts) == 1, (calls.blips, calls.converts)
+    seen, real = [], (officeart.bstore, officeart.fbse_delay)
+    with patched(officeart, bstore=lambda d: seen.append("bstore") or real[0](d),
+                 fbse_delay=lambda d, o: seen.append(o) or real[1](d, o)):
+        read_pub(blob)
+    assert seen.count("bstore") == 1 and len(seen) == 4, seen
+    with Compound(blob) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+    with patched(limits, IMAGE_BYTES=12345):
+        assert pub._Reader(*streams, b"", Context()).budget.total == 12345
+    png = len(got[0])
+    doc, ctx = calls.read(blob, IMAGE_BYTES=2 * png)
+    assert len(images_of(doc)) == 2 and ctx.skipped == {"image": 6}, ctx.skipped
+    assert len(calls.blips) == 1 and len(calls.converts) == 1, (calls.blips, calls.converts)
+    doc, ctx = calls.read(blob, IMAGE_BYTES=0)
+    assert images_of(doc) == [] and ctx.skipped == {"image": 8} and calls.blips == calls.converts == []
+    # a BMP whose bytes alone pass what is left of the budget: not converted
+    doc, ctx = calls.read(picture_file([oa_fbse(blip_bitmap(0xF01F, 0x7A8, DIB + bytes(400)))], [(0x30, 1)]),
+                          IMAGE_BYTES=png)
+    assert images_of(doc) == [] and ctx.skipped == {"image": 1} and calls.converts == [], ctx.skipped
+
+
+def test_picture_hostile():
+    # a pib past the BStore, an empty slot (cRef 0), a DIB whose header size is bogus, a BLIP past the delay stream,
+    # and a deflate bomb: each placement counted image, the page's text kept; pib 0 is no picture; no delay stream
+    bad_dib = struct.pack("<I", 0xFFFFFF00) + DIB[4:]
+    bomb = blip_metafile(0xF01B, 0x216, b"\x01\x00\x09\x00" + bytes(8 * MIB))
+    blips = [oa_fbse(blip_bitmap(0xF01F, 0x7A8, bad_dib)), oa_fbse(blip_png(PNG), cref=0), oa_fbse(delay=10**6),
+             oa_fbse(bomb)]
+    shapes = [(0x30, 9), (0x31, 1), (0x32, 2), (0x33, 3), (0x34, 4), (0x35, 0)]
+    doc, ctx = read_pub(picture_file(blips, shapes, delay=bytes(16), texts=[(0x35, 1)]))
+    assert images_of(doc) == [] and ctx.skipped == {"image": 5}, ctx.skipped
+    assert [text_of(b) for b in page_blocks(doc)] == ["text 1"]
+    doc, ctx = read_pub(picture_file([oa_fbse(delay=0)], [(0x30, 1)]))
+    assert images_of(doc) == [] and ctx.skipped == {"image": 1}, ctx.skipped
+    # a picture that fails in the reading is counted image; its shape's text stays
+
+    def boom(self, pib):
+        raise ValueError("boom")
+    with patched(pub._Reader, _blip=boom):
+        doc, ctx = read_pub(picture_file([oa_fbse(blip_png(PNG))], [(0x30, 1)], texts=[(0x30, 1)]))
+    assert [text_of(b) for b in page_blocks(doc)] == ["text 1"] and ctx.skipped == {"image": 1}, ctx.skipped
+
+
+def test_overlong_chunk_counted_once():
+    # a chunk whose length runs past the next chunk, cut there, leaving a variable block past the cut: record once
+    # (the clamp), not again for the cut walk
+    doc_ = pub_block(0x02, 0xA0, pub_block(0, 0x70, 2))
+    pg = pub_block(0x02, 0xA0, pub_block(0, 0x70, 3))
+    sh = pub_block(0x27, 0x20, 1) + bytes([0x10, 0xC0]) + struct.pack("<I", 200) + b"x" * 10
+    S, P, D = pub_contents.SHAPE, pub_contents.PAGE, pub_contents.DOCUMENT
+    contents = bytearray(_aliased([doc_, pg, sh, pub_block(0x27, 0x20, 2)], [(D, 0), (P, 1), (S, 2), (S, 3)]))
+    at = pub_contents.directory(bytes(contents), Context())[2].offset
+    struct.pack_into("<I", contents, at, 0x7FFFFFF0)
+    ctx = Context()
+    doc = pub._Reader(bytes(contents), quill_fix([(1, "kept"), (2, "other")]), b"", ctx).run()
+    assert outline(doc) == [("Page 1", ["kept"])] and ctx.skipped == {"record": 1}, (outline(doc), ctx.skipped)
+
+
+def test_read_lists_once():
+    # a page chunk's 0x02 list is held once in the offset cache (its 0x70 entries), not again as a page list
+    blob = pub_file([page(0x20, [0x30, 0x31, 0x32])], [shape(0x30, 1), shape(0x31, 2), shape(0x32, 3)],
+                    [(1, "a"), (2, "b"), (3, "c")])
+    with Compound(blob) as cf:
+        streams = [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+    reader = pub._Reader(*streams, b"", Context())
+    doc = reader.run()
+    assert outline(doc) == [("Page 1", ["a", "b", "c"])]
+    entry = reader.chunks[reader.refs[0x20].offset]
+    held = [x for part in entry if isinstance(part, list) for x in part]
+    assert sorted(held) == [0x30, 0x31, 0x32], entry
 
 
 # -- measure: hostile-input probes, in memory
@@ -1579,6 +2021,8 @@ def measure():
     blob = _v4(pub_file([page(2, [])]), {"Quill/QuillSub/CONTENTS": quill})
     _probe("pub: 400k links", lambda: _run_pub(blob), len(blob))
     _alias_probes()
+    _table_probes()
+    _picture_probes()
 
 
 def _alias_probes():
@@ -1593,6 +2037,116 @@ def _alias_probes():
             doc = reader.run()
             return f"blocks {len(doc.blocks)} meter {reader.meter.used} {dict(ctx.skipped)}"
         _probe(name, run, len(contents))
+
+
+def _streams(blob):
+    """The Contents and Quill streams of a fixture compound file."""
+    with Compound(blob) as cf:
+        return [cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS")]
+
+
+def _run_reader(contents, quill, escher=b"", delay=b""):
+    ctx = Context()
+    reader = pub._Reader(contents, quill, escher, ctx, delay)
+    doc = reader.run()
+    got = page_blocks(doc)
+    tables = [b for b in got if isinstance(b, Table)]
+    cells = sum(len(r) for t in tables for r in t.rows)
+    pics = sum(isinstance(b, Image) for b in got)
+    return f"tables {len(tables)} cells {cells} images {pics} meter {reader.meter.used} {dict(ctx.skipped)}"
+
+
+def _deflate_zeros(n):
+    z, out, chunk = zlib.compressobj(9), [], bytes(MIB)
+    for _ in range(n // MIB):
+        out.append(z.compress(chunk))
+    out.append(z.flush())
+    return b"".join(out)
+
+
+def _table_probes():
+    # Task 19, tables: a declared grid of 2^32 x 2^32 over 100k cells (refused before any layout), a grid at
+    # GRID_SLOTS with TABLE_NODES cells, 1,000 diagonal spans each reaching into the next (one cell covers all, the
+    # others join it), 1,414 diagonal cells of one place each (2M kept places, nearly all gaps: the meter cuts the
+    # scan), a TCD bit of 2M offsets over a 3-cell table and 20k tables naming one CELLS chunk
+    n = 100_000
+    many = [(r, r, c, c) for r in range(50) for c in range(2000)]
+    text, bounds = "x\r" * n, list(range(0, 2 * n + 1, 2))
+    for name, blob in (("pub: grid 2^32 x 2^32, 100k cells", table_file(many, 0xFFFFFFFF, 0xFFFFFFFF, text, bounds)),
+                       ("pub: grid 50 x 2000, 100k cells", table_file(many, 50, 2000, text, bounds)),
+                       ("pub: 1000 diagonal spans", table_file([(k, 999, k, 999) for k in range(1000)], 1000, 1000,
+                                                               "y\r" * 1000, list(range(0, 2001, 2)))),
+                       ("pub: 1414 diagonal cells", table_file([(k, k, k, k) for k in range(1414)], 1414, 1414,
+                                                               "y\r" * 1414, list(range(0, 2829, 2))))):
+        streams = _streams(blob)
+        _probe(name, lambda: _run_reader(*streams), sum(map(len, streams)))
+    # a TCD bit of 2M ends over a 1 Mi-character story of a 3-cell table: the cells past the table's are not read
+    contents = _streams(table_file(MERGED))[0]
+    ends = list(range(1, 2 * MIB + 1))
+    tcd = struct.pack("<III", len(ends) - 1, 0, 0xFF00) + struct.pack(f"<{len(ends)}I", *ends)
+    quill = _quill_with([(b"TEXT", b"TEXT", 0, ("z" * MIB).encode("utf-16-le")),
+                         (b"STRS", b"PLC ", 0, _plc_lengths([MIB])), (b"SYID", b"SYID", 0, struct.pack("<III", 8, 1, 1)),
+                         (b"TCD ", b"PLC ", 0, tcd)])
+    _probe("pub: TCD 2M offsets, 3 cells", lambda: _run_reader(contents, quill), len(contents) + len(quill))
+    # 20k TABLE shapes naming one CELLS chunk of 100 cells (10 x 10), each its own story of 100 cells, the first 990 a
+    # TCD bit (the Quill directory holds QUILL_BITS entries): the CELLS chunk walked once, TABLE_NODES spent by the
+    # 1,000th table, the rest counted table
+    n, cells = 20_000, [(r, r, c, c) for r in range(10) for c in range(10)]
+    shapes = [shape(3 + k, k + 1, type=pub_contents.TABLE, extra=pub_table(10, 10, 3 + n)) for k in range(n)]
+    shapes.append(shape(3 + n, type=pub_contents.CELLS, extra=pub_cells(cells)))
+    contents = _streams(pub_file([page(2, [3 + k for k in range(n)])], shapes))[0]
+    ends = list(range(2, 201, 2))
+    tcd = struct.pack("<III", len(ends) - 1, 0, 0xFF00) + struct.pack(f"<{len(ends)}I", *ends)
+    quill = _quill_with([(b"TEXT", b"TEXT", 0, ("c\r" * 100 * n).encode("utf-16-le")),
+                         (b"STRS", b"PLC ", 0, _plc_lengths([200] * n)),
+                         (b"SYID", b"SYID", 0, struct.pack("<II", 8, n) + struct.pack(f"<{n}I", *range(1, n + 1)))]
+                        + [(b"TCD ", b"PLC ", k, tcd) for k in range(990)])
+    _probe("pub: 20k tables, one CELLS chunk", lambda: _run_reader(contents, quill), len(contents) + len(quill))
+
+
+def _picture_probes():
+    # Task 19, pictures: 90k shapes naming one 1 MiB PNG (decoded once, placements charged to IMAGE_BYTES), 90k FBSEs
+    # naming one delay-stream BLIP, a delay stream of 8 deflate bombs of 1 GiB each, 4,096 small ones (1 KiB, just
+    # past flate's 1 MiB floor) and 1,000 DIBs with bogus header sizes and dimensions
+    n = 90_000
+    contents, quill = _streams(pub_file([page(2, [3 + k for k in range(n)])], [shape(3 + k) for k in range(n)]))
+    png = PNG + bytes(MIB)
+    escher = pub_escher(*(pub_sp(3 + k, pib=1) for k in range(n)), store=[oa_fbse(blip_png(png))])
+    _probe("pub: 90k shapes, one 1 MiB PNG", lambda: _run_reader(contents, quill, escher), len(escher))
+    delay = blip_png(png)
+    escher = pub_escher(*(pub_sp(3 + k, pib=k + 1) for k in range(n)), store=[oa_fbse(delay=0)] * n)
+    _probe("pub: 90k FBSEs, one delay BLIP", lambda: _run_reader(contents, quill, escher, delay),
+           len(escher) + len(delay))
+    bomb = _deflate_zeros(1024 * MIB)
+    head = struct.pack("<I16s8sIBB", 1024 * MIB, bytes(16), bytes(8), len(bomb), 0, 0xFE)
+    one = oa_record(0xF01B, bytes(range(16)) + head + bomb, inst=0x216)
+    delay = one * 8
+    k8 = 8
+    escher = pub_escher(*(pub_sp(3 + k, pib=k + 1) for k in range(k8)),
+                        store=[oa_fbse(delay=k * len(one)) for k in range(k8)])
+    _probe("pub: delay stream, 8 x 1 GiB bombs", lambda: _run_reader(contents, quill, escher, delay),
+           len(escher) + len(delay))
+    wmf = b"\x01\x00\x09\x00" + bytes(MIB)
+    bomb = zlib.compress(wmf, 9)
+    head = struct.pack("<I16s8sIBB", len(wmf), bytes(16), bytes(8), len(bomb), 0, 0xFE)
+    one = oa_record(0xF01B, bytes(range(16)) + head + bomb, inst=0x216)
+    k4 = 4096
+    delay = one * k4
+    escher = pub_escher(*(pub_sp(3 + k, pib=k + 1) for k in range(k4)),
+                        store=[oa_fbse(delay=k * len(one)) for k in range(k4)])
+    _probe("pub: delay stream, 4096 small bombs", lambda: _run_reader(contents, quill, escher, delay),
+           len(escher) + len(delay))
+    m = 1000
+    dibs = []
+    for k in range(m):
+        # header sizes past the DIB, a core header, a 40-byte one; 2^31 x 2^31 pixels; a palette size of 2^32 - 1 on
+        # every seventh, none (so the DIB reaches bmp_to_png) on the rest
+        size = (0xFFFFFFFF, 40, 12, 0x7FFFFFFF, 40)[k % 5]
+        dib = struct.pack("<IiiHHIIiiII", size, 0x7FFFFFFF, -0x7FFFFFFF, 1, (1, 4, 8, 24, 32, 16)[k % 6], 0,
+                          0xFFFFFFFF, 0, 0, 0xFFFFFFFF if k % 7 == 0 else 0, 0) + bytes(1100)
+        dibs.append(oa_fbse(blip_bitmap(0xF01F, 0x7A8, dib)))
+    escher = pub_escher(*(pub_sp(3 + k, pib=k + 1) for k in range(m)), store=dibs)
+    _probe("pub: 1000 bogus DIBs", lambda: _run_reader(contents, quill, escher), len(escher))
 
 
 def _v4(blob, streams):
