@@ -1113,6 +1113,158 @@ def test_no_contents_routes():
     refused(lambda: read_pub(bytes(blob)), "damaged", "Contents stream")
 
 
+def _aliased(chunks, refs):
+    """A 2002 Contents stream of the chunks `chunks` (block bytes) whose directory entry k + 1 (entry 0 a DUMMY block)
+    is refs[k], a (chunk type, chunk index) pair: many entries may name one chunk's offset."""
+    body = bytearray(b"\xE8\xAC\x2C\x00" + bytes(0x3C))
+    offsets = []
+    for blocks in chunks:
+        offsets.append(len(body))
+        body += struct.pack("<I", len(blocks) + 4) + blocks
+    entries = bytearray(pub_block(0, 0x78))
+    for ctype, k in refs:
+        entries += pub_block(0, 0x88, pub_block(0x02, 0x18, ctype) + pub_block(0x04, 0xB8, offsets[k]))
+    trailer = pub_block(1, 0x20, 0) + pub_block(2, 0x20, 0) + pub_block(3, 0x90, bytes(entries))
+    toff = len(body)
+    body += struct.pack("<I", len(trailer) + 4) + trailer
+    struct.pack_into("<I", body, 0x1A, toff)
+    return bytes(body)
+
+
+def _shape_aliases(n, size):
+    """Contents: DOCUMENT (seq 1) listing page 2, page 2 listing shapes 3 .. n + 2, every one of them a directory entry
+    naming one shape chunk (text id 1, and a 0xC0 block of `size` bytes)."""
+    doc = pub_block(0x02, 0xA0, pub_block(0, 0x70, 2))
+    pg = pub_block(0x02, 0xA0, b"".join(pub_block(0, 0x70, 3 + k) for k in range(n)))
+    sh = pub_block(0x27, 0x20, 1) + pub_block(0x10, 0xC0, b"s" * size)
+    return _aliased([doc, pg, sh], [(pub_contents.DOCUMENT, 0), (pub_contents.PAGE, 1)] + [(pub_contents.SHAPE, 2)] * n)
+
+
+def _page_aliases(n, size):
+    """Contents: DOCUMENT (seq 1) listing pages 2 .. n + 1, every one naming one PAGE chunk whose 0x0E master name is
+    `size` bytes and whose shape list is seq n + 2 (text id 1)."""
+    doc = pub_block(0x02, 0xA0, b"".join(pub_block(0, 0x70, 2 + k) for k in range(n)))
+    pg = pub_block(0x02, 0xA0, pub_block(0, 0x70, n + 2)) + pub_block(0x0E, 0xC0, b"M\x00" * (size // 2))
+    sh = pub_block(0x27, 0x20, 1)
+    return _aliased([doc, pg, sh], [(pub_contents.DOCUMENT, 0)] + [(pub_contents.PAGE, 1)] * n
+                    + [(pub_contents.SHAPE, 2)])
+
+
+def _counting_chunks(contents, quill):
+    """(outline, skipped, the chunk offsets walked, meter used) of reading `contents` with `quill`."""
+    walked = []
+    real = pub._Reader._chunk
+
+    def chunk(self, ref):
+        walked.append(ref.offset)
+        return real(self, ref)
+    ctx = Context()
+    with patched(pub._Reader, _chunk=chunk):
+        reader = pub._Reader(contents, quill, b"", ctx)
+        doc = reader.run()
+    return outline(doc), ctx.skipped, walked, reader.meter.used
+
+
+def test_aliased_offsets():
+    # many directory entries naming one chunk offset: the chunk is walked once (its string blocks copied once), so the
+    # work is linear in the bytes. The meter: 3 ticks a directory entry, 1 a list entry, 1 a shape placed (a page in
+    # each of the page and master passes); a walk of the aliased chunk per entry would add 2 or 3 more
+    quill = quill_fix([(1, "hello")])
+    got, skipped, walked, used = _counting_chunks(_shape_aliases(2000, 4096), quill)
+    assert got == [("Page 1", ["hello"])] and not skipped, (got, skipped)
+    assert len(walked) == len(set(walked)) == 3, len(walked)
+    assert used <= 2000 * 5 + 100, used
+    got, skipped, walked, used = _counting_chunks(_page_aliases(2000, 4096), quill)
+    assert got == [("Master page: " + "M" * 2048, ["hello"])] and not skipped, (got, skipped)
+    assert len(walked) == len(set(walked)) == 3, len(walked)
+    assert used <= 2000 * 6 + 100, used
+    # timing-bounded: 20,000 aliases of a 256 KiB string block, well under a second where each alias walked would copy
+    # 5 GiB
+    contents = _shape_aliases(20_000, 256 * 1024)
+    t = time.perf_counter()
+    got, skipped, walked, _ = _counting_chunks(contents, quill)
+    assert got == [("Page 1", ["hello"])] and len(walked) == 3 and time.perf_counter() - t < 2.0
+
+
+def test_chunk_span():
+    # a chunk whose declared length runs past the next chunk is read to that chunk only, counted record once
+    blob = one_page(["a", "b", "c"])
+    with Compound(blob) as cf:
+        contents, quill = (cf.read(n) for n in ("Contents", "Quill/QuillSub/CONTENTS"))
+    refs = {r.seqnum: r for r in pub_contents.directory(contents, Context())}
+    bad = bytearray(contents)
+    for seq in (0x30, 0x31):
+        struct.pack_into("<I", bad, refs[seq].offset, 0x7FFFFFF0)
+    ctx = Context()
+    doc = pub._Reader(bytes(bad), quill, b"", ctx).run()
+    assert outline(doc) == [("Page 1", ["a", "b", "c"])] and ctx.skipped == {"record": 1}, (outline(doc), ctx.skipped)
+
+
+def test_span_by_offset():
+    # a chunk's span ends at the next chunk in byte order, whatever the directory order: the page (its length too long)
+    # stops at shape A, which follows it in the stream though its directory entry comes after B's, so A's shape list
+    # (naming C) is not read as the page's
+    doc = pub_block(0x02, 0xA0, pub_block(0, 0x70, 2))
+    pg = pub_block(0x02, 0xA0, pub_block(0, 0x70, 3))
+    a = pub_block(0x27, 0x20, 2) + pub_block(0x02, 0xA0, pub_block(0, 0x70, 5))
+    b, c = pub_block(0x27, 0x20, 1), pub_block(0x27, 0x20, 3)
+    S, P, D = pub_contents.SHAPE, pub_contents.PAGE, pub_contents.DOCUMENT
+    contents = bytearray(_aliased([doc, pg, a, b, c], [(D, 0), (P, 1), (S, 3), (S, 2), (S, 4)]))
+    at = pub_contents.directory(bytes(contents), Context())[1].offset
+    struct.pack_into("<I", contents, at, 0x7FFFFFF0)
+    ctx = Context()
+    doc = pub._Reader(bytes(contents), quill_fix([(1, "b"), (2, "a"), (3, "c")]), b"", ctx).run()
+    assert outline(doc) == [("Page 1", ["b"])] and ctx.skipped == {"record": 1}, (outline(doc), ctx.skipped)
+
+
+def test_page_list_entries():
+    # the DOCUMENT page list takes its entries of id 0 only
+    doc = pub_block(0x02, 0xA0, pub_block(0, 0x70, 2) + pub_block(1, 0x70, 3))
+    pages = [pub_block(0x02, 0xA0, pub_block(0, 0x70, 4)), pub_block(0x02, 0xA0, pub_block(0, 0x70, 5))]
+    shapes = [pub_block(0x27, 0x20, 1), pub_block(0x27, 0x20, 2)]
+    S, P, D = pub_contents.SHAPE, pub_contents.PAGE, pub_contents.DOCUMENT
+    contents = _aliased([doc] + pages + shapes, [(D, 0), (P, 1), (P, 2), (S, 3), (S, 4)])
+    doc = pub._Reader(contents, quill_fix([(1, "listed"), (2, "not listed")]), b"", Context()).run()
+    assert outline(doc) == [("Page 1", ["listed"])], outline(doc)
+
+
+def test_escher_share():
+    # an Escher stream of filler records spends at most half the meter: the pages are still read, their text in list
+    # order, counted record once
+    filler = pub_escher(*[oa_record(0xF00B)] * 3000)
+    with patched(limits, BIN_RECORDS=2000):
+        doc, ctx = read_pub(one_page(["A", "B"], escher=filler))
+    assert outline(doc) == [("Page 1", ["A", "B"])] and ctx.skipped == {"record": 1}, (outline(doc), ctx.skipped)
+    # the share and then the meter itself run out: record still counted once
+    blob = one_page(["A", "B"], escher=filler)
+    for cap in range(0, 200, 3):
+        with patched(limits, BIN_RECORDS=cap):
+            try:
+                _, ctx = read_pub(blob)
+            except ReadError:
+                continue
+        assert ctx.skipped == {"record": 1}, (cap, ctx.skipped)
+    with patched(limits, BIN_RECORDS=2000):
+        doc, ctx = read_pub(one_page(["A", "B"], escher=pub_escher(pub_sp(0x30, (0, 9, 1, 10)),
+                                                                     pub_sp(0x31, (0, 1, 1, 2)))))
+    assert outline(doc) == [("Page 1", ["B", "A"])] and not ctx.skipped
+
+
+def test_broken_stream_named():
+    # a stream whose sector chain loops is named in the damaged detail
+    with Compound(one_page(["t"])) as cf:
+        contents = cf.read("Contents")
+    raw, info = cfb_bytes({"Contents": contents, "Quill/QuillSub/CONTENTS": b"CHNKINK " + bytes(5000)})
+    chain, blob = info["chains"]["Quill/QuillSub/CONTENTS"], bytearray(raw)
+    struct.pack_into("<I", blob, (info["fat"][chain[-1] // 128] + 1) * 512 + chain[-1] % 128 * 4, chain[0])
+    refused(lambda: read_pub(bytes(blob)), "damaged", "Quill/QuillSub/CONTENTS stream")
+    raw, info = cfb_bytes({"Contents": contents, "Quill/QuillSub/CONTENTS": b"CHNKINK ",
+                           "Escher/EscherStm": bytes(5000)})
+    chain, blob = info["chains"]["Escher/EscherStm"], bytearray(raw)
+    struct.pack_into("<I", blob, (info["fat"][chain[-1] // 128] + 1) * 512 + chain[-1] % 128 * 4, chain[0])
+    refused(lambda: read_pub(bytes(blob)), "damaged", "Escher/EscherStm stream")
+
+
 def _anchor(box):
     """A ClientAnchor record of the values 0x2001-0x2004 (xs, ys, xe, ye)."""
     return oa_record(0xF010, bytes(4) + b"".join(struct.pack("<HI", k, v & 0xFFFFFFFF)
@@ -1426,6 +1578,21 @@ def measure():
     quill = _quill_with([(b"TOKN", b"PLC ", k, tokn) for k in range(400)])
     blob = _v4(pub_file([page(2, [])]), {"Quill/QuillSub/CONTENTS": quill})
     _probe("pub: 400k links", lambda: _run_pub(blob), len(blob))
+    _alias_probes()
+
+
+def _alias_probes():
+    # 99,000 directory entries naming one chunk that holds a 1 MiB string block: as shapes, and as pages (the master
+    # name 1 MiB)
+    quill = quill_fix([(1, "hello")])
+    for name, contents in (("pub: 99k shape aliases x1 MiB", _shape_aliases(99_000, MIB)),
+                           ("pub: 99k page aliases x1 MiB", _page_aliases(99_000, MIB))):
+        def run():
+            ctx = Context()
+            reader = pub._Reader(contents, quill, b"", ctx)
+            doc = reader.run()
+            return f"blocks {len(doc.blocks)} meter {reader.meter.used} {dict(ctx.skipped)}"
+        _probe(name, run, len(contents))
 
 
 def _v4(blob, streams):

@@ -15,7 +15,8 @@ Version. The Contents stream starts `E8 AC xx 00`: 0x2C is 2002 and later, read 
 98) is not read yet ("Publisher 2000 or 98"), any other byte is `unsupported`, and a stream not starting E8 AC is
 damaged. A compound file with no Contents stream goes to `cfb_route.route(cf, "pub", "no Contents stream")`. A
 2002+ file needs the Quill stream (`Quill/QuillSub/CONTENTS`) and a DOCUMENT chunk, as libmspub does; without
-either it is damaged.
+either it is damaged. A stream the compound file cannot give (a broken sector chain) is damaged, the detail naming
+it ("Contents stream", "Quill/QuillSub/CONTENTS stream", "Escher/EscherStm stream").
 
 Pages. The DOCUMENT chunk's page list (block 0x02, its entries of id 0) gives the order, each seqnum once; with no
 list, the PAGE chunks in seqnum order (libmspub's `go`). Of these, a PAGE chunk whose block 0x0E (THIS_MASTER_NAME)
@@ -26,14 +27,18 @@ type 0x70). Block 0x0D, the master a page applies, is not followed: the master's
 section, never again on the pages naming it, so no master chain is walked. Masters follow the normal pages, in
 directory order, as `Section("master", title=name)` (the name UTF-16LE, charged to the room; past it the title is
 left out, counted `text`). Then the scratch area: the shapes of the DUMMY pages, in directory order, in one
-`Section("page", title="Scratch area", hidden="hidden")`. Each page chunk is read once.
+`Section("page", title="Scratch area", hidden="hidden")`. Each chunk offset is walked once a document, however many
+directory entries name it (their reads cached by offset), and a chunk ends at the next chunk's offset (or the trailer's
+or the stream's end): a declared length past that is cut there, counted `record` once.
 
 Shapes. A listed shape chunk (SHAPE, ALTSHAPE, TABLE; libmspub's `parseShape`) gives the Quill story its block 0x27
 (SHAPE_TEXT_ID) names, the last one winning; a GROUP or LOGO chunk has no text and stands for its members, the
-chunks whose directory parent it is, in directory order, groups inside included. Each shape is placed once in the
-document (where first met) and each story given once (a story two shapes name follows the first); a shape naming no
-story gives nothing, uncounted. The story's `Para`s carry its bold (`pub_quill`). Tables are given as their story's
-paragraphs.
+chunks whose directory parent it is, in directory order, groups inside included. This differs from libmspub, which
+takes a group's members from the Escher SpgrContainer nesting (`beginGroup`, `setCurrentGroupSeqNum`); the two agree
+where Publisher writes a member's directory parent as its group, as on every bench file. Each shape is placed once
+in the document (where first met) and each story given once (a story two shapes name follows the first); a shape
+naming no story gives nothing, uncounted. The story's `Para`s carry its bold (`pub_quill`). Tables are given as their
+story's paragraphs.
 
 Order. Top, then left, by the shape's box as libmspub's `parseEscherShape` reads it (the Contents shape chunk holds
 only a width and height): the `Escher/EscherStm` DgContainers' SpgrContainers, walked as `parseShapeGroup`, each
@@ -50,10 +55,12 @@ storage named VBA anywhere (Publisher's `VBA/`, Word's `Macros/VBA/`) counts `vb
 Bounds (each read at call time). One `pub_contents.Meter` of `limits.BIN_RECORDS` a document: the directory, every
 Contents block walked (page list, page chunks, shape chunks), each page visited, each shape placed, each Escher
 record and value, and the Quill stories' styles tick it; the first refusal counts `record` once and every later walk
-stops. The page list and the shapes are walked with seen-sets, so a page or shape listed twice, naming itself or a
-cycle of groups is read once; group members past `limits.MAX_DEPTH` levels, and Escher groups nested past it, are
-left out, counted `depth` once. `ctx.guard("page")` wraps each page and scratch page, `ctx.guard("master_page")`
-each master and `ctx.guard("shape")` each shape; a page's blocks are kept only when its guard succeeds. Each story
+stops. The Escher walk, which only orders text, may spend no more than half of `limits.BIN_RECORDS` (`_Share`): past
+that the boxes found so far are kept and the pages are still read, `record` counted once a document. The page list
+and the shapes are walked with seen-sets, so a page or shape listed twice, naming itself or a cycle of groups is read
+once; group members past `limits.MAX_DEPTH` levels, and Escher groups nested past it, are left out, counted `depth`
+once. `ctx.guard("page")` wraps each page and scratch page, `ctx.guard("master_page")` each master and
+`ctx.guard("shape")` each shape; a page's blocks are kept only when its guard succeeds. Each story
 given is charged to one room of `limits.MAX_OUTPUT` a document, as the stories are charged (`pub_quill`): its
 characters and `vsdx.LINE` for itself, each paragraph end or line break and each bold run; past the room it is left
 out, counted `text`. Each link is charged its characters and LINE; past the room the rest are left out, counted
@@ -61,6 +68,7 @@ out, counted `text`. Each link is charged its characters and LINE; past the room
 `pub_contents.PUB_CHUNKS`.
 """
 import struct
+from bisect import bisect_right
 
 from .. import limits
 from ..containers.cfb import CfbError, Compound, is_cfb
@@ -139,8 +147,9 @@ def _values(data, body: int, size: int, meter) -> dict:
 class _Boxes:
     """The Escher walk of `boxes`: {Contents shape seqnum: (top, left)}."""
 
-    def __init__(self, data, meter, ctx):
-        self.data, self.meter, self.ctx = data, meter, ctx
+    def __init__(self, data, meter, ctx, limit=None):
+        self.data, self.ctx = data, ctx
+        self.meter = meter if limit is None else _Share(meter, limit)
         self.out = {}
         self.deep = False
 
@@ -208,6 +217,20 @@ class _Boxes:
             box[:] = got
 
 
+class _Share:
+    """The Escher walk's share of the document meter: it stops once the meter's use reaches `limit` (uncounted here:
+    `_Reader.run` counts it), and ticks the meter itself below that."""
+
+    def __init__(self, meter, limit: int):
+        self.meter, self.limit, self.cut = meter, limit, False
+
+    def tick(self) -> bool:
+        if self.meter.used >= self.limit:
+            self.cut = True
+            return False
+        return self.meter.tick()
+
+
 def boxes(data, meter, ctx) -> dict:
     """{Contents shape seqnum: (top, left)} from an Escher/EscherStm stream (see the module docstring)."""
     return _Boxes(data, meter, ctx).walk()
@@ -228,47 +251,69 @@ class _Reader:
         self.meter = pub_contents.Meter(ctx)
         self.refs = {}   # seqnum -> its reference (a 2002 seqnum is its directory index, so each is one chunk)
         self.kids = {}   # seqnum -> the seqnums naming it as their parent, in directory order (a group's members)
+        bounds = {len(contents)}
         for ref in pub_contents.directory(contents, ctx, meter=self.meter):  # at most PUB_CHUNKS
             self.refs[ref.seqnum] = ref
+            bounds.update((ref.offset, ref.end))
             if ref.parent is not None:
                 self.kids.setdefault(ref.parent, []).append(ref.seqnum)
+        self.bounds = sorted(bounds)  # every chunk offset, the trailer's and the stream's end: a chunk ends at the next
         bits = pub_quill.bits(quill, ctx)
         self.stories = pub_quill.stories(bits, ctx, meter=self.meter)
         self.urls = pub_quill.links(bits)
-        self.boxes = boxes(escher, self.meter, ctx) if escher else {}
+        walk = _Boxes(escher, self.meter, ctx, self.meter.used + limits.BIN_RECORDS // 2)
+        self.boxes = walk.walk() if escher else {}
+        self.escher_cut = walk.meter.cut
         self.room = limits.MAX_OUTPUT
-        self.pages = {}      # page seqnum -> (master name bytes or None, shape seqnums)
+        self.chunks = {}     # chunk offset -> what `_read` found there
+        self.long = False    # a chunk length past its span was cut (counted once)
         self.placed = set()  # shapes placed
         self.told = set()    # text ids given
         self.deep = False
 
     def _chunk(self, ref):
-        """The blocks of a chunk: a u32 length counting itself, then blocks (as libmspub reads to offset + length)."""
+        """The blocks of a chunk: a u32 length counting itself, then blocks, to offset + length as libmspub reads, but
+        never past the next chunk's offset (a longer length is cut there, counted record once)."""
         at = ref.offset
         if at + 4 > len(self.data):
             return iter(())
-        return pub_contents.blocks(self.data, at + 4, at + _U32.unpack_from(self.data, at)[0], meter=self.meter)
+        end = at + _U32.unpack_from(self.data, at)[0]
+        k = bisect_right(self.bounds, at)
+        span = self.bounds[k] if k < len(self.bounds) else len(self.data)
+        if end > span:
+            end = span
+            if not self.long:
+                self.long = True
+                self.meter.cut()
+        return pub_contents.blocks(self.data, at + 4, end, meter=self.meter)
 
-    def _page_list(self, doc) -> list:
-        out = []
-        for b in self._chunk(doc):
-            if b.id == PAGE_LIST:  # a fixed block has no children; a non-int entry names no chunk
-                out.extend(s.data for s in pub_contents.children(self.data, b, meter=self.meter) if s.id == 0)
-        return out
-
-    def _page(self, ref) -> tuple:
-        """(the master name's bytes, None for a normal page; its shape seqnums) of a PAGE chunk, read once."""
-        got = self.pages.get(ref.seqnum)
+    def _read(self, ref) -> tuple:
+        """(the 0x0E master name's bytes or None, the 0x02 list's id-0 entries, its 0x70 entries, the last 0x27 text
+        id) of the chunk at `ref.offset`: walked once a document, however many directory entries name that offset."""
+        got = self.chunks.get(ref.offset)
         if got is None:
-            master, shapes = None, []
+            master, listed, shapes, tid = None, [], [], None
             for b in self._chunk(ref):
                 if b.id == THIS_MASTER_NAME and b.type == STRING_CONTAINER:
                     master = b.data if any(b.data) else None
-                elif b.id == PAGE_SHAPES:
-                    shapes.extend(s.data for s in pub_contents.children(self.data, b, meter=self.meter)
-                                  if s.type == SHAPE_SEQNUM)
-            got = self.pages[ref.seqnum] = (master, shapes)
+                elif b.id == PAGE_LIST:  # PAGE_SHAPES too; a fixed block has no children
+                    for s in pub_contents.children(self.data, b, meter=self.meter):
+                        if s.id == 0:
+                            listed.append(s.data)  # a non-int entry names no chunk
+                        if s.type == SHAPE_SEQNUM:
+                            shapes.append(s.data)
+                elif b.id == SHAPE_TEXT_ID:  # a non-int value names no story
+                    tid = b.data
+            got = self.chunks[ref.offset] = (master, listed or (), shapes or (), tid)  # () shared: most chunks list none
         return got
+
+    def _page_list(self, doc) -> list:
+        return self._read(doc)[1]
+
+    def _page(self, ref) -> tuple:
+        """(the master name's bytes, None for a normal page; its shape seqnums) of a PAGE chunk."""
+        master, _, shapes, _ = self._read(ref)
+        return master, shapes
 
     def _expand(self, seqs) -> list:
         """The shape references of a page's list, each group replaced by its members, each shape once a document."""
@@ -307,10 +352,7 @@ class _Reader:
 
     def _text(self, ref) -> list:
         """The paragraphs of the story a shape names, once a document, charged to the room."""
-        tid = None
-        for b in self._chunk(ref):
-            if b.id == SHAPE_TEXT_ID:  # a non-int value names no story
-                tid = b.data
+        tid = self._read(ref)[3]
         story = self.stories.get(tid)
         if story is None or tid in self.told:
             return []
@@ -384,6 +426,8 @@ class _Reader:
         if scratch:
             out.append(Section("page", title="Scratch area", blocks=scratch, hidden="hidden"))
         out.extend(self._links())
+        if self.escher_cut and not self.meter.spent:  # the Escher walk's share ran out (record counted once)
+            self.ctx.skipped["record"] += 1
         return Doc(blocks=out)
 
 
@@ -407,10 +451,12 @@ def parse(path, ctx) -> Doc:
 def parse_compound(src, ctx) -> Doc | str:
     """Read the compound file `src` (a path or its bytes, nothing is written): the Doc, or the name of the other
     parser `cfb_route` picks for a compound file that holds no Contents stream. `parse` ends in it."""
+    part = "compound file"
     try:
         with Compound(src) as cf:
             other = cfb_route.route(cf, "pub", "no Contents stream")
             if other is None:
+                part = f"{CONTENTS} stream"
                 contents = cf.read(CONTENTS)
                 if len(contents) < 4 or contents[:2] != HEAD:
                     raise ReadError("damaged", "not a Publisher Contents stream")
@@ -420,11 +466,13 @@ def parse_compound(src, ctx) -> Doc | str:
                     raise ReadError("unsupported", f"unknown Publisher version (Contents byte 0x{contents[2]:02X})")
                 if not cf.exists(QUILL):
                     raise ReadError("damaged", "no Quill stream")
+                part = f"{QUILL} stream"
                 quill = cf.read(QUILL)
+                part = f"{ESCHER} stream"
                 escher = cf.read(ESCHER) if cf.exists(ESCHER) else b""
                 vba = any(_vba(n) for n in cf.names())
     except (KeyError, CfbError):
-        raise ReadError("damaged", "Contents stream") from None
+        raise ReadError("damaged", part) from None
     if other is not None:
         return other
     if vba:
