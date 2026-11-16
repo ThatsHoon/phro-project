@@ -113,6 +113,33 @@ def test_picture_free_slide_counts_nothing():
     assert "![](" not in out, out
 
 
+def test_delay_records_charged():
+    # FBSEs whose foDelay offsets name records nested in one another in the Pictures stream: each record is charged
+    # 8 + its length against the stream before it is read, as doc does, so only the first that fits is decoded and
+    # the others are counted image, unread; two FBSEs naming one offset share one read
+    from reader import officeart
+    from reader.containers import flate
+    from reader_fix import oa_container, oa_fbse, oa_record
+    inner = blip_png(PNG)
+    outer = oa_record(0xF01E, bytes(range(16)) + b"\xff" + inner, inst=0x6E0)
+    at = len(outer) - len(inner)
+    dgg = oa_container(0xF000, oa_record(0xF006, bytes(16)),
+                       oa_container(0xF001, oa_fbse(delay=at), oa_fbse(delay=0), oa_fbse(delay=at), inst=3))
+    calls, real = [], officeart.blip_image
+    officeart.blip_image = lambda *a: calls.append(a[1]) or real(*a)
+    try:
+        ctx = Context()
+        pics = ppt_pictures.Pictures(dgg, (0, len(dgg)), outer, flate.Budget(), ctx)
+        got = [pics.image(pib) for pib in (1, 2, 3)]
+        # a record running past the Pictures stream (though shorter than it) is refused unread
+        short = ppt_pictures.Pictures(dgg, (0, len(dgg)), bytes(at) + inner[:-1], flate.Budget(), ctx)
+        assert short.image(1) is None
+    finally:
+        officeart.blip_image = real
+    assert got[0].data == PNG and got[1] is None and got[2].data == PNG, got
+    assert dict(ctx.skipped) == {"image": 2} and calls == [at], (dict(ctx.skipped), calls)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
