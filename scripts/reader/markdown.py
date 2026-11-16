@@ -57,6 +57,7 @@ LOST = (
     (("table",), "table", "tables"),
     (("db_table",), "database table", "database tables"),
     (("query",), "query not rebuilt as SQL", "queries not rebuilt as SQL"),
+    (("withheld",), "query with connection details withheld", "queries with connection details withheld"),
     (("smartart",), "SmartArt diagram", "SmartArt diagrams"),
     (("smartart_cut",), "SmartArt diagram cut short", "SmartArt diagrams cut short"),
     (("object",), "embedded object", "embedded objects"),

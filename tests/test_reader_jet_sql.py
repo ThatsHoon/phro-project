@@ -9,6 +9,7 @@ puts a join condition on the innermost join holding both tables, and writes DIST
 
 Run: python -I -X utf8 tests/test_reader_jet_sql.py
 """
+import re
 import sys
 import time
 from pathlib import Path
@@ -372,30 +373,71 @@ def test_quoting():
 
 
 def connect_cleaner(s):
-    """A stand-in for jet.py's cleaner (idempotent, as it is): the text before ";PWD=", marked "~"."""
-    return s if s.endswith("~") else s.split(";PWD=")[0] + "~"
+    """A stand-in for jet.py's connect cleaner (idempotent, as it is): the text from "PWD" on withheld, as "…"."""
+    k = s.find("PWD")
+    return s if k < 0 else s[:k].rstrip(".;") + ";…"
+
+
+def url_cleaner(s):
+    """A stand-in for jet.py's URL rule (idempotent): a URL's user part after "//" withheld, as "…"."""
+    return re.sub(r"//[^/@\s'\"]*@", "//…@", s).replace("//……@", "//…@")
 
 
 def test_connect_hook():
-    # every connect string and database path goes through `connect`; bracketed or quoted text holding ";" and "="
-    # anywhere else in the text too; a pass-through query's stored text never
+    # the connect positions go through `connect`: a remote database's path and type, a source's qualifier, a
+    # make-table or append target, and in the text of a union part, a derived table or a subquery an IN clause's
+    # path and type and a [connect]. prefix; a pass-through query's stored text never
     q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(TABLE, "ODBC;DSN=x;PWD=s", None, "T"),
          row(REMOTEDB, "ODBC;DSN=y;PWD=s", None, "\\\\h\\d.mdb")]
     got = jet_sql.sql(q, connect=connect_cleaner)
-    assert got == lines("SELECT a", "FROM [ODBC;DSN=x~].T IN '\\\\h\\d.mdb~' [ODBC;DSN=y~];"), got
+    assert got == lines("SELECT a", "FROM [ODBC;DSN=x;…].T IN '\\\\h\\d.mdb' [ODBC;DSN=y;…];"), got
     q = [row(TYPE, "ODBC;PWD=s", APPEND, "T", "p.mdb"), row(COLUMN, "1", APPEND_VALUE)]
-    assert jet_sql.sql(q, connect=connect_cleaner) == lines("INSERT INTO T IN 'p.mdb~' [ODBC~]", "VALUES (1);")
+    assert jet_sql.sql(q, connect=connect_cleaner) == lines("INSERT INTO T IN 'p.mdb' [ODBC;…]", "VALUES (1);")
     q = [row(TYPE, None, UNION), row(TABLE, "Select a from T IN '' [ODBC;DSN=z;PWD=s]", None, None, PART1),
-         row(TABLE, "Select 'k;PWD=v' from \"U;x=1\"", None, None, PART2)]
+         row(TABLE, "Select 'k;PWD=v' from \"U;x=1\" IN \"c:\\x\" \"dBASE IV;PWD=w\"", None, None, PART2)]
     got = jet_sql.sql(q, connect=connect_cleaner)
-    assert got == lines("Select a from T IN '' [ODBC;DSN=z~]", "UNION ALL Select 'k~' from \"U;x=1~\";"), got
-    # an unclosed group runs to the end of the text
-    q = [row(TYPE, None, SELECT), row(COLUMN, "'a"), row(WHERE, "[ODBC;PWD=s")]
-    assert jet_sql.sql(q, connect=connect_cleaner) == "SELECT 'a\nWHERE [ODBC~", jet_sql.sql(q, connect=connect_cleaner)
-    q = [row(TYPE, "SELECT * FROM t WHERE p = '[x;PWD=y]'", PASSTHROUGH, "ODBC;DSN=a;PWD=s")]
-    assert jet_sql.sql(q, connect=connect_cleaner) == "SELECT * FROM t WHERE p = '[x;PWD=y]'"
+    assert got == lines("Select a from T IN '' [ODBC;DSN=z;…]",
+                        "UNION ALL Select 'k;PWD=v' from \"U;x=1\" IN \"c:\\x\" \"dBASE IV;…\";"), got
+    # a derived table and a subquery: an IN clause, a [connect]. prefix, a brace holding "]" inside a prefix
+    q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(TABLE, "SELECT * FROM T IN 'x;PWD=1'", None, None, "q"),
+         row(WHERE, "a IN (SELECT b FROM [ODBC;DSN=a;PWD=1].T) OR c IN (SELECT d FROM "
+                    "[ODBC;DRIVER={x};PWD={ab]s3cr3t}].U)")]
+    got = jet_sql.sql(q, connect=connect_cleaner)
+    assert got == lines("SELECT a", "FROM (SELECT * FROM T IN 'x;…') AS q",
+                        "WHERE a IN (SELECT b FROM [ODBC;DSN=a;…].T) OR c IN "
+                        "(SELECT d FROM [ODBC;DRIVER={x};…].U);"), got
+    # a target or source name holding ";" is cleaned whole, before it is split at "."
+    q = [row(TYPE, None, MAKE_TABLE, "ODBC;DSN=a;.PWD=s3cr3t"), row(COLUMN, "a"),
+         row(TABLE, None, None, "ODBC;DSN=b;PWD=x.y")]
+    got = jet_sql.sql(q, connect=connect_cleaner)
+    assert got == lines("SELECT a INTO [ODBC;DSN=a;…]", "FROM [ODBC;DSN=b;…];"), got
+    # an IN clause left open runs to the end of the text, cleaned
+    q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, "a IN 'x;PWD=1")]
+    assert jet_sql.sql(q, connect=connect_cleaner) == lines("SELECT a", "WHERE a IN 'x;…"), \
+        jet_sql.sql(q, connect=connect_cleaner)
+    # any other literal or identifier is the document's content, kept as stored
+    kept = ["[Notes] Like \"*key=1;*\"", "DLookUp(\"Name\",\"T\",\"[A]=1 AND [B]='x;PWD=y'\") Is Null",
+            "[a;PWD=b] = 'IN ''x;PWD=1'' z' AND [x;y=z]", "'a\nWHERE [ODBC;PWD=s"]
+    for w in kept:
+        q = [row(TYPE, None, SELECT), row(COLUMN, "a"), row(WHERE, w)]
+        assert jet_sql.sql(q, connect=connect_cleaner) == lines("SELECT a", f"WHERE {w};"), w
+    # a pass-through query's stored text: no connect position; its connect string is never written
+    q = [row(TYPE, "SELECT * FROM t IN 'x;PWD=y' WHERE p = '[x;PWD=y]'", PASSTHROUGH, "ODBC;DSN=a;PWD=s")]
+    assert jet_sql.sql(q, connect=connect_cleaner) == "SELECT * FROM t IN 'x;PWD=y' WHERE p = '[x;PWD=y]'"
     # without the hook, the text is Jackcess's
-    assert jet_sql.sql([row(TYPE, None, SELECT), row(COLUMN, "'a;b=c'")]) == "SELECT 'a;b=c';"
+    assert jet_sql.sql([row(TYPE, None, SELECT), row(COLUMN, "'a;b=c'"), row(TABLE, "x;PWD=1", None, "T")]) == \
+        lines("SELECT 'a;b=c'", "FROM [x;PWD=1].T;")
+
+
+def test_url_hook():
+    # `urls` takes a URL's user part out anywhere in the text, pass-through included, and from a name before it is
+    # split at "."
+    q = [row(TYPE, None, SELECT), row(COLUMN, "'see //bob:pw@h/x'"), row(TABLE, None, None, "https://u:p.w@h/x"),
+         row(WHERE, "a Like \"*key=1;*\"")]
+    got = jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner)
+    assert got == lines("SELECT 'see //…@h/x'", "FROM [https://…@h/x]", "WHERE a Like \"*key=1;*\";"), got
+    q = [row(TYPE, "SELECT 1 FROM t WHERE u = '//bob:pw@h'\0", PASSTHROUGH, "ODBC;DSN=a")]
+    assert jet_sql.sql(q, connect=connect_cleaner, urls=url_cleaner) == "SELECT 1 FROM t WHERE u = '//…@h'"
 
 
 def test_unrebuildable():
@@ -424,15 +466,11 @@ def test_unrebuildable():
         jet_sql.JET_SQL = old
 
 
-def test_work_bounds_the_steps():
-    """`work(rows)` is an upper bound on what sql() does, in steps; jet.py charges it before sql() runs. The dearest
-    shapes stay under 0.2 microseconds a step, the meter's unit, which jet.py prices a step at (`_SQL`)."""
-    def timed(rows):
-        t = time.perf_counter()
-        jet_sql.sql(rows, connect=lambda s: s)
-        return time.perf_counter() - t, jet_sql.work(rows)
+def shapes():
+    """The dearest shapes for `work`: many columns, long parameter names, joins, repeated conditions, deep joins,
+    quoted runs, the Order sort, the scrub's IN clauses and prefixes."""
     n = 2000
-    shapes = {
+    return {
         "columns": [row(TYPE, None, SELECT)] + [row(COLUMN, "a", None, "b c") for _ in range(n)],
         "params": [row(TYPE, None, SELECT)] + [row(PARAMETER, None, 4, "F!x" * 50) for _ in range(n)],
         "joins": [row(TYPE, None, SELECT)] + [row(TABLE, None, None, f"T{i}") for i in range(n)]
@@ -445,33 +483,60 @@ def test_work_bounds_the_steps():
         "groups": [row(TYPE, None, SELECT), row(COLUMN, "'x;y=z'" * 4000)],
         "sorted": [Row(COLUMN, "a", None, None, None, 1, bytes([i % 256, i // 256])) for i in range(n)]
         + [Row(TYPE, None, SELECT, None, None, 1, b"\0")],
+        "scrub": [row(TYPE, None, SELECT), row(WHERE, "x IN  '' [a;b].[c;d]. " * 2000 + "IN" + " " * 20_000)],
+        "text": [row(TYPE, None, SELECT), row(COLUMN, "x" * 60000)],
     }
-    for name, rows in shapes.items():
-        best = min(timed(rows)[0] for _ in range(3))
-        steps = jet_sql.work(rows)
-        assert best <= steps * 0.2e-6, (name, best, steps)
+
+
+class Steps:
+    """Counts what jet_sql.py runs while open (sys.monitoring): its backward jumps and its function starts."""
+    TOOL = 5
+
+    def __enter__(self):
+        mon = sys.monitoring
+        self.n = 0
+
+        def event(code, *args):
+            if code.co_filename != jet_sql.__file__:
+                return mon.DISABLE
+            if len(args) == 2 and args[1] >= args[0]:  # a forward jump
+                return mon.DISABLE
+            self.n += 1
+        mon.use_tool_id(self.TOOL, "jet_sql steps")
+        mon.register_callback(self.TOOL, mon.events.JUMP, event)
+        mon.register_callback(self.TOOL, mon.events.PY_START, event)
+        mon.set_events(self.TOOL, mon.events.JUMP | mon.events.PY_START)
+        mon.restart_events()
+        return self
+
+    def __exit__(self, *exc):
+        mon = sys.monitoring
+        mon.set_events(self.TOOL, 0)
+        mon.register_callback(self.TOOL, mon.events.JUMP, None)
+        mon.register_callback(self.TOOL, mon.events.PY_START, None)
+        mon.free_tool_id(self.TOOL)
+
+
+def test_work_bounds_the_steps():
+    """`work(rows)` is an upper bound on what sql() does, in steps; jet.py charges it before sql() runs. Here the
+    loop trips and calls jet_sql.py makes stay within it on the dearest shapes (`measure` times them: each stays well
+    under 0.2 microseconds a step, the meter's unit, which jet.py prices a step at)."""
+    for name, rows in shapes().items():
+        with Steps() as steps:
+            jet_sql.sql(rows, connect=lambda s: s, urls=lambda s: s)
+        assert steps.n <= jet_sql.work(rows), (name, steps.n, jet_sql.work(rows))
 
 
 def measure():
-    """Microseconds a step on the shapes of test_work_bounds_the_steps (for jet.py's price)."""
-    n = 2000
-    for name, rows in {
-        "columns": [row(TYPE, None, SELECT)] + [row(COLUMN, "a", None, "b c") for _ in range(n)],
-        "params": [row(TYPE, None, SELECT)] + [row(PARAMETER, None, 4, "F!x" * 50) for _ in range(n)],
-        "joins": [row(TYPE, None, SELECT)] + [row(TABLE, None, None, f"T{i}") for i in range(n)]
-        + [row(JOIN, "c", 1, f"T{i}", f"T{i + 1}") for i in range(40)],
-        "conditions": [row(TYPE, None, SELECT)] + [row(TABLE, None, None, f"T{i}") for i in range(200)]
-        + [row(JOIN, "c", 1, "T0", "T1")] * n,
-        "deep": [row(TYPE, None, SELECT)] + [row(TABLE, None, None, f"T{i}") for i in range(n)]
-        + [row(JOIN, "c", 1, f"T{i}", f"T{i + 1}") for i in range(limits.MAX_DEPTH)]
-        + [row(JOIN, "c", 1, "T0", "T1")] * n,
-        "groups": [row(TYPE, None, SELECT), row(COLUMN, "'x;y=z'" * 4000)],
-        "text": [row(TYPE, None, SELECT), row(COLUMN, "x" * 60000)],
-    }.items():
-        t = time.perf_counter()
-        jet_sql.sql(rows, connect=lambda s: s)
-        dt = time.perf_counter() - t
-        print(f"{name}: {dt * 1e6 / jet_sql.work(rows):.3f} us a step ({jet_sql.work(rows)} steps, {dt:.4f} s)")
+    """Microseconds a step on `shapes()` (for jet.py's price)."""
+    for name, rows in shapes().items():
+        best = None
+        for _ in range(3):
+            t = time.perf_counter()
+            jet_sql.sql(rows, connect=lambda s: s, urls=lambda s: s)
+            dt = time.perf_counter() - t
+            best = dt if best is None else min(best, dt)
+        print(f"{name}: {best * 1e6 / jet_sql.work(rows):.3f} us a step ({jet_sql.work(rows)} steps, {best:.4f} s)")
 
 
 def main():

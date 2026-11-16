@@ -76,9 +76,12 @@ cannot be read (an unknown type, a cut stream, a header past the data), counts `
 Queries. After the tables, each saved query (catalog type 5, not a system object) is a section "Query: <name>"
 (hidden when flagged 0x08) holding its SQL text in an `sql` Code block: its MSysQueries rows, grouped by ObjectId
 in one walk of the table (`_query_rows`), rebuilt the way Jackcess writes them by `jet_sql` (never run). The connect
-strings and database paths a query names, and any bracketed or quoted run of its text holding ";" and "=", are
-cleaned as a linked table's connect string (`_clean_connect`), so no PWD=, UID= or URL user part shows; a
-pass-through query's stored text is shown as stored, its connect string never. A query whose rows are not kept (past
+strings and database paths a query names, by position (`jet_sql`: a remote database, a source's qualifier, a
+target, an IN clause's path and type and a [connect]. prefix in its text), are cleaned as a linked table's connect
+string (`_clean_connect`), so no PWD=, UID= or URL user part shows there; any other literal or identifier is the
+document's content, kept as stored, except that a URL's user part is taken out anywhere (`_clean_urls`). What is
+withheld shows as "…", and each query showing one counts `withheld`. A pass-through query's stored text is shown as
+stored (a URL's user part aside), its connect string never. A query whose rows are not kept (past
 `jet_sql.JET_QUERY_ROWS`, a cell that cannot be read, a Memo past eight times `jet_sql.JET_SQL` bytes, the queries'
 room of four times the file's bytes), whose SQL Jackcess cannot write or past `JET_SQL`, or past the meter keeps its
 heading alone, counted `query`; a row of MSysQueries that cannot be read names no query, so then no query has SQL. A
@@ -132,8 +135,8 @@ but only while their estimated size fits a room of the file's bytes (one room fo
 is not kept. The flat tables' values (and a picture's FileData definition) have their own room, four times the
 file's bytes, and so do the queries' rows (a row 128 bytes and its strings), held until the queries are written.
 Past the room a repeat is read again, charged like the first read (a definition or target past it is dropped,
-counted `record`). So what is kept stays within about the file's size, the page cache within the decoded pages of the file, and the rows held for the
-sort within the grid's caps.
+counted `record`). So what is kept stays within about the file's size, the page cache within the decoded pages of
+the file, and the rows held for the sort within the grid's caps.
 
 Long values. A MEMO is inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00). An LVAL value read whole is
 decoded once and kept by its definition (room allowing), so a repeat costs its charge but no read; definitions that
@@ -244,6 +247,9 @@ LINK_SCHEMES = frozenset(("http", "https", "mailto", "ftp"))
 _NUMBERS = frozenset((BYTE, INT, LONG, BIGINT, MONEY, FLOAT, DOUBLE, NUMERIC))
 _ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md; every real file read has 0)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_SLASHES = re.compile(r"[/\\]+")
+_WORD_STOP = re.compile(r"[\s'\"\[\]()<>,]")
+_AUTH_STOP = re.compile(r"[/\\?#]")
 _SQL_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")  # shown as a space in a query's text
 _BAD = (ValueError, IndexError, struct.error, ArithmeticError)  # a row, cell or TDEF that cannot be read
 
@@ -1619,27 +1625,75 @@ def _linked_target(db: _Db, connect: str, database: str) -> str:
     cell = _safe_value(database)
     if cell:
         return cell
-    kept = [text for i, (k, v, text) in enumerate(parts)
-            if (k is None and i == 0 or k in _SAFE_KEYS) and _safe_value(v) == v.strip() and v.strip()]
-    return ";".join(kept)
+    return ";".join(text for i, (k, v, text) in enumerate(parts) if _safe_part(i, k, v, False))
+
+
+def _safe_part(i: int, k, v: str, query: bool) -> bool:
+    """Whether a connect string's part (`_connect_parts`) may show: a bare first token or a `_SAFE_KEYS` part with a
+    value, its value one `_safe_value` leaves as it is; for a query (`_clean_connect`) also an empty bare part, and
+    an empty first one."""
+    value = v.strip()
+    if _safe_value(v) != value:
+        return False
+    if k is None:
+        return i == 0 and (query or bool(value)) or query and not value
+    return k in _SAFE_KEYS and bool(value)
 
 
 # -- saved queries
 
-def _clean_connect(db: _Db, s: str) -> str:
-    """A connect string or database path a query names (`jet_sql`'s `connect`), showing less rather than a
-    credential, as a linked table's: its characters and marks charged first; kept are a bare first token (a path,
-    "ODBC"), later bare parts only when empty, and `_SAFE_KEYS` parts with a value, each only when `_safe_value`
-    leaves its value as it is; joined with ";". "" when it does not parse cleanly (`_connect_parts`). Cleaning it
-    again changes nothing, as `jet_sql`'s scrub of the finished text needs."""
+def _clean_connect(db: _Db, s: str):
+    """A connect position of a query (`jet_sql`'s `connect`): the string cleaned as a linked table's, showing less
+    rather than a credential, and whether anything was withheld. Its characters and marks are charged first. The
+    parts `_safe_part` keeps stay as they are; each run of parts it drops becomes one "…" part (an "…" already there
+    is kept, so cleaning again changes nothing); a string that does not parse cleanly (`_connect_parts`) is "…"."""
     marks = s.count(";") + s.count("}") + s.count('"') + s.count("'") + 1
     db.charge(len(s) + _PART * marks)
     parts, ok = _connect_parts(s)
     if not ok:
-        return ""
-    kept = [text for i, (k, v, text) in enumerate(parts)
-            if (k is None and (i == 0 or not v) or k in _SAFE_KEYS and v.strip()) and _safe_value(v) == v.strip()]
-    return ";".join(kept)
+        return "…", True
+    out, dropped = [], False
+    for i, (k, v, text) in enumerate(parts):
+        if k is None and v == "…" or _safe_part(i, k, v, True):
+            out.append(text)
+            continue
+        dropped = True
+        if not out or out[-1] != "…":
+            out.append("…")
+    return ";".join(out), dropped
+
+
+def _clean_urls(db: _Db, s: str):
+    """`s` with each URL's user part taken out, as `_safe_value` reads one, put as "…" ("http://…@host/x"), and
+    whether any was. A URL here is a run of two or more slashes or backslashes, or one after a ":"; its authority runs
+    to the next "/", "\\", "?" or "#" (or the end of its word: a space, quote, bracket, parenthesis, "<", ">" or
+    ","). The user part is up to the authority's last "@"; an authority holding ":" and no "@" whose word holds one
+    later (`u:pa/ss@h`) gives up to that "@". Its characters are charged first; one pass."""
+    db.charge(len(s))
+    out, last, dropped = [], 0, False
+    word_end, word_at = -1, -1
+    for m in _SLASHES.finditer(s):
+        a = m.end()
+        if a <= last or m.end() - m.start() < 2 and not (m.start() and s[m.start() - 1] == ":"):
+            continue
+        if a >= word_end:
+            stop = _WORD_STOP.search(s, a)
+            word_end = len(s) if stop is None else stop.start()
+            word_at = s.rfind("@", a, word_end)
+        stop = _AUTH_STOP.search(s, a, word_end)
+        b = word_end if stop is None else stop.start()
+        at = s.rfind("@", a, b)
+        if at < 0 and word_at >= a and ":" in s[a:b]:
+            at = word_at
+        if at < 0:
+            continue
+        if s[a:at] != "…":
+            dropped = True
+        out.append(s[last:a])
+        out.append("…")
+        last = at
+    out.append(s[last:])
+    return "".join(out), dropped
 
 
 def _query_int(col: Column, raw):
@@ -1723,17 +1777,29 @@ def _query_rows(db: _Db, catalog: list, queries: list):
 def _query(db: _Db, obj: Obj, rows) -> Section:
     """A query's section, "Query: <name>", holding its SQL (`jet_sql.sql`, its work charged first through
     `Meter.afford`) as a Code block; with no SQL (rows not kept, Jackcess unable to write it, the meter) the heading
-    stays alone, counted `query`. A control character other than a tab or line break shows as a space."""
+    stays alone, counted `query`. Its connect positions go through `_clean_connect` and its text through
+    `_clean_urls`; a query whose SQL shows with anything withheld ("…") counts `withheld` once. A control character
+    other than a tab or line break shows as a space."""
     text = None
+    withheld = []
+
+    def clean(fn, s):
+        out, dropped = fn(db, s)
+        if dropped:
+            withheld.append(True)
+        return out
     try:
         db.charge(_QUERY)
         if rows is not None and db.meter.afford(_SQL * jet_sql.work(rows)):
-            text = jet_sql.sql(rows, flags=obj.flags, connect=lambda s: _clean_connect(db, s))
+            text = jet_sql.sql(rows, flags=obj.flags, connect=lambda s: clean(_clean_connect, s),
+                               urls=lambda s: clean(_clean_urls, s))
     except _Spent:
         text = None
     blocks = []
     if text and text.strip():
         blocks.append(Code(_SQL_CONTROL.sub(" ", text), "sql"))
+        if withheld:
+            db.ctx.skipped["withheld"] += 1
     else:
         db.ctx.skipped["query"] += 1
     if obj.flags & HIDDEN_FLAG:
@@ -1997,7 +2063,8 @@ def _table(db: _Db, obj: Obj, budget, rels: dict, objs=()):
 
 
 def parse_bytes(data, ctx) -> Doc:
-    """An Access database held in memory: the summary line, then a table section per user table."""
+    """An Access database held in memory: the summary line, a table section per user table, then a query section
+    per saved query."""
     jet = jet_pages.open(data)
     _refuse_encrypted(jet)
     db = _Db(jet, ctx)

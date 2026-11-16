@@ -2607,12 +2607,13 @@ def test_hidden_query():
 
 
 def test_query_credentials():
-    # connect strings and paths a query names are cleaned as a linked table's: PWD=, UID=, a URL's user part and a
-    # {braced} password never show, in a remote database, a source's qualifier, a target, or the query's text
+    # the connect positions a query names are cleaned as a linked table's: PWD=, UID=, a URL's user part and a
+    # {braced} password never show, in a remote database, a source's qualifier, a target, and in the text of a union
+    # part, a derived table or a subquery (an IN clause's path and type, a [connect]. prefix); each part withheld
+    # shows as "…", and each query holding one counts `withheld` once
     rows = [(1, None, 1, None, None),
             (4, "ODBC;DSN=s;UID=u1;PWD=secret1", None, "https://user1:secret2@h/d.mdb", None),
-            (6, "A", None, None, None), (5, "DRIVER={SQL Server};SERVER=s;UID=u2;PWD={se;cret3}", None, "T", None),
-            (8, "B = 'ODBC;UID=u3;PWD=secret4' OR C = \"x;Password=secret5\"", None, None, None)]
+            (6, "A", None, None, None), (5, "DRIVER={SQL Server};SERVER=s;UID=u2;PWD={se;cret3}", None, "T", None)]
     union = [(1, None, 9, None, None), (5, "SELECT a FROM [ODBC;DSN=z;PWD=secret6].T", None, None, UNION1),
              (5, "SELECT b FROM U IN '' [ODBC;UID=u4;PWD=secret7]", None, None, UNION2)]
     make = [(1, "ODBC;DSN=m;PWD=secret8", 2, "New", "\\\\srv\\x.mdb"), (6, "A", None, None, None)]
@@ -2623,13 +2624,53 @@ def test_query_credentials():
         doc, ctx, md = convert(jet_db(v, [], queries=qs))
         texts = [q.blocks[0].text for q in queries(doc)]
         assert texts == [
-            "SELECT A\nFROM [DRIVER={SQL Server};SERVER=s].T IN '' [ODBC;DSN=s]\nWHERE B = 'ODBC' OR C = \"x\";",
-            "SELECT a FROM [ODBC;DSN=z].T\nUNION ALL SELECT b FROM U IN '' [ODBC];",
-            "SELECT A INTO New IN '\\\\srv\\x.mdb' [ODBC;DSN=m];",
-            "INSERT INTO T IN ''\nVALUES (1);"], texts
-        for secret in ("secret", "u1", "u2", "u3", "u4", "u5", "user1", "UID", "PWD", "Password"):
+            "SELECT A\nFROM [DRIVER={SQL Server};SERVER=s;…].T IN '…' [ODBC;DSN=s;…];",
+            "SELECT a FROM [ODBC;DSN=z;…].T\nUNION ALL SELECT b FROM U IN '' [ODBC;…];",
+            "SELECT A INTO New IN '\\\\srv\\x.mdb' [ODBC;DSN=m;…];",
+            "INSERT INTO T IN '…'\nVALUES (1);"], texts
+        for secret in ("secret", "u1", "u2", "u4", "u5", "user1", "UID", "PWD"):
             assert secret not in md, (secret, md)
-        assert "query" not in ctx.skipped
+        assert ctx.skipped == {"withheld": 4} and "4 queries with connection details withheld" in md, ctx.skipped
+
+
+def test_query_credential_positions():
+    # the review's leaks: a URL's user part in a union part, a derived table and a subquery's IN path (with a
+    # [type] after it); a target named "ODBC;…;.PWD=…", split at "." by the quoting; a password in braces holding "]"
+    union = [(1, None, 9, None, None), (5, "SELECT a FROM T IN 'https://bob:s3cr3t@h/x.mdb'", None, None, UNION1),
+             (5, "SELECT b FROM U IN 'ftp://bob:s3cr3t@h/y.mdb' [MS Access]", None, None, UNION2)]
+    derived = [(1, None, 1, None, None), (6, "a", None, None, None),
+               (5, "SELECT * FROM T IN '//bob:s3cr3t@srv/x.mdb'", None, None, "q"),
+               (8, "a IN (SELECT b FROM V IN '\\\\bob:s3cr3t@srv\\z.mdb')", None, None, None)]
+    make = [(1, None, 2, "ODBC;DSN=a;.PWD=s3cr3t", None), (6, "a", None, None, None)]
+    brace = [(1, None, 1, None, None), (6, "a", None, None, None),
+             (5, "ODBC;DRIVER={x};PWD={ab]s3cr3t}", None, "T", None),
+             (8, "b IN (SELECT c FROM [ODBC;DRIVER={x};PWD={cd]s3cr3t}].W)", None, None, None)]
+    qs = [Query("U", union, flags=0x80), Query("D", derived), Query("M", make, flags=0x50), Query("B", brace)]
+    for v in (0, 1, 3):
+        doc, ctx, md = convert(jet_db(v, [], queries=qs))
+        texts = [q.blocks[0].text for q in queries(doc)]
+        assert texts == [
+            "SELECT a FROM T IN '…'\nUNION ALL SELECT b FROM U IN '…' [MS Access];",
+            "SELECT a\nFROM (SELECT * FROM T IN '…') AS q\nWHERE a IN (SELECT b FROM V IN '…');",
+            "SELECT a INTO [ODBC;DSN=a;…];",
+            "SELECT a\nFROM [ODBC;DRIVER={x};…].T\nWHERE b IN (SELECT c FROM [ODBC;DRIVER={x};…].W);"], texts
+        assert "s3cr3t" not in md and "bob" not in md and ctx.skipped == {"withheld": 4}, (md, ctx.skipped)
+
+
+def test_query_content_kept():
+    # any other literal or identifier is the document's content, shown as stored and not counted, except that a
+    # URL's user part is taken out anywhere ("…@"), pass-through text included
+    where = ("[Notes] Like \"*key=1;*\" AND DLookUp(\"Name\",\"T\",\"[A]=1 AND [B]='x;y'\") Is Null "
+             "AND [a;b=c] = 'ODBC;UID=u;PWD=p'")
+    q = [(1, None, 1, None, None), (6, "a", None, None, None), (8, where, None, None, None)]
+    doc, ctx, md = convert(jet_db(1, [], queries=[Query("K", q)]))
+    assert queries(doc)[0].blocks[0].text == f"SELECT a\nWHERE {where};" and ctx.skipped == {}, ctx.skipped
+    q = [(1, None, 1, None, None), (6, "'http://bob:pw@site/x' AS u", None, None, None)]
+    p = [(1, "SELECT 1 FROM t WHERE u = 'https://ann:pw@h/x'\0", 8, "ODBC;", None)]
+    doc, ctx, md = convert(jet_db(1, [], queries=[Query("L", q), Query("P", p, flags=0x70)]))
+    assert [x.blocks[0].text for x in queries(doc)] == [
+        "SELECT 'http://…@site/x' AS u;", "SELECT 1 FROM t WHERE u = 'https://…@h/x'"]
+    assert "bob" not in md and "ann" not in md and ctx.skipped == {"withheld": 2}, ctx.skipped
 
 
 def test_passthrough_shown_as_stored():
@@ -2729,7 +2770,10 @@ def test_query_meter():
             doc, ctx, _ = convert(data)
         finally:
             limits.JET_WORK_TOTAL = old
-        assert len(queries(doc)) + ctx.skipped["record"] >= 1
+        # each run ends with a Doc; a query the catalog reached has its heading; the ones without SQL are counted
+        names = [q.title for q in queries(doc)]
+        assert names in (["A", "B"], ["A"], []) and (names == ["A", "B"] or ctx.skipped["record"] >= 1), names
+        assert ctx.skipped["query"] == sum(1 for q in queries(doc) if not q.blocks), (ctx.skipped, names)
 
 
 def test_query_rows_charged():
@@ -2768,7 +2812,13 @@ def test_query_work_charged():
         sec = jet._query(db, q, got)
     spent = db.meter.charged - before
     assert sec.blocks[0].text.startswith("PARAMETERS ") and "(d) AND (d)" in sec.blocks[0].text
-    assert spent >= jet._QUERY + jet._SQL * jet_sql.work(got) and loops.n <= 2 * spent + 16, (loops.n, spent)
+    # the query, its work, and its text's characters for the URL rule (no connect position here)
+    least = jet._QUERY + jet._SQL * jet_sql.work(got) + len(sec.blocks[0].text)
+    assert spent >= least and loops.n <= 2 * spent + 16, (loops.n, spent, least)
+    # a query whose rows were not kept costs `_QUERY` alone: its heading
+    before = db.meter.charged
+    assert jet._query(db, q, None).blocks == [] and db.meter.charged - before == jet._QUERY
+    db.ctx.skipped.clear()
     # past what the meter has left the work is not done: the heading alone
     db.meter.total = db.meter.spent + jet._SQL * jet_sql.work(got)
     sec = jet._query(db, q, got)
@@ -2783,15 +2833,37 @@ def test_query_connect_charged():
     with Loops() as loops:
         got = jet._clean_connect(db, s)
     spent = db.meter.charged - before
-    assert got == "ODBC;DSN=d" and loops.n <= 2 * spent + 16, (loops.n, spent)
+    assert got == ("ODBC;…;DSN=d", True) and loops.n <= 2 * spent + 16, (loops.n, spent)
     assert spent >= len(s) + jet._PART * s.count(";"), spent
-    # cleaning is idempotent (the scrub of the finished text cleans a bracketed group again), and showing less
+    # cleaning is idempotent (the scrub of the finished text cleans a position again, withholding nothing more),
+    # and shows less: what is withheld is "…"
     for s in ("ODBC;DSN=a;UID=u;PWD=p", "\\\\h\\d.mdb", "DRIVER={x;y};SERVER=s", "https://u:p@h/d", "a;;DSN=b;",
-              "PWD={unclosed", "ODBC; DSN = x ;"):
-        once = jet._clean_connect(db, s)
-        assert jet._clean_connect(db, once) == once and "p@" not in once and "PWD" not in once, (s, once)
-    assert jet._clean_connect(db, "PWD={unclosed") == "" and jet._clean_connect(db, "a;;DSN=b;") == "a;;DSN=b;"
-    assert jet._clean_connect(db, "https://u:p@h/d") == ""
+              "PWD={unclosed", "ODBC; DSN = x ;", "ODBC;DSN=a;.PWD=s.t", ""):
+        once, _ = jet._clean_connect(db, s)
+        assert jet._clean_connect(db, once) == (once, False) and "p@" not in once and "PWD" not in once, (s, once)
+    assert jet._clean_connect(db, "PWD={unclosed") == ("…", True)
+    assert jet._clean_connect(db, "a;;DSN=b;") == ("a;;DSN=b;", False)
+    assert jet._clean_connect(db, "https://u:p@h/d") == ("…", True)
+    assert jet._clean_connect(db, "ODBC;UID=u;DSN=a;PWD=p;X=1") == ("ODBC;…;DSN=a;…", True)
+
+
+def test_query_urls_charged():
+    # a URL's user part taken out anywhere: its characters charged first, one pass however many slashes there are
+    db = jet._Db(jet_pages.open(jet_db(1)), Context())
+    for s in ("//a:b" * 20_000 + "@h", "x//" * 20_000, "'http://u:p@h/x' " * 5_000, "/" * 60_000 + "u@h"):
+        before = db.meter.charged
+        with Loops() as loops:
+            got, _ = jet._clean_urls(db, s)
+        spent = db.meter.charged - before
+        assert spent >= len(s) and loops.n <= 2 * spent + 16, (s[:20], loops.n, spent)
+    cases = {"see http://bob:pw@site/x and //ann@h": ("see http://…@site/x and //…@h", True),
+             "\\\\bob:pw@srv\\share": ("\\\\…@srv\\share", True), "u:pa/ss@h, ftp://u:pa/ss@h/x": (
+                 "u:pa/ss@h, ftp://…@h/x", True), "C:\\a@b\\c": ("C:\\…@b\\c", True),
+             "a/b@c x//y": ("a/b@c x//y", False),
+             "mailto:bob@h": ("mailto:bob@h", False), "http://…@h": ("http://…@h", False)}
+    for s, want in cases.items():
+        got = jet._clean_urls(db, s)
+        assert got == want and jet._clean_urls(db, got[0]) == (got[0], False), (s, got)
 
 
 def test_query_mutations_end():

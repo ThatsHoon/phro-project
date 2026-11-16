@@ -8,8 +8,8 @@ attributes, flags, parameter types and join types), `BaseSelectQueryImpl.java`, 
 `MakeTableQueryImpl.java`, `AppendQueryImpl.java`, `UpdateQueryImpl.java`, `DeleteQueryImpl.java`,
 `CrossTabQueryImpl.java`, `DataDefinitionQueryImpl.java`, `PassthroughQueryImpl.java` and `UnionQueryImpl.java`.
 
-`sql(rows, flags=, connect=)` is Jackcess's `toSQLString`: lines joined with "\\n" (Jackcess's line separator), the
-text of a SELECT (1), make-table (2), append (3), update (4), delete (5), crosstab (6), union (9) ending with ";", a
+`sql(rows, flags=, connect=, urls=)` is Jackcess's `toSQLString`: lines joined with "\\n" (Jackcess's line
+separator), the text of a SELECT (1), make-table (2), append (3), update (4), delete (5), crosstab (6), union (9) ending with ";", a
 DDL (7) or pass-through (8) query its stored text as it is (the NULs that end it dropped). The type is the object
 flag's (`flags & 0xF0`, MSysObjects' Flags) or, when that is 0, the type row's, and the two must agree. Where Java
 appends a null, "null" is written, as Jackcess does. None when Jackcess would throw (an unknown type, a parameter or
@@ -18,12 +18,16 @@ no type or no condition), and also for: no type row; more than `JET_QUERY_ROWS` 
 `limits.MAX_DEPTH` (Jackcess recurses without a bound); text past `JET_SQL` characters. Both caps are read at call
 time.
 
-Credentials. With `connect`, every connect string and database path a query names is passed through it before it is
-written (a remote database's path and type, `IN '<path>' [<type>]`, of a source or of a make-table or append target;
-a source's database qualifier, `[<qualifier>].<table>`), and so is the content of every bracketed or quoted run of the
-finished text holding ";" and "=" (one left open runs to the end), so a connect string typed into a union part, a
-derived table or an expression is cleaned too. A pass-through query's stored text is shown as stored, and its connect
-string (the type row's Name1) is never written.
+Credentials, by position. With `connect`, every connect position is passed through it: a remote database's path
+and type (`IN '<path>' [<type>]`) of a source or of a make-table or append target; a source's database qualifier
+(`[<qualifier>].<table>`); a source or target name holding ";", whole, before it is split at "."; and in the finished
+text (a union part, a derived table, a subquery, any expression) the quoted path after an IN keyword, the quoted or
+bracketed type right after that path, and a bracketed prefix holding ";" that a "." follows (a "{" in it reaches its
+"}", so a braced value holding "]" stays inside; one left open runs to the end of the text). Every other quoted
+literal or bracketed identifier is the document's content and is kept as stored. With `urls`, a URL's user part is
+taken out anywhere in the text (pass-through text included) and from a name before it is split. A pass-through
+query's stored text has no connect position, and its connect string (the type row's Name1) is never written. The
+hooks are idempotent; what they withhold they mark ("…").
 
 Work. `work(rows)` is an upper bound on what `sql` does, in steps (a character of text, `_ROW` a row, a comparison of
 the sort, `_JOIN` a table source a join looks at, builds or walks); the caller charges it before `sql` runs.
@@ -53,6 +57,7 @@ _JOIN_TYPES = {1: " INNER JOIN ", 2: " LEFT JOIN ", 3: " RIGHT JOIN "}
 _QUOTABLE = re.compile(r"[^A-Za-z0-9_]")  # Java's \W is ASCII
 _LINES = re.compile(r"[\r\n]+")
 _OPENS = re.compile(r"[\[\"']")
+_BRACKET_STOP = re.compile(r"[\]{]")
 _JAVA_SPACE = "".join(map(chr, range(33)))  # what Java's trim() takes off
 _ROW = 32  # steps a row costs beyond its text: its getters, filters, quoting and separators
 _JOIN = 4  # steps a table source costs a join row: a look in the search, and one in each level a condition goes down
@@ -97,40 +102,85 @@ def work(rows) -> int:
     return 4 * chars + _ROW * n + n * n.bit_length() + _JOIN * joins * nodes * (2 + min(joins, limits.MAX_DEPTH))
 
 
-def sql(rows, *, flags: int = 0, connect=None) -> str | None:
+def sql(rows, *, flags: int = 0, connect=None, urls=None) -> str | None:
     """The query's SQL text, or None (see the module's docstring)."""
     if len(rows) > JET_QUERY_ROWS:
         return None
     try:
-        q = _Query(rows, flags, connect)
+        q = _Query(rows, flags, connect, urls)
         text = q.text()
     except _Fail:
         return None
     if connect is not None and q.kind != PASSTHROUGH:
         text = _scrub(text, connect)
+    if urls is not None:
+        text = urls(text)
     return text if len(text) <= JET_SQL else None
 
 
 def _scrub(text: str, connect) -> str:
-    """`text` with the content of each [bracketed], 'quoted' or "quoted" run holding ";" and "=" passed through
-    `connect` (a doubled quote is part of its run; a run left open ends with the text). One pass."""
-    out, i = [], 0
+    """`text` with each connect position's content passed through `connect` (see the module's docstring): the quoted
+    path after IN, the quoted or bracketed type right after it, a bracketed prefix holding ";" that a "." follows or
+    that is left open. Quoted and bracketed runs are read in one pass (a doubled quote is part of its run); any other
+    run is kept as it is, and a run left open ends the scan with the text."""
+    out, i, last, path = [], 0, 0, -1
+    n = len(text)
     while True:
         m = _OPENS.search(text, i)
         if m is None:
             break
         o = m.start()
         c = text[o]
-        end = text.find("]", o + 1) if c == "[" else _closing(text, o + 1, c)
-        inner = text[o + 1:] if end < 0 else text[o + 1:end]
-        out.append(text[i:o + 1])
-        out.append(connect(inner) if ";" in inner and "=" in inner else inner)
+        prefix = False
+        if c == "[":
+            end = text.find("]", o + 1)
+            if end >= 0 and ";" in text[o + 1:end]:
+                end = _bracket_end(text, o + 1)
+                prefix = end < 0 or text[end + 1:end + 2] == "."
+        else:
+            end = _closing(text, o + 1, c)
+        stop = n if end < 0 else end
+        after_in = _after_in(text, o)
+        typed = path >= 0 and not text[path:o].strip()
+        position = after_in or typed or prefix
+        path = stop + 1 if after_in and c != "[" else -1
+        if position:
+            out.append(text[last:o + 1])
+            out.append(connect(text[o + 1:stop]))
+            last = stop
         if end < 0:
-            return "".join(out)
-        out.append(text[end])
+            break
         i = end + 1
-    out.append(text[i:])
+    out.append(text[last:])
     return "".join(out)
+
+
+def _after_in(text: str, o: int) -> bool:
+    """Whether the keyword IN (any case, a whole word) comes before `o`, spaces aside."""
+    j = o
+    while j > 0 and text[j - 1] in " \t\r\n":
+        j -= 1
+    return j >= 2 and text[j - 2:j].upper() == "IN" and (j == 2 or not (text[j - 3].isalnum() or text[j - 3] == "_"))
+
+
+def _bracket_end(text: str, at: int) -> int:
+    """Where a bracket opened before `at` closes, a {braced} value (its "}}" escaped) passed over whole; -1 when the
+    bracket or a brace is left open."""
+    while True:
+        m = _BRACKET_STOP.search(text, at)
+        if m is None:
+            return -1
+        if m.group() == "]":
+            return m.start()
+        at = m.start() + 1
+        while True:
+            k = text.find("}", at)
+            if k < 0:
+                return -1
+            if text[k + 1:k + 2] != "}":
+                at = k + 1
+                break
+            at = k + 2
 
 
 def _closing(text: str, at: int, q: str) -> int:
@@ -184,7 +234,7 @@ def _param_name(name) -> str:
     parts.append(name[start:])
     if not bang or any(not p or p[0] == " " or p[-1] == " " for p in parts):
         return _opt_quoted(name, False)
-    return parts and "".join((seps[i - 1] if i else "") + _opt_quoted(p, False) for i, p in enumerate(parts))
+    return "".join((seps[i - 1] if i else "") + _opt_quoted(p, False) for i, p in enumerate(parts))
 
 
 class _Simple:
@@ -248,7 +298,7 @@ def _render(ts, top: bool, out: list):
 
 
 class _Query:
-    def __init__(self, rows, flags: int, connect):
+    def __init__(self, rows, flags: int, connect, urls):
         if all(r.order is not None for r in rows):  # sortByOrder: by attribute (a Java byte), then Order, stable
             rows = sorted(rows, key=lambda r: (-1 if r.attribute is None else (r.attribute + 128 & 0xFF) - 128,
                                                r.order))
@@ -268,6 +318,7 @@ class _Query:
         if (self.kind if found is None else found) != self.kind:
             raise _Fail(f"unexpected query type {found}")
         self.connect = connect or (lambda s: s)
+        self.urls = urls or (lambda s: s)
 
     # -- rows
 
@@ -287,6 +338,13 @@ class _Query:
     def type_text(self):
         text = self.one(TYPE).expression
         return None if text is None else text.rstrip("\0")
+
+    def ident(self, name, source: bool) -> str:
+        """`toOptionalQuotedExpr(name, true)`, the name cleaned first: a source or target name holding ";" through
+        `connect` (whole, before the split at "."), any other through `urls`."""
+        if name is not None:
+            name = self.connect(name) if source and ";" in name else self.urls(name)
+        return _opt_quoted(name, True)
 
     # -- pieces
 
@@ -369,7 +427,7 @@ class _Query:
         out.append(", ".join(self.select_columns()))
         if self.kind == MAKE_TABLE:
             t = self.one(TYPE)
-            out.append(" INTO " + _opt_quoted(t.name1, True) + self.remote(t.name2, t.expression))
+            out.append(" INTO " + self.ident(t.name1, True) + self.remote(t.name2, t.expression))
         tables = self.from_tables()
         if tables:
             db = self.one(REMOTEDB)
@@ -401,7 +459,7 @@ class _Query:
                 s = "" if t.expression is None else f"({t.expression})"
             else:
                 s = ("" if t.expression is None else _quoted(self.connect(t.expression)) + ".")
-                s += _opt_quoted(t.name1, True)
+                s += self.ident(t.name1, True)
             sources.append(_Simple(t.name2 if t.name2 is not None else t.name1, s + _alias(t.name2)))
         for j in self.rows(JOIN):
             if j.name1 is None or j.name2 is None or j.flag is None:
@@ -423,8 +481,8 @@ class _Query:
                     sources.pop(i)
                     continue
                 i += 1
-            left = left or _Simple(j.name1, _opt_quoted(j.name1, True))
-            right = right or _Simple(j.name2, _opt_quoted(j.name2, True))
+            left = left or _Simple(j.name1, self.ident(j.name1, True))
+            right = right or _Simple(j.name2, self.ident(j.name2, True))
             if left is right:
                 if left.add_condition(f, t, kind, j.expression):
                     continue
@@ -458,7 +516,7 @@ class _Query:
         self.select_type(out)
         db = self.one(REMOTEDB)
         out.append(", ".join(self.from_tables()) + self.remote(db.name1, db.expression))
-        out.append("\nSET " + ", ".join(_opt_quoted(r.name2, True) + " = " + _s(r.expression)
+        out.append("\nSET " + ", ".join(self.ident(r.name2, False) + " = " + _s(r.expression)
                                         for r in self.rows(COLUMN)))
         where = self.one(WHERE).expression
         if where is not None:
@@ -466,8 +524,8 @@ class _Query:
 
     def append(self, out):
         t = self.one(TYPE)
-        out.append("INSERT INTO " + _opt_quoted(t.name1, True))
-        targets = [_opt_quoted(r.name2, True) for r in self.rows(COLUMN) if r.name2 is not None]
+        out.append("INSERT INTO " + self.ident(t.name1, True))
+        targets = [self.ident(r.name2, False) for r in self.rows(COLUMN) if r.name2 is not None]
         if targets:
             out.append(f" ({', '.join(targets)})")
         out.append(self.remote(t.name2, t.expression) + "\n")
