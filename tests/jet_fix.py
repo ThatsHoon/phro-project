@@ -415,8 +415,10 @@ class _Writer:
     # -- properties
 
     def props(self, table_props, col_props):
-        maps = [(0, "", table_props)] + [(1, name, p) for name, p in col_props if p]
-        if not table_props and len(maps) == 1:
+        """A table's LvProp blob: the name list chunk, then the table's own (default, 0x00) map when it has properties
+        and a column (0x01) map for each column that has some; None without any."""
+        maps = ([(0, "", table_props)] if table_props else []) + [(1, name, p) for name, p in col_props if p]
+        if not maps:
             return None
         names = []
         for _, _, p in maps:

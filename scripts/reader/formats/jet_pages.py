@@ -33,11 +33,13 @@ of range or a step giving None ends it. Malformed map bytes raise ValueError; ca
 
 Work meter. Each file has one `Meter` (`Jet.meter`): a total of `limits.JET_WORK_TOTAL` units, or `WORK_PER_BYTE`
 times the file's bytes and 1 MiB if less, a unit being about 0.2 microseconds (a byte of compressed text decoded).
-Every loop whose trip count comes from the file's bytes ticks it before its work, here and in `jet.py`: a page RC4
-decodes (`RC4_BYTE` a byte), each chain item (`CHAIN_STEP`), each usage map pointer (`MAP_POINTER`) and each bitmap
-byte scanned (one, and `MAP_BITS` more when it is not zero, for its eight bits). Past the total `tick` raises
-`Spent`, which `jet.py` turns into its cut. So the work of a file is at most a constant times its total, whatever
-its bytes say.
+Every loop whose trip count comes from the file's bytes ticks it before its work, here and in `jet.py`, or makes a
+grid cell, which `SHEET_CELLS` bounds (in `jet.py`: the Yes/No defaults of a row and `value()` on a cell that is
+shown; see there). Here: a page RC4 decodes (`RC4_BYTE` a byte), each chain item (`CHAIN_STEP`), each usage map
+pointer (`MAP_POINTER`) and each bitmap byte scanned (one, and `MAP_BITS` more when it is not zero, for its eight
+bits). Past the total `tick` raises `Spent`, which `jet.py` turns into its cut; `afford` charges work that has a
+cheaper way out only when it fits. So the work of a file is at most a constant times its total, plus the fixed
+work of the grid's cells, whatever its bytes say.
 """
 import codecs
 import struct
@@ -82,6 +84,14 @@ class Meter:
         self.charged += n
         if self.spent > self.total:
             raise Spent
+
+    def afford(self, n: int) -> bool:
+        """Tick n units when they fit what is left; False, charging nothing, when they do not (for work that has a
+        cheaper way out, such as a sort)."""
+        if self.spent + n > self.total:
+            return False
+        self.tick(n)
+        return True
 
     def give(self, n: int):
         self.spent -= n

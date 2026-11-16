@@ -16,11 +16,11 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import limits, markdown  # noqa: E402
+from reader import html, limits, markdown  # noqa: E402
 from reader.containers import crypto  # noqa: E402
 from reader.formats import jet, jet_pages, sheet_grid  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Para, Section, Table, Text  # noqa: E402
+from reader.model import Context, Hidden, Link, Para, Section, Table, Text  # noqa: E402
 from jet_fix import (Col, Query, Row, Tbl, jet_db, BINARY, BIGINT, BOOL, BYTE, DATE, DOUBLE,  # noqa: E402
                      EXTDATE, FLOAT, GUID, INT, LONG, MEMO, MONEY, NUMERIC, OLE, TEXT)
 
@@ -274,7 +274,7 @@ def test_jet4_table():
     assert "## Table: Orders (3 rows)" in md
     sec = section(doc, "Orders")
     assert sec.kind == "table" and sec.title == "Orders (3 rows)" and not sec.hidden
-    assert columns_line(sec) == "Columns: ID (Long) · Name (Text) · Notes (Memo)"
+    assert columns_line(sec) == "Columns: ID (Long, PK) · Name (Text) · Notes (Memo)"
     assert grid(sec) == [["ID", "Name", "Notes"], ["1", "Ann", "first"], ["2", "Bob", ""], ["3", "Cy", "third note"]]
     assert not ctx.skipped, ctx.skipped
     for v in (0, 2, 3, 5, 6):  # the same table in every version
@@ -596,19 +596,22 @@ def memo_cost(data):
     return db.spent - before
 
 
-def catalog_spend(data):
-    """What reading the catalog charges against the work total (charged before any table)."""
+def catalog_spend(data, rels=True):
+    """What reading the catalog and MSysRelationships charges against the work total (charged before any table);
+    with rels False the catalog alone."""
     db = jet._Db(jet_pages.open(data), Context())
-    jet._catalog(db)
+    objs = jet._catalog(db)
+    if rels:
+        jet._relationships(db, objs)
     return db.spent
 
 
 def row_spend(data, name="M"):
     """(lead, per row) for table `name`, whose rows each cost the same: what the meter has charged when its first row
-    is about to be read (the catalog, the TDEF, the map, the first page and its slots), and what each row then costs
-    net (its row, mask byte, cells and value, the shown cells given back)."""
+    is about to be read (the catalog and MSysRelationships, the TDEF, the map, the first page and its slots), and what
+    each row then costs net (its row, mask byte, cells and value, the shown cells given back)."""
     db = jet._Db(jet_pages.open(data), Context())
-    jet._catalog(db)
+    jet._relationships(db, jet._catalog(db))
     tdef = jet._tdef(db, tdef_page(data, name))
     spent = []
     for _, cells in jet._rows(db, tdef):
@@ -1255,7 +1258,7 @@ def test_usage_walks_charged():
             ctx, w = metered(data)
     finally:
         limits.JET_WORK_TOTAL = old
-    started = maps.calls - 1  # the catalog's own map is the first walked
+    started = maps.calls - 2  # the catalog's own map is the first walked, MSysRelationships' the second
     assert 0 < started < 30 and tdefs.calls == maps.calls, (maps.calls, tdefs.calls)
     assert ctx.skipped == {"sheet_cut": 1, "db_table": 60 - started}, ctx.skipped
     assert len(sections(w.out)) == started and summary(w.out).endswith(": 60 tables."), summary(w.out)
@@ -1342,19 +1345,50 @@ def test_long_value_room():
     w.bounded(len(data))
 
 
+def opened(data):
+    """(ctx, Work, the Jet the parse opened) for one metered parse of `data`."""
+    jets = []
+    orig = jet_pages.open
+
+    def capture(*a):
+        jets.append(orig(*a))
+        return jets[-1]
+    jet_pages.open = capture
+    try:
+        ctx, w = metered(data, True)
+    finally:
+        jet_pages.open = orig
+    return ctx, w, jets[-1]
+
+
 def test_page_cache_bound():
-    # a db_key file read once keeps its decoded pages, at most the file's own bytes (and JET_PAGE_CACHE pages)
+    # a db_key file read once keeps its decoded pages: the cache holds at most the file's own bytes (each page once)
+    # and at most JET_PAGE_CACHE pages. The pages are measured in the cache itself; the traced peak, which also
+    # holds each cached page's object header (about 1.03 times the file) and the noise of the plain run beside it,
+    # gets a quarter of the file and 64 KiB of room
     tbl = Tbl("P", [Col("ID", LONG), Col("N", TEXT)], [[i, "x" * 60] for i in range(4_000)])
     plain, coded = jet_db(1, [tbl]), jet_db(1, [tbl], db_key=0x1234)
-    (cp, wp), (cc, wc) = metered(plain, True), metered(coded, True)
+    (cp, wp, _), (cc, wc, j) = opened(plain), opened(coded)
     assert grid(section(wp.out, "P")) == grid(section(wc.out, "P")) and cp.skipped == cc.skipped
-    assert wc.peak - wp.peak <= len(coded), (wp.peak, wc.peak, len(coded))
+    cached = sum(len(p) for p in j._cache.values())
+    assert 0 < cached <= len(coded) - j.page_size and len(j._cache) <= limits.JET_PAGE_CACHE, (cached, len(coded))
+    assert wc.peak - wp.peak <= 1.25 * len(coded) + 2 ** 16, (wp.peak, wc.peak, len(coded))
     wc.bounded(len(coded))
+    # with the cap lowered under the file's pages the cache keeps that many, and the output is the same
+    old = limits.JET_PAGE_CACHE
+    limits.JET_PAGE_CACHE = 4
+    try:
+        cs, ws, j = opened(coded)
+    finally:
+        limits.JET_PAGE_CACHE = old
+    assert len(j._cache) == 4 and grid(section(ws.out, "P")) == grid(section(wp.out, "P")), len(j._cache)
 
 
 def guard_fixtures():
     """Clean files for the mutation guard: Jet3, Jet4 (also under a db_key) and ACE (type 1 maps), each with fixed
-    and variable columns, Yes/No, long values (inline, one row, chained), deleted and overflow rows, a hidden table."""
+    and variable columns, Yes/No, long values (inline, one row, chained), deleted and overflow rows, a hidden table;
+    a 240-column table; and Jet4 and Jet3 tables with properties, hyperlinks, hidden columns, a primary key and
+    relationships."""
     cols = [Col("ID", LONG), Col("Name", TEXT), Col("Notes", MEMO), Col("Flag", BOOL), Col("Price", MONEY),
             Col("When", DATE), Col("Pic", OLE), Col("Key", GUID)]
     key = uuid.UUID(int=0x0123456789ABCDEF0123456789ABCDEF).bytes_le
@@ -1369,9 +1403,20 @@ def guard_fixtures():
     other = Tbl("H", [Col("A", INT), Col("B", TEXT)], [[i, "b" * i] for i in range(12)], flags=0x08)
     wide = Tbl("W", [Col(f"w{i}", TEXT if i % 3 else BOOL) for i in range(240)],
                [[f"{r}" if i % 3 else i % 2 for i in range(240)] for r in range(16)])
+    # properties (Percent, Yes/No, rich text, required), a hyperlink column, hidden columns, a primary key the rows
+    # are sorted by and a relationship naming it
+    keyed = [Col("ID", LONG, flags=0x05), Col("P", DOUBLE, props={"Format": "Percent", "Required": True}),
+             Col("Y", INT, props={"Format": "Yes/No"}), Col("R", MEMO, props={"TextFormat": 1}),
+             Col("U", MEMO, flags=0x80), Col("s_GUID", GUID), Col("X", TEXT, flags=0x10)]
+    krows = [[(7 * i) % 13, i / 8, i % 2, f"<div><b>r{i}</b> {'x' * (i * 40)}</div>", f"site{i}#https://e.com/{i}#",
+              str(uuid.UUID(int=i)), "x" * i] for i in range(13)]
+    child = Tbl("C", [Col("ID", LONG), Col("KID", LONG)], [[i, i % 13] for i in range(20)], pk="ID")
+    rels = [("CK", "C", "KID", "K", "ID"), ("KK", "K", "ID", "C", "ID")]
     return [jet_db(0, [Tbl("T", cols, rows(14)), other]), jet_db(1, [Tbl("T", cols, rows(14)), other]),
             jet_db(1, [Tbl("T", cols, rows(10))], db_key=0x2468), jet_db(3, [Tbl("T", cols, rows(14), umap=1), other]),
-            jet_db(1, [wide, Tbl("S", [Col("A", LONG)], [[i] for i in range(300)])])]
+            jet_db(1, [wide, Tbl("S", [Col("A", LONG)], [[i] for i in range(300)])]),
+            jet_db(1, [Tbl("K", keyed, krows, pk="ID", props={"Description": "keyed"}), child], relationships=rels),
+            jet_db(0, [Tbl("K", keyed[:4], [r[:4] for r in krows], pk="ID"), child], relationships=rels[:1])]
 
 
 def mutate(rng, data):
@@ -1442,12 +1487,14 @@ def mutate(rng, data):
 
 
 def test_mutation_guard():
-    # a structural guard: 400 seeded in-memory mutations of the clean files (never written to disk), each parsed with
-    # the default total or a small one. Each parse ends (a Doc or a ReadError, nothing else escapes, the meter's own
-    # Spent included), its loop iterations stay within twice the units charged and twice the grid cells put, the
-    # units within the file's total, and its tracemalloc peak within 4 times the file, 1 KiB a grid cell put (the
-    # document's own cells, which the grid's caps bound) and 1.5 MiB: so a loop left uncharged, or a cache growing
-    # past the file, anywhere on the paths the mutations reach fails here
+    # a structural backstop: 400 seeded in-memory mutations of the clean files (never written to disk), each parsed
+    # with the default total or a small one. What it checks: each parse ends (a Doc or a ReadError, nothing else
+    # escapes, the meter's own Spent included); the loop iterations of the whole parse stay within twice the units
+    # charged, twice the grid cells put and a constant; the units within the file's total; the tracemalloc peak
+    # within 4 times the file, 1 KiB a grid cell put (the document's own cells, which the grid's caps bound) and
+    # 1.5 MiB. The loop bound is file-wide, so one loop left uncharged is diluted by every other charge and passes
+    # here; each loop's own tick is pinned by its per-path test (test_columns_charged, test_index_blocks_charged,
+    # test_usage_*, test_props_charged, test_relationships_charged, ...). A cache growing past the file does fail here
     rng = random.Random(20261116)
     clean = guard_fixtures()
     old = limits.JET_WORK_TOTAL
@@ -1468,6 +1515,381 @@ def test_mutation_guard():
                 raise AssertionError(f"mutation {k}: {e}") from None
     finally:
         limits.JET_WORK_TOTAL = old
+
+
+# -- long values, properties, formats, hyperlinks, hidden columns, key order, relationships
+
+def lval_pages(data):
+    """The LVAL pages of a file, ascending (data pages whose owner field reads "LVAL")."""
+    j = jet_pages.open(data)
+    return [n for n in range(1, j.pages) if j.page(n)[0] == 1 and j.page(n)[4:8] == b"LVAL"]
+
+
+def cell_inlines(sec, r, c):
+    """The inlines of grid cell (r, c) of a table section (row 0 the header)."""
+    table = next(b for b in sec.blocks if isinstance(b, Table))
+    return [x for p in table.rows[r][c].blocks for x in p.inlines]
+
+
+def test_lval_forms():
+    # a memo of each form, in Jet3 and Jet4: inline (0x80), one LVAL row (0x40) and a chain of three LVAL pages
+    # (0x00); each reads back whole, nothing counted
+    for v, chained in ((0, "é" * 5_000), (1, "한" * 5_000)):
+        texts = ["inline memo", "o" * 1_500, chained]
+        data = jet_db(v, [Tbl("L", [Col("ID", LONG), Col("Notes", MEMO)], [[i, t] for i, t in enumerate(texts)])])
+        assert len(lval_pages(data)) == 4, (v, lval_pages(data))  # one for the single row, three for the chain
+        doc, ctx, _ = convert(data)
+        assert grid(section(doc, "L"))[1:] == [[str(i), t] for i, t in enumerate(texts)] and not ctx.skipped, v
+
+
+def test_lval_cycle():
+    # a three-page chain whose second row names the first page again: the walk stops at the repeat (its seen-set),
+    # the text read so far is shown, counted `record` once (shorter than its length); a row naming itself the same
+    text = "한" * 5_000
+    clean = jet_db(1, [Tbl("L", [Col("ID", LONG), Col("Notes", MEMO)], [[1, text]])])
+    first, second, _ = lval_pages(clean)
+    chunk = (4076 - 4) // 2  # the characters one chain row holds
+    for pg, want in ((second, 2 * chunk), (first, chunk)):
+        data = bytearray(clean)
+        at = pg * 4096 + (struct.unpack_from("<H", data, pg * 4096 + 14)[0] & 0x1FFF)
+        data[at:at + 4] = b"\x00" + first.to_bytes(3, "little")
+        with Count(jet._Db, "row_at") as rows:
+            doc, ctx, _ = convert(bytes(data))
+        assert grid(section(doc, "L"))[1] == ["1", "한" * want] and ctx.skipped == {"record": 1}, ctx.skipped
+        assert rows.calls == want // chunk, rows.calls
+
+
+def test_lval_cap():
+    # JET_LVAL_BYTES lowered to 100: a 502-byte value (FF FE and 500 compressed a's) reads 100 bytes and is cut
+    old = jet.JET_LVAL_BYTES
+    jet.JET_LVAL_BYTES = 100
+    try:
+        with Count(jet._Db, "row_at") as rows:
+            doc, ctx, _ = convert(jet_db(1, [Tbl("L", [Col("ID", LONG), Col("Notes", MEMO)],
+                                                 [[1, "a" * 500], [2, "short"]])]))
+    finally:
+        jet.JET_LVAL_BYTES = old
+    assert grid(section(doc, "L"))[1:] == [["1", "a" * 98 + "…"], ["2", "short"]] and ctx.skipped == {"text": 1}
+    assert rows.bytes <= 502 and rows.calls == 1, (rows.bytes, rows.calls)
+
+
+def test_ole_and_binary():
+    # OLE (one LVAL row, and a chain) shows its length, counted `object`, and no LVAL row is read; binary its length
+    cols = [Col("ID", LONG), Col("Pic", OLE), Col("Bin", BINARY)]
+    data = jet_db(1, [Tbl("O", cols, [[1, bytes(range(256)) * 8, b"\x01\x02\x03"], [2, b"z" * 10_000, None]])])
+    assert lval_pages(data), "the OLE values are long values"
+    with Count(jet._Db, "row_at") as rows:
+        doc, ctx, _ = convert(data)
+    assert grid(section(doc, "O"))[1:] == [["1", "<OLE 2048 bytes>", "<binary 3 bytes>"],
+                                           ["2", "<OLE 10000 bytes>", ""]] and ctx.skipped == {"object": 2}
+    assert rows.calls == 0, rows.calls
+
+
+def test_percent_and_yes_no():
+    # Format Percent: x 100 with "%", a trailing ".0" dropped (Double, Single, Long); Yes/No on an Integer; any other
+    # format (Currency here) is not applied; a column without properties is as before
+    cols = [Col("ID", LONG), Col("P", DOUBLE, props={"Format": "Percent"}), Col("S", FLOAT, props={"Format": "Percent"}),
+            Col("Y", INT, props={"Format": "Yes/No"}), Col("C", MONEY, props={"Format": "Currency"}),
+            Col("N", LONG, props={"Format": "Percent"}), Col("D", DOUBLE)]
+    rows = [[1, 0.25, 0.5, -1, 15000, 3, 0.25], [2, 0.125, 0.1, 0, 10000, -1, 0.125], [3] + [None] * 6]
+    for v in (0, 1, 3):
+        doc, ctx, _ = convert(jet_db(v, [Tbl("F", cols, rows)]))
+        assert grid(section(doc, "F"))[1:] == [["1", "25%", "50%", "Yes", "1.5", "300%", "0.25"],
+                                               ["2", "12.5%", "10%", "No", "1", "-100%", "0.125"],
+                                               ["3", "", "", "", "", "", ""]], v
+        assert not ctx.skipped, ctx.skipped
+
+
+def test_rich_text():
+    # TextFormat 1: the text of the HTML; a memo without it keeps its tags
+    cols = [Col("ID", LONG), Col("Notes", MEMO, props={"TextFormat": 1}), Col("Plain", MEMO)]
+    rows = [[1, "<div><b>Hi</b> there</div>", "<b>kept</b>"], [2, "<div>" + "y" * 3_000 + "</div>", None]]
+    data = jet_db(1, [Tbl("R", cols, rows)])
+    doc, ctx, _ = convert(data)
+    sec = section(doc, "R")
+    assert columns_line(sec) == "Columns: ID (Long) · Notes (Memo, rich text) · Plain (Memo)"
+    assert grid(sec)[1:] == [["1", "Hi there", "<b>kept</b>"], ["2", "y" * 3_000, ""]] and not ctx.skipped
+    # the HTML parser is fed at most the capped text; a cut value ends with "…", counted `text` once
+    old = jet.JET_CELL_CHARS
+    jet.JET_CELL_CHARS = 1_000
+    try:
+        with Count(html, "tree") as trees:
+            doc, ctx, _ = convert(data)
+    finally:
+        jet.JET_CELL_CHARS = old
+    assert grid(section(doc, "R"))[2] == ["2", "y" * (1_000 - len("<div>")) + "…", ""] and ctx.skipped == {"text": 1}
+    assert trees.calls == 2 and trees.given <= 1_000 + len(rows[0][1]), (trees.calls, trees.given)
+
+
+def test_hyperlinks():
+    # a hyperlink column (Memo, flag 0x80): display#address#subaddress#tip. http, https, mailto and ftp addresses
+    # are Links (the label the display, or the address); anything else, or an address holding a space, is
+    # "display (address)"
+    vals = ["Site#https://example.com/#", "Doc#file.docx#", "#mailto:a@example.com#", "Space#http://a b#",
+            "Sub#https://e.com/p#top#tip", "Plain", "#ftp://f.example/x#"]
+    cols = [Col("ID", LONG), Col("Link", MEMO, flags=0x80), Col("Text", MEMO)]
+    doc, ctx, md = convert(jet_db(1, [Tbl("H", cols, [[i, v, v] for i, v in enumerate(vals)])]))
+    sec = section(doc, "H")
+    assert cell_inlines(sec, 1, 1) == [Link("https://example.com/", [Text("Site")])]
+    assert grid(sec)[2][1] == "Doc (file.docx)"
+    assert cell_inlines(sec, 3, 1) == [Link("mailto:a@example.com", [Text("mailto:a@example.com")])]
+    assert grid(sec)[4][1] == "Space (http://a b)"
+    assert cell_inlines(sec, 5, 1) == [Link("https://e.com/p#top", [Text("Sub")])]
+    assert grid(sec)[6][1] == "Plain"
+    assert cell_inlines(sec, 7, 1) == [Link("ftp://f.example/x", [Text("ftp://f.example/x")])]
+    assert [r[2] for r in grid(sec)[1:]] == vals  # the same text in a plain memo
+    assert "[Site](https://example.com/)" in md and not ctx.skipped, ctx.skipped
+
+
+def orders_and_customers():
+    orders = Tbl("Orders", [Col("OrderID", LONG, flags=0x05), Col("CustomerID", LONG), Col("OrderDate", DATE),
+                            Col("Total", MONEY, props={"Required": True}),
+                            Col("Notes", MEMO, props={"TextFormat": 1, "Description": "free text"})],
+                 [[1, 7, 45000.0, 10000, "<p>n</p>"]], pk="OrderID")
+    customers = Tbl("Customers", [Col("ID", LONG, flags=0x05), Col("Name", TEXT)], [[7, "Ann"]], pk="ID")
+    rels = [("CustomersOrders", "Orders", "CustomerID", "Customers", "ID"),
+            ("Gone", "Orders", "OrderDate", "Nowhere", "X")]  # a table the catalog does not hold: left out
+    return [orders, customers], rels
+
+
+def test_schema_line():
+    # the spec's example: type, PK, autonumber, the relationship's target, required, rich text
+    tables, rels = orders_and_customers()
+    for v in (0, 1, 3):
+        doc, ctx, md = convert(jet_db(v, tables, relationships=rels))
+        assert columns_line(section(doc, "Orders")) == (
+            "Columns: OrderID (Long, PK, autonumber) · CustomerID (Long → Customers.ID) · OrderDate (Date) · "
+            "Total (Currency, required) · Notes (Memo, rich text)"), v
+        assert columns_line(section(doc, "Customers")) == "Columns: ID (Long, PK, autonumber) · Name (Text)"
+        assert grid(section(doc, "Orders"))[1] == ["1", "7", "2023-03-15", "1", "n"]
+        assert not ctx.skipped and "MSysRelationships" not in md and "Columns: OrderID" in md, ctx.skipped
+
+
+def test_hidden_columns():
+    # a replication column (s_), a Gen_ column and a column flagged 0x10: Hidden inlines in the schema line (each
+    # holding its separator, so the visible line reads right) and hidden columns of the grid
+    guid = "01234567-89ab-cdef-0123-456789abcdef"
+    cols = [Col("ID", LONG), Col("s_GUID", GUID), Col("Secret", TEXT, flags=0x10), Col("Name", TEXT),
+            Col("Gen_Notes", MEMO)]
+    data = jet_db(1, [Tbl("H", cols, [[1, guid, "classified", "Ann", "gen"]])])
+    doc, ctx, md = convert(data)
+    sec = section(doc, "H")
+    line = next(b for b in sec.blocks if isinstance(b, Para))
+    assert columns_line(sec) == "Columns: ID (Long) · Name (Text)"
+    hidden = ["".join(t.text for t in x.inlines) for x in line.inlines if isinstance(x, Hidden)]
+    assert hidden == [" · s_GUID (GUID)", " · Secret (Text)", " · Gen_Notes (Memo)"], hidden
+    table = next(b for b in sec.blocks if isinstance(b, Table))
+    assert table.hidden_cols == frozenset({1, 2, 4}) and grid(sec)[1][2] == "classified"
+    assert "Columns: ID (Long) · Name (Text)\n" in md and "classified" not in md and "Secret" not in md, md
+    assert "s_GUID" not in md and "gen" not in md and not ctx.skipped
+    _, _, shown = convert(data, hidden=True)
+    assert "classified" in shown and "s_GUID (GUID)" in shown and "Gen_Notes" in shown
+    # a hidden first column carries the separator after it
+    doc, _, md = convert(jet_db(1, [Tbl("F", [Col("s_Lineage", BINARY), Col("A", LONG)], [[b"\x01", 5]])]))
+    line = next(b for b in section(doc, "F").blocks if isinstance(b, Para))
+    assert [x.inlines[0].text for x in line.inlines if isinstance(x, Hidden)] == ["s_Lineage (Binary) · "]
+    assert "Columns: A (Long)\n" in md, md
+
+
+def test_pk_order():
+    # rows written 3, 1, 2 (the 1 an overflow row) under the primary key ID are shown 1, 2, 3
+    rows = [[3, "c"], Row("overflow", [1, "a"]), [2, "b"]]
+    for v in (0, 1):
+        doc, ctx, _ = convert(jet_db(v, [Tbl("T", [Col("ID", LONG), Col("Name", TEXT)], rows, pk="ID")]))
+        assert grid(section(doc, "T"))[1:] == [["1", "a"], ["2", "b"], ["3", "c"]] and not ctx.skipped, v
+    # a two-column key: typed (10 after 2), None first, text without case; ties keep their physical order
+    rows = [[2, "b"], [10, "a"], [1, "z"], [1, None], [2, "B"]]
+    doc, ctx, _ = convert(jet_db(1, [Tbl("T", [Col("ID", LONG), Col("Name", TEXT)], rows, pk=["ID", "Name"])]))
+    assert grid(section(doc, "T"))[1:] == [["1", ""], ["1", "z"], ["2", "b"], ["2", "B"], ["10", "a"]]
+    # no primary key: physical order
+    doc, ctx, _ = convert(jet_db(1, [Tbl("T", [Col("ID", LONG)], [[3], [1], [2]])]))
+    assert grid(section(doc, "T"))[1:] == [["3"], ["1"], ["2"]]
+
+
+def test_pk_sort_only_within_caps():
+    tbl = Tbl("T", [Col("ID", LONG), Col("Name", TEXT)], [[3, "c"], [1, "a"], [2, "b"]], pk="ID")
+    data = jet_db(1, [tbl])
+    old = limits.SHEET_ROWS, limits.SHEET_CELLS
+    try:
+        limits.SHEET_ROWS = 4  # the header and three rows fit: sorted
+        doc, ctx, _ = convert(data)
+        assert [r[0] for r in grid(section(doc, "T"))[1:]] == ["1", "2", "3"] and not ctx.skipped
+        limits.SHEET_ROWS = 3  # they do not: physical order, cut at the rows
+        doc, ctx, _ = convert(data)
+        assert grid(section(doc, "T"))[1:] == [["3", "c"], ["1", "a"]] and ctx.skipped == {"sheet_cut": 1}
+        limits.SHEET_ROWS = old[0]
+        limits.SHEET_CELLS = 7  # the rows' six cells do not fit the five the header leaves: physical order
+        doc, ctx, _ = convert(data)
+        assert [r[0] for r in grid(section(doc, "T"))[1:]] == ["3", "1", "2"] and ctx.skipped == {"sheet_cut": 1}
+    finally:
+        limits.SHEET_ROWS, limits.SHEET_CELLS = old
+    # a sort the meter cannot afford leaves the rows in physical order (no count; the table is read whole)
+    orig = jet_pages.Meter.afford
+    jet_pages.Meter.afford = lambda self, n: False
+    try:
+        doc, ctx, _ = convert(data)
+    finally:
+        jet_pages.Meter.afford = orig
+    assert [r[0] for r in grid(section(doc, "T"))[1:]] == ["3", "1", "2"] and not ctx.skipped
+
+
+def test_budget_shared_across_tables():
+    # one sheet_grid.Budget for the document: table A uses SHEET_CELLS up, so table B is cut at its first cell;
+    # sheet_cut counts once per cut table, and both headings stay
+    a = Tbl("A", [Col("ID", LONG), Col("N", TEXT)], [[i, f"a{i}"] for i in (2, 0, 1)], pk="ID")
+    b = Tbl("B", [Col("ID", LONG), Col("N", TEXT)], [[i, f"b{i}"] for i in range(3)])
+    old = limits.SHEET_CELLS
+    try:
+        limits.SHEET_CELLS = 8  # A's header and three rows, exactly
+        doc, ctx, md = convert(jet_db(1, [a, b]))
+        assert grid(section(doc, "A"))[1:] == [["0", "a0"], ["1", "a1"], ["2", "a2"]]
+        assert ctx.skipped == {"sheet_cut": 1} and not any(isinstance(x, Table) for x in section(doc, "B").blocks)
+        assert "## Table: A (3 rows)" in md and "## Table: B (3 rows)" in md
+        limits.SHEET_CELLS = 6  # both cut, one count each
+        doc, ctx, md = convert(jet_db(1, [a, b]))
+        assert ctx.skipped == {"sheet_cut": 2} and len(ctx.warnings) == 2, (ctx.skipped, ctx.warnings)
+        assert "## Table: A (3 rows)" in md and "## Table: B (3 rows)" in md
+    finally:
+        limits.SHEET_CELLS = old
+
+
+def test_props_caps():
+    tbl = Tbl("F", [Col("ID", LONG), Col("P", DOUBLE, props={"Format": "Percent"})], [[1, 0.25]])
+    for v, head in ((0, b"KKD\x00"), (1, b"MR2\x00")):
+        data = jet_db(v, [tbl])
+        with Count(jet, "_props") as parsed:
+            doc, ctx, _ = convert(data)
+        assert grid(section(doc, "F"))[1] == ["1", "25%"] and not ctx.skipped and parsed.calls == 1, v
+        old = jet.JET_PROP_CHUNKS, jet.JET_PROPS
+        try:
+            jet.JET_PROP_CHUNKS = 2  # the name list and the column's map
+            assert grid(section(convert(data)[0], "F"))[1] == ["1", "25%"]
+            jet.JET_PROP_CHUNKS = 1  # past it: the properties are ignored, counted `record`
+            doc, ctx, _ = convert(data)
+            assert grid(section(doc, "F"))[1] == ["1", "0.25"] and ctx.skipped == {"record": 1}, ctx.skipped
+            jet.JET_PROP_CHUNKS = old[0]
+            jet.JET_PROPS = 20  # a blob longer than JET_PROPS is not read
+            with Count(jet, "_props") as parsed:
+                doc, ctx, _ = convert(data)
+            assert grid(section(doc, "F"))[1] == ["1", "0.25"] and ctx.skipped == {"record": 1}
+            assert parsed.calls == 0
+        finally:
+            jet.JET_PROP_CHUNKS, jet.JET_PROPS = old
+        # a blob that is not a property blob: ignored, counted `record`
+        assert data.count(head) == 1
+        doc, ctx, _ = convert(data.replace(head, b"XYZ\x00"))
+        assert grid(section(doc, "F"))[1] == ["1", "0.25"] and ctx.skipped == {"record": 1}, ctx.skipped
+
+
+def prop_blob(names, values, chunks):
+    """A crafted Jet4 property blob: a name list of `names` empty names, a column map whose `values` entries each
+    name name 0 with no data, then `chunks` empty index maps (type 2)."""
+    def chunk(kind, body):
+        return struct.pack("<IH", 6 + len(body), kind) + body
+    name = struct.pack("<H", 2) + "c".encode("utf-16-le")
+    out = b"MR2\x00" + chunk(0x80, struct.pack("<H", 0) * names)
+    out += chunk(1, struct.pack("<I", 4 + len(name)) + name + struct.pack("<HBBHH", 8, 0, TEXT, 0, 0) * values)
+    return out + chunk(2, b"") * chunks
+
+
+def test_props_charged():
+    # each chunk, name and value of a blob is charged before it is read: the loops stay within the charge
+    db = jet._Db(jet_pages.open(jet_db(1)), Context())
+    blob = prop_blob(3_000, 3_000, 3_000)
+    before = db.meter.charged
+    with Loops() as loops:
+        out = jet._props(db, blob)
+    spent = db.meter.charged - before
+    assert out == {"c": {}}, out
+    assert loops.n <= 2 * spent + 16 and spent >= jet._PROP * (3_000 + 3_000 + 3_002), (loops.n, spent)
+    # a name's bytes are charged before they are decoded: 1,000 names of 100 characters (200 bytes each)
+    name = "n" * 100
+    names = b"".join(struct.pack("<H", 200) + name.encode("utf-16-le") for _ in range(1_000))
+    blob = b"MR2\x00" + struct.pack("<IH", 6 + len(names), 0x80) + names
+    before = db.meter.charged
+    assert jet._props(db, blob) == {}
+    assert db.meter.charged - before >= jet._PROP * 1_000 + 200 * 1_000, db.meter.charged - before
+    # a table's blob is read once, its LVAL rows charged as a long value's
+    data = jet_db(1, [Tbl("F", [Col("A", DOUBLE, props={"Format": "Percent", "Description": "d" * 3_000})], [[1.0]])])
+    assert lval_pages(data)
+    ctx, w = metered(data)
+    assert grid(section(w.out, "F"))[1] == ["100%"] and not ctx.skipped
+    w.bounded(len(data))
+
+
+def test_relationships_charged():
+    # 2,000 MSysRelationships rows naming one column: each row is charged (a row, its cells, its text) before it is
+    # read, and the target is kept once
+    data = jet_db(1, [Tbl("A", [Col("ID", LONG)], [[1]])],
+                  relationships=[(f"r{i}", "A", "ID", "A", "ID") for i in range(2_000)])
+    db = jet._Db(jet_pages.open(data), Context())
+    objs = jet._catalog(db)
+    before = db.meter.charged
+    with Loops() as loops:
+        rels = jet._relationships(db, objs)
+    spent = db.meter.charged - before
+    assert rels == {("a", "id"): {"A.ID": None}}, rels
+    assert loops.n <= 2 * spent + 16 and spent >= 2_000 * (jet._ROW + 4 * jet._CELL), (loops.n, spent)
+    doc, ctx, _ = convert(data)
+    assert columns_line(section(doc, "A")) == "Columns: ID (Long → A.ID)" and not ctx.skipped
+    # no room left for kept values: no target is kept, counted `record` once
+    db = jet._Db(jet_pages.open(data), Context())
+    objs = jet._catalog(db)
+    db.room = 0
+    assert jet._relationships(db, objs) == {} and db.ctx.skipped == {"record": 1}, db.ctx.skipped
+    # the meter spent inside them: the rest is ignored, counted `record` once, and no table is read
+    old = limits.JET_WORK_TOTAL
+    limits.JET_WORK_TOTAL = catalog_spend(data, rels=False) + 5_000
+    try:
+        doc, ctx, _ = convert(data)
+    finally:
+        limits.JET_WORK_TOTAL = old
+    assert ctx.skipped == {"record": 1, "db_table": 1}, ctx.skipped
+
+
+def test_schema_targets_charged():
+    # one column naming 300 tables: each target in the schema line is charged before it is written
+    tables = [Tbl("A", [Col("ID", LONG)], [[1]])] + [Tbl(f"T{i}", [Col("ID", LONG)], []) for i in range(300)]
+    data = jet_db(1, tables, relationships=[(f"r{i}", "A", "ID", f"T{i}", "ID") for i in range(300)])
+    db = jet._Db(jet_pages.open(data), Context())
+    objs = jet._catalog(db)
+    rels = jet._relationships(db, objs)
+    tdef = jet._tdef(db, tdef_page(data, "A"))
+    before = db.meter.charged
+    with Loops() as loops:
+        line = jet._schema(db, tdef, "A", rels)
+    spent = db.meter.charged - before
+    assert "".join(x.text for x in line).count(" → T") == 300
+    assert loops.n <= 2 * spent + 16 and spent >= 300 * jet._REF, (loops.n, spent)
+
+
+def test_text_forms_charged():
+    # rich text is charged _HTML a character fed to the parser, a hyperlink _LINK a character it splits, the key of
+    # a sorted row _KEY a key column, and the sort _SORT a comparison (n times the bits of n), each before its work
+    cols = [Col("ID", LONG), Col("R", MEMO, props={"TextFormat": 1}), Col("U", MEMO, flags=0x80)]
+    data = jet_db(1, [Tbl("X", cols, [[1, "<b>bold</b>", "a#http://b/#"]])])
+    db = jet._Db(jet_pages.open(data), Context())
+    objs = jet._catalog(db)
+    tdef = jet._tdef(db, tdef_page(data, "X"))
+    jet._apply_props(db, tdef, db.props_of(next(o for o in objs if o.name == "X")))
+    (_, cells), = list(jet._rows(db, tdef))
+    for i, text, want, extra in ((1, "<b>bold</b>", "bold", jet._HTML), (2, "a#http://b/#", None, jet._LINK)):
+        before = db.spent
+        got = jet.value(db, tdef.columns[i], cells[i])
+        assert db.spent - before == 2 + len(text) + extra * len(text), (i, db.spent - before)
+        assert got == want or got == [Link("http://b/", [Text("a")])], got
+    # the sort: the same 300 rows with and without a primary key differ by the key's index blocks, each row's key
+    # and the comparisons
+    rows = [[(7 * i) % 300] for i in range(300)]
+    plain = metered(jet_db(1, [Tbl("S", [Col("ID", LONG)], rows)]))[1].charged
+    keyed = metered(jet_db(1, [Tbl("S", [Col("ID", LONG)], rows, pk="ID")]))[1].charged
+    assert keyed - plain == 2 * jet._IDX + 300 * jet._KEY + jet._SORT * 300 * (300).bit_length(), keyed - plain
+    # a text key is charged a unit a character as well (its casefold, and its share of the comparisons)
+    rows = [[f"k{(7 * i) % 300}"] for i in range(300)]
+    plain = metered(jet_db(1, [Tbl("S", [Col("K", TEXT)], rows)]))[1].charged
+    keyed = metered(jet_db(1, [Tbl("S", [Col("K", TEXT)], rows, pk="K")]))[1].charged
+    chars = sum(len(r[0]) for r in rows)
+    assert keyed - plain == 2 * jet._IDX + 300 * jet._KEY + chars + jet._SORT * 300 * (300).bit_length(), keyed - plain
 
 
 def main():

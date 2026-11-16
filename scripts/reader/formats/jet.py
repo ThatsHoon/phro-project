@@ -1,15 +1,16 @@
 """Access databases (mdb, accdb): the catalog and the user tables, as one summary line and a section per table.
 
 Ported from Jackcess 5.0.4 (Apache-2.0; the Maven Central sources jar), `com/healthmarketscience/jackcess/impl/`:
-`DatabaseImpl.java` (`getDatabasePassword` and `getPasswordMask`, the catalog's columns, object types and flags),
-`TableImpl.java` (the TDEF and its continuation pages, `readColumnDefinitions`, `readIndexDefinitions`, the row
-offset table and its deleted and overflow bits, `positionAtRowData`, `getRowColumnData`,
-`readJumpTableVarColOffsets`), `ColumnImpl.java` (the column block and `read`: currency, dates, extended dates,
-numerics and GUIDs), `NumericColumnImpl.java` (precision and scale), `IndexData.java` and `IndexImpl.java` (the real
-and logical index blocks, the primary key), `LongValueColumnImpl.java` (`readLongValue`: inline, one-row and chained
-long values), `UsageMap.java` (the map row a TDEF points at), `NullMask.java` and `JetFormat.java` (the offsets of
-each version). mdbtools' `HACKING.md` (LGPL) was read as format knowledge only (the ACE encryption structure whose
-length is at 0x299); no code is taken from it. The page layer is `jet_pages`.
+`DatabaseImpl.java` (`getDatabasePassword` and `getPasswordMask`, the catalog's columns, object types and flags,
+`collectRelationships`), `TableImpl.java` (the TDEF and its continuation pages, `readColumnDefinitions`,
+`readIndexDefinitions`, the row offset table and its deleted and overflow bits, `positionAtRowData`,
+`getRowColumnData`, `readJumpTableVarColOffsets`), `ColumnImpl.java` (the column block, its autonumber, hidden and
+hyperlink flags, and `read`: currency, dates, extended dates, numerics and GUIDs), `MemoColumnImpl.java` (a hyperlink
+is a Memo), `NumericColumnImpl.java` (precision and scale), `IndexData.java` and `IndexImpl.java` (the real and
+logical index blocks, the primary key), `LongValueColumnImpl.java` (`readLongValue`: inline, one-row and chained long
+values), `PropertyMaps.java` (the LvProp blob), `UsageMap.java` (the map row a TDEF points at), `NullMask.java` and
+`JetFormat.java` (the offsets of each version). mdbtools' `HACKING.md` (LGPL) was read as format knowledge only (the
+ACE encryption structure whose length is at 0x299); no code is taken from it. The page layer is `jet_pages`.
 
 Encryption. A password at 0x42 (20 bytes in Jet3; 40 in Jet4 and ACE, XOR the int part of the creation date at 0x72,
 as `getPasswordMask` reads it) is `encrypted`, "database password set", although the pages are not encrypted. ACE with
@@ -18,43 +19,76 @@ a db_key or an encryption structure is `encrypted`, "ACE encryption". A Jet3 or 
 Catalog. MSysObjects (the TDEF at page 2) gives `Obj` rows, at most `JET_CATALOG` (the rest counted `record`).
 Objects flagged 0x80000000 or 0x2 are system objects, never shown or counted; 0x08 marks a hidden table. Text cells,
 the catalog's included, go through `Jet.text` with the column's compressed-unicode flag (ext 0x01); a column name
-is read once with its TDEF.
+is read once with its TDEF. A user table's LvProp definition (12 bytes, or the inline value) is kept with its row,
+room allowing (past it the table is shown without properties, counted `record`).
+
+Properties. A table's LvProp blob (`KKD\\0` or `MR2\\0`, then chunks: the property names, the table's own map, a map
+per column, index maps skipped) is read when the table is, once (`_props`), at most `JET_PROPS` bytes and
+`JET_PROP_CHUNKS` chunks; past either, or malformed, the properties are ignored and counted `record`. Of a column's
+properties, Format (only Percent and Yes/No are applied, to numbers: Percent is the shown digits x 100 with "%", Yes/No
+"No" for 0, else "Yes"), TextFormat (1 is rich text: the text of its HTML, `html.text_of(html.tree(...))`, fed at most
+`JET_CELL_CHARS` characters) and Required are used.
+
+Relationships. MSysRelationships is read once, before any table: each row gives a foreign key (szObject, szColumn)
+and what it names (szReferencedObject, szReferencedColumn); a row naming a table the catalog does not hold is left
+out. The schema line shows the target after the column's type, "CustomerID (Long → Customers.ID)".
+
+Schema line. "Columns: " then each column as "name (type[ → targets][, PK][, autonumber][, required][, rich
+text])". A hidden column (flag 0x10, or a name starting `s_` or `Gen_`, Access's replication and generated columns)
+is a Hidden inline that holds its separator, and its grid column is hidden.
+
+Values. A Memo flagged 0x80 is a hyperlink, `display#address#subaddress#tip`: a Link when the address is http, https,
+mailto or ftp and holds no space or control character, else "display (address)".
+
+Key order. A table with a primary key shows its rows in key order: rows are held while they fit what the grid has
+left (SHEET_ROWS - 1 rows, the cells and characters the shared budget still holds), then sorted by their typed key
+(null first, numbers by value, text without case; equal keys keep their page order) when the meter affords the sort.
+Past the grid, or past the meter, the rows are shown in page order: a sort never changes which rows are shown.
 
 Rows. Each data page the table's usage map owns is read: a row flagged 0x8000 is deleted (skipped, not counted), one
 flagged 0x4000 is a pointer followed once, to a row that must not be a pointer again; a table reads the row a
 pointer names once and keeps only the values it showed (no bytes of it), so many pointers naming one row cost a
-lookup each. Fixed columns are read at their
-`offset_F`, variable ones through their `offset_V` slot (Jet4's two-byte offset table, Jet3's one-byte offsets and
-jump table), so rows written before a column was deleted read right. A Yes/No value is its null-mask bit. Every
-offset and length is clipped to the row; a row or cell that cannot be read is counted `record`. A row visits only the
-columns whose null-mask bits are set, and of those at most the row's own column count (column numbers may repeat,
-so one bit can name many columns), each as a view into the row, never a copy. Var slices are clipped but may overlap,
-so many cells can name the same bytes; the work meter (below) bounds that.
+lookup each. Fixed columns are read at their `offset_F`, variable ones through their `offset_V` slot (Jet4's two-byte
+offset table, Jet3's one-byte offsets and jump table), so rows written before a column was deleted read right. A
+Yes/No value is its null-mask bit. Every offset and length is clipped to the row; a row or cell that cannot be read is
+counted `record`. A row visits only the columns whose null-mask bits are set, and of those at most the row's own
+column count (column numbers may repeat, so one bit can name many columns), each as a view into the row, never a
+copy. Var slices are clipped but may overlap, so many cells can name the same bytes; the work meter (below) bounds
+that.
 
 Work meter. One meter per file (`jet_pages.Meter`, `limits.JET_WORK_TOTAL` or ten units a byte of the file and 1 MiB
 if less, a unit about 0.2 microseconds) is the invariant: every loop whose trip count comes from the file's bytes
-ticks it before its work. Here: each page a usage map names (`_PAGE`), each row slot of a data page (`_SLOT`) and
-each live row (`_ROW`), each null-mask byte a row looks at (`_GROUP`), each column a set bit names (`_CELL`), each
-Jet3 variable offset, each column definition (`_COLDEF`) and its name's bytes, each index block (`_IDX`), each TDEF
-page, each text byte decoded, each LVAL row (its bytes and `_ROW_COST`); in `jet_pages` each RC4 page, chain item
-and usage map byte. The prices are measured, each at least what its path costs. Only a cell that becomes a non-empty
-grid cell has its `_CELL` given back, since `SHEET_CELLS` bounds those from there. A real file is charged a few units
-a byte of itself. Past the total: the table being read stops with one `sheet_cut` (the grid's own cut); a table not
-yet started is not read at all (not its TDEF, not its usage map) and counts `db_table`; in the catalog the rest
-counts `record` once.
+ticks it before its work, except two whose trips are grid cells, which `SHEET_CELLS` bounds: the Yes/No defaults a
+row adds ("No" for each Yes/No column past its count) and `value()` on a cell that is shown (its `_CELL` given back).
+Here: each page a usage map names (`_PAGE`), each row slot of a data page (`_SLOT`) and each live row (`_ROW`), each
+null-mask byte a row looks at (`_GROUP`), each column a set bit names (`_CELL`), each Jet3 variable offset, each column
+definition (`_COLDEF`) and its name's bytes, each index block (`_IDX`), each TDEF page, each text byte decoded, each
+LVAL row (its bytes and `_ROW_COST`), each property chunk, name and value (`_PROP`), each character of rich text fed
+to the HTML parser (`_HTML`) and of a hyperlink (`_LINK`), each key column of a held row (`_KEY`, and a unit a
+character of a text key), the sort (`_SORT` times n times the bits of n, through `Meter.afford`: past what is left
+the rows stay in page order) and each relationship target written (`_REF`); MSysRelationships' rows as any table's.
+In `jet_pages` each RC4 page, chain item and usage map byte. The prices are measured, each at least what its path
+costs. A real file is charged a few units a byte of itself. Past the total: the table being read stops with one
+`sheet_cut` (the grid's own cut, the rows held so far shown in page order); a table not yet started is not read at all
+(not its TDEF, not its usage map) and counts `db_table`; in the catalog, and in MSysRelationships, the rest counts
+`record` once.
 
-Kept values. A long value read whole and an overflow target's shown values are kept for repeats, but only while
-their estimated size fits a room of the file's bytes (one room for both); a target that shows nothing is not kept.
-Past the room a repeat is read again, charged like the first read. So what is kept stays within about the file's
-size, the page cache within the decoded pages of the file.
+Kept values. A long value read whole, an overflow target's shown values (and its sort key), a table's LvProp
+definition and properties, and the relationships' targets are kept, but only while their estimated size fits a room
+of the file's bytes (one room for all); a target that shows nothing is not kept. Past the room a repeat is read
+again, charged like the first read (a definition or target past it is dropped, counted `record`). So what is kept
+stays within about the file's size, the page cache within the decoded pages of the file, and the rows held for the
+sort within the grid's caps.
 
 Long values. A MEMO is inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00). An LVAL value read whole is
 decoded once and kept by its definition (room allowing), so a repeat costs its charge but no read; definitions that
-differ but share a chain's tail are each charged, so the meter bounds them too.
+differ but share a chain's tail are each charged, so the meter bounds them too. A chain that ends early (a cycle, an
+empty row, the pages cap) shows what was read, counted `record` once.
 
 Caps. `JET_COLS` columns per TDEF (past it a user table counts `db_table`, the catalog is `damaged`), `JET_NAME`
 characters per name and `JET_CELL_CHARS` per cell (cut, counted `text`), `JET_LVAL_BYTES` read per long value,
-the work meter per file. Every cap is read at call time, so a test can lower it.
+`JET_PROPS` bytes and `JET_PROP_CHUNKS` chunks per property blob, the work meter per file. Every cap is read at call
+time, so a test can lower it.
 """
 import collections
 import copy
@@ -65,12 +99,13 @@ import struct
 import sys
 import uuid
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, localcontext
+from operator import itemgetter
 from pathlib import Path
 
-from .. import limits
+from .. import html, limits
 from ..limits import ReadError
-from ..model import Doc, Para, Section, Text
+from ..model import Doc, Hidden, Link, Para, Section, Text
 from . import jet_pages, sheet_grid
 
 JET_CATALOG = 100_000
@@ -78,6 +113,8 @@ JET_NAME = 64
 JET_COLS = 1_024
 JET_CELL_CHARS = 32_768
 JET_LVAL_BYTES = 2 ** 20
+JET_PROPS = 2 ** 20
+JET_PROP_CHUNKS = 10_000
 
 BOOL, BYTE, INT, LONG, MONEY, FLOAT, DOUBLE, DATE, BINARY, TEXT, OLE, MEMO = range(1, 13)
 GUID, NUMERIC, BIGBIN, COMPLEX, BIGINT, EXTDATE = 15, 16, 17, 18, 19, 20
@@ -110,9 +147,23 @@ _GROUP = 4     # a null-mask byte a row looks at, its eight bits
 _PAGE = 8      # a page a usage map names (or a TDEF page): its read and type check
 _COLDEF = 32   # a column definition: its block, and its share of the schema line, header, groups and lookups
 _IDX = 16      # a real or logical index block
+_PROP = 4      # a property blob's chunk, name or value (a list of empty names, about 2.6)
+_HTML = 8      # a character of rich text fed to the HTML parser (repeated <p>, about 5.2)
+_LINK = 1      # a character of a hyperlink split and checked (about 0.25)
+_KEY = 8       # a key column of a row kept for the primary-key sort (a one-column Long key, about 4.6)
+_SORT = 4      # a step of that sort, n times the bits of n (ten Decimal columns, the last differing: about 2.2)
+_REF = 8       # a relationship target written in the schema line (two names of up to JET_NAME, about 3.2)
 _KEEP = 256    # the room a kept value takes beside its text (key, tuples, a dict slot)
 _Spent = jet_pages.Spent
 _PK = 1  # IndexImpl.PRIMARY_KEY_INDEX_TYPE
+_AUTONUMBER = 0x04 | 0x40  # ColumnImpl.AUTO_NUMBER_FLAG_MASK, AUTO_NUMBER_GUID_FLAG_MASK
+_HIDDEN_COLUMN = 0x10      # ColumnImpl.HIDDEN_FLAG_MASK: a column Access maintains and hides (replication too)
+_HYPERLINK = 0x80          # ColumnImpl.HYPERLINK_FLAG_MASK, on a Memo
+_PROP_HEADS = (b"KKD\x00", b"MR2\x00")  # JetFormat.PROPERTY_MAP_TYPES: Jet3, then Jet4 and ACE
+_PROP_NAMES, _PROP_DEFAULT, _PROP_COLUMN, _PROP_INDEX = 0x80, 0x00, 0x01, 0x02  # PropertyMaps' chunk types
+_WANTED = frozenset(("format", "description", "textformat", "expression", "required"))
+LINK_SCHEMES = frozenset(("http", "https", "mailto", "ftp"))
+_NUMBERS = frozenset((BYTE, INT, LONG, BIGINT, MONEY, FLOAT, DOUBLE, NUMERIC))
 _ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md; every real file read has 0)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 _BAD = (ValueError, IndexError, struct.error, ArithmeticError)  # a row, cell or TDEF that cannot be read
@@ -149,12 +200,15 @@ class Obj:
     parent: int | None = None
     connect: str = ""
     foreign_name: str = ""
+    lvprop: bytes = b""  # a user table's LvProp definition (12 bytes, or the inline value), room allowing
 
 
 @dataclass
 class Column:
     """One column block of a TDEF: `num` is the column number (the null-mask bit), `var` the variable offset slot
-    (`offset_V`), `fixed_off` the fixed data offset (`offset_F`); flags 0x01 fixed; ext 0x01 compressed unicode."""
+    (`offset_V`), `fixed_off` the fixed data offset (`offset_F`); flags 0x01 fixed, 0x04 and 0x40 autonumber, 0x10
+    hidden, 0x80 hyperlink; ext 0x01 compressed unicode. `fmt` (the Format property, lower case), `rich` (TextFormat
+    1) and `required` come from the table's properties."""
     name: str
     type: int
     num: int
@@ -165,6 +219,14 @@ class Column:
     ext: int = 0
     precision: int = 0
     scale: int = 0
+    fmt: str = ""
+    rich: bool = False
+    required: bool = False
+
+    @property
+    def hidden(self) -> bool:
+        """A column Access hides: flagged 0x10, or a replication column (`s_GUID`, `s_Lineage`, ...) or a `Gen_` one."""
+        return bool(self.flags & _HIDDEN_COLUMN) or self.name.startswith(("s_", "Gen_"))
 
 
 @dataclass
@@ -219,7 +281,10 @@ class _Db:
         self.meter = jet.meter
         self.charge = jet.meter.tick
         self.lval_cache = {}  # (definition, compressed) -> (text, bytes read, charge) of a long value read whole
-        self.room = jet.pages * jet.page_size  # bytes the kept values (long values, overflow targets) may take
+        self.props_cache = {}  # object id -> its properties (`_props`), room allowing
+        # bytes the kept values (long values, overflow targets, LvProp definitions and properties, relationship
+        # targets) may take
+        self.room = jet.pages * jet.page_size
 
     @property
     def spent(self) -> int:
@@ -302,13 +367,23 @@ class _Db:
             self.ctx.skipped["text"] += 1
         return s
 
-    def cut(self, s: str, more: bool = False) -> str:
+    def cut(self, s: str, more: bool = False, rich: bool = False) -> str:
         """A cell's text, at most JET_CELL_CHARS characters; a cut (or a long value read in part) ends with "…" and is
-        counted `text` once."""
-        if len(s) > JET_CELL_CHARS or more:
+        counted `text` once. Rich text is the text of its HTML (`rich_text`), the cut decided on the stored text."""
+        over = len(s) > JET_CELL_CHARS or more
+        if rich:
+            s = self.rich_text(s)
+        if over:
             self.ctx.skipped["text"] += 1
             return s[:JET_CELL_CHARS] + "…"
         return s
+
+    def rich_text(self, s: str) -> str:
+        """The text of a rich text value's HTML (`html.text_of(html.tree(...))`), fed at most JET_CELL_CHARS
+        characters, each charged `_HTML` first."""
+        s = s[:JET_CELL_CHARS]
+        self.charge(_HTML * len(s))
+        return html.text_of(html.tree(s.encode("utf-8")))
 
     def decode(self, raw, compressed: bool) -> str:
         """A cell's text bytes decoded, charged their length first."""
@@ -317,11 +392,11 @@ class _Db:
 
     # -- long values
 
-    def memo(self, raw: bytes, compressed: bool) -> str:
+    def memo(self, raw: bytes, compressed: bool, rich: bool = False) -> str:
         """A MEMO cell's text: inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00), read up to JET_LVAL_BYTES
         and no further than JET_CELL_CHARS characters can take, each charged against the file's work total. A value
         shorter than its length is counted `record` (and only that, however long its text); a cut at a cap ends with
-        "…", counted `text`."""
+        "…", counted `text`. With `rich`, the text of its HTML."""
         if len(raw) < 12:
             raise ValueError("long value definition shorter than 12 bytes")
         head = _u32(raw, 0)
@@ -330,7 +405,7 @@ class _Db:
         want = min(length, JET_LVAL_BYTES, 4 * JET_CELL_CHARS + 4)
         if kind == 2:
             data = raw[12:12 + want]
-            return self._whole(self.decode(data, compressed), len(data), want, length)
+            return self._whole(self.decode(data, compressed), len(data), want, length, rich)
         if kind == 3:
             raise ValueError("long value type 0xC0")
         key = (bytes(raw[:12]), compressed)
@@ -338,19 +413,64 @@ class _Db:
         if hit is not None:
             s, n, charge = hit
             self.charge(charge)
-            return self._whole(s, n, want, length)
+            return self._whole(s, n, want, length, rich)
         before = self.spent
         data = self._lval((int.from_bytes(raw[5:8], "little"), raw[4]), want, kind == 1)
         s = self.jet.text(data, compressed)
         if self.keep(sys.getsizeof(s) + len(key[0])):
             self.lval_cache[key] = (s, len(data), self.spent - before)
-        return self._whole(s, len(data), want, length)
+        return self._whole(s, len(data), want, length, rich)
 
-    def _whole(self, s: str, n: int, want: int, length: int) -> str:
+    def _whole(self, s: str, n: int, want: int, length: int, rich: bool) -> str:
         if n < want:  # counted once, `record`: a cut of its text is not counted again
             self.ctx.skipped["record"] += 1
-            return s if len(s) <= JET_CELL_CHARS else s[:JET_CELL_CHARS] + "…"
-        return self.cut(s, length > want)
+            over = len(s) > JET_CELL_CHARS
+            if rich:
+                s = self.rich_text(s)
+            return s[:JET_CELL_CHARS] + "…" if over else s
+        return self.cut(s, length > want, rich)
+
+    def long_bytes(self, raw, cap: int):
+        """The bytes of a long value (an LvProp blob) read whole, or None when its length is past `cap` (nothing is
+        read). ValueError when its rows hold less than its length."""
+        if len(raw) < 12:
+            raise ValueError("long value definition shorter than 12 bytes")
+        head = _u32(raw, 0)
+        length, kind = head & 0x3FFFFFFF, head >> 30
+        if length > cap:
+            return None
+        if kind == 3:
+            raise ValueError("long value type 0xC0")
+        if kind == 2:
+            data = bytes(raw[12:12 + length])
+        else:
+            data = self._lval((int.from_bytes(raw[5:8], "little"), raw[4]), length, kind == 1)
+        if len(data) < length:
+            raise ValueError("long value shorter than its length")
+        return data
+
+    def props_of(self, obj: "Obj") -> dict:
+        """The properties of a table (`_props` of its LvProp blob), read once per object and kept while the room
+        lasts. A blob past JET_PROPS bytes or JET_PROP_CHUNKS chunks, or one that cannot be read, is ignored and
+        counted `record`."""
+        hit = self.props_cache.get(obj.id)
+        if hit is not None:
+            return hit
+        out = {}
+        if obj.lvprop:
+            try:
+                blob = self.long_bytes(obj.lvprop, JET_PROPS)
+                if blob is None:
+                    self.ctx.skipped["record"] += 1
+                else:
+                    out = _props(self, blob)
+            except _BAD:
+                self.ctx.skipped["record"] += 1
+                out = {}
+        size = sum(64 + sum(64 + sys.getsizeof(v) for v in p.values()) for p in out.values())
+        if self.keep(size):
+            self.props_cache[obj.id] = out
+        return out
 
     def _lval(self, start, want: int, single: bool):
         """The bytes of one LVAL row or chain, each row charged as it is read. A chain row starts with the (row,
@@ -466,6 +586,176 @@ def _tdef(db: _Db, page: int) -> Tdef:
     for i, c in enumerate(cols):
         groups.setdefault(c.num >> 3, [[] for _ in range(8)])[c.num & 7].append((i, c))
     return Tdef(page, pages, row_count, cols, real, logical, pk, owned, sorted(groups.items()))
+
+
+# -- properties
+
+def _props(db: _Db, blob: bytes) -> dict:
+    """An LvProp blob (`PropertyMaps.Handler.read`): `KKD\\0` (Jet3) or `MR2\\0`, then chunks of a u32 length and a
+    u16 type: 0x80 the property names (each a u16 length and its bytes), 0x00 the object's own map, 0x01 a column's
+    map, 0x02 an index's (skipped). A map is a u32 name block (a name when longer than 6), then values: u16 length,
+    flags, data type, u16 name index, u16 data size and the data. Returns {map name, lower case ("" for the object's
+    own): {property, lower case: value}} for Format, Description, TextFormat, Expression and Required. Each chunk,
+    name and value is charged `_PROP` and each text byte decoded 1 before it is read. A malformed blob, or one past
+    JET_PROP_CHUNKS chunks, raises ValueError."""
+    if bytes(blob[:4]) not in _PROP_HEADS:
+        raise ValueError("not a property blob")
+    end, pos, chunks, names, out = len(blob), 4, 0, None, {}
+    while pos < end:
+        chunks += 1
+        if chunks > JET_PROP_CHUNKS:
+            raise ValueError("past JET_PROP_CHUNKS")
+        db.charge(_PROP)
+        size, kind = struct.unpack_from("<IH", blob, pos)
+        stop = pos + size
+        if size < 6 or stop > end:
+            raise ValueError(f"property chunk of {size} bytes at {pos}")
+        if kind == _PROP_NAMES:
+            names = _prop_names(db, blob, pos + 6, stop)
+        elif kind in (_PROP_DEFAULT, _PROP_COLUMN):
+            name, values = _prop_values(db, blob, pos + 6, stop, names)
+            out.setdefault("" if kind == _PROP_DEFAULT else name.lower(), {}).update(values)
+        elif kind != _PROP_INDEX:
+            raise ValueError(f"property chunk type {kind:#x}")
+        pos = stop
+    return out
+
+
+def _prop_name(db: _Db, blob: bytes, pos: int, stop: int):
+    """(name, the position after it): a u16 length and its bytes, uncompressed text."""
+    if pos + 2 > stop:
+        raise ValueError("property name length past its chunk")
+    n = struct.unpack_from("<h", blob, pos)[0]
+    pos += 2
+    if n < 0 or pos + n > stop:
+        raise ValueError(f"property name of {n} bytes")
+    db.charge(n)
+    return db.jet.text(blob[pos:pos + n], False), pos + n
+
+
+def _prop_names(db: _Db, blob: bytes, pos: int, stop: int) -> list:
+    names = []
+    while pos < stop:
+        db.charge(_PROP)
+        name, pos = _prop_name(db, blob, pos, stop)
+        names.append(name.lower())
+    return names
+
+
+def _prop_values(db: _Db, blob: bytes, pos: int, stop: int, names):
+    """(map name, {property: value}) of one map chunk; only the wanted properties are decoded."""
+    name = ""
+    if pos < stop:
+        if pos + 4 > stop:
+            raise ValueError("map name block past its chunk")
+        n = _u32(blob, pos)
+        after = pos + n
+        if n < 4 or after > stop:
+            raise ValueError(f"map name block of {n} bytes")
+        if n > 6:
+            name = db.name(_prop_name(db, blob, pos + 4, after)[0])
+        pos = after
+    values = {}
+    while pos < stop:
+        db.charge(_PROP)
+        if pos + 8 > stop:
+            raise ValueError("property value header past its chunk")
+        size, _, dtype, idx, n = struct.unpack_from("<hBBhh", blob, pos)
+        if size < 8 or pos + size > stop:
+            raise ValueError(f"property value of {size} bytes")
+        if names is None or not 0 <= idx < len(names):
+            raise ValueError(f"property name index {idx}")
+        if n < 0 or pos + 8 + n > stop:
+            raise ValueError(f"property data of {n} bytes")
+        key = names[idx]
+        if key in _WANTED:
+            values[key] = _prop_value(db, dtype, blob[pos + 8:pos + 8 + n])
+        pos += size
+    return name, values
+
+
+def _prop_value(db: _Db, dtype: int, data: bytes):
+    """Text (Text, Memo) through the file's text form, a number (Byte, Integer, Long), Yes/No as a bool; else None."""
+    if dtype in (TEXT, MEMO):
+        db.charge(len(data))
+        return db.jet.text(data, True)
+    if dtype == BOOL:
+        if not data:
+            raise ValueError("an empty Yes/No property")
+        return data[0] != 0
+    if dtype in (BYTE, INT, LONG):
+        size = {BYTE: 1, INT: 2, LONG: 4}[dtype]
+        if len(data) < size:  # too few for its type (PropertyMaps refuses the blob)
+            raise ValueError(f"{len(data)} bytes for a {size}-byte property")
+        return int.from_bytes(data[:size], "little", signed=dtype != BYTE)
+    return None
+
+
+def _apply_props(db: _Db, tdef: Tdef, props: dict):
+    """Format (lower case), TextFormat 1 (rich text, on Text and Memo) and Required onto the table's columns."""
+    for c in tdef.columns:
+        p = props.get(c.name.lower())
+        if not p:
+            continue
+        fmt = p.get("format")
+        c.fmt = fmt.strip().lower() if isinstance(fmt, str) else ""
+        c.rich = p.get("textformat") == 1 and c.type in (TEXT, MEMO)
+        c.required = bool(p.get("required"))
+
+
+# -- relationships
+
+def _relationships(db: _Db, objs: list) -> dict:
+    """{(table, column), lower case: {"Table.Column": None}} from MSysRelationships (Jackcess
+    `DatabaseImpl.collectRelationships`: szObject and szColumn hold the foreign key, szReferencedObject and
+    szReferencedColumn what it names). A row naming a table the catalog does not hold is left out. Its rows and text
+    are charged as any table's; a target is kept once, while the room lasts (past it the rest are counted `record`
+    once). The meter running out, or a table that cannot be read, ends it: counted `record` once."""
+    if db.meter.over:  # the catalog was cut, and counted
+        return {}
+    tables = {o.name.lower() for o in objs if o.type == TABLE and not o.flags & SYSTEM_FLAGS}
+    rel = next((o for o in objs if o.type == TABLE and o.flags & SYSTEM_FLAGS
+                and o.name.lower() == "msysrelationships"), None)
+    out = {}
+    if rel is None:
+        return out
+    roomless = False
+    try:
+        tdef = _tdef(db, rel.id & 0xFFFFFF)
+        at = {c.name.lower(): i for i, c in reversed(list(enumerate(tdef.columns)))}
+        want = ("szobject", "szcolumn", "szreferencedobject", "szreferencedcolumn")
+        if not all(k in at for k in want):
+            raise ValueError("MSysRelationships has no szObject, szColumn or szReferenced columns")
+        cols = [tdef.columns[at[k]] for k in want]
+        for _, cells in _rows(db, tdef):
+            try:
+                t, c, rt, rc = (_name_cell(db, col, cells.get(at[k])) for col, k in zip(cols, want))
+            except _BAD:
+                db.ctx.skipped["record"] += 1
+                continue
+            if not (t and c and rt and rc) or t.lower() not in tables or rt.lower() not in tables:
+                continue
+            target = f"{rt}.{rc}"
+            seen = out.get((t.lower(), c.lower()))
+            if seen is not None and target in seen:
+                continue
+            if not db.keep(sys.getsizeof(target) + (0 if seen is not None else 128)):
+                if not roomless:
+                    roomless = True
+                    db.ctx.skipped["record"] += 1
+                continue
+            out.setdefault((t.lower(), c.lower()), {})[target] = None
+    except (_Spent, *_BAD):
+        db.ctx.skipped["record"] += 1
+    return out
+
+
+def _name_cell(db: _Db, col: Column, raw):
+    """A Text or Memo cell holding a name, on one line and cut at JET_NAME; None when null or of another type."""
+    if raw is None or col.type not in (TEXT, MEMO):
+        return None
+    v = value(db, col, raw)
+    return db.name(v) if isinstance(v, str) else None
 
 
 # -- rows
@@ -605,41 +895,95 @@ def _jump_offsets(buf: bytes, head: int, end: int):
 
 def value(db: _Db, col: Column, raw):
     """A cell as shown: Yes/No, integers, Currency, Single and Double, Date, extended date, Decimal, GUID, Text (cut at
-    JET_CELL_CHARS, counted `text`), Memo, OLE (its length, counted `object`) and binary (its length). Raw bytes that
-    do not fit the type raise ValueError (the caller counts `record`)."""
+    JET_CELL_CHARS, counted `text`), Memo, OLE (its length, counted `object`) and binary (its length). Of the Format
+    property only Percent and Yes/No are applied, to numbers; rich text (TextFormat 1) is the text of its HTML; a
+    hyperlink Memo is a Link (a list of inlines) or "display (address)". Raw bytes that do not fit the type raise
+    ValueError (the caller counts `record`)."""
     t = col.type
     if t == BOOL:
         return "Yes" if raw else "No"
     if raw is None:
         return ""
-    if t == BYTE:
-        return str(_need(raw, 1)[0])
-    if t in (INT, LONG, BIGINT, COMPLEX):
-        return str(struct.unpack({INT: "<h", LONG: "<i", BIGINT: "<q", COMPLEX: "<i"}[t], raw)[0])
-    if t == MONEY:
-        return format(Decimal(f"{struct.unpack('<q', raw)[0]}e-4").normalize(), "f")
-    if t == FLOAT:
-        return _single(bytes(_need(raw, 4)))
-    if t == DOUBLE:
-        return repr(struct.unpack("<d", raw)[0])
+    if t in _NUMBERS:
+        s = _number(t, raw, col.scale)
+        return _formatted(col.fmt, s) if col.fmt else s
+    if t == COMPLEX:
+        return str(struct.unpack("<i", raw)[0])
     if t == DATE:
         return _date(struct.unpack("<d", raw)[0])
     if t == EXTDATE:
         return _ext_date(bytes(_need(raw, 42)))
-    if t == NUMERIC:
-        return _numeric(_need(raw, 17), col.scale)
     if t == GUID:
         return "{" + str(uuid.UUID(bytes_le=bytes(_need(raw, 16)))).upper() + "}"
     if t == TEXT:
-        return db.cut(db.decode(raw, bool(col.ext & 0x01)))
+        return db.cut(db.decode(raw, bool(col.ext & 0x01)), rich=col.rich)
     if t == MEMO:
-        return db.memo(raw, bool(col.ext & 0x01))
+        s = db.memo(raw, bool(col.ext & 0x01), col.rich)
+        return _hyperlink(db, s) if col.flags & _HYPERLINK else s
     if t == OLE:
         if len(raw) < 4:
             raise ValueError("OLE definition shorter than its length")
         db.ctx.skipped["object"] += 1
         return f"<OLE {_u32(raw, 0) & 0x3FFFFFFF} bytes>"
     return f"<binary {len(raw)} bytes>"
+
+
+def _number(t: int, raw, scale: int) -> str:
+    if t == BYTE:
+        return str(_need(raw, 1)[0])
+    if t in (INT, LONG, BIGINT):
+        return str(struct.unpack({INT: "<h", LONG: "<i", BIGINT: "<q"}[t], raw)[0])
+    if t == MONEY:
+        return format(Decimal(f"{struct.unpack('<q', raw)[0]}e-4").normalize(), "f")
+    if t == FLOAT:
+        return _single(bytes(_need(raw, 4)))
+    if t == DOUBLE:
+        return repr(struct.unpack("<d", raw)[0])
+    return _numeric(_need(raw, 17), scale)
+
+
+def _formatted(fmt: str, s: str) -> str:
+    """A number under its Format property: Percent is x 100 with "%" (exact, on the shown digits; a trailing ".0"
+    dropped), Yes/No is "No" for 0 and "Yes" otherwise; any other format, or a value that is not finite, as it is."""
+    if fmt not in ("percent", "yes/no"):
+        return s
+    try:
+        d = Decimal(s)
+    except InvalidOperation:
+        return s
+    if not d.is_finite():
+        return s
+    if fmt == "yes/no":
+        return "No" if d == 0 else "Yes"
+    with localcontext() as c:
+        c.prec = 100
+        d = d.scaleb(2)
+        if not -30 <= d.adjusted() <= 30:  # far from 1: its exponent form, not tens of zeros
+            return f"{d.normalize()}%"
+    out = format(d, "f")
+    if "." in out:
+        out = out.rstrip("0").rstrip(".")
+    return out + "%"
+
+
+def _hyperlink(db: _Db, s: str):
+    """A hyperlink value, `display#address#subaddress#tip` (Access's own form): a Link to address (and #subaddress)
+    labelled display (or the address) when the address is http, https, mailto or ftp and holds no space or control
+    character; else "display (address)". A value without "#" is its text. Each character is charged `_LINK` first."""
+    db.charge(_LINK * len(s))
+    display, sep, rest = s.partition("#")
+    if not sep:
+        return s
+    address, _, rest = rest.partition("#")
+    sub = rest.partition("#")[0]
+    url = f"{address}#{sub}" if sub else address
+    if not url:
+        return display
+    scheme, colon, tail = url.partition(":")
+    if colon and tail and scheme.lower() in LINK_SCHEMES and not any(ch.isspace() or not ch.isprintable()
+                                                                      for ch in url):
+        return [Link(url, [Text(display or url)])]
+    return f"{display} ({url})" if display else url
 
 
 def _single(raw: bytes) -> str:
@@ -747,6 +1091,15 @@ def _obj(db, cells, cell):
     parent = cell(cells, "parentid", (None, None))[0]
     obj = Obj(struct.unpack("<i", oid)[0], db.name(db.decode(name, bool(ncol.ext & 0x01))), kind, flags,
               struct.unpack("<i", parent)[0] if parent is not None else None)
+    if kind == TABLE and not flags & SYSTEM_FLAGS:
+        raw, pcol = cell(cells, "lvprop", (None, None))
+        if raw is not None and pcol.type in (OLE, MEMO):
+            inline = len(raw) >= 4 and _u32(raw, 0) >> 30 == 2
+            definition = bytes(raw if inline else raw[:12])
+            if db.keep(len(definition)):
+                obj.lvprop = definition
+            else:  # past the room: the table is shown without its properties
+                db.ctx.skipped["record"] += 1
     if kind in (LINKED, LINKED_ODBC) and not flags & SYSTEM_FLAGS:
         raw, ccol = cell(cells, "connect", (None, None))
         if raw is not None:
@@ -774,7 +1127,7 @@ def _count(n: int, one: str, many: str) -> str:
 
 
 def _shown(db: _Db, cols: list, cells: dict, bools: list) -> list:
-    """A row's non-empty values as (column index, text); a Yes/No cell absent from the row is "No". A visited cell
+    """A row's non-empty values as (column index, value); a Yes/No cell absent from the row is "No". A visited cell
     that gives a value has its `_CELL` given back: the grid charges it from there."""
     out = []
     for i, raw in cells.items():
@@ -792,45 +1145,192 @@ def _shown(db: _Db, cols: list, cells: dict, bools: list) -> list:
     return out
 
 
-def _table(db: _Db, obj: Obj, budget):
-    """The table's Section; None when the meter runs out on its TDEF (counted `db_table`, as a table not read)."""
+def _schema(db: _Db, tdef: Tdef, name: str, rels: dict) -> list:
+    """The "Columns:" line as inlines: each column's name, type, the targets its relationships name (`_REF` each,
+    charged first), PK, autonumber, required and rich text. A hidden column is a Hidden inline holding its separator
+    (the one before it, or after it when no shown column comes first), so the shown line reads right either way."""
+    pk = set(tdef.pk)
+    table = name.lower()
+    cols = tdef.columns
+    out, text, shown = [], ["Columns: "], False
+    for k, c in enumerate(cols):
+        kind = TYPE_NAMES.get(c.type, f"type {c.type}")
+        targets = rels.get((table, c.name.lower()))
+        if targets:
+            db.charge(_REF * len(targets))
+            kind += "".join([f" → {t}" for t in targets])
+        bits = [kind]
+        if c.num in pk:
+            bits.append("PK")
+        if c.flags & _AUTONUMBER:
+            bits.append("autonumber")
+        if c.required:
+            bits.append("required")
+        if c.rich:
+            bits.append("rich text")
+        piece = f"{c.name} ({', '.join(bits)})"
+        if not c.hidden:
+            text.append(" · " + piece if shown else piece)
+            shown = True
+            continue
+        if text:
+            out.append(Text("".join(text)))
+            text = []
+        if shown:
+            piece = " · " + piece
+        elif k + 1 < len(cols):
+            piece += " · "
+        out.append(Hidden([Text(piece)]))
+    if text:
+        out.append(Text("".join(text)))
+    return out
+
+
+def _key_columns(tdef: Tdef) -> list:
+    """The column indexes of the primary key (at most ten, an index's limit), the first column of each number."""
+    first = {}
+    for i, c in enumerate(tdef.columns):
+        first.setdefault(c.num, i)
+    return [first[n] for n in tdef.pk if n in first]
+
+
+def _sort_key(db: _Db, cols: list, keys: list, cells: dict, shown: list) -> tuple:
+    """A row's primary-key values as typed tuples, `_KEY` a column charged first: null first, numbers and dates by
+    value (NaN last), text without case (from the value shown, a unit a character charged first: the sort compares
+    it), other bytes as they are; a value that cannot be read after all of them."""
+    db.charge(_KEY * len(keys))
+    texts = None
+    out = []
+    for i in keys:
+        c, raw = cols[i], cells.get(i)
+        t = c.type
+        if t == BOOL:
+            out.append((1, raw is not None))
+            continue
+        if raw is None:
+            out.append((0,))
+            continue
+        try:
+            if t == MONEY:
+                v = struct.unpack("<q", raw)[0]
+            elif t in (BYTE, INT, LONG, BIGINT, COMPLEX):
+                v = int(_number(LONG if t == COMPLEX else t, raw, 0))
+            elif t in (FLOAT, DOUBLE, DATE):
+                v = struct.unpack("<f" if t == FLOAT else "<d", raw)[0]
+                if v != v:
+                    out.append((2,))
+                    continue
+            elif t == NUMERIC:  # one scale a column: its signed integer orders it
+                _need(raw, 17)
+                v = int.from_bytes(b"".join(bytes(raw[k:k + 4])[::-1] for k in (1, 5, 9, 13)), "big")
+                v = -v if raw[0] else v
+            elif t in (TEXT, MEMO):
+                if texts is None:
+                    texts = dict(shown)
+                v = texts.get(i, "")
+                v = v if isinstance(v, str) else ""
+                db.charge(len(v))  # its casefold, and its share of each comparison it takes part in
+                v = v.casefold()
+            else:
+                v = bytes(raw)
+        except _BAD:
+            out.append((3,))
+            continue
+        out.append((1, v))
+    return tuple(out)
+
+
+class _Order:
+    """A keyed table's rows held for the primary-key sort, while they fit what the grid has left: at most
+    SHEET_ROWS - 1 rows (the header is row 0), and the cells and characters the shared budget still holds. So what is
+    held is bounded by the grid's own caps."""
+
+    def __init__(self, budget):
+        self.budget, self.rows, self.cells, self.chars = budget, [], 0, 0
+
+    def add(self, key, shown) -> bool:
+        """Hold a row; False, holding nothing, when it does not fit."""
+        cells = self.cells + len(shown)
+        chars = self.chars + sum(sheet_grid._chars(v) for _, v in shown)
+        b = self.budget
+        if len(self.rows) + 1 > limits.SHEET_ROWS - 1 or cells > b.cells or chars > b.chars:
+            return False
+        self.rows.append((key, shown))
+        self.cells, self.chars = cells, chars
+        return True
+
+
+def _table(db: _Db, obj: Obj, budget, rels: dict):
+    """The table's Section; None when the meter runs out on its TDEF, its properties or its schema line (counted
+    `db_table`, as a table not read). A table with a primary key shows its rows in key order when they all fit the
+    grid and the meter affords the sort; else in page order."""
     try:
         tdef = _tdef(db, obj.id & 0xFFFFFF)
+        _apply_props(db, tdef, db.props_of(obj))
+        line = _schema(db, tdef, obj.name, rels)
     except _Spent:
         db.ctx.skipped["db_table"] += 1
         return None
     title = f"{obj.name} ({_count(tdef.row_count, 'row', 'rows')})"
-    schema = " · ".join(f"{c.name} ({TYPE_NAMES.get(c.type, f'type {c.type}')})" for c in tdef.columns)
     grid = sheet_grid.Grid(obj.name, budget, db.ctx)
-    for i, c in enumerate(tdef.columns):
+    cols = tdef.columns
+    for i, c in enumerate(cols):
         if not grid.put(0, i, c.name):
             break
-    cols = tdef.columns
+    for i, c in enumerate(cols):
+        if c.hidden:
+            grid.hide_cols(i, i)
     bools = [i for i, c in enumerate(cols) if c.type == BOOL]  # "No" past a row's count: each one a grid cell
-    done = {}  # an overflow target's key -> (its non-empty values, the counts making them added); room allowing
+    keys = _key_columns(tdef)
+    order = _Order(budget) if keys else None
+    # an overflow target's key -> (its non-empty values, the counts making them added, its sort key); room allowing
+    done = {}
     r = 1
+
+    def put(shown):
+        nonlocal r
+        for i, v in shown:
+            if not grid.put(r, i, v):
+                break
+        r += 1
+
+    def flush():
+        nonlocal order
+        held, order = order.rows, None
+        for _, shown in held:
+            if grid.cut:
+                break
+            put(shown)
+
     try:
         for key, cells in _rows(db, tdef, done):
             if grid.cut:
                 break
             if cells is None:  # a row many pointers name: read once, its values and counts repeated for each
-                shown, made = done[key]
+                shown, made, sk = done[key]
                 db.ctx.skipped.update(made)
-            elif key is not None:
-                before = collections.Counter(db.ctx.skipped)
-                shown = _shown(db, cols, cells, bools)
-                if shown and db.keep(sum(64 + sys.getsizeof(v) for _, v in shown)):  # nothing shown: read again
-                    done[key] = shown, db.ctx.skipped - before
             else:
+                before = collections.Counter(db.ctx.skipped) if key is not None else None
                 shown = _shown(db, cols, cells, bools)
-            for i, v in shown:
-                if not grid.put(r, i, v):
-                    break
-            r += 1
+                sk = _sort_key(db, cols, keys, cells, shown) if order is not None else None
+                if key is not None and shown and db.keep(sum(64 + sys.getsizeof(v) for _, v in shown)):
+                    done[key] = shown, db.ctx.skipped - before, sk  # nothing shown: read again
+            if order is not None:
+                if order.add(sk, shown):
+                    continue
+                flush()  # past the grid: page order from here
+            put(shown)
     except _Spent:
+        if order is not None:
+            flush()
         if not grid.cut:
             grid.stop("units of work", db.total)
-    blocks = [Para([Text("Columns: " + schema)])] + grid.blocks()
+    if order is not None:
+        n = len(order.rows)
+        if db.meter.afford(_SORT * n * n.bit_length()):
+            order.rows.sort(key=itemgetter(0))  # stable: equal keys keep their page order
+        flush()
+    blocks = [Para(line)] + grid.blocks()
     if obj.flags & HIDDEN_FLAG:
         return Section("table", title, blocks=_hide(blocks), hidden="hidden")
     return Section("table", title, blocks=blocks)
@@ -841,7 +1341,9 @@ def parse_bytes(data, ctx) -> Doc:
     jet = jet_pages.open(data)
     _refuse_encrypted(jet)
     db = _Db(jet, ctx)
-    objs = [o for o in _catalog(db) if not o.flags & SYSTEM_FLAGS]
+    catalog = _catalog(db)
+    rels = _relationships(db, catalog)
+    objs = [o for o in catalog if not o.flags & SYSTEM_FLAGS]
     tables = [o for o in objs if o.type == TABLE]
     queries = [o for o in objs if o.type == QUERY]
     linked = [o for o in objs if o.type in (LINKED, LINKED_ODBC)]
@@ -859,7 +1361,7 @@ def parse_bytes(data, ctx) -> Doc:
             continue
         sec = None
         with ctx.guard("db_table"):
-            sec = _table(db, o, budget)
+            sec = _table(db, o, budget, rels)
         if sec is not None:
             out.append(sec)
     if tables and not out and not (queries or linked or others) and not db.meter.over:
