@@ -209,14 +209,7 @@ class _Render:
                     parts.append(list(it.inlines))
             else:
                 parts.append(self._one(it, m))
-        out = ""
-        for p in parts:
-            if isinstance(p, list):
-                s = self._bold(p, m)
-                out += s
-            else:
-                out += p
-        return out
+        return "".join(self._bold(p, m) if isinstance(p, list) else p for p in parts)  # joined once: linear
 
     def _bold(self, items, m):
         inner = self.inlines(items, m)
@@ -300,14 +293,16 @@ class _Render:
 
     @staticmethod
     def join(pieces) -> str:
-        out = ""
+        """The pieces with one blank line between them, none between list items; collected and joined once, since
+        `out += s` copies the text so far on each piece (quadratic past a few MB)."""
+        out = []
         prev = None
         for kind, s in pieces:
             if prev is not None:
-                out += "\n" if prev == kind == "li" else "\n\n"
-            out += s
+                out.append("\n" if prev == kind == "li" else "\n\n")
+            out.append(s)
             prev = kind
-        return out
+        return "".join(out)
 
     def _tag(self, b, s):
         return f"(hidden) {s}" if b.hidden and self.show else s
@@ -685,13 +680,13 @@ class _Render:
                 cells[0] = ("(hidden) " + cells[0][0], cells[0][1])
             before = len(lines)
             if spans:
-                tds = ""
+                tds = []
                 for s, info in cells:
                     cell, rs, cs = info
                     tag = "th" if cell.header else "td"
                     attrs = (f' rowspan="{rs}"' if rs > 1 else "") + (f' colspan="{cs}"' if cs > 1 else "")
-                    tds += f"<{tag}{attrs}>{s}</{tag}>"
-                lines.append(f"<tr>{tds}</tr>")
+                    tds.append(f"<{tag}{attrs}>{s}</{tag}>")
+                lines.append(f"<tr>{''.join(tds)}</tr>")
             else:
                 lines.append("|" + "|".join(s for s, _ in cells) + "|")
                 if shown == 0:

@@ -617,6 +617,22 @@ def test_hidden_code_and_lang():
     assert R(Doc(blocks=[Code("x", "s`q\nl")])) == "```sql\nx\n```\n"
 
 
+def test_render_joins_in_linear_time():
+    # about 18 MB in 9,000 blocks, then 15 MB in one paragraph of 300,000 runs: joining with `out += s` copies the
+    # text so far on each piece (measured 16 s for the first, 4 s for 10 MB of the second); collected and joined once it is well under a second
+    import time
+    doc = Doc(blocks=[P(f"{i:05d}" + "w" * 1995) for i in range(9_000)])
+    t0 = time.perf_counter()
+    out = R(doc)
+    took = time.perf_counter() - t0
+    assert len(out) == 9_000 * 2_002 - 1 and out.startswith("00000w") and took < 4, took
+    doc = Doc(blocks=[Para([Text(f"{i:06d}" + "v" * 44) for i in range(300_000)])])
+    t0 = time.perf_counter()
+    out = R(doc)
+    took = time.perf_counter() - t0
+    assert len(out) == 300_000 * 50 + 1 and took < 4, took
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
