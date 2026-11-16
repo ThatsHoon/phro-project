@@ -18,13 +18,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import images, limits, markdown, officeart  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
-from reader.formats import cfb_route, pub, pub_contents, pub_quill, vsdx, zip_route  # noqa: E402
+from reader.formats import cfb_route, pub, pub_2k, pub_contents, pub_quill, vsdx, zip_route  # noqa: E402
 from reader.formats.pub_contents import Block, ChunkRef  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Bold, Break, Context, Image, Link, Para, Section, Table, Text  # noqa: E402
 from reader_fix import (blip_bitmap, blip_metafile, blip_png, cfb_bytes, oa_container, oa_fbse,  # noqa: E402
-                        oa_record, pub_block, pub_cells, pub_contents as contents_fix, pub_escher, pub_file,
-                        pub_group, pub_quill as quill_fix, pub_sp, pub_table)
+                        oa_record, pub_2k_contents, pub_2k_file, pub_block, pub_cells, pub_contents as contents_fix, pub_escher,
+                        pub_file, pub_group, pub_quill as quill_fix, pub_sp, pub_table)
 
 MIB = 2**20
 
@@ -1063,11 +1063,10 @@ def refused(fn, kind, detail):
 
 
 def test_unknown_version():
-    # byte 0x30 -> unsupported "unknown Publisher version (Contents byte 0x30)"; 0x22 is Publisher 2000 or 98, not
-    # read yet; a Contents stream not starting E8 AC is damaged
+    # byte 0x30 -> unsupported "unknown Publisher version (Contents byte 0x30)" (0x22 is Publisher 2000 or 97/98,
+    # read by pub_2k); a Contents stream not starting E8 AC is damaged
     for byte, kind, detail in ((0x30, "unsupported", "unknown Publisher version (Contents byte 0x30)"),
-                               (0xA1, "unsupported", "unknown Publisher version (Contents byte 0xA1)"),
-                               (0x22, "unsupported", "Publisher 2000 or 98")):
+                               (0xA1, "unsupported", "unknown Publisher version (Contents byte 0xA1)")):
         refused(lambda: read_pub(one_page(["t"], version=byte)), kind, detail)
     with Compound(one_page(["t"])) as cf:
         quill = cf.read("Quill/QuillSub/CONTENTS")
@@ -1896,6 +1895,368 @@ def test_read_lists_once():
     assert sorted(held) == [0x30, 0x31, 0x32], entry
 
 
+# -- pub_2k.py: Publisher 2000 (Quill text) and 97/98 (8-bit text)
+
+PG = 0x10A          # a normal page seqnum in both versions
+
+
+def text2k(seq, tid, parent=PG, box=None):
+    """A Publisher 2000 text box (type 0x08, its text id at +0x58)."""
+    return dict(seq=seq, type=0x08, parent=parent, text=tid, box=box)
+
+
+def text97(seq, tid, parent=PG, box=None):
+    """A Publisher 97 text box (type 0x00, its text id at +0x46)."""
+    return dict(seq=seq, type=0x00, parent=parent, text=tid, at=0x46, box=box)
+
+
+def picture2k(seq, data, parent=PG, box=None, data_seq=None):
+    """A picture shape (0x02) and its image data chunk (0x21) naming it as parent."""
+    return [dict(seq=seq, type=0x02, parent=parent, box=box),
+            dict(seq=data_seq or seq + 0x40, type=0x21, parent=seq, data=data)]
+
+
+def file97(text, shapes=None, pages=(PG,), **kw):
+    """A Publisher 97 file whose text boxes 0, 1, ... are shapes 0x30, 0x31, ... on page PG (as many as `text` has
+    0x0C-split boxes, unless `shapes` is given)."""
+    if shapes is None:
+        shapes = [text97(0x30 + k, k) for k in range(text.count(b"\x0c") + 1)]
+    return pub_2k_file(list(pages), shapes, quill=False, text97=text, **kw)
+
+
+def contents_of(blob):
+    with Compound(blob) as cf:
+        return cf.read("Contents")
+
+
+def test_pub2000_text():
+    # a 0x22 Contents with a Quill story at text id +0x58 -> the text in its page; bold from FDPC as in 2002; the links
+    # line; pages in seqnum order, a page without text left out; a non-text shape's +0x58 names no story
+    blob = pub_2k_file([0x127, PG, 0x12C], [text2k(0x125, 1), text2k(0x12A, 2, parent=0x127),
+                                            dict(seq=0x12E, type=0x05, parent=0x127, text=3)],
+                       [(1, "Hello\rWorld"), (2, "Second"), (3, "Not a text box")], bold=[(0, 5)],
+                       links=["https://a.example/"])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["**Hello**", "World"]), ("Page 2", ["Second"]),
+                            (None, ["Links: https://a.example/"])] and not ctx.skipped, (outline(doc), ctx.skipped)
+    # top, then left, by the chunk's own box at +6 (xs, ys, xe, ye; either corner order)
+    shapes = [text2k(0x30, 1, box=(0, 100, 10, 110)), text2k(0x31, 2, box=(0, 60, 10, 50)),
+              text2k(0x33, 4, box=(-5, 110, -1, 100))]
+    doc, _ = read_pub(pub_2k_file([PG], shapes, [(1, "Low"), (2, "High"), (4, "Left")]))
+    assert outline(doc) == [("Page 1", ["High", "Left", "Low"])], outline(doc)
+
+
+def test_pub2000_wmf_and_master():
+    # a 0x21 picture -> an asset, not viewable; a 0x109 master -> "## Master page: Background", after the pages
+    blob = pub_2k_file([PG, 0x109], picture2k(0x30, WMF, box=(0, 0, 9, 9)) +
+                       [text2k(0x31, 1, box=(0, 20, 9, 29)), text2k(0x32, 2, parent=0x109)],
+                       [(1, "Body"), (2, "Footer")])
+    doc, ctx = read_pub(blob)
+    got = page_blocks(doc)
+    assert isinstance(got[0], Image) and got[0].data == WMF and text_of(got[1]) == "Body", got
+    master = doc.blocks[1]
+    assert (master.kind, master.title, [text_of(p) for p in master.blocks]) == ("master", "Background", ["Footer"])
+    assert len(doc.blocks) == 2 and not ctx.skipped, (doc.blocks, ctx.skipped)
+    text = md(doc, ctx)
+    assert "## Master page: Background" in text and text.index("## Page 1") < text.index("## Master page"), text
+    assert "Not viewable here: assets/img-001.wmf" in text and "![" not in text, text
+    # a picture shape with no data chunk gives nothing, uncounted; a data chunk naming no picture shape is not placed
+    blob = pub_2k_file([PG], [dict(seq=0x30, type=0x02, parent=PG), dict(seq=0x31, type=0x21, parent=0x55, data=WMF),
+                              text2k(0x32, 1)], [(1, "t")])
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["t"])] and not ctx.skipped, (outline(doc), ctx.skipped)
+
+
+def test_pub2000_scratch():
+    # a 0x116 DUMMY shape -> hidden; every 2000 DUMMY seqnum is the scratch area, a 2002 one (0x110) a normal page
+    dummies = (0x108, 0x10B, 0x10D, 0x116, 0x119)
+    shapes = [text2k(0x30, 1), text2k(0x37, 8, parent=0x110)]
+    shapes += [text2k(0x31 + k, 2 + k, parent=p) for k, p in enumerate(dummies)]
+    stories = [(1, "Body"), (2, "s108"), (3, "s10B"), (4, "s10D"), (5, "Secret"), (6, "s119"), (8, "Next")]
+    doc, ctx = read_pub(pub_2k_file([PG, 0x110, *dummies], shapes, stories))
+    assert outline(doc) == [("Page 1", ["Body"]), ("Page 2", ["Next"]),
+                            ("Page: Scratch area (hidden)", ["s108", "s10B", "s10D", "Secret", "s119"])], outline(doc)
+    left, shown = md(doc, ctx), md(doc, ctx, hidden=True)
+    assert "Secret" not in left and "Scratch area" not in left and "Secret" in shown, (left, shown)
+
+
+def test_pub97_text():
+    # b"Hello\r\nWorld\x0bnext\x0cBox two" -> paragraphs, a break, two text boxes (text ids 0 and 1 at +0x46)
+    doc, ctx = read_pub(file97(b"Hello\r\nWorld\x0bnext\x0cBox two"))
+    assert outline(doc) == [("Page 1", ["Hello", "World|next", "Box two"])] and not ctx.skipped, outline(doc)
+    assert not doc.warnings
+    # a lone CR is dropped (libmspub), a lone LF breaks the line, other controls go; a box that ends the text with
+    # 0x0C has no box after it; text boxes are ordered by their box; a 2000 text box (0x08) holds no 97 text
+    shapes = [text97(0x30, 0, box=(0, 50, 9, 59)), text97(0x31, 1, box=(0, 10, 9, 19)), text2k(0x32, 0)]
+    doc, ctx = read_pub(file97(b"a\rb\nc\x01d\x0cTop\x0c", shapes))
+    assert outline(doc) == [("Page 1", ["Top", "ab|cd"])] and not ctx.skipped, outline(doc)
+
+
+def test_pub97_pictures_counted():
+    # one picture -> skipped["image"] == 1; a picture shape with no data chunk, or a data chunk naming a text box,
+    # counts nothing
+    shapes = [text97(0x30, 0)] + picture2k(0x31, WMF) + [dict(seq=0x33, type=0x02, parent=PG),
+                                                         dict(seq=0x34, type=0x21, parent=0x30, data=WMF)]
+    doc, ctx = read_pub(file97(b"Text", shapes))
+    assert outline(doc) == [("Page 1", ["Text"])] and ctx.skipped == {"image": 1}, (outline(doc), ctx.skipped)
+
+
+def test_pub2k_routes():
+    # 0x22 with a Quill stream: Publisher 2000; without: 97/98; a VBA storage is named once in both
+    blob = pub_2k_file([PG], [text2k(0x30, 1)], [(1, "quill")], streams={"VBA/dir": b"\x01" * 16})
+    doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["quill"])] and ctx.skipped == {"vba": 1}, (outline(doc), ctx.skipped)
+    doc, ctx = read_pub(file97(b"eight", streams={"VBA/dir": b"\x01" * 16}))
+    assert outline(doc) == [("Page 1", ["eight"])] and ctx.skipped == {"vba": 1}, (outline(doc), ctx.skipped)
+    # no DOCUMENT chunk: damaged, as 2002+
+    contents = contents_fix([(PG, 0x14, None, bytes(8))], version=0x22)
+    refused(lambda: read_pub(cfb_bytes({"Contents": contents})[0]), "damaged", "no document chunk")
+    # a Quill stream whose sector chain loops: damaged "Quill/QuillSub/CONTENTS stream"
+    contents = contents_of(pub_2k_file([PG], [text2k(0x30, 1)], [(1, "t")]))
+    raw, info = cfb_bytes({"Contents": contents, "Quill/QuillSub/CONTENTS": b"CHNKINK " + bytes(5000)})
+    chain, blob = info["chains"]["Quill/QuillSub/CONTENTS"], bytearray(raw)
+    struct.pack_into("<I", blob, (info["fat"][chain[-1] // 128] + 1) * 512 + chain[-1] % 128 * 4, chain[0])
+    refused(lambda: read_pub(bytes(blob)), "damaged", "Quill/QuillSub/CONTENTS stream")
+
+
+def test_pub2k_groups():
+    # a group (0x0F) stands for its members, the chunks naming it as parent, groups inside included; a group cycle
+    # and a shape under no page are read once or not at all; members past MAX_DEPTH counted depth once
+    shapes = [dict(seq=0x40, type=0x0F, parent=PG), text2k(0x41, 1, parent=0x40),
+              dict(seq=0x42, type=0x0F, parent=0x40), text2k(0x43, 2, parent=0x42),
+              dict(seq=0x44, type=0x0F, parent=0x45), dict(seq=0x45, type=0x0F, parent=0x44), text2k(0x46, 3, parent=0x45),
+              text2k(0x47, 4, parent=0x99),
+              # seqnum 0x48 listed twice (a group on the page and a member of its own member 0x49): read once
+              dict(seq=0x48, type=0x0F, parent=PG), dict(seq=0x49, type=0x0F, parent=0x48),
+              dict(seq=0x48, type=0x0F, parent=0x49), text2k(0x4A, 5, parent=0x49)]
+    doc, ctx = read_pub(pub_2k_file([PG], shapes, [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]))
+    assert outline(doc) == [("Page 1", ["a", "b", "e"])] and not ctx.skipped, (outline(doc), ctx.skipped)
+    chain = [dict(seq=0x40, type=0x0F, parent=PG)]
+    chain += [dict(seq=0x41 + k, type=0x0F, parent=0x40 + k) for k in range(6)] + [text2k(0x60, 1, parent=0x46)]
+    chain += [text2k(0x61, 2, parent=0x43), text2k(0x62, 3, parent=0x44)]
+    blob = pub_2k_file([PG], chain, [(1, "deep"), (2, "two"), (3, "three")])
+    with patched(limits, MAX_DEPTH=4):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["two"])] and ctx.skipped == {"depth": 1}, (outline(doc), ctx.skipped)
+
+
+def test_pub2k_text_ids():
+    # shapes naming one text id give it once; a text id past the stream names nothing; a missing story gives nothing
+    shapes = [text2k(0x30 + k, 1) for k in range(5)] + [text2k(0x40, 9)]
+    doc, ctx = read_pub(pub_2k_file([PG], shapes, [(1, "once")]))
+    assert outline(doc) == [("Page 1", ["once"])] and not ctx.skipped, outline(doc)
+    contents = bytearray(contents_of(pub_2k_file([PG], [text2k(0x30, 1)], [(1, "t")])))
+    toff = struct.unpack_from("<I", contents, 0x16)[0]
+    struct.pack_into("<I", contents, toff + 2 + 2 * 10 + 6, len(contents) - 0x50)  # the shape at the stream's end
+    struct.pack_into("<H", contents, len(contents) - 0x50, 0x08)
+    reader = pub_2k._Reader2000(bytes(contents), quill_fix([(1, "t")]), Context())
+    ref = reader.refs[0x30]
+    assert ref.offset + 0x58 + 2 > len(contents) and reader._tid(ref) is None
+    # a box past the stream is none: the shape follows the placed ones
+    assert reader._box(ref._replace(offset=len(contents) - 22)) is not None
+    assert reader._box(ref._replace(offset=len(contents) - 21)) is None
+
+
+def _entry_offset(contents, k, offset):
+    """`contents` with the Publisher 2000 directory entry k's chunk offset set to `offset`."""
+    out = bytearray(contents)
+    struct.pack_into("<I", out, struct.unpack_from("<I", out, 0x16)[0] + 2 + 10 * k + 6, offset)
+    return bytes(out)
+
+
+def test_pub2000_wmf_hostile():
+    # a data length past its chunk's span, bytes that are no image, or past limits.IMAGE_BYTES: counted image, nothing
+    # given; two data chunks for one picture: the first; directory entries naming one data offset share one copy
+    def run(shapes, contents=None, cap=None):
+        blob = pub_2k_file([PG], shapes, [(1, "t")])
+        if contents is not None:
+            blob = cfb_bytes({"Contents": contents(contents_of(blob)), "Quill/QuillSub/CONTENTS": quill_fix([])})[0]
+        with patched(limits, IMAGE_BYTES=cap if cap is not None else limits.IMAGE_BYTES):
+            doc, ctx = read_pub(blob)
+        return images_of(doc), ctx.skipped
+    long = picture2k(0x30, WMF) + [text2k(0x31, 1)]   # the text chunk follows the data: a longer length is in-stream
+    for n in (len(WMF) + 40, 0xFFFFFFFF):
+        got, skipped = run(long, lambda c: c.replace(struct.pack("<I", len(WMF)) + WMF[:4], struct.pack("<I", n) + WMF[:4]))
+        assert got == [] and skipped == {"image": 1}, (n, got, skipped)
+    assert run(picture2k(0x30, b"not an image at all"))[1] == {"image": 1}
+    assert run(picture2k(0x30, b""))[1] == {"image": 1}
+    assert run(picture2k(0x30, WMF), cap=len(WMF) - 1) == ([], {"image": 1})
+    # past IMAGE_BYTES nothing is copied
+    contents = contents_of(pub_2k_file([PG], picture2k(0x30, WMF)))
+    with patched(limits, IMAGE_BYTES=len(WMF) - 1):
+        reader = pub_2k._Reader2000(contents, b"", Context())
+        reader.run()
+    assert list(reader.wmfs.values()) == [None], reader.wmfs
+    # a data chunk at the stream's end, its length past it: counted image, no damaged-part warning
+    cut = contents + b"\x21\x00\x00\x00"
+    reader = pub_2k._Reader2000(_entry_offset(cut, 3, len(contents)), b"", Context())
+    reader.run()
+    assert reader.ctx.skipped == {"image": 1} and not reader.ctx.warnings, (reader.ctx.skipped, reader.ctx.warnings)
+    # a data chunk naming a text box gives no picture (only a picture shape's data is read)
+    doc, ctx = read_pub(pub_2k_file([PG], [text2k(0x30, 1), dict(seq=0x31, type=0x21, parent=0x30, data=WMF)],
+                                    [(1, "t")]))
+    assert outline(doc) == [("Page 1", ["t"])] and not ctx.skipped, (outline(doc), ctx.skipped)
+    assert run(picture2k(0x30, WMF) + picture2k(0x31, WMF), cap=len(WMF)) == ([WMF], {"image": 1})
+    other = WMF[:-1] + b"\x01"
+    got, skipped = run(picture2k(0x30, WMF) + [dict(seq=0x80, type=0x21, parent=0x30, data=other)])
+    assert got == [WMF] and not skipped, (got, skipped)
+    # entry 5 (the second picture's data chunk) made to name entry 3's (the first's): one copy, charged twice
+    shapes = picture2k(0x30, WMF) + picture2k(0x31, other)
+    contents = contents_of(pub_2k_file([PG], shapes))
+    toff = struct.unpack_from("<I", contents, 0x16)[0]
+    first = struct.unpack_from("<I", contents, toff + 2 + 10 * 3 + 6)[0]
+    reader = pub_2k._Reader2000(_entry_offset(contents, 5, first), b"", Context())
+    got = [b.data for s in reader.run().blocks for b in s.blocks]
+    assert got == [WMF, WMF] and got[0] is got[1] and reader.img == 2 * len(WMF), got
+
+
+def test_pub2k_guards():
+    # a shape that fails is left out (shape); a page (page) and the master (master_page) that fail are left out
+    blob = pub_2k_file([PG, 0x127, 0x109], [text2k(0x30, 1), text2k(0x31, 2), text2k(0x32, 3, parent=0x127),
+                                           text2k(0x33, 4, parent=0x109)], [(1, "a"), (2, "b"), (3, "c"), (4, "m")])
+    real_tid, real_shapes = pub_2k._Reader2000._tid, pub_2k._Reader2000._shapes
+
+    def bad_tid(self, ref):
+        if ref.seqnum == 0x31:
+            raise ValueError("boom")
+        return real_tid(self, ref)
+
+    def bad_shapes(self, seqs):
+        if 0x32 in seqs or 0x33 in seqs:
+            raise ValueError("boom")
+        return real_shapes(self, seqs)
+    with patched(pub_2k._Reader2000, _tid=bad_tid):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["a"]), ("Page 2", ["c"]), ("Master page: Background", ["m"])], outline(doc)
+    assert ctx.skipped == {"shape": 1}, ctx.skipped
+    with patched(pub_2k._Reader2000, _shapes=bad_shapes):
+        doc, ctx = read_pub(blob)
+    assert outline(doc) == [("Page 1", ["a", "b"])] and ctx.skipped == {"page": 1, "master_page": 1}, ctx.skipped
+    # a picture whose read fails: counted image, the page's text stays
+    with patched(pub_2k._Reader2000, _wmf=lambda self, at: 1 / 0):
+        doc, ctx = read_pub(pub_2k_file([PG], picture2k(0x30, WMF) + [text2k(0x31, 1)], [(1, "a")]))
+    assert outline(doc) == [("Page 1", ["a"])] and ctx.skipped == {"image": 1}, ctx.skipped
+
+
+def test_pub2k_meter():
+    # one meter of limits.BIN_RECORDS a document: the directory table, each page, each shape placed and the Quill
+    # styles (2000) or each 97 text box tick it; at any cap the read ends without error, record counted at most once
+    shapes = [text2k(0x30, 1), dict(seq=0x40, type=0x0F, parent=PG), text2k(0x41, 2, parent=0x40),
+              text2k(0x32, 3, parent=0x109), text2k(0x33, 4, parent=0x10D)]
+    shapes97 = [text97(0x30, 0), dict(seq=0x40, type=0x0F, parent=PG), text97(0x41, 1, parent=0x40),
+                text97(0x32, 2, parent=0x109), text97(0x33, 3, parent=0x10D)]
+    for blob, first in ((pub_2k_file([PG, 0x109, 0x10D], shapes, [(1, "a"), (2, "b"), (3, "m"), (4, "s")],
+                                     bold=[(0, 1)]), "**a**"),
+                        (file97(b"a\x0cb\x0cm\x0cs", shapes97, pages=(PG, 0x109, 0x10D)), "a")):
+        full = outline(read_pub(blob)[0])
+        assert full == [("Page 1", [first, "b"]), ("Master page: Background", ["m"]),
+                        ("Page: Scratch area (hidden)", ["s"])], full
+        seen = set()
+        for cap in range(0, 120):
+            with patched(limits, BIN_RECORDS=cap):
+                try:
+                    doc, ctx = read_pub(blob)
+                except ReadError as e:
+                    assert (e.kind, e.detail) == ("damaged", "no document chunk"), (cap, e.kind, e.detail)
+                    seen.add("refused")
+                    continue
+            assert set(ctx.skipped) <= {"record"} and ctx.skipped["record"] <= 1, (cap, ctx.skipped)
+            seen.add(str(outline(doc)))
+        assert len(seen) > 3 and str(full) in seen, seen
+
+
+def test_directory_2000_meter():
+    # the Publisher 2000 table ticks the meter before each entry: at the cap the rest are left out, record once
+    data = contents_fix([(0x100, 0x15, None, bytes(10)), (0x101, 0x14, 0x100, bytes(6)), (0x102, 0x05, 0x101, b"")],
+                        version=0x22)
+    with patched(limits, BIN_RECORDS=2):
+        ctx = Context()
+        refs = pub_contents.directory(data, ctx, trailer=0x16)
+    assert [r.seqnum for r in refs] == [0x100, 0x101] and ctx.skipped == {"record": 1}, (refs, ctx.skipped)
+    meter = pub_contents.Meter(Context())
+    assert len(pub_contents.directory(data, Context(), trailer=0x16, meter=meter)) == 3 and meter.used == 3
+
+
+def _text_head(contents, start=None, end=None, head=None):
+    """`contents` (a 97 one) with its text start, end or the header's offset (the u32 at 0x12) replaced."""
+    out = bytearray(contents)
+    if head is not None:
+        struct.pack_into("<I", out, 0x12, head)
+    at = struct.unpack_from("<I", out, 0x12)[0] + 14
+    if start is not None:
+        struct.pack_into("<I", out, at, start)
+    if end is not None:
+        struct.pack_into("<I", out, at + 4, end)
+    return bytes(out)
+
+
+def run97(contents):
+    ctx = Context()
+    doc = pub_2k.parse_97(contents, ctx)
+    return outline(doc), ctx.skipped, doc.warnings
+
+
+def test_pub97_text_range():
+    # the header's text range is clamped to the stream: an end past it reads to the stream's end (record once), a start
+    # past it or a header past it reads no text (record once), an end before the start no text (record once)
+    contents = contents_of(file97(b"one\x0ctwo"))
+    n = len(contents)
+    assert run97(contents) == ([("Page 1", ["one", "two"])], {}, [])
+    assert run97(_text_head(contents, end=0xFFFFFFFF)) == ([("Page 1", ["one", "two"])], {"record": 1}, [])
+    assert run97(_text_head(contents, end=n + 1))[:2] == ([("Page 1", ["one", "two"])], {"record": 1})
+    assert run97(_text_head(contents, end=n))[:2] == ([("Page 1", ["one", "two"])], {})
+    for bad in (dict(start=n + 1), dict(start=0xFFFFFFFF, end=0xFFFFFFFF), dict(head=n - 21), dict(head=0xFFFFFFF0),
+                dict(start=n - 2, end=n - 3)):
+        assert run97(_text_head(contents, **bad)) == ([], {"record": 1}, []), bad
+    assert run97(_text_head(contents, head=n - 22, start=n, end=n)) == ([], {}, [])
+    # a Contents stream too short for the header's offset: no text, then damaged (no document chunk)
+    refused(lambda: run97(b"\xE8\xAC\x22\x00" + bytes(14)), "damaged", "no document chunk")
+
+
+def test_pub97_boxes_bounded():
+    # past pub_2k.BOXES boxes (the u16 text ids' range) the rest is left out, record once; past the room the rest is
+    # left out, text once; each box ticks the meter
+    contents = contents_of(file97(b"a\x0cb\x0cc\x0cd"))
+    with patched(pub_2k, BOXES=2):
+        assert run97(contents)[:2] == ([("Page 1", ["a", "b"])], {"record": 1})
+    with patched(pub_2k, BOXES=4):
+        assert run97(contents)[:2] == ([("Page 1", ["a", "b", "c", "d"])], {})
+    with patched(limits, MAX_OUTPUT=2 * (1 + vsdx.LINE)):
+        assert run97(contents)[:2] == ([("Page 1", ["a", "b"])], {"text": 1})
+    with patched(limits, MAX_OUTPUT=2 * (1 + vsdx.LINE) + 3):  # a break and a paragraph end charge LINE each
+        assert run97(contents_of(file97(b"a\x0cb\x0bc\x0cd")))[:2] == ([("Page 1", ["a"])], {"text": 1})
+    meter = pub_contents.Meter(Context())
+    boxes, _ = pub_2k.text_boxes(contents, Context(), meter)
+    assert sorted(boxes) == [0, 1, 2, 3] and meter.used == 4, meter.used
+    with patched(limits, BIN_RECORDS=2):
+        ctx = Context()
+        boxes, _ = pub_2k.text_boxes(contents, ctx, pub_contents.Meter(ctx))
+    assert sorted(boxes) == [0, 1] and ctx.skipped == {"record": 1}, (boxes, ctx.skipped)
+
+
+def test_pub97_garbled():
+    # 8-bit text the code page leaves undefined (U+FFFD) or C1 controls past 5% -> the "garbled" warning, no skip kind
+    for text, warned in ((b"\x81\x8d\x8f" * 3 + b"x" * 40, True), (b"caf\xe9 \x93ok\x94\r\n" * 5, False),
+                         (b"line\r\n" * 30, False), (b"a\x0bb\x0cc\x0c" * 10, False)):
+        got = run97(contents_of(file97(text, [text97(0x30, 0)])))
+        assert got[2] == (["garbled"] if warned else []) and not got[1], (text, got)
+    assert outline(read_pub(file97(b"caf\xe9 \x93ok\x94"))[0]) == [("Page 1", ["café “ok”"])]
+
+
+def test_convert_garbled_once():
+    # reader.convert adds "garbled" from the Markdown only when the parser has not: the warning is listed once
+    import reader
+    from reader.model import Doc
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "a.pub"
+        src.write_bytes(b"x")
+        for warned in (["garbled"], []):
+            doc = Doc(blocks=[Para([Text("�" * 50)])], warnings=list(warned))
+            with patched(reader, parse=lambda path, ctx, **kw: doc):
+                meta = reader.convert(src, Path(tmp) / "out")
+            assert meta["warnings"] == ["garbled"], meta["warnings"]
+
+
 # -- measure: hostile-input probes, in memory
 
 def _probe(name, fn, size):
@@ -2199,6 +2560,43 @@ def _picture_probes():
                             store=[oa_fbse(delay=73 * k) for k in range(n)])
         _probe(f"pub: {n} nested delay DIBs", lambda: _run_reader(contents, quill, escher, delay),
                len(escher) + len(delay))
+    _pub_2k_probes()
+
+
+def _run_2000(contents, quill):
+    ctx = Context()
+    reader = pub_2k._Reader2000(contents, quill, ctx)
+    doc = reader.run()
+    paras = sum(len(s.blocks) for s in doc.blocks if isinstance(s, Section))
+    return f"paras {paras} meter {reader.meter.used} {dict(ctx.skipped)}"
+
+
+def _run_97(contents):
+    ctx = Context()
+    doc = pub_2k.parse_97(contents, ctx)
+    paras = sum(len(s.blocks) for s in doc.blocks if isinstance(s, Section))
+    return f"paras {paras} {dict(ctx.skipped)} {doc.warnings}"
+
+
+def _pub_2k_probes():
+    # pub_2k.py: a Publisher 2000 directory at the u16 count's cap, every chunk a text box on one page; then every box
+    # naming one 1 MiB story
+    stories = [(k + 1, f"story {k}\r") for k in range(1000)]
+    n = 65_000
+    contents = pub_2k_contents([PG], [text2k(0x200 + k, k % 1000 + 1) for k in range(n)])
+    quill = quill_fix(stories)
+    _probe("pub2000: 65k chunks, one page", lambda: _run_2000(contents, quill), len(contents) + len(quill))
+    contents = pub_2k_contents([PG], [text2k(0x200 + k, 1) for k in range(n)])
+    quill = quill_fix([(1, "x" * MIB + "\r")])
+    _probe("pub2000: 65k text ids, one 1 Mi story", lambda: _run_2000(contents, quill), len(contents) + len(quill))
+    # Publisher 97: a text range ending at 2^32 - 1 over a 64 MiB stream of short lines; 8 MiB of 0x0C (box ends)
+    contents = _text_head(pub_2k_contents([PG], [text97(0x30, 0)], text97=b"a") + b"line\r\n" * (64 * MIB // 6),
+                          end=0xFFFFFFFF)
+    _probe("pub97: text range to 4 GiB, 64 MiB", lambda: _run_97(contents), len(contents))
+    contents = pub_2k_contents([PG], [text97(0x30, 0)], text97=b"\x0c" * 8 * MIB)
+    _probe("pub97: 8 Mi 0x0C boxes", lambda: _run_97(contents), len(contents))
+    contents = pub_2k_contents([PG], [text97(0x200 + k, k) for k in range(1000)], text97=b"ab\x0c" * (8 * MIB // 3))
+    _probe("pub97: 2.8 Mi short boxes, 1000 read", lambda: _run_97(contents), len(contents))
 
 
 def _nested_bombs(n):

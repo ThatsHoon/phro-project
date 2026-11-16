@@ -2171,3 +2171,52 @@ def pub_file(pages, shapes=(), stories=(), *, order=None, escher=None, version=0
         out["Escher/EscherStm"] = escher
     out.update(streams or {})
     return cfb_bytes(out)[0]
+
+
+# -- Publisher 2000 and 97/98 (libmspub MSPUBParser2k, MSPUBParser97 layouts)
+
+PUB_2K_DOCUMENT = 0x100   # the DOCUMENT chunk's seqnum in pub_2k_contents
+
+
+def pub_2k_chunk(box=None, text=None, at=0x58, data=None, size=0x60) -> bytes:
+    """The bytes of a Publisher 2000 or 97 chunk after its type u16: `size` bytes, the box (xs, ys, xe, ye; s32) at +6
+    and the text id u16 at `at` (+0x58 in 2000, +0x46 in 97) when given; `data` makes an image data (0x21) chunk
+    instead: 2 bytes, the u32 length at +4 and the bytes from +8."""
+    if data is not None:
+        return bytes(2) + struct.pack("<I", len(data)) + bytes(data)
+    raw = bytearray(size - 2)
+    if box is not None:
+        struct.pack_into("<4i", raw, 6 - 2, *box)
+    if text is not None:
+        struct.pack_into("<H", raw, at - 2, text)
+    return bytes(raw)
+
+
+def pub_2k_contents(pages, shapes=(), *, text97=None) -> bytes:
+    """A Publisher 2000 or 97 Contents stream (pub_contents version 0x22): the DOCUMENT chunk (0x15, seqnum
+    PUB_2K_DOCUMENT), a PAGE chunk (0x14) for each page seqnum, whose parent is the document, and each shape, a
+    dict: seq, type (the chunk's first u16), parent (its page or group), and its pub_2k_chunk keywords (box, text,
+    at, data). `text97`: the 8-bit text of Publisher 97, placed after the trailer with its header (14 bytes, the
+    text's start and end u32, four u16), whose offset the u32 at 0x12 holds."""
+    chunks = [(PUB_2K_DOCUMENT, 0x15, None, bytes(0x20))]
+    chunks += [(p, 0x14, PUB_2K_DOCUMENT, bytes(0x10)) for p in pages]
+    for s in shapes:
+        kw = {k: s[k] for k in ("box", "text", "at", "data") if k in s}
+        chunks.append((s["seq"], s["type"], s.get("parent"), pub_2k_chunk(**kw)))
+    body = bytearray(pub_contents(chunks, version=0x22))
+    if text97 is not None:
+        head = len(body)
+        start = head + 14 + 8 + 8
+        body += bytes(14) + struct.pack("<II", start, start + len(text97)) + bytes(8) + bytes(text97)
+        struct.pack_into("<I", body, 0x12, head)
+    return bytes(body)
+
+
+def pub_2k_file(pages, shapes=(), stories=(), *, quill=True, text97=None, streams=None, **quill_kw) -> bytes:
+    """A Publisher 2000 compound file (Contents from pub_2k_contents and the Quill stream of `stories`), or, with
+    `quill` False, a Publisher 97/98 one (no Quill; `text97` the Contents text); `streams` added as they are."""
+    out = {"Contents": pub_2k_contents(pages, shapes, text97=text97)}
+    if quill:
+        out["Quill/QuillSub/CONTENTS"] = pub_quill(list(stories), **quill_kw)
+    out.update(streams or {})
+    return cfb_bytes(out)[0]

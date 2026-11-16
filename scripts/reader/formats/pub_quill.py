@@ -316,6 +316,11 @@ def _paras(text: str, start: int, bold: list, ends: list) -> tuple:
     return tuple(paras)
 
 
+def paragraphs(text: str) -> tuple:
+    """The `model.Para`s of a story's text with no bold, cut as `stories` cuts them (Publisher 97's text boxes)."""
+    return _paras(text, 0, [], [])
+
+
 def stories(bits_, ctx=None, *, meter=None) -> dict:
     """{text id: Story} (see the module docstring); {} without TEXT, STRS or SYID. `meter`: the document's
     `pub_contents.Meter` (a new one on `ctx` when None)."""

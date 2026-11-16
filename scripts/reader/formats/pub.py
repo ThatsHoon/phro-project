@@ -13,9 +13,9 @@ Ported from libmspub (MPL-2.0) at 0477b85184e02dc5276582d9cea969208d56c655, `src
 `EscherFieldIds.h` and `TableInfo.h`. The Contents blocks and chunk directory are `pub_contents`'s, the Quill stories,
 bold, table cells and links `pub_quill`'s, the BStore and BLIPs `officeart`'s.
 
-Version. The Contents stream starts `E8 AC xx 00`: 0x2C is 2002 and later, read here; 0x22 (Publisher 2000, 97 and
-98) is not read yet ("Publisher 2000 or 98"), any other byte is `unsupported`, and a stream not starting E8 AC is
-damaged. A compound file with no Contents stream goes to `cfb_route.route(cf, "pub", "no Contents stream")`. A
+Version. The Contents stream starts `E8 AC xx 00`: 0x2C is 2002 and later, read here; 0x22 is Publisher 2000 (with a
+Quill stream) or 97/98 (without), read by `pub_2k` on this module's `_Pages`; any other byte is `unsupported`, and a
+stream not starting E8 AC is damaged. A compound file with no Contents stream goes to `cfb_route.route(cf, "pub", "no Contents stream")`. A
 2002+ file needs the Quill stream (`Quill/QuillSub/CONTENTS`) and a DOCUMENT chunk, as libmspub does; without
 either it is damaged. A stream the compound file cannot give (a broken sector chain) is damaged, the detail naming
 it ("Contents stream", "Quill/QuillSub/CONTENTS stream", "Escher/EscherStm stream", "Escher/EscherDelayStm stream").
@@ -322,19 +322,178 @@ def _cost(story) -> int:
     return len(text) + vsdx.LINE * (1 + breaks + runs)
 
 
-class _Reader:
-    def __init__(self, contents, quill, escher, ctx, delay=b""):
+class _Pages:
+    """What the Publisher readers share (`_Reader` here, `pub_2k`'s for Publisher 2000 and 97/98): the document's
+    meter and directory, the pages in order with their masters and scratch area, each page's shapes (groups expanded,
+    each once) in reading order under their guards, each story given once and charged to the room, the master titles,
+    the pictures charged to IMAGE_BYTES and the links line. A subclass names its chunk types and DUMMY seqnums, sets
+    `stories` and gives the hooks `_page_list`, `_page`, `_box`, `_tid`, `_name`, `_picture` and, when TABLE is a
+    type, `_table`."""
+    PAGE, DOCUMENT, TABLE = PAGE, DOCUMENT, TABLE
+    SHAPES, GROUPS, DUMMY = SHAPES, GROUPS, DUMMY_PAGES
+    escher_cut = False   # an Escher walk cut short by its share of the meter (2002+ only)
+    urls = ()            # the links line's URLs
+
+    def __init__(self, contents, ctx, trailer=pub_contents.TRAILER):
         self.data, self.ctx = contents, ctx
         self.meter = pub_contents.Meter(ctx)
         self.refs = {}   # seqnum -> its reference (a 2002 seqnum is its directory index, so each is one chunk)
         self.kids = {}   # seqnum -> the seqnums naming it as their parent, in directory order (a group's members)
+        self.listed = pub_contents.directory(contents, ctx, trailer=trailer, meter=self.meter)  # at most PUB_CHUNKS
         bounds = {len(contents)}
-        for ref in pub_contents.directory(contents, ctx, meter=self.meter):  # at most PUB_CHUNKS
+        for ref in self.listed:
             self.refs[ref.seqnum] = ref
             bounds.update((ref.offset, ref.end))
             if ref.parent is not None:
                 self.kids.setdefault(ref.parent, []).append(ref.seqnum)
         self.bounds = sorted(bounds)  # every chunk offset, the trailer's and the stream's end: a chunk ends at the next
+        self.room = limits.MAX_OUTPUT
+        self.placed = set()  # shapes placed
+        self.told = set()    # text ids given
+        self.deep = False
+        self.img = 0         # image bytes placed so far (IMAGE_BYTES)
+
+    def _span(self, at: int) -> int:
+        """Where the chunk at `at` ends: the first chunk offset, trailer or stream end past it."""
+        k = bisect_right(self.bounds, at)
+        return self.bounds[k] if k < len(self.bounds) else len(self.data)
+
+    def _place(self, data) -> list:
+        """[Image(data)] charged to limits.IMAGE_BYTES; [] after counting `image` when `data` is None or past it."""
+        if data is not None and self.img + len(data) <= limits.IMAGE_BYTES:
+            self.img += len(data)
+            return [Image(data)]
+        self.ctx.skipped["image"] += 1
+        return []
+
+    def _expand(self, seqs) -> list:
+        """The shape references of a page's list, each group replaced by its members, each shape once a document."""
+        flat = []
+        for seq in seqs:
+            stack = [(seq, 0)]
+            while stack:
+                s, depth = stack.pop()
+                ref = self.refs.get(s)
+                if s in self.placed or ref is None or ref.type not in self.SHAPES:
+                    continue
+                if depth > limits.MAX_DEPTH:
+                    if not self.deep:
+                        self.deep = True
+                        self.ctx.skipped["depth"] += 1
+                    continue
+                if not self.meter.tick():
+                    return flat
+                self.placed.add(s)
+                if ref.type in self.GROUPS:
+                    stack.extend((k, depth + 1) for k in reversed(self.kids.get(s, ())))
+                else:
+                    flat.append(ref)
+        return flat
+
+    def _shapes(self, seqs) -> list:
+        """The blocks of a page's shapes, in reading order (`_box`: top, then left; no box last, in list order): each
+        shape's picture, then its text."""
+        flat = self._expand(seqs)
+        at = [self._box(r) for r in flat]
+        placed = sorted((b, i) for i, b in enumerate(at) if b is not None)
+        order = [flat[i] for _, i in placed] + [r for r, b in zip(flat, at) if b is None]
+        out = []
+        for ref in order:
+            with self.ctx.guard("shape"):
+                got = self._picture(ref)
+                got.extend(self._text(ref))
+                out.extend(got)
+        return out
+
+    def _text(self, ref) -> list:
+        """The paragraphs of the story a shape names, or its table, once a document, charged to the room."""
+        tid = self._tid(ref)
+        story = self.stories.get(tid)
+        if story is None or tid in self.told:
+            return []
+        self.told.add(tid)
+        cost = _cost(story)
+        if cost > self.room:
+            self.ctx.skipped["text"] += 1
+            return []
+        self.room -= cost
+        if ref.type == self.TABLE:
+            return self._table(ref, story)
+        return list(story.paras)
+
+    def _title(self, raw) -> str:
+        """A master's title (`_name` of what `_page` gave for it), charged to the room; past it "" (counted text)."""
+        name = self._name(raw)
+        cost = len(name) + vsdx.LINE
+        if cost > self.room:
+            self.ctx.skipped["text"] += 1
+            return ""
+        self.room -= cost
+        return name
+
+    def _links(self) -> list:
+        inlines = [Text("Links: ")]
+        for url in self.urls:
+            cost = len(url) + vsdx.LINE
+            if cost > self.room:
+                self.ctx.skipped["link"] += 1
+                break
+            self.room -= cost
+            if len(inlines) > 1:
+                inlines.append(Text(", "))
+            inlines.append(Link(url, [Text(url)]))
+        return [Para(inlines)] if len(inlines) > 1 else []
+
+    def run(self) -> Doc:
+        doc = next((r for r in self.refs.values() if r.type == self.DOCUMENT), None)
+        if doc is None:
+            raise ReadError("damaged", "no document chunk")
+        pages = [r for r in self.refs.values() if r.type == self.PAGE]   # directory order
+        order = self._page_list(doc) or sorted(r.seqnum for r in pages)
+        out, seen, number = [], set(), 0
+        for seq in order:
+            ref = self.refs.get(seq)
+            if seq in seen or ref is None or ref.type != self.PAGE or seq in self.DUMMY:
+                continue
+            seen.add(seq)
+            if not self.meter.tick():
+                break
+            with self.ctx.guard("page"):
+                master, shapes = self._page(ref)
+                if master is None:
+                    number += 1
+                    blocks = self._shapes(shapes)
+                    if blocks:
+                        out.append(Section("page", number=number, blocks=blocks))
+        for ref in pages:
+            if ref.seqnum in self.DUMMY or not self.meter.tick():
+                continue
+            with self.ctx.guard("master_page"):
+                master, shapes = self._page(ref)
+                if master is not None:
+                    blocks = self._shapes(shapes)
+                    if blocks:
+                        out.append(Section("master", title=self._title(master), blocks=blocks))
+        scratch = []
+        for ref in pages:
+            if ref.seqnum not in self.DUMMY or not self.meter.tick():
+                continue
+            with self.ctx.guard("page"):
+                blocks = self._shapes(self._page(ref)[1])
+                scratch.extend(blocks)
+        if scratch:
+            out.append(Section("page", title="Scratch area", blocks=scratch, hidden="hidden"))
+        out.extend(self._links())
+        if self.escher_cut and not self.meter.spent:  # the Escher walk's share ran out (record counted once)
+            self.ctx.skipped["record"] += 1
+        return Doc(blocks=out)
+
+
+class _Reader(_Pages):
+    """Publisher 2002 and later (see the module docstring)."""
+
+    def __init__(self, contents, quill, escher, ctx, delay=b""):
+        super().__init__(contents, ctx)
         self.bits = pub_quill.bits(quill, ctx)
         self.stories = pub_quill.stories(self.bits, ctx, meter=self.meter)
         self.urls = pub_quill.links(self.bits)
@@ -344,19 +503,14 @@ class _Reader:
         self.sps = walk.sp   # shape seqnum -> its SpContainer's offset in the Escher stream
         self.escher_cut = walk.meter.cut
         self.escher, self.delay = escher, delay
-        self.room = limits.MAX_OUTPUT
         self.nodes = limits.TABLE_NODES   # table cells the document may still lay out
         self.chunks = {}     # chunk offset -> what `_read` found there
         self.cell_defs = {}  # CELLS chunk offset -> its cells, or _TOO_MANY
         self.long = False    # a chunk length past its span was cut (counted once)
-        self.placed = set()  # shapes placed
-        self.told = set()    # text ids given
-        self.deep = False
         self.store = None    # the BStore's file block offsets, read at the first picture
         self.budget = flate.Budget(limits.IMAGE_BYTES)
         self.blips = {}      # pib -> its image bytes or None
         self.decoded = {}    # a BLIP's place (the delay offset or the FBSE's) -> its image bytes or None
-        self.img = 0         # image bytes placed so far (IMAGE_BYTES)
         self.delay_read = 0  # delay-stream bytes read so far, at most the stream's length
 
     def _chunk(self, ref):
@@ -367,8 +521,7 @@ class _Reader:
         if at + 4 > len(self.data):
             return iter(())
         end = at + _U32.unpack_from(self.data, at)[0]
-        k = bisect_right(self.bounds, at)
-        span = self.bounds[k] if k < len(self.bounds) else len(self.data)
+        span = self._span(at)
         meter = self.meter
         if end > span:
             end = span
@@ -412,58 +565,17 @@ class _Reader:
         master, shapes, _, _ = self._read(ref)
         return master, shapes
 
-    def _expand(self, seqs) -> list:
-        """The shape references of a page's list, each group replaced by its members, each shape once a document."""
-        flat = []
-        for seq in seqs:
-            stack = [(seq, 0)]
-            while stack:
-                s, depth = stack.pop()
-                ref = self.refs.get(s)
-                if s in self.placed or ref is None or ref.type not in SHAPES:
-                    continue
-                if depth > limits.MAX_DEPTH:
-                    if not self.deep:
-                        self.deep = True
-                        self.ctx.skipped["depth"] += 1
-                    continue
-                if not self.meter.tick():
-                    return flat
-                self.placed.add(s)
-                if ref.type in GROUPS:
-                    stack.extend((k, depth + 1) for k in reversed(self.kids.get(s, ())))
-                else:
-                    flat.append(ref)
-        return flat
+    def _box(self, ref):
+        """(top, left) of a shape from the Escher walk, or None."""
+        return self.boxes.get(ref.seqnum)
 
-    def _shapes(self, seqs) -> list:
-        """The blocks of a page's shapes, in reading order: each shape's picture, then its text."""
-        flat = self._expand(seqs)
-        placed = sorted((self.boxes[r.seqnum], i) for i, r in enumerate(flat) if r.seqnum in self.boxes)
-        order = [flat[i] for _, i in placed] + [r for r in flat if r.seqnum not in self.boxes]
-        out = []
-        for ref in order:
-            with self.ctx.guard("shape"):
-                got = self._picture(ref)
-                got.extend(self._text(ref))
-                out.extend(got)
-        return out
+    def _tid(self, ref):
+        """The text id (block 0x27) of a shape chunk, or None."""
+        return self._read(ref)[2]
 
-    def _text(self, ref) -> list:
-        """The paragraphs of the story a shape names, or its table, once a document, charged to the room."""
-        tid = self._read(ref)[2]
-        story = self.stories.get(tid)
-        if story is None or tid in self.told:
-            return []
-        self.told.add(tid)
-        cost = _cost(story)
-        if cost > self.room:
-            self.ctx.skipped["text"] += 1
-            return []
-        self.room -= cost
-        if ref.type == TABLE:
-            return self._table(ref, story)
-        return list(story.paras)
+    def _name(self, raw: bytes) -> str:
+        """A master's name: its 0x0E block's UTF-16LE."""
+        return str(memoryview(raw)[:len(raw) // 2 * 2], "utf-16-le", "replace").replace("\0", "").strip()
 
     # ---- tables
 
@@ -607,11 +719,7 @@ class _Reader:
         if not pib:
             return []
         with self.ctx.guard("image"):
-            data = self._blip(pib)
-            if data is not None and self.img + len(data) <= limits.IMAGE_BYTES:
-                self.img += len(data)
-                return [Image(data)]
-            self.ctx.skipped["image"] += 1
+            return self._place(self._blip(pib))
         return []
 
     def _blip(self, pib: int):
@@ -653,74 +761,6 @@ class _Reader:
             raw = images.bmp_to_png(raw) or raw
         return raw
 
-    # ---- titles, links and the document
-
-    def _title(self, raw: bytes) -> str:
-        name = str(memoryview(raw)[:len(raw) // 2 * 2], "utf-16-le", "replace").replace("\0", "").strip()
-        cost = len(name) + vsdx.LINE
-        if cost > self.room:
-            self.ctx.skipped["text"] += 1
-            return ""
-        self.room -= cost
-        return name
-
-    def _links(self) -> list:
-        inlines = [Text("Links: ")]
-        for url in self.urls:
-            cost = len(url) + vsdx.LINE
-            if cost > self.room:
-                self.ctx.skipped["link"] += 1
-                break
-            self.room -= cost
-            if len(inlines) > 1:
-                inlines.append(Text(", "))
-            inlines.append(Link(url, [Text(url)]))
-        return [Para(inlines)] if len(inlines) > 1 else []
-
-    def run(self) -> Doc:
-        doc = next((r for r in self.refs.values() if r.type == DOCUMENT), None)
-        if doc is None:
-            raise ReadError("damaged", "no document chunk")
-        pages = [r for r in self.refs.values() if r.type == PAGE]   # directory order
-        order = self._page_list(doc) or sorted(r.seqnum for r in pages)
-        out, seen, number = [], set(), 0
-        for seq in order:
-            ref = self.refs.get(seq)
-            if seq in seen or ref is None or ref.type != PAGE or seq in DUMMY_PAGES:
-                continue
-            seen.add(seq)
-            if not self.meter.tick():
-                break
-            with self.ctx.guard("page"):
-                master, shapes = self._page(ref)
-                if master is None:
-                    number += 1
-                    blocks = self._shapes(shapes)
-                    if blocks:
-                        out.append(Section("page", number=number, blocks=blocks))
-        for ref in pages:
-            if ref.seqnum in DUMMY_PAGES or not self.meter.tick():
-                continue
-            with self.ctx.guard("master_page"):
-                master, shapes = self._page(ref)
-                if master is not None:
-                    blocks = self._shapes(shapes)
-                    if blocks:
-                        out.append(Section("master", title=self._title(master), blocks=blocks))
-        scratch = []
-        for ref in pages:
-            if ref.seqnum not in DUMMY_PAGES or not self.meter.tick():
-                continue
-            with self.ctx.guard("page"):
-                blocks = self._shapes(self._page(ref)[1])
-                scratch.extend(blocks)
-        if scratch:
-            out.append(Section("page", title="Scratch area", blocks=scratch, hidden="hidden"))
-        out.extend(self._links())
-        if self.escher_cut and not self.meter.spent:  # the Escher walk's share ran out (record counted once)
-            self.ctx.skipped["record"] += 1
-        return Doc(blocks=out)
-
 
 def _vba(name: str) -> bool:
     return "VBA" in name.upper().split("/")[:-1]
@@ -741,8 +781,11 @@ def parse(path, ctx) -> Doc:
 
 def parse_compound(src, ctx) -> Doc | str:
     """Read the compound file `src` (a path or its bytes, nothing is written): the Doc, or the name of the other
-    parser `cfb_route` picks for a compound file that holds no Contents stream. `parse` ends in it."""
+    parser `cfb_route` picks for a compound file that holds no Contents stream. `parse` ends in it. Version 0x22 goes
+    to `pub_2k`: Publisher 2000 with a Quill stream, 97/98 without (libmspub's `MSPUBDocument::parse`)."""
+    from . import pub_2k  # it builds on this module, so it is imported once this one is
     part = "compound file"
+    older = False
     try:
         with Compound(src) as cf:
             other = cfb_route.route(cf, "pub", "no Contents stream")
@@ -751,23 +794,28 @@ def parse_compound(src, ctx) -> Doc | str:
                 contents = cf.read(CONTENTS)
                 if len(contents) < 4 or contents[:2] != HEAD:
                     raise ReadError("damaged", "not a Publisher Contents stream")
-                if contents[2] == V2000:
-                    raise ReadError("unsupported", "Publisher 2000 or 98")
-                if contents[2] != V2002:
+                if contents[2] not in (V2000, V2002):
                     raise ReadError("unsupported", f"unknown Publisher version (Contents byte 0x{contents[2]:02X})")
-                if not cf.exists(QUILL):
-                    raise ReadError("damaged", "no Quill stream")
-                part = f"{QUILL} stream"
-                quill = cf.read(QUILL)
-                part = f"{ESCHER} stream"
-                escher = cf.read(ESCHER) if cf.exists(ESCHER) else b""
-                part = f"{DELAY} stream"
-                delay = cf.read(DELAY) if escher and cf.exists(DELAY) else b""
-                vba = any(_vba(n) for n in cf.names())
+                if any(_vba(n) for n in cf.names()):
+                    ctx.skipped["vba"] = 1  # macros are never read; named once
+                if contents[2] == V2000:
+                    if cf.exists(QUILL):
+                        part = f"{QUILL} stream"
+                        return pub_2k.parse_2000(cf, contents, ctx)
+                    older = True
+                else:
+                    if not cf.exists(QUILL):
+                        raise ReadError("damaged", "no Quill stream")
+                    part = f"{QUILL} stream"
+                    quill = cf.read(QUILL)
+                    part = f"{ESCHER} stream"
+                    escher = cf.read(ESCHER) if cf.exists(ESCHER) else b""
+                    part = f"{DELAY} stream"
+                    delay = cf.read(DELAY) if escher and cf.exists(DELAY) else b""
     except (KeyError, CfbError):
         raise ReadError("damaged", part) from None
     if other is not None:
         return other
-    if vba:
-        ctx.skipped["vba"] = 1  # macros are never read; named once
+    if older:
+        return pub_2k.parse_97(contents, ctx)
     return _Reader(contents, quill, escher, ctx, delay).run()

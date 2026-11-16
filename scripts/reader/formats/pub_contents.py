@@ -39,9 +39,9 @@ one call, and they share everything after the read: the cap, the ends and the cy
 For both: `type_of(data, ref)`, when given, gives the type instead. A chunk ends where the next one in directory
 order begins; the last ends at the trailer, or at the end of the stream when it starts past the trailer; an end
 before its own offset is the offset, and none passes the stream unless its offset does. Up to `PUB_CHUNKS`
-references are read (0x88 blocks, or table entries); at the next one the directory stops, counted `record` once.
-Parent links are walked once each with a seen-set; the link that closes a cycle is cut (its parent set to None,
-nothing counted, nothing lost). The first reference of a sequence number is the one parents name.
+references are read (0x88 blocks, or table entries, each ticking the meter); at the next one the directory stops,
+counted `record` once. Parent links are walked once each with a seen-set; the link that closes a cycle is cut (its
+parent set to None, nothing counted, nothing lost). The first reference of a sequence number is the one parents name.
 """
 import struct
 from collections import namedtuple
@@ -206,9 +206,9 @@ def _refs_2002(data, ctx, trailer: int, meter: Meter) -> tuple:
     return refs, toff
 
 
-def _refs_2000(data, ctx, trailer: int) -> tuple:
+def _refs_2000(data, ctx, trailer: int, meter: Meter) -> tuple:
     """([type, offset, end, parent, seqnum] lists, the trailer's offset) from Publisher 2000's directory table; the
-    type is the chunk's first u16 (None when the chunk is past the stream)."""
+    type is the chunk's first u16 (None when the chunk is past the stream). Each entry ticks the meter."""
     refs = []
     if trailer + 4 > len(data):
         return refs, len(data)
@@ -220,6 +220,8 @@ def _refs_2000(data, ctx, trailer: int) -> tuple:
     for i in range(min(count, fits)):
         if i >= PUB_CHUNKS:
             ctx.skipped["record"] += 1
+            break
+        if not meter.tick():
             break
         _, seq, parent, offset = _ENTRY_2K.unpack_from(data, toff + 2 + i * _ENTRY_2K.size)
         ctype = _U16.unpack_from(data, offset)[0] if offset + 2 <= len(data) else None
@@ -251,7 +253,7 @@ def directory(data, ctx, *, trailer: int = TRAILER, type_of=None, meter: Meter |
     if meter is None:
         meter = Meter(ctx)
     if trailer == TRAILER_2K:
-        refs, toff = _refs_2000(data, ctx, trailer)
+        refs, toff = _refs_2000(data, ctx, trailer, meter)
     else:
         refs, toff = _refs_2002(data, ctx, trailer, meter)
     n = len(data)
