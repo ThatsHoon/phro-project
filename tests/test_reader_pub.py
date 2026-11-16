@@ -304,6 +304,119 @@ def test_quill_bold():
     assert [text_of(p) for p in got[9].paras] == ["**A**|**B**"], got[9].paras
 
 
+def test_quill_default_bold():
+    # libmspub's bold: the FDPC flag XOR the paragraph's default character style (FDPP block 0x19 indexes the even
+    # entries of the second STSH bit; without the block the index is 0)
+    def paras(**kw):
+        got = pub_quill.stories(pub_quill.bits(quill_fix(STORIES, **kw)))
+        return [text_of(p) for p in got[7].paras], [text_of(p) for p in got[9].paras]
+    # inherited: "Hello\r" on default 1 (bold), the rest on default 0 (plain); no FDPC bold
+    assert paras(fdpp=[(6, 1), (14, 0)], stsh=(False, True)) == (["**Hello**", "World"], ["A|B"])
+    # un-bold: every paragraph on a bold default, an FDPC bold run over "World" makes it plain
+    assert paras(bold=[(6, 11)], fdpp=[(14, 1)], stsh=(False, True)) == (["**Hello**", "World"], ["**A**|**B**"])
+    # a paragraph style without block 0x19 takes default 0
+    assert paras(fdpp=[(14, None)], stsh=(True,)) == (["**Hello**", "**World**"], ["**A**|**B**"])
+    # an index past the defaults is not bold
+    assert paras(bold=[(6, 11)], fdpp=[(14, 5)], stsh=(True,)) == (["Hello", "**World**"], ["A|B"])
+    # a block 0x19 that is not a number leaves the index 0
+    bits = pub_quill.bits(quill_fix(STORIES, fdpp=[(14, 1)], stsh=(True, False)))
+    raw = bytes(bits["FDPP"][0])
+    assert raw.count(bytes([0x19, 0x20, 1, 0, 0, 0])) == 1
+    bits["FDPP"] = [like(raw.replace(bytes([0x19, 0x20, 1, 0, 0, 0]), pub_block(0x19, 0x88)), bits["FDPP"][0])]
+    assert text_of(pub_quill.stories(bits)[7].paras[0]) == "**Hello**"
+    assert text_of(pub_quill.stories(pub_quill.bits(quill_fix(STORIES, fdpp=[(14, 1)], stsh=(True, False))))[7]
+                   .paras[0]) == "Hello"
+
+
+def test_default_bold_missing():
+    # without FDPP, without STSH, with one STSH bit only, or either malformed: FDPC alone, and the text stays
+    want = (["Hello", "**World**"], ["A|B"])
+    def paras(bits):
+        got = pub_quill.stories(bits)
+        return [text_of(p) for p in got[7].paras], [text_of(p) for p in got[9].paras]
+    assert paras(pub_quill.bits(quill_fix(STORIES, bold=[(6, 11)], stsh=(True,)))) == want
+    assert paras(pub_quill.bits(quill_fix(STORIES, bold=[(6, 11)], fdpp=[(14, None)]))) == want
+    full = pub_quill.bits(quill_fix(STORIES, bold=[(6, 11)], fdpp=[(14, None)], stsh=(True,)))
+    assert paras(full) == (["**Hello**", "World"], ["**A**|**B**"])
+    assert paras({**full, "STSH": full["STSH"][:1]}) == want
+    assert paras({**full, "STSH": full["STSH"][1:]}) == want  # one STSH bit: libmspub reads only the second
+    stsh = full["STSH"][1]
+    for raw in (bytes(stsh)[:6], bytes(stsh)[:19], bytes(stsh)[:24],
+                struct.pack("<II", 0, 0xFFFFFFFF) + bytes(stsh)[8:]):
+        assert paras({**full, "STSH": [full["STSH"][0], like(raw, stsh)]})[0][1] in ("World", "**World**"), raw
+    assert paras({**full, "STSH": [full["STSH"][0], like(bytes(stsh)[:19], stsh)]}) == want
+    fdpp = full["FDPP"][0]
+    bad = bytearray(fdpp)
+    struct.pack_into("<H", bad, 0, 0xFFFF)
+    assert paras({**full, "FDPP": [like(bytes(bad), fdpp)]}) == want
+    for raw in (b"", b"\x01"):
+        assert paras({**full, "FDPP": [like(raw, fdpp)]}) == want
+    # a default style offset past the bit is not bold
+    bad = bytearray(stsh)
+    struct.pack_into("<I", bad, 20, 0xFFFFFF00)
+    assert paras({**full, "STSH": [full["STSH"][0], like(bytes(bad), stsh)]}) == want
+
+
+def test_default_bold_meter():
+    # the FDPP runs, their styles and the default styles spend the same meter: past it bold is lost, record once, and
+    # the text stays
+    bits = pub_quill.bits(quill_fix(STORIES, bold=[(6, 11)], fdpp=[(6, None), (14, None)], stsh=(True,)))
+    full = pub_quill.stories(bits)
+    assert [text_of(p) for p in full[7].paras] == ["**Hello**", "World"]
+    for cap in range(12):
+        with patched(limits, BIN_RECORDS=cap):
+            ctx = Context()
+            got = pub_quill.stories(bits, ctx)
+        assert [s.text for s in got.values()] == ["Hello\rWorld", "A\vB"], cap
+        assert ctx.skipped in ({}, {"record": 1}), (cap, ctx.skipped)
+    with patched(limits, BIN_RECORDS=1):
+        ctx = Context()
+        pub_quill.stories(bits, ctx)
+        assert ctx.skipped == {"record": 1}
+    # the ticks, exactly: 3 FDPC runs and the bold style's block; one default style and its block; 2 FDPP runs (their
+    # styles have no block). Without a bold default FDPP is not read.
+    meter = pub_contents.Meter(Context())
+    pub_quill.stories(bits, meter=meter)
+    assert meter.used == 3 + 1 + 1 + 1 + 2, meter.used
+    meter = pub_contents.Meter(Context())
+    pub_quill.stories(pub_quill.bits(quill_fix(STORIES, bold=[(6, 11)], fdpp=[(6, None), (14, None)],
+                                               stsh=(False,))), meter=meter)
+    assert meter.used == 3 + 1 + 1, meter.used
+
+
+def test_stories_meter_shared():
+    # stories spends the caller's meter: a spent one reads no bold and counts nothing more
+    bits = pub_quill.bits(quill_fix(STORIES, bold=[(6, 11)]))
+    ctx = Context()
+    meter = pub_contents.Meter(ctx)
+    pub_quill.stories(bits, ctx, meter=meter)
+    assert meter.used > 0
+    with patched(limits, BIN_RECORDS=0):
+        ctx = Context()
+        meter = pub_contents.Meter(ctx)
+        meter.tick()
+        got = pub_quill.stories(bits, ctx, meter=meter)
+    assert got[7].paras[1] == Para([Text("World")]) and ctx.skipped == {"record": 1}, ctx.skipped
+
+
+def test_repeated_id_counted():
+    # a text id named twice keeps its last story; each story replaced is counted record
+    bits = pub_quill.bits(quill_fix([(7, "one"), (7, "two"), (9, "x"), (7, "three")]))
+    ctx = Context()
+    got = pub_quill.stories(bits, ctx)
+    assert {k: s.text for k, s in got.items()} == {7: "three", 9: "x"} and got[7].index == 3, got
+    assert ctx.skipped == {"record": 2}, ctx.skipped
+
+
+def test_fdpc_short_bits():
+    # FDPC bits of 0 and 1 bytes are not read: no bold, the stories stay
+    bits = pub_quill.bits(quill_fix(STORIES, bold=[(6, 11)]))
+    for raw in (b"", b"\x01"):
+        got = pub_quill.stories({**bits, "FDPC": [like(raw, bits["FDPC"][0])]})
+        assert [s.text for s in got.values()] == ["Hello\rWorld", "A\vB"], raw
+        assert got[7].paras[1] == Para([Text("World")]), raw
+
+
 def test_quill_without_fdpc():
     # fdpc=False -> the text, no Bold
     bits = pub_quill.bits(quill_fix(STORIES, bold=[(6, 11)], fdpc=False))
@@ -378,7 +491,35 @@ def test_quill_list_chain_cap():
     assert pub_quill.bits(bytes(data), ctx) == {} and ctx.skipped == {}, ctx.skipped
 
 
+def test_quill_copy_peak():
+    # a bit refused for the copy room is not copied first: 100 small bits spend the room, then one naming nearly the
+    # whole stream is refused without a copy of it
+    size = 4 * MIB
+    small = size // 100
+    entries = [struct.pack("<H4sHHH4sII", 0x18, b"JUNK", 0, 1, 0, b"JUNK", 1, small) for _ in range(100)]
+    entries.append(struct.pack("<H4sHHH4sII", 0x18, b"JUNK", 0, 1, 0, b"JUNK", 1, size - 1))
+    head = b"CHNKINK " + bytes(0x10) + struct.pack("<HHI", 0, len(entries), 0xFFFFFFFF) + b"".join(entries)
+    data = head + bytes(size - len(head))
+    tracemalloc.start()
+    try:
+        ctx = Context()
+        bits = pub_quill.bits(data, ctx)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert len(bits["JUNK"]) == 100 and ctx.skipped == {"record": 1}, (len(bits["JUNK"]), ctx.skipped)
+    assert peak < 1.5 * size, peak / size
+
+
 def test_quill_copy_room():
+    # a bit whose length passes the stream's end is read to the end, charged what it copies, nothing counted
+    data = bytearray(quill_fix(STORIES))
+    text = pub_quill.bits(bytes(data))["TEXT"][0]
+    at = next(0x20 + 24 * k for k in range(4) if data[0x20 + 24 * k + 2:0x20 + 24 * k + 6] == b"TEXT")
+    struct.pack_into("<I", data, at + 20, 0xFFFFFFF0)
+    ctx = Context()
+    bits = pub_quill.bits(bytes(data), ctx)
+    assert bytes(bits["TEXT"][0]) == bytes(data[text.offset:]) and ctx.skipped == {}, ctx.skipped
     # bits that overlap copy at most the stream's size in all: here 9 entries each naming the whole stream
     data = bytearray(quill_fix(STORIES))
     entry = struct.pack("<H4sHHH4sII", 0x18, b"JUNK", 0, 1, 0, b"JUNK", 0, len(data) // 3)
@@ -681,7 +822,8 @@ def measure():
                      + bytes([0x02, 0x0A]) * 2000)
     chars = runs * nbits
     data = _quill_with([(b"TEXT", b"TEXT", 0, ("a" * chars).encode("utf-16-le")),
-                        (b"STRS", b"PLC ", 0, _plc_lengths([chars])), (b"SYID", b"SYID", 0, struct.pack("<III", 8, 1, 1))]
+                        (b"STRS", b"PLC ", 0, _plc_lengths([chars])),
+                        (b"SYID", b"SYID", 0, struct.pack("<III", 8, 1, 1))]
                        + [(b"FDPC", b"FDPC", k, f) for k, f in enumerate(fdpcs)])
     _probe("FDPC 250 bits x10k runs", lambda: _run_quill(data), len(data))
 

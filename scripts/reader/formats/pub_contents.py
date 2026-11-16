@@ -89,6 +89,7 @@ _U32 = struct.Struct("<I")
 _ENTRY_2K = struct.Struct("<HHHI")
 
 Block = namedtuple("Block", "id type start end data")
+# `parent` is None when a 2002+ reference has none; Publisher 2000's table keeps the raw u16 (0xFFFF for none)
 ChunkRef = namedtuple("ChunkRef", "type offset end parent seqnum")
 
 

@@ -1,13 +1,14 @@
 # This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not
 # distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
-# Ported from libmspub 0477b85184e02dc5276582d9cea969208d56c655, src/lib/MSPUBParser.cpp.
+# Ported from libmspub 0477b85184e02dc5276582d9cea969208d56c655, src/lib/MSPUBParser.cpp, src/lib/MSPUBCollector.cpp.
 """The Quill stream of a Publisher file (`Quill/QuillSub/CONTENTS`): its bits, stories, table cells and links.
 
-Ported from libmspub (MPL-2.0) at 0477b85184e02dc5276582d9cea969208d56c655, `src/lib/MSPUBParser.cpp`
-(`parseQuill`, `parseQuillChunkReference`, `parseCharacterStyles`, `getCharacterStyle`,
-`parseTableCellDefinitions`). The bit entry fields and the PLC bits (`PLC ` kind: the count and type first, and
-type 12's hyperlink list) follow Apache POI's `hpbf/model/QuillContents.java` and `hpbf/model/qcbits/QCPLCBit.java`
-at 47dcff769bb395034dddfd59c4609659b6dbc6a4.
+Ported from libmspub (MPL-2.0) at 0477b85184e02dc5276582d9cea969208d56c655, `src/lib/MSPUBParser.cpp` (`parseQuill`,
+`parseQuillChunkReference`, `parseCharacterStyles`, `parseParagraphStyles`, `parseDefaultStyle`,
+`getCharacterStyle`, `getParagraphStyle`, `parseTableCellDefinitions`) and `src/lib/MSPUBCollector.cpp`
+(`getCharStyleProps`, `addTextString`). The bit entry fields and the PLC bits (`PLC ` kind: the count and type
+first, and type 12's hyperlink list) follow Apache POI's `hpbf/model/QuillContents.java` and
+`hpbf/model/qcbits/QCPLCBit.java` at 47dcff769bb395034dddfd59c4609659b6dbc6a4.
 
 Bits (`bits`). The stream starts `CHNKINK `. At 0x18 is a list: 2 bytes, a u16 count, the u32 offset of the next
 list (0xFFFFFFFF ends) and the count's 24-byte entries: a u16, the name (4 bytes), the id u16, 4 bytes, the kind (4
@@ -15,25 +16,36 @@ bytes: `PLC ` for the PLC bits, else the name again), the bit's offset and lengt
 libmspub does, with a seen-set of list offsets. `bits` gives {name: [Bit]} in directory order; a `Bit` is the bit's
 bytes (a bytes subclass) with its `id`, `kind` and stream `offset`. Up to `QUILL_BITS` entries are read and at most
 as many lists visited; the bits copy at most the stream's size in all (overlapping bits only come from a damaged
-file). Past any of these the rest is ignored, counted `record` once when a `ctx` is given.
+file), checked before each copy. Past any of these the rest is ignored, counted `record` once when a `ctx` is given.
 
 Stories (`stories`). TEXT (UTF-16LE; libmspub's last TEXT bit) cut by the STRS lengths (characters; a PLC whose
 lengths start 4 bytes past the u32 at +4), in order, keyed by the SYID text ids (a count at +4, the ids from +8);
 STRS and SYID bits add up in directory order, and the stories pair them as far as both go. A text id named twice
-keeps its last story (libmspub's map). `\\r` ends a paragraph, `\\v` and `\\n` break a line (libmspub breaks on
-`\\n`), a tab stays and other control characters are left out; a paragraph with no visible character is left out
-and breaks at its ends are dropped. Bold comes from the FDPC bits (u16 count, 6 bytes, the count's u32 run ends as
-stream byte offsets past the TEXT bit's start, then the count's u16 style offsets in the bit; a style is a u32
-length counting itself and blocks, bold when block id 0x02 is present, as `getCharacterStyle` reads BOLD_1). Only
-TEXT, STRS and SYID are needed: without FDPC the text stays and only bold is lost, where libmspub drops the text
-(it also waits for FDPP, STSH and FONT, which give nothing this reader keeps).
+keeps its last story (libmspub's map); each story replaced is counted `record`. `\\r` ends a paragraph, `\\v` and
+`\\n` break a line (libmspub breaks on `\\n`), a tab stays and other control characters are left out; a paragraph
+with no visible character is left out and breaks at its ends are dropped.
+
+Bold is libmspub's: a character is bold when its FDPC run's style flag differs from its paragraph's default
+character style (`getCharStyleProps`: `style.bold ^ defaultCharStyle.bold`).
+- FDPC bits: a u16 count, 6 bytes, the count's u32 run ends as stream byte offsets past the TEXT bit's start, then
+  the count's u16 style offsets in the bit. A style is a u32 length counting itself and blocks; it is bold when block
+  id 0x02 is present, as `getCharacterStyle` reads BOLD_1.
+- FDPP bits: the paragraph runs, in FDPC's layout. A paragraph style's block 0x19 (PARAGRAPH_DEFAULT_CHAR_STYLE)
+  indexes the default character styles; without the block the index is 0.
+- The second STSH bit: a u32, the count at +4, 12 bytes, then the count's u32 offsets from +20. Each style is at +20
+  plus its offset, past a u16. The even entries are the default character styles; an index past them is not bold.
+Without FDPP, without a second STSH bit, or when either gives nothing (absent, too short, a count that does not fit),
+the default is not bold and FDPC alone decides. Only TEXT, STRS and SYID are needed: without FDPC the text stays and
+only bold is lost, where libmspub drops the text (it also waits for FDPP, STSH and FONT).
 
 `Story(id, index, text, paras)`: the SYID text id, the story's place in STRS order (a `TCD ` bit names its table
 story by it), the story's characters as stored and its paragraphs, `model.Para`s of `Text`, `Bold` and `Break`. The
 Paras are built once per document and shared: a caller copies one before changing it.
 
-Bounds. The FDPC runs and the blocks of their styles (each style read once) tick one `pub_contents.Meter` of
-`limits.BIN_RECORDS`; past it bold is lost for the rest, counted `record` once. Each story is charged, before it is
+Bounds. The FDPC and FDPP runs, the default styles and the blocks of every style (each style read once per bit)
+tick one `pub_contents.Meter` of `limits.BIN_RECORDS`: the caller's (`stories(..., meter=)`, so a document's Contents
+walks and its Quill stories share one budget), or a new one. Past it bold is lost for the rest, counted `record`
+once. Each story is charged, before it is
 built, to one room of `limits.MAX_OUTPUT`: its characters, and `vsdx.LINE` for itself, each paragraph end or line
 break and each bold run in it (each is a model object however short). Past the room the remaining stories are left
 out, counted `text` once. A count past its bit reads what the bit holds; an FDPC whose count does not fit its bit is
@@ -51,6 +63,7 @@ than POI's 1,000 PLCs is not read; an entry past the bit ends that bit (POI then
 repeats are left out; the rest come in directory order.
 """
 import bisect
+import heapq
 import re
 import struct
 from dataclasses import dataclass
@@ -65,6 +78,8 @@ HEAD = b"CHNKINK "
 DIRECTORY = 0x18
 END = 0xFFFFFFFF
 BOLD_1 = 0x02        # MSPUBBlockID.h BOLD_1_ID, in a character style
+DEFAULT_CHAR_STYLE = 0x19  # MSPUBBlockID.h PARAGRAPH_DEFAULT_CHAR_STYLE, in a paragraph style
+STSH_OFFSETS = 20    # where the second STSH bit's style offsets start, and what they count from
 PLC = "PLC "
 LINKS = 12           # the PLC type of a hyperlink list (POI's Type12)
 PLCS = 1_000         # POI's MAX_NUMBER_OF_PLCS: a PLC bit naming more is not read
@@ -122,10 +137,11 @@ def bits(data, ctx=None) -> dict:
                 return cut()
             entries += 1
             _, name, bid, _, _, kind, off, length = _ENTRY.unpack_from(data, at + 8 + i * _ENTRY.size)
-            raw = bytes(data[off:off + length]) if off < n else b""
-            if len(raw) > room:
+            size = min(length, n - off) if off < n else 0
+            if size > room:
                 return cut()
-            room -= len(raw)
+            room -= size
+            raw = memoryview(data)[off:off + size]
             out.setdefault(name.decode("latin-1"), []).append(Bit(raw, bid, kind.decode("latin-1"), off))
         at = nxt
     return out
@@ -150,17 +166,70 @@ def _ids(bitlist):
             yield from _u32s(bit, 8, _U32.unpack_from(bit, 4)[0])
 
 
-def _bold_style(bit, at: int, meter) -> bool:
+def _style(bit, at: int, meter):
+    """The blocks of the style at `at` in `bit` (a u32 length counting itself, then blocks); none when it does not
+    fit the bit."""
     if at + 4 > len(bit):
-        return False
+        return ()
     size = _U32.unpack_from(bit, at)[0]
     if size < 4 or size > len(bit) - at:
-        return False
-    return any(b.id == BOLD_1 for b in pub_contents.blocks(bit, at + 4, at + size, meter=meter))
+        return ()
+    return pub_contents.blocks(bit, at + 4, at + size, meter=meter)
 
 
-def _bold(bitlist, text_at: int, meter) -> list:
-    """The bold [start, end) character ranges of the TEXT bit at stream offset `text_at`, sorted and disjoint."""
+def _bold_style(bit, at: int, meter) -> bool:
+    return any(b.id == BOLD_1 for b in _style(bit, at, meter))
+
+
+def _defaults(stsh, meter) -> list:
+    """The bold flags of the default character styles: the even entries of the second STSH bit."""
+    if len(stsh) < 2 or len(stsh[1]) < STSH_OFFSETS:
+        return []
+    bit = stsh[1]
+    out = []
+    for i, off in enumerate(_u32s(bit, STSH_OFFSETS, _U32.unpack_from(bit, 4)[0])):
+        if i % 2:
+            continue
+        if not meter.tick():
+            break
+        out.append(_bold_style(bit, STSH_OFFSETS + off + 2, meter))
+    return out
+
+
+def _para_default(bit, at: int, meter, defaults: list) -> bool:
+    """Whether the paragraph style at `at` names a bold default character style (block 0x19, else index 0)."""
+    index = 0
+    for b in _style(bit, at, meter):
+        if b.id == DEFAULT_CHAR_STYLE and isinstance(b.data, int):
+            index = b.data
+    return index < len(defaults) and defaults[index]
+
+
+def _xor(a: list, b: list) -> list:
+    """The characters in exactly one of two sorted, disjoint range lists, as sorted, disjoint ranges."""
+    points = []
+    for p in heapq.merge((p for r in a for p in r), (p for r in b for p in r)):
+        if points and points[-1] == p:
+            points.pop()
+        else:
+            points.append(p)
+    return [[points[i], points[i + 1]] for i in range(0, len(points) - 1, 2)]
+
+
+def _bold(bits_, text_at: int, meter) -> list:
+    """The bold [start, end) character ranges of the TEXT bit at stream offset `text_at`, sorted and disjoint: the
+    FDPC runs' bold XOR the paragraphs' default character style."""
+    runs = _ranges(bits_.get("FDPC", ()), text_at, meter, lambda bit, at: _bold_style(bit, at, meter))
+    defaults = _defaults(bits_.get("STSH", ()), meter)
+    if not any(defaults):
+        return runs
+    base = _ranges(bits_.get("FDPP", ()), text_at, meter, lambda bit, at: _para_default(bit, at, meter, defaults))
+    return _xor(runs, base)
+
+
+def _ranges(bitlist, text_at: int, meter, flag) -> list:
+    """The [start, end) character ranges, sorted and disjoint, of the runs of FDPC-laid-out bits whose style
+    `flag(bit, at)` holds (each style offset asked once per bit)."""
     out = []
     prev = 0
     for bit in bitlist:
@@ -180,7 +249,7 @@ def _bold(bitlist, text_at: int, meter) -> list:
                 continue
             bold = styles.get(at)
             if bold is None:
-                bold = styles[at] = _bold_style(bit, at, meter)
+                bold = styles[at] = flag(bit, at)
             if bold:
                 if out and out[-1][1] == prev:
                     out[-1][1] = end
@@ -239,14 +308,15 @@ def _paras(text: str, start: int, bold: list, ends: list) -> tuple:
     return tuple(paras)
 
 
-def stories(bits_, ctx=None) -> dict:
-    """{text id: Story} (see the module docstring); {} without TEXT, STRS or SYID."""
+def stories(bits_, ctx=None, *, meter=None) -> dict:
+    """{text id: Story} (see the module docstring); {} without TEXT, STRS or SYID. `meter`: the document's
+    `pub_contents.Meter` (a new one on `ctx` when None)."""
     texts = bits_.get("TEXT")
     if not texts or "STRS" not in bits_ or "SYID" not in bits_:
         return {}
     raw = texts[-1]
     text = str(memoryview(raw)[:len(raw) // 2 * 2], "utf-16-le", "replace")
-    bold = _bold(bits_.get("FDPC", ()), raw.offset, pub_contents.Meter(ctx))
+    bold = _bold(bits_, raw.offset, meter if meter is not None else pub_contents.Meter(ctx))
     starts = [b[0] for b in bold]
     ends = [b[1] for b in bold]
     room = limits.MAX_OUTPUT
@@ -265,6 +335,8 @@ def stories(bits_, ctx=None) -> dict:
             break
         room -= cost
         piece = text[start:pos]
+        if tid in out and ctx is not None:
+            ctx.skipped["record"] += 1
         out[tid] = Story(tid, index, piece, _paras(piece, start, bold, ends))
     return out
 

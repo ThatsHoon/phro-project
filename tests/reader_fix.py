@@ -1994,14 +1994,46 @@ def _quill_fdpc(text_off, total, bold) -> bytes:
     return out + struct.pack("<I", 4) + struct.pack("<I", 6) + bytes([0x02, 0x0A])
 
 
-def pub_quill(stories, *, bold=(), tcd=None, links=(), fdpc=True, cycle=False) -> bytes:
+def _quill_fdpp(text_off, runs) -> bytes:
+    """An FDPP bit (FDPC's layout): paragraph runs (end, default character style index), each style a u32 length and,
+    unless the index is None, block 0x19 (PARAGRAPH_DEFAULT_CHAR_STYLE) holding the index."""
+    n = len(runs)
+    styles = b""
+    at = []
+    for _, index in runs:
+        at.append(8 + 6 * n + len(styles))
+        body = b"" if index is None else pub_block(0x19, 0x20, index)
+        styles += struct.pack("<I", 4 + len(body)) + body
+    out = struct.pack("<H", n) + bytes(6)
+    out += b"".join(struct.pack("<I", text_off + 2 * end) for end, _ in runs)
+    return out + b"".join(struct.pack("<H", a) for a in at) + styles
+
+
+def _quill_stsh(defaults) -> bytes:
+    """The second STSH bit as libmspub's parseDefaultStyle reads it: a u32, the count at +4, 12 bytes, the count's u32
+    offsets from +20, each style at +20 + offset past a u16; even entries are the default character styles (bold for
+    each true flag of `defaults`), odd ones paragraph styles (empty)."""
+    styles = []
+    for flag in defaults:
+        styles.append(bytes(2) + (struct.pack("<I", 6) + bytes([0x02, 0x0A]) if flag else struct.pack("<I", 4)))
+        styles.append(bytes(2) + struct.pack("<I", 4))
+    count = len(styles)
+    offsets, body = [], b""
+    for s in styles:
+        offsets.append(4 * count + len(body))
+        body += s
+    return struct.pack("<II", 0, count) + bytes(12) + b"".join(struct.pack("<I", o) for o in offsets) + body
+
+
+def pub_quill(stories, *, bold=(), tcd=None, links=(), fdpc=True, cycle=False, fdpp=None, stsh=None) -> bytes:
     """A Quill/QuillSub/CONTENTS stream: `CHNKINK `, the bit directory at 0x18 (24-byte entries: 0x18, name, id,
     two u16, kind, offset, length) and the bits from 0x200: TEXT (the `stories` texts, (text id, text) pairs, in
     UTF-16LE), STRS (PLC type 8, lengths from +12), SYID (ids from +8), FDPC when `fdpc` (bold over the `bold`
     (start, end) character ranges of the whole text), a `TCD ` bit (PLC type 0, id = the story index) for each
     {story index: cell boundaries} of `tcd`, written as the cell ends from +0xC (boundaries [0, 2, 5] are ends
     [2, 5]), and a TOKN PLC type 12 bit holding `links`. `cycle`: the directory is two lists, the second naming the
-    first as next."""
+    first as next. `fdpp`: (end, default character style index or None) paragraph runs, as an FDPP bit; `stsh`: the
+    bold flags of the default character styles, as the second of two STSH bits (the first holds none)."""
     text = "".join(t for _, t in stories).encode("utf-16-le")
     total = len(text) // 2
     data_at = 0x200
@@ -2012,6 +2044,11 @@ def pub_quill(stories, *, bold=(), tcd=None, links=(), fdpc=True, cycle=False) -
                  b"".join(struct.pack("<I", i) for i, _ in stories)))
     if fdpc:
         bits.append(("FDPC", "FDPC", 0, _quill_fdpc(data_at, total, bold)))
+    if fdpp is not None:
+        bits.append(("FDPP", "FDPP", 0, _quill_fdpp(data_at, fdpp)))
+    if stsh is not None:
+        bits.append(("STSH", "STSH", 0, _quill_stsh(())))
+        bits.append(("STSH", "STSH", 1, _quill_stsh(stsh)))
     for index, bounds in sorted((tcd or {}).items()):
         ends = list(bounds[1:])
         bits.append(("TCD ", "PLC ", index, _quill_plc(len(ends) - 1, 0, struct.pack("<I", 0xFF00), ends)))
