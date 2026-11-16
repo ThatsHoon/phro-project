@@ -9,7 +9,7 @@ from . import limits
 from .images import Assets, sniff
 from .limits import ReadError
 from .model import (
-    Bold, Break, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math,
+    Bold, Break, Code, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math,
     NoteRef, Para, Quote, Section, Table, Text,
 )
 
@@ -35,11 +35,13 @@ LOST = (
     (("page_cut",), "page past the time or page limit", "pages past the time or page limit"),
     (("page_part",), "page read in part", "pages read in part"),
     (("scan",), "scanned page not shown", "scanned pages not shown"),
+    (("textless",), "page with no text layer", "pages with no text layer"),
     (("figure",), "vector figure not shown", "vector figures not shown"),
     (("field",), "form field", "form fields"),
     (("annotation",), "annotation", "annotations"),
     (("document",), "document part", "document parts"),
     (("master",), "master slide", "master slides"),
+    (("master_page",), "master page", "master pages"),
     (("notes",), "notes page", "notes pages"),
     (("header",), "header", "headers"),
     (("footer",), "footer", "footers"),
@@ -49,14 +51,18 @@ LOST = (
     (("note",), "note", "notes"),
     (("block",), "text block", "text blocks"),
     (("shape", "alternate"), "shape", "shapes"),
+    (("stencil",), "master shape", "master shapes"),
     (("image",), "image", "images"),
     (("chart",), "chart", "charts"),
     (("table",), "table", "tables"),
+    (("db_table",), "database table", "database tables"),
+    (("query",), "query not rebuilt as SQL", "queries not rebuilt as SQL"),
     (("smartart",), "SmartArt diagram", "SmartArt diagrams"),
     (("smartart_cut",), "SmartArt diagram cut short", "SmartArt diagrams cut short"),
     (("object",), "embedded object", "embedded objects"),
     (("link",), "link", "links"),
     (("links_cut",), "hyperlink list cut short", "hyperlink lists cut short"),
+    (("connections_cut",), "connection list cut short", "connection lists cut short"),
     (("glyphs",), "text run without Unicode", "text runs without Unicode"),
     (("text",), "text run cut short", "text runs cut short"),
     (("truncated", "node", "parse"), "chapter cut short", "chapters cut short"),
@@ -69,10 +75,11 @@ LOST = (
 )
 # Named items: reported after the counted ones, by name only (a flag, not a count).
 NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"),
-         ("kf8_fallback", "KF8 layout (the MOBI 6 copy was read)"), ("plain_text", "book markup (read as plain text)"))
+         ("kf8_fallback", "KF8 layout (the MOBI 6 copy was read)"), ("plain_text", "book markup (read as plain text)"),
+         ("page_images", "page images (text layer only)"), ("linked_data", "linked tables' data (in other files)"))
 # counted too, but they only change formatting or reading order, so they are not reported
 INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story",
-                      "char_positions", "attribute", "merge", "duplicate"})  # char_positions: pdf glyph positions dropped, the text kept
+                      "char_positions", "attribute", "merge", "duplicate", "jet_page8"})  # char_positions: pdf glyph positions dropped, the text kept
 
 
 def lost(skipped) -> list:
@@ -333,6 +340,12 @@ class _Render:
             if not inner:
                 return []
             return [("q", self._tag(b, "\n".join(("> " + ln).rstrip() for ln in inner.split("\n"))))]
+        if isinstance(b, Code):
+            if not b.text.strip():
+                return []
+            runs = re.findall(r"`+", b.text)
+            fence = "`" * max(3, max(map(len, runs), default=0) + 1)
+            return [("c", self._tag(b, f"{fence}{b.lang}\n{b.text}\n{fence}"))]
         if isinstance(b, Section):
             return self._section(b)
         return []
@@ -366,6 +379,12 @@ class _Render:
             head = "## Slide" + (f" {s.number}" if s.number is not None else "") + (f": {s.title}" if s.title else "")
         elif s.kind == "sheet":
             head = f"## Sheet: {s.title}"
+        elif s.kind == "table":
+            head = f"## Table: {s.title}"
+        elif s.kind == "query":
+            head = f"## Query: {s.title}"
+        elif s.kind == "master":
+            head = f"## Master page: {s.title}"
         elif s.kind == "page" and s.number is not None:
             head = f"## Page {s.number}" + (f": {s.title}" if s.title else "")
         elif s.kind == "page" and s.title:
@@ -405,6 +424,8 @@ class _Render:
                 s = self._image_text(b, m)
             elif isinstance(b, Equation):
                 s = m.esc(f"${b.tex}$")
+            elif isinstance(b, Code):
+                s = m.esc(b.text)
             elif isinstance(b, Quote):
                 s = m.br.join(x for x in (self._flat(x, m) for x in b.blocks) if x)
             elif isinstance(b, Section):
@@ -471,6 +492,8 @@ class _Render:
             return bool(b.alt.strip()) or (len(b.data) >= 16 and sniff(b.data) is not None)
         if isinstance(b, Equation):
             return True
+        if isinstance(b, Code):
+            return bool(b.text.strip())
         if isinstance(b, (Quote, Section)):
             return self._has_text(b.blocks)
         if isinstance(b, Table):

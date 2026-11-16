@@ -122,8 +122,15 @@ class Quote:
 
 
 @dataclass
+class Code:
+    text: str
+    lang: str = ""
+    hidden: str = _hid()
+
+
+@dataclass
 class Section:
-    kind: str  # slide | sheet | chapter | page
+    kind: str  # slide | sheet | chapter | page | table | query | master
     title: str = ""
     number: int | None = None
     blocks: list = field(default_factory=list)
@@ -132,7 +139,7 @@ class Section:
     comments: list = field(default_factory=list)  # Para, one per comment, shown after the notes
 
 
-Block = Union[Heading, Para, ListItem, Table, Image, Equation, Quote, Section]
+Block = Union[Heading, Para, ListItem, Table, Image, Equation, Quote, Code, Section]
 
 
 @dataclass

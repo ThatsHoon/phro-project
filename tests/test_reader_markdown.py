@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from reader import limits, markdown, text  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import (  # noqa: E402
-    Bold, Break, Cell, Context, Doc, Equation, Heading, Hidden, Image, Link,
+    Bold, Break, Cell, Code, Context, Doc, Equation, Heading, Hidden, Image, Link,
     ListItem, Math, NoteRef, Para, Quote, Section, Table, Text,
 )
 
@@ -586,6 +586,28 @@ def test_phase3_skip_kinds():
     assert markdown.unread({"table": 2, "kf8_fallback": 1, "plain_text": 1, "attribute": 3, "merge": 1,
                             "duplicate": 1}) == ["2 tables", "KF8 layout (the MOBI 6 copy was read)",
                                                  "book markup (read as plain text)"]
+
+
+def test_code_fence():
+    assert R(Doc(blocks=[Code("SELECT 1;", "sql")])) == "```sql\nSELECT 1;\n```\n"
+    assert R(Doc(blocks=[Code("a ``` b")])) == "````\na ``` b\n````\n"
+    assert R(Doc(blocks=[Code("x ````` y")])) == "``````\nx ````` y\n``````\n"
+    assert R(Doc(blocks=[Code("")])) == ""
+    assert R(Doc(blocks=[Code("  \n ")])) == ""
+
+
+def test_phase4_section_heads():
+    assert R(Doc(blocks=[Section("table", title="Orders (1,204 rows)")])) == "## Table: Orders (1,204 rows)\n"
+    assert R(Doc(blocks=[Section("query", title="Q1")])) == "## Query: Q1\n"
+    assert R(Doc(blocks=[Section("master", title="Master A")])) == "## Master page: Master A\n"
+
+
+def test_phase4_skip_kinds():
+    assert markdown.unread({"textless": 2, "master_page": 1, "stencil": 2, "db_table": 1, "query": 3,
+                            "connections_cut": 1, "page_images": 1, "linked_data": 1, "jet_page8": 4}) == [
+        "2 pages with no text layer", "1 master page", "2 master shapes", "1 database table",
+        "3 queries not rebuilt as SQL", "1 connection list cut short", "page images (text layer only)",
+        "linked tables' data (in other files)"]
 
 
 def main():
