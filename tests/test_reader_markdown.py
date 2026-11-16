@@ -610,6 +610,13 @@ def test_phase4_skip_kinds():
         "linked tables' data (in other files)"]
 
 
+def test_hidden_code_and_lang():
+    doc = Doc(blocks=[P("a"), Code("SELECT 1;", "sql", hidden="hidden")])
+    assert R(doc, hidden=True) == "a\n\n(hidden)\n```sql\nSELECT 1;\n```\n", R(doc, hidden=True)
+    assert R(doc) == "(1 hidden places left out)\n\na\n", R(doc)
+    assert R(Doc(blocks=[Code("x", "s`q\nl")])) == "```sql\nx\n```\n"
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

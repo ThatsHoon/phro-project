@@ -345,7 +345,8 @@ class _Render:
                 return []
             runs = re.findall(r"`+", b.text)
             fence = "`" * max(3, max(map(len, runs), default=0) + 1)
-            return [("c", self._tag(b, f"{fence}{b.lang}\n{b.text}\n{fence}"))]
+            lang = re.sub(r"[`\r\n]", "", b.lang)
+            return [("c", ("(hidden)\n" if b.hidden and self.show else "") + f"{fence}{lang}\n{b.text}\n{fence}")]
         if isinstance(b, Section):
             return self._section(b)
         return []
