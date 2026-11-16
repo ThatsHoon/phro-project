@@ -134,6 +134,27 @@ def test_private_sessions():
     assert "비공개" not in text and "보통 작업" in text and "공개 작업" in text, text
 
 
+def test_private_command():
+    plugin = copy_of(Path(tempfile.mkdtemp()))
+    real = HOME / ".claude/private-sessions.txt"
+    me = {"CLAUDE_CODE_SESSION_ID": "dddd4444-0000"}
+    try:
+        assert daily(plugin, "private", extra=me).stdout == "PRIVATE\tdddd4444-0000\n", "the running session, whole"
+        assert daily(plugin, "private", extra=me).stdout.startswith("EXISTS\t"), "never twice"
+        out = daily(plugin, "private", "--session", "eeee5555", "--from", "2026-11-10T09:00", "--to", "2026-11-10T10:30", extra=me).stdout
+        assert out == "PRIVATE\teeee5555 2026-11-10T00:00:00Z 2026-11-10T01:30:00Z\n", out
+        assert "9999-01-01" in daily(plugin, "private", "--session", "ffff6666", "--from", "now").stdout, "from now on, open"
+        assert daily(plugin, "private", "--from", "now", "--to", "2020-01-01", extra=me).stdout.startswith("FAILED"), "an end before the start"
+        assert daily(plugin, "private", extra={"CLAUDE_CODE_SESSION_ID": ""}).stdout.startswith("FAILED"), "no session, no line"
+        d = load(plugin)
+        d.PRIVATE = real
+        hidden = d.private()
+        assert hidden["dddd4444-0000"] is None and hidden["eeee5555"][0][0] == datetime(2026, 11, 10, 0, 0, tzinfo=timezone.utc), hidden
+        assert real.read_text(encoding="utf-8").startswith("#"), "a new file explains itself"
+    finally:
+        real.unlink(missing_ok=True)
+
+
 def test_check():
     d = load(copy_of(Path(tempfile.mkdtemp())))
     assert d.check("```\n" + GOOD + "```") == GOOD

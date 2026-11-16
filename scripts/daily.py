@@ -5,6 +5,7 @@
   daily.py run [--date YYYY-MM-DD] [--force]      gather the period, ask `claude -p` for the report, check its form, write the file
   daily.py digest [--date YYYY-MM-DD]             print what `run` would send, for a look
   daily.py on | off                               turn the morning hook on or off for this copy (off by default)
+  daily.py private [--session ID] [--from T] [--to T]  keep this session (or a stretch of it) out of every report
 
 Only a copy writes reports (origin.json names its project); the original plugin stays silent.
 `clone.py ensure` writes new copies with "daily": false, so the hook stays off until `daily.py on`; a copy without the key
@@ -385,11 +386,48 @@ def hook():
         start_background(day)
 
 
+def moment(value):
+    """An ISO time or "now", as UTC; a time without a zone is KST."""
+    t = datetime.now(KST) if value == "now" else datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return (t if t.tzinfo else t.replace(tzinfo=KST)).astimezone(timezone.utc)
+
+
+def register(sid, start=None, end=None):
+    """Add one line to PRIVATE: the whole session, or the stretch from start to end (an open end runs to year 9999)."""
+    if not sid or not re.fullmatch(r"[\w-]{8,}", sid):
+        print("FAILED\tno session id: pass --session, or run it from inside a Claude Code session")
+        return 1
+    if start is None and end is not None:
+        print("FAILED\t--to needs --from")
+        return 1
+    if start is not None:
+        end = end or datetime(9999, 1, 1, tzinfo=timezone.utc)
+        if end <= start:
+            print("FAILED\t--to must come after --from")
+            return 1
+    line = sid if start is None else f"{sid} {start:%Y-%m-%dT%H:%M:%SZ} {end:%Y-%m-%dT%H:%M:%SZ}"
+    PRIVATE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        old = PRIVATE.read_text(encoding="utf-8")
+    except OSError:
+        old = '# Sessions the daily report never reads: "<session id>", or "<session id> <from> <to>" (ISO; Z = UTC, no zone = KST)\n'
+    if line in old.splitlines():
+        print(f"EXISTS\t{line}")
+        return 0
+    PRIVATE.write_text(old + ("" if old.endswith("\n") or not old else "\n") + line + "\n", encoding="utf-8")
+    print(f"PRIVATE\t{line}")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
     for name in ("hook", "on", "off"):
         sub.add_parser(name)
+    s = sub.add_parser("private", help="keep this session, or a stretch of it, out of the report")
+    s.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"), help="the default is the session running this command")
+    s.add_argument("--from", dest="start", type=moment, help='ISO time or "now"; without it the whole session')
+    s.add_argument("--to", dest="end", type=moment, help='ISO time or "now"; without it the stretch stays open')
     for name in ("run", "digest"):
         s = sub.add_parser(name)
         s.add_argument("--date", type=lambda v: datetime.strptime(v, "%Y-%m-%d").date(), default=datetime.now(KST).date())
@@ -405,6 +443,8 @@ def main():
         return 0
     if a.command in ("on", "off"):
         return switch(a.command == "on")
+    if a.command == "private":
+        return register(a.session, a.start, a.end)
     if a.command == "digest":
         root = project()
         print(digest(root, a.date)[0] if root else "SKIPPED\tthe original plugin writes no report")
