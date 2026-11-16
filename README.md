@@ -303,7 +303,7 @@ Run as `python -I -X utf8 scripts/clone.py <command>`.
 | Command | Does |
 |---|---|
 | `ensure <root> [--dest dir] [--no-register]` | Prints `CREATED`, `EXISTS`, `THIS`, `ORIGINAL`, `WRONG-PROJECT` or `NO-PROJECT`, and what to do. Every skill runs it first |
-| `sync [--from dir] [--dry-run]` | Run from a copy. Takes a newer original: files the project did not touch are updated, new ones added, dropped ones removed. Files the project added stay, and files it changed stay and print as `kept`. An original in a git checkout is taken from its published ref (`origin/main`, else `main`) by `git archive`, never from a worktree; a session hears of a new commit or a changed folder, not only a new version. `--dry-run` lists the changes and writes nothing. `.git` files, `.superpowers`, `.worktrees` and Claude Code's `.in_use` marks never reach a copy |
+| `sync [--from dir] [--dry-run]`, `merged <path>...` | Run from a copy. Takes a newer original: files the project did not touch are updated, new ones added, dropped ones removed. Files the project added stay, and files it changed stay and print as `kept`; `kept-changed` when the original changed the same file (with the original's `<base>..<new>` commits when it is a git checkout, and named on every sync until `merged <path>` records the change as taken), `kept-removed` when the original deleted it. An original in a git checkout is taken from its published ref (`origin/main`, else `main`) by `git archive`, never from a worktree; a session hears of a new commit or a changed folder, not only a new version. `--dry-run` lists the changes and writes nothing. `.git` files, `.superpowers`, `.worktrees` and Claude Code's `.in_use` marks never reach a copy |
 
 ## `restructure.py` commands
 

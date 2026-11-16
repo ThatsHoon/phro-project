@@ -151,7 +151,9 @@ def demo():
         assert "A new line in the original." in (copy / "skills/design/SKILL.md").read_text(encoding="utf-8"), out.stdout
         assert (copy / "skills/fresh/SKILL.md").exists() and not (copy / "skills/route-test/SKILL.md").exists(), out.stdout
         assert (copy / "skills/own/SKILL.md").read_text(encoding="utf-8") == own, "what the project added stays"
-        assert (copy / "skills/audit/SKILL.md").read_text(encoding="utf-8") == changed and "kept\tskills/audit/SKILL.md" in out.stdout, out.stdout
+        assert (copy / "skills/audit/SKILL.md").read_text(encoding="utf-8") == changed, out.stdout
+        assert "kept-changed\tskills/audit/SKILL.md\n" in out.stdout, "both changed it: the copy keeps its own and is told the original moved"
+        assert "kept\tskills/own/SKILL.md" not in out.stdout, "a file only the project has is its own, not a kept one"
         manifest = json.loads((copy / clone.MANIFEST).read_text(encoding="utf-8"))
         assert manifest["version"] == "9.0.0" and manifest["name"] == "phro-project_demo-app", manifest
         assert "SYNCED\t9.0.0" in out.stdout and "/reload-plugins" in out.stdout, out.stdout
@@ -159,7 +161,12 @@ def demo():
 
         after = tree(copy)
         out = run(copy, "sync")
-        assert tree(copy) == {**after, clone.ORIGIN: tree(copy)[clone.ORIGIN]} and "kept\tskills/audit/SKILL.md" in out.stdout, "a second sync changes nothing, and still names what it keeps"
+        assert tree(copy) == {**after, clone.ORIGIN: tree(copy)[clone.ORIGIN]} and "kept-changed\tskills/audit/SKILL.md" in out.stdout, "a second sync changes nothing, and still names the change not taken"
+        merged = run(copy, "merged", "skills/audit/SKILL.md", "skills/own/SKILL.md")
+        assert "MERGED\tskills/audit/SKILL.md" in merged.stdout and "SKIPPED\tskills/own/SKILL.md" in merged.stdout, merged.stdout
+        dry = run(copy, "sync", "--dry-run")
+        assert "keep\tskills/audit/SKILL.md\n" in dry.stdout and "keep-changed" not in dry.stdout, "once merged, only a later change of the original is named"
+        assert "pending" not in json.loads((copy / clone.ORIGIN).read_text(encoding="utf-8"))
         assert "updated\t0" in out.stdout and "added\t0" in out.stdout and "removed\t0" in out.stdout, out.stdout
 
         (newer / "skills/design/SKILL.md").write_text("restored\n", encoding="utf-8")
@@ -171,7 +178,8 @@ def demo():
             f.write("\nThe project grew this.\n")
         out = run(copy, "sync")
         assert "restored" not in (copy / "skills/design/SKILL.md").read_text(encoding="utf-8"), "a file the project edited is never overwritten"
-        assert (copy / "skills/fresh/SKILL.md").exists() and "kept\tskills/fresh/SKILL.md" in out.stdout, "nor deleted"
+        assert (copy / "skills/fresh/SKILL.md").exists() and "kept-removed\tskills/fresh/SKILL.md" in out.stdout, "nor deleted, and the removal is named"
+        assert "kept-changed\tskills/design/SKILL.md" in out.stdout, out.stdout
 
         repo = base / "repo"
         shutil.copytree(original, repo, ignore=shutil.ignore_patterns(".git", "__pycache__", ".superpowers", ".worktrees"))
@@ -206,6 +214,15 @@ def demo():
         out = run(gcopy, "sync")
         assert out.returncode == 0 and (gcopy / "skills/audit/SKILL.md").read_text(encoding="utf-8") == "Committed later.\n", (out.stdout, out.stderr)
         assert "newer" not in hook(gcopy, gapp), "the worktree it came from is gone, and the copy still follows the repository"
+        two = git("rev-parse", "--short=7", "main")
+        with (gcopy / "skills/audit/SKILL.md").open("a", encoding="utf-8") as f:
+            f.write("The project's line.\n")
+        (repo / "skills/audit/SKILL.md").write_text("Committed later.\nAnd again.\n", encoding="utf-8")
+        git("commit", "-q", "-am", "three")
+        out = run(gcopy, "sync")
+        three = git("rev-parse", "--short=7", "main")
+        assert f"kept-changed\tskills/audit/SKILL.md\t{two}..{three}" in out.stdout, "the range to read is the original's own history"
+        assert "And again." not in (gcopy / "skills/audit/SKILL.md").read_text(encoding="utf-8")
 
         calls = []
 

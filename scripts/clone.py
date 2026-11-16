@@ -5,6 +5,10 @@ A project's first use copies the plugin to ~/phro-project_<project> and turns it
 
   clone.py ensure <project root> [--dest DIR] [--no-register]   make this project's copy if it has none, and say which plugin to use
   clone.py sync [--from DIR] [--dry-run]                        run from a copy: take a newer original, keeping what the project added or changed
+  clone.py merged <path>...                                     run from a copy: the original's change to a kept file is now in it
+
+A kept file the original also changed prints `kept-changed` (with `<base>..<new>` commits of the original's repository when
+known) and stays listed until `merged`; one the original deleted prints `kept-removed`.
 
 Updates flow one way, from the original into a copy. What a project adds to or changes in its copy is its own and never goes back.
 """
@@ -193,6 +197,20 @@ def repo_of(record):
     return git_origin(Path(record["origin_dir"])) if Path(record["origin_dir"]).is_dir() else None
 
 
+def base_of(repo, ref, rel, recorded):
+    """The short commit of the original whose rel hashes to recorded (as an export writes it), or None."""
+    for commit in (git(repo, "log", "--format=%H", "-n", "200", ref, "--", rel) or "").split():
+        data = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", commit, "--", rel], capture_output=True).stdout
+        try:
+            with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+                body = tar.extractfile(rel).read()
+        except (tarfile.TarError, KeyError, AttributeError):
+            continue
+        if hashlib.sha256(body).hexdigest()[:16] == recorded:
+            return commit[:7]
+    return None
+
+
 def newer(record):
     """What is ahead of this copy, or None: a new commit on the original's ref, or an original folder that changed or has a newer version."""
     found = repo_of(record)
@@ -225,15 +243,17 @@ def command_sync(a):
             for key in ("origin_repo", "origin_ref"):
                 record.pop(key, None)
             where = {"origin_dir": str(source), "origin_id": tree_id(source)}
-        take(record, source, where, a.dry_run)
+        take(record, source, where, a.dry_run, (found[0], found[1]) if found else None)
 
 
-def take(record, source, where, dry_run):
-    """Bring source into this copy. Files the project added or changed stay as they are."""
+def take(record, source, where, dry_run, history=None):
+    """Bring source into this copy. Files the project added or changed stay as they are; the original's changes to them are named."""
     old = record["files"]
     files = {}
     counts = {"updated": 0, "added": 0, "removed": 0}
     kept = []
+    changed = {}  # kept file -> what the copy has not taken from the original: "", "<base>..<new>" or "removed"
+    pending = {}
     planned = []
 
     def act(kind, rel):
@@ -257,6 +277,10 @@ def take(record, source, where, dry_run):
                 kept.append(rel)
                 if rel in old:
                     files[rel] = old[rel]
+                    if old[rel] != wanted:  # the original changed it too, and the copy does not have that change
+                        base = history and base_of(history[0], history[1], rel, old[rel])
+                        changed[rel] = f"{base}..{where['origin_id'][:7]}" if base else ""
+                        pending[rel] = wanted
                 continue
             if current != wanted:
                 act("updated", rel)
@@ -269,24 +293,53 @@ def take(record, source, where, dry_run):
             act("removed", rel)
         else:
             kept.append(rel)
+            changed[rel] = "removed"
     version = read_json(source / MANIFEST)["version"]
     if dry_run:
         for line in planned:
             print(line)
         for rel in sorted(kept):
-            print(f"keep\t{rel}")
+            print(kept_line("keep", rel, changed))
         print(f"DRY-RUN\t{version}\tnothing was written; run sync without --dry-run to take it")
         return
     manifest = read_json(HERE / MANIFEST)
     manifest["version"] = version
     write_json(HERE / MANIFEST, manifest)
-    record.update(**where, version=version, files=files)
+    record.update(**where, version=version, files=files, pending=pending)
+    if not pending:
+        record.pop("pending")
     write_json(HERE / ORIGIN, record)
     for name, number in counts.items():
         print(f"{name}\t{number}")
     for rel in sorted(kept):
-        print(f"kept\t{rel}")
+        print(kept_line("kept", rel, changed))
     print(f"SYNCED\t{version}\ttell the user to type /reload-plugins")
+
+
+def kept_line(word, rel, changed):
+    if rel not in changed:
+        return f"{word}\t{rel}"
+    if changed[rel] == "removed":
+        return f"{word}-removed\t{rel}"
+    return f"{word}-changed\t{rel}" + (f"\t{changed[rel]}" if changed[rel] else "")
+
+
+def command_merged(a):
+    """The project took the original's change into these kept files, so the next sync stops naming it."""
+    if not (HERE / ORIGIN).is_file():
+        sys.exit("FAILED\tthis is the original: run merged from a project's copy")
+    record = read_json(HERE / ORIGIN)
+    pending = record.get("pending", {})
+    for rel in a.paths:
+        rel = Path(rel).as_posix()
+        if rel not in pending:
+            print(f"SKIPPED\t{rel}\tno change of the original waits in it")
+            continue
+        record["files"][rel] = pending.pop(rel)
+        print(f"MERGED\t{rel}")
+    if not pending:
+        record.pop("pending", None)
+    write_json(HERE / ORIGIN, record)
 
 
 def main():
@@ -301,6 +354,9 @@ def main():
     p.add_argument("--from", dest="source", help="the original to take; the default is the original's published ref, or the newest installed")
     p.add_argument("--dry-run", action="store_true", help="list what would change and write nothing")
     p.set_defaults(fn=command_sync)
+    p = sub.add_parser("merged", help="mark the original's change to kept files as taken into them")
+    p.add_argument("paths", nargs="+", help="paths relative to the copy, as sync printed them")
+    p.set_defaults(fn=command_merged)
     a = parser.parse_args()
     a.fn(a)
 
