@@ -688,13 +688,13 @@ JAVA_EXE = str(Path(tempfile.gettempdir()) / "fake-jdk" / "bin" / "java.exe")
 
 @contextmanager
 def which_java(path):
-    """shutil.which("java") answers `path` (None: no java); every other name goes to the real which."""
-    real = shutil.which
-    shutil.which = lambda name, *a, **k: path if name == "java" else real(name, *a, **k)
+    """pyenv.find_java() answers `path` (None: no java)."""
+    real = pyenv.find_java
+    pyenv.find_java = lambda: path
     try:
         yield
     finally:
-        shutil.which = real
+        pyenv.find_java = real
 
 
 def jdk(d, rel=("bin", "server", "jvm.dll")):
@@ -1056,6 +1056,73 @@ def test_prune_skips_mpp_declined():
     import inspect
     from reader import cache
     assert '"mpp-declined"' in inspect.getsource(cache.prune)
+
+
+def _fake_java_in(folder):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    exe = folder / ("java.exe" if sys.platform == "win32" else "java")
+    exe.write_bytes(b"")  # a clean empty file: it is never run, the run is stubbed
+    return exe
+
+
+@contextmanager
+def path_and_cwd(path, cwd):
+    old_path, old_cwd = os.environ.get("PATH"), os.getcwd()
+    os.environ["PATH"] = path
+    os.chdir(cwd)
+    try:
+        yield
+    finally:
+        os.chdir(old_cwd)
+        if old_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = old_path
+
+
+def test_find_java_absolute_entries_only():
+    with env() as d:
+        planted = _fake_java_in(d / "planted")
+        good = _fake_java_in(d / "good")
+        # the current directory and relative / empty PATH entries are never searched
+        with path_and_cwd(os.pathsep.join(["", ".", "planted", "rel"]),
+                          d / "planted"):
+            assert pyenv.find_java() is None
+            assert pyenv.java_info() == "java not found on PATH"
+        with path_and_cwd(os.pathsep.join(["", ".", "rel", str(good.parent)]), d / "planted"):
+            got = pyenv.find_java()
+            assert os.path.normcase(got) == os.path.normcase(str(good)) and os.path.isabs(got), got
+        with path_and_cwd(str(d / "empty-dir"), d):
+            assert pyenv.find_java() is None
+
+
+def test_java_info_runs_the_full_path():
+    with env() as d:
+        planted = _fake_java_in(d / "planted")
+        good = _fake_java_in(d / "good")
+        home = jdk(d)
+        run = java_run(home)
+        with path_and_cwd(os.pathsep.join([".", str(good.parent)]), d / "planted"):
+            info = pyenv.java_info(run=run)
+        nc = os.path.normcase
+        assert nc(info["path"]) == nc(str(good)) and run.cmd[0] == info["path"], (info, run.cmd)
+        assert nc(run.cmd[0]) != nc(str(planted)) and run.cmd[0] != "java"
+
+
+def test_state_ignores_a_planted_java():
+    with env() as d:
+        good = _fake_java_in(d / "good")
+        planted = _fake_java_in(d / "planted")
+        dest = d / "mpp-venv"
+        with path_and_cwd(str(good.parent), d):
+            info = pyenv.java_info(run=java_run(jdk(d)))
+        assert pysetup.setup(dest, MppStub(info), kind="mpp").startswith("READY	")
+        with path_and_cwd(os.pathsep.join([".", str(good.parent)]), d / "planted"):
+            assert pyenv.state(dest, "mpp") == "READY"
+        with path_and_cwd(".", d / "planted"):  # only a planted java in the cwd: not found, so STALE
+            assert pyenv.state(dest, "mpp") == "STALE"
+        assert planted.is_file()
 
 
 def main():

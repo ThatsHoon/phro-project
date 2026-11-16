@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sys
 from pathlib import Path
 
@@ -103,6 +102,23 @@ def _home(venv):
     return None
 
 
+def find_java():
+    """The first `java` on the absolute entries of PATH, as an absolute path, else None. shutil.which and a bare
+    name given to CreateProcess both look in the current directory first on Windows, so PATH is walked here:
+    empty, "." and other relative entries are skipped."""
+    exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e] \
+        if sys.platform == "win32" else [""]
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry):
+            continue
+        for ext in exts:
+            cand = os.path.join(entry, "java" + ext)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
 def _same_path(a, b) -> bool:
     return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
 
@@ -115,7 +131,7 @@ def _java_ok(ready) -> bool:
     path, jvm = java.get("path"), java.get("jvm")
     if not isinstance(path, str) or not isinstance(jvm, str):
         return False
-    found = shutil.which("java")
+    found = find_java()
     try:
         return bool(found) and _same_path(found, path) and Path(jvm).is_file()
     except (OSError, ValueError):
@@ -285,7 +301,7 @@ def _props(text) -> dict:
 
 def java_info(run=None):
     """Run `java -XshowSettings:properties -version`: {"path", "major", "home", "jvm", "bits"}, or the FAIL detail."""
-    path = shutil.which("java")
+    path = find_java()
     if not path:
         return "java not found on PATH"
     if run is None:
