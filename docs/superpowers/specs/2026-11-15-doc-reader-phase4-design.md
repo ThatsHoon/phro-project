@@ -8,7 +8,7 @@ The gate converts djvu (its text layer only), Access databases (mdb, accdb, mde,
 
 Success, as in the engine spec, with these changes:
 
-- Every phase 4 extension but mpp converts with the standard library alone. mpp converts only through the opt-in path.
+- Every phase 4 extension but mpp converts with no install, through the engine's own parsers (the standard library is not a goal: a library replaces a parser wherever it measurably wins on tokens or compute, installed on the user's yes; the user, 2026-11-16). mpp converts only through the opt-in path.
 - No bench document of these formats has a truth file. The bar per format is in "Bench" below. Where there is no truth, it says what the bar becomes.
 - No real document's name or content enters this repository. Bench documents are named by doc_id only.
 
@@ -425,7 +425,7 @@ In "## Document reader":
   - pub pages, tables, pictures and master pages;
   - vsd and vsdx connection lists and master text;
   - mpp through the opt-in MPXJ venv, Java not installed by the plugin, and MPXJ's LGPL-2.1 licence (installed, not copied).
-- "Standard library only" gains "except the optional pdf and mpp engines in their own venvs".
+- "Standard library only" is replaced by: no install needed for the built formats; the optional pdf and mpp engines run in their own venvs, installed on the user's yes; libraries are chosen by token and compute efficiency.
 - The extension count changes, and the phase 4 bench lines are added after the phase.
 
 In "## Not done yet", phase 4 is built.

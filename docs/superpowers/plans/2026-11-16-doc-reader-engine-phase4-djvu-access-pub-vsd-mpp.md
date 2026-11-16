@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** The Read gate converts djvu (its text layer only), Access databases (`mdb`, `accdb`, `mde`, `accde`, `accdr`), Publisher (`pub`) and Visio binary (`vsd`, `vst`) with the standard library alone. vsdx (and `vsdm`, `vstx`) gains master text and a connection list, so vsd and vsdx give the same output. Project (`mpp`, `mpt`) stays denied, with one opt-in path: MPXJ in a plugin-managed venv, installed only on the user's yes, using Java already on PATH.
+**Goal:** The Read gate converts djvu (its text layer only), Access databases (`mdb`, `accdb`, `mde`, `accde`, `accdr`), Publisher (`pub`) and Visio binary (`vsd`, `vst`) with no install (the engine's own parsers; the standard library is not a goal, see Global Constraints). vsdx (and `vsdm`, `vstx`) gains master text and a connection list, so vsd and vsdx give the same output. Project (`mpp`, `mpt`) stays denied, with one opt-in path: MPXJ in a plugin-managed venv, installed only on the user's yes, using Java already on PATH.
 
 **Architecture:**
 - **Five shared parts:**
@@ -19,7 +19,7 @@
   - `formats/mpp.py` raises `unsupported` outside the mpp venv. `formats/mpp_mpxj.py` runs only in the child under the mpp venv.
 - **Output path:** everything ends in the existing model and renderer, `sheet_grid.Grid` with one `sheet_grid.Budget` per document, `officeart` and `images`. The model gains one block, `Code`, and three section kinds.
 
-**Tech Stack:** The Python 3.12 standard library only, except `formats/mpp_mpxj.py`, which imports `jpype` and `mpxj` inside its functions and runs only under the mpp venv interpreter. Tests are plain scripts. The bench at `C:/Users/hunje/research/ai-document-reader-plugins/bench` is the yardstick.
+**Tech Stack:** Python 3.12. The parsers in this plan need no third-party package; the standard library is not a goal (user, 2026-11-16) and a library may replace a parser where it measurably wins on tokens or compute (installed only on the user's yes). `formats/mpp_mpxj.py` which imports `jpype` and `mpxj` inside its functions and runs only under the mpp venv interpreter. Tests are plain scripts. The bench at `C:/Users/hunje/research/ai-document-reader-plugins/bench` is the yardstick.
 
 **Spec:** `docs/superpowers/specs/2026-11-15-doc-reader-phase4-design.md`, approved 2026-11-16 (commit 245e797). It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md`. The engine spec edits that the phase 4 spec lists at its end are **not** in the repository yet; Task 1 makes them. Read both specs before Task 2. Each task names the spec sections it implements, and those sections hold the exact values. Where this plan repeats a value, it is the spec's.
 
@@ -53,7 +53,7 @@
 
 ## Global Constraints
 
-- **Imports:** `scripts/read.py` and everything under `scripts/reader/` import only the Python 3.12 standard library, except `formats/pdf_pdfium.py` (2d) and `formats/mpp_mpxj.py`, which import their libraries inside functions and run only under their venv. Every command runs as `python -I -X utf8`.
+- **Imports:** the standard library is not a goal (user, 2026-11-16); choose by token and compute efficiency. The gate must still work with no install: a third-party import lives in a module that imports it inside functions and runs only under its plugin-managed venv (today `formats/pdf_pdfium.py` and `formats/mpp_mpxj.py`), pinned and hash-checked in a requirements file, installed only on the user's yes. Every command runs as `python -I -X utf8`.
 - **Leave `scripts/reader/formats/rtf_lex.py` alone.** It has an uncommitted owner change. Never edit, stage, restore or stash it.
 - **Tests:**
   - They run as `python -I -X utf8 <worktree>/tests/<file>.py`. Each file defines `test_*` functions and a `main()` that runs them all and prints `pass` last. A `measure` argument runs measurements instead.
