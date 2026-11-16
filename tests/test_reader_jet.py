@@ -4,6 +4,7 @@ and the reader in jet (encryption, catalog, TDEFs, rows, scalar values, output).
 Run: python -I -X utf8 tests/test_reader_jet.py
 """
 import datetime
+import random
 import tracemalloc
 import struct
 import sys
@@ -17,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
 from reader.containers import crypto  # noqa: E402
-from reader.formats import jet, jet_pages  # noqa: E402
+from reader.formats import jet, jet_pages, sheet_grid  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Para, Section, Table, Text  # noqa: E402
 from jet_fix import (Col, Query, Row, Tbl, jet_db, BINARY, BIGINT, BOOL, BYTE, DATE, DOUBLE,  # noqa: E402
@@ -602,6 +603,24 @@ def catalog_spend(data):
     return db.spent
 
 
+def row_spend(data, name="M"):
+    """(lead, per row) for table `name`, whose rows each cost the same: what the meter has charged when its first row
+    is about to be read (the catalog, the TDEF, the map, the first page and its slots), and what each row then costs
+    net (its row, mask byte, cells and value, the shown cells given back)."""
+    db = jet._Db(jet_pages.open(data), Context())
+    jet._catalog(db)
+    tdef = jet._tdef(db, tdef_page(data, name))
+    spent = []
+    for _, cells in jet._rows(db, tdef):
+        jet._shown(db, tdef.columns, cells, [])
+        spent.append(db.spent)
+        if len(spent) == 3:
+            break
+    per = spent[2] - spent[1]
+    assert spent[1] - spent[0] == per, spent
+    return spent[0] - per, per
+
+
 def test_long_value_budget():
     # 200 cells naming one 40,000-byte chain: read and decoded once; each repeat is charged, so the file's work total
     # (ten times the file and 1 MiB here) stops the table when it is spent: one sheet_cut, no row past it
@@ -617,9 +636,11 @@ def test_long_value_budget():
     assert 0 < len(shown) <= total // cost and set(shown) == {"a" * 20_000} and ctx.skipped == {"sheet_cut": 1}
     old = limits.JET_WORK_TOTAL
     try:
-        # the total, lowered to the catalog and five rows (each a row and its memo, and room for a row's two cells,
-        # charged before the grid gives them back): five rows, then the cut
-        limits.JET_WORK_TOTAL = catalog_spend(data) + 5 * (jet._ROW + cost) + 2 * jet._CELL
+        # the total, lowered to what comes before the rows and five rows (each a row, its mask byte and its memo, and
+        # room for a row's two cells, charged before the grid gives them back): five rows, then the cut
+        lead, per = row_spend(data)
+        assert per == jet._ROW + jet._GROUP + cost, (per, cost)
+        limits.JET_WORK_TOTAL = lead + 5 * per + 2 * jet._CELL
         doc, ctx, _ = convert(data)
         assert [r[1] for r in grid(section(doc, "M"))[1:]] == ["a" * 20_000] * 5 and ctx.skipped == {"sheet_cut": 1}
         # distinct definitions defeat the cache: the total still bounds the LVAL bytes read, the work stops
@@ -641,7 +662,8 @@ def test_long_value_forms():
     assert [r[1] for r in grid(section(doc, "M"))[1:]] == ["a" * 500] * 51 and not ctx.skipped
     assert rows.calls == 1, rows.calls
     old = limits.JET_WORK_TOTAL
-    limits.JET_WORK_TOTAL = catalog_spend(data) + 2 * (jet._ROW + memo_cost(data)) + 2 * jet._CELL
+    lead, per = row_spend(data)
+    limits.JET_WORK_TOTAL = lead + 2 * per + 2 * jet._CELL
     try:
         doc, ctx, _ = convert(data)
     finally:
@@ -847,16 +869,25 @@ def test_kept_target_counts_repeat():
 
 
 def test_work_charges():
-    # what each path costs: a row visited _ROW, each present cell _CELL (given back when it makes a grid cell, which
-    # the grid's caps bound from there), text its bytes; a null cell is not visited
+    # what each path costs: the map's bytes, each page it names _PAGE, each row slot _SLOT, a row visited _ROW, its
+    # mask byte _GROUP, each present cell _CELL (given back when it makes a grid cell, which the grid's caps bound from
+    # there), text its bytes; a null cell is not visited
     data = jet_db(1, [Tbl("E", [Col("ID", LONG), Col("T", TEXT), Col("M", MEMO), Col("N", LONG)],
                           [[i, "", "x" * 30, None] for i in range(50)])])
     db = jet._Db(jet_pages.open(data), Context())
     jet._catalog(db)
     base = db.spent
     tdef = jet._tdef(db, tdef_page(data, "E"))
+    # its one page (a chain item), four column definitions and their names' bytes, its index blocks
+    names = len("IDTMN".encode("utf-16-le"))
+    idx = jet._IDX * (len(tdef.real) + len(tdef.logical))
+    assert db.spent - base == jet_pages.CHAIN_STEP + 4 * jet._COLDEF + names + idx, (db.spent - base, idx)
+    base = db.spent
+    pages = db.jet.usage(tdef.owned)
+    walk = db.spent - base + len(pages) * jet._PAGE + sum(db.rows_on(db.jet.page(p)) for p in pages) * jet._SLOT
+    base = db.spent
     rows = list(jet._rows(db, tdef))
-    assert db.spent - base == 50 * (jet._ROW + 3 * jet._CELL), db.spent - base
+    assert db.spent - base == walk + 50 * (jet._ROW + jet._GROUP + 3 * jet._CELL), (db.spent - base, walk)
     before = db.spent
     shown = jet._shown(db, tdef.columns, rows[0][1], [])
     assert shown == [(0, "0"), (2, "x" * 30)], shown
@@ -888,9 +919,10 @@ def test_catalog_spent():
     assert ctx.skipped["record"] == 1, ctx.skipped
 
 
-def patch_columns(data, name, kind=None):
-    """Table `name`'s TDEF patched in memory: every column's var slot set to 0 (all share one slice), and with `kind`
-    every column's type set to it (a var GUID: no slice is 16 bytes, so each cell is a `record`)."""
+def patch_columns(data, name, kind=None, *, num=None, var=0):
+    """Table `name`'s TDEF patched in memory: every column's var slot set to `var` (0: all share one slice), with
+    `kind` every column's type set to it (a var GUID: no slice is 16 bytes, so each cell is a `record`), and with
+    `num` every column's number set to it (one null-mask bit names them all)."""
     data = bytearray(data)
     db = jet._Db(jet_pages.open(bytes(data)), Context())
     page = tdef_page(data, name)
@@ -907,7 +939,9 @@ def patch_columns(data, name, kind=None):
         o = col_at + i * f.col_size
         if kind is not None:
             data[at(o)] = kind
-        data[at(o + f.col_var)] = data[at(o + f.col_var + 1)] = 0
+        if num is not None:
+            data[at(o + f.col_num)], data[at(o + f.col_num + 1)] = num & 0xFF, num >> 8
+        data[at(o + f.col_var)], data[at(o + f.col_var + 1)] = var & 0xFF, var >> 8
     return bytes(data)
 
 
@@ -1009,6 +1043,431 @@ def test_rc4_total():
         assert summary(convert(data)[0]).endswith("1 table.")
     finally:
         limits.JET_PAGE_CACHE, limits.DECRYPT_BYTES = old
+
+
+# -- the work meter as the invariant
+
+class Loops:
+    """Counts the loop iterations (backward jumps) run in jet.py, jet_pages.py and crypto.py (the RC4 of db_key
+    pages) while open, through sys.monitoring; any other code location, and every forward jump, is switched off at its
+    first event."""
+    TOOL = 4
+
+    def __enter__(self):
+        mon = sys.monitoring
+        files = {jet.__file__, jet_pages.__file__, crypto.__file__}
+        self.n = 0
+
+        def jump(code, src, dst):
+            if dst >= src or code.co_filename not in files:
+                return mon.DISABLE
+            self.n += 1
+        mon.use_tool_id(self.TOOL, "jet loops")
+        mon.register_callback(self.TOOL, mon.events.JUMP, jump)
+        mon.set_events(self.TOOL, mon.events.JUMP)
+        mon.restart_events()
+        return self
+
+    def __exit__(self, *exc):
+        mon = sys.monitoring
+        mon.set_events(self.TOOL, 0)
+        mon.register_callback(self.TOOL, mon.events.JUMP, None)
+        mon.free_tool_id(self.TOOL)
+
+
+class Work:
+    """What one parse did: `charged` the meter's units (given back or not), `total` its total, `loops` the loop
+    iterations in jet.py and jet_pages.py, `puts` the grid cells put (bounded by the grid's own caps), `peak` the
+    tracemalloc peak (0 untraced), `out` the Doc or the ReadError."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+    def bounded(self, size):
+        """At most two loop iterations a unit charged and two a grid cell, past a constant for the fixed work (the
+        header, page 0), and the units charged at most the file's total and the cells given back."""
+        assert self.loops <= 2 * self.charged + 2 * self.puts + 2_000, (self.loops, self.charged, self.puts)
+        top = min(limits.JET_WORK_TOTAL, jet_pages.WORK_PER_BYTE * size + 2 ** 20)
+        assert self.charged <= top + jet._CELL * self.puts + 2 ** 18, (self.charged, top, self.puts)
+
+
+def metered(data, trace=False):
+    """Parse `data` once, counting (see `Work`); a ReadError is returned, any other exception raised."""
+    meters = []
+    orig = jet_pages.Meter.__init__
+
+    def init(self, total):
+        orig(self, total)
+        meters.append(self)
+    jet_pages.Meter.__init__ = init
+    ctx = Context()
+    try:
+        with Count(sheet_grid.Grid, "put") as puts, Loops() as loops:
+            if trace:
+                tracemalloc.start()
+            try:
+                out = jet.parse_bytes(data, ctx)
+            except ReadError as e:
+                out = e
+            finally:
+                peak = tracemalloc.get_traced_memory()[1] if trace else 0
+                if trace:
+                    tracemalloc.stop()
+    finally:
+        jet_pages.Meter.__init__ = orig
+    m = meters[-1]
+    return ctx, Work(charged=m.charged, total=m.total, loops=loops.n, puts=puts.calls, peak=peak, out=out)
+
+
+def page_of(tdef, rows, flags=None, ps=4096):
+    """A data page (Jet4, or Jet3 with ps 2048) owned by `tdef` holding `rows` (bytes each) packed from its end,
+    flags[i] OR-ed into row i's offset."""
+    count = 8 if ps == 2048 else 12
+    p = bytearray(ps)
+    p[0], p[1] = 1, 1
+    struct.pack_into("<I", p, 4, tdef)
+    struct.pack_into("<H", p, count, len(rows))
+    at = ps
+    for i, r in enumerate(rows):
+        at -= len(r)
+        assert at >= count + 2 + 2 * len(rows)
+        p[at:at + len(r)] = r
+        struct.pack_into("<H", p, count + 2 + 2 * i, at | (flags[i] if flags else 0))
+    return bytes(p)
+
+
+def annex(data, tdefs, pages, ps=4096):
+    """`pages` appended to a Jet4 (or Jet3, ps 2048) file, and one inline usage map naming them all (on a page after
+    them) set as the owned map of each TDEF in `tdefs`, in memory."""
+    data = bytearray(data)
+    first = len(data) // ps
+    for p in pages:
+        data += p
+    bitmap = bytearray((len(pages) + 7) // 8)
+    for k in range(len(pages)):
+        bitmap[k >> 3] |= 1 << (k & 7)
+    mp = len(data) // ps
+    data += page_of(0, [b"\x00" + struct.pack("<I", first) + bytes(bitmap)], ps=ps)
+    owned = 35 if ps == 2048 else 55
+    for t in tdefs:
+        data[t * ps + owned:t * ps + owned + 4] = b"\x00" + mp.to_bytes(3, "little")
+    return bytes(data)
+
+
+def test_columns_charged():
+    # the re-review's probes (New 1), in memory: 999 Text columns patched to share one column number. varnone: number
+    # 0, var slot 500, rows of count 1 with no var offsets, so every column's slot is past the row's; dupnum: number
+    # 7, rows of count 1, so every column is past the count. A row visits at most its own count of columns and
+    # charges each before visiting it, so the loops stay within the meter's units (they ran 999 a row uncharged) ...
+    base = jet_db(1, [Tbl("C", [Col(f"c{i}", TEXT) for i in range(999)], [])])
+    for num, var, row in ((0, 500, struct.pack("<HHH", 1, 2, 0) + b"\x01"), (7, 0, struct.pack("<H", 1) + b"\xfe")):
+        data = patch_columns(base, "C", num=num, var=var)
+        tp = tdef_page(data, "C")
+        k = (4096 - 14) // (len(row) + 2)
+        data = annex(data, [tp], [page_of(tp, [row] * k) for _ in range(30)])
+        ctx, w = metered(data)
+        assert isinstance(w.out, jet.Doc) and not ctx.skipped, ctx.skipped
+        w.bounded(len(data))
+        # ... and a lowered total stops the table: one sheet_cut
+        old = limits.JET_WORK_TOTAL
+        limits.JET_WORK_TOTAL = catalog_spend(data) + 100_000
+        try:
+            ctx, w = metered(data)
+        finally:
+            limits.JET_WORK_TOTAL = old
+        assert ctx.skipped == {"sheet_cut": 1}, ctx.skipped
+        assert w.loops <= 2 * w.charged + 2 * w.puts + 2_000, (w.loops, w.charged)
+    # a total that runs out inside the table's 999 column definitions: the table is not read, counted db_table (as a
+    # table the meter stopped, not a damaged one)
+    old = limits.JET_WORK_TOTAL
+    limits.JET_WORK_TOTAL = catalog_spend(data) + 10_000
+    try:
+        ctx, w = metered(data)
+    finally:
+        limits.JET_WORK_TOTAL = old
+    assert ctx.skipped == {"db_table": 1} and not ctx.warnings and not sections(w.out), (ctx.skipped, ctx.warnings)
+
+
+def test_jet3_offsets_charged():
+    # a Jet3 row of count 1 whose 255 one-byte variable offsets name nothing (so it shows nothing and is not kept),
+    # named by 289 pointer rows: each pointer reads it again, and its offsets and jump entries are charged first
+    data = jet_db(0, [Tbl("J", [Col("T", TEXT)], [])])
+    tp = tdef_page(data, "J")
+    row = bytearray(300)
+    row[0], row[298], row[299] = 1, 255, 0x01  # the count, nvar, the null mask (column 0 set)
+    first = len(data) // 2048
+    ptr = b"\x00" + first.to_bytes(3, "little")
+    data = annex(data, [tp], [page_of(tp, [bytes(row)] + [ptr] * 289, [0] + [0x4000] * 289, ps=2048)], ps=2048)
+    ctx, w = metered(data)
+    assert section(w.out, "J").title == "J (0 rows)" and not ctx.skipped, ctx.skipped
+    w.bounded(len(data))
+
+
+def test_index_blocks_charged():
+    # a TDEF patched to no columns and 300 real and 200 logical index blocks, read from its column area: each block
+    # is charged before it is read
+    data = bytearray(jet_db(1, [Tbl("X", [Col(f"c{i}", LONG) for i in range(1_000)], [])]))
+    tp = tdef_page(data, "X")
+    struct.pack_into("<HII", data, tp * 4096 + 45, 0, 200, 300)  # num_cols, the logical count, the real count
+    ctx, w = metered(bytes(data))
+    assert not ctx.skipped and columns_line(section(w.out, "X")) == "Columns: ", ctx.skipped
+    w.bounded(len(data))
+    # the TDEF read alone: its loops within its own charge, which holds each block and each continuation page
+    db = jet._Db(jet_pages.open(bytes(data)), Context())
+    before = db.meter.charged
+    with Loops() as loops:
+        td = jet._tdef(db, tp)
+    spent = db.meter.charged - before
+    assert len(td.pages) > 2 and len(td.real) == 300 and len(td.logical) == 200, len(td.pages)
+    assert loops.n <= 2 * spent + 16 and spent >= jet._IDX * 500 + jet._PAGE * (len(td.pages) - 1), (loops.n, spent)
+
+
+def test_usage_bitmap_charged():
+    # a file of 2,000 more pages, and usage maps whose bytes name all of them: zero bytes, 0xFF bytes, and a type 1
+    # map's type 5 page. Each byte scanned is charged first (one, and MAP_BITS more for a non-zero byte's bits)
+    data = bytearray(jet_db(1) + bytes(4096 * 2_000))
+    data[1_000 * 4096] = 5
+    j = jet_pages.open(bytes(data))
+    for m in (b"\x00" + bytes(4) + bytes(600), b"\x00" + bytes(4) + b"\xff" * 600,
+              b"\x01" + struct.pack("<I", 1_000)):
+        before = j.meter.charged
+        with Loops() as loops:
+            got = j.usage(m)
+        assert loops.n <= 2 * (j.meter.charged - before) + 16, (loops.n, j.meter.charged - before)
+        assert len(got) == (j.pages - 1 if m[5:6] == b"\xff" else 0), len(got)
+
+
+def test_usage_walks_charged():
+    # the re-review's probe (usage map walk), in memory: 60 tables whose maps all name the same 1,000 pages, none of
+    # them owned by a table. Each page a map names is charged, so the walks stay within the meter's units ...
+    data = jet_db(1, [Tbl(f"t{i}", [Col("ID", LONG)], []) for i in range(60)])
+    tps = [tdef_page(data, f"t{i}") for i in range(60)]
+    data = annex(data, tps, [page_of(0, []) for _ in range(1_000)])
+    ctx, w = metered(data)
+    assert len(sections(w.out)) == 60 and not ctx.skipped, ctx.skipped
+    w.bounded(len(data))
+    # ... and past a lowered total the table being read stops (one sheet_cut) and no later table is read: not its
+    # TDEF, not its map (each counted db_table)
+    old = limits.JET_WORK_TOTAL
+    limits.JET_WORK_TOTAL = catalog_spend(data) + 20 * 1_000 * jet._PAGE
+    try:
+        with Count(jet_pages.Jet, "usage") as maps, Count(jet, "_tdef") as tdefs:
+            ctx, w = metered(data)
+    finally:
+        limits.JET_WORK_TOTAL = old
+    started = maps.calls - 1  # the catalog's own map is the first walked
+    assert 0 < started < 30 and tdefs.calls == maps.calls, (maps.calls, tdefs.calls)
+    assert ctx.skipped == {"sheet_cut": 1, "db_table": 60 - started}, ctx.skipped
+    assert len(sections(w.out)) == started and summary(w.out).endswith(": 60 tables."), summary(w.out)
+
+
+def tiny_targets(npg, shown=False):
+    """The re-review's probe (New 2): `npg` pages of a one-column table, each holding 256 two-byte live rows (column
+    count 0, nothing shown) and 500 pointers naming rows of the next pages, every pointer a distinct target; with
+    `shown` the column is Yes/No and each page's 200 live rows are three bytes with the bit set, so each target
+    shows "Yes"."""
+    data = jet_db(1, [Tbl("C", [Col("F", BOOL if shown else LONG)], [])])
+    tp = tdef_page(data, "C")
+    first = len(data) // 4096
+    live, n = (struct.pack("<HB", 1, 1), 200) if shown else (struct.pack("<H", 0), 256)
+    pages = []
+    for g in range(npg):
+        ptrs = [bytes([k % n]) + (first + (g + 1 + k // n) % npg).to_bytes(3, "little") for k in range(500)]
+        pages.append(page_of(tp, [live] * n + ptrs, [0] * n + [0x4000] * 500))
+    return annex(data, [tp], pages)
+
+
+def test_target_room():
+    # pointers naming distinct targets that show nothing: no target is kept, so the memory does not grow with them
+    # (it grew about 18 times the file)
+    small, big = tiny_targets(16), tiny_targets(64)
+    (cs, ws), (cb, wb) = metered(small, True), metered(big, True)
+    assert not cs.skipped and not cb.skipped, (cs.skipped, cb.skipped)
+    assert wb.peak - ws.peak < len(big) - len(small) and wb.peak < 3 * len(big) + 2 ** 21, (ws.peak, wb.peak, len(big))
+    wb.bounded(len(big))
+    # targets that show a value are kept while the room of the file's bytes lasts; past it a repeat is read again,
+    # charged, and shows the same
+    data = tiny_targets(16, shown=True)
+    kept = []
+    orig = jet._Db.keep
+
+    def keep(self, size):
+        ok = orig(self, size)
+        kept.append(size + jet._KEEP if ok else 0)
+        return ok
+    jet._Db.keep = keep
+    try:
+        ctx, w = metered(data, True)
+    finally:
+        jet._Db.keep = orig
+    assert 0 < sum(kept) <= len(data) and kept.count(0) > 0, (sum(kept), len(data), kept.count(0))
+    want = grid(section(w.out, "C"))
+    orig_init = jet._Db.__init__
+
+    def roomless(self, *a):
+        orig_init(self, *a)
+        self.room = 0
+    jet._Db.__init__ = roomless
+    try:
+        ctx2, w2 = metered(data)
+    finally:
+        jet._Db.__init__ = orig_init
+    assert grid(section(w2.out, "C")) == want and ctx2.skipped == ctx.skipped, (ctx.skipped, ctx2.skipped)
+    w2.bounded(len(data))
+
+
+def test_long_value_room():
+    # 200 distinct definitions naming one chain of 40,000 characters, each read and decoded (the meter bounds that)
+    # and shown cut at JET_CELL_CHARS: the texts kept for repeats stay within the room of the file's bytes (they were
+    # kept until the total ran out, about ten times the file)
+    data = shared_memo(200, 40_000, distinct=True)
+    dbs = []
+    orig = jet._Db.__init__
+
+    def init(self, *a):
+        orig(self, *a)
+        dbs.append(self)
+    jet._Db.__init__ = init
+    try:
+        ctx, w = metered(data, True)
+    finally:
+        jet._Db.__init__ = orig
+    assert ctx.skipped["sheet_cut"] == 1 and ctx.skipped["text"] > 10, ctx.skipped
+    kept = sum(sys.getsizeof(s) + len(k[0]) for k, (s, _, _) in dbs[-1].lval_cache.items())
+    assert 0 < kept <= len(data), (kept, len(data))
+    # beside the grid's own strings (each cut value 32,769 characters of two bytes, "…" being past Latin-1), the
+    # peak stays within three times the file (it was about 14 times)
+    shown = sum(sys.getsizeof(v) for row in grid(section(w.out, "M")) for v in row)
+    assert w.peak <= shown + 3 * len(data) + 2 ** 18, (w.peak, shown, len(data))
+    w.bounded(len(data))
+
+
+def test_page_cache_bound():
+    # a db_key file read once keeps its decoded pages, at most the file's own bytes (and JET_PAGE_CACHE pages)
+    tbl = Tbl("P", [Col("ID", LONG), Col("N", TEXT)], [[i, "x" * 60] for i in range(4_000)])
+    plain, coded = jet_db(1, [tbl]), jet_db(1, [tbl], db_key=0x1234)
+    (cp, wp), (cc, wc) = metered(plain, True), metered(coded, True)
+    assert grid(section(wp.out, "P")) == grid(section(wc.out, "P")) and cp.skipped == cc.skipped
+    assert wc.peak - wp.peak <= len(coded), (wp.peak, wc.peak, len(coded))
+    wc.bounded(len(coded))
+
+
+def guard_fixtures():
+    """Clean files for the mutation guard: Jet3, Jet4 (also under a db_key) and ACE (type 1 maps), each with fixed
+    and variable columns, Yes/No, long values (inline, one row, chained), deleted and overflow rows, a hidden table."""
+    cols = [Col("ID", LONG), Col("Name", TEXT), Col("Notes", MEMO), Col("Flag", BOOL), Col("Price", MONEY),
+            Col("When", DATE), Col("Pic", OLE), Col("Key", GUID)]
+    key = uuid.UUID(int=0x0123456789ABCDEF0123456789ABCDEF).bytes_le
+
+    def rows(n):
+        out = [[i, f"n{i}" * (i % 4), ("memo " * i)[:300] if i % 6 else "m" * (900 + 40 * i), i % 3 == 0, i * 125,
+                45000.5 + i, b"x" * (i % 5) or None, key] for i in range(n)]
+        out[3] = Row("deleted", out[3])
+        out[5] = Row("overflow", out[5])
+        out[7] = Row("overflow", out[7])
+        return out
+    other = Tbl("H", [Col("A", INT), Col("B", TEXT)], [[i, "b" * i] for i in range(12)], flags=0x08)
+    wide = Tbl("W", [Col(f"w{i}", TEXT if i % 3 else BOOL) for i in range(240)],
+               [[f"{r}" if i % 3 else i % 2 for i in range(240)] for r in range(16)])
+    return [jet_db(0, [Tbl("T", cols, rows(14)), other]), jet_db(1, [Tbl("T", cols, rows(14)), other]),
+            jet_db(1, [Tbl("T", cols, rows(10))], db_key=0x2468), jet_db(3, [Tbl("T", cols, rows(14), umap=1), other]),
+            jet_db(1, [wide, Tbl("S", [Col("A", LONG)], [[i] for i in range(300)])])]
+
+
+def mutate(rng, data):
+    """One in-memory mutation of a clean file: random bytes, a u16 or u32 set to an edge value, column blocks given
+    one number or slot, a usage map's bytes set, a row turned into a pointer, a chunk copied elsewhere, a data page
+    filled with deleted slots, or every column of a TDEF given one number and slot."""
+    data = bytearray(data)
+    ps = 2048 if data[0x14] == 0 else 4096
+    pages = len(data) // ps
+    pg = rng.randrange(1, pages)
+    at = pg * ps + rng.randrange(ps)
+    op = rng.randrange(8)
+    if op == 6:  # every slot a page's offset table can hold, flagged deleted (or, at random, some not)
+        pg = rng.choice([p for p in range(1, pages) if data[p * ps] == 1] or [pg])
+        base = pg * ps + (8 if ps == 2048 else 12)
+        n = (ps - (base - pg * ps) - 2) // 2
+        data[base:base + 2] = n.to_bytes(2, "little")
+        for r in range(n):
+            flag = 0x8000 if rng.random() < 0.97 else rng.choice([0, 0x4000])
+            data[base + 2 + 2 * r:base + 4 + 2 * r] = (flag | rng.randrange(ps)).to_bytes(2, "little")
+        return bytes(data)
+    if op == 7:  # one TDEF's column blocks all given one number and one var slot
+        pg = rng.choice([p for p in range(2, pages) if data[p * ps] == 2] or [2])
+        b = data[pg * ps:(pg + 1) * ps]
+        j3 = ps == 2048
+        ncols = int.from_bytes(b[25:27] if j3 else b[45:47], "little")
+        nidx = int.from_bytes(b[31:35] if j3 else b[51:55], "little")
+        size, num, var = (18, 1, 3) if j3 else (25, 5, 7)
+        col_at = (43 if j3 else 63) + nidx * (8 if j3 else 12)
+        v, s = rng.randrange(0, 9).to_bytes(2, "little"), rng.randrange(0, 3).to_bytes(2, "little")
+        for o in range(pg * ps + col_at, min(pg * ps + col_at + size * ncols, (pg + 1) * ps - size), size):
+            data[o + num:o + num + 2], data[o + var:o + var + 2] = v, s
+        return bytes(data)
+    if op == 0:
+        for _ in range(rng.randrange(1, 9)):
+            data[pg * ps + rng.randrange(ps)] = rng.randrange(256)
+    elif op == 1:
+        v = rng.choice([0, 1, 2, 0xFF, 0xFFFF, 0x7FFF, 0x4000 | rng.randrange(ps), 0x8000, rng.randrange(65536)])
+        n = rng.choice([2, 4])
+        at = min(at, len(data) - n)
+        data[at:at + n] = (v if n == 2 else v * 0x10001).to_bytes(n, "little")
+    elif op == 2:
+        pg = rng.choice([p for p in range(2, pages) if data[p * ps] == 2] or [2])
+        size, num, var = (18, 1, 3) if ps == 2048 else (25, 5, 7)
+        start = pg * ps + rng.randrange(40, 120)
+        v = rng.randrange(0, 12).to_bytes(2, "little")
+        for o in range(start, min(start + size * rng.randrange(2, 30), (pg + 1) * ps - size), size):
+            data[o + rng.choice([num, var]):o + rng.choice([num, var]) + 2] = v
+    elif op == 3:
+        n = rng.randrange(1, 64)
+        data[ps + rng.randrange(ps - n):][:n] = b"\xff" * n
+    elif op == 4:
+        b = ps * pg
+        if data[b] == 1:
+            base = 8 if ps == 2048 else 12
+            nrows = int.from_bytes(data[b + base:b + base + 2], "little")
+            if nrows:
+                r = rng.randrange(min(nrows, (ps - base - 2) // 2))
+                loc = int.from_bytes(data[b + base + 2 + 2 * r:b + base + 4 + 2 * r], "little") & 0x1FFF
+                data[b + base + 2 + 2 * r:b + base + 4 + 2 * r] = (loc | 0x4000).to_bytes(2, "little")
+                if loc + 4 <= ps:
+                    data[b + loc:b + loc + 4] = bytes([rng.randrange(8)]) + rng.randrange(pages).to_bytes(3, "little")
+    else:
+        n = rng.randrange(8, 200)
+        src, dst = rng.randrange(len(data) - n), rng.randrange(ps, len(data) - n)
+        data[dst:dst + n] = data[src:src + n]
+    return bytes(data)
+
+
+def test_mutation_guard():
+    # a structural guard: 400 seeded in-memory mutations of the clean files (never written to disk), each parsed with
+    # the default total or a small one. Each parse ends (a Doc or a ReadError, nothing else escapes, the meter's own
+    # Spent included), its loop iterations stay within twice the units charged and twice the grid cells put, the
+    # units within the file's total, and its tracemalloc peak within 4 times the file, 1 KiB a grid cell put (the
+    # document's own cells, which the grid's caps bound) and 1.5 MiB: so a loop left uncharged, or a cache growing
+    # past the file, anywhere on the paths the mutations reach fails here
+    rng = random.Random(20261116)
+    clean = guard_fixtures()
+    old = limits.JET_WORK_TOTAL
+    try:
+        for k in range(400):
+            src = clean[k % len(clean)]
+            data = mutate(rng, src)
+            limits.JET_WORK_TOTAL = old if rng.random() < 0.5 else rng.randrange(200, 40_000)
+            try:
+                ctx, w = metered(data, trace=k % 4 == 0)
+            except Exception as e:
+                raise AssertionError(f"mutation {k}: {type(e).__name__}: {e}") from e
+            assert isinstance(w.out, (jet.Doc, ReadError)), (k, w.out)
+            try:
+                w.bounded(len(data))
+                assert w.peak <= 4 * len(data) + 1024 * w.puts + 3 * 2 ** 19, (w.peak, len(data), w.puts)
+            except AssertionError as e:
+                raise AssertionError(f"mutation {k}: {e}") from None
+    finally:
+        limits.JET_WORK_TOTAL = old
 
 
 def main():

@@ -30,6 +30,14 @@ Bounds. `page(n)` raises ValueError outside `0 <= n < pages`. A usage map drops 
 `1 <= id < pages`, reads each type 5 page once and stops at the pointer whose range starts past the file, so its
 work is bounded by the page count. `chain` keeps a seen-set and yields at most `pages` items; a repeat, an id out
 of range or a step giving None ends it. Malformed map bytes raise ValueError; callers count the member.
+
+Work meter. Each file has one `Meter` (`Jet.meter`): a total of `limits.JET_WORK_TOTAL` units, or `WORK_PER_BYTE`
+times the file's bytes and 1 MiB if less, a unit being about 0.2 microseconds (a byte of compressed text decoded).
+Every loop whose trip count comes from the file's bytes ticks it before its work, here and in `jet.py`: a page RC4
+decodes (`RC4_BYTE` a byte), each chain item (`CHAIN_STEP`), each usage map pointer (`MAP_POINTER`) and each bitmap
+byte scanned (one, and `MAP_BITS` more when it is not zero, for its eight bits). Past the total `tick` raises
+`Spent`, which `jet.py` turns into its cut. So the work of a file is at most a constant times its total, whatever
+its bytes say.
 """
 import codecs
 import struct
@@ -47,6 +55,40 @@ MSISAM = b"MSISAM Database"
 USAGE_PAGE = 0x05
 _MAP_INLINE, _MAP_REFERENCE = 0, 1
 _MAP_DATA = 4  # where the bitmap starts on a type 5 page (Jackcess OFFSET_USAGE_MAP_PAGE_DATA)
+# the meter's prices, in its units (about 0.2 microseconds), measured on the dearest case of each and rounded up
+WORK_PER_BYTE = 10  # the total is at most this many units a byte of the file (and 1 MiB)
+RC4_BYTE = 1        # a byte of a page RC4 decodes (about 0.6 measured)
+CHAIN_STEP = 4      # an item of a chain, its step's page read included
+MAP_POINTER = 4     # a pointer of a type 1 usage map (a page read and its type check)
+MAP_BITS = 8        # a non-zero bitmap byte: its eight bits and the ids it adds (a zero byte costs one)
+
+
+class Spent(Exception):
+    """A file's work total is spent: `jet.py` stops the walk it was in and reads nothing more."""
+
+
+class Meter:
+    """One file's work total. `tick(n)` charges n units before the work they price and raises `Spent` past the
+    total; `give(n)` hands back units of work whose output another cap bounds from there (a grid cell). `charged` is
+    every unit ticked, given back or not."""
+
+    def __init__(self, total: int):
+        self.total = total
+        self.spent = 0
+        self.charged = 0
+
+    def tick(self, n: int):
+        self.spent += n
+        self.charged += n
+        if self.spent > self.total:
+            raise Spent
+
+    def give(self, n: int):
+        self.spent -= n
+
+    @property
+    def over(self) -> bool:
+        return self.spent > self.total
 
 
 def open(data: bytes) -> "Jet":
@@ -93,6 +135,7 @@ class Jet:
         self.db_key = struct.unpack_from("<I", self._page0, 0x3E)[0]
         self._cache = OrderedDict()  # page number -> decoded page (db_key only)
         self._rc4_left = max(limits.DECRYPT_BYTES, 2 * len(data))  # page bytes RC4 may still decode
+        self.meter = Meter(min(limits.JET_WORK_TOTAL, WORK_PER_BYTE * self.pages * self.page_size + 2 ** 20))
 
     def page(self, n: int) -> bytes:
         """Page `n`, decoded (page 0 with its header unmasked; with a Jet3/Jet4 db_key, the RC4 of the others)."""
@@ -109,6 +152,7 @@ class Jet:
         raw = self._data[n * self.page_size:(n + 1) * self.page_size]
         if len(raw) > self._rc4_left:
             raise ReadError("too_large", "part: RC4 pages")
+        self.meter.tick(RC4_BYTE * len(raw))
         self._rc4_left -= len(raw)
         out = self._cache[n] = crypto.rc4(((self.db_key ^ n) & 0xFFFFFFFF).to_bytes(4, "little"), raw)
         while len(self._cache) > max(limits.JET_PAGE_CACHE, 1):
@@ -123,13 +167,14 @@ class Jet:
     def chain(self, start, step):
         """Follow `step(item) -> next item | None` from `start`. An item is a page number or a tuple whose first
         field is one (an LVAL (page, row)). The walk ends at a repeat, at a page outside 1..pages-1, or after
-        `pages` items."""
+        `pages` items. Each item ticks the meter."""
         seen = set()
         item = start
         while item is not None and len(seen) < self.pages:
             pg = item if isinstance(item, int) else item[0]
             if not (isinstance(pg, int) and 0 < pg < self.pages) or item in seen:
                 return
+            self.meter.tick(CHAIN_STEP)
             seen.add(item)
             yield item
             item = step(item)
@@ -149,9 +194,9 @@ class Jet:
         per = (self.page_size - _MAP_DATA) * 8
         out = []
         seen = set()
-        for i in range((len(m) - 1) // 4):
-            if i * per >= self.pages:
-                break
+        n = min((len(m) - 1) // 4, -(-self.pages // per))  # the pointers before the one whose range starts past
+        self.meter.tick(MAP_POINTER * n)
+        for i in range(n):
             ptr = struct.unpack_from("<I", m, 1 + 4 * i)[0]
             if not 0 < ptr < self.pages or ptr in seen:
                 continue
@@ -163,15 +208,19 @@ class Jet:
         return out
 
     def _bits(self, buf: bytes, at: int, base: int) -> list:
+        """The ids of the set bits of buf[at:], bit k naming page base + k; only the bytes naming pages in the file
+        are scanned, and charged first."""
         out = []
         top = self.pages
-        for k in range(at, len(buf)):
+        stop = min(len(buf), at + max(0, -(-(top - base) // 8)))
+        if stop <= at:
+            return out
+        self.meter.tick(stop - at + MAP_BITS * (stop - at - buf.count(0, at, stop)))
+        for k in range(at, stop):
             b = buf[k]
             if not b:
                 continue
             first = base + (k - at) * 8
-            if first >= top:
-                break
             for bit in range(8):
                 if b >> bit & 1:
                     pg = first + bit

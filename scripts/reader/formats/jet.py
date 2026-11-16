@@ -27,24 +27,34 @@ lookup each. Fixed columns are read at their
 `offset_F`, variable ones through their `offset_V` slot (Jet4's two-byte offset table, Jet3's one-byte offsets and
 jump table), so rows written before a column was deleted read right. A Yes/No value is its null-mask bit. Every
 offset and length is clipped to the row; a row or cell that cannot be read is counted `record`. A row visits only the
-cells whose null-mask bits are set (a zero mask byte costs nothing more), each as a view into the row, never a copy.
-Var slices are clipped but may overlap, so many cells can name the same bytes; the work total (below) bounds that.
+columns whose null-mask bits are set, and of those at most the row's own column count (column numbers may repeat,
+so one bit can name many columns), each as a view into the row, never a copy. Var slices are clipped but may overlap,
+so many cells can name the same bytes; the work meter (below) bounds that.
 
-Work total. Every path through the rows is charged against one total for the whole file, `limits.JET_WORK_TOTAL` or
-`_PER_BYTE` times the file's bytes and 1 MiB if less, in units of about 0.2 microseconds (a byte of text decoded):
-each row visited `_ROW`, each cell visited `_CELL` (given back when the cell becomes a non-empty grid cell, which
-`SHEET_CELLS` bounds from there), each text byte decoded one, each LVAL row read its bytes and `_ROW_COST`. So an
-empty cell, a cell that is counted `record` and a repeat of a kept value all cost what they take. A real file is
-charged at most a few units a byte of itself. Past the total, the table being read stops with one `sheet_cut` (the
-grid's own cut) and so does every later one; in the catalog the rest counts `record` once.
+Work meter. One meter per file (`jet_pages.Meter`, `limits.JET_WORK_TOTAL` or ten units a byte of the file and 1 MiB
+if less, a unit about 0.2 microseconds) is the invariant: every loop whose trip count comes from the file's bytes
+ticks it before its work. Here: each page a usage map names (`_PAGE`), each row slot of a data page (`_SLOT`) and
+each live row (`_ROW`), each null-mask byte a row looks at (`_GROUP`), each column a set bit names (`_CELL`), each
+Jet3 variable offset, each column definition (`_COLDEF`) and its name's bytes, each index block (`_IDX`), each TDEF
+page, each text byte decoded, each LVAL row (its bytes and `_ROW_COST`); in `jet_pages` each RC4 page, chain item
+and usage map byte. The prices are measured, each at least what its path costs. Only a cell that becomes a non-empty
+grid cell has its `_CELL` given back, since `SHEET_CELLS` bounds those from there. A real file is charged a few units
+a byte of itself. Past the total: the table being read stops with one `sheet_cut` (the grid's own cut); a table not
+yet started is not read at all (not its TDEF, not its usage map) and counts `db_table`; in the catalog the rest
+counts `record` once.
+
+Kept values. A long value read whole and an overflow target's shown values are kept for repeats, but only while
+their estimated size fits a room of the file's bytes (one room for both); a target that shows nothing is not kept.
+Past the room a repeat is read again, charged like the first read. So what is kept stays within about the file's
+size, the page cache within the decoded pages of the file.
 
 Long values. A MEMO is inline (0x80), one LVAL row (0x40) or an LVAL chain (0x00). An LVAL value read whole is
-decoded once and kept by its definition, so a repeat costs its charge but no read; definitions that differ but share
-a chain's tail are each charged, so the total bounds them too.
+decoded once and kept by its definition (room allowing), so a repeat costs its charge but no read; definitions that
+differ but share a chain's tail are each charged, so the meter bounds them too.
 
 Caps. `JET_COLS` columns per TDEF (past it a user table counts `db_table`, the catalog is `damaged`), `JET_NAME`
 characters per name and `JET_CELL_CHARS` per cell (cut, counted `text`), `JET_LVAL_BYTES` read per long value,
-the work total per file. Every cap is read at call time, so a test can lower it.
+the work meter per file. Every cap is read at call time, so a test can lower it.
 """
 import collections
 import copy
@@ -52,6 +62,7 @@ import datetime
 import math
 import re
 import struct
+import sys
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -89,16 +100,18 @@ _DATA_PAGE, _TDEF_PAGE = 0x01, 0x02
 _DELETED, _OVERFLOW, _OFFSET = 0x8000, 0x4000, 0x1FFF
 _UNUSED = 0xFFFF
 _ROW_COST = 256  # charged on top of each LVAL row's bytes, so a chain of tiny rows costs as its steps
-# the work total's units (about 0.2 microseconds each, a byte of text decoded), set from measurement above the
-# dearest cell (a var GUID counted `record` through a 1 KiB slot, about 6.4 units) and row (an overflow pointer to an
-# unreadable row, about 15 units); a cell that makes a grid cell is given back, the grid's caps bound those
-_CELL = 8
-_ROW = 16
-_PER_BYTE = 10  # the total is at most this many units a byte of the file (and 1 MiB)
-
-
-class _Spent(Exception):
-    """The file's work total is spent: the table being read stops (one `sheet_cut`), the catalog's rest is cut."""
+# the meter's prices (units of about 0.2 microseconds, a byte of text decoded), each set from measurement at or above
+# the dearest case of its path (the report's table): a cell that makes a grid cell is given back, the grid's caps
+# bound those
+_CELL = 8      # a column a set null-mask bit names (a var GUID counted `record` through a 1 KiB slot, about 6.4)
+_ROW = 16      # a live row (an overflow pointer to an unreadable row, about 15)
+_SLOT = 2      # a row slot of a data page, deleted or not
+_GROUP = 4     # a null-mask byte a row looks at, its eight bits
+_PAGE = 8      # a page a usage map names (or a TDEF page): its read and type check
+_COLDEF = 32   # a column definition: its block, and its share of the schema line, header, groups and lookups
+_IDX = 16      # a real or logical index block
+_KEEP = 256    # the room a kept value takes beside its text (key, tuples, a dict slot)
+_Spent = jet_pages.Spent
 _PK = 1  # IndexImpl.PRIMARY_KEY_INDEX_TYPE
 _ENCRYPTION_AT = 0x299  # the length of ACE's encryption structure (mdbtools HACKING.md; every real file read has 0)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
@@ -126,7 +139,7 @@ class _Fmt:
         self.precision, self.scale = 11, 12
 
 
-@dataclass
+@dataclass(slots=True)
 class Obj:
     """One MSysObjects row."""
     id: int
@@ -203,9 +216,25 @@ class _Db:
         self.j3 = jet.version == 0
         self.f = _Fmt(self.j3)
         self.tdef_pages = set()  # continuation pages already part of a TDEF: a chain reaching one ends there
-        self.spent = 0  # work charged against total
-        self.total = min(limits.JET_WORK_TOTAL, _PER_BYTE * jet.pages * jet.page_size + 2 ** 20)
+        self.meter = jet.meter
+        self.charge = jet.meter.tick
         self.lval_cache = {}  # (definition, compressed) -> (text, bytes read, charge) of a long value read whole
+        self.room = jet.pages * jet.page_size  # bytes the kept values (long values, overflow targets) may take
+
+    @property
+    def spent(self) -> int:
+        return self.meter.spent
+
+    @property
+    def total(self) -> int:
+        return self.meter.total
+
+    def keep(self, size: int) -> bool:
+        """Take `size` bytes (and `_KEEP`) of the room for a kept value; False, taking nothing, past it."""
+        if size + _KEEP > self.room:
+            return False
+        self.room -= size + _KEEP
+        return True
 
     # -- pages and rows
 
@@ -281,12 +310,6 @@ class _Db:
             return s[:JET_CELL_CHARS] + "…"
         return s
 
-    def charge(self, n: int):
-        """Charge `n` units of work; _Spent once the file's total is passed."""
-        self.spent += n
-        if self.spent > self.total:
-            raise _Spent
-
     def decode(self, raw, compressed: bool) -> str:
         """A cell's text bytes decoded, charged their length first."""
         self.charge(len(raw))
@@ -319,7 +342,8 @@ class _Db:
         before = self.spent
         data = self._lval((int.from_bytes(raw[5:8], "little"), raw[4]), want, kind == 1)
         s = self.jet.text(data, compressed)
-        self.lval_cache[key] = (s, len(data), self.spent - before)
+        if self.keep(sys.getsizeof(s) + len(key[0])):
+            self.lval_cache[key] = (s, len(data), self.spent - before)
         return self._whole(s, len(data), want, length)
 
     def _whole(self, s: str, n: int, want: int, length: int) -> str:
@@ -341,8 +365,9 @@ class _Db:
             return (nxt, b[0]) if nxt else None
 
         for item in [start] if single else self.jet.chain(start, step):
+            self.charge(_ROW_COST)
             b = self.row_at(item[0], item[1])
-            self.charge(len(b) + _ROW_COST)
+            self.charge(len(b))
             if single:
                 return b[:want]
             if len(b) <= 4:
@@ -381,6 +406,7 @@ def _tdef(db: _Db, page: int) -> Tdef:
     for pg in jet.chain(page, jet.next_pg):
         if pg == page:
             continue
+        db.charge(_PAGE)
         p = jet.page(pg)
         if p[0] != _TDEF_PAGE or pg in db.tdef_pages:  # no two tables share a page, so the work stays linear
             break
@@ -397,12 +423,14 @@ def _tdef(db: _Db, page: int) -> Tdef:
     pos = col_at + ncols * f.col_size
     if pos > len(b):
         raise ValueError("column blocks past the table definition")
+    db.charge(_COLDEF * ncols)
     names = []
     for _ in range(ncols):
         n = b[pos] if f.name_len == 1 else _u16(b, pos)
         pos += f.name_len
         if pos + n > len(b):
             raise ValueError("column name past the table definition")
+        db.charge(n)
         names.append(db.name(jet.text(b[pos:pos + n], False)))
         pos += n
     cols = []
@@ -412,6 +440,9 @@ def _tdef(db: _Db, page: int) -> Tdef:
                            _u16(b, o + f.col_len), b[o + f.col_flags], b[o + f.col_ext] if f.col_ext else 0,
                            b[o + f.precision], b[o + f.scale]))
     cols.sort(key=lambda c: c.num)
+    if pos + nidx * f.real_block > len(b):
+        raise ValueError("index block past the table definition")
+    db.charge(_IDX * nidx)
     real = []
     for _ in range(nidx):
         if pos + f.real_block > len(b):
@@ -419,6 +450,9 @@ def _tdef(db: _Db, page: int) -> Tdef:
         o = pos + f.real_skip
         real.append([n for n in (_u16(b, o + 3 * k) for k in range(10)) if n != _UNUSED])
         pos += f.real_block
+    if pos + nlog * f.log_block > len(b):
+        raise ValueError("logical index block past the table definition")
+    db.charge(_IDX * nlog)
     logical = []
     for _ in range(nlog):
         if pos + f.log_block > len(b):
@@ -440,14 +474,17 @@ def _rows(db: _Db, tdef: Tdef, kept=()):
     """Each live row of the table, in page order, as (key, {column index: raw cell}) (see `_cells`): key is None, or
     for an overflow row the (tdef page, page, row) its pointer names. When `kept` holds that key the row is not read
     again and its cells are None (the caller keeps what it made of it). Only data pages naming this TDEF are read, so
-    a map naming other tables' pages costs nothing. Each row visited is charged `_ROW`; one that cannot be read is
-    counted `record`; a bad usage map raises ValueError for the caller."""
+    a map naming other tables' pages costs a page read each. Each page, slot and live row is charged first; a row that
+    cannot be read is counted `record`; a bad usage map raises ValueError for the caller."""
     jet = db.jet
     for pg in jet.usage(tdef.owned):
+        db.charge(_PAGE)
         page = jet.page(pg)
         if page[0] != _DATA_PAGE or _u32(page, 4) != tdef.page:
             continue
-        for r in range(db.rows_on(page)):
+        n = db.rows_on(page)
+        db.charge(_SLOT * n)
+        for r in range(n):
             if _u16(page, db.f.row_start + 2 * r) & _DELETED:
                 continue
             db.charge(_ROW)
@@ -467,8 +504,9 @@ def _rows(db: _Db, tdef: Tdef, kept=()):
 def _cells(db: _Db, tdef: Tdef, buf: bytes) -> dict:
     """One row's raw cells as {column index: a memoryview into the row, or True for Yes/No}: the column count, the
     fixed data at offset_F, the variable data through offset_V, the null mask at the end; offsets clipped to the row.
-    Only the columns whose null-mask bits are set (and under the row's count) are visited, each charged `_CELL`; a
-    null or "No" cell, or one past the count, is absent."""
+    Each mask byte looked at is charged `_GROUP`; the columns a set bit names (at most the row's count of them, column
+    numbers being free to repeat) are charged `_CELL` each before they are visited; a null or "No" cell, or one past
+    the count, is absent."""
     head = 1 if db.j3 else 2
     n = len(buf)
     if n < head:
@@ -482,7 +520,9 @@ def _cells(db: _Db, tdef: Tdef, buf: bytes) -> dict:
     row = memoryview(buf)
     var = None
     out = {}
-    for byte, bits in tdef.groups:
+    groups = tdef.groups
+    db.charge(_GROUP * min(len(groups), mlen))
+    for byte, bits in groups:
         if byte >= mlen:
             break
         m = mask[byte]
@@ -491,9 +531,13 @@ def _cells(db: _Db, tdef: Tdef, buf: bytes) -> dict:
         for bit in range(8):
             if not m >> bit & 1:
                 continue
-            for i, c in bits[bit]:
-                if c.num >= ncols:
-                    continue
+            named = bits[bit]  # one column number: all of them past the count, or the first ncols of them
+            if not named or named[0][1].num >= ncols:
+                continue
+            db.charge(_CELL * min(len(named), ncols))
+            for i, c in named:
+                if i >= ncols:
+                    break
                 if c.type == BOOL:
                     out[i] = True
                 elif c.flags & 0x01:
@@ -501,11 +545,14 @@ def _cells(db: _Db, tdef: Tdef, buf: bytes) -> dict:
                     out[i] = row[min(a, end):min(a + FIXED_SIZE.get(c.type, c.length), end)]
                 else:
                     if var is None:
-                        var = (_jump_offsets if db.j3 else _var_offsets)(row, head, end)
+                        if db.j3:
+                            db.charge(buf[end - 1] + 1 + (n - 1) // 256)  # its offsets and jump entries
+                            var = _jump_offsets(row, head, end)
+                        else:
+                            var = _var_offsets(row, head, end)
                     v = var(c.var)
                     if v is not None:
                         out[i] = v
-    db.charge(_CELL * len(out))
     return out
 
 
@@ -658,6 +705,9 @@ def _catalog(db: _Db) -> list:
         tdef = _tdef(db, 2)
     except _BAD as e:
         raise ReadError("damaged", f"jet: no readable catalog ({e})") from None
+    except _Spent:
+        db.ctx.skipped["record"] += 1
+        return []
     at = {c.name.lower(): i for i, c in reversed(list(enumerate(tdef.columns)))}
     if not all(k in at for k in ("id", "name", "type", "flags")):
         raise ReadError("damaged", "jet: the catalog has no Id, Name, Type or Flags column")
@@ -735,15 +785,20 @@ def _shown(db: _Db, cols: list, cells: dict, bools: list) -> list:
             continue
         if v:
             out.append((i, v))
-    db.spent -= _CELL * len(out)
+    db.meter.give(_CELL * len(out))
     for i in bools:
         if i not in cells:
             out.append((i, "No"))
     return out
 
 
-def _table(db: _Db, obj: Obj, budget) -> Section:
-    tdef = _tdef(db, obj.id & 0xFFFFFF)
+def _table(db: _Db, obj: Obj, budget):
+    """The table's Section; None when the meter runs out on its TDEF (counted `db_table`, as a table not read)."""
+    try:
+        tdef = _tdef(db, obj.id & 0xFFFFFF)
+    except _Spent:
+        db.ctx.skipped["db_table"] += 1
+        return None
     title = f"{obj.name} ({_count(tdef.row_count, 'row', 'rows')})"
     schema = " · ".join(f"{c.name} ({TYPE_NAMES.get(c.type, f'type {c.type}')})" for c in tdef.columns)
     grid = sheet_grid.Grid(obj.name, budget, db.ctx)
@@ -752,7 +807,7 @@ def _table(db: _Db, obj: Obj, budget) -> Section:
             break
     cols = tdef.columns
     bools = [i for i, c in enumerate(cols) if c.type == BOOL]  # "No" past a row's count: each one a grid cell
-    done = {}  # an overflow target's key -> (its non-empty values, the counts making them added); no bytes kept
+    done = {}  # an overflow target's key -> (its non-empty values, the counts making them added); room allowing
     r = 1
     try:
         for key, cells in _rows(db, tdef, done):
@@ -764,7 +819,8 @@ def _table(db: _Db, obj: Obj, budget) -> Section:
             elif key is not None:
                 before = collections.Counter(db.ctx.skipped)
                 shown = _shown(db, cols, cells, bools)
-                done[key] = shown, db.ctx.skipped - before
+                if shown and db.keep(sum(64 + sys.getsizeof(v) for _, v in shown)):  # nothing shown: read again
+                    done[key] = shown, db.ctx.skipped - before
             else:
                 shown = _shown(db, cols, cells, bools)
             for i, v in shown:
@@ -798,12 +854,15 @@ def parse_bytes(data, ctx) -> Doc:
             ctx.skipped["record"] += 1
             continue
         seen.add(page)
+        if db.meter.over:  # the work total is spent: no further table is read
+            ctx.skipped["db_table"] += 1
+            continue
         sec = None
         with ctx.guard("db_table"):
             sec = _table(db, o, budget)
         if sec is not None:
             out.append(sec)
-    if tables and not out and not (queries or linked or others):
+    if tables and not out and not (queries or linked or others) and not db.meter.over:
         raise ReadError("damaged", "no table could be read")
     parts = [_count(len(seen), "table", "tables")]
     if queries:
