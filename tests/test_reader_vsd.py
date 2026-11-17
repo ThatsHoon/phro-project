@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import limits, markdown  # noqa: E402
+from reader import diagram, limits, markdown  # noqa: E402
 from reader.formats import vsd, vsd_stream, vsdx  # noqa: E402
 from reader.formats.vsd_stream import Chunk, Pointer  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
@@ -998,12 +998,12 @@ def test_connection_budget_shared():
         return {"shapes": [{"id": 1, "text": f"A{tag}"}, {"id": 2, "text": f"B{tag}"},
                            {"id": 3, "text": f"c{tag}", "misc": misc(11, ends=(1, 2))}]}
 
-    old = vsdx.CONNECTIONS
-    vsdx.CONNECTIONS = 1
+    old = diagram.CONNECTIONS
+    diagram.CONNECTIONS = 1
     try:
         doc, ctx = read(drawing([page(1), page(2)]))
     finally:
-        vsdx.CONNECTIONS = old
+        diagram.CONNECTIONS = old
     assert [lines(s) for s in doc.blocks] == [["A1", "B1", "Connections:", "- A1 → B1 (c1)"], ["A2", "B2"]]
     assert ctx.skipped == {"connections_cut": 1}, ctx.skipped
 
@@ -1252,12 +1252,12 @@ def test_edge_cap_per_page():
 
     shapes = [{"id": 1, "text": "A"}, {"id": 2, "text": "B"}] + [
         {"id": k, "misc": misc(11, ends=(1, 2))} for k in (3, 4, 5)]
-    old = vsdx.CONNECTIONS
-    vsdx.CONNECTIONS, vsd._Reader.finish = 1, spy
+    old = diagram.CONNECTIONS
+    diagram.CONNECTIONS, vsd._Reader.finish = 1, spy
     try:
         doc, ctx = read(drawing([{"shapes": shapes}]))
     finally:
-        vsdx.CONNECTIONS, vsd._Reader.finish = old, real
+        diagram.CONNECTIONS, vsd._Reader.finish = old, real
     assert seen == [2], seen
     assert lines(doc.blocks[0]) == ["A", "B", "Connections:", "- A → B"] and ctx.skipped == {"connections_cut": 1}
 

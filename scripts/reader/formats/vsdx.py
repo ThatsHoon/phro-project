@@ -1,19 +1,36 @@
-"""Visio drawing (vsdx, vsdm) to the document model: one section per page, shape text in reading order, picture
-shapes, then the page's connection list.
+"""Visio drawing (vsdx, vsdm) to the document model: one section per page, shape text in reading order and picture
+shapes, the page's connectors written as one `diagram` block.
 
 Elements match by local name. A shape without a Text element takes its master's shape text (`visio/masters`, each
 master part loaded once, up to MASTERS parts); a HideText cell, the shape's own else its master shape's, makes the text
 hidden. Shape text, own and each inherited copy, is charged to one MAX_OUTPUT room by its characters and LINE per
-line break. Connectors glued at both ends are listed after the page's shapes as "A → B (label)", their shown text left out
-of the shape flow; `name_of`, `connections` and `ConnectionBudget` are shared with the binary vsd reader. A vbaProject
-part is named, never read.
+line break. A vbaProject part is named, never read.
+
+Each page is one `diagram.Diagram` scope: every shape is registered under its ID (a missing or repeated one gets a key
+no glue names), textless ones too, and its slot in the flow carries that key. A shape's cells are its own, and for the
+cells in INHERITED its master shape's when it has none (each master shape's cells read once).
+
+- **Geometry**, in page units: the box is (PinX - LocPinX, PinY - LocPinY) and (Width, Height), mirrored about the pin
+  by FlipX and FlipY, as the bound of the box turned by Angle about the pin, offset by the parent group's origin (its
+  Pin less its LocPin, added up the groups). A missing LocPin term counts as 0; no pin or no size is no box.
+- **Connectors**: a shape with BeginX and EndX cells, or one a Connects row names by BeginX or EndX. Its ends are glued
+  by the page's Connects rows (FromCell BeginX / EndX to ToSheet, the first row of each end wins) and lie at (BeginX,
+  BeginY) and (EndX, EndY) plus its parent's origin. Its shown text is the edge label; hidden text is none and stays in
+  the flow, hidden.
+- **Arrowheads**: BeginArrow and EndArrow, each from the shape's own cell, else its master shape's, else the LineStyle
+  chain (the shape's LineStyle, else its master shape's) of the `visio/document.xml` StyleSheets, loaded once and
+  walked through at most `limits.MAX_DEPTH` styles with a seen-set. A value above 0 is an arrowhead, any other number
+  none, no value not known.
+- **Kinds** from the NameU masters.xml gives the shape's own Master, else the shape's NameU, case-folded.
+- **Containers**: a User row msvStructureType whose Value is Container, the shape's own else its master shape's; its
+  shown text is the subgraph title.
 """
 import math
 
-from .. import limits
+from .. import diagram, limits
 from ..containers.zipx import Package, attr, kids, local
 from ..limits import ReadError
-from ..model import Break, Doc, Image, ListItem, Para, Section, Text
+from ..model import Break, Doc, Image, Para, Section, Text
 from . import ooxml_base
 
 IMAGE_BYTES = 256 * 2**20  # image bytes one drawing may emit, copies counted
@@ -21,57 +38,17 @@ MAX_TITLE = 200
 MAX_TEXT = 20_000          # characters of text one shape may emit
 COORD = 1e12
 MASTERS = 1_000            # master parts one vsdx may load; inherited text from the rest is counted `stencil`
-CONNECTIONS = 10_000       # connectors one document may list (vsd and vsdx); past it `connections_cut` per cut list
-NAME = 80                  # characters of a shape's name in a connection list
 # characters one line break of shape text is charged against the MAX_OUTPUT room, besides its own: a line is a Text
 # and a Break in the model however short, so "a\n" text would otherwise make two model objects per two characters
 LINE = 64
-
-
-def name_of(text: str, name_u: str, name: str, sid: str) -> str:
-    """A shape's name in a connection list: the first line of its text cut at NAME characters, else its NameU, else
-    its Name, else `shape <ID>`."""
-    line = (text or "").strip().replace("\r\n", "\n").replace("\r", "\n").split("\n", 1)[0].strip()
-    if line:
-        return line[:NAME]
-    for v in (name_u, name):
-        v = (v or "").strip()
-        if v:
-            return v[:NAME]
-    return f"shape {str(sid)[:NAME]}"
-
-
-def connections(edges: list, names: dict) -> list:
-    """`Connections:` and one `- A → B` item per (begin id, end id, label) edge, ` (label)` added when the connector
-    has text; `names` maps a shape id to its name_of (an id it lacks reads `shape <ID>`). [] for no edges."""
-    if not edges:
-        return []
-    out = [Para([Text("Connections:")])]
-    for begin, end, label in edges:
-        line = f"{names.get(begin) or name_of('', '', '', begin)} → {names.get(end) or name_of('', '', '', end)}"
-        label = " ".join((label or "").split())
-        if label:
-            line += f" ({label})"
-        out.append(ListItem(0, "-", [Text(line)]))
-    return out
-
-
-class ConnectionBudget:
-    """The document's CONNECTIONS room (read when made): `take` keeps what fits of one page's edges and counts
-    `connections_cut` once for a list it cuts."""
-
-    def __init__(self, ctx):
-        self.ctx = ctx
-        self.room = CONNECTIONS
-
-    def take(self, edges) -> list:
-        if len(edges) <= self.room:
-            self.room -= len(edges)
-            return edges
-        kept = edges[:max(0, self.room)]
-        self.room = 0
-        self.ctx.skipped["connections_cut"] += 1
-        return kept
+CELLS = ("PinX", "PinY", "LocPinX", "LocPinY", "HideText", "Width", "Height", "Angle", "FlipX", "FlipY", "BeginX",
+         "BeginY", "EndX", "EndY", "BeginArrow", "EndArrow")
+# cells a shape takes from its master shape when it has none (a master's pin is on the master's own page)
+INHERITED = ("LocPinX", "LocPinY", "Width", "Height", "Angle", "FlipX", "FlipY", "BeginX", "BeginY", "EndX", "EndY",
+             "BeginArrow", "EndArrow")
+ARROWS = ("BeginArrow", "EndArrow")
+_KINDS = (("decision", "decision"), ("start/end", "terminator"), ("terminator", "terminator"), ("circle", "circle"),
+          ("ellipse", "circle"), ("database", "store"))
 
 
 def _kid(el, name):
@@ -87,13 +64,27 @@ def _rid(el):
 
 
 def _cells(shape) -> dict:
-    """{N: V} of the shape's own Cell elements (first one wins)."""
+    """{N: V} of the shape's own Cell elements named in CELLS (first one wins)."""
     out = {}
     for c in kids(shape, "Cell"):
         n = attr(c, "N")
-        if n in ("PinX", "PinY", "LocPinX", "LocPinY", "HideText") and n not in out:
+        if n in CELLS and n not in out:
             out[n] = attr(c, "V")
     return out
+
+
+def _structure(shape):
+    """The Value of the shape's own User row msvStructureType (first one wins), or None when it has none."""
+    for sec in kids(shape, "Section"):
+        if attr(sec, "N") != "User":
+            continue
+        for row in kids(sec, "Row"):
+            if attr(row, "N") != "msvStructureType":
+                continue
+            for c in kids(row, "Cell"):
+                if attr(c, "N") == "Value" and attr(c, "V") is not None:
+                    return attr(c, "V")
+    return None
 
 
 def _on(v) -> bool:
@@ -110,6 +101,44 @@ def _num(v):
     if not math.isfinite(f):
         return None
     return max(-COORD, min(COORD, f))
+
+
+def _arrow(v):
+    """An arrow cell's value: True above 0, False for any other number, None for no number."""
+    f = _num(v)
+    return None if f is None else f > 0
+
+
+def _kind(name) -> str:
+    n = (name or "").casefold()
+    for word, kind in _KINDS:
+        if word in n:
+            return kind
+    return ""
+
+
+def _box(c, ox, oy):
+    """(x0, y0, x1, y1) on the page of the shape with cells `c` under a parent at origin (ox, oy), or None without a
+    pin or a size: its box mirrored about the pin by FlipX / FlipY, bounded after the turn by Angle about the pin."""
+    px, py, w, h = (_num(c.get(n)) for n in ("PinX", "PinY", "Width", "Height"))
+    if px is None or py is None or w is None or h is None:
+        return None
+    lx, ly = _num(c.get("LocPinX")) or 0.0, _num(c.get("LocPinY")) or 0.0
+    x0 = lx - w if _on(c.get("FlipX")) else -lx  # the box's left and bottom from the pin
+    y0 = ly - h if _on(c.get("FlipY")) else -ly
+    corners = [(x0, y0), (x0 + w, y0), (x0, y0 + h), (x0 + w, y0 + h)]
+    a = _num(c.get("Angle")) or 0.0
+    if a:
+        co, si = math.cos(a), math.sin(a)
+        corners = [(x * co - y * si, x * si + y * co) for x, y in corners]
+    xs, ys = [x for x, _ in corners], [y for _, y in corners]
+    return px + ox + min(xs), py + oy + min(ys), px + ox + max(xs), py + oy + max(ys)
+
+
+def _end(c, which, ox, oy):
+    """A 1-D shape's Begin or End point on the page, or None when either coordinate is missing."""
+    x, y = _num(c.get(which + "X")), _num(c.get(which + "Y"))
+    return None if x is None or y is None else (x + ox, y + oy)
 
 
 def _text(shape) -> str:
@@ -135,8 +164,8 @@ def _inlines(text):
 
 
 def _glued(root) -> dict:
-    """{connector ID: (begin ID, end ID)} of a page's Connects, for connectors glued at both ends (BeginX and EndX;
-    the first Connect row of each end wins), in the order their first row appears."""
+    """{connector ID: (begin ID or None, end ID or None)} of a page's Connects rows from BeginX and EndX (the first
+    row of each end wins)."""
     conn = _kid(root, "Connects")
     ends = {}
     for c in kids(conn, "Connect") if conn is not None else ():
@@ -147,7 +176,7 @@ def _glued(root) -> dict:
         i = 0 if cell == "BeginX" else 1
         if e[i] is None:
             e[i] = to
-    return {s: (b, e) for s, (b, e) in ends.items() if b is not None and e is not None}
+    return {s: (b, e) for s, (b, e) in ends.items()}
 
 
 class _Reader:
@@ -157,12 +186,17 @@ class _Reader:
         self.image_bytes = 0
         self.main = ""
         self.master_parts = None  # Master ID -> master part, read from masters.xml on first use
+        self.master_names = {}    # Master ID -> its NameU in masters.xml
         self.masters = {}         # master part -> ({shape ID: element}, first top-level shape), or None: unreadable
         self.shapes = {}          # master shape element -> (text, hides it), so a shared shape is read once
+        self.mcells = {}          # master shape element -> (its cells, its structure type, its LineStyle)
+        self.style_index = None   # StyleSheet ID -> ({arrow cell: V}, its LineStyle), read on first use
+        self.style_arrows = {}    # (StyleSheet ID, arrow cell) -> its value up the chain
         self.room = limits.MAX_OUTPUT  # shape text the document may still emit, copies counted (see `spend`)
-        self.budget = ConnectionBudget(ctx)
-        self.glued = {}           # this page's connectors glued at both ends: ID -> (begin ID, end ID)
-        self.info = {}            # this page's shapes by ID (first wins): (text, NameU, Name), kept when glued
+        self.budget = diagram.ConnectionBudget(ctx)
+        self.dia = None           # this page's diagram
+        self.keys = set()         # this page's diagram keys given out so far
+        self.glued = {}           # this page's Connects ends: connector ID -> (begin ID, end ID), either may be None
 
     def deep(self):
         self.ctx.skipped["depth"] += 1
@@ -219,29 +253,30 @@ class _Reader:
             raise ReadError("damaged", "not a page")
         self.part = part
         sec = Section("page", title=name)
-        self.glued, self.info = _glued(root), {}
+        self.dia, self.keys, self.glued = diagram.Diagram(self.ctx, self.budget), set(), _glued(root)
         shapes = _kid(root, "Shapes")
+        out = []
         if shapes is not None:
-            out = []
             self.walk(shapes, 0.0, 0.0, 0, out, None)
-            placed = sorted((e for e in out if e[0] is not None), key=lambda e: e[0])
-            for _, blocks in placed + [e for e in out if e[0] is None]:
-                sec.blocks.extend(blocks)
-        # a Connect row naming a connector that is not a shape on this page lists nothing
-        edges = [(b, e, self.info[c][0]) for c, (b, e) in self.glued.items() if c in self.info]
-        edges = self.budget.take(edges)
-        names = {}
-        for b, e, _ in edges:
-            for sid in (b, e):
-                if sid not in names and sid in self.info:
-                    names[sid] = name_of(*self.info[sid], sid)
-        sec.blocks.extend(connections(edges, names))
-        self.glued, self.info = {}, {}
+        placed = sorted((e for e in out if e[0] is not None), key=lambda e: e[0])
+        slots = [(key, blocks) for _, key, blocks in placed + [e for e in out if e[0] is None]]
+        flow = [b for _, blocks in slots for b in blocks]
+        with self.ctx.guard("shape"):
+            flow = self.dia.place(slots)
+        sec.blocks.extend(flow)
+        self.dia, self.keys, self.glued = None, set(), {}
         return sec
 
+    def key(self, sid):
+        """A shape's diagram key: its ID, or a key no glue names when it has none or repeats one on the page."""
+        k = sid if sid is not None and sid not in self.keys else ("unkeyed", len(self.keys))
+        self.keys.add(k)
+        return k
+
     def walk(self, container, dx, dy, d, out, master):
-        """Append (sort key or None, blocks) for every Shape under `container`; (dx, dy) is the group offset, `master`
-        the Master ID of the nearest enclosing instance (its sub-shapes name their master shape by MasterShape)."""
+        """Append (sort key or None, diagram key, blocks) for every Shape under `container`; (dx, dy) is the group
+        origin, `master` the Master ID of the nearest enclosing instance (its sub-shapes name their master shape by
+        MasterShape)."""
         if d > limits.MAX_DEPTH:
             self.deep()
             return
@@ -250,16 +285,15 @@ class _Reader:
                 self.shape(el, dx, dy, d, out, master)
 
     def shape(self, el, dx, dy, d, out, master):
-        cells = _cells(el)
-        x, y = _num(cells.get("PinX")), _num(cells.get("PinY"))
-        key = (-(y + dy), x + dx) if x is not None and y is not None else None
+        own_cells = _cells(el)
+        x, y = _num(own_cells.get("PinX")), _num(own_cells.get("PinY"))
+        sort = (-(y + dy), x + dx) if x is not None and y is not None else None
         own = attr(el, "Master")
         master = own if own is not None else master
         ref = own is not None or (master is not None and attr(el, "MasterShape") is not None)
-        has_text, hide = _kid(el, "Text") is not None, cells.get("HideText")
-        # the master shape this one inherits from: its text when it has none, its HideText when it sets none
-        need = ref and not (has_text and hide is not None)
-        inherited = self.master_shape(master, attr(el, "MasterShape")) if need else None
+        mel = self.master_el(master, attr(el, "MasterShape")) if ref else None
+        inherited = self.master_text(mel) if ref else None
+        has_text, hide = _kid(el, "Text") is not None, own_cells.get("HideText")
         inlines = None  # an inherited text's lines are built once per master shape and shared by its copies
         if has_text:
             text = _text(el)
@@ -271,21 +305,93 @@ class _Reader:
             text = self.spend(inherited[0], "stencil") if inherited else ""
             inlines = inherited[2] if text else None
         hidden = _on(hide) if hide is not None else bool(inherited and inherited[1])
-        sid = attr(el, "ID")
-        if self.glued and sid is not None and sid not in self.info:  # hidden text never names a shape
-            self.info[sid] = ("" if hidden else text, attr(el, "NameU"), attr(el, "Name"))
         blocks = []
-        if text and (hidden or sid not in self.glued):  # a glued connector's shown text is in the list
+        if text:
             inlines = inlines if inlines is not None else _inlines(text.strip("\n"))
             blocks.append(Para(inlines, hidden="hidden" if hidden else ""))
         blocks.extend(self.picture(el))
-        if blocks:
-            out.append((key, blocks))
+        m_cells, m_struct, m_style = self.master_cells(mel)
+        c = dict(own_cells)
+        for n in INHERITED:
+            if c.get(n) is None and m_cells.get(n) is not None:
+                c[n] = m_cells[n]
+        sid = attr(el, "ID")
+        key = self.key(sid)
+        slot = key
+        glue = self.glued.get(sid) if key == sid else None  # Connects rows name the first shape of an ID
+        if (c.get("BeginX") is not None and c.get("EndX") is not None) or glue is not None:
+            begin, end = glue or (None, None)
+            style = attr(el, "LineStyle")
+            style = style if style is not None else m_style
+            arrows = tuple(self.arrow(n, own_cells, m_cells, style) for n in ARROWS)
+            self.dia.connector(key, begin, end, _end(c, "Begin", dx, dy), _end(c, "End", dx, dy), arrows,
+                               "" if hidden else text)
+            if hidden and text:  # hidden text is no label: it keeps its place in the flow
+                slot = None
+        else:
+            mname = self.master_names.get(own) if own is not None else None
+            kind = _kind(mname if mname else attr(el, "NameU"))
+            struct = _structure(el)
+            struct = struct if struct is not None else m_struct
+            container = (struct or "").strip().strip('"').strip().casefold() == "container"
+            self.dia.shape(key, blocks, kind, _box(c, dx, dy), hidden and bool(text), container,
+                           text if container and not hidden else "")
+        out.append((sort, slot, blocks))
         sub = _kid(el, "Shapes")
         if sub is not None:  # a missing pin or loc-pin term counts as 0, the other term still applies
-            ox = dx + (x or 0.0) - (_num(cells.get("LocPinX")) or 0.0)
-            oy = dy + (y or 0.0) - (_num(cells.get("LocPinY")) or 0.0)
+            ox = dx + (x or 0.0) - (_num(c.get("LocPinX")) or 0.0)
+            oy = dy + (y or 0.0) - (_num(c.get("LocPinY")) or 0.0)
             self.walk(sub, ox, oy, d + 1, out, master)
+
+    def arrow(self, name, own, inherited, style):
+        """An arrow cell's value: the shape's own, else its master shape's, else its LineStyle chain's; None: none."""
+        for v in (own.get(name), inherited.get(name)):
+            f = _arrow(v)
+            if f is not None:
+                return f
+        return self.style_arrow(style, name) if style is not None else None
+
+    # ---- style sheets
+    def style_arrow(self, style, name):
+        """`name`'s value from the first style up the LineStyle chain from `style` that has one, walking at most
+        `limits.MAX_DEPTH` styles and none twice; None when none has it."""
+        if (style, name) not in self.style_arrows:
+            index, seen, s, found = self.styles(), set(), style, None
+            for _ in range(limits.MAX_DEPTH):
+                if s is None or s in seen or s not in index:
+                    break
+                seen.add(s)
+                cells, s_up = index[s]
+                found = _arrow(cells.get(name))
+                if found is not None:
+                    break
+                s = s_up
+            self.style_arrows[(style, name)] = found
+        return self.style_arrows[(style, name)]
+
+    def styles(self) -> dict:
+        """{StyleSheet ID: ({arrow cell: V}, its LineStyle)} from the main document part (the first of an ID wins),
+        read once; {} when it cannot be read."""
+        if self.style_index is None:
+            self.style_index = {}  # set first: a part that fails is not read again
+            try:  # a part the reader refuses (damaged, past ZIP_RATIO, ...) gives no style; only timeout stops
+                root, _ = ooxml_base.load(self.pkg, self.main)
+            except ReadError as e:
+                if e.kind == "timeout":
+                    raise
+                return self.style_index
+            sheets = _kid(root, "StyleSheets")
+            for s in kids(sheets, "StyleSheet") if sheets is not None else ():
+                sid = attr(s, "ID")
+                if sid is None or sid in self.style_index:
+                    continue
+                cells = {}
+                for c in kids(s, "Cell"):
+                    n = attr(c, "N")
+                    if n in ARROWS and n not in cells:
+                        cells[n] = attr(c, "V")
+                self.style_index[sid] = (cells, attr(s, "LineStyle"))
+        return self.style_index
 
     # ---- masters
     def spend(self, text, kind) -> str:
@@ -299,26 +405,31 @@ class _Reader:
         self.room -= cost
         return text
 
-    def master_shape(self, mid, sid):
-        """(text, hides its text, its inlines) of master `mid`'s shape `sid` (sid None: the master's first top-level
-        shape), text "" when it has only blanks; ("", False, []) when the master has no such shape; None when the master is not read (not
-        listed, unreadable, or past MASTERS parts)."""
+    def master_el(self, mid, sid):
+        """Master `mid`'s shape `sid` (sid None: the master's first top-level shape); None when the master has no such
+        shape; False when the master is not read (not listed, unreadable, or past MASTERS parts)."""
         if self.master_parts is None:
             self.master_parts = {}  # set first: an index that fails is not tried again
             self.master_parts = self.master_index()
         part = self.master_parts.get(mid)
         if part is None:
-            return None
+            return False
         if part not in self.masters:
             if len(self.masters) >= MASTERS:
-                return None
+                return False
             self.masters[part] = None  # set first: a part that fails is not loaded again
             self.masters[part] = self.load_master(part)
         index = self.masters[part]
         if index is None:
-            return None
+            return False
         by_id, first = index
-        el = first if sid is None else by_id.get(sid)
+        return first if sid is None else by_id.get(sid)
+
+    def master_text(self, el):
+        """(text, hides its text, its inlines) of a master shape, text "" when it has only blanks; ("", False, [])
+        for no master shape; None when the master is not read (`master_el` gave False)."""
+        if el is False:
+            return None
         if el is None:
             return "", False, []
         if el not in self.shapes:
@@ -327,8 +438,17 @@ class _Reader:
             self.shapes[el] = (text, _on(_cells(el).get("HideText")), _inlines(text.strip("\n")) if text else [])
         return self.shapes[el]
 
+    def master_cells(self, el):
+        """(cells, User msvStructureType, LineStyle) of a master shape, read once; ({}, None, None) for none."""
+        if el is None or el is False:
+            return {}, None, None
+        if el not in self.mcells:
+            self.mcells[el] = (_cells(el), _structure(el), attr(el, "LineStyle"))
+        return self.mcells[el]
+
     def master_index(self) -> dict:
-        """{Master ID: part} from masters.xml through its relationships (the first entry of an ID wins)."""
+        """{Master ID: part} from masters.xml through its relationships (the first entry of an ID wins); fills
+        `master_names` with each listed master's NameU."""
         listing = "visio/masters/masters.xml"
         for rel in ooxml_base.rels(self.pkg, self.main).values():
             if rel.type.endswith("/masters") and not rel.external:
@@ -351,6 +471,7 @@ class _Reader:
                 continue
             if self.pkg.has(rel.target):
                 out[mid] = rel.target
+                self.master_names[mid] = attr(m, "NameU") or ""
         return out
 
     def load_master(self, part):

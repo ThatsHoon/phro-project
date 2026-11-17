@@ -1,8 +1,10 @@
-"""Visio (vsdx) parser: page order, text markers, groups, images, master text, connections, macros, hostile input.
+"""Visio (vsdx) parser: page order, text markers, groups, images, master text, diagrams (geometry, arrows through
+masters and line styles, kinds, containers), macros, hostile input.
 
 Run: python -I -X utf8 tests/test_reader_vsdx.py
      python -I -X utf8 tests/test_reader_vsdx.py measure   (times the hostile master and connection probes)
 """
+import math
 import sys
 import tempfile
 import time
@@ -13,11 +15,12 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
-from reader import markdown  # noqa: E402
+from reader import diagram, markdown  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.formats import vsdx as VX  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, ListItem, Para, Text  # noqa: E402
+from reader.model import Context, Para, Text  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 from reader_fix import make_zip  # noqa: E402
 
 REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -62,12 +65,46 @@ def glued(sheet, begin, end):
     return connect(sheet, "BeginX", begin) + connect(sheet, "EndX", end)
 
 
-def master_members(masters):
-    """{Master ID: shapes xml} -> masters.xml, its rels and one masterN.xml part each (N counts from 1)."""
+def cell(**cells):
+    """Cell elements, one per keyword, in order."""
+    return "".join(f'<Cell N="{n}" V="{v}"/>' for n, v in cells.items())
+
+
+def box_cells(x, y, w, h):
+    """A 2-D shape's cells: pin (x, y) at the centre of a w by h box."""
+    return cell(PinX=x, PinY=y, Width=w, Height=h, LocPinX=w / 2, LocPinY=h / 2)
+
+
+def line(i, p0, p1, attrs=""):
+    """A 1-D shape from p0 to p1 (BeginX..EndY), no text."""
+    return f'<Shape ID="{i}" {attrs}>' + cell(BeginX=p0[0], BeginY=p0[1], EndX=p1[0], EndY=p1[1]) + "</Shape>"
+
+
+CONTAINER = '<Section N="User"><Row N="msvStructureType"><Cell N="Value" V="Container" U="STR"/></Row></Section>'
+
+
+def styles_xml(sheets):
+    """{StyleSheet ID: (its LineStyle or None, cells xml)} -> visio/document.xml."""
+    body = "".join(f'<StyleSheet ID="{i}"' + (f' LineStyle="{p}"' if p is not None else "") + f">{c}</StyleSheet>"
+                   for i, (p, c) in sheets.items())
+    return f"<VisioDocument {VNS}><StyleSheets>{body}</StyleSheets></VisioDocument>"
+
+
+def mermaid_of(out):
+    """The text of the only mermaid block in rendered Markdown."""
+    assert out.count("```mermaid\n") == 1, out
+    return out.split("```mermaid\n", 1)[1].split("\n```", 1)[0]
+
+
+def master_members(masters, names=None):
+    """{Master ID: shapes xml} -> masters.xml, its rels and one masterN.xml part each (N counts from 1); `names` maps
+    a Master ID to its NameU (default M<ID>)."""
     ids = list(masters)
+    names = names or {}
     out = {
         "visio/masters/masters.xml": f'<Masters xmlns:r="{REL}" {VNS}>' + "".join(
-            f'<Master ID="{m}" NameU="M{m}"><Rel r:id="rId{n}"/></Master>' for n, m in enumerate(ids, 1)) + "</Masters>",
+            f'<Master ID="{m}" NameU="{names.get(m, "M" + m)}"><Rel r:id="rId{n}"/></Master>'
+            for n, m in enumerate(ids, 1)) + "</Masters>",
         "visio/masters/_rels/masters.xml.rels": rels_xml(
             [(f"rId{n}", "master", f"master{n}.xml") for n in range(1, len(ids) + 1)]),
     }
@@ -76,9 +113,9 @@ def master_members(masters):
     return out
 
 
-def vsdx(pages, listed=None, extra=None, page_rels=None, masters=None, mem=False):
+def vsdx(pages, listed=None, extra=None, page_rels=None, masters=None, mem=False, mnames=None):
     """pages: {name: shapes xml (or full xml)}, stored as page1.xml..; listed: [(Name, index)] for pages.xml;
-    masters: {Master ID: shapes xml}; mem: return the zip's bytes (nothing written)."""
+    masters: {Master ID: shapes xml}, mnames: {Master ID: NameU}; mem: return the zip's bytes (nothing written)."""
     names = list(pages)
     listed = listed if listed is not None else [(n, i + 1) for i, n in enumerate(names)]
     doc_rels = [("rId1", "pages", "pages/pages.xml")] + ([("rId2", "masters", "masters/masters.xml")] if masters else [])
@@ -96,7 +133,7 @@ def vsdx(pages, listed=None, extra=None, page_rels=None, masters=None, mem=False
         members[f"visio/pages/page{i}.xml"] = body if body.startswith("<PageContents") else page_xml(body)
     for i, r in (page_rels or {}).items():
         members[f"visio/pages/_rels/page{i}.xml.rels"] = rels_xml(r)
-    members.update(master_members(masters) if masters else {})
+    members.update(master_members(masters, mnames) if masters else {})
     members.update(extra or {})
     return make_zip(None if mem else tmp() / "a.vsdx", members, stored=())
 
@@ -299,8 +336,14 @@ def test_hidden_text_own_and_inherited():
 def test_hidden_connector_text_not_a_label():
     shapes = (shape(1, "Start", (0, 9)) + shape(2, None, (0, 1), HIDE + "<Text>secret</Text>", 'NameU="End"')
               + shape(3, None, (0, 5), HIDE + "<Text>quiet</Text>"))
-    out, _ = md(vsdx({"P": page_xml(shapes, glued(3, 1, 2))}))
-    assert "- Start → End\n" in out and "secret" not in out and "quiet" not in out, out
+    p = vsdx({"P": page_xml(shapes, glued(3, 1, 2))})
+    out, _ = md(p)
+    t = mermaid_of(out)
+    # a hidden end is a blank node; the connector's hidden text is no label and stays in the flow, hidden
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n2[" "]\n  n1 --> n2', t
+    assert "secret" not in out and "quiet" not in out, out
+    shown = markdown.render(reader.parse(p, Context()), tmp() / "assets", hidden=True)
+    assert "quiet" in shown and "secret" in shown and mermaid_of(shown) == t, shown
 
 
 def test_masters_cap():
@@ -317,74 +360,234 @@ def test_masters_cap():
 def test_connections():
     shapes = shape(1, "Start", (0, 9)) + shape(2, "End", (0, 1)) + shape(3, None, (0, 5)) + shape(4, "yes", (0, 4))
     out, ctx = md(vsdx({"P": page_xml(shapes, glued(3, 1, 2) + glued(4, 1, 2))}))
-    assert "Connections:\n\n- Start → End\n- Start → End (yes)\n" in out, out
-    flow = out[:out.index("Connections:")]
-    assert "yes" not in flow and out.count("yes") == 1
-    assert out.index("Start") < out.index("End") < out.index("Connections:")
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n2["End"]\n  n1 --> n2\n  n1 -->|"yes"| n2', t
+    assert "Connections:" not in out and "→" not in out and out.count("yes") == 1, out
+    assert out == f"## Page: P\n\n```mermaid\n{t}\n```\n", repr(out)
 
 
-def test_connection_list_after_pictures():
+def test_duplicate_id_not_glued_again():
+    # Connects rows name the first shape of an ID: a later shape repeating it is an ordinary shape
+    shapes = shape(1, "A", (0, 9)) + shape(2, "B", (0, 1)) + shape(3) + shape(3, "dup", (0, 5))
+    out, _ = md(vsdx({"P": page_xml(shapes, glued(3, 1, 2))}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["A"]\n  n2["B"]\n  n1 --> n2', t
+    assert out.endswith("```\n\ndup\n"), repr(out)
+
+
+def test_diagram_before_later_pictures():
+    # the diagram stands where the first connected shape stood; a picture below it keeps its place after it
     fd = '<ForeignData ForeignType="Bitmap"><Rel r:id="rId1"/></ForeignData>'
     shapes = shape(1, "A", (0, 9)) + shape(2, "B", (0, 8)) + shape(3) + shape(5, None, (0, 1), fd)
     p = vsdx({"P": page_xml(shapes, glued(3, 1, 2))}, extra={"visio/media/image1.png": PNG},
              page_rels={1: [("rId1", "image", "../media/image1.png")]})
     out, _ = md(p)
-    assert out.index("![](") < out.index("Connections:") and out.endswith("- A → B\n"), out
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["A"]\n  n2["B"]\n  n1 --> n2', t
+    assert out.index("```mermaid") < out.index("![](") and out.endswith("![](assets/img-001.png)\n"), out
 
 
 def test_one_end_connector():
+    # glued at one end, with no end point to place: no diagram, its text stays, counted loose
     shapes = shape(1, "Start", (0, 9)) + shape(2, "End", (0, 1)) + shape(3, "dangle", (0, 5))
-    out, _ = md(vsdx({"P": page_xml(shapes, connect(3, "BeginX", 1))}))
-    assert "Connections:" not in out and "dangle" in out, out
-    out, _ = md(vsdx({"P": page_xml(shapes, connect(3, "EndX", 2) + connect(3, "PinX", 1))}))
-    assert "Connections:" not in out and "dangle" in out, out
+    out, ctx = md(vsdx({"P": page_xml(shapes, connect(3, "BeginX", 1))}))
+    assert "```mermaid" not in out and "dangle" in out and ctx.skipped["connector_loose"] == 1, (out, ctx.skipped)
+    out, ctx = md(vsdx({"P": page_xml(shapes, connect(3, "EndX", 2) + connect(3, "PinX", 1))}))
+    assert "```mermaid" not in out and "dangle" in out and ctx.skipped["connector_loose"] == 1, (out, ctx.skipped)
 
 
-def test_connection_names():
+def test_one_end_connector_inferred():
+    # BeginX glued to A, EndX free but inside B's box: an inferred edge
+    shapes = (shape(1, "A", (), box_cells(0.5, 0.5, 1, 1)) + shape(2, "B", (), box_cells(4.5, 0.5, 1, 1))
+              + line(3, (1, 0.5), (4.5, 0.5)))
+    out, ctx = md(vsdx({"P": page_xml(shapes, connect(3, "BeginX", 1))}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["A"]\n  n2["B"]\n  %% inferred from position\n  n1 --> n2', t
+    assert not ctx.skipped["connector_loose"], ctx.skipped
+    # the free end outside every box (and past INFER_TOL): no edge, counted loose
+    shapes = shapes.replace(line(3, (1, 0.5), (4.5, 0.5)), line(3, (1, 0.5), (2.5, 3)))
+    out, ctx = md(vsdx({"P": page_xml(shapes, connect(3, "BeginX", 1))}))
+    assert "```mermaid" not in out and ctx.skipped["connector_loose"] == 1, (out, ctx.skipped)
+
+
+def test_node_labels():
+    # textless ends are blank nodes; long text is cut with … and follows the diagram after "nK:"; an end at a missing
+    # shape is no glue (counted loose) and that connector's other end keeps its text in the flow
     shapes = (shape(1, None, (), "", 'NameU="Alpha" Name="Ignored"') + shape(2, None, (), "", 'Name="Beta"')
               + shape(4) + shape(5, "x" * 100 + "\nsecond") + shape(6, "\n  lead \nmore", (), "", 'NameU="No"')
               + shape(10) + shape(11) + shape(12))
-    out, _ = md(vsdx({"P": page_xml(shapes, glued(10, 1, 2) + glued(11, 4, 5) + glued(12, 6, 99))}))
-    assert "- Alpha → Beta\n" in out, out
-    assert "- shape 4 → " + "x" * 80 + "\n" in out, out
-    assert "- lead → shape 99\n" in out, out
-    assert VX.name_of("a\nb", "U", "N", "9") == "a"
-    assert VX.name_of("  ", "U", "N", "9") == "U"
-    assert VX.name_of("", "", "N", "9") == "N"
-    assert VX.name_of("", "", "", "9") == "shape 9"
-
-
-def test_connections_blocks():
-    assert VX.connections([], {}) == []
-    got = VX.connections([("1", "2", ""), ("2", "3", "a\n b")], {"1": "One", "2": "Two"})
-    assert got == [Para([Text("Connections:")]), ListItem(0, "-", [Text("One → Two")]),
-                   ListItem(0, "-", [Text("Two → shape 3 (a b)")])], got
-
-
-def test_connection_budget():
-    ctx = Context()
-    old = VX.CONNECTIONS
-    VX.CONNECTIONS = 3
-    try:
-        budget = VX.ConnectionBudget(ctx)
-    finally:
-        VX.CONNECTIONS = old
-    e = [(str(i), str(i + 1), "") for i in range(6)]
-    assert budget.take(e[:2]) == e[:2] and not ctx.skipped["connections_cut"]
-    assert budget.take(e[2:4]) == e[2:3] and ctx.skipped["connections_cut"] == 1
-    assert budget.take([]) == [] and ctx.skipped["connections_cut"] == 1
-    assert budget.take(e[4:]) == [] and ctx.skipped["connections_cut"] == 2
+    out, ctx = md(vsdx({"P": page_xml(shapes, glued(10, 1, 2) + glued(11, 4, 5) + glued(12, 6, 99))}))
+    t = mermaid_of(out)
+    want = ('flowchart TD\n  n1[" "]\n  n2[" "]\n  n3[" "]\n  n4["' + "x" * 80 + '…"]\n'
+            '  n1 --> n2\n  n3 --> n4')
+    assert mermaid_ok(t) and t == want, t
+    assert out.endswith("```\n\nn4:\n\n" + "x" * 100 + "\nsecond\n\n  lead\nmore\n"), repr(out)
+    assert "Alpha" not in out and "Beta" not in out and ctx.skipped["connector_loose"] == 1, (out, ctx.skipped)
 
 
 def test_connections_cap():
-    old = VX.CONNECTIONS
-    VX.CONNECTIONS = 1
+    old = diagram.CONNECTIONS
+    diagram.CONNECTIONS = 1
     try:
         shapes = shape(1, "Start", (0, 9)) + shape(2, "End", (0, 1)) + shape(3) + shape(4)
         out, ctx = md(vsdx({"P": page_xml(shapes, glued(3, 1, 2) + glued(4, 2, 1))}))
     finally:
-        VX.CONNECTIONS = old
-    assert out.count(" → ") == 1 and ctx.skipped["connections_cut"] == 1, (out, ctx.skipped)
+        diagram.CONNECTIONS = old
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t.endswith('"]\n  n1 --> n2') and t.count("-->") == 1, t
+    assert ctx.skipped["connections_cut"] == 1, ctx.skipped
+
+
+def edge(attrs="", inner="", styles=None, masters=None):
+    """The edge line of A -> B joined by connector 3 (its attributes and cells given), with document.xml's style
+    sheets and masters given."""
+    shapes = shape(1, "A", (0, 9)) + shape(2, "B", (0, 1)) + shape(3, None, (), inner, attrs)
+    extra = {"visio/document.xml": styles_xml(styles)} if styles is not None else None
+    out, _ = md(vsdx({"P": page_xml(shapes, glued(3, 1, 2))}, extra=extra, masters=masters))
+    t = mermaid_of(out)
+    assert mermaid_ok(t), t
+    return t.split("\n")[-1].strip()
+
+
+def test_arrow_from_line_style():
+    assert edge() == "n1 --> n2"  # not known
+    assert edge('LineStyle="3"', styles={"3": (None, cell(EndArrow=13))}) == "n1 --> n2"
+    assert edge('LineStyle="3"', styles={"3": (None, cell(BeginArrow=13))}) == "n2 --> n1"
+    assert edge('LineStyle="3"', styles={"3": (None, cell(BeginArrow=13, EndArrow=4))}) == "n1 <--> n2"
+    assert edge('LineStyle="3"', styles={"3": (None, cell(BeginArrow=0, EndArrow=0))}) == "n1 --- n2"
+    # each cell from the first style of the chain that has it
+    chain = {"5": ("3", cell(EndArrow=0)), "3": (None, cell(BeginArrow=1, EndArrow=1))}
+    assert edge('LineStyle="5"', styles=chain) == "n2 --> n1"
+    # the master shape's LineStyle when the shape names none; a style not listed, or junk, gives nothing
+    m = {"1": shape(1, None, (), "", 'LineStyle="3"')}
+    assert edge('Master="1"', styles={"3": (None, cell(BeginArrow=2))}, masters=m) == "n2 --> n1"
+    assert edge('LineStyle="9"', styles={"3": (None, cell(BeginArrow=2))}) == "n1 --> n2"
+    assert edge('LineStyle="3"', styles={"3": (None, cell(BeginArrow="x"))}) == "n1 --> n2"
+
+
+def test_style_sheets_loaded_once():
+    loads = []
+    real = VX.ooxml_base.load
+
+    def counting(pkg, part):
+        loads.append(part)
+        return real(pkg, part)
+    shapes = shape(1, "A", (0, 9)) + shape(2, "B", (0, 1)) + "".join(
+        shape(i, None, (), "", f'LineStyle="{i % 2 + 3}"') for i in range(3, 103))
+    links = "".join(glued(i, 1, 2) for i in range(3, 103))
+    styles = styles_xml({"3": (None, cell(EndArrow=1)), "4": ("3", "")})
+    data = vsdx({"P": page_xml(shapes, links), "Q": page_xml(shapes, links)}, extra={"visio/document.xml": styles},
+                mem=True)
+    VX.ooxml_base.load = counting
+    try:
+        doc, ctx = parse_mem(data)
+    finally:
+        VX.ooxml_base.load = real
+    assert loads.count("visio/document.xml") == 1, loads.count("visio/document.xml")
+    out = markdown.render(doc, tmp() / "assets")
+    blocks = [b.split("\n```", 1)[0] for b in out.split("```mermaid\n")[1:]]
+    assert len(blocks) == 2 and all(mermaid_ok(t) for t in blocks), out
+    assert out.count("n1 --> n2") == 200 and not ctx.skipped, (out.count("n1 --> n2"), ctx.skipped)
+
+
+def test_style_chain_cycle():
+    assert edge('LineStyle="3"', styles={"3": ("4", ""), "4": ("3", "")}) == "n1 --> n2"
+    assert edge('LineStyle="3"', styles={"3": ("3", "")}) == "n1 --> n2"
+    # MAX_DEPTH styles are walked: an arrow on the last one is found, one style further it is not
+    for n, want in ((limits.MAX_DEPTH, "n2 --> n1"), (limits.MAX_DEPTH + 1, "n1 --> n2")):
+        chain = {str(i): (str(i + 1), "") for i in range(1, n)}
+        chain[str(n)] = (None, cell(BeginArrow=1))
+        assert edge('LineStyle="1"', styles=chain) == want, n
+
+
+def test_own_arrow_overrides_master():
+    m = {"1": shape(1, None, (), cell(EndArrow=13))}
+    assert edge('Master="1"', cell(BeginArrow=0, EndArrow=0), masters=m) == "n1 --- n2"
+    assert edge('Master="1"', masters={"1": shape(1, None, (), cell(BeginArrow=13))}) == "n2 --> n1"
+    # the master's cell over the style chain, the shape's own over both
+    m = {"1": shape(1, None, (), cell(BeginArrow=0), 'LineStyle="3"')}
+    assert edge('Master="1"', masters=m, styles={"3": (None, cell(BeginArrow=1))}) == "n1 --- n2"
+    styles = {"3": (None, cell(BeginArrow=1, EndArrow=1))}
+    assert edge('LineStyle="3"', cell(BeginArrow=0), styles=styles) == "n1 --> n2"
+    # a sub-shape takes its master shape's cells by MasterShape
+    group = shape(3, None, (), "<Shapes>" + shape(4, None, (), "", 'MasterShape="7"') + "</Shapes>", 'Master="1"')
+    m = {"1": shape(6, None, (), "<Shapes>" + shape(7, None, (), cell(BeginArrow=1)) + "</Shapes>")}
+    shapes = shape(1, "A", (0, 9)) + shape(2, "B", (0, 1)) + group
+    out, _ = md(vsdx({"P": page_xml(shapes, glued(4, 1, 2))}, masters=m))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t.endswith("n2 --> n1"), out
+
+
+def test_vsdx_kinds():
+    masters = {"1": shape(1), "2": shape(1), "3": shape(1)}
+    names = {"1": "Decision", "2": "Start/End", "3": "Process"}
+    shapes = (shape(1, "Q", (0, 9), "", 'Master="1"') + shape(2, "S", (0, 8), "", 'Master="2"')
+              + shape(3, "C", (0, 7), "", 'NameU="CIRCLE.12"') + shape(4, "D", (0, 6), "", 'NameU="Database"')
+              + shape(5, "P", (0, 5), "", 'Master="3" NameU="Decision.4"')
+              + "".join(shape(i) for i in range(11, 15)))
+    links = glued(11, 1, 2) + glued(12, 2, 3) + glued(13, 3, 4) + glued(14, 4, 5)
+    out, _ = md(vsdx({"P": page_xml(shapes, links)}, masters=masters, mnames=names))
+    t = mermaid_of(out)
+    want = ('flowchart TD\n  n1{"Q"}\n  n2(["S"])\n  n3(("C"))\n  n4[("D")]\n  n5["P"]\n'
+            '  n1 --> n2\n  n2 --> n3\n  n3 --> n4\n  n4 --> n5')
+    assert mermaid_ok(t) and t == want, t
+
+
+def test_vsdx_container():
+    a = shape(1, "A", (), box_cells(1, 3, 1, 1))
+    b = shape(2, "B", (), box_cells(3, 1, 1, 1))
+    want = 'flowchart TD\n  subgraph c1 ["Lane"]\n    n1["A"]\n    n2["B"]\n  end\n  n1 --> n2'
+    lane = shape(10, "Lane", (), box_cells(2, 2, 4, 4) + CONTAINER)
+    out, _ = md(vsdx({"P": page_xml(lane + a + b + shape(3), glued(3, 1, 2))}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == want and out.count("Lane") == 1, out
+    # the User row on the master shape
+    lane = shape(10, "Lane", (), box_cells(2, 2, 4, 4), 'Master="1"')
+    m = {"1": shape(1, None, (), CONTAINER)}
+    out, _ = md(vsdx({"P": page_xml(lane + a + b + shape(3), glued(3, 1, 2))}, masters=m))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == want and out.count("Lane") == 1, out
+    # another structure type is an ordinary shape
+    lane = shape(10, "Lane", (), box_cells(2, 2, 4, 4) + CONTAINER.replace("Container", "List"))
+    out, _ = md(vsdx({"P": page_xml(lane + a + b + shape(3), glued(3, 1, 2))}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and "subgraph" not in t and "Lane" in out, out
+
+
+def test_group_child_box():
+    # sub-shapes of a group at origin (10, 10): their boxes and the group's connector ends are page-absolute
+    kids_ = shape(2, "A", (), box_cells(1, 1, 1, 1)) + shape(3, "B", (), box_cells(3, 1, 1, 1))
+    group = shape(1, None, (), cell(PinX=10, PinY=10, Width=4, Height=2, LocPinX=0, LocPinY=0)
+                  + f"<Shapes>{kids_}</Shapes>")
+    want = 'flowchart LR\n  n1["A"]\n  n2["B"]\n  %% inferred from position\n  n1 --> n2'
+    out, _ = md(vsdx({"P": group + line(4, (11, 11), (13, 11))}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == want, t
+    inner = group.replace("</Shapes>", line(4, (1, 1), (3, 1)) + "</Shapes>")
+    out, _ = md(vsdx({"P": inner}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == want, t
+    # the same ends in the group's own units land on nothing
+    out, ctx = md(vsdx({"P": group + line(4, (1, 1), (3, 1))}))
+    assert "```mermaid" not in out and ctx.skipped["connector_loose"] == 1, (out, ctx.skipped)
+
+
+def test_box_geometry():
+    c = {"PinX": "2", "PinY": "3", "Width": "4", "Height": "2", "LocPinX": "1", "LocPinY": "1"}
+    assert VX._box(c, 10, 20) == (11, 22, 15, 24), VX._box(c, 10, 20)
+    # FlipX mirrors the box about the pin: LocPinX 1 of 4 -> 3 left of the pin, 1 right
+    assert VX._box(dict(c, FlipX="1"), 10, 20) == (9, 22, 13, 24), VX._box(dict(c, FlipX="1"), 10, 20)
+    assert VX._box(dict(c, FlipY="1"), 10, 20) == (11, 22, 15, 24)
+    # a quarter turn about the pin (12, 23): the box (11, 22)-(15, 24) turns to (11, 22)-(13, 26)
+    got = VX._box(dict(c, Angle=str(math.pi / 2)), 10, 20)
+    assert all(abs(g - w) < 1e-9 for g, w in zip(got, (11, 22, 13, 26))), got
+    assert VX._box(dict(c, Width="nan"), 0, 0) is None and VX._box({"PinX": "1", "PinY": "1"}, 0, 0) is None
+    assert VX._box(dict(c, LocPinX="x"), 0, 0) == (2, 2, 6, 4)  # a junk loc pin counts as 0
+
+
+def test_removed_names():
+    for name in ("connections", "name_of", "NAME", "CONNECTIONS", "ConnectionBudget"):
+        assert not hasattr(VX, name), name
 
 
 def test_vsdm_vba():
@@ -526,7 +729,8 @@ def test_phantom_connector_not_listed():
     shapes = shape(1, "A", (0, 9)) + shape(2, "B", (0, 1)) + shape(3)
     rows = "".join(glued(i, 1, 2) for i in range(90, 110)) + glued(3, 1, 2)
     out, _ = md(vsdx({"P": page_xml(shapes, rows)}))
-    assert out.count(" → ") == 1 and "- A → B\n" in out, out
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["A"]\n  n2["B"]\n  n1 --> n2', t
 
 
 def test_missing_image_counted():

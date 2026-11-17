@@ -73,8 +73,8 @@ first shape is the group, as vsdx's first top-level shape. Pictures are not inhe
 Output: `Section("page", title=name)`; the shapes, each its text `Para` (hidden="hidden" when its text is hidden) and
 its picture, sorted by (-PinY, PinX) on the page, a shape's PinY and PinX added to its group's origin (the group's own
 origin plus its Pin less its LocPin, as vsdx places sub-shapes); shapes without an XForm follow in walk order. Then
-`vsdx.connections` of the connectors glued at both ends, in walk order, through the document's one
-`vsdx.ConnectionBudget`: "A → B (label)", A and B the ends' `vsdx.name_of` (their shown text; hidden text never names
+`_connections` of the connectors glued at both ends, in walk order, through the document's one
+`diagram.ConnectionBudget`: "A → B (label)", A and B the ends' `_name_of` (their shown text; hidden text never names
 a shape), the label the connector's shown text, which leaves the shape flow (hidden connector text stays in the flow,
 hidden). A `_VBA_PROJECT_CUR` storage counts `vba` once; macros are never read.
 
@@ -101,10 +101,10 @@ import datetime
 import math
 import struct
 
-from .. import images, limits, officeart, text as textmod
+from .. import diagram, images, limits, officeart, text as textmod
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
-from ..model import Doc, Image, Para, Section
+from ..model import Doc, Image, ListItem, Para, Section, Text
 from . import cfb_route, vsd_stream, vsdx, zip_route
 from .vsd_stream import Chunk
 
@@ -157,6 +157,34 @@ _DATES.update(dict.fromkeys((44, 45, *range(50, 66), 76, 77, 78, 79, 200, 217, 2
 _DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 _MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
            "November", "December")
+
+
+def _name_of(text: str, name_u: str, name: str, sid: str) -> str:
+    """A shape's name in a connection list: the first line of its text cut at diagram.NAME characters, else its NameU,
+    else its Name, else `shape <ID>`."""
+    line = (text or "").strip().replace("\r\n", "\n").replace("\r", "\n").split("\n", 1)[0].strip()
+    if line:
+        return line[:diagram.NAME]
+    for v in (name_u, name):
+        v = (v or "").strip()
+        if v:
+            return v[:diagram.NAME]
+    return f"shape {str(sid)[:diagram.NAME]}"
+
+
+def _connections(edges: list, names: dict) -> list:
+    """`Connections:` and one `- A → B` item per (begin id, end id, label) edge, ` (label)` added when the connector
+    has text; `names` maps a shape id to its _name_of (an id it lacks reads `shape <ID>`). [] for no edges."""
+    if not edges:
+        return []
+    out = [Para([Text("Connections:")])]
+    for begin, end, label in edges:
+        line = f"{names.get(begin) or _name_of('', '', '', begin)} → {names.get(end) or _name_of('', '', '', end)}"
+        label = " ".join((label or "").split())
+        if label:
+            line += f" ({label})"
+        out.append(ListItem(0, "-", [Text(line)]))
+    return out
 
 
 def _f64(data, at):
@@ -332,7 +360,7 @@ class _Reader:
         self.room = limits.MAX_OUTPUT    # shape text the document may still emit (vsdx's charge)
         self.stencil_room = limits.MAX_OUTPUT  # stencil shape text the document may keep
         self.image_bytes = 0
-        self.budget = vsdx.ConnectionBudget(ctx)
+        self.budget = diagram.ConnectionBudget(ctx)
         self.names = {}       # libvisio's m_names: 0x33 id -> its bytes; a 0x32 starts a new one
         self.index = {}       # level -> [name index chunk data, its type, the names it maps to, parsed or None]
         self.fonts = {}       # 0x19 id -> codec (None: LID)
@@ -568,9 +596,9 @@ class _Reader:
         for blocks in loose:
             sec.blocks.extend(blocks)
         edges = self.budget.take(page.edges)
-        names = {sid: vsdx.name_of(page.names[sid], "", "", sid)
+        names = {sid: _name_of(page.names[sid], "", "", sid)
                  for b, e, _ in edges for sid in (b, e) if sid in page.names}
-        sec.blocks.extend(vsdx.connections(edges, names))
+        sec.blocks.extend(_connections(edges, names))
         return sec
 
     @staticmethod
