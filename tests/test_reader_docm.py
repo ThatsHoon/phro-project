@@ -14,9 +14,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 import reader  # noqa: E402
 from reader import limits, markdown  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
+from reader.model import Code, Context  # noqa: E402
 from reader.formats import ooxml  # noqa: E402
 from reader_fix import make_cfb, make_zip  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 WS = "http://purl.oclc.org/ooxml/wordprocessingml/main"
@@ -28,6 +29,8 @@ NSX = ('xmlns:r="{rel}" '
        'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" '
        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
+       'xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" '
+       'xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" '
        'xmlns:v="urn:schemas-microsoft-com:vml" '
        'xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"')
 MACRO = "application/vnd.ms-word.document.macroEnabled.main+xml"
@@ -584,6 +587,147 @@ def test_objects_in_deleted_and_vanished_runs_are_hidden():
             assert not ctx.skipped, (how, seen, dict(ctx.skipped))
             shown = markdown.render(doc, tmp() / "assets", True, ctx.skipped)
             assert seen in shown and "(hidden)" in shown, (how, seen, shown)
+
+
+# ---- drawing groups and canvases
+def _wbox(i, x, y, text, extra=""):
+    return (f'<wps:wsp><wps:cNvPr id="{i}" name="b{i}"{extra}/><wps:cNvSpPr/><wps:spPr><a:xfrm><a:off x="{x}" y="{y}"/>'
+            '<a:ext cx="1000" cy="500"/></a:xfrm><a:prstGeom prst="rect"/></wps:spPr><wps:txbx><w:txbxContent>'
+            f'<w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp>')
+
+
+def _wlink(i, a, b, extra=""):
+    return (f'<wps:wsp><wps:cNvPr id="{i}" name="c{i}"{extra}/><wps:cNvCnPr><a:stCxn id="{a}" idx="2"/>'
+            f'<a:endCxn id="{b}" idx="0"/></wps:cNvCnPr><wps:spPr><a:xfrm><a:off x="500" y="500"/>'
+            '<a:ext cx="0" cy="1000"/></a:xfrm><a:prstGeom prst="straightConnector1"/><a:ln><a:tailEnd type="triangle"/>'
+            '</a:ln></wps:spPr><wps:bodyPr/></wps:wsp>')
+
+
+def _wgp(members, xfrm="0 0 2000 2000 0 0 2000 2000"):
+    ox, oy, cx, cy, chx, chy, chcx, chcy = xfrm.split()
+    return (f'<wpg:wgp><wpg:cNvGrpSpPr/><wpg:grpSpPr><a:xfrm><a:off x="{ox}" y="{oy}"/><a:ext cx="{cx}" cy="{cy}"/>'
+            f'<a:chOff x="{chx}" y="{chy}"/><a:chExt cx="{chcx}" cy="{chcy}"/></a:xfrm></wpg:grpSpPr>{members}'
+            '</wpg:wgp>')
+
+
+def _anchored(graphic, fallback):
+    """A run holding an anchored drawing in an AlternateContent whose VML fallback repeats the text."""
+    return ('<w:r><mc:AlternateContent><mc:Choice Requires="wpg"><w:drawing><wp:anchor><wp:docPr id="99" name="g"/>'
+            f'<a:graphic><a:graphicData>{graphic}</a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice>'
+            f'<mc:Fallback><w:pict><v:group><v:shape><v:textbox><w:txbxContent>{fallback}</w:txbxContent></v:textbox>'
+            '</v:shape></v:group></w:pict></mc:Fallback></mc:AlternateContent></w:r>')
+
+
+def _mermaid(doc):
+    return "\n".join(b.text for b in doc.blocks if isinstance(b, Code) and b.lang == "mermaid")
+
+
+FLOW = 'flowchart TD\n  n1["Start"]\n  n2["End"]\n  n1 --> n2'
+
+
+def test_docx_group_connector():
+    group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "End") + _wlink(3, 1, 2))
+    body = f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("Start") + P("End"))}</w:p>'
+    doc, ctx = parse(docm(body))
+    t = _mermaid(doc)
+    assert mermaid_ok(t) and t == FLOW, t
+    out = markdown.render(doc, tmp() / "assets", False, ctx.skipped)
+    assert out.startswith("lead\n\n```mermaid\nflowchart TD") and out.count("Start") == 1, out
+    assert out.count("End") == 1 and not ctx.skipped, (out, dict(ctx.skipped))
+
+
+def test_docx_canvas_connector():
+    # End sits in a nested group that moves it right of Start: the transform composes, so the flow runs left to right
+    inner = ('<wpg:grpSp><wpg:cNvPr id="7" name="g"/><wpg:cNvGrpSpPr/><wpg:grpSpPr><a:xfrm><a:off x="3000" y="0"/>'
+             '<a:ext cx="1000" cy="500"/><a:chOff x="0" y="0"/><a:chExt cx="1000" cy="500"/></a:xfrm></wpg:grpSpPr>'
+             f'{_wbox(2, 0, 0, "End")}</wpg:grpSp>')
+    canvas = f'<wpc:wpc><wpc:bg/><wpc:whole/>{_wbox(1, 0, 0, "Start")}{inner}{_wlink(3, 1, 2)}</wpc:wpc>'
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(canvas, P("Start") + P("End"))}</w:p>'))
+    t = _mermaid(doc)
+    assert mermaid_ok(t) and t == FLOW.replace("TD", "LR"), t
+    out = markdown.render(doc, tmp() / "assets", False, ctx.skipped)
+    assert out.startswith("lead\n\n```mermaid\n") and out.count("Start") == out.count("End") == 1, out
+    assert not ctx.skipped, dict(ctx.skipped)
+
+
+def test_docx_group_only_moves_group():
+    group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "End") + _wlink(3, 1, 2) + _wbox(4, 3000, 0, "Aside"))
+    loose = ('<w:r><w:drawing><wp:anchor><a:graphic><a:graphicData><wps:wsp><wps:txbx><w:txbxContent>'
+             f'{P("Loose")}</w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>'
+             '</w:r>')
+    body = (P("before") + f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("Start"))}<w:r><w:t> tail</w:t></w:r>'
+            f'{loose}</w:p>' + P("after"))
+    doc, ctx = parse(docm(body))
+    out = markdown.render(doc, tmp() / "assets", False, ctx.skipped)
+    order = [out.index(s) for s in ("before", "lead tail", "```mermaid", "Aside", "Loose", "after")]
+    assert order == sorted(order) and all(out.count(s) == 1 for s in ("Start", "End", "Aside", "Loose")), out
+    assert mermaid_ok(_mermaid(doc)) and _mermaid(doc) == FLOW and not ctx.skipped, out
+    # without a connector the same group reads as before: each box's text after the paragraph, in order
+    plain = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "End"))
+    out = md(docm(P("before") + f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(plain, P("Start"))}</w:p>'))
+    assert out == "before\n\nlead\n\nStart\n\nEnd\n", out
+
+
+def test_docx_group_hidden_members():
+    # a hidden connector joins nothing; a hidden box is a blank node and its text stays out unless --hidden
+    group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "End") + _wlink(3, 1, 2, ' hidden="1"'))
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("Start"))}</w:p>'))
+    assert not _mermaid(doc) and markdown.render(doc, tmp() / "a") == "lead\n\nStart\n\nEnd\n"
+    group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "Secret", ' hidden="1"') + _wlink(3, 1, 2))
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("Start"))}</w:p>'))
+    t = _mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n2[" "]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert "Secret" not in out and "(1 hidden places left out)" in out, out
+    assert "Secret" in markdown.render(doc, tmp() / "a", True, ctx.skipped)
+    # so is every member of a hidden nested group
+    inner = f'<wpg:grpSp><wpg:cNvPr id="7" name="g" hidden="1"/>{_wbox(2, 0, 1500, "Secret")}</wpg:grpSp>'
+    group = _wgp(_wbox(1, 0, 0, "Start") + inner + _wlink(3, 1, 2))
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("x"))}</w:p>'))
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert _mermaid(doc) == t and "Secret" not in out and "(1 hidden places left out)" in out, out
+    # a group in a vanished run: every member is hidden, so nothing joins and nothing shows
+    group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "End") + _wlink(3, 1, 2))
+    run = _anchored(group, P("x")).replace("<w:r>", "<w:r><w:rPr><w:vanish/></w:rPr>", 1)
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{run}</w:p>'))
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert not _mermaid(doc) and "Start" not in out and "End" not in out and "lead" in out, out
+
+
+def test_docx_group_in_header_keeps_text():
+    group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "End") + _wlink(3, 1, 2))
+    hd = f'<w:hdr {{NS}}><w:p><w:r><w:t>top</w:t></w:r>{_anchored(group, P("x"))}</w:p></w:hdr>'
+    doc, ctx = parse(docm(P("body"), {"word/header1.xml": hd}, (("rH", "header", "header1.xml", False),)))
+    assert doc.headers == ["top Start End"] and not ctx.skipped, (doc.headers, dict(ctx.skipped))
+
+
+def test_docx_group_hostile_glue_and_geometry():
+    # glue to a missing id, to itself and to a connector; a repeated id; unusable numbers: no failure, no edge
+    bad = ('<wps:wsp><wps:cNvPr id="1"/><wps:spPr><a:xfrm><a:off x="1e99" y="-"/><a:ext cx="99999999999999999999" '
+           'cy="1"/></a:xfrm></wps:spPr><wps:txbx><w:txbxContent>' + P("Dup") + '</w:txbxContent></wps:txbx></wps:wsp>')
+    group = _wgp(_wbox(1, 0, 0, "Start") + bad + _wlink(3, 1, 9) + _wlink(4, 4, 1) + _wlink(5, 3, 1),
+                 "x y 1 1 0 0 0 0")
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("x"))}</w:p>'))
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert "lead\n\nStart\n\nDup\n" in out and "mermaid" not in out, out
+    assert dict(ctx.skipped) == {"connector_loose": 3}, dict(ctx.skipped)
+    # nested groups past the depth cap are left out and counted as too deep; the shallow members still read
+    deep = _wbox(1, 0, 0, "Start")
+    for _ in range(limits.MAX_DEPTH + 5):
+        deep = f'<wpg:grpSp><wpg:grpSpPr/>{deep}</wpg:grpSp>'
+    group = _wgp(_wbox(2, 0, 0, "Top") + deep)
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("x"))}</w:p>'))
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert "Top" in out and "Start" not in out and set(ctx.skipped) == {"depth"}, (out, dict(ctx.skipped))
+    # a diagram that fails leaves the members' blocks as they were and counts one shape
+    from reader import diagram
+    place, diagram.Diagram.place = diagram.Diagram.place, lambda self, slots: 1 / 0
+    try:
+        group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "End") + _wlink(3, 1, 2))
+        doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("x"))}</w:p>'))
+    finally:
+        diagram.Diagram.place = place
+    assert markdown.render(doc, tmp() / "a") == "lead\n\nStart\n\nEnd\n" and dict(ctx.skipped) == {"shape": 1}
 
 
 def main():

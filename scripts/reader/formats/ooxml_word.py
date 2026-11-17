@@ -1,12 +1,19 @@
-"""WordprocessingML (docm) to the document model. Elements match by local name."""
+"""WordprocessingML (docm) to the document model. Elements match by local name.
+
+Each drawing group (`wpg:wgp`) and canvas (`wpc:wpc`) is one diagram scope: its `wps:wsp` members, nested groups
+included, go to `diagram.Diagram` under their `wps:cNvPr@id` with their boxes in EMU through every enclosing group's
+transform, and a member with `wps:cNvCnPr` is a connector with its glue and arrowheads. The diagram takes the group's
+place among the blocks that follow the paragraph. A group in a header or footer, a lone `wps:wsp` and VML read as text.
+"""
 import re
 
-from .. import limits
+from .. import diagram, limits
 from ..containers.zipx import attr, kids, local
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import (Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math, NoteRef, Para,
                      Table, Text)
 from . import omml, ooxml_base, smartart
+from .drawingml import Xf, arrows, glue, kid, kind, xfrm
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
 from .word_fields import MAX_INSTR, MAX_URL, comment_note, hyperlink_url
@@ -76,6 +83,8 @@ class _Reader:
         self.chart_cells = 0
         self.smartart_nodes = 0
         self.opened = 0  # tables opened so far (TABLE_NODES)
+        self.budget = diagram.ConnectionBudget(ctx)  # the document's edges, shared by every group's diagram
+        self.diagrams = True  # False while a header or footer is read: its text is flattened to one line
 
     # ---- packages and parts
     def deep(self):
@@ -131,8 +140,12 @@ class _Reader:
             for name in self.related(suffix, kind):
                 root = self.open(name, kind)
                 if root is not None:
-                    with self.ctx.guard(kind):
-                        text = _flat(self.blocks(root, 0))
+                    self.diagrams = False
+                    try:
+                        with self.ctx.guard(kind):
+                            text = _flat(self.blocks(root, 0))
+                    finally:
+                        self.diagrams = True
                     if text:
                         store.append(text)
         root = self.open(self.part, "document")
@@ -424,9 +437,72 @@ class _Reader:
             self.extra(st, self.smartart(attr(el, "dm")))
         elif n == "txbxContent":
             self.extra(st, self.blocks(el, d + 1))
+        elif n in ("wgp", "wpc") and self.diagrams:
+            self.group(el, st, d)
         elif n not in _SKIP:
             for c in el:
                 self.node(c, st, d + 1)
+
+    # ---- drawing groups and canvases
+    def group(self, el, st, d):
+        """A group or canvas as one diagram scope: the blocks its members add after the paragraph become one slot each,
+        and the diagram's flow replaces them there."""
+        start, dia, slots = len(st.extras), diagram.Diagram(self.ctx, self.budget), []
+        self.members(el, st, d, Xf().group(xfrm(el)), False, dia, slots, set())
+        del st.extras[start:]
+        flow = [b for _, blocks in slots for b in blocks]
+        with self.ctx.guard("shape"):
+            flow = dia.place(slots)
+        st.extras.extend(flow)
+
+    def members(self, el, st, d, xf, hidden, dia, slots, keys):
+        """Each child of a group at depth `d`: a nested group is walked into with its transform composed (the same
+        scope), the chosen branch of an AlternateContent in place of it, anything else read as the paragraph reads it.
+        A member of a hidden group, or a hidden `wps:wsp`, has its blocks hidden."""
+        for c in el:
+            n = local(c.tag)
+            if n in ("grpSp", "wgp", "AlternateContent"):
+                if d + 1 > limits.MAX_DEPTH:
+                    self.deep()
+                elif n == "AlternateContent":
+                    chosen = self.choose(c)
+                    if chosen is not None:
+                        self.members(chosen, st, d + 1, xf, hidden, dia, slots, keys)
+                else:
+                    cnv = kid(c, "cNvPr")
+                    hid = hidden or (cnv is not None and attr(cnv, "hidden") in ("1", "true"))
+                    self.members(c, st, d + 1, xf.group(xfrm(c)), hid, dia, slots, keys)
+                continue
+            start = len(st.extras)
+            self.node(c, st, d + 1)
+            blocks = st.extras[start:]
+            del st.extras[start:]
+            cnv = kid(c, "cNvPr") if n == "wsp" else None
+            hid = hidden or (cnv is not None and attr(cnv, "hidden") in ("1", "true"))
+            if hid:
+                for b in blocks:
+                    if not b.hidden:
+                        b.hidden = "hidden"
+            key = attr(cnv, "id") if cnv is not None else None
+            if key is None or key in keys:
+                key = ("unkeyed", len(keys))
+            keys.add(key)
+            if n == "wsp":
+                with self.ctx.guard("shape"):
+                    self.member(c, key, blocks, xf, hid or bool(self.scope_hidden(st)), dia)
+            if blocks:
+                slots.append((key, blocks))
+
+    @staticmethod
+    def member(el, key, blocks, xf, hidden, dia):
+        """One `wps:wsp` of the scope: a connector when it has `wps:cNvCnPr`, else a shape."""
+        x, sppr = xfrm(el), kid(el, "spPr")
+        if kid(el, "cNvCnPr") is not None:
+            p0, p1 = xf.ends(x) or (None, None)
+            st, en = glue(el)
+            dia.connector(key, st, en, p0, p1, arrows(sppr), _flat(blocks), hidden=hidden)
+        else:
+            dia.shape(key, blocks, kind(sppr), xf.box(x), hidden)
 
     def picture(self, st, rid, alt=None):
         img = ooxml_base.image(self.pkg, self.scope.part, rid)
