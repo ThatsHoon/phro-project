@@ -67,6 +67,8 @@ LOST = (
     (("link",), "link", "links"),
     (("links_cut",), "hyperlink list cut short", "hyperlink lists cut short"),
     (("connections_cut",), "connection list cut short", "connection lists cut short"),
+    (("connector_loose",), "connector not attached", "connectors not attached"),
+    (("infer_skipped",), "diagram too large to place loose connectors", "diagrams too large to place loose connectors"),
     (("glyphs",), "text run without Unicode", "text runs without Unicode"),
     (("text",), "text run cut short", "text runs cut short"),
     (("truncated", "node", "parse"), "chapter cut short", "chapters cut short"),
