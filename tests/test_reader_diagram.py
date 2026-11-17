@@ -253,9 +253,26 @@ def test_hidden_end_blank_node():
     d.connector("k2", begin="A", end="E", arrows=(False, False))  # undirected: Mermaid, not a tree list
     out = d.place([("A", P("A")), ("B", secret), ("E", []), ("k1", []), ("k2", [])])
     ls = lines(out)
-    assert ls[1:4] == ['  n1["A"]', '  n2[" "]', '  n3[" "]'], ls
+    assert ls[1:] == ['  n1["A"]', "  n1 --> n2", "  n1 --- n3"], ls  # blank nodes: in their edges only
     assert "secret" not in "\n".join(ls)
     assert out[1:] == secret, out  # the hidden shape's slot stays where it was, after the diagram
+
+
+def test_blank_node_only_in_its_edges():
+    # a blank node outside every subgraph is not declared: Mermaid makes it from its first edge
+    d, _ = new()
+    d.shape("A", P("A"))
+    d.shape("B", [])
+    d.connector("k", begin="A", end="B")
+    assert lines(d.place([("A", []), ("B", [])])) == ["flowchart TD", '  n1["A"]', "  n1 --> n2"]
+    # inside a subgraph it is declared, so it is placed there
+    d, _ = new()
+    d.shape("C", P("Lane"), box=(0, 0, 100, 100), container=True, title="Lane")
+    d.shape("A", P("A"), box=(10, 10, 20, 20))
+    d.shape("B", [], box=(50, 50, 60, 60))
+    d.connector("k", begin="A", end="B")
+    assert lines(d.place([("C", []), ("A", []), ("B", [])])) == [
+        "flowchart TD", '  subgraph c1 ["Lane"]', '    n1["A"]', '    n2[" "]', "  end", "  n1 --> n2"]
 
 
 def test_hidden_connector_no_edge():

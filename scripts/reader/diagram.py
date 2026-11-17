@@ -21,6 +21,7 @@ numbers, escapes, orients and renders, and builds model blocks only.
   slotless ones in `shape()` order. Plain text of at most NAME characters is the whole label; any other content gets
   its first line cut at NAME plus `…` (or `(picture)`, `(table)`, `(chart)`, `(content)`), and its blocks follow the
   diagram after a `nK:` paragraph. A hidden shape, or one with no text, is a blank node; a hidden one keeps its slot.
+  A blank node is declared (`nK[" "]`) only inside a subgraph; elsewhere it is written in its edges alone.
 - **Containers.** A container shape (not hidden, with a box, not an edge end) holding a node's centre becomes
   `subgraph cK ["title"]`; the smallest box wins, containers nest the same way up to `limits.MAX_DEPTH`, and the nodes
   of deeper ones go to the deepest kept one. A container with no node is an ordinary shape, and so is every
@@ -466,7 +467,7 @@ class Diagram:
                 elif labels[k]:
                     o, e = _KINDS[self.shapes[k].kind]
                     lines.append(f'{pad}{nid[k]}{o}"{_esc(labels[k])}"{e}')
-                else:
+                elif at is not None:  # a blank node is declared only to place it in its subgraph, else edges make it
                     lines.append(f'{pad}{nid[k]}[" "]')
 
         emit(None, 1)

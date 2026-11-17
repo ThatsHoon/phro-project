@@ -362,7 +362,7 @@ def test_line_shape_and_textless_target():
     s = sp("", id=2, off=(0, 0), ext=(100, 100), paras="") + sp("Goal", id=3, off=(0, 1000), ext=(100, 100)) + line
     doc, _ = parse(deck([s]))
     t = mermaid(doc)
-    assert mermaid_ok(t) and t == ('flowchart TD\n  n1["Goal"]\n  n2[" "]\n  %% inferred from position\n'
+    assert mermaid_ok(t) and t == ('flowchart TD\n  n1["Goal"]\n  %% inferred from position\n'
                                    '  n2 --> n1'), t
     rule = sp("rule", id=4, off=(50, 100), ext=(0, 900), prst="line")  # no arrowhead: a divider, never an edge
     out = md(deck([sp("", id=2, off=(0, 0), ext=(100, 100), paras="") + sp("Goal", id=3, off=(0, 1000), ext=(100, 100))

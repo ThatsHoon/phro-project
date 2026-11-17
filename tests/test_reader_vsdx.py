@@ -349,7 +349,7 @@ def test_hidden_connector_text_not_a_label():
     out, _ = md(p)
     t = mermaid_of(out)
     # a hidden end is a blank node; the connector's hidden text is no label and stays in the flow, hidden
-    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n2[" "]\n  n1 --> n2', t
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n1 --> n2', t
     assert "secret" not in out and "quiet" not in out, out
     shown = markdown.render(reader.parse(p, Context()), tmp() / "assets", hidden=True)
     assert "quiet" in shown and "secret" in shown and mermaid_of(shown) == t, shown
@@ -427,7 +427,7 @@ def test_node_labels():
               + shape(10) + shape(11) + shape(12))
     out, ctx = md(vsdx({"P": page_xml(shapes, glued(10, 1, 2) + glued(11, 4, 5) + glued(12, 6, 99))}))
     t = mermaid_of(out)
-    want = ('flowchart TD\n  n1[" "]\n  n2[" "]\n  n3[" "]\n  n4["' + "x" * 80 + '…"]\n'
+    want = ('flowchart TD\n  n4["' + "x" * 80 + '…"]\n'
             '  n1 --> n2\n  n3 --> n4')
     assert mermaid_ok(t) and t == want, t
     assert out.endswith("```\n\nn4:\n\n" + "x" * 100 + "\nsecond\n\n  lead\nmore\n"), repr(out)

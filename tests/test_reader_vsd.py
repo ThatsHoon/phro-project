@@ -1077,7 +1077,7 @@ def test_hidden_text():
               {"id": 3, "master": (0, 1), "pin": (0.0, 7.0), "misc": misc()},
               {"id": 4, "text": "link", "pin": (0.0, 6.0), "misc": misc(hide=True, ends=(1, 3))}]
     doc, ctx = read(drawing([{"shapes": shapes}], stencils=stencils))
-    assert lines(doc.blocks[0]) == ['flowchart TD\n  n1[" "]\n  n2["veiled"]\n  n1 --> n2', "hidden:secret",
+    assert lines(doc.blocks[0]) == ['flowchart TD\n  n2["veiled"]\n  n1 --> n2', "hidden:secret",
                                     "hidden:veiled", "hidden:link"], lines(doc.blocks[0])
     assert not ctx.skipped
     with tempfile.TemporaryDirectory() as tmp:

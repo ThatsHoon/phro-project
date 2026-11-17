@@ -676,7 +676,7 @@ def test_docx_group_hidden_members():
     group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "Secret", ' hidden="1"') + _wlink(3, 1, 2))
     doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("Start"))}</w:p>'))
     t = _mermaid(doc)
-    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n2[" "]\n  n1 --> n2', t
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n1 --> n2', t
     out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
     assert "Secret" not in out and "(1 hidden places left out)" in out, out
     assert "Secret" in markdown.render(doc, tmp() / "a", True, ctx.skipped)
