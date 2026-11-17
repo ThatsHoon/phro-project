@@ -1,0 +1,129 @@
+# Diagrams plan: rulings and deferred minors
+
+Every decision the controller made on the owner's behalf while running docs/superpowers/plans/2026-11-17-doc-reader-diagrams.md (SDD), and every finding left for later, copied from the run's ledger in order. Each ruling reads: what was decided — why — what it costs if wrong.
+
+## Rulings (53)
+
+- Ruling: T1 test_tree_depth_cap builds a branching tree of depth 3 with smartart.MAX_LEVEL lowered to 2 (try/finally) and expects Mermaid — the plan text mixes "depth 9" with the lowered cap; the lowered cap is the testable intent — cost if wrong: one test rewrite.
+- Ruling: tree depth counts levels with the root as level 1; a tree fits when its levels <= smartart.MAX_LEVEL (8) — matches SmartArt's own level count — cost if wrong: an 8-level tree flips between list and Mermaid.
+- Task 1: Ruling: container candidates past INFER_SHAPES (2,000) give no subgraphs — containers become plain shapes, nothing counted (no content is dropped: their text stays as ordinary node/flow text); a scope whose nodes have no boxes skips container assignment at once — spec caps name INFER_SHAPES as the per-scope geometry bound; a new skip kind would go beyond the spec — cost if wrong: a huge swimlane file loses its subgraphs silently.
+- Task 1: Ruling: ConnectionBudget duplicate stands as plan-mandated transition; Task 6 deletes vsdx's copy, Task 7 confirms vsd uses diagram's — cost if wrong: a stale copy survives; the final review checks.
+- Task 1: Ruling: the container cK: follow-up (extra vs brief) is accepted — the spec's "nothing is lost" covers a container's rich content — cost if wrong: extra lines under a subgraph.
+- Task 2: Ruling: inference candidates capped at CONNECTIONS per scope, the rest count connections_cut once — reuses the spec's existing kind for the same edge cap; every file-driven loop must be capped — cost if wrong: a scope with >10k loose connectors reports a cut instead of loose counts.
+- Task 2: Ruling: hidden shapes may be snap targets (the end then gets the spec's blank/hidden node treatment); hidden connectors are never candidates or counted — spec "Hidden and blank ends" says a hidden connector gives no edge — cost if wrong: an edge to a hidden box appears as a blank node.
+- Task 2: Ruling: the INFER_SHAPES size check counts every boxed shape, containers included — spec cap names shapes with boxes in the scope — cost if wrong: a scope just under the cap with many containers skips inference slightly early.
+- Task 2: Ruling: inferred edges count for direction and tree detection; a tree list carries no %% marker — the spec's %% line belongs to the Mermaid output; a list has no comment syntax — cost if wrong: a reader cannot tell a tree's edges were inferred.
+- Task 2: Ruling: inference candidates are capped per DOCUMENT at CONNECTIONS (the shared ConnectionBudget tracks attempts, whether or not they become edges); once spent, later scopes skip inference and count infer_skipped once per scope, their loose connectors keep slots uncounted — worst case one document ≈ 12 s, within CONVERT_SECONDS; reuses existing kinds, no new constant — cost if wrong: a large multi-page file with many loose connectors loses inference on its later pages.
+- Task 3: Ruling: a title over 80 characters that is an edge end appears as the slide heading and again in the nK: follow-up — the spec's nothing-is-lost rule for long labels applies uniformly — cost if wrong: one repeated title per such slide.
+- Task 3: Ruling: placeholders whose position is inherited from layout/master get no box (glued ends work, no snapping) — resolving inherited geometry is outside this spec — cost if wrong: an unglued connector next to an inherited placeholder stays loose.
+- Task 4: Ruling: a oneCellAnchor/twoCellAnchor shape without xfrm (and no xdr:pos) has box None — cell-relative geometry needs column widths and row heights, outside this spec — cost if wrong: such shapes are only reachable by glue, never by snapping.
+- Task 4: Ruling: past limits.MAX_DEPTH nested groups geometry becomes None, nothing counted, text kept — depth cap already bounds the walk; geometry loss is not content loss — cost if wrong: deep groups lose inference silently.
+- Task 5: Ruling: groups in headers/footers keep today's flat text (no diagram) — the header/footer path flattens blocks and drops Code; headers rarely carry flowcharts — cost if wrong: a header flowchart reads as flat text.
+- Task 5: Ruling: Word connectors register with line=False like pptx cxnSp — a wps:cNvCnPr marks a connector explicitly — cost if wrong: none expected.
+- Task 5: Ruling: inside groups, a member hidden via cNvPr@hidden or a hidden nested group now gets its blocks marked hidden (previously shown) — the engine's hidden rule applies; this aligns docx with pptx — cost if wrong: such text needs --hidden to show.
+- Task 6: Ruling: PinX/PinY/HideText are not inherited from masters (LocPin is) — instances carry their own pin in practice; the brief lists the geometry cells — cost if wrong: a pinless instance gets a box at the origin side.
+- Task 6: Ruling: every unglued 1-D shape is an inference candidate (Visio arrows default None, not False), so decorative lines count connector_loose — the spec treats a Visio 1-D shape as a connector; the cost is a count, not content — cost if wrong: a page of decorative lines reports loose connectors.
+- Task 6: Ruling: the duplicate-ID glue fix is accepted as in scope — wrong glue would write a false edge — cost if wrong: none.
+- Task 7: Ruling: Visio 5 uses VSD5Parser offsets (0x85 markers at 21/22, line style s16 at 10, sheet parent s16 at 10) instead of the brief's v6/v11 offsets; a v5 master gives text only — the brief's offsets are version-specific; libvisio is the source — cost if wrong: v5 arrows read as unknown (-->).
+- Task 7: Ruling: shapes with no text, picture, XForm or connector data are not registered, and a page with no connector skips the Diagram — such shapes can be neither ends nor snap targets; saves memory — cost if wrong: none expected.
+- Task 7: Ruling: a stencil shape with only a line style keeps no entry (keeps test_blank_stencil_ids_cost_no_entry) — memory bound over a rare arrow source — cost if wrong: an instance of such a master loses its inherited arrow (falls back to its own or the chain).
+- Task 8: Ruling: presentation:style-name is looked up in the "presentation" family, not "graphic" as the brief's prop call reads — in ODF that attribute names a presentation-family style; a graphic lookup never finds it — cost if wrong: none (draw:style-name still uses graphic).
+- Task 8: Ruling: in odt only glued shapes are registered and positions are anchor-relative, so a loose connector can snap only to a connected shape, else connector_loose — body-wide geometry needs page layout, outside this spec — cost if wrong: odt loose connectors next to unconnected shapes stay loose.
+- Task 8: Ruling: an ods custom shape with no connection still produces no output (pre-existing); an odt loose connector's text moves from inline to a block after its paragraph — out of this task's scope / the diagram rule — cost if wrong: ods unconnected custom-shape text stays unread (flag for the final review).
+- Task 8: Ruling: the fix also covers review Minor 1 (a place() failure outside dia.place's guard leaves _Slots rendering as nothing) — it is content loss, so it joins the fix round: on any failure the slots swap back to their member blocks — cost if wrong: one extra test.
+- Task 9: Ruling: the slide title is a plain node with no slot and stays sec.title (as ooxml_slides does), not registered with title= — my dispatch misdescribed title= (it labels containers); the brief only requires the title kept as the title — cost if wrong: none.
+- Task 9: Ruling: ppt registers no hidden shapes (no per-shape hidden flag read) — the existing ppt walk has none; hidden ODRAW property 0x03BF is outside this task — cost if wrong: a hidden ppt shape's text joins a node label.
+- Task 10: Ruling: text boxes link by FTXBXS lid at offset 14 (the brief) rather than the spec's "lTxid" wording — the brief names the concrete field the reader already parses — cost if wrong: unlinked boxes stay after the main text.
+- Task 10: Ruling: a rule-end shape whose edge does not form puts its text at its anchor rather than after the main text (solver files only; nothing lost or duplicated) — the slot is the shape's place — cost if wrong: a moved text box in rare files.
+- Task 10: Ruling: connectors register only when a rule names them (decision 8, no boxes, no inference); a rule end naming no anchored shape counts connector_loose once — cost if wrong: none.
+- Task 10: Ruling: anchors inside a table put the diagram just before that table — a Mermaid block cannot sit inside a cell — cost if wrong: the diagram reads slightly early.
+- Task 11: Ruling: cell comments (also TXOs) now come out as paragraphs after the sheet's table — xls.py read no comments before (checked: no NOTE/comment handling), so this adds content without duplication; decision 11 makes no exception — cost if wrong: comment text reads as plain paragraphs, not tied to its cell.
+- Task 11: Ruling: group members (ChildAnchor only) get no box — glued rules still work; loose ends inside groups are not inferred — mapping child anchors needs the group's transform chain, as ppt does; deferred — cost if wrong: loose connectors inside xls groups stay loose.
+- Task 11: Ruling: group/patriarch shapes are registered as ordinary shapes — cost if wrong: a loose end between members may snap to the group box (flag for final review).
+- Task 12: Ruling: pub_2k is left unchanged (no boxes, no connectors); test_pub2k_inferred becomes test_pub2k_line_no_diagram (a 2000-format line between two text boxes adds no diagram; page byte-identical) — the spec's "inference only" needs an arrowed line, and no source reads one; guessing a byte from samples is not porting — cost if wrong: Publisher 2000/97 drawings stay flat text.
+- Task 12: Ruling: a rule whose connector spid maps to no shape on the page keeps the edge as glued ends with no connector slot to drop — the ends are what carry meaning — cost if wrong: none.
+- Task 12: Ruling: a connector whose own slot holds a picture or table keeps that content under key ("rule", spidC) instead of dropping it — no content lost (better than other formats' label-only rule) — cost if wrong: none.
+- Task 12: Ruling: implement the spec's inference for pub 2002+: every type 32–40 shape (line=False) and type 20 shape (line=True) on a page registers as a connector with p0/p1 from its full box after FSP flips; glue from any rule naming it as spidC, keeping each end only if that end's seqnum is on the same page (else unglued); a Diagram is built whenever a page has a connector candidate. test_pub_rule_other_page changes to: no edge on either page, and the connector's page counts connector_loose 1 (if no box catches the loose end) — the spec's inference covers ODRAW types in every format and the brief's "boxes for inference" shows intent — cost if wrong: a few more loose-connector notes on Publisher pages.
+- Task 12: Ruling: a picture/table connector slot is keyed ("slot", seqnum) rather than ("rule", spidC) — a connector found by type may have no rule and spid 0; behaviour (slot kept) is the same — cost if wrong: none.
+- Task 13: Ruling: a section scope spanning pages keeps PAPER/PAGE boxes in one frame — hwpx XML carries no page of an object, so a loose end may snap to a shape on another page; spec decision 8 gives these a box — cost if wrong: a rare false inferred edge.
+- Task 13: Ruling: glue to an hp:container id is not glue (containers are scopes, not shapes) — spec registers drawing objects as nodes; a container is a group — cost if wrong: an edge to a group becomes a loose end.
+- Task 14: Ruling: the shape key is the drawing-style instance id (kordoc's drawingStyle, read for members too), CTRL_HEADER @36 only when that is 0 or unreadable — kordoc maps the same id to hwpx instid, which Task 13 keys on — cost if wrong: on real files glue would not match and edges become loose ends (no text lost); checked in the Task 16 bench.
+- Task 14: Ruling: vertRelTo bits 3-4, horzRelTo bits 8-9 of CTRL_HEADER attr; plain-line arrows from line-attribute bits 10 and 16, else unknown — from kordoc's layout — cost if wrong: a box dropped or an arrow missed.
+- Task 14: Ruling: a truncated connect LINE record (<36 bytes) gives no glue and no points (one connector_loose) — all-or-nothing is simpler and the brief only forbids errors — cost if wrong: a partly readable connector is lost as an edge.
+- Task 14: Ruling: a truncated SHAPE_COMPONENT keeps an intact LINE record's glue (each field from its own record) — the brief's "no glue" was written for the LINE record being cut; no error either way — cost if wrong: an edge kept where the plan expected a loose end.
+- Task 16: Ruling: the bench line check excludes the five real-* documents — their paths are in the user's Downloads, which is never read (the before run hit FileNotFoundError and read nothing); their stored run records were restored from the backup — cost if wrong: five fewer documents checked.
+- Task 16: Ruling: the before set is main 23578a2's scripts (git archive into the scratchpad), not the stored runs, which mix versions 0.1.0-0.7.0 — cost if wrong: none.
+- Final: Ruling: blank-node declarations (reviewer Minor 4) re-graded Important and enter the fix wave — the user's end goal names token efficiency; +40% on such Visio documents — cost if wrong: a small checker change.
+- Final: Ruling: ODF absent marker stays None (`-->`, plan decision 7) — the style chain may be partly unread, and None keeps drawing order; changing it alters every ODF edge — cost if wrong: arrowless LibreOffice connectors read as directed.
+- Final: Ruling: spec wording follows the fixes (connector_loose excludes decorative lines; blank nodes outside subgraphs are undeclared) — controller edits the spec after the fix lands — cost if wrong: doc churn only.
+- Final: Ruling: edge labels stay on one line (line breaks and tabs become spaces, `_edge_label`), and the spec says so — an edge label is a short caption; no text is lost — cost if wrong: "yes<br>no" style labels read as "yes no".
+
+## Deferred minors (67)
+
+- Task 1: minor (deferred): a node whose only block is a Heading gets label "(content)"; Heading should count as a first-line candidate.
+- Task 1: minor (deferred): hidden node in a tree list renders an empty "-" item.
+- Task 1: minor (deferred): _plain and _first_line duplicate the inline-walk stack.
+- Task 1: minor (deferred): no test for the container cK: follow-up path, nor for a Hidden inline not leaking into a label.
+- Task 1: minor (deferred): subgraph ids follow node order, so c2 may print before c1.
+- Task 1: minor (deferred): Task 2 must merge test_bad_glue_is_not_glued with its planned test_bad_glue_is_unglued.
+- Task 2: minor (deferred): the 1e-9 × tol tie window is not tested (only exact ties).
+- Task 2: minor (deferred): module docstring says "within 1e-9 of the tol" — reads as 1e-9 absolute.
+- Task 2: minor (deferred): _point and _box duplicate the coordinate check; both unpack any iterable (_point("12") -> (1.0, 2.0)).
+- Task 2: minor (deferred): test_infer_inside_box and the second case of test_one_end_glued_other_inferred do not check ctx.skipped.
+- Task 2: minor (deferred): no test of partial room followed by a later scope across two scopes
+- Task 3: minor (deferred): drawingml.Xf docstrings say "slide space"/"on the slide" in a format-neutral module.
+- Task 3: minor (deferred): `self._body_text(body) if body is not None else ""` repeated twice in ooxml_slides.
+- Task 3: minor (deferred): a skipped placeholder (sldNum/dt/ftr) that is an edge end now shows its text as a node label; no test pins it.
+- Task 3: minor (deferred): no regression tests for a glued title's equation slot, cxnSp in a hidden grpSp, cxnSp without spPr (probes pass).
+- Task 3: minor (deferred): place() raising midway leaves budget/infer debits and connector_loose counts, then counts shape once more (diagram.py).
+- Task 3: minor (deferred): test fixture argument named `id` shadows the builtin (test_reader_slides.py).
+- Task 4: minor (deferred): no test of a standard oneCellAnchor without xdr:pos (box None).
+- Task 4: minor (deferred): a chart/picture graphicFrame with a zeroed xdr:xfrm gives a (0,0,0,0) box — a possible snap target near the origin.
+- Task 4: minor (deferred): Drawings.register is a staticmethod taking everything as arguments; a module function would be tidier.
+- Task 5: minor (deferred): a top-level wgp/wpc's own cNvPr@hidden is ignored (nested groups honour it).
+- Task 5: minor (deferred): scope_hidden(st) is evaluated per member; could be once per group.
+- Task 5: minor (deferred): no tests for a group in a table cell or footnote, two groups in one paragraph, a wpc inside a group.
+- Task 6: minor (deferred): near the MASTERS cap (>1,000 distinct masters) masters needed only for cells now take cap slots; a later master needing text may fall to stencil.
+- Task 6: minor (deferred): BeginX/EndX inherited from masters are master-page coordinates (plan-mandated); inference may snap wrongly if an instance lacks its own.
+- Task 6: minor (deferred): a non-ReadError in dia.shape/connector loses that shape's text slot (out.append runs after registration); file does not fail.
+- Task 6: minor (deferred): group Angle/Flip not applied to child boxes (origin offset only).
+- Task 6: minor (deferred): test_box_geometry's FlipY assertion passes even if FlipY is ignored (LocPinY at the centre).
+- Task 7: minor (deferred): style_found.clear() on every new sheet/sheet line makes alternating sheets/connectors O(connectors × MAX_DEPTH × 2) (~6 s worst at the 2M chunk cap); report's "amortised linear" is wrong.
+- Task 7: minor (deferred): the dangling-glue case was dropped from vsd test_connections; no vsd test of glue to a missing shape falling loose.
+- Task 7: minor (deferred): no end-to-end v5/v6 style-sheet chain test; shape line-style read's BIN_RECORDS charge not in the meter test; no vsd place()-raises fallback test.
+- Task 7: minor (deferred): vsd._bound duplicates vsdx._box's flip/rotate math.
+- Task 7: minor (deferred): no direct test that a line-style-only stencil keeps no entry (relies on test_blank_stencil_ids_cost_no_entry).
+- Task 8: minor (deferred): glue matches only a shape's preferred id (draw:id over xml:id); spec says either.
+- Task 8: minor (deferred): ods _drawn and odp _Slides.leaves each walk groups (duplication).
+- Task 8: minor (deferred): no committed tests for odt members in draw:g, hidden members, repeated rows, footnotes, or an inferred arrowed line in odp/ods (probes pass).
+- Task 8: minor (deferred): test_queue.py is date-dependent (failed at the 2026-11-18 rollover: "decision: 20261118 dropped by the owner").
+- Task 9: minor (deferred): ODRAW rotation (FOPT 0x0004) not applied to connector ends (spec line 105 says rotation applied; ODRAW row and brief name flips only); Tasks 10–12 inherit the gap.
+- Task 9: minor (deferred): "LINE_TYPE or CONNECTOR_TYPES" test duplicated in ppt.py and ppt_shapes.py; _child_tf still uses 0x40/0x80 literals instead of FLIP_H/FLIP_V.
+- Task 9: minor (deferred): leaf FLIP_V end flip not tested.
+- Task 9: minor (deferred): rules() builds up to MAX_RECORDS before the walk budget cuts it.
+- Task 9: minor (deferred): a title/skipped placeholder that is an edge end appears again as a Mermaid node (as ruled).
+- Task 10: minor (deferred): no test pins the order of several remaining boxes when some move into the diagram.
+- Task 10: minor (deferred): place()'s held handling scans blocks three times.
+- Task 11: minor (deferred): a TXO with only its formatting-run CONTINUE decodes the runs as text (NULs possible); cbRuns at offset 12 could tell them apart.
+- Task 11: minor (deferred): a short TXO (<12 bytes) is ignored uncounted while other damaged TXOs count record.
+- Task 11: minor (deferred): xls_drawing _read/_shape repeat most of officeart.Shapes; the flip swap in _register duplicates ppt_shapes.
+- Task 11: minor (deferred): pictures joined by a connector become blank nodes (images appended separately), not "(picture)".
+- Task 11: minor (deferred): no tests for multi-CONTINUE TXO text, a hidden sheet with a diagram, a connector glued to a duplicate spid.
+- Task 12: minor (deferred): officeart.rules builds the full list before pub's meter ticks (shared with ppt/xls).
+- Task 12: minor (deferred): duplicate seqnum across SpContainers: kinds/full take the last, spids the first.
+- Task 12: minor (deferred): no tests for the ("rule", spidC) picture/table path, a duplicate spid, or a rule whose spidC is one of its ends.
+- Task 12: minor (deferred): pub._label is a fourth per-reader inline flattener (odf_base, ooxml_word, doc); a shared helper in diagram.py would remove the copies.
+- Task 12: minor (deferred): pub.py Bounds docstring paragraph re-wrapped wholesale.
+- Task 13: minor (deferred): containers nested past MAX_DEPTH drop their text (counted under depth) — pre-existing reader cap, same as before this branch.
+- Task 13: minor (deferred): nested hp:container frames compose by offset only (no scaling) — affects position matching only.
+- Task 14: minor (deferred): picture/OLE instance ids are not read, so glue to a picture by key is not matched.
+- Task 15: minor (deferred): pptx and hwpx clean seeds leave a small mkdtemp dir per run (shared helpers sl.deck / hx.hwpx_doc, same as existing pptx_seed).
+- Task 15: minor (deferred): test_diagram_mutations leans on private helpers (hwp._Reader, _connect_sec, _connectline_sec); read_hwp mirrors hwp.parse's compound branch.
+- Task 16: minor (deferred): an arrowless unglued draw:connector used as a divider (public-odt-615320d65d) prints "(could not read: 1 connector not attached)".
+- Final: minor (deferred): xls group shapes are snap targets with no members (xls_drawing.py:221; fGroup -> box=None would fix).
+- Final: minor (deferred): vsdx container nesting `up` is quadratic per scope (~0.52 s/page at 2,000 containers; hostile input only).
+- Final: minor (deferred): a short label with a link or equation gets `…` and repeats as nK: (diagram.py:215).
+- Final: minor (deferred): ODRAW rotation not applied to inference (ppt/xls/pub, unglued rotated connectors only).
+- Final: minor (deferred): a connector whose text is partly hidden or deleted gets "(content)" or "yes…" plus a follow-up, same as shape nodes (judge plain-ness on visible text for both).
+- Final: minor (deferred): tests/diagram_fix.py mermaid_ok now only checks declared ⊆ used, so a typo id in an edge passes (most tests compare full text).
+- Final: minor (deferred): a ppt connector with a title run and long text can show the text twice (title and follow-up).
