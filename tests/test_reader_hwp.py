@@ -19,12 +19,15 @@ from reader import limits, markdown  # noqa: E402
 from reader.formats import hancom, hwp  # noqa: E402
 from reader.formats import hwp_records as hr  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Table  # noqa: E402
-from reader_fix import hwp_para, hwp_picture, hwp_record, hwp_table, make_cfb, make_hwp, make_zip  # noqa: E402
+from reader.model import Code, Context, Table  # noqa: E402
+from reader_fix import (  # noqa: E402
+    hwp_para, hwp_picture, hwp_record, hwp_shape, hwp_table, make_cfb, make_hwp, make_zip,
+)
+from diagram_fix import mermaid_ok  # noqa: E402
 
 FFFC = "\ufffc"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
-RECT = 79  # SHAPE_COMPONENT_RECTANGLE
+RECT = hr.SHAPE_RECT
 
 
 def tmp():
@@ -545,6 +548,154 @@ def test_group_depth_cap():
     assert ctx.skipped["depth"] == 1, ctx.skipped
     out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
     assert out == "(could not read: 1 place nested too deeply)\n\n얕음\n", out
+
+
+# ---- connect lines as diagrams
+def shape(kind, inst, text="", x=0, y=0, w=1000, h=1000, **kw):
+    return hwp_shape(kind, inst, (x, y, w, h), text, **kw)
+
+
+def conn(inst, a, b, ctype=1, ends=((0, 0), (0, 0)), **kw):
+    """A connect line glued a -> b; ctype 1 is STRAIGHT_ONEWAY, 5 STROKE_BOTH, 6 ARC_NOARROW."""
+    return shape("$col", inst, line=(ends[0], ends[1], ctype, a, b), fill=0, **kw)
+
+
+def objs(*controls, text="", level=0):
+    """A paragraph: some text, then the drawing objects."""
+    return hwp_para(text + FFFC * len(controls), controls=controls, level=level)
+
+
+def mermaid(doc):
+    return "\n".join(b.text for b in doc.blocks if isinstance(b, Code) and b.lang == "mermaid")
+
+
+def _connect_sec():
+    return (hwp_para("before") + objs(shape("$rec", 5, "Alpha"), shape("$rec", 6, "Beta", x=5000),
+                                      conn(7, 5, 6, x=1000, ends=((0, 500), (4000, 500))), text="lead")
+            + hwp_para("after"))
+
+
+def test_hwp_connect_line():
+    doc, ctx = parse(hwp_file(_connect_sec()))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Alpha"]\n  n2["Beta"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"before\n\nlead\n\n```mermaid\n{t}\n```\n\nafter\n", out  # each text once
+    assert not ctx.skipped["shape"] and not ctx.skipped["connector_loose"], ctx.skipped
+
+
+def test_hwp_both_and_none_arrows():
+    p = objs(shape("$rec", 1, "A"), shape("$ell", 2, "B", y=3000), shape("$rec", 3, "C", y=6000),
+             conn(4, 1, 2, 5), conn(5, 2, 3, 6))
+    t = mermaid(parse(hwp_file(p))[0])
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["A"]\n  n2(("B"))\n  n3["C"]\n  n1 <--> n2\n  n2 --- n3', t
+
+
+def test_hwp_glue_without_a_common_frame():
+    # objects placed relative to their paragraphs have no box, but their glue still holds across paragraphs
+    sec = (objs(shape("$rec", 11, "Alpha", rel="PARA"), text="one") + hwp_para("mid")
+           + objs(shape("$rec", 12, "Beta", rel="PARA"), conn(13, 11, 12, rel="PARA"), text="three"))
+    doc, _ = parse(hwp_file(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Alpha"]\n  n2["Beta"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"one\n\n```mermaid\n{t}\n```\n\nmid\n\nthree\n", out
+
+
+def member(kind, inst, text="", **kw):
+    """A group member's records at level 3: the members of a gso whose records are at level 2."""
+    if kind == "$col":
+        return conn(inst, kw.pop("a"), kw.pop("b"), member=True, level=3, **kw)
+    return shape(kind, inst, text, member=True, level=3, **kw)
+
+
+def test_hwp_group_inference():
+    # a loose connect line inside a group snaps to the members' boxes, offset in the group's frame
+    box = (member("$rec", 21, "Left"), member("$rec", 22, "Right", x=3000),
+           member("$col", 23, a=0, b=0, x=500, y=500, ends=((0, 0), (3000, 0))))
+    sec = objs(shape("$con", 20, w=4000, members=box), text="lead") + objs(shape("$rec", 30, "Zed", x=90000))
+    doc, ctx = parse(hwp_file(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == ('flowchart LR\n  n1["Left"]\n  n2["Right"]\n  %% inferred from position\n'
+                                   '  n1 --> n2'), t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"lead\n\n```mermaid\n{t}\n```\n\nZed\n", out
+    assert not ctx.skipped["connector_loose"], ctx.skipped
+
+
+def test_hwp_group_members_glued_by_instance_id():
+    box = (member("$rec", 21, "In1"), member("$rec", 22, "In2", y=3000), member("$col", 23, a=21, b=22))
+    doc, _ = parse(hwp_file(objs(shape("$con", 20, h=5000, members=box), text="lead")))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["In1"]\n  n2["In2"]\n  n1 --> n2', t
+    assert markdown.render(doc, tmp() / "a") == f"lead\n\n```mermaid\n{t}\n```\n"
+
+
+def test_hwp_arrowed_line_and_divider():
+    sec = objs(shape("$rec", 1, "A"), shape("$rec", 2, "B", x=5000),
+               shape("$lin", 3, line=((500, 500), (5500, 500)), arrows=(0, 1), fill=0),
+               shape("$lin", 4, line=((0, 2000), (6000, 2000)), fill=0))
+    doc, ctx = parse(hwp_file(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["A"]\n  n2["B"]\n  %% inferred from position\n  n1 --> n2', t
+    assert markdown.render(doc, tmp() / "a") == f"```mermaid\n{t}\n```\n"
+    assert not ctx.skipped["connector_loose"], ctx.skipped
+
+
+def test_hwp_truncated_component():
+    # a connect line whose LINE record is cut after its end points has no glue and no points: no edge, no error
+    cut = struct.pack("<4i", 0, 500, 4000, 500)
+    sec = objs(shape("$rec", 5, "Alpha"), shape("$rec", 6, "Beta", x=5000),
+               shape("$col", 7, x=1000, line=cut, fill=0), text="lead")
+    doc, ctx = parse(hwp_file(sec))
+    assert not mermaid(doc) and markdown.render(doc, tmp() / "a") == "lead\n\nAlpha\n\nBeta\n"
+    assert ctx.skipped["connector_loose"] == 1 and not ctx.skipped["shape"], ctx.skipped
+    # a shape whose component is cut to its ids has no box and no drawing style: the CTRL_HEADER's id is its key
+    sec = objs(shape("$rec", 5, "Alpha"), shape("$rec", 0, "Beta", head_id=6, component=b"cer$cer$"),
+               conn(7, 5, 6), text="lead")
+    doc, _ = parse(hwp_file(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Alpha"]\n  n2["Beta"]\n  n1 --> n2', t
+    # a component and a LINE record cut anywhere read without an error
+    _, head, recs = hwp_shape("$col", 7, (0, 0, 9, 9), line=((0, 0), (9, 9), 1, 5, 6))
+    full, line = (r.data for r in hr.records(recs, Context()))
+    for n in range(len(full) + 1):  # the ids twice, the offset, 4 bytes, then the original size, ending at 28
+        (o,) = hwp._objs(full[:n], head, False, line, [])  # cut inside its control id, it is no connect line
+        assert (o.box is None) == (n < 28) and (o.edge is None if n < 4 else o.edge[:2] == (5, 6)), (n, o.box)
+    for n in range(len(line) + 1):  # the glue ends at 36: the points, the type, the subjects and their indexes
+        (o,) = hwp._objs(full, head, False, line[:n], [])
+        assert (o.edge[:2] == (None, None)) == (n < 36) and (o.edge[2] is None) == (n < 36), (n, o.edge)
+    for n in range(len(head) + 1):  # the offsets end at 16: the id, the attribute, the vertical and horizontal ones
+        (o,) = hwp._objs(full, head[:n], False, line, [])
+        assert (o.box is None) == (n < 16) and o.edge[:2] == (5, 6), (n, o.box)
+
+
+def test_hwp_fill_brush_before_the_instance_id():
+    # every fill kind at once (kordoc fillBrushXml): solid, a three-colour gradation whose positions come first, an
+    # image, two extra bytes, then an alpha per kind; the shadow follows, then the instance id
+    style = (struct.pack("<IiIB", 0, 1, 3 << 16, 0) + u32(7) + bytes(12)
+             + struct.pack("<B4ii", 0, 0, 0, 0, 0, 3) + bytes(12) + bytes(12) + bytes(6)
+             + u32(2) + bytes(2) + bytes(3) + bytes(16) + u32(42) + bytes(2))
+    assert hwp._style(style, 0) == (3 << 16, 42)
+    assert hwp._style(style[:-6], 0) == (3 << 16, None)  # cut inside the id
+
+
+def test_hwp_shapes_without_line_unchanged():
+    box = (member("$rec", 1, "A"), member("$ell", 2, "B"))
+    sec = objs(shape("$con", 20, members=box), text="lead") + objs(shape("$rec", 3, "C"))
+    assert md(hwp_file(sec)) == "lead\n\nA\n\nB\n\nC\n"  # as the reader read it before diagrams
+    divider = objs(shape("$lin", 9, line=((0, 0), (1, 1)), fill=0))  # makes the section a scope; no text, no edge
+    assert md(hwp_file(sec + divider)) == md(hwp_file(sec))
+
+
+def test_hwp_line_in_a_note_reads_as_before():
+    # a note is read apart from the section's drawing: its connect line and shapes are read as before
+    note = sub_list(objs(shape("$rec", 1, "In", level=4), conn(2, 1, 3, level=4), text="주석", level=2))
+    sec = objs((17, b"fn  " + u32(1), note), shape("$rec", 3, "Out"), text="본문")
+    doc, ctx = parse(hwp_file(sec))
+    assert not mermaid(doc) and not ctx.skipped["shape"], ctx.skipped
+    out = markdown.render(doc, tmp() / "a")
+    assert out == "본문[^1]\n\nOut\n\n[^1]: 주석 In\n", out
 
 
 # ---- sections

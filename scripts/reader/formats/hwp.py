@@ -9,12 +9,19 @@ ViewText through hwp_records.view_text (dochan hwp/distdoc.py); the DRM sniff an
 preference follow rhwp parser/mod.rs, the PARA_RANGE_TAG kinds rhwp parser/tracked_viewtext.rs and dochan
 hwp/revisions.py. The inline model, paragraph rules and cell grid are hancom.py's, shared with hwpx.py. The chart
 in an OLE object is hwp_chart.py's.
+
+A section holding a connect line ($col) or a line ($lin) reads its drawing objects as `hancom.Obj` for
+`hancom.diagrams`, as hwpx.py does. The SHAPE_COMPONENT layout, the instance id after its line, fill and shadow
+(`drawingStyle`), and the LINE record of a connect line (points, type, then the start and end subjects and indexes)
+follow kordoc's `src/hwp5/to-hwpx/shapes.ts` (MIT); the CTRL_HEADER's offsets and their vertRelTo and horzRelTo bits
+its `controls.ts`. Every field comes from a record long enough to hold it, or is left unknown.
 """
 import re
 import struct
 from bisect import bisect_right
+from itertools import groupby
 
-from .. import limits
+from .. import diagram, limits
 from ..containers import flate
 from ..containers.cfb import Compound, is_cfb
 from ..images import sniff
@@ -22,13 +29,14 @@ from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Equation, Heading, Image, ListItem, Math, NoteRef, Para, Table, Text
 from . import hwpx, sheet_grid
 from .hancom import (
-    AUTO_ALT, Frame, Scopes, State, comment_note, cut_command, flat, heading_level, lone_equations, next_marker,
-    place, plain, strip_marker, style_name_level, tex as _tex,
+    AUTO_ALT, Frame, Obj, Scopes, State, comment_note, cut_command, diagrams, flat, heading_level, lone_equations,
+    next_marker, place, plain, strip_marker, style_name_level, tex as _tex,
 )
 from .hwp_chart import ole_table
 from .hwp_records import (
     CTRL_HEADER, EQEDIT, LIST_HEADER, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT, SHAPE_COMPONENT,
-    SHAPE_OLE, SHAPE_PICTURE, TABLE, DocInfo, ParaShape, doc_info, file_header, first_tag, records, view_text,
+    SHAPE_LINE, SHAPE_OLE, SHAPE_PICTURE, TABLE, DocInfo, ParaShape, doc_info, file_header, first_tag, records,
+    view_text,
 )
 
 _ZIP = b"PK\x03\x04"
@@ -53,6 +61,118 @@ _MEDIA = {
     "image": ("", lambda raw: len(raw) >= 16 and sniff(raw) is not None),
     "object": ("OLE", lambda raw: is_cfb(raw[4:12])),  # the OLE item: a 4-byte length, then a compound file
 }
+# SHAPE_COMPONENT control ids as stored (byte-reversed): a group, a connect line, a line, an ellipse; pictures, OLE
+# objects and groups carry no drawing style after their matrices
+_CON, _COL, _LIN, _ELL = b"noc$", b"loc$", b"nil$", b"lle$"
+_EDGES = (_COL, _LIN)
+_NO_STYLE = (b"cip$", b"elo$", _CON)
+_CONNECT = ((False, False), (False, True), (True, True))  # (start, end) arrowheads of connect type % 3, types 0-8
+
+
+def _num(data, pos, fmt="<i"):
+    """One number at pos, or None when the record is too short for it."""
+    return struct.unpack_from(fmt, data, pos)[0] if pos + struct.calcsize(fmt) <= len(data) else None
+
+
+def _geometry(data) -> tuple:
+    """A SHAPE_COMPONENT's (offset, size, where its drawing style starts) (kordoc readComponent): after the control id,
+    twice in a drawing object's own and once in a group member's, the offset (x, y) in the group's frame, group level,
+    version, the original and current sizes, flip, angle and centre, then the count of scale and rotation matrix pairs
+    that follow the translation matrix. The size is the current one, an axis written 0 the original's. Each is None
+    when the record is too short for it."""
+    p = 8 if len(data) >= 8 and data[:4] == data[4:8] else 4
+    x, y = _num(data, p), _num(data, p + 4)
+    w, h = (_num(data, p + 20 + a) or _num(data, p + 12 + a) for a in (0, 4))
+    n = _num(data, p + 42, "<H")
+    return (None if x is None or y is None else (x, y), None if w is None or h is None else (w, h),
+            None if n is None else p + 92 + 96 * n)
+
+
+def _style(data, p) -> tuple:
+    """(line attribute, instance id) of the drawing style at p (kordoc drawingStyle and fillBrushXml): line colour,
+    width, attribute and outline, the fill brush (its type, a solid colour, a gradation with its colours, an image,
+    the extra bytes, an alpha per kind), the shadow (type, colour, offsets), then the instance id; None for what the
+    record does not hold, and for an id of 0."""
+    if p is None:
+        return None, None
+    attr, kind = _num(data, p + 8, "<I"), _num(data, p + 13, "<I")
+    if kind is None:
+        return attr, None
+    f = p + 17
+    if kind & 1:
+        f += 12
+    if kind & 4:
+        n = _num(data, f + 17)  # after its type byte, angle, centre and step: the colour count
+        if n is None:
+            return attr, None
+        n = max(n, 0)
+        f += 21 + 4 * n + (4 * n if n > 2 else 0)  # past two colours, their positions come first
+    if kind & 2:
+        f += 6
+    extra = _num(data, f, "<I")
+    if extra is None:
+        return attr, None
+    f += 4 + extra + (kind & 1) + (kind >> 2 & 1) + (kind >> 1 & 1)
+    return attr, _num(data, f + 16, "<I") or None
+
+
+def _heads(attr) -> tuple:
+    """(start, end) arrowheads of a line attribute: the head and tail styles at bits 10 and 16 (kordoc lineShapeXml),
+    0 being none; (None, None) when the attribute is unknown."""
+    return (None, None) if attr is None else (bool(attr >> 10 & 0x3F), bool(attr >> 16 & 0x3F))
+
+
+def _line_ends(data, connect) -> tuple:
+    """(start, end, connect type, start subject, end subject) of a LINE record (kordoc $col and $lin): a line's two
+    points; a connect line's points, type, then the subjects and their indexes, all or nothing, so a record cut short
+    of its glue gives neither glue nor points. Subject 0 is no glue."""
+    if connect and len(data) >= 36:
+        x0, y0, x1, y1, kind, a, _, b, _ = struct.unpack_from("<4i5I", data)
+        return (x0, y0), (x1, y1), kind, a or None, b or None
+    if not connect and len(data) >= 16:
+        x0, y0, x1, y1 = struct.unpack_from("<4i", data)
+        return (x0, y0), (x1, y1), None, None, None
+    return None, None, None, None, None
+
+
+def _placed(head):
+    """A drawing object's top left from its CTRL_HEADER (vertical offset @8, horizontal @12) when both are relative to
+    the paper or the page: vertRelTo is bits 3-4 of the attribute @4, horzRelTo bits 8-9, 0 the paper and 1 the page
+    (kordoc controls.ts objPlacementXml); else None."""
+    if len(head) < 16:
+        return None
+    attr, y, x = struct.unpack_from("<Iii", head, 4)
+    return (x, y) if attr >> 3 & 3 < 2 and attr >> 8 & 3 < 2 else None
+
+
+def _at(origin, p):
+    return None if origin is None or p is None else (origin[0] + p[0], origin[1] + p[1])
+
+
+def _objs(data, head, inner, line, got) -> list:
+    """A SHAPE_COMPONENT read as hancom.Obj, with what it added to the paragraph (`got`): a group holds the objects
+    and runs of other blocks in it as its kids; anything else holds the other blocks, and objects in it follow. `head`
+    is a drawing object's CTRL_HEADER, None for a group member, whose offset is in its group's frame when `inner`.
+    `line` is the LINE record under it, or None. The key is the instance id, else the CTRL_HEADER's id @36."""
+    kind = data[:4]
+    offset, size, style = _geometry(data)
+    origin = _placed(head) if head is not None else offset if inner else None
+    box = origin + (origin[0] + size[0], origin[1] + size[1]) if origin and size else None
+    attr, key = _style(data, style) if kind not in _NO_STYLE else (None, None)
+    if key is None and head is not None:
+        key = _num(head, 36, "<I") or None
+    if kind == _CON:
+        kids = []
+        for is_obj, run in groupby(got, lambda b: isinstance(b, Obj)):
+            kids += run if is_obj else [Obj(None, list(run), group=True)]
+        return [Obj(key, [], kids, True, box=box)]
+    edge = None
+    if kind in _EDGES:
+        p0, p1, ctype, a, b = _line_ends(line or b"", kind == _COL)
+        arrows = _CONNECT[ctype % 3] if ctype is not None and ctype < 9 else _heads(attr)
+        edge = a, b, _at(origin, p0), _at(origin, p1), arrows, kind == _LIN
+    own = Obj(key, [b for b in got if not isinstance(b, Obj)], (), False, "circle" if kind == _ELL else "", box, edge)
+    return [own] + [b for b in got if isinstance(b, Obj)]
 
 
 def _wstr(data: bytes, pos: int) -> str:
@@ -125,6 +245,9 @@ class _Reader(Scopes):
         # holds the accepted text (dochan reader.py), so a range left in it hides nothing
         self.view = False
         self._ends_of, self._ends = None, []
+        self.edges = diagram.ConnectionBudget(ctx)  # the document's edges, shared by every section's diagrams
+        self.collect = False  # reading drawing objects as hancom.Obj: in a section with a line, not in a sub-list
+        self.grouped = False  # reading the members of a group
 
     # ---- streams
     def load(self, name, parse, decode=None):
@@ -245,8 +368,12 @@ class _Reader(Scopes):
                     recs, self.view = self.tracked(n, name)
                 else:
                     recs = self.load(name, records)
-                blocks = self.paras(recs, 0, len(recs), 0, False)
-                self.doc.blocks.extend(blocks)
+                scoped = self.collect = any(r.tag == SHAPE_COMPONENT and r.data[:4] in _EDGES for r in recs)
+                try:
+                    blocks = self.paras(recs, 0, len(recs), 0, False)
+                finally:
+                    self.collect = False
+                self.doc.blocks.extend(diagrams(self.ctx, self.edges, blocks) if scoped else blocks)
                 good += 1
         if not good:
             raise ReadError("damaged", "no readable section")
@@ -279,8 +406,17 @@ class _Reader(Scopes):
         return out
 
     def sub(self, recs, i, d, nohead=True) -> list:
-        """The paragraphs under the control at recs[i] (its LIST_HEADER's list)."""
-        return self.paras(recs, i + 1, self.end(recs, i), d + 1, nohead)
+        """The paragraphs under the control at recs[i] (its LIST_HEADER's list): a note, comment, header or footer."""
+        return self.apart(recs, i + 1, self.end(recs, i), d + 1, nohead)
+
+    def apart(self, recs, start, end, d, nohead) -> list:
+        """paras() for a list read apart from the section's drawing (a text box, caption, note, comment, header or
+        footer): drawing objects in it read as before, with no diagram."""
+        outer, self.collect = self.collect, False
+        try:
+            return self.paras(recs, start, end, d, nohead)
+        finally:
+            self.collect = outer
 
     def next_ctrl(self, recs, j, end, lvl) -> int:
         while j < end and not (recs[j].tag == CTRL_HEADER and recs[j].level == lvl):
@@ -610,10 +746,10 @@ class _Reader(Scopes):
             r = recs[j]
             if r.tag == LIST_HEADER:
                 k = self.list_end(recs, j)
-                caption.extend(self.paras(recs, j + 1, k, d + 1, True))
+                caption.extend(self.apart(recs, j + 1, k, d + 1, True))
                 j = k
             elif r.tag == SHAPE_COMPONENT:
-                j = self.component(recs, j, st, d, 1, alt)
+                j = self.component(recs, j, st, d, 1, alt, recs[i].data)
             elif name := self.SHAPES.get(r.tag):
                 j = max(getattr(self, name)(recs, j, st, d, 1, alt), j + 1)
             else:
@@ -622,17 +758,31 @@ class _Reader(Scopes):
         return end
 
     # ---- the SHAPE_COMPONENT walk: SHAPES handlers (recs, j, st, d, g, alt) -> the index after what they read
-    def component(self, recs, k, st, d, g, alt) -> int:
+    def component(self, recs, k, st, d, g, alt, head=None) -> int:
         """A SHAPE_COMPONENT's child records in order. A group's members sit beside its SHAPE_CONTAINER, each one
-        group and one depth level deeper; past _GROUPS groups or MAX_DEPTH the component is counted under depth."""
+        group and one depth level deeper; past _GROUPS groups or MAX_DEPTH the component is counted under depth. While
+        collecting, what it added to the paragraph becomes its hancom.Obj (_objs); `head` is the drawing object's
+        CTRL_HEADER, None for a group member."""
         end = self.end(recs, k)
         if g > _GROUPS or d > limits.MAX_DEPTH:
             self.deep()
             return end
-        j = k + 1
-        while j < end:
-            name = self.SHAPES.get(recs[j].tag)
-            j = max(getattr(self, name)(recs, j, st, d, g, alt), j + 1) if name else self.end(recs, j)
+        data, start, inner, line = recs[k].data, len(st.extras), self.grouped, None
+        self.grouped = data[:4] == _CON
+        try:
+            j = k + 1
+            while j < end:
+                r = recs[j]
+                if r.tag == SHAPE_LINE and line is None:
+                    line = r.data
+                name = self.SHAPES.get(r.tag)
+                j = max(getattr(self, name)(recs, j, st, d, g, alt), j + 1) if name else self.end(recs, j)
+        finally:
+            self.grouped = inner
+        if self.collect:
+            got = st.extras[start:]
+            del st.extras[start:]
+            st.extras.extend(_objs(data, head, inner, line, got))
         return end
 
     def member(self, recs, j, st, d, g, alt):
@@ -642,7 +792,7 @@ class _Reader(Scopes):
     def text_box(self, recs, j, st, d, g, alt):
         """A text box: its LIST_HEADER (or a bare paragraph) and the paragraphs beside it."""
         k = self.list_end(recs, j)
-        st.extras.extend(self.paras(recs, j, k, d + 1, st.nohead))
+        st.extras.extend(self.apart(recs, j, k, d + 1, st.nohead))
         return k
 
     def picture(self, recs, j, st, d, g, alt):

@@ -239,6 +239,60 @@ def hwp_picture(bin_id, alt="", *, level=2, caption=None):
     return 11, cid, b"".join(out)
 
 
+_HWP_REL = {"PAPER": 0, "PAGE": 1 << 3 | 1 << 8, "PARA": 2 << 3 | 3 << 8}  # vertRelTo bits 3-4, horzRelTo bits 8-9
+
+
+def hwp_shape(kind, inst_id, box, text="", line=None, *, level=2, member=False, members=(), rel="PAPER",
+              arrows=(0, 0), fill=1, head_id=0, component=None):
+    """A drawing object: for hwp_para's `controls` (11, b"gso " + its CTRL_HEADER fields, records at `level`), or with
+    `member` a group member's records at `level` alone.
+
+    `kind` is the control id: "$rec", "$ell", "$col", "$lin" or "$con" (stored byte-reversed). `box` (x, y, w, h) in
+    HWPUNIT: x, y are a gso's CTRL_HEADER offsets relative to `rel` (PAPER, PAGE or PARA) and a member's component
+    offset (in its group's frame); w, h are the component's current size. The CTRL_HEADER holds `head_id` at offset 36.
+    The SHAPE_COMPONENT (kordoc readComponent and drawingStyle) holds the id (twice for a gso, once for a member), the
+    offset, group level, version, original and current size, flip, angle, centre, no scale and rotation pairs, the
+    translation matrix, then for a group its members' count and ids, for anything else the drawing style: line colour,
+    width, attribute (`arrows`: head and tail styles at bits 10 and 16), outline, a fill brush (`fill` 1 solid, 0
+    none), the shadow, the instance id `inst_id` and two alphas. `component` replaces that record's data. Its records,
+    one level deeper: `text` as a text box (LIST_HEADER and one paragraph), then the shape record: RECTANGLE for
+    $rec, LINE for $col from `line` ((x0, y0), (x1, y1), connect type, begin id, end id) and for $lin from `line`
+    ((x0, y0), (x1, y1)), or `line` as raw bytes; a group's SHAPE_CONTAINER then its `members` (records written with
+    member=True at level + 1).
+    """
+    x, y, w, h = box
+    cid = kind.encode()[::-1]
+    data = (cid if member else cid + cid) + struct.pack("<ii", *((x, y) if member else (0, 0)))
+    data += struct.pack("<HH4IIhiiH", 0, 0, w, h, w, h, 0, 0, 0, 0, 0) + struct.pack("<6d", 1, 0, 0, 0, 1, 0)
+    if kind == "$con":
+        data += struct.pack("<H", len(members)) + bytes(4 * len(members)) + struct.pack("<I", inst_id)
+    else:
+        brush = struct.pack("<I3IIB", 1, 0xFFFFFF, 0, 0, 0, 0) if fill else struct.pack("<II", 0, 0)
+        data += (struct.pack("<iiIB", 0, 1, arrows[0] << 10 | arrows[1] << 16, 0) + brush
+                 + struct.pack("<IIiiIBB", 0, 0, 0, 0, inst_id, 0, 0))
+    if component is not None:
+        data = component
+    out = [hwp_record(76, level, data)]
+    if text:
+        out += [hwp_record(72, level + 1, struct.pack("<HIH", 1, 0, 0)), hwp_para(text, level=level + 1)]
+    if kind == "$rec":
+        out.append(hwp_record(79, level + 1, bytes(33)))
+    elif kind == "$col" and isinstance(line, tuple):
+        (x0, y0), (x1, y1), ctype, begin, end = line
+        out.append(hwp_record(78, level + 1, struct.pack("<4i6I", x0, y0, x1, y1, ctype, begin, 0, end, 0, 0)))
+    elif kind == "$lin" and isinstance(line, tuple):
+        (x0, y0), (x1, y1) = line
+        out.append(hwp_record(78, level + 1, struct.pack("<4iH", x0, y0, x1, y1, 0)))
+    elif line is not None:
+        out.append(hwp_record(78, level + 1, bytes(line)))
+    if kind == "$con":
+        out += [hwp_record(86, level + 1, struct.pack("<H", len(members)))] + list(members)
+    if member:
+        return b"".join(out)
+    attrs = struct.pack("<Iii2I", _HWP_REL[rel], y, x, w, h) + bytes(12) + struct.pack("<Ii", head_id, 0)
+    return 11, b"gso " + attrs + struct.pack("<H", 0), b"".join(out)
+
+
 def make_hwp(path, sections, doc_info=b"", bins=None, flags=1, extra=None):
     """Write an HWP 5.0.3.0 compound file: FileHeader, DocInfo, BodyText/Section<N> (raw-deflated when flags & 1),
     BinData/<name> and any extra streams as given."""
