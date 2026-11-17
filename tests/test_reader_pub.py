@@ -16,15 +16,17 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import images, limits, markdown, officeart  # noqa: E402
+from reader import diagram, images, limits, markdown, officeart  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import cfb_route, pub, pub_2k, pub_contents, pub_quill, vsdx, zip_route  # noqa: E402
 from reader.formats.pub_contents import Block, ChunkRef  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Bold, Break, Context, Image, Link, Para, Section, Table, Text  # noqa: E402
+from reader.model import Bold, Break, Code, Context, Image, Link, Para, Section, Table, Text  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 from reader_fix import (blip_bitmap, blip_metafile, blip_png, cfb_bytes, oa_container, oa_fbse,  # noqa: E402
-                        oa_record, pub_2k_contents, pub_2k_file, pub_block, pub_cells, pub_contents as contents_fix,
-                        pub_escher, pub_file, pub_group, pub_quill as quill_fix, pub_sp, pub_table)
+                        oa_record, oa_solver, pub_2k_contents, pub_2k_file, pub_block, pub_cells,
+                        pub_contents as contents_fix, pub_escher, pub_file, pub_group, pub_quill as quill_fix, pub_sp,
+                        pub_table)
 
 MIB = 2**20
 
@@ -1918,6 +1920,113 @@ def test_read_lists_once():
     assert sorted(held) == [0x30, 0x31, 0x32], entry
 
 
+# -- pub.py: connectors (OfficeArt solver rules) as a diagram, one scope a page
+
+END_ARROW = struct.pack("<HI", 0x01D1, 1)    # FOPT lineEndArrowhead, non-zero: an arrowhead
+START_ARROW = struct.pack("<HI", 0x01D0, 2)  # FOPT lineStartArrowhead
+FLOW = 'flowchart TD\n  n1["Start"]\n  n2["End"]\n  n1 --> n2'
+
+
+def flow_file(rule=(0x401, 0x402, 0x403), props=END_ARROW, conn=0x20, pages=None, label=None):
+    """Page 0x20: "Start" (shape 0x30, spid 0x401) above "End" (0x31, spid 0x402), the connector 0x32 (spid 0x403,
+    FOPT `props`, the story `label` when given) between them, listed on page `conn`, and "Note" (0x33) last; the
+    solver holds `rule` (none when None). `pages` replaces the pages."""
+    sps = [pub_sp(0x30, (0, 0, 100, 50), spid=0x401), pub_sp(0x31, (0, 200, 100, 250), spid=0x402),
+           pub_sp(0x32, (50, 50, 50, 200), spid=0x403, props=props), pub_sp(0x33, (0, 300, 100, 350), spid=0x404)]
+    if pages is None:
+        on = {0x20: [0x30, 0x31, 0x33]}
+        on.setdefault(conn, []).append(0x32)
+        pages = [page(k, v) for k, v in on.items()]
+    solver = oa_solver(rule) if rule else b""
+    stories = [(1, "Start"), (2, "End"), (3, "Note")] + ([(4, label)] if label is not None else [])
+    return pub_file(pages, [shape(0x30, 1), shape(0x31, 2), shape(0x32, 4), shape(0x33, 3)], stories,
+                    escher=pub_escher(*sps, solver=solver))
+
+
+def mermaid_of(blocks):
+    """The text of the one Mermaid block among `blocks` (checked by mermaid_ok), or None."""
+    codes = [b.text for b in blocks if isinstance(b, Code) and b.lang == "mermaid"]
+    assert len(codes) <= 1, codes
+    if codes:
+        assert mermaid_ok(codes[0]), codes[0]
+    return codes[0] if codes else None
+
+
+def test_pub_connector():
+    # a solver rule glues the connector 0x403 from "Start" to "End" (spid -> seqnum through each SpContainer's
+    # ClientData): the page's flow becomes one Mermaid block where "Start" stood; the connector's slot goes, "Note"
+    # stays after it
+    doc, ctx = read_pub(flow_file())
+    (sec,) = doc.blocks
+    assert mermaid_of(sec.blocks) == FLOW, sec.blocks
+    assert [text_of(b) for b in sec.blocks[1:]] == ["Note"] and not ctx.skipped, (sec.blocks, ctx.skipped)
+    # the start arrowhead alone points the edge back; no arrowhead (absent properties) is a plain link
+    doc, _ = read_pub(flow_file(props=START_ARROW))
+    assert mermaid_of(doc.blocks[0].blocks).endswith("\n  n2 --> n1"), doc.blocks
+    doc, _ = read_pub(flow_file(props=b""))
+    assert mermaid_of(doc.blocks[0].blocks).endswith("\n  n1 --- n2"), doc.blocks
+    # the connector's SpContainer listed on another page, or no SpContainer with spid C: the edge is still drawn,
+    # glued ends with no slot to drop
+    for blob in (flow_file(conn=0x21), flow_file(rule=(0x401, 0x402, 0x499))):
+        doc, ctx = read_pub(blob)
+        assert mermaid_of(doc.blocks[0].blocks) == FLOW and not ctx.skipped, (doc.blocks, ctx.skipped)
+    # the connector's own text is its label, its slot taken out (the text once); on another page the text stays there
+    doc, ctx = read_pub(flow_file(label="yes\rnow"))
+    assert mermaid_of(doc.blocks[0].blocks).endswith('\n  n1 -->|"yes now"| n2'), doc.blocks
+    assert [text_of(b) for b in doc.blocks[0].blocks[1:]] == ["Note"] and not ctx.skipped, (doc.blocks, ctx.skipped)
+    doc, ctx = read_pub(flow_file(label="yes", conn=0x21))
+    assert mermaid_of(doc.blocks[0].blocks) == FLOW, doc.blocks
+    assert [text_of(b) for b in doc.blocks[1].blocks] == ["yes"], doc.blocks
+    # without the rule the page reads as today: no diagram, every text in reading order
+    doc, ctx = read_pub(flow_file(rule=None))
+    assert outline(doc) == [("Page 1", ["Start", "End", "Note"])] and not ctx.skipped, outline(doc)
+
+    # place() failing falls back to the page's flow, one `shape` counted
+    def boom(self, slots):
+        raise ValueError("boom")
+
+    with patched(diagram.Diagram, place=boom):
+        doc, ctx = read_pub(flow_file())
+    assert outline(doc) == [("Page 1", ["Start", "End", "Note"])] and ctx.skipped == {"shape": 1}, ctx.skipped
+    # one ConnectionBudget a document: the second page's edge past CONNECTIONS is cut (connections_cut once) and that
+    # page left as its flow
+    sps = [pub_sp(0x30 + k, (0, 100 * k, 100, 100 * k + 50), spid=0x401 + k) for k in range(6)]
+    blob = pub_file([page(0x20, [0x30, 0x31, 0x32]), page(0x21, [0x33, 0x34, 0x35])],
+                    [shape(0x30 + k, k + 1 if k % 3 != 2 else None) for k in range(6)],
+                    [(1, "A"), (2, "B"), (4, "C"), (5, "D")],
+                    escher=pub_escher(*sps, solver=oa_solver((0x401, 0x402, 0x403), (0x404, 0x405, 0x406))))
+    with patched(diagram, CONNECTIONS=1):
+        doc, ctx = read_pub(blob)
+    assert mermaid_of(doc.blocks[0].blocks) is not None and mermaid_of(doc.blocks[1].blocks) is None, doc.blocks
+    assert [text_of(b) for b in doc.blocks[1].blocks] == ["C", "D"] and ctx.skipped == {"connections_cut": 1}, \
+        (doc.blocks, ctx.skipped)
+    doc, ctx = read_pub(blob)
+    assert all(mermaid_of(s.blocks) for s in doc.blocks) and not ctx.skipped, (doc.blocks, ctx.skipped)
+
+
+def test_pub_rule_other_page():
+    # the rule's ends on different pages (the connector with "Start"): no edge on either page, each read as without
+    # the rule
+    pages = [page(0x20, [0x30, 0x32, 0x33]), page(0x21, [0x31])]
+    doc, ctx = read_pub(flow_file(pages=pages))
+    assert outline(doc) == [("Page 1", ["Start", "Note"]), ("Page 2", ["End"])] and not ctx.skipped, outline(doc)
+    assert md(doc, ctx) == md(*read_pub(flow_file(rule=None, pages=pages)))
+    # an end on a master page and the other on a normal page: no edge either
+    pages = [page(0x20, [0x30, 0x32, 0x33]), page(0x22, [0x31], master="M")]
+    doc, ctx = read_pub(flow_file(pages=pages))
+    assert outline(doc) == [("Page 1", ["Start", "Note"]), ("Master page: M", ["End"])], outline(doc)
+    assert not any(mermaid_of(s.blocks) for s in doc.blocks) and not ctx.skipped, (doc.blocks, ctx.skipped)
+    # the whole rule on a master page: the diagram is in the master's section
+    pages = [page(0x20, [0x33]), page(0x22, [0x30, 0x31, 0x32], master="M")]
+    doc, ctx = read_pub(flow_file(pages=pages))
+    assert mermaid_of(doc.blocks[0].blocks) is None and mermaid_of(doc.blocks[1].blocks) == FLOW, doc.blocks
+    assert doc.blocks[1].kind == "master" and not ctx.skipped, (doc.blocks, ctx.skipped)
+    # a rule naming spid 0 or a spid no shape has as an end: no edge, nothing counted
+    for rule in ((0, 0x402, 0x403), (0x401, 0x498, 0x403)):
+        doc, ctx = read_pub(flow_file(rule=rule))
+        assert outline(doc) == [("Page 1", ["Start", "End", "Note"])] and not ctx.skipped, outline(doc)
+
+
 # -- pub_2k.py: Publisher 2000 (Quill text) and 97/98 (8-bit text)
 
 PG = 0x10A          # a normal page seqnum in both versions
@@ -1972,6 +2081,18 @@ def test_pub2000_text():
               text2k(0x33, 4, box=(-5, 110, -1, 100))]
     doc, _ = read_pub(pub_2k_file([PG], shapes, [(1, "Low"), (2, "High"), (4, "Left")]))
     assert outline(doc) == [("Page 1", ["High", "Left", "Low"])], outline(doc)
+
+
+def test_pub2k_line_no_diagram():
+    # Publisher 2000 has no Escher solver, and its line chunk (0x04) no arrowhead field (libmspub's MSPUBParser2k reads
+    # none), so two text boxes with a line between them give no diagram: the page renders as before connectors were
+    # read (the string captured from that engine), and as the same page without the line
+    shapes = [text2k(0x30, 1, box=(0, 0, 100, 50)), text2k(0x31, 2, box=(0, 200, 100, 250)),
+              dict(seq=0x32, type=0x04, parent=PG, box=(50, 50, 50, 200))]
+    doc, ctx = read_pub(pub_2k_file([PG], shapes, [(1, "Start"), (2, "End")]))
+    got = md(doc, ctx)
+    assert got == "## Page 1\n\nStart\n\nEnd\n" and not ctx.skipped, (got, ctx.skipped)
+    assert got == md(*read_pub(pub_2k_file([PG], shapes[:2], [(1, "Start"), (2, "End")])))
 
 
 def test_pub2000_wmf_and_master():

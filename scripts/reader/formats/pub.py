@@ -91,33 +91,45 @@ ClientData's values start 4 bytes in (`getEscherElementTailLength`, `getEscherEl
 box is arranged (its top the smaller y); rotation is not read. A shape with no box follows the placed ones in list
 order. This walk is the one walk over Publisher's SpContainers.
 
+Connectors. The same walk reads each DgContainer's SolverContainer (0xF005, `officeart.rules`: spidA the start,
+spidB the end, spidC the connector) and, for each SpContainer whose ClientData names a shape, its first FSP's spid
+and shape type and its first FOPT's arrowheads (`officeart.arrows`, absent is none). A spid maps to the shape seqnum
+of the first SpContainer naming it. A page is one diagram scope (`diagram.Diagram`), its slots each placed shape's
+(seqnum, blocks); a master page and each scratch page are one too. A rule is kept on a page only when both ends'
+seqnums are among that page's shapes, so a rule across pages draws nothing. The connector's key is its own seqnum
+when that shape is on the page with only paragraphs (their text becomes the edge label and its slot goes with the
+edge); otherwise `("rule", spidC)`, glued ends with no slot to drop, and arrowheads not known when no SpContainer has
+spidC. Nodes take their type's kind (`officeart.KINDS`) and their arranged box. A page with no rule kept is given
+exactly as before. Edges go through one `diagram.ConnectionBudget` a document. Publisher 2000 and 97/98 (`pub_2k`)
+have no solver, and their line chunk no arrowhead field, so their pages have no diagram.
+
 Links. `pub_quill.links` give one `Para([Text("Links: "), Link(u, [Text(u)]), Text(", "), ...])` at the end. VBA: a
 storage named VBA anywhere (Publisher's `VBA/`, Word's `Macros/VBA/`) counts `vba` once; macros are never read.
 
 Bounds (each read at call time). One `pub_contents.Meter` of `limits.BIN_RECORDS` a document: the directory, every
 Contents block walked (page list, page chunks, shape, table and CELLS chunks), each page visited, each shape placed,
-each Escher record and value, the Quill stories' styles and each step of a table's layout (a place checked or marked,
-a cell or gap of a row) tick it; the first refusal counts `record` once and every later walk stops (a table it cuts
-gives its story as paragraphs, uncounted again). The Escher walk, which only orders text and finds pictures, may spend
-no more than half of `limits.BIN_RECORDS` (`_Share`): past that the boxes found so far are kept and the pages are
-still read, `record` counted once a document. `officeart.shape_pib` re-reads only the children of an SpContainer the
-walk ticked, once (a seqnum names one), and `officeart.bstore` is walked once a document within
-`officeart.MAX_RECORDS`. The page list and the shapes are walked with seen-sets, so a page or shape listed twice,
-naming itself or a cycle of groups is read once; group members past `limits.MAX_DEPTH` levels, and Escher groups
-nested past it, are left out, counted `depth` once. `ctx.guard("page")` wraps each page and scratch page,
-`ctx.guard("master_page")` each master, `ctx.guard("shape")` each shape and `ctx.guard("image")` each picture; a
-page's blocks are kept only when its guard succeeds. Each story given is charged to one room of `limits.MAX_OUTPUT` a
-document, as the stories are charged (`pub_quill`): its characters and `vsdx.LINE` for itself, each paragraph end or
-line break and each bold run; past the room it is left out, counted `text`. Each link is charged its characters and
-LINE; past the room the rest are left out, counted `link` once. Nothing is allocated from a declared count; loops
-over the directory's references are bounded by `pub_contents.PUB_CHUNKS`.
+each Escher record, value and connector rule, the Quill stories' styles and each step of a table's layout (a place
+checked or marked, a cell or gap of a row) tick it; the first refusal counts `record` once and every later walk stops (a
+table it cuts gives its story as paragraphs, uncounted again). The Escher walk, which only orders text and finds
+pictures, may spend no more than half of `limits.BIN_RECORDS` (`_Share`): past that the boxes found so far are kept and
+the pages are still read, `record` counted once a document. `officeart.shape_pib` re-reads only the children of an
+SpContainer the walk ticked, once (a seqnum names one), and `officeart.bstore` is walked once a document within
+`officeart.MAX_RECORDS`. The page list and the shapes are walked with seen-sets, so a page or shape listed twice, naming
+itself or a cycle of groups is read once; group members past `limits.MAX_DEPTH` levels, and Escher groups nested past
+it, are left out, counted `depth` once. `ctx.guard("page")` wraps each page and scratch page, `ctx.guard("master_page")`
+each master, `ctx.guard("shape")` each shape, each diagram shape and connector registered and each page's place(), and
+`ctx.guard("image")` each picture; a page's blocks are kept only when its guard succeeds. Each story given is charged to
+one room of `limits.MAX_OUTPUT` a document, as the stories are charged (`pub_quill`): its characters and `vsdx.LINE` for
+itself, each paragraph end or line break and each bold run; past the room it is left out, counted `text`. Each link is
+charged its characters and LINE; past the room the rest are left out, counted `link` once. Nothing is allocated from a
+declared count; loops over the directory's references are bounded by `pub_contents.PUB_CHUNKS`.
 """
 import struct
 from array import array
 from bisect import bisect_left, bisect_right
 from itertools import islice
 
-from .. import images, limits, officeart
+from .. import diagram, images, limits, officeart
 from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
@@ -201,13 +213,20 @@ def _values(data, body: int, size: int, meter) -> dict:
 
 class _Boxes:
     """The Escher walk of `boxes`: {Contents shape seqnum: (top, left)} in `out`, and in `sp` {Contents shape seqnum:
-    the offset of the SpContainer whose ClientData names it} for every shape, with an anchor or without."""
+    the offset of the SpContainer whose ClientData names it} for every shape, with an anchor or without. For the
+    diagram: `full` {seqnum: (x0, y0, x1, y1)}, the box arranged; `kinds` {seqnum: (its FSP's shape type, the (start,
+    end) arrowheads of its first FOPT)}; `spids` {FSP spid other than 0: the seqnum of the first SpContainer naming
+    it}; `rules`, the (spidA, spidB, spidC) of the DgContainers' SolverContainers, each rule ticking the meter."""
 
     def __init__(self, data, meter, ctx, limit=None):
         self.data, self.ctx = data, ctx
         self.meter = meter if limit is None else _Share(meter, limit)
         self.out = {}
         self.sp = {}
+        self.full = {}
+        self.kinds = {}
+        self.spids = {}
+        self.rules = []
         self.deep = False
 
     def walk(self):
@@ -217,6 +236,11 @@ class _Boxes:
             for t, b, s in _records(self.data, body, body + size, self.meter):
                 if t == SPGR:
                     self.group(b, b + s, [0, 0, 0, 0], [0, 0, 0, 0], 1)
+                elif t == officeart.SOLVER:
+                    for rule in officeart.rules(self.data, b - 8, b + s):
+                        if not self.meter.tick():
+                            break
+                        self.rules.append(rule)
         return self.out
 
     def group(self, start: int, end: int, cs: list, box: list, depth: int):
@@ -236,13 +260,17 @@ class _Boxes:
 
     def shape(self, body: int, size: int, cs: list, box: list):
         """One SpContainer: an FSPGR sets the group's coordinate system; the ClientData's shape seqnum gets this
-        SpContainer's offset, and the box of the first anchor, which becomes the group's box when this shape set the
-        coordinate system."""
+        SpContainer's offset, its first FSP's spid and shape type, its first FOPT's arrowheads, and the box of the
+        first anchor, which becomes the group's box when this shape set the coordinate system."""
         data = self.data
         parent = tuple(cs)
-        fspgr = anchor = client = None
+        fspgr = anchor = client = fsp = fopt = None
         for typ, b, s in _records(data, body, body + size, self.meter):
-            if typ == FSPGR and fspgr is None:
+            if typ == officeart.FSP and fsp is None:
+                fsp = (officeart.fsp(data[b:b + min(s, 8)])[0], _HEAD.unpack_from(data, b - 8)[0] >> 4)
+            elif typ == officeart.FOPT and fopt is None:
+                fopt = officeart.arrows(data, _HEAD.unpack_from(data, b - 8)[0] >> 4, b, s)
+            elif typ == FSPGR and fspgr is None:
                 fspgr = (b, s)
             elif typ == CLIENT_DATA and client is None:
                 client = (b, s)
@@ -258,6 +286,10 @@ class _Boxes:
         if seq is None:
             return
         self.sp[seq] = body - 8
+        spid, stype = fsp or (0, 0)
+        self.kinds[seq] = (stype, fopt or (False, False))
+        if spid:
+            self.spids.setdefault(spid, seq)
         if anchor is None:
             return
         typ, b, s = anchor
@@ -274,6 +306,7 @@ class _Boxes:
             return
         got = [min(xs, xe), min(ys, ye), max(xs, xe), max(ys, ye)]
         self.out[seq] = (got[1], got[0])
+        self.full[seq] = tuple(got)
         if defines:
             box[:] = got
 
@@ -313,6 +346,23 @@ class _Quiet:
 def boxes(data, meter, ctx) -> dict:
     """{Contents shape seqnum: (top, left)} from an Escher/EscherStm stream (see the module docstring)."""
     return _Boxes(data, meter, ctx).walk()
+
+
+def _label(blocks) -> str:
+    """A connector's label: the text of its paragraphs, each run of white space and line breaks one space."""
+    parts = []
+    for p in blocks:
+        stack = list(reversed(p.inlines))
+        while stack:
+            i = stack.pop()
+            if isinstance(i, Text):
+                parts.append(i.text)
+            elif isinstance(i, (Bold, Link)):
+                stack.extend(reversed(i.inlines))
+            else:
+                parts.append(" ")
+        parts.append(" ")
+    return " ".join("".join(parts).split())
 
 
 def _cost(story) -> int:
@@ -400,18 +450,22 @@ class _Pages:
 
     def _shapes(self, seqs) -> list:
         """The blocks of a page's shapes, in reading order (`_box`: top, then left; no box last, in list order): each
-        shape's picture, then its text."""
+        shape's picture, then its text, a (seqnum, blocks) slot that `_drawn` lays out."""
         flat = self._expand(seqs)
         at = [self._box(r) for r in flat]
         placed = sorted((b, i) for i, b in enumerate(at) if b is not None)
         order = [flat[i] for _, i in placed] + [r for r, b in zip(flat, at) if b is None]
-        out = []
+        slots = []
         for ref in order:
             with self.ctx.guard("shape"):
                 got = self._picture(ref)
                 got.extend(self._text(ref))
-                out.extend(got)
-        return out
+                slots.append((ref.seqnum, got))
+        return self._drawn(slots)
+
+    def _drawn(self, slots) -> list:
+        """A page's blocks: each slot's in turn (Publisher 2000 and 97/98 have no connectors)."""
+        return [b for _, blocks in slots for b in blocks]
 
     def _text(self, ref) -> list:
         """The paragraphs of the story a shape names, or its table, once a document, charged to the room."""
@@ -507,6 +561,12 @@ class _Reader(_Pages):
         walk = _Boxes(escher, self.meter, ctx, self.meter.used + limits.BIN_RECORDS // 2)
         self.boxes = walk.walk() if escher else {}
         self.sps = walk.sp   # shape seqnum -> its SpContainer's offset in the Escher stream
+        self.full, self.kinds, self.spids = walk.full, walk.kinds, walk.spids
+        self.glue = {}       # start seqnum -> [(rule index, start seqnum, end seqnum, spidC)], both ends' spids mapped
+        for k, (a, b, c) in enumerate(walk.rules):
+            if a in self.spids and b in self.spids:
+                self.glue.setdefault(self.spids[a], []).append((k, self.spids[a], self.spids[b], c))
+        self.connections = diagram.ConnectionBudget(ctx)  # the document's edges, every page's together
         self.escher_cut = walk.meter.cut
         self.escher, self.delay = escher, delay
         self.nodes = limits.TABLE_NODES   # table cells the document may still lay out
@@ -574,6 +634,37 @@ class _Reader(_Pages):
     def _box(self, ref):
         """(top, left) of a shape from the Escher walk, or None."""
         return self.boxes.get(ref.seqnum)
+
+    def _drawn(self, slots) -> list:
+        """A page's blocks: each slot's in turn, unless a solver rule has both ends among the page's shapes; then the
+        page is one diagram scope (see the module docstring), each shape and connector registered under
+        guard("shape") and place() run under it, the slots' blocks kept when it fails."""
+        flat = [b for _, blocks in slots for b in blocks]
+        own = dict(slots)
+        kept = sorted(r for k in own for r in self.glue.get(k, ()) if r[2] in own)  # in rule order
+        if not kept:
+            return flat
+        lines = []   # (connector key, start seqnum, end seqnum, the connector's seqnum or None)
+        for _, a, b, c in kept:
+            seq = self.spids.get(c)
+            text = own.get(seq)
+            key = seq if text is not None and all(isinstance(x, Para) for x in text) else ("rule", c)
+            lines.append((key, a, b, seq))
+        conns = {key for key, _, _, _ in lines}
+        dia = diagram.Diagram(self.ctx, self.connections)
+        for seq, blocks in slots:
+            if seq not in conns:
+                with self.ctx.guard("shape"):
+                    stype = self.kinds.get(seq, (0,))[0]
+                    dia.shape(seq, blocks, officeart.KINDS.get(stype, ""), self.full.get(seq))
+        for key, a, b, seq in lines:
+            with self.ctx.guard("shape"):
+                arrows = self.kinds[seq][1] if seq in self.kinds else (None, None)
+                dia.connector(key, a, b, arrows=arrows, label=_label(own[key]) if key == seq else "")
+        out = flat
+        with self.ctx.guard("shape"):
+            out = dia.place(slots)
+        return out
 
     def _tid(self, ref):
         """The text id (block 0x27) of a shape chunk, or None."""

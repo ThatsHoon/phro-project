@@ -2107,16 +2107,18 @@ def _pub_values(pairs) -> bytes:
     return bytes(4) + b"".join(struct.pack("<HI", k, v & 0xFFFFFFFF) for k, v in pairs)
 
 
-def pub_sp(seq=None, box=None, *, child=None, group=None, pib=None) -> bytes:
-    """A Publisher SpContainer (0xF004): its FSP; an FSPGR (0xF009) with the child coordinate system `group` (xs, ys,
-    xe, ye) when given; an FOPT (0xF00B) whose one property is `pib` (0x4104) when given; a ClientAnchor (0xF010) of
-    the `box` (xs, ys, xe, ye, as values 0x2001-0x2004), or a ChildAnchor (0xF00F) of the `child` box in its group's
-    coordinates; a ClientData (0xF011) naming the Contents shape seqnum `seq` (value 0x6801)."""
-    rec = oa_record(0xF00A, struct.pack("<II", 0, 0x201 if group is not None else 0xA00), ver=2)
+def pub_sp(seq=None, box=None, *, child=None, group=None, pib=None, spid=0, props=b"") -> bytes:
+    """A Publisher SpContainer (0xF004): its FSP (spid `spid`); an FSPGR (0xF009) with the child coordinate system
+    `group` (xs, ys, xe, ye) when given; an FOPT (0xF00B) holding `pib` (0x4104) when given, then the 6-byte
+    properties `props` (opid u16, op u32 each), when either is given; a ClientAnchor (0xF010) of the `box` (xs, ys, xe,
+    ye, as values 0x2001-0x2004), or a ChildAnchor (0xF00F) of the `child` box in its group's coordinates; a ClientData
+    (0xF011) naming the Contents shape seqnum `seq` (value 0x6801)."""
+    rec = oa_record(0xF00A, struct.pack("<II", spid, 0x201 if group is not None else 0xA00), ver=2)
     if group is not None:
         rec += oa_record(0xF009, struct.pack("<4i", *group), ver=1)
-    if pib is not None:
-        rec += oa_record(0xF00B, struct.pack("<HI", 0x4104, pib), ver=3, inst=1)
+    fopt = (struct.pack("<HI", 0x4104, pib) if pib is not None else b"") + bytes(props)
+    if fopt:
+        rec += oa_record(0xF00B, fopt, ver=3, inst=len(fopt) // 6)
     if box is not None:
         rec += oa_record(0xF010, _pub_values(zip((0x2001, 0x2002, 0x2003, 0x2004), box)))
     if child is not None:
@@ -2131,15 +2133,15 @@ def pub_group(leader, *members) -> bytes:
     return oa_container(0xF003, leader, *members)
 
 
-def pub_escher(*members, store=()) -> bytes:
+def pub_escher(*members, store=(), solver=b"") -> bytes:
     """An Escher/EscherStm stream as Publisher writes it: a DggContainer and a DgContainer, each followed by 4 more
     bytes (libmspub getEscherElementTailLength); the Dg holds one SpgrContainer, its patriarch shape and `members`
-    (pub_sp, pub_group). `store`: the BStore's file blocks (oa_fbse records, pib k + 1 the k-th), a BStoreContainer
-    (0xF001) in the DggContainer after its FDGG when given."""
+    (pub_sp, pub_group), then `solver` (an oa_solver record) when given. `store`: the BStore's file blocks (oa_fbse
+    records, pib k + 1 the k-th), a BStoreContainer (0xF001) in the DggContainer after its FDGG when given."""
     bst = (oa_container(0xF001, *store, inst=len(store) & 0xFFF),) if store else ()  # the count in 12 bits
     dgg = oa_container(0xF000, oa_record(0xF006, bytes(16)), *bst) + bytes(4)
     spgr = oa_container(0xF003, pub_sp(group=(0, 0, 0, 0)), *members)
-    return dgg + oa_container(0xF002, oa_record(0xF008, bytes(8)), spgr) + bytes(4)
+    return dgg + oa_container(0xF002, oa_record(0xF008, bytes(8)), spgr, bytes(solver)) + bytes(4)
 
 
 def pub_table(rows, cols, cells) -> bytes:
