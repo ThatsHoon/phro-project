@@ -183,7 +183,9 @@ def test_phase4_formats_convert():
                 (d / name).write_bytes(data)  # clean fixtures
                 r = run(d / name, base)
                 assert r is not None and out(r)["permissionDecision"] == "allow", (name, r)
-                assert out(r)["updatedInput"]["file_path"] != str(d / name), name
+                got = Path(out(r)["updatedInput"]["file_path"])
+                assert got != d / name, name
+                assert ("Orders" if name.rsplit(".", 1)[1] in ("mdb", "accdb", "mde", "accde", "accdr") else "Hello") in got.read_text(encoding="utf-8"), name
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
