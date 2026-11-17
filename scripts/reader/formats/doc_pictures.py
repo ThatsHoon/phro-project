@@ -6,6 +6,9 @@ SpContainer and the FBSE that holds the picture, or the shape's pib in the BStor
 in PlcSpaMom, naming a shape of the DggInfo's drawings: its pib's BStore entry, or for a group shape its members'
 pictures in record order. A BStore entry's BLIP is in the entry or delay-loaded from WordDocument.
 
+The main drawing's connector rules (officeart.rules over its DgContainer) are kept for doc.py's diagram, and a shape's
+type and arrowheads are read from its SpContainer when doc.py registers it.
+
 What is read is bounded as doc.py's huge PAPXs are: the PICFs of a well-formed file never overlap and neither do its
 delay-loaded BLIPs, so the PICFs read in all are capped at len(Data) bytes, and the delay BLIPs at len(WordDocument),
 each charged before anything is copied; one past its cap is a lost picture. A delay BLIP is read once an offset, so
@@ -27,13 +30,15 @@ _MISS = object()
 
 class Drawing:
     """The document's drawings (Pictures.drawing): the anchors of PlcSpaMom ({CP: spid}), the shapes, the BStore's
-    file blocks and the DggInfo bytes they are offsets in. `damaged` is set when reading them counted a loss, so an
-    anchor whose shape is not found is not counted again."""
+    file blocks, the main drawing's connector rules ((spidA, spidB, spidC) in order) and the DggInfo bytes they are
+    offsets in. `damaged` is set when reading them counted a loss, so an anchor whose shape is not found is not
+    counted again."""
 
     def __init__(self):
         self.anchors = {}
         self.shapes = officeart.Shapes()
         self.store = []
+        self.rules = []
         self.dgg = b""
         self.damaged = False
 
@@ -84,6 +89,24 @@ class Pictures:
             self.r.ctx.skipped["image"] += j - i
             return []
         return sh.pics[i:j]
+
+    def shape_type(self, spid) -> tuple[int, tuple[bool, bool]]:
+        """(shape type, (start, end) arrowheads) of the shape `spid` names: its first FSP's instance and its first
+        FOPT's officeart.arrows; (0, (False, False)) for what it lacks, or for a shape no drawing holds. One walk of
+        the shape's own records, which officeart.records bounds."""
+        d = self.drawing()
+        at = d.shapes.at.get(spid)
+        stype, arrows = None, None
+        if at is not None:
+            h = officeart.header(d.dgg, at)
+            for _, inst, typ, body, size in officeart.records(d.dgg, at + 8, at + 8 + h[3]):
+                if typ == officeart.FSP and stype is None:
+                    stype = inst
+                elif typ == officeart.FOPT and arrows is None:
+                    arrows = officeart.arrows(d.dgg, inst, body, size)
+                if stype is not None and arrows is not None:
+                    break
+        return stype or 0, arrows or (False, False)
 
     def stored(self, pib) -> bytes | None:
         """BStore entry `pib` (1-based) as image bytes, read once a pib; None past the BStore or when its FBSE or BLIP
@@ -168,10 +191,11 @@ class Pictures:
         """The drawings, read once, at the first picture that needs them: the anchors of PlcSpaMom (26-byte FSPAs,
         spid first; the first FSPA at a CP wins), then the DggInfo (MS-DOC OfficeArtContent): a DggContainer holding
         the BStore, then an OfficeArtWordDrawing each (dgglbl u8, a DgContainer), the main document's and the header
-        document's, whose shapes go into one index; the content ends at anything else. Damage that loses shapes is
-        counted once under shape: a PlcfSpa or DggInfo outside the table stream or not whole, a DggInfo that does not
-        start with a whole DggContainer, a DgContainer cut short (its shapes before the cut are kept), records past
-        officeart.MAX_RECORDS; containers nested past MAX_DEPTH once under depth."""
+        document's, whose shapes go into one index, the main one's (dgglbl 0) connector rules into `rules`; the
+        content ends at anything else. Damage that loses shapes is counted once under shape: a PlcfSpa or DggInfo
+        outside the table stream or not whole, a DggInfo that does not start with a whole DggContainer, a DgContainer
+        cut short (its shapes before the cut are kept), records past officeart.MAX_RECORDS; containers nested past
+        MAX_DEPTH once under depth."""
         d = self._drawing
         if d is not None:
             return d
@@ -205,6 +229,8 @@ class Pictures:
                     ctx.skipped["shape"] += 1
                     cut, end = True, lcb
                 d.shapes.add(dgg, body, end)
+                if not dgg[pos]:
+                    d.rules += officeart.rules(dgg, body, end)
                 pos = end
             if d.shapes.deep:
                 r.deep()

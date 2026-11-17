@@ -589,25 +589,26 @@ def picf_inline(blip, mm=0x64, *, name=b"", pib=None, fbses=None):
     return struct.pack("<IHH", 68 + len(rest), 0x44, mm).ljust(68, b"\0") + rest
 
 
-def dgg_with_bstore(blips, shapes=None, header_shapes=None):
+def dgg_with_bstore(blips, shapes=None, header_shapes=None, solver=b""):
     """A DggInfo (FibRgFcLcb97 50, OfficeArtContent) for make_doc's fc: the DggContainer (an FDGG, then a
     BStoreContainer with an FBSE a blip: bytes embed that BLIP record, an int is the foDelay of a BLIP in
-    WordDocument), then the main document's drawing (dgglbl 0, a DgContainer whose SpgrContainer holds the shapes)
-    and, when header_shapes is given, the header document's (dgglbl 1). A shape is (spid, pib), pib None for one
-    without a pib (a text box, a line), or bytes: records already built (oa_shape, oa_group); `shapes` defaults to
-    spid 1025 + k showing pib k + 1."""
+    WordDocument), then the main document's drawing (dgglbl 0, a DgContainer whose SpgrContainer holds the shapes,
+    then `solver`, records already built: oa_solver) and, when header_shapes is given, the header document's (dgglbl
+    1). A shape is (spid, pib), pib None for one without a pib (a text box, a line), or bytes: records already built
+    (oa_shape, oa_group); `shapes` defaults to spid 1025 + k showing pib k + 1."""
     store = [oa_fbse(b) if isinstance(b, (bytes, bytearray)) else oa_fbse(delay=b) for b in blips]
     dgg = oa_container(0xF000, oa_record(0xF006, struct.pack("<4I", 1026, 2, 1, 1)),
                        oa_container(0xF001, *store, inst=len(store)))
 
-    def drawing(label, shapes):
+    def drawing(label, shapes, tail=b""):
         group = oa_container(0xF003, oa_container(0xF004, oa_record(0xF00A, struct.pack("<II", 1024, 5), ver=2)),
                              *(s if isinstance(s, (bytes, bytearray)) else oa_shape(*s) for s in shapes))
-        return bytes([label]) + oa_container(0xF002, oa_record(0xF008, struct.pack("<II", len(shapes), 1024)), group)
+        return bytes([label]) + oa_container(0xF002, oa_record(0xF008, struct.pack("<II", len(shapes), 1024)), group,
+                                             bytes(tail))
 
     if shapes is None:
         shapes = [(1025 + k, k + 1) for k in range(len(blips))]
-    out = dgg + drawing(0, shapes)
+    out = dgg + drawing(0, shapes, solver)
     if header_shapes is not None:
         out += drawing(1, header_shapes)
     return out

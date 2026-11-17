@@ -1,5 +1,6 @@
 """Word 97-2003 (.doc) stories past the main one: footnotes, endnotes, comments and their authors, headers and footers,
-text boxes; references matched at their exact CPs, nested and hidden references, hostile PLCs.
+text boxes; references matched at their exact CPs, nested and hidden references, hostile PLCs; floating shapes joined
+by connector rules, their text boxes as a diagram.
 
 Run: python -I -X utf8 tests/test_reader_doc_notes.py
 """
@@ -13,13 +14,15 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import markdown  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
+from reader import diagram, markdown  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import doc, ooxml_word, word_fields  # noqa: E402
-from reader.model import Context, NoteRef, Para, Text  # noqa: E402
-from reader_fix import doc_plc, doc_stories, make_cfb, make_doc, make_zip  # noqa: E402
+from reader.model import Code, Context, NoteRef, Para, Table, Text  # noqa: E402
+from reader_fix import (dgg_with_bstore, doc_plc, doc_spa, doc_stories, make_cfb, make_doc, make_zip,  # noqa: E402
+                        oa_shape, oa_solver)
 
-BOLD, VANISH, DELETED = 0x0835, 0x083C, 0x0800
+BOLD, VANISH, DELETED, SPEC = 0x0835, 0x083C, 0x0800, 0x0855
 IN_TABLE, TTP = 0x2416, 0x2417
 SEP = [""] * 6  # the six PlcfHdd separator stories, empty
 PAGE = "\x13 PAGE \x141\x15\r"  # a page-number field whose result is 1
@@ -41,9 +44,10 @@ def sp(op, value=1):
     return u16(op) + value.to_bytes((1, 1, 2, 4, 2, 2, 0, 3)[op >> 13], "little")
 
 
-def ftxbxs(n, reusable=()):
-    """n FTXBXS (cTxbx 1, fReusable 1 for the indices in `reusable`), then the dummy one."""
-    return b"".join(struct.pack("<iihiii", 1, 0, k in reusable, -1, k + 1, 0) for k in range(n)) + bytes(22)
+def ftxbxs(n, reusable=(), lids=None):
+    """n FTXBXS (cTxbx 1, fReusable 1 for the indices in `reusable`, lid k + 1 or lids[k]), then the dummy one."""
+    lids = lids or [k + 1 for k in range(n)]
+    return b"".join(struct.pack("<iihiii", 1, 0, k in reusable, -1, lids[k], 0) for k in range(n)) + bytes(22)
 
 
 def story_doc(main, *, fc=None, ccp=None, split=0, chpx=None, papx=None, **kw):
@@ -252,6 +256,115 @@ def test_textbox_dummy_and_reusable():
     assert md(q) == "본문\n\n상자\n", md(q)
     r = story_doc("본문\r", header_textboxes=["위\r", "남은\r"], fc={58: doc_plc([0, 2, 5]) + ftxbxs(1)})
     assert md(r) == "Header: 위\n\n본문\n", md(r)
+
+
+# ---- connected floating shapes: their text boxes become a diagram
+TEXT_BOX, DECISION, CONNECTOR = 202, 110, 32  # shape types (the FSP's instance)
+END_ARROW = struct.pack("<HI", 0x01D1, 2)     # FOPT lineEndArrowhead: an arrowhead
+SHAPES = [oa_shape(1, inst=TEXT_BOX), oa_shape(2, inst=DECISION), oa_shape(3, inst=CONNECTOR, props=END_ARROW)]
+FLOW = 'flowchart TD\n  n1["가"]\n  n2{"나"}\n  n1 --> n2'
+
+
+def drawn_doc(main, spids, shapes=SHAPES, rules=((1, 2, 3),), fc=None, papx=None, **kw):
+    """story_doc(main, **kw) whose k-th \\x08 has fSpec and anchors spids[k] in PlcSpaMom; the main drawing holds
+    `shapes` (records built) and a SolverContainer of `rules`, none when empty."""
+    at = [i for i, ch in enumerate(main) if ch == "\x08"]
+    solver = oa_solver(*rules) if rules else b""
+    entries = {40: doc_spa(list(zip(at, spids))), 50: dgg_with_bstore([], shapes, solver=solver), **(fc or {})}
+    return story_doc(main, fc=entries, chpx=[(i, i + 1, sp(SPEC)) for i in at], papx=papx, **kw)
+
+
+def mermaid(d):
+    codes = [b.text for b in d.blocks if isinstance(b, Code)]
+    assert len(codes) == 1 and mermaid_ok(codes[0]), codes
+    return codes[0]
+
+
+def test_doc_connector_textboxes():
+    # text boxes of shapes 1 and 2 (lid 1, 2) and the rule (1, 2, 3): one Mermaid block at the first anchor's
+    # paragraph, the box texts its node labels, the node kinds from the shape types
+    p = drawn_doc("본문\x08\x08\x08\r다음\r", [1, 2, 3], textboxes=["가\r", "나\r"])
+    d, ctx = parse(p)
+    assert mermaid(d) == FLOW and not ctx.skipped, (mermaid(d), ctx.skipped)
+    assert d.blocks == [Para([Text("본문")]), Code(FLOW, "mermaid"), Para([Text("다음")])], d.blocks
+    assert md(p) == f"본문\n\n```mermaid\n{FLOW}\n```\n\n다음\n", md(p)
+
+
+def test_textbox_node_not_repeated():
+    # the box texts are nodes only: not after the main text; header text boxes are header lines as before
+    p = drawn_doc("본문\x08\x08\x08\r다음\r", [1, 2, 3], textboxes=["가\r", "나\r"], header_textboxes=["가위\r"])
+    out = md(p)
+    assert out.count("가") == 2 and out.count("나") == 1, out
+    assert out == f"Header: 가위\n\n본문\n\n```mermaid\n{FLOW}\n```\n\n다음\n", out
+    # the boxes follow their lids, not their story order
+    q = drawn_doc("본문\x08\x08\x08\r다음\r", [1, 2, 3], textboxes=["나\r", "가\r"],
+                  fc={56: doc_plc([0, 2, 4, 5]) + ftxbxs(2, lids=[2, 1])})
+    assert md(q) == out.removeprefix("Header: 가위\n\n"), md(q)
+
+
+def test_unconnected_textbox_unchanged():
+    # a third text box, its shape anchored but named by no rule, stays after the main text, as today
+    shapes = SHAPES[:2] + [oa_shape(3, inst=TEXT_BOX), oa_shape(4, inst=CONNECTOR, props=END_ARROW)]
+    p = drawn_doc("본문\x08\x08\x08\x08\r다음\r", [1, 2, 3, 4], shapes, [(1, 2, 4)],
+                  textboxes=["가\r", "나\r", "다\r"])
+    d, ctx = parse(p)
+    assert mermaid(d) == FLOW and not ctx.skipped, ctx.skipped
+    assert md(p) == f"본문\n\n```mermaid\n{FLOW}\n```\n\n다음\n\n다\n", md(p)
+
+
+def test_doc_connector_label():
+    # the connector's own text box (lid 3) is its label, written once
+    p = drawn_doc("본문\x08\x08\x08\r다음\r", [1, 2, 3], textboxes=["가\r", "나\r", "예\r"])
+    d, ctx = parse(p)
+    assert mermaid(d) == FLOW.replace("-->", '-->|"예"|') and not ctx.skipped, mermaid(d)
+    assert md(p).count("예") == 1, md(p)
+
+
+def test_doc_without_solver_unchanged():
+    # no SolverContainer: the DggInfo bytes are the fixture's old ones and the text boxes follow the main text
+    assert dgg_with_bstore([], SHAPES) == dgg_with_bstore([], SHAPES, solver=b"")
+    p = drawn_doc("본문\x08\x08\x08\r다음\r", [1, 2, 3], rules=(), textboxes=["가\r", "나\r"])
+    assert md(p) == "본문\n\n다음\n\n가\n\n나\n", md(p)
+
+
+def test_doc_rule_missing_spid():
+    # a rule whose end names no shape gives no edge: the connector is counted as not attached and the box text of
+    # the shape it does name stays, at its anchor
+    p = drawn_doc("본문\x08\x08\x08\r다음\r", [1, 2, 3], rules=[(1, 9, 3)], textboxes=["가\r", "나\r"])
+    d, ctx = parse(p)
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
+    assert d.blocks == [Para([Text("본문")]), Para([Text("가")]), Para([Text("다음")]), Para([Text("나")])], d.blocks
+    # spid 0 is no shape: a rule naming it there makes no slot
+    q = drawn_doc("본문\x08\x08\r다음\r", [1, 3], rules=[(1, 0, 3), (0, 0, 0)], textboxes=["가\r", "나\r"])
+    d, ctx = parse(q)
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
+    assert d.blocks == [Para([Text("본문")]), Para([Text("가")]), Para([Text("다음")]), Para([Text("나")])], d.blocks
+
+
+def test_doc_connector_in_table():
+    # anchors in a table cell: the diagram goes before the table that holds them
+    p = drawn_doc("a\x08\x08\x08\x07\x07\r끝\r", [1, 2, 3], textboxes=["가\r", "나\r"],
+                  papx=[(0, 5, u16(0) + sp(IN_TABLE, 1)), (5, 6, u16(0) + sp(IN_TABLE, 1) + sp(TTP, 1))])
+    d, ctx = parse(p)
+    assert mermaid(d) == FLOW and not ctx.skipped, ctx.skipped
+    assert [type(b) for b in d.blocks] == [Code, Table, Para], d.blocks
+    assert d.blocks[1].rows[0][0].blocks == [Para([Text("a")])] and "가" not in md(p).split("```")[2], md(p)
+
+
+def test_doc_diagram_failure_falls_back():
+    # a diagram that fails is one shape lost: the slots stay, each box text at its anchor
+    real = diagram.Diagram.place
+
+    def place(self, slots):
+        raise RuntimeError("boom")
+
+    diagram.Diagram.place = place
+    try:
+        d, ctx = parse(drawn_doc("본문\x08\x08\x08\r다음\r", [1, 2, 3], textboxes=["가\r", "나\r"]))
+    finally:
+        diagram.Diagram.place = real
+    assert ctx.skipped == {"shape": 1}, ctx.skipped
+    assert d.blocks == [Para([Text("본문")]), Para([Text("가")]), Para([Text("나")]), Para([Text("다음")])], d.blocks
 
 
 # ---- hostile input

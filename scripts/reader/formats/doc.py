@@ -41,6 +41,14 @@ vanished or deleted text it is hidden as the text is. Each is read under guard("
 counted there; every deflated BLIP shares the document's flate.Budget. Header pictures are not read: a header is a
 line of text, and the docx reader drops its pictures too.
 
+The main story is one diagram scope (diagram.py). A floating shape that a connector rule of the main drawing names
+(doc_pictures keeps officeart.rules; spid 0 is no shape) leaves a stand-in among the blocks after its anchor's
+paragraph; one in a table waits until the outermost table closes and goes before it. After the walk each stand-in is a
+slot carrying the text box whose FTXBXS lid is its spid, which is then no longer written after the main text: the
+rule's connector with its arrowheads and its own text box as its label, any other shape a node with its type's kind.
+Top-level floats get no box (FSPA geometry is not read), so only glue makes edges; a connector no rule names is not
+registered and keeps today's output.
+
 Embedded objects are doc_objects.py's. An EMBED (or LINK) field whose separator has fSpec and fOle2 names an
 ObjectPool storage; the object goes where the field's result has its \\x01 (the preview), else at the field's end or
 at a paragraph mark that cuts the field. A \\x01 with fOle2 outside such a field names one itself. An equation is Math
@@ -53,7 +61,7 @@ from bisect import bisect_right
 from itertools import islice
 from operator import gt
 
-from .. import images, limits
+from .. import diagram, images, limits, officeart
 from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import IMAGE_BYTES, ReadError
@@ -85,6 +93,15 @@ _FOOTERS = frozenset((2, 3, 5))  # their places among a section's six
 _OWNERS = 0x10000  # GrpXstAtnOwners names an ibst (u16) can index
 PLC_MAX = 1_000_000  # entries one story PLC may hold; past it the PLC is not read and its story is counted
 _HEADER_STORIES = frozenset(("header", "header_textbox"))  # lines of text: their pictures are not read
+
+
+class _Slot:
+    """A stand-in, among the main story's blocks, for the floating shape `key` (its spid) that a connector rule names,
+    where its anchor stands; run() turns it into a diagram slot, so it never reaches the document."""
+    __slots__ = ("key",)
+
+    def __init__(self, key):
+        self.key = key
 
 
 def _plc(data: bytes, cb: int) -> tuple[list[int], list[bytes]]:
@@ -230,12 +247,14 @@ class _State:
     the rest of its segment (or of a deletion) joins while it is still the last inline of its scope. tables are the
     tables open around the paragraph, outermost first (tables[k] at depth k + 1); overflow is set while paragraphs nest
     past MAX_DEPTH or TABLE_NODES, so one overflowing subtree is counted once. extras are the blocks (pictures) that
-    follow the open paragraph where it goes, eqs its equations (Math)."""
+    follow the open paragraph where it goes, eqs its equations (Math). held are the _Slots of paragraphs in a table,
+    which go before the outermost table when it closes."""
 
     def __init__(self, name, story=None):
         self.name = name
         self.story = story  # the doc_fib.Story walked: CP <-> text index
         self.out = []
+        self.held = []
         self.run, self.seg = _PLAIN, -1
         self.tables: list[_Table] = []
         self.overflow = False
@@ -288,6 +307,9 @@ class _Reader:
         self.data = None             # the Data stream once read; False when missing or unreadable
         self._prm, self._runs, self._paras = {}, {}, {}  # memos: prm -> sprms; run and paragraph properties
         self._huge, self._huge_read = {}, 0  # Data offset -> the sprms of its huge PAPX; the bytes read so far
+        self.glue = None      # connector spid -> (start spid, end spid), the first rule naming it winning; read once
+        self.ends = set()     # the spids the connector rules name
+        self.slotted = False  # whether the main story holds a _Slot
 
     # ---- streams
     def stream(self, name) -> bytes:
@@ -323,9 +345,12 @@ class _Reader:
         self.props()
         self.notes()
         self.headers()
+        main = []
         with self.ctx.guard("document"):
-            self.doc.blocks.extend(self.story("text"))
-        for blocks in self.boxes("textbox", _TXBX, "block"):
+            main = self.story("text")
+        boxes = self.boxes("textbox", _TXBX, "block")
+        self.doc.blocks.extend(self.connect(main, boxes) if self.slotted else main)
+        for blocks in boxes.values():
             self.doc.blocks.extend(blocks)
         if self.styles.bad:
             self.ctx.skipped["styles"] += self.styles.bad
@@ -428,29 +453,63 @@ class _Reader:
                 text = flat(self.read("header", a, b))
                 if text:
                     (self.doc.footers if footer else self.doc.headers).append(text)
-        for blocks in self.boxes("header_textbox", _HDR_TXBX, "header"):
+        for blocks in self.boxes("header_textbox", _HDR_TXBX, "header").values():
             text = flat(blocks)
             if text:
                 self.doc.headers.append(text)
 
-    def boxes(self, name, index, kind) -> list[list]:
-        """The blocks of each text box of PlcftxbxTxt or PlcfHdrtxbxTxt, in story order: a range a text box, relative
-        to story `name`, with a 22-byte FTXBXS; the last FTXBXS is a dummy for the story's guard paragraph mark, and a
-        reusable one (fReusable) is a text box no longer in use, so neither is read. The PLC is read under
-        guard(kind), each text box too; a PLC that is not whole, whose CPs decrease or whose boxes run past the
-        story's ccp loses the story, counted once, and so does story text without a PLC entry (storyless)."""
-        spans, out = [], []
+    def boxes(self, name, index, kind) -> dict:
+        """{lid: blocks} of each text box of PlcftxbxTxt or PlcfHdrtxbxTxt, in story order: a range a text box,
+        relative to story `name`, with a 22-byte FTXBXS whose lid (i32 at 14) is the spid of the shape holding it; a
+        lid an earlier text box has is keyed ("unkeyed", i) instead, so no text box is lost. The last FTXBXS is a dummy
+        for the story's guard paragraph mark, and a reusable one (fReusable) is a text box no longer in use, so neither
+        is read. The PLC is read under guard(kind), each text box too; a PLC that is not whole, whose CPs decrease or
+        whose boxes run past the story's ccp loses the story, counted once, and so does story text without a PLC entry
+        (storyless)."""
+        spans, out = [], {}
         with self.ctx.guard(kind):
             cps, data = self.story_plc(index, _FTXBXS)
             self.storyless(name, kind, data)
             m = len(data) - 1
             if m > 0 and cps[m] > self.fib.ccp[name]:
                 raise ValueError("text box past its story")
-            spans = [(cps[i], cps[i + 1]) for i in range(max(m, 0))
+            spans = [(i, cps[i], cps[i + 1]) for i in range(max(m, 0))
                      if cps[i] < cps[i + 1] and not struct.unpack_from("<h", data[i], 8)[0]]
-        for a, b in spans:
+        for i, a, b in spans:
             with self.ctx.guard(kind):
-                out.append(self.read(name, a, b))
+                lid = struct.unpack_from("<i", data[i], 14)[0]
+                out[lid if lid not in out else ("unkeyed", i)] = self.read(name, a, b)
+        return out
+
+    def connect(self, main, boxes) -> list:
+        """The main story's blocks as one diagram scope: each _Slot a slot of its shape carrying the text box whose
+        lid is its spid, taken out of `boxes` (a second _Slot of that shape carries nothing), every other block a slot
+        of its own. Each shape is registered once, under guard("shape"): the connector of a rule with the rule's ends,
+        its FOPT arrowheads and its own text box's text as its label (a plain line, type 20, as a line); any other
+        one a node of its text box's blocks and its type's kind, with no box. place() runs under guard("shape") and
+        falls back to the slots' blocks."""
+        slots, seen = [], set()
+        for b in main:
+            if type(b) is _Slot:
+                slots.append((b.key, boxes.pop(b.key, [])))
+            else:
+                slots.append((None, [b]))
+        dia = diagram.Diagram(self.ctx, diagram.ConnectionBudget(self.ctx))  # one scope: the document's budget
+        for key, blocks in slots:
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            with self.ctx.guard("shape"):
+                stype, arrows = self.pictures.shape_type(key)
+                if key in self.glue:
+                    begin, end = self.glue[key]
+                    dia.connector(key, begin, end, arrows=arrows, label=flat(blocks),
+                                  line=stype == officeart.LINE_TYPE)
+                else:
+                    dia.shape(key, blocks, officeart.KINDS.get(stype, ""))
+        out = [b for _, blocks in slots for b in blocks]
+        with self.ctx.guard("shape"):
+            out = dia.place(slots)
         return out
 
     # ---- formatting
@@ -761,6 +820,9 @@ class _Reader:
         if not depth:
             st.out.extend(blocks)
             return
+        if self.slotted and any(type(b) is _Slot for b in blocks):
+            st.held += [b for b in blocks if type(b) is _Slot]
+            blocks = [b for b in blocks if type(b) is not _Slot]
         self.opened += max(depth - len(tables), 0)
         while len(tables) < depth:
             tables.append(_Table())
@@ -773,11 +835,15 @@ class _Reader:
 
     def close_tables(self, st, depth):
         """Close the tables deeper than `depth`, innermost first: each goes into the open cell of the table around it,
-        the outermost into the story. Damaged TDefTable operands are counted under styles."""
+        the outermost into the story after the _Slots its paragraphs held. Damaged TDefTable operands are counted
+        under styles."""
         while len(st.tables) > depth:
             table, bad = _table(st.tables.pop().finish())
             if bad:
                 self.ctx.skipped["styles"] += bad
+            if not st.tables and st.held:
+                st.out.extend(st.held)
+                st.held = []
             if table is not None:
                 (st.tables[-1].cell if st.tables else st.out).append(table)
 
@@ -874,8 +940,9 @@ class _Reader:
 
     def drawn(self, st, cp):
         """A floating object: a \\x08 with fSpec in the main story, the pictures of the shape its FSPA in PlcSpaMom
-        names (doc_pictures.Pictures.floating), each read under guard("image"). MS-DOC gives the stories other than
-        the main and header ones no PlcfSpa, so a \\x08 there is not resolved, and a header's is not read."""
+        names (doc_pictures.Pictures.floating), each read under guard("image"), then a _Slot when a connector rule
+        names that shape. MS-DOC gives the stories other than the main and header ones no PlcfSpa, so a \\x08 there
+        is not resolved, and a header's is not read."""
         if not st.run.special or st.name != "text" or not self.live(st):
             return
         pibs = []
@@ -884,6 +951,20 @@ class _Reader:
         for pib in pibs:
             with self.ctx.guard("image"):
                 self.put_image(st, self.pictures.stored(pib))
+        spid = self.pictures.drawing().anchors.get(cp)
+        if spid is not None and spid in self.linked():
+            st.extras.append(_Slot(spid))
+            self.slotted = True
+
+    def linked(self) -> set:
+        """The spids the main drawing's connector rules name, 0 (no shape) left out; read once, with self.glue."""
+        if self.glue is None:
+            self.glue = {}
+            for a, b, c in self.pictures.drawing().rules:
+                self.glue.setdefault(c, (a, b))
+                self.ends.update((a, b, c))
+            self.ends.discard(0)
+        return self.ends
 
     def put_image(self, st, data):
         """A picture into st.extras, hidden as its run is: deleted, else vanished. It is counted under image instead
