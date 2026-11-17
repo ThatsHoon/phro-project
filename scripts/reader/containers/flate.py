@@ -10,14 +10,15 @@ _CHUNK = 64 * 1024
 def _framing(data: bytes, wbits: int) -> bool:
     """The stream's first bytes are another framing than `wbits` reads, so a zlib.error there with nothing returned
     dropped no inflated output: a zlib (15) or gzip (31) reading stops at a header it does not accept, and the raw
-    (-15) reading of a zlib header meets a stored block (CMF's low bits are 000), whose output is its own input bytes
-    copied, never more than the stream holds."""
+    (-15) reading of a zlib header meets a stored block (CMF's low bits are 000) whose length check (LEN at bytes 1-2,
+    NLEN at 3-4) fails, so it stops there. When that check passes, the raw reading can go on past the stored block
+    into blocks of its own, so it is charged like any other failure."""
     zlib_head = len(data) >= 2 and data[0] & 0x0F == 8 and (data[0] << 8 | data[1]) % 31 == 0
     if wbits == 15:
         return not zlib_head
     if wbits == 31:
         return data[:2] != b"\x1f\x8b"
-    return zlib_head
+    return zlib_head and (len(data) < 5 or (data[1] | data[2] << 8) ^ (data[3] | data[4] << 8) != 0xFFFF)
 
 
 class Budget:

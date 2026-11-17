@@ -469,6 +469,41 @@ def test_corrupt_streams_charged():
             assert flate.inflate(co.compress(text) + co.flush(), b) == text and b.used == len(text), (wbits, level)
 
 
+def test_framing_probe_exemption():
+    # (Task 25 re-review) a valid zlib header whose next four bytes pass the stored-length check is read by the raw
+    # probe as a stored block and the blocks after it: 78 9C, then LEN 0x009C and NLEN 0xFF63, 156 stored bytes, 60
+    # KiB of zeros coded, a flush and a block of type 3. The raw probe inflates the 60 KiB and fails: it is charged.
+    # (The stored bytes start 9C 00, so the zlib reading sees a stored block of 0xFF63 bytes and ends Truncated.)
+    import zlib
+    from reader.containers import flate
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    body = c.compress(bytes(60 * 1024)) + c.flush(zlib.Z_FULL_FLUSH) + b"\xff" * 4
+    bad = b"\x78\x9c\x00\x63\xff" + b"\x9c\x00" + bytes(154) + body
+    assert len(bad) < 300, len(bad)
+    b = flate.Budget(2 * 2**20)
+    kinds = []
+    for _ in range(40):
+        try:
+            flate.inflate(bad, b)
+        except ReadError as e:
+            kinds.append(e.detail.split(":")[0])
+        except ValueError:
+            kinds.append("bad")
+    assert kinds[-1] == "total", (kinds, b.used)
+    # the zlib reading of half a raw stream stops at the header: only the raw reading's output is charged
+    text = bytes(range(256)) * 400
+    raw = zlib.compress(text, wbits=-15)
+    half = raw[:len(raw) // 2]
+    assert not (half[0] & 0x0F == 8 and (half[0] << 8 | half[1]) % 31 == 0)  # no zlib header by chance
+    b = flate.Budget()
+    try:
+        flate.inflate(half, b)
+    except flate.Truncated as e:
+        assert 0 < len(e.data) and b.used == len(e.data), (b.used, len(e.data))
+    else:
+        raise AssertionError("cut")
+
+
 def main():
     if sys.argv[1:] == ["measure"]:
         measure()
