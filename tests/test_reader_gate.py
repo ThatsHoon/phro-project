@@ -1295,6 +1295,250 @@ def test_setup_for_flag():
             os.environ["PHRO_READER_MPPENV"] = old
 
 
+# -- mpp: every mpp test pins PHRO_READER_MPPENV (a missing folder or a fake venv) and PATH (one folder, holding an
+# inert java stub or nothing), so a real venv or a real Java is never used; no child runs unless a test starts one
+
+MPP_HEAD = "{name}: Microsoft Project files are read only through MPXJ, which is not installed."
+MPP_ENGINE = "mpxj-16.10.0-java21"
+
+# a stand-in for the venv child: it records its arguments, files a one-line entry under the key the real child
+# works out from its own ready.json (cache.key(path, engine id)) and prints the out.md path
+FAKE_MPXJ_CHILD = '''import json, sys
+sys.path.insert(0, {scripts!r})
+from pathlib import Path
+from reader import cache
+Path({log!r}).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+k = cache.key(Path(sys.argv[1]), {engine!r})
+d = cache.root() / k[:2] / k
+d.mkdir(parents=True, exist_ok=True)
+(d / "out.md").write_text("# Plan" + chr(10), encoding="utf-8")
+(d / "meta.json").write_text(json.dumps({{"lines": 1}}), encoding="utf-8")
+print(d / "out.md")
+'''
+
+
+def mpp_offer(venv):
+    return (' MPXJ 16.10.0 with JPype 1.7.1 (PyPI, about 32 MB, LGPL-2.1 and Apache-2.0) reads it using the Java on'
+            ' this machine. Ask the user whether to install it, and only on their yes run: python -I -X utf8'
+            f' "{gate.READ_PY}" setup --for mpp --venv "{venv}" (or the same with --decline if they never want it).')
+
+
+@contextmanager
+def mpp_env(venv, java=True):
+    """stub()'s throwaway cache, PHRO_READER_MPPENV at `venv` and PATH holding one folder with an inert `java` file
+    (java=True: find_java answers it; the file is never run) or nothing. Yields the java path."""
+    bin_dir = tmp() / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / ("java.exe" if sys.platform == "win32" else "java")
+    if java:
+        exe.write_bytes(b"")
+    with stub(), envs(PHRO_READER_MPPENV=venv, PATH=bin_dir):
+        yield exe
+
+
+@contextmanager
+def no_child():
+    """Fail the test if the gate starts any process."""
+    real = gate.subprocess.run
+
+    def refuse(cmd, **kw):
+        raise AssertionError(f"a child was started: {cmd}")
+    gate.subprocess.run = refuse
+    try:
+        yield
+    finally:
+        gate.subprocess.run = real
+
+
+def mpp_venv(d, java):
+    """A fake READY mpp venv at d (test_reader_pyenv's layout: an interpreter file, pyvenv.cfg, the mpxj and jpype1
+    dist-infos) with a ready.json recording `java` as the Java on PATH, a JVM library file and Java 21."""
+    import test_reader_pyenv as tp
+    from reader import pyenv
+    d = Path(d)
+    tp.fake_mpp_venv(d)
+    jvm = tmp() / "jdk" / "bin" / "server" / "jvm.dll"
+    jvm.parent.mkdir(parents=True)
+    jvm.write_bytes(b"")
+    ready = {"kind": "mpp", "requirements": pyenv.requirements_hash("mpp"),
+             "python": {"version": "3.12.0", "home": str(d.parent)}, "mpxj": "16.10.0", "jpype1": "1.7.1",
+             "java": {"path": str(java), "major": 21, "home": str(jvm.parents[2]), "jvm": str(jvm),
+                      "bits": pyenv.python_bits()},
+             "records": pyenv.record_digests(d, "mpp")}
+    (d / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
+    return d
+
+
+def project(name="a.mpp", data=b""):
+    from reader_fix import cfb_bytes, comp_obj
+    return put(name, cfb_bytes({"\x01CompObj": comp_obj(b"MSProject.MPP9", b"Microsoft Project"),
+                                "Extra": data or b"x"})[0])
+
+
+def reason_of(d):
+    o = out(d)
+    assert o["permissionDecision"] == "deny", o
+    return o["permissionDecisionReason"]
+
+
+def test_mpp_deny_with_offer():
+    missing = tmp() / "no-mpp-venv"
+    with mpp_env(missing), no_child():
+        r = reason_of(gate.decide(ev(project())))
+    assert r == MPP_HEAD.format(name="a.mpp") + mpp_offer(missing), r
+    assert len(r) < gate.CONTEXT_MAX
+
+
+def test_mpp_deny_no_java():
+    with mpp_env(tmp() / "no-mpp-venv", java=False), no_child():
+        r = reason_of(gate.decide(ev(project())))
+    assert r == MPP_HEAD.format(name="a.mpp") + " It also needs Java 8 or later on PATH, which phro-project does not install.", r
+
+
+def test_mpp_deny_declined():
+    from reader import cache
+    for java in (True, False):  # a decline is said first, Java or not
+        with mpp_env(tmp() / "no-mpp-venv", java=java), no_child():
+            (cache.root() / "mpp-declined").parent.mkdir(parents=True, exist_ok=True)
+            (cache.root() / "mpp-declined").write_text("", encoding="utf-8")
+            r = reason_of(gate.decide(ev(project())))
+        assert r == (MPP_HEAD.format(name="a.mpp")
+                     + f' (Declined; python -I -X utf8 "{gate.READ_PY}" setup --for mpp installs it.)'), r
+
+
+def test_mpp_reason_fits():
+    venv = tmp() / "mpp-venv"
+    name = "x" * 496 + ".mpp"  # longer than a file name can be on disk: the reason alone is built
+    with mpp_env(venv):
+        r = gate.mpp_reason(Path("d") / name)
+        assert len(r) <= gate.CONTEXT_MAX - 1, len(r)
+        cmd = f'python -I -X utf8 "{gate.READ_PY}" setup --for mpp --venv "{venv}"'
+        assert cmd in r and r.endswith(mpp_offer(venv)), r
+        assert r.startswith("xxx") and "…: Microsoft Project files" in r, r
+        short = gate.mpp_reason(Path("d") / "a b\tc.mpt")
+        assert short.startswith("a b c.mpt: Microsoft Project") and "…" not in short, short
+    with mpp_env(venv, java=False):
+        r = gate.mpp_reason(Path("d") / name)
+        assert len(r) == gate.CONTEXT_MAX - 1 and r.endswith(" which phro-project does not install."), r
+
+
+def test_mpp_ready_child():
+    from reader import cache, pyenv
+    with mpp_env(tmp() / "unset") as java:
+        v = mpp_venv(tmp() / "mpp-venv", java)
+        with envs(PHRO_READER_MPPENV=v):
+            assert pyenv.engine("mpp", v) == MPP_ENGINE and pyenv.verify(v, "mpp")
+            p = project()
+            k = cache.key(p, MPP_ENGINE)
+            assert k != cache.key(p)
+            log = tmp() / "argv.json"
+            child = tmp() / "child.py"
+            child.write_text(FAKE_MPXJ_CHILD.format(scripts=str(HERE / "scripts"), log=str(log), engine=MPP_ENGINE),
+                             encoding="utf-8")
+            o = out(gate.decide(ev(p), command=[sys.executable, "-I", "-X", "utf8", str(child)]))
+            assert o["permissionDecision"] == "allow", o
+            assert Path(o["updatedInput"]["file_path"]) == cache.root() / k[:2] / k / "out.md", o
+            args = json.loads(log.read_text(encoding="utf-8"))
+            assert args == [str(p), "--engine", "mpxj"] and "--key" not in args, args  # the child hashes the file
+            assert o["additionalContext"].startswith("a.mpp was converted to Markdown by phro-project (1 line)."), o
+            # the gate looks the entry up under the engine's key: a second Read starts no child
+            with no_child():
+                o2 = out(gate.decide(ev(p), command=EXIT3))
+            assert o2["updatedInput"] == o["updatedInput"], o2
+            # with no command the child is the venv's interpreter, exactly as for pdf, and never gets --key
+            p2 = project("b.mpt", b"y")
+            seen, real = [], gate.subprocess.run
+
+            def fake_run(cmd, **kw):
+                seen.append(list(cmd))
+                return real([sys.executable, "-I", "-X", "utf8", str(child), *cmd[6:]], **kw)
+            gate.subprocess.run = fake_run
+            try:
+                o3 = out(gate.decide(ev(p2)))
+            finally:
+                gate.subprocess.run = real
+            assert o3["permissionDecision"] == "allow", o3
+            assert seen == [[str(pyenv.interpreter(v)), "-I", "-X", "utf8", str(gate.READ_PY), "convert", str(p2),
+                             "--engine", "mpxj"]], seen
+            k2 = cache.key(p2, MPP_ENGINE)
+            assert Path(o3["updatedInput"]["file_path"]) == cache.root() / k2[:2] / k2 / "out.md", o3
+
+
+def test_mpp_ready_but_broken_denies_with_offer():
+    from reader import pyenv
+    with mpp_env(tmp() / "unset") as java:
+        # the recorded Java no longer resolves (removed or upgraded after setup)
+        v = mpp_venv(tmp() / "mpp-venv", java)
+        with envs(PHRO_READER_MPPENV=v):
+            assert pyenv.engine("mpp", v) == MPP_ENGINE
+            java.unlink()
+            with no_child():
+                r = reason_of(gate.decide(ev(project()), command=EXIT3))
+            assert r == MPP_HEAD.format(name="a.mpp") + " It also needs Java 8 or later on PATH, which phro-project does not install.", r
+            java.write_bytes(b"")  # a java on PATH again, but another one than setup recorded
+            ready = json.loads((v / "ready.json").read_text(encoding="utf-8"))
+            ready["java"]["path"] = str(tmp() / "old-jdk" / java.name)
+            (v / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
+            with no_child():
+                r = reason_of(gate.decide(ev(project()), command=EXIT3))
+            assert r == MPP_HEAD.format(name="a.mpp") + mpp_offer(v), r
+        # the venv's files changed after setup: the file check fails before any child starts
+        v2 = mpp_venv(tmp() / "mpp-venv", java)
+        with envs(PHRO_READER_MPPENV=v2):
+            assert pyenv.engine("mpp", v2) == MPP_ENGINE
+            mod = v2 / "Lib" / "site-packages" / "mpxj" / "__init__.py"
+            mod.write_bytes(mod.read_bytes() + b"# changed\n")
+            with no_child():
+                r = reason_of(gate.decide(ev(project()), command=EXIT3))
+            assert r == MPP_HEAD.format(name="a.mpp") + mpp_offer(v2), r
+
+
+def test_mpp_child_fail_kinds():
+    from reader import pyenv
+    with mpp_env(tmp() / "unset") as java:
+        v = mpp_venv(tmp() / "mpp-venv", java)
+        with envs(PHRO_READER_MPPENV=v):
+            def fail(kind, detail=""):
+                return [sys.executable, "-c", f"print('FAIL\\t{kind}\\t{detail}')"]
+            r = reason_of(gate.decide(ev(project()), command=fail("encrypted", "password")))
+            assert r == "a.mpp: the file is encrypted and needs a password.", r
+            r = reason_of(gate.decide(ev(project()), command=fail("damaged", "MPXJ could not read the file")))
+            assert r.startswith("a.mpp: the file looks damaged (MPXJ could not read the file). Retry by hand:"), r
+            r = reason_of(gate.decide(ev(project()), command=[sys.executable, "-c", "import time; time.sleep(5)"],
+                                      timeout=1))
+            assert r.startswith(f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds."), r
+            # the venv child without its engine: the offer again (setup repairs the venv)
+            from reader.formats import mpp
+            assert gate.MPP_UNSUPPORTED == mpp.UNSUPPORTED
+            r = reason_of(gate.decide(ev(project()), command=fail("unsupported", mpp.UNSUPPORTED)))
+            assert r == MPP_HEAD.format(name="a.mpp") + mpp_offer(v), r
+            # another format's compound file named .mpp, which its own parser refuses: that parser's detail
+            r = reason_of(gate.decide(ev(project()), command=fail("unsupported", "Excel 5.0/95 workbook")))
+            assert r == "a.mpp: this file is not supported (Excel 5.0/95 workbook).", r
+            assert pyenv.engine("mpp", v) == MPP_ENGINE
+
+
+def test_mpt_same_path():
+    missing = tmp() / "no-mpp-venv"
+    with mpp_env(missing), no_child():
+        r = reason_of(gate.decide(ev(project("a.mpt"))))
+    assert r == MPP_HEAD.format(name="a.mpt") + mpp_offer(missing), r
+    assert "mpp" in reader.BUILT and "mpt" in reader.BUILT
+
+
+def test_mpp_too_large_before_engine():
+    # the size check comes first: an oversized Project file is denied as too large, offer or not
+    with mpp_env(tmp() / "no-mpp-venv"), no_child():
+        p = project()
+        real = gate.limits.MAX_INPUT
+        gate.limits.MAX_INPUT = 10
+        try:
+            r = reason_of(gate.decide(ev(p)))
+        finally:
+            gate.limits.MAX_INPUT = real
+    assert r == "a.mpp: the file is over 512 MiB.", r
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

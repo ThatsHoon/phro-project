@@ -83,12 +83,27 @@ def test_convert_writes_out_meta():
         assert meta["version"] == reader.VERSION and meta["hidden"] == 0
 
 
-def test_unsupported_ext():
+@contextmanager
+def unbuilt(ext="mpp"):
+    """ext out of reader.BUILT for a block, restored after: every in-scope extension is built, so the path of one
+    that is not stays covered this way."""
+    had = ext in reader.BUILT
+    reader.BUILT.discard(ext)
     try:
-        reader.parse(Path("x.mpp"), Context())
-    except ReadError as e:
-        assert e.kind == "unsupported"
-        return
+        yield
+    finally:
+        if had:
+            reader.BUILT.add(ext)
+
+
+def test_unsupported_ext():
+    assert set(reader.FORMATS) <= reader.BUILT, sorted(set(reader.FORMATS) - reader.BUILT)  # phase 4: all built
+    with unbuilt():
+        try:
+            reader.parse(Path("x.mpp"), Context())
+        except ReadError as e:
+            assert e.kind == "unsupported"
+            return
     raise AssertionError("ReadError not raised")
 
 
@@ -241,22 +256,28 @@ def test_prune():
         assert cache.prune(30) == 0
 
 
-def run_cli(*args, env_extra=None):
+def run_cli(*args, env_extra=None, prefix=None):
     env = dict(os.environ)
     env["PHRO_READER_CACHE"] = str(tmp())
     env["PYTHONUTF8"] = "1"
     env["PHRO_READER_PYENV"] = "off"  # a pdf convert must not re-run in the user's own pdf venv
-    r = subprocess.run([sys.executable, "-I", "-X", "utf8", str(READ), *args],
+    env["PHRO_READER_MPPENV"] = "off"  # nor an mpp convert in the user's own mpp venv
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", *(prefix or [str(READ)]), *args],
                        capture_output=True, text=True, encoding="utf-8", env=env)
     return r
+
+
+# read.py's CLI with mpp out of reader.BUILT (see unbuilt)
+UNBUILT_CLI = ["-c", "import sys; sys.path.insert(0, sys.argv[1]); import reader; reader.BUILT.discard('mpp'); "
+               "import read; sys.exit(read.main(sys.argv[2:]))", str(HERE / "scripts")]
 
 
 def test_cli_convert_and_fail():
     f = tmp() / "x.mpp"
     f.write_bytes(b"x")
-    r = run_cli("convert", str(f))
+    r = run_cli("convert", str(f), prefix=UNBUILT_CLI)
     assert r.returncode == 1
-    assert r.stdout.startswith("FAIL\tunsupported\t"), r.stdout
+    assert r.stdout == "FAIL\tunsupported\tmpp\n", r.stdout
 
 
 def test_cli_formats():
@@ -453,11 +474,12 @@ def test_cli_pdfium_without_module():
 
 
 def test_precheck():
-    try:
-        reader.precheck(Path("x.mpp"))
-    except ReadError as e:
-        assert e.kind == "unsupported"
-        return
+    with unbuilt():
+        try:
+            reader.precheck(Path("x.mpp"))
+        except ReadError as e:
+            assert e.kind == "unsupported"
+            return
     raise AssertionError("ReadError not raised")
 
 

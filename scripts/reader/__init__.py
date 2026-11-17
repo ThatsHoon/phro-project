@@ -31,7 +31,7 @@ FORMATS = {
 BUILT = {"hwpx", "hwp", "doc", "xls", "odt", "ods", "odp", "docm", "pptm", "ppsx", "vsdx", "epub", "xps", "oxps", "xlsb", "ppt", "rtf",
          "docx", "dotx", "dotm", "pptx", "potx", "potm", "ppsm", "xlsx", "xlsm", "xltx", "xltm", "pdf",
          "wpd", "wp", "wp5", "wp6", "wp7", "wpt", "mobi", "azw3", "pages", "numbers", "key",
-         "djvu", "djv", "mdb", "accdb", "mde", "accde", "accdr", "pub", "vsd", "vst", "vsdm", "vstx"}
+         "djvu", "djv", "mdb", "accdb", "mde", "accde", "accdr", "pub", "vsd", "vst", "vsdm", "vstx", "mpp", "mpt"}
 
 
 def ext_of(path) -> str:

@@ -78,18 +78,6 @@ class env_var:
                 os.environ[k] = v
 
 
-class built:
-    """mpp in reader.BUILT for a block (F13: it joins BUILT in Task 23), restored after."""
-
-    def __enter__(self):
-        self.had = "mpp" in reader.BUILT
-        reader.BUILT.add("mpp")
-
-    def __exit__(self, *exc):
-        if not self.had:
-            reader.BUILT.discard("mpp")
-
-
 # ---- mpp.parse without the engine, and routing (N20)
 
 def test_no_engine_unsupported():
@@ -216,10 +204,16 @@ def test_import_light():
 # ---- read.py
 
 def test_cli_without_venv():
-    with tempfile.TemporaryDirectory() as d, built(), env_var(PHRO_READER_MPPENV=Path(d) / "missing"):
+    assert {"mpp", "mpt"} <= reader.BUILT
+    with tempfile.TemporaryDirectory() as d, env_var(PHRO_READER_MPPENV=Path(d) / "missing"):
         p = project_file(d, name="x.mpp")
         code, out = cli("convert", str(p), "--out", str(Path(d) / "out"))
         assert code == 1 and out.strip() == f"FAIL\tunsupported\t{UNSUPPORTED}", (code, out)
+        # the same through read.py in its own process, as the gate's child runs it
+        r = subprocess.run([sys.executable, "-I", "-X", "utf8", str(READ_PY), "convert", str(p), "--out",
+                            str(Path(d) / "out2")], capture_output=True, text=True, encoding="utf-8", timeout=60,
+                           env=dict(os.environ, PHRO_READER_CACHE=str(Path(d) / "cache")))
+        assert r.returncode == 1 and r.stdout == f"FAIL\tunsupported\t{UNSUPPORTED}\n", (r.stdout, r.stderr)
         # --engine mpxj outside the venv: MPXJ does not import here, so the engine is not used
         calls, real = [], mpp_mpxj.read
         mpp_mpxj.read = lambda path, ctx: calls.append(path)
@@ -260,7 +254,7 @@ def test_cli_engine_mpxj_passes_engine():
     read._engine_id = lambda wanted: "mpxj-16.10.0-java21" if wanted == "mpxj" else "native"
     mpp_mpxj.read = fake_read
     try:
-        with tempfile.TemporaryDirectory() as d, built(), env_var(PHRO_READER_MPPENV=Path(d) / "missing"):
+        with tempfile.TemporaryDirectory() as d, env_var(PHRO_READER_MPPENV=Path(d) / "missing"):
             p = project_file(d, name="x.mpp")
             code, out = cli("convert", str(p), "--engine", "mpxj", "--out", str(Path(d) / "out"))
             assert code == 0 and got == {"read": "x.mpp"}, (code, out)
@@ -278,7 +272,7 @@ def test_cli_reexec_ready():
         calls.append(list(cmd))
         return types.SimpleNamespace(returncode=0, stdout=b"relayed\n", stderr=b"")
 
-    with tp.env() as d, tp.which_java(tp.JAVA_EXE), built():
+    with tp.env() as d, tp.which_java(tp.JAVA_EXE):
         v = tp.mpp_ready(d)
         os.environ["PHRO_READER_MPPENV"] = str(v)
         assert pyenv.state(v, "mpp") == "READY"

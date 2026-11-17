@@ -45,6 +45,15 @@ DENY_KINDS = ("encrypted", "drm", "too_large")  # a pdf failing any other way go
 FAILED_SECONDS = 86_400  # a failed pdf passes through at once for a day
 SUGGEST_PAGES = 20  # Claude's own Read takes at most 20 pdf pages a request
 
+# mpp and mpt: read only through MPXJ in the mpp venv; until it is ready every Read is denied with one of these
+MPP_DENY = "{name}: Microsoft Project files are read only through MPXJ, which is not installed."
+MPP_OFFER = (' MPXJ 16.10.0 with JPype 1.7.1 (PyPI, about 32 MB, LGPL-2.1 and Apache-2.0) reads it using the Java on'
+             ' this machine. Ask the user whether to install it, and only on their yes run: python -I -X utf8'
+             ' "{read_py}" setup --for mpp --venv "{dir}" (or the same with --decline if they never want it).')
+MPP_NO_JAVA = " It also needs Java {floor} or later on PATH, which phro-project does not install."
+MPP_DECLINED = ' (Declined; python -I -X utf8 "{read_py}" setup --for mpp installs it.)'
+MPP_UNSUPPORTED = "Microsoft Project files are read only through MPXJ"  # formats.mpp.UNSUPPORTED: the child had no engine
+
 
 def off_exts():
     """The extensions PHRO_READER_OFF hands back to Read: comma-separated, stripped, case-folded, one dot dropped."""
@@ -395,6 +404,8 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
         return _deny(path, "too_large", limits.BIG_INPUT)
     if reader.ext_of(path) == "pdf":
         return _pdf(event, path, start, timeout, command)
+    if reader.ext_of(path) in ("mpp", "mpt"):
+        return _mpp(event, path, start, timeout, command)
     from reader import cache
     k = cache.key(path)
     entry = cache.lookup(k)
@@ -403,6 +414,62 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
         cmd = command or [sys.executable, "-I", "-X", "utf8", str(READ_PY), "convert", str(path)]
         entry, kind, detail = _child(cmd, start, timeout)
         if entry is None:
+            return _deny(path, kind, detail)
+    out_md = entry / "out.md"
+    if not out_md.is_file():
+        return _deny(path, "damaged", "cache entry vanished")
+    return _allow(event, path, out_md, _context(_name(path), _meta(entry), out_md))
+
+
+def mpp_reason(path):
+    """The mpp deny: MPP_DENY, then the decline note, the Java note (no java on PATH, found the way setup and the
+    venv's own check find it) or the install offer. Over CONTEXT_MAX the name is cut with "…", never a command."""
+    from reader import pyenv
+    if pyenv.declined("mpp"):
+        tail = MPP_DECLINED.format(read_py=READ_PY)
+    elif pyenv.find_java() is None:
+        tail = MPP_NO_JAVA.format(floor=pyenv.JAVA_FLOOR)
+    else:
+        tail = MPP_OFFER.format(read_py=READ_PY, dir=pyenv.venv_dir("mpp"))
+    name = _name(path)
+    room = CONTEXT_MAX - 1 - len(MPP_DENY.format(name="")) - len(tail)
+    if len(name) > room:
+        name = name[:max(0, room - 1)] + "…"
+    return MPP_DENY.format(name=name) + tail
+
+
+def _mpp_deny(path):
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": mpp_reason(path),
+    }}
+
+
+def _mpp(event, path, start, timeout, command):
+    """decide() for mpp and mpt: denied with the MPXJ offer unless the mpp venv is READY; then the engine id in the
+    key and, on a miss, the venv's file check and the venv child (`--engine mpxj`), which hashes the file itself."""
+    from reader import cache, pyenv
+    venv = pyenv.venv_dir("mpp")
+    engine = pyenv.engine(kind="mpp", venv=venv)
+    if not engine:
+        return _mpp_deny(path)
+    entry = cache.lookup(cache.key(path, engine))
+    if entry is None:
+        if not pyenv.verify(venv, "mpp"):  # a venv whose files changed after setup never runs
+            return _mpp_deny(path)
+        if command is not None:
+            cmd = list(command)
+        else:
+            cmd = [str(pyenv.interpreter(venv)), "-I", "-X", "utf8", str(READ_PY), "convert"]
+        cmd += [str(path), "--engine", "mpxj"]
+        try:
+            entry, kind, detail = _child(cmd, start, timeout)
+        except OSError as e:  # the interpreter could not be started
+            entry, kind, detail = None, "damaged", f"internal error {type(e).__name__}"
+        if entry is None:
+            if kind == "unsupported" and detail in ("", MPP_UNSUPPORTED):
+                return _mpp_deny(path)
             return _deny(path, kind, detail)
     out_md = entry / "out.md"
     if not out_md.is_file():
