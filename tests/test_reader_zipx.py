@@ -375,6 +375,57 @@ def test_gunzip():
     assert b.used == 1000
 
 
+def _detail(fn):
+    try:
+        fn()
+    except ReadError as e:
+        assert e.kind == "too_large", e.kind
+        return e.detail
+    raise AssertionError("ReadError not raised")
+
+
+def test_failed_inflate_charged():
+    # an inflate that fails (past its cap or `limit`, or a corrupt stream) charges the bytes it inflated: small bombs
+    # each stopped at the 1 MiB ratio floor spend the document's Budget instead of inflating that much for free
+    import gzip
+    import random
+    import zlib
+    from reader.containers import flate
+    mib, chunk = 2**20, flate._CHUNK
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    bomb = c.compress(bytes(2 * mib)) + c.flush()  # about 2 KiB that would inflate to 2 MiB
+    b = flate.Budget(3 * mib)
+    assert _detail(lambda: flate.inflate(bomb, b)).startswith("part:")
+    assert mib < b.used <= mib + chunk, b.used
+    details = [_detail(lambda: flate.inflate(bomb, b)) for _ in range(3)]
+    assert details[0].startswith("part:") and details[2].startswith("total:"), details
+    # once a failure has passed the total, a later stream fails before it inflates anything
+    spent = b.used
+    assert spent > b.total
+    assert _detail(lambda: flate.inflate(bomb, b)).startswith("total:") and b.used == spent
+    # the caller's limit and gunzip's
+    b = flate.Budget()
+    assert _detail(lambda: flate.inflate(bomb, b, 1000)).startswith("part:") and 1000 < b.used <= chunk, b.used
+    b = flate.Budget()
+    assert _detail(lambda: flate.gunzip(gzip.compress(bytes(100_000)), b, 100)).startswith("part:")
+    assert 100 < b.used <= chunk, b.used
+    # a corrupt stream: the deflate blocks before the bad one are inflated and charged (but the output of the call
+    # that fails, at most one chunk, which zlib drops)
+    text = bytes(random.Random(5).choice(b"abcdefgh ") for _ in range(200_000))
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    bad = c.compress(text) + c.flush(zlib.Z_FULL_FLUSH) + b"\xff" * 16  # block type 3 does not exist
+    b = flate.Budget()
+    try:
+        flate.inflate(bad, b)
+    except ReadError:
+        raise
+    except ValueError as e:
+        assert not isinstance(e, flate.Truncated), e
+    else:
+        raise AssertionError("corrupt")
+    assert len(text) - chunk <= b.used <= len(text), b.used
+
+
 def main():
     if sys.argv[1:] == ["measure"]:
         measure()

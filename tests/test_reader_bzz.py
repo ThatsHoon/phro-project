@@ -1,9 +1,12 @@
 """DjVu's BZZ codec (ZP coder, MTF, inverse BWT): round trips, damaged and cut streams, the output caps, the ZP table.
 
 Run: python -I -X utf8 tests/test_reader_bzz.py
+     python -I -X utf8 tests/test_reader_bzz.py measure synthetic     (BZZ on 4 MiB of words: MiB, s, MiB/s)
+     python -I -X utf8 tests/test_reader_bzz.py measure sample <path>  (djvu.parse_bytes on one file: pages, s, pages/s)
 """
 import random
 import sys
+import time
 import tracemalloc
 from pathlib import Path
 
@@ -162,7 +165,51 @@ def test_zp_table_spot_values():
     assert len(t) == 251 and all(up < 251 and dn < 251 for _, _, up, dn in t)
 
 
+# -- measure: BZZ's speed on synthetic text, and djvu's on one file named at run time (never committed)
+
+def measure_synthetic():
+    """4 MiB of text-like words (random.Random(7)) BZZ-coded in memory, then bzz.decode timed."""
+    data = words(7, 4 * MIB)
+    packed = bzz_encode(data)
+    t0 = time.perf_counter()
+    out = bzz.decode(packed, bzz.BZZ_CHUNK)
+    dt = time.perf_counter() - t0
+    assert out == data
+    mib = len(out) / MIB
+    print(f"BZZ {mib:.2f} {dt:.2f} {mib / dt:.3f}", flush=True)
+
+
+def measure_sample(path):
+    """djvu.parse_bytes timed on one file (run with python -I; the file is only read)."""
+    from reader.formats import djvu
+    from reader.model import Context
+    data = Path(path).read_bytes()
+    counted = []
+    run = djvu._Reader.run
+
+    def counting(self, pages, short=False):  # the page list the reader walks, its length the file's pages
+        counted.append(len(pages))
+        return run(self, pages, short)
+
+    djvu._Reader.run = counting
+    try:
+        ctx = Context()
+        t0 = time.perf_counter()
+        djvu.parse_bytes(data, ctx)
+        dt = time.perf_counter() - t0
+    finally:
+        djvu._Reader.run = run
+    pages = counted[0]
+    print(f"DJVU {pages} {dt:.2f} {pages / dt:.2f}  {dict(ctx.skipped)}", flush=True)
+
+
 def main():
+    if sys.argv[1:] == ["measure", "synthetic"]:
+        measure_synthetic()
+        return
+    if sys.argv[1:3] == ["measure", "sample"] and len(sys.argv) == 4:
+        measure_sample(sys.argv[3])
+        return
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()

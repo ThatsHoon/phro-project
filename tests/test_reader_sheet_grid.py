@@ -386,6 +386,28 @@ def test_text_inlines():
     assert text_inlines("a\nb") == [Text("a"), Break(), Text("b")]
 
 
+def test_blocks_frees_its_intermediates():
+    # blocks() lets go of its per-cell maps as it lays the rows out: while it builds the table, the memory it holds
+    # above the grid is about the output's, not that plus the origin map and the row lists (at SHEET_CELLS these
+    # were 108 MiB of a 364 MiB peak)
+    import gc
+    import tracemalloc
+    g, _ = mk()
+    for r in range(200):
+        for c in range(100):
+            g.put(r, c, f"{r * 100 + c:09d}")
+    gc.collect()
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        out = g.blocks()
+        kept, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(out[0].rows) == 200 and txt(out[0].rows[199][99]) == "000019999"
+    assert peak - base < 1.2 * (kept - base), (peak - base, kept - base)
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

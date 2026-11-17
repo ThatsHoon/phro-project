@@ -210,7 +210,7 @@ def test_flate_limit():
         assert e.kind == "too_large", e.kind
     else:
         raise AssertionError("inflated past the limit")
-    assert budget.used == 0, budget.used
+    assert 1000 < budget.used <= flate._CHUNK, budget.used  # the failure is charged what it inflated (Task 25)
     assert len(flate.inflate(bomb, budget, 500_000)) == 500_000  # exactly the limit is allowed
 
 

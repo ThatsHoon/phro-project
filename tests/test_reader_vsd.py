@@ -739,6 +739,38 @@ def test_group_depth():
     assert ctx.skipped == {"depth": 1}, ctx.skipped
 
 
+def test_group_without_xform():
+    # a group with no XForm adds nothing to its children's pins, and passes on its own parent's offset
+    shapes = [{"id": 1, "type": 0x47, "text": "top", "pin": (0.0, 10.0, 0.0, 0.0)},
+              {"id": 2, "parent": 1, "type": 0x47},
+              {"id": 3, "parent": 2, "text": "deep", "pin": (0.0, -5.0)},
+              {"id": 4, "text": "mid", "pin": (0.0, 6.0)},
+              {"id": 5, "text": "low", "pin": (0.0, 4.0)},
+              {"id": 6, "parent": 7, "type": 0x47},
+              {"id": 7, "parent": 6, "text": "loop", "pin": (0.0, 1.0)}]
+    doc, ctx = read(drawing([{"shapes": shapes}]))
+    assert lines(doc.blocks[0]) == ["top", "mid", "deep", "low", "loop"], lines(doc.blocks[0])
+    assert not ctx.skipped
+
+
+def test_parented_ids_compact():
+    # a parented shape with no XForm keeps only its parent for the group walk, not a tuple of four empty pins: Task
+    # 16's probe of 1.9M such shapes (27 MiB coded) peaked at 404 MiB, 225 MiB of it these entries
+    n = 30_000
+
+    def peak(parent):
+        data = drawing([{"shapes": [{"id": k, "parent": parent} for k in range(2, n + 2)]}])
+        tracemalloc.start()
+        try:
+            _read_doc(data)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    extra = peak(1) - peak(0)  # parent 0 keeps no entry
+    assert extra < 115 * n, extra / n  # about 146 bytes a shape with the tuple, 89 without
+
+
 def test_fields():
     # a string field shows the shape's 0x2D name it points at; a number field its formatted value; the field list
     # (0x66) gives their order; a mark with no field left shows nothing
@@ -1352,6 +1384,34 @@ def test_master_first_shape_and_xform():
     shapes = [{"text": "own", "pin": (0.0, 3.0)}, {"master": (0, 5)}, {"master": (0, NONE), "pin": (0.0, 1.0)}]
     doc, ctx = read(drawing([{"shapes": shapes}], stencils=stencils))
     assert lines(doc.blocks[0]) == ["first", "own", "first"] and not ctx.skipped, lines(doc.blocks[0])
+
+
+def test_blank_stencil_shape_replaces():
+    # a blank stencil shape gives its inheritors nothing, also when an earlier shape of its id had text (the last of
+    # an id wins) and when it is the page's first shape (master shape 0xFFFFFFFF); nothing is counted
+    stencils = [[{"id": 5}, {"id": 2, "text": "Old"}, {"id": 2}, {"id": 6, "text": "second"}]]
+    shapes = [{"master": (0, 2), "pin": (0.0, 3.0)}, {"master": (0, NONE), "pin": (0.0, 2.0)},
+              {"master": (0, 6), "pin": (0.0, 1.0)}]
+    doc, ctx = read(drawing([{"shapes": shapes}], stencils=stencils))
+    assert lines(doc.blocks[0]) == ["second"] and not ctx.skipped, (lines(doc.blocks[0]), ctx.skipped)
+
+
+def test_blank_stencil_ids_cost_no_entry():
+    # blank stencil shapes of distinct ids keep no entry each (a missing id reads as blank): Task 16's probe of 1.9M
+    # of them (27 MiB coded) held an 80 MiB dict and 51 MiB of id ints at its 279 MiB peak
+    n = 20_000
+
+    def peak(ids):
+        data = drawing([{"shapes": [{"text": "p"}]}], stencils=[[{"id": k} for k in ids]])
+        tracemalloc.start()
+        try:
+            _read_doc(data)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    extra = peak(range(2, n + 2)) - peak([2] * n)  # one id n times keeps one entry
+    assert extra < 30 * n, extra / n
 
 
 def test_run_and_cut_fidelity():

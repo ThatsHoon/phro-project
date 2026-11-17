@@ -26,6 +26,12 @@ in a pass (an overflow target, an LVAL row, a usage map) decode it once. The pag
 it keeps) stops at that: past it `page` raises `too_large` ("part: RC4 pages"), as `crypto.rc4` does past
 DECRYPT_BYTES for one stream.
 
+Speed (measured 2026-11-17, CPython 3.12, `tests/test_reader_jet.py measure`): a 32 MiB Jet4 file with a db_key,
+one table of 154,433 rows of 200-character notes, reads in 3.1-3.2 s, 1.7 s of it RC4 (each of the 4,081 pages
+reached decoded once, so the page cache is not what binds). The meter, not the time, ends it: RC4 charges a unit a
+byte, so the walk stops at the total after 77,435 rows (counted `sheet_cut`), where the same file without the key
+stops at SHEET_ROWS (100,000) in 1.4 s.
+
 Bounds. `page(n)` raises ValueError outside `0 <= n < pages`. A usage map drops every page id outside
 `1 <= id < pages`, reads each type 5 page once and stops at the pointer whose range starts past the file, so its
 work is bounded by the page count. `chain` keeps a seen-set and yields at most `pages` items; a repeat, an id out

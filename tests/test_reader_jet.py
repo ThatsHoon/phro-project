@@ -2,6 +2,7 @@
 and the reader in jet (encryption, catalog, TDEFs, rows, scalar values, output).
 
 Run: python -I -X utf8 tests/test_reader_jet.py
+     python -I -X utf8 tests/test_reader_jet.py measure   (a 32 MiB Jet4 file with a db_key, in memory: MiB, s)
 """
 import datetime
 import random
@@ -9,6 +10,7 @@ import tracemalloc
 import struct
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -2995,7 +2997,49 @@ def test_query_mutations_end():
         w.bounded(len(data))
 
 
+# -- measure: an encoded Jet4 file of 32 MiB, read in memory
+
+def _words_table(rows):
+    rng = random.Random(25)
+    vocab = ["".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(2, 9))) for _ in range(500)]
+    text = [" ".join(rng.choice(vocab) for _ in range(30))[:200] for _ in range(1_000)]
+    return Tbl("Notes", [Col("ID", LONG), Col("Note", TEXT, length=510)], [[k, text[k % 1_000]] for k in range(rows)])
+
+
+def measure(mib=32):
+    """A Jet4 file of about `mib` MiB with a db_key (every page RC4-coded), one table of 200-character notes built in
+    memory, then jet.parse_bytes timed. Also printed: the pages RC4 decoded (each decode counted), the rows shown and
+    the meter's units spent."""
+    size = lambda rows: len(jet_db(1, [_words_table(rows)], db_key=0x5A5A1234))  # noqa: E731
+    base, step = size(0), size(2_000)
+    rows = max(0, int((mib * 2**20 - base) * 2_000 / (step - base)))
+    data = jet_db(1, [_words_table(rows)], db_key=0x5A5A1234)
+    opened, real = [], jet_pages.open
+
+    def keep(raw):
+        opened.append(real(raw))
+        return opened[-1]
+
+    jet_pages.open = keep
+    try:
+        ctx = Context()
+        t0 = time.perf_counter()
+        doc = jet.parse_bytes(data, ctx)
+        dt = time.perf_counter() - t0
+    finally:
+        jet_pages.open = real
+    j = opened[0]
+    decoded = (max(limits.DECRYPT_BYTES, 2 * len(data)) - j._rc4_left) // j.page_size
+    shown = sum(len(t.rows) - 1 for b in doc.blocks if isinstance(b, Section) for t in b.blocks  # less the head
+                if isinstance(t, Table))
+    print(f"JET {len(data) / 2**20:.2f} {dt:.2f}  pages {j.pages:,} decoded {decoded:,} rows {rows:,} shown "
+          f"{shown:,} meter {j.meter.spent:,}/{j.meter.total:,}  {dict(ctx.skipped)}", flush=True)
+
+
 def main():
+    if sys.argv[1:] == ["measure"]:
+        measure()
+        return
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn()

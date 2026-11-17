@@ -331,6 +331,7 @@ class Grid:
         by_row = {}
         for (r, c), v in origins.items():
             by_row.setdefault(r, []).append((c, v))
+        del origins  # the row lists hold every origin now, and each is let go once its row is laid out
         empty = Cell([])
         out, slots = [], 0
         spans = _Spans(c1 - c0 + 1)  # the row spans of earlier rows that are still open
@@ -340,7 +341,7 @@ class Grid:
                 out.append([])
             spans.expire(nr)
             row, at, opened = [], 0, []
-            for c, (text, r2, c2) in sorted(by_row.get(r, ())):
+            for c, (text, r2, c2) in sorted(by_row.pop(r, ())):
                 nc = c - c0
                 row.extend([empty] * spans.uncovered(at, nc))
                 rs, cs = new[r2] - nr + 1, c2 - c + 1

@@ -16,6 +16,11 @@ class Budget:
 
 
 def _run(data: bytes, wbits: int, budget: Budget, limit: int | None = None) -> bytes:
+    """Inflate within the cap and what is left of `budget`; the caller charges a whole result. A failure (too_large
+    or zlib.error) charges the bytes inflated before it here, so streams that fail still spend the document's budget:
+    the inflate work of a document is at most its total plus one _CHUNK a call, and none once a failure passed it."""
+    if budget.used > budget.total:  # only a charged failure gets here
+        raise ReadError("too_large", f"{limits.BIG_TOTAL}: inflated bytes of the document")
     cap = min(limits.CFB_STREAM, max(limits.ZIP_RATIO * len(data), limits.ZIP_RATIO_FLOOR))
     if limit is not None:
         cap = min(cap, limit)
@@ -24,22 +29,26 @@ def _run(data: bytes, wbits: int, budget: Budget, limit: int | None = None) -> b
     size = 0
     view = memoryview(data)
     pos = 0
-    while pos < len(view) and not d.eof:
-        # feed the input in slices: unconsumed_tail is a copy, so a whole-input feed would cost O(n^2)
-        buf = bytes(view[pos:pos + _CHUNK])
-        pos += _CHUNK
-        while True:
-            chunk = d.decompress(buf, _CHUNK)
-            size += len(chunk)
-            if size > cap:
-                raise ReadError("too_large", f"{limits.BIG_PART}: inflated stream over {cap} bytes")
-            if budget.used + size > budget.total:
-                raise ReadError("too_large", f"{limits.BIG_TOTAL}: inflated bytes of the document")
-            if chunk:
-                out.append(chunk)
-            buf = d.unconsumed_tail
-            if d.eof or (not buf and len(chunk) < _CHUNK):
-                break
+    try:
+        while pos < len(view) and not d.eof:
+            # feed the input in slices: unconsumed_tail is a copy, so a whole-input feed would cost O(n^2)
+            buf = bytes(view[pos:pos + _CHUNK])
+            pos += _CHUNK
+            while True:
+                chunk = d.decompress(buf, _CHUNK)
+                size += len(chunk)
+                if size > cap:
+                    raise ReadError("too_large", f"{limits.BIG_PART}: inflated stream over {cap} bytes")
+                if budget.used + size > budget.total:
+                    raise ReadError("too_large", f"{limits.BIG_TOTAL}: inflated bytes of the document")
+                if chunk:
+                    out.append(chunk)
+                buf = d.unconsumed_tail
+                if d.eof or (not buf and len(chunk) < _CHUNK):
+                    break
+    except (ReadError, zlib.error):
+        budget.used += size
+        raise
     return b"".join(out), d.eof
 
 

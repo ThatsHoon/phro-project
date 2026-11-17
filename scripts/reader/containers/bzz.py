@@ -9,6 +9,12 @@ A stream is a run of blocks, each a 24-bit size (0 ends the stream), two FSHIFT 
 read through 262 ZP contexts that are never reset between blocks; position 256 is the BWT end-of-block marker. Added
 to djvu-bzz: the 16-byte read past the end is checked at every refill (djvu-bzz looks every 4,096 symbols), a block
 is checked against the caller's `limit` and the ZIP_RATIO rule before it is decoded, and MARKERPOS is range checked.
+
+Speed (measured 2026-11-17, CPython 3.12, `tests/test_reader_bzz.py measure`): 4 MiB of text-like words decode in
+4.5-4.6 s, about 0.87-0.89 MiB/s (`measure synthetic`); the public 12-page sample public-djvu-427847fcd2 (87 KB of
+BZZ output, about 7 KB a page) is read whole at 135-153 pages/s (`measure sample`). A 500-page book of such pages
+takes about 3.5 s, inside DJVU_DEADLINE (36 s); at these rates the deadline binds only near 5,000 such pages, or
+past about 31 MiB of decoded text layer.
 """
 from array import array
 from collections import Counter

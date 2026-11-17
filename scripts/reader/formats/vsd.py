@@ -298,7 +298,7 @@ class _Entry:
         return self._inlines
 
 
-_EMPTY = _Entry("", False, False)  # the master page has no such shape; also every blank, shown, unplaced stencil shape
+_EMPTY = _Entry("", False, False)  # the master page has no such shape, or a blank, shown, unplaced one (kept as none)
 _LOST = _Entry("", False, False)   # the stencil room was spent on it, or it inherits from a lost one
 
 
@@ -307,7 +307,7 @@ class _Stencil:
 
     def __init__(self, ptr, idx):
         self.ptr, self.idx = ptr, idx
-        self.shapes = {}      # shape id -> _Entry
+        self.shapes = {}      # shape id -> _Entry or _LOST; a blank shape keeps no entry (it reads as _EMPTY)
         self.first = NONE
 
 
@@ -317,7 +317,8 @@ class _Page:
     def __init__(self, ptr):
         self.ptr, self.title = ptr, ""
         self.entries = []     # (parent, PinX, PinY, blocks) of the shapes that show something, in walk order
-        self.ids = {}         # shape id -> (parent, PinX, PinY, LocPinX, LocPinY), the first shape of an id
+        self.ids = {}         # shape id -> (parent, PinX, PinY, LocPinX, LocPinY), the first shape of an id; the
+        #                       parent alone (an int) for a shape with no XForm, which offsets nothing
         self.names = {}       # shape id -> its shown text (the first shape of an id with some)
         self.edges = []       # (begin id, end id, label) of the connectors glued at both ends
 
@@ -593,13 +594,18 @@ class _Reader:
                 return None
             path.append(cur)
             seen.add(cur)
-            cur = rec[0]
+            cur = rec if type(rec) is int else rec[0]
         for node in reversed(path):
             if base is not None:
-                _, x, y, lx, ly = ids[node]
+                rec = ids[node]
                 d = base[2] + 1
-                base = None if d > limits.MAX_DEPTH else (
-                    base[0] + (x or 0.0) - (lx or 0.0), base[1] + (y or 0.0) - (ly or 0.0), d)
+                if d > limits.MAX_DEPTH:
+                    base = None
+                elif type(rec) is int:
+                    base = (base[0], base[1], d)
+                else:
+                    _, x, y, lx, ly = rec
+                    base = (base[0] + (x or 0.0) - (lx or 0.0), base[1] + (y or 0.0) - (ly or 0.0), d)
             memo[node] = base
         return base
 
@@ -672,7 +678,7 @@ class _Reader:
         if cost > self.stencil_room:
             spage.shapes[s.sid] = _LOST
         elif not (text or cut or hide or pin):
-            spage.shapes[s.sid] = _EMPTY  # shared: a blank stencil shape costs no entry of its own
+            spage.shapes.pop(s.sid, None)  # blank: no entry, as a missing id reads _EMPTY (an earlier one dropped)
         else:
             self.stencil_room -= cost
             spage.shapes[s.sid] = _Entry(text, cut, hide, pin)
@@ -720,7 +726,7 @@ class _Reader:
             s.pin = entry.pin
         pin = s.pin or (None, None, None, None)
         if s.sid not in page.ids and (s.pin is not None or s.parent not in (0, NONE)):
-            page.ids[s.sid] = (s.parent, *pin)
+            page.ids[s.sid] = s.parent if s.pin is None else (s.parent, *pin)  # the parent alone: no 5-tuple of Nones
         if blocks:
             page.entries.append((s.parent, pin[0], pin[1], blocks))
 
