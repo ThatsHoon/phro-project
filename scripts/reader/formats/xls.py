@@ -10,12 +10,16 @@ when its default password verifies, else it is `encrypted`. A compound file with
 `sheet` and the others still come out. Charts (a chart sheet, or a substream nested in a worksheet) are read by
 `biff_chart` after every worksheet, so a reference to a later sheet resolves; each table goes back into its sheet's
 section after its pictures, charged against `CHART_TOTAL` like the other formats' charts. A sheet's pictures
-(`xls_drawing`) follow its table, charged against `IMAGE_BYTES` and the workbook's placement cap.
+(`xls_drawing`) follow its table, charged against `IMAGE_BYTES` and the workbook's placement cap. Between them come its
+text boxes: a TXO's text (cchText u16 at 10) is in the CONTINUEs after it, each starting with a flag byte (0 8-bit,
+1 UTF-16), but the last when there are two or more, which holds the formatting runs. It is charged against the sheet
+characters like a cell, and `xls_drawing.shapes` makes it a diagram node, a connector label or a paragraph; the sheet
+is one diagram scope, the workbook one connection budget. An embedded workbook reads no drawing and no TXO.
 """
 import copy
 import struct
 
-from .. import limits
+from .. import diagram, limits
 from ..containers.cfb import CfbError, Compound
 from ..containers import flate
 from ..containers.zipx import Package
@@ -28,6 +32,7 @@ _ROW, _COLINFO, _MERGED = 0x0208, 0x007D, 0x00E5
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
 _FORMULA, _STRING = 0x0006, 0x0207
 _MSODRAWING = 0x00EC  # a sheet's drawing records, joined and read by xls_drawing
+_TXO = 0x01B6        # a text box's text, in the CONTINUEs after it
 _AFTER_FORMULA = frozenset({0x04BC, 0x0221, 0x0236})  # SHRFMLA, ARRAY, TABLE: may sit between FORMULA and STRING
 _CELLS = frozenset({_LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR, _FORMULA})
 _ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!", 0x2A: "#N/A"}
@@ -61,6 +66,7 @@ class Workbook:
         self.spent = [0, 0]  # image bytes placed, picture placements read
         self.blips: dict[int, bytes | None] = {}  # BStore entries read (pib -> image), shared by every sheet
         self._starts: dict[int, list] = {}  # sheet index -> offsets of the chart substreams nested in it
+        self.connections = diagram.ConnectionBudget(ctx)  # the workbook's edges, every sheet's diagram together
 
     # ---- sheets
     def sections(self) -> list:
@@ -130,18 +136,37 @@ class Workbook:
         self.cells[i] = grid.cells
         draw: list = []
         starts: list = []
+        texts: list = []
         try:
-            self._walk(ref.offset, grid, draw, starts)
+            self._walk(ref.offset, grid, draw, starts, texts)
         except Exception:
             del self.cells[i]  # a sheet that fails leaves no half-read cells for a chart to use
             raise
         self._starts[i] = starts
         blocks = grid.blocks()
-        if draw and self.pictures:  # an embedded workbook drops its pictures, so they are not decoded
+        if (draw or texts) and self.pictures:  # an embedded workbook drops its drawing, so nothing is decoded
+            blocks = self._drawn(blocks, b"".join(draw), texts)
+        if draw and self.pictures:
             blocks = blocks + xls_drawing.pictures(self.g, b"".join(draw), self.flate, self.spent, self.ctx,
                                                        self.blips)
         self._blocks[i] = blocks
         return blocks
+
+    def _drawn(self, table: list, drawing: bytes, texts: list) -> list:
+        """The sheet's `table` blocks, then its shapes and TXO `texts` as one diagram scope (`xls_drawing.shapes`).
+        The shapes are read and place() runs under guard("shape"); a failure there falls back to the texts as
+        paragraphs in TXO order, or to the slots' blocks."""
+        dia = diagram.Diagram(self.ctx, self.connections)
+        slots = None
+        with self.ctx.guard("shape"):
+            slots = xls_drawing.shapes(drawing, texts, dia, self.ctx)
+        if slots is None:
+            return table + [b for t in texts for b in xls_drawing.paragraph(t)]
+        slots = [(None, table)] + slots
+        out = [b for _, blocks in slots for b in blocks]
+        with self.ctx.guard("shape"):
+            out = dia.place(slots)
+        return out
 
     def _code(self, ixfe: int) -> str:
         code = self._fmt.get(ixfe)
@@ -155,10 +180,11 @@ class Workbook:
             return value
         return display(value, code, self.g.date1904)
 
-    def _walk(self, offset: int, grid: sheet_grid.Grid, draw: list, starts: list) -> None:
+    def _walk(self, offset: int, grid: sheet_grid.Grid, draw: list, starts: list, texts: list) -> None:
         """Walk sheet substream `offset` into `grid`; the sheet's MSODRAWING bodies, CONTINUEs joined, go into `draw`
-        (a TXO or OBJ is another record, and a TXO's CONTINUEs belong to it); the offset of each chart substream nested
-        in it goes into `starts`."""
+        (a TXO or OBJ is another record, and a TXO's CONTINUEs belong to it); each TXO's text goes into `texts`
+        (`_txo`; none for an embedded workbook); the offset of each chart substream nested in it goes into
+        `starts`."""
         data = self.data
         if not 0 <= offset < len(data):
             raise ReadError("damaged", "sheet offset outside the stream")
@@ -207,6 +233,9 @@ class Workbook:
             elif rid == _MSODRAWING:
                 draw.append(data[off:off + size])
                 draw.extend(data[o:o + n] for o, n in rec.conts)
+            elif rid == _TXO:
+                if self.pictures:
+                    texts.append(self._txo(rec, grid))
             elif rid == _ROW:
                 if size >= 14 and struct.unpack_from("<H", data, off + 12)[0] & 0x20:
                     grid.hide_row(struct.unpack_from("<H", data, off)[0])
@@ -220,6 +249,29 @@ class Workbook:
                     grid.merge(r1, r2, c1, c2)
         if depth == 0:  # no record at all, or a stream cut before any BOF
             raise ReadError("damaged", "sheet does not start with a BOF")
+
+    def _txo(self, rec, grid: sheet_grid.Grid) -> str:
+        """The text of a TXO record, charged against the sheet characters (past them the sheet is cut, as by a cell).
+        "" for a TXO under 12 bytes, one with no text, a cut sheet, and text its CONTINUEs do not hold (counted under
+        record): cchText past them, an odd UTF-16 length, no CONTINUE."""
+        if grid.cut or rec.size < 12:
+            return ""
+        n = struct.unpack_from("<H", self.data, rec.off + 10)[0]
+        if not n:
+            return ""
+        segs = rec.conts[:-1] if len(rec.conts) > 1 else rec.conts  # the last CONTINUE holds the formatting runs
+        try:
+            cur = biff.Cursor(self.data, segs)
+            text = cur.chars(n, bool(cur.u8() & 1))
+        except ValueError:
+            self.ctx.skipped["record"] += 1
+            return ""
+        budget = grid.budget
+        if len(text) > budget.chars:
+            grid.stop("characters", budget.cap_chars)
+            return ""
+        budget.chars -= len(text)
+        return text
 
     def _cell(self, rec, grid: sheet_grid.Grid):
         """Put one cell record's displayed value. A FORMULA with a string result returns (row, col, ixfe) to wait for

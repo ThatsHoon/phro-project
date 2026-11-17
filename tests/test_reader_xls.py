@@ -16,9 +16,10 @@ import reader  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.formats import biff, sheet_grid, xls, xls_drawing  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
+from reader.model import Context, Para, Text  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 from reader_fix import (biff as rec, biff_chart, biff_workbook, blip_metafile, blip_png, make_cfb, make_xls,  # noqa: E402
-                        oa_container, oa_fbse, oa_group, oa_shape)
+                        oa_container, oa_fbse, oa_group, oa_record, oa_shape, oa_solver, xls_txo)
 
 
 def run(sheets, hidden=False, **kw):
@@ -518,6 +519,157 @@ def test_short_anchor_is_unanchored():
     text, _, assets = pics([sheet], drawing=dgg(PNG_A, PNG_B))
     assert [assets[f"img-00{i}.png"] for i in (1, 2)] == [PNG_B, PNG_A], assets
     assert "could not read" not in text, text
+
+
+# ---- text boxes (TXO) and connectors
+
+def cells(c1, r1, c2, r2, dx1=0, dy1=0, dx2=0, dy2=0):
+    """An OfficeArtClientAnchorSheet from cell (c1, r1) + (dx1/1024, dy1/256) to cell (c2, r2) + (dx2, dy2)."""
+    return struct.pack("<9H", 0, c1, dx1, r1, dy1, c2, dx2, r2, dy2)
+
+
+def tbox(spid, at=None, *, inst=202, flags=0xA00, props=b"", textbox=True):
+    """An SpContainer: FSP (type `inst`), an FOPT of `props` when given, a ClientAnchor `at`, and a ClientTextbox
+    (0xF00D) when `textbox`, so the next TXO of the sheet is its text."""
+    out = oa_record(0xF00A, struct.pack("<II", spid, flags), ver=2, inst=inst)
+    if props:
+        out += oa_record(0xF00B, props, ver=3, inst=len(props) // 6)
+    if at is not None:
+        out += oa_record(0xF010, at)
+    if textbox:
+        out += oa_record(0xF00D, bytes(4))
+    return oa_container(0xF004, out)
+
+
+END_ARROW = struct.pack("<HI", 0x01D1, 1)
+
+
+def drawn(shapes, texts, rules=(), **sheet):
+    """A sheet whose drawing (one MSODRAWING) holds `shapes` and a SolverContainer of `rules`, then a TXO with its
+    CONTINUEs for each of `texts` (a str, or the records already built)."""
+    extra = [oa_solver(*rules)] if rules else []
+    body = oa_container(0xF002, oa_group(1024, *shapes), *extra)
+    records = [rec(0x00EC, body)] + [xls_txo(t) if isinstance(t, str) else t for t in texts]
+    return {"name": "S", "cells": {(0, 0): "cell"}, "records": records, **sheet}
+
+
+def flow(md):
+    """The Mermaid block's text in out.md (the first one), or None."""
+    if "```mermaid\n" not in md:
+        return None
+    return md.split("```mermaid\n", 1)[1].split("\n```", 1)[0]
+
+
+def test_xls_textbox_text():
+    md, _ = run([drawn([tbox(1025, cells(1, 3, 3, 5))], ["note"])])
+    assert "note" in md and md.index("cell") < md.index("note"), md
+    assert "could not read" not in md and flow(md) is None, md
+
+
+def test_xls_connector():
+    shapes = [tbox(1025, cells(0, 0, 2, 1)), tbox(1026, cells(0, 4, 2, 5)),
+              tbox(1027, cells(1, 1, 1, 4), inst=32, flags=0xB00, props=END_ARROW)]
+    md, meta = run([drawn(shapes, ["Start", "End", "go"], rules=[(1025, 1026, 1027)])])
+    t = flow(md)
+    assert t is not None and mermaid_ok(t), md
+    assert t == 'flowchart TD\n  n1["Start"]\n  n2["End"]\n  n1 -->|"go"| n2', t
+    assert md.index("cell") < md.index("```mermaid"), md
+    assert md.count("go") == 1 and "could not read" not in md, md
+
+
+def test_txo_node_not_repeated():
+    shapes = [tbox(1025, cells(0, 0, 2, 1)), tbox(1026, cells(0, 4, 2, 5)),
+              tbox(1027, cells(1, 1, 1, 4), inst=32, textbox=False), tbox(1028, cells(0, 9, 2, 10))]
+    md, _ = run([drawn(shapes, ["Start", "End", "aside"], rules=[(1025, 1026, 1027)])])
+    t = flow(md)
+    assert t is not None and mermaid_ok(t), md
+    assert md.count("Start") == 1 and md.count("End") == 1, md
+    assert '"aside"' not in t and md.index("```mermaid") < md.index("aside"), md
+
+
+def test_txo_utf16_and_8bit():
+    shapes = [tbox(1025, cells(0, 2, 1, 3)), tbox(1026, cells(0, 5, 1, 6)), tbox(1027, cells(0, 7, 1, 8))]
+    md, _ = run([drawn(shapes, ["가나다", "caf\xe9", xls_txo("wide latin", wide=True)])])
+    assert md.index("가나다") < md.index("caf\xe9") < md.index("wide latin"), md
+    assert "could not read" not in md, md
+
+
+def test_textboxes_in_anchor_order_and_unpaired_txo_last():
+    # TXOs pair with the text boxes in record order; the paragraphs follow anchor order; a TXO with no text box
+    # comes after them, and a text box with no TXO, or a shape with no ClientTextbox, gives nothing
+    shapes = [tbox(1025, cells(0, 8, 1, 9)), tbox(1026, None, textbox=False), tbox(1027, cells(0, 2, 1, 3))]
+    md, _ = run([drawn(shapes, ["lower", "upper", "spare"])])
+    assert md.index("cell") < md.index("upper") < md.index("lower") < md.index("spare"), md
+    md, _ = run([drawn([tbox(1025, cells(0, 2, 1, 3)), tbox(1026, cells(0, 3, 1, 4))], ["only"])])
+    assert "only" in md and "could not read" not in md, md
+
+
+def test_txo_between_drawing_records():
+    # as Excel writes it: each shape's MSODRAWING, then its OBJ and TXO, then the next shape's MSODRAWING
+    first, second = tbox(1025, cells(0, 6, 1, 7)), tbox(1026, cells(0, 2, 1, 3))
+    head = oa_container(0xF002, oa_group(1024, first, second))
+    cut = len(head) - len(second)
+    records = [rec(0x00EC, head[:cut]) + rec(0x005D, b"obj") + xls_txo("one")
+               + rec(0x00EC, head[cut:]) + rec(0x005D, b"obj") + xls_txo("two")]
+    md, _ = run([{"name": "S", "cells": {(0, 0): "cell"}, "records": records}])
+    assert md.index("cell") < md.index("two") < md.index("one"), md
+
+
+def test_txo_without_drawing_is_a_paragraph():
+    md, _ = run([{"name": "S", "cells": {(0, 0): "cell"}, "records": [xls_txo("loose")]}])
+    assert md.index("cell") < md.index("loose") and "could not read" not in md, md
+
+
+def test_damaged_txo():
+    short = rec(0x01B6, b"txo") + rec(0x003C, b"\0text")             # no cchText: no text, nothing counted
+    bare = rec(0x01B6, struct.pack("<HH6xHHH2x", 0, 0, 4, 16, 0))    # cchText 4, no CONTINUE
+    long = xls_txo("abc", cch=9)                                       # cchText past its CONTINUE
+    odd = rec(0x01B6, struct.pack("<HH6xHHH2x", 0, 0, 2, 16, 0)) + rec(0x003C, b"\1abc") + rec(0x003C, bytes(16))
+    shapes = [tbox(1025 + k, cells(0, 2 + k, 1, 3 + k)) for k in range(5)]
+    md, meta = run([drawn(shapes, [short, bare, long, odd, "kept"])])
+    assert "kept" in md and "cell" in md and "abc" not in md, md
+    assert "(could not read: 3 damaged records)" in md, md
+
+
+def test_txo_charged_to_sheet_characters():
+    sheet = drawn([tbox(1025, cells(0, 2, 1, 3))], ["note"])
+    old = limits.SHEET_CHARS
+    limits.SHEET_CHARS = 6  # "cell" fits, "note" does not
+    try:
+        md, _ = run([sheet])
+    finally:
+        limits.SHEET_CHARS = old
+    assert "cell" in md and "note" not in md, md
+    wb = xls.Workbook(biff_workbook([sheet]), Context(), sheet_grid.Budget(chars=100))
+    blocks = wb.sheet_blocks(0)
+    wb.sheet_blocks(0)
+    assert wb.budget.chars == 100 - len("cell") - len("note"), wb.budget.chars
+    assert len(blocks) == 2 and blocks[-1] == Para([Text("note")]), blocks
+
+
+def test_embedded_workbook_skips_text_boxes():
+    sheet = drawn([tbox(1025, cells(0, 2, 1, 3))], ["note"])
+    wb = xls.Workbook(biff_workbook([sheet]), Context(), sheet_grid.Budget(chars=100), pictures=False)
+    plain = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, 0): "cell"}}]), Context(), sheet_grid.Budget())
+    assert wb.sheet_blocks(0) == plain.sheet_blocks(0) and wb.budget.chars == 100 - len("cell"), wb.sheet_blocks(0)
+
+
+def test_connector_ends_inferred_after_flips():
+    # no rule: the connector's anchor runs from its start corner (the far one on a flipped axis) to the opposite one
+    shapes = [tbox(1025, cells(0, 0, 2, 1)), tbox(1026, cells(0, 4, 2, 5)),
+              tbox(1027, cells(1, 0, 1, 4, dy1=128, dy2=128), inst=32, flags=0xB80, props=END_ARROW, textbox=False)]
+    md, _ = run([drawn(shapes, ["Start", "End"])])
+    t = flow(md)
+    assert t is not None and mermaid_ok(t), md
+    assert t.endswith("  %% inferred from position\n  n2 --> n1"), t
+
+
+def test_hidden_sheet_text_box():
+    sheet = drawn([tbox(1025, cells(0, 2, 1, 3))], ["note"], state=1)
+    md, _ = run([sheet, {"name": "T", "cells": {(0, 0): "shown"}}])
+    assert "note" not in md, md
+    md, _ = run([sheet, {"name": "T", "cells": {(0, 0): "shown"}}], hidden=True)
+    assert "note" in md, md
 
 
 def main():

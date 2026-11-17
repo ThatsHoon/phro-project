@@ -760,6 +760,19 @@ def biff(rid, body=b""):
     return struct.pack("<HH", rid, len(body)) + body
 
 
+def xls_txo(text, *, wide=None, cch=None):
+    """A text box's TXO (0x01B6, 18 bytes: grbit, rot, 6 reserved, cchText at 10, cbRuns, ifntEmpty, fmla) and its
+    two CONTINUEs: the text (a flag byte, 0 for 8-bit or 1 for UTF-16, then the characters; UTF-16 when `wide`, or
+    when `wide` is None and a character is past U+00FF) and the formatting runs (two 8-byte runs). `cch` overrides
+    cchText."""
+    if wide is None:
+        wide = any(ord(ch) > 255 for ch in text)
+    raw = text.encode("utf-16-le" if wide else "latin-1")
+    runs = struct.pack("<HHI", 0, 0, 0) + struct.pack("<HHI", len(text), 0, 0)
+    body = struct.pack("<HH6xHHH2x", 0x0212, 0, len(text) if cch is None else cch, len(runs), 0)
+    return biff(0x01B6, body) + biff(0x003C, bytes([1 if wide else 0]) + raw) + biff(0x003C, runs)
+
+
 def _xl_string(text, short=False):
     wide = any(ord(ch) > 255 for ch in text)
     raw = text.encode("utf-16-le" if wide else "latin-1")
