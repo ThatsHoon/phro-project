@@ -118,7 +118,7 @@ SOFTWARE.
 
 ## kordoc
 
-Ported: numbering, alt-text stripping, layout-table unwrapping and final-state track changes, in `scripts/reader/formats/hwpx.py`, the numbering now shared through `scripts/reader/formats/hancom.py`; outline and note numbering, `%clk` placeholders and the equation (EQEDIT) script in `scripts/reader/formats/hwp.py`; the NUMBERING, BULLET and PARA_SHAPE records in `scripts/reader/formats/hwp_records.py`.
+Ported: numbering, alt-text stripping, layout-table unwrapping and final-state track changes, and the connect line and drawing-object glue and geometry, from `src/hwp5/to-hwpx/shapes.ts` at commit 9be0346ca74ff80822f6e94b811e3e0fbffd0b0b, in `scripts/reader/formats/hwpx.py`, the numbering now shared through `scripts/reader/formats/hancom.py`; outline and note numbering, `%clk` placeholders and the equation (EQEDIT) script in `scripts/reader/formats/hwp.py`; the NUMBERING, BULLET and PARA_SHAPE records in `scripts/reader/formats/hwp_records.py`.
 
 ```
 MIT License

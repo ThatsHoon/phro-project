@@ -1,21 +1,33 @@
-"""HWPX (Hancom Office, zip + XML) to the document model. Elements match by local name."""
+"""HWPX (Hancom Office, zip + XML) to the document model. Elements match by local name.
+
+A section holding an `hp:connectLine` or `hp:line` reads its drawing objects as `hancom.Obj` for `hancom.diagrams`:
+keyed by `instid`, else `id`; a connect line glued by `hp:startPt` and `hp:endPt` `@subjectIDRef` (`0` is not glue)
+with its arrowheads from `@type`, a line by its line shape's head and tail styles; boxes in HWPUNIT from `hp:offset`
+inside an `hp:container`, and at top level from `hp:pos` only when it is relative to the paper or page, sized by
+`hp:sz`, else `hp:curSz`. The element and attribute names follow kordoc's `src/hwp5/to-hwpx/shapes.ts` (MIT).
+"""
 import fnmatch
 import re
 
-from .. import limits
+from .. import diagram, limits
 from ..charts import chart_table
 from ..containers.zipx import Package, attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Image, ListItem, Math, NoteRef, Para, Table, Text
 from .hancom import (
-    AUTO_ALT, Frame, Scopes, State, comment_note, cut_command, flat, heading_level, lone_equations, next_marker,
-    place, plain, strip_marker, style_name_level, tex as _tex,
+    AUTO_ALT, Frame, Obj, Scopes, State, comment_note, cut_command, diagrams, flat, heading_level, lone_equations,
+    next_marker, place, plain, strip_marker, style_name_level, tex as _tex,
 )
 
 HPF = "Contents/content.hpf"
 _MIME = "application/hwp+zip"
 _CASE_NS = {"http://www.hancom.co.kr/hwpml/2016/paragraph", "http://www.hancom.co.kr/hwpml/2016/ooxmlchart"}
 _BORDERS = ("leftBorder", "rightBorder", "topBorder", "bottomBorder")
+_OBJECTS = frozenset(("rect", "ellipse", "arc", "polygon", "curve", "line", "connectLine", "container", "textart",
+                      "pic"))
+_EDGES = ("connectLine", "line")
+_PAGE = ("PAPER", "PAGE")
+_ARROWS = {"_NOARROW": (False, False), "_ONEWAY": (False, True), "_BOTH": (True, True)}  # connectLine@type endings
 
 
 def _int(s, default=0):
@@ -23,6 +35,84 @@ def _int(s, default=0):
         return int(s)
     except (TypeError, ValueError):
         return default
+
+
+def _kid(el, name):
+    return next((c for c in el if local(c.tag) == name), None)
+
+
+def _unit(s):
+    """A HWPUNIT attribute, or None; one written as an unsigned 32-bit number reads as the signed one it is."""
+    v = _int(s, None)
+    return v - 2 ** 32 if v is not None and 2 ** 31 <= v < 2 ** 32 else v
+
+
+def _id(el, name):
+    """An id attribute, or None when absent, blank or 0."""
+    v = (attr(el, name) or "").strip() if el is not None else ""
+    return v if v not in ("", "0") else None
+
+
+def _origin(el, inner):
+    """The object's top left in its parent's frame: hp:offset in a container, hp:pos at top level when relative to
+    the paper or page; else None."""
+    if inner:
+        at = _kid(el, "offset")
+        xy = (attr(at, "x"), attr(at, "y")) if at is not None else (None, None)
+    else:
+        pos = _kid(el, "pos")
+        if pos is None or any((attr(pos, a) or "").upper() not in _PAGE for a in ("vertRelTo", "horzRelTo")):
+            return None
+        xy = attr(pos, "horzOffset"), attr(pos, "vertOffset")
+    x, y = (_unit(v) for v in xy)
+    return None if x is None or y is None else (x, y)
+
+
+def _size(el):
+    """(width, height) from hp:sz, else hp:curSz, where an axis written 0 is hp:orgSz's."""
+    sz = _kid(el, "sz")
+    if sz is not None:
+        return _unit(attr(sz, "width")), _unit(attr(sz, "height"))
+    cur, org = _kid(el, "curSz"), _kid(el, "orgSz")
+    out = []
+    for a in ("width", "height"):
+        v = _unit(attr(cur, a)) if cur is not None else None
+        out.append(v if v or org is None else _unit(attr(org, a)))
+    return tuple(out)
+
+
+def _point(origin, pt):
+    """A connector end: its own box origin plus the point's x, y; None when either is unknown."""
+    if origin is None or pt is None:
+        return None
+    dx, dy = _unit(attr(pt, "x")), _unit(attr(pt, "y"))
+    return None if dx is None or dy is None else (origin[0] + dx, origin[1] + dy)
+
+
+def _arrows(el) -> tuple:
+    """(start, end) arrowheads: a connect line's from its @type, else the line shape's head and tail styles (NORMAL
+    is none); None where neither says."""
+    kind = (attr(el, "type") or "").upper() if local(el.tag) == "connectLine" else ""
+    for end, arrows in _ARROWS.items():
+        if kind.endswith(end):
+            return arrows
+    ls = _kid(el, "lineShape")
+    styles = (attr(ls, "headStyle"), attr(ls, "tailStyle")) if ls is not None else (None, None)
+    return tuple(None if v is None else v.strip().upper() not in ("", "NORMAL") for v in styles)
+
+
+def _obj(el, inner, blocks, kids) -> Obj:
+    """A drawing object with its geometry in its parent's frame (a container's, when inner)."""
+    n = local(el.tag)
+    origin, (w, h) = _origin(el, inner), _size(el)
+    box = origin + (origin[0] + w, origin[1] + h) if origin and w is not None and h is not None else None
+    edge = None
+    if n in _EDGES:
+        start, end = _kid(el, "startPt"), _kid(el, "endPt")
+        glue = (_id(start, "subjectIDRef"), _id(end, "subjectIDRef")) if n == "connectLine" else (None, None)
+        edge = glue + (_point(origin, start), _point(origin, end), _arrows(el), n == "line")
+    return Obj(_id(el, "instid") or _id(el, "id"), blocks, kids, n == "container", "circle" if n == "ellipse" else "",
+               box, edge)
 
 
 class _Header:
@@ -68,6 +158,9 @@ class _Reader(Scopes):
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
         self.chart_cells = 0  # chart table cells placed so far, copies counted (CHART_TOTAL)
         self.margins = False  # walking a header or footer, whose pictures and charts are skipped
+        self.budget = diagram.ConnectionBudget(ctx)  # the document's edges, shared by every section's diagrams
+        self.collect = False  # reading drawing objects as hancom.Obj: in a section with a line, not in a sub-list
+        self.grouped = False  # reading the objects a container holds
 
     # ---- package
     def find(self, href):
@@ -131,7 +224,12 @@ class _Reader(Scopes):
                         raise
                     self.ctx.skipped["section"] += 1
                     continue
-                self.doc.blocks.extend(self.blocks(root, 0, False))
+                scoped = self.collect = any(local(e.tag) in _EDGES for e in root.iter())
+                try:
+                    blocks = self.blocks(root, 0, False)
+                finally:
+                    self.collect = False
+                self.doc.blocks.extend(diagrams(self.ctx, self.budget, blocks) if scoped else blocks)
                 good += 1
         if not good:
             raise ReadError("damaged", "no readable section")
@@ -166,9 +264,13 @@ class _Reader(Scopes):
         return out
 
     def sub(self, el, d, nohead=True):
-        out = []
-        for sl in kids(el, "subList"):
-            out.extend(self.blocks(sl, d + 1, nohead))
+        """A text box, note, comment, header or footer: drawing objects in it read as before, with no diagram."""
+        out, outer, self.collect = [], self.collect, False
+        try:
+            for sl in kids(el, "subList"):
+                out.extend(self.blocks(sl, d + 1, nohead))
+        finally:
+            self.collect = outer
         return out
 
     def para(self, p, d, nohead):
@@ -263,6 +365,8 @@ class _Reader(Scopes):
                 self.node(c, st, d + 1)
         elif n == "tbl":
             st.extras.extend(self.table(el, d))
+        elif n in _OBJECTS and self.collect:
+            self.drawing(el, st, d)
         elif n == "pic":
             self.picture(el, st)
         elif n == "chart":
@@ -298,6 +402,28 @@ class _Reader(Scopes):
         elif n != "secPr":
             for c in el:
                 self.node(c, st, d + 1)
+
+    def drawing(self, el, st, d):
+        """A drawing object as one hancom.Obj among the paragraph's extras, holding the blocks it adds there (a
+        picture's image, a text box's text); a container's objects become its kids, anything else's follow it."""
+        n, inner = local(el.tag), self.grouped
+        start = len(st.extras)
+        if n == "pic":
+            self.picture(el, st)
+        else:
+            self.grouped = n == "container"
+            try:
+                for c in el:
+                    self.node(c, st, d + 1)
+            finally:
+                self.grouped = inner
+        got = st.extras[start:]
+        del st.extras[start:]
+        objs = [b for b in got if isinstance(b, Obj)]
+        group = n == "container"
+        st.extras.append(_obj(el, inner, [b for b in got if not isinstance(b, Obj)], objs if group else ()))
+        if not group:
+            st.extras.extend(objs)
 
     def picture(self, pic, st):
         """Every placement is charged against IMAGE_BYTES, as in the Word readers; one past it is counted under image

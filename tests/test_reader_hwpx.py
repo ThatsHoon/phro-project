@@ -11,11 +11,12 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
-from reader import limits, markdown  # noqa: E402
+from reader import diagram, limits, markdown  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
+from reader.model import Code, Context  # noqa: E402
 from reader.formats import hwpx  # noqa: E402
 from reader_fix import make_zip  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 
 NS = ('xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" '
       'xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" '
@@ -374,6 +375,138 @@ def test_text_box():
            '<hp:t>밖</hp:t></hp:run></hp:p>')
     out = md(hwpx_doc(sec))
     assert "상자 글" in out and "밖" in out
+
+
+# ---- connect lines as diagrams
+def obj(tag, inst, text="", x=0, y=0, w=1000, h=1000, rel="PAPER", inner=False, attrs="", body=""):
+    """A drawing object: at top level placed by hp:pos relative to `rel`, inside a container by hp:offset."""
+    if inner:
+        place = f'<hp:offset x="{x}" y="{y}"/><hp:orgSz width="{w}" height="{h}"/><hp:curSz width="0" height="0"/>'
+    else:
+        place = (f'<hp:sz width="{w}" height="{h}"/><hp:pos treatAsChar="0" vertRelTo="{rel}" horzRelTo="{rel}" '
+                 f'vertOffset="{y}" horzOffset="{x}"/>')
+    text = f'<hp:drawText><hp:subList>{P(text)}</hp:subList></hp:drawText>' if text else ""
+    return f'<hp:{tag} id="0" instid="{inst}" {attrs}>{body}{text}{place}</hp:{tag}>'
+
+
+def conn(inst, a, b, kind="STRAIGHT_ONEWAY", ends=((0, 0), (0, 0)), **kw):
+    (x0, y0), (x1, y1) = ends
+    body = (f'<hp:startPt x="{x0}" y="{y0}" subjectIDRef="{a}" subjectIdx="0"/>'
+            f'<hp:endPt x="{x1}" y="{y1}" subjectIDRef="{b}" subjectIdx="0"/>')
+    return obj("connectLine", inst, attrs=f'type="{kind}"', body=body, **kw)
+
+
+def line(inst, head, tail, ends, **kw):
+    (x0, y0), (x1, y1) = ends
+    body = (f'<hp:lineShape headStyle="{head}" tailStyle="{tail}"/>'
+            f'<hc:startPt x="{x0}" y="{y0}"/><hc:endPt x="{x1}" y="{y1}"/>')
+    return obj("line", inst, body=body, **kw)
+
+
+def R(*objs, text=""):
+    """A paragraph whose run holds some text, then the objects."""
+    t = f"<hp:t>{text}</hp:t>" if text else ""
+    return f'<hp:p><hp:run>{t}{"".join(objs)}</hp:run></hp:p>'
+
+
+def mermaid(doc):
+    return "\n".join(b.text for b in doc.blocks if isinstance(b, Code) and b.lang == "mermaid")
+
+
+def _connectline_sec():
+    return (P("before") + R(obj("rect", 11, "Alpha"), obj("rect", 12, "Beta", x=5000),
+                            conn(13, 11, 12, x=1000, ends=((0, 500), (4000, 500))), text="lead") + P("after"))
+
+
+def test_hwpx_connectline():
+    doc, ctx = parse(hwpx_doc(_connectline_sec()))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Alpha"]\n  n2["Beta"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"before\n\nlead\n\n```mermaid\n{t}\n```\n\nafter\n", out  # each text once
+    assert not ctx.skipped["shape"] and not ctx.skipped["connector_loose"], ctx.skipped
+
+
+def test_hwpx_both_and_none_arrows():
+    sec = R(obj("rect", 1, "A"), obj("ellipse", 2, "B", y=3000), obj("rect", 3, "C", y=6000),
+            conn(4, 1, 2, "STROKE_BOTH"), conn(5, 2, 3, "ARC_NOARROW"))
+    doc, _ = parse(hwpx_doc(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["A"]\n  n2(("B"))\n  n3["C"]\n  n1 <--> n2\n  n2 --- n3', t
+
+
+def test_section_scope_first_node_place():
+    sec = (R(obj("rect", 11, "Alpha", rel="PARA"), text="one") + P("mid")
+           + R(obj("rect", 12, "Beta", rel="PARA"), conn(13, 11, 12, rel="PARA"), text="three"))
+    doc, _ = parse(hwpx_doc(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Alpha"]\n  n2["Beta"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"one\n\n```mermaid\n{t}\n```\n\nmid\n\nthree\n", out
+
+
+def test_hwpx_container_inference():
+    box = (obj("rect", 21, "Left", inner=True) + obj("rect", 22, "Right", x=3000, inner=True)
+           + conn(23, 0, 0, x=500, y=500, ends=((0, 0), (3000, 0)), inner=True))
+    sec = R(obj("container", 20, body=box), text="lead") + R(obj("rect", 30, "Zed", x=90000))
+    doc, ctx = parse(hwpx_doc(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == ('flowchart LR\n  n1["Left"]\n  n2["Right"]\n  %% inferred from position\n'
+                                   '  n1 --> n2'), t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"lead\n\n```mermaid\n{t}\n```\n\nZed\n", out
+    assert not ctx.skipped["connector_loose"], ctx.skipped
+
+
+def test_hwpx_container_connector_leaving_it_uses_the_section():
+    box = obj("rect", 21, "Inner", inner=True) + conn(23, 21, 30, inner=True)
+    sec = R(obj("container", 20, body=box), text="lead") + P("mid") + R(obj("rect", 30, "Outer"))
+    doc, _ = parse(hwpx_doc(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Inner"]\n  n2["Outer"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"lead\n\n```mermaid\n{t}\n```\n\nmid\n", out
+
+
+def test_hwpx_arrowed_line_and_divider():
+    sec = R(obj("rect", 1, "A"), obj("rect", 2, "B", x=5000),
+            line(3, "NORMAL", "ARROW", ((500, 500), (5500, 500))),
+            line(4, "NORMAL", "NORMAL", ((0, 2000), (6000, 2000))))
+    doc, ctx = parse(hwpx_doc(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["A"]\n  n2["B"]\n  %% inferred from position\n  n1 --> n2', t
+    assert markdown.render(doc, tmp() / "a") == f"```mermaid\n{t}\n```\n"
+    assert not ctx.skipped["connector_loose"], ctx.skipped
+
+
+def test_hwpx_shape_in_table_cell():
+    inner = R(obj("rect", 12, "Beta", rel="PARA"), conn(13, 11, 12, rel="PARA"))
+    cell = f'<hp:tc><hp:subList>{inner}</hp:subList></hp:tc>'
+    tbl = f'<hp:tbl><hp:tr>{cell}<hp:tc><hp:subList>{P("cell2")}</hp:subList></hp:tc></hp:tr></hp:tbl>'
+    sec = R(obj("rect", 11, "Alpha", rel="PARA"), text="one") + R(tbl)
+    doc, _ = parse(hwpx_doc(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Alpha"]\n  n2["Beta"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out.startswith(f"one\n\n```mermaid\n{t}\n```\n\n") and out.count("Beta") == 1 and "cell2" in out, out
+
+
+def test_shapes_without_connector_unchanged():
+    box = obj("rect", 1, "A", inner=True) + obj("ellipse", 2, "B", inner=True)
+    sec = R(obj("container", 20, body=box), text="lead") + R(obj("rect", 3, "C"))
+    assert md(hwpx_doc(sec)) == "lead\n\nA\n\nB\n\nC\n"  # as the reader read it before diagrams
+
+
+def test_place_failure_keeps_text():
+    def boom(self, slots):
+        raise ValueError("boom")
+    real, diagram.Diagram.place = diagram.Diagram.place, boom
+    try:
+        doc, ctx = parse(hwpx_doc(_connectline_sec()))
+    finally:
+        diagram.Diagram.place = real
+    assert markdown.render(doc, tmp() / "a") == "before\n\nlead\n\nAlpha\n\nBeta\n\nafter\n"
+    assert ctx.skipped["shape"] == 1, ctx.skipped
 
 
 def test_depth_counted_not_recursion_error():

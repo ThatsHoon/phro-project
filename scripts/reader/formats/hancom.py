@@ -1,9 +1,10 @@
-"""Helpers shared by the Hancom parsers (hwpx and hwp): equation scripts, numbering markers, the cell grid, and the
-inline model and paragraph rules both readers build paragraphs with."""
+"""Helpers shared by the Hancom parsers (hwpx and hwp): equation scripts, numbering markers, the cell grid, the
+inline model and paragraph rules both readers build paragraphs with, and the drawing objects (`Obj`) a section's
+diagrams are written from (`diagrams`)."""
 import re
 from bisect import bisect_left
 
-from .. import limits
+from .. import diagram, limits
 from ..model import Bold, Break, Cell, Equation, Heading, Hidden, Link, ListItem, Math, NoteRef, Para, Table, Text
 
 AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다\.?$")
@@ -331,3 +332,143 @@ def place(cells: list[tuple[int, int, int, int, Cell]]) -> list[list[Cell]]:
         cell.colspan = bisect_left(cols_at, col + cs) - c
         grid[r].append((c, cell))
     return [[cell for _, cell in sorted(g, key=lambda x: x[0])] for g in grid]
+
+
+# ---- drawing objects as diagrams
+class Obj:
+    """A drawing object a paragraph holds, standing among the blocks where it was read until `diagrams` writes its
+    section. `blocks` is what it reads as on its own and `key` its id (None when it has none). A group holds `kids`
+    in its own frame; `box` (x0, y0, x1, y1) is in the parent's frame, or None. A connector or line has `edge`
+    (begin id, end id, start point, end point, (start, end) arrowheads, plain line), its points in the same frame."""
+    __slots__ = ("key", "blocks", "kids", "group", "kind", "box", "edge")
+
+    def __init__(self, key, blocks, kids=(), group=False, kind="", box=None, edge=None):
+        self.key, self.blocks, self.kids, self.group = key, blocks, list(kids), group
+        self.kind, self.box, self.edge = kind, box, edge
+
+
+def _swap(blocks, fn) -> list:
+    """The blocks with each Obj replaced by fn(obj), through table cells (nested no deeper than the parser reads)."""
+    out = []
+    for b in blocks:
+        if isinstance(b, Obj):
+            out.extend(fn(b))
+            continue
+        if isinstance(b, Table):
+            for row in b.rows:
+                for cell in row:
+                    cell.blocks = _swap(cell.blocks, fn)
+        out.append(b)
+    return out
+
+
+def _shift(p, s):
+    return None if p is None or s is None else (p[0] + s[0], p[1] + s[1])
+
+
+def _below(top) -> list:
+    """The object and every object under it, in reading order, each with the shift from its frame to the top's own
+    (the top's kids are in its frame): (dx, dy), or None past a group with no box."""
+    out, stack = [(top, None)], [(k, (0, 0)) for k in reversed(top.kids)]
+    while stack:
+        o, s = stack.pop()
+        out.append((o, s))
+        inner = _shift(s, o.box[:2]) if o.box else None
+        stack.extend((k, inner) for k in reversed(o.kids))
+    return out
+
+
+def _own(o) -> list:
+    """What the object and every object under it read as, in reading order: what they read as with no diagram."""
+    return [b for x, _ in _below(o) for b in x.blocks]
+
+
+def _register(dia, o, key, shift) -> None:
+    if o.edge:
+        begin, end, p0, p1, arrows, line = o.edge
+        dia.connector(key, begin, end, _shift(p0, shift), _shift(p1, shift), arrows, flat(o.blocks), line)
+    else:
+        lo, hi = (_shift(o.box[:2], shift), _shift(o.box[2:], shift)) if o.box else (None, None)
+        dia.shape(key, o.blocks, o.kind, lo + hi if lo and hi else None)
+
+
+def _write(ctx, budget, regs, slots) -> list:
+    """One scope: the objects regs [(obj, key, shift)] registered and the slots [(key, blocks)] placed. Returns what
+    goes in each slot's place, plus one entry for the end of the section: the diagram before the slot it anchors at,
+    each slot's blocks when kept. A scope with no connector or line keeps every slot as it was."""
+    if not any(o.edge for o, _, _ in regs):
+        return [list(blocks) for _, blocks in slots] + [[]]
+    dia = diagram.Diagram(ctx, budget)
+    for o, key, shift in regs:
+        with ctx.guard("shape"):
+            _register(dia, o, key, shift)
+    marks = [object() for _ in slots]
+    flow = marks
+    with ctx.guard("shape"):
+        flow = dia.place([(key, [m]) for (key, _), m in zip(slots, marks)])
+    index = {id(m): i for i, m in enumerate(marks)}
+    kept, made, at, last = set(), [], len(slots), -1
+    for b in flow:  # the kept marks in order, the diagram's blocks just before the anchor's slot
+        i = index.get(id(b))
+        if i is not None:
+            kept.add(i)
+            last = i
+        else:
+            if not made:
+                at = last + 1
+            made.append(b)
+    out = [list(blocks) if i in kept else [] for i, (_, blocks) in enumerate(slots)] + [[]]
+    out[at][:0] = made
+    return out
+
+
+def diagrams(ctx, budget, blocks) -> list:
+    """The section's blocks with each Obj in them (through table cells) given way to what it reads as.
+
+    The section is one diagram scope. A top-level group is a scope of its own, in its own frame, when no glue crosses
+    its edge; otherwise its objects join the section's scope with no geometry, since its frame is not the
+    section's. Keys are the objects' ids, unique in the section (a missing or repeated one is unkeyed); groups are
+    not shapes. Each object is registered under guard("shape"), and place() runs under it too, falling back to the
+    slots' blocks; should anything else fail, every object reads as its blocks, so no text is lost."""
+    tops = []
+    blocks = _swap(blocks, lambda o: tops.append(o) or [o])
+    if not tops:
+        return blocks
+    done, tail = {}, []
+    with ctx.guard("shape"):
+        done, tail = _section(ctx, budget, tops)
+    return _swap(blocks, lambda o: done[id(o)] if id(o) in done else _own(o)) + tail
+
+
+def _section(ctx, budget, tops) -> tuple:
+    """({id(top): its blocks}, the blocks for the section's end): the closed groups' scopes, then the section's."""
+    trees = [_below(t) for t in tops]
+    keyed, owner = {}, {}
+    for t, tree in zip(tops, trees):
+        for o, _ in tree:
+            if o.group:
+                continue
+            if o.key is not None and o.key not in owner:
+                keyed[id(o)], owner[o.key] = o.key, t
+            else:
+                keyed[id(o)] = ("unkeyed", len(keyed))
+    opened = set()
+    for t, tree in zip(tops, trees):
+        for o, _ in tree:
+            for ref in o.edge[:2] if o.edge else ():
+                u = owner.get(ref)
+                if u is not None and u is not t:
+                    opened.update((id(t), id(u)))
+    regs, slots, spans = [], [], []
+    for t, tree in zip(tops, trees):
+        start = len(slots)
+        if t.group and id(t) not in opened:
+            parts = _write(ctx, budget, [(o, keyed[id(o)], s) for o, s in tree if not o.group],
+                           [(keyed.get(id(o)), o.blocks) for o, _ in tree])
+            slots.append((None, [b for p in parts for b in p]))
+        else:
+            regs += [(o, keyed[id(o)], (0, 0) if o is t else None) for o, _ in tree if not o.group]
+            slots += [(keyed.get(id(o)), o.blocks) for o, _ in tree]
+        spans.append((start, len(slots)))
+    parts = _write(ctx, budget, regs, slots)
+    return {id(t): [b for p in parts[a:b] for b in p] for t, (a, b) in zip(tops, spans)}, parts[-1]
