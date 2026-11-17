@@ -13,7 +13,7 @@ from ..limits import IMAGE_BYTES, ReadError
 from ..model import (Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math, NoteRef, Para,
                      Table, Text)
 from . import omml, ooxml_base, smartart
-from .drawingml import Xf, arrows, glue, kid, kind, xfrm
+from .drawingml import Xf, arrows, glue, kid, kind, rule, xfrm
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
 from .word_fields import MAX_INSTR, MAX_URL, comment_note, hyperlink_url
@@ -500,7 +500,7 @@ class _Reader:
         if kid(el, "cNvCnPr") is not None:
             p0, p1 = xf.ends(x) or (None, None)
             st, en = glue(el)
-            dia.connector(key, st, en, p0, p1, arrows(sppr), _flat(blocks), hidden=hidden)
+            dia.connector(key, st, en, p0, p1, arrows(sppr), _flat(blocks), line=rule(sppr, (st, en)), hidden=hidden)
         else:
             dia.shape(key, blocks, kind(sppr), xf.box(x), hidden)
 

@@ -701,6 +701,16 @@ def test_docx_group_in_header_keeps_text():
     assert doc.headers == ["top Start End"] and not ctx.skipped, (doc.headers, dict(ctx.skipped))
 
 
+def test_docx_unglued_line_is_a_rule():
+    # a connector of preset `line` with no glue and no arrowhead, its ends on both boxes: a rule, like a plain line
+    rule = (_wlink(3, 1, 2).replace('<a:stCxn id="1" idx="2"/><a:endCxn id="2" idx="0"/>', "")
+            .replace("straightConnector1", "line").replace('<a:ln><a:tailEnd type="triangle"/></a:ln>', ""))
+    group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "End") + rule)
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("x"))}</w:p>'))
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert not _mermaid(doc) and out == "lead\n\nStart\n\nEnd\n" and not ctx.skipped, (out, dict(ctx.skipped))
+
+
 def test_docx_group_hostile_glue_and_geometry():
     # glue to a missing id, to itself and to a connector; a repeated id; unusable numbers: no failure, no edge
     bad = ('<wps:wsp><wps:cNvPr id="1"/><wps:spPr><a:xfrm><a:off x="1e99" y="-"/><a:ext cx="99999999999999999999" '

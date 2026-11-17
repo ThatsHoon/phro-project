@@ -346,6 +346,18 @@ def test_plain_line_needs_arrow():
     assert lines(out)[-1] == "  n1 --> n2" and not ctx.skipped, (out, ctx.skipped)
 
 
+def test_decorative_connector_not_loose():
+    # glued at neither end, snapped at neither end, no arrowhead set True: decoration, not counted, its text kept
+    for kw in ({}, {"arrows": (False, False)}, {"p0": None, "p1": None}):
+        out, ctx = scope({"p0": (150, 200), "p1": (160, 200), **kw})
+        assert out == P("A") + P("B") + P("t0") and not ctx.skipped, (kw, out, ctx.skipped)
+    # an arrowhead, an end glued or naming a shape, or one end snapped: a connector meant to join, still loose
+    for kw in ({"arrows": (False, True)}, {"arrows": (True, None)}, {"begin": "A"}, {"end": "missing"},
+               {"p0": (50, 50)}):
+        out, ctx = scope({"p0": (150, 200), "p1": (160, 200), **kw})
+        assert out == P("A") + P("B") + P("t0") and ctx.skipped == {"connector_loose": 1}, (kw, out, ctx.skipped)
+
+
 def test_infer_shapes_cap():
     old = diagram.INFER_SHAPES
     try:
@@ -416,7 +428,7 @@ def test_nan_and_huge_geometry():
     d.connector("k5", p0=5, p1=(nan, nan))
     slots = [("A", P("A")), ("B", P("B")), ("H", P("H"))] + [(f"k{i}", P(f"t{i}")) for i in range(1, 6)]
     assert d.place(slots) == flat(slots)
-    assert ctx.skipped == {"connector_loose": 5}, ctx.skipped
+    assert ctx.skipped == {"connector_loose": 2}, ctx.skipped  # k3-k5 land nowhere at either end: decorations
 
 
 def test_zero_size_scope():
@@ -425,6 +437,12 @@ def test_zero_size_scope():
     d.shape("B", P("B"), box=(5, 5, 5, 5))
     d.connector("k", p0=(5, 5), p1=(5, 5))
     slots = [("A", P("A")), ("B", P("B")), ("k", P("t"))]
+    assert d.place(slots) == flat(slots)
+    assert not ctx.skipped, ctx.skipped  # unglued and arrowless, it lands nowhere: a decoration
+    d, ctx = new()
+    d.shape("A", P("A"), box=(5, 5, 5, 5))
+    d.shape("B", P("B"), box=(5, 5, 5, 5))
+    d.connector("k", p0=(5, 5), p1=(5, 5), arrows=(False, True))
     assert d.place(slots) == flat(slots)
     assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
 

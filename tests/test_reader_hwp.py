@@ -666,13 +666,14 @@ def test_hwp_arrowed_line_and_divider():
 
 
 def test_hwp_truncated_component():
-    # a connect line whose LINE record is cut after its end points has no glue and no points: no edge, no error
+    # a connect line whose LINE record is cut after its end points has no glue and no points: no edge, no error,
+    # and with no arrowhead it is a decoration, not counted
     cut = struct.pack("<4i", 0, 500, 4000, 500)
     sec = objs(shape("$rec", 5, "Alpha"), shape("$rec", 6, "Beta", x=5000),
                shape("$col", 7, x=1000, line=cut, fill=0), text="lead")
     doc, ctx = parse(hwp_file(sec))
     assert not mermaid(doc) and markdown.render(doc, tmp() / "a") == "lead\n\nAlpha\n\nBeta\n"
-    assert ctx.skipped["connector_loose"] == 1 and not ctx.skipped["shape"], ctx.skipped
+    assert not ctx.skipped["connector_loose"] and not ctx.skipped["shape"], ctx.skipped
     # a shape whose component is cut to its ids has no box and no drawing style: the CTRL_HEADER's id is its key
     sec = objs(shape("$rec", 5, "Alpha"), shape("$rec", 0, "Beta", head_id=6, component=b"cer$cer$"),
                conn(7, 5, 6), text="lead")

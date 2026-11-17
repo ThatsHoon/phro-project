@@ -13,7 +13,7 @@ from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Equation, Link, ListItem, Math, Para, Section, Table, Text, Image
 from . import omml, ooxml_base, smartart
-from .drawingml import Xf, arrows, glue, is_line, kind
+from .drawingml import Xf, arrows, glue, is_line, kind, rule
 from .drawingml import kid as _kid, nv as _nv, xfrm as _xfrm
 from .ooxml_base import int_of as _int
 from .word_fields import MAX_URL, comment_note
@@ -330,7 +330,7 @@ class _Reader:
             p0, p1 = xf.ends(x) or (None, None)
             st, en = glue(el)
             self.dia.connector(key, st, en, p0, p1, arrows(sppr), self._body_text(body) if body is not None else "",
-                               line=n != "cxnSp", hidden=hid)
+                               line=n != "cxnSp" or rule(sppr, (st, en)), hidden=hid)
         else:
             self.dia.shape(key, blocks, kind(sppr), xf.box(x), hid)
         if hid:

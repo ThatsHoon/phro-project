@@ -12,7 +12,8 @@ numbers, escapes, orients and renders, and builds model blocks only.
   end's point lands on the smallest box holding it, else on the nearest within INFER_TOL of the diagonal of the box
   around every shape box and every line end; containers and connectors are never targets, and a tie (equal areas, or
   distances within 1e-9 × tol) lands nowhere. When both ends land, on two shapes, it is an inferred edge, written
-  after `%% inferred from position`; else it counts `connector_loose` and keeps its slot. A scope of more than
+  after `%% inferred from position`; else it keeps its slot and counts `connector_loose`, unless it names a shape at
+  neither end, lands on none and has no arrowhead set True: a decoration, not counted. A scope of more than
   INFER_SHAPES boxed shapes is not inferred (`infer_skipped` once); a zero-size scope places no end.
 - **Nodes.** The edges' ends, numbered `n1`, `n2`, ... in the order their keys first appear in the slots, then the
   slotless ones in `shape()` order. Plain text of at most NAME characters is the whole label; any other content gets
@@ -317,8 +318,9 @@ class Diagram:
 
     def _infer(self, cands) -> list:
         """The candidates that become edges, each as a copy of its connector with both ends set. Counts
-        `connector_loose` for each other candidate it snaps, and `infer_skipped` once when the scope is too large or
-        the document's candidate room cannot take all of them; the ones not snapped keep their slots uncounted."""
+        `connector_loose` for each other candidate it snaps (a decoration, naming and landing on no shape and with no
+        arrowhead set True, uncounted), and `infer_skipped` once when the scope is too large or the document's candidate
+        room cannot take all of them; the ones not snapped keep their slots uncounted."""
         if not cands:
             return []
         boxed = [(k, s.box) for k, s in self.shapes.items() if s.box]
@@ -345,8 +347,9 @@ class Diagram:
             b = c.end if self._glued(c.end) else _snap(c.p1, targets, tol)
             if a is not None and b is not None and a != b:
                 out.append((k, _Connector(a, b, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden)))
-            else:
-                self.ctx.skipped["connector_loose"] += 1
+            elif (a is not None or b is not None or c.begin is not None or c.end is not None
+                  or any(x is True for x in c.arrows)):
+                self.ctx.skipped["connector_loose"] += 1  # meant to join something: not a decoration
         return out
 
     def _containers(self, nodes, ends):

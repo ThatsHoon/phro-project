@@ -229,6 +229,14 @@ def test_sheet_connector_xlsb():
     check_glued(*xlsb_md(GLUED))
 
 
+def test_sheet_unglued_line_is_a_rule():
+    # a cxnSp of preset `line` with no glue and no arrowhead, its ends on both boxes: a rule, like a plain line
+    rule = cxn(4, off=(500_000, 500_000), ext=(0, 1_500_000), tail=None).replace("straightConnector1", "line")
+    out, ctx = xlsx_md(GLUED[:2] + (anchor(2, rule),))
+    assert "```mermaid" not in out and out.count("Start") == out.count("End") == 1, out
+    assert not ctx.skipped, dict(ctx.skipped)
+
+
 def test_sheet_group_transform():
     # scale 2 from (1e6, 1e6): A lands on (1e6..1.2e6, 1e6..1.2e6), B on (1e6..1.2e6, 2e6..2.2e6), the connector's
     # ends on their edges. Read untransformed, its end would land on the smaller decoy D instead of B.

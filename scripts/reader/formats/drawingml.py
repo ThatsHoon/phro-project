@@ -156,6 +156,12 @@ def is_line(sppr) -> bool:
     return _prst(sppr) in _LINES
 
 
+def rule(sppr, ends) -> bool:
+    """Whether a connector with glue `ends` (from `glue`) is a drawn rule, a plain line to the diagram: preset `line`
+    and glued at neither end."""
+    return _prst(sppr) == "line" and ends == (None, None)
+
+
 def glue(el) -> tuple:
     """(stCxn@id, endCxn@id) of a connector, each None when absent: under nvCxnSpPr/cNvCxnSpPr, or Word's
     wps:cNvCnPr."""

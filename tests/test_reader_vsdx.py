@@ -567,9 +567,9 @@ def test_group_child_box():
     out, _ = md(vsdx({"P": inner}))
     t = mermaid_of(out)
     assert mermaid_ok(t) and t == want, t
-    # the same ends in the group's own units land on nothing
+    # the same ends in the group's own units land on nothing: unglued and arrowless, a decoration
     out, ctx = md(vsdx({"P": group + line(4, (1, 1), (3, 1))}))
-    assert "```mermaid" not in out and ctx.skipped["connector_loose"] == 1, (out, ctx.skipped)
+    assert "```mermaid" not in out and not ctx.skipped["connector_loose"], (out, ctx.skipped)
 
 
 def test_box_geometry():

@@ -370,6 +370,24 @@ def test_line_shape_and_textless_target():
     assert "mermaid" not in out and "rule" in out, out
 
 
+def test_unglued_line_connector_is_a_rule():
+    # PowerPoint's Line tool: a cxnSp of preset `line`, no glue, no arrowhead; a divider, not a loose connector
+    rule = cxn(9, off=(0, 150), ext=(5000, 0), prst="line")
+    s = sp("Title", ph="title", off=(0, 0), ext=(5000, 100)) + sp("Body text", id=3, off=(0, 300), ext=(5000, 1000))
+    doc, ctx = parse(deck([s + rule]))
+    out = markdown.render(doc, tmp() / "assets")
+    assert out == "## Slide 1: Title\n\nBody text\n" and not ctx.skipped, (out, ctx.skipped)
+    # touching two boxes it is still a rule, like a plain line: no inferred edge
+    pair = sp("Left", id=3, off=(0, 300), ext=(1000, 1000)) + sp("Right", id=4, off=(3000, 300), ext=(1000, 1000))
+    doc, ctx = parse(deck([pair + cxn(9, off=(1000, 800), ext=(2000, 0), prst="line")]))
+    assert not mermaid(doc) and not ctx.skipped, (mermaid(doc), ctx.skipped)
+    # glued, or arrowed, it is a connector as before
+    t = mermaid(parse(deck([pair + cxn(9, 3, 4, off=(1000, 800), ext=(2000, 0), prst="line")]))[0])
+    assert mermaid_ok(t) and t.endswith("\n  n1 --- n2"), t
+    t = mermaid(parse(deck([pair + cxn(9, off=(1000, 800), ext=(2000, 0), prst="line", tail="triangle")]))[0])
+    assert mermaid_ok(t) and t.endswith("\n  %% inferred from position\n  n1 --> n2"), t
+
+
 def test_hidden_connector_and_duplicate_ids():
     base = sp("A", id=2, off=(0, 0), ext=(100, 100)) + sp("B", id=3, off=(0, 1000), ext=(100, 100))
     out = md(deck([base + cxn(4, 2, 3, tail="triangle", hidden=True)]))

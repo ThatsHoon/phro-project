@@ -1118,7 +1118,7 @@ def test_xform_extras_and_1d():
     assert got[2] == [INFERRED_AB.format("")], got[2]
     assert got[3] == [INFERRED_AB.format("")], got[3]
     assert got[4] == [INFERRED_AB.format("")], got[4]
-    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
+    assert not ctx.skipped, ctx.skipped  # the short one lands nowhere, unglued and arrowless: a decoration
     # a 0x9D cut short (BeginX, BeginY and EndX only) is no end point: loose
     cut = {"id": 3, "chunks": [(0x9D, xform1d(1.5, 5.0, 5.5, 5.0)[:27], {"level": 3})]}
     doc, ctx = read(drawing([{"shapes": AB + [cut]}]))

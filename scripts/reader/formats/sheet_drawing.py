@@ -19,7 +19,7 @@ from ..containers.zipx import attr, kids, local, first
 from ..limits import ReadError
 from ..model import Para, Text
 from . import ooxml_base, smartart
-from .drawingml import Xf, arrows, glue, is_line, kid, kind, num, nv, xfrm
+from .drawingml import Xf, arrows, glue, is_line, kid, kind, num, nv, rule, xfrm
 
 MAX_ANCHORS = 10_000  # drawing anchors one drawing part reads
 SHAPE_CHARS = 1_000_000  # characters of shape text one workbook's drawings emit; the rest is counted once as a shape
@@ -143,7 +143,8 @@ class Drawings:
             p0, p1 = (_points(e) for e in ends) if ends else (None, None)
             st, en = glue(el)
             label = " ".join(i.text for b in blocks for i in getattr(b, "inlines", ()) if isinstance(i, Text))
-            dia.connector(key, st, en, p0, p1, arrows(sppr), label, line=local(el.tag) == "sp", hidden=hidden)
+            dia.connector(key, st, en, p0, p1, arrows(sppr), label, line=local(el.tag) == "sp" or rule(sppr, (st, en)),
+                          hidden=hidden)
         else:
             box = (xf.box(x) if xf is not None else None) if x is not None else spot
             dia.shape(key, blocks, kind(sppr), _points(box), hidden)
