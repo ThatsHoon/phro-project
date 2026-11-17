@@ -22,7 +22,8 @@ from reader import diagram, limits, markdown  # noqa: E402
 from reader.formats import vsd, vsd_stream, vsdx  # noqa: E402
 from reader.formats.vsd_stream import Chunk, Pointer  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Break, Context, Image, ListItem, Para, Section, Text  # noqa: E402
+from reader.model import Break, Code, Context, Image, ListItem, Para, Section, Text  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 from reader_fix import cfb_bytes, lz77, make_zip, vsd_chunk, vsd_document, vsd_head, vsd_list, vsd_pointer  # noqa: E402
 
 MIB = 2**20
@@ -462,24 +463,52 @@ EMF = struct.pack("<II", 1, 88) + bytes(32) + b" EMF" + bytes(44)
 NONE = 0xFFFFFFFF
 
 
-def xform(px, py, lx=0.0, ly=0.0):
+def xform(px, py, lx=0.0, ly=0.0, w=1.0, h=1.0, angle=0.0, fx=0, fy=0):
     """A 0x9B chunk's data: PinX, PinY, Width, Height, LocPinX, LocPinY, Angle, each a unit byte and a double, then
     the two flip bytes."""
-    return b"".join(b"\x00" + struct.pack("<d", v) for v in (px, py, 1.0, 1.0, lx, ly, 0.0)) + b"\x00\x00"
+    return b"".join(b"\x00" + struct.pack("<d", v) for v in (px, py, w, h, lx, ly, angle)) + bytes([fx, fy])
 
 
-def shape_data(parent=0, master=None, version=11):
-    """A shape chunk's data (readShape): v6 and v11 the parent u32 at 10, the master page u32 at 18 and the master
-    shape u32 at 26; v5 the parent s16 at 2, the master page and shape s16 at 6 and 8. No master: all ones."""
+def xform1d(bx, by, ex, ey):
+    """A 0x9D chunk's data (readXForm1D): BeginX, BeginY, EndX, EndY, each a unit byte and a double."""
+    return b"".join(b"\x00" + struct.pack("<d", v) for v in (bx, by, ex, ey))
+
+
+def line(start=0, end=0, version=11):
+    """A 0x85 chunk's data (readLine): the start and end markers at 25 and 26 (v5: 21 and 22), then the cap byte."""
+    return bytes(21 if version == 5 else 25) + bytes([start, end, 0])
+
+
+def shape_data(parent=0, master=None, version=11, line_style=NONE):
+    """A shape chunk's data (readShape): v6 and v11 the parent u32 at 10, the master page u32 at 18, the master
+    shape u32 at 26, then the fill, line and text style ids (u32 at 34, 42, 50); v5 the parent s16 at 2, the master
+    page and shape s16 at 6 and 8, the line, fill and text style s16 at 10, 12 and 14. No master: all ones; the fill
+    and text styles are all ones."""
     page, shape = master if master is not None else (NONE, NONE)
     if version == 5:
         d = bytearray(0x22)
-        struct.pack_into("<HxxHH", d, 2, parent & 0xFFFF, page & 0xFFFF, shape & 0xFFFF)
+        struct.pack_into("<HxxHHHHH", d, 2, parent & 0xFFFF, page & 0xFFFF, shape & 0xFFFF, line_style & 0xFFFF,
+                         0xFFFF, 0xFFFF)
         return bytes(d)
-    d = bytearray(0x30)
+    d = bytearray(0x36)
     struct.pack_into("<I", d, 10, parent)
     struct.pack_into("<I", d, 18, page)
     struct.pack_into("<I", d, 26, shape)
+    struct.pack_into("<I", d, 34, NONE)
+    struct.pack_into("<I", d, 42, line_style)
+    struct.pack_into("<I", d, 50, NONE)
+    return bytes(d)
+
+
+def sheet_data(parent=NONE, version=11):
+    """A style sheet chunk's data (0x4A, readStyleSheet): v6 and v11 the parent line, fill and text style u32 at 0x22,
+    0x2A and 0x32; v5 the s16s at 10, 12 and 14. The fill and text parents are all ones."""
+    if version == 5:
+        return bytes(10) + struct.pack("<HHH", parent & 0xFFFF, 0xFFFF, 0xFFFF)
+    d = bytearray(0x36)
+    struct.pack_into("<I", d, 0x22, parent)
+    struct.pack_into("<I", d, 0x2A, NONE)
+    struct.pack_into("<I", d, 0x32, NONE)
     return bytes(d)
 
 
@@ -540,15 +569,19 @@ def shape_chunks(s, version, level=1):
     """One shape's chunks: the shape chunk (header `level`) and its own chunks one level deeper (the XForm two).
     A shape dict: "id", "type", "parent", "master" ((page, shape)), "text" (or "raw": the text's bytes), "pin"
     (PinX, PinY[, LocPinX, LocPinY]), "misc" (readMisc data), "runs" ([(count, font id)]) and "chunks" ((type,
-    data[, keywords])). Visio 5 keeps the XForm and misc as records of a 0x68 list chunk and the runs in a 0x69."""
-    parts = [vsd_chunk(s.get("type", 0x48), shape_data(s.get("parent", 0), s.get("master"), version), version=version,
-                       cid=s.get("id", NONE), level=level)]
+    data[, keywords])), "line_style" (the shape chunk's line style id), "data" (the shape chunk's data in place of
+    shape_data's), "ends" (BeginX, BeginY, EndX, EndY: an XForm1D) and "line" (0x85 data). Visio 5 keeps the XForm,
+    XForm1D, line and misc as records of a 0x68 list chunk and the runs in a 0x69."""
+    head = s["data"] if "data" in s else shape_data(s.get("parent", 0), s.get("master"), version,
+                                                    s.get("line_style", NONE))
+    parts = [vsd_chunk(s.get("type", 0x48), head, version=version, cid=s.get("id", NONE), level=level)]
     sub = level + 1
     if "text" in s or "raw" in s:
         raw = s["raw"] if "raw" in s else encode(s["text"], version)
         parts.append(vsd_chunk(0x0E, bytes(8) + raw, version=version, level=sub))
     if version == 5:
         props = ([(0x9B, xform(*s["pin"]))] if "pin" in s else []) + ([(0xA4, s["misc"])] if "misc" in s else [])
+        props += ([(0x9D, xform1d(*s["ends"]))] if "ends" in s else []) + ([(0x85, s["line"])] if "line" in s else [])
         if props:
             parts.append(vsd_chunk(0x68, v5_records(props), version=5, level=sub))
         if s.get("runs"):
@@ -557,6 +590,10 @@ def shape_chunks(s, version, level=1):
     else:
         if "pin" in s:
             parts.append(vsd_chunk(0x9B, xform(*s["pin"]), version=version, level=sub + 1))
+        if "ends" in s:
+            parts.append(vsd_chunk(0x9D, xform1d(*s["ends"]), version=version, level=sub + 1))
+        if "line" in s:
+            parts.append(vsd_chunk(0x85, s["line"], version=version, level=sub + 1))
         if "misc" in s:
             parts.append(vsd_chunk(0xA4, s["misc"], version=version, level=sub))
         for n, f in s.get("runs", ()):
@@ -572,13 +609,27 @@ def page_stream(shapes, version):
     return vsd_chunk(0x15, bytes(0x30), version=version, cid=NONE) + b"".join(shape_chunks(s, version) for s in shapes)
 
 
-def drawing(pages, version=11, stencils=(), extra=(), more_stencils=()):
+def style_list(lay, sheets, version):
+    """The styles stream (0x1A, a list) of `sheets`, each a chunk stream: the style sheet chunk 0x4A (its id "id", its
+    parent line style "parent", or "data" in place of sheet_data's) and, when given, its "line" (0x85 data)."""
+    ptrs = []
+    for sh in sheets:
+        raw = vsd_chunk(0x4A, sh["data"] if "data" in sh else sheet_data(sh.get("parent", NONE), version),
+                        version=version, cid=sh["id"], level=0)
+        if "line" in sh:
+            raw += vsd_chunk(0x85, sh["line"], version=version, level=1)
+        ptrs.append(lay.put(raw, 0x4A, 0xD0))
+    return lay.put(vsd_list(ptrs, version=version, ptype=0x1A), 0x1A, 0x50)
+
+
+def drawing(pages, version=11, stencils=(), extra=(), more_stencils=(), styles=(), late_styles=False):
     """A VisioDocument laid out as real files: the trailer list holds the name list (0x32: one 0x33 name per page;
-    Visio 5 one blob of 0x33 records), the stencils (0x1D: each stencil page 0x1E a list of shape streams, a shape's
-    id its "id" else its index), `extra` ((type, format, stream bytes); real files hold their font list 0x18 before
-    the pages), then the pages list (0x27: each page a chunk stream, then the name index 0xC9 naming page k by name
-    k). A page is a dict: "name", "shapes", "background", "compressed" (the stream LZ77-coded, format bit 1).
-    `more_stencils` is a second stencil list after the first."""
+    Visio 5 one blob of 0x33 records), the style sheets (`styles`, see style_list), the stencils (0x1D: each stencil
+    page 0x1E a list of shape streams, a shape's id its "id" else its index), `extra` ((type, format, stream bytes);
+    real files hold their font list 0x18 before the pages), then the pages list (0x27: each page a chunk stream, then
+    the name index 0xC9 naming page k by name k), then the style sheets when `late_styles`. A page is a dict: "name",
+    "shapes", "background", "compressed" (the stream LZ77-coded, format bit 1). `more_stencils` is a second stencil
+    list after the first."""
     lay = Layout(version)
     unit = 2 if version == 11 else 1
     if version == 5:  # readName2 skips an s16 (VSD5Parser::getInt), then 8-bit text to a NUL
@@ -588,6 +639,8 @@ def drawing(pages, version=11, stencils=(), extra=(), more_stencils=()):
         names = [lay.put(struct.pack("<I", 1) + encode(p.get("name", ""), version) + bytes(unit), 0x33, 0x40)
                  for p in pages]
         top = [lay.put(vsd_list(names, version=version), 0x32, 0x50)]
+    if styles and not late_styles:
+        top.append(style_list(lay, styles, version))
     for stencil_list in (stencils, more_stencils):
         if not stencil_list:
             continue
@@ -609,6 +662,8 @@ def drawing(pages, version=11, stencils=(), extra=(), more_stencils=()):
         index = struct.pack("<I", len(pages)) + b"".join(struct.pack("<IIIB", k, k, k, 0) for k in range(len(pages)))
     ptrs.append(lay.put(index, 0xC9, 0x40))
     top.append(lay.put(vsd_list(ptrs, version=version, ptype=0x27), 0x27, 0x50))
+    if styles and late_styles:
+        top.append(style_list(lay, styles, version))
     return lay.done(lay.put(vsd_list(top, version=version), 0x14, 0x50))
 
 
@@ -626,10 +681,13 @@ def read(data, streams=None):
 
 def lines(sec):
     """Each block of a section as text: a Para's inlines joined (Break as a newline; "hidden:" before hidden text),
-    a list item after "- ", an Image as its kind."""
+    a list item after "- ", an Image as its kind, a Mermaid block as its text (checked by mermaid_ok)."""
     out = []
     for b in sec.blocks:
-        if isinstance(b, Para):
+        if isinstance(b, Code):
+            assert b.lang == "mermaid" and mermaid_ok(b.text), b
+            out.append(b.text)
+        elif isinstance(b, Para):
             out.append(("hidden:" if b.hidden else "")
                        + "".join(i.text if isinstance(i, Text) else "\n" for i in b.inlines))
         elif isinstance(b, ListItem):
@@ -972,28 +1030,28 @@ def test_master_ids_resolve_once():
 
 
 def test_connections():
-    # a connector glued at both ends (readMisc's blocks: v11 from 45, v6 from 23) is listed after the page's
-    # shapes, its text the label and out of the shape flow; one glued end only lists nothing and keeps its text;
-    # an end the page lacks reads "shape <id>"
+    # a connector glued at both ends (readMisc's blocks: v11 from 45, v6 from 23) is an edge of the page's Mermaid
+    # block, placed at its first node's slot; its text is the label and leaves the flow, as do the nodes' texts. One
+    # glued end and no XForm1D is a loose connector: counted, its text kept
     for version in (11, 6):
         shapes = [{"id": 1, "text": "Start", "pin": (0.0, 9.0)}, {"id": 2, "text": "End", "pin": (0.0, 5.0)},
                   {"id": 3, "text": "flows", "pin": (0.0, 7.0), "misc": misc(version, ends=(1, 2))},
-                  {"id": 4, "text": "loose", "pin": (0.0, 3.0), "misc": misc(version, ends=(1,))},
-                  {"id": 5, "misc": misc(version, ends=(2, 9))}]
+                  {"id": 4, "text": "loose", "pin": (0.0, 3.0), "misc": misc(version, ends=(1,))}]
         doc, ctx = read(drawing([{"shapes": shapes}], version=version))
-        assert lines(doc.blocks[0]) == ["Start", "End", "loose", "Connections:", "- Start → End (flows)",
-                                        "- End → shape 9"], (version, lines(doc.blocks[0]))
-        assert not ctx.skipped, ctx.skipped
+        got = lines(doc.blocks[0])
+        assert got == ['flowchart TD\n  n1["Start"]\n  n2["End"]\n  n1 -->|"flows"| n2', "loose"], (version, got)
+        assert not any("Connections:" in t for t in got)
+        assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
     # a block of another kind, or with the pattern broken, is passed over by its length
     odd = bytearray(misc(11, ends=(1, 2)))
     odd[45 + 6] = 0x75  # the first block is no longer a glue block: the second gives the begin only
-    doc, _ = read(drawing([{"shapes": [{"id": 1, "text": "a"}, {"id": 3, "text": "c", "misc": bytes(odd)}]}]))
-    assert lines(doc.blocks[0]) == ["a", "c"], lines(doc.blocks[0])
+    doc, ctx = read(drawing([{"shapes": [{"id": 1, "text": "a"}, {"id": 3, "text": "c", "misc": bytes(odd)}]}]))
+    assert lines(doc.blocks[0]) == ["a", "c"] and ctx.skipped == {"connector_loose": 1}, lines(doc.blocks[0])
 
 
 def test_connection_budget_shared():
-    # one ConnectionBudget for the document: CONNECTIONS 1, two pages with one connector each -> the first listed,
-    # the second cut (counted once), its text still out of the shape flow
+    # one ConnectionBudget for the document: CONNECTIONS 1, two pages with one connector each -> the first an edge,
+    # the second cut (counted once), its text kept in the flow
     def page(tag):
         return {"shapes": [{"id": 1, "text": f"A{tag}"}, {"id": 2, "text": f"B{tag}"},
                            {"id": 3, "text": f"c{tag}", "misc": misc(11, ends=(1, 2))}]}
@@ -1004,26 +1062,161 @@ def test_connection_budget_shared():
         doc, ctx = read(drawing([page(1), page(2)]))
     finally:
         diagram.CONNECTIONS = old
-    assert [lines(s) for s in doc.blocks] == [["A1", "B1", "Connections:", "- A1 → B1 (c1)"], ["A2", "B2"]]
+    assert [lines(s) for s in doc.blocks] == [['flowchart TD\n  n1["A1"]\n  n2["B1"]\n  n1 -->|"c1"| n2'],
+                                              ["A2", "B2", "c2"]], [lines(s) for s in doc.blocks]
     assert ctx.skipped == {"connections_cut": 1}, ctx.skipped
 
 
 def test_hidden_text():
     # readMisc's flag 0x20: the text is a hidden Para, left out unless --hidden and counted as hidden; a stencil
-    # shape's flag is inherited unless the shape has a misc chunk of its own; hidden text never names an end
+    # shape's flag is inherited unless the shape has a misc chunk of its own. A hidden shape is a blank node that
+    # keeps its slot; a connector's hidden text is no label and stays in the flow, hidden
     stencils = [[{"id": 1, "text": "veiled", "misc": misc(hide=True)}]]
     shapes = [{"id": 1, "text": "secret", "pin": (0.0, 9.0), "misc": misc(hide=True)},
               {"id": 2, "master": (0, 1), "pin": (0.0, 8.0)},
               {"id": 3, "master": (0, 1), "pin": (0.0, 7.0), "misc": misc()},
               {"id": 4, "text": "link", "pin": (0.0, 6.0), "misc": misc(hide=True, ends=(1, 3))}]
     doc, ctx = read(drawing([{"shapes": shapes}], stencils=stencils))
-    assert lines(doc.blocks[0]) == ["hidden:secret", "hidden:veiled", "veiled", "hidden:link", "Connections:",
-                                    "- shape 1 → veiled"], lines(doc.blocks[0])
+    assert lines(doc.blocks[0]) == ['flowchart TD\n  n1[" "]\n  n2["veiled"]\n  n1 --> n2', "hidden:secret",
+                                    "hidden:veiled", "hidden:link"], lines(doc.blocks[0])
     assert not ctx.skipped
     with tempfile.TemporaryDirectory() as tmp:
         shown = markdown.render(doc, Path(tmp) / "assets", True, ctx.skipped)
         left = markdown.render(doc, Path(tmp) / "assets", False, ctx.skipped)
     assert "secret" in shown and "secret" not in left and "(3 hidden places left out)" in left, left
+
+
+AB = [{"id": 1, "text": "A", "pin": (1.0, 5.0, 1.0, 0.5, 2.0, 1.0)},  # boxes (0, 4.5)-(2, 5.5) and (5, 4.5)-(7, 5.5)
+      {"id": 2, "text": "B", "pin": (6.0, 5.0, 1.0, 0.5, 2.0, 1.0)}]
+INFERRED_AB = 'flowchart LR\n  n1["A"]\n  n2["B"]\n  %% inferred from position\n  n1 -->{} n2'
+
+
+def test_xform_extras_and_1d():
+    # 0x9B's Width, Height, Angle and flips give each shape its box (about the pin, as vsdx), 0x9D its ends: an
+    # unglued 1-D shape whose ends lie in two boxes is an inferred edge, its text the label
+    go = {"id": 3, "text": "go", "pin": (3.5, 5.0, 2.0, 0.0, 4.0, 0.0), "ends": (1.5, 5.0, 5.5, 5.0)}
+    # an XForm cut before Width (the pin only) gives no box: nothing to land on, the connector stays loose
+    short = [{"id": k, "text": t, "chunks": [(0x9B, xform(x, 5.0, 1.0, 0.5, 2.0, 1.0)[:19], {"level": 3})]}
+             for k, t, x in ((1, "A", 1.0), (2, "B", 6.0))]
+    # turned: A is 4 x 1 turned a quarter about its pin, so (0, 1.8) is in it; B is mirrored by FlipX about its pin
+    turned = [{"id": 1, "text": "A", "pin": (0.0, 0.0, 2.0, 0.5, 4.0, 1.0, math.pi / 2)},
+              {"id": 2, "text": "B", "pin": (10.0, 0.0, 0.0, 0.5, 2.0, 1.0, 0.0, 1)},
+              {"id": 3, "ends": (0.0, 1.8, 9.0, 0.0)}]
+    # a connector in a group: its ends are in the group's frame, offset by the group's origin (50, 50)
+    grouped = AB + [{"id": 10, "type": 0x47, "pin": (50.0, 50.0, 0.0, 0.0, 0.5, 0.5)},
+                    {"id": 11, "parent": 10, "ends": (-48.5, -45.0, -44.5, -45.0)}]
+    # master entries carry the XForm's size and the XForm1D: B and the connector take their master's
+    stencils = [[{"id": 7, "text": "B", "pin": (6.0, 5.0, 1.0, 0.5, 2.0, 1.0)},
+                 {"id": 8, "ends": (1.5, 5.0, 5.5, 5.0)}]]
+    mastered = [AB[0], {"id": 2, "master": (0, 7)}, {"id": 3, "master": (0, 8)}]
+    pages = [{"shapes": AB + [go]}, {"shapes": short + [go]}, {"shapes": turned}, {"shapes": grouped},
+             {"shapes": mastered}]
+    doc, ctx = read(drawing(pages, stencils=stencils))
+    got = [lines(s) for s in doc.blocks]
+    assert got[0] == [INFERRED_AB.format('|"go"|')], got[0]
+    assert got[1] == ["A", "go", "B"], got[1]
+    assert got[2] == [INFERRED_AB.format("")], got[2]
+    assert got[3] == [INFERRED_AB.format("")], got[3]
+    assert got[4] == [INFERRED_AB.format("")], got[4]
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
+    # a 0x9D cut short (BeginX, BeginY and EndX only) is no end point: loose
+    cut = {"id": 3, "chunks": [(0x9D, xform1d(1.5, 5.0, 5.5, 5.0)[:27], {"level": 3})]}
+    doc, ctx = read(drawing([{"shapes": AB + [cut]}]))
+    assert lines(doc.blocks[0]) == ["A", "B"] and ctx.skipped == {"connector_loose": 1}, ctx.skipped
+
+
+def test_line_markers():
+    # 0x85's start (byte 25) and end (26) markers, nonzero an arrowhead, 0 none; no 0x85 is not known ('-->')
+    def page(**conn):
+        return {"shapes": [{"id": 1, "text": "A", "pin": (0.0, 9.0)}, {"id": 2, "text": "B", "pin": (0.0, 5.0)},
+                           {"id": 3, "misc": misc(conn.pop("version", 11), ends=(1, 2)), **conn}]}
+
+    want = 'flowchart TD\n  n1["A"]\n  n2["B"]\n  {}'
+    for version in (11, 6):
+        lines_ = [line(0, 13), line(5, 13), line(0, 0), line(4, 0), line(4, 13)[:26], None]
+        pages = [page(version=version, **({"line": d} if d is not None else {})) for d in lines_]
+        doc, ctx = read(drawing(pages, version=version))
+        got = [lines(s) for s in doc.blocks]
+        assert got == [[want.format(e)] for e in ("n1 --> n2", "n1 <--> n2", "n1 --- n2", "n2 --> n1",
+                                                  "n2 --> n1", "n1 --> n2")], (version, got)
+        assert not ctx.skipped, ctx.skipped
+    # a master shape's markers when the shape has no 0x85 of its own; its own one wins
+    stencils = [[{"id": 1, "line": line(0, 0)}]]
+    doc, ctx = read(drawing([page(master=(0, 1)), page(master=(0, 1), line=line(0, 9))], stencils=stencils))
+    assert [lines(s) for s in doc.blocks] == [[want.format("n1 --- n2")], [want.format("n1 --> n2")]], doc
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_style_sheet_arrow():
+    # style sheets: 0x4A chunks in the styles stream 0x1A, each its parent line style at 0x22 and its own 0x85; a
+    # shape's line style (the u32 at 42 of its chunk) is walked up the chain to the first sheet with a 0x85
+    styles = [{"id": 2, "line": line(4, 0)}, {"id": 3, "parent": 2}, {"id": 4, "line": line(0, 0)},
+              {"id": 5, "parent": 6}, {"id": 6, "parent": 5},
+              {"id": 7, "data": sheet_data(4)[:0x25]}]  # cut before its parent: no parent
+
+    def page(**conn):
+        return {"shapes": [{"id": 1, "text": "A", "pin": (0.0, 9.0)}, {"id": 2, "text": "B", "pin": (0.0, 5.0)},
+                           {"id": 3, "misc": misc(11, ends=(1, 2)), **conn}]}
+
+    want = 'flowchart TD\n  n1["A"]\n  n2["B"]\n  {}'
+    stencils = [[{"id": 1, "line_style": 4, "pin": (0.0, 0.0)}]]  # (a line style alone keeps no master entry)
+    cases = [(dict(line_style=3), "n2 --> n1"),                    # the marker only on sheet 2, through sheet 3
+             (dict(line_style=4), "n1 --- n2"),                    # explicit 0s: no arrowhead
+             (dict(line_style=4, line=line(0, 9)), "n1 --> n2"),   # the shape's own 0x85 first
+             (dict(line_style=5), "n1 --> n2"),                    # a cycle: none found, not known
+             (dict(line_style=9), "n1 --> n2"),                    # no such sheet
+             (dict(line_style=7), "n1 --> n2"),                    # a sheet cut short has no parent
+             (dict(master=(0, 1)), "n1 --- n2"),                   # no line style of its own: its master's
+             (dict(master=(0, 1), line_style=3), "n2 --> n1"),     # its own line style first
+             (dict(data=shape_data(line_style=4)[:45]), "n1 --> n2")]  # a shape chunk cut before its line style
+    doc, ctx = read(drawing([page(**c) for c, _ in cases], styles=styles, stencils=stencils))
+    got = [lines(s) for s in doc.blocks]
+    assert got == [[want.format(e)] for _, e in cases], got
+    assert not ctx.skipped, ctx.skipped
+    # the chain walks at most MAX_DEPTH sheets (read at call time): 10 -> 11 -> 12 -> 13, the marker on 13
+    chain = [{"id": 10, "parent": 11}, {"id": 11, "parent": 12}, {"id": 12, "parent": 13}, {"id": 13, "line": line(4)}]
+    old = limits.MAX_DEPTH
+    limits.MAX_DEPTH = 3
+    try:
+        doc, ctx = read(drawing([page(line_style=10), page(line_style=11)], styles=chain))
+    finally:
+        limits.MAX_DEPTH = old
+    assert [lines(s) for s in doc.blocks] == [[want.format("n1 --> n2")], [want.format("n2 --> n1")]], doc
+    # style sheets read after the pages give them nothing (libvisio's one walk)
+    doc, ctx = read(drawing([page(line_style=4)], styles=styles, late_styles=True))
+    assert lines(doc.blocks[0]) == [want.format("n1 --> n2")] and not ctx.skipped, lines(doc.blocks[0])
+    # each style sheet and its 0x85, each XForm's size, XForm1D, 0x85 and shape line style read takes an item of the
+    # BIN_RECORDS meter: past it nothing is read, counted `record` once
+    from types import SimpleNamespace
+    old = limits.BIN_RECORDS
+    limits.BIN_RECORDS = 2
+    try:
+        r = vsd._Reader(b"", 11, Context())
+        r.styles = 1
+        r.style_sheet(Chunk(0x4A, 2, 0, 1, sheet_data()))
+        r.style_line(line(4, 0))
+        r.style_sheet(Chunk(0x4A, 3, 0, 1, sheet_data(2)))
+        s = SimpleNamespace(pin=None, geo=None, ends=None, arrows=None)
+        r.xform(s, xform(1.0, 2.0, 0.0, 0.0, 3.0, 4.0))
+        r.xform1d(s, xform1d(1.0, 2.0, 3.0, 4.0))
+        r.line(s, line(4, 4))
+    finally:
+        limits.BIN_RECORDS = old
+    assert r.sheets == {2: [None, (True, False)]} and r.ctx.skipped == {"record": 1}, (r.sheets, r.ctx.skipped)
+    assert (s.pin, s.geo, s.ends, s.arrows) == ([1.0, 2.0, 0.0, 0.0], None, None, None), s
+
+
+def test_v5_inference_only():
+    # Visio 5 has no glue (readMisc's flags only), so its connectors are inferred from their XForm1D; its 0x85
+    # markers are at 21 and 22 (VSD5Parser::readLine); a v5 instance copies its master's text only, no XForm1D
+    stencils = [[{"id": 7, "ends": (1.5, 5.0, 5.5, 5.0)}]]
+    shapes = AB + [{"id": 3, "ends": (1.5, 5.0, 5.5, 5.0), "line": line(4, 0, version=5), "misc": misc(5)},
+                   {"id": 4, "text": "x", "pin": (3.5, 1.0), "misc": misc(5, ends=(1, 2))},
+                   {"id": 5, "master": (0, 7), "text": "m"}]
+    doc, ctx = read(drawing([{"shapes": shapes}], version=5, stencils=stencils))
+    want = 'flowchart LR\n  n1["A"]\n  n2["B"]\n  %% inferred from position\n  n2 --> n1'
+    assert lines(doc.blocks[0]) == [want, "x", "m"], lines(doc.blocks[0])
+    assert not ctx.skipped, ctx.skipped
 
 
 def test_vba():
@@ -1243,23 +1436,25 @@ def test_number_fidelity():
 
 
 def test_edge_cap_per_page():
-    # (fix round 1) a page keeps at most the budget's room + 1 glued connectors, so the budget still sees its cut
-    seen, real = [], vsd._Reader.finish
+    # (fix round 1) a page of more glued connectors than the budget's room: the first ones are edges, the cut is
+    # counted once, and the page's every connector is registered, so the budget sees the cut
+    seen, real = [], vsd.diagram.Diagram.place
 
-    def spy(self, page):
-        seen.append(len(page.edges))
-        return real(self, page)
+    def spy(self, slots):
+        seen.append(len(self.connectors))
+        return real(self, slots)
 
     shapes = [{"id": 1, "text": "A"}, {"id": 2, "text": "B"}] + [
         {"id": k, "misc": misc(11, ends=(1, 2))} for k in (3, 4, 5)]
     old = diagram.CONNECTIONS
-    diagram.CONNECTIONS, vsd._Reader.finish = 1, spy
+    diagram.CONNECTIONS, vsd.diagram.Diagram.place = 1, spy
     try:
         doc, ctx = read(drawing([{"shapes": shapes}]))
     finally:
-        diagram.CONNECTIONS, vsd._Reader.finish = old, real
-    assert seen == [2], seen
-    assert lines(doc.blocks[0]) == ["A", "B", "Connections:", "- A → B"] and ctx.skipped == {"connections_cut": 1}
+        diagram.CONNECTIONS, vsd.diagram.Diagram.place = old, real
+    assert seen == [3], seen
+    assert lines(doc.blocks[0]) == ['flowchart TD\n  n1["A"]\n  n2["B"]\n  n1 --> n2'], lines(doc.blocks[0])
+    assert ctx.skipped == {"connections_cut": 1}, ctx.skipped
 
 
 def test_misc_block_meter():
@@ -1268,7 +1463,8 @@ def test_misc_block_meter():
     filler = glue[:45] + struct.pack("<I", 4) * 500 + glue[45:]
     shapes = [{"id": 1, "text": "A"}, {"id": 2, "text": "B"}, {"id": 3, "text": "c", "misc": filler}]
     doc, ctx = read(drawing([{"shapes": shapes}]))
-    assert lines(doc.blocks[0])[-1] == "- A → B (c)" and not ctx.skipped  # the meter's room reaches the glue
+    want = 'flowchart TD\n  n1["A"]\n  n2["B"]\n  n1 -->|"c"| n2'
+    assert lines(doc.blocks[0]) == [want] and not ctx.skipped  # the meter's room reaches the glue
     old = limits.BIN_RECORDS
     limits.BIN_RECORDS = 100
     try:

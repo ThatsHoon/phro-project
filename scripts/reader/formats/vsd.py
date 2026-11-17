@@ -2,26 +2,32 @@
 # distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 # Ported from libvisio a42aaff13e4a67afcd077c3abb3ef13bb6463025, src/lib/VSDParser.cpp, VSD6Parser.cpp, VSD5Parser.cpp, VSDStencils.cpp, VSDFieldList.cpp, VSDContentCollector.cpp.
 """Visio 2002-2013 (version 11), Visio 2000 (version 6) and Visio 5 drawings (vsd, vst) to the document model: one
-section per page, each shape's text and picture together in reading order, then the page's connection list, as vsdx
-gives them.
+section per page, each shape's text and picture together in reading order, the page's connectors written as one
+`diagram` block, as vsdx gives them.
 
 Ported from libvisio (MPL-2.0) at a42aaff13e4a67afcd077c3abb3ef13bb6463025, `src/lib/`: `VSDParser.cpp`
-(`handleStream`'s page, stencil and shape context, `_handleLevelChange`, `readShape`, `readXFormData`, `readText`,
-`readName`, `readName2`, `readNameIDX`, `readNameIDX123`, `readFieldList`, `readTextField`, `readMisc`, `readFontIX`,
-`readForeignDataType`, `readForeignData`), `VSD6Parser.cpp` (the 8-bit `readText`, `readName`, `readName2`,
-`readTextField`, `readCharIX` and the v6 `readMisc`), `VSD5Parser.cpp` (`handleChunkRecords`, `readShape`,
+(`handleStream`'s page, stencil, style and shape context, `_handleLevelChange`, `readShape`, `readXFormData`,
+`readXForm1D`, `readLine`, `readStyleSheet`, `readText`, `readName`, `readName2`, `readNameIDX`, `readNameIDX123`,
+`readFieldList`, `readTextField`, `readMisc`, `readFontIX`, `readForeignDataType`, `readForeignData`),
+`VSD6Parser.cpp` (the 8-bit `readText`, `readName`, `readName2`, `readTextField`, `readCharIX` and the v6
+`readMisc`), `VSD5Parser.cpp` (`handleChunkRecords`, `readShape`, `readXForm1D`, `readLine`, `readStyleSheet`,
 `readNameIDX`, `readTextField`, `readCharIX`, `readMisc`, the s16 `getUInt`), `VSDStencils.cpp` (`getStencilShape`,
 the stencil pages and their shapes by id), `VSDFieldList.cpp` (`VSDFieldList::handle`'s order, the number and
 date formats of `VSDNumericField::getString`) and `VSDContentCollector.cpp` (a field mark taking the next field's
-value, the character runs of 8-bit text). The walk of the VisioDocument stream is `vsd_stream`'s; this module reads
-one walk of it.
+value, the character runs of 8-bit text, `collectStyleSheet` and `collectLineStyle`: a style's line is its last
+style sheet's). The walk of the VisioDocument stream is `vsd_stream`'s; this module reads one walk of it.
 
 Context. As libvisio, by levels: a stream type 0x15 (outside the stencils, 0x1D) opens a page and its leave closes it,
 background pages (format bit 0 clear) included. A chunk 0x48, 0x47 or 0x4E in a page, or in a stencil page (0x1E),
 starts a shape; the chunks and streams deeper than it are the shape's, and the next step at its level or above ends
-it. Its id is the chunk's, else its stream's pointer index; readShape gives its parent and master: v6 and v11 the
-u32 at 10, the master page u32 at 18 and the master shape u32 at 26; v5 s16s at 2, 6 and 8, widened as getUInt does
-(0xFFFFFFFF: none).
+it. Its id is the chunk's, else its stream's pointer index; readShape gives its parent, master and line style: v6 and
+v11 the u32 at 10, the master page u32 at 18, the master shape u32 at 26 and the line style u32 at 42; v5 s16s at 2,
+6, 8 and 10, widened as getUInt does (0xFFFFFFFF: none). The line style is read only when the chunk holds it.
+
+Style sheets (libvisio's m_isInStyles): inside a styles stream (0x1A) a chunk 0x4A is a style sheet, its id the
+chunk's, its parent line style the u32 at 0x22 (v5 the s16 at 10; none when the chunk is shorter); a 0x85 there is
+the line of the last style sheet read (the last 0x85 of a sheet wins). The first sheet of an id wins; a later one's
+line is not read. One walk, as libvisio: sheets read after a page give that page nothing.
 
 Visio 5 (VSD5Parser): 16-byte pointers and 12-byte chunks (`vsd_stream`); a list chunk (0x32, 0x65, 0x66, 0x68, 0x69,
 0x6A, 0x6B, 0x6C) holds records (handleChunkRecords: a record count u16 and the end offset u16 at its end, before them a
@@ -30,10 +36,14 @@ a chunk of its type, id its place in offset order, one level deeper. Records tha
 not read (no recursion). A name list 0x32 starts a new name map, as in v6 (libvisio's v5 keeps adding to the old one).
 Then v5 is read as v6, with its own layouts: the name index 0xC9 (u16 count, then u16 name id and u16 element id),
 readName2's s16 skip, the text field (the cell type at 3, a name id s16 or a double at 4, its format unknown, so a
-number field shows nothing, as libvisio), the CharIX run (u16 count, u16 font) and readMisc (the flags only: no glued
-ends, so no v5 connector is listed).
+number field shows nothing, as libvisio), the CharIX run (u16 count, u16 font), readLine (the markers at 21 and 22)
+and readMisc (the flags only: no glued ends).
 
-Content of a shape: 0x9B gives PinX, PinY, LocPinX and LocPinY (a unit byte before each double); 0x0E is the text, 8
+Content of a shape: 0x9B (readXFormData) gives PinX (1), PinY (10), Width (19), Height (28), LocPinX (37), LocPinY
+(46), Angle (55) (a unit byte before each double), FlipX (byte 63) and FlipY (byte 64); 0x9D (readXForm1D) BeginX
+(1), BeginY (10), EndX (19), EndY (28); 0x85 (readLine) the start and end markers, bytes 25 and 26 (v5: 21 and 22),
+nonzero an arrowhead and 0 none. Each value is read only when the chunk holds it, a missing one keeping what the shape
+had; the last chunk of a kind wins. 0x0E is the text, 8
 bytes skipped then UTF-16LE (v11) or 8-bit (v5, v6); 0x2C and 0x2D its names, 0x66 the field order and 0xA1 its fields
 (a string field shows the shape name it points at, a number field its value in its format, found from 0x36 (v11) or
 0x24 (v6) of the chunk); each field mark (U+FFFC, or the byte 0x1E in 8-bit text) takes the next field's value.
@@ -57,8 +67,10 @@ shapes by id (the last of an id wins; the first shape read is the page's first s
 as a page shape's, fields and runs included, once, and charged to a stencil room of `limits.MAX_OUTPUT` characters a
 document (past it the shape is lost, and the shapes that would inherit it count `stencil`). A shape naming a master
 page and shape (getStencilShape) takes its text when it has no text chunk of its own, its hidden flag when it has no
-misc chunk of its own, and its XForm (PinX, PinY, LocPinX, LocPinY) when it has none of its own; v5 copies the text
-only, as VSD5Parser::readShape. A master shape id of 0xFFFFFFFF names the master page's first shape: that is vsdx's
+misc chunk of its own, and its XForm (pin and size) when it has none of its own; as vsdx, also its XForm1D, each
+marker and its line style when it has none of its own; v5 copies the text only, as VSD5Parser::readShape. A stencil
+shape with nothing but a line style keeps no entry (a blank one costs none), so its inheritors take no line style
+from it. A master shape id of 0xFFFFFFFF names the master page's first shape: that is vsdx's
 rule (the master's first top-level shape) and libvisio's for vsdx (`m_firstShapeId` is set only by
 VSDXMLParserBase); libvisio's binary path never sets it, so there such an instance inherits nothing. Only completed
 stencil pages are looked in, so a stencil shape naming its own page, itself, or a page read later inherits nothing, as
@@ -72,11 +84,22 @@ first shape is the group, as vsdx's first top-level shape. Pictures are not inhe
 
 Output: `Section("page", title=name)`; the shapes, each its text `Para` (hidden="hidden" when its text is hidden) and
 its picture, sorted by (-PinY, PinX) on the page, a shape's PinY and PinX added to its group's origin (the group's own
-origin plus its Pin less its LocPin, as vsdx places sub-shapes); shapes without an XForm follow in walk order. Then
-`_connections` of the connectors glued at both ends, in walk order, through the document's one
-`diagram.ConnectionBudget`: "A → B (label)", A and B the ends' `_name_of` (their shown text; hidden text never names
-a shape), the label the connector's shown text, which leaves the shape flow (hidden connector text stays in the flow,
-hidden). A `_VBA_PROJECT_CUR` storage counts `vba` once; macros are never read.
+origin plus its Pin less its LocPin, as vsdx places sub-shapes); shapes without an XForm follow in walk order.
+
+Each page is one `diagram.Diagram` scope, through the document's one `diagram.ConnectionBudget`; the slots above are
+keyed by shape id (a repeated id gets a key no glue names). Every shape with text, a picture, an XForm or connector
+data is registered (a shape with none of these is not, so a glue naming it is no glue); a page without a connector
+skips the diagram, as its flow would come back unchanged. A connector is a shape with an XForm1D (BeginX and EndX) or
+a glued end; its ends are glued to the readMisc ids (v5 has no glue, so its connectors are inferred from position
+only) and lie at (BeginX, BeginY) and (EndX, EndY) plus its group's origin, in Visio's page units as they are. Its
+shown text is the label; hidden text is none and stays in the flow, hidden. Its arrowheads are its own 0x85 markers,
+else its master shape's, else the first found up the line style chain (the shape's line style, else its master
+shape's), walked through at most `limits.MAX_DEPTH` sheets with a seen-set; none found is not known. Any other shape
+is a node: its box is (PinX - LocPinX, PinY - LocPinY) and (Width, Height), mirrored about the pin by FlipX and FlipY,
+bounded after the turn by Angle about the pin, plus its group's origin (no pin or no size: no box); its kind is ""
+(decision 9: the reader has no master names), and vsd has no containers (the User section is not read). Diagram
+data never fails a page: registration and `place` run under `ctx.guard("shape")`, a failed `place` leaving the flow
+as it is. A `_VBA_PROJECT_CUR` storage counts `vba` once; macros are never read.
 
 Page names: 0x32 starts the name list, each 0x33 is one name (a u32, s16 in v5, then text to a NUL); a name index
 0xC9 (u32 count, 13-byte records: name id, name id, element id, a byte) or 0x34 (u32 pairs) maps element ids to
@@ -84,8 +107,9 @@ names for the streams one level above it, so a page takes the name its pointer i
 without one, or whose lookup fails (counted `page`), is numbered and keeps its shapes.
 
 Bounds (each read at call time): `vsd_stream`'s for the walk; `limits.BIN_RECORDS` items a document for the loops this
-module runs over chunk data (v5 records, name index records, field order entries, field format blocks, misc blocks),
-the first refusal counted `record` once; `ctx.guard("page")` and `ctx.guard("shape")` around every page and shape, a
+module runs over chunk data (v5 records, name index records, field order entries, field format blocks, misc blocks)
+and one item for each XForm's size, XForm1D, 0x85, shape line style and style sheet read, the first refusal counted
+`record` once; `ctx.guard("page")` and `ctx.guard("shape")` around every page and shape, a
 failed one left out; a shape's text cut at `vsdx.MAX_TEXT` characters (only when the bytes past it hold more than NULs
 and blanks), its names kept up to MAX_TEXT characters in all (a field showing a name not kept marks its text cut), its
 character runs up to MAX_TEXT; then charged to the document's `limits.MAX_OUTPUT` room as vsdx charges it (its
@@ -93,9 +117,9 @@ characters and `vsdx.LINE` for each line break) and LINE more for each block emi
 it is left out. Each cut or refusal counts once, `text` for own text, `stencil` for inherited, `image` for a
 picture; blank text never counts. Pictures: a DIB gets its file header from `officeart.dib_to_bmp` and becomes a PNG;
 each picture's emitted bytes are charged to `limits.IMAGE_BYTES` a document (past it counted `image`). Group chains
-deeper than `limits.MAX_DEPTH` are left out, counted `depth` once a page. Masters up to `vsdx.MASTERS` pages; edges
-kept per page up to the budget's room and one more. Text and names are cut to their caps before they are decoded, and
-nothing is allocated from a declared count.
+deeper than `limits.MAX_DEPTH` are left out, counted `depth` once a page. Masters up to `vsdx.MASTERS` pages; edges up
+to the budget's room. Text and names are cut to their caps before they are decoded, and nothing is allocated from a
+declared count.
 """
 import datetime
 import math
@@ -104,12 +128,13 @@ import struct
 from .. import diagram, images, limits, officeart, text as textmod
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
-from ..model import Doc, Image, ListItem, Para, Section, Text
+from ..model import Doc, Image, Para, Section
 from . import cfb_route, vsd_stream, vsdx, zip_route
 from .vsd_stream import Chunk
 
 PAGE = 0x15
 STENCILS, STENCIL_PAGE = 0x1D, 0x1E
+STYLES, STYLE_SHEET, LINE_CHUNK = 0x1A, 0x4A, 0x85
 SHAPES = frozenset((0x47, 0x48, 0x4E))
 NAME_LIST2, NAME2 = 0x32, 0x33
 NAME_INDEXES = (0xC9, 0x34)
@@ -159,32 +184,25 @@ _MONTHS = ("January", "February", "March", "April", "May", "June", "July", "Augu
            "November", "December")
 
 
-def _name_of(text: str, name_u: str, name: str, sid: str) -> str:
-    """A shape's name in a connection list: the first line of its text cut at diagram.NAME characters, else its NameU,
-    else its Name, else `shape <ID>`."""
-    line = (text or "").strip().replace("\r\n", "\n").replace("\r", "\n").split("\n", 1)[0].strip()
-    if line:
-        return line[:diagram.NAME]
-    for v in (name_u, name):
-        v = (v or "").strip()
-        if v:
-            return v[:diagram.NAME]
-    return f"shape {str(sid)[:diagram.NAME]}"
-
-
-def _connections(edges: list, names: dict) -> list:
-    """`Connections:` and one `- A → B` item per (begin id, end id, label) edge, ` (label)` added when the connector
-    has text; `names` maps a shape id to its _name_of (an id it lacks reads `shape <ID>`). [] for no edges."""
-    if not edges:
-        return []
-    out = [Para([Text("Connections:")])]
-    for begin, end, label in edges:
-        line = f"{names.get(begin) or _name_of('', '', '', begin)} → {names.get(end) or _name_of('', '', '', end)}"
-        label = " ".join((label or "").split())
-        if label:
-            line += f" ({label})"
-        out.append(ListItem(0, "-", [Text(line)]))
-    return out
+def _bound(pin, geo, ox, oy):
+    """(x0, y0, x1, y1) on the page of a shape with XForm `pin` (PinX, PinY, LocPinX, LocPinY) and `geo` (Width,
+    Height, Angle, FlipX, FlipY) under a group origin (ox, oy), as vsdx's box: mirrored about the pin by the flips,
+    bounded after the turn by Angle about the pin. None without a pin or a size; a missing LocPin or Angle is 0."""
+    if pin is None or geo is None:
+        return None
+    px, py, lx, ly = pin
+    w, h, a, fx, fy = geo
+    if px is None or py is None or w is None or h is None:
+        return None
+    lx, ly = lx or 0.0, ly or 0.0
+    x0 = lx - w if fx else -lx  # the box's left and bottom from the pin
+    y0 = ly - h if fy else -ly
+    corners = [(x0, y0), (x0 + w, y0), (x0, y0 + h), (x0 + w, y0 + h)]
+    if a:
+        co, si = math.cos(a), math.sin(a)
+        corners = [(x * co - y * si, x * si + y * co) for x, y in corners]
+    xs, ys = [x for x, _ in corners], [y for _, y in corners]
+    return px + ox + min(xs), py + oy + min(ys), px + ox + max(xs), py + oy + max(ys)
 
 
 def _f64(data, at):
@@ -291,11 +309,15 @@ def number(fmt: int, cell: int, value: float) -> str:
 class _Shape:
     __slots__ = ("sid", "level", "parent", "master", "home", "pin", "text", "cut", "names", "names_size",
                  "names_cut", "order", "fields", "ftype", "fformat", "data", "broken", "has_misc", "hide", "begin",
-                 "end", "runs")
+                 "end", "runs", "geo", "ends", "arrows", "line_style")
 
-    def __init__(self, sid, level, parent, master, home):
+    def __init__(self, sid, level, parent, master, home, line_style=None):
         self.sid, self.level, self.parent, self.master, self.home = sid, level, parent, master, home
+        self.line_style = line_style  # the shape chunk's line style id; None: none or not held
         self.pin = None       # [PinX, PinY, LocPinX, LocPinY], each None when absent
+        self.geo = None       # [Width, Height, Angle, FlipX, FlipY] of the same XForm, each None when absent
+        self.ends = None      # [BeginX, BeginY, EndX, EndY] (XForm1D), each None when absent
+        self.arrows = None    # (start, end) markers of its 0x85: True an arrowhead, False none, None not held
         self.text = None      # the text chunk's bytes, cut to MAX_TEXT characters; None: no text chunk
         self.cut = False      # the text chunk held more than blanks past the cut
         self.names = {}       # 0x2D: name id -> bytes, MAX_TEXT characters in all
@@ -313,12 +335,13 @@ class _Shape:
 
 
 class _Entry:
-    """A stencil shape as its inheritors see it: its text (fields resolved), cut, hidden flag, XForm (or None);
-    inlines built once."""
-    __slots__ = ("text", "cut", "hide", "pin", "_inlines")
+    """A stencil shape as its inheritors see it: its text (fields resolved), cut, hidden flag, XForm pin and size,
+    XForm1D, markers and line style (each None when it has none); inlines built once."""
+    __slots__ = ("text", "cut", "hide", "pin", "geo", "ends", "arrows", "line_style", "_inlines")
 
-    def __init__(self, text, cut, hide, pin=None):
+    def __init__(self, text, cut, hide, pin=None, geo=None, ends=None, arrows=None, line_style=None):
         self.text, self.cut, self.hide, self.pin, self._inlines = text, cut, hide, pin, None
+        self.geo, self.ends, self.arrows, self.line_style = geo, ends, arrows, line_style
 
     def inlines(self):
         if self._inlines is None:
@@ -339,16 +362,25 @@ class _Stencil:
         self.first = NONE
 
 
+class _Item:
+    """A page shape as the page's flow and diagram see it."""
+    __slots__ = ("sid", "parent", "pin", "geo", "ends", "blocks", "hidden", "text", "conn")
+
+    def __init__(self, sid, parent, pin, geo, ends, blocks, hidden, text, conn):
+        self.sid, self.parent, self.pin, self.geo, self.ends = sid, parent, pin, geo, ends
+        self.blocks, self.hidden, self.text = blocks, hidden, text  # its text hidden; its shown text
+        self.conn = conn      # a connector's (begin id, end id, arrows); None for a node
+
+
 class _Page:
-    __slots__ = ("ptr", "title", "entries", "ids", "names", "edges")
+    __slots__ = ("ptr", "title", "items", "ids", "conns")
 
     def __init__(self, ptr):
         self.ptr, self.title = ptr, ""
-        self.entries = []     # (parent, PinX, PinY, blocks) of the shapes that show something, in walk order
+        self.items = []       # _Item of the shapes with text, a picture, an XForm or connector data, in walk order
         self.ids = {}         # shape id -> (parent, PinX, PinY, LocPinX, LocPinY), the first shape of an id; the
         #                       parent alone (an int) for a shape with no XForm, which offsets nothing
-        self.names = {}       # shape id -> its shown text (the first shape of an id with some)
-        self.edges = []       # (begin id, end id, label) of the connectors glued at both ends
+        self.conns = 0        # connectors among the items
 
 
 class _Reader:
@@ -365,6 +397,10 @@ class _Reader:
         self.index = {}       # level -> [name index chunk data, its type, the names it maps to, parsed or None]
         self.fonts = {}       # 0x19 id -> codec (None: LID)
         self.stencil = 0      # stencil (0x1D) streams entered and not left
+        self.styles = 0       # styles (0x1A) streams entered and not left (libvisio's m_isInStyles)
+        self.sheet = None     # the style sheet a 0x85 in the styles goes to (libvisio's m_currentStyleSheet)
+        self.sheets = {}      # style sheet id -> [its parent line style or None, its (start, end) markers or None]
+        self.style_found = {}  # (line style, marker index) -> the marker up the chain; cleared when a sheet changes
         self.collecting = False  # this stencil list is read (no stencil page read before it)
         self.spage = None     # the stencil page being read
         self.spages = {}      # completed stencil pages by pointer index
@@ -412,6 +448,9 @@ class _Reader:
             self.stencil += 1
             if self.stencil == 1:
                 self.collecting = not self.spages
+        elif t == STYLES:
+            self.styles += 1
+            self.sheet = None
         elif t == STENCIL_PAGE:
             if self.stencil and self.collecting and self.spage is None and self.masters_read < vsdx.MASTERS:
                 self.masters_read += 1
@@ -425,6 +464,9 @@ class _Reader:
         t = step.pointer.type
         if t == STENCILS:
             self.stencil -= 1
+        elif t == STYLES:
+            self.styles -= 1
+            self.sheet = None
         elif t == STENCIL_PAGE and self.spage is not None and self.spage.ptr is step.pointer:
             if self.shape is not None:
                 self.flush()
@@ -462,6 +504,10 @@ class _Reader:
         elif t == FONT:
             if not self.wide:
                 self.font(c)
+        elif self.styles and t == STYLE_SHEET:
+            self.style_sheet(c)
+        elif self.styles and t == LINE_CHUNK:
+            self.style_line(c.data)
         elif t in SHAPES:
             if step is not None and self.home() is not None:
                 self.start_shape(step)
@@ -508,6 +554,52 @@ class _Reader:
         if not charset:
             charset = _name_charset(bytes(d[at:at + FONT_NAME]).split(b"\x00", 1)[0])
         self.fonts[c.id] = CHARSET_LID.get(charset)
+
+    # ---- style sheets
+    def style_sheet(self, c):
+        """readStyleSheet: the parent line style (u32 at 0x22; v5 s16 at 10; None when the chunk is shorter or it is
+        0xFFFFFFFF). The first sheet of an id wins; one item of the meter. The 0x85 chunks after it are its line."""
+        self.sheet = None
+        if c.id in self.sheets or not self.take(1):
+            return
+        parent = _s16w(c.data, 10, None) if self.v == 5 else _u32(c.data, 0x22, None)
+        self.sheets[c.id] = [None if parent == NONE else parent, None]
+        self.sheet = c.id
+        self.style_found.clear()
+
+    def style_line(self, data):
+        """collectLineStyle: a 0x85 in the styles is the line of the last style sheet read (its last one wins)."""
+        if self.sheet is None:
+            return
+        marks = self.markers(data)
+        if marks is not None:
+            self.sheets[self.sheet][1] = marks
+            self.style_found.clear()
+
+    def style_arrow(self, style, i):
+        """Marker `i` (0 start, 1 end) of the first sheet up the line style chain from `style` that holds it, walking
+        at most `limits.MAX_DEPTH` sheets and none twice; None when none holds it."""
+        key = (style, i)
+        if key not in self.style_found:
+            seen, cur, found = set(), style, None
+            for _ in range(limits.MAX_DEPTH):
+                if cur is None or cur in seen or cur not in self.sheets:
+                    break
+                seen.add(cur)
+                cur, marks = self.sheets[cur]
+                if marks is not None and marks[i] is not None:
+                    found = marks[i]
+                    break
+            self.style_found[key] = found
+        return self.style_found[key]
+
+    def markers(self, data):
+        """readLine's (start, end) markers: bytes 25 and 26 (v5: 21 and 22), nonzero an arrowhead; an end the chunk
+        does not hold is None. None when it holds neither or the meter refuses its item."""
+        at = 21 if self.v == 5 else 25
+        if len(data) <= at or not self.take(1):
+            return None
+        return data[at] != 0, (data[at + 1] != 0 if len(data) > at + 1 else None)
 
     # ---- pages
     def start_page(self, step):
@@ -576,30 +668,50 @@ class _Reader:
 
     def finish(self, page) -> Section:
         sec = Section("page", title=page.title)
-        memo, placed, loose, deep = {}, [], [], False
-        for parent, x, y, blocks in page.entries:
-            base = self.origin(page.ids, memo, parent)
+        memo, placed, loose, kept, keys, deep = {}, [], [], [], set(), False
+        for it in page.items:
+            base = self.origin(page.ids, memo, it.parent)
             if base is None or base[2] + 1 > limits.MAX_DEPTH:
                 deep = True
                 continue
+            key = it.sid if it.sid not in keys else ("unkeyed", len(keys))  # glue names the first shape of an id
+            keys.add(key)
+            kept.append((key, it, base))
+            slot = (None if it.conn is not None and it.hidden and it.text else key, it.blocks)  # hidden: no label
+            x, y = (it.pin[0], it.pin[1]) if it.pin is not None else (None, None)
             if x is None or y is None:
-                loose.append(blocks)
+                loose.append(slot)
             else:
-                placed.append(((-(y + base[1]), x + base[0]), blocks))
+                placed.append(((-(y + base[1]), x + base[0]), slot))
         if deep:
             self.ctx.skipped["depth"] += 1
             if self.ctx.skipped["depth"] == 1:
                 self.ctx.warnings.append("depth: skipped content nested too deeply")
         placed.sort(key=lambda e: e[0])
-        for _, blocks in placed:
-            sec.blocks.extend(blocks)
-        for blocks in loose:
-            sec.blocks.extend(blocks)
-        edges = self.budget.take(page.edges)
-        names = {sid: _name_of(page.names[sid], "", "", sid)
-                 for b, e, _ in edges for sid in (b, e) if sid in page.names}
-        sec.blocks.extend(_connections(edges, names))
+        slots = [slot for _, slot in placed] + loose
+        flow = [b for _, blocks in slots for b in blocks]
+        if page.conns:  # with no connector the diagram gives the flow back as it is
+            dia = diagram.Diagram(self.ctx, self.budget)
+            for key, it, base in kept:
+                with self.ctx.guard("shape"):
+                    self.register(dia, key, it, base[0], base[1])
+            with self.ctx.guard("shape"):
+                flow = dia.place(slots)
+        sec.blocks.extend(flow)
         return sec
+
+    @staticmethod
+    def register(dia, key, it, ox, oy):
+        """One page shape in the page's diagram: a connector with its glue, end points, arrowheads and shown text, or
+        a node with its blocks and box; (ox, oy) is its group's origin."""
+        if it.conn is None:
+            dia.shape(key, it.blocks, "", _bound(it.pin, it.geo, ox, oy), it.hidden and bool(it.text))
+            return
+        begin, end, arrows = it.conn
+        bx, by, ex, ey = it.ends or (None, None, None, None)
+        p0 = (bx + ox, by + oy) if bx is not None and by is not None else None
+        p1 = (ex + ox, ey + oy) if ex is not None and ey is not None else None
+        dia.connector(key, begin, end, p0, p1, arrows, "" if it.hidden else it.text)
 
     @staticmethod
     def origin(ids, memo, sid):
@@ -649,7 +761,11 @@ class _Reader:
             parent, master = _s16w(d, 2), (_s16w(d, 6, NONE), _s16w(d, 8, NONE))
         else:
             parent, master = _u32(d, 10), (_u32(d, 18, NONE), _u32(d, 26, NONE))
-        self.shape = _Shape(sid, step.level, parent, master, self.home())
+        at, size = (10, 2) if self.v == 5 else (42, 4)
+        style = None
+        if len(d) >= at + size and self.take(1):  # the line style id, only when the chunk holds it
+            style = _s16w(d, at) if self.v == 5 else _u32(d, at)
+        self.shape = _Shape(sid, step.level, parent, master, self.home(), None if style == NONE else style)
 
     def flush(self):
         s, self.shape = self.shape, None
@@ -673,13 +789,35 @@ class _Reader:
         return None if e is _LOST else e
 
     def inherited(self, s):
-        """(entry, hidden) for shape `s`: the master shape when it may give the text, the hidden flag or the XForm."""
-        entry = None
-        if s.master[0] != NONE and (s.text is None or not s.has_misc or (s.pin is None and self.v != 5)):
-            entry = self.master_shape(*s.master)
+        """(entry, hidden) for shape `s`: the master shape it names (see master_shape; None for none) and its hidden
+        flag, its own misc chunk's else its master shape's."""
+        entry = self.master_shape(*s.master) if s.master[0] != NONE else None
         if s.has_misc:
             return entry, s.hide
         return entry, bool(entry is not None and self.v != 5 and entry.hide)  # v5 copies no misc
+
+    def inherit(self, s, entry):
+        """readShape's copy of the master shape's XForm (v6, v11: pin and size together) when the shape has none of
+        its own; as vsdx, also its XForm1D, each marker and its line style. v5 copies the text only."""
+        if entry is None or self.v == 5:
+            return
+        if s.pin is None:
+            s.pin, s.geo = entry.pin, entry.geo
+        if s.ends is None:
+            s.ends = entry.ends
+        if entry.arrows is not None:
+            own = s.arrows or (None, None)
+            s.arrows = tuple(m if o is None else o for o, m in zip(own, entry.arrows))
+        if s.line_style is None:
+            s.line_style = entry.line_style
+
+    def arrows_of(self, s):
+        """A connector's (start, end) arrowheads: its own markers (its master's merged in), else its line style
+        chain's; None: not known."""
+        own = s.arrows or (None, None)
+        if s.line_style is None:
+            return own
+        return tuple(self.style_arrow(s.line_style, i) if v is None else v for i, v in enumerate(own))
 
     def keep(self, s, spage):
         """A stencil shape: its text resolved once and kept (charged to the stencil room) for its inheritors. One
@@ -702,17 +840,17 @@ class _Reader:
         if not text.strip():
             text = ""
         cost = len(text) + vsdx.LINE * (text.count("\n") + text.count("\r"))
-        pin = s.pin if s.pin is not None or entry is None or self.v == 5 else entry.pin
+        self.inherit(s, entry)
         if cost > self.stencil_room:
             spage.shapes[s.sid] = _LOST
-        elif not (text or cut or hide or pin):
+        elif not (text or cut or hide or s.pin or s.ends or s.arrows):  # a line style alone keeps no entry
             spage.shapes.pop(s.sid, None)  # blank: no entry, as a missing id reads _EMPTY (an earlier one dropped)
         else:
             self.stencil_room -= cost
-            spage.shapes[s.sid] = _Entry(text, cut, hide, pin)
+            spage.shapes[s.sid] = _Entry(text, cut, hide, s.pin, s.geo, s.ends, s.arrows, s.line_style)
 
     def place(self, s, page):
-        """A page shape: its text (its own, else its master's), hidden flag, glued ends and picture."""
+        """A page shape: its text (its own, else its master's), hidden flag, picture, geometry and connector data."""
         entry, hidden = self.inherited(s)
         kind, inlines = "text", None
         if s.text is not None:
@@ -724,10 +862,8 @@ class _Reader:
             text, cut = "", False
         else:
             text, cut, kind = entry.text, entry.cut, "stencil"
-        glued = s.begin is not None and s.end is not None
-        show = hidden or not glued  # a glued connector's shown text is its label in the connection list
         if text.strip():
-            cost = len(text) + vsdx.LINE * (text.count("\n") + text.count("\r") + show)
+            cost = len(text) + vsdx.LINE * (text.count("\n") + text.count("\r") + 1)
             if cost > self.room:
                 self.ctx.skipped[kind] += 1
                 text = ""
@@ -741,32 +877,62 @@ class _Reader:
             text = ""
             if cut:
                 self.ctx.skipped[kind] += 1
-        if text and not hidden and s.sid not in page.names:  # hidden text never names a shape
-            page.names[s.sid] = text
-        if glued and len(page.edges) <= self.budget.room:  # one past the room, so the budget sees the cut
-            page.edges.append((s.begin, s.end, "" if hidden else text))
         blocks = []
-        if text and show:
+        if text:
             blocks.append(Para(inlines if inlines is not None else vsdx._inlines(text.strip("\n")),
                                hidden="hidden" if hidden else ""))
         blocks.extend(self.picture(s))
-        if s.pin is None and entry is not None and self.v != 5:  # readShape copies the master's XForm (v6, v11)
-            s.pin = entry.pin
+        self.inherit(s, entry)
         pin = s.pin or (None, None, None, None)
         if s.sid not in page.ids and (s.pin is not None or s.parent not in (0, NONE)):
             page.ids[s.sid] = s.parent if s.pin is None else (s.parent, *pin)  # the parent alone: no 5-tuple of Nones
-        if blocks:
-            page.entries.append((s.parent, pin[0], pin[1], blocks))
+        conn = None
+        if (s.ends is not None and s.ends[0] is not None and s.ends[2] is not None) or s.begin is not None \
+                or s.end is not None:  # an XForm1D (BeginX and EndX) or a glued end
+            conn = (s.begin, s.end, self.arrows_of(s))
+            page.conns += 1
+        if blocks or s.pin is not None or conn is not None:
+            page.items.append(_Item(s.sid, s.parent, s.pin, s.geo, s.ends, blocks, hidden, text, conn))
 
     # ---- chunk readers (libvisio's names)
     def xform(self, s, data):
-        """readXFormData: PinX at 1, PinY at 10, LocPinX at 37, LocPinY at 46 (a unit byte before each double);
-        a value the chunk does not hold keeps what the shape had."""
+        """readXFormData: PinX at 1, PinY at 10, LocPinX at 37, LocPinY at 46 (a unit byte before each double); then,
+        for one item of the meter when the chunk holds Width, Width at 19, Height at 28, Angle at 55, the FlipX
+        byte at 63 and FlipY at 64. A value the chunk does not hold keeps what the shape had."""
+        n = len(data)
         pin = list(s.pin or (None, None, None, None))
         for i, at in enumerate((1, 10, 37, 46)):
-            if at + 8 <= len(data):
+            if at + 8 <= n:
                 pin[i] = _f64(data, at)
         s.pin = pin
+        if n < 27 or not self.take(1):
+            return
+        geo = list(s.geo or (None, None, None, None, None))
+        for i, at in enumerate((19, 28, 55)):
+            if at + 8 <= n:
+                geo[i] = _f64(data, at)
+        for i, at in ((3, 63), (4, 64)):
+            if at < n:
+                geo[i] = data[at] != 0
+        s.geo = geo
+
+    def xform1d(self, s, data):
+        """readXForm1D: BeginX at 1, BeginY at 10, EndX at 19, EndY at 28 (a unit byte before each double), one item
+        of the meter; a value the chunk does not hold keeps what the shape had."""
+        n = len(data)
+        if n < 9 or not self.take(1):
+            return
+        ends = list(s.ends or (None, None, None, None))
+        for i, at in enumerate((1, 10, 19, 28)):
+            if at + 8 <= n:
+                ends[i] = _f64(data, at)
+        s.ends = ends
+
+    def line(self, s, data):
+        """readLine of a shape: its start and end markers (see markers); the last 0x85 wins."""
+        marks = self.markers(data)
+        if marks is not None:
+            s.arrows = marks
 
     def text(self, s, data):
         """readText: 8 bytes skipped, the rest kept up to MAX_TEXT characters (the chunk's last wins); cut when the
@@ -990,8 +1156,9 @@ class _Reader:
 
 
 # chunk type -> the _Reader method that reads it (looked up per call); _BY_CHUNK's take the chunk, the rest its data
-_HANDLERS = {0x9B: "xform", 0x0E: "text", 0x2C: "name_list", 0x2D: "listed", 0x66: "field_list", 0xA1: "field",
-             0xA4: "misc", 0x94: "char_ix", 0x98: "foreign_type", 0x0C: "foreign_data"}
+_HANDLERS = {0x9B: "xform", 0x9D: "xform1d", 0x85: "line", 0x0E: "text", 0x2C: "name_list", 0x2D: "listed",
+             0x66: "field_list", 0xA1: "field", 0xA4: "misc", 0x94: "char_ix", 0x98: "foreign_type",
+             0x0C: "foreign_data"}
 _BY_CHUNK = frozenset((0x2D, 0xA1))
 
 
