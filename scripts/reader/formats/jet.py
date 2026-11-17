@@ -1076,7 +1076,9 @@ def _picture(db: _Db, definition: bytes):
     charged before inflation: a failure keeps it all, a success gives back what its output fell short of that most
     (keeping one whole pass and the output). A
     definition is decoded once a document (`_Db.pictures`): a repeat takes its bytes of the budget again, or is counted
-    `image` again when it failed. None, counted `image`, past the budget or when the wrapper cannot be read."""
+    `image` again when it failed. None, counted `image`, past the budget or when the wrapper cannot be read; a file
+    whose declared length n passes the budget's room is refused before it is inflated or charged (as zipx refuses a
+    member), so it leaves the room to the files after it."""
     budget = db.images
     key = bytes(definition)
     if key in db.pictures:
@@ -1096,6 +1098,8 @@ def _picture(db: _Db, definition: bytes):
             raise ReadError("too_large", "attachment past IMAGE_BYTES")
         kind, n = struct.unpack_from("<iI", blob, 0)
         if kind == 1:
+            if n > room:  # its declared length cannot fit: refused before any inflating, so it spends no room
+                raise ReadError("too_large", "attachment past IMAGE_BYTES")
             stream = blob[8:]
             most = min(n, limits.CFB_STREAM, max(limits.ZIP_RATIO * len(stream), limits.ZIP_RATIO_FLOOR), room,
                        max(0, db.total - db.spent - 1) * _INFLATE // 2)

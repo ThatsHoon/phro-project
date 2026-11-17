@@ -409,8 +409,8 @@ def test_failed_inflate_charged():
     b = flate.Budget()
     assert _detail(lambda: flate.gunzip(gzip.compress(bytes(100_000)), b, 100)).startswith("part:")
     assert 100 < b.used <= chunk, b.used
-    # a corrupt stream: the deflate blocks before the bad one are inflated and charged (but the output of the call
-    # that fails, at most one chunk, which zlib drops)
+    # a corrupt stream: the deflate blocks before the bad one are inflated and charged, and the call that fails is
+    # charged a whole chunk, the most it can have inflated before zlib dropped its output
     text = bytes(random.Random(5).choice(b"abcdefgh ") for _ in range(200_000))
     c = zlib.compressobj(9, zlib.DEFLATED, -15)
     bad = c.compress(text) + c.flush(zlib.Z_FULL_FLUSH) + b"\xff" * 16  # block type 3 does not exist
@@ -423,7 +423,50 @@ def test_failed_inflate_charged():
         assert not isinstance(e, flate.Truncated), e
     else:
         raise AssertionError("corrupt")
-    assert len(text) - chunk <= b.used <= len(text), b.used
+    assert len(text) <= b.used <= len(text) + chunk, b.used
+
+
+def test_corrupt_streams_charged():
+    # (Task 25 review) an 85-byte stream of 60 KiB of zeros, a flush and a block of type 3 inflates its 60 KiB inside
+    # the one call that fails, whose output zlib drops: each such stream is charged a chunk, so they spend the total
+    import gzip
+    import zlib
+    from reader.containers import flate
+    chunk = flate._CHUNK
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    bad = c.compress(bytes(60 * 1024)) + c.flush(zlib.Z_FULL_FLUSH) + b"\xff" * 4
+    assert len(bad) < 100, len(bad)
+    b = flate.Budget(2 * 2**20)
+    kinds = []
+    for _ in range(40):
+        try:
+            flate.inflate(bad, b)
+        except ReadError as e:
+            kinds.append(e.detail.split(":")[0])
+        except ValueError:
+            kinds.append("bad")
+    assert kinds[0] == "bad" and kinds[-1] == "total" and kinds.count("bad") <= 2 * 2**20 // chunk, kinds
+    # gunzip's stream too
+    b = flate.Budget()
+    gz = gzip.compress(b"")[:10] + bad
+    try:
+        flate.gunzip(gz, b, 10**6)
+    except ValueError:
+        pass
+    assert b.used >= chunk, b.used
+    # a well-formed stream is charged its bytes exactly, in either framing: the failed raw reading of a zlib stream
+    # and the zlib reading of a raw one stop at the header, so they cost nothing
+    text = bytes(range(256)) * 400
+    for packed, fn in ((zlib.compress(text), flate.inflate), (zlib.compress(text, wbits=-15), flate.inflate),
+                       (gzip.compress(text), lambda d, bud: flate.gunzip(d, bud, 10**6))):
+        for level in (1, 9):
+            b = flate.Budget()
+            assert fn(packed, b) == text and b.used == len(text), (b.used, level)
+    for wbits in (9, 10, 11, 12, 13, 14, 15):  # every zlib window size and level a writer may use
+        for level in (0, 1, 6, 9):
+            co = zlib.compressobj(level, zlib.DEFLATED, wbits)
+            b = flate.Budget()
+            assert flate.inflate(co.compress(text) + co.flush(), b) == text and b.used == len(text), (wbits, level)
 
 
 def main():

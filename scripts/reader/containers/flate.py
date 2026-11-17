@@ -7,6 +7,19 @@ from ..limits import ReadError
 _CHUNK = 64 * 1024
 
 
+def _framing(data: bytes, wbits: int) -> bool:
+    """The stream's first bytes are another framing than `wbits` reads, so a zlib.error there with nothing returned
+    dropped no inflated output: a zlib (15) or gzip (31) reading stops at a header it does not accept, and the raw
+    (-15) reading of a zlib header meets a stored block (CMF's low bits are 000), whose output is its own input bytes
+    copied, never more than the stream holds."""
+    zlib_head = len(data) >= 2 and data[0] & 0x0F == 8 and (data[0] << 8 | data[1]) % 31 == 0
+    if wbits == 15:
+        return not zlib_head
+    if wbits == 31:
+        return data[:2] != b"\x1f\x8b"
+    return zlib_head
+
+
 class Budget:
     """Inflated bytes one document may expand to, across every stream that shares this budget."""
 
@@ -16,9 +29,11 @@ class Budget:
 
 
 def _run(data: bytes, wbits: int, budget: Budget, limit: int | None = None) -> bytes:
-    """Inflate within the cap and what is left of `budget`; the caller charges a whole result. A failure (too_large
-    or zlib.error) charges the bytes inflated before it here, so streams that fail still spend the document's budget:
-    the inflate work of a document is at most its total plus one _CHUNK a call, and none once a failure passed it."""
+    """Inflate within the cap and what is left of `budget`; the caller charges a whole result. A failure charges
+    here what it inflated, so streams that fail still spend the document's budget: a too_large the bytes returned
+    before it; a zlib.error those and a whole _CHUNK more, the most its last call can have inflated before zlib
+    dropped that call's output (none when `_framing` shows the stream was never read as deflate data). So the inflate
+    work of a document is at most its total plus one _CHUNK a call, and none once a failure passed it."""
     if budget.used > budget.total:  # only a charged failure gets here
         raise ReadError("too_large", f"{limits.BIG_TOTAL}: inflated bytes of the document")
     cap = min(limits.CFB_STREAM, max(limits.ZIP_RATIO * len(data), limits.ZIP_RATIO_FLOOR))
@@ -46,8 +61,11 @@ def _run(data: bytes, wbits: int, budget: Budget, limit: int | None = None) -> b
                 buf = d.unconsumed_tail
                 if d.eof or (not buf and len(chunk) < _CHUNK):
                     break
-    except (ReadError, zlib.error):
+    except ReadError:
         budget.used += size
+        raise
+    except zlib.error:
+        budget.used += size if size == 0 and _framing(data, wbits) else size + _CHUNK
         raise
     return b"".join(out), d.eof
 

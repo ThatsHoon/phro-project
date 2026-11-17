@@ -2161,6 +2161,31 @@ def test_attachments_share_budget():
         ["1", "c.png"]
 
 
+def test_attachment_past_room_skipped():
+    # (Task 25 review) a deflated file whose declared length passes what is left of IMAGE_BYTES is counted `image`
+    # without inflating it, so it spends none of the budget: a small file after it is still kept
+    big = bytes(range(256)) * 80  # 20 KiB, deflates small
+    data = jet_db(3, [docs([[1, [("big.png", big, True)]], [2, [("ok.png", PNG, True)]]])])
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES = len(jet_fix_head("png")) + len(PNG) + 5_000
+    seen, orig = [], flate.inflate
+
+    def spy(raw, budget, limit=None):
+        seen.append(limit)
+        return orig(raw, budget, limit)
+    flate.inflate = spy
+    try:
+        ctx = Context()
+        doc = jet.parse_bytes(data, ctx)
+    finally:
+        limits.IMAGE_BYTES = old
+        flate.inflate = orig
+    sec = section(doc, "Docs")
+    assert [i.alt for i in images(sec)] == ["Docs 2: ok.png"] and ctx.skipped == {"image": 1}, ctx.skipped
+    assert len(seen) == 1, seen  # only the small file was inflated
+    assert grid(sec)[1:] == [["1", "big.png"], ["2", "ok.png"]]
+
+
 def jet_fix_head(ext):
     """The content header Jackcess writes before a file's bytes (its length, 1, the extension's length, the
     extension and NUL in UTF-16)."""
