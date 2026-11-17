@@ -966,6 +966,10 @@ def _child(py, src, out):
 
 
 def test_mpxj_samples():
+    """Every non-password .mpp in PHRO_READER_MPP_SAMPLES converts. The folder must hold the 12 MPXJ picks, the 3
+    MPP9 password files (readpassword9, password-protected-mpp9, writepassword9, under those names) and at least one
+    MPXJ test file that names a resource: the smallest picks name none, and without one the Resources table, and so
+    `_resource`'s getters, go unchecked."""
     got = _venv_samples()
     if got is None:
         return
@@ -998,8 +1002,7 @@ def test_mpxj_samples():
                 with_resources += 1
             assert not named or "## Resources" in md, i
     assert with_rows, "no sample showed a task row"
-    if not with_resources:  # the smallest MPXJ files name no resource; MPXJ's own getResources() agrees
-        print("skip: no sample names a resource (the Resources table is not checked)")
+    assert with_resources, "no sample showed a Resources table"
 
 
 def test_mpxj_password_encrypted():

@@ -471,7 +471,7 @@ Hidden content (hidden sheets, slides, rows and text) is left out and marked. To
 python -I -X utf8 scripts/read.py convert <file> [--out DIR] --hidden
 ```
 
-Result against the routing pick on the bench corpus, one line per extension:
+Result against the routing pick on the bench corpus, one line per extension. The `mdb`, `accdb`, `pub`, `vsd`, `vsdx`, `djvu` and `mpp` lines come from phase 4's run, whose bars leave out the documents both engines fail; the other lines keep the figures of the run they were written from, and none of their verdicts changes under that rule:
 
 - `docm`: PASS.
 - `odt`: PASS.
@@ -481,7 +481,7 @@ Result against the routing pick on the bench corpus, one line per extension:
 - `xlsx`: PASS (fidelity 0.714 against 0.705) after one fix: SmartArt anchored on a sheet was dropped without a count and is now read.
 - `xlsm`: PASS (fidelity 0.841 against 0.687). markitdown, the xlsx skill's command, read all three files; none of them holds VBA.
 - `pages`: PASS (fidelity 0.846 against 0.446). LibreOffice, the pick's first step, cannot open five of the ten files; the reader reads four of them, and the fifth is password-protected.
-- `mdb`: PASS on failures. Fidelity has no reference, since only mdbtools and the reader read Access and agreement needs three voters. The reader reads all 41 files; mdbtools cannot open eight Access 97 files, and both give garbled text on one test file. Tokens are listed, not gated: 1,152 against 751, from the schema lines and the saved queries' SQL, which the pick does not give.
+- `mdb`: PASS on failures. Fidelity has no reference, since only mdbtools and the reader read Access and agreement needs three voters. The reader reads 40 of the 41 files; the 41st, a test table of unusual Unicode values, is flagged as garbled for both engines, and mdbtools cannot open eight Access 97 files. Tokens are listed, not gated: 1,152 against 751, from the schema lines and the saved queries' SQL, which the pick does not give.
 - `accdb`: PASS on failures: the reader reads all 38 files, and mdbtools fails one on a decimal value. Tokens are 1,113 against 788, for the same reasons as `mdb`.
 - `pub`: PASS (fidelity 1.000 for both on the four POI files with expected text) with no failure; LibreOffice gives nothing for two files the reader reads. Tokens are 669 against 1,161.
 - `epub`: MISS on tokens only; the bench counts linked images as viewed, text-only tokens are below the pick.
@@ -498,8 +498,8 @@ Result against the routing pick on the bench corpus, one line per extension:
 - `ods`: MISS on fidelity (0.868 against 1.000), mostly a peer-agreement artifact on one public document.
 - `hwp`: MISS on fidelity (0.695 against 0.706) and tokens. The fidelity gap is peer agreement: the reader writes list paragraphs in table cells as marked items, where dochan and hwp-mcp both join them into one line without bullets, so their shared lines set the reference. Tokens: bitmaps become viewable PNGs and are counted, and tables with merged cells are HTML, which also puts text-only tokens above the pick.
 - `doc`: MISS on two failures the pick does not share: a Word 6/95 file, denied as "unsupported", and a hand-made test file without the table stream MS-DOC requires. On the generated document fidelity is above the pick (0.903 against 0.869) and tokens are 13% over, mostly an HTML table with merged cells.
-- `vsd`: MISS on lines only: 10 of the pick's 23 lines are not found whole. LibreOffice's pdf gives a page's text as long lines in drawing order, the reader one shape a paragraph: seven of the ten hold no word the reader lacks apart from words the pdf runs together, one is a lone "." glyph, and two are the text of embedded objects (charts), which the reader counts and does not read. No failure the pick does not share; tokens are 735 against 2,575.
-- `vsdx`: MISS on lines only: 1 of 6 lines is not found whole, and all 61 of its words are in the reader's output, in shape order. Tokens are 209 against 2,078.
+- `vsd`: MISS on lines only: 10 of the pick's 23 lines are not found whole. LibreOffice's pdf gives a page's text as long lines in drawing order, the reader one shape a paragraph: seven of the ten lose no word, or only tokens the pdf split or joined (13 of them, in three lines), one is a lone "." glyph, and two are the text of embedded objects (charts), which the reader counts and does not read. No failure the pick does not share; tokens are 735 against 2,575.
+- `vsdx`: MISS on lines only: 1 of 6 lines is not found whole; all of its 62 words but a lone "s" the pdf prints on its own are in the reader's output, in shape order. Tokens are 209 against 2,078.
 - `oxps`: NODATA, no corpus files; it goes through the `xps` module.
 - `djvu`: NODATA, no other engine reads it. The one corpus file converts with its 12 pages as 12 sections, each with its text layer.
 - `mpp`: NODATA through the MPXJ venv: mpxj is the only other engine and one library is one vote, so fidelity has no reference. Nothing fails that mpxj reads (both deny the one read-password file), and tokens are 257 against 379. Without the venv the reader denies every Project file as not supported, as designed.
