@@ -13,7 +13,8 @@ numbers, escapes, orients and renders, and builds model blocks only.
   diagram after a `nK:` paragraph. A hidden shape, or one with no text, is a blank node; a hidden one keeps its slot.
 - **Containers.** A container shape (not hidden, with a box, not an edge end) holding a node's centre becomes
   `subgraph cK ["title"]`; the smallest box wins, containers nest the same way up to `limits.MAX_DEPTH`, and the nodes
-  of deeper ones go to the deepest kept one. A container with no node is an ordinary shape.
+  of deeper ones go to the deepest kept one. A container with no node is an ordinary shape, and so is every
+  container of a scope with more than INFER_SHAPES of them or with no node box.
 - **Trees.** Directed unlabelled edges, one parent at most, one root reaching every node, a node with two or more
   children, at most `smartart.MAX_LEVEL` levels and no subgraph: a `-` list instead of Mermaid.
 - **Placement.** The block goes at the first slot whose key is a node, an edge or a subgraph; the slots of the shown
@@ -260,10 +261,13 @@ class Diagram:
         return out
 
     def _containers(self, nodes, ends):
-        """({node: its innermost kept container}, {kept container: its parent or None}) for the nodes held."""
+        """({node: its innermost kept container}, {kept container: its parent or None}) for the nodes held. Nothing
+        when no node has a box, or when the candidates pass INFER_SHAPES: the containers stay ordinary shapes."""
+        if not any(self.shapes[n].box for n in nodes):
+            return {}, {}
         cands = [k for k, s in self.shapes.items()
                  if s.container and not s.hidden and s.box and k not in ends and k not in self.connectors]
-        if not cands:
+        if not cands or len(cands) > INFER_SHAPES:
             return {}, {}
         area = {k: (self.shapes[k].box[2] - self.shapes[k].box[0]) * (self.shapes[k].box[3] - self.shapes[k].box[1])
                 for k in cands}

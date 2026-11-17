@@ -349,6 +349,38 @@ def test_nested_containers():
                           "  n1 --> n2"], out
 
 
+def test_container_cap():
+    def build():
+        d, _ = new()
+        d.shape("O", P("Outer"), box=(0, 0, 1000, 1000), container=True, title="Outer")
+        d.shape("I", P("Inner"), box=(0, 0, 100, 100), container=True, title="Inner")
+        d.shape("A", P("A"), box=(10, 10, 20, 20))
+        d.shape("B", P("B"), box=(500, 500, 510, 510))
+        d.connector("c", begin="A", end="B")
+        return d.place([("O", P("Outer")), ("I", P("Inner")), ("A", []), ("B", []), ("c", [])])
+    old = diagram.INFER_SHAPES
+    try:
+        diagram.INFER_SHAPES = 1  # two candidates: past the cap, no subgraph at all
+        out = build()
+    finally:
+        diagram.INFER_SHAPES = old
+    ls = lines(out)
+    assert not any("subgraph" in ln for ln in ls), ls
+    assert out[:2] == P("Outer") + P("Inner") and len(out) == 3, out  # ordinary shapes, their text kept
+    assert lines(build())[1] == '  subgraph c1 ["Outer"]'  # at the default cap they are subgraphs
+
+
+def test_containers_without_node_boxes():
+    d, ctx = new()
+    d.shape("O", P("Outer"), box=(0, 0, 1000, 1000), container=True, title="Outer")
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("c", begin="A", end="B")
+    out = d.place([("O", P("Outer")), ("A", []), ("B", []), ("c", [])])
+    assert lines(out) == ["flowchart TD", '  n1["A"]', '  n2["B"]', "  n1 --> n2"], out
+    assert out[:1] == P("Outer") and len(out) == 2 and not ctx.skipped, (out, ctx.skipped)
+
+
 def test_budget_cut():
     old = diagram.CONNECTIONS
     try:
