@@ -3,15 +3,18 @@ xref and object streams, R4 AES), the OOXML docx, pptx and xlsx packages, mobi (
 (WordPerfect 6 and 5), iWork (IWA Pages, Numbers and Keynote, '09 Pages and Numbers), djvu (a bundled TXTz book, a
 TXTa page), Access (Jet 3, Jet 4), Publisher (2002+, 2000, 97/98) and Visio binary (v11, v5) are damaged at random and
 read; every outcome must be a Doc, another parser's name for a compound file, or a ReadError (no other exception, no
-hang).
+hang). Five diagram seeds (a pptx slide with a glued and a loose connector, a vsdx page with a style-chain arrow, a ppt
+slide with a solver, an hwpx connectLine, an hwp $col) are damaged the same way, and every Mermaid block a damaged
+case writes must pass `diagram_fix.mermaid_ok`.
 
 About 100 cases a seed, each from `random.Random(SEED + k)`, so a failure names the case and repeats. No damaged
 case is ever written to disk: compound files and zips are built in memory and read through the formats' in-memory
 entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `ooxml.parse_package`, `rtf.parse_bytes`, `pdf.parse_bytes`,
 `mobi.parse_bytes`, `wpd.parse_bytes`, `iwork.parse_bytes`, `djvu.parse_bytes`, `jet.parse_bytes`, `pub.parse_compound`,
-`vsd.parse_compound`), and rendering never writes an image. Only the clean xlsb, ppt, docx and pptx seeds touch a
-temporary directory, once each (the xlsx, mobi, wpd, iWork, djvu, Access, Publisher and Visio seeds are built in
-memory). An OOXML case damages one or two of its seed's XML members. An IWA case damages the archive bytes of one or two
+`vsd.parse_compound`, `vsdx.parse` and `hwpx.parse` on bytes, hwp's reader on a compound file's bytes), and rendering
+never writes an image. Only the clean xlsb, ppt, docx and pptx seeds and the clean pptx, ppt, hwpx and hwp diagram
+seeds touch a temporary directory, once each (the xlsx, mobi, wpd, iWork, djvu, Access, Publisher, Visio and vsdx
+diagram seeds are built in memory). An OOXML case damages one or two of its seed's XML members. An IWA case damages the archive bytes of one or two
 `.iwa` members after Snappy is undone (every other case only inside one object's payload, the framing kept), then
 stores them as type-1 chunks; a '09 case damages `index.xml`. A Publisher case damages its Contents or Quill stream
 or both, a Visio case its VisioDocument stream (stored and LZ77-coded pages), before `cfb_bytes`. The RTF seed
@@ -20,6 +23,7 @@ them either.
 
 Run: python -I -X utf8 tests/test_reader_mutation.py
 """
+import dataclasses
 import io
 import random
 import re
@@ -28,6 +32,7 @@ import sys
 import tempfile
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -39,26 +44,31 @@ from reader import markdown  # noqa: E402
 from reader.containers import flate, pbwire, snappy  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
-from reader.formats import (djvu, iwork, iwork_iwa, jet, mobi, ooxml, pdf, ppt, pub, pub_contents, rtf,  # noqa: E402
-                            vsd, wpd, xls, xlsb)
+from reader.formats import (djvu, hwp, hwpx, iwork, iwork_iwa, jet, mobi, ooxml, pdf, ppt, pub,  # noqa: E402
+                            pub_contents, rtf, vsd, vsdx, wpd, xls, xlsb)
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Doc  # noqa: E402
+from reader.model import Code, Context, Doc  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 from pdf_fix import (EncryptSpec, Name, Ref, acroform, font_type0, image_xobject, link_annot,  # noqa: E402
                      outline_items, rule_ops, simple_pdf, text_annot, text_ops, widget)
-from reader_fix import (XLSX_SML, blip_png, cfb_bytes, encrypt_xls, make_ppt, make_xlsb, make_xlsx,  # noqa: E402
-                        make_zip, oa_fbse, pub_2k_file, pub_cells, pub_escher, pub_file, pub_sp, pub_table, xlsx_cell,
-                        xlsx_row)
+from reader_fix import (XLSX_SML, blip_png, cfb_bytes, encrypt_xls, hwp_para, make_hwp, make_ppt,  # noqa: E402
+                        make_xlsb, make_xlsx, make_zip, oa_fbse, oa_solver, pub_2k_file, pub_cells, pub_escher,
+                        pub_file, pub_sp, pub_table, xlsx_cell, xlsx_row)
 import djvu_fix as djf  # noqa: E402
 import iwork_fix as iwf  # noqa: E402
 import jet_fix as jf  # noqa: E402
 import test_reader_docm as dm  # noqa: E402  (the seed builders and fixtures of the owning test files)
+import test_reader_hwp as hw  # noqa: E402
+import test_reader_hwpx as hx  # noqa: E402
 import test_reader_iwork as iw  # noqa: E402
 import test_reader_mobi as mb  # noqa: E402
 import test_reader_omml as om  # noqa: E402
+import test_reader_ppt_shapes as ps  # noqa: E402
 import test_reader_pub as pb  # noqa: E402
 import test_reader_slides as sl  # noqa: E402
 import test_reader_smartart as sa  # noqa: E402
 import test_reader_vsd as vs  # noqa: E402
+import test_reader_vsdx as vx  # noqa: E402
 import test_reader_wpd as wp  # noqa: E402
 import test_reader_xlsb as xb  # noqa: E402
 
@@ -839,6 +849,187 @@ def test_vsd_mutations():
             return lambda: read_doc(vsd.parse_compound, blob)
 
         check_floor(f"vsd {label}", run_cases(f"vsd {label}", make))
+
+
+# ---- diagrams: five seeds whose connectors become a Mermaid graph, damaged in memory and read from bytes
+def mermaid_texts(node, out) -> list:
+    """The text of every Mermaid Code block in a model, in order (the parsers bound its nesting)."""
+    if isinstance(node, Code):
+        if node.lang == "mermaid":
+            out.append(node.text)
+    elif isinstance(node, (list, tuple)):
+        for x in node:
+            mermaid_texts(x, out)
+    elif isinstance(node, dict):
+        for x in node.values():
+            mermaid_texts(x, out)
+    elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+        for f in dataclasses.fields(node):
+            mermaid_texts(getattr(node, f.name), out)
+    return out
+
+
+def read_diagram(parse, data, label, drawn):
+    """read_doc that also checks every Mermaid block the case writes against the grammar and counts, in drawn[0],
+    the cases that write one."""
+    ctx = Context()
+    doc = parse(data, ctx)
+    if isinstance(doc, Doc):
+        texts = mermaid_texts(doc, [])
+        for t in texts:
+            assert mermaid_ok(t), (label, t)
+        drawn[0] += bool(texts)
+        render(doc, ctx.skipped)
+    return doc
+
+
+def pptx_diagram_seed() -> dict:
+    """A slide: Start glued to Middle by one connector, and a loose one from Middle's box to End's (`deck` writes it,
+    clean, to a temporary directory)."""
+    s = (sl.sp("Start", id=2, off=(0, 0), ext=(100, 100)) + sl.sp("Middle", id=3, off=(0, 1000), ext=(100, 100))
+         + sl.sp("End", id=6, off=(0, 2000), ext=(100, 100))
+         + sl.cxn(4, 2, 3, off=(50, 100), ext=(0, 900), tail="triangle")
+         + sl.cxn(5, off=(50, 1100), ext=(0, 900), tail="triangle"))
+    return zip_members(sl.deck([s]))
+
+
+def vsdx_diagram_seed() -> dict:
+    """A page: A and B glued by a connector whose arrows come through a two-style LineStyle chain; built in memory."""
+    shapes = vx.shape(1, "A", (0, 9)) + vx.shape(2, "B", (0, 1)) + vx.shape(3, None, (), "", 'LineStyle="5"')
+    chain = {"5": ("3", vx.cell(EndArrow=0)), "3": (None, vx.cell(BeginArrow=1, EndArrow=1))}
+    return zip_members(vx.vsdx({"P": vx.page_xml(shapes, vx.glued(3, 1, 2))},
+                               extra={"visio/document.xml": vx.styles_xml(chain)}, mem=True))
+
+
+def ppt_diagram_seed():
+    """(streams, (start, end)): a slide with Start and End glued by a solver's rule, its connector between them (built
+    once, clean, in a temporary directory), and the span of the PowerPoint Document stream from the slide's
+    PPDrawing to the end of its solver."""
+    slides, kw = ps.flow()
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "seed.ppt"
+        make_ppt(path, slides, **kw)
+        with Compound(path) as cf:
+            streams = {n: cf.read(n) for n in ("PowerPoint Document", "Current User")}
+    stream, solver = streams["PowerPoint Document"], oa_solver((2, 3, 4))
+    end = stream.find(solver) + len(solver)
+    start = stream.rfind(struct.pack("<HH", 0xF, 0x040C), 0, end)  # the PPDrawing container's header
+    assert end > len(solver) and start >= 0, (start, end)
+    return streams, (start, end)
+
+
+def hwpx_diagram_seed() -> dict:
+    """A section: Alpha and Beta glued by a connectLine (`hwpx_doc` writes it, clean, to a temporary directory)."""
+    return zip_members(hx.hwpx_doc(hx._connectline_sec()))
+
+
+def hwp_diagram_seed():
+    """(streams, raw section, (start, end)): Alpha and Beta glued by a $col (built once, clean, in a temporary
+    directory), the section's records before deflate, and the span of its drawing objects' paragraph."""
+    raw = hw._connect_sec()
+    start, end = len(hwp_para("before")), len(raw) - len(hwp_para("after"))
+    with tempfile.TemporaryDirectory() as d:
+        path = make_hwp(Path(d) / "seed.hwp", [raw])
+        with Compound(path) as cf:
+            streams = {n: cf.read(n) for n in ("FileHeader", "DocInfo", "BodyText/Section0")}
+    return streams, raw, (start, end)
+
+
+def read_hwp(blob, ctx):
+    """hwp.parse's compound-file branch, from bytes (its sniff reads only the FileHeader, never damaged here)."""
+    with Compound(blob) as cf:
+        return hwp._Reader(cf, ctx).run()
+
+
+def raw_deflate(data: bytes) -> bytes:
+    c = zlib.compressobj(wbits=-15)
+    return c.compress(data) + c.flush()
+
+
+def xml_diagram_case(members, targets, parse, label, drawn, stored=()):
+    """Cases that damage one or two of the `targets` XML members: bytes in even cases (the parser refuses most),
+    attribute values in odd ones (`damage_values`: ids, offsets, extents, styles), the zip rebuilt in memory."""
+    def make(rng, k):
+        parts = dict(members)
+        for name in rng.sample(targets, min(len(targets), rng.choice((1, 1, 2)))):
+            parts[name] = damage_values(rng, parts[name]) if k % 2 else apply(plan(rng, len(parts[name])), parts[name])
+        blob = make_zip(None, parts, stored=stored)
+        return lambda: read_diagram(parse, blob, f"{label} case {k}", drawn)
+    return make
+
+
+def ppt_diagram_case(streams, span, label, drawn):
+    """Cases that damage the PowerPoint Document stream: anywhere in even cases, with length-preserving edits inside
+    the slide's drawing and solver in odd ones (the record framing around them kept)."""
+    name = "PowerPoint Document"
+
+    def make(rng, k):
+        parts = dict(streams)
+        data = parts[name]
+        parts[name] = damage_payload(rng, data, [span]) if k % 2 else apply(plan(rng, len(data)), data)
+        blob = cfb_bytes(parts)[0]
+        return lambda: read_diagram(ppt.parse_compound, blob, f"{label} case {k}", drawn)
+    return make
+
+
+def hwp_diagram_case(streams, raw, span, label, drawn):
+    """Cases that damage the section's records before deflate: anywhere in even cases, with length-preserving edits
+    inside the drawing objects' paragraph in odd ones (the record headers around it kept)."""
+    def make(rng, k):
+        parts = dict(streams)
+        data = damage_payload(rng, raw, [span]) if k % 2 else apply(plan(rng, len(raw)), raw)
+        parts["BodyText/Section0"] = raw_deflate(data)
+        blob = cfb_bytes(parts)[0]
+        return lambda: read_diagram(read_hwp, blob, f"{label} case {k}", drawn)
+    return make
+
+
+def diagram_seeds() -> dict:
+    """label: (read(blob, ctx), clean blob, case maker(label, drawn), its clean Mermaid text, routed)."""
+    pptx_m, vsdx_m, hwpx_m = pptx_diagram_seed(), vsdx_diagram_seed(), hwpx_diagram_seed()
+    (ppt_s, ppt_span), (hwp_s, hwp_raw, hwp_span) = ppt_diagram_seed(), hwp_diagram_seed()
+    slide, page = "ppt/slides/slide1.xml", "visio/pages/page1.xml"
+    return {
+        "pptx": (ooxml.parse_package, make_zip(None, pptx_m, stored=()),
+                 lambda label, drawn: xml_diagram_case(pptx_m, [slide], ooxml.parse_package, label, drawn),
+                 'flowchart TD\n  n1["Start"]\n  n2["Middle"]\n  n3["End"]\n  n1 --> n2\n'
+                 '  %% inferred from position\n  n2 --> n3', False),
+        "vsdx": (vsdx.parse, make_zip(None, vsdx_m, stored=()),
+                 lambda label, drawn: xml_diagram_case(vsdx_m, [page, "visio/document.xml"], vsdx.parse, label,
+                                                       drawn),
+                 'flowchart TD\n  n1["A"]\n  n2["B"]\n  n2 --> n1', False),
+        "ppt": (ppt.parse_compound, cfb_bytes(ppt_s)[0],
+                lambda label, drawn: ppt_diagram_case(ppt_s, ppt_span, label, drawn),
+                'flowchart TD\n  n1["Start"]\n  n2["End"]\n  n1 --> n2', True),
+        "hwpx": (hwpx.parse, make_zip(None, hwpx_m),
+                 lambda label, drawn: xml_diagram_case(hwpx_m, ["Contents/section0.xml"], hwpx.parse, label, drawn,
+                                                       stored=("mimetype",)),
+                 'flowchart LR\n  n1["Alpha"]\n  n2["Beta"]\n  n1 --> n2', False),
+        "hwp": (read_hwp, cfb_bytes(hwp_s)[0],
+                lambda label, drawn: hwp_diagram_case(hwp_s, hwp_raw, hwp_span, label, drawn),
+                'flowchart LR\n  n1["Alpha"]\n  n2["Beta"]\n  n1 --> n2', False),
+    }
+
+
+# (Doc outcomes, cases that still draw a diagram): the fewest a seed's CASES cases may give, about half the rates
+# measured at SEED, so a regression that refuses every damaged case, or that stops drawing damaged diagrams, fails
+# while the draw of 100 cases does not. Measured at SEED: pptx 52, 48; vsdx 63, 42; ppt 73, 53; hwpx 53, 53;
+# hwp 100, 57.
+DIAGRAM_FLOOR = {"pptx": (26, 24), "vsdx": (31, 21), "ppt": (36, 26), "hwpx": (26, 26), "hwp": (50, 28)}
+
+
+def test_diagram_mutations():
+    for label, (read, clean, cases, want, routed) in diagram_seeds().items():
+        ctx = Context()
+        doc = read(clean, ctx)
+        texts = mermaid_texts(doc, [])
+        assert texts == [want] and mermaid_ok(want) and not +ctx.skipped, (label, texts, ctx.skipped)  # it draws
+        render(doc, ctx.skipped)
+        drawn = [0]
+        counts = run_cases(f"diagram {label}", cases(f"diagram {label}", drawn), routed=routed)
+        docs, draws = DIAGRAM_FLOOR[label]
+        assert sum(counts.values()) == CASES, (label, counts)
+        assert counts.get("doc", 0) >= docs and drawn[0] >= draws, (label, counts, drawn[0], DIAGRAM_FLOOR[label])
 
 
 def main():
