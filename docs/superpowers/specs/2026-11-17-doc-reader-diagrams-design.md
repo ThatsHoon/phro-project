@@ -44,7 +44,7 @@ Success:
 - **Node IDs.** `n1`, `n2`, … in reading order within the scope. Container IDs are `c1`, `c2`, ….
 - **Short text.** A shape whose content is plain text of at most `NAME` (80) characters goes into its node whole. Each line break becomes `<br>`.
 - **Long or rich content.** Any other shape still gets a node. Its label is the first line of its text, cut at 80 characters, plus `…`. A shape with no text shows a one-word label: `(picture)`, `(table)` or `(chart)`. The shape's own blocks then follow the Mermaid block in node order. Each set starts with a paragraph `nK:`, so nothing is lost.
-- **Hidden and blank ends.** An edge end at a hidden shape, or at a shape with no text, gets a blank node `nK[" "]`. Hidden text stays under the existing hidden rules: it is left out and counted, and shown with `--hidden`. A hidden connector gives no edge; its text follows the same hidden rules in the flow.
+- **Hidden and blank ends.** An edge end at a hidden shape, or at a shape with no text, gets a blank node: `nK[" "]` inside a subgraph; outside every subgraph it is not declared and appears only in its edges, which saves a line per blank end. Hidden text stays under the existing hidden rules: it is left out and counted, and shown with `--hidden`. A hidden connector gives no edge; its text follows the same hidden rules in the flow.
 - **Escapes.** Every label is quoted: `"` becomes `#quot;` and line breaks become `<br>`. Nothing else is escaped. Claude reads the source, so nothing needs to survive a renderer. The existing `Code` renderer already lengthens the fence past any backtick run.
 
 ### Shapes, edges and layout
@@ -69,7 +69,7 @@ Success:
   | at neither end | `nA --- nB` |
   | not known (the format's cell or property is absent) | `nA --> nB`, as today's list reads begin → end |
 
-  A connector with text gets the label form `nA -->|"label"| nB`. Self-loops and repeated edges are kept, since Mermaid allows both.
+  A connector with text gets the label form `nA -->|"label"| nB`. Its label follows the shape rules, on one line (its line breaks and tabs become single spaces): short plain text whole, anything else the first line cut at 80 characters plus `…`, with the connector's own blocks following the Mermaid block like a shape's, so pictures, tables and links on a connector are kept. Self-loops and repeated edges are kept, since Mermaid allows both.
 - **Direction.**
   - When the scope has geometry, it sums the absolute x and y moves between the centres of each edge's two ends.
   - The diagram is `flowchart LR` when the x sum is larger, otherwise `flowchart TD`.
@@ -112,6 +112,7 @@ The list is `ListItem` blocks with `-` markers; children follow their parent's r
   - A glued end keeps its glue. An inferred end must resolve to a shape different from the other end's.
   - If both ends resolve, the connector becomes an inferred edge, using the arrowhead rules above.
   - If they do not, the connector is no edge. Its text stays in the flow, and it counts one `connector_loose`.
+  - **Decoration.** A connector glued at neither end, resolving at neither end, with no arrowhead at either end, is a decorative line (a divider): no edge, its text stays in the flow, and it counts nothing. A DrawingML `cxnSp` with `prst="line"` and no glue is a plain line.
 - **Size.** A scope with more than `INFER_SHAPES` (2,000) shapes is not inferred. Its loose connectors count one `infer_skipped` for the scope.
 
 ## The shared module: `reader/diagram.py`
@@ -121,7 +122,7 @@ class Diagram:                       # one scope
     def __init__(self, ctx, budget: vsdx.ConnectionBudget): ...
     def shape(self, key, blocks: list, kind: str = "", box=None, hidden=False, container=False, title="") -> None
     def connector(self, key, begin=None, end=None, p0=None, p1=None, arrows=(None, None), label="",
-                  line=False, hidden=False) -> None
+                  line=False, hidden=False, blocks=None) -> None
     def place(self, slots: list) -> list
 ```
 
