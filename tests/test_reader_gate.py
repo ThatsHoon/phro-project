@@ -136,9 +136,56 @@ def test_deny_detail_capped():
 
 
 def test_binary_still_denied():
-    for name, data in (("a.vsd", bytes.fromhex("D0CF11E0A1B11AE1") + bytes(100)),):
-        o = out(gate.decide(ev(put(name, data))))
-        assert "not supported yet" in o["permissionDecisionReason"], name
+    # a .vsd of random bytes is not plain text and not built-in-parseable: denied as damaged
+    import random
+    data = bytes(random.Random(7).randrange(256) for _ in range(400))
+    o = out(gate.decide(ev(put("a.vsd", data))))
+    assert o["permissionDecision"] == "deny", o
+    assert "damaged" in o["permissionDecisionReason"], o
+
+
+def test_vst_mpt_not_cfb_pass_through():
+    # .vst is also a Targa image extension; a .vst or .mpt without the compound-file magic is not ours
+    targa = bytes([0, 0, 2]) + bytes(9) + bytes([4, 0, 4, 0, 24, 0]) + bytes(range(256)) * 2
+    assert gate.decide(ev(put("a.vst", targa))) is None
+    assert gate.decide(ev(put("a.mpt", bytes(range(1, 40)) * 20 + bytes(3)))) is None
+    # with the magic the file is ours: a .vst of that head is denied, not passed through
+    o = gate.decide(ev(put("b.vst", bytes.fromhex("D0CF11E0A1B11AE1") + bytes(600))))
+    assert o is not None and out(o)["permissionDecision"] == "deny", o
+
+
+def test_djvu_unsupported_detail():
+    from djvu_fix import iff, page
+    o = out(gate.decide(ev(put("a.djvu", iff(page(None))))))
+    assert o["permissionDecision"] == "deny", o
+    assert "this file is not supported (no text layer:" in o["permissionDecisionReason"], o
+
+
+def test_phase4_formats_convert():
+    import shutil
+    import test_reader_jet as tj
+    from djvu_fix import iff, page
+    from jet_fix import jet_db
+    from reader_fix import cfb_bytes, vsd_document
+    import test_reader_pub as tp
+    import test_reader_vsdx as tx
+    jet = jet_db(1, [tj.orders()])
+    ace = jet_db(5, [tj.orders()])
+    vsd = cfb_bytes({"VisioDocument": vsd_document(11, [[{"text": "Hello"}]])})[0]
+    vsdx = tx.vsdx({"P": tx.shape(1, "Hello")}, mem=True)
+    files = {"a.djvu": iff(page("Hello")), "a.djv": iff(page("Hello")), "a.mdb": jet, "a.accdb": ace,
+             "a.mde": jet, "a.accde": ace, "a.accdr": ace, "a.pub": tp.one_page(["Hello"]),
+             "a.vsd": vsd, "a.vst": vsd, "a.vsdm": vsdx, "a.vstx": vsdx}
+    d = tmp()
+    try:
+        with stub() as base:
+            for name, data in files.items():
+                (d / name).write_bytes(data)  # clean fixtures
+                r = run(d / name, base)
+                assert r is not None and out(r)["permissionDecision"] == "allow", (name, r)
+                assert out(r)["updatedInput"]["file_path"] != str(d / name), name
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_rtf_converts():
@@ -184,11 +231,18 @@ def test_name_is_flattened():
 
 
 def test_unsupported_phase():
-    p = tmp() / "x.vsd"
-    p.write_bytes(b"\xd0\xcf\x11\xe0\x00")
-    o = out(gate.decide(ev(p)))
+    # an extension in FORMATS but not in BUILT is denied as not supported yet
+    old = dict(reader.FORMATS)
+    try:
+        reader.FORMATS["zzq"] = "zzq"
+        p = tmp() / "x.zzq"
+        p.write_bytes(b"\xd0\xcf\x11\xe0\x00")
+        o = out(gate.decide(ev(p)))
+    finally:
+        reader.FORMATS.clear()
+        reader.FORMATS.update(old)
     assert o["permissionDecision"] == "deny"
-    assert o["permissionDecisionReason"] == "x.vsd: this format is not supported yet.", o
+    assert o["permissionDecisionReason"] == "x.zzq: this format is not supported yet.", o
 
 
 def test_retry_by_hand_only_where_it_can_help():

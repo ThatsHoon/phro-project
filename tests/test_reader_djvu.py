@@ -605,8 +605,6 @@ def test_convert_passes_started():
         seen.update(kw)
         return real(data, ctx, **kw)
 
-    had = "djvu" in reader.BUILT
-    reader.BUILT.add("djvu")
     djvu.parse_bytes = stub
     try:
         with tempfile.TemporaryDirectory() as d:
@@ -616,8 +614,6 @@ def test_convert_passes_started():
             out = (Path(d) / "out" / "out.md").read_text(encoding="utf-8")
     finally:
         djvu.parse_bytes = real
-        if not had:
-            reader.BUILT.discard("djvu")
     assert seen.get("started") == reader.STARTED, seen
     assert "Converted" in out
 

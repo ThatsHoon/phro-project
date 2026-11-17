@@ -37,8 +37,9 @@ JET_WORK_TOTAL = 32 * 2**20  # work one Access file may spend on its rows, in un
 #                               decoded; jet.py prices rows and cells in them), at most 10 a byte of the file and 1 MiB
 JET_PAGE_CACHE = 8_192       # decoded pages one Access file with a Jet3/Jet4 db_key keeps (32 MiB at 4 KiB)
 # image bytes one docx, doc, pptx, hwp, hwpx, ppt, xls, xlsb, xlsx, rtf, mobi, azw3, wpd (wp, wp5, wp6, wp7, wpt), pages,
-# numbers, key or pdf document may emit, copies counted (each placement of a picture is charged; a pdf's renders are
-# included)
+# numbers, key, pub, vsd or vsdx or pdf document may emit, copies counted (each placement of a picture is charged; a
+# pdf's renders are included); a djvu file renders none and an Access file's attachments and OLE objects are not
+# emitted as images
 IMAGE_BYTES = 256 * 2**20
 # (an xls also caps the picture placements it reads, all its sheets together: xls_drawing.MAX_PLACEMENTS)
 # tables one doc, docx, hwp, hwpx, rtf or pdf document may open, nested ones counted (an rtf or ppt table's cells are what

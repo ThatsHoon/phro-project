@@ -115,6 +115,15 @@ def looks_like_text(path):
     return not text.lstrip("﻿").startswith("{\\rtf")
 
 
+def _is_cfb(path):
+    """True when the file starts with the compound-file magic."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(8) == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+    except OSError:
+        return False
+
+
 def _is_zip(path):
     """True when the file starts with the zip local-header signature (every Keynote file is a zip)."""
     try:
@@ -378,6 +387,8 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
         return None
     if reader.ext_of(path) == "key" and not _is_zip(path):
         return None  # a binary .key (a DER or PKCS key, say) is not a Keynote file
+    if reader.ext_of(path) in ("vst", "mpt") and not _is_cfb(path):
+        return None  # .vst is also a Targa image extension; a Visio or Project template is a compound file
     if reader.ext_of(path) not in reader.BUILT:
         return _deny(path, "unsupported")
     if path.stat().st_size > limits.MAX_INPUT:

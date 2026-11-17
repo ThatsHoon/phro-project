@@ -32,7 +32,7 @@ def raises_kind(fn, kind):
 
 
 def test_formats_cover_scope():
-    assert len(reader.FORMATS) == 46 and not hasattr(reader, "SKILL_EXTS")
+    assert len(reader.FORMATS) == 54 and not hasattr(reader, "SKILL_EXTS")
     assert reader.ext_of("C:/x/A.HWPX") == "hwpx"
     assert reader.ext_of("C:/x/noext") == ""
     assert reader.BUILT <= set(reader.FORMATS)

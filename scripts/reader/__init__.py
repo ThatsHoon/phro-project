@@ -2,7 +2,7 @@
 import time
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # when the reader was imported: the CLI child passes it to the pdf and djvu page loops' deadlines
 STARTED = time.monotonic()
@@ -20,16 +20,17 @@ FORMATS = {
     "rtf": "rtf", "wpd": "wpd", "wp": "wpd", "wp5": "wpd", "wp6": "wpd", "wp7": "wpd", "wpt": "wpd",
     "mobi": "mobi", "azw3": "mobi",
     "pages": "iwork", "numbers": "iwork", "key": "iwork",
-    "djvu": "djvu",
-    "mdb": "jet", "accdb": "jet",
-    "pub": "pub", "vsd": "vsd", "mpp": "mpp",
+    "djvu": "djvu", "djv": "djvu",
+    "mdb": "jet", "accdb": "jet", "mde": "jet", "accde": "jet", "accdr": "jet",
+    "pub": "pub", "vsd": "vsd", "vst": "vsd", "vsdm": "vsdx", "vstx": "vsdx", "mpp": "mpp", "mpt": "mpp",
     "pdf": "pdf",
 }
 
 # extensions with a working parser; each format task adds its own
 BUILT = {"hwpx", "hwp", "doc", "xls", "odt", "ods", "odp", "docm", "pptm", "ppsx", "vsdx", "epub", "xps", "oxps", "xlsb", "ppt", "rtf",
          "docx", "dotx", "dotm", "pptx", "potx", "potm", "ppsm", "xlsx", "xlsm", "xltx", "xltm", "pdf",
-         "wpd", "wp", "wp5", "wp6", "wp7", "wpt", "mobi", "azw3", "pages", "numbers", "key"}
+         "wpd", "wp", "wp5", "wp6", "wp7", "wpt", "mobi", "azw3", "pages", "numbers", "key",
+         "djvu", "djv", "mdb", "accdb", "mde", "accde", "accdr", "pub", "vsd", "vst", "vsdm", "vstx"}
 
 
 def ext_of(path) -> str:

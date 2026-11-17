@@ -85,7 +85,7 @@ def test_convert_writes_out_meta():
 
 def test_unsupported_ext():
     try:
-        reader.parse(Path("x.vsd"), Context())
+        reader.parse(Path("x.mpp"), Context())
     except ReadError as e:
         assert e.kind == "unsupported"
         return
@@ -252,7 +252,7 @@ def run_cli(*args, env_extra=None):
 
 
 def test_cli_convert_and_fail():
-    f = tmp() / "x.vsd"
+    f = tmp() / "x.mpp"
     f.write_bytes(b"x")
     r = run_cli("convert", str(f))
     assert r.returncode == 1
@@ -262,7 +262,7 @@ def test_cli_convert_and_fail():
 def test_cli_formats():
     r = run_cli("formats")
     lines = r.stdout.splitlines()
-    assert r.returncode == 0 and len(lines) == 46
+    assert r.returncode == 0 and len(lines) == 54
     assert any(ln.startswith("hwpx\thwpx\t") for ln in lines)
     assert lines == sorted(lines)
     assert all(ln.split("\t")[2] in ("built", "unsupported") for ln in lines)
@@ -454,7 +454,7 @@ def test_cli_pdfium_without_module():
 
 def test_precheck():
     try:
-        reader.precheck(Path("x.vsd"))
+        reader.precheck(Path("x.mpp"))
     except ReadError as e:
         assert e.kind == "unsupported"
         return
