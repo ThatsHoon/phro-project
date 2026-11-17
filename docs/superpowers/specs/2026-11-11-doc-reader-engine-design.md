@@ -25,6 +25,7 @@ Success:
 7. (User, 2026-11-14.) The engine also reads docx, pptx, xlsx and xlsm, and dotx, dotm, potx, potm, ppsm, xltx and xltm: phase 2c, specified in `2026-11-14-doc-reader-ooxml-four-design.md`. This moves reading only; creating and editing these files stays with `anthropic-skills:*`. pdf stays with its skill until phase 2d.
 8. (User, 2026-11-14.) pdf is read by the engine: phase 2d, specified in `2026-11-14-doc-reader-pdf-design.md`. Editing and creation stay with `anthropic-skills:pdf`. The stdlib-only rule is dropped (the user, 2026-11-14, restated 2026-11-16: the bar is token and compute efficiency, never the standard library); for pdf that library is pypdfium2 in a plugin-managed venv, installed only on the user's yes, with a stdlib port of dochan's parser when there is no venv.
 9. (User, 2026-11-14.) Phase 4 as specified in `2026-11-15-doc-reader-phase4-design.md`: djvu reads its text layer only; MPL-2.0 ports (libmspub, libvisio) are allowed; mpp is unsupported by default and read only through an opt-in MPXJ venv.
+10. (User, 2026-11-17.) Diagrams as specified in `2026-11-17-doc-reader-diagrams-design.md`: shapes joined by connectors become a Mermaid flowchart, or a nested list for a branching tree, and connector ends left loose are placed by position.
 
 ## Reverse-engineering findings that shape the design
 
@@ -107,6 +108,7 @@ From what cost tokens or lost content in the bench outputs:
 - Tables: GFM pipes with no padding. Only when a table has merged cells, a compact HTML table with `rowspan`/`colspan`. A merged cell's text is written once. Empty trailing rows and columns are trimmed. A 1×1 table becomes a paragraph; a one-column table becomes lines; an empty nested table is dropped.
 - Spreadsheet cells show the displayed value (`₩1,385.50`, dates as formatted), not raw numbers. Formulas are off, except that an xlsx formula cell with no cached value shows its formula (`=SUM(A1:A3)`).
 - Slides: `## Slide N: Title`, speaker notes as `> Notes: …`, then slide comments as `> Comment by Author: …`. Sheets: `## Sheet: name`. Master, date, footer and slide-number placeholders are skipped. Access tables and saved queries: `## Table: name (N rows)` and `## Query: name`, the query's SQL in a fenced `Code` block; Publisher master pages: `## Master page: name`.
+- Diagrams: connected shapes leave the flow for one fenced `mermaid` `Code` block (or a nested list for a tree) at the first connected shape's place, followed by `nK:` paragraphs for content too long or rich for a node label.
 - Footnotes and comments: `[^n]` in place, definitions at the end of the document. A spreadsheet cell's comment is a footnote on its cell, and an external hyperlink stays a link in the cell.
 - Headers and footers: deduplicated, one `Header:`/`Footer:` line at the top; page-number-only ones dropped.
 - Images: written to `assets/img-NNN.<ext>` and linked as `![alt](assets/img-NNN.png)`. Never base64. BMP is converted to PNG. WMF, EMF and other formats Claude cannot view are kept as files and listed once in a note.
@@ -152,6 +154,7 @@ The gate ships in phase 1. A format whose phase is not built yet is denied with 
 | 2d | pdf | `pdfenv` (now `pyenv`) and `read.py setup` (the pypdfium2 venv), `pdfnative/` (dochan's parser), `pdf_layout`, `pdf_tables` (dochan's table assembly), AES-256 and CBC in `crypto`; specified in `2026-11-14-doc-reader-pdf-design.md` |
 | 3 | wpd (with wp, wp5, wp6, wp7, wpt), mobi, azw3, pages, numbers, key | `palmdb`, `snappy`, `pbwire`; specified in `2026-11-15-doc-reader-phase3-design.md` |
 | 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp (opt-in) | `bzz`, `jet_pages`, `vsd_stream`, `pub_contents`, `pub_quill`, `pyenv` (mpp); specified in `2026-11-15-doc-reader-phase4-design.md` |
+| diagrams | every format with drawings: vsd, vsdx, ppt, pptx, doc, docx, xls, xlsx, odp, odt, ods, pub, hwp, hwpx | `diagram`; specified in `2026-11-17-doc-reader-diagrams-design.md` |
 
 Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-reader-plugins/notes/*-survey.md`, rulings in `rea-decisions.md`). A format that cannot reach the success bar stays "unsupported" with the reason recorded; mpp is one: unsupported by default, read only through the opt-in `read.py setup --for mpp` path when Java and the user's install are present.
 
@@ -166,4 +169,4 @@ Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-read
 
 ## Out of scope
 
-OCR of scanned pages or images (a scanned pdf page goes out as a page image); user passwords and DRM removal; editing or writing documents (pdf editing and creation stay with `anthropic-skills:pdf`); rendering WMF/EMF.
+OCR of scanned pages or images (specified next, in spec ③; until then a scanned pdf page goes out as a page image); rendering WMF/EMF (spec ②); diagram structure in pdf and xps, which have no connector data; user passwords and DRM removal; editing or writing documents (pdf editing and creation stay with `anthropic-skills:pdf`).

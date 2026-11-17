@@ -1,6 +1,6 @@
 # doc-reader diagrams: shapes and connectors as Mermaid
 
-Written 2026-11-17 from the user's answers in the brainstorm. Not yet approved: the user reviews this file before a plan is written. It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec); the engine spec edits listed at the end are made in the commit that records its approval. It is the first of three content-gap specs, in the user's order: ① diagrams (this), ② WMF/EMF, ③ OCR. Research behind it, outside this repository: the session notes `research-wmf-diagram.md` (diagram part).
+Approved 2026-11-17 (the user: "Approve, write plan"), written from the user's answers in the brainstorm. It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec); the engine spec edits listed at the end are made in the commit that records its approval. It is the first of three content-gap specs, in the user's order: ① diagrams (this), ② WMF/EMF, ③ OCR. Research behind it, outside this repository: the session notes `research-wmf-diagram.md` (diagram part).
 
 ## Goal
 
