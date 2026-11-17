@@ -602,6 +602,29 @@ def test_hwp_glue_without_a_common_frame():
     assert out == f"one\n\n```mermaid\n{t}\n```\n\nmid\n\nthree\n", out
 
 
+def test_hwp_offsets_relative_to_a_paragraph_place_nothing():
+    # paragraph-relative offsets share no frame: a loose connect line whose ends would land on A and B stays loose
+    sec = (objs(shape("$rec", 1, "A", rel="PARA"), text="p1")
+           + objs(shape("$rec", 2, "B", x=5000, rel="PARA"),
+                  conn(3, 0, 0, ends=((500, 500), (5500, 500)), rel="PARA"), text="p2"))
+    doc, ctx = parse(hwp_file(sec))
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert out == "(could not read: 1 connector not attached)\n\np1\n\nA\n\np2\n\nB\n", out
+    assert ctx.skipped["connector_loose"] == 1, ctx.skipped
+
+
+def test_hwp_style_read_only_for_drawn_shapes():
+    # a control id kordoc reads no drawing style for ($vid) takes the CTRL_HEADER's id, not style bytes that would
+    # hold another shape's id
+    sec = objs(shape("$vid", 5, "Video"), shape("$rec", 5, "Alpha"), shape("$rec", 6, "Beta", x=5000),
+               conn(7, 5, 6), text="lead")
+    doc, _ = parse(hwp_file(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Alpha"]\n  n2["Beta"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"lead\n\nVideo\n\n```mermaid\n{t}\n```\n", out
+
+
 def member(kind, inst, text="", **kw):
     """A group member's records at level 3: the members of a gso whose records are at level 2."""
     if kind == "$col":

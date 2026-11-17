@@ -61,11 +61,11 @@ _MEDIA = {
     "image": ("", lambda raw: len(raw) >= 16 and sniff(raw) is not None),
     "object": ("OLE", lambda raw: is_cfb(raw[4:12])),  # the OLE item: a 4-byte length, then a compound file
 }
-# SHAPE_COMPONENT control ids as stored (byte-reversed): a group, a connect line, a line, an ellipse; pictures, OLE
-# objects and groups carry no drawing style after their matrices
+# SHAPE_COMPONENT control ids as stored (byte-reversed): a group, a connect line, a line, an ellipse; the drawn
+# shapes kordoc reads a drawing style for after their matrices ($rec, $ell, $arc, $pol, $cur, $col, $lin)
 _CON, _COL, _LIN, _ELL = b"noc$", b"loc$", b"nil$", b"lle$"
 _EDGES = (_COL, _LIN)
-_NO_STYLE = (b"cip$", b"elo$", _CON)
+_STYLED = (b"cer$", _ELL, b"cra$", b"lop$", b"ruc$", _COL, _LIN)
 _CONNECT = ((False, False), (False, True), (True, True))  # (start, end) arrowheads of connect type % 3, types 0-8
 
 
@@ -158,7 +158,7 @@ def _objs(data, head, inner, line, got) -> list:
     offset, size, style = _geometry(data)
     origin = _placed(head) if head is not None else offset if inner else None
     box = origin + (origin[0] + size[0], origin[1] + size[1]) if origin and size else None
-    attr, key = _style(data, style) if kind not in _NO_STYLE else (None, None)
+    attr, key = _style(data, style) if kind in _STYLED else (None, None)
     if key is None and head is not None:
         key = _num(head, 36, "<I") or None
     if kind == _CON:
