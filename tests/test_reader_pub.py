@@ -1927,12 +1927,14 @@ START_ARROW = struct.pack("<HI", 0x01D0, 2)  # FOPT lineStartArrowhead
 FLOW = 'flowchart TD\n  n1["Start"]\n  n2["End"]\n  n1 --> n2'
 
 
-def flow_file(rule=(0x401, 0x402, 0x403), props=END_ARROW, conn=0x20, pages=None, label=None):
-    """Page 0x20: "Start" (shape 0x30, spid 0x401) above "End" (0x31, spid 0x402), the connector 0x32 (spid 0x403,
-    FOPT `props`, the story `label` when given) between them, listed on page `conn`, and "Note" (0x33) last; the
-    solver holds `rule` (none when None). `pages` replaces the pages."""
+def flow_file(rule=(0x401, 0x402, 0x403), props=END_ARROW, conn=0x20, pages=None, label=None,
+              cbox=(50, 50, 50, 200), **kw):
+    """Page 0x20: "Start" (shape 0x30, spid 0x401, box 0-100 x 0-50) above "End" (0x31, spid 0x402, box 0-100 x
+    200-250), the connector 0x32 (spid 0x403, box `cbox`, FOPT `props`, the story `label` when given, `kw` its
+    pub_sp keywords: inst, flags) between them, listed on page `conn`, and "Note" (0x33, box 0-100 x 300-350) last;
+    the solver holds `rule` (none when None). `pages` replaces the pages."""
     sps = [pub_sp(0x30, (0, 0, 100, 50), spid=0x401), pub_sp(0x31, (0, 200, 100, 250), spid=0x402),
-           pub_sp(0x32, (50, 50, 50, 200), spid=0x403, props=props), pub_sp(0x33, (0, 300, 100, 350), spid=0x404)]
+           pub_sp(0x32, cbox, spid=0x403, props=props, **kw), pub_sp(0x33, (0, 300, 100, 350), spid=0x404)]
     if pages is None:
         on = {0x20: [0x30, 0x31, 0x33]}
         on.setdefault(conn, []).append(0x32)
@@ -1965,18 +1967,20 @@ def test_pub_connector():
     assert mermaid_of(doc.blocks[0].blocks).endswith("\n  n2 --> n1"), doc.blocks
     doc, _ = read_pub(flow_file(props=b""))
     assert mermaid_of(doc.blocks[0].blocks).endswith("\n  n1 --- n2"), doc.blocks
-    # the connector's SpContainer listed on another page, or no SpContainer with spid C: the edge is still drawn,
-    # glued ends with no slot to drop
-    for blob in (flow_file(conn=0x21), flow_file(rule=(0x401, 0x402, 0x499))):
-        doc, ctx = read_pub(blob)
-        assert mermaid_of(doc.blocks[0].blocks) == FLOW and not ctx.skipped, (doc.blocks, ctx.skipped)
+    # no SpContainer with spid C: the edge is still drawn, glued ends with no slot to drop
+    doc, ctx = read_pub(flow_file(rule=(0x401, 0x402, 0x499)))
+    assert mermaid_of(doc.blocks[0].blocks) == FLOW and not ctx.skipped, (doc.blocks, ctx.skipped)
+    # the connector listed on another page: its ends' glue holds only on its own page, so neither page has an edge;
+    # its page has no box to catch its ends (connector_loose)
+    doc, ctx = read_pub(flow_file(conn=0x21))
+    assert outline(doc) == [("Page 1", ["Start", "End", "Note"])], outline(doc)
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
     # the connector's own text is its label, its slot taken out (the text once); on another page the text stays there
     doc, ctx = read_pub(flow_file(label="yes\rnow"))
     assert mermaid_of(doc.blocks[0].blocks).endswith('\n  n1 -->|"yes now"| n2'), doc.blocks
     assert [text_of(b) for b in doc.blocks[0].blocks[1:]] == ["Note"] and not ctx.skipped, (doc.blocks, ctx.skipped)
     doc, ctx = read_pub(flow_file(label="yes", conn=0x21))
-    assert mermaid_of(doc.blocks[0].blocks) == FLOW, doc.blocks
-    assert [text_of(b) for b in doc.blocks[1].blocks] == ["yes"], doc.blocks
+    assert outline(doc) == [("Page 1", ["Start", "End", "Note"]), ("Page 2", ["yes"])], outline(doc)
     # without the rule the page reads as today: no diagram, every text in reading order
     doc, ctx = read_pub(flow_file(rule=None))
     assert outline(doc) == [("Page 1", ["Start", "End", "Note"])] and not ctx.skipped, outline(doc)
@@ -2005,26 +2009,59 @@ def test_pub_connector():
 
 
 def test_pub_rule_other_page():
-    # the rule's ends on different pages (the connector with "Start"): no edge on either page, each read as without
-    # the rule
+    # the rule's ends on different pages (the connector with "Start"): no edge on either page, the texts as without
+    # the rule; the end off the connector's page is loose and no box there catches it (connector_loose)
     pages = [page(0x20, [0x30, 0x32, 0x33]), page(0x21, [0x31])]
     doc, ctx = read_pub(flow_file(pages=pages))
-    assert outline(doc) == [("Page 1", ["Start", "Note"]), ("Page 2", ["End"])] and not ctx.skipped, outline(doc)
-    assert md(doc, ctx) == md(*read_pub(flow_file(rule=None, pages=pages)))
+    assert outline(doc) == [("Page 1", ["Start", "Note"]), ("Page 2", ["End"])], outline(doc)
+    assert not any(mermaid_of(s.blocks) for s in doc.blocks) and ctx.skipped == {"connector_loose": 1}, ctx.skipped
+    assert outline(doc) == outline(read_pub(flow_file(rule=None, pages=pages))[0])
     # an end on a master page and the other on a normal page: no edge either
     pages = [page(0x20, [0x30, 0x32, 0x33]), page(0x22, [0x31], master="M")]
     doc, ctx = read_pub(flow_file(pages=pages))
     assert outline(doc) == [("Page 1", ["Start", "Note"]), ("Master page: M", ["End"])], outline(doc)
-    assert not any(mermaid_of(s.blocks) for s in doc.blocks) and not ctx.skipped, (doc.blocks, ctx.skipped)
+    assert not any(mermaid_of(s.blocks) for s in doc.blocks) and ctx.skipped == {"connector_loose": 1}, ctx.skipped
     # the whole rule on a master page: the diagram is in the master's section
     pages = [page(0x20, [0x33]), page(0x22, [0x30, 0x31, 0x32], master="M")]
     doc, ctx = read_pub(flow_file(pages=pages))
     assert mermaid_of(doc.blocks[0].blocks) is None and mermaid_of(doc.blocks[1].blocks) == FLOW, doc.blocks
     assert doc.blocks[1].kind == "master" and not ctx.skipped, (doc.blocks, ctx.skipped)
-    # a rule naming spid 0 or a spid no shape has as an end: no edge, nothing counted
+
+
+INFERRED = 'flowchart TD\n  n1["Start"]\n  n2["End"]\n  %% inferred from position\n  n1 --> n2'
+
+
+def test_pub_unglued_connector_inferred():
+    # a straight connector (type 32) with no solver: its ends, the corners of its box, lie in "Start" and "End", so it
+    # is an inferred edge; "Note" stays
+    doc, ctx = read_pub(flow_file(rule=None, inst=32))
+    assert mermaid_of(doc.blocks[0].blocks) == INFERRED and not ctx.skipped, (doc.blocks, ctx.skipped)
+    assert [text_of(b) for b in doc.blocks[0].blocks[1:]] == ["Note"], doc.blocks
+    # FSP fFlipV (0x80) swaps its ends: it runs from "End" up to "Start"
+    doc, _ = read_pub(flow_file(rule=None, inst=32, flags=0xA00 | officeart.FLIP_V))
+    assert mermaid_of(doc.blocks[0].blocks).endswith("\n  n2 --> n1"), doc.blocks
+    # a plain line (type 20) with an arrowhead is a candidate; without one it stays a line: the page as without it
+    doc, ctx = read_pub(flow_file(rule=None, inst=20))
+    assert mermaid_of(doc.blocks[0].blocks) == INFERRED and not ctx.skipped, (doc.blocks, ctx.skipped)
+    doc, ctx = read_pub(flow_file(rule=None, inst=20, props=b""))
+    assert outline(doc) == [("Page 1", ["Start", "End", "Note"])] and not ctx.skipped, outline(doc)
+    # ends no box catches: no edge, connector_loose once, the texts as they were
+    doc, ctx = read_pub(flow_file(rule=None, inst=32, cbox=(500, 500, 600, 600)))
+    assert outline(doc) == [("Page 1", ["Start", "End", "Note"])], outline(doc)
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
+
+
+def test_pub_half_glued_rule():
+    # a rule naming spid 0, or a spid no shape has, as one end: the other end keeps its glue and the loose one is
+    # placed by position (the connector's box corner in "Start", or in "End")
     for rule in ((0, 0x402, 0x403), (0x401, 0x498, 0x403)):
         doc, ctx = read_pub(flow_file(rule=rule))
-        assert outline(doc) == [("Page 1", ["Start", "End", "Note"])] and not ctx.skipped, outline(doc)
+        assert mermaid_of(doc.blocks[0].blocks) == INFERRED and not ctx.skipped, (rule, doc.blocks, ctx.skipped)
+        assert [text_of(b) for b in doc.blocks[0].blocks[1:]] == ["Note"], doc.blocks
+    # the loose end in no box: no edge, connector_loose once, the texts as they were
+    doc, ctx = read_pub(flow_file(rule=(0, 0x402, 0x403), cbox=(500, 500, 50, 200)))
+    assert outline(doc) == [("Page 1", ["Start", "End", "Note"])], outline(doc)
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
 
 
 # -- pub_2k.py: Publisher 2000 (Quill text) and 97/98 (8-bit text)

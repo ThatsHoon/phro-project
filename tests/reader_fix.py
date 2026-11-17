@@ -2107,13 +2107,16 @@ def _pub_values(pairs) -> bytes:
     return bytes(4) + b"".join(struct.pack("<HI", k, v & 0xFFFFFFFF) for k, v in pairs)
 
 
-def pub_sp(seq=None, box=None, *, child=None, group=None, pib=None, spid=0, props=b"") -> bytes:
-    """A Publisher SpContainer (0xF004): its FSP (spid `spid`); an FSPGR (0xF009) with the child coordinate system
+def pub_sp(seq=None, box=None, *, child=None, group=None, pib=None, spid=0, props=b"", inst=0, flags=None) -> bytes:
+    """A Publisher SpContainer (0xF004): its FSP (instance the shape type `inst`, spid `spid`, grfPersistent `flags`,
+    by default 0x201 for a group and 0xA00 otherwise); an FSPGR (0xF009) with the child coordinate system
     `group` (xs, ys, xe, ye) when given; an FOPT (0xF00B) holding `pib` (0x4104) when given, then the 6-byte
     properties `props` (opid u16, op u32 each), when either is given; a ClientAnchor (0xF010) of the `box` (xs, ys, xe,
     ye, as values 0x2001-0x2004), or a ChildAnchor (0xF00F) of the `child` box in its group's coordinates; a ClientData
     (0xF011) naming the Contents shape seqnum `seq` (value 0x6801)."""
-    rec = oa_record(0xF00A, struct.pack("<II", spid, 0x201 if group is not None else 0xA00), ver=2)
+    if flags is None:
+        flags = 0x201 if group is not None else 0xA00
+    rec = oa_record(0xF00A, struct.pack("<II", spid, flags), ver=2, inst=inst)
     if group is not None:
         rec += oa_record(0xF009, struct.pack("<4i", *group), ver=1)
     fopt = (struct.pack("<HI", 0x4104, pib) if pib is not None else b"") + bytes(props)

@@ -92,16 +92,20 @@ box is arranged (its top the smaller y); rotation is not read. A shape with no b
 order. This walk is the one walk over Publisher's SpContainers.
 
 Connectors. The same walk reads each DgContainer's SolverContainer (0xF005, `officeart.rules`: spidA the start,
-spidB the end, spidC the connector) and, for each SpContainer whose ClientData names a shape, its first FSP's spid
-and shape type and its first FOPT's arrowheads (`officeart.arrows`, absent is none). A spid maps to the shape seqnum
-of the first SpContainer naming it. A page is one diagram scope (`diagram.Diagram`), its slots each placed shape's
-(seqnum, blocks); a master page and each scratch page are one too. A rule is kept on a page only when both ends'
-seqnums are among that page's shapes, so a rule across pages draws nothing. The connector's key is its own seqnum
-when that shape is on the page with only paragraphs (their text becomes the edge label and its slot goes with the
-edge); otherwise `("rule", spidC)`, glued ends with no slot to drop, and arrowheads not known when no SpContainer has
-spidC. Nodes take their type's kind (`officeart.KINDS`) and their arranged box. A page with no rule kept is given
-exactly as before. Edges go through one `diagram.ConnectionBudget` a document. Publisher 2000 and 97/98 (`pub_2k`)
-have no solver, and their line chunk no arrowhead field, so their pages have no diagram.
+spidB the end, spidC the connector) and, for each SpContainer whose ClientData names a shape, its first FSP's spid,
+flags and shape type and its first FOPT's arrowheads (`officeart.arrows`, absent is none). A spid maps to the shape
+seqnum of the first SpContainer naming it. A page is one diagram scope (`diagram.Diagram`), its slots each placed
+shape's (seqnum, blocks); a master page and each scratch page are one too. A connector is a shape that a rule names as
+spidC (the first such rule its glue) or whose type is a connector (`officeart.CONNECTOR_TYPES`) or a line
+(`officeart.LINE_TYPE`, a candidate only with an arrowhead); it runs from its box's start corner after the FSP flips to
+the opposite one. An end keeps its glue only when that end's seqnum is among the connector's page's shapes, so a rule
+across pages, or naming spid 0, leaves that end loose for `diagram`'s inference (`connector_loose` when no box catches
+it). Its key is its seqnum when its slot holds only paragraphs (their text becomes the edge label and the slot goes
+with the edge); otherwise `("slot", seqnum)`, the slot kept. A rule whose spidC no shape has is drawn only when both
+ends are on the page, as `("rule", spidC)` with glued ends and arrowheads not known. Nodes take their type's kind
+(`officeart.KINDS`) and their arranged box. A page with neither is given exactly as before. Edges go through one
+`diagram.ConnectionBudget` a document. Publisher 2000 and 97/98 (`pub_2k`) have no solver, and their line chunk no
+arrowhead field, so their pages have no diagram.
 
 Links. `pub_quill.links` give one `Para([Text("Links: "), Link(u, [Text(u)]), Text(", "), ...])` at the end. VBA: a
 storage named VBA anywhere (Publisher's `VBA/`, Word's `Macros/VBA/`) counts `vba` once; macros are never read.
@@ -214,9 +218,10 @@ def _values(data, body: int, size: int, meter) -> dict:
 class _Boxes:
     """The Escher walk of `boxes`: {Contents shape seqnum: (top, left)} in `out`, and in `sp` {Contents shape seqnum:
     the offset of the SpContainer whose ClientData names it} for every shape, with an anchor or without. For the
-    diagram: `full` {seqnum: (x0, y0, x1, y1)}, the box arranged; `kinds` {seqnum: (its FSP's shape type, the (start,
-    end) arrowheads of its first FOPT)}; `spids` {FSP spid other than 0: the seqnum of the first SpContainer naming
-    it}; `rules`, the (spidA, spidB, spidC) of the DgContainers' SolverContainers, each rule ticking the meter."""
+    diagram: `full` {seqnum: (x0, y0, x1, y1)}, the box arranged; `kinds` {seqnum: (its FSP's shape type and flags,
+    the (start, end) arrowheads of its first FOPT)}; `spids` {FSP spid other than 0: the seqnum of the first
+    SpContainer naming it}; `rules`, the (spidA, spidB, spidC) of the DgContainers' SolverContainers, each rule
+    ticking the meter."""
 
     def __init__(self, data, meter, ctx, limit=None):
         self.data, self.ctx = data, ctx
@@ -260,14 +265,14 @@ class _Boxes:
 
     def shape(self, body: int, size: int, cs: list, box: list):
         """One SpContainer: an FSPGR sets the group's coordinate system; the ClientData's shape seqnum gets this
-        SpContainer's offset, its first FSP's spid and shape type, its first FOPT's arrowheads, and the box of the
-        first anchor, which becomes the group's box when this shape set the coordinate system."""
+        SpContainer's offset, its first FSP's spid, flags and shape type, its first FOPT's arrowheads, and the box of
+        the first anchor, which becomes the group's box when this shape set the coordinate system."""
         data = self.data
         parent = tuple(cs)
         fspgr = anchor = client = fsp = fopt = None
         for typ, b, s in _records(data, body, body + size, self.meter):
             if typ == officeart.FSP and fsp is None:
-                fsp = (officeart.fsp(data[b:b + min(s, 8)])[0], _HEAD.unpack_from(data, b - 8)[0] >> 4)
+                fsp = (*officeart.fsp(data[b:b + min(s, 8)]), _HEAD.unpack_from(data, b - 8)[0] >> 4)
             elif typ == officeart.FOPT and fopt is None:
                 fopt = officeart.arrows(data, _HEAD.unpack_from(data, b - 8)[0] >> 4, b, s)
             elif typ == FSPGR and fspgr is None:
@@ -286,8 +291,8 @@ class _Boxes:
         if seq is None:
             return
         self.sp[seq] = body - 8
-        spid, stype = fsp or (0, 0)
-        self.kinds[seq] = (stype, fopt or (False, False))
+        spid, flags, stype = fsp or (0, 0, 0)
+        self.kinds[seq] = (stype, flags, fopt or (False, False))
         if spid:
             self.spids.setdefault(spid, seq)
         if anchor is None:
@@ -562,9 +567,12 @@ class _Reader(_Pages):
         self.boxes = walk.walk() if escher else {}
         self.sps = walk.sp   # shape seqnum -> its SpContainer's offset in the Escher stream
         self.full, self.kinds, self.spids = walk.full, walk.kinds, walk.spids
-        self.glue = {}       # start seqnum -> [(rule index, start seqnum, end seqnum, spidC)], both ends' spids mapped
-        for k, (a, b, c) in enumerate(walk.rules):
-            if a in self.spids and b in self.spids:
+        self.rule_of = {}    # connector seqnum -> (spidA, spidB) of the first rule whose spidC names it
+        self.glue = {}       # start seqnum -> [(rule index, start seqnum, end seqnum, spidC)] of the rules whose spidC
+        for k, (a, b, c) in enumerate(walk.rules):  # no shape has, both ends' spids mapped
+            if c in self.spids:
+                self.rule_of.setdefault(self.spids[c], (a, b))
+            elif a in self.spids and b in self.spids:
                 self.glue.setdefault(self.spids[a], []).append((k, self.spids[a], self.spids[b], c))
         self.connections = diagram.ConnectionBudget(ctx)  # the document's edges, every page's together
         self.escher_cut = walk.meter.cut
@@ -636,35 +644,48 @@ class _Reader(_Pages):
         return self.boxes.get(ref.seqnum)
 
     def _drawn(self, slots) -> list:
-        """A page's blocks: each slot's in turn, unless a solver rule has both ends among the page's shapes; then the
-        page is one diagram scope (see the module docstring), each shape and connector registered under
-        guard("shape") and place() run under it, the slots' blocks kept when it fails."""
-        flat = [b for _, blocks in slots for b in blocks]
+        """A page's blocks: each slot's in turn, unless the page has a connector (a shape a rule names as spidC, of a
+        connector type or a line) or a rule whose spidC no shape has with both ends among its shapes; then the page is
+        one diagram scope (see the module docstring), each shape and connector registered under guard("shape") and
+        place() run under it, the slots' blocks kept when it fails."""
         own = dict(slots)
+        conns = {seq for seq in own if self._connector(seq)}
         kept = sorted(r for k in own for r in self.glue.get(k, ()) if r[2] in own)  # in rule order
-        if not kept:
-            return flat
-        lines = []   # (connector key, start seqnum, end seqnum, the connector's seqnum or None)
-        for _, a, b, c in kept:
-            seq = self.spids.get(c)
-            text = own.get(seq)
-            key = seq if text is not None and all(isinstance(x, Para) for x in text) else ("rule", c)
-            lines.append((key, a, b, seq))
-        conns = {key for key, _, _, _ in lines}
+        if not conns and not kept:
+            return [b for _, blocks in slots for b in blocks]
         dia = diagram.Diagram(self.ctx, self.connections)
         for seq, blocks in slots:
             if seq not in conns:
                 with self.ctx.guard("shape"):
-                    stype = self.kinds.get(seq, (0,))[0]
-                    dia.shape(seq, blocks, officeart.KINDS.get(stype, ""), self.full.get(seq))
-        for key, a, b, seq in lines:
+                    dia.shape(seq, blocks, officeart.KINDS.get(self.kinds.get(seq, (0,))[0], ""), self.full.get(seq))
+        for seq in (s for s, _ in slots if s in conns):  # in reading order
             with self.ctx.guard("shape"):
-                arrows = self.kinds[seq][1] if seq in self.kinds else (None, None)
-                dia.connector(key, a, b, arrows=arrows, label=_label(own[key]) if key == seq else "")
-        out = flat
+                stype, flags, arrows = self.kinds.get(seq, (0, 0, (False, False)))
+                ends = [self.spids.get(e) for e in self.rule_of.get(seq, ())] or [None, None]
+                begin, end = (e if e in own else None for e in ends)  # glue holds on the connector's page only
+                p0 = p1 = None
+                if seq in self.full:
+                    x0, y0, x1, y1 = self.full[seq]
+                    if flags & officeart.FLIP_H:
+                        x0, x1 = x1, x0
+                    if flags & officeart.FLIP_V:
+                        y0, y1 = y1, y0
+                    p0, p1 = (x0, y0), (x1, y1)
+                plain = all(isinstance(x, Para) for x in own[seq])  # else its slot stays, under another key
+                dia.connector(seq if plain else ("slot", seq), begin, end, p0, p1, arrows,
+                              _label(own[seq]) if plain else "", line=stype == officeart.LINE_TYPE)
+        for _, a, b, c in kept:
+            with self.ctx.guard("shape"):
+                dia.connector(("rule", c), a, b)
+        out = [b for _, blocks in slots for b in blocks]
         with self.ctx.guard("shape"):
             out = dia.place(slots)
         return out
+
+    def _connector(self, seq) -> bool:
+        """Whether the shape is a connector: a rule names it as spidC, or its type is a connector's or a line's."""
+        stype = self.kinds.get(seq, (0,))[0]
+        return seq in self.rule_of or stype == officeart.LINE_TYPE or stype in officeart.CONNECTOR_TYPES
 
     def _tid(self, ref):
         """The text id (block 0x27) of a shape chunk, or None."""
