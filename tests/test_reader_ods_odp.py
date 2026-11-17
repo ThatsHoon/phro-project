@@ -444,6 +444,17 @@ def test_odp_connector():
     assert not ctx.skipped["connector_loose"] and not ctx.skipped["shape"], ctx.skipped
 
 
+def test_odp_connector_long_text_follows():
+    long = "w" * 90
+    shapes = (shape('draw:id="a"', "Top", "0cm", "1cm") + shape('draw:id="b"', "Bottom", "0cm", "5cm")
+              + connector("a", "b", long))
+    doc, ctx = parse(odp(page("p", shapes)))
+    t = mermaid(doc.blocks[0].blocks)
+    assert mermaid_ok(t) and t.endswith('\n  n1 -->|"' + "w" * 80 + '…"| n2'), t
+    out = markdown.render(doc, tmp() / "a")
+    assert out.endswith(f"```\n\nn1 --> n2:\n\n{long}\n") and out.count(long) == 1, out
+
+
 def test_odp_marker_from_style_chain():
     styles = ('<style:style style:name="Base" style:family="graphic"><style:graphic-properties draw:marker-end="Arrow"/>'
               '</style:style><style:style style:name="gr1" style:family="graphic" style:parent-style-name="Base"/>'

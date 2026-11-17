@@ -333,6 +333,15 @@ def test_hidden_text_own_and_inherited():
     assert shown.count("PLACEHOLDER") == 2 and "OWNHIDDEN" in shown, shown
 
 
+def test_connector_long_text_follows():
+    long = "v" * 90
+    shapes = shape(1, "Start", (0, 9)) + shape(2, "End", (0, 1)) + shape(3, long, (0, 5))
+    out, _ = md(vsdx({"P": page_xml(shapes, glued(3, 1, 2))}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t.endswith('\n  n1 -->|"' + "v" * 80 + '…"| n2'), t
+    assert out.endswith(f"```\n\nn1 --> n2:\n\n{long}\n") and out.count(long) == 1, out
+
+
 def test_hidden_connector_text_not_a_label():
     shapes = (shape(1, "Start", (0, 9)) + shape(2, None, (0, 1), HIDE + "<Text>secret</Text>", 'NameU="End"')
               + shape(3, None, (0, 5), HIDE + "<Text>quiet</Text>"))

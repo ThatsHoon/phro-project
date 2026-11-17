@@ -214,6 +214,35 @@ def test_rich_node_follow_up():
                        [Para([Text("n4:")])] + titled + [Para([Text("n5:")])] + linked), out
 
 
+def test_connector_blocks_label_and_follow_up():
+    two = [Para([Text("yes")]), Para([Text("  now "), Break(), Text("then")])]  # plain and short: one line
+    pic = [Image(PNG)]
+    rich = [Para([Text("see "), Link("http://x", [Text("here")])])]
+    long = P("y" * 90)
+    d, _ = new()
+    for k in "ABCDE":
+        d.shape(k, P(k))
+    d.connector("k1", begin="A", end="B", blocks=two)
+    d.connector("k2", begin="B", end="C", blocks=pic)
+    d.connector("k3", begin="D", end="C", arrows=(True, False), blocks=rich)  # drawn C to D
+    d.connector("k4", begin="D", end="E", blocks=long)
+    out = d.place([(k, []) for k in "ABCDE"] + [("k1", two), ("k2", pic), ("k3", rich), ("k4", long)])
+    ls = lines(out)
+    assert ls[6:] == ['  n1 -->|"yes now then"| n2', '  n2 -->|"(picture)"| n3', '  n3 -->|"see here…"| n4',
+                      '  n4 -->|"' + "y" * 80 + '…"| n5'], ls
+    assert out[1:] == ([Para([Text("n2 --> n3:")])] + pic + [Para([Text("n3 --> n4:")])] + rich +
+                       [Para([Text("n4 --> n5:")])] + long), out  # each slot taken out, its blocks once
+    # an inferred edge carries its blocks the same way; a loose connector keeps its slot and its blocks stay there
+    d, ctx = new()
+    d.shape("A", P("A"), box=(0, 0, 100, 100))
+    d.shape("B", P("B"), box=(200, 300, 300, 400))
+    d.connector("k1", p0=(50, 50), p1=(250, 350), blocks=pic)
+    d.connector("k2", begin="A", p1=(999, 999), blocks=long)
+    out = d.place([("A", []), ("B", []), ("k1", pic), ("k2", long)])
+    assert lines(out)[-1] == '  n1 -->|"(picture)"| n2', out
+    assert out[1:] == [Para([Text("n1 --> n2:")])] + pic + long and ctx.skipped == {"connector_loose": 1}, out
+
+
 def test_hidden_end_blank_node():
     d, _ = new()
     secret = P("secret", hidden="hidden")

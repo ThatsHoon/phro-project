@@ -6,7 +6,9 @@ numbers, escapes, orients and renders, and builds model blocks only.
 
 - **Edges.** A connector glued at both ends to registered shapes is an edge; a glue reference to a missing key or to a
   connector (itself included) is not glue. A hidden connector is never an edge. Edges keep `connector()` order and go
-  through the document's `ConnectionBudget`, the glued ones first.
+  through the document's `ConnectionBudget`, the glued ones first. A connector given its slot's blocks is labelled
+  with their plain text on one line when that is at most NAME characters; else as a node is (below), and as an edge
+  its blocks follow the diagram after an `nA --> nB:` paragraph, the edge as written.
 - **Loose ends.** A connector with an end not glued (a plain `line` only with an arrowhead set True) is a candidate,
   up to CONNECTIONS a document, snapped or not (`infer_skipped` once for a scope that has some past them). Each loose
   end's point lands on the smallest box holding it, else on the nearest within INFER_TOL of the diagonal of the box
@@ -75,11 +77,12 @@ class _Shape:
 
 
 class _Connector:
-    __slots__ = ("begin", "end", "p0", "p1", "arrows", "label", "line", "hidden")
+    __slots__ = ("begin", "end", "p0", "p1", "arrows", "label", "line", "hidden", "follow")
 
-    def __init__(self, begin, end, p0, p1, arrows, label, line, hidden):
+    def __init__(self, begin, end, p0, p1, arrows, label, line, hidden, follow=None):
         self.begin, self.end, self.p0, self.p1 = begin, end, p0, p1
         self.arrows, self.label, self.line, self.hidden = arrows, label, line, hidden
+        self.follow = follow  # the blocks that follow the diagram when it is an edge, or None
 
 
 def _box(box):
@@ -222,6 +225,25 @@ def _label(blocks):
     return "(content)", True
 
 
+def _edge_label(blocks):
+    """(label, follow) of a connector's blocks: their plain text on one line, each run of white space one space, when
+    that is at most NAME characters, with nothing to follow; else `_label`'s cut first line or stand-in, the blocks
+    to follow the diagram."""
+    text = _plain(blocks)
+    if text is not None:
+        line = " ".join(text.split())
+        if len(line) <= NAME:
+            return line, None
+    return _label(blocks)[0], list(blocks)
+
+
+def _edge(c, nid) -> tuple:
+    """(from, arrow, to) of an edge as written: its node ids, swapped when only the start has an arrowhead."""
+    arrow, swapped = _arrow(c.arrows)
+    a, b = nid[c.begin], nid[c.end]
+    return (b, arrow, a) if swapped else (a, arrow, b)
+
+
 def _inlines(label: str) -> list:
     """A label as list-item inlines, its line breaks as Break."""
     out = []
@@ -249,11 +271,16 @@ class Diagram:
                                   (title or "").strip())
 
     def connector(self, key, begin=None, end=None, p0=None, p1=None, arrows=(None, None), label: str = "",
-                  line: bool = False, hidden: bool = False) -> None:
+                  line: bool = False, hidden: bool = False, blocks=None) -> None:
+        """`blocks`, when given, are what the connector's slot holds: they make the label (see `_edge_label`), and
+        when they are more than a short plain text they follow the diagram should it become an edge."""
         if key in self.connectors:
             return
+        follow = None
+        if blocks is not None:
+            label, follow = _edge_label(blocks)
         self.connectors[key] = _Connector(begin, end, _point(p0), _point(p1), arrows, (label or "").strip(),
-                                          bool(line), bool(hidden))
+                                          bool(line), bool(hidden), follow)
 
     def _glued(self, key) -> bool:
         return key is not None and key in self.shapes and key not in self.connectors
@@ -296,6 +323,9 @@ class Diagram:
                 labels[k], follow = _label(s.blocks)
             if follow:
                 follows += [Para([Text(f"{cid[k]}:")])] + list(s.blocks)
+        for _, c in edges:
+            if c.follow:
+                follows += [Para([Text(" ".join(_edge(c, nid)) + ":")])] + c.follow
 
         items = None if groups else _tree(edges, nodes, nid, labels, long)
         if items is None:
@@ -346,7 +376,7 @@ class Diagram:
             a = c.begin if self._glued(c.begin) else _snap(c.p0, targets, tol)
             b = c.end if self._glued(c.end) else _snap(c.p1, targets, tol)
             if a is not None and b is not None and a != b:
-                out.append((k, _Connector(a, b, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden)))
+                out.append((k, _Connector(a, b, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden, c.follow)))
             elif (a is not None or b is not None or c.begin is not None or c.end is not None
                   or any(x is True for x in c.arrows)):
                 self.ctx.skipped["connector_loose"] += 1  # meant to join something: not a decoration
@@ -443,10 +473,7 @@ class Diagram:
         for i, (_, c) in enumerate(edges):
             if i == nglued:
                 lines.append("  %% inferred from position")
-            arrow, swapped = _arrow(c.arrows)
-            a, b = nid[c.begin], nid[c.end]
-            if swapped:
-                a, b = b, a
+            a, arrow, b = _edge(c, nid)
             label = f'|"{_esc(c.label)}"|' if c.label else ""
             lines.append(f"  {a} {arrow}{label} {b}")
         return "\n".join(lines)

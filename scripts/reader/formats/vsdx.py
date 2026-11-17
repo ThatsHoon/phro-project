@@ -325,7 +325,7 @@ class _Reader:
             style = style if style is not None else m_style
             arrows = tuple(self.arrow(n, own_cells, m_cells, style) for n in ARROWS)
             self.dia.connector(key, begin, end, _end(c, "Begin", dx, dy), _end(c, "End", dx, dy), arrows,
-                               "" if hidden else text)
+                               blocks=[] if hidden and text else blocks)
             if hidden and text:  # hidden text is no label: it keeps its place in the flow
                 slot = None
         else:

@@ -503,8 +503,8 @@ class _Reader:
                 stype, arrows = self.pictures.shape_type(key)
                 if key in self.glue:
                     begin, end = self.glue[key]
-                    dia.connector(key, begin, end, arrows=arrows, label=flat(blocks),
-                                  line=stype == officeart.LINE_TYPE)
+                    dia.connector(key, begin, end, arrows=arrows, line=stype == officeart.LINE_TYPE,
+                                  blocks=blocks)
                 else:
                     dia.shape(key, blocks, officeart.KINDS.get(stype, ""))
         out = [b for _, blocks in slots for b in blocks]

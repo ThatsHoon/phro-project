@@ -500,7 +500,7 @@ class _Reader:
         if kid(el, "cNvCnPr") is not None:
             p0, p1 = xf.ends(x) or (None, None)
             st, en = glue(el)
-            dia.connector(key, st, en, p0, p1, arrows(sppr), _flat(blocks), line=rule(sppr, (st, en)), hidden=hidden)
+            dia.connector(key, st, en, p0, p1, arrows(sppr), line=rule(sppr, (st, en)), hidden=hidden, blocks=blocks)
         else:
             dia.shape(key, blocks, kind(sppr), xf.box(x), hidden)
 

@@ -140,7 +140,7 @@ def shapes(drawing: bytes, texts: list, dia, ctx) -> list:
         keys.add(key)
         blocks = paragraph(text)
         with ctx.guard("shape"):
-            _register(dia, drawing, sp, key, text, blocks, glue)
+            _register(dia, drawing, sp, key, blocks, glue)
         keyed.append((key, blocks, sp.order))
     order = sorted(range(len(keyed)), key=lambda k: _position(drawing, keyed[k][2]))  # stable: record order
     return [keyed[k][:2] for k in order] + [(None, paragraph(t)) for t in rest]
@@ -200,7 +200,7 @@ def _shape(drawing: bytes, body: int, size: int, sp: _Sp) -> int:
     return n
 
 
-def _register(dia, drawing: bytes, sp: _Sp, key, text: str, blocks: list, glue: dict):
+def _register(dia, drawing: bytes, sp: _Sp, key, blocks: list, glue: dict):
     """One shape on the sheet's diagram: a connector or line from its start corner to the opposite one, glued to the
     ends of the rule that names its spid and labelled with its text; any other shape a node of its paragraph, with
     its type's kind and its box."""
@@ -215,8 +215,7 @@ def _register(dia, drawing: bytes, sp: _Sp, key, text: str, blocks: list, glue: 
             if sp.flags & officeart.FLIP_V:
                 y0, y1 = y1, y0
             p0, p1 = (x0, y0), (x1, y1)
-        dia.connector(key, begin, end, p0, p1, sp.arrows, " ".join(text.split()),
-                      line=sp.stype == officeart.LINE_TYPE)
+        dia.connector(key, begin, end, p0, p1, sp.arrows, line=sp.stype == officeart.LINE_TYPE, blocks=blocks)
     else:
         dia.shape(key, blocks, officeart.KINDS.get(sp.stype, ""), box)
 

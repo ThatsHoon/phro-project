@@ -392,7 +392,7 @@ def _own(o) -> list:
 def _register(dia, o, key, shift) -> None:
     if o.edge:
         begin, end, p0, p1, arrows, line = o.edge
-        dia.connector(key, begin, end, _shift(p0, shift), _shift(p1, shift), arrows, flat(o.blocks), line)
+        dia.connector(key, begin, end, _shift(p0, shift), _shift(p1, shift), arrows, line=line, blocks=o.blocks)
     else:
         lo, hi = (_shift(o.box[:2], shift), _shift(o.box[2:], shift)) if o.box else (None, None)
         dia.shape(key, o.blocks, o.kind, lo + hi if lo and hi else None)

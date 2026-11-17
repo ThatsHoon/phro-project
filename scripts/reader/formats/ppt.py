@@ -175,8 +175,8 @@ class Presentation:
         if shape.stype == officeart.LINE_TYPE or shape.stype in officeart.CONNECTOR_TYPES:
             begin, end = glue.get(key, (None, None))
             p0, p1 = shape.ends or (None, None)
-            label = " ".join(plain for _, _, plain in runs if plain)
-            dia.connector(key, begin, end, p0, p1, shape.arrows, label, line=shape.stype == officeart.LINE_TYPE)
+            dia.connector(key, begin, end, p0, p1, shape.arrows, line=shape.stype == officeart.LINE_TYPE,
+                          blocks=[b for _, blocks, _ in runs for b in blocks])
         else:
             box = (shape.left, shape.top, shape.right, shape.bottom) if shape.anchored else None
             dia.shape(key, [b for _, blocks, _ in runs for b in blocks], officeart.KINDS.get(shape.stype, ""), box)

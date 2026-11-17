@@ -142,9 +142,8 @@ class Drawings:
             ends = xf.ends(x) if xf is not None and x is not None else None
             p0, p1 = (_points(e) for e in ends) if ends else (None, None)
             st, en = glue(el)
-            label = " ".join(i.text for b in blocks for i in getattr(b, "inlines", ()) if isinstance(i, Text))
-            dia.connector(key, st, en, p0, p1, arrows(sppr), label, line=local(el.tag) == "sp" or rule(sppr, (st, en)),
-                          hidden=hidden)
+            dia.connector(key, st, en, p0, p1, arrows(sppr), line=local(el.tag) == "sp" or rule(sppr, (st, en)),
+                          hidden=hidden, blocks=blocks)
         else:
             box = (xf.box(x) if xf is not None else None) if x is not None else spot
             dia.shape(key, blocks, kind(sppr), _points(box), hidden)

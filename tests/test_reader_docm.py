@@ -701,6 +701,19 @@ def test_docx_group_in_header_keeps_text():
     assert doc.headers == ["top Start End"] and not ctx.skipped, (doc.headers, dict(ctx.skipped))
 
 
+def test_docx_connector_content_kept():
+    # a table in the connector's own text box: the edge is labelled (table) and the table follows the diagram
+    tbl = '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>'
+    link = _wlink(3, 1, 2).replace("<wps:bodyPr/>", f"<wps:txbx><w:txbxContent>{tbl}</w:txbxContent></wps:txbx>"
+                                   "<wps:bodyPr/>")
+    group = _wgp(_wbox(1, 0, 0, "Start") + _wbox(2, 0, 1500, "End") + link)
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>lead</w:t></w:r>{_anchored(group, P("x"))}</w:p>'))
+    t = _mermaid(doc)
+    assert mermaid_ok(t) and t.endswith('\n  n1 -->|"(table)"| n2'), t
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert out.endswith("```\n\nn1 --> n2:\n\ncell\n") and out.count("cell") == 1, out  # a 1x1 table reads as text
+
+
 def test_docx_unglued_line_is_a_rule():
     # a connector of preset `line` with no glue and no arrowhead, its ends on both boxes: a rule, like a plain line
     rule = (_wlink(3, 1, 2).replace('<a:stCxn id="1" idx="2"/><a:endCxn id="2" idx="0"/>', "")

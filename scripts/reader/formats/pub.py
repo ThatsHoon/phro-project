@@ -100,9 +100,9 @@ spidC (the first such rule its glue) or whose type is a connector (`officeart.CO
 (`officeart.LINE_TYPE`, a candidate only with an arrowhead); it runs from its box's start corner after the FSP flips to
 the opposite one. An end keeps its glue only when that end's seqnum is among the connector's page's shapes, so a rule
 across pages, or naming spid 0, leaves that end loose for `diagram`'s inference (`connector_loose` when no box catches
-it). Its key is its seqnum when its slot holds only paragraphs (their text becomes the edge label and the slot goes
-with the edge); otherwise `("slot", seqnum)`, the slot kept. A rule whose spidC no shape has is drawn only when both
-ends are on the page, as `("rule", spidC)` with glued ends and arrowheads not known. Nodes take their type's kind
+it). Its key is its seqnum and its slot's blocks go with it (`diagram` makes them its label, and the slot goes with
+the edge). A rule whose spidC no shape has is drawn only when both ends are on the page, as `("rule", spidC)` with
+glued ends and arrowheads not known. Nodes take their type's kind
 (`officeart.KINDS`) and their arranged box. A page with neither is given exactly as before. Edges go through one
 `diagram.ConnectionBudget` a document. Publisher 2000 and 97/98 (`pub_2k`) have no solver, and their line chunk no
 arrowhead field, so their pages have no diagram.
@@ -351,23 +351,6 @@ class _Quiet:
 def boxes(data, meter, ctx) -> dict:
     """{Contents shape seqnum: (top, left)} from an Escher/EscherStm stream (see the module docstring)."""
     return _Boxes(data, meter, ctx).walk()
-
-
-def _label(blocks) -> str:
-    """A connector's label: the text of its paragraphs, each run of white space and line breaks one space."""
-    parts = []
-    for p in blocks:
-        stack = list(reversed(p.inlines))
-        while stack:
-            i = stack.pop()
-            if isinstance(i, Text):
-                parts.append(i.text)
-            elif isinstance(i, (Bold, Link)):
-                stack.extend(reversed(i.inlines))
-            else:
-                parts.append(" ")
-        parts.append(" ")
-    return " ".join("".join(parts).split())
 
 
 def _cost(story) -> int:
@@ -671,9 +654,7 @@ class _Reader(_Pages):
                     if flags & officeart.FLIP_V:
                         y0, y1 = y1, y0
                     p0, p1 = (x0, y0), (x1, y1)
-                plain = all(isinstance(x, Para) for x in own[seq])  # else its slot stays, under another key
-                dia.connector(seq if plain else ("slot", seq), begin, end, p0, p1, arrows,
-                              _label(own[seq]) if plain else "", line=stype == officeart.LINE_TYPE)
+                dia.connector(seq, begin, end, p0, p1, arrows, line=stype == officeart.LINE_TYPE, blocks=own[seq])
         for _, a, b, c in kept:
             with self.ctx.guard("shape"):
                 dia.connector(("rule", c), a, b)

@@ -711,7 +711,7 @@ class _Reader:
         bx, by, ex, ey = it.ends or (None, None, None, None)
         p0 = (bx + ox, by + oy) if bx is not None and by is not None else None
         p1 = (ex + ox, ey + oy) if ex is not None and ey is not None else None
-        dia.connector(key, begin, end, p0, p1, arrows, "" if it.hidden else it.text)
+        dia.connector(key, begin, end, p0, p1, arrows, blocks=[] if it.hidden and it.text else it.blocks)
 
     @staticmethod
     def origin(ids, memo, sid):

@@ -329,8 +329,8 @@ class _Reader:
         if n == "cxnSp" or (n == "sp" and is_line(sppr)):
             p0, p1 = xf.ends(x) or (None, None)
             st, en = glue(el)
-            self.dia.connector(key, st, en, p0, p1, arrows(sppr), self._body_text(body) if body is not None else "",
-                               line=n != "cxnSp" or rule(sppr, (st, en)), hidden=hid)
+            self.dia.connector(key, st, en, p0, p1, arrows(sppr), line=n != "cxnSp" or rule(sppr, (st, en)),
+                               hidden=hid, blocks=blocks)
         else:
             self.dia.shape(key, blocks, kind(sppr), xf.box(x), hid)
         if hid:

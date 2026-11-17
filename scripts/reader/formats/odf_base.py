@@ -139,7 +139,7 @@ def register(dia, styles, el, key, blocks, hidden=False):
     if n in ("connector", "line"):
         p0, p1 = ((_cm(attr(el, f"x{i}")), _cm(attr(el, f"y{i}"))) for i in (1, 2))
         begin, end = (attr(el, "start-shape"), attr(el, "end-shape")) if n == "connector" else (None, None)
-        dia.connector(key, begin, end, p0, p1, arrows(styles, el), _flat(blocks), line=n == "line", hidden=hidden)
+        dia.connector(key, begin, end, p0, p1, arrows(styles, el), line=n == "line", hidden=hidden, blocks=blocks)
         return
     if n in ("ellipse", "circle"):
         kind = "circle"
