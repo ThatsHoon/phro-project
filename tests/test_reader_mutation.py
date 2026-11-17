@@ -1,16 +1,20 @@
 """Fixed-seed mutation tests: synthetic fixtures of xls (clear, RC4, XOR), xlsb, ppt (clear, encrypted), rtf, pdf (plain,
 xref and object streams, R4 AES), the OOXML docx, pptx and xlsx packages, mobi (MOBI 6, KF8 combo, HUFF/CDIC), wpd
-(WordPerfect 6 and 5) and iWork (IWA Pages, Numbers and Keynote, '09 Pages and Numbers) are damaged at random and read;
-every outcome must be a Doc or a ReadError (no other exception, no hang).
+(WordPerfect 6 and 5), iWork (IWA Pages, Numbers and Keynote, '09 Pages and Numbers), djvu (a bundled TXTz book, a
+TXTa page), Access (Jet 3, Jet 4), Publisher (2002+, 2000, 97/98) and Visio binary (v11, v5) are damaged at random and
+read; every outcome must be a Doc, another parser's name for a compound file, or a ReadError (no other exception, no
+hang).
 
 About 100 cases a seed, each from `random.Random(SEED + k)`, so a failure names the case and repeats. No damaged
 case is ever written to disk: compound files and zips are built in memory and read through the formats' in-memory
 entries (`xls.parse_compound`, `ppt.parse_compound`, `xlsb.parse_package`, `ooxml.parse_package`, `rtf.parse_bytes`, `pdf.parse_bytes`,
-`mobi.parse_bytes`, `wpd.parse_bytes`, `iwork.parse_bytes`), and rendering never writes an image. Only the clean xlsb,
-ppt, docx and pptx seeds touch a temporary directory, once each (the xlsx, mobi, wpd and iWork seeds are built in
+`mobi.parse_bytes`, `wpd.parse_bytes`, `iwork.parse_bytes`, `djvu.parse_bytes`, `jet.parse_bytes`, `pub.parse_compound`,
+`vsd.parse_compound`), and rendering never writes an image. Only the clean xlsb, ppt, docx and pptx seeds touch a
+temporary directory, once each (the xlsx, mobi, wpd, iWork, djvu, Access, Publisher and Visio seeds are built in
 memory). An OOXML case damages one or two of its seed's XML members. An IWA case damages the archive bytes of one or two
 `.iwa` members after Snappy is undone (every other case only inside one object's payload, the framing kept), then
-stores them as type-1 chunks; a '09 case damages `index.xml`. The RTF seed
+stores them as type-1 chunks; a '09 case damages `index.xml`. A Publisher case damages its Contents or Quill stream
+or both, a Visio case its VisioDocument stream (stored and LZ77-coded pages), before `cfb_bytes`. The RTF seed
 holds none of the control words of a shape's property groups, and the test builds them with `cat` so no .pyc holds
 them either.
 
@@ -35,20 +39,26 @@ from reader import markdown  # noqa: E402
 from reader.containers import flate, pbwire, snappy  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
-from reader.formats import iwork, iwork_iwa, mobi, ooxml, pdf, ppt, rtf, wpd, xls, xlsb  # noqa: E402
+from reader.formats import (djvu, iwork, iwork_iwa, jet, mobi, ooxml, pdf, ppt, pub, pub_contents, rtf,  # noqa: E402
+                            vsd, wpd, xls, xlsb)
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc  # noqa: E402
 from pdf_fix import (EncryptSpec, Name, Ref, acroform, font_type0, image_xobject, link_annot,  # noqa: E402
                      outline_items, rule_ops, simple_pdf, text_annot, text_ops, widget)
 from reader_fix import (XLSX_SML, blip_png, cfb_bytes, encrypt_xls, make_ppt, make_xlsb, make_xlsx,  # noqa: E402
-                        make_zip, xlsx_cell, xlsx_row)
+                        make_zip, oa_fbse, pub_2k_file, pub_cells, pub_escher, pub_file, pub_sp, pub_table, xlsx_cell,
+                        xlsx_row)
+import djvu_fix as djf  # noqa: E402
 import iwork_fix as iwf  # noqa: E402
+import jet_fix as jf  # noqa: E402
 import test_reader_docm as dm  # noqa: E402  (the seed builders and fixtures of the owning test files)
 import test_reader_iwork as iw  # noqa: E402
 import test_reader_mobi as mb  # noqa: E402
 import test_reader_omml as om  # noqa: E402
+import test_reader_pub as pb  # noqa: E402
 import test_reader_slides as sl  # noqa: E402
 import test_reader_smartart as sa  # noqa: E402
+import test_reader_vsd as vs  # noqa: E402
 import test_reader_wpd as wp  # noqa: E402
 import test_reader_xlsb as xb  # noqa: E402
 
@@ -474,7 +484,10 @@ def mobi_seeds() -> dict:
 # so a regression that refuses every damaged case fails while the draw of 100 cases does not.
 DOC_FLOOR = {"mobi mobi6": 25, "mobi kf8 combo": 25, "mobi huffcdic": 10, "wpd wp6": 35, "wpd wp5": 40,
              "iwork pages": CASES // 4, "iwork numbers": CASES // 4, "iwork key": CASES // 4,
-             "iwork pages09": 25, "iwork numbers09": 25}
+             "iwork pages09": 25, "iwork numbers09": 25,
+             # measured at SEED: 42, 28; 85, 82; 61, 63, 45; 40, 39
+             "djvu book": 20, "djvu page": 14, "jet jet3": 40, "jet jet4": 40, "pub 2002": 30, "pub 2000": 30,
+             "pub 97": 22, "vsd v11": 20, "vsd v5": 19}
 
 
 def check_floor(label, counts):
@@ -688,6 +701,144 @@ def test_iwork_mutations():
         out = render(iwork.parse_bytes(seed, ctx, app), ctx.skipped)
         assert probe in out and not ctx.skipped, (label, out, ctx.skipped)  # the clean seed reads whole
         check_floor(f"iwork {label}", run_cases(f"iwork {label}", iwork_case(seed, app), routed=False))
+
+
+def check_clean(label, read, probe, expect=None):
+    """The clean seed reads whole: `probe` in its Markdown, and nothing counted at parse time but `expect` (a zero
+    count, which renders nothing, is no count)."""
+    ctx = Context()
+    doc = read(ctx)
+    counted = dict(+ctx.skipped)
+    out = render(doc, ctx.skipped)
+    assert probe in out and counted == (expect or {}), (label, out, counted)
+
+
+# ---- djvu: a bundled book and a single page built in memory, damaged whole and read from bytes
+def djvu_seeds() -> dict:
+    """A bundled two-page TXTz book with an ANTz (a link, a comment, a title) on its first page and a NAVM, and a
+    single-page TXTa file."""
+    ant = '(maparea "http://a.example/" "A" (rect 0 0 1 1)) (maparea "" "a note" (rect 0 0 1 1)) (metadata (title "T"))'
+    book = djf.djvm([djf.page("First page\x1fsecond paragraph", z=True, ant=ant, antz=True),
+                     djf.page("Second page words", z=True)], titles=["Intro", None],
+                    navm=djf.navm([("Part", "#1", [("Chapter", "#2", [])])]))
+    return {"book": (book, "Second page words"), "page": (djf.iff(djf.page("Plain page\nline two")), "Plain page")}
+
+
+def test_djvu_mutations():
+    for label, (seed, probe) in djvu_seeds().items():
+        check_clean(f"djvu {label}", lambda ctx, seed=seed: djvu.parse_bytes(seed, ctx), probe)
+
+        def make(rng, k, seed=seed):
+            data = apply(plan(rng, len(seed)), seed)
+            return lambda: read_doc(djvu.parse_bytes, data)
+
+        check_floor(f"djvu {label}", run_cases(f"djvu {label}", make, routed=False))
+
+
+# ---- Access: a Jet3 and a Jet4 file built in memory, damaged whole and read from bytes
+def jet_seeds() -> dict:
+    """Jet3: one table whose memo is an LVAL chain. Jet4: two tables (one with an attachment column), a select query
+    and a relationship between them."""
+    memo = " ".join(f"word{i}" for i in range(900))  # past one 2 KiB LVAL page: a chain
+    jet3 = jf.jet_db(0, [jf.Tbl("Notes", [jf.Col("ID", jf.LONG), jf.Col("Name", jf.TEXT), jf.Col("Body", jf.MEMO)],
+                                [[1, "first", memo], [2, "second", "short"]], pk="ID")])
+    files = jf.Col("Files", jf.COMPLEX, attachments=True)
+    a = jf.Tbl("A", [jf.Col("ID", jf.LONG), jf.Col("Name", jf.TEXT), files],
+               [[1, "alpha", [("a.png", PNG)]], [2, "beta", None]], pk="ID")
+    b = jf.Tbl("B", [jf.Col("ID", jf.LONG), jf.Col("AID", jf.LONG)], [[1, 1], [2, 2]])
+    query = jf.Query("Q", [(1, None, 1, None, None), (5, None, None, "A", None), (6, "Name", None, None, None)])
+    jet4 = jf.jet_db(1, [a, b], queries=[query], relationships=[("AB", "B", "AID", "A", "ID")])
+    return {"jet3": (jet3, "word899"), "jet4": (jet4, "FROM A")}
+
+
+def test_jet_mutations():
+    for label, (seed, probe) in jet_seeds().items():
+        check_clean(f"jet {label}", lambda ctx, seed=seed: jet.parse_bytes(seed, ctx), probe)
+
+        def make(rng, k, seed=seed):
+            data = apply(plan(rng, len(seed)), seed)
+            return lambda: read_doc(jet.parse_bytes, data)
+
+        check_floor(f"jet {label}", run_cases(f"jet {label}", make, routed=False))
+
+
+# ---- Publisher: the Contents and Quill streams damaged, the compound file rebuilt and read in memory
+PUB_STREAMS = ("Contents", "Quill/QuillSub/CONTENTS", "Escher/EscherStm")
+
+
+def pub_seeds() -> dict:
+    """2002+: two pages (text, a 2x2 table with a merged row, a picture), a master page with a footer, a link. 2000:
+    two pages and a master, Quill text with bold. 97/98: 8-bit text in two boxes (no Quill)."""
+    page = dict
+    pages = [page(seq=0x25, shapes=[0x34], master="Master A"), page(seq=0x21, shapes=[0x30, 0x31], applied=0x25),
+             page(seq=0x22, shapes=[0x32, 0x33], applied=0x25)]
+    shapes = [dict(seq=0x30, text=1), dict(seq=0x31, text=2, type=pub_contents.TABLE, extra=pub_table(2, 2, 0x50)),
+              dict(seq=0x50, type=pub_contents.CELLS, extra=pub_cells(pb.MERGED)), dict(seq=0x32),
+              dict(seq=0x33, text=3), dict(seq=0x34, text=4)]
+    stories = [(1, "Hello\rWorld"), (2, pb.TABLE_TEXT), (3, "Second page"), (4, "Footer")]
+    escher = pub_escher(pub_sp(0x30, (0, 10, 50, 20)), pub_sp(0x32, (0, 30, 50, 60), pib=1),
+                        store=[oa_fbse(blip_png(PNG))])
+    v2002 = pub_file(pages, shapes, stories, escher=escher, bold=[(0, 5)], tcd={1: pb.TABLE_BOUNDS},
+                     links=["https://a.example/"])
+    v2000 = pub_2k_file([pb.PG, 0x10C, 0x109], [pb.text2k(0x30, 1, box=(0, 0, 9, 9)), pb.text2k(0x31, 2, parent=0x10C),
+                                                pb.table2k(0x32, 3), pb.text2k(0x33, 4, parent=0x109)],
+                        [(1, "Hello\rWorld"), (2, "Second"), (3, "Cell"), (4, "Footer")], bold=[(0, 5)])
+    v97 = pb.file97(b"Hello\r\nWorld\x0bnext\x0cBox two")
+    # a 2000 table's structure is not read: its story is, counted `table` once
+    return {"2002": (v2002, "Footer", None), "2000": (v2000, "Cell", {"table": 1}), "97": (v97, "Box two", None)}
+
+
+def pub_case(blob):
+    """Cases that damage one or both of the Contents and Quill streams (Escher kept), rebuilt with cfb_bytes."""
+    with Compound(blob) as cf:
+        streams = {n: cf.read(n) for n in PUB_STREAMS if cf.exists(n)}
+    names = [n for n in PUB_STREAMS[:2] if n in streams]
+
+    def make(rng, k):
+        parts = dict(streams)
+        for name in rng.sample(names, min(len(names), rng.choice((1, 1, 2)))):
+            parts[name] = apply(plan(rng, len(parts[name])), parts[name])
+        damaged = cfb_bytes(parts)[0]
+        return lambda: read_doc(pub.parse_compound, damaged)
+    return make
+
+
+def test_pub_mutations():
+    for label, (seed, probe, expect) in pub_seeds().items():
+        check_clean(f"pub {label}", lambda ctx, seed=seed: pub.parse_compound(seed, ctx), probe, expect)
+        check_floor(f"pub {label}", run_cases(f"pub {label}", pub_case(seed)))
+
+
+# ---- Visio binary: the VisioDocument stream damaged (stored and LZ77-coded pages), wrapped and read in memory
+def vsd_seeds() -> dict:
+    """v11: a page with a group, a shape taking its stencil master's text and a glued connector, and a second page
+    LZ77-coded. v5: a page with a stencil master, a hidden shape and a cp1251 font run."""
+    shapes = [{"id": 1, "type": 0x47, "text": "group", "pin": (5.0, 10.0, 1.0, 2.0)},
+              {"id": 2, "parent": 1, "text": "child", "pin": (0.5, 1.0)},
+              {"id": 3, "master": (0, 2), "pin": (0.0, 8.0)},
+              {"id": 4, "text": "End", "pin": (0.0, 5.0)},
+              {"id": 5, "text": "flows", "pin": (0.0, 7.0), "misc": vs.misc(11, ends=(1, 4))}]
+    coded = {"name": "Coded", "compressed": True, "shapes": [{"id": 1, "text": "packed", "pin": (1.0, 1.0)}]}
+    v11 = vs.drawing([{"name": "Main", "shapes": shapes}, coded],
+                     stencils=[[{"id": 1, "text": "first"}, {"id": 2, "text": "Master"}]])
+    v5_shapes = [{"id": 1, "text": "low", "pin": (0.0, 1.0)}, {"id": 3, "master": (0, 4), "pin": (0.0, 5.0)},
+                 {"id": 5, "text": "quiet", "pin": (0.0, 3.0), "misc": vs.misc(5, hide=True)},
+                 {"id": 6, "raw": "Мир".encode("cp1251"), "runs": [(3, 7)], "pin": (0.0, 2.0)}]
+    v5 = vs.drawing([{"name": "Front", "shapes": v5_shapes}], version=5, stencils=[[{"id": 4, "text": "Master"}]],
+                    extra=[vs.fonts([(7, 204, b"Arial")], version=5)])
+    return {"v11": (v11, "packed"), "v5": (v5, "Мир")}
+
+
+def test_vsd_mutations():
+    for label, (seed, probe) in vsd_seeds().items():
+        blob = cfb_bytes({"VisioDocument": seed})[0]
+        check_clean(f"vsd {label}", lambda ctx, blob=blob: vsd.parse_compound(blob, ctx), probe)
+
+        def make(rng, k, seed=seed):
+            blob = cfb_bytes({"VisioDocument": apply(plan(rng, len(seed)), seed)})[0]
+            return lambda: read_doc(vsd.parse_compound, blob)
+
+        check_floor(f"vsd {label}", run_cases(f"vsd {label}", make))
 
 
 def main():
