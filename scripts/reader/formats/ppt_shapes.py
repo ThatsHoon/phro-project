@@ -5,7 +5,9 @@ bottom (i16, or i32 in 16 bytes) while a ChildAnchor and an FSPGR rectangle hold
 group maps the rectangle of its children's coordinates (FSPGR) onto its own anchor, flips included, and the maps of
 nested groups compose; a group whose FOPT property 0x039F has bit 0 set is a table whose grid is cut by the edges of
 its cells. [MS-ODRAW] and [MS-PPT] are knowledge only. The text atoms of a shape are those of `ppt_text`; this module
-also holds the record budget (`Walk`) and the text-atom walk the slide reader shares.
+also holds the record budget (`Walk`) and the text-atom walk the slide reader shares. For the slide's diagram a shape
+keeps its arrowheads, and a connector or line its two ends: its anchor's start corner (the far one on an axis its FSP
+flips) and the opposite corner, mapped like its box; the drawing's connector rules come with the shapes.
 
 Hostile input: every record is bounded by `officeart.records`, the walk is iterative, groups nest `MAX_GROUPS` deep
 (deeper ones are skipped and counted under `depth`), every record spends the presentation's `BIN_RECORDS`, and a table
@@ -128,15 +130,18 @@ class Shape:
     spid: int = 0
     stype: int = 0
     table: bool = False
+    arrows: tuple = (False, False)
+    ends: tuple | None = None  # a connector's or line's (start, end) points; None for another shape or no anchor
 
 
 class _Raw:
     """What one SpContainer says before it is placed."""
     __slots__ = ("flags", "stype", "spid", "table", "pib", "client", "child", "rect", "runs", "text_ref",
-                 "placeholder", "ole_ref")
+                 "placeholder", "ole_ref", "arrows")
 
     def __init__(self):
         self.flags = self.stype = self.spid = 0
+        self.arrows = (False, False)
         self.table, self.pib, self.client, self.child, self.rect = False, None, None, None, None
         self.runs, self.text_ref, self.placeholder, self.ole_ref = [], None, None, None
 
@@ -159,13 +164,14 @@ def _shape(data, body, size, walk) -> _Raw:
         if not walk.spend():
             break
         if typ == officeart.FSP and s >= 8:
-            raw.spid, raw.flags = struct.unpack_from("<II", data, b)
+            raw.spid, raw.flags = officeart.fsp(data[b:b + 8])
             raw.stype = inst
         elif typ == officeart.FOPT and not seen_opt:
             seen_opt = True
             prop = officeart.fopt_property(data, inst, b, s, _TABLE_PROP)
             raw.table = raw.table or bool(prop is not None and prop & 1)
             raw.pib = officeart.fopt_property(data, inst, b, s, officeart.PIB) or None
+            raw.arrows = officeart.arrows(data, inst, b, s)
         elif typ in _EXTRA_FOPT:  # PowerPoint keeps the table flag in the tertiary properties
             prop = officeart.fopt_property(data, inst, b, s, _TABLE_PROP)
             raw.table = raw.table or bool(prop is not None and prop & 1)
@@ -237,6 +243,18 @@ def _child_tf(raw: _Raw, box, tf):
     return (sx * ax, sy * ay, dx + sx * (ox - x0 * ax), dy + sy * (oy - y0 * ay))
 
 
+def _ends(raw: _Raw, box, tf):
+    """A connector's (start, end): the start corner of its raw box (left, top; right on fFlipH, bottom on fFlipV) and
+    the opposite corner, mapped through `tf`; None without a box."""
+    if box is None:
+        return None
+    left, top, right, bottom = box
+    x0, x1 = (right, left) if raw.flags & officeart.FLIP_H else (left, right)
+    y0, y1 = (bottom, top) if raw.flags & officeart.FLIP_V else (top, bottom)
+    sx, sy, dx, dy = tf
+    return ((_clamp(sx * x0 + dx), _clamp(sy * y0 + dy)), (_clamp(sx * x1 + dx), _clamp(sy * y1 + dy)))
+
+
 def _leaf(raw: _Raw, tf) -> Shape:
     if raw.ole_ref is not None:  # an OLE object's shape also carries its preview as a pib
         kind = "object"
@@ -245,18 +263,22 @@ def _leaf(raw: _Raw, tf) -> Shape:
     else:
         kind = "text"
     shape = Shape(kind, text_ref=raw.text_ref, placeholder=raw.placeholder, pib=raw.pib, ole_ref=raw.ole_ref,
-                  runs=raw.runs, blocks=[b for _, bl, _ in raw.runs for b in bl], spid=raw.spid, stype=raw.stype)
+                  runs=raw.runs, blocks=[b for _, bl, _ in raw.runs for b in bl], spid=raw.spid, stype=raw.stype,
+                  arrows=raw.arrows)
     _place(shape, _box(raw), tf)
+    if raw.stype == officeart.LINE_TYPE or raw.stype in officeart.CONNECTOR_TYPES:
+        shape.ends = _ends(raw, _box(raw), tf)
     return shape
 
 
-def walk(data, start: int, end: int, ctx, budget: Walk | None = None) -> list:
-    """The shapes of the PPDrawing (or DgContainer) records in data[start:end], as the top-level Shapes of its
-    SpgrContainer: a group has its members in `children`, in record order and in slide coordinates (see `ordered`).
-    A group nested more than MAX_GROUPS deep is skipped and counted under `depth`."""
+def walk(data, start: int, end: int, ctx, budget: Walk | None = None) -> tuple[list, list]:
+    """(shapes, rules) of the PPDrawing (or DgContainer) records in data[start:end]: the top-level Shapes of its
+    SpgrContainer, a group with its members in `children`, in record order and in slide coordinates (see `ordered`),
+    and the (spidA, spidB, spidC) connector rules of its SolverContainers, each spending a record. A group nested more
+    than MAX_GROUPS deep is skipped and counted under `depth`."""
     budget = budget or Walk(ctx)
     top = Shape("group")
-    pending, found = [officeart.records(data, start, end)], []
+    pending, found, rules = [officeart.records(data, start, end)], [], []
     while pending:
         for ver, _, typ, body, size in pending[-1]:
             if not budget.spend():
@@ -270,11 +292,16 @@ def walk(data, start: int, end: int, ctx, budget: Walk | None = None) -> list:
                 found.append((body, size))
             elif typ == officeart.SP_CONTAINER:
                 top.children.append(_leaf(_shape(data, body, size, budget), _IDENTITY))
+            elif typ == officeart.SOLVER:
+                for rule in officeart.rules(data, body - 8, body + size):
+                    if not budget.spend():
+                        break
+                    rules.append(rule)
         else:
             pending.pop()
     for body, size in found:
         _group(data, body, size, budget, top)
-    return top.children
+    return top.children, rules
 
 
 def _group(data, body, size, budget, top):

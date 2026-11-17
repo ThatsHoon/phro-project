@@ -2,6 +2,7 @@
 
 Run: python -I -X utf8 tests/test_reader_ppt_shapes.py
 """
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -11,20 +12,27 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
-from reader import limits, markdown  # noqa: E402
+from reader import limits, markdown, officeart  # noqa: E402
 from reader.formats import ppt_shapes  # noqa: E402
-from reader.model import Context, Table  # noqa: E402
-from reader_fix import make_ppt, oa_group, ppt_drawing, ppt_shape  # noqa: E402
+from reader.model import Code, Context, Table  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
+from reader_fix import (make_ppt, oa_container, oa_group, oa_record, oa_shape, oa_solver,  # noqa: E402
+                        ppt_drawing, ppt_shape)
 
 
-def md(slides, **kw):
-    """Build a .ppt, parse it, render it: (markdown, ctx)."""
+def parsed(slides, **kw):
+    """Build a .ppt and parse it: (doc, ctx, assets directory)."""
     d = Path(tempfile.mkdtemp())
     path = d / "a.ppt"
     make_ppt(path, slides, **kw)
     ctx = Context()
-    doc = reader.parse(path, ctx)
-    return markdown.render(doc, d / "assets", False, ctx.skipped), ctx
+    return reader.parse(path, ctx), ctx, d / "assets"
+
+
+def md(slides, **kw):
+    """Build a .ppt, parse it, render it: (markdown, ctx)."""
+    doc, ctx, assets = parsed(slides, **kw)
+    return markdown.render(doc, assets, False, ctx.skipped), ctx
 
 
 def text(t, box, **kw):
@@ -35,7 +43,7 @@ def walked(shapes):
     """ppt_shapes.walk over a PPDrawing of the make_ppt shape dicts: the top-level Shapes."""
     ids = [1025]
     data = ppt_drawing(*[ppt_shape(s, ids) for s in shapes])
-    return ppt_shapes.walk(data, 0, len(data), Context())
+    return ppt_shapes.walk(data, 0, len(data), Context())[0]
 
 
 def test_textbox_order():
@@ -256,6 +264,173 @@ def test_placeholder_5_text_left_out_of_notes():
                             text("spoken words", (0, 100, 100, 150), placeholder=6, text_kind=2)]}}
     out, ctx = md([{"title": "T"}], notes=notes)
     assert "spoken words" in out and "image words" not in out and not ctx.skipped, (out, ctx.skipped)
+
+
+# ---- connectors
+END_ARROW = struct.pack("<HI", 0x01D1, 1)  # FOPT lineEndArrowhead: an arrowhead at the end
+
+
+def mermaid(doc):
+    return "\n".join(b.text for sec in doc.blocks for b in sec.blocks if isinstance(b, Code) and b.lang == "mermaid")
+
+
+def test_rules_walk():
+    dg = oa_container(0xF002, oa_group(1024, oa_shape(2), oa_shape(3), oa_shape(4, inst=32)), oa_solver((2, 3, 4)))
+    assert officeart.rules(dg, 8, len(dg)) == [(2, 3, 4)], officeart.rules(dg, 8, len(dg))
+    # a rule shorter than its 24 bytes is left out; a solver cut by the end of the range is not read
+    short = oa_record(0xF012, struct.pack("<5I", 9, 5, 6, 7, 0), ver=1)
+    solver = oa_container(0xF005, short, oa_solver((2, 3, 4))[8:])
+    assert officeart.rules(solver, 0, len(solver)) == [(2, 3, 4)]
+    assert officeart.rules(solver, 0, len(solver) - 1) == []
+    two = oa_solver((2, 3, 4), (5, 6, 7))
+    assert officeart.rules(two[:-4], 0, len(two)) == []
+    # a rule whose own length passes its solver ends that solver's walk
+    long = oa_container(0xF005, oa_solver((2, 3, 4))[8:], struct.pack("<HHI", 0x10, 0xF012, 0x100) + bytes(24))
+    assert officeart.rules(long, 0, len(long)) == [(2, 3, 4)]
+    # rules outside a SolverContainer are not read; the walk visits at most MAX_RECORDS records
+    assert officeart.rules(oa_solver((2, 3, 4))[8:], 0, 32) == []
+    many = oa_solver(*[(k, k + 1, k + 2) for k in range(10)])
+    old = officeart.MAX_RECORDS
+    officeart.MAX_RECORDS = 4
+    try:
+        assert officeart.rules(many, 0, len(many)) == [(0, 1, 2), (1, 2, 3), (2, 3, 4)]
+    finally:
+        officeart.MAX_RECORDS = old
+
+
+def test_fsp_flags_and_arrows():
+    sp = oa_shape(4, inst=32, flags=0xA40, props=END_ARROW)
+    (_, inst, typ, b, s), (_, finst, ftyp, fb, fs) = officeart.records(sp, 8, len(sp))
+    assert typ == officeart.FSP and inst in officeart.CONNECTOR_TYPES and ftyp == officeart.FOPT
+    spid, flags = officeart.fsp(sp[b:b + s])
+    assert spid == 4 and flags & officeart.FLIP_H and not flags & officeart.FLIP_V, (spid, flags)
+    assert officeart.arrows(sp, finst, fb, fs) == (False, True)
+    both = oa_shape(5, pib=3, props=struct.pack("<HIHI", 0x01D0, 2, 0x01D1, 0))
+    _, (_, finst, _, fb, fs) = officeart.records(both, 8, len(both))
+    assert officeart.arrows(both, finst, fb, fs) == (True, False)
+    assert officeart.arrows(both, 0, fb, fs) == (False, False)  # no property: no arrowhead
+    assert officeart.fsp(b"\x05\x00") == (0, 0) and officeart.fsp(struct.pack("<I", 7)) == (7, 0)
+    assert officeart.KINDS[110] == "decision" and officeart.LINE_TYPE == 20 and 40 in officeart.CONNECTOR_TYPES
+
+
+def flow(far=False, rule=(2, 3, 4), **connector):
+    """A slide: a title, Start (spid 2) above End (spid 3) and connector spid 4 between them (far off when `far`),
+    with make_ppt's keywords for a solver of `rule`."""
+    box = (600, 600, 700, 700) if far else (200, 200, 200, 400)
+    shapes = [text("Deck title", (0, 10, 500, 50), placeholder=13, text_kind=0),
+              text("Start", (100, 100, 300, 200), spid=2), text("End", (100, 400, 300, 500), spid=3),
+              {"spid": 4, "inst": 32, "props": END_ARROW, "box": box, **connector}]
+    return [{"shapes": shapes}], {"raw_shapes": {1: oa_solver(rule)}} if rule else {}
+
+
+def test_ppt_connector_mermaid():
+    slides, kw = flow(far=True)
+    doc, ctx, assets = parsed(slides, **kw)
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n2["End"]\n  n1 --> n2', t
+    out = markdown.render(doc, assets, False, ctx.skipped)
+    assert out.startswith("## Slide 1: Deck title\n\n```mermaid\n"), out
+    for word in ("Start", "End", "Deck title"):
+        assert out.count(word) == 1, (word, out)
+    assert doc.blocks[0].title == "Deck title" and not ctx.skipped, ctx.skipped
+    # a rule naming a missing shape is no glue: far from every shape the connector stays loose
+    slides, kw = flow(far=True, rule=(2, 99, 4))
+    out, ctx = md(slides, **kw)
+    assert "mermaid" not in out and ctx.skipped["connector_loose"] == 1, (out, ctx.skipped)
+    # a line (type 20) glued by a rule is an edge too, labelled by its text
+    slides, kw = flow(far=True, inst=20, text="go")
+    doc, ctx, _ = parsed(slides, **kw)
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t.endswith('  n1 -->|"go"| n2'), t
+
+
+def test_ppt_kinds_from_shape_type():
+    slides, kw = flow()
+    slides[0]["shapes"][1]["inst"] = 110
+    slides[0]["shapes"][2]["inst"] = 116
+    doc, _, _ = parsed(slides, **kw)
+    t = mermaid(doc)
+    assert mermaid_ok(t) and '  n1{"Start"}' in t and '  n2(["End"])' in t, t
+
+
+def test_ppt_place_failure_keeps_the_flow():
+    from reader import diagram
+
+    def boom(self, slots):
+        raise ValueError("bad")
+    slides, kw = flow()
+    real = diagram.Diagram.place
+    diagram.Diagram.place = boom
+    try:
+        out, ctx = md(slides, **kw)
+    finally:
+        diagram.Diagram.place = real
+    assert out.endswith("## Slide 1: Deck title\n\nStart\n\nEnd\n") and ctx.skipped["shape"] == 1, (out, ctx.skipped)
+
+
+def snap_group(**connector):
+    """A Decoy at the top level where unmapped ends would fall, then a group mapping (0, 0, 100, 20) onto
+    (0, 100)-(1000, 300): A on the left, B on the right and a straight connector from (10, 10) to (90, 10) in its
+    ChildAnchor."""
+    return [text("Decoy", (0, 0, 30, 30)),
+            {"kind": "group", "box": (0, 100, 1000, 300), "rect": (0, 0, 100, 20), "client": True,
+             "children": [text("A", (0, 0, 20, 20)), text("B", (80, 0, 100, 20)),
+                          {"inst": 32, "props": END_ARROW, "box": (10, 10, 90, 10), **connector}]}]
+
+
+def test_ppt_child_anchor_snaps():
+    con = walked(snap_group())[1].children[2]
+    assert con.ends == ((100, 200), (900, 200)), con.ends
+    assert walked(snap_group(flags=0x40))[1].children[2].ends == ((900, 200), (100, 200))
+    for flags, edge in ((0, "n1 --> n2"), (0x40, "n2 --> n1")):  # flipped, the connector starts at its right corner
+        doc, ctx, assets = parsed([{"shapes": snap_group(flags=flags)}])
+        t = mermaid(doc)
+        assert mermaid_ok(t) and t == f'flowchart LR\n  n1["A"]\n  n2["B"]\n  %% inferred from position\n  {edge}', t
+        out = markdown.render(doc, assets, False, ctx.skipped)
+        assert out.startswith("## Slide 1\n\nDecoy\n\n```mermaid\n") and not ctx.skipped, (out, ctx.skipped)
+    # a flipped group mirrors its members, the connector's ends with them
+    con = walked([dict(snap_group()[1], flags=0x40)])[0].children[2]
+    assert con.ends == ((900, 200), (100, 200)), con.ends
+
+
+def _plain_slides():
+    """Decks with no solver and no connector: fixtures above, plus decision and terminator shapes and an arrowless
+    line."""
+    cells = [text("a1", (0, 0, 100, 50)), text("b1", (100, 0, 200, 50)),
+             text("c1", (0, 50, 100, 100)), text("d1", (100, 50, 200, 100))]
+    group = {"kind": "group", "box": (0, 100, 1000, 1100), "rect": (0, 0, 100, 100), "client": True,
+             "children": [text("A", (0, 50, 10, 60)), text("B", (0, 10, 10, 20))]}
+    return [
+        [{"shapes": [text("lower", (100, 500, 900, 600)), text("upper", (100, 100, 900, 200))]}],
+        [{"title": "Head", "body": ["Body text"], "extra": [(1, "Tail text")], "outline": True,
+          "shapes": [text("Top box", (0, 100, 500, 200)), {"placeholder": 14, "ref": 1, "box": (0, 500, 500, 600)},
+                     {"placeholder": 13, "ref": 0, "box": (0, 10, 500, 50)}]}],
+        [{"shapes": [text("Big idea", (0, 10, 500, 50), placeholder=15, text_kind=4),
+                     text("detail", (0, 100, 500, 150))]}],
+        [{"shapes": [text("Cee", (0, 400, 100, 450)), group]}],
+        [{"shapes": [table(cells)]}],
+        [{"shapes": [{"text": "free one"}, text("low", (0, 500, 100, 550)), {"text": "free two"}]}],
+        [{"title": "T", "body": ["kept body"]}, {"title": "U", "body": ["more"], "hidden": True}],
+        [{"shapes": [text("Choice", (0, 0, 100, 100), inst=110), text("rule", (0, 200, 500, 200), inst=20),
+                     text("Done", (0, 300, 100, 400), inst=116)]}],
+    ]
+
+
+_PLAIN = [  # what the reader wrote for these decks before it read connectors
+    '## Slide 1\n\nupper\n\nlower\n',
+    '## Slide 1: Head\n\nTop box\n\nBody text\n\nTail text\n',
+    '## Slide 1: Big idea\n\ndetail\n',
+    '## Slide 1\n\nB\n\nA\n\nCee\n',
+    '## Slide 1\n\n|a1|b1|\n|---|---|\n|c1|d1|\n',
+    '## Slide 1\n\nlow\n\nfree one\n\nfree two\n',
+    '(1 hidden places left out)\n\n## Slide 1: T\n\nkept body\n',
+    '## Slide 1\n\nChoice\n\nrule\n\nDone\n',
+]
+
+
+def test_ppt_without_solver_unchanged():
+    got = [md(s)[0] for s in _plain_slides()]
+    assert got == _PLAIN, got
 
 
 def main():

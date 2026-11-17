@@ -545,12 +545,14 @@ def oa_fbse(blip=b"", delay=0xFFFFFFFF, *, name=b"", cref=1):
     return oa_record(0xF007, body + bytes(name) + bytes(blip), ver=2, inst=6)
 
 
-def oa_shape(spid, pib=None, anchor: bytes | None = None):
-    """An SpContainer (0xF004): its FSP (0xF00A: spid, grfPersistent) and, when `pib` is given, an FOPT (0xF00B)
-    whose one property is pib (0x4104); when `anchor` is given, a ClientAnchor (0xF010) with that body."""
-    out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75)
-    if pib is not None:
-        out += oa_record(0xF00B, struct.pack("<HI", 0x4104, pib), ver=3, inst=1)
+def oa_shape(spid, pib=None, anchor: bytes | None = None, *, inst=75, flags=0xA00, props=b""):
+    """An SpContainer (0xF004): its FSP (0xF00A, instance the shape type `inst`: spid, grfPersistent `flags`) and,
+    when `pib` or `props` is given, an FOPT (0xF00B) holding pib (0x4104) when given, then the 6-byte properties
+    `props` (opid u16, op u32 each); when `anchor` is given, a ClientAnchor (0xF010) with that body."""
+    out = oa_record(0xF00A, struct.pack("<II", spid, flags), ver=2, inst=inst)
+    fopt = (struct.pack("<HI", 0x4104, pib) if pib is not None else b"") + bytes(props)
+    if fopt:
+        out += oa_record(0xF00B, fopt, ver=3, inst=len(fopt) // 6)
     if anchor is not None:
         out += oa_record(0xF010, anchor)
     return oa_container(0xF004, out)
@@ -565,6 +567,13 @@ def oa_group(spid, *members, anchor: bytes | None = None):
         shape += oa_record(0xF010, anchor)
     shape = oa_container(0xF004, shape)
     return oa_container(0xF003, shape, *members)
+
+
+def oa_solver(*rules):
+    """A SolverContainer (0xF005) of one ConnectorRule (0xF012) per (spidA, spidB, spidC) in `rules`: ruid k + 1,
+    spidA (the start's shape), spidB (the end's), spidC (the connector), cptiA and cptiB 0."""
+    return oa_container(0xF005, *[oa_record(0xF012, struct.pack("<6I", k + 1, a, b, c, 0, 0), ver=1)
+                                  for k, (a, b, c) in enumerate(rules)], inst=len(rules))
 
 
 def picf_inline(blip, mm=0x64, *, name=b"", pib=None, fbses=None):
@@ -1462,9 +1471,11 @@ def ppt_shape(spec, ids, *, inside=False, urls=()):
         members = [ppt_shape(c, ids, inside=True, urls=urls) for c in spec.get("children", ())]
         return oa_container(0xF003, oa_container(0xF004, head), *members)
     pib = spec.get("pib")
-    out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00), ver=2, inst=75 if pib else 202)
-    if pib:
-        out += oa_record(0xF00B, struct.pack("<HI", 0x4104, pib), ver=3, inst=1)
+    out = oa_record(0xF00A, struct.pack("<II", spid, 0xA00 | spec.get("flags", 0)), ver=2,
+                    inst=spec.get("inst", 75 if pib else 202))
+    fopt = (struct.pack("<HI", 0x4104, pib) if pib else b"") + bytes(spec.get("props", b""))
+    if fopt:
+        out += oa_record(0xF00B, fopt, ver=3, inst=len(fopt) // 6)
     out += anchor
     data = b""
     if kind == "object":
@@ -1601,7 +1612,9 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     slide's notes likewise.
     shapes: a list of dicts that replaces the slide's own text shapes in its PPDrawing (the SLWT is unchanged). A dict
     is a text shape, kind "group" or kind "picture" (key pib, the 1-based BStore index; box, text, placeholder and ref
-    as for a text shape); kind "object" (below). Keys: kind ("text" by default), spid, box ((left, top, right, bottom):
+    as for a text shape); kind "object" (below). Keys: kind ("text" by default), spid, inst (the FSP's shape type, 202
+    or 75 with a pib by default), flags (FSP flag bits added to 0xA00, 0x40 flipH, 0x80 flipV), props (6-byte FOPT
+    properties after the pib, for example 0x01D1 lineEndArrowhead), box ((left, top, right, bottom):
     a ClientAnchor at the top level, a ChildAnchor inside a group, unless client is true; wide makes the ClientAnchor 16
     bytes), text and text_kind (a text run of TextHeaderAtom type text_kind, 1 by default), placeholder (an
     OEPlaceholderAtom of that type in the ClientData), ref (an OutlineTextRefAtom index in the ClientData), link (the

@@ -1,6 +1,8 @@
-"""OfficeArt records (MS-ODRAW): bounded record walks, BLIPs as image bytes, the BStore and shapes by spid.
+"""OfficeArt records (MS-ODRAW): bounded record walks, BLIPs as image bytes, the BStore, shapes by spid, and what a
+diagram needs of a drawing: its connector rules, a shape's FSP spid and flags, its arrowheads and its type's kind.
 
-Format-neutral: doc reads its DggInfo and inline pictures through it, and the xls and ppt readers of phase 2b will.
+Format-neutral: doc reads its DggInfo and inline pictures through it, ppt its connector rules, and the xls and pub
+readers will.
 Offsets are into the buffer a caller passes, a record's offset being where its 8-byte header starts. Logic follows
 dochan office_binary/officeart.py (the record walk, the BLIP kinds and their UIDs, the DIB file header, the FBSE and
 its delay-loaded BLIP, FOPT properties); where it differs MS-ODRAW is followed: 0xF02A is a JPEG too, the compression
@@ -20,6 +22,14 @@ MAX_RECORDS = 1_000_000  # records one walk visits
 SP_CONTAINER, SPGR_CONTAINER, FSP, FOPT = 0xF004, 0xF003, 0xF00A, 0xF00B
 DGG_CONTAINER, BSTORE, FBSE = 0xF000, 0xF001, 0xF007
 CLIENT_ANCHOR = 0xF010
+SOLVER, CONNECTOR_RULE = 0xF005, 0xF012  # OfficeArtSolverContainer, OfficeArtFConnectorRule
+FLIP_H, FLIP_V = 0x40, 0x80               # FSP flags: the shape is mirrored horizontally, vertically
+LINE_START_ARROW, LINE_END_ARROW = 0x01D0, 0x01D1  # FOPT lineStartArrowhead, lineEndArrowhead: 0 is none
+# shape type (the FSP's instance) -> diagram node kind: diamond, flowChartDecision; flowChartTerminator; ellipse,
+# flowChartConnector; can, flowChartMagneticDisk
+KINDS = {110: "decision", 4: "decision", 116: "terminator", 3: "circle", 120: "circle", 22: "store", 132: "store"}
+CONNECTOR_TYPES = range(32, 41)  # straight, bent and curved connectors
+LINE_TYPE = 20                   # a plain line: a connector only with an arrowhead
 PIB = 0x0104           # the pib property's id (opid & 0x3FFF; fBid is 0x4000, fComplex 0x8000)
 _NO_DELAY = 0xFFFFFFFF  # an FBSE foDelay with no delay-loaded BLIP
 _DEFLATE, _STORED = 0, 0xFE  # OfficeArtMetafileHeader compression
@@ -209,6 +219,42 @@ def fopt_property(data, inst: int, body: int, size: int, prop: int) -> int | Non
         if opid & 0x3FFF == prop and not opid & 0x8000:
             return op
     return None
+
+
+def rules(data, start: int, end: int) -> list[tuple[int, int, int]]:
+    """(spidA, spidB, spidC) of each ConnectorRule (0xF012: ruid, spidA the start's shape, spidB the end's, spidC the
+    connector, cptiA, cptiB, u32 each) in the SolverContainers (0xF005) among the records in data[start:end], in
+    order. A rule shorter than its 24 bytes is left out, a solver's walk stops at a record that passes the solver, and
+    the walks visit at most MAX_RECORDS records together."""
+    out, n = [], 0
+    for _, _, typ, body, size in records(data, start, end):
+        n += 1
+        if n > MAX_RECORDS:
+            break
+        if typ != SOLVER:
+            continue
+        for _, _, t, b, s in records(data, body, body + size):
+            n += 1
+            if n > MAX_RECORDS:
+                return out
+            if t == CONNECTOR_RULE and s >= 24:
+                out.append(struct.unpack_from("<4xIII", data, b))
+    return out
+
+
+def fsp(body) -> tuple[int, int]:
+    """(spid, flags) of an FSP (0xF00A) body: spid u32, then the flags u32 (fGroup 0x1, ..., FLIP_H, FLIP_V); 0 for
+    a field the body is too short to hold."""
+    spid = struct.unpack_from("<I", body)[0] if len(body) >= 4 else 0
+    flags = struct.unpack_from("<I", body, 4)[0] if len(body) >= 8 else 0
+    return spid, flags
+
+
+def arrows(data, inst: int, body: int, size: int) -> tuple[bool, bool]:
+    """(start, end) arrowheads of the FOPT whose body is data[body:body + size]: lineStartArrowhead (0x01D0) and
+    lineEndArrowhead (0x01D1), non-zero is an arrowhead; an absent property is none."""
+    return (bool(fopt_property(data, inst, body, size, LINE_START_ARROW)),
+            bool(fopt_property(data, inst, body, size, LINE_END_ARROW)))
 
 
 class Shapes:
