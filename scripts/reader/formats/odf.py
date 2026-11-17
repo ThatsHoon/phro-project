@@ -1,4 +1,8 @@
-"""OpenDocument entry point: package checks, kind dispatch and the odt path. Shared walking lives in odf_base."""
+"""OpenDocument entry point: package checks, kind dispatch and the odt path. Shared walking lives in odf_base.
+
+An odt body that holds a connector is read as one diagram scope (`Body.scope`, `Body.place`); one without reads as
+before."""
+from .. import diagram
 from ..containers.zipx import Package, kids, local
 from ..limits import ReadError
 from ..model import Doc
@@ -59,9 +63,15 @@ def _text(pkg, ctx, content, styles_root) -> Doc:
     office = next((c for b in kids(content, "body") for c in b if local(c.tag) == "text"), None)
     if office is None:
         raise ReadError("damaged", "no readable body")
+    with ctx.guard("shape"):
+        body.scope(office)
     for c in office:
         with ctx.guard("block"):
             body.doc.blocks.extend(body.block(c, 0))
+    if body.glued is not None:
+        with ctx.guard("shape"):
+            body.place(diagram.ConnectionBudget(ctx))
+        body.glued = None
     if styles_root is not None:
         with ctx.guard("header"):
             body.master(styles_root)

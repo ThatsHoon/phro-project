@@ -1,29 +1,18 @@
-"""OpenDocument presentations (.odp): one slide section per draw:page, shapes in reading order."""
-import math
+"""OpenDocument presentations (.odp): one slide section per draw:page, shapes in reading order.
+
+Each slide is one diagram scope: its shapes and connectors (groups flattened) go to `diagram.Diagram` through
+`odf_base.register`; titles are registered without a slot."""
 import re
 
-from .. import limits
+from .. import diagram, limits
 from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
 from ..model import Doc, Image, Para, Section, Text
-from .odf_base import Body, Styles, _flat, _squash
+from .odf_base import GROUPS as _GROUPS, SHAPES as _SHAPES, Body, Styles, _cm, _flat, _squash, register, shape_key
 
-_SHAPES = frozenset({"frame", "custom-shape", "rect", "ellipse", "circle", "polygon", "polyline", "path",
-                     "caption", "line", "connector", "measure", "regular-polygon"})
-_GROUPS = frozenset({"g", "a"})
 _SKIP = frozenset({"page-number", "date-time", "header", "footer", "page"})
 _MASTER_SKIP = _SKIP | {"title", "outline", "subtitle"}
 _DEFAULT_NAME = re.compile(r"^(page|slide|folie|diapositive|diapositiva|dia|슬라이드)\s*\d+$", re.I)
-_UNITS = {"cm": 1.0, "mm": 0.1, "in": 2.54, "pt": 2.54 / 72, "px": 2.54 / 96, "pc": 2.54 / 6}
-_LEN = re.compile(r"^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(cm|mm|in|pt|px|pc)\s*$")
-
-
-def _cm(s):
-    m = _LEN.match(s or "")
-    if not m:
-        return None
-    v = float(m.group(1)) * _UNITS[m.group(2)]
-    return v if math.isfinite(v) else None
 
 
 def _pos(el):
@@ -35,6 +24,7 @@ def _pos(el):
 class _Slides:
     def __init__(self, body):
         self.body = body
+        self.budget = diagram.ConnectionBudget(body.ctx)  # the deck's edges, shared by every slide's diagram
 
     def leaves(self, cont, d, inherit, out):
         if d > limits.MAX_DEPTH:
@@ -66,14 +56,21 @@ class _Slides:
         return self.body.blocks(el, 1)
 
     def slide(self, page, number) -> Section:
-        title, blocks, notes = [], [], []
+        title, slots, notes = [], [], []
+        ctx, dia, keys = self.body.ctx, diagram.Diagram(self.body.ctx, self.budget), set()
         for el, cls in self.shapes(page, _SKIP):
             got = self.blocks(el)
-            if cls == "title":
+            key = shape_key(el, keys)
+            with ctx.guard("shape"):
+                register(dia, self.body.styles, el, key, got)
+            if cls == "title":  # the slide's heading: its text names the node, it has no slot
                 if t := _flat(got):
                     title.append(t)
             else:
-                blocks.extend(got)
+                slots.append((key, got))
+        blocks = [b for _, got in slots for b in got]
+        with ctx.guard("shape"):
+            blocks = dia.place(slots)
         for nt in kids(page, "notes"):
             for el, _ in self.shapes(nt, _SKIP):
                 notes.extend(b for b in self.blocks(el) if not isinstance(b, Image))

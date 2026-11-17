@@ -15,7 +15,8 @@ import reader  # noqa: E402
 from reader import limits, markdown  # noqa: E402
 from reader.formats import odf  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
+from reader.model import Code, Context  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 from reader_fix import make_zip  # noqa: E402
 
 NS = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
@@ -411,6 +412,74 @@ def test_shared_body_notes_document_wide():
     xml = page("a", frame("x" + ann)) + page("b", frame("y" + ann))
     doc, _ = parse(odp(xml))
     assert len(doc.notes) == 2
+
+
+# ---- connectors
+def shape(key, text, x, y="0cm", kind=""):
+    return (f'<draw:custom-shape {key} svg:x="{x}" svg:y="{y}" svg:width="2cm" svg:height="1cm">{P(text)}'
+            f'<draw:enhanced-geometry draw:type="{kind}"/></draw:custom-shape>')
+
+
+def connector(a, b, text="", extra=""):
+    return (f'<draw:connector draw:start-shape="{a}" draw:end-shape="{b}" svg:x1="1cm" svg:y1="1cm" svg:x2="1cm" '
+            f'svg:y2="5cm" {extra}>{P(text) if text else ""}</draw:connector>')
+
+
+def mermaid(blocks):
+    return "\n".join(b.text for b in blocks if isinstance(b, Code) and b.lang == "mermaid")
+
+
+def test_odp_connector():
+    shapes = (frame("Heading", "0cm", "0cm", "title") + shape('draw:id="a" xml:id="ignored"', "Top", "0cm", "1cm", "Flowchart-Terminator")
+              + shape('xml:id="b"', "Bottom", "0cm", "5cm") + f'<draw:ellipse draw:id="e" svg:x="9cm" svg:y="9cm">{P("Round")}</draw:ellipse>'
+              + connector("a", "b", "yes") + connector("b", "e") + frame("Loose text", "0cm", "7cm"))
+    doc, ctx = parse(odp(page("p", shapes)))
+    t = mermaid(doc.blocks[0].blocks)
+    assert mermaid_ok(t) and t == ('flowchart TD\n  n1(["Top"])\n  n2["Bottom"]\n  n3(("Round"))\n'
+                                   '  n1 -->|"yes"| n2\n  n2 --> n3'), t
+    out = markdown.render(doc, tmp() / "a")
+    for word in ("Top", "Bottom", "Round", "yes", "Heading", "Loose text"):
+        assert out.count(word) == 1, (word, out)
+    assert out.startswith("## Slide 1: Heading\n\n```mermaid\n") and out.index("```\n") < out.index("Loose text"), out
+    assert not ctx.skipped["connector_loose"] and not ctx.skipped["shape"], ctx.skipped
+
+
+def test_odp_marker_from_style_chain():
+    styles = ('<style:style style:name="Base" style:family="graphic"><style:graphic-properties draw:marker-end="Arrow"/>'
+              '</style:style><style:style style:name="gr1" style:family="graphic" style:parent-style-name="Base"/>'
+              '<style:style style:name="gr2" style:family="graphic" style:parent-style-name="Base">'
+              '<style:graphic-properties draw:marker-end="none"/></style:style>'
+              '<style:style style:name="gr3" style:family="graphic" style:parent-style-name="Base">'
+              '<style:graphic-properties draw:marker-start="Arrow"/></style:style>'
+              '<style:style style:name="gr4" style:family="graphic"><style:graphic-properties draw:marker-start=""/>'
+              '</style:style>'
+              '<style:style style:name="pr1" style:family="presentation"><style:graphic-properties '
+              'draw:marker-start="Arrow"/></style:style>')
+    pair = shape('draw:id="a"', "A", "0cm", "1cm") + shape('draw:id="b"', "B", "0cm", "5cm")
+    want = {"gr1": "n1 --> n2", "gr2": "n1 --- n2", "gr3": "n1 <--> n2", "gr4": "n1 --- n2"}
+    pages = "".join(page(f"p{i}", pair, connector("a", "b", extra=f'draw:style-name="{s}"'))
+                    for i, s in enumerate(want))
+    pages += page("pres", pair, connector("a", "b", extra='presentation:style-name="pr1"'))
+    doc, _ = parse(odp(pages, styles))
+    for sec, edge in zip(doc.blocks, list(want.values()) + ["n2 --> n1"]):
+        t = mermaid(sec.blocks)
+        assert mermaid_ok(t) and t.endswith("\n  " + edge), (edge, t)
+
+
+def test_ods_shapes_connector():
+    drawn = ('<table:shapes>' + shape('draw:id="a"', "Left", "0cm") + '<draw:g>' + shape('draw:id="b"', "Right", "6cm")
+             + '</draw:g><draw:connector draw:start-shape="a" draw:end-shape="b" svg:x1="2cm" svg:y1="0.5cm" '
+             'svg:x2="6cm" svg:y2="0.5cm"/>' + shape('draw:id="c"', "Unlinked", "0cm", "9cm") + frame("Framed")
+             + '</table:shapes>')
+    xml = '<table:table table:name="S">' + drawn + row(c("x"), c("y")) + '</table:table>'
+    doc, ctx = parse(ods(xml))
+    t = mermaid(doc.blocks[0].blocks)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Left"]\n  n2["Right"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"## Sheet: S\n\n|x|y|\n|---|---|\n\nFramed\n\n```mermaid\n{t}\n```\n", out
+    plain = '<table:table table:name="S"><table:shapes>' + shape('draw:id="a"', "Left", "0cm") + frame("Framed")
+    assert md(ods(plain + '</table:shapes>' + row(c("x"), c("y")) + '</table:table>')) == (
+        "## Sheet: S\n\n|x|y|\n|---|---|\n\nFramed\n")  # no connector: the sheet reads as before
 
 
 def test_via_convert():

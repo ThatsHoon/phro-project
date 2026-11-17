@@ -1,9 +1,17 @@
-"""Shared OpenDocument layer: styles, numbering and the Body walker for odt, ods and odp. Elements match by local name."""
+"""Shared OpenDocument layer: styles, numbering and the Body walker for odt, ods and odp. Elements match by local name.
+
+Drawing shapes and connectors go to `diagram.Diagram` through `register`: keyed by `draw:id`, else `xml:id`; glued by
+`draw:start-shape` and `draw:end-shape`; boxes from `svg:x`, `svg:y`, `svg:width`, `svg:height` and ends from
+`svg:x1`…`svg:y2`, in cm (`draw:transform` is not applied); arrowheads from the graphic style chain. An odt body that
+holds a connector is one scope: the shapes connectors glue and the connectors leave a `_Slot` in the flow, and
+`Body.place` puts the diagram at the first one that anchors it once the body is read.
+"""
 import collections
 import copy
+import math
 import re
 
-from .. import limits
+from .. import diagram, limits
 from ..containers.zipx import attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
 from ..markdown import blocks_len
@@ -26,6 +34,15 @@ _SPACES = 200
 _SYLLABLE = "가나다라마바사아자차카타파하"
 _ROMAN = ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
           (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"))
+_UNITS = {"cm": 1.0, "mm": 0.1, "in": 2.54, "pt": 2.54 / 72, "px": 2.54 / 96, "pc": 2.54 / 6}
+_LEN = re.compile(r"^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(cm|mm|in|pt|px|pc)\s*$")
+SHAPES = frozenset({"frame", "custom-shape", "rect", "ellipse", "circle", "polygon", "polyline", "path",
+                    "caption", "line", "connector", "measure", "regular-polygon"})
+GROUPS = frozenset({"g", "a"})
+_KINDS = {"flowchart-decision": "decision", "diamond": "decision", "flowchart-terminator": "terminator",
+          "ellipse": "circle", "circle": "circle", "flowchart-connector": "circle", "can": "store",
+          "flowchart-magnetic-disk": "store"}
+_XML_ID = "{http://www.w3.org/XML/1998/namespace}id"
 
 
 def _int(s, default=0):
@@ -63,6 +80,101 @@ def _flat(blocks) -> str:
 
 def _empty(blocks) -> bool:
     return all(isinstance(b, Para) and not _itext(b.inlines).strip() and not b.hidden for b in blocks)
+
+
+# ---- drawing shapes and connectors
+def _cm(s):
+    m = _LEN.match(s or "")
+    if not m:
+        return None
+    v = float(m.group(1)) * _UNITS[m.group(2)]
+    return v if math.isfinite(v) else None
+
+
+def _named(el, name, ns_part):
+    """The attribute with this local name whose namespace URI holds ns_part, or None."""
+    for k, v in el.attrib.items():
+        if local(k) == name and ns_part in k.partition("}")[0]:
+            return v
+    return None
+
+
+def _own_id(el):
+    return _named(el, "id", "drawing") or el.get(_XML_ID) or None
+
+
+def shape_key(el, keys: set):
+    """A shape's diagram key: its draw:id, else its xml:id; a key no glue names when it has neither or repeats one
+    already given out in the scope."""
+    k = _own_id(el)
+    if k is None or k in keys:
+        k = ("unkeyed", len(keys))
+    keys.add(k)
+    return k
+
+
+def arrows(styles, el) -> tuple:
+    """(start, end) arrowheads from the graphic style chain of draw:style-name, then the presentation style chain of
+    presentation:style-name: a marker name is True, an empty value or `none` False, absent None."""
+    draw, pres = _named(el, "style-name", "drawing"), _named(el, "style-name", "presentation")
+    out = []
+    for key in ("marker-start", "marker-end"):
+        v = styles.prop(draw, "graphic", key)
+        if v is None and pres:
+            v = styles.prop(pres, "presentation", key)
+        out.append(None if v is None else v.strip().casefold() not in ("", "none"))
+    return tuple(out)
+
+
+def edge_like(el, styles) -> bool:
+    """Whether the element is a connector, or a line with an arrowhead: what can make a diagram edge."""
+    n = local(el.tag)
+    return n == "connector" or (n == "line" and True in arrows(styles, el))
+
+
+def register(dia, styles, el, key, blocks, hidden=False):
+    """One drawing element to the scope's diagram: a draw:connector or draw:line as a connector, anything else as a
+    shape with its kind and box in cm."""
+    n = local(el.tag)
+    if n in ("connector", "line"):
+        p0, p1 = ((_cm(attr(el, f"x{i}")), _cm(attr(el, f"y{i}"))) for i in (1, 2))
+        begin, end = (attr(el, "start-shape"), attr(el, "end-shape")) if n == "connector" else (None, None)
+        dia.connector(key, begin, end, p0, p1, arrows(styles, el), _flat(blocks), line=n == "line", hidden=hidden)
+        return
+    if n in ("ellipse", "circle"):
+        kind = "circle"
+    else:
+        geo = kids(el, "enhanced-geometry") if n == "custom-shape" else []
+        kind = _KINDS.get((attr(geo[0], "type") or "").casefold(), "") if geo else ""
+    x, y, w, h = (_cm(attr(el, a)) for a in ("x", "y", "width", "height"))
+    box = None if None in (x, y, w, h) else (x, y, x + w, y + h)
+    dia.shape(key, blocks, kind, box, hidden)
+
+
+class _Slot:
+    """Where an odt diagram member stood in the flow, until `Body.place` puts the diagram's flow there."""
+
+    def __init__(self, key):
+        self.key, self.hidden = key, ""
+
+
+def _swap(blocks, fn, d=0) -> list:
+    """The blocks with each _Slot replaced by fn(slot), through sections and table cells."""
+    if d > limits.MAX_DEPTH:
+        return blocks
+    out = []
+    for b in blocks:
+        if isinstance(b, _Slot):
+            out.extend(fn(b))
+            continue
+        if isinstance(b, Section):
+            b.blocks = _swap(b.blocks, fn, d + 1)
+        elif isinstance(b, Table):
+            for row in b.rows:
+                for cell in row:
+                    cell.blocks = _swap(cell.blocks, fn, d + 1)
+        out.append(b)
+    return out
 
 
 # ---- numbering markers
@@ -161,6 +273,9 @@ class Body:
         self.left = _BUDGET  # expansion budget still available
         self.chars_left = limits.SHEET_CHARS  # characters that copies (repeats, reused objects) may still add
         self.wt = {}  # id(Table) -> (Table, cells it expands to)
+        self.glued = None  # odt read as one diagram scope: the shape ids connectors glue; None otherwise
+        self.members = {}  # diagram key -> (element, its blocks), waiting for place()
+        self.keys = set()  # diagram keys given out
 
     def hide(self, blocks):
         """Hidden copies of blocks; the originals may be shared with a cached object."""
@@ -252,7 +367,9 @@ class Body:
 
     def _child(self, c, out, d):
         n = local(c.tag)
-        if n == "span":
+        if self.glued is not None and n in SHAPES and (slot := self.member(c, d)) is not None:
+            self.extras.append(slot)
+        elif n == "span":
             sub = self.inlines(c, d + 1)
             if sub and self.is_bold(attr(c, "style-name")):
                 out.append(Bold([y for x in sub for y in (x.inlines if isinstance(x, Bold) and not x.hidden else [x])]))
@@ -403,6 +520,82 @@ class Body:
         tbl.caption = cap
         return [tbl]
 
+    # ---- an odt body as one diagram scope
+    def scope(self, office):
+        """Read the body as one diagram scope when it holds a connector or an arrowed line; else nothing changes."""
+        glued, found = set(), False
+        for el in office.iter():  # the parsed tree's elements, once each
+            if local(el.tag) in ("connector", "line") and edge_like(el, self.styles):
+                found = True
+                glued.update(v for v in (attr(el, "start-shape"), attr(el, "end-shape")) if v)
+        if found:
+            self.glued = glued
+
+    def member(self, el, d):
+        """A connector, an arrowed line, or the first shape of an id a connector glues: its blocks wait under its key
+        and the returned _Slot marks its place. None for anything else, which reads as before."""
+        own = _own_id(el)
+        if not edge_like(el, self.styles) and (own is None or own in self.keys or own not in self.glued):
+            return None
+        key = shape_key(el, self.keys)
+        saved, self.glued = self.glued, None  # what a member holds reads as before
+        try:
+            blocks = self.frame_blocks(el, d) if local(el.tag) == "frame" else self.blocks(el, d + 1)
+        finally:
+            self.glued = saved
+        self.members[key] = (el, blocks)
+        return _Slot(key)
+
+    def swap(self, fn):
+        self.doc.blocks = _swap(self.doc.blocks, fn)
+        for k, v in self.doc.notes.items():
+            self.doc.notes[k] = _swap(v, fn)
+
+    def place(self, budget):
+        """Write the scope: each _Slot gives way to its member's blocks when the diagram keeps them (hidden as the slot
+        was), and the diagram goes at the first slot that anchors it, or at the end when none does."""
+        self.glued = None
+        dia, slots, index = diagram.Diagram(self.ctx, budget), [], {}
+
+        def collect(s):  # flow order; a member in hidden content is a hidden shape or connector
+            if s.key not in index and s.key in self.members:
+                index[s.key] = len(slots)
+                el, blocks = self.members[s.key]
+                with self.ctx.guard("shape"):
+                    register(dia, self.styles, el, s.key, blocks, bool(s.hidden))
+                slots.append((s.key, [object()]))
+            return [s]
+
+        self.swap(collect)
+        flow = [m for _, marks in slots for m in marks]
+        with self.ctx.guard("shape"):
+            flow = dia.place(slots)
+        mark = {id(marks[0]): i for i, (_, marks) in enumerate(slots)}
+        kept, made, at, last = set(), [], len(slots), -1
+        for b in flow:  # the kept marks in order, the diagram's blocks just before the anchor's slot
+            i = mark.get(id(b))
+            if i is not None:
+                kept.add(i)
+                last = i
+            else:
+                if not made:
+                    at = last + 1
+                made.append(b)
+        todo = [made]
+
+        def put(s):
+            i, out = index.get(s.key), []
+            if i is not None and i == at and todo:
+                out += todo.pop()
+            if i in kept:
+                blocks = self.members[s.key][1]
+                out += self.hide(blocks) if s.hidden else blocks
+            return out
+
+        self.swap(put)
+        if todo:
+            self.doc.blocks.extend(todo.pop())
+
     # ---- blocks
     def blocks(self, el, d):
         if d > limits.MAX_DEPTH:
@@ -415,6 +608,8 @@ class Body:
 
     def block(self, c, d):
         n = local(c.tag)
+        if self.glued is not None and n in SHAPES and (slot := self.member(c, d)) is not None:
+            return [slot]
         if n in ("p", "h"):
             return self.para(c, d)
         if n == "list":

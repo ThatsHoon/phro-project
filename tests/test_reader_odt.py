@@ -15,8 +15,9 @@ import reader  # noqa: E402
 from reader import markdown  # noqa: E402
 from reader.containers.zipx import Package, parse_xml  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
+from reader.model import Code, Context  # noqa: E402
 from reader.formats import odf, odf_base  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 from reader_fix import make_zip  # noqa: E402
 
 NS = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
@@ -517,6 +518,54 @@ def test_one_bad_block_loses_only_itself():
     finally:
         odf_base.Body.table = orig
     assert ctx.skipped["block"] == 1 and markdown.render(doc, tmp() / "a") == "뒤\n"
+
+
+# ---- connectors
+def shape(key, text, x, kind=""):
+    return (f'<draw:custom-shape {key} svg:x="{x}" svg:y="0cm" svg:width="2cm" svg:height="1cm">{P(text)}'
+            f'<draw:enhanced-geometry draw:type="{kind}"/></draw:custom-shape>')
+
+
+def connector(a, b, text="", extra=""):
+    return (f'<draw:connector draw:start-shape="{a}" draw:end-shape="{b}" svg:x1="2cm" svg:y1="0.5cm" svg:x2="5cm" '
+            f'svg:y2="0.5cm" {extra}>{P(text) if text else ""}</draw:connector>')
+
+
+def mermaid(doc):
+    return "\n".join(b.text for b in doc.blocks if isinstance(b, Code) and b.lang == "mermaid")
+
+
+def test_odt_connector():
+    body = (P("before") + P("p1 " + shape('draw:id="a"', "Alpha", "0cm", "flowchart-decision"))
+            + P("p2" + shape('xml:id="b"', "Beta", "5cm") + connector("a", "b", "go"))
+            + P("lone " + shape('draw:id="z"', "Zed", "9cm")) + P("after"))
+    doc, ctx = parse(odt_doc(body))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1{"Alpha"}\n  n2["Beta"]\n  n1 -->|"go"| n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"before\n\np1\n\n```mermaid\n{t}\n```\n\np2\n\nlone Zed\n\nafter\n", out
+    assert not ctx.skipped["connector_loose"] and not ctx.skipped["shape"], ctx.skipped
+
+
+def test_odt_without_connector_unchanged():
+    body = ('<text:p>lead <draw:custom-shape draw:id="a" svg:x="0cm" svg:y="0cm" svg:width="2cm" svg:height="1cm">'
+            '<text:p>Alpha</text:p><draw:enhanced-geometry draw:type="flowchart-decision"/></draw:custom-shape> tail'
+            '</text:p><text:p><draw:g><draw:custom-shape xml:id="b"><text:p>Beta</text:p></draw:custom-shape>'
+            '<draw:frame draw:id="f"><draw:text-box><text:p>Gamma</text:p></draw:text-box></draw:frame></draw:g>'
+            '</text:p><draw:custom-shape draw:id="c"><text:p>Top</text:p></draw:custom-shape>'
+            '<text:p>rule<draw:line svg:x1="0cm" svg:y1="0cm" svg:x2="5cm" svg:y2="0cm"/></text:p>')
+    assert md(odt_doc(body)) == "lead Alpha tail\n\nBeta\n\nGamma\n\nrule\n"  # as the reader read it before diagrams
+
+
+def test_odt_divider_line_ignored():
+    body = (P("a" + shape('draw:id="a"', "Alpha", "0cm")) + P("b" + shape('draw:id="b"', "Beta", "5cm"))
+            + P(connector("a", "b")) + P("rule <draw:line svg:x1=\"0cm\" svg:y1=\"9cm\" svg:x2=\"9cm\" svg:y2=\"9cm\">"
+                                         + P("line text") + "</draw:line> end"))
+    doc, ctx = parse(odt_doc(body))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t.count("--") == 1 and "line text" not in t, t
+    assert "rule line text end" in markdown.render(doc, tmp() / "a")
+    assert not ctx.skipped["connector_loose"] and not ctx.skipped["infer_skipped"], ctx.skipped
 
 
 def main():

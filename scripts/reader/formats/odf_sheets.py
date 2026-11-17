@@ -1,13 +1,16 @@
-"""OpenDocument spreadsheets (.ods): one sheet section per table, bounded by row, column and cell caps."""
+"""OpenDocument spreadsheets (.ods): one sheet section per table, bounded by row, column and cell caps.
+
+A sheet's `table:shapes` that holds a connector is one diagram scope: every shape and connector in it, groups walked
+into, goes to `diagram.Diagram` through `odf_base.register`; only its frames have a slot, after the table, as before."""
 import math
 import re
 
-from .. import limits
+from .. import diagram, limits
 from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
 from ..markdown import blocks_len
 from ..model import Cell, Doc, Para, Section, Table, Text
-from .odf_base import Body, Styles, _GAP, _SPAN, _empty, _int, _squash
+from .odf_base import GROUPS, SHAPES, Body, Styles, _GAP, _SPAN, _empty, _int, _squash, edge_like, register, shape_key
 
 _WS = re.compile(r"[ \t\r\n]+")
 _COVERED = "covered-table-cell"
@@ -202,12 +205,13 @@ def sheets(pkg, ctx, content, styles_root) -> Doc:
     if office is None:
         raise ReadError("damaged", "no readable body")
     budget, chars, found, ok = [limits.SHEET_CELLS], [limits.SHEET_CHARS], 0, 0
+    links = diagram.ConnectionBudget(ctx)  # the workbook's edges, shared by every sheet's diagram
     for t in kids(office, "table"):  # sheets of the same name are kept: each is a separate element
         found += 1
         name = _squash(attr(t, "name", ""), 200)
         try:
             with ctx.guard("sheet"):
-                body.doc.blocks.append(_section(body, t, name, budget, chars))
+                body.doc.blocks.append(_section(body, t, name, budget, chars, links))
                 ok += 1
         except ReadError as e:
             if e.kind != "damaged":
@@ -218,14 +222,40 @@ def sheets(pkg, ctx, content, styles_root) -> Doc:
     return body.doc
 
 
-def _section(body, t, name, budget, chars) -> Section:
+def _section(body, t, name, budget, chars, links) -> Section:
     sh = _Sheet(body, name, budget, chars)
     sh.walk(t, 0, False)
     blocks = sh.result()
     for shapes in kids(t, "shapes"):  # charts and pictures anchored to the sheet
-        for fr in kids(shapes, "frame"):
-            blocks.extend(body.frame_blocks(fr, 1))
+        if not any(edge_like(el, body.styles) for el in shapes.iter()):
+            for fr in kids(shapes, "frame"):
+                blocks.extend(body.frame_blocks(fr, 1))
+            continue
+        dia, slots = diagram.Diagram(body.ctx, links), [(None, blocks)]
+        _drawn(body, shapes, 0, dia, set(), slots)
+        blocks = [b for _, got in slots for b in got]
+        with body.ctx.guard("shape"):
+            blocks = dia.place(slots)
     style = attr(t, "style-name")
     if style and body.styles.prop(style, "table", "display") == "false":
         return Section("sheet", name, blocks=body.hide(blocks), hidden="hidden")
     return Section("sheet", name, blocks=blocks)
+
+
+def _drawn(body, cont, d, dia, keys, slots):
+    """The shapes and connectors under cont, groups walked into up to limits.MAX_DEPTH, to the diagram; a frame of
+    table:shapes itself also gets a slot."""
+    if d > limits.MAX_DEPTH:
+        body.deep()
+        return
+    for el in cont:
+        n = local(el.tag)
+        if n in GROUPS:
+            _drawn(body, el, d + 1, dia, keys, slots)
+        elif n in SHAPES:
+            got = body.frame_blocks(el, 1) if n == "frame" else body.blocks(el, 1)
+            key = shape_key(el, keys)
+            with body.ctx.guard("shape"):
+                register(dia, body.styles, el, key, got)
+            if n == "frame" and d == 0:
+                slots.append((key, got))
