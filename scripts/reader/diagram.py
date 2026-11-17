@@ -6,7 +6,14 @@ numbers, escapes, orients and renders, and builds model blocks only.
 
 - **Edges.** A connector glued at both ends to registered shapes is an edge; a glue reference to a missing key or to a
   connector (itself included) is not glue. A hidden connector is never an edge. Edges keep `connector()` order and go
-  through the document's `ConnectionBudget`.
+  through the document's `ConnectionBudget`, the glued ones first.
+- **Loose ends.** A connector with an end not glued (a plain `line` only with an arrowhead set True) is a candidate,
+  the first CONNECTIONS of a scope (`connections_cut` once for the rest). Each loose end's point lands on the smallest
+  box holding it, else on the nearest within INFER_TOL of the diagonal of the box around every shape box and every
+  line end; containers and connectors are never targets, and a tie (equal areas, or distances within 1e-9 of the tol)
+  lands nowhere. When both ends land, on two shapes, it is an inferred edge, written after `%% inferred from
+  position`; else it counts `connector_loose` and keeps its slot. A scope of more than INFER_SHAPES boxed shapes is not
+  inferred (`infer_skipped` once); a zero-size scope places no end.
 - **Nodes.** The edges' ends, numbered `n1`, `n2`, ... in the order their keys first appear in the slots, then the
   slotless ones in `shape()` order. Plain text of at most NAME characters is the whole label; any other content gets
   its first line cut at NAME plus `…` (or `(picture)`, `(table)`, `(chart)`, `(content)`), and its blocks follow the
@@ -19,8 +26,6 @@ numbers, escapes, orients and renders, and builds model blocks only.
   children, at most `smartart.MAX_LEVEL` levels and no subgraph: a `-` list instead of Mermaid.
 - **Placement.** The block goes at the first slot whose key is a node, an edge or a subgraph; the slots of the shown
   nodes, the edges and the subgraphs are taken out. With no edge the slots come back unchanged.
-
-Loose ends (`p0`, `p1`, `line`) are stored for position inference; INFER_TOL and INFER_SHAPES are its caps.
 """
 import math
 import re
@@ -85,6 +90,46 @@ def _box(box):
     if not all(math.isfinite(v) and abs(v) <= COORD for v in (x0, y0, x1, y1)):
         return None
     return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+
+
+def _point(p):
+    """(x, y), or None when absent or not two finite numbers within COORD."""
+    if p is None:
+        return None
+    try:
+        x, y = (float(v) for v in p)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(v) and abs(v) <= COORD for v in (x, y)):
+        return None
+    return x, y
+
+
+def _snap(p, targets, tol):
+    """The key of the target (key, box, area) the point lands on: the smallest box holding it, else the nearest box
+    within tol; None for no point, a tie or no box in reach."""
+    if p is None:
+        return None
+    x, y = p
+    best, tie = None, False
+    for k, b, area in targets:
+        if b[0] <= x <= b[2] and b[1] <= y <= b[3]:
+            if best is None or area < best[0]:
+                best, tie = (area, k), False
+            elif area == best[0]:
+                tie = True
+    if best is not None:
+        return None if tie else best[1]
+    near, d1, d2 = None, math.inf, math.inf
+    for k, b, _ in targets:
+        d = math.hypot(max(b[0] - x, 0.0, x - b[2]), max(b[1] - y, 0.0, y - b[3]))
+        if d < d1:
+            near, d1, d2 = k, d, d1
+        elif d < d2:
+            d2 = d
+    if near is None or d1 > tol or d2 - d1 <= 1e-9 * tol:
+        return None
+    return near
 
 
 def _centre(box):
@@ -204,16 +249,27 @@ class Diagram:
                   line: bool = False, hidden: bool = False) -> None:
         if key in self.connectors:
             return
-        self.connectors[key] = _Connector(begin, end, p0, p1, arrows, (label or "").strip(), bool(line),
-                                          bool(hidden))
+        self.connectors[key] = _Connector(begin, end, _point(p0), _point(p1), arrows, (label or "").strip(),
+                                          bool(line), bool(hidden))
 
     def _glued(self, key) -> bool:
         return key is not None and key in self.shapes and key not in self.connectors
 
     def place(self, slots: list) -> list:
-        edges = [(k, c) for k, c in self.connectors.items()
-                 if not c.hidden and self._glued(c.begin) and self._glued(c.end)]
-        edges = self.budget.take(edges) if edges else []
+        glued, cands = [], []
+        for k, c in self.connectors.items():
+            if c.hidden:
+                continue
+            if self._glued(c.begin) and self._glued(c.end):
+                glued.append((k, c))
+            elif not c.line or any(a is True for a in c.arrows):
+                cands.append((k, c))
+        over = len(cands) > CONNECTIONS
+        edges = glued + self._infer(cands[:CONNECTIONS])
+        taken = self.budget.take(edges) if edges else []
+        if over and len(taken) == len(edges):  # the budget did not count this scope's cut
+            self.ctx.skipped["connections_cut"] += 1
+        edges, nglued = taken, min(len(glued), len(taken))
         if not edges:
             return [b for _, blocks in slots for b in blocks]
         ends = {k for _, c in edges for k in (c.begin, c.end)}
@@ -243,7 +299,7 @@ class Diagram:
 
         items = None if groups else _tree(edges, nodes, nid, labels, long)
         if items is None:
-            items = [Code(self._mermaid(edges, nodes, nid, groups, cid, member, parent, labels), "mermaid")]
+            items = [Code(self._mermaid(edges, nglued, nodes, nid, groups, cid, member, parent, labels), "mermaid")]
         block = items + follows
 
         removed = {k for k in nodes if not self.shapes[k].hidden} | {k for k, _ in edges} | set(groups)
@@ -258,6 +314,36 @@ class Diagram:
                 out += blocks
         if not placed:
             out += block
+        return out
+
+    def _infer(self, cands) -> list:
+        """The candidates that become edges, each as a copy of its connector with both ends set. Counts
+        `connector_loose` for each other candidate, or `infer_skipped` once when the scope is too large to infer."""
+        if not cands:
+            return []
+        boxed = [(k, s.box) for k, s in self.shapes.items() if s.box]
+        if len(boxed) > INFER_SHAPES:
+            self.ctx.skipped["infer_skipped"] += 1
+            return []
+        xs = [v for _, b in boxed for v in (b[0], b[2])]
+        ys = [v for _, b in boxed for v in (b[1], b[3])]
+        for c in self.connectors.values():
+            for p in (c.p0, c.p1):
+                if p:
+                    xs.append(p[0])
+                    ys.append(p[1])
+        diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys)) if xs else 0.0
+        targets = [] if diag <= 0 else [(k, b, (b[2] - b[0]) * (b[3] - b[1])) for k, b in boxed
+                                        if not self.shapes[k].container and k not in self.connectors]
+        tol = INFER_TOL * diag
+        out = []
+        for k, c in cands:
+            a = c.begin if self._glued(c.begin) else _snap(c.p0, targets, tol)
+            b = c.end if self._glued(c.end) else _snap(c.p1, targets, tol)
+            if a is not None and b is not None and a != b:
+                out.append((k, _Connector(a, b, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden)))
+            else:
+                self.ctx.skipped["connector_loose"] += 1
         return out
 
     def _containers(self, nodes, ends):
@@ -309,7 +395,7 @@ class Diagram:
                 c = up[c]
         return member, parent
 
-    def _mermaid(self, edges, nodes, nid, groups, cid, member, parent, labels) -> str:
+    def _mermaid(self, edges, nglued, nodes, nid, groups, cid, member, parent, labels) -> str:
         dx = dy = 0.0
         for _, c in edges:
             a, b = self.shapes[c.begin].box, self.shapes[c.end].box
@@ -348,7 +434,9 @@ class Diagram:
                     lines.append(f'{pad}{nid[k]}[" "]')
 
         emit(None, 1)
-        for _, c in edges:
+        for i, (_, c) in enumerate(edges):
+            if i == nglued:
+                lines.append("  %% inferred from position")
             arrow, swapped = _arrow(c.arrows)
             a, b = nid[c.begin], nid[c.end]
             if swapped:

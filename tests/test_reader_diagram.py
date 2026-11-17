@@ -245,15 +245,181 @@ def test_self_loop_kept():
     assert lines(d.place([("A", P("A")), ("c", [])])) == ["flowchart TD", '  n1["A"]', "  n1 --> n1"]
 
 
-def test_bad_glue_is_not_glued():
-    d, _ = new()
+def test_bad_glue_is_unglued():
+    d, ctx = new()
     d.shape("A", P("A"))
     d.connector("c1", begin="A", end="missing")
     d.connector("c2", begin="A", end="c2")  # itself
     d.connector("c3", begin="c1", end="A")  # another connector
     d.connector("c4", begin="A", end=None)
     slots = [("A", P("A")), ("c1", P("1")), ("c2", P("2")), ("c3", P("3")), ("c4", P("4"))]
+    assert d.place(slots) == flat(slots)  # loose ends with no point to place: no edge, every slot kept
+    assert ctx.skipped == {"connector_loose": 4}, ctx.skipped
+    d, ctx = new()  # bad glue on an end with a point: that end is placed by position
+    d.shape("A", P("A"), box=(0, 0, 100, 100))
+    d.shape("B", P("B"), box=(200, 300, 300, 400))
+    d.connector("c", begin="missing", end="A", p0=(250, 350), p1=(999, 999))
+    ls = lines(d.place([("A", []), ("B", []), ("c", [])]))
+    assert ls[-2:] == ["  %% inferred from position", "  n2 --> n1"], ls
+    assert not ctx.skipped, ctx.skipped
+
+
+def scope(*conns, extra=()):
+    """A (0,0)-(100,100) and B (200,300)-(300,400): a 300 x 400 scope, diagonal 500, tol 10. Each conn is a
+    connector() keyword dict, keyed k0, k1, ...; `extra` are more (key, box) shapes. Returns (place() output, ctx)."""
+    d, ctx = new()
+    d.shape("A", P("A"), box=(0, 0, 100, 100))
+    d.shape("B", P("B"), box=(200, 300, 300, 400))
+    for k, box in extra:
+        d.shape(k, P(k), box=box)
+    for i, kw in enumerate(conns):
+        d.connector(f"k{i}", **kw)
+    slots = ([("A", P("A")), ("B", P("B"))] + [(k, P(k)) for k, _ in extra] +
+             [(f"k{i}", P(f"t{i}")) for i in range(len(conns))])
+    return d.place(slots), ctx
+
+
+def test_infer_inside_box():
+    d, ctx = new()
+    d.shape("A", P("A"), box=(0, 0, 100, 100))
+    d.shape("B", P("B"), box=(200, 300, 300, 400))
+    d.shape("C", P("C"), box=(0, 300, 100, 400))
+    d.connector("k1", p0=(50, 50), p1=(250, 350), arrows=(False, True))  # registered first, written after
+    d.connector("k2", begin="C", end="A")
+    out = d.place([("A", P("A")), ("B", P("B")), ("C", P("C")), ("k1", P("t1")), ("k2", [])])
+    assert lines(out) == ["flowchart TD", '  n1["A"]', '  n2["B"]', '  n3["C"]', "  n3 --> n1",
+                          "  %% inferred from position", "  n1 --> n2"], out
+    assert len(out) == 1 and not ctx.skipped, (out, ctx.skipped)  # the inferred connector's slot is taken out
+
+
+def test_infer_nested_smallest():
+    out, ctx = scope({"p0": (20, 20), "p1": (250, 350)}, extra=[("I", (10, 10, 50, 50))])
+    assert lines(out)[1:] == ['  n1["B"]', '  n2["I"]', "  %% inferred from position", "  n2 --> n1"], out
+    assert out[:1] == P("A") and len(out) == 2 and not ctx.skipped, (out, ctx.skipped)  # I wins, A stays a shape
+
+
+def test_infer_within_tol():
+    out, ctx = scope({"p0": (100 + 0.019 * 500, 50), "p1": (250, 350)})
+    assert lines(out)[-1] == "  n1 --> n2" and not ctx.skipped, (out, ctx.skipped)
+    out, ctx = scope({"p0": (100 + 0.021 * 500, 50), "p1": (250, 350)})
+    assert out == P("A") + P("B") + P("t0"), out
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
+
+
+def test_infer_exactly_at_tol():
+    out, ctx = scope({"p0": (110, 50), "p1": (250, 350)})  # 10.0 from A's right edge, and tol is 10.0
+    assert lines(out)[-1] == "  n1 --> n2" and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_infer_tie_unresolved():
+    # D and E are 2 either side of (150, 50): a tie in distance, within tol
+    out, ctx = scope({"p0": (150, 50), "p1": (250, 350)}, extra=[("D", (120, 0, 148, 100)),
+                                                                 ("E", (152, 0, 180, 100))])
+    assert out == P("A") + P("B") + P("D") + P("E") + P("t0"), out
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
+    # F and G both hold the point and have equal areas: a tie inside
+    out, ctx = scope({"p0": (150, 150), "p1": (250, 350)}, extra=[("F", (140, 140, 160, 170)),
+                                                                   ("G", (130, 145, 170, 160))])
+    assert out == P("A") + P("B") + P("F") + P("G") + P("t0"), out
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
+
+
+def test_infer_same_shape_both_ends():
+    out, ctx = scope({"p0": (10, 10), "p1": (90, 90)}, {"begin": "A", "p1": (50, 50)})
+    assert out == P("A") + P("B") + P("t0") + P("t1"), out  # never inferred into a self-loop
+    assert ctx.skipped == {"connector_loose": 2}, ctx.skipped
+
+
+def test_one_end_glued_other_inferred():
+    out, ctx = scope({"begin": "A", "p0": (250, 350), "p1": (250, 350)})  # the glued end keeps its glue
+    assert lines(out)[-2:] == ["  %% inferred from position", "  n1 --> n2"], out
+    assert not ctx.skipped, ctx.skipped
+    out, ctx = scope({"p0": (250, 350), "end": "A", "p1": (250, 350)})
+    assert lines(out)[-1] == "  n2 --> n1", out
+
+
+def test_plain_line_needs_arrow():
+    for arrows in ((False, False), (None, None)):
+        out, ctx = scope({"p0": (50, 50), "p1": (250, 350), "line": True, "arrows": arrows})
+        assert out == P("A") + P("B") + P("t0") and not ctx.skipped, (arrows, out, ctx.skipped)
+    out, ctx = scope({"p0": (50, 50), "p1": (250, 350), "line": True, "arrows": (False, True)})
+    assert lines(out)[-1] == "  n1 --> n2" and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_infer_shapes_cap():
+    old = diagram.INFER_SHAPES
+    try:
+        diagram.INFER_SHAPES = 2
+        out, ctx = scope({"p0": (50, 50), "p1": (250, 350)}, {"p0": (60, 60), "p1": (260, 360)},
+                         extra=[("C", (0, 300, 100, 400))])
+        assert out == P("A") + P("B") + P("C") + P("t0") + P("t1"), out
+        assert ctx.skipped == {"infer_skipped": 1}, ctx.skipped  # once for the scope, no connector_loose
+        diagram.INFER_SHAPES = 3
+        out, ctx = scope({"p0": (50, 50), "p1": (250, 350)}, extra=[("C", (0, 300, 100, 400))])
+        assert lines(out)[-1] == "  n1 --> n2" and not ctx.skipped, (out, ctx.skipped)
+    finally:
+        diagram.INFER_SHAPES = old
+
+
+def test_infer_tol_read_at_call_time():
+    old = diagram.INFER_TOL
+    try:
+        diagram.INFER_TOL = 0.01  # tol 5: 9.5 from A is past it
+        out, ctx = scope({"p0": (109.5, 50), "p1": (250, 350)})
+    finally:
+        diagram.INFER_TOL = old
+    assert ctx.skipped == {"connector_loose": 1}, (out, ctx.skipped)
+
+
+def test_infer_connector_cap():
+    old = diagram.CONNECTIONS
+    try:
+        diagram.CONNECTIONS = 1
+        out, ctx = scope({"p0": (50, 50), "p1": (250, 350)}, {"p0": (60, 60), "p1": (260, 360)})
+    finally:
+        diagram.CONNECTIONS = old
+    assert lines(out)[-1] == "  n1 --> n2" and out[1:] == P("t1"), out  # the second is past the cap, its slot kept
+    assert ctx.skipped == {"connections_cut": 1}, ctx.skipped
+
+
+def test_nan_and_huge_geometry():
+    nan, inf = float("nan"), float("inf")
+    d, ctx = new()
+    d.shape("A", P("A"), box=(nan, 0, 100, 100))
+    d.shape("B", P("B"), box=(200, 300, 300, 400))
+    d.shape("H", P("H"), box=(0, 0, 1e10, 10))
+    d.connector("k1", p0=(50, 50), p1=(250, 350))  # A has no box
+    d.connector("k2", p0=(1e10, 350), p1=(250, 350))
+    d.connector("k3", p0=(inf, 0), p1=("x", 1))
+    d.connector("k4", p0=(250, 350, 1), p1=None)
+    d.connector("k5", p0=5, p1=(nan, nan))
+    slots = [("A", P("A")), ("B", P("B")), ("H", P("H"))] + [(f"k{i}", P(f"t{i}")) for i in range(1, 6)]
     assert d.place(slots) == flat(slots)
+    assert ctx.skipped == {"connector_loose": 5}, ctx.skipped
+
+
+def test_zero_size_scope():
+    d, ctx = new()
+    d.shape("A", P("A"), box=(5, 5, 5, 5))
+    d.shape("B", P("B"), box=(5, 5, 5, 5))
+    d.connector("k", p0=(5, 5), p1=(5, 5))
+    slots = [("A", P("A")), ("B", P("B")), ("k", P("t"))]
+    assert d.place(slots) == flat(slots)
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
+
+
+def test_infer_targets_exclude_containers_and_connectors():
+    d, ctx = new()
+    d.shape("A", P("A"), box=(0, 0, 100, 100))
+    d.shape("B", P("B"), box=(200, 300, 300, 400))
+    d.shape("L", P("Lane"), box=(190, 290, 310, 410), container=True, title="Lane")
+    d.shape("k0", P("k0"), box=(40, 40, 60, 60))  # a connector's key with a box: never a target
+    d.connector("k0", p0=(50, 50), p1=(191, 291))  # p0 is in A and k0's box, p1 in the lane only
+    d.connector("k1", p0=(50, 50), p1=(250, 350))  # lands in B, which the lane holds
+    out = d.place([("A", []), ("B", []), ("L", P("Lane")), ("k0", P("t0")), ("k1", [])])
+    assert lines(out) == ["flowchart TD", '  n1["A"]', '  subgraph c1 ["Lane"]', '    n2["B"]', "  end",
+                          "  %% inferred from position", "  n1 --> n2"], out
+    assert out[1:] == P("t0") and ctx.skipped == {"connector_loose": 1}, (out, ctx.skipped)
 
 
 def test_tree_as_list():
