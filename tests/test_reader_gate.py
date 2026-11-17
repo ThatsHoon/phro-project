@@ -1526,6 +1526,57 @@ def test_mpt_same_path():
     assert "mpp" in reader.BUILT and "mpt" in reader.BUILT
 
 
+def test_mpp_off_no_offer():
+    # PHRO_READER_MPPENV=off turns the engine off: no install offer (setup could never make it read), Java or not,
+    # declined or not
+    from reader import cache
+    for java in (True, False):
+        for declined in (False, True):
+            with mpp_env("off", java=java), no_child():
+                if declined:
+                    (cache.root() / "mpp-declined").parent.mkdir(parents=True, exist_ok=True)
+                    (cache.root() / "mpp-declined").write_text("", encoding="utf-8")
+                r = reason_of(gate.decide(ev(project())))
+            assert r == MPP_HEAD.format(name="a.mpp") + " The mpp engine is turned off (PHRO_READER_MPPENV=off).", r
+    # a READY venv is not used either while the engine is off
+    with mpp_env(tmp() / "unset") as java:
+        v = mpp_venv(tmp() / "mpp-venv", java)
+        with envs(PHRO_READER_MPPENV="off"), no_child():
+            r = reason_of(gate.decide(ev(project()), command=EXIT3))
+        assert r.endswith(" The mpp engine is turned off (PHRO_READER_MPPENV=off)."), r
+        assert v.is_dir()
+
+
+def test_mpp_reason_commands_never_cut():
+    # READ_PY and the venv folder so long that the commands alone pass CONTEXT_MAX: the commands stay whole and
+    # only the name is cut, down to "…"
+    venv = Path("C:/" + "d" * 150) / "mpp-venv"
+    real = gate.READ_PY
+    gate.READ_PY = Path("C:/" + "p" * 150) / "scripts" / "read.py"
+    try:
+        with mpp_env(venv):
+            r = gate.mpp_reason(Path("d") / "plan.mpp")
+            cmd = f'python -I -X utf8 "{gate.READ_PY}" setup --for mpp --venv "{venv}"'
+            assert len(r) > gate.CONTEXT_MAX and cmd in r, r
+            assert r == MPP_HEAD.format(name="…") + mpp_offer(venv), r
+    finally:
+        gate.READ_PY = real
+
+
+def test_mpp_child_default_timeout():
+    # with no timeout given, the mpp child runs under CONVERT_SECONDS, as every other child
+    with mpp_env(tmp() / "unset") as java:
+        v = mpp_venv(tmp() / "mpp-venv", java)
+        with envs(PHRO_READER_MPPENV=v):
+            seen, real = [], gate._child
+            gate._child = lambda cmd, start, timeout: seen.append(timeout) or (None, "damaged", "x")
+            try:
+                r = reason_of(gate.decide(ev(project())))
+            finally:
+                gate._child = real
+    assert seen == [gate.limits.CONVERT_SECONDS] and "looks damaged (x)" in r, (seen, r)
+
+
 def test_mpp_too_large_before_engine():
     # the size check comes first: an oversized Project file is denied as too large, offer or not
     with mpp_env(tmp() / "no-mpp-venv"), no_child():

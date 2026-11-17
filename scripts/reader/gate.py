@@ -52,7 +52,8 @@ MPP_OFFER = (' MPXJ 16.10.0 with JPype 1.7.1 (PyPI, about 32 MB, LGPL-2.1 and Ap
              ' "{read_py}" setup --for mpp --venv "{dir}" (or the same with --decline if they never want it).')
 MPP_NO_JAVA = " It also needs Java {floor} or later on PATH, which phro-project does not install."
 MPP_DECLINED = ' (Declined; python -I -X utf8 "{read_py}" setup --for mpp installs it.)'
-MPP_UNSUPPORTED = "Microsoft Project files are read only through MPXJ"  # formats.mpp.UNSUPPORTED: the child had no engine
+MPP_OFF = " The mpp engine is turned off (PHRO_READER_MPPENV=off)."
+MPP_UNSUPPORTED ="Microsoft Project files are read only through MPXJ"  # formats.mpp.UNSUPPORTED: the child had no engine
 
 
 def off_exts():
@@ -422,10 +423,14 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
 
 
 def mpp_reason(path):
-    """The mpp deny: MPP_DENY, then the decline note, the Java note (no java on PATH, found the way setup and the
-    venv's own check find it) or the install offer. Over CONTEXT_MAX the name is cut with "…", never a command."""
+    """The mpp deny: MPP_DENY, then the engine-off note (PHRO_READER_MPPENV=off, where an install could never be
+    used), the decline note, the Java note (no java on PATH, found the way setup and the venv's own check find it) or
+    the install offer. Over CONTEXT_MAX the name is cut with "…", never a command: when READ_PY and the venv folder
+    alone pass it, the name is "…" and the reason runs over."""
     from reader import pyenv
-    if pyenv.declined("mpp"):
+    if pyenv.forced_native("mpp"):
+        tail = MPP_OFF
+    elif pyenv.declined("mpp"):
         tail = MPP_DECLINED.format(read_py=READ_PY)
     elif pyenv.find_java() is None:
         tail = MPP_NO_JAVA.format(floor=pyenv.JAVA_FLOOR)

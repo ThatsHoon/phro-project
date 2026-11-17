@@ -87,7 +87,7 @@ def code_digest(base=None) -> str:
 
 def key(path, engine: str = "") -> str:
     h = hashlib.sha1(VERSION.encode() + b"\0" + code_digest().encode() + b"\0")
-    if engine:  # only pdf has one; every other format's key is unchanged
+    if engine:  # pdf (native or pdfium) and mpp (mpxj) have one; every other format's key is unchanged
         h.update(engine.encode() + b"\0")
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
