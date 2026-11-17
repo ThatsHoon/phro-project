@@ -296,6 +296,21 @@ def test_msproject_progid():
         with Compound(cfb_bytes({"\x01CompObj": head + ansi(b"Microsoft Project") + clip
                                  + ansi(b"MSProject.Project.9")})[0]) as cf:
             assert cfb_route.progid(cf) == "MSProject.Project.9"
+    # MPXJ keys on the clipboard-format string (MSProject.MPP9): it names mpp too, whatever the ProgID says
+    for tail in (bytes(4), ansi(b"Other.Thing")):
+        with Compound(cfb_bytes({"\x01CompObj": head + ansi(b"Microsoft Project") + ansi(b"MSProject.MPP9")
+                                 + tail})[0]) as cf:
+            assert cfb_route.msproject(cf) and cfb_route.route(cf, "doc", "no WordDocument stream") == "mpp"
+            assert cfb_route.route(cf, "mpp", "no MSProject CompObj") is None
+    with Compound(cfb_bytes({"\x01CompObj": head + ansi(b"Microsoft Project") + ansi(b"MSProject.MPP9")})[0]) as cf:
+        assert cfb_route.progid(cf) == "" and cfb_route.msproject(cf)  # no ProgID field at all
+    for data in (head + ansi(b"U") + struct.pack("<I", 40) + b"MSProject.MPP9",  # the format string runs past the end
+                 head + ansi(b"U") + ansi(b"Word.Document.8") + ansi(b"Word.Document.8"),
+                 head + ansi(b"U") + struct.pack("<II", 0xFFFFFFFF, 3) + ansi(b"Word.Document.8")):
+        with Compound(cfb_bytes({"\x01CompObj": data})[0]) as cf:
+            assert not cfb_route.msproject(cf), data[28:]
+    with Compound(cfb_bytes({"\x01CompObj": prog})[0]) as cf:
+        assert cfb_route.msproject(cf)
     # hostile: lengths past the end, a missing terminator, nothing after the header, a stream of one byte
     for data in (head + struct.pack("<I", 0xFFFFFFF0), head + ansi(b"U") + bytes(4) + struct.pack("<I", 0x7FFFFFFF),
                  head + ansi(b"U") + struct.pack("<I", 0xFFFFFF00) + b"MSProject.", head, b"\x01",

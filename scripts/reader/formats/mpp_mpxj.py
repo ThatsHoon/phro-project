@@ -16,7 +16,8 @@ failure, MPXJ's or the JVM's, is `damaged` with a fixed detail, since MPXJ's mes
 date` line (the parts that are set), `## Tasks` and `## Resources` through `sheet_grid.Grid` (one `Budget` a document,
 so SHEET_ROWS, SHEET_CELLS and SHEET_CHARS bound them; every task or resource visited counts toward SHEET_ROWS, null
 ones too), then `## Notes`, a ListItem per task note cut at MPP_NOTE characters (counted `text`) and charged against
-the same Budget's characters (past them the notes stop, counted `sheet_cut` once). Null tasks are skipped, inactive
+the same Budget's characters only after both grids, so a note never takes a task row's or a resource's characters (past
+them the notes stop, counted `sheet_cut` once, and no later note is read). Null tasks are skipped, inactive
 tasks and resources are hidden rows (their notes hidden items), a summary task's name is bold and a milestone's ends
 in ` (milestone)`. A predecessor or resource list is read only until its text passes the characters left. Each task
 and resource is read under `ctx.guard("record")` and put only once read whole. Calendars, views, filters, baselines
@@ -194,7 +195,7 @@ def _name_cell(name: str, summary: bool, milestone: bool) -> list:
 
 
 def _task(t, room: int):
-    """(row values, active, ID, name, note) of a task that is not null, else None."""
+    """(row values, active, ID, name) of a task that is not null, else None."""
     if t.getNull():
         return None
     tid, name = _int(t.getID()), _s(t.getName())
@@ -205,7 +206,7 @@ def _task(t, room: int):
            _name_cell(name, bool(t.getSummary()), bool(t.getMilestone())), _duration(t.getDuration()),
            _day(t.getStart()), _day(t.getFinish()), pct + "%" if pct else "",
            _joined(_predecessors(t), room), _joined(_assignments(t), room)]
-    return row, bool(t.getActive()), ident, " ".join(name.split()), _s(t.getNotes())
+    return row, bool(t.getActive()), ident, " ".join(name.split())
 
 
 def _put(grid, r: int, row: list) -> bool:
@@ -222,8 +223,18 @@ class _Notes:
     def __init__(self, ctx, budget):
         self.ctx, self.budget, self.items, self.open = ctx, budget, [], True
 
+    def read(self, pending):
+        """The notes of the tasks put, (task, ID, name, active) in order, read only while the notes are open."""
+        for t, ident, name, active in pending:
+            if not self.open:
+                break
+            note = ""
+            with self.ctx.guard("record"):
+                note = _s(t.getNotes())
+            self.add(ident, name, note, active)
+
     def add(self, ident: str, name: str, note: str, active: bool):
-        if not self.open or not note:
+        if not note:  # `read` calls this only while the notes are open
             return
         cut = len(note) > MPP_NOTE
         if cut:
@@ -242,7 +253,8 @@ class _Notes:
                                    hidden="" if active else "hidden"))
 
 
-def _tasks(project, ctx, budget, notes) -> list:
+def _tasks(project, ctx, budget, pending) -> list:
+    """The Tasks table; each task put is appended to `pending` (task, ID, name, active) for its note."""
     grid = sheet_grid.Grid("Tasks", budget, ctx)
     _put(grid, 0, list(TASK_COLUMNS))
     r = seen = 1
@@ -258,13 +270,13 @@ def _tasks(project, ctx, budget, notes) -> list:
             got = _task(t, budget.chars)
         if got is None:
             continue
-        row, active, ident, name, note = got
+        row, active, ident, name = got
         if not active:
             grid.hide_row(r)
         if not _put(grid, r, row):
             break
         r += 1
-        notes.add(ident, name, note, active)
+        pending.append((t, ident, name, active))
     return grid.blocks()
 
 
@@ -314,11 +326,13 @@ def build(project, ctx) -> Doc:
                                                  ("Status date", _day(props.getStatusDate()))) if day]
     blocks = [Para([Text(DOT.join(parts))])] if parts else []
     budget = sheet_grid.Budget(limits.SHEET_CELLS, limits.SHEET_CHARS)
-    notes = _Notes(ctx, budget)
-    blocks += [Heading(2, [Text("Tasks")])] + _tasks(project, ctx, budget, notes)
+    pending = []
+    blocks += [Heading(2, [Text("Tasks")])] + _tasks(project, ctx, budget, pending)
     res = _resources(project, ctx, budget)
     if res:
         blocks += [Heading(2, [Text("Resources")])] + res
+    notes = _Notes(ctx, budget)
+    notes.read(pending)  # after both grids: a note never starves a task row or a resource
     if notes.items:
         blocks += [Heading(2, [Text("Notes")])] + notes.items
     return Doc(title=title, blocks=blocks)

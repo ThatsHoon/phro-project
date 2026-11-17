@@ -104,6 +104,8 @@ def test_no_engine_unsupported():
 def test_not_msproject_routes():
     # a compound file whose CompObj does not name MS Project goes to cfb_route (as ppt's parse_compound)
     assert mpp.route(cfb_bytes({"\x01CompObj": MSPROJECT})[0]) is None
+    # the CompObj is asked first: a Project file with another format's stream is still Project's
+    assert mpp.route(cfb_bytes({"\x01CompObj": MSPROJECT, "WordDocument": bytes(64)})[0]) is None
     assert mpp.route(cfb_bytes({"VisioDocument": b"Visio (TM) Drawing\r\n"})[0]) == "vsd"
     assert mpp.route(cfb_bytes({"WordDocument": bytes(64), "\x01CompObj": comp_obj(b"Word.Document.8")})[0]) == "doc"
     for streams in ({"Other": b"x"}, {"\x01CompObj": comp_obj(b"Word.Document.8")}, {"\x01CompObj": b"\x01" * 9}):
@@ -120,6 +122,48 @@ def test_not_msproject_routes():
         p = project_file(d, {"Other": b"x"}, "y.mpp")
         e = raises(ReadError, mpp.parse, p, Context(), engine="mpxj")
         assert e.kind == "damaged" and e.detail == "no MSProject CompObj"
+
+
+def test_zip_handed_to_zip_route():
+    # a zip named .mpp goes to zip_route, which picks its parser (never mpp, never MPXJ)
+    import zipfile
+    seen = []
+    real = mpp.zip_route.parse
+
+    def fake(path, ctx):
+        seen.append(Path(path).name)
+        return Doc(title="zip")
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "z.mpp"
+        with zipfile.ZipFile(p, "w") as z:
+            z.writestr("[Content_Types].xml", "<Types/>")
+        e = raises(ReadError, mpp.parse, p, Context())  # the real zip_route: not a Project file's refusal
+        assert e.detail not in (mpp.UNSUPPORTED, "not a Microsoft Project file"), e
+        mpp.zip_route.parse = fake
+        try:
+            assert mpp.parse(p, Context()).title == "zip" and mpp.parse(p, Context(), engine="mpxj").title == "zip"
+        finally:
+            mpp.zip_route.parse = real
+        assert seen == ["z.mpp", "z.mpp"]
+
+
+def test_broken_fat_damaged():
+    # a compound file whose FAT or mini FAT is broken (in memory): a clean damaged, never another exception
+    import struct
+    for streams in ({"\x01CompObj": MSPROJECT}, {"\x01CompObj": MSPROJECT, "Big": bytes(9000)}):
+        data, info = cfb_bytes(streams)
+        b = bytearray(data)
+        for sid in info["fat"]:  # every FAT entry names sector 5: the directory chain loops
+            b[(sid + 1) * 512:(sid + 2) * 512] = struct.pack("<I", 5) * 128
+        e = raises(ReadError, mpp.route, bytes(b))
+        assert e.kind == "damaged", e
+        b = bytearray(data)
+        first_mini = struct.unpack_from("<I", b, 0x3C)[0]
+        for i in range(128):  # every mini FAT entry names itself: the CompObj's mini chain loops
+            struct.pack_into("<I", b, (first_mini + 1) * 512 + 4 * i, i)
+        e = raises(ReadError, mpp.route, bytes(b))
+        assert e.kind == "damaged" and e.detail == "no MSProject CompObj", e
 
 
 def test_not_msproject_handed_on():
@@ -583,11 +627,44 @@ def test_notes_share_the_character_budget():
         tasks = [Task(i, "T", notes="n" * 60) for i in range(1, 20)]
         doc = mpp_mpxj.build(Project(Props(), tasks), ctx)
         items = [b for b in doc.blocks if isinstance(b, ListItem)]
-        # 400 - 63 (the header) = 337: four rows of 3 and four notes of 65 fit, the fifth note does not
+        # 400 - 63 (the header) - 19 rows of 3 = 280, charged after the grid: four notes of 65 fit, the fifth not
         assert len(items) == 4, len(items)
         assert ctx.skipped["sheet_cut"] == 1 and "notes cut at 400 characters" in ctx.warnings, (ctx.skipped,
                                                                                                 ctx.warnings)
         assert sum(ctx.skipped.values()) == 1
+    finally:
+        limits.SHEET_CHARS = real
+
+
+def test_notes_after_both_grids():
+    # notes are charged only after the Tasks and Resources grids: they never starve a task row or a resource
+    real = limits.SHEET_CHARS
+    limits.SHEET_CHARS = 300  # header 63 + 5 rows of 3 + resources 19 + 2 rows of 12 = 121; one note of 105 fits
+    try:
+        ctx = Context()
+        tasks = [Task(i, "T", notes="n" * 100) for i in range(1, 6)]
+        doc = mpp_mpxj.build(Project(Props(), tasks, [Res(1, "Ann"), Res(2, "Bob")]), ctx)
+        md = render(doc, ctx)
+        assert all(f"|{i}|1|T|" in md for i in range(1, 6)), md
+        assert "|1|Ann|Work|100%|" in md and "|2|Bob|Work|100%|" in md, md
+        items = [b for b in doc.blocks if isinstance(b, ListItem)]
+        assert len(items) == 1 and ctx.skipped["sheet_cut"] == 1, (len(items), ctx.skipped)
+        heads = [b.inlines[0].text for b in doc.blocks if isinstance(b, Heading)]
+        assert heads == ["Tasks", "Resources", "Notes"]
+    finally:
+        limits.SHEET_CHARS = real
+    # once the notes are closed, no later task's note is read
+    reads = []
+
+    class Noted(Task):
+        def getNotes(self):
+            reads.append(self.tid)
+            return "n" * 100
+
+    limits.SHEET_CHARS = 300
+    try:
+        mpp_mpxj.build(Project(Props(), [Noted(i, "T") for i in range(1, 6)]), Context())
+        assert reads == [1, 2, 3], reads  # 63 + 15 + 105 + 105 = 288; the third does not fit and closes the notes
     finally:
         limits.SHEET_CHARS = real
 
@@ -645,7 +722,12 @@ def test_rows_capped_without_values():
                 return False
 
         mpp_mpxj.build(Project(Props(), [Empty(None, None, level=None) for _ in range(1000)]), ctx)
-        assert len(seen) <= 5 and ctx.skipped["sheet_cut"] == 1, (len(seen), ctx.skipped)
+        # the header is row 0: SHEET_ROWS - 1 tasks are visited, the next one is not
+        assert len(seen) == 4 and ctx.skipped["sheet_cut"] == 1, (len(seen), ctx.skipped)
+        seen.clear()
+        ctx = Context()
+        mpp_mpxj.build(Project(Props(), [Empty(None, None, level=None) for _ in range(4)]), ctx)
+        assert len(seen) == 4 and not ctx.skipped, (len(seen), ctx.skipped)  # exactly SHEET_ROWS - 1: no cut
         seen.clear()
 
         class NullRes(Res):
@@ -655,8 +737,12 @@ def test_rows_capped_without_values():
 
         ctx = Context()
         doc = mpp_mpxj.build(Project(Props(), [], [NullRes(i, "R") for i in range(1000)]), ctx)
-        assert len(seen) <= 5 and ctx.skipped["sheet_cut"] == 1, (len(seen), ctx.skipped)
+        assert len(seen) == 4 and ctx.skipped["sheet_cut"] == 1, (len(seen), ctx.skipped)
         assert not any(isinstance(b, Heading) and b.inlines[0].text == "Resources" for b in doc.blocks)
+        seen.clear()
+        ctx = Context()
+        mpp_mpxj.build(Project(Props(), [], [NullRes(i, "R") for i in range(4)]), ctx)
+        assert len(seen) == 4 and not ctx.skipped, (len(seen), ctx.skipped)
     finally:
         limits.SHEET_ROWS = real
 
@@ -890,8 +976,10 @@ def test_mpxj_samples():
     if got is None:
         return
     py, folder = got
+    import re
     files = sorted(f for f in folder.glob("*.mpp") if "password" not in f.name.lower())
     assert files, "no .mpp files in PHRO_READER_MPP_SAMPLES"
+    with_resources = 0
     for i, f in enumerate(files):
         with tempfile.TemporaryDirectory() as d:
             code, out = _child(py, f, Path(d) / "o")
@@ -900,6 +988,20 @@ def test_mpxj_samples():
             assert "## Tasks" in md and HEADER in md, i
             at = md.index(HEADER)
             assert len(md) > at + 2 and md[at + 2].startswith("|"), i  # the header, its rule, then a row
+            # a getter MPXJ lacks makes a task or resource a damaged record: none may be
+            unread = json.loads((Path(d) / "o" / "meta.json").read_text(encoding="utf-8"))["unread"]
+            assert not any("damaged record" in u for u in unread), (i, unread)
+            # a task row naming a resource (through _assignments) means the Resources table (through _resource)
+            rows = []
+            for line in md[at + 2:]:
+                if not line.startswith("|"):
+                    break
+                rows.append(re.split(r"(?<!\\)\|", line))
+            named = any(len(c) > 9 and c[9].strip() for c in rows)
+            if "## Resources" in md:
+                with_resources += 1
+            assert not named or "## Resources" in md, i
+    assert with_resources, "no sample showed a Resources table"
 
 
 def test_mpxj_password_encrypted():
