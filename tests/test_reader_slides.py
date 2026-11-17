@@ -14,8 +14,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 import reader  # noqa: E402
 from reader import markdown  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
+from reader.model import Code, Context  # noqa: E402
 from reader_fix import make_zip  # noqa: E402
+from diagram_fix import mermaid_ok  # noqa: E402
 
 REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS = ('xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
@@ -72,15 +73,28 @@ def deck(slides, order=None, notes=None, kind="ppsx", extra=None, srels=None, id
     return make_zip(tmp() / ("a." + kind), members)
 
 
-def sp(text="", ph=None, off=None, ext=None, extra_nv="", paras=None, hidden=False):
+def sp(text="", ph=None, off=None, ext=None, extra_nv="", paras=None, hidden=False, id=2, prst=None):
     phx = f'<p:ph type="{ph}"/>' if ph and ph != "-" else ("<p:ph/>" if ph == "-" else "")
     h = ' hidden="1"' if hidden else ""
     xf = ""
     if off:
         xf = f'<a:xfrm><a:off x="{off[0]}" y="{off[1]}"/><a:ext cx="{(ext or (1, 1))[0]}" cy="{(ext or (1, 1))[1]}"/></a:xfrm>'
+    geom = f'<a:prstGeom prst="{prst}"><a:avLst/></a:prstGeom>' if prst else ""
     body = paras if paras is not None else f"<a:p><a:r><a:t>{text}</a:t></a:r></a:p>"
-    return (f'<p:sp><p:nvSpPr><p:cNvPr id="2" name="s"{h}/><p:cNvSpPr/><p:nvPr>{phx}</p:nvPr></p:nvSpPr>'
-            f'<p:spPr>{xf}</p:spPr><p:txBody><a:bodyPr/>{body}</p:txBody></p:sp>')
+    return (f'<p:sp><p:nvSpPr><p:cNvPr id="{id}" name="s"{h}/><p:cNvSpPr/><p:nvPr>{phx}</p:nvPr></p:nvSpPr>'
+            f'<p:spPr>{xf}{geom}</p:spPr><p:txBody><a:bodyPr/>{body}</p:txBody></p:sp>')
+
+
+def cxn(id, st=None, end=None, off=(0, 0), ext=(1, 1), head=None, tail=None, flip="", hidden=False, prst="straightConnector1"):
+    """A p:cxnSp glued from shape id `st` to `end` (None: loose), arrowheads `head` (start) and `tail` (end) as
+    a:ln types, `flip` any of "H" and "V"."""
+    g = (f'<a:stCxn id="{st}" idx="0"/>' if st is not None else "") + (f'<a:endCxn id="{end}" idx="0"/>' if end is not None else "")
+    fl = "".join(f' flip{c}="1"' for c in flip)
+    ln = (f'<a:headEnd type="{head}"/>' if head else "") + (f'<a:tailEnd type="{tail}"/>' if tail else "")
+    h = ' hidden="1"' if hidden else ""
+    return (f'<p:cxnSp><p:nvCxnSpPr><p:cNvPr id="{id}" name="c"{h}/><p:cNvCxnSpPr>{g}</p:cNvCxnSpPr><p:nvPr/></p:nvCxnSpPr>'
+            f'<p:spPr><a:xfrm{fl}><a:off x="{off[0]}" y="{off[1]}"/><a:ext cx="{ext[0]}" cy="{ext[1]}"/></a:xfrm>'
+            f'<a:prstGeom prst="{prst}"><a:avLst/></a:prstGeom>' + (f"<a:ln>{ln}</a:ln>" if ln else "") + '</p:spPr></p:cxnSp>')
 
 
 def grp(children, off, ext, choff, chext, hidden=False):
@@ -302,6 +316,128 @@ def test_pptm_same_path():
     s = [sp("T", "title") + sp("body")]
     assert md(deck(s, kind="pptm")) == md(deck(s, kind="ppsx"))
 
+
+# ---- connectors
+def mermaid(doc):
+    return "\n".join(b.text for sec in doc.blocks for b in sec.blocks if isinstance(b, Code) and b.lang == "mermaid")
+
+
+def test_slide_connector_mermaid():
+    s = (sp("T", "title", id=1) + sp("Start", id=2, off=(0, 0), ext=(100, 100))
+         + sp("End", id=3, off=(0, 1000), ext=(100, 100)) + cxn(4, 2, 3, off=(50, 100), ext=(0, 900), tail="triangle"))
+    doc, ctx = parse(deck([s]))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n2["End"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "assets")
+    assert out.startswith("## Slide 1: T\n\n```mermaid\n") and out.count("Start") == 1, out
+    assert out.count("End") == 1 and ctx.skipped["connector_loose"] == 0, out
+
+
+def test_slide_title_stays_title():
+    s = (sp("T", "title", id=2, off=(0, 0), ext=(1000, 100)) + sp("Body", id=3, off=(0, 500), ext=(1000, 100))
+         + cxn(4, 2, 3, tail="triangle"))
+    doc, _ = parse(deck([s]))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and '  n1["Body"]' in t and '  n2["T"]' in t and "  n2 --> n1" in t, t
+    out = markdown.render(doc, tmp() / "assets")
+    assert out.startswith("## Slide 1: T\n\n```mermaid\n") and out.count("Body") == 1, out
+    assert doc.blocks[0].title == "T"
+
+
+def test_group_scaled_connector_snaps():
+    for c in (cxn(9, off=(5, 10), ext=(0, 40), tail="triangle"), cxn(9, off=(5, 10), ext=(0, 40), head="arrow", flip="V")):
+        inner = (sp("A", id=2, off=(0, 0), ext=(10, 10)) + sp("B", id=3, off=(0, 50), ext=(10, 10)) + c)
+        g = grp(inner, off=(1000, 1000), ext=(1000, 1000), choff=(0, 0), chext=(100, 100))
+        doc, ctx = parse(deck([sp("Out", id=5, off=(0, 0), ext=(100, 100)) + g]))
+        t = mermaid(doc)
+        assert mermaid_ok(t) and t == ('flowchart TD\n  n1["A"]\n  n2["B"]\n  %% inferred from position\n'
+                                       '  n1 --> n2'), t
+        out = markdown.render(doc, tmp() / "assets")
+        assert out.startswith("## Slide 1\n\nOut\n\n```mermaid") and ctx.skipped["connector_loose"] == 0, out
+
+
+def test_line_shape_and_textless_target():
+    line = sp("", id=4, off=(50, 100), ext=(0, 900), prst="line", paras="").replace(
+        "</p:spPr>", '<a:ln><a:tailEnd type="triangle"/></a:ln></p:spPr>')
+    s = sp("", id=2, off=(0, 0), ext=(100, 100), paras="") + sp("Goal", id=3, off=(0, 1000), ext=(100, 100)) + line
+    doc, _ = parse(deck([s]))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == ('flowchart TD\n  n1["Goal"]\n  n2[" "]\n  %% inferred from position\n'
+                                   '  n2 --> n1'), t
+    rule = sp("rule", id=4, off=(50, 100), ext=(0, 900), prst="line")  # no arrowhead: a divider, never an edge
+    out = md(deck([sp("", id=2, off=(0, 0), ext=(100, 100), paras="") + sp("Goal", id=3, off=(0, 1000), ext=(100, 100))
+                   + rule]))
+    assert "mermaid" not in out and "rule" in out, out
+
+
+def test_hidden_connector_and_duplicate_ids():
+    base = sp("A", id=2, off=(0, 0), ext=(100, 100)) + sp("B", id=3, off=(0, 1000), ext=(100, 100))
+    out = md(deck([base + cxn(4, 2, 3, tail="triangle", hidden=True)]))
+    assert "mermaid" not in out and "A" in out and "B" in out, out
+    # a second shape reusing id 2 keeps its text and cannot take the glue
+    dup = sp("A2", id=2, off=(0, 2000), ext=(100, 100))
+    doc, _ = parse(deck([base + dup + cxn(4, 2, 3, tail="triangle")]))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and '"A"' in t and "A2" not in t, t
+    assert "A2" in markdown.render(doc, tmp() / "assets")
+
+
+def test_place_failure_keeps_the_flow():
+    from reader import diagram
+
+    def boom(self, slots):
+        raise ValueError("bad")
+    real = diagram.Diagram.place
+    diagram.Diagram.place = boom
+    try:
+        doc, ctx = parse(deck([sp("A", id=2, off=(0, 0), ext=(100, 100)) + sp("B", id=3, off=(0, 1000), ext=(100, 100))
+                               + cxn(4, 2, 3, tail="triangle")]))
+    finally:
+        diagram.Diagram.place = real
+    out = markdown.render(doc, tmp() / "assets")
+    assert out.endswith("## Slide 1\n\nA\n\nB\n") and ctx.skipped["shape"] == 1, (out, dict(ctx.skipped))
+
+
+def _plain_decks():
+    """(deck, hidden) pairs with no connector: the fixtures above, plus a textless shape and an arrowless line."""
+    pic = ('<p:pic><p:nvPicPr><p:cNvPr id="5" name="p" descr="d"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>'
+           '<p:blipFill><a:blip r:embed="rI"/></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="300"/>'
+           '<a:ext cx="10" cy="10"/></a:xfrm><a:prstGeom prst="ellipse"/></p:spPr></p:pic>')
+    a, b = sp("A", off=(0, 100), ext=(10, 10)), sp("B", off=(0, 0), ext=(10, 10))
+    inner = grp(sp("In", off=(0, 50), ext=(1, 1)), off=(0, 0), ext=(200, 200), choff=(0, 0), chext=(100, 100))
+    return [
+        (deck([sp("Head", "ctrTitle") + sp("Body", "body") + sp("Free")]), False),
+        (deck([grp(a + b, off=(0, 0), ext=(1000, 1000), choff=(0, 0), chext=(100, 100))
+               + sp("C", off=(0, 5000), ext=(1, 1)) + sp("D")]), False),
+        (deck([grp(inner, off=(0, 1000), ext=(100, 100), choff=(0, 0), chext=(100, 100))
+               + sp("Mid", off=(0, 1050), ext=(1, 1)) + sp("Low", off=(0, 1200), ext=(1, 1))]), False),
+        (deck([sp("first") + sp("later", off=(0, 500), ext=(1, 1)) + sp("top", off=(0, 100), ext=(1, 1))
+               + sp("last")]), False),
+        (deck([sp("x", "title") + sp("secret", hidden=True)]), False),
+        (deck([sp("x", "title") + sp("secret", hidden=True)]), True),
+        (deck([sp("t", "title") + sp("7", "sldNum") + sp("2026", "dt") + sp("f", "ftr") + sp("keep", "-")]), False),
+        (deck([sp("T", "title", id=1) + sp("", id=2, off=(0, 0), ext=(100, 100), paras="", prst="diamond")
+               + sp("rule", id=3, off=(0, 200), ext=(500, 0), prst="line") + pic
+               + sp("after", id=6, off=(0, 400), ext=(10, 10), prst="flowChartDecision")],
+              srels={1: [("rI", "image", "../media/i.png")]}, extra={"ppt/media/i.png": PNG}), False),
+    ]
+
+
+_PLAIN = [  # what the reader wrote for these decks before it read connectors
+    '## Slide 1: Head\n\nBody\n\nFree\n',
+    '## Slide 1\n\nB\n\nA\n\nC\n\nD\n',
+    '## Slide 1\n\nMid\n\nIn\n\nLow\n',
+    '## Slide 1\n\nfirst\n\ntop\n\nlater\n\nlast\n',
+    '(1 hidden places left out)\n\n## Slide 1: x\n',
+    '## Slide 1: x\n\n(hidden) secret\n',
+    '## Slide 1: t\n\nkeep\n',
+    '## Slide 1: T\n\nrule\n\n![d](assets/img-001.png)\n\nafter\n',
+]
+
+
+def test_slide_without_connector_unchanged():
+    got = [md(d, h) for d, h in _plain_decks()]
+    assert got == _PLAIN, got
 
 # ---- hostile input
 def test_duplicate_sldIdLst_entries():

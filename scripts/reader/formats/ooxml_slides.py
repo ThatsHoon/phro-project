@@ -3,14 +3,18 @@
 Run hyperlinks and legacy slide comments are ported from dochan (`ooxml/pptx.py`); a14 math goes through `omml`.
 Comments (legacy `p:cm`, modern `p188:cm` with replies) become the Section's `comments`, one note line each.
 Layouts and masters are read only for the position of a placeholder that has none of its own.
+Each slide is one diagram scope: every shape (titles, left-out placeholders and textless ones too) and connector
+(`p:cxnSp`, or an `sp` whose preset is a line) goes to `diagram.Diagram` under its `cNvPr@id`, in slide EMU.
 """
 import re
 
-from .. import limits
+from .. import diagram, limits
 from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Equation, Link, ListItem, Math, Para, Section, Table, Text, Image
 from . import omml, ooxml_base, smartart
+from .drawingml import Xf, arrows, glue, is_line, kind
+from .drawingml import kid as _kid, nv as _nv, xfrm as _xfrm
 from .ooxml_base import int_of as _int
 from .word_fields import MAX_URL, comment_note
 
@@ -18,27 +22,12 @@ IMAGE_BYTES = 256 * 2**20  # image bytes one deck may emit, copies counted
 SPAN_CELLS = 500_000       # grid slots all spans of one table may cover; past it spans become 1
 MAX_ALT, MAX_TITLE = 200, 200
 MAX_COMMENTS = 10_000      # comments one deck may emit, replies counted; the rest are counted once as `comments_cut`
-COORD = 10**13
 A14_M = "{http://schemas.microsoft.com/office/drawing/2010/main}m"
 
 _TITLES = frozenset({"title", "ctrTitle"})
 _PH_ALIAS = {"ctrTitle": ("title",), "subTitle": ("body",), "obj": ("body",)}  # inherited from these on a master
 _SKIP_PH = frozenset({"sldNum", "dt", "ftr", "hdr", "sldImg"})
-_SHAPES = frozenset({"sp", "pic", "graphicFrame"})
-
-
-def _num(el, name):
-    v = attr(el, name) if el is not None else None
-    try:
-        n = int(v)
-    except (TypeError, ValueError):
-        return None
-    return max(-COORD, min(COORD, n))
-
-
-def _kid(el, name):
-    k = kids(el, name)
-    return k[0] if k else None
+_SHAPES = frozenset({"sp", "pic", "graphicFrame", "cxnSp"})
 
 
 def _rid(el):
@@ -63,61 +52,6 @@ def _flat(inlines) -> str:
     return out
 
 
-def _nv(el):
-    """(cNvPr, ph) of a shape, either may be None."""
-    cnv = ph = None
-    for c in el:
-        if local(c.tag).startswith("nv"):
-            cnv = cnv if cnv is not None else _kid(c, "cNvPr")
-            for pr in kids(c, "nvPr"):
-                ph = ph if ph is not None else _kid(pr, "ph")
-    return cnv, ph
-
-
-def _xfrm(el):
-    for c in el:
-        n = local(c.tag)
-        if n == "xfrm":
-            return c
-        if n in ("spPr", "grpSpPr"):
-            x = _kid(c, "xfrm")
-            if x is not None:
-                return x
-    return None
-
-
-class _Xf:
-    """x' = ox + x * sx, y' = oy + y * sy: the map from a shape's own space to slide space."""
-
-    def __init__(self, ox=0.0, sx=1.0, oy=0.0, sy=1.0):
-        self.ox, self.sx, self.oy, self.sy = ox, sx, oy, sy
-
-    @staticmethod
-    def _scale(ext, ch):
-        return ext / ch if ext is not None and ch is not None and ext >= 0 and ch > 0 else 1.0
-
-    def group(self, xfrm):
-        """The map for the children of a group whose xfrm is `xfrm`; identity scale when its numbers are unusable."""
-        if xfrm is None:
-            return self
-        off, ext, cho, che = (_kid(xfrm, n) for n in ("off", "ext", "chOff", "chExt"))
-        ox, oy, cx, cy = _num(off, "x"), _num(off, "y"), _num(cho, "x"), _num(cho, "y")
-        if None in (ox, oy, cx, cy):
-            return self
-        sx = self._scale(_num(ext, "cx"), _num(che, "cx"))
-        sy = self._scale(_num(ext, "cy"), _num(che, "cy"))
-        return _Xf(max(-1e15, min(1e15, self.ox + (ox - cx * sx) * self.sx)), max(1e-9, min(1e9, sx * self.sx)),
-                   max(-1e15, min(1e15, self.oy + (oy - cy * sy) * self.sy)), max(1e-9, min(1e9, sy * self.sy)))
-
-    def point(self, xfrm):
-        """(y, x) on the slide of a shape's offset, or None without a usable offset."""
-        off = _kid(xfrm, "off") if xfrm is not None else None
-        x, y = _num(off, "x"), _num(off, "y")
-        if x is None or y is None:
-            return None
-        return (self.oy + y * self.sy, self.ox + x * self.sx)
-
-
 class _Scope:
     def __init__(self, part, nsmap):
         self.part, self.nsmap = part, nsmap
@@ -135,6 +69,9 @@ class _Reader:
         self.cut = False
         self.ph_maps = {}  # layout or master part -> {("idx", i) | ("type", t): (y, x)}
         self.inherit = []  # the current slide's layout and master maps, in lookup order
+        self.budget = diagram.ConnectionBudget(ctx)  # the deck's edges, shared by every slide's diagram
+        self.dia = None    # the current slide's diagram
+        self.keys = set()  # the current slide's diagram keys given out so far
 
     def deep(self):
         self.ctx.skipped["depth"] += 1
@@ -182,10 +119,14 @@ class _Reader:
         tree = _kid(_kid(root, "cSld"), "spTree") if _kid(root, "cSld") is not None else None
         out, titles = [], []
         self.inherit = self.layout_maps(name)
+        self.dia, self.keys = diagram.Diagram(self.ctx, self.budget), set()
         if tree is not None:
-            self.walk(tree, _Xf(), 0, False, out, titles)
-        for _, blocks in _reading_order(out):
-            sec.blocks.extend(blocks)
+            self.walk(tree, Xf(), 0, False, out, titles)
+        slots = [(key, blocks) for _, key, blocks in _reading_order(out)]
+        flow = [b for _, blocks in slots for b in blocks]
+        with self.ctx.guard("shape"):
+            flow = self.dia.place(slots)
+        sec.blocks.extend(flow)
         sec.title = re.sub(r"\s+", " ", " ".join(titles)).strip()[:MAX_TITLE]
         notes = self.notes_part(name)
         if notes:
@@ -291,7 +232,7 @@ class _Reader:
             tree = _kid(csld, "spTree") if csld is not None else None
             for el in (tree if tree is not None else ()):
                 _, ph = _nv(el)
-                pos = _Xf().point(_xfrm(el)) if ph is not None else None
+                pos = Xf().point(_xfrm(el)) if ph is not None else None
                 if pos is None:
                     continue
                 if attr(ph, "idx") is not None:
@@ -360,32 +301,51 @@ class _Reader:
         if n == "grpSp":
             self.walk(el, xf.group(_xfrm(el)), d + 1, hid, out, titles)
             return
+        key, x, sppr = self.key(cnv), _xfrm(el), _kid(el, "spPr")
         ptype = (attr(ph, "type") or "body") if ph is not None else None
-        if ptype in _SKIP_PH:
+        body = _kid(el, "txBody") if n in ("sp", "cxnSp") else None
+        if ptype in _SKIP_PH:  # left out of the flow; a connector may still end on it
+            text = self._body_text(body) if body is not None else ""
+            self.dia.shape(key, [Para([Text(text)])] if text else [], kind(sppr), xf.box(x), hid)
             return
-        geom = xf.point(_xfrm(el))
+        geom = xf.point(x)
         if geom is None and ph is not None:
             geom = self.inherited(ph)
-        if n == "sp":
-            body = _kid(el, "txBody")
+        if n in ("sp", "cxnSp"):
             blocks = self.text_blocks(body)
-            if ptype in _TITLES and not hid:
+            if ptype in _TITLES and not hid:  # the slide's heading: its text names the node, it has no slot
                 text = " ".join(_flat(getattr(b, "inlines", [])) for b in blocks)
                 if text.strip():
                     titles.append(text)
                 eqs = [b for b in blocks if isinstance(b, Equation)]
+                self.dia.shape(key, [b for b in blocks if not isinstance(b, Equation)], kind(sppr), xf.box(x))
                 if eqs:
-                    out.append((geom, eqs))
+                    out.append((geom, None, eqs))
                 return
         elif n == "pic":
             blocks = self.picture(el, cnv)
         else:
             blocks = self.frame(el)
+        if n == "cxnSp" or (n == "sp" and is_line(sppr)):
+            p0, p1 = xf.ends(x) or (None, None)
+            st, en = glue(el)
+            self.dia.connector(key, st, en, p0, p1, arrows(sppr), self._body_text(body) if body is not None else "",
+                               line=n != "cxnSp", hidden=hid)
+        else:
+            self.dia.shape(key, blocks, kind(sppr), xf.box(x), hid)
         if hid:
             for b in blocks:
                 b.hidden = "hidden"
         if blocks:
-            out.append((geom, blocks))
+            out.append((geom, key, blocks))
+
+    def key(self, cnv):
+        """A shape's diagram key: its cNvPr id, or a key no glue names when it has none or repeats one on the slide."""
+        k = attr(cnv, "id") if cnv is not None else None
+        if k is None or k in self.keys:
+            k = ("unkeyed", len(self.keys))
+        self.keys.add(k)
+        return k
 
     def picture(self, el, cnv):
         blip = next((e for e in el.iter() if local(e.tag) == "blip"), None)
@@ -547,7 +507,7 @@ class _Reader:
 
 
 def _reading_order(out):
-    """(position, blocks) entries sorted by position. One without a position keeps its spTree place: it goes just
+    """(position, key, blocks) entries sorted by position. One without a position keeps its spTree place: it goes just
     before the highest shape that follows it, or last when none with a position follows."""
     keys, low = [], None
     for i in range(len(out) - 1, -1, -1):
