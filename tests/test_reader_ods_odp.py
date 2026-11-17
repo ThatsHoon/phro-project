@@ -476,10 +476,25 @@ def test_ods_shapes_connector():
     t = mermaid(doc.blocks[0].blocks)
     assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Left"]\n  n2["Right"]\n  n1 --> n2', t
     out = markdown.render(doc, tmp() / "a")
-    assert out == f"## Sheet: S\n\n|x|y|\n|---|---|\n\nFramed\n\n```mermaid\n{t}\n```\n", out
+    # every drawn shape with text keeps it in the flow: the unlinked one after the diagram, before the frame
+    assert out == f"## Sheet: S\n\n|x|y|\n|---|---|\n\n```mermaid\n{t}\n```\n\nUnlinked\n\nFramed\n", out
     plain = '<table:table table:name="S"><table:shapes>' + shape('draw:id="a"', "Left", "0cm") + frame("Framed")
     assert md(ods(plain + '</table:shapes>' + row(c("x"), c("y")) + '</table:table>')) == (
         "## Sheet: S\n\n|x|y|\n|---|---|\n\nFramed\n")  # no connector: the sheet reads as before
+
+
+def test_ods_shapes_text_kept_beside_connector():
+    # an unconnected shape, a half-glued connector's label and a grouped frame keep their text beside a diagram
+    drawn = ('<table:shapes>' + shape('draw:id="a"', "Start", "0cm") + shape('draw:id="b"', "Stop", "0cm", "3cm")
+             + shape('draw:id="z"', "LEGEND", "0cm", "20cm") + connector("a", "b")
+             + '<draw:connector draw:start-shape="a" svg:x1="1cm" svg:y1="1cm" svg:x2="30cm" svg:y2="30cm">'
+             + P("LOOSE LABEL") + '</draw:connector><draw:g>' + frame("Grouped") + '</draw:g></table:shapes>')
+    doc, ctx = parse(ods('<table:table table:name="S">' + drawn + row(c("x")) + '</table:table>'))
+    t = mermaid(doc.blocks[0].blocks)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n2["Stop"]\n  n1 --> n2', t
+    out = markdown.render(doc, tmp() / "a")
+    assert out == f"## Sheet: S\n\nx\n\n```mermaid\n{t}\n```\n\nLEGEND\n\nLOOSE LABEL\n\nGrouped\n", out
+    assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
 
 
 def test_via_convert():

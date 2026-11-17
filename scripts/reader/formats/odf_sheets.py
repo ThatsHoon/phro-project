@@ -1,7 +1,9 @@
 """OpenDocument spreadsheets (.ods): one sheet section per table, bounded by row, column and cell caps.
 
 A sheet's `table:shapes` that holds a connector is one diagram scope: every shape and connector in it, groups walked
-into, goes to `diagram.Diagram` through `odf_base.register`; only its frames have a slot, after the table, as before."""
+into, goes to `diagram.Diagram` through `odf_base.register`; each with text, and each top-level frame, has a slot after
+the table, so the text of a shape or connector that joins nothing stays in the flow. A `table:shapes` with no connector
+reads as before: only its top-level frames."""
 import math
 import re
 
@@ -243,8 +245,8 @@ def _section(body, t, name, budget, chars, links) -> Section:
 
 
 def _drawn(body, cont, d, dia, keys, slots):
-    """The shapes and connectors under cont, groups walked into up to limits.MAX_DEPTH, to the diagram; a frame of
-    table:shapes itself also gets a slot."""
+    """The shapes and connectors under cont, groups walked into up to limits.MAX_DEPTH, to the diagram; each with
+    blocks gets a slot, so its text stays in the flow, and so does a frame of table:shapes itself."""
     if d > limits.MAX_DEPTH:
         body.deep()
         return
@@ -257,5 +259,5 @@ def _drawn(body, cont, d, dia, keys, slots):
             key = shape_key(el, keys)
             with body.ctx.guard("shape"):
                 register(dia, body.styles, el, key, got)
-            if n == "frame" and d == 0:
+            if got or (n == "frame" and d == 0):
                 slots.append((key, got))
