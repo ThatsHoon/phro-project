@@ -50,8 +50,16 @@ def _pages(text):
 
 
 def _engine_id(wanted) -> str:
-    """The engine id a pdf is read with: for --engine pdfium, when pypdfium2 imports (the venv child),
-    pyenv.engine_id_from_module(); otherwise native, so native output is never filed under a pdfium key."""
+    """The engine id a file is read with. pdf: for --engine pdfium, when pypdfium2 imports (the venv child),
+    pyenv.engine_id_from_module(); otherwise native, so native output is never filed under a pdfium key. mpp: for
+    --engine mpxj, pyenv.engine_id_from_module("mpp") when this is a ready mpp venv's interpreter, else "" (no engine:
+    the file is unsupported)."""
+    if wanted == "mpxj":
+        try:
+            from reader import pyenv
+            return pyenv.engine_id_from_module("mpp")
+        except Exception:  # noqa: BLE001 - not the mpp venv (no ready.json, no mpxj): no engine
+            return ""
     if wanted != "pdfium":
         return "native"
     try:
@@ -61,16 +69,22 @@ def _engine_id(wanted) -> str:
         return "native"
 
 
+_VENV_KIND = {"pdf": "pdf", "mpp": "mpp", "mpt": "mpp"}  # extension -> the venv that reads it
+_VENV_ENGINE = {"pdf": "pdfium", "mpp": "mpxj"}
+
+
 def _reexec(a):
-    """A pdf with no --engine, while a READY pdf venv exists and this is not its interpreter: run the same convert
-    there with --engine pdfium and relay its output. Returns the exit code, or None to read natively."""
-    if a.engine is not None or reader.ext_of(Path(a.file)) != "pdf":
+    """A pdf (or an mpp or mpt) with no --engine, while a READY pdf (mpp) venv exists and this is not its
+    interpreter: run the same convert there with --engine pdfium (mpxj) and relay its output. Returns the exit code,
+    or None to convert in this process (pdf natively; mpp raises unsupported)."""
+    kind = _VENV_KIND.get(reader.ext_of(Path(a.file)))
+    if a.engine is not None or kind is None:
         return None
     from reader import pyenv
-    if pyenv.forced_native():
+    if pyenv.forced_native(kind):
         return None
-    venv = pyenv.venv_dir()
-    if pyenv.state(venv) != "READY":
+    venv = pyenv.venv_dir(kind)
+    if pyenv.state(venv, kind) != "READY":
         return None
     py = pyenv.interpreter(venv)
     if os.path.normcase(os.path.abspath(sys.executable)) == os.path.normcase(os.path.abspath(py)):
@@ -83,12 +97,12 @@ def _reexec(a):
         cmd.append("--hidden")
     if a.key:
         cmd += ["--key", a.key]
-    if a.pages:
+    if a.pages and kind == "pdf":
         cmd += ["--pages", f"{a.pages[0]}-{a.pages[1]}"]
-    cmd += ["--engine", "pdfium"]
+    cmd += ["--engine", _VENV_ENGINE[kind]]
     try:
         r = subprocess.run(cmd, capture_output=True)
-    except OSError:  # the venv interpreter cannot be launched: read natively
+    except OSError:  # the venv interpreter cannot be launched: convert here (pdf natively; mpp is unsupported)
         return None
     sys.stdout.write(r.stdout.decode("utf-8", "replace"))
     if r.stderr:
@@ -123,11 +137,16 @@ def cmd_convert(a) -> int:
         with contextlib.redirect_stdout(sys.stderr):
             reader.precheck(src)
             opts, engine = {}, ""
-            if reader.ext_of(src) == "pdf":
-                engine = _engine_id(a.engine)
+            fmt = reader.FORMATS.get(reader.ext_of(src))
+            if fmt == "pdf":
+                engine = _engine_id("pdfium" if a.engine == "pdfium" else "native")
                 opts["engine"] = "native" if engine == "native" else "pdfium"
                 if a.pages:
                     opts["pages"] = a.pages
+            elif fmt == "mpp" and a.engine == "mpxj":
+                engine = _engine_id("mpxj")  # "" outside the mpp venv: no engine, so the file is unsupported
+                if engine:
+                    opts["engine"] = "mpxj"
             if a.out:
                 out = Path(a.out)
                 reader.convert(src, out, a.hidden, **opts)
@@ -187,7 +206,7 @@ def main(argv=None) -> int:
     c.add_argument("--out")
     c.add_argument("--hidden", action="store_true")
     c.add_argument("--key", help=argparse.SUPPRESS)
-    c.add_argument("--engine", choices=("pdfium", "native"))
+    c.add_argument("--engine", choices=("pdfium", "native", "mpxj"))
     c.add_argument("--pages", type=_pages, metavar="A-B")
     c.set_defaults(fn=cmd_convert)
     s = sub.add_parser("setup")

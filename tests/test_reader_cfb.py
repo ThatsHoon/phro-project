@@ -269,6 +269,74 @@ def test_quill_routes():
         assert cfb_route.route(cf, "pub", "no Contents stream") == "doc"
 
 
+def test_msproject_progid():
+    # cfb_route.progid: the ANSI ProgID of \x01CompObj; a ProgID starting MSProject. routes to mpp after the stream list
+    from reader.formats import cfb_route
+    from reader_fix import cfb_bytes, comp_obj
+    prog = comp_obj(b"MSProject.MPP9", b"Microsoft Project")
+    with Compound(cfb_bytes({"\x01CompObj": prog})[0]) as cf:
+        assert cfb_route.progid(cf) == "MSProject.MPP9"
+        assert cfb_route.route(cf, "doc", "no WordDocument stream") == "mpp"
+        assert cfb_route.route(cf, "xls", "no Workbook stream") == "mpp"
+        assert cfb_route.route(cf, "mpp", "no MSProject CompObj") is None
+    with Compound(cfb_bytes({"\x01CompObj": prog, "VisioDocument": b"x"})[0]) as cf:
+        assert cfb_route.route(cf, "doc", "no WordDocument stream") == "vsd"  # the stream list comes first
+    with Compound(cfb_bytes({"Other": b"x"})[0]) as cf:
+        assert cfb_route.progid(cf) == ""
+    with Compound(cfb_bytes({"\x01CompObj": comp_obj(b"Word.Document.8")})[0]) as cf:
+        assert cfb_route.progid(cf) == "Word.Document.8"
+        e = raises(ReadError, cfb_route.route, cf, "doc", "no WordDocument stream")
+        assert e.kind == "damaged" and e.detail == "no WordDocument stream"
+    # a clipboard format as a marker and id (0xFFFFFFFF / 0xFFFFFFFE) or as a string before the ProgID
+    head = struct.pack("<II", 0xFFFE0001, 0xA03).ljust(28, b"\xff")
+
+    def ansi(s):
+        return struct.pack("<I", len(s) + 1) + s + b"\0"
+    for clip in (struct.pack("<II", 0xFFFFFFFF, 3), struct.pack("<II", 0xFFFFFFFE, 3), ansi(b"MSProject.MPP9")):
+        with Compound(cfb_bytes({"\x01CompObj": head + ansi(b"Microsoft Project") + clip
+                                 + ansi(b"MSProject.Project.9")})[0]) as cf:
+            assert cfb_route.progid(cf) == "MSProject.Project.9"
+    # hostile: lengths past the end, a missing terminator, nothing after the header, a stream of one byte
+    for data in (head + struct.pack("<I", 0xFFFFFFF0), head + ansi(b"U") + bytes(4) + struct.pack("<I", 0x7FFFFFFF),
+                 head + ansi(b"U") + struct.pack("<I", 0xFFFFFF00) + b"MSProject.", head, b"\x01",
+                 head + ansi(b"U") + struct.pack("<I", 0xFFFFFFFF)):
+        with Compound(cfb_bytes({"\x01CompObj": data})[0]) as cf:
+            assert cfb_route.progid(cf) == "", data[28:]
+    with Compound(cfb_bytes({"\x01CompObj": head + ansi(b"U") + bytes(4) + struct.pack("<I", 40) + b"MSProject.X"})[0]) as cf:
+        assert cfb_route.progid(cf) == "MSProject.X"  # a short last string: what is there, up to its end
+    # a CompObj over 4,096 bytes: only the head may be read, so it is not read at all (as doc_objects and
+    # xls_embedded); one of exactly 4,096 bytes is read
+    big = prog + bytes(4097 - len(prog))
+    exact = prog + bytes(4096 - len(prog))
+    with Compound(cfb_bytes({"\x01CompObj": exact})[0]) as cf:
+        assert cfb_route.progid(cf) == "MSProject.MPP9"
+    with Compound(cfb_bytes({"\x01CompObj": big})[0]) as cf:
+        reads = []
+        real = cf.read
+        cf.read = lambda name: reads.append(name) or real(name)
+        assert cfb_route.progid(cf) == "" and reads == []
+        e = raises(ReadError, cfb_route.route, cf, "doc", "no WordDocument stream")
+        assert e.kind == "damaged"
+    # a CompObj whose chain cannot be read: no ProgID
+
+    class Unreadable:
+        def exists(self, name):
+            return True
+
+        def size(self, name):
+            return 64
+
+        def read(self, name):
+            raise CfbError("short chain")
+    assert cfb_route.progid(Unreadable()) == ""
+    # a .doc compound file holding only the MSProject CompObj is handed to mpp (unsupported without the engine)
+    d = tmp()
+    p = d / "plan.doc"
+    p.write_bytes(cfb_bytes({"\x01CompObj": prog})[0])
+    e = raises(ReadError, reader.parse, p, Context())
+    assert e.kind == "unsupported" and e.detail == "Microsoft Project files are read only through MPXJ", e
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
