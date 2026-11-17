@@ -448,7 +448,7 @@ def test_section_scope_first_node_place():
 def test_hwpx_container_inference():
     box = (obj("rect", 21, "Left", inner=True) + obj("rect", 22, "Right", x=3000, inner=True)
            + conn(23, 0, 0, x=500, y=500, ends=((0, 0), (3000, 0)), inner=True))
-    sec = R(obj("container", 20, body=box), text="lead") + R(obj("rect", 30, "Zed", x=90000))
+    sec = R(obj("container", 20, w=4000, body=box), text="lead") + R(obj("rect", 30, "Zed", x=90000))
     doc, ctx = parse(hwpx_doc(sec))
     t = mermaid(doc)
     assert mermaid_ok(t) and t == ('flowchart LR\n  n1["Left"]\n  n2["Right"]\n  %% inferred from position\n'
@@ -495,6 +495,47 @@ def test_shapes_without_connector_unchanged():
     box = obj("rect", 1, "A", inner=True) + obj("ellipse", 2, "B", inner=True)
     sec = R(obj("container", 20, body=box), text="lead") + R(obj("rect", 3, "C"))
     assert md(hwpx_doc(sec)) == "lead\n\nA\n\nB\n\nC\n"  # as the reader read it before diagrams
+
+
+DIVIDER = R(line(9, "NORMAL", "NORMAL", ((0, 0), (1, 1))))  # makes the section a scope; adds no text, no edge
+
+
+def _cells(*texts):
+    cells = "".join(f"<hp:tc><hp:subList>{t}</hp:subList></hp:tc>" for t in texts)
+    return f"<hp:tbl><hp:tr>{cells}</hp:tr></hp:tbl>"
+
+
+def test_table_in_a_drawing_object_reads_as_before():
+    tbl = _cells(R(obj("rect", 50, "Held", rel="PARA")), P("c2"))
+    in_box = obj("container", 20, body=obj("rect", 21, "In", inner=True) + tbl)
+    for sec in (R(obj("rect", 1, "A", body=tbl)), R(in_box)):
+        assert md(hwpx_doc(sec + DIVIDER)) == md(hwpx_doc(sec)), sec  # no shape is left in the model
+
+
+def test_container_keeps_reading_order():
+    box = obj("rect", 21, "First", inner=True) + _cells(P("Mid")) + obj("rect", 22, "Last", inner=True)
+    sec = R(obj("container", 20, body=box))
+    assert md(hwpx_doc(sec + DIVIDER)) == md(hwpx_doc(sec)) == "First\n\nMid\n\nLast\n"
+
+
+def test_hwpx_container_end_outside_its_box_uses_the_section():
+    box = obj("rect", 21, "In", w=500, h=500, inner=True) + conn(23, 0, 0, ends=((100, 100), (5500, 500)), inner=True)
+    sec = R(obj("container", 20, body=box), text="lead") + R(obj("rect", 30, "Out", x=5000))
+    doc, ctx = parse(hwpx_doc(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["In"]\n  n2["Out"]\n  %% inferred from position\n  n1 --> n2', t
+    assert markdown.render(doc, tmp() / "a") == f"lead\n\n```mermaid\n{t}\n```\n"
+    assert not ctx.skipped["connector_loose"], ctx.skipped
+
+
+def test_hwpx_glue_to_a_connector_keeps_the_container():
+    box = obj("rect", 21, "In1", inner=True) + obj("rect", 22, "In2", x=3000, inner=True) + conn(23, 21, 22, inner=True)
+    sec = R(obj("container", 20, rel="PARA", body=box)) + R(obj("rect", 30, "Out", rel="PARA"),
+                                                             conn(31, 23, 30, rel="PARA"))
+    doc, _ = parse(hwpx_doc(sec))
+    t = mermaid(doc)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["In1"]\n  n2["In2"]\n  n1 --> n2', t  # the container's frame
+    assert markdown.render(doc, tmp() / "a") == f"```mermaid\n{t}\n```\n\nOut\n"
 
 
 def test_place_failure_keeps_text():

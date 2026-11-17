@@ -338,8 +338,9 @@ def place(cells: list[tuple[int, int, int, int, Cell]]) -> list[list[Cell]]:
 class Obj:
     """A drawing object a paragraph holds, standing among the blocks where it was read until `diagrams` writes its
     section. `blocks` is what it reads as on its own and `key` its id (None when it has none). A group holds `kids`
-    in its own frame; `box` (x0, y0, x1, y1) is in the parent's frame, or None. A connector or line has `edge`
-    (begin id, end id, start point, end point, (start, end) arrowheads, plain line), its points in the same frame."""
+    in its own frame (a run of other blocks it holds is a keyless group kid, so the kids keep reading order); `box`
+    (x0, y0, x1, y1) is in the parent's frame, or None. A connector or line has `edge` (begin id, end id, start point,
+    end point, (start, end) arrowheads, plain line), its points in the same frame."""
     __slots__ = ("key", "blocks", "kids", "group", "kind", "box", "edge")
 
     def __init__(self, key, blocks, kids=(), group=False, kind="", box=None, edge=None):
@@ -376,6 +377,11 @@ def _below(top) -> list:
         inner = _shift(s, o.box[:2]) if o.box else None
         stack.extend((k, inner) for k in reversed(o.kids))
     return out
+
+
+def _scrub(blocks) -> list:
+    """The blocks with every Obj in them, through table cells, read as its own blocks: what it read as before."""
+    return _swap(blocks, lambda o: _scrub(_own(o)))
 
 
 def _own(o) -> list:
@@ -426,33 +432,60 @@ def diagrams(ctx, budget, blocks) -> list:
     """The section's blocks with each Obj in them (through table cells) given way to what it reads as.
 
     The section is one diagram scope. A top-level group is a scope of its own, in its own frame, when no glue crosses
-    its edge; otherwise its objects join the section's scope with no geometry, since its frame is not the
-    section's. Keys are the objects' ids, unique in the section (a missing or repeated one is unkeyed); groups are
-    not shapes. Each object is registered under guard("shape"), and place() runs under it too, falling back to the
-    slots' blocks; should anything else fail, every object reads as its blocks, so no text is lost."""
+    its edge and no loose end leaves its box; otherwise its objects join the section's scope, placed by the group's
+    box, or with no geometry when it has none. Keys are the objects' ids, unique in the section (a missing or repeated
+    one is unkeyed); groups are not shapes, and glue to a connector does not join scopes. An object in a table that
+    another object holds reads as before. Each object is registered under guard("shape"), and place() runs under it
+    too, falling back to the slots' blocks; should anything else fail, every object reads as its blocks. No Obj is
+    left in what comes back."""
     tops = []
     blocks = _swap(blocks, lambda o: tops.append(o) or [o])
     if not tops:
         return blocks
     done, tail = {}, []
     with ctx.guard("shape"):
+        for t in tops:
+            for o, _ in _below(t):
+                o.blocks = _scrub(o.blocks)
         done, tail = _section(ctx, budget, tops)
-    return _swap(blocks, lambda o: done[id(o)] if id(o) in done else _own(o)) + tail
+    return _scrub(_swap(blocks, lambda o: done[id(o)] if id(o) in done else _own(o)) + tail)
+
+
+def _leaves(t, tree, owner) -> bool:
+    """Whether a loose end of a connector or arrowed line under group t lies outside t's box, compared in t's parent's
+    frame. A group with no box has no frame to compare in, so its loose ends are taken to stay inside it."""
+    if not t.box:
+        return False
+    (x0, x1), (y0, y1) = sorted((t.box[0], t.box[2])), sorted((t.box[1], t.box[3]))
+    for o, s in tree:
+        if not o.edge:
+            continue
+        begin, end, p0, p1, arrows, line = o.edge
+        if line and True not in arrows:  # a divider is no connector
+            continue
+        for ref, p in ((begin, p0), (end, p1)):
+            q = _shift(_shift(p, s), t.box[:2])
+            if owner.get(ref) is None and q is not None and not (x0 <= q[0] <= x1 and y0 <= q[1] <= y1):
+                return True
+    return False
 
 
 def _section(ctx, budget, tops) -> tuple:
     """({id(top): its blocks}, the blocks for the section's end): the closed groups' scopes, then the section's."""
     trees = [_below(t) for t in tops]
-    keyed, owner = {}, {}
+    keyed, used, owner = {}, set(), {}  # owner: the top holding each shape (not connector) id glue can name
     for t, tree in zip(tops, trees):
         for o, _ in tree:
             if o.group:
                 continue
-            if o.key is not None and o.key not in owner:
-                keyed[id(o)], owner[o.key] = o.key, t
+            if o.key is not None and o.key not in used:
+                keyed[id(o)] = o.key
+                used.add(o.key)
+                if not o.edge:
+                    owner[o.key] = t
             else:
                 keyed[id(o)] = ("unkeyed", len(keyed))
-    opened = set()
+    opened = {id(t) for t, tree in zip(tops, trees) if t.group and _leaves(t, tree, owner)}
     for t, tree in zip(tops, trees):
         for o, _ in tree:
             for ref in o.edge[:2] if o.edge else ():
@@ -467,7 +500,8 @@ def _section(ctx, budget, tops) -> tuple:
                            [(keyed.get(id(o)), o.blocks) for o, _ in tree])
             slots.append((None, [b for p in parts for b in p]))
         else:
-            regs += [(o, keyed[id(o)], (0, 0) if o is t else None) for o, _ in tree if not o.group]
+            at = t.box[:2] if t.box else None  # a group's frame placed in the section's, when it has a box
+            regs += [(o, keyed[id(o)], (0, 0) if o is t else _shift(s, at)) for o, s in tree if not o.group]
             slots += [(keyed.get(id(o)), o.blocks) for o, _ in tree]
         spans.append((start, len(slots)))
     parts = _write(ctx, budget, regs, slots)

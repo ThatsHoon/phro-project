@@ -8,6 +8,7 @@ inside an `hp:container`, and at top level from `hp:pos` only when it is relativ
 """
 import fnmatch
 import re
+from itertools import groupby
 
 from .. import diagram, limits
 from ..charts import chart_table
@@ -419,11 +420,14 @@ class _Reader(Scopes):
                 self.grouped = inner
         got = st.extras[start:]
         del st.extras[start:]
-        objs = [b for b in got if isinstance(b, Obj)]
-        group = n == "container"
-        st.extras.append(_obj(el, inner, [b for b in got if not isinstance(b, Obj)], objs if group else ()))
-        if not group:
-            st.extras.extend(objs)
+        if n == "container":  # a run of other blocks is a keyless group kid, so the kids keep reading order
+            kids = []
+            for is_obj, run in groupby(got, lambda b: isinstance(b, Obj)):
+                kids += run if is_obj else [Obj(None, list(run), group=True)]
+            st.extras.append(_obj(el, inner, [], kids))
+        else:
+            st.extras.append(_obj(el, inner, [b for b in got if not isinstance(b, Obj)], ()))
+            st.extras.extend(b for b in got if isinstance(b, Obj))
 
     def picture(self, pic, st):
         """Every placement is charged against IMAGE_BYTES, as in the Word readers; one past it is counted under image
