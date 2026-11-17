@@ -379,7 +379,28 @@ def test_infer_connector_cap():
     finally:
         diagram.CONNECTIONS = old
     assert lines(out)[-1] == "  n1 --> n2" and out[1:] == P("t1"), out  # the second is past the cap, its slot kept
-    assert ctx.skipped == {"connections_cut": 1}, ctx.skipped
+    assert ctx.skipped == {"infer_skipped": 1}, ctx.skipped
+
+
+def test_infer_document_cap():
+    def build(d):
+        d.shape("A", P("A"), box=(0, 0, 100, 100))
+        d.shape("B", P("B"), box=(200, 300, 300, 400))
+        d.connector("k0", p0=(10, 10), p1=(20, 20))  # snapped and loose: it still spends the document's room
+        d.connector("k1", p0=(50, 50), p1=(250, 350))
+        return d.place([("A", P("A")), ("B", P("B")), ("k0", P("t0")), ("k1", P("t1"))])
+    old = diagram.CONNECTIONS
+    try:
+        diagram.CONNECTIONS = 2
+        ctx = Context()
+        budget = ConnectionBudget(ctx)
+        first = build(Diagram(ctx, budget))
+        assert lines(first)[-1] == "  n1 --> n2" and ctx.skipped == {"connector_loose": 1}, (first, ctx.skipped)
+        second = build(Diagram(ctx, budget))  # the two candidates of the first scope used the document's room
+    finally:
+        diagram.CONNECTIONS = old
+    assert second == P("A") + P("B") + P("t0") + P("t1"), second
+    assert ctx.skipped == {"connector_loose": 1, "infer_skipped": 1}, ctx.skipped
 
 
 def test_nan_and_huge_geometry():

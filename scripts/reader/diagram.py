@@ -8,12 +8,12 @@ numbers, escapes, orients and renders, and builds model blocks only.
   connector (itself included) is not glue. A hidden connector is never an edge. Edges keep `connector()` order and go
   through the document's `ConnectionBudget`, the glued ones first.
 - **Loose ends.** A connector with an end not glued (a plain `line` only with an arrowhead set True) is a candidate,
-  the first CONNECTIONS of a scope (`connections_cut` once for the rest). Each loose end's point lands on the smallest
-  box holding it, else on the nearest within INFER_TOL of the diagonal of the box around every shape box and every
-  line end; containers and connectors are never targets, and a tie (equal areas, or distances within 1e-9 of the tol)
-  lands nowhere. When both ends land, on two shapes, it is an inferred edge, written after `%% inferred from
-  position`; else it counts `connector_loose` and keeps its slot. A scope of more than INFER_SHAPES boxed shapes is not
-  inferred (`infer_skipped` once); a zero-size scope places no end.
+  up to CONNECTIONS a document, snapped or not (`infer_skipped` once for a scope that has some past them). Each loose
+  end's point lands on the smallest box holding it, else on the nearest within INFER_TOL of the diagonal of the box
+  around every shape box and every line end; containers and connectors are never targets, and a tie (equal areas, or
+  distances within 1e-9 × tol) lands nowhere. When both ends land, on two shapes, it is an inferred edge, written
+  after `%% inferred from position`; else it counts `connector_loose` and keeps its slot. A scope of more than
+  INFER_SHAPES boxed shapes is not inferred (`infer_skipped` once); a zero-size scope places no end.
 - **Nodes.** The edges' ends, numbered `n1`, `n2`, ... in the order their keys first appear in the slots, then the
   slotless ones in `shape()` order. Plain text of at most NAME characters is the whole label; any other content gets
   its first line cut at NAME plus `…` (or `(picture)`, `(table)`, `(chart)`, `(content)`), and its blocks follow the
@@ -47,11 +47,13 @@ _KINDS = {"": ("[", "]"), "decision": ("{", "}"), "terminator": ("([", "])"), "c
 
 class ConnectionBudget:
     """The document's CONNECTIONS room (read when made): `take` keeps what fits of one scope's edges and counts
-    `connections_cut` once for a list it cuts."""
+    `connections_cut` once for a list it cuts. `infer` is the room for inference candidates, spent whether they become
+    edges or stay loose."""
 
     def __init__(self, ctx):
         self.ctx = ctx
         self.room = CONNECTIONS
+        self.infer = CONNECTIONS
 
     def take(self, edges) -> list:
         if len(edges) <= self.room:
@@ -264,11 +266,8 @@ class Diagram:
                 glued.append((k, c))
             elif not c.line or any(a is True for a in c.arrows):
                 cands.append((k, c))
-        over = len(cands) > CONNECTIONS
-        edges = glued + self._infer(cands[:CONNECTIONS])
+        edges = glued + self._infer(cands)
         taken = self.budget.take(edges) if edges else []
-        if over and len(taken) == len(edges):  # the budget did not count this scope's cut
-            self.ctx.skipped["connections_cut"] += 1
         edges, nglued = taken, min(len(glued), len(taken))
         if not edges:
             return [b for _, blocks in slots for b in blocks]
@@ -318,13 +317,17 @@ class Diagram:
 
     def _infer(self, cands) -> list:
         """The candidates that become edges, each as a copy of its connector with both ends set. Counts
-        `connector_loose` for each other candidate, or `infer_skipped` once when the scope is too large to infer."""
+        `connector_loose` for each other candidate it snaps, and `infer_skipped` once when the scope is too large or
+        the document's candidate room cannot take all of them; the ones not snapped keep their slots uncounted."""
         if not cands:
             return []
         boxed = [(k, s.box) for k, s in self.shapes.items() if s.box]
-        if len(boxed) > INFER_SHAPES:
+        if len(boxed) > INFER_SHAPES or self.budget.infer < len(cands):
             self.ctx.skipped["infer_skipped"] += 1
-            return []
+            if len(boxed) > INFER_SHAPES or self.budget.infer <= 0:
+                return []
+            cands = cands[:self.budget.infer]
+        self.budget.infer -= len(cands)
         xs = [v for _, b in boxed for v in (b[0], b[2])]
         ys = [v for _, b in boxed for v in (b[1], b[3])]
         for c in self.connectors.values():
