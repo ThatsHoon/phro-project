@@ -24,8 +24,9 @@ keeps the text read before the cut and has no section without any. When every pa
 `unsupported` ("no text layer: ..."), so a scan is not called damaged; a file whose pages are all cut is `damaged`.
 
 BZZ budget. Each BZZ chunk decodes with `min(BZZ_CHUNK, left)`, `left` being what remains of the document's
-`BZZ_TOTAL`. A Limit at BZZ_CHUNK, a Truncated stream or a damaged one counts the chunk `record`. A Limit at `left`
-spends the budget: that page and every later one count `textless` (but never make the file "no text layer"). Shared
+`BZZ_TOTAL`. A Limit at BZZ_CHUNK, a Truncated stream or a damaged one counts the chunk `record`, and charges
+`left` the symbols it decoded before failing (bzz.decode's `work`), as a good chunk charges its output. A Limit at
+`left` spends the budget: that page and every later one count `textless` (but never make the file "no text layer"). Shared
 text repeated on a later page charges its size to `left` again, as if decoded again, so output stays bounded when one
 DJVI is included by every page. A shared DJVI's annotations are parsed once, and each repeat charges the size of
 the lines it gives to `left` the same way; a repeat that does not fit drops that page's shared annotation lines only,
@@ -49,8 +50,9 @@ those deeper than BOOKMARK_DEPTH levels are walked past; the rest are unused. A 
 NAVM that does not fit, cannot be decoded or ends early counts `record` once (the bookmarks read before are kept). A
 page counted textless keeps a section when it has a heading or annotation lines (it is still counted textless).
 
-Deadline. Before each page, `clock() - started` past DJVU_DEADLINE seconds: that page and the rest count `page_cut`,
-and the output so far is kept, as DJVU_PAGES does.
+Deadline. Before each page, and before each BZZ chunk's decode, `clock() - started` past DJVU_DEADLINE seconds: that
+page and the rest count `page_cut`, once each, and the output of the pages before it is kept, as DJVU_PAGES does. A
+page the deadline stops part way is dropped whole (what it had read is not shown, and it is not counted otherwise).
 """
 import re
 import struct
@@ -76,6 +78,7 @@ TEXT_CHUNKS = frozenset((b"TXTa", b"TXTz"))
 _KINDS = {1: "page", 2: "thum"}  # DIRM type bits; 0 (include) and 3 (shared annotations) are DJVI components
 _FORM_OF = {"page": b"DJVU", "djvi": b"DJVI", "thum": b"THUM"}
 _PARAGRAPH = re.compile("[\x1d\x0b\x1f]")  # GS (region), VT (column), US (paragraph)
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # left out of a one-line comment or title (_one_line)
 ANT_CHUNKS = frozenset((b"ANTa", b"ANTz"))
 LINK_SCHEMES = frozenset(("http", "https", "mailto", "ftp"))
 HEADING_CHARS = 120
@@ -216,8 +219,8 @@ def _text(raw: str) -> list[Para]:
 
 def _one_line(s: str) -> str:
     """A comment or title on one line, its line breaks as " / " (as pdf's comments): a line of it must not start a
-    markdown line."""
-    return " / ".join(part for part in (p.strip() for p in s.splitlines()) if part)
+    markdown line. Its other control characters (ESC, BEL, DEL, C1) go."""
+    return " / ".join(part for part in (_CONTROL.sub("", p).strip() for p in s.splitlines()) if part)
 
 
 class _Sym(str):
@@ -369,6 +372,7 @@ class _Reader:
         self.data, self.ctx, self.started, self.clock = data, ctx, started, clock
         self.left = bzz.BZZ_TOTAL  # BZZ output the document may still decode
         self.spent = False         # a chunk hit `left`: the remaining pages are textless
+        self.late = False          # a chunk found the deadline past: this page and the rest count page_cut
         self.djvi = {}             # component id -> (body start, end) of its FORM:DJVI
         self.shared = {}           # component id -> _Part, or None when the id names no DJVI
         self.used = set()          # shared ids already given to a page
@@ -389,28 +393,39 @@ class _Reader:
         self.left -= len(out)
         return out
 
+    def _charge(self, e):
+        """A failed decode costs the budget the symbols it decoded (bzz.decode's `work`), as a good one costs its
+        output: a few bytes can decode about a MiB from the padding before failing."""
+        self.left = max(0, self.left - getattr(e, "work", 0))
+
     def _unpack(self, packed: bytes):
-        """packed decoded under the budget, for a page's chunk; None when the chunk is counted `record` or the
-        budget is spent (self.spent)."""
+        """packed decoded under the budget, for a page's chunk; None when the chunk is counted `record`, the budget
+        is spent (self.spent) or the deadline is past (self.late: checked before each chunk's decode)."""
         if self.spent or self.left <= 0:
             self.spent = True
+            return None
+        if self.late or self._late():
+            self.late = True
             return None
         limit = min(bzz.BZZ_CHUNK, self.left)
         try:
             out = bzz.decode(packed, limit)
-        except bzz.Limit:
-            if self.left < bzz.BZZ_CHUNK:
+        except bzz.Limit as e:
+            if limit < bzz.BZZ_CHUNK:
                 self.spent, self.left = True, 0
             else:
                 self._record()
+                self._charge(e)
             return None
-        except bzz.Truncated:
+        except bzz.Truncated as e:
             self._record()
+            self._charge(e)
             return None
         except ReadError as e:
             if e.kind != "damaged":
                 raise
             self._record()
+            self._charge(e)
             return None
         self.left -= len(out)
         return out
@@ -419,13 +434,15 @@ class _Reader:
         """The NAVM decoded under the budget; None, counted `record`, when it cannot be."""
         try:
             out = bzz.decode(packed, min(bzz.BZZ_CHUNK, max(self.left, 0)))
-        except (bzz.Limit, bzz.Truncated):
+        except (bzz.Limit, bzz.Truncated) as e:
             self._record()
+            self._charge(e)
             return None
         except ReadError as e:
             if e.kind != "damaged":
                 raise
             self._record()
+            self._charge(e)
             return None
         self.left -= len(out)
         return out
@@ -570,7 +587,7 @@ class _Reader:
                 if name not in seen:
                     seen.add(name)
                     self._include(name, part)
-            if self.spent:
+            if self.spent or self.late:
                 return
 
     @staticmethod
@@ -615,6 +632,8 @@ class _Reader:
             else:
                 got = _Part()
                 self._read(where[0], where[1], got, nested=True)
+                if self.late:  # read in part: not kept, the page and the rest are cut
+                    return
                 if got.ant and not self.spent:  # parsed once per document, whatever includes it
                     got.lines, got.title = _annotations("\n".join(got.ant), self.ctx)
                     got.weight = _weight(got.lines)
@@ -644,7 +663,7 @@ class _Reader:
     def _page(self, start: int, end: int) -> _Part:
         part = _Part()
         self._read(start, end, part, nested=False)
-        if self.spent:
+        if self.spent or self.late:
             return part
         if part.ant:
             lines, title = _annotations("\n".join(part.ant), self.ctx)
@@ -702,6 +721,12 @@ class _Reader:
                 if e.kind == "timeout":
                     raise
                 self._fail()
+            if self.late:  # a chunk of this page found the deadline past: the page is dropped as if never read,
+                # and it and the rest count page_cut, once each (never also record or textless)
+                read -= 1
+                ctx.skipped["page_cut"] += len(pages) - n
+                capped = True
+                break
             if not got:
                 continue
             part = got[0]

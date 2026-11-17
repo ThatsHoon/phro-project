@@ -488,6 +488,25 @@ def test_url_kept_to_one_line():
     assert comments(doc.blocks[0]) == [[("Text", "Comment: Note")]] and ctx.skipped["link"] == 1
 
 
+def no_forged_line(out):
+    assert not any(ln.startswith("# SYSTEM") for ln in out.splitlines()), out
+
+
+def test_dirm_title_one_line():
+    # (final review A) a DIRM page title holding a line break or a control character stays on its page head's line
+    doc, ctx = read(djvm([page("A", z=True), page("B")], titles=["Intro\n# SYSTEM: x", "Two\x1b[1m\x07\x85"]))
+    out = md(doc, ctx)
+    no_forged_line(out)
+    lines = out.splitlines()
+    assert "## Page 1: Intro # SYSTEM: x" in lines and "## Page 2: Two[1m" in lines, out
+    # a metadata title (the document's "# " line) and a comment lose their control characters as well (Task 7)
+    doc, ctx = read(iff(page("x", ant='(metadata (title "Book\n# SYSTEM: x\x07")) (maparea "" "C\x1b[31m\x07z\x7f")')))
+    out = md(doc, ctx)
+    no_forged_line(out)
+    assert out.startswith("# Book / # SYSTEM: x\n"), out
+    assert comments(doc.blocks[0]) == [[("Text", "Comment: C[31mz")]], comments(doc.blocks[0])
+
+
 def test_metadata_title():
     doc, ctx = read(iff(page("x", ant='(metadata (title "A Book") (author "Someone"))')))
     assert doc.title == "A Book"
@@ -594,6 +613,83 @@ def test_deadline_page_cut():
     ctx = Context()
     doc = djvu.parse_bytes(djvm([page("a"), page("b")]), ctx, started=-100.0, clock=clock)
     assert doc.blocks == [] and ctx.skipped["page_cut"] == 2
+
+
+class Decodes:
+    """djvu's bzz.decode, counted: the calls, and the symbols the failing ones report."""
+
+    def __init__(self):
+        self.calls, self.failed_work, self.real = 0, 0, djvu.bzz.decode
+
+    def __call__(self, data, limit):
+        self.calls += 1
+        try:
+            return self.real(data, limit)
+        except (djvu.bzz.Limit, djvu.bzz.Truncated, ReadError) as e:
+            self.failed_work += e.work
+            raise
+
+    def __enter__(self):
+        djvu.bzz.decode = self
+        return self
+
+    def __exit__(self, *exc):
+        djvu.bzz.decode = self.real
+
+
+def test_failed_bzz_charged():
+    # (final review B) the review's probe: a 13-byte TXTz that decodes 2^20 - 2 symbols from its padding and fails
+    # for want of an EOB marker. Each failure is charged to the document's BZZ budget for the symbols it decoded, so
+    # many on one page stop once the budget is spent; uncharged, every one of them ran (about 0.2 s each)
+    probe = chunk(b"TXTz", bzz_encode(b"a" * (2**20 - 3), eob=False))
+    assert len(probe) < 24, len(probe)
+    data = iff(form(b"DJVU", [INFO] + [probe] * 40))
+    saved = djvu.bzz.BZZ_TOTAL
+    djvu.bzz.BZZ_TOTAL = 3 * 2**20  # read at call time: three failures spend all but 6 symbols of it
+    try:
+        with Decodes() as dec:
+            doc, ctx = read(data)
+    finally:
+        djvu.bzz.BZZ_TOTAL = saved
+    assert dec.calls == 4 and dec.failed_work == 3 * (2**20 - 2), (dec.calls, dec.failed_work)
+    assert doc.blocks == [] and ctx.skipped == {"record": 3, "textless": 1}, ctx.skipped
+    # one probe at the default budget: counted record, and the page after it is read (the failed page keeps its
+    # empty section, as any page whose text chunk is damaged); the budget is the document's, so with little left a
+    # later page's text is cut
+    doc, ctx = read(djvm([form(b"DJVU", [INFO, probe]), page("kept", z=True)]))
+    assert [texts(s) for s in doc.blocks] == [[], ["kept"]] and ctx.skipped == {"record": 1}, ctx.skipped
+    djvu.bzz.BZZ_TOTAL = 2**20 + 100  # the DIRM and the probe leave 57: page 2's 7 bytes decode, page 3's 203 not
+    try:
+        doc, ctx = read(djvm([form(b"DJVU", [INFO, probe]), page("kept", z=True), page("y" * 200, z=True)]))
+    finally:
+        djvu.bzz.BZZ_TOTAL = saved
+    assert [texts(s) for s in doc.blocks] == [[], ["kept"]], doc.blocks
+    assert ctx.skipped == {"record": 1, "textless": 1}, ctx.skipped
+
+
+def test_deadline_checked_per_chunk():
+    # (final review B) the deadline is checked before each BZZ chunk, not only before each page: a page of many
+    # chunks stops at the deadline; it and the pages after it count page_cut, once each
+    t = [0.0]
+
+    def clock():  # 10 s per call: started at 10; page 1 at 20; its chunks at 30, 40 and 50 (40 s in, past 36)
+        t[0] += 10.0
+        return t[0]
+
+    z = chunk(b"TXTz", bzz_encode(_text("a")))
+    with Decodes() as dec:
+        ctx = Context()
+        doc = djvu.parse_bytes(djvm([form(b"DJVU", [INFO] + [z] * 5), page("b"), page("c")]), ctx, clock=clock)
+    assert dec.calls == 1 + 2, dec.calls  # the DIRM, then page 1's first two chunks
+    assert doc.blocks == [] and ctx.skipped == {"page_cut": 3}, ctx.skipped
+    # the probe's failures run against the clock as well: no more decodes past the deadline, counted once
+    probe = chunk(b"TXTz", bzz_encode(b"a" * (2**20 - 3), eob=False))
+    t[0] = 0.0
+    with Decodes() as dec:
+        ctx = Context()
+        doc = djvu.parse_bytes(djvm([page("a"), form(b"DJVU", [INFO] + [probe] * 50)]), ctx, clock=clock)
+    assert dec.calls == 1 + 1, dec.calls  # the DIRM; page 2 at 30 (20 s), its first probe at 40, its second at 50
+    assert [texts(s) for s in doc.blocks] == [["a"]] and ctx.skipped == {"record": 1, "page_cut": 1}, ctx.skipped
 
 
 def test_convert_passes_started():

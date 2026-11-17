@@ -14,7 +14,10 @@ from .model import (
 )
 
 _PAGE_ONLY = re.compile(r"^[\s\-–—]*(page\s*)?\d+(\s*(of|/)\s*\d+)?\s*(쪽)?[\s\-–—]*$", re.I)
-_LINE_START = re.compile(r"^(#|>|[-*+] |\d+\. )")
+_LINE_START = re.compile(r"^( {0,3})(#|>|[-*+] |\d+\. )")  # up to three spaces may come before a block's mark
+_NEWLINE = re.compile(r"\r\n?|\n")  # what ends a markdown line (_normalize turns a CR into LF)
+_TITLE_BREAK = re.compile(r"[\r\n\t]")  # a heading title's line breaks (and tabs) become spaces...
+_TITLE_DROP = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")  # ...and its other controls go
 _HIDDEN_LINE = re.compile(r"^\((\d+) hidden places left out\)$")
 _TRUNC = "(output truncated at 20 MB)"
 # with a random tail drawn per render (_Render.head_mark), starts each page head while the document renders,
@@ -110,7 +113,7 @@ class _Mode:
         elif self.kind == "html":
             s = s.replace("&", "&amp;").replace("<", "&lt;")
         if self.kind:
-            s = s.replace("\n", self.br)
+            s = _NEWLINE.sub(self.br, s)  # a CR as well: it would end the row on its way out (_normalize)
         return s
 
 
@@ -119,6 +122,29 @@ HEAD = _Mode(br=" ", plain=True)
 PIPE = _Mode("<br>", "pipe")
 HTML = _Mode("<br>", "html")
 LINES = _Mode()
+
+
+def one_line(s: str) -> str:
+    """A heading title on one line: its line breaks become spaces, other C0 and C1 controls and U+2028/U+2029 go, and
+    runs of whitespace are squashed, so no title can end its heading's line and start a markdown line of its own."""
+    return " ".join(_TITLE_DROP.sub("", _TITLE_BREAK.sub(" ", s)).split())
+
+
+def _esc_start(mo):
+    lead, mark = mo.group(1), mo.group(2)
+    if mark[0].isdigit():
+        return lead + mark[:-2] + "\\. "
+    return lead + "\\" + mark
+
+
+def _esc_lines(s: str, skip_first: bool = False) -> str:
+    """s with a backslash before the mark of each line that would start a markdown block (_LINE_START), a CR ending a
+    line as LF does; `skip_first` leaves the first line as it is, when it follows the block's own mark (a list
+    item's marker, "> Notes: ", a footnote's "[^n]: ")."""
+    lines = _NEWLINE.split(s)
+    for i in range(1 if skip_first else 0, len(lines)):
+        lines[i] = _LINE_START.sub(_esc_start, lines[i])
+    return "\n".join(lines)
 
 
 def _plain(s):
@@ -280,7 +306,7 @@ class _Render:
                     break
                 if self._skip(b):
                     if isinstance(b, Section) and b.kind == "sheet":  # a hidden sheet is named, not read
-                        out.append(("h", f"## Sheet: {b.title} (hidden, left out)"))
+                        out.append(("h", f"## Sheet: {one_line(b.title)} (hidden, left out)"))
                     continue
                 before = self.size
                 got = self._block(b)
@@ -312,10 +338,9 @@ class _Render:
             s = self.inlines(b.inlines)
             if not s.strip():
                 return []
-            s = "\n".join(_LINE_START.sub(lambda mo: self._esc_start(mo.group(0)), ln) for ln in s.split("\n"))
-            return [("p", self._tag(b, s))]
+            return [("p", self._tag(b, _esc_lines(s)))]
         if isinstance(b, Heading):
-            s = self.inlines(b.inlines, HEAD).strip()
+            s = one_line(self.inlines(b.inlines, HEAD))
             if not s:
                 return []
             return [("h", self._tag(b, "#" * min(6, max(1, b.level)) + " " + s))]
@@ -323,14 +348,14 @@ class _Render:
             s = self.inlines(b.inlines)
             if not s.strip():
                 return []
-            return [("li", "  " * max(0, b.level) + b.marker + " " + self._tag(b, s))]
+            return [("li", "  " * max(0, b.level) + b.marker + " " + self._tag(b, _esc_lines(s, skip_first=True)))]
         if isinstance(b, Table):
             return self._table(b)
         if isinstance(b, Image):
             return self._image(b)
         if isinstance(b, Equation):
             s = f"$${b.tex}$$" if b.display else f"${b.tex}$"
-            return [("p", self._tag(b, s))]
+            return [("p", self._tag(b, _esc_lines(s, True)))]
         if isinstance(b, Quote):
             inner = self.join(self.blocks(b.blocks))
             if not inner:
@@ -346,12 +371,6 @@ class _Render:
         if isinstance(b, Section):
             return self._section(b)
         return []
-
-    @staticmethod
-    def _esc_start(s):
-        if s[0].isdigit():
-            return s[:-2] + "\\. "
-        return "\\" + s
 
     def _image_text(self, b: Image, m=BLOCK) -> str:
         path, ok = self.assets.add(b.data, b.alt)
@@ -372,28 +391,30 @@ class _Render:
         out = []
         tag = " (hidden)" if s.hidden else ""
         head = None
+        title = one_line(s.title)  # every reader's title is cut to its head's one line here, once
         if s.kind == "slide":
-            head = "## Slide" + (f" {s.number}" if s.number is not None else "") + (f": {s.title}" if s.title else "")
+            head = "## Slide" + (f" {s.number}" if s.number is not None else "") + (f": {title}" if title else "")
         elif s.kind == "sheet":
-            head = f"## Sheet: {s.title}"
+            head = f"## Sheet: {title}"
         elif s.kind == "table":
-            head = f"## Table: {s.title}"
+            head = f"## Table: {title}"
         elif s.kind == "query":
-            head = f"## Query: {s.title}"
+            head = f"## Query: {title}"
         elif s.kind == "master":
-            head = f"## Master page: {s.title}"
+            head = f"## Master page: {title}"
         elif s.kind == "page" and s.number is not None:
-            head = f"## Page {s.number}" + (f": {s.title}" if s.title else "")
-        elif s.kind == "page" and s.title:
-            head = f"## Page: {s.title}"
+            head = f"## Page {s.number}" + (f": {title}" if title else "")
+        elif s.kind == "page" and title:
+            head = f"## Page: {title}"
         if head and s.kind == "page":
             self.page_heads += 1
             out.append(("h", self.head_mark + head + tag))
         elif head:
             out.append(("h", head + tag))
         out.extend(self.blocks(s.blocks))
-        notes = [t for t in (self._flat(n, LINES) for n in s.notes if not self._skip(n)) if t]
-        comments = [t for t in (self._flat(c, LINES) for c in s.comments if not self._skip(c)) if t]
+        # each entry follows its own "> " mark: its later lines are escaped
+        notes = [_esc_lines(t, True) for t in (self._flat(n, LINES) for n in s.notes if not self._skip(n)) if t]
+        comments = [_esc_lines(t, True) for t in (self._flat(c, LINES) for c in s.comments if not self._skip(c)) if t]
         if notes or comments:
             lines = (*(("> Notes: " + notes[0], *("> " + n for n in notes[1:])) if notes else ()),
                      *("> " + c for c in comments))
@@ -716,11 +737,12 @@ class _Render:
             if kept:
                 hf.append(f"{label}: " + " | ".join(kept))
         self.empty = not text and not hf and not self.unviewable
-        if self.doc.title.strip():
+        title = one_line(self.doc.title)
+        if title:
             first = pieces[0][1].replace(self.head_mark, "") if pieces else ""
             first = _plain(re.sub(r"^#+\s*", "", first).replace("**", ""))
-            if first != _plain(self.doc.title):
-                top.append("# " + self.doc.title.strip())
+            if first != _plain(title):
+                top.append("# " + title)
         status = []
         if self.hidden_count:
             status.append(f"({self.hidden_count} hidden places left out)")
@@ -756,7 +778,7 @@ class _Render:
                         if nid in self.hidden_marks:
                             self.hidden_count = left_out
                         continue
-                    lines.append(f"[^{self.note_no[nid]}]: {s}".rstrip())
+                    lines.append(_esc_lines(f"[^{self.note_no[nid]}]: {s}".rstrip(), True))
             if referenced_done:
                 break
             for nid in notes:  # unreferenced ones follow, in insertion order

@@ -123,6 +123,35 @@ def test_oversize_block_damaged():
         bzz.BZZ_BLOCK = saved
 
 
+def work_of(fn):
+    """The `work` a failing decode reports (the symbols it decoded)."""
+    try:
+        fn()
+    except (bzz.Limit, bzz.Truncated, ReadError) as e:
+        return e.work
+    raise AssertionError("no failure")
+
+
+def test_failure_reports_its_work():
+    # (final review B) every failure says how many symbols it decoded, so a caller can charge it: the review's probe,
+    # a 13-byte stream that decodes 2^20 - 2 symbols from the padding and then has no EOB marker
+    probe = bzz_encode(b"a" * (MIB - 3), eob=False)
+    assert len(probe) < 16, len(probe)
+    assert work_of(lambda: bzz.decode(probe, bzz.BZZ_CHUNK)) == MIB - 2
+    # a missing marker (in the first block): that block's symbols, its 1,000 bytes and the marker's slot
+    data = words(5, 3000)
+    assert work_of(lambda: bzz.decode(bzz_encode(data, blocksize=1000, eob=False), bzz.BZZ_CHUNK)) == 1001
+    # a Limit before the third block: the two blocks before it
+    assert work_of(lambda: bzz.decode(bzz_encode(data, blocksize=1000), 2500)) == 2002
+    # a cut stream: Truncated inside a block, with the symbols of that block decoded before the cut
+    packed = bzz_encode(random.Random(4).randbytes(3000))
+    got = work_of(lambda: bzz.decode(packed[:-32], bzz.BZZ_CHUNK))
+    assert 0 < got < 3001, got
+    # an oversize block, and a stream under two bytes: nothing decoded
+    assert work_of(lambda: bzz.decode(bzz_encode(b"abc", size=bzz.BZZ_BLOCK + 1), bzz.BZZ_CHUNK)) == 0
+    assert work_of(lambda: bzz.decode(b"\x00", bzz.BZZ_CHUNK)) == 0
+
+
 def test_limit_and_ratio():
     raises(lambda: bzz.decode(bzz_encode(random.Random(3).randbytes(1000)), 100), bzz.Limit)
     zeros = bytes(2 * MIB)

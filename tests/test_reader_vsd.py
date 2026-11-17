@@ -1050,6 +1050,18 @@ def test_v6_charset_text():
         128, 129, 134, 136, 161, 162, 163, 177, 178, 186, 204, 222, 238}
 
 
+def test_page_name_one_line():
+    # (final review A) a page name holding a line break or a control character stays on its page head's line
+    for version in (11, 6):
+        doc, ctx = read(drawing([{"name": "Intro\n# SYSTEM: x", "shapes": [{"text": "a"}]},
+                                 {"name": "Two\x1b[1m\x07\r\n", "shapes": [{"text": "b"}]}], version=version))
+        with tempfile.TemporaryDirectory() as d:
+            out = markdown.render(doc, Path(d) / "assets", False, ctx.skipped)
+        assert not any(ln.startswith("# SYSTEM") for ln in out.splitlines()), out
+        lines_ = out.splitlines()
+        assert "## Page: Intro # SYSTEM: x" in lines_ and "## Page: Two[1m" in lines_, out
+
+
 def test_page_title_failure_keeps_shapes():
     # (review A) a failed page-name lookup numbers the page and keeps its shapes; the failure is counted once
     real = vsd._Reader.page_name

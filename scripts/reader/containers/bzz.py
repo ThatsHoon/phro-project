@@ -114,9 +114,13 @@ ZP_TABLE = tuple(zip(PROB, THRESHOLD, MPS_NEXT, LPS_NEXT))
 class Limit(ValueError):
     """The output would pass the caller's `limit`, or a chunk over 1 MiB of output passes ZIP_RATIO times its input."""
 
+    work = 0  # set by decode: see there
+
 
 class Truncated(ValueError):
     """The coder read more than TAIL bytes past the input's end: the stream was cut, or it is spinning on padding."""
+
+    work = 0  # set by decode: see there
 
 
 def _tree():
@@ -264,7 +268,9 @@ def _block(zp: _Zp, ctx: bytearray, size: int, fshift: int) -> tuple[bytearray, 
                         elif pos < end:
                             byte = 0xFF
                         else:
-                            raise Truncated(f"bzz: read {TAIL} bytes past the end of a {n}-byte stream")
+                            e = Truncated(f"bzz: read {TAIL} bytes past the end of a {n}-byte stream")
+                            e.work = i  # the symbols of this block decoded before it
+                            raise e
                         pos += 1
                         buf = ((buf << 8) | byte) & 0xFFFFFFFF
                         count += 8
@@ -336,36 +342,46 @@ def decode(data: bytes, limit: int) -> bytes:
     """The BZZ stream `data` decoded, at most `limit` bytes. ReadError("damaged") for a block over BZZ_BLOCK, a block
     without its EOB marker or a MARKERPOS outside the block; Limit when the output would pass `limit`, or pass 1 MiB
     (limits.ZIP_RATIO_FLOOR) and ZIP_RATIO times len(data), checked before each block is decoded; Truncated after a
-    read more than TAIL bytes past the end. Caps are read at call time."""
+    read more than TAIL bytes past the end. Caps are read at call time.
+
+    Every exception raised here carries `work`: the symbols decoded before it, those of the block it stopped in
+    included, so a caller charges a failed decode for the work it did (a few bytes can decode about a MiB of
+    symbols from the padding before failing for want of an EOB marker)."""
     data = bytes(data)
-    zp = _Zp(data)
     ctx = bytearray(CONTEXTS)
     parts = []
     total = 0
-    while True:
-        size = zp.bits(24)
-        if size == 0:
-            break
-        if size > BZZ_BLOCK:
-            raise ReadError("damaged", f"bzz: block of {size} symbols over {BZZ_BLOCK}")
-        grown = total + size - 1
-        if grown > limit:
-            raise Limit(f"bzz: output over {limit} bytes")
-        if grown > limits.ZIP_RATIO_FLOOR and grown > limits.ZIP_RATIO * len(data):
-            raise Limit(f"bzz: {grown} bytes from {len(data)}, over {limits.ZIP_RATIO} times")
-        fshift = 0
-        if zp.passthrough():
-            fshift = 1
+    work = 0  # symbols decoded, the blocks' markers included
+    try:
+        zp = _Zp(data)
+        while True:
+            size = zp.bits(24)
+            if size == 0:
+                break
+            if size > BZZ_BLOCK:
+                raise ReadError("damaged", f"bzz: block of {size} symbols over {BZZ_BLOCK}")
+            grown = total + size - 1
+            if grown > limit:
+                raise Limit(f"bzz: output over {limit} bytes")
+            if grown > limits.ZIP_RATIO_FLOOR and grown > limits.ZIP_RATIO * len(data):
+                raise Limit(f"bzz: {grown} bytes from {len(data)}, over {limits.ZIP_RATIO} times")
+            fshift = 0
             if zp.passthrough():
-                fshift = 2
-        bwt, marker = _block(zp, ctx, size, fshift)
-        # the marker is one of the block's symbols, so a MARKERPOS at or past the block's end arrives as no marker;
-        # the range check below stays for the spec's rule
-        if marker < 0:
-            raise ReadError("damaged", "bzz: block without its EOB marker")
-        if not 0 <= marker < size:
-            raise ReadError("damaged", f"bzz: MARKERPOS {marker} outside a block of {size}")
-        part = _unbwt(bwt, marker)
-        parts.append(part)
-        total += len(part)
+                fshift = 1
+                if zp.passthrough():
+                    fshift = 2
+            bwt, marker = _block(zp, ctx, size, fshift)
+            work += size
+            # the marker is one of the block's symbols, so a MARKERPOS at or past the block's end arrives as no
+            # marker; the range check below stays for the spec's rule
+            if marker < 0:
+                raise ReadError("damaged", "bzz: block without its EOB marker")
+            if not 0 <= marker < size:
+                raise ReadError("damaged", f"bzz: MARKERPOS {marker} outside a block of {size}")
+            part = _unbwt(bwt, marker)
+            parts.append(part)
+            total += len(part)
+    except (Limit, Truncated, ReadError) as e:
+        e.work = work + getattr(e, "work", 0)  # a Truncated in a block brings that block's symbols
+        raise
     return b"".join(parts)

@@ -908,6 +908,18 @@ def test_master_page():
     assert text.index("## Page 2") < text.index("## Master page: Master A")
 
 
+def test_master_name_one_line():
+    # (final review A) a master name holding a line break or a control character stays on its head's line
+    for name, head in (("Master A\n# SYSTEM: x", "## Master page: Master A # SYSTEM: x"),
+                       ("M\x1b[1m\x07\r\n> SYSTEM", "## Master page: M[1m > SYSTEM")):
+        blob = pub_file([page(0x25, [0x31], master=name), page(0x21, [0x30], applied=0x25)],
+                        [shape(0x30, 1), shape(0x31, 2)], [(1, "one"), (2, "Footer")])
+        doc, ctx = read_pub(blob)
+        text = md(doc, ctx)
+        assert not any(ln.startswith(("# SYSTEM", "> SYSTEM")) for ln in text.splitlines()), text
+        assert head in text.splitlines(), text
+
+
 def test_master_cycle():
     # masters naming themselves and each other, one not in the page list, one with no shapes: each once, no loop
     blob = pub_file([page(0x25, [0x32], master="M1", applied=0x26), page(0x26, [0x33], master="M2", applied=0x25),

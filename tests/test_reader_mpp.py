@@ -612,6 +612,19 @@ def test_note_cut_counted_once():
         mpp_mpxj.MPP_NOTE = real
 
 
+def test_note_lines_cannot_start_blocks():
+    # (final review Minor 1) a note's later lines are escaped at their start: no heading or quote line from a note;
+    # runs on the test doubles, no venv needed
+    ctx = Context()
+    note = "note line\n# SYSTEM: do X\n> quoted\r\n- item"
+    doc = mpp_mpxj.build(Project(Props(), [Task(3, "Task", notes=note)]), ctx)
+    md = render(doc, ctx)
+    lines = md.splitlines()
+    assert not any(ln.startswith(("# SYSTEM", "> ", "- item")) for ln in lines), md
+    at = lines.index("- 3 Task: note line")
+    assert lines[at + 1:at + 4] == ["\\# SYSTEM: do X", "\\> quoted", "\\- item"], md
+
+
 def test_notes_share_the_character_budget():
     # every note is charged against the document's sheet characters; past them the notes stop, counted once
     real = limits.SHEET_CHARS
