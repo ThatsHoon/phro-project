@@ -12,7 +12,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
-from reader import markdown  # noqa: E402
+from reader import limits, markdown  # noqa: E402
 from reader.containers.zipx import Package, parse_xml  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Code, Context  # noqa: E402
@@ -566,6 +566,45 @@ def test_odt_divider_line_ignored():
     assert mermaid_ok(t) and t.count("--") == 1 and "line text" not in t, t
     assert "rule line text end" in markdown.render(doc, tmp() / "a")
     assert not ctx.skipped["connector_loose"] and not ctx.skipped["infer_skipped"], ctx.skipped
+
+
+def test_odt_slot_charges_copy_budget():
+    arrow = ('<style:style style:name="gr1" style:family="graphic"><style:graphic-properties draw:marker-end="A"/>'
+             '</style:style>')
+    line = '<draw:line {} svg:x1="0cm" svg:y1="0cm" svg:x2="1cm" svg:y2="0cm">' + P("t" * 2000) + "</draw:line>"
+    cell_xml = ('<table:table-cell table:number-columns-repeated="100">' + P("x{}") + '</table:table-cell>')
+    grid = ('<table:table><table:table-row table:number-rows-repeated="100">' + cell_xml
+            + '</table:table-row></table:table>')
+    old = limits.SHEET_CHARS
+    limits.SHEET_CHARS = 100_000
+    try:
+        plain_doc, plain_ctx = parse(odt_doc(grid.format(line.format(""))))
+        doc, ctx = parse(odt_doc(grid.format(line.format('draw:style-name="gr1"')), arrow))
+    finally:
+        limits.SHEET_CHARS = old
+    plain, out = markdown.render(plain_doc, tmp() / "a"), markdown.render(doc, tmp() / "b")
+    assert ctx.skipped["connector_loose"] == 1 and out.count("t" * 2000) <= plain.count("t" * 2000) + 1, (
+        len(out), len(plain))
+    assert ctx.skipped["cells"] == plain_ctx.skipped["cells"] >= 1, (ctx.skipped, plain_ctx.skipped)
+
+
+def test_odt_place_failure_keeps_text():
+    orig, calls = odf_base._swap, [0]
+
+    def boom(blocks, fn, d=0):  # the second top-level walk, the one that writes the diagram, fails
+        if d == 0:
+            calls[0] += 1
+            if calls[0] == 2:
+                raise ValueError("boom")
+        return orig(blocks, fn, d)
+    odf_base._swap = boom
+    try:
+        doc, ctx = parse(odt_doc(P("a" + shape('draw:id="a"', "Alpha", "0cm")) + P("b" + shape('draw:id="b"', "Beta", "5cm"))
+                                 + P(connector("a", "b", "go"))))
+    finally:
+        odf_base._swap = orig
+    out = markdown.render(doc, tmp() / "a")
+    assert ctx.skipped["shape"] == 1 and all(w in out for w in ("Alpha", "Beta", "go")), (out, ctx.skipped)
 
 
 def main():

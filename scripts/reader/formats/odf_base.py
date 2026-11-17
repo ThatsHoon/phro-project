@@ -152,10 +152,11 @@ def register(dia, styles, el, key, blocks, hidden=False):
 
 
 class _Slot:
-    """Where an odt diagram member stood in the flow, until `Body.place` puts the diagram's flow there."""
+    """Where an odt diagram member stood in the flow, until `Body.place` puts the diagram's flow there. It carries the
+    member's blocks, so the copy budgets (`blocks_len`, `Body.weight`) charge them wherever a repeat copies the slot."""
 
-    def __init__(self, key):
-        self.key, self.hidden = key, ""
+    def __init__(self, key, blocks):
+        self.key, self.blocks, self.hidden = key, blocks, ""
 
 
 def _swap(blocks, fn, d=0) -> list:
@@ -274,7 +275,7 @@ class Body:
         self.chars_left = limits.SHEET_CHARS  # characters that copies (repeats, reused objects) may still add
         self.wt = {}  # id(Table) -> (Table, cells it expands to)
         self.glued = None  # odt read as one diagram scope: the shape ids connectors glue; None otherwise
-        self.members = {}  # diagram key -> (element, its blocks), waiting for place()
+        self.members = {}  # diagram key -> its element, waiting for place()
         self.keys = set()  # diagram keys given out
 
     def hide(self, blocks):
@@ -311,7 +312,7 @@ class Body:
         for b in blocks:
             if isinstance(b, Table):
                 w += self.wt.get(id(b), (b, 1))[1]
-            elif isinstance(b, Section):
+            elif isinstance(b, (Section, _Slot)):
                 w += self.weight(b.blocks)
         return w
 
@@ -543,26 +544,37 @@ class Body:
             blocks = self.frame_blocks(el, d) if local(el.tag) == "frame" else self.blocks(el, d + 1)
         finally:
             self.glued = saved
-        self.members[key] = (el, blocks)
-        return _Slot(key)
+        self.members[key] = el
+        return _Slot(key, blocks)
 
     def swap(self, fn):
         self.doc.blocks = _swap(self.doc.blocks, fn)
         for k, v in self.doc.notes.items():
             self.doc.notes[k] = _swap(v, fn)
 
+    def own(self, s) -> list:
+        """A slot's member blocks, hidden when the slot was."""
+        return self.hide(s.blocks) if s.hidden else s.blocks
+
     def place(self, budget):
         """Write the scope: each _Slot gives way to its member's blocks when the diagram keeps them (hidden as the slot
-        was), and the diagram goes at the first slot that anchors it, or at the end when none does."""
+        was), and the diagram goes at the first slot that anchors it, or at the end when none does. On any failure
+        every slot left gives way to its member's blocks, so no text is lost."""
         self.glued = None
+        try:
+            self._place(budget)
+        except Exception:
+            self.swap(self.own)
+            raise
+
+    def _place(self, budget):
         dia, slots, index = diagram.Diagram(self.ctx, budget), [], {}
 
         def collect(s):  # flow order; a member in hidden content is a hidden shape or connector
             if s.key not in index and s.key in self.members:
                 index[s.key] = len(slots)
-                el, blocks = self.members[s.key]
                 with self.ctx.guard("shape"):
-                    register(dia, self.styles, el, s.key, blocks, bool(s.hidden))
+                    register(dia, self.styles, self.members[s.key], s.key, s.blocks, bool(s.hidden))
                 slots.append((s.key, [object()]))
             return [s]
 
@@ -588,8 +600,7 @@ class Body:
             if i is not None and i == at and todo:
                 out += todo.pop()
             if i in kept:
-                blocks = self.members[s.key][1]
-                out += self.hide(blocks) if s.hidden else blocks
+                out += self.own(s)
             return out
 
         self.swap(put)
