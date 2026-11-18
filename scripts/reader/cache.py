@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from . import VERSION, convert
+from .limits import FIGURES_LATE
 
 _counter = itertools.count()
 _lock = threading.Lock()
@@ -124,10 +125,14 @@ def store(k: str, src, hidden: bool = False, **opts) -> Path:
         n = next(_counter)
     tmp = bucket / f".tmp-{k}-{os.getpid()}-{n}"
     try:
-        convert(src, tmp, hidden, **opts)
+        meta = convert(src, tmp, hidden, **opts)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+    if FIGURES_LATE in (meta.get("warnings") or []):
+        # cut by the deadline, like a conversion that ran out of time: handed out from its temporary folder (prune
+        # clears it after a day) and never filed under k, so the next read converts again
+        return tmp
     for attempt in (0, 1):
         try:
             os.replace(tmp, target)

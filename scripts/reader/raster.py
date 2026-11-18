@@ -151,7 +151,7 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
                 fig.warnings.add("figure glyphs unmapped")
         fonts.UNMAPPED = False
     if deadline is not None and deadline - time.time() < limits.FIGURE_RESERVE:
-        fig.warnings.add("figures not rendered: time")
+        fig.warnings.add(limits.FIGURES_LATE)
         return fig
     b = backend()
     if refused or b == "none":
@@ -161,7 +161,7 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
     except ReadError as e:  # emf_write or the child ran out of time: like the parser's deadline, nothing is drawn
         fig.png = None
         if e.detail == "figure time":
-            fig.warnings.add("figures not rendered: time")
+            fig.warnings.add(limits.FIGURES_LATE)
     except Exception:  # noqa: BLE001 - any failure leaves the picture unconverted
         fig.png = None
     return fig

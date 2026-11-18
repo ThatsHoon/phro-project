@@ -416,6 +416,65 @@ def test_cache_key_holds_image_backend():
     assert r.returncode == 0 and Path(r.stdout.strip()).parent.name == cache.key(f, "native"), r.stdout
 
 
+def test_time_cut_figures_not_kept():
+    """A conversion whose figures the deadline cut is handed out, but not filed under its key: the next convert reads
+    the file again. Every other result is kept."""
+    from reader import limits
+    calls = []
+    late = []
+
+    def fn():
+        calls.append(1)
+    with stub(fn=fn):
+        mod = sys.modules[STUB]
+        plain = mod.parse
+        mod.parse = lambda path, ctx: Doc(blocks=plain(path, ctx).blocks, warnings=list(late))
+        late.append(limits.FIGURES_LATE)
+        assert limits.FIGURES_LATE == "figures not rendered: time"
+        p = sample()
+        c1, o1 = cli("convert", str(p))
+        c2, o2 = cli("convert", str(p))
+        assert c1 == c2 == 0 and len(calls) == 2, (calls, o1, o2)
+        assert Path(o1.strip()).read_text() == "hello\n" and Path(o2.strip()).is_file()
+        from reader import raster
+        k = cache.key(p, image=raster.backend())
+        assert cache.lookup(k) is None and Path(o1.strip()).parent.name != k, o1
+        late.clear()
+        c3, o3 = cli("convert", str(p))
+        c4, o4 = cli("convert", str(p))
+        assert c3 == c4 == 0 and len(calls) == 3 and Path(o3.strip()).parent.name == k == Path(o4.strip()).parent.name
+
+
+def test_mpp_and_pdf_keys_ignore_image():
+    """read.py gives the image backend to every key but pdf's and mpp's (their venv children have no figure backend)."""
+    from pdf_fix import text_ops
+    seen = []
+    real = cache.key
+
+    def spy(path, engine="", image=""):
+        seen.append((Path(path).suffix, engine, image))
+        return real(path, engine, image)
+    old = {k: os.environ.get(k) for k in ("PHRO_READER_MPPENV", "PHRO_READER_PYENV")}
+    os.environ["PHRO_READER_MPPENV"] = os.environ["PHRO_READER_PYENV"] = "off"
+    cache.key = spy
+    try:
+        with stub():
+            m = tmp() / "x.mpp"
+            m.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + bytes(600))
+            cli("convert", str(m), "--engine", "mpxj")  # no mpp venv here: unsupported, but the key is worked out
+            cli("convert", str(_pdf_file([text_ops("Hi")])), "--engine", "native")
+            cli("convert", str(sample()))
+    finally:
+        cache.key = real
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    from reader import raster
+    assert seen == [(".mpp", "", ""), (".pdf", "native", ""), (".txtx", "", raster.backend())], seen
+
+
 def test_code_digest_json():
     base = tmp()
     (base / "a.py").write_text("x = 1\n")

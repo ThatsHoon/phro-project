@@ -973,6 +973,30 @@ def test_extension_mismatch_damaged():
         assert err.kind == "damaged", err
 
 
+def test_lone_picture_capped():
+    """A lone picture past IMAGE_BYTES is too_large, worked out from its size before it is read (a lowered cap)."""
+    from reader import model
+    from reader.formats import picture
+    data = emf([emf_textw(100, 200, "Big")])
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES = len(data) - 1
+    try:
+        for name, body in (("a.emf", data), ("b.tif", tiff([(40, 40, 0)])), ("c.wpg", data), ("d.emz", data)):
+            p = lone(name, body if len(body) > limits.IMAGE_BYTES else body + bytes(len(data)))
+            real = Path.read_bytes
+            Path.read_bytes = lambda self: (_ for _ in ()).throw(AssertionError("read before the size check"))
+            try:
+                picture.parse(p, model.Context())
+                raise AssertionError(name)
+            except ReadError as e:
+                assert e.kind == "too_large" and e.detail == "picture past IMAGE_BYTES", (name, e.kind, e.detail)
+            finally:
+                Path.read_bytes = real
+    finally:
+        limits.IMAGE_BYTES = old
+    assert picture.parse(lone("a.emf", data), model.Context()).blocks[0].data == data
+
+
 def test_image_page_reaches_assets():
     """An Image block's page goes to raster.convert and is part of the Assets key; page 0 is the first page."""
     from reader.model import Image

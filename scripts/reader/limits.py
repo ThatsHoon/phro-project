@@ -59,6 +59,8 @@ METAFILE_NESTING = 16         # metafiles nested inside EMF+ image objects
 TIFF_PAGES = 100           # pages of a lone TIFF
 FONT_FILES = 4_000         # font files indexed
 FONT_BYTES = 64 * 2**20    # bytes read from one font file
+# the warning of a document whose figures the deadline left undrawn: its result is not kept in the cache
+FIGURES_LATE = "figures not rendered: time"
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 # a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
 BIG_INPUT = "input"  # the file is over MAX_INPUT

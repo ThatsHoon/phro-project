@@ -29,7 +29,7 @@ import reader
 from reader.model import Doc, Heading, Para, Text
 from pathlib import Path
 mod = types.ModuleType({stub!r})
-mod.parse = lambda path, ctx: Doc(blocks=[Heading(1, [Text(t[2:])]) if t.startswith("# ") else Para([Text(t)]) for t in Path(path).read_text(encoding="utf-8").lstrip(chr(0)).split("|")])
+mod.parse = lambda path, ctx: Doc(blocks=[Heading(1, [Text(t[2:])]) if t.startswith("# ") else Para([Text(t)]) for t in Path(path).read_text(encoding="utf-8").lstrip(chr(0)).split("|")], warnings=["figures not rendered: time"] if "LATE" in Path(path).read_text(encoding="utf-8") else [])
 reader.FORMATS["txtx"] = "_teststub"
 reader.BUILT.add("txtx")
 sys.modules[{stub!r}] = mod
@@ -1687,9 +1687,12 @@ def test_gate_image_offer_once_a_session():
         assert gate.image_backend() == "none"
         p = sample()
         figure_entry(p, "none", 2)
-        offer = gate.IMAGE_OFFER.format(k=2, read_py=gate.READ_PY)
+        from reader import pyenv
+        venv = pyenv.venv_dir("image")
+        offer = gate.IMAGE_OFFER.format(k=2, read_py=gate.READ_PY, dir=venv)
         assert offer == (" 2 figures (WMF/EMF/PICT/WPG/TIFF) are not shown as images; their text is included. To show"
-                         f" them, ask the user, then run python {gate.READ_PY} setup --for image."), offer
+                         f' them, ask the user, then run python -I -X utf8 "{gate.READ_PY}" setup --for image --venv'
+                         f' "{venv}" (--decline instead if they never want it).'), offer
         c = ctx_of(gate.decide(sev(p, "s1"), command=EXIT3))  # a cache hit: the child would exit 3
         assert c.endswith(offer) and len(c) < 600, c
         assert IMAGE_OFFER_START not in ctx_of(gate.decide(sev(p, "s1"), command=EXIT3))
@@ -1710,6 +1713,74 @@ def test_gate_image_offer_once_a_session():
     assert offer not in c and "figures (WMF" not in c and len(c) < 600, c
     c = gate._context("a.docx", {"lines": 1, "unread": ["1 chart"]}, md, offer=offer)
     assert offer in c and c.index(offer) < c.index(" Some parts could not be read"), c
+
+
+def test_gate_image_repair_not_after_decline():
+    from reader import cache
+    with stub(), image_env(windows=False, engine=FAKE_RESVG, verify=False, interpreter=Path("/v/bin/python3")):
+        p = sample()
+        figure_entry(p, "none", 2)
+        (cache.root() / "image-declined").write_text("", encoding="utf-8")
+        c = ctx_of(gate.decide(sev(p, "s1"), command=EXIT3))
+        assert "image engine failed" not in c and "figures (WMF" not in c, c
+
+
+def test_gate_none_entry_misses_once_resvg():
+    """An entry read with no backend is not served once the image venv is ready: the file is converted again."""
+    with stub():
+        p = sample()
+        with image_env(windows=False):
+            d = figure_entry(p, "none", 2)
+            o = out(gate.decide(sev(p), command=EXIT3))
+            assert Path(o["updatedInput"]["file_path"]).parent == d, o
+        with image_env(windows=False, engine=FAKE_RESVG, verify=True, interpreter=Path("/v/bin/python3")):
+            with child_cmds() as seen:
+                o = out(gate.decide(sev(p)))
+            assert len(seen) == 1 and seen[0][0] == str(Path("/v/bin/python3")), seen
+            assert o["permissionDecision"] == "deny", o  # the stubbed child timed out: nothing was served from d
+
+
+def test_gate_time_cut_converts_again():
+    """A conversion whose figures were cut by the deadline is served, but not kept: the next Read converts again."""
+    with stub() as base:
+        p = sample("LATE figure")
+        runs = []
+        real = gate.subprocess.run
+
+        def counting(cmd, **kw):
+            runs.append(cmd)
+            return real(cmd, **kw)
+        gate.subprocess.run = counting
+        try:
+            o1 = out(run(p, base))
+            o2 = out(run(p, base))
+        finally:
+            gate.subprocess.run = real
+        assert o1["permissionDecision"] == o2["permissionDecision"] == "allow", (o1, o2)
+        assert len(runs) == 2, runs
+        assert "LATE figure" in md_lines(o2), md_lines(o2)
+        q = sample("on time")
+        assert out(run(q, base))["permissionDecision"] == "allow"
+        assert out(gate.decide(ev(q), command=EXIT3))["permissionDecision"] == "allow"  # kept: a hit
+
+
+def test_setup_for_image_venv_and_decline():
+    import io
+    from contextlib import redirect_stdout
+    import read
+    from reader import pyenv
+    nowhere = Path(tempfile.gettempdir()).resolve() / "phro-no-such-image-venv"
+    with stub():  # a throwaway cache root for the decline marker
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = read.main(["setup", "--for", "image", "--venv", str(nowhere), "--check"])
+        assert code == 0 and buf.getvalue().strip() == f"MISSING\t{nowhere}", buf.getvalue()
+        assert not pyenv.declined("image")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = read.main(["setup", "--for", "image", "--venv", str(nowhere), "--decline"])
+        assert code == 0 and buf.getvalue().strip() == "DECLINED" and pyenv.declined("image"), buf.getvalue()
+        assert not pyenv.declined("pdf")
 
 
 def test_gate_no_offer_on_windows():

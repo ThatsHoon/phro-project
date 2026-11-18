@@ -1,8 +1,9 @@
 """Lone picture files: WMF, EMF, PICT, WPG and TIFF, and `wmz` and `emz` (gzip-compressed WMF and EMF).
 
 Each picture is one Image block, so the output is its PNG link and its figure text (markdown and raster do the rest);
-a TIFF gives one block a page, up to TIFF_PAGES. A `wmz` or `emz` is inflated within IMAGE_BYTES and the zip ratio
-rule (ZIP_RATIO times the input once past ZIP_RATIO_FLOOR). Bytes that are not the format the extension names are
+a TIFF gives one block a page, up to TIFF_PAGES. A file over IMAGE_BYTES is too_large, as embedded pictures are capped.
+A `wmz` or `emz` is inflated within IMAGE_BYTES and the zip ratio rule (ZIP_RATIO times the input once past
+ZIP_RATIO_FLOOR). Bytes that are not the format the extension names are
 `damaged`.
 """
 from pathlib import Path
@@ -51,6 +52,8 @@ def unpack(data: bytes, ext: str) -> bytes:
 def parse(path, ctx) -> Doc:
     path = Path(path)
     ext = path.suffix.lower().lstrip(".")
+    if path.stat().st_size > limits.IMAGE_BYTES:  # the cap embedded pictures share, checked before reading
+        raise ReadError("too_large", "picture past IMAGE_BYTES")
     data = unpack(path.read_bytes(), ext)
     if KIND[ext] != "tiff":
         return Doc(blocks=[Image(data)])

@@ -58,7 +58,8 @@ MPP_UNSUPPORTED ="Microsoft Project files are read only through MPXJ"  # formats
 # figures (WMF, EMF, PICT, WPG, TIFF) in every format but pdf and mpp: GDI+ draws them on Windows, the image venv
 # (resvg_py, Pillow) elsewhere once it is set up; the offer comes when some were left undrawn for want of it
 IMAGE_OFFER = (" {k} figures (WMF/EMF/PICT/WPG/TIFF) are not shown as images; their text is included. To show them,"
-               " ask the user, then run python {read_py} setup --for image.")
+               ' ask the user, then run python -I -X utf8 "{read_py}" setup --for image --venv "{dir}" (--decline'
+               " instead if they never want it).")
 IMAGE_REPAIR = (" The image engine failed its file check, so {k} figures (WMF/EMF/PICT/WPG/TIFF) are not shown as"
                 ' images; to repair it, ask the user and only on their yes run: python -I -X utf8 "{read_py}" setup'
                 ' --for image --venv "{dir}".')
@@ -450,11 +451,9 @@ def _generic(event, path, start, timeout, command):
     image venv's backend, the venv's file check and then the convert child under the venv's interpreter, so resvg_py
     and Pillow import in that one process; a venv that fails the check is not used (backend none, and the offer is
     the repair). The image setup offer when figures were left undrawn with backend none, once a session."""
-    from reader import cache
-    venv, repair = None, False
-    if not _windows():
-        from reader import pyenv
-        venv = pyenv.venv_dir("image")
+    from reader import cache, pyenv
+    repair = False
+    venv = None if _windows() else pyenv.venv_dir("image")
     image = image_backend(venv)
     entry = cache.lookup(cache.key(path, image=image))
     if entry is None and image.startswith("resvg-") and not pyenv.verify(venv, "image"):
@@ -479,12 +478,10 @@ def _generic(event, path, start, timeout, command):
     meta = _meta(entry)
     left = meta.get("figures_left")
     offer, mark = "", None
-    if not _windows() and image == "none" and isinstance(left, int) and not isinstance(left, bool) and left > 0:
-        if repair:
-            offer = IMAGE_REPAIR.format(k=left, read_py=READ_PY, dir=venv)
-        elif not pyenv.forced_native("image") and not pyenv.declined("image"):
-            offer = IMAGE_OFFER.format(k=left, read_py=READ_PY)
-        mark = _offer_mark(event) if offer else None
+    if (not _windows() and image == "none" and isinstance(left, int) and not isinstance(left, bool) and left > 0
+            and not pyenv.forced_native("image") and not pyenv.declined("image")):  # as pdf: never after a decline
+        offer = (IMAGE_REPAIR if repair else IMAGE_OFFER).format(k=left, read_py=READ_PY, dir=venv)
+        mark = _offer_mark(event)
         if mark is not None and mark.exists():
             offer = ""
     context = _context(_name(path), meta, out_md, offer=offer)
