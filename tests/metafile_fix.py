@@ -427,3 +427,183 @@ def pict(opcodes: list[bytes], frame=(0, 0, 72, 72), version=2, head=True, dpi=7
                + body + b"\x00\xff")
     out = struct.pack(">H", len(out) & 0xFFFF) + out[2:]
     return b"\0" * 512 + out if head else out
+
+
+# ---- WPG ---------------------------------------------------------------------------------------------------------------
+
+def wpg_head(major=1, doc=16) -> bytes:
+    """The 16-byte WPC head: magic, the document pointer, product 1, file type 0x16, the version, no encryption."""
+    return b"\xffWPC" + struct.pack("<IBBBBHH", doc, 1, 0x16, major, 0, 0, 0)
+
+
+def wpg_varint(n: int) -> bytes:
+    if n < 255:
+        return bytes([n])
+    if n < 0x8000:
+        return b"\xff" + struct.pack("<H", n)
+    return b"\xff" + struct.pack("<HH", 0x8000 | n >> 16, n & 0xFFFF)
+
+
+def wpg1_rec(typ: int, data: bytes = b"") -> bytes:
+    return bytes([typ]) + wpg_varint(len(data)) + data
+
+
+def wpg1(records: list[bytes], size=(1200, 1200), head=True) -> bytes:
+    """A WPG 1 file: the head, Start WPG with `size` in 1/1200 inch, the records and End WPG."""
+    body = wpg1_rec(0x0F, struct.pack("<BBHH", 1, 0, *size)) + b"".join(records) + wpg1_rec(0x10)
+    return (wpg_head(1) if head else b"") + body
+
+
+def wpg1_colormap(start, rgbs) -> bytes:
+    return wpg1_rec(0x0E, struct.pack("<HH", start, len(rgbs)) + b"".join(bytes(c) for c in rgbs))
+
+
+def wpg1_fill(style, color) -> bytes:
+    return wpg1_rec(0x01, bytes([style, color]))
+
+
+def wpg1_line_attr(style, color, width) -> bytes:
+    return wpg1_rec(0x02, struct.pack("<BBH", style, color, width))
+
+
+def wpg1_line(x0, y0, x1, y1) -> bytes:
+    return wpg1_rec(0x05, struct.pack("<hhhh", x0, y0, x1, y1))
+
+
+def wpg1_poly(typ, points, count=None) -> bytes:
+    return wpg1_rec(typ, struct.pack("<H", len(points) if count is None else count)
+                    + b"".join(struct.pack("<hh", *p) for p in points))
+
+
+def wpg1_rect(x, y, w, h) -> bytes:
+    return wpg1_rec(0x07, struct.pack("<hhhh", x, y, w, h))
+
+
+def wpg1_ellipse(cx, cy, rx, ry, rot=0) -> bytes:
+    return wpg1_rec(0x09, struct.pack("<hhhhhhhH", cx, cy, rx, ry, rot, 0, 0, 0))
+
+
+def wpg1_text_attr(avg=0, size=0, align=0, color=0) -> bytes:
+    return wpg1_rec(0x0D, struct.pack("<HH", avg, size) + bytes(13) + bytes([align, 0, color]))
+
+
+def wpg1_text(x, y, s: bytes) -> bytes:
+    return wpg1_rec(0x0C, struct.pack("<Hhh", len(s), x, y) + s)
+
+
+def wpg1_text2(x1, y1, x2, y2, s: bytes, rot=0) -> bytes:
+    return wpg1_rec(0x18, struct.pack("<ihHhhhhhhB", len(s), rot, len(s), x1, y1, x2, y2, 1, 1, 0) + s)
+
+
+def wpg1_bitmap1(w, h, depth, rle: bytes, hres=72, vres=72) -> bytes:
+    return wpg1_rec(0x0B, struct.pack("<hhhhh", w, h, depth, hres, vres) + rle)
+
+
+def wpg1_bitmap2(x1, y1, x2, y2, w, h, depth, rle: bytes, rot=0, hres=72, vres=72) -> bytes:
+    return wpg1_rec(0x14, struct.pack("<hhhhhhhhhh", rot, x1, y1, x2, y2, w, h, depth, hres, vres) + rle)
+
+
+def wpg2_rec(typ: int, data: bytes = b"", ext=0) -> bytes:
+    return bytes([0, typ]) + wpg_varint(ext) + wpg_varint(len(data)) + data
+
+
+def wpg2(records: list[bytes], units=(1200, 1200), size=(1200, 1200), dp=False, head=True, org=(0, 0),
+         start_ext=0) -> bytes:
+    """A WPG 2 file: the head, Start WPG (units per inch, the precision, a viewport and the image rectangle from `org`
+    to `org` + `size`, in 16.16 numbers when `dp`), the records and End WPG. `start_ext` is the number of records
+    that follow Start WPG as its page attributes."""
+    one = (lambda v: struct.pack("<i", v << 16)) if dp else (lambda v: struct.pack("<h", v))
+    (x0, y0), (w, h) = org, size
+    start = (struct.pack("<HHB", *units, 1 if dp else 0) + b"".join(one(v) for v in (0, 0, w, h))
+             + b"".join(one(v) for v in (x0, y0, x0 + w, y0 + h)))
+    body = wpg2_rec(0x01, start, start_ext) + b"".join(records) + wpg2_rec(0x02)
+    return (wpg_head(2) if head else b"") + body
+
+
+def wpg2_char(filled=False, closed=False, framed=True, winding=False, scale=None, skew=None, move=None,
+              rotate=None) -> bytes:
+    """An object characterization. Each transform part is present when given: `scale` (sx, sy), `skew` (kx, ky),
+    `move` (tx, ty in whole units) and `rotate` (degrees, counterclockwise: it writes the angle, the cosines and
+    the sines)."""
+    import math
+    flags = (filled << 13) | (closed << 14) | (framed << 15) | (winding << 12)
+    out = b""
+    if rotate is not None:
+        flags |= 0x10
+        out += struct.pack("<i", int(rotate * 65536))
+        c, s = math.cos(math.radians(rotate)), math.sin(math.radians(rotate))
+        scale, skew = (c, c), (-s, s)
+    if scale is not None:
+        flags |= 0x08
+    if skew is not None:
+        flags |= 0x04
+    if scale is not None:
+        out += struct.pack("<ii", int(scale[0] * 65536), int(scale[1] * 65536))
+    if skew is not None:
+        out += struct.pack("<ii", int(skew[0] * 65536), int(skew[1] * 65536))
+    if move is not None:
+        flags |= 0x02
+        out += struct.pack("<HiHi", 0, move[0], 0, move[1])
+    return struct.pack("<H", flags) + out
+
+
+def wpg2_pt(vals, dp=False) -> bytes:
+    return b"".join(struct.pack("<i", int(v * 65536)) if dp else struct.pack("<h", int(v)) for v in vals)
+
+
+def wpg2_polyline(points, dp=False, ext=0, count=None, **kw) -> bytes:
+    flat = [v for p in points for v in p]
+    return wpg2_rec(0x15, wpg2_char(**kw) + struct.pack("<H", len(points) if count is None else count)
+                    + wpg2_pt(flat, dp), ext)
+
+
+def wpg2_polycurve(triples, dp=False, **kw) -> bytes:
+    flat = [v for t in triples for p in t for v in p]
+    return wpg2_rec(0x17, wpg2_char(**kw) + struct.pack("<H", len(triples)) + wpg2_pt(flat, dp))
+
+
+def wpg2_rect(x1, y1, x2, y2, rx=0, ry=0, dp=False, **kw) -> bytes:
+    return wpg2_rec(0x18, wpg2_char(**kw) + wpg2_pt((x1, y1, x2, y2, rx, ry), dp))
+
+
+def wpg2_arc(cx, cy, rx, ry, ix, iy, ex, ey, dp=False, **kw) -> bytes:
+    return wpg2_rec(0x19, wpg2_char(**kw) + wpg2_pt((cx, cy, rx, ry, ix, iy, ex, ey), dp))
+
+
+def wpg2_pen(rgb, dp=False) -> bytes:
+    r, g, b = rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF
+    return wpg2_rec(0x25, bytes((r, g, b, 0)))
+
+
+def wpg2_pen_size(w) -> bytes:
+    return wpg2_rec(0x2B, struct.pack("<H", w))
+
+
+def wpg2_brush(rgb) -> bytes:
+    r, g, b = rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF
+    return wpg2_rec(0x31, bytes((0, r, g, b, 0)))
+
+
+def wpg2_palette(start, rgbs) -> bytes:
+    return wpg2_rec(0x0C, struct.pack("<HH", start, len(rgbs)) + b"".join(bytes(c) + b"\0" for c in rgbs))
+
+
+def wpg2_textline(x, y, angle=0.0, dp=False, **kw) -> bytes:
+    return wpg2_rec(0x1C, wpg2_char(**kw) + struct.pack("<H", 0) + wpg2_pt((x, y), dp) + b"\x00\x00"
+                    + struct.pack("<i", int(angle * 65536)))
+
+
+def wpg2_textblock(x1, y1, x2, y2, dp=False, **kw) -> bytes:
+    return wpg2_rec(0x1D, wpg2_char(**kw) + wpg2_pt((x1, y1, x2, y2), dp))
+
+
+def wpg2_textdata(s: bytes) -> bytes:
+    return wpg2_rec(0x0F, s)
+
+
+def wpg2_bitmap(x1, y1, x2, y2, dp=False, hres=72, vres=72, **kw) -> bytes:
+    return wpg2_rec(0x1B, wpg2_char(**kw) + wpg2_pt((x1, y1, x2, y2, hres, vres), dp))
+
+
+def wpg2_bitmap_data(w, h, fmt, comp, data: bytes) -> bytes:
+    return wpg2_rec(0x0E, struct.pack("<HHBB", w, h, fmt, comp) + data)
