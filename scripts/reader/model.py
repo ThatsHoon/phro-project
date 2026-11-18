@@ -106,6 +106,7 @@ class Image:
     data: bytes
     alt: str = ""
     hidden: str = _hid()
+    codepage: str = ""  # the 8-bit code page of the document's text, for metafile fonts with DEFAULT_CHARSET
 
 
 @dataclass
