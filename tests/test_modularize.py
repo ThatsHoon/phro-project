@@ -1,9 +1,3 @@
-"""A tiny two-bundle project: allowed imports pass, a cross-bundle and an escaping relative import are caught,
-the copy test passes for an isolated feature and fails for one that reaches outside, contracts report gaps
-(including examples that name no schema or a schema file that is not there).
-
-Run: python -I -X utf8 tests/test_modularize.py
-"""
 import contextlib
 import importlib.util
 import io
@@ -15,7 +9,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
-import modularize  # noqa: E402
+import modularize
 
 FILES = {
     "shared/msg/__init__.py": "def pack(x):\n    return x + 1\n",
@@ -58,10 +52,10 @@ def main():
         code, out = run("imports", str(root))
         assert code == 1, out
         bad = [l for l in out.splitlines() if l.startswith("FORBIDDEN")]
-        assert len(bad) == 2 and all("control/bad" in l for l in bad), out  # cross-bundle + relative escape; json is stdlib
+        assert len(bad) == 2 and all("control/bad" in l for l in bad), out
         assert "must not import app/stt" in out and "relative import leaves" in out, out
 
-        if importlib.util.find_spec("pytest") is None:  # copytest runs pytest with this Python: the reason must show
+        if importlib.util.find_spec("pytest") is None:
             code, out = run("copytest", str(root), "control/hazard")
             assert code == 1 and "No module named pytest" in out, out
         else:
@@ -76,7 +70,7 @@ def main():
         assert code == 1, out
         assert any(l.startswith("OK\tcontrol/hazard") for l in out.splitlines()), out
         assert "MISSING\tapp/stt" in out and "not linked" in out, out
-        geo = next(l for l in out.splitlines() if "\tcontrol/geo\t" in l)  # each example names a schema file that exists
+        geo = next(l for l in out.splitlines() if "\tcontrol/geo\t" in l)
         assert geo.startswith("MISSING") and "a.json names no schema" in geo and "b.json names missing gone.json" in geo, out
     finally:
         shutil.rmtree(root, ignore_errors=True)

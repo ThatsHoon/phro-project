@@ -41,7 +41,6 @@ def config_dir():
 
 
 def sections(text, names):
-    """The named `## ` sections, in the order asked, each with its heading; frontmatter and CRLF do not matter."""
     text = re.sub(r"\A---\n.*?\n---\n", "", text.replace("\r\n", "\n"), flags=re.S)
     found = {}
     for part in re.split(r"(?m)^(?=## )", text):
@@ -51,7 +50,6 @@ def sections(text, names):
 
 
 def originals_enabled(cwd):
-    """True when a later settings file leaves ponytail or i-have-adhd enabled. Unreadable files count as empty."""
     plugins = {}
     for path in (config_dir() / "settings.json", Path(cwd or ".") / ".claude/settings.json",
                  Path(cwd or ".") / ".claude/settings.local.json"):
@@ -72,7 +70,6 @@ def is_off(session_id):
 
 
 def set_off(session_id, off):
-    """Marks this session off or on; False for an id that is not a plain token, which then stays on."""
     path = off_file(session_id)
     if not path:
         return False
@@ -85,7 +82,6 @@ def set_off(session_id, off):
 
 
 def prune(days=7):
-    """Drops off-markers older than `days`; only session-named files, nothing else in the folder."""
     folder = config_dir() / "phro-lean/off"
     cutoff = time.time() - days * 86400
     for path in folder.glob("*") if folder.is_dir() else []:
@@ -125,7 +121,6 @@ def handle(event):
 
 
 def reply_flags(text):
-    """(a list group of more than 5 top-level items, more than one question in the last paragraph)."""
     run = longest = 0
     for line in text.splitlines():
         run = run + 1 if LIST_ITEM.match(line) else 0
@@ -136,7 +131,6 @@ def reply_flags(text):
 
 
 def stats(folder, days):
-    """Rows per arm: sessions, replies, big_list, multi_question. Reads assistant text and hook attachments only."""
     cutoff = time.time() - days * 86400
     arms = {True: [0, 0, 0, 0], False: [0, 0, 0, 0]}
     for path in sorted(Path(folder).glob("*.jsonl")):

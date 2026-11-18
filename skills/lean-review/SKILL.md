@@ -11,6 +11,8 @@ Find what this change could lose. The best outcome for the diff is to get shorte
 
 Review the diff or path the user named. With none named, review `git diff HEAD` (staged and unstaged) plus the untracked files `git status --short` lists, and say so in the first line. Read the whole diff, and grep every caller of a function before suggesting its deletion. Read every comment in the reviewed lines too.
 
+When this session wrote the diff, hand the review to a fresh subagent with the paths and `${CLAUDE_PLUGIN_ROOT}/skills/lean-review/SKILL.md`, since an author defends what it wrote. Check each finding it returns against the code before you report it.
+
 ## Format
 
 One line per finding: `<file>:L<line>: <tag> <what>. <replacement>.` (drop `<file>:` for a one-file diff).
@@ -22,7 +24,7 @@ One line per finding: `<file>:L<line>: <tag> <what>. <replacement>.` (drop `<fil
 | `native:` | a dependency or code doing what the platform already does | name the feature |
 | `yagni:` | an abstraction with one implementation, config nobody sets, a layer with one caller | inline it |
 | `shrink:` | the same logic in more lines than needed | show the shorter form |
-| `comment:` | a comment outside the exceptions below, or a `lean:`, `ponytail:`, `TODO`, `FIXME` or `HACK` marker | nothing, or a rename or extraction that makes the code say it; for a marker, the work it names done now |
+| `comment:` | a comment outside the exceptions below, or a `lean:`, `ponytail:`, `TODO`, `FIXME` or `HACK` marker | nothing, or a rename or extraction that makes the code say it; for a comment that guards a constraint, the test, assertion or type that enforces it; for a marker, the work it names done now |
 
 Examples, one per tag:
 - `cache.py:L52-71: delete: retry wrapper around an idempotent local call. Nothing replaces it.`
@@ -37,6 +39,6 @@ End with `net: -<N> lines possible.` When there is nothing to cut, say `Lean alr
 ## Boundaries
 
 - Over-engineering only. Correctness bugs, security holes and performance are out of scope; point them to a normal review.
-- Comments that stay: a license header; behavior forced by an outside dependency, platform or protocol that the code cannot show, with its issue or spec link; a public API's documented contract. Every other comment is a finding, since a comment that records a shortcut or a limit becomes the reason later work keeps it.
+- Comments that stay: a license header; behavior forced by an outside dependency, platform or protocol that the code cannot show, with its issue or spec link; a public API's documented contract. Every other comment is a finding, since a comment that records a shortcut or a limit becomes the reason later work keeps it. When unsure an exception applies, it is a finding.
 - The one runnable check that lean's Build rules leave behind is never flagged.
 - Does not apply the fixes; it only lists them.

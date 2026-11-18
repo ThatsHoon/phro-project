@@ -19,7 +19,7 @@ import time
 import warnings
 from pathlib import Path
 
-warnings.filterwarnings("ignore", category=SyntaxWarning)  # parsing other people's code should not print about it
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".phro-project", ".idea", ".vscode", "site-packages", ".cache"}
 SCRIPT = {".py", ".js", ".ts", ".tsx", ".jsx", ".cjs", ".mjs", ".sh", ".ps1", ".bat", ".cmd"}
@@ -30,7 +30,7 @@ CONFIG = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
 TEXT = SCRIPT | WEB | DOC | CONFIG
 MAX_READ = 1_500_000
 MAX_LINE = 2000
-BULK_FILES = 200  # a folder with this many files and almost no code is data, moved whole and not read
+BULK_FILES = 200
 HARD = {"import", "js", "path"}
 SHOWN = 12
 STATE = ".phro-project/restructure"
@@ -65,7 +65,6 @@ def sha(data):
 
 
 def logic_sha(text):
-    """A file's hash without import lines, comments and blanks: it moves only when behaviour may have changed."""
     return sha("\n".join(line.strip() for line in text.splitlines() if not LOGIC_SKIP.match(line)).encode("utf-8"))
 
 
@@ -74,7 +73,6 @@ def read_text(path):
 
 
 def dotted(rel):
-    """The module name of a project path from the root, or None when a folder name cannot be imported."""
     parts = rel.split("/")
     if parts[-1].endswith(".py"):
         parts[-1] = parts[-1][:-3]
@@ -84,7 +82,6 @@ def dotted(rel):
 
 
 def check_also(root, also):
-    """A move here rewrites the text under --also, so folders shared by every project and other projects' folders are refused."""
     claude = Path.home().resolve() / ".claude"
     projects = claude / "projects"
     mine = projects / re.sub(r"[^A-Za-z0-9]", "-", str(Path(root).resolve()))
@@ -96,7 +93,6 @@ def check_also(root, also):
 
 
 class Scan:
-    """The project as read now: files, folders, and every reference that resolves to one of them."""
 
     def __init__(self, root, also=()):
         self.root = Path(root).resolve()
@@ -233,7 +229,6 @@ class Scan:
                 consider(found.start(1), found.end(1))
 
     def resolve(self, src, token, is_js, prefixed=False):
-        """(target, how, form) for a path-like token, or None. A token only counts when the target exists, which is what keeps this precise."""
         if prefixed and self.known(posixpath.normpath(token)):
             return posixpath.normpath(token), "path", "root"
         if src.startswith("also:"):
@@ -330,7 +325,7 @@ def clusters(scan):
 
     code = {f for f, (kind, _) in scan.files.items() if kind in ("code", "web")}
     for e in scan.edges:
-        real = e["how"] in ("import", "import~", "js") or (e["how"] == "path" and scan.files.get(e["src"], ("",))[0] == "web")  # a path string in a script may be a comment
+        real = e["how"] in ("import", "import~", "js") or (e["how"] == "path" and scan.files.get(e["src"], ("",))[0] == "web")
         if real and e["src"] in code and e["dst"] in code and e["src"] != e["dst"]:
             parent[find(e["src"])] = find(e["dst"])
     groups = collections.defaultdict(list)
@@ -453,7 +448,6 @@ def validate(root, moves):
 
 
 def between(target, start):
-    """A relative path inside the project, independent of the working folder."""
     return posixpath.relpath("/" + target, "/" + start)
 
 
@@ -462,7 +456,6 @@ def same_position(edge, src, dst):
 
 
 def new_token(edge, mapped):
-    """The replacement for a path token after the moves, or None when it stays right. A token that still points the same way keeps its spelling."""
     src, dst = mapped(edge["src"]), mapped(edge["dst"])
     old = edge["token"]
     plain = old.replace("\\\\", "/").replace("\\", "/")
@@ -491,12 +484,11 @@ def new_token(edge, mapped):
 
 
 def import_change(edge, mapped):
-    """(old module text, new module text, form) for a Python import, or a string with the reason it needs a person. None when it stays right."""
     src, dst = mapped(edge["src"]), mapped(edge["dst"])
     base = edge["base"]
     if src == edge["src"] and dst == edge["dst"]:
         return None
-    if base in ("dir", "rel", "hack") and same_position(edge, src, dst):  # a whole subproject moved: its own import root moved with it
+    if base in ("dir", "rel", "hack") and same_position(edge, src, dst):
         return None
     if base in ("root", "hack") and dst == edge["dst"]:
         return None
@@ -541,7 +533,6 @@ def rewrite_import(line, change):
 
 
 def compute(scan, moves):
-    """Per-file edits for a plan: {src: {line: {"spans": [...], "imports": [...]}}}, plus what a person must fix."""
     mapped = mapper(moves)
     edits = collections.defaultdict(lambda: collections.defaultdict(lambda: {"spans": [], "imports": []}))
     manual = []
@@ -565,7 +556,6 @@ def compute(scan, moves):
 
 
 def fragile_lines(scan, moves, mapped):
-    """Code that computes paths and may break silently: depth-sensitive lines in moved files, and any such line that names a moved folder."""
     words = {part for key in moves for part in key.split("/") if len(part) > 1}
     named = re.compile(r"(?<![\w\-])(?:" + "|".join(map(re.escape, sorted(words, key=len, reverse=True))) + r")(?![\w\-])") if words else None
     out, texts = [], {}
@@ -605,7 +595,6 @@ def apply_edits(text, per_line, manual, src):
 
 
 def move_tree(root, old, new, done):
-    """Rename, merging into a folder that exists. `done` records each real rename, so undo reverses exactly what happened."""
     source, target = root / old, root / new
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.is_dir() and source.is_dir():
@@ -632,7 +621,6 @@ def reverse_moves(root, done):
 
 
 def moved_sources(root, patterns, moves):
-    """Source patterns of core.json after the moves. They are globs, so the reference scan cannot see them, and a pattern left behind means later edits never mark a document stale. Call it before moving, since it reads what each move takes along."""
     mapped = mapper(moves)
     out = []
     for pattern in patterns:
@@ -645,7 +633,6 @@ def moved_sources(root, patterns, moves):
         out.append("/".join(filter(None, [mapped(prefix), tail])))
         wanted = pattern if tail else pattern.rstrip("/") + "/*"
         for old, new in moves.items():
-            # A move out from under the pattern takes files it covered somewhere it no longer reaches.
             if not prefix or not old.startswith(prefix + "/") or new.startswith(mapped(prefix) + "/"):
                 continue
             path = root / old
@@ -658,7 +645,6 @@ def moved_sources(root, patterns, moves):
 
 
 def moved_manifest(root, original, current, moves):
-    """The text of core.json after the moves. Patterns come from the original, since the reference rewrite may already have moved a plain path. A manifest this cannot read stays as it is, and compass reports it."""
     try:
         manifest = json.loads(current)
         changed = False
@@ -807,7 +793,7 @@ def command_verify(args):
     found["syntax"] = [f"{a}\t{b}" for a, b in syntax_errors(root, scan, {f for f in touched if f in scan.files})]
     keys = [k for k in journal["moves"] if not (root / k).exists()]
     paths = [k for k in keys if "/" in k or "." in k]
-    names = [k for k in keys if k not in paths]  # a one-word folder counts only as ROOT / "scripts" or as a path prefix, as in scripts/<name>.py
+    names = [k for k in keys if k not in paths]
     pieces = []
     if paths:
         pieces.append(r"(?:(?<![\w.\-/])|(?<=\}/))(?:" + "|".join(map(re.escape, sorted(paths, key=len, reverse=True))) + r")(?![\w\-])")

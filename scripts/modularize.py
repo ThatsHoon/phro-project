@@ -40,7 +40,6 @@ def py_files(folder):
 
 
 def imported(path, root):
-    """Project-relative module paths ('control/geo/grid') this file imports; relative imports resolved."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (SyntaxError, UnicodeDecodeError):
@@ -138,8 +137,6 @@ def cmd_copytest(a):
 
 
 def schema_links(name, data, schema_dir):
-    """An example names the schema it follows: "schema": "<file>" for the whole example, or {"input": "<file>", ...}
-    per part. The feature's own contract test validates the example against it (jsonschema lives in its requirements)."""
     ref = data.get("schema") if isinstance(data, dict) else None
     files = [ref] if isinstance(ref, str) else list(ref.values()) if isinstance(ref, dict) else []
     if not files:

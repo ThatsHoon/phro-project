@@ -1,7 +1,3 @@
-"""Seeded-defect test: a clean docs/core passes, each planted defect is found, and the hook stays silent without docs/core.
-
-Run: python -I -X utf8 tests/test_compass.py
-"""
 import json
 import os
 import re
@@ -14,7 +10,7 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/compass.py"
 sys.path.insert(0, str(SCRIPT.parent))
-import compass  # noqa: E402
+import compass
 
 GOALS = "# 목표\n\n## 최종 목표\n\n> 2026-11-05 사용자: 결제 API 다섯 개를 안정화한다\n\n## 중기 목표\n\n- 정산 먼저\n"
 
@@ -87,6 +83,12 @@ def demo():
             clean(d)
             plant(d)
             assert kind in kinds(d), (kind, compass.lint(d))
+            ran = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "lint", d], capture_output=True, text=True, encoding="utf-8")
+            rows = [line.split("\t") for line in ran.stdout.splitlines()[:-1]]
+            assert rows and all(len(r) == 4 and len(r[3]) > 10 and r[3] == compass.FIX[r[0]] for r in rows), ran.stdout
+    import inspect
+    emitted = set(re.findall(r'\(\("([a-z-]+)"', inspect.getsource(compass)))
+    assert emitted == set(compass.FIX), emitted ^ set(compass.FIX)
 
     with tempfile.TemporaryDirectory() as d:
         clean(d)
@@ -244,7 +246,7 @@ def demo():
             write(d, rel, "x\n")
             os.utime(Path(d) / rel, (future, future))
         assert dict(compass.elsewhere(d, compass.load(d))[0]) == {"demo/twin": 2, "demo": 1, ".": 1}, "folders only, without sources, skipped folders, docs/core or a venv"
-        for _ in range(2):  # running status by hand must not use up what the next refresh sees
+        for _ in range(2):
             said = status(d)
             assert "elsewhere\tdemo/twin\t2 changed" in said and "ELSEWHERE\t4\n" in said and said.endswith("STALE\t1\n"), said
         for number in range(compass.SHOWN):
@@ -355,6 +357,7 @@ def resume_once():
         assert "바뀐 줄" in compass.session_text(d, "resume", "s1"), "a changed index is sent again"
         compact = compass.session_text(d, "compact", "s1")
         assert "바뀐 줄" in compact and "stated it as one" in compact and "outlasts this task" in compact, compact
+        assert "check it on the real artifact" in compact and "only what the user said or a file shows" in compact, compact
     ran = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "debt", "."], capture_output=True, text=True, encoding="utf-8")
     assert ran.returncode != 0, "the debt command is gone"
 

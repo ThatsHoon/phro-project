@@ -1,7 +1,3 @@
-"""lean hook: what each event injects, the size limits, the guard against the original plugins, and the fixed rules in the skill texts.
-
-Run: python -I -X utf8 tests/test_lean.py
-"""
 import json
 import os
 import subprocess
@@ -16,7 +12,6 @@ sys.path.insert(0, str(SCRIPT.parent))
 
 
 def run(event, config, cwd):
-    """Runs the hook as Claude Code does; returns (exit code, stdout)."""
     env = dict(os.environ, CLAUDE_CONFIG_DIR=str(config))
     data = event if isinstance(event, str) else json.dumps(event)
     res = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "hook"], input=data, capture_output=True,
@@ -212,7 +207,6 @@ def lean_review_rules():
 
 
 def review_fixes():
-    """Final-review fixes: each phrase pins one finding."""
     has_all("skills/lean/SKILL.md", ("Ask a question at most once",
                                      "never drop a finding to fit",
                                      "when you can write files and the brief allows it",
@@ -231,6 +225,32 @@ def comment_rules():
     compass_skill = (ROOT / "skills/compass/SKILL.md").read_text(encoding="utf-8")
     assert "debt" not in compass_skill and "(hook: guard.py)" in compass_skill
     assert "5b. A repeated mistake" in (ROOT / "skills/design/SKILL.md").read_text(encoding="utf-8")
+
+
+def evidence_rules():
+    import lean
+    text = SKILL.read_text(encoding="utf-8")
+    main, sub, report = lean.main_text(), lean.sections(text, lean.SUB), lean.sections(text, ["Report"])
+    for s in ("A guard, retry, fallback or swallowed error that makes the symptom go away is not a fix",
+              "write the premise down and test it directly before a third",
+              "move every caller and delete the old path in the same change",
+              "stays only if a run shows it helped",
+              "seen failing once on broken code before it counts",
+              "checked on the real artifact before you build on it or report it",
+              "the check that shows done, the proof to return"):
+        assert s in main and s in sub, s
+    for s in ("the check that will show it done", "never loosen it to finish", "A choice that is cheap to undo is yours",
+              "Never hand the user a check you could run", "ran it, read it (file:line) or inferred",
+              "agreeing is not the default"):
+        assert s in main and s not in sub, s
+    for s in ("A check that could not run is inconclusive, not a pass", "gets one line, not a fix"):
+        assert s in report and s in sub and s not in main, s
+    assert "how to try it" not in text and "diagnostic question" not in text and "Quote only the log lines" not in text
+    has_all("skills/lean-review/SKILL.md", ("hand the review to a fresh subagent", "When unsure an exception applies, it is a finding",
+                                            "the test, assertion or type that enforces it"))
+    has_all("skills/grill/SKILL.md", ("A question that a quick run or prototype can settle is a fact too",))
+    has_all("skills/design/SKILL.md", ("the rule was the symptom", "names what is wrong, where, and the next step",
+                                       "stops the run before any side effect", "`echo-description`"))
 
 
 def resume_once():
@@ -295,7 +315,7 @@ def stats():
 
 CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules,
           toggle, copy_toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules, review_fixes,
-          comment_rules, resume_once, read_only_subagent, stats]
+          comment_rules, evidence_rules, resume_once, read_only_subagent, stats]
 
 
 def main():

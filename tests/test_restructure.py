@@ -1,7 +1,3 @@
-"""A small real project moved end to end: its own test passes before and after, verify catches a planted break, undo restores every byte.
-
-Run: python -I -X utf8 tests/test_restructure.py
-"""
 import hashlib
 import json
 import os
@@ -18,7 +14,7 @@ HERE = Path(__file__).resolve().parents[1]
 SCRIPT = HERE / "scripts/restructure.py"
 TEMPLATE = HERE / "skills/restructure/references/test_structure.py"
 sys.path.insert(0, str(SCRIPT.parent))
-import restructure  # noqa: E402
+import restructure
 
 FILES = {
     "run.py": 'from lib.util import f\nfrom lib import helper\nimport json\nif __name__ == "__main__":\n    print(f(), helper.g(), json.load(open("data/table.json"))["a"])\n',
@@ -215,7 +211,7 @@ def demo():
             if rel.startswith("misc/"):
                 path.parent.rmdir()
         assert check().returncode == 0
-        nested = root / ".worktrees/branch/services/e.py"  # a git worktree inside the project holds its own copy
+        nested = root / ".worktrees/branch/services/e.py"
         nested.parent.mkdir(parents=True)
         nested.write_text("import sys\nsys.path.insert(0, '.')\n", encoding="utf-8")
         assert check().returncode == 0, "dot folders (.worktrees, .claude, ...) are not the project's code: " + check().stderr[-300:]
@@ -297,7 +293,7 @@ def demo():
         assert sources[0]["sources"] == ["~memory"], sources
         assert sources[1]["sources"] == ["src/*.py", "lib/deep/*.py", "lib/single.py", "web/app.py", "training/run.py", "training", "other/*.py", "*.toml"], sources
         lint = compass(root, "lint")
-        assert lint.stdout.splitlines() == ["dead-source\tfeatures/app.md\tsrc/*.py", "FINDINGS\t1"], lint.stdout
+        assert lint.stdout.splitlines() == ["dead-source\tfeatures/app.md\tsrc/*.py\tpoint the pattern at where those files are now, or remove it", "FINDINGS\t1"], lint.stdout
         manifest = json.loads((root / "docs/core/core.json").read_text(encoding="utf-8"))
         manifest["docs"][1]["sources"].remove("src/*.py")
         (root / "docs/core/core.json").write_text(json.dumps(manifest), encoding="utf-8")

@@ -1,8 +1,4 @@
-"""Whether a session already holds a hook's text. Standard library only.
-
-A resumed session keeps what SessionStart printed before, so printing the same text again adds it twice. Each hook
-records a hash per session and part; on a resume, an unchanged part is skipped and a changed one prints.
-"""
+"""A resumed session keeps what SessionStart printed before, so printing the same text again adds it twice."""
 import hashlib
 import os
 import re
@@ -18,7 +14,6 @@ def folder():
 
 
 def needed(session_id, part, text, source):
-    """False only on a resume whose session last received this exact text. Records the text whenever it is sent."""
     if not text or not session_id or not TOKEN.fullmatch(session_id):
         return bool(text)
     path = folder() / f"{session_id}.{part}"

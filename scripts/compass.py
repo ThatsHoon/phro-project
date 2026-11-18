@@ -30,7 +30,6 @@ SHOWN_DOCS = 30
 DOC_SUFFIXES = {".md", ".rst", ".adoc"}
 DRIFT_CHARS = 200
 
-# The same lists as the style check in phro-search, cut to what a reference document can trip on.
 MARKS = ["Generated with", "Co-Authored-By", "Written by Claude", "AI-generated", "as an AI", "Claude가 작성", "AI가 작성", "AI 요약", "언어 모델로서",
          "알아보겠습니다", "살펴보겠습니다", "결론적으로", "요약하자면", "정리하자면", "혁신적", "획기적", "게임 체인저", "게임체인저", "패러다임 전환",
          "in conclusion", "in summary", "to summarize", "worth noting", "important to note", "game-changer", "groundbreaking", "revolutionary", "cutting-edge"]
@@ -67,7 +66,6 @@ def walk(start, skip):
 
 
 def source_files(root, pattern, skip):
-    """Files behind one source pattern. Walks only below the pattern's literal prefix, since a project can hold 200k files."""
     if pattern == "~memory":
         yield from memory_dir(root).glob("*.md")
         return
@@ -89,7 +87,6 @@ def source_files(root, pattern, skip):
 
 
 def stale(root, manifest):
-    """Rows of (doc, changed source paths, days since review, never reviewed)."""
     skip = set(manifest.get("skip", []))
     reviewed = manifest.get("reviewed", {})
     core = Path(root) / CORE
@@ -100,7 +97,7 @@ def stale(root, manifest):
         changed = []
         for pattern in doc.get("sources", []):
             for path in source_files(root, pattern, skip):
-                if path.is_relative_to(core):  # a refresh edits these after the review time it records
+                if path.is_relative_to(core):
                     continue
                 try:
                     if path.stat().st_mtime > since:
@@ -112,7 +109,6 @@ def stale(root, manifest):
 
 
 def elsewhere(root, manifest):
-    """Changed files that no document's sources cover, since the oldest review: a count per folder, and the documents among them, newest first. Sources stay narrow, so this is where a refresh sees work and writing outside the core documents."""
     since = min(manifest.get("reviewed", {}).values(), default=None)
     counts, documents = collections.Counter(), []
     if since is None:
@@ -134,13 +130,28 @@ def elsewhere(root, manifest):
 
 
 def goal_section(text):
-    """The first level-2 section of goals.md: the final goal, in the user's own words."""
     found = re.search(r"^## .*?(?=^## |\Z)", text, re.M | re.S)
     return found.group(0).strip() if found else ""
 
 
 def sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+FIX = {
+    "missing": "write the document, or remove it from core.json",
+    "long": "move the detail into the document it points to, or cut what does not change a decision",
+    "hidden": "remove the hidden text and tell the user, since no refresh wrote it",
+    "unlisted": "add one index line saying when to read it",
+    "dead-source": "point the pattern at where those files are now, or remove it",
+    "no-manifest": "add it to core.json with file, brief and sources, or delete it",
+    "watermark": "remove the mark",
+    "tell": "replace the character with plain text",
+    "history": "rewrite the line as what is true now",
+    "dated": "remove the date; git and the ledgers hold when",
+    "dead-path": "write the path it has now, or name a removed path without backticks",
+    "goal-changed": "restore the user's words, or pass --accept-goal after the user said so",
+}
 
 
 def path_findings(root, doc, text):
@@ -196,7 +207,7 @@ def lint(root, accept_goal=False):
         if name != "README.md" and len(text.splitlines()) > DOC_LINES:
             out.append(("long", name, f"{len(text.splitlines())} lines, limit {DOC_LINES}"))
         for line_no, line in enumerate(text.splitlines(), 1):
-            if line.lstrip().startswith(">"):  # the user's own words stay as they are
+            if line.lstrip().startswith(">"):
                 continue
             where = f"{name}:{line_no}"
             lowered = line.lower()
@@ -223,11 +234,11 @@ def stamp(root, names, accept_goal=False, drift=None):
     if found:
         return found
     manifest = load(root)
-    now = manifest.get("checked") or time.time()  # when status looked: a file saved since then was never read, so it stays stale
+    last_status_check = manifest.get("checked") or time.time()
     reviewed = manifest.setdefault("reviewed", {})
     for doc in manifest["docs"]:
         if not names or doc["file"] in names:
-            reviewed[doc["file"]] = now
+            reviewed[doc["file"]] = last_status_check
     goals = Path(root) / CORE / "goals.md"
     if goals.exists() and (accept_goal or not manifest.get("goal_sha")):
         manifest["goal_sha"] = sha(goal_section(goals.read_text(encoding="utf-8")))
@@ -239,7 +250,6 @@ def stamp(root, names, accept_goal=False, drift=None):
 
 
 def newer_original():
-    """For a project's copy of this plugin: what of the original is ahead of the copy (a commit or a version), by clone.py's own test."""
     try:
         record = json.loads((PLUGIN / "origin.json").read_text(encoding="utf-8"))
         spec = importlib.util.spec_from_file_location("phro_clone", PLUGIN / "scripts/clone.py")
@@ -252,11 +262,9 @@ def newer_original():
 
 
 def session_text(root, source=None, session_id=None):
-    """What a session receives. Reads two small files and never walks the project, so it stays fast everywhere.
-    On a resume that already holds this index unchanged, the preamble and the index are left out and the status lines stay."""
     core = Path(root) / CORE
     index = core / "README.md"
-    if not index.is_file() or not (core / "core.json").is_file():  # README.md alone may be another tool's docs/core
+    if not index.is_file() or not (core / "core.json").is_file():
         return ""
     text = index.read_text(encoding="utf-8-sig").strip()
     if HIDDEN.search(text):
@@ -295,7 +303,8 @@ def session_text(root, source=None, session_id=None):
         parts.append("A compaction just finished, and the summary above is this session's record. Before the next step, compare it with these documents. "
                      "If it shows the user settled or changed a goal, a design or a principle, ruled something out or adopted something, and the matching document in docs/core does not say so, update that document now: "
                      "only what outlasts this task and changes later work, stated as true now, no progress or numbers, and never the first section of goals.md unless the user said so. "
-                     "A preference seen once in the summary becomes a rule only when the user stated it as one. "
+                     "Take into them only what the user said or a file shows. A preference seen once in the summary becomes a rule only when the user stated it as one. "
+                     "A claim in the summary that something passes or is done is the earlier context's own word: check it on the real artifact before the next step relies on it. "
                      f"Then run: python -I -X utf8 {Path(__file__).resolve().as_posix()} lint {Path(root).as_posix()} and fix what it flags. If nothing needs changing, say nothing about it and go on.")
     return "\n\n".join(parts)
 
@@ -308,7 +317,7 @@ def hook():
         event = {}
     try:
         root = os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd") or "."
-        text = session_text(root, event.get("source"), event.get("session_id"))  # the queue rule comes from queue.py hook, which knows the session id
+        text = session_text(root, event.get("source"), event.get("session_id"))
     except Exception:
         return
     if text:
@@ -316,7 +325,6 @@ def hook():
 
 
 def usage(root):
-    """Reads of each core document in this project's own transcripts, leaving out sessions that ran stamp, since a refresh reads what it writes. A fork copies lines, so each event counts once. Counts only, never text."""
     core = Path(root).resolve() / CORE
     counts = {doc["file"]: 0 for doc in load(root)["docs"]}
     seen = set()
@@ -407,7 +415,7 @@ def main():
         return
     found = lint(args.root) if args.command == "lint" else stamp(args.root, args.files, args.accept_goal, args.drift)
     for row in found:
-        print("\t".join(row))
+        print("\t".join(row + (FIX[row[0]],)))
     print(f"FINDINGS\t{len(found)}" if found else "OK")
     sys.exit(1 if found else 0)
 

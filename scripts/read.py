@@ -1,4 +1,3 @@
-"""CLI for the document reader: convert | setup | formats | prune | hook."""
 import os
 import sys
 
@@ -8,7 +7,6 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _place(paths: list, here: str) -> list:
-    """`paths` without `here`, then `here` put just before the first site-packages entry (else last)."""
     key = os.path.normcase(here)
     rest = [p for p in paths if os.path.normcase(os.path.abspath(p or ".")) != key]
     for i, p in enumerate(rest):
@@ -19,15 +17,15 @@ def _place(paths: list, here: str) -> list:
 
 sys.path[:] = _place(sys.path, _HERE)
 
-import argparse  # noqa: E402
-import contextlib  # noqa: E402
-import json  # noqa: E402
-from pathlib import Path  # noqa: E402
+import argparse
+import contextlib
+import json
+from pathlib import Path
 
 READ_PY = Path(__file__).resolve()
 
-import reader  # noqa: E402
-from reader.limits import ReadError  # noqa: E402
+import reader
+from reader.limits import ReadError
 
 
 def _flat(x) -> str:
@@ -39,7 +37,6 @@ def _is_key(k) -> bool:
 
 
 def _pages(text):
-    """`A-B` with 1 <= A <= B, as (A, B)."""
     try:
         first, last = (int(x) for x in text.split("-"))
     except ValueError:
@@ -50,33 +47,26 @@ def _pages(text):
 
 
 def _engine_id(wanted) -> str:
-    """The engine id a file is read with. pdf: for --engine pdfium, when pypdfium2 imports (the venv child),
-    pyenv.engine_id_from_module(); otherwise native, so native output is never filed under a pdfium key. mpp: for
-    --engine mpxj, pyenv.engine_id_from_module("mpp") when this is a ready mpp venv's interpreter, else "" (no engine:
-    the file is unsupported)."""
     if wanted == "mpxj":
         try:
             from reader import pyenv
             return pyenv.engine_id_from_module("mpp")
-        except Exception:  # noqa: BLE001 - not the mpp venv (no ready.json, no mpxj): no engine
+        except Exception:
             return ""
     if wanted != "pdfium":
         return "native"
     try:
-        from reader import pyenv  # engine_id_from_module imports pypdfium2 itself
+        from reader import pyenv
         return pyenv.engine_id_from_module()
-    except Exception:  # noqa: BLE001 - not importable, or a broken install: read natively
+    except Exception:
         return "native"
 
 
-_VENV_KIND = {"pdf": "pdf", "mpp": "mpp", "mpt": "mpp"}  # extension -> the venv that reads it
+_VENV_KIND = {"pdf": "pdf", "mpp": "mpp", "mpt": "mpp"}
 _VENV_ENGINE = {"pdf": "pdfium", "mpp": "mpxj"}
 
 
 def _reexec(a):
-    """A pdf (or an mpp or mpt) with no --engine, while a READY pdf (mpp) venv exists and this is not its
-    interpreter: run the same convert there with --engine pdfium (mpxj) and relay its output. Returns the exit code,
-    or None to convert in this process (pdf natively; mpp raises unsupported)."""
     kind = _VENV_KIND.get(reader.ext_of(Path(a.file)))
     if a.engine is not None or kind is None:
         return None
@@ -102,7 +92,7 @@ def _reexec(a):
     cmd += ["--engine", _VENV_ENGINE[kind]]
     try:
         r = subprocess.run(cmd, capture_output=True)
-    except OSError:  # the venv interpreter cannot be launched: convert here (pdf natively; mpp is unsupported)
+    except OSError:
         return None
     sys.stdout.write(r.stdout.decode("utf-8", "replace"))
     if r.stderr:
@@ -133,7 +123,6 @@ def cmd_convert(a) -> int:
     if code is not None:
         return code
     try:
-        # a stray print in a format module must not reach the protocol stream
         with contextlib.redirect_stdout(sys.stderr):
             reader.precheck(src)
             opts, engine = {}, ""
@@ -144,14 +133,14 @@ def cmd_convert(a) -> int:
                 if a.pages:
                     opts["pages"] = a.pages
             elif fmt == "mpp" and a.engine == "mpxj":
-                engine = _engine_id("mpxj")  # "" outside the mpp venv: no engine, so the file is unsupported
+                engine = _engine_id("mpxj")
                 if engine:
                     opts["engine"] = "mpxj"
             if a.out:
                 out = Path(a.out)
                 reader.convert(src, out, a.hidden, **opts)
             else:
-                k = a.key if _is_key(a.key) else cache.key(src, engine)  # the gate passes the key it already worked out
+                k = a.key if _is_key(a.key) else cache.key(src, engine)
                 if "pages" in opts:
                     k += f"-p{a.pages[0]}-{a.pages[1]}"
                 if a.hidden:
@@ -161,8 +150,8 @@ def cmd_convert(a) -> int:
     except ReadError as e:
         print(f"FAIL	{e.kind}	{_flat(e.detail)}")
         return 1
-    except Exception as e:  # noqa: BLE001
-        print(f"FAIL	damaged	internal error {type(e).__name__}")  # the message may quote document text
+    except Exception as e:
+        print(f"FAIL	damaged	internal error {type(e).__name__}")
         return 1
     return 0
 
@@ -188,7 +177,7 @@ def cmd_hook(a) -> int:
         return 0
     try:
         out = gate.decide(event)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         p = gate.scope(event)
         out = gate.deny_text(p, f"damaged: internal error {type(e).__name__}") if p else None
     if out is not None:

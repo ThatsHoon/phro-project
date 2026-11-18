@@ -1,7 +1,3 @@
-"""The work queue: tickets in their own git repo, one-path commits, no re-asking, the third return, the board.
-
-Run: python -I -X utf8 tests/test_queue.py
-"""
 import json
 import os
 import re
@@ -24,7 +20,7 @@ CLOSE_OR_SHRINK = "Close this ticket or shrink it to one step?"
 
 A = "aaaaaaaa-1111-4111-8111-111111111111"
 B = "bbbbbbbb-2222-4222-8222-222222222222"
-HOME = Path(tempfile.mkdtemp())  # transcripts live under a fake home, never the real one
+HOME = Path(tempfile.mkdtemp())
 ENV = {**os.environ, "HOME": str(HOME), "USERPROFILE": str(HOME), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 ENV.pop("CLAUDE_PROJECT_DIR", None)
@@ -48,7 +44,7 @@ def transcript(root, sid, title=None, mtime=None):
     folder = HOME / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path(root).resolve()))
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{sid}.jsonl"
-    filler = json.dumps({"type": "user", "text": "x" * 70000})  # pushes an early title out of the 64 KB tail
+    filler = json.dumps({"type": "user", "text": "x" * 70000})
     lines = [json.dumps({"type": "custom-title", "customTitle": "old title"}), filler]
     if title:
         lines.append(json.dumps({"type": "custom-title", "customTitle": title, "sessionId": sid}))
@@ -95,7 +91,7 @@ def test_init():
     assert len(git(root, "log", "--oneline").splitlines()) == 1
     assert "queue/" in (root / ".git/info/exclude").read_text(encoding="utf-8")
     status = subprocess.run(["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True).stdout
-    assert "?? queue/" not in status.splitlines() and "?? src/" in status.splitlines(), status  # only the top queue/ is hidden
+    assert "?? queue/" not in status.splitlines() and "?? src/" in status.splitlines(), status
     again = q(root, "init")
     assert again.returncode == 0 and len(git(root, "log", "--oneline").splitlines()) == 1
     return root
@@ -348,7 +344,7 @@ def test_hook_routing():
     assert f"--session {A}" in start and queue_py in start, start
     commands = [c.split(" <")[0] for c in re.findall(r"`([^`]*queue\.py[^`]*)`", start)]
     assert len(commands) == 4, start
-    for c in commands:  # each command the rule gives must parse as written
+    for c in commands:
         ran = subprocess.run(shlex.split(c) + ["--help"], capture_output=True, text=True, encoding="utf-8", env=ENV)
         assert ran.returncode == 0 and "usage:" in ran.stdout, c + ran.stderr
     t = path_of(ask(root, title="Pick a backbone"))
@@ -397,7 +393,7 @@ def test_sessions_repair():
     root = fresh()
     transcript(root, A)
     transcript(root, B)
-    transcript(root, "aaaaaaaa-9999-4999-8999-999999999999")  # shares A's 8-character prefix
+    transcript(root, "aaaaaaaa-9999-4999-8999-999999999999")
     made = [path_of(ask(root, title=f"t{i}")) for i in range(4)]
     for path, value in zip(made, (f"local_{B}", B[:8], "aaaaaaaa", "s1")):
         path.write_text(path.read_text(encoding="utf-8").replace(f"session: {A}", f"session: {value}"), encoding="utf-8")
@@ -448,8 +444,8 @@ def test_board_sessions():
     t_b = path_of(ask(root, title="for b", session=B))
     path_of(ask(root, title="for gone", session=gone))
     asked = t_a.stat().st_mtime
-    transcript(root, A, title="Fire model work", mtime=asked + 900)  # wrote well after the ask
-    transcript(root, B, mtime=t_b.stat().st_mtime - 10)  # stopped right after asking, no title
+    transcript(root, A, title="Fire model work", mtime=asked + 900)
+    transcript(root, B, mtime=t_b.stat().st_mtime - 10)
     data = json.loads(q(root, "board").stdout and (root / "queue/board.json").read_text(encoding="utf-8"))
     rows = {t["title"]: t for t in data["tickets"]}
     assert data["sessions"][A]["title"] == "Fire model work", "the last custom-title, read from the tail"

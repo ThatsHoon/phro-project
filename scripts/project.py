@@ -37,16 +37,16 @@ PATH_REF = re.compile(r"(?<![\w./-])((?:references|scripts|hooks|agents|skills|c
 MD_LINK = re.compile(r"\]\(([^)#:\s<>]+\.\w+)\)")
 IMPORT = re.compile(r"^\s*(?:from|import)\s+(\w+)", re.M)
 STOP = set("the and for with use when this that from not you your any are can into only about all its it's run runs used using skill skills user users asks wants whenever even".split())
-PROMPT_MIN, PROMPT_MAX = 10, 200  # shorter is a mode word, longer is usually pasted material
+PROMPT_MIN, PROMPT_MAX = 10, 200
 TOOLS = "[Read, Glob, Grep, WebSearch, Skill]"
-ROUTE_CASES = "tests/route_cases.json"  # routing cases that live in the plugin count as evals, one node for the file
-PROJECT_PARTS = ("skills", "agents", "commands", "tests")  # a project's .claude also holds settings and worktrees, which are not capabilities
+ROUTE_CASES = "tests/route_cases.json"
+PROJECT_PARTS = ("skills", "agents", "commands", "tests")
 STEP_TOOLS = "[Read, Glob, Grep, WebSearch, Write, Edit, Skill]"
-STEP_TURNS = 10  # a step-triggered case has to do the step first
+STEP_TURNS = 10
 FETCHERS = {"npx", "bunx", "uvx", "pipx"}
 PINNED = re.compile(r"(?:@|==)v?\d[\w.+-]*$")
 LEAK = re.compile(r"\b(?:evals?|evaluation|judge[sd]?|grader?s?|rubrics?|benchmarks?|candidates?|test case|this is a test)\b|평가|채점|시험 삼아|테스트용|벤치마크", re.I)
-# From code.claude.com/docs/en/skills and /hooks, read 2026-11-11. A key or event Claude Code does not know is ignored without an error.
+# From code.claude.com/docs/en/skills and /hooks. A key or event Claude Code does not know is ignored without an error.
 SKILL_KEYS = set("name description when_to_use argument-hint arguments disable-model-invocation user-invocable allowed-tools "
                  "disallowed-tools model effort context agent background hooks paths shell metadata license compatibility version".split())
 HOOK_EVENTS = set("SessionStart Setup UserPromptSubmit UserPromptExpansion PreToolUse PermissionRequest PermissionDenied PostToolUse "
@@ -61,7 +61,6 @@ def tokens(text):
 
 
 def plugin_root(path):
-    """A plugin folder as given. A project root means its .claude: its skills live there, and the root can hold 200k files."""
     path = Path(path).resolve()
     if not (path / ".claude-plugin").exists() and not (path / "skills").is_dir() and (path / ".claude/skills").is_dir():
         return path / ".claude"
@@ -88,7 +87,6 @@ def frontmatter(text):
 
 
 def user_only(fields):
-    """Only the user can call this skill, so it has no listing cost and nothing for routing to measure."""
     return fields.get("disable-model-invocation") == "true"
 
 
@@ -114,7 +112,6 @@ def classify(rel):
 
 
 def scan(root):
-    """Return (database, plugin name, {node id: text}, {node id: source files})."""
     root = Path(root).resolve()
     manifest_path = root / ".claude-plugin/plugin.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
@@ -133,7 +130,6 @@ def scan(root):
         sources[node].append(rel)
         if path.suffix in TEXT:
             texts[node] += path.read_text(encoding="utf-8", errors="replace") + "\n"
-    # MCP servers are nodes of their own, so a server's script has a dependent.
     servers = manifest.get("mcpServers") if isinstance(manifest.get("mcpServers"), dict) else {}
     if (root / ".mcp.json").exists():
         loaded = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
@@ -186,7 +182,6 @@ def add_edges(db, plugin, kinds, texts, sources):
 
 
 def usage(directory, plugin):
-    """Typed commands and model Skill calls per skill, or None without any transcript, which is not a count of zero. Forked sessions copy lines, so every event counts once by uuid. Counts only, no text."""
     typed, model, reads, seen = collections.Counter(), collections.Counter(), collections.Counter(), set()
     paths = list(Path(directory).rglob("*.jsonl"))
     if not paths:
@@ -204,7 +199,7 @@ def usage(directory, plugin):
                 continue
             seen.add(uid)
             content = (e.get("message") or {}).get("content")
-            if e.get("type") == "assistant" and isinstance(content, list):  # a subagent reading a reference uses it too
+            if e.get("type") == "assistant" and isinstance(content, list):
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Read":
                         reads[str((b.get("input") or {}).get("file_path", "")).replace("\\", "/")] += 1
@@ -230,13 +225,11 @@ def usage(directory, plugin):
 
 
 def references(sources, kinds):
-    """A skill's own documents other than SKILL.md: read on demand, so a reference nobody reads costs upkeep for nothing."""
     return sorted(rel for node, files in sources.items() if kinds.get(node) == "doc" for rel in files
                   if rel.startswith("skills/") and rel.endswith(".md") and Path(rel).name not in ("SKILL.md", "CONTRACT.md"))
 
 
 def fetched_package(entry):
-    """The package an MCP server entry fetches from a registry at start, or None for a local command."""
     command = re.sub(r"\.(?:cmd|exe)$", "", Path(str(entry.get("command", ""))).name.lower())
     args = [str(x) for x in entry.get("args") or []]
     if command not in FETCHERS:
@@ -247,8 +240,33 @@ def fetched_package(entry):
     return next((x for x in args if not x.startswith("-") and x != "run"), None)
 
 
+FIX = {
+    "broken-ref": "write the path it has now, or remove the mention",
+    "duplicate-file": "keep one and point the others at it, unless the copy is deliberate",
+    "shared-lines": "move the shared lines into one file both read, or cut them from one",
+    "orphan": "delete it, or name it where it is used",
+    "mcp-unpinned": "pin an exact version",
+    "hook-config": "use a known event and give every command a timeout",
+    "leaky-case": "rewrite the prompt as a user would type it, without measurement words",
+    "unknown-frontmatter": "remove the key, or spell it as Claude Code reads it",
+    "no-eval": "add cases to tests/route_cases.json as the design skill describes",
+    "no-description": "write one: what it does in a clause, then the words users type",
+    "long-description": "cut it below the limit",
+    "long-body": "move detail into a references file the body points to",
+    "echo-description": "delete the repeated sentence from the body",
+    "overlap-candidate": "read both descriptions; fix the overlap, or merge them if one real request fits both",
+    "never-called": "check that the transcripts span the skill's life, then sharpen its description or remove it",
+    "never-read": "put what it holds where it is needed, or delete it",
+    "unmeasured": "pass --usage with this project's transcripts folder",
+}
+
+
+def echoed(description, body):
+    flat = " ".join(body.split())
+    return [x for x in re.split(r"(?<=[.!?])\s+", " ".join(description.split())) if len(x) >= 40 and x in flat]
+
+
 def case_findings(root):
-    """Routing prompts and quality prompts that tell the model it is being measured, which changes how it behaves."""
     out = []
     try:
         cases = json.loads((root / ROUTE_CASES).read_text(encoding="utf-8"))
@@ -266,7 +284,6 @@ def case_findings(root):
 
 
 def hook_findings(root):
-    """hooks/hooks.json entries Claude Code would skip, or that can hold a session for the default timeout."""
     path = root / "hooks/hooks.json"
     if not path.exists():
         return []
@@ -291,11 +308,9 @@ def findings(root, usage_dir=None):
     out = []
     nodes = db.execute("select id, kind, description, desc_tokens from node").fetchall()
     kinds = {n[0]: n[1] for n in nodes}
-    # Broken references, in the files that run. Docs and tests may mention what no longer exists on purpose.
     every = [rel for files in sources.values() for rel in files]
     instructions = {rel for node, files in sources.items() if kinds[node] in ("skill", "agent", "command", "config") for rel in files}
     for rel in every:
-        # Reference documents quote examples of other projects' files, so only files that are followed directly count.
         scripted = rel.startswith(("skills/", "scripts/", "hooks/")) and Path(rel).suffix in {".py", ".js", ".ts", ".tsx", ".cjs", ".mjs", ".sh", ".ps1"}
         if rel not in instructions and not scripted:
             continue
@@ -303,14 +318,11 @@ def findings(root, usage_dir=None):
         named = set(PATH_REF.findall(text))
         links = set(MD_LINK.findall(text)) if rel.endswith(".md") else set()
         for ref in sorted(named | links):
-            # A script's comment may name a skill's file relative to that skill, so any file ending in the path counts.
             found = (root / ref).exists() or ((root / rel).parent / ref).exists() or any(f.endswith("/" + ref) for f in every)
-            # A link into a folder this plugin does not have is an example about the user's project, not a reference.
             head = ref.removeprefix("./").split("/")[0]
             example = ref not in named and "/" in ref and not (root / head).exists() and not ((root / rel).parent / head).exists()
             if not found and not example:
                 out.append(("broken-ref", rel, ref))
-    # Whole-file duplicates, then lines copied between instruction files.
     by_hash = collections.defaultdict(list)
     for node, files in sources.items():
         if kinds[node] == "eval":
@@ -327,14 +339,12 @@ def findings(root, usage_dir=None):
             shared = len(long_lines[a] & long_lines[b])
             if shared >= SHARED_LINES_MIN:
                 out.append(("shared-lines", a, f"{b}: {shared} lines"))
-    # Parts nothing reaches.
     reached = {r[0] for r in db.execute("select distinct dst from edge")}
     for node, kind in kinds.items():
         path = sources[node][0] if sources[node] else ""
         runs = path.startswith(("skills/", "scripts/", "hooks/")) and (kind == "script" or (kind == "doc" and path.endswith(".md")))
         if runs and node not in reached and Path(path).name not in ("__init__.py", "README.md", "CONTRACT.md"):
             out.append(("orphan", node, "no file refers to it"))
-    # An MCP server fetched by name runs whatever version is newest at each start, not the one that was reviewed.
     for node, kind in kinds.items():
         package = fetched_package(json.loads(texts[node])) if kind == "mcp" else None
         if package and not PINNED.search(package):
@@ -356,6 +366,7 @@ def findings(root, usage_dir=None):
             out.append(("long-description", node, f"{len(description)} chars, cut at {LISTING_LIMIT}"))
         if tokens(frontmatter(texts[node])[1]) > LONG_BODY_TOKENS:
             out.append(("long-body", node, f"over about {LONG_BODY_TOKENS} tokens, and a compaction cuts the rest"))
+        out += [("echo-description", node, x[:60]) for x in echoed(description or "", frontmatter(texts[node])[1])]
         if not user_only(fields):
             words[node] = {w for w in re.findall(r"\w{3,}", description.lower()) if w not in STOP}
     listed = sorted(words)
@@ -406,7 +417,7 @@ def cmd_summary(a):
 def cmd_check(a):
     out = findings(a.plugin, a.usage)
     for row in out:
-        print("\t".join(row))
+        print("\t".join(row + (FIX[row[0]],)))
     print(f"FINDINGS\t{len(out)}")
 
 
@@ -459,7 +470,7 @@ def cmd_mine(a):
     for i, case in enumerate(cases, 1):
         case["id"] = f"m{i:03d}"
     Path(a.out).write_text(json.dumps(cases, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"cases\t{len(cases)}")  # the prompts stay in the file; they are the user's own words
+    print(f"cases\t{len(cases)}")
     for skill, n in collections.Counter(c["skill"] for c in cases).most_common():
         print(f"{skill}\t{n}")
 
@@ -472,7 +483,7 @@ def cmd_catalog(a):
             fields, _ = frontmatter(path.read_text(encoding="utf-8", errors="replace"))
             name, text = fields.get("name", path.parent.name), fields.get("description", "")
             if re.fullmatch(r"[\w-]+", name) and len(text) >= 20 and (not only or name in only):
-                out.setdefault(name, text[:LISTING_LIMIT])  # the newest cached version is not guaranteed; pass one directory per plugin if it matters
+                out.setdefault(name, text[:LISTING_LIMIT])
     Path(a.out).write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"catalog\t{len(out)}")
 
@@ -522,9 +533,9 @@ def cmd_build(a):
     for case in cases:
         d = out / "evals" / case["id"]
         (d / "graders").mkdir(parents=True)
-        step = case.get("after")  # a skill meant to fire after this tool, not on the prompt itself
-        rule = f"append_system_prompt: {json.dumps(case['rule'], ensure_ascii=False)}\n" if case.get("rule") else ""  # stands in for the core index: an eval reads no project configuration
-        tool = case.get("tool")  # an MCP tool, by its full mcp__plugin_<plugin>_<server>__<tool> name, instead of a skill
+        step = case.get("after")
+        rule = f"append_system_prompt: {json.dumps(case['rule'], ensure_ascii=False)}\n" if case.get("rule") else ""
+        tool = case.get("tool")
         tools = STEP_TOOLS if step else TOOLS
         tools = tools[:-1] + f", {tool}]" if tool else tools
         head = f"max_turns: {max(a.max_turns, STEP_TURNS)}\ntimeout_seconds: 240\nallowed_tools: {tools}\n" if step else f"max_turns: {a.max_turns}\ntimeout_seconds: 180\nallowed_tools: {tools}\n"
@@ -533,7 +544,7 @@ def cmd_build(a):
         (d / "graders/target.md").write_text(tool_grader(tool) if tool else grader(target) if target else grader(none=True), encoding="utf-8")
         if step:
             (d / "graders/order.md").write_text(order_grader(step, target, tool), encoding="utf-8")
-        for name in skills:  # free graders, so a miss shows which skill took it
+        for name in skills:
             (d / f"graders/to-{name}.md").write_text(grader(name), encoding="utf-8")
         if a.history:
             shutil.copy(a.history, d / "history.jsonl")
@@ -543,7 +554,6 @@ def cmd_build(a):
     print(f'next\tclaude plugin eval "{out}" --ablation none --runs 1 --threshold 0 --no-publish --trust-plugin --max-cost-usd <usd> --json <result.json>{grant}')
 
 
-# Why a run ended abnormally decides what to do with it. First match wins.
 ERROR_KINDS = (
     ("turn_limit", r"maximum number of turns", "rerun these cases after build with a higher --max-turns"),
     ("timeout", r"timed out|timeout", "rerun once; if it repeats, raise timeout_seconds in the case"),
@@ -557,7 +567,6 @@ def error_kind(error):
 
 
 def fingerprint(root, whole):
-    """What a run measured: each skill's listing text for routing, or each SKILL.md and CONTRACT.md in full for output quality."""
     out = {}
     for path in sorted(Path(root).glob("skills/*/*.md")) if root and Path(root).is_dir() else []:
         rel, text = path.relative_to(root).as_posix(), path.read_text(encoding="utf-8", errors="replace")
@@ -576,7 +585,6 @@ def run_meta(data, whole):
 
 
 def stale(now, then):
-    """Why an accepted baseline may not compare: another model, another Claude Code, or skills changed since. Silent for an old file with no record."""
     if not then:
         return
     if then.get("model") != now["model"]:
@@ -590,7 +598,6 @@ def stale(now, then):
 
 
 def compare(now, accepted):
-    """Case outcomes against an accepted run. An unresolved run on either side shows no change."""
     good = ("hit", "ok")
     for key, outcome in now.items():
         before = accepted.get(key)
@@ -605,7 +612,6 @@ def compare(now, accepted):
 
 
 def by_split(outcomes, cases):
-    """Hits and false fires per split, so cases kept away from the description's writer show whether it was fitted to the rest."""
     split = {c["id"]: c.get("split", "write") for c in cases}
     if "test" not in split.values():
         return
@@ -634,7 +640,6 @@ def cmd_tally(a):
                 spec = next((g.get("config") or {} for g in case["graders"] if g["name"] == "target"), {})
                 m = re.search(r'\?([\w-]+)"$', spec.get("input_match", ""))
                 expected = m.group(1) if m else spec["tool"] if spec.get("tool") not in (None, "Skill") else None
-                # A run that ended abnormally with no skill yet, by turn limit, timeout or API error, has shown nothing; it is unresolved.
                 error = str(run.get("error") or "")[:60]
                 kind = error_kind(error) if error else ""
                 if expected is None:
@@ -694,11 +699,10 @@ def cmd_tally(a):
         print(f"saved\t{a.save}")
 
 
-NOISE = 0.34  # one run in three moving is noise, two is a change
+NOISE = 0.34
 
 
 def cmd_quality(a):
-    """Output quality of a with-without run: per case and grader, pass rate in each arm and what it proves."""
     data = json.loads(Path(a.result).read_text(encoding="utf-8"))
     rows, breaks, cost, reruns = [], [], collections.Counter(), collections.Counter()
     for case in data["cases"]:
@@ -706,7 +710,6 @@ def cmd_quality(a):
         withs, withouts = case["arms"].get("with", []), case["arms"].get("without", [])
         for arm, runs in (("with", withs), ("without", withouts)):
             cost[arm] += sum(r.get("costUsd") or 0 for r in runs)
-        # A run that ended abnormally never produced its output, so it neither passes nor fails a grader.
         aborted = [r for r in withs + withouts if r.get("error")]
         for r in aborted:
             reruns[error_kind(str(r["error"]))] += 1
@@ -717,7 +720,7 @@ def cmd_quality(a):
             seen = [g["passed"] for r in runs for g in r["graders"] if g["name"] == name]
             return sum(seen) / len(seen) if seen else None
         fired = sum(any(g["passed"] for g in r["graders"] if g["name"] in indicator) for r in withs)
-        fired = f"{fired}/{len(withs)}" if indicator else "-"  # no indicator grader: firing unknown, not 0
+        fired = f"{fired}/{len(withs)}" if indicator else "-"
         print(f"case\t{case['name']}\tfired\t{fired}\tunresolved\t{len(aborted)}")
         for name in sorted(defs):
             if name in indicator:
@@ -801,7 +804,7 @@ def main():
     p.add_argument("--history")
     p.add_argument("--stub", action="store_true")
     p.add_argument("--also")
-    p.add_argument("--max-turns", type=int, default=4)  # at 2, models that read files first were cut off before any skill call
+    p.add_argument("--max-turns", type=int, default=4)
     p.set_defaults(fn=cmd_build)
     p = sub.add_parser("tally")
     p.add_argument("results", nargs="+")

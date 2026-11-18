@@ -216,8 +216,8 @@ The import rules live in `contracts/modules.json`: `{"features": {"control/hazar
 
 `lean` is always on. A hook injects its rules from `skills/lean/SKILL.md`:
 
-- Main session, at start, resume, clear and compact: **Build** (minimal code, root-cause fixes, one runnable check, no comments) and **Answer** (the action or the answer first, one open question at a time, short visible lists, and a proposed enforcement when a written rule is broken again). A resume that already holds the same text gets nothing, so the rules are not added twice.
-- Each subagent: **Build** and **Report** (status first, the brief's bar is the whole bar, long output to a file, at most 20 lines). The read-only built-ins, Explore, Plan, claude-code-guide and web-fetch, get **Report** alone.
+- Main session, at start, resume, clear and compact: **Build** (minimal code, root-cause fixes, one runnable check seen failing, no comments, inherited claims checked, briefs that carry the goal and the done check) and **Answer** (the action or the answer first, the goal and its done check up front, reversible calls made rather than asked, the evidence that was run, how each claim is known, one open question at a time, short visible lists, and a proposed enforcement when a written rule is broken again). A resume that already holds the same text gets nothing, so the rules are not added twice.
+- Each subagent: **Build** and **Report** (status first, the brief's bar is the whole bar, evidence on each claim, inconclusive is not a pass, a problem the base already had in one line, long output to a file, at most 20 lines). The read-only built-ins, Explore, Plan, claude-code-guide and web-fetch, get **Report** alone.
 
 Type `phro-lean off` as the whole prompt to stop the rules for the current session and its subagents, and `phro-lean on` to bring them back. Other sessions are not affected. lean injects nothing while the original ponytail or i-have-adhd plugin is enabled, so the two never stack; disable those and lean takes over.
 
@@ -226,6 +226,8 @@ Type `phro-lean off` as the whole prompt to stop the rules for the current sessi
 No state lives in comments. A comment that records a shortcut, a limit or a skipped test as accepted becomes the context later sessions use to keep it, so lean writes no comments beyond a license header, behavior an outside dependency or protocol forces, and a public API contract. `lean-review` flags every other comment, and any `lean:`, `ponytail:`, `TODO`, `FIXME` or `HACK` marker, as `comment:`.
 
 `python -I -X utf8 scripts/lean.py stats <transcripts_dir> [--days N]` shows whether the answer rules hold: per arm (sessions that received lean and sessions that did not), the replies and the share with a visible list over 5 items or more than one question at the end. It counts and never prints text.
+
+The rules come from what pstack's design assumes about agents: they copy what they read, grade themselves on proxies, drift from the goal and keep adding what might help. So the rules keep stale text out of reach, ask for evidence a non-author can check, fix the finish line first, revert what a run did not prove, and settle facts by running something. `docs/superpowers/specs/2026-11-18-pstack-lessons-design.md` maps each rule to the failure it prevents.
 
 `grill` interviews you about a plan in rounds of at most 5 numbered questions. Each question has a recommended answer and one line of reason. The design tree is kept in a file, so a compaction does not lose it.
 
@@ -260,7 +262,7 @@ Run as `python -I -X utf8 scripts/project.py <command>`. `<plugin>` is a plugin 
 | Command | Does |
 |---|---|
 | `summary <plugin> [--usage DIR]` | Node counts, tokens per skill, uses, eval cases, calls in transcripts, and Reads of each skill's reference files |
-| `check <plugin> [--usage DIR]` | Deterministic findings, one per line |
+| `check <plugin> [--usage DIR]` | Deterministic findings, one per line: kind, where, detail, and the fix |
 | `impact <plugin> <node>` | What breaks if it is removed, and what only it uses |
 | `sql <plugin> "<select>"` | Read-only query on `node` and `edge` |
 | `mine <transcripts_dir> <cases.json> [--alias a=b] [--only a,b]` | Labeled prompts from typed commands |
@@ -278,6 +280,7 @@ Findings from `check` are candidates, not verdicts:
 | `no-eval`, `never-called`, `unmeasured` | No eval case or `tests/route_cases.json` entry grades it, or no call in the transcripts, or no transcripts to count in. A skill only the user invokes needs no eval |
 | `never-read` | A skill's reference file no Read in the transcripts opened, subagents included: a candidate to fold in or drop |
 | `no-description`, `long-description`, `long-body` | No description, over 1,536 characters, over about 5,000 tokens, where a compaction cuts a skill |
+| `echo-description` | A sentence of the description repeated in the body, read twice by every session that loads it |
 | `overlap-candidate` | Descriptions share many words. `audit` judges the meaning |
 | `unknown-frontmatter` | A skill key Claude Code does not read, such as `disable_model_invocation`. It is ignored without an error |
 | `hook-config` | An event name `hooks.json` does not have, or a command hook with no `timeout`, which can hold a session for the default |
@@ -293,7 +296,7 @@ Run as `python -I -X utf8 scripts/compass.py <command>`.
 |---|---|
 | `hook` | Reads the event from standard input and prints the index. Called by `hooks/hooks.json` |
 | `status <root>` | Per document: stale or current, sources changed, age. Lists up to 100 new paths per document, each path once, and says how many it left out. Then folders with changes outside every source since the oldest review, up to 30 changed documents among them by name, `ELSEWHERE n` and `STALE n`. Records when it looked |
-| `lint <root>` | One finding per line, then `OK` or `FINDINGS n` |
+| `lint <root>` | One finding per line with its fix, then `OK` or `FINDINGS n` |
 | `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint and the drift line |
 | `usage <root>` | Reads of each document in this project's transcripts, leaving out sessions that ran `stamp`. Counts only |
 
