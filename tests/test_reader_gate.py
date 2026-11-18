@@ -215,7 +215,7 @@ def test_vanished_entry_denied():
     with stub() as base:
         p = sample()
         run(p, base)
-        d = cache.lookup(cache.key(p))
+        d = cache.lookup(cache.key(p, image=gate.image_backend()))
         (d / "out.md").unlink()
         old = cache.lookup
         cache.lookup = lambda k: d
@@ -1592,6 +1592,180 @@ def test_mpp_too_large_before_engine():
         finally:
             gate.limits.MAX_INPUT = real
     assert r == "a.mpp: the file is over 512 MiB.", r
+
+
+# -- figures: the image backend id in the key, the image venv child and the image setup offer
+
+PICTURE_EXTS = ("wmf", "emf", "wmz", "emz", "tif", "tiff", "pct", "pict", "wpg")
+FAKE_RESVG = "resvg-0.5.0-pillow-12.3.0"
+IMAGE_OFFER_START = " 2 figures (WMF/EMF/PICT/WPG/TIFF) are not shown as images"
+
+
+@contextmanager
+def image_env(windows, engine=None, verify=None, interpreter=None):
+    """gate._windows pinned, PHRO_READER_IMAGEENV on a throwaway folder, and pyenv's engine, verify and interpreter
+    for kind image stubbed when given (other kinds keep the real ones). Yields the calls the stubs saw."""
+    from reader import pyenv
+    saved = gate._windows, pyenv.engine, pyenv.verify, pyenv.interpreter
+    real_engine, real_verify, real_interp = saved[1:]
+    calls = {"engine": [], "verify": [], "interpreter": []}
+
+    def fake_engine(kind="pdf", venv=None):
+        if kind != "image" or engine is None:
+            return real_engine(kind, venv)
+        calls["engine"].append(venv)
+        return engine
+
+    def fake_verify(venv, kind="pdf"):
+        if kind != "image" or verify is None:
+            return real_verify(venv, kind)
+        calls["verify"].append(venv)
+        return verify
+
+    def fake_interp(venv):
+        if interpreter is None:
+            return real_interp(venv)
+        calls["interpreter"].append(venv)
+        return interpreter
+    gate._windows = lambda: windows
+    pyenv.engine, pyenv.verify, pyenv.interpreter = fake_engine, fake_verify, fake_interp
+    try:
+        with envs(PHRO_READER_IMAGEENV=str(tmp() / "image-venv")):
+            yield calls
+    finally:
+        gate._windows, pyenv.engine, pyenv.verify, pyenv.interpreter = saved
+
+
+def figure_entry(p, image, figures_left=2):
+    """A cache entry for p under the given image backend, its meta saying figures_left figures were left."""
+    from reader import cache
+    d = cache.store(cache.key(p, image=image), p)
+    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    meta["figures_left"] = figures_left
+    (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return d
+
+
+@contextmanager
+def child_cmds():
+    """gate.subprocess.run records each command and times out, so no child runs."""
+    seen, real = [], gate.subprocess.run
+
+    def fake(cmd, **kw):
+        seen.append(cmd)
+        raise gate.subprocess.TimeoutExpired(cmd, 1)
+    gate.subprocess.run = fake
+    try:
+        yield seen
+    finally:
+        gate.subprocess.run = real
+
+
+def test_gate_routes_picture_extensions():
+    import metafile_fix as mf
+    from reader import cache
+    for ext in PICTURE_EXTS:
+        assert reader.FORMATS[ext] == "picture" and ext in reader.BUILT, ext
+    with stub():  # only for its throwaway cache root: the real read.py converts
+        d = tmp()
+        p = d / "a.wmf"
+        p.write_bytes(mf.wmf([mf.wmf_text(100, 200, b"Gate")]))
+        o = out(gate.decide(ev(p)))
+        assert o["permissionDecision"] == "allow", o
+        assert "Figure text: Gate" in md_lines(o), md_lines(o)
+        assert Path(o["updatedInput"]["file_path"]).parent.name == cache.key(p, image=gate.image_backend()), o
+        q = d / "b.wmf"
+        q.write_bytes(mf.emf([mf.emf_textw(100, 200, "Emf")]))
+        o = out(gate.decide(ev(q)))
+        assert o["permissionDecision"] == "deny", o
+        assert "b.wmf: the file looks damaged (not a wmf file)." in o["permissionDecisionReason"], o
+
+
+def test_gate_image_offer_once_a_session():
+    from reader import cache
+    with stub(), image_env(windows=False):  # no image venv: the backend is none
+        assert gate.image_backend() == "none"
+        p = sample()
+        figure_entry(p, "none", 2)
+        offer = gate.IMAGE_OFFER.format(k=2, read_py=gate.READ_PY)
+        assert offer == (" 2 figures (WMF/EMF/PICT/WPG/TIFF) are not shown as images; their text is included. To show"
+                         f" them, ask the user, then run python {gate.READ_PY} setup --for image."), offer
+        c = ctx_of(gate.decide(sev(p, "s1"), command=EXIT3))  # a cache hit: the child would exit 3
+        assert c.endswith(offer) and len(c) < 600, c
+        assert IMAGE_OFFER_START not in ctx_of(gate.decide(sev(p, "s1"), command=EXIT3))
+        assert offer in ctx_of(gate.decide(sev(p, "s2"), command=EXIT3))
+        assert offer in ctx_of(gate.decide(sev(p), command=EXIT3))  # no session id: no mark to keep
+        assert offer in ctx_of(gate.decide(sev(p), command=EXIT3))
+        q = sample("other")
+        figure_entry(q, "none", 0)  # every figure drawn: nothing to offer
+        assert "figures (WMF" not in ctx_of(gate.decide(sev(q, "s3"), command=EXIT3))
+        with envs(PHRO_READER_IMAGEENV="off"):  # turned off: never offered
+            assert "figures (WMF" not in ctx_of(gate.decide(sev(p, "s4"), command=EXIT3))
+        (cache.root() / "image-declined").write_text("", encoding="utf-8")
+        assert "figures (WMF" not in ctx_of(gate.decide(sev(p, "s5"), command=EXIT3))
+    # whole or not at all under CONTEXT_MAX
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    c = gate._context("n" * 400 + ".docx", {"lines": 1}, md, offer=offer)
+    assert offer not in c and "figures (WMF" not in c and len(c) < 600, c
+    c = gate._context("a.docx", {"lines": 1, "unread": ["1 chart"]}, md, offer=offer)
+    assert offer in c and c.index(offer) < c.index(" Some parts could not be read"), c
+
+
+def test_gate_no_offer_on_windows():
+    with stub(), image_env(windows=True, engine=FAKE_RESVG, verify=True, interpreter=Path("/v/bin/python3")) as calls:
+        assert gate.image_backend() == "gdiplus"
+        p = sample()
+        d = figure_entry(p, "gdiplus", 3)
+        o = out(gate.decide(sev(p, "s1"), command=EXIT3))
+        assert Path(o["updatedInput"]["file_path"]).parent == d, o
+        assert "figures (WMF" not in o["additionalContext"] and "image engine" not in o["additionalContext"], o
+        q = sample("miss")
+        with child_cmds() as seen:
+            gate.decide(ev(q))
+        assert seen and seen[0][0] == sys.executable, seen  # never the image venv, even when it is there
+        assert calls == {"engine": [], "verify": [], "interpreter": []}, calls
+
+
+def test_gate_image_venv_child_command():
+    from reader import cache, pyenv
+    venv_py = Path("/v/bin/python3")
+    with stub(), image_env(windows=False, engine=FAKE_RESVG, verify=True, interpreter=venv_py) as calls:
+        venv = pyenv.venv_dir("image")
+        assert gate.image_backend() == FAKE_RESVG
+        p = sample()
+        with child_cmds() as seen:
+            o = out(gate.decide(ev(p)))
+        assert seen and seen[0][0] == str(venv_py), seen
+        assert seen[0][1:] == ["-I", "-X", "utf8", str(gate.READ_PY), "convert", str(p)], seen
+        assert "--key" not in seen[0] and calls["verify"] == [venv], calls
+        assert o["permissionDecision"] == "deny", o
+        d = figure_entry(p, FAKE_RESVG, 0)  # a hit under the resvg key: no check, no child
+        calls["verify"].clear()
+        o = out(gate.decide(sev(p, "s1"), command=EXIT3))
+        assert Path(o["updatedInput"]["file_path"]).parent == d and not calls["verify"], (o, calls)
+        assert d.name == cache.key(p, image=FAKE_RESVG) != cache.key(p, image="none")
+
+
+def test_gate_image_venv_unverified_repair():
+    from reader import cache, pyenv
+    with stub(), image_env(windows=False, engine=FAKE_RESVG, verify=False, interpreter=Path("/v/bin/python3")):
+        venv = pyenv.venv_dir("image")
+        p = sample()
+        with child_cmds() as seen:
+            gate.decide(ev(p))
+        assert seen and seen[0][0] == sys.executable, seen  # the venv failed its check: not run
+        d = figure_entry(p, "none", 2)
+        o = out(gate.decide(sev(p, "s1"), command=EXIT3))
+        assert Path(o["updatedInput"]["file_path"]).parent == d, o
+        repair = gate.IMAGE_REPAIR.format(k=2, read_py=gate.READ_PY, dir=venv)
+        assert repair == (" The image engine failed its file check, so 2 figures (WMF/EMF/PICT/WPG/TIFF) are not shown"
+                          " as images; to repair it, ask the user and only on their yes run: python -I -X utf8"
+                          f' "{gate.READ_PY}" setup --for image --venv "{venv}".'), repair
+        c = o["additionalContext"]
+        assert repair in c and "To show them, ask the user" not in c and len(c) < 600, c
+        assert repair not in ctx_of(gate.decide(sev(p, "s1"), command=EXIT3))  # once a session, as the offer
+        assert d.name == cache.key(p, image="none")
 
 
 def main():

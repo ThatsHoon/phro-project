@@ -844,6 +844,156 @@ def test_pillow_tiff_page():
     assert raster._render_local({"tiff": data, "page": 2}) is None
 
 
+# ---- lone picture files (formats.picture) ------------------------------------------------------------------------------
+
+def lone(name: str, data: bytes) -> Path:
+    """A well-formed picture fixture in a fresh folder (only valid fixtures are written; hostile bytes stay in memory)."""
+    p = Path(tempfile.mkdtemp()) / name
+    p.write_bytes(data)
+    return p
+
+
+def convert_lone(p: Path) -> tuple[str, dict, Path]:
+    import json
+    import reader
+    out = Path(tempfile.mkdtemp()) / "out"
+    with empty_fonts():
+        meta = reader.convert(p, out)
+    return (out / "out.md").read_text(encoding="utf-8"), meta, out
+
+
+def test_lone_emf_file():
+    data = emf([emf_brush(0x000000), emf_rect(0, 1270, 1270, 2540), emf_textw(100, 200, "Hi")])
+    md, meta, out = convert_lone(lone("a.emf", data))
+    assert "Figure text: Hi" in md, md
+    if WINDOWS and raster.backend() == "gdiplus":
+        assert md.count("](assets/img-001.png)") == 1 and md.count("![") == 1, md
+        assert meta["figures"] == 1 and meta["figures_left"] == 0 and meta["images"] == 1, meta
+        assert png_size((out / "assets" / "img-001.png").read_bytes()) == (192, 192)
+    else:
+        print("skip: test_lone_emf_file PNG half (needs Windows GDI+)")
+
+
+def test_lone_wmz_inflates():
+    import gzip
+    from reader.formats import picture
+    md, _, _ = convert_lone(lone("a.wmz", gzip.compress(wmf([wmf_text(100, 200, b"Zipped")]))))
+    assert "Figure text: Zipped" in md, md
+    md, _, _ = convert_lone(lone("b.EMZ", gzip.compress(emf([emf_textw(100, 200, "Emz")]))))
+    assert "Figure text: Emz" in md, md
+    raw = wmf([wmf_text(100, 200, b"Cap")])
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES = len(raw) - 1  # read at call time: the inflated picture is capped at IMAGE_BYTES
+    try:
+        picture.unpack(gzip.compress(raw), "wmz")
+        raise AssertionError("no cap")
+    except ReadError as e:
+        assert e.kind == "too_large" and e.detail.startswith(limits.BIG_PART + ":"), (e.kind, e.detail)
+    finally:
+        limits.IMAGE_BYTES = old
+    assert picture.unpack(gzip.compress(raw), "wmz") == raw
+    for bad in (b"\x1f\x8b" + bytes(30), b"not gzip at all", gzip.compress(raw)[:-20]):
+        try:
+            picture.unpack(bad, "wmz")
+            raise AssertionError(bad)
+        except ReadError as e:
+            assert e.kind == "damaged", (e.kind, e.detail)
+
+
+def test_wmz_ratio_cap():
+    import gzip
+    from reader.formats import picture
+    bomb = gzip.compress(wmf([wmf_text(1, 1, b"x")]) + bytes(16 * 2**20), 9)  # built in memory, never written
+    assert len(bomb) * limits.ZIP_RATIO < 16 * 2**20, len(bomb)
+    try:
+        picture.unpack(bomb, "emz")
+        raise AssertionError("no ratio cap")
+    except ReadError as e:
+        assert e.kind == "too_large" and e.detail.startswith(limits.BIG_PART + ":"), (e.kind, e.detail)
+    # under the floor the ratio is not checked: 900 KB of zeros from a 1 KB stream is a picture
+    small = wmf([wmf_text(1, 1, b"x")]) + bytes(900_000)
+    assert picture.unpack(gzip.compress(small, 9), "wmz") == small
+
+
+def test_lone_tiff_pages_and_cap():
+    from reader import model
+    from reader.formats import picture
+    data = tiff([(4, 3, 0), (10, 5, 255), (6, 6, 128)])
+    p = lone("scan.tif", data)
+    doc = picture.parse(p, model.Context())
+    assert [b.page for b in doc.blocks] == [0, 1, 2] and all(b.data == data for b in doc.blocks), doc.blocks
+    assert [b.alt for b in doc.blocks] == ["page 1", "page 2", "page 3"] and doc.warnings == [], doc
+    old = limits.TIFF_PAGES
+    limits.TIFF_PAGES = 2
+    try:
+        doc = picture.parse(lone("scan.TIFF", data), model.Context())
+        assert [b.page for b in doc.blocks] == [0, 1] and doc.warnings == ["TIFF pages cut at 2"], doc
+        two = picture.parse(lone("two.tiff", tiff([(4, 3, 0), (10, 5, 255)])), model.Context())
+        assert [b.page for b in two.blocks] == [0, 1] and two.warnings == [], two  # exactly the cap: no cut
+    finally:
+        limits.TIFF_PAGES = old
+    one = picture.parse(lone("one.tif", tiff([(4, 3, 0)])), model.Context())
+    assert [(b.page, b.alt) for b in one.blocks] == [(0, "")], one.blocks
+    md, meta, out = convert_lone(p)
+    if WINDOWS and raster.backend() == "gdiplus":
+        assert md.count("![page ") == 3 and meta["figures"] == 3 and meta["figures_left"] == 0, (md, meta)
+        sizes = [png_size((out / "assets" / f"img-00{i}.png").read_bytes()) for i in (1, 2, 3)]
+        assert sizes == [raster.target_size(4, 3), raster.target_size(10, 5), raster.target_size(6, 6)], sizes
+    with no_backend():  # unconverted pages share one copy of the original file
+        md, meta, out = convert_lone(p)
+        assert sorted(f.name for f in (out / "assets").iterdir()) == ["img-001.tiff"], list((out / "assets").iterdir())
+        assert meta["figures"] == 0 and meta["figures_left"] == 1, meta
+
+
+def test_extension_mismatch_damaged():
+    import gzip
+    from reader.formats import picture
+    w = wmf([wmf_text(1, 1, b"x")])
+    e_ = emf([emf_textw(1, 1, "x")])
+    cases = [(e_, "wmf", "wmf"), (w, "emf", "emf"), (w, "tif", "tiff"), (tiff([(2, 2, 0)]), "pct", "pict"),
+             (w, "wpg", "wpg"), (gzip.compress(e_), "wmz", "wmf"), (b"\0" * 600, "pict", "pict")]
+    for data, ext, kind in cases:
+        try:
+            picture.unpack(data, ext)
+            raise AssertionError((ext, kind))
+        except ReadError as err:
+            assert err.kind == "damaged" and err.detail == f"not a {kind} file", (ext, err.kind, err.detail)
+    assert picture.unpack(w, "wmf") == w and picture.unpack(e_, "emf") == e_
+    # a PICT with its 512-byte head left out, or holding an application's bytes, gets a zero head
+    pic = pict([pict_longtext(20, 40, b"Mac")])
+    assert picture.unpack(pic, "pct") == pic
+    assert picture.unpack(pic[512:], "pict") == pic
+    assert picture.unpack(b"\x01" * 512 + pic[512:], "pict") == pic
+    p = lone("a.wmf", e_)
+    from reader import model
+    try:
+        picture.parse(p, model.Context())
+        raise AssertionError("emf in a .wmf")
+    except ReadError as err:
+        assert err.kind == "damaged", err
+
+
+def test_image_page_reaches_assets():
+    """An Image block's page goes to raster.convert and is part of the Assets key; page 0 is the first page."""
+    from reader.model import Image
+    assert Image(b"x").page == 0
+    seen = []
+    real = raster.convert
+
+    def fake(kind, data, **kw):
+        seen.append(kw.get("page", 0))
+        return raster.Figure(None, [], set())
+    raster.convert = fake
+    try:
+        a = images.Assets(Path(tempfile.mkdtemp()))
+        data = tiff([(4, 3, 0), (10, 5, 255)])
+        first = a.add(data)
+        assert a.add(data, page=1) == first and seen == [0, 1], (seen, first)  # one kept copy of the original
+        assert a.add(data, page=1) == first and seen == [0, 1], seen  # the page's own entry: not converted again
+    finally:
+        raster.convert = real
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

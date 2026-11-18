@@ -355,8 +355,9 @@ def _render_resvg(kind: str, data: bytes, d, page: int, mono: float | None = Non
 
 # ---- TIFF pages ------------------------------------------------------------------------------------------------------
 
-def _tiff_ifds(data: bytes) -> int:
-    """Pages of a TIFF by walking its IFD chain, at most TIFF_PAGES, stopping at a loop or past the end."""
+def _tiff_ifds(data: bytes, cap: int | None = None) -> int:
+    """Pages of a TIFF by walking its IFD chain, at most `cap` (TIFF_PAGES), stopping at a loop or past the end."""
+    cap = limits.TIFF_PAGES if cap is None else cap
     if data[:4] == b"II*\x00":
         e = "<"
     elif data[:4] == b"MM\x00*":
@@ -367,7 +368,7 @@ def _tiff_ifds(data: bytes) -> int:
         return 0
     off = struct.unpack_from(e + "I", data, 4)[0]
     seen, n = set(), 0
-    while off and n < limits.TIFF_PAGES and off not in seen and off + 2 <= len(data):
+    while off and n < cap and off not in seen and off + 2 <= len(data):
         seen.add(off)
         nxt = off + 2 + 12 * struct.unpack_from(e + "H", data, off)[0]
         if nxt + 4 > len(data):
@@ -377,8 +378,10 @@ def _tiff_ifds(data: bytes) -> int:
     return n
 
 
-def tiff_pages(data: bytes) -> int:
-    """Pages of a TIFF, at most TIFF_PAGES: GDI+'s count when it is there, else the IFD chain; 0 when not a TIFF."""
+def tiff_pages(data: bytes, cap: int | None = None) -> int:
+    """Pages of a TIFF, at most `cap` (TIFF_PAGES; a lone file asks for one more, to know it was cut): GDI+'s count
+    when it is there, else the IFD chain; 0 when not a TIFF."""
+    cap = limits.TIFF_PAGES if cap is None else cap
     data = bytes(data)
     if images.sniff(data) != "tiff":
         return 0
@@ -386,11 +389,11 @@ def tiff_pages(data: bytes) -> int:
         try:
             n = _gdip_frames(data)
             if n is not None:
-                return min(n, limits.TIFF_PAGES)
+                return min(n, cap)
         except Exception:  # noqa: BLE001
             pass
     try:
-        return _tiff_ifds(data)
+        return _tiff_ifds(data, cap)
     except struct.error:
         return 0
 

@@ -107,6 +107,7 @@ class Image:
     alt: str = ""
     hidden: str = _hid()
     codepage: str = ""  # the 8-bit code page of the document's text, for metafile fonts with DEFAULT_CHARSET
+    page: int = 0  # the TIFF page drawn, from 0 (a lone TIFF file gives one block a page; a document's, the first)
 
 
 @dataclass

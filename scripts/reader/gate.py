@@ -55,6 +55,14 @@ MPP_DECLINED = ' (Declined; python -I -X utf8 "{read_py}" setup --for mpp instal
 MPP_OFF = " The mpp engine is turned off (PHRO_READER_MPPENV=off)."
 MPP_UNSUPPORTED ="Microsoft Project files are read only through MPXJ"  # formats.mpp.UNSUPPORTED: the child had no engine
 
+# figures (WMF, EMF, PICT, WPG, TIFF) in every format but pdf and mpp: GDI+ draws them on Windows, the image venv
+# (resvg_py, Pillow) elsewhere once it is set up; the offer comes when some were left undrawn for want of it
+IMAGE_OFFER = (" {k} figures (WMF/EMF/PICT/WPG/TIFF) are not shown as images; their text is included. To show them,"
+               " ask the user, then run python {read_py} setup --for image.")
+IMAGE_REPAIR = (" The image engine failed its file check, so {k} figures (WMF/EMF/PICT/WPG/TIFF) are not shown as"
+                ' images; to repair it, ask the user and only on their yes run: python -I -X utf8 "{read_py}" setup'
+                ' --for image --venv "{dir}".')
+
 
 def off_exts():
     """The extensions PHRO_READER_OFF hands back to Read: comma-separated, stripped, case-folded, one dot dropped."""
@@ -287,7 +295,8 @@ def _head(name, meta):
 def _context(name, meta, out_md, *, past_end="", offer=""):
     """additionalContext for an allow, fitted under CONTEXT_MAX: for pdf, the head, PDF_HINT, the past-the-end
     sentence, the offer (whole or not at all), the unrendered and figure pages, the unread list and the page index;
-    for the rest, the head, the edit hint, the unread list and the heading index. The garble warning goes last."""
+    for the rest, the head, the edit hint, the image offer (whole or not at all), the unread list and the heading
+    index. The garble warning goes last."""
     pdf = reader.ext_of(name) == "pdf"
     head = _head(name, meta)
     tail = ""
@@ -315,6 +324,8 @@ def _context(name, meta, out_md, *, past_end="", offer=""):
     else:
         skill = SKILL_OF.get(reader.ext_of(name))
         head += EDIT_HINT.format(skill=skill) if skill else ""
+        if offer and len(head) + len(offer) + len(tail) <= CONTEXT_MAX - 1:  # the image offer, whole or not at all
+            head += offer
     unread = [" ".join(str(x).split()) for x in meta.get("unread") or []]
     if unread:
         head += _clause(" Some parts could not be read: ", unread, ".", len(head) + len(tail))
@@ -339,6 +350,30 @@ def _context(name, meta, out_md, *, past_end="", offer=""):
 def _now():
     import time  # not at module level: the gate's imports stay light for every Read
     return time.monotonic()
+
+
+def _windows():
+    return sys.platform == "win32"
+
+
+def image_backend(venv=None):
+    """The figure backend id in the key of every format but pdf and mpp: "gdiplus" on Windows, where the image venv
+    is never used, even when it exists; elsewhere pyenv.engine("image") ("resvg-…" when the venv is READY, else
+    "none"). The convert child works out the same id itself (raster.backend())."""
+    if _windows():
+        return "gdiplus"
+    from reader import pyenv
+    return pyenv.engine(kind="image", venv=venv if venv is not None else pyenv.venv_dir("image"))
+
+
+def _offer_mark(event):
+    """The once-a-session marker of the setup offers (pdf's and the image venv's share it), or None with no session."""
+    sid = event.get("session_id")
+    if not isinstance(sid, str) or not sid:
+        return None
+    import hashlib
+    from reader import cache
+    return cache.root() / "offers" / hashlib.sha1(sid.encode("utf-8", "replace")).hexdigest()
 
 
 def _child(cmd, start, timeout):
@@ -407,19 +442,55 @@ def decide(event, *, timeout=limits.CONVERT_SECONDS, command=None):
         return _pdf(event, path, start, timeout, command)
     if reader.ext_of(path) in ("mpp", "mpt"):
         return _mpp(event, path, start, timeout, command)
+    return _generic(event, path, start, timeout, command)
+
+
+def _generic(event, path, start, timeout, command):
+    """decide() for every format but pdf and mpp: the figure backend id in the key. Off Windows, on a miss with the
+    image venv's backend, the venv's file check and then the convert child under the venv's interpreter, so resvg_py
+    and Pillow import in that one process; a venv that fails the check is not used (backend none, and the offer is
+    the repair). The image setup offer when figures were left undrawn with backend none, once a session."""
     from reader import cache
-    k = cache.key(path)
-    entry = cache.lookup(k)
+    venv, repair = None, False
+    if not _windows():
+        from reader import pyenv
+        venv = pyenv.venv_dir("image")
+    image = image_backend(venv)
+    entry = cache.lookup(cache.key(path, image=image))
+    if entry is None and image.startswith("resvg-") and not pyenv.verify(venv, "image"):
+        image, repair = "none", True  # the child works out "none" too: its own check fails the same way
+        entry = cache.lookup(cache.key(path, image=image))
     if entry is None:
-        # the child hashes the bytes itself: a file saved after this hash must not be filed under k
-        cmd = command or [sys.executable, "-I", "-X", "utf8", str(READ_PY), "convert", str(path)]
-        entry, kind, detail = _child(cmd, start, timeout)
+        # the child hashes the bytes itself: a file saved after this hash must not be filed under the key
+        if command:
+            cmd = command
+        else:
+            py = pyenv.interpreter(venv) if image.startswith("resvg-") else sys.executable
+            cmd = [str(py), "-I", "-X", "utf8", str(READ_PY), "convert", str(path)]
+        try:
+            entry, kind, detail = _child(cmd, start, timeout)
+        except OSError as e:  # the venv's interpreter could not be started
+            entry, kind, detail = None, "damaged", f"internal error {type(e).__name__}"
         if entry is None:
             return _deny(path, kind, detail)
     out_md = entry / "out.md"
     if not out_md.is_file():
         return _deny(path, "damaged", "cache entry vanished")
-    return _allow(event, path, out_md, _context(_name(path), _meta(entry), out_md))
+    meta = _meta(entry)
+    left = meta.get("figures_left")
+    offer, mark = "", None
+    if not _windows() and image == "none" and isinstance(left, int) and not isinstance(left, bool) and left > 0:
+        if repair:
+            offer = IMAGE_REPAIR.format(k=left, read_py=READ_PY, dir=venv)
+        elif not pyenv.forced_native("image") and not pyenv.declined("image"):
+            offer = IMAGE_OFFER.format(k=left, read_py=READ_PY)
+        mark = _offer_mark(event) if offer else None
+        if mark is not None and mark.exists():
+            offer = ""
+    context = _context(_name(path), meta, out_md, offer=offer)
+    if offer and mark is not None and offer in context:
+        _touch(mark)
+    return _allow(event, path, out_md, context)
 
 
 def mpp_reason(path):
@@ -548,7 +619,6 @@ def _pdf(event, path, start, timeout, command):
 
 
 def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
-    import hashlib
     from reader import cache, pyenv
     k = cache.key(path, engine)
     entry = cache.lookup(k)
@@ -627,9 +697,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
     out_md = entry / "out.md"
     offer, mark = "", None
     if engine == "native" and not pyenv.forced_native() and not pyenv.declined():
-        sid = event.get("session_id")
-        if isinstance(sid, str) and sid:
-            mark = cache.root() / "offers" / hashlib.sha1(sid.encode("utf-8", "replace")).hexdigest()
+        mark = _offer_mark(event)
         if mark is None or not mark.exists():
             offer = offer_text(venv, repair)
     context = _context(_name(path), meta, out_md, past_end=past_end, offer=offer)

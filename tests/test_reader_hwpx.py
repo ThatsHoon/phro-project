@@ -62,7 +62,7 @@ def md(path, hidden=False):
 
 
 def test_registered():
-    assert "hwpx" in reader.BUILT and len(reader.FORMATS) == 54
+    assert "hwpx" in reader.BUILT and len(reader.FORMATS) == 63
 
 
 def test_text_tail_and_tab():

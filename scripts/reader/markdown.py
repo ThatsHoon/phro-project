@@ -375,7 +375,7 @@ class _Render:
         return []
 
     def _image_text(self, b: Image, m=BLOCK) -> str:
-        path, ok = self.assets.add(b.data, b.alt, b.codepage)
+        path, ok = self.assets.add(b.data, b.alt, b.codepage, **({"page": b.page} if b.page else {}))
         alt = re.sub(r"\s+", " ", b.alt).strip()
         if ok:
             self.linked.add(path)

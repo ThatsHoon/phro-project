@@ -25,13 +25,16 @@ FORMATS = {
     "mdb": "jet", "accdb": "jet", "mde": "jet", "accde": "jet", "accdr": "jet",
     "pub": "pub", "vsd": "vsd", "vst": "vsd", "vsdm": "vsdx", "vstx": "vsdx", "mpp": "mpp", "mpt": "mpp",
     "pdf": "pdf",
+    "wmf": "picture", "emf": "picture", "wmz": "picture", "emz": "picture", "tif": "picture", "tiff": "picture",
+    "pct": "picture", "pict": "picture", "wpg": "picture",
 }
 
 # extensions with a working parser; each format task adds its own
 BUILT = {"hwpx", "hwp", "doc", "xls", "odt", "ods", "odp", "docm", "pptm", "ppsx", "vsdx", "epub", "xps", "oxps", "xlsb", "ppt", "rtf",
          "docx", "dotx", "dotm", "pptx", "potx", "potm", "ppsm", "xlsx", "xlsm", "xltx", "xltm", "pdf",
          "wpd", "wp", "wp5", "wp6", "wp7", "wpt", "mobi", "azw3", "pages", "numbers", "key",
-         "djvu", "djv", "mdb", "accdb", "mde", "accde", "accdr", "pub", "vsd", "vst", "vsdm", "vstx", "mpp", "mpt"}
+         "djvu", "djv", "mdb", "accdb", "mde", "accde", "accdr", "pub", "vsd", "vst", "vsdm", "vstx", "mpp", "mpt",
+         "wmf", "emf", "wmz", "emz", "tif", "tiff", "pct", "pict", "wpg"}
 
 
 def ext_of(path) -> str:

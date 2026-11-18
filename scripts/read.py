@@ -151,7 +151,12 @@ def cmd_convert(a) -> int:
                 out = Path(a.out)
                 reader.convert(src, out, a.hidden, **opts)
             else:
-                k = a.key if _is_key(a.key) else cache.key(src, engine)  # the gate passes the key it already worked out
+                image = ""
+                if fmt not in ("pdf", "mpp"):  # their venv children have no figure backend: the engine id alone
+                    from reader import raster
+                    image = raster.backend()
+                # a key handed in (--key) is used as it is
+                k = a.key if _is_key(a.key) else cache.key(src, engine, image)
                 if "pages" in opts:
                     k += f"-p{a.pages[0]}-{a.pages[1]}"
                 if a.hidden:

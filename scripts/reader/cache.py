@@ -85,10 +85,15 @@ def code_digest(base=None) -> str:
     return h.hexdigest()
 
 
-def key(path, engine: str = "") -> str:
+def key(path, engine: str = "", image: str = "") -> str:
+    """`engine`: pdf's (native or pdfium) and mpp's (mpxj) engine id. `image`: the figure backend id ("gdiplus",
+    "resvg-…" or "none") every other format's key carries, so a file read with no backend is read again once one is
+    there."""
     h = hashlib.sha1(VERSION.encode() + b"\0" + code_digest().encode() + b"\0")
-    if engine:  # pdf (native or pdfium) and mpp (mpxj) have one; every other format's key is unchanged
+    if engine:
         h.update(engine.encode() + b"\0")
+    if image:  # tagged, so an image id never hashes like an engine id
+        h.update(b"image:" + image.encode() + b"\0")
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
             h.update(chunk)

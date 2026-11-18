@@ -283,7 +283,9 @@ def test_cli_convert_and_fail():
 def test_cli_formats():
     r = run_cli("formats")
     lines = r.stdout.splitlines()
-    assert r.returncode == 0 and len(lines) == 54
+    assert r.returncode == 0 and len(lines) == 63
+    for ext in ("wmf", "emf", "wmz", "emz", "tif", "tiff", "pct", "pict", "wpg"):
+        assert f"{ext}	picture	built" in lines, ext
     assert any(ln.startswith("hwpx\thwpx\t") for ln in lines)
     assert lines == sorted(lines)
     assert all(ln.split("\t")[2] in ("built", "unsupported") for ln in lines)
@@ -364,7 +366,8 @@ def test_cli_key_from_the_gate():
         code, o = cli("convert", str(p), "--key", "ab" * 20)
         assert code == 0 and Path(o.strip()).parent.name == "ab" * 20, o
         code, o = cli("convert", str(p), "--key", "../x")
-        assert code == 0 and Path(o.strip()).parent.name == cache.key(p), o
+        from reader import raster
+        assert code == 0 and Path(o.strip()).parent.name == cache.key(p, image=raster.backend()), o
 
 
 def test_prune_stale_tmp():
@@ -389,6 +392,28 @@ def test_key_engine():
     kp = cache.key(p, "pdfium-5.15.2-7000")
     assert kn != k0 and kp not in (k0, kn)
     assert cache.key(p, "") == k0
+
+
+def test_cache_key_holds_image_backend():
+    """The image backend id is in the key after the engine id; the CLI puts it in every key but pdf's and mpp's."""
+    from reader import raster
+    from pdf_fix import text_ops
+    p = sample()
+    k0 = cache.key(p)
+    kn = cache.key(p, image="none")
+    kr = cache.key(p, image="resvg-0.5.0-pillow-12.3.0")
+    kg = cache.key(p, image="gdiplus")
+    assert len({k0, kn, kr, kg}) == 4, (k0, kn, kr, kg)
+    assert cache.key(p, image="") == k0 and cache.key(p, "native", "") == cache.key(p, "native")
+    assert cache.key(p, "none") != kn  # an engine id never meets an image id
+    assert cache.key(p, "native", "none") not in (cache.key(p, "native"), kn)
+    with stub():
+        q = sample()
+        code, o = cli("convert", str(q))
+        assert code == 0 and Path(o.strip()).parent.name == cache.key(q, image=raster.backend()), o
+    f = _pdf_file([text_ops("Hi")])
+    r = run_cli("convert", str(f))  # a pdf: its key keeps the engine id alone
+    assert r.returncode == 0 and Path(r.stdout.strip()).parent.name == cache.key(f, "native"), r.stdout
 
 
 def test_code_digest_json():

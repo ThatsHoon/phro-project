@@ -164,8 +164,10 @@ class Assets:
         self.figures = 0  # pictures converted to PNG
         self.figures_left = 0  # figure kinds kept as the original file
         self.warnings: set[str] = set()  # the figure warnings raster raised
+        self._kept: dict[str, tuple[str, bool]] = {}  # unconverted figures by bytes and code page: one copy each
 
-    def add(self, data: bytes, alt: str = "", codepage: str = "") -> tuple[str, bool]:
+    def add(self, data: bytes, alt: str = "", codepage: str = "", page: int = 0) -> tuple[str, bool]:
+        """`page` is the TIFF page to draw, from 0 (a lone TIFF file's blocks name theirs)."""
         if len(data) < 16:
             return "", False
         kind = sniff(data)
@@ -174,6 +176,9 @@ class Assets:
         key = hashlib.sha1(data).hexdigest()
         if kind in FIGURES:  # the code page can change the text, so it is part of the key
             key += "/" + codepage
+        base = key
+        if kind in FIGURES and page:
+            key += f"/p{page}"
         if key in self._seen:
             return self._seen[key]
         lines: list = []
@@ -184,7 +189,7 @@ class Assets:
         elif kind in FIGURES:
             try:
                 from . import raster
-                fig = raster.convert(kind, data, codepage=codepage)
+                fig = raster.convert(kind, data, codepage=codepage, **({"page": page} if page else {}))
                 lines = list(fig.lines)
                 self.warnings |= fig.warnings
                 png = fig.png
@@ -193,6 +198,9 @@ class Assets:
             if png is not None:
                 data, kind = png, "png"
                 self.figures += 1
+            elif base in self._kept:  # another page of a file already kept as it is
+                self._seen[key] = self._kept[base]
+                return self._kept[base]
             else:
                 self.figures_left += 1
         self._n += 1
@@ -203,4 +211,6 @@ class Assets:
         if lines:
             self.lines[res[0]] = lines
         self._seen[key] = res
+        if kind in FIGURES:  # kept as the original file
+            self._kept[base] = res
         return res
