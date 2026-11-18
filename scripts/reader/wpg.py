@@ -1,12 +1,14 @@
 # This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not
 # distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
-# Ported from libwpg 982c77da697b967ffed07fb01206698e7fd679d4, src/lib/WPG1Parser.cpp, WPG2Parser.cpp, WPGBitmap.cpp, WPGXParser.cpp, WPGHeader.cpp.
+# Ported from libwpg 982c77da697b967ffed07fb01206698e7fd679d4, src/lib/WPG1Parser.cpp, WPG2Parser.cpp, WPGBitmap.cpp, WPGXParser.cpp, WPGHeader.cpp, WPGraphics.cpp.
 """WordPerfect Graphics (WPG 1 and WPG 2) for figures: `parse` returns a vector.Drawing, y growing downward.
 
 Ported from libwpg (MPL-2.0; copyright 2004-2007 Ariya Hidayat, Fridrich Strba and Marc Oude Kotte, and the libwpg
 contributors) at 982c77da697b967ffed07fb01206698e7fd679d4, `src/lib/`:
 `WPGHeader.cpp` (`WPGHeader::load`, `isSupported`: the 16-byte WPC head, the file type 0x16, the version, the encryption
-word, and the nested head libwpg's own dump once wrote), `WPGXParser.cpp` (`readVariableLengthInteger`),
+word), `WPGraphics.cpp` (`WPGraphics::parse`: the seek to `startOfDocument()`, the choice of WPG 1 or 2 by the major
+version, and for WPG 1 the nested head libwpg's own dump once wrote, whose document starts at `startOfDocument()+16`),
+`WPGXParser.cpp` (`readVariableLengthInteger`),
 `WPG1Parser.cpp` (`parse`'s record loop, `handleStartWPG`, `handleColormap`, `handleFillAttributes`,
 `handleLineAttributes`, `handleLine`, `handlePolyline`, `handlePolygon`, `handleRectangle`, `handleEllipse`,
 `handleCurvedPolyline`, `handleGraphicsTextAttributes`, `handleGraphicsTextTypeOne`, `handleGraphicsTextTypeTwo`,
@@ -32,8 +34,16 @@ stepped over undecoded. Known differences: WPG 2's `m_yofs` takes the lower of t
 imageX2 for one branch); the y scale of a WPG 2 matrix is `sycos` (libwpg writes `sxcos` to both); the fraction of a
 translation is kept; a compound polygon's matrix is applied after its member's own; a rectangle's four corners go
 through the matrix; a rounded corner is drawn; WPG 2 text blocks are drawn (libwpg drops them); WPG 1 curved
-polylines keep their last segment; the 5-5-5 and 4-4-4-4 pixels are scaled to 8 bits. A record that runs past the end
-of the file ends the parse (`damaged`); one too short for its own fields is dropped (`damaged`) and the next is read.
+polylines keep their last segment; the 5-5-5 and 4-4-4-4 pixels are scaled to 8 bits; graphics text type 2 is drawn
+(libwpg has it under `#if 0`); a WPG 1 bitmap type 2 is placed by its raw 1200-unit corner coordinates; the RLE size
+gates of libwpg (a record's bytes against the pixels it must fill) are gone, since pixels, `need` and the deadline
+already bound the work; a bitmap record whose matrix scale is negative is mirrored (libwpg's `m_hFlipped` and
+`m_vFlipped`, never reset there, belong to one record here); a matrix with zero determinant or a non-finite element is
+the identity for its item and the item is counted in `skipped`; an embedded PNG is read for its size and skipped past
+the pixel cap. A record that runs past the end of the file is dropped and ends the parse (`damaged`: a truncated final
+record is not drawn); one too short for its own fields is dropped (`damaged`) and the next is read. The double-precision
+translation of a matrix (`ix + fx/65536`, in coordinate units) is a guess: libwpg adds the integer part to 16.16
+numbers, and no sample confirms either.
 Every item is charged to the budget once, in `_charge`, kept or not.
 """
 import math
@@ -353,10 +363,11 @@ _ROW2 = {1: lambda w: (w + 7) // 8, 2: lambda w: (w + 3) // 4, 3: lambda w: (w +
 _BITS = {1: 1, 2: 2, 3: 4, 4: 8}
 
 
-def _bgr_body(budget, buf: bytes, w: int, h: int, rb: int, fmt: str, bits: int, pal: list) -> bytes:
+def _bgr_body(budget, buf: bytes, w: int, h: int, rb: int, fmt: str, bits: int, pal: list, hflip=False,
+              vflip=False) -> bytes:
     """The pixels of `buf` (rb bytes a row, h rows, at least rb * h bytes) as the body of a bottom-up 24-bit DIB:
     BGR rows of 3 * w bytes padded to four. One output buffer, filled a row at a time, so memory is the picture's own
-    size. fmt is "idx" (bits a pixel, through `pal`), "g16", "g8", "555", "4444", "rgb" or "rgba"."""
+    size; a mirrored picture has its columns (hflip) or rows (vflip) reversed. fmt is "idx" (bits a pixel, through `pal`), "g16", "g8", "555", "4444", "rgb" or "rgba"."""
     stride = 3 * w + (-3 * w) % 4
     body = bytearray(stride * h)
     if fmt == "idx":
@@ -384,7 +395,9 @@ def _bgr_body(budget, buf: bytes, w: int, h: int, rb: int, fmt: str, bits: int, 
             ba[0::3], ba[1::3], ba[2::3] = row[2:3 * w:3], row[1:3 * w:3], row[0:3 * w:3]
         else:
             ba[0::3], ba[1::3], ba[2::3] = row[2:4 * w:4], row[1:4 * w:4], row[0:4 * w:4]
-        at = (h - 1 - y) * stride                       # the DIB is bottom-up
+        if hflip:
+            ba[0::3], ba[1::3], ba[2::3] = ba[0::3][::-1], ba[1::3][::-1], ba[2::3][::-1]
+        at = (y if vflip else h - 1 - y) * stride       # the DIB is bottom-up
         body[at:at + 3 * w] = ba
         budget.points(0)                                # the deadline is read here, once in CLOCK_EVERY calls
     return bytes(body)
@@ -453,8 +466,8 @@ class _Wpg:
             frame, self.dpi = (0.0, 0.0, 1.0, 1.0), 1200.0
         return Drawing(frame, self.dpi, self.items, self.damaged, self.skipped)
 
-    def _bitmap_png(self, buf, w, h, rb, fmt, bits, pal) -> bytes | None:
-        return _body_png(_bgr_body(self.budget, buf, w, h, rb, fmt, bits, pal), w, h)
+    def _bitmap_png(self, buf, w, h, rb, fmt, bits, pal, hflip=False, vflip=False) -> bytes | None:
+        return _body_png(_bgr_body(self.budget, buf, w, h, rb, fmt, bits, pal, hflip, vflip), w, h)
 
 
 # ---- WPG 1 ------------------------------------------------------------------------------------------------------------
@@ -682,8 +695,7 @@ class _Wpg1(_Wpg):
         w, h = max(w, 0), max(h, 0)
         scan = (w * depth + 7) // 8
         need = scan * h
-        # what the record can hold: a 3-byte RLE step makes at most 255 bytes
-        if not need or w * h > images._MAX_PIXELS or rec.left() <= 0 or need > (rec.left() // 3 + 1) * 255:
+        if not need or w * h > images._MAX_PIXELS or rec.left() <= 0:
             self._drop()
             return
         buf = self._rle(rec, need, scan)
@@ -730,7 +742,7 @@ def _compose(inner: tuple, outer: tuple) -> tuple:
 
 class _Char:
     """An object characterization (parseCharacterization)."""
-    __slots__ = ("filled", "closed", "framed", "winding", "m", "angle")
+    __slots__ = ("filled", "closed", "framed", "winding", "m", "angle", "hflip", "vflip")
 
     @staticmethod
     def plain() -> "_Char":
@@ -738,6 +750,7 @@ class _Char:
         ch.filled = ch.closed = ch.winding = False
         ch.framed = True
         ch.m, ch.angle = _IDENT, 0.0
+        ch.hflip = ch.vflip = False
         return ch
 
 
@@ -761,7 +774,7 @@ class _Wpg2(_Wpg):
         self.brush_color, self.brush_on = 0, True
         self.stack: list[_Group] = []
         self.cp = None                  # the last compound polygon's characterization
-        self.bm = None                  # (box, ) of the last Bitmap record
+        self.bm = None                  # (box, hflip, vflip) of the last Bitmap record
         self.text = None                # (x, y, angle, block) of the last text line or block
         self.cap = None                 # the last Object Capsule: [box, kinds, next index]
         self.handlers = {0x0C: self._palette, 0x0D: self._palette_dp, 0x0E: self._bitmap_data, 0x0F: self._text_data,
@@ -878,6 +891,10 @@ class _Wpg2(_Wpg):
         if taper:
             rec.skip(8)
         m = (a, b, c, d, e, f)
+        ch.hflip, ch.vflip = bool(scale and a < 0), bool(scale and d < 0)
+        if not all(map(math.isfinite, m)) or a * d - b * c == 0:
+            m, ch.hflip, ch.vflip = _IDENT, False, False   # a matrix that squashes the item flat: the identity
+            self.skipped += 1
         if self._in_compound():
             m = _compose(m, self.stack[-1].ch.m)        # inside a compound: its own transform goes on top
         if m[0] or m[1]:
@@ -1058,7 +1075,7 @@ class _Wpg2(_Wpg):
     def _bitmap_rec(self, rec: _R):
         ch = self._char(rec)
         p1, p2 = self._pt(rec, ch.m), self._pt(rec, ch.m)
-        self.bm = (min(p1[0], p2[0]), min(p1[1], p2[1]), max(p1[0], p2[0]), max(p1[1], p2[1]))
+        self.bm = ((min(p1[0], p2[0]), min(p1[1], p2[1]), max(p1[0], p2[0]), max(p1[1], p2[1])), ch.hflip, ch.vflip)
 
     def _rle(self, rec: _R, need: int, raster: int, width: int) -> bytes:
         """handleBitmapData's RLE: 0x7D sets the bytes per pixel, 0x7F and 0xFF are runs of 0 and 255, 0xFD repeats
@@ -1119,23 +1136,24 @@ class _Wpg2(_Wpg):
         if fmt > 12 or fmt not in _ROW2 or self.bm is None:
             self._drop()
             return
+        box, hflip, vflip = self.bm
         rb = _ROW2[fmt](w)
         need = rb * h
         avail = rec.left()
         if (not w or not h or w * h > images._MAX_PIXELS or need > images._MAX_PIXELS * 4
-                or (comp == 0 and need > avail) or (comp == 1 and need >= ((avail + 1) // 2) * 256) or comp > 1):
+                or (comp == 0 and need > avail) or comp > 1):
             self._drop()
             return
         buf = rec.rest()[:need] if comp == 0 else self._rle(rec, need, rb, w)
         if fmt in _BITS:
-            png = self._bitmap_png(buf, w, h, rb, "idx", _BITS[fmt], self.pal)
+            png = self._bitmap_png(buf, w, h, rb, "idx", _BITS[fmt], self.pal, hflip, vflip)
         else:
             png = self._bitmap_png(buf, w, h, rb, {5: "g16", 6: "555", 7: "4444", 8: "rgb", 9: "rgba", 12: "g8"}[fmt], 8,
-                                   self.pal)
+                                   self.pal, hflip, vflip)
         if png is None:
             self._drop()
             return
-        self._emit_bitmap(png, "png", self.bm)
+        self._emit_bitmap(png, "png", box)
 
     def _capsule(self, rec: _R):
         ch = self._char(rec)
@@ -1158,7 +1176,11 @@ class _Wpg2(_Wpg):
         data = rec.rest()
         kind = kinds[i]
         if kind == "png" and data.startswith(_PNG):
-            self._emit_bitmap(data, "png", box)
+            pw, ph = struct.unpack_from(">II", data, 16) if len(data) >= 24 and data[12:16] == b"IHDR" else (0, 0)
+            if 0 < pw * ph <= images._MAX_PIXELS:       # the size in its IHDR is checked, not trusted
+                self._emit_bitmap(data, "png", box)
+            else:
+                self._drop()
         elif kind == "bmp" and (png := images.bmp_to_png(data)) is not None:
             self._emit_bitmap(png, "png", box)
         else:

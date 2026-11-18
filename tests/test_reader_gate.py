@@ -713,7 +713,7 @@ def test_notices_credit_port_sources():
     docs = {f.relative_to(HERE).as_posix(): ast.get_docstring(ast.parse(f.read_text(encoding="utf-8"))) or ""
             for f in sorted((HERE / "scripts" / "reader").rglob("*.py"))}
     for proj in ("dochan", "kordoc", "rhwp", "anydoc", "docling", "xberg", "tika", "foliate-js", "numbers-parser",
-                 "keynote-parser", "djvu-rs", "jackcess", "libmspub", "libvisio", "poi"):
+                 "keynote-parser", "djvu-rs", "jackcess", "libmspub", "libvisio", "libwpg", "poi"):
         sec = text.split(f"## {proj}\n", 1)[1].split("\n## ", 1)[0]
         paths = re.findall(r"`(scripts/[^`]+)`", next(ln for ln in sec.splitlines() if ln.startswith("Ported:")))
         for rel, doc in docs.items():
@@ -731,21 +731,21 @@ def _mpl_ok(source: str) -> bool:
     import re
     lines = source.splitlines()[:3]
     return (len(lines) == 3 and tuple(lines[:2]) == MPL_HEAD
-            and re.match(r"^# Ported from (libmspub|libvisio) [0-9a-f]{40}, src/lib/", lines[2]) is not None)
+            and re.match(r"^# Ported from (libmspub|libvisio|libwpg) [0-9a-f]{40}, src/lib/", lines[2]) is not None)
 
 
 def test_mpl_headers():
-    # every reader module whose docstring names libmspub or libvisio (MPL-2.0) starts with the MPL header
+    # every reader module whose docstring names libmspub, libvisio or libwpg (MPL-2.0) starts with the MPL header
     import ast
     import re
     ported = []
     for f in sorted((HERE / "scripts" / "reader").rglob("*.py")):
         source = f.read_text(encoding="utf-8")
-        if re.search(r"\b(libmspub|libvisio)\b", ast.get_docstring(ast.parse(source)) or "", re.I):
+        if re.search(r"\b(libmspub|libvisio|libwpg)\b", ast.get_docstring(ast.parse(source)) or "", re.I):
             ported.append(f.relative_to(HERE).as_posix())
             assert _mpl_ok(source), f
     assert {"scripts/reader/formats/vsd_stream.py", "scripts/reader/formats/pub_contents.py",
-            "scripts/reader/formats/pub_quill.py"} <= set(ported), ported
+            "scripts/reader/formats/pub_quill.py", "scripts/reader/wpg.py"} <= set(ported), ported
     head = "\n".join(MPL_HEAD) + "\n# Ported from libvisio " + "a" * 40 + ", src/lib/X.cpp.\n"
     assert _mpl_ok(head + '"""From libvisio."""\n')
     assert not _mpl_ok('"""From libvisio."""\n')

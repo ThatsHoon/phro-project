@@ -475,13 +475,6 @@ def test_wpg_bitmap_hostile():
     peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
     assert not bitmaps(d) and d.skipped == 1 and len(paths(d)) == 1 and peak < 10 * 2**20, peak
-    # a size the data could not fill (a few bytes of RLE for millions of pixels) is refused, not allocated
-    tiny = wpg1_bitmap1(4000, 4000, 8, bytes([0x84, 1]))
-    tracemalloc.start()
-    d = wpg.parse(wpg1([tiny]))
-    peak = tracemalloc.get_traced_memory()[1]
-    tracemalloc.stop()
-    assert not bitmaps(d) and peak < 10 * 2**20, peak
     # WPG 2: the same, for plain data and for RLE
     for comp, data in ((0, b"\x00" * 4), (1, bytes([0x7F, 255]))):
         tracemalloc.start()
@@ -525,6 +518,93 @@ def test_wpg_tall_narrow_bitmap_is_bounded_by_its_pixels():
             assert e.kind == "too_large"
         else:
             raise AssertionError("no ReadError")
+
+
+def _png_size(png):
+    return struct.unpack(">II", png[16:24])
+
+
+def test_wpg_heavily_compressed_blank_bitmaps_are_kept():
+    # a blank 1700x2200 1-bit WPG 1 page: 213 bytes a row, runs of 255 bytes
+    need = 213 * 2200
+    rle = bytes([0x80, 255]) * (need // 255) + bytes([0x80, need % 255])
+    d = wpg.parse(wpg1([wpg1_bitmap1(1700, 2200, 1, rle)]))
+    assert len(bitmaps(d)) == 1 and d.skipped == 0 and _png_size(bitmaps(d)[0].data) == (1700, 2200)
+    # a blank 2000x2000 8-bit WPG 2 bitmap: one raster of runs, then the raster repeated
+    rle = bytes([0xFF, 255]) * 7 + bytes([0xFF, 207]) + bytes([0xFE, 255]) * 7 + bytes([0xFE, 242])
+    d = wpg.parse(wpg2([wpg2_bitmap(0, 0, 100, 100), wpg2_bitmap_data(2000, 2000, 4, 1, rle)]))
+    assert len(bitmaps(d)) == 1 and d.skipped == 0 and _png_size(bitmaps(d)[0].data) == (2000, 2000)
+
+
+def test_wpg_rle_bombs_stay_bounded():
+    import tracemalloc
+    old = images._MAX_PIXELS
+    images._MAX_PIXELS = 1_000_000
+    try:
+        blobs = [wpg1([wpg1_bitmap1(1000, 1000, 8, bytes([0x80, 255]) * 3922)]),
+                 # one byte a step and no output: 0x7E only sets a flag
+                 wpg2([wpg2_bitmap(0, 0, 10, 10), wpg2_bitmap_data(1000, 1000, 4, 1, bytes([0x7E]) * 500_000)]),
+                 # three bytes of data for a million pixels
+                 wpg2([wpg2_bitmap(0, 0, 10, 10), wpg2_bitmap_data(1000, 1000, 4, 1, bytes([0xFF, 255, 0x7F]))])]
+        for blob in blobs:
+            t0 = time.time()
+            wpg.parse(blob)
+            took = time.time() - t0
+            assert took < 1, took
+            tracemalloc.start()
+            wpg.parse(blob)
+            peak = tracemalloc.get_traced_memory()[1]
+            tracemalloc.stop()
+            assert peak < 50 * 2**20, peak
+    finally:
+        images._MAX_PIXELS = old
+
+
+def test_wpg2_mirrored_bitmaps():
+    pal = wpg2_palette(0, [(255, 0, 0), (0, 255, 0)])
+    red, green = (255, 0, 0), (0, 255, 0)
+    data = b"\x00\x01\x01\x01"
+    plain = wpg.parse(wpg2([pal, wpg2_bitmap(0, 0, 100, 50), wpg2_bitmap_data(2, 2, 4, 0, data)]))
+    assert png_pixels(bitmaps(plain)[0].data)[2] == [[red, green], [green, green]]
+    h = wpg.parse(wpg2([pal, wpg2_bitmap(0, 0, 100, 50, scale=(-1.0, 1.0)), wpg2_bitmap_data(2, 2, 4, 0, data)]))
+    assert png_pixels(bitmaps(h)[0].data)[2] == [[green, red], [green, green]]
+    v = wpg.parse(wpg2([pal, wpg2_bitmap(0, 0, 100, 50, scale=(1.0, -1.0)), wpg2_bitmap_data(2, 2, 4, 0, data)]))
+    assert png_pixels(bitmaps(v)[0].data)[2] == [[green, green], [red, green]]
+    both = wpg.parse(wpg2([pal, wpg2_bitmap(0, 0, 100, 50, scale=(-1.0, -1.0)), wpg2_bitmap_data(2, 2, 4, 0, data)]))
+    assert png_pixels(bitmaps(both)[0].data)[2] == [[green, green], [green, red]]
+    # the flip belongs to its bitmap record: the next, unmirrored one is as it was
+    two = wpg.parse(wpg2([pal, wpg2_bitmap(0, 0, 100, 50, scale=(-1.0, 1.0)), wpg2_bitmap_data(2, 1, 4, 0, b"\x00\x01"),
+                          wpg2_bitmap(0, 0, 100, 50), wpg2_bitmap_data(2, 1, 4, 0, b"\x00\x01")]))
+    assert [png_pixels(b.data)[2][0] for b in bitmaps(two)] == [[green, red], [red, green]]
+
+
+def test_wpg2_degenerate_matrix_is_identity_and_counted():
+    d = wpg.parse(wpg2([wpg2_polyline([(0, 0), (100, 0)], scale=(0.0, 1.0)), wpg2_polyline([(0, 0), (100, 0)])]))
+    a, b = paths(d)
+    assert pts(a) == pts(b) == [(0.0, 1200.0), (100.0, 1200.0)] and d.skipped == 1
+    d = wpg.parse(wpg2([wpg2_polyline([(5, 5), (100, 5)], skew=(1.0, 1.0))]))     # [[1, 1], [1, 1]]: determinant 0
+    assert d.skipped == 1 and pts(paths(d)[0])[0] == (5.0, 1195.0)
+    d = wpg.parse(wpg2([wpg2_polyline([(0, 0), (100, 0)], scale=(2.0, 1.0))]))
+    assert d.skipped == 0
+
+
+def test_wpg2_png_object_size_is_checked():
+    cap = wpg2_rec(0x21, wpg2_char() + wpg2_pt4(10, 10, 110, 60) + struct.pack("<H", 1) + bytes([0x25]) + bytes(7))
+
+    def img(png):
+        return wpg2_rec(0x12, struct.pack("<H", 0) + png)
+    big = images._png(4, 4, [bytes(12)] * 4, False)
+    old = images._MAX_PIXELS
+    images._MAX_PIXELS = 10
+    try:
+        d = wpg.parse(wpg2([cap, img(big)]))
+        assert not bitmaps(d) and d.skipped == 1
+        d = wpg.parse(wpg2([cap, img(big[:20])]))           # a head cut before its IHDR
+        assert not bitmaps(d) and d.skipped == 1
+        small = images._png(3, 3, [bytes(9)] * 3, False)
+        assert len(bitmaps(wpg.parse(wpg2([cap, img(small)])))) == 1
+    finally:
+        images._MAX_PIXELS = old
 
 
 def test_wpg_group_depth_and_records_cap():
