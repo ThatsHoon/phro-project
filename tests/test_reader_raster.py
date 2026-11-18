@@ -22,6 +22,7 @@ from metafile_fix import (emf, emf_brush, emf_font, emf_glyphs, emf_pen, emf_rec
                           pict_longtext, pict_op, wmf, wmf_brush, wmf_font, wmf_rect, wmf_select, wmf_text, wmf_window, wpg1,
                           wpg1_fill, wpg1_rect, wpg1_text)
 from reader import emf_write, fonts, images, limits, metafile, raster, svg_write  # noqa: E402
+from reader import pict as pictmod, wpg as wpgmod  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.vector import Bitmap, Brush, Clip, Drawing, Path as VPath, Pen, Run, text_lines  # noqa: E402
 
@@ -127,19 +128,48 @@ def dark_count(rows, x0, y0, x1, y1) -> int:
 # ---- sizes, text and warnings ----------------------------------------------------------------------------------------
 
 def test_target_size_rules():
-    assert raster.target_size(48, 48) == (96, 96)
-    assert raster.target_size(4000, 1000) == (1568, 392)
-    assert raster.target_size(100, 50) == (200, 100)
-    assert raster.target_size(1, 1) == (2, 2)
-    assert raster.target_size(0, -3) == (2, 2)
-    assert raster.target_size(10000, 1) == (1568, 1)  # each side stays at least 1
-    old = limits.FIGURE_EDGE
-    limits.FIGURE_EDGE = 10_000  # the pixel cap holds when the edge does not
+    """Sized by content: never upscaled, except text under FIGURE_TEXT_PX (up to 2x, to FIGURE_EDGE); the long side
+    at most FIGURE_EDGE_TEXT with text, FIGURE_EDGE_PLAIN without, FIGURE_EDGE_TEXT for TIFF."""
+    ts = raster.target_size
+    assert (limits.FIGURE_EDGE_TEXT, limits.FIGURE_EDGE_PLAIN, limits.FIGURE_TEXT_PX) == (1024, 768, 12)
+    # no text: never upscaled, the long side at most 768
+    assert ts(600, 400) == (600, 400) and ts(2000, 1000) == (768, 384) and ts(48, 48) == (48, 48)
+    # text: no upscale at 12 px or more, the long side at most 1024
+    assert ts(600, 400, text_px=20) == (600, 400) and ts(3000, 1500, text_px=20) == (1024, 512)
+    assert ts(600, 400, text_px=12) == (600, 400)
+    # text under 12 px: up by 12 / its height, at most 2x, then the long side at most 1568
+    assert ts(600, 200, text_px=6) == (1200, 400) and ts(600, 200, text_px=10) == (720, 240)
+    assert ts(600, 200, text_px=1) == (1200, 400) and ts(3000, 1500, text_px=6) == (1568, 784)
+    # TIFF: never upscaled, the long side at most 1024
+    assert ts(3000, 2000, kind="tiff") == (1024, 683) and ts(4, 3, kind="tiff") == (4, 3)
+    # unknown content (the parser failed, GDI+ gave the size): as text, with no upscale
+    assert ts(3000, 1500, kind="unknown") == (1024, 512) and ts(96, 96, kind="unknown") == (96, 96)
+    assert ts(1, 1) == (1, 1) and ts(0, -3) == (1, 1)
+    assert ts(10000, 1) == (768, 1)  # each side stays at least 1
+    old = limits.FIGURE_EDGE_PLAIN
+    limits.FIGURE_EDGE_PLAIN = 10_000  # the pixel cap holds when the edge does not
     try:
-        w, h = raster.target_size(8000, 8000)
+        w, h = ts(8000, 8000)
         assert w * h <= 16_777_216 and w == h and w > 4000
     finally:
-        limits.FIGURE_EDGE = old
+        limits.FIGURE_EDGE_PLAIN = old
+
+
+def test_convert_sizes_by_the_smallest_text():
+    """convert hands the renderer the size worked out from the drawing: its smallest text in pixels at 96 dpi."""
+    seen = []
+
+    def run(jobs, mono):
+        seen.append((jobs[0]["w"], jobs[0]["h"]))
+        return [None]
+
+    def pic(height=None):  # 600 x 200 px; a font of `height` twips is height / 15 px
+        recs = [wmf_font(height), wmf_select(0), wmf_text(100, 1000, b"Hi")] if height else [wmf_rect(0, 0, 900, 900)]
+        return wmf(recs, placeable=(0, 0, 9000, 3000, 1440))
+    with fake_resvg(run):
+        for height in (90, 150, 300, None):
+            raster.convert("wmf", pic(height))
+    assert seen == [(1200, 400), (720, 240), (600, 200), (600, 200)], seen
 
 
 def test_text_without_backend():
@@ -429,8 +459,9 @@ def test_gdiplus_fallback_size_96dpi():
     finally:
         raster._parse = real
     assert f.warnings == set() and f.lines == []
-    assert png_size(f.png) == raster.target_size(96, 96) == (192, 192)
-    assert png_size(g.png) == raster.target_size(200, 100) == (400, 200)
+    # content unknown: sized as text, not upscaled
+    assert png_size(f.png) == raster.target_size(96, 96, kind="unknown") == (96, 96)
+    assert png_size(g.png) == raster.target_size(200, 100, kind="unknown") == (200, 100)
     w, h, rows = png_pixels(f.png)
     assert dark(rows[h * 3 // 4][w // 4]) and not dark(rows[h // 4][w * 3 // 4])
 
@@ -450,11 +481,12 @@ def test_gdiplus_emf_write_time_is_not_rendered():
 
 @needs_gdiplus
 def test_gdiplus_emf_write_text_pixels():
-    png = render(Drawing((0, 0, 200, 100), 96.0, [Run("X", 20, 80, "Arial", 72)]))
+    d = Drawing((0, 0, 200, 100), 96.0, [Run("X", 20, 80, "Arial", 72)])
+    png = raster._render_gdiplus("pict", b"", d, 0)
     w, h, rows = png_pixels(png)
-    assert (w, h) == (400, 200)
-    assert dark_count(rows, 40, 40, 160, 170) > 300  # the X, at twice its size, above its baseline
-    assert dark_count(rows, 200, 0, 400, 200) == 0
+    assert (w, h) == raster.drawing_size(d) == (200, 100)  # 72 px text: not upscaled
+    assert dark_count(rows, 20, 20, 80, 85) > 75  # the X, above its baseline
+    assert dark_count(rows, 100, 0, 200, 100) == 0
 
 
 @needs_gdiplus
@@ -462,9 +494,9 @@ def test_gdiplus_emf_write_bitmap_lands_in_box():
     black = images._png(4, 4, [b"\x00\x00\x00" * 4] * 4, False)
     png = render(Drawing((0, 0, 100, 100), 96.0, [Bitmap(black, "png", (50, 50, 100, 100))]))
     w, h, rows = png_pixels(png)
-    assert (w, h) == (200, 200)
-    assert dark(rows[150][150]) and dark(rows[105][105]) and dark(rows[195][195])
-    assert not dark(rows[90][150]) and not dark(rows[150][90]) and not dark(rows[50][50])
+    assert (w, h) == (100, 100)  # no text: not upscaled
+    assert dark(rows[75][75]) and dark(rows[53][53]) and dark(rows[97][97])
+    assert not dark(rows[45][75]) and not dark(rows[75][45]) and not dark(rows[25][25])
 
 
 @needs_gdiplus
@@ -477,17 +509,20 @@ def test_gdiplus_emf_write_clips():
         png = render(Drawing((0, 0, 100, 100), 96.0, [Clip(clip), VPath(whole, None, Brush(0)), Clip(None),
                                                       VPath(corner, None, Brush(0))]))
         w, h, rows = png_pixels(png)
-        assert dark(rows[inside[1] * 2][inside[0] * 2]) and not dark(rows[outside[1] * 2][outside[0] * 2])
-        assert dark(rows[10][190])  # drawn after the clip is removed
+        assert (w, h) == (100, 100)  # no text: not upscaled
+        assert dark(rows[inside[1]][inside[0]]) and not dark(rows[outside[1]][outside[0]])
+        assert dark(rows[5][95])  # drawn after the clip is removed
 
 @needs_gdiplus
 def test_gdiplus_wmf_png_size():
     data = wmf([wmf_text(100, 200, b"Hello")])  # placeable 1440 x 1440 at 1440 a inch: 96 px
     f = raster.convert("wmf", data)
     assert f.png is not None and f.lines == ["Hello"]
-    assert png_size(f.png) == raster.target_size(96, 96) == (192, 192)
+    assert png_size(f.png) == raster.drawing_size(metafile.parse(data))
+    assert metafile.parse(data).size_px() == (96, 96)
     data = wmf([wmf_text(100, 200, b"Wide")], placeable=(0, 0, 2880, 720, 1440))
-    assert png_size(raster.convert("wmf", data).png) == (384, 96)
+    d = metafile.parse(data)
+    assert d.size_px() == (192, 48) and png_size(raster.convert("wmf", data).png) == raster.drawing_size(d)
 
 
 @needs_gdiplus
@@ -495,8 +530,8 @@ def test_gdiplus_emf_png():
     data = emf([emf_brush(0x000000), emf_rect(0, 1270, 1270, 2540), emf_textw(100, 200, "Hi")])
     f = raster.convert("emf", data)
     assert f.png[:8] == b"\x89PNG\r\n\x1a\n" and f.lines == ["Hi"]
-    want = raster.target_size(*metafile.parse(data).size_px())
-    assert png_size(f.png) == want == (192, 192)
+    want = raster.drawing_size(metafile.parse(data))
+    assert png_size(f.png) == want and metafile.parse(data).size_px() == (96, 96)
     w, h, rows = png_pixels(f.png)
     assert dark(rows[h * 3 // 4][w // 4]) and not dark(rows[h // 4][w * 3 // 4])  # the black lower left quarter
 
@@ -507,9 +542,9 @@ def test_gdiplus_text_pixels():
     f = raster.convert("wmf", data)
     assert f.lines == ["X"]
     w, h, rows = png_pixels(f.png)
-    assert (w, h) == (400, 200)
-    assert dark_count(rows, 40, 20, 170, 180) > 300  # the X, at twice its size
-    assert dark_count(rows, 200, 0, 400, 200) == 0   # nothing to its right
+    assert (w, h) == (200, 100)  # 72 px text: not upscaled
+    assert dark_count(rows, 20, 10, 85, 90) > 75  # the X
+    assert dark_count(rows, 100, 0, 200, 100) == 0   # nothing to its right
 
 
 @needs_gdiplus
@@ -519,8 +554,10 @@ def test_gdiplus_wmf_without_placeable():
     f = raster.convert("wmf", data)
     assert f.lines == ["Plain"] and f.png is not None
     w, h, rows = png_pixels(f.png)
-    assert (w, h) == (600, 300)
-    assert dark(rows[225][150]) and not dark(rows[75][450]) and not dark(rows[225][450])
+    assert (w, h) == raster.drawing_size(metafile.parse(data)) and w * 150 == h * 300
+    k = w / 300
+    assert dark(rows[int(112 * k)][int(75 * k)]) and not dark(rows[int(37 * k)][int(225 * k)])
+    assert not dark(rows[int(112 * k)][int(225 * k)])
     # no window and no parser frame to take the box from: 512 px on the long side
     bare = raster._placeable(wmf([wmf_text(1, 1, b"a")], placeable=None), None)
     assert bare[6:14] == struct.pack("<4h", 0, 0, 512, 512)
@@ -534,8 +571,9 @@ def test_gdiplus_pict_via_emf():
     f = raster.convert("pict", data)
     assert f.lines == ["Mac"] and f.png is not None
     w, h, rows = png_pixels(f.png)
-    assert (w, h) == (192, 192)
-    assert dark(rows[150][40]) and not dark(rows[150][150])
+    assert (w, h) == raster.drawing_size(pictmod.parse(data)) and w == h
+    k = w / 192
+    assert dark(rows[int(150 * k)][int(40 * k)]) and not dark(rows[int(150 * k)][int(150 * k)])
 
 
 @needs_gdiplus
@@ -544,8 +582,9 @@ def test_gdiplus_wpg_via_emf():
     f = raster.convert("wpg", data)
     assert f.lines == ["Wpg"] and f.png is not None
     w, h, rows = png_pixels(f.png)
-    assert (w, h) == (192, 192)
-    assert dark(rows[150][40]) and not dark(rows[40][40])
+    assert (w, h) == raster.drawing_size(wpgmod.parse(data)) and w == h
+    k = w / 192
+    assert dark(rows[int(150 * k)][int(40 * k)]) and not dark(rows[int(40 * k)][int(40 * k)])
 
 
 def tiff(pages) -> bytes:
@@ -598,13 +637,13 @@ def test_gdiplus_tiff_page_two():
     data = tiff([(4, 3, 0), (10, 5, 255)])
     assert raster.tiff_pages(data) == 2
     one = raster.convert("tiff", data)
-    assert png_size(one.png) == raster.target_size(4, 3) == (8, 6) and one.lines == []
+    assert png_size(one.png) == raster.target_size(4, 3, kind="tiff") == (4, 3) and one.lines == []
     two = raster.convert("tiff", data, page=1)
-    assert png_size(two.png) == raster.target_size(10, 5) == (20, 10)
+    assert png_size(two.png) == raster.target_size(10, 5, kind="tiff") == (10, 5)
     _, _, rows = png_pixels(two.png)
-    assert rows[5][10] == (255, 255, 255)
+    assert rows[2][5] == (255, 255, 255)
     _, _, rows = png_pixels(one.png)
-    assert dark(rows[3][4])
+    assert dark(rows[1][2])
     assert raster.convert("tiff", data, page=2).png is None
 
 
@@ -890,7 +929,7 @@ def test_backend_none_without_venv_or_libraries():
 @needs_image_venv
 def test_resvg_render():
     d = sample_drawing()
-    size = raster.target_size(*d.size_px())
+    size = raster.drawing_size(d)
     png = raster._render_local({"svg": svg_write.write(d, size, fonts.resolve), "w": size[0], "h": size[1]})
     assert png[:8] == PNG_HEAD and png_size(png) == size
 
@@ -899,7 +938,7 @@ def test_resvg_render():
 def test_pillow_tiff_page():
     data = base64.b64encode(tiff([(6, 4, 10), (8, 5, 250)])).decode("ascii")
     png = raster._render_local({"tiff": data, "page": 1})
-    assert png[:8] == PNG_HEAD and png_size(png) == raster.target_size(8, 5)
+    assert png[:8] == PNG_HEAD and png_size(png) == raster.target_size(8, 5, kind="tiff")
     assert raster._render_local({"tiff": data, "page": 2}) is None
 
 
@@ -928,7 +967,8 @@ def test_lone_emf_file():
     if WINDOWS and raster.backend() == "gdiplus":
         assert md.count("](assets/img-001.png)") == 1 and md.count("![") == 1, md
         assert meta["figures"] == 1 and meta["figures_left"] == 0 and meta["images"] == 1, meta
-        assert png_size((out / "assets" / "img-001.png").read_bytes()) == (192, 192)
+        want = raster.drawing_size(metafile.parse(data))
+        assert png_size((out / "assets" / "img-001.png").read_bytes()) == want, want
     else:
         print("skip: test_lone_emf_file PNG half (needs Windows GDI+)")
 
@@ -997,7 +1037,7 @@ def test_lone_tiff_pages_and_cap():
     if WINDOWS and raster.backend() == "gdiplus":
         assert md.count("![page ") == 3 and meta["figures"] == 3 and meta["figures_left"] == 0, (md, meta)
         sizes = [png_size((out / "assets" / f"img-00{i}.png").read_bytes()) for i in (1, 2, 3)]
-        assert sizes == [raster.target_size(4, 3), raster.target_size(10, 5), raster.target_size(6, 6)], sizes
+        assert sizes == [(4, 3), (10, 5), (6, 6)], sizes  # TIFF pages: not upscaled
     with no_backend():  # unconverted pages share one copy of the original file
         md, meta, out = convert_lone(p)
         assert sorted(f.name for f in (out / "assets").iterdir()) == ["img-001.tiff"], list((out / "assets").iterdir())

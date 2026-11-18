@@ -50,7 +50,10 @@ TABLE_NODES = 100_000
 SMARTART_NODES = 5_000  # SmartArt text items one document may emit, copies counted; one data part reads at most four times as many points and connections
 # metafile pictures (WMF, EMF, PICT, WPG, TIFF): each cap is read at call time
 FIGURE_CHARS = 20_000      # figure text per picture
-FIGURE_EDGE = 1_568        # long side of a figure PNG, in pixels
+FIGURE_EDGE = 1_568        # long side of a figure PNG upscaled for small text, in pixels
+FIGURE_EDGE_TEXT = 1_024   # long side of a figure PNG with text (and of a TIFF page), never upscaled otherwise
+FIGURE_EDGE_PLAIN = 768    # long side of a figure PNG with no text, never upscaled
+FIGURE_TEXT_PX = 12        # smallest text height, in pixels at 96 dpi, under which a figure is upscaled (at most 2x)
 FIGURE_RESERVE = 3         # seconds left before the deadline under which no further picture is rendered
 METAFILE_RECORDS = 1_000_000  # records of one WMF, EMF, PICT or WPG
 METAFILE_POINTS = 4_000_000   # points across all paths of one picture

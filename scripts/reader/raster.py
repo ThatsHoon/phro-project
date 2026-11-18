@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import emf_write, fonts, images, limits, svg_write
 from .limits import ReadError
-from .vector import CAP, text_lines
+from .vector import CAP, Run, text_lines
 
 KINDS = ("wmf", "emf", "pict", "wpg", "tiff")
 DEADLINE_ENV = "PHRO_READER_DEADLINE"
@@ -74,12 +74,26 @@ def _detect() -> str:
         return "none"
 
 
-def target_size(w_px: int, h_px: int) -> tuple[int, int]:
-    """The PNG size for a picture of w_px x h_px: the long side up to FIGURE_EDGE, at most twice the picture, the
-    pixel count under images._MAX_PIXELS, the aspect kept and each side at least 1."""
+def target_size(w_px: int, h_px: int, *, text_px: float | None = None, kind: str = "") -> tuple[int, int]:
+    """The PNG size for a picture of w_px x h_px at 96 dpi, by its content, so a figure costs no more pixels than its
+    text needs:
+    - with text (`text_px`, its smallest run in pixels): not upscaled, the long side at most FIGURE_EDGE_TEXT; text
+      under FIGURE_TEXT_PX is scaled up by FIGURE_TEXT_PX / text_px, at most 2x, the long side then at most FIGURE_EDGE;
+    - with no text (text_px None): not upscaled, the long side at most FIGURE_EDGE_PLAIN;
+    - kind "tiff" (scans hold text not seen yet) or "unknown" (the parser failed): not upscaled, at most
+      FIGURE_EDGE_TEXT.
+    The pixel count stays under images._MAX_PIXELS, the aspect is kept and each side is at least 1."""
     w = max(1, int(w_px)) if math.isfinite(w_px) else 1
     h = max(1, int(h_px)) if math.isfinite(h_px) else 1
-    k = min(2.0, max(1, limits.FIGURE_EDGE) / max(w, h))
+    if kind in ("tiff", "unknown"):
+        k, edge = 1.0, limits.FIGURE_EDGE_TEXT
+    elif text_px is None:
+        k, edge = 1.0, limits.FIGURE_EDGE_PLAIN
+    elif text_px < limits.FIGURE_TEXT_PX:
+        k, edge = min(2.0, limits.FIGURE_TEXT_PX / text_px) if text_px > 0 else 2.0, limits.FIGURE_EDGE
+    else:
+        k, edge = 1.0, limits.FIGURE_EDGE_TEXT
+    k = min(k, max(1, edge) / max(w, h))
     tw, th = max(1, round(w * k)), max(1, round(h * k))
     cap = images._MAX_PIXELS
     if tw * th > cap:
@@ -91,6 +105,23 @@ def target_size(w_px: int, h_px: int) -> tuple[int, int]:
             else:
                 th = max(1, cap // tw)
     return tw, th
+
+
+def text_px(d) -> float | None:
+    """The height in pixels at 96 dpi of the drawing's smallest text run (its em height after every transform), or
+    None when it has no text."""
+    k = 96.0 / d.dpi if d.dpi > 0 else 1.0
+    least = None
+    for it in d.items:
+        if isinstance(it, Run) and (it.text.strip() or it.glyphs) and math.isfinite(it.height) and it.height > 0:
+            px = it.height * k
+            least = px if least is None else min(least, px)
+    return least
+
+
+def drawing_size(d) -> tuple[int, int]:
+    """target_size for a parsed drawing: its frame at 96 dpi and its smallest text."""
+    return target_size(*d.size_px(), text_px=text_px(d))
 
 
 def _env_deadline() -> float | None:
@@ -247,7 +278,7 @@ def _pillow_tiff(Image, data: bytes, page: int) -> bytes | None:
         rgba = im.convert("RGBA")
     flat = Image.new("RGB", rgba.size, (255, 255, 255))
     flat.paste(rgba, mask=rgba.getchannel("A"))
-    size = target_size(w, h)
+    size = target_size(w, h, kind="tiff")
     if size != (w, h):
         flat = flat.resize(size, Image.Resampling.LANCZOS)
     out = io.BytesIO()
@@ -351,7 +382,7 @@ def _render_resvg(kind: str, data: bytes, d, page: int, mono: float | None = Non
     else:
         if d is None:  # SVG needs the drawing
             return None
-        size = target_size(*d.size_px())
+        size = drawing_size(d)
         job = {"svg": svg_write.write(d, size, fonts.resolve), "w": size[0], "h": size[1]}
     png = _run_jobs([job], mono)[0]
     if not isinstance(png, (bytes, bytearray)) or bytes(png[:8]) != _PNG_SIG:
@@ -631,7 +662,7 @@ def _with_image(g, data: bytes, create, use):
 
 def _metafile_png(g, data: bytes, size) -> bytes:
     def use(img):
-        tw, th = size if size is not None else target_size(*_metafile_size(g, img))
+        tw, th = size if size is not None else target_size(*_metafile_size(g, img), kind="unknown")
         return _draw(g, img, tw, th)
     return _with_image(g, data, g.GdipCreateMetafileFromStream, use)
 
@@ -681,7 +712,7 @@ def _tiff_png(g, data: bytes, page: int) -> bytes | None:
         w, h = _image_size(g, img)
         if not 0 < w * h <= images._MAX_PIXELS:
             return None
-        return _draw(g, img, *target_size(w, h))
+        return _draw(g, img, *target_size(w, h, kind="tiff"))
     return _with_image(g, data, g.GdipCreateBitmapFromStream, use)
 
 
@@ -694,13 +725,13 @@ def _render_gdiplus(kind: str, data: bytes, d, page: int, mono: float | None = N
     if kind in ("pict", "wpg"):
         if d is None:
             return None
-        return _metafile_png(g, emf_write.write(d, _decoder(g), mono), target_size(*d.size_px()))
+        return _metafile_png(g, emf_write.write(d, _decoder(g), mono), drawing_size(d))
     mk = _meta_kind(data)
     if mk is None:
         return None
-    size = target_size(*d.size_px()) if d is not None else None
+    size = drawing_size(d) if d is not None else None
     if mk == "wmf":
         data = _placeable(data, d.frame if d is not None else None)
         if size is None:
-            size = target_size(_BARE_EDGE, _BARE_EDGE)
+            size = target_size(_BARE_EDGE, _BARE_EDGE, kind="unknown")
     return _metafile_png(g, data, size)
