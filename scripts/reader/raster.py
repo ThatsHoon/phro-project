@@ -124,15 +124,19 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
     data = bytes(data)
     if deadline is None:
         deadline = _env_deadline()
-    mono = time.monotonic() + (deadline - time.time()) if deadline is not None else None
+    # every figure step (the parser's Budget, emf_write, the venv child's timeout) stops FIGURE_RESERVE before the
+    # document deadline: a figure still working then leaves the rest of the document that time to be written
+    mono = time.monotonic() + (deadline - limits.FIGURE_RESERVE - time.time()) if deadline is not None else None
     d = None
     refused = False  # the parser said the bytes are not the format: they are never handed to GDI+
+    late = False  # the parser was stopped by the time: its text is cut, and nothing is drawn
     if kind != "tiff":
         fonts.UNMAPPED = False
         try:
             d = _parse(kind, data, codepage, mono)
         except ReadError as e:
             refused = e.kind == "damaged"
+            late = e.detail == "figure time"
             # a size cap keeps the drawing read up to it (vector.kept: damaged, its text kept); one that still got out
             # leaves no text, and GDI+ draws the picture
             if e.kind == "too_large" and e.detail == CAP:
@@ -152,7 +156,7 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
             if fonts.UNMAPPED:
                 fig.warnings.add("figure glyphs unmapped")
         fonts.UNMAPPED = False
-    if deadline is not None and deadline - time.time() < limits.FIGURE_RESERVE:
+    if late or (mono is not None and time.monotonic() >= mono):  # less than FIGURE_RESERVE left
         fig.warnings.add(limits.FIGURES_LATE)
         return fig
     b = backend()

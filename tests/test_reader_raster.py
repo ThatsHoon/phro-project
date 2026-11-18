@@ -793,6 +793,36 @@ def test_resvg_job_carries_our_svg():
     assert job["w"] >= 1 and job["h"] >= 1 and f'width="{job["w"]}"' in job["svg"]
 
 
+def test_figure_work_keeps_the_reserve():
+    """Every figure step (the parser's Budget, emf_write, the image venv's child) stops FIGURE_RESERVE before the
+    document deadline, so a figure still working leaves the rest of the document that time to be written."""
+    data = wmf([wmf_text(100, 200, b"Hello")])
+    given = []
+
+    def slow(kind, data, codepage, mono):  # works until the time it is given, as Budget does, then stops
+        given.append(mono)
+        while mono is not None and time.monotonic() < mono:
+            time.sleep(0.01)
+        raise ReadError("too_large", "figure time")
+    real = raster._parse
+    raster._parse = slow
+    deadline = time.time() + limits.FIGURE_RESERVE + 0.5
+    try:
+        with no_backend():
+            f = raster.convert("wmf", data, deadline=deadline)
+    finally:
+        raster._parse = real
+    left = deadline - time.time()
+    assert f.png is None and f.warnings == {limits.FIGURES_LATE}, f
+    assert left > limits.FIGURE_RESERVE - 1, left  # returned about half a second in, the reserve still ahead
+    # the renderer (emf_write and GDI+, or the venv's child) is handed the same time: the deadline less the reserve
+    deadline = time.time() + limits.FIGURE_RESERVE + 30
+    with fake_resvg(lambda jobs, mono: given.append(mono) or [None]):
+        g = raster.convert("wmf", data, deadline=deadline)
+    want = time.monotonic() + (deadline - limits.FIGURE_RESERVE - time.time())
+    assert g.lines == ["Hello"] and abs(given[-1] - want) < 1, (given[-1], want)
+
+
 def test_resvg_failure_leaves_text():
     data = wmf([wmf_text(100, 200, b"Hello")])
 
