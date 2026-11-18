@@ -110,6 +110,27 @@ def test_budget_records():
         raise AssertionError("no error")
 
 
+def test_budget_deadline():
+    def calls_until_error(b, call):
+        for i in range(1, 4097):
+            try:
+                call(b)
+            except ReadError as e:
+                assert e.kind == "too_large" and e.detail == "figure time"
+                return i
+        return None
+    past = time.monotonic() - 1.0
+    assert calls_until_error(Budget(deadline=past), Budget.tick) == 4096
+    assert calls_until_error(Budget(deadline=past), lambda b: b.points(0)) == 4096
+    b = Budget(deadline=past)  # tick and points share one counter
+    for _ in range(2048):
+        b.tick()
+    assert calls_until_error(b, lambda b: b.points(0)) == 2048
+    # a deadline still ahead, or none, never raises
+    assert calls_until_error(Budget(deadline=time.monotonic() + 3600), Budget.tick) is None
+    assert calls_until_error(Budget(), Budget.tick) is None
+
+
 def test_symbol_table():
     assert text.SYMBOL[0x61] == "α" and text.SYMBOL[0x44] == "Δ"
     assert text.SYMBOL[0xA5] == "∞" and text.SYMBOL[0xB4] == "×"

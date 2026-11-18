@@ -4,6 +4,7 @@ It holds no format knowledge. Colors are 0xRRGGBB; None means no pen or no fill.
 own frame units, y growing downward.
 """
 import math
+import time
 import unicodedata
 from dataclasses import dataclass, field
 
@@ -91,22 +92,35 @@ def arc_beziers(cx, cy, rx, ry, start, sweep) -> list[tuple]:
     return out
 
 
+CLOCK_EVERY = 4096  # Budget calls between two reads of the clock
+
+
 class Budget:
     """Counts records and points against the caps, read at call time unless given."""
 
-    def __init__(self, records=None, points=None):
+    def __init__(self, records=None, points=None, deadline: float | None = None):
         self._records = records
         self._points = points
+        self.deadline = deadline  # a time.monotonic() value, or None for no time limit
         self.n = 0
         self.p = 0
+        self._calls = 0
+
+    def _clock(self):
+        """Reads the clock once every CLOCK_EVERY calls of tick and points together, not on each."""
+        self._calls += 1
+        if self.deadline is not None and self._calls % CLOCK_EVERY == 0 and time.monotonic() > self.deadline:
+            raise ReadError("too_large", "figure time")
 
     def tick(self):
+        self._clock()
         self.n += 1
         cap = limits.METAFILE_RECORDS if self._records is None else self._records
         if self.n > cap:
             raise ReadError("too_large", "figure")
 
     def points(self, n):
+        self._clock()
         self.p += n
         cap = limits.METAFILE_POINTS if self._points is None else self._points
         if self.p > cap:

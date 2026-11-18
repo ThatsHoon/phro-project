@@ -707,6 +707,47 @@ def test_emfplus_path_object_drawn_many_times_charged():
     assert _kind_under_points_cap(1000, clips) == "too_large"
 
 
+def test_items_weighed_by_cost():
+    # a Run or a Bitmap costs ITEM_WEIGHT points, a Clip its points but at least 4, a Path its points
+    w = metafile.ITEM_WEIGHT
+    assert w == 16
+    three = emf([emf_font(-100), BASELINE] + [emf_textw(0, 100 * i, "t") for i in range(3)])
+    assert len(runs(metafile.parse(three))) == 3
+    assert _kind_under_points_cap(3 * w, three) is None and _kind_under_points_cap(3 * w - 1, three) == "too_large"
+    png = b"\x89PNG\r\n\x1a\n" + b"\0" * 20
+    two = emf([emfplus([plus_header(False), plus_image_bitmap(0, png)] + [plus_draw_image(0, 0, 0, 96, 48)] * 2)])
+    assert _kind_under_points_cap(2 * w, two) is None and _kind_under_points_cap(2 * w - 1, two) == "too_large"
+    # SAVEDC, a clip rectangle (5 points), RESTOREDC back to no clip (Clip(None): 4), then a rectangle (5 points)
+    clipped = emf([emf_rec(33), emf_rec(30, struct.pack("<4i", 0, 0, 50, 50)), emf_rec(34, struct.pack("<i", -1)),
+                   emf_rect(0, 0, 10, 10)])
+    d = metafile.parse(clipped)
+    assert [type(i).__name__ for i in d.items] == ["Clip", "Clip", "Path"] and d.items[1].segs is None
+    assert _kind_under_points_cap(14, clipped) is None and _kind_under_points_cap(13, clipped) == "too_large"
+
+
+def _nested_runs(depth: int) -> bytes:
+    x = emf([emf_font(-100), BASELINE, emf_textw(100, 300, "deep")])
+    for _ in range(depth):
+        x = _place_many(x, 10)
+    return x
+
+
+def test_nested_runs_stop_at_the_deadline():
+    import time
+    x = _nested_runs(7)  # 10**7 runs if nothing stopped it
+    t = time.monotonic()
+    try:
+        metafile.parse(x, deadline=t + 0.2)
+    except ReadError as e:
+        assert e.kind == "too_large" and e.detail == "figure time", e
+    else:
+        raise AssertionError("no too_large")
+    assert time.monotonic() - t < 2.0
+    # a deadline that is not reached changes nothing
+    d = metafile.parse(_nested_runs(1), deadline=time.monotonic() + 3600)
+    assert [r.text for r in runs(d)] == ["deep"] * 10
+
+
 def test_dual_skipped_records_still_move_the_current_point():
     def last_path(skipped):
         recs = [emfplus([plus_header(), plus_fill_rect(0, 0, 5, 5)]), emf_rec(27, struct.pack("<ii", 10, 10))]

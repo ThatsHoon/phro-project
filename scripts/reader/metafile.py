@@ -167,9 +167,16 @@ def _is_emf(d: bytes) -> bool:
     return len(d) >= 44 and struct.unpack_from("<I", d)[0] == 1 and d[40:44] == b" EMF"
 
 
-def parse(data: bytes, codepage: str = "") -> Drawing:
-    """The drawing of a WMF or EMF. ReadError("damaged", "not a metafile") when the bytes are neither."""
-    return _parse(data, codepage, 0, None)
+# METAFILE_POINTS charged for an item that is not a path: a run or a bitmap costs far more to put out and to write
+# than one point, and a clip is at least its rectangle
+ITEM_WEIGHT = 16
+CLIP_LEAST = 4
+
+
+def parse(data: bytes, codepage: str = "", deadline: float | None = None) -> Drawing:
+    """The drawing of a WMF or EMF. ReadError("damaged", "not a metafile") when the bytes are neither. Past
+    `deadline` (a time.monotonic() value) the figure stops with ReadError("too_large", "figure time")."""
+    return _parse(data, codepage, 0, Budget(deadline=deadline))
 
 
 def _parse(data: bytes, codepage: str, depth: int, budget) -> Drawing:
@@ -461,16 +468,21 @@ class _Wmf:
         w = max(self._dist(pen.width, 0), self.dpi / 96.0)
         return Pen(pen.color, w if math.isfinite(w) else 1.0)
 
-    def _charge(self, segs=None):
-        """The one place METAFILE_POINTS is charged: every item as it goes out, kept or dropped, a path or clip by
-        its points (a close counts as one), anything else as one. Geometry drawn again, a path object filled many
-        times or a nested picture placed many times, is so paid for each time it is drawn."""
-        self.budget.points(1 if segs is None else sum((len(s) - 1) // 2 or 1 for s in segs))
+    def _charge(self, segs=None, least=0):
+        """The one place METAFILE_POINTS is charged: every item as it goes out, kept or dropped. A path costs its
+        points (a close counts as one), a clip its points but at least `least`, a run or a bitmap ITEM_WEIGHT.
+        Geometry drawn again, a path object filled many times or a nested picture placed many times, is so paid for
+        each time it is drawn."""
+        if segs is None and not least:
+            n = ITEM_WEIGHT
+        else:
+            n = max(least, sum((len(s) - 1) // 2 or 1 for s in segs or ()))
+        self.budget.points(n)
 
     def _emit(self, item):
         """A Clip or Bitmap, charged; one with a non-finite coordinate is dropped and counted."""
         if isinstance(item, Clip):
-            self._charge(item.segs)
+            self._charge(item.segs, CLIP_LEAST)
             vals = () if item.segs is None else [v for s in item.segs for v in s[1:]]
         else:
             self._charge()
