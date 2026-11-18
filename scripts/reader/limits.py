@@ -48,6 +48,17 @@ IMAGE_BYTES = 256 * 2**20
 # ten times that is past any, and holds the tables to about 60 MB and a second or two of parse and render
 TABLE_NODES = 100_000
 SMARTART_NODES = 5_000  # SmartArt text items one document may emit, copies counted; one data part reads at most four times as many points and connections
+# metafile pictures (WMF, EMF, PICT, WPG, TIFF): each cap is read at call time
+FIGURE_CHARS = 20_000      # figure text per picture
+FIGURE_EDGE = 1_568        # long side of a figure PNG, in pixels
+FIGURE_RESERVE = 3         # seconds left before the deadline under which no further picture is rendered
+METAFILE_RECORDS = 1_000_000  # records of one WMF, EMF, PICT or WPG
+METAFILE_POINTS = 4_000_000   # points across all paths of one picture
+METAFILE_OBJECTS = 65_535     # WMF and EMF object table slots
+METAFILE_NESTING = 16         # metafiles nested inside EMF+ image objects
+TIFF_PAGES = 100           # pages of a lone TIFF
+FONT_FILES = 4_000         # font files indexed
+FONT_BYTES = 64 * 2**20    # bytes read from one font file
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 # a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
 BIG_INPUT = "input"  # the file is over MAX_INPUT
