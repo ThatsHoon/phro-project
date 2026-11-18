@@ -4,6 +4,7 @@ Run: python -I -X utf8 tests/test_reader_vector.py
 """
 import math
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -113,6 +114,40 @@ def test_symbol_table():
     assert text.SYMBOL[0x61] == "α" and text.SYMBOL[0x44] == "Δ"
     assert text.SYMBOL[0xA5] == "∞" and text.SYMBOL[0xB4] == "×"
     assert text.SYMBOL[0x20] == " " and 0xFE in text.SYMBOL
+
+
+def test_overprint_is_near_linear():
+    runs = [run("w%d" % (i % 50), (i % 200) * 40.0, (i // 200) * 20.0) for i in range(20000)]
+    runs.append(run("w0", 0.5, 0.5))  # a true overprint of the first run
+    old = limits.FIGURE_CHARS
+    limits.FIGURE_CHARS = 10**9
+    try:
+        t = time.time()
+        lines, _ = text_lines(draw(*runs))
+        assert time.time() - t < 5
+    finally:
+        limits.FIGURE_CHARS = old
+    assert sum(l.split().count("w0") for l in lines) == sum(1 for i in range(20000) if i % 50 == 0)
+
+
+def test_arc_beziers_clamped():
+    assert len(arc_beziers(0, 0, 1, 1, 0, 1e9)) <= 4
+    for bad in (float("inf"), float("nan")):
+        assert arc_beziers(0, 0, 1, 1, 0, bad) == []
+        assert arc_beziers(bad, 0, 1, 1, 0, 90) == []
+        assert arc_beziers(0, 0, 1, bad, 0, 90) == []
+        assert arc_beziers(0, 0, 1, 1, bad, 90) == []
+
+
+def test_wide_characters_count_one_em():
+    d = draw(run("한글", 0, 100), run("글", 20, 100))  # "한글" spans 20 at 1 em a character
+    assert text_lines(d)[0] == ["한글글"]
+    assert text_lines(draw(run("한글", 0, 100), run("글", 35, 100)))[0] == ["한글 글"]
+
+
+def test_run_width_used():
+    assert text_lines(draw(run("ab", 0, 100, width=50), run("c", 55, 100)))[0] == ["abc"]
+    assert text_lines(draw(run("ab", 0, 100, width=5), run("c", 55, 100)))[0] == ["ab c"]
 
 
 def main():

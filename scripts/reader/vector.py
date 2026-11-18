@@ -4,6 +4,7 @@ It holds no format knowledge. Colors are 0xRRGGBB; None means no pen or no fill.
 own frame units, y growing downward.
 """
 import math
+import unicodedata
 from dataclasses import dataclass, field
 
 from . import limits
@@ -41,6 +42,7 @@ class Run:
     angle: float = 0.0
     color: int = 0
     glyphs: tuple | None = None  # glyph numbers when text is ""
+    width: float | None = None  # advance width in frame units, when the parser knows it
 
 
 @dataclass
@@ -71,6 +73,9 @@ class Drawing:
 
 def arc_beziers(cx, cy, rx, ry, start, sweep) -> list[tuple]:
     """Cubic "C" segments (at most 90 degrees each) for an elliptical arc; angles in degrees."""
+    if not all(map(math.isfinite, (cx, cy, rx, ry, start, sweep))):
+        return []
+    sweep = max(-360.0, min(360.0, sweep))
     n = max(1, math.ceil(abs(sweep) / 90.0 - 1e-9))
     step = math.radians(sweep) / n
     k = 4.0 / 3.0 * math.tan(step / 4.0)
@@ -109,12 +114,43 @@ class Budget:
 
 
 def _width(r: Run, text: str) -> float:
-    return 0.5 * r.height * len(text)  # no font metrics here: half an em per character
+    if r.width is not None:
+        return r.width
+    # no font metrics here: one em for a wide East Asian character, half an em for the rest
+    return r.height * sum(1.0 if unicodedata.east_asian_width(c) in "WF" else 0.5 for c in text)
+
+
+def _seen(grid: dict, r: Run, t: str) -> bool:
+    """True when an earlier run with the same text lies within a quarter of r's height; r is added otherwise.
+
+    Kept runs sit in a grid per text, cell size a power of two near a quarter of their own height, so a lookup
+    visits a few cells instead of every earlier run.
+    """
+    tol = 0.25 * r.height
+    levels = grid.setdefault(t, {})
+    for e, cells in levels.items():
+        c = 2.0 ** e
+        if tol / c > 2:  # a coarse query over a fine grid: scan the level
+            if any(abs(r.x - q.x) <= tol and abs(r.y - q.y) <= tol for lst in cells.values() for q in lst):
+                return True
+            continue
+        for i in range(math.floor((r.x - tol) / c), math.floor((r.x + tol) / c) + 1):
+            for j in range(math.floor((r.y - tol) / c), math.floor((r.y + tol) / c) + 1):
+                for q in cells.get((i, j), ()):
+                    if abs(r.x - q.x) <= tol and abs(r.y - q.y) <= tol:
+                        return True
+    h = 0.25 * r.height
+    e = math.ceil(math.log2(h)) if h > 0 and math.isfinite(h) else 0
+    c = 2.0 ** e
+    if math.isfinite(r.x) and math.isfinite(r.y):
+        levels.setdefault(e, {}).setdefault((math.floor(r.x / c), math.floor(r.y / c)), []).append(r)
+    return False
 
 
 def text_lines(d: Drawing, resolve=None) -> tuple[list[str], bool]:
     """Reading-order lines of a drawing's text, and whether FIGURE_CHARS cut them."""
     kept: list[tuple[Run, str]] = []
+    grid: dict = {}
     for r in d.items:
         if not isinstance(r, Run):
             continue
@@ -123,22 +159,21 @@ def text_lines(d: Drawing, resolve=None) -> tuple[list[str], bool]:
             t = resolve(r)
         if not t or not t.strip():
             continue
-        if any(t == u and abs(r.x - q.x) <= 0.25 * r.height and abs(r.y - q.y) <= 0.25 * r.height
-               for q, u in kept):
+        if _seen(grid, r, t):
             continue
         kept.append((r, t))
-    rows: list[tuple[float, float, list]] = []  # (anchor y, order, runs)
+    rows: list[list] = []  # [anchor y, runs, largest height]
     flat = sorted((p for p in kept if p[0].angle % 360 == 0), key=lambda p: p[0].y)
     cur = None
     for r, t in flat:
-        if cur is not None and abs(r.y - cur[0]) <= 0.5 * max(r.height, cur[3]):
-            cur[2].append((r, t))
-            cur[3] = max(cur[3], r.height)
+        if cur is not None and abs(r.y - cur[0]) <= 0.5 * max(r.height, cur[2]):
+            cur[1].append((r, t))
+            cur[2] = max(cur[2], r.height)
         else:
-            cur = [r.y, 0, [(r, t)], r.height]
+            cur = [r.y, [(r, t)], r.height]
             rows.append(cur)
     lines: list[tuple[float, str]] = []
-    for y, _, runs, _h in rows:
+    for y, runs, _h in rows:
         runs.sort(key=lambda p: p[0].x)
         s = ""
         prev = None
