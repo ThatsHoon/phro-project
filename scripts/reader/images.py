@@ -182,12 +182,16 @@ class Assets:
             if png is not None:
                 data, kind = png, "png"
         elif kind in FIGURES:
-            from . import raster
-            fig = raster.convert(kind, data, codepage=codepage)
-            lines = list(fig.lines)
-            self.warnings |= fig.warnings
-            if fig.png is not None:
-                data, kind = fig.png, "png"
+            try:
+                from . import raster
+                fig = raster.convert(kind, data, codepage=codepage)
+                lines = list(fig.lines)
+                self.warnings |= fig.warnings
+                png = fig.png
+            except Exception:  # noqa: BLE001 - a picture never makes a document fail
+                lines, png = [], None
+            if png is not None:
+                data, kind = png, "png"
                 self.figures += 1
             else:
                 self.figures_left += 1

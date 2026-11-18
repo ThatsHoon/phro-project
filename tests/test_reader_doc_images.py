@@ -497,6 +497,14 @@ def test_many_shapes_linear():
     assert time.monotonic() - t0 < 10
 
 
+def test_picture_codepage_is_the_document_code_page():
+    # lid 0x0412 is Korean (double byte): compressed text is cp1252 but the picture's code page is cp949
+    p = inline_doc(picf_inline(blip_png(PNG)), "a\x01\r", lid=0x0412)
+    d, ctx = parse(p)
+    assert [b.codepage for b in d.blocks if isinstance(b, Image)] == ["cp949"], d.blocks
+    d, ctx = parse(inline_doc(picf_inline(blip_png(PNG)), "a\x01\r", lid=0x0409))
+    assert [b.codepage for b in d.blocks if isinstance(b, Image)] == ["cp1252"]
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

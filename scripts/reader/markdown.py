@@ -391,9 +391,11 @@ class _Render:
         fig = m.esc("Figure text: " + " / ".join(lines))
         if m is not BLOCK:
             return head + " " + fig if head else fig
+        if not head:
+            return fig  # the caller's tag marks this paragraph
         if b.hidden and self.show:
-            fig = "(hidden) " + fig  # its own paragraph is marked as the link's is
-        return head + "\n\n" + fig if head else fig
+            fig = "(hidden) " + fig  # a second paragraph: marked as the first is
+        return head + "\n\n" + fig
 
     def _image(self, b: Image) -> list:
         s = self._image_text(b)

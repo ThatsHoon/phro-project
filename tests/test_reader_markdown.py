@@ -801,6 +801,16 @@ def test_figure_warnings_in_meta():
     assert info["warnings"] == ["figure damaged", "figure text cut"], info
 
 
+def test_hidden_figure_tag_once_everywhere():
+    with figs(["x"], png=None):
+        out = R(Doc(blocks=[Image(FIG, hidden="hidden")]), hidden=True)
+        assert out.count("(hidden)") == 1 and "(hidden) Figure text: x" in out, out
+        out = R(Doc(blocks=[Image(FIG, alt="a", hidden="hidden")]), hidden=True)
+        assert out.count("(hidden)") == 2 and "(hidden) [image: a]" in out and "(hidden) Figure text: x" in out, out
+    with figs(["x"]):
+        out = R(Doc(blocks=[Table([[Cell([Image(FIG, hidden="hidden")]), Cell([P("z")])]])]), hidden=True)
+        assert out.count("(hidden)") == 1, out
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

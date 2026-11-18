@@ -277,6 +277,31 @@ def test_assets_figure_unconverted_and_codepage():
 
 
 
+def test_codepage_part_of_cache_key():
+    data = wmf([wmf_text(100, 200, b"Hi")])
+    with fake_convert(lambda k, b, **kw: raster.Figure(PNG, [], set())) as fc:
+        with tempfile.TemporaryDirectory() as d:
+            a = images.Assets(Path(d) / "assets")
+            p1 = a.add(data, codepage="cp949")
+            p2 = a.add(data, codepage="cp1252")
+            assert len(fc.calls) == 2 and p1 != p2, (fc.calls, p1, p2)
+            a.add(data, codepage="cp949")
+            a.add(data, codepage="cp1252")
+            assert len(fc.calls) == 2
+
+
+def test_convert_error_keeps_original():
+    data = wmf([wmf_text(100, 200, b"Hi")])
+
+    def boom(k, b, **kw):
+        raise RuntimeError("x")
+    with fake_convert(boom):
+        with tempfile.TemporaryDirectory() as d:
+            a = images.Assets(Path(d) / "assets")
+            assert a.add(data) == ("assets/img-001.wmf", False)
+            assert (Path(d) / "assets" / "img-001.wmf").read_bytes() == data
+            assert a.figures == 0 and a.figures_left == 1 and not a.lines
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

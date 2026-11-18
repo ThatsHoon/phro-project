@@ -979,7 +979,7 @@ class _Reader:
             return
         run = st.run
         st.extras.append(Image(data, hidden="deleted" if run.deleted else "hidden" if run.vanish else "",
-                                codepage=doc_fib.compressed_codepage(self.lid)))
+                                codepage=doc_fib.codepage(self.lid)))
 
 
 def parse(path, ctx) -> Doc:
