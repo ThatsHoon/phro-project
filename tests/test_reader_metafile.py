@@ -226,6 +226,26 @@ def test_wmf_placeable_frame_ignores_the_viewport():
     assert p.segs[0][1:] == (0, 0) and p.segs[2][1:] == (1000, 1000)
 
 
+def test_wmf_frame_keeps_a_lines_extent():
+    d = metafile.parse(wmf([wmf_rec(0x0214, 50, 10), wmf_rec(0x0213, 50, 210)], placeable=None))
+    assert d.frame == (10, 50, 210, 50)
+    (p,) = [i for i in d.items if isinstance(i, VPath)]
+    xs = [v for s in p.segs for v in s[1::2]]
+    assert d.frame[0] <= min(xs) and max(xs) <= d.frame[2] and p.segs[0][2] == d.frame[1]
+    assert d.size_px() == (200, 1)
+
+
+def test_wmf_window_maps_onto_the_placeable_box():
+    box = (0, 0, 1000, 1000, 1000)
+    vp = [wmf_rec(0x020D, 7, 9), wmf_rec(0x020E, 300, 300)]
+    d = metafile.parse(wmf(wmf_window((0, 0), (2000, 2000)) + vp + [wmf_rect(0, 0, 2000, 2000)], placeable=box))
+    (p,) = [i for i in d.items if isinstance(i, VPath)]
+    assert p.segs[0][1:] == (0, 0) and p.segs[2][1:] == (1000, 1000) and d.frame == (0, 0, 1000, 1000)
+    d = metafile.parse(wmf(wmf_window((0, 2000), (2000, -2000)) + vp + [wmf_rect(0, 0, 2000, 2000)], placeable=box))
+    (p,) = [i for i in d.items if isinstance(i, VPath)]
+    assert p.segs[0][1:] == (0, 1000) and p.segs[2][1:] == (1000, 0)
+
+
 def test_wmf_never_emits_non_finite_values():
     recs = wmf_window((0, 0), (100, 100)) + [wmf_rec(0x0410, 1, 32767, 1, 32767)] * 100 + [
         wmf_font(-10), wmf_select(0), wmf_text(5, 5, b"t"), wmf_rect(0, 0, 10, 10)]
@@ -303,7 +323,7 @@ def test_wmf_mutated_records_never_raise():
         except ReadError:
             continue
         _assert_finite(d)
-    assert time.time() - t0 < 10
+    assert time.time() - t0 < 5
 
 
 def test_not_a_metafile():

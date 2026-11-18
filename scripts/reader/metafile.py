@@ -249,7 +249,7 @@ class _Wmf:
             pos += size
         self._freeze()
         frame = self.frame or self._extent()
-        if not _ok(*frame) or frame[0] == frame[2] or frame[1] == frame[3]:
+        if not _ok(*frame):  # a zero width or height stays: size_px clamps each side to a pixel
             frame = (0.0, 0.0, 1.0, 1.0)
         return Drawing(frame, self.dpi, self.items, self.damaged, self.skipped)
 
