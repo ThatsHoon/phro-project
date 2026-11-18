@@ -224,6 +224,44 @@ def test_pict_pixpat_is_stepped_over():
     assert text_lines(d)[0] == ["x"] and not d.damaged
 
 
+def test_pict_tall_narrow_bitmap_is_bounded_by_its_width():
+    import time
+    import tracemalloc
+    # 8-bit, w=1, h=32000, rowBytes 16383: each row is a u16 count and two packed bytes, but is kept as 1 byte
+    row = struct.pack(">H", 2) + bytes([0, 1])
+    data = (_pixmap(1, 32000, 16383, 8, table=[(0, 0, 0), (255, 0, 0)]) + rect(0, 0, 32000, 1) + rect(0, 0, 32000, 1)
+            + struct.pack(">H", 0) + row * 32000)
+    blob = pict([pict_op(0x98, data)])
+    t0 = time.time()
+    d = pictmod.parse(blob)
+    took = time.time() - t0
+    assert len(bitmaps(d)) == 1 and not d.damaged and took < 1, took
+    tracemalloc.start()                                 # the clock apart from tracemalloc's own slowing
+    pictmod.parse(blob)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert peak < 50 * 2**20, peak
+
+
+def test_pict_extended_dpi_is_clamped():
+    assert pictmod.parse(pict([], dpi=1 / 65536)).dpi == 1.0
+    assert pictmod.parse(pict([], dpi=30000)).dpi == 4800.0
+    assert pictmod.parse(pict([], dpi=1 / 65536)).size_px()[0] <= 72 * 96
+
+
+def test_pict_unpacked_32bit_row_is_pad_r_g_b():
+    for pt in (0, 2, 4):
+        data = (struct.pack(">I", 0xFF) + _pixmap(1, 1, 4, 32, packtype=pt, cmp=3, cmpsize=8, direct=True)
+                + rect(0, 0, 1, 1) + rect(0, 0, 1, 1) + struct.pack(">H", 0) + bytes([0, 255, 0, 0]))
+        d = pictmod.parse(pict([pict_op(0x9A, data)]))
+        assert png_pixels(bitmaps(d)[0].data)[2] == [[(255, 0, 0)]], pt
+
+
+def test_pict_font_zero_is_chicago():
+    d = pictmod.parse(pict([pict_longtext(5, 5, b"x")]))
+    assert runs(d)[0].face == "Chicago"
+
+
 def test_pict_not_a_pict_and_caps():
     for bad in (b"\x00" * 600, b"abc", b""):
         try:

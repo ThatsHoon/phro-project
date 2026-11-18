@@ -32,10 +32,11 @@ _HEADER_OP, _QT_COMPRESSED, _QT_UNCOMPRESSED = 0x0C00, 0x8200, 0x8201
 _OLD_COLORS = {33: 0x000000, 30: 0xFFFFFF, 205: 0xFF0000, 341: 0x00FF00, 409: 0x0000FF, 273: 0x00FFFF,
                137: 0xFF00FF, 69: 0xFFFF00}
 # Mac font ids with a well-known name; others have none
-_FONTS = {0: "System", 1: "Geneva", 2: "New York", 3: "Geneva", 4: "Monaco", 5: "Venice", 6: "London", 7: "Athens",
+_FONTS = {0: "Chicago", 1: "Geneva", 2: "New York", 3: "Geneva", 4: "Monaco", 5: "Venice", 6: "London", 7: "Athens",
           8: "San Francisco", 9: "Toronto", 11: "Cairo", 12: "Los Angeles", 13: "Zapf Dingbats", 14: "Bookman",
           15: "Helvetica Narrow", 16: "Palatino", 18: "Zapf Chancery", 20: "Times", 21: "Helvetica", 22: "Courier",
           23: "Symbol", 24: "Taliesin"}
+MIN_DPI, MAX_DPI = 1.0, 4800.0   # the resolution of an extended header is clamped to these
 _DEFAULT_FACE = "Geneva"
 _DEFAULT_SIZE = 12.0
 
@@ -306,7 +307,7 @@ class _Pict:
                 h = struct.unpack_from(">i", d, p + 4)[0] / 65536.0
                 t, l, b, r = struct.unpack_from(">hhhh", d, p + 12)
                 if h > 0 and _ok(h):
-                    self.dpi = h
+                    self.dpi = min(max(h, MIN_DPI), MAX_DPI)
                 if r != l and b != t:
                     self.frame = (float(min(l, r)), float(min(t, b)), float(max(l, r)), float(max(t, b)))
             return end
@@ -602,14 +603,20 @@ class _Pict:
         if rb < max(need, 0):
             raise ValueError("row bytes")
         compressed = packed and rb >= 8 and pt != 1
-        unit, expected = 1, rb
+        unit = 1
         if ps == 16:
             pt = 3 if pt == 0 else pt
             unit = 2 if pt == 3 else 1
+            keep_len = 2 * w
         elif ps == 32:
             pt = 4 if pt == 0 else pt
             cmpn = cmp if cmp in (3, 4) else 3
-            expected = w * cmpn if pt == 4 else (w * 3 if pt == 2 else rb)
+            # what a row holds once unpacked: planes, or 3-byte pixels, or (not compressed) pad, R, G, B pixels
+            keep_len = w * cmpn if compressed and pt == 4 else (3 * w if compressed and pt == 2 else 4 * w)
+        else:
+            keep_len = need
+        # a row is cut to what its pixels need, never padded out to the declared rowBytes, and the bytes kept are capped
+        room = images._MAX_PIXELS * 4
         rows = []
         for _ in range(h):
             if compressed:
@@ -621,13 +628,17 @@ class _Pict:
                     p += 1
                 end = self._need(p + n)
                 if keep:
-                    rows.append(_unpack(d[p:end], expected, unit))
+                    rows.append(_unpack(d[p:end], keep_len, unit))
                 p = end
             else:
                 end = self._need(p + rb)
                 if keep:
-                    rows.append(d[p:end])
+                    rows.append(d[p:min(end, p + keep_len)])
                 p = end
+            if keep:
+                room -= keep_len
+                if room < 0:
+                    raise ValueError("rows too large")
             self.budget.points(0)                       # the deadline is read here, once in CLOCK_EVERY calls
         info["_mode"] = (ps, pt, cmp, compressed)
         return rows, p
@@ -655,13 +666,13 @@ class _Pict:
                 if ps == 16:
                     words = struct.unpack(">%dH" % w, row[:2 * w])
                     bgr = b"".join(map(tab.__getitem__, words))
-                elif pt == 4 or compressed and pt != 2:
+                elif compressed and pt == 4:
                     planes = cmp if cmp in (3, 4) else 3
                     r_, g_, b_ = (row[(planes - 3 + k) * w:(planes - 2 + k) * w] for k in range(3))
                     ba = bytearray(3 * w)
                     ba[0::3], ba[1::3], ba[2::3] = b_, g_, r_
                     bgr = bytes(ba)
-                elif pt == 2:                           # pad byte dropped: R, G, B in pixel order
+                elif compressed and pt == 2:            # pad byte dropped: R, G, B in pixel order
                     ba = bytearray(row[:3 * w])
                     ba[0::3], ba[2::3] = ba[2::3], ba[0::3]
                     bgr = bytes(ba)

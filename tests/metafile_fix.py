@@ -422,7 +422,7 @@ def pict(opcodes: list[bytes], frame=(0, 0, 72, 72), version=2, head=True, dpi=7
     if version == 1:
         out = struct.pack(">HhhhhBB", 0, top, left, bottom, right, 0x11, 0x01) + body + b"\xff"
     else:
-        hdr = struct.pack(">HHii4hI", 0xFFFE, 0, dpi << 16, dpi << 16, top, left, bottom, right, 0)
+        hdr = struct.pack(">HHii4hI", 0xFFFE, 0, int(dpi * 65536), int(dpi * 65536), top, left, bottom, right, 0)
         out = (struct.pack(">Hhhhh", 0, top, left, bottom, right) + b"\x00\x11\x02\xff" + b"\x0c\x00" + hdr
                + body + b"\x00\xff")
     out = struct.pack(">H", len(out) & 0xFFFF) + out[2:]
