@@ -54,7 +54,11 @@ The parser collects text runs from the drawing list with their position in the p
 ### The PNG
 
 - Size: the picture's frame at 96 dpi. WMF uses the placeable header's box and units per inch; a WMF without one uses its `SetWindowExt` extent as pixels, else 512 px on the long side. EMF uses `rclFrame` (0.01 mm). PICT uses `picFrame` at 72 dpi, WPG its page size, TIFF its pixels.
-- The long side is scaled down to at most `FIGURE_EDGE` (1568 px), the size above which Claude's image input is downscaled anyway. A small picture is scaled up at most 2×. The pixel count stays under the existing 16,777,216 cap.
+- The size follows what the picture holds (owner, 2026-11-18, after the bench showed image tokens growing tenfold). Figure text already carries the words, so the PNG is not enlarged for them:
+  - A picture with text runs keeps its size, with the long side at most `FIGURE_EDGE_TEXT` (1024 px). When its smallest text run is under `FIGURE_TEXT_PX` (12 px) high, it is scaled up until that run is 12 px, at most 2×, with the long side at most `FIGURE_EDGE` (1568 px, the size above which Claude's image input is downscaled anyway).
+  - A picture with no text runs is never scaled up; its long side is at most `FIGURE_EDGE_PLAIN` (768 px).
+  - A TIFF is never scaled up; its long side is at most 1024 px, since a scan holds text the parser cannot see.
+  - The pixel count stays under the existing 16,777,216 cap.
 - The background is white: a transparent PNG shows dark in some viewers, and office pictures assume paper.
 - TIFF inside a document gives its first page. A lone TIFF file gives every page, up to `TIFF_PAGES` (100), one image each.
 
@@ -177,6 +181,9 @@ All of these go in `limits.py`:
 |---|---|---|
 | `FIGURE_CHARS` | 20,000 | figure text per picture |
 | `FIGURE_EDGE` | 1,568 | long side of a figure PNG, in pixels |
+| `FIGURE_EDGE_TEXT` | 1,024 | long side of a figure PNG with text runs, unless tiny text scales it up |
+| `FIGURE_EDGE_PLAIN` | 768 | long side of a figure PNG with no text runs |
+| `FIGURE_TEXT_PX` | 12 | smallest text height, in pixels, below which a figure is scaled up |
 | `FIGURE_RESERVE` | 3 | seconds left before the deadline under which no further picture is rendered |
 | `METAFILE_RECORDS` | 1,000,000 | records of one WMF, EMF, PICT or WPG |
 | `METAFILE_POINTS` | 4,000,000 | points across all paths of one picture |
