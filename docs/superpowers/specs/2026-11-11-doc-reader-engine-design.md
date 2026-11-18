@@ -2,13 +2,13 @@
 
 ## Goal
 
-phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all formats in scope: the 28 of decision 1, and since decision 7 also docx, pptx, xlsx and xlsm with their template and macro variants, since decision 8 pdf, with phase 3 the WordPerfect variants wp, wp5, wp6, wp7 and wpt, and with phase 4 the variants mde, accde, accdr, djv, vst, vsdm, vstx and mpt (54 extensions). The standard library is not a goal (the user, 2026-11-16): parsers and libraries are chosen for token efficiency, compute efficiency and the AI understanding every content type; a third-party library is used wherever it measurably beats our own code, installed only on the user's yes. The parsers built so far are Python with no third-party imports; libraries in use today (decision 8: pypdfium2 for pdf, in a plugin-managed venv created only with the user's yes, with a stdlib parser beside it; decision 9: MPXJ for mpp, which reads only through its opt-in venv). It is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
+phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all formats in scope: the 28 of decision 1, and since decision 7 also docx, pptx, xlsx and xlsm with their template and macro variants, since decision 8 pdf, with phase 3 the WordPerfect variants wp, wp5, wp6, wp7 and wpt, with phase 4 the variants mde, accde, accdr, djv, vst, vsdm, vstx and mpt, and since decision 11 the picture files wmf, emf, wmz, emz, tif, tiff, pct, pict and wpg (63 extensions). The standard library is not a goal (the user, 2026-11-16): parsers and libraries are chosen for token efficiency, compute efficiency and the AI understanding every content type; a third-party library is used wherever it measurably beats our own code, installed only on the user's yes. The parsers built so far are Python with no third-party imports; libraries in use today (decision 8: pypdfium2 for pdf, in a plugin-managed venv created only with the user's yes, with a stdlib parser beside it; decision 9: MPXJ for mpp, which reads only through its opt-in venv; decision 11: resvg_py and Pillow for pictures on macOS and Linux, in the opt-in image venv). It is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
 
 This is stage 4 of the user's request. Stages 1 to 3 (clone, test, report) are done: `C:\Users\hunje\research\ai-document-reader-plugins\bench` and its reports.
 
 Success:
 
-- Every in-scope extension converts through the gate with no software outside the plugin-managed venvs. pdf converts with none at all through its stdlib parser; the optional pdf venv holds only pypdfium2 and is created only with the user's yes (phase 2d). mpp has no stdlib path: it converts only through the mpp venv (MPXJ and JPype), created only with the user's yes, using a Java already on PATH. The plugin never installs Java (phase 4).
+- Every in-scope extension converts through the gate with no software outside the plugin-managed venvs. pdf converts with none at all through its stdlib parser; the optional pdf venv holds only pypdfium2 and is created only with the user's yes (phase 2d). mpp has no stdlib path: it converts only through the mpp venv (MPXJ and JPype), created only with the user's yes, using a Java already on PATH. The plugin never installs Java (phase 4). Pictures (WMF, EMF, PICT, WPG, TIFF) become PNGs on Windows with nothing installed, through GDI+; on macOS and Linux through the image venv, created only with the user's yes; their text needs nothing (decision 11).
 - On the bench, for every format with scored documents, the engine's fidelity is at least the current recommended route's minus 0.01, and its calibrated tokens are at most that route's plus 5%. Where it misses, the format's report says why and what it would take. For docx, pptx, xlsx and xlsm the route is the skill's own read command run on the original file, and the skill's own load is reported in its own column (decision 7).
 - A document never reaches Claude as raw binary: the gate either swaps in the Markdown or blocks the Read with a reason.
 - Nothing is printed into a session that does not read a document. The plugin's always-on token cost does not change.
@@ -26,6 +26,7 @@ Success:
 8. (User, 2026-11-14.) pdf is read by the engine: phase 2d, specified in `2026-11-14-doc-reader-pdf-design.md`. Editing and creation stay with `anthropic-skills:pdf`. The stdlib-only rule is dropped (the user, 2026-11-14, restated 2026-11-16: the bar is token and compute efficiency, never the standard library); for pdf that library is pypdfium2 in a plugin-managed venv, installed only on the user's yes, with a stdlib port of dochan's parser when there is no venv.
 9. (User, 2026-11-14.) Phase 4 as specified in `2026-11-15-doc-reader-phase4-design.md`: djvu reads its text layer only; MPL-2.0 ports (libmspub, libvisio) are allowed; mpp is unsupported by default and read only through an opt-in MPXJ venv.
 10. (User, 2026-11-17.) Diagrams as specified in `2026-11-17-doc-reader-diagrams-design.md`: shapes joined by connectors become a Mermaid flowchart, or a nested list for a branching tree, and connector ends left loose are placed by position.
+11. (User, 2026-11-18.) Metafiles as specified in `2026-11-18-doc-reader-metafiles-design.md`: WMF, EMF, PICT, WPG and TIFF pictures become PNG links followed by their text, drawn by GDI+ on Windows and by our SVG writer and resvg_py elsewhere.
 
 ## Reverse-engineering findings that shape the design
 
@@ -71,7 +72,7 @@ scripts/reader/
                vsd.py vsd_stream.py mpp.py mpp_mpxj.py
                pdf.py pdf_pdfium.py pdf_layout.py pdf_tables.py
   pdfnative/                    stdlib pdf parser (dochan port)
-  pyenv.py pysetup.py           the pdf and mpp venvs: location, ready marker, setup
+  pyenv.py pysetup.py           the pdf, mpp and image venvs: location, ready marker, setup
 ```
 
 Each format module exposes one function, `parse(path: Path, ctx: Context) -> Doc`. It reads through a container module and emits model blocks; it never writes Markdown. `markdown.render(doc, assets_dir) -> str` is the only place output format and token rules live, so every format gets the same rules.
@@ -84,7 +85,7 @@ Each format module exposes one function, `parse(path: Path, ctx: Context) -> Doc
 | `convert <file> [--out DIR] [--hidden]` | converts one file, prints the out.md path |
 | `formats` | lists extensions and their module |
 | `prune [--days 30]` | deletes cache entries not used for N days |
-| `setup [--for pdf\|mpp] [--venv DIR] [--check] [--decline] [--remove]` | creates, checks or removes the pdf (default) or mpp venv; run only on the user's yes |
+| `setup [--for pdf\|mpp\|image] [--venv DIR] [--check] [--decline] [--remove]` | creates, checks or removes the pdf (default), mpp or image venv; run only on the user's yes |
 
 ### Document model
 
@@ -111,7 +112,7 @@ From what cost tokens or lost content in the bench outputs:
 - Diagrams: connected shapes leave the flow for one fenced `mermaid` `Code` block (or a nested list for a tree) at the first connected shape's place, followed by `nK:` paragraphs for content too long or rich for a node label.
 - Footnotes and comments: `[^n]` in place, definitions at the end of the document. A spreadsheet cell's comment is a footnote on its cell, and an external hyperlink stays a link in the cell.
 - Headers and footers: deduplicated, one `Header:`/`Footer:` line at the top; page-number-only ones dropped.
-- Images: written to `assets/img-NNN.<ext>` and linked as `![alt](assets/img-NNN.png)`. Never base64. BMP is converted to PNG. WMF, EMF and other formats Claude cannot view are kept as files and listed once in a note.
+- Images: written to `assets/img-NNN.<ext>` and linked as `![alt](assets/img-NNN.png)`. Never base64. BMP is converted to PNG. WMF, EMF, PICT, WPG and TIFF are converted to PNG when a backend is present, and their text follows the link (`Figure text:`); a picture that does not convert, and other formats Claude cannot view, are kept as files and listed once in a note.
 - Hidden content (hidden text, rows, sheets, slides, sections) and tracked deletions are left out. The first line says how many places were left out; `convert --hidden` includes them, marked `(hidden)`.
 - Metadata: title only, and only when the body does not start with it.
 
@@ -131,7 +132,7 @@ The hook must also run correctly when Claude reads the converted file or an asse
 
 ### Cache
 
-`%LOCALAPPDATA%\phro-project\reader\<sha1[:2]>\<sha1>\` on Windows, `~/.cache/phro-project/reader/...` elsewhere: `out.md`, `assets/`, `meta.json` (source path, size, version, seconds, warnings). Shared by every project and every clone of the plugin. A different version re-converts. For pdf the key also holds the engine id (pypdfium2 and pdfium versions, or `native`). `prune` is manual.
+`%LOCALAPPDATA%\phro-project\reader\<sha1[:2]>\<sha1>\` on Windows, `~/.cache/phro-project/reader/...` elsewhere: `out.md`, `assets/`, `meta.json` (source path, size, version, seconds, warnings). Shared by every project and every clone of the plugin. A different version re-converts. For pdf the key also holds the engine id (pypdfium2 and pdfium versions, or `native`). For every format it also holds the image backend id (`gdiplus`, `resvg-<version>` or `none`). `prune` is manual.
 
 ### Safety and errors
 
@@ -155,6 +156,7 @@ The gate ships in phase 1. A format whose phase is not built yet is denied with 
 | 3 | wpd (with wp, wp5, wp6, wp7, wpt), mobi, azw3, pages, numbers, key | `palmdb`, `snappy`, `pbwire`; specified in `2026-11-15-doc-reader-phase3-design.md` |
 | 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp (opt-in) | `bzz`, `jet_pages`, `vsd_stream`, `pub_contents`, `pub_quill`, `pyenv` (mpp); specified in `2026-11-15-doc-reader-phase4-design.md` |
 | diagrams | every format with drawings: vsd, vsdx, ppt, pptx, doc, docx, xls, xlsx, odp, odt, ods, pub, hwp, hwpx | `diagram`; specified in `2026-11-17-doc-reader-diagrams-design.md` |
+| metafiles | wmf, emf, wmz, emz, tif, tiff, pct, pict, wpg, and the pictures in every format | `vector`, `metafile`, `pict`, `wpg`, `fonts`, `raster`, `emf_write`, `svg_write`, `pyenv` (image); specified in `2026-11-18-doc-reader-metafiles-design.md` |
 
 Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-reader-plugins/notes/*-survey.md`, rulings in `rea-decisions.md`). A format that cannot reach the success bar stays "unsupported" with the reason recorded; mpp is one: unsupported by default, read only through the opt-in `read.py setup --for mpp` path when Java and the user's install are present.
 
@@ -169,4 +171,4 @@ Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-read
 
 ## Out of scope
 
-OCR of scanned pages or images (specified next, in spec ③; until then a scanned pdf page goes out as a page image); rendering WMF/EMF (spec ②); diagram structure in pdf and xps, which have no connector data; user passwords and DRM removal; editing or writing documents (pdf editing and creation stay with `anthropic-skills:pdf`).
+OCR of scanned pages or images (specified next, in spec ③; until then a scanned pdf page goes out as a page image and a scanned TIFF as a PNG); diagram structure in pdf, xps and pictures, which have no connector data; user passwords and DRM removal; editing or writing documents (pdf editing and creation stay with `anthropic-skills:pdf`).

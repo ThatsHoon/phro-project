@@ -1,6 +1,6 @@
 # doc-reader metafiles: WMF, EMF, PICT, WPG and TIFF as viewable figures
 
-Draft 2026-11-18, written from the user's answers in the brainstorm; it awaits the user's review. It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec); the engine spec edits listed at the end are made in the commit that records its approval. It is the second of three content-gap specs, in the user's order: ① diagrams (done, reader 0.8.0), ② metafiles (this), ③ OCR. Research behind it, outside this repository: the session notes `research-wmf-diagram.md` (part 1).
+Approved 2026-11-18 (the user: "Approve, write plan"), written from the user's answers in the brainstorm. It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec); the engine spec edits listed at the end are made in the commit that records its approval. It is the second of three content-gap specs, in the user's order: ① diagrams (done, reader 0.8.0), ② metafiles (this), ③ OCR. Research behind it, outside this repository: the session notes `research-wmf-diagram.md` (part 1).
 
 ## Goal
 
