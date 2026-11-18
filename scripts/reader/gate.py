@@ -360,7 +360,8 @@ def _windows():
 def image_backend(venv=None):
     """The figure backend id in the key of every format but pdf and mpp: "gdiplus" on Windows, where the image venv
     is never used, even when it exists; elsewhere pyenv.engine("image") ("resvg-…" when the venv is READY, else
-    "none"). The convert child works out the same id itself (raster.backend())."""
+    "none"). The convert child keys with this same function on Windows (read._image_id), so GDI+ is never started
+    for a key; elsewhere it works the id out itself (raster.backend(), which also verifies the venv)."""
     if _windows():
         return "gdiplus"
     from reader import pyenv

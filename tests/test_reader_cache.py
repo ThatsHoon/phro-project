@@ -469,7 +469,7 @@ def test_figure_cache_carries_a_cut_read_further():
         with stub():
             sys.modules[STUB].parse = lambda path, ctx: Doc(blocks=[Image(b) for b in pics])
             p = sample()
-            k = cache.key(p, image=raster.backend())
+            k = cache.key(p, image=read._image_id("_teststub"))
             done = []
             for n in (6, 4, 2):  # each read converts two more; the ones before come from the figure cache
                 calls.clear()
@@ -491,6 +491,30 @@ def test_figure_cache_carries_a_cut_read_further():
             assert code == 0 and calls == [] and Path(o.strip()).parent.name == k
     finally:
         raster.convert = real
+
+
+def test_child_key_is_the_gates_without_gdiplus():
+    """On Windows the convert child keys a read with the gate's own backend id: GDI+ is not started for the key, so
+    a child whose GdiplusStartup fails still files the read where the gate looks for it."""
+    if sys.platform != "win32":
+        print("skip: test_child_key_is_the_gates_without_gdiplus (needs Windows GDI+)")
+        return
+    from reader import gate, raster
+    started = []
+
+    def failing():  # GdiplusStartup failing in this child
+        started.append(1)
+        return None
+    old = raster._gdip, raster._backend
+    raster._gdip, raster._backend = failing, None
+    try:
+        with stub():
+            p = sample()
+            code, o = cli("convert", str(p))
+            assert code == 0 and Path(o.strip()).parent.name == cache.key(p, image=gate.image_backend()), o
+            assert started == [], "GDI+ started for the key"
+    finally:
+        raster._gdip, raster._backend = old
 
 
 def test_figure_cache_misses_and_prunes():

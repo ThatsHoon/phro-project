@@ -126,6 +126,20 @@ def cmd_setup(a) -> int:
     return 1 if line.startswith("FAIL") else 0
 
 
+def _image_id(fmt) -> str:
+    """The figure backend id of the cache key for format module `fmt`: none for pdf and mpp (their venv children
+    have no figure backend: the engine id alone). On Windows the gate's own id (gate.image_backend), so GDI+ is not
+    started just for a key and the child files the read where the gate looks even when GdiplusStartup fails here;
+    elsewhere the image venv's id as this process works it out (raster.backend)."""
+    if fmt in ("pdf", "mpp"):
+        return ""
+    if sys.platform == "win32":
+        from reader import gate
+        return gate.image_backend()
+    from reader import raster
+    return raster.backend()
+
+
 def cmd_convert(a) -> int:
     from reader import cache
     src = Path(a.file)
@@ -151,12 +165,8 @@ def cmd_convert(a) -> int:
                 out = Path(a.out)
                 reader.convert(src, out, a.hidden, **opts)
             else:
-                image = ""
-                if fmt not in ("pdf", "mpp"):  # their venv children have no figure backend: the engine id alone
-                    from reader import raster
-                    image = raster.backend()
                 # a key handed in (--key) is used as it is
-                k = a.key if _is_key(a.key) else cache.key(src, engine, image)
+                k = a.key if _is_key(a.key) else cache.key(src, engine, _image_id(fmt))
                 if "pages" in opts:
                     k += f"-p{a.pages[0]}-{a.pages[1]}"
                 if a.hidden:
