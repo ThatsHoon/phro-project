@@ -7,6 +7,9 @@ from pathlib import Path
 VIEWABLE = frozenset({"png", "jpg", "gif", "webp"})
 _MAX_PIXELS = 16_777_216
 FIGURES = frozenset({"wmf", "emf", "pict", "wpg", "tiff"})  # converted to PNG with their text (raster)
+# the per-figure cache (cache.Figures) Assets reads before converting a figure and keeps finished ones in; set by
+# cache.store for the read it files, None otherwise
+FIGURE_CACHE = None
 
 
 def sniff(data: bytes) -> str | None:
@@ -153,6 +156,27 @@ def _bmp_to_png(data: bytes) -> bytes | None:
     return _png(w, h, rows, alpha)
 
 
+def _figure(kind: str, data: bytes, sha: str, codepage: str, page: int):
+    """raster.convert's Figure for one picture, from FIGURE_CACHE when it holds it; a finished one is kept there."""
+    from . import raster
+    store, k = FIGURE_CACHE, None
+    if store is not None:
+        try:
+            k = store.key(sha, codepage, page, raster.backend())
+            fig = store.get(k)
+            if fig is not None:
+                return fig
+        except Exception:  # noqa: BLE001 - the figure cache is only a shortcut
+            k = None
+    fig = raster.convert(kind, data, codepage=codepage, **({"page": page} if page else {}))
+    if k is not None:
+        try:
+            store.put(k, fig)  # not when the time cut it
+        except Exception:  # noqa: BLE001
+            pass
+    return fig
+
+
 class Assets:
     """Writes images under `dir`, named img-001.ext in order; identical bytes share a file."""
 
@@ -173,7 +197,7 @@ class Assets:
         kind = sniff(data)
         if kind is None:
             return "", False
-        key = hashlib.sha1(data).hexdigest()
+        sha = key = hashlib.sha1(data).hexdigest()
         if kind in FIGURES:  # the code page can change the text, so it is part of the key
             key += "/" + codepage
         base = key
@@ -188,8 +212,7 @@ class Assets:
                 data, kind = png, "png"
         elif kind in FIGURES:
             try:
-                from . import raster
-                fig = raster.convert(kind, data, codepage=codepage, **({"page": page} if page else {}))
+                fig = _figure(kind, data, sha, codepage, page)
                 lines = list(fig.lines)
                 self.warnings |= fig.warnings
                 png = fig.png

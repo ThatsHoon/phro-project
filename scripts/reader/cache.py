@@ -116,7 +116,83 @@ def _complete(d: Path) -> bool:
     return (d / "out.md").is_file() and (d / "meta.json").is_file()
 
 
+FIGURES = "figures"  # the folder under the root that holds converted figures (Figures)
+_FIG_MAGIC = b"PHROFIG1"
+
+
+class Figures:
+    """Converted figures, one file each at <dir>/<k[:2]>/<k>: the PNG (if any), the text lines and the figure's own
+    warnings. A read the deadline cut is not filed, but the figures it finished are kept here, so the next read
+    takes them and gets further. Figures cut by the time are never stored. Written atomically; prune clears them."""
+
+    def __init__(self, dir: Path):
+        self.dir = Path(dir)
+
+    @staticmethod
+    def key(sha: str, codepage: str, page: int, backend: str) -> str:
+        """sha1 of the picture bytes' sha1, the code page, the page and the backend id, under the reader's version
+        and code digest (a code change misses, as the document cache does)."""
+        h = hashlib.sha1(VERSION.encode() + b"\0" + code_digest().encode() + b"\0")
+        for part in (sha, codepage, str(int(page)), backend):
+            h.update(part.encode("utf-8", "replace") + b"\0")
+        return h.hexdigest()
+
+    def path(self, k: str) -> Path:
+        return self.dir / k[:2] / k
+
+    def get(self, k: str):
+        """The stored raster.Figure, or None (a miss, or a file that does not read back whole)."""
+        import json
+        from .raster import Figure
+        f = self.path(k)
+        try:
+            raw = f.read_bytes()
+        except OSError:
+            return None
+        try:
+            if raw[:8] != _FIG_MAGIC or len(raw) < 12:
+                return None
+            n = int.from_bytes(raw[8:12], "little")
+            head = json.loads(raw[12:12 + n].decode("utf-8"))
+            png = raw[12 + n:] or None
+            lines, warnings = head["lines"], head["warnings"]
+            if (not isinstance(lines, list) or not all(isinstance(x, str) for x in lines)
+                    or not isinstance(warnings, list) or not all(isinstance(x, str) for x in warnings)
+                    or head.get("png") != len(png or b"") or (png is not None and png[:8] != b"\x89PNG\r\n\x1a\n")):
+                return None
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
+        try:
+            os.utime(f, None)  # in use: prune keeps it
+        except OSError:
+            pass
+        return Figure(png, lines, set(warnings))
+
+    def put(self, k: str, fig) -> None:
+        """Stores a finished figure; one cut by the time (FIGURES_LATE) is not stored. Errors are swallowed."""
+        import json
+        if FIGURES_LATE in fig.warnings:
+            return
+        png = bytes(fig.png) if fig.png is not None else b""
+        head = json.dumps({"lines": list(fig.lines), "warnings": sorted(fig.warnings), "png": len(png)},
+                          ensure_ascii=False).encode("utf-8")
+        f = self.path(k)
+        with _lock:
+            n = next(_counter)
+        tmp = f.parent / f".tmp-{k}-{os.getpid()}-{n}"
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(_FIG_MAGIC + len(head).to_bytes(4, "little") + head + png)
+            os.replace(tmp, f)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def store(k: str, src, hidden: bool = False, **opts) -> Path:
+    from . import images
     bucket = root() / k[:2]
     target = bucket / k
     if _complete(target):
@@ -124,11 +200,15 @@ def store(k: str, src, hidden: bool = False, **opts) -> Path:
     with _lock:
         n = next(_counter)
     tmp = bucket / f".tmp-{k}-{os.getpid()}-{n}"
+    old = images.FIGURE_CACHE
+    images.FIGURE_CACHE = Figures(root() / FIGURES)  # the figures of this read are taken from and kept there
     try:
         meta = convert(src, tmp, hidden, **opts)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+    finally:
+        images.FIGURE_CACHE = old
     if FIGURES_LATE in (meta.get("warnings") or []):
         # cut by the deadline, like a conversion that ran out of time: handed out from its temporary folder (prune
         # clears it after a day) and never filed under k, so the next read converts again
@@ -163,8 +243,21 @@ def prune(days: int = 30) -> int:
                     f.unlink()
             except OSError:
                 pass
+    figs = base / FIGURES
+    if figs.is_dir():  # converted figures: unused for `days` (a lookup touches them), or a writer's leftover after a day
+        for bucket in figs.iterdir():
+            if not bucket.is_dir():
+                continue
+            for f in bucket.iterdir():
+                try:
+                    age = f.stat().st_mtime
+                    if age < (time.time() - 86400 if f.name.startswith(".tmp-") else cutoff):
+                        f.unlink()
+                        n += 1
+                except OSError:
+                    pass
     for bucket in base.iterdir():
-        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined"):
+        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined", FIGURES):
             continue
         for d in bucket.iterdir():
             if d.name.startswith(".tmp-"):

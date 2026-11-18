@@ -3,6 +3,7 @@
 Run: python -I -X utf8 tests/test_reader_cache.py
 """
 import io
+import json
 import os
 import subprocess
 import sys
@@ -443,6 +444,79 @@ def test_time_cut_figures_not_kept():
         c3, o3 = cli("convert", str(p))
         c4, o4 = cli("convert", str(p))
         assert c3 == c4 == 0 and len(calls) == 3 and Path(o3.strip()).parent.name == k == Path(o4.strip()).parent.name
+
+
+def test_figure_cache_carries_a_cut_read_further():
+    """A read the deadline cut keeps the figures it finished (PNG, lines, warnings) in the figure cache under the
+    cache root; the next read takes them from there and gets further. The cut document itself is still not filed."""
+    from metafile_fix import wmf, wmf_text
+    from reader import limits, raster
+    from reader.model import Image
+    png = b"\x89PNG\r\n\x1a\n" + bytes(16)
+    pics = [wmf([wmf_text(0, 100, f"pic{i}".encode())]) for i in range(6)]
+    calls, left = [], [0]
+
+    def fake(kind, data, **kw):  # time for `left` figures a read; the others are cut, their text still read
+        calls.append(data)
+        text = [f"pic{pics.index(data)}"]
+        if left[0] <= 0:
+            return raster.Figure(None, text, {limits.FIGURES_LATE})
+        left[0] -= 1
+        return raster.Figure(png, text, {"figure text cut"})
+    real = raster.convert
+    raster.convert = fake
+    try:
+        with stub():
+            sys.modules[STUB].parse = lambda path, ctx: Doc(blocks=[Image(b) for b in pics])
+            p = sample()
+            k = cache.key(p, image=raster.backend())
+            done = []
+            for n in (6, 4, 2):  # each read converts two more; the ones before come from the figure cache
+                calls.clear()
+                left[0] = 2
+                code, o = cli("convert", str(p))
+                entry = Path(o.strip()).parent
+                meta = json.loads((entry / "meta.json").read_text(encoding="utf-8"))
+                md = (entry / "out.md").read_text(encoding="utf-8")
+                assert code == 0 and len(calls) == n, (len(calls), n, o)
+                done.append(meta["figures"])
+                assert all(f"Figure text: pic{i}" in md for i in range(6)), md
+                assert "figure text cut" in meta["warnings"], meta
+            assert done == [2, 4, 6], done
+            assert Path(o.strip()).parent.name == k and cache.lookup(k) is not None  # the whole read is filed
+            assert (cache.root() / "figures").is_dir()
+            calls.clear()
+            left[0] = 0
+            code, o = cli("convert", str(p))  # filed: a cache hit, nothing converted
+            assert code == 0 and calls == [] and Path(o.strip()).parent.name == k
+    finally:
+        raster.convert = real
+
+
+def test_figure_cache_misses_and_prunes():
+    """The figure cache key follows the bytes, the code page, the page and the backend id; a stored figure that is
+    damaged on disk is a miss; time-cut figures are never stored; prune clears figures not used for `days`."""
+    from reader import limits, raster
+    with stub():
+        put = cache.Figures(cache.root() / "figures")
+        k = put.key("ab" * 20, "cp949", 0, "gdiplus")
+        assert len({k, put.key("ab" * 20, "", 0, "gdiplus"), put.key("ab" * 20, "cp949", 1, "gdiplus"),
+                    put.key("ab" * 20, "cp949", 0, "none"), put.key("cd" * 20, "cp949", 0, "gdiplus")}) == 5
+        png = b"\x89PNG\r\n\x1a\n" + bytes(8)
+        put.put(k, raster.Figure(png, ["a", "b"], {"figure damaged"}))
+        got = put.get(k)
+        assert got.png == png and got.lines == ["a", "b"] and got.warnings == {"figure damaged"}, got
+        late = put.key("ef" * 20, "", 0, "gdiplus")
+        put.put(late, raster.Figure(None, ["x"], {limits.FIGURES_LATE}))
+        assert put.get(late) is None
+        f = put.path(k)
+        f.write_bytes(f.read_bytes()[:-3])  # a truncated file (not picture bytes): a miss, not an error
+        assert put.get(k) is None
+        put.put(k, raster.Figure(None, ["only text"], set()))
+        assert put.get(k).png is None and put.get(k).lines == ["only text"]
+        old = time.time() - 40 * 86400
+        os.utime(put.path(k), (old, old))
+        assert cache.prune(30) >= 1 and not put.path(k).exists()
 
 
 def test_mpp_and_pdf_keys_ignore_image():
