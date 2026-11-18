@@ -85,6 +85,69 @@ def test_full_name_beats_typographic_family():
         assert fonts.find("plain narrow") == e.dir / "a_narrow.ttf"
 
 
+def test_style_picks_cut_by_weight_and_italic():
+    with Env() as e:
+        reg = e.put("a_reg.ttf", ttf("Duo", {0x41: 1, 0x42: 2}, os2=(400, 0x40)))
+        bold = e.put("b_bold.ttf", ttf("Duo", {0x41: 2, 0x42: 1}, full="Duo Bold", os2=(700, 0x20)))
+        assert fonts.locate("duo") == (reg, 0)
+        assert fonts.locate("duo", 700) == (bold, 0)
+        assert fonts.locate("duo", 400, False) == (reg, 0)
+        assert fonts.locate("duo", 700, True) == (bold, 0)  # no italic cut: the closest weight
+        assert fonts.locate("duo", 400, True) == (reg, 0)
+        assert fonts.resolve(Run("", 0, 0, "Duo", 10, weight=700, glyphs=(1, 2))) == "BA"
+        assert fonts.resolve(Run("", 0, 0, "Duo", 10, weight=400, glyphs=(1, 2))) == "AB"
+        ital = e.put("c_ital.ttf", ttf("Duo", {0x41: 1}, full="Duo Italic", os2=(400, 0x01)))
+        fonts.reset()
+        assert fonts.locate("duo", 400, True) == (ital, 0)
+        assert fonts.locate("duo", 400, False) == (reg, 0)
+
+
+def test_style_from_subfamily_name_without_os2():
+    with Env() as e:
+        e.put("a.ttf", ttf("Sub", {65: 1}))
+        b = e.put("b.ttf", ttf("Sub", {65: 1}, full="Sub Bold Italic", extra_names=[(3, 1, 2, "Bold Italic")]))
+        assert fonts.locate("sub", 700, True) == (b, 0)
+        rows = json.loads((cache.root() / "fonts.json").read_text(encoding="utf-8"))
+        assert rows[1][3][0][1:] == [700, True]
+
+
+def test_old_row_shape_rebuilt():
+    with Env() as e:
+        p = e.put("a.ttf", ttf("Fresh", {65: 1}))
+        st = p.stat()
+        cache.root().mkdir(parents=True, exist_ok=True)
+        (cache.root() / "fonts.json").write_text(json.dumps([[str(p), st.st_size, st.st_mtime_ns, [["stale"]]]]),
+                                                  encoding="utf-8")
+        assert fonts.find("fresh") == p
+        assert fonts.find("stale") is None
+
+
+def test_save_rows_surrogate_path_does_not_raise():
+    with Env():
+        fonts._save_rows([["bad" + chr(0xDC80) + ".ttf", 1, 1, [[["x"], 400, False]]]])
+
+
+def test_one_bad_face_keeps_the_others():
+    with Env() as e:
+        data = bytearray(ttc([("First", {65: 1}), ("Second", {66: 1}), ("Third", {67: 1})]))
+        second = struct.unpack(">I", bytes(data[16:20]))[0]
+        data[second:second + 4] = bytes([255]) * 4
+        p = e.put("c.ttc", bytes(data))
+        assert fonts.locate("First") == (p, 0)
+        assert fonts.locate("Third") == (p, 2)
+        assert fonts.locate("Second") is None
+
+
+def test_family_tie_prefers_shorter_full_name():
+    with Env() as e:
+        # the narrow bold lists "Wide" as its typographic family and sorts first; the plain bold is the better cut
+        e.put("a_narrowbold.ttf", ttf("Wide Narrow", {65: 1}, full="Wide Narrow Bold", os2=(700, 0x20),
+                                      extra_names=[(3, 1, 16, "Wide")]))
+        p = e.put("b_bold.ttf", ttf("Wide", {65: 1}, full="Wide Bold", os2=(700, 0x20)))
+        assert fonts.find("wide") is not None
+        assert fonts.locate("wide", 700) == (p, 0)
+
+
 def test_ttc_second_face():
     with Env() as e:
         p = e.put("c.ttc", ttc([("First", {65: 1}), ("Second", {66: 1, 67: 2})]))
@@ -138,7 +201,7 @@ def test_index_rebuilt_on_mtime_change():
         p = e.put("a.ttf", ttf("Before", {65: 1}))
         assert fonts.find("Before") == p
         rows = json.loads((cache.root() / "fonts.json").read_text(encoding="utf-8"))
-        assert rows[0][0] == str(p) and rows[0][1] == p.stat().st_size and rows[0][3] == [["before"]]
+        assert rows[0][0] == str(p) and rows[0][1] == p.stat().st_size and rows[0][3] == [[["before"], 400, False]]
         p.write_bytes(ttf("After", {65: 1}))
         st = p.stat()
         os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
@@ -153,7 +216,7 @@ def test_index_reused_when_unchanged():
         fonts.find("Kept")
         idx = cache.root() / "fonts.json"
         rows = json.loads(idx.read_text(encoding="utf-8"))
-        rows[0][3] = [["planted"]]  # a row whose size and mtime still match is not parsed again
+        rows[0][3] = [[["planted"], 400, False]]  # a row whose size and mtime still match is not parsed again
         idx.write_text(json.dumps(rows), encoding="utf-8")
         fonts.reset()
         assert fonts.find("planted") == p

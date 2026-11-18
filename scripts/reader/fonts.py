@@ -21,6 +21,7 @@ UNMAPPED = False  # set by resolve when glyphs were dropped or no font matched; 
 _SUFFIXES = {".ttf", ".otf", ".ttc", ".otc"}
 _SFNT = {b"\x00\x01\x00\x00", b"OTTO", b"true", b"typ1"}
 _NAME_IDS = (4, 1, 16)  # the order names are listed in: a full name outranks a family
+_STYLE_IDS = (2, 17)    # subfamily names ("Bold Italic"), read when a font has no OS/2 table
 _MAX_FACES = 1024        # faces read from one collection
 _MAX_TABLES = 512        # tables in one table directory
 _MAX_SUBTABLES = 16      # cmap subtables looked at
@@ -112,9 +113,10 @@ def _tables(f: _File, off: int) -> dict[bytes, tuple[int, int]]:
     return out
 
 
-def _names(f: _File, tables) -> list[str]:
+def _name_strings(f: _File, tables) -> dict[int, list[str]]:
+    found: dict[int, list[str]] = {i: [] for i in _NAME_IDS + _STYLE_IDS}
     if b"name" not in tables:
-        return []
+        return found
     o, ln = tables[b"name"]
     t = f.get(o, ln)
     if len(t) < 6:
@@ -122,10 +124,9 @@ def _names(f: _File, tables) -> list[str]:
     _fmt, count, sto = struct.unpack(">HHH", t[:6])
     if 6 + 12 * count > len(t) or sto > len(t):
         raise _Bad("name records")
-    found: dict[int, list[str]] = {i: [] for i in _NAME_IDS}
     for i in range(count):
         plat, enc, _lang, nid, ln2, so = struct.unpack(">6H", t[6 + 12 * i:18 + 12 * i])
-        if nid not in _NAME_IDS:
+        if nid not in found:
             continue
         a = sto + so
         if a + ln2 > len(t):
@@ -143,10 +144,32 @@ def _names(f: _File, tables) -> list[str]:
         s = " ".join(s.replace("\0", " ").split()).casefold()
         if s and s not in found[nid]:
             found[nid].append(s)
-    out: list[str] = []
+    return found
+
+
+def _style(f: _File, tables, found) -> tuple[int, bool]:
+    """(weight, italic) of a face: OS/2 usWeightClass and fsSelection, else the subfamily name."""
+    if b"OS/2" in tables:
+        o, ln = tables[b"OS/2"]
+        if ln >= 64:
+            t = f.get(o, 64)
+            w, sel = struct.unpack(">H", t[4:6])[0], struct.unpack(">H", t[62:64])[0]
+            if not 1 <= w <= 1000:
+                w = 700 if sel & 0x20 else 400
+            return w, bool(sel & 1)
+    sub = " ".join(found[17] + found[2])
+    return (700 if "bold" in sub else 400), ("italic" in sub or "oblique" in sub)
+
+
+def _face(f: _File, off: int) -> list:
+    """[names, weight, italic] of the face at `off`."""
+    tables = _tables(f, off)
+    found = _name_strings(f, tables)
+    names: list[str] = []
     for nid in _NAME_IDS:
-        out += [s for s in found[nid] if s not in out]
-    return out
+        names += [x for x in found[nid] if x not in names]
+    w, it = _style(f, tables, found)
+    return [names, w, it]
 
 
 def _cmap4(t: bytes, o: int, inv: dict, left: list):
@@ -245,11 +268,18 @@ def glyph_map(path, index: int = 0) -> dict[int, int]:
     return out
 
 
-def _parse_file(path) -> list[list[str]]:
-    """The names of each face of one file; _Bad or OSError when it cannot be read."""
+def _parse_file(path) -> list[list]:
+    """[names, weight, italic] of each face of one file; a face that cannot be read has no names. _Bad or OSError
+    when the file as a whole cannot be read."""
     fh, f = _open(path)
     with fh:
-        return [_names(f, _tables(f, off)) for off in _faces(f)]
+        out = []
+        for off in _faces(f):
+            try:
+                out.append(_face(f, off))
+            except (_Bad, struct.error, ValueError, OverflowError):
+                out.append([[], 400, False])
+        return out
 
 
 def _load_rows() -> list:
@@ -260,7 +290,9 @@ def _load_rows() -> list:
     ok = (isinstance(rows, list) and all(
         isinstance(r, list) and len(r) == 4 and isinstance(r[0], str) and isinstance(r[1], int)
         and isinstance(r[2], int) and isinstance(r[3], list)
-        and all(isinstance(face, list) and all(isinstance(s, str) for s in face) for face in r[3])
+        and all(isinstance(face, list) and len(face) == 3 and isinstance(face[0], list)
+                and all(isinstance(s, str) for s in face[0]) and isinstance(face[1], int)
+                and isinstance(face[2], bool) for face in r[3])
         for r in rows))
     return rows if ok else []
 
@@ -274,7 +306,7 @@ def _save_rows(rows: list):
             json.dump(rows, fh, ensure_ascii=False)
         os.replace(tmp, root / "fonts.json")
         tmp = None
-    except OSError:
+    except (OSError, ValueError):  # ValueError: a path that does not encode
         pass
     finally:
         if tmp:
@@ -325,24 +357,34 @@ def _names_index() -> dict:
         rows = _scan(dirs)
         if rows != before:
             _save_rows(rows)
-        got = {}
-        for first in (True, False):  # a face's first name (its full name) outranks other faces' family names
-            for p, _size, _mt, faces in rows:
-                for i, names in enumerate(faces):
-                    for n in names[:1] if first else names:
-                        got.setdefault(n, (Path(p), i))
+        got = {}  # name -> [(rank, Path, face, weight, italic, full name length)]; rank 0 for a full name
+        for p, _size, _mt, faces in rows:
+            for i, (names, w, it) in enumerate(faces):
+                for n in names:
+                    got.setdefault(n, []).append((0 if n == names[0] else 1, Path(p), i, w, it, len(names[0])))
         _index[dirs] = got
     return got
 
 
-def locate(face: str) -> tuple[Path, int] | None:
-    """The font file and face index whose family or full name is `face` (any language, ignoring case)."""
+def locate(face: str, weight: int = 400, italic: bool = False) -> tuple[Path, int] | None:
+    """The font file and face index whose family or full name is `face` (any language, ignoring case). Among the
+    faces with that name the closest cut wins: the smallest weight distance, with a mismatched italic counting
+    1000; then a full-name match over a family name; then the shorter full name ("Arial Bold" over "Arial Narrow
+    Bold" for the family "Arial"); then the order the files were indexed in."""
     if not isinstance(face, str):
         return None
     key = " ".join(face.replace("\0", " ").split()).casefold()
     if not key:
         return None
-    return _names_index().get(key)
+    cands = _names_index().get(key)
+    if not cands:
+        return None
+    try:
+        weight = int(weight)
+    except (TypeError, ValueError):
+        weight = 400
+    best = min(cands, key=lambda c: (abs(weight - c[3]) + (1000 if bool(italic) != c[4] else 0), c[0], c[5]))
+    return best[1], best[2]
 
 
 def find(face: str) -> Path | None:
@@ -355,7 +397,7 @@ def resolve(run) -> str | None:
     matches or nothing maps. UNMAPPED is set when anything was dropped or unmatched. Never raises."""
     global UNMAPPED
     try:
-        got = locate(run.face)
+        got = locate(run.face, run.weight, run.italic)
         if got is None:
             UNMAPPED = True
             return None

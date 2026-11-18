@@ -355,10 +355,12 @@ def _name_table(family: str, full: str, extra) -> bytes:
     return head + out + strings
 
 
-def ttf(family: str, cmap: dict[int, int], full: str | None = None, extra_names=(), ranged=False, base=0) -> bytes:
-    """A minimal TrueType font: table directory, `name` (IDs 1 and 4, platform 3) and `cmap` (format 4, and
-    format 12 when a code point is above 0xFFFF). `extra_names` adds (platform, encoding, id, text) records.
-    `base` is where the font starts inside a collection (table offsets are from the start of the file)."""
+def ttf(family: str, cmap: dict[int, int], full: str | None = None, extra_names=(), ranged=False, base=0,
+        os2=None) -> bytes:
+    """A minimal TrueType font: table directory, `name` (IDs 1 and 4, platform 3), `cmap` (format 4, and format 12
+    when a code point is above 0xFFFF) and, with os2=(usWeightClass, fsSelection), an `OS/2` table.
+    `extra_names` adds (platform, encoding, id, text) records. `base` is where the font starts inside a collection
+    (table offsets are from the start of the file)."""
     subs = [(3, 1, _cmap4(cmap, ranged))]
     if any(c > 0xFFFF for c in cmap):
         subs.append((3, 10, _cmap12(cmap)))
@@ -368,14 +370,21 @@ def ttf(family: str, cmap: dict[int, int], full: str | None = None, extra_names=
     for plat, enc, data in subs:
         head += struct.pack(">HHI", plat, enc, off + len(body))
         body += data
-    cm = head + body
-    nm = _name_table(family, full or family, extra_names)
-    start = base + 12 + 16 * 2
+    tabs = []  # (tag, data), in tag order
+    if os2 is not None:
+        o = bytearray(78)
+        struct.pack_into(">H", o, 4, os2[0])
+        struct.pack_into(">H", o, 62, os2[1])
+        tabs.append((b"OS/2", bytes(o)))
+    tabs.append((b"cmap", head + body))
+    tabs.append((b"name", _name_table(family, full or family, extra_names)))
     pad = lambda b: b + b"\0" * (-len(b) % 4)  # noqa: E731
-    out = struct.pack(">IHHHH", 0x00010000, 2, 0, 0, 0)
-    out += b"cmap" + struct.pack(">III", 0, start, len(cm))
-    out += b"name" + struct.pack(">III", 0, start + len(pad(cm)), len(nm))
-    return out + pad(cm) + pad(nm)
+    pos = base + 12 + 16 * len(tabs)
+    out = struct.pack(">IHHHH", 0x00010000, len(tabs), 0, 0, 0)
+    for tag, data in tabs:
+        out += tag + struct.pack(">III", 0, pos, len(data))
+        pos += len(pad(data))
+    return out + b"".join(pad(d) for _, d in tabs)
 
 
 def ttc(specs: list[tuple]) -> bytes:
