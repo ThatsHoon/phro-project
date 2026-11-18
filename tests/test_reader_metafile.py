@@ -10,7 +10,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from metafile_fix import (wmf, wmf_brush, wmf_exttext, wmf_font, wmf_polygon, wmf_rec, wmf_rect,  # noqa: E402
+from metafile_fix import (wmf, wmf_bitblt, wmf_bitmap16, wmf_stretchblt, wmf_brush, wmf_exttext, wmf_font, wmf_polygon, wmf_rec, wmf_rect,  # noqa: E402
                           wmf_select, wmf_text, wmf_window)
 from reader import limits, metafile  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
@@ -191,19 +191,119 @@ def test_wmf_dib_becomes_png_bitmap():
     assert d.skipped == 1
 
 
+def test_wmf_bitblt_bitmap16():
+    one = wmf_bitmap16(8, 2, 1, b"\xff\x00\x00\x00")
+    px24 = wmf_bitmap16(1, 1, 24, b"\x00\x00\xff\x00")
+    px32 = wmf_bitmap16(1, 1, 32, b"\x00\x00\xff\x00")
+    d = metafile.parse(wmf([wmf_bitblt(10, 20, 8, 2, bitmap=one), wmf_stretchblt(0, 0, 4, 4, bitmap=px24),
+                            wmf_bitblt(5, 5, 1, 1, bitmap=px32)]))
+    bs = [i for i in d.items if isinstance(i, Bitmap)]
+    assert len(bs) == 3 and all(b.kind == "png" and b.data[:4] == b"\x89PNG" for b in bs)
+    assert bs[0].box == (10, 20, 18, 22) and bs[1].box == (0, 0, 4, 4) and d.skipped == 0
+    # another depth, a truncated bitmap and a raster operation that is not a source copy are skipped and counted
+    d = metafile.parse(wmf([wmf_bitblt(0, 0, 8, 2, bitmap=wmf_bitmap16(8, 2, 8, b"\0" * 16)),
+                            wmf_bitblt(0, 0, 8, 2, bitmap=wmf_bitmap16(8, 2, 1, b"\0\0")),
+                            wmf_bitblt(0, 0, 8, 2, rop=0x00420066, bitmap=one)]))
+    assert not [i for i in d.items if isinstance(i, Bitmap)] and d.skipped == 3
+
+
+def test_wmf_bitblt_without_bitmap_is_a_pattern_fill():
+    d = metafile.parse(wmf([wmf_brush(0x00FF00), wmf_select(0), wmf_bitblt(10, 20, 30, 40, rop=0x00F00021),
+                            wmf_stretchblt(0, 0, 5, 5, rop=0x00F00021)]))
+    p1, p2 = [i for i in d.items if isinstance(i, VPath)]
+    assert p1.brush.color == 0x00FF00 and p1.pen is None and p1.segs[2][1:] == (40, 60) and d.skipped == 0
+    assert p2.segs[2][1:] == (5, 5)
+    d = metafile.parse(wmf([wmf_bitblt(10, 20, 30, 40, rop=0x00CC0020)]))
+    assert not d.items and d.skipped == 1
+
+
+def test_wmf_placeable_frame_ignores_the_viewport():
+    recs = wmf_window((0, 0), (1000, 1000)) + [wmf_rec(0x020D, 7, 9), wmf_rec(0x020E, 300, 300),
+                                               wmf_rec(0x0211, 5, 5), wmf_rec(0x0412, 1, 2, 1, 2),
+                                               wmf_rect(0, 0, 1000, 1000)]
+    d = metafile.parse(wmf(recs, placeable=(0, 0, 1000, 1000, 1000)))
+    (p,) = [i for i in d.items if isinstance(i, VPath)]
+    assert p.segs[0][1:] == (0, 0) and p.segs[2][1:] == (1000, 1000)
+
+
+def test_wmf_never_emits_non_finite_values():
+    recs = wmf_window((0, 0), (100, 100)) + [wmf_rec(0x0410, 1, 32767, 1, 32767)] * 100 + [
+        wmf_font(-10), wmf_select(0), wmf_text(5, 5, b"t"), wmf_rect(0, 0, 10, 10)]
+    d = metafile.parse(wmf(recs, placeable=None))
+    _assert_finite(d)
+    assert d.frame == (0, 0, 1, 1)
+
+
+def test_wmf_ext_text_pdy_reads_two_values_a_character():
+    d = metafile.parse(wmf([wmf_exttext(0, 100, b"AB", options=0x2000, dx=[10, 5, 20, -5])]))
+    assert runs(d)[0].width == 30
+
+
+def test_wmf_empty_text_is_not_a_run():
+    d = metafile.parse(wmf([wmf_text(0, 0, b""), wmf_exttext(0, 0, b"", options=0x10)]))
+    assert runs(d) == []
+
+
+def _arc_mid(recs, placeable):
+    d = metafile.parse(wmf(recs + [wmf_rec(0x0817, 100, 50, 0, 50, 100, 100, 0, 0)], placeable=placeable))
+    (p,) = [i for i in d.items if isinstance(i, VPath)]
+    return p.segs[1][5:7], p.segs[0][1:]  # the end of the first quarter, the start
+
+
+def test_wmf_arc_keeps_its_logical_side_under_a_flip():
+    # from the top centre to the bottom centre of a 100 box, counterclockwise: through the left side
+    (mx, _my), _ = _arc_mid([], (0, 0, 1000, 1000, 1000))
+    assert mx < 50
+    flip = wmf_window((0, 1000), (1000, -1000))
+    (mx, my), (sx, sy) = _arc_mid(flip, (0, 0, 1000, 1000, 1000))
+    assert mx < 50 and my > 940 and sy > 990  # the box sits at the bottom of the frame, the arc still goes left
+
+
+def _assert_finite(d):
+    import math
+    assert all(map(math.isfinite, d.frame))
+    d.size_px()
+    for it in d.items:
+        if isinstance(it, VPath):
+            assert all(math.isfinite(v) for s in it.segs for v in s[1:])
+            assert it.pen is None or math.isfinite(it.pen.width)
+        elif isinstance(it, Run):
+            assert all(map(math.isfinite, (it.x, it.y, it.height)))
+        elif isinstance(it, Bitmap):
+            assert all(map(math.isfinite, it.box))
+
+
 def test_wmf_mutated_records_never_raise():
     import random
-    base = wmf([wmf_font(-100, 129), wmf_select(0), wmf_text(0, 100, b"ab"), wmf_exttext(1, 2, b"xy", dx=[1, 2]),
-                wmf_polygon([(0, 0), (5, 5), (9, 0)]), wmf_rect(0, 0, 5, 5), wmf_rec(0x0817, 0, 100, 50, 0, 100, 100, 0, 0)])
+    import time
+    dib = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0) + b"\x00\x00\xff\x00"
+    seeds = [wmf([
+        wmf_font(-100, 129), wmf_select(0), wmf_text(0, 100, b"ab"), wmf_exttext(1, 2, b"xy", dx=[1, 2]),
+        wmf_polygon([(0, 0), (5, 5), (9, 0)]), wmf_rect(0, 0, 5, 5), wmf_rec(0x0817, 0, 100, 50, 0, 100, 100, 0, 0),
+        wmf_rec(0x0F43, 0x0020, 0x00CC, 0, 1, 1, 0, 0, 10, 10, 40, 40, dib),
+        wmf_rec(0x0B41, 0x0020, 0x00CC, 1, 1, 0, 0, 10, 10, 5, 5, dib),
+        wmf_bitblt(1, 1, 8, 2, bitmap=wmf_bitmap16(8, 2, 1, b"\xff\x00\x00\x00")),
+        wmf_stretchblt(1, 1, 1, 1, bitmap=wmf_bitmap16(1, 1, 24, b"\x00\x00\xff\x00")),
+        wmf_bitblt(0, 0, 3, 3, rop=0x00F00021),
+        wmf_rec(0x06FF, struct.pack("<HHIhhhhhhhh", 0, 6, 1, 0, 0, 0, 0, 0, 5, 5, 0)),
+        wmf_rec(0x012C, 1), wmf_rec(0x0416, 50, 60, 10, 20), wmf_rec(0x0538, 2, 3, 3, *[1] * 12),
+        wmf_rec(0x0410, 1, 2, 1, 2), wmf_rec(0x020F, 3, 4), wmf_rec(0x0412, 1, 2, 1, 2), wmf_rec(0x0211, 3, 4),
+        wmf_rec(0x01F0, 0), wmf_rec(0x0213, 5, 5), wmf_rec(0x020E, 50, 50), wmf_rec(0x020C, 9, 9),
+        wmf_rec(0x001E), wmf_rec(0x0127, -1)]),
+        wmf(wmf_window((0, 1000), (1000, -1000)) + [wmf_text(0, 100, b"x"), wmf_rec(0x061C, 5, 5, 90, 90, 1, 1)],
+            placeable=None)]
     rnd = random.Random(7)
-    for _ in range(2000):
-        b = bytearray(base)
+    t0 = time.time()
+    for n in range(1200):
+        b = bytearray(seeds[n % len(seeds)])
         for _ in range(rnd.randint(1, 6)):
             b[rnd.randrange(len(b))] = rnd.randrange(256)
         try:
-            metafile.parse(bytes(b))
+            d = metafile.parse(bytes(b))
         except ReadError:
-            pass
+            continue
+        _assert_finite(d)
+    assert time.time() - t0 < 10
 
 
 def test_not_a_metafile():

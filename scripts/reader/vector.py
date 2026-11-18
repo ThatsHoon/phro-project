@@ -113,7 +113,7 @@ class Budget:
             raise ReadError("too_large", "figure")
 
 
-def _width(r: Run, text: str) -> float:
+def run_width(r: Run, text: str) -> float:
     if r.width is not None:
         return r.width
     # no font metrics here: one em for a wide East Asian character, half an em for the rest
@@ -179,7 +179,7 @@ def text_lines(d: Drawing, resolve=None) -> tuple[list[str], bool]:
         prev = None
         for r, t in runs:
             if prev is not None:
-                gap = r.x - (prev[0].x + _width(*prev))
+                gap = r.x - (prev[0].x + run_width(*prev))
                 if gap > max(r.height, prev[0].height):
                     s += " "
             s += t

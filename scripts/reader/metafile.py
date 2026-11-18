@@ -15,7 +15,7 @@ from .images import bmp_to_png
 from .limits import ReadError
 from .officeart import dib_to_bmp
 from .text import SYMBOL
-from .vector import Bitmap, Brush, Budget, Clip, Drawing, Path, Pen, Run, _width, arc_beziers
+from .vector import Bitmap, Brush, Budget, Clip, Drawing, Path, Pen, Run, arc_beziers, run_width
 
 # font charset -> the code page ANSI text in that charset is decoded with
 CHARSETS: dict[int, str] = {
@@ -26,7 +26,7 @@ CHARSETS: dict[int, str] = {
 SYMBOL_CHARSET = 2
 
 _TA_UPDATECP, _TA_RIGHT, _TA_CENTER, _TA_BOTTOM, _TA_BASELINE = 1, 2, 6, 8, 24
-_ETO_GLYPH_INDEX = 0x10
+_ETO_GLYPH_INDEX, _ETO_PDY = 0x10, 0x2000
 _ASCENT = 0.8  # of the em: where a top-aligned run's baseline lies below the reference point
 _DEFAULT_EM_PT = 12.0
 
@@ -120,6 +120,7 @@ _DIBBITBLT, _DIBSTRETCHBLT, _STRETCHDIB, _SETDIBTODEV = 0x0940, 0x0B41, 0x0F43, 
 # records that change nothing the figure shows, so they are not counted as skipped
 _QUIET = {0x0102, 0x0104, 0x0105, 0x0107, 0x0108, 0x0201, 0x020A, 0x0231, 0x0626, 0x0234, 0x0035, 0x0436, 0x0037,
           0x0139, 0x0220}
+_PATCOPY = 0x00F00021
 _SRC_ROPS = {0x00CC0020, 0x00EE0086, 0x008800C6}  # SRCCOPY, SRCPAINT, SRCAND
 
 
@@ -162,6 +163,7 @@ class _Wmf:
         self.dpi = 96.0
         self.frame: tuple | None = None
         self._frozen = False
+        self._placeable = False  # a placeable box fixes the frame: the viewport records are ignored
         self._clip_out = None
         self.pos = 0
         if data[:4] == b"\xd7\xcd\xc6\x9a":
@@ -174,6 +176,7 @@ class _Wmf:
             if x1 > x0 and y1 > y0:
                 self.frame = (float(x0), float(y0), float(x1), float(y1))
                 self._frozen = True
+                self._placeable = True
             self.pos = 22
         self.pos += 18
 
@@ -246,6 +249,8 @@ class _Wmf:
             pos += size
         self._freeze()
         frame = self.frame or self._extent()
+        if not _ok(*frame) or frame[0] == frame[2] or frame[1] == frame[3]:
+            frame = (0.0, 0.0, 1.0, 1.0)
         return Drawing(frame, self.dpi, self.items, self.damaged, self.skipped)
 
     def _extent(self) -> tuple:
@@ -256,7 +261,7 @@ class _Wmf:
                     xs += s[1::2]
                     ys += s[2::2]
             elif isinstance(it, Run):
-                w = it.width if it.width is not None else _width(it, it.text)
+                w = it.width if it.width is not None else run_width(it, it.text)
                 xs += [it.x, it.x + w]
                 ys += [it.y - it.height, it.y + 0.2 * it.height]
             elif isinstance(it, Bitmap):
@@ -366,17 +371,23 @@ class _Wmf:
         self._pair("we", p)
 
     def _viewport_org(self, p):
-        self._pair("vo", p)
+        if not self._placeable:
+            self._pair("vo", p)
 
     def _viewport_ext(self, p):
-        self._pair("ve", p)
+        if not self._placeable:
+            self._pair("ve", p)
 
     def _offset(self, name, p):
+        if name == "vo" and self._placeable:
+            return
         y, x = struct.unpack_from("<hh", p)
         ox, oy = getattr(self.dc, name)
         setattr(self.dc, name, (ox + x, oy + y))
 
     def _scale(self, name, p):
+        if name == "ve" and self._placeable:
+            return
         yd, yn, xd, xn = struct.unpack_from("<4h", p)
         cur = getattr(self.dc, name) or (1, 1)
         if xd and yd:
@@ -414,7 +425,8 @@ class _Wmf:
         pen = self.dc.pen
         if pen.null:
             return None
-        return Pen(pen.color, max(self._dist(pen.width, 0), self.dpi / 96.0))
+        w = max(self._dist(pen.width, 0), self.dpi / 96.0)
+        return Pen(pen.color, w if math.isfinite(w) else 1.0)
 
     def _put(self, segs, pen, fill, even_odd=False):
         """Adds a Path; a path with no pen and no brush shows nothing, one with a non-finite coordinate is dropped."""
@@ -467,29 +479,31 @@ class _Wmf:
         self._put([("M", cx + rx, cy)] + arc_beziers(cx, cy, rx, ry, 0, 360) + [("Z",)], True, True)
 
     def _arc(self, p, kind):
+        """Angles and sweep are worked out in logical units, so a flipping transform mirrors the arc instead of
+        reversing it; the curve's points are then mapped one by one."""
         ye, xe, ys, xs, b, r, t, l = struct.unpack_from("<8h", p)
-        x0, y0, x1, y1 = self._box(struct.pack("<4h", b, r, t, l))
-        cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, abs(x1 - x0) / 2, abs(y1 - y0) / 2
+        cx, cy, rx, ry = (l + r) / 2, (t + b) / 2, abs(r - l) / 2, abs(b - t) / 2
         if not rx or not ry:
             return
-        sx, sy = self._xy(xs, ys)
-        ex, ey = self._xy(xe, ye)
-        a1 = math.degrees(math.atan2((sy - cy) / ry, (sx - cx) / rx))
-        a2 = math.degrees(math.atan2((ey - cy) / ry, (ex - cx) / rx))
-        sweep = -(((a1 - a2) % 360.0) or 360.0)  # counterclockwise on the page, which y-down angles count as negative
+        a1 = math.degrees(math.atan2((ys - cy) / ry, (xs - cx) / rx))
+        a2 = math.degrees(math.atan2((ye - cy) / ry, (xe - cx) / rx))
+        sweep = -(((a1 - a2) % 360.0) or 360.0)  # counterclockwise with y down, the GDI default
         arcs = arc_beziers(cx, cy, rx, ry, a1, sweep)
         if not arcs:
             self.skipped += 1
             return
         a = math.radians(a1)
         segs = [("M", cx + rx * math.cos(a), cy + ry * math.sin(a))] + arcs
-        self.budget.points(len(segs) * 3)
         if kind == "pie":
-            self._put(segs + [("L", cx, cy), ("Z",)], True, True)
+            segs += [("L", cx, cy), ("Z",)]
         elif kind == "chord":
-            self._put(segs + [("Z",)], True, True)
-        else:
-            self._put(segs, True, False)
+            segs += [("Z",)]
+        self.budget.points(len(segs) * 3)
+        out = []
+        for sg in segs:
+            pts = [self._xy(sg[i], sg[i + 1]) for i in range(1, len(sg), 2)]
+            out.append((sg[0],) + tuple(v for q in pts for v in q))
+        self._put(out, True, kind != "arc")
 
     def _poly(self, p, closed):
         n = struct.unpack_from("<h", p)[0]
@@ -552,13 +566,14 @@ class _Wmf:
         glyph = bool(opts & _ETO_GLYPH_INDEX)
         off = 8 + (8 if opts & 6 else 0)
         nbytes = n * 2 if glyph else n
+        per = 2 if opts & _ETO_PDY else 1  # ETO_PDY: an x and a y advance for each character
         if n < 0 or off + nbytes > len(p):
             raise ValueError
         raw = bytes(p[off:off + nbytes])
         off += nbytes + (nbytes & 1)
         dx = None
-        if n and off + 2 * n <= len(p):
-            dx = struct.unpack_from("<%dh" % n, p, off)
+        if n and off + 2 * n * per <= len(p):
+            dx = struct.unpack_from("<%dh" % (n * per), p, off)[::per]
         self._text(x, y, raw, dx, glyph)
 
     def _text(self, x, y, raw: bytes, dx, glyph: bool):
@@ -579,10 +594,12 @@ class _Wmf:
             if text is None:
                 self.skipped += 1
                 return
+        if not text and not glyphs:
+            return
         width = self._dist(sum(map(abs, dx)), 0) if dx is not None else None
         run = Run(text, fx, fy, face, em, f.weight if f else 400, bool(f and f.italic),
                   (f.escapement / 10.0) if f else 0.0, dc.color, glyphs, width)
-        w = width if width is not None else _width(run, text if text else "\0" * len(glyphs or ()))
+        w = width if width is not None else run_width(run, text if text else "\0" * len(glyphs or ()))
         v = dc.align & _TA_BASELINE
         run.y = fy + _ASCENT * em if v == 0 else fy - (1 - _ASCENT) * em if v == _TA_BOTTOM else fy
         h = dc.align & _TA_CENTER
@@ -597,6 +614,12 @@ class _Wmf:
 
     # ---- bitmaps -------------------------------------------------------------------------------------------------
 
+    def _place(self, png, dest):
+        x, y, w, h = dest
+        (x0, y0), (x1, y1) = self._xy(x, y), self._xy(x + w, y + h)
+        if _ok(x0, y0, x1, y1):
+            self.items.append(Bitmap(png, "png", (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))))
+
     def _bitmap(self, p, rop, dib_at, dest):
         """`dest` is the (x, y, w, h) of the destination rectangle from the record; the DIB starts at `dib_at`."""
         if rop is not None and rop not in _SRC_ROPS:
@@ -607,10 +630,45 @@ class _Wmf:
         if png is None:
             self.skipped += 1
             return
-        x, y, w, h = dest
-        (x0, y0), (x1, y1) = self._xy(x, y), self._xy(x + w, y + h)
-        if _ok(x0, y0, x1, y1):
-            self.items.append(Bitmap(png, "png", (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))))
+        self._place(png, dest)
+
+    def _blit(self, p, rop, at, dest):
+        """BitBlt and StretchBlt: a Bitmap16 (1, 24 or 32 bits a pixel) at `at`, or none, which is a pattern fill."""
+        if len(p) < at + 10:
+            if rop == _PATCOPY:
+                x, y, w, h = dest
+                (x0, y0), (x1, y1) = self._xy(x, y), self._xy(x + w, y + h)
+                self.budget.points(4)
+                self._put(_rect_segs(x0, y0, x1, y1), False, True)
+            else:
+                self.skipped += 1
+            return
+        if rop not in _SRC_ROPS:
+            self.skipped += 1
+            return
+        _typ, w, h, stride, _planes, bpp = struct.unpack_from("<hhhhBB", p, at)
+        bits = bytes(p[at + 10:])
+        row = (w * bpp + 7) // 8
+        png = None
+        if bpp in (1, 24, 32) and w > 0 and h > 0 and stride >= row and stride * h <= len(bits):
+            pad = -row % 4  # a BMP row ends on 4 bytes, a DDB row on 2
+            rows = b"".join(bits[i * stride:i * stride + row] + b"\0" * pad for i in range(h))
+            pal = struct.pack("<8B", 0, 0, 0, 0, 255, 255, 255, 0) if bpp == 1 else b""
+            head = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, bpp, 0, len(rows), 0, 0, 2 if bpp == 1 else 0, 0)
+            png = bmp_to_png(struct.pack("<2sIHHI", b"BM", 54 + len(pal) + len(rows), 0, 0, 54 + len(pal))
+                             + head + pal + rows)
+        if png is None:
+            self.skipped += 1
+            return
+        self._place(png, dest)
+
+    def _bitblt(self, p):
+        rop, _ys, _xs, h, w, yd, xd = struct.unpack_from("<I6h", p)
+        self._blit(p, rop, 16, (xd, yd, w, h))
+
+    def _stretchblt(self, p):
+        rop, _sh, _sw, _ys, _xs, dh, dw, yd, xd = struct.unpack_from("<I8h", p)
+        self._blit(p, rop, 20, (xd, yd, dw, dh))
 
     def _dibstretchblt(self, p):
         rop, _sh, _sw, _ys, _xs, dh, dw, yd, xd = struct.unpack_from("<I8h", p)
@@ -648,5 +706,5 @@ _HANDLERS = {
     _CREATEREGION: _Wmf._create_region, _CREATEPALETTE: _Wmf._create_other,
     _CREATEPATTERNBRUSH: _Wmf._create_other, _DIBCREATEPATTERNBRUSH: _Wmf._create_other,
     _DIBBITBLT: _Wmf._dibbitblt, _DIBSTRETCHBLT: _Wmf._dibstretchblt, _STRETCHDIB: _Wmf._stretchdib,
-    _SETDIBTODEV: _Wmf._setdibtodev,
+    _SETDIBTODEV: _Wmf._setdibtodev, 0x0922: _Wmf._bitblt, 0x0B23: _Wmf._stretchblt,
 }

@@ -78,3 +78,23 @@ def wmf_rect(l, t, r, b) -> bytes:
 
 def wmf_polygon(points) -> bytes:
     return wmf_rec(0x0324, len(points), *[v for p in points for v in p])
+
+
+def wmf_bitmap16(w, h, bpp, bits: bytes, widthbytes=None) -> bytes:
+    """A Bitmap16 object: type, width, height, widthbytes, planes, bits per pixel, then the bits."""
+    if widthbytes is None:
+        widthbytes = (w * bpp + 15) // 16 * 2
+    return struct.pack("<hhhhBB", 0, w, h, widthbytes, 1, bpp) + bits
+
+
+def wmf_bitblt(x, y, w, h, rop=0x00CC0020, bitmap: bytes | None = None) -> bytes:
+    """META_BITBLT; without a bitmap the record holds the raster op, the rectangles and a reserved word."""
+    words = [rop & 0xFFFF, rop >> 16, 0, 0, h, w, y, x]
+    words.append(bitmap if bitmap is not None else 0)
+    return wmf_rec(0x0922, *words)
+
+
+def wmf_stretchblt(x, y, w, h, rop=0x00CC0020, bitmap: bytes | None = None) -> bytes:
+    words = [rop & 0xFFFF, rop >> 16, h, w, 0, 0, h, w, y, x]
+    words.append(bitmap if bitmap is not None else 0)
+    return wmf_rec(0x0B23, *words)
