@@ -337,69 +337,26 @@ def demo():
         out = run_hook(d).stdout
         assert "`goals.md`" in out and "밀렸다" not in out, "a hidden drift line stays out, the index stays in"
     queue_rule()
-    debt_scan()
+    resume_once()
     print("ok")
 
 
-def debt_scan():
-    with tempfile.TemporaryDirectory() as d:
-        write(d, "src/a.py", 'x = 1  # lean: one pass only | when: input > 1e6 rows | fix: stream it\n'
-                             '# lean: rough guess\n# ponytail: old style\ns = "lean: not a comment"\n')
-        write(d, "notes.md", "# lean: in docs | when: never | fix: none\n")
-        write(d, "tests/test_a.py", "# lean: needs GPU | when: CI has a GPU | fix: unskip\n@pytest.mark.skip\ndef t(): pass\n\n"
-                                    "@pytest.mark.xfail\ndef u(): pass\n")
-        write(d, "web/a.test.cjs", 'it.skip("x", () => {})\n')
-        write(d, "runs/big.py", "# lean: ignored | when: x | fix: y\n")
-        lines = compass.debt_lines(d)
-        assert lines[0] == "DEBT 7 NEW 0 GONE 0 INCOMPLETE 2 SKIP 2 no baseline", lines
-        assert any(l.startswith("incomplete\tsrc/a.py:2\tmarker\trough guess") for l in lines), lines
-        assert not any("notes.md" in l or "not a comment" in l for l in lines), lines
-        write(d, "docs/core/core.json", json.dumps({"skip": ["runs"], "docs": []}))
-        assert compass.debt_lines(d)[0] == "DEBT 6 NEW 0 GONE 0 INCOMPLETE 2 SKIP 2 no baseline"
-        ran = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "debt", d], capture_output=True, text=True, encoding="utf-8")
-        assert ran.returncode == 0 and ran.stdout.splitlines()[0] == "DEBT 6 NEW 0 GONE 0 INCOMPLETE 2 SKIP 2 no baseline", ran.stdout + ran.stderr
-        write(d, "src/many.py", "".join(f"# lean: corner {i}\n" for i in range(60)))
-        lines = compass.debt_lines(d)
-        assert lines[0] == "DEBT 66 NEW 0 GONE 0 INCOMPLETE 62 SKIP 2 no baseline", lines[0]
-        assert len(lines) == 52 and lines[-1].startswith("and 14 more"), (len(lines), lines[-1])
-        write(d, "src/huge.py", "# lean: big\n" + "x = 1\n" * 400_000)
-        (Path(d) / "src/noise.py").write_bytes(os.urandom(4096))
-        compass.debt_lines(d)
-    with tempfile.TemporaryDirectory() as d:
+def resume_once():
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as cfg, mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": cfg}):
         clean(d)
-        mark = "# lean: one pass | when: input > 1e6 rows | fix: stream it\n"
-        write(d, "src/b.py", mark)
-        assert compass.stamp(d, []) == []
-        assert compass.debt_lines(d)[0].endswith("no baseline"), "only a refresh stamp (with --drift) moves the baseline"
-        assert compass.stamp(d, [], drift="") == []
-        assert compass.debt_lines(d)[0] == "DEBT 1 NEW 0 GONE 0 INCOMPLETE 0 SKIP 0"
-        write(d, "src/b.py", "\n\n" + mark)
-        assert compass.debt_lines(d)[0].startswith("DEBT 1 NEW 0 GONE 0"), "a moved marker is not new"
-        write(d, "src/b.py", mark + mark)
-        lines = compass.debt_lines(d)
-        assert lines[0].startswith("DEBT 2 NEW 1 GONE 0") and lines[1].startswith("new\tsrc/b.py:2\tmarker"), lines
-        assert compass.stamp(d, [], drift="") == []
-        write(d, "src/b.py", mark)
-        lines = compass.debt_lines(d)
-        assert lines[0].startswith("DEBT 1 NEW 0 GONE 1") and lines[1].startswith("gone\tsrc/b.py\tmarker\tone pass"), lines
-        assert compass.lint(d) == []
-    with tempfile.TemporaryDirectory() as d:
-        write(d, "src/ok.py", "# lean: kept | when: x | fix: y\n")
-        write(d, "src/locked.py", "# lean: unreadable\n")
-        write(d, ".worktrees/branch/.git", "gitdir: elsewhere\n")
-        write(d, ".worktrees/branch/src/ok.py", "# lean: kept | when: x | fix: y\n")
-        write(d, "queue/.git/HEAD", "ref: refs/heads/main\n")
-        write(d, "queue/tool.py", "# lean: nested repo | when: x | fix: y\n")
-        real = Path.read_text
-        def flaky(self, *a, **k):
-            if self.name == "locked.py":
-                raise PermissionError("denied")
-            return real(self, *a, **k)
-        with mock.patch.object(Path, "read_text", flaky):
-            assert compass.debt_lines(d)[0] == "DEBT 1 NEW 0 GONE 0 INCOMPLETE 0 SKIP 0 no baseline", compass.debt_lines(d)
-    own = [i for i in compass.debt_items(SCRIPT.parents[1]) if i[0].startswith("scripts/") and not i[4]]
-    assert not own, own
-
+        assert compass.stamp(d, [], drift="정산이 밀렸다") == []
+        assert "`goals.md`" in compass.session_text(d, "startup", "s1")
+        again = compass.session_text(d, "resume", "s1")
+        assert "`goals.md`" not in again and "Project core docs" not in again, again
+        assert "Reviewed" in again and "밀렸다" in again, "the status lines stay on a resume"
+        assert "`goals.md`" in compass.session_text(d, "resume", "s2"), "another session gets the index"
+        assert "`goals.md`" in compass.session_text(d, "resume", "bad id/.."), "an id that is not a plain token is never used as a file name"
+        write(d, "docs/core/README.md", "# 핵심\n\n- `goals.md`\n- `features/app.md`\n- 바뀐 줄\n")
+        assert "바뀐 줄" in compass.session_text(d, "resume", "s1"), "a changed index is sent again"
+        compact = compass.session_text(d, "compact", "s1")
+        assert "바뀐 줄" in compact and "stated it as one" in compact and "outlasts this task" in compact, compact
+    ran = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "debt", "."], capture_output=True, text=True, encoding="utf-8")
+    assert ran.returncode != 0, "the debt command is gone"
 
 
 def queue_rule():

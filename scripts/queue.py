@@ -26,6 +26,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import once
+
 QUEUE = "queue"
 PLUGIN = Path(__file__).resolve().parents[1]
 STATES = ("new", "researching", "ready", "doing", "verify", "done", "needs-owner", "blocked")
@@ -149,7 +152,6 @@ def last_line(root, links):
 
 
 def age_of(root, path):
-    # lean: one git call per ticket | when: queue > 300 tickets | fix: batch with one git log
     r = git(root, "log", "--diff-filter=A", "--format=%ct", "--", f"tickets/{path.name}", check=False)
     stamps = r.stdout.split()
     born = int(stamps[-1]) if stamps else int(path.stat().st_mtime)
@@ -215,7 +217,7 @@ def board(root):
             print(f"SKIPPED\t{path.as_posix()}\t{e}")
             continue
         counts[t["status"]] += 1
-        changed = path.stat().st_mtime  # lean: last change = file mtime | when: a copy or checkout touches tickets | fix: a changed_at field
+        changed = path.stat().st_mtime
         if t["status"] == "done" and changed >= week:
             closed += 1
         rows.append({"id": t["id"], "title": t["title"], "status": t["status"], "priority": t["priority"],
@@ -452,7 +454,7 @@ def cmd_ask(a):
     if a.ticket:
         path = ticket_path(a.root, a.ticket)
         t = read_ticket(path)
-        if t["decisions"] and t["question"] == a.question:  # lean: dedup checks the current question only | when: an old question is asked again | fix: compare every past question
+        if t["decisions"] and t["question"] == a.question:
             raise Refused(f"already decided: {path.as_posix()}")
         if a.title:
             t["title"] = a.title
@@ -591,7 +593,9 @@ def hook_lines(event):
     queue, r = f'python -I -X utf8 "{Path(__file__).resolve().as_posix()}"', f'"{root.as_posix()}"'
     out, name = [], event.get("hook_event_name")
     if name == "SessionStart":
-        out.append(RULE.format(queue=queue, root=r, sid=sid))
+        rule = RULE.format(queue=queue, root=r, sid=sid)
+        if once.needed(sid, "queue", rule, event.get("source")):
+            out.append(rule)
         mine = [t for t in rows if t.get("session") == sid and t.get("status") in ("needs-owner", "doing", "verify", "blocked")]
         if mine:
             out.append("Your open tickets: " + ", ".join(f"{t['id']} ({t.get('status')})" for t in mine[:8])

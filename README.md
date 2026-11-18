@@ -11,7 +11,7 @@ It has no universal structure, because plugins differ too much between projects.
 Always-on cost, in every session of every project where the plugin is enabled:
 
 - One skill description, `design`, about 80 tokens. The other four skills are not listed, so they cost nothing until you type them.
-- One `SessionStart` hook, at start, resume, clear and compaction. Resume matters for forks and sessions reopened after a restart, which otherwise never see a rule added since they began. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing. An index holding hidden text prints one warning instead. After a compaction it adds about 150 tokens telling the session to update the documents from its summary, which can take that session a few turns.
+- One `SessionStart` hook, at start, resume, clear and compaction. Resume matters for sessions reopened after a restart, which otherwise never see a rule added since they began; a resumed session that already holds the same index gets only the status lines, since the earlier text is still in its conversation. A fork inherits the parent's context. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing. An index holding hidden text prints one warning instead. After a compaction it adds about 150 tokens telling the session to update the documents from its summary, which can take that session a few turns.
 
 ## 새 프로젝트에서 쓰기
 
@@ -216,14 +216,16 @@ The import rules live in `contracts/modules.json`: `{"features": {"control/hazar
 
 `lean` is always on. A hook injects its rules from `skills/lean/SKILL.md`:
 
-- Main session, at start, resume, clear and compact: **Build** (minimal code, root-cause fixes, one runnable check) and **Answer** (the action or the answer first, one open question at a time, short visible lists).
-- Each subagent: **Build** and **Report** (status first, long output to a file, at most 20 lines).
+- Main session, at start, resume, clear and compact: **Build** (minimal code, root-cause fixes, one runnable check, no comments) and **Answer** (the action or the answer first, one open question at a time, short visible lists, and a proposed enforcement when a written rule is broken again). A resume that already holds the same text gets nothing, so the rules are not added twice.
+- Each subagent: **Build** and **Report** (status first, the brief's bar is the whole bar, long output to a file, at most 20 lines). The read-only built-ins, Explore, Plan, claude-code-guide and web-fetch, get **Report** alone.
 
 Type `phro-lean off` as the whole prompt to stop the rules for the current session and its subagents, and `phro-lean on` to bring them back. Other sessions are not affected. lean injects nothing while the original ponytail or i-have-adhd plugin is enabled, so the two never stack; disable those and lean takes over.
 
 `lean-review` fires when you ask for an over-engineering review. It lists what a diff could delete or shrink, one line per finding, and ends with the lines it could save.
 
-Technical debt lives in the code: each shortcut and each skipped test carries one English comment, `lean: <ceiling> | when: <trigger> | fix: <upgrade path>`. `compass.py debt` counts them against the last refresh, the daily refresh adds `debt N (+K)` to the drift line every session receives, and only debt whose `when` is `owner` or already met becomes a work-queue ticket. `lean-review` reports markers whose `when` holds as `debt:` findings.
+No state lives in comments. A comment that records a shortcut, a limit or a skipped test as accepted becomes the context later sessions use to keep it, so lean writes no comments beyond a license header, behavior an outside dependency or protocol forces, and a public API contract. `lean-review` flags every other comment, and any `lean:`, `ponytail:`, `TODO`, `FIXME` or `HACK` marker, as `comment:`.
+
+`python -I -X utf8 scripts/lean.py stats <transcripts_dir> [--days N]` shows whether the answer rules hold: per arm (sessions that received lean and sessions that did not), the replies and the share with a visible list over 5 items or more than one question at the end. It counts and never prints text.
 
 `grill` interviews you about a plan in rounds of at most 5 numbered questions. Each question has a recommended answer and one line of reason. The design tree is kept in a file, so a compaction does not lose it.
 
@@ -292,8 +294,7 @@ Run as `python -I -X utf8 scripts/compass.py <command>`.
 | `hook` | Reads the event from standard input and prints the index. Called by `hooks/hooks.json` |
 | `status <root>` | Per document: stale or current, sources changed, age. Lists up to 100 new paths per document, each path once, and says how many it left out. Then folders with changes outside every source since the oldest review, up to 30 changed documents among them by name, `ELSEWHERE n` and `STALE n`. Records when it looked |
 | `lint <root>` | One finding per line, then `OK` or `FINDINGS n` |
-| `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint, the drift line and the debt baseline |
-| `debt <root>` | `DEBT n NEW n GONE n INCOMPLETE n SKIP n`, then up to 50 lines: new markers, skipped tests with no marker, markers with no `when`, removed markers. Reads code files only and writes nothing |
+| `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint and the drift line |
 | `usage <root>` | Reads of each document in this project's transcripts, leaving out sessions that ran `stamp`. Counts only |
 
 ## `clone.py` commands

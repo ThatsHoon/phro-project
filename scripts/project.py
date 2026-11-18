@@ -31,7 +31,7 @@ SKIP = {".git", "__pycache__", "node_modules", "results", ".venv"}
 TEXT = {".md", ".py", ".json", ".yaml", ".yml", ".sh", ".js", ".ts", ".tsx", ".cjs", ".mjs", ".toml", ".txt", ".ps1", ".jsonl"}
 LISTING_LIMIT = 1536  # description + when_to_use, cut off in the skill listing beyond this
 LONG_BODY_TOKENS = 5000  # a compaction re-attaches a skill cut to its first 5,000 tokens
-OVERLAP_MIN = 0.25  # lean: word Jaccard only finds candidates | when: audit misses an overlap the user spots | fix: let the model judge overlap in audit
+OVERLAP_MIN = 0.25
 SHARED_LINES_MIN = 3
 PATH_REF = re.compile(r"(?<![\w./-])((?:references|scripts|hooks|agents|skills|commands|assets|templates|fixtures)/[\w./-]*\w\.\w+)")
 MD_LINK = re.compile(r"\]\(([^)#:\s<>]+\.\w+)\)")
@@ -43,8 +43,9 @@ ROUTE_CASES = "tests/route_cases.json"  # routing cases that live in the plugin 
 PROJECT_PARTS = ("skills", "agents", "commands", "tests")  # a project's .claude also holds settings and worktrees, which are not capabilities
 STEP_TOOLS = "[Read, Glob, Grep, WebSearch, Write, Edit, Skill]"
 STEP_TURNS = 10  # a step-triggered case has to do the step first
-FETCHERS = {"npx", "bunx", "uvx", "pipx"}  # lean: docker images and npm exec are not read | when: a project runs an MCP server that way | fix: parse their image or package argument
+FETCHERS = {"npx", "bunx", "uvx", "pipx"}
 PINNED = re.compile(r"(?:@|==)v?\d[\w.+-]*$")
+LEAK = re.compile(r"\b(?:evals?|evaluation|judge[sd]?|grader?s?|rubrics?|benchmarks?|candidates?|test case|this is a test)\b|평가|채점|시험 삼아|테스트용|벤치마크", re.I)
 # From code.claude.com/docs/en/skills and /hooks, read 2026-11-11. A key or event Claude Code does not know is ignored without an error.
 SKILL_KEYS = set("name description when_to_use argument-hint arguments disable-model-invocation user-invocable allowed-tools "
                  "disallowed-tools model effort context agent background hooks paths shell metadata license compatibility version".split())
@@ -56,7 +57,7 @@ SKILL_CALL = '"skill"\\s*:\\s*"(?:[\\w-]+:)?{}"'
 
 
 def tokens(text):
-    return len(text.encode("utf-8")) // 4  # lean: rough byte estimate | when: a listing-cost decision rests on it | fix: read claude plugin details
+    return len(text.encode("utf-8")) // 4
 
 
 def plugin_root(path):
@@ -224,7 +225,6 @@ def usage(directory, plugin):
 
     def used(name):
         return count(typed, name), count(model, name)
-    # lean: matched by the path inside the plugin, so another plugin's file at the same path counts too | when: two installed plugins share a skill and reference name | fix: match the plugin's folder name as well
     used.reads = lambda rel: sum(n for path, n in reads.items() if path.endswith("/" + rel))
     return used
 
@@ -245,6 +245,24 @@ def fetched_package(entry):
         if flag in args[:-1]:
             return args[args.index(flag) + 1]
     return next((x for x in args if not x.startswith("-") and x != "run"), None)
+
+
+def case_findings(root):
+    """Routing prompts and quality prompts that tell the model it is being measured, which changes how it behaves."""
+    out = []
+    try:
+        cases = json.loads((root / ROUTE_CASES).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cases = []
+    for case in cases if isinstance(cases, list) else []:
+        found = LEAK.search(str(case.get("prompt", ""))) if isinstance(case, dict) else None
+        if found:
+            out.append(("leaky-case", f"{ROUTE_CASES}#{case.get('id', '?')}", found.group(0)))
+    for path in sorted(root.glob("evals/quality/*/*/prompt.md")):
+        found = LEAK.search(path.read_text(encoding="utf-8", errors="replace"))
+        if found:
+            out.append(("leaky-case", path.relative_to(root).as_posix(), found.group(0)))
+    return out
 
 
 def hook_findings(root):
@@ -322,6 +340,7 @@ def findings(root, usage_dir=None):
         if package and not PINNED.search(package):
             out.append(("mcp-unpinned", node, package))
     out += hook_findings(root)
+    out += case_findings(root)
     tested = {r[0] for r in db.execute("select e.dst from edge e join node n on n.id = e.src where n.kind = 'eval'")}
     words = {}
     for node, kind, description, _ in nodes:

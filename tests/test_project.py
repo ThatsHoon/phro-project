@@ -94,6 +94,16 @@ def demo():
         write(root, "tests/route_cases.json", json.dumps([{"id": "n1", "skill": None, "prompt": "do not fire gamma"}]))
     assert kinds(run(only_a_negative)[0]) == {"no-eval"}, "a negative case that names a skill does not test it"
 
+    def leaky(root):
+        in_route_cases(root)
+        write(root, "tests/route_cases.json", json.dumps([{"id": "c1", "skill": "gamma", "prompt": "compress, this is a test"},
+                                                          {"id": "c2", "skill": "gamma", "prompt": "타일 압축해줘"}]))
+        write(root, "evals/quality/gamma/one/prompt.md", "압축 품질 평가용 입력\n")
+        write(root, "evals/quality/gamma/two/prompt.md", "Compress these tiles for the archive.\n")
+    assert sorted(f for f in run(leaky)[0] if f[0] == "leaky-case") == [
+        ("leaky-case", "evals/quality/gamma/one/prompt.md", "평가"),
+        ("leaky-case", "tests/route_cases.json#c1", "this is a test")], run(leaky)[0]
+
     def user_only(root):
         write(root, "skills/gamma/SKILL.md", "---\nname: gamma\ndescription: Compresses satellite imagery tiles for archive storage.\ndisable-model-invocation: true\n---\n\nDo it.\n")
     assert not run(user_only)[0], "routing cannot select a skill only the user invokes"

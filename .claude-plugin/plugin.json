@@ -1,6 +1,6 @@
 {
   "name": "phro-project",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "description": "Keeps a long project on course: designs and audits its plugins, measures whether skills get called, holds core goal and architecture documents for every session and fork, and restructures its folders, splits them into portable feature modules, and keeps a queue of the owner's decisions. It also brings an always-on working style, an over-engineering review and a design interview.",
   "author": {
     "name": "thatshoon"

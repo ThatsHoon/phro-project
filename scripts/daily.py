@@ -86,7 +86,7 @@ def period(day):
 
 
 def due(now):
-    """Today's date when its report should exist by now, else None. lean: no public holidays | when: owner | fix: a holiday list in docs/daily"""
+    """Today's date when its report should exist by now, else None."""
     now = now.astimezone(KST)
     if now.weekday() >= 5 or now.hour < HOUR:
         return None

@@ -17,6 +17,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import once
+
 CORE = Path("docs/core")
 PLUGIN = Path(__file__).resolve().parents[1]
 INDEX_LINES, INDEX_CHARS = 40, 2500
@@ -26,12 +29,6 @@ SHOWN = 100
 SHOWN_DOCS = 30
 DOC_SUFFIXES = {".md", ".rst", ".adoc"}
 DRIFT_CHARS = 200
-CODE_SUFFIXES = {".py", ".js", ".cjs", ".mjs", ".ts", ".tsx", ".jsx", ".sh", ".ps1", ".go", ".rs", ".java", ".kt", ".swift",
-                 ".c", ".h", ".cpp", ".cs", ".rb", ".html", ".css", ".yml", ".yaml", ".toml"}
-DEBT_SHOWN = 50
-DEBT_MAX_BYTES = 1_000_000
-MARKER = re.compile(r"(?:#|//|/\*|\*|<!--|--)\s*(?:lean|ponytail):\s*(.*?)\s*(?:\*/|-->)?\s*$")
-SKIPPED = re.compile(r"pytest\.mark\.(?:skip|xfail)|pytest\.skip\(|unittest\.skip|\b(?:it|test|describe)\.skip\(|\bx(?:it|describe)\(")
 
 # The same lists as the style check in phro-search, cut to what a reference document can trip on.
 MARKS = ["Generated with", "Co-Authored-By", "Written by Claude", "AI-generated", "as an AI", "Claude가 작성", "AI가 작성", "AI 요약", "언어 모델로서",
@@ -43,7 +40,6 @@ DATE = re.compile(r"(?<!\d)20\d\d[-./]\d{1,2}[-./]\d{1,2}(?!\d)")
 CHAIN = re.compile(r"\bv\d+\s*(?:->|→)\s*v\d+", re.I)
 TICKED = re.compile(r"`([^`\n]+)`")
 LINK = re.compile(r"\]\(([^)\s]+)\)")
-# lean: blocks hidden text only, plain doc text passes like CLAUDE.md | when: a plain-text injection is seen | fix: owner reviews index changes
 HIDDEN = re.compile(r"[\U0000200B-\U0000200D\U00002060\U00002062-\U00002064\U0000FEFF\U0000202A-\U0000202E\U00002066-\U00002069\U000E0000-\U000E007F]"
                     r"|<!--|<[a-z]+\s[^>]*(?:display\s*:\s*none|visibility\s*:\s*hidden|\bhidden\b)", re.I)
 
@@ -63,74 +59,11 @@ def memory_dir(root):
     return Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(Path(root).resolve())) / "memory"
 
 
-def walk(start, skip, nested=True):
-    """nested=False also leaves out folders that are their own git checkout, such as worktrees and the queue."""
+def walk(start, skip):
     for folder, dirs, files in os.walk(start):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d not in skip and not (Path(folder) / d / "pyvenv.cfg").exists()
-                   and (nested or not (Path(folder) / d / ".git").exists())]
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d not in skip and not (Path(folder) / d / "pyvenv.cfg").exists()]
         for name in files:
             yield Path(folder) / name
-
-
-def manifest_or_none(root):
-    try:
-        return load(root)
-    except (OSError, ValueError):
-        return None
-
-
-def debt_items(root):
-    """(path, line, kind, text, complete) for each lean or ponytail comment and each skipped test with no such comment."""
-    manifest = manifest_or_none(root) or {}
-    items = []
-    for path in sorted(walk(root, set(manifest.get("skip", [])), nested=False)):
-        try:
-            if path.suffix.lower() not in CODE_SUFFIXES or path.stat().st_size > DEBT_MAX_BYTES:
-                continue
-            text_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:  # vanished, unreadable or a broken link: skip it rather than stop the refresh
-            continue
-        rel = path.relative_to(root).as_posix()
-        previous = None
-        for number, line in enumerate(text_lines, 1):
-            marker = MARKER.search(line)
-            if marker:
-                text = marker.group(1)
-                items.append((rel, number, "marker", text, bool(re.search(r"\|\s*when:", text, re.I))))
-            elif SKIPPED.search(line) and not (previous and MARKER.search(previous)):
-                items.append((rel, number, "skip", line.strip(), False))
-            previous = line
-    return items
-
-
-def fingerprint(item):
-    path, _, kind, text, _ = item
-    return f"{path}\t{kind}\t{' '.join(text.split())}"
-
-
-def debt_lines(root):
-    items = debt_items(root)
-    baseline = (manifest_or_none(root) or {}).get("debt")
-    now = collections.Counter(fingerprint(i) for i in items)
-    new, gone = collections.Counter(), collections.Counter()
-    if baseline is not None:
-        new, gone = now - collections.Counter(baseline), collections.Counter(baseline) - now
-    rows, left = [], dict(new)
-    for item in reversed(items):  # the last copies of a fingerprint are the new ones
-        key = fingerprint(item)
-        if left.get(key):
-            left[key] -= 1
-            rows.insert(0, ("new", item))
-    rows += [("skip", i) for i in items if i[2] == "skip"]
-    rows += [("incomplete", i) for i in items if i[2] == "marker" and not i[4]]
-    shown = [f"{state}\t{i[0]}:{i[1]}\t{i[2]}\t{i[3]}" for state, i in rows]
-    shown += ["gone\t" + key for key in sorted(gone.elements())]
-    head = (f"DEBT {len(items)} NEW {sum(new.values())} GONE {sum(gone.values())} "
-            f"INCOMPLETE {sum(1 for i in items if i[2] == 'marker' and not i[4])} SKIP {sum(1 for i in items if i[2] == 'skip')}")
-    if baseline is None:
-        head += " no baseline"
-    tail = [f"and {len(shown) - DEBT_SHOWN} more"] if len(shown) > DEBT_SHOWN else []
-    return [head] + shown[:DEBT_SHOWN] + tail
 
 
 def source_files(root, pattern, skip):
@@ -300,7 +233,7 @@ def stamp(root, names, accept_goal=False, drift=None):
         manifest["goal_sha"] = sha(goal_section(goals.read_text(encoding="utf-8")))
     if drift is not None:
         manifest["drift"] = drift[:DRIFT_CHARS]
-        manifest["debt"] = sorted(fingerprint(i) for i in debt_items(root))  # only a refresh moves the baseline
+        manifest.pop("debt", None)
     save(root, manifest)
     return []
 
@@ -318,8 +251,9 @@ def newer_original():
     return (record["origin"], found) if found else None
 
 
-def session_text(root, source=None):
-    """What a session receives. Reads two small files and never walks the project, so it stays fast everywhere."""
+def session_text(root, source=None, session_id=None):
+    """What a session receives. Reads two small files and never walks the project, so it stays fast everywhere.
+    On a resume that already holds this index unchanged, the preamble and the index are left out and the status lines stay."""
     core = Path(root) / CORE
     index = core / "README.md"
     if not index.is_file() or not (core / "core.json").is_file():  # README.md alone may be another tool's docs/core
@@ -336,6 +270,8 @@ def session_text(root, source=None):
     if len(text) > INDEX_CHARS:
         text = text[:INDEX_CHARS] + "\n\nThis index is over its limit and was cut here. Read docs/core/README.md, and shorten it."
     parts.append(text)
+    if session_id and not once.needed(session_id, "compass", text, source):
+        parts = []
     try:
         manifest = load(root)
         reviewed = min(manifest.get("reviewed", {}).values(), default=None)
@@ -358,7 +294,8 @@ def session_text(root, source=None):
     if source == "compact":  # the summary is in this session's context, and no hook on this event can call a model, so the session itself does the update
         parts.append("A compaction just finished, and the summary above is this session's record. Before the next step, compare it with these documents. "
                      "If it shows the user settled or changed a goal, a design or a principle, ruled something out or adopted something, and the matching document in docs/core does not say so, update that document now: "
-                     "only what outlasts this task, stated as true now, no progress or numbers, and never the first section of goals.md unless the user said so. "
+                     "only what outlasts this task and changes later work, stated as true now, no progress or numbers, and never the first section of goals.md unless the user said so. "
+                     "A preference seen once in the summary becomes a rule only when the user stated it as one. "
                      f"Then run: python -I -X utf8 {Path(__file__).resolve().as_posix()} lint {Path(root).as_posix()} and fix what it flags. If nothing needs changing, say nothing about it and go on.")
     return "\n\n".join(parts)
 
@@ -371,7 +308,7 @@ def hook():
         event = {}
     try:
         root = os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd") or "."
-        text = session_text(root, event.get("source"))  # the queue rule comes from queue.py hook, which knows the session id
+        text = session_text(root, event.get("source"), event.get("session_id"))  # the queue rule comes from queue.py hook, which knows the session id
     except Exception:
         return
     if text:
@@ -427,11 +364,7 @@ def main():
     p.add_argument("--accept-goal", action="store_true", help="the user changed the final goal")
     p.add_argument("--drift", help="one line for every session on work that serves no goal; empty clears it")
     sub.add_parser("usage", help="how often sessions open each document, counted from this project's transcripts").add_argument("root")
-    sub.add_parser("debt", help="lean and ponytail comments and unmarked skipped tests, against the last stamp").add_argument("root")
     args = parser.parse_args()
-    if args.command == "debt":
-        print("\n".join(debt_lines(args.root)))
-        return
     if args.command == "hook":
         return hook()
     if args.command == "usage":

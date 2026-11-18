@@ -108,7 +108,9 @@ def fixed_rules():
               "When the user asked a question, the first line is the answer",
               "Where a test-first process or the plan names tests, follow that instead",
               "Once you return, you are finished",
-              'grep -rn "lean:\\|ponytail:"'):
+              "Write no comments",
+              "The brief's bar is the whole bar",
+              "propose in the same reply the strongest enforcement that fits"):
         assert s in text, s
 
 
@@ -219,23 +221,81 @@ def review_fixes():
     has_all("skills/lean-review/SKILL.md", ("git diff HEAD", "untracked"))
 
 
-def debt_rules():
+def comment_rules():
     import lean
-    form = "lean: <ceiling> | when: <trigger> | fix: <upgrade path>"
     text = SKILL.read_text(encoding="utf-8")
     for injected in (lean.main_text(), lean.sections(text, lean.SUB)):
-        assert form in injected and "English comment" in injected, injected[:200]
-    has_all("skills/lean-review/SKILL.md", ("`debt:`", "grep -rn \"lean:\\|ponytail:\" <reviewed paths>"))
-    assert "compass.py debt" not in (ROOT / "skills/lean-review/SKILL.md").read_text(encoding="utf-8")
-    step6_text = (ROOT / "skills/compass/SKILL.md").read_text(encoding="utf-8")
-    assert "already lists an open ticket" in step6_text
-    step6 = next(l for l in (ROOT / "skills/compass/SKILL.md").read_text(encoding="utf-8").splitlines() if l.startswith("6. "))
-    assert "`debt <root>`" in step6 and "when` is `owner`" in step6, step6
+        assert "Write no comments" in injected and "| when:" not in injected and "lean: <" not in injected, injected[:200]
+    review = (ROOT / "skills/lean-review/SKILL.md").read_text(encoding="utf-8")
+    assert "`comment:`" in review and "`debt:`" not in review and "grep -rn" not in review
+    compass_skill = (ROOT / "skills/compass/SKILL.md").read_text(encoding="utf-8")
+    assert "debt" not in compass_skill and "(hook: guard.py)" in compass_skill
+    assert "5b. A repeated mistake" in (ROOT / "skills/design/SKILL.md").read_text(encoding="utf-8")
+
+
+def resume_once():
+    config, cwd = fresh()
+    assert "## Build" in run(start("s1", cwd), config, cwd)[1]
+    assert run(start("s1", cwd, "resume"), config, cwd)[1] == "", "a resume that holds the same text gets nothing"
+    assert "## Build" in run(start("s2", cwd, "resume"), config, cwd)[1], "another session gets the rules"
+    assert "## Build" in run(start("s1", cwd, "compact"), config, cwd)[1], "a compaction drops the rules, so they come back"
+    assert "## Build" in run(start("s3", cwd, "resume"), config, cwd)[1]
+    seen = config / "phro-project/seen/s3.lean"
+    seen.write_text("stale", encoding="ascii")
+    assert "## Build" in run(start("s3", cwd, "resume"), config, cwd)[1], "changed rules are sent again"
+    old = seen.stat().st_mtime - 15 * 86400
+    os.utime(seen, (old, old))
+    run(start("s4", cwd), config, cwd)
+    assert not seen.exists(), "startup prunes old records"
+
+
+def read_only_subagent():
+    config, cwd = fresh()
+    for kind in ("Explore", "Plan", "claude-code-guide", "web-fetch"):
+        event = dict(sub("s1", cwd), agent_type=kind)
+        ctx = json.loads(run(event, config, cwd)[1])["hookSpecificOutput"]["additionalContext"]
+        assert "## Report" in ctx and "## Build" not in ctx, (kind, ctx[:200])
+    for kind in ("general-purpose", "my-plugin:writer"):
+        event = dict(sub("s1", cwd), agent_type=kind)
+        assert "## Build" in json.loads(run(event, config, cwd)[1])["hookSpecificOutput"]["additionalContext"], kind
+
+
+def stats():
+    import lean
+    base = Path(tempfile.mkdtemp())
+
+    def session(name, header, replies):
+        lines = []
+        if header:
+            lines.append(json.dumps({"type": "attachment", "attachment": {"type": "hook_additional_context", "content": [lean.HEADER + " rules"]}}))
+        for text in replies:
+            lines.append(json.dumps({"type": "user", "message": {"content": "q"}}))
+            lines.append(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}, {"type": "tool_use", "name": "Read"}]}}))
+        (base / f"{name}.jsonl").write_text("\n".join(lines) + "\n{broken\n", encoding="utf-8")
+
+    big = "Done.\n\n" + "\n".join(f"- item {i}" for i in range(6))
+    numbered = "\n".join(f"{i}. step" for i in range(1, 7))
+    session("a", True, ["Done.", big])
+    session("b", True, ["One?\n\nTwo? Three?"])
+    session("c", False, [numbered, "A? B?", "plain"])
+    session("d", False, [])
+    old = base / "old.jsonl"
+    old.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}) + "\n", encoding="utf-8")
+    t = old.stat().st_mtime - 30 * 86400
+    os.utime(old, (t, t))
+    rows = lean.stats(base, 7)
+    assert rows == ["arm\tsessions\treplies\tbig_list\tmulti_question",
+                    "lean\t2\t3\t33.3%\t33.3%",
+                    "none\t1\t3\t33.3%\t33.3%"], rows
+    assert lean.reply_flags("- a\n- b\n\n- c\n- d\n- e\n- f") == (False, False), "a blank line ends a group"
+    res = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "stats", str(base), "--days", "60"],
+                         capture_output=True, text=True, encoding="utf-8")
+    assert res.returncode == 0 and res.stdout.splitlines()[2].startswith("none\t2\t4\t"), res.stdout + res.stderr
 
 
 CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules,
           toggle, copy_toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules, review_fixes,
-          debt_rules]
+          comment_rules, resume_once, read_only_subagent, stats]
 
 
 def main():

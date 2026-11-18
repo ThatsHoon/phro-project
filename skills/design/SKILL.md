@@ -1,6 +1,6 @@
 ---
 name: design
-description: Adds a capability to this project or its plugin: finds what already exists, decides where it belongs, builds it when told to, and tests that it fires when it should. 스킬로 만들어서 내장, 앞으로 ~할 때 자동으로, 이런 파일 읽는 플러그인 찾아서 설치, 플러그인 기능 추가 설계, 어디에 넣을지.
+description: Adds a capability to this project or its plugin, or stops a repeated mistake for good: finds what already exists, decides where it belongs, builds it when told to, and tests that it fires when it should. 스킬로 만들어서 내장, 앞으로 ~할 때 자동으로, 이런 파일 읽는 플러그인 찾아서 설치, 플러그인 기능 추가 설계, 어디에 넣을지, 같은 실수 다시 못 하게 막아.
 ---
 
 # design
@@ -29,6 +29,17 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
 | `paths` on a skill | Only relevant when certain files are in play | Gated without a hook |
 | Hook | Must react to an event the model will not act on by itself, such as a tool error. Measured misses come first (`route-test`). A hook cannot see a step like "the draft is done": that is a standing rule. Build it by `references/hooks.md` | Runs every time, so it costs every time |
 | MCP | A tool or a live connection that a script run cannot provide, or state shared across calls. Build it by `references/mcp.md` | Costs a server |
+
+5b. A repeated mistake is placed by what enforces the fix, not by cost, since nothing fails when an agent skips prose. It counts once it has happened twice; a written rule broken again is that second time. Read the commits, reverts and corrections that show it, then take the first rung that holds:
+
+| Rung | Fix |
+|---|---|
+| Architecture | One owner for the state, one supported way to do the task, the wrong path removed or hidden so it fails |
+| Permission or hook | A `permissions.deny` entry, or a PreToolUse hook whose message names what to do instead |
+| Type, lint or test | A check that fails on the mistake; prove it by running it on a real past instance |
+| Written rule | Only for a judgment call no check can make, as one standing rule naming what it guards |
+
+Name the rung in the rule that stays, as compass's writing rules say, and report why each higher rung did not work.
 
 6. Put it in this project's copy, never in the original:
    - A skill goes in `skills/<name>/SKILL.md` of the copy `ensure` printed, its cases in that copy's `tests/route_cases.json`. The copy loads in place, so `/reload-plugins` makes it live, and `clone.py sync` never touches what the project added. The original stays free of any project, so it can be pushed as it is.

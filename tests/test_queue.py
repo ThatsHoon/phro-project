@@ -28,6 +28,7 @@ HOME = Path(tempfile.mkdtemp())  # transcripts live under a fake home, never the
 ENV = {**os.environ, "HOME": str(HOME), "USERPROFILE": str(HOME), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 ENV.pop("CLAUDE_PROJECT_DIR", None)
+ENV.pop("CLAUDE_CONFIG_DIR", None)
 
 
 def q(root, *args):
@@ -365,6 +366,19 @@ def test_hook_routing():
     assert "decided for you" not in hook(root, B, "UserPromptSubmit", "hi"), "B never gets A's pull"
     path_of(q(root, "move", t.stem, "doing"))
     assert hook(root, A, "UserPromptSubmit", "hi") == ""
+
+
+def test_hook_resume():
+    root = fresh()
+
+    def resume(sid):
+        return hook(root, sid, None, stdin=json.dumps({"session_id": sid, "cwd": str(root), "hook_event_name": "SessionStart", "source": "resume"}))
+
+    assert f"--session {B}" in hook(root, B, "SessionStart")
+    t = path_of(ask(root, session=B))
+    again = resume(B)
+    assert f"--session {B}" not in again and t.stem in again, "an unchanged rule is not sent twice; the open tickets still are"
+    assert f"--session {A}" in resume(A), "a session that never got the rule gets it on resume"
 
 
 def test_deliver():
