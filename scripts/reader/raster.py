@@ -104,6 +104,8 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
             d = _parse(kind, data, codepage, mono)
         except ReadError as e:
             refused = e.kind == "damaged"
+            if e.kind == "too_large" and e.detail == "figure":  # the size cap: GDI+ still draws it, with no text
+                fig.warnings.add("figure damaged")
         except Exception:  # noqa: BLE001 - a picture never makes a document fail
             d = None
         if d is not None:
@@ -125,7 +127,11 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
     if refused or backend() != "gdiplus":
         return fig
     try:
-        fig.png = _render_gdiplus(kind, data, d, page)
+        fig.png = _render_gdiplus(kind, data, d, page, mono)
+    except ReadError as e:  # emf_write ran out of time: like the parser's deadline, nothing is drawn
+        fig.png = None
+        if e.detail == "figure time":
+            fig.warnings.add("figures not rendered: time")
     except Exception:  # noqa: BLE001 - any failure leaves the picture unconverted
         fig.png = None
     return fig
@@ -236,7 +242,7 @@ def _load():
     import atexit
     import ctypes
     import uuid
-    from ctypes import POINTER, Structure, c_int, c_size_t, c_uint, c_uint32, c_ubyte, c_uint16, c_void_p
+    from ctypes import POINTER, Structure, c_float, c_int, c_size_t, c_uint, c_uint32, c_ubyte, c_uint16, c_void_p
 
     class GUID(Structure):
         _fields_ = [("Data1", c_uint32), ("Data2", c_uint16), ("Data3", c_uint16), ("Data4", c_ubyte * 8)]
@@ -264,6 +270,8 @@ def _load():
         "GdipImageSelectActiveFrame": (I, [P, PG, U]),
         "GdipGetImageWidth": (I, [P, PU]),
         "GdipGetImageHeight": (I, [P, PU]),
+        "GdipGetImageHorizontalResolution": (I, [P, POINTER(c_float)]),
+        "GdipGetImageVerticalResolution": (I, [P, POINTER(c_float)]),
         "GdipCreateBitmapFromScan0": (I, [I, I, I, I, P, PP]),
         "GdipGetImageGraphicsContext": (I, [P, PP]),
         "GdipGraphicsClear": (I, [P, c_uint32]),
@@ -357,6 +365,19 @@ def _image_size(g, img) -> tuple[int, int]:
     return w.value, h.value
 
 
+def _metafile_size(g, img) -> tuple[int, int]:
+    """A metafile's size at 96 dpi. GDI+ gives it in the units of its reference device (an EMF made at 2540 dpi
+    reports 2541 for an inch), so each side is scaled by 96 over the image's own resolution."""
+    ct = g.ct
+    w, h = _image_size(g, img)
+    rx, ry = ct.c_float(0), ct.c_float(0)
+    _ok(g.GdipGetImageHorizontalResolution(img, ct.byref(rx)))
+    _ok(g.GdipGetImageVerticalResolution(img, ct.byref(ry)))
+    if not (math.isfinite(rx.value) and math.isfinite(ry.value) and rx.value > 0 and ry.value > 0):
+        raise _Fail("resolution")
+    return max(1, round(w * 96.0 / rx.value)), max(1, round(h * 96.0 / ry.value))
+
+
 def _draw(g, img, tw: int, th: int, argb_out: bool = False):
     """img drawn into a white tw x th 32-bit ARGB bitmap: the PNG bytes, or with argb_out the BGRA rows top-down."""
     ct = g.ct
@@ -422,7 +443,7 @@ def _with_image(g, data: bytes, create, use):
 
 def _metafile_png(g, data: bytes, size) -> bytes:
     def use(img):
-        tw, th = size if size is not None else target_size(*_image_size(g, img))
+        tw, th = size if size is not None else target_size(*_metafile_size(g, img))
         return _draw(g, img, tw, th)
     return _with_image(g, data, g.GdipCreateMetafileFromStream, use)
 
@@ -476,7 +497,7 @@ def _tiff_png(g, data: bytes, page: int) -> bytes | None:
     return _with_image(g, data, g.GdipCreateBitmapFromStream, use)
 
 
-def _render_gdiplus(kind: str, data: bytes, d, page: int) -> bytes | None:
+def _render_gdiplus(kind: str, data: bytes, d, page: int, mono: float | None = None) -> bytes | None:
     g = _gdip()
     if g is None:
         return None
@@ -485,7 +506,7 @@ def _render_gdiplus(kind: str, data: bytes, d, page: int) -> bytes | None:
     if kind in ("pict", "wpg"):
         if d is None:
             return None
-        return _metafile_png(g, emf_write.write(d, _decoder(g)), target_size(*d.size_px()))
+        return _metafile_png(g, emf_write.write(d, _decoder(g), mono), target_size(*d.size_px()))
     mk = _meta_kind(data)
     if mk is None:
         return None

@@ -1,22 +1,26 @@
 """A plain EMF from a drawing list, so GDI+ can draw a PICT or WPG the way it draws an EMF.
 
-Only the plain EMF records are written: paths with pens and brushes, EXTTEXTOUTW at the baseline, STRETCHDIBITS for
-bitmaps, and clips. One logical unit is one device pixel is 0.01 mm, the unit of rclFrame: the reference device is
-1000 x 1000 pixels over 10 x 10 mm. Every coordinate is clamped to the 32-bit range before it is written.
+Only the plain EMF records are written: paths with pens and brushes (runs of lines as one POLYLINETO, runs of curves
+as one POLYBEZIERTO), EXTTEXTOUTW at the baseline, STRETCHDIBITS for bitmaps, and clips. One logical unit is one
+device pixel is 0.01 mm, the unit of rclFrame: the reference device is 1000 x 1000 pixels over 10 x 10 mm. Every
+coordinate is clamped to the 32-bit range before it is written.
 """
 import math
 import struct
+import time
 
 from . import images, limits
+from .limits import ReadError
 from .vector import Bitmap, Clip, Path, Run
 
 _I32_MIN, _I32_MAX = -2**31, 2**31 - 1
 
 # record types (MS-EMF 2.1.1)
 _HEADER, _EOF = 1, 14
-_POLYBEZIERTO, _SETBKMODE, _SETPOLYFILLMODE, _SETTEXTALIGN, _SETTEXTCOLOR = 5, 18, 19, 22, 24
+_POLYBEZIERTO, _POLYLINETO = 5, 6
+_SETBKMODE, _SETPOLYFILLMODE, _SETTEXTALIGN, _SETTEXTCOLOR = 18, 19, 22, 24
 _MOVETOEX, _INTERSECTCLIPRECT, _SELECTOBJECT, _CREATEBRUSHINDIRECT, _DELETEOBJECT = 27, 30, 37, 39, 40
-_LINETO, _BEGINPATH, _ENDPATH, _CLOSEFIGURE, _FILLPATH, _STROKEANDFILLPATH, _STROKEPATH = 54, 59, 60, 61, 62, 63, 64
+_BEGINPATH, _ENDPATH, _CLOSEFIGURE, _FILLPATH, _STROKEANDFILLPATH, _STROKEPATH = 59, 60, 61, 62, 63, 64
 _SELECTCLIPPATH, _EXTSELECTCLIPRGN, _STRETCHDIBITS, _EXTCREATEFONTINDIRECTW, _EXTTEXTOUTW = 67, 75, 81, 82, 84
 _EXTCREATEPEN = 95
 
@@ -25,6 +29,7 @@ _NULL_BRUSH, _NULL_PEN, _SYSTEM_FONT = 0x80000005, 0x80000008, 0x8000000D
 _TRANSPARENT, _TA_BASELINE, _RGN_COPY, _ALTERNATE, _WINDING = 1, 24, 5, 1, 2
 _PS_GEOMETRIC, _ETO_GLYPH_INDEX, _SRCCOPY = 0x10000, 0x10, 0x00CC0020
 _UNIT = 2540.0  # logical units (0.01 mm) per inch
+CLOCK_EVERY = 4096  # items and segments between two reads of the clock
 
 
 def _i(v) -> int:
@@ -49,8 +54,10 @@ def _rec(typ: int, body: bytes = b"") -> bytes:
 
 
 class _Writer:
-    def __init__(self, d, decode):
+    def __init__(self, d, decode, deadline=None):
         self.decode = decode
+        self.deadline = deadline  # a time.monotonic() value, or None
+        self.work = 0
         dpi = float(d.dpi) if isinstance(d.dpi, (int, float)) and math.isfinite(d.dpi) and d.dpi > 0 else 96.0
         fr = [float(v) if isinstance(v, (int, float)) and math.isfinite(v) else 0.0 for v in d.frame]
         self.x0, self.y0 = min(fr[0], fr[2]), min(fr[1], fr[3])
@@ -59,8 +66,13 @@ class _Writer:
         self.h = self._extent(abs(fr[3] - fr[1]), dpi)
         self.out: list[bytes] = []
         self.pen = self.brush = self.font = self.color = self.fill = None
-        self.bitmaps: dict = {}
-        self.bitmap_bytes = 0
+        self.failed: set = set()  # bitmaps that did not decode, so a repeat is not decoded again
+        self.bitmap_bytes = 0     # DIB bytes written; at IMAGE_BYTES no further bitmap is decoded
+
+    def tick(self):
+        self.work += 1
+        if self.deadline is not None and self.work % CLOCK_EVERY == 0 and time.monotonic() > self.deadline:
+            raise ReadError("too_large", "figure time")
 
     def _extent(self, span: float, dpi: float) -> int:
         """The frame side in 0.01 mm, nudged so that it gives back the drawing's own pixel size."""
@@ -129,47 +141,47 @@ class _Writer:
 
     # ---- items ---------------------------------------------------------------------------------------------------
 
-    def segs(self, segs) -> int:
-        """The path's segments as MOVETOEX, LINETO, POLYBEZIERTO and CLOSEFIGURE records; how many went out."""
-        n, started, i = 0, False, 0
+    def segs(self, segs) -> list[bytes]:
+        """The path's segments as MOVETOEX, POLYLINETO, POLYBEZIERTO and CLOSEFIGURE records. A run of lines or of
+        curves is one record. A close before any point, and a segment that is not one, write nothing."""
+        out: list[bytes] = []
+        started, i = False, 0
         segs = list(segs or ())
-        while i < len(segs):
+        n = len(segs)
+        while i < n:
             s = segs[i]
             op = s[0] if s else None
-            if op == "M" and len(s) >= 3:
-                self.add(_MOVETOEX, struct.pack("<ii", self.x(s[1]), self.y(s[2])))
-                started = True
-            elif op == "L" and len(s) >= 3:
-                if not started:
-                    self.add(_MOVETOEX, struct.pack("<ii", self.x(s[1]), self.y(s[2])))
-                    started = True
-                self.add(_LINETO, struct.pack("<ii", self.x(s[1]), self.y(s[2])))
-            elif op == "C" and len(s) >= 7:
+            want = 3 if op == "L" else 7 if op == "C" else 0
+            if want and len(s) >= want:
                 pts = []
-                while i < len(segs) and segs[i] and segs[i][0] == "C" and len(segs[i]) >= 7:
+                while i < n and segs[i] and segs[i][0] == op and len(segs[i]) >= want:
+                    self.tick()
                     c = segs[i]
-                    pts += [(self.x(c[k]), self.y(c[k + 1])) for k in (1, 3, 5)]
+                    pts += [(self.x(c[k]), self.y(c[k + 1])) for k in range(1, want, 2)]
                     i += 1
-                i -= 1
                 if not started:
-                    self.add(_MOVETOEX, struct.pack("<ii", *pts[0]))
+                    out.append(_rec(_MOVETOEX, struct.pack("<ii", *pts[0])))
                     started = True
                 xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-                self.add(_POLYBEZIERTO, struct.pack("<4iI", min(xs), min(ys), max(xs), max(ys), len(pts))
-                         + struct.pack("<%di" % (2 * len(pts)), *[v for p in pts for v in p]))
-            elif op == "Z":
-                if started:
-                    self.add(_CLOSEFIGURE)
-            else:
-                i += 1
+                out.append(_rec(_POLYLINETO if op == "L" else _POLYBEZIERTO,
+                                struct.pack("<4iI", min(xs), min(ys), max(xs), max(ys), len(pts))
+                                + struct.pack("<%di" % (2 * len(pts)), *[v for p in pts for v in p])))
                 continue
-            n += 1
+            self.tick()
+            if op == "M" and len(s) >= 3:
+                out.append(_rec(_MOVETOEX, struct.pack("<ii", self.x(s[1]), self.y(s[2]))))
+                started = True
+            elif op == "Z" and started:
+                out.append(_rec(_CLOSEFIGURE))
             i += 1
-        return n
+        return out
 
     def path(self, p):
         pen, brush = p.pen, p.brush
-        if pen is None and brush is None or not p.segs:
+        if pen is None and brush is None:
+            return
+        recs = self.segs(p.segs)
+        if not recs:
             return
         if pen is not None:
             self.use_pen(pen)
@@ -180,9 +192,7 @@ class _Writer:
                 self.add(_SETPOLYFILLMODE, struct.pack("<I", mode))
                 self.fill = mode
         self.add(_BEGINPATH)
-        if not self.segs(p.segs):
-            self.out.pop()
-            return
+        self.out += recs
         self.add(_ENDPATH)
         bounds = struct.pack("<4i", 0, 0, self.w, self.h)
         self.add(_STROKEANDFILLPATH if pen is not None and brush is not None else _FILLPATH if brush is not None
@@ -221,11 +231,12 @@ class _Writer:
         if box is not None:
             self.add(_INTERSECTCLIPRECT, struct.pack("<4i", *box))
             return
-        self.add(_BEGINPATH)
-        if not self.segs(c.segs):
-            self.out.pop()
+        recs = self.segs(c.segs)
+        if not recs:
             self.add(_INTERSECTCLIPRECT, struct.pack("<4i", 0, 0, 0, 0))  # an empty clip shows nothing
             return
+        self.add(_BEGINPATH)
+        self.out += recs
         self.add(_ENDPATH)
         self.add(_SELECTCLIPPATH, struct.pack("<I", _RGN_COPY))
 
@@ -249,33 +260,32 @@ class _Writer:
         return min(xs), min(ys), max(xs), max(ys)
 
     def bitmap(self, b):
-        if self.decode is None or b.kind not in ("png", "jpg"):
+        """STRETCHDIBITS of a decoded PNG or JPEG. Once IMAGE_BYTES of DIBs are written, nothing more is decoded;
+        a DIB is not kept after its record is written."""
+        if self.decode is None or b.kind not in ("png", "jpg") or self.bitmap_bytes >= limits.IMAGE_BYTES:
             return
-        key = (b.kind, b.data)
-        if key not in self.bitmaps:
-            got = None
-            try:
-                got = self.decode(b.data, b.kind)
-            except Exception:  # noqa: BLE001 - a bitmap that does not decode is left out
-                got = None
-            if got is not None:
-                w, h, bits = got
-                size = 4 * w * h if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0 else -1
-                if (size <= 0 or w * h > images._MAX_PIXELS or len(bits) != size
-                        or self.bitmap_bytes + size > limits.IMAGE_BYTES):
-                    got = None
-                else:
-                    self.bitmap_bytes += size
-            self.bitmaps[key] = got
-        got = self.bitmaps[key]
-        if got is None:
-            return
-        w, h, bits = got
         box = list(b.box) if len(b.box) == 4 else [0, 0, 0, 0]
         x0, y0, x1, y1 = self.x(box[0]), self.y(box[1]), self.x(box[2]), self.y(box[3])
         cx, cy = _i(x1 - x0), _i(y1 - y0)
-        if not cx or not cy:
+        key = (b.kind, bytes(b.data))
+        if not cx or not cy or key in self.failed:
             return
+        try:
+            got = self.decode(key[1], b.kind)
+        except Exception:  # noqa: BLE001 - a bitmap that does not decode is left out
+            got = None
+        if got is not None:
+            w, h, bits = got
+            size = 4 * w * h if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0 else -1
+            if size <= 0 or w * h > images._MAX_PIXELS or len(bits) != size:
+                got = None
+            elif self.bitmap_bytes + size > limits.IMAGE_BYTES:
+                self.bitmap_bytes = limits.IMAGE_BYTES  # the budget is spent: this and the rest are left out
+                return
+        if got is None:
+            self.failed.add(key)
+            return
+        self.bitmap_bytes += size
         # BITMAPINFOHEADER: 32 bits, BI_RGB, a negative height for top-down rows
         bmi = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, 32, 0, len(bits), 0, 0, 0, 0)
         body = struct.pack("<4i6i6I2i", min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1), x0, y0, 0, 0, w, h,
@@ -283,13 +293,15 @@ class _Writer:
         self.add(_STRETCHDIBITS, body + bmi + bits)
 
 
-def write(d, decode=None) -> bytes:
+def write(d, decode=None, deadline: float | None = None) -> bytes:
     """The EMF of a drawing. `decode(data, kind)` turns a PNG or JPEG into (width, height, BGRA rows top-down) or
-    None; without one, or when it fails, the bitmap is left out."""
-    wr = _Writer(d, decode)
+    None; without one, or when it fails, the bitmap is left out. Past `deadline` (a time.monotonic() value, read
+    every CLOCK_EVERY items and segments) it raises ReadError("too_large", "figure time")."""
+    wr = _Writer(d, decode, deadline)
     wr.add(_SETBKMODE, struct.pack("<I", _TRANSPARENT))
     wr.add(_SETTEXTALIGN, struct.pack("<I", _TA_BASELINE))
     for it in d.items:
+        wr.tick()
         if isinstance(it, Path):
             wr.path(it)
         elif isinstance(it, Run):

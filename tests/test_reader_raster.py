@@ -16,10 +16,11 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from metafile_fix import (emf, emf_glyphs, emf_brush, emf_rect, emf_textw, pict, pict_longtext,  # noqa: E402
-                          pict_op, wmf, wmf_brush, wmf_font, wmf_rect, wmf_select, wmf_text, wmf_window, wpg1,
+from metafile_fix import (emf, emf_brush, emf_font, emf_glyphs, emf_pen, emf_rect, emf_textw, pict,  # noqa: E402
+                          pict_longtext, pict_op, wmf, wmf_brush, wmf_font, wmf_rect, wmf_select, wmf_text, wmf_window, wpg1,
                           wpg1_fill, wpg1_rect, wpg1_text)
-from reader import emf_write, fonts, limits, metafile, raster  # noqa: E402
+from reader import emf_write, fonts, images, limits, metafile, raster  # noqa: E402
+from reader.limits import ReadError  # noqa: E402
 from reader.vector import Bitmap, Brush, Clip, Drawing, Path as VPath, Pen, Run, text_lines  # noqa: E402
 
 WINDOWS = sys.platform == "win32"
@@ -288,18 +289,165 @@ def test_emf_write_hostile_values():
     assert empty.size_px() == (1, 1)
 
 
+def emf_records(data: bytes) -> list[tuple[int, bytes]]:
+    """(type, body) of every record after the header."""
+    out, pos = [], struct.unpack_from("<I", data, 4)[0]
+    while pos + 8 <= len(data):
+        typ, size = struct.unpack_from("<II", data, pos)
+        out.append((typ, data[pos + 8:pos + size]))
+        pos += size
+    return out
+
+
+def test_fixture_emf_counts():
+    data = emf([emf_font(-100, index=1), emf_brush(0, index=7), emf_pen(index=3), emf_rect(0, 0, 5, 5)])
+    n, handles = struct.unpack_from("<IH", data, 52)
+    assert (n, handles) == (9, 8), (n, handles)  # header, three creates, three selects, a rect, EOF
+    assert struct.unpack_from("<IH", emf([]), 52) == (2, 1)
+
+
+def test_emf_write_batches_lines_and_curves():
+    segs = [("M", 0, 0), ("L", 10, 0), ("L", 10, 10), ("L", 0, 10), ("C", 1, 1, 2, 2, 3, 3), ("C", 4, 4, 5, 5, 6, 6),
+            ("L", 20, 20), ("L", 30, 30), ("Z",)]
+    d = Drawing((0, 0, 100, 100), 96.0, [VPath(segs, Pen(0, 1), None)])
+    recs = emf_records(emf_write.write(d))
+    types = [t for t, _ in recs]
+    assert 54 not in types, types  # no single LINETO
+    polys = [(t, struct.unpack_from("<I", b, 16)[0]) for t, b in recs if t in (5, 6)]
+    assert polys == [(6, 3), (5, 6), (6, 2)], polys
+    back = metafile.parse(emf_write.write(d))
+    p = [i for i in back.items if isinstance(i, VPath)][0]
+    assert [s[0] for s in p.segs] == ["M", "L", "L", "L", "C", "C", "L", "L", "Z"], p.segs
+    k = 2540 / 96
+    assert abs(p.segs[2][1] - 10 * k) < 1 and abs(p.segs[7][2] - 30 * k) < 1
+
+
+def test_emf_write_lone_close_writes_nothing():
+    frame = (0, 0, 50, 50)
+    empty = emf_write.write(Drawing(frame, 96.0, []))
+    assert emf_write.write(Drawing(frame, 96.0, [VPath([("Z",)], Pen(0xFF0000, 2), Brush(0x00FF00))])) == empty
+    assert emf_write.write(Drawing(frame, 96.0, [VPath([("Z",), ("Z",)], None, Brush(0))])) == empty
+
+
+def test_emf_write_deadline():
+    items = [VPath([("M", i, 0), ("L", i, 10)], Pen(0, 1), None) for i in range(5000)]
+    d = Drawing((0, 0, 100, 100), 96.0, items)
+    try:
+        emf_write.write(d, deadline=time.monotonic() - 1)
+    except ReadError as e:
+        assert (e.kind, e.detail) == ("too_large", "figure time")
+    else:
+        raise AssertionError("no ReadError")
+    assert emf_write.write(d, deadline=time.monotonic() + 60)[:4] == b"\x01\x00\x00\x00"
+
+
+def test_emf_write_bitmap_budget():
+    calls = []
+
+    def decode(data, kind):
+        calls.append(data)
+        return 2, 1, b"\x00\x00\xff\xff" * 2
+
+    items = [Bitmap(bytes([i]) * 20, "png", (0, 0, 10, 10)) for i in range(5)]
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES = 16  # two 2 x 1 DIBs of 8 bytes
+    try:
+        out = emf_write.write(Drawing((0, 0, 100, 100), 96.0, items), decode)
+    finally:
+        limits.IMAGE_BYTES = old
+    assert len(calls) == 2, len(calls)
+    assert [t for t, _ in emf_records(out)].count(81) == 2
+    limits.IMAGE_BYTES = 12  # the second DIB passes the budget: it is dropped and decoding stops
+    calls.clear()
+    try:
+        out = emf_write.write(Drawing((0, 0, 100, 100), 96.0, items), decode)
+    finally:
+        limits.IMAGE_BYTES = old
+    assert len(calls) == 2 and [t for t, _ in emf_records(out)].count(81) == 1
+
+
+def test_size_cap_warns_damaged():
+    data = emf([emf_textw(100, 200, "Hi")])
+    old = limits.METAFILE_RECORDS
+    limits.METAFILE_RECORDS = 1
+    try:
+        with no_backend():
+            f = raster.convert("emf", data)
+    finally:
+        limits.METAFILE_RECORDS = old
+    assert f.png is None and f.lines == [] and f.warnings == {"figure damaged"}
+
 # ---- GDI+ ------------------------------------------------------------------------------------------------------------
 
-def counted(data: bytes) -> bytes:
-    """A fixture EMF with nRecords and nHandles filled in, as every real EMF has them: GDI refuses a header with
-    none."""
-    b, pos, n = bytearray(data), 108, 1
-    while pos < len(b):
-        pos += struct.unpack_from("<I", b, pos + 4)[0]
-        n += 1
-    struct.pack_into("<IHH", b, 52, n, 16, 0)
-    return bytes(b)
+def render(d: Drawing) -> bytes:
+    """A drawing through emf_write and GDI+, as convert draws a PICT or WPG."""
+    return raster._render_gdiplus("pict", b"", d, 0)
 
+
+@needs_gdiplus
+def test_gdiplus_fallback_size_96dpi():
+    """With the parser stopped at its size cap, the PNG size comes from GDI+ at 96 dpi."""
+    one_inch = emf([emf_brush(0x000000), emf_rect(0, 1270, 1270, 2540)])
+    wide = emf_write.write(Drawing((0, 0, 200, 100), 96.0, [VPath([("M", 0, 50), ("L", 100, 50), ("L", 100, 100),
+                                                                   ("L", 0, 100), ("Z",)], None, Brush(0))]))
+    old = limits.METAFILE_RECORDS
+    limits.METAFILE_RECORDS = 1
+    try:
+        f = raster.convert("emf", one_inch)
+        g = raster.convert("emf", wide)
+    finally:
+        limits.METAFILE_RECORDS = old
+    assert f.warnings == {"figure damaged"} and f.lines == []
+    assert png_size(f.png) == raster.target_size(96, 96) == (192, 192)
+    assert png_size(g.png) == raster.target_size(200, 100) == (400, 200)
+    w, h, rows = png_pixels(f.png)
+    assert dark(rows[h * 3 // 4][w // 4]) and not dark(rows[h // 4][w * 3 // 4])
+
+
+@needs_gdiplus
+def test_gdiplus_emf_write_time_is_not_rendered():
+    def late(d, decode=None, deadline=None):
+        raise ReadError("too_large", "figure time")
+    old = emf_write.write
+    emf_write.write = late
+    try:
+        f = raster.convert("pict", pict([pict_longtext(20, 10, b"Mac")]))
+    finally:
+        emf_write.write = old
+    assert f.png is None and f.lines == ["Mac"] and f.warnings == {"figures not rendered: time"}
+
+
+@needs_gdiplus
+def test_gdiplus_emf_write_text_pixels():
+    png = render(Drawing((0, 0, 200, 100), 96.0, [Run("X", 20, 80, "Arial", 72)]))
+    w, h, rows = png_pixels(png)
+    assert (w, h) == (400, 200)
+    assert dark_count(rows, 40, 40, 160, 170) > 300  # the X, at twice its size, above its baseline
+    assert dark_count(rows, 200, 0, 400, 200) == 0
+
+
+@needs_gdiplus
+def test_gdiplus_emf_write_bitmap_lands_in_box():
+    black = images._png(4, 4, [b"\x00\x00\x00" * 4] * 4, False)
+    png = render(Drawing((0, 0, 100, 100), 96.0, [Bitmap(black, "png", (50, 50, 100, 100))]))
+    w, h, rows = png_pixels(png)
+    assert (w, h) == (200, 200)
+    assert dark(rows[150][150]) and dark(rows[105][105]) and dark(rows[195][195])
+    assert not dark(rows[90][150]) and not dark(rows[150][90]) and not dark(rows[50][50])
+
+
+@needs_gdiplus
+def test_gdiplus_emf_write_clips():
+    whole = [("M", 0, 0), ("L", 100, 0), ("L", 100, 100), ("L", 0, 100), ("Z",)]
+    rect = [("M", 0, 0), ("L", 50, 0), ("L", 50, 100), ("L", 0, 100), ("Z",)]
+    tri = [("M", 0, 0), ("L", 100, 0), ("L", 0, 100), ("Z",)]
+    corner = [("M", 90, 0), ("L", 100, 0), ("L", 100, 10), ("L", 90, 10), ("Z",)]
+    for clip, inside, outside in ((rect, (25, 50), (75, 50)), (tri, (20, 20), (80, 80))):
+        png = render(Drawing((0, 0, 100, 100), 96.0, [Clip(clip), VPath(whole, None, Brush(0)), Clip(None),
+                                                      VPath(corner, None, Brush(0))]))
+        w, h, rows = png_pixels(png)
+        assert dark(rows[inside[1] * 2][inside[0] * 2]) and not dark(rows[outside[1] * 2][outside[0] * 2])
+        assert dark(rows[10][190])  # drawn after the clip is removed
 
 @needs_gdiplus
 def test_gdiplus_wmf_png_size():
@@ -313,7 +461,7 @@ def test_gdiplus_wmf_png_size():
 
 @needs_gdiplus
 def test_gdiplus_emf_png():
-    data = counted(emf([emf_brush(0x000000), emf_rect(0, 1270, 1270, 2540), emf_textw(100, 200, "Hi")]))
+    data = emf([emf_brush(0x000000), emf_rect(0, 1270, 1270, 2540), emf_textw(100, 200, "Hi")])
     f = raster.convert("emf", data)
     assert f.png[:8] == b"\x89PNG\r\n\x1a\n" and f.lines == ["Hi"]
     want = raster.target_size(*metafile.parse(data).size_px())

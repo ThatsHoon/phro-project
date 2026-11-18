@@ -114,11 +114,22 @@ def emf_rec(typ: int, body: bytes = b"") -> bytes:
 
 
 def emf(records: list[bytes], frame=(0, 0, 2540, 2540)) -> bytes:
-    """An EMF file: the 108-byte header (rclFrame `frame` in 0.01 mm), the records, then EMR_EOF."""
+    """An EMF file: the 108-byte header (rclFrame `frame` in 0.01 mm), the records, then EMR_EOF. nRecords counts
+    the header and EOF; nHandles is one more than the highest object index the records create (GDI refuses 0)."""
     l, t, r, b = frame
     recs = b"".join(records) + emf_rec(14, struct.pack("<III", 0, 16, 20))
+    n, top, pos = 1, 0, 0
+    while pos + 8 <= len(recs):  # a deliberately broken record ends the count
+        typ, size = struct.unpack_from("<II", recs, pos)
+        if size < 8 or pos + size > len(recs):
+            break
+        if typ in (38, 39, 49, 82, 93, 94, 95) and size >= 12:  # pen, brush, palette, font, pattern brushes, ext pen
+            top = max(top, struct.unpack_from("<I", recs, pos + 8)[0])
+        n += 1
+        pos += size
+    handles = min(top + 1, 0xFFFF)
     head = struct.pack("<II4i4iIIIIHHIII2i2iIII2i", 1, 108, l, t, r, b, l, t, r, b, 0x464D4520, 0x10000,
-                       108 + len(recs), 0, 0, 0, 0, 0, 0, 1000, 1000, 10, 10, 0, 0, 0, 10000, 10000)
+                       108 + len(recs), n, handles, 0, 0, 0, 0, 1000, 1000, 10, 10, 0, 0, 0, 10000, 10000)
     return head + recs
 
 
