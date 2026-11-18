@@ -122,14 +122,16 @@ def _int_r(d, off):
     return (b - 0x80 if b & 0x40 else b), off + 1
 
 
-def _read_points(d, off, n, flags, budget):
-    """`n` points at `off`: relative EmfPlusPointR with 0x0800, 16-bit with 0x4000, else floats. (points, end)."""
+def _read_points(d, off, n, flags, budget=None):
+    """`n` points at `off`: relative EmfPlusPointR with 0x0800, 16-bit with 0x4000, else floats. (points, end).
+    An object's points are charged to `budget` when it is defined; a drawing record's are charged as they go out."""
     if n < 0:
         raise ValueError
     rel, small = flags & 0x0800, flags & 0x4000
     if off + n * (2 if rel else 4 if small else 8) > len(d):
         raise ValueError
-    budget.points(n)
+    if budget is not None:
+        budget.points(n)
     if rel:
         out, x, y = [], 0, 0
         for _ in range(n):
@@ -517,6 +519,7 @@ class Plus:
     def _clip_path(self, flags, d):
         o = self._obj(flags & 0xFF, "path")
         if o is not None:
+            self.h._charge(o[1])  # the path's points are mapped again for each use
             pts = [q for s in o[1] for q in zip(s[1::2], s[2::2])]
             if pts:
                 self._clip_to(self._frame_box(pts), flags >> 8 & 0xF)
@@ -638,13 +641,11 @@ class Plus:
     def _fill_rects(self, flags, d):
         brush, n = struct.unpack_from("<II", d)
         rects = _read_rects(d, 8, n, flags)
-        self.h.budget.points(4 * n)
         self._fill([s for r in rects for s in _rect_segs(*r)], self._color(flags, brush))
 
     def _draw_rects(self, flags, d):
         n, = struct.unpack_from("<I", d)
         rects = _read_rects(d, 4, n, flags)
-        self.h.budget.points(4 * n)
         self._stroke([s for r in rects for s in _rect_segs(*r)], flags & 0xFF)
 
     def _poly_segs(self, pts, closed):
@@ -655,12 +656,12 @@ class Plus:
 
     def _fill_polygon(self, flags, d):
         brush, n = struct.unpack_from("<II", d)
-        pts, _ = _read_points(d, 8, n, flags, self.h.budget)
+        pts, _ = _read_points(d, 8, n, flags)
         self._fill(self._poly_segs(pts, True), self._color(flags, brush))
 
     def _draw_lines(self, flags, d):
         n, = struct.unpack_from("<I", d)
-        pts, _ = _read_points(d, 4, n, flags, self.h.budget)
+        pts, _ = _read_points(d, 4, n, flags)
         self._stroke(self._poly_segs(pts, bool(flags & 0x2000)), flags & 0xFF)
 
     def _rect_at(self, flags, d, off):
@@ -668,21 +669,17 @@ class Plus:
 
     def _fill_ellipse(self, flags, d):
         brush, = struct.unpack_from("<I", d)
-        self.h.budget.points(13)
         self._fill(_ellipse_segs(*self._rect_at(flags, d, 4)), self._color(flags, brush))
 
     def _draw_ellipse(self, flags, d):
-        self.h.budget.points(13)
         self._stroke(_ellipse_segs(*self._rect_at(flags, d, 0)), flags & 0xFF)
 
     def _fill_pie(self, flags, d):
         brush, start, sweep = struct.unpack_from("<Iff", d)
-        self.h.budget.points(16)
         self._fill(_arc_segs(*self._rect_at(flags, d, 12), start, sweep, "pie"), self._color(flags, brush))
 
     def _draw_pie(self, flags, d, kind="pie"):
         start, sweep = struct.unpack_from("<ff", d)
-        self.h.budget.points(16)
         self._stroke(_arc_segs(*self._rect_at(flags, d, 8), start, sweep, kind), flags & 0xFF)
 
     def _draw_arc(self, flags, d):
@@ -709,22 +706,22 @@ class Plus:
 
     def _fill_closed_curve(self, flags, d):
         brush, tension, n = struct.unpack_from("<IfI", d)
-        pts, _ = _read_points(d, 12, n, flags, self.h.budget)
+        pts, _ = _read_points(d, 12, n, flags)
         self._fill(_cardinal(pts, tension, True), self._color(flags, brush), not flags & 0x2000)
 
     def _draw_closed_curve(self, flags, d):
         tension, n = struct.unpack_from("<fI", d)
-        pts, _ = _read_points(d, 8, n, flags, self.h.budget)
+        pts, _ = _read_points(d, 8, n, flags)
         self._stroke(_cardinal(pts, tension, True), flags & 0xFF)
 
     def _draw_curve(self, flags, d):
         tension, offset, nseg, n = struct.unpack_from("<fIII", d)
-        pts, _ = _read_points(d, 16, n, flags & 0x4000, self.h.budget)
+        pts, _ = _read_points(d, 16, n, flags & 0x4000)
         self._stroke(_cardinal(pts, tension, False, offset, nseg), flags & 0xFF)
 
     def _draw_beziers(self, flags, d):
         n, = struct.unpack_from("<I", d)
-        pts, _ = _read_points(d, 4, n, flags, self.h.budget)
+        pts, _ = _read_points(d, 4, n, flags)
         if pts:
             segs = [("M",) + pts[0]] + [("C",) + pts[i] + pts[i + 1] + pts[i + 2] for i in range(1, len(pts) - 2, 3)]
             self._stroke(segs if len(segs) > 1 else [], flags & 0xFF)
@@ -742,7 +739,7 @@ class Plus:
         n, = struct.unpack_from("<I", d, 24)
         if n != 3:
             raise ValueError
-        pts, _ = _read_points(d, 28, 3, flags, self.h.budget)
+        pts, _ = _read_points(d, 28, 3, flags)
         if o is not None:
             self._place(o, *pts)
 
@@ -752,11 +749,7 @@ class Plus:
         q0, q1, q2 = apply(m, *p0), apply(m, *p1), apply(m, *p2)
         if o[1] != "meta":
             q3 = (q1[0] + q2[0] - q0[0], q1[1] + q2[1] - q0[1])
-            box = _box_of([q0, q1, q2, q3])
-            if all(map(math.isfinite, box)):
-                self.h.items.append(Bitmap(o[2], o[1], box))
-            else:
-                self.h.skipped += 1
+            self.h._emit(Bitmap(o[2], o[1], _box_of([q0, q1, q2, q3])))
             return
         if not o[3]:
             o[3].append(self.h._nested(o[2]))
@@ -790,16 +783,13 @@ class Plus:
             elif isinstance(it, Bitmap):
                 x0, y0, x1, y1 = it.box
                 box = _box_of([apply(a, x0, y0), apply(a, x1, y0), apply(a, x0, y1), apply(a, x1, y1)])
-                if all(map(math.isfinite, box)):
-                    self.h.items.append(Bitmap(it.data, it.kind, box))
+                self.h._emit(Bitmap(it.data, it.kind, box))
             elif isinstance(it, Clip):
                 clipped = True
                 if it.segs is None:
                     self.h._force_clip()
                 else:
-                    segs = self._map(it.segs, a)
-                    if all(map(math.isfinite, (v for s in segs for v in s[1:]))):
-                        self.h.items.append(Clip(segs))
+                    self.h._emit(Clip(self._map(it.segs, a)))
         if clipped:
             self.h._force_clip()
 
@@ -866,7 +856,6 @@ class Plus:
         brush, opts, has_m, n = struct.unpack_from("<IIII", d)
         if 16 + 10 * n > len(d):
             raise ValueError
-        self.h.budget.points(n)
         glyphs = struct.unpack_from("<%dH" % n, d, 16)
         pos = struct.unpack_from("<%df" % (2 * n), d, 16 + 2 * n)
         font = self._obj(flags & 0xFF, "font")

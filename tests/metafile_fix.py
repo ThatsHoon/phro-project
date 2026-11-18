@@ -142,10 +142,11 @@ def emf_pen(rgb=0, width=1, style=0, index=3) -> bytes:
     return emf_rec(38, struct.pack("<IIii", index, style, width, 0) + _colorref(rgb)) + emf_select(index)
 
 
-def _emr_text(typ, x, y, raw: bytes, n: int, options=0, dx=None) -> bytes:
-    """EMR_EXTTEXTOUTA/W: bounds, graphics mode and scales, then the EmrText and its string and dx at the end."""
+def _emr_text(typ, x, y, raw: bytes, n: int, options=0, dx=None, keep_rect=False) -> bytes:
+    """EMR_EXTTEXTOUTA/W: bounds, graphics mode and scales, then the EmrText and its string and dx at the end. The
+    rectangle is left out under ETO_NO_RECT as MS-EMF says, unless `keep_rect`, as Windows writes it."""
     head = struct.pack("<4iIff", 0, 0, 0, 0, 1, 0.0, 0.0)
-    rect = b"" if options & ETO_NO_RECT else struct.pack("<4i", 0, 0, 0, 0)
+    rect = b"" if options & ETO_NO_RECT and not keep_rect else struct.pack("<4i", 0, 0, 0, 0)
     at = 8 + len(head) + 20 + len(rect) + 4
     raw = raw + b"\0" * (-len(raw) % 4)
     off_dx = at + len(raw) if dx is not None else 0
@@ -154,9 +155,9 @@ def _emr_text(typ, x, y, raw: bytes, n: int, options=0, dx=None) -> bytes:
     return emf_rec(typ, head + text + raw + tail)
 
 
-def emf_textw(x, y, s: str, options=0, dx=None) -> bytes:
+def emf_textw(x, y, s: str, options=0, dx=None, keep_rect=False) -> bytes:
     raw = s.encode("utf-16-le")
-    return _emr_text(84, x, y, raw, len(raw) // 2, options, dx)
+    return _emr_text(84, x, y, raw, len(raw) // 2, options, dx, keep_rect)
 
 
 def emf_texta(x, y, s: bytes, options=0, dx=None) -> bytes:

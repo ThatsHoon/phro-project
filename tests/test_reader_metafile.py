@@ -667,6 +667,75 @@ def test_emfplus_lines_curves_and_paths():
     assert fp.brush.color == 0x00FF00 and [s[0] for s in fp.segs] == ["M", "L", "L", "L", "Z"]
 
 
+def _kind_under_points_cap(cap, data):
+    """The ReadError kind parsing `data` raises with METAFILE_POINTS lowered to `cap`, or None."""
+    old = limits.METAFILE_POINTS
+    limits.METAFILE_POINTS = cap
+    try:
+        metafile.parse(data)
+    except ReadError as e:
+        return e.kind
+    finally:
+        limits.METAFILE_POINTS = old
+    return None
+
+
+def _place_many(inner: bytes, k: int) -> bytes:
+    return emf([emfplus([plus_header(False), plus_image_metafile(0, inner)] + [plus_draw_image(0, 0, 0, 96, 96)] * k)])
+
+
+def test_emfplus_redrawn_pictures_charged():
+    # one rectangle, placed 10 times at each of 3 levels: the picture is parsed once a level, drawn 1000 times
+    x = emf([emf_rect(0, 0, 10, 10)])
+    for _ in range(3):
+        x = _place_many(x, 10)
+    d = metafile.parse(x)
+    assert len(paths(d)) == 1000 and not d.damaged and d.skipped == 0
+    assert _kind_under_points_cap(2000, x) == "too_large"
+
+
+def test_emfplus_path_object_drawn_many_times_charged():
+    path = plus_object(1, 3, struct.pack("<IiI", PLUS_VERSION, 4, 0) + struct.pack("<8f", 0, 0, 10, 0, 10, 10, 0, 10)
+                       + bytes((0, 1, 1, 0x81)))
+    fill = plus_rec(0x4014, 0x8001, struct.pack("<I", 0xFF00FF00))  # FillPath of path 1
+    clip = plus_rec(0x4033, 1 | 1 << 8)  # SetClipPath of path 1, intersect
+    many = emf([emfplus([plus_header(False), path] + [fill] * 300)])
+    assert len(paths(metafile.parse(many))) == 300
+    assert _kind_under_points_cap(1000, many) == "too_large"
+    clips = emf([emfplus([plus_header(False), path] + [clip] * 300)])
+    assert len([i for i in metafile.parse(clips).items if isinstance(i, Clip)]) == 1
+    assert _kind_under_points_cap(1000, clips) == "too_large"
+
+
+def test_dual_skipped_records_still_move_the_current_point():
+    def last_path(skipped):
+        recs = [emfplus([plus_header(), plus_fill_rect(0, 0, 5, 5)]), emf_rec(27, struct.pack("<ii", 10, 10))]
+        recs += skipped + [emfplus([plus_getdc()]), emf_rec(54, struct.pack("<ii", 500, 100))]
+        d = metafile.parse(emf(recs))
+        assert d.skipped == 0 and len(paths(d)) == 2
+        return paths(d)[-1]
+    p = last_path([emf_rec(54, struct.pack("<ii", 300, 400))])  # a LINETO the EMF+ records drew
+    assert p.segs[0][1:] == (300, 400) and p.segs[1][1:] == (500, 100)
+    p = last_path([emf_poly(89, [(30, 40), (60, 70)], wide=False)])  # POLYLINETO16
+    assert p.segs[0][1:] == (60, 70)
+    p = last_path([emf_rec(22, struct.pack("<I", 1)), emf_font(-100), emf_textw(0, 0, "ab", dx=[7, 8]),
+                   emf_rec(22, struct.pack("<I", 0))])  # text under TA_UPDATECP advances by its dx
+    assert p.segs[0][1:] == (25, 10)
+    p = last_path([emf_rec(22, struct.pack("<I", 0)), emf_textw(0, 0, "ab", dx=[7, 8])])  # no TA_UPDATECP: no move
+    assert p.segs[0][1:] == (10, 10)
+
+
+def test_emf_no_rect_flag_with_the_rect_kept():
+    # Windows keeps the rectangle under ETO_NO_RECT: offDx follows it
+    d = metafile.parse(emf([emf_font(-100), emf_textw(0, 100, "abc", options=0x100, dx=[30, 40, 50], keep_rect=True)]))
+    (r,) = runs(d)
+    assert r.text == "abc" and close(r.width, 120)
+    # laid out as MS-EMF says, with the rectangle left out: offDx at the spec's place
+    d = metafile.parse(emf([emf_font(-100), emf_textw(0, 100, "abc", options=0x100, dx=[30, 40, 50])]))
+    (r,) = runs(d)
+    assert r.text == "abc" and close(r.width, 120)
+
+
 def test_emfplus_image_bitmap_kept():
     png = b"\x89PNG\r\n\x1a\n" + b"\0" * 20
     d = metafile.parse(emf([emfplus([plus_header(False), plus_image_bitmap(0, png), plus_draw_image(0, 0, 0, 96, 48)])]))

@@ -379,7 +379,7 @@ class _Wmf:
     def _sync_clip(self):
         if self.dc.clip != self._clip_out:
             self._clip_out = self.dc.clip
-            self.items.append(Clip(None if self._clip_out is None else _rect_segs(*self._clip_out)))
+            self._emit(Clip(None if self._clip_out is None else _rect_segs(*self._clip_out)))
 
     def _mapmode(self, p):
         self.dc.mapmode = struct.unpack_from("<H", p)[0]
@@ -461,8 +461,28 @@ class _Wmf:
         w = max(self._dist(pen.width, 0), self.dpi / 96.0)
         return Pen(pen.color, w if math.isfinite(w) else 1.0)
 
+    def _charge(self, segs=None):
+        """The one place METAFILE_POINTS is charged: every item as it goes out, kept or dropped, a path or clip by
+        its points (a close counts as one), anything else as one. Geometry drawn again, a path object filled many
+        times or a nested picture placed many times, is so paid for each time it is drawn."""
+        self.budget.points(1 if segs is None else sum((len(s) - 1) // 2 or 1 for s in segs))
+
+    def _emit(self, item):
+        """A Clip or Bitmap, charged; one with a non-finite coordinate is dropped and counted."""
+        if isinstance(item, Clip):
+            self._charge(item.segs)
+            vals = () if item.segs is None else [v for s in item.segs for v in s[1:]]
+        else:
+            self._charge()
+            vals = item.box
+        if _ok(*vals):
+            self.items.append(item)
+        else:
+            self.skipped += 1
+
     def _put(self, segs, pen, fill, even_odd=False):
         """Adds a Path; a path with no pen and no brush shows nothing, one with a non-finite coordinate is dropped."""
+        self._charge(segs)
         brush = Brush(self.dc.brush.color) if fill and self.dc.brush.color is not None else None
         pen = self._pen() if pen else None
         if pen is None and brush is None:
@@ -480,12 +500,10 @@ class _Wmf:
         y, x = struct.unpack_from("<hh", p)
         (ax, ay), (bx, by) = self._xy(*self.dc.cp), self._xy(x, y)
         self.dc.cp = (x, y)
-        self.budget.points(2)
         self._put([("M", ax, ay), ("L", bx, by)], True, False)
 
     def _rect(self, p):
         x0, y0, x1, y1 = self._box(p)
-        self.budget.points(4)
         self._put(_rect_segs(x0, y0, x1, y1), True, True)
 
     def _roundrect(self, p):
@@ -502,13 +520,11 @@ class _Wmf:
                 ("L", c, d - ry), ("C", c, d - ry + k * ry, c - rx + k * rx, d, c - rx, d),
                 ("L", a + rx, d), ("C", a + rx - k * rx, d, a, d - ry + k * ry, a, d - ry),
                 ("L", a, b2 + ry), ("C", a, b2 + ry - k * ry, a + rx - k * rx, b2, a + rx, b2), ("Z",)]
-        self.budget.points(12)
         self._put(segs, True, True)
 
     def _ellipse(self, p):
         x0, y0, x1, y1 = self._box(p)
         cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, abs(x1 - x0) / 2, abs(y1 - y0) / 2
-        self.budget.points(13)
         self._put([("M", cx + rx, cy)] + arc_beziers(cx, cy, rx, ry, 0, 360) + [("Z",)], True, True)
 
     def _arc(self, p, kind):
@@ -531,7 +547,6 @@ class _Wmf:
             segs += [("L", cx, cy), ("Z",)]
         elif kind == "chord":
             segs += [("Z",)]
-        self.budget.points(len(segs) * 3)
         out = []
         for sg in segs:
             pts = [self._xy(sg[i], sg[i + 1]) for i in range(1, len(sg), 2)]
@@ -542,7 +557,6 @@ class _Wmf:
         n = struct.unpack_from("<h", p)[0]
         if n < 0 or 2 + 4 * n > len(p):
             raise ValueError
-        self.budget.points(n)
         pts = [self._xy(*struct.unpack_from("<hh", p, 2 + 4 * i)) for i in range(n)]
         if len(pts) < 2:
             return
@@ -560,7 +574,6 @@ class _Wmf:
         total = sum(counts)
         if 2 + 2 * n + 4 * total > len(p):
             raise ValueError
-        self.budget.points(total)
         off, segs = 2 + 2 * n, []
         for c in counts:
             pts = [self._xy(*struct.unpack_from("<hh", p, off + 4 * i)) for i in range(c)]
@@ -643,6 +656,7 @@ class _Wmf:
         if dc.align & _TA_UPDATECP:
             adv = sum(map(abs, dx)) if dx is not None else (w / (self._dist(1, 0) or 1.0))
             dc.cp = (x + adv, y)
+        self._charge()
         self.items.append(run)
 
     # ---- bitmaps -------------------------------------------------------------------------------------------------
@@ -651,7 +665,7 @@ class _Wmf:
         x, y, w, h = dest
         (x0, y0), (x1, y1) = self._xy(x, y), self._xy(x + w, y + h)
         if _ok(x0, y0, x1, y1):
-            self.items.append(Bitmap(png, "png", (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))))
+            self._emit(Bitmap(png, "png", (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))))
 
     def _bitmap(self, p, rop, dib_at, dest):
         """`dest` is the (x, y, w, h) of the destination rectangle from the record; the DIB starts at `dib_at`."""
@@ -671,7 +685,6 @@ class _Wmf:
             if rop == _PATCOPY:
                 x, y, w, h = dest
                 (x0, y0), (x1, y1) = self._xy(x, y), self._xy(x + w, y + h)
-                self.budget.points(4)
                 self._put(_rect_segs(x0, y0, x1, y1), False, True)
             else:
                 self.skipped += 1
@@ -805,6 +818,7 @@ class _Emf(_Wmf):
         self.in_path = False
         self.path_open = False  # the path's last figure is open at the current position
         self.plus = None
+        self._ghost = False     # a skipped record is run for its current position alone: nothing goes out
         hsize = struct.unpack_from("<I", data, 4)[0]
         if hsize < 88 or hsize > len(data):
             raise ReadError("damaged", "emf header")
@@ -844,6 +858,8 @@ class _Emf(_Wmf):
             if typ == _E_EOF:
                 break
             if typ in _E_DRAW and not self._follow():  # the EMF+ records drew this
+                if typ in _E_MOVES:
+                    self._move_only(_EMF_HANDLERS[typ], d[pos + 8:pos + size])
                 pos += size
                 continue
             h = _EMF_HANDLERS.get(typ)
@@ -860,6 +876,19 @@ class _Emf(_Wmf):
         if not _ok(*frame):
             frame = (0.0, 0.0, 1.0, 1.0)
         return Drawing(frame, self.dpi, self.items, self.damaged, self.skipped)
+
+    def _move_only(self, h, p):
+        """A drawing record the EMF+ records drew still moves the current position, which a later GetDC section
+        draws from; it runs with nothing going out, and only the position is kept."""
+        skipped, damaged = self.skipped, self.damaged
+        self._ghost = True
+        try:
+            h(self, p)
+        except _ERRORS:
+            pass
+        finally:
+            self._ghost = False
+            self.skipped, self.damaged = skipped, damaged
 
     def _follow(self) -> bool:
         """EMF drawing records are followed: no EMF+ header was seen, or EmfPlusGetDC handed back to them."""
@@ -911,7 +940,10 @@ class _Emf(_Wmf):
     # ---- output, shared with emfplus.Plus ------------------------------------------------------------------------
 
     def _add_path(self, segs, pen, brush, even_odd):
-        if (pen is None and brush is None) or not segs:
+        if not segs:
+            return
+        self._charge(segs)
+        if pen is None and brush is None:
             return
         if not all(_ok(*s[1:]) for s in segs):
             self.skipped += 1
@@ -921,6 +953,9 @@ class _Emf(_Wmf):
         self.items.append(Path(segs, pen, brush, even_odd))
 
     def _add_run(self, run: Run):
+        if self._ghost:
+            return
+        self._charge()
         if not _ok(run.x, run.y, run.height, run.angle) or (run.width is not None and not _ok(run.width)):
             self.skipped += 1
             return
@@ -933,7 +968,7 @@ class _Emf(_Wmf):
             want = None
         if want != self._clip_out:
             self._clip_out = want
-            self.items.append(Clip(None if want is None else _rect_segs(*want)))
+            self._emit(Clip(None if want is None else _rect_segs(*want)))
 
     def _force_clip(self):
         self._clip_out = _UNSET  # a nested picture stated its own clips: state the current one again
@@ -960,6 +995,8 @@ class _Emf(_Wmf):
 
     def _put(self, segs, pen, fill, even_odd=False):
         """Segments in frame units: into an open path bracket, else drawn with the DC's pen and brush."""
+        if self._ghost:
+            return
         if self.in_path:
             self.path.extend(segs)
             self.path_open = False
@@ -971,6 +1008,8 @@ class _Emf(_Wmf):
         """Frame segments that continue from the current position, which then moves to `last` (logical)."""
         start = ("M",) + self._xy(*self.dc.cp)
         self.dc.cp = last
+        if self._ghost:
+            return
         if self.in_path:
             if not self.path_open:
                 self.path.append(start)
@@ -1147,7 +1186,6 @@ class _Emf(_Wmf):
     def _e_pts(self, p, off, n, wide) -> list:
         if n < 0 or off + (8 if wide else 4) * n > len(p):
             raise ValueError
-        self.budget.points(n)
         v = struct.unpack_from(("<%di" if wide else "<%dh") % (2 * n), p, off)
         return [(v[2 * i], v[2 * i + 1]) for i in range(n)]
 
@@ -1193,21 +1231,17 @@ class _Emf(_Wmf):
 
     def _e_lineto(self, p):
         x, y = struct.unpack_from("<ii", p)
-        self.budget.points(2)
         self._to([("L",) + self._xy(x, y)], (x, y))
 
     def _e_rect(self, p):
-        self.budget.points(4)
         self._put(self._map(_rect_segs(*struct.unpack_from("<4i", p))), True, True)
 
     def _e_ellipse(self, p):
         l, t, r, b = struct.unpack_from("<4i", p)
         cx, cy, rx, ry = (l + r) / 2, (t + b) / 2, abs(r - l) / 2, abs(b - t) / 2
-        self.budget.points(13)
         self._put(self._map([("M", cx + rx, cy)] + arc_beziers(cx, cy, rx, ry, 0, 360) + [("Z",)]), True, True)
 
     def _e_roundrect(self, p):
-        self.budget.points(12)
         self._put(self._map(_round_segs(*struct.unpack_from("<6i", p))), True, True)
 
     def _e_arc(self, p, kind):
@@ -1228,7 +1262,6 @@ class _Emf(_Wmf):
             return
         a = math.radians(a1)
         start = ("M", cx + rx * math.cos(a), cy + ry * math.sin(a))
-        self.budget.points(3 * len(arcs) + 3)
         if kind == "arcto":
             self._to(self._map([("L",) + start[1:]] + arcs), arcs[-1][5:7])
             return
@@ -1247,7 +1280,6 @@ class _Emf(_Wmf):
             self.skipped += 1
             return
         a = math.radians(-start)
-        self.budget.points(3 * len(arcs) + 1)
         self._to(self._map([("L", x + rad * math.cos(a), y + rad * math.sin(a))] + arcs), arcs[-1][5:7])
 
     def _rgn_rects(self, p, at, cb) -> list:
@@ -1257,7 +1289,6 @@ class _Emf(_Wmf):
         n, = struct.unpack_from("<I", p, at + 8)
         if at + 32 + 16 * n > len(p):
             raise ValueError
-        self.budget.points(4 * n)
         kx, ky = self.k
         segs = []
         for i in range(n):
@@ -1296,21 +1327,33 @@ class _Emf(_Wmf):
             self._emrtext(p, 32 + 40 * i, wide, True)
 
     def _emrtext(self, p, at, wide, fixed):
-        """An EmrText at `at`: its string and dx offsets count from the record's start, 8 bytes before `p`. The
-        rectangle is left out under ETO_NO_RECT, except in the fixed-size entries of POLYTEXTOUT."""
+        """An EmrText at `at`: its string and dx offsets count from the record's start, 8 bytes before `p`. Windows,
+        Wine and LibreOffice keep the 16-byte rectangle even under ETO_NO_RECT, though MS-EMF says it is left out:
+        offDx is looked for after the rectangle first, and at the spec's place only when that one does not fit."""
         x, y, n, off_s, opts = struct.unpack_from("<iiIII", p, at)
-        off_dx, = struct.unpack_from("<I", p, at + 20 + (0 if opts & _ETO_NO_RECT and not fixed else 16))
         glyph = bool(opts & _ETO_GLYPH_INDEX)
         nbytes = 2 * n if wide or glyph else n
         s0 = off_s - 8
         if s0 < 0 or s0 + nbytes > len(p):
             raise ValueError
         per = 2 if opts & _ETO_PDY else 1  # ETO_PDY: an x and a y advance for each character
-        d0 = off_dx - 8
-        dx = None
-        if n and off_dx and d0 >= 0 and d0 + 4 * n * per <= len(p):
-            dx = struct.unpack_from("<%di" % (n * per), p, d0)[::per]
+        d0 = self._dx_at(p, at + 36, at + 40, n * per, s0, nbytes)
+        if d0 is None and opts & _ETO_NO_RECT and not fixed:
+            d0 = self._dx_at(p, at + 20, at + 24, n * per, s0, nbytes)
+        dx = struct.unpack_from("<%di" % (n * per), p, d0)[::per] if d0 is not None else None
         self._etext(x, y, p[s0:s0 + nbytes], wide, glyph, dx)
+
+    @staticmethod
+    def _dx_at(p, field, floor, count, s0, nbytes):
+        """Where in `p` the `count` advances start, by the offDx at `field`, or None when it points before `floor`
+        (the end of the EmrText it belongs to), past the record, or into the string."""
+        if not count or field + 4 > len(p):
+            return None
+        d0 = struct.unpack_from("<I", p, field)[0] - 8
+        end = d0 + 4 * count
+        if d0 < floor or end > len(p) or (d0 < s0 + nbytes and s0 < end):
+            return None
+        return d0
 
     def _e_smalltext(self, p):
         """SMALLTEXTOUT: 8-bit characters with ETO_SMALL_CHARS, else UTF-16; bounds unless ETO_NO_RECT."""
@@ -1386,7 +1429,7 @@ class _Emf(_Wmf):
         if got is None or not _ok(*box):
             self.skipped += 1
             return
-        self.items.append(Bitmap(got[0], got[1], box))
+        self._emit(Bitmap(got[0], got[1], box))
 
     def _e_blt(self, p, any_rop=False):
         """BITBLT, STRETCHBLT, ALPHABLEND and TRANSPARENTBLT share the layout up to the source bitmap's offsets."""
@@ -1394,7 +1437,6 @@ class _Emf(_Wmf):
         off_bmi, cb_bmi, off_bits, cb_bits = struct.unpack_from("<4I", p, 76)
         if cb_bmi == 0:
             if rop == _PATCOPY and not any_rop:
-                self.budget.points(4)
                 self._put(self._map(_rect_segs(x, y, x + w, y + h)), False, True)
             else:
                 self.skipped += 1
@@ -1463,3 +1505,6 @@ _EMF_HANDLERS = {
     83: lambda s, p: s._e_exttext(p, False), 84: lambda s, p: s._e_exttext(p, True),
     96: lambda s, p: s._e_polytext(p, False), 97: lambda s, p: s._e_polytext(p, True), 108: _Emf._e_smalltext,
 }
+# drawing records that move the current position: LINETO, POLYLINETO, POLYBEZIERTO (and their 16-bit forms), ARCTO,
+# ANGLEARC, and the text records under TA_UPDATECP
+_E_MOVES = frozenset({5, 6, 41, 54, 55, 83, 84, 88, 89, 96, 97, 108})
