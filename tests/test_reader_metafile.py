@@ -12,6 +12,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from metafile_fix import (wmf, wmf_bitblt, wmf_bitmap16, wmf_stretchblt, wmf_brush, wmf_exttext, wmf_font, wmf_polygon, wmf_rec, wmf_rect,  # noqa: E402
                           wmf_select, wmf_text, wmf_window)
+from metafile_fix import (PLUS_VERSION, emf, emf_brush, emf_dib, emf_font, emf_glyphs, emf_modify_world, emf_pen,  # noqa: E402
+                          emf_poly, emf_polytextw, emf_rec, emf_rect, emf_smalltext, emf_texta, emf_textw, emf_world,
+                          emfplus, plus_draw_image, plus_driver, plus_fill_rect, plus_font, plus_getdc, plus_header,
+                          plus_image_bitmap, plus_image_metafile, plus_object, plus_rec, plus_solid, plus_string,
+                          plus_world)
 from reader import limits, metafile  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.vector import Bitmap, Clip, Path as VPath, Run, text_lines  # noqa: E402
@@ -324,6 +329,401 @@ def test_wmf_mutated_records_never_raise():
             continue
         _assert_finite(d)
     assert time.time() - t0 < 5
+
+
+# ---- EMF ---------------------------------------------------------------------------------------------------------------
+
+K = 2540 / 96  # frame units (0.01 mm) per EMF+ pixel at the header's 96 dpi
+BASELINE = emf_rec(22, struct.pack("<I", 24))  # SETTEXTALIGN TA_BASELINE
+
+
+def paths(d):
+    return [i for i in d.items if isinstance(i, VPath)]
+
+
+def close(a, b, tol=1e-6):
+    return abs(a - b) <= tol * max(1.0, abs(b))
+
+
+def test_emf_exttextoutw():
+    d = metafile.parse(emf([emf_font(-100), emf_textw(100, 200, "Hello", dx=[50] * 5)]))
+    (r,) = runs(d)
+    assert r.text == "Hello" and r.face == "Arial" and r.height == 100 and r.width == 250
+    assert r.x == 100 and r.y == 280  # top aligned: the baseline lies 0.8 em below the reference point
+    assert lines(d) == ["Hello"] and not d.damaged and d.skipped == 0
+    (r,) = runs(metafile.parse(emf([emf_font(-100), BASELINE, emf_textw(100, 200, "Hi")])))
+    assert (r.x, r.y) == (100, 200) and r.width is None
+    # ETO_PDY: an x and a y advance a character, the x ones summed
+    (r,) = runs(metafile.parse(emf([emf_textw(0, 0, "AB", options=0x2000, dx=[10, 5, 20, -5])])))
+    assert r.width == 30
+
+
+def test_emf_exttexta_charset():
+    raw = "한글".encode("cp949")
+    assert lines(metafile.parse(emf([emf_font(-100, charset=129), emf_texta(0, 100, raw)]))) == ["한글"]
+    assert lines(metafile.parse(emf([emf_font(-100, charset=128), emf_texta(0, 100, "日本".encode("cp932"))]))) == ["日本"]
+    assert lines(metafile.parse(emf([emf_font(-100, charset=0), emf_texta(0, 100, "café".encode("cp1252"))]))) == ["café"]
+    assert lines(metafile.parse(emf([emf_font(-100, charset=1), emf_texta(0, 100, raw)]), "cp949")) == ["한글"]
+    # wide text: Symbol maps its private-use codes, another symbol font is dropped and counted
+    assert lines(metafile.parse(emf([emf_font(-100, "Symbol", 2), emf_textw(0, 100, "b")]))) == ["αβ"]
+    d = metafile.parse(emf([emf_font(-100, "Wingdings", 2), emf_textw(0, 100, "")]))
+    assert lines(d) == [] and d.skipped == 1
+
+
+def test_emf_smalltextout():
+    d = metafile.parse(emf([emf_font(-100, charset=0), emf_smalltext(10, 100, "café".encode("cp1252")),
+                            emf_smalltext(10, 500, "Wide 한"), emf_smalltext(10, 900, "norect", options=0x100)]))
+    assert lines(d) == ["café", "Wide 한", "norect"] and not d.damaged
+    assert runs(d)[0].x == 10 and runs(d)[0].y == 180
+
+
+def test_emf_polytextoutw_as_several():
+    d = metafile.parse(emf([emf_font(-100), emf_polytextw([(10, 100, "One"), (10, 500, "Two")])]))
+    assert [(r.text, r.x) for r in runs(d)] == [("One", 10), ("Two", 10)]
+    assert lines(d) == ["One", "Two"] and not d.damaged
+
+
+def test_emf_frame_from_rclframe():
+    d = metafile.parse(emf([], frame=(0, 0, 2540, 2540)))
+    assert d.frame == (0, 0, 2540, 2540) and d.dpi == 2540 and d.size_px() == (96, 96)
+    assert metafile.parse(emf([], frame=(100, 200, 5180, 2740))).size_px() == (192, 96)
+
+
+def test_emf_world_transform_flip():
+    recs = [emf_world(1, 0, 0, -1, 0, 1000), emf_font(-100), emf_textw(0, 100, "bottom"), emf_textw(0, 900, "top")]
+    d = metafile.parse(emf(recs, frame=(0, 0, 1000, 1000)))
+    assert lines(d) == ["top", "bottom"]
+    assert all(r.angle == 0 and r.height == 100 for r in runs(d))
+    # a quarter turn: the baseline runs down the frame
+    (r,) = runs(metafile.parse(emf([emf_world(0, 1, -1, 0, 500, 0), emf_font(-100), BASELINE, emf_textw(0, 0, "r")])))
+    assert r.angle % 360 == 270 and close(r.height, 100) and (r.x, r.y) == (500, 0)
+
+
+def test_emf_modify_world_transform():
+    def x_of(recs):
+        return runs(metafile.parse(emf([BASELINE] + recs + [emf_textw(10, 0, "a")])))[0].x
+    t = emf_world(1, 0, 0, 1, 100, 0)
+    assert x_of([t, emf_modify_world(2, 0, 0, 2, 0, 0, 2)]) == 120  # left multiply: the scale first
+    assert x_of([t, emf_modify_world(2, 0, 0, 2, 0, 0, 3)]) == 220  # right multiply: the translation first
+    assert x_of([t, emf_modify_world(5, 0, 0, 5, 0, 0, 1)]) == 10   # identity
+    assert x_of([t, emf_modify_world(3, 0, 0, 3, 7, 0, 4)]) == 37   # set
+
+
+def test_emf_path_bracket_fill():
+    pt = lambda x, y: struct.pack("<ii", x, y)  # noqa: E731
+    bounds = struct.pack("<4i", 0, 0, 0, 0)
+    recs = [emf_brush(0xFF0000), emf_rec(59), emf_rec(27, pt(10, 10)), emf_rec(54, pt(110, 10)), emf_rec(54, pt(60, 90)),
+            emf_rec(61), emf_rec(60), emf_rec(62, bounds)]
+    (p,) = paths(metafile.parse(emf(recs)))
+    assert [s[0] for s in p.segs] == ["M", "L", "L", "Z"] and p.segs[0][1:] == (10, 10)
+    assert p.brush.color == 0xFF0000 and p.pen is None
+    # stroke and fill of a rectangle and a polygon in one bracket; nothing inside the bracket draws on its own
+    recs = [emf_rec(59), emf_rect(0, 0, 10, 10), emf_poly(3, [(0, 0), (5, 5), (9, 0)]), emf_rec(60), emf_rec(63, bounds)]
+    (p,) = paths(metafile.parse(emf(recs)))
+    assert p.pen is not None and p.brush is not None and [s[0] for s in p.segs].count("M") == 2
+    # an aborted path draws nothing; a stroked one has no brush
+    assert paths(metafile.parse(emf([emf_rec(59), emf_rect(0, 0, 9, 9), emf_rec(60), emf_rec(68), emf_rec(62, bounds)]))) == []
+    (p,) = paths(metafile.parse(emf([emf_rec(59), emf_rect(0, 0, 9, 9), emf_rec(60), emf_rec(64, bounds)])))
+    assert p.brush is None and p.pen is not None
+
+
+def test_emf_polybezier16():
+    d = metafile.parse(emf([emf_poly(85, [(0, 0), (10, 20), (30, 20), (40, 0)], wide=False),
+                            emf_poly(86, [(0, 0), (5, 5), (9, 0)], wide=False)]))
+    bez, poly = paths(d)
+    assert [s[0] for s in bez.segs] == ["M", "C"] and bez.segs[1][1:] == (10, 20, 30, 20, 40, 0) and bez.brush is None
+    assert [s[0] for s in poly.segs] == ["M", "L", "L", "Z"] and poly.brush is not None
+    # POLYBEZIERTO16 starts at the current position; the 32-bit POLYBEZIER reads the same way
+    d = metafile.parse(emf([emf_rec(27, struct.pack("<ii", 5, 5)), emf_poly(88, [(10, 20), (30, 20), (40, 0)], wide=False),
+                            emf_poly(2, [(0, 0), (1, 2), (3, 2), (4, 0)])]))
+    a, b = paths(d)
+    assert a.segs == [("M", 5, 5), ("C", 10, 20, 30, 20, 40, 0)] and b.segs[1][1:] == (1, 2, 3, 2, 4, 0)
+
+
+def test_emf_glyph_index_run():
+    d = metafile.parse(emf([emf_glyphs(10, 100, [36, 37, 38], "Calibri")]))
+    (r,) = runs(d)
+    assert r.text == "" and r.glyphs == (36, 37, 38) and r.face == "Calibri"
+    assert lines(d) == []
+
+
+def test_emf_nan_transform_identity():
+    nan, inf = float("nan"), float("inf")
+    recs = [emf_font(-100), BASELINE, emf_world(nan, 0, 0, 1, 0, 0), emf_textw(100, 200, "a"),
+            emf_world(0, 0, 0, 0, 5, 5), emf_textw(100, 600, "b"),
+            emf_world(1, 0, 0, 1, 0, 0), emf_modify_world(inf, 0, 0, 1, 0, 0, 2), emf_textw(100, 1000, "c")]
+    d = metafile.parse(emf(recs))
+    assert [(r.x, r.y) for r in runs(d)] == [(100, 200), (100, 600), (100, 1000)]
+    _assert_finite(d)
+    d = metafile.parse(emf([emfplus([plus_header(False), plus_world(nan, 0, 0, 1, 0, 0), plus_font(0, 12, "Arial"),
+                                     plus_driver(0, "x", x=96, y=96)])]))
+    (r,) = runs(d)
+    assert close(r.x, 96 * K) and close(r.y, 96 * K)
+
+
+def test_emf_bitmap_stretchdibits():
+    dib = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0) + b"\x00\x00\xff\x00"
+    d = metafile.parse(emf([emf_dib(40, 40, 10, 10, dib)]))
+    (b,) = [i for i in d.items if isinstance(i, Bitmap)]
+    assert b.kind == "png" and b.data[:4] == b"\x89PNG" and b.box == (40, 40, 50, 50)
+    d = metafile.parse(emf([emf_dib(40, 40, 10, 10, dib, rop=0x00420066)]))
+    assert d.skipped == 1 and not d.items
+
+
+def test_emf_truncated_record_keeps_partial():
+    data = emf([emf_font(-100), emf_textw(0, 100, "kept")])
+    d = metafile.parse(data[:-20] + struct.pack("<II", 84, 5000))  # the EOF record becomes one that passes the end
+    assert d.damaged and lines(d) == ["kept"]
+    # a header that does not fit is not an EMF
+    try:
+        metafile.parse(data[:44])
+    except ReadError as e:
+        assert e.kind == "damaged"
+    else:
+        raise AssertionError("no ReadError")
+
+
+def test_emf_stock_objects_and_pens():
+    recs = [emf_pen(0x0000FF, 40), emf_brush(0x00FF00), emf_rect(0, 0, 10, 10), emf_rec(37, struct.pack("<I", 0x80000005)),
+            emf_rec(37, struct.pack("<I", 0x80000008)), emf_rect(0, 0, 10, 10), emf_rec(37, struct.pack("<I", 0x80000004)),
+            emf_rect(0, 0, 10, 10), emf_rec(37, struct.pack("<I", 0x80001234)), emf_rec(37, struct.pack("<I", 77))]
+    d = metafile.parse(emf(recs))
+    a, b = paths(d)
+    assert a.pen.color == 0x0000FF and a.pen.width == 40 and a.brush.color == 0x00FF00
+    assert b.pen is None and b.brush.color == 0 and not d.damaged
+
+
+# ---- EMF+ ---------------------------------------------------------------------------------------------------------------
+
+def test_emfplus_drawstring():
+    d = metafile.parse(emf([emfplus([plus_header(dual=False), plus_font(0, 12, "Arial"), plus_string(0, 96, 96, "Hello")])]))
+    (r,) = runs(d)
+    assert r.text == "Hello" and r.face == "Arial" and r.angle == 0
+    assert close(r.height, 12 * K) and close(r.x, 96 * K) and close(r.y, (96 + 0.8 * 12) * K)
+    assert lines(d) == ["Hello"] and not d.damaged and d.skipped == 0
+    # a centred format in a layout box, two lines, under a world scale
+    fmt = plus_object(1, 7, struct.pack("<IIIII", PLUS_VERSION, 0, 0, 1, 0) + b"\0" * 40)
+    d = metafile.parse(emf([emfplus([plus_header(False), plus_font(0, 10, "Arial"), fmt, plus_world(2, 0, 0, 2, 0, 0),
+                                     plus_string(0, 0, 0, "One\r\nTwo", w=200, h=100, fmt=1)])]))
+    one, two = runs(d)
+    assert lines(d) == ["One", "Two"] and close(one.height, 20 * K) and two.y > one.y
+    assert close(one.x, (100 - 0.5 * 3 * 10 / 2) * 2 * K)  # the estimated width, centred in the box
+
+
+def test_emfplus_page_units():
+    def x_of(head, unit, scale=1.0):
+        page = plus_rec(0x4030, unit, struct.pack("<f", scale))
+        d = metafile.parse(emf([emfplus([head, plus_font(0, 12, "Arial"), page, plus_driver(0, "a", x=10, y=0)])]))
+        return runs(d)[0].x
+    assert close(x_of(plus_header(False), 2), 10 * K) and close(x_of(plus_header(False), 6, 2.0), 2000)  # pixels; 2 mm
+    assert close(x_of(plus_header(False, dpi=192), 2), 10 * 2540 / 192) and close(x_of(plus_header(False), 4), 25400)
+    # display units are pixels on a video reference device and hundredths of an inch on a printer
+    assert close(x_of(plus_header(False), 1), 10 * K) and close(x_of(plus_header(False, video=False), 1), 254)
+
+
+def test_emfplus_driverstring_cmap_and_glyphs():
+    d = metafile.parse(emf([emfplus([plus_header(False), plus_font(0, 12, "Arial"),
+                                     plus_driver(0, "Hi", x=10, y=50, advance=6),
+                                     plus_driver(0, [43, 44], cmap=False, x=10, y=200)])]))
+    a, b = runs(d)
+    assert a.text == "Hi" and close(a.x, 10 * K) and close(a.y, 50 * K) and close(a.width, 12 * K)
+    assert b.text == "" and b.glyphs == (43, 44) and b.face == "Arial"
+    assert lines(d) == ["Hi"]
+    # glyphs on two baselines in one record are two runs
+    d = metafile.parse(emf([emfplus([plus_header(False), plus_font(0, 12, "Arial"),
+                                     plus_driver(0, "ab", positions=[(0, 10), (0, 100)])])]))
+    assert [r.text for r in runs(d)] == ["a", "b"] and lines(d) == ["a", "b"]
+
+
+def test_dual_text_once():
+    recs = [emfplus([plus_header(), plus_font(0, 12, "Arial"), plus_string(0, 10, 10, "Sales")]),
+            emf_font(-317), emf_textw(1000, 1500, "Sales"), emf_rect(0, 0, 100, 100)]
+    d = metafile.parse(emf(recs))
+    assert lines(d) == ["Sales"] and len(runs(d)) == 1 and paths(d) == []
+
+
+def test_dual_getdc_text_kept():
+    head = [emfplus([plus_header(), plus_fill_rect(0, 0, 50, 50), plus_getdc()]), emf_font(-100), emf_textw(100, 100, "Q1")]
+    d = metafile.parse(emf(head))
+    assert lines(d) == ["Q1"] and len(paths(d)) == 1
+    # the next EMF+ drawing record ends the hand-back; a state record does not
+    d = metafile.parse(emf(head + [emfplus([plus_world(1, 0, 0, 1, 0, 0)]), emf_textw(100, 500, "Q2"),
+                                   emfplus([plus_fill_rect(0, 0, 5, 5)]), emf_textw(100, 900, "Q3")]))
+    assert lines(d) == ["Q1", "Q2"] and len(paths(d)) == 2
+
+
+def test_dual_clip_follows_the_records_followed():
+    def box(c):
+        return c.segs[0][1:] + c.segs[2][1:]
+    recs = [emfplus([plus_header(), plus_rec(0x4032, 0, struct.pack("<4f", 0, 0, 48, 48))]),
+            emf_rec(30, struct.pack("<4i", 0, 0, 100, 100)),  # an EMF clip while EMF+ is followed: kept, not stated
+            emfplus([plus_getdc()]), emf_rec(30, struct.pack("<4i", 0, 0, 50, 50)),
+            emfplus([plus_fill_rect(0, 0, 1, 1)])]
+    clips = [i for i in metafile.parse(emf(recs)).items if isinstance(i, Clip)]
+    assert [box(c) for c in clips] == [(0, 0, 48 * K, 48 * K), (0, 0, 100, 100), (0, 0, 50, 50), (0, 0, 48 * K, 48 * K)]
+
+
+def test_emfplus_only_file():
+    recs = [emfplus([plus_header(dual=False), plus_fill_rect(10, 10, 20, 20, 0xFF00FF00), plus_font(0, 12, "Arial"),
+                     plus_string(0, 10, 50, "Only")])]
+    d = metafile.parse(emf(recs))
+    assert lines(d) == ["Only"]
+    (p,) = paths(d)
+    assert p.brush.color == 0x00FF00 and p.pen is None and close(p.segs[0][1], 10 * K) and close(p.segs[2][2], 30 * K)
+    # an EMF-only file follows its EMF records; EMF+ records with no EMF+ header are ignored
+    assert lines(metafile.parse(emf([emf_font(-100), emf_textw(0, 100, "plain")]))) == ["plain"]
+    d = metafile.parse(emf([emfplus([plus_font(0, 12, "Arial"), plus_string(0, 10, 10, "ghost")]),
+                            emf_textw(0, 100, "gdi")]))
+    assert lines(d) == ["gdi"]
+
+
+def test_emfplus_container_depth_capped():
+    n = 200
+    begin = [plus_rec(0x4028, 0, struct.pack("<I", i)) for i in range(n)]
+    end = [plus_rec(0x4029, 0, struct.pack("<I", i)) for i in reversed(range(n))]
+    d = metafile.parse(emf([emfplus([plus_header(False), plus_font(0, 12, "Arial")] + begin
+                                    + [plus_string(0, 10, 10, "deep")] + end)]))
+    assert lines(d) == ["deep"] and d.skipped == n - limits.MAX_DEPTH
+    # a container maps its source rectangle onto its destination until it ends
+    box = plus_rec(0x4027, 0, struct.pack("<8fI", 100, 100, 200, 200, 0, 0, 100, 100, 7))
+    d = metafile.parse(emf([emfplus([plus_header(False), plus_font(0, 12, "Arial"), box, plus_driver(0, "a", x=10, y=10),
+                                     plus_rec(0x4029, 0, struct.pack("<I", 7)), plus_driver(0, "b", x=10, y=10)])]))
+    a, b = runs(d)
+    assert close(a.x, 120 * K) and close(a.height, 24 * K) and close(b.x, 10 * K)
+
+
+def _wrap(inner: bytes) -> bytes:
+    return emf([emfplus([plus_header(False), plus_image_metafile(0, inner), plus_draw_image(0, 0, 0, 96, 96)])])
+
+
+def test_emfplus_nested_metafile_capped():
+    inner = emf([emf_font(-100), BASELINE, emf_textw(100, 300, "deep")])
+    d = metafile.parse(_wrap(inner))
+    (r,) = runs(d)
+    assert lines(d) == ["deep"] and close(r.x, 100) and close(r.y, 300) and close(r.height, 100)
+    x = inner
+    for _ in range(limits.METAFILE_NESTING):
+        x = _wrap(x)
+    assert lines(metafile.parse(x)) == ["deep"]
+    d = metafile.parse(_wrap(_wrap(x)))  # past the cap: skipped, not recursed into
+    assert lines(d) == [] and d.skipped == 1
+    # a destination with no area cannot hold the picture: skipped and counted
+    flat = emf([emfplus([plus_header(False), plus_image_metafile(0, inner), plus_draw_image(0, 0, 0, 96, 0)])])
+    d = metafile.parse(flat)
+    assert lines(d) == [] and d.skipped == 1
+
+
+def test_emfplus_bad_object_id_ignored():
+    recs = [plus_header(False), plus_object(200, 6, b"\0" * 8), plus_font(0, 12, "Arial"),
+            plus_string(70, 0, 0, "bad font"), plus_string(5, 0, 0, "missing font"),
+            plus_rec(0x4015, 63, struct.pack("<I", 99)),  # DrawPath of a path that is not there, with no pen
+            plus_rec(0x400A, 0, struct.pack("<II4f", 40, 1, 0, 0, 5, 5)),  # FillRects with a brush that is not there
+            plus_rec(0x401A, 9, struct.pack("<Ii4f4f", 0, 2, 0, 0, 1, 1, 0, 0, 5, 5)),  # DrawImage of no image
+            plus_string(0, 10, 10, "ok")]
+    d = metafile.parse(emf([emfplus(recs)]))
+    assert lines(d) == ["ok"] and not d.damaged and paths(d) == []
+
+
+def test_emfplus_continued_object_joined():
+    face = "Arial".encode("utf-16-le")
+    font = struct.pack("<IfIiII", PLUS_VERSION, 12, 2, 0, 0, 5) + face
+    a, b = font[:10], font[10:]
+    d = metafile.parse(emf([emfplus([plus_header(False), plus_object(0, 6, a, cont=len(font)), plus_object(0, 6, b),
+                                     plus_string(0, 10, 10, "joined")])]))
+    assert lines(d) == ["joined"] and runs(d)[0].face == "Arial"
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES = 16
+    try:
+        d = metafile.parse(emf([emfplus([plus_header(False), plus_object(0, 6, a, cont=len(font)), plus_object(0, 6, b),
+                                         plus_string(0, 10, 10, "dropped")])]))
+        assert lines(d) == [] and d.skipped >= 1
+    finally:
+        limits.IMAGE_BYTES = old
+
+
+def test_emfplus_brushes_average_and_foreground():
+    linear = plus_object(1, 1, struct.pack("<IIIi4fIIII", PLUS_VERSION, 4, 0, 0, 0, 0, 10, 10,
+                                           0xFFFF0000, 0xFF0000FF, 0, 0))
+    hatch = plus_object(2, 1, struct.pack("<IIIII", PLUS_VERSION, 1, 3, 0xFF00FF00, 0xFFFFFFFF))
+    clear = plus_solid(3, 0x00FFFFFF)
+    fills = [plus_rec(0x400A, i, struct.pack("<II4f", i, 1, 0, 0, 5, 5)) for i in (1, 2, 3)]
+    d = metafile.parse(emf([emfplus([plus_header(False), linear, hatch, clear] + fills)]))
+    assert [p.brush.color for p in paths(d)] == [0x7F007F, 0x00FF00]  # a fully transparent brush fills nothing
+
+
+def test_emfplus_lines_curves_and_paths():
+    pen = plus_object(0, 2, struct.pack("<IIIIf", PLUS_VERSION, 0, 0, 2, 1.0) + struct.pack("<III", PLUS_VERSION, 0, 0xFF0000FF))
+    path = plus_object(1, 3, struct.pack("<IiI", PLUS_VERSION, 4, 0) + struct.pack("<8f", 0, 0, 10, 0, 10, 10, 0, 10)
+                       + bytes((0, 1, 1, 0x81)))
+    lines_ = plus_rec(0x400D, 0x2000, struct.pack("<I6f", 3, 0, 0, 10, 0, 10, 10))  # closed, pen 0
+    curve = plus_rec(0x4018, 0, struct.pack("<fIII6f", 0.5, 0, 2, 3, 0, 0, 10, 10, 20, 0))
+    fill_path = plus_rec(0x4014, 0x8001, struct.pack("<I", 0xFF00FF00))
+    d = metafile.parse(emf([emfplus([plus_header(False), pen, path, lines_, curve, fill_path])]))
+    ln, cv, fp = paths(d)
+    assert ln.pen.color == 0x0000FF and [s[0] for s in ln.segs] == ["M", "L", "L", "Z"] and ln.brush is None
+    assert [s[0] for s in cv.segs] == ["M", "C", "C"] and close(cv.segs[2][5], 20 * K)
+    # the first control point leaves the first point along the first chord, a sixth of the way at tension 0.5
+    assert close(cv.segs[1][1], 10 / 6 * K) and close(cv.segs[1][2], 10 / 6 * K)
+    assert fp.brush.color == 0x00FF00 and [s[0] for s in fp.segs] == ["M", "L", "L", "L", "Z"]
+
+
+def test_emfplus_image_bitmap_kept():
+    png = b"\x89PNG\r\n\x1a\n" + b"\0" * 20
+    d = metafile.parse(emf([emfplus([plus_header(False), plus_image_bitmap(0, png), plus_draw_image(0, 0, 0, 96, 48)])]))
+    (b,) = [i for i in d.items if isinstance(i, Bitmap)]
+    assert b.kind == "png" and b.data == png and close(b.box[2], 2540) and close(b.box[3], 1270)
+
+
+def test_emf_mutated_records_never_raise():
+    import random
+    import time
+    dib = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0) + b"\x00\x00\xff\x00"
+    bounds = struct.pack("<4i", 0, 0, 0, 0)
+    pen = plus_object(4, 2, struct.pack("<IIIIf", PLUS_VERSION, 0, 0, 2, 1.0) + struct.pack("<III", PLUS_VERSION, 0, 0xFF000000))
+    path = plus_object(1, 3, struct.pack("<IiI", PLUS_VERSION, 3, 0) + struct.pack("<6f", 0, 0, 5, 5, 9, 0) + bytes((0, 1, 0x81, 0)))
+    region = plus_object(2, 4, struct.pack("<III4f", PLUS_VERSION, 0, 0x10000000, 0, 0, 10, 10))
+    seeds = [
+        emf([emf_font(-100, charset=129), emf_texta(0, 100, "한".encode("cp949")), emf_textw(5, 5, "ab", dx=[1, 2]),
+             emf_smalltext(1, 1, b"s"), emf_polytextw([(1, 1, "p"), (2, 2, "q")]), emf_glyphs(1, 1, [3, 4], "Arial"),
+             emf_pen(0xFF, 3), emf_brush(0xFF00), emf_rect(0, 0, 5, 5), emf_poly(3, [(0, 0), (5, 5), (9, 0)]),
+             emf_poly(86, [(0, 0), (5, 5), (9, 0)], wide=False), emf_poly(85, [(0, 0), (1, 1), (2, 2), (3, 3)], wide=False),
+             emf_rec(42, struct.pack("<4i", 0, 0, 9, 9)), emf_rec(44, struct.pack("<6i", 0, 0, 9, 9, 2, 2)),
+             emf_rec(45, struct.pack("<8i", 0, 0, 9, 9, 9, 5, 0, 5)), emf_rec(47, struct.pack("<8i", 0, 0, 9, 9, 9, 5, 0, 5)),
+             emf_rec(8, struct.pack("<4iIII4i", 0, 0, 0, 0, 1, 2, 2, 0, 0, 5, 5)),
+             emf_world(1, 0, 0, -1, 0, 100), emf_modify_world(2, 0, 0, 2, 0, 0, 2), emf_rec(33), emf_rec(34, struct.pack("<i", -1)),
+             emf_rec(17, struct.pack("<I", 8)), emf_rec(9, struct.pack("<ii", 100, 100)), emf_rec(11, struct.pack("<ii", 50, 50)),
+             emf_rec(30, struct.pack("<4i", 0, 0, 50, 50)), emf_rec(59), emf_rec(27, struct.pack("<ii", 1, 1)),
+             emf_rec(54, struct.pack("<ii", 9, 9)), emf_rec(61), emf_rec(60), emf_rec(63, bounds), emf_dib(1, 1, 2, 2, dib),
+             emf_rec(75, struct.pack("<II8I4i", 48, 1, 32, 1, 1, 16, 0, 0, 5, 5, 0, 0, 5, 5)), emf_rec(40, struct.pack("<I", 2))]),
+        emf([emfplus([plus_header(), plus_font(0, 12, "Arial"), plus_string(0, 1, 1, "x\ny", w=50, h=50), pen, path, region,
+                      plus_driver(0, "ab"), plus_driver(0, [5, 6], cmap=False), plus_fill_rect(0, 0, 5, 5),
+                      plus_rec(0x400D, 4, struct.pack("<I4f", 2, 0, 0, 5, 5)), plus_rec(0x4015, 1, struct.pack("<I", 4)),
+                      plus_rec(0x4014, 0x8001, struct.pack("<I", 0xFF00FF00)), plus_rec(0x4018, 4, struct.pack("<fIII6f", 0.5, 0, 2, 3, 0, 0, 1, 1, 2, 0)),
+                      plus_rec(0x4016, 0x8000, struct.pack("<IfI6f", 0xFF000000, 0.5, 3, 0, 0, 1, 1, 2, 0)),
+                      plus_rec(0x4010, 0x8000, struct.pack("<Iff4f", 0xFF000000, 0, 90, 0, 0, 9, 9)),
+                      plus_rec(0x4012, 4, struct.pack("<ff4f", 0, 90, 0, 0, 9, 9)), plus_rec(0x400E, 0x8000, struct.pack("<I4f", 0xFF000000, 0, 0, 9, 9)),
+                      plus_rec(0x4019, 4, struct.pack("<I8f", 4, 0, 0, 1, 1, 2, 2, 3, 3)), plus_rec(0x4013, 0x8002, struct.pack("<I", 0xFF000000)),
+                      plus_rec(0x4032, 1 << 8, struct.pack("<4f", 0, 0, 50, 50)), plus_rec(0x4034, 2, b""), plus_rec(0x4033, 1, b""),
+                      plus_rec(0x4031), plus_world(2, 0, 0, 2, 0, 0), plus_rec(0x402F, 0, struct.pack("<f", 30)),
+                      plus_rec(0x402D, 0, struct.pack("<ff", 1, 1)), plus_rec(0x402E, 0x2000, struct.pack("<ff", 2, 2)),
+                      plus_rec(0x4030, 2, struct.pack("<f", 1.5)), plus_rec(0x4025, 0, struct.pack("<I", 1)),
+                      plus_rec(0x4027, 0, struct.pack("<8fI", 0, 0, 9, 9, 0, 0, 1, 1, 2)), plus_rec(0x4029, 0, struct.pack("<I", 2)),
+                      plus_rec(0x4026, 0, struct.pack("<I", 1)), plus_image_bitmap(3, b"\x89PNG\r\n\x1a\n" + b"\0" * 8),
+                      plus_draw_image(3, 0, 0, 5, 5), plus_getdc()]),
+             emf_font(-50), emf_textw(1, 1, "gdi"), _wrap(emf([emf_textw(1, 1, "in")]))[108:-20]]),
+        _wrap(emf([emf_font(-10), emf_textw(1, 1, "nested"), emf_rect(0, 0, 5, 5)]))]
+    rnd = random.Random(11)
+    t0 = time.time()
+    for n in range(1500):
+        b = bytearray(seeds[n % len(seeds)])
+        for _ in range(rnd.randint(1, 6)):
+            b[rnd.randrange(len(b))] = rnd.randrange(256)
+        try:
+            d = metafile.parse(bytes(b))
+        except ReadError:
+            continue
+        _assert_finite(d)
+    assert time.time() - t0 < 10
 
 
 def test_not_a_metafile():

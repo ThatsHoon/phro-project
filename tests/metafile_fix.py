@@ -98,3 +98,216 @@ def wmf_stretchblt(x, y, w, h, rop=0x00CC0020, bitmap: bytes | None = None) -> b
     words = [rop & 0xFFFF, rop >> 16, h, w, 0, 0, h, w, y, x]
     words.append(bitmap if bitmap is not None else 0)
     return wmf_rec(0x0B23, *words)
+
+
+# ---- EMF (MS-EMF) ----------------------------------------------------------------------------------------------------
+# The header's reference device makes one device pixel one frame unit (0.01 mm): szlDevice 1000 x 1000 pixels over
+# szlMillimeters 10 x 10 (and szlMicrometers 10000 x 10000), so MM_TEXT logical coordinates are frame units.
+
+ETO_GLYPH_INDEX, ETO_NO_RECT, ETO_SMALL_CHARS, ETO_PDY = 0x10, 0x100, 0x200, 0x2000
+
+
+def emf_rec(typ: int, body: bytes = b"") -> bytes:
+    """One EMF record: type, size (the 8-byte head included), the body padded to 4 bytes."""
+    body = body + b"\0" * (-len(body) % 4)
+    return struct.pack("<II", typ, 8 + len(body)) + body
+
+
+def emf(records: list[bytes], frame=(0, 0, 2540, 2540)) -> bytes:
+    """An EMF file: the 108-byte header (rclFrame `frame` in 0.01 mm), the records, then EMR_EOF."""
+    l, t, r, b = frame
+    recs = b"".join(records) + emf_rec(14, struct.pack("<III", 0, 16, 20))
+    head = struct.pack("<II4i4iIIIIHHIII2i2iIII2i", 1, 108, l, t, r, b, l, t, r, b, 0x464D4520, 0x10000,
+                       108 + len(recs), 0, 0, 0, 0, 0, 0, 1000, 1000, 10, 10, 0, 0, 0, 10000, 10000)
+    return head + recs
+
+
+def emf_select(index: int) -> bytes:
+    return emf_rec(37, struct.pack("<I", index))
+
+
+def emf_font(height, face="Arial", charset=0, escapement=0, weight=400, index=1) -> bytes:
+    """EMR_EXTCREATEFONTINDIRECTW (a 92-byte LogFont) plus EMR_SELECTOBJECT."""
+    lf = struct.pack("<5i8B", height, 0, escapement, 0, weight, 0, 0, 0, charset, 0, 0, 0, 0)
+    name = face.encode("utf-16-le")[:62].ljust(64, b"\0")
+    return emf_rec(82, struct.pack("<I", index) + lf + name) + emf_select(index)
+
+
+def emf_brush(rgb, style=0, index=2) -> bytes:
+    """EMR_CREATEBRUSHINDIRECT plus EMR_SELECTOBJECT."""
+    return emf_rec(39, struct.pack("<II", index, style) + _colorref(rgb) + struct.pack("<I", 0)) + emf_select(index)
+
+
+def emf_pen(rgb=0, width=1, style=0, index=3) -> bytes:
+    return emf_rec(38, struct.pack("<IIii", index, style, width, 0) + _colorref(rgb)) + emf_select(index)
+
+
+def _emr_text(typ, x, y, raw: bytes, n: int, options=0, dx=None) -> bytes:
+    """EMR_EXTTEXTOUTA/W: bounds, graphics mode and scales, then the EmrText and its string and dx at the end."""
+    head = struct.pack("<4iIff", 0, 0, 0, 0, 1, 0.0, 0.0)
+    rect = b"" if options & ETO_NO_RECT else struct.pack("<4i", 0, 0, 0, 0)
+    at = 8 + len(head) + 20 + len(rect) + 4
+    raw = raw + b"\0" * (-len(raw) % 4)
+    off_dx = at + len(raw) if dx is not None else 0
+    text = struct.pack("<iiIII", x, y, n, at, options) + rect + struct.pack("<I", off_dx)
+    tail = struct.pack("<%di" % len(dx), *dx) if dx is not None else b""
+    return emf_rec(typ, head + text + raw + tail)
+
+
+def emf_textw(x, y, s: str, options=0, dx=None) -> bytes:
+    raw = s.encode("utf-16-le")
+    return _emr_text(84, x, y, raw, len(raw) // 2, options, dx)
+
+
+def emf_texta(x, y, s: bytes, options=0, dx=None) -> bytes:
+    return _emr_text(83, x, y, s, len(s), options, dx)
+
+
+def emf_glyphs(x, y, glyphs, face) -> bytes:
+    """A font of `face`, then EMR_EXTTEXTOUTW with ETO_GLYPH_INDEX: the string is 16-bit glyph numbers."""
+    raw = struct.pack("<%dH" % len(glyphs), *glyphs)
+    return emf_font(-100, face) + _emr_text(84, x, y, raw, len(glyphs), ETO_GLYPH_INDEX)
+
+
+def emf_smalltext(x, y, s, options=0) -> bytes:
+    """EMR_SMALLTEXTOUT: bytes are written 8-bit with ETO_SMALL_CHARS, a str as UTF-16."""
+    if isinstance(s, bytes):
+        options |= ETO_SMALL_CHARS
+        raw, n = s, len(s)
+    else:
+        raw = s.encode("utf-16-le")
+        n = len(raw) // 2
+    bounds = b"" if options & ETO_NO_RECT else struct.pack("<4i", 0, 0, 0, 0)
+    return emf_rec(108, struct.pack("<iiIIIff", x, y, n, options, 1, 0.0, 0.0) + bounds + raw)
+
+
+def emf_polytextw(items) -> bytes:
+    """EMR_POLYTEXTOUTW: (x, y, str) items, each a 40-byte EmrText, their strings after the array."""
+    at = 8 + 16 + 12 + 4 + 40 * len(items)
+    texts, strings = b"", b""
+    for x, y, s in items:
+        raw = s.encode("utf-16-le")
+        raw += b"\0" * (-len(raw) % 4)
+        texts += struct.pack("<iiIII4iI", x, y, len(s), at + len(strings), 0, 0, 0, 0, 0, 0)
+        strings += raw
+    return emf_rec(97, struct.pack("<4iIffI", 0, 0, 0, 0, 1, 0.0, 0.0, len(items)) + texts + strings)
+
+
+def emf_world(m11, m12, m21, m22, dx, dy) -> bytes:
+    """EMR_SETWORLDTRANSFORM."""
+    return emf_rec(35, struct.pack("<6f", m11, m12, m21, m22, dx, dy))
+
+
+def emf_modify_world(m11, m12, m21, m22, dx, dy, mode) -> bytes:
+    """EMR_MODIFYWORLDTRANSFORM: mode 1 identity, 2 left multiply, 3 right multiply, 4 set."""
+    return emf_rec(36, struct.pack("<6fI", m11, m12, m21, m22, dx, dy, mode))
+
+
+def emf_poly(typ, points, wide=True) -> bytes:
+    """A poly record (POLYGON 3, POLYLINE 4, POLYBEZIER 2, ...; the 16-bit forms with wide=False): bounds, count,
+    points."""
+    fmt = "<%di" % (2 * len(points)) if wide else "<%dh" % (2 * len(points))
+    pts = struct.pack(fmt, *[v for p in points for v in p])
+    return emf_rec(typ, struct.pack("<4iI", 0, 0, 0, 0, len(points)) + pts)
+
+
+def emf_rect(l, t, r, b) -> bytes:
+    return emf_rec(43, struct.pack("<4i", l, t, r, b))
+
+
+def emf_dib(x, y, w, h, dib: bytes, rop=0x00CC0020) -> bytes:
+    """EMR_STRETCHDIBITS of a packed DIB whose header is the first 40 bytes."""
+    bmi, bits = dib[:40], dib[40:]
+    at = 8 + 72
+    body = struct.pack("<4i6i4IIIii", 0, 0, 0, 0, x, y, 0, 0, w, h, at, len(bmi), at + len(bmi), len(bits), 0, rop,
+                       w, h)
+    return emf_rec(81, body + bmi + bits)
+
+
+# ---- EMF+ (MS-EMFPLUS) -----------------------------------------------------------------------------------------------
+
+PLUS_VERSION = 0xDBC01002
+
+
+def plus_rec(typ: int, flags: int = 0, data: bytes = b"") -> bytes:
+    """One EMF+ record: type, flags, size (padding included), data size (the data alone), then the padded data."""
+    pad = b"\0" * (-len(data) % 4)
+    return struct.pack("<HHII", typ, flags, 12 + len(data) + len(pad), len(data)) + data + pad
+
+
+def emfplus(records: list[bytes]) -> bytes:
+    """EMF+ records inside one EMR_GDICOMMENT: DataSize, the "EMF+" identifier, the records."""
+    data = b"EMF+" + b"".join(records)
+    return emf_rec(70, struct.pack("<I", len(data)) + data)
+
+
+def plus_header(dual=True, dpi=96, video=True) -> bytes:
+    """EmfPlusHeader; `video` sets the flag that says the reference device is a display, not a printer."""
+    return plus_rec(0x4001, 1 if dual else 0, struct.pack("<IIII", PLUS_VERSION, 1 if video else 0, dpi, dpi))
+
+
+def plus_object(oid: int, otype: int, data: bytes, cont: int | None = None) -> bytes:
+    """EmfPlusObject; with `cont` the continue flag is set and `cont` is the TotalObjectSize."""
+    flags = oid | otype << 8
+    if cont is not None:
+        return plus_rec(0x4008, flags | 0x8000, struct.pack("<I", cont) + data)
+    return plus_rec(0x4008, flags, data)
+
+
+def plus_font(oid, size, face, unit=2, style=0) -> bytes:
+    """An EmfPlusFont object: em size in `unit` (2 pixels), style, the family name."""
+    name = face.encode("utf-16-le")
+    return plus_object(oid, 6, struct.pack("<IfIiII", PLUS_VERSION, size, unit, style, 0, len(face)) + name)
+
+
+def plus_solid(oid, argb) -> bytes:
+    return plus_object(oid, 1, struct.pack("<III", PLUS_VERSION, 0, argb))
+
+
+def plus_string(font_id, x, y, s: str, w=0.0, h=0.0, argb=0xFF000000, fmt=0xFFFFFFFF) -> bytes:
+    """EmfPlusDrawString with a solid color (the S flag) in the layout rectangle (x, y, w, h)."""
+    raw = s.encode("utf-16-le")
+    return plus_rec(0x401C, font_id | 0x8000, struct.pack("<III4f", argb, fmt, len(raw) // 2, x, y, w, h) + raw)
+
+
+def plus_driver(font_id, s_or_glyphs, cmap=True, x=0.0, y=0.0, advance=10.0, argb=0xFF000000, positions=None):
+    """EmfPlusDrawDriverString: a str is written as UTF-16 code units (with cmap), a list as glyph numbers; each
+    glyph sits `advance` after the one before on the baseline y, unless `positions` gives them."""
+    if isinstance(s_or_glyphs, str):
+        raw = s_or_glyphs.encode("utf-16-le")
+        glyphs = list(struct.unpack("<%dH" % (len(raw) // 2), raw))
+    else:
+        glyphs = list(s_or_glyphs)
+    n = len(glyphs)
+    pos = positions if positions is not None else [(x + i * advance, y) for i in range(n)]
+    data = struct.pack("<IIII", argb, 1 if cmap else 0, 0, n) + struct.pack("<%dH" % n, *glyphs)
+    data += struct.pack("<%df" % (2 * n), *[v for p in pos for v in p])
+    return plus_rec(0x4036, font_id | 0x8000, data)
+
+
+def plus_getdc() -> bytes:
+    return plus_rec(0x4004)
+
+
+def plus_fill_rect(x, y, w, h, argb=0xFF808080) -> bytes:
+    """EmfPlusFillRects of one rectangle in a solid color."""
+    return plus_rec(0x400A, 0x8000, struct.pack("<II4f", argb, 1, x, y, w, h))
+
+
+def plus_world(m11, m12, m21, m22, dx, dy) -> bytes:
+    return plus_rec(0x402A, 0, struct.pack("<6f", m11, m12, m21, m22, dx, dy))
+
+
+def plus_image_metafile(oid, data: bytes, mtype=3) -> bytes:
+    """An EmfPlusImage object holding a metafile (type 3 EMF)."""
+    return plus_object(oid, 5, struct.pack("<IiiI", PLUS_VERSION, 2, mtype, len(data)) + data)
+
+
+def plus_image_bitmap(oid, data: bytes) -> bytes:
+    """An EmfPlusImage object holding a compressed bitmap (PNG, JPEG, ...)."""
+    return plus_object(oid, 5, struct.pack("<IiiiiIi", PLUS_VERSION, 1, 1, 1, 0, 0, 1) + data)
+
+
+def plus_draw_image(oid, x, y, w, h) -> bytes:
+    """EmfPlusDrawImage of image `oid` into the rectangle (x, y, w, h)."""
+    return plus_rec(0x401A, oid, struct.pack("<Ii4f4f", 0xFFFFFFFF, 2, 0, 0, 1, 1, x, y, w, h))
