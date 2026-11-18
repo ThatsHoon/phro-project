@@ -748,6 +748,46 @@ def test_nested_runs_stop_at_the_deadline():
     assert [r.text for r in runs(d)] == ["deep"] * 10
 
 
+def _padded_nest(pad: int, levels: int) -> bytes:
+    """A picture with the text "deep" and `pad` bytes in a GDI comment that is not EMF+ (read past, never drawn),
+    nested `levels` deep in EMF+ image objects, the outermost with its own text "outer" before its EMF+ records."""
+    x = emf([emf_font(-100), BASELINE, emf_textw(100, 300, "deep"), emf_rec(70, struct.pack("<I", pad) + bytes(pad))])
+    for _ in range(levels - 1):
+        x = _wrap(x)
+    return emf([emf_font(-100), BASELINE, emf_textw(100, 2000, "outer"),
+                emfplus([plus_header(False), plus_image_metafile(0, x), plus_draw_image(0, 0, 0, 96, 96)])])
+
+
+def test_nested_pictures_share_their_bytes():
+    """A picture nested METAFILE_NESTING deep is parsed without a copy of its bytes at each level: the peak stays a
+    small multiple of the file (the copies once made it about fifty times)."""
+    import tracemalloc
+    x = _padded_nest(1 << 20, limits.METAFILE_NESTING)
+    tracemalloc.start()
+    try:
+        d = metafile.parse(x)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert set(lines(d)) == {"outer", "deep"} and not d.damaged, (lines(d), d.damaged)
+    assert peak < 2 * len(x), (peak, len(x))
+
+
+def test_nested_bytes_capped():
+    """The bytes of every nested parse count against one cap, max(2 x the picture, METAFILE_NESTED): past it the
+    nested picture is skipped and the drawing marked damaged, and the outer text stays."""
+    x = _padded_nest(1 << 16, limits.METAFILE_NESTING)
+    old = getattr(limits, "METAFILE_NESTED", None)
+    limits.METAFILE_NESTED = 0  # the cap is then twice the picture: about two of its sixteen levels
+    try:
+        d = metafile.parse(x)
+    finally:
+        limits.METAFILE_NESTED = old
+    assert d.damaged and lines(d) == ["outer"], (d.damaged, lines(d))
+    d = metafile.parse(x)  # under the real cap the whole nest is read
+    assert set(lines(d)) == {"outer", "deep"} and not d.damaged
+
+
 def test_dual_skipped_records_still_move_the_current_point():
     def last_path(skipped):
         recs = [emfplus([plus_header(), plus_fill_rect(0, 0, 5, 5)]), emf_rec(27, struct.pack("<ii", 10, 10))]

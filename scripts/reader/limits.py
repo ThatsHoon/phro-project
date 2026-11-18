@@ -56,6 +56,9 @@ METAFILE_RECORDS = 1_000_000  # records of one WMF, EMF, PICT or WPG
 METAFILE_POINTS = 4_000_000   # points across all paths of one picture
 METAFILE_OBJECTS = 65_535     # WMF and EMF object table slots
 METAFILE_NESTING = 16         # metafiles nested inside EMF+ image objects
+# bytes all the metafiles nested in one picture may hand to a parse together, or twice the picture's own size when
+# that is more: a picture nested many levels deep is parsed level by level, each level's bytes counted
+METAFILE_NESTED = 64 * 2**20
 TIFF_PAGES = 100           # pages of a lone TIFF
 FONT_FILES = 4_000         # font files indexed
 FONT_BYTES = 64 * 2**20    # bytes read from one font file

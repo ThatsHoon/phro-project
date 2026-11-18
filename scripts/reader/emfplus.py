@@ -310,10 +310,12 @@ def _pen(d):
 
 
 def _image(d):
+    """An image object from `d` (bytes or a memoryview). A bitmap is copied out as bytes; a metafile stays a view of
+    `d`, and the object is a list so that _place can drop the view once its drawing is built."""
     _ver, typ = struct.unpack_from("<Ii", d, 0)
     if typ == 1:  # bitmap: width, height, stride, pixel format, type (0 pixels, 1 compressed)
         w, h, stride, fmt, btype = struct.unpack_from("<iiiIi", d, 8)
-        raw = d[28:]
+        raw = bytes(d[28:])
         if btype == 1:
             kind = sniff(raw)
             if kind in ("png", "jpg"):
@@ -335,7 +337,7 @@ def _image(d):
         mtype, size = struct.unpack_from("<iI", d, 8)
         if not 1 <= mtype <= 5 or 16 + size > len(d):
             return None
-        return ("image", "meta", d[16:16 + size], [])  # the list caches the parsed drawing
+        return ["image", "meta", d[16:16 + size], []]  # the last list caches the parsed drawing
     return None
 
 
@@ -370,7 +372,9 @@ class Plus:
 
     # ---- the record loop -----------------------------------------------------------------------------------------
 
-    def feed(self, buf: bytes):
+    def feed(self, buf):
+        """`buf` is bytes or a memoryview into the EMF: an object record's data stays a view of it (an image object
+        may hold a whole nested picture), every other record is copied out, small as they are."""
         pos, n = 0, len(buf)
         while pos + 12 <= n:
             typ, flags, size, dsize = struct.unpack_from("<HHII", buf, pos)
@@ -379,6 +383,8 @@ class Plus:
                 return
             self.h.budget.tick()
             data = buf[pos + 12:pos + 12 + dsize]
+            if typ != OBJECT:
+                data = bytes(data)
             pos += size
             if typ == HEADER:
                 self._header(data)
@@ -566,14 +572,17 @@ class Plus:
             p[2] += d[4:]
             if len(p[2]) < p[1]:
                 return
-            d = bytes(self.pending.pop(oid)[2])
+            d = memoryview(self.pending.pop(oid)[2])  # the gathered object, read in place
         else:
             p = self.pending.pop(oid, None)
             if p is not None and p[0] == otype:
                 if len(p[2]) + len(d) > limits.IMAGE_BYTES:
                     self.h.skipped += 1
                     return
-                d = bytes(p[2]) + d
+                p[2] += d
+                d = memoryview(p[2])
+        if otype != 5:  # only an image object is read as a view; the others are small and parsed as bytes
+            d = bytes(d)
         self.objs.pop(oid, None)
         try:
             obj = self._parse_object(otype, d)
@@ -753,6 +762,7 @@ class Plus:
             return
         if not o[3]:
             o[3].append(self.h._nested(o[2]))
+            o[2] = None  # the drawing is kept; the bytes are not needed again
         nd = o[3][0]
         if nd is None:
             return

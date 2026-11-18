@@ -176,13 +176,15 @@ CLIP_LEAST = 4
 def parse(data: bytes, codepage: str = "", deadline: float | None = None) -> Drawing:
     """The drawing of a WMF or EMF. ReadError("damaged", "not a metafile") when the bytes are neither. Past
     `deadline` (a time.monotonic() value) the figure stops with ReadError("too_large", "figure time")."""
-    return _parse(data, codepage, 0, Budget(deadline=deadline))
+    return _parse(data, codepage, 0, Budget(deadline=deadline, size=len(data)))
 
 
-def _parse(data: bytes, codepage: str, depth: int, budget) -> Drawing:
-    """`depth` counts the EMF+ image objects this metafile is nested in; `budget` is shared with the outer ones."""
+def _parse(data, codepage: str, depth: int, budget) -> Drawing:
+    """`depth` counts the EMF+ image objects this metafile is nested in; `budget` is shared with the outer ones.
+    A nested picture's `data` is a memoryview into the bytes it came in: an EMF reads it in place, record by record,
+    and a WMF (which nests nothing) is copied once."""
     if data[:4] == b"\xd7\xcd\xc6\x9a" or _is_plain_wmf(data):
-        return _Wmf(data, codepage, budget).run()
+        return _Wmf(bytes(data), codepage, budget).run()
     if _is_emf(data):
         return _Emf(data, codepage, depth, budget).run()
     raise ReadError("damaged", "not a metafile")
@@ -857,6 +859,7 @@ class _Emf(_Wmf):
 
     def run(self) -> Drawing:
         d, n = self.data, len(self.data)
+        mv = memoryview(d)  # records are sliced from it: a GDI comment (EMF+, nested pictures) is never copied
         pos = self.pos
         while pos < n:
             if n - pos < 8:
@@ -871,13 +874,14 @@ class _Emf(_Wmf):
                 break
             if typ in _E_DRAW and not self._follow():  # the EMF+ records drew this
                 if typ in _E_MOVES:
-                    self._move_only(_EMF_HANDLERS[typ], d[pos + 8:pos + size])
+                    self._move_only(_EMF_HANDLERS[typ], bytes(mv[pos + 8:pos + size]))
                 pos += size
                 continue
             h = _EMF_HANDLERS.get(typ)
             try:
                 if h is not None:
-                    h(self, d[pos + 8:pos + size])
+                    rec = mv[pos + 8:pos + size]
+                    h(self, rec if typ == _E_COMMENT else bytes(rec))
                 elif typ not in _E_QUIET:
                     self.skipped += 1
             except _ERRORS:
@@ -989,13 +993,19 @@ class _Emf(_Wmf):
     def _wide(self, raw: bytes, face: str):
         return decode_wide(raw, 1, face)
 
-    def _nested(self, data: bytes):
-        """The drawing of a metafile inside an EMF+ image object, or None; past METAFILE_NESTING it is skipped."""
+    def _nested(self, data):
+        """The drawing of a metafile inside an EMF+ image object, or None; past METAFILE_NESTING it is skipped, and
+        past the nested byte cap (Budget.nest) it is skipped and the drawing marked damaged. `data` is a memoryview
+        into the outer picture's bytes (or into a continued object's), parsed in place."""
         if self.depth >= limits.METAFILE_NESTING:
             self.skipped += 1
             return None
+        if not self.budget.nest(len(data)):
+            self.skipped += 1
+            self.damaged = True
+            return None
         try:
-            d = _parse(bytes(data), self.codepage, self.depth + 1, self.budget)
+            d = _parse(data, self.codepage, self.depth + 1, self.budget)
         except ReadError as e:
             if e.kind == "too_large":
                 raise

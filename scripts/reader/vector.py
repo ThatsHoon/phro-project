@@ -98,12 +98,14 @@ CLOCK_EVERY = 4096  # Budget calls between two reads of the clock
 class Budget:
     """Counts records and points against the caps, read at call time unless given."""
 
-    def __init__(self, records=None, points=None, deadline: float | None = None):
+    def __init__(self, records=None, points=None, deadline: float | None = None, size: int = 0):
         self._records = records
         self._points = points
         self.deadline = deadline  # a time.monotonic() value, or None for no time limit
+        self.size = size  # the bytes of the picture itself, which sets the nested cap with METAFILE_NESTED
         self.n = 0
         self.p = 0
+        self.nested = 0  # bytes handed to nested parses so far
         self._calls = 0
 
     def _clock(self):
@@ -125,6 +127,11 @@ class Budget:
         cap = limits.METAFILE_POINTS if self._points is None else self._points
         if self.p > cap:
             raise ReadError("too_large", "figure")
+
+    def nest(self, n: int) -> bool:
+        """Counts `n` bytes of a nested picture; False once all nested bytes pass max(2 x size, METAFILE_NESTED)."""
+        self.nested += n
+        return self.nested <= max(2 * self.size, limits.METAFILE_NESTED)
 
 
 def run_width(r: Run, text: str) -> float:
