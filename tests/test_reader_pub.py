@@ -20,6 +20,9 @@ from reader import diagram, images, limits, markdown, officeart  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import cfb_route, pub, pub_2k, pub_contents, pub_quill, vsdx, zip_route  # noqa: E402
 from reader.formats.pub_contents import Block, ChunkRef  # noqa: E402
+from reader import raster  # noqa: E402
+
+raster.backend = lambda: "none"  # these tests keep metafiles as files; drawing them is test_reader_raster's
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Bold, Break, Code, Context, Image, Link, Para, Section, Table, Text  # noqa: E402
 from diagram_fix import mermaid_ok  # noqa: E402

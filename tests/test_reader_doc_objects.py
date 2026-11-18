@@ -142,7 +142,7 @@ def test_equation_bad_bytes():
     p = embed_doc({1: {"Equation Native": eq_native(b"garbage, not MTEF")}}, preview=PNG_PREVIEW)
     assert md(p) == "(could not read: 1 embedded object)\n\n![](assets/img-001.png)\n", md(p)
     d, ctx = parse(p)
-    assert d.blocks == [Image(PNG)] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+    assert d.blocks == [Image(PNG, codepage="cp1252")] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
     # cbHdr past the stream, a stream too short for one, an empty one, MTEF v2 and v4, a header with no record
     for native in (eq_native(FRAC)[:20] + b"\xff\xff", b"\x1c", b"", eq_native(b"\x02\x01\x01\x01\x00\x00"),
                    eq_native(b"\x04" + FRAC[1:]), eq_native(mtef_v5(b""))):
@@ -213,7 +213,7 @@ def test_object_in_hidden_text():
                               ({1: {"Equation Native": b"bad"}}, PNG_PREVIEW),
                               ({1: {"\x01Ole10Native": bytes(8)}}, EMF_PREVIEW), ({2: {"x": b"x"}}, None)):
             d, ctx = parse(embed_doc(objs, text="a" + EMBED + "\r", preview=preview, props=props))
-            pic = [Image(EMF if preview is EMF_PREVIEW else PNG, hidden=kind)] if preview else []
+            pic = [Image(EMF if preview is EMF_PREVIEW else PNG, hidden=kind, codepage="cp1252")] if preview else []
             assert d.blocks == [Para([Text("a")])] + pic and not ctx.skipped, (objs, d.blocks, ctx.skipped)
     p = embed_doc(eq, text="a" + EMBED + "\r", props=sp(VANISH))
     assert md(p) == "(1 hidden places left out)\n\na\n", md(p)
@@ -234,7 +234,7 @@ def test_missing_storage_counted():
 def test_other_object_png_preview_kept():
     p = embed_doc({1: {"\x01Ole10Native": bytes(8), "\x01CompObj": comp_obj(b"Package")}}, preview=PNG_PREVIEW)
     d, ctx = parse(p)
-    assert d.blocks == [Image(PNG)] and not ctx.skipped, (d.blocks, ctx.skipped)
+    assert d.blocks == [Image(PNG, codepage="cp1252")] and not ctx.skipped, (d.blocks, ctx.skipped)
     assert md(p) == "![](assets/img-001.png)\n", md(p)
     # a DIB preview is viewable when it converts to PNG, as Assets converts it; one without its pixels is not
     dib = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0)
@@ -265,7 +265,7 @@ def test_equation_preview_not_decoded():
         d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(FRAC)}}, preview=PNG_PREVIEW))
         assert d.blocks == [Equation(r"\frac{a}{b}")] and calls == [], (d.blocks, calls)
         d, ctx = parse(embed_doc({1: {"Equation Native": b"bad"}}, preview=PNG_PREVIEW))
-        assert d.blocks == [Image(PNG)] and calls == [AT], (d.blocks, calls)
+        assert d.blocks == [Image(PNG, codepage="cp1252")] and calls == [AT], (d.blocks, calls)
     finally:
         doc_pictures.Pictures.inline = real
 
@@ -278,7 +278,7 @@ def test_real_embed_shapes():
     assert d.blocks == [Equation(r"\frac{a}{b}")] and not ctx.skipped, d.blocks
     other = {5: {"\x01Ole10Native": bytes(8)}}
     d, ctx = parse(embed_doc(other, oid=5, preview=PNG_PREVIEW))
-    assert d.blocks == [Image(PNG)] and not ctx.skipped, (d.blocks, ctx.skipped)  # one preview, not two
+    assert d.blocks == [Image(PNG, codepage="cp1252")] and not ctx.skipped, (d.blocks, ctx.skipped)  # one preview, not two
     # older files: the \x01 shares the separator's run, fOle2 and PicLocation the id: there is no PICF to show
     merged = sp(SPEC) + sp(OLE) + sp(PIC, 5)
     d, ctx = parse(embed_doc(eq, oid=5, one=merged))
@@ -303,7 +303,7 @@ def test_real_embed_shapes():
     assert d.blocks == [Equation(r"\frac{a}{b}")] and not ctx.skipped, d.blocks
     # a separator without fOle2 (a picture field's result) leaves its \x01 a plain picture
     d, ctx = parse(embed_doc(eq, text="\x13 INCLUDEPICTURE x \x14\x01\x15\r", sep=sp(SPEC), preview=PNG_PREVIEW))
-    assert d.blocks == [Image(PNG)] and not ctx.skipped, d.blocks
+    assert d.blocks == [Image(PNG, codepage="cp1252")] and not ctx.skipped, d.blocks
 
 
 def test_object_field_cut_by_paragraph_placed():
@@ -396,15 +396,15 @@ def test_partial_equation_kept_and_counted():
     assert tex_of(mtef_v5(l5(c5("a=") + t5(11, l5(c5("1")))[:-1]))) == (r"a=\frac{1}{}", {"stop"})  # cut short
     p = embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}, preview=PNG_PREVIEW)
     d, ctx = parse(p)
-    assert d.blocks == [Equation("a"), Image(PNG)] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+    assert d.blocks == [Equation("a"), Image(PNG, codepage="cp1252")] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
     assert md(p) == "(could not read: 1 embedded object)\n\n$$a$$\n\n![](assets/img-001.png)\n", md(p)
     # beside text: inline Math, the preview after the paragraph; hidden, both hidden and nothing counted
     d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}, text="z" + EMBED + "\r",
                              preview=PNG_PREVIEW))
-    assert d.blocks == [Para([Text("z"), Math("a")]), Image(PNG)] and ctx.skipped == {"object": 1}, d.blocks
+    assert d.blocks == [Para([Text("z"), Math("a")]), Image(PNG, codepage="cp1252")] and ctx.skipped == {"object": 1}, d.blocks
     d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}, text="z" + EMBED + "\r",
                              preview=PNG_PREVIEW, props=sp(VANISH)))
-    assert d.blocks == [Para([Text("z"), Hidden([Math("a")], "hidden")]), Image(PNG, hidden="hidden")], d.blocks
+    assert d.blocks == [Para([Text("z"), Hidden([Math("a")], "hidden")]), Image(PNG, hidden="hidden", codepage="cp1252")], d.blocks
     assert not ctx.skipped, ctx.skipped
     # no preview: the partial equation alone, still counted once
     d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}))
@@ -424,7 +424,7 @@ def test_template_first_equation_preview_only():
     except ValueError:
         pass
     d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(sum_first)}}, preview=PNG_PREVIEW))
-    assert d.blocks == [Image(PNG)] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+    assert d.blocks == [Image(PNG, codepage="cp1252")] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
 
 
 def test_v3_fence_sides():
@@ -444,7 +444,7 @@ def test_v3_fence_sides():
     p = embed_doc({1: {"Equation Native": eq_native(mtef_v3(l3(c3("a") + t3(1, x, c3("("), var=7))))}},
                   preview=PNG_PREVIEW)
     d, ctx = parse(p)
-    assert d.blocks == [Equation("a"), Image(PNG)] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+    assert d.blocks == [Equation("a"), Image(PNG, codepage="cp1252")] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
 
 
 def test_symbol_loss_counted():
@@ -461,7 +461,7 @@ def test_symbol_loss_counted():
         assert tex_of(mtef_v3(c3("a" + sp_ + "b", 0x81))) == (r"\text{a b}", set()), sp_
     p = embed_doc({1: {"Equation Native": eq_native(mtef_v3(c3("ab")))}}, preview=PNG_PREVIEW)
     d, ctx = parse(p)
-    assert d.blocks == [Equation("ab"), Image(PNG)] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+    assert d.blocks == [Equation("ab"), Image(PNG, codepage="cp1252")] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
     d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v3(c3("a b")))}}, preview=PNG_PREVIEW))
     assert d.blocks == [Equation(r"a{\ }b")] and not ctx.skipped, (d.blocks, ctx.skipped)
 

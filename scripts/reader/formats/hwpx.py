@@ -444,7 +444,7 @@ class _Reader(Scopes):
             return
         sc = first(pic, "shapeComment")
         alt = re.sub(r"\s+", " ", sc.text or "").strip() if sc is not None else ""
-        st.extras.append(Image(data, "" if AUTO_ALT.match(alt) else alt))
+        st.extras.append(Image(data, "" if AUTO_ALT.match(alt) else alt, codepage="cp949"))
 
     def chart(self, el, st):
         """A part two charts name is read once, but every placement is charged against CHART_TOTAL, as in the Word

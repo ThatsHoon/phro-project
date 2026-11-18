@@ -85,6 +85,7 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
     warnings = list(ctx.warnings) + [w for w in doc.warnings if w not in ctx.warnings]
     if "garbled" not in warnings and text.garble_ratio(md) > text.GARBLED:  # a parser may have found it (pub 97)
         warnings.append("garbled")
+    warnings += [w for w in info["warnings"] if w not in warnings]  # the figure warnings, each once
     meta = {
         "source": str(src),
         "size": src.stat().st_size,
@@ -96,6 +97,8 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
         "headings": st["headings"],
         "unread": info["unread"],
         "warnings": warnings,
+        "figures": info["figures"],  # metafile, PICT, WPG and TIFF pictures written as PNG
+        "figures_left": info["figures_left"],  # those kept as the original file
     }
     if doc.meta and "engine" in doc.meta:
         meta.update(engine=doc.meta["engine"], pages_total=doc.meta.get("pages_total"),

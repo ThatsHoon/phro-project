@@ -12,7 +12,8 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import images, markdown  # noqa: E402
+from metafile_fix import emf, emf_rect, emf_textw, wmf, wmf_text  # noqa: E402
+from reader import images, markdown, raster  # noqa: E402
 from reader.model import Cell, Doc, Image, Para, Table, Text  # noqa: E402
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
@@ -218,6 +219,62 @@ def test_sniff_phase3_kinds():
     assert not {"wpg", "heic", "pdf"} & images.VIEWABLE
     with tempfile.TemporaryDirectory() as d:
         assert images.Assets(Path(d) / "assets").add(wpg) == ("assets/img-001.wpg", False)
+
+
+class fake_convert:
+    """raster.convert replaced by `fn(kind, data, **kw) -> Figure`; the calls are kept."""
+
+    def __init__(self, fn):
+        self.fn, self.calls = fn, []
+
+    def __enter__(self):
+        self.old = raster.convert
+
+        def call(kind, data, **kw):
+            self.calls.append((kind, kw))
+            return self.fn(kind, data, **kw)
+        raster.convert = call
+        return self
+
+    def __exit__(self, *exc):
+        raster.convert = self.old
+
+
+def test_emf_becomes_png_with_text():
+    if sys.platform != "win32" or raster.backend() != "gdiplus":
+        print("skip: test_emf_becomes_png_with_text (needs Windows GDI+)")
+        return
+    data = emf([emf_rect(100, 100, 900, 900), emf_textw(200, 400, "Hello")])
+    with tempfile.TemporaryDirectory() as d:
+        a = images.Assets(Path(d) / "assets")
+        path, ok = a.add(data)
+        assert (path, ok) == ("assets/img-001.png", True), (path, ok)
+        assert (Path(d) / "assets" / "img-001.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        assert [p.name for p in (Path(d) / "assets").iterdir()] == ["img-001.png"]
+        assert a.lines[path] == ["Hello"] and a.figures == 1 and a.figures_left == 0
+
+
+def test_same_bytes_convert_once():
+    data = wmf([wmf_text(100, 200, b"Hi")])
+    with fake_convert(lambda k, b, **kw: raster.Figure(PNG, ["Hi"], {"figure damaged"})) as fc:
+        with tempfile.TemporaryDirectory() as d:
+            a = images.Assets(Path(d) / "assets")
+            assert a.add(data, "x") == ("assets/img-001.png", True)
+            assert a.add(data) == ("assets/img-001.png", True)
+            assert len(fc.calls) == 1 and a.figures == 1 and a.lines["assets/img-001.png"] == ["Hi"]
+            assert a.warnings == {"figure damaged"}
+
+
+def test_assets_figure_unconverted_and_codepage():
+    data = wmf([wmf_text(100, 200, b"Hi")])
+    with fake_convert(lambda k, b, **kw: raster.Figure(None, ["Hi"], set())) as fc:
+        with tempfile.TemporaryDirectory() as d:
+            a = images.Assets(Path(d) / "assets")
+            assert a.add(data, codepage="cp949") == ("assets/img-001.wmf", False)
+            assert fc.calls == [("wmf", {"codepage": "cp949"})], fc.calls
+            assert a.lines["assets/img-001.wmf"] == ["Hi"] and a.figures == 0 and a.figures_left == 1
+            assert (Path(d) / "assets" / "img-001.wmf").read_bytes() == data
+
 
 
 def main():

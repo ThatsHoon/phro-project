@@ -808,7 +808,7 @@ class _Reader(Scopes):
             if self.image_bytes > limits.IMAGE_BYTES:
                 self.ctx.skipped["image"] += 1
             else:
-                st.extras.append(Image(img, "" if AUTO_ALT.match(alt) else alt))
+                st.extras.append(Image(img, "" if AUTO_ALT.match(alt) else alt, codepage="cp949"))
         return self.end(recs, j)
 
     def ole(self, recs, j, st, d, g, alt):

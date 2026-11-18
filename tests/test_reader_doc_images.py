@@ -18,6 +18,9 @@ from reader import limits, markdown, officeart  # noqa: E402
 from reader.containers import flate  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import doc  # noqa: E402
+from reader import raster  # noqa: E402
+
+raster.backend = lambda: "none"  # these tests keep metafiles as files; drawing them is test_reader_raster's
 from reader.model import Cell, Context, Image, Para, Table, Text  # noqa: E402
 from reader_fix import (DOC_EXTRA, blip_bitmap, blip_metafile, blip_png, dgg_with_bstore, doc_spa,  # noqa: E402
                         doc_stories, make_doc, oa_container, oa_fbse, oa_group, oa_record, oa_shape, picf_inline)
@@ -143,11 +146,11 @@ def test_picture_in_hidden_text():
     assert md(p) == "(1 hidden places left out)\n\na\n", md(p)
     assert md(p, hidden=True) == "a\n\n(hidden) ![](assets/img-001.png)\n", md(p, hidden=True)
     d, ctx = parse(p)
-    assert d.blocks == [Para([Text("a")]), Image(PNG, hidden="hidden")] and not ctx.skipped, (d.blocks, ctx.skipped)
+    assert d.blocks == [Para([Text("a")]), Image(PNG, hidden="hidden", codepage="cp1252")] and not ctx.skipped, (d.blocks, ctx.skipped)
     d, ctx = parse(inline_doc(picf_inline(blip_png(PNG)), "a\x01\r", props=sp(DELETED)))
-    assert d.blocks == [Para([Text("a")]), Image(PNG, hidden="deleted")] and not ctx.skipped, (d.blocks, ctx.skipped)
+    assert d.blocks == [Para([Text("a")]), Image(PNG, hidden="deleted", codepage="cp1252")] and not ctx.skipped, (d.blocks, ctx.skipped)
     d, ctx = parse(float_doc("a\x08\r", dgg_with_bstore([blip_png(PNG)]), props=sp(VANISH)))
-    assert d.blocks == [Para([Text("a")]), Image(PNG, hidden="hidden")] and not ctx.skipped, (d.blocks, ctx.skipped)
+    assert d.blocks == [Para([Text("a")]), Image(PNG, hidden="hidden", codepage="cp1252")] and not ctx.skipped, (d.blocks, ctx.skipped)
 
 
 # ---- where pictures go: after their paragraph, in its cell or note
@@ -155,7 +158,7 @@ def test_picture_in_table_cell():
     cell, row = u16(0) + sp(IN_TABLE), u16(0) + sp(IN_TABLE) + sp(TTP)
     p = inline_doc(picf_inline(blip_png(PNG)), "x\x01\x07z\x07\x07y\r", papx=[(0, 5, cell), (5, 6, row)])
     d, ctx = parse(p)
-    want = [Table([[Cell([Para([Text("x")]), Image(PNG)]), Cell([Para([Text("z")])])]]), Para([Text("y")])]
+    want = [Table([[Cell([Para([Text("x")]), Image(PNG, codepage="cp1252")]), Cell([Para([Text("z")])])]]), Para([Text("y")])]
     assert d.blocks == want and not ctx.skipped, d.blocks
     assert md(p).split("\n")[0] == "|x<br>![](assets/img-001.png)|z|", md(p)
 
@@ -166,7 +169,7 @@ def test_picture_in_note():
     p = inline_doc(picf_inline(blip_png(PNG)), s["pieces"][0][0], ccp=s["ccp"], fc=s["fc"],
                    chpx=[(pic, pic + 1, sp(SPEC) + sp(PIC, AT))])
     d, ctx = parse(p)
-    assert d.notes == {"fn-1": [Para([Text(" ")]), Image(PNG)]} and not ctx.skipped, (d.notes, ctx.skipped)
+    assert d.notes == {"fn-1": [Para([Text(" ")]), Image(PNG, codepage="cp1252")]} and not ctx.skipped, (d.notes, ctx.skipped)
     assert md(p) == "a[^1]\n\n[^1]: ![](assets/img-001.png)\n", md(p)
 
 
@@ -211,10 +214,10 @@ def test_group_members_in_record_order():
     group = oa_group(1025, oa_shape(1026, 2), oa_shape(1027), oa_group(1028, oa_shape(1029, 1)))
     dgg = dgg_with_bstore([png, jpeg], shapes=[group])
     d, ctx = parse(float_doc("a\x08\r", dgg))
-    assert d.blocks == [Para([Text("a")]), Image(JPEG), Image(PNG)] and not ctx.skipped, (d.blocks, ctx.skipped)
+    assert d.blocks == [Para([Text("a")]), Image(JPEG, codepage="cp1252"), Image(PNG, codepage="cp1252")] and not ctx.skipped, (d.blocks, ctx.skipped)
     # a member anchored itself is that member's picture
     d, ctx = parse(float_doc("a\x08\r", dgg, anchors=[(1, 1029)]))
-    assert d.blocks == [Para([Text("a")]), Image(PNG)] and not ctx.skipped, (d.blocks, ctx.skipped)
+    assert d.blocks == [Para([Text("a")]), Image(PNG, codepage="cp1252")] and not ctx.skipped, (d.blocks, ctx.skipped)
     # one bad member: the other is shown, the bad one counted
     group = oa_group(1025, oa_shape(1026, 1), oa_shape(1027, 9))
     got = md(float_doc("a\x08\r", dgg_with_bstore([png], shapes=[group])))
@@ -264,7 +267,7 @@ def test_header_pictures_skipped():
     try:
         for p in (run(picf_inline(blip_png(big)), 2), run(b"\x01\x02", 9)):
             d, ctx = parse(p)
-            assert d.headers == ["h"] and d.blocks == [Para([Text("m")]), Image(PNG)], (d.headers, d.blocks)
+            assert d.headers == ["h"] and d.blocks == [Para([Text("m")]), Image(PNG, codepage="cp1252")], (d.headers, d.blocks)
             assert not ctx.skipped, ctx.skipped
     finally:
         doc.IMAGE_BYTES = old
@@ -490,7 +493,7 @@ def test_many_shapes_linear():
     p = float_doc("\x08" * n + "\r", dgg, chpx=[(0, n, sp(SPEC))])
     t0 = time.monotonic()
     d, ctx = parse(p)
-    assert len(d.blocks) == n and all(b == Image(PNG) for b in d.blocks) and not ctx.skipped
+    assert len(d.blocks) == n and all(b == Image(PNG, codepage="cp1252") for b in d.blocks) and not ctx.skipped
     assert time.monotonic() - t0 < 10
 
 

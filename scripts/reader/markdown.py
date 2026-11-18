@@ -375,15 +375,25 @@ class _Render:
         return []
 
     def _image_text(self, b: Image, m=BLOCK) -> str:
-        path, ok = self.assets.add(b.data, b.alt)
+        path, ok = self.assets.add(b.data, b.alt, b.codepage)
         alt = re.sub(r"\s+", " ", b.alt).strip()
         if ok:
             self.linked.add(path)
             alt = alt.replace("\\", "\\\\").replace("]", "\\]")
-            return m.esc(f"![{alt}](") + path + ")"
-        if path and path not in self.unviewable:
-            self.unviewable.append(path)
-        return m.esc(f"[image: {alt}]") if alt else ""
+            head = m.esc(f"![{alt}](") + path + ")"
+        else:
+            if path and path not in self.unviewable:
+                self.unviewable.append(path)
+            head = m.esc(f"[image: {alt}]") if alt else ""
+        lines = [x for x in (" ".join(ln.split()) for ln in self.assets.lines.get(path, ())) if x]
+        if not lines:
+            return head
+        fig = m.esc("Figure text: " + " / ".join(lines))
+        if m is not BLOCK:
+            return head + " " + fig if head else fig
+        if b.hidden and self.show:
+            fig = "(hidden) " + fig  # its own paragraph is marked as the link's is
+        return head + "\n\n" + fig if head else fig
 
     def _image(self, b: Image) -> list:
         s = self._image_text(b)
@@ -818,7 +828,8 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
 
     `skipped` is the parse context's skip counter; what it says was lost becomes a "(could not read: ...)" line.
     A dict passed as `info` receives "unread" (that line's items), "lost" (the counted ones among them), "empty" (no content rendered at all),
-    "images" (how many viewable images the output links to) and "pages" (the line numbers of the page heads it wrote, for stats; None
+    "images" (how many viewable images the output links to), "figures" and "figures_left" (pictures converted to PNG,
+    and figure kinds kept as the original file), "warnings" (the figure warnings, sorted) and "pages" (the line numbers of the page heads it wrote, for stats; None
     when it wrote none, or a head did not survive to the output).
     """
     r = _Render(doc, Path(assets_dir), hidden, skipped)
@@ -837,7 +848,8 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     md = _cap(text)
     if info is not None:
         info.update(unread=r.unread, lost=r.lost, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked),
-                    pages=pages)
+                    pages=pages, figures=r.assets.figures, figures_left=r.assets.figures_left,
+                    warnings=sorted(r.assets.warnings))
     return md
 
 

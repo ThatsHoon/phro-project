@@ -905,6 +905,39 @@ def test_many_inline_equations_are_linear():
     assert took < 5, took
 
 
+def _wmf_with_cp949():
+    from metafile_fix import wmf, wmf_font, wmf_select, wmf_text
+    return wmf([wmf_font(-200, charset=1), wmf_select(0), wmf_text(100, 300, "한글".encode("cp949"))])
+
+
+class _no_raster_backend:
+    def __enter__(self):
+        from reader import raster
+        self.old = raster.backend
+        raster.backend = lambda: "none"
+
+    def __exit__(self, *exc):
+        from reader import raster
+        raster.backend = self.old
+
+
+def test_hwp_image_codepage_reaches_parser():
+    p = pic_file(hwp_picture(1), bins=(("wmf", 0),), streams={"BIN0001.wmf": deflate(_wmf_with_cp949())})
+    with _no_raster_backend():
+        out = md(p)
+    assert out == "Figure text: 한글\n\nNot viewable here: assets/img-001.wmf\n", out
+
+
+def test_hwp_figures_in_meta_json():
+    import json
+    p = pic_file(hwp_picture(1), bins=(("wmf", 0),), streams={"BIN0001.wmf": deflate(_wmf_with_cp949())})
+    o = tmp() / "o"
+    with _no_raster_backend():
+        meta = reader.convert(p, o)
+    assert meta["figures"] == 0 and meta["figures_left"] == 1, meta
+    assert json.loads((o / "meta.json").read_text(encoding="utf-8"))["figures_left"] == 1
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

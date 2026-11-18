@@ -141,9 +141,9 @@ class MemAssets:
     """Stands in for images.Assets while a case is rendered: no image is ever written out."""
 
     def __init__(self, dir):
-        pass
+        self.lines, self.figures, self.figures_left, self.warnings = {}, 0, 0, set()
 
-    def add(self, data, alt=""):
+    def add(self, data, alt="", codepage=""):
         return "assets/mem.png", True
 
 

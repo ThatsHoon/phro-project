@@ -10,7 +10,8 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import limits, markdown, text  # noqa: E402
+from metafile_fix import wmf, wmf_text  # noqa: E402
+from reader import limits, markdown, raster, text  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import (  # noqa: E402
     Bold, Break, Cell, Code, Context, Doc, Equation, Heading, Hidden, Image, Link,
@@ -715,6 +716,89 @@ def test_render_joins_in_linear_time():
         assert len(out) == n * 50 + 1
         large, out = _render_time(Doc(blocks=[Para([Text(f"{i:06d}" + "v" * 44) for i in range(2 * n)])]))
         assert len(out) == 2 * n * 50 + 1 and large < 3 * small, (small, large)
+
+
+FIG_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
+FIG = wmf([wmf_text(100, 200, b"Hi")])
+
+
+class figs:
+    """raster.convert replaced: every figure gives a PNG (png=None: none), `lines` and `warnings`."""
+
+    def __init__(self, lines=(), warnings=(), png=FIG_PNG):
+        self.f = (png, list(lines), set(warnings))
+
+    def __enter__(self):
+        self.old = raster.convert
+        raster.convert = lambda kind, data, **kw: raster.Figure(self.f[0], list(self.f[1]), set(self.f[2]))
+
+    def __exit__(self, *exc):
+        raster.convert = self.old
+
+
+def test_figure_text_paragraph_after_link():
+    with figs(["2024 sales", "Q1 120"]):
+        out = R(Doc(blocks=[P("a"), Image(FIG, alt="chart"), P("b")]))
+    assert out == "a\n\n![chart](assets/img-001.png)\n\nFigure text: 2024 sales / Q1 120\n\nb\n", out
+
+
+def test_figure_text_inline_in_cell():
+    with figs(["Q1 120", "Q2"]):
+        out = R(Doc(blocks=[Table([[Cell([Image(FIG, alt="c")]), Cell([P("z")])]])]))
+    assert "|![c](assets/img-001.png) Figure text: Q1 120 / Q2|z|" in out, out
+    assert len([ln for ln in out.splitlines() if ln.startswith("|")]) == 2  # the row and the separator
+    with figs(["a|b"]):
+        out = R(Doc(blocks=[Table([[Cell([Image(FIG)]), Cell([P("z")])]])]))
+    assert "Figure text: a\\|b" in out, out
+
+
+def test_figure_without_text_link_only():
+    with figs([]):
+        assert R(Doc(blocks=[Image(FIG, alt="c")])) == "![c](assets/img-001.png)\n"
+    with figs(["  ", ""]):
+        assert R(Doc(blocks=[Image(FIG, alt="c")])) == "![c](assets/img-001.png)\n"
+
+
+def test_unconverted_figure_keeps_text():
+    with figs(["Hello"], png=None):
+        out = R(Doc(blocks=[Image(FIG, alt="chart"), Image(wmf([wmf_text(5, 5, b"Q")])), P("end")]))
+    assert out == ("[image: chart]\n\nFigure text: Hello\n\nFigure text: Hello\n\nend\n\n"
+                   "Not viewable here: assets/img-001.wmf, assets/img-002.wmf\n"), out
+    with tempfile.TemporaryDirectory() as d:
+        a = Path(d) / "assets"
+        with figs(["Hello"], png=None):
+            markdown.render(Doc(blocks=[Image(FIG)]), a)
+        assert (a / "img-001.wmf").read_bytes() == FIG
+
+
+def test_hidden_figure_text_tagged():
+    with figs(["Secret"]):
+        out = R(Doc(blocks=[Image(FIG, hidden="hidden")]), hidden=True)
+        assert out.splitlines()[0].startswith("(hidden) ![](assets/img-001.png)"), out
+        assert [ln for ln in out.splitlines() if "Figure text" in ln] == ["(hidden) Figure text: Secret"], out
+        out = R(Doc(blocks=[Image(FIG, hidden="hidden")]))
+        assert "Secret" not in out and "img-001" not in out, out
+
+
+def test_meta_figures_counts():
+    info = {}
+    with figs(["a"]):
+        with tempfile.TemporaryDirectory() as d:
+            markdown.render(Doc(blocks=[Image(FIG), Image(wmf([wmf_text(1, 1, b"Z")]))]), Path(d), info=info)
+    assert info["figures"] == 2 and info["figures_left"] == 0 and info["images"] == 2, info
+    info = {}
+    with figs(["a"], png=None):
+        with tempfile.TemporaryDirectory() as d:
+            markdown.render(Doc(blocks=[Image(FIG), Image(FIG)]), Path(d), info=info)
+    assert info["figures"] == 0 and info["figures_left"] == 1 and info["images"] == 0, info
+
+
+def test_figure_warnings_in_meta():
+    info = {}
+    with figs(["a"], warnings=["figure text cut", "figure damaged"]):
+        with tempfile.TemporaryDirectory() as d:
+            markdown.render(Doc(blocks=[Image(FIG), Image(wmf([wmf_text(1, 1, b"Z")]))]), Path(d), info=info)
+    assert info["warnings"] == ["figure damaged", "figure text cut"], info
 
 
 def main():

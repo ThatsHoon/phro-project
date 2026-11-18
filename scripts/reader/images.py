@@ -6,6 +6,7 @@ from pathlib import Path
 
 VIEWABLE = frozenset({"png", "jpg", "gif", "webp"})
 _MAX_PIXELS = 16_777_216
+FIGURES = frozenset({"wmf", "emf", "pict", "wpg", "tiff"})  # converted to PNG with their text (raster)
 
 
 def sniff(data: bytes) -> str | None:
@@ -159,24 +160,43 @@ class Assets:
         self.dir = Path(dir)
         self._seen: dict[str, tuple[str, bool]] = {}
         self._n = 0
+        self.lines: dict[str, list] = {}  # figure text lines by the path add returned
+        self.figures = 0  # pictures converted to PNG
+        self.figures_left = 0  # figure kinds kept as the original file
+        self.warnings: set[str] = set()  # the figure warnings raster raised
 
-    def add(self, data: bytes, alt: str = "") -> tuple[str, bool]:
+    def add(self, data: bytes, alt: str = "", codepage: str = "") -> tuple[str, bool]:
         if len(data) < 16:
             return "", False
         kind = sniff(data)
         if kind is None:
             return "", False
         key = hashlib.sha1(data).hexdigest()
+        if kind in FIGURES:  # the code page can change the text, so it is part of the key
+            key += "/" + codepage
         if key in self._seen:
             return self._seen[key]
+        lines: list = []
         if kind == "bmp":
             png = bmp_to_png(data)
             if png is not None:
                 data, kind = png, "png"
+        elif kind in FIGURES:
+            from . import raster
+            fig = raster.convert(kind, data, codepage=codepage)
+            lines = list(fig.lines)
+            self.warnings |= fig.warnings
+            if fig.png is not None:
+                data, kind = fig.png, "png"
+                self.figures += 1
+            else:
+                self.figures_left += 1
         self._n += 1
         name = f"img-{self._n:03d}.{kind}"
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / name).write_bytes(data)
         res = (f"assets/{name}", kind in VIEWABLE)
+        if lines:
+            self.lines[res[0]] = lines
         self._seen[key] = res
         return res
