@@ -26,11 +26,11 @@ paragraph being built and its own open fields, so a note or a header never ends 
 * Lists: the text of a `\\listtext` or `\\pntext` group, without tabs, is the marker of the paragraph's ListItem, its
   level `\\ilvlN` clamped to 0..8 (0 first, as every format here). A paragraph with `\\lsN` and no list text has the
   marker `-`. `\\pard` resets `\\ls`, `\\ilvl`, `\\intbl` and `\\itap`. A heading stays a Heading.
-* Pictures: `{\\pict ...}` with `\\pngblip`, `\\jpegblip`, `\\emfblip`, `\\wmetafile` or `\\dibitmap` is one Image after the
+* Pictures: `{\\pict ...}` with `\\pngblip`, `\\jpegblip`, `\\emfblip`, `\\wmetafile`, `\\dibitmap` or `\\macpict` is one Image after the
   paragraph it is in (a table cell's blocks, in a table). Its hex digits (cleaned in one `re.sub`, an odd last digit
   dropped) or `\\bin` bytes are charged against `IMAGE_BYTES`, the document's earlier pictures included, as they are
   collected: past it collection stops, `image` is counted once and nothing is emitted. A DIB becomes a BMP through
-  `officeart.dib_to_bmp`, then a PNG. `\\macpict` and any other format are counted under `image`. A group inside `\\pict` is
+  `officeart.dib_to_bmp`, then a PNG. A `\\macpict` gets the 512-byte zero head of a PICT file before its bytes, as a BLIP PICT does. Any other format is counted under `image`. A group inside `\\pict` is
   skipped; `{\\*\\shppict{\\pict ...}}` is read and `\\nonshppict` skipped, so the pair is one image; an `\\object` keeps
   its `\\result` and skips `\\objdata`.
 * Paragraphs: `\\par` and `\\sect` end one; `\\line`, `\\lbr`, `\\page` and `\\column` are a Break; `\\tab` is a space;
@@ -119,8 +119,9 @@ _CODEPAGES = {"mac": 10000, "pc": 437, "pca": 850}  # the charset words that sta
 _LINE_WORDS = frozenset(("line", "lbr", "page", "column"))
 _PAR_WORDS = frozenset(("par", "sect"))
 # picture format words: the ones read (what _pict_data decodes), and the ones that are counted instead
-_BLIPS = {"pngblip": "png", "jpegblip": "jpeg", "emfblip": "emf", "wmetafile": "wmf", "dibitmap": "dib"}
-_UNREAD = ("macpict", "wbitmap", "pmmetafile")
+_BLIPS = {"pngblip": "png", "jpegblip": "jpeg", "emfblip": "emf", "wmetafile": "wmf", "dibitmap": "dib",
+          "macpict": "pict"}
+_UNREAD = ("wbitmap", "pmmetafile")
 
 
 class _Group:
@@ -799,13 +800,15 @@ class _Reader:
         if pic.dead:
             return
         data = None
-        if pic.fmt in ("png", "jpeg", "emf", "wmf", "dib"):
+        if pic.fmt in ("png", "jpeg", "emf", "wmf", "dib", "pict"):
             try:
                 if pic.raw:
                     data = b"".join(pic.raw)
                 else:
                     digits = _NONHEX.sub(b"", b"".join(pic.hex))
                     data = bytes.fromhex(digits[:len(digits) & ~1].decode("ascii"))
+                if pic.fmt == "pict":  # an rtf PICT has no file head: Image data starts with the 512 zero bytes
+                    data = bytes(512) + data
                 if pic.fmt == "dib":  # a DIB is a BMP without its file header
                     bmp = dib_to_bmp(data)
                     data = images.bmp_to_png(bmp) if bmp is not None else None

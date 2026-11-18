@@ -16,6 +16,9 @@ from reader import markdown  # noqa: E402
 from reader.formats import rtf  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
+from metafile_fix import pict, pict_longtext  # noqa: E402
+from reader import images  # noqa: E402
+from reader.model import Image  # noqa: E402
 from reader_fix import make_doc, make_zip  # noqa: E402
 
 
@@ -316,6 +319,14 @@ def test_pict_counted_once_each():
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
     assert "3 images" in out and "89504e47" not in out and "ffd8" not in out, out
     assert "abc" in out
+
+
+def test_macpict_becomes_image_with_head():
+    pic = pict([pict_longtext(30, 20, b"Hi")], head=False)
+    d, ctx = parse(rtf_file(rb"{\rtf1 a{\pict\macpict\picw72\pich72 " + pic.hex().encode() + rb"}b\par}"))
+    imgs = [b for b in d.blocks if isinstance(b, Image)]
+    assert len(imgs) == 1 and not ctx.skipped["image"], (d.blocks, ctx.skipped)
+    assert imgs[0].data == bytes(512) + pic and images.sniff(imgs[0].data) == "pict"
 
 
 def test_pntext_and_unknown_star_group():

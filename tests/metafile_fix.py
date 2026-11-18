@@ -400,3 +400,30 @@ def ttc(specs: list[tuple]) -> bytes:
         pos += len(f)
     return b"ttcf" + struct.pack(">II", 0x00010000, len(specs)) + b"".join(struct.pack(">I", b) for b in bases) \
         + b"".join(fonts)
+
+
+# ---- PICT --------------------------------------------------------------------------------------------------------------
+
+def pict_op(code: int, data: bytes = b"", v2=True) -> bytes:
+    """One PICT opcode and its data: a 16-bit opcode padded to a word in PICT 2, an 8-bit one as it is in PICT 1."""
+    out = struct.pack(">H" if v2 else ">B", code) + data
+    return out + b"\0" * (len(out) & 1) if v2 else out
+
+
+def pict_longtext(v, h, s: bytes, v2=True) -> bytes:
+    return pict_op(0x28, struct.pack(">hhB", v, h, len(s)) + s, v2)
+
+
+def pict(opcodes: list[bytes], frame=(0, 0, 72, 72), version=2, head=True, dpi=72) -> bytes:
+    """A PICT: the 512-byte head (zeros) unless head is False, picSize, picFrame (frame is left, top, right, bottom),
+    the version opcode, for version 2 the extended header at `dpi`, the opcodes and OpEndPic."""
+    left, top, right, bottom = frame
+    body = b"".join(opcodes)
+    if version == 1:
+        out = struct.pack(">HhhhhBB", 0, top, left, bottom, right, 0x11, 0x01) + body + b"\xff"
+    else:
+        hdr = struct.pack(">HHii4hI", 0xFFFE, 0, dpi << 16, dpi << 16, top, left, bottom, right, 0)
+        out = (struct.pack(">Hhhhh", 0, top, left, bottom, right) + b"\x00\x11\x02\xff" + b"\x0c\x00" + hdr
+               + body + b"\x00\xff")
+    out = struct.pack(">H", len(out) & 0xFFFF) + out[2:]
+    return b"\0" * 512 + out if head else out
