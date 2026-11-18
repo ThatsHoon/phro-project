@@ -40,6 +40,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
+from reader import metafile, pict, svg_write, vector, wpg  # noqa: E402
 from reader import markdown  # noqa: E402
 from reader.containers import flate, pbwire, snappy  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
@@ -55,6 +56,7 @@ from reader_fix import (XLSX_SML, blip_png, cfb_bytes, encrypt_xls, hwp_para, ma
                         make_xlsb, make_xlsx, make_zip, oa_fbse, oa_solver, pub_2k_file, pub_cells, pub_escher,
                         pub_file, pub_sp, pub_table, xlsx_cell, xlsx_row)
 import djvu_fix as djf  # noqa: E402
+import metafile_fix as mf  # noqa: E402
 import iwork_fix as iwf  # noqa: E402
 import jet_fix as jf  # noqa: E402
 import test_reader_docm as dm  # noqa: E402  (the seed builders and fixtures of the owning test files)
@@ -1030,6 +1032,64 @@ def test_diagram_mutations():
         docs, draws = DIAGRAM_FLOOR[label]
         assert sum(counts.values()) == CASES, (label, counts)
         assert counts.get("doc", 0) >= docs and drawn[0] >= draws, (label, counts, drawn[0], DIAGRAM_FLOOR[label])
+
+# ---- figures: a WMF, an EMF+ dual file, a PICT 2 and a WPG 1 damaged in memory, parsed, read for text and drawn as SVG
+def _pict_pixmap(w, h, rowbytes, table):
+    out = struct.pack(">H", 0x8000 | rowbytes) + struct.pack(">hhhh", 0, 0, h, w)
+    out += struct.pack(">HHIiiHHHHIII", 0, 0, 0, 72 << 16, 72 << 16, 0, 8, 1, 8, 0, 0, 0)
+    out += struct.pack(">IHH", 0, 0, len(table) - 1)
+    for i, (r, g, b) in enumerate(table):
+        out += struct.pack(">HHHH", i, r << 8, g << 8, b << 8)
+    return out
+
+
+def figure_seeds() -> dict:
+    """label: (parse(bytes), clean bytes, text the clean seed reads)."""
+    wmf_seed = mf.wmf([mf.wmf_font(-100), mf.wmf_select(0), mf.wmf_brush(0xFF0000), mf.wmf_select(1),
+                       mf.wmf_rect(10, 10, 600, 400), mf.wmf_text(100, 200, b"Seed text")])
+    plus = mf.emf([mf.emfplus([mf.plus_header(), mf.plus_font(0, 12, "Arial"), mf.plus_string(0, 96, 96, "Plus text"),
+                               mf.plus_fill_rect(0, 0, 50, 50)]),
+                   mf.emf_font(-100), mf.emf_textw(100, 100, "Dual text")])
+    packed = (_pict_pixmap(10, 2, 10, [(0, 0, 0), (255, 0, 0)]) + struct.pack(">hhhh", 0, 0, 2, 10)
+              + struct.pack(">hhhh", 5, 6, 7, 16) + struct.pack(">H", 0)
+              + bytes([2, 256 - 9, 1]) + bytes([2, 256 - 9, 0]))
+    pict_seed = mf.pict([mf.pict_longtext(30, 20, b"Pict text"), mf.pict_op(0x98, packed)])
+    wpg_seed = mf.wpg1([mf.wpg1_text_attr(avg=100, size=200, align=0, color=4), mf.wpg1_text(100, 1000, b"Wpg text"),
+                        mf.wpg1_rect(10, 10, 300, 200)])
+    return {"wmf": (metafile.parse, wmf_seed, "Seed text"), "emfplus": (metafile.parse, plus, "Plus text"),
+            "pict": (pict.parse, pict_seed, "Pict text"), "wpg1": (wpg.parse, wpg_seed, "Wpg text")}
+
+
+def read_figure(parse, data):
+    """What a figure goes through after a picture's bytes are read: parse, text lines, SVG."""
+    d = parse(data)
+    assert isinstance(d, vector.Drawing), type(d)
+    vector.text_lines(d)
+    svg_write.write(d, d.size_px())
+    return d
+
+
+# The fewest parse successes of a seed's CASES cases: about half the rates measured at SEED (measured below), so a
+# regression that refuses every damaged case fails while the draw of 100 cases does not.
+# Measured at SEED: wmf 74, emfplus 84, pict 47, wpg1 57.
+FIGURE_FLOOR = {"wmf": 37, "emfplus": 42, "pict": 23, "wpg1": 28}
+
+
+def test_figure_mutations():
+    for label, (parse, seed, probe) in figure_seeds().items():
+        d = read_figure(parse, seed)
+        assert any(probe in t for t in vector.text_lines(d)[0]) and not d.damaged, (label, vector.text_lines(d))
+
+        def make(rng, k, seed=seed, parse=parse):
+            data = apply(plan(rng, len(seed)), seed)
+            return lambda: read_figure(parse, data)
+
+        def to_doc(f):  # outcome() wants a Doc; a Drawing counts as one
+            return lambda: (f(), Doc())[1]
+
+        counts = run_cases(f"figure {label}", lambda rng, k: to_doc(make(rng, k)), routed=False)
+        assert sum(counts.values()) == CASES, (label, counts)
+        assert counts.get("doc", 0) >= FIGURE_FLOOR[label], (label, counts, FIGURE_FLOOR[label])
 
 
 def main():
