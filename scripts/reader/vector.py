@@ -119,19 +119,34 @@ class Budget:
         self.n += 1
         cap = limits.METAFILE_RECORDS if self._records is None else self._records
         if self.n > cap:
-            raise ReadError("too_large", "figure")
+            raise ReadError("too_large", CAP)
 
     def points(self, n):
         self._clock()
         self.p += n
         cap = limits.METAFILE_POINTS if self._points is None else self._points
         if self.p > cap:
-            raise ReadError("too_large", "figure")
+            raise ReadError("too_large", CAP)
 
     def nest(self, n: int) -> bool:
         """Counts `n` bytes of a nested picture; False once all nested bytes pass max(2 x size, METAFILE_NESTED)."""
         self.nested += n
         return self.nested <= max(2 * self.size, limits.METAFILE_NESTED)
+
+
+CAP = "figure"  # the detail of the ReadError("too_large") Budget raises at a size cap; the deadline's is "figure time"
+
+
+def kept(parser, finish) -> "Drawing":
+    """parser.run(); past a size cap (records or points) the drawing read so far instead: the parser is marked
+    damaged and finish() makes the drawing of what it holds. The deadline's "figure time" still raises."""
+    try:
+        return parser.run()
+    except ReadError as e:
+        if e.kind != "too_large" or e.detail != CAP:
+            raise
+    parser.damaged = True
+    return finish()
 
 
 def run_width(r: Run, text: str) -> float:

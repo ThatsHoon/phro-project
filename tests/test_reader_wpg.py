@@ -612,26 +612,21 @@ def test_wpg_group_depth_and_records_cap():
     recs = [wpg2_rec(0x15, wpg2_char() + struct.pack("<H", 0), ext=100)] * (limits.MAX_DEPTH + 10)
     d = wpg.parse(wpg2(recs))
     assert d.damaged
+    # past a size cap the drawing read so far is kept, marked damaged
     old = limits.METAFILE_RECORDS
     limits.METAFILE_RECORDS = 3
     try:
-        wpg.parse(wpg1([wpg1_line(0, 0, 1, 1)] * 10))
-    except ReadError as e:
-        assert e.kind == "too_large"
-    else:
-        raise AssertionError("no ReadError")
+        d = wpg.parse(wpg1([wpg1_line(0, 0, 1, 1)] * 10))
     finally:
         limits.METAFILE_RECORDS = old
+    assert d.damaged and 0 < len(d.items) < 10, (d.damaged, len(d.items))
     old = limits.METAFILE_POINTS
     limits.METAFILE_POINTS = 20
     try:
-        wpg.parse(wpg1([wpg1_poly(0x06, [(i, i) for i in range(30)])]))
-    except ReadError as e:
-        assert e.kind == "too_large"
-    else:
-        raise AssertionError("no ReadError")
+        d = wpg.parse(wpg1([wpg1_line(0, 0, 1, 1), wpg1_poly(0x06, [(i, i) for i in range(30)])]))
     finally:
         limits.METAFILE_POINTS = old
+    assert d.damaged and len(d.items) == 1, (d.damaged, d.items)
 
 
 def test_wpg_deadline():
@@ -650,14 +645,11 @@ def test_wpg_item_weight_matches_metafile():
     # a run is charged ITEM_WEIGHT, kept or not
     old = limits.METAFILE_POINTS
     limits.METAFILE_POINTS = wpg.ITEM_WEIGHT * 2 - 1
-    try:
-        wpg.parse(wpg1([wpg1_text(0, 600, b"a"), wpg1_text(0, 600, b"b")]))
-    except ReadError as e:
-        assert e.kind == "too_large"
-    else:
-        raise AssertionError("no ReadError")
+    try:  # the second run passes the cap: the first is kept, the drawing marked damaged
+        d = wpg.parse(wpg1([wpg1_text(0, 600, b"a"), wpg1_text(0, 600, b"b")]))
     finally:
         limits.METAFILE_POINTS = old
+    assert d.damaged and [r.text for r in d.items if isinstance(r, Run)] == ["a"], d.items
 
 
 def test_wpg_images_sniff():

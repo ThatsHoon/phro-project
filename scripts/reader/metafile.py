@@ -19,7 +19,7 @@ from .images import bmp_to_png
 from .limits import ReadError
 from .officeart import dib_to_bmp
 from .text import SYMBOL
-from .vector import Bitmap, Brush, Budget, Clip, Drawing, Path, Pen, Run, arc_beziers, run_width
+from .vector import Bitmap, Brush, Budget, Clip, Drawing, Path, Pen, Run, arc_beziers, kept, run_width
 
 # font charset -> the code page ANSI text in that charset is decoded with
 CHARSETS: dict[int, str] = {
@@ -182,12 +182,15 @@ def parse(data: bytes, codepage: str = "", deadline: float | None = None) -> Dra
 def _parse(data, codepage: str, depth: int, budget) -> Drawing:
     """`depth` counts the EMF+ image objects this metafile is nested in; `budget` is shared with the outer ones.
     A nested picture's `data` is a memoryview into the bytes it came in: an EMF reads it in place, record by record,
-    and a WMF (which nests nothing) is copied once."""
+    and a WMF (which nests nothing) is copied once.
+    A size cap met on the way keeps the drawing read up to it, marked damaged (vector.kept)."""
     if data[:4] == b"\xd7\xcd\xc6\x9a" or _is_plain_wmf(data):
-        return _Wmf(bytes(data), codepage, budget).run()
-    if _is_emf(data):
-        return _Emf(data, codepage, depth, budget).run()
-    raise ReadError("damaged", "not a metafile")
+        p = _Wmf(bytes(data), codepage, budget)
+    elif _is_emf(data):
+        p = _Emf(data, codepage, depth, budget)
+    else:
+        raise ReadError("damaged", "not a metafile")
+    return kept(p, p._drawing)
 
 
 class _Wmf:
@@ -289,6 +292,10 @@ class _Wmf:
                 self.damaged = True
                 self.skipped += 1
             pos += size
+        return self._drawing()
+
+    def _drawing(self) -> Drawing:
+        """The drawing of what was read; for an EMF the frame is the header's (_freeze does nothing there)."""
         self._freeze()
         frame = self.frame or self._extent()
         if not _ok(*frame):  # a zero width or height stays: size_px clamps each side to a pixel
@@ -888,10 +895,7 @@ class _Emf(_Wmf):
                 self.damaged = True
                 self.skipped += 1
             pos += size
-        frame = self.frame or self._extent()
-        if not _ok(*frame):
-            frame = (0.0, 0.0, 1.0, 1.0)
-        return Drawing(frame, self.dpi, self.items, self.damaged, self.skipped)
+        return self._drawing()
 
     def _move_only(self, h, p):
         """A drawing record the EMF+ records drew still moves the current position, which a later GetDC section

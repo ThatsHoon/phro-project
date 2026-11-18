@@ -368,6 +368,31 @@ def test_emf_write_bitmap_budget():
     assert len(calls) == 2 and [t for t, _ in emf_records(out)].count(81) == 1
 
 
+def test_cap_keeps_the_text_before_it():
+    """A picture past METAFILE_POINTS keeps what was read before the cap: its text lines, with "figure damaged"."""
+    rect = struct.pack(">hhhh", 36, 0, 72, 36)
+    pictures = {
+        "emf": emf([emf_font(-100), emf_textw(100, 200, "Label")] + [emf_rect(0, 0, 10, 10)] * 50
+                   + [emf_textw(100, 900, "late")]),
+        "wmf": wmf([wmf_font(100), wmf_text(100, 200, b"Label")] + [wmf_rect(0, 0, 10, 10)] * 50
+                   + [wmf_text(100, 900, b"late")]),
+        "pict": pict([pict_longtext(20, 10, b"Label")] + [pict_op(0x31, rect)] * 50
+                     +[pict_longtext(20, 60, b"late")]),
+        "wpg": wpg1([wpg1_text(700, 300, b"Label")] + [wpg1_rect(0, 0, 600, 600)] * 50 + [wpg1_text(700, 900, b"late")]),
+    }
+    old = limits.METAFILE_POINTS
+    limits.METAFILE_POINTS = 100
+    try:
+        for kind, data in pictures.items():
+            with no_backend():
+                f = raster.convert(kind, data)
+            assert f.lines == ["Label"] and f.warnings == {"figure damaged"}, (kind, f.lines, f.warnings)
+    finally:
+        limits.METAFILE_POINTS = old
+    with no_backend():  # under the real cap every line is read
+        assert raster.convert("emf", pictures["emf"]).lines == ["Label", "late"]
+
+
 def test_size_cap_warns_damaged():
     data = emf([emf_textw(100, 200, "Hi")])
     old = limits.METAFILE_RECORDS
@@ -377,7 +402,7 @@ def test_size_cap_warns_damaged():
             f = raster.convert("emf", data)
     finally:
         limits.METAFILE_RECORDS = old
-    assert f.png is None and f.lines == [] and f.warnings == {"figure damaged"}
+    assert f.png is None and f.lines == ["Hi"] and f.warnings == {"figure damaged"}  # the text before the cap kept
 
 # ---- GDI+ ------------------------------------------------------------------------------------------------------------
 
@@ -388,18 +413,22 @@ def render(d: Drawing) -> bytes:
 
 @needs_gdiplus
 def test_gdiplus_fallback_size_96dpi():
-    """With the parser stopped at its size cap, the PNG size comes from GDI+ at 96 dpi."""
+    """With the parser failed (a size cap now keeps the drawing, so a failure is stubbed), the PNG size comes from
+    GDI+ at 96 dpi, and there is no text."""
     one_inch = emf([emf_brush(0x000000), emf_rect(0, 1270, 1270, 2540)])
     wide = emf_write.write(Drawing((0, 0, 200, 100), 96.0, [VPath([("M", 0, 50), ("L", 100, 50), ("L", 100, 100),
                                                                    ("L", 0, 100), ("Z",)], None, Brush(0))]))
-    old = limits.METAFILE_RECORDS
-    limits.METAFILE_RECORDS = 1
+    real = raster._parse
+
+    def fail(*a):
+        raise RuntimeError("parser failed")
+    raster._parse = fail
     try:
         f = raster.convert("emf", one_inch)
         g = raster.convert("emf", wide)
     finally:
-        limits.METAFILE_RECORDS = old
-    assert f.warnings == {"figure damaged"} and f.lines == []
+        raster._parse = real
+    assert f.warnings == set() and f.lines == []
     assert png_size(f.png) == raster.target_size(96, 96) == (192, 192)
     assert png_size(g.png) == raster.target_size(200, 100) == (400, 200)
     w, h, rows = png_pixels(f.png)

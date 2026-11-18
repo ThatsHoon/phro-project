@@ -272,14 +272,11 @@ def test_pict_not_a_pict_and_caps():
             raise AssertionError("no ReadError")
     old = limits.METAFILE_RECORDS
     limits.METAFILE_RECORDS = 3
-    try:
-        pictmod.parse(pict([pict_op(0x30, rect(0, 0, 1, 1))] * 10))
-    except ReadError as e:
-        assert e.kind == "too_large"
-    else:
-        raise AssertionError("no ReadError")
+    try:  # past the cap the drawing read so far is kept, marked damaged
+        d = pictmod.parse(pict([pict_op(0x30, rect(0, 0, 1, 1))] * 10))
     finally:
         limits.METAFILE_RECORDS = old
+    assert d.damaged and 0 < len(d.items) < 10, (d.damaged, len(d.items))
 
 
 def test_pict_item_weight_matches_metafile():

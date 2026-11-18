@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import emf_write, fonts, images, limits, svg_write
 from .limits import ReadError
-from .vector import text_lines
+from .vector import CAP, text_lines
 
 KINDS = ("wmf", "emf", "pict", "wpg", "tiff")
 DEADLINE_ENV = "PHRO_READER_DEADLINE"
@@ -133,7 +133,9 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
             d = _parse(kind, data, codepage, mono)
         except ReadError as e:
             refused = e.kind == "damaged"
-            if e.kind == "too_large" and e.detail == "figure":  # the size cap: GDI+ still draws it, with no text
+            # a size cap keeps the drawing read up to it (vector.kept: damaged, its text kept); one that still got out
+            # leaves no text, and GDI+ draws the picture
+            if e.kind == "too_large" and e.detail == CAP:
                 fig.warnings.add("figure damaged")
         except Exception:  # noqa: BLE001 - a picture never makes a document fail
             d = None

@@ -54,7 +54,7 @@ from .formats.wpd_charsets import char
 from .limits import ReadError
 from .officeart import dib_to_bmp
 from .pict import _tab16
-from .vector import Bitmap, Brush, Budget, Drawing, Path, Pen, Run, arc_beziers
+from .vector import Bitmap, Brush, Budget, Drawing, Path, Pen, Run, arc_beziers, kept
 
 # METAFILE_POINTS charged for an item that is not a path, as in metafile.py (kept equal there; a test checks it)
 ITEM_WEIGHT = 16
@@ -1190,7 +1190,8 @@ class _Wpg2(_Wpg):
 def parse(data: bytes, deadline: float | None = None) -> Drawing:
     """The drawing of a WPG with its 16-byte WPC head. ReadError("damaged", ...) when the bytes are not one or have
     no Start WPG record. Past `deadline` (a time.monotonic() value) the figure stops with ReadError("too_large",
-    "figure time")."""
+    "figure time"); past a size cap the drawing read so far is kept, marked damaged."""
     data = bytes(data)
     start, major = _head(data)
-    return (_Wpg1 if major == 1 else _Wpg2)(data, start, Budget(deadline=deadline)).run()
+    p = (_Wpg1 if major == 1 else _Wpg2)(data, start, Budget(deadline=deadline, size=len(data)))
+    return kept(p, p._finish)

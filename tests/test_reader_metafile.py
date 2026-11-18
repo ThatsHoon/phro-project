@@ -136,17 +136,14 @@ def test_wmf_truncated_record_keeps_partial():
 
 
 def test_wmf_record_cap():
+    # past the cap the drawing read so far is kept, marked damaged
     old = limits.METAFILE_RECORDS
     limits.METAFILE_RECORDS = 2
     try:
-        try:
-            metafile.parse(wmf([wmf_text(0, 0, b"a"), wmf_text(0, 50, b"b"), wmf_text(0, 90, b"c")]))
-        except ReadError as e:
-            assert e.kind == "too_large"
-        else:
-            raise AssertionError("no too_large")
+        d = metafile.parse(wmf([wmf_text(0, 0, b"a"), wmf_text(0, 50, b"b"), wmf_text(0, 90, b"c")]))
     finally:
         limits.METAFILE_RECORDS = old
+    assert d.damaged and "".join(lines(d)) == "ab", (d.damaged, lines(d))  # "c" is past the cap
 
 
 def test_wmf_select_missing_object_ignored():
@@ -668,16 +665,15 @@ def test_emfplus_lines_curves_and_paths():
 
 
 def _kind_under_points_cap(cap, data):
-    """The ReadError kind parsing `data` raises with METAFILE_POINTS lowered to `cap`, or None."""
+    """"cut" when parsing `data` with METAFILE_POINTS lowered to `cap` stops at the cap (the drawing kept, marked
+    damaged), else None."""
     old = limits.METAFILE_POINTS
     limits.METAFILE_POINTS = cap
     try:
-        metafile.parse(data)
-    except ReadError as e:
-        return e.kind
+        d = metafile.parse(data)
     finally:
         limits.METAFILE_POINTS = old
-    return None
+    return "cut" if d.damaged else None
 
 
 def _place_many(inner: bytes, k: int) -> bytes:
@@ -691,7 +687,7 @@ def test_emfplus_redrawn_pictures_charged():
         x = _place_many(x, 10)
     d = metafile.parse(x)
     assert len(paths(d)) == 1000 and not d.damaged and d.skipped == 0
-    assert _kind_under_points_cap(2000, x) == "too_large"
+    assert _kind_under_points_cap(2000, x) == "cut"
 
 
 def test_emfplus_path_object_drawn_many_times_charged():
@@ -701,10 +697,10 @@ def test_emfplus_path_object_drawn_many_times_charged():
     clip = plus_rec(0x4033, 1 | 1 << 8)  # SetClipPath of path 1, intersect
     many = emf([emfplus([plus_header(False), path] + [fill] * 300)])
     assert len(paths(metafile.parse(many))) == 300
-    assert _kind_under_points_cap(1000, many) == "too_large"
+    assert _kind_under_points_cap(1000, many) == "cut"
     clips = emf([emfplus([plus_header(False), path] + [clip] * 300)])
     assert len([i for i in metafile.parse(clips).items if isinstance(i, Clip)]) == 1
-    assert _kind_under_points_cap(1000, clips) == "too_large"
+    assert _kind_under_points_cap(1000, clips) == "cut"
 
 
 def test_items_weighed_by_cost():
@@ -713,16 +709,16 @@ def test_items_weighed_by_cost():
     assert w == 16
     three = emf([emf_font(-100), BASELINE] + [emf_textw(0, 100 * i, "t") for i in range(3)])
     assert len(runs(metafile.parse(three))) == 3
-    assert _kind_under_points_cap(3 * w, three) is None and _kind_under_points_cap(3 * w - 1, three) == "too_large"
+    assert _kind_under_points_cap(3 * w, three) is None and _kind_under_points_cap(3 * w - 1, three) == "cut"
     png = b"\x89PNG\r\n\x1a\n" + b"\0" * 20
     two = emf([emfplus([plus_header(False), plus_image_bitmap(0, png)] + [plus_draw_image(0, 0, 0, 96, 48)] * 2)])
-    assert _kind_under_points_cap(2 * w, two) is None and _kind_under_points_cap(2 * w - 1, two) == "too_large"
+    assert _kind_under_points_cap(2 * w, two) is None and _kind_under_points_cap(2 * w - 1, two) == "cut"
     # SAVEDC, a clip rectangle (5 points), RESTOREDC back to no clip (Clip(None): 4), then a rectangle (5 points)
     clipped = emf([emf_rec(33), emf_rec(30, struct.pack("<4i", 0, 0, 50, 50)), emf_rec(34, struct.pack("<i", -1)),
                    emf_rect(0, 0, 10, 10)])
     d = metafile.parse(clipped)
     assert [type(i).__name__ for i in d.items] == ["Clip", "Clip", "Path"] and d.items[1].segs is None
-    assert _kind_under_points_cap(14, clipped) is None and _kind_under_points_cap(13, clipped) == "too_large"
+    assert _kind_under_points_cap(14, clipped) is None and _kind_under_points_cap(13, clipped) == "cut"
 
 
 def _nested_runs(depth: int) -> bytes:

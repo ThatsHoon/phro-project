@@ -19,7 +19,7 @@ import struct
 from . import images
 from .limits import ReadError
 from .officeart import dib_to_bmp
-from .vector import Bitmap, Brush, Budget, Clip, Drawing, Path, Pen, Run, arc_beziers, run_width
+from .vector import Bitmap, Brush, Budget, Clip, Drawing, Path, Pen, Run, arc_beziers, kept, run_width
 
 # METAFILE_POINTS charged for an item that is not a path, as in metafile.py (kept equal there; a test checks it)
 ITEM_WEIGHT = 16
@@ -187,6 +187,9 @@ class _Pict:
                 break
             if self.v2 and pos & 1:
                 pos += 1
+        return self._drawing()
+
+    def _drawing(self) -> Drawing:
         frame = self.frame
         if not _ok(*frame, self.dpi):
             frame, self.dpi = (0.0, 0.0, 1.0, 1.0), 72.0
@@ -732,5 +735,6 @@ class _Pict:
 def parse(data: bytes, deadline: float | None = None) -> Drawing:
     """The drawing of a PICT, with or without the 512-byte file head. ReadError("damaged", "not a PICT") when the
     bytes are not one. Past `deadline` (a time.monotonic() value) the figure stops with ReadError("too_large",
-    "figure time")."""
-    return _Pict(bytes(data), Budget(deadline=deadline)).run()
+    "figure time"); past a size cap the drawing read so far is kept, marked damaged."""
+    p = _Pict(bytes(data), Budget(deadline=deadline, size=len(data)))
+    return kept(p, p._drawing)
