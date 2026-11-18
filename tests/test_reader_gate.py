@@ -792,6 +792,10 @@ def envs(**values):
 def pdf_env(pyenv="off"):
     """stub()'s throwaway cache and child, with PHRO_READER_PYENV pinned: "off" (native, no offer), a missing
     folder (native with the offer) or a fake venv."""
+    import time
+    import reader
+    # the pdf page loop's deadline runs from reader.STARTED (the process start): a long test run must not use it up
+    reader.STARTED = time.monotonic()
     with stub() as base, envs(PHRO_READER_PYENV=pyenv):
         yield base
 
