@@ -128,6 +128,39 @@ def test_private_sessions():
     assert "비공개" not in text and "보통 작업" in text and "공개 작업" in text, text
 
 
+def test_queue_sources():
+    project = Path(tempfile.mkdtemp())
+    d = load(copy_of(project))
+    start, end = d.period(date(2026, 11, 10))
+    t = start + timedelta(hours=2)
+    u = lambda x: x.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (project / "queue").mkdir()
+    rows = [(u(t), "pppp0000", "kept the private backbone"), (u(t), "nnnn1111", "kept the open backbone"),
+            (u(t + timedelta(hours=3)), "ssss2222", "a stretch decision"), (u(t + timedelta(hours=1)), "ssss2222", "before the stretch"),
+            (u(end + timedelta(hours=1)), "nnnn1111", "after the period")]
+    (project / "queue/trail.tsv").write_text("ts\tsession\tphase\tdecision\twhy\tevidence\tresult\n"
+                                             + "".join(f"{ts}\t{sid}\tsweep\t{dec}\tw\te\tkept\n" for ts, sid, dec in rows)
+                                             + "broken row\n", encoding="utf-8")
+    gen = int(end.timestamp())
+    (project / "queue/board.json").write_text(json.dumps({"generated": gen, "tickets": [
+        {"title": "private ticket", "status": "done", "session": "pppp0000", "changed_s": gen - int(t.timestamp())},
+        {"title": "open ticket", "status": "done", "session": "nnnn1111", "changed_s": gen - int(t.timestamp())}]}), encoding="utf-8")
+    d.PRIVATE = Path(tempfile.mkdtemp()) / "private-sessions.txt"
+    a, b = (t + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M"), (t + timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M")
+    d.PRIVATE.write_text(f"pppp0000\nssss2222 {a} {b}\n", encoding="utf-8")
+    hidden = d.private()
+    assert d.decisions(project, start, end, hidden) == ["kept the open backbone (kept)", "before the stretch (kept)"], d.decisions(project, start, end, hidden)
+    assert d.tickets(project, start, end, hidden)[0] == ["open ticket"], "a private session's ticket title stays out"
+    real = HOME / ".claude/private-sessions.txt"
+    shutil.copy(d.PRIVATE, real)
+    try:
+        text = daily(Path(d.__file__).parents[1], "digest", "--date", "2026-11-10").stdout
+    finally:
+        real.unlink()
+    assert "kept the open backbone" in text and "open ticket" in text, text
+    assert "private" not in text and "stretch decision" not in text and "after the period" not in text, text
+
+
 def test_private_command():
     plugin = copy_of(Path(tempfile.mkdtemp()))
     real = HOME / ".claude/private-sessions.txt"

@@ -133,9 +133,11 @@ function render(v) {
   const later = v.tickets.filter(t => t.status === "needs-owner" && t.can_wait);
   const decided = v.tickets.filter(t => t.status === "ready");
   const running = v.tickets.filter(t => t.status === "doing" || t.status === "verify");
+  const paused = v.tickets.filter(t => t.status === "paused");
+  const trail = v.trail || [];
   const people = Object.entries(sessions);
   const at = v.attention || {};
-  const notes = [[at.gone, "with the asking session gone"], [at.returned, "returned 3 times"], [v.counts.blocked, "blocked"]].filter(([n]) => n).map(([n, s]) => `${n} ${s}`);
+  const notes = [[at.gone, "with the asking session gone"], [at.returned, "returned 3 times"], [v.counts.blocked, "blocked"], [at.stale_paused, "paused over 3 days"]].filter(([n]) => n).map(([n, s]) => `${n} ${s}`);
   const parts = [
     el("section", {}, el("h2", {}, `Needs your answer (${needs.length})`),
       needs.length ? needs.map(t => waiting(v, t, q[t.id])) : el("p", { class: "empty" }, "Nothing is waiting on you.")),
@@ -150,6 +152,14 @@ function render(v) {
       el("div", { class: "card" }, running.map(t => el("div", { class: "line" },
         el("span", { class: "title" }, t.title), el("span", { class: "meta" }, `${t.status} · ${who(t)}`),
         t.last_line ? el("span", { class: "meta" }, t.last_line) : null)))) : null,
+    paused.length ? el("section", {}, el("h2", {}, `Paused, for a later session (${paused.length})`),
+      el("div", { class: "card" }, paused.map(t => el("div", { class: "line" },
+        el("span", { class: "title" }, t.title),
+        el("span", { class: `meta${t.changed_s > 3 * 86400 ? " late" : ""}` }, `${who(t)} · paused ${age(t.changed_s)} ago`))))) : null,
+    trail.length ? el("section", {}, el("h2", {}, `Decided by sessions (${v.trail_7d} in 7 days)`),
+      el("div", { class: "card" }, trail.map(r => el("div", { class: "line" },
+        el("span", { class: "title" }, r.decision),
+        el("span", { class: "meta" }, `${r.result} · ${r.phase} · ${r.who} · ${r.ts.slice(0, 16).replace("T", " ")} UTC`))))) : null,
     people.length ? el("section", {}, el("h2", {}, `Sessions (${people.length})`),
       el("div", { class: "card" }, people.map(([sid, s]) => {
         const n = v.tickets.filter(t => t.session === sid && t.status !== "done").length;

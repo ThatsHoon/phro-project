@@ -11,6 +11,10 @@ each other's files. Output is paths and counts, never ticket bodies.
   queue.py move <root> <id> <status> [--priority N] [--session UUID]
   queue.py done <root> <id>
   queue.py drop <root> <id>        the owner removes a waiting question (closed with a record line)
+  queue.py log <root> --session UUID --phase P --decision D --why W --evidence E --result R [--supersedes TS]
+                                   one row of the decision trail, queue/trail.tsv, append-only
+  queue.py pause <root> --session UUID --note FILE (--title T | --ticket ID) [--priority N]
+                                   unfinished work any later session may pick up; the note needs ## Goal, ## Verified, ## Next, ## Files
   queue.py board <root>
   queue.py deliver <root> <id>     prints SEND<TAB>local_<UUID><TAB><message> for the asking session
   queue.py sessions <root>         repairs ticket session values to bare UUIDs
@@ -24,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -31,7 +36,7 @@ import once
 
 QUEUE = "queue"
 PLUGIN = Path(__file__).resolve().parents[1]
-STATES = ("new", "researching", "ready", "doing", "verify", "done", "needs-owner", "blocked")
+STATES = ("new", "researching", "ready", "doing", "verify", "done", "needs-owner", "blocked", "paused")
 FIELDS = ("status", "waiting_on", "priority", "priority_reason", "session", "links", "returns")
 OPTIONAL = ("default",)
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -43,6 +48,15 @@ ASKING_TURN_TAIL_S = 300
 CLOSE_OR_SHRINK = "Close this ticket or shrink it to one step?"
 CLOSE_OPTIONS = ["A: close it", "B: shrink it to one step"]
 LINE_MAX = 120
+TRAIL = "trail.tsv"
+TRAIL_COLS = ("ts", "session", "phase", "decision", "why", "evidence", "result")
+TRAIL_SHOWN = 8
+CELL_MAX = 300
+PHASE_MAX = 40
+TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+NOTE_HEADS = ("Goal", "Verified", "Next", "Files")
+STALE_PAUSED_S = 3 * 86400
+PICKUP_SHOWN = 3
 
 
 class Refused(Exception):
@@ -193,6 +207,21 @@ def session_info(root, sid):
     return {"title": clean(title)[:80] or sid[:8], "last_active": mtime, "gone": False}
 
 
+def trail_rows(root):
+    try:
+        lines = (qdir(root) / TRAIL).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [dict(zip(TRAIL_COLS, l.split("\t"))) for l in lines[1:] if l.count("\t") == len(TRAIL_COLS) - 1]
+
+
+def trail_time(row):
+    try:
+        return datetime.strptime(row["ts"], TS_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+    except (KeyError, ValueError):
+        return 0
+
+
 def plugin_name():
     try:
         return json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))["name"]
@@ -226,12 +255,16 @@ def board(root):
         last = sessions.get(r["session"], {}).get("last_active")
         r["still_working"] = bool(r["status"] == "needs-owner" and last and last > now - r["changed_s"] + ASKING_TURN_TAIL_S)
     open_rows = [r for r in rows if r["status"] != "done"]
-    attention = {"gone": sum(1 for r in open_rows if sessions[r["session"]]["gone"]),
+    attention = {"gone": sum(1 for r in open_rows if r["status"] != "paused" and sessions[r["session"]]["gone"]),
                  "returned": sum(1 for r in open_rows if r["returns"] >= 3),
-                 "stale_ready": sum(1 for r in rows if r["status"] == "ready" and r["changed_s"] > 86400)}
+                 "stale_ready": sum(1 for r in rows if r["status"] == "ready" and r["changed_s"] > 86400),
+                 "stale_paused": sum(1 for r in rows if r["status"] == "paused" and r["changed_s"] > STALE_PAUSED_S)}
+    recent = [r for r in trail_rows(root) if trail_time(r) >= week]
+    titles = {sid: session_info(root, sid)["title"] for sid in {r["session"] for r in recent[-TRAIL_SHOWN:]}}
+    trail = [{k: r[k] for k in ("ts", "phase", "decision", "result")} | {"who": titles[r["session"]]} for r in recent[-TRAIL_SHOWN:]][::-1]
     data = {"generated": int(now), "counts": counts, "closed_7d": closed, "inbox": f"/{plugin_name()}:inbox",
             "script": Path(__file__).resolve().as_posix(), "root": Path(root).resolve().as_posix(),
-            "attention": attention, "sessions": sessions, "tickets": rows}
+            "attention": attention, "sessions": sessions, "tickets": rows, "trail_7d": len(recent), "trail": trail}
     write_atomic(qdir(root) / "board.json", json.dumps(data, ensure_ascii=False, indent=1) + "\n")
     return data
 
@@ -398,7 +431,7 @@ def ticket_path(root, tid):
     return p
 
 
-def save(root, path, t, message):
+def save(root, path, t, message, also=()):
     text = render_ticket(t)
     try:
         back = parse_ticket(text, path.stem)
@@ -406,8 +439,11 @@ def save(root, path, t, message):
         raise Refused(f"a field would not read back: {e}")
     if any(back[k] != t[k] for k in back if k != "id"):
         raise Refused("a field would not read back the same: keep titles, options, reasons and answers on one line")
+    for rel, body in also:
+        (qdir(root) / rel).parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(qdir(root) / rel, body)
     write_atomic(path, text)
-    commit(root, message, [f"tickets/{path.name}"])
+    commit(root, message, [f"tickets/{path.name}", *(rel for rel, _ in also)])
     return path
 
 
@@ -505,6 +541,83 @@ def cmd_drop(a):
     return save(a.root, path, t, f"drop {path.stem}"), None
 
 
+def cell(name, value, limit=CELL_MAX):
+    v = re.sub(r"[\t\r\n]+", " ", str(value)).strip()
+    if not v:
+        raise Refused(f"--{name} is empty: say it in a few words")
+    if len(v) > limit:
+        raise Refused(f"--{name} is {len(v)} characters, over {limit}: put the detail in a file and point at it with --evidence")
+    return "'" + v if v[0] in "=+-@" else v
+
+
+def cmd_log(a):
+    sid = norm_session(a.session)
+    path = qdir(a.root) / TRAIL
+    rows = trail_rows(a.root)
+    decision = cell("decision", a.decision)
+    if a.supersedes:
+        hits = [r for r in rows if r["ts"] == a.supersedes.strip()]
+        if len(hits) != 1:
+            raise Refused(f"{len(hits)} trail rows at {a.supersedes!r}: copy the ts of the row being corrected from {path.as_posix()}")
+        decision = cell("decision", f"supersedes {hits[0]['ts']}: {decision}", CELL_MAX + 40)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    last = max((trail_time(r) for r in rows), default=0)
+    if now.timestamp() <= last:
+        now = datetime.fromtimestamp(last, timezone.utc) + timedelta(seconds=1)
+    ts = now.strftime(TS_FORMAT)
+    row = [ts, sid, cell("phase", a.phase, PHASE_MAX), decision, cell("why", a.why), cell("evidence", a.evidence), cell("result", a.result)]
+    head = "" if path.exists() and path.stat().st_size else "\t".join(TRAIL_COLS) + "\n"
+    with path.open("a", encoding="utf-8", newline="\n") as f:
+        f.write(head + "\t".join(row) + "\n")
+    commit(a.root, f"log {row[2]}", [TRAIL])
+    return path, ts
+
+
+def note_sections(text):
+    found = {}
+    for part in re.split(r"(?m)^(?=## )", text.replace("\r\n", "\n")):
+        if part.startswith("## "):
+            head, _, body = part[3:].partition("\n")
+            found[head.strip()] = body.strip()
+    return found
+
+
+def cmd_pause(a):
+    note = Path(a.note)
+    try:
+        text = note.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
+    except OSError:
+        raise Refused(f"cannot read {note.as_posix()}: write the note first, with " + ", ".join(f"## {h}" for h in NOTE_HEADS))
+    found = note_sections(text)
+    missing = [f"## {h}" for h in NOTE_HEADS if not found.get(h)]
+    if missing:
+        raise Refused(f"the note {note.as_posix()} has no text under {', '.join(missing)}: add it, then pause again")
+    sid = norm_session(a.session)
+    if a.ticket:
+        path = ticket_path(a.root, a.ticket)
+        t = read_ticket(path)
+        if t["status"] == "done":
+            raise Refused(f"ticket {a.ticket} is done: pause new work with --title")
+    else:
+        if not a.title:
+            raise Refused("--title or --ticket is needed")
+        tickets = qdir(a.root) / "tickets"
+        path = tickets / f"{slug(a.title, time.strftime('%Y%m%d'), tickets)}.md"
+        goal = re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", next(l.strip() for l in found["Goal"].splitlines() if l.strip()))
+        t = {"title": a.title, "status": "paused", "waiting_on": "agent", "priority": a.priority or 2,
+             "priority_reason": "paused by its session", "session": sid, "links": [], "returns": 0, "default": "",
+             "question": clean(goal)[:LINE_MAX * 2], "options": [], "decisions": []}
+    rel = f"notes/{path.stem}.md"
+    link = f"{QUEUE}/{rel}"
+    t["links"] = t["links"] + ([link] if link not in t["links"] else [])
+    t["session"] = sid
+    if a.priority:
+        t["priority"] = a.priority
+    if t["status"] != "paused":
+        set_status(t, "paused")
+    return save(a.root, path, t, f"pause {path.stem}", also=[(rel, text.rstrip("\n") + "\n")]), None
+
+
 def cmd_board(a):
     data = board(a.root)
     return qdir(a.root) / "board.json", f"{len(data['tickets'])} tickets"
@@ -555,7 +668,13 @@ RULE = ("When you need the owner's decision, open a ticket with `{queue} ask {ro
         "When you go past your own ticket, close it with `{queue} done {root} <id>`, or decide it with --text \"self: <what you did>\". "
         "When the owner answers here a ticket another session owns, record it with decide, run `{queue} deliver {root} <id>` "
         "and send the printed message to the printed session; do not do that ticket's work here. "
-        "If an answer names no ticket id and this session owns no waiting ticket, ask the owner for the id in one line.")
+        "If an answer names no ticket id and this session owns no waiting ticket, ask the owner for the id in one line. "
+        "In a run nobody watches, or work that will span sessions, record each fork, revert, finished unit and stop with "
+        "`{queue} log {root} --session {sid} --phase <p> --decision <what> --why <why> --evidence <path, commit or command> --result <state>`; "
+        "correct a wrong row with a new one, --supersedes <its ts>. "
+        "To leave unfinished work for a later session, only when the owner says so or this session must end, write a note with "
+        "## Goal, ## Verified, ## Next and ## Files, then run `{queue} pause {root} --session {sid} --note <file> --title <title>` "
+        "(or --ticket <id> for a ticket you hold).")
 
 
 def find_root(start):
@@ -576,10 +695,16 @@ def hook_lines(event):
         rule = RULE.format(queue=queue, root=r, sid=sid)
         if once.needed(sid, "queue", rule, event.get("source")):
             out.append(rule)
-        mine = [t for t in rows if t.get("session") == sid and t.get("status") in ("needs-owner", "doing", "verify", "blocked")]
+        mine = [t for t in rows if t.get("session") == sid and t.get("status") in ("needs-owner", "doing", "verify", "blocked", "paused")]
         if mine:
             out.append("Your open tickets: " + ", ".join(f"{t['id']} ({t.get('status')})" for t in mine[:8])
                        + ". Close any you already went past, as the rule says.")
+        paused = [t for t in rows if t.get("status") == "paused" and t.get("session") != sid]
+        if paused and event.get("source") in ("startup", "clear", None):
+            for t in paused[:PICKUP_SHOWN]:
+                out.append(f'Paused work: {t["id"]} "{clean(t.get("title"))[:80]}", note {(qdir(root) / "notes" / (t["id"] + ".md")).as_posix()}.')
+            out.append(f"Pick paused work up only when the owner asks for it: run {queue} move {r} <id> doing --session {sid}, read its note, "
+                       "check what the note calls verified on the real files, and go on from its next step without redoing the rest.")
     for t in rows:
         if t.get("session") == sid and t.get("status") == "ready":
             path = (qdir(root) / "tickets" / f"{t['id']}.md").as_posix()
@@ -632,6 +757,15 @@ def main(argv=None):
     s = sub.add_parser("done"); s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_done)
     s = sub.add_parser("drop", help="the owner removes a waiting question; closes it with a record line")
     s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_drop)
+    s = sub.add_parser("log", help="one row of the decision trail, append-only")
+    s.add_argument("root"); s.set_defaults(fn=cmd_log)
+    s.add_argument("--session", required=True); s.add_argument("--phase", required=True); s.add_argument("--decision", required=True)
+    s.add_argument("--why", required=True); s.add_argument("--evidence", required=True, help="a path, commit, URL or command, not prose")
+    s.add_argument("--result", required=True); s.add_argument("--supersedes", help="the ts of the row this one corrects")
+    s = sub.add_parser("pause", help="leave unfinished work, with a resume note, for a later session")
+    s.add_argument("root"); s.set_defaults(fn=cmd_pause)
+    s.add_argument("--session", required=True); s.add_argument("--note", required=True, help="a Markdown file with ## Goal, ## Verified, ## Next, ## Files")
+    s.add_argument("--title"); s.add_argument("--ticket"); s.add_argument("--priority", **prio)
     s = sub.add_parser("board"); s.add_argument("root"); s.set_defaults(fn=cmd_board)
     s = sub.add_parser("deliver"); s.add_argument("root"); s.add_argument("id"); s.set_defaults(fn=cmd_deliver)
     s = sub.add_parser("sessions"); s.add_argument("root"); s.set_defaults(fn=cmd_sessions)

@@ -236,10 +236,10 @@ def evidence_rules():
               "move every caller and delete the old path in the same change",
               "stays only if a run shows it helped",
               "seen failing once on broken code before it counts",
-              "checked on the real artifact before you build on it or report it",
-              "the check that shows done, the proof to return"):
+              "checked on the real artifact before you build on it or report it"):
         assert s in main and s in sub, s
-    for s in ("the check that will show it done", "never loosen it to finish", "A choice that is cheap to undo is yours",
+    for s in ("the check that shows done, the proof to return", "name the fuller one in one line",
+              "the check that will show it done", "never loosen it to finish", "A choice that is cheap to undo is yours",
               "Never hand the user a check you could run", "ran it, read it (file:line) or inferred",
               "agreeing is not the default"):
         assert s in main and s not in sub, s
@@ -251,6 +251,24 @@ def evidence_rules():
     has_all("skills/grill/SKILL.md", ("A question that a quick run or prototype can settle is a fact too",))
     has_all("skills/design/SKILL.md", ("the rule was the symptom", "names what is wrong, where, and the next step",
                                        "stops the run before any side effect", "`echo-description`"))
+
+
+def long_run_rules():
+    import lean
+    main, sub = lean.main_text(), lean.sections(SKILL.read_text(encoding="utf-8"), lean.SUB)
+    for s in ("search the git log and the project's problem log for earlier attempts, and start where the last one failed",
+              "a number that looks too good, is checked for what else it measured",
+              "the rest of that work is taken as given, not redone",
+              "units, each ending in a check run before the next starts",
+              "a rerunnable script, proven first on one unit by hand",
+              "what must outlive this context goes to a file, not the chat"):
+        assert s in main and s in sub, s
+    has_all("skills/design/SKILL.md", ("| Scheduled run or loop |", "`references/runs.md`"))
+    has_all("skills/design/references/runs.md", ("A duration is not a finish condition", "## Before turning it on",
+                                                 "a minimum number of attempts", "`queue.py log`", "`queue.py pause`",
+                                                 "never a looser check", "stops the run instead of passing it on"))
+    has_all("skills/compass/SKILL.md", ("with no enforcer in parentheses", "--default \"keep the rule as written\"",
+                                        "no open ticket in `queue/board.json` already proposes it", "the tickets opened"))
 
 
 def resume_once():
@@ -315,7 +333,7 @@ def stats():
 
 CHECKS = [session_start, subagent, subagent_no_id, guard, bad_settings, crlf, broken_stdin, fixed_rules,
           toggle, copy_toggle, mention_only, bad_id, guard_toggle, prune, hooks_json, grill_rules, lean_review_rules, review_fixes,
-          comment_rules, evidence_rules, resume_once, read_only_subagent, stats]
+          comment_rules, evidence_rules, long_run_rules, resume_once, read_only_subagent, stats]
 
 
 def main():

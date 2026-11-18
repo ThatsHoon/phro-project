@@ -201,7 +201,12 @@ def commits(root, start, end):
     return [l for l in r.stdout.splitlines() if l.strip()][:40] if r.returncode == 0 else []
 
 
-def tickets(root, start, end):
+def hidden_at(hidden, sid, when):
+    hide = hidden.get(sid, ())
+    return hide is None or any(a <= when < b for a, b in hide)
+
+
+def tickets(root, start, end, hidden=None):
     try:
         board = json.loads((Path(root) / "queue/board.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -209,11 +214,32 @@ def tickets(root, start, end):
     closed, open_ = [], []
     for t in board.get("tickets", []):
         changed = board.get("generated", 0) - t.get("changed_s", 0)
+        if hidden_at(hidden or {}, t.get("session"), datetime.fromtimestamp(changed, timezone.utc)):
+            continue
         if t.get("status") == "done" and start.timestamp() <= changed < end.timestamp():
             closed.append(t["title"])
         elif t.get("status") != "done":
             open_.append(f"{t['title']} ({t['status']})")
     return closed, open_
+
+
+def decisions(root, start, end, hidden=None):
+    try:
+        lines = (Path(root) / "queue/trail.tsv").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[1:]:
+        cells = line.split("\t")
+        if len(cells) != 7:
+            continue
+        try:
+            when = datetime.strptime(cells[0], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if start <= when < end and not hidden_at(hidden or {}, cells[1], when):
+            out.append(f"{cells[3]} ({cells[6]})")
+    return out[-40:]
 
 
 def goals(root):
@@ -234,7 +260,10 @@ def digest(root, day):
     found = commits(root, start, end)
     if found:
         parts += ["# Commits", *(f"- {c}" for c in found)]
-    closed, open_ = tickets(root, start, end)
+    closed, open_ = tickets(root, start, end, hidden)
+    made = decisions(root, start, end, hidden)
+    if made:
+        parts += ["# Decisions sessions made on their own (decision, result)", *(f"- {m}" for m in made)]
     if closed:
         parts += ["# Queue tickets closed", *(f"- {c}" for c in closed)]
     if open_:
@@ -242,7 +271,7 @@ def digest(root, day):
     g = goals(root)
     if g:
         parts += ["# Current goals (docs/core)", g]
-    return "\n".join(parts)[:DIGEST], bool(sessions or found or closed)
+    return "\n".join(parts)[:DIGEST], bool(sessions or found or closed or made)
 
 
 def style():

@@ -27,6 +27,7 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
 | Skill with `disable-model-invocation: true` | Judgement is needed, and it moves files, spends money, or the user always types it | No listing cost, and it never fires by accident |
 | Skill | Judgement is needed, and a user request or a standing rule can name it | Listed by description, read on demand |
 | `paths` on a skill | Only relevant when certain files are in play | Gated without a hook |
+| Scheduled run or loop | It must happen with nobody typing: on a clock, or again and again until a condition holds. Build its prompt by `references/runs.md` | Every pass costs a session, and nobody watches it |
 | Hook | Must react to an event the model will not act on by itself, such as a tool error. Measured misses come first (`route-test`). A hook cannot see a step like "the draft is done": that is a standing rule. Build it by `references/hooks.md` | Runs every time, so it costs every time |
 | MCP | A tool or a live connection that a script run cannot provide, or state shared across calls. Build it by `references/mcp.md` | Costs a server |
 

@@ -8,6 +8,7 @@ This is not an import of pstack skills. It takes apart why pstack's agents do be
 
 - "주석을 통해 상태를 기록하고 추후 작업에 참고하는 식의 플로우 … ai의 회피 편향을 기록하고 추후 그것을 정당화해가는 맥락으로 구축하여 프로젝트 퀄리티의 한계를 만드니 주석의 99%는 쓰지 않도록 해라."
 - "pstack에서 유용한 스킬 몇 개를 phro-project 내에 장착하는 지시가 아님. pstack에서 agentic 개발 방식에서 agent를 보다 똑똑하게 작업시키기 위한 개발 원칙이나 철학을 해체하여 이해한 뒤에 phro-project에 반영하는 것임."
+- "다시 한 번 프로젝트를 장기적으로 끌고 나가는 agentic 활용및 방침 고도화 측면에서 patack에서 놓친 부분은 없는지 전체적으로 점검하고 개선 진행해" (0.22.0, Part 4)
 
 ## Part 1. The model of an agent behind pstack
 
@@ -57,15 +58,41 @@ The code follows the same laws: every error names what is wrong, where and the n
 5. Evals the candidate cannot recognize: `check` flags `leaky-case`.
 6. Whether lean holds: `lean.py stats`.
 
+## Part 4. Carrying a project over months (0.22.0)
+
+Parts 2 and 3 cover one session. A project that runs for months also needs what pstack builds for runs nobody watches and for work that crosses sessions: the overnight contract, autonomous-run, show-me-your-work, pause-safely, session-pickup, recall, correct, hillclimb and benny. The gaps below were checked against the one project that uses this plugin daily.
+
+| pstack idea | phro-project before | Gap seen in real use | Change |
+|---|---|---|---|
+| The overnight contract, autonomous-run, earn trust before the loop, hillclimb, benny (laws 3, 4, 5) | design places skills, hooks, scripts and MCP; nothing for a run with nobody typing | The project's hourly unattended loop was built by hand: its plan has steps but no run-level finish condition, no budget per pass and no record format | design row "Scheduled run or loop" and `references/runs.md`: four trust conditions before turning it on; a prompt with the goal and a checkable finish condition (a duration is not one), a "nothing to do" exit, what it does without asking and what becomes a ticket with a default, a claim before work, a budget per pass, one change, one check and one trail row per step, a plateau that changes the approach and never loosens the check, evidence handed between steps and a stop when a step cannot show its output, and dead ends written to a ticket. A run that improves a number freezes its measurement, takes a baseline first, and sets a target with a minimum number of attempts |
+| show-me-your-work (law 7) | 0.21.0 made reversible calls the agent's own | Autonomy with no record: what a session decided alone is only in transcripts, which no tool may read as text | `queue.py log`: append-only `queue/trail.tsv` (ts, session, phase, decision, why, evidence, result), committed. A wrong row is corrected by a new row that supersedes it by ts. One line per cell, at most 300 characters, detail in a file named by evidence; a cell a spreadsheet would run is quoted; ts strictly increases. The board shows decision, result, phase and session for 7 days; daily reads decision and result |
+| pause-safely, session-pickup (law 7) | Nothing; handoffs written by hand | Two hand-written handoff documents, several status files and a memory pointing at a handoff three weeks old; nothing told a new session they existed | `queue.py pause` with a note that must hold Goal, Verified, Next and Files; the ticket becomes `paused`. A new session, not a compaction or resume, sees other sessions' paused tickets; it takes one only on the owner's word, checks what the note calls verified, and does not redo the rest. The board counts pauses older than 3 days |
+| correct, encode-lessons-in-structure (law 6) | Answer proposes an enforcement when the user corrects a mistake a rule covers | The proposal waits for the user to notice; a rule broken in a run nobody watched is never raised | compass refresh: each work rule with no enforcer is checked against the problem log, reverts and feedback memories; a repeat opens a can-wait ticket proposing an enforcement, default "keep the rule as written", never a second ticket for the same rule |
+| recall (law 7) | Build: root cause | A fix starts from nothing although the problem log or git holds the last failed attempt | Build: before the first fix, search the git log and the problem log and start where the last attempt failed |
+| explain-the-number, figure-it-out (law 2) | Build: a check seen failing | A check that passes too easily, or a number too good, is accepted | Build: it is checked for what else it measured |
+| session-pickup, "the trail is authoritative" (law 7) | Build: inherited claims checked | Checking turns into redoing | Build: the rest of that work is taken as given, not redone |
+| sequence-verifiable-units, build-the-lever, guard-the-context-window (laws 3, 4) | Nothing | Long sessions make the same edit by hand in many files and keep state only in the chat, which a compaction cuts | Build: long work in units that each end in a check; a repeated edit through a rerunnable script proven on one unit by hand; what must outlive the context in a file |
+
+The always-on text kept its byte caps (main session 6000, subagent 4000). Two main-only rules moved from Build to Answer to make room: the minimal version with the fuller one named, and the shape of a subagent brief. A subagent spawns no subagents and takes its scope from its brief, so neither applies to it.
+
+Two defects came out of this round. daily put the titles of tickets from private sessions into its prompt; tickets and trail rows now pass the same private filter as transcripts. The board counted a paused ticket as "asking session gone", although a session that pauses is meant to end; paused tickets are left out of that count.
+
 ## Not taken, with the reason
 
 - pstack's skills themselves, its model panels and multi-vendor reviewers, and Cursor-only features.
 - Its autonomy defaults that act outward without asking (posting, PRs opened ready): this user's standing rules keep pushes and outward actions on the user's word.
-- A decision-log skill for overnight runs: the queue holds decisions, git holds the trail, and no autonomous run has needed more yet.
+- A decision log was not taken in 0.21.0 ("the queue holds decisions, git holds the trail"). Reversed in 0.22.0: 0.21.0 made reversible calls the agent's own, the project already runs an unattended loop, and git holds what changed, not why. It is a queue command, not a skill.
+- Cross-model review and show-me-your-work's Attention section: one model family is in use. The board shows the trail without why or evidence, and the owner opens `trail.tsv` for those.
+- A wip commit on pause: commits wait for the owner's word, and the project that uses this most is not a git repository. The note's Files section names what changed.
+- Progress kept in memory: memory holds lasting facts; progress goes to the trail and pause notes, which carry a date and an owner.
+- Evidence and risk fields on tickets: a ticket stays a question; evidence goes in trail rows.
+- worktree-audit and maintain-verification: worktrees belong to the harness and the branch-finishing skill, and no stale verification has been seen.
+- A rule to retry a failed subagent with a fresh one: one case, not measured.
+- Paused work and the trail in the queue panel: the board page shows them, and the panel waits until someone asks.
 - Naming every applied principle in each reply: it costs words in every answer, and `lean.py stats` and `compass usage` already measure rule use without it.
 - A ratchet baseline for `check`: four findings exist, all in the reader under work on other branches; a baseline file would make them look accepted.
 - Lint suppressions as a comment exception: a suppression on the line is accepted state in a comment, which the owner's directive rules out.
-- daily's sources: it reads commits and tickets with the session tails; it is a status note the owner reads, not a proof.
+- daily as proof: it reads commits, tickets and trail decisions with the session tails; it is a status note the owner reads, not a proof.
 
 ## Tests
 
@@ -74,4 +101,7 @@ The code follows the same laws: every error names what is wrong, where and the n
 - `test_project.py`: every check finding prints a fix; `echo-description` fires on a body that repeats its description and not on one that does not.
 - `test_restructure.py`: the lint line it compares carries the fix column.
 - The whole suite after the comment removal, with no change in behavior. Each deleted comment that guarded a constraint is either covered by a test that fails when the constraint breaks (the manifest read before the move, private session titles, both shown failing on a broken copy) or gets one: `test_read_cli.py` keeps document text out of an internal error, and `test_project.py` keeps the catch-all error kind last.
-- Every new test above was run once on a broken copy of the code and failed there.
+- `test_queue.py` (0.22.0): `log` quotes formula cells, appends, supersedes one exact ts, refuses empty and overlong cells, keeps ts increasing; `pause` checks the note's headings, refuses done work, shows pickup to new sessions of others only, and the board counts stale pauses without counting them as gone.
+- `test_daily.py` (0.22.0): trail decisions in the period reach the digest; private sessions and stretches hide their decisions and ticket titles.
+- `test_lean.py` (0.22.0): the long-run Build rules reach both roles, the moved rules reach the main session only, the byte caps hold, and the runs reference, design row and compass sweep keep their key lines.
+- Every new test above was run once on a broken copy of the code and failed there: 12 mutants of `queue.py`, 6 of `daily.py` and 6 of the skill texts in 0.22.0.

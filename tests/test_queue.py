@@ -342,8 +342,8 @@ def test_hook_routing():
     queue_py = SCRIPT.as_posix()
     start = hook(root, A, "SessionStart")
     assert f"--session {A}" in start and queue_py in start, start
-    commands = [c.split(" <")[0] for c in re.findall(r"`([^`]*queue\.py[^`]*)`", start)]
-    assert len(commands) == 4, start
+    commands = [re.sub(r"\s--[a-z]+$", "", c.split(" <")[0]) for c in re.findall(r"`([^`]*queue\.py[^`]*)`", start)]
+    assert len(commands) == 6, start
     for c in commands:
         ran = subprocess.run(shlex.split(c) + ["--help"], capture_output=True, text=True, encoding="utf-8", env=ENV)
         assert ran.returncode == 0 and "usage:" in ran.stdout, c + ran.stderr
@@ -474,6 +474,86 @@ def test_drop():
     assert hook(root, A, "UserPromptSubmit", "hi") == ""
     data = board(root)
     assert data["script"] == SCRIPT.as_posix() and data["root"] == root.resolve().as_posix(), "the panel's drop button runs these"
+
+
+def test_log():
+    root = fresh()
+
+    def log(*extra, decision="kept the small backbone", evidence="runs/s0/metrics.json"):
+        return q(root, "log", "--session", A, "--phase", "sweep", "--decision", decision, "--why", "same score, half the memory",
+                 "--evidence", evidence, "--result", "kept", *extra)
+
+    first = log()
+    assert first.returncode == 0, first.stdout
+    ts = first.stdout.strip().split("\t")[-1]
+    second = log(decision="=SUM(A1)", evidence="@runs/s0")
+    assert second.stdout.strip().split("\t")[-1] > ts, "every row gets its own later ts, even in the same second"
+    lines = (root / "queue/trail.tsv").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "ts\tsession\tphase\tdecision\twhy\tevidence\tresult" and len(lines) == 3, lines
+    assert lines[2].split("\t")[3] == "'=SUM(A1)" and lines[2].split("\t")[5] == "'@runs/s0", "a cell a spreadsheet would run is quoted"
+    fix = log("--supersedes", ts, decision="kept the large backbone")
+    assert fix.returncode == 0 and f"supersedes {ts}: kept the large backbone" in (root / "queue/trail.tsv").read_text(encoding="utf-8")
+    assert (root / "queue/trail.tsv").read_text(encoding="utf-8").splitlines()[:3] == lines, "append-only: old rows never change"
+    for bad, why in ((log("--supersedes", "2020-01-01T00:00:00Z"), "0 trail rows"), (log(decision="line\n" * 200), "over 300"),
+                     (log(evidence="  "), "--evidence is empty")):
+        assert bad.returncode == 1 and why in bad.stdout, bad.stdout
+    assert len((root / "queue/trail.tsv").read_text(encoding="utf-8").splitlines()) == 4, "a refused row writes nothing"
+    assert git(root, "log", "-1", "--format=%s").strip() == "log sweep" and "trail.tsv" in git(root, "ls-files")
+    data = board(root)
+    assert data["trail_7d"] == 3 and data["trail"][0]["decision"].startswith("supersedes") and data["trail"][0]["who"] == A[:8], data["trail"]
+    assert set(data["trail"][0]) == {"ts", "phase", "decision", "result", "who"}, "the board never carries why or evidence"
+
+
+def test_log_order():
+    root = fresh()
+    ahead = "2999-01-01T00:00:00Z"
+    (root / "queue/trail.tsv").write_text("ts\tsession\tphase\tdecision\twhy\tevidence\tresult\n"
+                                          f"{ahead}\t{A}\tsweep\tclock ahead\tw\te\tr\n", encoding="utf-8")
+    r = q(root, "log", "--session", A, "--phase", "sweep", "--decision", "d", "--why", "w", "--evidence", "e", "--result", "r")
+    assert r.stdout.strip().split("\t")[-1] == "2999-01-01T00:00:01Z", "a ts never repeats or goes back, so --supersedes names one row"
+
+
+NOTE = "## Goal\n- move every caller to the new parser\n\n## Verified\n- parser fixtures pass: tests/test_parser.py\n\n## Next\n- callers in src/io\n\n## Files\n- src/parser.py\n"
+
+
+def test_pause_pickup():
+    root = fresh()
+    note = root / "note.md"
+    note.write_text(NOTE.replace("## Next\n- callers in src/io\n", "## Next\n\n"), encoding="utf-8")
+    bad = q(root, "pause", "--session", A, "--note", str(note), "--title", "parser move")
+    assert bad.returncode == 1 and "## Next" in bad.stdout and not list((root / "queue/tickets").glob("*.md")), bad.stdout
+    note.write_text(NOTE, encoding="utf-8")
+    t = path_of(q(root, "pause", "--session", A, "--note", str(note), "--title", "parser move"))
+    kept = root / "queue/notes" / f"{t.stem}.md"
+    assert kept.read_text(encoding="utf-8") == NOTE and "notes/" in git(root, "ls-files"), "the note is the queue's own copy"
+    text = t.read_text(encoding="utf-8")
+    assert "status: paused" in text and "waiting_on: agent" in text and f'"queue/notes/{t.stem}.md"' in text, text
+    data = board(root)
+    assert data["counts"]["paused"] == 1 and not [r for r in data["tickets"] if r["status"] == "needs-owner"]
+    own = hook(root, A, "SessionStart")
+    assert f"{t.stem} (paused)" in own and "Paused work" not in own, "the pausing session sees it as its own, not as work to pick up"
+    fresh_start = hook(root, B, "SessionStart")
+    assert f'Paused work: {t.stem} "parser move", note {kept.resolve().as_posix()}' in fresh_start, fresh_start
+    assert f'move "{root.resolve().as_posix()}" <id> doing --session {B}' in fresh_start and "only when the owner asks" in fresh_start
+    resumed = json.dumps({"session_id": B, "cwd": str(root), "hook_event_name": "SessionStart", "source": "compact"})
+    assert "Paused work" not in hook(root, B, "SessionStart", stdin=resumed), "a compaction is the same session going on"
+    path_of(q(root, "move", t.stem, "doing", "--session", B))
+    assert "Paused work" not in hook(root, B, "SessionStart") and "Paused work" not in hook(root, A, "SessionStart")
+    path_of(q(root, "pause", "--session", B, "--note", str(note), "--ticket", t.stem))
+    assert "status: paused" in t.read_text(encoding="utf-8") and t.read_text(encoding="utf-8").count("queue/notes/") == 1
+    path_of(q(root, "done", t.stem))
+    assert q(root, "pause", "--session", B, "--note", str(note), "--ticket", t.stem).returncode == 1, "done work is not paused again"
+
+
+def test_stale_paused():
+    root = fresh()
+    (root / "note.md").write_text(NOTE, encoding="utf-8")
+    t = path_of(q(root, "pause", "--session", A, "--note", str(root / "note.md"), "--title", "old pause"))
+    old = time.time() - 4 * 86400
+    os.utime(t, (old, old))
+    path_of(q(root, "board"))
+    at = board(root)["attention"]
+    assert at["stale_paused"] == 1 and at["gone"] == 0, "a paused session is meant to be gone"
 
 
 def main():
