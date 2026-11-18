@@ -312,3 +312,82 @@ def plus_image_bitmap(oid, data: bytes) -> bytes:
 def plus_draw_image(oid, x, y, w, h) -> bytes:
     """EmfPlusDrawImage of image `oid` into the rectangle (x, y, w, h)."""
     return plus_rec(0x401A, oid, struct.pack("<Ii4f4f", 0xFFFFFFFF, 2, 0, 0, 1, 1, x, y, w, h))
+
+
+# ---- TrueType fonts -----------------------------------------------------------------------------------------------
+
+def _cmap4(cmap: dict, ranged: bool) -> bytes:
+    """A format 4 subtable for the BMP part of cmap. One segment per code point; with `ranged` each segment reads its
+    glyph through idRangeOffset and the glyph id array instead of idDelta."""
+    items = sorted((c, g) for c, g in cmap.items() if c <= 0xFFFF and c != 0xFFFF)
+    segs = [(c, c, g) for c, g in items] + [(0xFFFF, 0xFFFF, 0)]
+    n = len(segs)
+    ends = b"".join(struct.pack(">H", e) for _, e, _ in segs)
+    starts = b"".join(struct.pack(">H", s) for s, _, _ in segs)
+    if ranged:
+        deltas = b"\0\0" * n
+        # idRangeOffset[i] points at glyph array slot i: (n - i) words from its own entry, then i words in
+        ros = b"".join(struct.pack(">H", 2 * (n - i) + 2 * i) for i in range(n))
+        garr = b"".join(struct.pack(">H", g) for _, _, g in segs)
+    else:
+        deltas = b"".join(struct.pack(">H", (g - s) & 0xFFFF if s != 0xFFFF else 1) for s, _, g in segs)
+        ros = b"\0\0" * n
+        garr = b""
+    body = struct.pack(">HHHH", n * 2, 0, 0, 0) + ends + b"\0\0" + starts + deltas + ros + garr
+    return struct.pack(">HHH", 4, 6 + len(body), 0) + body
+
+
+def _cmap12(cmap: dict) -> bytes:
+    groups = b"".join(struct.pack(">III", c, c, g) for c, g in sorted(cmap.items()))
+    return struct.pack(">HHIII", 12, 0, 16 + len(groups), 0, len(cmap)) + groups
+
+
+def _name_table(family: str, full: str, extra) -> bytes:
+    recs = [(3, 1, 0x409, 1, family.encode("utf-16-be")), (3, 1, 0x409, 4, full.encode("utf-16-be"))]
+    for plat, enc, nid, s in extra:
+        recs.append((plat, enc, 0x409 if plat == 3 else 0, nid, s.encode("mac_roman" if plat == 1 else "utf-16-be")))
+    head = struct.pack(">HHH", 0, len(recs), 6 + 12 * len(recs))
+    strings = b""
+    out = b""
+    for plat, enc, lang, nid, raw in recs:
+        out += struct.pack(">HHHHHH", plat, enc, lang, nid, len(raw), len(strings))
+        strings += raw
+    return head + out + strings
+
+
+def ttf(family: str, cmap: dict[int, int], full: str | None = None, extra_names=(), ranged=False, base=0) -> bytes:
+    """A minimal TrueType font: table directory, `name` (IDs 1 and 4, platform 3) and `cmap` (format 4, and
+    format 12 when a code point is above 0xFFFF). `extra_names` adds (platform, encoding, id, text) records.
+    `base` is where the font starts inside a collection (table offsets are from the start of the file)."""
+    subs = [(3, 1, _cmap4(cmap, ranged))]
+    if any(c > 0xFFFF for c in cmap):
+        subs.append((3, 10, _cmap12(cmap)))
+    off = 4 + 8 * len(subs)
+    head = struct.pack(">HH", 0, len(subs))
+    body = b""
+    for plat, enc, data in subs:
+        head += struct.pack(">HHI", plat, enc, off + len(body))
+        body += data
+    cm = head + body
+    nm = _name_table(family, full or family, extra_names)
+    start = base + 12 + 16 * 2
+    pad = lambda b: b + b"\0" * (-len(b) % 4)  # noqa: E731
+    out = struct.pack(">IHHHH", 0x00010000, 2, 0, 0, 0)
+    out += b"cmap" + struct.pack(">III", 0, start, len(cm))
+    out += b"name" + struct.pack(">III", 0, start + len(pad(cm)), len(nm))
+    return out + pad(cm) + pad(nm)
+
+
+def ttc(specs: list[tuple]) -> bytes:
+    """A TrueType collection from (family, cmap) pairs."""
+    head = 12 + 4 * len(specs)
+    bases, fonts = [], []
+    pos = head
+    for fam, cm in specs:
+        bases.append(pos)
+        f = ttf(fam, cm, base=pos)
+        f += b"\0" * (-len(f) % 4)
+        fonts.append(f)
+        pos += len(f)
+    return b"ttcf" + struct.pack(">II", 0x00010000, len(specs)) + b"".join(struct.pack(">I", b) for b in bases) \
+        + b"".join(fonts)
