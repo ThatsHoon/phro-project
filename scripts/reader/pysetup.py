@@ -1,4 +1,5 @@
-"""Creating an optional venv (kind "pdf": pypdfium2; kind "mpp": MPXJ and JPype, with a Java found on PATH).
+"""Creating an optional venv (kind "pdf": pypdfium2; kind "mpp": MPXJ and JPype, with a Java found on PATH;
+kind "image": resvg_py and Pillow, not on Windows, where GDI+ draws pictures).
 Runs only from `read.py setup`: nothing else imports it.
 
 Each step that touches the system sits in `Steps`, so tests replace them with stubs.
@@ -123,6 +124,37 @@ class MppSteps(Steps):
         return r.returncode == 0 and "phro-mpp-ok" in r.stdout
 
 
+# Run in the venv with -I -c: resvg_py draws a one-line SVG with text, and the answer must be a PNG.
+SMOKE_IMAGE = (
+    "import resvg_py\n"
+    "svg = ('<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"32\">'\n"
+    "       '<rect width=\"120\" height=\"32\" fill=\"#ffffff\"/>'\n"
+    "       '<text x=\"4\" y=\"22\" font-size=\"16\" font-family=\"sans-serif\">phro smoke</text></svg>')\n"
+    "png = bytes(resvg_py.svg_to_bytes(svg_string=svg))\n"
+    "assert png[:8] == b'\\x89PNG\\r\\n\\x1a\\n' and len(png) > 80\n"
+    "print('phro-image-ok')\n")
+
+
+class ImageSteps(Steps):
+    """Steps for kind "image": the versions of resvg-py and pillow, and a smoke render of one line of text."""
+
+    def versions(self, python):
+        code = ("import json; from importlib.metadata import version as v; "
+                "print(json.dumps([v('resvg-py'), v('pillow')]))")
+        r = _run([str(python), "-I", "-X", "utf8", "-c", code])
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip())
+        resvg, pillow = json.loads(r.stdout.strip().splitlines()[-1])
+        return resvg, pillow, pyenv.record_digests(Path(python).parent.parent, "image")
+
+    def smoke(self, python):
+        try:
+            r = _run([str(python), "-I", "-X", "utf8", "-c", SMOKE_IMAGE], timeout=SMOKE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return r.returncode == 0 and "phro-image-ok" in r.stdout
+
+
 def _flat(text, limit=300) -> str:
     return " ".join(str(text).split())[:limit]
 
@@ -211,7 +243,9 @@ def _clean_leftovers(venv: Path, tmp: Path) -> None:
 
 def setup(venv, steps=None, kind="pdf") -> str:
     pyenv._check(kind)
-    steps = steps or (MppSteps() if kind == "mpp" else Steps())
+    if kind == "image" and sys.platform == "win32":  # before anything is made: GDI+ draws pictures there
+        return "FAIL\timage\tthe image venv is not needed on Windows (GDI+ draws pictures)"
+    steps = steps or {"mpp": MppSteps, "image": ImageSteps}.get(kind, Steps)()
     java = None
     if kind == "mpp":  # before anything is made: no Java, no folder
         java = steps.java()
@@ -266,12 +300,16 @@ def _build(venv: Path, tmp: Path, steps, kind="pdf", java=None) -> str:
     except Exception as e:  # noqa: BLE001
         return f"FAIL\tsmoke\t{_flat(e)}"
     if not smoked:
-        return ("FAIL\tsmoke\tJPype could not start the JVM and load MPXJ" if kind == "mpp"
-                else "FAIL\tsmoke\tthe test page did not read with pdfium")
+        return {"mpp": "FAIL\tsmoke\tJPype could not start the JVM and load MPXJ",
+                "image": "FAIL\tsmoke\tthe test SVG did not render with resvg_py",
+                }.get(kind, "FAIL\tsmoke\tthe test page did not read with pdfium")
     ready = {"kind": kind, "requirements": pyenv.requirements_hash(kind), "python": _python_info(tmp)}
     if kind == "mpp":  # versions() gave (mpxj, jpype1, records)
         ready.update({"mpxj": version, "jpype1": build, "java": java, "records": records})
         engine = pyenv.mpp_engine_id(version, java["major"])
+    elif kind == "image":  # versions() gave (resvg-py, pillow, records)
+        ready.update({"resvg": version, "pillow": build, "records": records})
+        engine = pyenv.image_engine_id(version, build)
     else:
         ready.update({"pypdfium2": version, "pdfium": build, "records": records})
         engine = pyenv.engine_id(version, build)
@@ -308,6 +346,8 @@ def check(venv, kind="pdf") -> str:
     st = pyenv.state(venv, kind)
     if st == "READY":
         ready = pyenv._ready(venv)
+        if kind == "image":
+            return f"READY\t{venv}\t{pyenv.image_engine_id(ready.get('resvg'), ready.get('pillow'))}"
         if kind == "mpp":
             return f"READY\t{venv}\t{pyenv.mpp_engine_id(ready.get('mpxj'), ready['java']['major'])}"
         return f"READY\t{venv}\t{pyenv.engine_id(ready.get('pypdfium2'), ready.get('pdfium'))}"

@@ -3,12 +3,14 @@
 Run: python -I -X utf8 tests/test_reader_raster.py
 Every fixture is built in memory and every PNG is checked in memory.
 """
+import base64
 import os
 import random
 import struct
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path
 
@@ -19,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from metafile_fix import (emf, emf_brush, emf_font, emf_glyphs, emf_pen, emf_rect, emf_textw, pict,  # noqa: E402
                           pict_longtext, pict_op, wmf, wmf_brush, wmf_font, wmf_rect, wmf_select, wmf_text, wmf_window, wpg1,
                           wpg1_fill, wpg1_rect, wpg1_text)
-from reader import emf_write, fonts, images, limits, metafile, raster  # noqa: E402
+from reader import emf_write, fonts, images, limits, metafile, raster, svg_write  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.vector import Bitmap, Brush, Clip, Drawing, Path as VPath, Pen, Run, text_lines  # noqa: E402
 
@@ -203,7 +205,7 @@ def test_kinds_and_garbage_never_raise():
 
 def test_backend_value_cached():
     a = raster.backend()
-    assert a in ("gdiplus", "none")
+    assert a in ("gdiplus", "none") or a.startswith("resvg-"), a
     assert raster.backend() == a
     if WINDOWS:
         assert a == "gdiplus"
@@ -585,6 +587,261 @@ def test_gdiplus_garbage_none():
             f = raster.convert(kind, rnd.randbytes(n))
             assert f.png is None, kind
     assert raster.tiff_pages(rnd.randbytes(100)) == 0
+
+
+# ---- SVG, and the resvg and Pillow backend ----------------------------------------------------------------------------
+
+SVG_NS = "{http://www.w3.org/2000/svg}"
+FAKE_RESVG = "resvg-0.5.0-pillow-12.3.0"
+PNG_HEAD = b"\x89PNG\r\n\x1a\n"
+
+
+def svg_root(d: Drawing, size=(400, 200), resolve=None):
+    return ET.fromstring(svg_write.write(d, size, resolve))
+
+
+def needs_image_venv(fn):
+    def wrapped():
+        if sys.platform == "win32" or raster._load_local() is None:
+            print(f"skip: {fn.__name__} (needs the image venv)")
+            return
+        fn()
+    wrapped.__name__ = fn.__name__
+    return wrapped
+
+
+class fake_resvg:
+    """convert with a resvg backend named and the renderer replaced by `run(jobs, mono)`."""
+
+    def __init__(self, run):
+        self.run = run
+
+    def __enter__(self):
+        self.old = raster.backend, raster._run_jobs
+        raster.backend = lambda: FAKE_RESVG
+        raster._run_jobs = self.run
+
+    def __exit__(self, *exc):
+        raster.backend, raster._run_jobs = self.old
+
+
+def test_svg_parses_as_xml():
+    root = svg_root(sample_drawing())
+    assert root.tag == SVG_NS + "svg"
+    assert root.get("width") == "400" and root.get("height") == "200" and root.get("viewBox") == "0 0 200 100"
+    first = root[0]
+    assert first.tag == SVG_NS + "rect" and first.get("fill") == "#ffffff", first.attrib
+    paths = [e for e in root.iter(SVG_NS + "path") if e.get("fill") is not None]  # not the clipPath ones
+    assert len(paths) == 3
+    assert paths[0].get("stroke") == "#000000" and paths[0].get("fill") == "#cccccc"
+    assert paths[1].get("fill") == "none" and paths[1].get("stroke") == "#ff0000"
+    assert paths[2].get("stroke") == "none" and paths[2].get("fill-rule") == "evenodd"
+    assert paths[0].get("fill-rule") == "nonzero"
+    assert paths[0].get("d").startswith("M10 10 L190 10") and paths[0].get("d").endswith("Z")
+    assert " C" in paths[1].get("d")
+    texts = root.findall(f".//{SVG_NS}text")
+    assert [t.text for t in texts] == ["Sales", "2024", "Q1 120", "up"]
+    t = texts[1]
+    assert t.get("x") == "80" and t.get("y") == "30" and t.get("font-size") == "12"
+    assert t.get("font-weight") == "700" and t.get("font-style") == "normal" and t.get("fill") == "#000000"
+    assert texts[2].get("font-style") == "italic" and texts[2].get("fill") == "#0000ff"
+    assert texts[2].get("font-family") == "Times New Roman, serif"
+    assert texts[0].get("font-family") == "Arial, sans-serif"
+    img = root.find(f".//{SVG_NS}image")
+    assert img.get("href").startswith("data:image/png;base64,") and img.get("width") == "10"
+
+
+def test_svg_escapes_text_and_face():
+    d = Drawing((0, 0, 100, 50), 96.0, [Run('<&"', 5, 20, 'a"b', 10), Run("]]><x/>", 5, 40, "<i>", 10)])
+    root = svg_root(d, (100, 50))
+    t = root.findall(f".//{SVG_NS}text")
+    assert t[0].text == '<&"' and t[0].get("font-family") == 'a"b, sans-serif'
+    assert t[1].text == "]]><x/>" and t[1].get("font-family") == "<i>, sans-serif"
+    assert not any(e.tag.endswith("}x") for e in root.iter())
+    d = Drawing((0, 0, 100, 50), 96.0, [Run("a\x00b\x08c\ud800d", 5, 20, "F\x01", 10)])
+    text = svg_write.write(d, (100, 50))
+    assert ET.fromstring(text).find(f".//{SVG_NS}text").text == "abcd"
+
+
+def test_svg_no_external_refs():
+    root = svg_root(sample_drawing())
+    hrefs = [v for e in root.iter() for k, v in e.attrib.items() if k.endswith("href")]
+    assert hrefs and all(h.startswith("data:") for h in hrefs), hrefs
+    text = svg_write.write(sample_drawing(), (400, 200)).replace('xmlns="http://www.w3.org/2000/svg"', "")
+    for bad in ("<script", "<!DOCTYPE", "<!ENTITY", "<use", "<foreignObject", "http:", "file:"):
+        assert bad not in text, bad
+    # a bitmap of an unknown kind is left out, and a hostile box is clamped, never linked
+    d = Drawing((0, 0, 10, 10), 96.0, [Bitmap(b"x", "gif", (0, 0, 5, 5)),
+                                       Bitmap(b"\xff\xd8\xff", "jpg", (0, 0, float("nan"), 1e99))])
+    imgs = svg_root(d, (10, 10)).findall(f".//{SVG_NS}image")
+    assert len(imgs) == 1 and imgs[0].get("href").startswith("data:image/jpeg;base64,")
+    assert float(imgs[0].get("height")) <= 2**32
+
+
+def test_svg_cjk_fallback():
+    d = Drawing((0, 0, 200, 100), 96.0, [
+        Run("한글", 5, 20, "Batang", 10),
+        Run("かな", 5, 40, "MS Mincho", 10),
+        Run("汉字", 5, 60, "Microsoft YaHei", 10),
+        Run("漢字", 5, 80, "Microsoft JhengHei", 10),
+        Run("Plain", 5, 95, "Palatino Roman", 10),
+        Run("Tight", 5, 99, "Calibri", 10)])
+    t = [e.get("font-family") for e in svg_root(d, (200, 100)).findall(f".//{SVG_NS}text")]
+    kr = "Malgun Gothic, Apple SD Gothic Neo, Noto Sans CJK KR, sans-serif"
+    assert t[0] == "Batang, " + kr, t[0]
+    assert t[1] == "MS Mincho, Yu Gothic, Hiragino Sans, Noto Sans CJK JP, " + kr, t[1]
+    assert t[2] == "Microsoft YaHei, Microsoft YaHei, PingFang SC, Noto Sans CJK SC, " + kr, t[2]
+    assert t[3] == "Microsoft JhengHei, Microsoft JhengHei, PingFang TC, Noto Sans CJK TC, " + kr, t[3]
+    assert t[4] == "Palatino Roman, serif" and t[5] == "Calibri, sans-serif"
+    assert svg_write._family("MS Sans Serif", "x") == "MS Sans Serif, sans-serif"  # "Sans" wins over "Serif"
+    assert svg_write._family("", "x") == "sans-serif"
+
+
+def test_svg_rotation():
+    d = Drawing((0, 0, 100, 100), 96.0, [Run("up", 30, 70, "Arial", 10, angle=90.0), Run("flat", 5, 5, "Arial", 10),
+                                         Run("full", 5, 9, "Arial", 10, angle=360.0),
+                                         Run("nan", 5, 9, "Arial", 10, angle=float("nan"))])
+    t = svg_root(d, (100, 100)).findall(f".//{SVG_NS}text")
+    assert t[0].get("transform") == "rotate(-90 30 70)", t[0].attrib
+    assert t[1].get("transform") is None and t[2].get("transform") is None and t[3].get("transform") is None
+
+
+def test_svg_clip():
+    sq = [("M", 0, 0), ("L", 50, 0), ("L", 50, 50), ("L", 0, 50), ("Z",)]
+    d = Drawing((0, 0, 100, 100), 96.0, [
+        VPath(sq, None, Brush(0xFF0000)),
+        Clip(sq),
+        VPath(sq, None, Brush(0x00FF00)),
+        Clip([]),
+        VPath(sq, None, Brush(0x0000FF)),
+        Clip(None),
+        VPath(sq, None, Brush(0x000000))])
+    root = svg_root(d, (100, 100))
+    clips = root.findall(f".//{SVG_NS}clipPath")
+    assert len(clips) == 2 and all(c.get("id") for c in clips)
+    ids = [c.get("id") for c in clips]
+    assert len(set(ids)) == 2
+    groups = root.findall(f"{SVG_NS}g")
+    assert [g.get("clip-path") for g in groups] == [f"url(#{i})" for i in ids], [g.attrib for g in groups]
+    assert groups[0].find(f"{SVG_NS}path").get("fill") == "#00ff00"
+    assert clips[0].find(f"{SVG_NS}path").get("d").startswith("M0 0")
+    assert clips[1].find(f"{SVG_NS}path").get("d") == "M0 0 L0 0 Z"  # an empty clip shows nothing
+    top = [e.get("fill") for e in root if e.tag == SVG_NS + "path"]
+    assert top == ["#ff0000", "#000000"], top
+
+
+def test_svg_hostile_numbers():
+    nan, inf = float("nan"), float("inf")
+    d = Drawing((0, 0, 100, 100), 96.0, [
+        VPath([("M", nan, inf), ("L", -1e300, 1e300), ("C", 1, 2, 3, 4, 5, nan), ("Z",), ("X", 1)],
+              Pen(0, nan), Brush(0)),
+        Run("t", nan, inf, "Arial", nan)])
+    root = svg_root(d, (100, 100))
+    dd = root.find(f".//{SVG_NS}path").get("d")
+    assert "nan" not in dd.lower() and "inf" not in dd.lower() and "e+" not in dd, dd
+    assert "2147483647" in dd and "-2147483648" in dd, dd
+    t = root.find(f".//{SVG_NS}text")
+    assert t is not None and "nan" not in t.get("x").lower() and "nan" not in t.get("font-size").lower()
+    f = svg_write.write(Drawing((nan, 0, inf, 5), 0.0, []), (0, -4))
+    assert ET.fromstring(f).get("width") == "1" and ET.fromstring(f).get("height") == "1"
+
+
+def test_svg_glyph_runs_use_resolve():
+    d = Drawing((0, 0, 100, 50), 96.0, [Run("", 5, 20, "Sym", 10, glyphs=(3, 4)), Run("", 5, 40, "Sym", 10, glyphs=(9,))])
+    root = svg_root(d, (100, 50), resolve=lambda r: "AB" if r.glyphs == (3, 4) else None)
+    assert [t.text for t in root.findall(f".//{SVG_NS}text")] == ["AB"]
+    assert svg_root(d, (100, 50)).findall(f".//{SVG_NS}text") == []
+
+
+def test_resvg_job_carries_our_svg():
+    seen = []
+    png = PNG_HEAD + b"\0" * 16
+    with fake_resvg(lambda jobs, mono: seen.append(jobs) or [png]):
+        g = raster.convert("wmf", wmf([wmf_rect(10, 10, 100, 100), wmf_text(100, 200, b"Hello")]))
+    assert g.png == png and g.lines == ["Hello"], g
+    job = seen[-1][0]
+    assert job["svg"].startswith("<svg") and "Hello" in job["svg"] and len(seen[-1]) == 1
+    assert job["w"] >= 1 and job["h"] >= 1 and f'width="{job["w"]}"' in job["svg"]
+
+
+def test_resvg_failure_leaves_text():
+    data = wmf([wmf_text(100, 200, b"Hello")])
+
+    def boom(jobs, mono):
+        raise RuntimeError("x")
+
+    def late(jobs, mono):
+        raise ReadError("too_large", "figure time")
+    with fake_resvg(boom):
+        f = raster.convert("wmf", data)
+    assert f.png is None and f.lines == ["Hello"] and f.warnings == set()
+    with fake_resvg(late):
+        f = raster.convert("wmf", data)
+    assert f.png is None and f.lines == ["Hello"] and f.warnings == {"figures not rendered: time"}
+    with fake_resvg(lambda jobs, mono: [b"not a png"]):  # a renderer that answers garbage
+        assert raster.convert("wmf", data).png is None
+    with fake_resvg(lambda jobs, mono: [None]):
+        assert raster.convert("wmf", data).png is None
+
+
+def test_resvg_tiff_job_and_parser_failure():
+    seen = []
+    with fake_resvg(lambda jobs, mono: seen.append(jobs) or [PNG_HEAD + b"xx"]):
+        f = raster.convert("tiff", tiff([(4, 4, 90), (4, 4, 200)]), page=1)
+        assert f.png and seen[-1][0]["page"] == 1 and base64.b64decode(seen[-1][0]["tiff"])[:2] == b"II"
+        n = len(seen)
+        assert raster.convert("tiff", b"nope").png is None and len(seen) == n  # not a TIFF: no job
+        assert raster.convert("tiff", tiff([(4, 4, 1)]), page=limits.TIFF_PAGES).png is None and len(seen) == n
+        assert raster.convert("wmf", b"\0" * 40).png is None and len(seen) == n  # no drawing, no SVG
+
+
+def test_worker_protocol_and_timeout():
+    """The child entry takes a JSON batch on stdin and answers one result per job; no backend here, so null."""
+    jobs = [{"svg": "<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>", "w": 4, "h": 4},
+            {"tiff": base64.b64encode(tiff([(4, 4, 9)])).decode("ascii"), "page": 0}]
+    cmd = raster._child_cmd(sys.executable)
+    assert cmd[1:5] == ["-I", "-X", "utf8", "-c"] and cmd[-1] == str(Path(raster.__file__).resolve().parents[1])
+    out = raster._run_child(cmd, jobs, 60)
+    assert len(out) == 2
+    if raster._load_local() is None:
+        assert out == [None, None], out
+    slow = [sys.executable, "-I", "-c", "import time; time.sleep(30)"]
+    t0 = time.monotonic()
+    try:
+        raster._run_child(slow, jobs, 1)
+    except ReadError as e:
+        assert e.kind == "too_large" and e.detail == "figure time"
+    else:
+        raise AssertionError("no timeout")
+    assert time.monotonic() - t0 < 15
+    junk = [sys.executable, "-I", "-c", "print('not json')"]
+    assert raster._run_child(junk, jobs, 30) == [None, None]
+    five = [sys.executable, "-I", "-c", "import json; print(json.dumps({'results': ['AAAA'] * 5}))"]
+    assert raster._run_child(five, jobs, 30) == [None, None]  # the wrong count is not trusted
+    fake = [sys.executable, "-I", "-c", "import json; print(json.dumps({'results': ['iVBORw0KGgo=', None]}))"]
+    assert raster._run_child(fake, jobs, 30) == [base64.b64decode("iVBORw0KGgo="), None]
+
+
+def test_backend_none_without_venv_or_libraries():
+    if raster._load_local() is not None or sys.platform == "win32":
+        return
+    assert raster.backend() == "none"
+
+
+@needs_image_venv
+def test_resvg_render():
+    d = sample_drawing()
+    size = raster.target_size(*d.size_px())
+    png = raster._render_local({"svg": svg_write.write(d, size, fonts.resolve), "w": size[0], "h": size[1]})
+    assert png[:8] == PNG_HEAD and png_size(png) == size
+
+
+@needs_image_venv
+def test_pillow_tiff_page():
+    data = base64.b64encode(tiff([(6, 4, 10), (8, 5, 250)])).decode("ascii")
+    png = raster._render_local({"tiff": data, "page": 1})
+    assert png[:8] == PNG_HEAD and png_size(png) == raster.target_size(8, 5)
+    assert raster._render_local({"tiff": data, "page": 2}) is None
 
 
 def main():

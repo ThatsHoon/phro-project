@@ -4,15 +4,23 @@ A picture is parsed into its drawing list, its text lines are taken from it, and
 Windows that is GDI+ through ctypes: WMF and EMF bytes go to it as they are, PICT and WPG as the EMF emf_write writes
 from the drawing, TIFF as a bitmap. GDI+ reads memory streams only; nothing is written to disk. ctypes is imported
 inside the GDI+ functions alone, so importing this module stays light.
+
+Elsewhere the drawing becomes SVG (svg_write) and resvg_py draws it; Pillow reads TIFF pages. Both live in the image
+venv (pyenv kind "image"). Inside that venv they import in-process; otherwise a child of the venv's interpreter takes
+a JSON batch of jobs on stdin and answers PNGs (`serve`), bounded by the time left. resvg_py and PIL are imported
+inside the functions that use them, wrapped in ImportError handling. On Windows GDI+ stays, and the venv is never used.
 """
+import base64
+import json
 import math
 import os
 import struct
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from . import emf_write, fonts, images, limits
+from . import emf_write, fonts, images, limits, svg_write
 from .limits import ReadError
 from .vector import text_lines
 
@@ -25,6 +33,9 @@ _BARE_EDGE = 512       # the long side, in pixels, of a bare WMF the parser gave
 _ARGB32 = 0x26200A     # PixelFormat32bppARGB
 _PAGE_DIM = "{7462DC86-6180-4C7E-8E3F-EE7333A7A483}"  # FrameDimensionPage
 _PNG_CLSID = "{557CF406-1A04-11D3-9A73-0000F81EF32E}"  # the PNG encoder
+_PNG_SIG = b"\x89PNG\r\n\x1a\n"
+CHILD_CAP = 120.0      # seconds, the longest the image venv's child runs when no deadline bounds it
+_CHILD_CODE = "import sys; sys.path.insert(0, sys.argv[1]); from reader import raster; raster.serve()"
 
 
 @dataclass
@@ -38,11 +49,29 @@ _backend = None
 
 
 def backend() -> str:
-    """"gdiplus" on Windows when gdiplus.dll loads and starts, else "none"; worked out once a process."""
+    """"gdiplus" on Windows when gdiplus.dll loads and starts. Elsewhere "resvg-<resvg_py>-pillow-<Pillow>" when both
+    import here (inside the image venv) or the image venv is READY and verified; else "none". Worked out once a
+    process."""
     global _backend
     if _backend is None:
-        _backend = "gdiplus" if sys.platform == "win32" and _gdip() is not None else "none"
+        _backend = _detect()
     return _backend
+
+
+def _detect() -> str:
+    if sys.platform == "win32":
+        return "gdiplus" if _gdip() is not None else "none"
+    from . import pyenv
+    try:
+        if pyenv.forced_native("image"):
+            return "none"
+        if _load_local() is not None:
+            return pyenv.engine_id_from_module("image")
+        venv = pyenv.venv_dir("image")
+        eng = pyenv.engine("image", venv)
+        return eng if eng != "none" and pyenv.verify(venv, "image") else "none"
+    except Exception:  # noqa: BLE001 - no backend
+        return "none"
 
 
 def target_size(w_px: int, h_px: int) -> tuple[int, int]:
@@ -124,11 +153,12 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
     if deadline is not None and deadline - time.time() < limits.FIGURE_RESERVE:
         fig.warnings.add("figures not rendered: time")
         return fig
-    if refused or backend() != "gdiplus":
+    b = backend()
+    if refused or b == "none":
         return fig
     try:
-        fig.png = _render_gdiplus(kind, data, d, page, mono)
-    except ReadError as e:  # emf_write ran out of time: like the parser's deadline, nothing is drawn
+        fig.png = _render_gdiplus(kind, data, d, page, mono) if b == "gdiplus" else _render_resvg(kind, data, d, page, mono)
+    except ReadError as e:  # emf_write or the child ran out of time: like the parser's deadline, nothing is drawn
         fig.png = None
         if e.detail == "figure time":
             fig.warnings.add("figures not rendered: time")
@@ -172,6 +202,155 @@ def _placeable(data: bytes, frame) -> bytes:
     for (w,) in struct.iter_unpack("<H", head):
         check ^= w
     return head + struct.pack("<H", check) + data
+
+
+# ---- resvg_py and Pillow (the image venv) ----------------------------------------------------------------------------
+
+_local = None
+_UNIMPORTED = object()
+
+
+def _load_local():
+    """(resvg_py, PIL.Image) when both import in this process (inside the image venv), else None; tried once."""
+    global _local
+    if _local is None:
+        _local = _UNIMPORTED
+        try:
+            import resvg_py
+            from PIL import Image
+            _local = (resvg_py, Image)
+        except ImportError:
+            pass
+    return None if _local is _UNIMPORTED else _local
+
+
+def _pillow_tiff(Image, data: bytes, page: int) -> bytes | None:
+    """Page `page` of a TIFF as a PNG on white, at target_size; None when it is not a TIFF or has no such page."""
+    import io
+    if images.sniff(data) != "tiff" or not 0 <= page < limits.TIFF_PAGES:
+        return None
+    Image.MAX_IMAGE_PIXELS = images._MAX_PIXELS
+    with Image.open(io.BytesIO(data), formats=["TIFF"]) as im:
+        try:
+            im.seek(page)
+        except EOFError:
+            return None
+        w, h = im.size
+        if not 0 < w * h <= images._MAX_PIXELS:
+            return None
+        rgba = im.convert("RGBA")
+    flat = Image.new("RGB", rgba.size, (255, 255, 255))
+    flat.paste(rgba, mask=rgba.getchannel("A"))
+    size = target_size(w, h)
+    if size != (w, h):
+        flat = flat.resize(size, Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    flat.save(out, "PNG")
+    return out.getvalue()
+
+
+def _render_local(job: dict) -> bytes | None:
+    """One job drawn in this process: {"svg", "w", "h"} through resvg_py, or {"tiff" (base64), "page"} through
+    Pillow. Raises when the libraries are not here."""
+    lib = _load_local()
+    if lib is None:
+        raise _Fail("no resvg_py or Pillow")
+    resvg_py, Image = lib
+    if isinstance(job.get("svg"), str):
+        png = bytes(resvg_py.svg_to_bytes(svg_string=job["svg"]))
+    elif isinstance(job.get("tiff"), str):
+        png = _pillow_tiff(Image, base64.b64decode(job["tiff"]), int(job.get("page", 0)))
+    else:
+        return None
+    return png if png and png[:8] == _PNG_SIG and len(png) <= limits.IMAGE_BYTES else None
+
+
+def serve() -> None:
+    """The child's entry: a JSON {"jobs": [...]} on stdin, a JSON {"results": [base64 PNG or null, ...]} on stdout."""
+    req = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    jobs = req.get("jobs") if isinstance(req, dict) else None
+    out = []
+    for job in jobs if isinstance(jobs, list) else []:
+        try:
+            png = _render_local(job) if isinstance(job, dict) else None
+        except Exception:  # noqa: BLE001 - one bad picture leaves a null, not a dead batch
+            png = None
+        out.append(base64.b64encode(png).decode("ascii") if png else None)
+    sys.stdout.write(json.dumps({"results": out}) + "\n")
+    sys.stdout.flush()
+
+
+def _child_cmd(python=None) -> list:
+    """The command that runs `serve` in the image venv's interpreter (or `python`), isolated."""
+    if python is None:
+        from . import pyenv
+        python = pyenv.interpreter(pyenv.venv_dir("image"))
+    return [str(python), "-I", "-X", "utf8", "-c", _CHILD_CODE, str(Path(__file__).resolve().parents[1])]
+
+
+def _run_child(cmd: list, jobs: list, timeout: float) -> list:
+    """The PNG bytes (or None) of each job, from one child run bounded by `timeout` seconds. A timeout raises
+    ReadError("too_large", "figure time"); any other trouble gives None for every job."""
+    import subprocess
+    none = [None] * len(jobs)
+    payload = json.dumps({"jobs": jobs}).encode("utf-8")
+    try:
+        r = subprocess.run(cmd, input=payload, capture_output=True, timeout=max(0.1, timeout))
+    except subprocess.TimeoutExpired:
+        raise ReadError("too_large", "figure time") from None
+    except (OSError, ValueError):
+        return none
+    try:
+        lines = r.stdout.decode("utf-8", "replace").strip().splitlines()
+        res = json.loads(lines[-1])["results"] if r.returncode == 0 and lines else None
+    except (ValueError, KeyError, TypeError, IndexError):
+        res = None
+    if not isinstance(res, list) or len(res) != len(jobs):
+        return none
+    out = []
+    for item in res:
+        try:
+            png = base64.b64decode(item, validate=True) if isinstance(item, str) and item else None
+        except ValueError:
+            png = None
+        out.append(png if png and len(png) <= limits.IMAGE_BYTES else None)
+    return out
+
+
+def _run_jobs(jobs: list, mono: float | None) -> list:
+    """The PNG (or None) of each job: in this process inside the image venv, else in a child of its interpreter,
+    given the time left before `mono` (a time.monotonic() value). Raises ReadError("too_large", "figure time")."""
+    late = ReadError("too_large", "figure time")
+    if _load_local() is not None:
+        out = []
+        for job in jobs:
+            if mono is not None and time.monotonic() > mono:
+                raise late
+            try:
+                out.append(_render_local(job))
+            except Exception:  # noqa: BLE001
+                out.append(None)
+        return out
+    left = CHILD_CAP if mono is None else min(CHILD_CAP, mono - time.monotonic())
+    if left <= 0:
+        raise late
+    return _run_child(_child_cmd(), jobs, left)
+
+
+def _render_resvg(kind: str, data: bytes, d, page: int, mono: float | None = None) -> bytes | None:
+    if kind == "tiff":
+        if images.sniff(data) != "tiff" or not 0 <= page < limits.TIFF_PAGES:
+            return None
+        job = {"tiff": base64.b64encode(data).decode("ascii"), "page": page}
+    else:
+        if d is None:  # SVG needs the drawing
+            return None
+        size = target_size(*d.size_px())
+        job = {"svg": svg_write.write(d, size, fonts.resolve), "w": size[0], "h": size[1]}
+    png = _run_jobs([job], mono)[0]
+    if not isinstance(png, (bytes, bytearray)) or bytes(png[:8]) != _PNG_SIG:
+        return None
+    return bytes(png)
 
 
 # ---- TIFF pages ------------------------------------------------------------------------------------------------------

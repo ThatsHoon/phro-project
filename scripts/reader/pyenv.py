@@ -1,5 +1,6 @@
-"""State of the optional venvs (kind "pdf": pypdfium2; kind "mpp": MPXJ and JPype, with a Java found on PATH):
-cheap checks only (no subprocess at import, no format modules).
+"""State of the optional venvs (kind "pdf": pypdfium2; kind "mpp": MPXJ and JPype, with a Java found on PATH;
+kind "image": resvg_py and Pillow, for figures off Windows): cheap checks only (no subprocess at import, no format
+modules).
 
 A venv is made only by `read.py setup` (see pysetup). Here: where it lives, whether it is usable, and
 the engine id a file is read with. `java_info` runs `java` once, for setup (the subprocess module is imported
@@ -13,11 +14,12 @@ import re
 import sys
 from pathlib import Path
 
-KINDS = ("pdf", "mpp")
+KINDS = ("pdf", "mpp", "image")
 _HERE = Path(__file__).resolve().parent
-REQUIREMENTS = {"pdf": _HERE / "requirements-pdf.txt", "mpp": _HERE / "requirements-mpp.txt"}
-_ENV = {"pdf": "PHRO_READER_PYENV", "mpp": "PHRO_READER_MPPENV"}
-_DISTS = {"pdf": ("pypdfium2",), "mpp": ("mpxj", "jpype1")}
+REQUIREMENTS = {"pdf": _HERE / "requirements-pdf.txt", "mpp": _HERE / "requirements-mpp.txt",
+                "image": _HERE / "requirements-image.txt"}
+_ENV = {"pdf": "PHRO_READER_PYENV", "mpp": "PHRO_READER_MPPENV", "image": "PHRO_READER_IMAGEENV"}
+_DISTS = {"pdf": ("pypdfium2",), "mpp": ("mpxj", "jpype1"), "image": ("resvg-py", "pillow")}
 
 JAVA_FLOOR = 8  # MPXJ 16.10.0 compiles for Java 8; JPype 1.7.1 lists Java 8
 MPXJ_VERSION = "16.10.0"
@@ -43,7 +45,8 @@ def _requirements(kind) -> Path:
 
 
 def forced_native(kind="pdf") -> bool:
-    """The kind's env var is `off`: pdf reads natively, mpp is not read (engine() is "")."""
+    """The kind's env var is `off`: pdf reads natively, mpp is not read (engine() is ""), image draws nothing
+    (engine() is "none")."""
     _check(kind)
     return os.environ.get(_ENV[kind]) == "off"
 
@@ -166,16 +169,24 @@ def mpp_engine_id(mpxj: str, major: int) -> str:
     return f"mpxj-{mpxj}-java{major}"
 
 
+def image_engine_id(resvg: str, pillow: str) -> str:
+    return f"resvg-{resvg}-pillow-{pillow}"
+
+
 def engine(kind="pdf", venv=None) -> str:
-    """pdf: the engine id when READY, else "native". mpp: the engine id when READY, else ""."""
+    """pdf: the engine id when READY, else "native". mpp: the engine id when READY, else "". image: the id
+    `raster.backend()` gives inside the venv when READY, else "none"."""
     _check(kind)
+    off = {"pdf": "native", "mpp": "", "image": "none"}[kind]
     if forced_native(kind):
-        return "native" if kind == "pdf" else ""
-    off = "native" if kind == "pdf" else ""
+        return off
     venv = Path(venv) if venv is not None else venv_dir(kind)
     if state(venv, kind) != "READY":
         return off
     ready = _ready(venv)
+    if kind == "image":
+        r, p = ready.get("resvg"), ready.get("pillow")
+        return image_engine_id(r, p) if r and p and isinstance(r, str) and isinstance(p, str) else off
     if kind == "mpp":
         major = (ready.get("java") or {}).get("major")
         if not ready.get("mpxj") or not isinstance(major, int):
@@ -189,6 +200,9 @@ def engine(kind="pdf", venv=None) -> str:
 def engine_id_from_module(kind="pdf") -> str:
     """Used in the venv child, where the libraries import."""
     _check(kind)
+    if kind == "image":
+        import importlib.metadata
+        return image_engine_id(importlib.metadata.version("resvg-py"), importlib.metadata.version("pillow"))
     if kind == "mpp":
         import importlib.metadata
         ready = json.loads((Path(sys.prefix) / "ready.json").read_text(encoding="utf-8"))
@@ -262,6 +276,8 @@ def verify(venv, kind="pdf") -> bool:
     ready = _ready(venv)
     if ready is None or not isinstance(ready.get("records"), dict) or ready_kind(ready) != kind:
         return False
+    if kind == "image":
+        return all(_verify_record(venv, d, ready["records"].get(d)) for d in _DISTS["image"])
     if kind == "mpp":
         if not _java_ok(ready):
             return False

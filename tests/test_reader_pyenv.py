@@ -639,7 +639,7 @@ def test_read_py_before_site_packages():
 
 def test_pdf_kind_default():
     with env() as d:
-        assert pyenv.KINDS == ("pdf", "mpp")
+        assert pyenv.KINDS == ("pdf", "mpp", "image")
         assert pyenv.venv_dir() == pyenv.venv_dir("pdf")
         assert pyenv.requirements_hash() == pyenv.requirements_hash("pdf")
         assert pyenv.declined() == pyenv.declined("pdf") is False
@@ -1123,6 +1123,259 @@ def test_state_ignores_a_planted_java():
         with path_and_cwd(".", d / "planted"):  # only a planted java in the cwd: not found, so STALE
             assert pyenv.state(dest, "mpp") == "STALE"
         assert planted.is_file()
+
+
+# ---- kind "image": resvg_py and Pillow for figures off Windows -----------------------------------------------------------
+
+@contextmanager
+def platform(name):
+    old = sys.platform
+    sys.platform = name
+    try:
+        yield
+    finally:
+        sys.platform = old
+
+
+def fake_image_venv(tmp):
+    """A fake image venv: an interpreter file, pyvenv.cfg with an existing home, and one dist-info with a RECORD
+    for each of resvg-py and pillow (no ready.json: setup writes it)."""
+    import base64
+    import hashlib
+    d = Path(tmp)
+    for rel in (("bin", "python3"), ("Scripts", "python.exe")):  # whichever platform the test patches in
+        py = d.joinpath(*rel)
+        py.parent.mkdir(parents=True, exist_ok=True)
+        py.write_bytes(b"")
+    (d / "pyvenv.cfg").write_text(f"home = {d.parent}\nversion = 3.12.0\n", encoding="utf-8")
+    site = d / "lib" / "site-packages"
+    for name, ver, pkg in (("resvg_py", "0.5.0", "resvg_py"), ("pillow", "12.3.0", "PIL")):
+        mod = site / pkg / "__init__.py"
+        mod.parent.mkdir(parents=True, exist_ok=True)
+        data = f"# {name}\n".encode()
+        mod.write_bytes(data)
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        info = site / f"{name}-{ver}.dist-info"
+        info.mkdir(exist_ok=True)
+        (info / "RECORD").write_bytes(
+            f"{pkg}/__init__.py,sha256={digest},{len(data)}\n{name}-{ver}.dist-info/RECORD,,\n".encode())
+
+
+class ImageStub:
+    """Stub steps for kind "image": a fake venv, no pip, no real smoke render."""
+
+    def __init__(self, *, smoke=True):
+        self.smoke_result, self.calls = smoke, []
+
+    def make_venv(self, tmp):
+        self.calls.append("make_venv")
+        fake_image_venv(tmp)
+
+    def pip(self, python, requirements):
+        self.calls.append("pip")
+        self.requirements = requirements
+        return True, "ok"
+
+    def versions(self, python):
+        self.calls.append("versions")
+        return "0.5.0", "12.3.0", pyenv.record_digests(Path(python).parent.parent, "image")
+
+    def smoke(self, python):
+        self.calls.append("smoke")
+        return self.smoke_result
+
+
+def image_ready(d):
+    """A READY image venv at d/image-venv made by setup with stubs (the platform is patched to linux)."""
+    dest = d / "image-venv"
+    with platform("linux"):
+        out = pysetup.setup(dest, ImageStub(), kind="image")
+    assert out.startswith("READY\t"), out
+    return dest
+
+
+def test_image_kind_paths_and_env():
+    assert pyenv.KINDS == ("pdf", "mpp", "image")
+    assert pyenv._ENV["image"] == "PHRO_READER_IMAGEENV"
+    assert pyenv._DISTS["image"] == ("resvg-py", "pillow")
+    assert pyenv.REQUIREMENTS["image"].name == "requirements-image.txt" and pyenv.REQUIREMENTS["image"].is_file()
+    with env() as d:
+        old = os.environ.get("PHRO_READER_IMAGEENV")
+        try:
+            os.environ.pop("PHRO_READER_IMAGEENV", None)
+            os.environ["CLAUDE_PLUGIN_DATA"] = str(d / "data")
+            assert pyenv.venv_dir("image") == d / "data" / "image-venv"
+            os.environ.pop("CLAUDE_PLUGIN_DATA")
+            from reader import cache
+            assert pyenv.venv_dir("image") == cache.venv_base() / "image-venv"
+            os.environ["PHRO_READER_IMAGEENV"] = str(d / "elsewhere")
+            assert pyenv.venv_dir("image") == d / "elsewhere" and not pyenv.forced_native("image")
+            os.environ["PHRO_READER_IMAGEENV"] = "off"
+            assert pyenv.forced_native("image") and pyenv.engine("image") == "none"
+            assert not pyenv.forced_native("pdf") and not pyenv.forced_native("mpp")
+        finally:
+            if old is None:
+                os.environ.pop("PHRO_READER_IMAGEENV", None)
+            else:
+                os.environ["PHRO_READER_IMAGEENV"] = old
+        assert pyenv.requirements_hash("image") != pyenv.requirements_hash("pdf")
+
+
+def test_image_engine_none_without_venv():
+    with env() as d:
+        os.environ.pop("PHRO_READER_IMAGEENV", None)
+        assert pyenv.engine("image") == "none"
+        assert pyenv.engine("image", d / "nothing") == "none"
+        assert pysetup.check(d / "nothing", "image") == f"MISSING\t{(d / 'nothing').resolve()}"
+        empty = d / "empty-venv"
+        empty.mkdir()
+        assert pyenv.engine("image", empty) == "none"
+
+
+def test_image_engine_id_from_ready():
+    with env() as d:
+        dest = image_ready(d)
+        ready = json.loads((dest / "ready.json").read_text(encoding="utf-8"))
+        assert ready["kind"] == "image" and ready["resvg"] == "0.5.0" and ready["pillow"] == "12.3.0"
+        assert ready["requirements"] == pyenv.requirements_hash("image")
+        assert set(ready["records"]) == {"resvg-py", "pillow"} and "pypdfium2" not in ready
+        assert pyenv.state(dest, "image") == "READY" and pyenv.verify(dest, "image") is True
+        assert pyenv.engine("image", dest) == "resvg-0.5.0-pillow-12.3.0"
+        assert pyenv.image_engine_id("0.5.0", "12.3.0") == "resvg-0.5.0-pillow-12.3.0"
+        assert pysetup.check(dest, "image") == f"READY\t{dest.resolve()}\tresvg-0.5.0-pillow-12.3.0"
+        # a venv that lost a version is not used; a pdf venv is not an image venv
+        (dest / "ready.json").write_text(json.dumps({**ready, "pillow": ""}), encoding="utf-8")
+        assert pyenv.engine("image", dest) == "none"
+        (dest / "ready.json").write_text(json.dumps({**ready, "kind": "pdf"}), encoding="utf-8")
+        assert pyenv.engine("image", dest) == "none" and pyenv.state(dest, "image") == "BROKEN"
+        # a changed pin makes it stale
+        (dest / "ready.json").write_text(json.dumps({**ready, "requirements": "0" * 64}), encoding="utf-8")
+        assert pyenv.state(dest, "image") == "STALE" and pyenv.engine("image", dest) == "none"
+
+
+def test_image_verify_record_mismatch():
+    with env() as d:
+        dest = image_ready(d)
+        assert pyenv.verify(dest, "image")
+        (next(dest.rglob("PIL")) / "__init__.py").write_text("# tampered\n", encoding="utf-8")
+        assert pyenv.verify(dest, "image") is False
+
+
+def test_image_setup_refused_on_windows():
+    with env() as d:
+        steps = ImageStub()
+        dest = d / "sub" / "image-venv"
+        with platform("win32"):
+            out = pysetup.setup(dest, steps, kind="image")
+        assert out == "FAIL\timage\tthe image venv is not needed on Windows (GDI+ draws pictures)", out
+        assert steps.calls == [] and not dest.parent.exists()
+
+
+def test_image_setup_replaces_only_image_venvs():
+    with env() as d:
+        steps = ImageStub()
+        dest = d / "image-venv"
+        pdf_fix.fake_venv(dest)  # a pdf venv sits where the image venv would go
+        with platform("linux"):
+            out = pysetup.setup(dest, steps, kind="image")
+        assert out == f"FAIL\tinstall\t{dest.resolve()} is not a image venv" and steps.calls == [], out
+
+
+def test_image_setup_smoke_fail_and_steps():
+    with env() as d:
+        dest = d / "image-venv"
+        with platform("linux"):
+            out = pysetup.setup(dest, ImageStub(smoke=False), kind="image")
+        assert out == "FAIL\tsmoke\tthe test SVG did not render with resvg_py", out
+        assert not dest.exists() and leftovers(dest) == []
+        assert isinstance(pysetup.ImageSteps(), pysetup.Steps)
+        assert pysetup.ImageSteps().versions.__func__ is not pysetup.Steps.versions
+        code = pysetup.SMOKE_IMAGE
+        compile(code, "smoke", "exec")
+        assert "resvg_py" in code and "<text" in code and "PNG" in code.upper().replace("\\X89", "")
+
+
+def test_image_setup_ready_line_and_pointer():
+    with env() as d:
+        from reader import cache
+        decl = cache.root() / "image-declined"
+        decl.parent.mkdir(parents=True, exist_ok=True)
+        decl.write_text("", encoding="utf-8")
+        dest = d / "image-venv"
+        steps = ImageStub()
+        with platform("linux"):
+            out = pysetup.setup(dest, steps, kind="image")
+        assert out == f"READY\t{dest.resolve()}\tresvg-0.5.0-pillow-12.3.0", out
+        assert steps.calls == ["make_venv", "pip", "versions", "smoke"] and steps.requirements == pyenv.REQUIREMENTS["image"]
+        assert json.loads((cache.root() / "image-venv.json").read_text(encoding="utf-8")) == {"venv": str(dest.resolve())}
+        assert not decl.exists() and not pyenv.declined("image")
+        assert pysetup.decline("image") == "DECLINED" and pyenv.declined("image") and not pyenv.declined("pdf")
+        assert pysetup.remove(dest, "image") == f"REMOVED\t{dest.resolve()}" and not dest.exists()
+
+
+def test_read_py_setup_for_image():
+    with env() as d:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = read.main(["setup", "--for", "image", "--check", "--venv", str(d / "nothing")])
+        assert code == 0 and buf.getvalue().startswith("MISSING	"), buf.getvalue()
+        buf = io.StringIO()
+        with platform("win32"), redirect_stdout(buf):
+            code = read.main(["setup", "--for", "image", "--venv", str(d / "nothing")])
+        assert code == 1 and "not needed on Windows" in buf.getvalue(), buf.getvalue()
+        assert not (d / "nothing").exists()
+
+
+def test_image_requirements_pinned_with_hashes():
+    text = pyenv.REQUIREMENTS["image"].read_text(encoding="utf-8")
+    blocks, cur = {}, None
+    for ln in text.splitlines():
+        if ln.startswith("#") or not ln.strip():
+            continue
+        if not ln.startswith(" "):
+            cur = ln.split("==")[0]
+            blocks[cur] = []
+        blocks[cur].append(ln)
+    assert set(blocks) == {"resvg-py", "pillow"}, set(blocks)
+    assert blocks["resvg-py"][0] == "resvg-py==0.5.0 \\"
+    assert re.fullmatch(r"pillow==12\.\d+\.\d+ \\", blocks["pillow"][0]), blocks["pillow"][0]
+    for name, lines in blocks.items():
+        assert all(ln.endswith("\\") for ln in lines[:-1]) and not lines[-1].endswith("\\"), name
+        assert all(re.fullmatch(r"    --hash=sha256:[0-9a-f]{64}( \\)?", ln) for ln in lines[1:]), name
+    assert len(blocks["resvg-py"]) == 1 + 5 and len(blocks["pillow"]) == 1 + 25
+    every = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#") and not ln.startswith("    ")]
+    assert all(ln.endswith("\\") for ln in every)  # each name line opens a continuation of hashes
+    hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})", text)
+    assert len(hashes) == len(set(hashes)) == 30
+    # the comment block lists each wheel, in the order of its hashes
+    assert len(re.findall(r"^# \d+ resvg_py-0\.5\.0-", text, re.M)) == 5
+    assert len(re.findall(r"^# \d+ pillow-12\.\d+\.\d+-cp31[0-4]-cp31[0-4]-", text, re.M)) == 25
+    for py in ("cp310", "cp311", "cp312", "cp313", "cp314"):
+        for plat in ("macosx_.*_x86_64", "macosx_.*_arm64", "manylinux.*_x86_64", "manylinux.*_aarch64", "musllinux.*_x86_64"):
+            assert re.search(rf"^# \d+ pillow-\S+-{py}-{py}-{plat}\.whl$", text, re.M), (py, plat)
+    for plat in ("macosx_10_12_x86_64", "macosx_11_0_arm64", "manylinux_2_17_x86_64", "manylinux_2_17_aarch64", "musllinux_1_2_x86_64"):
+        assert re.search(rf"^# \d+ resvg_py-0\.5\.0-cp310-abi3-{plat}", text, re.M), plat
+    assert "\r" not in text
+
+
+def test_image_requirements_pip_parse():
+    code = ("import json, sys\n"
+            "try:\n"
+            "    from pip._internal.network.session import PipSession\n"
+            "    from pip._internal.req.req_file import parse_requirements\n"
+            "except Exception:\n"
+            "    sys.exit(3)\n"
+            "reqs = list(parse_requirements(sys.argv[1], session=PipSession()))\n"
+            "print(json.dumps([[str(r.requirement), r.options.get('hashes', {}).get('sha256')] for r in reqs]))\n")
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, str(pyenv.REQUIREMENTS["image"])],
+                       capture_output=True, text=True, cwd=tempfile.gettempdir())
+    if r.returncode == 3:
+        print("note: pip not importable, image pip parse check skipped")
+        return
+    assert r.returncode == 0, r.stderr
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    assert [g[0].replace(" ", "") for g in got][0] == "resvg-py==0.5.0" and len(got[0][1]) == 5, got
+    assert got[1][0].replace(" ", "").startswith("pillow==12.") and len(got[1][1]) == 25, got
 
 
 def main():

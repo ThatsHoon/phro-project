@@ -210,7 +210,7 @@ def main(argv=None) -> int:
     c.add_argument("--pages", type=_pages, metavar="A-B")
     c.set_defaults(fn=cmd_convert)
     s = sub.add_parser("setup")
-    s.add_argument("--for", dest="kind", choices=("pdf", "mpp"), default="pdf")
+    s.add_argument("--for", dest="kind", choices=("pdf", "mpp", "image"), default="pdf")
     s.add_argument("--venv")
     mode = s.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true")
