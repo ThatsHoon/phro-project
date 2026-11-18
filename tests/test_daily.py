@@ -1,7 +1,3 @@
-"""The weekday morning report: the period, when it is due, reading transcript tails backwards, the form check, and a run with a stub model.
-
-Run: python -I -X utf8 tests/test_daily.py
-"""
 import importlib.util
 import json
 import os
@@ -22,7 +18,6 @@ GOOD = "어제 완료:\n* 홍수 모델 파이프라인 구축\n\n오늘 할 일
 
 
 def copy_of(project):
-    """A minimal project copy of the plugin: the script, the skill and origin.json naming the project."""
     plugin = Path(tempfile.mkdtemp())
     (plugin / "scripts").mkdir()
     (plugin / "skills/daily").mkdir(parents=True)
@@ -40,7 +35,6 @@ def load(plugin):
 
 
 def stub(text):
-    """A stand-in for `claude -p`: prints the given text and records the prompt it got."""
     folder = Path(tempfile.mkdtemp())
     (folder / "out.txt").write_text(text, encoding="utf-8")
     (folder / "stub.py").write_text("import sys, pathlib\nh = pathlib.Path(__file__).parent\n(h / 'prompt.txt').write_text(sys.stdin.read(), encoding='utf-8')\n"
@@ -125,13 +119,46 @@ def test_private_sessions():
     s = d.session(part, start, end, hidden["bbbb2222"])
     assert "공개 작업" in s and "비공개 부분" not in s and "비공개 섞인 제목" not in s, s
     assert d.session(open_, start, end, hidden.get("cccc3333", ())).startswith("## 보통")
-    real = HOME / ".claude/private-sessions.txt"  # the digest command reads the file at its home, as a run does
+    real = HOME / ".claude/private-sessions.txt"
     shutil.copy(d.PRIVATE, real)
     try:
         text = daily(Path(d.__file__).parents[1], "digest", "--date", "2026-11-10").stdout
     finally:
         real.unlink()
     assert "비공개" not in text and "보통 작업" in text and "공개 작업" in text, text
+
+
+def test_queue_sources():
+    project = Path(tempfile.mkdtemp())
+    d = load(copy_of(project))
+    start, end = d.period(date(2026, 11, 10))
+    t = start + timedelta(hours=2)
+    u = lambda x: x.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (project / "queue").mkdir()
+    rows = [(u(t), "pppp0000", "kept the private backbone"), (u(t), "nnnn1111", "kept the open backbone"),
+            (u(t + timedelta(hours=3)), "ssss2222", "a stretch decision"), (u(t + timedelta(hours=1)), "ssss2222", "before the stretch"),
+            (u(end + timedelta(hours=1)), "nnnn1111", "after the period")]
+    (project / "queue/trail.tsv").write_text("ts\tsession\tphase\tdecision\twhy\tevidence\tresult\n"
+                                             + "".join(f"{ts}\t{sid}\tsweep\t{dec}\tw\te\tkept\n" for ts, sid, dec in rows)
+                                             + "broken row\n", encoding="utf-8")
+    gen = int(end.timestamp())
+    (project / "queue/board.json").write_text(json.dumps({"generated": gen, "tickets": [
+        {"title": "private ticket", "status": "done", "session": "pppp0000", "changed_s": gen - int(t.timestamp())},
+        {"title": "open ticket", "status": "done", "session": "nnnn1111", "changed_s": gen - int(t.timestamp())}]}), encoding="utf-8")
+    d.PRIVATE = Path(tempfile.mkdtemp()) / "private-sessions.txt"
+    a, b = (t + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M"), (t + timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M")
+    d.PRIVATE.write_text(f"pppp0000\nssss2222 {a} {b}\n", encoding="utf-8")
+    hidden = d.private()
+    assert d.decisions(project, start, end, hidden) == ["kept the open backbone (kept)", "before the stretch (kept)"], d.decisions(project, start, end, hidden)
+    assert d.tickets(project, start, end, hidden)[0] == ["open ticket"], "a private session's ticket title stays out"
+    real = HOME / ".claude/private-sessions.txt"
+    shutil.copy(d.PRIVATE, real)
+    try:
+        text = daily(Path(d.__file__).parents[1], "digest", "--date", "2026-11-10").stdout
+    finally:
+        real.unlink()
+    assert "kept the open backbone" in text and "open ticket" in text, text
+    assert "private" not in text and "stretch decision" not in text and "after the period" not in text, text
 
 
 def test_private_command():
@@ -160,13 +187,13 @@ def test_check():
     assert d.check("```\n" + GOOD + "```") == GOOD
     many = "어제 완료:\n" + "".join(f"* 일 {i}\n" for i in range(6)) + "\n오늘 할 일:\n* x\n"
     for bad in ("오늘은 홍수 모델을 개선할 예정입니다.", "어제 완료:\n* 홍수 모델을 만들었습니다", "어제 완료:\n- 홍수 모델", "# 일일\n어제 완료:\n* x",
-                "어제 완료 - 재난:\n* x\n\n오늘 할 일:\n* y",  # one 어제 완료 heading, no split
+                "어제 완료 - 재난:\n* x\n\n오늘 할 일:\n* y",
                 "어제 완료:\n* x\n\n어제 완료:\n* y\n\n오늘 할 일:\n* z",
-                "어제 완료:\n* x",  # 오늘 할 일 missing
+                "어제 완료:\n* x",
                 many,
-                "어제 완료:\n* 졸음운전 판정 실험 설계 (089 데이터)\n\n오늘 할 일:\n* y",  # internal numbers
-                "어제 완료:\n* 화재 열원+탄 자국 실험\n\n오늘 할 일:\n* y",  # symbol shorthand
-                "어제 완료:\n* 재난 분석 결과 화면 개선 (프런트 전달)\n\n오늘 할 일:\n* y",  # parentheses
+                "어제 완료:\n* 졸음운전 판정 실험 설계 (089 데이터)\n\n오늘 할 일:\n* y",
+                "어제 완료:\n* 화재 열원+탄 자국 실험\n\n오늘 할 일:\n* y",
+                "어제 완료:\n* 재난 분석 결과 화면 개선 (프런트 전달)\n\n오늘 할 일:\n* y",
                 "어제 완료:\n* 화재 복합 판독 실험 - 열원+연기(high) 단계 불통과로 종결, 열원+탄 자국(confirmed) 후보는 2024 봄 오탐 기준 통과\n\n오늘 할 일:\n* y"):
         try:
             d.check(bad)
@@ -243,7 +270,7 @@ def test_off_until_switched_on():
     (plugin / "origin.json").write_text(json.dumps({"project": str(project)}), encoding="utf-8")
     assert load(plugin).enabled(), "a copy made before the switch keeps running"
     (plugin / "origin.json").write_text(json.dumps({"project": str(project), "daily": False}), encoding="utf-8")
-    d.due = lambda now: date(2026, 11, 10)  # due now, so only the switch keeps the hook quiet
+    d.due = lambda now: date(2026, 11, 10)
     d.hook()
     assert not (plugin / "docs/daily").exists(), "off: the hook claims nothing"
     assert daily(plugin, "on").stdout == "DAILY\ton\n"

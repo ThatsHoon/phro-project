@@ -11,7 +11,7 @@ It has no universal structure, because plugins differ too much between projects.
 Always-on cost, in every session of every project where the plugin is enabled:
 
 - One skill description, `design`, about 80 tokens. The other four skills are not listed, so they cost nothing until you type them.
-- One `SessionStart` hook, at start, resume, clear and compaction. Resume matters for forks and sessions reopened after a restart, which otherwise never see a rule added since they began. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing. An index holding hidden text prints one warning instead. After a compaction it adds about 150 tokens telling the session to update the documents from its summary, which can take that session a few turns.
+- One `SessionStart` hook, at start, resume, clear and compaction. Resume matters for sessions reopened after a restart, which otherwise never see a rule added since they began; a resumed session that already holds the same index gets only the status lines, since the earlier text is still in its conversation. A fork inherits the parent's context. It reads `docs/core/README.md` and `docs/core/core.json` and prints the index, cut at 2,500 characters, plus a few lines. What it prints enters the session's context, although `claude plugin details` counts a hook as free. It makes no model call and never walks the project. Without both files it prints nothing. An index holding hidden text prints one warning instead. After a compaction it adds about 150 tokens telling the session to update the documents from its summary, which can take that session a few turns.
 
 ## 새 프로젝트에서 쓰기
 
@@ -48,6 +48,7 @@ phro-project/
   hooks/hooks.json             SessionStart: prints the core index
   skills/
     design/SKILL.md            adding a capability: find it, place it, build it, make it fire
+      references/runs.md       the prompt of a run nobody watches: finish condition, permissions, budget, trail
     route-test/SKILL.md        whether skills get called on real prompts, and who takes each miss
     audit/SKILL.md             after growth: merge, delete and repair proposals
     compass/SKILL.md           build and refresh docs/core
@@ -115,6 +116,7 @@ Say what the project should be able to do, and from when: "make this method a sk
    | Skill only you invoke | It needs judgment, and it moves files, spends money or is always typed |
    | Skill | It needs judgment, and a user request can name it |
    | Skill with `paths` | It matters only when certain files are touched |
+   | Scheduled run or loop | It must happen with nobody typing, on a clock or again and again until a condition holds. Its prompt follows `skills/design/references/runs.md`: a checkable finish condition, what it may do without asking, a budget per pass, one change and one check per step, a trail row per decision |
    | Hook | It must react to an event the model does not act on, and a miss was measured |
    | MCP | It needs a connection or shared state that running a script cannot give |
 
@@ -183,6 +185,7 @@ Detection machinery is not stacked in advance. Measure per skill, and move a ski
 5. `lint` must pass before `stamp`. It flags AI marks and tells, change history, dates, overlong documents, dead paths, unlisted documents, source patterns that match no file and hidden text in the index. A `>` quote is the user's own words, so it is never flagged for wording.
 6. After `/compact` or an automatic compaction, in any session or fork of the project, the hook tells that session to compare its summary with the documents and update what is out of date, then run `lint`. A summary reaches a hook only on `PostCompact`, which cannot call a model or reach the session, so the session that already holds the summary does the work and no extra run is paid for. After a manual `/compact` this happens with your next message. A session that ends first updates nothing, and whether sessions follow the instruction is not measured.
 7. A refresh ends with `stamp --drift "<line>"`: work that serves no listed goal, and goals with no recent work, in at most 200 characters. The folder list from `status` is what it judges this from. Every session receives this line after the index, about 50 tokens.
+8. A refresh also sweeps the work rules. For each rule in the index with no enforcer named beside it, it looks in what changed (the problem log, reverts in git, feedback memories) for the mistake the rule guards. When that mistake happened again and no open ticket proposes it yet, it opens a can-wait ticket proposing an enforcement by design step 5b, with the default "keep the rule as written", and names it in its report. Without this, a written rule that keeps being broken is caught only when you correct it.
 
 Session transcripts are never a source for these documents, since they can hold private data. Sources are memory, documents, code and, right after a compaction, the summary the session already holds. `usage` is the one script that opens them: it counts reads of each document and prints no text.
 
@@ -216,14 +219,18 @@ The import rules live in `contracts/modules.json`: `{"features": {"control/hazar
 
 `lean` is always on. A hook injects its rules from `skills/lean/SKILL.md`:
 
-- Main session, at start, resume, clear and compact: **Build** (minimal code, root-cause fixes, one runnable check) and **Answer** (the action or the answer first, one open question at a time, short visible lists).
-- Each subagent: **Build** and **Report** (status first, long output to a file, at most 20 lines).
+- Main session, at start, resume, clear and compact: **Build** (minimal code, root-cause fixes that start from earlier attempts in the git log and problem log, one runnable check seen failing, a number that looks too good checked for what else it measured, no comments, inherited claims checked and the rest of that work not redone, long work in checked units, repeated edits through a rerunnable script, what must outlive the context in a file) and **Answer** (the action or the answer first, the goal and its done check up front, the minimal version with the fuller one named, briefs that carry the goal, the done check and the proof to return, reversible calls made rather than asked, the evidence that was run, how each claim is known, one open question at a time, short visible lists, and a proposed enforcement when a written rule is broken again). A resume that already holds the same text gets nothing, so the rules are not added twice.
+- Each subagent: **Build** and **Report** (status first, the brief's bar is the whole bar, evidence on each claim, inconclusive is not a pass, a problem the base already had in one line, long output to a file, at most 20 lines). The read-only built-ins, Explore, Plan, claude-code-guide and web-fetch, get **Report** alone.
 
 Type `phro-lean off` as the whole prompt to stop the rules for the current session and its subagents, and `phro-lean on` to bring them back. Other sessions are not affected. lean injects nothing while the original ponytail or i-have-adhd plugin is enabled, so the two never stack; disable those and lean takes over.
 
 `lean-review` fires when you ask for an over-engineering review. It lists what a diff could delete or shrink, one line per finding, and ends with the lines it could save.
 
-Technical debt lives in the code: each shortcut and each skipped test carries one English comment, `lean: <ceiling> | when: <trigger> | fix: <upgrade path>`. `compass.py debt` counts them against the last refresh, the daily refresh adds `debt N (+K)` to the drift line every session receives, and only debt whose `when` is `owner` or already met becomes a work-queue ticket. `lean-review` reports markers whose `when` holds as `debt:` findings.
+No state lives in comments. A comment that records a shortcut, a limit or a skipped test as accepted becomes the context later sessions use to keep it, so lean writes no comments beyond a license header, behavior an outside dependency or protocol forces, and a public API contract. `lean-review` flags every other comment, and any `lean:`, `ponytail:`, `TODO`, `FIXME` or `HACK` marker, as `comment:`.
+
+`python -I -X utf8 scripts/lean.py stats <transcripts_dir> [--days N]` shows whether the answer rules hold: per arm (sessions that received lean and sessions that did not), the replies and the share with a visible list over 5 items or more than one question at the end. It counts and never prints text.
+
+The rules come from what pstack's design assumes about agents: they copy what they read, grade themselves on proxies, drift from the goal and keep adding what might help. So the rules keep stale text out of reach, ask for evidence a non-author can check, fix the finish line first, revert what a run did not prove, and settle facts by running something. `docs/superpowers/specs/2026-11-18-pstack-lessons-design.md` maps each rule to the failure it prevents.
 
 `grill` interviews you about a plan in rounds of at most 5 numbered questions. Each question has a recommended answer and one line of reason. The design tree is kept in a file, so a compaction does not lose it.
 
@@ -258,7 +265,7 @@ Run as `python -I -X utf8 scripts/project.py <command>`. `<plugin>` is a plugin 
 | Command | Does |
 |---|---|
 | `summary <plugin> [--usage DIR]` | Node counts, tokens per skill, uses, eval cases, calls in transcripts, and Reads of each skill's reference files |
-| `check <plugin> [--usage DIR]` | Deterministic findings, one per line |
+| `check <plugin> [--usage DIR]` | Deterministic findings, one per line: kind, where, detail, and the fix |
 | `impact <plugin> <node>` | What breaks if it is removed, and what only it uses |
 | `sql <plugin> "<select>"` | Read-only query on `node` and `edge` |
 | `mine <transcripts_dir> <cases.json> [--alias a=b] [--only a,b]` | Labeled prompts from typed commands |
@@ -276,6 +283,7 @@ Findings from `check` are candidates, not verdicts:
 | `no-eval`, `never-called`, `unmeasured` | No eval case or `tests/route_cases.json` entry grades it, or no call in the transcripts, or no transcripts to count in. A skill only the user invokes needs no eval |
 | `never-read` | A skill's reference file no Read in the transcripts opened, subagents included: a candidate to fold in or drop |
 | `no-description`, `long-description`, `long-body` | No description, over 1,536 characters, over about 5,000 tokens, where a compaction cuts a skill |
+| `echo-description` | A sentence of the description repeated in the body, read twice by every session that loads it |
 | `overlap-candidate` | Descriptions share many words. `audit` judges the meaning |
 | `unknown-frontmatter` | A skill key Claude Code does not read, such as `disable_model_invocation`. It is ignored without an error |
 | `hook-config` | An event name `hooks.json` does not have, or a command hook with no `timeout`, which can hold a session for the default |
@@ -291,9 +299,8 @@ Run as `python -I -X utf8 scripts/compass.py <command>`.
 |---|---|
 | `hook` | Reads the event from standard input and prints the index. Called by `hooks/hooks.json` |
 | `status <root>` | Per document: stale or current, sources changed, age. Lists up to 100 new paths per document, each path once, and says how many it left out. Then folders with changes outside every source since the oldest review, up to 30 changed documents among them by name, `ELSEWHERE n` and `STALE n`. Records when it looked |
-| `lint <root>` | One finding per line, then `OK` or `FINDINGS n` |
-| `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint, the drift line and the debt baseline |
-| `debt <root>` | `DEBT n NEW n GONE n INCOMPLETE n SKIP n`, then up to 50 lines: new markers, skipped tests with no marker, markers with no `when`, removed markers. Reads code files only and writes nothing |
+| `lint <root>` | One finding per line with its fix, then `OK` or `FINDINGS n` |
+| `stamp <root> [files] [--accept-goal] [--drift line]` | Records the review time, the goal's fingerprint and the drift line |
 | `usage <root>` | Reads of each document in this project's transcripts, leaving out sessions that ran `stamp`. Counts only |
 
 ## `clone.py` commands
@@ -411,14 +418,16 @@ Sessions and forks that need the owner's decision file a ticket instead of waiti
 - Blocking or not: `ask --default "<what I do without an answer>"` makes a ticket can-wait, so only tickets that stop a session show as needing an answer. A session that went past its own ticket closes it with `done` or `decide --text "self: ..."`.
 - `/phro-project:inbox [id]`: walks the waiting tickets one at a time, highest priority first, records each answer and sends what `queue.py deliver` prints to the asking session.
 - A decided question is not asked again. A ticket returned three times becomes the question "close it or shrink it to one step".
+- The trail: in a run nobody watches, or work that spans sessions, a session records each fork, revert, finished unit and stop with `queue.py log <project> --session <UUID> --phase P --decision D --why W --evidence E --result R`. Rows go to `queue/trail.tsv`, append only and committed. A wrong row stays and a new one names it with `--supersedes <its ts>`. Each cell is one line of at most 300 characters, so detail goes in a file that `--evidence` names, and a cell a spreadsheet would run as a formula is quoted. Without it, the owner rebuilds from transcripts what an autonomous session decided and why.
+- Pause and pickup: work left for a later session goes through `queue.py pause <project> --session <UUID> --note <file> (--title T | --ticket ID)`, only when the owner says so or the session must end. The note needs `## Goal`, `## Verified`, `## Next` and `## Files`, none empty; it is kept at `queue/notes/<id>.md` and the ticket becomes `paused`. A new session, not a compaction or resume, sees up to 3 paused tickets of other sessions with their note paths, and takes one only when the owner asks: `move <id> doing`, check on the real files what the note calls verified, and go on from Next without redoing the rest. A handoff written by hand has no fixed shape and nothing tells a new session it exists.
 
-- The board page: `ui/board.html`, one self-contained file. `queue.py serve <project> [--port 8765]` hands it out on 127.0.0.1 and fills it on each refresh (every 10 s) from `queue/` and `docs/core/`: waiting questions with their options, a free answer box and a two-press drop, can-wait, decided, in progress, sessions and the core documents map. Answers and drops go through `decide` and `drop`; writes need the token the page was served with and a local Host and Origin. Nothing is published. The `show` skill starts it through `<project>/.claude/launch.json` and opens it in the browser pane.
+- The board page: `ui/board.html`, one self-contained file. `queue.py serve <project> [--port 8765]` hands it out on 127.0.0.1 and fills it on each refresh (every 10 s) from `queue/` and `docs/core/`: waiting questions with their options, a free answer box and a two-press drop, can-wait, decided, in progress, paused work, the decisions sessions logged in the last 7 days (decision, result, phase and session; never why or evidence), sessions and the core documents map. Answers and drops go through `decide` and `drop`; writes need the token the page was served with and a local Host and Origin. Nothing is published. The `show` skill starts it through `<project>/.claude/launch.json` and opens it in the browser pane.
 
-`queue.py` commands: `init`, `ask`, `decide`, `move`, `done`, `drop`, `board`, `deliver`, `sessions`, `serve`, `hook`; each prints `OK`, `SEND` or `REFUSED` with a path, never a ticket body.
+`queue.py` commands: `init`, `ask`, `decide`, `move`, `done`, `drop`, `log`, `pause`, `board`, `deliver`, `sessions`, `serve`, `hook`; each prints `OK`, `SEND` or `REFUSED` with a path, never a ticket body.
 
 ### The queue panel
 
-The panel (`mods/queue-panel/`) reads `queue/board.json` only. Sections, empty ones hidden except the first: Needs your answer (blocking tickets, with the question, the session's title, stopped or still working, an answer button that fills `/<copy>:inbox <id>`, and a drop button that on a second press runs `queue.py drop`, closing the ticket with a record line), Can wait (collapsed), Decided not picked up (over a day highlighted), In progress, Sessions (title, working or idle, open count), attention counts and what closed in 7 days. Sessions appear by title, never by full id. It is a plugin of its own, because a plugin's panel state belongs to that plugin's name and each project's copy has another name. `init` turns it on for one project, from the project folder:
+The panel (`mods/queue-panel/`) reads `queue/board.json` only. Sections, empty ones hidden except the first: Needs your answer (blocking tickets, with the question, the session's title, stopped or still working, an answer button that fills `/<copy>:inbox <id>`, and a drop button that on a second press runs `queue.py drop`, closing the ticket with a record line), Can wait (collapsed), Decided not picked up (over a day highlighted), In progress, Sessions (title, working or idle, open count), attention counts and what closed in 7 days. Sessions appear by title, never by full id. Paused work and the trail are on the board page only. It is a plugin of its own, because a plugin's panel state belongs to that plugin's name and each project's copy has another name. `init` turns it on for one project, from the project folder:
 
 ```bash
 claude plugin marketplace add <the project's copy>/mods/queue-panel --scope local
@@ -429,7 +438,7 @@ Then `/reload-plugins`. Every project registers the marketplace under the one na
 
 ## Daily report
 
-Each copy holds its own setting, `"daily"` in its `origin.json`, and `update` never changes it. A new copy starts off (`init` writes `"daily": false`); a copy made before this setting existed has no key and keeps running. `daily.py on` and `daily.py off` switch it. Once on, a project's copy writes `docs/daily/<YYYY-MM-DD>(<요일>).md` on each weekday: what was finished since the previous weekday and what comes today, in short Korean list items (style in `skills/daily/SKILL.md`). No scheduler: `daily.py hook` runs at every session start and prompt, and the first one after 08:00 KST that finds today's file missing starts `daily.py run` in the background. `run` reads the tails of every session transcript of the project for the period (previous weekday 00:00 to today 00:00 KST, so Monday covers Friday to Sunday), the project's commits, the queue's closed and open tickets and the current goals in `docs/core/README.md`, leaves out the sessions and stretches listed in `~/.claude/private-sessions.txt` (`daily.py private` adds the running session; format in `skills/daily/SKILL.md`), asks `claude -p --model sonnet` with no tools, checks the form and writes the file. A failure is kept in `docs/daily/.state/<date>.error` and retried after 30 minutes. The original plugin never writes one.
+Each copy holds its own setting, `"daily"` in its `origin.json`, and `update` never changes it. A new copy starts off (`init` writes `"daily": false`); a copy made before this setting existed has no key and keeps running. `daily.py on` and `daily.py off` switch it. Once on, a project's copy writes `docs/daily/<YYYY-MM-DD>(<요일>).md` on each weekday: what was finished since the previous weekday and what comes today, in short Korean list items (style in `skills/daily/SKILL.md`). No scheduler: `daily.py hook` runs at every session start and prompt, and the first one after 08:00 KST that finds today's file missing starts `daily.py run` in the background. `run` reads the tails of every session transcript of the project for the period (previous weekday 00:00 to today 00:00 KST, so Monday covers Friday to Sunday), the project's commits, the queue's closed and open tickets, the decisions sessions logged in `queue/trail.tsv` and the current goals in `docs/core/README.md`, leaves out of transcripts, tickets and decisions alike the sessions and stretches listed in `~/.claude/private-sessions.txt` (`daily.py private` adds the running session; format in `skills/daily/SKILL.md`), asks `claude -p --model sonnet` with no tools, checks the form and writes the file. A failure is kept in `docs/daily/.state/<date>.error` and retried after 30 minutes. The original plugin never writes one.
 
 ```bash
 python -I -X utf8 <copy>/scripts/daily.py run --force [--date YYYY-MM-DD]

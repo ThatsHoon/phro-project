@@ -1,7 +1,3 @@
-"""A project's first use makes its own copy, the original stays as it was, and a newer original reaches a copy without touching what the project added.
-
-Run: python -I -X utf8 tests/test_clone.py
-"""
 import hashlib
 import json
 import os
@@ -14,11 +10,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-import clone  # noqa: E402
+import clone
 
 
 def tree(root):
-    """Every file under root with its bytes' hash, so any change at all shows."""
     return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
 
 
@@ -49,7 +44,7 @@ def demo():
             (path / "src/app.py").write_text("print(1)\n", encoding="utf-8")
             return path
 
-        if (original / clone.ORIGIN).is_file():  # run from a project's copy: turn the copied tree back into an original
+        if (original / clone.ORIGIN).is_file():
             (original / clone.ORIGIN).unlink()
             (original / clone.MARKET).unlink(missing_ok=True)
             data = json.loads((original / clone.MANIFEST).read_text(encoding="utf-8"))

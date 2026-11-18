@@ -29,14 +29,14 @@ HERE = Path(__file__).resolve().parents[1]
 KST = timezone(timedelta(hours=9))
 HOUR = 8
 DAYS = "월화수목금토일"
-CHILD = "PHRO_DAILY_CHILD"  # set for the background run and the model call, so neither starts another run
+CHILD = "PHRO_DAILY_CHILD"
 RETRY_S = 30 * 60
-PER_SESSION = 2400  # characters of one session in the digest
+PER_SESSION = 2400
 DIGEST = 60000
 TAG = re.compile(r"<([a-zA-Z][\w-]*)[^>]*>.*?</\1>", re.S)
 STAMP = re.compile(rb'"timestamp":\s*"(\d{4}-\d\d-\d\dT[\d:.]+Z?)"')
 SPOKEN = re.compile(rb'"type":\s*"(?:user|assistant)"')
-PRIVATE = Path.home() / ".claude/private-sessions.txt"  # one line each: "<session id>" or "<session id> <from> <to>"; "#" starts a comment
+PRIVATE = Path.home() / ".claude/private-sessions.txt"
 
 
 def record():
@@ -52,12 +52,10 @@ def project():
 
 
 def enabled():
-    """The copy's own setting. New copies are written with "daily": false; a copy made before the switch has no key and keeps running."""
     return record().get("daily", True) is True
 
 
 def switch(on):
-    """Set "daily" in origin.json; sync keeps the other keys and this one."""
     data = record()
     if not data.get("project"):
         print("SKIPPED\tthe original plugin writes no report")
@@ -77,7 +75,6 @@ def name_of(day):
 
 
 def period(day):
-    """[previous weekday 00:00, day 00:00) in KST: Monday covers Friday to Sunday."""
     end = datetime(day.year, day.month, day.day, tzinfo=KST)
     start = end - timedelta(days=1)
     while start.weekday() >= 5:
@@ -86,7 +83,6 @@ def period(day):
 
 
 def due(now):
-    """Today's date when its report should exist by now, else None. lean: no public holidays | when: owner | fix: a holiday list in docs/daily"""
     now = now.astimezone(KST)
     if now.weekday() >= 5 or now.hour < HOUR:
         return None
@@ -104,7 +100,6 @@ def stamp(raw):
 
 
 def entries(path, start, end, chunk=4 << 20):
-    """Transcript lines with a timestamp in [start, end), read backwards from the end until one is older than start."""
     found = []
     with open(path, "rb") as f:
         pos, rest = f.seek(0, 2), b""
@@ -114,7 +109,7 @@ def entries(path, start, end, chunk=4 << 20):
             f.seek(pos)
             parts = (f.read(n) + rest).split(b"\n")
             rest = parts.pop(0) if pos else b""
-            for raw in reversed(parts):  # at pos 0 nothing was popped, so the first line is in parts
+            for raw in reversed(parts):
                 t = stamp(raw) if raw.strip() else None
                 if t is None:
                     continue
@@ -144,8 +139,6 @@ def title_of(path):
 
 
 def private():
-    """Session id -> the stretches kept out of the report as (from, to) pairs, or None for the whole session.
-    Times are ISO; one without a zone is KST. A line that does not parse hides its whole session rather than leak it."""
     hidden = {}
     try:
         lines = PRIVATE.read_text(encoding="utf-8").splitlines()
@@ -167,7 +160,6 @@ def private():
 
 
 def session(path, start, end, hide=()):
-    """One session's typed prompts and last replies inside the period, leaving out the hidden stretches, or None."""
     if hide is None:
         return None
     asked, said = [], []
@@ -190,7 +182,7 @@ def session(path, start, end, hide=()):
         (asked if d.get("type") == "user" else said).append(text)
     if not asked and not said:
         return None
-    title = path.stem[:8] if hide else title_of(path)  # a title can name the private part
+    title = path.stem[:8] if hide else title_of(path)
     lines = [f"## {title}", *(f"- asked: {a[:240]}" for a in asked[-12:]), *(f"- replied: {s[:700]}" for s in said[-3:])]
     return "\n".join(lines)[:PER_SESSION]
 
@@ -209,7 +201,12 @@ def commits(root, start, end):
     return [l for l in r.stdout.splitlines() if l.strip()][:40] if r.returncode == 0 else []
 
 
-def tickets(root, start, end):
+def hidden_at(hidden, sid, when):
+    hide = hidden.get(sid, ())
+    return hide is None or any(a <= when < b for a, b in hide)
+
+
+def tickets(root, start, end, hidden=None):
     try:
         board = json.loads((Path(root) / "queue/board.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -217,11 +214,32 @@ def tickets(root, start, end):
     closed, open_ = [], []
     for t in board.get("tickets", []):
         changed = board.get("generated", 0) - t.get("changed_s", 0)
+        if hidden_at(hidden or {}, t.get("session"), datetime.fromtimestamp(changed, timezone.utc)):
+            continue
         if t.get("status") == "done" and start.timestamp() <= changed < end.timestamp():
             closed.append(t["title"])
         elif t.get("status") != "done":
             open_.append(f"{t['title']} ({t['status']})")
     return closed, open_
+
+
+def decisions(root, start, end, hidden=None):
+    try:
+        lines = (Path(root) / "queue/trail.tsv").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[1:]:
+        cells = line.split("\t")
+        if len(cells) != 7:
+            continue
+        try:
+            when = datetime.strptime(cells[0], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if start <= when < end and not hidden_at(hidden or {}, cells[1], when):
+            out.append(f"{cells[3]} ({cells[6]})")
+    return out[-40:]
 
 
 def goals(root):
@@ -242,7 +260,10 @@ def digest(root, day):
     found = commits(root, start, end)
     if found:
         parts += ["# Commits", *(f"- {c}" for c in found)]
-    closed, open_ = tickets(root, start, end)
+    closed, open_ = tickets(root, start, end, hidden)
+    made = decisions(root, start, end, hidden)
+    if made:
+        parts += ["# Decisions sessions made on their own (decision, result)", *(f"- {m}" for m in made)]
     if closed:
         parts += ["# Queue tickets closed", *(f"- {c}" for c in closed)]
     if open_:
@@ -250,7 +271,7 @@ def digest(root, day):
     g = goals(root)
     if g:
         parts += ["# Current goals (docs/core)", g]
-    return "\n".join(parts)[:DIGEST], bool(sessions or found or closed)
+    return "\n".join(parts)[:DIGEST], bool(sessions or found or closed or made)
 
 
 def style():
@@ -259,7 +280,7 @@ def style():
 
 
 HEADS = ["어제 완료:", "오늘 할 일:"]
-ITEM_MAX = 42  # "* " plus 40 characters
+ITEM_MAX = 42
 
 PROMPT = """Write a Korean daily work report from the material below. Output only the report, nothing before or after it.
 Exactly two sections, each heading once: `어제 완료:` (work finished or clearly advanced in the period) and `오늘 할 일:` (the next steps the material names: open questions, open tickets, the last replies' next actions, the current goals). Merge the same work across sessions into one item per piece of work. The reader is a teammate who never saw these sessions: say what was done in everyday words, the way a person posts it in the team chat. When the period had no work, write `* 작업 없음` under 어제 완료.
@@ -272,7 +293,6 @@ Exactly two sections, each heading once: `어제 완료:` (work finished or clea
 
 
 def check(text):
-    """The report's lines, or ValueError naming the first line that breaks the form."""
     lines = [l.rstrip() for l in text.strip().strip("`").strip().splitlines()]
     if not lines or not lines[0].endswith(":"):
         raise ValueError(f"first line is not a heading: {lines[:1]}")
@@ -285,9 +305,9 @@ def check(text):
         elif l:
             if re.search(r"[다요]\.?$", l):
                 raise ValueError(f"item ends as a sentence: {l[:80]}")
-            if len(l) > ITEM_MAX:  # long items are where the jargon goes
+            if len(l) > ITEM_MAX:
                 raise ValueError(f"item longer than {ITEM_MAX - 2} characters: {l[:80]}")
-            if re.search(r"[0-9+?()\[\]]", l):  # run numbers, versions, ports, `a+b` shorthand, side notes
+            if re.search(r"[0-9+?()\[\]]", l):
                 raise ValueError(f"item holds a digit, `+`, `?` or brackets; say it in words: {l[:80]}")
             count[heads[-1]] = count.get(heads[-1], 0) + 1
     if heads != HEADS:
@@ -298,14 +318,13 @@ def check(text):
 
 
 def claude_cmd():
-    """The model command: `claude`, or PHRO_DAILY_CLAUDE (a JSON list or one program), which tests point at a stub."""
     v = os.environ.get("PHRO_DAILY_CLAUDE", "claude")
     return json.loads(v) if v.startswith("[") else [shutil.which(v) or v]
 
 
 def ask_model(prompt):
     env = {**os.environ, CHILD: "1"}
-    with tempfile.TemporaryDirectory() as cwd:  # the call leaves no transcript in the project
+    with tempfile.TemporaryDirectory() as cwd:
         r = subprocess.run([*claude_cmd(), "-p", "--model", "sonnet", "--tools", "", "--no-session-persistence"], input=prompt, cwd=cwd,
                            capture_output=True, text=True, encoding="utf-8", env=env, timeout=600)
     if r.returncode:
@@ -329,7 +348,7 @@ def run(day, force=False):
         prompt = PROMPT.format(style=style(), material=material)
         try:
             text = check(ask_model(prompt))
-        except ValueError as e:  # one more try, told what was wrong
+        except ValueError as e:
             text = check(ask_model(prompt + f"\n\nYour last answer broke the form ({e}). Follow the style exactly."))
         tmp = target.with_suffix(".tmp")
         tmp.write_text(text, encoding="utf-8")
@@ -346,7 +365,6 @@ def run(day, force=False):
 
 
 def claim(day):
-    """True when this process may start today's run: no report yet, no fresh lock, no fresh error."""
     if (out_dir() / name_of(day)).exists():
         return False
     state = out_dir() / ".state"
@@ -387,13 +405,11 @@ def hook():
 
 
 def moment(value):
-    """An ISO time or "now", as UTC; a time without a zone is KST."""
     t = datetime.now(KST) if value == "now" else datetime.fromisoformat(value.replace("Z", "+00:00"))
     return (t if t.tzinfo else t.replace(tzinfo=KST)).astimezone(timezone.utc)
 
 
 def register(sid, start=None, end=None):
-    """Add one line to PRIVATE: the whole session, or the stretch from start to end (an open end runs to year 9999)."""
     if not sid or not re.fullmatch(r"[\w-]{8,}", sid):
         print("FAILED\tno session id: pass --session, or run it from inside a Claude Code session")
         return 1

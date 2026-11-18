@@ -1,8 +1,5 @@
-"""Seeded-defect test: plant one of each defect in a plugin copy, expect each found, and expect nothing on the clean control.
-
-Run: python -I -X utf8 tests/test_project.py
-"""
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -10,7 +7,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/project.py"
 sys.path.insert(0, str(SCRIPT.parent))
-import project  # noqa: E402
+import project
 
 SHARED = "\n".join(f"Shared rule number {i} that was copied into more than one instruction file." for i in range(4))
 
@@ -30,7 +27,6 @@ def grader(name):
 
 
 def clean(root):
-    """A small plugin with nothing wrong: every part reached, every skill tested, descriptions apart."""
     write(root, ".claude-plugin/plugin.json", json.dumps({"name": "demo", "version": "0.1.0"}))
     write(root, "skills/alpha/SKILL.md", skill("alpha", "Rotates database credentials on a schedule.", "Read `references/steps.md`, then run `python scripts/rotate.py`."))
     write(root, "skills/alpha/references/steps.md", "Step one.\n")
@@ -76,6 +72,29 @@ def demo():
         write(root, "skills/beta/SKILL.md", skill("beta", "Renders invoice PDFs from monthly billing exports.", "Hand off to `demo:alpha`.\n" + SHARED))
     assert kinds(run(copied)[0]) == {"shared-lines"}
 
+    def echo(root):
+        write(root, "skills/beta/SKILL.md", skill("beta", "Renders invoice PDFs from monthly billing exports. Use it when finance asks for the month's invoices.",
+                                                  "Hand off to `demo:alpha`. Use it when finance asks for the month's invoices."))
+    assert run(echo)[0] == [("echo-description", "skill:beta", "Use it when finance asks for the month's invoices.")], run(echo)[0]
+
+    def short_echo(root):
+        write(root, "skills/beta/SKILL.md", skill("beta", "Renders invoice PDFs from monthly billing exports.", "Hand off to `demo:alpha`. Renders invoice PDFs."))
+    assert not run(short_echo)[0], "a short phrase shared with the description is not an echo"
+
+    import inspect
+    emitted = set(re.findall(r'\(\("([a-z-]+)"', inspect.getsource(project.findings) + inspect.getsource(project.case_findings) + inspect.getsource(project.hook_findings)))
+    emitted |= {"echo-description", "duplicate-file", "unknown-frontmatter", "never-called", "never-read"}
+    assert emitted == set(project.FIX), emitted ^ set(project.FIX)
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "demo"
+        clean(root)
+        write(root, "scripts/dead.py", "x = 1\n")
+        ran = subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), "check", str(root)], capture_output=True, text=True, encoding="utf-8")
+        assert ran.stdout.splitlines()[0] == "orphan\tscripts/dead.py\tno file refers to it\tdelete it, or name it where it is used", ran.stdout
+
+    assert [project.error_kind(e) for e in ("Reached maximum number of turns", "Request timed out", "API Error: 529 overloaded", "boom")] == [
+        "turn_limit", "timeout", "api_error", "other"], "the catch-all comes last, or it takes every error"
+
     def orphan(root):
         write(root, "scripts/dead.py", "print('never called')\n")
     assert ("orphan", "scripts/dead.py", "no file refers to it") in run(orphan)[0]
@@ -93,6 +112,16 @@ def demo():
         untested(root)
         write(root, "tests/route_cases.json", json.dumps([{"id": "n1", "skill": None, "prompt": "do not fire gamma"}]))
     assert kinds(run(only_a_negative)[0]) == {"no-eval"}, "a negative case that names a skill does not test it"
+
+    def leaky(root):
+        in_route_cases(root)
+        write(root, "tests/route_cases.json", json.dumps([{"id": "c1", "skill": "gamma", "prompt": "compress, this is a test"},
+                                                          {"id": "c2", "skill": "gamma", "prompt": "타일 압축해줘"}]))
+        write(root, "evals/quality/gamma/one/prompt.md", "압축 품질 평가용 입력\n")
+        write(root, "evals/quality/gamma/two/prompt.md", "Compress these tiles for the archive.\n")
+    assert sorted(f for f in run(leaky)[0] if f[0] == "leaky-case") == [
+        ("leaky-case", "evals/quality/gamma/one/prompt.md", "평가"),
+        ("leaky-case", "tests/route_cases.json#c1", "this is a test")], run(leaky)[0]
 
     def user_only(root):
         write(root, "skills/gamma/SKILL.md", "---\nname: gamma\ndescription: Compresses satellite imagery tiles for archive storage.\ndisable-model-invocation: true\n---\n\nDo it.\n")
@@ -275,7 +304,7 @@ def demo():
         assert "target\t2/3" in out and "alpha\t3\t2\t0\t0\t0\t1" in out and "wrong_order" in out, out
         assert "o2 alpha -> called, but not after the step" in out, "a call at the wrong moment is not a hit"
 
-        def arm(passes, n=3):  # passes: grader name -> how many of n runs passed it
+        def arm(passes, n=3):
             return [{"costUsd": 0.1, "error": None, "graders": [{"name": g, "passed": i < k} for g, k in passes.items()]} for i in range(n)]
         defs = [{"name": "skill", "type": "tool_used", "config": {"tool": "Skill"}}] + [{"name": g, "type": "regex", "config": {}} for g in ("b-ban", "f-num", "j-faith")]
         doc = {"partial": False, "cases": [
@@ -307,7 +336,6 @@ def demo():
     def cli(*args):
         return subprocess.run([sys.executable, "-I", "-X", "utf8", str(SCRIPT), *map(str, args)], capture_output=True, text=True, encoding="utf-8").stdout
 
-    # An MCP tool case is graded on the tool, and the run may call it.
     tool = "mcp__plugin_demo_files__search"
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "demo"
@@ -330,13 +358,12 @@ def demo():
         out = cli("tally", path)
         assert f"{tool}\t2\t1\t1\t0\t0\t0" in out and f"t3 {tool} -> beta" in out, out
 
-    # A reference nobody reads is a candidate for removal; a subagent's read counts.
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "demo"
         clean(root)
         write(root, "skills/beta/SKILL.md", skill("beta", "Renders invoice PDFs from monthly billing exports.", "Hand off to `demo:alpha`. Read `references/layout.md`."))
         write(root, "skills/beta/references/layout.md", "Layout.\n")
-        write(root, "skills/beta/CONTRACT.md", "Output: an invoice PDF.\n")  # read by quality-test, not by the skill at work
+        write(root, "skills/beta/CONTRACT.md", "Output: an invoice PDF.\n")
         seen = Path(d) / "transcripts"
         events = [{"type": "assistant", "uuid": str(i), "message": {"content": [{"type": "tool_use", "name": "Skill", "input": {"skill": f"demo:{n}"}}]}}
                   for i, n in enumerate(("alpha", "beta"))]
@@ -347,7 +374,6 @@ def demo():
         summary = cli("summary", root, "--usage", seen)
         assert "skills/alpha/references/steps.md\t1" in summary and "skills/beta/references/layout.md\t0" in summary, summary
 
-    # An accepted baseline remembers the model and what the skills were, and says so when either changed.
     with tempfile.TemporaryDirectory() as d:
         copy = Path(d) / "copy"
         clean(copy)

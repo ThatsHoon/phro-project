@@ -32,7 +32,7 @@ When the user accepts a whole round with one word and a decision in it is costly
 
 ## Facts and decisions
 
-Finding facts is your job, never the user's. When a question needs a fact from the files, tools or the web, look it up, or send a sub-agent, and do not ask the user for it. A running lookup blocks only the questions downstream of it; ask the rest of the frontier now. Decisions belong to the user: put each to them and wait.
+Finding facts is your job, never the user's. When a question needs a fact from the files, tools or the web, look it up, or send a sub-agent, and do not ask the user for it. A question that a quick run or prototype can settle is a fact too: settle it that way and give the result in the round. A running lookup blocks only the questions downstream of it; ask the rest of the frontier now. Decisions belong to the user: put each to them and wait.
 
 ## The tree file
 

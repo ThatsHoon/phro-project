@@ -29,7 +29,7 @@ HERE = Path(__file__).resolve().parents[1]
 ORIGIN = "origin.json"
 MANIFEST = ".claude-plugin/plugin.json"
 MARKET = ".claude-plugin/marketplace.json"
-OWN = {ORIGIN, MANIFEST, MARKET}  # written for each copy, so a sync leaves them to this script
+OWN = {ORIGIN, MANIFEST, MARKET}
 IGNORE = {".git", ".in_use", "__pycache__", ".phro-project", "results", ".venv", "node_modules", ".superpowers", ".worktrees"}  # folder or file names; a worktree's .git is a file
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 VERSION = re.compile(r"\d+\.\d+\.\d+")
@@ -57,7 +57,6 @@ def digest(path):
 
 
 def tree_id(root):
-    """One hash for every file a copy would take, so a changed original shows without a new version number."""
     h = hashlib.sha256()
     for rel in sorted(files_of(root)):
         h.update(f"{rel}\0{digest(root / rel)}\n".encode("utf-8"))
@@ -72,7 +71,6 @@ def git(root, *args):
 
 
 def git_origin(root):
-    """The repository and its published ref, when the original is the top of a git checkout, so a copy follows what was committed, not a worktree that may go away."""
     if git(root, "rev-parse", "--show-prefix") != "":
         return None
     repo = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
@@ -95,7 +93,6 @@ def short_hash(project):
 
 
 def place_for(project, parent, original):
-    """This project's folder under parent, and whether its copy is already there. A folder name two projects share gets a hash, so neither can reach the other's copy."""
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", project.name).strip("-._") or f"project-{short_hash(project)}"
     base = f"{original}_{slug}"
     for folder in (parent / base, parent / f"{base}-{short_hash(project)}"):
@@ -107,7 +104,6 @@ def place_for(project, parent, original):
 
 
 def create(project, folder, source=HERE):
-    """A copy that loads in place: its own marketplace at its root, with the plugin at ./, so an edit needs only /reload-plugins."""
     found = git_origin(source)
     if found:
         with tempfile.TemporaryDirectory() as scratch:
@@ -135,12 +131,11 @@ def make(project, folder, source, where):
     write_json(temporary / MANIFEST, manifest)
     owner = manifest.get("author") or {"name": original}
     write_json(temporary / MARKET, {"name": folder.name, "owner": owner, "description": f"Holds this project's own copy of {original}.", "plugins": [{"name": folder.name, "source": "./", "description": manifest["description"]}]})
-    write_json(temporary / ORIGIN, {"origin": original, **where, "version": version, "project": str(project), "daily": False, "files": files})  # a new copy starts with the daily report off
+    write_json(temporary / ORIGIN, {"origin": original, **where, "version": version, "project": str(project), "daily": False, "files": files})
     temporary.rename(folder)
 
 
 def register(project, folder, original):
-    """Turn the copy on and the original off, in this project's own settings. Returns what failed."""
     claude = shutil.which("claude")
     if not claude:
         return ["the claude command was not found"]
@@ -150,7 +145,7 @@ def register(project, folder, original):
                  ["plugin", "disable", original, "--scope", "local"]):
         done = subprocess.run([claude, *args], cwd=project, capture_output=True, text=True, encoding="utf-8", errors="replace")
         said = (done.stdout + done.stderr).strip()
-        if done.returncode and "already" not in said:  # a second ensure finds its own earlier work
+        if done.returncode and "already" not in said:
             failed.append(f"claude {' '.join(args)}: {said[:300]}")
     return failed
 
@@ -191,14 +186,12 @@ def newest_origin(record):
 
 
 def repo_of(record):
-    """A record's git original, also for a copy made before records named one."""
     if record.get("origin_repo"):
         return Path(record["origin_repo"]), record["origin_ref"]
     return git_origin(Path(record["origin_dir"])) if Path(record["origin_dir"]).is_dir() else None
 
 
 def base_of(repo, ref, rel, recorded):
-    """The short commit of the original whose rel hashes to recorded (as an export writes it), or None."""
     for commit in (git(repo, "log", "--format=%H", "-n", "200", ref, "--", rel) or "").split():
         data = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", commit, "--", rel], capture_output=True).stdout
         try:
@@ -212,7 +205,6 @@ def base_of(repo, ref, rel, recorded):
 
 
 def newer(record):
-    """What is ahead of this copy, or None: a new commit on the original's ref, or an original folder that changed or has a newer version."""
     found = repo_of(record)
     if found:
         commit = git(found[0], "rev-parse", found[1])
@@ -247,12 +239,11 @@ def command_sync(a):
 
 
 def take(record, source, where, dry_run, history=None):
-    """Bring source into this copy. Files the project added or changed stay as they are; the original's changes to them are named."""
     old = record["files"]
     files = {}
     counts = {"updated": 0, "added": 0, "removed": 0}
     kept = []
-    changed = {}  # kept file -> what the copy has not taken from the original: "", "<base>..<new>" or "removed"
+    changed = {}
     pending = {}
     planned = []
 
@@ -273,11 +264,11 @@ def take(record, source, where, dry_run, history=None):
             act("added", rel)
         else:
             current = digest(target)
-            if current != wanted and old.get(rel) != current:  # the project changed it, so it stays
+            if current != wanted and old.get(rel) != current:
                 kept.append(rel)
                 if rel in old:
                     files[rel] = old[rel]
-                    if old[rel] != wanted:  # the original changed it too, and the copy does not have that change
+                    if old[rel] != wanted:
                         base = history and base_of(history[0], history[1], rel, old[rel])
                         changed[rel] = f"{base}..{where['origin_id'][:7]}" if base else ""
                         pending[rel] = wanted
@@ -325,7 +316,6 @@ def kept_line(word, rel, changed):
 
 
 def command_merged(a):
-    """The project took the original's change into these kept files, so the next sync stops naming it."""
     if not (HERE / ORIGIN).is_file():
         sys.exit("FAILED\tthis is the original: run merged from a project's copy")
     record = read_json(HERE / ORIGIN)

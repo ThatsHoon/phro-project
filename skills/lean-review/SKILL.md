@@ -9,7 +9,9 @@ Find what this change could lose. The best outcome for the diff is to get shorte
 
 ## Scope
 
-Review the diff or path the user named. With none named, review `git diff HEAD` (staged and unstaged) plus the untracked files `git status --short` lists, and say so in the first line. Read the whole diff, and grep every caller of a function before suggesting its deletion. Also run `grep -rn "lean:\|ponytail:" <reviewed paths>` and check each marker's `when` against the code as it is now.
+Review the diff or path the user named. With none named, review `git diff HEAD` (staged and unstaged) plus the untracked files `git status --short` lists, and say so in the first line. Read the whole diff, and grep every caller of a function before suggesting its deletion. Read every comment in the reviewed lines too.
+
+When this session wrote the diff, hand the review to a fresh subagent with the paths and `${CLAUDE_PLUGIN_ROOT}/skills/lean-review/SKILL.md`, since an author defends what it wrote. Check each finding it returns against the code before you report it.
 
 ## Format
 
@@ -22,7 +24,7 @@ One line per finding: `<file>:L<line>: <tag> <what>. <replacement>.` (drop `<fil
 | `native:` | a dependency or code doing what the platform already does | name the feature |
 | `yagni:` | an abstraction with one implementation, config nobody sets, a layer with one caller | inline it |
 | `shrink:` | the same logic in more lines than needed | show the shorter form |
-| `debt:` | a `lean:` marker whose `when` already holds | its `fix` |
+| `comment:` | a comment outside the exceptions below, or a `lean:`, `ponytail:`, `TODO`, `FIXME` or `HACK` marker | nothing, or a rename or extraction that makes the code say it; for a comment that guards a constraint, the test, assertion or type that enforces it; for a marker, the work it names done now |
 
 Examples, one per tag:
 - `cache.py:L52-71: delete: retry wrapper around an idempotent local call. Nothing replaces it.`
@@ -30,13 +32,13 @@ Examples, one per tag:
 - `L4: native: a date-picker library for one field. <input type="date">, 0 deps.`
 - `repo.py:L88: yagni: AbstractRepository with one implementation. Inline it until a second one exists.`
 - `L30-44: shrink: a loop that builds a dict. dict(zip(keys, values)), 1 line.`
-- `queue.py:L139: debt: one git call per ticket, queue now 412 tickets. Batch with one git log.`
+- `queue.py:L139: comment: "lean: one git call per ticket" records a shortcut as settled. Batch with one git log, drop the comment.`
 
 End with `net: -<N> lines possible.` When there is nothing to cut, say `Lean already. Ship.` and stop.
 
 ## Boundaries
 
 - Over-engineering only. Correctness bugs, security holes and performance are out of scope; point them to a normal review.
-- A `lean:` or `ponytail:` comment marks a deliberate corner. Flag it only when the ceiling it names has been reached.
+- Comments that stay: a license header; behavior forced by an outside dependency, platform or protocol that the code cannot show, with its issue or spec link; a public API's documented contract. Every other comment is a finding, since a comment that records a shortcut or a limit becomes the reason later work keeps it. When unsure an exception applies, it is a finding.
 - The one runnable check that lean's Build rules leave behind is never flagged.
 - Does not apply the fixes; it only lists them.

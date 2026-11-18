@@ -1,6 +1,6 @@
 ---
 name: design
-description: Adds a capability to this project or its plugin: finds what already exists, decides where it belongs, builds it when told to, and tests that it fires when it should. 스킬로 만들어서 내장, 앞으로 ~할 때 자동으로, 이런 파일 읽는 플러그인 찾아서 설치, 플러그인 기능 추가 설계, 어디에 넣을지.
+description: Adds a capability to this project or its plugin, or stops a repeated mistake for good: finds what already exists, decides where it belongs, builds it when told to, and tests that it fires when it should. 스킬로 만들어서 내장, 앞으로 ~할 때 자동으로, 이런 파일 읽는 플러그인 찾아서 설치, 플러그인 기능 추가 설계, 어디에 넣을지, 같은 실수 다시 못 하게 막아.
 ---
 
 # design
@@ -27,8 +27,20 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
 | Skill with `disable-model-invocation: true` | Judgement is needed, and it moves files, spends money, or the user always types it | No listing cost, and it never fires by accident |
 | Skill | Judgement is needed, and a user request or a standing rule can name it | Listed by description, read on demand |
 | `paths` on a skill | Only relevant when certain files are in play | Gated without a hook |
+| Scheduled run or loop | It must happen with nobody typing: on a clock, or again and again until a condition holds. Build its prompt by `references/runs.md` | Every pass costs a session, and nobody watches it |
 | Hook | Must react to an event the model will not act on by itself, such as a tool error. Measured misses come first (`route-test`). A hook cannot see a step like "the draft is done": that is a standing rule. Build it by `references/hooks.md` | Runs every time, so it costs every time |
 | MCP | A tool or a live connection that a script run cannot provide, or state shared across calls. Build it by `references/mcp.md` | Costs a server |
+
+5b. A repeated mistake is placed by what enforces the fix, not by cost, since nothing fails when an agent skips prose. It counts once it has happened twice; a written rule broken again is that second time. Read the commits, reverts and corrections that show it, then take the first rung that holds:
+
+| Rung | Fix |
+|---|---|
+| Architecture | One owner for the state, one supported way to do the task, the wrong path removed or hidden so it fails |
+| Permission or hook | A `permissions.deny` entry, or a PreToolUse hook whose message names what to do instead |
+| Type, lint or test | A check that fails on the mistake; prove it by running it on a real past instance |
+| Written rule | Only for a judgment call no check can make, as one standing rule naming what it guards |
+
+Name the rung in the rule that stays, as compass's writing rules say, and report why each higher rung did not work. When a structural fix lands, the written rule it replaces is deleted on the user's yes: the rule was the symptom.
 
 6. Put it in this project's copy, never in the original:
    - A skill goes in `skills/<name>/SKILL.md` of the copy `ensure` printed, its cases in that copy's `tests/route_cases.json`. The copy loads in place, so `/reload-plugins` makes it live, and `clone.py sync` never touches what the project added. The original stays free of any project, so it can be pushed as it is.
@@ -40,10 +52,12 @@ Script: `python -I -X utf8 ${CLAUDE_PLUGIN_ROOT}/scripts/project.py <command>`. 
    - From a step in the work: cases with `after` and `rule`, as `route-test` describes.
    - Mark 3 cases that should fire and 3 that should not with `"split": "test"`, and do not read them while writing the description. `tally --cases` scores them apart; a clearly lower score there means the description was fitted to the other cases.
 8b. For a skill that produces something (text, a file, a decision), write what it must produce before the body: `skills/<name>/CONTRACT.md` and 3 to 5 cases in `evals/quality/<name>/`, by `${CLAUDE_PLUGIN_ROOT}/skills/design/references/quality.md`. Agree the contract with the user; after that it changes only on their word. Write the body by the kind of failure the cases show: the output's parts in order when the shape goes wrong, a required slot when something is left out, a condition on something visible when it depends on the case, and a plain prohibition only for a rule skipped under pressure. Boundaries are checked by graders, not repeated as bans in the body.
-9. Write the description last, from those prompts: what it does in one clause, then the words users really type, in their language. Never list its steps in order, since a model can follow a description in place of the body. In one measurement, adding the user's own verbs to a description moved a skill from 1 of 7 to 6 of 7. Keep the combined description and when_to_use under 1,536 characters; shorter is better, since a description is read every session.
+9. Every sentence of a body becomes an instruction some agent follows: keep only those that change a decision, and give a reason only where judgment needs it, with an example of the failure. Write the description last, from those prompts: what it does in one clause, then the words users really type, in their language. Never list its steps in order, since a model can follow a description in place of the body. In one measurement, adding the user's own verbs to a description moved a skill from 1 of 7 to 6 of 7. Keep the combined description and when_to_use under 1,536 characters; shorter is better, since a description is read every session. The body never repeats it (`check` flags `echo-description`).
 10. Build it if the user told you to, and write its standing rule in the same step. A script or hook that runs several steps, or has a side effect such as a push, a deploy or a message, also gets:
    - one JSON line per step start and end, under one run id, with the elapsed time and the error kind; no secrets or private paths in it;
    - a log write that fails never stops the work;
+   - an error or refusal line names what is wrong, where, and the next step;
+   - a missing, ambiguous or unknown input stops the run before any side effect, never a guessed default;
    - a step with a side effect runs once and is never retried by itself; retries follow a fixed list of error kinds;
    - results go to a new folder each run, written as each step ends, never over an earlier run;
    - in a hook or a stdio MCP server, logs go to stderr or a file, since stdout is what it returns.
