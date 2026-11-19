@@ -209,14 +209,14 @@ def test_worker_killed_mid_page_gives_failed():
 
 
 def test_deadline_makes_late():
-    with stub(delay=5):
-        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + 1, BACKEND, cmd=STUB)
+    with stub(delay=5):  # a worker that runs past its `left`
+        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + limits.OCR_ANSWER_MARGIN + 1, BACKEND, cmd=STUB)
         try:
             t0 = time.monotonic()
             ts = [s.submit(gray(w), "page", 200.0) for w in (11, 12)]
             r = s.wait(ts[0])
             assert r.status == "late" and r.page is None, r.status
-            assert time.monotonic() - t0 < 2.0
+            assert time.monotonic() - t0 < limits.OCR_ANSWER_MARGIN + 2.0
             assert s.wait(ts[1]).status == "late" and s.late
             assert gone(s._proc), "the worker outlived the deadline"
             assert s.wait(s.submit(gray(13), "page", 200.0)).status == "late"
@@ -228,7 +228,7 @@ def test_deadline_kills_grandchild():
     """The worker's tesseract children die with it: a grandchild the stand-in spawns is gone within 2 s of the kill."""
     pid = None
     with stub(child=True, delays=[0.0, 30.0]):
-        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + 2, BACKEND, cmd=STUB)
+        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + limits.OCR_ANSWER_MARGIN + 2, BACKEND, cmd=STUB)
         try:
             first = s.submit(gray(11), "page", 200.0)
             slow = s.submit(gray(12), "page", 200.0)
@@ -560,9 +560,10 @@ def test_cut_answer_is_done_but_not_cached():
 
 def test_answer_after_stop_is_not_cached():
     """I1 (b): an answer that arrives at or after the stop, while no wait is pending, is not filed in the store."""
-    with tmpdir() as d, stub(delay=1.5):
+    with tmpdir() as d, stub(delay=limits.OCR_ANSWER_MARGIN + 1.5):  # a worker that runs past its `left`
         store = cache.OcrResults(d)
-        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + 0.5, BACKEND, cmd=STUB, store=store)
+        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + limits.OCR_ANSWER_MARGIN + 0.5, BACKEND, cmd=STUB,
+                        store=store)
         try:
             t = s.submit(gray(11), "page", 200.0)
             t0 = time.monotonic()  # nobody waits: the reader thread files the answer, after the stop
@@ -584,6 +585,62 @@ def test_worker_flags_cut_answers():
     assert got[1]["ok"] and got[1].get("cut") is True, got[1]
     assert got[2]["ok"] and not got[2].get("cut"), got[2]
     assert got[3]["ok"] and not got[3].get("cut"), got[3]
+
+
+def test_slow_page_answers_cut_before_stop():
+    """M6: a job's `left` ends OCR_ANSWER_MARGIN before the session's stop, so a page the worker cannot finish comes
+    back cut before the stop: done, used, not late and not cached."""
+    with tmpdir() as d, stub(delay=30, honor_left=True):
+        store = cache.OcrResults(d)
+        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + limits.OCR_ANSWER_MARGIN + 1.5, BACKEND, cmd=STUB,
+                        store=store)
+        try:
+            t = s.submit(gray(12), "page", 200.0)
+            r = s.wait(t)
+            assert r.status == "done" and words(r) == ["w12"] and not s.late, (r.status, s.late)
+            assert time.monotonic() < s._stop()
+            assert store.get(t.key) is None, "a cut answer was cached"
+        finally:
+            s.close()
+
+
+def test_page_queued_past_the_answer_margin_is_late():
+    """M6: a job whose answer could no longer land before the stop is not sent: it is late at once."""
+    with stub(delay=30, honor_left=True):
+        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + limits.OCR_ANSWER_MARGIN / 2, BACKEND, cmd=STUB)
+        try:
+            t0 = time.monotonic()
+            r = s.wait(s.submit(gray(12), "page", 200.0))
+            assert r.status == "late" and s.late and time.monotonic() - t0 < 0.5, (r.status, time.monotonic() - t0)
+            assert time.monotonic() < s._stop()
+        finally:
+            s.close()
+
+
+class SkewWin(FakeWin):
+    """An engine that deskews: its word box is in the deskewed frame, away from the ink, and `ink` holds where the
+    word is in the page's pixels."""
+
+    def recognize(self, g: Gray, deadline: float):
+        dark = [i for i, v in enumerate(g.data) if v < 128]
+        xs, ys = [i % g.w for i in dark], [i // g.w for i in dark]
+        box = (min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1)
+        moved = (box[0], box[1] + 12, box[2], box[3])
+        return ocr.OcrPage(g.w, g.h, [ocr.Word("가나다", *moved, 0, None)], -2.0, 0, self.engine, self.version,
+                           ink=[box])
+
+
+def test_worker_measures_unread_on_ink_boxes():
+    """I1: the unread ink is measured with the page's `ink` boxes when the engine gives them; the layout boxes go out
+    as the engine gave them."""
+    g = block(60, 40, 10, 2, 40, 8)
+    got, _ = serve(frames(({"id": 1, "kind": "page", "w": g.w, "h": g.h, "dpi": 200.0, "left": 30.0}, g.data)),
+                   SkewWin())
+    a = got[1]
+    assert a["ok"] and a["unread"]["share"] == 0.0, a["unread"]
+    assert a["page"]["words"][0]["y"] == 14 and a["page"]["ink"] == [[10, 2, 30, 6]], a["page"]
+    r = ocr._result_of(a, "page")
+    assert r.page.ink == [(10, 2, 30, 6)] and r.verdict.kind == "trusted", r
 
 
 def test_oversized_number_answer_fails_at_once():
@@ -672,7 +729,8 @@ def test_key_follows_worker_limits_and_code():
     g = gray(11)
     k = ocr.picture_key(g, "win-ko", "1", kind="page", dpi=200.0)
     for name, value in (("TESS_PSM_KOR", 6), ("OCR_JUNK", 0.5), ("OCR_LATIN", 0.5), ("TESS_PSM_LATIN", 6),
-                        ("OCR_RULE", 0.5), ("OCR_RULE_THICK", 0.5), ("OCR_RULES_MAX", 7), ("OCR_DPI", 300)):
+                        ("OCR_RULE", 0.5), ("OCR_RULE_THICK", 0.5), ("OCR_RULES_MAX", 7), ("OCR_DPI", 300),
+                        ("OCR_PAPER", 5)):
         old = getattr(limits, name)
         setattr(limits, name, value)
         try:

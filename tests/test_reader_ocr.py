@@ -276,11 +276,40 @@ def test_judge_thresholds():
 def test_judge_area_then_trusted():
     p = page(CLEAN_KO)
     box = (0.1, 0.5, 0.6, 0.9)
-    v = ocr.judge(p, Unread(0.05, box, limits.OCR_AREA))
+    dense = limits.OCR_AREA_DENSITY
+    v = ocr.judge(p, Unread(0.05, box, limits.OCR_AREA, dense))
     assert v == ocr.Verdict("area", box), v
-    v = ocr.judge(p, Unread(0.05, box, limits.OCR_AREA - 1e-6))
+    v = ocr.judge(p, Unread(0.05, box, limits.OCR_AREA - 1e-6, dense))
     assert v == ocr.Verdict("trusted", None), v
     assert ocr.judge(p, Unread(0.0, None, 0.0)) == ocr.Verdict("trusted", None)
+
+
+def test_judge_scattered_misses_trusted():
+    """I3: glyphs an engine missed here and there span a large box with sparse ink in it: no picture there."""
+    p = page(CLEAN_KO)
+    box = (0.1, 0.1, 0.9, 0.7)
+    v = ocr.judge(p, Unread(0.03, box, 0.48, limits.OCR_AREA_DENSITY - 1e-3))
+    assert v == ocr.Verdict("trusted", None), v
+    v = ocr.judge(p, Unread(0.03, box, 0.48, limits.OCR_AREA_DENSITY))
+    assert v == ocr.Verdict("area", box), v
+
+
+def test_judge_compact_dense_ink_is_area_past_unread():
+    """I8: a logo or a dark photo is much of a clean page's ink, but compact and dense: a crop of it, not the whole
+    page. Ink spread over the page (a noisy scan), or sparse in its box, stays doubtful."""
+    p = page(CLEAN_KO)
+    logo = (0.75, 0.05, 0.85, 0.11)
+    v = ocr.judge(p, Unread(0.12, logo, 0.006, 0.9))
+    assert v == ocr.Verdict("area", logo), v
+    photo = (0.3, 0.35, 0.7, 0.65)
+    assert ocr.judge(p, Unread(0.7, photo, 0.12, 0.95)) == ocr.Verdict("area", photo)
+    from reader.formats.pdf import FIGURE_WHOLE
+    whole = (0.0, 0.0, 1.0, 1.0)
+    assert ocr.judge(p, Unread(0.12, whole, 1.0, 0.9)).kind == "doubtful"
+    big = (0.0, 0.0, 1.0, FIGURE_WHOLE)
+    assert ocr.judge(p, Unread(0.12, big, FIGURE_WHOLE, 0.9)).kind == "doubtful"
+    assert ocr.judge(p, Unread(0.12, logo, 0.006, limits.OCR_AREA_DENSITY - 1e-3)).kind == "doubtful"
+    assert ocr.judge(page(JUNK), Unread(0.12, logo, 0.006, 0.9)).kind == "doubtful"  # the other signals still count
 
 
 def test_scribbles_without_words_doubtful():
@@ -288,6 +317,57 @@ def test_scribbles_without_words_doubtful():
     assert ocr.judge(empty, Unread(0.6, (0.1, 0.1, 0.9, 0.9), 0.64)).kind == "doubtful"
     assert ocr.judge(empty, Unread(limits.OCR_UNREAD / 2, None, 0.0)).kind == "doubtful"
     assert ocr.judge(empty, Unread(0.0, None, 0.0)).kind == "trusted"  # a blank page
+
+
+def test_faint_page_without_words_doubtful():
+    """M3: ink too faint for the Otsu split leaves no unread share; a gray range past OCR_FLAT still keeps the
+    page's image. A truly flat page is blank: its image is dropped."""
+    empty = page([])
+    assert ocr.judge(empty, Unread(0.0, None, 0.0, 0.0, limits.OCR_FLAT + 1)).kind == "doubtful"
+    assert ocr.judge(empty, Unread(0.0, None, 0.0, 0.0, limits.OCR_FLAT)).kind == "trusted"
+    assert ocr.judge(page(CLEAN_KO), Unread(0.0, None, 0.0, 0.0, 200)).kind == "trusted"  # words were read
+
+
+def sloped(texts_per_line: int, lines: int, degrees: float, engine="tess-kor+eng") -> OcrPage:
+    """Lines of word boxes whose baselines slope by `degrees` (y down), each line its own engine line."""
+    k = math.tan(math.radians(degrees))
+    words = []
+    for ln in range(lines):
+        for i in range(texts_per_line):
+            x = 100 + 120 * i
+            words.append(Word("가나", x, round(200 + 60 * ln + k * x), 100, 30, ln, 95.0))
+    return OcrPage(2000, 3000, words, 0.0, 0, engine, "v1")
+
+
+def test_judge_sloped_lines_doubtful():
+    """I7: a skewed page read without deskewing (Tesseract psm 4 shreds its lines) is doubtful past OCR_SKEW."""
+    clean = Unread(0.0, None, 0.0)
+    assert ocr.judge(sloped(12, 20, 2.0), clean).kind == "doubtful"
+    assert ocr.judge(sloped(12, 20, -2.0), clean).kind == "doubtful"
+    assert ocr.judge(sloped(12, 20, limits.OCR_SKEW * 1.2), clean).kind == "doubtful"
+    assert ocr.judge(sloped(12, 20, limits.OCR_SKEW * 0.6), clean).kind == "trusted"
+    assert ocr.judge(sloped(12, 20, 0.0), clean).kind == "trusted"
+    assert ocr.judge(sloped(1, 20, 3.0), clean).kind == "trusted"  # one word a line gives no slope
+
+
+def test_no_windows_latin_page_read_again_by_eng():
+    """I7: without Windows OCR, a kor+eng page of Latin letters is read again by eng at TESS_PSM_LATIN."""
+    tess = Tess({"kor", "eng"}, lambda g, langs: page(ENGLISH, "tess-" + langs, conf=96))
+    got, hint = ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page")
+    assert tess.calls == [("kor+eng", limits.TESS_PSM_KOR), ("eng", limits.TESS_PSM_LATIN)], tess.calls
+    assert got.engine == "tess-eng" and hint is False
+    tess = Tess({"kor", "eng"}, lambda g, langs: page(ENGLISH if langs == "kor+eng" else [], "tess-" + langs))
+    got, _ = ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page")
+    assert got.engine == "tess-kor+eng", got.engine  # a re-read with no words keeps the first
+    tess = Tess({"kor", "eng"})  # Korean: no re-read
+    ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page")
+    assert tess.calls == [("kor+eng", limits.TESS_PSM_KOR)], tess.calls
+    tess = Tess({"eng"}, lambda g, langs: page(ENGLISH, "tess-" + langs, conf=96))  # eng alone read it already
+    ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page")
+    assert tess.calls == [("eng", limits.TESS_PSM_LATIN)], tess.calls
+    tess = Tess({"kor", "eng"}, lambda g, langs: page(ENGLISH, "tess-" + langs, conf=96))
+    got, _ = ocr.read_page(G, ocr.Engines(Win(lambda g: None), tess, True), FAR, "page")  # Windows gave no page
+    assert got.engine == "tess-eng" and tess.calls[-1] == ("eng", limits.TESS_PSM_LATIN), tess.calls
 
 
 def test_shares():

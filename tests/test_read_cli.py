@@ -219,7 +219,7 @@ def test_tiff_pages_become_text():
                     f"{SCANNED}\n\nAlpha beta gamma\n\n![page 1](assets/img-001.png)\n\n"
                     f"{SCANNED}\n\nAlpha beta gamma\n\n![page 2](assets/img-002.png)\n"), text
     area = words("Alpha beta gamma")
-    area["unread"] = {"share": 0.02, "box": [0.1, 0.5, 0.6, 0.9], "area": 0.2}
+    area["unread"] = {"share": 0.02, "box": [0.1, 0.5, 0.6, 0.9], "area": 0.2, "density": 0.5}
     with stub_engine(answer=area):
         text, meta = convert(tiff_file(pages(1)))
     assert text == (f"(1 scanned page read by OCR)\n\n{SCANNED}\n\nAlpha beta gamma\n\n"
@@ -283,7 +283,7 @@ def test_tiff_crop_is_gray_from_the_read_pixels():
         print("skip: test_tiff_crop_is_gray_from_the_read_pixels (needs GDI+)")
         return
     area = words("Alpha beta gamma")
-    area["unread"] = {"share": 0.02, "box": [0.1, 0.5, 0.6, 0.9], "area": 0.2}
+    area["unread"] = {"share": 0.02, "box": [0.1, 0.5, 0.6, 0.9], "area": 0.2, "density": 0.5}
     out = tmp()
     with stub_engine(answer=area):
         reader.convert(tiff_file(pages(1)), out)
@@ -291,7 +291,7 @@ def test_tiff_crop_is_gray_from_the_read_pixels():
     w, h, ch, _ = images.png_pixels(crop)
     assert (w, h, ch) == (300, 320, 1), (w, h, ch)
     whole = words("Alpha beta gamma")
-    whole["unread"] = {"share": 0.02, "box": [0.0, 0.1, 1.0, 0.9], "area": 0.8}
+    whole["unread"] = {"share": 0.02, "box": [0.0, 0.1, 1.0, 0.9], "area": 0.8, "density": 0.5}
     with stub_engine(answer=whole):
         text, _ = convert(tiff_file(pages(1)))
     assert "![Picture on page 1](assets/img-001.png)" in text, text

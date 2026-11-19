@@ -814,7 +814,7 @@ def test_doubtful_page_text_then_image():
 def test_scan_with_photo_gets_crop_link():
     data, g = fixture_scan()
     box = [0.1, 0.18, 0.7, 0.68]  # 30 % of the page, its top between the first paragraph and the second
-    with ocr_stub(answer=canned(g, {"share": 0.02, "box": box, "area": 0.3})):
+    with ocr_stub(answer=canned(g, {"share": 0.02, "box": box, "area": 0.3, "density": 0.5})):
         text, _, doc, assets = md_assets(data)
     x0, y0, x1, y1 = box_pixels(g.w, g.h, box)
     assert text == (f"{READ}## Page 1\n\n{SCANNED}\n\nAlpha beta gamma delta epsilon\n\n"
@@ -822,7 +822,7 @@ def test_scan_with_photo_gets_crop_link():
     assert dims(assets) == {"img-001.png": (x1 - x0, y1 - y0)}, dims(assets)
     assert doc.meta["ocr"] == {"pages": 1, "doubtful": 0, "failed": 0, "stopped_at": None}, doc.meta
     whole = [0.0, 0.1, 1.0, 0.85]  # 75 %: past FIGURE_WHOLE, the whole page instead
-    with ocr_stub(answer=canned(g, {"share": 0.02, "box": whole, "area": 0.75})):
+    with ocr_stub(answer=canned(g, {"share": 0.02, "box": whole, "area": 0.75, "density": 0.5})):
         text, _, doc, assets = md_assets(data)
     assert "![Picture on page 1](assets/img-001.png)" in text, text
     assert dims(assets) == {"img-001.png": (g.w, g.h)}, dims(assets)
@@ -835,7 +835,7 @@ def test_turned_page_crop_cut_from_the_page_image():
     page_png = md_assets(data)[3]["img-001.png"]
     box = [0.1, 0.18, 0.7, 0.68]
     for turn, back in ((90, (0.18, 0.3, 0.68, 0.9)), (180, (0.3, 0.32, 0.9, 0.82)), (270, (0.32, 0.1, 0.82, 0.7))):
-        answer = canned(g, {"share": 0.02, "box": box, "area": 0.3})
+        answer = canned(g, {"share": 0.02, "box": box, "area": 0.3, "density": 0.5})
         side = (g.h, g.w) if turn in (90, 270) else (g.w, g.h)
         answer["page"].update(turn=turn, w=side[0], h=side[1])
         with ocr_stub(answer=answer):
@@ -921,7 +921,7 @@ def test_ocr_answer_that_raises_leaves_the_page_as_today():
     def boom(*a, **kw):
         raise RuntimeError("boom")
 
-    photo = {"share": 0.02, "box": [0.1, 0.18, 0.7, 0.68], "area": 0.3}
+    photo = {"share": 0.02, "box": [0.1, 0.18, 0.7, 0.68], "area": 0.3, "density": 0.5}
     for obj, name, unread in ((ocr_layout, "segments", None), (images, "png_crop", photo)):
         with patched(obj, name, boom):
             charged, text, doc = _image_bytes_at_after(data, answer=canned(g, unread))
@@ -986,7 +986,7 @@ def test_native_jpeg_scan_photo_cropped():
     data = with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode"))
     g = raster.gray(JPEG)[0]
     box = [0.1, 0.18, 0.7, 0.68]
-    with ocr_stub(answer=canned(g, {"share": 0.02, "box": box, "area": 0.3})):
+    with ocr_stub(answer=canned(g, {"share": 0.02, "box": box, "area": 0.3, "density": 0.5})):
         text, _, doc, assets = md_assets(data)
     x0, y0, x1, y1 = box_pixels(g.w, g.h, box)
     assert "![Picture on page 1](assets/img-001.png)" in text, text

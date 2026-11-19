@@ -9,6 +9,7 @@
     child_secs  how long that grandchild sleeps (default 30)
     child_pipes the grandchild inherits this worker's stdin and stdout pipes
     bad_frame   answer the first job with a frame whose head length is past OCR_FRAME_JSON
+    honor_left  as the real worker: a job whose delay passes its `left` is answered when `left` runs out, flagged cut
 
 A done answer is a page of one word, "w<W>", where W is the job's width, so a test can match answers to jobs.
 
@@ -39,7 +40,7 @@ def main():
         pipes = {"stdin": sys.stdin.buffer, "stdout": sys.stdout.buffer} if conf.get("child_pipes") else {}
         child = subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({secs})"], **pipes)
 
-    def answer(head: dict) -> None:
+    def answer(head: dict, cut: bool = False) -> None:
         w = head["w"]
         page = {"w": w, "h": head["h"], "words": [{"text": f"w{w}", "x": 0, "y": 0, "w": w, "h": head["h"],
                                                      "line": 0, "conf": None}],
@@ -47,6 +48,8 @@ def main():
         res = {"id": head["id"], "ok": True, "page": page, "rules": [],
                "unread": {"share": 0.0, "box": None, "area": 0.0} if head["kind"] == "page" else None,
                "hint": False}
+        if cut:
+            res["cut"] = True
         res.update(conf.get("answer") or {})
         with lock:
             n = conf.get("die_after")
@@ -63,8 +66,10 @@ def main():
                 os._exit(3)
 
     def job(head: dict, delay: float) -> None:
-        time.sleep(delay)
-        answer(head)
+        left = head.get("left")
+        cut = bool(conf.get("honor_left")) and left is not None and delay > left
+        time.sleep(max(0.0, left) if cut else delay)
+        answer(head, cut)
 
     delays = conf.get("delays")
     threads = []

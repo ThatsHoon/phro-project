@@ -734,6 +734,39 @@ def test_store_replaces_incomplete_target():
         assert (d / "out.md").read_text() == "hello\n"
 
 
+def test_cut_ocr_page_files_the_document():
+    """M6: a lone TIFF page whose OCR outlasts the session is answered cut before the stop: the page is read, the
+    conversion is filed under its document key, and the cut answer stays out of the per-picture cache. A page that
+    still goes late (a worker that runs past its `left`) keeps the conversion out of the document cache."""
+    if sys.platform != "win32":
+        print("skip: test_cut_ocr_page_files_the_document (needs GDI+)")
+        return
+    import ocr_fix
+    from reader import limits, ocr, raster
+    from test_read_cli import pages, tiff_file, words
+    saved = ocr.WORKER_CMD
+    ocr.WORKER_CMD = ocr_fix.STUB
+    try:
+        for honor in (True, False):
+            with stub(), ocr_fix.stub_env(delay=30, honor_left=honor, answer=words("Alpha beta")):
+                wall = time.time() + limits.FIGURE_RESERVE + limits.OCR_ANSWER_MARGIN + 2
+                os.environ[raster.DEADLINE_ENV] = repr(wall)
+                try:
+                    src = tiff_file(pages(1))
+                    k = cache.key(src)
+                    out = cache.store(k, src, backend=("win-ko", "test"))
+                finally:
+                    os.environ.pop(raster.DEADLINE_ENV, None)
+                meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+                assert (out.name == k) is honor, (honor, out.name, meta["warnings"])
+                assert (meta["ocr"]["pages"] == 1) is honor, (honor, meta["ocr"])
+                assert (limits.OCR_LATE in meta["warnings"]) is not honor, (honor, meta["warnings"])
+                kept = [p for p in (cache.root() / cache.OCR).rglob("*") if p.is_file()]
+                assert kept == [], kept
+    finally:
+        ocr.WORKER_CMD = saved
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

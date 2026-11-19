@@ -1,7 +1,7 @@
 """The OCR worker process: `read.py ocr-worker`, started by `ocr.Session` once per conversion.
 
 It reads request frames on stdin (`ocr.read_frame`: a JSON head with the job's id, size, kind, dpi and the seconds
-`left` to the conversion's deadline, then the Gray8 pixels) and answers each job on stdout when it finishes, so
+`left` by which it must answer, then the Gray8 pixels) and answers each job on stdout when it finishes, so
 answers come in any order. It holds no state between jobs (decision 12): the per-picture cache is the Session's.
 
 An engine that faults natively kills this process alone; the Session turns its open tickets into "failed" ones and
@@ -19,7 +19,8 @@ from .ocr_pixels import Gray, rotate, rules, threshold, unread
 
 
 def _job(head: dict, body: bytes, eng: ocr.Engines) -> dict:
-    """One job's answer. Pages get their rules and unread ink in the page's turned frame; pictures get neither. An
+    """One job's answer. Pages get their rules and unread ink in the page's turned frame, the ink measured with the
+    page's `ink` boxes when the engine gives them (its word boxes are then deskewed); pictures get neither. An
     answer read while the job's deadline passed carries `"cut": true`: the rotation search or a re-read may have
     been cut short, so the Session never caches it. A head without `left` has no deadline."""
     jid, kind = head["id"], head["kind"]
@@ -31,8 +32,8 @@ def _job(head: dict, body: bytes, eng: ocr.Engines) -> dict:
         left = float(left)
         if not math.isfinite(left):
             raise ValueError(f"left {left!r}")
-        # the conversion's own deadline: a cancelled Windows page keeps running natively, so the deadline is the
-        # only bound, and the Session kills this process before it comes
+        # the job's own deadline, OCR_ANSWER_MARGIN before the Session's stop: a cancelled Windows page keeps
+        # running natively, so the deadline is the only bound, and the Session kills this process at its stop
         deadline = time.monotonic() + left
     g = Gray(head["w"], head["h"], body)
     page, hint = ocr.read_page(g, eng, deadline, kind)
@@ -47,9 +48,11 @@ def _job(head: dict, body: bytes, eng: ocr.Engines) -> dict:
         turned = rotate(g, page.turn)  # the frame the page's boxes are in
         thr = threshold(turned)
         found = rules(turned, dpi, thr)
-        un = unread(turned, [(w.x, w.y, w.w, w.h) for w in page.words], found, thr)
+        boxes = page.ink if page.ink is not None else [(w.x, w.y, w.w, w.h) for w in page.words]
+        un = unread(turned, boxes, found, thr)
         res = {"id": jid, "ok": True, "page": asdict(page), "rules": [list(b) for b in found],
-               "unread": {"share": un.share, "box": None if un.box is None else list(un.box), "area": un.area},
+               "unread": {"share": un.share, "box": None if un.box is None else list(un.box), "area": un.area,
+                          "density": un.density, "spread": un.spread},
                "hint": hint}
     if cut:
         res["cut"] = True

@@ -147,7 +147,8 @@ def test_engine_id_and_version():
 
 @needs_ko
 def test_recognizers_lists_ko():
-    assert "ko-kr" in ocr_win.recognizers()
+    from reader import ocr_probe
+    assert "ko-kr" in ocr_probe.recognizers()
 
 
 @needs_ko
@@ -216,23 +217,82 @@ def test_result_before_done_cancels():
 @needs_ko
 def test_version_without_orp():
     """A recognizer folder with no .orp file (or no folder at all) leaves "0:0" for that part, not a failed engine."""
-    real = ocr_win._recognizer_folder
+    from reader import ocr_probe
+    real = ocr_probe._recognizer_folder
     try:
-        ocr_win._recognizer_folder = lambda tag: Path(__file__).parent / "fixtures"
+        ocr_probe._recognizer_folder = lambda tag, deps=None: Path(__file__).parent / "fixtures"
         eng = ocr_win.WinOcr("ko")
         try:
             dll, orp = eng.version.split("/")
             assert orp == "0:0" and dll != "0:0", eng.version
         finally:
             eng.close()
-        ocr_win._recognizer_folder = lambda tag: None
+        ocr_probe._recognizer_folder = lambda tag, deps=None: None
         eng = ocr_win.WinOcr("ko")
         eng.close()
         assert eng.version.endswith("/0:0"), eng.version
     finally:
-        ocr_win._recognizer_folder = real
+        ocr_probe._recognizer_folder = real
     folder = real("ko")
     assert folder is not None and any(p.suffix.lower() == ".orp" for p in folder.iterdir())
+
+
+def turned(g, degrees):
+    """`g` turned by `degrees` about its centre (y down, nearest pixel, white outside): a page scanned askew."""
+    import math
+    c, s = math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+    cx, cy = g.w / 2, g.h / 2
+    out = bytearray(b"\xff" * (g.w * g.h))
+    for y in range(g.h):
+        dy = y - cy
+        for x in range(g.w):
+            dx = x - cx
+            sx, sy = int(cx + dx * c + dy * s), int(cy - dx * s + dy * c)
+            if 0 <= sx < g.w and 0 <= sy < g.h:
+                out[y * g.w + x] = g.data[sy * g.w + sx]
+    return Gray(g.w, g.h, bytes(out))
+
+
+def test_word_boxes_turned_back_cover_skewed_ink():
+    """I1: boxes given in the deskewed frame, turned back by the text angle, cover the ink they read; as given they
+    leave much of it unread."""
+    import math
+    from reader import ocr_pixels
+    w, h, angle = 2000, 1500, -2.0
+    c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    buf = bytearray(b"\xff" * (w * h))
+    boxes = []
+    for y in range(200, 1300, 50):
+        for x in range(150, 1800, 80):
+            boxes.append((x, y, 60, 20))
+            dx, dy = x + 30 - w / 2, y + 10 - h / 2
+            px, py = round(w / 2 + dx * c - dy * s), round(h / 2 + dx * s + dy * c)
+            for r in range(py - 8, py + 8):
+                buf[r * w + px - 25:r * w + px + 25] = b"\x1e" * 50
+    g = Gray(w, h, bytes(buf))
+    thr = ocr_pixels.threshold(g)
+    assert ocr_pixels.unread(g, boxes, [], thr).share > 0.3
+    back = [ocr_win._unskew(x, y, x + bw, y + bh, angle, w, h) for x, y, bw, bh in boxes]
+    assert ocr_pixels.unread(g, back, [], thr).share == 0.0
+    assert ocr_win._unskew(10.2, 10.0, 60.0, 30.4, 0.0, w, h) == (10, 10, 50, 21)
+    assert ocr_win._unskew(-5, -5, 60, 30, 0.0, w, h) == (0, 0, 60, 30)  # clipped to the frame
+
+
+@needs_ko
+def test_skewed_fixture_ink_boxes():
+    """I1 on the engine: a page scanned 2 degrees askew comes back with its words in the deskewed frame (the layout
+    keeps them) and `ink`, the same boxes in the page's pixels, which leave next to no ink unread."""
+    from reader import ocr_pixels
+    g = turned(load(KO), 2.0)
+    page = engine().recognize(g, monotonic() + 30)
+    assert page is not None and abs(abs(page.angle) - 2.0) < 0.5, page.angle
+    assert page.ink is not None and len(page.ink) == len(page.words)
+    thr = ocr_pixels.threshold(g)
+    deskewed = ocr_pixels.unread(g, [(w.x, w.y, w.w, w.h) for w in page.words], [], thr).share
+    back = ocr_pixels.unread(g, page.ink, [], thr).share
+    assert deskewed > 0.1 and back < 0.02, (deskewed, back)
+    straight = read(KO)
+    assert straight.ink is None or straight.ink == [(w.x, w.y, w.w, w.h) for w in straight.words]
 
 
 def main():

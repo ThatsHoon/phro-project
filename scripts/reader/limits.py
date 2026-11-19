@@ -82,6 +82,16 @@ OCR_RULE_THICK = 1 / 40    # thickest rule, in inches (at least 2 px); spike tab
 OCR_RULES_MAX = 1_000      # rules a page may have; past this it is texture (a photo, halftone) and gives none
 OCR_AREA = 0.04            # share of the page the unread ink's box must cover to make a picture area; a drawing or
 #                            light photo pasted on a spike page: 0.12-0.45; Windows clean pages: 0
+OCR_AREA_DENSITY = 0.01    # share of the unread box's pixels that must be unread ink for a picture area; spike:
+#                            Tesseract's scattered misses on clean Korean pages 0.000-0.005, a line drawing pasted on
+#                            a page 0.018-0.020, photos 0.29-0.62, light photos 0.21-0.84, a logo 0.93-0.94
+OCR_PAPER = 32             # levels under the paper's mean from which a pixel is not paper (the picture area's ink);
+#                            spike: a light photo (gray 150-250 on paper 255) boxed at 0.12-0.49 of the page
+OCR_FLAT = 16              # gray range (levels) up to which a page with no words is blank; spike: clean pages 228-255,
+#                            noisy 155-188, a blank render 0
+OCR_SKEW = 0.5             # degrees the engine's lines may slope before a page is doubtful; spike: straight pages and
+#                            Windows' deskewed lines 0.00-0.10, pages turned 2 degrees 1.84-2.03
+OCR_ANSWER_MARGIN = 2      # seconds before the session's stop by which the worker must have answered a job
 OCR_LATIN = 0.9            # share of Latin letters from which Tesseract eng reads a Windows page again
 OCR_JUNK = 0.03            # share of junk characters over which a page is doubtful and a picture gets no text; clean
 #                            spike pages at most 0.003, noisy 0-0.033: the other signals carry the noisy pages

@@ -41,7 +41,9 @@ class OcrPage:
     """An engine's result for one bitmap. `turn` is the rotation the reader applied before the engine read it: 0,
     90, 180 or 270 degrees clockwise (`ocr_pixels.rotate`). `w`, `h` and every word box are in the frame of that
     turned bitmap, `rotate(g, turn)`, so `w` and `h` are swapped for 90 and 270. `angle` is the text angle the engine
-    reported, `engine` and `version` the ids that key caches."""
+    reported, `engine` and `version` the ids that key caches. An engine that deskews the bitmap before reading it
+    gives its word boxes in the deskewed frame, which the layout keeps, and `ink`: the same boxes (x, y, w, h) in the
+    bitmap's own pixels, one per word, which the unread ink is measured with. None when the word boxes are those."""
     w: int
     h: int
     words: list[Word]
@@ -49,6 +51,7 @@ class OcrPage:
     turn: int
     engine: str
     version: str
+    ink: list[tuple[int, int, int, int]] | None = None
 
 
 # ---- engines ---------------------------------------------------------------------------------------------------------
@@ -76,8 +79,8 @@ class _Tess:
 
 def _win_load():
     """Windows OCR asking for Korean, when a recognizer folder exists under %WINDIR%\\OCR; else None."""
-    from . import ocr_win
-    return ocr_win.WinOcr("ko") if ocr_win.recognizers() else None
+    from . import ocr_probe, ocr_win
+    return ocr_win.WinOcr("ko") if ocr_probe.recognizers() else None
 
 
 def _tess_load() -> _Tess | None:
@@ -177,18 +180,37 @@ def _tess_read(tess, g: Gray, want: tuple[str, ...], psm: int | None, deadline: 
     return tess.recognize(g, "+".join(langs), psm, deadline)
 
 
+def _latin_again(tess, g: Gray, page: OcrPage, deadline: float) -> OcrPage | None:
+    """Tesseract eng's re-read at TESS_PSM_LATIN of a page whose letters are at least OCR_LATIN Latin, when it gives
+    words; else None (a re-read with no words never replaces one with words)."""
+    if tess is None or "eng" not in tess.langs or latin_share(page) < limits.OCR_LATIN:
+        return None
+    again = _tess_read(tess, g, ("eng",), limits.TESS_PSM_LATIN, deadline)
+    return again if again is not None and again.words else None
+
+
+def _tess_page(tess, g: Gray, deadline: float) -> OcrPage | None:
+    """Tesseract as on a machine without Windows OCR: kor+eng (or the one of them it has), and a Latin page that kor
+    read, read again by eng alone."""
+    if tess is None:
+        return None
+    page = _tess_read(tess, g, ("kor", "eng"), None, deadline)
+    if page is None or "kor" not in tess.langs:
+        return page
+    return _latin_again(tess, g, page, deadline) or page
+
+
 def _read_once(g: Gray, eng: Engines, deadline: float) -> tuple[OcrPage | None, bool]:
     """One pass of the engine choice on `g` as it stands: (page, hint)."""
     tess = eng.tess
     if eng.win is None:
-        return (None, False) if tess is None else (_tess_read(tess, g, ("kor", "eng"), None, deadline), False)
+        return _tess_page(tess, g, deadline), False
     page = eng.win.recognize(g, deadline)
     if page is None:  # Windows gave no page: Tesseract as on a machine without Windows OCR, while time is left
-        return (None, False) if tess is None else (_tess_read(tess, g, ("kor", "eng"), None, deadline), False)
-    if tess is not None and "eng" in tess.langs and latin_share(page) >= limits.OCR_LATIN:
-        again = _tess_read(tess, g, ("eng",), limits.TESS_PSM_LATIN, deadline)
-        if again is not None and again.words:  # a re-read with no words never replaces one with words
-            return again, False
+        return _tess_page(tess, g, deadline), False
+    again = _latin_again(tess, g, page, deadline)
+    if again is not None:
+        return again, False
     if not eng.win_korean and junk_share(page) > limits.OCR_JUNK:
         if tess is None or "kor" not in tess.langs:
             return page, True  # decision 13: a non-Korean Windows engine, junk, and no Tesseract kor
@@ -245,24 +267,52 @@ class Verdict:
     box: tuple[float, float, float, float] | None
 
 
+def skew(page: OcrPage) -> float:
+    """The slope of the page's lines in degrees, unsigned: the least-squares slope of the word box centres within
+    each engine line, pooled over the lines, so a long line weighs more. 0.0 with no line of two words."""
+    lines: dict[int, list[Word]] = {}
+    for w in page.words:
+        lines.setdefault(w.line, []).append(w)
+    sxy = sxx = 0.0
+    for ws in lines.values():
+        if len(ws) < 2:
+            continue
+        xs = [w.x + w.w / 2 for w in ws]
+        ys = [w.y + w.h / 2 for w in ws]
+        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+        sxy += sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        sxx += sum((x - mx) ** 2 for x in xs)
+    return abs(math.degrees(math.atan(sxy / sxx))) if sxx else 0.0
+
+
 def judge(page: OcrPage, un: Unread) -> Verdict:
-    """Doubtful when the junk share passes OCR_JUNK, the unread share passes OCR_UNREAD, the words' mean confidence
-    (when they carry one) is under OCR_CONF, the share of those words under OCR_LOW_WORD passes OCR_LOW, or there are
-    no words while some ink is unread. Otherwise a picture area when the unread box covers at least OCR_AREA.
+    """Doubtful when the junk share passes OCR_JUNK, the words' mean confidence (when they carry one) is under
+    OCR_CONF, the share of those words under OCR_LOW_WORD passes OCR_LOW, the lines slope past OCR_SKEW degrees (an
+    engine that does not deskew may have cut them and mixed their order), or there are no words while some ink is
+    unread or the gray range passes OCR_FLAT (faint writing).
+
+    Otherwise the unread ink decides. A picture is a box whose pixels are at least OCR_AREA_DENSITY unread ink:
+    scattered misses span a large box with sparse ink. Past OCR_UNREAD unread, a compact picture (its box under
+    pdf.FIGURE_WHOLE: a logo, a dark photo) is an area, and anything else (a noisy scan's ink over the whole page) is
+    doubtful. Under it, a picture whose box covers at least OCR_AREA is an area, and the page is trusted otherwise.
 
     `un` must be computed on `rotate(g, page.turn)`, the frame the page's boxes are in, so `Verdict.box` is a
     fractional box of that turned bitmap."""
+    from .formats.pdf import FIGURE_WHOLE
     confs = [w.conf for w in page.words if w.conf is not None]
     doubtful = (
         junk_share(page) > limits.OCR_JUNK
-        or un.share > limits.OCR_UNREAD
         or (confs and sum(confs) / len(confs) < limits.OCR_CONF)
         or (confs and sum(1 for c in confs if c < limits.OCR_LOW_WORD) / len(confs) > limits.OCR_LOW)
-        or (not page.words and un.share > 0)
+        or skew(page) > limits.OCR_SKEW
+        or (not page.words and (un.share > 0 or un.spread > limits.OCR_FLAT))
     )
     if doubtful:
         return Verdict("doubtful", None)
-    if un.box is not None and un.area >= limits.OCR_AREA:
+    picture = un.box is not None and un.density >= limits.OCR_AREA_DENSITY
+    if un.share > limits.OCR_UNREAD:
+        return Verdict("area", un.box) if picture and un.area < FIGURE_WHOLE else Verdict("doubtful", None)
+    if picture and un.area >= limits.OCR_AREA:
         return Verdict("area", un.box)
     return Verdict("trusted", None)
 
@@ -278,12 +328,13 @@ def picture_lines(page: OcrPage) -> list[str]:
 
 # ---- the per-picture key ---------------------------------------------------------------------------------------------
 
-_SOURCES = ("ocr.py", "ocr_layout.py", "ocr_pixels.py", "ocr_tess.py", "ocr_win.py", "ocr_worker.py")  # sorted
+_SOURCES = ("ocr.py", "ocr_layout.py", "ocr_pixels.py", "ocr_probe.py", "ocr_tess.py", "ocr_win.py",
+            "ocr_worker.py")  # sorted
 
 # the limits that shape what the worker answers (engine choice, rotation search, rules); the verdict thresholds
 # are not here, since `judge` runs again on every load
 _KEY_LIMITS = ("OCR_JUNK", "OCR_LATIN", "TESS_PSM_LATIN", "TESS_PSM_KOR", "OCR_RULE", "OCR_RULE_THICK",
-               "OCR_RULES_MAX", "OCR_DPI")
+               "OCR_RULES_MAX", "OCR_DPI", "OCR_PAPER")
 
 
 @functools.cache
@@ -475,6 +526,12 @@ def _str(v) -> str:
     return v
 
 
+def _box_of(b, num) -> tuple:
+    if not isinstance(b, list) or len(b) != 4:
+        raise ValueError("box")
+    return tuple(num(v) for v in b)
+
+
 def _page_of(d) -> OcrPage:
     if not isinstance(d, dict) or not isinstance(d["words"], list):
         raise ValueError("page is not an object with words")
@@ -483,18 +540,20 @@ def _page_of(d) -> OcrPage:
     turn = _int(d["turn"])
     if turn not in (0, 90, 180, 270):
         raise ValueError(f"turn {turn}")
-    return OcrPage(_int(d["w"]), _int(d["h"]), words, _num(d["angle"]), turn, _str(d["engine"]), _str(d["version"]))
+    ink = d.get("ink")
+    if ink is not None:
+        if not isinstance(ink, list) or len(ink) != len(words):
+            raise ValueError("ink boxes")
+        ink = [_box_of(b, _int) for b in ink]
+    return OcrPage(_int(d["w"]), _int(d["h"]), words, _num(d["angle"]), turn, _str(d["engine"]), _str(d["version"]),
+                   ink)
 
 
 def _unread_of(d) -> Unread | None:
     if d is None:
         return None
-    box = d["box"]
-    if box is not None:
-        if not isinstance(box, list) or len(box) != 4:
-            raise ValueError("unread box")
-        box = tuple(_num(v) for v in box)
-    return Unread(_num(d["share"]), box, _num(d["area"]))
+    box = None if d["box"] is None else _box_of(d["box"], _num)
+    return Unread(_num(d["share"]), box, _num(d["area"]), _num(d.get("density", 0.0)), _int(d.get("spread", 0)))
 
 
 def _result_of(d: dict, kind: str) -> Result:
@@ -752,11 +811,14 @@ class Session:
                 self._cond.notify_all()
                 if t.id not in self._open:  # settled meanwhile (late, or the worker died)
                     continue
-            # `left` runs to the conversion's own deadline, so the worker does not cut a page short of the session's
-            # stop; with no deadline it is left out, which the worker reads as no limit
+            # `left` ends OCR_ANSWER_MARGIN before the session's stop, so a page the worker cannot finish comes back
+            # cut while it can still be used; with no deadline it is left out, which the worker reads as no limit
             head = {"id": t.id, "w": g.w, "h": g.h, "kind": t.kind, "dpi": t.dpi}
-            left = self.deadline - time.monotonic()
+            left = self._stop() - limits.OCR_ANSWER_MARGIN - time.monotonic()
             if math.isfinite(left):
+                if left <= 0:  # its answer could no longer land before the stop
+                    self._settle(t.id, Result("late"))
+                    continue
                 head["left"] = left
             try:
                 prefix = _frame_head(head, g.data)

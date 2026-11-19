@@ -1919,7 +1919,7 @@ def test_backend_ids():
 
 
 def test_backend_win_version_as_engine():
-    """The probe's Windows version is the one the Windows engine itself reports (ocr_win._version)."""
+    """The probe's Windows version is the one the Windows engine itself reports."""
     from reader import ocr_probe, ocr_win
     folders = ocr_probe.recognizers()
     if not folders or not ocr_probe.dll().is_file():
@@ -1928,7 +1928,8 @@ def test_backend_win_version_as_engine():
     got = ocr_probe.probe({})[:2]
     tag = next((f for f in folders if f.split("-")[0] == "ko"), folders[0])
     assert got[0].split("+")[0] == "win-" + tag.split("-")[0], got
-    assert got[1].split("+")[0] == ocr_win._version(tag), (got, ocr_win._version(tag))
+    with ocr_win.WinOcr("ko") as eng:
+        assert got[1].split("+")[0] == eng.version, (got, eng.version)
 
 
 def test_backend_memo():

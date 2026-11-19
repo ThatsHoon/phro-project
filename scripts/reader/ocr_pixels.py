@@ -383,12 +383,16 @@ def rules(g: Gray, dpi: float, thr: int) -> list[tuple[int, int, int, int]]:
 
 @dataclass
 class Unread:
-    """The dark pixels of a page no word box or rule covers. `share`: their count over all dark pixels (0.0 with
-    none). `box`: the fractional box (x0, y0, x1, y1), y down, that bounds them, None with none left after the 1 %
-    rule of `unread`. `area`: the box's area over the page's (0.0 with no box)."""
+    """The ink of a page no word box or rule covers. `share`: the dark pixels left over all dark pixels (0.0 with
+    none). `box`: the fractional box (x0, y0, x1, y1), y down, that bounds the pixels left that are not paper (darker
+    than the paper by OCR_PAPER: light pictures too), None with none left after the 1 % rule of `unread`. `area`: the
+    box's area over the page's (0.0 with no box). `density`: those pixels inside the box over the box's pixels (0.0
+    with no box). `spread`: the page's gray range, the levels between its darkest and lightest 0.5 %."""
     share: float
     box: tuple[float, float, float, float] | None
     area: float
+    density: float = 0.0
+    spread: int = 0
 
 
 def _clear(m: bytearray, w: int, h: int, x0, y0, x1, y1) -> None:
@@ -420,10 +424,11 @@ def _or(parts) -> bytes:
     return acc.to_bytes(n, "big")
 
 
-def _ink_box(m: bytearray, w: int, h: int) -> tuple[float, float, float, float] | None:
-    """The fractional box of the ones in the 0/1 page `m`, on a grid of 4 x 4 pixel cells. A cell is marked when any
-    of its 16 full-resolution pixels is one; a grid row is kept when at least 1 % of the grid's width of its cells are
-    marked, a grid column when at least 1 % of the grid's height are. None when no row or no column is kept."""
+def _ink_box(m: bytearray, w: int, h: int) -> tuple[int, int, int, int] | None:
+    """The pixel box (x0, y0, x1, y1), exclusive ends, of the ones in the 0/1 page `m`, on a grid of 4 x 4 pixel
+    cells. A cell is marked when any of its 16 full-resolution pixels is one; a grid row is kept when at least 1 % of
+    the grid's width of its cells are marked, a grid column when at least 1 % of the grid's height are. None when no
+    row or no column is kept."""
     gw, gh = -(-w // 4), -(-h // 4)
     wp, hp = 4 * gw, 4 * gh
     if wp == w:
@@ -438,27 +443,51 @@ def _ink_box(m: bytearray, w: int, h: int) -> tuple[float, float, float, float] 
     cols = [c for c in range(gw) if grid[c::gw].count(1) * 100 >= gh]
     if not rows or not cols:
         return None
-    return (cols[0] * 4 / w, rows[0] * 4 / h, min(cols[-1] * 4 + 4, w) / w, min(rows[-1] * 4 + 4, h) / h)
+    return cols[0] * 4, rows[0] * 4, min(cols[-1] * 4 + 4, w), min(rows[-1] * 4 + 4, h)
+
+
+def _levels(g: Gray, thr: int) -> tuple[int, float]:
+    """(spread, paper) over every 4th pixel: the levels between the darkest and the lightest 0.5 % of them, and the
+    mean of those at or over `thr` (of all of them when none is)."""
+    hist = sorted(Counter(g.data[::4]).items())
+    n = sum(c for _, c in hist)
+    cut = n // 200
+
+    def edge(items):
+        seen = 0
+        for v, c in items:
+            seen += c
+            if seen > cut:
+                return v
+        return items[-1][0]
+    paper = [(v, c) for v, c in hist if v >= thr] or hist
+    return edge(hist[::-1]) - edge(hist), sum(v * c for v, c in paper) / sum(c for _, c in paper)
 
 
 def unread(g: Gray, word_boxes, rule_boxes, thr: int) -> Unread:
-    """The page's dark pixels (value < thr) that no word box and no rule covers (decision 10: rule pixels are not
-    unread). `word_boxes` are pixel boxes (x, y, w, h), y down, as the `ocr.Word` fields give them, each grown by a
-    quarter of its height on every side; `rule_boxes` are `rules`' boxes (x0, y0, x1, y1), exclusive ends, each grown
-    by 1 px on every side for the rule's anti-aliased edges. `share` counts over all dark pixels, rules included."""
+    """The page's ink that no word box and no rule covers (decision 10: rule pixels are not unread). `word_boxes` are
+    pixel boxes (x, y, w, h), y down, as the `ocr.Word` fields give them, each grown by a quarter of its height on
+    every side; `rule_boxes` are `rules`' boxes (x0, y0, x1, y1), exclusive ends, each grown by 1 px on every side for
+    the rule's anti-aliased edges. `share` counts the dark pixels (value < thr) left over all dark pixels, rules
+    included. The box and its density count the pixels left that are not paper: dark, or darker than the mean of the
+    pixels at or over `thr` by OCR_PAPER, so a picture lighter than the Otsu split still has its box."""
     w, h = g.w, g.h
+    spread, paper = _levels(g, thr)
     m = bytearray(g.data.translate(_dark(thr)))
+    p = bytearray(g.data.translate(_dark(max(thr, math.ceil(paper - limits.OCR_PAPER)))))
     total = m.count(1)
-    if not total:
-        return Unread(0.0, None, 0.0)
     for x, y, bw, bh in word_boxes:
         grow = bh / 4
-        _clear(m, w, h, x - grow, y - grow, x + bw + grow, y + bh + grow)
+        for mask in (m, p):
+            _clear(mask, w, h, x - grow, y - grow, x + bw + grow, y + bh + grow)
     for x0, y0, x1, y1 in rule_boxes:
-        _clear(m, w, h, x0 - 1, y0 - 1, x1 + 1, y1 + 1)
-    left = m.count(1)
-    if not left:
-        return Unread(0.0, None, 0.0)
-    box = _ink_box(m, w, h)
-    area = 0.0 if box is None else (box[2] - box[0]) * (box[3] - box[1])
-    return Unread(left / total, box, area)
+        for mask in (m, p):
+            _clear(mask, w, h, x0 - 1, y0 - 1, x1 + 1, y1 + 1)
+    share = m.count(1) / total if total else 0.0
+    px = _ink_box(p, w, h) if 1 in p else None
+    if px is None:
+        return Unread(share, None, 0.0, 0.0, spread)
+    x0, y0, x1, y1 = px
+    inside = sum(p.count(1, r * w + x0, r * w + x1) for r in range(y0, y1))
+    box = (x0 / w, y0 / h, x1 / w, y1 / h)
+    return Unread(share, box, (box[2] - box[0]) * (box[3] - box[1]), inside / ((x1 - x0) * (y1 - y0)), spread)

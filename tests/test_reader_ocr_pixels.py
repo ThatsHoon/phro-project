@@ -304,6 +304,75 @@ def test_picture_area_box_spares_text_rows():
     assert abs(u.area - (x1 - x0) * (y1 - y0)) < 1e-12 and 0.2 < u.area < 0.25, u
 
 
+def word_page(w=1000, h=1400):
+    """Lines of word blocks over the top and bottom of a white page; returns (buffer, word boxes)."""
+    buf = blank(w, h)
+    words = []
+    for y in list(range(80, 420, 40)) + list(range(1000, 1340, 40)):
+        for i in range(10):
+            x = 100 + 80 * i
+            fill(buf, w, x, y, x + 60, y + 20)
+            words.append((x, y, 60, 20))
+    return buf, words
+
+
+def test_light_block_on_word_page_gives_area():
+    """I9: a pastel picture lighter than the Otsu split is no unread ink, but it is not paper either: its box is the
+    picture area, dense, and the page an area."""
+    from reader import ocr
+    w, h = 1000, 1400
+    buf, words = word_page(w, h)
+    x0, y0, x1, y1 = 200, 520, 800, 900
+    for y in range(y0, y1):
+        buf[y * w + x0:y * w + x1] = bytes(160 + (x * 40) // (x1 - x0) for x in range(x1 - x0))
+    g = Gray(w, h, bytes(buf))
+    thr = ocr_pixels.threshold(g)
+    assert thr <= 160, thr
+    u = ocr_pixels.unread(g, words, ocr_pixels.rules(g, 200, thr), thr)
+    assert u.share == 0.0, u
+    assert u.box is not None and holds(u, (x0, y0, x1, y1), w, h), u
+    assert u.density > 0.5, u
+    page = ocr.OcrPage(w, h, [ocr.Word("가나", *b, 0, None) for b in words], 0.0, 0, "win-ko", "v1")
+    v = ocr.judge(page, u)
+    assert v.kind == "area" and v.box == u.box, v
+
+
+def test_density_tells_a_block_from_scattered_specks():
+    """I3: specks spread over a large box leave it sparse; a block of the same box is dense."""
+    w, h = 1000, 1400
+    buf, words = word_page(w, h)
+    rnd = random.Random(7)
+    for _ in range(40):
+        x, y = rnd.randrange(100, 900), rnd.randrange(450, 950)
+        fill(buf, w, x, y, x + 6, y + 6)
+    g = Gray(w, h, bytes(buf))
+    u = ocr_pixels.unread(g, words, [], 128)
+    assert u.box is not None and u.area > 0.1 and u.density < limits.OCR_AREA_DENSITY, u
+    buf, words = word_page(w, h)
+    fill(buf, w, 300, 600, 700, 800)
+    u = ocr_pixels.unread(Gray(w, h, bytes(buf)), words, [], 128)
+    assert u.box is not None and u.density > 0.5, u
+
+
+def test_spread_flat_noisy_and_faint():
+    """M3: the gray range a page with no words is judged on. A flat or lightly noisy page is under OCR_FLAT; faint
+    writing, which the Otsu split calls no ink, is over it."""
+    w, h = 600, 800
+    flat = Gray(w, h, bytes(blank(w, h, 240)))
+    assert ocr_pixels.unread(flat, [], [], ocr_pixels.threshold(flat)).spread == 0
+    rnd = random.Random(3)
+    noisy = Gray(w, h, bytes(240 + rnd.randrange(-4, 5) for _ in range(w * h)))
+    u = ocr_pixels.unread(noisy, [], [], ocr_pixels.threshold(noisy))
+    assert u.spread <= limits.OCR_FLAT and u.share == 0.0, u
+    buf = blank(w, h, 245)
+    for y in range(100, 700, 30):
+        fill(buf, w, 80, y, 520, y + 8, 215)
+    faint = Gray(w, h, bytes(buf))
+    assert ocr_pixels.threshold(faint) == 0
+    u = ocr_pixels.unread(faint, [], [], 0)
+    assert u.share == 0.0 and u.spread > limits.OCR_FLAT, u
+
+
 def a4_page():
     """An A4 page at 200 dpi: lines of word blocks and a ruled table; returns (Gray, word boxes)."""
     w, h = 1654, 2339

@@ -8,13 +8,10 @@ pointer is released once. ctypes is imported only inside functions, so importing
 off Windows.
 """
 import math
-import os
-import sys
 import threading
 import time
-from pathlib import Path
 
-from . import ocr_pixels
+from . import ocr_pixels, ocr_probe
 from .ocr import OcrPage, Word
 from .ocr_pixels import Gray
 
@@ -37,26 +34,6 @@ _POLL = 0.005  # seconds between Status reads in recognize
 
 _lib = None
 _LOCK = threading.Lock()
-
-
-def recognizers() -> list[str]:
-    """The recognizer folders under %WINDIR%\\OCR that hold an .orp file, lower case, found by listing only."""
-    if sys.platform != "win32":
-        return []
-    names = []
-    try:
-        with os.scandir(_ocr_root()) as it:
-            folders = [e for e in it if e.is_dir()]
-    except OSError:
-        return []
-    for d in folders:
-        try:
-            with os.scandir(d.path) as files:
-                if any(f.name.lower().endswith(".orp") and f.is_file() for f in files):
-                    names.append(d.name.lower())
-        except OSError:
-            continue
-    return sorted(names)
 
 
 class WinOcr:
@@ -98,7 +75,7 @@ class WinOcr:
             self._idle.append(engine)
             tag = _tag(lib, engine)
             self.engine = f"win-{lang.lower()}" if own else f"win-{tag.lower()}"
-            self.version = _version(tag)
+            self.version = ocr_probe._version(tag)
         except BaseException:
             self.close()
             raise
@@ -258,7 +235,7 @@ class WinOp:
                 angle = value if math.isfinite(value) else 0.0
             finally:
                 _release(lib, ref)
-        words = []
+        words, ink = [], []
         lines = _out_ptr(lib, res, 6, "OcrResult.Lines", ())  # IVectorView<OcrLine>
         try:
             for n in range(_size(lib, lines) if lines else 0):
@@ -277,24 +254,22 @@ class WinOp:
                         box = self._box(rect)
                         if text and box:
                             words.append(Word(text, *box, line=n, conf=None))
+                            ink.append(self._box(rect, angle))
                 finally:
                     _release(lib, vec)
                     _release(lib, line)
         finally:
             _release(lib, lines)
         owner = self._owner
-        return OcrPage(self._w, self._h, words, angle, 0, owner.engine, owner.version)
+        return OcrPage(self._w, self._h, words, angle, 0, owner.engine, owner.version, ink if angle else None)
 
-    def _box(self, r) -> tuple[int, int, int, int] | None:
-        """The engine's float rect scaled back by the fit factors, as a pixel box of at least 1x1 inside the frame."""
+    def _box(self, r, angle: float = 0.0) -> tuple[int, int, int, int] | None:
+        """The engine's float rect scaled back by the fit factors, turned by `angle` (`_unskew`), as a pixel box of
+        at least 1x1 inside the frame."""
         if not all(math.isfinite(v) for v in (r.X, r.Y, r.Width, r.Height)):
             return None
-        sx, sy, w, h = self._kx, self._ky, self._w, self._h
-        x0 = min(max(math.floor(r.X * sx), 0), w - 1)
-        y0 = min(max(math.floor(r.Y * sy), 0), h - 1)
-        x1 = min(max(math.ceil((r.X + r.Width) * sx), x0 + 1), w)
-        y1 = min(max(math.ceil((r.Y + r.Height) * sy), y0 + 1), h)
-        return x0, y0, x1 - x0, y1 - y0
+        sx, sy = self._kx, self._ky
+        return _unskew(r.X * sx, r.Y * sy, (r.X + r.Width) * sx, (r.Y + r.Height) * sy, angle, self._w, self._h)
 
     def cancel(self):
         """Cancels the operation if it still runs, and releases it. Safe to call more than once."""
@@ -331,6 +306,24 @@ class WinOp:
             self.cancel()
         except Exception:  # noqa: BLE001 - interpreter shutdown: nothing left to release into
             pass
+
+
+def _unskew(x0: float, y0: float, x1: float, y1: float, angle: float, w: int, h: int) -> tuple[int, int, int, int]:
+    """The box x0..x1, y0..y1 of the deskewed frame in the w x h bitmap's own pixels, as (x, y, w, h) of at least
+    1x1 inside it: the axis-aligned bounds of the rectangle turned by `angle` degrees (the engine's TextAngle; y
+    down) about the bitmap's centre, which undoes the engine's deskew. An angle of 0 leaves the box as it is."""
+    if angle:
+        c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+        cx, cy = w / 2, h / 2
+        corners = [(x - cx, y - cy) for x in (x0, x1) for y in (y0, y1)]
+        xs = [cx + dx * c - dy * s for dx, dy in corners]
+        ys = [cy + dx * s + dy * c for dx, dy in corners]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    px0 = min(max(math.floor(x0), 0), w - 1)
+    py0 = min(max(math.floor(y0), 0), h - 1)
+    px1 = min(max(math.ceil(x1), px0 + 1), w)
+    py1 = min(max(math.ceil(y1), py0 + 1), h)
+    return px0, py0, px1 - px0, py1 - py0
 
 
 # ---- WinRT plumbing --------------------------------------------------------------------------------------------------
@@ -508,59 +501,3 @@ def _tag(lib, engine: int) -> str:
         return _string(lib, language, 6, "Language.LanguageTag")
     finally:
         _release(lib, language)
-
-
-# ---- files -----------------------------------------------------------------------------------------------------------
-
-def _ocr_root() -> Path:
-    return Path(os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows") / "OCR"
-
-
-def _recognizer_folder(tag: str) -> Path | None:
-    """The recognizer folder for a BCP-47 tag: the same name, else one for a region of it, else one of the same
-    language; None when there is none."""
-    tag = tag.lower()
-    folders = recognizers()
-    folder = next((f for f in folders if f == tag), None) \
-        or next((f for f in folders if f.startswith(tag + "-")), None) \
-        or next((f for f in folders if f.split("-")[0] == tag.split("-")[0]), None)
-    return None if folder is None else _ocr_root() / folder
-
-
-def _orp(folder: Path | None) -> Path | None:
-    """The folder's first .orp file in sorted order, whatever its name; None when it has none."""
-    if folder is None:
-        return None
-    try:
-        with os.scandir(folder) as it:
-            names = sorted(e.name for e in it if e.name.lower().endswith(".orp") and e.is_file())
-    except OSError:
-        return None
-    return folder / names[0] if names else None
-
-
-def _stamp(p: Path | None) -> str:
-    """'<size>:<mtime_ns>' of a file, or '0:0' when there is none or it cannot be read."""
-    if p is None:
-        return "0:0"
-    try:
-        st = p.stat()
-    except OSError:
-        return "0:0"
-    return f"{st.st_size}:{st.st_mtime_ns}"
-
-
-def dll() -> Path:
-    """Where the Windows build keeps Windows.Media.Ocr.dll."""
-    return Path(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows") / "System32" \
-        / "Windows.Media.Ocr.dll"
-
-
-def _version(tag: str) -> str:
-    """'<size>:<mtime_ns>/<size>:<mtime_ns>' of Windows.Media.Ocr.dll and of the recognizer's .orp file, a part
-    '0:0' when its file is missing or cannot be read. Never raises: the version only keys caches."""
-    try:
-        orp = _orp(_recognizer_folder(tag))
-    except Exception:  # noqa: BLE001 - a version is never a reason for no engine
-        orp = None
-    return f"{_stamp(dll())}/{_stamp(orp)}"

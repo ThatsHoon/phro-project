@@ -64,8 +64,10 @@ def recognizers(deps: dict | None = None) -> list[str]:
     return sorted(names)
 
 
-def _orp(folder: Path) -> Path | None:
-    """The folder's first .orp file in sorted order; None when it has none."""
+def _orp(folder: Path | None) -> Path | None:
+    """The folder's first .orp file in sorted order, whatever its name; None when it has none."""
+    if folder is None:
+        return None
     try:
         with os.scandir(folder) as it:
             names = sorted(e.name for e in it if e.name.lower().endswith(".orp") and e.is_file())
@@ -74,17 +76,38 @@ def _orp(folder: Path) -> Path | None:
     return folder / names[0] if names else None
 
 
+def _recognizer_folder(tag: str, deps: dict | None = None) -> Path | None:
+    """The recognizer folder for a BCP-47 tag: the same name, else one for a region of it, else one of the same
+    language; None when there is none."""
+    tag = tag.lower()
+    folders = recognizers(deps)
+    folder = next((f for f in folders if f == tag), None) \
+        or next((f for f in folders if f.startswith(tag + "-")), None) \
+        or next((f for f in folders if f.split("-")[0] == tag.split("-")[0]), None)
+    return None if folder is None else _ocr_root() / folder
+
+
+def _version(tag: str, deps: dict | None = None) -> str:
+    """'<size>:<mtime_ns>/<size>:<mtime_ns>' of Windows.Media.Ocr.dll and of the .orp file of the recognizer for
+    `tag`, a part '0:0' when its file is missing or cannot be read: the version the Windows engine reports. Never
+    raises: the version only keys caches."""
+    try:
+        orp = _orp(_recognizer_folder(tag, deps))
+    except Exception:  # noqa: BLE001 - a version is never a reason for no engine
+        orp = None
+    return f"{_stamp(dll(), deps)}/{_stamp(orp, deps)}"
+
+
 def _win(deps: dict) -> tuple[str, str] | None:
     """`win-ko` with a Korean recognizer, else `win-<language>` of the first recognizer folder, and the version the
-    engine reports (`ocr_win._version`): the stamps of Windows.Media.Ocr.dll and of the recognizer's .orp file. None
-    without the dll or a recognizer."""
+    engine reports (`_version`). None without the dll or a recognizer."""
     folders = recognizers(deps)
     lib = dll()
     _stamp(lib, deps)
     if not folders or not lib.is_file():
         return None
     tag = next((f for f in folders if f.split("-")[0] == "ko"), folders[0])
-    return "win-" + tag.split("-")[0], f"{_stamp(lib)}/{_stamp(_orp(_ocr_root() / tag), deps)}"
+    return "win-" + tag.split("-")[0], _version(tag, deps)
 
 
 # ---- Tesseract -------------------------------------------------------------------------------------------------------
