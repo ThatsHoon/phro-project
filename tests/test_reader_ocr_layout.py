@@ -187,6 +187,13 @@ def test_line_shares_baseline():
     assert a.char_offsets == (0.0, 10.0, 20.0, 30.0), a.char_offsets
 
 
+
+def test_one_inflated_box_does_not_set_size():
+    """Of five words, one box grown by noise does not set the line's size."""
+    words = [word(f"w{k}", 100 + 80 * k, 100, 60, 20, 0) for k in range(4)] + [word("noisy", 420, 60, 60, 60, 0)]
+    assert {f.size for f in ocr_layout.fragments(page(words), 72.0)} == {20.0}
+
+
 def body_page(big: bool) -> OcrPage:
     words = [word("Results", 100, 60, 280, 40 if big else 20, 0)]
     for r in range(5):

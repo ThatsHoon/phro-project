@@ -1,9 +1,9 @@
 """OCR words through the pdf layout and table builder: each word becomes a `pdf_layout.Fragment` and each rule a
 `pdf_tables.Segment`, in points, y up, in the frame of the page's turned bitmap (`rotate(g, page.turn)`).
 
-The words of one engine line share a baseline (the median box bottom) and a size: the line's tallest box, an estimate of
-the em, since a box holds only its word's ink. Tables take their words by position. Lines are read from positions in
-two clean columns, else in the engine's order through `pdf_layout.reading_order` (`_read`).
+The words of one engine line share a baseline (the median box bottom) and a size: an estimate of the em, since a box holds only
+its word's ink (`_em`). Tables take their words by position. Lines are read from positions in two clean columns, else
+in the engine's order through `pdf_layout.reading_order` (`_read`).
 """
 import statistics
 from collections import Counter, defaultdict
@@ -18,13 +18,20 @@ SCANNED = "_Scanned page, text by OCR._"
 BAND = 0.05  # a line within this share of the width from the middle crosses it, as in `xps._columns`
 
 
+def _em(heights) -> int:
+    """The tallest box of a line of up to 4 words, else the second tallest: a box with both an ascender and a
+    descender spans about the em, and one box grown by noise is passed over."""
+    hs = sorted(heights)
+    return hs[-1] if len(hs) <= 4 else hs[-2]
+
+
 def fragments(page: OcrPage, dpi: float) -> list:
     """One Fragment per word, `order` its index, in a page of `page.w * 72 / dpi` by `page.h * 72 / dpi` points."""
     s = 72.0 / dpi
     by_line = defaultdict(list)
     for w in page.words:
         by_line[w.line].append(w)
-    shared = {n: (statistics.median(w.y + w.h for w in ws), max(w.h for w in ws)) for n, ws in by_line.items()}
+    shared = {n: (statistics.median(w.y + w.h for w in ws), _em(w.h for w in ws)) for n, ws in by_line.items()}
     out = []
     for i, w in enumerate(page.words):
         bottom, height = shared[w.line]
