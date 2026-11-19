@@ -60,6 +60,14 @@ def _png(width: int, height: int, rows: list, alpha: bool, level: int = -1) -> b
             + _chunk(b"IDAT", zlib.compress(raw, level)) + _chunk(b"IEND", b""))
 
 
+def gray_png(g, level: int = 1) -> bytes:
+    """An 8-bit grayscale PNG (colour type 0, filter 0 on every row) of an `ocr_pixels.Gray`."""
+    ihdr = struct.pack(">IIBBBBB", g.w, g.h, 8, 0, 0, 0, 0)
+    raw = b"".join(b"\x00" + g.data[y * g.w:(y + 1) * g.w] for y in range(g.h))
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw, level)) + _chunk(b"IEND", b""))
+
+
 def _shift(mask: int):
     """(shift, bits) of a contiguous channel mask."""
     shift = (mask & -mask).bit_length() - 1
