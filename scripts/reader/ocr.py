@@ -170,8 +170,8 @@ def _read_once(g: Gray, eng: Engines, deadline: float) -> tuple[OcrPage | None, 
     if eng.win is None:
         return (None, False) if tess is None else (_tess_read(tess, g, ("kor", "eng"), None, deadline), False)
     page = eng.win.recognize(g, deadline)
-    if page is None:
-        return None, False
+    if page is None:  # Windows gave no page: Tesseract as on a machine without Windows OCR, while time is left
+        return (None, False) if tess is None else (_tess_read(tess, g, ("kor", "eng"), None, deadline), False)
     if tess is not None and "eng" in tess.langs and latin_share(page) >= limits.OCR_LATIN:
         again = _tess_read(tess, g, ("eng",), limits.TESS_PSM_LATIN, deadline)
         if again is not None and again.words:  # a re-read with no words never replaces one with words

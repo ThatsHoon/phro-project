@@ -122,11 +122,34 @@ def test_no_windows_uses_tess_present_langs():
     assert ocr.read_page(G, ocr.Engines(None, None, False), FAR, "page") == (None, False)
 
 
-def test_no_page_from_windows_gives_none():
+def test_no_page_from_windows_falls_back_to_tess():
+    for langs, call in (({"kor", "eng"}, ("kor+eng", limits.TESS_PSM_KOR)), ({"eng"}, ("eng", limits.TESS_PSM_LATIN))):
+        win = Win(lambda g: None, engine="win-en-us")
+        tess = Tess(langs)
+        got, hint = ocr.read_page(G, ocr.Engines(win, tess, False), FAR, "page")
+        assert got is not None and got.engine == "tess-" + call[0] and text(got) == " ".join(CLEAN_KO)
+        assert tess.calls == [call], tess.calls
+        assert len(win.calls) == 1 and hint is False
     win = Win(lambda g: None)
+    assert ocr.read_page(G, ocr.Engines(win, None, True), FAR, "page") == (None, False)  # no Tesseract
+    assert ocr.read_page(G, ocr.Engines(win, Tess({"osd"}), True), FAR, "page") == (None, False)
+
+
+def test_windows_fallback_stops_at_deadline():
+    clock = [100.0]
+
+    def late(g):
+        clock[0] = 111.0
+        return None
+
     tess = Tess({"kor", "eng"})
-    assert ocr.read_page(G, ocr.Engines(win, tess, False), FAR, "page") == (None, False)
-    assert tess.calls == []
+    saved = ocr._now
+    ocr._now = lambda: clock[0]
+    try:
+        got = ocr.read_page(G, ocr.Engines(Win(late), tess, True), 110.0, "page")
+    finally:
+        ocr._now = saved
+    assert got == (None, False) and tess.calls == []
 
 
 def test_engine_error_propagates():
