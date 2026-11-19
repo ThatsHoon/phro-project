@@ -1,8 +1,9 @@
 """The OCR worker process: `read.py ocr-worker`, started by `ocr.Session` once per conversion.
 
-It reads request frames on stdin (`ocr.read_frame`: a JSON head with the job's id, size, kind, dpi and the seconds
-`left` by which it must answer, then the Gray8 pixels) and answers each job on stdout when it finishes, so
-answers come in any order. It holds no state between jobs (decision 12): the per-picture cache is the Session's.
+It reads request frames on stdin (`ocr.read_head`: a JSON head with the job's id, size, kind, dpi and the seconds
+`left` by which it must answer, counted from when the head is read; then `ocr.read_body`: the Gray8 pixels) and
+answers each job on stdout when it finishes, so answers come in any order. It holds no state between jobs
+(decision 12): the per-picture cache is the Session's.
 
 An engine that faults natively kills this process alone; the Session turns its open tickets into "failed" ones and
 the conversion carries on. Any exception in a job answers `{"id", "ok": false}` for that job only.
@@ -18,11 +19,13 @@ from . import limits, ocr
 from .ocr_pixels import Gray, rotate, rules, threshold, unread
 
 
-def _job(head: dict, body: bytes, eng: ocr.Engines) -> dict:
+def _job(head: dict, body: bytes, eng: ocr.Engines, got: float) -> dict:
     """One job's answer. Pages get their rules and unread ink in the page's turned frame, the ink measured with the
-    page's `ink` boxes when the engine gives them (its word boxes are then deskewed); pictures get neither. An
-    answer read while the job's deadline passed carries `"cut": true`: the rotation search or a re-read may have
-    been cut short, so the Session never caches it. A head without `left` has no deadline."""
+    page's `ink` boxes when the engine gives them (its word boxes are then deskewed); pictures get neither. The job's
+    deadline is `left` seconds after `got`, the time.monotonic() its head was read, so a job that waits for a thread
+    keeps it. An answer read while the deadline passed carries `"cut": true`: the rotation search or a re-read may
+    have been cut short, so the Session never caches it; one cut before the engine gave any page is
+    `{"id", "ok": false, "cut": true}`, which the Session files late. A head without `left` has no deadline."""
     jid, kind = head["id"], head["kind"]
     dpi = float(head["dpi"])
     left = head.get("left")
@@ -34,13 +37,13 @@ def _job(head: dict, body: bytes, eng: ocr.Engines) -> dict:
             raise ValueError(f"left {left!r}")
         # the job's own deadline, OCR_ANSWER_MARGIN before the Session's stop: a cancelled Windows page keeps
         # running natively, so the deadline is the only bound, and the Session kills this process at its stop
-        deadline = time.monotonic() + left
+        deadline = got + left
     g = Gray(head["w"], head["h"], body)
     page, hint = ocr.read_page(g, eng, deadline, kind)
     cut = time.monotonic() >= deadline
     if page is None:
-        if cut:  # cut by the time, not a page without text: nothing to keep
-            return {"id": jid, "ok": False}
+        if cut:
+            return {"id": jid, "ok": False, "cut": True}
         return {"id": jid, "ok": True, "page": None, "rules": [], "unread": None, "hint": hint}
     if kind != "page":
         res = {"id": jid, "ok": True, "page": asdict(page), "rules": [], "unread": None, "hint": hint}
@@ -74,9 +77,10 @@ def serve(inp=None, out=None) -> None:
 
     `ocr.engines()` is built once; up to OCR_WORKERS jobs run at once in threads, the Windows ones sharing its
     `WinOcr`, the Tesseract ones each a process of its own. At most twice that many jobs are held: past them the
-    next frame is not read, so the pipe and the Session's writer wait. A request whose head is over OCR_FRAME_JSON,
-    or whose size is not two positive ints or is over images._MAX_PIXELS, is answered `ok: false` when its id can
-    be read, and the worker goes on when the stream can be followed past it; otherwise it ends. At EOF it waits for
+    next frame's body is not read, so the pipe and the Session's writer wait; its head is read first, so its time
+    runs from when the Session sent it. A request whose head is over OCR_FRAME_JSON, or whose size is not two
+    positive ints or is over images._MAX_PIXELS, is answered `ok: false` when its id can be read, and the worker
+    goes on when the stream can be followed past it; otherwise it ends. At EOF it waits for
     the running jobs, then closes the Windows engine: never before every operation has ended."""
     inp = sys.stdin.buffer if inp is None else inp
     out = sys.stdout.buffer if out is None else out
@@ -84,7 +88,7 @@ def serve(inp=None, out=None) -> None:
     n = max(1, int(limits.OCR_WORKERS))
     out_lock = threading.Lock()
     cond = threading.Condition()
-    jobs: deque = deque()  # (head, body); None ends a thread
+    jobs: deque = deque()  # (head, body, time.monotonic() of the head); None ends a thread
     held = threading.BoundedSemaphore(2 * n)
 
     def send(head: dict) -> None:
@@ -107,9 +111,9 @@ def serve(inp=None, out=None) -> None:
                 item = jobs.popleft()
             if item is None:
                 return
-            head, body = item
+            head, body, got = item
             try:
-                res = _job(head, body, eng)
+                res = _job(head, body, eng, got)
             except Exception:  # noqa: BLE001 - an engine's OSError or anything else: this job fails, not the worker
                 res = {"id": head.get("id"), "ok": False}
             del body, item
@@ -130,11 +134,19 @@ def serve(inp=None, out=None) -> None:
         t.start()
     try:
         while True:
-            held.acquire()
+            body = None
             try:
-                fr = ocr.read_frame(inp)
+                head = ocr.read_head(inp)
+                if head is None:
+                    break
+                got = time.monotonic()
+                held.acquire()
+                try:
+                    body = ocr.read_body(inp, head)
+                finally:
+                    if body is None:
+                        held.release()
             except ocr.FrameError as e:
-                held.release()
                 jid = e.head.get("id") if isinstance(e.head, dict) else None
                 if type(jid) is not int:
                     break
@@ -143,12 +155,8 @@ def serve(inp=None, out=None) -> None:
                     continue
                 break
             except (OSError, ValueError):
-                held.release()
                 break
-            if fr is None:
-                held.release()
-                break
-            give(fr)
+            give((head, body, got))
     finally:
         for _ in threads:
             give(None)

@@ -337,6 +337,80 @@ def test_light_block_on_word_page_gives_area():
     assert v.kind == "area" and v.box == u.box, v
 
 
+def verdict(buf, w, h, words):
+    """judge's verdict on the page `buf` with these word boxes, its rules found as the worker finds them; and the
+    Unread."""
+    from reader import ocr
+    g = Gray(w, h, bytes(buf))
+    thr = ocr_pixels.threshold(g)
+    u = ocr_pixels.unread(g, words, ocr_pixels.rules(g, 200, thr), thr)
+    page = ocr.OcrPage(w, h, [ocr.Word("가나", *b, 0, None) for b in words], 0.0, 0, "win-ko", "v1")
+    return ocr.judge(page, u).kind, u
+
+
+def table_page(shade, w=1000, h=1400):
+    """The word page with a 4 x 6 table in its middle, rows 50 px tall, a word in every cell; `shade(r, c)` is the
+    gray of cell (r, c), or None for paper. Rules between the cells when every cell is shaded."""
+    buf, words = word_page(w, h)
+    cols = [(100, 300), (300, 500), (500, 700), (700, 900)]
+    ruled = all(shade(r, c) is not None for r in range(6) for c in range(4))
+    for r in range(6):
+        y0 = 500 + 60 * r
+        for c, (x0, x1) in enumerate(cols):
+            v = shade(r, c)
+            if v is not None:
+                fill(buf, w, x0, y0, x1, y0 + 60, v)
+            wx = x0 + 15
+            ww = 60 + 25 * ((r + c) % 4)
+            fill(buf, w, wx, y0 + 20, wx + ww, y0 + 40)
+            words.append((wx, y0 + 20, ww, 20))
+    if ruled:
+        for r in range(7):
+            fill(buf, w, 100, 500 + 60 * r, 900, 502 + 60 * r)
+        for x, _ in cols + [(900, 0)]:
+            fill(buf, w, x, 500, x + 2, 862)
+    return buf, words
+
+
+def test_shaded_table_stays_trusted():
+    """N2: gray table cells under words are paper the words sit on, not a picture."""
+    buf, words = table_page(lambda r, c: 200 if r == 0 or c == 0 else 215)
+    kind, u = verdict(buf, 1000, 1400, words)
+    assert kind == "trusted", (kind, u)
+
+
+def test_striped_table_stays_trusted():
+    """N2: a zebra-striped table (every other row gray, no rules) is no picture."""
+    buf, words = table_page(lambda r, c: 205 if r % 2 else None)
+    kind, u = verdict(buf, 1000, 1400, words)
+    assert kind == "trusted", (kind, u)
+
+
+def test_vignette_stays_trusted():
+    """N2: a phone capture's radial vignette, its corners 70 levels under the paper, is no picture."""
+    w, h = 1000, 1400
+    buf, words = word_page(w, h)
+    cx, cy, far = w / 2, h / 2, (w * w + h * h) / 4
+    for y in range(h):
+        dy = (y - cy) ** 2
+        row = buf[y * w:(y + 1) * w]
+        buf[y * w:(y + 1) * w] = bytes(min(v, round(250 - 70 * ((x - cx) ** 2 + dy) / far))
+                                       for x, v in enumerate(row))
+    kind, u = verdict(buf, w, h, words)
+    assert kind == "trusted", (kind, u)
+
+
+def test_edge_shadow_stays_trusted():
+    """N2: a scanner's shadow along the binding edge, 80 levels under the paper at the edge and fading over 120 px,
+    is no picture."""
+    w, h = 1000, 1400
+    buf, words = word_page(w, h)
+    for y in range(h):
+        buf[y * w:y * w + 120] = bytes(min(buf[y * w + x], 175 + 80 * x // 120) for x in range(120))
+    kind, u = verdict(buf, w, h, words)
+    assert kind == "trusted", (kind, u)
+
+
 def test_density_tells_a_block_from_scattered_specks():
     """I3: specks spread over a large box leave it sparse; a block of the same box is dense."""
     w, h = 1000, 1400

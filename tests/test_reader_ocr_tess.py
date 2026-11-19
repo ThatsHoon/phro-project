@@ -205,7 +205,8 @@ def test_find_only_absolute_path_entries():
 
 def test_tessdata_found_off_windows():
     """Without TESSDATA_PREFIX: <bin>/tessdata, else <prefix>/share/tessdata, else the newest
-    <prefix>/share/tesseract-ocr/<version>/tessdata that exists; None when none does. Found by listing only."""
+    <prefix>/share/tesseract-ocr/<version>/tessdata, else <prefix>/share/tesseract/tessdata (Fedora, RHEL) that
+    exists; None when none does. Found by listing only."""
     saved = os.environ.pop("TESSDATA_PREFIX", None)
     try:
         with tempfile.TemporaryDirectory() as d:
@@ -214,6 +215,11 @@ def test_tessdata_found_off_windows():
             exe.parent.mkdir()
             exe.write_bytes(b"")
             assert ocr_probe.tessdata(exe) is None
+            fedora = top / "share" / "tesseract" / "tessdata"
+            fedora.mkdir(parents=True)
+            (fedora / "eng.traineddata").write_bytes(b"e")
+            assert ocr_probe.tessdata(exe) == fedora, ocr_probe.tessdata(exe)
+            assert ocr_probe.langs(exe) == {"eng"}
             versions = top / "share" / "tesseract-ocr"
             for v in ("4.00", "5", "notes"):
                 (versions / v / "tessdata").mkdir(parents=True)

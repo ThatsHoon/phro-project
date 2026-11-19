@@ -384,8 +384,8 @@ def rules(g: Gray, dpi: float, thr: int) -> list[tuple[int, int, int, int]]:
 @dataclass
 class Unread:
     """The ink of a page no word box or rule covers. `share`: the dark pixels left over all dark pixels (0.0 with
-    none). `box`: the fractional box (x0, y0, x1, y1), y down, that bounds the pixels left that are not paper (darker
-    than the paper by OCR_PAPER: light pictures too), None with none left after the 1 % rule of `unread`. `area`: the
+    none). `box`: the fractional box (x0, y0, x1, y1), y down, that bounds the pixels left that are not paper (dark,
+    or the light ink of a picture: see `unread`), None with none left after the 1 % rule of `unread`. `area`: the
     box's area over the page's (0.0 with no box). `density`: those pixels inside the box over the box's pixels (0.0
     with no box). `spread`: the page's gray range, the levels between its darkest and lightest 0.5 %."""
     share: float
@@ -464,17 +464,91 @@ def _levels(g: Gray, thr: int) -> tuple[int, float]:
     return edge(hist[::-1]) - edge(hist), sum(v * c for v, c in paper) / sum(c for _, c in paper)
 
 
+def _band_counts(mask, w: int, r0: int, r1: int) -> bytes:
+    """Per column, the ones of the 0/1 rows r0..r1 of `mask` (at most 255 rows), summed as big integers."""
+    acc = 0
+    for r in range(r0, r1):
+        acc += int.from_bytes(mask[r * w:(r + 1) * w], "big")
+    return acc.to_bytes(w, "big")
+
+
+def _pictures(light: bytes, dark: bytes, w: int, h: int, word_boxes) -> bytes:
+    """`light` with only its ones in light pictures kept: the light (not dark) ink of a page that is not paper shaded
+    under text, a vignette or a shadow.
+
+    On a grid of square cells, OCR_LIGHT_CELLS along the page's short side, a cell is light when at least half its
+    pixels that are not dark are light, so the words on a shaded fill do not break it. Light cells joined by their
+    sides make a region. A region is a picture when it touches no side of the page (a vignette, a scanner or gutter
+    shadow, the table a phone capture lies on) and no word box's centre lies in its box (the fill a table cell, a
+    stripe or a callout gives its text); the light ink of its cells and of the cells around them is kept."""
+    c = max(1, min(255, min(w, h) // limits.OCR_LIGHT_CELLS))
+    gw, gh = -(-w // c), -(-h // c)
+    cells = bytearray(gw * gh)
+    for gy in range(gh):
+        r0, r1 = gy * c, min(h, gy * c + c)
+        lc, dc = _band_counts(light, w, r0, r1), _band_counts(dark, w, r0, r1)
+        for gx in range(gw):
+            x0, x1 = gx * c, min(w, gx * c + c)
+            n = (r1 - r0) * (x1 - x0) - sum(dc[x0:x1])
+            if n > 0 and 2 * sum(lc[x0:x1]) >= n:
+                cells[gy * gw + gx] = 1
+    out = bytearray(len(light))
+    if 1 not in cells:
+        return bytes(out)
+    centres = [(min(gw - 1, max(0, int((x + bw / 2) // c))), min(gh - 1, max(0, int((y + bh / 2) // c))))
+               for x, y, bw, bh in word_boxes if all(map(math.isfinite, (x, y, bw, bh)))]
+    keep = bytearray(gw * gh)
+    seen = bytearray(gw * gh)
+    for start in range(gw * gh):
+        if not cells[start] or seen[start]:
+            continue
+        seen[start] = 1
+        stack, region = [start], []
+        while stack:
+            i = stack.pop()
+            region.append(i)
+            x, y = i % gw, i // gw
+            for j, ok in ((i - 1, x > 0), (i + 1, x < gw - 1), (i - gw, y > 0), (i + gw, y < gh - 1)):
+                if ok and cells[j] and not seen[j]:
+                    seen[j] = 1
+                    stack.append(j)
+        xs, ys = [i % gw for i in region], [i // gw for i in region]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        if x0 == 0 or y0 == 0 or x1 == gw - 1 or y1 == gh - 1:
+            continue
+        if any(x0 <= cx <= x1 and y0 <= cy <= y1 for cx, cy in centres):
+            continue
+        for i in region:
+            x, y = i % gw, i // gw
+            for yy in (y - 1, y, y + 1):
+                keep[yy * gw + x - 1:yy * gw + x + 2] = b"\x01\x01\x01"
+    for gy in range(gh):
+        row = keep[gy * gw:(gy + 1) * gw]
+        gx = row.find(1)
+        while gx >= 0:
+            end = row.find(0, gx)
+            end = gw if end < 0 else end
+            x0, x1 = gx * c, min(w, end * c)
+            for r in range(gy * c, min(h, gy * c + c)):
+                out[r * w + x0:r * w + x1] = light[r * w + x0:r * w + x1]
+            gx = row.find(1, end) if end < gw else -1
+    return bytes(out)
+
+
 def unread(g: Gray, word_boxes, rule_boxes, thr: int) -> Unread:
     """The page's ink that no word box and no rule covers (decision 10: rule pixels are not unread). `word_boxes` are
     pixel boxes (x, y, w, h), y down, as the `ocr.Word` fields give them, each grown by a quarter of its height on
     every side; `rule_boxes` are `rules`' boxes (x0, y0, x1, y1), exclusive ends, each grown by 1 px on every side for
     the rule's anti-aliased edges. `share` counts the dark pixels (value < thr) left over all dark pixels, rules
-    included. The box and its density count the pixels left that are not paper: dark, or darker than the mean of the
-    pixels at or over `thr` by OCR_PAPER, so a picture lighter than the Otsu split still has its box."""
+    included. The box and its density count the pixels left that are not paper: dark, or light (darker than the mean
+    of the pixels at or over `thr` by OCR_PAPER) in a light picture (`_pictures`), so a picture lighter than the Otsu
+    split still has its box, and shaded paper does not make one."""
     w, h = g.w, g.h
     spread, paper = _levels(g, thr)
     m = bytearray(g.data.translate(_dark(thr)))
-    p = bytearray(g.data.translate(_dark(max(thr, math.ceil(paper - limits.OCR_PAPER)))))
+    cut = min(max(thr, math.ceil(paper - limits.OCR_PAPER)), 256)
+    light = g.data.translate(b"\x00" * thr + b"\x01" * (cut - thr) + b"\x00" * (256 - cut))
+    p = bytearray(_or((bytes(m), _pictures(light, bytes(m), w, h, word_boxes))))
     total = m.count(1)
     for x, y, bw, bh in word_boxes:
         grow = bh / 4

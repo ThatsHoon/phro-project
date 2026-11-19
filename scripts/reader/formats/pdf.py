@@ -199,7 +199,7 @@ class _Kept:
         self.hidden = []          # hidden Paras, one per text object
         self.comments = []
         self.blocks = []
-        self.pending = None       # (ticket, png, alt) of a page sent to OCR, its image not placed yet
+        self.pending = None       # (ticket, png, alt, whole) of a page sent to OCR, its image not placed yet
         self.links = []           # the page's links, kept for its OCR text
         self.glyphs = (0, 0)      # (`glyphs` counted on this page, glyphs it showed without Unicode)
         self.ocr_read = False     # its text came from OCR
@@ -503,7 +503,7 @@ class _Reader:
             ticket = self.ocr.submit(g, "page", dpi, until=until)
             got = self.ocr.peek(ticket)
             self.ocr_stopped = got is not None and got.status == "late"
-            keep.pending = (ticket, data, alt)
+            keep.pending = (ticket, data, alt, pd.render is not None)
             keep.links = state["links"]
             return
         box, paths = pd.figure
@@ -535,14 +535,14 @@ class _Reader:
         for k in kept:
             if k.pending is None:
                 continue
-            ticket, png, alt = k.pending
+            ticket, png, alt, whole = k.pending
             k.pending = None
             r = self.ocr.wait(ticket)
             if r.status == "done":
                 self.part = False
                 placed = []
                 with self._page_guard("page_part"):
-                    self._read_page(k, r, ticket.dpi, png)
+                    self._read_page(k, r, ticket.dpi, png, whole)
                     placed.append(r.verdict.kind)
                 if placed:
                     counts["pages"] += 1
@@ -557,15 +557,17 @@ class _Reader:
             k.items.append((math.inf, 0.0, -1, Image(png, alt=alt, ocr="page")))
         return counts
 
-    def _read_page(self, k, r, dpi, png):
+    def _read_page(self, k, r, dpi, png, whole):
         """The OCR words of page `k` as its own text, laid out and searched for ruled tables as pdf
         text is, in the frame of the page bitmap OCR read; then its image as `r.verdict` says. Built
-        aside and put on `k` at the end: a step that raises leaves `k` and the charge as they were."""
+        aside and put on `k` at the end: a step that raises leaves `k` and the charge as they were.
+        When OCR read a render of the `whole` page, the page's other images are in its text and are
+        marked so; the scan image's own pixels hold none of them."""
         from .. import ocr_layout
         page, n = r.page, k.number
         w, h = page.w * 72.0 / dpi, page.h * 72.0 / dpi
         new = _Kept(n, (0.0, 0.0, w, h))
-        new.items = [(*it[:3], replace(it[3], ocr="page")) if isinstance(it[3], Image) else it
+        new.items = [(*it[:3], replace(it[3], ocr="page")) if whole and isinstance(it[3], Image) else it
                      for it in k.items if not isinstance(it[3], Table)]
         state = {"frags": ocr_layout.fragments(page, dpi), "ocr": set(), "links": k.links, "read": ocr_layout.read}
         self._layout(new, state)

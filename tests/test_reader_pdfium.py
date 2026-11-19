@@ -757,6 +757,22 @@ def test_pdfium_scan_read_by_ocr():
         assert not got["skipped"], got["skipped"]
 
 
+def test_pdfium_scan_images_not_read_again():
+    """OCR read a render of the whole scanned page, so another picture on it is in that text: not read again by the
+    picture pass, which runs here inside the session."""
+    data = simple_pdf([FULL + b"q 100 0 0 100 72 72 cm /Im2 Do Q"],
+                      resources=dict(F1, XObject={"Im1": Ref(30), "Im2": Ref(31)}),
+                      extra_objects={30: image_xobject(64, 64, data=bytes(range(64)) * 64),
+                                     31: image_xobject(64, 64, data=bytes(range(64)) * 64)})
+    stub = str(HERE / "tests" / "ocr_stub_worker.py")
+    whole = _SCAN.replace("\nwith tempfile.TemporaryDirectory() as tmp:\n",
+                          "\n    held = tempfile.TemporaryDirectory()\n    tmp = held.name\n")
+    assert whole != _SCAN
+    got = child(whole, data, stub, env=dict(os.environ, PHRO_OCR_STUB="{}"))
+    assert got["sent"] == [[1700, 2200, "page", 200.0]], got["sent"]
+    assert "_Scanned page, text by OCR._" in got["md"], got["md"]
+
+
 def test_pdfium_small_scan_not_sent():
     """A scanned page of 20 points, whose gray at OCR_DPI is under OCR_MIN_EDGE, is not read: today's image."""
     data = simple_pdf([b"q 20 0 0 20 0 0 cm /Im1 Do Q "], resources=dict(F1, XObject={"Im1": Ref(30)}),

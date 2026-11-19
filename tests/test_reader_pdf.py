@@ -1023,8 +1023,9 @@ def test_scanned_two_columns_read_in_column_order():
     assert re.findall(r"[LR]\d[ab]", text) == want, text
 
 
-def test_scanned_page_images_not_read_again():
-    """A picture on a scanned page is in the page render OCR read: its text is not read a second time."""
+def test_native_scan_leaves_other_images_to_the_picture_pass():
+    """The native engine reads only the scan image's own pixels: another picture on the page is not in them, so it
+    is read as a picture of its own. (Through pdfium, OCR reads a render of the whole page: test_reader_pdfium.)"""
     g = fixture_gray()
     data = simple_pdf([FULL + b"q 100 0 0 100 72 72 cm /Im2 Do Q"],
                       resources=dict(F1, XObject={"Im1": Ref(30), "Im2": Ref(31)}),
@@ -1032,8 +1033,8 @@ def test_scanned_page_images_not_read_again():
                                      31: image_xobject(64, 64, data=bytes(range(64)) * 64)})
     with ocr_stub(answer=canned(g)) as (s, sent):
         text, _, _ = md(data)
-    assert [k for _, _, k in sent] == ["page"], sent
-    assert text.count("](assets/") == 1 and SCANNED in text, text
+    assert [k for _, _, k in sent] == ["page", "picture"], sent
+    assert text.count("](assets/") == 1 and SCANNED in text and "Picture text" in text, text
 
 
 def _rendered(png):

@@ -142,8 +142,9 @@ def _newest_first(name: str) -> tuple:
 
 def tessdata(exe, deps: dict | None = None) -> Path | None:
     """TESSDATA_PREFIX when set; else the first folder that exists of <bin>/tessdata, <prefix>/share/tessdata and
-    <prefix>/share/tesseract-ocr/<version>/tessdata, newest version first, where <bin> holds the executable and
-    <prefix> is its parent (the Windows installer, Homebrew, and Debian or Ubuntu); None when none does."""
+    <prefix>/share/tesseract-ocr/<version>/tessdata, newest version first, and <prefix>/share/tesseract/tessdata,
+    where <bin> holds the executable and <prefix> is its parent (the Windows installer, Homebrew, Debian or Ubuntu,
+    and Fedora or RHEL); None when none does."""
     env = os.environ.get("TESSDATA_PREFIX")
     if env:
         _stamp(env, deps)
@@ -159,6 +160,7 @@ def tessdata(exe, deps: dict | None = None) -> Path | None:
     except OSError:
         names = []
     cands += [versions / n / "tessdata" for n in sorted(names, key=_newest_first, reverse=True)]
+    cands.append(share / "tesseract" / "tessdata")
     for c in cands:
         _stamp(c, deps)
         if c.is_dir():

@@ -88,6 +88,8 @@ OCR_AREA_DENSITY = 0.01    # share of the unread box's pixels that must be unrea
 #                            a page 0.018-0.020, photos 0.29-0.62, light photos 0.21-0.84, a logo 0.93-0.94
 OCR_PAPER = 32             # levels under the paper's mean from which a pixel is not paper (the picture area's ink);
 #                            spike: a light photo (gray 150-250 on paper 255) boxed at 0.12-0.49 of the page
+OCR_LIGHT_CELLS = 64       # cells along the page's short side of the grid on which light (not dark) ink is found as
+#                            regions; a cell is ~0.1 inch at 150-300 dpi, under a text line
 OCR_FLAT = 16              # gray range (levels) up to which a page with no words is blank; spike: clean pages 228-255,
 #                            noisy 155-188, a blank render 0
 OCR_SKEW = 0.5             # degrees the lines of a TESS_PSM_KOR read may slope before the page is doubtful; spike:

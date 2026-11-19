@@ -336,7 +336,7 @@ _SOURCES = ("ocr.py", "ocr_layout.py", "ocr_pixels.py", "ocr_probe.py", "ocr_tes
 # the limits that shape what the worker answers (engine choice, rotation search, rules); the verdict thresholds
 # are not here, since `judge` runs again on every load
 _KEY_LIMITS = ("OCR_JUNK", "OCR_LATIN", "TESS_PSM_LATIN", "TESS_PSM_KOR", "OCR_RULE", "OCR_RULE_THICK",
-               "OCR_RULES_MAX", "OCR_DPI", "OCR_PAPER")
+               "OCR_RULES_MAX", "OCR_DPI", "OCR_PAPER", "OCR_LIGHT_CELLS")
 
 
 @functools.cache
@@ -455,9 +455,15 @@ def write_frame(f, head: dict, body: bytes = b"") -> None:
 
 
 def read_frame(f) -> tuple[dict, bytes] | None:
-    """The next frame of `f` as (head, body), or None at EOF before a frame. FrameError (a ValueError) for a head
-    length over OCR_FRAME_JSON, a head that is not a UTF-8 JSON object, a size that is not two positive ints or is
-    over images._MAX_PIXELS, or a frame cut short."""
+    """The next frame of `f` as (head, body), or None at EOF before a frame: `read_head`, then `read_body`."""
+    head = read_head(f)
+    return None if head is None else (head, read_body(f, head))
+
+
+def read_head(f) -> dict | None:
+    """The head of the next frame of `f`, its body not read, or None at EOF before a frame. FrameError (a
+    ValueError) for a head length over OCR_FRAME_JSON, a head that is not a UTF-8 JSON object, a size that is not two
+    positive ints or is over images._MAX_PIXELS, or a head cut short."""
     raw = _exact(f, 4)
     if not raw:
         return None
@@ -475,11 +481,17 @@ def read_frame(f) -> tuple[dict, bytes] | None:
         raise FrameError("frame head is not JSON") from None
     if not isinstance(head, dict):
         raise FrameError("frame head is not an object")
+    _body_len(head)
+    return head
+
+
+def read_body(f, head: dict) -> bytes:
+    """The body of the frame whose head `read_head` just gave. FrameError for a body cut short."""
     size = _body_len(head)
     body = _exact(f, size)
     if len(body) < size:
         raise FrameError("frame body cut short", head)
-    return head, body
+    return body
 
 
 # ---- results ---------------------------------------------------------------------------------------------------------
@@ -678,7 +690,7 @@ class Session:
 
     OCR never fails a conversion, nor stalls it past the stop. A worker that exits, cannot start, refuses a job or
     sends a frame that does not read gives "failed" tickets (a bad frame also kills it); a dead worker is not started
-    again. At
+    again. A refusal the worker flags `cut` (the job's time ran out before any page) is "late". At
     `deadline - FIGURE_RESERVE` (the stop) a waiting `wait` kills the worker with its whole process tree, and every
     open ticket becomes "late", as does any later one. An answer the worker flags `cut` (its deadline passed while it
     read the job) or that arrives at or after the stop is used but never filed in `store`: it may be a reading the
@@ -864,7 +876,7 @@ class Session:
         if t is None:
             return False
         if not ok:
-            self._settle(tid, Result("failed"))
+            self._settle(tid, Result("late" if cut else "failed"))
             return True
         try:
             r = _result_of(head, t.kind)

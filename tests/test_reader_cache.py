@@ -767,6 +767,60 @@ def test_cut_ocr_page_files_the_document():
         ocr.WORKER_CMD = saved
 
 
+def _scan_store(n, conf, ahead):
+    """`n` TIFF pages stored with the stand-in worker set by `conf`, under a deadline `ahead` seconds past the
+    session's answer margin; (folder, key, meta, out.md)."""
+    import ocr_fix
+    from reader import limits, ocr, raster
+    from test_read_cli import pages, tiff_file
+    saved = ocr.WORKER_CMD
+    ocr.WORKER_CMD = ocr_fix.STUB
+    try:
+        with stub(), ocr_fix.stub_env(**conf):
+            wall = time.time() + limits.FIGURE_RESERVE + limits.OCR_ANSWER_MARGIN + ahead
+            os.environ[raster.DEADLINE_ENV] = repr(wall)
+            try:
+                src = tiff_file(pages(n))
+                k = cache.key(src)
+                out = cache.store(k, src, backend=("win-ko", "test"))
+            finally:
+                os.environ.pop(raster.DEADLINE_ENV, None)
+            stop = wall - limits.FIGURE_RESERVE
+            assert time.time() < stop, "the conversion ran past the session's stop"
+            meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+            return out, k, meta, (out / "out.md").read_text(encoding="utf-8")
+    finally:
+        ocr.WORKER_CMD = saved
+
+
+def test_queued_ocr_pages_answer_before_the_stop():
+    """N1: on one worker thread, the pages queued behind a slow one keep the session's stop less the margin, from
+    when the worker received them: each comes back done or cut before the stop, none late, and the conversion is
+    filed under its document key."""
+    if sys.platform != "win32":
+        print("skip: test_queued_ocr_pages_answer_before_the_stop (needs GDI+)")
+        return
+    from reader import limits
+    out, k, meta, text = _scan_store(3, {"serve": 30, "workers": 1}, 2)
+    assert out.name == k, (out.name, meta["warnings"])
+    assert meta["ocr"]["pages"] == 3 and meta["ocr"]["stopped_at"] is None, meta["ocr"]
+    assert limits.OCR_LATE not in meta["warnings"], meta["warnings"]
+    assert text.count("w600") == 3, text
+
+
+def test_cut_ocr_page_without_text_is_late():
+    """N5: a page cut by the time before any page was read is late, not failed: the stop note shows and the
+    conversion is not filed under its document key."""
+    if sys.platform != "win32":
+        print("skip: test_cut_ocr_page_without_text_is_late (needs GDI+)")
+        return
+    from reader import limits
+    out, k, meta, text = _scan_store(1, {"answer": {"ok": False, "cut": True}}, 2)
+    assert out.name != k and limits.OCR_LATE in meta["warnings"], (out.name, meta["warnings"])
+    assert meta["ocr"]["stopped_at"] == 1 and meta["ocr"]["failed"] == 0, meta["ocr"]
+    assert "(OCR stopped at page 1; read the file again to continue)" in text, text
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

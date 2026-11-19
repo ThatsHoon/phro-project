@@ -10,6 +10,8 @@
     child_pipes the grandchild inherits this worker's stdin and stdout pipes
     bad_frame   answer the first job with a frame whose head length is past OCR_FRAME_JSON
     honor_left  as the real worker: a job whose delay passes its `left` is answered when `left` runs out, flagged cut
+    serve       the real worker's own loop (`ocr_worker.serve`) with `workers` threads (default 1), its engine a
+                stand-in that reads `serve` seconds a job, or until the job's deadline, and gives the page either way
 
 A done answer is a page of one word, "w<W>", where W is the job's width, so a test can match answers to jobs.
 
@@ -29,8 +31,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from reader import limits, ocr  # noqa: E402
 
 
+def serve(secs: float, workers: int) -> None:
+    from reader import ocr_worker
+
+    class Slow:
+        engine, version = "stub", "1"
+
+        def recognize(self, g, deadline):
+            time.sleep(max(0.0, min(secs, deadline - time.monotonic())))
+            return ocr.OcrPage(g.w, g.h, [ocr.Word(f"w{g.w}", 0, 0, g.w, g.h, 0, None)], 0.0, 0, "stub", "1")
+
+        def close(self):
+            pass
+
+    limits.OCR_WORKERS = workers
+    ocr.engines = lambda: ocr.Engines(Slow(), None, True)
+    ocr_worker.serve()
+
+
 def main():
     conf = json.loads(os.environ.get("PHRO_OCR_STUB") or "{}")
+    if "serve" in conf:
+        serve(float(conf["serve"]), int(conf.get("workers", 1)))
+        return
     inp, out = sys.stdin.buffer, sys.stdout.buffer
     lock = threading.Lock()
     answered = [0]

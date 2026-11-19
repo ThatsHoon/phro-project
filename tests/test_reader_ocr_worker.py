@@ -617,6 +617,60 @@ def test_page_queued_past_the_answer_margin_is_late():
             s.close()
 
 
+class SlowWin(FakeWin):
+    """Reads `secs` a page, or until the deadline, and gives the page read so far either way."""
+
+    def __init__(self, secs):
+        super().__init__()
+        self.secs = secs
+
+    def recognize(self, g: Gray, deadline: float):
+        time.sleep(max(0.0, min(self.secs, deadline - time.monotonic())))
+        return ocr.OcrPage(g.w, g.h, [ocr.Word("가나다", 0, 0, 5, 5, 0, None)], 0.0, 0, self.engine, self.version)
+
+
+def test_worker_deadline_runs_from_receipt():
+    """N1: a job's `left` runs from when the worker receives its frame head, not from when a thread takes the job:
+    with one thread, the job queued behind a slow one and the one whose head waits for room keep the same end, and
+    all three come back cut by then."""
+    g = block(40, 30, 0, 0, 10, 8)
+    old = limits.OCR_WORKERS
+    limits.OCR_WORKERS = 1
+    try:
+        reqs = [({"id": i, "w": g.w, "h": g.h, "kind": "picture", "dpi": 200.0, "left": 1.0}, g.data)
+                for i in range(1, 4)]
+        t0 = time.monotonic()
+        got, _ = serve(frames(*reqs), SlowWin(30))
+        took = time.monotonic() - t0
+    finally:
+        limits.OCR_WORKERS = old
+    assert sorted(got) == [1, 2, 3] and all(a["ok"] and a.get("cut") is True for a in got.values()), got
+    assert took < 1.8, f"queued jobs ran past their end: {took:.2f}s"
+
+
+class NoneWin(FakeWin):
+    def recognize(self, g: Gray, deadline: float):
+        return None
+
+
+def test_cut_job_without_page_is_late():
+    """N5: a job cut by the time before any page is answered cut, not failed; the Session files it late, so the
+    document is not filed. A job with time left whose engine gives no page still fails."""
+    g = block(40, 30, 0, 0, 10, 8)
+    head = {"w": g.w, "h": g.h, "kind": "page", "dpi": 200.0}
+    got, _ = serve(frames(({"id": 1, **head, "left": 0.0}, g.data), ({"id": 2, **head, "left": 30.0}, g.data)),
+                   NoneWin())
+    assert got[1] == {"id": 1, "ok": False, "cut": True}, got[1]
+    assert got[2]["ok"] and got[2]["page"] is None and not got[2].get("cut"), got[2]
+    with stub(answer={"ok": False, "cut": True}):
+        s = ocr.Session(time.monotonic() + 60, BACKEND, cmd=STUB)
+        try:
+            r = s.wait(s.submit(gray(11), "page", 200.0))
+            assert r.status == "late" and s.late, (r.status, s.late)
+        finally:
+            s.close()
+
+
 class SkewWin(FakeWin):
     """An engine that deskews: its word box is in the deskewed frame, away from the ink, and `ink` holds where the
     word is in the page's pixels."""
@@ -730,7 +784,7 @@ def test_key_follows_worker_limits_and_code():
     k = ocr.picture_key(g, "win-ko", "1", kind="page", dpi=200.0)
     for name, value in (("TESS_PSM_KOR", 6), ("OCR_JUNK", 0.5), ("OCR_LATIN", 0.5), ("TESS_PSM_LATIN", 6),
                         ("OCR_RULE", 0.5), ("OCR_RULE_THICK", 0.5), ("OCR_RULES_MAX", 7), ("OCR_DPI", 300),
-                        ("OCR_PAPER", 5)):
+                        ("OCR_PAPER", 5), ("OCR_LIGHT_CELLS", 9)):
         old = getattr(limits, name)
         setattr(limits, name, value)
         try:
