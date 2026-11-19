@@ -191,6 +191,66 @@ class Figures:
                 pass
 
 
+OCR = "ocr"  # the folder under the root that holds per-picture OCR results (OcrResults)
+
+
+class OcrResults:
+    """Per-picture OCR results, one JSON file each at <dir>/<k[:2]>/<k>, keyed by `ocr.picture_key`: the worker's
+    answer fields (page, rules, unread, hint). The verdict is not stored: the Session judges a loaded result again,
+    so a calibrated threshold applies to it. A read the deadline cut keeps the pictures it finished here, so the
+    next read continues (decision 12). Written atomically; prune clears them as it does figures."""
+
+    def __init__(self, dir: Path):
+        self.dir = Path(dir)
+
+    def path(self, k: str) -> Path:
+        return self.dir / k[:2] / k
+
+    def get(self, k: str) -> dict | None:
+        """The stored dict, or None (a miss, or a file that is not a JSON object within OCR_FRAME_JSON bytes)."""
+        import json
+        from . import limits
+        f = self.path(k)
+        try:
+            if f.stat().st_size > limits.OCR_FRAME_JSON:
+                return None
+            raw = f.read_bytes()
+        except OSError:
+            return None
+        try:
+            d = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return None
+        if not isinstance(d, dict):
+            return None
+        try:
+            os.utime(f, None)  # in use: prune keeps it
+        except OSError:
+            pass
+        return d
+
+    def put(self, k: str, result: dict) -> None:
+        """Stores `result`; errors (a value that is not JSON, a disk that cannot be written) are swallowed."""
+        import json
+        try:
+            data = json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError, RecursionError):
+            return
+        f = self.path(k)
+        with _lock:
+            n = next(_counter)
+        tmp = f.parent / f".tmp-{k}-{os.getpid()}-{n}"
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(data)
+            os.replace(tmp, f)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def store(k: str, src, hidden: bool = False, **opts) -> Path:
     from . import images
     bucket = root() / k[:2]
@@ -243,9 +303,13 @@ def prune(days: int = 30) -> int:
                     f.unlink()
             except OSError:
                 pass
-    figs = base / FIGURES
-    if figs.is_dir():  # converted figures: unused for `days` (a lookup touches them), or a writer's leftover after a day
-        for bucket in figs.iterdir():
+    for name in (FIGURES, OCR):
+        # converted figures and OCR results: unused for `days` (a lookup touches them), or a writer's leftover
+        # after a day
+        files = base / name
+        if not files.is_dir():
+            continue
+        for bucket in files.iterdir():
             if not bucket.is_dir():
                 continue
             for f in bucket.iterdir():
@@ -257,7 +321,7 @@ def prune(days: int = 30) -> int:
                 except OSError:
                     pass
     for bucket in base.iterdir():
-        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined", FIGURES):
+        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined", FIGURES, OCR):
             continue
         for d in bucket.iterdir():
             if d.name.startswith(".tmp-"):

@@ -2,6 +2,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -56,9 +57,11 @@ def version(exe, used: Iterable[str]) -> str:
 
 
 def parse_tsv(text: str) -> list[Word]:
-    """Level-5 rows with non-blank text become words; `line` numbers the distinct (page, block, par, line) keys."""
-    rows = text.splitlines()
-    if not rows:
+    """Level-5 rows with non-blank text become words; `line` numbers the distinct (page, block, par, line) keys. Rows
+    end at a line feed alone (a carriage return before it is dropped): `splitlines` would also cut at a form feed or
+    NEL inside the recognized text."""
+    rows = [r.rstrip("\r") for r in text.split("\n")]
+    if not rows or not rows[0]:
         return []
     head = rows[0].split("\t")
     words: list[Word] = []
@@ -89,10 +92,12 @@ def recognize(g, langs: str, psm: int, deadline: float, *, run=subprocess.run) -
         return None
     env = dict(os.environ)
     env["OMP_THREAD_LIMIT"] = "1"
+    # the reader runs inside a hook: no console window may flash on Windows
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         p = run([str(exe), "-", "stdout", "-l", langs, "--psm", str(psm), "-c", "tessedit_create_tsv=1"],
                 input=images.gray_png(g), capture_output=True, timeout=max(0.0, deadline - time.monotonic()),
-                env=env)
+                env=env, creationflags=flags)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if p.returncode != 0:

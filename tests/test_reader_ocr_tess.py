@@ -57,6 +57,33 @@ def test_parse_tsv_lines_and_conf():
     assert (ws[1].x, ws[1].y, ws[1].w, ws[1].h) == (50, 5, 45, 10)
 
 
+def test_parse_tsv_keeps_rows_whole():
+    # a form feed or NEL inside recognized text must not tear its row; CRLF row ends are taken as LF
+    tsv = TSV.replace("\tworld\n", "\two\x0crld\n").replace("\tNext\n", "\tNe\x85xt\n").replace("\n", "\r\n")
+    ws = ocr_tess.parse_tsv(tsv)
+    assert [w.text for w in ws] == ["Hello", "wo\x0crld", "Ne\x85xt"], [w.text for w in ws]
+    assert [w.line for w in ws] == [0, 0, 1] and ws[2].conf == 80.0
+
+
+def test_tesseract_starts_without_a_window():
+    seen = {}
+
+    def run(argv, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(argv, 0, stdout=TSV.encode(), stderr=b"")
+
+    orig = ocr_tess.find
+    ocr_tess.find = lambda: Path(sys.executable)
+    try:
+        ocr_tess.recognize(Gray(2, 2, bytes(4)), "eng", 3, time.monotonic() + 30, run=run)
+    finally:
+        ocr_tess.find = orig
+    if sys.platform == "win32":
+        assert seen.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW, seen.get("creationflags")
+    else:
+        assert not seen.get("creationflags")
+
+
 def test_stdin_is_reader_png():
     g = Gray(4, 4, bytes(range(16)))
     seen = {}

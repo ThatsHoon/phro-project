@@ -199,6 +199,17 @@ def cmd_hook(a) -> int:
     return 0
 
 
+def cmd_ocr_worker(a) -> int:
+    """The OCR worker (reader.ocr_worker), started by ocr.Session: frames on stdin and stdout. Anything printed
+    goes to stderr, so no stray line lands between frames."""
+    from reader import ocr_worker
+    out = sys.stdout.buffer
+    sys.stdout.flush()
+    sys.stdout = sys.stderr
+    ocr_worker.serve(sys.stdin.buffer, out)
+    return 0
+
+
 def main(argv=None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -225,6 +236,7 @@ def main(argv=None) -> int:
     pr.add_argument("--days", type=int, default=30)
     pr.set_defaults(fn=cmd_prune)
     sub.add_parser("hook").set_defaults(fn=cmd_hook)
+    sub.add_parser("ocr-worker", help=argparse.SUPPRESS).set_defaults(fn=cmd_ocr_worker)
     a = p.parse_args(argv)
     return a.fn(a)
 
