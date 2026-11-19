@@ -302,6 +302,58 @@ def test_convert_error_keeps_original():
             assert (Path(d) / "assets" / "img-001.wmf").read_bytes() == data
             assert a.figures == 0 and a.figures_left == 1 and not a.lines
 
+
+def png_with(png, **ihdr):
+    """`png` with IHDR fields replaced (depth, ctype, interlace) and its CRC rewritten."""
+    body = bytearray(png[16:29])
+    for name, pos in (("depth", 8), ("ctype", 9), ("interlace", 12)):
+        if name in ihdr:
+            body[pos] = ihdr[name]
+    return png[:8] + images._chunk(b"IHDR", bytes(body)) + png[33:]
+
+
+def test_png_pixels_reads_own_png():
+    rows = [bytes([1, 2, 3, 4, 5, 6, 7, 8, 9]), bytes([10, 11, 12, 13, 14, 15, 16, 17, 18])]
+    png = images._png(3, 2, rows, False, 1)
+    assert images.png_pixels(png) == (3, 2, 3, b"".join(rows))
+    rgba = [bytes([1, 2, 3, 4, 5, 6, 7, 8])]
+    assert images.png_pixels(images._png(2, 1, rgba, True)) == (2, 1, 4, rgba[0])
+    from reader.ocr_pixels import Gray
+    assert images.png_pixels(images.gray_png(Gray(2, 2, b"\x00\x40\x80\xff"))) == (2, 2, 1, b"\x00\x40\x80\xff")
+    # a row with filter 1 (Sub) is not read
+    raw = b"\x00" + rows[0] + b"\x01" + rows[1]
+    sub = png[:33] + images._chunk(b"IDAT", zlib.compress(raw)) + images._chunk(b"IEND", b"")
+    assert images.png_pixels(sub) is None
+    assert images.png_pixels(png_with(png, interlace=1)) is None
+    assert images.png_pixels(png_with(png, depth=16)) is None
+    assert images.png_pixels(png_with(png, ctype=3)) is None
+    short = png[:33] + images._chunk(b"IDAT", zlib.compress(raw[:-1])) + images._chunk(b"IEND", b"")
+    assert images.png_pixels(short) is None
+    assert images.png_pixels(b"not a png") is None and images.png_pixels(png[:20]) is None
+    # IDAT that inflates past IMAGE_BYTES is cut, not inflated to the end
+    from reader import limits
+    big = images._png(1000, 1000, [bytes(3000)] * 1000, False)
+    old = limits.IMAGE_BYTES
+    limits.IMAGE_BYTES = 100_000
+    try:
+        assert images.png_pixels(big) is None
+    finally:
+        limits.IMAGE_BYTES = old
+    assert images.png_pixels(big)[:3] == (1000, 1000, 3)
+
+
+def test_png_crop_box():
+    rows = [bytes([1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]), bytes([5, 5, 5, 6, 6, 6, 7, 7, 7, 8, 8, 8])]
+    png = images._png(4, 2, rows, False)
+    right = images.png_crop(png, (0.5, 0.0, 1.0, 1.0))
+    assert images.png_pixels(right) == (2, 2, 3, bytes([3, 3, 3, 4, 4, 4, 7, 7, 7, 8, 8, 8]))
+    one = images.png_crop(png, (0.0, 0.5, 0.25, 1.0))
+    assert images.png_pixels(one) == (1, 1, 3, bytes([5, 5, 5]))
+    assert images.png_crop(b"not a png", (0, 0, 1, 1)) is None
+    assert images.png_crop(png, (0.9, 0.9, 0.9, 0.9)) is not None  # an empty box still keeps one pixel
+    assert images.png_crop(png, (float("nan"), 0, 1, 1)) is None
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

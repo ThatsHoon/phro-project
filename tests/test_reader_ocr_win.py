@@ -150,6 +150,91 @@ def test_recognizers_lists_ko():
     assert "ko-kr" in ocr_win.recognizers()
 
 
+@needs_ko
+def test_fit_averages_keeps_text():
+    """A page fitted to a quarter of its pixels by 2x2 averaging still reads: keeping every 2nd row and column instead
+    measured CER 0.235 on this page."""
+    from reader import ocr_pixels
+    g = load(KO)
+    small = ocr_pixels.fit(g, g.w * g.h // 4)
+    assert (small.w, small.h) == (g.w // 2, g.h // 2)
+    page = engine().recognize(small, monotonic() + 30)
+    got = cer(by_line(page), truth(KO))
+    assert got <= 0.12, got
+
+
+@needs_ko
+def test_start_fits_by_averaging():
+    """start() fits past MaxImageDimension with ocr_pixels.fit, not by dropping rows and columns."""
+    from reader import ocr_pixels
+    g = load(KO)
+    seen = []
+    real = ocr_pixels.fit
+
+    def spy(img, max_pixels, **kw):
+        out = real(img, max_pixels, **kw)
+        seen.append((img.w, img.h, max_pixels, kw.get("max_side"), out.w, out.h))
+        return out
+    eng = engine()
+    old = eng.max_dim
+    eng.max_dim = 1000
+    ocr_pixels.fit = spy
+    try:
+        eng.start(g).cancel()
+    finally:
+        ocr_pixels.fit = real
+        eng.max_dim = old
+    assert seen and seen[-1][3] == 1000 and seen[-1][4:] == (g.w // 2, g.h // 2), seen
+
+
+@needs_ko
+def test_result_before_done_cancels():
+    """result() on an operation still running cancels it before releasing it, so the recognition stops, and raises."""
+    g = load(KO)
+    calls = []
+    real = ocr_win._call
+
+    def spy(lib, obj, index, what, argtypes, *args):
+        calls.append(what)
+        return real(lib, obj, index, what, argtypes, *args)
+    op = engine().start(g)
+    ocr_win._call = spy
+    try:
+        op._status = lambda lib: ocr_win._STARTED  # as if read the instant after start
+        try:
+            op.result()
+        except OSError as e:
+            assert "not completed" in str(e), e
+        else:
+            raise AssertionError("result() of a running operation did not raise")
+    finally:
+        ocr_win._call = real
+    assert "IAsyncInfo.Cancel" in calls, calls
+    assert op.done() and engine().recognize(g, monotonic() + 30).words
+
+
+@needs_ko
+def test_version_without_orp():
+    """A recognizer folder with no .orp file (or no folder at all) leaves "0:0" for that part, not a failed engine."""
+    real = ocr_win._recognizer_folder
+    try:
+        ocr_win._recognizer_folder = lambda tag: Path(__file__).parent / "fixtures"
+        eng = ocr_win.WinOcr("ko")
+        try:
+            dll, orp = eng.version.split("/")
+            assert orp == "0:0" and dll != "0:0", eng.version
+        finally:
+            eng.close()
+        ocr_win._recognizer_folder = lambda tag: None
+        eng = ocr_win.WinOcr("ko")
+        eng.close()
+        assert eng.version.endswith("/0:0"), eng.version
+    finally:
+        ocr_win._recognizer_folder = real
+    folder = real("ko")
+    assert folder is not None and any(p.suffix.lower() == ".orp" for p in folder.iterdir())
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

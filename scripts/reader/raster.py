@@ -35,6 +35,11 @@ _PAGE_DIM = "{7462DC86-6180-4C7E-8E3F-EE7333A7A483}"  # FrameDimensionPage
 _PNG_CLSID = "{557CF406-1A04-11D3-9A73-0000F81EF32E}"  # the PNG encoder
 _PNG_SIG = b"\x89PNG\r\n\x1a\n"
 CHILD_CAP = 120.0      # seconds, the longest the image venv's child runs when no deadline bounds it
+GRAY_KINDS = frozenset({"png", "jpg", "gif", "bmp", "tiff", "webp"})  # pictures raster.gray decodes for OCR
+_GRAY_HEAD = b"GRAY"   # the image venv's answer to a gray job: this, then >IIf (w, h, dpi), then w*h Gray8 bytes
+_DPI_MIN, _DPI_MAX = 50.0, 2400.0  # a picture's own resolution is believed in this range; 96 is assumed outside it
+_PILLOW_GRAY_PIXELS = 8 * images._MAX_PIXELS  # Pillow warns past this and refuses past twice it, in the child
+_BAND_BYTES = 32 * 2**20  # 32-bit source pixels GDI+ draws at a time for raster.gray
 _CHILD_CODE = "import sys; sys.path.insert(0, sys.argv[1]); from reader import raster; raster.serve()"
 
 
@@ -204,6 +209,78 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
     return fig
 
 
+def gray(data: bytes, *, page: int = 0, max_pixels: int | None = None):
+    """(ocr_pixels.Gray, dpi) of a picture for OCR, or None when nothing decodes it. The pixels are the green channel
+    on white, already fitted within `max_pixels` (images._MAX_PIXELS when None) by ocr_pixels.reduction's powers of
+    two; dpi is the picture's own horizontal resolution when it gives one in 50-2400, else 96, divided by the same
+    factor. A TIFF reads page `page` (from 0); any other picture has only page 0.
+
+    The decoders, in order (decision 5): GDI+ on Windows; Pillow in the image venv (a gray job, in this process or
+    the venv's child); the reader's own PNG decoder (images.png_pixels; BMP through images.bmp_to_png first). Each
+    one that fails hands over to the next. When the image venv's child runs out of time (PHRO_READER_DEADLINE less
+    FIGURE_RESERVE), None. Never raises."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        return None
+    data = bytes(data)
+    cap = images._MAX_PIXELS if max_pixels is None else max_pixels
+    kind = images.sniff(data)
+    if (kind not in GRAY_KINDS or not isinstance(page, int) or not 0 <= page < limits.TIFF_PAGES
+            or (page and kind != "tiff") or not isinstance(cap, int) or cap < 1):
+        return None
+    got = None
+    try:
+        b = backend()
+        if b == "gdiplus":
+            got = _gray_gdiplus(data, kind, page, cap)
+        elif b != "none":
+            deadline = _env_deadline()
+            mono = None if deadline is None else time.monotonic() + (deadline - limits.FIGURE_RESERVE - time.time())
+            job = {"op": "gray", "data": base64.b64encode(data).decode("ascii"), "page": page, "max": cap}
+            got = _gray_frame(_run_jobs([job], mono)[0], cap)
+    except ReadError as e:
+        if e.detail == "figure time":
+            return None
+    except Exception:  # noqa: BLE001 - the next decoder tries
+        got = None
+    if got is not None:
+        return got
+    try:
+        return _gray_own(data, kind, page, cap)
+    except Exception:  # noqa: BLE001 - a picture never makes a document fail
+        return None
+
+
+def _gray_own(data: bytes, kind: str, page: int, cap: int):
+    """(Gray, dpi) from the reader's own decoder: a png_pixels-readable PNG, or a BMP through bmp_to_png; 96 dpi."""
+    from . import ocr_pixels
+    if page:
+        return None
+    if kind == "bmp":
+        data = images.bmp_to_png(data)
+        if data is None:
+            return None
+    elif kind != "png":
+        return None
+    got = images.png_pixels(data)
+    if got is None:
+        return None
+    w, h, ch, raw = got
+    kx, _ = ocr_pixels.reduction(w, h, cap)
+    return ocr_pixels.fit(ocr_pixels.from_pixels(w, h, raw, ch), cap), 96.0 / kx
+
+
+def _gray_frame(frame, cap: int):
+    """(Gray, dpi) of a GRAY frame the image venv answered, or None when it is not one: the head, w and h above 0
+    with w*h within `cap`, exactly w*h pixel bytes, and a dpi that is a finite number above 0."""
+    from . import ocr_pixels
+    if not isinstance(frame, (bytes, bytearray)) or len(frame) < 16 or bytes(frame[:4]) != _GRAY_HEAD:
+        return None
+    w, h, dpi = struct.unpack_from(">IIf", frame, 4)
+    if not (0 < w * h <= cap and len(frame) == 16 + w * h and math.isfinite(dpi) and dpi > 0):
+        return None
+    return ocr_pixels.Gray(w, h, bytes(frame[16:])), float(dpi)
+
+
 def _meta_kind(data: bytes) -> str | None:
     """"placeable", "wmf" (no placeable header) or "emf" by the header, else None."""
     from . import metafile
@@ -286,13 +363,66 @@ def _pillow_tiff(Image, data: bytes, page: int) -> bytes | None:
     return out.getvalue()
 
 
+def _pillow_gray(Image, data: bytes, page: int, cap: int) -> bytes | None:
+    """A GRAY frame of a picture for OCR: the green channel on white, reduced by Image.reduce(2) (a 2x2 box) as many
+    times as ocr_pixels.reduction says, so its size is what GDI+ and the reader's own decoder give."""
+    import io
+    from . import ocr_pixels
+    kind = images.sniff(data)
+    if kind not in GRAY_KINDS or not 0 <= page < limits.TIFF_PAGES or (page and kind != "tiff") or cap < 1:
+        return None
+    Image.MAX_IMAGE_PIXELS = _PILLOW_GRAY_PIXELS
+    with Image.open(io.BytesIO(data)) as im:
+        if page:
+            try:
+                im.seek(page)
+            except EOFError:
+                return None
+        w, h = im.size
+        if w <= 0 or h <= 0:
+            return None
+        try:
+            dpi = float(im.info.get("dpi", (96.0,))[0])
+        except (TypeError, ValueError, IndexError):
+            dpi = 96.0
+        if not (math.isfinite(dpi) and _DPI_MIN <= dpi <= _DPI_MAX):
+            dpi = 96.0
+        if im.mode == "L" and "transparency" not in im.info:
+            pix = im.copy()
+        elif im.mode == "1":
+            pix = im.convert("L")
+        elif "A" in im.getbands() or "transparency" in im.info:
+            rgba = im.convert("RGBA")
+            flat = Image.new("RGB", rgba.size, (255, 255, 255))
+            flat.paste(rgba, mask=rgba.getchannel("A"))
+            pix = flat.getchannel("G")
+        else:
+            pix = im.convert("RGB").getchannel("G")
+    kx, ky = ocr_pixels.reduction(w, h, cap)
+    fx, fy = kx, ky
+    while fx > 1 or fy > 1:
+        pix = pix.reduce((2 if fx > 1 else 1, 2 if fy > 1 else 1))
+        fx, fy = max(1, fx // 2), max(1, fy // 2)
+    tw, th = w // kx, h // ky
+    if pix.size != (tw, th):  # reduce keeps a partial last box; the reader drops it
+        pix = pix.crop((0, 0, tw, th))
+    return _GRAY_HEAD + struct.pack(">IIf", tw, th, dpi / kx) + pix.tobytes()
+
+
 def _render_local(job: dict) -> bytes | None:
-    """One job drawn in this process: {"svg", "w", "h"} through resvg_py, or {"tiff" (base64), "page"} through
-    Pillow. Raises when the libraries are not here."""
+    """One job done in this process: {"svg", "w", "h"} through resvg_py, or {"tiff" (base64), "page"} through
+    Pillow, each answering a PNG; or {"op": "gray", "data" (base64), "page", "max"} through Pillow, answering a GRAY
+    frame (_pillow_gray). Raises when the libraries are not here."""
     lib = _load_local()
     if lib is None:
         raise _Fail("no resvg_py or Pillow")
     resvg_py, Image = lib
+    if job.get("op") == "gray":
+        cap = job.get("max", images._MAX_PIXELS)
+        if not isinstance(job.get("data"), str) or not isinstance(cap, int):
+            return None
+        frame = _pillow_gray(Image, base64.b64decode(job["data"]), int(job.get("page", 0)), cap)
+        return frame if _gray_frame(frame, cap) is not None else None
     if isinstance(job.get("svg"), str):
         png = bytes(resvg_py.svg_to_bytes(svg_string=job["svg"]))
     elif isinstance(job.get("tiff"), str):
@@ -303,7 +433,8 @@ def _render_local(job: dict) -> bytes | None:
 
 
 def serve() -> None:
-    """The child's entry: a JSON {"jobs": [...]} on stdin, a JSON {"results": [base64 PNG or null, ...]} on stdout."""
+    """The child's entry: a JSON {"jobs": [...]} on stdin, a JSON {"results": [base64 PNG, base64 GRAY frame for a
+    gray job, or null, ...]} on stdout."""
     req = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     jobs = req.get("jobs") if isinstance(req, dict) else None
     out = []
@@ -326,8 +457,9 @@ def _child_cmd(python=None) -> list:
 
 
 def _run_child(cmd: list, jobs: list, timeout: float) -> list:
-    """The PNG bytes (or None) of each job, from one child run bounded by `timeout` seconds. A timeout raises
-    ReadError("too_large", "figure time"); any other trouble gives None for every job."""
+    """The answer bytes (or None) of each job, from one child run bounded by `timeout` seconds: a PNG, or a GRAY
+    frame for a gray job; the caller checks which (_render_resvg, _gray_frame). Each is at most IMAGE_BYTES. A
+    timeout raises ReadError("too_large", "figure time"); any other trouble gives None for every job."""
     import subprocess
     none = [None] * len(jobs)
     payload = json.dumps({"jobs": jobs}).encode("utf-8")
@@ -355,8 +487,9 @@ def _run_child(cmd: list, jobs: list, timeout: float) -> list:
 
 
 def _run_jobs(jobs: list, mono: float | None) -> list:
-    """The PNG (or None) of each job: in this process inside the image venv, else in a child of its interpreter,
-    given the time left before `mono` (a time.monotonic() value). Raises ReadError("too_large", "figure time")."""
+    """The answer (a PNG, a GRAY frame, or None) of each job: in this process inside the image venv, else in a child
+    of its interpreter, given the time left before `mono` (a time.monotonic() value). Raises ReadError("too_large",
+    "figure time")."""
     late = ReadError("too_large", "figure time")
     if _load_local() is not None:
         out = []
@@ -498,6 +631,8 @@ def _load():
         "GdipSetTextRenderingHint": (I, [P, I]),
         "GdipSetInterpolationMode": (I, [P, I]),
         "GdipDrawImageRectI": (I, [P, P, I, I, I, I]),
+        "GdipDrawImageRectRectI": (I, [P, P, I, I, I, I, I, I, I, I, I, P, P, P]),
+        "GdipSetPixelOffsetMode": (I, [P, I]),
         "GdipSaveImageToStream": (I, [P, P, PG, P]),
         "GdipBitmapLockBits": (I, [P, POINTER(Rect), U, I, POINTER(BitmapData)]),
         "GdipBitmapUnlockBits": (I, [P, POINTER(BitmapData)]),
@@ -597,8 +732,9 @@ def _metafile_size(g, img) -> tuple[int, int]:
     return max(1, round(w * 96.0 / rx.value)), max(1, round(h * 96.0 / ry.value))
 
 
-def _draw(g, img, tw: int, th: int, argb_out: bool = False):
-    """img drawn into a white tw x th 32-bit ARGB bitmap: the PNG bytes, or with argb_out the BGRA rows top-down."""
+def _draw(g, img, tw: int, th: int, read=None):
+    """img drawn into a white tw x th 32-bit ARGB bitmap: the PNG bytes, or what `read(g, bmp, tw, th)` takes from
+    the bitmap (_bits: the BGRA rows top-down; _green: the G byte of each pixel)."""
     ct = g.ct
     bmp = ct.c_void_p()
     _ok(g.GdipCreateBitmapFromScan0(tw, th, 0, _ARGB32, None, ct.byref(bmp)))
@@ -613,8 +749,8 @@ def _draw(g, img, tw: int, th: int, argb_out: bool = False):
             _ok(g.GdipDrawImageRectI(gr, img, 0, 0, tw, th))
         finally:
             g.GdipDeleteGraphics(gr)
-        if argb_out:
-            return _bits(g, bmp, tw, th)
+        if read is not None:
+            return read(g, bmp, tw, th)
         out = _stream(g, b"")
         try:
             _ok(g.GdipSaveImageToStream(bmp, out, ct.byref(g.png_clsid), None))
@@ -642,6 +778,85 @@ def _bits(g, bmp, w: int, h: int) -> bytes:
         return b"".join(ct.string_at(bd.Scan0 + y * bd.Stride, 4 * w) for y in range(h))
     finally:
         g.GdipBitmapUnlockBits(bmp, ct.byref(bd))
+
+
+def _green(g, bmp, w: int, h: int) -> bytes:
+    """The G byte of each pixel of a 32-bit ARGB bitmap, rows top-down, sliced straight from the locked bits: the
+    BGRA rows are never copied into Python."""
+    ct = g.ct
+    rect = g.Rect(0, 0, w, h)
+    bd = g.BitmapData()
+    _ok(g.GdipBitmapLockBits(bmp, ct.byref(rect), 1, _ARGB32, ct.byref(bd)))  # ImageLockModeRead
+    try:
+        if not bd.Scan0:
+            raise _Fail("Scan0")
+
+        def view(addr, n):
+            return memoryview((ct.c_ubyte * n).from_address(addr)).cast("B")
+        if bd.Stride == 4 * w:
+            return view(bd.Scan0, 4 * w * h)[1::4].tobytes()
+        return b"".join(view(bd.Scan0 + y * bd.Stride, 4 * w)[1::4].tobytes() for y in range(h))
+    finally:
+        g.GdipBitmapUnlockBits(bmp, ct.byref(bd))
+
+
+def _gray_gdiplus(data: bytes, kind: str, page: int, cap: int):
+    """(Gray, dpi) of a picture GDI+ decodes, drawn with high-quality bicubic straight into a bitmap of the size
+    ocr_pixels.reduction gives; None when GDI+ is absent or the TIFF has no such page. Raises when GDI+ refuses."""
+    from . import ocr_pixels
+    g = _gdip()
+    if g is None:
+        return None
+    ct = g.ct
+
+    def use(img):
+        if kind == "tiff":
+            n = ct.c_uint(0)
+            _ok(g.GdipImageGetFrameCount(img, ct.byref(g.page_dim), ct.byref(n)))
+            if page >= n.value:
+                return None
+            _ok(g.GdipImageSelectActiveFrame(img, ct.byref(g.page_dim), page))
+        w, h = _image_size(g, img)
+        if w <= 0 or h <= 0:
+            return None
+        kx, ky = ocr_pixels.reduction(w, h, cap)
+        rx = ct.c_float(0)
+        dpi = 96.0
+        if g.GdipGetImageHorizontalResolution(img, ct.byref(rx)) == 0 and math.isfinite(rx.value) \
+                and _DPI_MIN <= rx.value <= _DPI_MAX:
+            dpi = float(rx.value)
+        return ocr_pixels.Gray(w // kx, h // ky, _draw_gray(g, img, w, h, kx, ky)), dpi / kx
+    return _with_image(g, data, g.GdipCreateBitmapFromStream, use)
+
+
+def _draw_gray(g, img, w: int, h: int, kx: int, ky: int) -> bytes:
+    """The G bytes of img (w x h) drawn on white into a (w // kx) x (h // ky) 32-bit ARGB bitmap, kx x ky source
+    pixels to one, with high-quality bicubic and pixel centres aligned (PixelOffsetModeHalf). The source goes in bands
+    of rows (a multiple of ky, about _BAND_BYTES of 32-bit pixels): drawn whole, GDI+ makes a 32-bit copy of the full
+    source (1.2 GB more working set for a 20000 x 15000 bilevel scan; 64 MB in bands, which match the whole draw
+    within 2 levels). The rows and columns past the last whole kx x ky block are left out, as ocr_pixels.fit drops
+    them."""
+    ct = g.ct
+    tw, th = w // kx, h // ky
+    band = max(ky, _BAND_BYTES // (4 * w) // ky * ky)
+    bmp = ct.c_void_p()
+    _ok(g.GdipCreateBitmapFromScan0(tw, th, 0, _ARGB32, None, ct.byref(bmp)))
+    try:
+        gr = ct.c_void_p()
+        _ok(g.GdipGetImageGraphicsContext(bmp, ct.byref(gr)))
+        try:
+            _ok(g.GdipGraphicsClear(gr, 0xFFFFFFFF))
+            _ok(g.GdipSetInterpolationMode(gr, 7))   # InterpolationModeHighQualityBicubic
+            _ok(g.GdipSetPixelOffsetMode(gr, 4))     # PixelOffsetModeHalf
+            for y in range(0, th * ky, band):
+                n = min(band, th * ky - y)
+                _ok(g.GdipDrawImageRectRectI(gr, img, 0, y // ky, tw, n // ky, 0, y, tw * kx, n, 2,  # UnitPixel
+                                             None, None, None))
+        finally:
+            g.GdipDeleteGraphics(gr)
+        return _green(g, bmp, tw, th)
+    finally:
+        g.GdipDisposeImage(bmp)
 
 
 def _with_image(g, data: bytes, create, use):
@@ -677,7 +892,7 @@ def _decoder(g):
             w, h = _image_size(g, img)
             if not 0 < w * h <= images._MAX_PIXELS:
                 return None
-            return w, h, _draw(g, img, w, h, argb_out=True)
+            return w, h, _draw(g, img, w, h, read=_bits)
         try:
             return _with_image(g, bytes(data), g.GdipCreateBitmapFromStream, use)
         except Exception:  # noqa: BLE001

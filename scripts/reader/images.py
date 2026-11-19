@@ -53,19 +53,78 @@ def _chunk(tag: bytes, body: bytes) -> bytes:
     return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
 
 
-def _png(width: int, height: int, rows: list, alpha: bool, level: int = -1) -> bytes:
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6 if alpha else 2, 0, 0, 0)
+def _png_rows(width: int, height: int, ctype: int, rows, level: int) -> bytes:
+    """An 8-bit PNG of colour type `ctype` whose rows all use filter 0."""
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, ctype, 0, 0, 0)
     raw = b"".join(b"\x00" + r for r in rows)
     return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
             + _chunk(b"IDAT", zlib.compress(raw, level)) + _chunk(b"IEND", b""))
 
 
+def _png(width: int, height: int, rows: list, alpha: bool, level: int = -1) -> bytes:
+    return _png_rows(width, height, 6 if alpha else 2, rows, level)
+
+
 def gray_png(g, level: int = 1) -> bytes:
     """An 8-bit grayscale PNG (colour type 0, filter 0 on every row) of an `ocr_pixels.Gray`."""
-    ihdr = struct.pack(">IIBBBBB", g.w, g.h, 8, 0, 0, 0, 0)
-    raw = b"".join(b"\x00" + g.data[y * g.w:(y + 1) * g.w] for y in range(g.h))
-    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
-            + _chunk(b"IDAT", zlib.compress(raw, level)) + _chunk(b"IEND", b""))
+    mv = memoryview(g.data)
+    return _png_rows(g.w, g.h, 0, (mv[y * g.w:(y + 1) * g.w] for y in range(g.h)), level)
+
+
+_CHANNELS = {0: 1, 2: 3, 6: 4}  # PNG colour type: bytes a pixel at depth 8
+
+
+def png_pixels(data: bytes) -> tuple[int, int, int, bytes] | None:
+    """(w, h, channels, raw rows packed) of a non-interlaced 8-bit PNG of colour type 0 (gray), 2 (RGB) or 6 (RGBA)
+    whose rows all use filter 0, as images._png, gray_png and pdfium's render write; None for anything else. IDAT is
+    inflated no further than the rows need, and never past limits.IMAGE_BYTES."""
+    from . import limits
+    try:
+        data = bytes(data)
+        if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+            return None
+        w, h, depth, ctype, comp, filt, lace = struct.unpack(">IIBBBBB", data[16:29])
+        ch = _CHANNELS.get(ctype)
+        if ch is None or depth != 8 or comp or filt or lace or not 0 < w * h <= _MAX_PIXELS:
+            return None
+        stride = w * ch + 1
+        need = stride * h
+        if need > limits.IMAGE_BYTES:
+            return None
+        idat, pos = [], 8
+        while pos + 8 <= len(data):
+            n, tag = struct.unpack_from(">I4s", data, pos)
+            if pos + 12 + n > len(data):
+                return None
+            if tag == b"IDAT":
+                idat.append(data[pos + 8:pos + 8 + n])
+            elif tag == b"IEND":
+                break
+            pos += 12 + n
+        raw = zlib.decompressobj().decompress(b"".join(idat), need + 1)
+    except (struct.error, zlib.error, ValueError):
+        return None
+    if len(raw) != need or raw[0::stride].count(0) != h:
+        return None
+    mv = memoryview(raw)
+    return w, h, ch, b"".join(mv[y * stride + 1:(y + 1) * stride] for y in range(h))
+
+
+def png_crop(data: bytes, box) -> bytes | None:
+    """A PNG of the fractional box (x0, y0, x1, y1), y down, of a png_pixels-readable PNG; None when it is not one or
+    the box is not numbers. The crop keeps at least one pixel."""
+    from .ocr_pixels import box_pixels
+    got = png_pixels(data)
+    if got is None:
+        return None
+    w, h, ch, raw = got
+    px = box_pixels(w, h, box)
+    if px is None:
+        return None
+    x0, y0, x1, y1 = px
+    mv, row = memoryview(raw), w * ch
+    ctype = {1: 0, 3: 2, 4: 6}[ch]
+    return _png_rows(x1 - x0, y1 - y0, ctype, (mv[y * row + x0 * ch:y * row + x1 * ch] for y in range(y0, y1)), -1)
 
 
 def _shift(mask: int):

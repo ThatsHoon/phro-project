@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import ocr_pixels
 from .ocr import OcrPage, Word
 from .ocr_pixels import Gray
 
@@ -133,12 +134,13 @@ class WinOcr:
         _release(self._lib, engine)
 
     def start(self, g: Gray) -> "WinOp":
-        """Starts RecognizeAsync on `g`, fitted to max_dim on its long side by keeping every step-th row and column."""
+        """Starts RecognizeAsync on `g`, fitted to max_dim on its long side by ocr_pixels.fit (2x2 averaging, so each
+        side is divided by a power of two; the boxes are scaled back by the same factors)."""
         lib = _rt()
         ct = lib.ct
-        long = max(g.w, g.h)
-        step = -(-long // self.max_dim) if long > self.max_dim else 1
-        fw, fh, data = _fit(g, step)
+        kx, ky = ocr_pixels.reduction(g.w, g.h, None, self.max_dim)
+        fitted = ocr_pixels.fit(g, None, max_side=self.max_dim)
+        fw, fh, data = fitted.w, fitted.h, fitted.data
         engine = self._take()
         buf = bitmap = op = None
         try:
@@ -151,7 +153,7 @@ class WinOcr:
             if not op:
                 raise OSError("RecognizeAsync gave no operation")
             info = _qi(lib, op, _IID_ASYNC_INFO, "IAsyncInfo")
-            started = WinOp(self, engine, op, info, g.w, g.h, step)
+            started = WinOp(self, engine, op, info, g.w, g.h, kx, ky)
             engine = op = None  # owned by `started` now
             return started
         finally:
@@ -206,9 +208,9 @@ class WinOcr:
 class WinOp:
     """One RecognizeAsync in flight on its own engine. done() polls it; result() or cancel() ends it and releases it."""
 
-    def __init__(self, owner: WinOcr, engine: int, op: int, info: int, w: int, h: int, step: int):
+    def __init__(self, owner: WinOcr, engine: int, op: int, info: int, w: int, h: int, kx: int = 1, ky: int = 1):
         self._owner, self._engine, self._op, self._info = owner, engine, op, info
-        self._w, self._h, self._step = w, h, step
+        self._w, self._h, self._kx, self._ky = w, h, kx, ky
 
     def done(self) -> bool:
         if not self._op:
@@ -219,7 +221,8 @@ class WinOp:
         return _get(lib, self._info, 7, "IAsyncInfo.Status", lib.ct.c_int32)
 
     def result(self) -> OcrPage:
-        """The words in engine order, boxes in the frame of the bitmap given to start(). Ends the operation."""
+        """The words in engine order, boxes in the frame of the bitmap given to start(). Ends the operation; one still
+        running is cancelled first (else the engine reads the page to its end for nothing) and raises OSError."""
         if not self._op:
             raise OSError("the OCR operation has already ended")
         lib = _rt()
@@ -229,6 +232,12 @@ class WinOp:
             if status == _ERROR:
                 code = _get(lib, self._info, 8, "IAsyncInfo.ErrorCode", lib.ct.c_int32)
                 raise OSError(f"RecognizeAsync failed: HRESULT 0x{code & 0xFFFFFFFF:08X}")
+            if status == _STARTED:
+                try:
+                    _call(lib, self._info, 9, "IAsyncInfo.Cancel", ())
+                except OSError:
+                    pass
+                raise OSError("RecognizeAsync not completed (still running; cancelled)")
             if status != _COMPLETED:
                 raise OSError(f"RecognizeAsync not completed (status {status})")
             res = _out_ptr(lib, self._op, 8, "IAsyncOperation<OcrResult>.GetResults", ())
@@ -277,14 +286,14 @@ class WinOp:
         return OcrPage(self._w, self._h, words, angle, 0, owner.engine, owner.version)
 
     def _box(self, r) -> tuple[int, int, int, int] | None:
-        """The engine's float rect scaled back by the fit step, as a pixel box of at least 1x1 inside the frame."""
+        """The engine's float rect scaled back by the fit factors, as a pixel box of at least 1x1 inside the frame."""
         if not all(math.isfinite(v) for v in (r.X, r.Y, r.Width, r.Height)):
             return None
-        s, w, h = self._step, self._w, self._h
-        x0 = min(max(math.floor(r.X * s), 0), w - 1)
-        y0 = min(max(math.floor(r.Y * s), 0), h - 1)
-        x1 = min(max(math.ceil((r.X + r.Width) * s), x0 + 1), w)
-        y1 = min(max(math.ceil((r.Y + r.Height) * s), y0 + 1), h)
+        sx, sy, w, h = self._kx, self._ky, self._w, self._h
+        x0 = min(max(math.floor(r.X * sx), 0), w - 1)
+        y0 = min(max(math.floor(r.Y * sy), 0), h - 1)
+        x1 = min(max(math.ceil((r.X + r.Width) * sx), x0 + 1), w)
+        y1 = min(max(math.ceil((r.Y + r.Height) * sy), y0 + 1), h)
         return x0, y0, x1 - x0, y1 - y0
 
     def cancel(self):
@@ -501,33 +510,52 @@ def _tag(lib, engine: int) -> str:
         _release(lib, language)
 
 
-# ---- pixels and files ------------------------------------------------------------------------------------------------
-
-def _fit(g: Gray, step: int) -> tuple[int, int, bytes]:
-    """(w, h, data) of `g` keeping every step-th row and column."""
-    if step <= 1:
-        return g.w, g.h, g.data
-    rows = range(0, g.h, step)
-    data = b"".join(g.data[r * g.w:(r + 1) * g.w:step] for r in rows)
-    return len(range(0, g.w, step)), len(rows), data
-
+# ---- files -----------------------------------------------------------------------------------------------------------
 
 def _ocr_root() -> Path:
     return Path(os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows") / "OCR"
 
 
-def _version(tag: str) -> str:
-    """'<size>:<mtime_ns>/<size>:<mtime_ns>' of Windows.Media.Ocr.dll and of the recognizer's MsOcrRes.orp."""
-    system = Path(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows") / "System32"
+def _recognizer_folder(tag: str) -> Path | None:
+    """The recognizer folder for a BCP-47 tag: the same name, else one for a region of it, else one of the same
+    language; None when there is none."""
     tag = tag.lower()
     folders = recognizers()
     folder = next((f for f in folders if f == tag), None) \
         or next((f for f in folders if f.startswith(tag + "-")), None) \
         or next((f for f in folders if f.split("-")[0] == tag.split("-")[0]), None)
+    return None if folder is None else _ocr_root() / folder
+
+
+def _orp(folder: Path | None) -> Path | None:
+    """The folder's first .orp file in sorted order, whatever its name; None when it has none."""
     if folder is None:
-        raise OSError(f"no recognizer folder for {tag!r} under {_ocr_root()}")
-    parts = []
-    for p in (system / "Windows.Media.Ocr.dll", _ocr_root() / folder / "MsOcrRes.orp"):
+        return None
+    try:
+        with os.scandir(folder) as it:
+            names = sorted(e.name for e in it if e.name.lower().endswith(".orp") and e.is_file())
+    except OSError:
+        return None
+    return folder / names[0] if names else None
+
+
+def _stamp(p: Path | None) -> str:
+    """'<size>:<mtime_ns>' of a file, or '0:0' when there is none or it cannot be read."""
+    if p is None:
+        return "0:0"
+    try:
         st = p.stat()
-        parts.append(f"{st.st_size}:{st.st_mtime_ns}")
-    return "/".join(parts)
+    except OSError:
+        return "0:0"
+    return f"{st.st_size}:{st.st_mtime_ns}"
+
+
+def _version(tag: str) -> str:
+    """'<size>:<mtime_ns>/<size>:<mtime_ns>' of Windows.Media.Ocr.dll and of the recognizer's .orp file, a part
+    '0:0' when its file is missing or cannot be read. Never raises: the version only keys caches."""
+    system = Path(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows") / "System32"
+    try:
+        orp = _orp(_recognizer_folder(tag))
+    except Exception:  # noqa: BLE001 - a version is never a reason for no engine
+        orp = None
+    return f"{_stamp(system / 'Windows.Media.Ocr.dll')}/{_stamp(orp)}"

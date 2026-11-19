@@ -1117,6 +1117,276 @@ def test_image_page_reaches_assets():
         raster.convert = real
 
 
+# ---- gray pixels for OCR (ocr_pixels and raster.gray) ----------------------------------------------------------------
+
+def test_from_pixels_takes_green():
+    from reader import ocr_pixels
+    bgra = bytes([10, 20, 30, 255, 11, 21, 31, 255, 12, 22, 32, 0, 13, 23, 33, 7])  # 2x2, B G R A
+    g = ocr_pixels.from_pixels(2, 2, bgra, 4)
+    assert (g.w, g.h, g.data) == (2, 2, bytes([20, 21, 22, 23]))
+    bgr = bytes([1, 2, 3, 4, 5, 6, 99, 99]) + bytes([7, 8, 9, 10, 11, 12, 99, 99])  # 2x2 BGR, rows padded to 8
+    assert ocr_pixels.from_pixels(2, 2, bgr, 3, stride=8).data == bytes([2, 5, 8, 11])
+    assert ocr_pixels.from_pixels(3, 1, b"\x01\x02\x03", 1).data == b"\x01\x02\x03"
+    for bad in ((2, 2, bgra[:-1], 4), (2, 2, bgra, 2), (2, 2, bgr, 3, 5)):
+        try:
+            ocr_pixels.from_pixels(*bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"from_pixels{bad[:2]} accepted a short or odd buffer")
+
+
+def test_fit_within_cap():
+    """Each reduction averages 2x2 blocks (a power of two), never keeps every n-th pixel."""
+    from reader import ocr_pixels
+    rnd = random.Random(3)
+    src = ocr_pixels.Gray(1000, 1000, rnd.randbytes(1000 * 1000))
+    assert ocr_pixels.fit(src, 1_000_000) is src
+    g = ocr_pixels.fit(src, 250_000)
+    assert (g.w, g.h) == (500, 500)
+    d, w = src.data, src.w
+    for r, c in [(0, 0), (499, 499), (123, 456)] + [(rnd.randrange(500), rnd.randrange(500)) for _ in range(500)]:
+        block = d[2 * r * w + 2 * c] + d[2 * r * w + 2 * c + 1] + d[(2 * r + 1) * w + 2 * c] + d[(2 * r + 1) * w + 2 * c + 1]
+        assert abs(g.data[r * g.w + c] - block // 4) <= 1, (r, c, g.data[r * g.w + c], block / 4)
+    assert ocr_pixels.reduction(1000, 1000, 250_000) == (2, 2)
+    assert ocr_pixels.reduction(1000, 1000, 249_999) == (4, 4)
+    q = ocr_pixels.fit(src, 249_999)
+    assert (q.w, q.h) == (250, 250)
+
+
+def test_fit_odd_sides_and_long_side():
+    from reader import ocr_pixels
+    src = ocr_pixels.Gray(5, 3, bytes([0, 0, 200, 200, 9,
+                                       0, 0, 200, 200, 9,
+                                       77, 77, 77, 77, 77]))
+    g = ocr_pixels.fit(src, 4)  # the odd last row and column are dropped
+    assert (g.w, g.h, g.data) == (2, 1, bytes([0, 200]))
+    assert ocr_pixels.fit(src, None, max_side=5) is src
+    assert ocr_pixels.reduction(1754, 1240, None, max_side=1000) == (2, 2)
+    assert ocr_pixels.reduction(1754, 1240, None, max_side=438) == (4, 4)
+    thin = ocr_pixels.Gray(1, 64, bytes(range(64)))  # a side of 1 is not halved further
+    t = ocr_pixels.fit(thin, 16)
+    assert (t.w, t.h) == (1, 16) and ocr_pixels.reduction(1, 64, 16) == (1, 4)
+    assert abs(t.data[0] - 1) <= 1 and abs(t.data[15] - 61) <= 1
+
+
+def test_rotate_quarter_turns():
+    from reader import ocr_pixels
+    g = ocr_pixels.Gray(3, 2, b"abcdef")  # rows "abc", "def"
+    r90 = ocr_pixels.rotate(g, 90)
+    assert (r90.w, r90.h, r90.data) == (2, 3, b"daebfc")
+    r270 = ocr_pixels.rotate(g, 270)
+    assert (r270.w, r270.h, r270.data) == (2, 3, b"cfbead")
+    assert ocr_pixels.rotate(g, 180).data == b"fedcba" and ocr_pixels.rotate(g, 0) == g
+    x = g
+    for _ in range(4):
+        x = ocr_pixels.rotate(x, 90)
+    assert x == g
+
+
+def test_crop_png_box():
+    from reader import ocr_pixels
+    g = ocr_pixels.Gray(4, 2, bytes([1, 2, 3, 4, 5, 6, 7, 8]))
+    png = ocr_pixels.crop_png(g, (0.5, 0.0, 1.0, 1.0), 1024)
+    assert images.png_pixels(png) == (2, 2, 1, bytes([3, 4, 7, 8]))
+    big = ocr_pixels.Gray(100, 40, bytes(range(100)) * 40)
+    w, h, ch, raw = images.png_pixels(ocr_pixels.crop_png(big, (0.0, 0.0, 1.0, 1.0), 25))
+    assert (w, h, ch) == (25, 10, 1) and raw[:3] == bytes([0, 4, 8])  # every 4th row and column
+
+
+def gdip_bitmap_bytes(w, h, bgra: bytes, clsid: str) -> bytes:
+    """A w x h BGRA buffer encoded in memory by GDI+ with the encoder `clsid`."""
+    import uuid
+    g = raster._gdip()
+    ct = g.ct
+    buf = ct.create_string_buffer(bgra, len(bgra))
+    bmp = ct.c_void_p()
+    raster._ok(g.GdipCreateBitmapFromScan0(w, h, 4 * w, raster._ARGB32, buf, ct.byref(bmp)))
+    try:
+        out = raster._stream(g, b"")
+        try:
+            enc = g.GUID.from_buffer_copy(uuid.UUID(clsid).bytes_le)
+            raster._ok(g.GdipSaveImageToStream(bmp, out, ct.byref(enc), None))
+            return raster._stream_bytes(g, out)
+        finally:
+            raster._release(g, out)
+    finally:
+        g.GdipDisposeImage(bmp)
+
+
+JPEG_CLSID = "{557CF401-1A04-11D3-9A73-0000F81EF32E}"
+
+
+@needs_gdiplus
+def test_gray_jpeg_via_gdiplus():
+    w, h = 256, 32
+    ramp = bytes(x for _ in range(h) for x in range(w))
+    jpg = gdip_bitmap_bytes(w, h, b"".join(bytes([v, v, v, 255]) for v in ramp), JPEG_CLSID)
+    assert images.sniff(jpg) == "jpg"
+    g, dpi = raster.gray(jpg)
+    assert (g.w, g.h) == (w, h) and dpi == 96.0, (g.w, g.h, dpi)
+    worst = max(abs(a - b) for a, b in zip(g.data, ramp))
+    assert worst <= 8, worst
+    small, dpi2 = raster.gray(jpg, max_pixels=w * h // 4)
+    assert (small.w, small.h) == (w // 2, h // 2) and dpi2 == 48.0
+    assert abs(small.data[5 * small.w + 64] - 129) <= 8  # columns 128 and 129 of the ramp
+    assert raster.gray(jpg, page=1) is None  # only a TIFF has pages
+
+
+@needs_gdiplus
+def test_gray_tiff_page():
+    data = tiff([(4, 3, 0), (10, 5, 255)])
+    g, dpi = raster.gray(data, page=1)
+    assert (g.w, g.h) == (10, 5) and set(g.data) == {255} and dpi == 96.0
+    g, _ = raster.gray(data)
+    assert (g.w, g.h) == (4, 3) and max(g.data) < 30
+    assert raster.gray(data, page=2) is None
+
+
+def peak_working_set() -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                                           "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                                           "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+    k32 = ctypes.WinDLL("kernel32")
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    k32.K32GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(Counters), wintypes.DWORD]
+    c = Counters()
+    c.cb = ctypes.sizeof(Counters)
+    assert k32.K32GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb)
+    return c.PeakWorkingSetSize
+
+
+def bilevel_tiff(w, h, rows: bytes, strip_rows: int, dpi: int | None = None) -> bytes:
+    """A little-endian uncompressed 1-bit TIFF (WhiteIsZero: a set bit is black) of packed `rows`; with `dpi`, its
+    X and Y resolution in pixels per inch, else none at all."""
+    line = (w + 7) // 8
+    strips = [(y, min(strip_rows, h - y)) for y in range(0, h, strip_rows)]
+    n = 9 if dpi is None else 12
+    head = 8
+    ifd_size = 2 + 12 * n + 4
+    offs_at = head + ifd_size
+    counts_at = offs_at + 4 * len(strips)
+    res_at = counts_at + 4 * len(strips)
+    pix = res_at + (0 if dpi is None else 8)
+    offsets = [pix + y * line for y, _ in strips]
+    counts = [k * line for _, k in strips]
+    one = len(strips) == 1
+    tags = [(256, 4, 1, w), (257, 4, 1, h), (258, 3, 1, 1), (259, 3, 1, 1), (262, 3, 1, 0),
+            (273, 4, len(strips), offsets[0] if one else offs_at), (277, 3, 1, 1), (278, 4, 1, strip_rows),
+            (279, 4, len(strips), counts[0] if one else counts_at)]
+    if dpi is not None:  # XResolution and YResolution share one RATIONAL dpi/1; ResolutionUnit inch
+        tags += [(282, 5, 1, res_at), (283, 5, 1, res_at), (296, 3, 1, 2)]
+    out = bytearray(b"II*\x00" + struct.pack("<I", head) + struct.pack("<H", n))
+    for tag, typ, cnt, val in tags:
+        out += struct.pack("<HHI", tag, typ, cnt) + (struct.pack("<HH", val, 0) if typ == 3 else struct.pack("<I", val))
+    out += b"\0\0\0\0"
+    out += struct.pack(f"<{len(strips)}I", *offsets) + struct.pack(f"<{len(strips)}I", *counts)
+    if dpi is not None:
+        out += struct.pack("<II", dpi, 1)
+    assert len(out) == pix
+    return bytes(out) + rows
+
+
+@needs_gdiplus
+def test_gray_dpi_from_the_picture():
+    """The picture's own resolution when it is 50-2400 dpi, else 96; a fitted picture's dpi is divided by the
+    factor."""
+    w, h = 64, 32
+    rows = (b"\0" * 8) * h
+    for dpi, want in ((300, 300.0), (2400, 2400.0), (49, 96.0), (5000, 96.0), (None, 96.0)):
+        g, got = raster.gray(bilevel_tiff(w, h, rows, h, dpi))
+        assert (g.w, g.h) == (w, h) and got == want, (dpi, got)
+    g, got = raster.gray(bilevel_tiff(w, h, rows, h, 300), max_pixels=w * h // 16)
+    assert (g.w, g.h, got) == (16, 8, 75.0), (g.w, g.h, got)
+
+
+@needs_gdiplus
+def test_huge_tiff_gray_within_cap():
+    """A 20000 x 15000 scan (37.5 MB packed, in memory only) comes back within the pixel cap, its marks in place, and
+    the process's peak working set rises by less than 400 MB."""
+    w, h = 20000, 15000
+    line = w // 8
+    white = b"\0" * line
+    bar = b"\0" * 500 + b"\xff" * 1500 + b"\0" * 500  # columns 4000-15999 black
+    rows = white * 7000 + bar * 1000 + white * 7000
+    for strip_rows in (h, 512):  # one 37.5 MB strip, or 512-row strips if GDI+ refuses that
+        data = bilevel_tiff(w, h, rows, strip_rows)
+        before = peak_working_set()
+        t0 = time.monotonic()
+        res = raster.gray(data)
+        spent = time.monotonic() - t0
+        rise = peak_working_set() - before
+        del data
+        if res is not None:
+            break
+        print(f"note: GDI+ refused {strip_rows}-row strips")
+    assert res is not None
+    g, dpi = res
+    assert g.w * g.h <= images._MAX_PIXELS and (g.w, g.h) == (w // 8, h // 8), (g.w, g.h)
+    assert dpi == 96.0 / 8, dpi  # the file gives no resolution: 96, at 1/8
+    k = 8
+    assert g.data[(7500 // k) * g.w + 10000 // k] < 60  # inside the bar
+    assert g.data[(3000 // k) * g.w + 10000 // k] > 200 and g.data[(7500 // k) * g.w + 1000 // k] > 200
+    assert rise < 400 * 2**20, (rise >> 20, spent)
+    print(f"note: huge TIFF gray {spent:.2f} s, peak working set +{rise >> 20} MB")
+
+
+def test_gray_none_for_unknown_bytes():
+    assert raster.gray(b"not an image") is None
+    assert raster.gray(b"") is None
+
+
+def test_gray_own_png_without_gdiplus():
+    """With no backend the reader's own PNG decoder gives the pixels: RGB, RGBA, gray and a BMP through bmp_to_png."""
+    rows = [bytes([10, 20, 30, 40, 50, 60]), bytes([70, 80, 90, 100, 110, 120])]
+    with no_backend():
+        g, dpi = raster.gray(images._png(2, 2, rows, False, 1))
+        assert (g.w, g.h, g.data, dpi) == (2, 2, bytes([20, 50, 80, 110]), 96.0)
+        rgba = [bytes([1, 2, 3, 255, 4, 5, 6, 255])]
+        assert raster.gray(images._png(2, 1, rgba, True)).__getitem__(0).data == bytes([2, 5])
+        from reader import ocr_pixels
+        gp = images.gray_png(ocr_pixels.Gray(4, 4, bytes(range(16))))
+        g, dpi = raster.gray(gp, max_pixels=4)
+        assert (g.w, g.h, dpi) == (2, 2, 48.0) and abs(g.data[0] - 2) <= 1, g
+        px = bytes([30, 20, 10]) + b"\0"  # one BGR pixel, row padded to 4
+        bmp = (b"BM" + struct.pack("<IHHI", 58, 0, 0, 54)
+               + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0) + px)
+        assert raster.gray(bmp)[0].data == bytes([20])
+        assert raster.gray(images._png(2, 2, rows, False, 1), page=1) is None
+        jpg_head = b"\xff\xd8\xff\xe0" + b"\0" * 40
+        assert raster.gray(jpg_head) is None  # nothing here decodes a JPEG
+
+
+def test_gray_from_pillow_child_frame():
+    """The image venv's gray job answers a GRAY frame (w, h, dpi, then the pixels); a bad frame is not trusted."""
+    seen = []
+    pixels = bytes(range(6))
+    frame = b"GRAY" + struct.pack(">IIf", 3, 2, 150.0) + pixels
+
+    def run(jobs, mono):
+        seen.append(jobs)
+        return [answer[0]]
+    answer = [frame]
+    png = images._png(2, 1, [bytes([1, 2, 3, 4, 5, 6])], False)
+    with fake_resvg(run):
+        g, dpi = raster.gray(png, page=0, max_pixels=100)
+        assert (g.w, g.h, g.data, dpi) == (3, 2, pixels, 150.0)
+        job = seen[-1][0]
+        assert job["op"] == "gray" and job["page"] == 0 and job["max"] == 100
+        assert base64.b64decode(job["data"]) == png
+        for bad in (frame[:-1], b"GRAX" + frame[4:], b"GRAY" + struct.pack(">IIf", 3, 2, float("nan")) + pixels,
+                    b"GRAY" + struct.pack(">IIf", 30, 20, 96.0) + bytes(600), PNG_HEAD + b"xx", None):
+            answer[0] = bad
+            g, dpi = raster.gray(png, max_pixels=100)  # the reader's own decoder takes over
+            assert (g.w, g.h, g.data, dpi) == (2, 1, bytes([2, 5]), 96.0), bad
+        answer[0] = None
+        assert raster.gray(b"GIF89a" + b"\0" * 30) is None
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
