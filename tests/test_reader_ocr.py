@@ -3,8 +3,10 @@ pages and record their calls. Neither Windows OCR nor Tesseract is needed.
 
 Run: python -I -X utf8 tests/test_reader_ocr.py
 """
+import json
 import math
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -328,15 +330,16 @@ def test_faint_page_without_words_doubtful():
     assert ocr.judge(page(CLEAN_KO), Unread(0.0, None, 0.0, 0.0, 200)).kind == "trusted"  # words were read
 
 
-def sloped(texts_per_line: int, lines: int, degrees: float, engine="tess-kor+eng") -> OcrPage:
-    """Lines of word boxes whose baselines slope by `degrees` (y down), each line its own engine line."""
+def sloped(texts_per_line: int, lines: int, degrees: float, engine="tess-kor+eng", psm=limits.TESS_PSM_KOR) -> OcrPage:
+    """Lines of word boxes whose baselines slope by `degrees` (y down), each line its own engine line, as the engine
+    `engine` read them at page segmentation mode `psm` (None: not Tesseract)."""
     k = math.tan(math.radians(degrees))
     words = []
     for ln in range(lines):
         for i in range(texts_per_line):
             x = 100 + 120 * i
             words.append(Word("가나", x, round(200 + 60 * ln + k * x), 100, 30, ln, 95.0))
-    return OcrPage(2000, 3000, words, 0.0, 0, engine, "v1")
+    return OcrPage(2000, 3000, words, 0.0, 0, engine, "v1", psm=psm)
 
 
 def test_judge_sloped_lines_doubtful():
@@ -348,6 +351,18 @@ def test_judge_sloped_lines_doubtful():
     assert ocr.judge(sloped(12, 20, limits.OCR_SKEW * 0.6), clean).kind == "trusted"
     assert ocr.judge(sloped(12, 20, 0.0), clean).kind == "trusted"
     assert ocr.judge(sloped(1, 20, 3.0), clean).kind == "trusted"  # one word a line gives no slope
+
+
+def test_skew_doubt_only_for_psm_kor_reads():
+    """The skew doubt is for Tesseract's psm 4 (TESS_PSM_KOR) read, which shreds skewed lines: the eng read at
+    TESS_PSM_LATIN (psm 3) and Windows (which deskews) read 2-degree pages at CER 0.001-0.015 in the spike."""
+    clean = Unread(0.0, None, 0.0)
+    assert ocr.judge(sloped(12, 20, 2.0, "tess-kor+eng", limits.TESS_PSM_KOR), clean).kind == "doubtful"
+    assert ocr.judge(sloped(12, 20, 2.0, "tess-eng", limits.TESS_PSM_LATIN), clean).kind == "trusted"
+    assert ocr.judge(sloped(12, 20, 2.0, "win-ko", None), clean).kind == "trusted"
+    page = sloped(12, 20, 2.0, "tess-kor+eng", limits.TESS_PSM_KOR)
+    back = ocr._page_of(json.loads(json.dumps(asdict(page))))
+    assert back.psm == limits.TESS_PSM_KOR and ocr.judge(back, clean).kind == "doubtful"
 
 
 def test_no_windows_latin_page_read_again_by_eng():

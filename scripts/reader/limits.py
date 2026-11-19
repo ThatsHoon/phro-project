@@ -89,8 +89,8 @@ OCR_PAPER = 32             # levels under the paper's mean from which a pixel is
 #                            spike: a light photo (gray 150-250 on paper 255) boxed at 0.12-0.49 of the page
 OCR_FLAT = 16              # gray range (levels) up to which a page with no words is blank; spike: clean pages 228-255,
 #                            noisy 155-188, a blank render 0
-OCR_SKEW = 0.5             # degrees the engine's lines may slope before a page is doubtful; spike: straight pages and
-#                            Windows' deskewed lines 0.00-0.10, pages turned 2 degrees 1.84-2.03
+OCR_SKEW = 0.5             # degrees the lines of a TESS_PSM_KOR read may slope before the page is doubtful; spike:
+#                            straight pages 0.00-0.09, text pages turned 2 degrees 1.84-1.94 (CER 0.28-0.66)
 OCR_ANSWER_MARGIN = 2      # seconds before the session's stop by which the worker must have answered a job
 OCR_LATIN = 0.9            # share of Latin letters from which Tesseract eng reads a Windows page again
 OCR_JUNK = 0.03            # share of junk characters over which a page is doubtful and a picture gets no text; clean

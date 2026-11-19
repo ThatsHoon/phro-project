@@ -123,7 +123,7 @@ def test_stdin_is_reader_png():
     assert "-c" in argv and argv[argv.index("-c") + 1] == "tessedit_create_tsv=1"
     assert argv[argv.index("--psm") + 1] == "4"
     assert seen["kw"]["env"]["OMP_THREAD_LIMIT"] == "1"
-    assert page is not None and page.engine == "tess-eng" and (page.w, page.h) == (4, 4)
+    assert page is not None and page.engine == "tess-eng" and (page.w, page.h) == (4, 4) and page.psm == 4
     assert page.angle == 0.0 and page.turn == 0 and len(page.words) == 3
 
 

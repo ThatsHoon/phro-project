@@ -43,7 +43,8 @@ class OcrPage:
     turned bitmap, `rotate(g, turn)`, so `w` and `h` are swapped for 90 and 270. `angle` is the text angle the engine
     reported, `engine` and `version` the ids that key caches. An engine that deskews the bitmap before reading it
     gives its word boxes in the deskewed frame, which the layout keeps, and `ink`: the same boxes (x, y, w, h) in the
-    bitmap's own pixels, one per word, which the unread ink is measured with. None when the word boxes are those."""
+    bitmap's own pixels, one per word, which the unread ink is measured with. None when the word boxes are those.
+    `psm` is the Tesseract page segmentation mode the page was read at, None for another engine."""
     w: int
     h: int
     words: list[Word]
@@ -52,6 +53,7 @@ class OcrPage:
     engine: str
     version: str
     ink: list[tuple[int, int, int, int]] | None = None
+    psm: int | None = None
 
 
 # ---- engines ---------------------------------------------------------------------------------------------------------
@@ -287,9 +289,10 @@ def skew(page: OcrPage) -> float:
 
 def judge(page: OcrPage, un: Unread) -> Verdict:
     """Doubtful when the junk share passes OCR_JUNK, the words' mean confidence (when they carry one) is under
-    OCR_CONF, the share of those words under OCR_LOW_WORD passes OCR_LOW, the lines slope past OCR_SKEW degrees (an
-    engine that does not deskew may have cut them and mixed their order), or there are no words while some ink is
-    unread or the gray range passes OCR_FLAT (faint writing).
+    OCR_CONF, the share of those words under OCR_LOW_WORD passes OCR_LOW, the lines of a page read at TESS_PSM_KOR
+    slope past OCR_SKEW degrees (that mode cuts skewed lines and mixes their order; Windows deskews and the eng read
+    at TESS_PSM_LATIN keeps them), or there are no words while some ink is unread or the gray range passes OCR_FLAT
+    (faint writing).
 
     Otherwise the unread ink decides. A picture is a box whose pixels are at least OCR_AREA_DENSITY unread ink:
     scattered misses span a large box with sparse ink. Past OCR_UNREAD unread, a compact picture (its box under
@@ -304,7 +307,7 @@ def judge(page: OcrPage, un: Unread) -> Verdict:
         junk_share(page) > limits.OCR_JUNK
         or (confs and sum(confs) / len(confs) < limits.OCR_CONF)
         or (confs and sum(1 for c in confs if c < limits.OCR_LOW_WORD) / len(confs) > limits.OCR_LOW)
-        or skew(page) > limits.OCR_SKEW
+        or (page.psm == limits.TESS_PSM_KOR and skew(page) > limits.OCR_SKEW)
         or (not page.words and (un.share > 0 or un.spread > limits.OCR_FLAT))
     )
     if doubtful:
@@ -545,8 +548,9 @@ def _page_of(d) -> OcrPage:
         if not isinstance(ink, list) or len(ink) != len(words):
             raise ValueError("ink boxes")
         ink = [_box_of(b, _int) for b in ink]
+    psm = d.get("psm")
     return OcrPage(_int(d["w"]), _int(d["h"]), words, _num(d["angle"]), turn, _str(d["engine"]), _str(d["version"]),
-                   ink)
+                   ink, None if psm is None else _int(psm))
 
 
 def _unread_of(d) -> Unread | None:

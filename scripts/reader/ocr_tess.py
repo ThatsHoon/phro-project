@@ -61,4 +61,4 @@ def recognize(g, langs: str, psm: int, deadline: float, *, run=subprocess.run) -
     text = p.stdout.decode("utf-8", "replace")
     if not text.startswith("level\t"):
         return None
-    return OcrPage(g.w, g.h, parse_tsv(text), 0.0, 0, "tess-" + langs, version(exe, langs.split("+")))
+    return OcrPage(g.w, g.h, parse_tsv(text), 0.0, 0, "tess-" + langs, version(exe, langs.split("+")), psm=psm)
