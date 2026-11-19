@@ -19,6 +19,8 @@ import reader  # noqa: E402
 from reader import gate  # noqa: E402
 from reader.model import Doc, Heading, Para, Text  # noqa: E402
 
+os.environ["PHRO_READER_OCR"] = "none"  # decision 8: OCR off, keys as before, except in the OCR id tests
+
 READ = HERE / "scripts" / "read.py"
 STUB = "reader.formats._teststub"
 
@@ -1837,6 +1839,106 @@ def test_gate_image_venv_unverified_repair():
         assert repair in c and "To show them, ask the user" not in c and len(c) < 600, c
         assert repair not in ctx_of(gate.decide(sev(p, "s1"), command=EXIT3))  # once a session, as the offer
         assert d.name == cache.key(p, image="none")
+
+
+@contextmanager
+def fake_tess(*langs):
+    """OCR on, with a Tesseract found through PHRO_READER_TESSERACT (a file that is never run) and these
+    traineddata in its TESSDATA_PREFIX."""
+    d = tmp()
+    exe = d / "tesseract.exe"
+    exe.write_bytes(b"not run")
+    (d / "tessdata").mkdir()
+    for lang in langs:
+        (d / "tessdata" / f"{lang}.traineddata").write_bytes(lang.encode())
+    with envs(PHRO_READER_OCR=None, PHRO_READER_TESSERACT=exe, TESSDATA_PREFIX=d / "tessdata"):
+        yield exe
+
+
+@contextmanager
+def patched(mod, **attrs):
+    old = {k: getattr(mod, k) for k in attrs}
+    try:
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        yield
+    finally:
+        for k, v in old.items():
+            setattr(mod, k, v)
+
+
+def test_backend_none_switch():
+    from reader import ocr
+    with fake_tess("eng"):
+        assert ocr.backend()[0].endswith("tess"), ocr.backend()
+        with envs(PHRO_READER_OCR="none"):
+            assert ocr.backend() == ("", "")
+
+
+def test_backend_ids():
+    from reader import ocr, ocr_tess, ocr_win
+    d = tmp()
+    dll = d / "Windows.Media.Ocr.dll"
+    dll.write_bytes(b"dll")
+
+    def ids(folders, tess=None, dll_path=dll, recognizers=None):
+        listing = recognizers or (lambda: list(folders))
+        with patched(ocr_win, recognizers=listing, dll=lambda: dll_path), \
+                patched(ocr_tess, find=lambda: tess):
+            return ocr.backend()
+
+    with patched(ocr_win, recognizers=lambda: ["ko-kr"], dll=lambda: dll):
+        wv = ocr_win._version("ko-kr")
+    assert wv.startswith(f"3:{dll.stat().st_mtime_ns}/"), wv
+    with fake_tess("kor", "osd") as exe:
+        got = ids(["en-us", "ko-kr"])
+        assert got == ("win-ko", wv), got
+        assert ids(["en-us"])[0] == "win-en"
+        both = ids(["en-us", "ko-kr"], exe)
+        assert both == ("win-ko+tess", wv + "+" + ocr_tess.version(exe, {"kor"})), both
+        assert ids([], exe) == ("tess", ocr_tess.version(exe, {"kor"}))
+        assert ids(["ko-kr"], exe, d / "no.dll")[0] == "tess"  # no Windows.Media.Ocr.dll: no Windows engine
+        assert ids([]) == ("", "")
+
+        def broken():
+            raise OSError("listing failed")
+        assert ids([], exe, recognizers=broken)[0] == "tess"  # a probe that fails is that engine absent
+        assert ids(["ko-kr"], d)[0] == "win-ko"  # a folder, not a Tesseract: absent
+    with fake_tess("osd") as exe:  # neither kor nor eng: Tesseract is never used
+        assert ids(["ko-kr"], exe)[0] == "win-ko"
+
+
+def test_backend_runs_no_process():
+    from reader import ocr
+    with fake_tess("eng"):
+        want = ocr.backend()
+        started = []
+
+        def refuse(*a, **k):
+            started.append(a)
+            raise AssertionError("a process was started")
+        with patched(subprocess, Popen=refuse, run=refuse):
+            got = ocr.backend()
+    assert started == [] and got == want and got[0].endswith("tess"), (started, got, want)
+
+
+def test_gate_passes_ocr_id_to_child():
+    """The gate keys with the OCR backend id, and the convert child files its read under that same key."""
+    from reader import cache, ocr
+    with stub() as base, fake_tess("eng"):
+        oid = gate.ocr_backend()
+        assert oid == ":".join(ocr.backend()) and "tess:" in oid, oid
+        p = sample()
+        o = out(run(p, base))
+        k = cache.key(p, image=gate.image_backend(), ocr=oid)
+        assert Path(o["updatedInput"]["file_path"]).parent.name == k != cache.key(p, image=gate.image_backend()), o
+    with pdf_env(), fake_tess("eng"):
+        oid = gate.ocr_backend()
+        p = four_pages()
+        o = out(gate.decide(ev(p)))
+        assert Path(o["updatedInput"]["file_path"]).parent.name == cache.key(p, "native", ocr=oid), o
+        o = out(gate.decide(ev(p, pages="3-4")))
+        assert Path(o["updatedInput"]["file_path"]).parent.name == cache.key(p, "native", ocr=oid), o
 
 
 def main():

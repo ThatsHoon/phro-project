@@ -130,6 +130,15 @@ def _image_id(fmt) -> str:
     return raster.backend()
 
 
+def _ocr_id(fmt) -> str:
+    """The OCR backend id of the cache key for format module `fmt`: the gate's own (gate.ocr_backend), worked out
+    from the engines' files, so the child files the read where the gate looks; none for mpp, which has no pictures."""
+    if fmt == "mpp":
+        return ""
+    from reader import gate
+    return gate.ocr_backend()
+
+
 def cmd_convert(a) -> int:
     from reader import cache
     src = Path(a.file)
@@ -154,7 +163,7 @@ def cmd_convert(a) -> int:
                 out = Path(a.out)
                 reader.convert(src, out, a.hidden, **opts)
             else:
-                k = a.key if _is_key(a.key) else cache.key(src, engine, _image_id(fmt))
+                k = a.key if _is_key(a.key) else cache.key(src, engine, _image_id(fmt), _ocr_id(fmt))
                 if "pages" in opts:
                     k += f"-p{a.pages[0]}-{a.pages[1]}"
                 if a.hidden:

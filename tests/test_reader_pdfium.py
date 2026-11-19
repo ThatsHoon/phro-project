@@ -459,7 +459,8 @@ def test_pdfium_cli_engine():
         out = r.stdout.decode("utf-8").strip()
         assert r.returncode == 0, (out, r.stderr.decode("utf-8", "replace"))
         d = Path(out).parent
-        assert d.name == cache.key(src, run(simple_pdf([text_ops("id")]))["engine_id"]), d.name
+        from reader import gate
+        assert d.name == cache.key(src, run(simple_pdf([text_ops("id")]))["engine_id"], ocr=gate.ocr_backend()), d.name
         assert d.name != cache.key(src, "native"), d.name
         meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
         assert meta["engine"] == "pdfium", meta

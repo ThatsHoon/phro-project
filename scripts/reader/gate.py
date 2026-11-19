@@ -368,6 +368,14 @@ def image_backend(venv=None):
     return pyenv.engine(kind="image", venv=venv if venv is not None else pyenv.venv_dir("image"))
 
 
+def ocr_backend():
+    """The OCR backend id and version in the key of every format but mpp: `ocr.backend()` joined with ":", from the
+    engines' files alone; "" with no engine. The convert child keys with this same function (read._ocr_id)."""
+    from reader import ocr
+    b = ocr.backend()
+    return ":".join(b) if b[0] else ""
+
+
 def _offer_mark(event):
     """The once-a-session marker of the setup offers (pdf's and the image venv's share it), or None with no session."""
     sid = event.get("session_id")
@@ -455,11 +463,11 @@ def _generic(event, path, start, timeout, command):
     from reader import cache, pyenv
     repair = False
     venv = None if _windows() else pyenv.venv_dir("image")
-    image = image_backend(venv)
-    entry = cache.lookup(cache.key(path, image=image))
+    image, ocr = image_backend(venv), ocr_backend()
+    entry = cache.lookup(cache.key(path, image=image, ocr=ocr))
     if entry is None and image.startswith("resvg-") and not pyenv.verify(venv, "image"):
         image, repair = "none", True  # the child works out "none" too: its own check fails the same way
-        entry = cache.lookup(cache.key(path, image=image))
+        entry = cache.lookup(cache.key(path, image=image, ocr=ocr))
     if entry is None:
         # the child hashes the bytes itself: a file saved after this hash must not be filed under the key
         if command:
@@ -618,7 +626,7 @@ def _pdf(event, path, start, timeout, command):
 
 def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
     from reader import cache, pyenv
-    k = cache.key(path, engine)
+    k = cache.key(path, engine, ocr=ocr_backend())
     entry = cache.lookup(k)
     verified = []  # the venv's file check runs once, before the first pdfium child of this call
 

@@ -86,15 +86,18 @@ def code_digest(base=None) -> str:
     return h.hexdigest()
 
 
-def key(path, engine: str = "", image: str = "") -> str:
+def key(path, engine: str = "", image: str = "", ocr: str = "") -> str:
     """`engine`: pdf's (native or pdfium) and mpp's (mpxj) engine id. `image`: the figure backend id ("gdiplus",
     "resvg-…" or "none") every other format's key carries, so a file read with no backend is read again once one is
-    there."""
+    there. `ocr`: the OCR backend id and version (`gate.ocr_backend()`) every key but mpp's carries, so installing or
+    updating an engine reads the file again; empty, the key is the one from before OCR."""
     h = hashlib.sha1(VERSION.encode() + b"\0" + code_digest().encode() + b"\0")
     if engine:
         h.update(engine.encode() + b"\0")
     if image:  # tagged, so an image id never hashes like an engine id
         h.update(b"image:" + image.encode() + b"\0")
+    if ocr:
+        h.update(b"ocr:" + ocr.encode("utf-8", "replace") + b"\0")
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
             h.update(chunk)

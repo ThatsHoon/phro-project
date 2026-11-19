@@ -24,6 +24,8 @@ from reader import cache  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc, Para, Text  # noqa: E402
 
+os.environ["PHRO_READER_OCR"] = "none"  # decision 8: OCR off, keys as before, except in the OCR id tests
+
 READ = HERE / "scripts" / "read.py"
 STUB = "reader.formats._teststub"
 
@@ -543,20 +545,75 @@ def test_figure_cache_misses_and_prunes():
         assert cache.prune(30) >= 1 and not put.path(k).exists()
 
 
+def test_key_unchanged_without_ocr():
+    """An empty OCR id leaves the key as it was before OCR (these values are from 631d028, with the code digest and
+    the version pinned), so no cached document is read again on a machine without OCR."""
+    p = tmp() / "a.bin"
+    p.write_bytes(b"phro ocr key")
+    old = cache.code_digest, cache.VERSION
+    cache.code_digest, cache.VERSION = (lambda base=None: "0" * 40), "0.0.0"
+    try:
+        assert cache.key(p) == cache.key(p, ocr="") == "510f96b67b6fa7fba40476f1e3906ea4a6320270"
+        assert cache.key(p, "native", ocr="") == "0475b4c4c7d711147d956fa879a9a4f0c9c082ae"
+        assert cache.key(p, image="gdiplus", ocr="") == "0c9520a463e8be09759952d774f4677af870afbe"
+        assert cache.key(p, "native", "gdiplus", ocr="") == "2bcdcfd3c12362db84db77575e97a1429173ceaf"
+    finally:
+        cache.code_digest, cache.VERSION = old
+
+
+def test_key_changes_with_ocr_version():
+    p = sample()
+    keys = {cache.key(p, image="gdiplus"), cache.key(p, image="gdiplus", ocr="win-ko:1:2/3:4"),
+            cache.key(p, image="gdiplus", ocr="win-ko:1:2/3:5"), cache.key(p, image="gdiplus", ocr="win-en:1:2/3:4"),
+            cache.key(p, image="gdiplus", ocr="win-ko+tess:1:2/3:4+5:6/7:8"),
+            cache.key(p, image="gdiplus", ocr="win-ko+tess:1:2/3:4+5:6/7:9")}
+    assert len(keys) == 6, keys
+    assert cache.key(p, ocr="tess:1:2") not in (cache.key(p, "tess:1:2"), cache.key(p, image="tess:1:2"))
+    assert cache.key(p, "native", ocr="tess:1:2") != cache.key(p, "native")
+
+
+@contextmanager
+def fake_tess():
+    """OCR on, with a Tesseract found through PHRO_READER_TESSERACT (a file that is never run) and eng."""
+    d = tmp()
+    exe = d / "tesseract.exe"
+    exe.write_bytes(b"not run")
+    (d / "tessdata").mkdir()
+    (d / "tessdata" / "eng.traineddata").write_bytes(b"eng")
+    values = {"PHRO_READER_OCR": None, "PHRO_READER_TESSERACT": str(exe), "TESSDATA_PREFIX": str(d / "tessdata")}
+    old = {k: os.environ.get(k) for k in values}
+    try:
+        for k, v in values.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def test_mpp_and_pdf_keys_ignore_image():
-    """read.py gives the image backend to every key but pdf's and mpp's (their venv children have no figure backend)."""
+    """read.py gives the image backend to every key but pdf's and mpp's (their venv children have no figure backend),
+    and the gate's OCR backend id to every key but mpp's."""
     from pdf_fix import text_ops
+    from reader import gate
     seen = []
     real = cache.key
 
-    def spy(path, engine="", image=""):
-        seen.append((Path(path).suffix, engine, image))
-        return real(path, engine, image)
+    def spy(path, engine="", image="", ocr=""):
+        seen.append((Path(path).suffix, engine, image, ocr))
+        return real(path, engine, image, ocr)
     old = {k: os.environ.get(k) for k in ("PHRO_READER_MPPENV", "PHRO_READER_PYENV")}
     os.environ["PHRO_READER_MPPENV"] = os.environ["PHRO_READER_PYENV"] = "off"
     cache.key = spy
     try:
-        with stub():
+        with stub(), fake_tess():
+            oid = gate.ocr_backend()
             m = tmp() / "x.mpp"
             m.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + bytes(600))
             cli("convert", str(m), "--engine", "mpxj")  # no mpp venv here: unsupported, but the key is worked out
@@ -570,7 +627,8 @@ def test_mpp_and_pdf_keys_ignore_image():
             else:
                 os.environ[k] = v
     from reader import raster
-    assert seen == [(".mpp", "", ""), (".pdf", "native", ""), (".txtx", "", raster.backend())], seen
+    assert "tess:" in oid and seen == [(".mpp", "", "", ""), (".pdf", "native", "", oid),
+                                       (".txtx", "", raster.backend(), oid)], (oid, seen)
 
 
 def test_code_digest_json():

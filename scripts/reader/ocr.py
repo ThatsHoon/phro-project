@@ -10,6 +10,7 @@ import hashlib
 import itertools
 import json
 import math
+import os
 import struct
 import sys
 import threading
@@ -930,9 +931,44 @@ class Session:
 _current: Session | None = None
 
 
+def _win_files() -> tuple[str, str] | None:
+    """Windows OCR as its files show it: `win-ko` with a Korean recognizer, else `win-<language>` of the first
+    recognizer folder, and `ocr_win._version` of that recognizer; None without Windows.Media.Ocr.dll or a recognizer."""
+    from . import ocr_win
+    folders = ocr_win.recognizers()
+    if not folders or not ocr_win.dll().is_file():
+        return None
+    tag = next((f for f in folders if f.split("-")[0] == "ko"), folders[0])
+    return "win-" + tag.split("-")[0], ocr_win._version(tag)
+
+
+def _tess_files() -> tuple[str, str] | None:
+    """Tesseract as its files show it: `tess` and the version of its executable and its kor and eng traineddata;
+    None when it is not found or has neither (as `_tess_load`)."""
+    from . import ocr_tess
+    exe = ocr_tess.find()
+    if exe is None or not exe.is_file():
+        return None
+    used = ocr_tess.langs(exe) & {"kor", "eng"}
+    return ("tess", ocr_tess.version(exe, used)) if used else None
+
+
 def backend() -> tuple[str, str]:
-    """(engine id, version) of the OCR engines on this machine; ("", "") for none."""
-    return "", ""
+    """(engine id, version) of the OCR engines on this machine, from their files alone: no engine is loaded and no
+    process is started, so the gate can key every Read with it. The id is `win-ko` or `win-<language>`, with `+tess`
+    when Tesseract is here too, or `tess` alone; the version joins the engines' versions with `+`. ("", "") for none,
+    and under PHRO_READER_OCR=none. An engine whose files cannot be read, for any reason, is absent."""
+    if os.environ.get("PHRO_READER_OCR", "").strip().lower() == "none":
+        return "", ""
+    found = []
+    for probe in (_win_files, _tess_files):
+        try:
+            got = probe()
+        except Exception:  # noqa: BLE001 - OCR never makes a Read fail
+            got = None
+        if got is not None:
+            found.append(got)
+    return "+".join(i for i, _ in found), "+".join(v for _, v in found)
 
 
 def session() -> Session | None:

@@ -550,12 +550,17 @@ def _stamp(p: Path | None) -> str:
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
+def dll() -> Path:
+    """Where the Windows build keeps Windows.Media.Ocr.dll."""
+    return Path(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows") / "System32" \
+        / "Windows.Media.Ocr.dll"
+
+
 def _version(tag: str) -> str:
     """'<size>:<mtime_ns>/<size>:<mtime_ns>' of Windows.Media.Ocr.dll and of the recognizer's .orp file, a part
     '0:0' when its file is missing or cannot be read. Never raises: the version only keys caches."""
-    system = Path(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows") / "System32"
     try:
         orp = _orp(_recognizer_folder(tag))
     except Exception:  # noqa: BLE001 - a version is never a reason for no engine
         orp = None
-    return f"{_stamp(system / 'Windows.Media.Ocr.dll')}/{_stamp(orp)}"
+    return f"{_stamp(dll())}/{_stamp(orp)}"
