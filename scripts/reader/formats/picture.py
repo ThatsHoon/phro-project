@@ -87,12 +87,15 @@ def _ocr(doc: Doc, s, data: bytes, ctx) -> None:
     stop = s.deadline - limits.FIGURE_RESERVE
     until = stop - limits.FIGURE_RESERVE
     pages = [replace(b, ocr="page") for b in doc.blocks]
-    sent, late = [], False  # per page: its Ticket, "late" (not sent for the time) or None (no pixels)
+    sent, late = [], False  # per page: its Ticket, "late" (not sent for the time), "small" (under OCR_MIN_EDGE: not sent, not counted) or None (no pixels)
     for i in range(len(pages)):
         got = None if late else raster.gray(data, page=i, deadline=stop)
         if got is None:
             late = late or time.monotonic() >= stop
             sent.append("late" if late else None)
+            continue
+        if max(got[0].w, got[0].h) < limits.OCR_MIN_EDGE:
+            sent.append("small")
             continue
         t = s.submit(got[0], "page", got[1], until=until)
         r = s.peek(t)
@@ -101,6 +104,9 @@ def _ocr(doc: Doc, s, data: bytes, ctx) -> None:
     counts = {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None}
     budget, out = pdf_tables.TableBudget(), []
     for i, (im, t) in enumerate(zip(pages, sent)):
+        if t == "small":
+            out.append(im)
+            continue
         r = s.wait(t) if isinstance(t, ocr.Ticket) else None
         status = (t or "failed") if r is None else r.status
         if status == "done":

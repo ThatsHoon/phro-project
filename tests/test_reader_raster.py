@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from metafile_fix import (emf, emf_brush, emf_font, emf_glyphs, emf_pen, emf_rect, emf_textw, pict,  # noqa: E402
                           pict_longtext, pict_op, wmf, wmf_brush, wmf_font, wmf_rect, wmf_select, wmf_text, wmf_window, wpg1,
                           wpg1_fill, wpg1_rect, wpg1_text)
+from ocr_fix import ocr_stub  # noqa: E402
 from reader import emf_write, fonts, images, limits, metafile, raster, svg_write  # noqa: E402
 from reader import pict as pictmod, wpg as wpgmod  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
@@ -1012,6 +1013,22 @@ def test_wmz_ratio_cap():
     # under the floor the ratio is not checked: 900 KB of zeros from a 1 KB stream is a picture
     small = wmf([wmf_text(1, 1, b"x")]) + bytes(900_000)
     assert picture.unpack(gzip.compress(small, 9), "wmz") == small
+
+
+def test_lone_tiff_page_under_min_edge_not_read():
+    from reader import model
+    from reader.formats import picture
+    if not (WINDOWS and raster.backend() == "gdiplus"):
+        return
+    answer = {"page": {"w": 64, "h": 64, "angle": 0.0, "turn": 0, "engine": "stub", "version": "1",
+                       "words": [{"text": t, "x": x, "y": 20, "w": 20, "h": 16, "line": 0, "conf": None}
+                                 for t, x in (("Total", 4), ("120", 30))]}}
+    p = lone("edge.tif", tiff([(63, 63, 0), (64, 64, 0)]))
+    with ocr_stub(answer=answer) as (_, sent):
+        doc = picture.parse(p, model.Context())
+    assert sent == [(64, 64, "page")], sent
+    assert doc.meta["ocr"]["pages"] == 1 and doc.meta["ocr"]["failed"] == 0, doc.meta
+    assert doc.blocks[0].page == 0 and doc.blocks[0].ocr == "page", doc.blocks
 
 
 def test_lone_tiff_pages_and_cap():
