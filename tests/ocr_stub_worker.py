@@ -6,6 +6,8 @@
     die_after   exit (code 3) once this many jobs were answered, before answering any more
     answer      fields merged into every answer head (e.g. {"ok": false})
     child       spawn a sleeping grandchild at start and report its pid in each answer's page `version` as "child:<pid>"
+    child_secs  how long that grandchild sleeps (default 30)
+    child_pipes the grandchild inherits this worker's stdin and stdout pipes
     bad_frame   answer the first job with a frame whose head length is past OCR_FRAME_JSON
 
 A done answer is a page of one word, "w<W>", where W is the job's width, so a test can match answers to jobs.
@@ -33,7 +35,9 @@ def main():
     answered = [0]
     child = None
     if conf.get("child"):
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        secs = float(conf.get("child_secs", 30))
+        pipes = {"stdin": sys.stdin.buffer, "stdout": sys.stdout.buffer} if conf.get("child_pipes") else {}
+        child = subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({secs})"], **pipes)
 
     def answer(head: dict) -> None:
         w = head["w"]

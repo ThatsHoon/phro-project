@@ -84,6 +84,23 @@ def test_tesseract_starts_without_a_window():
         assert not seen.get("creationflags")
 
 
+def test_no_deadline_runs_without_timeout():
+    # a conversion with no time limit passes deadline=math.inf; subprocess cannot wait for an infinite timeout
+    seen = {}
+
+    def run(argv, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(argv, 0, stdout=TSV.encode(), stderr=b"")
+
+    orig = ocr_tess.find
+    ocr_tess.find = lambda: Path(sys.executable)
+    try:
+        page = ocr_tess.recognize(Gray(2, 2, bytes(4)), "eng", 3, float("inf"), run=run)
+    finally:
+        ocr_tess.find = orig
+    assert page is not None and seen["timeout"] is None, seen.get("timeout")
+
+
 def test_stdin_is_reader_png():
     g = Gray(4, 4, bytes(range(16)))
     seen = {}

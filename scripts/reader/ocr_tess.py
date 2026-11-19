@@ -1,4 +1,5 @@
 """Tesseract as an OCR engine: found by a PATH scan, fed a PNG the reader encoded on stdin, read back as inline TSV."""
+import math
 import os
 import shutil
 import subprocess
@@ -94,9 +95,11 @@ def recognize(g, langs: str, psm: int, deadline: float, *, run=subprocess.run) -
     env["OMP_THREAD_LIMIT"] = "1"
     # the reader runs inside a hook: no console window may flash on Windows
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    # no deadline (math.inf) is no timeout: subprocess cannot wait an infinite time
+    timeout = max(0.0, deadline - time.monotonic()) if math.isfinite(deadline) else None
     try:
         p = run([str(exe), "-", "stdout", "-l", langs, "--psm", str(psm), "-c", "tessedit_create_tsv=1"],
-                input=images.gray_png(g), capture_output=True, timeout=max(0.0, deadline - time.monotonic()),
+                input=images.gray_png(g), capture_output=True, timeout=timeout,
                 env=env, creationflags=flags)
     except (subprocess.TimeoutExpired, OSError):
         return None

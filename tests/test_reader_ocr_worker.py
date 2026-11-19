@@ -8,12 +8,14 @@ The real-worker tests skip unless Windows OCR with the `ko` recognizer is presen
 """
 import io
 import json
+import math
 import os
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -123,11 +125,14 @@ def test_frame_over_cap_refused():
             raise AssertionError("head over cap written")
         except ValueError:
             pass
-        try:
-            ocr.read_frame(io.BytesIO(struct.pack(">I", 65) + b"{" * 65))
-            raise AssertionError("head over cap read")
-        except ValueError:
-            pass
+        padded = json.dumps({"id": 1, "pad": "x" * 45}).encode()  # valid JSON, one byte over the cap
+        assert len(padded) == 65
+        for raw in (struct.pack(">I", 65) + padded, struct.pack(">I", 2**31)):
+            try:
+                ocr.read_frame(io.BytesIO(raw))
+                raise AssertionError("head over cap read")
+            except ValueError as e:
+                assert "over the cap" in str(e), e
         limits.OCR_FRAME_JSON = old_json
         images._MAX_PIXELS = 50
         try:
@@ -426,9 +431,9 @@ def answers(out: io.BytesIO) -> dict:
     return got
 
 
-def serve(inp) -> tuple[dict, FakeWin]:
+def serve(inp, fake=None) -> tuple[dict, FakeWin]:
     from reader import ocr_worker
-    fake = FakeWin()
+    fake = FakeWin() if fake is None else fake
     orig = ocr.engines
     ocr.engines = lambda: ocr.Engines(fake, None, True)
     try:
@@ -483,6 +488,224 @@ def test_worker_refuses_bad_frames():
         assert got == {} and fake.closed
     finally:
         images._MAX_PIXELS = old
+
+
+# ---- fix round 1 -----------------------------------------------------------------------------------------------------
+
+def test_cut_answer_is_done_but_not_cached():
+    """I1 (a): an answer the worker flags as cut by the time is used, never cached."""
+    with tmpdir() as d, stub(answer={"cut": True}):
+        store = cache.OcrResults(d)
+        s = ocr.Session(time.monotonic() + 60, BACKEND, cmd=STUB, store=store)
+        try:
+            t = s.submit(gray(12), "page", 200.0)
+            assert s.wait(t).status == "done"
+            assert store.get(t.key) is None, "a cut answer was cached"
+        finally:
+            s.close()
+
+
+def test_answer_after_stop_is_not_cached():
+    """I1 (b): an answer that arrives at or after the stop, while no wait is pending, is not filed in the store."""
+    with tmpdir() as d, stub(delay=1.5):
+        store = cache.OcrResults(d)
+        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + 0.5, BACKEND, cmd=STUB, store=store)
+        try:
+            t = s.submit(gray(11), "page", 200.0)
+            t0 = time.monotonic()  # nobody waits: the reader thread files the answer, after the stop
+            while t.id not in s._done and time.monotonic() - t0 < 15:
+                time.sleep(0.05)
+            assert t.id in s._done and time.monotonic() >= s._stop()
+            assert store.get(t.key) is None, "an answer past the stop was cached"
+            assert s.wait(t).status in ("done", "late")
+        finally:
+            s.close()
+
+
+def test_worker_flags_cut_answers():
+    """I1 (a), the worker side: a job whose deadline passed while it was read is answered with "cut": true."""
+    g = block(40, 30, 0, 0, 10, 8)
+    head = {"w": g.w, "h": g.h, "kind": "picture", "dpi": 200.0}
+    got, _ = serve(frames(({"id": 1, **head, "left": 0.0}, g.data), ({"id": 2, **head, "left": 30.0}, g.data),
+                          ({"id": 3, **head}, g.data)))  # I4: no `left` is no limit
+    assert got[1]["ok"] and got[1].get("cut") is True, got[1]
+    assert got[2]["ok"] and not got[2].get("cut"), got[2]
+    assert got[3]["ok"] and not got[3].get("cut"), got[3]
+
+
+def test_oversized_number_answer_fails_at_once():
+    """I2: a number too big for a float in an answer is the worker's death: "failed" at once, not "late"."""
+    with stub(answer={"unread": {"share": 10 ** 400, "box": None, "area": 0.0}}):
+        s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + 4, BACKEND, cmd=STUB)
+        try:
+            t0 = time.monotonic()
+            r = s.wait(s.submit(gray(11), "page", 200.0))
+            assert r.status == "failed" and not s.late, (r.status, s.late)
+            assert time.monotonic() - t0 < 2.5
+        finally:
+            s.close()
+
+
+class OddStore:
+    """A store whose entries do not read: `get` gives `value`, or raises it when it is an exception."""
+
+    def __init__(self, value):
+        self.value, self.puts = value, 0
+
+    def get(self, key):
+        if isinstance(self.value, BaseException):
+            raise self.value
+        return self.value
+
+    def put(self, key, result):
+        self.puts += 1
+
+
+def test_bad_cache_entry_is_a_miss():
+    """I2: a cache entry that does not read, or a store that raises, is a miss; submit never raises."""
+    huge = {"page": {"w": 11, "h": 4, "words": [], "angle": 0.0, "turn": 0, "engine": "e", "version": "v"},
+            "rules": [], "unread": {"share": 10 ** 400, "box": None, "area": 0.0}, "hint": False}
+    for value in (huge, RuntimeError("store fault")):
+        with stub():
+            store = OddStore(value)
+            s = ocr.Session(time.monotonic() + 60, BACKEND, cmd=STUB, store=store)
+            try:
+                r = s.wait(s.submit(gray(11), "page", 200.0))
+                assert r.status == "done" and words(r) == ["w11"], (value, r.status)
+            finally:
+                s.close()
+
+
+def test_nan_dpi_costs_nothing():
+    """I3: a page with a NaN dpi is read at OCR_DPI, and the pages around it are read too."""
+    with stub():
+        s = ocr.Session(time.monotonic() + 60, BACKEND, cmd=STUB)
+        try:
+            ts = [s.submit(gray(11), "page", 200.0), s.submit(gray(12), "page", math.nan),
+                  s.submit(gray(13), "page", 200.0), s.submit(gray(14), "page", -1.0),
+                  s.submit(gray(15), "page", math.inf)]
+            assert [s.wait(t).status for t in ts] == ["done"] * 5, [s.wait(t).status for t in ts]
+            assert [t.dpi for t in ts[1:4:2]] == [float(limits.OCR_DPI)] * 2 and ts[4].dpi == float(limits.OCR_DPI)
+        finally:
+            s.close()
+
+
+def test_no_deadline():
+    """I4: deadline None or math.inf means no limit: jobs are read, nothing goes late."""
+    for deadline in (None, math.inf):
+        with stub(delay=0.3):
+            s = ocr.Session(deadline, BACKEND, cmd=STUB)
+            try:
+                ts = [s.submit(gray(w), "page", 200.0) for w in (11, 12)]
+                assert [s.wait(t).status for t in ts] == ["done", "done"], deadline
+                assert not s.late
+            finally:
+                s.close()
+    with ocr.opened(None, BACKEND, cmd=STUB) as s:
+        assert s.wait(s.submit(gray(11), "picture", 200.0)).status == "done"
+
+
+def test_key_follows_worker_limits_and_code():
+    """I5: the key changes with the worker-side limits; ocr_worker.py is part of CODE."""
+    assert "ocr_worker.py" in ocr._SOURCES and list(ocr._SOURCES) == sorted(ocr._SOURCES)
+    g = gray(11)
+    k = ocr.picture_key(g, "win-ko", "1", kind="page", dpi=200.0)
+    for name, value in (("TESS_PSM_KOR", 6), ("OCR_JUNK", 0.5), ("OCR_LATIN", 0.5), ("TESS_PSM_LATIN", 6),
+                        ("OCR_RULE", 0.5), ("OCR_RULE_THICK", 0.5), ("OCR_RULES_MAX", 7), ("OCR_DPI", 300)):
+        old = getattr(limits, name)
+        setattr(limits, name, value)
+        try:
+            assert ocr.picture_key(g, "win-ko", "1", kind="page", dpi=200.0) != k, name
+        finally:
+            setattr(limits, name, old)
+    assert ocr.picture_key(g, "win-ko", "1", kind="page", dpi=200.0) == k
+
+
+class TypeErrorWin(FakeWin):
+    """Every page it gives has a confidence JSON cannot write (TypeError in the answer)."""
+
+    def recognize(self, g: Gray, deadline: float):
+        return ocr.OcrPage(g.w, g.h, [ocr.Word("가나다", 0, 0, 2, 2, 0, 1j)], 0.0, 0, self.engine, self.version)
+
+
+def test_worker_survives_unwritable_answers():
+    """M2: answers that cannot be written are refused one by one; no thread dies and no slot is lost."""
+    g = block(5, 5, 0, 0, 2, 2)
+    old = limits.OCR_WORKERS
+    limits.OCR_WORKERS = 1
+    box = {}
+    try:
+        reqs = [({"id": i, "w": 5, "h": 5, "kind": "picture", "dpi": 200.0, "left": 30.0}, g.data) for i in range(6)]
+        th = threading.Thread(target=lambda: box.update(got=serve(frames(*reqs), TypeErrorWin())[0]), daemon=True)
+        th.start()
+        th.join(15)
+        assert not th.is_alive(), "the worker stalled after an answer it could not write"
+    finally:
+        limits.OCR_WORKERS = old
+    assert box["got"] == {i: {"id": i, "ok": False} for i in range(6)}, box["got"]
+
+
+def test_kill_after_reap_spares_the_group():
+    """M3: once the worker is reaped, a later kill never signals its (possibly reused) process group."""
+    if sys.platform == "win32":
+        print("skip: test_kill_after_reap_spares_the_group (POSIX process groups)")
+        return
+    import signal
+    with stub():
+        s = ocr.Session(time.monotonic() + 60, BACKEND, cmd=STUB)
+        try:
+            s.wait(s.submit(gray(11), "page", 200.0))
+            s._kill()
+            assert s._proc.returncode is not None
+            seen, orig = [], os.killpg
+            os.killpg = lambda pid, sig: seen.append((pid, sig))
+            try:
+                s._kill()
+            finally:
+                os.killpg = orig
+            assert not seen, seen
+        finally:
+            s.close()
+
+
+def test_job_object_takes_the_popen_handle():
+    """M3: on Windows the job object is given the worker's own process handle, not one reopened by pid."""
+    if sys.platform != "win32":
+        print("skip: test_job_object_takes_the_popen_handle (Windows job objects)")
+        return
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                         creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        job = ocr._job_for(p)
+        assert job, "no job object for the Popen"
+        ocr._job_kill(job)
+        p.wait(3)
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+
+
+def test_close_with_inherited_pipes_is_bounded():
+    """M5: with no job object, a grandchild that holds the worker's pipes must not make close() wait for it."""
+    pid = None
+    orig = ocr._job_for
+    ocr._job_for = lambda *a: None
+    try:
+        with stub(child=True, child_secs=12, child_pipes=True):
+            s = ocr.Session(time.monotonic() + 60, BACKEND, cmd=STUB)
+            try:
+                r = s.wait(s.submit(gray(11), "page", 200.0))
+                pid = int(r.page.version.split(":")[1])
+            finally:
+                t0 = time.monotonic()
+                s.close()
+                took = time.monotonic() - t0
+        assert took < 7, f"close took {took:.1f}s"
+    finally:
+        ocr._job_for = orig
+        if pid is not None:
+            end(pid)
 
 
 # ---- cache ----------------------------------------------------------------------------------------------------------

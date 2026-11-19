@@ -283,7 +283,12 @@ def picture_lines(page: OcrPage) -> list[str]:
 
 # ---- the per-picture key ---------------------------------------------------------------------------------------------
 
-_SOURCES = ("ocr.py", "ocr_layout.py", "ocr_pixels.py", "ocr_tess.py", "ocr_win.py")  # sorted by name
+_SOURCES = ("ocr.py", "ocr_layout.py", "ocr_pixels.py", "ocr_tess.py", "ocr_win.py", "ocr_worker.py")  # sorted
+
+# the limits that shape what the worker answers (engine choice, rotation search, rules); the verdict thresholds
+# are not here, since `judge` runs again on every load
+_KEY_LIMITS = ("OCR_JUNK", "OCR_LATIN", "TESS_PSM_LATIN", "TESS_PSM_KOR", "OCR_RULE", "OCR_RULE_THICK",
+               "OCR_RULES_MAX", "OCR_DPI")
 
 
 def _code() -> str:
@@ -303,15 +308,19 @@ CODE = _code()  # computed once at import
 
 
 def picture_key(g: Gray, engine: str, version: str, *, kind: str = "picture", dpi: float = 0.0) -> str:
-    """The per-picture cache key: SHA-1 over the size and Gray8 pixels, the engine id and version, `CODE` and the
-    reader's version. A page (`kind` "page") is another entry than the same pixels read as a picture, and its dpi is
-    hashed too: a page's result carries rules, found at that dpi, and its unread ink."""
+    """The per-picture cache key: SHA-1 over the size and Gray8 pixels, the engine id and version, `CODE` (which
+    covers the worker too), the reader's version, and the current values of `_KEY_LIMITS`, read at call time, so a
+    calibrated limit never serves a reading made under the old one. A page (`kind` "page") is another entry than the
+    same pixels read as a picture, and its dpi is hashed too: a page's result carries rules, found at that dpi, and
+    its unread ink."""
     from . import VERSION
     h = hashlib.sha1(f"{g.w}x{g.h}\0".encode())
     h.update(g.data)
     h.update(b"\0")
     for part in (engine, version, CODE, VERSION):
         h.update(str(part).encode("utf-8", "replace") + b"\0")
+    for name in _KEY_LIMITS:
+        h.update(f"{name}={getattr(limits, name)!r}\0".encode())
     if kind != "picture":
         h.update(f"kind:{kind}\0dpi:{float(dpi)!r}\0".encode())
     return h.hexdigest()
@@ -364,19 +373,32 @@ def _write_all(f, data) -> None:
         mv = mv[n:]
 
 
-def write_frame(f, head: dict, body: bytes = b"") -> None:
-    """One frame: `struct.pack(">I", len(head)) + head + body`, the head as UTF-8 JSON. ValueError, before anything
-    is written, for a head over OCR_FRAME_JSON bytes or not JSON, or a body that is not the head's w*h bytes (none
+def _frame_head(head: dict, body: bytes) -> bytes:
+    """The length prefix and JSON head of a frame, checked against `body`. FrameError for a head over OCR_FRAME_JSON
+    bytes or not JSON (NaN, infinity, a value JSON cannot write), or a body that is not the head's w*h bytes (none
     for a head without `w` and `h`) or is over images._MAX_PIXELS."""
-    data = json.dumps(head, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    try:
+        data = json.dumps(head, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (ValueError, TypeError, RecursionError) as e:
+        raise FrameError(f"frame head is not JSON: {e}") from None
     if len(data) > limits.OCR_FRAME_JSON:
         raise FrameError(f"frame head of {len(data)} bytes over the cap")
     if len(body) != _body_len(head):
         raise FrameError(f"frame body of {len(body)} bytes for {head.get('w')!r}x{head.get('h')!r}")
-    _write_all(f, struct.pack(">I", len(data)) + data)
+    return struct.pack(">I", len(data)) + data
+
+
+def _send(f, prefix: bytes, body: bytes) -> None:
+    _write_all(f, prefix)
     if body:
         _write_all(f, body)
     f.flush()
+
+
+def write_frame(f, head: dict, body: bytes = b"") -> None:
+    """One frame: `struct.pack(">I", len(head)) + head + body`, the head as UTF-8 JSON. FrameError (a ValueError),
+    before anything is written, for a head or body `_frame_head` refuses."""
+    _send(f, _frame_head(head, body), body)
 
 
 def read_frame(f) -> tuple[dict, bytes] | None:
@@ -497,7 +519,7 @@ def _result_of(d: dict, kind: str) -> Result:
     return Result("done", page, rules, un, judge(page, un), hint)
 
 
-_BAD = (ValueError, TypeError, KeyError, AttributeError)
+_BAD = (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError)
 
 
 # ---- killing the worker's whole tree ---------------------------------------------------------------------------------
@@ -521,10 +543,11 @@ def _k32():
     return ctypes, wintypes, k32
 
 
-def _job_for(pid: int) -> int | None:
-    """A Windows Job object holding process `pid`, set to kill every process in it when its handle closes
-    (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE), so the worker's tesseract children die with it. None when any call fails:
-    the worker alone is killed then."""
+def _job_for(proc) -> int | None:
+    """A Windows Job object holding the `subprocess.Popen` `proc`, set to kill every process in it when its handle
+    closes (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE), so the worker's tesseract children die with it. The Popen's own
+    process handle is used (no pid to reopen, so no pid-reuse window); a process is opened by pid only when the
+    Popen has none. None when any call fails: the worker alone is killed then."""
     try:
         ctypes, wintypes, k32 = _k32()
 
@@ -545,19 +568,21 @@ def _job_for(pid: int) -> int | None:
             return None
         info = Extended()
         info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        proc = None
+        own = None
         try:
             if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # Extended = 9
                 raise OSError("SetInformationJobObject")
-            proc = k32.OpenProcess(0x0100 | 0x0001, False, pid)  # PROCESS_SET_QUOTA | PROCESS_TERMINATE
-            if not proc or not k32.AssignProcessToJobObject(job, proc):
+            handle = getattr(proc, "_handle", None)
+            if handle is None:
+                handle = own = k32.OpenProcess(0x0100 | 0x0001, False, proc.pid)  # SET_QUOTA | TERMINATE
+            if not handle or not k32.AssignProcessToJobObject(job, int(handle)):
                 raise OSError("AssignProcessToJobObject")
         except OSError:
             k32.CloseHandle(job)
             return None
         finally:
-            if proc:
-                k32.CloseHandle(proc)
+            if own:
+                k32.CloseHandle(own)
         return job
     except Exception:  # noqa: BLE001 - a ctypes fault of any type: fall back to killing the worker alone
         return None
@@ -588,13 +613,23 @@ class Session:
 
     OCR never fails or stalls a conversion. A worker that exits, cannot start, refuses a job or sends a frame that
     does not read gives "failed" tickets (a bad frame also kills it); a dead worker is not started again. At
-    `deadline - FIGURE_RESERVE` a waiting `wait` kills the worker with its whole process tree, and every open ticket
-    becomes "late", as does any later one. `deadline` is a time.monotonic() value; `backend` is (engine id, version),
-    the ids the per-picture key takes.
+    `deadline - FIGURE_RESERVE` (the stop) a waiting `wait` kills the worker with its whole process tree, and every
+    open ticket becomes "late", as does any later one. An answer the worker flags `cut` (its deadline passed while it
+    read the job) or that arrives at or after the stop is used but never filed in `store`: it may be a reading the
+    time cut short.
+
+    `deadline` is a time.monotonic() value, or None (or math.inf, or NaN) for no limit: nothing then goes late, waits
+    are only bounded by the answers, and the jobs go without `left`, which the worker reads as no limit. `backend`
+    is (engine id, version), the ids the per-picture key takes. A `dpi` that is not a positive finite number is read
+    as OCR_DPI.
     """
 
-    def __init__(self, deadline: float, backend: tuple[str, str], *, cmd: list | None = None, store=None):
-        self.deadline = deadline
+    def __init__(self, deadline: float | None, backend: tuple[str, str], *, cmd: list | None = None, store=None):
+        try:
+            deadline = math.inf if deadline is None else float(deadline)
+        except (TypeError, ValueError):
+            deadline = math.inf
+        self.deadline = math.inf if math.isnan(deadline) else deadline
         self.backend = (str(backend[0]), str(backend[1]))
         self.cmd = list(WORKER_CMD if cmd is None else cmd)
         self.store = store
@@ -619,7 +654,7 @@ class Session:
         try:
             d = self.store.get(key)
             r = _result_of(d, kind) if isinstance(d, dict) else None
-        except _BAD:
+        except Exception:  # noqa: BLE001 - a store or entry that does not read is a miss, never the document's fault
             return None
         return r if r is not None and r.status == "done" else None
 
@@ -634,7 +669,12 @@ class Session:
     def submit(self, g: Gray, kind: str, dpi: float) -> Ticket:
         if kind not in ("page", "picture"):
             raise ValueError(f"kind {kind!r}")
-        dpi = float(dpi)
+        try:
+            dpi = float(dpi)
+        except (TypeError, ValueError):
+            dpi = math.nan
+        if not math.isfinite(dpi) or dpi <= 0:  # a resolution tag of 0/0, say: the page is still read
+            dpi = float(limits.OCR_DPI)
         key = picture_key(g, *self.backend, kind=kind, dpi=dpi)
         t = Ticket(next(self._ids), kind, key, dpi)
         hit = self._cached(key, kind)
@@ -674,7 +714,7 @@ class Session:
             self._state = "dead"
             return
         self._proc = proc
-        self._job = _job_for(proc.pid) if sys.platform == "win32" else None
+        self._job = _job_for(proc) if sys.platform == "win32" else None
         self._state = "running"
         self._threads = [threading.Thread(target=self._write_loop, args=(proc,), daemon=True),
                          threading.Thread(target=self._read_loop, args=(proc,), daemon=True)]
@@ -692,14 +732,19 @@ class Session:
                 t, g = item
                 if t.id not in self._open:  # settled meanwhile (late, or the worker died)
                     continue
-            # `left` runs to the conversion's own deadline: the worker never cuts a page short of the session's
-            # stop, so a page it gives up on is always one the session has already called late
-            head = {"id": t.id, "w": g.w, "h": g.h, "kind": t.kind, "dpi": t.dpi,
-                    "left": self.deadline - time.monotonic()}
+            # `left` runs to the conversion's own deadline, so the worker does not cut a page short of the session's
+            # stop; with no deadline it is left out, which the worker reads as no limit
+            head = {"id": t.id, "w": g.w, "h": g.h, "kind": t.kind, "dpi": t.dpi}
+            left = self.deadline - time.monotonic()
+            if math.isfinite(left):
+                head["left"] = left
             try:
-                write_frame(proc.stdin, head, g.data)
-            except FrameError:
+                prefix = _frame_head(head, g.data)
+            except FrameError:  # nothing was written: the stream is intact, only this ticket fails
                 self._settle(t.id, Result("failed"))
+                continue
+            try:
+                _send(proc.stdin, prefix, g.data)
             except (OSError, ValueError):  # the pipe broke or was closed: the worker is gone
                 self._gone(proc)
                 return
@@ -713,16 +758,21 @@ class Session:
     def _read_loop(self, proc) -> None:
         try:
             while (fr := read_frame(proc.stdout)) is not None:
-                if not self._answer(fr[0]):
+                try:
+                    ok = self._answer(fr[0])
+                except Exception:  # noqa: BLE001 - an answer that breaks anything is a worker not to be trusted
+                    ok = False
+                if not ok:
                     break
-        except (OSError, ValueError):
+        except Exception:  # noqa: BLE001 - a frame that does not read, or the pipe: the worker is gone
             pass
-        self._gone(proc)
+        finally:
+            self._gone(proc)
 
     def _answer(self, head: dict) -> bool:
         """One answer filed; False for one that does not read, which counts as the worker's death."""
-        tid, ok = head.get("id"), head.get("ok")
-        if type(tid) is not int or type(ok) is not bool:
+        tid, ok, cut = head.get("id"), head.get("ok"), head.get("cut", False)
+        if type(tid) is not int or type(ok) is not bool or type(cut) is not bool:
             return False
         with self._cond:
             t = self._open.get(tid)
@@ -735,7 +785,7 @@ class Session:
             r = _result_of(head, t.kind)
         except _BAD:
             return False
-        if r.status == "done" and self.store is not None:
+        if r.status == "done" and self.store is not None and not cut and time.monotonic() < self._stop():
             try:
                 self.store.put(t.key, {k: head[k] for k in _FIELDS})
             except Exception:  # noqa: BLE001 - a cache that cannot be written costs only the next read's time
@@ -779,7 +829,7 @@ class Session:
             return
         if job is not None:
             _job_kill(job)
-        elif sys.platform != "win32":
+        elif sys.platform != "win32" and proc.returncode is None:  # once reaped, its pgid may be someone else's
             import os
             import signal
             try:
@@ -805,7 +855,7 @@ class Session:
                 left = self._stop() - time.monotonic()
                 if left <= 0:
                     break
-                self._cond.wait(left)
+                self._cond.wait(min(left, 3600.0))  # no deadline is inf, which Condition.wait cannot take
             r = self._done.get(t.id)
         if r is None:
             self._expire()
@@ -830,10 +880,12 @@ class Session:
             writer.join(1.0)
             if writer.is_alive():  # stuck on a full pipe: the worker is not reading
                 self._kill()
-            try:
-                proc.stdin.close()
-            except (OSError, ValueError):
-                pass
+                writer.join(1.0)
+            if not writer.is_alive():  # closing a pipe a thread is blocked on can wait on the CRT's fd lock
+                try:
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    pass
             try:
                 proc.wait(1.0)
             except Exception:  # noqa: BLE001 - TimeoutExpired: killed below
@@ -841,7 +893,9 @@ class Session:
         self._kill()
         for th in self._threads:
             th.join(2.0)
-        if proc is not None:
+        # a reader still blocked means another process holds the pipe (a grandchild with no job object): its pipe is
+        # left to that process's exit
+        if proc is not None and not self._threads[1].is_alive():
             try:
                 proc.stdout.close()
             except (OSError, ValueError):

@@ -19,29 +19,41 @@ from .ocr_pixels import Gray, rotate, rules, threshold, unread
 
 
 def _job(head: dict, body: bytes, eng: ocr.Engines) -> dict:
-    """One job's answer. Pages get their rules and unread ink in the page's turned frame; pictures get neither."""
+    """One job's answer. Pages get their rules and unread ink in the page's turned frame; pictures get neither. An
+    answer read while the job's deadline passed carries `"cut": true`: the rotation search or a re-read may have
+    been cut short, so the Session never caches it. A head without `left` has no deadline."""
     jid, kind = head["id"], head["kind"]
-    dpi, left = float(head["dpi"]), float(head["left"])
-    if not math.isfinite(left):
-        raise ValueError(f"left {left!r}")
+    dpi = float(head["dpi"])
+    left = head.get("left")
+    if left is None:
+        deadline = math.inf
+    else:
+        left = float(left)
+        if not math.isfinite(left):
+            raise ValueError(f"left {left!r}")
+        # the conversion's own deadline: a cancelled Windows page keeps running natively, so the deadline is the
+        # only bound, and the Session kills this process before it comes
+        deadline = time.monotonic() + left
     g = Gray(head["w"], head["h"], body)
-    # the conversion's own deadline: a cancelled Windows page keeps running natively, so the deadline is the only
-    # bound, and the Session kills this process before it comes
-    deadline = time.monotonic() + left
     page, hint = ocr.read_page(g, eng, deadline, kind)
+    cut = time.monotonic() >= deadline
     if page is None:
-        if time.monotonic() >= deadline:  # cut by the time, not a page without text: nothing to keep
+        if cut:  # cut by the time, not a page without text: nothing to keep
             return {"id": jid, "ok": False}
         return {"id": jid, "ok": True, "page": None, "rules": [], "unread": None, "hint": hint}
     if kind != "page":
-        return {"id": jid, "ok": True, "page": asdict(page), "rules": [], "unread": None, "hint": hint}
-    turned = rotate(g, page.turn)  # the frame the page's boxes are in
-    thr = threshold(turned)
-    found = rules(turned, dpi, thr)
-    un = unread(turned, [(w.x, w.y, w.w, w.h) for w in page.words], found, thr)
-    return {"id": jid, "ok": True, "page": asdict(page), "rules": [list(b) for b in found],
-            "unread": {"share": un.share, "box": None if un.box is None else list(un.box), "area": un.area},
-            "hint": hint}
+        res = {"id": jid, "ok": True, "page": asdict(page), "rules": [], "unread": None, "hint": hint}
+    else:
+        turned = rotate(g, page.turn)  # the frame the page's boxes are in
+        thr = threshold(turned)
+        found = rules(turned, dpi, thr)
+        un = unread(turned, [(w.x, w.y, w.w, w.h) for w in page.words], found, thr)
+        res = {"id": jid, "ok": True, "page": asdict(page), "rules": [list(b) for b in found],
+               "unread": {"share": un.share, "box": None if un.box is None else list(un.box), "area": un.area},
+               "hint": hint}
+    if cut:
+        res["cut"] = True
+    return res
 
 
 def _skip(inp, n: int) -> bool:
@@ -76,10 +88,10 @@ def serve(inp=None, out=None) -> None:
         with out_lock:
             try:
                 ocr.write_frame(out, head)
-            except ValueError:  # over the frame cap, or not JSON: refused, answered as a failed job
+            except (ValueError, TypeError):  # over the frame cap, or not JSON: refused, answered as a failed job
                 try:
                     ocr.write_frame(out, {"id": head.get("id"), "ok": False})
-                except (OSError, ValueError):
+                except (OSError, ValueError, TypeError):
                     pass
             except OSError:  # the Session is gone; EOF on stdin ends this process
                 pass
@@ -98,8 +110,12 @@ def serve(inp=None, out=None) -> None:
             except Exception:  # noqa: BLE001 - an engine's OSError or anything else: this job fails, not the worker
                 res = {"id": head.get("id"), "ok": False}
             del body, item
-            send(res)
-            held.release()
+            try:
+                send(res)
+            except Exception:  # noqa: BLE001 - nothing more can be said for this job; the thread and its slot live on
+                pass
+            finally:
+                held.release()
 
     def give(item) -> None:
         with cond:
