@@ -63,10 +63,11 @@ def parse(path, ctx, **opts):
     return mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
 
 
-def convert(src, out_dir, hidden=False, **opts) -> dict:
+def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     """Convert src into out_dir/out.md, out_dir/assets/ and out_dir/meta.json.
 
-    Parsing and rendering run inside an OCR session (`ocr.opened`) when an OCR engine is here (`ocr.backend()`),
+    Parsing and rendering run inside an OCR session (`ocr.opened`) when an OCR engine is here: `backend`, the
+    (id, version) the caller keyed the read with, else `ocr.backend()`,
     its results cached per picture under the cache root; its deadline is PHRO_READER_DEADLINE's, none without it.
     meta.json then holds the OCR counts ("ocr"), and OCR_LATE among the warnings when the time left pages or
     pictures unread."""
@@ -81,7 +82,7 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
     ctx = Context()
     if FORMATS.get(ext_of(src)) in ("pdf", "djvu"):  # the page loop's deadline runs from the process start
         opts.setdefault("started", STARTED)
-    backend, store, deadline = ocr.backend(), None, None
+    backend, store, deadline = ocr.backend() if backend is None else backend, None, None
     if backend[0]:
         from . import cache, raster
         store = cache.OcrResults(cache.root() / cache.OCR)

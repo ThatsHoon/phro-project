@@ -1,60 +1,13 @@
-"""Tesseract as an OCR engine: found by a PATH scan, fed a PNG the reader encoded on stdin, read back as inline TSV."""
+"""Tesseract as an OCR engine: found by `ocr_probe.find`, fed a PNG the reader encoded on stdin, read back as inline TSV."""
 import math
 import os
-import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Iterable
-from pathlib import Path
 
 from . import images
 from .ocr import OcrPage, Word
-
-
-def find() -> Path | None:
-    """`PHRO_READER_TESSERACT` when it names a file, else `tesseract` on PATH. Nothing is run. A variable that is
-    set but names no file gives None: the user pointed somewhere specific."""
-    env = os.environ.get("PHRO_READER_TESSERACT")
-    if env:
-        p = Path(env)
-        return p if p.is_file() else None
-    found = shutil.which("tesseract")
-    return Path(found) if found else None
-
-
-def tessdata(exe: Path) -> Path | None:
-    env = os.environ.get("TESSDATA_PREFIX")
-    if env:
-        return Path(env)
-    return Path(exe).parent / "tessdata"
-
-
-def langs(exe) -> frozenset[str]:
-    """The stems of `*.traineddata` in the tessdata folder, by listing only."""
-    d = tessdata(Path(exe))
-    try:
-        return frozenset(p.stem for p in d.glob("*.traineddata")) if d is not None else frozenset()
-    except OSError:
-        return frozenset()
-
-
-def _stamp(p: Path) -> str:
-    try:
-        st = p.stat()
-        return f"{st.st_size}:{st.st_mtime_ns}"
-    except OSError:
-        return "0:0"
-
-
-def version(exe, used: Iterable[str]) -> str:
-    """`size:mtime_ns` of the executable and of each traineddata used, joined with `/`, in sorted language order."""
-    exe = Path(exe)
-    parts = [_stamp(exe)]
-    d = tessdata(exe)
-    for lang in sorted(used):
-        parts.append(_stamp(d / f"{lang}.traineddata") if d is not None else "0:0")
-    return "/".join(parts)
+from .ocr_probe import find, version
 
 
 def parse_tsv(text: str) -> list[Word]:

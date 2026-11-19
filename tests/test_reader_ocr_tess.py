@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import images, ocr_tess  # noqa: E402
+from reader import images, ocr_probe, ocr_tess  # noqa: E402
 from reader.ocr_pixels import Gray  # noqa: E402
 from ocr_fix import cer, load, truth  # noqa: E402
 
@@ -151,9 +151,9 @@ def test_find_uses_env():
             f = Path(d) / "tesseract.exe"
             f.write_bytes(b"")
             os.environ["PHRO_READER_TESSERACT"] = str(f)
-            assert ocr_tess.find() == f
+            assert ocr_probe.find() == f
             os.environ["PHRO_READER_TESSERACT"] = str(Path(d) / "missing.exe")
-            assert ocr_tess.find() is None
+            assert ocr_probe.find() is None
     finally:
         if old is None:
             os.environ.pop("PHRO_READER_TESSERACT", None)
@@ -161,9 +161,82 @@ def test_find_uses_env():
             os.environ["PHRO_READER_TESSERACT"] = old
 
 
+def _executable(p: Path) -> Path:
+    p.write_bytes(b"")
+    p.chmod(0o755)
+    return p
+
+
+def test_find_only_absolute_path_entries():
+    """A stray Tesseract in the working folder, or on an empty, "." or relative PATH entry, is never found, even with
+    NoDefaultCurrentDirectoryInExePath unset; on Windows only `tesseract.exe` counts, not a .bat or .cmd on PATH. A
+    relative PHRO_READER_TESSERACT is no Tesseract either."""
+    keys = ("PATH", "PHRO_READER_TESSERACT", "NoDefaultCurrentDirectoryInExePath")
+    saved, cwd = {k: os.environ.get(k) for k in keys}, os.getcwd()
+    with tempfile.TemporaryDirectory() as d:
+        work, on_path = Path(d) / "work", Path(d) / "bin"
+        (work / "rel").mkdir(parents=True)
+        on_path.mkdir()
+        for folder in (work, work / "rel"):
+            for name in ("tesseract.bat", "tesseract.cmd", "tesseract.exe", "tesseract"):
+                _executable(folder / name)
+        _executable(on_path / "tesseract.bat")
+        _executable(on_path / "tesseract.cmd")
+        try:
+            os.chdir(work)
+            for k in keys[1:]:
+                os.environ.pop(k, None)
+            os.environ["PATH"] = os.pathsep.join(["", ".", "rel", str(on_path)])
+            assert ocr_probe.find() is None, ocr_probe.find()
+            os.environ["PHRO_READER_TESSERACT"] = "tesseract.exe"
+            assert ocr_probe.find() is None, ocr_probe.find()
+            del os.environ["PHRO_READER_TESSERACT"]
+            real = _executable(on_path / ("tesseract.exe" if sys.platform == "win32" else "tesseract"))
+            got = ocr_probe.find()
+            assert got is not None and got.is_absolute() and os.path.samefile(got, real), got
+        finally:
+            os.chdir(cwd)
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+def test_tessdata_found_off_windows():
+    """Without TESSDATA_PREFIX: <bin>/tessdata, else <prefix>/share/tessdata, else the newest
+    <prefix>/share/tesseract-ocr/<version>/tessdata that exists; None when none does. Found by listing only."""
+    saved = os.environ.pop("TESSDATA_PREFIX", None)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            top = Path(d)
+            exe = top / "bin" / "tesseract"
+            exe.parent.mkdir()
+            exe.write_bytes(b"")
+            assert ocr_probe.tessdata(exe) is None
+            versions = top / "share" / "tesseract-ocr"
+            for v in ("4.00", "5", "notes"):
+                (versions / v / "tessdata").mkdir(parents=True)
+            (versions / "10").mkdir()  # newest, but holds no tessdata
+            (versions / "5" / "tessdata" / "kor.traineddata").write_bytes(b"k")
+            assert ocr_probe.tessdata(exe) == versions / "5" / "tessdata", ocr_probe.tessdata(exe)
+            assert ocr_probe.langs(exe) == {"kor"}
+            (top / "share" / "tessdata").mkdir()
+            assert ocr_probe.tessdata(exe) == top / "share" / "tessdata"
+            (top / "bin" / "tessdata").mkdir()
+            assert ocr_probe.tessdata(exe) == top / "bin" / "tessdata"
+            os.environ["TESSDATA_PREFIX"] = str(versions / "4.00" / "tessdata")
+            assert ocr_probe.tessdata(exe) == versions / "4.00" / "tessdata"
+    finally:
+        if saved is None:
+            os.environ.pop("TESSDATA_PREFIX", None)
+        else:
+            os.environ["TESSDATA_PREFIX"] = saved
+
+
 def test_reads_english_fixture():
-    exe = ocr_tess.find()
-    if exe is None or "eng" not in ocr_tess.langs(exe):
+    exe = ocr_probe.find()
+    if exe is None or "eng" not in ocr_probe.langs(exe):
         print("skip: test_reads_english_fixture (needs tesseract)")
         return
     name = "en-times-11.150dpi"

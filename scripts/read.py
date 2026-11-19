@@ -130,13 +130,14 @@ def _image_id(fmt) -> str:
     return raster.backend()
 
 
-def _ocr_id(fmt) -> str:
-    """The OCR backend id of the cache key for format module `fmt`: the gate's own (gate.ocr_backend), worked out
-    from the engines' files, so the child files the read where the gate looks; none for mpp, which has no pictures."""
+def _ocr_id(fmt) -> tuple[str, str]:
+    """The OCR backend (id, version) for format module `fmt`: the gate's own probe (ocr_probe.backend), so the child
+    files the read where the gate looks; none for mpp, which has no pictures. Worked out once: the key carries it
+    (gate.ocr_key) and reader.convert opens its OCR session with it."""
     if fmt == "mpp":
-        return ""
-    from reader import gate
-    return gate.ocr_backend()
+        return "", ""
+    from reader import ocr_probe
+    return ocr_probe.backend()
 
 
 def cmd_convert(a) -> int:
@@ -150,6 +151,7 @@ def cmd_convert(a) -> int:
             reader.precheck(src)
             opts, engine = {}, ""
             fmt = reader.FORMATS.get(reader.ext_of(src))
+            opts["backend"] = _ocr_id(fmt)
             if fmt == "pdf":
                 engine = _engine_id("pdfium" if a.engine == "pdfium" else "native")
                 opts["engine"] = "native" if engine == "native" else "pdfium"
@@ -163,7 +165,11 @@ def cmd_convert(a) -> int:
                 out = Path(a.out)
                 reader.convert(src, out, a.hidden, **opts)
             else:
-                k = a.key if _is_key(a.key) else cache.key(src, engine, _image_id(fmt), _ocr_id(fmt))
+                if _is_key(a.key):
+                    k = a.key
+                else:
+                    from reader import gate
+                    k = cache.key(src, engine, _image_id(fmt), gate.ocr_key(opts["backend"]))
                 if "pages" in opts:
                     k += f"-p{a.pages[0]}-{a.pages[1]}"
                 if a.hidden:

@@ -1844,14 +1844,15 @@ def test_gate_image_venv_unverified_repair():
 @contextmanager
 def fake_tess(*langs):
     """OCR on, with a Tesseract found through PHRO_READER_TESSERACT (a file that is never run) and these
-    traineddata in its TESSDATA_PREFIX."""
+    traineddata in its TESSDATA_PREFIX, and a cache root of its own, which holds the probe's memo."""
     d = tmp()
     exe = d / "tesseract.exe"
     exe.write_bytes(b"not run")
     (d / "tessdata").mkdir()
     for lang in langs:
         (d / "tessdata" / f"{lang}.traineddata").write_bytes(lang.encode())
-    with envs(PHRO_READER_OCR=None, PHRO_READER_TESSERACT=exe, TESSDATA_PREFIX=d / "tessdata"):
+    with envs(PHRO_READER_OCR=None, PHRO_READER_TESSERACT=exe, TESSDATA_PREFIX=d / "tessdata",
+              PHRO_READER_CACHE=d / "cache"):
         yield exe
 
 
@@ -1868,44 +1869,130 @@ def patched(mod, **attrs):
 
 
 def test_backend_none_switch():
-    from reader import ocr
+    """PHRO_READER_OCR=none is no engine, and the memo is neither read nor written."""
+    from reader import cache, ocr, ocr_probe
     with fake_tess("eng"):
-        assert ocr.backend()[0].endswith("tess"), ocr.backend()
+        memo = cache.root() / ocr_probe.MEMO
         with envs(PHRO_READER_OCR="none"):
             assert ocr.backend() == ("", "")
+        assert not memo.exists()
+        assert ocr.backend()[0].endswith("tess"), ocr.backend()
+        assert memo.is_file()
+        with envs(PHRO_READER_OCR="none"):
+            memo.write_text("not json", encoding="utf-8")
+            assert ocr.backend() == ("", "") and gate.ocr_backend() == ""
+            assert memo.read_text(encoding="utf-8") == "not json"
 
 
 def test_backend_ids():
-    from reader import ocr, ocr_tess, ocr_win
+    from reader import ocr_probe
     d = tmp()
     dll = d / "Windows.Media.Ocr.dll"
     dll.write_bytes(b"dll")
+    (d / "OCR" / "ko-kr").mkdir(parents=True)
+    orp = d / "OCR" / "ko-kr" / "a.orp"
+    orp.write_bytes(b"orp!")
 
     def ids(folders, tess=None, dll_path=dll, recognizers=None):
-        listing = recognizers or (lambda: list(folders))
-        with patched(ocr_win, recognizers=listing, dll=lambda: dll_path), \
-                patched(ocr_tess, find=lambda: tess):
-            return ocr.backend()
+        listing = recognizers or (lambda deps=None: list(folders))
+        with patched(ocr_probe, recognizers=listing, dll=lambda: dll_path, _ocr_root=lambda: d / "OCR"), \
+                patched(ocr_probe, find=lambda: tess):
+            return ocr_probe.probe({})[:2]
 
-    with patched(ocr_win, recognizers=lambda: ["ko-kr"], dll=lambda: dll):
-        wv = ocr_win._version("ko-kr")
-    assert wv.startswith(f"3:{dll.stat().st_mtime_ns}/"), wv
+    wv = f"3:{dll.stat().st_mtime_ns}/4:{orp.stat().st_mtime_ns}"
     with fake_tess("kor", "osd") as exe:
         got = ids(["en-us", "ko-kr"])
         assert got == ("win-ko", wv), got
         assert ids(["en-us"])[0] == "win-en"
         both = ids(["en-us", "ko-kr"], exe)
-        assert both == ("win-ko+tess", wv + "+" + ocr_tess.version(exe, {"kor"})), both
-        assert ids([], exe) == ("tess", ocr_tess.version(exe, {"kor"}))
+        assert both == ("win-ko+tess", wv + "+" + ocr_probe.version(exe, {"kor"})), both
+        assert ids([], exe) == ("tess", ocr_probe.version(exe, {"kor"}))
         assert ids(["ko-kr"], exe, d / "no.dll")[0] == "tess"  # no Windows.Media.Ocr.dll: no Windows engine
         assert ids([]) == ("", "")
 
-        def broken():
+        def broken(deps=None):
             raise OSError("listing failed")
         assert ids([], exe, recognizers=broken)[0] == "tess"  # a probe that fails is that engine absent
         assert ids(["ko-kr"], d)[0] == "win-ko"  # a folder, not a Tesseract: absent
     with fake_tess("osd") as exe:  # neither kor nor eng: Tesseract is never used
         assert ids(["ko-kr"], exe)[0] == "win-ko"
+
+
+def test_backend_win_version_as_engine():
+    """The probe's Windows version is the one the Windows engine itself reports (ocr_win._version)."""
+    from reader import ocr_probe, ocr_win
+    folders = ocr_probe.recognizers()
+    if not folders or not ocr_probe.dll().is_file():
+        print("skip: test_backend_win_version_as_engine (needs Windows OCR)")
+        return
+    got = ocr_probe.probe({})[:2]
+    tag = next((f for f in folders if f.split("-")[0] == "ko"), folders[0])
+    assert got[0].split("+")[0] == "win-" + tag.split("-")[0], got
+    assert got[1].split("+")[0] == ocr_win._version(tag), (got, ocr_win._version(tag))
+
+
+def test_backend_memo():
+    """The id is kept in a memo under the cache root: the same id on every call, with no probe while the memo holds,
+    a new id once a traineddata the id rests on changes, a memo that does not parse probed again, and no process
+    started."""
+    from reader import cache, ocr_probe
+    started = []
+
+    def refuse(*a, **k):
+        started.append(a)
+        raise AssertionError("a process was started")
+    with fake_tess("eng") as exe, patched(subprocess, Popen=refuse, run=refuse):
+        first = gate.ocr_backend()
+        assert "tess:" in first, first
+        probes = []
+        real = ocr_probe.probe
+
+        def counted(deps):
+            probes.append(1)
+            return real(deps)
+        with patched(ocr_probe, probe=counted):
+            assert gate.ocr_backend() == first and gate.ocr_backend() == first
+            assert probes == [], probes
+            eng = exe.parent / "tessdata" / "eng.traineddata"
+            st = eng.stat()
+            os.utime(eng, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+            second = gate.ocr_backend()
+            assert second != first and "tess:" in second, (first, second)
+            assert gate.ocr_backend() == second and probes == [1], probes
+            (cache.root() / ocr_probe.MEMO).write_text("{", encoding="utf-8")
+            assert gate.ocr_backend() == second and probes == [1, 1], probes
+    assert started == [], started
+
+
+def test_backend_memo_rewalks_a_miss_daily():
+    """A PATH walk that found no Tesseract stands for a day; then PATH is walked again."""
+    from reader import cache, ocr_probe
+    d = tmp()
+    with envs(PHRO_READER_CACHE=d / "cache", PHRO_READER_OCR=None, PHRO_READER_TESSERACT=None, TESSDATA_PREFIX=None,
+              PATH=d / "bin"):
+        assert not ocr_probe.backend()[0].endswith("tess"), ocr_probe.backend()
+        (d / "bin" / "tessdata").mkdir(parents=True)
+        (d / "bin" / "tessdata" / "eng.traineddata").write_bytes(b"eng")
+        exe = d / "bin" / ("tesseract.exe" if sys.platform == "win32" else "tesseract")
+        exe.write_bytes(b"not run")
+        exe.chmod(0o755)
+        assert not ocr_probe.backend()[0].endswith("tess"), ocr_probe.backend()
+        memo = cache.root() / ocr_probe.MEMO
+        m = json.loads(memo.read_text(encoding="utf-8"))
+        m["walked"] -= 2 * 86400
+        memo.write_text(json.dumps(m), encoding="utf-8")
+        assert ocr_probe.backend()[0].endswith("tess"), ocr_probe.backend()
+
+
+def test_gate_ocr_id_imports_light():
+    """The gate works out the OCR id without importing reader.ocr or the engine modules."""
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); from reader import gate, cache; gate.ocr_backend(); "
+            "print(sorted(m for m in sys.modules if m.startswith('reader.ocr') and m != 'reader.ocr_probe'))")
+    env = dict(os.environ, PHRO_READER_CACHE=str(tmp()))
+    env.pop("PHRO_READER_OCR", None)
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, str(HERE / "scripts")],
+                       capture_output=True, text=True, encoding="utf-8", env=env)
+    assert r.returncode == 0 and r.stdout.strip() == "[]", (r.stdout, r.stderr)
 
 
 def test_backend_runs_no_process():

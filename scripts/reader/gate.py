@@ -368,12 +368,17 @@ def image_backend(venv=None):
     return pyenv.engine(kind="image", venv=venv if venv is not None else pyenv.venv_dir("image"))
 
 
-def ocr_backend():
-    """The OCR backend id and version in the key of every format but mpp: `ocr.backend()` joined with ":", from the
-    engines' files alone; "" with no engine. The convert child keys with this same function (read._ocr_id)."""
-    from reader import ocr
-    b = ocr.backend()
+def ocr_key(b) -> str:
+    """An OCR backend (id, version) as the cache key carries it: joined with ":"; "" with no engine."""
     return ":".join(b) if b[0] else ""
+
+
+def ocr_backend():
+    """The OCR backend id and version in the key of every format but mpp: `ocr_probe.backend()` as `ocr_key`, from
+    the engines' files alone, without importing reader.ocr. The convert child keys with this same probe and
+    `ocr_key` (read._ocr_id)."""
+    from reader import ocr_probe
+    return ocr_key(ocr_probe.backend())
 
 
 def _offer_mark(event):

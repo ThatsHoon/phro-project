@@ -20,7 +20,7 @@ import read  # noqa: E402
 import ocr_fix  # noqa: E402
 import reader  # noqa: E402
 from pdf_fix import Ref, image_xobject, simple_pdf  # noqa: E402
-from reader import images, limits, ocr  # noqa: E402
+from reader import images, limits, ocr, ocr_probe  # noqa: E402
 from reader.formats import hwp_records as hr  # noqa: E402
 from reader.ocr_pixels import Gray  # noqa: E402
 from reader_fix import hwp_para, hwp_picture, hwp_record, make_hwp, make_zip  # noqa: E402
@@ -358,14 +358,14 @@ def test_read_cli_tiff_end_to_end():
     name = "ko-malgun-11.150dpi"
     path = tiff_file([ocr_fix.load(name)], dpi=150)
     out = tmp()
-    saved = ocr.backend
-    ocr.backend = lambda: backend
+    saved = ocr_probe.backend
+    ocr_probe.backend = lambda: backend
     try:
         with env(PHRO_READER_CACHE=str(tmp()), PHRO_READER_DEADLINE=None), \
                 contextlib.redirect_stdout(io.StringIO()) as printed:
             code = read.main(["convert", str(path), "--out", str(out)])
     finally:
-        ocr.backend = saved
+        ocr_probe.backend = saved
     assert code == 0 and printed.getvalue().strip() == str(out / "out.md"), printed.getvalue()
     text = (out / "out.md").read_text(encoding="utf-8")
     assert text.startswith(f"(1 scanned page read by OCR)\n\n{SCANNED}\n\n"), text[:200]
@@ -373,6 +373,31 @@ def test_read_cli_tiff_end_to_end():
     c = ocr_fix.cer(body, ocr_fix.truth(name))
     print(f"read.py convert on the ko fixture as a TIFF: CER {c:.4f}")
     assert c <= 0.03, c
+
+
+def test_convert_probes_ocr_once():
+    """read.py convert works the OCR id out once, for the key and for reader.convert, which opens its session with
+    that same id."""
+    calls, seen = [], []
+    saved = ocr_probe.backend, ocr.opened
+
+    def counted():
+        calls.append(1)
+        return "", ""
+
+    def opened(deadline, backend, **k):
+        seen.append(backend)
+        return saved[1](deadline, backend, **k)
+    ocr_probe.backend, ocr.opened = counted, opened
+    try:
+        for extra in ([], ["--out", str(tmp())]):
+            calls.clear()
+            seen.clear()
+            with env(PHRO_READER_CACHE=str(tmp())), contextlib.redirect_stdout(io.StringIO()):
+                code = read.main(["convert", str(docx(png(80, 80)))] + extra)
+            assert code == 0 and calls == [1] and seen == [("", "")], (extra, code, calls, seen)
+    finally:
+        ocr_probe.backend, ocr.opened = saved
 
 
 def _ko_backend():
