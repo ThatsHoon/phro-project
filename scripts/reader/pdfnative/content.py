@@ -141,10 +141,11 @@ class PageContent:
     segments: Sequence[Segment]
     short: Sequence[Segment]
     figure: tuple  # (union box or None, count of painted paths that gave no rule)
-    # (resource name, box, stream) in content order. The name is from the resources of the
-    # stream that drew it (a form has its own), so the resolved image XObject `stream` is what
-    # to read; it is None when the name does not resolve to a stream.
-    image_draws: List[Tuple[str, tuple, Optional[PDFStream]]]
+    # (resource name, box, stream, last text object) in content order. The name is from the
+    # resources of the stream that drew it (a form has its own), so the resolved image XObject
+    # `stream` is what to read; it is None when the name does not resolve to a stream. The last
+    # text object is the `obj` of the last one begun before the draw (-1 for none).
+    image_draws: List[Tuple[str, tuple, Optional[PDFStream], int]]
     objects: int  # page objects walked, forms included
     cut: Counter = field(default_factory=Counter)
     unmapped: int = 0  # text operators whose font could not be decoded (their text is gone)
@@ -331,7 +332,7 @@ class _Page:
         self.expanded = 0
         self.active = set()
         self.frags: List[Fragment] = []
-        self.image_draws: List[Tuple[str, tuple, Optional[PDFStream]]] = []
+        self.image_draws: List[Tuple[str, tuple, Optional[PDFStream], int]] = []
         self.text_object = -1
         self.positions_left = MAX_TRACKED_PAGE
         self.positions_cut = False
@@ -708,7 +709,7 @@ class _Page:
             box = (min(xs), min(ys), max(xs), max(ys))
             if _sane(*box) and box[2] > box[0] and box[3] > box[1]:
                 if self._in_clips(a, b, c, d, e, f):
-                    self.image_draws.append((name, box, stream))
+                    self.image_draws.append((name, box, stream, self.text_object))
         elif subtype == "Form":
             self._object()
             self._form(stream, resources, st, depth, off, frags, paths)

@@ -29,7 +29,9 @@ own image (`raster.gray`). The pixels go to the worker and the page's image is h
 after the line `_Scanned page, text by OCR._`; a trusted page drops its image (its bytes refunded),
 a picture area links its crop, a doubtful page links the image after its text, and a page OCR could
 not read (failed, or late at the session's stop) keeps today's image. The other images of a page
-OCR read, and a vector figure render holding the page's own text, are not read again as pictures.
+OCR read, a vector figure render holding the page's own text, and an image the page's own text
+lies under (`PageImage.under`: an OCR layer's scan, wherever the page draws it), are not read again
+as pictures.
 With OCR_QUEUE_BYTES of pixels already waiting, a page waits for room only until PDF_DEADLINE less
 PDF_PAGE_SECONDS: it then goes late, and OCR stops there for this read, every later page today's
 image. doc.meta["ocr"] holds the counts, and OCR_LATE joins the warnings when a page went late.
@@ -68,6 +70,10 @@ RENDER_DPI, CROP_DPI, RENDER_LONG = 110, 150, 1_568
 PDF_PAGE_DECODE_PIXELS = 4 * images._MAX_PIXELS
 SCAN_COVER = 0.5            # no chars and one image covering this share of the page: a scan
 OCR_COVER = 0.8             # invisible text over an image this big is an OCR layer, read as text
+# share of a page's chars that, drawn before an image and lying on it, make the image the scan of
+# the page's text layer (PageImage.under). Corpus: a scanned pdf's pages 0.82-1.0, labels an
+# image's box reaches on other pages at most 0.027
+TEXT_UNDER = 0.5
 FIGURE_PATHS = 32           # non-rule paths that make a vector figure
 FIGURE_COVER = 0.04         # share of the page the figure's paths must cover
 FIGURE_PAD = 6.0            # points added around the figure's union box
@@ -430,6 +436,7 @@ class _Reader:
             self._layout(keep, state)
 
     def _images(self, pd, turn, keep, state, scan):
+        under = {im.data for im in pd.images if im.under}
         shown = []
         for i, im in enumerate(pd.images):
             if im is scan or i in state["ocr"]:
@@ -442,7 +449,7 @@ class _Reader:
                 continue
             self.image_bytes += len(im.data)
             vb = _view_box(im.box, turn, pd.box)
-            shown.append((vb[3], vb[0], 1000 + i, Image(im.data)))
+            shown.append((vb[3], vb[0], 1000 + i, Image(im.data, ocr="page" if im.data in under else "")))
         keep.items.extend(shown)
 
     def _render(self, make):

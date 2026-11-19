@@ -773,6 +773,22 @@ def test_pdfium_scan_images_not_read_again():
     assert "_Scanned page, text by OCR._" in got["md"], got["md"]
 
 
+def test_pdfium_picture_under_text_layer_not_ocred():
+    """As through native: a picture under invisible text, or drawn over the page's text (an OCR layer), is not read
+    by the picture pass; one with a label drawn over it, or drawn over a label on a page of other text, is."""
+    picture = b"q 200 0 0 200 100 300 cm /Im1 Do Q "
+    stub = str(HERE / "tests" / "ocr_stub_worker.py")
+    inside = _SCAN.replace("\nwith tempfile.TemporaryDirectory() as tmp:\n",
+                           "\n    held = tempfile.TemporaryDirectory()\n    tmp = held.name\n")
+    for content, read in ((picture + text_ops("Layer words", x=150, y=400, extra=b"3 Tr"), False),
+                          (text_ops("Layer words", x=150, y=400) + b" " + picture, False),
+                          (picture + text_ops("Label", x=150, y=400), True),
+                          (text_ops("Label", x=150, y=400) + b" " + picture + text_ops("Other text here", y=700), True)):
+        data = with_image(content, image_xobject(64, 64, data=bytes(range(64)) * 64))
+        got = child(inside, data, stub, env=dict(os.environ, PHRO_OCR_STUB="{}"))
+        assert [k for _w, _h, k, _d in got["sent"]] == (["picture"] if read else []), (content, got["sent"])
+
+
 def test_pdfium_small_scan_not_sent():
     """A scanned page of 20 points, whose gray at OCR_DPI is under OCR_MIN_EDGE, is not read: today's image."""
     data = simple_pdf([b"q 20 0 0 20 0 0 cm /Im1 Do Q "], resources=dict(F1, XObject={"Im1": Ref(30)}),

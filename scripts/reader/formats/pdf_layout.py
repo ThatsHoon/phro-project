@@ -97,11 +97,40 @@ def across(frag: Fragment) -> float:
 @dataclass
 class PageImage:
     """One image on a page: its box, its viewable bytes (or None) and its pixel size.
-    `kind` is "jpg", "png", "jpx", "ccitt", "jbig2" or "raw"."""
+    `kind` is "jpg", "png", "jpx", "ccitt", "jbig2" or "raw". `under`: the page's own text lies
+    under it (`text_under`), as an OCR layer lies on its scan, so OCR would read that text again."""
     box: Tuple[float, float, float, float]
     data: Optional[bytes]
     px: Tuple[int, int]
     kind: str
+    under: bool = False
+
+
+def text_marks(frags):
+    """(fragment, its non-space chars, its centre x, y) of each fragment with text, for `text_under`."""
+    marks = []
+    for f in frags:
+        n = sum(1 for ch in f.text if not ch.isspace())
+        if n:
+            fb = box_of([f])
+            marks.append((f, n, (fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2))
+    return marks
+
+
+def text_under(box, marks, before, share) -> bool:
+    """Whether the page's text (`text_marks`) lies under an image drawn in `box`: an invisible
+    fragment has its centre in the box (hidden text laid on the image, read as pdf._hide reads
+    it), or the fragments drawn before the image (`before(fragment)`) with their centre in the box
+    hold at least `share` of the page's chars (the image is drawn over the page's text). A label
+    the image's box merely reaches holds a small share."""
+    total = sum(n for _f, n, _x, _y in marks)
+    held = 0
+    for f, n, cx, cy in marks:
+        if (f.invisible or before(f)) and box[0] <= cx <= box[2] and box[1] <= cy <= box[3]:
+            if f.invisible:
+                return True
+            held += n
+    return total > 0 and held >= share * total
 
 
 @dataclass

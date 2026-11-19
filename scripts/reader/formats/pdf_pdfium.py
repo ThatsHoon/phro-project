@@ -83,7 +83,7 @@ from ..pdfnative import annotations
 from ..pdfnative.cmap import encoding_wmode
 from ..pdfnative.objects import PDFStream
 from . import pdf as caps
-from .pdf_layout import LINE_TOLERANCE, Comment, Fragment, PageData, PageImage
+from .pdf_layout import LINE_TOLERANCE, Comment, Fragment, PageData, PageImage, text_marks, text_under
 from .pdf_tables import PDF_SEGMENTS, PathCollector
 
 FORM_DEPTH = 16                  # form XObject levels walked (pypdfium2 get_objects max_depth)
@@ -413,9 +413,10 @@ class PdfiumDoc:
         drop = None if self.native is None else self._guessed(index)
         textpage = page.get_textpage()
         try:
-            fragments, vertical, (unmapped, lost) = self._chars(textpage, cut, drop)
+            fragments, vertical, (unmapped, lost), objects = self._chars(textpage, cut, drop)
         finally:
             textpage.close()
+        own = fragments
         native = self._native_fragments(index, cut, vertical, bool(lost))
         if native is not None:
             fragments, unmapped = native
@@ -425,12 +426,17 @@ class PdfiumDoc:
                 cut["glyphs"] += 1
         chars = sum(1 for f in fragments for ch in f.text if not ch.isspace())
         collector = PathCollector()
-        drawn, whole = self._walk(page, collector, cut)
+        drawn, whole, texts = self._walk(page, collector, cut)
+        order = {i: texts[a] for a, i in objects.items() if a in texts}
+        marks = text_marks(own) if drawn else []
+
+        def under(at, image_box):
+            return text_under(image_box, marks, lambda f: order.get(f.obj, at) < at, caps.TEXT_UNDER)
         # every image the page draws, by its pixel size (no decode): a render decodes all of them,
         # so past PDF_PAGE_DECODE_PIXELS (or with the walk cut short, the total unknown) the page
         # has no render at all, and its images are decoded one by one within the budget
         budget = caps.PDF_PAGE_DECODE_PIXELS
-        total = sum(px[0] * px[1] for _obj, _m, px in drawn)
+        total = sum(px[0] * px[1] for _obj, _m, px, _at in drawn)
         renders = whole and total <= budget
         left = [budget]
 
@@ -441,7 +447,7 @@ class PdfiumDoc:
 
         # an image the budget refused has no data, so pdf.py counts it `image` as it does any
         # image it cannot take
-        shown, capped = self._images(drawn, box, chars, render, renders, left)
+        shown, capped = self._images(drawn, box, chars, render, renders, left, under)
         self.decoded += budget - left[0]
         if capped:
             cut["image"] += 1
@@ -508,15 +514,16 @@ class PdfiumDoc:
 
     def _chars(self, textpage, cut, drop):
         """(fragments, whether a vertical column was seen, (the chars dropped for having no
-        Unicode, the base font names they were in)); they are dropped in the fonts named in `drop`,
-        or in any font when it is None. A text object's direction is its char
-        matrix's x axis, unless its second char sits below its first along the glyph's up: a
+        Unicode, the base font names they were in), {text object address: its fragments' `obj`});
+        chars are dropped in the fonts named in `drop`, or in any font when it is None. A text
+        object's direction is its char matrix's x axis, unless its second char sits below its
+        first along the glyph's up: a
         vertical font, whose glyphs advance down the up axis; the object then reads with native's
         vertical axes (direction -up, up the x axis), which pdf_layout.vertical_lines takes."""
         tp = textpage.raw
         count = raw.FPDFText_CountChars(tp)
         if count <= 0:
-            return [], False, (0, set())
+            return [], False, (0, set()), {}
         limit = CHAR_SCAN * caps.PDF_PAGE_CHARS
         scan_cut = count > limit  # counted page_part only when the scan, not the char cap, stops
         if scan_cut:
@@ -727,7 +734,7 @@ class PdfiumDoc:
             cut["bad_coord"] += 1
         if scan_cut and not capped:
             cut["page_part"] += 1
-        return frags, vertical, (dropped, lost)
+        return frags, vertical, (dropped, lost), objects
 
     @staticmethod
     def _fragment(run, order):
@@ -757,10 +764,12 @@ class PdfiumDoc:
     # -- page objects
 
     def _walk(self, page, collector, cut):
-        """Paths into `collector`; ([(image handle, matrix, (width, height) pixels)] in content
-        order, whether every object was visited). Iterative, to FORM_DEPTH form levels and
-        pdf.PDF_PAGE_OBJECTS objects. The pixel size is read without decoding."""
-        images = []
+        """Paths into `collector`; ([(image handle, matrix, (width, height) pixels, its place)] in
+        content order, whether every object was visited, {text object address: its place}). A
+        place is the object's count in the walk, so it orders text and images as drawn. Iterative,
+        to FORM_DEPTH form levels and pdf.PDF_PAGE_OBJECTS objects. The pixel size is read without
+        decoding."""
+        images, texts = [], {}
         whole = True
         w, h = ctypes.c_uint(), ctypes.c_uint()
         visited = 0
@@ -783,6 +792,9 @@ class PdfiumDoc:
             if not obj:
                 continue
             kind = raw.FPDFPageObj_GetType(obj)
+            if kind == raw.FPDF_PAGEOBJ_TEXT:
+                texts[_address(obj)] = visited
+                continue
             if kind not in (raw.FPDF_PAGEOBJ_PATH, raw.FPDF_PAGEOBJ_IMAGE, raw.FPDF_PAGEOBJ_FORM):
                 continue
             m = _compose(_matrix(obj), outer)
@@ -791,14 +803,14 @@ class PdfiumDoc:
             elif kind == raw.FPDF_PAGEOBJ_IMAGE:
                 if not raw.FPDFImageObj_GetImagePixelSize(obj, w, h):
                     w.value = h.value = 0
-                images.append((obj, m, (w.value, h.value)))
+                images.append((obj, m, (w.value, h.value), visited))
             elif depth + 1 < FORM_DEPTH:
                 frames.append([obj, True, m, depth + 1, 0, raw.FPDFFormObj_CountObjects(obj)])
             elif not deep and raw.FPDFFormObj_CountObjects(obj) > 0:
                 deep = True
                 whole = False  # a render would still draw (and decode) what lies below
                 cut["page_part"] += 1
-        return images, whole
+        return images, whole, texts
 
     @staticmethod
     def _path(obj, m, collector, points):
@@ -836,15 +848,16 @@ class PdfiumDoc:
         op = b"B" if filled and stroke.value else b"f" if filled else b"S" if stroke.value else b"n"
         collector.operate(op, [], m)
 
-    def _images(self, drawn, crop, chars, render, renders, left):
+    def _images(self, drawn, crop, chars, render, renders, left, under):
         """(PageImages of the drawn images, whether past pdf.PDF_PAGE_IMAGES). At most PDF_PAGE_IMAGES images (the rest count `image`
         once). Bytes are not taken for images pdf.py leaves out anyway: under the size floor,
         or the page's scan, which pdf.py renders whole. A decode or a render takes its pixels
         from `left` (a one-item list, the page's budget): an image that would take it below
-        zero, or that needs a render on a page with none (`renders` false), is not decoded."""
+        zero, or that needs a render on a page with none (`renders` false), is not decoded.
+        `under(place, box)` tells whether the page's text lies under the image (PageImage.under)."""
         placed = []
         capped = False
-        for obj, m, px in drawn:
+        for obj, m, px, at in drawn:
             if len(placed) >= caps.PDF_PAGE_IMAGES:
                 capped = True
                 break
@@ -853,15 +866,15 @@ class PdfiumDoc:
                         max(p[0] for p in corners), max(p[1] for p in corners))
             if box is None:
                 continue
-            placed.append((obj, box, px))
+            placed.append((obj, box, px, at))
         scan = -1
         if chars == 0:
-            covers = [(caps._cover(box, crop), i) for i, (_o, box, _px) in enumerate(placed)]
+            covers = [(caps._cover(box, crop), i) for i, (_o, box, _px, _at) in enumerate(placed)]
             best = max(covers, default=(0.0, -1))
             if best[0] >= caps.SCAN_COVER:
                 scan = best[1]
         shown = []
-        for i, (obj, box, px) in enumerate(placed):
+        for i, (obj, box, px, at) in enumerate(placed):
             small = (min(px) < caps.IMAGE_MIN_PX
                      or min(box[2] - box[0], box[3] - box[1]) < caps.IMAGE_MIN_PT)
             if i == scan or small:
@@ -877,7 +890,7 @@ class PdfiumDoc:
                     raise
             except Exception:  # noqa: BLE001 - an image that cannot be taken counts `image` in pdf.py
                 data, kind = None, "raw"
-            shown.append(PageImage(box, data, px, kind))
+            shown.append(PageImage(box, data, px, kind, under(at, box)))
         return shown, capped
 
     @staticmethod

@@ -18,7 +18,7 @@ from collections import Counter
 from typing import Dict, List, Tuple
 
 from ..formats import pdf as caps
-from ..formats.pdf_layout import PageData, PageImage
+from ..formats.pdf_layout import PageData, PageImage, text_marks, text_under
 from ..limits import ReadError
 from . import annotations, images
 from .content import interpret
@@ -176,14 +176,16 @@ class NativeDoc:
             self._count_glyphs(cut, resources)
 
         shown: List[PageImage] = []
-        for _name, draw_box, stream in content.image_draws:
+        marks = text_marks(content.fragments) if content.image_draws else []
+        for _name, draw_box, stream, last in content.image_draws:
             if len(shown) >= caps.PDF_PAGE_IMAGES:
                 cut["image"] += 1
                 break
             if not isinstance(stream, PDFStream):
                 continue
             got = images.image(pdf, stream)
-            shown.append(PageImage(draw_box, got.data, got.px, got.kind))
+            under = text_under(draw_box, marks, lambda f: f.obj <= last, caps.TEXT_UNDER)
+            shown.append(PageImage(draw_box, got.data, got.px, got.kind, under))
 
         if _part_grew(before, pdf.cuts):
             cut["page_part"] += 1  # a structure cap fired while this page was read: read in part

@@ -889,6 +889,28 @@ def test_ocr_layer_page_not_ocred():
     assert doc.meta["ocr"]["pages"] == 0
 
 
+PICTURE = b"q 200 0 0 200 100 300 cm /Im1 Do Q "
+
+
+def test_picture_under_text_layer_not_ocred():
+    """A picture the page's own text lies under (invisible text over it, or most of the page's text drawn before it:
+    an OCR layer) is not read by OCR, its text being out already, nor is the same picture drawn again on that page;
+    a picture with a label drawn over it, one drawn over a label on a page of other text, or one with none, still
+    is."""
+    image = image_xobject(64, 64, data=bytes(range(64)) * 64)
+    body = text_ops("The page's own paragraph of text", y=700)
+    for content, read in ((PICTURE + text_ops("Layer words", x=150, y=400, extra=b"3 Tr"), False),
+                          (text_ops("Layer words", x=150, y=400) + b" " + PICTURE, False),
+                          (PICTURE + text_ops("Layer words", x=150, y=400) + b" " + PICTURE, False),
+                          (text_ops("Label", x=150, y=400) + b" " + PICTURE + body, True),
+                          (PICTURE + text_ops("Label", x=150, y=400), True),
+                          (PICTURE + text_ops("Caption", x=72, y=200), True)):
+        with ocr_stub() as (s, sent):
+            text, _, doc = md(with_image(content, image))
+        assert [k for _, _, k in sent] == (["picture"] if read else []), (content, sent)
+        assert "](assets/img-001.png)" in text, text
+
+
 def _image_bytes_at_after(data, **conf):
     """The reader's image bytes once OCR is collected (as `_after` starts), the Markdown and the Doc."""
     seen, real = [], pdf._Reader._after
