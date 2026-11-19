@@ -266,18 +266,10 @@ def judge(page: OcrPage, un: Unread) -> Verdict:
 
 def picture_lines(page: OcrPage) -> list[str]:
     """The text lines of a picture for `Picture text:`, in reading order; empty under OCR_MIN_WORDS words or past
-    OCR_JUNK. The order comes from `ocr_layout.reading_lines`; until that module exists, from the engine's lines."""
+    OCR_JUNK, in the order of `ocr_layout.reading_lines`."""
     if len(page.words) < limits.OCR_MIN_WORDS or junk_share(page) > limits.OCR_JUNK:
         return []
-    try:
-        from .ocr_layout import reading_lines
-    except ModuleNotFoundError as e:  # only the missing module itself, never an import error inside it
-        if e.name != f"{__package__}.ocr_layout":
-            raise
-        lines: dict[int, list[str]] = {}
-        for w in page.words:
-            lines.setdefault(w.line, []).append(w.text)
-        return [" ".join(ws) for _, ws in sorted(lines.items())]
+    from .ocr_layout import reading_lines
     return reading_lines(page)
 
 

@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from reader import limits, ocr  # noqa: E402
+from reader import limits, ocr, ocr_layout  # noqa: E402
 from reader.ocr import OcrPage, Word  # noqa: E402
 from reader.ocr_pixels import Gray, Unread, rotate  # noqa: E402
 
@@ -305,8 +305,7 @@ def test_picture_lines_need_two_words():
     one = page(["hello"])
     assert ocr.picture_lines(one) == []
     two = page(["hello", "world", "next", "line"], lines=[0, 0, 1, 1])
-    # interim expectation, from the engine's line order; Task 7 replaces it with ocr_layout.reading_lines
-    assert ocr.picture_lines(two) == ["hello world", "next line"], ocr.picture_lines(two)
+    assert ocr.picture_lines(two) == ocr_layout.reading_lines(two) == ["hello world", "next line"], ocr.picture_lines(two)
     assert ocr.picture_lines(page(["hello"] + JUNK)) == []
     saved = limits.OCR_MIN_WORDS
     limits.OCR_MIN_WORDS = 5
