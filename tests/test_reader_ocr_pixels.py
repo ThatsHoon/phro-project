@@ -3,14 +3,18 @@ picture-area box, and the time `rules` plus `unread` take on an A4 page at 200 d
 
 Run: python -I -X utf8 tests/test_reader_ocr_pixels.py
 """
+import json
+import random
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, ocr_pixels  # noqa: E402
 from reader.ocr_pixels import Gray  # noqa: E402
+from ocr_fix import DIR, load  # noqa: E402
 
 INK = 30
 
@@ -65,6 +69,17 @@ def test_threshold_splits_ink_and_paper():
     assert 60 < t < 200, t
 
 
+def test_threshold_paper_noise_has_no_ink():
+    """Paper with noise 248-255 and no ink: Otsu's two class means are under 40 levels apart, so nothing is dark."""
+    w, h = 400, 300
+    rnd = random.Random(11)
+    g = Gray(w, h, bytes(rnd.randrange(248, 256) for _ in range(w * h)))
+    t = ocr_pixels.threshold(g)
+    assert t == 0, t
+    u = ocr_pixels.unread(g, [], ocr_pixels.rules(g, 200, t), t)
+    assert u.share == 0.0 and u.box is None, u
+
+
 def test_grid_rules_found():
     g, _ = grid_page()
     thr = ocr_pixels.threshold(g)
@@ -91,22 +106,133 @@ def test_short_run_not_rule():
     fill(buf, w, 100, 500, 100 + int(0.04 * w), 501)
     g = Gray(w, h, bytes(buf))
     assert ocr_pixels.rules(g, 200, 128) == []
+    fill(buf, w, 300, 800, 300 + int(0.06 * w), 801)  # the positive control: 6 % of the width is a rule
+    assert ocr_pixels.rules(Gray(w, h, bytes(buf)), 200, 128) == [(300, 800, 360, 801)]
 
 
 def test_noise_row_stops_at_2000_runs():
-    """With the rule length lowered to 2 px, a row of 2100 two-pixel runs is scanned for its first 2000 only."""
-    w, h = 3 * 2100, 3
+    """With the rule length lowered to 2 px, a row of 2100 three-pixel runs is scanned for its first 2000 only."""
+    w, h = 4 * 2100, 3
     buf = blank(w, h)
-    buf[w:2 * w] = (b"\x00\x00\xff" * 2100)
+    buf[w:2 * w] = (b"\x00\x00\x00\xff" * 2100)
     g = Gray(w, h, bytes(buf))
-    saved = limits.OCR_RULE
-    limits.OCR_RULE = 0.0003  # ceil(0.0003 * 6300) == 2 along the rows, 1 down the columns
+    saved = limits.OCR_RULE, limits.OCR_RULES_MAX
+    limits.OCR_RULE = 0.0002  # ceil(0.0002 * 8400) == 2 along the rows, 1 down the columns
+    limits.OCR_RULES_MAX = 10**6
     try:
-        boxes = ocr_pixels.rules(g, 100, 128)  # at 100 dpi a rule is 1 px thick: the column pairs are not rules
+        # at 100 dpi a rule is at most 2 px thick: the 3-column groups are bars, not vertical rules
+        boxes = ocr_pixels.rules(g, 100, 128)
     finally:
-        limits.OCR_RULE = saved
+        limits.OCR_RULE, limits.OCR_RULES_MAX = saved
     assert len(boxes) == 2000, len(boxes)
-    assert all(b[1] == 1 and b[3] == 2 and b[2] - b[0] == 2 for b in boxes), boxes[:3]
+    assert all(b[1] == 1 and b[3] == 2 and b[2] - b[0] == 3 for b in boxes), boxes[:3]
+
+
+def test_too_many_rules_is_texture():
+    """More rules than OCR_RULES_MAX after the guards: the page is texture and gives none."""
+    w, h = 4 * 2100, 3
+    buf = blank(w, h)
+    buf[w:2 * w] = (b"\x00\x00\x00\xff" * 2100)
+    g = Gray(w, h, bytes(buf))
+    saved = limits.OCR_RULE, limits.OCR_RULES_MAX
+    limits.OCR_RULE, limits.OCR_RULES_MAX = 0.0002, 1999
+    try:
+        assert ocr_pixels.rules(g, 100, 128) == []
+        limits.OCR_RULES_MAX = 2000
+        assert len(ocr_pixels.rules(g, 100, 128)) == 2000
+    finally:
+        limits.OCR_RULE, limits.OCR_RULES_MAX = saved
+
+
+def test_rules_dpi_clamped():
+    """A non-finite dpi is read as OCR_DPI; a huge one as 1200, where a 40 px bar is still no rule."""
+    g, _ = grid_page()
+    assert ocr_pixels.rules(g, float("nan"), 128) == ocr_pixels.rules(g, limits.OCR_DPI, 128)
+    assert ocr_pixels.rules(g, float("inf"), 128) == ocr_pixels.rules(g, limits.OCR_DPI, 128)
+    w, h = 800, 600
+    buf = blank(w, h)
+    fill(buf, w, 100, 300, 700, 340)
+    bar = Gray(w, h, bytes(buf))
+    assert ocr_pixels.rules(bar, 1e9, 128) == []
+    assert ocr_pixels.rules(bar, 1e9, 128) == ocr_pixels.rules(bar, 1200, 128)
+
+
+def test_rule_thickness_from_limits():
+    """A 4 px rule is a rule at 150 dpi (1/40 inch is 4 px there); a 5 px one is not; the bound is read at call
+    time."""
+    w, h = 800, 600
+    buf = blank(w, h)
+    fill(buf, w, 100, 100, 700, 104)
+    fill(buf, w, 100, 300, 700, 305)
+    g = Gray(w, h, bytes(buf))
+    assert ocr_pixels.rules(g, 150, 128) == [(100, 100, 700, 104)]
+    saved = limits.OCR_RULE_THICK
+    limits.OCR_RULE_THICK = 1 / 25  # 6 px at 150 dpi
+    try:
+        assert len(ocr_pixels.rules(g, 150, 128)) == 2
+    finally:
+        limits.OCR_RULE_THICK = saved
+
+
+def speckled_photo(w=1400, h=1400, box=(200, 200, 1200, 1200), seed=7):
+    """A dark rectangle with 0-7 light specks a row at seeded places."""
+    x0, y0, x1, y1 = box
+    buf = blank(w, h)
+    rnd = random.Random(seed)
+    for y in range(y0, y1):
+        buf[y * w + x0:y * w + x1] = bytes([40]) * (x1 - x0)
+        for _ in range(rnd.randrange(0, 8)):
+            buf[y * w + rnd.randrange(x0, x1)] = 255
+    return Gray(w, h, bytes(buf))
+
+
+def holds(u, box, w, h):
+    x0, y0, x1, y1 = box
+    return (u.box is not None and u.box[0] <= x0 / w and u.box[1] <= y0 / h
+            and u.box[2] >= x1 / w and u.box[3] >= y1 / h)
+
+
+def test_speckled_photo_stays_unread():
+    box = (200, 200, 1200, 1200)
+    g = speckled_photo(box=box)
+    thr = ocr_pixels.threshold(g)
+    rb = ocr_pixels.rules(g, 200, thr)
+    u = ocr_pixels.unread(g, [], rb, thr)
+    assert u.share > limits.OCR_UNREAD, (u, len(rb))
+    assert holds(u, box, g.w, g.h), u
+
+
+def test_striped_photo_gives_no_rules():
+    """A dark rectangle with a light row every 4th row (banding, halftone) gives no rule inside it."""
+    w = h = 1400
+    x0, y0, x1, y1 = box = (200, 200, 1200, 1200)
+    buf = blank(w, h)
+    for y in range(y0, y1):
+        if (y - y0) % 4 != 3:
+            buf[y * w + x0:y * w + x1] = bytes([40]) * (x1 - x0)
+    g = Gray(w, h, bytes(buf))
+    thr = ocr_pixels.threshold(g)
+    for dpi in (150, 200, 300):
+        rb = ocr_pixels.rules(g, dpi, thr)
+        inside = [b for b in rb if b[0] < x1 and b[2] > x0 and b[1] < y1 and b[3] > y0]
+        assert inside == [], (dpi, len(inside), inside[:3])
+        u = ocr_pixels.unread(g, [], rb, thr)
+        assert holds(u, box, w, h), (dpi, u)
+
+
+def test_fixture_table_rules_and_unread():
+    """The spike's ruled table at 150 dpi: 8 horizontal and 6 vertical rules, and with the spike's words no ink is left
+    unread."""
+    name = "mix-table-malgun.150dpi"
+    g = load(name)
+    thr = ocr_pixels.threshold(g)
+    rb = ocr_pixels.rules(g, 150, thr)
+    hs, vs = horizontal(rb), vertical(rb)
+    assert len(hs) == 8 and len(vs) == 6, rb
+    spike = json.loads((DIR / f"{name}.win.json").read_text(encoding="utf-8"))
+    words = [(wd["x"], wd["y"], wd["w"], wd["h"]) for line in spike["lines"] for wd in line["words"]]
+    u = ocr_pixels.unread(g, words, rb, thr)
+    assert u.share == 0.0 and u.box is None, u
 
 
 def test_unread_zero_when_words_cover_ink():
@@ -200,10 +326,19 @@ def a4_page():
             x, y = left + 282 * c + 30, top + 90 * r + 35
             fill(buf, w, x, y, x + 120, y + 20)
             words.append((x, y, 120, 20))
+    rnd = random.Random(5)  # a speckled photo no word covers, below the table
+    for y in range(PHOTO[1], PHOTO[3]):
+        buf[y * w + PHOTO[0]:y * w + PHOTO[2]] = bytes([40]) * (PHOTO[2] - PHOTO[0])
+        for _ in range(rnd.randrange(0, 8)):
+            buf[y * w + rnd.randrange(PHOTO[0], PHOTO[2])] = 255
     return Gray(w, h, bytes(buf)), words
 
 
+PHOTO = (400, 2140, 1200, 2320)
+
+
 def test_speed_a4_200dpi():
+    """1654 is not a multiple of 4, so the photo's box runs `unread`'s padded grid."""
     g, words = a4_page()
     t0 = time.perf_counter()
     thr = ocr_pixels.threshold(g)
@@ -216,7 +351,8 @@ def test_speed_a4_200dpi():
     print(f"A4 200 dpi: threshold {t1 - t0:.3f}s, rules {t2 - t1:.3f}s ({len(boxes)} found), "
           f"unread {t3 - t2:.3f}s (share {u.share:.4f}); rules + unread {secs:.3f}s")
     assert len(horizontal(boxes)) == 9 and len(vertical(boxes)) == 6, boxes
-    assert u.share < 0.01, u
+    assert u.share > 0.1, u
+    assert holds(u, PHOTO, g.w, g.h) and u.box[1] > 2122 / g.h, u  # the box starts below the table
     assert secs < 1.0, secs
 
 

@@ -5,6 +5,7 @@ runs per pixel.
 """
 import math
 import re
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass
 
@@ -127,7 +128,6 @@ def rotate(g: Gray, turn: int) -> Gray:
 def box_pixels(w: int, h: int, box) -> tuple[int, int, int, int] | None:
     """A fractional box (x0, y0, x1, y1), y down, as whole pixels inside w x h, at least 1 x 1; None when a value is
     not a finite number."""
-    import math
     try:
         x0, y0, x1, y1 = (float(v) for v in box)
     except (TypeError, ValueError):
@@ -171,8 +171,9 @@ def _dark(thr: int) -> bytes:
 
 def threshold(g: Gray) -> int:
     """Otsu's threshold over a histogram of every 4th pixel: the value t such that pixels under t are ink. When a
-    span of cut points ties (a histogram gap between paper and ink), the middle of the span is taken. 128 for a page
-    of one value."""
+    span of cut points ties (a histogram gap between paper and ink), the middle of the span is taken. 0 (no pixel is
+    dark) when the two classes' means are under `_INK_GAP` levels apart: paper noise or a vignette, not ink. 128 for
+    a page of one value."""
     hist = Counter(g.data[::4])
     n = sum(hist.values())
     s = sum(v * c for v, c in hist.items())
@@ -191,7 +192,18 @@ def threshold(g: Gray) -> int:
             best, first, last = (num, den), k, k
         elif num * best[1] == best[0] * den:
             last = k
-    return 128 if first is None else (first + last) // 2 + 1
+    if first is None:
+        return 128
+    t = (first + last) // 2 + 1
+    n0 = sum(c for v, c in hist.items() if v < t)
+    s0 = sum(v * c for v, c in hist.items() if v < t)
+    n1, s1 = n - n0, s - s0
+    if s1 * n0 - s0 * n1 < _INK_GAP * n0 * n1:  # mean(paper) - mean(ink) < _INK_GAP, both sides times n0 * n1
+        return 0
+    return t
+
+
+_INK_GAP = 40  # levels the ink and paper means must differ by for a page to have ink
 
 
 _RUNS = 2000  # runs one row or column is scanned for: a noise page must not stall
@@ -213,10 +225,9 @@ def _runs(lines, n: int) -> list[list[tuple[int, int]]]:
     return out
 
 
-def _merge(lines: list[list[tuple[int, int]]], thick: int) -> list[tuple[int, int, int, int]]:
+def _merge(lines: list[list[tuple[int, int]]]) -> list[tuple[int, int, int, int]]:
     """Runs on adjacent lines merged when they overlap by at least 90 % of the longer one (each run is compared with
-    the runs of the line before only), as (start, end, first line, last line + 1): the merged groups at most `thick`
-    lines thick."""
+    the runs of the line before only), as groups (start, end, first line, last line + 1)."""
     done = []
     prev = []  # the line before: (start, end, group) for each run, a group being [lo, hi, first line, last line]
     for li, runs in enumerate(lines):
@@ -225,11 +236,14 @@ def _merge(lines: list[list[tuple[int, int]]], thick: int) -> list[tuple[int, in
             while j < len(prev) and prev[j][1] <= s:  # both lines' runs are sorted and disjoint
                 j += 1
             grp = None
-            for ps, pe, p in prev[j:j + 2]:
+            k = j
+            while k < len(prev) and prev[k][0] < e:  # every run of the line before that overlaps this one
+                ps, pe, p = prev[k]
                 ov = min(e, pe) - max(s, ps)
                 if ov > 0 and ov * 10 >= 9 * max(e - s, pe - ps) and p[3] != li:
                     grp = p
                     break
+                k += 1
             if grp is None:
                 grp = [s, e, li, li]
             else:
@@ -238,24 +252,133 @@ def _merge(lines: list[list[tuple[int, int]]], thick: int) -> list[tuple[int, in
         done.extend(p for _, _, p in prev if p[3] != li)
         prev = cur
     done.extend(p for _, _, p in prev)
-    return [(p[0], p[1], p[2], p[3] + 1) for p in done if p[3] + 1 - p[2] <= thick]
+    return [(p[0], p[1], p[2], p[3] + 1) for p in done]
+
+
+class _Near:
+    """Groups (lo, hi, first line, last line + 1) indexed by every line they occupy, each line's entries sorted by
+    lo, so the groups that overlap a span on a range of lines are found without scanning every group."""
+
+    def __init__(self, groups):
+        self.groups = groups
+        self.at: dict[int, list[tuple[int, int]]] = {}
+        for i, (lo, hi, l0, l1) in enumerate(groups):
+            for li in range(l0, l1):
+                self.at.setdefault(li, []).append((lo, i))
+        for entries in self.at.values():
+            entries.sort()
+        self.span = max((hi - lo for lo, hi, _, _ in groups), default=0)
+
+    def overlapping(self, lo: int, hi: int, first: int, stop: int) -> set[int]:
+        """The groups on lines first..stop-1 whose span overlaps lo..hi."""
+        out = set()
+        for li in range(first, stop):
+            entries = self.at.get(li)
+            if not entries:
+                continue
+            a = bisect_right(entries, (lo - self.span, len(self.groups)))  # an entry's hi is at most lo + span
+            b = bisect_left(entries, (hi, -1))
+            out.update(i for glo, i in entries[a:b] if self.groups[i][1] > lo)
+        return out
+
+
+def _coalesce(groups: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    """Groups whose lines touch or overlap joined into one, transitively, when their spans overlap by at least 90 %
+    of the shorter one. The spans compared are those of the blocks joined so far, so the anti-aliased edge row of a
+    rule rejoins it, and the fragments a speckled dark area splits into, its edge rows included, join into one thick
+    block."""
+    parent = list(range(len(groups)))
+    box = [list(g) for g in groups]  # each root's joined (lo, hi, first line, last line + 1)
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    near = _Near(groups)
+    order = sorted(range(len(groups)), key=lambda i: (groups[i][2], groups[i][0]))
+    pairs = [(i, j) for i in order for j in sorted(near.overlapping(*groups[i][:2], groups[i][2] - 1, groups[i][3] + 1))
+             if j != i]
+    for _ in range(_COALESCE_PASSES):  # again while anything joins: a block that grew may now hold an edge fragment
+        joined = False
+        for i, j in pairs:
+            ri, rj = root(i), root(j)
+            if ri == rj:
+                continue
+            a, b = box[ri], box[rj]
+            ov = min(a[1], b[1]) - max(a[0], b[0])
+            if ov * 10 >= 9 * min(a[1] - a[0], b[1] - b[0]):
+                parent[rj] = ri
+                a[0], a[1], a[2], a[3] = min(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), max(a[3], b[3])
+                joined = True
+        if not joined:
+            break
+    return [tuple(box[i]) for i in range(len(groups)) if parent[i] == i]
+
+
+_COALESCE_PASSES = 4  # passes over the touching pairs; a texture needs two or three, a ruled table one
+
+
+def _rules_along(lines: list[list[tuple[int, int]]], thick: int, dark) -> list[tuple[int, int, int, int]]:
+    """The rules among one direction's runs, as (lo, hi, first line, last line + 1). Runs merge into groups
+    (`_merge`), the groups coalesce (`_coalesce`), and a group is a rule when it is at most `thick` lines thick and
+    neither guard drops it:
+    - neighbour guard: the line just before it and the line just after it are both more than half dark along its
+      span (`dark(line, lo, hi)` counts; a line off the page is paper): it lies inside a dark area;
+    - stack guard: more than two other groups cover at least half its span within 2 * thick + 2 lines of it:
+      stripes, halftone or banding, never a ruled table's rules."""
+    groups = _coalesce(_merge(lines))
+    near = _Near(groups)
+    reach = 2 * thick + 2
+    out = []
+    for i, (lo, hi, l0, l1) in enumerate(groups):
+        if l1 - l0 > thick:
+            continue
+        span = hi - lo
+        if dark(l0 - 1, lo, hi) * 2 > span and dark(l1, lo, hi) * 2 > span:
+            continue
+        stack = 0
+        for j in near.overlapping(lo, hi, l0 - reach, l1 + reach):
+            if j != i and (min(hi, groups[j][1]) - max(lo, groups[j][0])) * 2 >= span:
+                stack += 1
+                if stack > 2:
+                    break
+        if stack <= 2:
+            out.append((lo, hi, l0, l1))
+    return out
 
 
 def rules(g: Gray, dpi: float, thr: int) -> list[tuple[int, int, int, int]]:
     """The ruled-table rules of a page as pixel boxes (x0, y0, x1, y1), y down, exclusive ends: horizontal rules
     first, then vertical ones. A rule is a dark run at least `OCR_RULE` of the page side long (rows: the width;
-    columns: the height); runs on adjacent rows (columns) that overlap by 90 % merge, and a merged run thicker than
-    1/100 inch is a bar, not a rule."""
+    columns: the height); runs on adjacent rows (columns) that overlap by 90 % merge, and a group thicker than
+    `OCR_RULE_THICK` inch (at least 2 px) is a bar, not a rule. Groups inside a dark area or stacked like stripes are
+    texture, not rules (`_rules_along`), and a page with more than `OCR_RULES_MAX` rules has none. `dpi` is clamped to
+    50-1200; a value that is not a finite number is read as `OCR_DPI`."""
+    try:
+        dpi = float(dpi)
+    except (TypeError, ValueError):
+        dpi = float(limits.OCR_DPI)
+    if not math.isfinite(dpi):
+        dpi = float(limits.OCR_DPI)
+    dpi = min(max(dpi, 50.0), 1200.0)
     w, h = g.w, g.h
     m = g.data.translate(_dark(thr))
-    thick = max(1, round(dpi / 100))
+    thick = max(2, round(dpi * limits.OCR_RULE_THICK))
+
+    def row_dark(r, lo, hi):
+        return m.count(1, r * w + lo, r * w + hi) if 0 <= r < h else 0
+
+    def col_dark(c, lo, hi):
+        return m[lo * w + c:(hi - 1) * w + c + 1:w].count(1) if 0 <= c < w else 0
+
     rows = _runs((m[r * w:(r + 1) * w] for r in range(h)), max(1, math.ceil(limits.OCR_RULE * w)))
+    out = sorted(((x0, y0, x1, y1) for x0, x1, y0, y1 in _rules_along(rows, thick, row_dark)),
+                 key=lambda b: (b[1], b[0]))
     cols = _runs((m[c::w] for c in range(w)), max(1, math.ceil(limits.OCR_RULE * h)))
-    out = [(x0, y0, x1, y1) for x0, x1, y0, y1 in _merge(rows, thick)]
-    out.sort(key=lambda b: (b[1], b[0]))
-    vert = [(x0, y0, x1, y1) for y0, y1, x0, x1 in _merge(cols, thick)]
-    vert.sort()
-    return out + vert
+    out += sorted((x0, y0, x1, y1) for y0, y1, x0, x1 in _rules_along(cols, thick, col_dark))
+    return [] if len(out) > limits.OCR_RULES_MAX else out
 
 
 @dataclass
