@@ -706,12 +706,14 @@ from reader import markdown, ocr
 from reader.formats import pdf
 from reader.model import Context
 data = sys.stdin.buffer.read()
+for name, value in json.loads(sys.argv[3] if len(sys.argv) > 3 else "{}").items():
+    setattr(pdf, name, value)
 ctx = Context()
 with ocr.opened(None, ("win-ko", "test"), cmd=[sys.executable, "-I", "-X", "utf8", sys.argv[2]]) as s:
     sent, real = [], s.submit
-    def submit(g, kind, dpi):
+    def submit(g, kind, dpi, until=None):
         sent.append([g.w, g.h, kind, dpi])
-        return real(g, kind, dpi)
+        return real(g, kind, dpi, until)
     s.submit = submit
     doc = pdf.parse_bytes(data, ctx, engine="pdfium")
 with tempfile.TemporaryDirectory() as tmp:
@@ -752,6 +754,41 @@ def test_pdfium_scan_read_by_ocr():
         assert got["assets"] == ([["img-001.png", 935, 1210]] if linked else []), got["assets"]
         assert got["meta"]["ocr"] == {"pages": 1, "doubtful": int(linked), "failed": 0, "stopped_at": None}
         assert not got["skipped"], got["skipped"]
+
+
+def test_pdfium_renders_counted_once_per_scan():
+    """The page PNG and the gray of one scanned page are one render: under PDF_RENDERS = 2 the first two pages go to
+    OCR and the third is counted `scan`."""
+    data = simple_pdf([FULL] * 3, resources=dict(F1, XObject={"Im1": Ref(30)}),
+                      extra_objects={30: image_xobject(64, 64, data=bytes(range(64)) * 64)})
+    stub = str(HERE / "tests" / "ocr_stub_worker.py")
+    got = child(_SCAN, data, stub, json.dumps({"PDF_RENDERS": 2}), env=dict(os.environ, PHRO_OCR_STUB="{}"))
+    assert got["sent"] == [[1700, 2200, "page", 200.0]] * 2, got["sent"]
+    assert got["meta"]["unrendered"] == [3] and got["skipped"] == {"scan": 1}, (got["meta"], got["skipped"])
+    assert got["md"].count("_Scanned page, text by OCR._") == 2, got["md"]
+
+
+def test_pdfium_unmapped_page_read_by_ocr():
+    """A page of glyphs without Unicode that OCR reads takes OCR's text in place of its own lines and ruled tables,
+    and its `glyphs` count goes; when OCR fails, the page is today's: its lines, its table and its image."""
+    cells = [("Alpha", 110, 540), ("Beta", 210, 540), ("Gamma", 110, 510), ("Delta", 210, 510)]
+    words = b" ".join(text_ops(t, x=x, y=y, size=10) for t, x, y in cells)
+    body = b" ".join(b"BT /F2 12 Tf 72 %d Td <0001000200030004> Tj ET" % (750 - 20 * i) for i in range(30))
+    data = simple_pdf([body + b" " + _grid_ops() + b" " + words + b" " + text_ops("Title", y=100)],
+                      resources=dict(F1, Font={"F1": Ref(3), "F2": Ref(100)}),
+                      extra_objects=font_type0(tounicode=None, ordering="Identity"))
+    stub = str(HERE / "tests" / "ocr_stub_worker.py")
+    got = child(_SCAN, data, stub, env=dict(os.environ, PHRO_OCR_STUB="{}"))
+    md = got["md"]
+    assert md.count("_Scanned page, text by OCR._") == 1 and "w1700" in md, md
+    assert "Title" not in md and "Alpha" not in md and "](assets/" not in md, md
+    assert not got["skipped"] and "without Unicode" not in md, (got["skipped"], md)
+    assert got["meta"]["ocr"] == {"pages": 1, "doubtful": 0, "failed": 0, "stopped_at": None}, got["meta"]
+    got = child(_SCAN, data, stub, env=dict(os.environ, PHRO_OCR_STUB=json.dumps({"die_after": 0})))
+    md = got["md"]
+    assert "Title" in md and "|Alpha|Beta|" in md and "![Page 1, text without Unicode](assets/img-001.png)" in md, md
+    assert "_Scanned page" not in md and got["skipped"] == {"glyphs": 1}, (got["skipped"], md)
+    assert got["meta"]["ocr"] == {"pages": 0, "doubtful": 0, "failed": 1, "stopped_at": None}, got["meta"]
 
 
 def main():

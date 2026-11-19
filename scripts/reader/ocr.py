@@ -206,8 +206,9 @@ def read_page(g: Gray, eng: Engines, deadline: float, kind: str) -> tuple[OcrPag
     engine gives a page. An engine's OSError is not caught here: the worker catches it per job.
 
     The returned page's `w`, `h` and boxes are in the frame of `rotate(g, page.turn)`. The caller computes the page's
-    `threshold`, `rules` and `Unread` on that turned bitmap, so `judge`'s `Verdict.box` is in the same frame; the page
-    image or crop shown for a turned page is cut from that turned bitmap too.
+    `threshold`, `rules` and `Unread` on that turned bitmap, so `judge`'s `Verdict.box` is in the same frame. The
+    picture shown is cut from the image as it is stored, not from the turned bitmap: the caller turns the box back
+    first (`pdf._unturned`).
     """
     if kind not in ("page", "picture"):
         raise ValueError(f"kind {kind!r}")
@@ -599,8 +600,9 @@ class Session:
     """The conversion's link to its OCR worker process, started on first need and once per conversion.
 
     `submit` files a picture or page and returns at once, unless more than OCR_QUEUE_BYTES of pixels already wait
-    for the worker: it then waits for room, at most until the stop, and a page still waiting then is "late" without
-    being queued. `wait` gives its Result. A result in `store` (a `cache.OcrResults`, or any object with `get(key)`
+    for the worker: it then waits for room until the caller's `until`, and at most until the stop. A page still
+    waiting at `until` is "late" at once, not queued, and the session goes on; one still waiting at the stop expires
+    the session. `wait` gives its Result. A result in `store` (a `cache.OcrResults`, or any object with `get(key)`
     and `put(key, dict)`) is taken from there without the worker, and each "done" one is filed there (decision 12).
     Frames go to the worker from a writer thread and come back to one reader thread, which matches answers to tickets
     by id: they come in any order.
@@ -662,7 +664,10 @@ class Session:
             self.late = True
         self._cond.notify_all()
 
-    def submit(self, g: Gray, kind: str, dpi: float) -> Ticket:
+    def submit(self, g: Gray, kind: str, dpi: float, until: float | None = None) -> Ticket:
+        """A ticket for `g`. Over OCR_QUEUE_BYTES, waits for room until `until` (a time.monotonic() value; None: no
+        bound of its own), and at most until the stop: still over budget at `until`, the ticket is "late" at once,
+        its pixels not queued and the session going on; at the stop, the session expires."""
         if kind not in ("page", "picture"):
             raise ValueError(f"kind {kind!r}")
         try:
@@ -674,15 +679,19 @@ class Session:
         key = picture_key(g, *self.backend, kind=kind, dpi=dpi)
         t = Ticket(next(self._ids), kind, key, dpi)
         hit = self._cached(key, kind)
-        expire = False
+        expire = full = False
+        end = self._stop() if until is None else min(float(until), self._stop())
         with self._cond:
             while hit is None and self._state == "running" and self._queued > limits.OCR_QUEUE_BYTES:
-                left = self._stop() - time.monotonic()
+                left = end - time.monotonic()
                 if left <= 0:
+                    full = True
                     break
                 self._cond.wait(min(left, 3600.0))
             if hit is not None:
                 self._file(t, hit)
+            elif full and time.monotonic() < self._stop():
+                self._file(t, Result("late"))
             elif self._state == "over" or time.monotonic() >= self._stop():
                 self._open[t.id] = t
                 expire = True
@@ -849,6 +858,11 @@ class Session:
             proc.wait(2)
         except Exception:  # noqa: BLE001 - TimeoutExpired: nothing more can be done from here
             pass
+
+    def peek(self, t: Ticket) -> Result | None:
+        """`t`'s Result when it is settled, else None, without waiting."""
+        with self._cond:
+            return self._done.get(t.id)
 
     def wait(self, t: Ticket) -> Result:
         """`t`'s Result, waiting at most until `deadline - FIGURE_RESERVE`; then the worker is killed and every open

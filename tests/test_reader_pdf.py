@@ -641,13 +641,13 @@ def test_unmapped_font_garble_warning():
         src = Path(tmp) / "a.pdf"
         src.write_bytes(simple_pdf([body], resources=res,
                                    extra_objects=font_type0(tounicode=None, ordering="Identity")))
-        meta = reader.convert(src, Path(tmp) / "o1")
+        meta = reader.convert(src, Path(tmp) / "o1", started=time.monotonic())
         assert "1 text run without Unicode" in meta["unread"], meta
         assert "garbled" not in meta["warnings"], meta
         src2 = Path(tmp) / "b.pdf"
         src2.write_bytes(simple_pdf([b"BT /F2 12 Tf 72 700 Td <0001> Tj ET"], resources=res,
                                     extra_objects=font_type0(tounicode={1: "�" * 12})))
-        meta = reader.convert(src2, Path(tmp) / "o2")
+        meta = reader.convert(src2, Path(tmp) / "o2", started=time.monotonic())
         assert "garbled" in meta["warnings"], meta
         assert json.loads((Path(tmp) / "o2" / "meta.json").read_text(encoding="utf-8"))["warnings"] == meta["warnings"]
 
@@ -686,7 +686,7 @@ def test_comment_newlines_stay_in_line():
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "a.pdf"
         src.write_bytes(_spoof_pdf())
-        meta = reader.convert(src, Path(tmp) / "o")
+        meta = reader.convert(src, Path(tmp) / "o", started=time.monotonic())
         text = (Path(tmp) / "o" / "out.md").read_text(encoding="utf-8")
     assert re.findall(r"^## Page.*$", text, re.M) == ["## Page 1", "## Page 2"], text
     assert meta["pages"] == [[1, 1], [2, text.splitlines().index("## Page 2") + 1]], meta["pages"]
@@ -772,23 +772,22 @@ def counting(s):
     """The (w, h, kind, dpi) of every page `s` is given from now on."""
     sent, real = [], s.submit
 
-    def submit(g, kind, dpi):
+    def submit(g, kind, dpi, until=None):
         sent.append((g.w, g.h, kind, dpi))
-        return real(g, kind, dpi)
+        return real(g, kind, dpi, until)
 
     s.submit = submit
     return sent
 
 
 def fixture_gray():
-    """The Korean fixture's gray at a quarter of its size: the stand-in worker never reads it, and a small page keeps
-    this file's run short."""
-    return fit(ocr_fix.load(KO), None, max_side=440)
+    """The Korean fixture's gray."""
+    return ocr_fix.load(KO)
 
 
-def fixture_scan(pages=1):
-    """A pdf of `pages` Letter pages, each `fixture_gray()` as a full-page Flate image; and the gray."""
-    g = fixture_gray()
+def fixture_scan(pages=1, g=None):
+    """A pdf of `pages` Letter pages, each `g` (`fixture_gray()` if None) as a full-page Flate image; and the gray."""
+    g = g or fixture_gray()
     data = simple_pdf([FULL] * pages, resources=dict(F1, XObject={"Im1": Ref(30)}),
                       extra_objects={30: image_xobject(g.w, g.h, data=g.data)})
     return data, g
@@ -797,14 +796,14 @@ def fixture_scan(pages=1):
 def canned(g, unread=None):
     """A worker answer for a page of `g`'s size: two paragraphs, the first on two lines."""
     def line(texts, y, n):
-        out, x = [], 20
+        out, x = [], 100
         for t in texts:
-            out.append({"text": t, "x": x, "y": y, "w": 8 * len(t), "h": 10, "line": n, "conf": None})
-            x += 8 * len(t) + 6
+            out.append({"text": t, "x": x, "y": y, "w": 24 * len(t), "h": 30, "line": n, "conf": None})
+            x += 24 * len(t) + 18
         return out
 
-    words = (line(["Alpha", "beta", "gamma"], 50, 0) + line(["delta", "epsilon"], 64, 1)
-             + line(["Second", "paragraph", "here"], 150, 2))
+    words = (line(["Alpha", "beta", "gamma"], 200, 0) + line(["delta", "epsilon"], 240, 1)
+             + line(["Second", "paragraph", "here"], 400, 2))
     page = {"w": g.w, "h": g.h, "words": words, "angle": 0.0, "turn": 0, "engine": "stub", "version": "1"}
     return {"page": page, "rules": [], "unread": unread or {"share": 0.0, "box": None, "area": 0.0}}
 
@@ -881,6 +880,26 @@ def test_late_pages_are_images_and_named():
     assert doc.warnings == [limits.OCR_LATE] and not ctx.skipped, (doc.warnings, ctx.skipped)
 
 
+def test_full_queue_stops_ocr_not_the_page_loop():
+    """Past OCR_QUEUE_BYTES a page waits for room only until the loop's deadline less a page's time: that page is then
+    late, OCR stops there for this read, and every page still comes out, the rest as images."""
+    data, g = fixture_scan(pages=8, g=fit(fixture_gray(), None, max_side=440))  # small: 8 pages stay quick
+    saved = limits.OCR_QUEUE_BYTES
+    limits.OCR_QUEUE_BYTES = 1
+    try:
+        deadline = time.monotonic() + limits.FIGURE_RESERVE + 10
+        with patched(pdf, "PDF_DEADLINE", 3.0), ocr_stub(deadline=deadline, delay=1, answer=canned(g)) as s:
+            sent = counting(s)
+            text, ctx, doc = md(data, started=time.monotonic())
+    finally:
+        limits.OCR_QUEUE_BYTES = saved
+    stop = doc.meta["ocr"]["stopped_at"]
+    assert not ctx.skipped and stop is not None, (ctx.skipped, doc.meta["ocr"])
+    assert len(sent) == stop and doc.meta["ocr"]["pages"] == stop - 1, (len(sent), doc.meta["ocr"])
+    assert text.count(SCANNED) == stop - 1 and text.count("![Scanned page") == 9 - stop, text
+    assert doc.warnings == [limits.OCR_LATE], doc.warnings
+
+
 def test_ocr_layer_page_not_ocred():
     content = FULL + text_ops("Scanned words", y=400, extra=b"3 Tr")
     with ocr_stub() as s:
@@ -891,7 +910,7 @@ def test_ocr_layer_page_not_ocred():
 
 
 def _image_bytes_at_after(data, **conf):
-    """The reader's image bytes once OCR is collected (as `_after` starts), and the Markdown."""
+    """The reader's image bytes once OCR is collected (as `_after` starts), the Markdown and the Doc."""
     seen, real = [], pdf._Reader._after
 
     def after(self, kept):
@@ -899,17 +918,37 @@ def _image_bytes_at_after(data, **conf):
         return real(self, kept)
 
     with patched(pdf._Reader, "_after", after), ocr_stub(**conf):
-        text, _, _ = md(data)
-    return seen[0], text
+        text, _, doc = md(data)
+    return seen[0], text, doc
 
 
 def test_trusted_page_refunds_image_bytes():
     data, g = fixture_scan()
-    trusted, text = _image_bytes_at_after(data, answer=canned(g))
+    trusted, text, _ = _image_bytes_at_after(data, answer=canned(g))
     assert trusted == 0 and "![" not in text, (trusted, text)
-    doubtful, text = _image_bytes_at_after(data, answer=canned(g, {"share": 0.5, "box": None, "area": 0.0}))
+    doubtful, text, _ = _image_bytes_at_after(data, answer=canned(g, {"share": 0.5, "box": None, "area": 0.0}))
     page_png = md_assets(data)[3]["img-001.png"]
     assert doubtful == len(page_png) and "![Scanned page 1]" in text, (doubtful, len(page_png))
+
+
+def test_ocr_answer_that_raises_leaves_the_page_as_today():
+    """A step of placing an OCR answer that raises, before or after the page image's refund, leaves the page as it
+    was: today's image, still charged, no OCR text; the page counts as failed."""
+    from reader import ocr_layout
+    data, g = fixture_scan()
+    page_png = md_assets(data)[3]["img-001.png"]
+
+    def boom(*a, **kw):
+        raise RuntimeError("boom")
+
+    photo = {"share": 0.02, "box": [0.1, 0.18, 0.7, 0.68], "area": 0.3}
+    for obj, name, unread in ((ocr_layout, "segments", None), (images, "png_crop", photo)):
+        with patched(obj, name, boom):
+            charged, text, doc = _image_bytes_at_after(data, answer=canned(g, unread))
+        assert text == ("(could not read: 1 page read in part)\n\n"
+                        "## Page 1\n\n![Scanned page 1](assets/img-001.png)\n"), (name, text)
+        assert charged == len(page_png), (name, charged, len(page_png))
+        assert doc.meta["ocr"] == {"pages": 0, "doubtful": 0, "failed": 1, "stopped_at": None}, (name, doc.meta)
 
 
 def test_renders_counted_once_per_page():
@@ -934,16 +973,8 @@ def test_no_session_output_unchanged():
                       resources=dict(F1, XObject={"Im1": Ref(30), "Im2": Ref(31)}),
                       extra_objects={30: image_xobject(g.w, g.h, data=g.data),
                                      31: image_xobject(8, 8, data=JPEG, filter="DCTDecode")})
-    old = os.environ.get("PHRO_READER_OCR")
-    os.environ["PHRO_READER_OCR"] = "none"
-    try:
-        assert ocr.session() is None
-        text, ctx, doc = md(data)
-    finally:
-        if old is None:
-            os.environ.pop("PHRO_READER_OCR", None)
-        else:
-            os.environ["PHRO_READER_OCR"] = old
+    assert ocr.session() is None
+    text, ctx, doc = md(data)
     assert text == NO_OCR, text
     assert not ctx.skipped and "ocr" not in doc.meta, doc.meta
 
@@ -955,15 +986,33 @@ def test_native_scan_uses_page_image():
     decoded, real = [], raster.gray
 
     def gray(data, **kw):
-        decoded.append(data)
+        decoded.append((data, kw.get("deadline")))
         return real(data, **kw)
 
-    with patched(raster, "gray", gray), ocr_stub() as s:
+    deadline = time.monotonic() + 60
+    with patched(raster, "gray", gray), ocr_stub(deadline=deadline) as s:
         sent = counting(s)
         text, _, doc = md(with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode")))
-    assert decoded == [JPEG], decoded
+    assert decoded == [(JPEG, deadline - limits.FIGURE_RESERVE)], decoded
     assert len(sent) == 1 and sent[0][:3] == (8, 8, "page"), sent
     assert text == f"## Page 1\n\n{SCANNED}\n\nw8\n", text
+    assert doc.meta["ocr"]["pages"] == 1
+
+
+def test_native_jpeg_scan_photo_cropped():
+    """A native JPEG scan with a photo on 30 % of it links a crop of that photo, cut from the pixels the reader
+    decodes, not the whole page."""
+    if sys.platform != "win32":
+        print("skip: test_native_jpeg_scan_photo_cropped (needs GDI+)")
+        return
+    data = with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode"))
+    g = raster.gray(JPEG)[0]
+    box = [0.1, 0.18, 0.7, 0.68]
+    with ocr_stub(answer=canned(g, {"share": 0.02, "box": box, "area": 0.3})):
+        text, _, doc, assets = md_assets(data)
+    x0, y0, x1, y1 = box_pixels(g.w, g.h, box)
+    assert "![Picture on page 1](assets/img-001.png)" in text, text
+    assert dims(assets) == {"img-001.png": (x1 - x0, y1 - y0)}, dims(assets)
     assert doc.meta["ocr"]["pages"] == 1
 
 

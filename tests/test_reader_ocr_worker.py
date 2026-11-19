@@ -404,6 +404,32 @@ def test_submit_waits_while_queued_pixels_pass_the_budget():
             limits.OCR_QUEUE_BYTES = saved
 
 
+def test_submit_over_budget_past_until_is_late_at_once():
+    """Over OCR_QUEUE_BYTES, a submit waits only until its `until`: then its ticket is late at once, its pixels not
+    queued, and the session reads on what it has."""
+    saved = limits.OCR_QUEUE_BYTES
+    limits.OCR_QUEUE_BYTES = 1
+    try:
+        with stub(delay=1):
+            s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + 20, BACKEND, cmd=STUB)
+            try:
+                earlier, late = [], None
+                for k in range(6):
+                    queued, t0 = len(s._queue), time.monotonic()
+                    t = s.submit(gray(1000 + k, 300), "page", 200.0, until=t0 + 0.5)
+                    if s.peek(t) is not None:
+                        late = (s.peek(t).status, time.monotonic() - t0, len(s._queue) - queued)
+                        break
+                    earlier.append(t)
+                assert late is not None and late[0] == "late" and late[1] < 3.0 and late[2] == 0, late
+                assert s._state == "running" and earlier, (s._state, earlier)
+                assert [s.wait(t).status for t in earlier] == ["done"] * len(earlier)
+            finally:
+                s.close()
+    finally:
+        limits.OCR_QUEUE_BYTES = saved
+
+
 def test_opened_sets_session():
     assert ocr.session() is None
     with ocr.opened(time.monotonic() + 60, ("", "")) as s:
