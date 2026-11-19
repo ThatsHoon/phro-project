@@ -30,7 +30,7 @@ from pathlib import Path
 
 from .. import images, limits
 from ..limits import ReadError
-from ..model import Doc, Heading, Image, Link, Para, Section, Text
+from ..model import Doc, Image, Para, Section, Text
 from . import pdf_layout, pdf_tables
 
 PDF_PAGE_OBJECTS = 100_000  # page objects (text, path, image, form) interpreted per page
@@ -135,10 +135,6 @@ def _dpi(box, dpi) -> float:
 
 def _norm(text: str) -> str:
     return " ".join(text.split()).casefold()
-
-
-def _inlines(ln):
-    return [Link(u, [Text(t)]) if u else Text(t) for t, u in ln.runs if t]
 
 
 # ---- one page
@@ -468,31 +464,7 @@ class _Reader:
                 level = pdf_layout.heading_level(ln.text, ln.size, body)
                 if level is not None:
                     levels[i] = level
-        return self._blocks(k, levels) + k.hidden
-
-    def _blocks(self, k, levels):
-        """Headings and paragraphs in line order, with each table, image and render placed
-        before the first line whose top is below its own top."""
-        items = sorted(k.items, key=lambda it: (-it[0], it[1], it[2]))
-        out, run, n = [], [], 0
-
-        def flush():
-            out.extend(pdf_layout.paragraphs(run, self.model))
-            run.clear()
-
-        for i, ln in enumerate(k.lines):
-            while n < len(items) and items[n][0] > ln.box[3]:
-                flush()
-                out.append(items[n][3])
-                n += 1
-            if i in levels:
-                flush()
-                out.append(Heading(levels[i], _inlines(ln)))
-            else:
-                run.append(ln)
-        flush()
-        out.extend(it[3] for it in items[n:])
-        return out
+        return pdf_layout.place(k.lines, k.items, levels, self.model) + k.hidden
 
 
 def parse_bytes(data, ctx, *, engine="native", pages=None, clock=time.monotonic, started=None) -> Doc:

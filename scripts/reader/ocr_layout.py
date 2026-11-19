@@ -1,19 +1,21 @@
 """OCR words through the pdf layout and table builder: each word becomes a `pdf_layout.Fragment` and each rule a
 `pdf_tables.Segment`, in points, y up, in the frame of the page's turned bitmap (`rotate(g, page.turn)`).
 
-The words of one engine line share a baseline (the median box bottom) and a size (the median box height). Tables take
-their words by position. Lines follow the positions where these show two clean columns, else the engine's order
-through `pdf_layout.reading_order` (`_read`).
+The words of one engine line share a baseline (the median box bottom) and a size: the line's tallest box, an estimate of
+the em, since a box holds only its word's ink. Tables take their words by position. Lines are read from positions in
+two clean columns, else in the engine's order through `pdf_layout.reading_order` (`_read`).
 """
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import replace
+from itertools import groupby
 
-from .formats import pdf_layout, pdf_tables, xps
-from .model import Heading, Para, Text
+from .formats import pdf_layout, pdf_tables
+from .model import Para, Text
 from .ocr import OcrPage, Result
 
 SCANNED = "_Scanned page, text by OCR._"
+BAND = 0.05  # a line within this share of the width from the middle crosses it, as in `xps._columns`
 
 
 def fragments(page: OcrPage, dpi: float) -> list:
@@ -22,8 +24,7 @@ def fragments(page: OcrPage, dpi: float) -> list:
     by_line = defaultdict(list)
     for w in page.words:
         by_line[w.line].append(w)
-    shared = {n: (statistics.median(w.y + w.h for w in ws), statistics.median(w.h for w in ws))
-              for n, ws in by_line.items()}
+    shared = {n: (statistics.median(w.y + w.h for w in ws), max(w.h for w in ws)) for n, ws in by_line.items()}
     out = []
     for i, w in enumerate(page.words):
         bottom, height = shared[w.line]
@@ -48,10 +49,10 @@ def segments(rules, page: OcrPage, dpi: float) -> list:
     return out
 
 
-def _by_position(frags) -> list:
-    """The fragments renumbered in rows from the top, each row right to left. So ordered, `pdf_layout.lines` joins a
-    word to its row only within the gutter rule of `_Row.take_back`: two columns across one baseline stay two lines.
-    Left to right, it would join them whatever the gap."""
+def _by_position(frags) -> tuple[list, list]:
+    """The fragments in rows from the top, and the row of each. A row is cut where a gap passes `pdf_layout.GUTTER`
+    sizes; its pieces go right to left, each piece's words left to right. So fed, `pdf_layout.lines` joins the words of
+    a piece whatever their sizes or box overlaps, and refuses each piece the row on its left (`_Row.take_back`)."""
     rows, row, anchor, size = [], [], 0.0, 0.0
     for f in sorted(frags, key=lambda f: (-f.y, f.x)):
         if row and anchor - f.y > pdf_layout.LINE_TOLERANCE * max(f.size, size):
@@ -63,21 +64,64 @@ def _by_position(frags) -> list:
         size = f.size
     if row:
         rows.append(row)
-    ordered = [f for row in rows for f in sorted(row, key=lambda f: -f.x)]
-    return [replace(f, order=k) for k, f in enumerate(ordered)]
+    ordered, row_of = [], []
+    for r, row in enumerate(rows):
+        pieces, end = [], 0.0
+        for f in sorted(row, key=lambda f: f.x):
+            if pieces and f.x - end <= pdf_layout.GUTTER * max(f.size, pieces[-1][-1].size):
+                pieces[-1].append(f)
+                end = max(end, f.x + f.width)
+            else:
+                pieces.append([f])
+                end = f.x + f.width
+        for piece in reversed(pieces):
+            ordered += piece
+            row_of += [r] * len(piece)
+    return ordered, row_of
+
+
+def _columns(lns, width, row_of):
+    """The left lines, then the right, each by row and x, when the lines (none crossing the middle band) hold at least
+    3 rows a side, as `xps._columns` asks; else None."""
+    if width <= 0 or len(lns) < 6:
+        return None
+    left = [ln for ln in lns if ln.box[0] < width / 2]
+    right = [ln for ln in lns if ln.box[0] >= width / 2]
+    if min(len({row_of[ln.order] for ln in side}) for side in (left, right)) < 3:
+        return None
+    return [ln for side in (left, right) for ln in sorted(side, key=lambda ln: (row_of[ln.order], ln.box[0]))]
 
 
 def _read(frags, width) -> list:
-    """The lines of `frags` in reading order. When their positions show two clean columns (`xps._columns`, the rule
-    of `pdf_layout.reading_order`), the left column, then the right, each by (top, x). Otherwise
-    `pdf_layout.reading_order` over the lines in the engine's order: on a gutter narrower than that rule's band, the
-    engine's order is the only column order there is."""
-    placed = pdf_layout.lines(_by_position(frags))
-    runs = [(-ln.box[3], ln.box[0], ln.size, ln.text, i) for i, ln in enumerate(placed)]
-    columns = xps._columns(runs, width)
-    if len(columns) == 2:
-        return [placed[r[4]] for column in columns for r in sorted(column, key=lambda r: (r[0], r[1]))]
-    return pdf_layout.reading_order(pdf_layout.lines(frags), width)
+    """The lines of `frags` in reading order. The rows holding a line whose measured box reaches the middle band (a
+    title, a full-width line, a narrow gutter) cut the page into bands. A band clear of the middle with two clean
+    columns reads its left column, then its right. The rows between such bands keep the engine's order through
+    `pdf_layout.reading_order`, taken over all of them at once: on a narrow gutter that is the only column order there
+    is."""
+    ordered, row_of = _by_position(frags)
+    placed = pdf_layout.lines([replace(f, order=k) for k, f in enumerate(ordered)])
+    by_row = defaultdict(list)
+    for ln in placed:
+        by_row[row_of[ln.order]].append(ln)
+    lo, hi = width * (0.5 - BAND), width * (0.5 + BAND)
+    crossing = {r for r, lns in by_row.items() if any(ln.box[0] < hi and ln.box[2] > lo for ln in lns)}
+    out, rest = [], []
+
+    def engine():
+        out.extend(pdf_layout.reading_order(pdf_layout.lines(rest), width))
+        rest.clear()
+
+    for cross, band in groupby(range(len(ordered)), key=lambda k: row_of[k] in crossing):
+        band = list(band)
+        split = None if cross else _columns([ln for r in sorted({row_of[k] for k in band}) for ln in by_row[r]],
+                                            width, row_of)
+        if split is None:
+            rest += [ordered[k] for k in band]
+        else:
+            engine()
+            out += split
+    engine()
+    return out
 
 
 def reading_lines(page: OcrPage, dpi: float = 72.0) -> list[str]:
@@ -85,36 +129,20 @@ def reading_lines(page: OcrPage, dpi: float = 72.0) -> list[str]:
     return [ln.text for ln in _read(fragments(page, dpi), page.w * 72.0 / dpi)]
 
 
-def blocks(res: Result, number: int, dpi: float, skipped: Counter) -> list:
+def blocks(res: Result, number: int, dpi: float, skipped: Counter, *,
+           budget: pdf_tables.TableBudget | None = None) -> list:
     """A lone TIFF page as blocks: the scanned line, then the ruled tables placed by their tops among the headings and
-    paragraphs of the other words, as pdf.py places a page's tables. `skipped` takes the table caps' cuts."""
+    paragraphs of the other words, as pdf places a page's tables. `skipped` takes the table caps' cuts. `budget` is the
+    document's table budget, held across its pages; a new one when None."""
     page = res.page
     model = pdf_layout.load_model()
     frags = fragments(page, dpi)
-    found = pdf_tables.tables(segments(res.rules, page, dpi), frags, number, pdf_tables.TableBudget(), skipped,
-                              model=model)
+    found = pdf_tables.tables(segments(res.rules, page, dpi), frags, number,
+                              budget if budget is not None else pdf_tables.TableBudget(), skipped, model=model)
     used = set().union(*(got.used for got in found))
-    items = sorted(((got.bbox[3], got.bbox[0], k, got.table) for k, got in enumerate(found)),
-                   key=lambda it: (-it[0], it[1], it[2]))
+    items = [(got.bbox[3], got.bbox[0], k, got.table) for k, got in enumerate(found)]
     lns = _read([f for f in frags if f.order not in used], page.w * 72.0 / dpi)
     body = pdf_layout.body_size(lns)
-    out, run, n = [Para([Text(SCANNED)])], [], 0
-
-    def flush():
-        out.extend(pdf_layout.paragraphs(run, model))
-        run.clear()
-
-    for ln in lns:
-        while n < len(items) and items[n][0] > ln.box[3]:
-            flush()
-            out.append(items[n][3])
-            n += 1
-        level = pdf_layout.heading_level(ln.text, ln.size, body)
-        if level is None:
-            run.append(ln)
-        else:
-            flush()
-            out.append(Heading(level, [Text(ln.text)]))
-    flush()
-    out.extend(it[3] for it in items[n:])
-    return out
+    levels = {i: lvl for i, ln in enumerate(lns)
+              if (lvl := pdf_layout.heading_level(ln.text, ln.size, body)) is not None}
+    return [Para([Text(SCANNED)])] + pdf_layout.place(lns, items, levels, model)

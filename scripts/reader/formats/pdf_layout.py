@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..model import Link, Para, Text
+from ..model import Heading, Link, Para, Text
 from . import xps
 
 
@@ -782,6 +782,36 @@ def paragraphs(lns, model) -> List[Para]:
         inlines = [Link(u, [Text(t)]) if u else Text(t) for t, u in merged]
         if inlines:
             out.append(Para(inlines))
+    return out
+
+
+def inlines(ln) -> list:
+    """A line's runs as Text inlines, a run with a url as a Link."""
+    return [Link(u, [Text(t)]) if u else Text(t) for t, u in ln.runs if t]
+
+
+def place(lns, items, levels, model) -> list:
+    """Headings and paragraphs in line order, with each item placed before the first line whose top is below its own
+    top. `items` are (top, x, seq, block); `levels` maps a line index to its heading level."""
+    items = sorted(items, key=lambda it: (-it[0], it[1], it[2]))
+    out, run, n = [], [], 0
+
+    def flush():
+        out.extend(paragraphs(run, model))
+        run.clear()
+
+    for i, ln in enumerate(lns):
+        while n < len(items) and items[n][0] > ln.box[3]:
+            flush()
+            out.append(items[n][3])
+            n += 1
+        if i in levels:
+            flush()
+            out.append(Heading(levels[i], inlines(ln)))
+        else:
+            run.append(ln)
+    flush()
+    out.extend(it[3] for it in items[n:])
     return out
 
 
