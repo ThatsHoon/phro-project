@@ -924,6 +924,11 @@ class Session:
 _current: Session | None = None
 
 
+def backend() -> tuple[str, str]:
+    """(engine id, version) of the OCR engines on this machine; ("", "") for none."""
+    return "", ""
+
+
 def session() -> Session | None:
     """The conversion's current Session, or None (no OCR engine, or outside `opened`)."""
     return _current
@@ -932,9 +937,14 @@ def session() -> Session | None:
 @contextlib.contextmanager
 def opened(deadline: float | None, backend: tuple[str, str], *, cmd: list | None = None, store=None):
     """Sets the current Session for the block and closes it after; yields None, and sets none, when `backend[0]`
-    is empty (no OCR engine)."""
+    is empty (no OCR engine). With a Session, raster's backend is settled first, before any thread may decode
+    pixels through `raster.gray`."""
     global _current
-    s = Session(deadline, backend, cmd=cmd, store=store) if backend and backend[0] else None
+    s = None
+    if backend and backend[0]:
+        from . import raster
+        raster.backend()
+        s = Session(deadline, backend, cmd=cmd, store=store)
     prev, _current = _current, s
     try:
         yield s

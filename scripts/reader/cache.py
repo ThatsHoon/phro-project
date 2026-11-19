@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import VERSION, convert
-from .limits import FIGURES_LATE
+from .limits import FIGURES_LATE, OCR_LATE
 
 _counter = itertools.count()
 _lock = threading.Lock()
@@ -269,9 +269,10 @@ def store(k: str, src, hidden: bool = False, **opts) -> Path:
         raise
     finally:
         images.FIGURE_CACHE = old
-    if FIGURES_LATE in (meta.get("warnings") or []):
-        # cut by the deadline, like a conversion that ran out of time: handed out from its temporary folder (prune
-        # clears it after a day) and never filed under k, so the next read converts again
+    if {FIGURES_LATE, OCR_LATE} & set(meta.get("warnings") or []):
+        # figures or OCR cut by the deadline, like a conversion that ran out of time: handed out from its temporary
+        # folder (prune clears it after a day) and never filed under k, so the next read converts again (and takes
+        # the figures and OCR results it finished from their own caches)
         return tmp
     for attempt in (0, 1):
         try:

@@ -252,6 +252,7 @@ class Assets:
         self._seen: dict[str, tuple[str, bool]] = {}
         self._n = 0
         self.lines: dict[str, list] = {}  # figure text lines by the path add returned
+        self.picture: dict[str, str] = {}  # picture text (OCR) by the path add returned
         self.figures = 0  # pictures converted to PNG
         self.figures_left = 0  # figure kinds kept as the original file
         self.warnings: set[str] = set()  # the figure warnings raster raised
@@ -304,3 +305,15 @@ class Assets:
         if kind in FIGURES:  # kept as the original file
             self._kept[base] = res
         return res
+
+    def keep_picture(self, path: str, lines) -> str:
+        """Keeps and returns the picture text of the picture `add` returned `path` for: its OCR lines, each on one
+        line, joined with " / " and cut at FIGURE_CHARS (a cut adds the warning "figure text cut")."""
+        from . import limits
+        text = " / ".join(x for x in (" ".join(ln.split()) for ln in lines) if x)
+        cap = limits.FIGURE_CHARS
+        if len(text) > cap:
+            text = text[:max(cap - 1, 0)] + "…"
+            self.warnings.add("figure text cut")
+        self.picture[path] = text
+        return text

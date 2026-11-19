@@ -6,9 +6,11 @@ A `wmz` or `emz` is inflated within IMAGE_BYTES and the zip ratio rule (ZIP_RATI
 ZIP_RATIO_FLOOR). Bytes that are not the format the extension names are
 `damaged`.
 """
+import time
+from dataclasses import replace
 from pathlib import Path
 
-from .. import images, limits
+from .. import images, limits, ocr
 from ..containers import flate
 from ..limits import ReadError
 from ..model import Doc, Image
@@ -65,4 +67,89 @@ def parse(path, ctx) -> Doc:
     warnings = [f"TIFF pages cut at {cap}"] if n > cap else []
     n = min(n, cap)
     blocks = [Image(data, f"page {i + 1}" if n > 1 else "", page=i) for i in range(n)]
-    return Doc(blocks=blocks, warnings=warnings)
+    doc = Doc(blocks=blocks, warnings=warnings)
+    s = ocr.session()
+    if s is not None:
+        _ocr(doc, s, data, ctx)
+    return doc
+
+
+def _ocr(doc: Doc, s, data: bytes, ctx) -> None:
+    """A lone TIFF's pages read by OCR (decisions 1 and 6 of the OCR plan). Each page's pixels (raster.gray) go to
+    the session in turn; then each page read gives its text (`ocr_layout.blocks`, one table budget for the file): a
+    doubtful page adds its image after the text, a picture area a gray crop of the pixels OCR read (the whole page
+    past pdf.FIGURE_WHOLE). A page not queued by FIGURE_RESERVE before the session's stop goes late at once, and no
+    later page is sent. A page OCR could not read (failed, late, or not sent for the time) stays as today's image; one
+    whose pixels do not decode, too, uncounted. doc.meta["ocr"] holds the counts, and OCR_LATE joins the warnings
+    when a page went late. Every page image is marked `ocr="page"`, so no picture pass reads it again."""
+    from .. import raster
+    from . import pdf, pdf_tables
+    stop = s.deadline - limits.FIGURE_RESERVE
+    until = stop - limits.FIGURE_RESERVE
+    pages = [replace(b, ocr="page") for b in doc.blocks]
+    sent, late = [], False  # per page: its Ticket, "late" (not sent for the time) or None (no pixels)
+    for i in range(len(pages)):
+        got = None if late else raster.gray(data, page=i, deadline=stop)
+        if got is None:
+            late = late or time.monotonic() >= stop
+            sent.append("late" if late else None)
+            continue
+        t = s.submit(got[0], "page", got[1], until=until)
+        r = s.peek(t)
+        late = r is not None and r.status == "late"
+        sent.append(t)
+    counts = {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None}
+    budget, out = pdf_tables.TableBudget(), []
+    for i, (im, t) in enumerate(zip(pages, sent)):
+        r = s.wait(t) if isinstance(t, ocr.Ticket) else None
+        status = t if r is None else r.status
+        if status == "done":
+            got = _read(data, i, im, r, t.dpi, ctx.skipped, budget, stop, pdf.FIGURE_WHOLE)
+            if got is not None:
+                out += got
+                counts["pages"] += 1
+                counts["doubtful"] += r.verdict.kind == "doubtful"
+                continue
+            status = "failed"
+        if status == "failed":
+            counts["failed"] += 1
+        elif status == "late" and counts["stopped_at"] is None:
+            counts["stopped_at"] = i + 1
+        out.append(im)
+    doc.blocks = out
+    doc.meta["ocr"] = counts
+    if counts["stopped_at"] is not None:
+        doc.warnings.append(limits.OCR_LATE)
+
+
+def _read(data, i, im, r, dpi, skipped, budget, stop, whole) -> list | None:
+    """The blocks of page `i` OCR read: its text, then its image (`im`) when doubtful, or its picture area; None when
+    laying them out fails, which leaves the page as today's image."""
+    from .. import ocr_layout
+    try:
+        got = ocr_layout.blocks(r, i + 1, dpi, skipped, budget=budget)
+        if r.verdict.kind == "doubtful":
+            got.append(im)
+        elif r.verdict.kind == "area":
+            got.append(_area(data, i, r, stop, whole) or replace(im, alt=f"Picture on page {i + 1}"))
+        return got
+    except ReadError as e:
+        if e.kind == "timeout":
+            raise
+    except Exception:  # noqa: BLE001 - OCR never makes a document fail
+        pass
+    return None
+
+
+def _area(data: bytes, i: int, r, stop: float, whole: float) -> Image | None:
+    """The picture area of page `i`: a gray PNG cut from the pixels as OCR read them (turned as it read them), at
+    most FIGURE_EDGE_TEXT on the long side (decision 6); None past `whole` of the page, or when the pixels no longer
+    decode."""
+    from .. import ocr_pixels, raster
+    if r.unread.area > whole:
+        return None
+    got = raster.gray(data, page=i, deadline=stop)
+    if got is None:
+        return None
+    crop = ocr_pixels.crop_png(ocr_pixels.rotate(got[0], r.page.turn), r.verdict.box, limits.FIGURE_EDGE_TEXT)
+    return Image(crop, f"Picture on page {i + 1}", ocr="page")

@@ -64,11 +64,16 @@ def parse(path, ctx, **opts):
 
 
 def convert(src, out_dir, hidden=False, **opts) -> dict:
-    """Convert src into out_dir/out.md, out_dir/assets/ and out_dir/meta.json."""
+    """Convert src into out_dir/out.md, out_dir/assets/ and out_dir/meta.json.
+
+    Parsing and rendering run inside an OCR session (`ocr.opened`) when an OCR engine is here (`ocr.backend()`),
+    its results cached per picture under the cache root; its deadline is PHRO_READER_DEADLINE's, none without it.
+    meta.json then holds the OCR counts ("ocr"), and OCR_LATE among the warnings when the time left pages or
+    pictures unread."""
     import json
     import time
-    from . import markdown
-    from .limits import ReadError
+    from . import markdown, ocr
+    from .limits import OCR_LATE, ReadError
     from .model import Context
     from . import text
     t0 = time.monotonic()
@@ -76,11 +81,17 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
     ctx = Context()
     if FORMATS.get(ext_of(src)) in ("pdf", "djvu"):  # the page loop's deadline runs from the process start
         opts.setdefault("started", STARTED)
-    doc = parse(src, ctx, **opts)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    assets = out_dir / "assets"
+    backend, store, deadline = ocr.backend(), None, None
+    if backend[0]:
+        from . import cache, raster
+        store = cache.OcrResults(cache.root() / cache.OCR)
+        wall = raster._env_deadline()
+        deadline = None if wall is None else time.monotonic() + (wall - time.time())
     info = {}
-    md = markdown.render(doc, assets, hidden, ctx.skipped, info)
+    with ocr.opened(deadline, backend, store=store):
+        doc = parse(src, ctx, **opts)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        md = markdown.render(doc, out_dir / "assets", hidden, ctx.skipped, info)
     if info["empty"] and info["lost"]:  # every content part failed: nothing was read
         raise ReadError("damaged", "nothing readable (could not read: " + ", ".join(info["lost"]) + ")")
     (out_dir / "out.md").write_text(md, encoding="utf-8", newline="\n")
@@ -89,6 +100,9 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
     if "garbled" not in warnings and text.garble_ratio(md) > text.GARBLED:  # a parser may have found it (pub 97)
         warnings.append("garbled")
     warnings += [w for w in info["warnings"] if w not in warnings]  # the figure warnings, each once
+    counts = info["ocr"]
+    if counts and (counts["stopped_at"] is not None or counts["pictures_left"]) and OCR_LATE not in warnings:
+        warnings.append(OCR_LATE)
     meta = {
         "source": str(src),
         "size": src.stat().st_size,
@@ -106,5 +120,7 @@ def convert(src, out_dir, hidden=False, **opts) -> dict:
     if doc.meta and "engine" in doc.meta:
         meta.update(engine=doc.meta["engine"], pages_total=doc.meta.get("pages_total"),
                     unrendered=doc.meta.get("unrendered"), figures=doc.meta.get("figures"), pages=st["pages"])
+    if counts is not None:
+        meta["ocr"] = counts
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     return meta

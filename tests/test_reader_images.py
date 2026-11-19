@@ -2,10 +2,13 @@
 
 Run: python -I -X utf8 tests/test_reader_images.py
 """
+import json
+import os
 import struct
 import sys
 import tempfile
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -13,8 +16,9 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from metafile_fix import emf, emf_rect, emf_textw, wmf, wmf_text  # noqa: E402
-from reader import images, markdown, raster  # noqa: E402
+from reader import images, markdown, ocr, raster  # noqa: E402
 from reader.model import Cell, Doc, Image, Para, Table, Text  # noqa: E402
+from reader.ocr_pixels import Gray  # noqa: E402
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
 GIF = b"GIF89a" + b"\x00" * 20
@@ -352,6 +356,82 @@ def test_png_crop_box():
     assert images.png_crop(b"not a png", (0, 0, 1, 1)) is None
     assert images.png_crop(png, (0.9, 0.9, 0.9, 0.9)) is not None  # an empty box still keeps one pixel
     assert images.png_crop(png, (float("nan"), 0, 1, 1)) is None
+
+
+# ---- which pictures OCR reads, through the stand-in worker (tests/ocr_stub_worker.py)
+
+STUB = [sys.executable, "-I", "-X", "utf8", str(Path(__file__).parent / "ocr_stub_worker.py")]
+TWO = {"page": {"w": 200, "h": 100, "angle": 0.0, "turn": 0, "engine": "stub", "version": "1",
+                "words": [{"text": t, "x": x, "y": 20, "w": 40, "h": 16, "line": 0, "conf": None}
+                          for t, x in (("Total", 10), ("120", 60))]}}
+
+
+@contextmanager
+def reading(**conf):
+    """An OCR session on the stand-in worker; yields the (w, h, kind) of every bitmap it is given."""
+    old = os.environ.get("PHRO_OCR_STUB")
+    os.environ["PHRO_OCR_STUB"] = json.dumps(conf)
+    try:
+        with ocr.opened(None, ("win-ko", "test"), cmd=STUB) as s:
+            sent, real = [], s.submit
+
+            def submit(g, kind, dpi, until=None):
+                sent.append((g.w, g.h, kind))
+                return real(g, kind, dpi, until)
+
+            s.submit = submit
+            yield sent
+    finally:
+        if old is None:
+            os.environ.pop("PHRO_OCR_STUB", None)
+        else:
+            os.environ["PHRO_OCR_STUB"] = old
+
+
+def gray_png(w, h, shade=250):
+    rows = [bytes([shade]) * w] * h
+    rows[h // 2] = bytes(w)
+    return images.gray_png(Gray(w, h, b"".join(rows)))
+
+
+def render(*blocks):
+    return markdown.render(Doc(blocks=list(blocks)), Path(tempfile.mkdtemp()))
+
+
+def test_small_picture_not_read():
+    with reading(answer=TWO) as sent:
+        out = render(Image(gray_png(63, 20)), Image(gray_png(20, 63)))
+    assert sent == [] and "Picture text" not in out, (sent, out)
+    with reading(answer=TWO) as sent:
+        out = render(Image(gray_png(64, 20)))
+    assert sent == [(64, 20, "picture")] and "Picture text: Total 120" in out, (sent, out)
+
+
+def test_metafile_not_read_as_picture():
+    with reading(answer=TWO) as sent:
+        out = render(Image(wmf([wmf_text(5, 5, b"Q")])), Image(EMF))
+    assert sent == [] and "Picture text" not in out, (sent, out)
+
+
+def test_same_picture_read_once():
+    a, b = gray_png(80, 80), gray_png(80, 80, shade=240)
+    with reading(answer=TWO) as sent:
+        out = render(Image(a), Para([Text("x")]), Image(a, alt="again"), Image(b))
+    assert sent == [(80, 80, "picture")] * 2, sent
+    assert out.count("Picture text: Total 120") == 3, out
+
+
+def test_page_image_not_read_again():
+    with reading(answer=TWO) as sent:
+        out = render(Image(gray_png(80, 80), alt="Scanned page 1", ocr="page"))
+    assert sent == [] and out == "![Scanned page 1](assets/img-001.png)\n", (sent, out)
+
+
+def test_bmp_picture_read():
+    with reading(answer=TWO) as sent:
+        out = render(Image(bmp(70, 70, 24, (bytes([200]) * 210 + b"\0\0") * 70)))
+    assert sent == [(70, 70, "picture")], sent
+    assert out == "![](assets/img-001.png)\n\nPicture text: Total 120\n", out
 
 
 def main():

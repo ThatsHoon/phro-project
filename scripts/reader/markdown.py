@@ -1,7 +1,9 @@
 """The one Markdown renderer: every output format and token rule lives here."""
 import collections
+import itertools
 import re
 import secrets
+import time
 from bisect import bisect_left, bisect_right
 from pathlib import Path
 
@@ -103,6 +105,126 @@ def unread(skipped) -> list:
     return lost(skipped) + [name for k, name in NAMED if skipped.get(k, 0) > 0]
 
 
+# ---- OCR: the status lines (decision 7) and the pictures read (decision 1)
+
+NO_OCR = {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None}  # a parser's doc.meta["ocr"] counts
+KOREAN_HINT = ('(Korean OCR is not installed in Windows: Settings > Time & language > Language > add Korean with '
+               '"Optical character recognition".)')
+
+
+def ocr_notes(counts: dict, hint: bool) -> list:
+    """The OCR status lines of `counts` (NO_OCR's keys and "pictures_left"), in their order; the Korean hint last."""
+    out = []
+    n, m = counts["pages"], counts["doubtful"]
+    if n:
+        doubt = f"; {m} of them doubtful, shown with the page image" if m else ""
+        out.append(f"({n} scanned page{'' if n == 1 else 's'} read by OCR{doubt})")
+    if counts["stopped_at"] is not None:
+        out.append(f"(OCR stopped at page {counts['stopped_at']}; read the file again to continue)")
+    elif k := counts["pictures_left"]:
+        out.append(f"(OCR stopped; {k} picture{'' if k == 1 else 's'} not read)")
+    if f := counts["failed"]:
+        out.append("(OCR failed on 1 page; shown as an image.)" if f == 1 else f"(OCR failed on {f} pages; shown as images.)")
+    if hint:
+        out.append(KOREAN_HINT)
+    return out
+
+
+_END = object()
+
+
+def _images(doc: Doc, show: bool):
+    """Each Image block the render may write, in document order (the notes last). A hidden block, and a hidden table
+    row, is passed over unless hidden content is shown. A block list the document holds more than once is walked
+    once."""
+    stack, seen = [itertools.chain(doc.blocks, *doc.notes.values())], set()
+    while stack:
+        b = next(stack[-1], _END)
+        if b is _END:
+            stack.pop()
+            continue
+        if b.hidden and not show:
+            continue
+        if isinstance(b, Image):
+            yield b
+            continue
+        if isinstance(b, Table):
+            lists = [c.blocks for r, row in enumerate(b.rows) if show or r not in b.hidden_rows for c in row]
+        elif isinstance(b, Section):
+            lists = [b.blocks, b.notes, b.comments]
+        elif isinstance(b, Quote):
+            lists = [b.blocks]
+        else:
+            continue
+        fresh = [x for x in lists if id(x) not in seen]
+        seen.update(map(id, fresh))
+        stack.append(itertools.chain.from_iterable(fresh))
+
+
+class _Pictures:
+    """The raster pictures OCR reads: each Image with `ocr` "" whose bytes are a PNG, JPEG, BMP, GIF or TIFF and whose
+    pixels (raster.gray) have a long side of at least OCR_MIN_EDGE, submitted to the session as the render starts,
+    once for the same bytes, and collected as the render writes them.
+
+    A picture not queued by FIGURE_RESERVE before the session's stop goes late at once, so the ones queued keep that
+    time to be read; after it, and past the stop, no further picture is sent. Each picture that went late, or was
+    not sent for the time, is in `left`."""
+
+    KINDS = frozenset({"png", "jpg", "bmp", "gif", "tiff"})
+
+    def __init__(self, s, doc: Doc, show: bool):
+        from . import raster
+        self.s = s
+        self.tickets = {}  # (bytes, page) -> Ticket
+        self.left = set()  # (bytes, page) of the pictures not read for the time
+        stop = s.deadline - limits.FIGURE_RESERVE
+        until = stop - limits.FIGURE_RESERVE
+        passed = set()
+        for im in _images(doc, show):
+            k = (im.data, im.page)
+            if im.ocr or k in self.tickets or k in self.left or k in passed:
+                continue
+            if len(im.data) < 16 or sniff(im.data) not in self.KINDS:
+                passed.add(k)
+                continue
+            late = bool(self.left) or time.monotonic() >= stop
+            got = None if late else raster.gray(im.data, page=im.page, deadline=stop)
+            if got is None:
+                if late or time.monotonic() >= stop:
+                    self.left.add(k)
+                else:
+                    passed.add(k)
+                continue
+            g, dpi = got
+            if max(g.w, g.h) < limits.OCR_MIN_EDGE:
+                passed.add(k)
+                continue
+            t = s.submit(g, "picture", dpi, until=until)
+            r = s.peek(t)
+            if r is not None and r.status == "late":
+                self.left.add(k)
+            else:
+                self.tickets[k] = t
+
+    def lines(self, b: Image) -> list:
+        """The picture text lines of `b` (ocr.picture_lines), waiting for its ticket; none for a picture not sent, or
+        one OCR could not read."""
+        from . import ocr
+        k = (b.data, b.page)
+        t = self.tickets.get(k)
+        if t is None:
+            return []
+        r = self.s.wait(t)
+        if r.status == "late":
+            self.left.add(k)
+        if r.status != "done":
+            return []
+        try:
+            return ocr.picture_lines(r.page)
+        except Exception:  # noqa: BLE001 - OCR never makes a document fail
+            return []
+
+
 class _Mode:
     """Where inline text lands: block, table cell (pipe or HTML), or heading."""
 
@@ -177,8 +299,11 @@ def blocks_len(blocks, d=0) -> int:
 
 
 class _Render:
-    def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool, skipped=None, drop=frozenset()):
+    def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool, skipped=None, drop=frozenset(), pictures=None):
         self.doc, self.assets_dir, self.show = doc, assets_dir, show_hidden
+        self.pictures = pictures  # the _Pictures OCR reads, or None without a session
+        self.ocr = None  # the OCR counts (NO_OCR's keys and "pictures_left"), set by body when there are any
+        self.ocr_hint = False
         self.drop = drop  # ids of hidden-only notes whose marks are left out with their definitions
         self.marked: set[str] = set()  # ids of notes whose mark was shown
         self.hidden_marks: set[str] = set()  # ids of notes whose mark was left out as hidden (and counted)
@@ -386,16 +511,20 @@ class _Render:
                 self.unviewable.append(path)
             head = m.esc(f"[image: {alt}]") if alt else ""
         lines = [x for x in (" ".join(ln.split()) for ln in self.assets.lines.get(path, ())) if x]
-        if not lines:
-            return head
-        fig = m.esc("Figure text: " + " / ".join(lines))
-        if m is not BLOCK:
-            return head + " " + fig if head else fig
-        if not head:
-            return fig  # the caller's tag marks this paragraph
-        if b.hidden and self.show:
-            fig = "(hidden) " + fig  # a second paragraph: marked as the first is
-        return head + "\n\n" + fig
+        texts = ["Figure text: " + " / ".join(lines)] if lines else []
+        if path and not b.ocr and self.pictures is not None:
+            pic = self.assets.picture.get(path)
+            if pic is None:
+                pic = self.assets.keep_picture(path, self.pictures.lines(b))
+            if pic:
+                texts.append("Picture text: " + pic)
+        parts = [head] if head else []
+        for s in texts:
+            s = m.esc(s)
+            if parts and m is BLOCK and b.hidden and self.show:
+                s = "(hidden) " + s  # a further paragraph: marked as the first is (the caller's tag marks that one)
+            parts.append(s)
+        return (" " if m is not BLOCK else "\n\n").join(parts)
 
     def _image(self, b: Image) -> list:
         s = self._image_text(b)
@@ -764,6 +893,11 @@ class _Render:
             status.append(f"({self.too_deep} places nested too deeply left out)")
         if self.unread:
             status.append("(could not read: " + ", ".join(self.unread) + ")")
+        if "ocr" in self.doc.meta or self.pictures is not None:
+            left = len(self.pictures.left) if self.pictures is not None else 0
+            self.ocr = dict(NO_OCR, **self.doc.meta.get("ocr", {}), pictures_left=left)
+            self.ocr_hint = self.pictures is not None and self.pictures.s.hint
+            status += ocr_notes(self.ocr, self.ocr_hint)
         if hf:
             status.append("\n".join(hf))
         top = status + top
@@ -832,14 +966,21 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     A dict passed as `info` receives "unread" (that line's items), "lost" (the counted ones among them), "empty" (no content rendered at all),
     "images" (how many viewable images the output links to), "figures" and "figures_left" (pictures converted to PNG,
     and figure kinds kept as the original file), "warnings" (the figure warnings, sorted) and "pages" (the line numbers of the page heads it wrote, for stats; None
-    when it wrote none, or a head did not survive to the output).
+    when it wrote none, or a head did not survive to the output), "ocr" (doc.meta["ocr"]'s counts with
+    "pictures_left"; None with neither those counts nor an OCR session) and "ocr_hint" (the Korean hint was written).
+
+    With an OCR session (`ocr.session()`), the raster pictures are sent to it first (`_Pictures`), and each one's
+    words follow its link as `Picture text:`, placed as `Figure text:` is.
     """
-    r = _Render(doc, Path(assets_dir), hidden, skipped)
+    from . import ocr
+    s = ocr.session()
+    pictures = _Pictures(s, doc, hidden) if s is not None else None
+    r = _Render(doc, Path(assets_dir), hidden, skipped, pictures=pictures)
     text = r.body()
     if r.dangling:  # a hidden-only note's mark was shown: render again with those marks left out (and unnumbered)
         drop = frozenset(r.dangling)
         del text, r  # the first render is not kept while the second runs
-        r = _Render(doc, Path(assets_dir), hidden, skipped, drop=drop)
+        r = _Render(doc, Path(assets_dir), hidden, skipped, drop=drop, pictures=pictures)
         text = r.body()
     text = _normalize(text)  # rebound, so the raw text is not held while _cap runs
     pages = None
@@ -851,7 +992,7 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     if info is not None:
         info.update(unread=r.unread, lost=r.lost, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked),
                     pages=pages, figures=r.assets.figures, figures_left=r.assets.figures_left,
-                    warnings=sorted(r.assets.warnings))
+                    warnings=sorted(r.assets.warnings), ocr=r.ocr, ocr_hint=r.ocr_hint)
     return md
 
 

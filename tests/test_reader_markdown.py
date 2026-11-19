@@ -2,8 +2,12 @@
 
 Run: python -I -X utf8 tests/test_reader_markdown.py
 """
+import json
+import os
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -11,7 +15,8 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from metafile_fix import wmf, wmf_text  # noqa: E402
-from reader import limits, markdown, raster, text  # noqa: E402
+from reader import images, limits, markdown, ocr, raster, text  # noqa: E402
+from reader.ocr_pixels import Gray  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import (  # noqa: E402
     Bold, Break, Cell, Code, Context, Doc, Equation, Heading, Hidden, Image, Link,
@@ -810,6 +815,162 @@ def test_hidden_figure_tag_once_everywhere():
     with figs(["x"]):
         out = R(Doc(blocks=[Table([[Cell([Image(FIG, hidden="hidden")]), Cell([P("z")])]])]), hidden=True)
         assert out.count("(hidden)") == 1, out
+
+
+# ---- OCR: picture text and the status lines, through the stand-in worker (tests/ocr_stub_worker.py)
+
+STUB = [sys.executable, "-I", "-X", "utf8", str(Path(__file__).parent / "ocr_stub_worker.py")]
+
+
+@contextmanager
+def stub(deadline=None, **conf):
+    """An OCR session on the stand-in worker behaving as `conf` says; yields the session and the list of the
+    (w, h, kind) of every bitmap it is given."""
+    old = os.environ.get("PHRO_OCR_STUB")
+    os.environ["PHRO_OCR_STUB"] = json.dumps(conf)
+    try:
+        with ocr.opened(deadline, ("win-ko", "test"), cmd=STUB) as s:
+            sent, real = [], s.submit
+
+            def submit(g, kind, dpi, until=None):
+                sent.append((g.w, g.h, kind))
+                return real(g, kind, dpi, until)
+
+            s.submit = submit
+            yield s, sent
+    finally:
+        if old is None:
+            os.environ.pop("PHRO_OCR_STUB", None)
+        else:
+            os.environ["PHRO_OCR_STUB"] = old
+
+
+def pic(w=80, h=80, shade=250):
+    """A gray PNG of w x h: `shade` with one black row."""
+    rows = [bytes([shade]) * w] * h
+    rows[h // 2] = bytes(w)
+    return images.gray_png(Gray(w, h, b"".join(rows)))
+
+
+def seen(*lines, hint=False):
+    """A worker answer reading the given lines of words in a picture."""
+    out = []
+    for n, line in enumerate(lines):
+        x = 10
+        for t in line.split():
+            out.append({"text": t, "x": x, "y": 20 + 30 * n, "w": 12 * len(t), "h": 16, "line": n, "conf": None})
+            x += 12 * len(t) + 8
+    page = {"w": 400, "h": 300, "words": out, "angle": 0.0, "turn": 0, "engine": "stub", "version": "1"}
+    return {"page": page, "rules": [], "unread": None, "hint": hint}
+
+
+TEXT = "Picture text: Total 120 / Net 80"
+
+
+def test_picture_text_block_after_link():
+    with stub(answer=seen("Total 120", "Net 80")) as (_, sent):
+        out = R(Doc(blocks=[P("a"), Image(pic(), alt="chart"), P("b")]))
+    assert out == f"a\n\n![chart](assets/img-001.png)\n\n{TEXT}\n\nb\n", out
+    assert sent == [(80, 80, "picture")], sent
+
+
+def test_picture_text_inline_in_cell():
+    with stub(answer=seen("Total 120", "Net 80")):
+        out = R(Doc(blocks=[Table([[Cell([Image(pic(), alt="c")]), Cell([P("z")])]])]))
+    assert f"|![c](assets/img-001.png) {TEXT}|z|" in out, out
+    with stub(answer=seen("a|b c")):
+        out = R(Doc(blocks=[Table([[Cell([Image(pic())]), Cell([P("z")])]])]))
+    assert "Picture text: a\\|b c|z|" in out, out
+
+
+def test_picture_text_hidden_tagged():
+    with stub(answer=seen("Total 120", "Net 80")) as (_, sent):
+        out = R(Doc(blocks=[Image(pic(), hidden="hidden")]), hidden=True)
+    assert out == f"(hidden) ![](assets/img-001.png)\n\n(hidden) {TEXT}\n", out
+    with stub(answer=seen("Total 120", "Net 80")) as (_, sent):
+        out = R(Doc(blocks=[Image(pic(), hidden="hidden"), P("x")]))
+    assert out == "(1 hidden places left out)\n\nx\n" and sent == [], (out, sent)
+
+
+def test_picture_text_cut_at_figure_chars():
+    saved = limits.FIGURE_CHARS
+    limits.FIGURE_CHARS = 10
+    info = {}
+    try:
+        with stub(answer=seen("Total 120", "Net 80")), tempfile.TemporaryDirectory() as d:
+            out = markdown.render(Doc(blocks=[Image(pic())]), Path(d), info=info)
+    finally:
+        limits.FIGURE_CHARS = saved
+    assert out == "![](assets/img-001.png)\n\nPicture text: Total 120…\n", out
+    assert info["warnings"] == ["figure text cut"], info
+
+
+def test_photo_gets_no_picture_text():
+    with stub(answer=seen("▒▓░ ◆◇◆ ▒▒")) as (_, sent):
+        out = R(Doc(blocks=[Image(pic())]))
+    assert out == "![](assets/img-001.png)\n" and len(sent) == 1, (out, sent)
+    with stub() as (_, sent):  # one word only: under OCR_MIN_WORDS
+        out = R(Doc(blocks=[Image(pic())]))
+    assert out == "![](assets/img-001.png)\n" and len(sent) == 1, (out, sent)
+
+
+def test_status_lines_singular_and_plural():
+    def lines(counts, skipped=None, hint=False):
+        info = {}
+        with tempfile.TemporaryDirectory() as d:
+            out = markdown.render(Doc(blocks=[P("body")], meta={"ocr": counts}), Path(d), skipped=skipped,
+                                  info=info)
+        return out, info
+
+    one = {"pages": 1, "doubtful": 0, "failed": 1, "stopped_at": None}
+    out, info = lines(one)
+    assert out == "(1 scanned page read by OCR)\n\n(OCR failed on 1 page; shown as an image.)\n\nbody\n", out
+    assert info["ocr"] == dict(one, pictures_left=0) and info["ocr_hint"] is False, info
+    out, _ = lines({"pages": 3, "doubtful": 1, "failed": 2, "stopped_at": None}, skipped={"page": 1})
+    assert out == ("(could not read: 1 page)\n\n"
+                   "(3 scanned pages read by OCR; 1 of them doubtful, shown with the page image)\n\n"
+                   "(OCR failed on 2 pages; shown as images.)\n\nbody\n"), out
+    out, _ = lines({"pages": 1, "doubtful": 1, "failed": 0, "stopped_at": None})
+    assert out == "(1 scanned page read by OCR; 1 of them doubtful, shown with the page image)\n\nbody\n", out
+    out, info = lines({"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None})
+    assert out == "body\n", out
+    info = {}
+    with tempfile.TemporaryDirectory() as d:
+        assert markdown.render(Doc(blocks=[P("body")]), Path(d), info=info) == "body\n"
+    assert info["ocr"] is None and info["ocr_hint"] is False, info
+
+
+def test_stop_note_for_pages_and_pictures():
+    with tempfile.TemporaryDirectory() as d:
+        out = markdown.render(Doc(blocks=[P("body")], meta={"ocr": {"pages": 40, "doubtful": 0, "failed": 0,
+                                                                     "stopped_at": 41}}), Path(d))
+    assert out == ("(40 scanned pages read by OCR)\n\n(OCR stopped at page 41; read the file again to continue)"
+                   "\n\nbody\n"), out
+    info = {}
+    with stub(deadline=time.monotonic() + limits.FIGURE_RESERVE + 1, delay=30, answer=seen("Total 120")), \
+            tempfile.TemporaryDirectory() as d:
+        out = markdown.render(Doc(blocks=[Image(pic(shade=250)), Image(pic(shade=240)), Image(pic(shade=250))]),
+                              Path(d), info=info)
+    assert out == ("(OCR stopped; 2 pictures not read)\n\n![](assets/img-001.png)\n\n![](assets/img-002.png)\n\n"
+                   "![](assets/img-001.png)\n"), out
+    assert info["ocr"]["pictures_left"] == 2, info
+
+
+def test_korean_hint_once():
+    hint = ('(Korean OCR is not installed in Windows: Settings > Time & language > Language > add Korean with '
+            '"Optical character recognition".)')
+    info = {}
+    with stub(answer=seen("Total 120", hint=True)), tempfile.TemporaryDirectory() as d:
+        out = markdown.render(Doc(blocks=[Image(pic(shade=250)), Image(pic(shade=240))],
+                                  meta={"ocr": {"pages": 0, "doubtful": 0, "failed": 1, "stopped_at": None}}),
+                              Path(d), info=info)
+    assert out.count("Korean OCR") == 1, out
+    assert out.startswith(f"(OCR failed on 1 page; shown as an image.)\n\n{hint}\n\n![](assets/img-001.png)"), out
+    assert info["ocr_hint"] is True, info
+    with stub(answer=seen("Total 120")), tempfile.TemporaryDirectory() as d:
+        out = markdown.render(Doc(blocks=[Image(pic())]), Path(d), info=info)
+    assert "Korean" not in out and info["ocr_hint"] is False, (out, info)
+
 
 def main():
     for name, fn in sorted(globals().items()):
