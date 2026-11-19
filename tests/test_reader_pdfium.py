@@ -757,6 +757,16 @@ def test_pdfium_scan_read_by_ocr():
         assert not got["skipped"], got["skipped"]
 
 
+def test_pdfium_small_scan_not_sent():
+    """A scanned page of 20 points, whose gray at OCR_DPI is under OCR_MIN_EDGE, is not read: today's image."""
+    data = simple_pdf([b"q 20 0 0 20 0 0 cm /Im1 Do Q "], resources=dict(F1, XObject={"Im1": Ref(30)}),
+                      extra_objects={30: image_xobject(64, 64, data=bytes(range(64)) * 64)}, media=(0, 0, 20, 20))
+    stub = str(HERE / "tests" / "ocr_stub_worker.py")
+    got = child(_SCAN, data, stub, env=dict(os.environ, PHRO_OCR_STUB="{}"))
+    assert got["sent"] == [] and got["md"] == "## Page 1\n\n![Scanned page 1](assets/img-001.png)\n", got
+    assert not got["skipped"], got["skipped"]
+
+
 def test_pdfium_renders_counted_once_per_scan():
     """The page PNG and the gray of one scanned page are one render: under PDF_RENDERS = 2 the first two pages go to
     OCR and the third is counted `scan`."""

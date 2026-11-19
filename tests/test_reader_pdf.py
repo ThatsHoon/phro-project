@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pdf_fix import (JPEG, EncryptSpec, Name, Ref, acroform, font_type0, image_xobject,  # noqa: E402
+from pdf_fix import (JPEG, JPEG64, EncryptSpec, Name, Ref, acroform, font_type0, image_xobject,  # noqa: E402
                      link_annot, ocg_catalog, outline_items, rule_ops, simple_pdf, text_annot,
                      text_ops, widget)
 
@@ -722,7 +722,7 @@ def test_caps():
     assert (pdf.PDF_PAGE_CHARS, pdf.PDF_RENDERS) == (200_000, 100)
     assert (pdf.RENDER_DPI, pdf.CROP_DPI, pdf.RENDER_LONG) == (110, 150, 1_568)
     assert (pdf.SCAN_COVER, pdf.OCR_COVER, pdf.FIGURE_PATHS, pdf.FIGURE_COVER) == (0.5, 0.8, 32, 0.04)
-    assert (pdf.FIGURE_PAD, pdf.FIGURE_WHOLE, pdf.TINY_PT) == (6.0, 0.7, 1.0)
+    assert (pdf.FIGURE_PAD, limits.FIGURE_WHOLE, pdf.TINY_PT) == (6.0, 0.7, 1.0)
     assert (pdf.IMAGE_MIN_PX, pdf.IMAGE_MIN_PT) == (32, 16.0)
     assert (pdf.PDF_PAGE_OBJECTS, pdf.PDF_PAGE_IMAGES) == (100_000, 64)
 
@@ -970,10 +970,10 @@ def test_native_scan_uses_page_image():
 
     deadline = time.monotonic() + 60
     with patched(raster, "gray", gray), ocr_stub(deadline=deadline) as (s, sent):
-        text, _, doc = md(with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode")))
-    assert decoded == [(JPEG, deadline - limits.FIGURE_RESERVE)], decoded
-    assert len(sent) == 1 and sent[0][:3] == (8, 8, "page"), sent
-    assert text == f"{READ}## Page 1\n\n{SCANNED}\n\nw8\n", text
+        text, _, doc = md(with_image(FULL, image_xobject(64, 64, data=JPEG64, filter="DCTDecode")))
+    assert decoded == [(JPEG64, deadline - limits.FIGURE_RESERVE)], decoded
+    assert len(sent) == 1 and sent[0][:3] == (64, 64, "page"), sent
+    assert text == f"{READ}## Page 1\n\n{SCANNED}\n\nw64\n", text
     assert doc.meta["ocr"]["pages"] == 1
 
 
@@ -983,8 +983,8 @@ def test_native_jpeg_scan_photo_cropped():
     if sys.platform != "win32":
         print("skip: test_native_jpeg_scan_photo_cropped (needs GDI+)")
         return
-    data = with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode"))
-    g = raster.gray(JPEG)[0]
+    data = with_image(FULL, image_xobject(64, 64, data=JPEG64, filter="DCTDecode"))
+    g = raster.gray(JPEG64)[0]
     box = [0.1, 0.18, 0.7, 0.68]
     with ocr_stub(answer=canned(g, {"share": 0.02, "box": box, "area": 0.3, "density": 0.5})):
         text, _, doc, assets = md_assets(data)
@@ -992,6 +992,77 @@ def test_native_jpeg_scan_photo_cropped():
     assert "![Picture on page 1](assets/img-001.png)" in text, text
     assert dims(assets) == {"img-001.png": (x1 - x0, y1 - y0)}, dims(assets)
     assert doc.meta["ocr"]["pages"] == 1
+
+
+def test_small_native_scan_not_sent():
+    """A scanned page whose pixels have a long side under OCR_MIN_EDGE is not read: today's image, not read again as a
+    picture."""
+    if sys.platform != "win32":
+        print("skip: test_small_native_scan_not_sent (needs GDI+)")
+        return
+    with ocr_stub() as (s, sent):
+        text, ctx, doc = md(with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode")))
+    assert sent == [] and text == "## Page 1\n\n![Scanned page 1](assets/img-001.jpg)\n", (sent, text)
+    assert doc.meta["ocr"] == {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None} and not ctx.skipped
+
+
+def _answer(p):
+    """The stand-in worker's answer for an OcrPage."""
+    words = [{"text": w.text, "x": w.x, "y": w.y, "w": w.w, "h": w.h, "line": w.line, "conf": None} for w in p.words]
+    page = {"w": p.w, "h": p.h, "words": words, "angle": 0.0, "turn": 0, "engine": "stub", "version": "1"}
+    return {"page": page, "rules": [], "unread": {"share": 0.0, "box": None, "area": 0.0}}
+
+
+def test_scanned_two_columns_read_in_column_order():
+    """Engine lines across both columns (Tesseract psm 4) read left column, then right, as a lone TIFF page reads."""
+    from test_reader_ocr_layout import two_columns
+    data, _ = fixture_scan()
+    with ocr_stub(answer=_answer(two_columns(True))):
+        text, _, _ = md(data)
+    want = [f"L{r}{h}" for r in range(4) for h in "ab"] + [f"R{r}{h}" for r in range(4) for h in "ab"]
+    assert re.findall(r"[LR]\d[ab]", text) == want, text
+
+
+def test_scanned_page_images_not_read_again():
+    """A picture on a scanned page is in the page render OCR read: its text is not read a second time."""
+    g = fixture_gray()
+    data = simple_pdf([FULL + b"q 100 0 0 100 72 72 cm /Im2 Do Q"],
+                      resources=dict(F1, XObject={"Im1": Ref(30), "Im2": Ref(31)}),
+                      extra_objects={30: image_xobject(g.w, g.h, data=g.data),
+                                     31: image_xobject(64, 64, data=bytes(range(64)) * 64)})
+    with ocr_stub(answer=canned(g)) as (s, sent):
+        text, _, _ = md(data)
+    assert [k for _, _, k in sent] == ["page"], sent
+    assert text.count("](assets/") == 1 and SCANNED in text, text
+
+
+def _rendered(png):
+    """NativeDoc.page patched so every page renders as `png`."""
+    real = dm.NativeDoc.page
+
+    def page(self, index):
+        pd = real(self, index)
+        pd.render = lambda box, dpi, gray=False: png
+        return pd
+    return patched(dm.NativeDoc, "page", page)
+
+
+def test_figure_render_with_text_not_read_as_picture():
+    """A vector figure render holding the page's own text is not read by OCR (its text is already out); one holding
+    none is, and so is a page with no text (outlined letters)."""
+    from reader.ocr_pixels import Gray
+    png = images.gray_png(Gray(200, 200, bytes(range(200)) * 200))
+    crop = b"".join(b"%d %d 5 5 re f " % (100 + 45 * (i % 6), 100 + 45 * (i // 6)) for i in range(40))
+    whole = b"".join(b"%d %d 5 5 re f " % (20 + 110 * (i % 6), 20 + 110 * (i // 6)) for i in range(42))
+    for body, words, read in ((crop, text_ops("Label", x=150, y=200), False),
+                              (whole, text_ops("Caption", y=740), False),
+                              (crop, text_ops("Caption", y=740), True),
+                              (crop, b"", True)):
+        with _rendered(png), ocr_stub() as (s, sent):
+            text, _, doc = md(simple_pdf([words + b" " + body]))
+        assert doc.meta["figures"] == [1], doc.meta
+        assert [k for _, _, k in sent] == (["picture"] if read else []), (words, sent)
+        assert "Picture text" not in text, text
 
 
 # ---- measure (not a test): python -I -X utf8 tests/test_reader_pdf.py measure <what> [path]

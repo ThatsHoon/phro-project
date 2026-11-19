@@ -25,14 +25,16 @@ Scanned pages and OCR (decisions 1-4 and 6 of the OCR plan). With an OCR session
 (`ocr.session()`), a scanned or unmapped page that renders also gives its Gray8 pixels in the same
 render, counted once against PDF_RENDERS: pdfium renders it at OCR_DPI, native decodes the page's
 own image (`raster.gray`). The pixels go to the worker and the page's image is held. After the loop
-(`_ocr`) each page's words become its text, after the line `_Scanned page, text by OCR._`; a
-trusted page drops its image (its bytes refunded), a picture area links its crop, a doubtful page
-links the image after its text, and a page OCR could not read (failed, or late at the session's
-stop) keeps today's image. With OCR_QUEUE_BYTES of pixels already waiting, a page waits for room
-only until PDF_DEADLINE less PDF_PAGE_SECONDS: it then goes late, and OCR stops there for this read,
-every later page today's image. doc.meta["ocr"] holds the counts, and OCR_LATE joins the warnings
-when a page went late. `glyphs` leaves out the fonts first met on a page whose text OCR gave.
-Without a session, or when the gray cannot be made, the page is today's.
+(`_ocr`) each page's words become its text, laid out as a lone TIFF page's (`ocr_layout.read`),
+after the line `_Scanned page, text by OCR._`; a trusted page drops its image (its bytes refunded),
+a picture area links its crop, a doubtful page links the image after its text, and a page OCR could
+not read (failed, or late at the session's stop) keeps today's image. The other images of a page
+OCR read, and a vector figure render holding the page's own text, are not read again as pictures.
+With OCR_QUEUE_BYTES of pixels already waiting, a page waits for room only until PDF_DEADLINE less
+PDF_PAGE_SECONDS: it then goes late, and OCR stops there for this read, every later page today's
+image. doc.meta["ocr"] holds the counts, and OCR_LATE joins the warnings when a page went late.
+`glyphs` leaves out the fonts first met on a page whose text OCR gave. Without a session, when the
+gray cannot be made, or when its long side is under OCR_MIN_EDGE, the page is today's.
 """
 import math
 import time
@@ -69,7 +71,6 @@ OCR_COVER = 0.8             # invisible text over an image this big is an OCR la
 FIGURE_PATHS = 32           # non-rule paths that make a vector figure
 FIGURE_COVER = 0.04         # share of the page the figure's paths must cover
 FIGURE_PAD = 6.0            # points added around the figure's union box
-FIGURE_WHOLE = 0.7          # a figure box over this share of the page renders the whole page
 TINY_PT = 1.0               # text under this size is hidden ("tiny")
 IMAGE_MIN_PX = 32           # images under this many pixels a side are left out, uncounted
 IMAGE_MIN_PT = 16.0         # images drawn under this many points a side are left out, uncounted
@@ -155,6 +156,22 @@ def _decoded(data, deadline):
     from .. import raster
     got = raster.gray(data, deadline=deadline)
     return got[0] if got else None
+
+
+def _text_lines(frags, width, links=()):
+    """The lines of a page's own text in reading order."""
+    return pdf_layout.reading_order(pdf_layout.lines(frags, links), width)
+
+
+def _holds_text(frags, box) -> bool:
+    """Whether the centre of a fragment with text lies in `box` (page space)."""
+    for f in frags:
+        if f.text.strip():
+            fb = pdf_layout.box_of([f])
+            cx, cy = (fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2
+            if box[0] <= cx <= box[2] and box[1] <= cy <= box[3]:
+                return True
+    return False
 
 
 def _unturned(box, turn):
@@ -325,7 +342,7 @@ class _Reader:
             best = max(covers, default=(0.0, -1))
             if best[0] >= SCAN_COVER:
                 scan = pd.images[best[1]]
-        state = {"frags": [], "ocr": set(), "links": []}
+        state = {"frags": [], "ocr": set(), "links": [], "read": _text_lines}
         steps = (lambda: self._text(pd, turn, keep, state),
                  lambda: self._tables(pd, turn, keep, state),
                  lambda: self._images(pd, turn, keep, state, scan),
@@ -358,8 +375,7 @@ class _Reader:
 
     def _layout(self, keep, state):
         visible = [f for f in state["frags"] if not f.hidden]
-        lns = pdf_layout.lines(visible, state["links"])
-        keep.lines = pdf_layout.reading_order(lns, keep.view[2] - keep.view[0])
+        keep.lines = state["read"](visible, keep.view[2] - keep.view[0], links=state["links"])
 
     def _hide(self, frags, box, images):
         """The hidden rules, in page space: ocg as given, then offcrop, tiny and invisible.
@@ -477,6 +493,8 @@ class _Reader:
                 self.ctx.skipped["scan"] += 1
                 return
             alt = f"Page {pd.number}, text without Unicode" if unmapped else f"Scanned page {pd.number}"
+            if g is not None and max(g.w, g.h) < limits.OCR_MIN_EDGE:
+                g = None
             if g is None:
                 keep.items.append((math.inf, 0.0, -1, Image(data, alt=alt, ocr="page" if self.ocr is not None else "")))
                 return
@@ -494,7 +512,7 @@ class _Reader:
         crop = pd.box
         grown = (max(crop[0], box[0] - FIGURE_PAD), max(crop[1], box[1] - FIGURE_PAD),
                  min(crop[2], box[2] + FIGURE_PAD), min(crop[3], box[3] + FIGURE_PAD))
-        whole = _cover(grown, crop) > FIGURE_WHOLE or (pd.chars == 0 and not pd.images)
+        whole = _cover(grown, crop) > limits.FIGURE_WHOLE or (pd.chars == 0 and not pd.images)
         target = None if whole else grown
         data = None
         if pd.render is not None:
@@ -504,7 +522,8 @@ class _Reader:
             self.ctx.skipped["figure"] += 1
             return
         top = math.inf if whole else _view_box(grown, turn, crop)[3]
-        keep.items.append((top, 0.0, -1, Image(data)))
+        own = self.ocr is not None and _holds_text(pd.fragments, target or crop)
+        keep.items.append((top, 0.0, -1, Image(data, ocr="page" if own else "")))
         self.figures.append(pd.number)
 
     # -- after the loop
@@ -546,8 +565,9 @@ class _Reader:
         page, n = r.page, k.number
         w, h = page.w * 72.0 / dpi, page.h * 72.0 / dpi
         new = _Kept(n, (0.0, 0.0, w, h))
-        new.items = [it for it in k.items if not isinstance(it[3], Table)]
-        state = {"frags": ocr_layout.fragments(page, dpi), "ocr": set(), "links": k.links}
+        new.items = [(*it[:3], replace(it[3], ocr="page")) if isinstance(it[3], Image) else it
+                     for it in k.items if not isinstance(it[3], Table)]
+        state = {"frags": ocr_layout.fragments(page, dpi), "ocr": set(), "links": k.links, "read": ocr_layout.read}
         self._layout(new, state)
         self._found(new, state, ocr_layout.segments(r.rules, page, dpi), [])
         new.items.append((math.inf, -math.inf, -2, Para([Text(ocr_layout.SCANNED)])))
@@ -558,7 +578,7 @@ class _Reader:
             charge = -len(png)
         if v.kind == "area":
             data = png
-            if _cover(v.box, (0.0, 0.0, 1.0, 1.0)) <= FIGURE_WHOLE:
+            if _cover(v.box, (0.0, 0.0, 1.0, 1.0)) <= limits.FIGURE_WHOLE:
                 data = self._crop(png, _unturned(v.box, page.turn)) or png
             charge += len(data)
             new.items.append(((1 - v.box[1]) * h, v.box[0] * w, -1,

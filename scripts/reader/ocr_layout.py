@@ -3,7 +3,7 @@
 
 The words of one engine line share a baseline (the median box bottom) and a size: an estimate of the em, since a box holds only
 its word's ink (`_em`). Tables take their words by position. Lines are read from positions in two clean columns, else
-in the engine's order through `pdf_layout.reading_order` (`_read`).
+in the engine's order through `pdf_layout.reading_order` (`read`).
 """
 import math
 import statistics
@@ -129,14 +129,14 @@ def _columns(lns, mid, row_of):
     return [ln for side in (left, right) for ln in sorted(side, key=lambda ln: (row_of[ln.order], ln.box[0]))]
 
 
-def _read(frags, width) -> list:
-    """The lines of `frags` in reading order. The rows holding a line whose measured box reaches the middle band (a
-    title, a full-width line, a narrow gutter) cut the page into bands; when the rows leave a gutter clear inside the
-    band (`_gutter`), only the rows with a line over the gutter's middle do. A band clear of it with two clean columns
-    reads its left column, then its right. The rows between such bands keep the engine's order through
-    `pdf_layout.reading_order`, taken over all of them at once."""
+def read(frags, width, links=()) -> list:
+    """The lines of `frags` in reading order; a character in a box of `links` [(box, url)] carries its url. The rows
+    holding a line whose measured box reaches the middle band (a title, a full-width line, a narrow gutter) cut the
+    page into bands; when the rows leave a gutter clear inside the band (`_gutter`), only the rows with a line over the
+    gutter's middle do. A band clear of it with two clean columns reads its left column, then its right. The rows
+    between such bands keep the engine's order through `pdf_layout.reading_order`, taken over all of them at once."""
     ordered, row_of = _by_position(frags)
-    placed = pdf_layout.lines([replace(f, order=k) for k, f in enumerate(ordered)])
+    placed = pdf_layout.lines([replace(f, order=k) for k, f in enumerate(ordered)], links)
     by_row = defaultdict(list)
     for ln in placed:
         by_row[row_of[ln.order]].append(ln)
@@ -146,7 +146,7 @@ def _read(frags, width) -> list:
     out, rest = [], []
 
     def engine():
-        out.extend(pdf_layout.reading_order(pdf_layout.lines(rest), width))
+        out.extend(pdf_layout.reading_order(pdf_layout.lines(rest, links), width))
         rest.clear()
 
     for cross, band in groupby(range(len(ordered)), key=lambda k: row_of[k] in crossing):
@@ -164,7 +164,7 @@ def _read(frags, width) -> list:
 
 def reading_lines(page: OcrPage, dpi: float = 72.0) -> list[str]:
     """The text of each line, in reading order."""
-    return [ln.text for ln in _read(fragments(page, dpi), page.w * 72.0 / dpi)]
+    return [ln.text for ln in read(fragments(page, dpi), page.w * 72.0 / dpi)]
 
 
 def blocks(res: Result, number: int, dpi: float, skipped: Counter, *,
@@ -179,7 +179,7 @@ def blocks(res: Result, number: int, dpi: float, skipped: Counter, *,
                               budget if budget is not None else pdf_tables.TableBudget(), skipped, model=model)
     used = set().union(*(got.used for got in found))
     items = [(got.bbox[3], got.bbox[0], k, got.table) for k, got in enumerate(found)]
-    lns = _read([f for f in frags if f.order not in used], page.w * 72.0 / dpi)
+    lns = read([f for f in frags if f.order not in used], page.w * 72.0 / dpi)
     body = pdf_layout.body_size(lns)
     levels = {i: lvl for i, ln in enumerate(lns)
               if (lvl := pdf_layout.heading_level(ln.text, ln.size, body)) is not None}

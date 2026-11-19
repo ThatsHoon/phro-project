@@ -78,12 +78,12 @@ def _ocr(doc: Doc, s, data: bytes, ctx) -> None:
     """A lone TIFF's pages read by OCR (decisions 1 and 6 of the OCR plan). Each page's pixels (raster.gray) go to
     the session in turn; then each page read gives its text (`ocr_layout.blocks`, one table budget for the file): a
     doubtful page adds its image after the text, a picture area a gray crop of the pixels OCR read (the whole page
-    past pdf.FIGURE_WHOLE). A page not queued by FIGURE_RESERVE before the session's stop goes late at once, and no
+    past FIGURE_WHOLE). A page not queued by FIGURE_RESERVE before the session's stop goes late at once, and no
     later page is sent. A page OCR could not read (failed, late, or not sent for the time) stays as today's image; one
     whose pixels do not decode, too, counted as failed. A layout thrown away leaves no skip counts. doc.meta["ocr"]
     holds the counts, and OCR_LATE joins the warnings when a page went late. Every page image is marked `ocr="page"`, so no picture pass reads it again."""
     from .. import raster
-    from . import pdf, pdf_tables
+    from . import pdf_tables
     stop = s.deadline - limits.FIGURE_RESERVE
     until = stop - limits.FIGURE_RESERVE
     pages = [replace(b, ocr="page") for b in doc.blocks]
@@ -110,7 +110,7 @@ def _ocr(doc: Doc, s, data: bytes, ctx) -> None:
         r = s.wait(t) if isinstance(t, ocr.Ticket) else None
         status = (t or "failed") if r is None else r.status
         if status == "done":
-            got = _read(data, i, im, r, t.dpi, ctx.skipped, budget, stop, pdf.FIGURE_WHOLE)
+            got = _read(data, i, im, r, t.dpi, ctx.skipped, budget, stop)
             if got is not None:
                 out += got
                 counts["pages"] += 1
@@ -128,7 +128,7 @@ def _ocr(doc: Doc, s, data: bytes, ctx) -> None:
         doc.warnings.append(limits.OCR_LATE)
 
 
-def _read(data, i, im, r, dpi, skipped, budget, stop, whole) -> list | None:
+def _read(data, i, im, r, dpi, skipped, budget, stop) -> list | None:
     """The blocks of page `i` OCR read: its text, then its image (`im`) when doubtful, or its picture area; None when
     laying them out fails, which leaves the page as today's image and `skipped` as it was."""
     from collections import Counter
@@ -139,7 +139,7 @@ def _read(data, i, im, r, dpi, skipped, budget, stop, whole) -> list | None:
         if r.verdict.kind == "doubtful":
             got.append(im)
         elif r.verdict.kind == "area":
-            got.append(_area(data, i, r, stop, whole) or replace(im, alt=f"Picture on page {i + 1}"))
+            got.append(_area(data, i, r, stop) or replace(im, alt=f"Picture on page {i + 1}"))
         skipped.update(own)
         return got
     except ReadError as e:
@@ -150,12 +150,12 @@ def _read(data, i, im, r, dpi, skipped, budget, stop, whole) -> list | None:
     return None
 
 
-def _area(data: bytes, i: int, r, stop: float, whole: float) -> Image | None:
+def _area(data: bytes, i: int, r, stop: float) -> Image | None:
     """The picture area of page `i`: a gray PNG cut from the pixels as OCR read them (turned as it read them), at
-    most FIGURE_EDGE_TEXT on the long side (decision 6); None past `whole` of the page, or when the pixels no longer
-    decode."""
+    most FIGURE_EDGE_TEXT on the long side (decision 6); None past FIGURE_WHOLE of the page, or when the pixels no
+    longer decode."""
     from .. import ocr_pixels, raster
-    if r.unread.area > whole:
+    if r.unread.area > limits.FIGURE_WHOLE:
         return None
     got = raster.gray(data, page=i, deadline=stop)
     if got is None:

@@ -305,11 +305,10 @@ def test_judge_compact_dense_ink_is_area_past_unread():
     assert v == ocr.Verdict("area", logo), v
     photo = (0.3, 0.35, 0.7, 0.65)
     assert ocr.judge(p, Unread(0.7, photo, 0.12, 0.95)) == ocr.Verdict("area", photo)
-    from reader.formats.pdf import FIGURE_WHOLE
     whole = (0.0, 0.0, 1.0, 1.0)
     assert ocr.judge(p, Unread(0.12, whole, 1.0, 0.9)).kind == "doubtful"
-    big = (0.0, 0.0, 1.0, FIGURE_WHOLE)
-    assert ocr.judge(p, Unread(0.12, big, FIGURE_WHOLE, 0.9)).kind == "doubtful"
+    big = (0.0, 0.0, 1.0, limits.FIGURE_WHOLE)
+    assert ocr.judge(p, Unread(0.12, big, limits.FIGURE_WHOLE, 0.9)).kind == "doubtful"
     assert ocr.judge(p, Unread(0.12, logo, 0.006, limits.OCR_AREA_DENSITY - 1e-3)).kind == "doubtful"
     assert ocr.judge(page(JUNK), Unread(0.12, logo, 0.006, 0.9)).kind == "doubtful"  # the other signals still count
 

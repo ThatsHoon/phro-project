@@ -620,6 +620,10 @@ JPEG = bytes.fromhex(
     "494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2"
     "a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9"
     "eaf1f2f3f4f5f6f7f8f9faffda0008010100003f002bffd9")
+# JPEG at 64 x 64, at least OCR_MIN_EDGE: its frame header's size set, and 64 blocks of DC difference 0 then end of
+# block (bits 00 1010 each, no byte padding between them), a flat grey that GDI+ decodes
+JPEG64 = (JPEG[:JPEG.index(b"\xff\xc0") + 5] + bytes([0, 64, 0, 64])
+          + JPEG[JPEG.index(b"\xff\xc0") + 9:JPEG.index(b"\xff\xda") + 10] + bytes.fromhex("28a28a") * 16 + b"\xff\xd9")
 
 
 def fake_venv(dir, *, build=7000):

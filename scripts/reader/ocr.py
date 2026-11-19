@@ -296,12 +296,11 @@ def judge(page: OcrPage, un: Unread) -> Verdict:
 
     Otherwise the unread ink decides. A picture is a box whose pixels are at least OCR_AREA_DENSITY unread ink:
     scattered misses span a large box with sparse ink. Past OCR_UNREAD unread, a compact picture (its box under
-    pdf.FIGURE_WHOLE: a logo, a dark photo) is an area, and anything else (a noisy scan's ink over the whole page) is
+    FIGURE_WHOLE: a logo, a dark photo) is an area, and anything else (a noisy scan's ink over the whole page) is
     doubtful. Under it, a picture whose box covers at least OCR_AREA is an area, and the page is trusted otherwise.
 
     `un` must be computed on `rotate(g, page.turn)`, the frame the page's boxes are in, so `Verdict.box` is a
     fractional box of that turned bitmap."""
-    from .formats.pdf import FIGURE_WHOLE
     confs = [w.conf for w in page.words if w.conf is not None]
     doubtful = (
         junk_share(page) > limits.OCR_JUNK
@@ -314,7 +313,7 @@ def judge(page: OcrPage, un: Unread) -> Verdict:
         return Verdict("doubtful", None)
     picture = un.box is not None and un.density >= limits.OCR_AREA_DENSITY
     if un.share > limits.OCR_UNREAD:
-        return Verdict("area", un.box) if picture and un.area < FIGURE_WHOLE else Verdict("doubtful", None)
+        return Verdict("area", un.box) if picture and un.area < limits.FIGURE_WHOLE else Verdict("doubtful", None)
     if picture and un.area >= limits.OCR_AREA:
         return Verdict("area", un.box)
     return Verdict("trusted", None)

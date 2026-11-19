@@ -56,6 +56,7 @@ FIGURE_EDGE_TEXT = 1_024   # long side of a figure PNG with text (and of a TIFF 
 FIGURE_EDGE_PLAIN = 768    # long side of a figure PNG with no text, never upscaled
 FIGURE_TEXT_PX = 12        # smallest text height, in pixels at 96 dpi, under which a figure is upscaled (at most 2x)
 FIGURE_RESERVE = 3         # seconds left before the deadline under which no further picture is rendered
+FIGURE_WHOLE = 0.7         # a pdf figure box, or an OCR picture area, over this share of the page takes the whole page
 METAFILE_RECORDS = 1_000_000  # records of one WMF, EMF, PICT or WPG
 METAFILE_POINTS = 4_000_000   # points across all paths of one picture
 METAFILE_OBJECTS = 65_535     # WMF and EMF object table slots
