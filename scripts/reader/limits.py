@@ -69,23 +69,33 @@ FONT_BYTES = 64 * 2**20    # bytes read from one font file
 # the warning of a document whose figures the deadline left undrawn: its result is not kept in the cache
 FIGURES_LATE = "figures not rendered: time"
 # OCR of scanned pages and raster pictures: each cap is read at call time. The doubt signals (OCR_JUNK, OCR_UNREAD,
-# OCR_CONF, OCR_LOW), OCR_WORKERS and the Tesseract page segmentation modes are start values the bench calibrates
+# OCR_CONF, OCR_LOW), OCR_WORKERS, the rule and area bounds and the Tesseract page segmentation modes are calibrated
+# on the OCR spike's 30 synthetic pages (6 layouts at 150, 200 and 300 dpi, skewed 2 degrees and noisy): every noisy
+# page doubtful, the most clean pages trusted
 OCR_DPI = 200              # resolution a pdf page is rendered at for OCR
 OCR_MIN_EDGE = 64          # long side, in pixels, under which a picture is not read
 OCR_MIN_WORDS = 2          # words under which a picture gets no text
-OCR_WORKERS = min(4, os.cpu_count() or 1)  # pages recognized at once
+OCR_WORKERS = min(4, os.cpu_count() or 1)  # pages recognized at once; 12 pages: 2.12, 1.34, 0.92 s a page at 1, 2, 4
 OCR_RULE = 0.05            # shortest ruled-table rule, as a share of the page side it runs along
-OCR_RULE_THICK = 1 / 40    # thickest rule, in inches (at least 2 px); start value, Task 11 calibrates it
+OCR_RULE_THICK = 1 / 40    # thickest rule, in inches (at least 2 px); spike tables' rules 2-5 px at 150-300 dpi, noisy
+#                            included, all found; 1/60 loses them at 150 and 200 dpi; no text page gives a rule at 1/20
 OCR_RULES_MAX = 1_000      # rules a page may have; past this it is texture (a photo, halftone) and gives none
-OCR_AREA = 0.04            # share of the page the unread ink's box must cover to make a picture area
+OCR_AREA = 0.04            # share of the page the unread ink's box must cover to make a picture area; a drawing or
+#                            light photo pasted on a spike page: 0.12-0.45; Windows clean pages: 0
 OCR_LATIN = 0.9            # share of Latin letters from which Tesseract eng reads a Windows page again
-OCR_JUNK = 0.03            # share of junk characters over which a page is doubtful and a picture gets no text
-OCR_UNREAD = 0.15          # share of dark pixels outside the word boxes over which a page is doubtful
-OCR_CONF = 88              # mean word confidence under which a Tesseract page is doubtful
-OCR_LOW = 0.08             # share of low-confidence words over which a Tesseract page is doubtful
+OCR_JUNK = 0.03            # share of junk characters over which a page is doubtful and a picture gets no text; clean
+#                            spike pages at most 0.003, noisy 0-0.033: the other signals carry the noisy pages
+OCR_UNREAD = 0.07          # share of dark pixels outside the word boxes over which a page is doubtful; spike: clean text
+#                            pages at most 0.055 (Tesseract), noisy Windows Korean pages 0.087-0.121
+OCR_CONF = 88              # mean word confidence under which a Tesseract page is doubtful; spike: clean 90.2-96.6,
+#                            noisy 71.6-83.5
+OCR_LOW = 0.08             # share of low-confidence words over which a Tesseract page is doubtful; spike: clean at most
+#                            0.039, noisy 0.131-0.292
 OCR_LOW_WORD = 60          # confidence under which a word counts as low
-TESS_PSM_LATIN = 3         # Tesseract page segmentation mode for a Latin read
-TESS_PSM_KOR = 4           # Tesseract page segmentation mode for a kor+eng read
+TESS_PSM_LATIN = 3         # Tesseract page segmentation mode for a Latin read; spike English CER in reading order
+#                            0.015 (psm 4: 0.206, psm 6: 0.141)
+TESS_PSM_KOR = 4           # Tesseract page segmentation mode for a kor+eng read; spike CER in reading order 0.299
+#                            (psm 3: 0.475, psm 6: 0.335)
 OCR_FRAME_JSON = 2**20     # header bytes of one OCR worker frame
 OCR_QUEUE_BYTES = 64 * 2**20  # pixel bytes waiting for the worker past which submitting a page waits (until the stop)
 # the warning of a document whose OCR the deadline left unfinished

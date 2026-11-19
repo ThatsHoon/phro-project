@@ -3,7 +3,7 @@ are imported only there; heavier imports happen inside functions."""
 import time
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 # when the reader was imported: the CLI child passes it to the pdf and djvu page loops' deadlines
 STARTED = time.monotonic()

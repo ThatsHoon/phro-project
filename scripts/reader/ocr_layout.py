@@ -5,6 +5,7 @@ The words of one engine line share a baseline (the median box bottom) and a size
 its word's ink (`_em`). Tables take their words by position. Lines are read from positions in two clean columns, else
 in the engine's order through `pdf_layout.reading_order` (`_read`).
 """
+import math
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import replace
@@ -87,13 +88,42 @@ def _by_position(frags) -> tuple[list, list]:
     return ordered, row_of
 
 
-def _columns(lns, width, row_of):
-    """The left lines, then the right, each by row and x, when the lines (none crossing the middle band) hold at least
-    3 rows a side, as `xps._columns` asks; else None."""
-    if width <= 0 or len(lns) < 6:
+def _gutter(ordered, row_of, width):
+    """The middle of the widest strip of the middle band, in whole points, that the words of at most a tenth of the
+    rows cross; None when the strip is narrower than `pdf_layout.GUTTER` median sizes, so the rows are cut there into
+    pieces (`_by_position`). A two-column page's gutter narrower than the band is such a strip; a page of one column,
+    whose words cover the middle on most rows, has none."""
+    lo, hi = width * (0.5 - BAND), width * (0.5 + BAND)
+    n = math.ceil(hi - lo)
+    if not ordered or n <= 0:
         return None
-    left = [ln for ln in lns if ln.box[0] < width / 2]
-    right = [ln for ln in lns if ln.box[0] >= width / 2]
+    count = [0] * n
+    by_row = defaultdict(set)
+    for f, r in zip(ordered, row_of):
+        a, b = max(int(f.x - lo), 0), min(math.ceil(f.x + f.width - lo), n)
+        by_row[r].update(range(a, b))
+    for bins in by_row.values():
+        for k in bins:
+            count[k] += 1
+    allowed = len(set(row_of)) // 10
+    best, start = (0, 0), None
+    for k, c in enumerate(count + [allowed + 1]):
+        if c <= allowed:
+            start = k if start is None else start
+        elif start is not None:
+            best, start = max(best, (k - start, start)), None
+    if best[0] < pdf_layout.GUTTER * statistics.median(f.size for f in ordered):
+        return None
+    return lo + best[1] + best[0] / 2
+
+
+def _columns(lns, mid, row_of):
+    """The left lines, then the right, each by row and x, when the lines (none crossing the middle band or the gutter
+    around `mid`) hold at least 3 rows a side, as `xps._columns` asks; else None."""
+    if mid <= 0 or len(lns) < 6:
+        return None
+    left = [ln for ln in lns if ln.box[0] < mid]
+    right = [ln for ln in lns if ln.box[0] >= mid]
     if min(len({row_of[ln.order] for ln in side}) for side in (left, right)) < 3:
         return None
     return [ln for side in (left, right) for ln in sorted(side, key=lambda ln: (row_of[ln.order], ln.box[0]))]
@@ -101,16 +131,17 @@ def _columns(lns, width, row_of):
 
 def _read(frags, width) -> list:
     """The lines of `frags` in reading order. The rows holding a line whose measured box reaches the middle band (a
-    title, a full-width line, a narrow gutter) cut the page into bands. A band clear of the middle with two clean
-    columns reads its left column, then its right. The rows between such bands keep the engine's order through
-    `pdf_layout.reading_order`, taken over all of them at once: on a narrow gutter that is the only column order there
-    is."""
+    title, a full-width line, a narrow gutter) cut the page into bands; when the rows leave a gutter clear inside the
+    band (`_gutter`), only the rows with a line over the gutter's middle do. A band clear of it with two clean columns
+    reads its left column, then its right. The rows between such bands keep the engine's order through
+    `pdf_layout.reading_order`, taken over all of them at once."""
     ordered, row_of = _by_position(frags)
     placed = pdf_layout.lines([replace(f, order=k) for k, f in enumerate(ordered)])
     by_row = defaultdict(list)
     for ln in placed:
         by_row[row_of[ln.order]].append(ln)
-    lo, hi = width * (0.5 - BAND), width * (0.5 + BAND)
+    mid = _gutter(ordered, row_of, width)
+    lo, hi = (mid, mid) if mid is not None else (width * (0.5 - BAND), width * (0.5 + BAND))
     crossing = {r for r, lns in by_row.items() if any(ln.box[0] < hi and ln.box[2] > lo for ln in lns)}
     out, rest = [], []
 
@@ -121,7 +152,7 @@ def _read(frags, width) -> list:
     for cross, band in groupby(range(len(ordered)), key=lambda k: row_of[k] in crossing):
         band = list(band)
         split = None if cross else _columns([ln for r in sorted({row_of[k] for k in band}) for ln in by_row[r]],
-                                            width, row_of)
+                                            (lo + hi) / 2, row_of)
         if split is None:
             rest += [ordered[k] for k in band]
         else:

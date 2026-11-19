@@ -105,6 +105,23 @@ def test_narrow_gutter_keeps_engine_column_order():
     assert ocr_layout.reading_lines(page(words)) == want, ocr_layout.reading_lines(page(words))
 
 
+def test_narrow_gutter_found_in_rows_given_across_columns():
+    """Tesseract psm 4 on a two-column page whose gutter (30 pt, 2.5 em) lies inside the middle band: one engine line
+    holds both halves of a row, and the left column's ragged lines reach into the band. The clear strip all rows
+    leave is the gutter: the left column is read, then the right."""
+    words, left, right = [], [], []
+    for r in range(6):
+        n, end = 3 + r % 3, 470 + 10 * (r % 3)
+        step = (end - 50) // n
+        texts = [f"L{r}{k}" for k in range(n)]
+        words += [word(t, 50 + step * k, 100 + 30 * r, step - 10 if k < n - 1 else end - 50 - step * k, 12, r)
+                  for k, t in enumerate(texts)]
+        words += [word(f"R{r}{k}", 520 + 140 * k, 100 + 30 * r, 130, 12, r) for k in range(3)]
+        left.append(" ".join(texts))
+        right.append(" ".join(f"R{r}{k}" for k in range(3)))
+    assert ocr_layout.reading_lines(page(words)) == left + right, ocr_layout.reading_lines(page(words))
+
+
 GRID_X = (100, 300, 500, 700)  # pixels at 144 dpi: 50, 150, 250 and 350 pt
 GRID_Y = (100, 160, 220, 280)
 ROWS = (("Apples", "3", "5"), ("Pears", "4", "6"), ("Plums", "7", "8"))
