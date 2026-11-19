@@ -25,9 +25,10 @@ class Word:
 
 @dataclass
 class OcrPage:
-    """An engine's result for one bitmap. `w` and `h` are the frame the boxes are in, `angle` the text angle the
-    engine reported, `turn` the rotation the reader applied (0, 90, 180 or 270), `engine` and `version` the ids
-    that key caches."""
+    """An engine's result for one bitmap. `turn` is the rotation the reader applied before the engine read it: 0,
+    90, 180 or 270 degrees clockwise (`ocr_pixels.rotate`). `w`, `h` and every word box are in the frame of that
+    turned bitmap, `rotate(g, turn)`, so `w` and `h` are swapped for 90 and 270. `angle` is the text angle the engine
+    reported, `engine` and `version` the ids that key caches."""
     w: int
     h: int
     words: list[Word]
@@ -60,31 +61,44 @@ class _Tess:
         return ocr_tess.recognize(g, langs, psm, deadline)
 
 
-def engines() -> Engines:
-    """The real engines. Windows OCR is loaded when a recognizer folder exists under %WINDIR%\\OCR, asking for Korean;
-    it is Korean when the engine it gives is (`win-ko`), which needs a `ko` recognizer. Tesseract is kept when it is
-    found and has `kor` or `eng`. An engine that fails to load is None."""
-    from . import ocr_tess, ocr_win
-    win, korean = None, False
-    try:
-        if ocr_win.recognizers():
-            win = ocr_win.WinOcr("ko")
-            korean = win.engine == "win-ko" or win.engine.startswith("win-ko-")
-    except OSError:
-        win = None
-    tess = None
+def _win_load():
+    """Windows OCR asking for Korean, when a recognizer folder exists under %WINDIR%\\OCR; else None."""
+    from . import ocr_win
+    return ocr_win.WinOcr("ko") if ocr_win.recognizers() else None
+
+
+def _tess_load() -> _Tess | None:
+    """Tesseract when it is found and has `kor` or `eng`; else None."""
+    from . import ocr_tess
     exe = ocr_tess.find()
-    if exe is not None:
-        langs = ocr_tess.langs(exe)
-        if langs & {"kor", "eng"}:
-            tess = _Tess(langs)
+    if exe is None:
+        return None
+    langs = ocr_tess.langs(exe)
+    return _Tess(langs) if langs & {"kor", "eng"} else None
+
+
+def engines() -> Engines:
+    """The real engines. The Windows engine is Korean when the engine it gives is (`win-ko`), which needs a `ko`
+    recognizer. An engine that fails to load, for any reason, is None: OCR never makes a document fail. The caller
+    owns `win` and closes it (`WinOcr.close()`) after the last page."""
+    try:
+        win = _win_load()
+        korean = win is not None and (win.engine == "win-ko" or win.engine.startswith("win-ko-"))
+    except Exception:  # noqa: BLE001 - a ctypes fault of any type means no Windows engine
+        win, korean = None, False
+    try:
+        tess = _tess_load()
+    except Exception:  # noqa: BLE001 - likewise for the Tesseract probe
+        tess = None
     return Engines(win, tess, korean)
 
 
 # ---- characters ------------------------------------------------------------------------------------------------------
 
-_ASCII_PUNCT = ".,:;!?'\"()[]{}<>-_/\\%&*+=#@~"
-PUNCT = _ASCII_PUNCT + "–—·…‘’“”「」『』《》〈〉○●□■△▲※" + "".join(chr(ord(c) + 0xFEE0) for c in _ASCII_PUNCT)
+# The punctuation `junk_share` accepts: the brief's list, plus `$ | ^ ° ₩ €` (prices, footnotes and degrees are
+# common on clean pages), plus the full-width forms of the ASCII ones.
+_ASCII_PUNCT = ".,:;!?'\"()[]{}<>-_/\\%&*+=#@~$|^"
+PUNCT = _ASCII_PUNCT + "–—·…‘’“”「」『』《》〈〉○●□■△▲※°₩€" +"".join(chr(ord(c) + 0xFEE0) for c in _ASCII_PUNCT)
 _PUNCT = frozenset(PUNCT)
 
 
@@ -160,13 +174,13 @@ def _read_once(g: Gray, eng: Engines, deadline: float) -> tuple[OcrPage | None, 
         return None, False
     if tess is not None and "eng" in tess.langs and latin_share(page) >= limits.OCR_LATIN:
         again = _tess_read(tess, g, ("eng",), limits.TESS_PSM_LATIN, deadline)
-        if again is not None:
+        if again is not None and again.words:  # a re-read with no words never replaces one with words
             return again, False
     if not eng.win_korean and junk_share(page) > limits.OCR_JUNK:
         if tess is None or "kor" not in tess.langs:
             return page, True  # decision 13: a non-Korean Windows engine, junk, and no Tesseract kor
         again = _tess_read(tess, g, ("kor", "eng"), limits.TESS_PSM_KOR, deadline)
-        if again is not None:
+        if again is not None and again.words:
             return again, False
     return page, False
 
@@ -175,9 +189,14 @@ def read_page(g: Gray, eng: Engines, deadline: float, kind: str) -> tuple[OcrPag
     """The page read by the engine chosen for it, and whether it calls for the Korean hint (decision 13).
 
     `kind` is "page" or "picture". A page whose 0-degree pass has a junk share over OCR_JUNK is read again turned
-    180, 90 and 270 degrees while time is left, and the pass with the best `_score` is kept, with its `turn` set and
-    its hint; a picture is read once (decision 11). `deadline` is a time.monotonic() value. (None, False) when no
+    clockwise by 180, 90 and 270 degrees, in that order, while time is left. The search stops at the first turn whose
+    pass has words and a junk share of at most OCR_JUNK. The pass with the best `_score` is kept, with its `turn` set
+    and its hint. A picture is read once (decision 11). `deadline` is a time.monotonic() value. (None, False) when no
     engine gives a page. An engine's OSError is not caught here: the worker catches it per job.
+
+    The returned page's `w`, `h` and boxes are in the frame of `rotate(g, page.turn)`. The caller computes the page's
+    `threshold`, `rules` and `Unread` on that turned bitmap, so `judge`'s `Verdict.box` is in the same frame; the page
+    image or crop shown for a turned page is cut from that turned bitmap too.
     """
     if kind not in ("page", "picture"):
         raise ValueError(f"kind {kind!r}")
@@ -197,6 +216,8 @@ def read_page(g: Gray, eng: Engines, deadline: float, kind: str) -> tuple[OcrPag
         s = _score(p)
         if s > best_score:
             best, best_hint, best_score = p, h, s
+        if p.words and junk_share(p) <= limits.OCR_JUNK:  # a clean turn ends the search; an empty one does not
+            break
     return best, best_hint
 
 
@@ -213,7 +234,10 @@ class Verdict:
 def judge(page: OcrPage, un: Unread) -> Verdict:
     """Doubtful when the junk share passes OCR_JUNK, the unread share passes OCR_UNREAD, the words' mean confidence
     (when they carry one) is under OCR_CONF, the share of those words under OCR_LOW_WORD passes OCR_LOW, or there are
-    no words while some ink is unread. Otherwise a picture area when the unread box covers at least OCR_AREA."""
+    no words while some ink is unread. Otherwise a picture area when the unread box covers at least OCR_AREA.
+
+    `un` must be computed on `rotate(g, page.turn)`, the frame the page's boxes are in, so `Verdict.box` is a
+    fractional box of that turned bitmap."""
     confs = [w.conf for w in page.words if w.conf is not None]
     doubtful = (
         junk_share(page) > limits.OCR_JUNK
