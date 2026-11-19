@@ -1,4 +1,5 @@
 """Budgets and the one error type every reader module raises."""
+import os
 
 MAX_INPUT = 512 * 2**20
 ZIP_TOTAL = 2**30
@@ -67,6 +68,25 @@ FONT_FILES = 4_000         # font files indexed
 FONT_BYTES = 64 * 2**20    # bytes read from one font file
 # the warning of a document whose figures the deadline left undrawn: its result is not kept in the cache
 FIGURES_LATE = "figures not rendered: time"
+# OCR of scanned pages and raster pictures: each cap is read at call time. The doubt signals (OCR_JUNK, OCR_UNREAD,
+# OCR_CONF, OCR_LOW), OCR_WORKERS and the Tesseract page segmentation modes are start values the bench calibrates
+OCR_DPI = 200              # resolution a pdf page is rendered at for OCR
+OCR_MIN_EDGE = 64          # long side, in pixels, under which a picture is not read
+OCR_MIN_WORDS = 2          # words under which a picture gets no text
+OCR_WORKERS = min(4, os.cpu_count() or 1)  # pages recognized at once
+OCR_RULE = 0.05            # shortest ruled-table rule, as a share of the page side it runs along
+OCR_AREA = 0.04            # share of the page the unread ink's box must cover to make a picture area
+OCR_LATIN = 0.9            # share of Latin letters from which Tesseract eng reads a Windows page again
+OCR_JUNK = 0.03            # share of junk characters over which a page is doubtful and a picture gets no text
+OCR_UNREAD = 0.15          # share of dark pixels outside the word boxes over which a page is doubtful
+OCR_CONF = 88              # mean word confidence under which a Tesseract page is doubtful
+OCR_LOW = 0.08             # share of low-confidence words over which a Tesseract page is doubtful
+OCR_LOW_WORD = 60          # confidence under which a word counts as low
+TESS_PSM_LATIN = 3         # Tesseract page segmentation mode for a Latin read
+TESS_PSM_KOR = 4           # Tesseract page segmentation mode for a kor+eng read
+OCR_FRAME_JSON = 2**20     # header bytes of one OCR worker frame
+# the warning of a document whose OCR the deadline left unfinished
+OCR_LATE = "ocr not finished: time"
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 # a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
 BIG_INPUT = "input"  # the file is over MAX_INPUT
