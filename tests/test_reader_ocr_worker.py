@@ -377,6 +377,33 @@ def test_close_ends_worker():
         assert s.wait(t).status == "failed"
 
 
+def test_submit_waits_while_queued_pixels_pass_the_budget():
+    """The worker sleeps on its first page and the writer blocks on the second (past any pipe buffer), so pages pile up
+    in the queue: past OCR_QUEUE_BYTES `submit` blocks, at most until the stop, and a page still blocked then is late
+    without being queued. Under the budget the same submits return at once."""
+    assert limits.OCR_QUEUE_BYTES == 64 * 2**20
+    saved = limits.OCR_QUEUE_BYTES
+    with stub(delay=30):
+        try:
+            for budget, blocks in ((1, True), (2**40, False)):
+                limits.OCR_QUEUE_BYTES = budget
+                s = ocr.Session(time.monotonic() + limits.FIGURE_RESERVE + 3, BACKEND, cmd=STUB)
+                try:
+                    t0 = time.monotonic()
+                    ts = [s.submit(gray(1000 + k, 300), "page", 200.0) for k in range(6)]
+                    took = time.monotonic() - t0
+                    if blocks:
+                        assert took > 2.5, took
+                        assert s._state == "over" and s.wait(ts[-1]).status == "late"
+                    else:
+                        assert took < 2.0, took
+                        assert len(s._queue) >= 3, len(s._queue)
+                finally:
+                    s.close()
+        finally:
+            limits.OCR_QUEUE_BYTES = saved
+
+
 def test_opened_sets_session():
     assert ocr.session() is None
     with ocr.opened(time.monotonic() + 60, ("", "")) as s:

@@ -41,7 +41,8 @@ last page and the document; pdf.py calls it in a finally.
 - An image's bytes: DCT data as it is; over `images._MAX_PIXELS` pixels, a CROP_DPI render of
   its box; anything else a PNG of `FPDFImageObj_GetBitmap` through `images._png`.
 - `render(box, dpi)` renders the page (box None) or a page-space box, long side capped at
-  RENDER_LONG pixels.
+  RENDER_LONG pixels. `render(box, dpi, gray=True, cap=None)` gives the Gray8 pixels for OCR
+  instead, at most `cap` pixels (images._MAX_PIXELS).
 - Decode budget: every image object's pixel size is summed first (no decode). A render decodes
   every image on the page, so a page whose images total more than `pdf.PDF_PAGE_DECODE_PIXELS`
   (or whose walk was cut short) has no render: `render` raises and pdf.py puts its scan or figure
@@ -433,10 +434,10 @@ class PdfiumDoc:
         renders = whole and total <= budget
         left = [budget]
 
-        def render(target, dpi):
+        def render(target, dpi, gray=False, cap=None):
             if not renders:
                 raise ReadError("too_large", "page images past the decode budget")
-            return self._render(page, box, turn, target, dpi)
+            return self._render(page, box, turn, target, dpi, gray, cap)
 
         # an image the budget refused has no data, so pdf.py counts it `image` as it does any
         # image it cannot take
@@ -928,9 +929,12 @@ class PdfiumDoc:
     # -- renders
 
     @staticmethod
-    def _render(page, crop, turn, target, dpi):
+    def _render(page, crop, turn, target, dpi, gray=False, cap=None):
         """PNG bytes of the page, or of `target` (a page-space box), at `dpi` lowered so the
-        long side is at most RENDER_LONG pixels (a page over 200 inches renders at that cap)."""
+        long side is at most RENDER_LONG pixels (a page over 200 inches renders at that cap).
+        With `gray`, an `ocr_pixels.Gray` instead (the green channel when pypdfium2 gives no
+        grayscale render), at `dpi` lowered so it holds at most `cap` pixels
+        (images._MAX_PIXELS when None)."""
         x0, y0, x1, y1 = crop
         if target is not None:
             target = _rect(max(target[0], x0), max(target[1], y0), min(target[2], x1), min(target[3], y1))
@@ -947,10 +951,13 @@ class PdfiumDoc:
         long_side = max(vx1 - vx0, vy1 - vy0)
         if not dpi or dpi <= 0 or long_side <= 0:
             raise ValueError("nothing to render")
+        cut = (max(0.0, vx0), max(0.0, vy0), max(0.0, vw - vx1), max(0.0, vh - vy1))
+        if gray:
+            return PdfiumDoc._gray(page, cut, vx1 - vx0, vy1 - vy0, dpi,
+                                   reader_images._MAX_PIXELS if cap is None else cap)
         # one pixel under the cap: pdfium rounds each edge up
         scale = min(dpi / 72.0, (caps.RENDER_LONG - 1) / long_side)
-        bitmap = page.render(scale=scale, crop=(max(0.0, vx0), max(0.0, vy0), max(0.0, vw - vx1),
-                                                max(0.0, vh - vy1)), rev_byteorder=True)
+        bitmap = page.render(scale=scale, crop=cut, rev_byteorder=True)
         width, height, stride = bitmap.width, bitmap.height, bitmap.stride
         if max(width, height) > caps.RENDER_LONG:
             raise ValueError("render past the long-side cap")
@@ -962,6 +969,25 @@ class PdfiumDoc:
         got = _rgb_rows_rev(data, width, height, stride, channels)
         # zlib level 1: the default level took 0.19 s of a 0.21 s render of a grained scan (Task 19)
         return reader_images._png(width, height, got, False, 1)
+
+    @staticmethod
+    def _gray(page, cut, bw, bh, dpi, cap):
+        """The Gray of a `bw` x `bh` point view at `dpi`, lowered so the bitmap holds at most `cap`
+        pixels. pdfium rounds each edge up, by under a pixel, so the scale s solves
+        (bw*s + 1)(bh*s + 1) = cap."""
+        from ..ocr_pixels import fit, from_pixels
+        a, b = bw * bh, bw + bh
+        scale = min(dpi / 72.0, (math.sqrt(b * b + 4 * a * (cap - 1)) - b) / (2 * a))
+        try:
+            bitmap = page.render(scale=scale, crop=cut, grayscale=True)
+        except TypeError:  # a pypdfium2 without the grayscale option: decision 4 takes the green channel
+            bitmap = page.render(scale=scale, crop=cut)
+        try:
+            g = from_pixels(bitmap.width, bitmap.height, bytes(bitmap.buffer), bitmap.n_channels,
+                            bitmap.stride)
+        finally:
+            bitmap.close()
+        return fit(g, cap)
 
     # -- annotations
 

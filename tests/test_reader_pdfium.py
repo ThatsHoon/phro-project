@@ -680,6 +680,80 @@ def test_pdfium_native_damaged():
     assert "Only pdfium reads" in got["md"] and got["meta"]["engine"] == "pdfium", got
 
 
+# children run as `python -I -X utf8 -c CODE <scripts> ...`: scripts/ goes after site-packages (its queue.py must not
+# shadow the stdlib's), the pdf on stdin, one JSON line out
+_GRAY = r"""
+import json, sys
+sys.path.append(sys.argv[1])
+from reader.formats import pdf_pdfium
+from reader.pdfnative.document import NativeDoc
+data = sys.stdin.buffer.read()
+doc = pdf_pdfium.PdfiumDoc(data, NativeDoc(data))
+try:
+    pd = doc.page(0)
+    out = [[type(g).__name__, g.w, g.h, min(g.data), max(g.data)]
+           for g in (pd.render(None, 200, gray=True), pd.render(None, 200, gray=True, cap=1_000_000))]
+finally:
+    doc.close()
+print(json.dumps(out))
+"""
+
+_SCAN = r"""
+import json, struct, sys, tempfile
+from pathlib import Path
+sys.path.append(sys.argv[1])
+from reader import markdown, ocr
+from reader.formats import pdf
+from reader.model import Context
+data = sys.stdin.buffer.read()
+ctx = Context()
+with ocr.opened(None, ("win-ko", "test"), cmd=[sys.executable, "-I", "-X", "utf8", sys.argv[2]]) as s:
+    sent, real = [], s.submit
+    def submit(g, kind, dpi):
+        sent.append([g.w, g.h, kind, dpi])
+        return real(g, kind, dpi)
+    s.submit = submit
+    doc = pdf.parse_bytes(data, ctx, engine="pdfium")
+with tempfile.TemporaryDirectory() as tmp:
+    text = markdown.render(doc, Path(tmp) / "assets", False, ctx.skipped)
+    folder = Path(tmp) / "assets"
+    assets = [[p.name, *struct.unpack(">II", p.read_bytes()[16:24])] for p in sorted(folder.glob("*.png"))]
+print(json.dumps({"md": text, "sent": sent, "meta": doc.meta, "skipped": dict(ctx.skipped), "assets": assets}))
+"""
+
+
+def child(code, data, *args, env=None):
+    r = subprocess.run([str(PY), "-I", "-X", "utf8", "-c", code, str(HERE / "scripts"), *args], input=data,
+                       capture_output=True, timeout=300, env=env)
+    err = r.stderr.decode("utf-8", "replace")
+    assert r.returncode == 0, err
+    return json.loads(r.stdout.decode("utf-8").strip().splitlines()[-1])
+
+
+def test_pdfium_gray_render_size():
+    whole, capped = child(_GRAY, simple_pdf([text_ops("Gray")]))
+    assert whole[:3] == ["Gray", 1700, 2200] and whole[3] < 128 and whole[4] == 255, whole
+    assert capped[0] == "Gray" and 900_000 < capped[1] * capped[2] <= 1_000_000, capped
+    assert abs(capped[1] / capped[2] - 1700 / 2200) < 0.01, capped
+
+
+def test_pdfium_scan_read_by_ocr():
+    """A scanned page renders once: the gray at OCR_DPI goes to the worker, the page PNG at RENDER_DPI is held and
+    linked only when the page is doubtful."""
+    data = with_image(FULL, image_xobject(64, 64, data=bytes(range(64)) * 64))
+    stub = str(HERE / "tests" / "ocr_stub_worker.py")
+    for unread, linked in ((0.0, False), (0.5, True)):
+        conf = {"answer": {"unread": {"share": unread, "box": None, "area": 0.0}}}
+        got = child(_SCAN, data, stub, env=dict(os.environ, PHRO_OCR_STUB=json.dumps(conf)))
+        assert got["sent"] == [[1700, 2200, "page", 200.0]], got["sent"]
+        md = got["md"]
+        assert md.index("_Scanned page, text by OCR._") < md.index("w1700"), md
+        assert ("![Scanned page 1](assets/img-001.png)" in md) == linked, md
+        assert got["assets"] == ([["img-001.png", 935, 1210]] if linked else []), got["assets"]
+        assert got["meta"]["ocr"] == {"pages": 1, "doubtful": int(linked), "failed": 0, "stopped_at": None}
+        assert not got["skipped"], got["skipped"]
+
+
 def main():
     if PY is None:
         print("skip: no pdf venv")

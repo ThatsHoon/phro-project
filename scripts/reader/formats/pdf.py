@@ -20,6 +20,16 @@ page counts `text`, once with the char cap.
 A page whose glyphs without Unicode (dropped, counted `glyphs`) outnumber its chars is offered as
 an image, as a scan is: pdfium renders it; native, with no render, puts it on `unrendered` and
 counts `scan`.
+
+Scanned pages and OCR (decisions 1-4 and 6 of the OCR plan). With an OCR session open
+(`ocr.session()`), a scanned or unmapped page that renders also gives its Gray8 pixels in the same
+render, counted once against PDF_RENDERS: pdfium renders it at OCR_DPI, native decodes the page's
+own image (`raster.gray`). The pixels go to the worker and the page's image is held. After the loop
+(`_ocr`) each page's words become its text, after the line `_Scanned page, text by OCR._`; a
+trusted page drops its image (its bytes refunded), a picture area links its crop, a doubtful page
+links the image after its text, and a page OCR could not read (failed, or late at the session's
+stop) keeps today's image. doc.meta["ocr"] holds the counts, and OCR_LATE joins the warnings when a
+page went late. Without a session, or when the gray cannot be made, the page is today's.
 """
 import math
 import time
@@ -28,9 +38,9 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
-from .. import images, limits
+from .. import images, limits, ocr
 from ..limits import ReadError
-from ..model import Doc, Image, Para, Section, Text
+from ..model import Doc, Image, Para, Section, Table, Text
 from . import pdf_layout, pdf_tables
 
 PDF_PAGE_OBJECTS = 100_000  # page objects (text, path, image, form) interpreted per page
@@ -137,6 +147,25 @@ def _norm(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
+def _decoded(data):
+    """The Gray of a page's own image, decoded by the reader (raster.gray), or None."""
+    from .. import raster
+    got = raster.gray(data)
+    return got[0] if got else None
+
+
+def _unturned(box, turn):
+    """A fractional box (x0, y0, x1, y1), y down, of `ocr_pixels.rotate(g, turn)`, as a box of `g`."""
+    x0, y0, x1, y1 = box
+    if turn == 90:
+        return y0, 1 - x1, y1, 1 - x0
+    if turn == 180:
+        return 1 - x1, 1 - y1, 1 - x0, 1 - y0
+    if turn == 270:
+        return 1 - y1, x0, 1 - y0, x1
+    return box
+
+
 # ---- one page
 
 class _Kept:
@@ -150,6 +179,8 @@ class _Kept:
         self.hidden = []          # hidden Paras, one per text object
         self.comments = []
         self.blocks = []
+        self.pending = None       # (ticket, png, alt) of a page sent to OCR, its image not placed yet
+        self.links = []           # the page's links, kept for its OCR text
 
 
 class _Reader:
@@ -164,6 +195,10 @@ class _Reader:
         self.figures = []
         self.part = False   # page_part already counted for the page being read
         self.text_cut = False  # text already counted for the page being read
+        self.ocr = ocr.session()
+        if self.ocr is not None and engine == "native":
+            from .. import raster
+            raster.backend()  # settled here, before any thread may decode a page through raster.gray
 
     # -- counting
 
@@ -239,13 +274,16 @@ class _Reader:
         if not kept and not stopped:
             raise ReadError("damaged", "no readable pages")
         doc = Doc()
+        if self.ocr is not None:
+            doc.meta["ocr"] = self._ocr(kept)
+            if doc.meta["ocr"]["stopped_at"] is not None:
+                doc.warnings.append(limits.OCR_LATE)
         doc.headers, doc.footers, kept = self._after(kept)
         if not kept and not stopped:
             raise ReadError("damaged", "no readable pages")
         doc.blocks = [Section("page", number=k.number, blocks=k.blocks, comments=k.comments)
                       for k in kept]
-        doc.meta = {"engine": self.engine, "pages_total": count,
-                    "unrendered": self.unrendered, "figures": self.figures}
+        doc.meta.update(engine=self.engine, pages_total=count, unrendered=self.unrendered, figures=self.figures)
         return doc
 
     def _page(self, index) -> _Kept:
@@ -277,7 +315,7 @@ class _Reader:
         steps = (lambda: self._text(pd, turn, keep, state),
                  lambda: self._tables(pd, turn, keep, state),
                  lambda: self._images(pd, turn, keep, state, scan),
-                 lambda: self._renders(pd, turn, keep, scan, unmapped))
+                 lambda: self._renders(pd, turn, keep, scan, unmapped, state))
         for k, step in enumerate(steps):
             if k and self._late(t0):
                 break
@@ -346,8 +384,13 @@ class _Reader:
             return [pdf_tables.Segment(*_view_box((s.x0, s.y0, s.x1, s.y1), turn, pd.box))
                     for s in items]
 
-        found = pdf_tables.tables(view(pd.segments), state["frags"], pd.number, self.budget,
-                                  self.ctx.skipped, short=view(pd.short), model=self.model)
+        self._found(keep, state, view(pd.segments), view(pd.short))
+
+    def _found(self, keep, state, segments, short):
+        """The ruled tables of `segments` over the page's fragments, placed as items; their words
+        leave the lines."""
+        found = pdf_tables.tables(segments, state["frags"], keep.number, self.budget,
+                                  self.ctx.skipped, short=short, model=self.model)
         used = set()
         for k, got in enumerate(found):
             used |= set(got.used)
@@ -391,19 +434,41 @@ class _Reader:
         self.image_bytes += len(data)
         return data
 
-    def _renders(self, pd, turn, keep, scan, unmapped=False):
+    def _gray(self, make):
+        """The Gray `make` gives, or None when it fails or gives none: the page is then today's."""
+        try:
+            return make()
+        except ReadError as e:
+            if e.kind == "timeout":
+                raise
+        except Exception:  # noqa: BLE001 - OCR never makes a page fail
+            pass
+        return None
+
+    def _renders(self, pd, turn, keep, scan, unmapped, state):
         if scan is not None or unmapped:
-            data = None
+            data = g = None
             if pd.render is not None:
                 data = self._render(lambda: pd.render(None, _dpi(pd.box, RENDER_DPI)))
+                if data and self.ocr is not None:
+                    g = self._gray(lambda: pd.render(None, limits.OCR_DPI, gray=True))
+                box = pd.box
             elif not unmapped:
                 data = self._render(lambda: scan.data)  # native: the page's own image
-            if data:
-                alt = f"Page {pd.number}, text without Unicode" if unmapped else f"Scanned page {pd.number}"
-                keep.items.append((math.inf, 0.0, -1, Image(data, alt=alt)))
-            else:
+                if data and self.ocr is not None:
+                    g = self._gray(lambda: _decoded(data))
+                box = scan.box
+            if not data:
                 self.unrendered.append(pd.number)
                 self.ctx.skipped["scan"] += 1
+                return
+            alt = f"Page {pd.number}, text without Unicode" if unmapped else f"Scanned page {pd.number}"
+            if g is None:
+                keep.items.append((math.inf, 0.0, -1, Image(data, alt=alt)))
+                return
+            dpi = 72.0 * max(g.w, g.h) / max(box[2] - box[0], box[3] - box[1])
+            keep.pending = (self.ocr.submit(g, "page", dpi), data, alt)
+            keep.links = state["links"]
             return
         box, paths = pd.figure
         if box is None or paths < FIGURE_PATHS or _cover(box, pd.box) < FIGURE_COVER:
@@ -425,6 +490,61 @@ class _Reader:
         self.figures.append(pd.number)
 
     # -- after the loop
+
+    def _ocr(self, kept) -> dict:
+        """Each page sent to OCR, collected: its text, and its image as the verdict says; a page OCR
+        could not read keeps today's image. The counts for doc.meta["ocr"]."""
+        counts = {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None}
+        for k in kept:
+            if k.pending is None:
+                continue
+            ticket, png, alt = k.pending
+            k.pending = None
+            r = self.ocr.wait(ticket)
+            if r.status == "done":
+                self.part = False
+                placed = []
+                with self._page_guard("page_part"):
+                    self._read_page(k, r, ticket.dpi, png)
+                    placed.append(r.verdict.kind)
+                if placed:
+                    counts["pages"] += 1
+                    counts["doubtful"] += placed[0] == "doubtful"
+                    continue
+            elif r.status == "late":
+                if counts["stopped_at"] is None:
+                    counts["stopped_at"] = k.number
+            else:
+                counts["failed"] += 1
+            k.items.append((math.inf, 0.0, -1, Image(png, alt=alt, ocr="page")))
+        return counts
+
+    def _read_page(self, k, r, dpi, png):
+        """The OCR words of page `k` as its own text, laid out and searched for ruled tables as pdf
+        text is, in the frame of the page bitmap OCR read; then its image as `r.verdict` says."""
+        from .. import ocr_layout
+        page, n = r.page, k.number
+        w, h = page.w * 72.0 / dpi, page.h * 72.0 / dpi
+        k.view = (0.0, 0.0, w, h)
+        k.items = [it for it in k.items if not isinstance(it[3], Table)]
+        state = {"frags": ocr_layout.fragments(page, dpi), "ocr": set(), "links": k.links}
+        self._layout(k, state)
+        self._found(k, state, ocr_layout.segments(r.rules, page, dpi), [])
+        k.items.append((math.inf, -math.inf, -2, Para([Text(ocr_layout.SCANNED)])))
+        v = r.verdict
+        if v.kind == "doubtful":
+            k.items.append((-math.inf, 0.0, -1, Image(png, alt=f"Scanned page {n}", ocr="page")))
+            return
+        self.image_bytes -= len(png)
+        if v.kind != "area":
+            return
+        crop = None
+        if _cover(v.box, (0.0, 0.0, 1.0, 1.0)) <= FIGURE_WHOLE:
+            crop = images.png_crop(png, _unturned(v.box, page.turn))
+        data = crop or png
+        self.image_bytes += len(data)
+        k.items.append(((1 - v.box[1]) * h, v.box[0] * w, -1,
+                        Image(data, alt=f"Picture on page {n}", ocr="page")))
 
     def _after(self, kept):
         headers, footers, drops = pdf_layout.running([k.lines for k in kept], [k.view for k in kept])

@@ -598,13 +598,16 @@ WORKER_CMD = [sys.executable, "-I", "-X", "utf8", str(Path(__file__).resolve().p
 class Session:
     """The conversion's link to its OCR worker process, started on first need and once per conversion.
 
-    `submit` files a picture or page and returns at once; `wait` gives its Result. A result in `store` (a
-    `cache.OcrResults`, or any object with `get(key)` and `put(key, dict)`) is taken from there without the worker,
-    and each "done" one is filed there (decision 12). Frames go to the worker from a writer thread and come back to
-    one reader thread, which matches answers to tickets by id: they come in any order.
+    `submit` files a picture or page and returns at once, unless more than OCR_QUEUE_BYTES of pixels already wait
+    for the worker: it then waits for room, at most until the stop, and a page still waiting then is "late" without
+    being queued. `wait` gives its Result. A result in `store` (a `cache.OcrResults`, or any object with `get(key)`
+    and `put(key, dict)`) is taken from there without the worker, and each "done" one is filed there (decision 12).
+    Frames go to the worker from a writer thread and come back to one reader thread, which matches answers to tickets
+    by id: they come in any order.
 
-    OCR never fails or stalls a conversion. A worker that exits, cannot start, refuses a job or sends a frame that
-    does not read gives "failed" tickets (a bad frame also kills it); a dead worker is not started again. At
+    OCR never fails a conversion, nor stalls it past the stop. A worker that exits, cannot start, refuses a job or
+    sends a frame that does not read gives "failed" tickets (a bad frame also kills it); a dead worker is not started
+    again. At
     `deadline - FIGURE_RESERVE` (the stop) a waiting `wait` kills the worker with its whole process tree, and every
     open ticket becomes "late", as does any later one. An answer the worker flags `cut` (its deadline passed while it
     read the job) or that arrives at or after the stop is used but never filed in `store`: it may be a reading the
@@ -635,6 +638,7 @@ class Session:
         self._proc = None
         self._job = None
         self._queue: deque = deque()  # (ticket, pixels) for the writer thread; None ends it
+        self._queued = 0  # pixel bytes in `_queue`
         self._threads: list[threading.Thread] = []
 
     def _stop(self) -> float:
@@ -672,6 +676,11 @@ class Session:
         hit = self._cached(key, kind)
         expire = False
         with self._cond:
+            while hit is None and self._state == "running" and self._queued > limits.OCR_QUEUE_BYTES:
+                left = self._stop() - time.monotonic()
+                if left <= 0:
+                    break
+                self._cond.wait(min(left, 3600.0))
             if hit is not None:
                 self._file(t, hit)
             elif self._state == "over" or time.monotonic() >= self._stop():
@@ -687,6 +696,7 @@ class Session:
                 else:
                     self._open[t.id] = t
                     self._queue.append((t, g))
+                    self._queued += len(g.data)
                     self._cond.notify_all()
         if expire:
             self._expire()
@@ -722,6 +732,8 @@ class Session:
                 if item is None:
                     return
                 t, g = item
+                self._queued -= len(g.data)
+                self._cond.notify_all()
                 if t.id not in self._open:  # settled meanwhile (late, or the worker died)
                     continue
             # `left` runs to the conversion's own deadline, so the worker does not cut a page short of the session's
@@ -799,6 +811,7 @@ class Session:
     def _drop(self) -> None:
         """Under the lock: the frames not yet written are dropped and the writer thread ends."""
         self._queue.clear()
+        self._queued = 0
         self._queue.append(None)
         self._cond.notify_all()
 
@@ -903,7 +916,7 @@ def session() -> Session | None:
 
 
 @contextlib.contextmanager
-def opened(deadline: float, backend: tuple[str, str], *, cmd: list | None = None, store=None):
+def opened(deadline: float | None, backend: tuple[str, str], *, cmd: list | None = None, store=None):
     """Sets the current Session for the block and closes it after; yields None, and sets none, when `backend[0]`
     is empty (no OCR engine)."""
     global _current

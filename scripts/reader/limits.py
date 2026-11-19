@@ -87,6 +87,7 @@ OCR_LOW_WORD = 60          # confidence under which a word counts as low
 TESS_PSM_LATIN = 3         # Tesseract page segmentation mode for a Latin read
 TESS_PSM_KOR = 4           # Tesseract page segmentation mode for a kor+eng read
 OCR_FRAME_JSON = 2**20     # header bytes of one OCR worker frame
+OCR_QUEUE_BYTES = 64 * 2**20  # pixel bytes waiting for the worker past which submitting a page waits (until the stop)
 # the warning of a document whose OCR the deadline left unfinished
 OCR_LATE = "ocr not finished: time"
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
