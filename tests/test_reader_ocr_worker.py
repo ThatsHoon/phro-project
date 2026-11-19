@@ -658,6 +658,14 @@ def test_no_deadline():
         assert s.wait(s.submit(gray(11), "picture", 200.0)).status == "done"
 
 
+def test_code_hashed_on_first_key_only():
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); from reader import ocr; "
+            "print('CODE' in vars(ocr), len(ocr.CODE), ocr.CODE == ocr._code())")
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, str(Path(__file__).resolve().parents[1] / "scripts")],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and r.stdout.split() == ["False", "40", "True"], (r.stdout, r.stderr)
+
+
 def test_key_follows_worker_limits_and_code():
     """I5: the key changes with the worker-side limits; ocr_worker.py is part of CODE."""
     assert "ocr_worker.py" in ocr._SOURCES and list(ocr._SOURCES) == sorted(ocr._SOURCES)

@@ -2,12 +2,10 @@
 
 Run: python -I -X utf8 tests/test_reader_markdown.py
 """
-import json
-import os
+import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -15,7 +13,8 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from metafile_fix import wmf, wmf_text  # noqa: E402
-from reader import images, limits, markdown, ocr, raster, text  # noqa: E402
+from ocr_fix import ocr_stub  # noqa: E402
+from reader import images, limits, markdown, raster, text  # noqa: E402
 from reader.ocr_pixels import Gray  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import (  # noqa: E402
@@ -819,30 +818,7 @@ def test_hidden_figure_tag_once_everywhere():
 
 # ---- OCR: picture text and the status lines, through the stand-in worker (tests/ocr_stub_worker.py)
 
-STUB = [sys.executable, "-I", "-X", "utf8", str(Path(__file__).parent / "ocr_stub_worker.py")]
-
-
-@contextmanager
-def stub(deadline=None, **conf):
-    """An OCR session on the stand-in worker behaving as `conf` says; yields the session and the list of the
-    (w, h, kind) of every bitmap it is given."""
-    old = os.environ.get("PHRO_OCR_STUB")
-    os.environ["PHRO_OCR_STUB"] = json.dumps(conf)
-    try:
-        with ocr.opened(deadline, ("win-ko", "test"), cmd=STUB) as s:
-            sent, real = [], s.submit
-
-            def submit(g, kind, dpi, until=None):
-                sent.append((g.w, g.h, kind))
-                return real(g, kind, dpi, until)
-
-            s.submit = submit
-            yield s, sent
-    finally:
-        if old is None:
-            os.environ.pop("PHRO_OCR_STUB", None)
-        else:
-            os.environ["PHRO_OCR_STUB"] = old
+stub = ocr_stub
 
 
 def pic(w=80, h=80, shade=250):
@@ -970,6 +946,72 @@ def test_korean_hint_once():
     with stub(answer=seen("Total 120")), tempfile.TemporaryDirectory() as d:
         out = markdown.render(Doc(blocks=[Image(pic())]), Path(d), info=info)
     assert "Korean" not in out and info["ocr_hint"] is False, (out, info)
+
+
+def gone(seconds=1.0):
+    """A session deadline whose stop (FIGURE_RESERVE before it) passed `seconds` ago."""
+    return time.monotonic() + limits.FIGURE_RESERVE - seconds
+
+
+def test_small_pictures_after_stop_not_counted():
+    info = {}
+    with stub(deadline=gone()) as (_, sent), tempfile.TemporaryDirectory() as d:
+        out = markdown.render(Doc(blocks=[Image(pic(8, 8, shade=s)) for s in (250, 240, 230)]), Path(d), info=info)
+    assert "OCR stopped" not in out and info["ocr"]["pictures_left"] == 0 and sent == [], (out, info, sent)
+    with stub(deadline=gone()) as (_, sent), tempfile.TemporaryDirectory() as d:
+        out = markdown.render(Doc(blocks=[Image(pic(8, 8)), Image(pic(80, 80))]), Path(d), info=info)
+    assert out.startswith("(OCR stopped; 1 picture not read)\n\n") and info["ocr"]["pictures_left"] == 1, (out, info)
+
+
+def test_hidden_column_picture_not_sent_or_counted():
+    table = Table([[Cell([P("a")]), Cell([Image(pic())])]], hidden_cols=frozenset({1}))
+    with stub(answer=seen("Total 120", "Net 80")) as (_, sent):
+        out = R(Doc(blocks=[table]))
+    assert sent == [] and "Picture text" not in out, (sent, out)
+    info = {}
+    with stub(deadline=gone()), tempfile.TemporaryDirectory() as d:
+        out = markdown.render(Doc(blocks=[table]), Path(d), info=info)
+    assert "OCR stopped" not in out and info["ocr"]["pictures_left"] == 0, (out, info)
+    with stub(answer=seen("Total 120", "Net 80")) as (_, sent):
+        out = R(Doc(blocks=[table]), hidden=True)
+    assert sent == [(80, 80, "picture")] and TEXT in out, (sent, out)
+
+
+def test_picture_past_output_cap_not_counted():
+    saved = limits.MAX_OUTPUT
+    limits.MAX_OUTPUT = 40
+    info = {}
+    try:
+        with stub(deadline=gone()), tempfile.TemporaryDirectory() as d:
+            out = markdown.render(Doc(blocks=[P("x" * 60), Image(pic())]), Path(d), info=info)
+    finally:
+        limits.MAX_OUTPUT = saved
+    assert "OCR stopped" not in out and info["ocr"]["pictures_left"] == 0, (out, info)
+
+
+def test_picture_kinds_outside_list_not_sent():
+    webp = b"RIFF" + bytes([32, 0, 0, 0]) + b"WEBPVP8 " + bytes(32)
+    emf = bytes([1, 0, 0, 0]) + bytes(36) + b" EMF" + bytes(32)
+    blocks = [Image(webp), Image(wmf([wmf_text(5, 5, b"Q")])), Image(emf), Image(pic())]
+    assert [images.sniff(b.data) for b in blocks] == ["webp", "wmf", "emf", "png"]
+    saved = raster.gray
+    raster.gray = lambda data, page=0, deadline=None: (Gray(80, 80, bytes(6400)), 96.0)
+    try:
+        with stub(answer=seen("Total 120")) as (s, sent):
+            markdown._Pictures(s, Doc(blocks=blocks), False, lambda t, count=True: ({}, 0, 0))
+    finally:
+        raster.gray = saved
+    assert sent == [(80, 80, "picture")], sent
+
+
+def test_render_without_session_does_not_import_ocr():
+    code = ("import sys, tempfile; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+            "from reader import markdown; from reader.model import Doc, Para, Text; "
+            "markdown.render(Doc(blocks=[Para([Text('x')])]), Path(tempfile.mkdtemp())); "
+            "print('reader.ocr' in sys.modules)")
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, str(HERE / "scripts")],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and r.stdout.strip() == "False", (r.stdout, r.stderr)
 
 
 def main():

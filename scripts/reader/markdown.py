@@ -3,12 +3,13 @@ import collections
 import itertools
 import re
 import secrets
+import sys
 import time
 from bisect import bisect_left, bisect_right
 from pathlib import Path
 
 from . import limits
-from .images import Assets, sniff
+from .images import Assets, pixel_size, sniff
 from .limits import ReadError
 from .model import (
     Bold, Break, Code, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math,
@@ -133,10 +134,10 @@ def ocr_notes(counts: dict, hint: bool) -> list:
 _END = object()
 
 
-def _images(doc: Doc, show: bool):
-    """Each Image block the render may write, in document order (the notes last). A hidden block, and a hidden table
-    row, is passed over unless hidden content is shown. A block list the document holds more than once is walked
-    once."""
+def _images(doc: Doc, show: bool, grid):
+    """Each Image block the render may write, in document order (the notes last). A hidden block, a hidden table row
+    and a hidden column's cells (as `grid`, a `_Render._grid`, lays the table out) are passed over unless hidden
+    content is shown. A block list the document holds more than once is walked once."""
     stack, seen = [itertools.chain(doc.blocks, *doc.notes.values())], set()
     while stack:
         b = next(stack[-1], _END)
@@ -148,7 +149,9 @@ def _images(doc: Doc, show: bool):
         if isinstance(b, Image):
             yield b
             continue
-        if isinstance(b, Table):
+        if isinstance(b, Table) and b.hidden_cols and not show:
+            lists = [cell.blocks for (r, _), (cell, _, _) in grid(b, False)[0].items() if r not in b.hidden_rows]
+        elif isinstance(b, Table):
             lists = [c.blocks for r, row in enumerate(b.rows) if show or r not in b.hidden_rows for c in row]
         elif isinstance(b, Section):
             lists = [b.blocks, b.notes, b.comments]
@@ -167,31 +170,36 @@ class _Pictures:
     once for the same bytes, and collected as the render writes them.
 
     A picture not queued by FIGURE_RESERVE before the session's stop goes late at once, so the ones queued keep that
-    time to be read; after it, and past the stop, no further picture is sent. Each picture that went late, or was
-    not sent for the time, is in `left`."""
+    time to be read; after it, and past the stop, no further picture is sent, and one whose header (images.pixel_size)
+    gives a long side under OCR_MIN_EDGE is passed over. A picture that went late, or was not sent for the time, is
+    put in `left` when the render writes it (`lines`), so one the render leaves out is not counted."""
 
     KINDS = frozenset({"png", "jpg", "bmp", "gif", "tiff"})
 
-    def __init__(self, s, doc: Doc, show: bool):
+    def __init__(self, s, doc: Doc, show: bool, grid):
         from . import raster
         self.s = s
         self.tickets = {}  # (bytes, page) -> Ticket
-        self.left = set()  # (bytes, page) of the pictures not read for the time
+        self.late = set()  # (bytes, page) of the pictures not read for the time
+        self.left = set()  # those of them the render wrote
         stop = s.deadline - limits.FIGURE_RESERVE
         until = stop - limits.FIGURE_RESERVE
         passed = set()
-        for im in _images(doc, show):
+        for im in _images(doc, show, grid):
             k = (im.data, im.page)
-            if im.ocr or k in self.tickets or k in self.left or k in passed:
+            if im.ocr or k in self.tickets or k in self.late or k in passed:
                 continue
             if len(im.data) < 16 or sniff(im.data) not in self.KINDS:
                 passed.add(k)
                 continue
-            late = bool(self.left) or time.monotonic() >= stop
+            late = bool(self.late) or time.monotonic() >= stop
+            if late and max(pixel_size(im.data) or (limits.OCR_MIN_EDGE,)) < limits.OCR_MIN_EDGE:
+                passed.add(k)
+                continue
             got = None if late else raster.gray(im.data, page=im.page, deadline=stop)
             if got is None:
                 if late or time.monotonic() >= stop:
-                    self.left.add(k)
+                    self.late.add(k)
                 else:
                     passed.add(k)
                 continue
@@ -202,7 +210,7 @@ class _Pictures:
             t = s.submit(g, "picture", dpi, until=until)
             r = s.peek(t)
             if r is not None and r.status == "late":
-                self.left.add(k)
+                self.late.add(k)
             else:
                 self.tickets[k] = t
 
@@ -211,6 +219,8 @@ class _Pictures:
         one OCR could not read."""
         from . import ocr
         k = (b.data, b.page)
+        if k in self.late:
+            self.left.add(k)
         t = self.tickets.get(k)
         if t is None:
             return []
@@ -972,9 +982,9 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     With an OCR session (`ocr.session()`), the raster pictures are sent to it first (`_Pictures`), and each one's
     words follow its link as `Picture text:`, placed as `Figure text:` is.
     """
-    from . import ocr
-    s = ocr.session()
-    pictures = _Pictures(s, doc, hidden) if s is not None else None
+    ocr = sys.modules.get(__package__ + ".ocr")  # no session can be open unless ocr was imported
+    s = ocr.session() if ocr is not None else None
+    pictures = _Pictures(s, doc, hidden, _Render(doc, Path(assets_dir), hidden)._grid) if s is not None else None
     r = _Render(doc, Path(assets_dir), hidden, skipped, pictures=pictures)
     text = r.body()
     if r.dangling:  # a hidden-only note's mark was shown: render again with those marks left out (and unnumbered)

@@ -80,8 +80,8 @@ def _ocr(doc: Doc, s, data: bytes, ctx) -> None:
     doubtful page adds its image after the text, a picture area a gray crop of the pixels OCR read (the whole page
     past pdf.FIGURE_WHOLE). A page not queued by FIGURE_RESERVE before the session's stop goes late at once, and no
     later page is sent. A page OCR could not read (failed, late, or not sent for the time) stays as today's image; one
-    whose pixels do not decode, too, uncounted. doc.meta["ocr"] holds the counts, and OCR_LATE joins the warnings
-    when a page went late. Every page image is marked `ocr="page"`, so no picture pass reads it again."""
+    whose pixels do not decode, too, counted as failed. A layout thrown away leaves no skip counts. doc.meta["ocr"]
+    holds the counts, and OCR_LATE joins the warnings when a page went late. Every page image is marked `ocr="page"`, so no picture pass reads it again."""
     from .. import raster
     from . import pdf, pdf_tables
     stop = s.deadline - limits.FIGURE_RESERVE
@@ -102,7 +102,7 @@ def _ocr(doc: Doc, s, data: bytes, ctx) -> None:
     budget, out = pdf_tables.TableBudget(), []
     for i, (im, t) in enumerate(zip(pages, sent)):
         r = s.wait(t) if isinstance(t, ocr.Ticket) else None
-        status = t if r is None else r.status
+        status = (t or "failed") if r is None else r.status
         if status == "done":
             got = _read(data, i, im, r, t.dpi, ctx.skipped, budget, stop, pdf.FIGURE_WHOLE)
             if got is not None:
@@ -124,14 +124,17 @@ def _ocr(doc: Doc, s, data: bytes, ctx) -> None:
 
 def _read(data, i, im, r, dpi, skipped, budget, stop, whole) -> list | None:
     """The blocks of page `i` OCR read: its text, then its image (`im`) when doubtful, or its picture area; None when
-    laying them out fails, which leaves the page as today's image."""
+    laying them out fails, which leaves the page as today's image and `skipped` as it was."""
+    from collections import Counter
     from .. import ocr_layout
+    own = Counter()
     try:
-        got = ocr_layout.blocks(r, i + 1, dpi, skipped, budget=budget)
+        got = ocr_layout.blocks(r, i + 1, dpi, own, budget=budget)
         if r.verdict.kind == "doubtful":
             got.append(im)
         elif r.verdict.kind == "area":
             got.append(_area(data, i, r, stop, whole) or replace(im, alt=f"Picture on page {i + 1}"))
+        skipped.update(own)
         return got
     except ReadError as e:
         if e.kind == "timeout":

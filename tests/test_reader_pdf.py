@@ -4,13 +4,11 @@ tables, images, fields and comments; hidden text, scanned pages, vector figures 
 Run: python -I -X utf8 tests/test_reader_pdf.py
 """
 import json
-import os
 import re
 import struct
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -748,36 +746,11 @@ def test_parse_path():
 
 # ---- scanned pages read by OCR, through the stand-in worker (tests/ocr_stub_worker.py)
 
-STUB = [sys.executable, "-I", "-X", "utf8", str(Path(__file__).parent / "ocr_stub_worker.py")]
 SCANNED = "_Scanned page, text by OCR._"
 KO = "ko-malgun-11.150dpi"
 
 
-@contextmanager
-def ocr_stub(deadline=None, **conf):
-    """An OCR session on the stand-in worker behaving as `conf` says, opened as reader.convert will open one."""
-    old = os.environ.get("PHRO_OCR_STUB")
-    os.environ["PHRO_OCR_STUB"] = json.dumps(conf)
-    try:
-        with ocr.opened(deadline, ("win-ko", "test"), cmd=STUB) as s:
-            yield s
-    finally:
-        if old is None:
-            os.environ.pop("PHRO_OCR_STUB", None)
-        else:
-            os.environ["PHRO_OCR_STUB"] = old
-
-
-def counting(s):
-    """The (w, h, kind, dpi) of every page `s` is given from now on."""
-    sent, real = [], s.submit
-
-    def submit(g, kind, dpi, until=None):
-        sent.append((g.w, g.h, kind, dpi))
-        return real(g, kind, dpi, until)
-
-    s.submit = submit
-    return sent
+ocr_stub = ocr_fix.ocr_stub
 
 
 def fixture_gray():
@@ -819,6 +792,13 @@ def test_scanned_page_text_with_stub_worker():
     assert text == f"{READ}## Page 1\n\n{SCANNED}\n\n{PARAS}\n", text
     assert doc.meta["ocr"] == {"pages": 1, "doubtful": 0, "failed": 0, "stopped_at": None}, doc.meta
     assert not ctx.skipped and doc.meta["unrendered"] == [] and not doc.warnings, (ctx.skipped, doc.meta)
+
+
+def test_page_without_gray_not_read_as_picture():
+    data, g = fixture_scan()
+    with patched(pdf._Reader, "_gray", lambda self, make: None), ocr_stub(answer=canned(g)) as (_, sent):
+        text, _, doc = md(data)
+    assert text == "## Page 1\n\n![Scanned page 1](assets/img-001.png)\n" and sent == [], (text, sent)
 
 
 def test_doubtful_page_text_then_image():
@@ -890,8 +870,7 @@ def test_full_queue_stops_ocr_not_the_page_loop():
     limits.OCR_QUEUE_BYTES = 1
     try:
         deadline = time.monotonic() + limits.FIGURE_RESERVE + 10
-        with patched(pdf, "PDF_DEADLINE", 3.0), ocr_stub(deadline=deadline, delay=1, answer=canned(g)) as s:
-            sent = counting(s)
+        with patched(pdf, "PDF_DEADLINE", 3.0), ocr_stub(deadline=deadline, delay=1, answer=canned(g)) as (s, sent):
             text, ctx, doc = md(data, started=time.monotonic())
     finally:
         limits.OCR_QUEUE_BYTES = saved
@@ -904,8 +883,7 @@ def test_full_queue_stops_ocr_not_the_page_loop():
 
 def test_ocr_layer_page_not_ocred():
     content = FULL + text_ops("Scanned words", y=400, extra=b"3 Tr")
-    with ocr_stub() as s:
-        sent = counting(s)
+    with ocr_stub() as (s, sent):
         text, _, doc = md(with_image(content, image_xobject(64, 64)))
     assert sent == [] and "Scanned words" in text and "![" not in text and SCANNED not in text, (sent, text)
     assert doc.meta["ocr"]["pages"] == 0
@@ -955,8 +933,7 @@ def test_ocr_answer_that_raises_leaves_the_page_as_today():
 
 def test_renders_counted_once_per_page():
     data, g = fixture_scan(pages=2)
-    with patched(pdf, "PDF_RENDERS", 1), ocr_stub(answer=canned(g)) as s:
-        sent = counting(s)
+    with patched(pdf, "PDF_RENDERS", 1), ocr_stub(answer=canned(g)) as (s, sent):
         text, ctx, doc = md(data)
     assert len(sent) == 1 and sent[0][2] == "page", sent
     assert text.count(SCANNED) == 1 and text.index(SCANNED) < text.index("## Page 2"), text
@@ -992,8 +969,7 @@ def test_native_scan_uses_page_image():
         return real(data, **kw)
 
     deadline = time.monotonic() + 60
-    with patched(raster, "gray", gray), ocr_stub(deadline=deadline) as s:
-        sent = counting(s)
+    with patched(raster, "gray", gray), ocr_stub(deadline=deadline) as (s, sent):
         text, _, doc = md(with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode")))
     assert decoded == [(JPEG, deadline - limits.FIGURE_RESERVE)], decoded
     assert len(sent) == 1 and sent[0][:3] == (8, 8, "page"), sent

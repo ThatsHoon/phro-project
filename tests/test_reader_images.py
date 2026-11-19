@@ -2,8 +2,6 @@
 
 Run: python -I -X utf8 tests/test_reader_images.py
 """
-import json
-import os
 import struct
 import sys
 import tempfile
@@ -16,7 +14,8 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from metafile_fix import emf, emf_rect, emf_textw, wmf, wmf_text  # noqa: E402
-from reader import images, markdown, ocr, raster  # noqa: E402
+from ocr_fix import ocr_stub  # noqa: E402
+from reader import images, markdown, raster  # noqa: E402
 from reader.model import Cell, Doc, Image, Para, Table, Text  # noqa: E402
 from reader.ocr_pixels import Gray  # noqa: E402
 
@@ -360,7 +359,6 @@ def test_png_crop_box():
 
 # ---- which pictures OCR reads, through the stand-in worker (tests/ocr_stub_worker.py)
 
-STUB = [sys.executable, "-I", "-X", "utf8", str(Path(__file__).parent / "ocr_stub_worker.py")]
 TWO = {"page": {"w": 200, "h": 100, "angle": 0.0, "turn": 0, "engine": "stub", "version": "1",
                 "words": [{"text": t, "x": x, "y": 20, "w": 40, "h": 16, "line": 0, "conf": None}
                           for t, x in (("Total", 10), ("120", 60))]}}
@@ -369,23 +367,8 @@ TWO = {"page": {"w": 200, "h": 100, "angle": 0.0, "turn": 0, "engine": "stub", "
 @contextmanager
 def reading(**conf):
     """An OCR session on the stand-in worker; yields the (w, h, kind) of every bitmap it is given."""
-    old = os.environ.get("PHRO_OCR_STUB")
-    os.environ["PHRO_OCR_STUB"] = json.dumps(conf)
-    try:
-        with ocr.opened(None, ("win-ko", "test"), cmd=STUB) as s:
-            sent, real = [], s.submit
-
-            def submit(g, kind, dpi, until=None):
-                sent.append((g.w, g.h, kind))
-                return real(g, kind, dpi, until)
-
-            s.submit = submit
-            yield sent
-    finally:
-        if old is None:
-            os.environ.pop("PHRO_OCR_STUB", None)
-        else:
-            os.environ["PHRO_OCR_STUB"] = old
+    with ocr_stub(**conf) as (_, sent):
+        yield sent
 
 
 def gray_png(w, h, shade=250):
@@ -406,6 +389,17 @@ def test_small_picture_not_read():
         out = render(Image(gray_png(64, 20)))
     assert sent == [(64, 20, "picture")] and "Picture text: Total 120" in out, (sent, out)
 
+
+def test_pixel_size_from_header():
+    png = gray_png(70, 30)
+    gif = b"GIF89a" + struct.pack("<HH", 300, 20) + bytes(8)
+    bmp = b"BM" + bytes(16) + struct.pack("<ii", 40, -500) + bytes(8)
+    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF" + bytes(10)
+    sof2 = b"\xff\xc2" + struct.pack(">HBHH", 17, 8, 90, 120) + bytes(12)
+    jpg = b"\xff\xd8" + app0 + b"\xff\xdb" + struct.pack(">H", 4) + bytes(2) + sof2
+    assert [images.pixel_size(x) for x in (png, gif, bmp, jpg)] == [(70, 30), (300, 20), (40, 500), (120, 90)]
+    tiff = b"II*\x00" + bytes(16)
+    assert [images.pixel_size(x) for x in (tiff, png[:20], jpg[:30], b"\xff\xd8\xff\xd9")] == [None] * 4
 
 def test_metafile_not_read_as_picture():
     with reading(answer=TWO) as sent:

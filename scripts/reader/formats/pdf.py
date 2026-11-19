@@ -202,9 +202,6 @@ class _Reader:
         self.text_cut = False  # text already counted for the page being read
         self.ocr = ocr.session()
         self.ocr_stopped = False  # a page went late at submit: no later page is sent in this read
-        if self.ocr is not None and engine == "native":
-            from .. import raster
-            raster.backend()  # settled here, before any thread may decode a page through raster.gray
 
     # -- counting
 
@@ -481,7 +478,7 @@ class _Reader:
                 return
             alt = f"Page {pd.number}, text without Unicode" if unmapped else f"Scanned page {pd.number}"
             if g is None:
-                keep.items.append((math.inf, 0.0, -1, Image(data, alt=alt, ocr="page" if self.ocr_stopped else "")))
+                keep.items.append((math.inf, 0.0, -1, Image(data, alt=alt, ocr="page" if self.ocr is not None else "")))
                 return
             dpi = 72.0 * max(g.w, g.h) / max(box[2] - box[0], box[3] - box[1])
             until = time.monotonic() + (self.started + PDF_DEADLINE - PDF_PAGE_SECONDS - self.clock())

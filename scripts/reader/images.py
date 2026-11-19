@@ -49,6 +49,44 @@ def sniff(data: bytes) -> str | None:
     return None
 
 
+_SOF = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}  # the JPEG start-of-frame markers
+
+
+def pixel_size(data: bytes) -> tuple[int, int] | None:
+    """(w, h) a PNG, GIF, BMP or JPEG header gives, without decoding; None for other kinds or a header cut short."""
+    kind = sniff(data)
+    try:
+        if kind == "png" and data[12:16] == b"IHDR":
+            return struct.unpack(">II", data[16:24])
+        if kind == "gif":
+            return struct.unpack("<HH", data[6:10])
+        if kind == "bmp":
+            w, h = struct.unpack("<ii", data[18:26])
+            return abs(w), abs(h)
+        if kind == "jpg":
+            pos = 2
+            while pos + 4 <= len(data):
+                if data[pos] != 0xFF:
+                    return None
+                marker = data[pos + 1]
+                if marker == 0xFF:
+                    pos += 1
+                    continue
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    pos += 2
+                    continue
+                if marker == 0xD9:
+                    return None
+                n = struct.unpack(">H", data[pos + 2:pos + 4])[0]
+                if marker in _SOF:
+                    h, w = struct.unpack(">HH", data[pos + 5:pos + 9])
+                    return w, h
+                pos += 2 + n
+    except struct.error:
+        return None
+    return None
+
+
 def _chunk(tag: bytes, body: bytes) -> bytes:
     return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
 

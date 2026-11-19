@@ -5,6 +5,7 @@ tried for an upside-down or sideways page, and the page's verdict. Then the work
 The engines are reached only through `Engines`, so `ocr_win` and `ocr_tess` are imported inside `engines()` alone.
 """
 import contextlib
+import functools
 import hashlib
 import itertools
 import json
@@ -284,8 +285,10 @@ _KEY_LIMITS = ("OCR_JUNK", "OCR_LATIN", "TESS_PSM_LATIN", "TESS_PSM_KOR", "OCR_R
                "OCR_RULES_MAX", "OCR_DPI")
 
 
+@functools.cache
 def _code() -> str:
-    """SHA-1 of the OCR modules' source bytes (CRLF read as LF), in sorted name order; a file not there is skipped."""
+    """SHA-1 of the OCR modules' source bytes (CRLF read as LF), in sorted name order; a file not there is skipped.
+    Computed on first use (`CODE`), not at import."""
     here = Path(__file__).resolve().parent
     h = hashlib.sha1()
     for name in _SOURCES:
@@ -297,7 +300,10 @@ def _code() -> str:
     return h.hexdigest()
 
 
-CODE = _code()  # computed once at import
+def __getattr__(name):
+    if name == "CODE":
+        return _code()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def picture_key(g: Gray, engine: str, version: str, *, kind: str = "picture", dpi: float = 0.0) -> str:
@@ -310,7 +316,7 @@ def picture_key(g: Gray, engine: str, version: str, *, kind: str = "picture", dp
     h = hashlib.sha1(f"{g.w}x{g.h}\0".encode())
     h.update(g.data)
     h.update(b"\0")
-    for part in (engine, version, CODE, VERSION):
+    for part in (engine, version, _code(), VERSION):
         h.update(str(part).encode("utf-8", "replace") + b"\0")
     for name in _KEY_LIMITS:
         h.update(f"{name}={getattr(limits, name)!r}\0".encode())

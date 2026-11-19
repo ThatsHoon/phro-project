@@ -25,7 +25,6 @@ from reader.formats import hwp_records as hr  # noqa: E402
 from reader.ocr_pixels import Gray  # noqa: E402
 from reader_fix import hwp_para, hwp_picture, hwp_record, make_hwp, make_zip  # noqa: E402
 
-STUB = [sys.executable, "-I", "-X", "utf8", str(Path(__file__).parent / "ocr_stub_worker.py")]
 SCANNED = "_Scanned page, text by OCR._"
 
 
@@ -160,10 +159,10 @@ def stub_engine(deadline=None, **conf):
     """reader.convert with an OCR engine: the backend id patched in, the stand-in worker (tests/ocr_stub_worker.py)
     behaving as `conf` says, a temporary cache root, and PHRO_READER_DEADLINE `deadline` seconds from now."""
     saved = ocr.backend, ocr.WORKER_CMD
-    ocr.backend, ocr.WORKER_CMD = (lambda: ("win-ko", "test")), STUB
+    ocr.backend, ocr.WORKER_CMD = (lambda: ("win-ko", "test")), ocr_fix.STUB
     wall = None if deadline is None else repr(time.time() + deadline)
     try:
-        with env(PHRO_OCR_STUB=json.dumps(conf), PHRO_READER_CACHE=str(tmp()), PHRO_READER_DEADLINE=wall):
+        with ocr_fix.stub_env(**conf), env(PHRO_READER_CACHE=str(tmp()), PHRO_READER_DEADLINE=wall):
             yield
     finally:
         ocr.backend, ocr.WORKER_CMD = saved
@@ -244,6 +243,41 @@ def test_tiff_late_pages_are_images():
     assert limits.OCR_LATE in meta["warnings"], meta
 
 
+def test_tiff_page_without_pixels_counts_as_failed():
+    from reader import raster
+    real = raster.gray
+
+    def gray(data, page=0, deadline=None):
+        return None if page == 0 else real(data, page=page, deadline=deadline)
+
+    raster.gray = gray
+    try:
+        with stub_engine(answer=words("Alpha beta gamma")):
+            text, meta = convert(tiff_file(pages(2)))
+    finally:
+        raster.gray = real
+    assert text.startswith("(1 scanned page read by OCR)\n\n(OCR failed on 1 page; shown as an image.)\n\n"), text
+    assert meta["ocr"] == {"pages": 1, "doubtful": 0, "failed": 1, "stopped_at": None, "pictures_left": 0}, meta
+
+
+def test_tiff_discarded_layout_leaves_no_skips():
+    from reader import ocr_layout
+    real = ocr_layout.blocks
+
+    def blocks(res, number, dpi, skipped, *, budget=None):
+        skipped["cells"] += 1
+        raise ValueError("layout")
+
+    ocr_layout.blocks = blocks
+    try:
+        with stub_engine(answer=words("Alpha beta gamma")):
+            text, meta = convert(tiff_file(pages(1)))
+    finally:
+        ocr_layout.blocks = real
+    assert text == "(OCR failed on 1 page; shown as an image.)\n\n![](assets/img-001.png)\n", text
+    assert meta["unread"] == [], meta
+
+
 def test_tiff_crop_is_gray_from_the_read_pixels():
     if sys.platform != "win32":
         print("skip: test_tiff_crop_is_gray_from_the_read_pixels (needs GDI+)")
@@ -309,8 +343,11 @@ NO_ENGINE = (
 
 def test_no_engine_output_unchanged():
     with env(PHRO_READER_OCR="none"):
-        got = tuple(convert(p)[0] for p in (docx(png(80, 80)), hwp(png(80, 80)), scanned_pdf(pages(1)[0])))
-    assert got == NO_ENGINE, got
+        assert ocr.backend() == ("", ""), ocr.backend()
+        got = [convert(p) for p in (docx(png(80, 80)), hwp(png(80, 80)), scanned_pdf(pages(1)[0]))]
+    assert tuple(text for text, _ in got) == NO_ENGINE, got
+    for _, meta in got:
+        assert "ocr" not in meta and limits.OCR_LATE not in meta["warnings"], meta
 
 
 def test_read_cli_tiff_end_to_end():
