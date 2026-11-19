@@ -35,6 +35,21 @@ def from_pixels(w: int, h: int, buf, channels: int, stride: int | None = None) -
     return Gray(w, h, b"".join(buf[y * stride + first:y * stride + row:channels] for y in range(h)))
 
 
+_INVERT = bytes(range(255, -1, -1))  # v -> 255 - v
+
+
+def on_white(g: Gray, alpha) -> Gray:
+    """`g` with each pixel's alpha (one byte a pixel, 0 clear, 255 opaque) laid on white as G | (255 - A): a clear
+    pixel is white and an opaque one keeps its value; a partial one is never darker than its own value nor than
+    255 - A (an approximation of G*A/255 + 255 - A, at C speed on big integers)."""
+    alpha = bytes(alpha)
+    if len(alpha) != len(g.data):
+        raise ValueError(f"on_white: {len(alpha)} alpha bytes for {len(g.data)} pixels")
+    n = len(alpha)
+    clear = int.from_bytes(alpha.translate(_INVERT), "big")
+    return Gray(g.w, g.h, (int.from_bytes(g.data, "big") | clear).to_bytes(n, "big"))
+
+
 def reduction(w: int, h: int, max_pixels: int | None, max_side: int | None = None) -> tuple[int, int]:
     """(kx, ky), the powers of two `fit` divides the sides by: each side is halved (floor) while the area is over
     `max_pixels` or the long side over `max_side`; a side of 1 is not halved again. GDI+ and the image venv scale by

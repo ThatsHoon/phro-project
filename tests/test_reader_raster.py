@@ -1304,35 +1304,132 @@ def test_gray_dpi_from_the_picture():
     assert (g.w, g.h, got) == (16, 8, 75.0), (g.w, g.h, got)
 
 
+HUGE_CHILD = r"""
+import json, sys, time
+sys.path.insert(0, sys.argv[1] + "/scripts")
+sys.path.insert(0, sys.argv[1] + "/tests")
+import test_reader_raster as t
+from reader import raster
+w, h = 20000, 15000
+line = w // 8
+white = b"\0" * line
+bar = b"\0" * 500 + b"\xff" * 1500 + b"\0" * 500  # columns 4000-15999 black
+rows = white * 7000 + bar * 1000 + white * 7000
+out = {"refused": []}
+for strip_rows in (h, 512):  # one 37.5 MB strip, or 512-row strips if GDI+ refuses that
+    data = t.bilevel_tiff(w, h, rows, strip_rows)
+    raster.backend()  # GDI+ started before the measure
+    before = t.peak_working_set()
+    t0 = time.monotonic()
+    res = raster.gray(data)
+    out["spent"] = time.monotonic() - t0
+    out["rise"] = t.peak_working_set() - before
+    del data
+    if res is not None:
+        g, dpi = res
+        k = 8
+        out.update(w=g.w, h=g.h, dpi=dpi, bar=g.data[(7500 // k) * g.w + 10000 // k],
+                   above=g.data[(3000 // k) * g.w + 10000 // k], left=g.data[(7500 // k) * g.w + 1000 // k])
+        break
+    out["refused"].append(strip_rows)
+print(json.dumps(out))
+"""
+
+
 @needs_gdiplus
 def test_huge_tiff_gray_within_cap():
     """A 20000 x 15000 scan (37.5 MB packed, in memory only) comes back within the pixel cap, its marks in place, and
-    the process's peak working set rises by less than 400 MB."""
-    w, h = 20000, 15000
-    line = w // 8
-    white = b"\0" * line
-    bar = b"\0" * 500 + b"\xff" * 1500 + b"\0" * 500  # columns 4000-15999 black
-    rows = white * 7000 + bar * 1000 + white * 7000
-    for strip_rows in (h, 512):  # one 37.5 MB strip, or 512-row strips if GDI+ refuses that
-        data = bilevel_tiff(w, h, rows, strip_rows)
-        before = peak_working_set()
-        t0 = time.monotonic()
-        res = raster.gray(data)
-        spent = time.monotonic() - t0
-        rise = peak_working_set() - before
-        del data
-        if res is not None:
-            break
-        print(f"note: GDI+ refused {strip_rows}-row strips")
-    assert res is not None
-    g, dpi = res
-    assert g.w * g.h <= images._MAX_PIXELS and (g.w, g.h) == (w // 8, h // 8), (g.w, g.h)
-    assert dpi == 96.0 / 8, dpi  # the file gives no resolution: 96, at 1/8
-    k = 8
-    assert g.data[(7500 // k) * g.w + 10000 // k] < 60  # inside the bar
-    assert g.data[(3000 // k) * g.w + 10000 // k] > 200 and g.data[(7500 // k) * g.w + 1000 // k] > 200
-    assert rise < 400 * 2**20, (rise >> 20, spent)
-    print(f"note: huge TIFF gray {spent:.2f} s, peak working set +{rise >> 20} MB")
+    the peak working set rises by less than 400 MB. Measured in a fresh child: the peak is monotonic, so in this
+    process an earlier test's higher peak would hide the rise."""
+    import json
+    import subprocess
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", HUGE_CHILD, str(HERE)], capture_output=True,
+                       text=True, encoding="utf-8", timeout=300)
+    assert r.returncode == 0, r.stderr[-2000:]
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    for n in out["refused"]:
+        print(f"note: GDI+ refused {n}-row strips")
+    w, h, k = 20000, 15000, 8
+    assert "w" in out, out
+    assert out["w"] * out["h"] <= images._MAX_PIXELS and (out["w"], out["h"]) == (w // k, h // k), out
+    assert out["dpi"] == 96.0 / k, out  # the file gives no resolution: 96, at 1/8
+    assert out["bar"] < 60 and out["above"] > 200 and out["left"] > 200, out
+    assert 0 < out["rise"] < 400 * 2**20, (out["rise"] >> 20, out["spent"])
+    print(f"note: huge TIFF gray {out['spent']:.2f} s, peak working set +{out['rise'] >> 20} MB (child process)")
+
+
+def tiff_header_only(w, h) -> bytes:
+    """A bilevel TIFF that declares w x h but carries 64 bytes of pixels: never decodable to the end."""
+    head = bytearray(bilevel_tiff(8, 8, b"\0" * 8, 8))
+    for tag, val in ((256, w), (257, h), (278, h), (279, (w + 7) // 8 * h)):
+        pos = head.index(struct.pack("<HHI", tag, 4, 1))
+        struct.pack_into("<I", head, pos + 8, val)
+    return bytes(head) + b"\0" * 56
+
+
+def png_header_only(w, h) -> bytes:
+    """An RGB PNG that declares w x h with one small IDAT."""
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    return (PNG_HEAD + images._chunk(b"IHDR", ihdr) + images._chunk(b"IDAT", zlib.compress(b"\0" * 4096))
+            + images._chunk(b"IEND", b""))
+
+
+def test_gray_source_caps():
+    """A TIFF page over TIFF_SOURCE_CAP times the pixel cap, or another picture over SOURCE_CAP times it, is not
+    decoded: None, at once. Just under the TIFF cap the size is still accepted (GDI+ then finds no pixels)."""
+    cap = images._MAX_PIXELS
+    assert raster.GRAY_TIFF_SOURCE == 64 and raster.GRAY_SOURCE == 4
+    big_tiff = tiff_header_only(40000, raster.GRAY_TIFF_SOURCE * cap // 40000 + 1)
+    big_png = png_header_only(8192, raster.GRAY_SOURCE * cap // 8192 + 1)
+    seen = []
+    real = raster._draw_gray
+
+    def spy(*a, **kw):
+        seen.append(a[2:4])
+        return real(*a, **kw)
+    raster._draw_gray = spy
+    try:
+        for data in (big_tiff, big_png):
+            t0 = time.monotonic()
+            assert raster.gray(data) is None
+            assert time.monotonic() - t0 < 1.0
+        assert seen == [], seen  # refused before any drawing
+    finally:
+        raster._draw_gray = real
+
+
+def test_gray_deadline_past():
+    """A deadline (time.monotonic()) already past gives None without decoding, whatever the decoder."""
+    png = images._png(2, 1, [bytes([1, 2, 3, 4, 5, 6])], False)
+    assert raster.gray(png, deadline=time.monotonic() - 1) is None
+    with no_backend():
+        assert raster.gray(png, deadline=time.monotonic() - 1) is None
+        assert raster.gray(png, deadline=time.monotonic() + 60) is not None
+    seen = []
+    with fake_resvg(lambda jobs, mono: seen.append(mono) or [None]):
+        now = time.monotonic()
+        raster.gray(png, deadline=now + 30)
+        assert seen and now + 29 < seen[-1] <= now + 30, seen  # the child's timeout is the deadline
+
+
+@needs_gdiplus
+def test_gray_deadline_between_bands():
+    """The GDI+ band loop stops once the deadline passes: a scan whose bands outlast it gives None."""
+    w, h = 20000, 4096
+    data = bilevel_tiff(w, h, b"\0" * (w // 8 * h), h)
+    calls = []
+    real = raster.time.monotonic
+    start = real()
+
+    def clock():
+        calls.append(1)
+        return start + len(calls)  # one second a call
+    raster.time.monotonic = clock
+    try:
+        assert raster.gray(data, max_pixels=w * h // 64, deadline=start + 3) is None
+    finally:
+        raster.time.monotonic = real
+    assert raster.gray(data, max_pixels=w * h // 64, deadline=real() + 60) is not None
 
 
 def test_gray_none_for_unknown_bytes():
@@ -1348,6 +1445,14 @@ def test_gray_own_png_without_gdiplus():
         assert (g.w, g.h, g.data, dpi) == (2, 2, bytes([20, 50, 80, 110]), 96.0)
         rgba = [bytes([1, 2, 3, 255, 4, 5, 6, 255])]
         assert raster.gray(images._png(2, 1, rgba, True)).__getitem__(0).data == bytes([2, 5])
+        # black text on a transparent background reads as black on white, not black on black
+        clear, ink = bytes([0, 0, 0, 0]), bytes([0, 0, 0, 255])
+        text = [clear + ink + clear, ink + ink + ink, clear + ink + clear]
+        g, _ = raster.gray(images._png(3, 3, text, True))
+        assert g.data == bytes([255, 0, 255, 0, 0, 0, 255, 0, 255]), g.data
+        half = [bytes([0, 0, 0, 128, 200, 200, 200, 0])]  # partial alpha: approximate, never darker than its G
+        g, _ = raster.gray(images._png(2, 1, half, True))
+        assert g.data[1] == 255 and g.data[0] >= 127, g.data
         from reader import ocr_pixels
         gp = images.gray_png(ocr_pixels.Gray(4, 4, bytes(range(16))))
         g, dpi = raster.gray(gp, max_pixels=4)

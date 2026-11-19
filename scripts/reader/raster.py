@@ -40,6 +40,20 @@ _GRAY_HEAD = b"GRAY"   # the image venv's answer to a gray job: this, then >IIf 
 _DPI_MIN, _DPI_MAX = 50.0, 2400.0  # a picture's own resolution is believed in this range; 96 is assumed outside it
 _PILLOW_GRAY_PIXELS = 8 * images._MAX_PIXELS  # Pillow warns past this and refuses past twice it, in the child
 _BAND_BYTES = 32 * 2**20  # 32-bit source pixels GDI+ draws at a time for raster.gray
+# The largest source raster.gray decodes, in multiples of images._MAX_PIXELS. A TIFF page is drawn in bands of rows,
+# so GDI+ holds the page in its own (often 1-bit) format plus one band: a 20000 x 15000 bilevel scan (18x) costs
+# about 90 MB. Every other kind is decoded whole by GDI+ (or Pillow) at up to 4 bytes a pixel before any drawing, so
+# its cap is what that decode may cost: 4x is 256 MB.
+GRAY_TIFF_SOURCE = 64
+GRAY_SOURCE = 4
+
+
+class _Late(Exception):
+    """raster.gray's deadline passed while GDI+ was drawing."""
+
+
+def _source_cap(kind: str) -> int:
+    return (GRAY_TIFF_SOURCE if kind == "tiff" else GRAY_SOURCE) * images._MAX_PIXELS
 _CHILD_CODE = "import sys; sys.path.insert(0, sys.argv[1]); from reader import raster; raster.serve()"
 
 
@@ -209,11 +223,15 @@ def convert(kind: str, data: bytes, *, codepage: str = "", page: int = 0, deadli
     return fig
 
 
-def gray(data: bytes, *, page: int = 0, max_pixels: int | None = None):
+def gray(data: bytes, *, page: int = 0, max_pixels: int | None = None, deadline: float | None = None):
     """(ocr_pixels.Gray, dpi) of a picture for OCR, or None when nothing decodes it. The pixels are the green channel
     on white, already fitted within `max_pixels` (images._MAX_PIXELS when None) by ocr_pixels.reduction's powers of
     two; dpi is the picture's own horizontal resolution when it gives one in 50-2400, else 96, divided by the same
-    factor. A TIFF reads page `page` (from 0); any other picture has only page 0.
+    factor. A TIFF reads page `page` (from 0); any other picture has only page 0. A source over GRAY_TIFF_SOURCE
+    (a TIFF page) or GRAY_SOURCE (any other picture) times images._MAX_PIXELS is not decoded: None.
+
+    `deadline` is a time.monotonic() value: past it, None. It is checked before each decoder, between GDI+'s bands,
+    and is the image venv child's timeout (with PHRO_READER_DEADLINE less FIGURE_RESERVE when that is sooner).
 
     The decoders, in order (decision 5): GDI+ on Windows; Pillow in the image venv (a gray job, in this process or
     the venv's child); the reader's own PNG decoder (images.png_pixels; BMP through images.bmp_to_png first). Each
@@ -227,16 +245,22 @@ def gray(data: bytes, *, page: int = 0, max_pixels: int | None = None):
     if (kind not in GRAY_KINDS or not isinstance(page, int) or not 0 <= page < limits.TIFF_PAGES
             or (page and kind != "tiff") or not isinstance(cap, int) or cap < 1):
         return None
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
     got = None
     try:
         b = backend()
         if b == "gdiplus":
-            got = _gray_gdiplus(data, kind, page, cap)
+            got = _gray_gdiplus(data, kind, page, cap, deadline)
         elif b != "none":
-            deadline = _env_deadline()
-            mono = None if deadline is None else time.monotonic() + (deadline - limits.FIGURE_RESERVE - time.time())
+            env = _env_deadline()
+            mono = None if env is None else time.monotonic() + (env - limits.FIGURE_RESERVE - time.time())
+            if deadline is not None:
+                mono = deadline if mono is None else min(mono, deadline)
             job = {"op": "gray", "data": base64.b64encode(data).decode("ascii"), "page": page, "max": cap}
             got = _gray_frame(_run_jobs([job], mono)[0], cap)
+    except _Late:
+        return None
     except ReadError as e:
         if e.detail == "figure time":
             return None
@@ -244,6 +268,8 @@ def gray(data: bytes, *, page: int = 0, max_pixels: int | None = None):
         got = None
     if got is not None:
         return got
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
     try:
         return _gray_own(data, kind, page, cap)
     except Exception:  # noqa: BLE001 - a picture never makes a document fail
@@ -266,7 +292,10 @@ def _gray_own(data: bytes, kind: str, page: int, cap: int):
         return None
     w, h, ch, raw = got
     kx, _ = ocr_pixels.reduction(w, h, cap)
-    return ocr_pixels.fit(ocr_pixels.from_pixels(w, h, raw, ch), cap), 96.0 / kx
+    g = ocr_pixels.from_pixels(w, h, raw, ch)
+    if ch == 4:  # RGBA: on white, as GDI+ and Pillow give it
+        g = ocr_pixels.on_white(g, raw[3::4])
+    return ocr_pixels.fit(g, cap), 96.0 / kx
 
 
 def _gray_frame(frame, cap: int):
@@ -379,7 +408,7 @@ def _pillow_gray(Image, data: bytes, page: int, cap: int) -> bytes | None:
             except EOFError:
                 return None
         w, h = im.size
-        if w <= 0 or h <= 0:
+        if w <= 0 or h <= 0 or w * h > _source_cap(kind):
             return None
         try:
             dpi = float(im.info.get("dpi", (96.0,))[0])
@@ -800,9 +829,10 @@ def _green(g, bmp, w: int, h: int) -> bytes:
         g.GdipBitmapUnlockBits(bmp, ct.byref(bd))
 
 
-def _gray_gdiplus(data: bytes, kind: str, page: int, cap: int):
+def _gray_gdiplus(data: bytes, kind: str, page: int, cap: int, deadline: float | None = None):
     """(Gray, dpi) of a picture GDI+ decodes, drawn with high-quality bicubic straight into a bitmap of the size
-    ocr_pixels.reduction gives; None when GDI+ is absent or the TIFF has no such page. Raises when GDI+ refuses."""
+    ocr_pixels.reduction gives; None when GDI+ is absent, the TIFF has no such page, or the source is over its cap
+    (read from the header, before anything is drawn). Raises _Late past `deadline`, and when GDI+ refuses."""
     from . import ocr_pixels
     g = _gdip()
     if g is None:
@@ -817,7 +847,7 @@ def _gray_gdiplus(data: bytes, kind: str, page: int, cap: int):
                 return None
             _ok(g.GdipImageSelectActiveFrame(img, ct.byref(g.page_dim), page))
         w, h = _image_size(g, img)
-        if w <= 0 or h <= 0:
+        if w <= 0 or h <= 0 or w * h > _source_cap(kind):
             return None
         kx, ky = ocr_pixels.reduction(w, h, cap)
         rx = ct.c_float(0)
@@ -825,17 +855,17 @@ def _gray_gdiplus(data: bytes, kind: str, page: int, cap: int):
         if g.GdipGetImageHorizontalResolution(img, ct.byref(rx)) == 0 and math.isfinite(rx.value) \
                 and _DPI_MIN <= rx.value <= _DPI_MAX:
             dpi = float(rx.value)
-        return ocr_pixels.Gray(w // kx, h // ky, _draw_gray(g, img, w, h, kx, ky)), dpi / kx
+        return ocr_pixels.Gray(w // kx, h // ky, _draw_gray(g, img, w, h, kx, ky, deadline)), dpi / kx
     return _with_image(g, data, g.GdipCreateBitmapFromStream, use)
 
 
-def _draw_gray(g, img, w: int, h: int, kx: int, ky: int) -> bytes:
+def _draw_gray(g, img, w: int, h: int, kx: int, ky: int, deadline: float | None = None) -> bytes:
     """The G bytes of img (w x h) drawn on white into a (w // kx) x (h // ky) 32-bit ARGB bitmap, kx x ky source
     pixels to one, with high-quality bicubic and pixel centres aligned (PixelOffsetModeHalf). The source goes in bands
     of rows (a multiple of ky, about _BAND_BYTES of 32-bit pixels): drawn whole, GDI+ makes a 32-bit copy of the full
     source (1.2 GB more working set for a 20000 x 15000 bilevel scan; 64 MB in bands, which match the whole draw
     within 2 levels). The rows and columns past the last whole kx x ky block are left out, as ocr_pixels.fit drops
-    them."""
+    them. Raises _Late when time.monotonic() reaches `deadline` before a band."""
     ct = g.ct
     tw, th = w // kx, h // ky
     band = max(ky, _BAND_BYTES // (4 * w) // ky * ky)
@@ -849,6 +879,8 @@ def _draw_gray(g, img, w: int, h: int, kx: int, ky: int) -> bytes:
             _ok(g.GdipSetInterpolationMode(gr, 7))   # InterpolationModeHighQualityBicubic
             _ok(g.GdipSetPixelOffsetMode(gr, 4))     # PixelOffsetModeHalf
             for y in range(0, th * ky, band):
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise _Late
                 n = min(band, th * ky - y)
                 _ok(g.GdipDrawImageRectRectI(gr, img, 0, y // ky, tw, n // ky, 0, y, tw * kx, n, 2,  # UnitPixel
                                              None, None, None))
