@@ -301,12 +301,12 @@ def test_cache_hit_skips_worker():
             assert r.status == "done" and words(r) == ["w11"] and r.verdict.kind == "trusted"
             assert r.unread is not None and r.hint and s2.hint
             assert s2._proc is None, "a cache hit started the worker"
-            old = limits.OCR_UNREAD  # the verdict is judged again on load, with the threshold of the day
-            limits.OCR_UNREAD = -1.0
+            old = limits.OCR_UNREAD_NOCONF  # the verdict is judged again on load, with the threshold of the day
+            limits.OCR_UNREAD_NOCONF = -1.0
             try:
                 assert s2.wait(s2.submit(gray(11), "page", 200.0)).verdict.kind == "doubtful"
             finally:
-                limits.OCR_UNREAD = old
+                limits.OCR_UNREAD_NOCONF = old
             miss = s2.submit(gray(11), "picture", 200.0)  # the same pixels read as a picture are another entry
             assert miss.key != t.key and s2.wait(miss).status == "failed"  # the worker cannot start
         finally:

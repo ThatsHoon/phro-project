@@ -70,9 +70,9 @@ FONT_BYTES = 64 * 2**20    # bytes read from one font file
 # the warning of a document whose figures the deadline left undrawn: its result is not kept in the cache
 FIGURES_LATE = "figures not rendered: time"
 # OCR of scanned pages and raster pictures: each cap is read at call time. The doubt signals (OCR_JUNK, OCR_UNREAD,
-# OCR_CONF, OCR_LOW), OCR_WORKERS, the rule and area bounds and the Tesseract page segmentation modes are calibrated
-# on the OCR spike's 30 synthetic pages (6 layouts at 150, 200 and 300 dpi, skewed 2 degrees and noisy): every noisy
-# page doubtful, the most clean pages trusted
+# OCR_UNREAD_NOCONF, OCR_CONF, OCR_LOW), OCR_WORKERS, the rule and area bounds and the Tesseract page segmentation
+# modes are calibrated on the OCR spike's 30 synthetic pages (6 layouts at 150, 200 and 300 dpi, skewed 2 degrees and
+# noisy): every noisy page doubtful, the most clean pages trusted
 OCR_DPI = 200              # resolution a pdf page is rendered at for OCR
 OCR_MIN_EDGE = 64          # long side, in pixels, under which a picture is not read
 OCR_MIN_WORDS = 2          # words under which a picture gets no text
@@ -100,6 +100,9 @@ OCR_JUNK = 0.03            # share of junk characters over which a page is doubt
 #                            spike pages at most 0.003, noisy 0-0.033: the other signals carry the noisy pages
 OCR_UNREAD = 0.07          # share of dark pixels outside the word boxes over which a page is doubtful; spike: clean text
 #                            pages at most 0.055 (Tesseract), noisy Windows Korean pages 0.087-0.121
+OCR_UNREAD_NOCONF = 0.015  # the same share for a page whose words carry no confidence (Windows OCR, which has none
+#                            to doubt it by); spike: clean Windows pages at most 0.007, noisy 0.062-0.413 (the English
+#                            one 0.062, CER 0.42); public scan pages Windows read 0.027-0.727 (CER 0.18-0.61)
 OCR_CONF = 88              # mean word confidence under which a Tesseract page is doubtful; spike: clean 90.2-96.6,
 #                            noisy 71.6-83.5
 OCR_LOW = 0.08             # share of low-confidence words over which a Tesseract page is doubtful; spike: clean at most

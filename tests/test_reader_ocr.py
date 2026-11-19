@@ -253,7 +253,7 @@ def test_judge_thresholds():
         p = page(["가" * (n - k) + "ㄱ" * k])
         assert ocr.judge(p, clean).kind == want, ("junk", k, ocr.junk_share(p))
 
-    p = page(CLEAN_KO)
+    p = page(CLEAN_KO, "tess-kor+eng", conf=95.0)
     for share, want in ((limits.OCR_UNREAD - 1e-3, "trusted"), (limits.OCR_UNREAD + 1e-3, "doubtful")):
         assert ocr.judge(p, Unread(share, None, 0.0)).kind == want, ("unread", share)
 
@@ -275,8 +275,25 @@ def test_judge_thresholds():
     assert ocr.judge(p, clean).kind == "trusted"
 
 
+def test_judge_unread_bar_without_confidence():
+    """Words without a confidence (Windows OCR) leave nothing but the ink they did not read to doubt them by, and an
+    engine that reads clean text covers nearly all of it: past OCR_UNREAD_NOCONF the page is doubtful. Words with a
+    confidence keep the looser OCR_UNREAD, the bar Tesseract's scattered misses need, and so does ink a picture
+    holds (a dense box): a page with a large photo is not doubted for the photo's ink."""
+    lo, hi = limits.OCR_UNREAD_NOCONF - 1e-3, limits.OCR_UNREAD_NOCONF + 1e-3
+    assert hi < limits.OCR_UNREAD
+    bare, sure = page(ENGLISH), page(ENGLISH, "tess-eng", conf=95.0)
+    assert ocr.judge(bare, Unread(lo, None, 0.0)).kind == "trusted"
+    assert ocr.judge(bare, Unread(limits.OCR_UNREAD_NOCONF, None, 0.0)).kind == "trusted"
+    assert ocr.judge(bare, Unread(hi, None, 0.0)).kind == "doubtful"
+    assert ocr.judge(bare, Unread(hi, (0.0, 0.0, 1.0, 1.0), 1.0, 0.006)).kind == "doubtful"  # noise over the page
+    assert ocr.judge(sure, Unread(hi, None, 0.0)).kind == "trusted"
+    photo = (0.0, 0.1, 1.0, 0.9)
+    assert ocr.judge(bare, Unread(hi, photo, 0.8, 0.5)) == ocr.Verdict("area", photo)
+
+
 def test_judge_area_then_trusted():
-    p = page(CLEAN_KO)
+    p = page(CLEAN_KO, "tess-kor+eng", conf=95.0)
     box = (0.1, 0.5, 0.6, 0.9)
     dense = limits.OCR_AREA_DENSITY
     v = ocr.judge(p, Unread(0.05, box, limits.OCR_AREA, dense))
@@ -288,7 +305,7 @@ def test_judge_area_then_trusted():
 
 def test_judge_scattered_misses_trusted():
     """I3: glyphs an engine missed here and there span a large box with sparse ink in it: no picture there."""
-    p = page(CLEAN_KO)
+    p = page(CLEAN_KO, "tess-kor+eng", conf=95.0)
     box = (0.1, 0.1, 0.9, 0.7)
     v = ocr.judge(p, Unread(0.03, box, 0.48, limits.OCR_AREA_DENSITY - 1e-3))
     assert v == ocr.Verdict("trusted", None), v
@@ -477,7 +494,7 @@ def test_judge_at_threshold():
     p = page(["가" * (n - k) + "ㄱ" * k])
     assert ocr.junk_share(p) == limits.OCR_JUNK  # exactly at it: not over
     assert ocr.judge(p, clean).kind == "trusted"
-    assert ocr.judge(page(CLEAN_KO), Unread(limits.OCR_UNREAD, None, 0.0)).kind == "trusted"
+    assert ocr.judge(page(CLEAN_KO, "tess-kor+eng", conf=95.0), Unread(limits.OCR_UNREAD, None, 0.0)).kind == "trusted"
     p = page(CLEAN_KO * 5, "tess-kor+eng", conf=float(limits.OCR_CONF))
     assert sum(w.conf for w in p.words) / len(p.words) == limits.OCR_CONF  # exactly at it: not under
     assert ocr.judge(p, clean).kind == "trusted"
