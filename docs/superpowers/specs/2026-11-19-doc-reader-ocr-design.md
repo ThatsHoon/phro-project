@@ -1,6 +1,6 @@
 # doc-reader OCR: text from scanned pages and pictures
 
-Approved 2026-11-19 (the user: "승인, 스펙 문서 작성해"), written from the user's answers in the brainstorm. It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec); the engine spec edits listed at the end are made in the commit that records its approval. It is the third of three content-gap specs, in the user's order: ① diagrams (done, reader 0.8.0), ② metafiles (done, reader 0.9.0), ③ OCR (this).
+Approved 2026-11-19 (the user: "승인, 스펙 문서 작성해"; the written spec: "확정, 계획 작성"), written from the user's answers in the brainstorm. It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec); the engine spec edits listed at the end are made in the commit that records its approval. It is the third of three content-gap specs, in the user's order: ① diagrams (done, reader 0.8.0), ② metafiles (done, reader 0.9.0), ③ OCR (this).
 
 Research behind it, outside this repository, in `research/ai-document-reader-plugins/`:
 - `reverse/rea/windows-ocr.md`: REA 6.8.0 on `Windows.Media.Ocr.dll` and its model file.

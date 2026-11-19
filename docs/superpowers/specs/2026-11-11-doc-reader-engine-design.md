@@ -8,7 +8,7 @@ This is stage 4 of the user's request. Stages 1 to 3 (clone, test, report) are d
 
 Success:
 
-- Every in-scope extension converts through the gate with no software outside the plugin-managed venvs. pdf converts with none at all through its stdlib parser; the optional pdf venv holds only pypdfium2 and is created only with the user's yes (phase 2d). mpp has no stdlib path: it converts only through the mpp venv (MPXJ and JPype), created only with the user's yes, using a Java already on PATH. The plugin never installs Java (phase 4). Pictures (WMF, EMF, PICT, WPG, TIFF) become PNGs on Windows with nothing installed, through GDI+; on macOS and Linux through the image venv, created only with the user's yes; their text needs nothing (decision 11).
+- Every in-scope extension converts through the gate with no software outside the plugin-managed venvs. pdf converts with none at all through its stdlib parser; the optional pdf venv holds only pypdfium2 and is created only with the user's yes (phase 2d). mpp has no stdlib path: it converts only through the mpp venv (MPXJ and JPype), created only with the user's yes, using a Java already on PATH. The plugin never installs Java (phase 4). Pictures (WMF, EMF, PICT, WPG, TIFF) become PNGs on Windows with nothing installed, through GDI+; on macOS and Linux through the image venv, created only with the user's yes; their text needs nothing (decision 11). Scanned pages and raster pictures are read by OCR when an engine is present: Windows OCR, built in, and Tesseract when the user has it. The reader installs no OCR engine (decision 12).
 - On the bench, for every format with scored documents, the engine's fidelity is at least the current recommended route's minus 0.01, and its calibrated tokens are at most that route's plus 5%. Where it misses, the format's report says why and what it would take. For docx, pptx, xlsx and xlsm the route is the skill's own read command run on the original file, and the skill's own load is reported in its own column (decision 7).
 - A document never reaches Claude as raw binary: the gate either swaps in the Markdown or blocks the Read with a reason.
 - Nothing is printed into a session that does not read a document. The plugin's always-on token cost does not change.
@@ -27,6 +27,7 @@ Success:
 9. (User, 2026-11-14.) Phase 4 as specified in `2026-11-15-doc-reader-phase4-design.md`: djvu reads its text layer only; MPL-2.0 ports (libmspub, libvisio) are allowed; mpp is unsupported by default and read only through an opt-in MPXJ venv.
 10. (User, 2026-11-17.) Diagrams as specified in `2026-11-17-doc-reader-diagrams-design.md`: shapes joined by connectors become a Mermaid flowchart, or a nested list for a branching tree, and connector ends left loose are placed by position.
 11. (User, 2026-11-18.) Metafiles as specified in `2026-11-18-doc-reader-metafiles-design.md`: WMF, EMF, PICT, WPG and TIFF pictures become PNG links followed by their text, drawn by GDI+ on Windows and by our SVG writer and resvg_py elsewhere.
+12. (User, 2026-11-19.) OCR as specified in `2026-11-19-doc-reader-ocr-design.md`: scanned pdf and TIFF pages give their text, plus the page image when the page is doubtful, and raster pictures get `Picture text:`. Windows OCR is reached through ctypes; Tesseract `eng` reads Latin pages when present.
 
 ## Reverse-engineering findings that shape the design
 
@@ -112,7 +113,7 @@ From what cost tokens or lost content in the bench outputs:
 - Diagrams: connected shapes leave the flow for one fenced `mermaid` `Code` block (or a nested list for a tree) at the first connected shape's place, followed by `nK:` paragraphs for content too long or rich for a node label.
 - Footnotes and comments: `[^n]` in place, definitions at the end of the document. A spreadsheet cell's comment is a footnote on its cell, and an external hyperlink stays a link in the cell.
 - Headers and footers: deduplicated, one `Header:`/`Footer:` line at the top; page-number-only ones dropped.
-- Images: written to `assets/img-NNN.<ext>` and linked as `![alt](assets/img-NNN.png)`. Never base64. BMP is converted to PNG. WMF, EMF, PICT, WPG and TIFF are converted to PNG when a backend is present, and their text follows the link (`Figure text:`); a picture that does not convert, and other formats Claude cannot view, are kept as files and listed once in a note.
+- Images: written to `assets/img-NNN.<ext>` and linked as `![alt](assets/img-NNN.png)`. Never base64. BMP is converted to PNG. WMF, EMF, PICT, WPG and TIFF are converted to PNG when a backend is present, and their text follows the link (`Figure text:`); a raster picture is followed by its OCR text (`Picture text:`) when an engine finds words; a picture that does not convert, and other formats Claude cannot view, are kept as files and listed once in a note.
 - Hidden content (hidden text, rows, sheets, slides, sections) and tracked deletions are left out. The first line says how many places were left out; `convert --hidden` includes them, marked `(hidden)`.
 - Metadata: title only, and only when the body does not start with it.
 
@@ -123,7 +124,7 @@ From what cost tokens or lost content in the bench outputs:
 `gate.decide(event) -> dict | None`:
 
 1. Not a `Read`, the extension is not in `FORMATS`, or it is listed in `PHRO_READER_OFF` (comma-separated extensions): print nothing, exit 0.
-2. Look the file up in the cache (key = SHA-1 of the bytes + `reader.VERSION`). A hit skips conversion.
+2. Look the file up in the cache (key = SHA-1 of the bytes + `reader.VERSION`, with the figure and OCR backend ids and the OCR engines' versions). A hit skips conversion.
 3. Otherwise convert in a child process with a 45-second budget, so a hang cannot reach the hook timeout (on a hook timeout Claude Code would read the original binary).
 4. Success: `permissionDecision: "allow"`, `updatedInput` = the original input with `file_path` set to `out.md` (offset and limit kept), and `additionalContext`, under 600 characters: `<name> was converted to Markdown by phro-project (N lines, M images in assets/; Read them to view). k hidden places left out.` For outputs over 2,000 lines it adds the line numbers of the first-level headings so Claude can read by range. For the OOXML family (docx, docm, dotx, dotm, pptx, pptm, ppsx, potx, potm, ppsm, xlsx, xlsm, xltx, xltm) it adds `Read-only view (no XML, cell addresses or formulas); to edit the file, use the <docx|pptx|xlsx> skill.` For pdf it adds the page-line hint, the setup offer when the stdlib parser was used, the unrendered pages and the page index (pdf spec).
 5. Failure: `permissionDecision: "deny"` with a one-line reason: unsupported (phase not built yet, or the reader's detail: `this file is not supported (<detail>)`), encrypted (needs a password), DRM, damaged, too large, or timed out, plus the `convert` command to retry by hand. For the OOXML family the reason also names the skill as the other way to read the file. A pdf that fails as damaged or timed out passes through to Claude's own Read instead; a pdf denial names the pdf skill. An mpp denial carries the MPXJ install offer until the user declines it (phase 4).
@@ -157,6 +158,7 @@ The gate ships in phase 1. A format whose phase is not built yet is denied with 
 | 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp (opt-in) | `bzz`, `jet_pages`, `vsd_stream`, `pub_contents`, `pub_quill`, `pyenv` (mpp); specified in `2026-11-15-doc-reader-phase4-design.md` |
 | diagrams | every format with drawings: vsd, vsdx, ppt, pptx, doc, docx, xls, xlsx, odp, odt, ods, pub, hwp, hwpx | `diagram`; specified in `2026-11-17-doc-reader-diagrams-design.md` |
 | metafiles | wmf, emf, wmz, emz, tif, tiff, pct, pict, wpg, and the pictures in every format | `vector`, `metafile`, `pict`, `wpg`, `fonts`, `raster`, `emf_write`, `svg_write`, `pyenv` (image); specified in `2026-11-18-doc-reader-metafiles-design.md` |
+| ocr | scanned pdf pages, TIFF pages and the raster pictures in every format | `ocr`, `ocr_win`, `ocr_tess`, the `ocr-worker` command; specified in `2026-11-19-doc-reader-ocr-design.md` |
 
 Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-reader-plugins/notes/*-survey.md`, rulings in `rea-decisions.md`). A format that cannot reach the success bar stays "unsupported" with the reason recorded; mpp is one: unsupported by default, read only through the opt-in `read.py setup --for mpp` path when Java and the user's install are present.
 
@@ -171,4 +173,4 @@ Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-read
 
 ## Out of scope
 
-OCR of scanned pages or images (specified next, in spec ③; until then a scanned pdf page goes out as a page image and a scanned TIFF as a PNG); diagram structure in pdf, xps and pictures, which have no connector data; user passwords and DRM removal; editing or writing documents (pdf editing and creation stay with `anthropic-skills:pdf`).
+OCR of textless djvu (needs IW44 and JB2 decoders), handwriting recognition and borderless tables in scans; diagram structure in pdf, xps and pictures, which have no connector data; user passwords and DRM removal; editing or writing documents (pdf editing and creation stay with `anthropic-skills:pdf`).
