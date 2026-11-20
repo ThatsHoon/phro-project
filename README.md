@@ -31,6 +31,7 @@ Always-on cost, in every session of every project where the plugin is enabled:
 | 이 프로젝트에 능력을 더할 때 | "이 방식을 스킬로 만들고 앞으로 설계 때마다 호출해", "hwp 읽는 플러그인 찾아서 내장해", 또는 `/phro-project:design` |
 | 스킬이 안 불리는 것 같을 때 | `/phro-project:route-test`, 비용을 먼저 알려 줍니다 |
 | 플러그인이 커졌을 때 | `/phro-project:audit` |
+| 남의 레포가 쓸 만한지 볼 때 | `/phro-project:repo-brief <링크>`, 로컬 md 파일과 채팅 표로 정리합니다 |
 
 제대로 돌면 이렇게 보입니다.
 
@@ -55,6 +56,7 @@ phro-project/
     update/SKILL.md            take a newer original into this project's copy, one way
     restructure/SKILL.md       reorganize a whole project
       references/test_structure.py   copied into the project: enforces its folder rules
+    repo-brief/SKILL.md        one GitHub repo read into a local Markdown brief and a chat table, typed only
   scripts/
     project.py                 plugin structure, routing tests. Standard library only
     clone.py                   a project's own copy of this plugin: ensure and sync. Standard library only
@@ -88,7 +90,7 @@ The graph answers structure questions such as what breaks if a part is removed. 
 
 ## Workflow
 
-`design` fires on its own or by name. `compass`, `route-test`, `audit` and `restructure` run only when you type them. The core documents also update after every compaction, without a skill call. When `design` or `audit` reaches its routing step, it reads the `route-test` instructions directly. Sections 1 to 3 follow a plugin's life. Sections 4 and 5 serve the project itself.
+`design` fires on its own or by name. `compass`, `route-test`, `audit`, `restructure` and `repo-brief` run only when you type them. The core documents also update after every compaction, without a skill call. When `design` or `audit` reaches its routing step, it reads the `route-test` instructions directly. Sections 1 to 3 follow a plugin's life. Sections 4 and 5 serve the project itself.
 
 ```
 design -> build -> route-test -> use in real work -> audit -> apply on a copy -> route-test
