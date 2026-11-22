@@ -85,7 +85,8 @@ LOST = (
 # Named items: reported after the counted ones, by name only (a flag, not a count).
 NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"),
          ("kf8_fallback", "KF8 layout (the MOBI 6 copy was read)"), ("plain_text", "book markup (read as plain text)"),
-         ("page_images", "page images (text layer only)"), ("linked_data", "linked tables' data (in other files)"))
+         ("page_images", "page images (text layer only)"), ("linked_data", "linked tables' data (in other files)"),
+         ("toc", "table of contents (its headings are not marked)"))
 # counted too, but they only change formatting or reading order, so they are not reported
 INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story",
                       "char_positions", "attribute", "merge", "duplicate", "jet_page8"})  # char_positions: pdf glyph positions dropped, the text kept

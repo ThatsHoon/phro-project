@@ -134,13 +134,13 @@ def test_css_cascade():
 
     def n(tag, **a):
         return xhtml.Node(tag, {k.replace("_", "-"): v for k, v in a.items()}, [])
-    assert c.display_none(n("p"), ())
-    assert not c.display_none(n("p", **{"class": "show"}), ())
-    assert not c.display_none(n("p", **{"class": "show", "style": "display:block"}), ())
-    assert c.display_none(n("div", **{"class": "y", "style": "display:block"}), ())
-    assert c.display_none(n("div", style="display: none"), ())
+    assert c.hidden(n("p"), ())
+    assert not c.hidden(n("p", **{"class": "show"}), ())
+    assert not c.hidden(n("p", **{"class": "show", "style": "display:block"}), ())
+    assert c.hidden(n("div", **{"class": "y", "style": "display:block"}), ())
+    assert c.hidden(n("div", style="display: none"), ())
     assert c.bold(n("span", **{"class": "x"})) and not c.bold(n("span"))
-    assert c.display_none(n("div"), (n("div", style="display:none"),)) is True
+    assert c.hidden(n("div"), (n("div", style="display:none"),)) is True
 
 
 def test_inline_hidden_and_hidden_attr():
@@ -208,11 +208,11 @@ def test_pre_br_blockquote_lists_bold():
 
 
 def test_math_and_switch():
-    body = ('<p><math alttext="x^2"><mi>x</mi></math></p>'
+    body = ('<p><math alttext="x^2"><msup><mi>x</mi><mn>2</mn></msup></math></p>'
             '<epub:switch><epub:case required-namespace="m"><p>CASE</p></epub:case>'
             '<epub:default><p>DEF</p></epub:default></epub:switch>')
     out, _ = md(epub_book({"c.xhtml": body}))
-    assert "$x^2$" in out and "DEF" in out and "CASE" not in out, out
+    assert "$x^{2}$" in out and "DEF" in out and "CASE" not in out, out
 
 
 def test_drm():
@@ -284,10 +284,10 @@ def test_huge_css_is_capped():
     t0 = time.monotonic()
     c = xhtml.Css(["x" * 3_000_000 + "{display:none}", "/*" * 500_000, ".a{display:none}" * 300_000])
     assert time.monotonic() - t0 < 5
-    assert xhtml.Css([" " * 2**20 + ".a{display:none}"]).display_none(xhtml.Node("p", {"class": "a"}, []), ()) is False
+    assert xhtml.Css([" " * 2**20 + ".a{display:none}"]).hidden(xhtml.Node("p", {"class": "a"}, []), ()) is False
     many = xhtml.Css(["".join(f".k{i}{{display:none}}" for i in range(20_000))])
-    assert not many.display_none(xhtml.Node("p", {"class": "k19999"}, []), ())  # past the selector cap
-    assert many.display_none(xhtml.Node("p", {"class": "k5"}, []), ()) and c
+    assert not many.hidden(xhtml.Node("p", {"class": "k19999"}, []), ())  # past the selector cap
+    assert many.hidden(xhtml.Node("p", {"class": "k5"}, []), ()) and c
 
 
 def test_stylesheet_hrefs_stay_in_package():
@@ -410,6 +410,92 @@ def test_referenced_linear():
     keep = xhtml.referenced(body, notes)
     took = time.perf_counter() - t0
     assert keep == [f"n{i}" for i in range(n)] and took < 2, took
+
+
+NCX_HEAD = '<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><navMap>'
+NCX_ITEM = '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>'
+
+
+def nav_point(label, src, inner=""):
+    return f'<navPoint><navLabel><text>{label}</text></navLabel><content src="{src}"/>{inner}</navPoint>'
+
+
+def test_toc_targets_become_headings():
+    body = ('<ol><li id="toc_1"><b>Plan</b></li></ol><ol><li id="toc_2"><b>1. Background</b></li></ol>'
+            '<p>body text</p><ol><li value="2" id="toc_3"><b>1.1 Sub part</b></li></ol>'
+            '<div id="wrap"><p>a long first paragraph</p></div><ol><li>an item</li></ol>')
+    ncx = NCX_HEAD + nav_point("Plan", "c.xhtml", nav_point("1. Background", "c.xhtml#toc_2", nav_point(
+        "1.1 Sub part", "c.xhtml#toc_3")) + nav_point("Wrapped", "c.xhtml#wrap")) + "</navMap></ncx>"
+    out, _ = md(epub_book({"c.xhtml": body}, extra={"OEBPS/toc.ncx": ncx}, manifest_extra=NCX_ITEM))
+    assert out.startswith("# 책\n\n# Plan\n\n## 1. Background\n\nbody text\n\n### 1.1 Sub part\n\n"), out
+    assert "a long first paragraph\n\n1. an item\n" in out and "**" not in out, out
+    nav = page('<nav epub:type="toc"><ol><li><a href="c.xhtml#big">Big  title</a><ol><li>'
+               '<a href="c.xhtml#small">Small</a></li></ol></li></ol></nav>')
+    body = '<p id="big" class="t">Big title</p><p>text</p><p><a id="small"/>Small</p><p>Small</p>'
+    item = '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
+    out, _ = md(epub_book({"c.xhtml": body}, css=".t{font-size:2em;font-weight:bold}",
+                          extra={"OEBPS/nav.xhtml": nav, "OEBPS/toc.ncx": ncx}, manifest_extra=item + NCX_ITEM))
+    assert "# Big title\n\ntext\n\n## Small\n\nSmall\n" in out, out
+    out, _ = md(epub_book({"c.xhtml": "<p>Plan</p><p>x\x0e1y</p>"}, extra={"OEBPS/toc.ncx": ncx},
+                          manifest_extra=NCX_ITEM))
+    assert "# Plan" not in out and "x\x0e1y" in out, out
+
+
+def test_unreadable_toc_counted():
+    out, ctx = md(epub_book({"c.xhtml": "<p>Plan</p>"}, extra={"OEBPS/toc.ncx": "<ncx><navMap"},
+                            manifest_extra=NCX_ITEM))
+    assert "Plan" in out and "# Plan" not in out and ctx.skipped["toc"] == 1, (out, ctx.skipped)
+    assert markdown.unread(ctx.skipped) == ["table of contents (its headings are not marked)"], ctx.skipped
+
+
+def test_placeholder_title_left_out():
+    out, _ = md(epub_book({"c.xhtml": "<p>본문</p>"}, title="Unknown"))
+    assert out == "본문\n", out
+    out, _ = md(epub_book({"c.xhtml": "<p>본문</p>"}, title=" unknown "))
+    assert out == "본문\n", out
+
+
+def test_mathml_becomes_tex():
+    def tex(math):
+        out, _ = md(epub_book({"c.xhtml": f"<p>f: {math}</p>"}, title=""))
+        return out.strip()
+    assert tex("<math><mfrac><mrow><mi>a</mi><mo>+</mo><mi>b</mi></mrow><msup><mi>c</mi><mn>2</mn></msup>"
+               "</mfrac></math>") == "f: $\\frac{a+b}{c^{2}}$"
+    assert tex("<math><msqrt><mi>x</mi></msqrt><mo>=</mo><mroot><mi>y</mi><mn>3</mn></mroot></math>") \
+        == "f: $\\sqrt{x}=\\sqrt[3]{y}$"
+    assert tex("<math><msubsup><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>n</mi></msubsup>"
+               "<msub><mi>x</mi><mi>i</mi></msub><mo>≤</mo><mi>α</mi></math>") \
+        == "f: $\\sum_{i=1}^{n}x_{i}\\le\\alpha$"
+    assert tex("<math><mi>sin</mi><mo>(</mo><mi>θ</mi><mo>)</mo><mtext>if ok</mtext></math>") \
+        == "f: $\\sin(\\theta)\\text{if ok}$"
+    assert tex("<math><munderover><mo>∫</mo><mn>0</mn><mn>1</mn></munderover><mover><mi>v</mi><mo>→</mo></mover>"
+               "</math>") == "f: $\\int_{0}^{1}\\vec{v}$"
+    assert tex('<math><semantics><mi>z</mi><annotation encoding="application/x-tex">z_0</annotation>'
+               "</semantics></math>") == "f: $z_0$"
+    assert tex('<math alttext="x squared"><msup><mi>x</mi><mn>2</mn></msup></math>') == "f: $x^{2}$"
+    assert tex('<math alttext="q"></math>') == "f: $q$"
+    assert tex('<m:math xmlns:m="http://www.w3.org/1998/Math/MathML"><m:mi>k</m:mi></m:math>') == "f: $k$"
+    deep = "<mrow>" * 300 + "<mi>d</mi>" + "</mrow>" * 300
+    assert "d" in tex(f"<math>{deep}</math>")
+
+
+def test_visibility_hidden_is_hidden():
+    out, _ = md(epub_book({"c.xhtml": '<p>shown</p><p class="v">secret</p><p style="visibility: collapse">x2</p>'
+                                      '<p>a <span style="visibility:hidden">b</span> c</p>'},
+                          css=".v{visibility:hidden}"))
+    assert "secret" not in out and "x2" not in out and " b " not in out and "(3 hidden places left out)" in out, out
+    c = xhtml.Css([".v{visibility:hidden} .w{visibility:visible}"])
+    assert c.hidden(xhtml.Node("p", {"class": "v"}, []), ()) and not c.hidden(xhtml.Node("p", {"class": "w"}, []), ())
+
+
+def test_drop_cap_picture_gives_its_letter():
+    cap = PNG + b"cap"
+    body = ('<p class="nind"><span class="letra"><img alt="M" src="m.png"/></span>R. BENNET was among</p>'
+            '<p><img alt="A" src="m.png"/> lone picture</p><p><b><img alt="T" src="m.png"/>he end</b></p>')
+    out, _ = md(epub_book({"c.xhtml": body}, extra={"OEBPS/m.png": cap}))
+    assert out.startswith("# 책\n\nMR. BENNET was among\n\n"), out
+    assert "lone picture\n\n![A](assets/img-001.png)" in out and "**The end**" in out, out
+    assert out.count("![") == 1, out
 
 
 def main():

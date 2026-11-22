@@ -1,11 +1,15 @@
 """EPUB to the document model: one chapter section per spine document, in reading order.
 
 The package is read through Package; every href is resolved inside it and anything that points outside
-(`../`, absolute paths, URL schemes) counts as missing.
+(`../`, absolute paths, URL schemes) counts as missing. The table of contents (the EPUB 3 nav, else the NCX) makes
+headings: each target's block, when its text is the entry's label, is marked in the tree and becomes a heading of the
+entry's depth (`html.promote`); a chapter that already holds the marker byte is read without them.
 """
 import re
+from urllib.parse import unquote
 
 from .. import html as xhtml
+from .. import limits
 from ..containers.zipx import Package, attr, first, kids, parse_xml, resolve, walk
 from ..limits import ReadError
 from ..model import Doc, Section
@@ -30,6 +34,71 @@ def _inside(base: str, href: str):
     return None if name == ".." or name.startswith("../") or not name else name
 
 
+def _text_is(node, want: str) -> bool:
+    """Whether the text under node, white space collapsed and case folded, is `want`; it stops reading once the text
+    or the walk outgrows want."""
+    chars, steps = len(want.replace(" ", "")), 4 * len(want) + 256
+    out, seen, stack = [], 0, [node]
+    while stack:
+        steps -= 1
+        if steps < 0:
+            return False
+        n = stack.pop()
+        if isinstance(n, str):
+            seen += len("".join(n.split()))
+            if seen > chars:
+                return False
+            out.append(n)
+        elif n.tag not in ("script", "style"):
+            stack.extend(reversed(n.children))
+    return " ".join("".join(out).split()).casefold() == want
+
+
+def _labelled(node, label: str):
+    """The deepest of node and its leading blocks (each the first content of the one before) whose text is the label."""
+    want = " ".join(label.split()).casefold()
+    found = None
+    for _ in range(limits.MAX_DEPTH):
+        if not want:
+            break
+        if _text_is(node, want):
+            found = node
+        lead = next((c for c in node.children if not isinstance(c, str) or c.strip()), None)
+        if not isinstance(lead, xhtml.Node) or lead.tag not in xhtml.BLOCKS:
+            break
+        node = lead
+    return found
+
+
+def _mark(root, targets) -> bool:
+    """A heading marker (html.MARK and the depth digit) put first in the block each table-of-contents target names:
+    the element its fragment names, climbed to the nearest block, or for a target with no fragment the body; then down
+    its leading blocks to the deepest whose text is the target's label. A target whose label matches no such block
+    marks nothing. True when any marker was put."""
+    want = {frag for frag, _, _ in targets if frag}
+    ids, parent, stack = {}, {}, [root]
+    while want and stack:
+        n = stack.pop()
+        i = n.attrs.get("id")
+        if i in want and i not in ids:
+            ids[i] = n
+        kids_ = [c for c in n.children if isinstance(c, xhtml.Node)]
+        for c in kids_:
+            parent[id(c)] = n
+        stack.extend(reversed(kids_))
+    body = xhtml.find(root, "body") or root
+    marked = set()
+    for frag, depth, label in targets:
+        node = ids.get(frag) if frag else body
+        while node is not None and node is not body and node.tag not in xhtml.BLOCKS:
+            node = parent.get(id(node))
+        node = _labelled(node, label) if node is not None else None
+        if node is not None and id(node) not in marked:
+            marked.add(id(node))
+            node.children.insert(0, xhtml.MARK + str(min(max(depth, 0), 5)))
+    return bool(marked)
+
+
 class _Book:
     def __init__(self, pkg, ctx):
         self.pkg, self.ctx = pkg, ctx
@@ -37,6 +106,7 @@ class _Book:
         self.sheets = {}   # member -> stylesheet text
         self.css = {}      # tuple of sheet texts -> Css
         self.image_bytes = 0
+        self.targets = {}  # member -> [(fragment or None, depth, label)]
 
     def warn(self, kind, msg):
         self.ctx.skipped[kind] += 1
@@ -102,14 +172,80 @@ class _Book:
                     and resolve("", uri).lower() in spine:
                 raise ReadError("drm", "encrypted chapter")
 
+    # ---- table of contents
+    def toc(self, opf, root) -> dict:
+        """{member: [(fragment or None, depth, label)]} of the book's table of contents, in order: the EPUB 3 nav
+        document's toc nav, else the NCX. At most limits.TOC_ITEMS entries; one that cannot be read gives none,
+        counted."""
+        nav = ncx = None
+        man = first(root, "manifest")
+        for it in kids(man, "item") if man is not None else []:
+            href = _inside(opf, it.get("href", ""))
+            if nav is None and "nav" in it.get("properties", "").split():
+                nav = href
+            elif ncx is None and it.get("media-type", "").split(";")[0].strip().lower() == "application/x-dtbncx+xml":
+                ncx = href
+        entries = []
+        for name, read in ((nav, self.nav_entries), (ncx, self.ncx_entries)):
+            if entries or name is None or not self.pkg.has(name):
+                continue
+            try:
+                entries = read(name)
+            except ReadError as e:
+                if e.kind not in ("damaged", "too_large"):
+                    raise
+                self.warn("toc", "a table of contents could not be read; its headings are not marked")
+        out: dict = {}
+        for base, href, depth, label in entries:
+            part = _inside(base, href)
+            if part is not None and label:
+                frag = unquote(href.partition("#")[2]) or None
+                out.setdefault(part, []).append((frag, depth, label[:MAX_TITLE]))
+        return out
+
+    def nav_entries(self, name) -> list:
+        root, toc = xhtml.tree(self.pkg.read(name)), None
+        stack = [root]
+        while stack and toc is None:
+            n = stack.pop()
+            if n.tag == "nav" and {"toc", "doc-toc"} & set(
+                    (n.attrs.get("epub:type", "") + " " + n.attrs.get("role", "")).lower().split()):
+                toc = n
+            stack.extend(c for c in reversed(n.children) if isinstance(c, xhtml.Node))
+        stack, out = ([(toc, -1)] if toc is not None else []), []
+        while stack and len(out) < limits.TOC_ITEMS:
+            n, depth = stack.pop()
+            if n.tag == "a":
+                href = n.attrs.get("href", "").strip()
+                if href:
+                    out.append((name, href, max(depth, 0), " ".join(xhtml.text_of(n).split())))
+                continue
+            depth += n.tag in ("ol", "ul")
+            stack.extend((c, depth) for c in reversed(n.children) if isinstance(c, xhtml.Node))
+        return out
+
+    def ncx_entries(self, name) -> list:
+        nav_map = first(parse_xml(self.pkg.read(name)), "navMap")
+        stack, out = ([(p, 0) for p in reversed(kids(nav_map, "navPoint"))] if nav_map is not None else []), []
+        while stack and len(out) < limits.TOC_ITEMS:
+            point, depth = stack.pop()
+            label = next(iter(kids(point, "navLabel")), None)
+            content = next(iter(kids(point, "content")), None)
+            src = (attr(content, "src") or "").strip() if content is not None else ""
+            if src:
+                out.append((name, src, depth, " ".join("".join(label.itertext()).split()) if label is not None else ""))
+            stack.extend((p, depth + 1) for p in reversed(kids(point, "navPoint")))
+        return out
+
     # ---- chapters
     def run(self) -> Doc:
         opf, root = self.package()
         doc = Doc()
         title = first(root, "title")
-        doc.title = " ".join((title.text or "").split())[:MAX_TITLE] if title is not None else ""
+        doc.title = xhtml.book_title(title.text or "", MAX_TITLE) if title is not None else ""
         parts = self.spine(opf, root)
         self.check_drm(parts)
+        self.targets = self.toc(opf, root)
         for number, part in enumerate(parts, 1):
             try:
                 with self.ctx.guard("chapter"):
@@ -133,8 +269,14 @@ class _Book:
         if len(raw) > xhtml.MAX_DOC:
             self.warn("truncated", "a chapter was cut at the size limit")
         node = xhtml.tree(raw)
+        marked = xhtml.MARK.encode() not in raw and _mark(node, self.targets.get(part, ()))
+        known = len(self.notes)
         blocks = xhtml.blocks(node, css=self.stylesheet(part, node), load=lambda src: self.load(part, src),
                               notes=self.notes, ctx=self.ctx, part=part)
+        if marked:
+            blocks = xhtml.promote(blocks)
+            for key in list(self.notes)[known:]:
+                xhtml.strip_marks(self.notes[key])
         return Section("chapter", number=number, blocks=blocks)
 
     def stylesheet(self, part, node) -> xhtml.Css:
