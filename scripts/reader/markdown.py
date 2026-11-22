@@ -117,7 +117,8 @@ def unread(skipped) -> list:
 
 # ---- OCR: the status lines (decision 7) and the pictures read (decision 1)
 
-_RESERVED = re.compile(r"(?i)con|prn|aux|nul|com\d|lpt\d")  # device names Windows will not open as files
+_RESERVED = re.compile(r"(?i)con|prn|aux|nul|(com|lpt)[\d\u00b9\u00b2\u00b3]")
+VBA_NAMED = 20
 NO_OCR = {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None}  # a parser's doc.meta["ocr"] counts
 KOREAN_HINT = ('(Korean OCR is not installed in Windows: Settings > Time & language > Language > add Korean with '
                '"Optical character recognition".)')
@@ -1149,7 +1150,9 @@ class _Render:
     def _vba(self, mods) -> str:
         """The line naming the VBA modules, their source written to <assets>/vba/<module>.bas. A file name keeps
         the module name's letters, digits, `_` and `-` (64 at most, anything else `_`); a name Windows reserves
-        gets a leading `_`, and a name already taken, whatever its case, a number."""
+        for a device gets a leading `_`, and a name already taken, whatever its case, a number. A module whose
+        file is not named as it is has its own name beside the file's. The line names VBA_NAMED modules and
+        counts the rest; every module's file is written."""
         folder = self.assets_dir / "vba"
         folder.mkdir(parents=True, exist_ok=True)
         taken, items = set(), []
@@ -1164,7 +1167,11 @@ class _Render:
             taken.add(stem.lower())
             (folder / f"{stem}.bas").write_text(source + "\n", encoding="utf-8", newline="\n")
             lines = source.count("\n") + 1
-            items.append(f"{stem}.bas ({kind}, {lines} line{'s' if lines != 1 else ''})")
+            own = "" if stem == name else one_line(name)[:64] + ", "
+            items.append(f"{stem}.bas ({own}{kind}, {lines} line{'s' if lines != 1 else ''})")
+        more = len(items) - VBA_NAMED
+        if more > 0:
+            items[VBA_NAMED:] = [f"and {more} more"]
         return f"VBA modules (source in {self.assets_dir.name}/vba/): " + "; ".join(items)
 
     def _note_defs(self) -> str:

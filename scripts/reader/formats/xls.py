@@ -755,7 +755,7 @@ def parse_compound(src, ctx) -> Doc | str:
             if other is None:
                 data = cf.read("Workbook" if cf.exists("Workbook") else "Book")
             if other is None:
-                vba.compound(cf, ctx, any(n.upper().startswith("_VBA_PROJECT_CUR/") for n in cf.names()))
+                vba.compound(cf, ctx, "_VBA_PROJECT_CUR/")
     except (KeyError, CfbError):
         raise ReadError("damaged", "Workbook stream") from None
     if other is not None:

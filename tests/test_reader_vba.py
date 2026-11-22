@@ -8,14 +8,17 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import limits, markdown  # noqa: E402
+from reader import gate, limits, markdown  # noqa: E402
 from reader.containers import vba  # noqa: E402  (ModuleNotFoundError before vba.py exists)
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import ooxml  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
 from reader.model import Context, Doc, Para, Text  # noqa: E402
 from reader_fix import cfb_bytes  # noqa: E402
+import test_reader_doc as in_doc  # noqa: E402
 import test_reader_docm as in_docm  # noqa: E402
+import test_reader_pub as in_pub  # noqa: E402
+import test_reader_vsd as in_vsd  # noqa: E402
 import test_reader_xls as in_xls  # noqa: E402
 
 # [MS-OVBA] 3.2: the specification's three examples
@@ -60,10 +63,10 @@ def project(sources, prefix="", codepage=949):
     return streams
 
 
-def read(streams, ctx=None):
+def read(streams, ctx=None, prefix=""):
     ctx = ctx or Context()
     with Compound(cfb_bytes(streams)[0]) as cf:
-        return vba.project(cf, ctx), ctx
+        return vba.modules(cf, prefix, ctx), ctx
 
 
 SUB = 'Attribute VB_Name = "Module1"\r\nSub Hello()\r\n    MsgBox "안녕"\r\nEnd Sub\r\n'
@@ -109,10 +112,54 @@ def test_attribute_lines_keep_only_a_description():
 
 def test_project_is_found_under_any_storage():
     for prefix in ("Macros/", "_VBA_PROJECT_CUR/", ""):
-        got, _ = read(project({"M": (SUB, 0x21)}, prefix))
+        got, _ = read(project({"M": (SUB, 0x21)}, prefix), prefix=prefix)
         assert [m[0] for m in got] == ["M"], (prefix, got)
     got, ctx = read({"Other/stream": b"x"})
     assert got is None and not ctx.skipped, (got, ctx.skipped)
+
+
+def test_a_documents_own_project_is_the_one_read():
+    decoy = project({"Decoy": (SUB, 0x21)}, "MBD00000001/Macros/")
+    _, ctx = in_xls.book([{"name": "S", "cells": {(0, 0): "x"}}],
+                         streams={**decoy, **project({"Real": (SUB, 0x21)}, "_VBA_PROJECT_CUR/")})
+    assert [m[0] for m in ctx.vba] == ["Real"] and not ctx.skipped, (ctx.vba, ctx.skipped)
+    _, ctx = in_xls.book([{"name": "S", "cells": {(0, 0): "x"}}], streams=decoy)
+    assert not ctx.vba and not ctx.skipped, (ctx.vba, ctx.skipped)
+    decoy = project({"Decoy": (SUB, 0x21)}, "ObjectPool/_1/_VBA_PROJECT_CUR/")
+    p = in_doc.doc_file([("x\r", False)], streams={**decoy, **project({"Real": (SUB, 0x21)}, "Macros/")})
+    _, ctx = in_doc.parse(p)
+    assert [m[0] for m in ctx.vba] == ["Real"] and not ctx.skipped, (ctx.vba, ctx.skipped)
+
+
+def test_vsd_and_pub_projects_are_read():
+    doc, ctx = in_vsd.read(in_vsd.drawing([{"shapes": [{"text": "t"}]}]),
+                           project({"ThisDocument": (SUB, 0x22)}, "_VBA_PROJECT_CUR/"))
+    assert [m[:2] for m in ctx.vba] == [("ThisDocument", "class or document")] and not ctx.skipped, ctx.vba
+    for prefix in ("", "Macros/"):
+        doc, ctx = in_pub.read_pub(in_pub.one_page(["t"], streams=project({"M": (SUB, 0x21)}, prefix)))
+        assert [m[0] for m in ctx.vba] == ["M"] and not ctx.skipped, (prefix, ctx.vba, ctx.skipped)
+
+
+def test_a_dir_that_names_modules_and_gives_none_is_named():
+    cut = rec(1, struct.pack("<I", 1)) + rec(3, struct.pack("<H", 949)) + rec(0x0F, struct.pack("<H", 2))
+    got, ctx = read({"VBA/dir": container(cut)})
+    assert got == [] and ctx.skipped == {"vba": 1}, (got, ctx.skipped)
+    open_ = cut + rec(0x19, b"A") + rec(0x1A, b"A") + rec(0x31, struct.pack("<I", 7)) + rec(0x21)
+    got, ctx = read({"VBA/dir": container(open_), "VBA/A": b"compild" + container(SUB.encode("cp949"))})
+    assert got == [] and ctx.skipped == {"vba_module": 1}, (got, ctx.skipped)
+    twice = open_ + rec(0x19, b"B") + rec(0x1A, b"A") + rec(0x31, struct.pack("<I", 7)) + rec(0x2B)
+    got, ctx = read({"VBA/dir": container(twice), "VBA/A": b"compild" + container(SUB.encode("cp949"))})
+    assert [m[0] for m in got] == ["B"] and ctx.skipped == {"vba_module": 1}, (got, ctx.skipped)
+
+
+def test_a_mac_code_page_decodes():
+    src = 'Attribute VB_Name = "M"\r\nx = "\u00e9"\r\n'.encode("mac_roman")
+    streams = {"VBA/M": container(src)}
+    out = rec(1, struct.pack("<I", 1)) + rec(3, struct.pack("<H", 10000))
+    out += rec(0x19, b"M") + rec(0x1A, b"M") + rec(0x31, struct.pack("<I", 0)) + rec(0x21) + rec(0x2B)
+    streams["VBA/dir"] = container(out)
+    got, _ = read(streams)
+    assert got == [("M", "module", 'x = "\u00e9"')], got
 
 
 def test_what_cannot_be_read_is_counted():
@@ -134,11 +181,47 @@ def test_modules_and_bytes_are_bounded():
         limits.VBA_MODULES = 2
         got, ctx = read(streams)
         assert [m[0] for m in got] == ["A", "B"] and ctx.skipped == {"vba_module": 1}, (got, ctx.skipped)
-        limits.VBA_MODULES, limits.VBA_BYTES = old[0], len(SUB.encode("cp949")) + 10
+        size = len(vba.decompress(streams["VBA/dir"], 10**6))
+        limits.VBA_MODULES, limits.VBA_BYTES = old[0], size + len(SUB.encode("cp949")) + 10
         got, ctx = read(streams)
         assert [m[0] for m in got] == ["A"] and ctx.skipped == {"vba_module": 2}, (got, ctx.skipped)
     finally:
         limits.VBA_MODULES, limits.VBA_BYTES = old
+
+
+def test_a_module_that_does_not_fit_spends_the_budget():
+    streams = project({n: ("x = 1\r\n" * 60, 0x21) for n in "ABCDEF"})
+    size = len(vba.decompress(streams["VBA/dir"], 10**6))
+    old, real, calls = limits.VBA_BYTES, vba.decompress, []
+    limits.VBA_BYTES = size + 100
+    vba.decompress = lambda data, cap: (calls.append(cap), real(data, cap))[1]
+    try:
+        got, ctx = read(streams)
+        assert got == [] and ctx.skipped == {"vba_module": 6} and len(calls) == 2, (got, ctx.skipped, calls)
+        assert ctx.vba_bytes >= limits.VBA_BYTES, ctx.vba_bytes
+        calls.clear()
+        blob, _ = cfb_bytes(streams)
+        doc, ctx2 = in_docm.parse(in_docm.docm(in_docm.P("Hi"), parts={"word/vbaProject.bin": blob}))
+        ctx2.vba_bytes = limits.VBA_BYTES
+        from reader.containers.zipx import Package as Pkg
+        with Pkg(in_docm.docm(in_docm.P("Hi"), parts={"word/vbaProject.bin": blob})) as pkg:
+            calls.clear()
+            assert vba.package(pkg, ctx2) == [] and not calls and ctx2.skipped["vba"] == 1, (calls, ctx2.skipped)
+    finally:
+        limits.VBA_BYTES, vba.decompress = old, real
+
+
+def test_the_module_count_is_the_documents():
+    one, _ = cfb_bytes(project({"A": (SUB, 0x21), "B": (SUB, 0x21)}))
+    two, _ = cfb_bytes(project({"C": (SUB, 0x21), "D": (SUB, 0x21)}))
+    old = limits.VBA_MODULES
+    limits.VBA_MODULES = 3
+    try:
+        doc, ctx = in_docm.parse(in_docm.docm(in_docm.P("Hi"), parts={"word/vbaProject.bin": one,
+                                                                    "x/vbaProject.bin": two}))
+    finally:
+        limits.VBA_MODULES = old
+    assert [m[0] for m in doc.meta["vba"]] == ["A", "B", "C"] and ctx.skipped == {"vba_module": 1}, ctx.skipped
 
 
 def render(doc, ctx):
@@ -167,7 +250,46 @@ def test_hostile_module_names_stay_inside_the_folder():
     assert not [p for p in out.rglob("*") if p.is_file() and p.parent != folder], list(out.rglob("*"))
     assert "매크로_1.bas" in files and "_CON.bas" in files and "_con-2.bas" in files, files
     assert all(len(f) <= 72 and "/" not in f and "\\" not in f and ".." not in f for f in files), files
-    assert all(f"{f} (module, 1 line)" in md for f in files), md
+    assert "매크로_1.bas (매크로 1, module, 1 line)" in md and "_CON.bas (CON, module, 1 line)" in md, md
+
+
+def test_superscript_device_names_are_reserved():
+    doc = Doc(blocks=[Para([Text("body")])])
+    doc.meta["vba"] = [("COM\u00b9", "module", "x = 1"), ("lpt\u00b3", "module", "x = 1")]
+    md, out = render(doc, Context())
+    assert sorted(p.name for p in (out / "assets" / "vba").iterdir()) == ["_COM\u00b9.bas", "_lpt\u00b3.bas"], md
+
+
+def test_a_long_module_list_is_cut_in_the_line():
+    doc = Doc(blocks=[Para([Text("body")])])
+    doc.meta["vba"] = [(f"M{k}", "module", "x = 1") for k in range(30)]
+    md, out = render(doc, Context())
+    assert len(list((out / "assets" / "vba").iterdir())) == 30
+    assert "M19.bas (module, 1 line); and 10 more\n" in md and "M20.bas" not in md, md
+
+
+def test_the_gate_names_the_vba_folder():
+    with tempfile.TemporaryDirectory() as tmp:
+        md = Path(tmp) / "out.md"
+        md.write_text("x\n", encoding="utf-8")
+        folder = str(Path(tmp) / "assets" / "vba") + gate.os.sep
+        c = gate._context("a.docm", {"lines": 5, "vba": 2}, md)
+        assert f"2 VBA modules in {folder}; Read one to see its source" in c, c
+        c = gate._context("a.docm", {"lines": 5, "vba": 1, "images": 1}, md)
+        assert f"1 VBA module in {folder}" in c and "1 image in" in c, c
+        assert "VBA" not in gate._context("a.docm", {"lines": 5, "vba": "2"}, md)
+
+
+def test_convert_writes_the_module_count():
+    import json
+    import reader
+    blob, _ = cfb_bytes(project({"NewMacros": (SUB, 0x21)}))
+    src = in_docm.docm(in_docm.P("Hi"), parts={"word/vbaProject.bin": blob})
+    with tempfile.TemporaryDirectory() as tmp:
+        reader.convert(src, Path(tmp))
+        assert json.loads((Path(tmp) / "meta.json").read_text(encoding="utf-8"))["vba"] == 1
+        reader.convert(in_docm.docm(in_docm.P("Hi")), Path(tmp))
+        assert "vba" not in json.loads((Path(tmp) / "meta.json").read_text(encoding="utf-8"))
 
 
 def test_docm_project_is_read():

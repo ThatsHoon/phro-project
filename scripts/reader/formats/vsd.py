@@ -104,8 +104,8 @@ part of the group, and of any other shape vsd gives no verdict. vsd has no conta
 read). A connector's route is the end points of its own first geometry section's rows (0x8A MoveTo, 0x8B LineTo, 0x8C
 ArcTo, 0x90 EllipticalArcTo, 0xA5 SplineStart, 0xA6 SplineKnot, 0xC1 PolylineTo, 0xC3 NURBSTo: X at 1, Y at 10; a later
 0x89 Geometry ends it), placed as its box is placed. Diagram data never fails a page: registration and `place` run
-under `ctx.guard("shape")`, a failed `place` leaving the flow as it is. A `_VBA_PROJECT_CUR` storage counts `vba` once;
-macros are never read.
+under `ctx.guard("shape")`, a failed `place` leaving the flow as it is. The project in a `_VBA_PROJECT_CUR` storage is read by
+containers.vba, never run.
 
 Background pages (readPage): the page chunk 0x15's u32 at 8 (v5 the s16 at 0) is the pointer index of its
 background page; a page naming another one that is a background page begins with `Background page: <name>`, and a
@@ -1260,7 +1260,7 @@ def parse_compound(src, ctx) -> Doc | str:
             other = cfb_route.route(cf, "vsd", "no VisioDocument stream")
             data = cf.read("VisioDocument") if other is None else None
             if other is None:
-                vba.compound(cf, ctx, any(n.upper().startswith("_VBA_PROJECT_CUR/") for n in cf.names()))
+                vba.compound(cf, ctx, "_VBA_PROJECT_CUR/")
     except (KeyError, CfbError):
         raise ReadError("damaged", "VisioDocument stream") from None
     if other is not None:

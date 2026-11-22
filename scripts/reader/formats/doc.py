@@ -1103,6 +1103,6 @@ def parse(path, ctx) -> Doc:
     with Compound(path) as cf:
         other = cfb_route.route(cf, "doc", "no WordDocument stream")
         if other is None:
-            vba.compound(cf, ctx, any(n.upper().startswith("MACROS/") for n in cf.names()))
+            vba.compound(cf, ctx, "Macros/")
             return _Reader(cf, ctx, flate.Budget()).run()  # one inflate budget a document
     return cfb_route.parse(other, path, ctx)  # another format's compound file named .doc
