@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import VERSION, convert
-from .limits import FIGURES_LATE, OCR_LATE
+from .limits import FIGURES_LATE, OCR_LATE, READ_BYTES, READ_TOKEN_BYTES, READ_TOKENS
 
 _counter = itertools.count()
 _lock = threading.Lock()
@@ -273,9 +273,15 @@ def store(k: str, src, hidden: bool = False, **opts) -> Path:
         raise
     finally:
         images.FIGURE_CACHE = old
+    extra = {}
     if {FIGURES_LATE, OCR_LATE} & set(meta.get("warnings") or []):
+        extra["partial"] = True
+    if (tmp / "out.md").stat().st_size > min(READ_TOKENS * READ_TOKEN_BYTES, READ_BYTES):
+        lines = (tmp / "out.md").read_bytes().split(b"\n")
+        extra["line_bytes"] = [len(x) + 1 for x in (lines[:-1] if lines[-1] == b"" else lines)]
+    if extra:
         import json
-        meta["partial"] = True
+        meta.update(extra)
         (tmp / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     for attempt in (0, 1):
         try:

@@ -281,10 +281,12 @@ def test_context_unread_clause_fits():
     md.write_text("x\n", encoding="utf-8")
     meta = {"lines": 1, "unread": ["1 slide", "2 images"]}
     assert gate._context("a.hwpx", meta, md).endswith("(1 line). Some parts could not be read: 1 slide, 2 images.")
+    assets = f"{md.parent / 'assets'}{os.sep}"
     c = gate._context("a.hwpx", {"lines": 2, "images": 1}, md)
-    assert c.endswith("(2 lines, 1 image in assets/; Read it to view)."), c
+    assert c.endswith(f"(2 lines, 1 image in {assets}; Read it to view)."), c
     c = gate._context("a.hwpx", {"lines": 2, "images": 3}, md)
-    assert c.endswith("(2 lines, 3 images in assets/; Read them to view)."), c
+    assert c.endswith(f"(2 lines, 3 images in {assets}; Read them to view)."), c
+    assert "assets" not in gate._context("a.hwpx", {"lines": 2, "images": 0}, md)
     meta = {"lines": 3000, "hidden": 4, "warnings": ["garbled"], "unread": [f"{i} kinds of thing" for i in range(60)],
             "headings": [(i, "h") for i in range(100)]}
     c = gate._context("n" * 250 + ".hwpx", meta, md)
@@ -377,9 +379,10 @@ def test_reader_off_convert_ignores():
 def test_heading_index_long_output():
     with stub() as base:
         parts = ["# H"] + [f"p{i}" for i in range(599)] + ["# H"] + [f"q{i}" for i in range(600)]
-        c = out(run(sample("|".join(parts)), base))["additionalContext"]
-        assert 'Sections at lines: 1 "H", 1201 "H"' in c, c
-        assert len(c) < 600
+        o = out(run(sample("|".join(parts)), base))
+        c = o["additionalContext"]
+        assert c.endswith(" Sections at lines: 1 H; 1201 H"), c
+        assert len(c) < 600 and not (Path(o["updatedInput"]["file_path"]).parent / "index.md").exists()
 
 
 def test_heading_index_reaches_the_second_level():
@@ -390,25 +393,83 @@ def test_heading_index_reaches_the_second_level():
     meta = markdown.stats(md.read_text(encoding="utf-8"))
     assert len(meta["headings"]) == 41
     c = gate._context("a.docx", meta, md)
-    assert ' Sections at lines: 1 "T", 2 "H0", 64 "H62", 126 "H124"' in c, c
-    assert len(c) < 600 and c.endswith(", …"), c
+    assert "index.md): 1 T; 64 H62; 188 H186; " in c and len(c) < 600, c
 
 
-def test_heading_index_text_is_quoted_and_clean():
+def test_heading_index_long_titles_sample_and_index_md():
+    """64 headings with long titles: the context keeps an even sample, names index.md beside out.md, and index.md
+    holds every heading with its line and whole title."""
     md = tmp() / "out.md"
     md.write_text("x\n", encoding="utf-8")
-    meta = {"lines": 3000, "headings": [(5, 'say "hi"\nnow\x1b[2J\x85 ‮end “q” '), (9, '""'), (12, "z" * 80)]}
+    heads = [(80 * i + 1, f"Chapter {i}; the long and winding title of it") for i in range(64)]
+    c = gate._context("a.epub", {"lines": 5104, "headings": heads}, md)
+    full = md.parent / "index.md"
+    assert f" Sections at lines (all in {full}): 1 Chapter 0, the long and windin; " in c, c
+    assert len(c) < 600 and c.endswith("; …"), c
+    shown = c.split("): ", 1)[1].split("; ")[:-1]
+    step = (int(shown[1].split()[0]) - 1) // 80
+    assert step > 1 and all(int(e.split()[0]) == 80 * step * n + 1 for n, e in enumerate(shown)), shown
+    text = full.read_text(encoding="utf-8").splitlines()
+    assert text[1:] == [f"{line} {t}" for line, t in heads], text[:3]
+    assert gate._context("a.epub", {"lines": 5104, "headings": heads}, md) == c
+    c = gate._context("a.epub", {"lines": 5104, "headings": heads, "images": 2}, md)
+    assert f"2 images in {md.parent / 'assets'}{os.sep}; " in c and str(full) not in c, c
+    assert " Sections at lines (all in index.md next to that assets folder): 1 Chapter 0," in c, c
+
+
+def test_page_index_md_for_a_sampled_pdf():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    c = gate._context("a.pdf", _pdf_meta(), md)
+    full = md.parent / "index.md"
+    assert f" Pages at lines (all in {full}): 1:1, " in c and len(c) < 600, c
+    assert full.read_text(encoding="utf-8").splitlines()[1:] == [f"{p}:{10 * (p - 1) + 1}" for p in range(1, 301)]
+
+
+def test_heading_index_text_is_clean():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = {"lines": 3000, "headings": [(5, 'say "hi"\nnow\x1b[2J\x85 \u202eend “q” '), (9, '""'), (12, "z" * 80)]}
     c = gate._context("a.docx", meta, md)
-    assert c.endswith(f' Sections at lines: 5 "say hi now [2J end q", 12 "{"z" * 60}"'), c
+    assert c.endswith(f" Sections at lines: 5 say hi now [2J end q; 12 {'z' * 30}"), c
 
 
 def test_heading_index_drops_invisible_marks():
     md = tmp() / "out.md"
     md.write_text("x\n", encoding="utf-8")
-    meta = {"lines": 3000, "headings": [(5, "a‎b‏c؜d​e﻿f‍g")]}
+    meta = {"lines": 3000, "headings": [(5, "a\u200eb\u200fc\u061cd\u200be\ufefff\u200dg")]}
     c = gate._context("a.docx", meta, md)
-    assert c.endswith(' Sections at lines: 5 "abcdefg"'), c
+    assert c.endswith(" Sections at lines: 5 abcdefg"), c
 
+
+def big_sample(paras=7000):
+    """A txtx document whose out.md is about 700 KB: `paras` paragraphs of 99 characters and a blank line between."""
+    return sample("|".join(f"{i:06d} " + "w" * 92 for i in range(paras)))
+
+
+def test_long_output_gets_a_window():
+    """An output past the Read window: a read without offset or limit gets the limit that fits READ_TOKENS (one
+    token per READ_TOKEN_BYTES bytes, the newline counted) and READ_BYTES, and the context says how to go on."""
+    from reader import limits
+    with stub() as base:
+        p = big_sample()
+        o = out(run(p, base))
+        md = Path(o["updatedInput"]["file_path"]).read_bytes()
+        assert len(md) > 690_000, len(md)
+        sizes = [len(x) + 1 for x in md.split(b"\n")[:-1]]
+        cap = min(limits.READ_TOKENS * limits.READ_TOKEN_BYTES, limits.READ_BYTES)
+        n = o["updatedInput"]["limit"]
+        assert sum(sizes[:n]) <= cap < sum(sizes[:n + 1]) and "offset" not in o["updatedInput"], (n, o)
+        assert o["additionalContext"].endswith(f" Lines 1-{n} of {len(sizes)}; continue with offset={n + 1}."), o
+        o = out(run(p, base, offset=n + 1))
+        m = o["updatedInput"]["limit"]
+        assert o["updatedInput"]["offset"] == n + 1 and sum(sizes[n:n + m]) <= cap < sum(sizes[n:n + m + 1]), o
+        assert f" Lines {n + 1}-{n + m} of {len(sizes)}; continue with offset={n + m + 1}." in o["additionalContext"]
+        for keys in ({"offset": 5000, "limit": 10}, {"limit": 3000}):
+            o = out(run(p, base, **keys))
+            assert {k: o["updatedInput"].get(k) for k in keys} == keys and " Lines " not in o["additionalContext"], o
+        o = out(run(sample("short"), base))
+        assert "limit" not in o["updatedInput"] and " Lines " not in o["additionalContext"], o
 
 def test_child_hashes_the_file_itself():
     # a key handed to the child would file a document saved in between under the old content's key
@@ -432,7 +493,7 @@ def test_heading_index_cut_whole_items():
     with stub() as base:
         parts = [f"# Heading number {i}" if i % 10 == 0 else f"p{i}" for i in range(2500)]
         c = out(run(sample("|".join(parts)), base))["additionalContext"]
-        assert len(c) < 600 and c.endswith(", …"), c
+        assert len(c) < 600 and c.endswith("; …") and "index.md): " in c, c
 
 
 def test_cache_hit_no_child():
@@ -1032,7 +1093,9 @@ def test_cut_pages_named_in_runs():
     c = gate._context("a.pdf", meta, md, offer=gate.offer_text("v"))
     assert (' Pages 286-384 are past the cut; Read the pdf with pages="286-305", then the next 20 pages and so on,'
             ' to read them.') in c, c
-    assert " Pages at lines: 1:1, " in c and len(c) < 600, c
+    assert len(c) < 600, c
+    c = gate._context("a.pdf", meta, md)
+    assert "index.md): 1:1, " in c and c.endswith('pages="286-305", then the next 20 pages and so on, to read them.'), c
     assert "past the cut" not in gate._context("a.pdf", _pdf_meta(pages=4), md)
     c = gate._context("a.pdf", _pdf_meta(pages=3, pages_total=384), md, upto=12)
     assert ' Pages 4-12 are past the cut; Read the pdf with pages="4-12" to read them.' in c, c
@@ -1170,8 +1233,11 @@ def test_offer_fits_with_hint():
     assert f'python -I -X utf8 "{read_py}" setup --venv "{venv}" (--decline' in offer, offer
     meta = {"lines": 120, "images": 3, "hidden": 3,
             "unread": ["1 slide", "2 charts", "3 form fields", "4 annotations", "5 links"]}
+    c = gate._context("n" * 24 + ".pdf", meta, md, offer=offer)  # the assets folder's path leaves it no room
+    assert offer not in c and f"3 images in {md.parent / 'assets'}{os.sep};" in c and len(c) < 600, c
+    meta["images"] = 0
     c = gate._context("n" * 24 + ".pdf", meta, md, offer=offer)
-    assert c.index(PDF_HINT) == 149 and len(PDF_HINT) == 94, c
+    assert c.index(PDF_HINT) == 109 and len(PDF_HINT) == 94, c
     assert offer in c and len(c) < 600, (len(c), c)
     # the repair sentence fits the same way
     gate.READ_PY = read_py
@@ -1267,12 +1333,13 @@ def test_page_index_long():
     md = tmp() / "out.md"
     md.write_text("x\n", encoding="utf-8")
     c = gate._context("a.pdf", _pdf_meta(), md)
-    assert " Pages at lines: 1:1, " in c and "Sections at lines" not in c and len(c) < 600, c
-    shown = [int(x.split(":")[0]) for x in c.split(" Pages at lines: ")[1].split(", ") if x != "…"]
+    prefix = f" Pages at lines (all in {md.parent / 'index.md'}): "
+    assert prefix + "1:1, " in c and "Sections at lines" not in c and len(c) < 600, c
+    shown = [int(x.split(":")[0]) for x in c.split(prefix)[1].split(", ") if x != "…"]
     step = shown[1] - shown[0]
     assert step > 1 and shown == list(range(1, 301, step))[:len(shown)], shown  # every k-th page, smallest k
     longer = ", ".join(f"{p}:{10 * (p - 1) + 1}" for p in range(1, 301, step - 1))
-    assert len(c) - len(c.split(" Pages at lines: ")[1]) + len(longer) > 599, step
+    assert len(c) - len(c.split(prefix)[1]) + len(longer) > 599, step
     c = gate._context("a.pdf", _pdf_meta(pages=5, per=500), md)
     assert c.endswith(" Pages at lines: 1:1, 2:501, 3:1001, 4:1501, 5:2001"), c
 

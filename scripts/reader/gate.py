@@ -10,6 +10,7 @@ from reader import limits
 
 INDEX_LINES = 2000
 INDEX_CHARS = 10_000
+INDEX_TITLE = 30  # characters of a heading in the context's index; index.md holds the whole title
 CONTEXT_MAX = 600
 DETAIL_MAX = 200  # characters of a failure detail in a deny reason (`_why`); the file controls some of it
 READ_PY = Path(__file__).resolve().parents[1] / "read.py"
@@ -224,7 +225,7 @@ _CLEAN.update({c: None for c in (*range(0x200b, 0x2010), 0x061c, 0x2060, 0xfeff)
 
 
 def _heading(text):
-    return " ".join(str(text).translate(_CLEAN).split())[:60].strip()
+    return " ".join(str(text).translate(_CLEAN).split())
 
 
 def _clause(prefix, entries, end, used):
@@ -268,16 +269,79 @@ def page_index(meta):
     return sorted(pairs, key=lambda pl: pl[1])
 
 
-def _page_lines(meta, used):
-    """` Pages at lines: p:line, …` with every k-th page, for the smallest k that fits."""
-    prefix = " Pages at lines: "
-    entries = [f"{p}:{line}" for p, line in page_index(meta)]
+def _sample(prefix, entries, sep, room):
+    """(prefix and every k-th entry, k) for the smallest k whose text fits in room, `sep` and "…" ending it when the
+    last entry is not in the sample; ("", 0) when not even the first fits."""
     for k in range(1, len(entries) + 1):
-        mark = "" if (len(entries) - 1) % k == 0 else ", …"  # ", …" when the last page is not in the sample
-        text = prefix + ", ".join(entries[::k]) + mark
-        if used + len(text) <= CONTEXT_MAX - 1:
-            return text
-    return ""
+        mark = "" if (len(entries) - 1) % k == 0 else sep + "…"
+        text = prefix + sep.join(entries[::k]) + mark
+        if len(text) <= room:
+            return text, k
+    return "", 0
+
+
+def _write_index(target, head, lines):
+    """index.md beside out.md: `head`, then one entry a line; True when it is there."""
+    if target.is_file():
+        return True
+    tmp = target.with_name(f".tmp-index-{os.getpid()}")
+    try:
+        tmp.write_text(head + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+        return True
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return target.is_file()
+
+
+def _index(meta, out_md, pdf, used, beside_assets=False):
+    """The index the context gives a long output: for pdf ` Pages at lines: page:line, …`, for the rest ` Sections
+    at lines: line title; …` (titles cut to INDEX_TITLE). Whole when it fits beside `used` characters; else every
+    k-th entry for the smallest k that fits, and the whole index in index.md beside out.md, named in the prefix
+    by its path, or as next to the assets folder when the context already gave that folder's path."""
+    if pdf:
+        name, sep, head = " Pages at lines", ", ", "Pages of out.md, as page:line"
+        entries = full = [f"{p}:{line}" for p, line in page_index(meta)]
+    else:
+        name, sep, head = " Sections at lines", "; ", "Sections of out.md, as line and title"
+        heads = [(line, t) for line, text in meta.get("headings") or [] if (t := _heading(text))]
+        entries = [f"{line} {t[:INDEX_TITLE].strip().replace(';', ',')}" for line, t in heads]
+        full = [f"{line} {t}" for line, t in heads]
+    if not entries:
+        return ""
+    room = CONTEXT_MAX - 1 - used
+    text, k = _sample(name + ": ", entries, sep, room)
+    target = out_md.parent / "index.md"
+    if k == 1 or not _write_index(target, head, full):
+        return text
+    where = "index.md next to that assets folder" if beside_assets else str(target)
+    return _sample(f"{name} (all in {where}): ", entries, sep, room)[0]
+
+
+def _window(meta, ti):
+    """({"limit": n}, the sentence that says so) for a read without a limit whose Read window from its offset would
+    pass READ_TOKENS or READ_BYTES by meta's line_bytes; ({}, "") when Read's own window fits or the offset is not a
+    line number."""
+    sizes = meta.get("line_bytes")
+    off = ti.get("offset", 1)
+    if ("limit" in ti or not isinstance(sizes, list) or not isinstance(off, int) or isinstance(off, bool)):
+        return {}, ""
+    s, m = max(1, off), len(sizes)
+    stop = min(m, s - 1 + limits.READ_LINES)
+    cap = min(limits.READ_TOKENS * limits.READ_TOKEN_BYTES, limits.READ_BYTES)
+    used, e = 0, s - 1
+    for b in sizes[s - 1:stop]:
+        b = _count(b)
+        if used + b > cap:
+            break
+        used, e = used + b, e + 1
+    if e >= stop:
+        return {}, ""
+    e = max(e, s)
+    return {"limit": e - s + 1}, f" Lines {s}-{e} of {m}; continue with offset={e + 1}."
 
 
 def _count(v):
@@ -315,29 +379,31 @@ def _time_cut(meta):
     return items
 
 
-def _head(name, meta):
+def _head(name, meta, assets):
     n = meta.get("lines", 0)
     m = meta.get("images", 0)
     k = meta.get("hidden", 0)
     head = f"{name} was converted to Markdown by phro-project ({n} line{'' if n == 1 else 's'}"
     if m:
-        head += f", {m} image in assets/; Read it to view" if m == 1 else f", {m} images in assets/; Read them to view"
+        head += f", {m} image in {assets}; Read it to view" if m == 1 else f", {m} images in {assets}; Read them to view"
     head += ")."
     if k:
         head += f" {k} hidden places left out."
     return head
 
 
-def _context(name, meta, out_md, *, past_end="", offer="", upto=None):
+def _context(name, meta, out_md, *, past_end="", offer="", upto=None, window=""):
     """additionalContext for an allow, fitted under CONTEXT_MAX: for pdf, the head, PDF_HINT, the past-the-end
     sentence, the offer (whole or not at all), the unrendered and figure pages, the unread list and the page index;
     for the rest, the head, the edit hint, the image offer (whole or not at all), the unread list and the heading
     index. Then, always given room: what the time cut, for pdf the pages past the cut (up to `upto`, the end of a
-    range read) and the read that gets them, and the garble warning."""
+    range read) and the read that gets them, the `window` sentence and the garble warning. The head names the
+    assets folder by its absolute path: the Read result does not show out.md's."""
     pdf = reader.ext_of(name) == "pdf"
-    head = _head(name, meta)
+    head = _head(name, meta, f"{out_md.parent / 'assets'}{os.sep}")
     cut = _time_cut(meta)
     tail = (" Cut by the time limit: " + ", ".join(cut) + "." if cut else "") + (_past_cut(meta, upto) if pdf else "")
+    tail += window
     if "garbled" in (meta.get("warnings") or []):
         tail += " Warning: the text may be garbled."
     if pdf:
@@ -375,13 +441,7 @@ def _context(name, meta, out_md, *, past_end="", offer="", upto=None):
                 long_out = len(out_md.read_text(encoding="utf-8", errors="replace")) > INDEX_CHARS
         except OSError:
             pass
-    index = ""
-    heads = meta.get("headings") or []
-    if long_out and pdf:
-        index = _page_lines(meta, len(head) + len(tail))
-    elif long_out and heads:
-        entries = [f'{line} "{t}"' for line, text in heads if (t := _heading(text))]
-        index = _clause(" Sections at lines: ", entries, "", len(head) + len(tail))
+    index = _index(meta, out_md, pdf, len(head) + len(tail), bool(meta.get("images"))) if long_out else ""
     return head + index + tail
 
 
@@ -535,10 +595,11 @@ def _generic(event, path, start, timeout, command):
         mark = _offer_mark(event)
         if mark is not None and mark.exists():
             offer = ""
-    context = _context(_name(path), meta, out_md, offer=offer)
+    limit, window = _window(meta, event["tool_input"])
+    context = _context(_name(path), meta, out_md, offer=offer, window=window)
     if offer and mark is not None and offer in context:
         _touch(mark)
-    return _allow(event, path, out_md, context)
+    return _allow(event, path, out_md, context, **limit)
 
 
 def mpp_reason(path):
@@ -598,7 +659,9 @@ def _mpp(event, path, start, timeout, command):
     out_md = entry / "out.md"
     if not out_md.is_file():
         return _deny(path, "damaged", "cache entry vanished")
-    return _allow(event, path, out_md, _context(_name(path), _meta(entry), out_md))
+    meta = _meta(entry)
+    limit, window = _window(meta, event["tool_input"])
+    return _allow(event, path, out_md, _context(_name(path), meta, out_md, window=window), **limit)
 
 
 def parse_pages(v):
@@ -748,7 +811,9 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
         mark = _offer_mark(event)
         if mark is None or not mark.exists():
             offer = offer_text(venv, repair)
-    context = _context(_name(path), meta, out_md, past_end=past_end, offer=offer, upto=upto)
+    limit, window = _window(meta, {**{k: v for k, v in event["tool_input"].items() if k not in drop}, **at})
+    at.update(limit)
+    context = _context(_name(path), meta, out_md, past_end=past_end, offer=offer, upto=upto, window=window)
     if offer and mark is not None and offer in context:
         _touch(mark)
     return _allow(event, path, out_md, context, drop, **at)

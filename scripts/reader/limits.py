@@ -116,6 +116,12 @@ OCR_FRAME_JSON = 2**20     # header bytes of one OCR worker frame
 OCR_QUEUE_BYTES = 64 * 2**20  # pixel bytes waiting for the worker past which submitting a page waits (until the stop)
 # the warning of a document whose OCR the deadline left unfinished
 OCR_LATE = "ocr not finished: time"
+# one Read of out.md: Claude Code's Read returns 2,000 lines by default, refuses a result over about 25,000 tokens and
+# a file over about 256 KB without offset and limit; a read past these gets a limit that fits
+READ_LINES = 2_000
+READ_TOKENS = 20_000
+READ_TOKEN_BYTES = 3       # the estimate: one token per 3 UTF-8 bytes of a line, its newline counted
+READ_BYTES = 240_000
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 # a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
 BIG_INPUT = "input"  # the file is over MAX_INPUT
