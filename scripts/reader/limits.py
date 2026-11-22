@@ -48,6 +48,8 @@ IMAGE_BYTES = 256 * 2**20
 # 600 bytes. A real document has thousands at most (a thousand-page form with ten tables a page has ten thousand);
 # ten times that is past any, and holds the tables to about 60 MB and a second or two of parse and render
 TABLE_NODES = 100_000
+TOC_WORK = 2_000_000  # nodes one book's table-of-contents labels are matched over (about a second); past it the rest
+#                       of the entries make no heading and are counted
 TOC_ITEMS = 10_000  # table-of-contents entries one epub (nav, else NCX) or mobi (NCX index) book reads for headings
 SMARTART_NODES = 5_000  # SmartArt text items one document may emit, copies counted; one data part reads at most four times as many points and connections
 # metafile pictures (WMF, EMF, PICT, WPG, TIFF): each cap is read at call time

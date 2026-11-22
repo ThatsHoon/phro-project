@@ -301,14 +301,14 @@ def _tidy(items: list) -> list:
 
 @dataclass
 class _Cap:
-    """A picture whose alt is one or two letters, held in its paragraph until the paragraph shows whether it opens a
+    """A picture whose alt is one letter (an opening quote mark may come before it), held in its paragraph until the paragraph shows whether it opens a
     word (a drop cap: the letter stays and the picture goes) or not (the picture stays, after the paragraph)."""
     node: Node
 
 
 def _cap_letter(node) -> str:
     alt = node.attrs.get("alt", "").strip()
-    return alt if 0 < len(alt) <= 2 and alt.isalpha() else ""
+    return alt if alt[-1:].isalpha() and (len(alt) == 1 or (len(alt) == 2 and alt[0] in "\"'“‘«「『")) else ""
 
 
 def _uncap(items: list) -> list:
@@ -619,6 +619,12 @@ _LIMIT_NAMES = frozenset({"lim", "liminf", "limsup", "max", "min", "sup", "inf",
 _SILENT = frozenset({"annotation", "annotation-xml", "none", "mprescripts", "mspace", "malignmark", "maligngroup"})
 
 
+_PRESENTED = frozenset({"mi", "mn", "mo", "mtext", "ms", "annotation"})
+_VARIANT = {"bold": "\\mathbf", "double-struck": "\\mathbb", "script": "\\mathcal", "fraktur": "\\mathfrak",
+            "sans-serif": "\\mathsf", "monospace": "\\mathtt", "bold-italic": "\\boldsymbol",
+            "bold-script": "\\mathcal", "bold-fraktur": "\\mathfrak"}
+
+
 def _local(tag: str) -> str:
     return tag.rpartition(":")[2]
 
@@ -633,7 +639,16 @@ def _token(node) -> str:
 
 def mathml(node) -> str:
     """TeX of a MathML element without delimiters: a TeX annotation of `semantics` as written, else the presentation
-    markup through the TeX buffer the Office Math reader writes with. Past limits.MAX_DEPTH an element is its text."""
+    markup through the TeX buffer the Office Math reader writes with. Past limits.MAX_DEPTH an element is its text.
+    "" for a tree with no presentation token and no annotation (Content MathML): its text is not the formula."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if _local(n.tag) in _PRESENTED:
+            break
+        stack.extend(_args(n))
+    else:
+        return ""
     out = omml.Tex()
     _mm(node, out, 0)
     return out.finish()
@@ -661,9 +676,15 @@ def _mm(n, out, depth):
     t, a = _local(n.tag), _args(n)
     if t in ("mi", "mn", "mo"):
         s = _token(n)
-        name = omml.function_name(s) if t != "mn" and len(s) > 1 else None
+        variant = n.attrs.get("mathvariant", "").strip().lower()
+        font = _VARIANT.get(variant) or ("\\mathrm" if variant == "normal" and t == "mi" and len(s) > 1 else None)
+        name = omml.function_name(s) if t != "mn" and len(s) > 1 and not font else None
         if name:
             out.push_macro(name)
+        elif font and s:
+            inner = omml.Tex()
+            inner.push_math_text(s)
+            out.push_command(font, inner)
         else:
             out.push_math_text(s)
     elif t in ("mtext", "ms"):

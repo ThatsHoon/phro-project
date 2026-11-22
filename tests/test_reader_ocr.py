@@ -521,21 +521,27 @@ def answer(p: OcrPage) -> dict:
     return {"page": asdict(p), "rules": [], "unread": None, "hint": False}
 
 
-def test_picture_verdict_by_text_signals():
+def test_picture_verdict_by_the_words_it_keeps():
     def kind(p):
         return ocr._result_of(answer(p), "picture").verdict.kind
     assert kind(page(CLEAN_KO, "tess-kor+eng", conf=95.0)) == "trusted"
     assert kind(page(ENGLISH)) == "trusted"  # Windows: no confidence, no junk
     assert kind(page(CLEAN_KO, "tess-kor+eng", conf=50.0)) == "doubtful"
-    low = page(CLEAN_KO * 10, "tess-kor+eng", conf=95.0)
-    low.words[0].conf = low.words[1].conf = 10.0
-    assert kind(low) == "doubtful"  # 2 of 20 words low: over OCR_LOW, mean still over OCR_CONF
+    low = page(["w%d" % i for i in range(20)], "tess-kor+eng", conf=86.0)
+    low.words[3].conf = low.words[7].conf = 10.0
+    assert kind(low) == "trusted"  # a readable picture under OCR_CONF and over OCR_LOW: its low words alone go
+    assert ocr.picture_lines(low) == [" ".join("w%d" % i for i in range(20) if i not in (3, 7))], ocr.picture_lines(low)
+    for i in range(11):
+        low.words[i].conf = 10.0
+    assert kind(low) == "doubtful"  # under half its words are left
     assert kind(page(["가나"] + JUNK)) == "doubtful"
+    left = page(["good", "words"] + JUNK, "tess-kor+eng", conf=95.0)
+    left.words[2].conf = 10.0
+    assert kind(left) == "doubtful"  # the words left are junk past OCR_JUNK
     sloped = page(["가나", "다라", "마바"], "tess-kor+eng", conf=95.0)
     for i, w in enumerate(sloped.words):
         w.y += 20 * i
-    assert kind(replace(sloped, psm=limits.TESS_PSM_KOR)) == "doubtful"
-    assert kind(sloped) == "trusted"
+    assert kind(replace(sloped, psm=limits.TESS_PSM_KOR)) == "trusted"  # a label on a slope is a label
 
 
 def test_picture_lines_leave_doubt_to_the_verdict():
@@ -604,7 +610,7 @@ def test_junk_page_read_again_by_the_other_engine():
     assert len(win.calls) == 5 and tess.calls == [("kor+eng", limits.TESS_PSM_KOR)], (len(win.calls), tess.calls)
     tess = Tess({"kor", "eng"}, lambda g, langs: page(CLEAN_KO, "tess-" + langs, conf=50.0))
     got, _ = rp(G, ocr.Engines(Win(lambda g: page(JUNK)), tess, True), FAR, "page")
-    assert got.engine == "tess-kor+eng" and got.turn == 0, got.engine  # both doubtful: the more good text
+    assert got.engine == "win-ko" and got.turn == 0, got.engine  # both doubtful: the first read stays
     tess = Tess({"kor", "eng"}, lambda g, langs: page(JUNK, "tess-" + langs, conf=40.0))
     got, _ = rp(G, ocr.Engines(None, tess, False), FAR, "page")
     assert len(tess.calls) == 5 and got.engine == "tess-kor+eng"  # no Windows: no other engine
@@ -618,7 +624,7 @@ def test_doubtful_turns_rank_by_score():
     assert got.turn == 0 and text(got) == " ".join(out[0]), (got.turn, text(got))  # every turn doubtful by its ink
 
 
-def test_big_junk_page_read_again_at_half_scale():
+def test_big_junk_page_not_read_at_another_scale():
     win = Win(lambda g: page(JUNK))
     saved = ocr.images._MAX_PIXELS
     ocr.images._MAX_PIXELS = 4 * G.w * G.h - 1
@@ -626,7 +632,14 @@ def test_big_junk_page_read_again_at_half_scale():
         rp(G, ocr.Engines(win, None, True), FAR, "page")
     finally:
         ocr.images._MAX_PIXELS = saved
-    assert (win.calls[-1].w, win.calls[-1].h) == (2, 1), win.calls[-1]
+    assert [(c.w, c.h) for c in win.calls] == [(4, 2), (4, 2), (2, 4), (2, 4)], win.calls
+
+
+def test_other_engine_not_asked_for_a_read_it_already_gave():
+    win = Win(lambda g: page(ENGLISH + JUNK))
+    tess = Tess({"kor", "eng"}, lambda g, langs: page(ENGLISH + JUNK + ["more"], "tess-" + langs, conf=95.0))
+    rp(G, ocr.Engines(win, tess, True), FAR, "page")
+    assert len(win.calls) <= 5, len(win.calls)
 
 
 def test_reread_stops_at_deadline():

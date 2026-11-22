@@ -34,14 +34,15 @@ def _inside(base: str, href: str):
     return None if name == ".." or name.startswith("../") or not name else name
 
 
-def _text_is(node, want: str) -> bool:
+def _text_is(node, want: str, work: list) -> bool:
     """Whether the text under node, white space collapsed and case folded, is `want`; it stops reading once the text
-    or the walk outgrows want."""
+    or the walk outgrows want, or the book's `work` (nodes left, in a one-item list) is spent."""
     chars, steps = len(want.replace(" ", "")), 4 * len(want) + 256
     out, seen, stack = [], 0, [node]
     while stack:
         steps -= 1
-        if steps < 0:
+        work[0] -= 1
+        if steps < 0 or work[0] < 0:
             return False
         n = stack.pop()
         if isinstance(n, str):
@@ -54,14 +55,14 @@ def _text_is(node, want: str) -> bool:
     return " ".join("".join(out).split()).casefold() == want
 
 
-def _labelled(node, label: str):
-    """The deepest of node and its leading blocks (each the first content of the one before) whose text is the label."""
-    want = " ".join(label.split()).casefold()
+def _labelled(node, want: str, work: list):
+    """The deepest of node and its leading blocks (each the first content of the one before) whose text is `want`,
+    a label with its white space collapsed and its case folded."""
     found = None
     for _ in range(limits.MAX_DEPTH):
-        if not want:
+        if not want or work[0] < 0:
             break
-        if _text_is(node, want):
+        if _text_is(node, want, work):
             found = node
         lead = next((c for c in node.children if not isinstance(c, str) or c.strip()), None)
         if not isinstance(lead, xhtml.Node) or lead.tag not in xhtml.BLOCKS:
@@ -70,11 +71,12 @@ def _labelled(node, label: str):
     return found
 
 
-def _mark(root, targets) -> bool:
+def _mark(root, targets, work: list) -> bool:
     """A heading marker (html.MARK and the depth digit) put first in the block each table-of-contents target names:
     the element its fragment names, climbed to the nearest block, or for a target with no fragment the body; then down
     its leading blocks to the deepest whose text is the target's label. A target whose label matches no such block
-    marks nothing. True when any marker was put."""
+    marks nothing, and a block is searched for a label once. True when any marker was put. `work` is the book's
+    nodes left for the search (`_text_is`); it is under 0 when the search stopped for it."""
     want = {frag for frag, _, _ in targets if frag}
     ids, parent, stack = {}, {}, [root]
     while want and stack:
@@ -87,12 +89,18 @@ def _mark(root, targets) -> bool:
             parent[id(c)] = n
         stack.extend(reversed(kids_))
     body = xhtml.find(root, "body") or root
-    marked = set()
+    marked, tried = set(), set()
     for frag, depth, label in targets:
         node = ids.get(frag) if frag else body
         while node is not None and node is not body and node.tag not in xhtml.BLOCKS:
             node = parent.get(id(node))
-        node = _labelled(node, label) if node is not None else None
+        want = " ".join(label.split()).casefold()
+        if node is None or (id(node), want) in tried:
+            continue
+        if work[0] < 0:
+            break
+        tried.add((id(node), want))
+        node = _labelled(node, want, work)
         if node is not None and id(node) not in marked:
             marked.add(id(node))
             node.children.insert(0, xhtml.MARK + str(min(max(depth, 0), 5)))
@@ -107,6 +115,7 @@ class _Book:
         self.css = {}      # tuple of sheet texts -> Css
         self.image_bytes = 0
         self.targets = {}  # member -> [(fragment or None, depth, label)]
+        self.toc_work = [limits.TOC_WORK]
 
     def warn(self, kind, msg):
         self.ctx.skipped[kind] += 1
@@ -269,7 +278,10 @@ class _Book:
         if len(raw) > xhtml.MAX_DOC:
             self.warn("truncated", "a chapter was cut at the size limit")
         node = xhtml.tree(raw)
-        marked = xhtml.MARK.encode() not in raw and _mark(node, self.targets.get(part, ()))
+        spent = self.toc_work[0] < 0
+        marked = xhtml.MARK.encode() not in raw and _mark(node, self.targets.get(part, ()), self.toc_work)
+        if self.toc_work[0] < 0 and not spent:
+            self.ctx.skipped["toc"] += 1
         known = len(self.notes)
         blocks = xhtml.blocks(node, css=self.stylesheet(part, node), load=lambda src: self.load(part, src),
                               notes=self.notes, ctx=self.ctx, part=part)

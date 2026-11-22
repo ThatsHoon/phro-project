@@ -297,7 +297,7 @@ def read_page(g: Gray, eng: Engines, deadline: float, kind: str, dpi: float = li
     if kind not in ("page", "picture"):
         raise ValueError(f"kind {kind!r}")
     if kind == "picture":
-        page, hint = _read_once(g, eng, deadline, _text_doubt)
+        page, hint = _read_once(g, eng, deadline, lambda p: picture_kept(p) is None)
         return None if page is None else Reading(page, hint)
     measure = _measurer(g, dpi)
 
@@ -322,11 +322,9 @@ def read_page(g: Gray, eng: Engines, deadline: float, kind: str, dpi: float = li
         return (None, h) if p is None else (back(p), h)
 
     def other(turn: int, p: OcrPage) -> tuple[OcrPage | None, bool]:
-        base = rotate(g, turn)
-        if eng.win is not None and p.engine == eng.win.engine:
-            got = _tess_page(eng.tess, base, deadline)
-        else:
-            got = eng.win.recognize(base, deadline) if eng.win is not None else None
+        if eng.win is None or p.engine != eng.win.engine:
+            return None, False
+        got = _tess_page(eng.tess, rotate(g, turn), deadline)
         return (None if got is None else replace(got, turn=turn)), False
 
     best = at(0, 1)
@@ -344,12 +342,14 @@ def read_page(g: Gray, eng: Engines, deadline: float, kind: str, dpi: float = li
             if p.words and junk_share(p) <= limits.OCR_JUNK:  # a clean turn ends the search; an empty one does not
                 break
         turn = best[0].turn
-        k = 2 if 4 * g.w * g.h <= images._MAX_PIXELS else 0.5
-        for again in (lambda: at(turn, k), lambda: other(turn, best[0])):
+        again = [lambda: other(turn, best[0])]
+        if 4 * g.w * g.h <= images._MAX_PIXELS:
+            again.insert(0, lambda: at(turn, 2))
+        for read in again:
             if not doubtful(best[0]) or _now() >= deadline:
                 break
-            p, h = again()
-            if p is not None and rank(p) > rank(best[0]):
+            p, h = read()
+            if p is not None and not doubtful(p):
                 best = p, h
     return Reading(best[0], best[1], *measure(best[0]))
 
@@ -385,8 +385,7 @@ def skew(page: OcrPage) -> float:
 def _text_doubt(page: OcrPage) -> bool:
     """The doubt the text itself gives (`judge`'s first signals): its junk share passes OCR_JUNK, the words' mean
     confidence (when they carry one) is under OCR_CONF, the share of those words under OCR_LOW_WORD passes OCR_LOW,
-    or the lines of a read at TESS_PSM_KOR slope past OCR_SKEW degrees. A picture's text is judged by these alone:
-    the ink of a picture is mostly not text."""
+    or the lines of a read at TESS_PSM_KOR slope past OCR_SKEW degrees."""
     confs = [w.conf for w in page.words if w.conf is not None]
     return bool(
         junk_share(page) > limits.OCR_JUNK
@@ -423,13 +422,27 @@ def judge(page: OcrPage, un: Unread) -> Verdict:
     return Verdict("trusted", None)
 
 
+def picture_kept(page: OcrPage) -> OcrPage | None:
+    """A picture's read without the words whose confidence is under OCR_LOW_WORD (a read with no confidence keeps
+    them all); None, the picture doubtful, when fewer than OCR_MIN_WORDS (of a read that had them) or under half of the words are left, or the
+    junk share of those left passes OCR_JUNK. The page signals (mean confidence, low share, slope) are not a
+    picture's: a few words on a drawing pass them by one bad word."""
+    keep = [i for i, w in enumerate(page.words) if w.conf is None or w.conf >= limits.OCR_LOW_WORD]
+    if len(keep) < min(limits.OCR_MIN_WORDS, len(page.words)) or 2 * len(keep) < len(page.words):
+        return None
+    kept = page if len(keep) == len(page.words) else replace(
+        page, words=[page.words[i] for i in keep], ink=None if page.ink is None else [page.ink[i] for i in keep])
+    return None if junk_share(kept) > limits.OCR_JUNK else kept
+
+
 def picture_lines(page: OcrPage) -> list[str]:
-    """The text lines of a picture for `Picture text:`, in the order of `ocr_layout.reading_lines`; empty under
-    OCR_MIN_WORDS words. Whether they are written is the picture's verdict."""
+    """The text lines of a picture for `Picture text:`, in the order of `ocr_layout.reading_lines`, of the words
+    `picture_kept` keeps (of all of them for a doubtful picture); empty under OCR_MIN_WORDS words. Whether they are
+    written is the picture's verdict."""
     if len(page.words) < limits.OCR_MIN_WORDS:
         return []
     from .ocr_layout import reading_lines
-    return reading_lines(page)
+    return reading_lines(picture_kept(page) or page)
 
 
 # ---- the per-picture key ---------------------------------------------------------------------------------------------
@@ -614,7 +627,7 @@ class Result:
     """A ticket's outcome. `status`: "done" (`page` and `verdict` are set; for a page, `unread` too), "blank" (a
     picture with nothing on it to read, `blank`, not sent), "failed" (the worker died, could not start, refused the
     job, or no engine gave a page) or "late" (the deadline came first). A picture's verdict is "doubtful" or
-    "trusted", by its text alone (`_text_doubt`).
+    "trusted", by the words it keeps (`picture_kept`).
     `rules` are pixel boxes (x0, y0, x1, y1) and `unread` the unread ink, both in the frame of
     `rotate(g, page.turn)`; a picture has no rules and no unread. `hint`: it calls for the Korean hint (decision 13)."""
     status: str
@@ -693,7 +706,7 @@ def _result_of(d: dict, kind: str) -> Result:
         rules.append(tuple(_int(v) for v in b))
     un = _unread_of(d["unread"])
     if kind == "picture":
-        return Result("done", page, rules, un, Verdict("doubtful" if _text_doubt(page) else "trusted", None), hint)
+        return Result("done", page, rules, un, Verdict("trusted" if picture_kept(page) is not None else "doubtful", None), hint)
     if un is None:
         raise ValueError("a page answer without unread ink")
     return Result("done", page, rules, un, judge(page, un), hint)

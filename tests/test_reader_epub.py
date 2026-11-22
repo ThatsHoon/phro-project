@@ -441,6 +441,25 @@ def test_toc_targets_become_headings():
     assert "# Plan" not in out and "x\x0e1y" in out, out
 
 
+def test_toc_marking_is_budgeted():
+    deep = "<div>" * 59 + "<i></i>" * 1500 + "</div>" * 59
+    body = f'<div id="deep">{deep}</div><p id="t">Real title</p><p>text</p>'
+    item = '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
+
+    def book(labels):
+        nav = page('<nav epub:type="toc"><ol>' + "".join(f'<li><a href="c.xhtml#deep">{x}</a></li>' for x in labels)
+                   + '<li><a href="c.xhtml#t">Real title</a></li></ol></nav>')
+        return epub_book({"c.xhtml": body}, extra={"OEBPS/nav.xhtml": nav}, manifest_extra=item)
+    t0 = time.perf_counter()
+    out, ctx = md(book(["x" * 300] * 2000))
+    assert time.perf_counter() - t0 < 5 and "# Real title\n\ntext" in out and not ctx.skipped["toc"], (
+        time.perf_counter() - t0, ctx.skipped)
+    t0 = time.perf_counter()
+    out, ctx = md(book([f"{k} " + "x" * 300 for k in range(2000)]))
+    assert time.perf_counter() - t0 < 8 and ctx.skipped["toc"] == 1 and "Real title" in out, (
+        time.perf_counter() - t0, ctx.skipped)
+
+
 def test_unreadable_toc_counted():
     out, ctx = md(epub_book({"c.xhtml": "<p>Plan</p>"}, extra={"OEBPS/toc.ncx": "<ncx><navMap"},
                             manifest_extra=NCX_ITEM))
@@ -474,6 +493,14 @@ def test_mathml_becomes_tex():
                "</semantics></math>") == "f: $z_0$"
     assert tex('<math alttext="x squared"><msup><mi>x</mi><mn>2</mn></msup></math>') == "f: $x^{2}$"
     assert tex('<math alttext="q"></math>') == "f: $q$"
+    got = tex('<math alttext="\\mathbb{R}^n"><msup><mi mathvariant="double-struck">R</mi><mi>n</mi>'
+              '</msup></math>')
+    assert got == "f: ${\\mathbb{R}}^{n}$", got
+    got = tex('<math><mi mathvariant="bold">v</mi><mo>∈</mo><mi mathvariant="script">F</mi>'
+              '<mi mathvariant="normal">kg</mi></math>')
+    assert got == "f: $\\mathbf{v}\\in\\mathcal{F}\\mathrm{kg}$", got
+    assert tex('<math alttext="E=mc^2"><apply><eq/><ci>E</ci><apply><times/><ci>m</ci><apply><power/><ci>c</ci>'
+               '<cn>2</cn></apply></apply></apply></math>') == "f: $E=mc^2$"
     assert tex('<m:math xmlns:m="http://www.w3.org/1998/Math/MathML"><m:mi>k</m:mi></m:math>') == "f: $k$"
     deep = "<mrow>" * 300 + "<mi>d</mi>" + "</mrow>" * 300
     assert "d" in tex(f"<math>{deep}</math>")
@@ -496,6 +523,10 @@ def test_drop_cap_picture_gives_its_letter():
     assert out.startswith("# 책\n\nMR. BENNET was among\n\n"), out
     assert "lone picture\n\n![A](assets/img-001.png)" in out and "**The end**" in out, out
     assert out.count("![") == 1, out
+    body = ('<p><img alt="주의" src="m.png"/>전원을 끄십시오</p><p><img alt="OK" src="m.png"/>done</p>'
+            '<p><img alt="“I" src="m.png"/>t was late</p>')
+    out, _ = md(epub_book({"c.xhtml": body}, extra={"OEBPS/m.png": cap}))
+    assert "주의전원" not in out and "OKdone" not in out and "“It was late" in out and out.count("![") == 2, out
 
 
 def main():
