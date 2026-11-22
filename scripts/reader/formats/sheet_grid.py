@@ -566,6 +566,7 @@ class Grid:
         self.name, self.budget, self.ctx = name, budget, ctx
         self.cells = {}
         self.merges = []
+        self.lead = {}  # a merge moved past hidden rows or columns: its slot -> (rows, columns) moved
         self._seen = set()
         self.rows_h, self.cols_h, self.heads = _Ranges(), _Ranges(), _Ranges()
         self.cut = False
@@ -829,6 +830,8 @@ class Grid:
                 vc = self.cols_h.first_free(m[1], m[3])
                 if vr is None or vc is None:
                     vr, vc = m[0], m[1]
+                if (vr, vc) != (m[0], m[1]):
+                    self.lead[(vr, vc)] = (vr - m[0], vc - m[1])
                 items.append((vr, vc, m[2], m[3], text))
         items.sort(key=_FIRST_TWO)
         return items
@@ -1045,13 +1048,14 @@ class Grid:
                         rs = cs = 1
                     else:
                         slots[1] += rs * cs
+                lead = self.lead.get((r, c), (0, 0)) if self.lead else (0, 0)
                 if isinstance(value, tuple):
-                    key = (id(value), rs, cs, head)
+                    key = (id(value), rs, cs, head, lead)
                     cell = made.get(key)
                     if cell is None:
-                        cell = made[key] = Cell(list(value), rs, cs, head)
+                        cell = made[key] = Cell(list(value), rs, cs, head, lead)
                 else:
-                    cell = Cell(self._blocks(value), rs, cs, head)
+                    cell = Cell(self._blocks(value), rs, cs, head, lead)
                 row.append(cell)
                 if rs > 1:
                     opened.append((nr + rs - 1, nc, nc + cs - 1))

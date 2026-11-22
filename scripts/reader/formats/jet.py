@@ -48,8 +48,8 @@ Schema. The grid's header cell of each column is "name (type[ → targets][, = e
 required][, rich text])"; an attachment column's type is "Attachment", another complex column's "Complex". The grid
 column of a hidden column (flag 0x10; a replication column, `s_GUID`, `s_Lineage`, `s_Generation` or `s_ColLineage`;
 or `Gen_X` where X is a column of the same table; names without case) is hidden. A user column that only looks like
-one (`s_total`) is shown. A table of over `_WIDE` columns with one row is written a line a column, "header cell:
-value", a table of one column in place of the grid (`_record`).
+one (`s_total`) is shown. A table of over `_WIDE` columns with one row is written a row a column, its header cell
+and its value, a table of two columns in place of the grid (`_record`).
 
 Values. A Memo flagged 0x80 is a hyperlink, `display#address#subaddress#tip`: a Link when the address is http, https,
 mailto or ftp and holds no space or control character, else "display (address)".
@@ -217,7 +217,7 @@ _HTML = 8      # a character of rich text fed to the HTML parser (repeated <p>, 
 _LINK = 1      # a character of a hyperlink split and checked (about 0.25)
 _KEY = 8       # a key column of a row kept for the primary-key sort (a one-column Long key, about 4.6)
 _SORT = 4      # a step of that sort, n times the bits of n (ten Decimal columns, the last differing: about 2.2)
-_WIDE = 12     # columns past which a table's lone row is written a line a column
+_WIDE = 12     # columns past which a table's lone row is written a row a column
 _REF = 8       # a relationship target written in a header cell (two names of up to JET_NAME, about 3.2)
 _CPLX = 8      # a value of a complex cell joined, or a file looked at for a picture (and a unit a character joined)
 _PART = 4      # a part of a linked table's connect string (and a unit a character)
@@ -1863,11 +1863,15 @@ def _schema(db: _Db, tdef: Tdef, name: str, rels: dict, cplx=None) -> list:
 
 
 def _record(heads: list, cols: list, shown: list) -> Table:
-    """The lone row of a table of over _WIDE columns as a table of one column, a row a column of the database's:
-    its header cell, then ": " and its value when it has one. A hidden column's row is hidden."""
+    """The lone row of a table of over _WIDE columns as a table of two columns, a row a column of the database's:
+    its header cell and its value, as the grid's cell holds it. A hidden column's row is hidden."""
     got = dict(shown)
-    rows = [[Cell([Para([Text(heads[i] + (": " + str(got[i]) if got.get(i) else ""))])])] for i in range(len(cols))]
-    return Table(rows, hidden_rows=frozenset(i for i, c in enumerate(cols) if c.hidden))
+    rows = [[Cell([Para([Text("Column")])], header=True), Cell([Para([Text("Value")])], header=True)]]
+    for i in range(len(cols)):
+        v = got.get(i)
+        v = str(v) if isinstance(v, _Files) else v
+        rows.append([Cell([Para([Text(heads[i])])])] + ([Cell(sheet_grid.Grid._blocks(v))] if v else []))
+    return Table(rows, hidden_rows=frozenset(i + 1 for i, c in enumerate(cols) if c.hidden))
 
 
 def _key_columns(tdef: Tdef) -> list:

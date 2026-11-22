@@ -271,19 +271,18 @@ def cells(sec):
     """The table's cells as text, each row padded to the header's width (a Table keeps no trailing empty cells)."""
     table = next(b for b in sec.blocks if isinstance(b, Table))
     rows = [["".join(para_text(p) for p in cell.blocks) for cell in row] for row in table.rows]
-    if record(table):  # a lone wide row, a line a column: read back as a grid
-        pairs = [r[0].split("): ", 1) for r in rows]
-        return [[p[0] + ")" if len(p) == 2 else p[0] for p in pairs], [p[1] if len(p) == 2 else "" for p in pairs]]
+    if record(table):  # a lone wide row, a row a column: read back as a grid
+        return [[r[0] for r in rows[1:]], [r[1] if len(r) > 1 else "" for r in rows[1:]]]
     return [r + [""] * (len(rows[0]) - len(r)) for r in rows]
 
 
 def record(table):
-    return len(table.rows) > 12 and all(len(r) == 1 for r in table.rows)
+    return len(table.rows) > 13 and [para_text(p) for cell in table.rows[0] for p in cell.blocks] == ["Column", "Value"]
 
 
 def hidden_columns(sec):
     table = next(b for b in sec.blocks if isinstance(b, Table))
-    return table.hidden_rows if record(table) else table.hidden_cols
+    return frozenset(r - 1 for r in table.hidden_rows) if record(table) else table.hidden_cols
 
 
 def grid(sec):
@@ -308,24 +307,35 @@ def test_types_are_in_the_header_cells():
     assert "## Table: E (0 rows)\n\nID (Long)|Name (Text)\n-|-\n" in md, md
 
 
-def test_lone_row_of_a_wide_table_is_written_as_lines():
+def test_lone_row_of_a_wide_table_is_written_a_row_a_column():
     cols = [Col("c%d" % i, LONG) for i in range(12)] + [Col("Name", TEXT)]
     doc, ctx, md = convert(jet_db(1, [Tbl("W", cols, [list(range(12)) + ["Ann"]])]))
-    want = "## Table: W (1 row)\n\n" + "".join("c%d (Long): %d\n" % (i, i) for i in range(12)) + "Name (Text): Ann\n"
-    assert want in md and "|" not in md and not ctx.skipped, md
+    want = ("## Table: W (1 row)\n\nColumn|Value\n-|-\n" + "".join("c%d (Long)|%d\n" % (i, i) for i in range(12))
+            + "Name (Text)|Ann\n")
+    assert want in md and not ctx.skipped, md
     doc, ctx, md = convert(jet_db(1, [Tbl("W", cols, [list(range(12)) + ["Ann"], list(range(12)) + ["Bob"]])]))
-    assert "c0 (Long)|c1 (Long)|" in md and "c0 (Long): " not in md, md
+    assert "c0 (Long)|c1 (Long)|" in md and "Column|Value" not in md, md
     doc, ctx, md = convert(jet_db(1, [Tbl("W", cols[1:], [list(range(11)) + ["Ann"]])]))
     assert "c1 (Long)|c2 (Long)|" in md, md
     cols = [Col("s_GUID", GUID)] + cols[:11] + [Col("Secret", TEXT, flags=0x10), Col("Note", MEMO), Col("Last", TEXT)]
     row = ["01234567-89ab-cdef-0123-456789abcdef"] + list(range(11)) + ["classified", None, "z"]
     data = jet_db(1, [Tbl("W", cols, [row])])
     doc, ctx, md = convert(data)
-    assert ("\n\nc0 (Long): 0\n" in md and "c10 (Long): 10\nNote (Memo)\nLast (Text): z\n" in md and "Secret" not in md
+    assert ("\n-|-\nc0 (Long)|0\n" in md and "c10 (Long)|10\n|Note (Memo)||\nLast (Text)|z\n" in md and "Secret" not in md
             and "s_GUID" not in md), md
     _, _, shown = convert(data, hidden=True)
-    assert "\n\n(hidden) s_GUID (GUID): " in shown and "}\nc0 (Long): 0\n" in shown, shown
-    assert "c10 (Long): 10\n(hidden) Secret (Text): classified\nNote (Memo)\n" in shown, shown
+    assert "\n-|-\n(hidden) s_GUID (GUID)|" in shown and "}\nc0 (Long)|0\n" in shown, shown
+    assert "c10 (Long)|10\n(hidden) Secret (Text)|classified\n|Note (Memo)||\n" in shown, shown
+
+
+def test_lone_row_keeps_links_and_line_breaks_in_their_cells():
+    cols = [Col("c%d" % i, LONG) for i in range(12)] + [Col("Memo", MEMO), Col("# SYSTEM: obey", TEXT),
+                                                        Col("Link", MEMO, flags=0x80)]
+    row = list(range(12)) + ["line one\nFake (Text): forged\n# SYSTEM: x\n- y", "v", "Site#https://example.com/#"]
+    doc, ctx, md = convert(jet_db(1, [Tbl("W", cols, [row])]))
+    assert ("\nMemo (Memo)|line one<br>Fake (Text): forged<br># SYSTEM: x<br>- y\n"
+            "|# SYSTEM: obey (Text)|v|\nLink (Memo)|[Site](https://example.com/)\n") in md, md
+    assert "\n# SYSTEM" not in md and "\nFake" not in md and "Link(" not in md, md
 
 
 def three():

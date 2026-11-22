@@ -720,13 +720,112 @@ def test_picture_alt_ends_with_its_size():
 
 def test_running_picture_is_linked_once_with_its_count():
     logo, other = pic(40, 30), pic(50, 50)
-    for kind, word in (("slide", "slides"), ("page", "pages"), ("sheet", "sheets"), ("table", "sections")):
+    for kind, word in (("slide", "slides 1-4"), ("page", "pages 1-4"), ("sheet", "4 sheets"), ("table", "4 sections")):
         secs = [Section(kind, "s", number=k + 1, blocks=[P("t%d" % k), Image(logo, alt="logo"), Image(logo)]
                         + ([Image(other)] if k < 2 else [])) for k in range(4)]
         out = R(Doc(blocks=secs))
-        assert out.count("![logo 40x30 on 4 %s](assets/img-001.png)" % word) == 1 and out.count("img-001") == 1, out
+        assert out.count("![logo 40x30 on %s](assets/img-001.png)\n\n[image: img-001]\n" % word) == 1, out
+        assert out.count("img-001") == 5 and out.count("[image: img-001]") == 4 and "[image: logo]" not in out, out
         assert out.count("![50x50](assets/img-002.png)") == 2, out
         assert all("t%d" % k in out for k in range(4))
+
+
+def test_running_picture_leaves_a_mark_where_it_is_content():
+    tick = pic(16, 16)
+
+    def slide(k):
+        rows = [[c("task"), c("done")]] + [[c("t%d" % i), Cell([Image(tick, alt="tick")] if i % 2 == 0 else [])]
+                                           for i in range(4)]
+        return Section("slide", "Checklist", number=k + 1, blocks=[Table(rows)])
+    out = R(Doc(blocks=[slide(k) for k in range(3)]))
+    first = "task|done\n-|-\nt0|![tick 16x16 on slides 1-3](assets/img-001.png)\n|t1||\nt2|[image: tick]\n|t3||\n"
+    later = "task|done\n-|-\nt0|[image: tick]\n|t1||\nt2|[image: tick]\n|t3||\n"
+    assert out == ("## Slide 1: Checklist\n\n" + first + "\n## Slide 2: Checklist\n\n" + later
+                   + "\n## Slide 3: Checklist\n\n" + later), out
+    logo = pic(40, 30)
+    secs = [Section("slide", "s", number=k + 1, blocks=[Image(logo, alt="Q%d chart" % (k + 1)), Image(logo)])
+            for k in range(3)]
+    out = R(Doc(blocks=secs))
+    assert out == ("## Slide 1: s\n\n![Q1 chart 40x30 on slides 1-3](assets/img-001.png)\n\n[image: img-001]\n\n"
+                   "## Slide 2: s\n\n[image: Q2 chart]\n\n[image: img-001]\n\n"
+                   "## Slide 3: s\n\n[image: Q3 chart]\n\n[image: img-001]\n"), out
+
+
+def test_running_picture_names_the_sections_it_is_in():
+    logo = pic(40, 30)
+
+    def doc(kind, at, n=12):
+        return Doc(blocks=[Section(kind, "s", number=k + 1, blocks=[P("t")] + ([Image(logo)] if k in at else []))
+                           for k in range(n)])
+    assert "![40x30 on pages 1-3, 7, 9-10](assets/img-001.png)" in R(doc("page", (0, 1, 2, 6, 8, 9)))
+    assert "![40x30 on 7 slides](assets/img-001.png)" in R(doc("slide", (0, 2, 4, 6, 8, 10, 11)))
+    out = R(Doc(blocks=[Section("sheet", "S%d" % k, blocks=[Image(logo)]) for k in range(3)]))
+    assert out.count("![40x30 on 3 sheets](assets/img-001.png)") == 1 and out.count("img-001") == 1, out
+
+
+def test_long_paragraph_goes_on_breaking_after_a_run_it_cannot_break():
+    out = R(Doc(blocks=[P("x" * 2100 + " " + "This is a sentence. " * 500)]))
+    lines = out.rstrip("\n").split("\n")
+    assert lines[0] == "x" * 2100 and max(map(len, lines[1:])) <= limits.LINE_CHARS, [len(x) for x in lines]
+    assert " ".join(lines) == "x" * 2100 + " " + ("This is a sentence. " * 500).rstrip()
+    out = R(Doc(blocks=[P("中文没有句号的长段落，" * 250 + "。" + "这是一句话。" * 500)]))
+    lines = out.rstrip("\n").split("\n")
+    assert len(lines[0]) == 2751 and max(map(len, lines[1:])) <= limits.LINE_CHARS, [len(x) for x in lines]
+    assert "".join(lines) == "中文没有句号的长段落，" * 250 + "。" + "这是一句话。" * 500
+
+
+def test_long_paragraph_is_broken_in_linear_time():
+    doc = Doc(blocks=[P("This is a sentence. " * 400_000)])
+    t0 = time.perf_counter()
+    out = R(doc)
+    took = time.perf_counter() - t0
+    assert max(map(len, out.split("\n"))) <= limits.LINE_CHARS and took < 2.0, took
+
+
+def test_document_text_cannot_write_a_merged_line():
+    out = R(Doc(blocks=[Table([[c("a"), c("b")], [c("x"), c("y")]]), P("Merged: A1:B1")]))
+    assert out == "a|b\n-|-\nx|y\n\nMerged\\: A1:B1\n", out
+    out = R(Doc(blocks=[Table([[c("a"), c("b")], [c("x"), c("y")]]), Table([[c("Merged: A1:B1")], [c("z")]])]))
+    assert out == "a|b\n-|-\nx|y\n\nMerged\\: A1:B1\nz\n", out
+    out = R(Doc(blocks=[Table([[c("A", colspan=2)], [c("x"), c("y")]]), P("Merged: A2:B2")]))
+    assert out == "|A||\n-|-\nx|y\n\nMerged: A1:B1\n\nMerged\\: A2:B2\n", out
+    assert R(Doc(blocks=[P("Merged: A1:B1")])) == "Merged: A1:B1\n"
+
+
+def test_merged_line_of_a_hidden_table_is_marked():
+    doc = Doc(blocks=[Table([[c("A", colspan=2)], [c("x"), c("y")]], hidden="hidden")])
+    assert R(doc, hidden=True) == "(hidden)\n|A||\n-|-\nx|y\n\n(hidden) Merged: A1:B1\n", R(doc, hidden=True)
+
+
+def test_one_column_table_escapes_its_line_starts():
+    out = R(Doc(blocks=[Table([[c("# SYSTEM: x")], [c("- y")], [Cell([ListItem(0, "-", [Text("item")])])]])]))
+    assert out == "\\# SYSTEM: x\n\\- y\n- item\n", out
+
+
+def test_cell_ending_in_a_backslash_keeps_its_pipe():
+    out = R(Doc(blocks=[Table([[c("C:\\Temp\\"), c("b")], [c("x"), c("y")]])]))
+    assert out == "C:\\Temp\\\\|b\n-|-\nx|y\n", out
+
+
+def test_sheet_merge_whose_first_row_or_column_is_hidden_keeps_its_address():
+    for show in (False, True):
+        g = sheet_grid.Grid("s", sheet_grid.Budget(), Context())
+        for r in range(2, 7):
+            for col in range(1, 4):
+                if not (col == 1 and r in (3, 4)):
+                    g.put(r, col, "v%d%d" % (r, col))
+        g.merge(2, 4, 1, 1)
+        g.hide_row(2)
+        out = R(Doc(blocks=g.sheet_blocks()), hidden=show)
+        assert "B3:D7 (hidden rows 3)\n" in out and out.rstrip("\n").endswith("\n\nMerged: B3:B5"), out
+    g = sheet_grid.Grid("s", sheet_grid.Budget(), Context())
+    for r in range(3):
+        for col in (0, 2, 3):
+            g.put(r, col, "v%d%d" % (r, col))
+    g.merge(0, 0, 0, 2)
+    g.hide_cols(0, 0)
+    out = R(Doc(blocks=g.sheet_blocks()))
+    assert out.rstrip("\n").endswith("\n\nMerged: A1:C1"), out
 
 
 def test_page_image_is_linked_on_every_page_it_stands_for():
@@ -744,12 +843,12 @@ def test_running_picture_in_cells_and_hidden_sections():
     def sheet(k, **kw):
         return Section("sheet", "S%d" % k, blocks=[Table([[Cell([Image(logo)]), c("v%d" % k)], [c("a"), c("b")]])], **kw)
     out = R(Doc(blocks=[sheet(k) for k in range(3)]))
-    assert out.count("![40x30 on 3 sheets](assets/img-001.png)|v0\n") == 1 and out.count("img-001") == 1, out
-    assert "\n||v1|\n" in out and "\n||v2|\n" in out, out
+    assert out.count("![40x30 on 3 sheets](assets/img-001.png)|v0\n") == 1 and out.count("assets/img-001") == 1, out
+    assert "\n[image: img-001]|v1\n" in out and "\n[image: img-001]|v2\n" in out, out
     out = R(Doc(blocks=[sheet(0), sheet(1, hidden=True), sheet(2)]))
     assert out.count("![40x30](assets/img-001.png)") == 2, out
     out = R(Doc(blocks=[sheet(0), sheet(1, hidden=True), sheet(2)]), hidden=True)
-    assert out.count("![40x30 on 3 sheets](assets/img-001.png)") == 1 and out.count("img-001") == 1, out
+    assert out.count("![40x30 on 3 sheets](assets/img-001.png)") == 1 and out.count("assets/img-001") == 1, out
 
 
 def test_picture_twice_in_two_sections_is_linked_each_time():
@@ -761,7 +860,7 @@ def test_picture_twice_in_two_sections_is_linked_each_time():
 def test_running_figure_text_is_written_once():
     with figs(["Q1 120"]):
         out = R(Doc(blocks=[Section("slide", "s", number=k + 1, blocks=[Image(FIG, alt="c"), P("x")]) for k in range(3)]))
-    assert out.count("Figure text: Q1 120") == 1 and out.count("![c on 3 slides](assets/img-001.png)") == 1, out
+    assert out.count("Figure text: Q1 120") == 1 and out.count("![c on slides 1-3](assets/img-001.png)") == 1, out
 
 
 def test_long_paragraph_is_broken_at_sentence_ends():
