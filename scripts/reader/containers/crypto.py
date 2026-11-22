@@ -233,6 +233,50 @@ def rc4(key: bytes, data: bytes, skip: int = 0) -> bytes:
         raise limits.ReadError("too_large", "part: RC4 data")
     if not key:
         raise ValueError("RC4 needs a key")
+    out = _rc4_system(key, data, skip)
+    return _rc4_loop(key, data, skip) if out is None else out
+
+
+_CNG_KEY = 64  # CNG's RC4 takes keys of up to 512 bits and cuts a longer one short
+
+
+@cache
+def _cng():
+    """(bcrypt.dll, its RC4 provider) on Windows, None elsewhere or when it does not open."""
+    import sys
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    try:
+        lib, alg = ctypes.WinDLL("bcrypt"), ctypes.c_void_p()
+        if lib.BCryptOpenAlgorithmProvider(ctypes.byref(alg), ctypes.c_wchar_p("RC4"), None, 0):
+            return None
+    except (OSError, AttributeError):
+        return None
+    return lib, alg
+
+
+def _rc4_system(key: bytes, data: bytes, skip: int) -> bytes | None:
+    """`rc4` by the system's own RC4 (Windows CNG); None where there is none or it refuses the key."""
+    got = _cng()
+    if got is None or len(key) > _CNG_KEY:
+        return None
+    import ctypes
+    lib, alg = got
+    handle, done = ctypes.c_void_p(), ctypes.c_ulong()
+    if lib.BCryptGenerateSymmetricKey(alg, ctypes.byref(handle), None, 0, bytes(key), len(key), 0):
+        return None
+    try:
+        buf = bytes(skip) + bytes(data)
+        out = ctypes.create_string_buffer(len(buf))
+        if lib.BCryptEncrypt(handle, buf, len(buf), None, None, 0, out, len(buf), ctypes.byref(done), 0)                 or done.value != len(buf):
+            return None
+        return out.raw[skip:]
+    finally:
+        lib.BCryptDestroyKey(handle)
+
+
+def _rc4_loop(key: bytes, data: bytes, skip: int) -> bytes:
     s = list(range(256))
     j = 0
     klen = len(key)
