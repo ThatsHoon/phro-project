@@ -10,8 +10,13 @@ Matrix and its BBox clip; its text and figure paths join the page, its rule segm
 (art inside forms would build empty grids in unrelated drawings).
 
 Text is `hidden = "ocg"` inside `/OC /x BDC` of an off group and inside a form whose /OC is
-off; render mode 3 or 7 sets `invisible`. Caps, each counted once per dropped thing on the
-page's `cut` under `page_part`: a form nested past MAX_FORM_DEPTH or referring to itself,
+off; render mode 3 or 7 sets `invisible`. Marked content (ISO 32000-1 14.6): a fragment and an
+image draw carry the /MCID of the innermost sequence that has one (a form drawn inside it
+included) and whether a sequence around it is an /Artifact; the fragments shown inside a
+sequence whose properties have /ActualText become one fragment of that text at its EMC (none
+when the text is empty), its width the span from the first's start to the farthest end. Caps,
+each counted once per dropped thing on the page's `cut` under `page_part`: a form nested past
+MAX_FORM_DEPTH or referring to itself,
 MAX_FORM_OPERATORS operators in forms per page, MAX_FORM_EXPANDED_BYTES of form data per page,
 and `pdf.PDF_PAGE_OBJECTS` page objects (text objects, painted paths, images and forms). Rule
 segments stop at PDF_SEGMENTS, ignored and not counted. Past 2 x `pdf.PDF_PAGE_CHARS` shown
@@ -24,12 +29,13 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Sequence, Tuple
 
-from ..formats.pdf_layout import Fragment
+from ..formats.pdf_layout import Fragment, span_width
 from ..formats.pdf_tables import PathCollector, Segment
 from .fonts import FontInfo, VerticalMetrics, default_byte_decoder, font_infos
 from .objects import DELIMITERS, WHITESPACE, PDFLexer, PDFName, PDFStream, PDFSyntaxError
 from .ocg import OCState
 from .show_table import font_table
+from .annotations import text_string
 from .structure import PDFFile
 from .widths import WidthMap
 
@@ -141,11 +147,11 @@ class PageContent:
     segments: Sequence[Segment]
     short: Sequence[Segment]
     marks: List[tuple]  # (box, pieces, rule) of each painted path, PathCollector.marks
-    # (resource name, box, stream, last text object) in content order. The name is from the
-    # resources of the stream that drew it (a form has its own), so the resolved image XObject
-    # `stream` is what to read; it is None when the name does not resolve to a stream. The last
-    # text object is the `obj` of the last one begun before the draw (-1 for none).
-    image_draws: List[Tuple[str, tuple, Optional[PDFStream], int]]
+    # (resource name, box, stream, last text object, (mcid, artifact)) in content order. The name
+    # is from the resources of the stream that drew it (a form has its own), so the resolved image
+    # XObject `stream` is what to read; it is None when the name does not resolve to a stream. The
+    # last text object is the `obj` of the last one begun before the draw (-1 for none).
+    image_draws: List[Tuple[str, tuple, Optional[PDFStream], int, Tuple[int, bool]]]
     objects: int  # page objects walked, forms included
     cut: Counter = field(default_factory=Counter)
     unmapped: int = 0  # text operators whose font could not be decoded (their text is gone)
@@ -317,7 +323,10 @@ class _State:
 
 
 class _Page:
-    """One page's walk: its budgets, its output and the form stack."""
+    """One page's walk: its budgets, its output and the form stack. `tags` holds the open
+    marked-content sequences, forms included, as (mcid, artifact, actual text or None, first
+    fragment index, fragment list), mcid and artifact the effective ones, inherited from the
+    sequences around."""
 
     def __init__(self, pdf: PDFFile, fonts_cache: dict, oc: OCState, object_cap: int, char_cap: int):
         self.pdf = pdf
@@ -332,7 +341,8 @@ class _Page:
         self.expanded = 0
         self.active = set()
         self.frags: List[Fragment] = []
-        self.image_draws: List[Tuple[str, tuple, Optional[PDFStream], int]] = []
+        self.image_draws: List[Tuple[str, tuple, Optional[PDFStream], int, Tuple[int, bool]]] = []
+        self.tags: list = []
         self.text_object = -1
         self.positions_left = MAX_TRACKED_PAGE
         self.positions_cut = False
@@ -397,6 +407,35 @@ class _Page:
             self._labels[key] = label
         return label
 
+    @property
+    def tag(self) -> Tuple[int, bool]:
+        """(mcid or -1, artifact) of the innermost open marked-content sequence."""
+        return self.tags[-1][:2] if self.tags else (-1, False)
+
+    def _open(self, name: str, props, frags) -> None:
+        props = self.pdf.resolve(props)
+        mcid, artifact = self.tag
+        actual = None
+        if isinstance(props, dict):
+            got = self.pdf.resolve(props.get("MCID"))
+            if isinstance(got, int) and not isinstance(got, bool) and got >= 0:
+                mcid = got
+            text = self.pdf.resolve(props.get("ActualText"))
+            if isinstance(text, bytes):
+                actual = text_string(text, MAX_TRACKED_RUN)
+        self.tags.append((mcid, artifact or name == "Artifact", actual, len(frags), frags))
+
+    def _close(self) -> None:
+        _mcid, _artifact, actual, start, frags = self.tags.pop()
+        if actual is None or start >= len(frags):
+            return
+        span = frags[start:]
+        del frags[start:]
+        if not actual.strip():
+            return
+        frags.append(replace(span[0], text=actual, width=span_width(span), char_offsets=(), char_gaps=(),
+                             order=len(frags)))
+
     def _property(self, resources, name):
         props = self.pdf.resolve(resources.get("Properties")) if isinstance(resources, dict) else None
         return props.get(name) if isinstance(props, dict) else None
@@ -413,100 +452,109 @@ class _Page:
         marks: list = []  # one bool per open marked-content sequence: is its layer off
         off_marks = 0
         operands: list = []
-        while True:
-            event = scanner.next()
-            if event is None:
-                break
-            kind, value = event
-            if kind == "operand":
-                operands.append(value)
-                if len(operands) > MAX_OPERAND_STACK:
-                    del operands[:-8]
-                continue
-            op = value
-            if depth:
-                self.ops += 1
-                if self.ops > MAX_FORM_OPERATORS:
-                    self._drop_ops()
-                    return
-            if op in (b"Tj", b"TJ", b"'", b'"'):
-                if not self.text_cut:
-                    self._text_operator(op, operands, st, off or off_marks > 0, frags)
-                else:
-                    scanner.pass_text_run()  # past the char cap: no more fragments
-            elif op in (b"Td", b"TD", b"Tm", b"T*"):
-                self.link_reliable = True
-                if op == b"Tm" and len(operands) >= 6:
-                    st.tm = st.tlm = tuple(_num(o) for o in operands[-6:])
-                elif op == b"T*":
-                    st.tlm = st.tm = _matmul((1, 0, 0, 1, 0, -st.tl), st.tlm)
-                elif op != b"Tm" and len(operands) >= 2:
-                    tx, ty = _num(operands[-2]), _num(operands[-1])
-                    if op == b"TD":
-                        st.tl = -ty
-                    st.tlm = st.tm = _matmul((1, 0, 0, 1, tx, ty), st.tlm)
-            elif op == b"BT":
-                self._object()
-                self.text_object += 1
-                self.link_reliable = True
-                st.tm = st.tlm = _IDENTITY
-            elif op == b"Tf":
-                if len(operands) >= 2 and isinstance(operands[-2], PDFName):
-                    name = str(operands[-2])
-                    st.font = infos.get(name)
-                    st.fname = self._label(resources, name) if st.font is not None else ""
-                if operands and isinstance(operands[-1], (int, float)):
-                    st.fs = _num(operands[-1])
-            elif op == b"Tc" and operands and isinstance(operands[-1], (int, float)):
-                st.tc = _num(operands[-1])
-            elif op == b"Tw" and operands and isinstance(operands[-1], (int, float)):
-                st.tw = _num(operands[-1])
-            elif op == b"Tz" and operands and isinstance(operands[-1], (int, float)):
-                st.th = _num(operands[-1]) / 100.0
-            elif op == b"TL" and operands and isinstance(operands[-1], (int, float)):
-                st.tl = _num(operands[-1])
-            elif op == b"Tr" and operands and isinstance(operands[-1], (int, float)):
-                number = _num(operands[-1])
-                if number.is_integer():
-                    st.tr = int(number)
-            elif op == b"q":
-                if len(stack) < MAX_STATE_STACK:
-                    stack.append(st.saved())
-                else:
-                    overflow += 1
-            elif op == b"Q":
-                if overflow:
-                    overflow -= 1
-                elif stack:
-                    st.restore(stack.pop())
-            elif op == b"cm" and len(operands) >= 6:
-                st.ctm = _matmul(tuple(_num(o) for o in operands[-6:]), st.ctm)
-            elif op in _PATH_OPS or op in _PAINT_OPS:
-                if op in _PAINT_OPS and op != b"n":
+        base = len(self.tags)
+        try:
+            while True:
+                event = scanner.next()
+                if event is None:
+                    break
+                kind, value = event
+                if kind == "operand":
+                    operands.append(value)
+                    if len(operands) > MAX_OPERAND_STACK:
+                        del operands[:-8]
+                    continue
+                op = value
+                if depth:
+                    self.ops += 1
+                    if self.ops > MAX_FORM_OPERATORS:
+                        self._drop_ops()
+                        return
+                if op in (b"Tj", b"TJ", b"'", b'"'):
+                    if not self.text_cut:
+                        self._text_operator(op, operands, st, off or off_marks > 0, frags)
+                    else:
+                        scanner.pass_text_run()  # past the char cap: no more fragments
+                elif op in (b"Td", b"TD", b"Tm", b"T*"):
+                    self.link_reliable = True
+                    if op == b"Tm" and len(operands) >= 6:
+                        st.tm = st.tlm = tuple(_num(o) for o in operands[-6:])
+                    elif op == b"T*":
+                        st.tlm = st.tm = _matmul((1, 0, 0, 1, 0, -st.tl), st.tlm)
+                    elif op != b"Tm" and len(operands) >= 2:
+                        tx, ty = _num(operands[-2]), _num(operands[-1])
+                        if op == b"TD":
+                            st.tl = -ty
+                        st.tlm = st.tm = _matmul((1, 0, 0, 1, tx, ty), st.tlm)
+                elif op == b"BT":
                     self._object()
-                    if off or off_marks:
-                        op = b"n"  # a path in an off layer is not drawn
-                paths.operate(op, [_num(o) for o in operands], st.ctm)
-            elif op == b"Do" and operands and isinstance(operands[-1], PDFName):
-                self._do(str(operands[-1]), resources, st, depth, off or off_marks > 0, frags, paths)
-            elif op == b"BDC":
-                hidden = False
-                if len(operands) >= 2 and str(operands[-2]) == "OC":
-                    props = operands[-1]
-                    if isinstance(props, PDFName):
-                        props = self._property(resources, str(props))
-                    hidden = props is not None and self.oc.hidden(props)
-                marks.append(hidden)
-                off_marks += hidden
-            elif op == b"BMC":
-                marks.append(False)
-            elif op == b"EMC":
-                if marks:
-                    off_marks -= marks.pop()
-            elif op == b"BI":
-                self._object()
-                scanner.pos = self._skip_inline_image(data, scanner.pos)
-            operands = []
+                    self.text_object += 1
+                    self.link_reliable = True
+                    st.tm = st.tlm = _IDENTITY
+                elif op == b"Tf":
+                    if len(operands) >= 2 and isinstance(operands[-2], PDFName):
+                        name = str(operands[-2])
+                        st.font = infos.get(name)
+                        st.fname = self._label(resources, name) if st.font is not None else ""
+                    if operands and isinstance(operands[-1], (int, float)):
+                        st.fs = _num(operands[-1])
+                elif op == b"Tc" and operands and isinstance(operands[-1], (int, float)):
+                    st.tc = _num(operands[-1])
+                elif op == b"Tw" and operands and isinstance(operands[-1], (int, float)):
+                    st.tw = _num(operands[-1])
+                elif op == b"Tz" and operands and isinstance(operands[-1], (int, float)):
+                    st.th = _num(operands[-1]) / 100.0
+                elif op == b"TL" and operands and isinstance(operands[-1], (int, float)):
+                    st.tl = _num(operands[-1])
+                elif op == b"Tr" and operands and isinstance(operands[-1], (int, float)):
+                    number = _num(operands[-1])
+                    if number.is_integer():
+                        st.tr = int(number)
+                elif op == b"q":
+                    if len(stack) < MAX_STATE_STACK:
+                        stack.append(st.saved())
+                    else:
+                        overflow += 1
+                elif op == b"Q":
+                    if overflow:
+                        overflow -= 1
+                    elif stack:
+                        st.restore(stack.pop())
+                elif op == b"cm" and len(operands) >= 6:
+                    st.ctm = _matmul(tuple(_num(o) for o in operands[-6:]), st.ctm)
+                elif op in _PATH_OPS or op in _PAINT_OPS:
+                    if op in _PAINT_OPS and op != b"n":
+                        self._object()
+                        if off or off_marks:
+                            op = b"n"  # a path in an off layer is not drawn
+                    paths.operate(op, [_num(o) for o in operands], st.ctm)
+                elif op == b"Do" and operands and isinstance(operands[-1], PDFName):
+                    self._do(str(operands[-1]), resources, st, depth, off or off_marks > 0, frags, paths)
+                elif op == b"BDC":
+                    hidden = False
+                    name, props = "", None
+                    if len(operands) >= 2:
+                        name, props = str(operands[-2]), operands[-1]
+                        if isinstance(props, PDFName):
+                            props = self._property(resources, str(props))
+                    if name == "OC":
+                        hidden = props is not None and self.oc.hidden(props)
+                    marks.append(hidden)
+                    off_marks += hidden
+                    self._open(name, props, frags)
+                elif op == b"BMC":
+                    marks.append(False)
+                    self._open(str(operands[-1]) if operands else "", None, frags)
+                elif op == b"EMC":
+                    if marks:
+                        off_marks -= marks.pop()
+                        self._close()
+                elif op == b"BI":
+                    self._object()
+                    scanner.pos = self._skip_inline_image(data, scanner.pos)
+                operands = []
+        finally:
+            del self.tags[base:]
 
     # -- text --
 
@@ -617,7 +665,7 @@ class _Page:
             dir_x=start_tm[0], dir_y=start_tm[1], up_x=start_tm[2], up_y=start_tm[3],
             char_offsets=offsets, char_gaps=char_gaps, link_geometry_reliable=reliable,
             invisible=st.tr in (3, 7), font=st.fname, obj=max(self.text_object, 0),
-            hidden="ocg" if off else ""))
+            hidden="ocg" if off else "", mcid=self.tag[0], artifact=self.tag[1]))
         self._shown(text)
 
     def _drop_positions(self) -> None:
@@ -671,7 +719,7 @@ class _Page:
             space_width=abs(metrics.metrics(32)[0]) / 1000.0 * fs * scale, order=len(frags),
             dir_x=-start_tm[2], dir_y=-start_tm[3], up_x=start_tm[0], up_y=start_tm[1],
             invisible=st.tr in (3, 7), font=st.fname, obj=max(self.text_object, 0),
-            hidden="ocg" if off else "", vertical=True))
+            hidden="ocg" if off else "", vertical=True, mcid=self.tag[0], artifact=self.tag[1]))
         self._shown(text)
 
     @staticmethod
@@ -709,7 +757,7 @@ class _Page:
             box = (min(xs), min(ys), max(xs), max(ys))
             if _sane(*box) and box[2] > box[0] and box[3] > box[1]:
                 if self._in_clips(a, b, c, d, e, f):
-                    self.image_draws.append((name, box, stream, self.text_object))
+                    self.image_draws.append((name, box, stream, self.text_object, self.tag))
         elif subtype == "Form":
             self._object()
             self._form(stream, resources, st, depth, off, frags, paths)

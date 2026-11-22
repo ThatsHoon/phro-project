@@ -20,7 +20,7 @@ from typing import Dict, List, Tuple
 from ..formats import pdf as caps
 from ..formats.pdf_layout import PageData, PageImage, text_marks, text_under
 from ..limits import ReadError
-from . import annotations, images
+from . import annotations, images, tagged
 from .content import interpret
 from .fonts import font_infos
 from .objects import PDFStream
@@ -89,6 +89,7 @@ class NativeDoc:
             self.xfa = annotations.has_xfa(self._pdf)
             self.attachments = annotations.attachments(self._pdf)
             self.labels = annotations.page_labels(self._pdf, self.page_count)
+            self.tags = tagged.read(self._pdf)
             if self._pdf.cuts["decrypt_budget"]:
                 # structure.py swallows a refused piece and counts it; spent while opening
                 # (an object stream or a string of the page tree, catalog or fields), the file
@@ -181,21 +182,22 @@ class NativeDoc:
 
         drawn = []
         marks = text_marks(content.fragments) if content.image_draws else []
-        for _name, draw_box, stream, last in content.image_draws:
+        for _name, draw_box, stream, last, tag in content.image_draws:
             if len(drawn) >= caps.PDF_PAGE_IMAGES:
                 cut["image"] += 1
                 break
             if isinstance(stream, PDFStream):
                 drawn.append((draw_box, stream, text_under(draw_box, marks, lambda f: f.obj <= last,
-                                                           caps.TEXT_UNDER)))
-        under = {id(stream) for _box, stream, at in drawn if at}
+                                                           caps.TEXT_UNDER), tag))
+        under = {id(stream) for _box, stream, at, _tag in drawn if at}
         shown: List[PageImage] = []
-        for draw_box, stream, _at in drawn:
+        for draw_box, stream, _at, (mcid, artifact) in drawn:
             got = images.image(pdf, stream)
             if id(stream) in under:
-                shown.append(PageImage(draw_box, None, got.px, got.kind, True))
+                shown.append(PageImage(draw_box, None, got.px, got.kind, True, mcid=mcid, artifact=artifact))
             else:
-                shown.append(PageImage(draw_box, got.data, got.px, got.kind, load=got.load))
+                shown.append(PageImage(draw_box, got.data, got.px, got.kind, load=got.load, mcid=mcid,
+                                       artifact=artifact))
 
         if _part_grew(before, pdf.cuts):
             cut["page_part"] += 1  # a structure cap fired while this page was read: read in part

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import images, limits
-from ..model import Heading, Link, Para, Text
+from ..model import Cell, Heading, Link, ListItem, Para, Table, Text
 from . import xps
 
 
@@ -64,6 +64,8 @@ class Fragment:
     char_gaps: tuple = ()
     # Drawn with a vertical font (WMode 1): its glyphs stand upright and advance down the page.
     vertical: bool = False
+    mcid: int = -1          # the marked-content id it is drawn in (ISO 32000-1 14.6), -1 for none
+    artifact: bool = False  # drawn inside /Artifact marked content
 
 
 def writing_direction(frag: Fragment) -> str:
@@ -101,13 +103,16 @@ class PageImage:
     """One image on a page: its box, its viewable bytes (or None) and its pixel size.
     `kind` is "jpg", "png", "jpx", "ccitt", "jbig2" or "raw". `under`: the page's own text lies
     under it (`text_under`), as an OCR layer lies on its scan, so its pixels are not taken.
-    `load`, when set, decodes the samples only when called and gives what `picture` gives."""
+    `load`, when set, decodes the samples only when called and gives what `picture` gives.
+    `mcid` and `artifact` are its marked content's, as a Fragment's."""
     box: Tuple[float, float, float, float]
     data: Optional[bytes]
     px: Tuple[int, int]
     kind: str
     under: bool = False
     load: Optional[Callable] = None
+    mcid: int = -1
+    artifact: bool = False
 
     def picture(self):
         """(bytes or None, flat): `data`, or the PNG `load` decodes and encodes; flat is True for
@@ -374,6 +379,7 @@ class Line:
     order: int
     vertical: bool = False
     direction: str = "ltr"
+    tag: int = -1   # the structure element whose block it is, on a tagged page (`tagged_place`)
 
 
 def _unit(x, y, default):
@@ -1108,9 +1114,15 @@ def place(lns, items, levels, model) -> list:
 # ---- headings
 
 def body_size(all_lines) -> float:
-    """The median line size."""
-    sizes = [ln.size for ln in all_lines if ln.size > 0]
-    return float(statistics.median(sizes)) if sizes else 0.0
+    """The size the median char is set in, chars other than spaces counted: how the text is cut
+    into lines (a tagged table's cells, each its own line) moves no body."""
+    sizes = sorted((ln.size, sum(1 for ch in ln.text if not ch.isspace())) for ln in all_lines if ln.size > 0)
+    half, seen = sum(n for _s, n in sizes) / 2, 0
+    for size, n in sizes:
+        seen += n
+        if seen >= half and seen:
+            return float(size)
+    return 0.0
 
 
 def heading_level(text: str, size: float, body: float) -> Optional[int]:
@@ -1126,6 +1138,107 @@ def heading_level(text: str, size: float, body: float) -> Optional[int]:
 
 def outline_level(depth: int) -> int:
     return min(6, depth + 2)
+
+
+# ---- tagged pages
+
+def span_width(frags) -> float:
+    """The width from the first fragment's start to the farthest end of `frags`, along the first's
+    direction: the width of one fragment that stands for them all."""
+    first = frags[0]
+    norm = math.hypot(first.dir_x, first.dir_y) or 1.0
+    ends = [((f.x - first.x) * first.dir_x + (f.y - first.y) * first.dir_y) / norm + f.width for f in frags]
+    return max(0.0, max(ends))
+
+
+def _marker(text: str) -> Tuple[str, str]:
+    """(list marker, text left in the item) of a list label: a number like `1.` or `2)` is the
+    marker, a bullet glyph gives `-`, any other label stays in the item's text after `-`."""
+    label = text.strip()
+    if re.fullmatch(r"\d{1,4}[.)]", label):
+        return label, ""
+    if len(label) <= 2 and not any(ch.isalnum() for ch in label):
+        return "-", ""
+    return "-", label
+
+
+def tagged_place(lns, items, levels, model, tags, order, alts) -> list:
+    """The blocks of a tagged page (ISO 32000-1 14.8.4), its lines in structure order: each run of
+    lines with one `tag` is that block element's, and its type makes the block. A heading type is a
+    Heading (H1-H6 at `outline_level` of their number, H and Title as H1), and so is a P whose
+    lines all have one outline level in `levels` (a tree that tags its headings as paragraphs); a
+    list item's label and body are a ListItem, its level the number of lists around it less one,
+    its marker the label's (`_marker`); the first cell of a table makes its Table from the tree's
+    rows that hold the page's cells (`tags.rows`), each cell its own lines' text, a TH a header
+    cell, /RowSpan and /ColSpan kept; a Figure with an /Alt that no picture took (`alts`, {figure
+    element: alt}) gives `Figure: <alt>` before its own text, or, with no lines on the page, at
+    its place in structure order (`order`, {block: walk sequence}); any other block is one Para of
+    its lines. Lines of no block (tag -1) are read by `place` with their outline `levels`. Items
+    go where `_slot` puts them, as in `place`."""
+    slots = defaultdict(list)
+    for it in sorted(items, key=lambda it: (-it[0], it[1], it[2])):
+        slots[_slot(lns, it)].append(it)
+    of = defaultdict(list)
+    for ln in lns:
+        of[ln.tag].append(ln)
+    pending = sorted((order.get(f, math.inf), f) for f in alts if f not in of)
+    out, tables, labels = [], set(), {}
+
+    def figure_alt(f):
+        out.append(Para([Text("Figure: " + alts.pop(f))]))
+
+    i = 0
+    while i < len(lns):
+        tag = lns[i].tag
+        j = i
+        while j < len(lns) and lns[j].tag == tag:
+            j += 1
+        for x in range(i, j):
+            out.extend(it[3] for it in slots.get(x, ()))
+        while pending and tag >= 0 and pending[0][0] < order.get(tag, math.inf):
+            figure_alt(pending.pop(0)[1])
+        group = lns[i:j]
+        i = j
+        if tag < 0:
+            run = {k: levels[n] for k, n in enumerate(range(j - len(group), j)) if n in levels}
+            out.extend(place(group, [], run, model))
+            continue
+        kind = tags.elements[tag].kind
+        inl = _joined(group, model)
+        level = {levels.get(n) for n in range(j - len(group), j)}
+        if kind == "P" and len(level) == 1 and None not in level:
+            out.append(Heading(level.pop(), inl))
+        elif kind in ("Title", "H", "H1", "H2", "H3", "H4", "H5", "H6"):
+            out.append(Heading(outline_level(int(kind[1:]) if kind[1:].isdigit() else 1), inl))
+        elif kind == "Lbl":
+            item = tags.nearest(tag, ("LI",))
+            nxt = lns[j].tag if j < len(lns) else -1
+            if item >= 0 and nxt >= 0 and tags.nearest(nxt, ("LI",)) == item and tags.elements[nxt].kind != "Lbl":
+                labels[item] = "".join(ln.text + " " for ln in group).strip()
+            else:
+                out.append(ListItem(max(0, tags.depth(tag, "L") - 1), "-", inl))
+        elif kind in ("LBody", "LI"):
+            marker, rest = _marker(labels.pop(tags.nearest(tag, ("LI",)), ""))
+            out.append(ListItem(max(0, tags.depth(tag, "L") - 1), marker,
+                                ([Text(rest + " ")] if rest else []) + inl))
+        elif kind in ("TD", "TH") and tags.nearest(tag, ("Table",)) >= 0:
+            table = tags.nearest(tag, ("Table",))
+            if table not in tables:
+                tables.add(table)
+                cells = [c for c in of if c >= 0 and tags.elements[c].kind in ("TD", "TH")]
+                rows = [[Cell([Para(_joined(of[c], model))] if of.get(c) else [], *tags.elements[c].span,
+                              header=tags.elements[c].kind == "TH") for c in row]
+                        for row in tags.rows(table, cells)]
+                if any(cell.blocks for row in rows for cell in row):
+                    out.append(Table([row for row in rows if row]))
+        else:
+            if kind == "Figure" and tag in alts:
+                figure_alt(tag)
+            out.append(Para(inl))
+    out.extend(it[3] for it in slots.get(len(lns), ()))
+    for _seq, f in pending:
+        figure_alt(f)
+    return out
 
 
 # ---- running headers and footers

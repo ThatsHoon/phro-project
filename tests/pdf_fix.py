@@ -665,6 +665,75 @@ JPEG64 = (JPEG[:JPEG.index(b"\xff\xc0") + 5] + bytes([0, 64, 0, 64])
           + JPEG[JPEG.index(b"\xff\xc0") + 9:JPEG.index(b"\xff\xda") + 10] + bytes.fromhex("28a28a") * 16 + b"\xff\xd9")
 
 
+def _marked(tag, mcid, ops, actual=None):
+    props = b"<< /MCID %d%s >>" % (mcid, b"" if actual is None else b" /ActualText (" + actual + b")")
+    return b"/" + tag + b" " + props + b" BDC " + ops + b" EMC "
+
+
+def struct_tree(elements, owners, **root):
+    """A structure tree (ISO 32000-1 14.7) as objects 600 up: the root at 600, its kids the
+    elements whose parent is 600, its /ParentTree at 699 giving page /StructParents 0 the
+    elements `owners` lists by MCID (None for an id no element owns). `elements` is
+    {num: (type, parent num, /K, optional extra entries)}."""
+    out = {600: dict({"Type": Name("StructTreeRoot"), "ParentTree": Ref(699),
+                      "K": [Ref(n) for n, e in elements.items() if e[1] == 600]}, **root),
+           699: {"Nums": [0, [None if n is None else Ref(n) for n in owners]]}}
+    for n, (kind, parent, kids, *more) in elements.items():
+        out[n] = dict({"Type": Name("StructElem"), "S": Name(kind), "P": Ref(parent), "Pg": Ref(4), "K": kids},
+                      **(more[0] if more else {}))
+    return out
+
+
+def tagged_pdf(marked=True, ruled=False):
+    """One tagged page (ISO 32000-1 14.8): an /Artifact running head; a heading of the custom type
+    Heading1, which /RoleMap maps to H1; a paragraph over two lines; a list of two items with Lbl
+    and LBody; a table with a TH row and a TD row; a Figure with /Alt drawing an image; a
+    paragraph whose marked content has /ActualText; and one whose structure element has it.
+    `marked` False drops /MarkInfo: the file is then not tagged and reads by its layout. `ruled`
+    draws the table's grid."""
+    def line(text, x, y, size=12):
+        return b"BT /F1 %d Tf %d %d Td (%s) Tj ET" % (size, x, y, text)
+
+    ops = b" ".join([
+        b"/Artifact BMC " + line(b"Running head of the report", 72, 760, 9) + b" EMC",
+        _marked(b"Heading1", 0, line(b"Annual report", 72, 720, 18)),
+        _marked(b"P", 1, line(b"Body text that runs", 72, 690) + b" " + line(b"over two lines.", 72, 676)),
+        _marked(b"Lbl", 2, line(b"1.", 72, 650)), _marked(b"LBody", 3, line(b"First item", 90, 650)),
+        _marked(b"Lbl", 4, line(b"2.", 72, 636)), _marked(b"LBody", 5, line(b"Second item", 90, 636)),
+        _marked(b"TH", 6, line(b"Name", 72, 600)), _marked(b"TH", 7, line(b"Score", 200, 600)),
+        _marked(b"TD", 8, line(b"Kim", 72, 586)), _marked(b"TD", 9, line(b"90", 200, 586)),
+        _marked(b"Figure", 10, b"q 100 0 0 50 72 500 cm /Im1 Do Q"),
+        _marked(b"P", 11, line(b"N o t e", 72, 470), actual=b"Note text"),
+        _marked(b"P", 12, line(b"x-y", 72, 450)),
+    ] + ([b"0.5 w 66 612 m 260 612 l 66 596 m 260 596 l 66 582 m 260 582 l "
+          b"66 582 m 66 612 l 130 582 m 130 612 l 190 582 m 190 612 l 260 582 m 260 612 l S"] if ruled else []))
+
+    tree = struct_tree({
+        601: ("Document", 600, [Ref(602), Ref(603), Ref(604), Ref(610), Ref(620), Ref(621), Ref(622)]),
+        602: ("Heading1", 601, 0), 603: ("P", 601, 1),
+        604: ("L", 601, [Ref(605), Ref(606)]),
+        605: ("LI", 604, [Ref(607), Ref(608)]), 607: ("Lbl", 605, 2), 608: ("LBody", 605, 3),
+        606: ("LI", 604, [Ref(609), Ref(611)]), 609: ("Lbl", 606, 4), 611: ("LBody", 606, 5),
+        610: ("Table", 601, [Ref(612), Ref(613)]),
+        612: ("TR", 610, [Ref(614), Ref(615)]), 614: ("TH", 612, 6), 615: ("TH", 612, 7),
+        613: ("TR", 610, [Ref(616), Ref(617)]), 616: ("TD", 613, 8), 617: ("TD", 613, 9),
+        620: ("Figure", 601, [{"Type": Name("MCR"), "MCID": 10, "Pg": Ref(4)}], {"Alt": "A bar chart of scores"}),
+        621: ("P", 601, 11), 622: ("P", 601, 12, {"ActualText": "x minus y"}),
+    }, [602, 603, 607, 608, 609, 611, 614, 615, 616, 617, 620, 621, 622], RoleMap={"Heading1": Name("H1")})
+    picture = image_xobject(32, 32, data=bytes((x * 8 + y) % 256 for x in range(32) for y in range(32)))
+    catalog = {"StructTreeRoot": Ref(600)}
+    if marked:
+        catalog["MarkInfo"] = {"Marked": True}
+    return simple_pdf([ops], resources={"Font": {"F1": Ref(3)}, "XObject": {"Im1": Ref(30)}},
+                      catalog=catalog, page_extra={"StructParents": 0},
+                      extra_objects={**tree, 30: picture})
+
+
+TAGGED_MD = ["## Page 1", "### Annual report", "Body text that runs over two lines.", "1. First item",
+             "2. Second item", "|Name|Score|", "|Kim|90|", "![A bar chart of scores](assets/img-001.png)",
+             "Note text", "x minus y"]
+
+
 def fake_venv(dir, *, build=7000):
     """A fake READY pdf venv, laid out like the real wheel: an interpreter file, pyvenv.cfg with an existing home,
     ONE pypdfium2 dist-info whose RECORD lists a pypdfium2 file, a pypdfium2_raw file and a ../../Scripts file

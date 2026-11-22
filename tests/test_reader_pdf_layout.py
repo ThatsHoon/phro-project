@@ -283,6 +283,11 @@ def test_body_size():
     lns = L.lines(numbered([frag("a b", 72, 700, size=10), frag("c d", 72, 686, size=10),
                             frag("T T", 72, 740, size=20)]))
     assert L.body_size(lns) == 10 and L.body_size([]) == 0.0
+    # the size most chars are set in: cutting small text into many lines (a tagged table's cells) moves no body
+    cells = [frag("%d" % k, 72 + 30 * k, 600, size=8) for k in range(6)]
+    lns = L.lines(numbered([frag("A body line that holds most of the text", 72, 700, size=10)])) + [
+        ln for c in cells for ln in L.lines(numbered([c]))]
+    assert L.body_size(lns) == 10, [ln.size for ln in lns]
 
 
 def test_outline_level():

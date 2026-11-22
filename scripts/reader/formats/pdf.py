@@ -37,6 +37,17 @@ PDF_PAGE_SECONDS: it then goes late, and OCR stops there for this read, every la
 image. doc.meta["ocr"] holds the counts, and OCR_LATE joins the warnings when a page went late.
 `glyphs` leaves out the fonts first met on a page whose text OCR gave. Without a session, when the
 gray cannot be made, or when its long side is under OCR_MIN_EDGE, the page is today's.
+
+Tagged pdf (ISO 32000-1 14.8). In a tagged file (`pdfnative.tagged`, the engine's `tags`), a page
+is tagged when TAG_COVER of its visible chars, artifacts aside, lie in marked content that a block
+element of the tree owns (`_page_tags`). On a tagged page artifacts (running heads, page numbers,
+decoration) are left out, text and pictures alike; the fragments under an element with
+/ActualText become one fragment of that text; each block's fragments make lines of their own, the
+blocks in the tree's order and the lines of no block put among them by their top
+(`_tagged_lines`); ruled tables are found among the fragments of no block only (`_found`); a
+picture in a Figure takes its /Alt; and `pdf_layout.tagged_place` makes the
+headings, list items, tables and paragraphs from the block types. Any other page, and every page
+of a file that is not tagged, is read by its layout.
 """
 import math
 import time
@@ -79,6 +90,7 @@ FIGURE_PAD = 6.0            # points added around the figure's union box
 FIGURE_LINE = 0.5           # lines of prose this share of a figure's width wide holding most of its text: body text
 FIGURE_ADVANCE = 1.0        # ems a char of a line of prose advances at most (spread labels advance more)
 FIGURE_CHARS = 20           # chars a line of prose holds at least when narrower than FIGURE_LINE (a column's line)
+TAG_COVER = 0.8             # share of a page's visible chars in tagged blocks that makes the page read by its tags
 TINY_PT = 1.0               # text under this size is hidden ("tiny")
 IMAGE_MIN_PX = 32           # images under this many pixels a side are left out, uncounted
 IMAGE_MIN_PT = 16.0         # images drawn under this many points a side are left out, uncounted
@@ -189,6 +201,57 @@ def _text_lines(frags, width, links=()):
     return pdf_layout.reading_order(pdf_layout.lines(frags, links), width)
 
 
+def _tagged_lines(owned, frags, width, links=()):
+    """The lines of a tagged page: each block's fragments (`owned`, {mcid: (sequence, block)}) are
+    lines of their own in reading order, tagged with the block, the blocks in order of their first
+    sequence and all at the page's word gap; the lines of no block, in reading order, go before the
+    first block whose first line's top is below theirs."""
+    gap = pdf_layout.word_gap(frags)
+    groups, loose = defaultdict(list), []
+    for f in frags:
+        got = owned.get(f.mcid)
+        if got is not None and got[1] >= 0:
+            groups[got[1]].append((got[0], f))
+        else:
+            loose.append(f)
+    out = []
+    for block, got in sorted(groups.items(), key=lambda kv: min(s for s, _f in kv[1])):
+        out.extend(replace(ln, tag=block)
+                   for ln in pdf_layout.reading_order(pdf_layout.lines([f for _s, f in got], links, gap), width))
+    for ln in pdf_layout.reading_order(pdf_layout.lines(loose, links, gap), width):
+        at = next((i for i, other in enumerate(out) if other.tag >= 0 and other.box[3] < ln.box[3]
+                   and (i == 0 or out[i - 1].tag != other.tag)), len(out))
+        out.insert(at, ln)
+    return out
+
+
+def _actual(frags, owned, tags):
+    """The fragments with those under a structure element with /ActualText (the nearest one around
+    their marked content) made one fragment of that text, at the first one's place; none when the
+    text is empty."""
+    out, merged, holder = [], {}, {}
+    for f in frags:
+        got = owned.get(f.mcid)
+        if got is None:
+            out.append(f)
+            continue
+        if got[1] not in holder:
+            holder[got[1]] = next((i for i in tags.ancestors(got[1]) if tags.elements[i].actual is not None), -1)
+        el = holder[got[1]]
+        if el < 0:
+            out.append(f)
+        elif el in merged:
+            merged[el][1].append(f)
+        else:
+            merged[el] = (len(out), [f])
+            out.append(None)
+    for el, (at, span) in merged.items():
+        text = tags.elements[el].actual
+        out[at] = replace(span[0], text=text, width=pdf_layout.span_width(span), char_offsets=(),
+                          char_gaps=()) if text.strip() else None
+    return [f for f in out if f is not None]
+
+
 def _holds_text(frags, box) -> bool:
     """Whether the centre of a fragment with text lies in `box` (page space)."""
     for f in frags:
@@ -281,6 +344,8 @@ class _Kept:
         self.pending = None       # (ticket, png, alt, whole) of a page sent to OCR, its image not placed yet
         self.links = []           # the page's links, kept for its OCR text
         self.glyphs = (0, 0)      # (`glyphs` counted on this page, glyphs it showed without Unicode)
+        self.tags = None          # {mcid: (sequence, block)} of a tagged page (`_page_tags`), else None
+        self.alts = {}            # {Figure element: /Alt} of the page's figures no picture took
         self.ocr_read = False     # its text came from OCR
 
 
@@ -446,10 +511,34 @@ class _Reader:
 
     # -- steps
 
+    def _page_tags(self, index, frags):
+        """{mcid: (walk sequence, block element)} of the page's marked content when the page is
+        tagged (TAG_COVER of its visible chars, artifacts aside, in a block), else None."""
+        tags = getattr(self.native, "tags", None)
+        if tags is None:
+            return None
+        owned = {mcid: (seq, tags.block(el)) for mcid, (seq, el) in tags.page(index).items()}
+        if not owned:
+            return None
+        total = covered = 0
+        for f in frags:
+            if f.hidden or f.artifact:
+                continue
+            n = sum(1 for ch in f.text if not ch.isspace())
+            total += n
+            got = owned.get(f.mcid)
+            covered += n if got is not None and got[1] >= 0 else 0
+        return owned if total and covered >= TAG_COVER * total else None
+
     def _text(self, pd, turn, keep, state):
         frags = sorted(pd.fragments, key=lambda f: f.order)
         frags = self._hide(frags, pd.box, pd.images)
         frags = self._chars(frags)
+        keep.tags = self._page_tags(pd.number - 1, frags)
+        if keep.tags is not None:
+            owned = keep.tags
+            frags = _actual([f for f in frags if not f.artifact], owned, self.native.tags)
+            state["read"] = lambda visible, width, links=(): _tagged_lines(owned, visible, width, links)
         view = pdf_layout.rotate_into_view(frags, turn, pd.box)
         state["frags"] = view
         state["links"] = [(_view_box(b, turn, pd.box), url) for b, url in pd.links]
@@ -505,9 +594,13 @@ class _Reader:
         self._found(keep, state, view(pd.segments), view(pd.short))
 
     def _found(self, keep, state, segments, short):
-        """The ruled tables of `segments` over the page's fragments, placed as items; their words
-        leave the lines."""
-        found = pdf_tables.tables(segments, state["frags"], keep.number, self.budget,
+        """The ruled tables of `segments` over the page's fragments, on a tagged page over those of
+        no block only (the tree gives the rest its tables), placed as items; their words leave the
+        lines."""
+        frags = state["frags"]
+        if keep.tags is not None:
+            frags = [f for f in frags if keep.tags.get(f.mcid, (0, -1))[1] < 0]
+        found = pdf_tables.tables(segments, frags, keep.number, self.budget,
                                   self.ctx.skipped, short=short, model=self.model)
         used = set()
         for k, got in enumerate(found):
@@ -524,8 +617,15 @@ class _Reader:
         left out, uncounted; a picture's pixels are decoded and encoded only once it is chosen."""
         shown = []
         crop = pd.box
+        tags = self.native.tags if keep.tags is not None else None
+        figures = {}
+        if tags is not None:
+            for _seq, el in keep.tags.values():
+                figure = tags.nearest(el, ("Figure",))
+                if figure >= 0 and tags.elements[figure].alt:
+                    figures[figure] = tags.elements[figure].alt
         for i, im in enumerate(pd.images):
-            if im is scan or im.under:
+            if im is scan or im.under or (tags is not None and im.artifact):
                 continue
             if im.box[2] <= crop[0] or im.box[0] >= crop[2] or im.box[3] <= crop[1] or im.box[1] >= crop[3]:
                 continue
@@ -539,9 +639,14 @@ class _Reader:
                 self.ctx.skipped["image"] += 1
                 continue
             self.image_bytes += len(data)
+            alt = ""
+            if tags is not None and im.mcid in keep.tags:
+                figure = tags.nearest(tags.page(pd.number - 1)[im.mcid][1], ("Figure",))
+                alt = figures.pop(figure, "") if figure >= 0 else ""
             vb = _view_box(im.box, turn, pd.box)
-            shown.append((vb[3], vb[0], 1000 + i, Image(data), vb[2]))
+            shown.append((vb[3], vb[0], 1000 + i, Image(data, alt=alt), vb[2]))
         keep.items.extend(shown)
+        keep.alts = figures
 
     def _render(self, make):
         """Bytes of one render, or None past PDF_RENDERS or the image bytes cap, or when the
@@ -759,6 +864,12 @@ class _Reader:
                 level = pdf_layout.heading_level(ln.text, ln.size, body)
                 if level is not None:
                     levels[i] = level
+        if k.tags is not None:
+            order = {}
+            for seq, block in k.tags.values():
+                order[block] = min(seq, order.get(block, seq))
+            return pdf_layout.tagged_place(k.lines, items, levels, self.model, self.native.tags, order,
+                                           dict(k.alts)) + k.hidden
         return pdf_layout.place(k.lines, items, levels, self.model) + k.hidden
 
 
