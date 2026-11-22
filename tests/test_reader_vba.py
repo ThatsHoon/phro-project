@@ -146,7 +146,7 @@ def test_a_dir_that_names_modules_and_gives_none_is_named():
     assert got == [] and ctx.skipped == {"vba": 1}, (got, ctx.skipped)
     open_ = cut + rec(0x19, b"A") + rec(0x1A, b"A") + rec(0x31, struct.pack("<I", 7)) + rec(0x21)
     got, ctx = read({"VBA/dir": container(open_), "VBA/A": b"compild" + container(SUB.encode("cp949"))})
-    assert got == [] and ctx.skipped == {"vba_module": 1}, (got, ctx.skipped)
+    assert got == [] and ctx.skipped == {"vba_module": 2}, (got, ctx.skipped)
     twice = open_ + rec(0x19, b"B") + rec(0x1A, b"A") + rec(0x31, struct.pack("<I", 7)) + rec(0x2B)
     got, ctx = read({"VBA/dir": container(twice), "VBA/A": b"compild" + container(SUB.encode("cp949"))})
     assert [m[0] for m in got] == ["B"] and ctx.skipped == {"vba_module": 1}, (got, ctx.skipped)
@@ -181,8 +181,7 @@ def test_modules_and_bytes_are_bounded():
         limits.VBA_MODULES = 2
         got, ctx = read(streams)
         assert [m[0] for m in got] == ["A", "B"] and ctx.skipped == {"vba_module": 1}, (got, ctx.skipped)
-        size = len(vba.decompress(streams["VBA/dir"], 10**6))
-        limits.VBA_MODULES, limits.VBA_BYTES = old[0], size + len(SUB.encode("cp949")) + 10
+        limits.VBA_MODULES, limits.VBA_BYTES = old[0], len(streams["VBA/dir"]) + len(streams["VBA/A"]) - 7 + 10
         got, ctx = read(streams)
         assert [m[0] for m in got] == ["A"] and ctx.skipped == {"vba_module": 2}, (got, ctx.skipped)
     finally:
@@ -209,6 +208,29 @@ def test_a_module_that_does_not_fit_spends_the_budget():
             assert vba.package(pkg, ctx2) == [] and not calls and ctx2.skipped["vba"] == 1, (calls, ctx2.skipped)
     finally:
         limits.VBA_BYTES, vba.decompress = old, real
+
+
+def test_a_stream_that_gives_nothing_is_charged_what_was_scanned():
+    names = [f"M{k}" for k in range(40)]
+    streams = {"VBA/dir": dir_stream([(n, "S", 0, 0x21) for n in names]),
+               "VBA/S": b"\x01" + b"\x00\xb0\x00" * 20000}
+    old, real, calls = limits.VBA_BYTES, vba.decompress, []
+    limits.VBA_BYTES = 150_000
+    vba.decompress = lambda data, cap: (calls.append(len(data)), real(data, cap))[1]
+    try:
+        got, ctx = read(streams)
+    finally:
+        limits.VBA_BYTES, vba.decompress = old, real
+    assert got == [] and len(calls) <= 4 and ctx.skipped == {"vba_module": 40}, (got, calls, ctx.skipped)
+
+
+def test_modules_a_cut_dir_announced_are_counted():
+    cut = rec(1, struct.pack("<I", 1)) + rec(3, struct.pack("<H", 949)) + rec(0x0F, struct.pack("<H", 5))
+    for n in (b"A", b"B"):
+        cut += rec(0x19, n) + rec(0x1A, n) + rec(0x31, struct.pack("<I", 7)) + rec(0x21) + rec(0x2B)
+    source = b"compild" + container(SUB.encode("cp949"))
+    got, ctx = read({"VBA/dir": container(cut), "VBA/A": source, "VBA/B": source})
+    assert [m[0] for m in got] == ["A", "B"] and ctx.skipped == {"vba_module": 3}, (got, ctx.skipped)
 
 
 def test_the_module_count_is_the_documents():
@@ -250,7 +272,15 @@ def test_hostile_module_names_stay_inside_the_folder():
     assert not [p for p in out.rglob("*") if p.is_file() and p.parent != folder], list(out.rglob("*"))
     assert "매크로_1.bas" in files and "_CON.bas" in files and "_con-2.bas" in files, files
     assert all(len(f) <= 72 and "/" not in f and "\\" not in f and ".." not in f for f in files), files
-    assert "매크로_1.bas (매크로 1, module, 1 line)" in md and "_CON.bas (CON, module, 1 line)" in md, md
+    assert '매크로_1.bas ("매크로 1", module, 1 line)' in md and '_CON.bas ("CON", module, 1 line)' in md, md
+    assert "module.bas (module, 1 line)" in md, md
+
+
+def test_a_module_name_in_the_line_is_quoted():
+    doc = Doc(blocks=[Para([Text("body")])])
+    doc.meta["vba"] = [('a b); x.bas ("y", module', "module", "x = 1")]
+    md, out = render(doc, Context())
+    assert '.bas ("a b); x.bas (\\"y\\", module", module, 1 line)\n' in md, md
 
 
 def test_superscript_device_names_are_reserved():

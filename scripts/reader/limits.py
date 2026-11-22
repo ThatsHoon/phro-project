@@ -45,7 +45,7 @@ HWP_RECORDS = 1_000_000   # records of one HWP stream
 BIN_RECORDS = 2_000_000    # records of one BIFF stream, one BIFF12 part or one PowerPoint Document stream
 DECRYPT_BYTES = 32 * 2**20  # bytes one xls or ppt stream may decrypt
 VBA_MODULES = 256           # VBA modules one document reads, all its projects together
-VBA_BYTES = 2 * 2**20       # bytes one document's VBA projects decompress to (dir streams and source)
+VBA_BYTES = 2 * 2**20       # bytes one document's VBA projects decompress to or scan (dir streams and source)
 EMBED_BYTES = 16 * 2**20    # bytes of one Excel workbook stream embedded in an hwp or doc object
 JET_WORK_TOTAL = 32 * 2**20  # work one Access file may spend on its rows, in units of about 0.2 us (a text byte
 #                               decoded; jet.py prices rows and cells in them), at most 10 a byte of the file and 1 MiB

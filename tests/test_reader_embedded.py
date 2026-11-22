@@ -168,6 +168,25 @@ def test_embedded_workbook_reads_one_sheet_under_the_documents_budget():
     assert got[0] == "table" and sum(ctx.skipped.values()) > 0, (got, ctx.skipped)
 
 
+def test_embedded_workbooks_scan_under_the_documents_count():
+    from reader.formats import ooxml_sheets
+    rows = "".join(xlsx_row(r, xlsx_cell(f"A{r}", inline="<t>v</t>")) for r in range(1, 21))
+    inner = make_xlsx(None, [{"name": "S", "rows": rows}], shared=["<t>s</t>"] * 30)
+    top = make_xlsx(None, [{"name": "S", "rows": xlsx_row(1, xlsx_cell("A1", inline="<t>top</t>")),
+                            "rels": [(f"rO{k}", SHEET_REL, f"../embeddings/b{k}.xlsx", False) for k in range(6)]}],
+                    extra_parts={f"xl/embeddings/b{k}.xlsx": inner for k in range(6)})
+    old = limits.SHEET_SCAN
+    limits.SHEET_SCAN = 100
+    try:
+        doc, ctx = host(top)
+    finally:
+        limits.SHEET_SCAN = old
+    budget = embedded.of(ctx).budget()
+    assert 0 < budget.scan <= 101 and budget.strings == ooxml_sheets.SST_ELEMENTS * 100, \
+        (budget.scan, budget.strings)
+    assert ctx.skipped == {"sheet_cut": 1, "object": 4} and flat(doc).count("v") == 23, (ctx.skipped, flat(doc))
+
+
 def test_a_parser_error_costs_only_the_object():
     bad = nest(0, book='<bookViews><workbookView activeTab="²"/></bookViews>')
     got, ctx = read(bad)

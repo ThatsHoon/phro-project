@@ -239,10 +239,11 @@ def _package(data, ctx):
 
 
 def _shown(blocks, own, ctx):
-    """The tables of `blocks`, with what reading them counted in `own`; a chart when there is none."""
+    """The tables of `blocks`, with what reading them counted in `own`. With no table, a chart, or UNREAD when
+    the read counted something it left out."""
     out = _tables(blocks)
     if not out:
-        return CHART
+        return UNREAD if own.skipped else CHART
     ctx.skipped.update(own.skipped)
     return "table", out, _NONE
 

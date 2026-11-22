@@ -362,8 +362,10 @@ def _workbook(root, rels, wb, ctx):
 def _styles(pkg, part, wb, ctx):
     """`numFmts/numFmt` codes and the `cellXfs/xf` format ids, streamed; `cellStyleXfs` is not read. The read ends
     with `cellXfs` (by schema order `numFmts` comes before it, and nothing after it is used). Past STYLE_ELEMENTS
-    closed elements the part stops, counted under `document`, and what was read is kept."""
-    seen, els, tags, done, names = 0, [], [], [], {}
+    closed elements, the document's embedded workbooks counted with it, the part stops, counted under `document`,
+    and what was read is kept."""
+    budget = embedded.of(ctx).budget()
+    els, tags, done, names = [], [], [], {}
     with pkg.open(part) as f:
         for ev, el in iterparse(f, ("start", "end")):
             name = names.get(el.tag)
@@ -376,10 +378,10 @@ def _styles(pkg, part, wb, ctx):
                 continue
             els.pop()
             tags.pop()
-            seen += 1
-            if seen > STYLE_ELEMENTS:
+            if budget.styles >= STYLE_ELEMENTS:
                 ctx.skipped["document"] += 1
                 return
+            budget.styles += 1
             if tags:
                 if name == "numFmt" and tags[-1] == "numFmts":
                     fid = _int(attr(el, "numFmtId"))
@@ -394,10 +396,11 @@ def _styles(pkg, part, wb, ctx):
 
 def _strings(pkg, part, wb, ctx):
     """The shared-string table, streamed; past its character or entry cap, or SST_ELEMENTS times SHEET_SCAN closed
-    elements, it stops, counted once (decision 2)."""
+    elements, the document's embedded workbooks counted with it, it stops, counted once (decision 2)."""
     chars_cap, entries_cap = limits.SHEET_CHARS, limits.SHEET_SCAN
     cap = SST_ELEMENTS * limits.SHEET_SCAN
-    seen, total, size, parts, els, tags, done, names = 0, 0, 0, [], [], [], [], {}
+    budget = embedded.of(ctx).budget()
+    total, size, parts, els, tags, done, names = 0, 0, [], [], [], [], {}
     with pkg.open(part) as f:
         for ev, el in iterparse(f, ("start", "end")):
             name = names.get(el.tag)
@@ -412,9 +415,9 @@ def _strings(pkg, part, wb, ctx):
                 continue
             els.pop()
             tags.pop()
-            seen += 1
-            if seen > cap:
+            if budget.strings >= cap:
                 return _cut(ctx, f"{cap} XML elements")
+            budget.strings += 1
             if name == "t" and tags:
                 up = tags[-1]
                 if up == "si" or (up == "r" and len(tags) >= 2 and tags[-2] == "si"):
@@ -477,14 +480,13 @@ def read_workbook(pkg, part, ctx) -> _Wb:
 
 
 class _Sheets:
-    """The sheets of one workbook, sharing one cell budget and one scan count."""
+    """The sheets of one workbook, under the document's sheet budget and scan count."""
 
     def __init__(self, pkg, wb, ctx):
         self.pkg, self.wb, self.ctx = pkg, wb, ctx
         self.objects = embedded.Parts(pkg, ctx)
         self.budget = self.objects.objects.budget()
         self.draw = sheet_drawing.Drawings(pkg, ctx)  # charts and pictures; one image byte count and chart cell count
-        self.scan = 0                    # elements the sheet parts have closed, all sheets together
         self.used: set[str] = set()      # sheet parts read
         self.notes: dict = {}            # note key -> blocks, for Doc.notes
         self.comment_count = 0           # comments turned into notes, all sheets together
@@ -547,7 +549,7 @@ class _Sheets:
             return self._drawn(part, relmap)
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         cap = limits.SHEET_SCAN
-        if self.scan >= cap:
+        if self.budget.scan >= cap:
             # its first element could not close inside the cap: the sheet is cut as the stream would cut it, but its
             # part and comments are not opened, so their bytes are not charged to ZIP_TOTAL ahead of its drawings
             grid.stop("scanned XML elements", cap)
@@ -568,7 +570,7 @@ class _Sheets:
                     if tag is None:
                         tag = names[el.tag] = local(el.tag)
                     if ev == "start":
-                        if self.scan >= cap:  # this element cannot close inside the cap
+                        if self.budget.scan >= cap:  # this element cannot close inside the cap
                             grid.stop("scanned XML elements", cap, (max(row, 0), None))
                             break
                         stack.append(el)
@@ -589,8 +591,8 @@ class _Sheets:
                         continue
                     stack.pop()
                     kids = done.pop()
-                    self.scan += 1
-                    if self.scan > cap:  # an element past the cap: exactly SHEET_SCAN closes are not a cut
+                    self.budget.scan += 1
+                    if self.budget.scan > cap:  # an element past the cap: exactly SHEET_SCAN closes are not a cut
                         grid.stop("scanned XML elements", cap, (max(row, 0), None))
                         break
                     if tag == "c":
@@ -973,10 +975,10 @@ class _Sheets:
             if item is None or grid.cut:
                 continue
             r1, r2, c1, c2, url, place = item
-            if self.scan + min((r2 - r1 + 1) * (c2 - c1 + 1), len(grid.cells)) > cap:
+            if self.budget.scan + min((r2 - r1 + 1) * (c2 - c1 + 1), len(grid.cells)) > cap:
                 self.ctx.skipped["link"] += 1
                 continue
-            self.scan += grid.link(r1, r2, c1, c2, url, place)
+            self.budget.scan += grid.link(r1, r2, c1, c2, url, place)
 
     def _cell(self, el, row: int, col: int, shared: dict):
         """The displayed value of a `c` element at (row, col) by its type, and its formula's pattern or None. The

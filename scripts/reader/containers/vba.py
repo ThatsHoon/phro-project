@@ -12,11 +12,12 @@ compressed container starts in the stream, after the compiled code), MODULETYPE 
 
 `modules` gives (name, kind, source) for each module that holds code: its `Attribute` lines are left out, all but a
 procedure's VB_Description, and a module with no other line is not listed. One document reads at most VBA_MODULES
-modules and decompresses at most VBA_BYTES bytes, its dir streams and a container that fails part way included, all
-its projects together. A module past either, one whose stream is over EMBED_BYTES or does not decompress, and one
-the dir leaves without its end record is counted under vba_module. A project whose `dir` cannot be read or gives
-none of the modules it announces, and one met after the budget is spent, is named under vba, as a project never
-read was. `compound` hands a compound file's own project to `Context.vba` and `package` reads the projects of a
+modules and spends at most VBA_BYTES bytes on them, the larger of what a container gives and what was scanned
+for it, its dir streams and a container that fails part way included, all its projects together. A module past
+either, one whose stream is over EMBED_BYTES, does not decompress or gives nothing, one the dir leaves without its
+end record and one it announces and does not hold is counted under vba_module. A project whose `dir` cannot be
+read or gives none of the modules it announces, and one met after the budget is spent, is named under vba, as a
+project never read was. `compound` hands a compound file's own project to `Context.vba` and `package` reads the projects of a
 zip package; reader.parse puts `Context.vba` in the Doc's meta for markdown to list and write under assets/vba.
 """
 import codecs
@@ -88,16 +89,20 @@ def _spent(ctx) -> bool:
 
 
 def _unpack(cf, name: str, offset: int, ctx) -> bytes:
-    """Stream `name` of `cf` from `offset` on, decompressed; what it made is charged to the document's VBA_BYTES
-    whether or not it ends well. ValueError for a stream over EMBED_BYTES."""
+    """Stream `name` of `cf` from `offset` on, decompressed; the larger of what it made and what was scanned for
+    it is charged to the document's VBA_BYTES whether or not it ends well. ValueError for a stream over
+    EMBED_BYTES and for one that gives nothing."""
     if cf.size(name) > limits.EMBED_BYTES:
         raise ValueError("stream too large", 0)
+    data = cf.read(name)[offset:]
     try:
-        out = decompress(cf.read(name)[offset:], limits.VBA_BYTES - ctx.vba_bytes)
+        out = decompress(data, limits.VBA_BYTES - ctx.vba_bytes)
     except ValueError as e:
-        ctx.vba_bytes += e.args[1]
+        ctx.vba_bytes += max(e.args[1], len(data))
         raise
-    ctx.vba_bytes += len(out)
+    ctx.vba_bytes += max(len(out), len(data))
+    if not out:
+        raise ValueError("empty", 0)
     return out
 
 
@@ -211,10 +216,10 @@ def modules(cf, prefix: str, ctx) -> list | None:
             raise
         ctx.skipped["vba"] = 1
         return []
-    if lost:
-        ctx.skipped["vba_module"] += lost
-    elif told and not entries:
+    if told and not entries and not lost:
         ctx.skipped["vba"] = 1
+    elif max(lost, told - len(entries)) > 0:
+        ctx.skipped["vba_module"] += max(lost, told - len(entries))
     out = []
     for k, m in enumerate(entries):
         if ctx.vba_modules >= limits.VBA_MODULES or _spent(ctx):

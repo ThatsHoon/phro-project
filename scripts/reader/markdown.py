@@ -1,6 +1,7 @@
 """The one Markdown renderer: every output format and token rule lives here."""
 import collections
 import itertools
+import json
 import re
 import secrets
 import sys
@@ -1151,7 +1152,7 @@ class _Render:
         """The line naming the VBA modules, their source written to <assets>/vba/<module>.bas. A file name keeps
         the module name's letters, digits, `_` and `-` (64 at most, anything else `_`); a name Windows reserves
         for a device gets a leading `_`, and a name already taken, whatever its case, a number. A module whose
-        file is not named as it is has its own name beside the file's. The line names VBA_NAMED modules and
+        file is not named as it is has its own name, quoted, beside the file's. The line names VBA_NAMED modules and
         counts the rest; every module's file is written."""
         folder = self.assets_dir / "vba"
         folder.mkdir(parents=True, exist_ok=True)
@@ -1167,7 +1168,8 @@ class _Render:
             taken.add(stem.lower())
             (folder / f"{stem}.bas").write_text(source + "\n", encoding="utf-8", newline="\n")
             lines = source.count("\n") + 1
-            own = "" if stem == name else one_line(name)[:64] + ", "
+            shown = one_line(name)[:64]
+            own = "" if stem == name or not shown else json.dumps(shown, ensure_ascii=False) + ", "
             items.append(f"{stem}.bas ({own}{kind}, {lines} line{'s' if lines != 1 else ''})")
         more = len(items) - VBA_NAMED
         if more > 0:
