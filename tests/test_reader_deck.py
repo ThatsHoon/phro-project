@@ -67,6 +67,11 @@ def test_repeated_keys_an_item_once():
     assert len(rep.items) == 1 and len(next(iter(rep.items.values()))[1]) == 399
 
 
+def test_two_columns_of_uneven_rows_that_overlap_a_little_read_by_column():
+    assert deck.Order()([(0, 0, 520, 150), (0, 160, 520, 400), (480, 0, 1000, 250), (480, 260, 1000, 400)]) == [0, 1, 2, 3]
+    assert deck.Order()([(0, 0, 520, 300), (0, 310, 520, 400), (480, 0, 1000, 80), (480, 90, 1000, 400)]) == [0, 1, 2, 3]
+
+
 def test_side_by_side_boxes_that_overlap_a_little_read_left_first():
     pair = [(0, 100, 520, 400), (480, 90, 1000, 400)]
     assert deck.Order()(pair) == [0, 1], deck.Order()(pair)

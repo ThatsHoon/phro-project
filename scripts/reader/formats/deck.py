@@ -5,7 +5,7 @@ the masters, layouts and footers put on more than one slide.
 (a cut across y) or between columns (a cut across x), rows on a tie, and each part is read the same way; a set with no
 gap reads by (top, left), and so does one
 whose only cut is between columns that overlap where a box of one column sits above or below a box of the other it
-overlaps (boxes stacked, not side by side). A box counts from a quarter of the smallest height (width) in the set in from each edge, so
+overlaps and no two boxes across the cut sit side by side (boxes stacked). A box counts from a quarter of the smallest height (width) in the set in from each edge, so
 two rows (columns) that overlap by less than half the smallest box still part, a row whose boxes sit a fraction of a
 line off is one row, and a small box at the edge of a large one does not cut it.
 A shape with no box keeps its place in the source: it goes just before the first read of the boxed shapes that follow
@@ -77,8 +77,9 @@ class Order:
         return self._placed(seq, boxes)
 
     def _stacked(self, cut, norm) -> bool:
-        """Whether a column cut through overlapping boxes parts a box from one above or below it: some pair, one box
-        from each side, overlaps across x and not across y. A cut with more pairs than the work left counts as one."""
+        """Whether a column cut through overlapping boxes parts only boxes above and below each other: no pair, one
+        box from each side, overlaps across x and across y (side by side). A cut with more pairs than the work left
+        counts as one."""
         edge = min(norm[i][0] for i in cut[2])
         first = [norm[i] for i in cut[1] if norm[i][2] > edge]
         edge = max(b[2] for b in first)
@@ -86,7 +87,7 @@ class Order:
         if self.left < len(first) * len(second):
             return True
         self.left -= len(first) * len(second)
-        return any(a[2] > b[0] and (a[3] <= b[1] or b[3] <= a[1]) for a in first for b in second)
+        return not any(a[2] > b[0] and a[3] > b[1] and b[3] > a[1] for a in first for b in second)
 
     @staticmethod
     def _placed(seq, boxes) -> list:
