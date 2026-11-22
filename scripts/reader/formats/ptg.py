@@ -123,22 +123,27 @@ def shown(rgce: bytes, extra: bytes, env: Env, ctx) -> str:
     return got
 
 
-def named(n, env: Env, ctx):
-    """A defined name (biff.DefinedName) as (`name = formula`, hidden); None for one with no formula or a hidden
-    built-in one (flags 0x01 and 0x20: Excel's own record, as `_FilterDatabase`)."""
-    if not n.name or not n.rgce or n.flags & 0x21 == 0x21:
-        return None
-    return f"{n.name} = {shown(n.rgce, n.extra, env, ctx)}", bool(n.flags & 1)
+def names(defs, env: Env, ctx) -> tuple:
+    """The defined names (biff.DefinedName) of `defs` as `sheet_grid.listed` takes them with a total: an iterator of
+    each one's (`name = formula`, hidden), the shown ones first, and how many they are. One with no formula and a
+    hidden built-in one (flags 0x01 and 0x20: Excel's own record, as `_FilterDatabase`) are left out. A formula is
+    read when its entry is asked for, so the names past what a paragraph lists cost nothing."""
+    kept = sorted((n for n in defs if n.name and n.rgce and n.flags & 0x21 != 0x21), key=lambda n: n.flags & 1)
+    return ((f"{n.name} = {shown(n.rgce, n.extra, env, ctx)}", bool(n.flags & 1)) for n in kept), len(kept)
 
 
 def put(grid, forms: list, anchored: dict, env: Env, ctx) -> None:
     """Each cell's formula into the sheet's formulas paragraph (`Grid.formula`). `forms` holds each formula's
     (row, col, tokens, extra); one that is only a PtgExp takes the shared or array formula `anchored` keeps under the
     cell it names, read once at that cell. A formula not read here is `?` and counted under formula; past the
-    read's time the formulas left are not read."""
+    read's time the formulas left are not read, and past an embedded object's they are counted under formula."""
     done = {}
-    for row, col, rgce, extra in forms:
+    objs = ctx.embedded
+    for k, (row, col, rgce, extra) in enumerate(forms):
         if ctx.late():
+            break
+        if objs is not None and objs.over():
+            ctx.skipped["formula"] += len(forms) - k
             break
         if not rgce or grid.cut and (row, col) not in grid.cells:
             continue

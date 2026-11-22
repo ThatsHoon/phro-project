@@ -313,14 +313,15 @@ class _Sheets:
     def book_facts(self) -> list:
         """The workbook's own facts, before its sheets: its names, its external links by number, its protection."""
         env = self._env()
-        names = [e for e in (ptg.named(n, env, self.ctx) for n in self.wb.names if n.itab == 0) if e]
+        names, total = ptg.names((n for n in self.wb.names if n.itab == 0), env, self.ctx)
         links = []
         for k, rid in enumerate(self.wb.externals, 1):
             target = self._external(rid)
             if target:
                 links.append((f"[{k}] {target}", False))
         b, ctx = self.budget, self.ctx
-        return (sheet_grid.listed("Names", names, b, ctx, cap=limits.FACT_ITEMS) + sheet_grid.listed("External links", links, b, ctx, cap=limits.FACT_ITEMS)
+        return (sheet_grid.listed("Names", names, b, ctx, cap=limits.FACT_ITEMS, total=total)
+                + sheet_grid.listed("External links", links, b, ctx, cap=limits.FACT_ITEMS)
                 + sheet_grid.listed("Protected", self.wb.protect, b, ctx))
 
     def _external(self, rid: str) -> str | None:
@@ -596,7 +597,7 @@ class _Sheets:
 
     def _facts(self, grid, no: int, facts: _Facts, rels: dict, env: ptg.Env):
         """The sheet's facts in their order on `grid`: names, tables, filter, validations, rules, protection."""
-        grid.fact("Names", [e for e in (ptg.named(n, env, self.ctx) for n in self.wb.names if n.itab == no) if e])
+        grid.fact("Names", *ptg.names((n for n in self.wb.names if n.itab == no), env, self.ctx))
         for rid in facts.tables:
             rel = rels.get(rid)
             if rel is not None and not rel.external and rel.type.endswith("/table"):

@@ -442,7 +442,8 @@ def _pending(meta):
 def _reach(path, meta, out_md, short=False):
     """The sentence naming the read that gets what the deadline left out of a partial entry, in fewer words when
     `short`: for a pdf range entry the same pages= read again, for a whole pdf the pages= read of the first pages
-    left (and how far they go), else the convert by hand that finishes the entry (it names the native engine for a
+    left (and how far they go), else the convert by hand that finishes the entry, or that one was cut too when
+    the entry is a hand run's whose read the time cut (it names the native engine for a
     pdf entry read natively, and no engine for one pdfium read: read.py then goes to the pdf venv by itself, so
     either run stores under the entry's own key); "" when the entry is whole."""
     if meta.get("partial") is not True:
@@ -462,6 +463,9 @@ def _reach(path, meta, out_md, short=False):
             else:
                 more = f", then pages {b + 1}-{pages[-1]}."
             return f' Read the pdf with pages="{_span(a, b)}"{rest}' + more
+    late = {limits.READ_LATE, limits.OCR_LATE, limits.FIGURES_LATE} & set(meta.get("warnings") or [])
+    if late == {limits.READ_LATE} and _count(meta.get("read_budget")) > limits.CONVERT_SECONDS:
+        return " A run by hand was cut too." if short else " A run by hand stopped at the time limit too."
     run = _by_hand(path, "native" if reader.ext_of(path) == "pdf" and meta.get("engine") == "native" else "")
     if short:
         return f" For the rest, run {run} and Read again."

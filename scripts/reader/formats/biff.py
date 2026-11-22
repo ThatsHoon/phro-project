@@ -73,7 +73,7 @@ class Stream:
         while pos < end:
             if self.ctx.late():
                 return
-            if bank.records >= limits.BIN_RECORDS:
+            if bank.records >= limits.BIN_RECORDS or bank.over():
                 self.ctx.skipped["record"] += 1
                 return
             rec = self._one(pos, end)

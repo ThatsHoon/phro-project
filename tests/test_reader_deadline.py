@@ -131,6 +131,31 @@ def test_a_late_convert_says_so_and_is_filed_partial():
     assert gate._time_cut(filed, True) == " Cut by the time limit."
 
 
+def test_the_read_clock_follows_the_deadline_it_is_given():
+    import time
+    from reader import gate, limits
+    src = dm.docm(dm.P("ALPHA"))
+    saved = reader.STARTED
+    reader.STARTED = time.monotonic() - 2 * limits.READ_SECONDS
+    try:
+        with cli.env(PHRO_READER_DEADLINE=repr(time.time() + limits.HAND_SECONDS)):
+            whole = reader.convert(src, tmp() / "out", backend=("", ""))
+    finally:
+        reader.STARTED = saved
+    assert limits.READ_LATE not in whole["warnings"] and "read_budget" not in whole, whole
+    with cli.env(PHRO_READER_DEADLINE=repr(time.time() - 5)):
+        cut = reader.convert(src, tmp() / "out", backend=("", ""))
+    assert limits.READ_LATE in cut["warnings"] and cut["read_budget"] <= limits.READ_SECONDS, cut
+    meta = {"partial": True, "warnings": [limits.READ_LATE], "read_budget": limits.READ_SECONDS}
+    out_md = tmp() / "k" / "out.md"
+    assert "To read the rest, run: " in gate._reach(src, meta, out_md), gate._reach(src, meta, out_md)
+    meta["read_budget"] = limits.HAND_SECONDS * 4 // 5
+    assert gate._reach(src, meta, out_md) == " A run by hand stopped at the time limit too.", gate._reach(src, meta, out_md)
+    assert gate._reach(src, meta, out_md, True) == " A run by hand was cut too."
+    both = dict(meta, warnings=[limits.READ_LATE, limits.OCR_LATE])
+    assert "To read the rest, run: " in gate._reach(src, both, out_md), gate._reach(src, both, out_md)
+
+
 def test_the_render_writes_no_block_past_its_stop():
     import time
     from reader.model import Doc, Para, Text
@@ -274,6 +299,38 @@ def test_a_pages_body_stops_at_the_time_limit():
         assert REST in out, out
         mids.append("ALPHA" in out and "OMEGA" not in out)
     assert True in mids, mids
+
+
+def test_the_shapes_of_one_slide_or_page_stop_at_the_time_limit():
+    import test_reader_vsdx as vx
+    cut_mid("pptx shapes", sl.deck(["".join(sl.sp(t, id=i + 2) for i, t in enumerate(words(str)))]))
+    cut_mid("vsdx shapes", vx.vsdx({"P": "".join(vx.shape(i + 1, t) for i, t in enumerate(words(str)))}))
+
+
+def test_an_object_stops_inside_itself_at_its_own_time():
+    import struct
+    from reader import embedded, limits
+    from reader.formats import biff, ptg
+
+    class Grid:
+        cut, cells, got = False, {}, []
+
+        def formula(self, *a):
+            self.got.append(a)
+
+    ctx = Context()
+    objs = embedded.of(ctx)
+    data = fx.biff(0x0203, bytes(14)) * 9
+    forms = [(r, 0, struct.pack("<Bd", 0x1F, 1.0 + r), b"") for r in range(5)]
+    with objs.timed():
+        assert not objs.over() and len(list(biff.Stream(data, ctx).records(0))) == 9
+        ptg.put(Grid(), forms, {}, ptg.Env(False), ctx)
+        assert len(Grid.got) == 5 and not ctx.skipped, (Grid.got, ctx.skipped)
+        objs.spent = limits.EMBED_SECONDS
+        assert objs.over() and list(biff.Stream(data, ctx).records(0)) == []
+        ptg.put(Grid(), forms, {}, ptg.Env(False), ctx)
+        assert len(Grid.got) == 5 and ctx.skipped == {"record": 1, "formula": 5}, (Grid.got, ctx.skipped)
+    assert not objs.over() and len(list(biff.Stream(data, ctx).records(0))) == 9
 
 
 def test_paged_documents_and_books_stop_at_the_time_limit():

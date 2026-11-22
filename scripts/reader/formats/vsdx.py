@@ -390,6 +390,8 @@ class _Reader:
             self.deep()
             return
         for el in kids(container, "Shape"):
+            if self.ctx.late():
+                break
             with self.ctx.guard("shape"):
                 self.shape(el, dx, dy, d, out, master, parent)
 

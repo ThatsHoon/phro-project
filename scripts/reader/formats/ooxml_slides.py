@@ -412,6 +412,8 @@ class _Reader:
             self.deep()
             return
         for el in container:
+            if self.ctx.late():
+                break
             with self.ctx.guard("shape"):
                 self.shape(el, xf, d, hidden, out, titles)
 

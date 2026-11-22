@@ -312,7 +312,11 @@ def listed(label: str, entries, budget, ctx, kind: str = "fact", cap: int = 0, t
         return []
     budget.chars -= len(label) + 2
     body, units, shown, visible = [], 0, 0, 0
-    for text, hid, *n in entries:
+    entries = iter(entries)
+    while not cap or units < cap:  # an entry past the cap is not asked for: asking may read it
+        text, hid, *n = next(entries, (None, False))
+        if text is None:
+            break
         units += n[0] if n else 1
         if cap and units > cap or len(text) + 2 > budget.chars:
             break
@@ -975,8 +979,8 @@ class Grid:
         if line:
             out.append(Para([Text(line)]))
         out.extend(self._formulas())
-        for label, entries in self.facts:
-            out.extend(listed(label, entries, self.budget, self.ctx, cap=limits.FACT_ITEMS))
+        for label, entries, total in self.facts:
+            out.extend(listed(label, entries, self.budget, self.ctx, cap=limits.FACT_ITEMS, total=total))
         return out
 
     @staticmethod
@@ -1026,9 +1030,10 @@ class Grid:
             return [Para([Text(f"{rng}: ")] + list(first.inlines), hidden=first.hidden)] + blocks[1:]
         return [Para([Text(f"{rng}:")])] + blocks
 
-    def fact(self, label: str, entries: list):
-        """A paragraph of the sheet's facts after its formulas: `label` and its (text, hidden) entries, by `listed`."""
-        self.facts.append((label, entries))
+    def fact(self, label: str, entries, total=None):
+        """A paragraph of the sheet's facts after its formulas: `label` and its (text, hidden) entries, by `listed`
+        (with `total`, an iterator of that many, as `listed` takes it)."""
+        self.facts.append((label, entries, total))
 
     def table(self, name: str, r1: int, r2: int, c1: int, c2: int, heads: bool, totals: bool):
         """A table's fact: `Table <name> <range>` and its header and totals rows."""

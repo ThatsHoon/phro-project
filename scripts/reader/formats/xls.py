@@ -150,10 +150,10 @@ class Workbook:
     def book_facts(self) -> list:
         """The workbook's own facts, before its sheets: its names, its external links by number, its protection."""
         env = self._env()
-        names = [e for e in (ptg.named(n, env, self.ctx) for n in self.g.names if n.itab == 0) if e]
+        names, total = ptg.names((n for n in self.g.names if n.itab == 0), env, self.ctx)
         links = [(f"[{k}] {p}", False) for k, p in enumerate(self.g.books, 1) if p]
         b, ctx = self.budget, self.ctx
-        return (sheet_grid.listed("Names", names, b, ctx, cap=limits.FACT_ITEMS) + sheet_grid.listed("External links", links, b, ctx, cap=limits.FACT_ITEMS)
+        return (sheet_grid.listed("Names", names, b, ctx, cap=limits.FACT_ITEMS, total=total) + sheet_grid.listed("External links", links, b, ctx, cap=limits.FACT_ITEMS)
                 + sheet_grid.listed("Protected", [(p, False) for p in self.g.protect], b, ctx))
 
     def _charts(self, shown: list) -> dict:
@@ -233,8 +233,7 @@ class Workbook:
         """The sheet's facts in their order: its names, its filter, its validations, its rules, its pivot tables
         (SXVIEW: the range, 16 fields, the lengths of its name and its data name, the name; an SXDI's name is a
         value it shows), its protection. A table (FEAT11, FEAT12) and a CF12 rule are counted under fact."""
-        grid.fact("Names", [e for e in (ptg.named(n, sh.env, self.ctx) for n in self.g.names if n.itab == i + 1)
-                            if e])
+        grid.fact("Names", *ptg.names((n for n in self.g.names if n.itab == i + 1), sh.env, self.ctx))
         rng = self._filter_range(i) if sh.filtered else None
         if rng is not None:
             crit = [(c, False) for c in (_criterion(b, rng[2]) for b in sh.crit) if c]

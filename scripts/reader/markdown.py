@@ -390,8 +390,8 @@ def _broken(line: str) -> str:
         if end is None:
             a = line.rfind(" ", start + 1, stop + 1)
             if a < 0:
-                end = _SENTENCE_END.search(line, stop)
                 a = line.find(" ", stop)
+                end = _SENTENCE_END.search(line, stop, n if a < 0 else a + 1)
                 if end is not None and 0 <= a <= end.start():
                     end = None
         if end is not None and end.group(1) is not None:

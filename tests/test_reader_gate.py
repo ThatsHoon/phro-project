@@ -2537,12 +2537,12 @@ sys.exit(read.main(["convert", sys.argv[2], "--out", sys.argv[3]]))
 """
 
 
-def test_convert_by_hand_has_the_hook_deadline():
-    """`read.py convert` run by hand gets PHRO_READER_DEADLINE CONVERT_SECONDS from its start, as the hook's child
-    does; one already set is kept."""
+def test_convert_by_hand_has_its_own_deadline():
+    """`read.py convert` run by hand gets PHRO_READER_DEADLINE HAND_SECONDS from its start (the hook's child has
+    the hook's); one already set is kept."""
     import time
     p = sample("x")
-    for given in (None, "12345.5"):
+    for given in (None, "99999999999.5"):
         o = tmp()
         env = {k: v for k, v in os.environ.items() if k != "PHRO_READER_DEADLINE"}
         if given:
@@ -2555,7 +2555,7 @@ def test_convert_by_hand_has_the_hook_deadline():
         if given:
             assert got == given, got
         else:
-            assert t + gate.limits.CONVERT_SECONDS - 5 < float(got) < time.time() + gate.limits.CONVERT_SECONDS, got
+            assert t + gate.limits.HAND_SECONDS - 5 < float(got) < time.time() + gate.limits.HAND_SECONDS, got
 
 
 def test_reexec_has_a_timeout():

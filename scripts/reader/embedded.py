@@ -99,6 +99,11 @@ class Objects:
         spent = self.spent if self.since is None else self.spent + clock() - self.since
         return spent >= limits.EMBED_SECONDS
 
+    def over(self) -> bool:
+        """Whether an object is being read and the objects' time is up: its own loops stop there, as late() keeps
+        the next object from being opened."""
+        return self.since is not None and self.late()
+
     @contextlib.contextmanager
     def timed(self):
         """Counts the time one object takes; an object read inside another is in the outer one's time."""

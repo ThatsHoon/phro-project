@@ -789,6 +789,17 @@ def test_long_paragraph_is_broken_in_linear_time():
     assert max(map(len, out.split("\n"))) <= limits.LINE_CHARS and took < 2.0, took
 
 
+def test_long_words_are_broken_in_linear_time():
+    word = "x" * (limits.LINE_CHARS + 1)
+    doc = Doc(blocks=[P(" ".join([word] * 1500))])
+    t0 = time.perf_counter()
+    out = R(doc)
+    took = time.perf_counter() - t0
+    assert out.split() == [word] * 1500 and out.count(" ") == 0 and took < 2.0, took
+    long = "y" * (limits.LINE_CHARS + 5)
+    assert R(Doc(blocks=[P(long + "a. b " + long + " c")])) == long + "a.\nb\n" + long + "\nc\n"
+
+
 def test_document_text_cannot_write_a_merged_line():
     out = R(Doc(blocks=[Table([[c("a"), c("b")], [c("x"), c("y")]]), P("Merged: A1:B1")]))
     assert out == "a|b\n-|-\nx|y\n\nMerged\\: A1:B1\n", out

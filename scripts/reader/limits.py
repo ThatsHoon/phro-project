@@ -9,8 +9,10 @@ MAX_DEPTH = 64
 TEX_DEPTH = 32
 MAX_OUTPUT = 20 * 10**6
 CONVERT_SECONDS = 45
-READ_SECONDS = 36.0   # from the process start: past them a format reads no further part (Context.late)
-RENDER_SECONDS = 41.0  # from the process start: past them the render writes no further block
+HAND_SECONDS = 110    # the deadline of a convert run by hand, under the two minutes a shell call is given
+# of a convert's CONVERT_SECONDS (reader.convert takes the same share of the time to its deadline, whatever that is):
+READ_SECONDS = 36.0   # past them a format reads no further part (Context.late)
+RENDER_SECONDS = 41.0  # past them the render writes no further block
 # the warning of a document whose later part the time left unread
 READ_LATE = "read not finished: time"
 HOOK_SECONDS = 55     # the gate's whole budget, hashing included, under the 60-second hook timeout in hooks.json
@@ -21,7 +23,7 @@ SHEET_CELLS = 500_000     # cells one document's sheets may materialize
 SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one document's sheets may materialize
 SHEET_RUNS = 20           # hidden row or column runs a sheet table's caption names; the rest are counted
 SHEET_ISLAND_STEPS = 8 * SHEET_CELLS  # cells (and columns) one sheet's island splits may visit, all levels together
-FORMULA_CHARS = 8_192     # Excel's own limit of one formula's text: a binary formula that spells more is not read
+FORMULA_CHARS = 32_767    # the most characters a cell holds: a binary formula that spells more is not read
 FORMULA_GROUPS = 1_000    # cell ranges one sheet's formulas paragraph lists; the groups past them are counted
 SHEET_COMMENTS = 10_000   # cell comments one workbook may turn into notes; the rest are cut, counted once
 FACT_VALUES = 20          # values or ranges one entry of a sheet's fact lists; the rest are counted in the entry

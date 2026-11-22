@@ -165,6 +165,17 @@ def test_names_workbook_first_sheet_scoped_on_the_sheet():
     assert texts(doc.blocks[1].blocks)[-1] == "Names: Local = Data!$A$1", doc.blocks[1].blocks
 
 
+def test_names_past_the_listed_ones_are_not_read():
+    from reader import limits
+    bad = bytes([0x18, 0, 0])
+    names = b"".join(lbl_at(f"N{k}", bad if k >= limits.FACT_ITEMS else struct.pack("<BH", 0x1E, 7), itab=k % 2)
+                     for k in range(2 * limits.FACT_ITEMS + 6))
+    doc, ctx = book([{"name": "Data", "cells": {(0, 0): 5}}], globals_extra=names)
+    assert ctx.skipped["formula"] == limits.FACT_ITEMS and ctx.skipped["fact"] == 6, ctx.skipped
+    assert texts(doc.blocks[:1])[0].endswith("N1998 = ?; (3 more not listed)"), texts(doc.blocks[:1])[0][-60:]
+    assert texts(doc.blocks[1].blocks)[-1].endswith("N1999 = ?; (3 more not listed)"), texts(doc.blocks[1].blocks)[-1][-60:]
+
+
 GUID_STDLINK = bytes.fromhex("d0c9ea79f9bace118c8200aa004ba90b")
 GUID_URL = bytes.fromhex("e0c9ea79f9bace118c8200aa004ba90b")
 GUID_FILE = bytes.fromhex("0303000000000000c000000000000046")
