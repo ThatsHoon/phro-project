@@ -189,6 +189,13 @@ def test_sheet_table_names_merges_by_the_sheets_addresses():
     assert R(doc) == "(2 hidden places left out)\n\nA||z\n-|-|-\np|r|s\nv|2|3\n||8|9|\n\nMerged: B2:D2, B4:B6\n", R(doc)
 
 
+def test_one_column_sheet_table_keeps_a_line_for_every_row():
+    doc = Doc(blocks=[Table([[c("a")], [c("")], [c("b", rowspan=2)], [], [c("e")]], origin="A1")])
+    assert R(doc) == "a\n||\nb\n||\ne\n\nMerged: A3:A4\n", R(doc)
+    doc = Doc(blocks=[Table([[c("a")], [c("h")], [c("")], [c("e")]], origin="B2", hidden_rows=frozenset({1}))])
+    assert R(doc) == "(1 hidden places left out)\n\na\n||\ne\n", R(doc)
+
+
 def test_merge_over_a_hidden_row_is_named_by_the_rows_written():
     rows = [[c("h"), c("k")], [c("v", rowspan=3), c("1")], [c("2")], [c("3")], [c("w", rowspan=2), c("4")], [c("5")]]
     out = R(Doc(blocks=[Table(rows, hidden_rows=frozenset({2, 5}))]))
@@ -787,6 +794,15 @@ def test_long_paragraph_is_broken_in_linear_time():
     out = R(doc)
     took = time.perf_counter() - t0
     assert max(map(len, out.split("\n"))) <= limits.LINE_CHARS and took < 2.0, took
+
+
+def test_trailing_blanks_are_cut_in_linear_time():
+    import time
+    blanks = " \t" * 200_000
+    t0 = time.perf_counter()
+    got = markdown._normalize("a" + blanks + "b" + blanks + "\r\n\n\n\nc \n")
+    assert time.perf_counter() - t0 < 2.0, time.perf_counter() - t0
+    assert got == "a" + blanks + "b\n\nc\n", got[-20:]
 
 
 def test_long_words_are_broken_in_linear_time():

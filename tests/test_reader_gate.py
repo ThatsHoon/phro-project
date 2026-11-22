@@ -341,7 +341,7 @@ def test_context_unread_clause_fits():
 def test_edit_hint_by_family():
     md = tmp() / "out.md"
     md.write_text("x\n", encoding="utf-8")
-    hint = " Read-only view (no XML, cell addresses or formulas); to edit the file, use the {} skill."
+    hint = " Read-only view (no XML); to edit the file, use the {} skill."
     assert gate._context("a.docx", {"lines": 1}, md) == (
         "a.docx was converted to Markdown by phro-project (1 line)." + hint.format("docx"))
     assert gate._context("a.pptm", {"lines": 1}, md).endswith("use the pptx skill.")
@@ -443,7 +443,7 @@ def test_heading_index_reaches_the_second_level():
     md.write_text("\n".join(lines) + "\n", encoding="utf-8")
     meta = markdown.stats(md.read_text(encoding="utf-8"))
     assert len(meta["headings"]) == 41
-    c = gate._context("a.docx", meta, md)
+    c = gate._context("a_report_of_the_second_quarter.docx", meta, md)
     assert "index.md): 1 T; 64 H62; 188 H186; " in c and len(c) < 600, c
 
 
@@ -656,6 +656,23 @@ def test_child_env_carries_the_deadline():
             # the rest of the environment goes through unchanged
             rest = {k: v for k, v in env.items() if k != "PHRO_READER_DEADLINE"}
             assert rest == {k: v for k, v in ours.items() if k != "PHRO_READER_DEADLINE"}
+    finally:
+        gate.subprocess.run = old
+
+
+def test_child_that_ran_out_of_time_is_a_timeout_of_whose_budget_it_was():
+    import types
+    from reader import limits
+    old = gate.subprocess.run
+    gate.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(stdout="FAIL\ttimeout\t\n", stderr="", returncode=1)
+    try:
+        with stub(), clock(0.0, 30.0):
+            d = gate.decide(ev(sample()), command=["x"])
+        assert "used up the hook's time limit" in out(d)["permissionDecisionReason"], out(d)
+        with stub(), clock(0.0, 1.0):
+            d = gate.decide(ev(sample()), command=["x"])
+        why = out(d)["permissionDecisionReason"]
+        assert f"conversion took over {limits.CONVERT_SECONDS} seconds. Retry by hand: " in why, why
     finally:
         gate.subprocess.run = old
 

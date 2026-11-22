@@ -80,6 +80,27 @@ def test_compound_objects():
     assert read(blob)[0] == ("chart", [], frozenset())
 
 
+def test_notes_of_an_embedded_workbook_reach_the_document():
+    import test_reader_xlsx as in_xlsx
+    from reader_fix import xlsx_cell, xlsx_row
+    rows = xlsx_row(1, xlsx_cell("A1", inline="<t>Item</t>"), xlsx_cell("B1", inline="<t>Qty</t>")) + \
+        xlsx_row(2, xlsx_cell("A2", inline="<t>Pen</t>"), xlsx_cell("B2", "3"))
+    book = make_xlsx(None, [{"name": "Data", "rows": rows, "rels": [("rC", in_xlsx.LEGACY, "../comments1.xml", False)]}],
+                     extra_parts={in_xlsx.LEG_PART: in_xlsx.legacy_xml(("B2", 0, "CELL COMMENT"))})
+    foot = '<w:p><w:r><w:t>host text</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r></w:p>'
+    notes = (f'<w:footnotes xmlns:w="{in_docm.W}"><w:footnote w:id="2"><w:p><w:r><w:t>HOST NOTE</w:t></w:r></w:p>'
+             '</w:footnote></w:footnotes>')
+    src = in_docm.docm(foot + word_object("rO") + word_object("rQ"),
+                       parts={"word/media/p.png": in_docm.PNG, "word/embeddings/book.xlsx": book,
+                              "word/embeddings/more.xlsx": book, "word/footnotes.xml": notes},
+                       rels=[("rP", "image", "media/p.png", False), ("rO", PKG_REL, "embeddings/book.xlsx", False),
+                             ("rQ", PKG_REL, "embeddings/more.xlsx", False), ("rF", "footnotes", "footnotes.xml", False)])
+    out = in_docm.md(src)
+    assert out.count("CELL COMMENT") == 2 and "HOST NOTE" in out, out
+    marks = [m for m in ("[^1]", "[^2]", "[^3]") if out.count(m) == 2]
+    assert len(marks) == 3, out
+
+
 def test_what_is_not_read_gives_none():
     for data in (b"", b"plain bytes", cfb_bytes({"CONTENTS": b"%PDF-1.4"})[0], b"PK\x03\x04" + b"\0" * 40,
                  make_zip(None, {"mimetype": CHART_MIME, "content.xml": "<a"}),

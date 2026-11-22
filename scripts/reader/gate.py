@@ -33,7 +33,7 @@ SKILL_OF = {**dict.fromkeys(("docx", "docm", "dotx", "dotm"), "docx"),
             **dict.fromkeys(("pptx", "pptm", "ppsx", "potx", "potm", "ppsm"), "pptx"),
             **dict.fromkeys(("xlsx", "xlsm", "xltx", "xltm"), "xlsx"),
             "pdf": "pdf"}
-EDIT_HINT = " Read-only view (no XML, cell addresses or formulas); to edit the file, use the {skill} skill."
+EDIT_HINT = " Read-only view (no XML); to edit the file, use the {skill} skill."
 SAVE_AS = {**dict.fromkeys(("doc", "docx", "docm", "dotx", "dotm", "rtf", "odt", "wpd", "wp", "wp5", "wp6", "wp7",
                             "wpt", "pages"), "docx or pdf"),
            **dict.fromkeys(("xls", "xlsx", "xlsm", "xltx", "xltm", "xlsb", "ods", "numbers"), "xlsx or pdf"),
@@ -660,6 +660,8 @@ def _child(cmd, start, timeout):
     last = lines[-1] if lines else ""
     if last.startswith("FAIL\t"):
         parts = last.split("\t", 2)
+        if parts[1] == "timeout":
+            return None, "timeout", LATE if budget < timeout else ""
         return None, parts[1], parts[2] if len(parts) > 2 else ""
     out = Path(last) if last else None
     if r.returncode != 0 or out is None or out.name != "out.md" or not out.is_file():

@@ -1025,20 +1025,23 @@ class _Render:
                 out[0] = (out[0][0], s)
             return ([("p", c) for c in cap]) + out
         if ncols == 1:
-            lines, used = [], 0
+            lines, used, written = [], 0, []
             for r in range(nrows):
                 if self.size + used > limits.MAX_OUTPUT:
                     break
-                if (r, 0) not in origins:
-                    continue
                 h = hid(r)
                 if h is None:
                     continue
-                s = mark(0, self._cell_text(origins[(r, 0)][0], COLUMN))
+                s = mark(0, self._cell_text(origins[(r, 0)][0], COLUMN)) if (r, 0) in origins else ""
                 if s:
                     lines.append(("(hidden) " if h and not s.startswith("(hidden) ") else "") + s)
-                    used += len(lines[-1]) + 1
-            return finish("\n".join(lines))
+                elif t.origin:
+                    lines.append(_pipe_row([""]))
+                else:
+                    continue
+                written.append(r)
+                used += len(lines[-1]) + 1
+            return finish("\n".join(lines), ", ".join(self._merged(t, origins, whole, written)) if t.origin else "")
         spans = len(whole) > max(3, nrows // 20)
         m = HTML if spans else PIPE
         lines = []
@@ -1224,7 +1227,7 @@ class _Render:
 
 def _normalize(s: str) -> str:
     s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"[ \t]+$", "", s, flags=re.M)
+    s = "\n".join(line.rstrip(" \t") for line in s.split("\n"))
     s = re.sub(r"\n{3,}", "\n\n", s).strip("\n")
     return s + "\n" if s else ""
 

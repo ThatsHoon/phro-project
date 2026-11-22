@@ -46,7 +46,7 @@ from . import limits
 from .containers.cfb import CfbError, Compound, is_cfb
 from .containers.zipx import Package, charged
 from .limits import ReadError
-from .model import Cell, Context, Equation, Para, Section, Table
+from .model import Cell, Context, Equation, NoteRef, Para, Section, Table
 
 DEPTH = 4  # objects inside objects that are opened
 MAX_OBJECTS = 256  # embedded objects one document reads (the rest are not read)
@@ -283,13 +283,27 @@ def _package(data, ctx):
     return None
 
 
-def _shown(blocks, own, ctx):
-    """The tables of `blocks`, with what reading them counted in `own`. With no table, a chart, or UNREAD when
-    the read counted something it left out."""
+def _shown(blocks, own, ctx, notes=None):
+    """The tables of `blocks`, with what reading them counted in `own`; the `notes` they mark go to the document
+    (`ctx.notes`), each under a key of its own. With no table, a chart, or UNREAD when the read counted something
+    it left out."""
     out = _tables(blocks)
     if not out:
         return UNREAD if own.skipped else CHART
     ctx.skipped.update(own.skipped)
+    if notes:
+        base, stack = f"embedded {len(ctx.notes)}: ", list(out)
+        while stack:
+            x = stack.pop()
+            if isinstance(x, NoteRef):
+                if x.id in notes:
+                    ctx.notes[base + x.id] = notes[x.id]
+                    x.id = base + x.id
+                continue
+            for name in ("inlines", "blocks"):
+                stack.extend(getattr(x, name, ()))
+            for row in getattr(x, "rows", ()):
+                stack.extend(row)
     return "table", out, _NONE
 
 
@@ -313,7 +327,7 @@ def _odf(data, ctx):
         if any(local(c.tag) == "spreadsheet" for c in inner):
             doc = odf_sheets.sheets(pkg, own, root, None, first=True)
             sec = next((b for b in doc.blocks if isinstance(b, Section) and not b.hidden), None)
-            return _shown(sec.blocks if sec is not None else [], own, ctx)
+            return _shown(sec.blocks if sec is not None else [], own, ctx, doc.notes)
     return None
 
 
@@ -325,4 +339,5 @@ def _workbook(data, ctx):
         if ooxml_base.local(root.tag) != "workbook":
             return None
         own = of(ctx).inner()
-        return _shown(ooxml_sheets.active_sheet(pkg, part, own), own, ctx)
+        blocks, notes = ooxml_sheets.active_sheet(pkg, part, own)
+        return _shown(blocks, own, ctx, notes)

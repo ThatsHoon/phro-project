@@ -123,7 +123,7 @@ def test_a_late_convert_says_so_and_is_filed_partial():
             reader.convert(book, tmp() / "out", backend=("", ""))
             raise AssertionError("a workbook with no sheet read gave a result")
         except ReadError as e:
-            assert (e.kind, e.detail) == ("damaged", "nothing read within the time limit"), e
+            assert (e.kind, e.detail) == ("timeout", ""), e
     finally:
         reader.STARTED = saved
     assert limits.READ_LATE in meta["warnings"] and REST in (out / "out.md").read_text(encoding="utf-8"), meta

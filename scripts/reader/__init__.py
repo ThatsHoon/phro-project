@@ -45,6 +45,7 @@ def parse(path, ctx, **opts):
     doc = mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
     if ctx.vba:
         doc.meta["vba"] = ctx.vba
+    doc.notes.update(ctx.notes)
     return doc
 
 
@@ -106,7 +107,7 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
             doc = parse(src, ctx, **opts)
         except ReadError as e:
             if e.kind == "damaged" and ctx.skipped["time"]:
-                raise ReadError("damaged", "nothing read within the time limit") from None
+                raise ReadError("timeout", "") from None
             raise
         out_dir.mkdir(parents=True, exist_ok=True)
         md = markdown.render(doc, out_dir / "assets", hidden, ctx.skipped, info,
