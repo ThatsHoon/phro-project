@@ -475,10 +475,10 @@ def _head(name, meta, assets):
 
 def _context(path, meta, out_md, *, past_end="", offer="", upto=None, window=""):
     """additionalContext for an allow, never past CONTEXT_MAX - 1 characters. Room goes first to the head (the file
-    name cut short when it must), what the time cut, for pdf the pages past the cut (up to `upto`, the end of a
+    name cut short when it must) with, for all but pdf, the edit hint, what the time cut, for pdf the pages past the cut (up to `upto`, the end of a
     range read) and the read that gets them, the `window` sentence, the garble warning, and the floor of a long
     output's index; then, for pdf, the past-the-end sentence, PDF_HINT, the offer (whole or not at all), the
-    unrendered and figure pages, and for the rest the edit hint and the image offer (whole or not at all); then
+    unrendered and figure pages, and for the rest the image offer (whole or not at all); then
     the unread list; the index takes what is left. They read head, hint, past-the-end, offer, pages, unread, index,
     then the time cut and the read that gets the rest, and the rest. The head names the assets folder by its
     absolute path: the Read result does not show out.md's."""
@@ -500,12 +500,14 @@ def _context(path, meta, out_md, *, past_end="", offer="", upto=None, window="")
         except OSError:
             pass
     fit, floor = _index(meta, out_md, pdf, bool(meta.get("images"))) if long_out else (None, 0)
-    head = _head(name, meta, assets)
-    over = len(head) + len(tail) + floor - (CONTEXT_MAX - 1)
     ext = reader.ext_of(name)
+    skill = SKILL_OF.get(ext)
+    edit = EDIT_HINT.format(skill=skill) if skill and not pdf else ""
+    head = _head(name, meta, assets) + edit
+    over = len(head) + len(tail) + floor - (CONTEXT_MAX - 1)
     stem = name[:len(name) - len(ext) - 1] if ext else name
     if over > 0 and len(stem) > 2:
-        head = _head(stem[:max(1, len(stem) - over - 1)] + "…" + (f".{ext}" if ext else ""), meta, assets)
+        head = _head(stem[:max(1, len(stem) - over - 1)] + "…" + (f".{ext}" if ext else ""), meta, assets) + edit
     if len(head) + len(tail) + floor > CONTEXT_MAX - 1:
         tail = tail_of(True)
     if len(head) + len(tail) + floor > CONTEXT_MAX - 1:
@@ -542,10 +544,8 @@ def _context(path, meta, out_md, *, past_end="", offer="", upto=None, window="")
                                     used()))
         order = ("hint", "past_end", "offer", "unrendered", "figures", "unread")
     else:
-        skill = SKILL_OF.get(reader.ext_of(name))
-        take("hint", EDIT_HINT.format(skill=skill) if skill else "")
         take("offer", offer)
-        order = ("hint", "offer", "unread")
+        order = ("offer", "unread")
     unread = [" ".join(str(x).split()) for x in meta.get("unread") or []]
     if unread:
         take("unread", _clause(" Some parts could not be read: ", unread, ".", used()))

@@ -352,8 +352,12 @@ def test_edit_hint_fits():
     md.write_text("x\n", encoding="utf-8")
     meta = {"lines": 3000, "hidden": 4, "warnings": ["garbled"], "unread": [f"{i} kinds of thing" for i in range(60)],
             "headings": [(i, "h") for i in range(100)]}
-    c = gate._context("n" * 250 + ".xlsm", meta, md)
-    assert len(c) < 600 and gate.EDIT_HINT.format(skill="xlsx") in c and "…." in c and c.endswith("may be garbled."), c
+    deep = tmp().joinpath(*["r" * 49] * 3) / "out.md"
+    deep.parent.mkdir(parents=True)
+    for out_md in (md, deep):
+        c = gate._context("n" * 250 + ".xlsm", meta, out_md)
+        assert len(c) < 600 and gate.EDIT_HINT.format(skill="xlsx") in c and "…." in c, c
+        assert c.endswith("may be garbled."), c
 
 
 def test_edit_hint_before_lists():
