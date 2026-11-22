@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from reader import limits, markdown  # noqa: E402
 from reader.formats import ooxml, ooxml_sheets  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Hidden, Link, NoteRef, Para, Table, Text  # noqa: E402
+from reader.model import Bold, Context, Hidden, Link, NoteRef, Para, Table, Text  # noqa: E402
 from reader_fix import XLSX_REL, XLSX_SML, make_xlsx, xlsx_cell, xlsx_row  # noqa: E402
 import test_reader_xlsb as xb  # noqa: E402  (the drawing, anchor and chart fixtures)
 
@@ -1312,6 +1312,21 @@ def test_chart_keeps_its_table_when_the_sheet_shows_a_cell_of_its_range_as_somet
     assert len(t.rows) == 2 and "hidden places left out" in out and "\nQ1|7\n" in out, (t.rows, out)
     t, out, _ = charted([sheet(xlsx_row(1, NAME) + xlsx_row(2, CAT, xlsx_cell("B2", "7", f="A1+1")))])
     assert t.rows == [] and out.count("Q1") == 1, (t.rows, out)
+
+
+def test_chart_keeps_its_table_when_a_linked_or_noted_cell_shows_no_value():
+    from reader.formats import sheet_grid
+    link = '<hyperlinks><hyperlink ref="B2" location="S!A1"/></hyperlinks>'
+    t, out, _ = charted([sheet(xlsx_row(1, NAME) + xlsx_row(2, CAT, xlsx_cell("B2", f="A1+1")), after=link)])
+    assert len(t.rows) == 2 and "\nQ1|=A1+1 → S!A1\n" in out and "\nQ1|7\n" in out, (t.rows, out)
+    t, out, _ = charted([sheet(PLOTTED, after=link)])
+    assert t.rows == [] and "\nQ1|7 → S!A1\n" in out, (t.rows, out)
+    mark, shows = NoteRef("n1"), sheet_grid.shows
+    for value in ("=A1", [Text("=A1"), mark], [Link("u", [Text("=A1")])], [Link("u", [Hidden([Text("7")])])], [mark],
+                  [Text("=A1"), Text(" → S!A1")], [Hidden([Text("7")])], (Para([Text("7")]),), [Bold([Hidden([Text("7")])])]):
+        assert not shows(value), value
+    for value in ("7", [Text("7"), mark], [Link("u", [Text("7")]), mark], [Text("7"), Text(" → S!A1")], [Bold([Text("7")])]):
+        assert shows(value), value
 
 
 def test_chart_keeps_its_table_when_two_sheets_answer_to_its_sheet_name():

@@ -338,6 +338,26 @@ def _column_major(item):
     return item[0][1], item[0][0]
 
 
+def shows(value) -> bool:
+    """Whether a cell's value, as the grid holds it, shows the cell's own value in the output: its first text is
+    not a formula written for want of a value, and nothing of it is hidden. A link and a note mark around the text
+    do not count; a value of blocks is taken as not shown."""
+    if isinstance(value, str):
+        return bool(value) and value[0] != "="
+    if not isinstance(value, list):
+        return False
+    stack, first = [value], None
+    while stack:
+        for x in stack.pop():
+            if isinstance(x, Hidden):
+                return False
+            if isinstance(x, (Link, Bold)):
+                stack.append(x.inlines)
+            elif isinstance(x, Text) and first is None and not stack:
+                first = x.text
+    return bool(first) and first[0] != "="
+
+
 class Written:
     """What a sheet read whole wrote to the output: the columns holding a value the output shows in each row, as
     runs, its hidden rows and columns and its merged ranges. A formula with no value, written as its text, and a
@@ -346,7 +366,7 @@ class Written:
     def __init__(self, grid):
         rows = {}
         for (r, c), v in sorted(grid.cells.items()):
-            if v[:1] == "=" if isinstance(v, str) else any(isinstance(x, Hidden) for x in v):
+            if not shows(v):
                 continue
             runs = rows.get(r)
             if runs is None:
