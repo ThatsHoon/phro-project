@@ -15,6 +15,9 @@ Two measurements (test_reader_pdf.py measure) print one other line and nothing e
 """
 import os
 import sys
+import tempfile
+
+os.environ.setdefault("PHRO_READER_CACHE", tempfile.mkdtemp())
 
 _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 

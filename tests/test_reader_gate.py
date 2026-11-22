@@ -280,7 +280,15 @@ def test_deny_texts_name_the_next_step():
     assert r("d/a.pptx", "damaged", "x") == ("a.pptx: the file looks damaged: x. Read it with the pptx skill instead,"
                                              " or ask the user for the file saved again, as pptx or pdf.")
     assert r("d/a.hwp", "damaged", "internal error KeyError") == (
-        "a.hwp: reading failed: internal error KeyError. Ask the user for the file saved again, as hwpx or pdf.")
+        "a.hwp: reading failed: internal error KeyError. Tell the user phro-project failed on this file.")
+    assert r("d/a.docx", "damaged", "conversion gave no output") == (
+        "a.docx: reading failed: conversion gave no output. Read it with the docx skill instead, or tell the user"
+        " phro-project failed on this file.")
+    assert r("d/a.hwp", "damaged", "cache entry vanished") == (
+        "a.hwp: reading failed: cache entry vanished. Read it again.")
+    why = r("d/a.mpp", "timeout")
+    assert why == (f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds. A run by hand stops at the same"
+                   " limit; ask the user for a smaller project, or the project saved as pdf."), why
     assert r("d/a.hwp", "too_large", gate.limits.BIG_INPUT) == (
         "a.hwp: the file is over 512 MiB. That is phro-project's safety limit; ask the user for a smaller file, such"
         " as the part they need saved on its own.")
@@ -366,8 +374,8 @@ def test_hook_cli_internal_error_deny():
     r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, str(HERE / "scripts"), str(f)],
                        capture_output=True)
     o = json.loads(r.stdout.decode("utf-8"))["hookSpecificOutput"]
-    assert o["permissionDecisionReason"] == ("a.hwp: reading failed: internal error ZeroDivisionError. Ask the user"
-                                             " for the file saved again, as hwpx or pdf."), o
+    assert o["permissionDecisionReason"] == ("a.hwp: reading failed: internal error ZeroDivisionError. Tell the user"
+                                             " phro-project failed on this file."), o
 
 
 @contextmanager
@@ -719,6 +727,11 @@ def test_gate_uppercase_ext():
         assert out(run(sample(name="X.TXTX"), base))["permissionDecision"] == "allow"
 
 
+def test_formats_have_one_home():
+    import reader.exts
+    assert reader.FORMATS is reader.exts.FORMATS
+
+
 def test_import_is_light():
     code = ("import sys; sys.path.insert(0, sys.argv[1]); import reader.gate as g; "
             "r = g.decide({'tool_name': 'Read', 'tool_input': {'file_path': 'C:/x.py'}}); "
@@ -1053,6 +1066,21 @@ def test_pages_values_parsed():
     with pdf_env():
         o = out(gate.decide(ev(four_pages(), pages="1234567890")))
         assert ' The pdf has 4 pages; pages="1234567890-1234567890" starts past its end.' in o["additionalContext"], o
+
+
+def test_pages_piece_fits_the_read_window():
+    """A pages= Read inside the page index whose piece of out.md is over Read's window gets the lines that fit and
+    the offset to go on from."""
+    with pdf_env():
+        p = four_pages()
+        o = out(gate.decide(ev(p)))
+        n = len(md_lines(o))
+        _edit_meta(p, line_bytes=[25_000] * n)
+        o = out(gate.decide(ev(p, pages="1-3")))
+        lines = md_lines(o)
+        u = o["updatedInput"]
+        assert u["offset"] == 1 and u["limit"] == 2 < lines.index("## Page 4"), (u, lines)
+        assert o["additionalContext"].endswith(f" Lines 1-2 of {n}; continue with offset=3."), o
 
 
 def test_pages_offset_limit():

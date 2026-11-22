@@ -25,7 +25,7 @@ from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc, Para, Text  # noqa: E402
 
 os.environ["PHRO_READER_OCR"] = "none"  # decision 8: OCR off, keys as before, except in the OCR id tests
-os.environ.setdefault("PHRO_READER_CACHE", tempfile.mkdtemp())  # keys and digests leave memos in the cache root
+os.environ.setdefault("PHRO_READER_CACHE", tempfile.mkdtemp())
 
 READ = HERE / "scripts" / "read.py"
 STUB = "reader.formats._teststub"

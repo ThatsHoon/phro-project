@@ -39,6 +39,8 @@ SAVE_AS = {**dict.fromkeys(("doc", "docx", "docm", "dotx", "dotm", "rtf", "odt",
            **dict.fromkeys(("ppt", "pptx", "pptm", "ppsx", "potx", "potm", "ppsm", "odp", "key"), "pptx or pdf"),
            **dict.fromkeys(("hwp", "hwpx"), "hwpx or pdf")}
 PROTECTED = " phro-project cannot open protected files; ask the user for an unprotected copy"
+VANISHED = "cache entry vanished"
+READER_FAULTS = ("internal error", "conversion gave no output", VANISHED)
 LARGE_PART = "the part they need saved on its own"
 
 # pdf
@@ -161,11 +163,21 @@ def _is_zip(path):
         return False
 
 
-def _next(path, kind):
+def _next(path, kind, detail=""):
     """The one sentence a deny of `kind` ends with: what can be done next. The convert command only for a timeout,
-    the one failure that running it again can mend."""
+    the one failure that running it again can mend, and not for mpp, whose run by hand has the same limit; for a
+    failure of phro-project's own, not of the file, another way to read it, or the same Read again for a cache
+    entry that went missing."""
     ext = reader.ext_of(path)
     skill = SKILL_OF.get(ext)
+    if kind == "timeout" and reader.FORMATS.get(ext) == "mpp":
+        return (" A run by hand stops at the same limit; ask the user for a smaller project, or the project saved"
+                " as pdf.")
+    if kind == "damaged" and detail == VANISHED:
+        return " Read it again."
+    if kind == "damaged" and detail.startswith(READER_FAULTS):
+        return (f" Read it with the {skill} skill instead, or tell" if skill else " Tell") + \
+            " the user phro-project failed on this file."
     if kind == "timeout":
         return (f' Retry by hand: python -I -X utf8 "{READ_PY}" convert "{path}"'
                 + (f" or read it with the {skill} skill." if skill else ""))
@@ -186,7 +198,7 @@ def _why(kind, detail=""):
     DETAIL_MAX characters (a zip member name in it is the file's, up to 64 KB)."""
     if len(detail) > DETAIL_MAX:
         detail = detail[:DETAIL_MAX - 1] + "…"
-    if kind == "damaged" and detail.startswith("internal error"):
+    if kind == "damaged" and detail.startswith(READER_FAULTS):
         return f"reading failed: {detail}"
     if kind == "damaged":
         return f"the file looks damaged: {detail}"
@@ -204,7 +216,7 @@ def _deny(path, kind, detail=""):
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": f"{_name(path)}: {_why(kind, detail)}." + _next(path, kind),
+        "permissionDecisionReason": f"{_name(path)}: {_why(kind, detail)}." + _next(path, kind, detail),
     }}
 
 
@@ -346,16 +358,16 @@ def _index(meta, out_md, pdf, beside_assets=False):
     return fit, min(len(whole), len(pointer))
 
 
-def _window(meta, ti):
-    """({"limit": n}, the sentence that says so) for a read without a limit whose Read window from its offset would
-    pass READ_TOKENS or READ_BYTES by meta's line_bytes; ({}, "") when Read's own window fits or the offset is not a
-    line number."""
+def _window(meta, ti, span=None):
+    """({"limit": n}, the sentence that says so) for a read without a limit whose lines from its offset (`span` of
+    them, the gate's own limit for a pages= piece, else Read's READ_LINES) would pass READ_TOKENS or READ_BYTES by
+    meta's line_bytes; ({}, "") when they fit, the read has its own limit or the offset is not a line number."""
     sizes = meta.get("line_bytes")
     off = ti.get("offset", 1)
-    if ("limit" in ti or not isinstance(sizes, list) or not isinstance(off, int) or isinstance(off, bool)):
+    if "limit" in ti or not isinstance(sizes, list) or not isinstance(off, int) or isinstance(off, bool):
         return {}, ""
     s, m = max(1, off), len(sizes)
-    stop = min(m, s - 1 + limits.READ_LINES)
+    stop = min(m, s - 1 + (span or limits.READ_LINES))
     cap = min(limits.READ_TOKENS * limits.READ_TOKEN_BYTES, limits.READ_BYTES)
     used, e = 0, s - 1
     for b in sizes[s - 1:stop]:
@@ -725,7 +737,7 @@ def _generic(event, path, start, timeout, command):
             return _deny(path, kind, detail)
     out_md = entry / "out.md"
     if not out_md.is_file():
-        return _deny(path, "damaged", "cache entry vanished")
+        return _deny(path, "damaged", VANISHED)
     meta = _meta(entry)
     left = meta.get("figures_left")
     offer, mark = "", None
@@ -803,7 +815,7 @@ def _mpp(event, path, start, timeout, command):
             return _deny(path, kind, detail)
     out_md = entry / "out.md"
     if not out_md.is_file():
-        return _deny(path, "damaged", "cache entry vanished")
+        return _deny(path, "damaged", VANISHED)
     meta = _meta(entry)
     limit, window = _window(meta, event["tool_input"])
     return _allow(event, path, out_md, _context(path, meta, out_md, window=window), **limit)
@@ -928,7 +940,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
         if entry is None:
             return result
     if not (entry / "out.md").is_file():
-        return _pass(path, _why("damaged", "cache entry vanished"))
+        return _pass(path, _why("damaged", VANISHED))
     meta = _meta(entry)
     total = meta.get("pages_total")
     past_end, at, drop, upto = "", {}, ("pages",), None  # fact F4a: updatedInput replaces the input, so pages can go
@@ -950,7 +962,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
                 if entry is None:
                     return result
                 if not (entry / "out.md").is_file():
-                    return _pass(path, _why("damaged", "cache entry vanished"))
+                    return _pass(path, _why("damaged", VANISHED))
                 meta, upto = _meta(entry), b
                 if _all_unrendered(meta, a, b):
                     return None
@@ -968,7 +980,8 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
         mark = _offer_mark(event)
         if mark is None or not mark.exists():
             offer = offer_text(venv, repair)
-    limit, window = _window(meta, {**{k: v for k, v in event["tool_input"].items() if k not in drop}, **at})
+    kept = {k: v for k, v in event["tool_input"].items() if k not in drop}
+    limit, window = _window(meta, {**kept, **{k: v for k, v in at.items() if k != "limit"}}, at.get("limit"))
     at.update(limit)
     context = _context(path, meta, out_md, past_end=past_end, offer=offer, upto=upto, window=window)
     if offer and mark is not None and offer in context:

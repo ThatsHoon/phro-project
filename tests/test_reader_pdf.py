@@ -4,6 +4,7 @@ tables, images, fields and comments; hidden text, scanned pages, vector figures 
 Run: python -I -X utf8 tests/test_reader_pdf.py
 """
 import json
+import os
 import re
 import struct
 import sys
@@ -11,6 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 
+os.environ.setdefault("PHRO_READER_CACHE", tempfile.mkdtemp())
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
