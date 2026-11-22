@@ -32,24 +32,43 @@ def _roman(n):
     return out
 
 
-def _bijective(n, alphabet):
-    out = ""
-    while n > 0:
-        n, r = divmod(n - 1, len(alphabet))
-        out = alphabet[r] + out
-    return out or str(n)
+def _letters(n, alphabet):
+    """The letter n falls on, repeated once more each time the set is passed (a..z, aa, bb: ECMA-376 17.18.59);
+    past MAX_MARKER letters, the number."""
+    turn, at = divmod(n - 1, len(alphabet))
+    return alphabet[at] * (turn + 1) if turn < MAX_MARKER else str(n)
 
 
-def _counting(n, digits, units):
-    """n below 10,000 in a counting system: the digit before each unit, one left out before a unit (十, 百, 千)."""
+def _counting(n, digits, units, one=False, zero="", teen=False):
+    """n below 10,000 in a counting system: the digit before each unit. Without `one` a one is left out before a
+    unit (十, 百十); with it the one is said (壹拾), except, with `teen`, before ten in a number below twenty
+    (Chinese 十一, 一百一十). `zero` stands once for the empty places between two digits (一百零一)."""
     if not 0 < n < 10_000:
         return str(n)
-    out = ""
-    for i, unit in ((3, units[2]), (2, units[1]), (1, units[0])):
+    out, gap = "", False
+    for i, unit in ((3, units[2]), (2, units[1]), (1, units[0]), (0, "")):
         d = n // 10 ** i % 10
-        if d:
-            out += ("" if d == 1 else digits[d]) + unit
-    return out + (digits[n % 10] if n % 10 else "")
+        if not d:
+            gap = bool(out)
+            continue
+        if gap and zero:
+            out += zero
+        gap = False
+        said = one and not (teen and i == 1 and n < 20)
+        out += (digits[d] if d > 1 or said or not unit else "") + unit
+    return out
+
+
+def _hebrew(n):
+    if not 0 < n < 1000:
+        return str(n)
+    out = "ת" * (n // 400) if n >= 400 else ""
+    n %= 400
+    out += " קרש"[n // 100].strip()
+    n %= 100
+    if n in (15, 16):
+        return out + "ט" + "וז"[n - 15]
+    return out + " יכלמנסעפצ"[n // 10].strip() + " אבגדהוזחט"[n % 10].strip()
 
 
 def _native_korean(n):
@@ -71,12 +90,12 @@ def _english(n, ordinal=False):
     elif n:
         words.append(_EN_ONES[n])
     text = " ".join(words)
-    if not ordinal:
-        return text
-    head, _, last = text.rpartition(" ")
-    tail, dash, word = last.rpartition("-")
-    word = _EN_ORDINAL.get(word) or (word[:-1] + "ieth" if word.endswith("y") else word + "th")
-    return (head + " " if head else "") + tail + dash + word
+    if ordinal:
+        head, _, last = text.rpartition(" ")
+        tail, dash, word = last.rpartition("-")
+        word = _EN_ORDINAL.get(word) or (word[:-1] + "ieth" if word.endswith("y") else word + "th")
+        text = (head + " " if head else "") + tail + dash + word
+    return text.capitalize()
 
 
 def _ordinal(n):
@@ -93,14 +112,16 @@ _EN_ORDINAL = {"One": "First", "Two": "Second", "Three": "Third", "Five": "Fifth
                "Twelve": "Twelfth"}
 _CJK = "〇一二三四五六七八九"
 _COUNTING = {
-    **dict.fromkeys(("japaneseCounting", "chineseCounting", "chineseCountingThousand", "taiwaneseCounting",
-                     "taiwaneseCountingThousand", "koreanDigital2"), (_CJK, "十百千")),
-    **dict.fromkeys(("koreanDigital", "koreanCounting"), (_HANGUL_DIGITS, "십백천")),
-    "japaneseLegal": ("〇壱弐参四伍六七八九", "拾百阡"),
-    "chineseLegalSimplified": ("零壹贰叁肆伍陆柒捌玖", "拾佰仟"),
-    "ideographLegalTraditional": ("零壹貳參肆伍陸柒捌玖", "拾佰仟"),
+    "japaneseCounting": (_CJK, "十百千"), "koreanCounting": (_HANGUL_DIGITS, "십백천"),
+    **dict.fromkeys(("chineseCounting", "chineseCountingThousand", "taiwaneseCounting", "taiwaneseCountingThousand"),
+                    (_CJK, "十百千", True, "零", True)),
+    "japaneseLegal": ("〇壱弐参四伍六七八九", "拾百阡", True),
+    "chineseLegalSimplified": ("零壹贰叁肆伍陆柒捌玖", "拾佰仟", True, "零"),
+    "ideographLegalTraditional": ("零壹貳參肆伍陸柒捌玖", "拾佰仟", True, "零"),
 }
+_STEMS, _BRANCHES = "甲乙丙丁戊己庚辛壬癸", "子丑寅卯辰巳午未申酉戌亥"
 _DIGITS = {
+    "koreanDigital": _HANGUL_DIGITS, "koreanDigital2": "零一二三四五六七八九",
     "decimalFullWidth": "０１２３４５６７８９", "decimalFullWidth2": "０１２３４５６７８９",
     "decimalHalfWidth": "0123456789", "ideographDigital": _CJK, "japaneseDigitalTenThousand": _CJK,
     "taiwaneseDigital": _CJK, "hindiNumbers": "०१२३४५६७८९", "thaiNumbers": "๐๑๒๓๔๕๖๗๘๙",
@@ -115,6 +136,7 @@ _ALPHABETS = {
     "ideographTraditional": "甲乙丙丁戊己庚辛壬癸", "ideographZodiac": "子丑寅卯辰巳午未申酉戌亥",
     "russianLower": "абвгдежзиклмнопрстуфхцчшщэюя", "russianUpper": "АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩЭЮЯ",
     "hebrew2": "אבגדהוזחטיכלמנסעפצקרשת", "arabicAlpha": "أبتثجحخدذرزسشصضطظعغفقكلمنهوي",
+    "arabicAbjad": "أبجدهوزحطيكلمنسعفصقرشتثخذضظغ",
     "thaiLetters": "กขคงจฉชซฌญฎฏฐฑฒณดตถทธนบปผฝพฟภมยรลวศษสหฬอฮ",
     "hindiVowels": "अआइईउऊऋऌएऐओऔ", "hindiConsonants": "कखगघङचछजझञटठडढणतथदधनपफबभमयरलवशषसह",
 }
@@ -125,7 +147,7 @@ def _fmt(n, kind):
     if n < 1:
         return str(n)
     if kind in _ALPHABETS:
-        return _bijective(n, _ALPHABETS[kind])
+        return _letters(n, _ALPHABETS[kind])
     if kind in _COUNTING:
         return _counting(n, *_COUNTING[kind])
     if kind in _DIGITS:
@@ -137,13 +159,17 @@ def _fmt(n, kind):
     if kind in ("decimalEnclosedCircle", "decimalEnclosedCircleChinese"):
         return chr(0x2460 + n - 1) if n <= 20 else str(n)
     if kind == "ideographEnclosedCircle":
-        return chr(0x3220 + n - 1) if n <= 10 else str(n)
+        return chr(0x3280 + n - 1) if n <= 10 else str(n)
     if kind == "decimalEnclosedFullstop":
         return chr(0x2488 + n - 1) if n <= 20 else f"{n}."
     if kind == "decimalEnclosedParen":
         return f"({n})"
     if kind == "decimalZero":
         return f"{n:02d}"
+    if kind == "hebrew1":
+        return _hebrew(n)
+    if kind == "ideographZodiacTraditional":
+        return _STEMS[(n - 1) % 10] + _BRANCHES[(n - 1) % 12]
     if kind == "koreanLegal":
         return _native_korean(n)
     if kind == "ordinal":

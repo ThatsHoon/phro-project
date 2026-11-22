@@ -646,6 +646,9 @@ def test_meta_properties():
                    "modified: 2024-04-01 08:00; keywords: lease, rent; Client: Hanbit\n\n# Lease\n\nbody\n"), out
     out = md(odt_doc(P("body"), extra={"meta.xml": "<broken"}))
     assert out == "body\n", out
+    big = META.replace("</office:document-meta>", " " * (3 * 2**20) + "</office:document-meta>")
+    doc, ctx = parse(odt_doc(P("body"), extra={"meta.xml": big}))
+    assert markdown.render(doc, tmp() / "a") == "body\n" and ctx.skipped["properties"] == 1, ctx.skipped
 
 
 def test_ruby_is_base_then_reading():

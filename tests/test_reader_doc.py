@@ -531,6 +531,10 @@ def test_no_table_stream_reads_the_main_stream():
     assert md(p) == "Привет, мир!\n\nВторой абзац.\n", md(p)
     p = handmade("こんにちは世界。\r日本語の段落です。\r".encode("cp932"), 0, flags=0x4000, lid_fe=0x0411)
     assert md(p) == "こんにちは世界。\n\n日本語の段落です。\n", md(p)
+    p = handmade("Привет, мир!\rВторой абзац.\r".encode("utf-16-le"), 0x0419)
+    assert md(p) == "Привет, мир!\n\nВторой абзац.\n", md(p)
+    p = handmade("Hello, world.\rSecond.\r".encode("utf-16-le"), 0x0409)
+    assert md(p) == "Hello, world.\n\nSecond.\n", md(p)
     q = tmp() / "empty.doc"
     word = bytearray(1024)
     struct.pack_into("<6H", word, 0, 0xA5EC, 0x00C1, 0, 0x0409, 0, 0)
@@ -613,6 +617,14 @@ def test_summary_information_properties():
                      "# Lease\n\nbody\n"), md(p)
     p = doc_file([("body\r", False)], streams={"\x05SummaryInformation": summary[:60]})
     d, ctx = parse(p)
+    assert markdown.render(d, tmp() / "a") == "body\n" and ctx.skipped["properties"] == 1, ctx.skipped
+    p = doc_file([("body\r", False)], streams={"\x05SummaryInformation": summary})
+    old = limits.PROPERTY_STREAM
+    try:
+        limits.PROPERTY_STREAM = len(summary) - 1
+        d, ctx = parse(p)
+    finally:
+        limits.PROPERTY_STREAM = old
     assert markdown.render(d, tmp() / "a") == "body\n" and ctx.skipped["properties"] == 1, ctx.skipped
 
 

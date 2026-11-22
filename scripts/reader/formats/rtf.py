@@ -80,7 +80,8 @@ from ..officeart import dib_to_bmp
 from .rtf_lex import BIN, CLOSE, HEX, OPEN, SYM, TEXT, WORD, Pending, codec, tokens
 from . import zip_route
 from .rtf_table import Tables
-from .word_fields import MAX_INSTR, MAX_NAME, MAX_PROPERTIES, MAX_PROPERTY, comment_note, hyperlink_url, properties
+from .word_fields import (FORM_DEFAULT, MAX_ENTRIES, MAX_INSTR, MAX_NAME, MAX_PROPERTIES, MAX_PROPERTY, comment_note,
+                          form_state, hyperlink_url, properties)
 
 MAX_GROUPS = 1_000      # groups nested deeper than this are skipped to their close
 MAX_FIELDS = 32         # fields nested deeper than this give their result and no link
@@ -179,11 +180,12 @@ class _Pic:
 
 
 class _Field:
-    __slots__ = ("depth", "instr", "size", "start", "par", "over")
+    __slots__ = ("depth", "instr", "size", "start", "par", "over", "form")
 
     def __init__(self, depth, start, par, over):
         self.depth, self.start, self.par, self.over = depth, start, par, over
         self.instr, self.size = [], 0
+        self.form = None
 
 
 class _Story:
@@ -520,6 +522,13 @@ class _Reader:
                 k = cap == "staticval"
                 if pair is not None and len(pair[k]) < (MAX_PROPERTY if k else MAX_NAME):
                     pair[k] += s
+            elif cap == "ffl":
+                fields = self.story.fields
+                entries = fields[-1].form["entries"] if fields and fields[-1].form else None
+                if entries and len(entries[-1]) < MAX_NAME:
+                    entries[-1] += s[:MAX_NAME]
+            elif cap == "formfield":
+                pass
             elif cap == "revtbl":
                 if self.revs_len < MAX_STYLES * MAX_NAME:
                     self.revs.append(s)
@@ -628,6 +637,8 @@ class _Reader:
             "ansicpg": self.w_ansicpg, "deff": self.w_deff,
             "fcharset": self.w_fcharset, "cpg": self.w_cpg,
             "field": self.w_field, "fldinst": self.w_fldinst, "fldrslt": self.w_fldrslt,
+            "formfield": self.w_formfield, "ffl": self.w_ffl, "fftype": self.w_ff("kind"), "ffres": self.w_ff("result"),
+            "ffdefres": self.w_ff("default"),
             "footnote": self.w_footnote, "ftnalt": self.w_ftnalt,
             "pict": self.w_pict, "shppict": self.w_shppict, "shptxt": self.w_on, "nesttableprops": self.w_on,
             "result": self.w_on, "listtext": self.w_listtext, "pntext": self.w_listtext,
@@ -1031,9 +1042,39 @@ class _Reader:
     def w_fldrslt(self, p, fresh):
         self.g.cap = ""
 
+    def w_formfield(self, p, fresh):
+        """A legacy form field's data inside its instruction: its kind, result, default and drop-down entries are
+        kept on the field, and none of its text (its name, its help) is the instruction's."""
+        g = self.g
+        fields = self.story.fields
+        if g.cap == "fldinst" and fields and not fields[-1].over:
+            fields[-1].form = {"kind": 0, "result": FORM_DEFAULT, "default": 0, "entries": []}
+            g.cap = "formfield"
+        g.suppress = True
+
+    def w_ff(self, key):
+        def ff(p, fresh):
+            fields = self.story.fields
+            if self.g.cap == "formfield" and fields and fields[-1].form and p is not None:
+                fields[-1].form[key] = p
+        return ff
+
+    def w_ffl(self, p, fresh):
+        g = self.g
+        fields = self.story.fields
+        if g.cap == "formfield" and fields and fields[-1].form and len(fields[-1].form["entries"]) < MAX_ENTRIES:
+            fields[-1].form["entries"].append("")
+            g.cap = "ffl"
+
     def close_field(self, story):
         f = story.fields.pop()
         if f.over:
+            return
+        if f.form:
+            shown = form_state(f.form["kind"], f.form["result"], f.form["default"], f.form["entries"])
+            if shown:
+                story.cur.append((*self.look(), shown))
+                story.has = True
             return
         url = hyperlink_url("".join(f.instr))
         start = f.start if f.par == story.pars else 0
@@ -1170,9 +1211,10 @@ def parse_bytes(data, ctx, spent=None) -> Doc:
 
 
 def _date(d) -> str:
-    """`YYYY-MM-DD HH:MM` of an RTF time group's words; "" without a year in 1..9999."""
+    """`YYYY-MM-DD HH:MM` of an RTF time group's words; "" without a year in 1602..9999 (1601 is the unset time
+    Word writes for a document never saved or printed)."""
     yr = d.get("yr", 0)
-    if not 0 < yr < 10_000:
+    if not 1601 < yr < 10_000:
         return ""
     mo, dy, hr, mi = (min(max(d.get(k, low), 0), 99) for k, low in (("mo", 1), ("dy", 1), ("hr", 0), ("min", 0)))
     return f"{yr:04d}-{mo:02d}-{dy:02d} {hr:02d}:{mi:02d}"

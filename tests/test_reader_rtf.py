@@ -422,6 +422,19 @@ def test_style_chain_cut_keeps_near_styles():
     assert out == "p41\n\np33\n\n## p32\n\n## p30\n", out
 
 
+def test_form_fields_show_their_state():
+    """A legacy check box shows ☒ or ☐ (\ffres, or \ffdefres when it is 25), a drop-down its chosen \ffl entry, a
+    text field its result; the field's name is not text."""
+    box = (rb"{\field{\*\fldinst{ FORMCHECKBOX }{{\*\formfield{\fftype1\ffres%d\ffhps20{\*\ffname Check1}"
+           rb"\ffdefres%d}}}}{\fldrslt }}")
+    dd = (rb"{\field{\*\fldinst{ FORMDROPDOWN }{{\*\formfield{\fftype2\ffres%d\ffhaslistbox{\*\ffname D1}\ffdefres0"
+          rb"{\*\ffl DD-FIRST}{\*\ffl DD-SECOND}}}}}{\fldrslt }}")
+    text = rb"{\field{\*\fldinst{ FORMTEXT }{{\*\formfield{\fftype0{\*\ffname T1}}}}}{\fldrslt typed}}"
+    src = (rb"{\rtf1\ansi agree " + box % (1, 0) + box % (0, 1) + box % (25, 1) + rb"\par pick " + dd % 1
+           + rb" or " + dd % 9 + rb"\par " + text + rb"\par}")
+    assert md(src) == "agree ☒☐☒\n\npick DD-SECOND or\n\ntyped\n", md(src)
+
+
 def md_mem(data, hidden=False):
     """The markdown of RTF bytes read in memory (rtf.parse_bytes): nothing is written to disk."""
     ctx = Context()

@@ -70,7 +70,7 @@ from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Inserted, Li
 from . import cfb_route, doc_fib, doc_objects, doc_pictures, zip_route
 from ..text import decode_8bit
 from .hancom import flat, lone_equations
-from .word_fields import MAX_INSTR, MAX_NAME, comment_note, hyperlink_url, properties
+from .word_fields import MAX_FORM, MAX_INSTR, MAX_NAME, comment_note, form_data, hyperlink_url, properties
 
 _ZIP = b"PK\x03\x04"
 _RTF = b"{\\rtf"
@@ -160,10 +160,10 @@ class _Frame:
 
 class _Field:
     """An open field: its instruction so far, whether its result has begun, the index of the link frame it opened, the
-    ObjectPool id its separator names until the object is placed."""
+    ObjectPool id its separator names until the object is placed, what its form data shows (word_fields.form_data)."""
 
     def __init__(self):
-        self.instr, self.size, self.result, self.frame, self.obj = [], 0, False, None, None
+        self.instr, self.size, self.result, self.frame, self.obj, self.form = [], 0, False, None, None, ""
 
 
 class _Table:
@@ -332,13 +332,16 @@ class _Reader:
 
     def main_only(self):
         """A WordDocument without a table stream, as anydoc reads one: the bytes fcMin..fcMac (FibBase 0x18 and
-        0x1C) are the main story, 8-bit text in the code page of the document's language, decoded whole (a
-        double-byte code page too) and held as one UTF-16 piece after the stream's bytes. The FIB's entries point into
+        0x1C) are the main story: UTF-16 when a unit's high byte is zero (8-bit text holds no zero byte), else 8-bit
+        text in the code page of the document's language, decoded whole (a double-byte code page too); either way
+        held as one UTF-16 piece after the stream's bytes. The FIB's entries point into
         the missing table, so none is read. A range that is empty or outside the stream is damaged."""
         lo, hi = struct.unpack_from("<II", self.word, 0x18)
         if not lo < hi <= len(self.word):
             raise ReadError("damaged", "no table stream")
-        units = decode_8bit(self.word[lo:hi], self.lid).encode("utf-16-le")
+        raw = self.word[lo:hi]
+        wide = not len(raw) % 2 and 0 in raw[1::2]
+        units = raw if wide else decode_8bit(raw, self.lid).encode("utf-16-le")
         at = len(self.word) + len(self.word) % 2
         self.word = self.word + bytes(at - len(self.word)) + units
         self.pieces = [doc_fib.Piece(0, len(units) // 2, at, False, 0)]
@@ -984,16 +987,29 @@ class _Reader:
             self.objects.place(st, f.obj, None)
         if f.frame is not None:
             self.close_to(st, f.frame)
+        if f.form:
+            self.text(st, f.form)
+
+    def form(self, at) -> str:
+        """What the form field data at `at` in the Data stream shows: a NilPICFAndBinData, its FFData after the
+        header its cbHeader gives, read up to MAX_FORM bytes. "" when it is not there."""
+        data = self.data_stream()
+        if data is None or not 0 <= at <= len(data) - 6:
+            return ""
+        size, head = struct.unpack_from("<IH", data, at)
+        return form_data(data[at + head:at + min(size, MAX_FORM)])
 
     # ---- pictures (doc_pictures.py reads them)
     def picture(self, st, cp):
         """An inline picture: a \\x01 with fSpec, its PICF at its PicLocation in the Data stream (0, the CHP's
         default, without sprmCPicLocation). In the result of a field that names an object it is that object, the
         PICF its preview (none with fOle2, which Word sets when the \\x01 shares the separator's run); elsewhere a
-        \\x01 with fOle2 is the object its ObjLocation, else PicLocation, names. One in a field instruction (a form
-        field's data) is not shown, as text there is not; one in a header is not read (a header is a line of text, as
+        \\x01 with fOle2 is the object its ObjLocation, else PicLocation, names. One in a field instruction is a form
+        field's data (form), not a picture; one in a header is not read (a header is a line of text, as
         in the docx reader). An inline drawing object without a picture is no loss."""
         run = st.run
+        if run.special and st.codes == 1 and not st.over and st.fields and not st.fields[-1].result:
+            st.fields[-1].form = self.form(run.pic or 0)
         if not run.special or st.name in _HEADER_STORIES or not self.live(st):
             return
         f = st.fields[-1] if st.fields else None

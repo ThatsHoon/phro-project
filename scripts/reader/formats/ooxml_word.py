@@ -16,7 +16,8 @@ from . import omml, ooxml_base, rtf, smartart
 from .drawingml import Xf, arrows, glue, kid, kind, rule, xfrm
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
-from .word_fields import MAX_INSTR, MAX_NAME, MAX_URL, comment_note, hyperlink_url, properties, symbol, when
+from .word_fields import (MAX_INSTR, MAX_NAME, MAX_URL, comment_note, hyperlink_url, page_shell, properties, symbol,
+                          when)
 
 MAX_COLS = 1_000
 MAX_ALT = 200
@@ -28,7 +29,9 @@ _SKIP = frozenset({"pPr", "rPr", "sectPr", "tblPr", "trPr", "tcPr", "proofErr", 
 _PAGE_FIELD = re.compile(r"^\s*(?:PAGE|NUMPAGES|SECTIONPAGES)\b", re.I)
 _CORE = {"title": "title", "subject": "subject", "creator": "author", "lastModifiedBy": "last author",
          "created": "created", "modified": "modified", "keywords": "keywords"}
-_SHARED = ("image_bytes", "chart_cells", "smartart_nodes", "opened", "budget")
+_SHARED = ("image_bytes", "chart_cells", "smartart_nodes", "opened", "budget", "chunk_parts", "chunk_bytes")
+_HTML_ROOT = re.compile(rb"^\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--.*?-->\s*)*(?:<!doctype\s+html\b|<(?:\w+:)?html[\s>])",
+                        re.I | re.S)
 _PROPERTY_PARTS = ("/metadata/core-properties", "/extended-properties", "/custom-properties")
 
 
@@ -108,6 +111,8 @@ class _Reader:
     def __init__(self, pkg, part, ctx, chunk=0):
         self.pkg, self.part, self.ctx, self.chunk = pkg, part, ctx, chunk
         self.chunks = set()
+        self.chunk_parts = self.chunk_bytes = 0
+        self.paged = False
         self.doc = Doc()
         self.styles, self.numbering = Styles(), Numbering()
         self.scope = None
@@ -173,13 +178,13 @@ class _Reader:
             for name in self.related(suffix, kind):
                 root = self.open(name, kind)
                 if root is not None:
-                    self.diagrams = False
+                    self.diagrams, self.paged = False, False
                     try:
                         with self.ctx.guard(kind):
                             text = _flat(self.blocks(root, 0))
                     finally:
                         self.diagrams = True
-                    if text:
+                    if text and not (self.paged and page_shell(text)):
                         store.append(text)
         root = self.open(self.part, "document")
         body = next(iter(kids(root, "body")), None)
@@ -204,7 +209,7 @@ class _Reader:
             try:
                 got[kind] = ooxml_base.load(self.pkg, rel.target)[0]
             except ReadError as e:
-                if e.kind != "damaged":
+                if e.kind == "timeout":
                     raise
                 self.ctx.skipped["properties"] += 1
         pairs = []
@@ -289,17 +294,23 @@ class _Reader:
         """An imported part (w:altChunk, its aFChunk relationship) read by the reader's own parser for its kind, by
         its bytes, then its name: a Word package as a docx body (its counters shared with this one, so the document's
         budgets hold), RTF (its pictures charged to IMAGE_BYTES with this document's), HTML, plain text. Its note ids
-        are renamed (_renamed). A part is read once, so a package cannot read one part many times over; one read
-        again, one past ALT_CHUNK_DEPTH levels, missing, unreadable or of another kind is counted under chunk."""
+        are renamed (_renamed). A part is read once in its package, and every part the document reads, at any level,
+        is charged to ALT_CHUNKS and its size to ALT_CHUNK_BYTES before it is read; one read again, one past either
+        budget or past ALT_CHUNK_DEPTH levels, missing, unreadable or of another kind is counted under chunk and the
+        text around it goes on."""
         rel = self.scope.rels.get(rid or "")
         data = None
         if rel is not None and not rel.external and rel.type.endswith("/aFChunk") and self.pkg.has(rel.target) \
-                and rel.target not in self.chunks and self.chunk < limits.ALT_CHUNK_DEPTH:
+                and rel.target not in self.chunks and self.chunk < limits.ALT_CHUNK_DEPTH \
+                and self.chunk_parts < limits.ALT_CHUNKS \
+                and self.chunk_bytes + self.pkg.size(rel.target) <= limits.ALT_CHUNK_BYTES:
             self.chunks.add(rel.target)
+            self.chunk_parts += 1
+            self.chunk_bytes += self.pkg.size(rel.target)
             try:
                 data = self.pkg.read(rel.target)
             except ReadError as e:
-                if e.kind not in ("damaged", "too_large"):
+                if e.kind == "timeout":
                     raise
         if not data:
             self.ctx.skipped["chunk"] += 1
@@ -309,18 +320,27 @@ class _Reader:
         tag = f"chunk{self.chunk + 1}-{rid}"
         if data.startswith(b"PK\x03\x04"):
             from .ooxml import _main_part
-            with Package(data) as pkg:
-                sub = _Reader(pkg, _main_part(pkg), self.ctx, self.chunk + 1)
-                for k in _SHARED:
-                    setattr(sub, k, getattr(self, k))
-                doc = sub.run()
-                for k in _SHARED:
-                    setattr(self, k, getattr(sub, k))
+            try:
+                with Package(data) as pkg:
+                    sub = _Reader(pkg, _main_part(pkg), self.ctx, self.chunk + 1)
+                    for k in _SHARED:
+                        setattr(sub, k, getattr(self, k))
+                    try:
+                        doc = sub.run()
+                    finally:
+                        for k in _SHARED:
+                            setattr(self, k, getattr(sub, k))
+            except ReadError as e:
+                if e.kind == "timeout":
+                    raise
+                self.ctx.skipped["chunk"] += 1
+                return []
         elif head.startswith(b"{\\rtf"):
             spent = {"images": self.image_bytes}
             doc = rtf.parse_bytes(data, self.ctx, spent)
             self.image_bytes = spent["images"]
-        elif head.startswith((b"<!doctype", b"<html", b"<?xml")) or name.endswith((".htm", ".html", ".xhtml")):
+        elif _HTML_ROOT.match(data[:4096].lstrip(b"\xef\xbb\xbf")) or (
+                not head.startswith(b"<?xml") and name.endswith((".htm", ".html", ".xhtml"))):
             notes = {}
             blocks = xhtml.blocks(xhtml.tree(data), css=xhtml.Css([]), load=lambda _: None, notes=notes,
                                   ctx=self.ctx, part=tag)
@@ -448,6 +468,7 @@ class _Reader:
             f[4] = (st.frames[-1], len(st.frames[-1].inl))
             instr = "".join(f[0])
             url = hyperlink_url(instr)
+            self.paged = self.paged or bool(_PAGE_FIELD.match(instr))
             frame = _Frame("link", url) if url else _Frame("drop") if not self.diagrams and _PAGE_FIELD.match(instr) \
                 else None
             if frame is not None:
@@ -555,6 +576,7 @@ class _Reader:
             if url:
                 self.scoped(st, el, d, _Frame("link", url))
             elif not self.diagrams and _PAGE_FIELD.match(attr(el, "instr") or ""):
+                self.paged = True
                 return
             else:
                 for c in el:

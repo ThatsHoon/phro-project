@@ -781,7 +781,8 @@ def test_numbering_formats():
     """Every numFmt a contract uses shows as Word shows it, not as a decimal."""
     cases = (("decimalEnclosedParen", 1, "(1)"), ("decimalZero", 3, "03"), ("japaneseCounting", 11, "十一"),
              ("chineseCounting", 20, "二十"), ("aiueo", 2, "ｲ"), ("iroha", 3, "ﾊ"), ("ordinal", 2, "2nd"),
-             ("ordinal", 11, "11th"), ("cardinalText", 21, "Twenty-One"), ("ordinalText", 3, "Third"),
+             ("ordinal", 11, "11th"), ("cardinalText", 21, "Twenty-one"), ("ordinalText", 3, "Third"),
+             ("ordinalText", 21, "Twenty-first"), ("cardinalText", 120, "One hundred twenty"),
              ("koreanLegal", 2, "둘"), ("koreanCounting", 12, "십이"), ("ideographDigital", 10, "一〇"),
              ("decimalFullWidth", 7, "７"), ("hex", 255, "FF"), ("chicago", 6, "††"), ("russianLower", 2, "б"))
     for fmt, start, want in cases:
@@ -789,6 +790,32 @@ def test_numbering_formats():
               + '</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>')
         out = md(docm(P("x", num(0)), {"word/numbering.xml": nm}, NUM_REL))
         assert out == f"{want} x\n", (fmt, out)
+
+
+def test_numbering_formats_past_their_sets():
+    """A letter format past its set repeats the letter (z, aa, bb); Chinese counting says the leading one and the
+    skipped place; legal forms say the one; the digital Korean forms are positional."""
+    from reader.formats.ooxml_styles import _fmt
+    got = [_fmt(n, "lowerLetter") for n in (26, 27, 28, 53)]
+    assert got == ["z", "aa", "bb", "aaa"], got
+    assert _fmt(15, "ganada") == "가가" and _fmt(16, "ganada") == "나나" and _fmt(27, "upperLetter") == "AA"
+    assert _fmt(10 ** 9, "lowerLetter") == str(10 ** 9)
+    got = [_fmt(n, "chineseCounting") for n in (10, 11, 20, 100, 101, 110, 111, 1001, 1010)]
+    assert got == ["十", "十一", "二十", "一百", "一百零一", "一百一十", "一百一十一", "一千零一", "一千零一十"], got
+    assert _fmt(101, "taiwaneseCountingThousand") == "一百零一" and _fmt(110, "japaneseCounting") == "百十"
+    got = [_fmt(n, "chineseLegalSimplified") for n in (10, 100, 105)]
+    assert got == ["壹拾", "壹佰", "壹佰零伍"], got
+    assert _fmt(10, "ideographLegalTraditional") == "壹拾" and _fmt(10, "japaneseLegal") == "壱拾"
+    assert _fmt(10, "koreanDigital") == "일영" and _fmt(21, "koreanDigital") == "이일"
+    assert _fmt(10, "koreanDigital2") == "一零" and _fmt(12, "koreanCounting") == "십이"
+    assert _fmt(1, "ideographEnclosedCircle") == "㊀" and _fmt(10, "ideographEnclosedCircle") == "㊉"
+    assert _fmt(11, "ideographEnclosedCircle") == "11"
+    got = [_fmt(n, "hebrew1") for n in (1, 11, 15, 16, 21, 100, 499)]
+    assert got == ["א", "יא", "טו", "טז", "כא", "ק", "תצט"], got
+    got = [_fmt(n, "arabicAbjad") for n in (1, 2, 3, 28)]
+    assert got == ["أ", "ب", "ج", "غ"], got
+    got = [_fmt(n, "ideographZodiacTraditional") for n in (1, 2, 11, 60, 61)]
+    assert got == ["甲子", "乙丑", "甲戌", "癸亥", "甲子"], got
 
 
 def test_numbering_style_link_and_instances():
@@ -855,12 +882,20 @@ def test_ruby_is_base_then_reading():
 
 def test_symbol_characters():
     """w:sym through the Symbol and Wingdings tables, a code in either's private-use form the same; another font's
-    code as itself; a private-use code of an unknown font is counted."""
+    code as itself; a private-use code of an unknown font is counted, and so is any code of a symbol font without a
+    table (its letters are pictures, not that letter); Wingdings 2's check marks are known."""
     syms = ('<w:r><w:sym w:font="Wingdings" w:char="F0FC"/></w:r><w:r><w:sym w:font="Wingdings" w:char="A8"/></w:r>'
             '<w:r><w:sym w:font="Symbol" w:char="F061"/></w:r><w:r><w:sym w:font="Arial" w:char="263A"/></w:r>'
             '<w:r><w:sym w:font="Webdings" w:char="F021"/></w:r>')
     doc, ctx = parse(docm(f'<w:p><w:r><w:t>ok</w:t></w:r>{syms}</w:p>'))
     assert markdown.render(doc, tmp() / "a") == "ok✔◻α☺\n" and ctx.skipped["symbol"] == 1, ctx.skipped
+    syms = ('<w:r><w:sym w:font="Webdings" w:char="0061"/></w:r><w:r><w:sym w:font="Wingdings 3" w:char="007D"/></w:r>'
+            '<w:r><w:sym w:font="Wingdings 2" w:char="F052"/></w:r><w:r><w:sym w:font="Wingdings 2" w:char="A3"/></w:r>'
+            '<w:r><w:sym w:font="wingdings 2" w:char="F050"/></w:r><w:r><w:sym w:font="Wingdings 2" w:char="F054"/></w:r>'
+            '<w:r><w:sym w:font="MT Extra" w:char="0026"/></w:r><w:r><w:sym w:font="Marlett" w:char="0061"/></w:r>')
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>ok</w:t></w:r>{syms}</w:p>'))
+    assert markdown.render(doc, tmp() / "a") == "ok☑☐✓☒\n" and ctx.skipped["symbol"] == 4, \
+        (markdown.render(doc, tmp() / "a"), ctx.skipped)
 
 
 def test_vml_text_art_and_drawing_title():
@@ -918,6 +953,55 @@ def test_alt_chunk_depth_is_capped():
         (out, ctx.skipped)
 
 
+def test_alt_chunks_share_one_budget():
+    """Every imported part a document reads, at any level, is charged to ALT_CHUNKS and its bytes to ALT_CHUNK_BYTES
+    before it is read; past either the part is counted."""
+    leaf = docm(P("leaf")).read_bytes()
+    five = tuple((f"r{i}", "aFChunk", f"l{i}.docx", False) for i in range(5))
+    mid = docm(P("mid") + "".join(f'<w:altChunk r:id="r{i}"/>' for i in range(5)),
+               {f"word/l{i}.docx": leaf for i in range(5)}, five).read_bytes()
+    three = tuple((f"r{i}", "aFChunk", f"m{i}.docx", False) for i in range(3))
+    top = docm(P("top") + "".join(f'<w:altChunk r:id="r{i}"/>' for i in range(3)),
+               {f"word/m{i}.docx": mid for i in range(3)}, three)
+    old = limits.ALT_CHUNKS, limits.ALT_CHUNK_BYTES
+    try:
+        limits.ALT_CHUNKS = 6
+        doc, ctx = parse(top)
+        out = markdown.render(doc, tmp() / "a")
+        assert (out.count("mid"), out.count("leaf"), ctx.skipped["chunk"]) == (1, 5, 2), (out, ctx.skipped)
+        limits.ALT_CHUNKS, limits.ALT_CHUNK_BYTES = old[0], 40
+        text = docm(P("top") + '<w:altChunk r:id="rA"/><w:altChunk r:id="rB"/>',
+                    {"word/a.txt": b"SMALL", "word/b.txt": b"B" * 36},
+                    (("rA", "aFChunk", "a.txt", False), ("rB", "aFChunk", "b.txt", False)))
+        doc, ctx = parse(text)
+        out = markdown.render(doc, tmp() / "a")
+        assert out == "top\n\nSMALL\n" and ctx.skipped["chunk"] == 1, (out, ctx.skipped)
+    finally:
+        limits.ALT_CHUNKS, limits.ALT_CHUNK_BYTES = old
+
+
+def test_alt_chunk_of_another_kind_never_fails_the_document():
+    """A part that starts like a zip but is no Word package, one cut short, and an XML part that is not HTML are
+    counted; the body around them is read."""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("x.txt", "not a package")
+    flat = (b'<?xml version="1.0"?><pkg:package xmlns:pkg="http://schemas.microsoft.com/office/2006/xmlPackage">'
+            b'<pkg:part><pkg:binaryData>QUJDQUJDQUJD</pkg:binaryData></pkg:part></pkg:package>')
+    xhtml = b'<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>XHTML-CHUNK</p></body></html>'
+    body = (P("BEFORE") + '<w:altChunk r:id="rZ"/><w:altChunk r:id="rC"/><w:altChunk r:id="rF"/>'
+            '<w:altChunk r:id="rH"/>' + P("AFTER"))
+    parts = {"word/z.docx": buf.getvalue(), "word/c.docx": b"PK\x03\x04" + b"cut short",
+             "word/f.xml": flat, "word/h.xml": xhtml}
+    rels = (("rZ", "aFChunk", "z.docx", False), ("rC", "aFChunk", "c.docx", False),
+            ("rF", "aFChunk", "f.xml", False), ("rH", "aFChunk", "h.xml", False))
+    doc, ctx = parse(docm(body, parts, rels))
+    out = markdown.render(doc, tmp() / "a")
+    assert out == "BEFORE\n\nXHTML-CHUNK\n\nAFTER\n" and ctx.skipped["chunk"] == 3, (out, ctx.skipped)
+
+
 CORE = ('<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
         'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>Lease</dc:title><dc:subject>Unit 4</dc:subject>'
@@ -962,6 +1046,36 @@ def test_document_properties():
                           "modified: 2024-04-01 08:00; keywords: lease, rent\n\nbody"), out
 
 
+def test_oversized_properties_part_is_counted():
+    """A properties part the package refuses (too large for its compressed size) is counted; the body is read."""
+    root = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{OFFICE_RELS}/officeDocument" Target="word/document.xml"/>'
+            f'<Relationship Id="rId4" Type="{OFFICE_RELS}/custom-properties" Target="docProps/custom.xml"/>'
+            '</Relationships>')
+    big = CUSTOM.replace("</Properties>", " " * (3 * 2**20) + "</Properties>")
+    doc, ctx = parse(docm(P("body"), {"_rels/.rels": root, "docProps/custom.xml": big}))
+    assert markdown.render(doc, tmp() / "a") == "body\n" and ctx.skipped["properties"] == 1, ctx.skipped
+
+
+def test_properties_an_application_writes_are_left_out():
+    """Custom properties an application stamps on every file (build numbers, sensitivity labels, content type ids)
+    say nothing about the document: only the author's own stay."""
+    def prop(pid, name, value):
+        return (f'<property fmtid="{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}" pid="{pid}" name="{name}">'
+                f'<vt:lpwstr>{value}</vt:lpwstr></property>')
+    custom = (CUSTOM.split("<property")[0] + prop(2, "KSOProductBuildVer", "1033-12.9.0.21549")
+              + prop(3, "ICV", "4A566D024B714F96833A365606725056_12")
+              + prop(4, "MSIP_Label_f42aa342-8706-4288-bd11-ebb85995028c_Enabled", "true")
+              + prop(5, "ContentTypeId", "0x0101009A1B") + prop(6, "Client", "Hanbit")
+              + prop(7, "_dlc_DocIdItemGuid", "7a1c") + "</Properties>")
+    root = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{OFFICE_RELS}/officeDocument" Target="word/document.xml"/>'
+            f'<Relationship Id="rId4" Type="{OFFICE_RELS}/custom-properties" Target="docProps/custom.xml"/>'
+            '</Relationships>')
+    out = md(docm(P("body"), {"_rels/.rels": root, "docProps/custom.xml": custom}))
+    assert out == "Properties: Client: Hanbit\n\nbody\n", out
+
+
 def test_page_fields_dropped_in_headers():
     """A header's PAGE, NUMPAGES or SECTIONPAGES result is left out, in a complex field or a simple one; in the body it
     stays."""
@@ -971,6 +1085,15 @@ def test_page_fields_dropped_in_headers():
     out = md(docm(f'<w:p><w:r><w:t xml:space="preserve">page </w:t></w:r>{fld("PAGE", "3")}</w:p>',
                   {"word/header1.xml": hd}, (("rH", "header", "header1.xml", False),)))
     assert out == "Header: HEADER-TEXT of\n\npage 3\n", out
+    for shell in ("Page {} of {}", "- {} -", "{} / {}", "{}쪽", "페이지 {}"):
+        a, _, b = shell.partition("{}")
+        b, _, c = b.partition("{}")
+        hd = ('<w:hdr {NS}><w:p><w:r><w:t xml:space="preserve">' + a + '</w:t></w:r>' + fld("PAGE", "1")
+              + '<w:r><w:t xml:space="preserve">' + b + '</w:t></w:r>'
+              + ('<w:fldSimple w:instr=" NUMPAGES "><w:r><w:t>9</w:t></w:r></w:fldSimple>' if "{}" in shell[len(a) + 2:]
+                 else "") + '<w:r><w:t xml:space="preserve">' + c + '</w:t></w:r></w:p></w:hdr>')
+        out = md(docm(P("body"), {"word/header1.xml": hd}, (("rH", "header", "header1.xml", False),)))
+        assert out == "body\n", (shell, out)
 
 
 def main():

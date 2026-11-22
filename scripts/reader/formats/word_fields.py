@@ -2,6 +2,7 @@
 target, the note a comment becomes, a symbol font's characters and the properties line every Word format fills
 (Doc.meta["properties"], which markdown renders as one line at the top)."""
 import re
+import struct
 
 from ..model import Para, Text
 from ..text import SYMBOL
@@ -43,21 +44,86 @@ WINGDINGS = dict(zip(range(0x20, 0x100), (
     "🡪🡩🡫🡬🡭🡯🡮🡸🡺🡹🡻🡼🡽🡿🡾⇦⇨⇧⇩⬄⇳⬀⬁⬃⬂🢬🢭🗶✔🗷🗹"
 )))
 WINGDINGS.pop(0x7F)
+WINGDINGS2 = {0x4F: "✗", 0x50: "✓", 0x51: "☒", 0x52: "☑", 0x53: "☒", 0x54: "☒", 0xA3: "☐"}
+_PICTURE_FONTS = frozenset(("webdings", "wingdings 2", "wingdings 3", "mt extra", "marlett", "bookshelf symbol 7",
+                            "zapfdingbats", "zapf dingbats", "monotype sorts", "ms outlook", "ms reference specialty"))
+_APP_PROPERTY = re.compile(r"^(?:KSOProductBuildVer|ICV|ContentTypeId|MSIP_Label_|_dlc_|_MarkAsFinal$|"
+                           r"MediaServiceImageTags$|GrammarlyDocumentId$|_NewReviewCycle$|TaxCatchAll)", re.I)
+_PAGE_SHELL = re.compile(r"(?:pages?|of|쪽|페이지|면|[\W_])*", re.I)
+
+
+def page_shell(text: str) -> bool:
+    """Whether a header or footer line whose page numbers were dropped holds only their wording ("Page of",
+    "- -", "/"), which says nothing without them."""
+    return _PAGE_SHELL.fullmatch(text) is not None
 
 
 def symbol(font: str, code: int) -> str | None:
     """The character a symbol font's code shows: Symbol through the Adobe Symbol table, Wingdings through WINGDINGS,
-    a code in either's private-use form (U+F020-U+F0FF) the same; any other font's code as itself when it is not a
-    private-use one. None when nothing is known."""
+    Wingdings 2's check marks through WINGDINGS2, a code in their private-use form (U+F020-U+F0FF) the same; a font
+    whose letters are pictures (_PICTURE_FONTS) has no other character; any other font's code as itself when it is
+    not a private-use one. None when nothing is known."""
     face = (font or "").strip().lower()
     low = code - 0xF000 if 0xF020 <= code <= 0xF0FF else code
     if face == "symbol":
         return SYMBOL.get(low)
     if face == "wingdings":
         return WINGDINGS.get(low)
+    if face == "wingdings 2":
+        return WINGDINGS2.get(low)
+    if face in _PICTURE_FONTS:
+        return None
     if 0 < code < 0x110000 and not 0xE000 <= code <= 0xF8FF and not 0xD800 <= code <= 0xDFFF:
         return chr(code)
     return None
+
+
+MAX_FORM, MAX_ENTRIES = 2**16, 256  # bytes read of a form field's data, and entries kept of a drop-down
+FORM_DEFAULT = 25  # a form field's result when it shows its default
+
+
+def form_state(kind: int, result: int, default: int, entries) -> str:
+    """What a legacy form field shows beside its result: ☒ or ☐ for a check box (kind 1), a drop-down's (kind 2)
+    chosen entry, "" for a text field; a result of FORM_DEFAULT stands for the default."""
+    pick = default if result == FORM_DEFAULT else result
+    if kind == 1:
+        return "☒" if pick else "☐"
+    return entries[pick] if kind == 2 and 0 <= pick < len(entries) else ""
+
+
+def form_data(ff: bytes) -> str:
+    """form_state of a .doc form field's FFData (MS-DOC 2.9.78): its kind and result in the bits after the version,
+    the default after the name, a drop-down's entries in the string table that ends it. "" for data cut short."""
+    try:
+        version, bits = struct.unpack_from("<IH", ff, 0)
+        if version != 0xFFFFFFFF:
+            return ""
+        kind, at = bits & 3, 10
+
+        def xstz(at):
+            return at + 4 + 2 * struct.unpack_from("<H", ff, at)[0]
+        at = xstz(at)
+        default = 0
+        if kind == 0:
+            at = xstz(at)
+        else:
+            default = struct.unpack_from("<H", ff, at)[0]
+            at += 2
+        for _ in range(5):
+            at = xstz(at)
+        entries = []
+        if kind == 2:
+            mark, count = struct.unpack_from("<HH", ff, at)
+            at += 6
+            for _ in range(min(count, MAX_ENTRIES) if mark == 0xFFFF else 0):
+                n = struct.unpack_from("<H", ff, at)[0]
+                if at + 2 + 2 * n > len(ff):
+                    return ""
+                entries.append(ff[at + 2:at + 2 + 2 * n].decode("utf-16-le", "replace")[:MAX_NAME])
+                at += 2 + 2 * n
+        return form_state(kind, bits >> 2 & 0x1F, default, entries)
+    except struct.error:
+        return ""
 
 
 def when(value: str) -> str:
@@ -68,13 +134,14 @@ def when(value: str) -> str:
 
 def properties(pairs) -> list:
     """The (label, value) pairs of a document's properties line (markdown renders it): values squashed to one line
-    and cut to MAX_PROPERTY, empty ones, repeats of a label and a last author who is the author left out; the
+    and cut to MAX_PROPERTY, empty ones, repeats of a label, a last author who is the author and the properties an
+    application stamps on every file (_APP_PROPERTY: build numbers, sensitivity labels, content type ids) left out; the
     labels of _ORDER first in that order, then the others (custom properties) as they came; at most MAX_PROPERTIES."""
     out, seen = [], {}
     for label, value in pairs:
         value = " ".join(str(value or "").split())[:MAX_PROPERTY]
         label = " ".join(str(label or "").split())[:MAX_NAME]
-        if value and label and label not in seen:
+        if value and label and label not in seen and not _APP_PROPERTY.match(label):
             seen[label] = value
             out.append((label, value))
     if seen.get("last author") == seen.get("author"):

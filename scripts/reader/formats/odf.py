@@ -88,11 +88,11 @@ def _text(pkg, ctx, content, styles_root) -> Doc:
 def _meta(pkg, ctx, doc):
     """meta.xml's dc:title as Doc.title; its subject, initial creator (the author), dc:creator (the last author),
     creation and save dates, keywords and user-defined fields as Doc.meta["properties"]. The generator, statistics and
-    editing figures are left out. A damaged meta.xml is counted under properties."""
+    editing figures are left out. A meta.xml that cannot be read is counted under properties."""
     try:
         root = pkg.xml("meta.xml")
     except ReadError as e:
-        if e.kind != "damaged":
+        if e.kind == "timeout":
             raise
         ctx.skipped["properties"] += 1
         return
