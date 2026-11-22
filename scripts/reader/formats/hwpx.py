@@ -14,11 +14,12 @@ from .. import diagram, limits
 from ..charts import chart_table
 from ..containers.zipx import Package, attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
-from ..model import Bold, Break, Cell, Doc, Image, Math, NoteRef, Table, Text
+from ..model import Bold, Break, Cell, Doc, Image, NoteRef, Para, Table, Text
 from .hancom import (
-    Frame, Obj, Scopes, State, alt_text, comment_note, cut_command, diagrams, flat, heading_level, lone_equations,
-    next_marker, outline_marker, paragraph, place, plain, style_name_level, tex as _tex,
+    Frame, Obj, Scopes, State, alt_text, cut_command, diagrams, flat, heading_level, lone_equations, next_marker,
+    outline_marker, paragraph, place, plain, style_name_level,
 )
+from .word_fields import comment_note
 
 HPF = "Contents/content.hpf"
 _MIME = "application/hwp+zip"
@@ -29,7 +30,9 @@ _OBJECTS = frozenset(("rect", "ellipse", "arc", "polygon", "curve", "line", "con
 _EDGES = ("connectLine", "line")
 _PAGE = ("PAPER", "PAGE")
 _ARROWS = {"_NOARROW": (False, False), "_ONEWAY": (False, True), "_BOTH": (True, True)}  # connectLine@type endings
-_CAPTIONED = _OBJECTS | {"equation", "chart"}
+_CAPTIONED = _OBJECTS | {"equation", "chart", "ole"}
+_BUTTONS = ("checkBtn", "radioBtn")
+_LISTS = ("comboBox", "listBox")
 
 
 def _pick(sw):
@@ -333,11 +336,17 @@ class _Reader(Scopes):
             t = Text(s)
             self.add(st, Bold([t]) if st.bold else t)
 
-    def field_begin(self, el, st):
+    def field_begin(self, el, st, d):
+        """A field begin. A memo's sub-list is a comment note by its Author, marked after the text up to its end."""
         kind = (attr(el, "type") or "").upper()
         fid = attr(el, "id")
-        if kind == "HYPERLINK":
-            params = {attr(p, "name"): (p.text or "") for p in el.iter() if local(p.tag) == "stringParam"}
+        params = {attr(p, "name"): (p.text or "") for p in el.iter() if local(p.tag) == "stringParam"}
+        if kind == "MEMO":
+            self.counts["cm"] += 1
+            nid = f"cm-{self.counts['cm']}"
+            self.doc.notes[nid] = comment_note(self.sub(el, d), (params.get("Author") or "").strip())
+            self.memo(st, fid, nid)
+        elif kind == "HYPERLINK":
             url = cut_command(params["Command"]) if params.get("Command") else (params.get("Path") or "").strip()
             self.open_field(st, fid, url)
         else:
@@ -372,7 +381,7 @@ class _Reader(Scopes):
         elif n in ("fwSpace", "nbSpace"):
             self.text(" ", st)
         elif n == "fieldBegin":
-            self.field_begin(el, st)
+            self.field_begin(el, st, d)
         elif n == "fieldEnd":
             self.close_field(st, attr(el, "beginIDRef"))
         elif n == "deleteBegin":
@@ -393,11 +402,22 @@ class _Reader(Scopes):
             self.chart(el, st)
         elif n == "equation":
             s = first(el, "script")
-            tex = _tex(s.text or "") if s is not None else ""
-            if tex:
-                m = Math(tex)
-                st.eqs.append(m)
-                self.add(st, m)
+            self.formula(st, (s.text or "") if s is not None else "")
+        elif n == "dutmal":
+            self.ruby(el, st)
+        elif n == "textart":
+            self.art(el, st)
+        elif n in _BUTTONS:
+            box = "☑" if (attr(el, "value") or "").upper() == "CHECKED" else "☐"
+            self.text(f"{box} {attr(el, 'captionText') or ''}".rstrip(), st)
+        elif n in _LISTS:
+            self.choice(el, st)
+        elif n == "edit":
+            t = first(el, "text")
+            self.text(t.text if t is not None else "", st)
+        elif n == "ole":
+            if not self.margins:
+                self.ctx.skipped["object"] += 1
         elif n in ("footNote", "endNote"):
             key = "fn" if n == "footNote" else "en"
             self.counts[key] += 1
@@ -407,7 +427,7 @@ class _Reader(Scopes):
         elif n == "hiddenComment":
             self.counts["cm"] += 1
             nid = f"cm-{self.counts['cm']}"
-            self.doc.notes[nid] = comment_note(self.sub(el, d))
+            self.doc.notes[nid] = comment_note(self.sub(el, d), "")
             self.add(st, NoteRef(nid))
         elif n in ("header", "footer"):  # a line of text, as in doc and hwp: pictures and charts are skipped unread
             outer, self.margins = self.margins, True
@@ -427,6 +447,23 @@ class _Reader(Scopes):
         if n in _CAPTIONED:
             self.caption(el, st, d)
 
+    def ruby(self, el, st):
+        """Ruby (덧말): the base text, then the ruby text in parentheses."""
+        base, ruby = (("" if (t := first(el, k)) is None else (t.text or "").strip()) for k in ("mainText", "subText"))
+        self.text(f"{base}({ruby})" if base and ruby else base or ruby, st)
+
+    def art(self, el, st):
+        """Text art (글맵시): its text, as a paragraph after the one it sits in."""
+        t = (attr(el, "text") or "").strip()
+        if t:
+            st.extras.append(Para([Text(t)]))
+
+    def choice(self, el, st):
+        """A combo or list box: the shown text of the item its selectedValue names, else that value."""
+        v = attr(el, "selectedValue") or ""
+        item = next((i for i in kids(el, "listItem") if attr(i, "value") == v), None)
+        self.text((attr(item, "displayText") if item is not None else None) or v, st)
+
     def caption(self, el, st, d):
         """An object's caption lists, as paragraphs after what the object reads as (hwp places them so)."""
         for c in kids(el, "caption"):
@@ -440,6 +477,8 @@ class _Reader(Scopes):
         if n == "pic":
             self.picture(el, st)
         else:
+            if n == "textart":
+                self.art(el, st)
             self.grouped = n == "container"
             try:
                 for c in el:

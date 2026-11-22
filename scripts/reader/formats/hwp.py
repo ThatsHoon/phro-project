@@ -26,18 +26,19 @@ from ..containers import flate
 from ..containers.cfb import Compound, is_cfb
 from ..images import sniff
 from ..limits import ReadError
-from ..model import Bold, Break, Cell, Doc, Equation, Image, Math, NoteRef, Table, Text
+from ..model import Bold, Break, Cell, Doc, Image, NoteRef, Table, Text
 from . import hwpx, sheet_grid
 from .hancom import (
-    Frame, Obj, Scopes, State, alt_text, comment_note, cut_command, diagrams, flat, heading_level, lone_equations,
-    next_marker, outline_marker, paragraph, place, plain, style_name_level, tex as _tex,
+    Frame, Obj, Scopes, State, alt_text, cut_command, diagrams, flat, heading_level, lone_equations, next_marker,
+    outline_marker, paragraph, place, plain, style_name_level,
 )
 from .hwp_chart import ole_table
 from .hwp_records import (
-    CTRL_HEADER, EQEDIT, LIST_HEADER, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT, SHAPE_COMPONENT,
-    SHAPE_LINE, SHAPE_OLE, SHAPE_PICTURE, TABLE, DocInfo, ParaShape, doc_info, file_header, first_tag, records,
-    view_text,
+    CTRL_HEADER, EQEDIT, LIST_HEADER, MEMO_LIST, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT,
+    SHAPE_COMPONENT, SHAPE_LINE, SHAPE_OLE, SHAPE_PICTURE, TABLE, TEXTART, DocInfo, ParaShape, doc_info, file_header,
+    first_tag, records, view_text,
 )
+from .word_fields import comment_note
 
 _ZIP = b"PK\x03\x04"
 _V3 = b"HWP Document File V3"
@@ -215,13 +216,13 @@ class _Reader(Scopes):
         b"secd": "section_def", b"cold": "skip", b"pgnp": "skip", b"atno": "skip", b"nwno": "skip",
         b"bokm": "skip", b"head": "header", b"foot": "footer", b"fn  ": "note", b"en  ": "note",
         b"tcmt": "comment", b"eqed": "equation", b"%hlk": "field", b"%clk": "field",
-        b"tbl ": "table", b"gso ": "drawing",
+        b"tbl ": "table", b"gso ": "drawing", b"tdut": "ruby", b"form": "form",
     }
     # a SHAPE_COMPONENT's child record tag -> handler (recs, j, st, d, g, alt) -> the index after what it read; g is
     # the component's group depth (1 for the drawing object itself) and alt the shape comment its picture takes
     SHAPES: dict[int, str] = {
         SHAPE_COMPONENT: "member", SHAPE_PICTURE: "picture", SHAPE_OLE: "ole", LIST_HEADER: "text_box",
-        PARA_HEADER: "text_box",
+        PARA_HEADER: "text_box", TEXTART: "art",
     }
 
     def __init__(self, cf, ctx):
@@ -234,7 +235,7 @@ class _Reader(Scopes):
         self.numbers = {}   # numbering id -> {level: counter}
         self.outline = 0    # the outline numbering id of the current section's secd
         self.blobs = {}     # (BinData stream name, inflated?, kind) -> its bytes, or None when it cannot be read
-        self.tables = {}    # an OLE item's bytes -> (its chart table or None, the table's cells)
+        self.tables = {}    # an OLE item's bytes -> (its chart table or None, its cells, the kind it was counted under)
         self.opened = 0     # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
         self.chart_cells = 0  # chart table cells placed so far, copies counted (CHART_TOTAL)
@@ -400,6 +401,9 @@ class _Reader(Scopes):
         while j < end:
             if recs[j].tag == PARA_HEADER:
                 out.extend(self.para(recs, j, d, nohead))
+                j = self.end(recs, j)
+            elif recs[j].tag == MEMO_LIST:
+                self.ctx.skipped["annotation"] += 1
                 j = self.end(recs, j)
             else:
                 j += 1
@@ -645,7 +649,7 @@ class _Reader(Scopes):
     def comment(self, recs, i, st, d):
         self.counts["cm"] += 1
         nid = f"cm-{self.counts['cm']}"
-        self.doc.notes[nid] = comment_note(self.sub(recs, i, d))
+        self.doc.notes[nid] = comment_note(self.sub(recs, i, d), "")
         self.add(st, NoteRef(nid))
         return self.end(recs, i)
 
@@ -655,15 +659,26 @@ class _Reader(Scopes):
         inline = len(data) >= 8 and struct.unpack_from("<I", data, 4)[0] & 1  # common attr bit 0: like a character
         for j in range(i + 1, end):
             if recs[j].tag == EQEDIT:
-                t = _tex(_wstr(recs[j].data, 4).replace("\0", ""))  # attr u32, then the script
-                if t and inline:
-                    m = Math(t)
-                    st.eqs.append(m)
-                    self.add(st, m)
-                elif t:
-                    st.extras.append(Equation(t, True))
+                self.formula(st, _wstr(recs[j].data, 4).replace("\0", ""), inline)  # attr u32, then the script
                 break
         return end
+
+    def ruby(self, recs, i, st, d):
+        """Ruby (덧말, tdut): after the id, the base text and the ruby text as two WCHAR arrays, written base(ruby);
+        a record too short to hold both counts under record."""
+        data = recs[i].data
+        k = 6 + 2 * struct.unpack_from("<H", data, 4)[0] if len(data) >= 6 else len(data)
+        if k + 2 > len(data) or k + 2 + 2 * struct.unpack_from("<H", data, k)[0] > len(data):
+            self.ctx.skipped["record"] += 1
+            return self.end(recs, i)
+        base, ruby = _wstr(data, 4).strip(), _wstr(data, k).strip()
+        self.text(f"{base}({ruby})" if base and ruby else base or ruby, st, False)
+        return self.end(recs, i)
+
+    def form(self, recs, i, st, d):
+        """A form object: its FORM_OBJECT record's layout is not established, so it is counted under field."""
+        self.ctx.skipped["field"] += 1
+        return self.end(recs, i)
 
     def field(self, recs, i, st, d):
         """A field begin: the text up to its field end is a link, dropped (an unfilled %clk) or kept."""
@@ -780,6 +795,11 @@ class _Reader(Scopes):
         st.extras.extend(self.apart(recs, j, k, d + 1, st.nohead))
         return k
 
+    def art(self, recs, j, st, d, g, alt):
+        """TEXTART: its record's layout is not established, so the text art is counted under shape."""
+        self.ctx.skipped["shape"] += 1
+        return self.end(recs, j)
+
     def picture(self, recs, j, st, d, g, alt):
         """SHAPE_PICTURE: the BinData item at offset 71. Every placement is charged against IMAGE_BYTES, as in the Word
         readers; one past it is counted under image instead. In a header or footer it is skipped (margin)."""
@@ -800,7 +820,8 @@ class _Reader(Scopes):
         """SHAPE_OLE: the BinData item at offset 12, an OLE object. The chart in it (hwp_chart.ole_table) is a table
         where a picture would be; an item two shapes name is read once, but every placement is charged against
         CHART_TOTAL, as in the Word and slide readers, and one past it is counted under chart instead. In a header or
-        footer it is skipped (margin)."""
+        footer it is skipped (margin). An item that is not read is counted at every placement, under the kind its
+        first read counted it as."""
         if self.margins:
             return self.end(recs, j)
         data = recs[j].data
@@ -812,9 +833,14 @@ class _Reader(Scopes):
                 if self.objects > MAX_OBJECTS:  # past the cap: counted under object, not read
                     self.ctx.skipped["object"] += 1
                     return self.end(recs, j)
+                before = self.ctx.skipped["object"], self.ctx.skipped["chart"]
                 tbl = ole_table(item, self.ctx, sheets=self.sheets)
-                self.tables[item] = tbl, sum(len(r) for r in tbl.rows) if tbl is not None else 0
-            tbl, cells = self.tables[item]
+                lost = ("object" if self.ctx.skipped["object"] > before[0] else
+                        "chart" if self.ctx.skipped["chart"] > before[1] else None)
+                self.tables[item] = tbl, sum(len(r) for r in tbl.rows) if tbl is not None else 0, lost
+            elif self.tables[item][2]:
+                self.ctx.skipped[self.tables[item][2]] += 1
+            tbl, cells, _ = self.tables[item]
             if tbl is not None:
                 self.chart_cells += cells
                 if self.chart_cells > limits.CHART_TOTAL:

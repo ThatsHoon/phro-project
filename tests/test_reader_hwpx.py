@@ -421,24 +421,84 @@ def test_equation():
     assert "값 $\\frac{a}{b}$" in md(hwpx_doc('<hp:p><hp:run><hp:t>값 </hp:t><hp:equation><hp:script>a over b</hp:script></hp:equation></hp:run></hp:p>'))
 
 
-def test_equation_script_to_tex():
-    tex = hwpx._tex
-    assert tex("a over b") == r"\frac{a}{b}"
-    assert tex("{a+b} over {c}") == r"\frac{a+b}{c}"
-    assert tex("sqrt x") == r"\sqrt{x}"
-    assert tex("sqrt {x+1}") == r"\sqrt{x+1}"
-    assert tex("x^2 + y_1") == "x^2 + y_1"
-    assert tex("a times b le c ge d") == r"a \times b \le c \ge d"
-    assert tex("alpha + Omega + omega") == r"\alpha + \Omega + \omega"
-    assert tex("foo bar") == "foo bar"
-    assert tex("{" * 500 + "a" + "}" * 500)  # deep groups do not recurse forever
-
-
 def test_text_box():
     sec = ('<hp:p><hp:run><hp:rect><hp:drawText><hp:subList>' + P("상자 글") + '</hp:subList></hp:drawText></hp:rect>'
            '<hp:t>밖</hp:t></hp:run></hp:p>')
     out = md(hwpx_doc(sec))
     assert "상자 글" in out and "밖" in out
+
+
+# ---- inline objects
+def test_ruby_keeps_base_and_ruby_text():
+    ruby = ('<hp:dutmal posType="TOP" szRatio="0" option="0" styleIDRef="0" align="CENTER"><hp:mainText>%s</hp:mainText>'
+            '<hp:subText>%s</hp:subText></hp:dutmal>')
+    sec = '<hp:p><hp:run><hp:t>앞 </hp:t>' + ruby % ("漢字", "한자") + '<hp:t> 뒤</hp:t></hp:run></hp:p>'
+    assert md(hwpx_doc(sec)) == "앞 漢字(한자) 뒤\n"
+    sec = '<hp:p><hp:run charPrIDRef="1">' + ruby % ("본말", "") + '</hp:run></hp:p>'
+    assert md(hwpx_doc(sec, '<hh:charPr id="1"><hh:bold/></hh:charPr>')) == "**본말**\n"
+
+
+def _memo(fid, body, author=None):
+    who = f'<hp:stringParam name="Author">{author}</hp:stringParam>' if author else ""
+    return (f'<hp:ctrl><hp:fieldBegin id="{fid}" type="MEMO" editable="1" dirty="1"><hp:parameters>{who}'
+            f'<hp:integerParam name="Number">1</hp:integerParam></hp:parameters><hp:subList>{body}</hp:subList>'
+            '</hp:fieldBegin></hp:ctrl>')
+
+
+def test_memo_becomes_a_comment():
+    # a memo field's sub-list is a comment note by its author, marked after the text the memo is anchored to
+    sec = ('<hp:p><hp:run><hp:t>대상 </hp:t>' + _memo(77, P("확인 바람"), "김검토") + '<hp:t>앵커 문구</hp:t>' + _fend(77)
+           + '<hp:t> 끝</hp:t></hp:run></hp:p>')
+    doc, _ = parse(hwpx_doc(sec))
+    assert list(doc.notes) == ["cm-1"]
+    assert md(hwpx_doc(sec)) == "대상 앵커 문구[^1] 끝\n\n[^1]: Comment by 김검토: 확인 바람\n"
+    # no author; a memo whose end is missing is marked at its paragraph's end; memos and hidden comments share cm-N
+    sec = ('<hp:p><hp:run><hp:ctrl><hp:hiddenComment><hp:subList>' + P("숨은") + '</hp:subList></hp:hiddenComment>'
+           '</hp:ctrl><hp:t>가</hp:t>' + _memo(5, P("메모 둘")) + '<hp:t>나</hp:t></hp:run></hp:p>')
+    doc, _ = parse(hwpx_doc(sec))
+    assert list(doc.notes) == ["cm-1", "cm-2"]
+    assert md(hwpx_doc(sec)) == "[^1]가나[^2]\n\n[^1]: Comment: 숨은\n[^2]: Comment: 메모 둘\n"
+
+
+def test_text_art_gives_its_text():
+    art = '<hp:textart id="5" text="%s"><hp:sz width="1000" height="1000"/><hp:textartPr fontName="굴림"/></hp:textart>'
+    sec = '<hp:p><hp:run><hp:t>앞</hp:t>' + art % "글맵시 문구" + '</hp:run></hp:p>'
+    assert md(hwpx_doc(sec)) == "앞\n\n글맵시 문구\n"
+    # in a section read as a diagram it is a shape that holds its text
+    sec = R(obj("rect", 1, "상자"), obj("textart", 2, attrs=' text="표어"'), conn(9, 1, 2))
+    out = md(hwpx_doc(sec))
+    assert "표어" in out and "상자" in out, out
+
+
+def test_form_objects_give_their_value():
+    sec = ('<hp:p><hp:run><hp:t>동의 </hp:t><hp:checkBtn captionText="동의함" value="CHECKED" name="c1"/><hp:t>, </hp:t>'
+           '<hp:checkBtn captionText="거부" value="UNCHECKED"/><hp:t>, </hp:t><hp:radioBtn captionText="남" value="CHECKED"/>'
+           '<hp:t> 지역 </hp:t><hp:comboBox name="cb" selectedValue="SEOUL"><hp:listItem displayText="부산" value="BUSAN"/>'
+           '<hp:listItem displayText="서울" value="SEOUL"/></hp:comboBox><hp:t> 이름 </hp:t><hp:edit name="e1">'
+           '<hp:text>홍길동</hp:text></hp:edit><hp:t> 목록 </hp:t><hp:listBox selectedValue="기타"/>'
+           '<hp:btn captionText="제출"/></hp:run></hp:p>')
+    assert md(hwpx_doc(sec)) == "동의 ☑ 동의함, ☐ 거부, ☑ 남 지역 서울 이름 홍길동 목록 기타\n"
+
+
+def test_ole_object_counted():
+    items = '<opf:item id="ole1" href="BinData/ole1.ole" media-type="application/ole"/>'
+    sec = ('<hp:p><hp:run><hp:t>앞</hp:t><hp:ole id="11" objectType="EMBEDDED" binaryItemIDRef="ole1">'
+           '<hp:sz width="100" height="100"/></hp:ole><hp:t>뒤</hp:t></hp:run></hp:p>')
+    p = hwpx_doc(sec, hpf_items=items, extra={"BinData/ole1.ole": b"\xd0\xcf\x11\xe0" + bytes(60)})
+    doc, ctx = parse(p)
+    assert ctx.skipped["object"] == 1, ctx.skipped
+    assert markdown.render(doc, tmp() / "a", False, ctx.skipped) == "(could not read: 1 embedded object)\n\n앞뒤\n"
+
+
+def test_equation_never_wrong_tex():
+    eq = '<hp:p><hp:run><hp:t>식 </hp:t><hp:equation><hp:script>%s</hp:script></hp:equation></hp:run></hp:p>'
+    assert md(hwpx_doc(eq % "x_i over n")) == "식 $\\frac{x_i}{n}$\n"
+    assert md(hwpx_doc(eq % "rm{kg} cdot m")) == "식 `rm{kg} cdot m`\n"
+    assert md(hwpx_doc(eq % "a`b")) == "식 $a\\,b$\n"
+    assert md(hwpx_doc(eq % "a`b over c over d")) == "식 ``a`b over c over d``\n"
+    lone = '<hp:p><hp:run><hp:equation><hp:script>%s</hp:script></hp:equation></hp:run></hp:p>'
+    assert md(hwpx_doc(lone % "sum from{i=1} to {n} x_i")) == "$$\\sum_{i=1}^n x_i$$\n"
+    assert md(hwpx_doc(lone % "a over b over c")) == "`a over b over c`\n"
 
 
 # ---- connect lines as diagrams

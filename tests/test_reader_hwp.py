@@ -325,6 +325,37 @@ def test_equation():
     assert md(hwp_file(hwp_para(FFFC, controls=(eqed("a over b", 1),)))) == f"$${tex}$$\n"
 
 
+def test_equation_never_wrong_tex():
+    assert md(hwp_file(hwp_para("식 " + FFFC, controls=(eqed("x_i over n", 1),)))) == "식 $\\frac{x_i}{n}$\n"
+    assert md(hwp_file(hwp_para("식 " + FFFC, controls=(eqed("a over b over c", 1),)))) == "식 `a over b over c`\n"
+    assert md(hwp_file(hwp_para("본문" + FFFC, controls=(eqed("rm{kg} cdot m"),)))) == "본문\n\n`rm{kg} cdot m`\n"
+
+
+# ---- inline objects
+def tdut(base, ruby):
+    return 23, b"tdut" + wstr(base) + wstr(ruby) + bytes(18), b""
+
+
+def test_ruby_keeps_base_and_ruby_text():
+    assert md(hwp_file(hwp_para("앞 " + FFFC + " 뒤", controls=(tdut("漢字", "한자"),)))) == "앞 漢字(한자) 뒤\n"
+    assert md(hwp_file(hwp_para(FFFC, controls=(tdut("본말", ""),)))) == "본말\n"
+    # a record cut inside its ruby text is a damaged record, not a guess
+    cut = (23, b"tdut" + wstr("漢字") + u16(5) + "한".encode("utf-16-le"), b"")
+    assert md(hwp_file(hwp_para("앞" + FFFC, controls=(cut,)))) == "(could not read: 1 damaged record)\n\n앞\n"
+
+
+def test_memo_form_and_text_art_counted():
+    # their record layouts are not established: each is counted, never guessed; a memo's anchor text stays
+    memo = hwp_para("대상 " + FFFC + "앵커" + FFFC + " 끝", controls=((3, field(b"%%me"), b""), (4, b"%%me", b"")))
+    memos = hwp_record(hr.MEMO_LIST, 0, u32(1)) + sub_list(hwp_para("메모 내용", level=2), level=1)
+    assert md(hwp_file(memo + memos)) == "(could not read: 1 annotation)\n\n대상 앵커 끝\n"
+    form = (11, b"form", hwp_record(91, 2, bytes(20)))
+    assert md(hwp_file(hwp_para("동의 " + FFFC + "끝", controls=(form,)))) == "(could not read: 1 form field)\n\n동의 끝\n"
+    art = (11, b"gso " + bytes(40) + u16(0),
+           hwp_record(hr.SHAPE_COMPONENT, 2, b"tat$tat$" + bytes(32)) + hwp_record(hr.TEXTART, 3, bytes(40)))
+    assert md(hwp_file(hwp_para("앞" + FFFC, controls=(art,)))) == "(could not read: 1 shape)\n\n앞\n"
+
+
 # ---- tables
 def table_md(rows, **kw):
     return md(hwp_file(hwp_para(FFFC, controls=(hwp_table(rows, **kw),))))

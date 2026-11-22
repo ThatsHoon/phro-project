@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from reader.formats import hancom  # noqa: E402
-from reader.model import Bold, Break, Cell, Equation, Hidden, Link, Math, Para, Text  # noqa: E402
+from reader.model import Bold, Break, Cell, Equation, Hidden, Link, Math, Text  # noqa: E402
 
 
 def test_number_kinds():
@@ -46,8 +46,45 @@ def test_tex_moved():
     assert tex("x^2 + y_1") == "x^2 + y_1"
     assert tex("a times b le c ge d") == r"a \times b \le c \ge d"
     assert tex("alpha + Omega + omega") == r"\alpha + \Omega + \omega"
-    assert tex("foo bar") == "foo bar"
-    assert tex("{" * 500 + "a" + "}" * 500)
+    assert tex("foo baz") == "foo baz"
+    assert tex("{" * 500 + "a" + "}" * 500) is None  # past _TEX_DEPTH groups the script is not translated
+
+
+def test_tex_constructs():
+    tex = hancom.tex
+    # a script binds tighter than over, which takes the one unit before it and the one after it
+    assert tex("x_i over n") == r"\frac{x_i}{n}"
+    assert tex("a^2 over b_1") == r"\frac{a^2}{b_1}"
+    assert tex("1 + a over b") == r"1 + \frac{a}{b}"
+    assert tex("LEFT ( a over b RIGHT )") == r"\left( \frac{a}{b} \right)"
+    assert tex("left { x right }") == r"\left\{ x \right\}"
+    assert tex("matrix{a & b # c & d}") == r"\begin{matrix}a & b \\ c & d\end{matrix}"
+    assert tex("pmatrix{1 & 0 # 0 & 1}") == r"\begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix}"
+    assert tex("cases{1 & x>0 # 0 & x<=0}") == r"\begin{cases}1 & x>0 \\ 0 & x\le0\end{cases}"
+    assert tex("root 3 of x") == r"\sqrt[3]{x}"
+    assert tex("sum from{i=1} to {n} x_i") == r"\sum_{i=1}^n x_i"
+    assert tex("int _0 ^1 f(x) dx") == r"\int_0^1 f(x) dx"
+    assert tex("lim from {x -> 0} {sin x} over x") == r"\lim_{x \rightarrow 0} \frac{\sin x}{x}"
+    assert tex("bar x + vec {AB}") == r"\bar{x} + \overrightarrow{AB}"
+    assert tex('"kg" cdot m') == r"\text{kg} \cdot m"
+    assert tex("한글 x") == r"\text{한글} x"
+    assert tex("") == "" and tex("  ") == ""
+
+
+def test_tex_refuses_what_it_cannot_translate():
+    # None, never a guess: chained over, a font switch that reaches past its group, a line break, an operand without
+    # braces before a script or over, from/to after anything but a big operator, an unknown or mixed-case keyword, a
+    # cases with three columns, an unclosed group, a double script
+    for s in ("a over b over c", "rm{kg} cdot m", "x # y", "a & b", "sqrt x over 2", "bar x _1", "a from b",
+              "Alpha", "Over", "alphabet", "cases{a & b & c}", "x_{i", "x^2^3", "a<<b", "left < x right >"):
+        assert hancom.tex(s) is None, s
+
+
+def test_equation_inline():
+    assert hancom.equation("a over b") == Math(r"\frac{a}{b}") and hancom.equation(" ") is None
+    assert hancom.equation("a over b over c") == Text("`a over b over c`")
+    assert hancom.equation("a`b  #\n c") == Text("``a`b # c``")
+    assert hancom.code_span("`x") == "`` `x ``" and hancom.code_span("x``") == "``` x`` ```"
 
 
 def test_regexes_moved():
@@ -130,8 +167,6 @@ def test_paragraph_rules():
     hl = hancom.heading_level
     assert hl(2, "짧은 제목") == 2 and hl(2, "x" * 121) == 0 and hl(2, "x" * 41 + ".") == 0 and hl(0, "") == 0
     assert hl(1, "x" * 39 + ".") == 1
-    assert hancom.comment_note([Para([Text("a")])]) == [Para([Text("Comment: "), Text("a")])]
-    assert hancom.comment_note([]) == [Para([Text("Comment:")])]
     assert hancom.cut_command(r"https://e.com/a\;b;1;0") == "https://e.com/a;b"
     assert hancom.plain([Text(" a \n"), Bold([Text("b")]), Break(), Text("c ")]) == "a b c"
 
