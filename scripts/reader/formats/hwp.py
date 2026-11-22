@@ -755,15 +755,16 @@ class _Reader(Scopes):
         if cid == b"%hlk":
             self.open_field(st, url=cut_command(command))
         elif command.startswith("MEMO/"):
-            part = command.split("/", 6)
+            part = command.split("/", 5)
+            author = part[5].rsplit("/", 1) if len(part) > 5 else []
             k = 15 + 2 * struct.unpack_from("<H", data, 9)[0]
             number = struct.unpack_from("<I", data, k)[0] if len(data) >= k + 4 else 0
-            if not number and len(part) > 2 and part[2].isascii() and part[2].isdigit():
+            if not number and len(part) > 2 and part[2].isascii() and part[2].isdigit() and len(part[2]) < 10:
                 number = int(part[2])
             self.counts["cm"] += 1
             nid = f"cm-{self.counts['cm']}"
             self.doc.notes[nid] = []
-            self.memos.setdefault(number, deque()).append((nid, part[5] if len(part) > 6 else ""))
+            self.memos.setdefault(number, deque()).append((nid, author[0] if len(author) == 2 else ""))
             self.memo(st, None, nid)
         else:
             unfilled = cid == b"%clk" and not attr & 0x8000

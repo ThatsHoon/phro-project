@@ -375,6 +375,11 @@ def test_memo_becomes_a_comment():
     assert out == "대상 앵커[^1] 끝\n\n둘째 구역\n\n[^1]: Comment by 김검토: 확인 바람\n", out
 
 
+def test_memo_author_keeps_its_slashes():
+    out = md(hwp_file(memo_para(1, "총무/김") + hwp_para("끝 문단") + memo_tail(1, hwp_para("고침", level=1))))
+    assert "Comment by 총무/김: 고침" in out, out
+
+
 def test_memo_text_is_never_lost():
     # a memo list no field names keeps its text where the section ends; a memo field without a list is counted
     out = md(hwp_file(hwp_para("본문") + memo_tail(4, hwp_para("남은 메모", level=1))))

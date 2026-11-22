@@ -101,6 +101,7 @@ def test_alt_text_drops_the_automatic_description():
     assert hancom.alt_text("그림입니다.\n출처: 통계청 2024") == "출처: 통계청 2024"
     assert hancom.alt_text("그림입니다. 원본 그림의 이름: a.bmp 원본 그림의 크기: 가로 1pixel, 세로 1pixel") == ""
     assert hancom.alt_text("그림입니다. 회사 로고") == "회사 로고"
+    assert hancom.alt_text("선입니다만 굵다") == "선입니다만 굵다" and hancom.alt_text("표입니다") == ""
 
 
 def test_props_reads_hancoms_property_string():
@@ -109,11 +110,13 @@ def test_props_reads_hancoms_property_string():
     assert hancom.props("") == {} and hancom.props("Text") == {} and hancom.props("Text:wstring") == {}
     assert hancom.props("Text:wstring:٣:abc") == {}
     assert len(hancom.props("K:int:1 " * 200_000)) == 1
+    assert hancom.props("A:int:1 Text:wstring:" + "9" * 5000 + ":abc") == {"A": "1"}
 
 
 def test_button_states():
     assert hancom.button(1, "동의") == "☑ 동의" and hancom.button(0, " 거부 ") == "☐ 거부"
     assert hancom.button(2, "보류") == "☐ 보류 (indeterminate)" and hancom.button(1, "") == "☑"
+    assert hancom.button(0, "IP R&&D연계") == "☐ IP R&D연계" and hancom.button(1, "확인(&O)") == "☑ 확인(O)"
 
 
 def test_paragraph_writes_every_number_it_takes():

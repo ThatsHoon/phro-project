@@ -8,7 +8,7 @@ from bisect import bisect_left
 from .. import diagram, limits
 from ..model import Bold, Break, Cell, Equation, Heading, Hidden, Link, ListItem, Math, NoteRef, Para, Table, Text
 
-AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다\.?\s*")
+AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다(?:\.\s*|\s+|$)")
 _AUTO_FIELD = re.compile(r"^(?:원본 그림의 이름|원본 그림의 크기|사진 찍은 날짜)\s*:")
 STYLE_HEAD = re.compile(r"^(?:개요|outline|heading)\s*(\d+)$", re.I)
 
@@ -504,7 +504,7 @@ def props(s: str) -> dict:
         if kind in ("set", "wstring"):
             c = s.find(":", pos)
             count = s[pos:c] if c >= 0 else ""
-            if not (count.isascii() and count.isdigit()):
+            if not (count.isascii() and count.isdigit()) or len(count) > 5:
                 break
             pos = c + 1
             if kind == "set":
@@ -519,8 +519,10 @@ def props(s: str) -> dict:
 
 
 def button(state: int, caption: str) -> str:
-    """A check box or radio button as text: its box (1 checked, 2 neither, else unchecked) and its caption."""
-    parts = ("☑" if state == 1 else "☐", caption.strip(), "(indeterminate)" if state == 2 else "")
+    """A check box or radio button as text: its box (1 checked, 2 neither, else unchecked) and its caption, an
+    access-key mark taken out (`&&` is one ampersand, a lone `&` marks the key after it)."""
+    parts = ("☑" if state == 1 else "☐", re.sub(r"&(.?)", r"\1", caption).strip(),
+             "(indeterminate)" if state == 2 else "")
     return " ".join(x for x in parts if x)
 
 
