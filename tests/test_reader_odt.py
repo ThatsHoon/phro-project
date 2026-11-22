@@ -143,7 +143,7 @@ def test_covered_cells_span():
     body = table_xml([cell("A", 'table:number-columns-spanned="2"') + "<table:covered-table-cell/>",
                       cell("x") + cell("y")])
     out = md(odt_doc(body))
-    assert '<td colspan="2">A</td>' in out and out.count("<td") == 3
+    assert out == "|A||\n-|-\nx|y\n\nMerged: A1:B1\n", out
 
 
 def test_header_rows_and_repeated_cells():
@@ -153,7 +153,7 @@ def test_header_rows_and_repeated_cells():
     doc, _ = parse(odt_doc(body))
     t = doc.blocks[0]
     assert [c.header for c in t.rows[0]] == [True, True] and [c.header for c in t.rows[1]] == [False, False]
-    assert md(odt_doc(body)).splitlines()[2] == "|v|v|"
+    assert md(odt_doc(body)) == "h1|h2\n-|-\nv|v\n"
 
 
 def test_footnote_and_comment():
@@ -244,7 +244,7 @@ def chart_xml(extra_ns="", title="매출", cls="chart:bar"):
 def test_chart_object():
     body = P(frame('<draw:object xlink:href="./Object 1"/>'))
     out = md(odt_doc(body, extra={"Object 1/content.xml": chart_xml()}))
-    assert "Chart: column — 매출" in out and "|연도|값|" in out and "|2025|3|" in out
+    assert "Chart: column — 매출" in out and "\n연도|값\n" in out and "\n2025|3\n" in out
 
 
 def test_formula_object():
@@ -419,7 +419,7 @@ def test_repeated_big_cell_is_budgeted_by_characters():
     data = (out / "out.md").read_bytes()
     # a full 20 MB output costs about this much; the unbudgeted build peaked at 478 MiB
     assert time.monotonic() - t0 < 10 and peak < 200 * 2**20, peak / 2**20
-    assert data.startswith("(could not read: 1 table cut short)\n\n앞 글\n\n|xxx".encode("utf-8")), data[:80]
+    assert data.startswith("(could not read: 1 table cut short)\n\n앞 글\n\nxxx".encode("utf-8")), data[:80]
     assert len(data) <= limits.MAX_OUTPUT + 64 and data.endswith(b"x\n(output truncated at 20 MB)\n")
     assert meta["unread"] == ["1 table cut short"], meta
 

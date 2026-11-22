@@ -249,7 +249,7 @@ def test_vmerge_gridspan():
     body = ('<w:tbl><w:tr>' + tc("A", '<w:vMerge w:val="restart"/>') + tc("B", '<w:gridSpan w:val="2"/>') + '</w:tr>'
             '<w:tr>' + tc("", "<w:vMerge/>") + tc("C") + tc("D") + '</w:tr></w:tbl>')
     out = md(docm(body))
-    assert '<td rowspan="2">A</td>' in out and '<td colspan="2">B</td>' in out, out
+    assert out == "|A|B||\n-|-|-\n||C|D|\n\nMerged: A1:A2, B1:C1\n", out
     assert "C" in out and "D" in out
 
 

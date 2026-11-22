@@ -175,7 +175,7 @@ ROWS = {2: "1분기", 3: "2분기", 4: "3분기", 5: "North", 6: 10.0, 7: 20.5, 
 # the same chart with a series per column: rows are categories
 COLS = {2: "North", 3: "South", 4: "1분기", 5: 10.0, 6: 5.0, 7: "2분기", 8: 20.5, 9: 0.0,
         10: "3분기", 11: 30.0, 12: -2.5}
-TABLE = ("Chart: column — Sales 2024\n||North|South|\n|---|---|---|\n|1분기|10|5|\n|2분기|20.5|0|\n|3분기|30|-2.5|\n")
+TABLE = ("Chart: column — Sales 2024\n||North|South|\n-|-|-\n1분기|10|5\n2분기|20.5|0\n3분기|30|-2.5\n")
 
 
 # ---- the HWP document around it
@@ -223,7 +223,7 @@ def native(**kw):
 def test_ooxml_chart_in_ole():
     # OOXMLChartContents with a barChart cache; the table sits where a picture would, between the paragraphs
     out, ctx = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(envelope({"OOXMLChartContents": CHART_XML}))}))
-    assert out == "앞\n\nChart: column\n||S|\n|---|---|\n|A|5|\n\n뒤\n", out
+    assert out == "앞\n\nChart: column\n||S|\n-|-\nA|5\n\n뒤\n", out
     assert not ctx.skipped, ctx.skipped
 
 
@@ -262,7 +262,7 @@ def test_biff_chart_read():
     # an Excel chart in the nested file is a Chart: table where the object is, and nothing is counted
     item = envelope({"Workbook": biff_chart([{"name": "S", "vals": [5], "cats": ["A"]}], title="Sales 2024")})
     out, ctx = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(item)}))
-    assert out == "앞\n\nChart: column — Sales 2024\n||S|\n|---|---|\n|A|5|\n\n뒤\n", out
+    assert out == "앞\n\nChart: column — Sales 2024\n||S|\n-|-\nA|5\n\n뒤\n", out
     assert "could not read" not in out and not ctx.skipped, (out, ctx.skipped)
     # a Workbook that holds no chart is still one chart counted
     item = envelope({"Workbook": b"\x09\x08" + bytes(30)})
@@ -295,7 +295,7 @@ def test_native_chart_cap():
     finally:
         limits.CHART_CELLS = old
     assert out == ("(could not read: 1 chart cut short)\n\n"
-                   "Chart: column — Sales 2024 (first 1 points, first 1 series)\n||North|\n|---|---|\n|1분기|10|\n"), out
+                   "Chart: column — Sales 2024 (first 1 points, first 1 series)\n||North|\n-|-\n1분기|10\n"), out
     assert ctx.skipped == {"chart_cut": 1}, ctx.skipped
     ctx = Context()  # read whole, the same grid does not parse
     assert hwp_chart.ole_table(item, ctx) is None and ctx.skipped == {"chart": 1}, ctx.skipped

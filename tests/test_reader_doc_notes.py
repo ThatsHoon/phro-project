@@ -227,7 +227,7 @@ def test_stories_use_the_walk():
     q = story_doc("본문\r", headers=SEP + ["", hdr, "", "", "", ""], textboxes=["a\x07b\x07\x07"],
                   papx=[(3 + len(hdr) + 1 + 0, 3 + len(hdr) + 1 + 4, u16(0) + sp(IN_TABLE, 1)),
                         (3 + len(hdr) + 1 + 4, 3 + len(hdr) + 1 + 5, u16(0) + sp(IN_TABLE, 1) + sp(TTP, 1))])
-    assert md(q) == "Header: 링크\n\n본문\n\n|a|b|\n|---|---|\n", md(q)
+    assert md(q) == "Header: 링크\n\n본문\n\na|b\n-|-\n", md(q)
 
 
 # ---- headers and footers

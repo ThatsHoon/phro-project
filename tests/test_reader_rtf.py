@@ -215,7 +215,7 @@ def test_text_after_root_close_ignored():
 
 def test_cell_and_row_separate_text():
     data = rb"{\rtf1\trowd\cellx1000\cellx2000 \pard\intbl A\cell B\cell\row\trowd\cellx1000 C\cell\row D}"
-    assert md(data) == "|A|B|\n|---|---|\n|C||\n\nD\n"  # Task 23: a table, and the D outside a row ends it
+    assert md(data) == "A|B\n-|-\n|C||\n\nD\n"  # Task 23: a table, and the D outside a row ends it
 
 
 def test_listtext_is_the_marker():

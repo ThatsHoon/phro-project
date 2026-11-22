@@ -266,7 +266,7 @@ def test_xls_named_ppt():
     path = d / "a.ppt"
     make_xls(path, [{"name": "Data", "cells": {(0, 0): "a", (0, 1): "b"}}])
     out, ctx = render(d, path)
-    assert "## Sheet: Data" in out and "|a|b|" in out and not ctx.skipped, (out, ctx.skipped)
+    assert "## Sheet: Data" in out and "\na|b\n" in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def test_powerpoint95_pp40():

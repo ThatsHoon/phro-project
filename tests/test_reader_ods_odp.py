@@ -113,7 +113,7 @@ def test_display_text_first():
 
 def test_interior_repeat_kept():
     out = md(ods(sheet("S", [row(c("a", 'table:number-columns-repeated="3"')), row(c("b"))])))
-    assert "|a|a|a|" in out.replace(" ", ""), out
+    assert "\na|a|a\n" in out.replace(" ", ""), out
 
 
 def test_formulas_read():
@@ -201,7 +201,7 @@ def test_value_types():
 
 def test_interior_repeat_kept():
     out = md(ods(sheet("S", [row(c("a", 'table:number-columns-repeated="3"')), row(c("b"))])))
-    assert "|a|a|a|" in out.replace(" ", ""), out
+    assert "\na|a|a\n" in out.replace(" ", ""), out
 
 
 def test_interior_gap_and_trailing_dropped():
@@ -244,7 +244,7 @@ def test_hidden_column_left_out_and_counted():
 def test_sheet_merge():
     out = md(ods(sheet("S", [row(c("head", 'table:number-columns-spanned="2"'), "<table:covered-table-cell/>"),
                              row(c("l"), c("r"))])))
-    assert '<td colspan="2">' in out and "head" in out, out
+    assert "\n|head||\n-|-\nl|r\n\nMerged: A1:B1\n" in out, out
 
 
 def test_header_rows_flag():
@@ -628,10 +628,10 @@ def test_ods_shapes_connector():
     assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Left"]\n  n2["Right"]\n  n1 --> n2', t
     out = markdown.render(doc, tmp() / "a")
     # every drawn shape with text keeps it in the flow: the unlinked one after the diagram, before the frame
-    assert out == f"## Sheet: S\n\nA1:B1\n|x|y|\n|---|---|\n\n```mermaid\n{t}\n```\n\nUnlinked\n\nFramed\n", out
+    assert out == f"## Sheet: S\n\nA1:B1\nx|y\n-|-\n\n```mermaid\n{t}\n```\n\nUnlinked\n\nFramed\n", out
     plain = '<table:table table:name="S"><table:shapes>' + shape('draw:id="a"', "Left", "0cm") + frame("Framed")
     assert md(ods(plain + '</table:shapes>' + row(c("x"), c("y")) + '</table:table>')) == (
-        "## Sheet: S\n\nA1:B1\n|x|y|\n|---|---|\n\nFramed\n")  # no connector: the sheet reads as before
+        "## Sheet: S\n\nA1:B1\nx|y\n-|-\n\nFramed\n")  # no connector: the sheet reads as before
 
 
 def test_ods_shapes_text_kept_beside_connector():
@@ -698,7 +698,7 @@ def test_picture_and_text_box_in_a_cell_stay_in_their_row():
             row(c("pear"), pic(2), extra='table:visibility="collapse"'), row(c("fig"), box)]
     path = ods(sheet("S", rows), extra={f"Pictures/{i}.png": PNG for i in (1, 2)})
     out = md(path)
-    assert "|apple|![photo 1](assets/img-001.png)|" in out and "|fig|note in box|" in out, out
+    assert "\napple|![photo 1](assets/img-001.png)\n" in out and "\nfig|note in box\n" in out, out
     assert out.startswith("(1 hidden places left out)") and "photo 2" not in out, out
 
 

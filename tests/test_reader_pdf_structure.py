@@ -60,7 +60,7 @@ def test_ruled_table_on_tagged_page():
     text, _ctx, _doc = md(tagged_pdf(ruled=True))
     assert lines(text) == TAGGED_MD, text
     plain, _ctx, _doc = md(tagged_pdf(marked=False, ruled=True))
-    assert "|Name||Score|" in plain, plain
+    assert "\nName||Score\n" in plain, plain
 
 
 def test_tagged_page_pdfium():
@@ -72,7 +72,7 @@ def test_tagged_page_pdfium():
 
 def test_untagged_file_reads_by_layout():
     text, _ctx, _doc = md(tagged_pdf(marked=False))
-    assert "Running head of the report" in text and "|Name|Score|" not in text, text
+    assert "Running head of the report" in text and "\nName|Score\n" not in text, text
     assert "1. First item" not in lines(text) and "A bar chart of scores" not in text, text
 
 
@@ -146,7 +146,7 @@ def test_table_over_pages():
     data = simple_pdf([first, second], catalog={"StructTreeRoot": Ref(600), "MarkInfo": {"Marked": True}},
                       page_extra=[{"StructParents": 0}, {"StructParents": 1}], extra_objects=tree)
     text, _ctx, _doc = md(data)
-    assert lines(text) == ["## Page 1", "|Name|Score|", "|Kim 90||", "## Page 2", "|Lee|85|"], text
+    assert lines(text) == ["## Page 1", "Name|Score", "|Kim 90||", "## Page 2", "Lee|85"], text
 
 
 def test_paragraph_set_as_heading():

@@ -290,6 +290,7 @@ class Assets:
         self._seen: dict[str, tuple[str, bool]] = {}
         self._n = 0
         self.lines: dict[str, list] = {}  # figure text lines by the path add returned
+        self.sizes: dict[str, tuple] = {}  # (w, h) in pixels by the path add returned, where the header gives it
         self.picture: dict[str, str] = {}  # picture text (OCR) by the path add returned
         self.figures = 0  # pictures converted to PNG
         self.figures_left = 0  # figure kinds kept as the original file
@@ -337,6 +338,9 @@ class Assets:
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / name).write_bytes(data)
         res = (f"assets/{name}", kind in VIEWABLE)
+        size = pixel_size(data)
+        if size and min(size) > 0:
+            self.sizes[res[0]] = size
         if lines:
             self.lines[res[0]] = lines
         self._seen[key] = res

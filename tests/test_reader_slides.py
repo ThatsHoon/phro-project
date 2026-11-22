@@ -272,7 +272,7 @@ def test_table_spans():
            '<a:tc><a:txBody><a:p><a:r><a:t>b</a:t></a:r></a:p></a:txBody></a:tc></a:tr>'
            '</a:tbl></a:graphicData></a:graphic></p:graphicFrame>')
     out = md(deck([tbl]))
-    assert '<td colspan="2">Head</td>' in out and "<td>a</td><td>b</td>" in out and ">x<" not in out, out
+    assert out == "## Slide 1\n\n|Head||\n-|-\na|b\n\nMerged: A1:B1\n", out
 
 
 def test_table_huge_spans_fast():

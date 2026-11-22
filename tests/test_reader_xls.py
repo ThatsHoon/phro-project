@@ -87,7 +87,7 @@ def test_values_displayed():
 
 def test_value_hidden_by_format():
     md, _ = run([{"name": "S", "cells": {(0, 0): ("fmt", 5, ";;;"), (0, 1): "x"}}])
-    assert "|5|" not in md and "(1 hidden places left out)" in md, md
+    assert "5|x" not in md and "(1 hidden places left out)" in md, md
     md, _ = run([{"name": "S", "cells": {(0, 0): ("fmt", 5, ";;;"), (0, 1): "x"}}], hidden=True)
     assert "5" in md.replace("A1:B1", ""), md
 
@@ -341,7 +341,7 @@ def test_formula_cached():
 
 def test_merged_cells():
     md, _ = run([{"name": "S", "cells": {(0, 0): "wide", (1, 0): "a", (1, 1): "b"}, "merges": [(0, 0, 0, 1)]}])
-    assert 'colspan="2"' in md, md
+    assert md.endswith("\nA1:B2\n|wide||\n-|-\na|b\n\nMerged: A1:B1\n"), md
 
 
 def test_hidden_row_col_sheet():
@@ -561,7 +561,7 @@ def test_macro_sheet_quiet():
 def test_chart_sheet_table():
     chart = biff_chart([{"name": "A", "vals": [1, 2], "cats": ["x", "y"]}], title="T")
     md, _ = run([{"name": "Real", "cells": {(0, 0): "data"}}, {"name": "Chart1", "kind": 2, "raw": chart}])
-    assert "## Sheet: Chart1\n\nChart: column — T\n||A|\n|---|---|\n|x|1|\n|y|2|\n" in md, md
+    assert "## Sheet: Chart1\n\nChart: column — T\n||A|\n-|-\nx|1\ny|2\n" in md, md
     assert "could not read" not in md, md
 
 

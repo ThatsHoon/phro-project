@@ -171,19 +171,19 @@ def test_render_alt_escaping_and_cells():
         assert md == "![a\\]b\\\\c](assets/img-001.png)\n"
         t = Table([[Cell([Image(PNG, alt="p|q")]), Cell([Para([Text("z")])])]])
         md = markdown.render(Doc(blocks=[t]), Path(d))
-        assert "|![p\\|q](assets/img-001.png)|z|" in md
+        assert md == "![p\\|q](assets/img-001.png)|z\n-|-\n", md
 
 
 def test_render_images_in_cells():
     with tempfile.TemporaryDirectory() as d:
         t = Table([[Cell([Image(PNG, alt="a")]), Cell([Para([Text("z")])])]])
         md = markdown.render(Doc(blocks=[t]), Path(d))
-        assert "|![a](assets/img-001.png)|z|" in md
+        assert md == "![a](assets/img-001.png)|z\n-|-\n", md
         t = Table([[Cell([Image(EMF, alt="<e>")]), Cell([Image(WMF)], colspan=2)],
                    [Cell([Para([Text("y")])]), Cell([Para([Text("w")])]), Cell([Para([Text("v")])])]])
         md = markdown.render(Doc(blocks=[t]), Path(d))
-        assert "<td>[image: &lt;e>]</td>" in md
-        assert md.rstrip().endswith("Not viewable here: assets/img-001.emf, assets/img-002.wmf")
+        assert md == ("|[image: <e>]|||\n-|-|-\ny|w|v\n\nMerged: B1:C1\n\n"
+                      "Not viewable here: assets/img-001.emf, assets/img-002.wmf\n"), md
         inner = Table([[Cell([Image(PNG)]), Cell([Para([Text("n")])])]])
         outer = Table([[Cell([inner]), Cell([Para([Text("o")])])]])
         md = markdown.render(Doc(blocks=[outer]), Path(d))
@@ -241,6 +241,16 @@ class fake_convert:
 
     def __exit__(self, *exc):
         raster.convert = self.old
+
+
+def test_assets_keep_the_pixel_size_of_what_they_wrote():
+    with tempfile.TemporaryDirectory() as d:
+        a = images.Assets(Path(d) / "assets")
+        p, _ = a.add(gray_png(300, 120))
+        q, _ = a.add(bmp(2, 3, 24, b"\x00" * 24))
+        e, _ = a.add(EMF)
+        assert a.add(gray_png(300, 120))[0] == p and (q, e) == ("assets/img-002.png", "assets/img-003.emf")
+        assert a.sizes == {p: (300, 120), q: (2, 3)}, a.sizes
 
 
 def test_emf_becomes_png_with_text():
@@ -418,7 +428,7 @@ def test_same_picture_read_once():
 def test_page_image_not_read_again():
     with reading(answer=TWO) as sent:
         out = render(Image(gray_png(80, 80), alt="Scanned page 1", ocr="page"))
-    assert sent == [] and out == "![Scanned page 1](assets/img-001.png)\n", (sent, out)
+    assert sent == [] and out == "![Scanned page 1 80x80](assets/img-001.png)\n", (sent, out)
 
 
 def test_bmp_picture_read():
@@ -426,7 +436,7 @@ def test_bmp_picture_read():
         row = bytes([200]) * 210 + b"\0\0"
         out = render(Image(bmp(70, 70, 24, bytes(3) + row[3:] + row * 69)))
     assert sent == [(70, 70, "picture")], sent
-    assert out == "![](assets/img-001.png)\n\nPicture text: Total 120\n", out
+    assert out == "![70x70](assets/img-001.png)\n\nPicture text: Total 120\n", out
 
 
 def main():

@@ -83,47 +83,47 @@ def test_cell_types():
                     xlsx_cell("D1", inline="<r><t>a</t></r><r><t>b</t></r>"), xlsx_cell("E1", 1, t="b"),
                     xlsx_cell("F1", "#DIV/0!", t="e"), xlsx_cell("G1", "2024-03-05T00:00:00", t="d"))
     out, ctx = md([sheet(rows)], shared=["<t>hi</t>"])
-    assert "|3.5|hi|res|ab|TRUE|#DIV/0!|2024-03-05T00:00:00|" in out and not ctx.skipped, (out, ctx.skipped)
+    assert "\n3.5|hi|res|ab|TRUE|#DIV/0!|2024-03-05T00:00:00\n" in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def test_number_formats():
     rows = xlsx_row(1, xlsx_cell("A1", 0.125, s=1), xlsx_cell("B1", 45356, s=2),
                     xlsx_cell("C1", "2024-03-05", t="d", s=2), xlsx_cell("D1", 0.5, s=9))
     out, ctx = md([sheet(rows)], numfmts={164: "0.00%"}, xfs=[0, 164, 14])
-    assert "|12.50%|2024-03-05|2024-03-05|0.5|" in out, out
+    assert "\n12.50%|2024-03-05|2024-03-05|0.5\n" in out, out
 
 
 def test_date1904():
     rows = xlsx_row(1, xlsx_cell("A1", 0, s=1), xlsx_cell("B1", 1, s=1))
     out, _ = md([sheet(rows)], xfs=[0, 14], date1904=True)
-    assert "|1904-01-01|1904-01-02|" in out, out
+    assert "\n1904-01-01|1904-01-02\n" in out, out
 
 
 def test_rich_and_phonetic():
     si = '<r><t>a</t></r><r><rPr><b/></rPr><t>b</t></r><rPh sb="0" eb="1"><t>x</t></rPh><phoneticPr fontId="0"/>'
     rows = xlsx_row(1, xlsx_cell("A1", 0, t="s"), xlsx_cell("B1", 1, t="s"))
     out, _ = md([sheet(rows)], shared=[si, "<t>y</t>"])
-    assert "|ab|y|" in out and "x" not in out.replace("xlsx", ""), out
+    assert "\nab|y\n" in out and "x" not in out.replace("xlsx", ""), out
 
 
 def test_escapes():
     shared = ["<t>a_x000D_\nb</t>", "<t>_x005F_x000D_</t>", "<t>_xD83D__xDE00_ _xD800_</t>"]
     rows = xlsx_row(1, *(xlsx_cell(f"{col_name(i)}1", i, t="s") for i in range(3)))
     out, _ = md([sheet(rows)], shared=shared)
-    assert "|a<br>b|" in out and out.count("x000D") == 1, out
+    assert "\na<br>b|_x000D_|" in out and out.count("x000D") == 1, out
     assert "\U0001F600 �" in out, out
 
 
 def test_formula_cache_wins():
     rows = xlsx_row(1, xlsx_cell("A1", 2, f="1+1"), xlsx_cell("B1", "k", t="str", f='"k"'))
     out, _ = md([sheet(rows)])
-    assert "|2|k|" in out and out.count("1+1") == 1 and 'Formulas: A1 =1+1; B1 ="k"' in out, out
+    assert "\n2|k\n" in out and out.count("1+1") == 1 and 'Formulas: A1 =1+1; B1 ="k"' in out, out
 
 
 def test_formula_without_cache():
     rows = xlsx_row(1, xlsx_cell("A1", f="SUM(A1:A2)"), xlsx_cell("B1", 3))
     out, _ = md([sheet(rows)])
-    assert "|=SUM(A1:A2)|3|" in out, out
+    assert "\n=SUM(A1:A2)|3\n" in out, out
 
 
 def test_shared_formula_empty():
@@ -256,7 +256,7 @@ def test_shared_strings_element_cap():
     rows = xlsx_row(1, xlsx_cell("A1", 0, t="s"), xlsx_cell("B1", 2, t="s"), xlsx_cell("C1", 3))
     with patched("SHEET_SCAN", 100):
         out, ctx = md([sheet(rows)], shared=shared)
-    assert "|a||3|" in out, out
+    assert "\na||3\n" in out, out
     assert warned(ctx, "shared strings cut at 200 XML elements") and ctx.skipped["sheet_cut"] == 1, (ctx.warnings,
                                                                                                    ctx.skipped)
 
@@ -269,7 +269,7 @@ def test_styles_element_cap():
     with patched("STYLE_ELEMENTS", 100_000, ooxml_sheets):
         doc, ctx, secs = parsed([sheet(rows)], xfs=[0], extra_parts={"xl/styles.xml": styles})
     out = markdown.render(doc, Path(tempfile.gettempdir()) / "unused-assets", False, ctx.skipped)
-    assert "|50.00%|2|" in out and ctx.skipped["document"] == 1 and secs < 2.0, (out, ctx.skipped, secs)
+    assert "\n50.00%|2\n" in out and ctx.skipped["document"] == 1 and secs < 2.0, (out, ctx.skipped, secs)
     assert "(could not read: 1 document part)" in out, out
 
 
@@ -303,7 +303,7 @@ def test_styles_damaged_counts_document():
     rows = xlsx_row(1, xlsx_cell("A1", 45356, s=1), xlsx_cell("B1", 2))
     bad = DOCTYPE + f'<styleSheet xmlns="{XLSX_SML}"/>'
     out, ctx = md([sheet(rows)], xfs=[0, 14], extra_parts={"xl/styles.xml": bad})
-    assert "|45356|2|" in out and ctx.skipped["document"] == 1 and not ctx.skipped["styles"], (out, ctx.skipped)
+    assert "\n45356|2\n" in out and ctx.skipped["document"] == 1 and not ctx.skipped["styles"], (out, ctx.skipped)
 
 
 def test_named_part_missing_counts_document():
@@ -318,7 +318,7 @@ def test_shared_strings_damaged():
     sst = f'<sst xmlns="{XLSX_SML}"><si><t>hi</t></si><si><t>lo'
     rows = xlsx_row(1, xlsx_cell("A1", 0, t="s"), xlsx_cell("B1", 1, t="s"), xlsx_cell("C1", 3))
     out, ctx = md([sheet(rows)], shared=[], extra_parts={"xl/sharedStrings.xml": sst})
-    assert "|hi||3|" in out and ctx.skipped["document"] == 1, (out, ctx.skipped)
+    assert "\nhi||3\n" in out and ctx.skipped["document"] == 1, (out, ctx.skipped)
 
 
 def test_scan_exact_cap_no_cut():
@@ -341,7 +341,7 @@ def test_shared_string_guard_factor():
     rows = xlsx_row(1, *(xlsx_cell(f"{col_name(i)}1", i, t="s") for i in range(4)))
     with patched("SHEET_CHARS", 50):
         out, ctx = md([sheet(rows)], shared=shared)
-    assert "\U0001F600" * 3 in out and "|q|" in out and not ctx.skipped, (out, ctx.skipped)
+    assert "|" + "\U0001F600" * 3 + "|<br>|q\n" in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def test_unreadable_styles_and_strings_go_on():
@@ -355,21 +355,21 @@ def test_unreadable_styles_and_strings_go_on():
     rows = xlsx_row(1, xlsx_cell("A1", 0.5, s=1), xlsx_cell("B1", 0, t="s"), xlsx_cell("C1", 3))
     with patched("_styles", bad_styles, ooxml_sheets), patched("_strings", bad_strings, ooxml_sheets):
         out, ctx = md([sheet(rows)], shared=["<t>hi</t>"], xfs=[0, 10])
-    assert "|0.5||3|" in out and ctx.skipped["document"] == 2, (out, ctx.skipped)
+    assert "\n0.5||3\n" in out and ctx.skipped["document"] == 2, (out, ctx.skipped)
 
 
 def test_bool_values():
     vals = ["2", "-0.5", "0", "0.0", "True", "FALSE", "maybe"]
     rows = xlsx_row(1, *(xlsx_cell(f"{col_name(i)}1", v, t="b") for i, v in enumerate(vals)))
     out, _ = md([sheet(rows)])
-    assert "|TRUE|TRUE|FALSE|FALSE|TRUE|FALSE|maybe|" in out, out
+    assert "\nTRUE|TRUE|FALSE|FALSE|TRUE|FALSE|maybe\n" in out, out
 
 
 def test_unescape_beyond_shared():
     rows = xlsx_row(1, xlsx_cell("A1", "a_x000D_b", t="str"), xlsx_cell("B1", "_x0023_N/A", t="e"),
                     xlsx_cell("C1", f='"_x0041_"'))
     out, _ = md([sheet(rows, name="S_x0031_")])
-    assert "## Sheet: S1" in out and '|a<br>b|#N/A|="A"|' in out and "_x" not in out, out
+    assert "## Sheet: S1" in out and '\na<br>b|#N/A|="A"\n' in out and "_x" not in out, out
 
 
 def test_ref_fallbacks():
@@ -378,7 +378,7 @@ def test_ref_fallbacks():
             + xlsx_row("abc", xlsx_cell(None, "e", t="str"), xlsx_cell(None, "f", t="str"))
             + xlsx_row(0, xlsx_cell("B9", "g", t="str")))
     out, ctx = md([sheet(rows)])
-    assert "|a|b|c|\n|---|---|---|\n|d|||\n|e|f||\n||g||" in out and not ctx.skipped, out
+    assert "a|b|c\n-|-|-\n|d|||\n|e|f||\n||g||" in out and not ctx.skipped, out
 
 
 def test_huge_row_number():
@@ -656,9 +656,9 @@ def test_hidden_rows_cols():
 def test_merge():
     rows = xlsx_row(1, xlsx_cell("A1", "m", t="str"), xlsx_cell("C1", "n", t="str"))
     out, _ = md([sheet(rows, after='<mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>')])
-    assert 'colspan="2"' in out, out
+    assert out.endswith("\nA1:C1\nm||n\n-|-|-\n\nMerged: A1:B1\n"), out
     out, ctx = md([sheet(rows, after='<mergeCells><mergeCell ref="bad"/><mergeCell ref="A1:B1"/></mergeCells>')])
-    assert 'colspan="2"' in out and not ctx.skipped, (out, ctx.skipped)
+    assert out.endswith("\nm||n\n-|-|-\n\nMerged: A1:B1\n") and not ctx.skipped, (out, ctx.skipped)
 
 
 def formulas_of(doc):
@@ -1107,8 +1107,8 @@ def test_drawing_image_and_chart():
     parts.update({"xl/charts/chart1.xml": xb.BAR, "xl/media/image1.png": xb.PNG})
     rows = xlsx_row(1, xlsx_cell("A1", "top", t="str"), xlsx_cell("B1", "next", t="str"))
     out, ctx = md([sheet(rows, rels=[DRAWING])], extra_parts=parts)
-    assert "|top|next|" in out and "Chart: column" in out and "|Q1|7|" in out, out
-    assert out.index("|top|next|") < out.index("assets/img-001.png") < out.index("Chart: column"), out  # anchor order
+    assert "\ntop|next\n" in out and "Chart: column" in out and "\nQ1|7\n" in out, out
+    assert out.index("\ntop|next\n") < out.index("assets/img-001.png") < out.index("Chart: column"), out  # anchor order
     assert not ctx.skipped, ctx.skipped
 
 
@@ -1229,7 +1229,7 @@ def test_valueless_formulas_do_not_spend_the_cells_of_later_sheets():
         out, ctx = md([sheet(blank, name="Template"), sheet(data, name="Data")])
     finally:
         limits.SHEET_CELLS, limits.BLANK_FORMULAS = old
-    assert "|kim|42|" in out and ctx.skipped["formula"] >= 80 and not ctx.skipped["sheet_cut"], (out, ctx.skipped)
+    assert "\nkim|42\n" in out and ctx.skipped["formula"] >= 80 and not ctx.skipped["sheet_cut"], (out, ctx.skipped)
 
 
 def main():

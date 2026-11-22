@@ -100,7 +100,7 @@ def test_inline_jpeg():
 
 def test_inline_dib_becomes_png():
     out = tmp()
-    assert md(inline_doc(picf_inline(blip_bitmap(0xF01F, 0x7A8, DIB))), out=out) == "![](assets/img-001.png)\n"
+    assert md(inline_doc(picf_inline(blip_bitmap(0xF01F, 0x7A8, DIB))), out=out) == "![1x1](assets/img-001.png)\n"
     assert (out / "assets" / "img-001.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 
@@ -160,7 +160,7 @@ def test_picture_in_table_cell():
     d, ctx = parse(p)
     want = [Table([[Cell([Para([Text("x")]), Image(PNG, codepage="cp1252")]), Cell([Para([Text("z")])])]]), Para([Text("y")])]
     assert d.blocks == want and not ctx.skipped, d.blocks
-    assert md(p).split("\n")[0] == "|x<br>![](assets/img-001.png)|z|", md(p)
+    assert md(p) == "x<br>![](assets/img-001.png)|z\n-|-\n\ny\n", md(p)
 
 
 def test_picture_in_note():

@@ -2,6 +2,7 @@
 
 Run: python -I -X utf8 tests/test_reader_markdown.py
 """
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from metafile_fix import wmf, wmf_text  # noqa: E402
 from ocr_fix import ocr_stub  # noqa: E402
 from reader import images, limits, markdown, raster, text  # noqa: E402
 from reader.ocr_pixels import Gray  # noqa: E402
+from reader.formats import sheet_grid  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import (  # noqa: E402
     Bold, Break, Cell, Code, Context, Doc, Equation, Heading, Hidden, Image, Link,
@@ -133,19 +135,115 @@ def test_list_items_consecutive():
 
 
 def test_pipe_table():
-    assert R(t([["a", "b"], ["c|d", ""], ["", ""]])) == "|a|b|\n|---|---|\n|c\\|d||\n"
+    assert R(t([["a", "b"], ["c|d", ""], ["", ""]])) == "a|b\n-|-\n|c\\|d||\n"
+    assert R(t([["a", "b", "c"], ["1", "", "3"]])) == "a|b|c\n-|-|-\n1||3\n"
 
 
-def test_merged_table_html():
+def test_row_with_an_empty_end_keeps_its_outer_pipes():
+    assert R(t([["", "b"], ["1", "2"], ["3", ""]])) == "||b|\n-|-\n1|2\n|3||\n"
+
+
+def test_row_that_would_start_another_block_keeps_its_outer_pipes():
+    for first in ("- a", "+ a", "* a", "# a", "#1", "> a", "1. a", "2) a", "<b", "```", "~~~"):
+        doc = Doc(blocks=[Table([[c("h"), c("k")], [Cell([Para([Text(first)])]), c("z")]])])
+        out = R(doc).split("\n")[2]
+        assert out.startswith("|") and out.endswith("|z|"), (first, out)
+    for first in ("-5", "1.5", "+82", "*", "12)"):
+        assert R(t([["h", "k"], [first, "z"]])).split("\n")[2].endswith("|z") and "\n|" not in R(t([["h", "k"], [first, "z"]]))
+
+
+def _parsed(text):
+    """The grid a GFM pipe table says: rows of cell texts."""
+    rows = []
+    for k, line in enumerate(text.rstrip("\n").split("\n")):
+        if k == 1:
+            continue
+        if line.startswith("|"):
+            line = line[1:]
+            if line.endswith("|") and not line.endswith("\\|"):
+                line = line[:-1]
+        rows.append([x.replace("\\|", "|") for x in re.split(r"(?<!\\)\|", line)])
+    return rows
+
+
+def test_empty_first_column_survives_a_round_trip():
+    rows = [["h", "k", "m"], ["", "1", "2"], ["a", "", ""], ["", "", "3"], ["b|c", "4", ""], ["", "", ""], ["x", "y", "z"]]
+    assert _parsed(R(t(rows))) == rows
+
+
+def test_few_merges_are_a_pipe_table_with_a_merged_line():
     doc = Doc(blocks=[Table([[c("A", colspan=2, header=True)], [c("x"), c("y")]])])
-    assert R(doc) == '<table>\n<tr><th colspan="2">A</th></tr>\n<tr><td>x</td><td>y</td></tr>\n</table>\n'
+    assert R(doc) == "|A||\n-|-\nx|y\n\nMerged: A1:B1\n"
     doc = Doc(blocks=[Table([[c("a<&", rowspan=2), c("b")], [c("d")]])])
-    assert R(doc) == '<table>\n<tr><td rowspan="2">a&lt;&amp;</td><td>b</td></tr>\n<tr><td>d</td></tr>\n</table>\n'
+    assert R(doc) == "a<&|b\n-|-\n||d|\n\nMerged: A1:A2\n"
+    doc = Doc(blocks=[Table([[c("h"), c("k"), c("m")], [c("p", rowspan=2, colspan=2), c("1")], [c("2")], [c("t", colspan=3)]])])
+    assert R(doc) == "h|k|m\n-|-|-\np||1\n|||2|\n|t|||\n\nMerged: A2:B3, A4:C4\n"
+
+
+def test_sheet_table_names_merges_by_the_sheets_addresses():
+    doc = Doc(blocks=[Table([[c("A", colspan=2)], [c("x"), c("y")]], origin="C5")])
+    assert R(doc) == "|A||\n-|-\nx|y\n\nMerged: C5:D5\n"
+    rows = [[c("A", colspan=3), c("z")], [c("p"), c("q"), c("r"), c("s")], [c("v", rowspan=3), c("1"), c("2"), c("3")],
+            [c("4"), c("5"), c("6")], [c("7"), c("8"), c("9")]]
+    doc = Doc(blocks=[Table(rows, origin="B2", hidden_cols=frozenset({1}), hidden_rows=frozenset({3}))])
+    assert R(doc) == "(2 hidden places left out)\n\nA||z\n-|-|-\np|r|s\nv|2|3\n||8|9|\n\nMerged: B2:D2, B4:B6\n", R(doc)
+
+
+def test_merge_over_a_hidden_row_is_named_by_the_rows_written():
+    rows = [[c("h"), c("k")], [c("v", rowspan=3), c("1")], [c("2")], [c("3")], [c("w", rowspan=2), c("4")], [c("5")]]
+    out = R(Doc(blocks=[Table(rows, hidden_rows=frozenset({2, 5}))]))
+    assert out == "(2 hidden places left out)\n\nh|k\n-|-\nv|1\n||3|\nw|4\n\nMerged: A2:A3\n", out
+
+
+def _html_grid(text):
+    from html.parser import HTMLParser
+    rows = []
+
+    class G(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            if tag == "tr":
+                rows.append([])
+            elif tag in ("td", "th"):
+                a = dict(attrs)
+                rows[-1].append([tag, int(a.get("rowspan", 1)), int(a.get("colspan", 1)), ""])
+
+        def handle_data(self, data):
+            if rows and rows[-1] and data.strip("\n"):
+                rows[-1][-1][3] += data.strip("\n")
+
+    g = G()
+    g.feed(text)
+    g.close()
+    return [[tuple(x) for x in r] for r in rows]
+
+
+def test_many_merges_are_compact_html():
+    rows = [[c("A", colspan=2, header=True), c("B", header=True)], [c("a<&", rowspan=2), c("b"), c("")],
+            [c("d", colspan=2)], [c("e"), c("f", rowspan=2), c("g")], [c("h"), c("i")]]
+    out = R(Doc(blocks=[Table(rows)]))
+    assert out == ("<table>\n<tr><th colspan=2>A<th>B\n<tr><td rowspan=2>a&lt;&amp;<td>b<td>\n<tr><td colspan=2>d\n"
+                   "<tr><td>e<td rowspan=2>f<td>g\n<tr><td>h<td>i\n</table>\n"), out
+    assert _html_grid(out) == [[("th", 1, 2, "A"), ("th", 1, 1, "B")], [("td", 2, 1, "a<&"), ("td", 1, 1, "b"), ("td", 1, 1, "")],
+                               [("td", 1, 2, "d")], [("td", 1, 1, "e"), ("td", 2, 1, "f"), ("td", 1, 1, "g")],
+                               [("td", 1, 1, "h"), ("td", 1, 1, "i")]]
+
+
+def test_merges_are_few_by_the_tables_rows():
+    def table(n, merged):
+        return Doc(blocks=[Table([[c("m%d" % r, colspan=2)] if r < merged else [c("a%d" % r), c("b")] for r in range(n)])])
+    assert R(table(10, 3)).startswith("|m0||\n-|-\n") and "Merged: A1:B1, A2:B2, A3:B3\n" in R(table(10, 3))
+    assert R(table(10, 4)).startswith("<table>\n<tr><td colspan=2>m0\n")
+    assert "<table>" not in R(table(100, 5)) and R(table(100, 6)).startswith("<table>")
+
+
+def test_span_reaching_past_the_text_is_cut_to_it():
+    doc = Doc(blocks=[Table([[c("a", rowspan=5), c("b")], [c("d")], [c("")], [c("")], [c("")]])])
+    assert R(doc) == "a|b\n-|-\n||d|\n\nMerged: A1:A2\n"
 
 
 def test_span_kept_in_one_row_table():
     out = R(Doc(blocks=[Table([[Cell([P("a")], colspan=2), Cell([P("b")])]])]))
-    assert '<td colspan="2">a</td>' in out and "<td>b</td>" in out, out
+    assert out == "a||b\n-|-|-\n\nMerged: A1:B1\n", out
 
 
 def test_huge_spans_render_fast():
@@ -170,9 +268,9 @@ def test_one_by_one_and_one_column():
 def test_nested_table_in_cell():
     inner = Table([[c("1"), c("2")], [c("3"), c("4")]])
     doc = Doc(blocks=[Table([[Cell([P("k"), inner]), c("z")]])])
-    assert R(doc) == "|k<br>1 / 2 ; 3 / 4|z|\n|---|---|\n"
+    assert R(doc) == "k<br>1 / 2 ; 3 / 4|z\n-|-\n"
     empty = Table([[c(""), c("")]])
-    assert R(Doc(blocks=[Table([[Cell([P("k"), empty]), c("z")]])])) == "|k|z|\n|---|---|\n"
+    assert R(Doc(blocks=[Table([[Cell([P("k"), empty]), c("z")]])])) == "k|z\n-|-\n"
 
 
 def test_slide_and_notes():
@@ -255,7 +353,7 @@ def test_many_notes_render_fast():
 
 def test_chart_caption():
     out = R(t([["a", "b"], ["1", "2"]], caption="Chart: bar — 매출"))
-    assert out == "Chart: bar — 매출\n|a|b|\n|---|---|\n|1|2|\n"
+    assert out == "Chart: bar — 매출\na|b\n-|-\n1|2\n"
 
 
 def test_equations():
@@ -344,8 +442,8 @@ def test_nested_hidden_rows():
     inner = Table([[c("a")], [c("SECRET")], [c("b")]], hidden_rows=frozenset({1}))
     doc = Doc(blocks=[Table([[Cell([inner]), c("z")]])])
     out = R(doc)
-    assert "SECRET" not in out and out.splitlines()[0] == "(1 hidden places left out)" and "|a ; b|z|" in out
-    assert "|a ; (hidden) SECRET ; b|z|" in R(doc, hidden=True)
+    assert "SECRET" not in out and out.splitlines()[0] == "(1 hidden places left out)" and "\na ; b|z\n" in out
+    assert R(doc, hidden=True) == "a ; (hidden) SECRET ; b|z\n-|-\n"
 
 
 def test_span_is_clamped():
@@ -353,17 +451,18 @@ def test_span_is_clamped():
     t0 = time.time()
     doc = Doc(blocks=[Table([[c("a", rowspan=10**6, colspan=10**6), c("b")], [c("d")]])])
     out = R(doc)
-    assert time.time() - t0 < 1 and 'rowspan="2"' in out and f'colspan="{limits.GRID_COLS}"' in out
+    assert time.time() - t0 < 1 and out.endswith(f"Merged: A1:{sheet_grid.address(1, limits.GRID_COLS - 1)}\n"), out[-40:]
 
 
 def test_cell_heading_and_alt_escaped():
     h = Cell([Heading(2, [Text("a|b")])])
-    assert "|a\\|b|z|" in R(Doc(blocks=[Table([[h, c("z")]])]))
+    assert R(Doc(blocks=[Table([[h, c("z")]])])) == "a\\|b|z\n-|-\n"
     img = Cell([Image(b"x", alt="p|q")])
-    assert "|[image: p\\|q]|z|" in R(Doc(blocks=[Table([[img, c("z")]])]))
+    assert R(Doc(blocks=[Table([[img, c("z")]])])) == "[image: p\\|q]|z\n-|-\n"
     h2 = Cell([Heading(1, [Text("<&>")]), Image(b"x", alt="<i>")])
-    out = R(Doc(blocks=[Table([[h2, c("z", colspan=1, rowspan=2)], [c("y")]])]))
-    assert "&lt;&amp;>" in out and "[image: &lt;i>]" in out
+    rows = [[h2, c("z", rowspan=2)], [c("y")], [c("p", colspan=2)], [c("q", colspan=2)], [c("r", colspan=2)]]
+    out = R(Doc(blocks=[Table(rows)]))
+    assert out.startswith("<table>\n<tr><td>&lt;&amp;><br>[image: &lt;i>]<td rowspan=2>z\n"), out
 
 
 def test_stats():
@@ -500,30 +599,30 @@ def test_over_deep_nesting_is_left_out():
 def test_hidden_cols_left_out():
     out = R(t([["a", "SECRET", "b"], ["c", "SECRET2", "d"]], hidden_cols=frozenset({1})))
     assert "SECRET" not in out and out.splitlines()[0] == "(1 hidden places left out)", out
-    assert "|a|b|" in out and "|c|d|" in out, out
+    assert out.endswith("\n\na|b\n-|-\nc|d\n"), out
 
 
 def test_hidden_cols_shown():
     out = R(t([["a", "SECRET", "b"], ["c", "SECRET2", "d"]], hidden_cols=frozenset({1})), hidden=True)
-    assert "|a|(hidden) SECRET|b|" in out and "|c|SECRET2|d|" in out and "hidden places" not in out, out
+    assert out == "a|(hidden) SECRET|b\n-|-|-\nc|SECRET2|d\n", out
 
 
 def test_span_over_hidden_col():
     tb = Table([[Cell([P("wide")], colspan=3)], [c("a"), c("b"), c("d")]], hidden_cols=frozenset({1}))
     out = R(Doc(blocks=[tb]))
-    assert 'colspan="2"' in out and "wide" in out and "<td>b</td>" not in out, out
+    assert out == "(1 hidden places left out)\n\n|wide||\n-|-\na|d\n\nMerged: A1:B1\n", out
 
 
 def test_hidden_empty_col_quiet():
     out = R(t([["a", "", "b"], ["c", "", "d"]], hidden_cols=frozenset({1})))
-    assert "hidden" not in out and "|a|b|" in out, out
+    assert out == "a|b\n-|-\nc|d\n", out
 
 
 def test_nested_hidden_cols():
     inner = Table([[c("a"), c("SECRET"), c("b")]], hidden_cols=frozenset({1}))
     doc = Doc(blocks=[Table([[Cell([inner]), c("z")]])])
     out = R(doc)
-    assert "SECRET" not in out and out.splitlines()[0] == "(1 hidden places left out)" and "|a / b|z|" in out, out
+    assert "SECRET" not in out and out.splitlines()[0] == "(1 hidden places left out)" and "\na / b|z\n" in out, out
     assert "(hidden) SECRET" in R(doc, hidden=True)
 
 
@@ -611,6 +710,86 @@ def test_phase4_section_heads():
     assert R(Doc(blocks=[Section("master", title="Master A")])) == "## Master page: Master A\n"
 
 
+def test_picture_alt_ends_with_its_size():
+    out = R(Doc(blocks=[Image(pic(64, 48), alt="chart"), Image(pic(30, 20)), Image(PNG + b"1", alt="k"), Image(PNG + b"2")]))
+    assert out == ("![chart 64x48](assets/img-001.png)\n\n![30x20](assets/img-002.png)\n\n![k](assets/img-003.png)\n\n"
+                   "![](assets/img-004.png)\n"), out
+    out = R(Doc(blocks=[Table([[Cell([Image(pic(64, 48), alt="a|b")]), c("z")]])]))
+    assert out == "![a\\|b 64x48](assets/img-001.png)|z\n-|-\n", out
+
+
+def test_running_picture_is_linked_once_with_its_count():
+    logo, other = pic(40, 30), pic(50, 50)
+    for kind, word in (("slide", "slides"), ("page", "pages"), ("sheet", "sheets"), ("table", "sections")):
+        secs = [Section(kind, "s", number=k + 1, blocks=[P("t%d" % k), Image(logo, alt="logo"), Image(logo)]
+                        + ([Image(other)] if k < 2 else [])) for k in range(4)]
+        out = R(Doc(blocks=secs))
+        assert out.count("![logo 40x30 on 4 %s](assets/img-001.png)" % word) == 1 and out.count("img-001") == 1, out
+        assert out.count("![50x50](assets/img-002.png)") == 2, out
+        assert all("t%d" % k in out for k in range(4))
+
+
+def test_page_image_is_linked_on_every_page_it_stands_for():
+    blank = pic(60, 80)
+    secs = [Section("page", number=k + 1, blocks=[Image(blank, alt="Scanned page %d" % (k + 1), ocr="page")])
+            for k in range(4)]
+    out = R(Doc(blocks=secs))
+    assert out == "".join("## Page %d\n\n![Scanned page %d 60x80](assets/img-001.png)\n\n" % (k, k)
+                          for k in range(1, 5))[:-1], out
+
+
+def test_running_picture_in_cells_and_hidden_sections():
+    logo = pic(40, 30)
+
+    def sheet(k, **kw):
+        return Section("sheet", "S%d" % k, blocks=[Table([[Cell([Image(logo)]), c("v%d" % k)], [c("a"), c("b")]])], **kw)
+    out = R(Doc(blocks=[sheet(k) for k in range(3)]))
+    assert out.count("![40x30 on 3 sheets](assets/img-001.png)|v0\n") == 1 and out.count("img-001") == 1, out
+    assert "\n||v1|\n" in out and "\n||v2|\n" in out, out
+    out = R(Doc(blocks=[sheet(0), sheet(1, hidden=True), sheet(2)]))
+    assert out.count("![40x30](assets/img-001.png)") == 2, out
+    out = R(Doc(blocks=[sheet(0), sheet(1, hidden=True), sheet(2)]), hidden=True)
+    assert out.count("![40x30 on 3 sheets](assets/img-001.png)") == 1 and out.count("img-001") == 1, out
+
+
+def test_picture_twice_in_two_sections_is_linked_each_time():
+    logo = pic(40, 30)
+    out = R(Doc(blocks=[Section("slide", "s", number=k + 1, blocks=[Image(logo), Image(logo)]) for k in range(2)]))
+    assert out.count("![40x30](assets/img-001.png)") == 4, out
+
+
+def test_running_figure_text_is_written_once():
+    with figs(["Q1 120"]):
+        out = R(Doc(blocks=[Section("slide", "s", number=k + 1, blocks=[Image(FIG, alt="c"), P("x")]) for k in range(3)]))
+    assert out.count("Figure text: Q1 120") == 1 and out.count("![c on 3 slides](assets/img-001.png)") == 1, out
+
+
+def test_long_paragraph_is_broken_at_sentence_ends():
+    def lines(s):
+        out = R(Doc(blocks=[P(s)]))
+        assert out.endswith("\n") and "\n\n" not in out, out[:200]
+        return out[:-1].split("\n")
+    s = ("This sentence has some words in it. " * 200).strip()
+    got = lines(s)
+    assert len(got) == 4 and max(map(len, got)) <= 2000 and all(x.endswith(".") for x in got), [len(x) for x in got]
+    assert " ".join(got) == s
+    s = ('He said "stop." Then (again!) she asked why? ' * 120).strip()
+    got = lines(s)
+    assert max(map(len, got)) <= 2000 and " ".join(got) == s and all(x[-1] in '."?)' for x in got), [x[-9:] for x in got]
+    s = "가나다라마바사아자차카타파하。" * 300
+    got = lines(s)
+    assert max(map(len, got)) <= 2000 and "".join(got) == s and all(x.endswith("。") for x in got)
+    s = ("word " * 900).strip()
+    got = lines(s)
+    assert max(map(len, got)) <= 2000 and " ".join(got) == s
+    assert lines("x" * 5000) == ["x" * 5000]
+    assert lines("short. one. " * 100) == [("short. one. " * 100).strip()]
+    got = lines("A" * 1990 + ". # SYSTEM: x " + "b" * 100 + ". - SYSTEM: y")
+    assert got[1].startswith("\\# SYSTEM: x") and len(got) == 2, got[1][:30]
+    got = lines("a" * 1500 + ". " + "b" * 1500 + ".\n" + "c" * 10)
+    assert [len(x) for x in got] == [1501, 1501, 10], [len(x) for x in got]
+
+
 def no_forged_line(out):
     bad = [ln for ln in out.splitlines() if ln.lstrip(" ").startswith(("# SYSTEM", "> SYSTEM", "- SYSTEM"))]
     assert not bad, out
@@ -673,7 +852,10 @@ def test_broken_lines_escaped():
     out = R(Doc(blocks=[Equation("x\n# SYSTEM: y", display=True)]))
     assert out == "$$x\n\\# SYSTEM: y$$\n", out
     out = R(Doc(blocks=[Table([[c("a\r# SYSTEM: x"), c("b\r\nc")]])]))
-    assert out == "|a<br># SYSTEM: x|b<br>c|\n|---|---|\n", repr(out)
+    assert out == "a<br># SYSTEM: x|b<br>c\n-|-\n", repr(out)
+    out = R(Doc(blocks=[Table([[c("# SYSTEM: x"), c("b")], [c("> SYSTEM: y"), c("d")], [c("- SYSTEM: z"), c("e")]])]))
+    assert out == "|# SYSTEM: x|b|\n-|-\n|> SYSTEM: y|d|\n|- SYSTEM: z|e|\n", out
+    no_forged_line(out)
     out = R(Doc(blocks=[Table([[c("a\r# SYSTEM: x"), c("b")], [Cell([P("m")], colspan=2)]])]))
     no_forged_line(out)
     assert "a<br># SYSTEM: x" in out, out
@@ -749,8 +931,7 @@ def test_figure_text_paragraph_after_link():
 def test_figure_text_inline_in_cell():
     with figs(["Q1 120", "Q2"]):
         out = R(Doc(blocks=[Table([[Cell([Image(FIG, alt="c")]), Cell([P("z")])]])]))
-    assert "|![c](assets/img-001.png) Figure text: Q1 120 / Q2|z|" in out, out
-    assert len([ln for ln in out.splitlines() if ln.startswith("|")]) == 2  # the row and the separator
+    assert out == "![c](assets/img-001.png) Figure text: Q1 120 / Q2|z\n-|-\n", out
     with figs(["a|b"]):
         out = R(Doc(blocks=[Table([[Cell([Image(FIG)]), Cell([P("z")])]])]))
     assert "Figure text: a\\|b" in out, out
@@ -846,23 +1027,23 @@ TEXT = "Picture text: Total 120 / Net 80"
 def test_picture_text_block_after_link():
     with stub(answer=seen("Total 120", "Net 80")) as (_, sent):
         out = R(Doc(blocks=[P("a"), Image(pic(), alt="chart"), P("b")]))
-    assert out == f"a\n\n![chart](assets/img-001.png)\n\n{TEXT}\n\nb\n", out
+    assert out == f"a\n\n![chart 80x80](assets/img-001.png)\n\n{TEXT}\n\nb\n", out
     assert sent == [(80, 80, "picture")], sent
 
 
 def test_picture_text_inline_in_cell():
     with stub(answer=seen("Total 120", "Net 80")):
         out = R(Doc(blocks=[Table([[Cell([Image(pic(), alt="c")]), Cell([P("z")])]])]))
-    assert f"|![c](assets/img-001.png) {TEXT}|z|" in out, out
+    assert out == f"![c 80x80](assets/img-001.png) {TEXT}|z\n-|-\n", out
     with stub(answer=seen("a|b c")):
         out = R(Doc(blocks=[Table([[Cell([Image(pic())]), Cell([P("z")])]])]))
-    assert "Picture text: a\\|b c|z|" in out, out
+    assert "Picture text: a\\|b c|z\n" in out, out
 
 
 def test_picture_text_hidden_tagged():
     with stub(answer=seen("Total 120", "Net 80")) as (_, sent):
         out = R(Doc(blocks=[Image(pic(), hidden="hidden")]), hidden=True)
-    assert out == f"(hidden) ![](assets/img-001.png)\n\n(hidden) {TEXT}\n", out
+    assert out == f"(hidden) ![80x80](assets/img-001.png)\n\n(hidden) {TEXT}\n", out
     with stub(answer=seen("Total 120", "Net 80")) as (_, sent):
         out = R(Doc(blocks=[Image(pic(), hidden="hidden"), P("x")]))
     assert out == "(1 hidden places left out)\n\nx\n" and sent == [], (out, sent)
@@ -877,18 +1058,18 @@ def test_picture_text_cut_at_figure_chars():
             out = markdown.render(Doc(blocks=[Image(pic())]), Path(d), info=info)
     finally:
         limits.FIGURE_CHARS = saved
-    assert out == "![](assets/img-001.png)\n\nPicture text: Total 120…\n", out
+    assert out == "![80x80](assets/img-001.png)\n\nPicture text: Total 120…\n", out
     assert info["warnings"] == ["figure text cut"], info
 
 
 def test_photo_gets_no_picture_text():
     with stub(answer=seen("▒▓░ ◆◇◆ ▒▒")) as (_, sent):
         out = R(Doc(blocks=[Image(pic())]))
-    assert out == "(OCR text of 1 picture left out as doubtful)\n\n![](assets/img-001.png)\n", out
+    assert out == "(OCR text of 1 picture left out as doubtful)\n\n![80x80](assets/img-001.png)\n", out
     assert len(sent) == 1, sent
     with stub() as (_, sent):  # one word only: under OCR_MIN_WORDS
         out = R(Doc(blocks=[Image(pic())]))
-    assert out == "![](assets/img-001.png)\n" and len(sent) == 1, (out, sent)
+    assert out == "![80x80](assets/img-001.png)\n" and len(sent) == 1, (out, sent)
 
 
 def test_doubtful_and_blank_pictures_counted_and_said():
@@ -903,13 +1084,13 @@ def test_doubtful_and_blank_pictures_counted_and_said():
         out = markdown.render(Doc(blocks=[Image(pic()), Image(pic(shade=240)), Image(pic()), Image(flat)]), Path(d),
                               info=info)
     assert out == ("(OCR text of 2 pictures left out as doubtful)\n\n(1 blank picture not sent to OCR)\n\n"
-                   "![](assets/img-001.png)\n\n![](assets/img-002.png)\n\n![](assets/img-001.png)\n\n"
-                   "![](assets/img-003.png)\n"), out
+                   "![80x80](assets/img-001.png)\n\n![80x80](assets/img-002.png)\n\n![80x80](assets/img-001.png)\n\n"
+                   "![80x80](assets/img-003.png)\n"), out
     assert (info["ocr"]["pictures_doubtful"], info["ocr"]["pictures_blank"]) == (2, 1), info
     assert len(sent) == 3, sent
     with stub(answer=conf(seen("Total 120", "Net 80"), 95.0)), tempfile.TemporaryDirectory() as d:
         out = markdown.render(Doc(blocks=[Image(pic())]), Path(d), info=info)
-    assert out == f"![](assets/img-001.png)\n\n{TEXT}\n" and info["ocr"]["pictures_doubtful"] == 0, out
+    assert out == f"![80x80](assets/img-001.png)\n\n{TEXT}\n" and info["ocr"]["pictures_doubtful"] == 0, out
 
 
 def test_status_lines_singular_and_plural():
@@ -950,8 +1131,8 @@ def test_stop_note_for_pages_and_pictures():
             tempfile.TemporaryDirectory() as d:
         out = markdown.render(Doc(blocks=[Image(pic(shade=250)), Image(pic(shade=240)), Image(pic(shade=250))]),
                               Path(d), info=info)
-    assert out == ("(OCR stopped; 2 pictures not read)\n\n![](assets/img-001.png)\n\n![](assets/img-002.png)\n\n"
-                   "![](assets/img-001.png)\n"), out
+    assert out == ("(OCR stopped; 2 pictures not read)\n\n![80x80](assets/img-001.png)\n\n![80x80](assets/img-002.png)\n\n"
+                   "![80x80](assets/img-001.png)\n"), out
     assert info["ocr"]["pictures_left"] == 2, info
 
 
@@ -978,7 +1159,7 @@ def test_korean_hint_once():
                                   meta={"ocr": {"pages": 0, "doubtful": 0, "failed": 1, "stopped_at": None}}),
                               Path(d), info=info)
     assert out.count("Korean OCR") == 1, out
-    assert out.startswith(f"(OCR failed on 1 page; shown as an image.)\n\n{hint}\n\n![](assets/img-001.png)"), out
+    assert out.startswith(f"(OCR failed on 1 page; shown as an image.)\n\n{hint}\n\n![80x80](assets/img-001.png)"), out
     assert info["ocr_hint"] is True, info
     with stub(answer=seen("Total 120")), tempfile.TemporaryDirectory() as d:
         out = markdown.render(Doc(blocks=[Image(pic())]), Path(d), info=info)

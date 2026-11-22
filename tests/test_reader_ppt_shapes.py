@@ -117,7 +117,7 @@ def test_table_group():
     cells = [text("a1", (0, 0, 100, 50)), text("b1", (100, 0, 200, 50)),
              text("c1", (0, 50, 100, 100)), text("d1", (100, 50, 200, 100))]
     out, _ = md([{"shapes": [table(cells)]}])
-    assert "|a1|b1|" in out and "|c1|d1|" in out, out
+    assert "\na1|b1\n" in out and "\nc1|d1\n" in out, out
     shape = walked([table(cells)])[0]
     assert shape.kind == "table" and isinstance(shape.blocks[0], Table), shape.kind
 
@@ -128,7 +128,7 @@ def test_table_flag_in_tertiary_fopt():
     shape = walked([table(cells, table="tertiary")])[0]
     assert shape.kind == "table" and len(shape.blocks[0].rows) == 2, shape.kind
     out, _ = md([{"shapes": [table(cells, table="tertiary")]}])
-    assert "|a1|b1|" in out and "|c1|d1|" in out, out
+    assert "\na1|b1\n" in out and "\nc1|d1\n" in out, out
 
 
 def test_table_spans():
@@ -429,7 +429,7 @@ _PLAIN = [  # what the reader wrote for these decks before it read connectors
     '## Slide 1: Head\n\nTop box\n\nBody text\n\nTail text\n',
     '## Slide 1: Big idea\n\ndetail\n',
     '## Slide 1\n\nB\n\nA\n\nCee\n',
-    '## Slide 1\n\n|a1|b1|\n|---|---|\n|c1|d1|\n',
+    '## Slide 1\n\na1|b1\n-|-\nc1|d1\n',
     '## Slide 1\n\nfree one\n\nlow\n\nfree two\n',
     '(1 hidden places left out)\n\n## Slide 1: T\n\nkept body\n',
     '## Slide 1\n\nChoice\n\nrule\n\nDone\n',

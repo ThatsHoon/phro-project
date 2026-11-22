@@ -228,18 +228,18 @@ def test_tiff_pages_become_text():
     with stub_engine(answer=doubtful):
         text, meta = convert(path)
     assert text == ("(2 scanned pages read by OCR; 2 of them doubtful, shown with the page image)\n\n"
-                    f"{SCANNED}\n\nAlpha beta gamma\n\n![page 1](assets/img-001.png)\n\n"
-                    f"{SCANNED}\n\nAlpha beta gamma\n\n![page 2](assets/img-002.png)\n"), text
+                    f"{SCANNED}\n\nAlpha beta gamma\n\n![page 1 600x800](assets/img-001.png)\n\n"
+                    f"{SCANNED}\n\nAlpha beta gamma\n\n![page 2 600x800](assets/img-002.png)\n"), text
     area = words("Alpha beta gamma")
     area["unread"] = {"share": 0.02, "box": [0.1, 0.5, 0.6, 0.9], "area": 0.2, "density": 0.5}
     with stub_engine(answer=area):
         text, meta = convert(tiff_file(pages(1)))
     assert text == (f"(1 scanned page read by OCR)\n\n{SCANNED}\n\nAlpha beta gamma\n\n"
-                    "![Picture on page 1](assets/img-001.png)\n"), text
+                    "![Picture on page 1 300x320](assets/img-001.png)\n"), text
     with stub_engine(die_after=0):
         text, meta = convert(path)
     assert text == ("(OCR failed on 2 pages; shown as images.)\n\n"
-                    "![page 1](assets/img-001.png)\n\n![page 2](assets/img-002.png)\n"), text
+                    "![page 1 600x800](assets/img-001.png)\n\n![page 2 600x800](assets/img-002.png)\n"), text
     assert meta["ocr"]["failed"] == 2 and "unread" in meta and not meta["unread"], meta
 
 
@@ -288,7 +288,7 @@ def test_tiff_discarded_layout_leaves_no_skips():
             text, meta = convert(tiff_file(pages(1)))
     finally:
         ocr_layout.blocks = real
-    assert text == "(OCR failed on 1 page; shown as an image.)\n\n![](assets/img-001.png)\n", text
+    assert text == "(OCR failed on 1 page; shown as an image.)\n\n![600x800](assets/img-001.png)\n", text
     assert meta["unread"] == [], meta
 
 
@@ -308,7 +308,7 @@ def test_tiff_crop_is_gray_from_the_read_pixels():
     whole["unread"] = {"share": 0.02, "box": [0.0, 0.1, 1.0, 0.9], "area": 0.8, "density": 0.5}
     with stub_engine(answer=whole):
         text, _ = convert(tiff_file(pages(1)))
-    assert "![Picture on page 1](assets/img-001.png)" in text, text
+    assert "![Picture on page 1 600x800](assets/img-001.png)" in text, text
 
 
 def test_late_conversion_filed_partial():
@@ -344,15 +344,15 @@ def test_meta_json_has_ocr_counts():
               "pictures_doubtful": 0, "pictures_blank": 0}
     assert meta["ocr"] == on_disk["ocr"] == counts, on_disk
     text = (out / "out.md").read_text(encoding="utf-8")
-    assert text == "Before\n\n![](assets/img-001.png)\n\nPicture text: Hello world / second line\n\nAfter\n", text
+    assert text == "Before\n\n![80x80](assets/img-001.png)\n\nPicture text: Hello world / second line\n\nAfter\n", text
 
 
 # captured from the code before OCR reached reader.convert (1912329): a docx with a PNG picture, an hwp with a
 # picture and a scanned pdf
 NO_ENGINE = (
-    "Before\n\n![](assets/img-001.png)\n\nAfter\n",
-    "Words\n\n![](assets/img-001.png)\n",
-    "## Page 1\n\n![Scanned page 1](assets/img-001.png)\n",
+    "Before\n\n![80x80](assets/img-001.png)\n\nAfter\n",
+    "Words\n\n![80x80](assets/img-001.png)\n",
+    "## Page 1\n\n![Scanned page 1 600x800](assets/img-001.png)\n",
 )
 
 

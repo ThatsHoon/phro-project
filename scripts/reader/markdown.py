@@ -177,6 +177,24 @@ def _images(doc: Doc, show: bool, grid):
         stack.append(itertools.chain.from_iterable(fresh))
 
 
+_UNITS = {"page": "pages", "slide": "slides", "sheet": "sheets"}
+
+
+def _running(doc: Doc, show: bool, grid) -> dict:
+    """(bytes, page) of each picture the render may write in RUNNING_PICTURE or more of the document's sections ->
+    "on N pages" (slides, sheets; sections for another kind, or more than one). Such a picture is linked where it
+    is first placed, and nowhere after. A page's own image (`ocr` "page") stands for that page and is never one."""
+    sections = [b for b in doc.blocks if isinstance(b, Section) and (show or not b.hidden)]
+    if len(sections) < limits.RUNNING_PICTURE:
+        return {}
+    kinds = collections.defaultdict(list)
+    for s in sections:
+        for k in {(im.data, im.page) for im in _images(Doc(blocks=[s]), show, grid) if im.ocr != "page"}:
+            kinds[k].append(s.kind)
+    return {k: f"on {len(v)} " + (_UNITS.get(v[0], "sections") if len(set(v)) == 1 else "sections")
+            for k, v in kinds.items() if len(v) >= limits.RUNNING_PICTURE}
+
+
 class _Pictures:
     """The raster pictures OCR reads: each Image with `ocr` "" whose bytes are a PNG, JPEG, BMP, GIF or TIFF and whose
     pixels (raster.gray) have a long side of at least OCR_MIN_EDGE, submitted to the session as the render starts,
@@ -257,6 +275,34 @@ class _Pictures:
         return got
 
 
+_A1 = re.compile(r"([A-Z]+)(\d+)")
+_ROW_START = re.compile(r" {0,3}(#|>|<|```|~~~|[-*+] |\d+[.)] )|\s")
+
+
+def _column(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def _a1(r: int, c: int) -> str:
+    s, n = "", c + 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        s = chr(65 + rem) + s
+    return f"{s}{r + 1}"
+
+
+def _pipe_row(cells) -> str:
+    """A row of a pipe table. The outer pipes are written only where the row needs them to be read back: its first
+    or last cell is empty, or its first cell would begin another block."""
+    row = "|".join(cells)
+    if not cells[0] or not cells[-1] or _ROW_START.match(cells[0]):
+        return "|" + row + "|"
+    return row
+
+
 class _Mode:
     """Where inline text lands: block, table cell (pipe or HTML), or heading."""
 
@@ -291,6 +337,34 @@ def _esc_start(mo):
     if mark[0].isdigit():
         return lead + mark[:-2] + "\\. "
     return lead + "\\" + mark
+
+
+_SENTENCE_END = re.compile(r"[.!?…][\"')\]”’]*(\s)|[。！？][」』”’)]*")
+
+
+def _broken(line: str) -> str:
+    """A paragraph's line over LINE_CHARS broken into lines within it (a line break inside a paragraph is read as
+    a space): at the last sentence end that fits, the space after it becoming the break; with none, at the last
+    space; with neither, left as it is."""
+    out = []
+    while len(line) > limits.LINE_CHARS:
+        end = None
+        for m in _SENTENCE_END.finditer(line, 0, limits.LINE_CHARS + 1):
+            if m.group(1) is not None or m.end() <= limits.LINE_CHARS:
+                end = m
+        if end is not None and end.group(1) is not None:
+            a, b = end.span(1)
+        elif end is not None:
+            a = b = end.end()
+        else:
+            a = line.rfind(" ", 0, limits.LINE_CHARS + 1)
+            b = a + 1
+        if a <= 0:
+            break
+        out.append(line[:a])
+        line = line[b:]
+    out.append(line)
+    return "\n".join(out)
 
 
 def _esc_lines(s: str, skip_first: bool = False) -> str:
@@ -361,6 +435,8 @@ class _Render:
         self.assets = Assets(assets_dir)
         self.unviewable: list[str] = []
         self.linked: set[str] = set()  # viewable images the output links to
+        self.running = None  # _running(doc), made when the first picture is written
+        self.placed = set()  # the running pictures written so far
         self.size = 0  # characters emitted so far by leaf blocks; building stops past MAX_OUTPUT
         self.memo = {}  # id(blocks) -> (has text, levels its scan went below the call, blocks): see _has_text
         self.reach = 0  # the deepest level the has-text scan under way has called _enter at
@@ -522,6 +598,8 @@ class _Render:
             s = self.inlines(b.inlines)
             if not s.strip():
                 return []
+            if len(s) > limits.LINE_CHARS:
+                s = "\n".join(_broken(ln) for ln in _NEWLINE.split(s))
             return [("p", self._tag(b, _esc_lines(s)))]
         if isinstance(b, Heading):
             s = one_line(self.inlines(b.inlines, HEAD))
@@ -557,16 +635,24 @@ class _Render:
         return []
 
     def _image_text(self, b: Image, m=BLOCK) -> str:
+        if self.running is None:
+            self.running = _running(self.doc, self.show, self._grid)
+        often = "" if b.ocr == "page" else self.running.get((b.data, b.page), "")
+        if often:
+            if (b.data, b.page) in self.placed:
+                return ""
+            self.placed.add((b.data, b.page))
         path, ok = self.assets.add(b.data, b.alt, b.codepage, **({"page": b.page} if b.page else {}))
         alt = re.sub(r"\s+", " ", b.alt).strip()
         if ok:
             self.linked.add(path)
-            alt = alt.replace("\\", "\\\\").replace("]", "\\]")
+            size = self.assets.sizes.get(path)
+            alt = " ".join(x for x in (alt.replace("\\", "\\\\").replace("]", "\\]"), "%dx%d" % size if size else "", often) if x)
             head = m.esc(f"![{alt}](") + path + ")"
         else:
             if path and path not in self.unviewable:
                 self.unviewable.append(path)
-            head = m.esc(f"[image: {alt}]") if alt else ""
+            head = m.esc(f"[image: {alt} {often}".rstrip() + "]") if alt else ""
         lines = [x for x in (" ".join(ln.split()) for ln in self.assets.lines.get(path, ())) if x]
         texts = ["Figure text: " + " / ".join(lines)] if lines else []
         if path and not b.ocr and self.pictures is not None:
@@ -729,7 +815,9 @@ class _Render:
         return False
 
     def _grid(self, t: Table, count=True):
-        """Origin cells by (row, col) on the reconstructed grid, trimmed: (origins, nrows, ncols).
+        """Origin cells by (row, col) on the reconstructed grid, trimmed to the rows and columns where a cell with
+        text begins (a span is cut there): (origins, nrows, ncols, whole). `whole` has, for each origin still merged,
+        the (column, rows, columns) it has in the table as it was read.
         Unless hidden content is shown, hidden columns are left out here: a span loses the ones it covers,
         a cell whose columns are all hidden is dropped, and each hidden column with such text counts one place."""
         covered = set()
@@ -762,13 +850,17 @@ class _Render:
                         covered.add((r + dr, c + dc))
                 c += cs
         hc = sorted(x for x in t.hidden_cols if 0 <= x < width) if t.hidden_cols and not self.show else ()
+        whole = {k: (k[1], rs, cs) for k, (_, rs, cs) in origins.items() if rs > 1 or cs > 1}
         if hc:
-            mapped, lost = {}, set()
+            mapped, lost, was = {}, set(), whole
+            whole = {}
             for (r, c), (cell, rs, cs) in origins.items():
                 lo, hi = bisect_left(hc, c), bisect_right(hc, c + cs - 1)
                 n = hi - lo
                 if n < cs:
                     mapped[(r, c - lo)] = (cell, rs, cs - n)
+                    if (r, c) in was:
+                        whole[(r, c - lo)] = was[(r, c)]
                     if n == 0:
                         continue
                     cols = hc[lo:hi]  # the hidden columns a wider span holds: its text is partly left out
@@ -790,13 +882,14 @@ class _Render:
             if k not in texty:
                 texty[k] = self._has_text(cell.blocks)
             if texty[k]:
-                nrows = max(nrows, r + rs)
-                ncols = max(ncols, c + cs)
-        kept = {k: v for k, v in origins.items() if k[0] < nrows and k[1] < ncols}
-        return kept, nrows, ncols
+                nrows = max(nrows, r + 1)
+                ncols = max(ncols, c + 1)
+        kept = {(r, c): (cell, min(rs, nrows - r), min(cs, ncols - c))
+                for (r, c), (cell, rs, cs) in origins.items() if r < nrows and c < ncols}
+        return kept, nrows, ncols, {k: v for k, v in whole.items() if k in kept and kept[k][1] * kept[k][2] > 1}
 
     def _nested(self, t: Table, m) -> str:
-        origins, nrows, _ = self._grid(t)
+        origins, nrows, _, _ = self._grid(t)
         hcs, marked = (t.hidden_cols if self.show else ()), set()
         rows, used = [], 0
         for r in range(nrows):
@@ -823,7 +916,7 @@ class _Render:
         return " ; ".join(rows)
 
     def _table(self, t: Table) -> list:
-        origins, nrows, ncols = self._grid(t)
+        origins, nrows, ncols, whole = self._grid(t)
         cap = [t.caption] if t.caption else []
         hcs, marked = (t.hidden_cols if self.show else ()), set()
 
@@ -842,13 +935,13 @@ class _Render:
                 return True
             return False
 
-        def finish(body):
+        def finish(body, merged=""):
             if not body:
                 return [("p", c) for c in cap]
             text = "\n".join(cap + [body])
             if t.hidden and self.show:
                 text = "(hidden)\n" + text
-            return [("t", text)]
+            return [("t", text)] + ([("p", "Merged: " + merged)] if merged else [])
 
         if not nrows:
             return finish("")
@@ -879,9 +972,10 @@ class _Render:
                     lines.append(("(hidden) " if h and not s.startswith("(hidden) ") else "") + s)
                     used += len(lines[-1]) + 1
             return finish("\n".join(lines))
-        spans = any(rs > 1 or cs > 1 for _, rs, cs in origins.values())
+        spans = len(whole) > max(3, nrows // 20)
         m = HTML if spans else PIPE
         lines = []
+        written = []
         shown = 0
         used = 0  # a table stops growing once the document would pass the output cap
         for r in range(nrows):
@@ -905,23 +999,45 @@ class _Render:
             if h and cells and not cells[0][0].startswith("(hidden) "):
                 cells[0] = ("(hidden) " + cells[0][0], cells[0][1])
             before = len(lines)
+            written.append(r)
             if spans:
                 tds = []
                 for s, info in cells:
                     cell, rs, cs = info
                     tag = "th" if cell.header else "td"
-                    attrs = (f' rowspan="{rs}"' if rs > 1 else "") + (f' colspan="{cs}"' if cs > 1 else "")
-                    tds.append(f"<{tag}{attrs}>{s}</{tag}>")
-                lines.append(f"<tr>{''.join(tds)}</tr>")
+                    attrs = (f" rowspan={rs}" if rs > 1 else "") + (f" colspan={cs}" if cs > 1 else "")
+                    tds.append(f"<{tag}{attrs}>{s}")
+                lines.append("<tr>" + "".join(tds))
             else:
-                lines.append("|" + "|".join(s for s, _ in cells) + "|")
+                lines.append(_pipe_row([s for s, _ in cells]))
                 if shown == 0:
-                    lines.append("|" + "|".join("---" for _ in range(ncols)) + "|")
+                    lines.append("|".join("-" * ncols))
             shown += 1
             used += sum(len(x) + 1 for x in lines[before:])
         if spans:
             lines = ["<table>", *lines, "</table>"] if lines else []
-        return finish("\n".join(lines))
+            return finish("\n".join(lines))
+        return finish("\n".join(lines), ", ".join(self._merged(t, origins, whole, written)))
+
+    @staticmethod
+    def _merged(t: Table, origins, whole, written) -> list:
+        """The merged regions of a table written with pipes, as A1 ranges. A sheet's table names them by the sheet's
+        own addresses, whole; any other by the rows and columns written, row 1 the first row written, and a region
+        with one cell written is left out."""
+        out = []
+        if t.origin:
+            m = _A1.fullmatch(t.origin)
+            r0, c0 = (int(m.group(2)) - 1, _column(m.group(1))) if m else (0, 0)
+            for (r, _), (c, rs, cs) in sorted(whole.items()):
+                out.append(f"{_a1(r0 + r, c0 + c)}:{_a1(r0 + r + rs - 1, c0 + c + cs - 1)}")
+            return out
+        at = {r: k for k, r in enumerate(written)}
+        for r, c in sorted(whole):
+            _, rs, cs = origins[(r, c)]
+            rows = [at[x] for x in range(r, r + rs) if x in at]
+            if rows and len(rows) * cs > 1:
+                out.append(f"{_a1(rows[0], c)}:{_a1(rows[-1], c + cs - 1)}")
+        return out
 
     # ---- document
     def body(self) -> str:

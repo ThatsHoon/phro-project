@@ -1115,7 +1115,7 @@ def test_v4_v5_side_by_side():
     doc, ctx = _numbers(*v4, *v5, sheets=[("S", [600, 800])])
     md = _md(doc, ctx)
     assert [t.caption for t in _tables(doc)] == ["Old", "New"] and not ctx.skipped, ctx.skipped
-    assert "Old\n|old|4|" in md and "New\n|new|5|" in md, md
+    assert "Old\nold|4\n" in md and "New\nnew|5\n" in md, md
 
 
 def test_wide_offsets():
@@ -2410,7 +2410,7 @@ def test_09_numbers_spans():
     [tab] = _tables(doc)
     assert [c.colspan for c in tab.rows[0]] == [2, 1], tab.rows[0]
     md = _md(doc, ctx)
-    assert md.count('colspan="2"') == 1, md
+    assert "\nWide||C\n-|-|-\na|b|c\n||q||\n\nMerged: A1:B1\n" in md, md
     assert not ctx.skipped, ctx.skipped
     # the column counts place a sparse row: a column whose count is spent is passed over (docling `place_row`)
     rows = [[_t("a"), _t("b")], [_t("y")], [_t("z")]]

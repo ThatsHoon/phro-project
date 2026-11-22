@@ -103,8 +103,8 @@ def test_pdfium_table():
     page = text_ops("Before", y=700) + b" " + _grid_ops() + b" " + words + b" " + text_ops("After", y=400)
     got = run(simple_pdf([page]))
     md = got["md"]
-    assert "|Alpha|Beta|" in md and "|Gamma|Delta|" in md, md
-    assert md.count("Alpha") == 1 and md.index("Before") < md.index("|Alpha") < md.index("After"), md
+    assert "\nAlpha|Beta\n" in md and "\nGamma|Delta\n" in md, md
+    assert md.count("Alpha") == 1 and md.index("Before") < md.index("Alpha|") < md.index("After"), md
     assert not got["skipped"], got["skipped"]
 
 
@@ -119,7 +119,7 @@ def test_pdfium_form_rules():
     words = b" ".join(text_ops(t, x=x, y=y, size=10) for t, x, y in cells)
     page = b"q 1 0 0 1 0 20 cm /Fm Do Q " + words
     got = run(simple_pdf([page], resources=dict(F1, XObject={"Fm": Ref(30)}), extra_objects={30: form}))
-    assert "|Alpha|Beta|" in got["md"] and "|Gamma|Delta|" in got["md"], got["md"]
+    assert "\nAlpha|Beta\n" in got["md"] and "\nGamma|Delta\n" in got["md"], got["md"]
 
 
 def test_pdfium_bitmap_png():
@@ -142,7 +142,7 @@ def test_pdfium_dct_kept():
 
 def test_pdfium_scan_rendered():
     got = run(with_image(FULL, image_xobject(64, 64, data=bytes(range(64)) * 64)))
-    assert "![Scanned page 1](" in got["md"], got["md"]
+    assert "![Scanned page 1 935x1210](" in got["md"], got["md"]
     assert len(got["assets"]) == 1 and got["assets"][0][2] == 935, got["assets"]
     assert got["meta"]["unrendered"] == [] and not got["skipped"], got
 
@@ -790,7 +790,7 @@ def test_pdfium_scan_read_by_ocr():
         assert got["sent"] == [[1700, 2200, "page", 200.0]], got["sent"]
         md = got["md"]
         assert md.index("_Scanned page, text by OCR._") < md.index("w1700"), md
-        assert ("![Scanned page 1](assets/img-001.png)" in md) == linked, md
+        assert ("![Scanned page 1 935x1210](assets/img-001.png)" in md) == linked, md
         assert got["assets"] == ([["img-001.png", 935, 1210]] if linked else []), got["assets"]
         assert got["meta"]["ocr"] == {"pages": 1, "doubtful": int(linked), "failed": 0, "stopped_at": None}
         assert not got["skipped"], got["skipped"]
@@ -850,7 +850,7 @@ def test_pdfium_small_scan_not_sent():
                       extra_objects={30: image_xobject(64, 64, data=bytes(range(64)) * 64)}, media=(0, 0, 20, 20))
     stub = str(HERE / "tests" / "ocr_stub_worker.py")
     got = child(_SCAN, data, stub, env=dict(os.environ, PHRO_OCR_STUB="{}"))
-    assert got["sent"] == [] and got["md"] == "## Page 1\n\n![Scanned page 1](assets/img-001.png)\n", got
+    assert got["sent"] == [] and got["md"] == "## Page 1\n\n![Scanned page 1 31x31](assets/img-001.png)\n", got
     assert not got["skipped"], got["skipped"]
 
 
@@ -884,7 +884,7 @@ def test_pdfium_unmapped_page_read_by_ocr():
     assert got["meta"]["ocr"] == {"pages": 1, "doubtful": 0, "failed": 0, "stopped_at": None}, got["meta"]
     got = child(_SCAN, data, stub, env=dict(os.environ, PHRO_OCR_STUB=json.dumps({"die_after": 0})))
     md = got["md"]
-    assert "Title" in md and "|Alpha|Beta|" in md and "![Page 1, text without Unicode](assets/img-001.png)" in md, md
+    assert "Title" in md and "\nAlpha|Beta\n" in md and "![Page 1, text without Unicode 935x1210](assets/img-001.png)" in md, md
     assert "_Scanned page" not in md and got["skipped"] == {"glyphs": 1}, (got["skipped"], md)
     assert got["meta"]["ocr"] == {"pages": 0, "doubtful": 0, "failed": 1, "stopped_at": None}, got["meta"]
 

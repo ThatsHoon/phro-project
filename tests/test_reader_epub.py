@@ -157,7 +157,7 @@ def test_nav_toc_removed():
 def test_table_colspan_and_header():
     body = '<table><tr><th colspan="2">h</th></tr><tr><td>a</td><td>b</td></tr></table>'
     out, _ = md(epub_book({"c.xhtml": body}))
-    assert '<th colspan="2">' in out or '<td colspan="2">' in out, out
+    assert "\n|h||\n-|-\na|b\n\nMerged: A1:B1\n" in out, out
 
 
 def test_table_hostile_spans_clamped():
@@ -166,7 +166,7 @@ def test_table_hostile_spans_clamped():
     t0 = time.monotonic()
     out, _ = md(epub_book({"c.xhtml": body}))
     assert time.monotonic() - t0 < 5
-    assert 'rowspan="2"' in out and 'colspan="999' not in out and "c" in out, out
+    assert "\n|a||b||\n-|-|-|-\n||||c|\n\nMerged: A1:B2, C1:C2\n" in out, out
 
 
 def test_image_and_data_uri():
@@ -374,7 +374,7 @@ def test_dangling_noteref_stays_text():
 def test_colspan_capped_to_real_width():
     body = '<table><tr><td colspan="9">a</td></tr><tr><td>b</td><td>c</td></tr></table>'
     out, _ = md(epub_book({"c.xhtml": body}))
-    assert 'colspan="2"' in out and 'colspan="9"' not in out, out
+    assert "\n|a||\n-|-\nb|c\n\nMerged: A1:B1\n" in out, out
 
 
 def test_nested_table_list_quote_past_depth():

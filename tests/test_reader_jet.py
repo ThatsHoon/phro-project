@@ -267,15 +267,65 @@ def para_text(p):
     return "".join(x.text for x in p.inlines if isinstance(x, Text))
 
 
-def grid(sec):
+def cells(sec):
     """The table's cells as text, each row padded to the header's width (a Table keeps no trailing empty cells)."""
     table = next(b for b in sec.blocks if isinstance(b, Table))
     rows = [["".join(para_text(p) for p in cell.blocks) for cell in row] for row in table.rows]
+    if record(table):  # a lone wide row, a line a column: read back as a grid
+        pairs = [r[0].split("): ", 1) for r in rows]
+        return [[p[0] + ")" if len(p) == 2 else p[0] for p in pairs], [p[1] if len(p) == 2 else "" for p in pairs]]
     return [r + [""] * (len(rows[0]) - len(r)) for r in rows]
 
 
+def record(table):
+    return len(table.rows) > 12 and all(len(r) == 1 for r in table.rows)
+
+
+def hidden_columns(sec):
+    table = next(b for b in sec.blocks if isinstance(b, Table))
+    return table.hidden_rows if record(table) else table.hidden_cols
+
+
+def grid(sec):
+    """`cells` with each header cell cut to its column's name."""
+    rows = cells(sec)
+    return [[h.split(" (")[0] for h in rows[0]]] + rows[1:]
+
+
 def columns_line(sec):
-    return para_text(next(b for b in sec.blocks if isinstance(b, Para)))
+    """The header cells of the columns shown, "name (type, ...)" each, as one line."""
+    if not any(isinstance(b, Table) for b in sec.blocks):
+        return "Columns: " + " · ".join(para_text(b) for b in sec.blocks if isinstance(b, Para))
+    return "Columns: " + " · ".join(h for i, h in enumerate(cells(sec)[0]) if i not in hidden_columns(sec))
+
+
+def test_types_are_in_the_header_cells():
+    doc, ctx, md = convert(jet_db(1, [three()]))
+    assert ("## Table: Orders (3 rows)\n\nID (Long, PK)|Name (Text)|Notes (Memo)\n-|-|-\n1|Ann|first\n|2|Bob||\n"
+            "3|Cy|third note\n") in md, md
+    assert "Columns:" not in md and not ctx.skipped
+    doc, ctx, md = convert(jet_db(1, [Tbl("E", [Col("ID", LONG), Col("Name", TEXT)], [])]))
+    assert "## Table: E (0 rows)\n\nID (Long)|Name (Text)\n-|-\n" in md, md
+
+
+def test_lone_row_of_a_wide_table_is_written_as_lines():
+    cols = [Col("c%d" % i, LONG) for i in range(12)] + [Col("Name", TEXT)]
+    doc, ctx, md = convert(jet_db(1, [Tbl("W", cols, [list(range(12)) + ["Ann"]])]))
+    want = "## Table: W (1 row)\n\n" + "".join("c%d (Long): %d\n" % (i, i) for i in range(12)) + "Name (Text): Ann\n"
+    assert want in md and "|" not in md and not ctx.skipped, md
+    doc, ctx, md = convert(jet_db(1, [Tbl("W", cols, [list(range(12)) + ["Ann"], list(range(12)) + ["Bob"]])]))
+    assert "c0 (Long)|c1 (Long)|" in md and "c0 (Long): " not in md, md
+    doc, ctx, md = convert(jet_db(1, [Tbl("W", cols[1:], [list(range(11)) + ["Ann"]])]))
+    assert "c1 (Long)|c2 (Long)|" in md, md
+    cols = [Col("s_GUID", GUID)] + cols[:11] + [Col("Secret", TEXT, flags=0x10), Col("Note", MEMO), Col("Last", TEXT)]
+    row = ["01234567-89ab-cdef-0123-456789abcdef"] + list(range(11)) + ["classified", None, "z"]
+    data = jet_db(1, [Tbl("W", cols, [row])])
+    doc, ctx, md = convert(data)
+    assert ("\n\nc0 (Long): 0\n" in md and "c10 (Long): 10\nNote (Memo)\nLast (Text): z\n" in md and "Secret" not in md
+            and "s_GUID" not in md), md
+    _, _, shown = convert(data, hidden=True)
+    assert "\n\n(hidden) s_GUID (GUID): " in shown and "}\nc0 (Long): 0\n" in shown, shown
+    assert "c10 (Long): 10\n(hidden) Secret (Text): classified\nNote (Memo)\n" in shown, shown
 
 
 def three():
@@ -1714,29 +1764,26 @@ def test_schema_line():
             "Total (Currency, required) · Notes (Memo, rich text)"), v
         assert columns_line(section(doc, "Customers")) == "Columns: ID (Long, PK, autonumber) · Name (Text)"
         assert grid(section(doc, "Orders"))[1] == ["1", "7", "2023-03-15", "1", "n"]
-        assert not ctx.skipped and "MSysRelationships" not in md and "Columns: OrderID" in md, ctx.skipped
+        assert not ctx.skipped and "MSysRelationships" not in md and "\nOrderID (Long, PK, autonumber)|" in md, ctx.skipped
 
 
 def test_hidden_columns():
     # a replication column (s_GUID), a Gen_ column naming a column of its table (Gen_Notes) and a column flagged
-    # 0x10: Hidden inlines in the schema line (each holding its separator, so the visible line reads right) and
-    # hidden columns of the grid. A user column that only looks like one (s_total, Gen_Other with no Other) is shown
+    # 0x10: hidden columns of the grid, header cell and all. A user column that only looks like one (s_total, Gen_Other with no Other) is shown
     guid = "01234567-89ab-cdef-0123-456789abcdef"
     cols = [Col("ID", LONG), Col("s_GUID", GUID), Col("Secret", TEXT, flags=0x10), Col("Name", TEXT),
             Col("Gen_Notes", BINARY), Col("Notes", MEMO), Col("s_total", LONG), Col("Gen_Other", TEXT)]
     data = jet_db(1, [Tbl("H", cols, [[1, guid, "classified", "Ann", b"\x01", "a note", 12, "gen"]])])
     doc, ctx, md = convert(data)
     sec = section(doc, "H")
-    line = next(b for b in sec.blocks if isinstance(b, Para))
     assert columns_line(sec) == ("Columns: ID (Long) · Name (Text) · Notes (Memo) · s_total (Long) · "
                                  "Gen_Other (Text)"), columns_line(sec)
-    hidden = ["".join(t.text for t in x.inlines) for x in line.inlines if isinstance(x, Hidden)]
-    assert hidden == [" · s_GUID (GUID)", " · Secret (Text)", " · Gen_Notes (Binary)"], hidden
+    assert [cells(sec)[0][i] for i in (1, 2, 4)] == ["s_GUID (GUID)", "Secret (Text)", "Gen_Notes (Binary)"]
     table = next(b for b in sec.blocks if isinstance(b, Table))
     assert table.hidden_cols == frozenset({1, 2, 4}) and grid(sec)[1][2] == "classified"
     assert "classified" not in md and "Secret" not in md, md
     assert "s_GUID" not in md and "Gen_Notes" not in md and not ctx.skipped
-    assert grid(sec)[1][5:] == ["a note", "12", "gen"] and "|12|gen|" in md, md
+    assert grid(sec)[1][5:] == ["a note", "12", "gen"] and "|12|gen\n" in md, md
     _, _, shown = convert(data, hidden=True)
     assert "classified" in shown and "s_GUID (GUID)" in shown and "Gen_Notes" in shown
     # the names are matched without case; flag 0x10 hides any column
@@ -1745,11 +1792,9 @@ def test_hidden_columns():
     doc, _, _ = convert(jet_db(1, [Tbl("C", cols, [[1, b"\x01", b"\x02", "n", "p", b"\x03", 4]])]))
     table = next(b for b in section(doc, "C").blocks if isinstance(b, Table))
     assert table.hidden_cols == frozenset({1, 2, 4, 5, 6}), table.hidden_cols
-    # a hidden first column carries the separator after it
+    # a hidden first column leaves a table of one column: lines
     doc, _, md = convert(jet_db(1, [Tbl("F", [Col("s_Lineage", BINARY), Col("A", LONG)], [[b"\x01", 5]])]))
-    line = next(b for b in section(doc, "F").blocks if isinstance(b, Para))
-    assert [x.inlines[0].text for x in line.inlines if isinstance(x, Hidden)] == ["s_Lineage (Binary) · "]
-    assert "Columns: A (Long)\n" in md, md
+    assert "## Table: F (1 row)\n\n(hidden columns A)\nA (Long)\n5\n" in md and "s_Lineage" not in md, md
 
 
 def test_pk_order():
@@ -1920,7 +1965,7 @@ def test_schema_targets_charged():
     with Loops() as loops:
         line = jet._schema(db, tdef, "A", rels)
     spent = db.meter.charged - before
-    assert "".join(x.text for x in line).count(" → T") == 300
+    assert "".join(line).count(" → T") == 300
     assert loops.n <= 2 * spent + 16 and spent >= 300 * jet._REF, (loops.n, spent)
 
 
@@ -2568,7 +2613,7 @@ def test_expression_charged():
     with Loops() as loops:
         line = jet._schema(db, tdef, "K", {})
     spent = db.meter.charged - before
-    assert "= [A]+[A]+" in "".join(x.text for x in line) and spent >= 12_000 and loops.n <= 2 * spent + 16, \
+    assert "= [A]+[A]+" in "".join(line) and spent >= 12_000 and loops.n <= 2 * spent + 16, \
         (loops.n, spent)
 
 # -- saved queries (jet_sql)

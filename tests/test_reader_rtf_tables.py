@@ -51,23 +51,21 @@ def hexed(data, line=64):
 def test_simple_table():
     data = b"{\\rtf1 " + rows((b"A", 1000), (b"B", 2000)) + rows((b"C", 1000), (b"D", 2000)) + b"\\pard after\\par}"
     out = md(data)
-    assert out == "|A|B|\n|---|---|\n|C|D|\n\nafter\n", out
+    assert out == "A|B\n-|-\nC|D\n\nafter\n", out
 
 
 def test_horizontal_merge():
     data = (b"{\\rtf1 " + rows((b"AB", 1000), (b"", 2000), (b"C", 3000), flags={0: b"\\clmgf", 1: b"\\clmrg"})
             + rows((b"x", 1000), (b"y", 2000), (b"z", 3000)) + b"}")
     out = md(data)
-    assert '<td colspan="2">AB</td><td>C</td>' in out, out
-    assert "<td>x</td><td>y</td><td>z</td>" in out, out
+    assert out == "AB||C\n-|-|-\nx|y|z\n\nMerged: A1:B1\n", out
 
 
 def test_vertical_merge():
     data = (b"{\\rtf1 " + rows((b"top", 1000), (b"R1", 2000), flags={0: b"\\clvmgf"})
             + rows((b"", 1000), (b"R2", 2000), flags={0: b"\\clvmrg"}) + b"}")
     out = md(data)
-    assert '<td rowspan="2">top</td>' in out, out
-    assert "<td>R2</td>" in out, out
+    assert out == "top|R1\n-|-\n||R2|\n\nMerged: A1:A2\n", out
 
 
 def test_uneven_edges():
@@ -156,7 +154,7 @@ def test_header_row_is_th():
     # a span makes the renderer write HTML, where header cells are th
     data = (b"{\\rtf1 " + rows((b"H", 2000), hdr=True) + rows((b"a", 1000), (b"b", 2000)) + b"}")
     out = md(data)
-    assert "<th" in out and "<td>a</td>" in out, out
+    assert out == "|H||\n-|-\na|b\n\nMerged: A1:B1\n", out
 
 
 def test_clustering_within_ten_twips():
@@ -322,7 +320,7 @@ def test_tables_of_other_edges_apart_are_two_gfm_tables():
     data = (b"{\\rtf1 " + rows((b"A", 1000), (b"B", 2000)) + rows((b"C", 1000), (b"D", 2000)) + b"\\pard\\par\n"
             + rows((b"E", 1500), (b"F", 3000)) + rows((b"G", 1500), (b"H", 3000)) + b"}")
     out = md(data)
-    assert out == "|A|B|\n|---|---|\n|C|D|\n\n|E|F|\n|---|---|\n|G|H|\n", out
+    assert out == "A|B\n-|-\nC|D\n\nE|F\n-|-\nG|H\n", out
 
 
 def test_empty_paragraph_between_rows_does_not_split_the_table():
@@ -381,7 +379,7 @@ def test_trleft_gap_cell():
     data = b"{\\rtf1 " + lrow(None, [(b"a", 1000), (b"b", 2000)]) + lrow(1000, [(b"c", 2000)]) + b"}"
     d, ctx = parse(rtf_file(data))
     assert spans(only_table(d)) == [[("a", 1), ("b", 1)], [("", 1), ("c", 1)]], spans(only_table(d))
-    assert md(data) == "|a|b|\n|---|---|\n||c|\n"
+    assert md(data) == "a|b\n-|-\n||c|\n"
 
 
 def test_trleft_minus_108_adds_no_column():

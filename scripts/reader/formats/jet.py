@@ -42,13 +42,14 @@ properties, Format (only Percent and Yes/No are applied, to numbers: Percent is 
 
 Relationships. MSysRelationships is read once, before any table: each row gives a foreign key (szObject, szColumn)
 and what it names (szReferencedObject, szReferencedColumn); a row naming a table the catalog does not hold is left
-out. The schema line shows the target after the column's type, "CustomerID (Long → Customers.ID)".
+out. The header cell shows the target after the column's type, "CustomerID (Long → Customers.ID)".
 
-Schema line. "Columns: " then each column as "name (type[ → targets][, = expression][, PK][, autonumber][,
-required][, rich text])"; an attachment column's type is "Attachment", another complex column's "Complex". A hidden
-column (flag 0x10; a replication column, `s_GUID`, `s_Lineage`, `s_Generation` or `s_ColLineage`; or `Gen_X` where X
-is a column of the same table; names without case) is a Hidden inline that holds its separator, and its grid column
-is hidden. A user column that only looks like one (`s_total`) is shown.
+Schema. The grid's header cell of each column is "name (type[ → targets][, = expression][, PK][, autonumber][,
+required][, rich text])"; an attachment column's type is "Attachment", another complex column's "Complex". The grid
+column of a hidden column (flag 0x10; a replication column, `s_GUID`, `s_Lineage`, `s_Generation` or `s_ColLineage`;
+or `Gen_X` where X is a column of the same table; names without case) is hidden. A user column that only looks like
+one (`s_total`) is shown. A table of over `_WIDE` columns with one row is written a line a column, "header cell:
+value", a table of one column in place of the grid (`_record`).
 
 Values. A Memo flagged 0x80 is a hyperlink, `display#address#subaddress#tip`: a Link when the address is http, https,
 mailto or ftp and holds no space or control character, else "display (address)".
@@ -169,7 +170,7 @@ from pathlib import Path
 from .. import html, limits
 from ..containers import flate
 from ..limits import ReadError
-from ..model import Break, Code, Doc, Hidden, Image, Link, Para, Section, Text
+from ..model import Break, Cell, Code, Doc, Hidden, Image, Link, Para, Section, Table, Text
 from . import jet_pages, jet_sql, sheet_grid
 
 JET_CATALOG = 100_000
@@ -209,14 +210,15 @@ _ROW = 16      # a live row (an overflow pointer to an unreadable row, about 15)
 _SLOT = 2      # a row slot of a data page, deleted or not
 _GROUP = 4     # a null-mask byte a row looks at, its eight bits
 _PAGE = 8      # a page a usage map names (or a TDEF page): its read and type check
-_COLDEF = 32   # a column definition: its block, and its share of the schema line, header, groups and lookups
+_COLDEF = 32   # a column definition: its block, and its share of the header cell, groups and lookups
 _IDX = 16      # a real or logical index block
 _PROP = 4      # a property blob's chunk, name or value (a list of empty names, about 2.6)
 _HTML = 8      # a character of rich text fed to the HTML parser (repeated <p>, about 5.2)
 _LINK = 1      # a character of a hyperlink split and checked (about 0.25)
 _KEY = 8       # a key column of a row kept for the primary-key sort (a one-column Long key, about 4.6)
 _SORT = 4      # a step of that sort, n times the bits of n (ten Decimal columns, the last differing: about 2.2)
-_REF = 8       # a relationship target written in the schema line (two names of up to JET_NAME, about 3.2)
+_WIDE = 12     # columns past which a table's lone row is written a line a column
+_REF = 8       # a relationship target written in a header cell (two names of up to JET_NAME, about 3.2)
 _CPLX = 8      # a value of a complex cell joined, or a file looked at for a picture (and a unit a character joined)
 _PART = 4      # a part of a linked table's connect string (and a unit a character)
 _NAME = 8      # an object or linked table named in the summary (a name of up to JET_NAME, its target already charged)
@@ -1830,15 +1832,13 @@ def _shown(db: _Db, cols: list, cells: dict, bools: list, cplx=None) -> list:
 
 
 def _schema(db: _Db, tdef: Tdef, name: str, rels: dict, cplx=None) -> list:
-    """The "Columns:" line as inlines: each column's name, type ("Attachment" for an attachment column), the targets
-    its relationships name (`_REF` each, charged first), a calculated column's "= expression" (on one line, cut at
-    JET_CELL_CHARS, counted `text`; its characters charged first), PK, autonumber, required and rich text. A hidden
-    column is a Hidden inline holding its separator (the one before it, or after it when no shown column comes
-    first), so the shown line reads right either way."""
+    """The header cell of each column: its name, type ("Attachment" for an attachment column), the targets its
+    relationships name (`_REF` each, charged first), a calculated column's "= expression" (on one line, cut at
+    JET_CELL_CHARS, counted `text`; its characters charged first), PK, autonumber, required and rich text."""
     pk = set(tdef.pk)
     table = name.lower()
     cols = tdef.columns
-    out, text, shown = [], ["Columns: "], False
+    out = []
     for k, c in enumerate(cols):
         info = cplx.get(k) if cplx else None
         kind = "Attachment" if info and info.kind == "attachment" else TYPE_NAMES.get(c.type, f"type {c.type}")
@@ -1858,22 +1858,16 @@ def _schema(db: _Db, tdef: Tdef, name: str, rels: dict, cplx=None) -> list:
             bits.append("required")
         if c.rich:
             bits.append("rich text")
-        piece = f"{c.name} ({', '.join(bits)})"
-        if not c.hidden:
-            text.append(" · " + piece if shown else piece)
-            shown = True
-            continue
-        if text:
-            out.append(Text("".join(text)))
-            text = []
-        if shown:
-            piece = " · " + piece
-        elif k + 1 < len(cols):
-            piece += " · "
-        out.append(Hidden([Text(piece)]))
-    if text:
-        out.append(Text("".join(text)))
+        out.append(f"{c.name} ({', '.join(bits)})")
     return out
+
+
+def _record(heads: list, cols: list, shown: list) -> Table:
+    """The lone row of a table of over _WIDE columns as a table of one column, a row a column of the database's:
+    its header cell, then ": " and its value when it has one. A hidden column's row is hidden."""
+    got = dict(shown)
+    rows = [[Cell([Para([Text(heads[i] + (": " + str(got[i]) if got.get(i) else ""))])])] for i in range(len(cols))]
+    return Table(rows, hidden_rows=frozenset(i for i, c in enumerate(cols) if c.hidden))
 
 
 def _key_columns(tdef: Tdef) -> list:
@@ -1951,15 +1945,15 @@ class _Order:
 
 
 def _table(db: _Db, obj: Obj, budget, rels: dict, objs=()):
-    """The table's Section; None when the meter runs out on its TDEF, its properties, its complex columns or its schema
-    line (counted `db_table`, as a table not read). A table with a primary key shows its rows in key order when they
+    """The table's Section; None when the meter runs out on its TDEF, its properties, its complex columns or its header
+    cells (counted `db_table`, as a table not read). A table with a primary key shows its rows in key order when they
     all fit the grid and the meter affords the sort; else in page order. The pictures of the rows shown follow the
     grid, in their order, alt "<table> <key>: <file name>" (the key the row's primary key values, or its row number)."""
     try:
         tdef = _tdef(db, obj.id & 0xFFFFFF)
         _apply_props(db, tdef, db.props_of(obj))
         cplx = {i: _complex_info(db, objs, tdef, c) for i, c in enumerate(tdef.columns) if c.type == COMPLEX}
-        line = _schema(db, tdef, obj.name, rels, cplx)
+        heads = _schema(db, tdef, obj.name, rels, cplx)
     except _Spent:
         db.ctx.skipped["db_table"] += 1
         return None
@@ -1967,7 +1961,7 @@ def _table(db: _Db, obj: Obj, budget, rels: dict, objs=()):
     grid = sheet_grid.Grid(obj.name, budget, db.ctx)
     cols = tdef.columns
     for i, c in enumerate(cols):
-        if not grid.put(0, i, c.name):
+        if not grid.put(0, i, heads[i]):
             break
     for i, c in enumerate(cols):
         if c.hidden:
@@ -1980,9 +1974,11 @@ def _table(db: _Db, obj: Obj, budget, rels: dict, objs=()):
     done = {}
     r = 1
     pics, pics_cut = [], False
+    lone = None
 
     def put(shown):
-        nonlocal r, pics_cut
+        nonlocal r, pics_cut, lone
+        lone = shown if r == 1 else None
         files = []
         for i, v in shown:
             if isinstance(v, _Files):
@@ -2038,7 +2034,8 @@ def _table(db: _Db, obj: Obj, budget, rels: dict, objs=()):
         if db.meter.afford(_SORT * n * n.bit_length()):
             order.rows.sort(key=itemgetter(0))  # stable: equal keys keep their page order
         flush()
-    blocks = [Para(line)] + grid.blocks() + pics
+    wide = lone is not None and len(cols) > _WIDE and not grid.cut
+    blocks = ([_record(heads, cols, lone)] if wide else grid.blocks()) + pics
     if obj.flags & HIDDEN_FLAG:
         return Section("table", title, blocks=_hide(blocks), hidden="hidden")
     return Section("table", title, blocks=blocks)

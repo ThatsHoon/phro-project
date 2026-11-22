@@ -255,7 +255,7 @@ def test_story_outside_package_ignored():
 def test_image_brush():
     body = '<Path><Path.Fill><ImageBrush ImageSource="/Resources/a.png"/></Path.Fill></Path>' + g("t", 10, 10)
     out = text(xps_doc([body], extra={"Resources/a.png": PNG}))
-    assert out.splitlines().count("![](assets/img-001.png)") == 1 and "t" in out.splitlines()
+    assert out == "t\n\n![1x1](assets/img-001.png)", out
 
 
 def test_image_hostile():
