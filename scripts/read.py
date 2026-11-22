@@ -153,7 +153,10 @@ def source(arg: str) -> str:
     if not arg.startswith("file:"):
         return arg
     from urllib.request import url2pathname
-    return url2pathname(arg[5:])
+    try:
+        return url2pathname(arg[5:])
+    except OSError:
+        return arg
 
 
 def _reexec(a):

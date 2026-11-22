@@ -34,6 +34,7 @@ def tmp():
 
 def test_convert_takes_a_file_uri():
     assert read.source("d/a b.docx") == "d/a b.docx"
+    assert read.source("file:///C:/d:/a.docx") in ("file:///C:/d:/a.docx", "/C:/d:/a.docx")
     assert read.source("file:d/it%27s%20%24%28x%29.docx") == os.path.join("d", "it's $(x).docx")
     if os.name == "nt":
         assert read.source("file:///C:/d/John%27s%20report.docx") == "C:\\d\\John's report.docx"

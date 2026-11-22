@@ -130,7 +130,7 @@ def _name(path):
 def _quoted(path):
     """`path` as one word of a command line that bash and PowerShell read alike: in single quotes, where neither
     expands anything; a path with a single quote, which the two shells escape differently, as a percent-encoded
-    file: URI with no character either shell reads (read.py's `source` takes it back). A long-path prefix
+    file: URI in single quotes, with no character either shell reads (read.py's `source` takes it back). A long-path prefix
     (\\\\?\\) is left off."""
     s = str(path)
     if s.startswith("\\\\?\\UNC\\"):
@@ -141,7 +141,7 @@ def _quoted(path):
         return "'" + s + "'"
     s = s.replace("\\", "/")
     lead = "file:" if s.startswith("//") else "file:///" if s[1:3] == ":/" else "file://" if s.startswith("/") else "file:"
-    return lead + quote(s, safe="/:")
+    return "'" + lead + quote(s, safe="/:") + "'"
 
 
 def _by_hand(path, engine=""):
