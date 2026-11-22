@@ -7,9 +7,9 @@ types follow anydoc `sheet/xlsx.rs`; the streaming walk, which keeps one cell in
 The workbook part gives the sheets in file order. A relationship of type worksheet or chartsheet is read; any other
 type (a macro or dialog sheet) and a missing relationship are counted under `sheet`. Styles and shared strings are
 streamed, the shared strings under their own cap (`SHEET_CHARS` characters, `SHEET_SCAN` entries), and each part
-under a closed-element cap (SST_ELEMENTS, STYLE_ELEMENTS); one that is named but missing, damaged or capped counts
+under an opened-element cap (SST_ELEMENTS, STYLE_ELEMENTS); one that is named but missing, damaged or capped counts
 `document`. Text escapes (`_xHHHH_`) are undone in strings, str and error values, formulas and sheet names. Every
-sheet part is streamed, and every element it closes is charged to the workbook's scan count, capped at `SHEET_SCAN`.
+sheet part is streamed, and every element it opens is charged to the document's scan count, capped at `SHEET_SCAN`.
 A sheet reached once the count is spent is cut without being opened, its comments unread (counted as `comments_cut`
 when it has some), so neither is charged to ZIP_TOTAL ahead of its drawings.
 A cell shows its cached value; a formula without one shows `=` and its text. Every formula, a shared one
@@ -36,7 +36,7 @@ Cell comments become notes (legacy `comments` parts ported from dochan, threaded
 then its replies, each a "Comment by <name>:" paragraph of one note, the names from the workbook's persons part; a
 legacy comment on a cell a thread covers is its placeholder and is dropped. The note's mark follows the cell's text
 (and its link); a commented cell with no value holds the mark alone. At most SHEET_COMMENTS comments are read a
-workbook (the rest counted once as `comments_cut`). The parts are streamed under _COMMENT_ELEMENTS closed elements each, empty
+workbook (the rest counted once as `comments_cut`). The parts are streamed under _COMMENT_ELEMENTS opened elements each, empty
 and out-of-grid comments included. Notes are placed after the cells: first the cells that hold only a mark, then the
 marks appended to valued cells, each only if its put succeeds and its text fits the character budget that the cells
 share (else the note is dropped, counted once as `comments_cut`). A comment on a merged-away cell moves its mark to
@@ -48,10 +48,10 @@ import posixpath
 import re
 from datetime import datetime
 
-from .. import limits
+from .. import embedded, limits
 from ..containers.zipx import attr, iterparse, local
 from ..limits import ReadError
-from ..model import Doc, Para, Section, Text
+from ..model import Doc, Equation, Para, Section, Text
 from ..numfmt import code_for
 from . import ooxml_base, sheet_drawing, sheet_grid
 from .word_fields import MAX_URL, comment_note
@@ -76,7 +76,7 @@ _PARENT = {"col": "cols", "mergeCell": "mergeCells", "hyperlink": "hyperlinks", 
            **dict.fromkeys(_FILTERS, "filterColumn")}
 _SHEET_TAGS = frozenset(_PARENT)
 _KEEP = frozenset({"formula1", "formula2"})
-_COMMENT_ELEMENTS = 200_000  # elements a comments, threaded comments or persons part may close; past it the part stops
+_COMMENT_ELEMENTS = 200_000  # elements a comments, threaded comments or persons part may open; past it the part stops
 _BATCH = 256  # ended siblings a streamed element keeps before they are dropped together
 
 
@@ -274,6 +274,7 @@ class _Wb:
         self.chartsheets: set[str] = set()  # sheet parts whose relationship is a chartsheet
         self.part = ""  # the workbook part
         self.at: dict[int, int] = {}
+        self.active = 0  # the first workbookView's activeTab: a position in the `sheets` element
         self.names: list[tuple[str, bool]] = []
         self.local: dict[int, list] = {}
         self.externals: list[str] = []
@@ -324,6 +325,10 @@ def _workbook(root, rels, wb, ctx):
         elif n == "workbookProtection":
             wb.protect = [(f"workbook {w}", False) for w, a in (("structure", "lockStructure"),
                                                                ("windows", "lockWindows")) if _on(attr(el, a))]
+        elif n == "bookViews":
+            tab = next((attr(v, "activeTab") or "" for v in el if local(v.tag) == "workbookView"), "")
+            if tab.isascii() and tab.isdigit() and len(tab) < 10:
+                wb.active = int(tab)
         elif n == "externalReferences":
             wb.externals = [attr(x, "id") or "" for x in el if local(x.tag) == "externalReference"]
         elif n == "definedNames":
@@ -357,24 +362,26 @@ def _workbook(root, rels, wb, ctx):
 def _styles(pkg, part, wb, ctx):
     """`numFmts/numFmt` codes and the `cellXfs/xf` format ids, streamed; `cellStyleXfs` is not read. The read ends
     with `cellXfs` (by schema order `numFmts` comes before it, and nothing after it is used). Past STYLE_ELEMENTS
-    closed elements the part stops, counted under `document`, and what was read is kept."""
-    seen, els, tags, done, names = 0, [], [], [], {}
+    opened elements, the document's embedded workbooks counted with it, the part stops, counted under `document`,
+    and what was read is kept."""
+    budget = embedded.of(ctx).budget()
+    els, tags, done, names = [], [], [], {}
     with pkg.open(part) as f:
         for ev, el in iterparse(f, ("start", "end")):
             name = names.get(el.tag)
             if name is None:
                 name = names[el.tag] = local(el.tag)
             if ev == "start":
+                if budget.styles >= STYLE_ELEMENTS:
+                    ctx.skipped["document"] += 1
+                    return
+                budget.styles += 1
                 els.append(el)
                 tags.append(name)
                 done.append(0)
                 continue
             els.pop()
             tags.pop()
-            seen += 1
-            if seen > STYLE_ELEMENTS:
-                ctx.skipped["document"] += 1
-                return
             if tags:
                 if name == "numFmt" and tags[-1] == "numFmts":
                     fid = _int(attr(el, "numFmtId"))
@@ -388,17 +395,21 @@ def _styles(pkg, part, wb, ctx):
 
 
 def _strings(pkg, part, wb, ctx):
-    """The shared-string table, streamed; past its character or entry cap, or SST_ELEMENTS times SHEET_SCAN closed
-    elements, it stops, counted once (decision 2)."""
+    """The shared-string table, streamed; past its character or entry cap, or SST_ELEMENTS times SHEET_SCAN opened
+    elements, the document's embedded workbooks counted with it, it stops, counted once (decision 2)."""
     chars_cap, entries_cap = limits.SHEET_CHARS, limits.SHEET_SCAN
     cap = SST_ELEMENTS * limits.SHEET_SCAN
-    seen, total, size, parts, els, tags, done, names = 0, 0, 0, [], [], [], [], {}
+    budget = embedded.of(ctx).budget()
+    total, size, parts, els, tags, done, names = 0, 0, [], [], [], [], {}
     with pkg.open(part) as f:
         for ev, el in iterparse(f, ("start", "end")):
             name = names.get(el.tag)
             if name is None:
                 name = names[el.tag] = local(el.tag)
             if ev == "start":
+                if budget.strings >= cap:
+                    return _cut(ctx, f"{cap} XML elements")
+                budget.strings += 1
                 els.append(el)
                 tags.append(name)
                 done.append(0)
@@ -407,9 +418,6 @@ def _strings(pkg, part, wb, ctx):
                 continue
             els.pop()
             tags.pop()
-            seen += 1
-            if seen > cap:
-                return _cut(ctx, f"{cap} XML elements")
             if name == "t" and tags:
                 up = tags[-1]
                 if up == "si" or (up == "r" and len(tags) >= 2 and tags[-2] == "si"):
@@ -472,13 +480,13 @@ def read_workbook(pkg, part, ctx) -> _Wb:
 
 
 class _Sheets:
-    """The sheets of one workbook, sharing one cell budget and one scan count."""
+    """The sheets of one workbook, under the document's sheet budget and scan count."""
 
     def __init__(self, pkg, wb, ctx):
         self.pkg, self.wb, self.ctx = pkg, wb, ctx
-        self.budget = sheet_grid.Budget()
+        self.objects = embedded.Parts(pkg, ctx)
+        self.budget = self.objects.objects.budget()
         self.draw = sheet_drawing.Drawings(pkg, ctx)  # charts and pictures; one image byte count and chart cell count
-        self.scan = 0                    # elements the sheet parts have closed, all sheets together
         self.used: set[str] = set()      # sheet parts read
         self.notes: dict = {}            # note key -> blocks, for Doc.notes
         self.comment_count = 0           # comments turned into notes, all sheets together
@@ -541,7 +549,7 @@ class _Sheets:
             return self._drawn(part, relmap)
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         cap = limits.SHEET_SCAN
-        if self.scan >= cap:
+        if self.budget.scan >= cap:
             # its first element could not close inside the cap: the sheet is cut as the stream would cut it, but its
             # part and comments are not opened, so their bytes are not charged to ZIP_TOTAL ahead of its drawings
             grid.stop("scanned XML elements", cap)
@@ -562,9 +570,10 @@ class _Sheets:
                     if tag is None:
                         tag = names[el.tag] = local(el.tag)
                     if ev == "start":
-                        if self.scan >= cap:  # this element cannot close inside the cap
+                        if self.budget.scan >= cap:  # an element past the cap: exactly SHEET_SCAN are not a cut
                             grid.stop("scanned XML elements", cap, (max(row, 0), None))
                             break
+                        self.budget.scan += 1
                         stack.append(el)
                         done.append(0)
                         if tag == "c":
@@ -583,10 +592,6 @@ class _Sheets:
                         continue
                     stack.pop()
                     kids = done.pop()
-                    self.scan += 1
-                    if self.scan > cap:  # an element past the cap: exactly SHEET_SCAN closes are not a cut
-                        grid.stop("scanned XML elements", cap, (max(row, 0), None))
-                        break
                     if tag == "c":
                         cells -= 1
                         c = _col(el.get("r"))
@@ -715,13 +720,37 @@ class _Sheets:
         grid.fact(f"Pivot {attr(root, 'name') or ''} {ref}".rstrip(), about or [("no fields", False)])
 
     def _drawn(self, part, relmap) -> list:
-        """The sheet's charts and pictures in anchor order, from the relationships the sheet read once. A drawing
-        ReadError other than a timeout costs only the drawings, counted under `object`."""
+        """The sheet's charts and pictures in anchor order, then its embedded objects, from the relationships the
+        sheet read once. A drawing ReadError other than a timeout costs only the drawings, counted under `object`."""
+        rels = self._sheet_rels(part, relmap)
         try:
-            return self.draw.blocks(part, self._sheet_rels(part, relmap))
+            out = self.draw.blocks(part, rels)
         except ReadError as e:
             _skip(self.ctx, "object", e)
-            return []
+            out = []
+        return out + self._embedded(rels)
+
+    def _embedded(self, rels) -> list:
+        """The sheet's embedded objects (its oleObject and package relationships, in id order), by embedded.Parts: an
+        equation or tables after the sheet's drawings. One that is not read is counted under object, a chart left
+        unread under chart; the sheet's legacy drawing holds its preview, which is not read."""
+        out = []
+        for rid in sorted(rels, key=lambda r: (len(r), r)):
+            rel = rels[rid]
+            if rel.external or not rel.type.endswith(("/oleObject", "/package")):
+                continue
+            got = self.objects.rel(rel)
+            kind = got[0] if got else ""
+            tables = self.objects.place(got) if kind == "table" else None
+            if tables is not None:
+                out.extend(tables)
+            elif kind == "equation":
+                out.append(Equation(got[1]))
+                if got[2]:
+                    self.ctx.skipped["depth" if got[2] <= {"depth"} else "object"] += 1
+            else:
+                self.ctx.skipped["chart" if kind in ("chart", "table") else "object"] += 1
+        return out
 
     def _collect(self, el, part, links, grid, relmap):
         """Keep the range of a `hyperlink`, the URL of the external hyperlink relationship it names and its
@@ -767,7 +796,7 @@ class _Sheets:
 
     def _ended(self, target):
         """Stream a part: yield (name, element, names of the open ancestors) for each element as it ends, then let
-        it go. Stops past _COMMENT_ELEMENTS closed elements, counted as `comments_cut`."""
+        it go. Stops past _COMMENT_ELEMENTS opened elements, counted as `comments_cut`."""
         seen, els, tags, done, names = 0, [], [], [], {}
         with self.pkg.open(target) as f:
             for ev, el in iterparse(f, ("start", "end")):
@@ -775,16 +804,16 @@ class _Sheets:
                 if name is None:
                     name = names[el.tag] = local(el.tag)
                 if ev == "start":
+                    if seen >= _COMMENT_ELEMENTS:
+                        self._cut_comments()
+                        return
+                    seen += 1
                     els.append(el)
                     tags.append(name)
                     done.append(0)
                     continue
                 els.pop()
                 tags.pop()
-                seen += 1
-                if seen > _COMMENT_ELEMENTS:
-                    self._cut_comments()
-                    return
                 yield name, el, tags
                 _drop(el, els, done)
 
@@ -943,10 +972,10 @@ class _Sheets:
             if item is None or grid.cut:
                 continue
             r1, r2, c1, c2, url, place = item
-            if self.scan + min((r2 - r1 + 1) * (c2 - c1 + 1), len(grid.cells)) > cap:
+            if self.budget.scan + min((r2 - r1 + 1) * (c2 - c1 + 1), len(grid.cells)) > cap:
                 self.ctx.skipped["link"] += 1
                 continue
-            self.scan += grid.link(r1, r2, c1, c2, url, place)
+            self.budget.scan += grid.link(r1, r2, c1, c2, url, place)
 
     def _cell(self, el, row: int, col: int, shared: dict):
         """The displayed value of a `c` element at (row, col) by its type, and its formula's pattern or None. The
@@ -1074,6 +1103,20 @@ def _book_facts(pkg, wb, budget, ctx) -> list:
     names = [e for e in wb.names if e[0].split(" = ", 1)[0] not in caches]
     return (sheet_grid.listed("Names", names, budget, ctx, cap=limits.FACT_ITEMS) + sheet_grid.listed("External links", links, budget, ctx, cap=limits.FACT_ITEMS)
             + sheet_grid.listed("Protected", wb.protect, budget, ctx))
+
+
+def active_sheet(pkg, part, ctx) -> list:
+    """The blocks of the workbook's active sheet, of its first shown sheet when that one is hidden or not in the
+    list: what an embedded workbook shows, the only sheet of it that is read. [] when it is not read."""
+    wb = read_workbook(pkg, part, ctx)
+    at = wb.at.get(wb.active)
+    pick = wb.sheets[at] if at is not None and wb.sheets[at][2] not in _HIDDEN else \
+        next((s for s in wb.sheets if s[2] not in _HIDDEN), None)
+    if pick is None:
+        return []
+    wb.sheets = [pick]
+    secs = _Sheets(pkg, wb, ctx).sections()
+    return secs[0].blocks if secs else []
 
 
 def parse_sheets(pkg, part, ctx) -> Doc:

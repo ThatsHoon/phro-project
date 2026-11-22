@@ -494,6 +494,9 @@ def _head(name, meta, assets):
     head = f"{name} was converted to Markdown by phro-project ({n} line{'' if n == 1 else 's'}"
     if m:
         head += f", {m} image in {assets}; Read it to view" if m == 1 else f", {m} images in {assets}; Read them to view"
+    v = meta.get("vba", 0)
+    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+        head += f", {v} VBA module{'' if v == 1 else 's'} in {assets}vba{os.sep}; Read one to see its source"
     head += ")."
     if k:
         head += f" {k} hidden place{'' if k == 1 else 's'} left out."

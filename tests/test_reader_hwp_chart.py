@@ -247,14 +247,14 @@ def test_native_chart_series_in_columns():
 
 def test_native_chart_kinds():
     for kind, name in ((3, "line"), (11, "bar"), (14, "pie"), (26, "unknown")):
-        table = hwp_chart.ole_table(native(kind=kind), Context())
+        [table] = hwp_chart.ole_blocks(native(kind=kind), Context())
         assert table.caption == f"Chart: {name} — Sales 2024", (kind, table.caption)
     # the VtWindow's VtObject base declared at the tail rather than referred to; a tail that does not end the archive
     # as VtChart's does leaves the kind unknown, and the data is still read
     c = contents(3, 4, ROWS, kind=10)
     declared = c[:-6] + i32(9) + u16(9) + b"VtObject\0" + u16(1) + bytes(2)
     for data, name in ((declared, "bar"), (c + b"\0", "unknown"), (c[:40] + i32(-1) + c[44:], "unknown")):
-        table = hwp_chart.ole_table(envelope({"Contents": data}), Context())
+        [table] = hwp_chart.ole_blocks(envelope({"Contents": data}), Context())
         assert table.caption == f"Chart: {name} — Sales 2024" and len(table.rows) == 4, (name, table.caption)
 
 
@@ -279,7 +279,7 @@ def test_ole_not_cfb_counted():
     for data in (struct.pack("<I", len(item)) + item[4:], b"\x01\x02", envelope({"Other": b"x" * 10}),
                  envelope({"Contents": b"\x00" * 64})):
         ctx = Context()
-        assert hwp_chart.ole_table(data, ctx) is None and ctx.skipped == {"object": 1}, ctx.skipped
+        assert hwp_chart.ole_blocks(data, ctx) == [] and ctx.skipped == {"object": 1}, ctx.skipped
 
 
 def test_native_chart_cap():
@@ -298,7 +298,7 @@ def test_native_chart_cap():
                    "Chart: column — Sales 2024 (first 1 points, first 1 series)\n||North|\n-|-\n1분기|10\n"), out
     assert ctx.skipped == {"chart_cut": 1}, ctx.skipped
     ctx = Context()  # read whole, the same grid does not parse
-    assert hwp_chart.ole_table(item, ctx) is None and ctx.skipped == {"chart": 1}, ctx.skipped
+    assert hwp_chart.ole_blocks(item, ctx) == [] and ctx.skipped == {"chart": 1}, ctx.skipped
 
 
 def test_native_grid_is_bounded():
@@ -309,7 +309,7 @@ def test_native_grid_is_bounded():
     item = envelope({"Contents": contents(rows, cols, cells)})
     ctx = Context()
     t0 = time.monotonic()
-    table = hwp_chart.ole_table(item, ctx)
+    [table] = hwp_chart.ole_blocks(item, ctx)
     took = time.monotonic() - t0
     # 0.5 s alone; a per-cell scan of the 120,000 slots (quadratic) is over 10**10 steps, minutes. 10 s holds when
     # two suites share the machine; the cell-count assertion below is what tells the cap from a full read
@@ -403,17 +403,17 @@ def test_stored_ole_marked_compressed():
 
 def test_ole_named_twice_read_once():
     calls = []
-    old = hwp.ole_table
+    old = hwp.ole_blocks
 
     def spy(data, ctx, **kw):
         calls.append(len(data))
         return old(data, ctx, **kw)
-    hwp.ole_table = spy
+    hwp.ole_blocks = spy
     try:
         out, ctx = read(doc(ole_shape(1), ole_shape(2), bins=items((2, 0, 1), (2, 0, 1)),
                             streams={"BIN0001.OLE": deflate(native())}, before="", after=""))
     finally:
-        hwp.ole_table = old
+        hwp.ole_blocks = old
     assert out == TABLE + "\n" + TABLE, out
     assert len(calls) == 1, calls
 
@@ -433,7 +433,7 @@ def test_chart_placements_charged():
     rows, cols, n = 3, 40_000, 50
     cells = {k: float(k) for k in range(cols + 2, rows * cols + 1) if (k - 1) % cols}
     item = envelope({"Contents": contents(rows, cols, cells)})
-    size = sum(len(r) for r in hwp_chart.ole_table(item, Context()).rows)
+    size = sum(len(r) for r in hwp_chart.ole_blocks(item, Context())[0].rows)
     t0 = time.monotonic()
     out, ctx = read(doc(*[ole_shape(1)] * n, bins=items((2, 0, 1)), streams={"BIN0001.OLE": deflate(item)},
                         before="", after=""))

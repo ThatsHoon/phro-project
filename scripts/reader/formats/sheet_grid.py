@@ -338,13 +338,15 @@ def _column_major(item):
 
 class Budget:
     """Cells, characters, valueless formula cells and characters of repeated formula text left for a document's
-    sheets; shared, so embedded workbooks count too."""
+    sheets, and the XML elements its sheet, shared-string and styles parts have opened (`scan`, `strings`,
+    `styles`); shared, so embedded workbooks count too."""
 
     def __init__(self, cells=None, chars=None):
         self.cells = self.cap_cells = limits.SHEET_CELLS if cells is None else cells
         self.chars = self.cap_chars = limits.SHEET_CHARS if chars is None else chars
         self.blank = limits.BLANK_FORMULAS
         self.copies = limits.FORMULA_COPY_CHARS
+        self.scan = self.strings = self.styles = 0
 
 
 class _Ranges:

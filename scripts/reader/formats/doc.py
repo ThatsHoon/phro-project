@@ -63,7 +63,7 @@ from itertools import islice
 from operator import gt
 
 from .. import diagram, images, limits, officeart
-from ..containers import flate
+from ..containers import flate, vba
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Inserted, Link, ListItem, NoteRef, Para, Table, Text
@@ -1103,5 +1103,6 @@ def parse(path, ctx) -> Doc:
     with Compound(path) as cf:
         other = cfb_route.route(cf, "doc", "no WordDocument stream")
         if other is None:
+            vba.compound(cf, ctx, "Macros/")
             return _Reader(cf, ctx, flate.Budget()).run()  # one inflate budget a document
     return cfb_route.parse(other, path, ctx)  # another format's compound file named .doc

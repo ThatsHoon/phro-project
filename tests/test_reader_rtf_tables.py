@@ -219,7 +219,7 @@ def test_jpeg_and_object_result():
             + hexed(JPEG) + b"}}}\\par}")
     d, ctx = parse(rtf_file(data))
     imgs = [b for b in d.blocks if isinstance(b, Image)]
-    assert len(imgs) == 1 and imgs[0].data == JPEG and not ctx.skipped, (d.blocks, ctx.skipped)
+    assert len(imgs) == 1 and imgs[0].data == JPEG and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
 
 
 def test_nested_group_in_pict_is_not_hex():

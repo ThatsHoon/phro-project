@@ -4,7 +4,7 @@ shapes, the page's connectors written as one `diagram` block.
 Elements match by local name. A shape without a Text element takes its master's shape text (`visio/masters`, each
 master part loaded once, up to MASTERS parts); a HideText cell, the shape's own else its master shape's, makes the text
 hidden. Shape text, own and each inherited copy, is charged to one MAX_OUTPUT room by its characters and LINE per
-line break. A vbaProject part is named, never read.
+line break. A vbaProject part's modules are read by containers.vba.
 
 Each page is one `diagram.Diagram` scope: every shape is registered under its ID (a missing or repeated one gets a key
 no glue names), textless ones too, and its slot in the flow carries that key. A shape's cells are its own, and for the
@@ -310,8 +310,7 @@ class _Reader:
 
     # ---- package
     def run(self) -> Doc:
-        if any(n.rsplit("/", 1)[-1].lower() == "vbaproject.bin" for n in self.pkg.names):
-            self.ctx.skipped["vba"] = 1  # macros are never read; named once, however many projects there are
+        ooxml_base.macros(self.pkg, self.ctx)
         main = None
         for rel in ooxml_base.rels(self.pkg, "").values():
             if rel.type.endswith("/document") and not rel.external and self.pkg.has(rel.target):

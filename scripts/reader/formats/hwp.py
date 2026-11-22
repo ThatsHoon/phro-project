@@ -22,18 +22,18 @@ from bisect import bisect_right
 from collections import deque
 from itertools import groupby
 
-from .. import diagram, limits
+from .. import diagram, embedded, limits
 from ..containers import flate
 from ..containers.cfb import Compound, is_cfb
 from ..images import sniff
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Image, NoteRef, Table, Text
-from . import hwpx, sheet_grid
+from . import hwpx
 from .hancom import (
     Frame, Obj, Scopes, State, alt_text, button, cut_command, diagrams, flat, heading_level, lone_equations,
     next_marker, outline_marker, paragraph, place, plain, props, style_name_level,
 )
-from .hwp_chart import ole_table
+from .hwp_chart import ole_blocks
 from .hwp_records import (
     CTRL_HEADER, EQEDIT, FORM_OBJECT, LIST_HEADER, MEMO_LIST, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT,
     SHAPE_COMPONENT, SHAPE_LINE, SHAPE_OLE, SHAPE_PICTURE, TABLE, TEXTART, DocInfo, ParaShape, doc_info, file_header,
@@ -248,11 +248,11 @@ class _Reader(Scopes):
         self.numbers = {}   # numbering id -> {level: counter}
         self.outline = 0    # the outline numbering id of the current section's secd
         self.blobs = {}     # (BinData stream name, inflated?, kind) -> its bytes, or None when it cannot be read
-        self.tables = {}    # an OLE item's bytes -> (its chart table or None, its cells, the kind it was counted under)
+        self.tables = {}    # an OLE item's bytes -> (the blocks it shows, their table cells, the kind it was counted under)
         self.opened = 0     # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
         self.chart_cells = 0  # chart table cells placed so far, copies counted (CHART_TOTAL)
-        self.sheets = sheet_grid.Budget()  # one for the document: the sheets of every embedded workbook share it
+        self.sheets = embedded.of(ctx).budget()
         self.objects = 0      # OLE items read so far (MAX_OBJECTS)
         self.margins = False  # walking a header or footer, whose pictures and objects are skipped
         # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
@@ -897,8 +897,9 @@ class _Reader(Scopes):
         return self.end(recs, j)
 
     def ole(self, recs, j, st, d, g, alt):
-        """SHAPE_OLE: the BinData item at offset 12, an OLE object. The chart in it (hwp_chart.ole_table) is a table
-        where a picture would be; an item two shapes name is read once, but every placement is charged against
+        """SHAPE_OLE: the BinData item at offset 12, an OLE object. What it shows (hwp_chart.ole_blocks: a chart's
+        table, an equation, a package's tables) stands where a picture would; an item two shapes name is read once,
+        but every placement is charged against
         CHART_TOTAL, as in the Word and slide readers, and one past it is counted under chart instead. In a header or
         footer it is skipped (margin). An item that is not read is counted at every placement, under the kind its
         first read counted it as."""
@@ -914,19 +915,19 @@ class _Reader(Scopes):
                     self.ctx.skipped["object"] += 1
                     return self.end(recs, j)
                 before = self.ctx.skipped["object"], self.ctx.skipped["chart"]
-                tbl = ole_table(item, self.ctx, sheets=self.sheets)
-                lost = None if tbl is not None else ("object" if self.ctx.skipped["object"] > before[0] else
-                                                    "chart" if self.ctx.skipped["chart"] > before[1] else None)
-                self.tables[item] = tbl, sum(len(r) for r in tbl.rows) if tbl is not None else 0, lost
+                blocks = ole_blocks(item, self.ctx, sheets=self.sheets)
+                lost = None if blocks else ("object" if self.ctx.skipped["object"] > before[0] else
+                                            "chart" if self.ctx.skipped["chart"] > before[1] else None)
+                self.tables[item] = blocks, sum(len(r) for b in blocks if isinstance(b, Table) for r in b.rows), lost
             elif self.tables[item][2]:
                 self.ctx.skipped[self.tables[item][2]] += 1
-            tbl, cells, _ = self.tables[item]
-            if tbl is not None:
+            blocks, cells, _ = self.tables[item]
+            if blocks:
                 self.chart_cells += cells
                 if self.chart_cells > limits.CHART_TOTAL:
                     self.ctx.skipped["chart"] += 1
                 else:
-                    st.extras.append(tbl)
+                    st.extras.extend(blocks)
         return self.end(recs, j)
 
 

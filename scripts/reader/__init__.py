@@ -42,7 +42,10 @@ def parse(path, ctx, **opts):
     precheck(path)
     ext = ext_of(path)
     mod = importlib.import_module("reader.formats." + FORMATS[ext])
-    return mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
+    doc = mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
+    if ctx.vba:
+        doc.meta["vba"] = ctx.vba
+    return doc
 
 
 def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
@@ -101,6 +104,8 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
         "figures": info["figures"],  # metafile, PICT, WPG and TIFF pictures written as PNG
         "figures_left": info["figures_left"],  # those kept as the original file
     }
+    if doc.meta.get("vba"):
+        meta["vba"] = len(doc.meta["vba"])  # VBA modules whose source is under assets/vba/
     if doc.meta and "engine" in doc.meta:
         meta.update(engine=doc.meta["engine"], pages_total=doc.meta.get("pages_total"),
                     unrendered=doc.meta.get("unrendered"), figures=doc.meta.get("figures"), pages=st["pages"])

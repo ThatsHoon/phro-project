@@ -36,13 +36,13 @@ parser), and a PowerPoint 95 file (a PP40 stream, or PowerPoint 95's short Curre
 import re
 import struct
 
-from .. import diagram, officeart
+from .. import diagram, embedded, officeart
 from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Para, Section, Text
 from . import ppt_records as rec
-from . import cfb_route, deck, ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, ppt_text, sheet_grid, zip_route
+from . import cfb_route, deck, ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, ppt_text, zip_route
 from .word_fields import MAX_URL
 
 MAX_TITLE = 300
@@ -82,7 +82,7 @@ class Presentation:
         self.walk.link = self._link
         self.budget = diagram.ConnectionBudget(ctx)  # the deck's edges, shared by every slide's diagram
         self.pictures = ppt_pictures.Pictures(self.doc, self._dgg(), pictures, flate.Budget(), ctx)
-        self.objects = ppt_objects.Objects(self.doc, self.persist, flate.Budget(), sheet_grid.Budget(), ctx)
+        self.objects = ppt_objects.Objects(self.doc, self.persist, flate.Budget(), embedded.of(ctx).budget(), ctx)
         self.links, self.media, self.hf = {}, {}, (0, "")
         self.omit_title = False
         self.numbers, self.masters, self.master_of = {}, {}, {}

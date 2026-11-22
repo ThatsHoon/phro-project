@@ -467,9 +467,9 @@ def test_shape_property_groups_are_left_out_and_shape_text_is_read():
     data = b"{\\rtf1 a " + props + b"b}"
     assert md_mem(data) == "a b\n", md_mem(data)
     assert "SECRET" not in md_mem(data, hidden=True)
-    # an object's result is read, its objdata is not
+    # the result of an object that is not read is read, and the object counted
     data = b"{\\rtf1 x{\\object{\\*\\objdata 0102}{\\result shown}}y}"
-    assert md_mem(data) == "xshowny\n", md_mem(data)
+    assert md_mem(data) == "(could not read: 1 embedded object)\n\nxshowny\n", md_mem(data)
     # a shape's text found in its instruction group keeps the order of the text around it
     data = b"{\\rtf1 one {\\*" + inst + props + b"{\\shptxt two}} three}"
     assert md_mem(data) == "one two three\n"

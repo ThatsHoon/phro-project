@@ -17,7 +17,7 @@ Each slide is one diagram scope: every shape (titles, left-out placeholders and 
 import posixpath
 import re
 
-from .. import diagram, limits
+from .. import diagram, embedded, limits
 from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Equation, Link, ListItem, Math, Para, Section, Table, Text, Image
@@ -132,6 +132,7 @@ class _Reader:
         self.scope = None
         self.image_bytes = 0
         self.chart_cells = 0
+        self.objects = embedded.Parts(pkg, ctx)
         self.smartart_nodes = 0
         self.authors = {}  # comment author id -> name, legacy and modern merged
         self.comment_count = 0
@@ -546,7 +547,33 @@ class _Reader:
                                      limits.SMARTART_NODES - self.smartart_nodes)
                 self.smartart_nodes += len(got)
                 return got
+            if n == "oleObj":
+                return self.ole(el, attr(e, "id"))
         return []
+
+    def ole(self, el, rid):
+        """An embedded object (p:oleObj) of frame `el`, by embedded.Parts: its equation or its tables; one that is not
+        read shows the frame's preview picture and is counted under object, a chart left unread under chart. An
+        object the package does not hold (a link) is counted only when it has no preview either."""
+        got = self.objects.get(self.scope.part, rid)
+        kind = got[0] if got else ""
+        if kind == "equation":
+            if "depth" in got[2]:
+                self.deep()
+            if got[2] <= {"depth"}:
+                return [Equation(got[1], False)]
+        elif kind == "table":
+            tables = self.objects.place(got)
+            if tables is not None:
+                return tables
+            kind = "chart"
+        blocks = [Equation(got[1], False)] if kind == "equation" else []
+        blocks += self.picture(el, next((e for e in el.iter() if local(e.tag) == "cNvPr"), None))
+        if kind == "chart":
+            self.ctx.skipped["chart"] += 1
+        elif kind or not blocks:
+            self.ctx.skipped["object"] += 1
+        return blocks
 
     # ---- text
     def para_children(self, p, d=0):

@@ -308,7 +308,7 @@ def graph(data: bytes, ctx):
         # a best-effort search: it walks a Stream over a throwaway Context, so pad bytes or a framing break past the
         # EOF count nothing, and it starts from the records already walked, so BIN_RECORDS still bounds it
         tail = biff.Stream(data, Context())
-        tail.count = st.count
+        tail.bank = st.bank
         for rec in tail.records(f.end):
             if rec.id == _CODEPAGE and rec.size >= 2:
                 ds.codepage = struct.unpack_from("<H", data, rec.off)[0]

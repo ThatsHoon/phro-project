@@ -31,8 +31,10 @@ paragraph being built and its own open fields, so a note or a header never ends 
   dropped) or `\\bin` bytes are charged against `IMAGE_BYTES`, the document's earlier pictures included, as they are
   collected: past it collection stops, `image` is counted once and nothing is emitted. A DIB becomes a BMP through
   `officeart.dib_to_bmp`, then a PNG. A `\\macpict` gets the 512-byte zero head of a PICT file before its bytes, as a BLIP PICT does. Any other format is counted under `image`. A group inside `\\pict` is
-  skipped; `{\\*\\shppict{\\pict ...}}` is read and `\\nonshppict` skipped, so the pair is one image; an `\\object` keeps
-  its `\\result` and skips `\\objdata`.
+  skipped; `{\\*\\shppict{\\pict ...}}` is read and `\\nonshppict` skipped, so the pair is one image; an `\\object` whose
+  `\\objdata` (hex or `\\bin`, EMBED_BYTES at most) holds an embedded OLE1 object is read by embedded.Objects: an
+  equation stands in the line, tables follow the paragraph, and its `\\result` is left out; any other object keeps
+  its `\\result`, and a chart left unread is counted.
 * Paragraphs: `\\par` and `\\sect` end one; `\\line`, `\\lbr`, `\\page` and `\\column` are a Break; `\\tab` is a space;
   `\\pard` resets the paragraph's outline and style. A paragraph with no text is dropped.
 * Headings: `\\outlinelevelN` (0..8) gives level N+1; so does a paragraph style `\\sN` named `heading N` or
@@ -72,10 +74,11 @@ paragraph being built and its own open fields, so a note or a header never ends 
 """
 import re
 
-from .. import images, limits
+from .. import embedded, images, limits
 from ..containers.cfb import Compound, is_cfb
 from ..limits import ReadError
-from ..model import Bold, Break, Doc, Heading, Hidden, Image, Inserted, Link, ListItem, NoteRef, Para, Table, Text
+from ..model import (Bold, Break, Doc, Heading, Hidden, Image, Inserted, Link, ListItem, Math, NoteRef, Para, Table,
+                     Text)
 from ..officeart import dib_to_bmp
 from .rtf_lex import BIN, CLOSE, HEX, OPEN, SYM, TEXT, WORD, Pending, codec, tokens
 from . import zip_route
@@ -108,10 +111,10 @@ _NONHEX = re.compile(rb"[^0-9a-fA-F]")
 # Doc.footers, and the info properties, which are captured. A bookmark start is added: anydoc captures its name, here
 # the name is simply not text; so are company and a user property's name and value, which are info properties only.
 _SKIP = frozenset((
-    "fonttbl", "colortbl", "stylesheet", "info", "object", "ftnsep", "ftnsepc", "aftnsep", "aftnsepc",
+    "fonttbl", "colortbl", "stylesheet", "info", "ftnsep", "ftnsepc", "aftnsep", "aftnsepc",
     "xmlnstbl", "themedata", "colorschememapping", "datastore", "latentstyles", "listtable", "listoverridetable",
     "rsidtbl", "generator", "filetbl", "revtbl", "datafield", "bkmkend",
-    "template", "defchp", "defpap", "panose", "falt", "objdata", "blipuid", "nonshppict", "wgrffmtfilter",
+    "template", "defchp", "defpap", "panose", "falt", "blipuid", "nonshppict", "wgrffmtfilter",
     "pgdsctbl", "docvar", "sp", "sn", "sv", "shpinst", "background", "userprops", "operator", "author", "title",
     "subject", "keywords", "doccomm", "creatim", "revtim", "printim", "bkmkstart", "company", "propname", "staticval",
 ))
@@ -177,6 +180,20 @@ class _Pic:
         self.hex, self.raw = [], []
         self.chars = self.nraw = 0  # hex characters and raw bytes collected
         self.dead = False     # over the budget or not readable: counted, nothing more is collected
+
+
+class _Obj:
+    """An \\object being read: its objdata's hex chunks or raw bytes so far, and whether it was shown."""
+    __slots__ = ("depth", "hex", "raw", "chars", "nraw", "dead", "seen", "shown", "counted")
+
+    def __init__(self, depth):
+        self.depth = depth    # the group depth of the \object group
+        self.hex, self.raw = [], []
+        self.chars = self.nraw = 0
+        self.dead = False     # over EMBED_BYTES: nothing more is collected and the object is not read
+        self.seen = False     # an objdata group was met (a second one is skipped)
+        self.shown = False    # the object was placed, so its result is left out
+        self.counted = False  # the object was counted (a chart left unread, an equation converted in part)
 
 
 class _Field:
@@ -334,6 +351,8 @@ class _Reader:
         self.user = []
         self.data = b""        # the input the BIN tokens point into
         self.pic = None        # the picture being collected
+        self.obj = None        # the object being read
+        self.objects = embedded.of(ctx)
         self.img_total = 0     # bytes of the pictures emitted so far (IMAGE_BYTES)
         # Cells the tables of the document may still take: one budget for the whole document, shared by every table
         # and charged per cell, as doc.py's is. It is the bound on hostile input (many tiny tables or one huge one
@@ -400,6 +419,9 @@ class _Reader:
                 if cap == "pict":
                     if k == TEXT:
                         self.pict_text(t[1])
+                elif cap == "objdata":
+                    if k == TEXT:
+                        self.obj_data(t[1], len(t[1]), 0)
                 elif not g.suppress or cap:
                     self.pend.push(t[1])
             elif k == WORD:
@@ -429,6 +451,8 @@ class _Reader:
             elif k == BIN:
                 if g.cap == "pict":
                     self.pict_bin(t[1], t[2])  # anywhere else the raw bytes are skipped
+                elif g.cap == "objdata":
+                    self.obj_data(bytes(self.data[t[1]:t[1] + t[2]]), 0, t[2])
         if self.pend:
             self.flush()
         if self.hi is not None:
@@ -444,7 +468,7 @@ class _Reader:
     def open_group(self):
         self.stack.append(self.g)
         g = self.g = self.g.clone()
-        if g.cap == "pict":
+        if g.cap in ("pict", "objdata"):
             g.cap, g.suppress = "", True  # a group inside a picture (its uid, its properties) is not data
         elif g.cap == "style" and len(self.stack) != self.ss_depth + 1:
             g.cap = ""
@@ -465,6 +489,14 @@ class _Reader:
         closing = self.g
         if self.pic is not None and depth == self.pic.depth:
             self.finish_pict(closing)
+        obj = self.obj
+        if obj is not None:
+            if depth == obj.depth:
+                if obj.seen and not obj.shown and not obj.counted:
+                    self.ctx.skipped["object"] += 1
+                self.obj = None
+            elif closing.cap == "objdata":
+                self.finish_object(closing)
         self.g = self.stack.pop()
         story = self.story
         if story.has and story.depth < depth and not closing.suppress and not closing.cap:
@@ -641,7 +673,7 @@ class _Reader:
             "ffdefres": self.w_ff("default"),
             "footnote": self.w_footnote, "ftnalt": self.w_ftnalt,
             "pict": self.w_pict, "shppict": self.w_shppict, "shptxt": self.w_on, "nesttableprops": self.w_on,
-            "result": self.w_on, "listtext": self.w_listtext, "pntext": self.w_listtext,
+            "result": self.w_result, "object": self.w_object, "objdata": self.w_objdata, "listtext": self.w_listtext, "pntext": self.w_listtext,
             "intbl": self.w_intbl, "itap": self.w_itap, "ls": self.w_ls, "ilvl": self.w_ilvl,
             "trowd": self.w_trowd, "cellx": self.w_cellx, "trhdr": self.w_trhdr,
             "clmgf": self.w_merge("first"), "clmrg": self.w_merge("cont"),
@@ -754,6 +786,24 @@ class _Reader:
     def w_on(self, p, fresh):
         """A destination that is read even inside text that is left out (a shape's text, an object's result)."""
         self.g.suppress = False
+
+    def w_result(self, p, fresh):
+        obj = self.obj
+        if obj is None or not obj.shown or len(self.stack) <= obj.depth:
+            self.g.suppress = False
+
+    def w_object(self, p, fresh):
+        g = self.g
+        if not g.suppress and not g.cap and self.obj is None:
+            self.obj = _Obj(len(self.stack))
+        g.suppress, g.dest, g.cap = True, "object", ""
+
+    def w_objdata(self, p, fresh):
+        g, obj = self.g, self.obj
+        g.cap = ""
+        if obj is not None and not obj.seen and len(self.stack) == obj.depth + 1:
+            obj.seen, g.cap = True, "objdata"
+        g.suppress, g.dest = True, "objdata"
 
     def w_shppict(self, p, fresh):
         if fresh == 2:
@@ -888,6 +938,60 @@ class _Reader:
             self.pict_fail(pic)
         else:
             pic.raw.append(bytes(self.data[off:off + n]))
+
+    # ---- objects
+    def obj_data(self, chunk, chars, nraw):
+        obj = self.obj
+        if obj.dead:
+            return
+        obj.chars += chars
+        obj.nraw += nraw
+        if obj.chars // 2 + obj.nraw > limits.EMBED_BYTES:
+            obj.dead = True
+            obj.hex, obj.raw = [], []
+        else:
+            (obj.raw if nraw else obj.hex).append(chunk)
+
+    def finish_object(self, g):
+        """The objdata group closes: the object's equation goes in the line and its tables after the paragraph
+        under way. An equation converted in part is counted and keeps the result too."""
+        obj = self.obj
+        if obj.dead:
+            return
+        if obj.raw:
+            data = b"".join(obj.raw)
+        else:
+            digits = _NONHEX.sub(b"", b"".join(obj.hex))
+            data = bytes.fromhex(digits[:len(digits) & ~1].decode("ascii"))
+        obj.hex, obj.raw = [], []
+        native = embedded.ole1_native(data)
+        got = self.objects.load(native) if native else None
+        kind = got[0] if got else ""
+        hidden = "deleted" if g.dele else "hidden" if g.hidden else ""
+        story, skipped = self.story, self.ctx.skipped
+        if kind == "equation":
+            story.cur.append(Math(got[1], hidden=hidden))
+            story.has = True
+            if "depth" in got[2]:
+                skipped["depth"] += 1
+            if got[2] <= {"depth"}:
+                obj.shown = True
+            else:
+                skipped["object"] += 1
+                obj.counted = True
+        elif kind == "table":
+            tables = self.objects.place(got)
+            if tables is None:
+                skipped["chart"] += 1
+                obj.counted = True
+            else:
+                for t in tables:
+                    t.hidden = hidden
+                story.extras.extend(tables)
+                obj.shown = True
+        elif kind == "chart":
+            skipped["chart"] += 1
+            obj.counted = True
 
     def finish_pict(self, g):
         """The pict group closes: its Image goes after the paragraph under way (before the next cell, in a table)."""

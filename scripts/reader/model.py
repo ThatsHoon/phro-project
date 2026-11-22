@@ -168,12 +168,20 @@ class Doc:
 
 
 class Context:
-    """Passed to every parse(): collects warnings and isolates per-part failures."""
+    """Passed to every parse(): collects warnings and isolates per-part failures.
+
+    `vba` holds (name, kind, source) of the VBA modules read (containers.vba), `vba_modules` how many modules were
+    opened (VBA_MODULES) and `vba_bytes` the bytes decompressed for them (VBA_BYTES). `embedded` is the document's
+    embedded.Objects, made by embedded.of."""
 
     def __init__(self):
         self.warnings: list[str] = []
         self.skipped: collections.Counter = collections.Counter()
         self.name = ""
+        self.vba: list = []
+        self.vba_modules = 0
+        self.vba_bytes = 0
+        self.embedded = None
 
     @contextmanager
     def guard(self, kind: str):

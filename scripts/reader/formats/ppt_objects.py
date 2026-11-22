@@ -5,9 +5,9 @@ The DocumentContainer's ExObjList (0x0409) holds one ExEmbed (0x0FCC) per object
 drawAspect, type, exObjId, subType, persistIdRef) maps the exObjId an object shape's ExObjRefAtom names to the persist
 object holding the storage, an ExOleObjStg (0x1011). At instance 0 its body is the compound file itself; at instance 1
 it is a u32 size and zlib data, inflated under the document's budget and capped at EMBED_BYTES, as the raw body is.
-The storage is opened as a compound file and read once an exObjId:
-  * an `Equation Native` stream is converted by mtef.native_tex and placed as an Equation;
-  * a Workbook or Book stream (Excel.Chart, Excel.Sheet, MSGraph.Chart) is read by xls_embedded.blocks over one
+The storage is read by embedded.read, once an exObjId:
+  * an equation is placed as an Equation;
+  * a workbook (Excel.Chart, Excel.Sheet, MSGraph.Chart), a chart package or a spreadsheet gives tables, over one
     sheet_grid.Budget for the presentation; each placement of its tables is charged against CHART_TOTAL (copies
     counted), and one past it shows the shape's preview and is counted under chart, as an unread workbook is;
   * anything else, and anything that cannot be read (a persist id with no ExOleObjStg, bad zlib, a body that is not a
@@ -21,16 +21,14 @@ shows the preview and counts one chart at each placement (never an object).
 """
 import struct
 
-from .. import limits, officeart
+from .. import embedded, limits, officeart
 from ..containers import flate
-from ..containers.cfb import CfbError, Compound
 from ..limits import ReadError
 from ..model import Equation, Table
-from . import mtef, sheet_grid, xls_embedded
+from . import sheet_grid
 from . import ppt_records as rec
 
 MAX_OBJECTS = 256     # objects one presentation reads (the rest are counted under object where they are placed)
-_NATIVE = "Equation Native"
 _SKIP = ("damaged", "too_large", "unsupported", "encrypted")  # a ReadError that leaves the one object unread
 
 
@@ -102,31 +100,15 @@ class Objects:
             raw = self._storage(pid)
             if raw is None:
                 return None
-            with Compound(raw) as cf:
-                if cf.exists(_NATIVE):
-                    if cf.size(_NATIVE) > 0xFFFF + mtef.MAX_BYTES:
-                        return None
-                    lost = set()
-                    tex = mtef.native_tex(cf.read(_NATIVE), lost)
-                    return "equation", [Equation(tex, False)], frozenset(lost)
-                before, warned = self.ctx.skipped["chart"], len(self.ctx.warnings)
-                out = xls_embedded.blocks(cf, self.ctx, self.sheets)
-                if out is None:
-                    return None
-                if out:
-                    return "table", out, frozenset()
-                del self.ctx.warnings[warned:]  # the guard's warning goes with its count
-                if before:  # the caller counts the chart where it is shown
-                    self.ctx.skipped["chart"] = before
-                else:
-                    self.ctx.skipped.pop("chart", None)
-                return "chart", [], frozenset()
+            got = embedded.read(raw, self.ctx, self.sheets)
+            if got is None or got[0] in ("bad", "unread"):
+                return None
+            if got[0] == "equation":
+                return "equation", [Equation(got[1], False)], got[2]
+            return got
         except ReadError as e:
             if e.kind not in _SKIP:
                 raise
-            return None
-        except (CfbError, KeyError, ValueError, struct.error):
-            # not a compound file or a broken chain, a stream that cannot be read, an equation that does not convert
             return None
 
     def blocks(self, ex_obj_id: int | None) -> tuple[list | None, bool]:

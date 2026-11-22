@@ -839,7 +839,7 @@ def test_hyperlink_noteref_after_link():
     grid = ooxml_sheets.sheet_grid.Grid("S", ooxml_sheets.sheet_grid.Budget(), ctx)
     grid.put(0, 0, [NoteRef("n1"), Text("a"), NoteRef("n2"), Text("b")])
     me = ooxml_sheets._Sheets.__new__(ooxml_sheets._Sheets)
-    me.ctx, me.scan = ctx, 0
+    me.ctx, me.budget = ctx, grid.budget
     me._link(grid, [(0, 0, 0, 0, LINK, None)])
     assert grid.get(0, 0) == [Link(LINK, [Text("a"), Text("b")]), NoteRef("n1"), NoteRef("n2")], grid.get(0, 0)
 
