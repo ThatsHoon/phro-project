@@ -920,7 +920,7 @@ def test_stop_note_for_pages_and_pictures():
     with tempfile.TemporaryDirectory() as d:
         out = markdown.render(Doc(blocks=[P("body")], meta={"ocr": {"pages": 40, "doubtful": 0, "failed": 0,
                                                                      "stopped_at": 41}}), Path(d))
-    assert out == ("(40 scanned pages read by OCR)\n\n(OCR stopped at page 41; read the file again to continue)"
+    assert out == ("(40 scanned pages read by OCR)\n\n(OCR stopped at page 41 for the time; later scanned pages are shown as images)"
                    "\n\nbody\n"), out
     info = {}
     with stub(deadline=time.monotonic() + limits.FIGURE_RESERVE + 1, delay=30, answer=seen("Total 120")), \

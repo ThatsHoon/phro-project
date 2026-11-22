@@ -125,8 +125,9 @@ _FIG_MAGIC = b"PHROFIG1"
 
 class Figures:
     """Converted figures, one file each at <dir>/<k[:2]>/<k>: the PNG (if any), the text lines and the figure's own
-    warnings. A read the deadline cut is not filed, but the figures it finished are kept here, so the next read
-    takes them and gets further. Figures cut by the time are never stored. Written atomically; prune clears them."""
+    warnings. A read the deadline cut is filed partial, and the figures it finished are kept here, so another read
+    of the same pictures takes them and gets further. Figures cut by the time are never stored. Written atomically;
+    prune clears them."""
 
     def __init__(self, dir: Path):
         self.dir = Path(dir)
@@ -200,8 +201,8 @@ OCR = "ocr"  # the folder under the root that holds per-picture OCR results (Ocr
 class OcrResults:
     """Per-picture OCR results, one JSON file each at <dir>/<k[:2]>/<k>, keyed by `ocr.picture_key`: the worker's
     answer fields (page, rules, unread, hint). The verdict is not stored: the Session judges a loaded result again,
-    so a calibrated threshold applies to it. A read the deadline cut keeps the pictures it finished here, so the
-    next read continues (decision 12). Written atomically; prune clears them as it does figures."""
+    so a calibrated threshold applies to it. A read the deadline cut keeps the pictures it finished here, so another
+    read of the same pictures continues (decision 12). Written atomically; prune clears them as it does figures."""
 
     def __init__(self, dir: Path):
         self.dir = Path(dir)
@@ -273,10 +274,9 @@ def store(k: str, src, hidden: bool = False, **opts) -> Path:
     finally:
         images.FIGURE_CACHE = old
     if {FIGURES_LATE, OCR_LATE} & set(meta.get("warnings") or []):
-        # figures or OCR cut by the deadline, like a conversion that ran out of time: handed out from its temporary
-        # folder (prune clears it after a day) and never filed under k, so the next read converts again (and takes
-        # the figures and OCR results it finished from their own caches)
-        return tmp
+        import json
+        meta["partial"] = True
+        (tmp / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     for attempt in (0, 1):
         try:
             os.replace(tmp, target)

@@ -770,6 +770,22 @@ import read
 sys.exit(read.main(sys.argv[1:]))
 '''
 
+# the same child, its OCR also cut by the time
+CUT_LATE_READ = '''import sys
+sys.path.insert(0, {scripts!r})
+from reader import limits
+from reader.formats import pdf
+pdf.PDF_PAGES = 2
+whole = pdf.parse
+def parse(path, ctx, **kw):
+    doc = whole(path, ctx, **kw)
+    doc.warnings.append(limits.OCR_LATE)
+    return doc
+pdf.parse = parse
+import read
+sys.exit(read.main(sys.argv[1:]))
+'''
+
 
 @contextmanager
 def envs(**values):
@@ -980,6 +996,64 @@ def test_pages_past_cut_range():
         assert got.parent.name.endswith("-p3-4"), got
         assert "## Page 3" in md_lines(o) and "## Page 1" not in md_lines(o)
         assert "pages" not in o["updatedInput"] and "offset" not in o["updatedInput"], o
+
+
+def test_cut_pdf_is_one_stable_result():
+    """Decision 4: a pdf conversion the deadline cut is filed under its key; a second Read starts no child and gets
+    the same out.md, path and bytes, and the context names the pages past the cut and the read that gets them."""
+    from reader import cache
+    with pdf_env():
+        cut = tmp() / "cut_late_read.py"
+        cut.write_text(CUT_LATE_READ.format(scripts=str(HERE / "scripts")), encoding="utf-8")
+        base = [sys.executable, "-I", "-X", "utf8", str(cut), "convert"]
+        p = four_pages()
+        seen, real = [], gate.subprocess.run
+        gate.subprocess.run = lambda cmd, **kw: seen.append(cmd) or real(cmd, **kw)
+        try:
+            o1 = out(gate.decide(ev(p), command=base))
+            first = Path(o1["updatedInput"]["file_path"]).read_bytes()
+            o2 = out(gate.decide(ev(p), command=EXIT3))
+        finally:
+            gate.subprocess.run = real
+        assert len(seen) == 1, seen
+        assert o1["updatedInput"]["file_path"] == o2["updatedInput"]["file_path"], (o1, o2)
+        got = Path(o2["updatedInput"]["file_path"])
+        assert got.parent.name == cache.key(p, "native") and got.read_bytes() == first, got
+        assert json.loads((got.parent / "meta.json").read_text(encoding="utf-8"))["partial"] is True
+        c = o2["additionalContext"]
+        assert ' Pages 3-4 are past the cut; Read the pdf with pages="3-4" to read them.' in c, c
+        assert len(c) < 600, c
+
+
+def test_cut_pages_named_in_runs():
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = _pdf_meta(pages=285, pages_total=384, unread=["99 pages past the time or page limit"])
+    c = gate._context("a.pdf", meta, md, offer=gate.offer_text("v"))
+    assert (' Pages 286-384 are past the cut; Read the pdf with pages="286-305", then the next 20 pages and so on,'
+            ' to read them.') in c, c
+    assert " Pages at lines: 1:1, " in c and len(c) < 600, c
+    assert "past the cut" not in gate._context("a.pdf", _pdf_meta(pages=4), md)
+    c = gate._context("a.pdf", _pdf_meta(pages=3, pages_total=384), md, upto=12)
+    assert ' Pages 4-12 are past the cut; Read the pdf with pages="4-12" to read them.' in c, c
+
+
+def test_partial_context_names_what_the_time_left_out():
+    from reader import limits
+    md = tmp() / "out.md"
+    md.write_text("x\n", encoding="utf-8")
+    meta = {"lines": 5, "partial": True, "warnings": [limits.OCR_LATE, limits.FIGURES_LATE], "figures_left": 3,
+            "ocr": {"pages": 2, "doubtful": 0, "failed": 0, "stopped_at": 7, "pictures_left": 63}}
+    c = gate._context("a.docx", meta, md)
+    assert c.endswith(" Cut by the time limit: OCR stopped at page 7 (later scanned pages are linked as images),"
+                      " 63 pictures not read by OCR (Read them to view), some figures not drawn (their text is"
+                      " included)."), c
+    meta["ocr"].update(stopped_at=None, pictures_left=1)
+    meta["warnings"] = [limits.OCR_LATE]
+    c = gate._context("a.docx", meta, md)
+    assert c.endswith(" Cut by the time limit: 1 picture not read by OCR (Read it to view)."), c
+    del meta["partial"]
+    assert "Cut by the time limit" not in gate._context("a.docx", meta, md)
 
 
 def _edit_meta(p, engine="native", **changes):
@@ -1742,8 +1816,9 @@ def test_gate_none_entry_misses_once_resvg():
             assert o["permissionDecision"] == "deny", o  # the stubbed child timed out: nothing was served from d
 
 
-def test_gate_time_cut_converts_again():
-    """A conversion whose figures were cut by the deadline is served, but not kept: the next Read converts again."""
+def test_gate_time_cut_is_kept():
+    """Decision 4: a conversion whose figures were cut by the deadline is filed partial: the next Read gets the same
+    out.md without a child, and the context says what the time left out."""
     with stub() as base:
         p = sample("LATE figure")
         runs = []
@@ -1759,8 +1834,11 @@ def test_gate_time_cut_converts_again():
         finally:
             gate.subprocess.run = real
         assert o1["permissionDecision"] == o2["permissionDecision"] == "allow", (o1, o2)
-        assert len(runs) == 2, runs
+        assert len(runs) == 1, runs
+        assert o1["updatedInput"]["file_path"] == o2["updatedInput"]["file_path"], (o1, o2)
         assert "LATE figure" in md_lines(o2), md_lines(o2)
+        assert o2["additionalContext"].endswith(
+            " Cut by the time limit: some figures not drawn (their text is included)."), o2
         q = sample("on time")
         assert out(run(q, base))["permissionDecision"] == "allow"
         assert out(gate.decide(ev(q), command=EXIT3))["permissionDecision"] == "allow"  # kept: a hit

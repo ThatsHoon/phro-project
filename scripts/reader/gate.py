@@ -280,6 +280,41 @@ def _page_lines(meta, used):
     return ""
 
 
+def _count(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def _past_cut(meta, upto=None):
+    """The sentence naming the pages after the page index's last one, up to `upto` (the pdf's last page when None),
+    and the pages= read that converts them; "" when there are none."""
+    end = _count(meta.get("pages_total") if upto is None else upto)
+    a = max((p for p, _ in page_index(meta)), default=0) + 1
+    if a > end:
+        return ""
+    if a == end:
+        return f' Page {a} is past the cut; Read the pdf with pages="{a}" to read it.'
+    if end - a < SUGGEST_PAGES:
+        return f' Pages {a}-{end} are past the cut; Read the pdf with pages="{a}-{end}" to read them.'
+    return (f' Pages {a}-{end} are past the cut; Read the pdf with pages="{a}-{a + SUGGEST_PAGES - 1}", then the next'
+            f' {SUGGEST_PAGES} pages and so on, to read them.')
+
+
+def _time_cut(meta):
+    """What the deadline left out of a partial entry, one item each."""
+    if meta.get("partial") is not True:
+        return []
+    ocr = meta.get("ocr") if isinstance(meta.get("ocr"), dict) else {}
+    items = []
+    if at := _count(ocr.get("stopped_at")):
+        items.append(f"OCR stopped at page {at} (later scanned pages are linked as images)")
+    if k := _count(ocr.get("pictures_left")):
+        items.append(f"{k} picture not read by OCR (Read it to view)" if k == 1
+                     else f"{k} pictures not read by OCR (Read them to view)")
+    if limits.FIGURES_LATE in (meta.get("warnings") or []):
+        items.append("some figures not drawn (their text is included)")
+    return items
+
+
 def _head(name, meta):
     n = meta.get("lines", 0)
     m = meta.get("images", 0)
@@ -293,16 +328,18 @@ def _head(name, meta):
     return head
 
 
-def _context(name, meta, out_md, *, past_end="", offer=""):
+def _context(name, meta, out_md, *, past_end="", offer="", upto=None):
     """additionalContext for an allow, fitted under CONTEXT_MAX: for pdf, the head, PDF_HINT, the past-the-end
     sentence, the offer (whole or not at all), the unrendered and figure pages, the unread list and the page index;
     for the rest, the head, the edit hint, the image offer (whole or not at all), the unread list and the heading
-    index. The garble warning goes last."""
+    index. Then, always given room: what the time cut, for pdf the pages past the cut (up to `upto`, the end of a
+    range read) and the read that gets them, and the garble warning."""
     pdf = reader.ext_of(name) == "pdf"
     head = _head(name, meta)
-    tail = ""
+    cut = _time_cut(meta)
+    tail = (" Cut by the time limit: " + ", ".join(cut) + "." if cut else "") + (_past_cut(meta, upto) if pdf else "")
     if "garbled" in (meta.get("warnings") or []):
-        tail = " Warning: the text may be garbled."
+        tail += " Warning: the text may be garbled."
     if pdf:
         head += PDF_HINT + past_end
         runs = _runs(_ints(meta.get("unrendered")))
@@ -677,7 +714,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
     meta = _meta(entry)
     rng = parse_pages(event["tool_input"].get("pages"))
     total = meta.get("pages_total")
-    past_end, at, drop = "", {}, ("pages",)  # fact F4a: updatedInput replaces the input, so pages can go
+    past_end, at, drop, upto = "", {}, ("pages",), None  # fact F4a: updatedInput replaces the input, so pages can go
     if rng is not None and isinstance(total, int) and not isinstance(total, bool):
         a, b = rng
         if a > total:
@@ -694,7 +731,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
                     return result
                 if not (entry / "out.md").is_file():
                     return _pass(path, _why("damaged", "cache entry vanished"))
-                meta = _meta(entry)
+                meta, upto = _meta(entry), b
                 if _all_unrendered(meta, a, b):
                     return None
             else:
@@ -711,7 +748,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
         mark = _offer_mark(event)
         if mark is None or not mark.exists():
             offer = offer_text(venv, repair)
-    context = _context(_name(path), meta, out_md, past_end=past_end, offer=offer)
+    context = _context(_name(path), meta, out_md, past_end=past_end, offer=offer, upto=upto)
     if offer and mark is not None and offer in context:
         _touch(mark)
     return _allow(event, path, out_md, context, drop, **at)

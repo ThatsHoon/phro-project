@@ -121,7 +121,7 @@ def ocr_notes(counts: dict, hint: bool) -> list:
         doubt = f"; {m} of them doubtful, shown with the page image" if m else ""
         out.append(f"({n} scanned page{'' if n == 1 else 's'} read by OCR{doubt})")
     if counts["stopped_at"] is not None:
-        out.append(f"(OCR stopped at page {counts['stopped_at']}; read the file again to continue)")
+        out.append(f"(OCR stopped at page {counts['stopped_at']} for the time; later scanned pages are shown as images)")
     elif k := counts["pictures_left"]:
         out.append(f"(OCR stopped; {k} picture{'' if k == 1 else 's'} not read)")
     if f := counts["failed"]:
