@@ -26,11 +26,11 @@ from ..containers import flate
 from ..containers.cfb import Compound, is_cfb
 from ..images import sniff
 from ..limits import ReadError
-from ..model import Bold, Break, Cell, Doc, Equation, Heading, Image, ListItem, Math, NoteRef, Para, Table, Text
+from ..model import Bold, Break, Cell, Doc, Equation, Image, Math, NoteRef, Table, Text
 from . import hwpx, sheet_grid
 from .hancom import (
-    AUTO_ALT, Frame, Obj, Scopes, State, comment_note, cut_command, diagrams, flat, heading_level, lone_equations,
-    next_marker, place, plain, strip_marker, style_name_level, tex as _tex,
+    Frame, Obj, Scopes, State, alt_text, comment_note, cut_command, diagrams, flat, heading_level, lone_equations,
+    next_marker, outline_marker, paragraph, place, plain, style_name_level, tex as _tex,
 )
 from .hwp_chart import ole_table
 from .hwp_records import (
@@ -576,43 +576,31 @@ class _Reader(Scopes):
         level = 0
         if not st.nohead:
             level = heading_level(min(shape.level + 1, 6) if shape.head == 1 else self.style_level(head), text)
-        outline = self.outline_marker(shape, lvl) if shape.head == 1 else None
-        main = None
-        if level and text:
-            if outline:
-                strip_marker(inl, outline)
-                inl.insert(0, Text(outline + " "))
-            main = Heading(level, inl)
-        elif shape.head in (2, 3):
-            if shape.head == 2:
-                marker = self.marker(shape.ref, lvl)
-                strip_marker(inl, marker)
-            else:  # a Markdown bullet; a copy of the BULLET character typed into the text is dropped
-                marker = "-"
-                if 1 <= shape.ref <= len(self.info.bullets):
-                    strip_marker(inl, self.info.bullets[shape.ref - 1])
-            if inl:
-                main = ListItem(lvl, marker, inl)
-        elif inl:
-            main = Para(inl)
+        number = self.outline_marker(shape, lvl) if shape.head == 1 else None
+        item = None
+        if shape.head == 2:
+            marker = self.marker(shape.ref, lvl)
+            item = (lvl, marker, marker)
+        elif shape.head == 3:  # a Markdown bullet; a copy of the BULLET character typed into the text is dropped
+            bullets = self.info.bullets
+            item = (lvl, "-", bullets[shape.ref - 1] if 1 <= shape.ref <= len(bullets) else None)
+        main = paragraph(inl, text, level, number, item)
         return ([main] if main else []) + out + st.extras
 
     # ---- numbering
-    def marker(self, nid, lvl) -> str:
-        """The shared marker rule over this numbering's levels, in hwpx's {level: (format, kind, start)} shape."""
+    def levels(self, nid) -> dict:
+        """A numbering's levels in hwpx's {level: (format, kind, start)} shape; {} for an id past the table."""
         nums = self.info.numberings
         num = nums[nid - 1] if 1 <= nid <= len(nums) else None
-        levels = {k + 1: (num.formats[k], num.kinds[k], num.starts[k]) for k in range(7)} if num else {}
-        return next_marker(levels, self.numbers.setdefault(nid, {}), lvl)
+        return {k + 1: (num.formats[k], num.kinds[k], num.starts[k]) for k in range(7)} if num else {}
+
+    def marker(self, nid, lvl) -> str:
+        return next_marker(self.levels(nid), self.numbers.setdefault(nid, {}), lvl)
 
     def outline_marker(self, shape, lvl):
         """An outline paragraph's number: its own numbering id, else the section's (kordoc); None without one."""
         nid = shape.ref or self.outline
-        nums = self.info.numberings
-        if not 1 <= nid <= len(nums) or not nums[nid - 1].formats[lvl]:
-            return None
-        mk = self.marker(nid, lvl)
-        return mk if mk != "-" else None
+        return outline_marker(self.levels(nid), self.numbers.setdefault(nid, {}), lvl)
 
     # ---- control handlers: (recs, i, st, d) -> the index of the first record after the control
     def skip(self, recs, i, st, d):
@@ -683,12 +671,9 @@ class _Reader(Scopes):
         cid = data[3::-1]
         attr = struct.unpack_from("<I", data, 4)[0] if len(data) >= 8 else 0
         if cid == b"%hlk":
-            url = cut_command(_wstr(data, 9))  # id, attr u32, one byte, then the command
-            self.push(st, Frame("link" if url else "pass", None, url))
-        elif cid == b"%clk" and not attr & 0x8000:
-            self.push(st, Frame("drop"))
+            self.open_field(st, url=cut_command(_wstr(data, 9)))  # id, attr u32, one byte, then the command
         else:
-            self.push(st, Frame("pass"))
+            self.open_field(st, unfilled=cid == b"%clk" and not attr & 0x8000)
         return self.end(recs, i)
 
     def table(self, recs, i, st, d):
@@ -739,7 +724,7 @@ class _Reader(Scopes):
         record (SHAPE_PICTURE or SHAPE_OLE) right under the control, read through SHAPES. What the shape holds, then
         its caption as paragraphs, follow the paragraph. The shape comment (offset 44) is its picture's alt text."""
         end = self.end(recs, i)
-        alt = re.sub(r"\s+", " ", _wstr(recs[i].data, 44).replace("\0", "")).strip()
+        alt = alt_text(_wstr(recs[i].data, 44))
         caption = []
         j = i + 1
         while j < end:
@@ -808,7 +793,7 @@ class _Reader(Scopes):
             if self.image_bytes > limits.IMAGE_BYTES:
                 self.ctx.skipped["image"] += 1
             else:
-                st.extras.append(Image(img, "" if AUTO_ALT.match(alt) else alt, codepage="cp949"))
+                st.extras.append(Image(img, alt, codepage="cp949"))
         return self.end(recs, j)
 
     def ole(self, recs, j, st, d, g, alt):

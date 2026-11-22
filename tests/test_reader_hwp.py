@@ -196,6 +196,16 @@ def test_long_heading_demoted():
     assert "#" not in md(hwp_file(hwp_para("가" * 41 + "."), doc_info=di))
 
 
+def test_demoted_outline_keeps_its_number():
+    # an outline paragraph demoted for its length writes the number it takes, as a heading does
+    secd = b"secd" + bytes(14) + u16(1) + bytes(20)
+    long = "본 사업은 지역 물류 체계를 개선하기 위하여 추진하는 것으로 세부 계획은 다음과 같이 정한다."
+    di = info(shapes=((1, 0, 0), (1, 1, 0)), numberings=([("^1.", 0), ("^2.", 8)],))
+    p = hwp_file(hwp_para(FFFC + "사업 개요", controls=((2, secd, b""),)) + hwp_para(long, shape=1)
+                 + hwp_para("추진 목표", shape=1), doc_info=di)
+    assert md(p) == f"# 1. 사업 개요\n\n가. {long}\n\n## 나. 추진 목표\n", md(p)
+
+
 def test_no_heading_in_note():
     note = sub_list(hwp_para("주석 제목", level=2))
     p = hwp_file(hwp_para("본" + FFFC, controls=((17, b"fn  " + u32(1), note),)), doc_info=info(shapes=((1, 0, 0),)))
@@ -473,6 +483,9 @@ def test_auto_alt_dropped():
     streams = {"BIN0001.png": PNG}
     assert md(pic_file(hwp_picture(1, "그림입니다."), streams=streams)) == "![](assets/img-001.png)\n"
     assert md(pic_file(hwp_picture(1, "회사 로고"), streams=streams)) == "![회사 로고](assets/img-001.png)\n"
+    auto = "그림입니다.\r\n원본 그림의 이름: CLP0000a1b2.bmp\r\n원본 그림의 크기: 가로 1024pixel, 세로 768pixel"
+    assert md(pic_file(hwp_picture(1, auto), streams=streams)) == "![](assets/img-001.png)\n"
+    assert md(pic_file(hwp_picture(1, auto + "\r\n회사 로고"), streams=streams)) == "![회사 로고](assets/img-001.png)\n"
 
 
 def test_picture_caption():

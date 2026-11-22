@@ -14,10 +14,10 @@ from .. import diagram, limits
 from ..charts import chart_table
 from ..containers.zipx import Package, attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
-from ..model import Bold, Break, Cell, Doc, Heading, Image, ListItem, Math, NoteRef, Para, Table, Text
+from ..model import Bold, Break, Cell, Doc, Image, Math, NoteRef, Table, Text
 from .hancom import (
-    AUTO_ALT, Frame, Obj, Scopes, State, comment_note, cut_command, diagrams, flat, heading_level, lone_equations,
-    next_marker, place, plain, strip_marker, style_name_level, tex as _tex,
+    Frame, Obj, Scopes, State, alt_text, comment_note, cut_command, diagrams, flat, heading_level, lone_equations,
+    next_marker, outline_marker, paragraph, place, plain, style_name_level, tex as _tex,
 )
 
 HPF = "Contents/content.hpf"
@@ -29,6 +29,27 @@ _OBJECTS = frozenset(("rect", "ellipse", "arc", "polygon", "curve", "line", "con
 _EDGES = ("connectLine", "line")
 _PAGE = ("PAPER", "PAGE")
 _ARROWS = {"_NOARROW": (False, False), "_ONEWAY": (False, True), "_BOTH": (True, True)}  # connectLine@type endings
+_CAPTIONED = _OBJECTS | {"equation", "chart"}
+
+
+def _pick(sw):
+    """The branch of an hp:switch to read: the case for a namespace this reader knows, else the default."""
+    for c in kids(sw, "case"):
+        if attr(c, "required-namespace") in _CASE_NS:
+            return c
+    d = kids(sw, "default")
+    return d[0] if d else None
+
+
+def _heading(para_pr):
+    """A paraPr's hh:heading, read through an hp:switch as the body is; None without one."""
+    for c in para_pr:
+        n = local(c.tag)
+        if n == "heading":
+            return c
+        if n == "switch" and (chosen := _pick(c)) is not None and (h := _heading(chosen)) is not None:
+            return h
+    return None
 
 
 def _int(s, default=0):
@@ -128,9 +149,9 @@ class _Header:
             if eid is None:
                 continue
             if name == "paraPr":
-                h = kids(el, "heading")
-                self.para[eid] = ((attr(h[0], "type", "NONE").upper(), attr(h[0], "idRef", "0"),
-                                   _int(attr(h[0], "level"))) if h else ("NONE", "0", 0))
+                h = _heading(el)
+                self.para[eid] = ((attr(h, "type", "NONE").upper(), attr(h, "idRef", "0"), _int(attr(h, "level")))
+                                  if h is not None else ("NONE", "0", 0))
             elif name == "style":
                 self.style[eid] = (attr(el, "name", "").strip(), attr(el, "paraPrIDRef"))
             elif name == "numbering":
@@ -153,6 +174,7 @@ class _Reader(Scopes):
         self.images = {}
         self.counts = {"fn": 0, "en": 0, "cm": 0}
         self.numbers = {}
+        self.outline = None
         self.cache = {}
         self.charts = {}  # a chart part's name -> (its table or None, the table's cells)
         self.opened = 0  # tables opened so far (TABLE_NODES)
@@ -242,13 +264,6 @@ class _Reader(Scopes):
         if self.ctx.skipped["depth"] == 1:
             self.ctx.warnings.append("depth: skipped content nested too deeply")
 
-    def pick(self, sw):
-        for c in kids(sw, "case"):
-            if attr(c, "required-namespace") in _CASE_NS:
-                return c
-        d = kids(sw, "default")
-        return d[0] if d else None
-
     def blocks(self, container, d, nohead):
         if d > limits.MAX_DEPTH:
             self.deep()
@@ -259,7 +274,7 @@ class _Reader(Scopes):
             if n == "p":
                 out.extend(self.para(c, d, nohead))
             elif n == "switch":
-                chosen = self.pick(c)
+                chosen = _pick(c)
                 if chosen is not None:
                     out.extend(self.blocks(chosen, d + 1, nohead))
         return out
@@ -290,16 +305,15 @@ class _Reader(Scopes):
             else:
                 level = self.style_level(attr(p, "styleIDRef"))
             level = heading_level(level, text)
-        main = None
-        if level and text:
-            main = Heading(level, inl)
-        elif htype in ("NUMBER", "BULLET"):
-            marker = self.marker(hid, hlvl) if htype == "NUMBER" else "-"
-            strip_marker(inl, marker)
-            if inl:
-                main = ListItem(min(hlvl, 6), marker, inl)
-        elif inl:
-            main = Para(inl)
+        number, item = None, None
+        if htype == "OUTLINE":
+            number = self.outline_marker(hid, hlvl)
+        elif htype == "NUMBER":
+            marker = self.marker(hid, hlvl)
+            item = (min(hlvl, 6), marker, marker)
+        elif htype == "BULLET":
+            item = (min(hlvl, 6), "-", "-")
+        main = paragraph(inl, text, level, number, item)
         return ([main] if main else []) + out + st.extras
 
     def style_level(self, sid):
@@ -307,6 +321,11 @@ class _Reader(Scopes):
 
     def marker(self, nid, lvl):
         return next_marker(self.hdr.numbering.get(nid, {}), self.numbers.setdefault(nid, {}), lvl)
+
+    def outline_marker(self, nid, lvl):
+        """An outline paragraph's number: its own numbering id, else the section's."""
+        nid = nid if nid not in (None, "", "0") else self.outline
+        return outline_marker(self.hdr.numbering.get(nid, {}), self.numbers.setdefault(nid, {}), lvl)
 
     # ---- inline scopes (add, push, close_to and close_field come from hancom.Scopes)
     def text(self, s, st):
@@ -320,9 +339,9 @@ class _Reader(Scopes):
         if kind == "HYPERLINK":
             params = {attr(p, "name"): (p.text or "") for p in el.iter() if local(p.tag) == "stringParam"}
             url = cut_command(params["Command"]) if params.get("Command") else (params.get("Path") or "").strip()
-            self.push(st, Frame("link" if url else "pass", fid, url))
-        elif kind == "CLICK_HERE":
-            self.push(st, Frame("drop", fid))
+            self.open_field(st, fid, url)
+        else:
+            self.open_field(st, fid, unfilled=kind == "CLICK_HERE" and attr(el, "dirty") != "1")
 
     def delete_end(self, st):
         for i in range(len(st.frames) - 1, 0, -1):
@@ -361,7 +380,7 @@ class _Reader(Scopes):
         elif n == "deleteEnd":
             self.delete_end(st)
         elif n == "switch":
-            chosen = self.pick(el)
+            chosen = _pick(el)
             for c in (chosen if chosen is not None else ()):
                 self.node(c, st, d + 1)
         elif n == "tbl":
@@ -400,9 +419,18 @@ class _Reader(Scopes):
                 (self.doc.headers if n == "header" else self.doc.footers).append(text)
         elif n == "drawText":
             st.extras.extend(self.sub(el, d, st.nohead))
-        elif n != "secPr":
+        elif n == "secPr":
+            self.outline = attr(el, "outlineShapeIDRef") or self.outline
+        elif n != "caption":
             for c in el:
                 self.node(c, st, d + 1)
+        if n in _CAPTIONED:
+            self.caption(el, st, d)
+
+    def caption(self, el, st, d):
+        """An object's caption lists, as paragraphs after what the object reads as (hwp places them so)."""
+        for c in kids(el, "caption"):
+            st.extras.extend(self.sub(c, d))
 
     def drawing(self, el, st, d):
         """A drawing object as one hancom.Obj among the paragraph's extras, holding the blocks it adds there (a
@@ -443,8 +471,7 @@ class _Reader(Scopes):
             self.ctx.skipped["image"] += 1
             return
         sc = first(pic, "shapeComment")
-        alt = re.sub(r"\s+", " ", sc.text or "").strip() if sc is not None else ""
-        st.extras.append(Image(data, "" if AUTO_ALT.match(alt) else alt, codepage="cp949"))
+        st.extras.append(Image(data, alt_text(sc.text or "") if sc is not None else "", codepage="cp949"))
 
     def chart(self, el, st):
         """A part two charts name is read once, but every placement is charged against CHART_TOTAL, as in the Word
@@ -496,13 +523,14 @@ class _Reader(Scopes):
                     blocks.extend(self.blocks(sl, d + 1, True))
                 raw.append((row, col, rs, cs, Cell(blocks, header=attr(tc, "header") == "1")))
                 plain = plain and self.hdr.plain.get(attr(tc, "borderFillIDRef"), False)
+        caption = [b for c in kids(tbl, "caption") for b in self.sub(c, d)]
         if not raw:
-            return []
+            return caption
         nrows, ncols = len({x[0] for x in raw}), len({x[1] for x in raw})
         rows = place(raw)
         if plain and (nrows == 1 or ncols == 1):
-            return [b for row in rows for c in row for b in c.blocks]
-        return [Table(rows)]
+            return [b for row in rows for c in row for b in c.blocks] + caption
+        return [Table(rows)] + caption
 
 
 def parse(path, ctx) -> Doc:

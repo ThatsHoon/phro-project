@@ -8,6 +8,7 @@ from .. import diagram, limits
 from ..model import Bold, Break, Cell, Equation, Heading, Hidden, Link, ListItem, Math, NoteRef, Para, Table, Text
 
 AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다\.?$")
+_AUTO_FIELD = re.compile(r"^[^:.?!]{1,20}:")
 STYLE_HEAD = re.compile(r"^(?:개요|outline|heading)\s*(\d+)$", re.I)
 
 # HWP 5.0 binary numbering-format code (the index) to the hwpx numFormat name; anything else is DIGIT
@@ -149,6 +150,16 @@ def next_marker(levels: dict, counters: dict, lvl: int) -> str:
     return re.sub(r"\^(\d)", sub, fmt).strip()[:64] or "-"
 
 
+def outline_marker(levels: dict, counters: dict, lvl: int):
+    """An outline paragraph's number at `lvl` from its numbering's levels (next_marker's shapes); None, the counters
+    left as they are, when that level has no format or its format gives no number."""
+    head = levels.get(lvl + 1)
+    if not head or not head[0]:
+        return None
+    mk = next_marker(levels, counters, lvl)
+    return mk if mk != "-" else None
+
+
 # ---- the inline model
 def itext(inlines) -> str:
     """The visible text: Bold and Link opened, a Break as a space."""
@@ -193,6 +204,19 @@ def strip_marker(inlines, marker) -> bool:
         if isinstance(it, (Link, Hidden, Math, NoteRef, Break)):
             return True
     return False
+
+
+def alt_text(comment: str) -> str:
+    """A shape comment as alt text. The description Hancom writes on its own, a first line such as "그림입니다." and
+    the "<label>: <value>" lines right after it (the original file's name and size, the date a photo was taken), is
+    left out; what follows it is kept, its whitespace squashed."""
+    lines = [ln.strip() for ln in re.split(r"\r\n|[\r\n]", comment.replace("\0", ""))]
+    k = 0
+    if AUTO_ALT.match(lines[0]):
+        k = 1
+        while k < len(lines) and _AUTO_FIELD.match(lines[k]):
+            k += 1
+    return re.sub(r"\s+", " ", " ".join(lines[k:])).strip()
 
 
 def flat(blocks) -> str:
@@ -254,6 +278,11 @@ class Scopes:
             elif f.kind == "pass":
                 parent.extend(f.inl)
 
+    def open_field(self, st, fid=None, url="", unfilled=False):
+        """A field begin: a hyperlink with a target scopes a Link, an unfilled click-here field's guide text is
+        dropped, and any other field's text is kept."""
+        self.push(st, Frame("drop" if unfilled else "link" if url else "pass", fid, url))
+
     def close_field(self, st, ref=None):
         """A field end closes the innermost open field (the one whose id is `ref`, when given)."""
         for i in range(len(st.frames) - 1, 0, -1):
@@ -281,6 +310,36 @@ def heading_level(level: int, text: str) -> int:
     if level and (len(text) > 120 or (len(text) > 40 and text[-1] in ".?!")):
         return 0
     return level
+
+
+def lead(inlines, number) -> None:
+    """Write `number` before the paragraph's text, dropping a copy of it typed there."""
+    strip_marker(inlines, number)
+    inlines.insert(0, Text(number + " "))
+
+
+def paragraph(inlines, text, level, number=None, item=None):
+    """The block a paragraph reads as, by the rules both readers share; None when nothing is left.
+
+    A paragraph with text at a heading `level` is a Heading. Otherwise `item` (level, marker, a typed copy of the
+    marker to drop or None), given for a numbered or bulleted paragraph, makes it a ListItem, and anything else is a
+    Para. `number`, an outline paragraph's number, leads its heading or its paragraph; a numbered paragraph's marker
+    leads its heading, so every number the counters take is written."""
+    if level and text:
+        mark = number or (item[1] if item and item[1] != "-" else None)
+        if mark:
+            lead(inlines, mark)
+        return Heading(level, inlines)
+    if item:
+        lvl, marker, typed = item
+        if typed:
+            strip_marker(inlines, typed)
+        return ListItem(lvl, marker, inlines) if inlines else None
+    if not inlines:
+        return None
+    if number and text:
+        lead(inlines, number)
+    return Para(inlines)
 
 
 def _shown(inlines, ids, out) -> None:

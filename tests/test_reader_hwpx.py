@@ -207,6 +207,12 @@ def test_image_and_auto_alt():
     assert md(p) == "![](assets/img-001.png)\n"
     p = hwpx_doc(pic % "회사 로고", hpf_items=items, extra={"BinData/image1.png": PNG})
     assert md(p) == "![회사 로고](assets/img-001.png)\n"
+    auto = ("그림입니다.\n원본 그림의 이름: CLP000012340001.bmp\n원본 그림의 크기: 가로 1024pixel, 세로 768pixel\n"
+            "사진 찍은 날짜: 2019년 05월 21일 오후 3:25")
+    p = hwpx_doc(pic % auto, hpf_items=items, extra={"BinData/image1.png": PNG})
+    assert md(p) == "![](assets/img-001.png)\n"
+    p = hwpx_doc(pic % (auto + "\n회사 로고"), hpf_items=items, extra={"BinData/image1.png": PNG})
+    assert md(p) == "![회사 로고](assets/img-001.png)\n"
 
 
 def test_footnote():
@@ -255,6 +261,64 @@ def test_click_here_dropped():
     sec = ('<hp:p><hp:run>' + _field(3, "CLICK_HERE") + '<hp:t>여기에 입력</hp:t>' + _fend(3)
            + '<hp:t>남음</hp:t></hp:run></hp:p>')
     assert md(hwpx_doc(sec)) == "남음\n"
+
+
+def test_click_here_filled_value_kept():
+    # a filled click-here field (dirty="1") holds its value between begin and end; the guide text is only in the
+    # Direction parameter and never shows, filled or not
+    begin = ('<hp:ctrl><hp:fieldBegin id="88" type="CLICK_HERE" name="성명" editable="1" dirty="%s"><hp:parameters>'
+             '<hp:stringParam name="Direction">이름을 입력하세요</hp:stringParam></hp:parameters></hp:fieldBegin></hp:ctrl>')
+    sec = ('<hp:p><hp:run><hp:t>성명: </hp:t>' + begin + '<hp:t>%s</hp:t>' + _fend(88) + '<hp:t> 끝</hp:t></hp:run></hp:p>')
+    assert md(hwpx_doc(sec % ("1", "홍길동"))) == "성명: 홍길동 끝\n"
+    assert md(hwpx_doc(sec % ("0", "이름을 입력하세요"))) == "성명:  끝\n"
+
+
+def test_table_and_picture_captions():
+    # a table's and a picture's caption list follow the object, as hwp has them
+    cap = '<hp:caption side="%s"><hp:subList>%s</hp:subList></hp:caption>'
+    tbl = ('<hp:p><hp:run><hp:t>표 앞</hp:t><hp:tbl>' + cap % ("TOP", P("표 7. 연도별 예산"))
+           + "<hp:tr>" + _tc("구분", 0, 0) + _tc("금액", 1, 0) + "</hp:tr><hp:tr>" + _tc("인건비", 0, 1)
+           + _tc("120", 1, 1) + "</hp:tr></hp:tbl></hp:run></hp:p>")
+    items = '<opf:item id="image1" href="BinData/image1.png" media-type="image/png"/>'
+    pic = ('<hp:p><hp:run><hp:pic>' + cap % ("BOTTOM", P("그림 3. 조직도"))
+           + '<hc:img binaryItemIDRef="image1"/></hp:pic><hp:t>그림 뒤</hp:t></hp:run></hp:p>')
+    out = md(hwpx_doc(tbl + pic, hpf_items=items, extra={"BinData/image1.png": PNG}))
+    assert out == ("표 앞\n\n|구분|금액|\n|---|---|\n|인건비|120|\n\n표 7. 연도별 예산\n\n그림 뒤\n\n"
+                   "![](assets/img-001.png)\n\n그림 3. 조직도\n"), out
+    # a shape's caption is a paragraph of its own, not text run into the paragraph that holds the shape
+    rect = ('<hp:p><hp:run><hp:t>앞</hp:t><hp:rect>' + cap % ("BOTTOM", P("도형 1")) + '<hp:drawText><hp:subList>'
+            + P("상자") + '</hp:subList></hp:drawText></hp:rect></hp:run></hp:p>')
+    assert md(hwpx_doc(rect)) == "앞\n\n상자\n\n도형 1\n"
+
+
+OUTLINE = ('<hh:numbering id="1"><hh:paraHead level="1" start="1" numFormat="DIGIT">^1.</hh:paraHead>'
+           '<hh:paraHead level="2" start="1" numFormat="HANGUL_SYLLABLE">^2.</hh:paraHead>'
+           '<hh:paraHead level="3" start="1" numFormat="DIGIT">^3)</hh:paraHead>'
+           '<hh:paraHead level="4" start="1" numFormat="DIGIT"/></hh:numbering>'
+           '<hh:paraPr id="1"><hh:heading type="OUTLINE" idRef="0" level="0"/></hh:paraPr>'
+           '<hh:paraPr id="2"><hh:heading type="OUTLINE" idRef="0" level="1"/></hh:paraPr>'
+           '<hh:paraPr id="4"><hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/paragraph">'
+           '<hh:heading type="OUTLINE" idRef="0" level="2"/></hp:case><hp:default><hh:heading type="NONE" idRef="0" '
+           'level="0"/></hp:default></hp:switch></hh:paraPr>'
+           '<hh:paraPr id="5"><hh:heading type="OUTLINE" idRef="0" level="3"/></hh:paraPr>')
+
+
+def test_outline_numbers():
+    # the section's outline numbering (secPr outlineShapeIDRef) numbers its outline paragraphs, a heading in a switch
+    # too; a paragraph demoted for its length keeps the number it took, a number typed in the text is not doubled,
+    # and a level whose format is empty gives none
+    sec = ('<hp:p><hp:run><hp:secPr outlineShapeIDRef="1"/></hp:run></hp:p>' + P("사업 개요", pr="1")
+           + P("본 사업은 지역 물류 체계를 개선하기 위하여 추진하는 것으로 세부 계획은 다음과 같이 정한다.", pr="2")
+           + P("나. 추진 목표", pr="2") + P("세부 항목", pr="4") + P("번호 없음", pr="5") + P("사업 내용", pr="1"))
+    out = md(hwpx_doc(sec, OUTLINE))
+    assert out == ("# 1. 사업 개요\n\n가. 본 사업은 지역 물류 체계를 개선하기 위하여 추진하는 것으로 세부 계획은 다음과 같이 "
+                   "정한다.\n\n## 나. 추진 목표\n\n### 1) 세부 항목\n\n#### 번호 없음\n\n# 2. 사업 내용\n"), out
+    # without a section outline numbering, and in a table cell, the outline paragraphs keep their own text only
+    assert md(hwpx_doc(P("사업 개요", pr="1"), OUTLINE)) == "# 사업 개요\n"
+    cell = _tbl(_tc("x", 0, 0) + _tc("y", 1, 0), _tc("z", 0, 1) + "<hp:tc><hp:subList>" + P("칸 제목", pr="1")
+                + '</hp:subList><hp:cellAddr colAddr="1" rowAddr="1"/></hp:tc>')
+    sec = '<hp:p><hp:run><hp:secPr outlineShapeIDRef="1"/></hp:run></hp:p>' + cell
+    assert "|z|1. 칸 제목|" in md(hwpx_doc(sec, OUTLINE))
 
 
 def test_track_change_deleted():

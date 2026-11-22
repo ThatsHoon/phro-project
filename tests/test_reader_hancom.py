@@ -55,6 +55,29 @@ def test_regexes_moved():
     assert hancom.STYLE_HEAD.match("개요 2").group(1) == "2" and not hancom.STYLE_HEAD.match("본문")
 
 
+def test_alt_text_drops_the_automatic_description():
+    auto = "그림입니다.\r\n원본 그림의 이름: a.bmp\r\n원본 그림의 크기: 가로 10pixel, 세로 7pixel\r\n사진 찍은 날짜: 2019년"
+    assert hancom.alt_text(auto) == "" and hancom.alt_text("그림입니다.") == ""
+    assert hancom.alt_text(auto + "\n회사  로고") == "회사 로고"
+    assert hancom.alt_text("설명: 회사 로고\n둘째 줄") == "설명: 회사 로고 둘째 줄" and hancom.alt_text("") == ""
+
+
+def test_paragraph_writes_every_number_it_takes():
+    # an outline number leads a heading and a demoted paragraph; a numbered paragraph that is a heading by its style
+    # writes its marker; a bullet never leads a heading; an empty paragraph gives no block
+    h = hancom.paragraph([Text("제목")], "제목", 2, "가.")
+    assert h.level == 2 and h.inlines == [Text("가. "), Text("제목")]
+    assert hancom.paragraph([Text("가. 본문")], "가. 본문", 0, "가.").inlines == [Text("가. "), Text("본문")]
+    assert hancom.paragraph([Text("x")], "x", 1, None, (0, "3)", "3)")).inlines == [Text("3) "), Text("x")]
+    assert hancom.paragraph([Text("x")], "x", 1, None, (0, "-", "-")).inlines == [Text("x")]
+    item = hancom.paragraph([Text("● y")], "● y", 0, None, (1, "-", "●"))
+    assert (item.level, item.marker, item.inlines) == (1, "-", [Text("y")])
+    assert hancom.paragraph([], "", 0, "1.") is None and hancom.paragraph([Text(" ")], "", 0, "1.").inlines == [Text(" ")]
+    assert hancom.outline_marker({1: ("", "DIGIT", 1)}, {}, 0) is None
+    cnt = {}
+    assert hancom.outline_marker({1: ("^1.", "DIGIT", 1)}, cnt, 0) == "1." and cnt == {0: 1}
+
+
 def test_place_moved():
     a, b, c = Cell([]), Cell([]), Cell([])
     rows = hancom.place([(0, 0, 1, 2, a), (1, 0, 1, 1, b), (1, 1, 1, 1, c)])
