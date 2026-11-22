@@ -10,7 +10,7 @@ from pathlib import Path
 from ..containers import cfb
 from ..containers.zipx import Package, local
 from ..limits import ReadError
-from .ooxml_base import UNDERSTOOD, alternate, chart, image, load, rels  # noqa: F401 (re-exported)
+from .ooxml_base import UNDERSTOOD, alternate, chart, image, load, macros, rels  # noqa: F401 (re-exported)
 
 
 # ---- entry
@@ -43,8 +43,7 @@ def _main_part(pkg) -> str:
 
 def read_package(pkg, ctx):
     """The Doc of an open package, by the root of its main part: a Word document, a presentation or a workbook."""
-    if any(n.rsplit("/", 1)[-1].lower() == "vbaproject.bin" for n in pkg.names):
-        ctx.skipped["vba"] = 1  # macros are never read; listed by name, however many projects there are
+    macros(pkg, ctx)
     part = _main_part(pkg)
     root, _ = load(pkg, part)
     kind = local(root.tag)

@@ -252,13 +252,13 @@ def test_workbook_in_cfb():
     assert Compound(p.read_bytes()).read("Workbook") == data
 
 
-def test_biff5_unsupported():
+def test_biff5_globals_keep_the_code_page():
     bof = struct.pack("<HHHH", 0x0500, 0x0005, 0, 0)
-    try:
-        biff.read_globals(biff.Stream(rec(0x0809, bof) + rec(0x000A, b""), Context()))
-        assert False
-    except ReadError as e:
-        assert e.kind == "unsupported" and "5.0/95" in e.detail
+    g = biff.read_globals(biff.Stream(rec(0x0809, bof) + rec(0x000A, b""), Context()))
+    assert g.ansi == "cp1252" and g.sheets == [], g
+    g = biff.read_globals(biff.Stream(rec(0x0809, bof) + rec(0x0042, struct.pack("<H", 1251)) + rec(0x000A, b""),
+                                      Context()))
+    assert g.ansi == "cp1251", g
 
 
 def test_not_biff():

@@ -41,6 +41,12 @@ def _cache(pkg) -> dict:
     return c
 
 
+def macros(pkg, ctx):
+    """Name a package's VBA project once: macros are never read, however many projects there are."""
+    if any(n.rsplit("/", 1)[-1].lower() == "vbaproject.bin" for n in pkg.names):
+        ctx.skipped["vba"] = 1
+
+
 def rels(pkg, part, ctx=None) -> dict:
     """Relationships of `part`, cached; a damaged .rels file reads as empty (counted when ctx is given)."""
     c = _cache(pkg)["rels"]

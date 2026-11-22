@@ -16,10 +16,11 @@ import reader  # noqa: E402
 from reader import limits  # noqa: E402
 from reader.formats import biff, sheet_grid, xls, xls_drawing  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Para, Text  # noqa: E402
+from reader.model import Context, Link, NoteRef, Para, Table, Text  # noqa: E402
 from diagram_fix import mermaid_ok  # noqa: E402
-from reader_fix import (biff as rec, biff_chart, biff_workbook, blip_metafile, blip_png, make_cfb, make_xls,  # noqa: E402
-                        oa_container, oa_fbse, oa_group, oa_record, oa_shape, oa_solver, xls_txo)
+from reader_fix import (biff as rec, biff_chart, biff_workbook, blip_metafile, blip_png,  # noqa: E402
+                        cfb_bytes, externsheet, make_cfb, make_xls, oa_container, oa_fbse, oa_group, oa_record,
+                        oa_shape, oa_solver, xls_txo)
 
 
 def run(sheets, hidden=False, **kw):
@@ -82,6 +83,248 @@ def test_values_displayed():
     md, _ = run([{"name": "S", "cells": cells}], formats={14: "yyyy-mm-dd"})
     for want in ("plain text", "₩1,385.50", "2023-03-15", "TRUE", "#DIV/0!", "100", "50%"):
         assert want in md, (want, md)
+
+
+def test_value_hidden_by_format():
+    md, _ = run([{"name": "S", "cells": {(0, 0): ("fmt", 5, ";;;"), (0, 1): "x"}}])
+    assert "|5|" not in md and "(1 hidden places left out)" in md, md
+    md, _ = run([{"name": "S", "cells": {(0, 0): ("fmt", 5, ";;;"), (0, 1): "x"}}], hidden=True)
+    assert "5" in md.replace("A1:B1", ""), md
+
+
+def fmla(row, col, rgce, value=1.0, extra=b""):
+    """A FORMULA record with a cached number: rw, col, ixfe, the result, grbit, chn, cce, then the tokens."""
+    return rec(0x0006, struct.pack("<HHHdHIH", row, col, 15, value, 0, 0, len(rgce)) + rgce + extra)
+
+
+def ref_n(drow, dcol):
+    return struct.pack("<BhH", 0x2C, drow, 0xC000 | (dcol & 0xFF))
+
+
+def lbl(name, rgce):
+    return rec(0x0018, struct.pack("<HBBHHH4x", 0, 0, len(name), len(rgce), 0, 0) + b"\0" + name.encode() + rgce)
+
+
+def test_formulas_decoded_and_grouped():
+    shared = ref_n(0, -2) + ref_n(0, -1) + b"\x05"
+    exp = struct.pack("<BHH", 0x01, 1, 3)
+    recs = [fmla(r, 3, exp) for r in (1, 2, 3)]
+    recs.insert(1, rec(0x04BC, struct.pack("<HHBBBBH", 1, 3, 3, 3, 0, 3, len(shared)) + shared))
+    three_d = struct.pack("<BHHH", 0x3A, 0, 0, 0xC000) + struct.pack("<BHH", 0x23, 1, 0) + b"\x03"
+    recs.append(fmla(1, 4, three_d))
+    recs.append(fmla(1, 5, b"\x18\0\0"))
+    data = biff_workbook([{"name": "Data", "cells": {(0, 0): 5}}, {"name": "S", "records": recs}],
+                         globals_extra=externsheet(0) + lbl("TaxRate", struct.pack("<BH", 0x1E, 7)))
+    ctx = Context()
+    secs = xls.Workbook(data, ctx, sheet_grid.Budget()).sections()
+    p = secs[1].blocks[-1]
+    assert "".join(i.text for i in p.inlines) == "Formulas: D2:D4 =B2*C2; E2 =Data!A1+TaxRate; F2 =?", p
+    assert ctx.skipped["formula"] == 1, ctx.skipped
+
+
+def texts(blocks) -> list:
+    """The text of each paragraph, a Hidden run's text in brackets."""
+    return ["".join(i.text if isinstance(i, Text) else "[" + "".join(t.text for t in i.inlines) + "]"
+                    for i in b.inlines) for b in blocks if isinstance(b, Para)]
+
+
+def book(sheets, **kw):
+    """The Doc of a compound file whose Workbook stream is biff_workbook(sheets, **kw), and its ctx; `streams` adds
+    other streams to the compound file."""
+    streams = kw.pop("streams", {})
+    blob, _ = cfb_bytes({"Workbook": biff_workbook(sheets, **kw), **streams})
+    ctx = Context()
+    return xls.parse_compound(blob, ctx), ctx
+
+
+def lbl_at(name, rgce, itab=0, flags=0):
+    """A NAME record local to one-based sheet `itab` (0 the workbook) with grbit `flags`."""
+    return rec(0x0018, struct.pack("<HBBHHH4x", flags, 0, len(name), len(rgce), 0, itab) + b"\0"
+               + name.encode("latin-1") + rgce)
+
+
+def xlstr(s):
+    """An XLUnicodeString of 8-bit characters."""
+    return struct.pack("<HB", len(s), 0) + s.encode("latin-1")
+
+
+def refs(*ranges):
+    """A SqRefU of Ref8U (first row, last row, first col, last col)."""
+    return struct.pack("<H", len(ranges)) + b"".join(struct.pack("<4H", *r) for r in ranges)
+
+
+AREA3D = struct.pack("<BHHHHH", 0x3B, 0, 0, 40, 0, 3)
+
+
+def test_names_workbook_first_sheet_scoped_on_the_sheet():
+    names = (externsheet(0) + lbl_at("TaxRate", struct.pack("<BH", 0x1E, 7))
+             + lbl_at("Local", struct.pack("<BHHH", 0x3A, 0, 0, 0), itab=1)
+             + lbl_at("\x0d", AREA3D, itab=1, flags=0x21))
+    doc, _ = book([{"name": "Data", "cells": {(0, 0): 5}}], globals_extra=names)
+    assert texts(doc.blocks[:1]) == ["Names: TaxRate = 7"], doc.blocks[:1]
+    assert texts(doc.blocks[1].blocks)[-1] == "Names: Local = Data!$A$1", doc.blocks[1].blocks
+
+
+GUID_STDLINK = bytes.fromhex("d0c9ea79f9bace118c8200aa004ba90b")
+GUID_URL = bytes.fromhex("e0c9ea79f9bace118c8200aa004ba90b")
+GUID_FILE = bytes.fromhex("0303000000000000c000000000000046")
+
+
+def hstr(s):
+    """A HyperlinkString: its length in characters with the NUL, then UTF-16 with the NUL."""
+    return struct.pack("<I", len(s) + 1) + (s + "\0").encode("utf-16-le")
+
+
+def hlink(r1, r2, c1, c2, url=None, path=None, place=None):
+    """An HLINK: the range, the StdLink CLSID, then a Hyperlink object with a URL or file moniker and a location."""
+    flags, body = 0, b""
+    if url is not None:
+        u = (url + "\0").encode("utf-16-le")
+        flags |= 0x03
+        body += GUID_URL + struct.pack("<I", len(u)) + u
+    if path is not None:
+        a = path.encode("latin-1") + b"\0"
+        flags |= 0x01
+        body += (GUID_FILE + struct.pack("<HI", 1, len(a)) + a + struct.pack("<HH", 0xFFFF, 0xDEAD) + bytes(20)
+                 + struct.pack("<I", 0))
+    if place is not None:
+        flags |= 0x08
+        body += hstr(place)
+    return rec(0x01B8, struct.pack("<4H", r1, r2, c1, c2) + GUID_STDLINK + struct.pack("<II", 2, flags) + body)
+
+
+def cell_inlines(table, r, c):
+    return table.rows[r][c].blocks[0].inlines
+
+
+def test_hyperlinks_on_their_cells():
+    records = [hlink(0, 0, 0, 0, url="https://example.com/north"), hlink(0, 0, 1, 1, path="budget.xls"),
+               hlink(0, 0, 2, 2, place="Data!A1"), hlink(0, 0, 3, 3)]
+    doc, ctx = book([{"name": "S", "cells": {(0, 0): "site", (0, 1): "file", (0, 2): "go", (0, 3): "odd"},
+                      "records": records}])
+    t = doc.blocks[0].blocks[0]
+    assert isinstance(t, Table), doc.blocks[0].blocks
+    assert cell_inlines(t, 0, 0) == [Link("https://example.com/north", [Text("site")])], cell_inlines(t, 0, 0)
+    assert cell_inlines(t, 0, 1) == [Link("..\\budget.xls", [Text("file")])], cell_inlines(t, 0, 1)
+    assert cell_inlines(t, 0, 2) == [Text("go"), Text(" → Data!A1")], cell_inlines(t, 0, 2)
+    assert cell_inlines(t, 0, 3) == [Text("odd")] and not ctx.skipped, (cell_inlines(t, 0, 3), ctx.skipped)
+
+
+def obj(oid, ot=0x19):
+    """An OBJ whose FtCmo gives the object type and id (0x19 a note's comment box)."""
+    return rec(0x005D, struct.pack("<HHHHH12x", 0x15, 0x12, ot, oid, 0) + bytes(4))
+
+
+def note(r, c, oid, author):
+    return rec(0x001C, struct.pack("<HHHH", r, c, 0, oid) + xlstr(author) + b"\0")
+
+
+def test_notes_on_their_cells_with_author():
+    records = [obj(1), xls_txo("Ann:\nDivision by zero on purpose"), obj(2, ot=6), xls_txo("box text"),
+               note(0, 0, 1, "Ann")]
+    doc, ctx = book([{"name": "S", "cells": {(0, 0): "x", (1, 0): "y"}, "records": records}])
+    t = doc.blocks[0].blocks[0]
+    key = next(iter(doc.notes))
+    assert cell_inlines(t, 0, 0) == [Text("x"), NoteRef(key)], cell_inlines(t, 0, 0)
+    assert texts(doc.notes[key]) == ["Comment by Ann: Division by zero on purpose"], doc.notes
+    assert texts(doc.blocks[0].blocks) == ["box text"] and not ctx.skipped, (doc.blocks[0].blocks, ctx.skipped)
+
+
+def dv(flags, f1, f2, *ranges):
+    """A DV: dwDvFlags, four empty strings (prompt and error titles and texts), two formulas, the ranges."""
+    empty = xlstr("\0")
+    return rec(0x01BE, struct.pack("<I", flags) + empty * 4 + struct.pack("<HH", len(f1), 0) + f1
+               + struct.pack("<HH", len(f2), 0) + f2 + refs(*ranges))
+
+
+def test_validations():
+    pick = dv(3 | 0x80, b"\x17" + bytes([11, 0]) + b"Open\0Closed", b"", (1, 8, 0, 0))
+    whole = dv(1, struct.pack("<BH", 0x1E, 0), struct.pack("<BH", 0x1E, 1000), (1, 8, 1, 2))
+    above = dv(2 | 4 << 20, struct.pack("<Bd", 0x1F, 0.5), b"", (0, 0, 7, 7))
+    records = [rec(0x01B2, struct.pack("<HIIII", 0, 0, 0, 0xFFFFFFFF, 3)), pick, whole, above]
+    doc, _ = book([{"name": "S", "cells": {(0, 0): "x"}, "records": records}])
+    assert texts(doc.blocks[0].blocks)[-1] == ('Validation: A2:A9 list "Open,Closed"; B2:C9 whole between 0 and 1000; '
+                                              "H1 decimal > 0.5"), doc.blocks[0].blocks
+
+
+def test_conditional_rules_one_line_each():
+    bound = (4, 7, 5, 5)
+    condfmt = rec(0x01B0, struct.pack("<HH4H", 2, 0, *bound) + refs(bound))
+    cell = rec(0x01B1, struct.pack("<BBHH", 1, 5, 3, 0) + bytes(6) + struct.pack("<BH", 0x1E, 150))
+    test = struct.pack("<BHH", 0x24, 4, 0xC005) + struct.pack("<BH", 0x1E, 100) + b"\x0d"
+    form = rec(0x01B1, struct.pack("<BBHH", 2, 0, len(test), 0) + bytes(6) + test)
+    doc, _ = book([{"name": "S", "cells": {(0, 0): "x"}, "records": [condfmt, cell, form]}])
+    assert texts(doc.blocks[0].blocks)[1:] == ["Conditional: F5:F8 cell > 150; F5:F8 formula =F5>100"], \
+        doc.blocks[0].blocks
+
+
+def test_pivot_view_names_its_range_and_values_and_unread_facts_are_counted():
+    view = rec(0x00B0, struct.pack("<4H", 2, 6, 0, 1) + struct.pack("<16H", *[0] * 16)
+               + struct.pack("<HH", 10, 4) + b"\0PivotSales" + b"\0Data")
+    item = rec(0x00C5, struct.pack("<7H", 3, 0, 0, 0, 0, 0, 13) + b"\0Sum of Amount")
+    bare = rec(0x00B0, struct.pack("<4H", 9, 12, 3, 4) + struct.pack("<16H", *[0] * 16)
+               + struct.pack("<HH", 2, 0) + b"\x01" + "피벗".encode("utf-16-le"))
+    unread = [rec(0x0872, bytes(30)), rec(0x087A, bytes(30)), rec(0x00B0, bytes(10))]
+    doc, ctx = book([{"name": "S", "cells": {(0, 0): "x"}, "records": [view, item, bare, *unread]}])
+    assert texts(doc.blocks[0].blocks)[1:] == ["Pivot PivotSales A3:B7: values Sum of Amount", "Pivot: 피벗 D10:E13"], \
+        doc.blocks[0].blocks
+    assert ctx.skipped == {"fact": 2, "record": 1}, ctx.skipped
+
+
+def test_hyperlink_with_a_location_keeps_its_file():
+    records = [hlink(0, 0, 0, 0, url="https://example.com/page", place="section2"),
+               hlink(0, 0, 1, 1, path="other.xls", place="Sheet1!A1")]
+    doc, ctx = book([{"name": "S", "cells": {(0, 0): "site", (0, 1): "file"}, "records": records}])
+    t = doc.blocks[0].blocks[0]
+    assert cell_inlines(t, 0, 0) == [Link("https://example.com/page#section2", [Text("site")])], cell_inlines(t, 0, 0)
+    assert cell_inlines(t, 0, 1) == [Link("..\\other.xls#Sheet1!A1", [Text("file")])], cell_inlines(t, 0, 1)
+
+
+def test_formula_with_an_empty_text_result_is_listed():
+    def formula(r, value):
+        tokens = struct.pack("<BHH", 0x44, r, 0xC000) + struct.pack("<BH", 0x1E, 2) + b"\x05"
+        return rec(0x0006, struct.pack("<HHH", r, 1, 15) + value + struct.pack("<HIH", 0, 0, len(tokens)) + tokens)
+
+    empty = bytes([3, 0, 0, 0, 0, 0, 0xFF, 0xFF])
+    records = [formula(0, struct.pack("<d", 2.0)), formula(1, empty), formula(2, struct.pack("<d", 6.0))]
+    doc, ctx = book([{"name": "S", "cells": {(0, 0): "1", (1, 0): "2", (2, 0): "3"}, "records": records}])
+    assert texts(doc.blocks[0].blocks)[-1] == "Formulas: B1:B3 =A1*2" and not ctx.skipped, \
+        (doc.blocks[0].blocks, ctx.skipped)
+
+
+def test_autofilter_range_from_its_name_and_criteria():
+    def doper_str(sign, s):
+        return struct.pack("<BB4xBBBx", 6, sign, len(s), 1, 0)
+
+    def doper_num(sign, v):
+        return struct.pack("<BBd", 4, sign, v)
+
+    names = externsheet(0) + lbl_at("\x0d", AREA3D, itab=1, flags=0x21)
+    records = [rec(0x009D, struct.pack("<H", 4)),
+               rec(0x009E, struct.pack("<HH", 2, 0x04) + doper_str(2, "Open") + bytes(10) + b"\0Open"),
+               rec(0x009E, struct.pack("<HH", 3, 0) + doper_num(4, 5) + doper_num(1, 9))]
+    doc, _ = book([{"name": "S", "cells": {(0, 0): "x"}, "records": records}], globals_extra=names)
+    assert texts(doc.blocks[0].blocks)[-1] == "Filter A1:D41: C = Open; D > 5 and D < 9", doc.blocks[0].blocks
+
+
+def test_protection_and_external_links():
+    supbooks = (rec(0x01AE, struct.pack("<HH", 1, 0x0401))
+                + rec(0x01AE, struct.pack("<HH", 1, 15) + b"\0" + b"\x01C\x03x\x03budget.xls" + xlstr("Sheet1")))
+    extra = supbooks + rec(0x0012, struct.pack("<H", 1)) + rec(0x0019, struct.pack("<H", 1))
+    doc, _ = book([{"name": "S", "cells": {(0, 0): "x"}, "records": [rec(0x0012, struct.pack("<H", 1))]},
+                   {"name": "T", "cells": {(0, 0): "y"}, "records": [rec(0x0012, struct.pack("<H", 0))]}],
+                  globals_extra=extra)
+    assert texts(doc.blocks[:2]) == ["External links: [1] C:\\x\\budget.xls",
+                                     "Protected: workbook structure; workbook windows"], doc.blocks[:2]
+    assert texts(doc.blocks[2].blocks)[-1] == "Protected: sheet", doc.blocks[2].blocks
+    assert texts(doc.blocks[3].blocks) == ["A1: y"], doc.blocks[3].blocks
+
+
+def test_macros_present_line():
+    _, ctx = book([{"name": "S", "cells": {(0, 0): "x"}}], streams={"_VBA_PROJECT_CUR/VBA/dir": b"x" * 8})
+    assert ctx.skipped["vba"] == 1, ctx.skipped
+    _, ctx = book([{"name": "S", "cells": {(0, 0): "x"}}])
+    assert not ctx.skipped["vba"], ctx.skipped
 
 
 def test_formula_cached():
@@ -195,7 +438,7 @@ def cells_of(sheet, **kw):
 
 def test_colinfo_last_column_0x100():
     info = rec(0x007D, struct.pack("<HHHHHH", 1, 0x100, 2560, 15, 1, 0))
-    wb = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, 1): "a", (0, 300): "c"},
+    wb = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, c): "a" for c in range(1, 301)},
                                       "records": [info]}]), Context(), sheet_grid.Budget())
     (t,) = wb.sheet_blocks(0)
     assert t.hidden_cols == frozenset(range(256)), sorted(t.hidden_cols)[-3:]  # columns 1..256 of 1..300
@@ -305,7 +548,8 @@ def test_sparse_far_rows():
                       sheet_grid.Budget())
     secs = wb.sections()
     assert time.monotonic() - t0 < 2
-    assert ctx.skipped["repeat"] == 1 and len(secs) == 1, ctx.skipped
+    assert len(secs) == 1 and not ctx.skipped, ctx.skipped
+    assert ["".join(i.text for i in b.inlines) for b in secs[0].blocks] == ["A1: top", "A65536: bottom"], secs[0].blocks
 
 
 def test_macro_sheet_quiet():
@@ -327,12 +571,94 @@ def test_filepass_encrypted():
     assert got[0] == "encrypted", got
 
 
-def test_book_stream():
-    with tempfile.TemporaryDirectory() as d:
-        src = Path(d) / "a.xls"
-        make_cfb(src, {"Book": biff_workbook([{"name": "S"}])})
-        got = denied(lambda: reader.convert(src, Path(d) / "out"))
-    assert got == ("unsupported", "Excel 5.0/95 workbook"), got
+def biff5_book(cells, *, globals_extra=b"", name="Лист1", codepage=1251, enc="cp1251"):
+    """A BIFF5 Book stream by hand: BOF 0x0500, CODEPAGE, a FORMAT (164, "0.00") and two XFs (the second uses it),
+    `globals_extra`, one BOUNDSHEET in the code page, then the sheet: BOF 0x0500 (dt 0x10), the `cells` records,
+    EOF."""
+    head = (rec(0x0809, struct.pack("<HHHH", 0x0500, 0x0005, 0, 0)) + rec(0x0042, struct.pack("<H", codepage))
+            + rec(0x041E, struct.pack("<HB", 164, 4) + b"0.00")
+            + rec(0x00E0, struct.pack("<HH", 0, 0) + bytes(12)) + rec(0x00E0, struct.pack("<HH", 0, 164) + bytes(12))
+            + globals_extra)
+    raw = name.encode(enc)
+    bound_len = 4 + 7 + len(raw)
+    eof = rec(0x000A)
+    pos = len(head) + bound_len + len(eof)
+    sheet = rec(0x0809, struct.pack("<HHHH", 0x0500, 0x0010, 0, 0)) + b"".join(cells) + eof
+    return head + rec(0x0085, struct.pack("<IBBB", pos, 0, 0, len(raw)) + raw) + eof + sheet
+
+
+def label5(r, c, text, enc="cp1251"):
+    raw = text.encode(enc)
+    return rec(0x0204, struct.pack("<HHHH", r, c, 0, len(raw)) + raw)
+
+
+def note5(r, c, raw, total=None):
+    return rec(0x001C, struct.pack("<HHH", r, c, len(raw) if total is None else total) + raw)
+
+
+def book5(stream):
+    blob, _ = cfb_bytes({"Book": stream})
+    ctx = Context()
+    return xls.parse_compound(blob, ctx), ctx
+
+
+def test_biff5_book_read_in_its_code_page():
+    """An Excel 5.0/95 Book: its sheet name, cell text and format code in the CODEPAGE's code page, a formula's
+    cached value (its tokens are BIFF5's, counted under formula), a NOTE split over a continuation NOTE (row
+    0xFFFF), and a NAME counted under fact."""
+    first, rest = "Заметка ".encode("cp1251"), "вторая часть".encode("cp1251")
+    cells = [label5(0, 0, "Привет"), rec(0x0203, struct.pack("<HHHd", 0, 1, 1, 1.5)),
+             rec(0x0006, struct.pack("<HHHdHIH", 0, 2, 0, 3.0, 0, 0, 3) + b"\x1e\x03\x00"),
+             note5(0, 0, first, total=len(first) + len(rest)), note5(0xFFFF, 0, rest)]
+    name = rec(0x0018, struct.pack("<HBBHHHHBBBB", 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0) + b"Rate")
+    doc, ctx = book5(biff5_book(cells, globals_extra=name))
+    sec = doc.blocks[0]
+    assert sec.title == "Лист1", sec
+    t = sec.blocks[0]
+    assert isinstance(t, Table), sec.blocks
+    key = next(iter(doc.notes))
+    assert cell_inlines(t, 0, 0) == [Text("Привет"), NoteRef(key)], cell_inlines(t, 0, 0)
+    assert [cell_inlines(t, 0, c) for c in (1, 2)] == [[Text("1.50")], [Text("3")]], t.rows
+    assert texts(doc.notes[key]) == ["Comment: Заметка вторая часть"], doc.notes
+    assert dict(ctx.skipped) == {"formula": 1, "fact": 1}, ctx.skipped
+
+
+def test_book_stream_routes_to_xls():
+    """A compound file holding only a Book stream is xls's own, whichever reader opened it."""
+    from reader.containers.cfb import Compound
+    from reader.formats import cfb_route
+    with Compound(cfb_bytes({"Book": biff5_book([label5(0, 0, "x")])})[0]) as cf:
+        assert cfb_route.route(cf, "xls", "no Workbook stream") is None
+        assert cfb_route.route(cf, "doc", "no WordDocument stream") == "xls"
+
+
+def test_biff5_codepages():
+    """CODEPAGE 1200 is UTF-16 (the bytes of a BIFF5 string are still its count), 32768 Mac Roman, and one Python
+    has no codec for is read as cp1252."""
+    assert biff._codec(1200) == "utf-16-le" and biff._codec(32768) == "mac_roman", biff._codec(1200)
+    assert biff._codec(1251) == "cp1251" and biff._codec(54321) == "cp1252", biff._codec(54321)
+    doc, _ = book5(biff5_book([label5(0, 0, "café", "cp1252")], name="Hoja", codepage=54321, enc="cp1252"))
+    assert doc.blocks[0].title == "Hoja" and texts(doc.blocks[0].blocks) == ["A1: café"], doc.blocks
+
+
+def test_biff5_filepass_encrypted():
+    stream = biff5_book([label5(0, 0, "x")], globals_extra=rec(0x002F, struct.pack("<HH", 0x1234, 0x5678)))
+    got = denied(lambda: book5(stream))
+    assert got[0] == "encrypted", got
+
+
+def obj5(ot):
+    """A BIFF5 OBJ: cObj, the object type, its id, then the rest of the record."""
+    return rec(0x005D, struct.pack("<IHH", 1, ot, 1) + bytes(26))
+
+
+def test_biff5_chart_and_objects_counted():
+    """A chart substream inside a BIFF5 sheet is counted under chart, not read as BIFF8; its chart OBJ is not counted
+    again, a picture OBJ is counted under image and a text box under shape."""
+    chart = rec(0x0809, struct.pack("<HHHH", 0x0500, 0x0020, 0, 0)) + rec(0x1001, b"\0\0") + rec(0x000A)
+    doc, ctx = book5(biff5_book([label5(0, 0, "x"), obj5(5), chart, obj5(8), obj5(6)]))
+    assert texts(doc.blocks[0].blocks) == ["A1: x"], doc.blocks
+    assert dict(ctx.skipped) == {"chart": 1, "image": 1, "shape": 1}, ctx.skipped
 
 
 def test_container_denials():
@@ -650,7 +976,8 @@ def test_txo_charged_to_sheet_characters():
 def test_embedded_workbook_skips_text_boxes():
     sheet = drawn([tbox(1025, cells(0, 2, 1, 3))], ["note"])
     wb = xls.Workbook(biff_workbook([sheet]), Context(), sheet_grid.Budget(chars=100), pictures=False)
-    plain = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, 0): "cell"}}]), Context(), sheet_grid.Budget())
+    plain = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, 0): "cell"}}]), Context(), sheet_grid.Budget(),
+                         pictures=False)
     assert wb.sheet_blocks(0) == plain.sheet_blocks(0) and wb.budget.chars == 100 - len("cell"), wb.sheet_blocks(0)
 
 

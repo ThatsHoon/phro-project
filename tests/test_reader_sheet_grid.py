@@ -12,7 +12,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
-from reader.formats.sheet_grid import Budget, Grid, text_inlines  # noqa: E402
+from reader.formats.sheet_grid import Budget, Grid, address, formula_text, listed, pattern, ruled, text_inlines  # noqa: E402
 from reader.model import Bold, Break, Context, Doc, Hidden, Link, NoteRef, Para, Table, Text  # noqa: E402
 
 
@@ -240,8 +240,9 @@ def test_tall_merges_are_fast():
 
 def test_open_merges_do_not_cost_every_row():
     """999 full-height merges, each in its own column, over 100,000 one-cell rows: a row costs its own cells and the
-    merges that start or end there, not every merge still open."""
-    g, _ = mk()
+    merges that start or end there, not every merge still open. The merges past GRID_SLOTS of area are one cell each,
+    so each row below holds their 979 filler cells before its own, and the table is cut at GRID_SLOTS."""
+    g, ctx = mk()
     for c in range(999):
         g.merge(0, 99_999, c, c)
         g.put(0, c, f"m{c}")
@@ -251,8 +252,9 @@ def test_open_merges_do_not_cost_every_row():
     t = table(g)
     took = time.monotonic() - t0
     assert took < 5, took
-    assert len(t.rows) == 100_000 and len(t.rows[0]) == 1000 and t.rows[0][0].rowspan == 100_000
-    assert [txt(c) for c in t.rows[1]] == ["1"] and [txt(c) for c in t.rows[-1]] == ["99999"], (t.rows[1], t.rows[-1])
+    assert len(t.rows[0]) == 1000 and [c.rowspan for c in t.rows[0][19:21]] == [100_000, 1], t.rows[0][19:21]
+    assert [txt(c) for c in t.rows[1]] == [""] * 979 + ["1"], t.rows[1][-2:]
+    assert txt(t.rows[-1][-1]) == str(len(t.rows) - 1) and len(t.rows) < 100_000 and ctx.skipped["sheet_cut"] == 1
 
 
 def test_merge_cap_dense():
@@ -406,6 +408,439 @@ def test_blocks_frees_its_intermediates():
         tracemalloc.stop()
     assert len(out[0].rows) == 200 and txt(out[0].rows[199][99]) == "000019999"
     assert peak - base < 1.2 * (kept - base), (peak - base, kept - base)
+
+
+def fill(g, r1, r2, c1, c2, tag=""):
+    for r in range(r1, r2 + 1):
+        for c in range(c1, c2 + 1):
+            assert g.put(r, c, f"{tag}{r},{c}")
+
+
+def para_text(b):
+    assert isinstance(b, Para), b
+    return "".join(i.text for i in b.inlines if isinstance(i, Text))
+
+
+def test_address():
+    assert [address(0, 0), address(8, 3), address(99_999, 25), address(0, 26), address(4, 701), address(0, 702)] == \
+        ["A1", "D9", "Z100000", "AA1", "ZZ5", "AAA1"]
+
+
+def test_three_islands_three_tables():
+    g, _ = mk()
+    fill(g, 0, 8, 0, 3, "a")    # A1:D9
+    fill(g, 4, 8, 6, 8, "b")    # G5:I9
+    fill(g, 13, 17, 2, 4, "c")  # C14:E18
+    out = g.sheet_blocks()
+    assert [type(b) for b in out] == [Table] * 3, out
+    assert [(t.caption, t.origin) for t in out] == [("A1:D9", "A1"), ("G5:I9", "G5"), ("C14:E18", "C14")], \
+        [(t.caption, t.origin) for t in out]
+    assert [len(t.rows) for t in out] == [9, 5, 5] and [len(t.rows[0]) for t in out] == [4, 3, 3]
+    assert txt(out[1].rows[0][0]) == "b4,6" and txt(out[2].rows[4][2]) == "c17,4"
+
+
+def test_lone_cell_island_is_an_addressed_paragraph():
+    g, _ = mk()
+    g.put(0, 0, "Quarterly report")
+    fill(g, 2, 4, 0, 2)
+    out = g.sheet_blocks()
+    assert para_text(out[0]) == "A1: Quarterly report" and (out[1].caption, out[1].origin) == ("A3:C5", "A3"), out
+    g, _ = mk()
+    g.put(2, 3, "only")
+    assert [para_text(b) for b in g.sheet_blocks()] == ["D3: only"]
+    g, _ = mk()  # a lone merged cell is led by its range
+    g.put(8, 0, "summary")
+    g.merge(8, 8, 0, 4)
+    assert [para_text(b) for b in g.sheet_blocks()] == ["A9:E9: summary"]
+
+
+def test_parts_with_the_same_span_stay_one_table():
+    g, _ = mk()
+    fill(g, 0, 0, 0, 3)          # a header row
+    fill(g, 2, 6, 0, 3)          # a blank row, then the data under the same columns
+    fill(g, 10, 14, 0, 0)        # a spacer column C between two parts on the same rows
+    fill(g, 10, 14, 3, 4)
+    out = g.sheet_blocks()
+    assert [t.caption for t in out] == ["A1:D7", "A11:E15"], [getattr(t, "caption", t) for t in out]
+    assert len(out[0].rows) == 7 and out[0].rows[1] == []
+
+
+def test_a_long_empty_run_splits_parts_with_the_same_span():
+    g, _ = mk()
+    fill(g, 0, 1, 0, 1)
+    fill(g, 66, 67, 0, 1)   # 64 empty rows between: one table
+    fill(g, 200, 201, 0, 1)  # 132 empty rows: a table of its own
+    out = g.sheet_blocks()
+    assert [t.caption for t in out] == ["A1:B68", "A201:B202"], [getattr(t, "caption", t) for t in out]
+    assert len(out[0].rows) == 68 and not g.ctx.skipped
+
+
+def test_merge_joins_its_parts_and_counts_in_the_range():
+    g, _ = mk()
+    g.put(0, 0, "title")
+    g.merge(0, 0, 0, 4)       # A1:E1 over the blank row's columns
+    fill(g, 2, 3, 0, 4)
+    out = g.sheet_blocks()
+    assert len(out) == 1 and out[0].caption == "A1:E4" and out[0].rows[0][0].colspan == 5, out
+
+
+def test_hidden_runs_named_in_the_caption():
+    g, _ = mk()
+    fill(g, 0, 19, 0, 5)
+    for r in (6, 11, 12, 13):
+        g.hide_row(r)
+    g.hide_cols(3, 3)
+    g.hide_cols(30, 40)  # outside the table: not named
+    g.put(25, 30, "far")
+    t = g.sheet_blocks()[0]
+    assert t.caption == "A1:F20 (hidden rows 7, 12-14; hidden columns D)", t.caption
+    assert t.hidden_rows == frozenset({6, 11, 12, 13}) and t.hidden_cols == frozenset({3})
+
+
+def test_hidden_runs_listed_up_to_the_cap():
+    g, _ = mk()
+    fill(g, 0, 99, 0, 1)
+    for r in range(0, 100, 2):
+        g.hide_row(r)
+    cap = g.sheet_blocks()[0].caption
+    shown = ", ".join(str(r + 1) for r in range(0, 2 * limits.SHEET_RUNS, 2))
+    assert cap == f"A1:B100 (hidden rows {shown} and {50 - limits.SHEET_RUNS} more)", cap
+
+
+def test_hidden_lone_cell_keeps_its_table():
+    g, _ = mk()
+    g.put(4, 1, "secret")
+    g.hide_row(4)
+    t = g.sheet_blocks()[0]
+    assert isinstance(t, Table) and t.caption == "B5 (hidden rows 5)" and t.origin == "B5", t
+
+
+def test_row_cut_named_where_it_is():
+    g, ctx = mk()
+    g.declare(0, 119_999, 0, 4)
+    for r in range(100_001):
+        if not g.put(r, 0, "v"):
+            break
+    out = g.sheet_blocks()
+    assert out[0].caption == "A1:A100000" and len(out[0].rows) == 100_000
+    assert para_text(out[-1]) == ("(Sheet cut at A100001 by the 100,000-row limit; not read from there to E120000, "
+                                  "20,000 rows)"), para_text(out[-1])
+    assert "sheet S cut at 100000 rows" in ctx.warnings
+    g, _ = mk()
+    g.put(0, 0, "a")
+    g.stop("scanned XML elements", 7, (3, None))
+    assert para_text(g.sheet_blocks()[-1]) == "(Sheet cut at row 4 by the workbook's 7-element limit; not read from there on)"
+
+
+def test_sheet_after_the_cell_budget_says_it_was_not_read():
+    b = Budget(cells=2)
+    g1, _ = mk("A", b)
+    fill(g1, 0, 0, 0, 1)
+    g2, ctx = mk("B", b)
+    g2.declare(0, 9, 0, 2)
+    assert not g2.put(0, 0, "x")
+    assert [para_text(x) for x in g2.sheet_blocks()] == [
+        "(Sheet not read: the document's 2-cell limit was used up by the sheets before it; it spans A1:C10, 10 rows)"]
+    g3, _ = mk("C", b)
+    assert g3.sheet_blocks() == []  # nothing was put, so nothing was left out
+
+
+def test_cut_inside_a_sheet_names_the_cell():
+    g, _ = mk("S", Budget(cells=5))
+    fill(g, 0, 0, 0, 2)
+    assert g.put(1, 0, "x") and g.put(1, 1, "y") and not g.put(1, 2, "z")
+    out = g.sheet_blocks()
+    assert out[0].caption == "A1:C2" and para_text(out[-1]) == \
+        "(Sheet cut at C2 by the document's 5-cell limit; not read from there on)", out
+
+
+def test_island_work_budget_still_splits_long_runs():
+    old = limits.SHEET_ISLAND_STEPS
+    limits.SHEET_ISLAND_STEPS = 1
+    try:
+        g, _ = mk()
+        fill(g, 0, 1, 0, 1)
+        fill(g, 0, 1, 5, 5)
+        fill(g, 300, 301, 0, 1)
+        out = g.sheet_blocks()
+        assert [t.caption for t in out] == ["A1:F2", "A301:B302"], [getattr(t, "caption", t) for t in out]
+    finally:
+        limits.SHEET_ISLAND_STEPS = old
+
+
+def test_islands_are_cheap_on_a_full_sheet():
+    g, _ = mk()
+    for r in range(1_000):
+        for c in range(100):
+            g.put(r, c, "v")
+    t0 = time.monotonic()
+    out = g.sheet_blocks()
+    took = time.monotonic() - t0
+    assert len(out) == 1 and out[0].caption == "A1:CV1000" and took < 3, took
+
+
+def test_tall_islands_charge_their_rows():
+    # 15 sparse columns 66 apart are 15 islands of 100,000 rows; their rows, empty ones too, are held to GRID_SLOTS
+    # for the sheet with its cells, so 23,000 cells cannot make 1.5 million table rows past it
+    g, ctx = mk()
+    for k in range(15):
+        for r in range(0, limits.SHEET_ROWS, 64):
+            g.put(r, 66 * k, "v")
+    limits.GRID_SLOTS, saved = 500_000, limits.GRID_SLOTS
+    try:
+        out = g.sheet_blocks()
+    finally:
+        limits.GRID_SLOTS = saved
+    tables = [b for b in out if isinstance(b, Table)]
+    assert sum(len(t.rows) for t in tables) <= 500_000 and len(tables) < 15, len(tables)
+    assert "sheet S cut at 500000 grid slots" in ctx.warnings, ctx.warnings
+
+
+def test_spans_share_one_area_budget_a_sheet():
+    # three islands, each a 1000 x 2 merge: past GRID_SLOTS of span area for the sheet (not for each table), a merge
+    # is laid out as one cell, as the renderer lays out one table's
+    g, ctx = mk()
+    for k in range(3):
+        g.put(2000 * k, 0, "m")
+        g.merge(2000 * k, 2000 * k + 999, 0, 1)
+        g.put(2000 * k, 2, "n")
+    limits.GRID_SLOTS, saved = 5_000, limits.GRID_SLOTS
+    try:
+        out = g.sheet_blocks()
+    finally:
+        limits.GRID_SLOTS = saved
+    tables = [b for b in out if isinstance(b, Table)]
+    assert [(t.rows[0][0].rowspan, t.rows[0][0].colspan) for t in tables] == [(1000, 2), (1000, 2), (1, 1)], tables
+    assert [len(t.rows) for t in tables] == [1000] * 3 and not ctx.warnings, ctx.warnings
+
+
+def test_formula_pattern_round_trip():
+    cases = [("B2*C2", 1, 3, "B3*C3", 2, 3), ("SUM($A$1:A1)", 0, 1, "SUM($A$1:A5)", 4, 1),
+             ("Other!A$1+'My Sheet'!$B2", 0, 0, "Other!B$1+'My Sheet'!$B3", 1, 1),
+             ('IF(A1="B2",LOG10(A1),A:A)', 0, 1, 'IF(A2="B2",LOG10(A2),A:A)', 1, 1),
+             ("SUM(2:2)+Q1!A1", 1, 0, "SUM(3:3)+Q1!A2", 2, 0), ("1.5E10+TAX1", 0, 0, "1.5E10+TAX2", 1, 0)]
+    for text, r, c, moved, r2, c2 in cases:
+        pat = pattern(text, r, c)
+        assert formula_text(pat, r, c) == text, (text, pat)
+        assert formula_text(pat, r2, c2) == moved, (text, formula_text(pat, r2, c2))
+    assert formula_text(pattern("A1", 0, 1), 0, 0) == "#REF!"
+    assert pattern("B2*C2", 1, 3) == pattern("B3*C3", 2, 3) != pattern("B2*C2", 2, 3)
+
+
+def test_fill_down_is_one_entry_and_a_break_is_listed_on_its_own():
+    g, _ = mk()
+    for r in range(1, 2001):
+        g.put(r, 3, str(r))
+        g.formula(r, 3, pattern(f"B{r + 1}*C{r + 1}", r, 3))
+    g.formula(999, 3, pattern("B1000+1", 999, 3))
+    g.put(1, 4, "t")
+    g.formula(1, 4, pattern("SUM(D2:D2001)", 1, 4))
+    out = g.sheet_blocks()
+    assert para_text(out[-1]) == "Formulas: D2:D999, D1001:D2001 =B2*C2; E2 =SUM(D2:D2001); D1000 =B1000+1", out[-1]
+
+
+def test_formula_ranges_join_across_columns_and_hidden_ones_are_hidden():
+    g, _ = mk()
+    for r in range(3):
+        for c in range(2):
+            g.put(r, c, "1")
+            g.formula(r, c, pattern(f"{'XY'[c]}{r + 1}*2", r, c))
+    g.put(5, 0, "2")
+    g.formula(5, 0, pattern("A1", 5, 0))
+    g.hide_rows(5, 5)
+    p = g.sheet_blocks()[-1]
+    assert p.inlines[:2] == [Text("Formulas: "), Text("A1:B3 =X1*2")], p.inlines
+    assert p.inlines[2] == Hidden([Text("; A6 =A1")]), p.inlines
+
+
+def test_formula_groups_past_the_cap_are_counted():
+    g, ctx = mk()
+    for c in range(3):
+        g.put(0, c, "1")
+        g.formula(0, c, pattern(f"{c}+1", 0, c))
+    limits.FORMULA_GROUPS, saved = 2, limits.FORMULA_GROUPS
+    try:
+        p = g.sheet_blocks()[-1]
+    finally:
+        limits.FORMULA_GROUPS = saved
+    assert para_text(p) == "Formulas: A1 =0+1; B1 =1+1; (1 more not listed)", para_text(p)
+    assert ctx.skipped["formula"] == 1, ctx.skipped
+
+
+def test_facts_follow_the_formulas_one_paragraph_each():
+    g, _ = mk()
+    g.put(0, 0, "1")
+    g.formula(0, 0, pattern("1+1", 0, 0))
+    g.fact("Validation", [('A1 list "a,b"', False), ("B1 whole > 0", False)])
+    g.fact("Protected", [("sheet", False)])
+    out = g.sheet_blocks()
+    assert [para_text(p) for p in out[-3:]] == ["Formulas: A1 =1+1", 'Validation: A1 list "a,b"; B1 whole > 0',
+                                                "Protected: sheet"], out[-3:]
+
+
+def test_hidden_facts_follow_the_shown_ones_and_all_hidden_hides_the_paragraph():
+    ctx = Context()
+    p, = listed("Names", [("_F = S!$A$1", True), ("Rate = S!$B$1", False)], Budget(), ctx)
+    assert p.inlines == [Text("Names: "), Text("Rate = S!$B$1"), Hidden([Text("; _F = S!$A$1")])], p.inlines
+    p, = listed("Names", [("_F = S!$A$1", True)], Budget(), ctx)
+    assert p.inlines == [Hidden([Text("Names: "), Text("_F = S!$A$1")])], p.inlines
+    assert listed("Names", [], Budget(), ctx) == []
+
+
+def test_facts_past_the_characters_are_counted():
+    ctx = Context()
+    budget = Budget(chars=19)
+    p, = listed("Names", [("A = S!$A$1", False), ("B = S!$B$1", False)], budget, ctx)
+    assert para_text(p) == "Names: A = S!$A$1; (1 more not listed)", para_text(p)
+    assert ctx.skipped["fact"] == 1 and budget.chars == 0, (ctx.skipped, budget.chars)
+
+
+def test_references_inside_quoted_sheet_names_and_structured_references_stay_text():
+    cases = [("'Q1 2024'!B2*2", 1, 0, "'Q1 2024'!B5*2", 4, 0),
+             ("'It''s A1'!$A1+A1", 0, 1, "'It''s A1'!$A3+A3", 2, 1),
+             ("Tbl[[#This Row],[Q1]]*B2", 1, 2, "Tbl[[#This Row],[Q1]]*B3", 2, 2),
+             ("SUM(Tbl[Q1])+[1]Sheet1!A1", 0, 0, "SUM(Tbl[Q1])+[1]Sheet1!A2", 1, 0),
+             ('"it''s B2"&B2&\'x"y\'!B2', 1, 0, '"it''s B2"&B3&\'x"y\'!B3', 2, 0)]
+    for text, r, c, moved, r2, c2 in cases:
+        pat = pattern(text, r, c)
+        assert formula_text(pat, r, c) == text, (text, pat)
+        assert formula_text(pat, r2, c2) == moved, (text, formula_text(pat, r2, c2))
+    assert pattern("'Q1 2024'!B2*2", 1, 0) == pattern("'Q1 2024'!B5*2", 4, 0)
+    t0 = time.perf_counter()
+    pattern("[a" * 20_000 + "'b" * 20_001, 0, 0)
+    assert time.perf_counter() - t0 < 2
+
+
+def test_formula_of_a_cell_without_a_value_is_listed_and_spends_no_cell():
+    budget = Budget(cells=20)
+    g, _ = mk(budget=budget)
+    for r in range(12):
+        if r % 3:
+            g.put(r, 1, "v")
+        g.formula(r, 1, pattern(f'IF(A{r + 1}>4,"",A{r + 1}*2)', r, 1))
+    assert para_text(g.sheet_blocks()[-1]) == 'Formulas: B1:B12 =IF(A1>4,"",A1*2)', g.sheet_blocks()[-1]
+    assert budget.cells == 12 and budget.blank == limits.BLANK_FORMULAS - 4, (budget.cells, budget.blank)
+
+
+def test_cut_paragraph_follows_the_tables_before_the_formulas():
+    g, _ = mk("S", Budget(cells=2))
+    g.put(0, 0, "1")
+    g.put(0, 1, "2")
+    g.formula(0, 1, pattern("A1+1", 0, 1))
+    assert not g.put(1, 0, "3")
+    g.fact("Protected", [("sheet", False)])
+    out = g.sheet_blocks()
+    assert [para_text(p) for p in out[1:]] == ["(Sheet cut at A2 by the document's 2-cell limit; not read from there on)",
+                                               "Formulas: B1 =A1+1", "Protected: sheet"], out[1:]
+
+
+def test_listing_stops_building_entries_at_the_cap_and_charges_the_label():
+    ctx, made = Context(), []
+
+    def entries():
+        for i in range(1000):
+            made.append(i)
+            yield f"e{i}", False
+
+    p, = listed("L", entries(), Budget(), ctx, cap=3, total=1000)
+    assert para_text(p) == "L: e0; e1; e2; (997 more not listed)" and len(made) == 4, (para_text(p), len(made))
+    budget = Budget(chars=10)
+    assert listed("A long label", [("x", False)], budget, ctx) == []
+    assert ctx.skipped["fact"] == 998 and budget.chars == 10, (ctx.skipped, budget.chars)
+    budget = Budget(chars=12)
+    p, = listed("Names", [("ab", False)], budget, ctx)
+    assert para_text(p) == "Names: ab" and budget.chars == 1, budget.chars
+
+
+def test_facts_past_the_item_cap_are_counted():
+    g, ctx = mk()
+    g.put(0, 0, "1")
+    g.fact("Names", [(f"n{i} = {i}", False) for i in range(5)])
+    limits.FACT_ITEMS, saved = 2, limits.FACT_ITEMS
+    try:
+        p = g.sheet_blocks()[-1]
+    finally:
+        limits.FACT_ITEMS = saved
+    assert para_text(p) == "Names: n0 = 0; n1 = 1; (3 more not listed)" and ctx.skipped["fact"] == 3, para_text(p)
+
+
+def test_rules_join_their_ranges_and_list_them_up_to_the_cap():
+    rules = [(["F5:F8"], "cell > 150"), (["B1:B9", "C1"], "top 3"), (["H1", "F5:F8"], "cell > 150")]
+    rules += [([f"A{i}"], "blank") for i in range(1, limits.FACT_VALUES + 11)]
+    many = ", ".join(f"A{i}" for i in range(1, limits.FACT_VALUES + 1))
+    assert ruled(rules) == [("F5:F8, H1 cell > 150", False), ("B1:B9, C1 top 3", False),
+                            (f"{many} and 10 more blank", False)], ruled(rules)
+
+
+def test_link_with_a_place_keeps_its_url():
+    g, ctx = mk()
+    ctx.name = "Book One.xlsx"
+    for c, v in enumerate(("site", "jump", "own", "other")):
+        g.put(0, c, v)
+    g.link(0, 0, 0, 0, "https://example.com/page", "section2")
+    g.link(0, 0, 1, 1, None, "Lists!A1")
+    g.link(0, 0, 2, 2, "../Book%20One.xlsx", "Lists!B2")
+    g.link(0, 0, 3, 3, "other.xlsx", "Sheet1!A1")
+    assert g.get(0, 0) == [Link("https://example.com/page#section2", [Text("site")])], g.get(0, 0)
+    assert g.get(0, 1) == [Text("jump"), Text(" → Lists!A1")], g.get(0, 1)
+    assert g.get(0, 2) == [Text("own"), Text(" → Lists!B2")], g.get(0, 2)
+    assert g.get(0, 3) == [Link("other.xlsx#Sheet1!A1", [Text("other")])], g.get(0, 3)
+
+
+def test_record_table_caption_names_its_hidden_runs():
+    g, _ = mk()
+    fill(g, 0, 3, 0, 2)
+    g.hide_rows(1, 2)
+    g.hide_cols(1, 1)
+    t, = g.blocks()
+    assert t.caption == "(hidden rows 2-3; hidden columns B)", t.caption
+    g, _ = mk()
+    fill(g, 0, 1, 0, 1)
+    assert g.blocks()[0].caption == ""
+
+
+def test_header_rows_marked():
+    g, _ = mk()
+    fill(g, 0, 2, 0, 1)
+    g.head_rows(0, 0)
+    t = g.sheet_blocks()[0]
+    assert t.rows[0][0].header and t.rows[0][1].header and not t.rows[1][0].header
+
+
+def test_record_blocks_keep_one_table():
+    g, _ = mk()
+    fill(g, 0, 1, 0, 0)
+    fill(g, 0, 1, 2, 2)
+    out = g.blocks()
+    assert len(out) == 1 and out[0].caption == "" and out[0].origin == "" and len(out[0].rows[0]) == 3
+
+
+def test_valueless_formulas_have_their_own_budget():
+    ctx = Context()
+    budget = Budget()
+    budget.blank = 2
+    g = Grid("S", budget, ctx)
+    for r in range(4):
+        g.formula(r, 0, pattern("=B1&\"\"", r, 0))
+    assert len(g.formulas) == 2 and ctx.skipped["formula"] == 2 and not g.cut and g.formulas_cut, ctx.skipped
+    assert g.put(0, 1, "kept") and budget.cells == budget.cap_cells - 1
+
+
+def test_ruled_counts_each_range_once():
+    rules = [([f"A{k}:A{k}" for k in range(1, 201)], "x > 1")] * 3
+    assert ruled(rules)[0][0].endswith(f"A{limits.FACT_VALUES} and 180 more x > 1"), ruled(rules)
+
+
+def test_link_place_is_one_fragment():
+    ctx = Context()
+    ctx.name = "own.xlsx"
+    g = Grid("S", Budget(), ctx)
+    g.put(0, 0, "a")
+    g.put(1, 0, "b")
+    g.link(0, 0, 0, 0, "https://example.com/b.xlsx", "'Sheet 2'!A1")
+    g.link(1, 1, 0, 0, "https://example.com/p#top", "Sheet1!A1")
+    urls = [next(x.url for x in g.get(r, 0) if hasattr(x, "url")) for r in (0, 1)]
+    assert urls == ["https://example.com/b.xlsx#'Sheet%202'!A1", "https://example.com/p#top"], urls
 
 
 def main():

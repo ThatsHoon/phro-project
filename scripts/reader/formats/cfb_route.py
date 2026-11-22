@@ -2,8 +2,8 @@
 formats is read by its own parser whichever extension it came with.
 
 Each of xls, ppt, doc, xlsb, wpd, vsd, pub and mpp asks `route` when its own main stream is missing. An encrypted OOXML
-package (EncryptedPackage) is `encrypted`; an Excel 5.0/95 workbook (Book) and a PowerPoint 95 presentation (PP40) are
-`unsupported`; a Workbook, PowerPoint Document, WordDocument, hwp FileHeader, WordPerfect PerfectOffice_MAIN,
+package (EncryptedPackage) is `encrypted`; a PowerPoint 95 presentation (PP40) is `unsupported`; a Workbook or Book
+(Excel 5.0/95), PowerPoint Document, WordDocument, hwp FileHeader, WordPerfect PerfectOffice_MAIN,
 VisioDocument or Publisher Quill/QuillSub/CONTENTS stream names the parser that reads the file, and the caller hands
 it on with `parse` once its own compound file is closed. A stream naming the caller itself is passed over (pub's own
 stream is Contents, so a Quill stream without one is not sent back to pub). After the streams, a `\\x01CompObj` whose
@@ -16,12 +16,11 @@ import struct
 from ..containers.cfb import CfbError
 from ..limits import ReadError
 
-EXCEL95 = "Excel 5.0/95 workbook"
 PP95 = "PowerPoint 95 presentation"
-_OWN = {"xls": "Workbook", "ppt": "PowerPoint Document", "doc": "WordDocument", "hwp": "FileHeader",
-        "wpd": "PerfectOffice_MAIN", "vsd": "VisioDocument", "pub": "Contents"}
+_OWN = {"xls": ("Workbook", "Book"), "ppt": ("PowerPoint Document",), "doc": ("WordDocument",),
+        "hwp": ("FileHeader",), "wpd": ("PerfectOffice_MAIN",), "vsd": ("VisioDocument",), "pub": ("Contents",)}
 # in this order: a stream naming a parser, or an old format's refusal
-_STREAMS = (("Workbook", "xls"), ("Book", EXCEL95), ("PowerPoint Document", "ppt"), ("PP40", PP95),
+_STREAMS = (("Workbook", "xls"), ("Book", "xls"), ("PowerPoint Document", "ppt"), ("PP40", PP95),
             ("WordDocument", "doc"), ("FileHeader", "hwp"), ("PerfectOffice_MAIN", "wpd"), ("VisioDocument", "vsd"),
             ("Quill/QuillSub/CONTENTS", "pub"))
 COMP_OBJ = "\x01CompObj"
@@ -78,7 +77,7 @@ def route(cf, own: str, damaged: str) -> str | None:
     """The parser ("xls", "ppt", "doc", "hwp", "wpd", "vsd", "pub" or "mpp") that reads the open compound file `cf`;
     None when that is `own` itself. Raises ReadError("encrypted") for an encrypted package, "unsupported" for an old
     format, and "damaged" with the detail `damaged` when no other stream or ProgID names a format."""
-    if own in _OWN and cf.exists(_OWN[own]):
+    if any(cf.exists(s) for s in _OWN.get(own, ())):
         return None
     if cf.exists("EncryptedPackage"):
         raise ReadError("encrypted")

@@ -140,7 +140,7 @@ def test_ods_named_xls_is_read_by_odf():
     from test_reader_ods_odp import c, ods, row, sheet
     src = ods(sheet("S", [row(c("a"), c("b")), row(c("1"), c("2"))]))
     md = run(Path(src).read_bytes())
-    assert md == "## Sheet: S\n\n|a|b|\n|---|---|\n|1|2|\n", md
+    assert md == "## Sheet: S\n\nA1:B2\n|a|b|\n|---|---|\n|1|2|\n", md
 
 
 def test_zip_named_xls_with_a_name_that_is_not_utf8():

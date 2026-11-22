@@ -111,6 +111,29 @@ def test_cbc_decrypt_speed():
     assert took < 2.0, took
 
 
+def test_tables_built_on_first_use():
+    import subprocess
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); from reader.containers import crypto; "
+            "n = crypto._tables.cache_info().currsize; crypto.aes_ecb_encrypt(bytes(16), bytes(16)); "
+            "print(n, crypto._tables.cache_info().currsize)")
+    out = subprocess.run([sys.executable, "-I", "-c", code, str(HERE / "scripts")], capture_output=True, text=True)
+    assert out.stdout.split() == ["0", "1"], (out.stdout, out.stderr)
+
+
+def test_cbc_key_schedule_once_a_call():
+    from reader.containers import crypto
+    calls, real = [], crypto._round_keys
+    crypto._round_keys = lambda key: calls.append(key) or real(key)
+    try:
+        key, iv = bytes(range(32)), bytes(range(16))
+        data = bytes(range(64)) * 4
+        enc = aes_cbc_encrypt(key, iv, data)
+        assert len(calls) == 1, len(calls)
+        assert aes_cbc_decrypt(key, iv, enc) == data and len(calls) == 2, len(calls)
+    finally:
+        crypto._round_keys = real
+
+
 def test_msvc_rand():
     r = MsvcRand(1)
     assert [r() for _ in range(5)] == [41, 18467, 6334, 26500, 19169]
