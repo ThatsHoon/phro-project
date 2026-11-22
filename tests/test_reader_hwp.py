@@ -444,25 +444,25 @@ def table_md(rows, **kw):
 
 
 def test_table_simple():
-    assert table_md([["a", "b"], ["c", "d"]]) == "|a|b|\n|---|---|\n|c|d|\n"
+    assert table_md([["a", "b"], ["c", "d"]]) == "a|b\n-|-\nc|d\n"
     # the table follows its paragraph's text
     p = hwp_file(hwp_para("앞" + FFFC, controls=(hwp_table([["a", "b"], ["c", "d"]]),)))
-    assert md(p) == "앞\n\n|a|b|\n|---|---|\n|c|d|\n"
+    assert md(p) == "앞\n\na|b\n-|-\nc|d\n"
 
 
 def test_table_merged():
     out = table_md([[("합", 2, 1)], ["c", "d"]])
-    assert '<td colspan="2">합</td>' in out and "<tr><td>c</td><td>d</td></tr>" in out, out
+    assert out == "|합||\n-|-\nc|d\n\nMerged: A1:B1\n", out
 
 
 def test_table_caption():
     out = table_md([["a", "b"], ["c", "d"]], caption="표 1")
-    assert out == "|a|b|\n|---|---|\n|c|d|\n\n표 1\n", out
+    assert out == "a|b\n-|-\nc|d\n\n표 1\n", out
 
 
 def test_table_cell_paragraphs():
     out = table_md([[["가", "나"], "다"], ["라", "마"]])
-    assert out == "|가<br>나|다|\n|---|---|\n|라|마|\n", out
+    assert out == "가<br>나|다\n-|-\n라|마\n", out
 
 
 def test_nested_table():
@@ -473,7 +473,7 @@ def test_nested_table():
     assert len(nested) == 1 and isinstance(nested[0], Table) and len(nested[0].rows) == 2, nested
     # the renderer writes a table inside a cell on one line
     out = md(p)
-    assert out == "|1 / 2 ; 3 / 4|z|\n|---|---|\n|y|w|\n", out
+    assert out == "1 / 2 ; 3 / 4|z\n-|-\ny|w\n", out
 
 
 def test_nested_table_depth_cap():
@@ -518,7 +518,7 @@ def test_picture_bmp_to_png():
     doc, ctx = parse(pic_file(hwp_picture(1), bins=(("bmp", 2),), streams={"BIN0001.bmp": bmp}))
     out_dir = tmp()
     out = markdown.render(doc, out_dir / "assets", False, ctx.skipped)
-    assert out == "![](assets/img-001.png)\n", out
+    assert out == "![1x1](assets/img-001.png)\n", out
     assert (out_dir / "assets" / "img-001.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 

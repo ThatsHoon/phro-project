@@ -730,7 +730,7 @@ def tagged_pdf(marked=True, ruled=False):
 
 
 TAGGED_MD = ["Header: Running head of the report", "## Page 1", "### Annual report", "Body text that runs over two lines.", "1. First item",
-             "2. Second item", "|Name|Score|", "|Kim|90|", "![A bar chart of scores](assets/img-001.png)",
+             "2. Second item", "Name|Score", "Kim|90", "![A bar chart of scores 32x32](assets/img-001.png)",
              "Note text", "x minus y"]
 
 

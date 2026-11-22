@@ -177,7 +177,7 @@ def test_xls_saved_as_xlsb():
         make_xls(path, [{"name": "Data", "cells": {(0, 0): "a", (0, 1): "b"}}])
         ctx = Context()
         out = markdown.render(xlsb.parse(path, ctx), Path(d) / "assets", False, ctx.skipped)
-    assert "## Sheet: Data" in out and "|a|b|" in out and not ctx.skipped, (out, ctx.skipped)
+    assert "## Sheet: Data" in out and "\na|b\n" in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def test_xlsx_saved_as_xlsb():
@@ -265,7 +265,7 @@ def test_cells_displayed():
 
 def test_value_hidden_by_format():
     out, ctx = md([{"name": "S", "cells": {(0, 0): ("fmt", 5, ";;;"), (0, 1): "x"}}])
-    assert "|5|" not in out and "(1 hidden places left out)" in out, out
+    assert "5|x" not in out and "(1 hidden places left out)" in out, out
 
 
 def parsed(rgce, extra=b""):
@@ -339,7 +339,7 @@ def test_hidden_row_col_sheet():
 def test_merge():
     out, _ = md([{"name": "S", "cells": {(0, 0): "wide", (1, 0): "x", (1, 1): "y"},
                   "records": [biff12(176, struct.pack("<IIII", 0, 0, 0, 1))]}])
-    assert 'colspan="2"' in out and "wide" in out, out
+    assert out.endswith("\nA1:B2\n|wide||\n-|-\nx|y\n\nMerged: A1:B1\n"), out
 
 
 def test_bad_cell_record_recovery():
@@ -377,7 +377,7 @@ def test_chart_in_xlsb():
                          rels=[("rId1", "chart", "../charts/chart1.xml"), ("rId2", "image", "../media/image1.png")],
                          extra={"xl/charts/chart1.xml": BAR, "xl/media/image1.png": PNG})
     out, ctx = md([{"name": "S", "cells": {(0, 0): "top"}}], extra_parts=parts)
-    assert "Chart: column" in out and "|Q1|7|" in out, out
+    assert "Chart: column" in out and "\nQ1|7\n" in out, out
     assert out.index("top") < out.index("Chart: column") < out.index("assets/img-001.png"), out  # anchor order
     assert not ctx.skipped, ctx.skipped
 

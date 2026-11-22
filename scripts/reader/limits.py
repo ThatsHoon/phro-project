@@ -29,6 +29,7 @@ BLANK_FORMULAS = 100_000  # formula cells with no value one document's sheets ke
 # closed elements, the styles at STYLE_ELEMENTS (1,000,000). Measured: 2,000,000 cells stream in 1.4 s, the whole xlsx
 # reader takes 3.2 s over them, and 7.1 s over the worst case all three caps allow together (test_reader_xlsx measure)
 SHEET_SCAN = 2_000_000
+RUNNING_PICTURE = 3       # sections a picture is placed in to be linked at the first one only
 GRID_COLS = 1_000        # columns a span may reach in a rendered table
 GRID_SLOTS = 2_000_000    # grid slots all spans of one rendered table may cover
 CHART_CELLS = 100_000     # cells one chart table may hold, header row included (series x rows)
@@ -140,6 +141,7 @@ OCR_LATE = "ocr not finished: time"
 # one Read of out.md: Claude Code's Read returns 2,000 lines by default, refuses a result over about 25,000 tokens and
 # a file over about 256 KB without offset and limit; a read past these gets a limit that fits
 READ_LINES = 2_000
+LINE_CHARS = 2_000         # a paragraph's line is broken to this (Read cuts a longer line)
 READ_TOKENS = 20_000
 READ_TOKEN_BYTES = 3       # the estimate: one token per 3 UTF-8 bytes of a line, its newline counted
 READ_BYTES = 240_000

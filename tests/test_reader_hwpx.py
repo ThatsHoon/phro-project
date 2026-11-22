@@ -109,7 +109,7 @@ def test_no_heading_in_cell():
             f'<hp:tc><hp:subList>{P("끝")}</hp:subList><hp:cellAddr colAddr="1" rowAddr="1"/></hp:tc>')
     sec = f'<hp:p><hp:run><hp:tbl><hp:tr>{cell}</hp:tr><hp:tr>{row2}</hp:tr></hp:tbl></hp:run></hp:p>'
     out = md(hwpx_doc(sec, hdr))
-    assert "#" not in out and "|칸|옆|" in out
+    assert out == "칸|옆\n-|-\n아래|끝\n", out
 
 
 NUM = ('<hh:numbering id="1"><hh:paraHead level="1" start="1" numFormat="DIGIT">^1.</hh:paraHead>'
@@ -149,7 +149,7 @@ def _tbl(*rows):
 def test_merged_table():
     sec = _tbl(_tc("합", 0, 0, rs=2) + _tc("우", 1, 0), _tc("하", 1, 1))
     out = md(hwpx_doc(sec))
-    assert out.count('<td rowspan="2">') == 1 and "<td>우</td>" in out and "<td>하</td>" in out
+    assert out == "합|우\n-|-\n||하|\n\nMerged: A1:A2\n", out
 
 
 def test_span_counts_compacted_columns():
@@ -160,14 +160,14 @@ def test_span_counts_compacted_columns():
     spans = [[(c.colspan, c.rowspan) for c in row] for row in doc.blocks[0].rows]
     assert spans == [[(2, 1), (1, 1)], [(1, 1), (1, 1), (1, 1)]], spans
     out = md(hwpx_doc(sec))
-    assert '<td colspan="2">A</td><td>B</td>' in out, out
+    assert out == "A||B\n-|-|-\nC|D|E\n\nMerged: A1:B1\n", out
 
 
 def test_header_cell_pipe_table():
     sec = _tbl(_tc("머", 0, 0, header="1") + _tc("리", 1, 0, header="1"), _tc("값", 0, 1) + _tc("둘", 1, 1))
     doc, _ = parse(hwpx_doc(sec))
     assert doc.blocks[0].rows[0][0].header and not doc.blocks[0].rows[1][0].header
-    assert "|머|리|\n|---|---|\n|값|둘|" in md(hwpx_doc(sec))
+    assert "머|리\n-|-\n값|둘" in md(hwpx_doc(sec))
 
 
 def test_table_budget():
@@ -285,7 +285,7 @@ def test_table_and_picture_captions():
     pic = ('<hp:p><hp:run><hp:pic>' + cap % ("BOTTOM", P("그림 3. 조직도"))
            + '<hc:img binaryItemIDRef="image1"/></hp:pic><hp:t>그림 뒤</hp:t></hp:run></hp:p>')
     out = md(hwpx_doc(tbl + pic, hpf_items=items, extra={"BinData/image1.png": PNG}))
-    assert out == ("표 앞\n\n|구분|금액|\n|---|---|\n|인건비|120|\n\n표 7. 연도별 예산\n\n그림 뒤\n\n"
+    assert out == ("표 앞\n\n구분|금액\n-|-\n인건비|120\n\n표 7. 연도별 예산\n\n그림 뒤\n\n"
                    "![](assets/img-001.png)\n\n그림 3. 조직도\n"), out
     # a shape's caption is a paragraph of its own, not text run into the paragraph that holds the shape
     rect = ('<hp:p><hp:run><hp:t>앞</hp:t><hp:rect>' + cap % ("BOTTOM", P("도형 1")) + '<hp:drawText><hp:subList>'
@@ -323,7 +323,7 @@ def test_outline_numbers():
     cell = _tbl(_tc("x", 0, 0) + _tc("y", 1, 0), _tc("z", 0, 1) + "<hp:tc><hp:subList>" + P("칸 제목", pr="1")
                 + '</hp:subList><hp:cellAddr colAddr="1" rowAddr="1"/></hp:tc>')
     sec = '<hp:p><hp:run><hp:secPr outlineShapeIDRef="1"/></hp:run></hp:p>' + cell
-    assert "|z|1. 칸 제목|" in md(hwpx_doc(sec, OUTLINE))
+    assert "\nz|1. 칸 제목\n" in md(hwpx_doc(sec, OUTLINE))
     # the outline numbering is the section's own: a later section that names none numbers nothing
     item = '<opf:item id="section1" href="Contents/section1.xml" media-type="application/xml"/>'
     first = '<hp:p><hp:run><hp:secPr outlineShapeIDRef="1"/></hp:run></hp:p>' + P("첫 구역", pr="1")
@@ -352,7 +352,7 @@ def test_chart():
            '<hp:chart chartIDRef="Chart/chart1.xml"/></hp:case><hp:default><hp:t>대체</hp:t></hp:default>'
            '</hp:switch></hp:run></hp:p>')
     out = md(hwpx_doc(sec, extra={"Chart/chart1.xml": CHART}))
-    assert "Chart: column" in out and "대체" not in out and "|A|5|" in out
+    assert "Chart: column" in out and "대체" not in out and "\nA|5\n" in out
 
 
 def test_header_pictures_and_charts_skipped():

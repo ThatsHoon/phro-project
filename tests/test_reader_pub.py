@@ -1488,7 +1488,7 @@ def test_table_merged_cells():
     assert isinstance(table, Table) and not ctx.skipped, (doc, ctx.skipped)
     assert grid(table) == [[(1, 2, ["Head"])], [(1, 1, ["**A**"]), (1, 1, ["B"])]], grid(table)
     got = md(doc, ctx)
-    assert "**A**" in got and "Head" in got and 'colspan="2"' in got, got
+    assert got.endswith("\n\n|Head||\n-|-\n**A**|B\n\nMerged: A1:B1\n"), got
     # a first column of one cell (rowspan 2)
     doc, ctx = read_pub(table_file([(0, 1, 0, 0), (0, 0, 1, 1), (1, 1, 1, 1)]))
     assert grid(page_blocks(doc)[0]) == [[(2, 1, ["Head"]), (1, 1, ["A"])], [(1, 1, ["B"])]] and not ctx.skipped
@@ -1742,7 +1742,8 @@ def test_pictures():
     with tempfile.TemporaryDirectory() as tmp:
         out = markdown.render(doc, Path(tmp) / "assets", False, ctx.skipped)
         assert (Path(tmp) / "assets" / "img-002.png").read_bytes() == got[1]
-    assert out.count("![](assets/img-") == 3 and "assets/img-003.wmf" in out and "Not viewable" in out, out
+    assert out.count("](assets/img-") == 3 and "![1x1](assets/img-002.png)" in out, out
+    assert out.endswith("\n\nNot viewable here: assets/img-003.wmf\n"), out
     # a shape with a picture and a story: the picture first
     got = page_blocks(read_pub(picture_file([oa_fbse(blip_png(PNG))], [(0x30, 1)], texts=[(0x30, 1)]))[0])
     assert isinstance(got[0], Image) and text_of(got[1]) == "text 1", got

@@ -52,17 +52,17 @@ def test_excel_chart_in_ppt():
     slide = {"shapes": [{"text": "above", "box": (0, 10, 400, 50)}, obj(),
                         {"text": "below", "box": (0, 500, 400, 550)}]}
     out, ctx, assets = build([slide], objects=[(excel_object([CHART], b"Excel.Chart.8"), {"compressed": True})])
-    assert "Chart: column — Sales" in out and "|Q2|2|" in out, out
+    assert "Chart: column — Sales" in out and "\nQ2|2\n" in out, out
     assert out.index("above") < out.index("Chart: column") < out.index("below"), out
     assert not ctx.skipped, dict(ctx.skipped)
     # the same workbook raw (instance 0), as a sheet
     out, ctx, _ = build([{"shapes": [obj()]}], objects=[excel_object([GRID], b"Excel.Sheet.8")])
-    assert "|1|2|\n|---|---|\n|3|4|" in out and not ctx.skipped, (out, dict(ctx.skipped))
+    assert "1|2\n-|-\n3|4" in out and not ctx.skipped, (out, dict(ctx.skipped))
 
 
 def test_msgraph_in_ppt():
     out, ctx, _ = build([{"shapes": [obj()]}], objects=[(msgraph_object(*GRAPH), {"compressed": True})])
-    assert "Chart: column\n||East|West|\n|---|---|---|\n|Q1|1|3|\n|Q2|2|4|" in out, out
+    assert "Chart: column\n||East|West|\n-|-|-\nQ1|1|3\nQ2|2|4" in out, out
     assert not ctx.skipped, dict(ctx.skipped)
 
 
@@ -152,7 +152,7 @@ def test_object_cap():
     slide = {"shapes": [obj(k + 1) for k in range(n)]}
     out, ctx, _ = build([slide], objects=[stg] * n)
     assert ctx.skipped["object"] == 3, dict(ctx.skipped)
-    assert out.count("|1|2|") == ppt_objects.MAX_OBJECTS, out.count("|1|2|")
+    assert out.count("\n1|2\n") == ppt_objects.MAX_OBJECTS, out.count("\n1|2\n")
 
 
 def test_embed_bytes_cap():
@@ -223,7 +223,7 @@ def test_chart_total_charged():
     finally:
         ppt_objects.limits.CHART_TOTAL = old
     # the placement past CHART_TOTAL shows the shape's preview and is counted under chart, as an unread workbook is
-    assert out.count("|1|2|") == 1 and "(could not read: 1 chart)" in out, out
+    assert out.count("\n1|2\n") == 1 and "(could not read: 1 chart)" in out, out
     assert assets == {"img-001.png": PNG} and out.count("![](assets/") == 1, (out, assets)
     assert ctx.skipped["chart"] == 1 and ctx.skipped["object"] == 0, dict(ctx.skipped)
 

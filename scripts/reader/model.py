@@ -99,6 +99,7 @@ class Cell:
     rowspan: int = 1
     colspan: int = 1
     header: bool = False
+    lead: tuple = (0, 0)  # rows and columns of its merged region before it: hidden ones a sheet moved it past
 
 
 @dataclass

@@ -238,7 +238,7 @@ def test_other_object_png_preview_kept():
     assert md(p) == "![](assets/img-001.png)\n", md(p)
     # a DIB preview is viewable when it converts to PNG, as Assets converts it; one without its pixels is not
     dib = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0)
-    for pixels, want in ((b"\x00\x00\xff\x00", "![](assets/img-001.png)\n"),
+    for pixels, want in ((b"\x00\x00\xff\x00", "![1x1](assets/img-001.png)\n"),
                          (b"", "(could not read: 1 embedded object)\n\nNot viewable here: assets/img-001.bmp\n")):
         p = embed_doc({1: {"\x01Ole10Native": bytes(8)}}, preview=picf_inline(blip_bitmap(0xF01F, 0x7A8, dib + pixels)))
         assert md(p) == want, md(p)

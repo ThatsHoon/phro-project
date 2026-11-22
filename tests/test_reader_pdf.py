@@ -130,7 +130,7 @@ def test_ocr_layer():
 
 def test_scan_native_jpeg():
     text, ctx, doc = md(with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode")))
-    assert "![Scanned page 1](assets/img-001.jpg)" in text, text
+    assert "![Scanned page 1 8x8](assets/img-001.jpg)" in text, text
     assert doc.meta["unrendered"] == [] and not ctx.skipped
 
 
@@ -407,9 +407,9 @@ def _table_page():
 
 def test_table_on_page():
     text, ctx, _ = md(simple_pdf([_table_page()]))
-    assert "|Alpha|Beta|" in text and "|Gamma|Delta|" in text, text
+    assert "\nAlpha|Beta\n" in text and "\nGamma|Delta\n" in text, text
     assert text.count("Alpha") == 1 and text.count("Delta") == 1, text
-    assert text.index("Before") < text.index("|Alpha") < text.index("After"), text
+    assert text.index("Before") < text.index("Alpha|") < text.index("After"), text
     assert not ctx.skipped
 
 
@@ -566,9 +566,9 @@ def test_rotated_page():
     text, ctx, _ = md(simple_pdf([b" ".join(ops)], page_extra={"Rotate": 90}))
     assert "### Report Title" in text, text
     assert "First body line second body line third body line" in text, text
-    assert "|Alpha|Beta|" in text and "|Gamma|Delta|" in text, text
-    order = [text.index(s) for s in ("### Report Title", "First body", "|Alpha|Beta|",
-                                     "|Gamma|Delta|", "Closing words")]
+    assert "\nAlpha|Beta\n" in text and "\nGamma|Delta\n" in text, text
+    order = [text.index(s) for s in ("### Report Title", "First body", "\nAlpha|Beta\n",
+                                     "\nGamma|Delta\n", "Closing words")]
     assert order == sorted(order) and text.count("Alpha") == 1, text
     assert not ctx.skipped, ctx.skipped
 
@@ -1004,7 +1004,7 @@ def test_page_without_gray_not_read_as_picture():
     data, g = fixture_scan()
     with patched(pdf._Reader, "_gray", lambda self, make: None), ocr_stub(answer=canned(g)) as (_, sent):
         text, _, doc = md(data)
-    assert text == "## Page 1\n\n![Scanned page 1](assets/img-001.png)\n" and sent == [], (text, sent)
+    assert text == "## Page 1\n\n![Scanned page 1 1240x1754](assets/img-001.png)\n" and sent == [], (text, sent)
 
 
 def test_doubtful_page_text_then_image():
@@ -1012,7 +1012,7 @@ def test_doubtful_page_text_then_image():
     with ocr_stub(answer=canned(g, {"share": 0.5, "box": None, "area": 0.0})):
         text, _, doc, assets = md_assets(data)
     assert text == ("(1 scanned page read by OCR; 1 of them doubtful, shown with the page image)\n\n"
-                    f"## Page 1\n\n{SCANNED}\n\n{PARAS}\n\n![Scanned page 1](assets/img-001.png)\n"), text
+                    f"## Page 1\n\n{SCANNED}\n\n{PARAS}\n\n![Scanned page 1 {g.w}x{g.h}](assets/img-001.png)\n"), text
     assert dims(assets) == {"img-001.png": (g.w, g.h)}, dims(assets)
     assert doc.meta["ocr"] == {"pages": 1, "doubtful": 1, "failed": 0, "stopped_at": None}, doc.meta
 
@@ -1024,13 +1024,13 @@ def test_scan_with_photo_gets_crop_link():
         text, _, doc, assets = md_assets(data)
     x0, y0, x1, y1 = box_pixels(g.w, g.h, box)
     assert text == (f"{READ}## Page 1\n\n{SCANNED}\n\nAlpha beta gamma delta epsilon\n\n"
-                    "![Picture on page 1](assets/img-001.png)\n\nSecond paragraph here\n"), text
+                    f"![Picture on page 1 {x1 - x0}x{y1 - y0}](assets/img-001.png)\n\nSecond paragraph here\n"), text
     assert dims(assets) == {"img-001.png": (x1 - x0, y1 - y0)}, dims(assets)
     assert doc.meta["ocr"] == {"pages": 1, "doubtful": 0, "failed": 0, "stopped_at": None}, doc.meta
     whole = [0.0, 0.1, 1.0, 0.85]  # 75 %: past FIGURE_WHOLE, the whole page instead
     with ocr_stub(answer=canned(g, {"share": 0.02, "box": whole, "area": 0.75, "density": 0.5})):
         text, _, doc, assets = md_assets(data)
-    assert "![Picture on page 1](assets/img-001.png)" in text, text
+    assert f"![Picture on page 1 {g.w}x{g.h}](assets/img-001.png)" in text, text
     assert dims(assets) == {"img-001.png": (g.w, g.h)}, dims(assets)
 
 
@@ -1046,7 +1046,7 @@ def test_turned_page_crop_cut_from_the_page_image():
         answer["page"].update(turn=turn, w=side[0], h=side[1])
         with ocr_stub(answer=answer):
             text, _, _, assets = md_assets(data)
-        assert "![Picture on page 1](assets/img-001.png)" in text, text
+        assert "![Picture on page 1 %dx%d](assets/img-001.png)" % dims(assets)["img-001.png"] in text, text
         assert assets["img-001.png"] == images.png_crop(page_png, back), (turn, dims(assets))
 
 
@@ -1054,7 +1054,7 @@ def test_failed_worker_page_is_image():
     data, g = fixture_scan()
     with ocr_stub(die_after=0):
         text, ctx, doc = md(data)
-    assert text == "(OCR failed on 1 page; shown as an image.)\n\n## Page 1\n\n![Scanned page 1](assets/img-001.png)\n", text
+    assert text == "(OCR failed on 1 page; shown as an image.)\n\n## Page 1\n\n![Scanned page 1 1240x1754](assets/img-001.png)\n", text
     assert doc.meta["ocr"] == {"pages": 0, "doubtful": 0, "failed": 1, "stopped_at": None}, doc.meta
     assert not ctx.skipped and not doc.warnings
 
@@ -1180,7 +1180,7 @@ def test_trusted_page_refunds_image_bytes():
     assert trusted == 0 and "![" not in text, (trusted, text)
     doubtful, text, _ = _image_bytes_at_after(data, answer=canned(g, {"share": 0.5, "box": None, "area": 0.0}))
     page_png = md_assets(data)[3]["img-001.png"]
-    assert doubtful == len(page_png) and "![Scanned page 1]" in text, (doubtful, len(page_png))
+    assert doubtful == len(page_png) and "![Scanned page 1 " in text, (doubtful, len(page_png))
 
 
 def test_ocr_answer_that_raises_leaves_the_page_as_today():
@@ -1198,7 +1198,7 @@ def test_ocr_answer_that_raises_leaves_the_page_as_today():
         with patched(obj, name, boom):
             charged, text, doc = _image_bytes_at_after(data, answer=canned(g, unread))
         assert text == ("(could not read: 1 page read in part)\n\n(OCR failed on 1 page; shown as an image.)\n\n"
-                        "## Page 1\n\n![Scanned page 1](assets/img-001.png)\n"), (name, text)
+                        "## Page 1\n\n![Scanned page 1 1240x1754](assets/img-001.png)\n"), (name, text)
         assert charged == len(page_png), (name, charged, len(page_png))
         assert doc.meta["ocr"] == {"pages": 0, "doubtful": 0, "failed": 1, "stopped_at": None}, (name, doc.meta)
 
@@ -1214,8 +1214,8 @@ def test_renders_counted_once_per_page():
 
 
 # captured from the code before OCR reached pdf pages (3925efe): a Flate scan, a text page and a JPEG scan
-NO_OCR = ("## Page 1\n\n![Scanned page 1](assets/img-001.png)\n\n## Page 2\n\nPlain words\n\n"
-          "## Page 3\n\n![Scanned page 3](assets/img-002.jpg)\n")
+NO_OCR = ("## Page 1\n\n![Scanned page 1 1240x1754](assets/img-001.png)\n\n## Page 2\n\nPlain words\n\n"
+          "## Page 3\n\n![Scanned page 3 8x8](assets/img-002.jpg)\n")
 
 
 def test_no_session_output_unchanged():
@@ -1261,7 +1261,7 @@ def test_native_jpeg_scan_photo_cropped():
     with ocr_stub(answer=canned(g, {"share": 0.02, "box": box, "area": 0.3, "density": 0.5})):
         text, _, doc, assets = md_assets(data)
     x0, y0, x1, y1 = box_pixels(g.w, g.h, box)
-    assert "![Picture on page 1](assets/img-001.png)" in text, text
+    assert "![Picture on page 1 39x33](assets/img-001.png)" in text, text
     assert dims(assets) == {"img-001.png": (x1 - x0, y1 - y0)}, dims(assets)
     assert doc.meta["ocr"]["pages"] == 1
 
@@ -1274,7 +1274,7 @@ def test_small_native_scan_not_sent():
         return
     with ocr_stub() as (s, sent):
         text, ctx, doc = md(with_image(FULL, image_xobject(8, 8, data=JPEG, filter="DCTDecode")))
-    assert sent == [] and text == "## Page 1\n\n![Scanned page 1](assets/img-001.jpg)\n", (sent, text)
+    assert sent == [] and text == "## Page 1\n\n![Scanned page 1 8x8](assets/img-001.jpg)\n", (sent, text)
     assert doc.meta["ocr"] == {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None} and not ctx.skipped
 
 

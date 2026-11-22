@@ -148,9 +148,9 @@ def test_suppressed_ilfo():
 
 # ---- the brief's behaviour: tables
 def test_table_2x2():
-    assert md(table_doc([["a", "b"], ["c", "d"]])) == "|a|b|\n|---|---|\n|c|d|\n"
+    assert md(table_doc([["a", "b"], ["c", "d"]])) == "a|b\n-|-\nc|d\n"
     with_defs = table_doc([["a", "b"], ["c", "d"]], [tdef([0, 1000, 2000])] * 2)
-    assert md(with_defs) == "|a|b|\n|---|---|\n|c|d|\n"
+    assert md(with_defs) == "a|b\n-|-\nc|d\n"
     d, _ = parse(with_defs)
     assert d.blocks == [Table([[Cell([Para([Text("a")])]), Cell([Para([Text("b")])])],
                                [Cell([Para([Text("c")])]), Cell([Para([Text("d")])])]])], d.blocks
@@ -158,38 +158,36 @@ def test_table_2x2():
 
 def test_table_horizontal_merge():
     defs = [tdef([0, 1, 2, 3], [FIRST_MERGED, MERGED, 0]), tdef([0, 1, 2, 3])]
-    want = ('<table>\n<tr><td colspan="2">ab</td><td>c</td></tr>\n'
-            "<tr><td>d</td><td>e</td><td>f</td></tr>\n</table>\n")
+    want = "ab||c\n-|-|-\nd|e|f\n\nMerged: A1:B1\n"
     assert md(table_doc([["ab", "", "c"], ["d", "e", "f"]], defs)) == want
     # both bits (3) make a first cell too; a merged cell that holds text gives it to the first cell
     defs = [tdef([0, 1, 2, 3], [FIRST_MERGED | MERGED, MERGED, 0]), tdef([0, 1, 2, 3])]
     out = md(table_doc([["a", "b", "c"], ["d", "e", "f"]], defs))
-    assert '<td colspan="2">a<br>b</td><td>c</td>' in out, out
+    assert out == "a<br>b||c\n-|-|-\nd|e|f\n\nMerged: A1:B1\n", out
     # fMerged with no set open is a plain cell
     out = md(table_doc([["a", "b"], ["c", "d"]], [tdef([0, 1, 2], [MERGED, 0])]))
-    assert out == "|a|b|\n|---|---|\n|c|d|\n", out
+    assert out == "a|b\n-|-\nc|d\n", out
     # adjacent merged pairs: a first cell closes the set before it and opens its own
-    pair = '<tr><td colspan="2">a</td><td colspan="2">c</td></tr>'
+    pair = "|a||c||\n-|-|-|-\nd|e|f|g\n\nMerged: A1:B1, C1:D1\n"
     for grf in ([FIRST_MERGED, MERGED, FIRST_MERGED, MERGED], [FIRST_MERGED, MERGED, FIRST_MERGED | MERGED, MERGED]):
         defs = [tdef([0, 1, 2, 3, 4], grf), tdef([0, 1, 2, 3, 4])]
         out = md(table_doc([["a", "", "c", ""], ["d", "e", "f", "g"]], defs))
-        assert pair in out, (grf, out)
+        assert out == pair, (grf, out)
     # a set goes on through every fMerged cell
     defs = [tdef([0, 1, 2, 3], [FIRST_MERGED, MERGED, MERGED]), tdef([0, 1, 2, 3])]
-    assert '<tr><td colspan="3">a</td></tr>' in md(table_doc([["a", "", ""], ["d", "e", "f"]], defs))
+    assert md(table_doc([["a", "", ""], ["d", "e", "f"]], defs)) == "|a|||\n-|-|-\nd|e|f\n\nMerged: A1:C1\n"
 
 
 def test_table_vertical_merge():
     defs = [tdef([0, 1, 2], [VERT_MERGE | VERT_RESTART, 0]), tdef([0, 1, 2], [VERT_MERGE, 0])]
-    want = '<table>\n<tr><td rowspan="2">a</td><td>b</td></tr>\n<tr><td>d</td></tr>\n</table>\n'
+    want = "a|b\n-|-\n||d|\n\nMerged: A1:A2\n"
     assert md(table_doc([["a", "b"], ["", "d"]], defs)) == want
     three = defs + [tdef([0, 1, 2], [VERT_MERGE, 0])]
-    assert '<td rowspan="3">a</td>' in md(table_doc([["a", "b"], ["", "d"], ["", "f"]], three))
+    assert md(table_doc([["a", "b"], ["", "d"], ["", "f"]], three)) == "a|b\n-|-\n||d|\n||f|\n\nMerged: A1:A3\n"
     # a row without the merge ends the set; a continuation under nothing open is a plain cell
     ended = defs + [tdef([0, 1, 2]), tdef([0, 1, 2], [VERT_MERGE, 0])]
     out = md(table_doc([["a", "b"], ["", "d"], ["e", "f"], ["g", "h"]], ended))
-    assert '<td rowspan="2">a</td>' in out and "<tr><td>e</td><td>f</td></tr>" in out \
-        and "<tr><td>g</td><td>h</td></tr>" in out, out
+    assert out == "a|b\n-|-\n||d|\ne|f\ng|h\n\nMerged: A1:A2\n", out
 
 
 def test_nested_table():
@@ -199,7 +197,7 @@ def test_nested_table():
     spans = [(0, 2, outer), (2, 4, inner + sp(INNER_CELL, 1)), (4, 6, inner + sp(INNER_CELL, 1)),
              (6, 7, inner + sp(INNER_ROW, 1)), (7, 8, outer), (8, 9, outer + sp(TTP, 1))]
     p = doc_file([(text, False)], papx=spans)
-    assert md(p) == "|x|p / q|\n|---|---|\n"
+    assert md(p) == "x|p / q\n-|-\n"
     d, _ = parse(p)
     (row,) = d.blocks[0].rows
     assert row[1].blocks == [Table([[Cell([Para([Text("p")])]), Cell([Para([Text("q")])])]])], row[1].blocks
@@ -208,7 +206,7 @@ def test_nested_table():
 def test_table_without_ttp():
     cell = u16(0) + sp(IN_TABLE, 1)
     p = doc_file([("a\x07b\x07after\r", False)], papx=[(0, 4, cell), (4, 10, u16(0))])
-    assert md(p) == "|a|b|\n|---|---|\n\nafter\n"
+    assert md(p) == "a|b\n-|-\n\nafter\n"
     d, ctx = parse(doc_file([("a\x07b\x07", False)], papx=[(0, 4, cell)]))
     assert len(d.blocks) == 1 and len(d.blocks[0].rows) == 1 and not ctx.skipped, (d.blocks, ctx.skipped)
 
@@ -277,7 +275,7 @@ def test_list_heading_and_cells():
     assert md(p) == "# 1. Title\n\n2. body\n"
     cell = u16(0) + sp(IN_TABLE, 1)
     q = doc_file([("a\x07b\x07\x07", False)], fc=fc, papx=[(0, 2, cell + g), (2, 4, cell), (4, 5, cell + sp(TTP, 1))])
-    assert md(q) == "|1. a|b|\n|---|---|\n"
+    assert md(q) == "|1. a|b|\n-|-\n"
     # an empty list paragraph still takes its number
     assert md(list_doc([("a", 1, 0), ("", 1, 0), ("c", 1, 0)], [(7, [(0, "%1.")])], [(7, ())])) == "1. a\n3. c\n"
 
@@ -351,14 +349,14 @@ def test_list_counters_bounded():
 def test_table_boundary_grid():
     # a row of one wide cell over a row of two: the boundaries put both on one grid, as Word's tblGrid does
     defs = [tdef([0, 2000]), tdef([0, 1000, 2000])]
-    want = '<table>\n<tr><td colspan="2">head</td></tr>\n<tr><td>a</td><td>b</td></tr>\n</table>\n'
+    want = "|head||\n-|-\na|b\n\nMerged: A1:B1\n"
     assert md(table_doc([["head"], ["a", "b"]], defs)) == want
     # a row that starts right of the grid's left edge starts with an empty cell over the gap
     defs = [tdef([0, 1000, 2000]), tdef([1000, 2000])]
-    assert md(table_doc([["a", "b"], ["c"]], defs)) == "|a|b|\n|---|---|\n||c|\n"
+    assert md(table_doc([["a", "b"], ["c"]], defs)) == "a|b\n-|-\n||c|\n"
     # vertical merges match cells over the same grid columns
     defs = [tdef([0, 1000, 2000], [VERT_MERGE | VERT_RESTART, 0]), tdef([0, 1000, 2000], [VERT_MERGE, 0])]
-    assert '<td rowspan="2">a</td>' in md(table_doc([["a", "b"], ["", "d"]], defs))
+    assert md(table_doc([["a", "b"], ["", "d"]], defs)) == "a|b\n-|-\n||d|\n\nMerged: A1:A2\n"
 
 
 def test_tdef_damaged():
@@ -366,7 +364,7 @@ def test_tdef_damaged():
     for bad in (bytes([64]) + bytes(400), bytes([3]) + bytes(4), tdef([1000, 0, 2000]), bytes([0]) + bytes(2), b""):
         d, ctx = parse(table_doc(rows, [bad, tdef([0, 1000, 2000])]))
         out = markdown.render(d, tmp() / "a", False, ctx.skipped)
-        assert out == "|a|b|\n|---|---|\n|c|d|\n" and ctx.skipped["styles"] == 1, (bad[:4], out, ctx.skipped)
+        assert out == "a|b\n-|-\nc|d\n" and ctx.skipped["styles"] == 1, (bad[:4], out, ctx.skipped)
     # fewer TC80s than cells: the rest have no merges, uncounted
     short = tdef([0, 1, 2], [FIRST_MERGED, MERGED])[:1 + 6 + 20]
     d, ctx = parse(table_doc(rows, [short]))
@@ -388,10 +386,10 @@ def test_cp_exact_cells():
     # a compressed piece then a Unicode one with a surrogate pair: the TTP is found at its CP, not its text index
     cell, ttp = u16(0) + sp(IN_TABLE, 1), u16(0) + sp(IN_TABLE, 1) + sp(TTP, 1)
     p = doc_file([("a\x07", True), ("😀\x07\x07", False)], papx=[(0, 5, cell), (5, 6, ttp)])
-    assert md(p) == "|a|😀|\n|---|---|\n"
+    assert md(p) == "a|😀\n-|-\n"
     text = "😀\x07b\x07\x07c\x07d\x07\x07"  # CPs: 😀 0-1, marks at 2, 4, 5, 7, 9, 10
     spans = [(0, 5, cell), (5, 6, ttp), (6, 10, cell), (10, 11, ttp)]
-    assert md(doc_file([(text, False)], papx=spans)) == "|😀|b|\n|---|---|\n|c|d|\n"
+    assert md(doc_file([(text, False)], papx=spans)) == "😀|b\n-|-\nc|d\n"
 
 
 def test_table_depth_capped():

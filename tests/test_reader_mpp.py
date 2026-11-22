@@ -30,7 +30,7 @@ from reader_fix import cfb_bytes, comp_obj  # noqa: E402
 
 UNSUPPORTED = "Microsoft Project files are read only through MPXJ"
 MSPROJECT = comp_obj(b"MSProject.MPP9", b"Microsoft Project")
-HEADER = "|ID|Outline|Name|Duration|Start|Finish|% Complete|Predecessors|Resources|"
+HEADER = "\nID|Outline|Name|Duration|Start|Finish|% Complete|Predecessors|Resources\n"
 READ_PY = HERE / "scripts" / "read.py"
 
 
@@ -558,15 +558,15 @@ def test_build_output():
     assert heads == ["Tasks", "Resources", "Notes"]
     md = render(doc, ctx)
     lines = md.splitlines()
-    assert HEADER in lines, md
+    assert HEADER in md, md
     assert "|0|0|**Launch**|20d|2026-01-05|2026-03-27|25%|||" in lines, md
-    assert "|1|1.1|Design|5d|2026-01-05|2026-01-09|100%||Ann[50%], Bob|" in lines, md
+    assert "1|1.1|Design|5d|2026-01-05|2026-01-09|100%||Ann[50%], Bob" in lines, md
     assert "|2|1.2|Build|2.5h|2026-01-12|2026-01-12||1FS+2d, 0SS, 1FF-1d||" in lines, md
     assert "|3|1.3|Go live (milestone)|0d|2026-03-27|2026-03-27||||" in lines, md
     assert "Parked" not in md and "never shown" not in md and "old idea" not in md  # inactive: hidden rows
-    assert "|ID|Name|Type|Max units|" in lines
-    assert "|1|Ann|Work|100%|" in lines and "|2|Bob|Material|300%|" in lines, md
-    assert "Ghost" not in md and "Idle" not in md and "|0||Work|100%|" not in lines  # MPXJ's unnamed resource 0
+    assert "ID|Name|Type|Max units" in lines
+    assert "1|Ann|Work|100%" in lines and "2|Bob|Material|300%" in lines, md
+    assert "Ghost" not in md and "Idle" not in md and "0||Work|100%" not in lines  # MPXJ's unnamed resource 0
     assert "- 1 Design: Check the" in md and "brief" in md, md
     shown = render(doc, Context(), hidden=True)
     assert "Parked" in shown and "4 Parked: old idea" in shown and "Idle" in shown
@@ -588,7 +588,7 @@ def test_build_partial_line_and_title():
     doc = mpp_mpxj.build(Project(Props("T", None, None, None)), ctx)
     assert not any(isinstance(b, Para) for b in doc.blocks)
     md = render(doc, ctx)
-    assert HEADER in md.splitlines() and "## Resources" not in md and "## Notes" not in md
+    assert HEADER in md and "## Resources" not in md and "## Notes" not in md
     # an outline level stands in for a missing WBS; a summary milestone keeps both marks
     t = Task(7, "Gate", wbs="", level=3, summary=True, milestone=True)
     doc = mpp_mpxj.build(Project(Props(), [t]), Context())
@@ -653,7 +653,7 @@ def test_notes_after_both_grids():
         doc = mpp_mpxj.build(Project(Props(), tasks, [Res(1, "Ann"), Res(2, "Bob")]), ctx)
         md = render(doc, ctx)
         assert all(f"|{i}|1|T|" in md for i in range(1, 6)), md
-        assert "|1|Ann|Work|100%|" in md and "|2|Bob|Work|100%|" in md, md
+        assert "\n1|Ann|Work|100%\n" in md and "\n2|Bob|Work|100%\n" in md, md
         items = [b for b in doc.blocks if isinstance(b, ListItem)]
         assert len(items) == 1 and ctx.skipped["sheet_cut"] == 1, (len(items), ctx.skipped)
         heads = [b.inlines[0].text for b in doc.blocks if isinstance(b, Heading)]
@@ -684,7 +684,7 @@ def test_rows_and_cells_capped():
         tasks = [Task(i, f"T{i}", notes=f"note {i}") for i in range(1, 50)]
         doc = mpp_mpxj.build(Project(Props(), tasks, [Res(i, f"R{i}") for i in range(1, 50)]), ctx)
         md = render(doc, ctx)
-        assert "|3|1|T3|" in md and "T4" not in md, md
+        assert "\n|3|1|T3|||||||\n" in md and "T4" not in md, md
         assert "note 3" in md and "note 4" not in md  # a task past the cut gives no note
         assert ctx.skipped["sheet_cut"] == 2, ctx.skipped  # Tasks once, Resources once
     finally:
@@ -812,7 +812,7 @@ def test_task_guarded():
     ctx = Context()
     doc = mpp_mpxj.build(Project(Props(), [Task(1, "A"), Task(2, "B", broken=True, notes="lost"), Task(3, "C")]), ctx)
     md = render(doc, ctx)
-    assert "|1|1|A|" in md and "|2|1|" not in md and "|3|1|C|" in md and "lost" not in md, md
+    assert "\n|1|1|A|||||||\n|3|1|C|||||||\n" in md and "lost" not in md, md
     assert ctx.skipped["record"] == 1
 
     class Broken(Res):
@@ -822,7 +822,7 @@ def test_task_guarded():
     ctx = Context()
     doc = mpp_mpxj.build(Project(Props(), [], [Res(1, "Ann"), Broken(2, "x"), Res(3, "Cy")]), ctx)
     md = render(doc, ctx)
-    assert "|1|Ann|Work|100%|" in md and "|3|Cy|Work|100%|" in md and ctx.skipped["record"] == 1, md
+    assert "\n1|Ann|Work|100%\n" in md and "\n3|Cy|Work|100%\n" in md and ctx.skipped["record"] == 1, md
 
 
 # ---- read(): the JVM, MPPReader and the exceptions, against stand-in jpype and mpxj modules (no Java here)

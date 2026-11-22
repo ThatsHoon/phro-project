@@ -54,7 +54,7 @@ def test_excel_sheet_object():
     out, ctx = blocks_of(object_streams(excel_object([GRID], b"Excel.Sheet.8")))
     assert len(out) == 1 and isinstance(out[0], Table), out
     text = markdown.render(Doc(blocks=out), tmp() / "a", False, {})
-    assert text == "|1|2|\n|---|---|\n|3|4|\n", text
+    assert text == "1|2\n-|-\n3|4\n", text
     assert not ctx.skipped, ctx.skipped
 
 
@@ -76,7 +76,7 @@ def test_cacheless_chart_reads_its_own_sheet():
     ctx = Context()
     with Compound(path) as cf:
         out = xls_embedded.blocks(cf, ctx, budget)
-    assert len(out) == 1 and render(out) == "Chart: column\n||V|\n|---|---|\n|Q1|5|\n|Q2|6|\n", render(out)
+    assert len(out) == 1 and render(out) == "Chart: column\n||V|\n-|-\nQ1|5\nQ2|6\n", render(out)
     assert not ctx.skipped, ctx.skipped
     assert budget.cells < budget.cap_cells, "the sheet's cells are charged to the document's budget"
 
@@ -89,7 +89,7 @@ def test_cached_chart_does_not_walk_sheets():
     make_cfb(path, cacheless_object(sheets=sheets))
     with Compound(path) as cf:
         out = xls_embedded.blocks(cf, Context(), budget)
-    assert render(out) == "Chart: column\n||V|\n|---|---|\n|z|7|\n", render(out)
+    assert render(out) == "Chart: column\n||V|\n-|-\nz|7\n", render(out)
     assert budget.cells == budget.cap_cells, "a chart with cached values reads no sheet"
 
 
@@ -106,7 +106,7 @@ def test_cached_chart_with_a_name_reference_reads_no_sheet():
         ctx = Context()
         with Compound(path) as cf:
             out = xls_embedded.blocks(cf, ctx, budget)
-        assert render(out) == f"Chart: column\n||{want}|\n|---|---|\n|z|7|\n", render(out)
+        assert render(out) == f"Chart: column\n||{want}|\n-|-\nz|7\n", render(out)
         assert budget.cells == budget.cap_cells and budget.chars == budget.cap_chars, (name, budget.cells)
         assert not ctx.skipped, ctx.skipped
     # without a cache the name reference still reads the sheet it names
@@ -115,7 +115,7 @@ def test_cached_chart_with_a_name_reference_reads_no_sheet():
     make_cfb(path, cacheless_object(refs=refs))
     with Compound(path) as cf:
         out = xls_embedded.blocks(cf, Context(), sheet_grid.Budget())
-    assert render(out) == "Chart: column\n||5|\n|---|---|\n|Q1|5|\n|Q2|6|\n", render(out)
+    assert render(out) == "Chart: column\n||5|\n-|-\nQ1|5\nQ2|6\n", render(out)
 
 
 def test_reference_outside_the_workbook_stays_empty():
@@ -128,7 +128,7 @@ def test_reference_outside_the_workbook_stays_empty():
     make_cfb(path, streams)
     with Compound(path) as cf:
         out = xls_embedded.blocks(cf, Context(), budget)
-    assert render(out) == "Chart: column\n||V|\n|---|---|\n", render(out)
+    assert render(out) == "Chart: column\n||V|\n-|-\n", render(out)
     assert budget.cells == budget.cap_cells
 
 
@@ -215,7 +215,7 @@ def test_doc_embedded_chart():
     p = dobj.embed_doc({1: obj}, preview=dobj.PNG_PREVIEW)
     d, ctx = dobj.parse(p)
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
-    assert out == "Chart: column — Sales\n||A|\n|---|---|\n|Q1|1|\n|Q2|2|\n|Q3|3|\n", out
+    assert out == "Chart: column — Sales\n||A|\n-|-\nQ1|1\nQ2|2\nQ3|3\n", out
     assert not ctx.skipped, ctx.skipped
 
 
@@ -234,7 +234,7 @@ def test_hwp_embedded_sheet():
     item = hchart.envelope(object_streams(excel_object([GRID], b"Excel.Sheet.8")))
     path = hchart.doc(hchart.ole_shape(1), streams={"BIN0001.OLE": hchart.deflate(item)})
     out, ctx = hchart.read(path)
-    assert out == "앞\n\n|1|2|\n|---|---|\n|3|4|\n\n뒤\n", out
+    assert out == "앞\n\n1|2\n-|-\n3|4\n\n뒤\n", out
     assert not ctx.skipped, ctx.skipped
 
 
@@ -280,9 +280,9 @@ def test_doc_objects_share_one_sheet_budget():
     finally:
         limits.SHEET_CELLS = old
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
-    assert out == ("(could not read: 1 chart, 1 sheet cut short)\n\naa\n\n|1|2|\n|---|---|\n|3|4|\n\n"
+    assert out == ("(could not read: 1 chart, 1 sheet cut short)\n\naa\n\n1|2\n-|-\n3|4\n\n"
                    "![](assets/img-001.png)\n"), out
-    assert "|5|" not in out and ctx.skipped["chart"] == 1, ctx.skipped
+    assert "5|" not in out and ctx.skipped["chart"] == 1, ctx.skipped
 
 
 def test_doc_object_cap():
@@ -294,7 +294,7 @@ def test_doc_object_cap():
     finally:
         doc_objects.MAX_OBJECTS = old
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
-    assert out.count("|1|2|") == 1 and out.count("|5|6|") == 1 and ctx.skipped == {"object": 1}, (out, ctx.skipped)
+    assert out.count("\n1|2\n") == 1 and out.count("\n5|6\n") == 1 and ctx.skipped == {"object": 1}, (out, ctx.skipped)
     assert "(could not read: 1 embedded object)" in out and out.count("![](") == 1, out
 
 
@@ -310,7 +310,7 @@ def test_hwp_object_cap():
         out, ctx = hchart.read(hchart.doc(*shapes, streams=streams))
     finally:
         hwp.MAX_OBJECTS = old
-    assert out.count("|1|2|") == 1 and out.count("|5|6|") == 1 and "|9|9|" not in out, out
+    assert out.count("\n1|2\n") == 1 and out.count("\n5|6\n") == 1 and "\n9|9\n" not in out, out
     assert ctx.skipped == {"object": 1}, ctx.skipped
 
 
@@ -341,7 +341,7 @@ def test_doc_workbook_past_chart_total_shows_preview():
     finally:
         limits.CHART_TOTAL = old
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
-    assert out.count("|1|2|") == 1 and out.count("![](") == 1, out
+    assert out.count("\n1|2\n") == 1 and out.count("![](") == 1, out
     assert "(could not read: 1 chart)" in out and ctx.skipped == {"chart": 1}, (out, ctx.skipped)
 
 
@@ -351,15 +351,15 @@ def test_doc_workbook_in_vanished_text_is_hidden():
     text = "a" + dobj.EMBED + "\r"
     p = dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW, props=dobj.sp(dobj.VANISH))
     shown = dobj.md(p, hidden=True)
-    assert "|1|2|\n|---|---|\n|3|4|" in shown, shown
+    assert "1|2\n-|-\n3|4" in shown, shown
     plain = dobj.md(p)
-    assert "|1|2|" not in plain and "hidden places left out" in plain, plain
+    assert "\n1|2\n" not in plain and "hidden places left out" in plain, plain
     d, ctx = dobj.parse(p)
     assert not ctx.skipped, ctx.skipped
     p = dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW, props=dobj.sp(dobj.DELETED))
     d, ctx = dobj.parse(p)
     assert not any(isinstance(b, Table) for b in d.blocks) and not ctx.skipped, (d.blocks, ctx.skipped)
-    assert "|1|2|" not in dobj.md(p, hidden=True), dobj.md(p, hidden=True)
+    assert "\n1|2\n" not in dobj.md(p, hidden=True), dobj.md(p, hidden=True)
 
 
 def test_ole_table_shares_budget():

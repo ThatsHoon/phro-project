@@ -155,8 +155,8 @@ def test_table_given_column_by_column_comes_out_in_rows():
     assert blocks[0] == SCANNED, blocks
     tables = [b for b in blocks if isinstance(b, Table)]
     assert len(tables) == 1 and len(blocks) == 2, blocks
-    rows = [ln for ln in render(blocks).splitlines() if ln.startswith("|") and "---" not in ln]
-    assert rows == [f"|{a}|{b}|{c}|" for a, b, c in ROWS], rows
+    rows = [ln for ln in render(blocks).splitlines() if "|" in ln and set(ln) - set("-|")]
+    assert rows == [f"{a}|{b}|{c}" for a, b, c in ROWS], rows
 
 
 def test_paragraphs_above_and_below_a_table():
