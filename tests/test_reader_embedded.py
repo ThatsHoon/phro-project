@@ -1,4 +1,5 @@
 """Tests for reader.embedded: one dispatcher for the objects a document embeds."""
+import struct
 import sys
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import test_reader_doc_objects as in_doc  # noqa: E402
 import test_reader_docm as in_docm  # noqa: E402
 import test_reader_odt as odt  # noqa: E402
 import test_reader_ppt_objects as in_ppt  # noqa: E402
+import test_reader_rtf as in_rtf  # noqa: E402
 import test_reader_slides as in_slides  # noqa: E402
 
 CHART_MIME = "application/vnd.oasis.opendocument.chart"
@@ -192,6 +194,54 @@ def test_ole_object_in_a_sheet():
     ctx = Context()
     out = markdown.render(ooxml.parse_package(data, ctx), Path(tempfile.mkdtemp()), False, ctx.skipped)
     assert out == "## Sheet: S\n\nA1:B1\nhost|1\n-|-\n\nChart: column — 매출\n연도|값\n-|-\n2025|3\n", out
+
+
+def ole1(native, cls=b"Equation.3"):
+    """An OLE1 embedded object as \\objdata holds it: version, format 2, class, empty topic and item, native data, no
+    presentation."""
+    return (struct.pack("<II", 0x501, 2) + struct.pack("<I", len(cls) + 1) + cls + b"\0" + struct.pack("<II", 0, 0)
+            + struct.pack("<I", len(native)) + native + struct.pack("<II", 0x501, 0))
+
+
+def rtf_object(data, result=b"{\\result preview}", lead=b"{\\*\\objclass Equation.3}"):
+    return b"{\\object\\objemb" + lead + b"{\\*\\objdata " + data.hex().encode() + b"}" + result + b"}"
+
+
+def test_rtf_object_equation_stands_in_the_line():
+    blob, _ = cfb_bytes({"Equation Native": eq_native(in_ppt.X)})
+    got = in_rtf.md(b"{\\rtf1 a " + rtf_object(ole1(blob)) + b" b\\par}")
+    assert got == "a $x$ b\n", repr(got)
+    got = in_rtf.md(b"{\\rtf1 " + rtf_object(ole1(blob), result=b"") + b"\\par next\\par}")
+    assert got == "$x$\n\nnext\n", repr(got)
+
+
+def test_rtf_object_workbook_follows_its_paragraph():
+    blob, _ = cfb_bytes({"Package": workbook()})
+    got = in_rtf.md(b"{\\rtf1 a " + rtf_object(ole1(blob, b"Excel.Sheet.12")) + b" b\\par c\\par}")
+    assert got == "a  b\n\nA1:B2\nItem|Qty\n-|-\nPen|3\n\nc\n", repr(got)
+
+
+def test_rtf_object_that_is_not_read_keeps_its_result():
+    d, ctx = in_rtf.parse(in_rtf.rtf_file(b"{\\rtf1 a " + rtf_object(ole1(b"not a file", b"Package")) + b"\\par}"))
+    got = in_rtf.markdown.render(d, in_rtf.tmp() / "assets", False, ctx.skipped)
+    assert got == "a preview\n" and not ctx.skipped, (got, ctx.skipped)
+    for data in (b"\x01\x05", ole1(b"")[:20], struct.pack("<II", 0x501, 1) + b"\0" * 40):
+        got = in_rtf.md(b"{\\rtf1 a " + rtf_object(data) + b"\\par}")
+        assert got == "a preview\n", (data, got)
+    blob, _ = cfb_bytes({"\x01CompObj": comp_obj(b"MSGraph.Chart.8")})
+    d, ctx = in_rtf.parse(in_rtf.rtf_file(b"{\\rtf1 a " + rtf_object(ole1(blob)) + b"\\par}"))
+    assert ctx.skipped == {"chart": 1}, ctx.skipped
+
+
+def test_rtf_object_data_is_bounded():
+    old = limits.EMBED_BYTES
+    limits.EMBED_BYTES = 64
+    try:
+        blob, _ = cfb_bytes({"Equation Native": eq_native(in_ppt.X)})
+        got = in_rtf.md(b"{\\rtf1 a " + rtf_object(ole1(blob)) + b"\\par}")
+    finally:
+        limits.EMBED_BYTES = old
+    assert got == "a preview\n", repr(got)
 
 
 def main():

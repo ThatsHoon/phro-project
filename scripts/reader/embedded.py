@@ -16,8 +16,9 @@ from them is a stream that cannot be read). What comes back is what the object s
   * None: anything else (a PDF's CONTENTS, a packager's Ole10Native, a Word or PowerPoint document, bytes that are
     no container). The caller keeps the object's preview picture and counts it under object.
 
-An OOXML package keeps its objects as parts a relationship names (`Parts`): each is read once, MAX_OBJECTS at
-most, and the tables of all of them are charged, copies counted, against CHART_TOTAL.
+A document reads its objects through one `Objects`: MAX_OBJECTS at most, over one sheet_grid.Budget, the tables of
+all of them charged, copies counted, against CHART_TOTAL. An OOXML package keeps them as parts a relationship names
+(`Parts`), each read once. An RTF `\\objdata` holds an OLE1 object whose native data is the file (`ole1_native`).
 
 A compound file's `Package` (Office), `package_stream` or `EmbeddedOdf` (LibreOffice) stream holds the object's own
 file and is read as bytes again, DEPTH levels at most; a stream or package over EMBED_BYTES is not read. A ReadError
@@ -25,6 +26,7 @@ that only says this object cannot be read (damaged, too large, unsupported, encr
 the document, as it does everywhere.
 """
 import copy
+import struct
 
 from . import limits
 from .containers.cfb import CfbError, Compound, is_cfb
@@ -33,7 +35,7 @@ from .limits import ReadError
 from .model import Cell, Context, Equation, Para, Section, Table
 
 DEPTH = 4  # objects inside objects that are opened
-MAX_OBJECTS = 256  # embedded parts one package reads (the rest are not read)
+MAX_OBJECTS = 256  # embedded objects one document reads (the rest are not read)
 NATIVE = "Equation Native"
 _PACKAGES = ("Package", "package_stream", "EmbeddedOdf")
 _COMP_OBJ = "\x01CompObj"
@@ -44,14 +46,41 @@ CHART = ("chart", [], _NONE)
 BAD = ("bad", "", _NONE)
 
 
-class Parts:
+class Objects:
+    """The embedded objects of one document."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.sheets = None  # the one sheet_grid.Budget of every embedded workbook, made with the first object
+        self.cells = 0      # table cells placed, copies counted
+        self.count = 0      # objects read
+
+    def load(self, data: bytes):
+        """What `read` gives for `data`; None past MAX_OBJECTS or EMBED_BYTES, or when it is not read."""
+        if self.count >= MAX_OBJECTS or len(data) > limits.EMBED_BYTES:
+            return None
+        self.count += 1
+        if self.sheets is None:
+            from .formats import sheet_grid
+            self.sheets = sheet_grid.Budget()
+        return read(data, self.ctx, self.sheets)
+
+    def place(self, got) -> list | None:
+        """Copies of a "table" object's tables for one placement, or None when they would pass CHART_TOTAL (the
+        caller counts a chart, as for a workbook that gave no table)."""
+        self.cells += sum(len(row) for t in got[1] for row in t.rows)
+        if self.cells > limits.CHART_TOTAL:
+            return None
+        return [copy.copy(t) for t in got[1]]
+
+
+class Parts(Objects):
     """The embedded objects of one OOXML package `pkg`."""
 
     def __init__(self, pkg, ctx):
-        self.pkg, self.ctx = pkg, ctx
-        self.sheets = None  # the one sheet_grid.Budget of every embedded workbook, made with the first object
-        self.cells = 0      # table cells placed, copies counted
-        self._read = {}     # part name -> what `read` gave
+        super().__init__(ctx)
+        self.pkg = pkg
+        self._read = {}     # part name -> what `load` gave
 
     def get(self, part: str, rid):
         """The object relationship `rid` of `part` names; None when it names none inside the package."""
@@ -65,27 +94,32 @@ class Parts:
             return None
         name = rel.target
         if name not in self._read:
-            if len(self._read) >= MAX_OBJECTS:
+            if self.count >= MAX_OBJECTS:
                 return None
             self._read[name] = None
             if self.pkg.size(name) <= limits.EMBED_BYTES:
-                if self.sheets is None:
-                    from .formats import sheet_grid
-                    self.sheets = sheet_grid.Budget()
                 try:
-                    self._read[name] = read(self.pkg.read(name), self.ctx, self.sheets)
+                    self._read[name] = self.load(self.pkg.read(name))
                 except ReadError as e:
                     if e.kind not in _SKIP:
                         raise
         return self._read[name]
 
-    def place(self, got) -> list | None:
-        """Copies of a "table" object's tables for one placement, or None when they would pass CHART_TOTAL (the
-        caller counts a chart, as for a workbook that gave no table)."""
-        self.cells += sum(len(row) for t in got[1] for row in t.rows)
-        if self.cells > limits.CHART_TOTAL:
+
+def ole1_native(data: bytes) -> bytes | None:
+    """The native data of an OLE1 embedded object ([MS-OLEDS] 2.2.5 EmbeddedObject: OLEVersion, FormatID 2, three
+    length-prefixed strings for class, topic and item, then NativeDataSize and the data), None for a linked object
+    or a header that does not fit. For an OLE2 object the native data is its compound file."""
+    try:
+        if struct.unpack_from("<I", data, 4)[0] != 2:
             return None
-        return [copy.copy(t) for t in got[1]]
+        at = 8
+        for _ in range(3):
+            at += 4 + struct.unpack_from("<I", data, at)[0]
+        size = struct.unpack_from("<I", data, at)[0]
+    except struct.error:
+        return None
+    return bytes(data[at + 4:at + 4 + size])
 
 
 def read(data: bytes, ctx, sheets, depth: int = 0):
