@@ -51,14 +51,16 @@ def parse(path, ctx, **opts):
 def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     """Convert src into out_dir/out.md, out_dir/assets/ and out_dir/meta.json.
 
-    Parsing and rendering run inside an OCR session (`ocr.opened`) when an OCR engine is here: `backend`, the
-    (id, version) the caller keyed the read with, else `ocr.backend()`,
-    its results cached per picture under the cache root; its deadline is PHRO_READER_DEADLINE's, none without it.
+    With an OCR engine here (`backend`, the (id, version) the caller keyed the read with, else
+    `ocr_probe.backend()`), an OCR session (`ocr.opened`) is open while a pdf or a picture file is parsed, and
+    while a document holding a raster picture OCR may read is rendered; no other read loads the OCR modules. Its
+    results are cached per picture under the cache root; its deadline is PHRO_READER_DEADLINE's, none without it.
     meta.json then holds the OCR counts ("ocr"), and OCR_LATE among the warnings when the time left pages or
     pictures unread."""
+    import contextlib
     import json
     import time
-    from . import markdown, ocr
+    from . import markdown
     from .limits import OCR_LATE, ReadError
     from .model import Context
     from . import text
@@ -68,17 +70,25 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     ctx.name = src.name
     if FORMATS.get(ext_of(src)) in ("pdf", "djvu"):  # the page loop's deadline runs from the process start
         opts.setdefault("started", STARTED)
-    backend, store, deadline = ocr.backend() if backend is None else backend, None, None
-    if backend[0]:
-        from . import cache, raster
-        store = cache.OcrResults(cache.root() / cache.OCR)
+    if backend is None:
+        from . import ocr_probe
+        backend = ocr_probe.backend()
+
+    def session():
+        from . import cache, ocr, raster
         wall = raster._env_deadline()
         deadline = None if wall is None else time.monotonic() + (wall - time.time())
+        return stack.enter_context(ocr.opened(deadline, backend, store=cache.OcrResults(cache.root() / cache.OCR)))
+
     info = {}
-    with ocr.opened(deadline, backend, store=store):
+    with contextlib.ExitStack() as stack:
+        eager = backend[0] and FORMATS.get(ext_of(src)) in ("pdf", "picture")
+        if eager:
+            session()
         doc = parse(src, ctx, **opts)
         out_dir.mkdir(parents=True, exist_ok=True)
-        md = markdown.render(doc, out_dir / "assets", hidden, ctx.skipped, info)
+        md = markdown.render(doc, out_dir / "assets", hidden, ctx.skipped, info,
+                             ocr=session if backend[0] and not eager else None)
     if info["empty"] and info["lost"]:  # every content part failed: nothing was read
         raise ReadError("damaged", "nothing readable (could not read: " + ", ".join(info["lost"]) + ")")
     (out_dir / "out.md").write_text(md, encoding="utf-8", newline="\n")
