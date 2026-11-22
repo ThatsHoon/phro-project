@@ -119,9 +119,10 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
         if not s.aux:  # k stays the cache column of the series after it
             out.append((name, got[1]))
     n = max([max(d) + 1 for d in [cats] + [v for _, v in out] if d] + [0])
-    table = series_table(_caption(f, g, cells, left, cuts, named), [cats.get(i, "") for i in range(n)],
+    whole = _caption(f, g, cells, left, cuts, named)
+    table = series_table(whole, [cats.get(i, "") for i in range(n)],
                          [(name, [v.get(i, "") for i in range(n)]) for name, v in out], f.cut_series, cuts[0], ctx)
-    if table is not None:
+    if table is not None and table.caption == whole:
         table.source = source(block)
     return table, end
 

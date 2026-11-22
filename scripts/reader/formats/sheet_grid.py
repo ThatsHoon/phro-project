@@ -339,12 +339,15 @@ def _column_major(item):
 
 
 class Written:
-    """What a sheet read whole wrote to the output: the columns holding a value in each row, as runs, its hidden rows
-    and columns and its merged ranges."""
+    """What a sheet read whole wrote to the output: the columns holding a value the output shows in each row, as
+    runs, its hidden rows and columns and its merged ranges. A formula with no value, written as its text, and a
+    value its format hides are not such values."""
 
     def __init__(self, grid):
         rows = {}
-        for r, c in sorted(grid.cells):
+        for (r, c), v in sorted(grid.cells.items()):
+            if v[:1] == "=" if isinstance(v, str) else any(isinstance(x, Hidden) for x in v):
+                continue
             runs = rows.get(r)
             if runs is None:
                 rows[r] = [(c, c)]
@@ -359,7 +362,7 @@ class Written:
         no merged range meets it, and every cell of each of `parts` holds a value. All are (r1, c1, r2, c2). The rows
         and merged ranges looked at are charged to `left[0]`; past it the answer is no."""
         r1, c1, r2, c2 = box
-        if (self.rows_h and self.rows_h.within(r1, r2)) or (self.cols_h and self.cols_h.within(c1, c2)):
+        if self.rows_h.meets(r1, r2) or self.cols_h.meets(c1, c2):
             return False
         left[0] -= len(self.merges) + sum(p[2] - p[0] + 1 for p in parts)
         if left[0] < 0:
@@ -380,8 +383,8 @@ class Written:
 def settle(charts, written: dict) -> None:
     """A workbook chart whose data range a shown sheet wrote whole keeps its caption alone: the caption names the
     range and the sheet's table holds the cells. `charts` are the workbook's chart Tables, `written` {the casefolded
-    name of a shown sheet: its Grid.written()}. The charts share one limits.SHEET_SCAN of rows looked at; past it
-    they keep their tables."""
+    name of a sheet: its Grid.written(), None for one not shown or a name two sheets answer to}. The charts share
+    one limits.SHEET_SCAN of rows looked at; past it they keep their tables."""
     left, seen = [limits.SHEET_SCAN], set()
     for t in charts:
         if not t.source or id(t) in seen:
@@ -438,6 +441,12 @@ class _Ranges:
 
     def __bool__(self):
         return bool(self.raw)
+
+    def meets(self, a, b) -> bool:
+        """Whether an interval meets a..b."""
+        self._norm()
+        i = bisect_right(self.starts, b) - 1
+        return i >= 0 and self.ends[i] >= a
 
     def within(self, a, b) -> list:
         """The intervals that meet a..b, clipped to it."""

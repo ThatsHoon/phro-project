@@ -127,11 +127,12 @@ class Workbook:
             shown.append((i, ref, blocks))
         tables = self._charts(shown)
         charts = [t for found in tables.values() for t in found]
-        named, written = {t.source[0].casefold() for t in charts if t.source}, {}
-        for i, ref, _ in shown:
+        named, written, at = {t.source[0].casefold() for t in charts if t.source}, {}, {i for i, _, _ in shown}
+        for i, ref in enumerate(self.g.sheets):
             key = ref.name.casefold()
-            if key in named and not ref.state and i in self._grids:
-                written[key] = None if key in written else self._grids[i].written()
+            if key in named:
+                whole = i in at and not ref.state and i in self._grids and key not in written
+                written[key] = self._grids[i].written() if whole else None
         sheet_grid.settle(charts, written)
         out = []
         for i, ref, blocks in shown:

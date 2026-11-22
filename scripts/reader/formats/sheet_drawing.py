@@ -68,14 +68,16 @@ class Drawings:
         self.budget = diagram.ConnectionBudget(ctx)  # the workbook's edges, shared by every drawing part's diagram
         self.charts: list = []       # chart tables placed
         self.charted = any("chart" in n.lower() for n in pkg.names)  # a package without such a member has no chart
-        self.written: dict = {}      # casefolded name of a shown sheet -> its Grid.written(), None for a name met twice
+        self.written: dict = {}      # casefolded sheet name -> its Grid.written(); None when not shown or met twice
         self.grid = None             # the Grid the sheet being read made its blocks from
 
-    def wrote(self, name: str) -> None:
-        """The sheet whose blocks were made from `grid` last is in the output, shown."""
-        if self.charted and self.grid is not None:
+    def wrote(self, name: str, shown: bool) -> None:
+        """The workbook has a sheet of this name; `shown`: its blocks, made from `grid` last, are in the output and
+        not hidden."""
+        if self.charted:
             key = name.casefold()
-            self.written[key] = None if key in self.written else self.grid.written()
+            whole = shown and key not in self.written and self.grid is not None
+            self.written[key] = self.grid.written() if whole else None
         self.grid = None
 
     def settle(self) -> None:

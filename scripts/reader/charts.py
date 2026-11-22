@@ -289,7 +289,7 @@ def _cell(text: str, header=False) -> Cell:
 def chart_table(space, ctx=None, workbook=False):
     """The chart's cached values as a Table, or None without series. A table is held to limits.CHART_CELLS cells
     (series first, then rows); a cut is counted in ctx.skipped["chart_cut"] when ctx is given. A chart of a workbook
-    (`workbook`) names its data_range in the caption too, and holds it as its `source`."""
+    (`workbook`) names its data_range in the caption too, and holds it as its `source` unless the table was cut."""
     plot = first(space, "plotArea")
     if plot is None:
         return None
@@ -359,7 +359,7 @@ def chart_table(space, ctx=None, workbook=False):
     rows = [[_cell(h, True) for h in heads]]
     for i in range(top):
         rows.append([_cell(c.get(i, "")) for c in cols])
-    return Table(rows, head, source=source(block))
+    return Table(rows, head, source=() if notes else source(block))
 
 
 def series_table(caption, cats, series, series_cut, points_cut, ctx) -> Table | None:
