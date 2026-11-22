@@ -95,7 +95,7 @@ from pathlib import Path
 READ_PY = Path(__file__).resolve()
 
 import reader
-from reader.limits import ReadError
+from reader.limits import CONVERT_SECONDS, ReadError
 
 
 def _flat(x) -> str:
@@ -132,6 +132,17 @@ def _engine_id(wanted) -> str:
         return "native"
 
 
+def _deadline_left() -> float:
+    """Seconds to PHRO_READER_DEADLINE, at least 0; CONVERT_SECONDS when it is not a finite number."""
+    import math
+    import time
+    try:
+        wall = float(os.environ.get("PHRO_READER_DEADLINE", ""))
+    except ValueError:
+        wall = math.nan
+    return max(0.0, wall - time.time()) if math.isfinite(wall) else float(CONVERT_SECONDS)
+
+
 _VENV_KIND = {"pdf": "pdf", "mpp": "mpp", "mpt": "mpp"}
 _VENV_ENGINE = {"pdf": "pdfium", "mpp": "mpxj"}
 
@@ -161,7 +172,10 @@ def _reexec(a):
         cmd += ["--pages", f"{a.pages[0]}-{a.pages[1]}"]
     cmd += ["--engine", _VENV_ENGINE[kind]]
     try:
-        r = subprocess.run(cmd, capture_output=True)
+        r = subprocess.run(cmd, capture_output=True, timeout=_deadline_left())
+    except subprocess.TimeoutExpired:
+        sys.stdout.write("FAIL\ttimeout\t\n")
+        return 1
     except OSError:
         return None
     sys.stdout.write(r.stdout.decode("utf-8", "replace"))
@@ -212,6 +226,9 @@ def _ocr_id(fmt) -> tuple[str, str]:
 
 def cmd_convert(a) -> int:
     from reader import cache
+    if not os.environ.get("PHRO_READER_DEADLINE"):
+        import time
+        os.environ["PHRO_READER_DEADLINE"] = repr(time.time() + CONVERT_SECONDS)
     src = Path(a.file)
     code = _reexec(a)
     if code is not None:

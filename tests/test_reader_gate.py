@@ -1056,6 +1056,7 @@ def test_pages_values_parsed():
 def test_pages_offset_limit():
     with pdf_env():
         p = four_pages()
+        assert out(gate.decide(ev(p)))["permissionDecision"] == "allow"
         o = out(gate.decide(ev(p, pages="2-3", offset=1, limit=9)))
         lines = md_lines(o)
         first, after = lines.index("## Page 2") + 1, lines.index("## Page 4") + 1
@@ -1081,11 +1082,12 @@ def test_pages_past_cut_range():
             return real(cmd, **kw)
         gate.subprocess.run = spy
         try:
+            assert out(gate.decide(ev(p), command=base))["permissionDecision"] == "allow"
             o = out(gate.decide(ev(p, pages="3-4"), command=base))
         finally:
             gate.subprocess.run = real
         assert o["permissionDecision"] == "allow", o
-        assert seen[-1][-2:] == ["--pages", "3-4"] and seen[-1][-4:-2] == ["--engine", "native"], seen
+        assert len(seen) == 2 and seen[-1][-2:] == ["--pages", "3-4"] and seen[-1][-4:-2] == ["--engine", "native"], seen
         assert "--pages" not in seen[0], seen
         got = Path(o["updatedInput"]["file_path"])
         assert got.parent.name.endswith("-p3-4"), got
@@ -1689,8 +1691,8 @@ def test_mpp_child_fail_kinds():
             r = reason_of(gate.decide(ev(project()), command=fail("damaged", "MPXJ could not read the file")))
             assert r == ("a.mpp: the file looks damaged: MPXJ could not read the file. Ask the user for the file"
                          " saved again, as pdf."), r
-            r = reason_of(gate.decide(ev(project()), command=[sys.executable, "-c", "import time; time.sleep(5)"],
-                                      timeout=1))
+            r = reason_of(gate.decide(ev(project(data=b"slow")), command=[sys.executable, "-c",
+                                                                         "import time; time.sleep(5)"], timeout=1))
             assert r.startswith(f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds."), r
             # the venv child without its engine: the offer again (setup repairs the venv)
             from reader.formats import mpp
@@ -2270,6 +2272,165 @@ def test_hook_skips_a_non_document_before_any_import():
     for raw in full:
         printed, code, mods = _hook_modules(raw)
         assert printed == [] and code == "0" and "reader" in mods.split(","), (raw[:80], printed, code, mods)
+
+
+SLOW = [sys.executable, "-c", "import time; time.sleep(5)"]
+
+
+@contextmanager
+def children():
+    """The commands of the children the gate starts, recorded; each still runs."""
+    seen, real = [], gate.subprocess.run
+    gate.subprocess.run = lambda cmd, **kw: seen.append(list(cmd)) or real(cmd, **kw)
+    try:
+        yield seen
+    finally:
+        gate.subprocess.run = real
+
+
+def test_timeout_remembered():
+    """A conversion that ran out of its time is remembered under its key: the next Read of the same bytes denies
+    at once with the same text and starts no child; new bytes are a new key and are converted. A timeout that only
+    the hook's own remaining time caused (LATE) is not remembered."""
+    from reader import cache
+    with stub() as base:
+        p = sample("slow")
+        first = reason_of(gate.decide(ev(p), command=SLOW, timeout=1))
+        assert first.startswith(f"a.txtx: conversion took over {gate.limits.CONVERT_SECONDS} seconds."), first
+        with no_child():
+            assert reason_of(gate.decide(ev(p), command=SLOW, timeout=1)) == first
+        p.write_bytes(bytes(1) + b"quick")
+        assert out(run(p, base))["permissionDecision"] == "allow"
+        q = sample("late")
+        with clock(0, gate.limits.HOOK_SECONDS):
+            assert gate.LATE_TEXT in reason_of(gate.decide(ev(q), command=SLOW, timeout=1))
+        assert not (cache.root() / "failed" / cache.key(q, image=gate.image_backend(), ocr=gate.ocr_backend())).exists()
+    with mpp_env(tmp() / "unset") as java:
+        v = mpp_venv(tmp() / "mpp-venv", java)
+        with envs(PHRO_READER_MPPENV=v):
+            p = project()
+            first = reason_of(gate.decide(ev(p), command=SLOW, timeout=1))
+            assert first.startswith(f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds."), first
+            with no_child():
+                assert reason_of(gate.decide(ev(p), command=SLOW, timeout=1)) == first
+
+
+def test_ranged_pdf_read_converts_the_range_alone():
+    """A pages="A-B" Read of a pdf with no whole entry starts one child, for that range, and serves its entry;
+    a range past the end falls back to the whole conversion, which then serves later ranges without a child."""
+    with pdf_env():
+        p = four_pages()
+        with children() as seen:
+            o = out(gate.decide(ev(p, pages="2-3")))
+        assert len(seen) == 1 and seen[0][-2:] == ["--pages", "2-3"], seen
+        body = Path(o["updatedInput"]["file_path"]).read_text(encoding="utf-8")
+        assert "Body2" in body and "Body3" in body and "Body1" not in body and "Body4" not in body, body
+        assert "pages" not in o["updatedInput"] and "offset" not in o["updatedInput"], o
+        q = four_pages()
+        with children() as seen:
+            o = out(gate.decide(ev(q, pages="9-10")))
+        assert [c[-2:] == ["--pages", "9-10"] for c in seen] == [True, False], seen
+        assert ' The pdf has 4 pages; pages="9-10" starts past its end.' in o["additionalContext"], o
+        with children() as seen:
+            o = out(gate.decide(ev(q, pages="2-3")))
+        assert seen == [] and o["updatedInput"]["offset"] > 1, (seen, o)
+
+
+def test_prune_once_a_day():
+    """After a miss the cache is pruned by a detached `read.py prune` at most once a day, timed by the "pruned"
+    marker in the cache root; a fresh root only sets the marker."""
+    import time
+    from reader import cache
+    seen, real = [], gate._detached
+    gate._detached = seen.append
+    try:
+        with stub() as base:
+            mark = cache.root() / "pruned"
+            assert out(run(sample("a"), base))["permissionDecision"] == "allow"
+            assert seen == [] and mark.is_file(), seen
+            os.utime(mark, (time.time() - 2 * 86400,) * 2)
+            for text in ("b", "c", "b"):
+                assert out(run(sample(text), base))["permissionDecision"] == "allow"
+            assert seen == [[sys.executable, "-I", "-X", "utf8", str(gate.READ_PY), "prune"]], seen
+            assert time.time() - mark.stat().st_mtime < 60
+            almost = time.time() - gate.PRUNE_SECONDS + 3600
+            os.utime(mark, (almost, almost))
+            assert out(run(sample("d"), base))["permissionDecision"] == "allow"
+            assert len(seen) == 1 and abs(mark.stat().st_mtime - almost) < 1, (seen, mark.stat().st_mtime, almost)
+    finally:
+        gate._detached = real
+    flag = tmp() / "ran"
+    gate._detached([sys.executable, "-c", "import sys; open(sys.argv[1], 'w').close()", str(flag)])
+    for _ in range(100):
+        if flag.exists():
+            break
+        time.sleep(0.1)
+    assert flag.exists()
+
+
+CONVERT_DEADLINE = """import io, json, os, sys, types
+sys.path.insert(0, sys.argv[1])
+import reader
+from reader.model import Doc, Para, Text
+mod = types.ModuleType("reader.formats._teststub")
+mod.parse = lambda path, ctx: Doc(blocks=[Para([Text(os.environ.get("PHRO_READER_DEADLINE", "none"))])])
+reader.FORMATS["txtx"] = "_teststub"
+reader.BUILT.add("txtx")
+sys.modules["reader.formats._teststub"] = mod
+import read
+sys.exit(read.main(["convert", sys.argv[2], "--out", sys.argv[3]]))
+"""
+
+
+def test_convert_by_hand_has_the_hook_deadline():
+    """`read.py convert` run by hand gets PHRO_READER_DEADLINE CONVERT_SECONDS from its start, as the hook's child
+    does; one already set is kept."""
+    import time
+    p = sample("x")
+    for given in (None, "12345.5"):
+        o = tmp()
+        env = {k: v for k, v in os.environ.items() if k != "PHRO_READER_DEADLINE"}
+        if given:
+            env["PHRO_READER_DEADLINE"] = given
+        t = time.time()
+        r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", CONVERT_DEADLINE, str(HERE / "scripts"), str(p),
+                            str(o)], capture_output=True, env=env)
+        assert r.returncode == 0, r.stderr[-400:]
+        got = (o / "out.md").read_text(encoding="utf-8").strip()
+        if given:
+            assert got == given, got
+        else:
+            assert t + gate.limits.CONVERT_SECONDS - 5 < float(got) < time.time() + gate.limits.CONVERT_SECONDS, got
+
+
+def test_reexec_has_a_timeout():
+    """The venv re-exec of a hand `read.py convert` is stopped at the deadline and prints a FAIL timeout line."""
+    import io
+    import time
+    import read
+    from contextlib import redirect_stdout
+    from reader import pyenv
+    real = {n: getattr(pyenv, n) for n in ("forced_native", "venv_dir", "state", "interpreter")}
+    run_real, seen = subprocess.run, []
+
+    def slow(cmd, **kw):
+        seen.append(kw.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+    pyenv.forced_native = lambda kind="pdf": False
+    pyenv.venv_dir = lambda kind="pdf": tmp()
+    pyenv.state = lambda venv, kind="pdf": "READY"
+    pyenv.interpreter = lambda venv: Path(tmp() / "python.exe")
+    subprocess.run = slow
+    buf = io.StringIO()
+    try:
+        with envs(PHRO_READER_DEADLINE=time.time() + 30), redirect_stdout(buf):
+            code = read.main(["convert", str(put("a.pdf", b"%PDF-1.7\n"))])
+    finally:
+        subprocess.run = run_real
+        for n, f in real.items():
+            setattr(pyenv, n, f)
+    assert code == 1 and buf.getvalue() == "FAIL\ttimeout\t\n", (code, buf.getvalue())
+    assert len(seen) == 1 and 25 < seen[0] <= 30, seen
 
 
 def main():

@@ -50,7 +50,8 @@ REPAIR = (' The pdf engine failed its file check, so the built-in parser was use
 PAST_END = ' The pdf has {n} pages; pages="{a}-{b}" starts past its end.'
 PASS_TEXT = "phro-project could not convert {name}: {why}. Claude's own Read is used."
 DENY_KINDS = ("encrypted", "drm", "too_large")  # a pdf failing any other way goes to Claude's own Read
-FAILED_SECONDS = 86_400  # a failed pdf passes through at once for a day
+FAILED_SECONDS = 86_400  # a failed pdf passes through, and a timed-out conversion is denied, at once for a day
+PRUNE_SECONDS = 86_400
 SUGGEST_PAGES = 20  # Claude's own Read takes at most 20 pdf pages a request
 
 # mpp and mpt: read only through MPXJ in the mpp venv; until it is ready every Read is denied with one of these
@@ -519,6 +520,8 @@ def _child(cmd, start, timeout):
                            errors="replace", timeout=budget, env=env)
     except subprocess.TimeoutExpired:
         return None, "timeout", LATE if budget < timeout else ""
+    finally:
+        _prune_daily()
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
     last = lines[-1] if lines else ""
     if last.startswith("FAIL\t"):
@@ -528,6 +531,41 @@ def _child(cmd, start, timeout):
     if r.returncode != 0 or out is None or out.name != "out.md" or not out.is_file():
         return None, "damaged", "conversion gave no output"
     return out.parent, "", ""
+
+
+def _detached(cmd):
+    """Starts cmd with no standard streams, in its own process group, and does not wait for it."""
+    if _windows():
+        kw = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        kw = {"start_new_session": True}
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    except OSError:
+        pass
+
+
+def _prune_daily():
+    """After a miss: a detached `read.py prune` when the "pruned" marker in the cache root is PRUNE_SECONDS old,
+    so the cache is pruned at most once a day off the Read's clock; a root without the marker only gets it."""
+    import time
+    from reader import cache
+    mark = cache.root() / "pruned"
+    try:
+        due = time.time() - mark.stat().st_mtime >= PRUNE_SECONDS
+    except OSError:
+        _touch(mark)
+        return
+    if due:
+        _touch(mark)
+        _detached([sys.executable, "-I", "-X", "utf8", str(READ_PY), "prune"])
+
+
+def _remember(mark, kind, detail):
+    """Keeps a timeout of the conversion's own budget in `mark`, so the next Read is denied at once; a timeout the
+    hook's remaining time caused (LATE) is not kept: the next Read has its full budget."""
+    if kind == "timeout" and detail != LATE:
+        _touch(mark, _why(kind, detail))
 
 
 def _meta(entry):
@@ -581,11 +619,16 @@ def _generic(event, path, start, timeout, command):
     repair = False
     venv = None if _windows() else pyenv.venv_dir("image")
     image, ocr = image_backend(venv), ocr_backend()
-    entry = cache.lookup(cache.key(path, image=image, ocr=ocr))
+    k = cache.key(path, image=image, ocr=ocr)
+    entry = cache.lookup(k)
     if entry is None and image.startswith("resvg-") and not pyenv.verify(venv, "image"):
         image, repair = "none", True  # the child works out "none" too: its own check fails the same way
-        entry = cache.lookup(cache.key(path, image=image, ocr=ocr))
+        k = cache.key(path, image=image, ocr=ocr)
+        entry = cache.lookup(k)
     if entry is None:
+        mark = cache.root() / "failed" / k
+        if _failed(mark) is not None:
+            return _deny(path, "timeout")
         # the child hashes the bytes itself: a file saved after this hash must not be filed under the key
         if command:
             cmd = command
@@ -597,6 +640,7 @@ def _generic(event, path, start, timeout, command):
         except OSError as e:  # the venv's interpreter could not be started
             entry, kind, detail = None, "damaged", f"internal error {type(e).__name__}"
         if entry is None:
+            _remember(mark, kind, detail)
             return _deny(path, kind, detail)
     out_md = entry / "out.md"
     if not out_md.is_file():
@@ -654,8 +698,12 @@ def _mpp(event, path, start, timeout, command):
     engine = pyenv.engine(kind="mpp", venv=venv)
     if not engine:
         return _mpp_deny(path)
-    entry = cache.lookup(cache.key(path, engine))
+    k = cache.key(path, engine)
+    entry = cache.lookup(k)
     if entry is None:
+        mark = cache.root() / "failed" / k
+        if _failed(mark) is not None:
+            return _deny(path, "timeout")
         if not pyenv.verify(venv, "mpp"):  # a venv whose files changed after setup never runs
             return _mpp_deny(path)
         if command is not None:
@@ -670,6 +718,7 @@ def _mpp(event, path, start, timeout, command):
         if entry is None:
             if kind == "unsupported" and detail in ("", MPP_UNSUPPORTED):
                 return _mpp_deny(path)
+            _remember(mark, kind, detail)
             return _deny(path, kind, detail)
     out_md = entry / "out.md"
     if not out_md.is_file():
@@ -751,7 +800,8 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
     verified = []  # the venv's file check runs once, before the first pdfium child of this call
 
     def convert(key, pages=None):
-        """(entry, None), or (None, the hook's output: a deny or a pass-through)."""
+        """(entry, None), or (None, the hook's output: a deny or a pass-through), or for `pages` that start past
+        the pdf's end (None, None)."""
         got = cache.lookup(key)
         if got is not None:
             return got, None
@@ -776,6 +826,8 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
             got, kind, detail = None, "damaged", f"internal error {type(e).__name__}"
         if got is not None:
             return got, None
+        if pages and kind == "damaged" and detail.startswith(f"pages {pages[0]}-{pages[1]} past the end"):
+            return None, None
         if kind in DENY_KINDS:
             return None, _deny(path, kind, detail)
         why = _why(kind, detail)
@@ -783,6 +835,13 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
             _touch(cache.root() / "failed" / key, why)
         return None, _pass(path, why)
 
+    rng = parse_pages(event["tool_input"].get("pages"))
+    ranged = False
+    if entry is None and rng is not None:
+        entry, result = convert(f"{k}-p{rng[0]}-{rng[1]}", rng)
+        if entry is None and result is not None:
+            return result
+        ranged = entry is not None
     if entry is None:
         entry, result = convert(k)
         if entry is None:
@@ -790,7 +849,6 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
     if not (entry / "out.md").is_file():
         return _pass(path, _why("damaged", "cache entry vanished"))
     meta = _meta(entry)
-    rng = parse_pages(event["tool_input"].get("pages"))
     total = meta.get("pages_total")
     past_end, at, drop, upto = "", {}, ("pages",), None  # fact F4a: updatedInput replaces the input, so pages can go
     if rng is not None and isinstance(total, int) and not isinstance(total, bool):
@@ -803,7 +861,9 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
                 return None
             drop = ("pages", "offset", "limit")  # the range decides what is read
             index = page_index(meta)
-            if not index or b > max(p for p, _ in index):  # past the cut: convert that range alone, served whole
+            if ranged:
+                upto = b
+            elif not index or b > max(p for p, _ in index):  # past the cut: convert that range alone, served whole
                 entry, result = convert(f"{k}-p{a}-{b}", (a, b))
                 if entry is None:
                     return result
