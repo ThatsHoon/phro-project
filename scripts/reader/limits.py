@@ -24,9 +24,9 @@ FACT_ITEMS = 1_000        # entries one fact paragraph of a sheet lists; the res
 FORMULA_COPY_CHARS = 4_000_000  # characters of formula text one document's sheets read again for repeated cells
 #                                 (an ods cell or row written once and repeated); the copies past them are counted
 BLANK_FORMULAS = 100_000  # formula cells with no value one document's sheets keep; the rest are counted
-# XML elements one xlsx workbook's sheet parts may close, styled empty cells included, and the entries its shared-string
-# table may hold. ooxml_sheets caps the other streamed parts: the shared strings at SST_ELEMENTS (2) times this many
-# closed elements, the styles at STYLE_ELEMENTS (1,000,000). Measured: 2,000,000 cells stream in 1.4 s, the whole xlsx
+# XML elements the sheet parts of one document's xlsx workbooks may open, styled empty cells included, and the entries
+# a shared-string table may hold. ooxml_sheets caps the other streamed parts: the shared strings at SST_ELEMENTS (2)
+# times this many opened elements, the styles at STYLE_ELEMENTS (1,000,000). Measured: 2,000,000 cells stream in 1.4 s, the whole xlsx
 # reader takes 3.2 s over them, and 7.1 s over the worst case all three caps allow together (test_reader_xlsx measure)
 SHEET_SCAN = 2_000_000
 RUNNING_PICTURE = 3       # sections a picture is placed in to be linked at the first one only
@@ -42,11 +42,12 @@ CFB_ENTRIES = 131_072     # directory entries
 CFB_DEPTH = 128           # storage nesting
 CFB_CHAIN = 4_000_000     # steps of one sector chain
 HWP_RECORDS = 1_000_000   # records of one HWP stream
-BIN_RECORDS = 2_000_000    # records of one BIFF stream, one BIFF12 part or one PowerPoint Document stream
+BIN_RECORDS = 2_000_000    # records of one document's BIFF streams, one BIFF12 part or one PowerPoint Document stream
 DECRYPT_BYTES = 32 * 2**20  # bytes one xls or ppt stream may decrypt
 VBA_MODULES = 256           # VBA modules one document reads, all its projects together
 VBA_BYTES = 2 * 2**20       # bytes one document's VBA projects decompress to or scan (dir streams and source)
 EMBED_BYTES = 16 * 2**20    # bytes of one Excel workbook stream embedded in an hwp or doc object
+EMBED_TOTAL = 16 * EMBED_BYTES  # bytes the packages embedded in one document inflate to, all together
 JET_WORK_TOTAL = 32 * 2**20  # work one Access file may spend on its rows, in units of about 0.2 us (a text byte
 #                               decoded; jet.py prices rows and cells in them), at most 10 a byte of the file and 1 MiB
 JET_PAGE_CACHE = 8_192       # decoded pages one Access file with a Jet3/Jet4 db_key keeps (32 MiB at 4 KiB)

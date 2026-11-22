@@ -322,7 +322,7 @@ class _Reader:
         if data.startswith(b"PK\x03\x04"):
             from .ooxml import _main_part
             try:
-                with Package(data) as pkg:
+                with Package(data, embedded.of(self.ctx)) as pkg:
                     sub = _Reader(pkg, _main_part(pkg), self.ctx, self.chunk + 1)
                     for k in _SHARED:
                         setattr(sub, k, getattr(self, k))

@@ -192,8 +192,10 @@ def iterparse(stream, events=("end",), chunk=65536):
 
 
 class Package:
-    def __init__(self, path: Path):
-        """`path` is a path, or the package's bytes (read in memory; every check below is the same)."""
+    def __init__(self, path: Path, objects=None):
+        """`path` is a path, or the package's bytes (read in memory; every check below is the same). `objects` is
+        the document's embedded.Objects when the package is one the document embeds: what its members inflate to
+        is charged to the document's EMBED_TOTAL as well."""
         if isinstance(path, (bytes, bytearray, memoryview)):
             path = io.BytesIO(bytes(path))
         try:
@@ -211,6 +213,7 @@ class Package:
             self._lower[k] = n
         self._seen = set()
         self._total = 0
+        self._objects = objects
 
     def close(self):
         self._zip.close()
@@ -257,10 +260,14 @@ class Package:
                 and info.file_size / max(info.compress_size, 1) > limits.ZIP_RATIO):
             raise ReadError("too_large", f"{limits.BIG_PART}: {real}")
         if real not in self._seen:
-            if self._total + info.file_size > limits.ZIP_TOTAL:
+            held = self._objects
+            if self._total + info.file_size > limits.ZIP_TOTAL or (
+                    held is not None and held.inflated + info.file_size > limits.EMBED_TOTAL):
                 raise ReadError("too_large", f"{limits.BIG_TOTAL}: zip uncompressed size")
             self._seen.add(real)
             self._total += info.file_size
+            if held is not None:
+                held.inflated += info.file_size
         return info
 
     def read(self, name) -> bytes:

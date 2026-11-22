@@ -10,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from reader import embedded, limits  # noqa: E402  (ModuleNotFoundError before embedded.py exists)
 from reader.formats import hwp_chart, sheet_grid  # noqa: E402
 from reader.model import Context, Equation, Table, Text  # noqa: E402
-from reader_fix import cfb_bytes, comp_obj, eq_native, make_xlsx, make_zip, xlsx_cell, xlsx_row  # noqa: E402
+from reader_fix import (XLSX_SML, cfb_bytes, comp_obj, eq_native, excel_object, make_xlsx, make_zip,  # noqa: E402
+                        xlsx_cell, xlsx_row)
 import test_reader_doc_objects as in_doc  # noqa: E402
 import test_reader_docm as in_docm  # noqa: E402
 import test_reader_odt as odt  # noqa: E402
@@ -184,7 +185,70 @@ def test_embedded_workbooks_scan_under_the_documents_count():
     budget = embedded.of(ctx).budget()
     assert 0 < budget.scan <= 101 and budget.strings == ooxml_sheets.SST_ELEMENTS * 100, \
         (budget.scan, budget.strings)
-    assert ctx.skipped == {"sheet_cut": 1, "object": 4} and flat(doc).count("v") == 23, (ctx.skipped, flat(doc))
+    assert ctx.skipped == {"sheet_cut": 1, "object": 4} and flat(doc).count("v") == 22, (ctx.skipped, flat(doc))
+
+
+def test_elements_an_embedded_workbook_only_opens_are_counted():
+    from reader.formats import ooxml_sheets
+    opened = "<a>" * 500
+    inner = make_xlsx(None, [{"name": "S", "part": f'<worksheet xmlns="{XLSX_SML}"><sheetData>{opened}'}],
+                      shared=["<t>s</t>"], numfmts={164: "0"},
+                      extra_parts={"xl/sharedStrings.xml": f'<sst xmlns="{XLSX_SML}">{opened}',
+                                   "xl/styles.xml": f'<styleSheet xmlns="{XLSX_SML}">{opened}'})
+    top = make_xlsx(None, [{"name": "S", "rows": xlsx_row(1, xlsx_cell("A1", inline="<t>top</t>")),
+                            "rels": [(f"rO{k}", SHEET_REL, f"../embeddings/b{k}.xlsx", False) for k in range(6)]}],
+                    extra_parts={f"xl/embeddings/b{k}.xlsx": inner for k in range(6)})
+    old, real, starts = (limits.SHEET_SCAN, ooxml_sheets.STYLE_ELEMENTS), ooxml_sheets.iterparse, [0]
+
+    def counted(f, events):
+        for ev, el in real(f, events):
+            starts[0] += ev == "start"
+            yield ev, el
+    limits.SHEET_SCAN, ooxml_sheets.STYLE_ELEMENTS, ooxml_sheets.iterparse = 100, 50, counted
+    try:
+        doc, ctx = host(top)
+    finally:
+        (limits.SHEET_SCAN, ooxml_sheets.STYLE_ELEMENTS), ooxml_sheets.iterparse = old, real
+    budget = embedded.of(ctx).budget()
+    assert (budget.scan, budget.strings, budget.styles) == (100, 200, 50), (budget.scan, budget.strings, budget.styles)
+    assert starts[0] <= 100 + 200 + 50 + 3 * 7, starts[0]
+    assert ctx.skipped == {"document": 1, "sheet_cut": 2, "object": 5}, ctx.skipped
+
+
+def test_embedded_xls_workbooks_share_the_record_count():
+    grid = {"name": "S", "cells": {(r, 0): r for r in range(200)}}
+    blob = excel_object([grid], b"Excel.Sheet.8")
+    ctx = Context()
+    alone = embedded.read(blob, ctx, embedded.of(ctx).budget())
+    assert len(cells(alone[1])) == 200 and not ctx.skipped, (alone, ctx.skipped)
+    used = embedded.of(ctx).records
+    old = limits.BIN_RECORDS
+    limits.BIN_RECORDS = used * 2 + used // 2
+    try:
+        ctx = Context()
+        got = [embedded.read(blob, ctx, embedded.of(ctx).budget()) for _ in range(4)]
+    finally:
+        limits.BIN_RECORDS = old
+    assert [len(cells(g[1])) for g in got[:2]] == [200, 200], got[:2]
+    assert embedded.of(ctx).records == used * 2 + used // 2 and ctx.skipped["record"] >= 1, \
+        (embedded.of(ctx).records, ctx.skipped)
+    assert not got[3][1], got[3]
+
+
+def test_embedded_packages_inflate_under_one_total():
+    import io
+    import zipfile
+    data = workbook()
+    size = sum(i.file_size for i in zipfile.ZipFile(io.BytesIO(data)).infolist())
+    old = limits.EMBED_TOTAL
+    limits.EMBED_TOTAL = 2 * size
+    try:
+        ctx = Context()
+        got = [embedded.of(ctx).load(data) for _ in range(4)]
+    finally:
+        limits.EMBED_TOTAL = old
+    assert got[0][0] == "table" and got[3] is None, got
+    assert 0 < embedded.of(ctx).inflated <= 2 * size, (embedded.of(ctx).inflated, size)
 
 
 def test_a_parser_error_costs_only_the_object():

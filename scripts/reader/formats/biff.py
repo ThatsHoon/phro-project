@@ -14,7 +14,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from .. import limits
+from .. import embedded, limits
 from ..limits import ReadError
 from ..numfmt import code_for
 
@@ -50,19 +50,28 @@ class Rec(NamedTuple):
 
 
 class Stream:
-    """One BIFF stream. Every walk over it draws on the same `limits.BIN_RECORDS`."""
+    """One BIFF stream. Every walk over it, and over the other BIFF streams of the document `ctx` reads, draws on
+    the same `limits.BIN_RECORDS`."""
 
     def __init__(self, data: bytes, ctx):
         self.data = data
         self.ctx = ctx
-        self.count = 0
+        self.bank = embedded.of(ctx)
+
+    @property
+    def count(self):
+        return self.bank.records
+
+    @count.setter
+    def count(self, n):
+        self.bank.records = n
 
     def records(self, start: int, end: int | None = None):
-        data = self.data
+        data, bank = self.data, self.bank
         end = len(data) if end is None else min(end, len(data))
         pos = start
         while pos < end:
-            if self.count >= limits.BIN_RECORDS:
+            if bank.records >= limits.BIN_RECORDS:
                 self.ctx.skipped["record"] += 1
                 return
             rec = self._one(pos, end)
@@ -70,17 +79,17 @@ class Stream:
                 self.ctx.skipped["record"] += 1
                 return
             rid, off, size = rec
-            self.count += 1  # the record itself first, so its CONTINUEs cannot take the last place and leave it over
+            bank.records += 1  # the record itself first, so its CONTINUEs cannot take the last place and leave it over
             nxt = off + size
             conts = []
             cut = False
             while nxt < end and data[nxt] == CONTINUE and nxt + 1 < end and data[nxt + 1] == 0 \
-                    and self.count < limits.BIN_RECORDS:
+                    and bank.records < limits.BIN_RECORDS:
                 c = self._one(nxt, end)
                 if c is None:
                     cut = True
                     break
-                self.count += 1
+                bank.records += 1
                 conts.append((c[1], c[2]))
                 nxt = c[1] + c[2]
             yield Rec(rid, off, size, tuple(conts))

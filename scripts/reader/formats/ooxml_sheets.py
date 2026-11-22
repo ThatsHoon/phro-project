@@ -7,9 +7,9 @@ types follow anydoc `sheet/xlsx.rs`; the streaming walk, which keeps one cell in
 The workbook part gives the sheets in file order. A relationship of type worksheet or chartsheet is read; any other
 type (a macro or dialog sheet) and a missing relationship are counted under `sheet`. Styles and shared strings are
 streamed, the shared strings under their own cap (`SHEET_CHARS` characters, `SHEET_SCAN` entries), and each part
-under a closed-element cap (SST_ELEMENTS, STYLE_ELEMENTS); one that is named but missing, damaged or capped counts
+under an opened-element cap (SST_ELEMENTS, STYLE_ELEMENTS); one that is named but missing, damaged or capped counts
 `document`. Text escapes (`_xHHHH_`) are undone in strings, str and error values, formulas and sheet names. Every
-sheet part is streamed, and every element it closes is charged to the workbook's scan count, capped at `SHEET_SCAN`.
+sheet part is streamed, and every element it opens is charged to the document's scan count, capped at `SHEET_SCAN`.
 A sheet reached once the count is spent is cut without being opened, its comments unread (counted as `comments_cut`
 when it has some), so neither is charged to ZIP_TOTAL ahead of its drawings.
 A cell shows its cached value; a formula without one shows `=` and its text. Every formula, a shared one
@@ -36,7 +36,7 @@ Cell comments become notes (legacy `comments` parts ported from dochan, threaded
 then its replies, each a "Comment by <name>:" paragraph of one note, the names from the workbook's persons part; a
 legacy comment on a cell a thread covers is its placeholder and is dropped. The note's mark follows the cell's text
 (and its link); a commented cell with no value holds the mark alone. At most SHEET_COMMENTS comments are read a
-workbook (the rest counted once as `comments_cut`). The parts are streamed under _COMMENT_ELEMENTS closed elements each, empty
+workbook (the rest counted once as `comments_cut`). The parts are streamed under _COMMENT_ELEMENTS opened elements each, empty
 and out-of-grid comments included. Notes are placed after the cells: first the cells that hold only a mark, then the
 marks appended to valued cells, each only if its put succeeds and its text fits the character budget that the cells
 share (else the note is dropped, counted once as `comments_cut`). A comment on a merged-away cell moves its mark to
@@ -76,7 +76,7 @@ _PARENT = {"col": "cols", "mergeCell": "mergeCells", "hyperlink": "hyperlinks", 
            **dict.fromkeys(_FILTERS, "filterColumn")}
 _SHEET_TAGS = frozenset(_PARENT)
 _KEEP = frozenset({"formula1", "formula2"})
-_COMMENT_ELEMENTS = 200_000  # elements a comments, threaded comments or persons part may close; past it the part stops
+_COMMENT_ELEMENTS = 200_000  # elements a comments, threaded comments or persons part may open; past it the part stops
 _BATCH = 256  # ended siblings a streamed element keeps before they are dropped together
 
 
@@ -362,7 +362,7 @@ def _workbook(root, rels, wb, ctx):
 def _styles(pkg, part, wb, ctx):
     """`numFmts/numFmt` codes and the `cellXfs/xf` format ids, streamed; `cellStyleXfs` is not read. The read ends
     with `cellXfs` (by schema order `numFmts` comes before it, and nothing after it is used). Past STYLE_ELEMENTS
-    closed elements, the document's embedded workbooks counted with it, the part stops, counted under `document`,
+    opened elements, the document's embedded workbooks counted with it, the part stops, counted under `document`,
     and what was read is kept."""
     budget = embedded.of(ctx).budget()
     els, tags, done, names = [], [], [], {}
@@ -372,16 +372,16 @@ def _styles(pkg, part, wb, ctx):
             if name is None:
                 name = names[el.tag] = local(el.tag)
             if ev == "start":
+                if budget.styles >= STYLE_ELEMENTS:
+                    ctx.skipped["document"] += 1
+                    return
+                budget.styles += 1
                 els.append(el)
                 tags.append(name)
                 done.append(0)
                 continue
             els.pop()
             tags.pop()
-            if budget.styles >= STYLE_ELEMENTS:
-                ctx.skipped["document"] += 1
-                return
-            budget.styles += 1
             if tags:
                 if name == "numFmt" and tags[-1] == "numFmts":
                     fid = _int(attr(el, "numFmtId"))
@@ -395,7 +395,7 @@ def _styles(pkg, part, wb, ctx):
 
 
 def _strings(pkg, part, wb, ctx):
-    """The shared-string table, streamed; past its character or entry cap, or SST_ELEMENTS times SHEET_SCAN closed
+    """The shared-string table, streamed; past its character or entry cap, or SST_ELEMENTS times SHEET_SCAN opened
     elements, the document's embedded workbooks counted with it, it stops, counted once (decision 2)."""
     chars_cap, entries_cap = limits.SHEET_CHARS, limits.SHEET_SCAN
     cap = SST_ELEMENTS * limits.SHEET_SCAN
@@ -407,6 +407,9 @@ def _strings(pkg, part, wb, ctx):
             if name is None:
                 name = names[el.tag] = local(el.tag)
             if ev == "start":
+                if budget.strings >= cap:
+                    return _cut(ctx, f"{cap} XML elements")
+                budget.strings += 1
                 els.append(el)
                 tags.append(name)
                 done.append(0)
@@ -415,9 +418,6 @@ def _strings(pkg, part, wb, ctx):
                 continue
             els.pop()
             tags.pop()
-            if budget.strings >= cap:
-                return _cut(ctx, f"{cap} XML elements")
-            budget.strings += 1
             if name == "t" and tags:
                 up = tags[-1]
                 if up == "si" or (up == "r" and len(tags) >= 2 and tags[-2] == "si"):
@@ -570,9 +570,10 @@ class _Sheets:
                     if tag is None:
                         tag = names[el.tag] = local(el.tag)
                     if ev == "start":
-                        if self.budget.scan >= cap:  # this element cannot close inside the cap
+                        if self.budget.scan >= cap:  # an element past the cap: exactly SHEET_SCAN are not a cut
                             grid.stop("scanned XML elements", cap, (max(row, 0), None))
                             break
+                        self.budget.scan += 1
                         stack.append(el)
                         done.append(0)
                         if tag == "c":
@@ -591,10 +592,6 @@ class _Sheets:
                         continue
                     stack.pop()
                     kids = done.pop()
-                    self.budget.scan += 1
-                    if self.budget.scan > cap:  # an element past the cap: exactly SHEET_SCAN closes are not a cut
-                        grid.stop("scanned XML elements", cap, (max(row, 0), None))
-                        break
                     if tag == "c":
                         cells -= 1
                         c = _col(el.get("r"))
@@ -799,7 +796,7 @@ class _Sheets:
 
     def _ended(self, target):
         """Stream a part: yield (name, element, names of the open ancestors) for each element as it ends, then let
-        it go. Stops past _COMMENT_ELEMENTS closed elements, counted as `comments_cut`."""
+        it go. Stops past _COMMENT_ELEMENTS opened elements, counted as `comments_cut`."""
         seen, els, tags, done, names = 0, [], [], [], {}
         with self.pkg.open(target) as f:
             for ev, el in iterparse(f, ("start", "end")):
@@ -807,16 +804,16 @@ class _Sheets:
                 if name is None:
                     name = names[el.tag] = local(el.tag)
                 if ev == "start":
+                    if seen >= _COMMENT_ELEMENTS:
+                        self._cut_comments()
+                        return
+                    seen += 1
                     els.append(el)
                     tags.append(name)
                     done.append(0)
                     continue
                 els.pop()
                 tags.pop()
-                seen += 1
-                if seen > _COMMENT_ELEMENTS:
-                    self._cut_comments()
-                    return
                 yield name, el, tags
                 _drop(el, els, done)
 

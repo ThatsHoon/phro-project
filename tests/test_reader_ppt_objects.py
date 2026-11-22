@@ -15,7 +15,8 @@ from reader import markdown  # noqa: E402
 from reader.formats import ppt_objects  # noqa: E402  (ModuleNotFoundError before ppt_objects.py exists)
 from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
 from reader.model import Context  # noqa: E402
-from reader_fix import (biff_chart, blip_png, eq_native, excel_object, make_cfb, make_ppt, msgraph_object,  # noqa: E402
+from reader_fix import (biff_chart, blip_png, eq_native, excel_object, make_cfb, make_ppt, make_xlsx,  # noqa: E402
+                        msgraph_object,
                         mtef_v5)
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"P" * 24
@@ -90,6 +91,14 @@ def test_unknown_object():
     # an id no ExEmbed names
     out, ctx, assets = build([{"shapes": [obj(7, pib=1)]}], objects=[stg], pictures=[blip_png(PNG)])
     assert assets == {"img-001.png": PNG} and "(could not read: 1 embedded object)" in out, out
+
+
+def test_package_that_reads_to_nothing_is_counted():
+    stg = cfb({"Package": make_xlsx(None, [{"name": "S", "missing": True}])})
+    out, ctx, assets = build([{"shapes": [obj(pib=1)]}], objects=[stg], pictures=[blip_png(PNG)])
+    assert assets == {"img-001.png": PNG} and ctx.skipped == {"object": 1}, (out, assets, dict(ctx.skipped))
+    out, ctx, assets = build([{"shapes": [obj()]}], objects=[stg])
+    assert not assets and ctx.skipped == {"object": 1}, (out, dict(ctx.skipped))
 
 
 def test_bad_zlib_counted():

@@ -70,6 +70,8 @@ class Objects:
         self.cells = 0      # table cells placed, copies counted
         self.count = 0      # objects read
         self.depth = 0      # objects open around the one being read
+        self.inflated = 0   # bytes the members read from embedded packages inflate to
+        self.records = 0    # records walked in BIFF streams, the document's own and its objects'
 
     def budget(self):
         """The document's one sheet_grid.Budget."""
@@ -251,7 +253,7 @@ def _shown(blocks, own, ctx):
 def _odf(data, ctx):
     from .formats import odf_sheets
     from .formats.odf_base import Body, Styles, kids, local
-    with Package(data) as pkg:
+    with Package(data, of(ctx)) as pkg:
         if not pkg.has("content.xml"):
             return None
         root = pkg.xml("content.xml")
@@ -274,7 +276,7 @@ def _odf(data, ctx):
 
 def _workbook(data, ctx):
     from .formats import ooxml, ooxml_base, ooxml_sheets
-    with Package(data) as pkg:
+    with Package(data, of(ctx)) as pkg:
         part = ooxml._main_part(pkg)
         root, _ = ooxml_base.load(pkg, part)
         if ooxml_base.local(root.tag) != "workbook":

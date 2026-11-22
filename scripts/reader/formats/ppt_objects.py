@@ -101,7 +101,7 @@ class Objects:
             if raw is None:
                 return None
             got = embedded.read(raw, self.ctx, self.sheets)
-            if got is None or got[0] == "bad":
+            if got is None or got[0] in ("bad", "unread"):
                 return None
             if got[0] == "equation":
                 return "equation", [Equation(got[1], False)], got[2]

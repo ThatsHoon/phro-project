@@ -338,7 +338,7 @@ def _column_major(item):
 
 class Budget:
     """Cells, characters, valueless formula cells and characters of repeated formula text left for a document's
-    sheets, and the XML elements its sheet, shared-string and styles parts have closed (`scan`, `strings`,
+    sheets, and the XML elements its sheet, shared-string and styles parts have opened (`scan`, `strings`,
     `styles`); shared, so embedded workbooks count too."""
 
     def __init__(self, cells=None, chars=None):
