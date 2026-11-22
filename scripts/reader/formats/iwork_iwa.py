@@ -501,6 +501,8 @@ def _numbers(store: Store, ctx) -> Doc | None:
     doc = Doc()
     text = iwork_text.TextReader(store, ctx, doc.notes, lambda d: drawable_blocks(store, d, ctx, text, "numbers"))
     for sid in dict.fromkeys(sheets):
+        if ctx.late():
+            break
         sec = _sheet(store, sid, text, doc, ctx)
         if sec is not None:
             doc.blocks.append(sec)

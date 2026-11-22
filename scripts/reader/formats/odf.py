@@ -70,6 +70,8 @@ def _text(pkg, ctx, content, styles_root) -> Doc:
     with ctx.guard("shape"):
         body.scope(office)
     for c in office:
+        if ctx.late():
+            break
         with ctx.guard("block"):
             body.doc.blocks.extend(body.block(c, 0))
     body.doc.blocks.extend(Para([got[1]]) for got in body.changes.values() if got[0] == "deletion")

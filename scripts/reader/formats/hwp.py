@@ -373,6 +373,8 @@ class _Reader(Scopes):
         good = 0
         # a distribution document's text is only in ViewText, encrypted with the key it carries (no BodyText fallback)
         for n, name in self.section_names("ViewText" if h.distribution else "BodyText"):
+            if self.ctx.late():
+                break
             with self.ctx.guard("section"):
                 self.view = False
                 if h.distribution:
@@ -443,6 +445,8 @@ class _Reader(Scopes):
         out = []
         j = start
         while j < end:
+            if self.ctx.late():
+                break
             if recs[j].tag == PARA_HEADER:
                 out.extend(self.para(recs, j, d, nohead))
                 j = self.end(recs, j)

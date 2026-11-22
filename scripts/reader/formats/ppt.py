@@ -437,7 +437,7 @@ class Presentation:
         error is raised when no slide reads."""
         secs, number, notes = [], 0, 0
         for _, _, typ, body, size in officeart.records(self.doc):
-            if not self.walk.spend():
+            if not self.walk.spend() or self.ctx.late():
                 break
             if typ == rec.SLIDE_CONTAINER:
                 number += 1
@@ -460,6 +460,8 @@ class Presentation:
         self.numbers = {sid: number for number, (_, sid, _, _) in enumerate(lists.get(0, []), 1)}
         self.masters = {sid: pid for pid, sid, _, _ in lists.get(1, [])}
         for number, (pid, sid, a, b) in enumerate(lists.get(0, []), 1):
+            if self.ctx.late():
+                break
             with self.ctx.guard("slide"):
                 sec = self._slide(pid, number, (a, b))
                 secs.append(sec)

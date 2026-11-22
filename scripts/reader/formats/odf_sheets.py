@@ -229,6 +229,8 @@ def sheets(pkg, ctx, content, styles_root, first=False) -> Doc:
     budget, found, ok = embedded.of(ctx).budget(), 0, 0
     links = diagram.ConnectionBudget(ctx)  # the workbook's edges, shared by every sheet's diagram
     for t in kids(office, "table"):  # sheets of the same name are kept: each is a separate element
+        if ctx.late():
+            break
         found += 1
         name = _squash(attr(t, "name", ""), 200)
         try:

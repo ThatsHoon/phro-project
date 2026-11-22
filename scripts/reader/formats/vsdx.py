@@ -331,6 +331,8 @@ class _Reader:
         entries = kids(root, "Page")
         doc, seen, meta = Doc(), set(), []
         for number, entry in enumerate(entries, 1):
+            if self.ctx.late():
+                break
             rel = rels.get(_rid(_kid(entry, "Rel")) or "") if _kid(entry, "Rel") is not None else None
             if rel is None or rel.external or not rel.type.endswith("/page") or not self.pkg.has(rel.target):
                 self.ctx.skipped["page"] += 1

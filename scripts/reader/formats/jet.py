@@ -2067,6 +2067,8 @@ def parse_bytes(data, ctx) -> Doc:
     budget = sheet_grid.Budget(limits.SHEET_CELLS, limits.SHEET_CHARS)
     out, seen = [], set()
     for o in tables:
+        if ctx.late():
+            break
         page = o.id & 0xFFFFFF
         if page in seen:  # a second catalog row for one TDEF
             ctx.skipped["record"] += 1

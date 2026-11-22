@@ -101,6 +101,9 @@ INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encrypt
                       "char_positions", "attribute", "merge", "duplicate", "jet_page8"})  # char_positions: pdf glyph positions dropped, the text kept
 
 
+_REST = dict(NAMED)["time"]
+
+
 def lost(skipped) -> list:
     """The counted items of unread(): content that was in the file and is missing from the output."""
     out = []
@@ -450,9 +453,11 @@ def blocks_len(blocks, d=0) -> int:
 
 class _Render:
     def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool, skipped=None, drop=frozenset(), pictures=None,
-                 counted=False):
+                 counted=False, stop=None):
         self.doc, self.assets_dir, self.show = doc, assets_dir, show_hidden
         self.counted = counted  # an OCR engine is here: the OCR counts are given though no picture went to it
+        self.stop = stop  # the time.monotonic() past which no further block is written
+        self.late = False  # a block was left out for it
         self.pictures = pictures  # the _Pictures OCR reads, or None without a session
         self.ocr = None  # the OCR counts (NO_OCR's keys and the pictures_ ones), set by body when there are any
         self.ocr_hint = False
@@ -604,6 +609,9 @@ class _Render:
             out = []
             for b in blocks:
                 if self.size > limits.MAX_OUTPUT:
+                    break
+                if self.stop is not None and (self.late or time.monotonic() >= self.stop):
+                    self.late = True
                     break
                 if self.depth == 1:
                     self.top += 1
@@ -1132,6 +1140,8 @@ class _Render:
             status.append(f"({self.hidden_count} hidden places left out)")
         if self.too_deep:
             status.append(f"({self.too_deep} places nested too deeply left out)")
+        if self.late and _REST not in self.unread:
+            self.unread.append(_REST)
         if self.unread:
             status.append("(could not read: " + ", ".join(self.unread) + ")")
         if "ocr" in self.doc.meta or self.pictures is not None or self.counted:
@@ -1236,7 +1246,7 @@ def _cap(s: str) -> str:
     return "\n".join(out) + "\n" + _TRUNC + "\n"
 
 
-def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=None, ocr=None) -> str:
+def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=None, ocr=None, stop=None) -> str:
     """Render a Doc to Markdown. The Doc is not modified.
 
     `skipped` is the parse context's skip counter; what it says was lost becomes a "(could not read: ...)" line.
@@ -1249,7 +1259,9 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
 
     With an OCR session (`ocr.session()`), the raster pictures are sent to it first (`_Pictures`), and each one's
     words follow its link as `Picture text:`, placed as `Figure text:` is. With none open, `ocr` is the caller's way
-    to open one (it returns the session): it is called when the document holds a picture OCR may read.
+    to open one (it returns the session): it is called when the document holds a picture OCR may read. `stop` is
+    the time.monotonic() past which no further block is written: the output then says the rest was not read, and
+    `info` has "late" true.
     """
     mod = sys.modules.get(__package__ + ".ocr")  # no session can be open unless ocr was imported
     s = mod.session() if mod is not None else None
@@ -1257,12 +1269,13 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     if s is None and ocr is not None and any(_Pictures.reads(im) for im in _images(doc, hidden, grid)):
         s = ocr()
     pictures = _Pictures(s, doc, hidden, grid) if s is not None else None
-    r = _Render(doc, Path(assets_dir), hidden, skipped, pictures=pictures, counted=ocr is not None)
+    r = _Render(doc, Path(assets_dir), hidden, skipped, pictures=pictures, counted=ocr is not None, stop=stop)
     text = r.body()
     if r.dangling:  # a hidden-only note's mark was shown: render again with those marks left out (and unnumbered)
         drop = frozenset(r.dangling)
         del text, r  # the first render is not kept while the second runs
-        r = _Render(doc, Path(assets_dir), hidden, skipped, drop=drop, pictures=pictures, counted=ocr is not None)
+        r = _Render(doc, Path(assets_dir), hidden, skipped, drop=drop, pictures=pictures, counted=ocr is not None,
+                    stop=stop)
         text = r.body()
     text = _normalize(text)  # rebound, so the raw text is not held while _cap runs
     pages = None
@@ -1272,7 +1285,7 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
         text = text.replace(r.head_mark, "")
     md = _cap(text)
     if info is not None:
-        info.update(unread=r.unread, lost=r.lost, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked),
+        info.update(late=r.late, unread=r.unread, lost=r.lost, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked),
                     pages=pages, figures=r.assets.figures, figures_left=r.assets.figures_left,
                     warnings=sorted(r.assets.warnings), ocr=r.ocr, ocr_hint=r.ocr_hint)
     return md

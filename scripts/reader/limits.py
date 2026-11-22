@@ -10,6 +10,7 @@ TEX_DEPTH = 32
 MAX_OUTPUT = 20 * 10**6
 CONVERT_SECONDS = 45
 READ_SECONDS = 36.0   # from the process start: past them a format reads no further part (Context.late)
+RENDER_SECONDS = 41.0  # from the process start: past them the render writes no further block
 # the warning of a document whose later part the time left unread
 READ_LATE = "read not finished: time"
 HOOK_SECONDS = 55     # the gate's whole budget, hashing included, under the 60-second hook timeout in hooks.json

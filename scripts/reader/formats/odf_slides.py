@@ -218,6 +218,8 @@ def slides(pkg, ctx, content, styles_root) -> Doc:
     decls = {attr(e, "name"): _squash("".join(e.itertext()), MAX_NAME) for e in kids(office, "footer-decl")}
     repeated = deck.Repeated()
     for number, page in enumerate(pages, 1):  # numbering counts hidden and unreadable slides
+        if ctx.late():
+            break
         try:
             with ctx.guard("slide"):
                 sec = sl.slide(page, number)

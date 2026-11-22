@@ -145,6 +145,8 @@ class _Reader:
             raise ReadError("damaged", "not an XPS package")
         doc, listed, ok_docs, seen_docs, seen_pages = Doc(), 0, 0, set(), set()
         for ref in kids(seq_root, "DocumentReference"):
+            if self.ctx.late():
+                break
             fdoc = resolve(seq, attr(ref, "Source", ""))
             if fdoc in seen_docs:
                 continue
@@ -154,6 +156,8 @@ class _Reader:
                     fdoc_root = self.xml(fdoc)
                     ok_docs += 1
                     for page in self.pages(fdoc, fdoc_root, seen_pages):
+                        if self.ctx.late():
+                            break
                         listed += 1
                         self.add_page(doc, page, fdoc)
             except ReadError as e:

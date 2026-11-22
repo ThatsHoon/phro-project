@@ -106,6 +106,8 @@ class Workbook:
     def sections(self) -> list:
         seen, shown = set(), []
         for i, ref in enumerate(self.g.sheets):
+            if self.ctx.late():
+                break
             if ref.kind in (_MACRO, _VBA):
                 continue
             blocks = []

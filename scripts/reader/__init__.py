@@ -56,13 +56,14 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     while a document holding a raster picture OCR may read is rendered; no other read loads the OCR modules. Its
     results are cached per picture under the cache root; its deadline is PHRO_READER_DEADLINE's, none without it.
     meta.json then holds the OCR counts ("ocr"), and OCR_LATE among the warnings when the time left pages or
-    pictures unread. A format reads no further part READ_SECONDS after the process start (`Context.late`): the
-    output then holds what was read and says so, with READ_LATE among the warnings."""
+    pictures unread. A format reads no further part READ_SECONDS after the process start (`Context.late`), and the
+    render writes no further block RENDER_SECONDS after it: the output then holds what was read and says so, with
+    READ_LATE among the warnings."""
     import contextlib
     import json
     import time
     from . import markdown
-    from .limits import OCR_LATE, READ_LATE, READ_SECONDS, ReadError
+    from .limits import OCR_LATE, READ_LATE, READ_SECONDS, RENDER_SECONDS, ReadError
     from .model import Context
     from . import text
     t0 = time.monotonic()
@@ -87,10 +88,15 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
         eager = backend[0] and FORMATS.get(ext_of(src)) in ("pdf", "picture")
         if eager:
             session()
-        doc = parse(src, ctx, **opts)
+        try:
+            doc = parse(src, ctx, **opts)
+        except ReadError as e:
+            if e.kind == "damaged" and ctx.skipped["time"]:
+                raise ReadError("damaged", "nothing read within the time limit") from None
+            raise
         out_dir.mkdir(parents=True, exist_ok=True)
         md = markdown.render(doc, out_dir / "assets", hidden, ctx.skipped, info,
-                             ocr=session if backend[0] and not eager else None)
+                             ocr=session if backend[0] and not eager else None, stop=STARTED + RENDER_SECONDS)
     if info["empty"] and info["lost"]:  # every content part failed: nothing was read
         raise ReadError("damaged", "nothing readable (could not read: " + ", ".join(info["lost"]) + ")")
     (out_dir / "out.md").write_text(md, encoding="utf-8", newline="\n")
@@ -99,7 +105,7 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     if "garbled" not in warnings and text.garble_ratio(md) > text.GARBLED:  # a parser may have found it (pub 97)
         warnings.append("garbled")
     warnings += [w for w in info["warnings"] if w not in warnings]  # the figure warnings, each once
-    if ctx.skipped["time"]:
+    if ctx.skipped["time"] or info["late"]:
         warnings.append(READ_LATE)
     counts = info["ocr"]
     if counts and (counts["stopped_at"] is not None or counts["pictures_left"]) and OCR_LATE not in warnings:

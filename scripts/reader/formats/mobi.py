@@ -812,6 +812,8 @@ def _chapters(pieces, load, css, encoding: int, ctx, headings: bool = False, tex
     count in."""
     trees = []
     for piece in pieces:
+        if ctx.late():
+            break
         if not piece.strip():
             continue
         tree = None

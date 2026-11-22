@@ -242,6 +242,8 @@ class _Reader(Scopes):
                 self.ctx.skipped["styles"] += 1  # header.xml holds the style and numbering tables
         good = 0
         for name in names:
+            if self.ctx.late():
+                break
             with self.ctx.guard("section"):
                 try:
                     root = pkg.xml(name)
@@ -273,6 +275,8 @@ class _Reader(Scopes):
             return []
         out = []
         for c in container:
+            if self.ctx.late():
+                break
             n = local(c.tag)
             if n == "p":
                 out.extend(self.para(c, d, nohead))

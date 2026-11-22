@@ -256,6 +256,8 @@ class _Book:
         self.check_drm(parts)
         self.targets = self.toc(opf, root)
         for number, part in enumerate(parts, 1):
+            if self.ctx.late():
+                break
             try:
                 with self.ctx.guard("chapter"):
                     doc.blocks.append(self.chapter(part, number))
