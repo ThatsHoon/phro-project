@@ -225,7 +225,7 @@ def chart_xml(extra_ns="", title="매출", cls="chart:bar"):
 def test_chart_object():
     body = P(frame('<draw:object xlink:href="./Object 1"/>'))
     out = md(odt_doc(body, extra={"Object 1/content.xml": chart_xml()}))
-    assert "Chart: bar — 매출" in out and "|연도|값|" in out and "|2025|3|" in out
+    assert "Chart: column — 매출" in out and "|연도|값|" in out and "|2025|3|" in out
 
 
 def test_formula_object():
@@ -242,7 +242,7 @@ def test_charts_xmlns_math_not_formula():
     xml = chart_xml()  # NS declares xmlns:math on the root, as LibreOffice charts do
     assert 'xmlns:math="http://www.w3.org/1998/Math/MathML"' in xml
     out = md(odt_doc(body, extra={"Object 1/content.xml": xml}))
-    assert "Chart: bar" in out and "$$" not in out
+    assert "Chart: column" in out and "$$" not in out
 
 
 def test_headers_and_footers():
@@ -328,7 +328,7 @@ def test_duplicate_references_read_once():
     finally:
         Package.read = orig
     assert reads.count("Pictures/a.png") == 1 and reads.count("Object 1/content.xml") == 1
-    assert out.count("Chart: bar") == 2 and out.count("![](") == 2
+    assert out.count("Chart: column") == 2 and out.count("![](") == 2
 
 
 def test_hostile_repeats_and_spans():
@@ -417,7 +417,7 @@ def test_hidden_copy_does_not_touch_cached_object():
     chart = frame('<draw:object xlink:href="./Object 1"/>')
     body = chart + '<text:section text:display="none">' + chart + "</text:section>"
     out = md(odt_doc(body, extra={"Object 1/content.xml": chart_xml()}))
-    assert out.count("Chart: bar") == 1 and "(1 hidden places left out)" in out
+    assert out.count("Chart: column") == 1 and "(1 hidden places left out)" in out
 
 
 def test_nested_bold_is_flat():

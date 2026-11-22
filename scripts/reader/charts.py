@@ -1,19 +1,125 @@
-"""DrawingML chart caches (c:chartSpace) to a Table, shared by hwpx and OOXML."""
+"""DrawingML chart caches (c:chartSpace) to a Table, shared by hwpx and OOXML, and the caption, kind and data range
+words every chart reader (DrawingML, BIFF, HWP, ODF, iWork) shares."""
+import math
 import re
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from . import limits
 from .containers.zipx import attr, first, kids, local, walk
 from .model import Cell, Para, Table, Text
+from .numfmt import display
 
-_CACHES = ("strCache", "numCache", "strLit", "numLit")
-_PCT = re.compile(r"^0(?:\.(0+))?%$")
-CHART_ROWS = 10_000  # point indexes past this are dropped
+_CACHES = ("strCache", "numCache", "strLit", "numLit", "multiLvlStrCache")
+_NUMERIC = ("numCache", "numLit")
+_AXES = ("catAx", "valAx", "dateAx", "serAx")
+_GROUPING = {"stacked": "stacked", "percentStacked": "percent"}
+_REF = re.compile(r"(?:'((?:[^']|'')+)'|([^'!\[\]()|,:]+))!\$?([A-Za-z]{1,3})\$?(\d{1,7})"
+                  r"(?::\$?([A-Za-z]{1,3})\$?(\d{1,7}))?")
+_BARE = re.compile(r"[^\W\d][\w.]*")
+_CELL = re.compile(r"[A-Za-z]{1,3}\d+|[Rr]\d*[Cc]\d*")
+CHART_ROWS = 10_000
+
+
+def kind(family: str, horizontal=None, grouping: str = "", three_d: bool = False) -> str:
+    """A chart kind in the words every reader uses: `column` and `bar` for vertical and horizontal bars (`bar` when the
+    file does not say), after `stacked ` or `100% stacked ` (grouping "stacked" or "percent") and `3-D `."""
+    name = ("column" if horizontal is False else "bar") if family == "bar" else family
+    head = {"stacked": "stacked ", "percent": "100% stacked "}.get(grouping, "")
+    return head + ("3-D " if three_d else "") + name
+
+
+def caption(kinds: str, title: str = "", axes=(), data: str = "") -> str:
+    """`Chart: <kind> — <title> (x: <title>; y: <title>)`, then `. Data: <range>` when the chart's cells are named
+    instead of written. `axes` are (letter, title) pairs, x the horizontal axis, y the vertical one, z the depth; a
+    second axis of a letter is `y2`."""
+    out = f"Chart: {kinds}" if kinds else "Chart"
+    if title:
+        out += f" — {title}"
+    named, seen = [], {}
+    for letter, text in sorted(axes, key=lambda a: "xyz".index(a[0])):
+        if text:
+            seen[letter] = seen.get(letter, 0) + 1
+            named.append(f"{letter}{seen[letter] if seen[letter] > 1 else ''}: {text}")
+    if named:
+        out += " (" + "; ".join(named) + ")"
+    if data:
+        out += f". Data: {data}"
+    return out
+
+
+def _a1(r: int, c: int) -> str:
+    letters = ""
+    c += 1
+    while c:
+        c, m = divmod(c - 1, 26)
+        letters = chr(65 + m) + letters
+    return f"{letters}{r + 1}"
+
+
+def _sheet(name: str) -> str:
+    if _BARE.fullmatch(name) and not _CELL.fullmatch(name):
+        return name
+    return "'" + name.replace("'", "''") + "'"
+
+
+def _block(vals, names, cat):
+    """(top, left, bottom, right) of the block whose columns are the series: values one column each, side by side,
+    each name right above its values, the categories in the columns right before the first. None otherwise."""
+    _, r1, c1, r2, _ = vals[0]
+    for k, v in enumerate(vals):
+        if v[1:] != (r1, c1 + k, r2, c1 + k):
+            return None
+    top = r1
+    if names[0] is not None:
+        for k, n in enumerate(names):
+            if n[1:] != (r1 - 1, c1 + k, r1 - 1, c1 + k):
+                return None
+        top = r1 - 1
+    left = c1
+    if cat is not None:
+        if (cat[1], cat[3], cat[4]) != (r1, r2, c1 - 1):
+            return None
+        left = cat[2]
+    return top, left, r2, c1 + len(vals) - 1
+
+
+def data_range(series, shown) -> str:
+    """The chart data range Excel would show, `Sheet1!A1:C9` (`, series in rows` when each series is a row), when
+    every series' values, and all or none of the names and the categories, are ranges of one sheet in `shown` (the
+    sheets whose cells the output holds) that make one block of a sheet laid out as a chart data range; else "".
+    `series` holds (name, categories, values) per series: None when the chart has none, False for a literal or a
+    reference that is not one range here, else (sheet, r1, c1, r2, c2), zero-based and inclusive."""
+    if not series or not shown:
+        return ""
+    names, cats, vals = (list(x) for x in zip(*series))
+    if None in vals or False in vals or False in names or False in cats or len(set(cats)) > 1:
+        return ""
+    if None in names and any(n is not None for n in names):
+        return ""
+    sheet = vals[0][0]
+    if sheet not in shown or any(r[0] != sheet for r in vals + names + cats if r):
+        return ""
+    for by_rows in (False, True):
+        def turn(r):
+            return (r[0], r[2], r[1], r[4], r[3]) if r and by_rows else r
+        box = _block([turn(v) for v in vals], [turn(n) for n in names], turn(cats[0]))
+        if box is None:
+            continue
+        r1, c1, r2, c2 = (box[1], box[0], box[3], box[2]) if by_rows else box
+        if r2 >= limits.SHEET_ROWS or c2 >= limits.SHEET_COLS:
+            return ""
+        a, b = _a1(r1, c1), _a1(r2, c2)
+        return f"{_sheet(sheet)}!{a if a == b else a + ':' + b}" + (", series in rows" if by_rows else "")
+    return ""
 
 
 def _kid(el, name):
     k = kids(el, name)
     return k[0] if k else None
+
+
+def _val(el, name, default=None):
+    k = _kid(el, name) if el is not None else None
+    return attr(k, "val", default) if k is not None else None
 
 
 def _cache(el):
@@ -33,33 +139,22 @@ def _int(s, default=0):
         return default
 
 
-def _fmt(text: str, code: str) -> str:
+def _fmt(text: str, code: str, date1904: bool) -> str:
     text = text.strip()
-    plain = text[:-2] if text.endswith(".0") else text
     try:
-        d = Decimal(text)
-        if not d.is_finite():
-            return plain
-        m = _PCT.match(code or "")
-        if m:
-            places = len(m.group(1) or "")
-            q = (d * 100).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
-            return f"{q:.{places}f}%"
-        if code == "#,##0":
-            return f"{int(d.quantize(Decimal(1), rounding=ROUND_HALF_UP)):,}"
-    except (InvalidOperation, ValueError, OverflowError):
-        pass
-    return plain
+        v = float(text)
+    except ValueError:
+        return text[:-2] if text.endswith(".0") else text
+    if not math.isfinite(v):
+        return text
+    return display(v, code or "General", date1904)
 
 
-def _column(holder):
-    """({idx: text}, rows its points reach, clamped) of the cache under a c:cat / c:val / c:xVal / c:yVal.
+def _points(cache, numeric: bool, date1904: bool):
+    """({idx: text}, rows its points reach, clamped) of one cache or one c:lvl.
 
     The row count comes from the points present, never from ptCount, which a file can set to anything.
     """
-    cache = _cache(holder)
-    if cache is None:
-        return {}, 0, False
     fc = _kid(cache, "formatCode")
     code = (fc.text or "").strip() if fc is not None else ""
     top = 0
@@ -73,8 +168,26 @@ def _column(holder):
         if idx >= CHART_ROWS:
             clamped = True
             continue
-        out[idx] = _fmt(v.text or "", (attr(pt, "formatCode") or code).strip())
+        text = v.text or ""
+        out[idx] = _fmt(text, (attr(pt, "formatCode") or code).strip(), date1904) if numeric else text.strip()
         top = max(top, idx + 1)
+    return out, top, clamped
+
+
+def _levels(holder, date1904: bool):
+    """([{idx: text}] outermost level first, rows they reach, clamped) of the cache under a c:cat / c:val / c:xVal /
+    c:yVal: one level, or a multi-level category's levels."""
+    cache = _cache(holder)
+    if cache is None:
+        return [], 0, False
+    if local(cache.tag) != "multiLvlStrCache":
+        got, top, clamped = _points(cache, local(cache.tag) in _NUMERIC, date1904)
+        return [got], top, clamped
+    out, top, clamped = [], 0, False
+    for lvl in reversed(kids(cache, "lvl")[:limits.GRID_COLS - 1]):
+        got, t, c = _points(lvl, False, date1904)
+        out.append(got)
+        top, clamped = max(top, t), clamped or c
     return out, top, clamped
 
 
@@ -84,65 +197,160 @@ def _name(ser, n: int) -> str:
     return ((v.text or "").strip() if v is not None else "") or f"Series {n}"
 
 
+def _title(el) -> str:
+    """The text a c:title shows: its rich text, paragraphs joined, or the cached text of its reference."""
+    tx = _kid(el, "tx") if el is not None else None
+    if tx is None:
+        return ""
+    rich = _kid(tx, "rich")
+    if rich is not None:
+        text = " ".join("".join(t.text or "" for t in walk(p, "t")) for p in kids(rich, "p"))
+    else:
+        v = first(tx, "v")
+        text = (v.text or "") if v is not None else ""
+    return " ".join(text.split())
+
+
+def _kind(ch, base: str) -> str:
+    three = base.endswith("3D")
+    base = base[:-2] if three else base
+    if base == "ofPie":
+        return ("bar" if _val(ch, "ofPieType") == "bar" else "pie") + " of pie"
+    horizontal = None
+    if base == "bar" and _kid(ch, "barDir") is not None:
+        horizontal = _val(ch, "barDir", "col") == "bar"
+    return kind(base, horizontal, _GROUPING.get(_val(ch, "grouping") or "", ""), three)
+
+
+def _axes(plot) -> list:
+    """(letter, title) of each shown axis that has a title, by where it is drawn: bottom or top x, left or right y."""
+    out = []
+    for ax in plot:
+        n = local(ax.tag)
+        if n not in _AXES or (_val(ax, "delete", "1") or "0") not in ("0", "false"):
+            continue
+        text = _title(_kid(ax, "title"))
+        if not text:
+            continue
+        pos = _val(ax, "axPos")
+        letter = ("z" if n == "serAx" else "x" if pos in ("b", "t") else "y" if pos in ("l", "r")
+                  else "y" if n == "valAx" else "x")
+        out.append((letter, text))
+    return out
+
+
+def _ref(holder):
+    """None without `holder`, else the range its c:f names as data_range takes it, or False for a literal or a
+    formula that is not one range."""
+    if holder is None:
+        return None
+    f = next((e for e in holder.iter() if local(e.tag) == "f"), None)
+    m = _REF.fullmatch((f.text or "").strip()) if f is not None else None
+    if m is None:
+        return False
+    sheet = m.group(1).replace("''", "'") if m.group(1) is not None else m.group(2)
+    r1, r2 = int(m.group(4)) - 1, int(m.group(6) or m.group(4)) - 1
+    c1, c2 = (_column(s) for s in (m.group(3), m.group(5) or m.group(3)))
+    if min(r1, r2) < 0:
+        return False
+    return sheet, min(r1, r2), min(c1, c2), max(r1, r2), max(c1, c2)
+
+
+def _column(letters: str) -> int:
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def _ranges(ser):
+    if _kid(ser, "bubbleSize") is not None:
+        return None, None, False
+    xy = _kid(ser, "val") is None
+    return _ref(_kid(ser, "tx")), _ref(_kid(ser, "xVal" if xy else "cat")), _ref(_kid(ser, "yVal" if xy else "val"))
+
+
 def _cell(text: str, header=False) -> Cell:
     return Cell([Para([Text(text)])] if text else [], header=header)
 
 
-def chart_table(space, ctx=None):
+def chart_table(space, ctx=None, sheets=None):
     """The chart's cached values as a Table, or None without series. A table is held to limits.CHART_CELLS cells
-    (series first, then rows); a cut is counted in ctx.skipped["chart_cut"] when ctx is given."""
+    (series first, then rows); a cut is counted in ctx.skipped["chart_cut"] when ctx is given. With `sheets`, the
+    names of the sheets whose cells the output holds (a chart of a workbook), a chart whose data_range is found is a
+    Table with no rows whose caption names the range."""
     plot = first(space, "plotArea")
     if plot is None:
         return None
-    types, sers = [], []
+    kinds, sers = [], []
     for ch in plot:
         name = local(ch.tag)
         if name.endswith("Chart") and len(name) > 5:
-            if name[:-5] not in types:
-                types.append(name[:-5])
+            k = _kind(ch, name[:-5])
+            if k not in kinds:
+                kinds.append(k)
             sers.extend(kids(ch, "ser"))
     if not sers:
         return None
-
-    title = ""
     chart = _kid(space, "chart")
-    if chart is not None and _kid(chart, "title") is not None:
-        title = "".join(t.text or "" for t in walk(_kid(chart, "title"), "t")).strip()
-    kind = "+".join(types)
+    title = _title(_kid(chart, "title")) if chart is not None else ""
+    date1904 = (_val(space, "date1904", "1") or "0") not in ("0", "false")
+    data = data_range([_ranges(s) for s in sers], sheets) if sheets else ""
+    head = caption("+".join(kinds), title, _axes(plot), data)
+    if data:
+        return Table([], head)
 
-    # Category layout when any series has c:val; otherwise x/y layout (scatter, bubble).
     xy = not any(_kid(x, "val") is not None for x in sers)
-    label, top, clamped = _column(_kid(sers[0], "xVal" if xy else "cat"))
-    names, cols, points, more = ["x" if xy else ""], [], len(label), False
+    heads, cols, top, clamped, more = [], [], 0, False, False
+    if not xy:
+        cat = next((h for s in sers if (h := _kid(s, "cat")) is not None), None)
+        cols, top, clamped = _levels(cat, date1904)
+        cols = cols or [{}]
+        heads = [""] * len(cols)
+    points = sum(len(c) for c in cols)
+    pairs = []
     for n, s in enumerate(sers, 1):
-        if n >= limits.GRID_COLS or points > limits.CHART_CELLS:  # parsed points stay near the cap too
+        if (len(heads) or 1) + len(pairs) + 1 > limits.GRID_COLS or points > limits.CHART_CELLS:
             more = True
             break
-        holder = _kid(s, "yVal") if xy or _kid(s, "val") is None else _kid(s, "val")
-        col, t, c = _column(holder)
-        names.append(_name(s, n))
-        cols.append(col)
-        points += len(col)
-        top = max(top, t)
-        clamped = clamped or c
-    room = max(limits.CHART_CELLS // len(names) - 1, 0)  # the header row counts too
+        x = None
+        if xy:
+            got, t, c = _levels(_kid(s, "xVal"), date1904)
+            x = got[0] if got else {}
+            top, clamped, points = max(top, t), clamped or c, points + len(x)
+        got, t, c = _levels(_kid(s, "yVal") if xy or _kid(s, "val") is None else _kid(s, "val"), date1904)
+        y = got[0] if got else {}
+        pairs.append((x, _name(s, n), y))
+        top, clamped, points = max(top, t), clamped or c, points + len(y)
+    if xy and pairs and any(p[0] != pairs[0][0] for p in pairs):
+        if len(pairs) > limits.GRID_COLS // 2:
+            more, pairs = True, pairs[:limits.GRID_COLS // 2]
+        for x, name, y in pairs:
+            heads += ["x", name]
+            cols += [x, y]
+    else:
+        if xy:
+            heads, cols = ["x"], [pairs[0][0]]
+        for _, name, y in pairs:
+            heads.append(name)
+            cols.append(y)
+    room = max(limits.CHART_CELLS // len(heads) - 1, 0)  # the header row counts too
     rows_cut = top > room
     top = min(top, room)
-    caption = f"Chart: {kind} — {title}" if title else f"Chart: {kind}"
     notes = []
     if rows_cut or clamped:
         notes.append(f"first {top if rows_cut else CHART_ROWS} points")
     if more:
-        notes.append(f"first {len(cols)} series")
+        notes.append(f"first {len(pairs)} series")
     if notes:
-        caption += " (" + ", ".join(notes) + ")"
+        head += " (" + ", ".join(notes) + ")"
         if ctx is not None:
             ctx.skipped["chart_cut"] += 1
 
-    rows = [[_cell(n, True) for n in names]]
+    rows = [[_cell(h, True) for h in heads]]
     for i in range(top):
-        rows.append([_cell(label.get(i, ""))] + [_cell(c.get(i, "")) for c in cols])
-    return Table(rows, caption)
+        rows.append([_cell(c.get(i, "")) for c in cols])
+    return Table(rows, head)
 
 
 def series_table(caption, cats, series, series_cut, points_cut, ctx) -> Table | None:

@@ -19,8 +19,8 @@ anywhere in the stream.
 import struct
 
 from .. import limits
-from ..charts import CHART_ROWS, series_table
-from ..model import Context
+from ..charts import CHART_ROWS, caption, data_range, kind, series_table
+from ..model import Context, Table
 from ..numfmt import code_for, display
 from . import biff
 
@@ -35,7 +35,10 @@ _SER_PARENT = 0x104A
 _DS_NUMBER, _DS_LABEL, _DS_ORIENT, _DS_ROWS, _DS_COLS = 0x0003, 0x0004, 0x1055, 0x1053, 0x1054
 _GRAPH_BOF = 0x8000
 _CODEPAGE = 0x0042
-_KINDS = {0x1018: "line", 0x101A: "area", 0x103E: "radar", 0x103F: "surface", 0x1040: "radar"}
+_KINDS = {0x103E: "radar", 0x103F: "surface", 0x1040: "radar"}
+_STACKED = {0x1018: "line", 0x101A: "area"}
+_SOLID = frozenset({"bar", "line", "area", "pie", "doughnut", "surface"})
+_AXIS_LINKS = {3: "x", 2: "y", 7: "z"}
 # these cannot belong to a chart: BLANK is not here, real charts hold it after SIIndex
 _SHEET_ONLY = frozenset({0x00FD, 0x027E, 0x00BD, 0x0006, 0x0208, 0x00BE})
 
@@ -79,7 +82,7 @@ class _Found:
 
 
 def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.Stream | None = None,
-          seen: dict | None = None):
+          seen: dict | None = None, sheet: bool = False):
     """The chart substream whose BOF is at `start`: (its Table or None, the offset after its EOF). `cells` maps a
     sheet index to {(row, col): displayed text}; a sheet it lacks has no cells. A substream that cannot be read is
     counted under `chart` and the offset is where the walk stopped. `st` is the workbook's Stream over `data`, so
@@ -87,7 +90,10 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
 
     A series name is its SeriesText, else its role 0 reference. For a series that carries cached values the reference
     resolves only against `seen`, the sheets already read (`cells` by default): when `cells` reads a sheet the first
-    time a reference names it (an embedded workbook's), no sheet is read for a name alone."""
+    time a reference names it (an embedded workbook's), no sheet is read for a name alone.
+
+    `sheet` says the chart is one of the workbook `g` whose visible sheets the output holds: a chart whose series are
+    one block of a visible sheet (charts.data_range) is a Table with no rows whose caption names that range."""
     st = biff.Stream(data, ctx) if st is None else st
     seen = cells if seen is None else seen
     f = _scan(data, start, st, ctx, biff.CHART_BOF)
@@ -97,6 +103,11 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
     series, texts, kinds, cache, end = f.series, f.texts, f.kinds, f.cache, f.end
     left = [MAX_POINTS - f.points]
     cuts = [f.cut_points]
+    if sheet:
+        shown = {s.name for s in g.sheets if not s.state}
+        where = data_range([_ranges(s, k, cache, g) for k, s in enumerate(series) if not s.aux], shown)
+        if where:
+            return Table([], _caption(f, g, cells, left, cuts, where)), end
     out, cats = [], {}
     for k, s in enumerate(series):
         name = s.name
@@ -111,8 +122,7 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
         if not s.aux:  # k stays the cache column of the series after it
             out.append((name, got[1]))
     n = max([max(d) + 1 for d in [cats] + [v for _, v in out] if d] + [0])
-    table = series_table(_caption(kinds, f.three_d, _title(texts, g, cells, left, cuts)),
-                         [cats.get(i, "") for i in range(n)],
+    table = series_table(_caption(f, g, cells, left, cuts), [cats.get(i, "") for i in range(n)],
                          [(name, [v.get(i, "") for i in range(n)]) for name, v in out], f.cut_series, cuts[0], ctx)
     return table, end
 
@@ -240,9 +250,9 @@ def _scan(data: bytes, start: int, st: biff.Stream, ctx, dt: int, ds: _Datasheet
             elif rid == _CHART3D:
                 three_d = True
             else:
-                kind = _kind(rid, data, off, size)
-                if kind and kind not in kinds:
-                    kinds.append(kind)
+                got = _kind(rid, data, off, size)
+                if got and got not in kinds:
+                    kinds.append(got)
         except (ValueError, struct.error):
             ctx.skipped["record"] += 1
     found = _Found()
@@ -344,29 +354,45 @@ def graph(data: bytes, ctx):
         out.append((s.name or text(label) or f"Series {k + 1}", {i: text(v) for i, v in indexed.get(axis, {}).items()}))
     n = max([max(d) + 1 for d in [cats] + [v for _, v in out] if d] + [0])
     left = [MAX_POINTS - f.points]
-    return series_table(_caption(f.kinds, f.three_d, _title(f.texts, biff.Globals(), {}, left, cuts)),
-                        [cats.get(i, "") for i in range(n)],
+    return series_table(_caption(f, biff.Globals(), {}, left, cuts), [cats.get(i, "") for i in range(n)],
                         [(name, [v.get(i, "") for i in range(n)]) for name, v in out], f.cut_series, cuts[0], ctx)
 
 
-def _kind(rid: int, data: bytes, off: int, size: int) -> str:
+def _kind(rid: int, data: bytes, off: int, size: int):
+    """(family, horizontal, grouping) of a chart group record, or None. Bar's flags (MS-XLS 2.4.20) are fTranspose,
+    fStacked and f100; Line's and Area's (2.4.156, 2.4.3) fStacked and f100."""
     if rid == _BAR:
-        return "bar"
+        flags = struct.unpack_from("<H", data, off + 4)[0] if size >= 6 else None
+        if flags is None:
+            return "bar", None, ""
+        return "bar", bool(flags & 1), "percent" if flags & 6 == 6 else "stacked" if flags & 2 else ""
+    if rid in _STACKED:
+        flags = struct.unpack_from("<H", data, off)[0] if size >= 2 else 0
+        return _STACKED[rid], None, "percent" if flags & 3 == 3 else "stacked" if flags & 1 else ""
     if rid == _PIE and size >= 4:
-        return "doughnut" if struct.unpack_from("<H", data, off + 2)[0] else "pie"
+        return ("doughnut" if struct.unpack_from("<H", data, off + 2)[0] else "pie"), None, ""
     if rid == _SCATTER and size >= 6:
-        return "bubble" if struct.unpack_from("<H", data, off + 4)[0] & 1 else "scatter"
-    return _KINDS.get(rid, "")
+        return ("bubble" if struct.unpack_from("<H", data, off + 4)[0] & 1 else "scatter"), None, ""
+    return (_KINDS[rid], None, "") if rid in _KINDS else None
 
 
-def _caption(kinds: list, three_d: bool, title: str) -> str:
-    kind = "+".join("bar3D" if three_d and k == "bar" else k for k in kinds) or "unknown"
-    return f"Chart: {kind} — {title}" if title else f"Chart: {kind}"
+def _caption(f: _Found, g, cells, left, cuts, where: str = "") -> str:
+    """charts.caption of a walked substream: its kinds (3-D when it holds Chart3d), the Text linked to the chart
+    (ObjectLink 1) as the title, the ones linked to the category, value and series axes (3, 2, 7) as axis titles, the
+    category axis drawn vertically and the value axis across in a chart of horizontal bars."""
+    names = "+".join(kind(fam, across, grouping, f.three_d and fam in _SOLID) for fam, across, grouping in f.kinds)
+    across = any(k[1] for k in f.kinds)
+    axes = []
+    for link, letter in _AXIS_LINKS.items():
+        if across and letter != "z":
+            letter = "y" if letter == "x" else "x"
+        axes.append((letter, _text(f.texts, link, g, cells, left, cuts)))
+    return caption(names or "unknown", _text(f.texts, 1, g, cells, left, cuts), axes, where)
 
 
-def _title(texts: list, g, cells, left, cuts) -> str:
+def _text(texts: list, link: int, g, cells, left, cuts) -> str:
     for t in texts:
-        if t.link == 1:
+        if t.link == link:
             if t.text:
                 return t.text
             if t.tokens:
@@ -387,10 +413,10 @@ def _values(s: _Series, role: int, cached, g, cells, left, cuts) -> dict:
     return _reference(tokens, g, cells, left, cuts) if source == 2 and tokens else {}
 
 
-def _reference(tokens: bytes, g, cells: dict, left: list, cuts: list) -> dict:
-    """{point index: text} of a Ref3d or Area3d token's cells, the index counting along the rows of the area."""
+def _area(tokens: bytes, g):
+    """(sheet index, r1, c1, r2, c2) of a Ref3d or Area3d token naming a sheet of this workbook, or None."""
     if len(tokens) < 7 or tokens[0] < 0x20 or ((tokens[0] & 0x1F) | 0x20) not in (0x3A, 0x3B):
-        return {}
+        return None
     if (tokens[0] & 0x1F) == 0x1A and len(tokens) == 7:  # Ref3d: sheet, row, column
         xti, r1, c1 = struct.unpack_from("<HHH", tokens, 1)
         r2, c2 = r1, c1 & 0xFF
@@ -398,11 +424,35 @@ def _reference(tokens: bytes, g, cells: dict, left: list, cuts: list) -> dict:
         xti, r1, r2, c1, c2 = struct.unpack_from("<HHHHH", tokens, 1)
         c2 &= 0xFF
     else:
-        return {}
+        return None
     c1 &= 0xFF
     if xti >= len(g.externs) or g.externs[xti] < 0 or r2 < r1 or c2 < c1:
+        return None
+    return g.externs[xti], r1, c1, r2, c2
+
+
+def _ranges(s: _Series, k: int, cache: dict, g):
+    """(name, categories, values) of series `k` as charts.data_range takes them: a role read from the sheet is its
+    range (False when it names no sheet of this workbook), one typed in the chart (a SeriesText name, cached
+    categories, any values not read from the sheet) is False, a name or categories the chart makes up is None."""
+    def where(role, typed):
+        source, tokens, _ = s.refs.get(role, (0, b"", 0))
+        if source != 2:
+            return False if typed else None
+        got = _area(tokens, g)
+        if got is None or got[0] >= len(g.sheets):
+            return False
+        return (g.sheets[got[0]].name,) + got[1:]
+    return where(0, bool(s.name)), where(2, (k, 2) in cache), where(1, True)
+
+
+def _reference(tokens: bytes, g, cells: dict, left: list, cuts: list) -> dict:
+    """{point index: text} of a Ref3d or Area3d token's cells, the index counting along the rows of the area."""
+    got = _area(tokens, g)
+    if got is None:
         return {}
-    sheet = cells.get(g.externs[xti]) or {}
+    idx, r1, c1, r2, c2 = got
+    sheet = cells.get(idx) or {}
     width = c2 - c1 + 1
     area = (r2 - r1 + 1) * width
     visits = min(area, len(sheet))

@@ -8,17 +8,17 @@ title (parser.rs) and the chart type at the end of the VtChart archive (the fiel
 parse_inner, whose whole object graph is not walked); a BIFF Workbook or Book is an embedded Excel object, read by
 xls_embedded (its first table is the item's).
 """
-import math
 import re
 import struct
 from dataclasses import dataclass
 
 from .. import limits
-from ..charts import chart_table, series_table
+from ..charts import caption, chart_table, series_table
 from ..containers.cfb import Compound, is_cfb
 from ..containers.zipx import parse_xml
 from ..limits import ReadError
 from ..model import Table
+from ..numfmt import display
 from . import sheet_grid, xls_embedded
 
 # grid.rs: the classes a data grid is made of; any other name in it means the shape cannot be trusted
@@ -137,17 +137,9 @@ def _native(data: bytes, ctx) -> Table | None:
     for s in range(n_series):
         values = [g.cells.get(pos(ls + s, lk + k)) for k in range(n_cats)]
         name = g.label(*pos(ls + s, 0)) or f"Series {s + 1}"
-        series.append((name, [_num(v) if isinstance(v, float) else "" for v in values]))
-    title = _title(data)
-    kind = _kind(data)
-    caption = f"Chart: {kind} — {title}" if title else f"Chart: {kind}"
-    return series_table(caption, cats, series, g.cut and by_rows, g.cut and not by_rows, ctx)
-
-
-def _num(v: float) -> str:
-    if math.isfinite(v) and v == int(v) and abs(v) < 1e16:
-        return str(int(v))
-    return repr(v)
+        series.append((name, [display(v, "General") if isinstance(v, float) else "" for v in values]))
+    return series_table(caption(_kind(data), _title(data)), cats, series, g.cut and by_rows, g.cut and not by_rows,
+                        ctx)
 
 
 class _Archive:

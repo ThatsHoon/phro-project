@@ -312,7 +312,7 @@ class _Sheets:
     def __init__(self, pkg, wb, ctx):
         self.pkg, self.wb, self.ctx = pkg, wb, ctx
         self.budget = sheet_grid.Budget()
-        self.draw = sheet_drawing.Drawings(pkg, ctx)  # charts and pictures; one image byte count and chart cell count
+        self.draw = sheet_drawing.Drawings(pkg, ctx, {n for n, _, s in wb.sheets if s not in _HIDDEN})
         self.scan = 0                    # elements the sheet parts have closed, all sheets together
         self.used: set[str] = set()      # sheet parts read
         self.notes: dict = {}            # note key -> blocks, for Doc.notes

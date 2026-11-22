@@ -117,11 +117,12 @@ def test_rows_follow_points_not_ptCount_and_series_are_capped():
 
 
 def test_fmt_overflow_and_nan():
-    cases = [("1e309", "0.0%"), ("1e30", "#,##0"), ("1" + "0" * 29, "#,##0"), ("NaN", "0%")]
-    for v, fmt in cases:
+    cases = [("1e309", "0.0%", "1e309"), ("1e30", "#,##0", "1," + ",".join(["000"] * 10)),
+             ("1" + "0" * 29, "#,##0", "100," + ",".join(["000"] * 9)), ("NaN", "0%", "NaN")]
+    for v, fmt, want in cases:
         plot = "<c:barChart>" + ser("A", cache([(0, v)], fmt=fmt)) + "</c:barChart>"
         t = chart_table(space(plot))
-        assert cells(t)[1][1] == v, (v, cells(t))
+        assert cells(t)[1][1] == want, (v, cells(t))
 
 
 def test_strip_and_bubble():
@@ -133,6 +134,110 @@ def test_strip_and_bubble():
          f"<c:bubbleSize><c:numRef>{cache([(0, '9')])}</c:numRef></c:bubbleSize>"
          "</c:ser></c:bubbleChart>")
     assert cells(chart_table(space(b))) == [["x", "S"], ["1", "3"]]
+
+
+def ref(f, items, kind="num", fmt=""):
+    return f"<c:{kind}Ref><c:f>{f}</c:f>{cache(items, kind, fmt)}</c:{kind}Ref>"
+
+
+def axis(tag, pos, title="", deleted=False):
+    t = (f"<c:title><c:tx><c:rich><a:p><a:r><a:t>{title}</a:t></a:r></a:p></c:rich></c:tx></c:title>"
+         if title else "")
+    return (f'<c:{tag}><c:axId val="1"/><c:delete val="{1 if deleted else 0}"/><c:axPos val="{pos}"/>{t}'
+            f"</c:{tag}>")
+
+
+def test_caption_kind_direction_grouping_and_axes():
+    one = ser("A", cache([(0, "1")]), [(0, "a")])
+    cases = [('<c:barDir val="col"/><c:grouping val="clustered"/>', "column"),
+             ('<c:barDir val="bar"/><c:grouping val="clustered"/>', "bar"),
+             ('<c:barDir val="col"/><c:grouping val="stacked"/>', "stacked column"),
+             ('<c:barDir val="bar"/><c:grouping val="percentStacked"/>', "100% stacked bar"),
+             ('<c:barDir/>', "column")]
+    for head, want in cases:
+        t = chart_table(space(f"<c:barChart>{head}{one}</c:barChart>", "T"))
+        assert t.caption == f"Chart: {want} — T", (head, t.caption)
+    t = chart_table(space(f'<c:bar3DChart><c:barDir val="col"/><c:grouping val="standard"/>{one}</c:bar3DChart>'))
+    assert t.caption == "Chart: 3-D column", t.caption
+    t = chart_table(space(f'<c:lineChart><c:grouping val="stacked"/>{one}</c:lineChart>'))
+    assert t.caption == "Chart: stacked line", t.caption
+    plot = (f'<c:barChart><c:barDir val="bar"/>{one}</c:barChart>'
+            + axis("catAx", "l", "Region") + axis("valAx", "b", "Units") + axis("valAx", "r", "Gone", deleted=True))
+    t = chart_table(space(plot, "Sales"))
+    assert t.caption == "Chart: bar — Sales (x: Units; y: Region)", t.caption
+    plot = (f'<c:barChart><c:barDir val="col"/>{one}</c:barChart>' + axis("catAx", "b", "Year")
+            + axis("valAx", "l", "Number of Ducks"))
+    assert chart_table(space(plot)).caption == "Chart: column (x: Year; y: Number of Ducks)"
+    linked = (f"<c:chartSpace {NS}><c:chart><c:title><c:tx><c:strRef><c:f>Sheet1!$B$1</c:f>"
+              f"{cache([(0, 'Linked')], 'str')}</c:strRef></c:tx></c:title><c:plotArea>"
+              f"<c:pieChart>{one}</c:pieChart></c:plotArea></c:chart></c:chartSpace>")
+    assert chart_table(parse_xml(linked.encode())).caption == "Chart: pie — Linked"
+
+
+def test_dates_and_general_digits():
+    cat = f"<c:cat><c:numRef>{cache([(0, '46023'), (1, '46054')], fmt='mmm-yy')}</c:numRef></c:cat>"
+    vals = cache([(0, "4.4000000000000004"), (1, "0.30000000000000004")], fmt="General")
+    plot = f"<c:lineChart><c:ser><c:tx><c:v>S</c:v></c:tx>{cat}<c:val><c:numRef>{vals}</c:numRef></c:val></c:ser></c:lineChart>"
+    assert cells(chart_table(space(plot))) == [["", "S"], ["Jan-26", "4.4"], ["Feb-26", "0.3"]]
+    s1904 = (f"<c:chartSpace {NS}><c:date1904 val=\"1\"/><c:chart><c:plotArea>{plot}</c:plotArea></c:chart>"
+             "</c:chartSpace>")
+    assert cells(chart_table(parse_xml(s1904.encode())))[1][0] == "Jan-30"
+
+
+def test_scatter_series_keep_their_own_x():
+    def xy(name, xs, ys):
+        return (f"<c:ser><c:tx><c:v>{name}</c:v></c:tx>"
+                f"<c:xVal><c:numRef>{cache(list(enumerate(xs)))}</c:numRef></c:xVal>"
+                f"<c:yVal><c:numRef>{cache(list(enumerate(ys)))}</c:numRef></c:yVal></c:ser>")
+    plot = "<c:scatterChart>" + xy("Lab A", ["1", "2"], ["10", "20"]) + xy("Lab B", ["5", "7", "9"],
+                                                                          ["1", "2", "3"]) + "</c:scatterChart>"
+    assert cells(chart_table(space(plot))) == [["x", "Lab A", "x", "Lab B"], ["1", "10", "5", "1"],
+                                               ["2", "20", "7", "2"], ["", "", "9", "3"]]
+    same = "<c:scatterChart>" + xy("A", ["1", "2"], ["3", "4"]) + xy("B", ["1", "2"], ["5", "6"]) + "</c:scatterChart>"
+    assert cells(chart_table(space(same))) == [["x", "A", "B"], ["1", "3", "5"], ["2", "4", "6"]]
+
+
+def test_multi_level_categories():
+    lvl = ('<c:multiLvlStrRef><c:multiLvlStrCache><c:ptCount val="4"/>'
+           '<c:lvl><c:pt idx="0"><c:v>Q1</c:v></c:pt><c:pt idx="1"><c:v>Q2</c:v></c:pt>'
+           '<c:pt idx="2"><c:v>Q1</c:v></c:pt><c:pt idx="3"><c:v>Q2</c:v></c:pt></c:lvl>'
+           '<c:lvl><c:pt idx="0"><c:v>2025</c:v></c:pt><c:pt idx="2"><c:v>2026</c:v></c:pt></c:lvl>'
+           '</c:multiLvlStrCache></c:multiLvlStrRef>')
+    vals = cache([(0, "1"), (1, "2"), (2, "3"), (3, "4")])
+    plot = f"<c:barChart><c:ser><c:tx><c:v>S</c:v></c:tx><c:cat>{lvl}</c:cat><c:val><c:numRef>{vals}</c:numRef></c:val></c:ser></c:barChart>"
+    assert cells(chart_table(space(plot))) == [["", "", "S"], ["2025", "Q1", "1"], ["", "Q2", "2"],
+                                               ["2026", "Q1", "3"], ["", "Q2", "4"]]
+
+
+def ranged(name_f, cat_f, val_f, name="A"):
+    tx = f"<c:tx>{ref(name_f, [(0, name)], 'str')}</c:tx>" if name_f else ""
+    cat = f"<c:cat>{ref(cat_f, [(0, 'a'), (1, 'b')], 'str')}</c:cat>" if cat_f else ""
+    return f"<c:ser>{tx}{cat}<c:val>{ref(val_f, [(0, '1'), (1, '2')])}</c:val></c:ser>"
+
+
+def test_data_range_instead_of_cells():
+    cols = ("<c:barChart>" + ranged("Sheet1!$B$1", "Sheet1!$A$2:$A$3", "Sheet1!$B$2:$B$3")
+            + ranged("Sheet1!$C$1", "Sheet1!$A$2:$A$3", "Sheet1!$C$2:$C$3", "B") + "</c:barChart>")
+    t = chart_table(space(cols, "T"), sheets={"Sheet1"})
+    assert t.caption == "Chart: bar — T. Data: Sheet1!A1:C3" and t.rows == [], (t.caption, t.rows)
+    rows = ("<c:barChart>" + ranged("'My Data'!$A$2", "'My Data'!$B$1:$C$1", "'My Data'!$B$2:$C$2")
+            + ranged("'My Data'!$A$3", "'My Data'!$B$1:$C$1", "'My Data'!$B$3:$C$3", "B") + "</c:barChart>")
+    t = chart_table(space(rows), sheets={"My Data"})
+    assert t.caption == "Chart: bar. Data: 'My Data'!A1:C3, series in rows" and t.rows == [], t.caption
+    keep = [(cols, None), (cols, {"Other"}),
+            ("<c:barChart>" + ranged("", "Sheet1!$A$2:$A$3", "Sheet1!$B$2:$B$3")
+             + ranged("Sheet1!$C$1", "Sheet1!$A$2:$A$3", "Sheet1!$C$2:$C$3") + "</c:barChart>", {"Sheet1"}),
+            ("<c:barChart>" + ranged("[1]Sheet1!$B$1", "[1]Sheet1!$A$2:$A$3", "[1]Sheet1!$B$2:$B$3")
+             + "</c:barChart>", {"Sheet1"}),
+            ("<c:barChart>" + ranged("Sheet1!$B$1", "Sheet1!$A$2:$A$3", "Sheet1!$B$2:$B$3")
+             + ranged("Sheet1!$D$1", "Sheet1!$A$2:$A$3", "Sheet1!$D$2:$D$3") + "</c:barChart>", {"Sheet1"}),
+            ("<c:barChart>" + ranged("Sheet1!$B$1", "Sheet1!$A$2:$A$3", "Sheet1!$B$2:$B$3")
+             + ranged("Sheet2!$C$1", "Sheet1!$A$2:$A$3", "Sheet1!$C$2:$C$3") + "</c:barChart>", {"Sheet1", "Sheet2"}),
+            ("<c:barChart><c:ser><c:tx><c:v>L</c:v></c:tx><c:val>" + ref("Sheet1!$B$2:$B$3", [(0, "1")])
+             + "</c:val></c:ser></c:barChart>", {"Sheet1"})]
+    for plot, sheets in keep:
+        t = chart_table(space(plot), sheets=sheets)
+        assert "Data:" not in t.caption and len(t.rows) > 1, (sheets, t.caption)
 
 
 def main():

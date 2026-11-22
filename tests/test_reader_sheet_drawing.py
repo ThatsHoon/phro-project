@@ -42,6 +42,22 @@ def test_drawings_direct():
     assert not ctx.skipped, dict(ctx.skipped)
 
 
+def test_chart_over_shown_sheet_names_its_range():
+    ranged = BAR.replace("<c:strRef>", "<c:strRef><c:f>Sheet1!$B$1</c:f>", 1).replace(
+        "<c:cat><c:strRef>", "<c:cat><c:strRef><c:f>Sheet1!$A$2</c:f>").replace(
+        "<c:numRef>", "<c:numRef><c:f>Sheet1!$B$2</c:f>")
+    members = {
+        "xl/worksheets/_rels/sheet1.xml.rels": rels_xml(("rId1", "drawing", "../drawings/drawing1.xml")),
+        "xl/drawings/drawing1.xml": drawing_xml(anchor(2, chart_frame("rId1"))),
+        "xl/drawings/_rels/drawing1.xml.rels": rels_xml(("rId1", "chart", "../charts/chart1.xml")),
+        "xl/charts/chart1.xml": ranged,
+    }
+    for shown, want in (({"Sheet1"}, ("Chart: bar. Data: Sheet1!A1:B2", 0)), ({"Other"}, ("Chart: bar", 2))):
+        ctx = Context()
+        (t,) = Drawings(Package(make_zip(None, members)), ctx, shown).blocks(SHEET)
+        assert (t.caption, len(t.rows)) == want, (t.caption, t.rows)
+
+
 def test_drawing_seen_once():
     ctx = Context()
     d = Drawings(package(), ctx)

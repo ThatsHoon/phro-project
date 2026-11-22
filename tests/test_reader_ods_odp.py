@@ -515,6 +515,39 @@ def test_via_convert():
     assert "## Sheet: S" in (out_dir / "out.md").read_text(encoding="utf-8")
 
 
+CHART_NS = 'xmlns:chart="urn:oasis:names:tc:opendocument:xmlns:chart:1.0"'
+
+
+def ods_chart(plot_props):
+    head = row(c(), c("1월"), c("2월"))
+    rows = [head, row(c("서울"), c("1200"), c("1350")), row(c("부산"), c("860"), c("910"))]
+    local = '<table:table table:name="local-table">' + "".join(rows) + "</table:table>"
+    return (f'<office:document-content {NS} {CHART_NS}><office:automatic-styles>'
+            f'<style:style style:name="ch4" style:family="chart"><style:chart-properties {plot_props}/>'
+            '</style:style></office:automatic-styles><office:body><office:chart><chart:chart chart:class="chart:bar">'
+            f'<chart:title>{P("지점별 매출")}</chart:title><chart:plot-area chart:style-name="ch4">'
+            f'<chart:axis chart:dimension="x" chart:name="primary-x"><chart:title>{P("월")}</chart:title></chart:axis>'
+            f'<chart:axis chart:dimension="y" chart:name="primary-y"><chart:title>{P("원")}</chart:title></chart:axis>'
+            f'</chart:plot-area>{local}</chart:chart></office:chart></office:body></office:document-content>')
+
+
+def test_chart_in_a_cell_is_one_table_after_the_sheet():
+    anchored = ('<table:table-cell><draw:frame draw:name="Chart 1"><draw:object xlink:href="./Object 1"/>'
+                '</draw:frame></table:table-cell>')
+    body = sheet("매출", [row(c("지점"), c("1월")), row(c("서울"), c("1200"), anchored), row(c("부산"), c("860"))])
+    for props, kind, axes in (('chart:vertical="false"', "column", "x: 월; y: 원"),
+                              ('chart:vertical="true" chart:stacked="true"', "stacked bar", "x: 원; y: 월"),
+                              ('chart:percentage="true"', "100% stacked column", "x: 월; y: 원")):
+        doc, _ = parse(ods(body, extra={"Object 1/content.xml": ods_chart(props)}))
+        blocks = doc.blocks[0].blocks
+        assert [type(b).__name__ for b in blocks] == ["Table", "Table"], blocks
+        grid, chart = blocks
+        assert all(len(r) <= 2 for r in grid.rows), grid.rows
+        assert chart.caption == f"Chart: {kind} — 지점별 매출 ({axes})", chart.caption
+        assert [["".join(x.text for b in c.blocks for x in b.inlines) for c in r] for r in chart.rows] == [
+            ["", "1월", "2월"], ["서울", "1200", "1350"], ["부산", "860", "910"]], chart.rows
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

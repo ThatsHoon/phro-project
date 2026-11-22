@@ -12,6 +12,7 @@ import math
 import re
 
 from .. import diagram, limits
+from ..charts import caption, kind
 from ..containers.zipx import attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
 from ..markdown import blocks_len
@@ -42,6 +43,7 @@ GROUPS = frozenset({"g", "a"})
 _KINDS = {"flowchart-decision": "decision", "diamond": "decision", "flowchart-terminator": "terminator",
           "ellipse": "circle", "circle": "circle", "flowchart-connector": "circle", "can": "store",
           "flowchart-magnetic-disk": "store"}
+_CHART_KINDS = {"circle": "pie", "ring": "doughnut", "filled-radar": "filled radar"}
 _XML_ID = "{http://www.w3.org/XML/1998/namespace}id"
 
 
@@ -259,6 +261,18 @@ class Styles:
 
     def list_level(self, name, level):
         return self.lists.get(name, {}).get(level)
+
+
+def _chart_props(root, name) -> dict:
+    """The style:chart-properties attributes, by local name, of the automatic style `name` of a chart object."""
+    if not name:
+        return {}
+    for styles in kids(root, "automatic-styles"):
+        for st in kids(styles, "style"):
+            if attr(st, "name") == name:
+                props = next(iter(kids(st, "chart-properties")), None)
+                return {local(k): v for k, v in props.attrib.items()} if props is not None else {}
+    return {}
 
 
 class Body:
@@ -504,16 +518,32 @@ class Body:
         for body in kids(root, "body"):
             for c in body:
                 if local(c.tag) == "chart":
-                    return self.chart(c, d)
+                    return self.chart(c, d, root)
                 break
         self.ctx.skipped["object"] += 1
         return []
 
-    def chart(self, ch, d):
+    def chart(self, ch, d, root):
+        """A chart object as its local table under charts.caption: chart:class (circle a pie, ring a doughnut), the
+        plot area's chart:vertical (horizontal bars; vertical ones by default), chart:stacked, chart:percentage and
+        chart:three-dimensional, the title, and each axis title by its chart:dimension, x and y trading places when
+        the bars are horizontal."""
         ch = next(iter(kids(ch, "chart")), ch)  # office:chart wraps chart:chart
         cls = (attr(ch, "class") or "").replace("chart:", "", 1)[:64]
         title = next((_squash("".join(t.itertext()), 100) for t in kids(ch, "title")), "")
-        cap = ("Chart: " + cls if cls else "Chart") + (" — " + title if title else "")
+        plot = next(iter(kids(ch, "plot-area")), None)
+        props = _chart_props(root, attr(plot, "style-name") if plot is not None else None)
+        across = props.get("vertical") == "true"
+        on = {k for k, v in props.items() if v == "true"}
+        grouping = "percent" if "percentage" in on else "stacked" if "stacked" in on else ""
+        name = kind(_CHART_KINDS.get(cls, cls), across, grouping, "three-dimensional" in on) if cls else ""
+        axes = []
+        for ax in kids(plot, "axis") if plot is not None else ():
+            dim = attr(ax, "dimension") or ""
+            text = next((_squash("".join(t.itertext()), 100) for t in kids(ax, "title")), "")
+            if dim in ("x", "y", "z") and text:
+                axes.append((({"x": "y", "y": "x"}.get(dim, dim)) if across else dim, text))
+        cap = caption(name, title, axes)
         src = first(ch, "table")
         tbl = self.table(src, d + 1) if src is not None else None
         if tbl is None:
@@ -608,13 +638,18 @@ class Body:
             self.doc.blocks.extend(todo.pop())
 
     # ---- blocks
-    def blocks(self, el, d):
+    def blocks(self, el, d, aside=None):
+        """The blocks of el's children; with `aside`, the blocks of the frames right under el (the shapes anchored to
+        a sheet cell) go there instead."""
         if d > limits.MAX_DEPTH:
             self.deep()
             return []
         out = []
         for c in el:
-            out.extend(self.block(c, d))
+            if aside is not None and local(c.tag) == "frame":
+                aside.extend(self.frame_blocks(c, d))
+            else:
+                out.extend(self.block(c, d))
         return out
 
     def block(self, c, d):

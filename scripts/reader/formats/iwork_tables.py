@@ -49,7 +49,7 @@ from decimal import Decimal
 from functools import lru_cache
 
 from .. import limits
-from ..charts import series_table
+from ..charts import caption, series_table
 from ..containers import pbwire
 from ..model import Break, Cell, Hidden, Image, NoteRef, Table
 from ..numfmt import MAX_CODE, display
@@ -754,7 +754,7 @@ def _chart_value(v) -> str:
     x = pbwire.f64(x)
     if not math.isfinite(x):
         return ""
-    return str(int(x)) if x == int(x) and abs(x) < 1e16 else repr(x)
+    return display(x, "General")
 
 
 def _name(raw: list, i: int) -> str:
@@ -815,7 +815,6 @@ def _chart(store, chart_id, ctx, tally) -> Table:
         read += max(len(rows[-1]), 1)
     nid = ref(c, 10)
     title = _chart_title(store, nid, ctx) if nid is not None else ""
-    caption = f"Chart: {kind} — {title}" if title else f"Chart: {kind}"
     # series are built only as far as series_table places them (GRID_COLS - 1 of them, points near CHART_CELLS)
     if by_row:
         n_series, names = len(rows), row_names
@@ -842,7 +841,7 @@ def _chart(store, chart_id, ctx, tally) -> Table:
         tally.skipped["chart"] += 1
     # by row a cut row list drops series and a cut row drops points; by column the other way round
     series_cut = len(series) < n_series or (rows_cut if by_row else values_cut)
-    return series_table(caption, cats, series, series_cut, values_cut if by_row else rows_cut, tally)
+    return series_table(caption(kind, title), cats, series, series_cut, values_cut if by_row else rows_cut, tally)
 
 
 def chart_block(store, chart_id: int, ctx) -> Table | None:

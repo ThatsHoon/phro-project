@@ -49,10 +49,12 @@ def _text(el) -> str:
 
 
 class Drawings:
-    """The drawings of one workbook, sharing one image byte count and one chart cell count."""
+    """The drawings of one workbook, sharing one image byte count and one chart cell count. `sheets` names the
+    workbook's sheets whose cells the output holds: a chart whose data is one block of one of them names that range
+    (charts.chart_table)."""
 
-    def __init__(self, pkg, ctx):
-        self.pkg, self.ctx = pkg, ctx
+    def __init__(self, pkg, ctx, sheets=None):
+        self.pkg, self.ctx, self.sheets = pkg, ctx, sheets
         self.seen: set[str] = set()  # drawing parts read
         self.image_bytes = 0         # image bytes placed (IMAGE_BYTES)
         self.chart_cells = 0         # chart table cells placed (CHART_TOTAL)
@@ -196,7 +198,7 @@ class Drawings:
                 out.append(Para([Text(text)], hidden=hidden))
 
     def chart(self, part: str, rid, out: list) -> None:
-        tbl = ooxml_base.chart(self.pkg, part, rid, self.ctx)
+        tbl = ooxml_base.chart(self.pkg, part, rid, self.ctx, self.sheets)
         if tbl is None:  # kept: a chart part with no series is "could not read" too, as in the slide and Word readers
             self.ctx.skipped["chart"] += 1
             return
