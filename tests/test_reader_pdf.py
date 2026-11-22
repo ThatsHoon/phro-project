@@ -1457,6 +1457,24 @@ def measure():
         raise SystemExit("usage: measure renders | decrypt | tables <path> | native <path> | pdfium <path>")
 
 
+def test_overlapping_figures_are_merged_within_a_budget():
+    """A page of many figures whose boxes overlap, among many lines, is judged within the page's time."""
+    from types import SimpleNamespace
+    page, step, run = (0.0, 0.0, 4800.0, 4800.0), 36, 900
+    marks, lines = [], []
+    for i in range(110):
+        x0, y0 = i * step, 4800 - run - i * step
+        marks += [((x0 + 12 * t + 2.0, y0 + 12 * t + 2.0, x0 + 12 * t + 6.0, y0 + 12 * t + 6.0), 4, False)
+                  for t in range(run // 12)]
+        lines.append(SimpleNamespace(box=(x0 - 2.0, y0 - step + 14.0, x0 + 44.0, y0 - step + 18.0), size=4.0,
+                                     text="Prose words of body %03d" % i))
+    lines += [SimpleNamespace(box=(20.0 + 6 * (k // 300), 20.0 + 5 * (k % 300), 22.0 + 6 * (k // 300), 24.0 + 5 * (k % 300)),
+                              size=4.0, text="a") for k in range(20000)]
+    t = time.perf_counter()
+    pdf._figure_boxes(marks, page, [], lines)
+    assert time.perf_counter() - t < 3.0, time.perf_counter() - t
+
+
 def main():
     if sys.argv[1:2] == ["measure"]:
         measure()

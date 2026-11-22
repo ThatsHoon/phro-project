@@ -182,6 +182,15 @@ def test_piece_that_goes_on_along_the_line_stays_in_its_paragraph():
     assert len(L.paragraphs(L._whole([lns[0], lns[1], far, lns[3]]), L.SpacingModel())) > 1
 
 
+def test_joined_line_has_the_size_of_most_of_its_text():
+    from dataclasses import replace
+    big = L.lines(numbered([frag("23. ", 72, 700)]))[0]
+    body = replace(big, text="words of the body in the common size", runs=[("words of the body in the common size", "")],
+                   box=(big.box[2] + 0.5, big.box[1], 400.0, big.box[3]), size=big.size / 2)
+    got = L._whole([big, body])
+    assert len(got) == 1 and got[0].size == body.size and got[0].text.startswith("23."), got
+
+
 def test_toc_entry_ends_paragraph():
     # evenly spaced table-of-contents entries: each one ends at its leader and page label
     assert _paras("Introduction ........ 1", "Scope · · · ··········· 12",

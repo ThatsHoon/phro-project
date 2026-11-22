@@ -751,7 +751,7 @@ def _stacked(frags) -> set:
     return out
 
 
-def lines(fragments, links=(), gap=None) -> List[Line]:
+def lines(fragments, links=(), gap=None, whole=True) -> List[Line]:
     """Lines in content order: consecutive fragments of one direction on one baseline are one
     line. A space goes between two glyphs when the gap is over `gap` x the size (when None, the
     `word_gap` of these fragments) and neither side is a space. Vertical writing comes last, as
@@ -759,7 +759,8 @@ def lines(fragments, links=(), gap=None) -> List[Line]:
     one-glyph fragments stacked in a column (`_stacked`: a horizontal font's glyphs placed one by
     one down a column, among a vertical font's punctuation). Other text running down the page is
     read as lines like any other. A line that goes on along the one before it (a piece set off by
-    a superscript or a font change) is one line with it (`_whole`).
+    a superscript or a font change) is one line with it (`_whole`), unless `whole` is False: each
+    line then lies in one row.
 
     A fragment that starts before the last one ended (a row whose cells are drawn right cell
     first, words drawn into the gaps a later string leaves) joins the line as `_Row.take_back`
@@ -808,7 +809,7 @@ def lines(fragments, links=(), gap=None) -> List[Line]:
             row = _Row(f, urls, d, a, gap)
         row.lo, row.hi, row.end = min(row.lo, s), max(row.hi, s + f.width), s + f.width
     flush(row, last)
-    return _whole(out) + vertical_lines(vertical, links)
+    return (_whole(out) if whole else out) + vertical_lines(vertical, links)
 
 
 def _tiers(frags) -> list:
@@ -987,7 +988,8 @@ def _along(prev, ln) -> bool:
 
 def _whole(lns) -> list:
     """`lns` with each line that goes on along the one before it (`_along`) made one line with it, a space between
-    them when they are over ALONG_SPACE sizes apart."""
+    them when they are over ALONG_SPACE of the smaller one's size apart. The line has the size of the piece with the
+    most chars (a large number or initial before the body's words does not make a heading of them)."""
     out, chain = [], []
 
     def close():
@@ -995,11 +997,12 @@ def _whole(lns) -> list:
             first = chain[0]
             runs, box = list(first.runs), first.box
             for prev, ln in zip(chain, chain[1:]):
-                if ln.box[0] - prev.box[2] > ALONG_SPACE * first.size and not ln.vertical:
+                if ln.box[0] - prev.box[2] > ALONG_SPACE * min(prev.size, ln.size) and not ln.vertical:
                     runs.append((" ", ""))
                 runs.extend(ln.runs)
                 box = (min(box[0], ln.box[0]), min(box[1], ln.box[1]), max(box[2], ln.box[2]), max(box[3], ln.box[3]))
-            out[-1] = replace(first, text="".join(t for t, _ in runs), runs=runs, box=box)
+            out[-1] = replace(first, text="".join(t for t, _ in runs), runs=runs, box=box,
+                              size=max(chain, key=lambda ln: len(ln.text)).size)
         chain.clear()
     reach = None
     for ln in lns:

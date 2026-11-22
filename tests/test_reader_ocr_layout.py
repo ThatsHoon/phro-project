@@ -269,6 +269,24 @@ def test_reading_lines_for_picture():
     assert ocr_layout.reading_lines(page([], 300, 300)) == []
 
 
+def test_piece_reaching_into_the_next_row_is_read_once():
+    """A small piece that goes on along a line of the row above it, over two columns, is read once."""
+    from dataclasses import replace
+    from reader.formats import pdf_layout
+
+    def fr(text, x, y, w, size=10.0):
+        n = len(text)
+        return pdf_layout.Fragment(x=x, y=y, width=w, size=size, text=text, space_width=0.25 * size, order=0,
+                                   char_offsets=tuple(w * k / n for k in range(n + 1)))
+    fs = [fr("Title-that-crosses-the-middle-of-page", 200, 700, 200), fr("Xleft-piece", 40, 696, 60),
+          fr("Ylost-words-here", 96.5, 694, 80, size=6.0)]
+    for k in range(3):
+        fs += [fr("Left-column-line-%d" % k, 40, 670 - 14 * k, 200), fr("Right-column-line-%d" % k, 340, 670 - 14 * k, 200)]
+    got = [ln.text for ln in ocr_layout.read([replace(f, order=i) for i, f in enumerate(fs)], 600.0)]
+    assert sum("Ylost-words-here" in t for t in got) == 1, got
+    assert sum(len(t.replace(" ", "")) for t in got) == sum(len(f.text) for f in fs), got
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

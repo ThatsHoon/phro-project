@@ -296,23 +296,30 @@ def _figure_boxes(marks, page, tables, lines) -> list:
     if not any(not rule for _b, _n, rule in paths):
         return []
     ruled = [(b, n) for b, n, rule in marks if rule and not any(within(b, t) for t in tables)]
+    lines = [((ln.box[0] + ln.box[2]) / 2, (ln.box[1] + ln.box[3]) / 2, len(ln.text), ln.box[2] - ln.box[0],
+              ln.size >= FIGURE_SMALL and ln.box[2] - ln.box[0] <= FIGURE_ADVANCE * ln.size * len(ln.text))
+             for ln in lines]
     found = []
     for box, pieces in _groups_of(paths, page):
         if _cover(box, page) >= FIGURE_COVER and _is_figure(box, whole(box, pieces), page, lines):
             found.append((box, pieces))
-    merged = True
+    merged, left = True, FIGURE_WORK
     while merged:
         merged = False
         for i, (a, n) in enumerate(found):
             for j in range(i + 1, len(found)):
                 b, m = found[j]
-                if (a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
-                        and _is_figure(union(a, b), n + m, page, lines)):
+                if not (a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]):
+                    continue
+                left -= len(lines) + 1
+                if left < 0:
+                    break
+                if _is_figure(union(a, b), n + m, page, lines):
                     found[i] = (union(a, b), n + m)
                     del found[j]
                     merged = True
                     break
-            if merged:
+            if merged or left < 0:
                 break
     found = [box for box, _n in found]
     if found and len(found) <= FIGURES_PAGE:
@@ -338,14 +345,12 @@ def _is_figure(box, pieces, page, lines) -> bool:
     if pieces < FIGURE_PATHS or _cover(box, page) < FIGURE_COVER:
         return False
     chars = wide = 0
-    for ln in lines:
-        x, y = (ln.box[0] + ln.box[2]) / 2, (ln.box[1] + ln.box[3]) / 2
-        if not (box[0] <= x <= box[2] and box[1] <= y <= box[3]):
-            continue
-        chars += len(ln.text)
-        if ln.size >= FIGURE_SMALL and ln.box[2] - ln.box[0] <= FIGURE_ADVANCE * ln.size * len(ln.text) \
-                and (ln.box[2] - ln.box[0] >= FIGURE_LINE * (box[2] - box[0]) or len(ln.text) >= FIGURE_CHARS):
-            wide += len(ln.text)
+    across = FIGURE_LINE * (box[2] - box[0])
+    for x, y, n, width, set_close in lines:
+        if box[0] <= x <= box[2] and box[1] <= y <= box[3]:
+            chars += n
+            if set_close and (width >= across or n >= FIGURE_CHARS):
+                wide += n
     return wide * 2 <= chars
 
 
