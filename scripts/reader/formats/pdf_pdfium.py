@@ -39,7 +39,8 @@ last page and the document; pdf.py calls it in a finally.
   in its form's space). Path points go through that matrix into `pdf_tables.PathCollector`, with
   its thin-fill and straight-curve rules. Images keep their box and pixel size.
 - An image's bytes: DCT data as it is; over `images._MAX_PIXELS` pixels, a CROP_DPI render of
-  its box; anything else a PNG of `FPDFImageObj_GetBitmap` through `images._png`.
+  its box; anything else a PNG of `FPDFImageObj_GetBitmap` through `pdf_layout.picture` (zlib
+  level 1, none for a flat picture), decoded and encoded only once pdf.py has chosen it.
 - `render(box, dpi)` renders the page (box None) or a page-space box, long side capped at
   RENDER_LONG pixels. `render(box, dpi, gray=True, cap=None)` gives the Gray8 pixels for OCR
   instead, at most `cap` pixels (images._MAX_PIXELS).
@@ -53,6 +54,10 @@ last page and the document; pdf.py calls it in a finally.
   page, a field with no widget on page 1); only when native could not open the file are they read
   from the page's widgets, through `annotations.field_entry`, a field then hidden when each of its
   widgets on the page is Hidden or NoView (as a comment with either flag is).
+- In a tagged file (native's `tags`), each text object's fragments and each image carry the
+  /MCID and /Artifact of its content marks (`_tag`), a form's marks holding for what it draws
+  (`_walk`), as native's do; pdfium's text page puts a marked-content /ActualText in place of the
+  glyphs itself.
 - On a page whose resources name an off optional-content group (decision 3), pdfium cannot tell
   which marked text the group covers: that page's fragments come from the native interpreter.
   So do they on a page with vertical text (a column pdfium saw, or a page font whose Encoding is a
@@ -72,6 +77,8 @@ import ctypes
 import logging
 import math
 from collections import Counter
+from dataclasses import replace
+from typing import Tuple
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as raw
@@ -83,7 +90,7 @@ from ..pdfnative import annotations
 from ..pdfnative.cmap import encoding_wmode
 from ..pdfnative.objects import PDFStream
 from . import pdf as caps
-from .pdf_layout import LINE_TOLERANCE, Comment, Fragment, PageData, PageImage, text_marks, text_under
+from .pdf_layout import LINE_TOLERANCE, Comment, Fragment, PageData, PageImage, picture, text_marks, text_under
 from .pdf_tables import PDF_SEGMENTS, PathCollector
 
 FORM_DEPTH = 16                  # form XObject levels walked (pypdfium2 get_objects max_depth)
@@ -262,6 +269,25 @@ def _oc_marked(handle) -> bool:
     return False
 
 
+def _tag(handle) -> Tuple[int, bool]:
+    """(the /MCID of the innermost marked content a page object is in, or -1; whether it is in
+    /Artifact marked content), from at most OBJECT_MARKS of its content marks, outermost first."""
+    name = (raw.FPDF_WCHAR * 16)()
+    size = ctypes.c_ulong()
+    value = ctypes.c_int()
+    mcid, artifact = -1, False
+    for i in range(min(max(raw.FPDFPageObj_CountMarks(handle), 0), OBJECT_MARKS)):
+        mark = raw.FPDFPageObj_GetMark(handle, i)
+        if not mark:
+            continue
+        if (raw.FPDFPageObjMark_GetName(mark, name, ctypes.sizeof(name), size)
+                and bytes(name)[:max(0, size.value - 2)] == "Artifact".encode("utf-16-le")):
+            artifact = True
+        if raw.FPDFPageObjMark_GetParamIntValue(mark, b"MCID", ctypes.byref(value)) and value.value >= 0:
+            mcid = value.value
+    return mcid, artifact
+
+
 def _address(handle) -> int:
     return ctypes.cast(handle, ctypes.c_void_p).value or 0
 
@@ -332,7 +358,8 @@ class PdfiumDoc:
         self.decoded = 0    # pixels decoded or rendered from page images, all pages together
         self.page_count = len(self._pdf)
         if native is not None:
-            self.xfa, self.attachments = native.xfa, native.attachments
+            self.xfa, self.attachments, self.labels = native.xfa, native.attachments, native.labels
+            self.tags = native.tags
             # fields are native's, read from /AcroForm /Fields (a field with no widget too), and
             # what native's walk of them cut is counted once here
             if native.cut["field"]:
@@ -340,7 +367,10 @@ class PdfiumDoc:
         else:
             self.xfa = raw.FPDF_GetFormType(self._pdf.raw) in (raw.FORMTYPE_XFA_FULL,
                                                                raw.FORMTYPE_XFA_FOREGROUND)
-            self.attachments = raw.FPDFDoc_GetAttachmentCount(self._pdf.raw) > 0
+            self.attachments = [(self._pdf.get_attachment(i).get_name() or "attached file", None, "", None, None)
+                                for i in range(min(self._pdf.count_attachments(), annotations.ATTACHMENTS))]
+            self.labels = {}
+            self.tags = None
         self._read: set = set()
         self._unmapped_seen: set = set()  # base font names counted `glyphs` (native None)
         self._field_page: dict = {}  # full field name -> the page its entry goes on
@@ -362,9 +392,12 @@ class PdfiumDoc:
                 self._page = None
 
     def outline(self):
-        """[(depth from 1, title, 0-based page)] from get_toc(): the depth is level + 1 and the page
-        dest.get_index() (a GoTo action's destination when the item has no /Dest). At most
-        OUTLINE_ITEMS items, from at most OUTLINE_SCAN bookmarks."""
+        """native's outline, or with native None [(depth from 1, title, 0-based page, None)] from
+        get_toc(): the depth is level + 1 and the page dest.get_index() (a GoTo action's destination
+        when the item has no /Dest). At most OUTLINE_ITEMS items, from at most OUTLINE_SCAN
+        bookmarks."""
+        if self.native is not None:
+            return self.native.outline()
         out = []
         doc = self._pdf.raw
         for visited, mark in enumerate(self._pdf.get_toc(max_depth=annotations.OUTLINE_DEPTH)):
@@ -382,7 +415,7 @@ class PdfiumDoc:
                     found = raw.FPDFDest_GetDestPageIndex(doc, target) if target else -1
                     page = found if found >= 0 else None
             if page is not None:
-                out.append((mark.level + 1, title[:1_000], page))
+                out.append((mark.level + 1, title[:1_000], page, None))
         return out
 
     # -- one page
@@ -426,8 +459,12 @@ class PdfiumDoc:
                 cut["glyphs"] += 1
         chars = sum(1 for f in fragments for ch in f.text if not ch.isspace())
         collector = PathCollector()
-        drawn, whole, texts = self._walk(page, collector, cut)
+        drawn, whole, texts, held = self._walk(page, collector, cut, self.tags is not None)
         order = {i: texts[a] for a, i in objects.items() if a in texts}
+        if held and fragments is own:
+            address = {i: a for a, i in objects.items()}
+            own = fragments = [replace(f, mcid=got[0], artifact=got[1]) if got else f
+                               for f in fragments for got in (held.get(address.get(f.obj)),)]
         marks = text_marks(own) if drawn else []
 
         def under(at, image_box):
@@ -447,8 +484,7 @@ class PdfiumDoc:
 
         # an image the budget refused has no data, so pdf.py counts it `image` as it does any
         # image it cannot take
-        shown, capped = self._images(drawn, box, chars, render, renders, left, under)
-        self.decoded += budget - left[0]
+        shown, capped = self._images(drawn, box, chars, render, renders, left, under, held)
         if capped:
             cut["image"] += 1
         links, comments, fields = self._annots(page, index, cut)
@@ -457,7 +493,7 @@ class PdfiumDoc:
             self.cut.update(cut)
         return PageData(number=index + 1, box=box, rotate=turn, fragments=fragments,
                         segments=collector.segments, short=collector.short_segments, images=shown,
-                        figure=collector.figure, links=links, fields=fields, comments=comments,
+                        marks=collector.marks, links=links, fields=fields, comments=comments,
                         chars=chars, cut=cut, render=render, unmapped=unmapped)
 
     def _guessed(self, index) -> frozenset:
@@ -763,22 +799,24 @@ class PdfiumDoc:
 
     # -- page objects
 
-    def _walk(self, page, collector, cut):
+    def _walk(self, page, collector, cut, tagged=False):
         """Paths into `collector`; ([(image handle, matrix, (width, height) pixels, its place)] in
-        content order, whether every object was visited, {text object address: its place}). A
-        place is the object's count in the walk, so it orders text and images as drawn. Iterative,
-        to FORM_DEPTH form levels and pdf.PDF_PAGE_OBJECTS objects. The pixel size is read without
-        decoding."""
-        images, texts = [], {}
+        content order, whether every object was visited, {text object address: its place},
+        {text or image object address: (mcid, artifact)} when `tagged`, else {}). A place is the
+        object's count in the walk, so it orders text and images as drawn. An object's tag is its
+        own `_tag`, the /MCID of the form it is drawn in when it has none and /Artifact when it or
+        a form around it is one. Iterative, to FORM_DEPTH form levels and pdf.PDF_PAGE_OBJECTS
+        objects. The pixel size is read without decoding."""
+        images, texts, held = [], {}, {}
         whole = True
         w, h = ctypes.c_uint(), ctypes.c_uint()
         visited = 0
         points = [PATH_POINTS]
         deep = False
-        frames = [[page.raw, False, _IDENTITY, 0, 0, raw.FPDFPage_CountObjects(page.raw)]]
+        frames = [[page.raw, False, _IDENTITY, 0, 0, raw.FPDFPage_CountObjects(page.raw), (-1, False)]]
         while frames:
             frame = frames[-1]
-            parent, form, outer, depth, i, n = frame
+            parent, form, outer, depth, i, n, around = frame
             if i >= n:
                 frames.pop()
                 continue
@@ -792,10 +830,17 @@ class PdfiumDoc:
             if not obj:
                 continue
             kind = raw.FPDFPageObj_GetType(obj)
+            if kind not in (raw.FPDF_PAGEOBJ_TEXT, raw.FPDF_PAGEOBJ_PATH, raw.FPDF_PAGEOBJ_IMAGE,
+                            raw.FPDF_PAGEOBJ_FORM):
+                continue
+            tag = around
+            if tagged and kind != raw.FPDF_PAGEOBJ_PATH:
+                mcid, artifact = _tag(obj)
+                tag = (mcid if mcid >= 0 else around[0], artifact or around[1])
+                if kind != raw.FPDF_PAGEOBJ_FORM:
+                    held[_address(obj)] = tag
             if kind == raw.FPDF_PAGEOBJ_TEXT:
                 texts[_address(obj)] = visited
-                continue
-            if kind not in (raw.FPDF_PAGEOBJ_PATH, raw.FPDF_PAGEOBJ_IMAGE, raw.FPDF_PAGEOBJ_FORM):
                 continue
             m = _compose(_matrix(obj), outer)
             if kind == raw.FPDF_PAGEOBJ_PATH:
@@ -805,12 +850,12 @@ class PdfiumDoc:
                     w.value = h.value = 0
                 images.append((obj, m, (w.value, h.value), visited))
             elif depth + 1 < FORM_DEPTH:
-                frames.append([obj, True, m, depth + 1, 0, raw.FPDFFormObj_CountObjects(obj)])
+                frames.append([obj, True, m, depth + 1, 0, raw.FPDFFormObj_CountObjects(obj), tag])
             elif not deep and raw.FPDFFormObj_CountObjects(obj) > 0:
                 deep = True
                 whole = False  # a render would still draw (and decode) what lies below
                 cut["page_part"] += 1
-        return images, whole, texts
+        return images, whole, texts, held
 
     @staticmethod
     def _path(obj, m, collector, points):
@@ -848,13 +893,14 @@ class PdfiumDoc:
         op = b"B" if filled and stroke.value else b"f" if filled else b"S" if stroke.value else b"n"
         collector.operate(op, [], m)
 
-    def _images(self, drawn, crop, chars, render, renders, left, under):
+    def _images(self, drawn, crop, chars, render, renders, left, under, held):
         """(PageImages of the drawn images, whether past pdf.PDF_PAGE_IMAGES). At most PDF_PAGE_IMAGES images (the rest count `image`
         once). Bytes are not taken for images pdf.py leaves out anyway: under the size floor,
-        or the page's scan, which pdf.py renders whole. A decode or a render takes its pixels
-        from `left` (a one-item list, the page's budget): an image that would take it below
-        zero, or that needs a render on a page with none (`renders` false), is not decoded.
-        `under(place, box)` tells whether the page's text lies under the image (PageImage.under)."""
+        the page's scan, which pdf.py renders whole, or one the page's text lies under
+        (`under(place, box)`, PageImage.under), drawn there or anywhere else on the page. A JPEG's bytes are taken as they are; any other
+        image is decoded only when pdf.py calls its `load`, which takes its pixels from `left`
+        (a one-item list, the page's budget): an image that would take it below zero, or that
+        needs a render on a page with none (`renders` false), is not decoded."""
         placed = []
         capped = False
         for obj, m, px, at in drawn:
@@ -873,6 +919,8 @@ class PdfiumDoc:
             best = max(covers, default=(0.0, -1))
             if best[0] >= caps.SCAN_COVER:
                 scan = best[1]
+        beneath = [under(at, box) for _obj, box, _px, at in placed]
+        kept = {self._stream(obj) for (obj, _b, _p, _a), at in zip(placed, beneath) if at}
         shown = []
         for i, (obj, box, px, at) in enumerate(placed):
             small = (min(px) < caps.IMAGE_MIN_PX
@@ -880,27 +928,53 @@ class PdfiumDoc:
             if i == scan or small:
                 shown.append(PageImage(box, None, px, "raw"))
                 continue
-            data, kind = None, "raw"
-            try:
-                data, kind = self._image_bytes(obj, box, px, render, renders, left)
-            except _Refused:
-                data, kind = None, "raw"
-            except ReadError as e:
-                if e.kind == "timeout":
-                    raise
-            except Exception:  # noqa: BLE001 - an image that cannot be taken counts `image` in pdf.py
-                data, kind = None, "raw"
-            shown.append(PageImage(box, data, px, kind, under(at, box)))
+            if beneath[i] or (kept and self._stream(obj) in kept):
+                shown.append(PageImage(box, None, px, "raw", True))
+                continue
+            data = None
+            if px[0] * px[1] <= reader_images._MAX_PIXELS:
+                data = self._taken(lambda: (self._jpeg(obj), False))[0]
+            if data is not None:
+                shown.append(PageImage(box, data, px, "jpg"))
+                continue
+            load = (lambda obj=obj, box=box, px=px:
+                    self._taken(lambda: self._image_bytes(obj, box, px, render, renders, left)))
+            shown.append(PageImage(box, None, px, "png", load=load))
+        if held:
+            shown = [replace(im, mcid=mcid, artifact=artifact)
+                     for im, (mcid, artifact) in zip(shown, (held.get(_address(obj), (-1, False))
+                                                             for obj, _b, _p, _a in placed))]
         return shown, capped
 
     @staticmethod
-    def _image_bytes(obj, box, px, render, renders, left):
-        pixels = px[0] * px[1]
-        if pixels > reader_images._MAX_PIXELS:
-            if not renders or pixels > left[0]:
-                raise _Refused
-            left[0] -= pixels
-            return render(box, caps.CROP_DPI), "png"
+    def _stream(obj) -> bytes:
+        """The image's stream bytes as they are in the file (no decode): one image drawn twice
+        gives the same bytes."""
+        n = raw.FPDFImageObj_GetImageDataRaw(obj, None, 0)
+        if not 0 < n <= limits.IMAGE_BYTES:
+            return b""
+        buf = ctypes.create_string_buffer(n)
+        raw.FPDFImageObj_GetImageDataRaw(obj, buf, n)
+        return buf.raw[:n]
+
+    @staticmethod
+    def _taken(make):
+        """What `make` gives, or (None, False) when the image cannot be taken (pdf.py counts it
+        `image`); a timeout propagates."""
+        try:
+            return make()
+        except _Refused:
+            return None, False
+        except ReadError as e:
+            if e.kind == "timeout":
+                raise
+            return None, False
+        except Exception:  # noqa: BLE001 - an image that cannot be taken counts `image` in pdf.py
+            return None, False
+
+    @staticmethod
+    def _jpeg(obj):
+        """The JPEG bytes of an image whose last filter is DCT after simple ones, or None."""
         filters = []
         for k in range(min(raw.FPDFImageObj_GetImageFilterCount(obj), IMAGE_FILTERS)):
             n = raw.FPDFImageObj_GetImageFilter(obj, k, None, 0)
@@ -915,29 +989,42 @@ class PdfiumDoc:
                 get(obj, buf, n)
                 data = buf.raw[:n]
                 if reader_images.sniff(data) == "jpg":
-                    return data, "jpg"
+                    return data
+        return None
+
+    def _image_bytes(self, obj, box, px, render, renders, left):
+        """(PNG, False) of the image's pixels, (None, True) when they are flat, or (None, False);
+        its pixels are taken from `left` and counted in `decoded`."""
+        pixels = px[0] * px[1]
+        if pixels > reader_images._MAX_PIXELS:
+            if not renders or pixels > left[0]:
+                raise _Refused
+            left[0] -= pixels
+            self.decoded += pixels
+            return render(box, caps.CROP_DPI), False
         if pixels > left[0]:
             raise _Refused
         left[0] -= pixels
+        self.decoded += pixels
         bitmap = raw.FPDFImageObj_GetBitmap(obj)
         if not bitmap:
-            return None, "raw"
+            return None, False
         try:
             width, height = raw.FPDFBitmap_GetWidth(bitmap), raw.FPDFBitmap_GetHeight(bitmap)
             stride, fmt = raw.FPDFBitmap_GetStride(bitmap), raw.FPDFBitmap_GetFormat(bitmap)
             if width <= 0 or height <= 0 or width * height > reader_images._MAX_PIXELS or stride <= 0:
-                return None, "raw"
+                return None, False
             pointer = raw.FPDFBitmap_GetBuffer(bitmap)
             if not pointer:
-                return None, "raw"
+                return None, False
             data = ctypes.string_at(pointer, stride * height)
         finally:
             raw.FPDFBitmap_Destroy(bitmap)
         got = _rgb_rows(data, width, height, stride, fmt)
         if got is None:
-            return None, "raw"
+            return None, False
         rows, alpha = got
-        return reader_images._png(width, height, rows, alpha), "png"
+        return picture(width, height, rows, alpha)
 
     # -- renders
 
@@ -1015,7 +1102,7 @@ class PdfiumDoc:
         # the widget walk reads fields only when native could not open the file
         native = self.native
         form = self._pdf.formenv.raw if self._pdf.formenv and native is None else None
-        items, done, shown, walked = [], set(), set(), []
+        items, done, shown, walked = [], {}, set(), []
         fields = list(native.fields.get(index, [])) if native is not None else []
         for k in range(max(0, total)):
             annot = raw.FPDFPage_GetAnnot(handle, k)
@@ -1031,7 +1118,7 @@ class PdfiumDoc:
                     self._field(form, annot, index, walked, done, shown, cut)
             finally:
                 raw.FPDFPage_CloseAnnot(annot)
-        fields += [(label, text, name not in shown) for label, text, name in walked]
+        fields += [(label, text, name not in shown, box) for label, text, name, box in walked]
         return links, annotations.order_comments(items), fields
 
     def _links(self, handle):
@@ -1082,39 +1169,51 @@ class PdfiumDoc:
         return k, irt, Comment(author, text, hidden)
 
     def _field(self, form, annot, index, fields, done, shown, cut):
-        """Append (label, value, full name) of the widget's field, once per field; `shown` gets
-        the names of the fields with a widget that is neither Hidden nor NoView."""
+        """Append (label, value, full name, box) of the widget's field, once per field, `box` its
+        first widget's Rect on the page; a radio group takes its checked widget's value wherever
+        that widget comes. `done` maps a field's name to its entry's index, `shown` gets the names
+        of the fields with a widget that is neither Hidden nor NoView. A choice's options are its
+        display texts (pdfium gives no export values)."""
         kind = _FIELD_KINDS.get(raw.FPDFAnnot_GetFormFieldType(form, annot))
         if kind is None:
             return
         name = _wide(raw.FPDFAnnot_GetFormFieldName, form, annot)
         if not raw.FPDFAnnot_GetFlags(annot) & _UNSEEN:
             shown.add(name)
-        if name in done or self._field_page.get(name, index) != index:
+        if self._field_page.get(name, index) != index:
+            return
+        checked = kind in ("check", "radio") and raw.FPDFAnnot_IsChecked(form, annot)
+        if name in done and not (kind == "radio" and checked):
             return  # another widget of a field already read
+        options = ()
         if kind in ("check", "radio"):
-            if not raw.FPDFAnnot_IsChecked(form, annot):
-                return  # a radio group's checked kid may come later
             value = (_wide(raw.FPDFAnnot_GetFormFieldExportValue, form, annot)
-                     or _wide(raw.FPDFAnnot_GetFormFieldValue, form, annot))
+                     or _wide(raw.FPDFAnnot_GetFormFieldValue, form, annot)) if checked else "Off"
         else:
             value = _wide(raw.FPDFAnnot_GetFormFieldValue, form, annot)
-            if raw.FPDFAnnot_GetFormFieldType(form, annot) == raw.FPDF_FORMFIELD_LISTBOX:
-                picked = [_wide(raw.FPDFAnnot_GetOptionLabel, form, annot, i)
-                          for i in range(min(max(0, raw.FPDFAnnot_GetOptionCount(form, annot)), OPTION_LABELS))
-                          if raw.FPDFAnnot_IsOptionSelected(form, annot, i)]
-                if len(picked) > 1:
-                    value = picked
-        done.add(name)
-        self._field_page.setdefault(name, index)
+            if kind == "choice":
+                count = min(max(0, raw.FPDFAnnot_GetOptionCount(form, annot)), OPTION_LABELS)
+                labels = [_wide(raw.FPDFAnnot_GetOptionLabel, form, annot, i) for i in range(count)]
+                options = [(t, t) for t in labels[:annotations.FIELD_OPTIONS + 1]]
+                if raw.FPDFAnnot_GetFormFieldType(form, annot) == raw.FPDF_FORMFIELD_LISTBOX:
+                    picked = [labels[i] for i in range(count) if raw.FPDFAnnot_IsOptionSelected(form, annot, i)]
+                    if len(picked) > 1:
+                        value = picked
         tu = _wide(raw.FPDFAnnot_GetFormFieldAlternateName, form, annot).strip() or None
-        entry = annotations.field_entry(tu, name, value, kind)
+        entry = annotations.field_entry(tu, name, value, kind, options)
         if entry is None:
             return
         label, text, was_cut = entry
         if was_cut:
             cut["field"] += 1
-        fields.append((label, text, name))
+        if name in done:
+            fields[done[name]] = (label, text, name, fields[done[name]][3])
+            return
+        rect = raw.FS_RECTF()
+        box = _rect(rect.left, rect.bottom, rect.right, rect.top) if raw.FPDFAnnot_GetRect(annot, rect) else None
+        done[name] = len(fields)
+        self._field_page.setdefault(name, index)
+        fields.append((label, text, name, box))
 
 
 def _rgb_rows_rev(data, width, height, stride, channels):

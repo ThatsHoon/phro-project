@@ -244,7 +244,7 @@ def test_rule_segments():
     assert len(pc.segments) == 4, pc.segments
     assert sorted((s.y0, s.y1) for s in pc.segments) == [
         (300, 300), (400, 400), (401, 401), (500, 500)]
-    assert pc.figure[1] == 1  # the diagonal gave no rule segment
+    assert [rule for _b, _n, rule in pc.marks] == [True, True, False, True]  # the diagonal gave no rule segment
 
 
 def test_segment_cap():
@@ -267,9 +267,10 @@ def test_short_segments():
 def test_figure_paths():
     body = b"".join(circle(50 + 12 * i, 100 + 3 * i, 5) for i in range(40))
     pc = run(body)
-    assert pc.figure[1] == 40 and not pc.segments
-    assert pc.figure[0] == (45, 95, 50 + 12 * 39 + 5, 100 + 3 * 39 + 5)
-    assert run(text_ops("A")).figure == (None, 0)
+    assert len(pc.marks) == 40 and not pc.segments and not any(rule for _b, _n, rule in pc.marks)
+    assert pc.marks[0][0] == (45, 95, 55, 105) and pc.marks[-1][0] == (50 + 12 * 39 - 5, 100 + 3 * 39 - 5, 50 + 12 * 39 + 5, 100 + 3 * 39 + 5)
+    assert {n for _b, n, _r in pc.marks} == {4}  # a circle is four curves
+    assert run(text_ops("A")).marks == []
 
 
 def test_off_layer_paths_dropped():
@@ -286,7 +287,7 @@ def test_image_draws():
     pf, resources = load(b"", res(XObject={"Im1": Ref(30)}), {30: IMAGE})
     body = b"q 100 0 0 50 72 600 cm /Im1 Do Q /Im2 Do"
     pc = cm.interpret(pf, body, resources, {}, OCState.from_catalog(pf), box=BOX)
-    assert [(n, b) for n, b, _s, _t in pc.image_draws] == [("Im1", (72, 600, 172, 650))]
+    assert [(n, b) for n, b, _s, _t, _g in pc.image_draws] == [("Im1", (72, 600, 172, 650))]
     assert pc.image_draws[0][2] is pf.resolve(resources["XObject"]["Im1"])
     off = run(b"/OC /L1 BDC /Im1 Do EMC",
               res(XObject={"Im1": Ref(30)}, Properties={"L1": Ref(10)}),
@@ -302,7 +303,7 @@ def test_image_in_form_carries_its_own_stream():
                          {30: IMAGE, 31: other, 20: form})
     body = b"q 50 0 0 50 0 0 cm /Im0 Do Q /Fm Do"
     pc = cm.interpret(pf, body, resources, {}, OCState.from_catalog(pf), box=BOX)
-    assert [n for n, _b, _s, _t in pc.image_draws] == ["Im0", "Im0"]
+    assert [n for n, _b, _s, _t, _g in pc.image_draws] == ["Im0", "Im0"]
     assert pc.image_draws[0][2] is pf.resolve(PDFRef(30, 0)) and pc.image_draws[1][2] is pf.resolve(PDFRef(31, 0))
     assert pc.image_draws[0][2] is not pc.image_draws[1][2]
 
@@ -311,7 +312,7 @@ def test_image_in_form_clipped_to_bbox():
     form = form_xobject(b"q 10 0 0 10 20 20 cm /Im1 Do Q q 10 0 0 10 300 300 cm /Im1 Do Q")
     form.dictionary["BBox"] = [0, 0, 100, 100]
     pc = run(b"/Fm Do", res(XObject={"Fm": Ref(20), "Im1": Ref(30)}), {20: form, 30: IMAGE})
-    assert [b for _n, b, _s, _t in pc.image_draws] == [(20, 20, 30, 30)]
+    assert [b for _n, b, _s, _t, _g in pc.image_draws] == [(20, 20, 30, 30)]
 
 
 def test_form_operator_cap_counted_once():

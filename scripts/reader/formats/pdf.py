@@ -37,6 +37,19 @@ PDF_PAGE_SECONDS: it then goes late, and OCR stops there for this read, every la
 image. doc.meta["ocr"] holds the counts, and OCR_LATE joins the warnings when a page went late.
 `glyphs` leaves out the fonts first met on a page whose text OCR gave. Without a session, when the
 gray cannot be made, or when its long side is under OCR_MIN_EDGE, the page is today's.
+
+Tagged pdf (ISO 32000-1 14.8). In a tagged file (`pdfnative.tagged`, the engine's `tags`), a page
+is tagged when TAG_COVER of its visible chars, artifacts aside, lie in marked content that a block
+element of the tree owns (`_page_tags`). On a tagged page the visible artifact text
+(running heads, decoration) is said once a document as headers and footers
+(`pdf_layout.marked_running`), page numbers aside, hidden artifact text counts as hidden, and
+artifact pictures are left out; the fragments under an element with
+/ActualText become one fragment of that text; each block's fragments make lines of their own, the
+blocks in the tree's order and the lines of no block put among them by their top
+(`_tagged_lines`); ruled tables are found among the fragments of no block only (`_found`); a
+picture in a Figure takes its /Alt; and `pdf_layout.tagged_place` makes the
+headings, list items, tables and paragraphs from the block types. Any other page, and every page
+of a file that is not tagged, is read by its layout.
 """
 import math
 import time
@@ -47,7 +60,7 @@ from pathlib import Path
 
 from .. import images, limits, ocr, ocr_pixels
 from ..limits import ReadError
-from ..model import Doc, Image, Para, Section, Table, Text
+from ..model import Doc, Heading, Image, Para, Section, Table, Text
 from . import pdf_layout, pdf_tables
 
 PDF_PAGE_OBJECTS = 100_000  # page objects (text, path, image, form) interpreted per page
@@ -69,14 +82,24 @@ RENDER_DPI, CROP_DPI, RENDER_LONG = 110, 150, 1_568
 # images past the budget are not decoded (each counts `image`)
 PDF_PAGE_DECODE_PIXELS = 4 * images._MAX_PIXELS
 SCAN_COVER = 0.5            # no chars and one image covering this share of the page: a scan
-OCR_COVER = 0.8             # invisible text over an image this big is an OCR layer, read as text
 # share of a page's chars that, drawn before an image and lying on it, make the image the scan of
 # the page's text layer (PageImage.under). Corpus: a scanned pdf's pages 0.82-1.0, labels an
 # image's box reaches on other pages at most 0.027
 TEXT_UNDER = 0.5
-FIGURE_PATHS = 32           # non-rule paths that make a vector figure
-FIGURE_COVER = 0.04         # share of the page the figure's paths must cover
+FIGURE_PATHS = 32           # line and curve pieces a vector figure's paths draw
+FIGURE_COVER = 0.03         # share of the page the figure's paths must cover
+FIGURE_CELL = 12.0          # points of the grid a page's paths are grouped on: paths this near are one figure
+FIGURE_RING = 8             # pieces of a path that is a frame at most: it lies on its box's edge alone
+FIGURE_SPAN = 400           # grid cells a page is across at most
+FIGURE_WORK = 400_000       # grid cells the boxes of a page's paths may fill, together
+FIGURES_PAGE = 6            # figures one page shows apart; more are tried as one
 FIGURE_PAD = 6.0            # points added around the figure's union box
+OUTLINE_LINES = 4            # lines in a row an outline title may be set over
+FIGURE_LINE = 0.5           # lines of prose this share of a figure's width wide holding most of its text: body text
+FIGURE_ADVANCE = 1.0        # ems a char of a line of prose advances at most (spread labels advance more)
+FIGURE_SMALL = 4.0          # points under which a line is no prose: text nobody reads on the page (a miniature)
+FIGURE_CHARS = 20           # chars a line of prose holds at least when narrower than FIGURE_LINE (a column's line)
+TAG_COVER = 0.8             # share of a page's visible chars in tagged blocks that makes the page read by its tags
 TINY_PT = 1.0               # text under this size is hidden ("tiny")
 IMAGE_MIN_PX = 32           # images under this many pixels a side are left out, uncounted
 IMAGE_MIN_PT = 16.0         # images drawn under this many points a side are left out, uncounted
@@ -137,6 +160,24 @@ def _view_box(box, turn, crop):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
+def _page_box(box, turn, crop):
+    """A viewer-space box in page space: `_view_box` undone."""
+    if not turn:
+        return tuple(box)
+    x0, y0, x1, y1 = crop
+    w, h = x1 - x0, y1 - y0
+
+    def back(vx, vy):
+        if turn == 90:
+            return x0 + w - vy, y0 + vx
+        if turn == 180:
+            return x0 + w - vx, y0 + h - vy
+        return x0 + vy, y0 + h - vx
+    pts = [back(x, y) for x in (box[0], box[2]) for y in (box[1], box[3])]
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 def _view_page(turn, crop):
     """The crop box in viewer space: its width and height swap on a quarter turn."""
     if not turn:
@@ -169,6 +210,57 @@ def _text_lines(frags, width, links=()):
     return pdf_layout.reading_order(pdf_layout.lines(frags, links), width)
 
 
+def _tagged_lines(owned, frags, width, links=()):
+    """The lines of a tagged page: each block's fragments (`owned`, {mcid: (sequence, block)}) are
+    lines of their own in reading order, tagged with the block, the blocks in order of their first
+    sequence and all at the page's word gap; the lines of no block, in reading order, go before the
+    first block whose first line's top is below theirs."""
+    gap = pdf_layout.word_gap(frags)
+    groups, loose = defaultdict(list), []
+    for f in frags:
+        got = owned.get(f.mcid)
+        if got is not None and got[1] >= 0:
+            groups[got[1]].append((got[0], f))
+        else:
+            loose.append(f)
+    out = []
+    for block, got in sorted(groups.items(), key=lambda kv: min(s for s, _f in kv[1])):
+        out.extend(replace(ln, tag=block)
+                   for ln in pdf_layout.reading_order(pdf_layout.lines([f for _s, f in got], links, gap), width))
+    for ln in pdf_layout.reading_order(pdf_layout.lines(loose, links, gap), width):
+        at = next((i for i, other in enumerate(out) if other.tag >= 0 and other.box[3] < ln.box[3]
+                   and (i == 0 or out[i - 1].tag != other.tag)), len(out))
+        out.insert(at, ln)
+    return out
+
+
+def _actual(frags, owned, tags):
+    """The fragments with those under a structure element with /ActualText (the nearest one around
+    their marked content) made one fragment of that text, at the first one's place; none when the
+    text is empty."""
+    out, merged, holder = [], {}, {}
+    for f in frags:
+        got = owned.get(f.mcid)
+        if got is None:
+            out.append(f)
+            continue
+        if got[1] not in holder:
+            holder[got[1]] = next((i for i in tags.ancestors(got[1]) if tags.elements[i].actual is not None), -1)
+        el = holder[got[1]]
+        if el < 0:
+            out.append(f)
+        elif el in merged:
+            merged[el][1].append(f)
+        else:
+            merged[el] = (len(out), [f])
+            out.append(None)
+    for el, (at, span) in merged.items():
+        text = tags.elements[el].actual
+        out[at] = replace(span[0], text=text, width=pdf_layout.span_width(span), char_offsets=(),
+                          char_gaps=()) if text.strip() else None
+    return [f for f in out if f is not None]
+
+
 def _holds_text(frags, box) -> bool:
     """Whether the centre of a fragment with text lies in `box` (page space)."""
     for f in frags:
@@ -178,6 +270,153 @@ def _holds_text(frags, box) -> bool:
             if box[0] <= cx <= box[2] and box[1] <= cy <= box[3]:
                 return True
     return False
+
+
+def _figure_boxes(marks, page, tables, lines) -> list:
+    """The boxes of the page's vector figures among its path `marks` (pdf_tables.PathCollector.marks, in the frame of
+    `page`), largest first. The paths that gave no rule, but for one covering FIGURE_WHOLE of the page (a background)
+    and one inside a ruled table (`tables`, boxes, grown by pdf_tables.TOLERANCE: the squares a table's joints are
+    filled with), are grouped where they lie within a FIGURE_CELL of one another or of one rule outside the ruled
+    tables (`_groups_of`: a chart's bars meet on its axis); a group, with the pieces of the rules inside its box that
+    lie in no ruled table, is a figure by `_is_figure`. Groups whose boxes overlap are one figure when their union is one too. When no group is a
+    figure, or more than FIGURES_PAGE are, the union of all the paths is tried as one (scattered marks that make a
+    drawing together)."""
+    def within(a, b):
+        return b[0] <= a[0] and b[1] <= a[1] and a[2] <= b[2] and a[3] <= b[3]
+
+    def union(a, b):
+        return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
+
+    def whole(box, pieces):
+        return pieces + sum(n for b, n in ruled if within(b, box))
+    grown = [(t[0] - pdf_tables.TOLERANCE, t[1] - pdf_tables.TOLERANCE, t[2] + pdf_tables.TOLERANCE,
+              t[3] + pdf_tables.TOLERANCE) for t in tables]
+    paths = [(b, n, rule) for b, n, rule in marks
+             if _cover(b, page) < limits.FIGURE_WHOLE and not any(within(b, t) for t in (tables if rule else grown))]
+    if not any(not rule for _b, _n, rule in paths):
+        return []
+    ruled = [(b, n) for b, n, rule in marks if rule and not any(within(b, t) for t in tables)]
+    lines = [((ln.box[0] + ln.box[2]) / 2, (ln.box[1] + ln.box[3]) / 2, len(ln.text), ln.box[2] - ln.box[0],
+              ln.size >= FIGURE_SMALL and ln.box[2] - ln.box[0] <= FIGURE_ADVANCE * ln.size * len(ln.text))
+             for ln in lines]
+    found = []
+    for box, pieces in _groups_of(paths, page):
+        if _cover(box, page) >= FIGURE_COVER and _is_figure(box, whole(box, pieces), page, lines):
+            found.append((box, pieces))
+    merged, left = True, FIGURE_WORK
+    while merged:
+        merged = False
+        for i, (a, n) in enumerate(found):
+            for j in range(i + 1, len(found)):
+                b, m = found[j]
+                if not (a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]):
+                    continue
+                left -= len(lines) + 1
+                if left < 0:
+                    break
+                if _is_figure(union(a, b), n + m, page, lines):
+                    found[i] = (union(a, b), n + m)
+                    del found[j]
+                    merged = True
+                    break
+            if merged or left < 0:
+                break
+    found = [box for box, _n in found]
+    if found and len(found) <= FIGURES_PAGE:
+        return sorted(found, key=lambda f: -(f[2] - f[0]) * (f[3] - f[1]))
+    box, pieces = None, 0
+    for b, n, rule in paths:
+        if not rule:
+            box, pieces = b if box is None else union(box, b), pieces + n
+    return [box] if _is_figure(box, whole(box, pieces), page, lines) else []
+
+
+def _cell(x, y, page):
+    return (max(0, min(int((x - page[0]) // FIGURE_CELL), FIGURE_SPAN)),
+            max(0, min(int((y - page[1]) // FIGURE_CELL), FIGURE_SPAN)))
+
+
+def _is_figure(box, pieces, page, lines) -> bool:
+    """Whether a group of paths in `box` drawing `pieces` line and curve pieces is a figure: FIGURE_PATHS pieces or
+    more, FIGURE_COVER of the page or more, and lines of prose (`lines` at least FIGURE_LINE of its width wide or of
+    FIGURE_CHARS chars or more, whose chars advance at most FIGURE_ADVANCE ems each) hold no more than half the chars
+    of the lines whose centre lies in it (else it is a box of body text, or icons beside columns of it). A line
+    smaller than FIGURE_SMALL is text of the drawing and no prose."""
+    if pieces < FIGURE_PATHS or _cover(box, page) < FIGURE_COVER:
+        return False
+    chars = wide = 0
+    across = FIGURE_LINE * (box[2] - box[0])
+    for x, y, n, width, set_close in lines:
+        if box[0] <= x <= box[2] and box[1] <= y <= box[3]:
+            chars += n
+            if set_close and (width >= across or n >= FIGURE_CHARS):
+                wide += n
+    return wide * 2 <= chars
+
+
+def _groups_of(paths, page) -> list:
+    """(box, pieces) of each group of `paths` ((box, pieces, rule) each) that holds a path that is no rule: its box
+    and pieces are those of its paths that are no rules. Two paths
+    are in one group when their boxes, laid on a grid of FIGURE_CELL points, share a cell or hold neighbouring ones;
+    a rule, and a path of up to FIGURE_RING pieces (a frame), lies on the cells of its box's edge alone. The cells
+    of all the boxes are at most FIGURE_WORK; past them the paths left make one group."""
+    parent = list(range(len(paths)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    owner, left, rest = {}, FIGURE_WORK, None
+    for i, (b, n, rule) in enumerate(paths):
+        (x0, y0), (x1, y1) = _cell(b[0], b[1], page), _cell(b[2], b[3], page)
+        ring = (rule or n <= FIGURE_RING) and x1 - x0 > 1 and y1 - y0 > 1
+        left -= 2 * (x1 - x0 + y1 - y0) if ring else (x1 - x0 + 1) * (y1 - y0 + 1)
+        if left < 0:
+            rest = i if rest is None else rest
+            parent[root(i)] = root(rest)
+            continue
+        if ring:
+            at = [(x, y) for x in range(x0, x1 + 1) for y in (y0, y1)] + [(x, y) for y in range(y0, y1 + 1) for x in (x0, x1)]
+        else:
+            at = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+        for c in at:
+            j = owner.setdefault(c, i)
+            if j != i:
+                parent[root(i)] = root(j)
+    for (x, y), i in owner.items():
+        for near in ((x + 1, y), (x, y + 1), (x + 1, y + 1), (x + 1, y - 1)):
+            j = owner.get(near)
+            if j is not None and root(i) != root(j):
+                parent[root(i)] = root(j)
+    groups = {}
+    for i, (b, n, rule) in enumerate(paths):
+        if rule:
+            continue
+        got = groups.get(root(i))
+        groups[root(i)] = (b, n) if got is None else (
+            (min(got[0][0], b[0]), min(got[0][1], b[1]), max(got[0][2], b[2]), max(got[0][3], b[3])), got[1] + n)
+    return list(groups.values())
+
+
+def _middle(box, turn, crop) -> float:
+    """The height in viewer space of the middle of a page-space box, or -inf (the page's end) for None: a field or an
+    attached file goes after the line its widget sits on."""
+    if box is None:
+        return -math.inf
+    vb = _view_box(box, turn, crop)
+    return (vb[1] + vb[3]) / 2
+
+
+def _attachment(name, size, kind) -> Para:
+    """`Attached file: name (size bytes, media type)` of an embedded file."""
+    about = ", ".join(x for x in (f"{size} bytes" if size is not None else "", kind) if x)
+    return Para([Text(f"Attached file: {_one_line(name)}" + (f" ({about})" if about else ""))])
+
+
+def _label(label, number) -> str:
+    """The page section's title from its page label: `p. <label>`, none when the label is the page number."""
+    return f"p. {_one_line(label)}" if label and label.strip() and label.strip() != str(number) else ""
 
 
 def _unturned(box, turn):
@@ -200,6 +439,7 @@ class _Kept:
     def __init__(self, number, view):
         self.number = number
         self.view = view          # the crop box in viewer space
+        self.turn, self.crop = 0, view
         self.lines = []
         self.items = []           # (top, x, seq, block): tables, images and renders
         self.hidden = []          # hidden Paras, one per text object
@@ -208,6 +448,9 @@ class _Kept:
         self.pending = None       # (ticket, png, alt, whole) of a page sent to OCR, its image not placed yet
         self.links = []           # the page's links, kept for its OCR text
         self.glyphs = (0, 0)      # (`glyphs` counted on this page, glyphs it showed without Unicode)
+        self.tags = None          # {mcid: (sequence, block)} of a tagged page (`_page_tags`), else None
+        self.artifacts = []       # the visible /Artifact lines of a tagged page, in viewer space
+        self.alts = {}            # {Figure element: /Alt} of the page's figures no picture took
         self.ocr_read = False     # its text came from OCR
 
 
@@ -306,10 +549,16 @@ class _Reader:
             self.ctx.skipped["attachment"] = 1
         if not kept and not stopped:
             raise ReadError("damaged", "no readable pages")
+        if kept:
+            files = [a for a in native.attachments if a[3] is None]
+            kept[0].items.extend((math.inf, -math.inf, -3 - k, _attachment(name, size, kind))
+                                 for k, (name, size, kind, _page, _box) in enumerate(files))
         doc.headers, doc.footers, kept = self._after(kept)
         if not kept and not stopped:
             raise ReadError("damaged", "no readable pages")
-        doc.blocks = [Section("page", number=k.number, blocks=k.blocks, comments=k.comments)
+        labels = getattr(native, "labels", {})
+        doc.blocks = [Section("page", number=k.number, blocks=k.blocks, comments=k.comments,
+                              title=_label(labels.get(k.number - 1), k.number))
                       for k in kept]
         doc.meta.update(engine=self.engine, pages_total=count, unrendered=self.unrendered, figures=self.figures)
         return doc
@@ -335,12 +584,17 @@ class _Reader:
         turn = pdf_layout.upright_turn(pd.fragments, _turn(pd.rotate))
         view = _view_page(turn, pd.box)
         keep = _Kept(pd.number, view)
+        keep.turn, keep.crop = turn, pd.box
         keep.glyphs = (pd.cut.get("glyphs", 0), pd.unmapped)
-        keep.comments = ([Para([Text(f"Field {_one_line(label)}: {value}")], hidden="hidden" if hidden else "")
-                          for label, value, hidden in pd.fields]
-                         + [Para([Text(f"Comment by {_one_line(c.author)}: {_one_line(c.text)}" if c.author
-                                       else f"Comment: {_one_line(c.text)}")],
-                                 hidden="hidden" if c.hidden else "") for c in pd.comments])
+        keep.comments = [Para([Text(f"Comment by {_one_line(c.author)}: {_one_line(c.text)}" if c.author
+                                    else f"Comment: {_one_line(c.text)}")],
+                              hidden="hidden" if c.hidden else "") for c in pd.comments]
+        for k, (label, value, hidden, box) in enumerate(pd.fields):
+            para = Para([Text(f"Field {_one_line(label)}: {value}")], hidden="hidden" if hidden else "")
+            keep.items.append((_middle(box, turn, pd.box), 0.0, 3000 + k, para))
+        files = [a for a in getattr(self.native, "attachments", ()) if a[3] == index]
+        for k, (name, size, kind, _page, box) in enumerate(files):
+            keep.items.append((_middle(box, turn, pd.box), 0.0, 3500 + k, _attachment(name, size, kind)))
         scan = None
         unmapped = pd.unmapped > pd.chars  # mostly glyphs without Unicode: an image, like a scan
         if pd.chars == 0 or unmapped:
@@ -348,7 +602,7 @@ class _Reader:
             best = max(covers, default=(0.0, -1))
             if best[0] >= SCAN_COVER:
                 scan = pd.images[best[1]]
-        state = {"frags": [], "ocr": set(), "links": [], "read": _text_lines}
+        state = {"frags": [], "links": [], "read": _text_lines}
         steps = (lambda: self._text(pd, turn, keep, state),
                  lambda: self._tables(pd, turn, keep, state),
                  lambda: self._images(pd, turn, keep, state, scan),
@@ -362,12 +616,42 @@ class _Reader:
 
     # -- steps
 
+    def _page_tags(self, index, frags):
+        """{mcid: (walk sequence, block element)} of the page's marked content when the page is
+        tagged (TAG_COVER of its visible chars, artifacts aside, in a block, and the artifacts no more
+        chars than the rest: a page drawn mostly as artifacts reads by its layout), else None."""
+        tags = getattr(self.native, "tags", None)
+        if tags is None:
+            return None
+        owned = {mcid: (seq, tags.block(el)) for mcid, (seq, el) in tags.page(index).items()}
+        if not owned:
+            return None
+        total = covered = aside = 0
+        for f in frags:
+            if f.hidden:
+                continue
+            n = sum(1 for ch in f.text if not ch.isspace())
+            if f.artifact:
+                aside += n
+                continue
+            total += n
+            got = owned.get(f.mcid)
+            covered += n if got is not None and got[1] >= 0 else 0
+        return owned if total and covered >= TAG_COVER * total and aside <= total else None
+
     def _text(self, pd, turn, keep, state):
         frags = sorted(pd.fragments, key=lambda f: f.order)
-        frags, ocr = self._hide(frags, pd.box, pd.images)
+        frags = self._hide(frags, pd.box, pd.images)
         frags = self._chars(frags)
+        keep.tags = self._page_tags(pd.number - 1, frags)
+        if keep.tags is not None:
+            owned = keep.tags
+            aside = [f for f in frags if f.artifact and not f.hidden]
+            keep.artifacts = pdf_layout.lines(pdf_layout.rotate_into_view(aside, turn, pd.box))
+            frags = _actual([f for f in frags if f.hidden or not f.artifact], owned, self.native.tags)
+            state["read"] = lambda visible, width, links=(): _tagged_lines(owned, visible, width, links)
         view = pdf_layout.rotate_into_view(frags, turn, pd.box)
-        state["frags"], state["ocr"] = view, ocr
+        state["frags"] = view
         state["links"] = [(_view_box(b, turn, pd.box), url) for b, url in pd.links]
         self._layout(keep, state)
         groups = defaultdict(list)
@@ -385,9 +669,9 @@ class _Reader:
 
     def _hide(self, frags, box, images):
         """The hidden rules, in page space: ocg as given, then offcrop, tiny and invisible.
-        Invisible text whose centre lies on an image is read; an image of OCR_COVER or more
-        under such text is an OCR layer's scan, left out uncounted."""
-        out, ocr = [], set()
+        Invisible text whose centre lies on an image is read (the image is then `under` the
+        page's text, an OCR layer's scan, left out by `_images`)."""
+        out = []
         for f in frags:
             kind = f.hidden
             if not kind:
@@ -398,13 +682,11 @@ class _Reader:
                     kind = "tiny"
                 elif f.invisible:
                     cx, cy = (fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2
-                    under = [i for i, im in enumerate(images)
-                             if im.box[0] <= cx <= im.box[2] and im.box[1] <= cy <= im.box[3]]
-                    if not under:
+                    if not any(im.box[0] <= cx <= im.box[2] and im.box[1] <= cy <= im.box[3]
+                               for im in images):
                         kind = "invisible"
-                    ocr.update(i for i in under if _cover(images[i].box, box) >= OCR_COVER)
             out.append(replace(f, hidden=kind) if kind != f.hidden else f)
-        return out, ocr
+        return out
 
     def _chars(self, frags):
         total = 0
@@ -423,34 +705,59 @@ class _Reader:
         self._found(keep, state, view(pd.segments), view(pd.short))
 
     def _found(self, keep, state, segments, short):
-        """The ruled tables of `segments` over the page's fragments, placed as items; their words
-        leave the lines."""
-        found = pdf_tables.tables(segments, state["frags"], keep.number, self.budget,
+        """The ruled tables of `segments` over the page's fragments, on a tagged page over those of
+        no block only (the tree gives the rest its tables), placed as items; their words leave the
+        lines."""
+        frags = state["frags"]
+        if keep.tags is not None:
+            frags = [f for f in frags if keep.tags.get(f.mcid, (0, -1))[1] < 0]
+        found = pdf_tables.tables(segments, frags, keep.number, self.budget,
                                   self.ctx.skipped, short=short, model=self.model)
         used = set()
         for k, got in enumerate(found):
             used |= set(got.used)
-            keep.items.append((got.bbox[3], got.bbox[0], k, got.table))
+            keep.items.append((got.bbox[3], got.bbox[0], k, got.table, got.bbox[2]))
+            state.setdefault("tables", []).append(got.bbox)
         if used:
             state["frags"] = [f for f in state["frags"] if f.order not in used]
             self._layout(keep, state)
 
     def _images(self, pd, turn, keep, state, scan):
-        under = {im.data for im in pd.images if im.under}
+        """The page's pictures as items. Decision 8: one the page's text lies under (a scan under
+        its text layer), one of a single colour and one drawn wholly outside the page's crop are
+        left out, uncounted; a picture's pixels are decoded and encoded only once it is chosen."""
         shown = []
+        crop = pd.box
+        tags = self.native.tags if keep.tags is not None else None
+        figures = {}
+        if tags is not None:
+            for _seq, el in keep.tags.values():
+                figure = tags.nearest(el, ("Figure",))
+                if figure >= 0 and tags.elements[figure].alt:
+                    figures[figure] = tags.elements[figure].alt
         for i, im in enumerate(pd.images):
-            if im is scan or i in state["ocr"]:
+            if im is scan or im.under or (tags is not None and im.artifact):
+                continue
+            if im.box[2] <= crop[0] or im.box[0] >= crop[2] or im.box[3] <= crop[1] or im.box[1] >= crop[3]:
                 continue
             w, h = im.box[2] - im.box[0], im.box[3] - im.box[1]
             if min(im.px) < IMAGE_MIN_PX or min(w, h) < IMAGE_MIN_PT:
                 continue
-            if im.data is None or self.image_bytes + len(im.data) > limits.IMAGE_BYTES:
+            data, flat = im.picture()
+            if flat:
+                continue
+            if data is None or self.image_bytes + len(data) > limits.IMAGE_BYTES:
                 self.ctx.skipped["image"] += 1
                 continue
-            self.image_bytes += len(im.data)
+            self.image_bytes += len(data)
+            alt = ""
+            if tags is not None and im.mcid in keep.tags:
+                figure = tags.nearest(tags.page(pd.number - 1)[im.mcid][1], ("Figure",))
+                alt = figures.pop(figure, "") if figure >= 0 else ""
             vb = _view_box(im.box, turn, pd.box)
-            shown.append((vb[3], vb[0], 1000 + i, Image(im.data, ocr="page" if im.data in under else "")))
+            shown.append((vb[3], vb[0], 1000 + i, Image(data, alt=alt), vb[2]))
         keep.items.extend(shown)
+        keep.alts = figures
 
     def _render(self, make):
         """Bytes of one render, or None past PDF_RENDERS or the image bytes cap, or when the
@@ -491,7 +798,7 @@ class _Reader:
                     g = self._gray(lambda: pd.render(None, limits.OCR_DPI, gray=True))
                 box = pd.box
             elif not unmapped:
-                data = self._render(lambda: scan.data)  # native: the page's own image
+                data = self._render(lambda: scan.picture()[0])  # native: the page's own image
                 if data and self.ocr is not None and not self.ocr_stopped:
                     g = self._gray(lambda: _decoded(data, self.ocr.deadline - limits.FIGURE_RESERVE))
                 box = scan.box
@@ -513,25 +820,44 @@ class _Reader:
             keep.pending = (ticket, data, alt, pd.render is not None)
             keep.links = state["links"]
             return
-        box, paths = pd.figure
-        if box is None or paths < FIGURE_PATHS or _cover(box, pd.box) < FIGURE_COVER:
-            return
-        crop = pd.box
-        grown = (max(crop[0], box[0] - FIGURE_PAD), max(crop[1], box[1] - FIGURE_PAD),
-                 min(crop[2], box[2] + FIGURE_PAD), min(crop[3], box[3] + FIGURE_PAD))
-        whole = _cover(grown, crop) > limits.FIGURE_WHOLE or (pd.chars == 0 and not pd.images)
-        target = None if whole else grown
+        crop, view = pd.box, keep.view
+        marks = [(_view_box(box, turn, crop), pieces, rule) for box, pieces, rule in pd.marks]
+        for box in _figure_boxes(marks, view, state.get("tables", ()), keep.lines):
+            if self._figure(pd, turn, keep, box):
+                break
+
+    def _figure(self, pd, turn, keep, box) -> bool:
+        """One of the page's vector figures (`box` in viewer space): its render placed at its top, between the lines of its
+        column, and the lines whose centre lies in it moved out of the page's text into one `Figure text:` after it,
+        rendered or not. A figure over FIGURE_WHOLE of the page renders the page whole and keeps the page's text:
+        True then, the page's last figure."""
+        crop, view = pd.box, keep.view
+        grown = (max(view[0], box[0] - FIGURE_PAD), max(view[1], box[1] - FIGURE_PAD),
+                 min(view[2], box[2] + FIGURE_PAD), min(view[3], box[3] + FIGURE_PAD))
+        whole = _cover(grown, view) > limits.FIGURE_WHOLE or (pd.chars == 0 and not pd.images)
+        target = None if whole else _page_box(grown, turn, crop)
         data = None
         if pd.render is not None:
             data = self._render(lambda: pd.render(target, _dpi(target or crop, CROP_DPI)))
-        if not data:
+        if data:
+            own = self.ocr is not None and _holds_text(pd.fragments, target or crop)
+            top = math.inf if whole else grown[3]
+            keep.items.append((top, grown[0], -1, Image(data, ocr="page" if own else ""), grown[2]))
+            self.figures.append(pd.number)
+        else:
             self.unrendered.append(pd.number)
             self.ctx.skipped["figure"] += 1
-            return
-        top = math.inf if whole else _view_box(grown, turn, crop)[3]
-        own = self.ocr is not None and _holds_text(pd.fragments, target or crop)
-        keep.items.append((top, 0.0, -1, Image(data, ocr="page" if own else "")))
-        self.figures.append(pd.number)
+        if whole:
+            return True
+        inside = [i for i, ln in enumerate(keep.lines)
+                  if grown[0] <= (ln.box[0] + ln.box[2]) / 2 <= grown[2]
+                  and grown[1] <= (ln.box[1] + ln.box[3]) / 2 <= grown[3]]
+        if inside:
+            text = " / ".join(" ".join(keep.lines[i].text.split()) for i in inside)
+            keep.items.append((grown[3], grown[0], 0, Para([Text("Figure text: " + text)]), grown[2]))
+            drop = set(inside)
+            keep.lines = [ln for i, ln in enumerate(keep.lines) if i not in drop]
+        return False
 
     # -- after the loop
 
@@ -574,9 +900,9 @@ class _Reader:
         page, n = r.page, k.number
         w, h = page.w * 72.0 / dpi, page.h * 72.0 / dpi
         new = _Kept(n, (0.0, 0.0, w, h))
-        new.items = [(*it[:3], replace(it[3], ocr="page")) if whole and isinstance(it[3], Image) else it
+        new.items = [(*it[:3], replace(it[3], ocr="page"), *it[4:]) if whole and isinstance(it[3], Image) else it
                      for it in k.items if not isinstance(it[3], Table)]
-        state = {"frags": ocr_layout.fragments(page, dpi), "ocr": set(), "links": k.links, "read": ocr_layout.read}
+        state = {"frags": ocr_layout.fragments(page, dpi), "links": k.links, "read": ocr_layout.read}
         self._layout(new, state)
         self._found(new, state, ocr_layout.segments(r.rules, page, dpi), [])
         new.items.append((math.inf, -math.inf, -2, Para([Text(ocr_layout.SCANNED)])))
@@ -607,19 +933,22 @@ class _Reader:
 
     def _after(self, kept):
         headers, footers, drops = pdf_layout.running([k.lines for k in kept], [k.view for k in kept])
+        pdf_layout.marked_running([k.artifacts for k in kept], [k.view for k in kept], headers, footers)
         for k, drop in zip(kept, drops):
             if drop:
                 k.lines = [ln for i, ln in enumerate(k.lines) if i not in drop]
         outline = defaultdict(list)
         try:
-            for depth, title, page in self.native.outline():
-                outline[page].append((depth, _norm(title)))
+            for depth, title, page, top in self.native.outline():
+                outline[page].append((depth, _norm(title), title, top))
         except ReadError as e:
             if e.kind == "timeout":
                 raise
         except Exception:
             pass  # no outline: the size rule alone makes headings
-        body = pdf_layout.body_size([ln for k in kept for ln in k.lines])
+        every = [ln for k in kept for ln in k.lines]
+        body = pdf_layout.body_size(every)
+        body = body, pdf_layout.heading_floor(every, body)
         done = []
         for k in kept:
             # a page whose headings or paragraphs fail is lost alone (`page`), as in the loop
@@ -629,21 +958,43 @@ class _Reader:
         return headers, footers, done
 
     def _page_blocks(self, k, titles, body):
-        levels = {}
+        """The page's blocks: an outline title that is the text of up to OUTLINE_LINES lines in a row (spaces
+        aside) makes them a heading of the outline's level; one matching none is a heading of its own, where its
+        destination's top is, else at the page's top."""
+        levels, items = {}, list(k.items)
         if titles:
-            at = defaultdict(list)  # normalized line text -> its line indexes, last first
-            for i in range(len(k.lines) - 1, -1, -1):
-                at[_norm(k.lines[i].text)].append(i)
-            for depth, title in titles:
-                found = at.get(title)
+            keys = ["".join(ln.text.split()).casefold() for ln in k.lines]
+            at = defaultdict(list)  # the text of up to OUTLINE_LINES lines, spaces aside -> (first, last), last first
+            for i in range(len(keys) - 1, -1, -1):
+                text = ""
+                for j in range(i, min(i + OUTLINE_LINES, len(keys))):
+                    text += keys[j]
+                    at[text].append((i, j))
+            for n, (depth, norm, title, top) in enumerate(titles):
+                found = at.get(norm.replace(" ", ""), [])
+                while found and any(i in levels for i in range(found[-1][0], found[-1][1] + 1)):
+                    found.pop()
                 if found:
-                    levels[found.pop()] = pdf_layout.outline_level(depth)
+                    first, last = found.pop()
+                    levels.update(dict.fromkeys(range(first, last + 1), pdf_layout.outline_level(depth)))
+                    continue
+                y = math.inf
+                if top is not None and not k.ocr_read:
+                    y = _view_point(k.crop[0], top, k.turn, k.crop)[1] if k.turn in (0, 180) else math.inf
+                heading = Heading(pdf_layout.outline_level(depth), [Text(_one_line(title))])
+                items.append((y, -math.inf, -10_000 + n, heading))
         for i, ln in enumerate(k.lines):
             if i not in levels:
-                level = pdf_layout.heading_level(ln.text, ln.size, body)
+                level = pdf_layout.heading_level(ln.text, ln.size, *body)
                 if level is not None:
                     levels[i] = level
-        return pdf_layout.place(k.lines, k.items, levels, self.model) + k.hidden
+        if k.tags is not None:
+            order = {}
+            for seq, block in k.tags.values():
+                order[block] = min(seq, order.get(block, seq))
+            return pdf_layout.tagged_place(k.lines, items, levels, self.model, self.native.tags, order,
+                                           dict(k.alts)) + k.hidden
+        return pdf_layout.place(k.lines, items, levels, self.model) + k.hidden
 
 
 def parse_bytes(data, ctx, *, engine="native", pages=None, clock=time.monotonic, started=None) -> Doc:

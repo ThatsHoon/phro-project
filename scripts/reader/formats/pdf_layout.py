@@ -7,10 +7,11 @@ hidden kind. `writing_direction`, `along` and `across` are dochan's.
 
 The layout half is after dochan 1.21.0 (MIT): `SpacingModel` and `load_model` are pdf/spacing.py
 (the table is `pdf_spacing.json`, dochan's korean_spacing.json byte for byte); the line join
-(`join_break`) and the paragraph merge are pdf/layout.py `merge_lines`, with a 1.5 x gap rule
-and no full-line rule; `running` is pdf/running.py `detect_running` over line indexes; the
-heading size ratios are pdf/reader.py:85-100. Glyph gaps, link runs, vertical columns and the
-column fallback (`xps._columns`) are this reader's own.
+(`join_break`) and the paragraph merge are pdf/layout.py `merge_lines`, with no full-line rule;
+`running` is pdf/running.py `detect_running` over line indexes; the heading size ratios are
+pdf/reader.py:85-100. The word gap and the body pitch measured on each page (`word_gap`,
+`pitch`), link runs, vertical columns and the column fallback (`xps._columns`) are this reader's
+own.
 
 Page space is y up. Every loop here runs over the fragments and lines the caller holds, which
 are capped upstream. Sorts are O(n log n); line building, joins and `running` are linear.
@@ -27,7 +28,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..model import Heading, Link, Para, Text
+from .. import images, limits
+from ..model import Cell, Heading, Link, ListItem, Para, Table, Text
 from . import xps
 
 
@@ -62,6 +64,8 @@ class Fragment:
     char_gaps: tuple = ()
     # Drawn with a vertical font (WMode 1): its glyphs stand upright and advance down the page.
     vertical: bool = False
+    mcid: int = -1          # the marked-content id it is drawn in (ISO 32000-1 14.6), -1 for none
+    artifact: bool = False  # drawn inside /Artifact marked content
 
 
 def writing_direction(frag: Fragment) -> str:
@@ -98,12 +102,43 @@ def across(frag: Fragment) -> float:
 class PageImage:
     """One image on a page: its box, its viewable bytes (or None) and its pixel size.
     `kind` is "jpg", "png", "jpx", "ccitt", "jbig2" or "raw". `under`: the page's own text lies
-    under it (`text_under`), as an OCR layer lies on its scan, so OCR would read that text again."""
+    under it (`text_under`), as an OCR layer lies on its scan, so its pixels are not taken.
+    `load`, when set, decodes the samples only when called and gives what `picture` gives.
+    `mcid` and `artifact` are its marked content's, as a Fragment's."""
     box: Tuple[float, float, float, float]
     data: Optional[bytes]
     px: Tuple[int, int]
     kind: str
     under: bool = False
+    load: Optional[Callable] = None
+    mcid: int = -1
+    artifact: bool = False
+
+    def picture(self):
+        """(bytes or None, flat): `data`, or the PNG `load` decodes and encodes; flat is True for
+        a picture of one colour, which has no bytes."""
+        return (self.data, False) if self.load is None else self.load()
+
+
+def flat(rows, span: int) -> bool:
+    """Whether every channel of 8-bit `rows` (`span` bytes a pixel) stays within
+    limits.OCR_FLAT levels: a picture of one colour."""
+    low, high = [255] * span, [0] * span
+    for row in rows:
+        for c in range(span):
+            line = row[c::span]
+            if line:
+                low[c], high[c] = min(low[c], min(line)), max(high[c], max(line))
+                if high[c] - low[c] > limits.OCR_FLAT:
+                    return False
+    return True
+
+
+def picture(width: int, height: int, rows, alpha: bool):
+    """(PNG at zlib level 1, False) of RGB (or RGBA) rows, or (None, True) when they are flat."""
+    if flat(rows, 4 if alpha else 3):
+        return None, True
+    return images._png(width, height, rows, alpha, 1), False
 
 
 def text_marks(frags):
@@ -145,8 +180,9 @@ class PageData:
     """Everything the reader takes from one page.
 
     `box` is the crop box in page space; `short` the sub-1-unit rule pieces kept for the
-    short-dash supplement; `figure` is (union box or None, non-rule path count); `links` is
-    [(box, url)], `fields` [(label, value, hidden)]; `cut` counts what a cap dropped; `render` is
+    short-dash supplement; `marks` are (box, pieces, rule) of the painted paths
+    (`pdf_tables.PathCollector.marks`); `links` is
+    [(box, url)], `fields` [(label, value, hidden, box or None)]; `cut` counts what a cap dropped; `render` is
     (box, dpi) -> png bytes or None; `unmapped` counts the glyphs dropped for having no Unicode.
     """
     number: int
@@ -156,7 +192,7 @@ class PageData:
     segments: list = field(default_factory=list)
     short: list = field(default_factory=list)
     images: List[PageImage] = field(default_factory=list)
-    figure: tuple = (None, 0)
+    marks: list = field(default_factory=list)
     links: list = field(default_factory=list)
     fields: list = field(default_factory=list)
     comments: List[Comment] = field(default_factory=list)
@@ -291,10 +327,23 @@ def load_model(path=None) -> SpacingModel:
 
 # ---- lines
 
-GAP = 0.2        # a gap over this many sizes between two glyphs is a space
+GAP = 0.2
+GAP_FLOOR = 0.08
+GAP_CEIL = 1.0
+GAP_BIN = 0.02
+GAP_SAMPLES = 32
+GAP_WORDS = 8
+GAP_SPACES = 0.5
 UPWARD = 0.3     # reading order is rebuilt when this share of line steps go up
 LINE_TOLERANCE = 0.5   # fragments within this many sizes of one baseline are one line
-PARA_GAP = 1.5   # a baseline step over this many line heights ends a paragraph
+LEADING = 1.2
+PARA_GAP = 1.25
+PITCH_BIN = 0.05
+PITCH_MAX = 2.0
+PITCH_SAMPLES = 3
+FIT_SLACK = 2    # chars past a first word that must fit after a line for it to have been ended
+LIST_MARK = re.compile(r"[•◦▪▫‣⁃●○■□]|\d{1,3}[.)]")
+TIER_STEP = 1.25  # a step of over this many sizes between rows of vertical glyphs, none of any column between, parts tiers
 # a table-of-contents entry's ending, read on a line's last TOC_TAIL chars, its trailing space
 # stripped: a leader of TOC_LEADER_DOTS dots or more (TOC_DOTS counts each mark; marks may mix,
 # and stand a single space apart), a gap of TOC_GAP, then a page label (TOC_LABEL): arabic, a
@@ -329,6 +378,8 @@ class Line:
     size: float
     order: int
     vertical: bool = False
+    direction: str = "ltr"
+    tag: int = -1   # the structure element whose block it is, on a tagged page (`tagged_place`)
 
 
 def _unit(x, y, default):
@@ -424,22 +475,28 @@ def _glyph_urls(f, grid):
     return out
 
 
-def _chars_of(f, urls, spaces=True):
+def _chars_of(f, urls, gap, spaces=True):
     """[(char, url)] of one fragment, with a space before each glyph whose `char_gaps` entry is
-    over GAP x the size, when neither side is a space."""
+    over `gap` x the size, when neither side is a space."""
     n = len(f.text)
     gaps = f.char_gaps if len(f.char_gaps) == n else ()
     out = []
     for k, ch in enumerate(f.text):
-        if (spaces and gaps and k and gaps[k] > GAP * f.size
+        if (spaces and gaps and k and gaps[k] > gap * f.size
                 and ch != " " and f.text[k - 1] != " "):
             out.append((" ", urls[k] if urls and urls[k] == urls[k - 1] else ""))
         out.append((ch, urls[k] if urls else ""))
     return out
 
 
+def _plain(ch: str) -> str:
+    """A mathematical alphanumeric symbol (U+1D400-1D7FF, and U+210E, the italic h that block
+    leaves to Letterlike Symbols) as the letter or digit it styles."""
+    return unicodedata.normalize("NFKC", ch) if "\U0001d400" <= ch <= "\U0001d7ff" or ch == "ℎ" else ch
+
+
 def _runs(chars):
-    """Chars as trimmed (text, url) runs."""
+    """Chars as trimmed (text, url) runs, mathematical alphanumerics as plain letters."""
     a, b = 0, len(chars)
     while a < b and chars[a][0].isspace():
         a += 1
@@ -447,6 +504,7 @@ def _runs(chars):
         b -= 1
     runs = []
     for ch, url in chars[a:b]:
+        ch = _plain(ch)
         if runs and runs[-1][1] == url:
             runs[-1][0].append(ch)
         else:
@@ -458,7 +516,7 @@ def _make_line(frags, chars, vertical=False):
     runs = _runs(chars)
     main = max(frags, key=lambda f: len(f.text))
     return Line("".join(t for t, _ in runs), runs, box_of(frags), main.size,
-                min(f.order for f in frags), vertical)
+                min(f.order for f in frags), vertical, writing_direction(main))
 
 
 def _glyphs(f, urls):
@@ -476,14 +534,14 @@ def _glyphs(f, urls):
     return out
 
 
-def _pieces(f, urls):
+def _pieces(f, urls, gap):
     """[(start, end, [(char, url)], size)]: the fragment's words along the reading axis, split
-    where a glyph's gap is over GAP x the size, with the spaces at their edges trimmed."""
+    where a glyph's gap is over `gap` x the size, with the spaces at their edges trimmed."""
     n = len(f.text)
     gaps = f.char_gaps if len(f.char_gaps) == n else ()
     out, cur = [], []
     for k, g in enumerate(_glyphs(f, urls) + [None]):
-        if g is None or (k and gaps and gaps[k] > GAP * f.size):
+        if g is None or (k and gaps and gaps[k] > gap * f.size):
             while cur and cur[-1][2].isspace():
                 cur.pop()
             if cur:
@@ -494,12 +552,12 @@ def _pieces(f, urls):
     return out
 
 
-def _piece_chars(pieces):
-    """[(char, url)] of pieces sorted by start: a space between two where the gap is over GAP x
+def _piece_chars(pieces, gap):
+    """[(char, url)] of pieces sorted by start: a space between two where the gap is over `gap` x
     the later one's size."""
     out, end = [], None
     for start, stop, chars, size in pieces:
-        if end is not None and start - end > GAP * size:
+        if end is not None and start - end > gap * size:
             out.append((" ", chars[0][1] if out[-1][1] == chars[0][1] else ""))
         out.extend(chars)
         end = stop if end is None else max(end, stop)
@@ -510,9 +568,10 @@ class _Row:
     """A line being built: its fragments in content order, its span along the reading axis and,
     once a fragment was drawn out of reading order, the word pieces of all of them by start."""
 
-    def __init__(self, f, urls, direction, anchor):
+    def __init__(self, f, urls, direction, anchor, gap):
         s = along(f)
-        self.frags, self.parts, self.chars = [f], [(f, urls)], _chars_of(f, urls)
+        self.gap = gap
+        self.frags, self.parts, self.chars = [f], [(f, urls)], _chars_of(f, urls, gap)
         self.direction, self.anchor = direction, anchor
         self.lo, self.hi, self.end = s, s + f.width, s + f.width
         self.starts = None   # piece starts, sorted; None while the row is in reading order
@@ -520,7 +579,7 @@ class _Row:
 
     def index(self):
         if self.starts is None:
-            self.pieces = sorted((p for f, urls in self.parts for p in _pieces(f, urls)),
+            self.pieces = sorted((p for f, urls in self.parts for p in _pieces(f, urls, self.gap)),
                                  key=lambda p: p[0])
             self.starts = [p[0] for p in self.pieces]
 
@@ -557,13 +616,13 @@ class _Row:
         placed text over itself, which is then left out."""
         if self.starts is None:
             s = along(f)
-            if (s - self.end > GAP * f.size and self.chars[-1][0] != " "
+            if (s - self.end > self.gap * f.size and self.chars[-1][0] != " "
                     and not f.text[0].isspace()):
                 same = self.chars[-1][1] == (urls[0] if urls else "")
                 self.chars.append((" ", self.chars[-1][1] if same else ""))
-            self.chars.extend(_chars_of(f, urls))
+            self.chars.extend(_chars_of(f, urls, self.gap))
         else:
-            pieces = _pieces(f, urls)
+            pieces = _pieces(f, urls, self.gap)
             if not self.free(pieces):
                 return self.repeats(pieces)
             self._place(pieces)
@@ -584,7 +643,7 @@ class _Row:
             if (self.lo - (s + f.width) > GUTTER * max(f.size, near)
                     or abs(f.size - near) > SIZE_TOLERANCE):
                 return False
-        pieces = _pieces(f, urls)
+        pieces = _pieces(f, urls, self.gap)
         if not self.free(pieces):
             return self.repeats(pieces)
         self._place(pieces)
@@ -600,7 +659,7 @@ class _Row:
                 <= LINE_TOLERANCE * max(other.frags[0].size, self.frags[0].size)):
             return False
         self.index()
-        pieces = [p for f, urls in other.parts for p in _pieces(f, urls)]
+        pieces = [p for f, urls in other.parts for p in _pieces(f, urls, self.gap)]
         if len(self.starts) + len(pieces) > LINE_PIECES or not self.free(pieces):
             return False
         self._place(pieces)
@@ -609,15 +668,99 @@ class _Row:
         return True
 
     def line_chars(self):
-        return self.chars if self.starts is None else _piece_chars(self.pieces)
+        return self.chars if self.starts is None else _piece_chars(self.pieces, self.gap)
 
 
-def lines(fragments, links=()) -> List[Line]:
+def _em_gaps(frags):
+    """The glyph gaps of fragments in content order, in sizes: each `char_gaps` entry between two
+    glyphs that are no spaces, and the gap from a fragment to the next one on its baseline."""
+    out, prev = [], None
+    for f in frags:
+        size = abs(f.size)
+        if size <= 0 or not math.isfinite(size):
+            prev = None
+            continue
+        n = len(f.text)
+        if len(f.char_gaps) == n:
+            out.extend(f.char_gaps[k] / size for k in range(1, n)
+                       if not f.text[k].isspace() and not f.text[k - 1].isspace())
+        if (prev is not None and writing_direction(prev) == writing_direction(f)
+                and not prev.text[-1].isspace() and not f.text[0].isspace()):
+            near = max(size, abs(prev.size))
+            gap = along(f) - (along(prev) + prev.width)
+            if abs(across(f) - across(prev)) <= LINE_TOLERANCE * near and gap >= -LINE_TOLERANCE * near:
+                out.append(gap / near)
+        prev = f
+    return out
+
+
+def _mode(bins):
+    return max(bins, key=lambda b: (bins[b], -b))
+
+
+def word_gap(fragments) -> float:
+    """The gap, in sizes, over which two glyphs of these fragments stand a word apart, split from
+    their own gaps (`_em_gaps`): binned by GAP_BIN, the most common bin is the gap between the
+    letters of a word, and the most common bin from GAP_FLOOR up and two bins clear of it the
+    gap between words. The threshold is the middle of the longest empty run of bins between the
+    two, else of the emptiest bin, and never under GAP_FLOOR. Gaps past GAP_CEIL (a column
+    gutter, a tab) are left out. With under GAP_SAMPLES gaps, under GAP_WORDS from GAP_FLOOR up,
+    space glyphs as many as GAP_SPACES of those (the text sets its words apart itself, so its
+    other gaps are letter spacing), or a most common gap of GAP_FLOOR or more (the fragments are
+    words, as OCR gives them, and no gap is a letter gap), it is GAP."""
+    frags = sorted((f for f in fragments if f.text and not f.hidden), key=lambda f: f.order)
+    values = [v for v in _em_gaps(frags) if -GAP_CEIL <= v <= GAP_CEIL]
+    if len(values) < GAP_SAMPLES:
+        return GAP
+    bins = Counter(math.floor(v / GAP_BIN) for v in values)
+    letters = _mode(bins)
+    if letters * GAP_BIN >= GAP_FLOOR:
+        return GAP
+    floor = max(letters + 2, math.ceil(GAP_FLOOR / GAP_BIN - 1e-9))
+    above = Counter({b: n for b, n in bins.items() if b >= floor})
+    wide = sum(above.values())
+    if wide < GAP_WORDS or sum(ch.isspace() for f in frags for ch in f.text) >= GAP_SPACES * wide:
+        return GAP
+    words = _mode(above)
+    runs, start = [], None
+    for b in range(letters + 1, words + 1):
+        if b < words and not bins.get(b):
+            start = b if start is None else start
+        elif start is not None:
+            runs.append((b - start, -start))
+            start = None
+    if runs:
+        width, start = max(runs)
+        middle = (-start + width / 2) * GAP_BIN
+    else:
+        low = min(range(letters + 1, words), key=lambda b: (bins.get(b, 0), b))
+        middle = (low + 0.5) * GAP_BIN
+    return max(GAP_FLOOR, middle)
+
+
+def _stacked(frags) -> set:
+    """The ids of the one-glyph fragments that stand in a column: each next in content order to
+    another one-glyph fragment at its x, up to 1.5 sizes below it."""
+    out = set()
+    for a, b in zip(frags, frags[1:]):
+        if len(a.text.strip()) != 1 or len(b.text.strip()) != 1:
+            continue
+        size = max(abs(a.size), abs(b.size))
+        if abs(a.x - b.x) <= LINE_TOLERANCE * size and 0 < a.y - b.y <= 1.5 * size:
+            out.update((id(a), id(b)))
+    return out
+
+
+def lines(fragments, links=(), gap=None, whole=True) -> List[Line]:
     """Lines in content order: consecutive fragments of one direction on one baseline are one
-    line. A space goes between two glyphs when the gap is over GAP x the size and neither side
-    is a space. Vertical writing comes last, as `vertical_lines`: the fragments of vertical fonts
-    that run down the page and, beside them, other fragments that do (Latin set inside vertical
-    text). Other text running down the page is read as lines like any other.
+    line. A space goes between two glyphs when the gap is over `gap` x the size (when None, the
+    `word_gap` of these fragments) and neither side is a space. Vertical writing comes last, as
+    `vertical_lines`: on a page with vertical fonts, the fragments that run down the page and the
+    one-glyph fragments stacked in a column (`_stacked`: a horizontal font's glyphs placed one by
+    one down a column, among a vertical font's punctuation). Other text running down the page is
+    read as lines like any other. A line that goes on along the one before it (a piece set off by
+    a superscript or a font change) is one line with it (`_whole`), unless `whole` is False: each
+    line then lies in one row.
 
     A fragment that starts before the last one ended (a row whose cells are drawn right cell
     first, words drawn into the gaps a later string leaves) joins the line as `_Row.take_back`
@@ -628,10 +771,12 @@ def lines(fragments, links=()) -> List[Line]:
     `links` is [(box, url)]; a character whose centre lies in a link box carries its url.
     """
     frags = sorted((f for f in fragments if f.text and not f.hidden), key=lambda f: f.order)
+    gap = word_gap(frags) if gap is None else gap
     grid = _LinkGrid(links) if links else None
     out, vertical = [], []
     row, last = None, None
     columns = any(f.vertical and writing_direction(f) == "down" for f in frags)
+    stacked = _stacked(frags) if columns else set()
 
     def flush(row, last):
         """Emit the row; returns it, or None when it holds no text."""
@@ -647,7 +792,7 @@ def lines(fragments, links=()) -> List[Line]:
 
     for f in frags:
         d = writing_direction(f)
-        if d == "down" and (f.vertical or columns):
+        if (d == "down" and (f.vertical or columns)) or id(f) in stacked:
             vertical.append(f)
             continue
         a, s = across(f), along(f)
@@ -661,29 +806,51 @@ def lines(fragments, links=()) -> List[Line]:
                 joined = row.take_back(f, urls, s)
         if not joined:
             last = flush(row, last)
-            row = _Row(f, urls, d, a)
+            row = _Row(f, urls, d, a, gap)
         row.lo, row.hi, row.end = min(row.lo, s), max(row.hi, s + f.width), s + f.width
     flush(row, last)
-    return out + vertical_lines(vertical, links)
+    return (_whole(out) if whole else out) + vertical_lines(vertical, links)
+
+
+def _tiers(frags) -> list:
+    """The fragments by tier, top first: the bands of the page that their glyph origins cover,
+    parted where the step from one row of glyphs to the next, in all columns, is over TIER_STEP
+    sizes (the empty row between the tiers of a page set in vertical columns)."""
+    spans = []
+    for f in frags:
+        n = len(f.text)
+        last = f.char_offsets[n - 1] if len(f.char_offsets) == n + 1 else f.width * (n - 1) / n
+        _ux, uy = _unit(f.dir_x, f.dir_y, (1.0, 0.0))
+        spans.append((max(f.y, f.y + uy * last), min(f.y, f.y + uy * last), f))
+    spans.sort(key=lambda s: (-s[0], s[2].order))
+    tiers, low = [], 0.0
+    for top, bottom, f in spans:
+        if not tiers or low - top > TIER_STEP * f.size:
+            tiers.append([])
+            low = bottom
+        tiers[-1].append(f)
+        low = min(low, bottom)
+    return tiers
 
 
 def vertical_lines(fragments, links=()) -> List[Line]:
-    """Columns right to left, the characters of each from the top down, one Line per column.
-    No spaces are added inside a column."""
-    frags = [f for f in fragments if f.text and not f.hidden]
+    """Tiers top down (`_tiers`), in each the columns right to left, the characters of each from
+    the top down, one Line per column. No spaces are added inside a column."""
     grid = _LinkGrid(links) if links else None
-    frags.sort(key=lambda f: (-f.x, -f.y, f.order))
-    columns, anchor = [], 0.0
-    for f in frags:
-        if columns and anchor - f.x <= LINE_TOLERANCE * max(f.size, columns[-1][-1].size):
-            columns[-1].append(f)
-        else:
-            columns.append([f])
-            anchor = f.x
+    columns = []
+    for tier in _tiers([f for f in fragments if f.text and not f.hidden]):
+        tier.sort(key=lambda f: (-f.x, -f.y, f.order))
+        start, anchor = len(columns), 0.0
+        for f in tier:
+            if len(columns) > start and anchor - f.x <= LINE_TOLERANCE * max(f.size, columns[-1][-1].size):
+                columns[-1].append(f)
+            else:
+                columns.append([f])
+                anchor = f.x
     out = []
     for col in columns:
         col.sort(key=lambda f: (-f.y, f.order))
-        chars = [c for f in col for c in _chars_of(f, _glyph_urls(f, grid), spaces=False)]
+        chars = [c for f in col for c in _chars_of(f, _glyph_urls(f, grid), GAP, spaces=False)]
         if any(not c[0].isspace() for c in chars):
             out.append(_make_line(col, chars, vertical=True))
     return out
@@ -766,52 +933,153 @@ def toc_entry(text: str) -> bool:
     return False
 
 
-def paragraphs(lns, model) -> List[Para]:
-    """Paragraphs: a baseline step over PARA_GAP x the line height (or a step that does not go
-    forward) starts a new one, and a table-of-contents entry (`toc_entry`) ends its own. Links
-    become Link inlines; nothing is bold."""
-    groups, cur, prev = [], [], None
+def _step(prev, ln):
+    """The baseline step from one line to the next, in sizes, or None between a vertical and a
+    horizontal line."""
+    if ln.vertical != prev.vertical:
+        return None
+    step = prev.box[0] - ln.box[0] if ln.vertical else prev.box[1] - ln.box[1]
+    return step / max(prev.size, ln.size, 1e-9)
+
+
+def pitch(lns) -> Tuple[float, float]:
+    """(horizontal, vertical) body pitch of a page's lines, in sizes: the most common baseline
+    step in PITCH_BIN bins, each step weighted by the chars of its line (a stack of one-glyph
+    lines does not outweigh the text), as the median of the steps in that bin. A direction with
+    under PITCH_SAMPLES steps of up to PITCH_MAX sizes has LEADING."""
+    out = []
+    for vertical in (False, True):
+        steps = []
+        for a, b in zip(lns, lns[1:]):
+            if a.vertical == vertical and b.vertical == vertical:
+                st = _step(a, b)
+                if st is not None and 0 < st <= PITCH_MAX:
+                    steps.append((st, len(b.text.strip()) or 1))
+        if len(steps) < PITCH_SAMPLES:
+            out.append(LEADING)
+            continue
+        bins = Counter()
+        for st, w in steps:
+            bins[math.floor(st / PITCH_BIN)] += w
+        top = _mode(bins)
+        out.append(float(statistics.median(st for st, _ in steps if math.floor(st / PITCH_BIN) == top)))
+    return out[0], out[1]
+
+
+def _breaks(prev, ln, body) -> bool:
+    """Whether a block ends between two lines: a step over PARA_GAP x the body pitch `body`
+    ((horizontal, vertical), as `pitch` gives it), or one that does not go forward."""
+    step = _step(prev, ln)
+    return step is None or step <= 0 or step > PARA_GAP * body[1 if ln.vertical else 0]
+
+
+ALONG_SPACE = 0.15
+
+
+def _along(prev, ln) -> bool:
+    """Whether `ln` goes on along the visual line of `prev`: on its baseline within half a size,
+    starting where it ends, under a size apart (a piece set off by a superscript or a font change)."""
+    step = _step(prev, ln)
+    if step is None or abs(step) >= 0.5 or prev.direction != "ltr" or ln.direction != "ltr":
+        return False
+    gap = prev.box[1] - ln.box[3] if ln.vertical else ln.box[0] - prev.box[2]
+    return -0.5 * prev.size < gap < prev.size
+
+
+def _whole(lns) -> list:
+    """`lns` with each line that goes on along the one before it (`_along`) made one line with it, a space between
+    them when they are over ALONG_SPACE of the smaller one's size apart. The line has the size of the piece with the
+    most chars (a large number or initial before the body's words does not make a heading of them)."""
+    out, chain = [], []
+
+    def close():
+        if len(chain) > 1:
+            first = chain[0]
+            runs, box = list(first.runs), first.box
+            for prev, ln in zip(chain, chain[1:]):
+                if ln.box[0] - prev.box[2] > ALONG_SPACE * min(prev.size, ln.size) and not ln.vertical:
+                    runs.append((" ", ""))
+                runs.extend(ln.runs)
+                box = (min(box[0], ln.box[0]), min(box[1], ln.box[1]), max(box[2], ln.box[2]), max(box[3], ln.box[3]))
+            out[-1] = replace(first, text="".join(t for t, _ in runs), runs=runs, box=box,
+                              size=max(chain, key=lambda ln: len(ln.text)).size)
+        chain.clear()
+    reach = None
     for ln in lns:
-        if prev is not None and cur:
-            if ln.vertical != prev.vertical:
-                step = None
-            elif ln.vertical:
-                step = prev.box[0] - ln.box[0]
-            else:
-                step = prev.box[1] - ln.box[1]
-            if step is None or step <= 0 or step > PARA_GAP * max(prev.size, ln.size):
-                groups.append(cur)
-                cur = []
+        if chain and _along(reach, ln):
+            reach = replace(reach, box=(min(reach.box[0], ln.box[0]), min(reach.box[1], ln.box[1]),
+                                        max(reach.box[2], ln.box[2]), max(reach.box[3], ln.box[3])))
+        else:
+            close()
+            out.append(ln)
+            reach = ln
+        chain.append(ln)
+    close()
+    return out
+
+
+def _ended(prev, ln, right) -> bool:
+    """Whether `prev` was ended rather than wrapped before `ln`: `ln` starts with a list marker
+    (LIST_MARK: a bullet, or a number of up to 3 digits closed by `.` or `)`), or past the end of
+    `prev`, up to `right` (the right end of its block's lines so far and of `ln`), is room for
+    the first word of `ln` (its first char in Han or Kana) and FIT_SLACK chars more, at the mean
+    char width of `ln`. Horizontal left-to-right lines only."""
+    words = ln.text.split()
+    if prev.vertical or ln.vertical or prev.direction != "ltr" or ln.direction != "ltr" or not words:
+        return False
+    if LIST_MARK.fullmatch(words[0]):
+        return True
+    char = (ln.box[2] - ln.box[0]) / max(1, len(ln.text))
+    first = words[0][:1] if _is_han_kana(words[0][0]) else words[0]
+    return right - prev.box[2] > (len(first) + FIT_SLACK) * char
+
+
+def _joined(group, model) -> list:
+    """The lines of one block as inlines, joined by `join_break`; a run with a url is a Link."""
+    runs: List[Tuple[str, str]] = []
+    for ln in group:
+        if runs:
+            drop, sep = _join_parts(runs[-1][0], ln.text, model)
+            if drop:
+                t, u = runs.pop()
+                if t[:-1]:
+                    runs.append((t[:-1], u))
+            if sep:
+                runs.append((sep, ""))
+        runs.extend(ln.runs)
+    merged: List[Tuple[str, str]] = []
+    for t, u in runs:
+        if merged and merged[-1][1] == u:
+            merged[-1] = (merged[-1][0] + t, u)
+        elif t:
+            merged.append((t, u))
+    return [Link(u, [Text(t)]) if u else Text(t) for t, u in merged]
+
+
+def paragraphs(lns, model, body=None) -> List[Para]:
+    """Paragraphs of `_groups`. Links become Link inlines; nothing is bold."""
+    return [Para(got) for got in (_joined(group, model) for group in _groups(lns, body)) if got]
+
+
+def _groups(lns, body=None) -> list:
+    """The lines of each paragraph: a baseline step over PARA_GAP x the body pitch `body` (the
+    `pitch` of these lines when None), a step that does not go forward, or a line that was ended
+    rather than wrapped (`_ended`) starts a new one; a table-of-contents entry (`toc_entry`) ends its own."""
+    body = pitch(lns) if body is None else body
+    groups, cur, prev, right = [], [], None, -math.inf
+    for ln in lns:
+        if prev is not None and cur and (_breaks(prev, ln, body) or _ended(prev, ln, max(right, ln.box[2]))):
+            groups.append(cur)
+            cur, right = [], -math.inf
         cur.append(ln)
+        right = max(right, ln.box[2])
         prev = ln
         if toc_entry(ln.text):
             groups.append(cur)
             cur = []
     if cur:
         groups.append(cur)
-    out = []
-    for group in groups:
-        runs: List[Tuple[str, str]] = []
-        for ln in group:
-            if runs:
-                drop, sep = _join_parts(runs[-1][0], ln.text, model)
-                if drop:
-                    t, u = runs.pop()
-                    if t[:-1]:
-                        runs.append((t[:-1], u))
-                if sep:
-                    runs.append((sep, ""))
-            runs.extend(ln.runs)
-        merged: List[Tuple[str, str]] = []
-        for t, u in runs:
-            if merged and merged[-1][1] == u:
-                merged[-1] = (merged[-1][0] + t, u)
-            elif t:
-                merged.append((t, u))
-        inlines = [Link(u, [Text(t)]) if u else Text(t) for t, u in merged]
-        if inlines:
-            out.append(Para(inlines))
-    return out
+    return groups
 
 
 def inlines(ln) -> list:
@@ -819,52 +1087,226 @@ def inlines(ln) -> list:
     return [Link(u, [Text(t)]) if u else Text(t) for t, u in ln.runs if t]
 
 
+def _slot(lns, item) -> int:
+    """The index of the line `item` goes before. An item (top, x0, seq, block, x1) goes before the first line of its
+    column (a line whose x range meets x0..x1) whose top is below its own top, else after the last line of its column;
+    one with no x1, or whose x range meets no line, before the first line whose top is below its top."""
+    top = item[0]
+    if len(item) > 4:
+        x0, x1 = item[1], item[4]
+        last = None
+        for i, ln in enumerate(lns):
+            if ln.box[0] < x1 and ln.box[2] > x0:
+                if ln.box[3] < top:
+                    return i
+                last = i
+        if last is not None:
+            return last + 1
+    return next((i for i, ln in enumerate(lns) if ln.box[3] < top), len(lns))
+
+
 def place(lns, items, levels, model) -> list:
-    """Headings and paragraphs in line order, with each item placed before the first line whose top is below its own
-    top. `items` are (top, x, seq, block); `levels` maps a line index to its heading level."""
-    items = sorted(items, key=lambda it: (-it[0], it[1], it[2]))
-    out, run, n = [], [], 0
+    """Headings and paragraphs in line order, with each item placed by `_slot`, items of one slot by top, then x, then
+    seq; an item slotted inside a paragraph goes after it. `items` are (top, x, seq, block) or (top, x0, seq, block,
+    x1); `levels` maps a line index to its heading level. Paragraphs break by the `pitch` of all the lines; consecutive
+    lines of one level within a paragraph's step of each other and at a size within SIZE_TOLERANCE are one heading (a
+    title that wraps)."""
+    slots = defaultdict(list)
+    for it in sorted(items, key=lambda it: (-it[0], it[1], it[2])):
+        slots[_slot(lns, it)].append(it)
+    body = pitch(lns)
+    out, run, head, held = [], [], [], {}
 
     def flush():
-        out.extend(paragraphs(run, model))
+        start = 0
+        for group in _groups(run, body):
+            end = start + len(group)
+            out.extend(it[3] for it in held.get(start, ()))
+            got = _joined(group, model)
+            if got:
+                out.append(Para(got))
+            out.extend(it[3] for at in range(start + 1, end) for it in held.get(at, ()))
+            start = end
         run.clear()
+        held.clear()
+        if head:
+            out.append(Heading(levels[head[0][0]], _joined([ln for _, ln in head], model)))
+            head.clear()
 
     for i, ln in enumerate(lns):
-        while n < len(items) and items[n][0] > ln.box[3]:
-            flush()
-            out.append(items[n][3])
-            n += 1
+        if i in slots:
+            if run and not head and i not in levels:
+                held[len(run)] = slots[i]
+            else:
+                flush()
+                out.extend(it[3] for it in slots[i])
         if i in levels:
-            flush()
-            out.append(Heading(levels[i], inlines(ln)))
+            if head and not (levels[head[-1][0]] == levels[i] and head[-1][0] == i - 1
+                             and abs(head[-1][1].size - ln.size) <= SIZE_TOLERANCE
+                             and not _breaks(head[-1][1], ln, body)):
+                flush()
+            elif run:
+                flush()
+            head.append((i, ln))
         else:
+            if head:
+                flush()
             run.append(ln)
     flush()
-    out.extend(it[3] for it in items[n:])
+    out.extend(it[3] for it in slots.get(len(lns), ()))
     return out
 
 
 # ---- headings
 
 def body_size(all_lines) -> float:
-    """The median line size."""
-    sizes = [ln.size for ln in all_lines if ln.size > 0]
-    return float(statistics.median(sizes)) if sizes else 0.0
+    """The size the median char is set in, chars other than spaces counted: how the text is cut
+    into lines (a tagged table's cells, each its own line) moves no body."""
+    sizes = sorted((ln.size, sum(1 for ch in ln.text if not ch.isspace())) for ln in all_lines if ln.size > 0)
+    half, seen = sum(n for _s, n in sizes) / 2, 0
+    for size, n in sizes:
+        seen += n
+        if seen >= half and seen:
+            return float(size)
+    return 0.0
 
 
-def heading_level(text: str, size: float, body: float) -> Optional[int]:
-    """3 at 1.5 x the body size, 4 at 1.25 x; none for a long line or one with under 2 letters."""
+HEAD_STEP = 1.15    # x the body size a rare size starts at to be a heading's
+HEAD_SHARE = 0.03   # of a document's chars set at a size or above it: under it the size is rare
+HEAD_CHARS = 60     # chars of a line that is a heading by a rare size under 1.25 x the body
+
+
+def heading_floor(all_lines, body: float) -> float:
+    """The smallest size from HEAD_STEP x `body` up at which and above which under HEAD_SHARE of
+    the chars (spaces aside) are set, for `heading_level`; 1.25 x the body when there is none."""
+    sizes = Counter()
+    for ln in all_lines:
+        if ln.size > 0:
+            sizes[ln.size] += sum(1 for ch in ln.text if not ch.isspace())
+    most, seen, floor = HEAD_SHARE * sum(sizes.values()), 0, body * 1.25
+    for size in sorted(sizes, reverse=True):
+        seen += sizes[size]
+        if size < body * HEAD_STEP or seen > most:
+            break
+        floor = min(floor, size)
+    return floor
+
+
+def heading_level(text: str, size: float, body: float, floor: Optional[float] = None) -> Optional[int]:
+    """3 at 1.5 x the body size, 4 at 1.25 x, and 4 for a line of up to HEAD_CHARS chars from
+    `floor` (`heading_floor`) up; none for a long line or one with under 2 letters."""
     if body <= 0 or size <= 0 or len(text) > 120 or sum(c.isalpha() for c in text) < 2:
         return None
     if size >= body * 1.5:
         return 3
-    if size >= body * 1.25:
+    if size >= body * 1.25 or (floor is not None and size >= floor and len(text) <= HEAD_CHARS):
         return 4
     return None
 
 
 def outline_level(depth: int) -> int:
     return min(6, depth + 2)
+
+
+# ---- tagged pages
+
+def span_width(frags) -> float:
+    """The width from the first fragment's start to the farthest end of `frags`, along the first's
+    direction: the width of one fragment that stands for them all."""
+    first = frags[0]
+    norm = math.hypot(first.dir_x, first.dir_y) or 1.0
+    ends = [((f.x - first.x) * first.dir_x + (f.y - first.y) * first.dir_y) / norm + f.width for f in frags]
+    return max(0.0, max(ends))
+
+
+def _marker(text: str) -> Tuple[str, str]:
+    """(list marker, text left in the item) of a list label: a number like `1.` or `2)` is the
+    marker, a bullet glyph gives `-`, any other label stays in the item's text after `-`."""
+    label = text.strip()
+    if re.fullmatch(r"\d{1,4}[.)]", label):
+        return label, ""
+    if len(label) <= 2 and not any(ch.isalnum() for ch in label):
+        return "-", ""
+    return "-", label
+
+
+def tagged_place(lns, items, levels, model, tags, order, alts) -> list:
+    """The blocks of a tagged page (ISO 32000-1 14.8.4), its lines in structure order: each run of
+    lines with one `tag` is that block element's, and its type makes the block. A heading type is a
+    Heading (H1-H6 at `outline_level` of their number, H and Title as H1), and so is a P whose
+    lines all have one outline level in `levels` (a tree that tags its headings as paragraphs); a
+    list item's label and body are a ListItem, its level the number of lists around it less one,
+    its marker the label's (`_marker`); the first cell of a table makes its Table from the tree's
+    rows that hold the page's cells (`tags.rows`), each cell its own lines' text, a TH a header
+    cell, /RowSpan and /ColSpan kept; a Figure with an /Alt that no picture took (`alts`, {figure
+    element: alt}) gives `Figure: <alt>` before its own text, or, with no lines on the page, at
+    its place in structure order (`order`, {block: walk sequence}); any other block is one Para of
+    its lines. Lines of no block (tag -1) are read by `place` with their outline `levels`. Items
+    go where `_slot` puts them, as in `place`."""
+    slots = defaultdict(list)
+    for it in sorted(items, key=lambda it: (-it[0], it[1], it[2])):
+        slots[_slot(lns, it)].append(it)
+    of = defaultdict(list)
+    for ln in lns:
+        of[ln.tag].append(ln)
+    pending = sorted((order.get(f, math.inf), f) for f in alts if f not in of)
+    out, tables, labels = [], set(), {}
+
+    def figure_alt(f):
+        out.append(Para([Text("Figure: " + alts.pop(f))]))
+
+    i = 0
+    while i < len(lns):
+        tag = lns[i].tag
+        j = i
+        while j < len(lns) and lns[j].tag == tag:
+            j += 1
+        for x in range(i, j):
+            out.extend(it[3] for it in slots.get(x, ()))
+        while pending and tag >= 0 and pending[0][0] < order.get(tag, math.inf):
+            figure_alt(pending.pop(0)[1])
+        group = lns[i:j]
+        i = j
+        if tag < 0:
+            run = {k: levels[n] for k, n in enumerate(range(j - len(group), j)) if n in levels}
+            out.extend(place(group, [], run, model))
+            continue
+        kind = tags.elements[tag].kind
+        inl = _joined(group, model)
+        level = {levels.get(n) for n in range(j - len(group), j)}
+        if kind == "P" and len(level) == 1 and None not in level:
+            out.append(Heading(level.pop(), inl))
+        elif kind in ("Title", "H", "H1", "H2", "H3", "H4", "H5", "H6"):
+            out.append(Heading(outline_level(int(kind[1:]) if kind[1:].isdigit() else 1), inl))
+        elif kind == "Lbl":
+            item = tags.nearest(tag, ("LI",))
+            nxt = lns[j].tag if j < len(lns) else -1
+            if item >= 0 and nxt >= 0 and tags.nearest(nxt, ("LI",)) == item and tags.elements[nxt].kind != "Lbl":
+                labels[item] = "".join(ln.text + " " for ln in group).strip()
+            else:
+                out.append(ListItem(max(0, tags.depth(tag, "L") - 1), "-", inl))
+        elif kind in ("LBody", "LI"):
+            marker, rest = _marker(labels.pop(tags.nearest(tag, ("LI",)), ""))
+            out.append(ListItem(max(0, tags.depth(tag, "L") - 1), marker,
+                                ([Text(rest + " ")] if rest else []) + inl))
+        elif kind in ("TD", "TH") and tags.nearest(tag, ("Table",)) >= 0:
+            table = tags.nearest(tag, ("Table",))
+            if table not in tables:
+                tables.add(table)
+                cells = [c for c in of if c >= 0 and tags.elements[c].kind in ("TD", "TH")]
+                rows = [[Cell([Para(_joined(of[c], model))] if of.get(c) else [], *tags.elements[c].span,
+                              header=tags.elements[c].kind == "TH") for c in row]
+                        for row in tags.rows(table, cells)]
+                if any(cell.blocks for row in rows for cell in row):
+                    out.append(Table([row for row in rows if row]))
+        else:
+            if kind == "Figure" and tag in alts:
+                figure_alt(tag)
+            out.append(Para(inl))
+    out.extend(it[3] for it in slots.get(len(lns), ()))
+    for _seq, f in pending:
+        figure_alt(f)
+    return out
 
 
 # ---- running headers and footers
@@ -928,9 +1370,40 @@ def _margin_gap_ok(items, block, zone):
     return gap >= MARGIN_GAP_FACTOR * max(ln.size for _, ln in block)
 
 
+def _side_lines(items, box):
+    """(index, Line) of the lines turned along the page (running up or down in a horizontal font)
+    that lie wholly in the left or right EDGE_FRACTION of its width: a margin notice."""
+    span = (box[2] - box[0]) * EDGE_FRACTION
+    return [(i, ln) for i, ln in items if ln.direction in ("up", "down") and _readable(ln)
+            and (ln.box[2] <= box[0] + span or ln.box[0] >= box[2] - span)]
+
+
+def _key(text: str) -> str:
+    """A running line's text with its numbers as #, when letters are left to tell it apart (a
+    page number inside a header); a line of numbers alone stays as it is."""
+    keyed = _DIGITS.sub("#", text)
+    return keyed if sum(ch.isalpha() for ch in keyed) >= 3 else text
+
+
+def marked_running(pages, boxes, headers, footers):
+    """Add to `headers` and `footers` the /Artifact lines of tagged pages (`pages`, each page's lines
+    in its `boxes` view), each text once a document by its `_key`: a line in the upper half of its
+    page is a header. Page-number lines and the texts already there are left out."""
+    seen = {_key(_normal(t)) for t in headers + footers}
+    for page, box in zip(pages, boxes):
+        for ln in sorted(page, key=lambda ln: -ln.box[1]):
+            text = _normal(ln.text)
+            if not text or _PAGE_NUMBER.fullmatch(text) or _key(text) in seen:
+                continue
+            seen.add(_key(text))
+            (headers if 2 * ln.box[1] > box[1] + box[3] else footers).append(ln.text)
+
+
 def running(pages, boxes) -> Tuple[List[str], List[str], List[set]]:
     """(headers, footers, drops): the repeated header and footer texts at their first page,
-    and for each page the indexes of its lines to drop. Page-number lines are dropped when they
+    and for each page the indexes of its lines to drop. A line repeats when its text, numbers
+    read as # (`_key`), comes back on the pages, in the top or bottom edge block or turned in a
+    side margin (`_side_lines`, kept with the headers). Page-number lines are dropped when they
     count up from page to page, and never become a header or footer."""
     drops = [set() for _ in pages]
     text_pages = sum(1 for p in pages if any(not ln.vertical and ln.text for ln in p))
@@ -939,16 +1412,16 @@ def running(pages, boxes) -> Tuple[List[str], List[str], List[set]]:
     occurrences = defaultdict(list)
     for n, (page, box) in enumerate(zip(pages, boxes)):
         items = [(i, ln) for i, ln in enumerate(page) if ln.text and not ln.vertical]
-        for zone in ("header", "footer"):
-            block = _edge_block(items, (box[1], box[3]), zone)
-            gap_ok = _margin_gap_ok(items, block, zone)
+        zones = [(zone, block, _margin_gap_ok(items, block, zone))
+                 for zone, block in ((z, _edge_block(items, (box[1], box[3]), z)) for z in ("header", "footer"))]
+        zones.append(("header", _side_lines(items, box), True))
+        for zone, block, gap_ok in zones:
             for i, ln in block:
                 text = _normal(ln.text)
                 if _ARTICLE_HEADING.fullmatch(text):
                     continue
                 is_page = bool(_PAGE_NUMBER.fullmatch(text))
-                if is_page:
-                    text = _DIGITS.sub("#", text)
+                text = _DIGITS.sub("#", text) if is_page else _key(text)
                 occurrences[(zone, text, is_page)].append((n, i, ln, gap_ok))
     threshold = max(2, math.ceil(0.3 * text_pages))
     firsts = defaultdict(list)

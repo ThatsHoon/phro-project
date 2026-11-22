@@ -497,7 +497,46 @@ def rule_ops(x0, y0, x1, y1, w=0.5):
     return b"%s w %s %s m %s %s l S" % tuple(_num(v).encode() for v in (w, x0, y0, x1, y1))
 
 
+def bar_chart():
+    """A bar chart: a filled plot area, six bars, six grid rules and short labels inside it, with a paragraph above and
+    below. Seven filled paths, under FIGURE_PATHS, but they and the rules draw 34 pieces."""
+    plot = b"0.9 g 100 280 400 220 re f "
+    bars = b"".join(b"0.2 g %d 300 30 %d re f " % (130 + 60 * i, 40 + 25 * i) for i in range(6))
+    grid = b" ".join(rule_ops(100, 300 + 40 * k, 500, 300 + 40 * k) for k in range(6))
+    labels = b" ".join(text_ops(str(40 * k), x=104, y=302 + 40 * k, size=7) for k in range(5))
+    labels += b" " + b" ".join(text_ops("Q%d" % (i + 1), x=135 + 60 * i, y=285, size=7) for i in range(6))
+    return (text_ops("Sales rose in every quarter of the year, as the chart below shows.", y=700) + b" "
+            + plot + bars + b"0 g " + grid + b" " + labels + b" "
+            + text_ops("The next paragraph follows the chart and is body text.", y=240))
+
+
 # -- annotations, form fields, outlines and images --
+
+def embedded_file(num, name, data=b"abc", kind="text/plain", **spec):
+    """{num: a file specification named `name`, num + 1: its embedded file of `data`}, the file's
+    /Subtype `kind` and /Params /Size its length; `spec` adds keys to the specification."""
+    stream = Stream({"Type": Name("EmbeddedFile"), "Subtype": Name(kind), "Params": {"Size": len(data)}}, data)
+    return {num: {"Type": Name("Filespec"), "F": name, "UF": name, "EF": {"F": Ref(num + 1)}, **spec},
+            num + 1: stream}
+
+
+def nav_pdf():
+    """Three pages labelled i, ii, 1 (/PageLabels); page 1's outline has "Intro", matching its first line, and
+    "Second part", matching none, its destination's top (/XYZ 650) between its two body lines; page 2's outline
+    item "Appendix" is a /Fit view."""
+    def views(objects):
+        objects[302]["Dest"] = [Ref(4), Name("XYZ"), 0, 650, 0]
+
+    items = outline_items([(1, "Intro", 0), (1, "Second part", 0), (1, "Appendix", 1)])
+    views(items)
+    labels = {"Nums": [0, {"S": Name("r")}, 2, {"S": Name("D")}]}
+    page1 = b" ".join([text_ops("Intro", y=720), text_ops("Body line one.", y=700), text_ops("Body line two.", y=600)])
+    return simple_pdf([page1, text_ops("Page two text.", y=700), text_ops("Page three text.", y=700)],
+                      catalog={"Outlines": Ref(300), "PageLabels": labels}, extra_objects=items)
+
+
+NAV_HEADS = ["## Page 1: p. i", "### Intro", "### Second part", "## Page 2: p. ii", "### Appendix", "## Page 3: p. 1"]
+
 
 def link_annot(rect, uri):
     """A /Link annotation whose action is a /URI."""
@@ -624,6 +663,75 @@ JPEG = bytes.fromhex(
 # block (bits 00 1010 each, no byte padding between them), a flat grey that GDI+ decodes
 JPEG64 = (JPEG[:JPEG.index(b"\xff\xc0") + 5] + bytes([0, 64, 0, 64])
           + JPEG[JPEG.index(b"\xff\xc0") + 9:JPEG.index(b"\xff\xda") + 10] + bytes.fromhex("28a28a") * 16 + b"\xff\xd9")
+
+
+def _marked(tag, mcid, ops, actual=None):
+    props = b"<< /MCID %d%s >>" % (mcid, b"" if actual is None else b" /ActualText (" + actual + b")")
+    return b"/" + tag + b" " + props + b" BDC " + ops + b" EMC "
+
+
+def struct_tree(elements, owners, **root):
+    """A structure tree (ISO 32000-1 14.7) as objects 600 up: the root at 600, its kids the
+    elements whose parent is 600, its /ParentTree at 699 giving page /StructParents 0 the
+    elements `owners` lists by MCID (None for an id no element owns). `elements` is
+    {num: (type, parent num, /K, optional extra entries)}."""
+    out = {600: dict({"Type": Name("StructTreeRoot"), "ParentTree": Ref(699),
+                      "K": [Ref(n) for n, e in elements.items() if e[1] == 600]}, **root),
+           699: {"Nums": [0, [None if n is None else Ref(n) for n in owners]]}}
+    for n, (kind, parent, kids, *more) in elements.items():
+        out[n] = dict({"Type": Name("StructElem"), "S": Name(kind), "P": Ref(parent), "Pg": Ref(4), "K": kids},
+                      **(more[0] if more else {}))
+    return out
+
+
+def tagged_pdf(marked=True, ruled=False):
+    """One tagged page (ISO 32000-1 14.8): an /Artifact running head; a heading of the custom type
+    Heading1, which /RoleMap maps to H1; a paragraph over two lines; a list of two items with Lbl
+    and LBody; a table with a TH row and a TD row; a Figure with /Alt drawing an image; a
+    paragraph whose marked content has /ActualText; and one whose structure element has it.
+    `marked` False drops /MarkInfo: the file is then not tagged and reads by its layout. `ruled`
+    draws the table's grid."""
+    def line(text, x, y, size=12):
+        return b"BT /F1 %d Tf %d %d Td (%s) Tj ET" % (size, x, y, text)
+
+    ops = b" ".join([
+        b"/Artifact BMC " + line(b"Running head of the report", 72, 760, 9) + b" EMC",
+        _marked(b"Heading1", 0, line(b"Annual report", 72, 720, 18)),
+        _marked(b"P", 1, line(b"Body text that runs", 72, 690) + b" " + line(b"over two lines.", 72, 676)),
+        _marked(b"Lbl", 2, line(b"1.", 72, 650)), _marked(b"LBody", 3, line(b"First item", 90, 650)),
+        _marked(b"Lbl", 4, line(b"2.", 72, 636)), _marked(b"LBody", 5, line(b"Second item", 90, 636)),
+        _marked(b"TH", 6, line(b"Name", 72, 600)), _marked(b"TH", 7, line(b"Score", 200, 600)),
+        _marked(b"TD", 8, line(b"Kim", 72, 586)), _marked(b"TD", 9, line(b"90", 200, 586)),
+        _marked(b"Figure", 10, b"q 100 0 0 50 72 500 cm /Im1 Do Q"),
+        _marked(b"P", 11, line(b"N o t e", 72, 470), actual=b"Note text"),
+        _marked(b"P", 12, line(b"x-y", 72, 450)),
+    ] + ([b"0.5 w 66 612 m 260 612 l 66 596 m 260 596 l 66 582 m 260 582 l "
+          b"66 582 m 66 612 l 130 582 m 130 612 l 190 582 m 190 612 l 260 582 m 260 612 l S"] if ruled else []))
+
+    tree = struct_tree({
+        601: ("Document", 600, [Ref(602), Ref(603), Ref(604), Ref(610), Ref(620), Ref(621), Ref(622)]),
+        602: ("Heading1", 601, 0), 603: ("P", 601, 1),
+        604: ("L", 601, [Ref(605), Ref(606)]),
+        605: ("LI", 604, [Ref(607), Ref(608)]), 607: ("Lbl", 605, 2), 608: ("LBody", 605, 3),
+        606: ("LI", 604, [Ref(609), Ref(611)]), 609: ("Lbl", 606, 4), 611: ("LBody", 606, 5),
+        610: ("Table", 601, [Ref(612), Ref(613)]),
+        612: ("TR", 610, [Ref(614), Ref(615)]), 614: ("TH", 612, 6), 615: ("TH", 612, 7),
+        613: ("TR", 610, [Ref(616), Ref(617)]), 616: ("TD", 613, 8), 617: ("TD", 613, 9),
+        620: ("Figure", 601, [{"Type": Name("MCR"), "MCID": 10, "Pg": Ref(4)}], {"Alt": "A bar chart of scores"}),
+        621: ("P", 601, 11), 622: ("P", 601, 12, {"ActualText": "x minus y"}),
+    }, [602, 603, 607, 608, 609, 611, 614, 615, 616, 617, 620, 621, 622], RoleMap={"Heading1": Name("H1")})
+    picture = image_xobject(32, 32, data=bytes((x * 8 + y) % 256 for x in range(32) for y in range(32)))
+    catalog = {"StructTreeRoot": Ref(600)}
+    if marked:
+        catalog["MarkInfo"] = {"Marked": True}
+    return simple_pdf([ops], resources={"Font": {"F1": Ref(3)}, "XObject": {"Im1": Ref(30)}},
+                      catalog=catalog, page_extra={"StructParents": 0},
+                      extra_objects={**tree, 30: picture})
+
+
+TAGGED_MD = ["Header: Running head of the report", "## Page 1", "### Annual report", "Body text that runs over two lines.", "1. First item",
+             "2. Second item", "|Name|Score|", "|Kim|90|", "![A bar chart of scores](assets/img-001.png)",
+             "Note text", "x minus y"]
 
 
 def fake_venv(dir, *, build=7000):

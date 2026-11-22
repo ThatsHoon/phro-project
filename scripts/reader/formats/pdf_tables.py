@@ -3,8 +3,8 @@
 Segment and PathCollector follow dochan 1.21.0 pdf/paths.py (MIT). A collector keeps each
 subpath's bounding box and edges, and at a paint operator gives out the horizontal and
 vertical rules: every edge of a stroke, and the long edges of a thin filled subpath (a
-rectangle drawn as a line). It also keeps the union box and count of the painted paths that
-gave no rule, the vector figure of the page.
+rectangle drawn as a line). It also keeps a mark of each painted path, its box, the pieces it
+draws and whether it gave a rule, from which pdf.py finds the vector figures of the page.
 
 A page holds at most PDF_SEGMENTS segments; past it the rest are ignored and not counted.
 
@@ -85,12 +85,13 @@ def _deviation(p0, p1, control) -> float:
 
 class _Subpath:
     """The bounding box and edges of one subpath. Points are not stored."""
-    __slots__ = ("x0", "y0", "x1", "y1", "edges")
+    __slots__ = ("x0", "y0", "x1", "y1", "edges", "pieces")
 
     def __init__(self, point):
         self.x0 = self.x1 = point[0]
         self.y0 = self.y1 = point[1]
         self.edges: List[Segment] = []
+        self.pieces = 0
 
     def include(self, point) -> None:
         x, y = point
@@ -117,27 +118,22 @@ class PathCollector:
         self._overflow = False
         self._point = None
         self._start = None
-        self._figure_box = None
-        self._figure_count = 0
+        self.marks: List[tuple] = []  # (box, pieces, rule) of each painted path
 
-    @property
-    def figure(self):
-        """(union box or None, count) of the painted paths that gave no rule segment."""
-        return self._figure_box, self._figure_count
+    def add_marks(self, marks) -> None:
+        """Add the marks of a form drawn inside this page."""
+        for box, pieces, rule in marks:
+            self._mark(box, pieces, rule)
 
-    def add_figure(self, box, count: int) -> None:
-        """Merge the figure of a form drawn inside this page."""
-        if box is not None and count:
-            self._merge_box(box)
-            self._figure_count += count
-
-    def _merge_box(self, box) -> None:
-        if self._figure_box is None:
-            self._figure_box = tuple(box)
-        else:
-            a = self._figure_box
-            self._figure_box = (min(a[0], box[0]), min(a[1], box[1]),
-                                max(a[2], box[2]), max(a[3], box[3]))
+    def _mark(self, box, pieces: int, rule: bool) -> None:
+        """One painted path: its box, the line and curve pieces it draws, whether it gave a rule.
+        Past PDF_SEGMENTS marks each further one is merged into the last."""
+        if len(self.marks) < PDF_SEGMENTS:
+            self.marks.append((tuple(box), pieces, rule))
+            return
+        a, n, r = self.marks[-1]
+        self.marks[-1] = ((min(a[0], box[0]), min(a[1], box[1]), max(a[2], box[2]), max(a[3], box[3])),
+                          n + pieces, r and rule)
 
     def _move(self, point) -> None:
         if len(self._groups) < PDF_SEGMENTS:
@@ -157,6 +153,7 @@ class PathCollector:
             self._move(self._point)
         subpath = self._current
         if subpath is not None:
+            subpath.pieces += 1
             for extra in extra_points:
                 subpath.include(extra)
             subpath.include(point)
@@ -251,14 +248,11 @@ class PathCollector:
                 self.segments.append(segment)
             if capped:
                 break
-        if capped or len(self.segments) > before:
-            return
-        boxes = [(g.x0, g.y0, g.x1, g.y1) for g in self._groups
-                 if _sane(g.x0, g.y0, g.x1, g.y1) and (g.x1 > g.x0 or g.y1 > g.y0)]
-        if boxes:
-            self._merge_box((min(b[0] for b in boxes), min(b[1] for b in boxes),
-                             max(b[2] for b in boxes), max(b[3] for b in boxes)))
-            self._figure_count += 1
+        drawn = [g for g in self._groups if _sane(g.x0, g.y0, g.x1, g.y1) and (g.x1 > g.x0 or g.y1 > g.y0)]
+        if drawn:
+            self._mark((min(g.x0 for g in drawn), min(g.y0 for g in drawn),
+                        max(g.x1 for g in drawn), max(g.y1 for g in drawn)),
+                       sum(g.pieces for g in drawn), capped or len(self.segments) > before)
 
 
 # ---- tables from the rules
@@ -272,7 +266,7 @@ MAX_INTERSECTION_CHECKS = 2_000_000  # horizontal x vertical rule checks per pag
 MAX_NESTED_DEPTH = 32
 MAX_PAGE_COMPONENTS = 1_000          # table candidates per page
 MAX_SPLIT_CHECKS = 2_000_000         # graph and grid checks of the connected-grid split, per page
-_TOLERANCE = 1.5
+TOLERANCE = 1.5
 
 
 @dataclass
@@ -521,21 +515,22 @@ def _reading_key(frag):
     return frag.x, frag.y
 
 
-def _cell_lines(fragments, cache):
-    """Lines of the fragments of a cell. The cache holds identical inputs once."""
+def _cell_lines(fragments, cache, gap):
+    """Lines of the fragments of a cell, spaced by the page's word gap `gap`. The cache holds
+    identical inputs once."""
     key = tuple(id(frag) for frag in fragments)
     if cache is not None and key in cache:
         return cache[key]
     # in reading order (dochan's key), whatever order the page drew them in; lines() follows
     # `order`, so the copies are numbered by that sort
     ordered = sorted(fragments, key=_reading_key)
-    out = pdf_layout.lines([replace(f, order=i) for i, f in enumerate(ordered)])
+    out = pdf_layout.lines([replace(f, order=i) for i, f in enumerate(ordered)], gap=gap)
     if cache is not None:
         cache[key] = out
     return out
 
 
-def _assign_text(grid, owners, boxes, xs, ys, fragments, mdl, breaks, reference_points, line_cache):
+def _assign_text(grid, owners, boxes, xs, ys, fragments, mdl, breaks, reference_points, line_cache, gap):
     """Each fragment goes to the cell holding its reference point. Returns the orders taken
     and, per cell key, the (y, kind, order, seq, block) events of its paragraphs."""
     by_cell = defaultdict(list)
@@ -556,7 +551,7 @@ def _assign_text(grid, owners, boxes, xs, ys, fragments, mdl, breaks, reference_
     events = defaultdict(list)
     for key, frags in by_cell.items():
         groups = [[]]
-        for line in _cell_lines(frags, line_cache):
+        for line in _cell_lines(frags, line_cache, gap):
             # a line whose baseline reaches the top of a nested table is above it: break after it
             if groups[-1] and not line.vertical and any(
                     line.box[1] < y <= groups[-1][-1].box[1] for y in breaks.get(key, ())):
@@ -573,7 +568,7 @@ def _assign_text(grid, owners, boxes, xs, ys, fragments, mdl, breaks, reference_
 _NUMBER = re.compile(r"[+−-]?\d[\d,]*(?:\.\d+)?%?")
 
 
-def _numeric_row_rules(horizontal, vertical, xs, ys, fragments, tolerance, reference_points, line_cache):
+def _numeric_row_rules(horizontal, vertical, xs, ys, fragments, tolerance, reference_points, line_cache, gap):
     """Split a ruled band only when three numeric columns agree on every row: all text must align
     with the same baselines, and every inner column edge must be ruled across the whole band."""
     if (len(xs) < 4 or len(fragments) * len(ys) > MAX_INTERSECTION_CHECKS
@@ -602,7 +597,7 @@ def _numeric_row_rules(horizontal, vertical, xs, ys, fragments, tolerance, refer
         columns = defaultdict(list)
         for column, fragment in bands[band]:
             columns[column].append(fragment)
-        lns = [_cell_lines(columns[c], line_cache) for c in range(len(xs) - 1)]
+        lns = [_cell_lines(columns[c], line_cache, gap) for c in range(len(xs) - 1)]
         numeric = [column for column in lns if len(column) >= 2 and all(
             not line.vertical and line.text.split() and all(
                 _NUMBER.fullmatch(word) for word in line.text.split()) for line in column)]
@@ -1013,7 +1008,7 @@ def _to_table(grid) -> Table:
 
 
 def tables(segments, fragments, page_number, budget, cut, short=(), model=None,
-           tolerance=_TOLERANCE) -> List[Found]:
+           tolerance=TOLERANCE) -> List[Found]:
     """The tables of one page, from its rule segments (dochan tables.py `_build_tables_python`).
 
     Rules that touch make a component; its rule coordinates are the grid axes, and a missing
@@ -1048,6 +1043,7 @@ def tables(segments, fragments, page_number, budget, cut, short=(), model=None,
     dash_runs = _short_dash_runs(short, tol)
     index = _fragment_index(fragments)
     line_cache = {}
+    gap = pdf_layout.word_gap(fragments)
     reference_points = {id(frag): point for point, frag in index[0]}
     separated = []
     component_boxes = {}
@@ -1088,7 +1084,7 @@ def tables(segments, fragments, page_number, budget, cut, short=(), model=None,
         if bbox[2] - bbox[0] >= 8 and bbox[3] - bbox[1] >= 8:
             if len(xs) >= 4:   # the numeric rule needs three columns
                 hs, ys = _numeric_row_rules(hs, vs, xs, ys, _fragments_inside(index, bbox), tol,
-                                            reference_points, line_cache)
+                                            reference_points, line_cache, gap)
             components.append((bbox, hs, vs, xs, ys))
     components.sort(key=lambda v: -_area(v[0]))
     remaining = MAX_PAGE_CELLS
@@ -1145,7 +1141,7 @@ def tables(segments, fragments, page_number, budget, cut, short=(), model=None,
         own_orders, events = _assign_text(
             node.grid, node.owners, node.boxes, node.xs, node.ys,
             [frag for frag in _fragments_inside(index, node.bbox) if frag.order not in used_orders],
-            mdl, breaks, reference_points, line_cache)
+            mdl, breaks, reference_points, line_cache, gap)
         for child in node.children:
             events[child.owner_key].append((child.bbox[3], 1, child.anchor, 0, _to_table(child.grid)))
         for key, blocks in events.items():

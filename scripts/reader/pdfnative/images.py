@@ -1,16 +1,16 @@
 """pdf image XObjects: a JPEG kept as it is, raw samples written as a stdlib PNG.
 
 Port of dochan 1.21.0 pdf/images.py (MIT). Differences from dochan: Pillow is gone, so
-`reader.images._png` writes the PNG (colour type 2, RGB rows) and the sample unpacking is done
-here; Gray and Indexed take 1, 2, 4 or 8 bits per component and RGB takes 8; an Indexed palette
+`formats.pdf_layout.picture` writes the PNG (colour type 2, RGB rows, zlib level 1; none for a
+flat picture) when the reader calls the image's `load`, and the sample unpacking is done here; Gray and Indexed take 1, 2, 4 or 8 bits per component and RGB takes 8; an Indexed palette
 over Gray or RGB is applied; JPX, CCITT and JBIG2 give no bytes (`data` None, with their kind);
 CMYK, any other colour space and an image over `reader.images._MAX_PIXELS` give `data` None
 with kind "raw". The caller sets the box.
 """
-from typing import List, Optional
+from typing import List
 
-from ..formats.pdf_layout import PageImage
-from ..images import _MAX_PIXELS, _png, sniff
+from ..formats.pdf_layout import PageImage, picture
+from ..images import _MAX_PIXELS, sniff
 from .objects import PDFStream
 from .structure import PDFFile
 
@@ -22,7 +22,8 @@ _CODECS = {"DCTDecode": "jpg", "DCT": "jpg", "JPXDecode": "jpx", "CCITTFaxDecode
 
 
 def image(pdf: PDFFile, stream: PDFStream) -> PageImage:
-    """The image of an image XObject stream. `data` is None when it cannot be shown."""
+    """The image of an image XObject stream: a JPEG's bytes as `data`, raw samples as a `load`
+    that decodes them when called; neither when it cannot be shown."""
     stream = _direct(pdf, stream)
     d = stream.dictionary
     width, height = _int(pdf.resolve(d.get("Width"))), _int(pdf.resolve(d.get("Height")))
@@ -38,8 +39,14 @@ def image(pdf: PDFFile, stream: PDFStream) -> PageImage:
             if sniff(data) != "jpg":
                 data = None
         return PageImage(_BOX, data, px, kind if data is not None or kind != "jpg" else "raw")
-    data = _png_of(pdf, stream, width, height)
-    return PageImage(_BOX, data, px, "png" if data is not None else "raw")
+    if _rows_of(pdf, stream, width, height, probe=True) is None:
+        return PageImage(_BOX, None, px, "raw")
+    return PageImage(_BOX, None, px, "png", load=lambda: _picture(pdf, stream, width, height))
+
+
+def _picture(pdf: PDFFile, stream: PDFStream, width: int, height: int):
+    rows = _rows_of(pdf, stream, width, height)
+    return (None, False) if rows is None else picture(width, height, rows, False)
 
 
 def _direct(pdf: PDFFile, stream: PDFStream) -> PDFStream:
@@ -100,7 +107,9 @@ def _space(pdf: PDFFile, cs, base: bool = False):
     return None, 0, None
 
 
-def _png_of(pdf: PDFFile, stream: PDFStream, width: int, height: int) -> Optional[bytes]:
+def _rows_of(pdf: PDFFile, stream: PDFStream, width: int, height: int, probe: bool = False):
+    """The RGB rows of raw samples, or None when they cannot be shown; with `probe`, whether
+    their dictionary can (True or None) without decoding them."""
     d = stream.dictionary
     if width <= 0 or height <= 0 or width * height > _MAX_PIXELS:
         return None
@@ -112,6 +121,8 @@ def _png_of(pdf: PDFFile, stream: PDFStream, width: int, height: int) -> Optiona
     bpc = pdf.resolve(d.get("BitsPerComponent"))
     if bpc not in ((8,) if kind == "rgb" else (1, 2, 4, 8)):
         return None
+    if probe:
+        return True
     stride = (width * comps * bpc + 7) // 8
     samples = pdf.decode_image_bytes(stream)
     if len(samples) < stride * height:
@@ -123,7 +134,7 @@ def _png_of(pdf: PDFFile, stream: PDFStream, width: int, height: int) -> Optiona
         for y in range(height):
             row = samples[y * stride:y * stride + stride]
             rows.append(row.translate(flip) if flip else row)
-        return _png(width, height, rows, False)
+        return rows
     levels = (1 << bpc) - 1
     if kind == "gray":
         values = bytes((levels - v if invert else v) * 255 // levels for v in range(levels + 1))
@@ -145,7 +156,7 @@ def _png_of(pdf: PDFFile, stream: PDFStream, width: int, height: int) -> Optiona
         for c in range(3):
             out[c::3] = idx.translate(tabs[c])
         rows.append(bytes(out))
-    return _png(width, height, rows, False)
+    return rows
 
 
 def _inverted(pdf: PDFFile, decode, comps: int) -> bool:

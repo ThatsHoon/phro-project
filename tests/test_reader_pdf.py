@@ -17,7 +17,9 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pdf_fix import (JPEG, JPEG64, EncryptSpec, Name, Ref, acroform, font_type0, image_xobject,  # noqa: E402
+from pdf_fix import (JPEG, JPEG64, NAV_HEADS, EncryptSpec, Name, Ref, acroform, bar_chart, embedded_file,  # noqa: E402
+                     font_type0, nav_pdf,
+                     image_xobject,
                      link_annot, ocg_catalog, outline_items, rule_ops, simple_pdf, text_annot,
                      text_ops, widget)
 
@@ -147,6 +149,140 @@ def test_figure_native_unrendered():
     assert ctx.skipped["figure"] == 1 and "Caption" in text, ctx.skipped
 
 
+def test_vector_chart_is_figure():
+    """A vector chart is a figure: the test counts what its paths draw. Its labels leave the page's text for one
+    `Figure text:` at its place, the paragraphs around it stay; native has no render, so it is unrendered."""
+    text, ctx, doc = md(simple_pdf([bar_chart()]))
+    assert doc.meta["unrendered"] == [1] and ctx.skipped["figure"] == 1, (doc.meta, ctx.skipped)
+    paras = [p for p in text.split("\n\n") if p.strip()]
+    fig = [p for p in paras if p.startswith("Figure text: ")]
+    assert len(fig) == 1 and "Q1" in fig[0] and "160" in fig[0] and "Sales" not in fig[0], paras
+    at = paras.index(fig[0])
+    assert paras[at - 1].startswith("Sales") and paras[at + 1].startswith("The next"), paras
+    assert "\nQ1" not in text and "\n160\n" not in text, text
+
+
+def test_ruled_table_joints_are_no_figure():
+    """The small squares a word processor fills at a ruled table's joints belong to the table: with a text box's
+    frame elsewhere on the page they make no figure, and the lines between them stay the page's text."""
+    xs, ys = (66, 226, 386, 546), (246, 260, 274)
+    ops = [b"0.5 w"]
+    for y in ys:
+        ops.append(b"%d %d m %d %d l S" % (xs[0], y, xs[-1], y))
+    for x in xs:
+        ops.append(b"%d %d m %d %d l S" % (x, ys[0], x, ys[-1]))
+    ops += [b"%d %d 1 1 re f" % (x, y) for x in xs for y in ys]
+    ops.append(b"316 587 186 33 re f 316 587 186 33 re S")
+    body = [text_ops("Bullet %d of the list" % k, x=108, y=582 - 16 * k, size=11) for k in range(3)]
+    body.append(text_ops("Subject is here", x=75, y=315, size=11))
+    body += [text_ops("Row %d Col %d" % (r, c), x=72 + 160 * c, y=264 - 14 * r, size=11)
+             for r in range(2) for c in range(3)]
+    text, ctx, doc = md(simple_pdf([b" ".join(ops + body)]))
+    assert doc.meta["figures"] == [] and doc.meta["unrendered"] == [] and "Figure text" not in text, (doc.meta, text)
+    assert "Bullet 0 of the list" in text and "Subject is here" in text, text
+
+
+def _icons_page(squares=3):
+    """Two columns of prose with an icon (`squares` nested filled squares, 4 pieces each) at three places apart."""
+    icons = b" ".join(b" ".join(b"%d %d %d %d re f" % (x + 2 * k, y + 2 * k, 30 - 4 * k, 30 - 4 * k)
+                                for k in range(squares))
+                      for x, y in ((40, 600), (310, 610), (310, 300)))
+    cols = [text_ops("Column %d prose line %d runs on" % (c, k), x=80 + 270 * c, y=700 - 14 * k, size=10)
+            for c in range(2) for k in range(30)]
+    return icons + b" " + b" ".join(cols)
+
+
+def test_scattered_icons_are_no_figure():
+    """Icons apart in two columns of prose make no figure: the columns' lines are prose by their length though each
+    is narrower than half the icons' span, small icons (12 pieces each) or large (36 pieces each)."""
+    for squares in (3, 9):
+        text, ctx, doc = md(simple_pdf([_icons_page(squares)]))
+        assert doc.meta["unrendered"] == [] and "Figure text" not in text and not ctx.skipped, (squares, doc.meta, ctx.skipped, text)
+        assert "Column 0 prose line 0 runs on" in text and "Column 1 prose line 29 runs on" in text, text
+
+
+def _blocks(cells, size=20):
+    return b" ".join(b"%d %d %d %d re f" % (x, y, size, size) for x, y in cells)
+
+
+def _prose(y0, lines=10):
+    return b" ".join(text_ops("Prose line %d of the page runs on across the column to its end" % k, x=72,
+                              y=y0 - 14 * k, size=10) for k in range(lines))
+
+
+def test_two_drawings_apart_are_two_figures():
+    """Drawings apart on a page are figures each, and the prose between them stays the page's text."""
+    upper = _blocks([(100 + 24 * c, 560 + 24 * r) for c in range(10) for r in range(5)])
+    lower = _blocks([(100 + 24 * c, 100 + 24 * r) for c in range(10) for r in range(5)])
+    text, ctx, doc = md(simple_pdf([upper + b" " + lower + b" " + _prose(480)]))
+    assert doc.meta["unrendered"] == [1, 1] and ctx.skipped["figure"] == 2, (doc.meta, ctx.skipped)
+    assert "Prose line 0 of the page" in text and "Prose line 9 of the page" in text, text
+
+
+def test_bars_on_one_axis_are_one_figure():
+    """Bars apart that stand on one ruled axis are one drawing; without the axis they are marks apart."""
+    bars = _blocks([(100 + 80 * c, 560 + 24 * r) for c in range(3) for r in range(4)])
+    rest = _blocks([(500, 100)]) + b" " + _prose(480)
+    text, ctx, doc = md(simple_pdf([bars + b" 0.5 w 90 556 m 290 556 l S " + rest]))
+    assert doc.meta["unrendered"] == [1] and "Prose line 9 of the page" in text, (doc.meta, text)
+    text, ctx, doc = md(simple_pdf([bars + b" " + rest]))
+    assert doc.meta["unrendered"] == [] and not ctx.skipped, (doc.meta, ctx.skipped)
+
+
+def test_drawing_of_miniature_text_is_a_figure():
+    """Lines too small to read inside a drawing are its text; lines of body size in a frame are a text box."""
+    ring = _blocks([(100 + 24 * c, y) for c in range(11) for y in (560, 680)]
+                   + [(x, 584 + 24 * r) for x in (100, 340) for r in range(4)])
+    for size, figure in ((1.5, True), (10, False)):
+        inner = b" ".join(text_ops("Words of a page shown small, line %02d of it" % k, x=150, y=600 + 12 * k, size=size)
+                          for k in range(6))
+        text, ctx, doc = md(simple_pdf([ring + b" " + inner + b" " + _prose(480)]))
+        assert (doc.meta["unrendered"] == [1]) == figure and ("Figure text: Words" in text) == figure, (size, doc.meta, text)
+        assert "line 05 of it" in text and "Prose line 9 of the page" in text, text
+
+
+def test_table_after_a_line_with_a_superscript_keeps_its_place():
+    """A raised citation makes pieces of one line; the table drawn inside the paragraph after it still comes out,
+    after the paragraph."""
+    full = "Words that fill the whole width of the column of this page, line %d of the text"
+    ops = [text_ops(full % 0, x=72, y=700, size=10), text_ops("and the count went up in the species.", x=72, y=688, size=10)]
+    ops += [text_ops(t, x=237 + dx, y=692, size=6) for t, dx in (("2", 0), (",", 3.4), ("3", 5.2))]
+    ops.append(text_ops("It is therefore said that this goes on to the end", x=247, y=688, size=10))
+    ops += [text_ops(full % k, x=72, y=700 - 12 * k, size=10) for k in (2, 3, 4)]
+    ops += [rule_ops(72, 590 + 20 * r, 272, 590 + 20 * r) for r in range(4)]
+    ops += [rule_ops(72 + 100 * c, 590, 72 + 100 * c, 650) for c in range(3)]
+    ops += [text_ops("cell %d%d" % (r, c), x=80 + 100 * c, y=596 + 20 * r, size=10) for r in range(3) for c in range(2)]
+    ops.append(text_ops(full % 5, x=72, y=560, size=10))
+    text, ctx, _doc = md(simple_pdf([b" ".join(ops)]))
+    assert text.count("cell 00") == 1 and text.count("cell 21") == 1 and not ctx.skipped, (text, ctx.skipped)
+    assert text.index("line 4 of the text") < text.index("cell 21") < text.index("line 5 of the text"), text
+    assert "species.2,3It is therefore said" in text, text
+
+
+def test_picture_between_paragraphs_of_its_column():
+    """A picture in the right column goes between that column's paragraphs, not into the left column's text."""
+    left = b" ".join(text_ops("Left column line %d of text" % k, x=72, y=700 - 14 * k, size=10) for k in range(30))
+    right = (b" ".join(text_ops("Right line %d above" % k, x=330, y=700 - 14 * k, size=10) for k in range(5))
+             + b" " + b" ".join(text_ops("Right line %d below" % k, x=330, y=400 - 14 * k, size=10) for k in range(5)))
+    picture = b" q 200 0 0 100 330 520 cm /Im1 Do Q "
+    text, _, _ = md(with_image(left + b" " + right + picture, image_xobject(64, 64, data=bytes(range(64)) * 64)))
+    at = text.index("![")
+    assert text.index("Right line 4 above") < at < text.index("Right line 0 below"), text
+    assert not text.index("Left column line 0") < at < text.index("Left column line 29"), text
+
+
+def test_picture_does_not_split_a_paragraph():
+    """A picture whose top falls inside a paragraph's lines goes after that paragraph."""
+    lines = b" ".join(text_ops("Wrapped paragraph line %d of text" % k, x=72, y=700 - 14 * k, size=10)
+                      for k in range(8))
+    after = text_ops("Next paragraph starts here", x=72, y=500, size=10)
+    picture = b" q 200 0 0 100 150 560 cm /Im1 Do Q "
+    text, _, _ = md(with_image(picture + lines + b" " + after, image_xobject(64, 64, data=bytes(range(64)) * 64)))
+    at = text.index("![")
+    assert "line 3 of text Wrapped" in text and "line 4 of text" in text, text
+    assert text.index("line 7 of text") < at < text.index("Next paragraph"), text
+
+
 def test_renders_cap_unrendered():
     image = image_xobject(8, 8, data=JPEG, filter="DCTDecode")
     data = simple_pdf([FULL] * 5, resources=dict(F1, XObject={"Im1": Ref(30)}),
@@ -182,16 +318,39 @@ def _form_pdf(flags=0):
                       extra_objects=objects, page_extra={"Annots": [Ref(100)]})
 
 
-def test_fields_comments_end():
+def test_field_at_its_place_comments_end():
     text, _, _ = md(_form_pdf())
-    assert "> Field Name: Kim\n> Comment by Ann: note" in text, text
-    assert text.index("Body text") < text.index("> Field Name")
+    assert "\n\nField Name: Kim\n\n" in text and text.rstrip().endswith("> Comment by Ann: note"), text
+    assert text.index("Body text") < text.index("Field Name") < text.index("> Comment"), text
+
+
+def test_fields_every_kind_at_their_place():
+    """Every field but a push button is out, at the line of its widget: an empty one as (empty), a check box checked
+    or not, a choice with its options' display texts and the display text of its value, a signature."""
+    fields = acroform([
+        widget((300, 690, 400, 705), Ref(4), T="Empty", FT=Name("Tx")),
+        widget((300, 650, 315, 665), Ref(4), T="Agree", FT=Name("Btn"), V=Name("Off")),
+        widget((300, 610, 400, 625), Ref(4), T="Colour", FT=Name("Ch"), Ff=1 << 17, V="g",
+               Opt=[["r", "Red"], ["g", "Green"], "Blue"]),
+        widget((300, 570, 400, 585), Ref(4), T="Sign", FT=Name("Sig")),
+        widget((300, 530, 400, 545), Ref(4), T="Go", FT=Name("Btn"), Ff=1 << 16),
+    ])
+    body = b" ".join(text_ops(t, y=y) for t, y in (("Your name", 695), ("Do you agree", 655),
+                                                  ("Pick a colour", 615), ("Signature", 575), ("The end", 500)))
+    annots = [Ref(n) for n, obj in sorted(fields.items()) if "Rect" in obj]
+    text, _, _ = md(simple_pdf([body], catalog={"AcroForm": Ref(200)}, extra_objects=fields,
+                               page_extra={"Annots": annots}))
+    paras = [p for p in text.split("\n\n") if p.strip()]
+    want = ["Your name", "Field Empty: (empty)", "Do you agree", "Field Agree (checkbox): not checked",
+            "Pick a colour", "Field Colour (choice: Red, Green, Blue): Green", "Signature",
+            "Field Sign (signature): (empty)", "The end"]
+    assert [p.strip() for p in paras if not p.startswith("##")] == want, paras
 
 
 def test_hidden_comment():
     text, _, _ = md(_form_pdf(flags=2))
     assert "note" not in text and text.splitlines()[0] == "(1 hidden places left out)", text
-    assert "> Field Name: Kim" in text
+    assert "\nField Name: Kim\n" in text
 
 
 def _hidden_form_pdf():
@@ -211,7 +370,7 @@ def _hidden_form_pdf():
                       page_extra={"Annots": annots})
 
 
-HIDDEN_FORM_LINES = ("> (hidden) Field Hid: hidden value", "> (hidden) Field NoView: noview value",
+HIDDEN_FORM_LINES = ("(hidden) Field Hid: hidden value", "(hidden) Field NoView: noview value",
                      "> (hidden) Comment by Ann: noview note")
 
 
@@ -220,7 +379,7 @@ def test_hidden_fields():
     data = _hidden_form_pdf()
     text, _, _ = md(data)
     assert text.splitlines()[0] == "(3 hidden places left out)", text
-    assert "> Field Two: two value" in text and "> Field Seen: seen value" in text, text
+    assert "\nField Two: two value\n" in text and "\nField Seen: seen value\n" in text, text
     assert not any(w in text for w in ("hidden value", "noview value", "noview note")), text
     text, _, _ = md(data, hidden=True)
     for line in HIDDEN_FORM_LINES:
@@ -260,6 +419,25 @@ def test_outline_headings():
                       catalog={"Outlines": Ref(300)}, extra_objects=outline_items([(1, "Intro", 0)]))
     text, _, _ = md(data)
     assert "### Intro" in text and text.count("Intro") == 1, text
+
+
+def test_outline_title_over_two_lines_is_one_heading():
+    data = simple_pdf([text_ops("Paying Wages, Pensions,", y=720) + b" " + text_ops("or  Annuities", y=706)
+                       + b" " + text_ops("Body line one that is the text", y=680)
+                       + b" " + text_ops("Body line two", y=666)],
+                      catalog={"Outlines": Ref(300)},
+                      extra_objects=outline_items([(1, "Paying Wages, Pensions, or Annuities", 0)]))
+    text, _, _ = md(data)
+    assert "### Paying Wages, Pensions, or Annuities" + chr(10) in text and text.count("Annuities") == 1, text
+
+
+def test_outline_and_page_labels():
+    """An outline title matching no line is a heading where its destination's top is, or at its page's top; a page's
+    label names its section."""
+    text, _, _ = md(nav_pdf())
+    assert re.findall(r"^#+ .*$", text, re.M) == NAV_HEADS, text
+    assert text.index("Body line one.") < text.index("### Second part") < text.index("Body line two."), text
+    assert text.index("### Appendix") < text.index("Page two text."), text
 
 
 def test_size_heading():
@@ -319,22 +497,22 @@ def test_bad_coord_is_text():
 
 
 def test_after_loop_page_isolated():
-    real = pdf_layout.paragraphs
+    real = pdf_layout._groups
 
-    def paragraphs(lns, model):
+    def groups(lns, *body):
         if any(ln.text == "P2" for ln in lns):
             raise ValueError("broken paragraphs")
-        return real(lns, model)
+        return real(lns, *body)
 
-    with patched(pdf_layout, "paragraphs", paragraphs):
+    with patched(pdf_layout, "_groups", groups):
         text, ctx, _ = md(simple_pdf([text_ops(f"P{n}") for n in range(1, 4)]))
     assert "P1" in text and "P3" in text and "P2" not in text, text
     assert ctx.skipped == {"page": 1}, ctx.skipped
 
-    def timeout(lns, model):
+    def timeout(lns, *body):
         raise ReadError("timeout", "paragraphs")
 
-    with patched(pdf_layout, "paragraphs", timeout):
+    with patched(pdf_layout, "_groups", timeout):
         try:
             md(simple_pdf([text_ops("A")]))
         except ReadError as e:
@@ -692,15 +870,41 @@ def test_comment_newlines_stay_in_line():
     assert meta["pages"] == [[1, 1], [2, text.splitlines().index("## Page 2") + 1]], meta["pages"]
     quoted = [ln for ln in text.splitlines() if ln.startswith("> ")]
     assert any("Ann / " in ln and "line one / " in ln and " / line three" in ln for ln in quoted), quoted
-    assert any(ln.startswith("> Field Label / ") and ln.endswith(" / x: v") for ln in quoted), quoted
+    assert any(ln.startswith("Field Label / ") and ln.endswith(" / x: v") for ln in text.splitlines()), text
 
 
 def test_xfa_attachment_named():
-    catalog = {"AcroForm": {"Fields": [], "XFA": []}, "Names": {"EmbeddedFiles": {"Names": []}}}
-    text, ctx, _ = md(simple_pdf([text_ops("A")], catalog=catalog))
+    catalog = {"AcroForm": {"Fields": [], "XFA": []}, "Names": {"EmbeddedFiles": {"Names": [b"a", Ref(500)]}}}
+    text, ctx, _ = md(simple_pdf([text_ops("A")], catalog=catalog, extra_objects=embedded_file(500, "a.txt")))
     line = next(ln for ln in text.splitlines() if ln.startswith("(could not read:"))
     assert "XFA form" in line and "attached files" in line, line
     assert ctx.skipped["xfa"] == 1 and ctx.skipped["attachment"] == 1
+
+
+def test_attachments_listed():
+    """A document's embedded files are listed at its start, a file attachment annotation's where it sits."""
+    files = {**embedded_file(500, "data.csv", b"a,b\n1,2\n", kind="text/csv"), **embedded_file(502, "note.txt")}
+    annot = dict(text_annot((72, 600, 90, 620), "see file", subtype="FileAttachment"), FS=Ref(502))
+    body = text_ops("Above", y=650) + b" " + text_ops("Below", y=500)
+    text, ctx, _ = md(simple_pdf([body], catalog={"Names": {"EmbeddedFiles": {"Names": [b"d", Ref(500)]}}},
+                                 extra_objects={**files, 510: annot}, page_extra={"Annots": [Ref(510)]}))
+    paras = [p for p in text.split("\n\n") if p.strip() and not p.startswith(("#", "(could not", ">"))]
+    assert paras == ["Attached file: data.csv (8 bytes, text/csv)", "Above",
+                     "Attached file: note.txt (3 bytes, text/plain)", "Below"], text
+    assert ctx.skipped["attachment"] == 1
+
+
+def test_encrypted_payload_is_drm():
+    """A Microsoft IRM wrapper (an unencrypted PDF whose real document is an encrypted payload) is `drm`."""
+    wrapped = embedded_file(500, "Protected.pdf", AFRelationship=Name("EncryptedPayload"),
+                            EP={"Type": Name("EncryptedPayload"), "Subtype": Name("MicrosoftIRMServices")})
+    catalog = {"AF": [Ref(500)], "Names": {"EmbeddedFiles": {"Names": [b"p", Ref(500)]}}}
+    try:
+        md(simple_pdf([text_ops("This document is protected")], catalog=catalog, extra_objects=wrapped))
+    except ReadError as e:
+        assert e.kind == "drm" and "MicrosoftIRMServices" in e.detail, e
+    else:
+        raise AssertionError("an IRM wrapper read")
 
 
 def test_encrypted_kinds():
@@ -723,7 +927,7 @@ def test_caps():
     assert (pdf.PDF_PAGES, pdf.PDF_DEADLINE, pdf.PDF_PAGE_SECONDS) == (5_000, 36.0, 4.0)
     assert (pdf.PDF_PAGE_CHARS, pdf.PDF_RENDERS) == (200_000, 100)
     assert (pdf.RENDER_DPI, pdf.CROP_DPI, pdf.RENDER_LONG) == (110, 150, 1_568)
-    assert (pdf.SCAN_COVER, pdf.OCR_COVER, pdf.FIGURE_PATHS, pdf.FIGURE_COVER) == (0.5, 0.8, 32, 0.04)
+    assert (pdf.SCAN_COVER, pdf.FIGURE_PATHS, pdf.FIGURE_COVER) == (0.5, 32, 0.03)
     assert (pdf.FIGURE_PAD, limits.FIGURE_WHOLE, pdf.TINY_PT) == (6.0, 0.7, 1.0)
     assert (pdf.IMAGE_MIN_PX, pdf.IMAGE_MIN_PT) == (32, 16.0)
     assert (pdf.PDF_PAGE_OBJECTS, pdf.PDF_PAGE_IMAGES) == (100_000, 64)
@@ -894,11 +1098,11 @@ def test_ocr_layer_page_not_ocred():
 PICTURE = b"q 200 0 0 200 100 300 cm /Im1 Do Q "
 
 
-def test_picture_under_text_layer_not_ocred():
-    """A picture the page's own text lies under (invisible text over it, or most of the page's text drawn before it:
-    an OCR layer) is not read by OCR, its text being out already, nor is the same picture drawn again on that page;
-    a picture with a label drawn over it, one drawn over a label on a page of other text, or one with none, still
-    is."""
+def test_picture_under_text_layer_left_out():
+    """Decision 8: a picture the page's own text lies under (invisible text over it, or most of the page's text drawn
+    before it: an OCR layer) is not a picture of the output, nor read by OCR, its text being out already, nor is the
+    same picture drawn again on that page; a picture with a label drawn over it, one drawn over a label on a page of
+    other text, or one with none, is, and OCR reads it."""
     image = image_xobject(64, 64, data=bytes(range(64)) * 64)
     body = text_ops("The page's own paragraph of text", y=700)
     for content, read in ((PICTURE + text_ops("Layer words", x=150, y=400, extra=b"3 Tr"), False),
@@ -910,7 +1114,51 @@ def test_picture_under_text_layer_not_ocred():
         with ocr_stub() as (s, sent):
             text, _, doc = md(with_image(content, image))
         assert [k for _, _, k in sent] == (["picture"] if read else []), (content, sent)
-        assert "](assets/img-001.png)" in text, text
+        assert ("](assets/img-001.png)" in text) == read, text
+
+
+def test_flat_picture_left_out():
+    """Decision 8: a picture of one colour (every channel within OCR_FLAT levels) is left out, uncounted; one with
+    any detail is kept."""
+    for data, kept in ((bytes(64 * 64), False), (bytes([200 + (k % 7) for k in range(64 * 64)]), False),
+                       (bytes(range(64)) * 64, True)):
+        text, ctx, _ = md(with_image(PICTURE + text_ops("Caption", x=72, y=200), image_xobject(64, 64, data=data)))
+        assert ("![" in text) == kept and not ctx.skipped, (kept, text, ctx.skipped)
+    rgb = image_xobject(64, 64, cs="DeviceRGB", data=bytes([10, 120, 240]) * 4096)
+    text, ctx, _ = md(with_image(PICTURE + text_ops("Caption", x=72, y=200), rgb))
+    assert "![" not in text and not ctx.skipped, (text, ctx.skipped)
+
+
+def test_picture_off_the_page_left_out():
+    """A picture drawn wholly outside the page's crop is not seen: left out, uncounted; one reaching into it is kept."""
+    for place, kept in ((b"q 200 0 0 200 -400 300 cm /Im1 Do Q ", False), (b"q 200 0 0 200 -100 300 cm /Im1 Do Q ", True)):
+        text, ctx, _ = md(with_image(place + text_ops("Caption", x=72, y=200), image_xobject(64, 64, data=bytes(range(64)) * 64)))
+        assert ("![" in text) == kept and not ctx.skipped, (kept, text, ctx.skipped)
+
+
+def test_picture_encoded_once_chosen():
+    """A page picture is encoded to PNG only once it is chosen for the output, at zlib level 1: a picture under the
+    page's text and a flat one are never encoded."""
+    levels, real = [], images._png_rows
+
+    def png_rows(width, height, ctype, rows, level):
+        levels.append(level)
+        return real(width, height, ctype, rows, level)
+
+    detail = image_xobject(64, 64, data=bytes(range(64)) * 64)
+    other = image_xobject(64, 64, data=bytes(range(63, -1, -1)) * 64)
+    flat = image_xobject(64, 64)
+    res = dict(F1, XObject={"Im1": Ref(30), "Im2": Ref(31), "Im3": Ref(32)})
+    content = (PICTURE + text_ops("Layer words", x=150, y=400, extra=b"3 Tr")
+               + b" q 100 0 0 100 300 100 cm /Im2 Do Q q 100 0 0 100 300 600 cm /Im3 Do Q "
+               + text_ops("Caption", x=72, y=80))
+    data = simple_pdf([content], resources=res, extra_objects={30: detail, 31: flat, 32: other})
+    with patched(images, "_png_rows", png_rows):
+        text, ctx, _, assets = md_assets(data)
+    assert levels == [1] and list(assets) == ["img-001.png"] and not ctx.skipped, (levels, assets, ctx.skipped)
+    png = assets["img-001.png"]
+    idat = png.index(b"IDAT") + 4
+    assert png[idat:idat + 2] == b"x", png[idat:idat + 2]
 
 
 def _image_bytes_at_after(data, **conf):
@@ -1209,6 +1457,24 @@ def measure():
         {"tables": measure_tables, "native": measure_native, "pdfium": measure_pdfium}[what](path)
     else:
         raise SystemExit("usage: measure renders | decrypt | tables <path> | native <path> | pdfium <path>")
+
+
+def test_overlapping_figures_are_merged_within_a_budget():
+    """A page of many figures whose boxes overlap, among many lines, is judged within the page's time."""
+    from types import SimpleNamespace
+    page, step, run = (0.0, 0.0, 4800.0, 4800.0), 36, 900
+    marks, lines = [], []
+    for i in range(110):
+        x0, y0 = i * step, 4800 - run - i * step
+        marks += [((x0 + 12 * t + 2.0, y0 + 12 * t + 2.0, x0 + 12 * t + 6.0, y0 + 12 * t + 6.0), 4, False)
+                  for t in range(run // 12)]
+        lines.append(SimpleNamespace(box=(x0 - 2.0, y0 - step + 14.0, x0 + 44.0, y0 - step + 18.0), size=4.0,
+                                     text="Prose words of body %03d" % i))
+    lines += [SimpleNamespace(box=(20.0 + 6 * (k // 300), 20.0 + 5 * (k % 300), 22.0 + 6 * (k // 300), 24.0 + 5 * (k % 300)),
+                              size=4.0, text="a") for k in range(20000)]
+    t = time.perf_counter()
+    pdf._figure_boxes(marks, page, [], lines)
+    assert time.perf_counter() - t < 3.0, time.perf_counter() - t
 
 
 def main():
