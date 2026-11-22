@@ -82,9 +82,13 @@ class NativeDoc:
             self._pdf = PDFFile(data, password)
             self.page_count = len(self._pdf.pages())
             self.oc = OCState.from_catalog(self._pdf)
+            payload = annotations.encrypted_payload(self._pdf)
+            if payload is not None:
+                raise ReadError("drm", f"encrypted payload {payload}")
             self.fields: Dict[int, list] = annotations.fields(self._pdf, self.cut)
             self.xfa = annotations.has_xfa(self._pdf)
-            self.attachments = annotations.has_attachments(self._pdf)
+            self.attachments = annotations.attachments(self._pdf)
+            self.labels = annotations.page_labels(self._pdf, self.page_count)
             if self._pdf.cuts["decrypt_budget"]:
                 # structure.py swallows a refused piece and counts it; spent while opening
                 # (an object stream or a string of the page tree, catalog or fields), the file
@@ -108,7 +112,7 @@ class NativeDoc:
         found = self._pdf.pages()[index][1].get("Resources")
         return found if isinstance(found, dict) else {}
 
-    def outline(self) -> List[Tuple[int, str, int]]:
+    def outline(self) -> List[tuple]:
         return annotations.outline(self._pdf, annotations.page_index(self._pdf))
 
     # -- pages --
@@ -175,17 +179,23 @@ class NativeDoc:
         if content.unmapped:
             self._count_glyphs(cut, resources)
 
-        shown: List[PageImage] = []
+        drawn = []
         marks = text_marks(content.fragments) if content.image_draws else []
         for _name, draw_box, stream, last in content.image_draws:
-            if len(shown) >= caps.PDF_PAGE_IMAGES:
+            if len(drawn) >= caps.PDF_PAGE_IMAGES:
                 cut["image"] += 1
                 break
-            if not isinstance(stream, PDFStream):
-                continue
+            if isinstance(stream, PDFStream):
+                drawn.append((draw_box, stream, text_under(draw_box, marks, lambda f: f.obj <= last,
+                                                           caps.TEXT_UNDER)))
+        under = {id(stream) for _box, stream, at in drawn if at}
+        shown: List[PageImage] = []
+        for draw_box, stream, _at in drawn:
             got = images.image(pdf, stream)
-            under = text_under(draw_box, marks, lambda f: f.obj <= last, caps.TEXT_UNDER)
-            shown.append(PageImage(draw_box, got.data, got.px, got.kind, under))
+            if id(stream) in under:
+                shown.append(PageImage(draw_box, None, got.px, got.kind, True))
+            else:
+                shown.append(PageImage(draw_box, got.data, got.px, got.kind, load=got.load))
 
         if _part_grew(before, pdf.cuts):
             cut["page_part"] += 1  # a structure cap fired while this page was read: read in part
@@ -197,6 +207,6 @@ class NativeDoc:
             self.cut.update(cut)
         return PageData(number=index + 1, box=box, rotate=turn, fragments=content.fragments,
                         segments=content.segments, short=content.short, images=shown,
-                        figure=content.figure, links=links, fields=self.fields.get(index, []),
+                        marks=content.marks, links=links, fields=self.fields.get(index, []),
                         comments=comments, chars=chars, cut=cut, render=None,
                         unmapped=content.unmapped_glyphs)

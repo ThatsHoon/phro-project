@@ -9,13 +9,14 @@ import sys
 import time
 import zlib
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pdf_fix import (JPEG, Name, Ref, Stream, acroform, image_xobject, link_annot,  # noqa: E402
+from pdf_fix import (JPEG, Name, Ref, Stream, acroform, embedded_file, image_xobject, link_annot,  # noqa: E402
                      outline_items, popup, simple_pdf, text_annot, widget)
 
 from reader import images as reader_images  # noqa: E402
@@ -80,8 +81,13 @@ def get_image(stream, extra=None):
 
 
 def decode(stream, extra=None):
+    """The PageImage of an image stream, its samples decoded and written as a PNG (flat or not) in `data`."""
     pf, s = get_image(stream, extra)
-    return im.image(pf, s)
+    got = im.image(pf, s)
+    if got.load is not None:
+        rows = im._rows_of(pf, im._direct(pf, s), *got.px)
+        got = replace(got, data=None if rows is None else reader_images._png(*got.px, rows, False), load=None)
+    return got
 
 
 # -- links --
@@ -156,13 +162,13 @@ def test_order_comments_pure():
 def test_field_tu_label():
     pf = with_form([{"T": "topmostSubform[0]", "Kids": [
         {"T": "Page1[0]", "Kids": [tx("Kim", "f1_01[0]", TU="Name")]}]}])
-    assert an.fields(pf, Counter()) == {0: [("Name", "Kim", False)]}
+    assert an.fields(pf, Counter()) == {0: [("Name", "Kim", False, RECT)]}
 
 
 def test_field_partial_name():
     pf = with_form([{"T": "topmostSubform[0]", "Kids": [
         {"T": "Page1[0]", "Kids": [tx("Kim", "f1_01[0]")]}]}])
-    assert an.fields(pf, Counter()) == {0: [("f1_01[0]", "Kim", False)]}
+    assert an.fields(pf, Counter()) == {0: [("f1_01[0]", "Kim", False, RECT)]}
 
 
 def test_checkbox_radio():
@@ -171,34 +177,44 @@ def test_checkbox_radio():
     radio = {"T": "Pick", "FT": Name("Btn"), "Ff": 1 << 15, "V": Name("Two"),
              "Kids": [widget(RECT, PAGE), widget(RECT, PAGE)]}
     pf = with_form([box, off, radio])
-    assert an.fields(pf, Counter()) == {0: [("Agree", "Yes", False), ("Pick", "Two", False)]}
+    assert an.fields(pf, Counter()) == {0: [("Agree (checkbox)", "checked", False, RECT),
+                                            ("Skip (checkbox)", "not checked", False, RECT),
+                                            ("Pick (radio button)", "Two", False, RECT)]}
 
 
 def test_empty_sig_button():
+    # an empty field is out as (empty), a signed signature as signed; a push button is no field
     sig = widget(RECT, PAGE, T="s", FT=Name("Sig"), V={"Type": Name("Sig")})
     push = widget(RECT, PAGE, T="p", FT=Name("Btn"), Ff=1 << 16, V="x")
     pf = with_form([tx("", "e"), sig, push])
-    assert an.fields(pf, Counter()) == {}
+    assert an.fields(pf, Counter()) == {0: [("e", "(empty)", False, RECT), ("s (signature)", "signed", False, RECT)]}
 
 
 def test_field_newlines_and_cut():
     cut = Counter()
     pf = with_form([tx("a\nb", "n"), tx("c\r\nd", "m"), tx("x" * 2_500, "long")])
     got = an.fields(pf, cut)[0]
-    assert got[0] == ("n", "a / b", False) and got[1] == ("m", "c / d", False)
+    assert got[0] == ("n", "a / b", False, RECT) and got[1] == ("m", "c / d", False, RECT)
     assert len(got[2][1]) == 2_000 and cut["field"] == 1
 
 
 def test_field_entry_pure():
     assert an.field_entry("Name", "a.b", "Kim", "text") == ("Name", "Kim", False)
     assert an.field_entry(None, "a.b", "x", "text") == ("b", "x", False)
-    assert an.field_entry(None, "c", "Off", "check") is None
-    assert an.field_entry(None, "c", "Yes", "check") == ("c", "Yes", False)
-    assert an.field_entry(None, "s", "v", "sig") is None
+    assert an.field_entry(None, "c", "Off", "check") == ("c (checkbox)", "not checked", False)
+    assert an.field_entry(None, "c", "Yes", "check") == ("c (checkbox)", "checked", False)
+    assert an.field_entry(None, "s", "v", "sig") == ("s (signature)", "signed", False)
+    assert an.field_entry(None, "s", None, "sig") == ("s (signature)", "(empty)", False)
     assert an.field_entry(None, "p", "v", "push") is None
-    assert an.field_entry(None, "e", "", "text") is None
-    assert an.field_entry(None, "l", ["x", "y"], "choice") == ("l", "x, y", False)
-    assert an.field_entry(None, "l", "a\nb", "choice") == ("l", "a / b", False)
+    assert an.field_entry(None, "e", "", "text") == ("e", "(empty)", False)
+    assert an.field_entry(None, "r", "Off", "radio") == ("r (radio button)", "(empty)", False)
+    assert an.field_entry(None, "l", ["x", "y"], "choice") == ("l (choice)", "x, y", False)
+    assert an.field_entry(None, "l", "a\nb", "choice") == ("l (choice)", "a / b", False)
+    opts = [("x", "Ex"), ("y", "Why")]
+    assert an.field_entry(None, "l", ["x", "y"], "choice", opts) == ("l (choice: Ex, Why)", "Ex, Why", False)
+    many = [(str(i), "o%d" % i) for i in range(an.FIELD_OPTIONS + 1)]
+    label, value, _cut = an.field_entry(None, "m", "3", "choice", many)
+    assert label.endswith(", o63, …)") and value == "o3", (label, value)
     label, value, cut = an.field_entry(None, "t", "x" * 2_500, "text")
     assert len(value) == 2_000 and cut is True
 
@@ -211,7 +227,7 @@ def test_field_tree_cycle():
                203: widget(RECT, PAGE, T="v", FT=Name("Tx"), V="one", Parent=Ref(201))}
     pf = PDFFile(simple_pdf([b""], catalog={"AcroForm": Ref(200)}, extra_objects=objects))
     got = an.fields(pf, Counter())
-    assert got == {0: [("v", "one", False)]} and time.time() - start < 1
+    assert got == {0: [("v", "one", False, RECT)]} and time.time() - start < 1
 
 
 def test_field_depth_cap():
@@ -229,7 +245,7 @@ def test_field_page_scan():
     objects = acroform([w])
     pf = PDFFile(simple_pdf([b"", b""], catalog={"AcroForm": Ref(200)}, extra_objects=objects,
                             page_extra=[{}, {"Annots": [Ref(201)]}]))
-    assert an.fields(pf, Counter()) == {1: [("t", "v", False)]}
+    assert an.fields(pf, Counter()) == {1: [("t", "v", False, RECT)]}
 
 
 def test_field_on_no_page():
@@ -237,24 +253,52 @@ def test_field_on_no_page():
     w = widget(RECT, None, T="t", FT=Name("Tx"), V="v")
     cut = Counter()
     pf = PDFFile(simple_pdf([b"", b""], catalog={"AcroForm": Ref(200)}, extra_objects=acroform([w])))
-    assert an.fields(pf, cut) == {0: [("t", "v", False)]} and not cut
+    assert an.fields(pf, cut) == {0: [("t", "v", False, None)]} and not cut
 
 
 def test_field_choice_list():
     ch = widget(RECT, PAGE, T="c", FT=Name("Ch"), V=["x", "y"])
     pf = with_form([ch])
-    assert an.fields(pf, Counter()) == {0: [("c", "x, y", False)]}
+    assert an.fields(pf, Counter()) == {0: [("c (choice)", "x, y", False, RECT)]}
 
 
 def test_xfa_attachment():
     pf = PDFFile(simple_pdf([b""], catalog={"AcroForm": {"Fields": [], "XFA": []}}))
-    assert an.has_xfa(pf) is True and an.has_attachments(pf) is False
+    assert an.has_xfa(pf) is True and an.attachments(pf) == []
     pf = PDFFile(simple_pdf([b""], catalog={"AcroForm": {"Fields": []}}))
     assert an.has_xfa(pf) is False
     pf = PDFFile(simple_pdf([b""], catalog={"Names": {"EmbeddedFiles": {"Names": []}}}))
-    assert an.has_attachments(pf) is True and an.has_xfa(pf) is False
-    pf, _page = with_annots([text_annot(RECT, "f", subtype="FileAttachment")])
-    assert an.has_attachments(pf) is True
+    assert an.attachments(pf) == [] and an.has_xfa(pf) is False
+    tree = {"Kids": [{"Names": [b"b.txt", Ref(500)]}, {"Names": [b"c", Ref(502)]}]}
+    files = {**embedded_file(500, "b.txt", b"hello"), **embedded_file(502, "c.csv", kind="text/csv")}
+    pf = PDFFile(simple_pdf([b""], catalog={"Names": {"EmbeddedFiles": tree}}, extra_objects=files))
+    assert an.attachments(pf) == [("b.txt", 5, "text/plain", None, None), ("c.csv", 3, "text/csv", None, None)]
+    pf, _page = with_annots([dict(text_annot(RECT, "f", subtype="FileAttachment"), FS=Ref(500))],
+                            extra_objects=embedded_file(500, "x.xlsx"))
+    assert an.attachments(pf) == [("x.xlsx", 3, "text/plain", 0, RECT)]
+
+
+def test_encrypted_payload():
+    """An unencrypted wrapper (ISO 32000-2 7.6.7): a file of /AF with /AFRelationship /EncryptedPayload and an /EP
+    dictionary names its payload's crypt filter; any other file has none."""
+    wrapped = embedded_file(500, "Protected.pdf", AFRelationship=Name("EncryptedPayload"),
+                            EP={"Type": Name("EncryptedPayload"), "Subtype": Name("MicrosoftIRMServices")})
+    pf = PDFFile(simple_pdf([b""], catalog={"AF": [Ref(500)], "Names": {"EmbeddedFiles": {"Names": [b"p", Ref(500)]}}},
+                            extra_objects=wrapped))
+    assert an.encrypted_payload(pf) == "MicrosoftIRMServices"
+    pf = PDFFile(simple_pdf([b""], catalog={"Names": {"EmbeddedFiles": {"Names": [b"a", Ref(500)]}}},
+                            extra_objects=embedded_file(500, "a.txt")))
+    assert an.encrypted_payload(pf) is None
+
+
+def test_page_labels():
+    """ISO 32000-1 12.4.2: each range's prefix, start and style; a page before the first range has no label."""
+    labels = {"Nums": [1, {"S": Name("r")}, 3, {"S": Name("D"), "St": 45}, 5, {"P": b"A-", "S": Name("A"), "St": 26},
+                       7, {"P": b"Cover"}]}
+    pf = PDFFile(simple_pdf([b""] * 8, catalog={"PageLabels": labels}))
+    assert an.page_labels(pf, 8) == {1: "i", 2: "ii", 3: "45", 4: "46", 5: "A-Z", 6: "A-AA", 7: "Cover"}
+    pf = PDFFile(simple_pdf([b""] * 2, catalog={"PageLabels": {"Kids": [{"Nums": [0, {"S": Name("R"), "St": 4}]}]}}))
+    assert an.page_labels(pf, 2) == {0: "IV", 1: "V"}
 
 
 # -- outline --
@@ -272,10 +316,21 @@ PAGES = {PDFRef(4, 0): 0, PDFRef(6, 0): 1}
 
 def test_outline():
     items = [(1, "Intro", 0), (2, "Part", 1)]
-    assert an.outline(outline_pdf(items), PAGES) == items
+    assert an.outline(outline_pdf(items), PAGES) == [(*it, None) for it in items]
     items = [(1, "A", 0), (2, "A1", 1), (2, "A2", 1), (1, "B", 1)]
-    assert an.outline(outline_pdf(items), PAGES) == items
+    assert an.outline(outline_pdf(items), PAGES) == [(*it, None) for it in items]
     assert an.outline(outline_pdf([]), PAGES) == []
+
+
+def test_outline_top():
+    # the y an /XYZ, /FitH or /FitBH destination shows at the top; none for /Fit
+    def views(objects):
+        objects[301]["Dest"] = [Ref(4), Name("XYZ"), 0, 640, 0]
+        objects[302]["Dest"] = [Ref(6), Name("FitH"), 300.5]
+        objects[303]["Dest"] = [Ref(6), Name("XYZ"), None, None, None]
+
+    pf = outline_pdf([(1, "A", 0), (1, "B", 1), (1, "C", 1), (1, "D", 1)], mutate=views)
+    assert an.outline(pf, PAGES) == [(1, "A", 0, 640.0), (1, "B", 1, 300.5), (1, "C", 1, None), (1, "D", 1, None)]
 
 
 def test_outline_cycle():
@@ -284,7 +339,7 @@ def test_outline_cycle():
         objects[301]["First"] = Ref(301)
 
     pf = outline_pdf([(1, "Intro", 0), (1, "End", 1)], mutate=loop)
-    assert an.outline(pf, PAGES) == [(1, "Intro", 0), (1, "End", 1)]
+    assert an.outline(pf, PAGES) == [(1, "Intro", 0, None), (1, "End", 1, None)]
 
 
 def test_outline_caps():
@@ -310,7 +365,7 @@ def test_outline_named_dest_and_action():
     objects[400] = {"Names": [b"sec", [Ref(4), Name("Fit")], b"zzz", {"D": [Ref(6), Name("Fit")]}]}
     pf = PDFFile(simple_pdf([b"", b""], extra_objects=objects, catalog={
         "Outlines": Ref(300), "Dests": {"chap": [Ref(6), Name("Fit")]}, "Names": {"Dests": Ref(400)}}))
-    assert an.outline(pf, PAGES) == [(1, "Chap", 1), (1, "Sec", 0), (1, "Dict", 1)]
+    assert an.outline(pf, PAGES) == [(1, "Chap", 1, None), (1, "Sec", 0, None), (1, "Dict", 1, None)]
     assert pf.cuts["outline"] == 2  # the web link and the missing name have no page: dropped, counted
 
 
@@ -462,7 +517,7 @@ def test_field_kids_shared_array():
                202: widget(RECT, PAGE)}
     pf = PDFFile(simple_pdf([b""], catalog={"AcroForm": Ref(200)}, extra_objects=objects))
     cut = Counter()
-    assert an.fields(pf, cut) == {0: [("r", "A", False)]} and cut["field"] == 1 and an.FIELD_KIDS == 10_000
+    assert an.fields(pf, cut) == {0: [("r (radio button)", "A", False, RECT)]} and cut["field"] == 1 and an.FIELD_KIDS == 10_000
 
 
 def test_page_index_shared_kids():

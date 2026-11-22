@@ -54,7 +54,9 @@ def test_native_images():
     assert len(page.images) == 1
     got = page.images[0]
     assert isinstance(got, PageImage) and got.box == (72, 600, 172, 650)
-    assert got.px == (40, 40) and got.kind == "png" and got.data[:4] == b"\x89PNG"
+    assert got.px == (40, 40) and got.kind == "png" and got.data is None
+    data, flat = got.picture()
+    assert data[:4] == b"\x89PNG" and not flat
 
 
 def test_native_image_cap():
@@ -116,10 +118,10 @@ def test_native_fields_comments():
                      page_extra={"Annots": [Ref(100)]})
     doc = dm.NativeDoc(pdf)
     page = doc.page(0)
-    assert page.fields[0] == ("Name", "Kim", False) and len(page.fields[1][1]) == 2_000
+    assert page.fields[0] == ("Name", "Kim", False, (72, 700, 200, 720)) and len(page.fields[1][1]) == 2_000
     assert [(c.author, c.text) for c in page.comments] == [("Lee", "note")]
     assert page.links == [] and doc.cut["field"] == 1
-    assert doc.fields == {0: page.fields} and doc.xfa is False and doc.attachments is False
+    assert doc.fields == {0: page.fields} and doc.xfa is False and doc.attachments == []
 
 
 def test_native_glyphs_once():
@@ -136,7 +138,7 @@ def test_native_outline():
     items = [(1, "Intro", 0), (2, "Detail", 1)]
     pdf = simple_pdf([text_ops("A"), text_ops("B")], catalog={"Outlines": Ref(300)},
                      extra_objects=outline_items(items))
-    assert dm.NativeDoc(pdf).outline() == items
+    assert dm.NativeDoc(pdf).outline() == [(*it, None) for it in items]
 
 
 def test_native_late_decrypt_budget():

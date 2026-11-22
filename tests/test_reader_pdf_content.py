@@ -244,7 +244,7 @@ def test_rule_segments():
     assert len(pc.segments) == 4, pc.segments
     assert sorted((s.y0, s.y1) for s in pc.segments) == [
         (300, 300), (400, 400), (401, 401), (500, 500)]
-    assert pc.figure[1] == 1  # the diagonal gave no rule segment
+    assert [rule for _b, _n, rule in pc.marks] == [True, True, False, True]  # the diagonal gave no rule segment
 
 
 def test_segment_cap():
@@ -267,9 +267,10 @@ def test_short_segments():
 def test_figure_paths():
     body = b"".join(circle(50 + 12 * i, 100 + 3 * i, 5) for i in range(40))
     pc = run(body)
-    assert pc.figure[1] == 40 and not pc.segments
-    assert pc.figure[0] == (45, 95, 50 + 12 * 39 + 5, 100 + 3 * 39 + 5)
-    assert run(text_ops("A")).figure == (None, 0)
+    assert len(pc.marks) == 40 and not pc.segments and not any(rule for _b, _n, rule in pc.marks)
+    assert pc.marks[0][0] == (45, 95, 55, 105) and pc.marks[-1][0] == (50 + 12 * 39 - 5, 100 + 3 * 39 - 5, 50 + 12 * 39 + 5, 100 + 3 * 39 + 5)
+    assert {n for _b, n, _r in pc.marks} == {4}  # a circle is four curves
+    assert run(text_ops("A")).marks == []
 
 
 def test_off_layer_paths_dropped():

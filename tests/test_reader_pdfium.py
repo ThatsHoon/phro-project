@@ -6,6 +6,7 @@ Run: python -I -X utf8 tests/test_reader_pdfium.py
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,8 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pdf_fix import (JPEG, EncryptSpec, Name, Ref, Stream, acroform, font_type0, image_xobject,  # noqa: E402
+from pdf_fix import (JPEG, NAV_HEADS, EncryptSpec, Name, Ref, Stream, acroform, bar_chart, embedded_file,  # noqa: E402
+                     font_type0, image_xobject, nav_pdf,
                      link_annot, ocg_catalog, outline_items, rule_ops, simple_pdf, text_annot, text_ops, widget)
 
 from reader import cache, images, pyenv  # noqa: E402
@@ -157,6 +159,18 @@ def test_pdfium_figure_crop():
     assert "Caption" in got["md"] and not got["skipped"], got
 
 
+def test_pdfium_vector_chart_is_figure():
+    """As through native: a bar chart of seven filled paths is a figure by the pieces it draws; pdfium renders its
+    crop, and its labels follow the render as one `Figure text:` between the paragraphs around it."""
+    got = run(simple_pdf([bar_chart()]))
+    assert got["meta"]["figures"] == [1] and got["meta"]["unrendered"] == [] and not got["skipped"], got["meta"]
+    _name, _size, w, h = got["assets"][0]
+    assert len(got["assets"]) == 1 and w < 1000 and h < 600, got["assets"]
+    md = got["md"]
+    assert md.index("Sales rose") < md.index("](assets/") < md.index("Figure text: ") < md.index("The next"), md
+    assert "Q1 Q2" in md[md.index("Figure text: "):md.index("The next")], md
+
+
 def test_pdfium_renders_cap():
     image = image_xobject(64, 64, data=bytes(range(64)) * 64)
     # a small square at a different place on each page keeps the renders distinct
@@ -178,11 +192,18 @@ def test_pdfium_pixel_cap():
     assert not got["skipped"], got["skipped"]
 
 
+def test_pdfium_picture_off_the_page_left_out():
+    """As through native: a picture drawn wholly outside the page's crop is left out, uncounted."""
+    for place, kept in ((b"q 200 0 0 200 -400 300 cm /Im1 Do Q ", False), (b"q 200 0 0 200 -100 300 cm /Im1 Do Q ", True)):
+        got = run(with_image(place + text_ops("Caption", x=72, y=200), image_xobject(64, 64, data=bytes(range(64)) * 64)))
+        assert ("![" in got["md"]) == kept and not got["skipped"], (kept, got["md"], got["skipped"])
+
+
 def test_pdfium_image_cap():
     res = dict(F1, XObject={f"Im{i}": Ref(30 + i) for i in range(3)})
     body = text_ops("Words", y=750) + b"".join(
         b" q 100 0 0 100 %d 400 cm /Im%d Do Q" % (72 + 150 * i, i) for i in range(3))
-    images = {30 + i: image_xobject(64, 64, data=bytes([40 * (i + 1)]) * 4096) for i in range(3)}
+    images = {30 + i: image_xobject(64, 64, data=bytes((k + 40 * i) % 256 for k in range(4096))) for i in range(3)}
     got = run(simple_pdf([body], resources=res, extra_objects=images), patch={"PDF_PAGE_IMAGES": 2})
     assert len(got["assets"]) == 2, got["assets"]
     assert got["skipped"] == {"image": 1}, got["skipped"]
@@ -205,8 +226,8 @@ def _fields_pdf():
 def test_pdfium_fields():
     got = run(_fields_pdf())
     md = got["md"]
-    assert "> Field Name: Kim" in md and "> Field Agree: Yes" in md, md
-    assert "Empty" not in md and md.index("Body text") < md.index("> Field Name"), md
+    assert "\nField Name: Kim\n" in md and "\nField Agree (checkbox): checked\n" in md, md
+    assert "\nField Empty: (empty)\n" in md and md.index("Body text") < md.index("Field Name"), md
     assert not got["skipped"], got["skipped"]
 
 
@@ -216,10 +237,10 @@ def test_pdfium_field_without_widget():
     data = simple_pdf([text_ops("First page"), text_ops("Second page")], catalog={"AcroForm": Ref(200)},
                       extra_objects=objects)
     got, native = run(data), run(data, engine="native")
-    assert native["md"].count("> Field Lonely: Solo") == 1, native["md"]
+    assert native["md"].count("\nField Lonely: Solo\n") == 1, native["md"]
     assert got["md"] == native["md"], (got["md"], native["md"])
     md = got["md"]
-    assert md.index("First page") < md.index("> Field Lonely") < md.index("## Page 2"), md
+    assert md.index("First page") < md.index("Field Lonely") < md.index("## Page 2"), md
     assert got["meta"]["engine"] == "pdfium", got["meta"]
 
 
@@ -326,6 +347,24 @@ def test_pdfium_outline_headings():
                       catalog={"Outlines": Ref(300)}, extra_objects=outline_items([(1, "Intro", 0)]))
     md = run(data)["md"]
     assert "### Intro" in md and md.count("Intro") == 1, md
+
+
+def test_pdfium_outline_and_page_labels():
+    md = run(nav_pdf())["md"]
+    assert re.findall(r"^#+ .*$", md, re.M) == NAV_HEADS, md
+    assert md.index("Body line one.") < md.index("### Second part") < md.index("Body line two."), md
+
+
+def test_pdfium_attachments_and_drm():
+    files = embedded_file(500, "data.csv", b"a,b\n1,2\n", kind="text/csv")
+    md = run(simple_pdf([text_ops("Body")], catalog={"Names": {"EmbeddedFiles": {"Names": [b"d", Ref(500)]}}},
+                        extra_objects=files))["md"]
+    assert "\nAttached file: data.csv (8 bytes, text/csv)\n" in md, md
+    wrapped = embedded_file(500, "Protected.pdf", AFRelationship=Name("EncryptedPayload"),
+                            EP={"Type": Name("EncryptedPayload"), "Subtype": Name("MicrosoftIRMServices")})
+    got = run(simple_pdf([text_ops("This document is protected")], extra_objects=wrapped,
+                         catalog={"AF": [Ref(500)], "Names": {"EmbeddedFiles": {"Names": [b"p", Ref(500)]}}}))
+    assert got.get("error", [None])[0] == "drm", got
 
 
 def _turned(text, vx, vy, size=10):
@@ -579,7 +618,7 @@ def _hidden_form_pdf():
                       page_extra={"Annots": annots})
 
 
-HIDDEN_FORM_LINES = ("> (hidden) Field Hid: hidden value", "> (hidden) Field NoView: noview value",
+HIDDEN_FORM_LINES = ("(hidden) Field Hid: hidden value", "(hidden) Field NoView: noview value",
                      "> (hidden) Comment by Ann: noview note")
 
 
@@ -589,7 +628,7 @@ def test_pdfium_hidden_fields():
     for opts in ({}, {"native_fails": True}):
         md = run(data, **opts)["md"]
         assert md.splitlines()[0] == "(3 hidden places left out)", (opts, md)
-        assert "> Field Two: two value" in md and "> Field Seen: seen value" in md, (opts, md)
+        assert "\nField Two: two value\n" in md and "\nField Seen: seen value\n" in md, (opts, md)
         shown = run(data, hidden=True, **opts)["md"].splitlines()
         assert all(line in shown for line in HIDDEN_FORM_LINES), (opts, shown)
 
@@ -597,9 +636,9 @@ def test_pdfium_hidden_fields():
 def test_pdfium_widget_walk():
     # native failed: fields come from the page's widgets and match native's
     data = _fields_pdf()
-    want = [ln for ln in run(data, engine="native")["md"].splitlines() if ln.startswith("> Field")]
+    want = run(data, engine="native")["md"]
     got = run(data, native_fails=True)
-    assert want and [ln for ln in got["md"].splitlines() if ln.startswith("> Field")] == want, (got, want)
+    assert "Field Agree (checkbox): checked" in want and got["md"] == want, (got, want)
 
 
 ARIAL = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "Fonts" / "arial.ttf"
@@ -773,9 +812,10 @@ def test_pdfium_scan_images_not_read_again():
     assert "_Scanned page, text by OCR._" in got["md"], got["md"]
 
 
-def test_pdfium_picture_under_text_layer_not_ocred():
-    """As through native: a picture under invisible text, or drawn over the page's text (an OCR layer), is not read
-    by the picture pass; one with a label drawn over it, or drawn over a label on a page of other text, is."""
+def test_pdfium_picture_under_text_layer_left_out():
+    """As through native (decision 8): a picture under invisible text, or drawn over the page's text (an OCR layer),
+    is no picture of the output and is not read by the picture pass; one with a label drawn over it, or drawn over a
+    label on a page of other text, is both."""
     picture = b"q 200 0 0 200 100 300 cm /Im1 Do Q "
     stub = str(HERE / "tests" / "ocr_stub_worker.py")
     inside = _SCAN.replace("\nwith tempfile.TemporaryDirectory() as tmp:\n",
@@ -787,6 +827,21 @@ def test_pdfium_picture_under_text_layer_not_ocred():
         data = with_image(content, image_xobject(64, 64, data=bytes(range(64)) * 64))
         got = child(inside, data, stub, env=dict(os.environ, PHRO_OCR_STUB="{}"))
         assert [k for _w, _h, k, _d in got["sent"]] == (["picture"] if read else []), (content, got["sent"])
+        assert ("![" in got["md"]) == read, got["md"]
+
+
+def test_pdfium_picture_decoded_once_chosen():
+    """As through native: a picture under the page's text is never decoded (no bitmap is taken), a flat one is left
+    out uncounted, and the one picture kept is the only one encoded."""
+    res = dict(F1, XObject={"Im1": Ref(30), "Im2": Ref(31), "Im3": Ref(32)})
+    content = (b"q 200 0 0 200 100 300 cm /Im1 Do Q " + text_ops("Layer words", x=150, y=400, extra=b"3 Tr")
+               + b" q 100 0 0 100 300 100 cm /Im2 Do Q q 100 0 0 100 300 600 cm /Im3 Do Q "
+               + text_ops("Caption", x=72, y=80))
+    objects = {30: image_xobject(64, 64, data=bytes(range(64)) * 64), 31: image_xobject(64, 64),
+               32: image_xobject(64, 64, data=bytes(range(63, -1, -1)) * 64)}
+    got = run(simple_pdf([content], resources=res, extra_objects=objects), count=["FPDFImageObj_GetBitmap"])
+    assert got["calls"] == {"FPDFImageObj_GetBitmap": 2}, got["calls"]
+    assert [a[2:] for a in got["assets"]] == [[64, 64]] and not got["skipped"], (got["assets"], got["skipped"])
 
 
 def test_pdfium_small_scan_not_sent():

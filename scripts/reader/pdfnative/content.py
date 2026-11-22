@@ -140,7 +140,7 @@ class PageContent:
     fragments: List[Fragment]
     segments: Sequence[Segment]
     short: Sequence[Segment]
-    figure: tuple  # (union box or None, count of painted paths that gave no rule)
+    marks: List[tuple]  # (box, pieces, rule) of each painted path, PathCollector.marks
     # (resource name, box, stream, last text object) in content order. The name is from the
     # resources of the stream that drew it (a form has its own), so the resolved image XObject
     # `stream` is what to read; it is None when the name does not resolve to a stream. The last
@@ -789,7 +789,7 @@ class _Page:
                 for frag in _clip_form_fragments(target, bbox, form_ctm):
                     frag.order = len(frags)
                     frags.append(frag)
-            paths.add_figure(*child_paths.figure)
+            paths.add_marks(child_paths.marks)
 
 
 def interpret(pdf: PDFFile, content: bytes, resources, fonts_cache: dict, oc: OCState, *,
@@ -813,5 +813,5 @@ def interpret(pdf: PDFFile, content: bytes, resources, fonts_cache: dict, oc: OC
             fragments.append(frag)
         else:
             page.cut["bad_coord"] += 1
-    return PageContent(fragments, paths.segments, paths.short_segments, paths.figure,
+    return PageContent(fragments, paths.segments, paths.short_segments, paths.marks,
                        page.image_draws, page.objects, page.cut, page.unmapped, page.unmapped_glyphs)

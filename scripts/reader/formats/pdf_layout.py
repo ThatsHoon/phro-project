@@ -28,6 +28,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .. import images, limits
 from ..model import Heading, Link, Para, Text
 from . import xps
 
@@ -99,12 +100,40 @@ def across(frag: Fragment) -> float:
 class PageImage:
     """One image on a page: its box, its viewable bytes (or None) and its pixel size.
     `kind` is "jpg", "png", "jpx", "ccitt", "jbig2" or "raw". `under`: the page's own text lies
-    under it (`text_under`), as an OCR layer lies on its scan, so OCR would read that text again."""
+    under it (`text_under`), as an OCR layer lies on its scan, so its pixels are not taken.
+    `load`, when set, decodes the samples only when called and gives what `picture` gives."""
     box: Tuple[float, float, float, float]
     data: Optional[bytes]
     px: Tuple[int, int]
     kind: str
     under: bool = False
+    load: Optional[Callable] = None
+
+    def picture(self):
+        """(bytes or None, flat): `data`, or the PNG `load` decodes and encodes; flat is True for
+        a picture of one colour, which has no bytes."""
+        return (self.data, False) if self.load is None else self.load()
+
+
+def flat(rows, span: int) -> bool:
+    """Whether every channel of 8-bit `rows` (`span` bytes a pixel) stays within
+    limits.OCR_FLAT levels: a picture of one colour."""
+    low, high = [255] * span, [0] * span
+    for row in rows:
+        for c in range(span):
+            line = row[c::span]
+            if line:
+                low[c], high[c] = min(low[c], min(line)), max(high[c], max(line))
+                if high[c] - low[c] > limits.OCR_FLAT:
+                    return False
+    return True
+
+
+def picture(width: int, height: int, rows, alpha: bool):
+    """(PNG at zlib level 1, False) of RGB (or RGBA) rows, or (None, True) when they are flat."""
+    if flat(rows, 4 if alpha else 3):
+        return None, True
+    return images._png(width, height, rows, alpha, 1), False
 
 
 def text_marks(frags):
@@ -146,8 +175,9 @@ class PageData:
     """Everything the reader takes from one page.
 
     `box` is the crop box in page space; `short` the sub-1-unit rule pieces kept for the
-    short-dash supplement; `figure` is (union box or None, non-rule path count); `links` is
-    [(box, url)], `fields` [(label, value, hidden)]; `cut` counts what a cap dropped; `render` is
+    short-dash supplement; `marks` are (box, pieces, rule) of the painted paths
+    (`pdf_tables.PathCollector.marks`); `links` is
+    [(box, url)], `fields` [(label, value, hidden, box or None)]; `cut` counts what a cap dropped; `render` is
     (box, dpi) -> png bytes or None; `unmapped` counts the glyphs dropped for having no Unicode.
     """
     number: int
@@ -157,7 +187,7 @@ class PageData:
     segments: list = field(default_factory=list)
     short: list = field(default_factory=list)
     images: List[PageImage] = field(default_factory=list)
-    figure: tuple = (None, 0)
+    marks: list = field(default_factory=list)
     links: list = field(default_factory=list)
     fields: list = field(default_factory=list)
     comments: List[Comment] = field(default_factory=list)
@@ -974,10 +1004,15 @@ def _joined(group, model) -> list:
 
 
 def paragraphs(lns, model, body=None) -> List[Para]:
-    """Paragraphs: a baseline step over PARA_GAP x the body pitch `body` (the `pitch` of these
-    lines when None), a step that does not go forward, or a line that was ended rather than
-    wrapped (`_ended`) starts a new one, and a table-of-contents entry (`toc_entry`) ends its own.
-    Links become Link inlines; nothing is bold."""
+    """Paragraphs of `_groups`. Links become Link inlines; nothing is bold."""
+    return [Para(got) for got in (_joined(group, model) for group in _groups(lns, body)) if got]
+
+
+def _groups(lns, body=None) -> list:
+    """The lines of each paragraph: a baseline step over PARA_GAP x the body pitch `body` (the
+    `pitch` of these lines when None), a step that does not go forward, or a line that was ended
+    rather than wrapped (`_ended`) starts a new one, and a table-of-contents entry (`toc_entry`)
+    ends its own."""
     body = pitch(lns) if body is None else body
     groups, cur, prev, right = [], [], None, -math.inf
     for ln in lns:
@@ -992,7 +1027,7 @@ def paragraphs(lns, model, body=None) -> List[Para]:
             cur = []
     if cur:
         groups.append(cur)
-    return [Para(got) for got in (_joined(group, model) for group in groups) if got]
+    return groups
 
 
 def inlines(ln) -> list:
@@ -1000,27 +1035,59 @@ def inlines(ln) -> list:
     return [Link(u, [Text(t)]) if u else Text(t) for t, u in ln.runs if t]
 
 
+def _slot(lns, item) -> int:
+    """The index of the line `item` goes before. An item (top, x0, seq, block, x1) goes before the first line of its
+    column (a line whose x range meets x0..x1) whose top is below its own top, else after the last line of its column;
+    one with no x1, or whose x range meets no line, before the first line whose top is below its top."""
+    top = item[0]
+    if len(item) > 4:
+        x0, x1 = item[1], item[4]
+        last = None
+        for i, ln in enumerate(lns):
+            if ln.box[0] < x1 and ln.box[2] > x0:
+                if ln.box[3] < top:
+                    return i
+                last = i
+        if last is not None:
+            return last + 1
+    return next((i for i, ln in enumerate(lns) if ln.box[3] < top), len(lns))
+
+
 def place(lns, items, levels, model) -> list:
-    """Headings and paragraphs in line order, with each item placed before the first line whose top is below its own
-    top. `items` are (top, x, seq, block); `levels` maps a line index to its heading level. Paragraphs break by the
-    `pitch` of all the lines; consecutive lines of one level within a paragraph's step of each other and at a size within
-    SIZE_TOLERANCE are one heading (a title that wraps)."""
-    items = sorted(items, key=lambda it: (-it[0], it[1], it[2]))
+    """Headings and paragraphs in line order, with each item placed by `_slot`, items of one slot by top, then x, then
+    seq; an item slotted inside a paragraph goes after it. `items` are (top, x, seq, block) or (top, x0, seq, block,
+    x1); `levels` maps a line index to its heading level. Paragraphs break by the `pitch` of all the lines; consecutive
+    lines of one level within a paragraph's step of each other and at a size within SIZE_TOLERANCE are one heading (a
+    title that wraps)."""
+    slots = defaultdict(list)
+    for it in sorted(items, key=lambda it: (-it[0], it[1], it[2])):
+        slots[_slot(lns, it)].append(it)
     body = pitch(lns)
-    out, run, head, n = [], [], [], 0
+    out, run, head, held = [], [], [], {}
 
     def flush():
-        out.extend(paragraphs(run, model, body))
+        start = 0
+        for group in _groups(run, body):
+            end = start + len(group)
+            out.extend(it[3] for it in held.get(start, ()))
+            got = _joined(group, model)
+            if got:
+                out.append(Para(got))
+            out.extend(it[3] for at in range(start + 1, end) for it in held.get(at, ()))
+            start = end
         run.clear()
+        held.clear()
         if head:
             out.append(Heading(levels[head[0][0]], _joined([ln for _, ln in head], model)))
             head.clear()
 
     for i, ln in enumerate(lns):
-        while n < len(items) and items[n][0] > ln.box[3]:
-            flush()
-            out.append(items[n][3])
-            n += 1
+        if i in slots:
+            if run and not head and i not in levels:
+                held[len(run)] = slots[i]
+            else:
+                flush()
+                out.extend(it[3] for it in slots[i])
         if i in levels:
             if head and not (levels[head[-1][0]] == levels[i] and head[-1][0] == i - 1
                              and abs(head[-1][1].size - ln.size) <= SIZE_TOLERANCE
@@ -1034,7 +1101,7 @@ def place(lns, items, levels, model) -> list:
                 flush()
             run.append(ln)
     flush()
-    out.extend(it[3] for it in items[n:])
+    out.extend(it[3] for it in slots.get(len(lns), ()))
     return out
 
 

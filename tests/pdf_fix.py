@@ -497,7 +497,46 @@ def rule_ops(x0, y0, x1, y1, w=0.5):
     return b"%s w %s %s m %s %s l S" % tuple(_num(v).encode() for v in (w, x0, y0, x1, y1))
 
 
+def bar_chart():
+    """A bar chart: a filled plot area, six bars, six grid rules and short labels inside it, with a paragraph above and
+    below. Seven filled paths, under FIGURE_PATHS, but they and the rules draw 34 pieces."""
+    plot = b"0.9 g 100 280 400 220 re f "
+    bars = b"".join(b"0.2 g %d 300 30 %d re f " % (130 + 60 * i, 40 + 25 * i) for i in range(6))
+    grid = b" ".join(rule_ops(100, 300 + 40 * k, 500, 300 + 40 * k) for k in range(6))
+    labels = b" ".join(text_ops(str(40 * k), x=104, y=302 + 40 * k, size=7) for k in range(5))
+    labels += b" " + b" ".join(text_ops("Q%d" % (i + 1), x=135 + 60 * i, y=285, size=7) for i in range(6))
+    return (text_ops("Sales rose in every quarter of the year, as the chart below shows.", y=700) + b" "
+            + plot + bars + b"0 g " + grid + b" " + labels + b" "
+            + text_ops("The next paragraph follows the chart and is body text.", y=240))
+
+
 # -- annotations, form fields, outlines and images --
+
+def embedded_file(num, name, data=b"abc", kind="text/plain", **spec):
+    """{num: a file specification named `name`, num + 1: its embedded file of `data`}, the file's
+    /Subtype `kind` and /Params /Size its length; `spec` adds keys to the specification."""
+    stream = Stream({"Type": Name("EmbeddedFile"), "Subtype": Name(kind), "Params": {"Size": len(data)}}, data)
+    return {num: {"Type": Name("Filespec"), "F": name, "UF": name, "EF": {"F": Ref(num + 1)}, **spec},
+            num + 1: stream}
+
+
+def nav_pdf():
+    """Three pages labelled i, ii, 1 (/PageLabels); page 1's outline has "Intro", matching its first line, and
+    "Second part", matching none, its destination's top (/XYZ 650) between its two body lines; page 2's outline
+    item "Appendix" is a /Fit view."""
+    def views(objects):
+        objects[302]["Dest"] = [Ref(4), Name("XYZ"), 0, 650, 0]
+
+    items = outline_items([(1, "Intro", 0), (1, "Second part", 0), (1, "Appendix", 1)])
+    views(items)
+    labels = {"Nums": [0, {"S": Name("r")}, 2, {"S": Name("D")}]}
+    page1 = b" ".join([text_ops("Intro", y=720), text_ops("Body line one.", y=700), text_ops("Body line two.", y=600)])
+    return simple_pdf([page1, text_ops("Page two text.", y=700), text_ops("Page three text.", y=700)],
+                      catalog={"Outlines": Ref(300), "PageLabels": labels}, extra_objects=items)
+
+
+NAV_HEADS = ["## Page 1: p. i", "### Intro", "### Second part", "## Page 2: p. ii", "### Appendix", "## Page 3: p. 1"]
+
 
 def link_annot(rect, uri):
     """A /Link annotation whose action is a /URI."""

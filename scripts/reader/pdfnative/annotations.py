@@ -30,7 +30,8 @@ FIELD_KID_TOTAL = 200_000   # /Kids entries read in all
 FIELD_SCAN =100_000        # page /Annots entries scanned to place fields without /P
 OUTLINE_ITEMS = 1_000
 OUTLINE_DEPTH = 32
-NAME_NODES = 10_000         # name tree nodes one destination lookup may visit
+NAME_NODES = 10_000         # name tree nodes one destination lookup (or one tree walk) may visit
+ATTACHMENTS = 256           # embedded files listed
 _COORD = 1e9
 _MARKUP = {"Text", "FreeText", "Highlight", "Underline", "Squiggly", "StrikeOut", "Caret",
            "Stamp", "Ink", "Square", "Circle", "Line", "Polygon", "PolyLine", "FileAttachment",
@@ -40,6 +41,9 @@ _NOVIEW = 32                # /F bit 6
 UNSEEN = _HIDDEN | _NOVIEW  # an annotation with either bit is not shown by a viewer
 _FF_RADIO = 1 << 15         # /Ff bit 16
 _FF_PUSH = 1 << 16          # /Ff bit 17
+FIELD_OPTIONS = 64          # options of a choice field listed
+EMPTY = "(empty)"           # the value of a field with none
+_KINDS = {"choice": "choice", "check": "checkbox", "radio": "radio button", "sig": "signature"}
 
 _SPECIAL = "•†‡…—–ƒ⁄‹›−‰„“”‘’‚™ﬁﬂŁŒŠŸŽıłœšž"
 _ACCENTS = "˘ˇˆ˙˝˛˚˜"
@@ -185,21 +189,37 @@ def order_comments(items: List[tuple]) -> List[Comment]:
 
 # -- form fields --
 
-def field_entry(label_tu: Optional[str], name: str, value, kind: str):
-    """(label, value, cut) of one field, or None when it is left out. The label is /TU, else the
-    last dot-part of the full name; newlines in a value become " / " and a value is cut at
-    FIELD_CHARS (cut True). `kind` is text, choice, check, radio, sig or push; a choice value may
-    be a list."""
-    if kind in ("sig", "push"):
+def field_entry(label_tu: Optional[str], name: str, value, kind: str, options=()):
+    """(label, value, cut) of one field, or None for a push button. The label is /TU, else the
+    last dot-part of the full name, and then the field's kind in brackets, but for a text field;
+    a choice's kind lists its options' display texts (at most FIELD_OPTIONS, then "…"). The value
+    of a check box is "checked" or "not checked", of a signature "signed" or EMPTY; a choice shows
+    the display texts of the export values picked; any other value is its text, EMPTY when blank
+    (or Off). Newlines in a value become " / " and a value is cut at FIELD_CHARS (cut True).
+    `kind` is text, choice, check, radio, sig or push; a choice value may be a list; `options` are
+    (export, display) pairs."""
+    if kind == "push":
         return None
     label = (label_tu or "").strip() or (name or "").rsplit(".", 1)[-1].strip() or "field"
-    if isinstance(value, (list, tuple)):
-        value = ", ".join(str(v) for v in value)
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    if not value or (kind in ("check", "radio") and value == "Off"):
-        return None
+    shown = dict(options)
+    if kind == "check":
+        value = "checked" if isinstance(value, str) and value.strip() not in ("", "Off") else "not checked"
+    elif kind == "sig":
+        value = "signed" if isinstance(value, str) and value.strip() else EMPTY
+    else:
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(shown.get(v, v) for v in value if isinstance(v, str))
+        elif isinstance(value, str):
+            value = shown.get(value, value)
+        value = value.strip() if isinstance(value, str) else ""
+        if not value or (kind == "radio" and value == "Off"):
+            value = EMPTY
+    if kind != "text":
+        desc = _KINDS[kind]
+        if kind == "choice" and options:
+            names = [" ".join(d.split()) for _e, d in options[:FIELD_OPTIONS]]
+            desc += ": " + ", ".join(names + ["…"] * (len(options) > FIELD_OPTIONS))
+        label = f"{label} ({desc})"
     value = value.replace("\r\n", " / ").replace("\r", " / ").replace("\n", " / ")
     cut = len(value) > FIELD_CHARS
     return label, value[:FIELD_CHARS], cut
@@ -261,10 +281,27 @@ def _field_kind(ft: str, flags: int) -> Optional[str]:
     return None
 
 
-def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str, bool]]]:
-    """{0-based page: [(label, value, hidden)]} of the filled fields in /AcroForm /Fields. A field
-    is hidden when each of its widgets (its kids without /T, else the field itself) has /F bit 2
-    or 6."""
+def _options(pdf: PDFFile, opt) -> List[Tuple[str, str]]:
+    """(export, display) of a choice field's /Opt: a text string is both, a pair is [export,
+    display]; at most FIELD_OPTIONS + 1 are read."""
+    out = []
+    opt = pdf.resolve(opt)
+    for item in opt[:FIELD_OPTIONS + 1] if isinstance(opt, list) else ():
+        item = pdf.resolve(item)
+        if isinstance(item, list) and len(item) == 2:
+            export, display = (text_string(pdf.resolve(v), 1_000) for v in item)
+        else:
+            export = display = text_string(item, 1_000) if isinstance(item, bytes) else ""
+        if display.strip():
+            out.append((export, display))
+    return out
+
+
+def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[tuple]]:
+    """{0-based page: [(label, value, hidden, box)]} of the fields in /AcroForm /Fields, push
+    buttons aside, through `field_entry`. `box` is the Rect of the field's widget on that page,
+    or None. A field is hidden when each of its widgets (its kids without /T, else the field
+    itself) has /F bit 2 or 6."""
     form = pdf.resolve(pdf.catalog.get("AcroForm"))
     roots = pdf.resolve(form.get("Fields")) if isinstance(form, dict) else None
     if not isinstance(roots, list):
@@ -272,7 +309,7 @@ def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str, bool]]]
     refs = None  # page index by reference, and the page of each widget listed in /Annots: lazy
     scan: Dict[int, int] = {}
 
-    def page_of(widgets) -> Optional[int]:
+    def page_of(widgets):
         nonlocal refs
         if refs is None:
             refs = page_index(pdf)
@@ -298,10 +335,10 @@ def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str, bool]]]
             if index is None and isinstance(ref, PDFRef):
                 index = scan.get(ref.num)
             if index is not None:
-                return index
-        return None
+                return index, _box(pdf, widget)
+        return None, None
 
-    out: Dict[int, List[Tuple[str, str, bool]]] = {}
+    out: Dict[int, List[tuple]] = {}
     if len(roots) > FIELD_KIDS:
         cut["field"] += 1
         roots = roots[:FIELD_KIDS]
@@ -329,7 +366,7 @@ def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str, bool]]]
         partial = text_string(pdf.resolve(node.get("T")), 1_000)
         name = f"{parent_name}.{partial}" if parent_name and partial else partial or parent_name
         state = dict(inherited)
-        for attr in ("FT", "V", "Ff"):
+        for attr in ("FT", "V", "Ff", "Opt"):
             if attr in node:
                 state[attr] = node[attr]
         kids = pdf.resolve(node.get("Kids"))
@@ -358,16 +395,20 @@ def fields(pdf: PDFFile, cut: Counter) -> Dict[int, List[Tuple[str, str, bool]]]
         if kind is None:
             continue
         tu = text_string(pdf.resolve(node.get("TU")), 1_000).strip() or None
-        entry = field_entry(tu, name, _field_value(pdf, state.get("V")), kind)
+        if kind == "sig":
+            value = "signed" if pdf.resolve(state.get("V")) is not None else None
+        else:
+            value = _field_value(pdf, state.get("V"))
+        entry = field_entry(tu, name, value, kind, _options(pdf, state.get("Opt")) if kind == "choice" else ())
         if entry is None:
             continue
         label, value, was_cut = entry
         if was_cut:
             cut["field"] += 1
-        page = page_of([(ref, node)] + widgets)
+        page, box = page_of([(ref, node)] + widgets)
         hidden = all(_unseen(pdf.resolve(widget.get("F"))) for _ref, widget in widgets or [(ref, node)])
-        # A filled field on no page is still document data: it goes to the first page.
-        out.setdefault(page or 0, []).append((label, value, hidden))
+        # A field on no page is still document data: it goes to the first page.
+        out.setdefault(page or 0, []).append((label, value, hidden, box if page is not None else None))
     return out
 
 
@@ -431,7 +472,10 @@ class _Destinations:
         return None
 
 
-def _dest_page(pdf: PDFFile, item: dict, pages: Dict[PDFRef, int], names: _Destinations):
+def _dest(pdf: PDFFile, item: dict, pages: Dict[PDFRef, int], names: _Destinations):
+    """(0-based page or None, top or None) of an outline item's destination: its /Dest, else its
+    GoTo action's /D, a name looked up in `names`. The top is the y of an /XYZ, /FitH or /FitBH
+    view (ISO 32000-1 12.3.2.2), in page space."""
     dest = pdf.resolve(item.get("Dest"))
     if dest is None:
         action = pdf.resolve(item.get("A"))
@@ -441,15 +485,18 @@ def _dest_page(pdf: PDFFile, item: dict, pages: Dict[PDFRef, int], names: _Desti
         dest = pdf.resolve(names.lookup(dest))
     if isinstance(dest, dict):
         dest = pdf.resolve(dest.get("D"))
-    if isinstance(dest, list) and dest and isinstance(dest[0], PDFRef):
-        return pages.get(dest[0])
-    return None
+    if not (isinstance(dest, list) and dest and isinstance(dest[0], PDFRef)):
+        return None, None
+    view = str(pdf.resolve(dest[1])) if len(dest) > 1 else ""
+    at = {"XYZ": 3, "FitH": 2, "FitBH": 2}.get(view)
+    top = pdf.resolve(dest[at]) if at is not None and len(dest) > at else None
+    return pages.get(dest[0]), float(top) if _number(top) else None
 
 
-def outline(pdf: PDFFile, page_index: Dict[PDFRef, int]) -> List[Tuple[int, str, int]]:
-    """[(depth from 1, title, 0-based page)] of the outline in document order. An item whose
-    destination is no page of this file is left out; both that and a cap are counted on
-    pdf.cuts["outline"]."""
+def outline(pdf: PDFFile, page_index: Dict[PDFRef, int]) -> List[tuple]:
+    """[(depth from 1, title, 0-based page, top or None)] of the outline in document order, `top`
+    the y its destination shows at the top (`_dest`). An item whose destination is no page of
+    this file is left out; both that and a cap are counted on pdf.cuts["outline"]."""
     root = pdf.resolve(pdf.catalog.get("Outlines"))
     if not isinstance(root, dict):
         return []
@@ -467,14 +514,14 @@ def outline(pdf: PDFFile, page_index: Dict[PDFRef, int]) -> List[Tuple[int, str,
             continue
         title = text_string(pdf.resolve(item.get("Title")), 1_000).strip()
         if title:
-            page = _dest_page(pdf, item, page_index, names)
+            page, top = _dest(pdf, item, page_index, names)
             if page is None:
                 pdf._cut("outline", "WARN: an outline item names no page of this file; it is left out")
             elif len(out) >= OUTLINE_ITEMS:
                 pdf._cut("outline", f"WARN: the outline passed {OUTLINE_ITEMS} items; the rest are dropped")
                 break
             else:
-                out.append((depth, title, page))
+                out.append((depth, title, page, top))
         stack.append((item.get("Next"), depth))
         if item.get("First") is not None:
             if depth + 1 > OUTLINE_DEPTH:
@@ -492,18 +539,147 @@ def has_xfa(pdf: PDFFile) -> bool:
     return isinstance(form, dict) and "XFA" in form
 
 
-def has_attachments(pdf: PDFFile) -> bool:
-    """True when the catalog names /Names /EmbeddedFiles, or a page has a /FileAttachment
-    annotation."""
+def _name_values(pdf: PDFFile, root) -> List[Any]:
+    """The values of a name tree (ISO 32000-1 7.9.6) in key order, at most ATTACHMENTS of them,
+    visiting at most NAME_NODES nodes."""
+    out: List[Any] = []
+    stack, seen = [root], set()
+    while stack and len(seen) < NAME_NODES and len(out) < ATTACHMENTS:
+        ref = stack.pop()
+        if _key(ref) in seen:
+            continue
+        seen.add(_key(ref))
+        node = pdf.resolve(ref)
+        if not isinstance(node, dict):
+            continue
+        pairs = pdf.resolve(node.get("Names"))
+        if isinstance(pairs, list):
+            out.extend(pairs[1:2 * ATTACHMENTS:2])
+        kids = pdf.resolve(node.get("Kids"))
+        if isinstance(kids, list):
+            stack.extend(reversed(kids[:NAME_NODES]))
+    return out[:ATTACHMENTS]
+
+
+def _attached(pdf: PDFFile, spec) -> Optional[Tuple[str, Optional[int], str]]:
+    """(name, size or None, media type or "") of a file specification with an embedded file."""
+    spec = pdf.resolve(spec)
+    if not isinstance(spec, dict):
+        return None
+    name = next((text_string(pdf.resolve(spec.get(k)), 1_000).strip() for k in ("UF", "F")
+                 if isinstance(pdf.resolve(spec.get(k)), bytes)), "") or "attached file"
+    ef = pdf.resolve(spec.get("EF"))
+    stream = pdf.resolve(ef.get("UF") or ef.get("F")) if isinstance(ef, dict) else None
+    if not isinstance(stream, PDFStream):
+        return None
+    d = stream.dictionary
+    params = pdf.resolve(d.get("Params"))
+    size = pdf.resolve(params.get("Size")) if isinstance(params, dict) else None
+    kind = pdf.resolve(d.get("Subtype"))
+    return (" ".join(name.split()), size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None,
+            str(kind) if isinstance(kind, PDFName) else "")
+
+
+def attachments(pdf: PDFFile) -> List[tuple]:
+    """[(name, size or None, media type, 0-based page or None, box or None)] of the embedded
+    files: those of /Names /EmbeddedFiles (no page), then those of /FileAttachment annotations
+    (their page and Rect), at most ATTACHMENTS in all."""
+    out: List[tuple] = []
     names = pdf.resolve(pdf.catalog.get("Names"))
-    if isinstance(names, dict) and "EmbeddedFiles" in names:
-        return True
-    for page, _inherited in pdf.pages():
+    if isinstance(names, dict) and names.get("EmbeddedFiles") is not None:
+        for spec in _name_values(pdf, names.get("EmbeddedFiles")):
+            got = _attached(pdf, spec)
+            if got is not None:
+                out.append((*got, None, None))
+    for index, (page, _inherited) in enumerate(pdf.pages()):
         annots = pdf.resolve(page.get("Annots"))
         if not isinstance(annots, list):
             continue
         for ref in annots[:PDF_ANNOTS]:
             annot = pdf.resolve(ref)
+            if len(out) >= ATTACHMENTS:
+                return out
             if isinstance(annot, dict) and str(pdf.resolve(annot.get("Subtype"))) == "FileAttachment":
-                return True
-    return False
+                got = _attached(pdf, annot.get("FS"))
+                if got is not None:
+                    out.append((*got, index, _box(pdf, annot)))
+    return out
+
+
+def encrypted_payload(pdf: PDFFile) -> Optional[str]:
+    """The /EP /Subtype of an unencrypted wrapper document (ISO 32000-2 7.6.7): a file of the
+    catalog's /AF or of /Names /EmbeddedFiles whose /AFRelationship is /EncryptedPayload or
+    that has an /EP dictionary. None for any other file."""
+    names = pdf.resolve(pdf.catalog.get("Names"))
+    specs = list(pdf.resolve(pdf.catalog.get("AF")) or ()) if isinstance(pdf.resolve(pdf.catalog.get("AF")), list) else []
+    if isinstance(names, dict) and names.get("EmbeddedFiles") is not None:
+        specs += _name_values(pdf, names.get("EmbeddedFiles"))
+    for spec in specs[:2 * ATTACHMENTS]:
+        spec = pdf.resolve(spec)
+        if not isinstance(spec, dict):
+            continue
+        ep = pdf.resolve(spec.get("EP"))
+        if isinstance(ep, dict) or str(pdf.resolve(spec.get("AFRelationship"))) == "EncryptedPayload":
+            kind = pdf.resolve(ep.get("Subtype")) if isinstance(ep, dict) else None
+            return str(kind) if isinstance(kind, PDFName) else "unknown"
+    return None
+
+
+def page_labels(pdf: PDFFile, count: int) -> Dict[int, str]:
+    """{0-based page: label} from the catalog's /PageLabels number tree (ISO 32000-1 12.4.2): a
+    range's /P prefix, then its /St start (1 by default) plus the page's place in the range in
+    its /S style: D decimal, R and r roman, A and a letters (A to Z, then AA to ZZ, ...). At most
+    NAME_NODES tree nodes and `count` pages."""
+    root = pdf.resolve(pdf.catalog.get("PageLabels"))
+    if not isinstance(root, dict):
+        return {}
+    starts: List[Tuple[int, dict]] = []
+    stack, seen = [root], set()
+    while stack and len(seen) < NAME_NODES:
+        ref = stack.pop()
+        if _key(ref) in seen:
+            continue
+        seen.add(_key(ref))
+        node = pdf.resolve(ref)
+        if not isinstance(node, dict):
+            continue
+        nums = pdf.resolve(node.get("Nums"))
+        if isinstance(nums, list):
+            for i in range(0, min(len(nums), 2 * MAX_PAGES) - 1, 2):
+                key, spec = pdf.resolve(nums[i]), pdf.resolve(nums[i + 1])
+                if isinstance(key, int) and not isinstance(key, bool) and 0 <= key < count and isinstance(spec, dict):
+                    starts.append((key, spec))
+        kids = pdf.resolve(node.get("Kids"))
+        if isinstance(kids, list):
+            stack.extend(reversed(kids[:NAME_NODES]))
+    starts.sort(key=lambda t: t[0])
+    out: Dict[int, str] = {}
+    for k, (first, spec) in enumerate(starts):
+        last = starts[k + 1][0] if k + 1 < len(starts) else count
+        style = str(pdf.resolve(spec.get("S")) or "")
+        prefix = pdf.resolve(spec.get("P"))
+        prefix = text_string(prefix, 1_000) if isinstance(prefix, bytes) else ""
+        start = pdf.resolve(spec.get("St"))
+        start = start if isinstance(start, int) and not isinstance(start, bool) and start >= 1 else 1
+        for page in range(first, last):
+            out[page] = " ".join((prefix + _label_number(start + page - first, style)).split())
+    return out
+
+
+def _label_number(n: int, style: str) -> str:
+    if style == "D":
+        return str(n)
+    if style in ("R", "r"):
+        if n >= 4000:
+            return str(n)
+        digits = []
+        for value, mark in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+                            (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+            count, n = divmod(n, value)
+            digits.append(mark * count)
+        roman = "".join(digits)
+        return roman if style == "R" else roman.lower()
+    if style in ("A", "a"):
+        letter = chr(ord("A") + (n - 1) % 26) * ((n - 1) // 26 + 1) if n <= 26 * 64 else str(n)
+        return letter if style == "A" else letter.lower()
+    return ""
