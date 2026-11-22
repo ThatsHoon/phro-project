@@ -21,7 +21,8 @@ counted under `object`.
 Hidden rows and columns and merged ranges go to the grid as they are read. Hyperlinks follow the cells, so they are
 collected (at most _LINKS a sheet) and applied after the stream: an external one wraps the cells in its range that
 hold a value in a link, at a cost of min(area, cells held) charged to the scan count; past SHEET_SCAN each link left
-is counted under `link`. A `location` alone changes nothing; an `r:id` without an external hyperlink relationship
+is counted under `link`. One with a `location` names a place in the workbook: the valued cells of its range are
+followed by `→ place`, and an `r:id` beside it is not followed. An `r:id` without an external hyperlink relationship
 counts `link`.
 Cell comments become notes (legacy `comments` parts ported from dochan, threaded ones new). A thread is its root and
 then its replies, each a "Comment by <name>:" paragraph of one note, the names from the workbook's persons part; a
@@ -43,7 +44,7 @@ from .. import limits
 from ..containers.zipx import attr, iterparse, local
 from ..limits import ReadError
 from ..model import Doc, Link, NoteRef, Para, Section, Text
-from ..numfmt import code_for, display
+from ..numfmt import code_for
 from . import ooxml_base, sheet_drawing, sheet_grid
 from .word_fields import MAX_URL, comment_note
 from .xls import _hide
@@ -60,8 +61,8 @@ STYLE_ELEMENTS = 1_000_000
 # (_x000D__x000A_), each two 7-character escapes for one character
 _RAW_PER_CHAR = 14
 _LINKS = 100_000  # hyperlink elements one sheet may collect; the rest are cut, counted once
-_SHEET_TAGS = frozenset({"col", "mergeCell", "hyperlink"})
-_PARENT = {"col": "cols", "mergeCell": "mergeCells", "hyperlink": "hyperlinks"}
+_SHEET_TAGS = frozenset({"col", "mergeCell", "hyperlink", "dimension"})
+_PARENT = {"col": "cols", "mergeCell": "mergeCells", "hyperlink": "hyperlinks", "dimension": "worksheet"}
 MAX_COMMENTS = 10_000  # comments one workbook may turn into notes; the rest are cut, counted once as `comments_cut`
 _COMMENT_ELEMENTS = 200_000  # elements a comments, threaded comments or persons part may close; past it the part stops
 _BATCH = 256  # ended siblings a streamed element keeps before they are dropped together
@@ -354,7 +355,7 @@ class _Sheets:
         code = self.code(style)
         if isinstance(value, str) and code == "General":
             return value
-        return display(value, code, self.wb.date1904)
+        return sheet_grid.shown(value, code, self.wb.date1904)
 
     def sheet(self, name: str, part: str, no: int = 0, hidden: bool = False) -> list:
         keys = []  # the note keys this sheet made
@@ -385,7 +386,7 @@ class _Sheets:
                 self._cut_comments()  # no mark could be placed on the cut grid
             return self._drawn(part, relmap)
         row, col, cells, rows_seen = -1, -1, 0, False  # cells: the `c` elements open
-        links = []  # (r1, r2, c1, c2, url) of the external hyperlinks, applied after the stream
+        links = []  # (r1, r2, c1, c2, url, place) of the hyperlinks, applied after the stream
         stack, done, names = [], [], {}  # the open path, and the ended children each open element still holds
         marks = self._comments(part, no, relmap, keys)  # (row, col) -> (note key, characters)
         try:
@@ -396,7 +397,7 @@ class _Sheets:
                         tag = names[el.tag] = local(el.tag)
                     if ev == "start":
                         if self.scan >= cap:  # this element cannot close inside the cap
-                            grid.stop("scanned XML elements", cap)
+                            grid.stop("scanned XML elements", cap, (max(row, 0), None))
                             break
                         stack.append(el)
                         done.append(0)
@@ -409,7 +410,7 @@ class _Sheets:
                             if row >= limits.SHEET_ROWS:
                                 # no row from here on can be put: end the sheet now, as `put` would at its first
                                 # value, so styled empties down to the last row leave the scan count to later sheets
-                                grid.stop("rows", limits.SHEET_ROWS)
+                                grid.stop("rows", limits.SHEET_ROWS, (row, None))
                                 break
                             if (el.get("hidden") or "").strip().lower() in ("1", "true"):
                                 grid.hide_row(row)
@@ -418,7 +419,7 @@ class _Sheets:
                     kids = done.pop()
                     self.scan += 1
                     if self.scan > cap:  # an element past the cap: exactly SHEET_SCAN closes are not a cut
-                        grid.stop("scanned XML elements", cap)
+                        grid.stop("scanned XML elements", cap, (max(row, 0), None))
                         break
                     if tag == "c":
                         cells -= 1
@@ -434,6 +435,10 @@ class _Sheets:
                             rng = _range(el.get("ref"))
                             if rng is not None:
                                 grid.merge(*rng)
+                        elif tag == "dimension":
+                            rng = _range(el.get("ref"))
+                            if rng is not None:
+                                grid.declare(*rng)
                         elif (el.get("hidden") or "").strip().lower() in ("1", "true"):
                             lo, hi = _int(el.get("min")), _int(el.get("max"))
                             if lo is not None and hi is not None and lo >= 1:
@@ -449,10 +454,10 @@ class _Sheets:
         except ReadError as e:
             if e.kind != "damaged" or not rows_seen:
                 raise
-            grid.stop("XML error", 1)  # decision 12: the rows read are kept
+            grid.stop("XML error", 1, (max(row, 0), None))  # decision 12: the rows read are kept
         self._place(grid, marks, hidden)
         self._link(grid, links)
-        blocks = grid.blocks()
+        blocks = grid.sheet_blocks()
         self._sweep(blocks, keys)
         return blocks + self._drawn(part, relmap)
 
@@ -466,10 +471,11 @@ class _Sheets:
             return []
 
     def _collect(self, el, part, links, grid, relmap):
-        """Keep the range and URL of a `hyperlink` that names an external hyperlink relationship; an `r:id` that
-        names none counts `link`. Past _LINKS the rest are cut, counted once."""
-        rid = attr(el, "id")
-        if not rid:  # a `location` alone points inside the workbook
+        """Keep the range and the place of a `hyperlink` with a `location`, or the range and URL of one that names an
+        external hyperlink relationship; an `r:id` that names none counts `link`. Past _LINKS the rest are cut,
+        counted once."""
+        rid, place = attr(el, "id"), (el.get("location") or "").strip()
+        if not rid and not place:
             return
         if len(links) >= _LINKS:
             if len(links) == _LINKS:
@@ -480,11 +486,14 @@ class _Sheets:
         rng = _range(el.get("ref"))
         if rng is None:
             return
+        if place:
+            links.append((*rng, None, place[:MAX_URL]))
+            return
         rel = self._sheet_rels(part, relmap).get(rid)
         if rel is None or not rel.external or not rel.type.endswith("/hyperlink") or not rel.target:
             self.ctx.skipped["link"] += 1
             return
-        links.append((*rng, rel.target[:MAX_URL]))
+        links.append((*rng, rel.target[:MAX_URL], None))
 
     def _sheet_rels(self, part, relmap) -> dict:
         """The sheet's relationships, read once whether that succeeds or fails."""
@@ -609,13 +618,15 @@ class _Sheets:
             elif name == "comment" and tags[-1:] == ["commentList"]:
                 text = re.sub(r"\s+", " ", _unescape("".join(parts))).strip()
                 parts, size = [], 0
+                i = _int(el.get("authorId"))
+                author = authors[i] if i is not None and 0 <= i < len(authors) else ""
+                if author and text.startswith(author + ":"):
+                    text = text[len(author) + 1:].lstrip()
                 if not text:
                     continue
                 pos = self._cell_of(el.get("ref"))
                 if pos is None or pos in covered:
                     continue
-                i = _int(el.get("authorId"))
-                author = authors[i] if i is not None and 0 <= i < len(authors) else ""
                 if not self._take(len(text)):
                     return
                 per_cell.setdefault(pos, []).extend(comment_note([Para([Text(text)])], author))
@@ -727,13 +738,14 @@ class _Sheets:
                 self._cut_comments()
 
     def _link(self, grid, links):
-        """Decision 9: wrap the valued cells of each range in a Link. The cost min(area, cells held) is charged to
-        the scan count before the range is walked; a link that no longer fits is counted under `link`."""
+        """Decision 9: wrap the valued cells of each range in a Link, or follow them with `→ place` for a place in
+        the workbook. The cost min(area, cells held) is charged to the scan count before the range is walked; a link
+        that no longer fits is counted under `link`."""
         cap = limits.SHEET_SCAN
         for item in links:
             if item is None or grid.cut:
                 continue
-            r1, r2, c1, c2, url = item
+            r1, r2, c1, c2, url, place = item
             if self.scan + min((r2 - r1 + 1) * (c2 - c1 + 1), len(grid.cells)) > cap:
                 self.ctx.skipped["link"] += 1
                 continue
@@ -745,7 +757,9 @@ class _Sheets:
                 body = [x for x in inl if not isinstance(x, NoteRef)]
                 if not body or any(isinstance(x, Link) for x in body):  # nothing to link, or already linked
                     continue
-                if not grid.put(r, c, [Link(url, body)] + [x for x in inl if isinstance(x, NoteRef)]):
+                marks = [x for x in inl if isinstance(x, NoteRef)]
+                linked = body + [Text(f" → {place}")] if place else [Link(url, body)]
+                if not grid.put(r, c, linked + marks):
                     break  # the budget is gone; the cell keeps its old value
 
     def _cell(self, el) -> str:

@@ -1,4 +1,10 @@
-"""OpenDocument spreadsheets (.ods): one sheet section per table, bounded by row, column and cell caps.
+"""OpenDocument spreadsheets (.ods): one sheet section per table, its cells through `sheet_grid.Grid`.
+
+Each table's cells go to a Grid at their sheet addresses, so an ods sheet is split into islands and captioned, hidden,
+merged and cut as the xlsx, xls and xlsb sheets are: one `Budget` for the document, a cell repeated by
+`number-columns-repeated` or a row by `number-rows-repeated` put once a copy (and charged once a copy), empty ones
+only counted. A row or column whose `table:visibility` is collapse or filter is hidden; a `table-header-rows` row is a
+header row; a span is a merge, its covered cells passed over.
 
 A sheet's `table:shapes` that holds a connector is one diagram scope: every shape and connector in it, groups walked
 into, goes to `diagram.Diagram` through `odf_base.register`; each with text, and each top-level frame, has a slot after
@@ -11,14 +17,16 @@ from .. import diagram, limits
 from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
 from ..markdown import blocks_len
-from ..model import Cell, Doc, Para, Section, Table, Text
-from .odf_base import GROUPS, SHAPES, Body, Styles, _GAP, _SPAN, _empty, _int, _squash, edge_like, register, shape_key
+from ..model import Doc, Para, Section, Text
+from . import sheet_grid
+from .odf_base import GROUPS, SHAPES, Body, Styles, _SPAN, _empty, _int, _squash, edge_like, register, shape_key
 
 _WS = re.compile(r"[ \t\r\n]+")
 _COVERED = "covered-table-cell"
 _NAMES = {}  # element tag -> local name; a sheet repeats a few tags millions of times
 _GROUPS = ("table-header-rows", "table-rows", "table-row-group")
-_HIDE_ROW = frozenset({"collapse", "filter"})
+_COLUMN_GROUPS = ("table-header-columns", "table-columns", "table-column-group")
+_HIDE = frozenset({"collapse", "filter"})
 
 
 def _ln(tag):
@@ -57,17 +65,31 @@ def _value(c) -> str:
 
 
 class _Sheet:
-    """Rows of one table. Empty rows wait as a count until content follows; trailing ones are never built."""
+    """The cells of one table, put into a Grid at their row and column."""
 
-    def __init__(self, body, name, budget, chars):
-        self.body, self.name, self.budget, self.chars = body, name, budget, chars  # cells and characters left for the document
-        self.rows, self.hidden, self.spanned = [], set(), []
-        self.gap, self.stop, self.cols_cut = 0, False, False
+    def __init__(self, body, name, budget):
+        self.body, self.name = body, name
+        self.grid = sheet_grid.Grid(name, budget, body.ctx)
+        self.at = 0
 
-    def cut(self, what, n):
-        self.body.ctx.warnings.append(f"sheet {self.name} cut at {n} {what}")
-        self.body.ctx.skipped["sheet_cut"] += 1
-        self.stop = True
+    # ---- columns
+    def columns(self, cont, d, col=0) -> int:
+        """Hide the columns whose `table:visibility` hides them; the first column after `cont`'s."""
+        if d > limits.MAX_DEPTH:
+            self.body.deep()
+            return col
+        for el in cont:
+            if col >= limits.SHEET_COLS:
+                break
+            n = _ln(el.tag)
+            if n == "table-column":
+                rep = max(1, _int(attr(el, "number-columns-repeated"), 1))
+                if attr(el, "visibility") in _HIDE:
+                    self.grid.hide_cols(col, col + rep - 1)
+                col += rep
+            elif n in _COLUMN_GROUPS:
+                col = self.columns(el, d + 1, col)
+        return col
 
     # ---- rows
     def walk(self, cont, d, header):
@@ -75,7 +97,7 @@ class _Sheet:
             self.body.deep()
             return
         for c in cont:
-            if self.stop:
+            if self.grid.cut:
                 return
             n = _ln(c.tag)
             if n == "table-row":
@@ -85,55 +107,27 @@ class _Sheet:
 
     def row(self, tr, d, header):
         rep = max(1, _int(attr(tr, "number-rows-repeated"), 1))
-        cells, chars = self.cells(tr, d, header)
-        if not cells and not self.cols_cut:
-            self.gap += rep
-            return
-        if self.gap:
-            gap, self.gap = self.gap, 0
-            if gap > _GAP:
-                self.body.ctx.skipped["repeat"] += 1
-            self.add([], 0, min(gap, _GAP), False)
-        if not self.stop:
-            self.add(cells, chars, 1 if self.cols_cut else rep, attr(tr, "visibility") in _HIDE_ROW)
-        if self.cols_cut:
-            self.cut("columns", limits.SHEET_COLS)
-
-    def add(self, cells, chars, rep, hidden):
-        """Append rep copies of a row, as many as the row, cell and character caps allow."""
-        w, n, why = len(cells), rep, None
-        room = limits.SHEET_ROWS - len(self.rows)
-        if n > room:
-            n, why = room, ("rows", limits.SHEET_ROWS)
-        if w and n > self.budget[0] // w:
-            n, why = self.budget[0] // w, ("cells", limits.SHEET_CELLS)
-        if chars and n > self.chars[0] // chars:
-            n, why = self.chars[0] // chars, ("characters", limits.SHEET_CHARS)
-        n = max(n, 0)
-        self.budget[0] -= w * n
-        self.chars[0] -= chars * n
-        copy = None
-        for i in range(n):
-            if i == 0:
-                row = cells
-                self.spanned.extend((len(self.rows), c) for c in {id(c): c for c in cells}.values() if c.rowspan > 1)
-            else:
-                if copy is None:  # repeated rows share one set of cells; a span never crosses the copies
-                    copy = [Cell(c.blocks, 1, c.colspan, c.header) for c in cells]
-                row = copy
-            if hidden:
-                self.hidden.add(len(self.rows))
-            self.rows.append(row)
-        if why:
-            self.cut(*why)
+        r0, grid = self.at, self.grid
+        self.at += rep
+        if attr(tr, "visibility") in _HIDE:
+            grid.hide_rows(r0, r0 + rep - 1)
+        if header:
+            grid.head_rows(r0, r0 + rep - 1)
+        cells = self.cells(tr, d)
+        for r in range(r0, min(r0 + rep, limits.SHEET_ROWS + 1)) if cells else ():
+            for col, crep, cs, rs, value, size in cells:
+                if value is not None and not grid.put_cols(r, col, col + crep - 1, value, size):
+                    return
+                if cs > 1 or rs > 1:
+                    for c in range(col, col + crep):
+                        grid.merge(r, r + rs - 1, c, c + cs - 1)
 
     # ---- cells
-    def cells(self, tr, d, header):
-        """(the row's origin cells up to its last significant one, their text length);
-        repeated empties past the last one are never built."""
-        out, gap, col, chars = [], 0, 0, 0  # col counts the pending empties too
-        empty = Cell([], header=header)
-        self.cols_cut = False
+    def cells(self, tr, d) -> list:
+        """(column, repeats, column span, row span, blocks or None, their characters) of the row's cells that hold
+        something or span. A cell's repeats end one column past SHEET_COLS, where `put` stops the sheet, and the row
+        ends with it."""
+        out, col = [], 0
         for c in tr:
             n = _ln(c.tag)
             if n != "table-cell" and n != _COVERED:
@@ -144,28 +138,15 @@ class _Sheet:
                 if n == "table-cell":
                     cs = min(max(_int(attr(c, "number-columns-spanned"), 1), 1), _SPAN)
                     rs = min(max(_int(attr(c, "number-rows-spanned"), 1), 1), _SPAN)
-            if n == _COVERED:  # its origin's span covers the slot, so it has no cell of its own
-                col += rep
-                if col > limits.SHEET_COLS:
-                    self.cols_cut = True
-                    break
-                continue
-            blocks, text = self.blocks(c, d)
-            if not text and cs == 1 and rs == 1:
-                gap += rep
-                col += rep
-                continue
-            take = min(rep, limits.SHEET_COLS - col)  # a span's other slots arrive as covered cells
-            if take > 0:
-                out.extend([empty] * gap)
-                gap = 0
-                out.extend([Cell(blocks, rs, cs, header)] * take)
-                col += take
-                chars += blocks_len(blocks) * take
-            if take < rep:
-                self.cols_cut = True
-                break
-        return out, chars
+            if n == "table-cell":
+                blocks, text = self.blocks(c, d)
+                if text or cs > 1 or rs > 1:
+                    out.append((col, min(rep, max(1, limits.SHEET_COLS + 1 - col)), cs, rs,
+                                tuple(blocks) if text else None, blocks_len(blocks)))
+                    if col + rep > limits.SHEET_COLS:
+                        break
+            col += rep
+        return out
 
     def blocks(self, c, d):
         """(blocks, whether they carry anything but blank paragraphs)."""
@@ -186,19 +167,7 @@ class _Sheet:
 
     # ---- result
     def result(self):
-        rows = self.rows
-        while rows and all(_empty(c.blocks) for c in rows[-1]):
-            rows.pop()
-            self.hidden.discard(len(rows))
-        for r, c in self.spanned:
-            c.rowspan = min(c.rowspan, max(1, len(rows) - r))
-        if not rows:
-            return []
-        if len(rows) == 1 and len(rows[0]) == 1 and not self.hidden:
-            c = rows[0][0]
-            if c.rowspan == 1 and c.colspan == 1 and not c.header:
-                return list(c.blocks)  # a lone cell is just its text
-        return [Table(rows, hidden_rows=frozenset(self.hidden))]
+        return self.grid.sheet_blocks()
 
 
 def sheets(pkg, ctx, content, styles_root) -> Doc:
@@ -206,14 +175,14 @@ def sheets(pkg, ctx, content, styles_root) -> Doc:
     office = next((c for b in kids(content, "body") for c in b if local(c.tag) == "spreadsheet"), None)
     if office is None:
         raise ReadError("damaged", "no readable body")
-    budget, chars, found, ok = [limits.SHEET_CELLS], [limits.SHEET_CHARS], 0, 0
+    budget, found, ok = sheet_grid.Budget(), 0, 0
     links = diagram.ConnectionBudget(ctx)  # the workbook's edges, shared by every sheet's diagram
     for t in kids(office, "table"):  # sheets of the same name are kept: each is a separate element
         found += 1
         name = _squash(attr(t, "name", ""), 200)
         try:
             with ctx.guard("sheet"):
-                body.doc.blocks.append(_section(body, t, name, budget, chars, links))
+                body.doc.blocks.append(_section(body, t, name, budget, links))
                 ok += 1
         except ReadError as e:
             if e.kind != "damaged":
@@ -224,8 +193,9 @@ def sheets(pkg, ctx, content, styles_root) -> Doc:
     return body.doc
 
 
-def _section(body, t, name, budget, chars, links) -> Section:
-    sh = _Sheet(body, name, budget, chars)
+def _section(body, t, name, budget, links) -> Section:
+    sh = _Sheet(body, name, budget)
+    sh.columns(t, 0)
     sh.walk(t, 0, False)
     blocks = sh.result()
     for shapes in kids(t, "shapes"):  # charts and pictures anchored to the sheet

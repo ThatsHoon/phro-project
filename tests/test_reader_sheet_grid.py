@@ -12,7 +12,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
-from reader.formats.sheet_grid import Budget, Grid, text_inlines  # noqa: E402
+from reader.formats.sheet_grid import Budget, Grid, address, text_inlines  # noqa: E402
 from reader.model import Bold, Break, Context, Doc, Hidden, Link, NoteRef, Para, Table, Text  # noqa: E402
 
 
@@ -240,8 +240,9 @@ def test_tall_merges_are_fast():
 
 def test_open_merges_do_not_cost_every_row():
     """999 full-height merges, each in its own column, over 100,000 one-cell rows: a row costs its own cells and the
-    merges that start or end there, not every merge still open."""
-    g, _ = mk()
+    merges that start or end there, not every merge still open. The merges past GRID_SLOTS of area are one cell each,
+    so each row below holds their 979 filler cells before its own, and the table is cut at GRID_SLOTS."""
+    g, ctx = mk()
     for c in range(999):
         g.merge(0, 99_999, c, c)
         g.put(0, c, f"m{c}")
@@ -251,8 +252,9 @@ def test_open_merges_do_not_cost_every_row():
     t = table(g)
     took = time.monotonic() - t0
     assert took < 5, took
-    assert len(t.rows) == 100_000 and len(t.rows[0]) == 1000 and t.rows[0][0].rowspan == 100_000
-    assert [txt(c) for c in t.rows[1]] == ["1"] and [txt(c) for c in t.rows[-1]] == ["99999"], (t.rows[1], t.rows[-1])
+    assert len(t.rows[0]) == 1000 and [c.rowspan for c in t.rows[0][19:21]] == [100_000, 1], t.rows[0][19:21]
+    assert [txt(c) for c in t.rows[1]] == [""] * 979 + ["1"], t.rows[1][-2:]
+    assert txt(t.rows[-1][-1]) == str(len(t.rows) - 1) and len(t.rows) < 100_000 and ctx.skipped["sheet_cut"] == 1
 
 
 def test_merge_cap_dense():
@@ -406,6 +408,226 @@ def test_blocks_frees_its_intermediates():
         tracemalloc.stop()
     assert len(out[0].rows) == 200 and txt(out[0].rows[199][99]) == "000019999"
     assert peak - base < 1.2 * (kept - base), (peak - base, kept - base)
+
+
+def fill(g, r1, r2, c1, c2, tag=""):
+    for r in range(r1, r2 + 1):
+        for c in range(c1, c2 + 1):
+            assert g.put(r, c, f"{tag}{r},{c}")
+
+
+def para_text(b):
+    assert isinstance(b, Para), b
+    return "".join(i.text for i in b.inlines if isinstance(i, Text))
+
+
+def test_address():
+    assert [address(0, 0), address(8, 3), address(99_999, 25), address(0, 26), address(4, 701), address(0, 702)] == \
+        ["A1", "D9", "Z100000", "AA1", "ZZ5", "AAA1"]
+
+
+def test_three_islands_three_tables():
+    g, _ = mk()
+    fill(g, 0, 8, 0, 3, "a")    # A1:D9
+    fill(g, 4, 8, 6, 8, "b")    # G5:I9
+    fill(g, 13, 17, 2, 4, "c")  # C14:E18
+    out = g.sheet_blocks()
+    assert [type(b) for b in out] == [Table] * 3, out
+    assert [(t.caption, t.origin) for t in out] == [("A1:D9", "A1"), ("G5:I9", "G5"), ("C14:E18", "C14")], \
+        [(t.caption, t.origin) for t in out]
+    assert [len(t.rows) for t in out] == [9, 5, 5] and [len(t.rows[0]) for t in out] == [4, 3, 3]
+    assert txt(out[1].rows[0][0]) == "b4,6" and txt(out[2].rows[4][2]) == "c17,4"
+
+
+def test_lone_cell_island_is_an_addressed_paragraph():
+    g, _ = mk()
+    g.put(0, 0, "Quarterly report")
+    fill(g, 2, 4, 0, 2)
+    out = g.sheet_blocks()
+    assert para_text(out[0]) == "A1: Quarterly report" and (out[1].caption, out[1].origin) == ("A3:C5", "A3"), out
+    g, _ = mk()
+    g.put(2, 3, "only")
+    assert [para_text(b) for b in g.sheet_blocks()] == ["D3: only"]
+    g, _ = mk()  # a lone merged cell is led by its range
+    g.put(8, 0, "summary")
+    g.merge(8, 8, 0, 4)
+    assert [para_text(b) for b in g.sheet_blocks()] == ["A9:E9: summary"]
+
+
+def test_parts_with_the_same_span_stay_one_table():
+    g, _ = mk()
+    fill(g, 0, 0, 0, 3)          # a header row
+    fill(g, 2, 6, 0, 3)          # a blank row, then the data under the same columns
+    fill(g, 10, 14, 0, 0)        # a spacer column C between two parts on the same rows
+    fill(g, 10, 14, 3, 4)
+    out = g.sheet_blocks()
+    assert [t.caption for t in out] == ["A1:D7", "A11:E15"], [getattr(t, "caption", t) for t in out]
+    assert len(out[0].rows) == 7 and out[0].rows[1] == []
+
+
+def test_a_long_empty_run_splits_parts_with_the_same_span():
+    g, _ = mk()
+    fill(g, 0, 1, 0, 1)
+    fill(g, 66, 67, 0, 1)   # 64 empty rows between: one table
+    fill(g, 200, 201, 0, 1)  # 132 empty rows: a table of its own
+    out = g.sheet_blocks()
+    assert [t.caption for t in out] == ["A1:B68", "A201:B202"], [getattr(t, "caption", t) for t in out]
+    assert len(out[0].rows) == 68 and not g.ctx.skipped
+
+
+def test_merge_joins_its_parts_and_counts_in_the_range():
+    g, _ = mk()
+    g.put(0, 0, "title")
+    g.merge(0, 0, 0, 4)       # A1:E1 over the blank row's columns
+    fill(g, 2, 3, 0, 4)
+    out = g.sheet_blocks()
+    assert len(out) == 1 and out[0].caption == "A1:E4" and out[0].rows[0][0].colspan == 5, out
+
+
+def test_hidden_runs_named_in_the_caption():
+    g, _ = mk()
+    fill(g, 0, 19, 0, 5)
+    for r in (6, 11, 12, 13):
+        g.hide_row(r)
+    g.hide_cols(3, 3)
+    g.hide_cols(30, 40)  # outside the table: not named
+    g.put(25, 30, "far")
+    t = g.sheet_blocks()[0]
+    assert t.caption == "A1:F20 (hidden rows 7, 12-14; hidden columns D)", t.caption
+    assert t.hidden_rows == frozenset({6, 11, 12, 13}) and t.hidden_cols == frozenset({3})
+
+
+def test_hidden_runs_listed_up_to_the_cap():
+    g, _ = mk()
+    fill(g, 0, 99, 0, 1)
+    for r in range(0, 100, 2):
+        g.hide_row(r)
+    cap = g.sheet_blocks()[0].caption
+    shown = ", ".join(str(r + 1) for r in range(0, 2 * limits.SHEET_RUNS, 2))
+    assert cap == f"A1:B100 (hidden rows {shown} and {50 - limits.SHEET_RUNS} more)", cap
+
+
+def test_hidden_lone_cell_keeps_its_table():
+    g, _ = mk()
+    g.put(4, 1, "secret")
+    g.hide_row(4)
+    t = g.sheet_blocks()[0]
+    assert isinstance(t, Table) and t.caption == "B5 (hidden rows 5)" and t.origin == "B5", t
+
+
+def test_row_cut_named_where_it_is():
+    g, ctx = mk()
+    g.declare(0, 119_999, 0, 4)
+    for r in range(100_001):
+        if not g.put(r, 0, "v"):
+            break
+    out = g.sheet_blocks()
+    assert out[0].caption == "A1:A100000" and len(out[0].rows) == 100_000
+    assert para_text(out[-1]) == ("(Sheet cut at A100001 by the 100,000-row limit; not read from there to E120000, "
+                                  "20,000 rows)"), para_text(out[-1])
+    assert "sheet S cut at 100000 rows" in ctx.warnings
+    g, _ = mk()
+    g.put(0, 0, "a")
+    g.stop("scanned XML elements", 7, (3, None))
+    assert para_text(g.sheet_blocks()[-1]) == "(Sheet cut at row 4 by the workbook's 7-element limit; not read from there on)"
+
+
+def test_sheet_after_the_cell_budget_says_it_was_not_read():
+    b = Budget(cells=2)
+    g1, _ = mk("A", b)
+    fill(g1, 0, 0, 0, 1)
+    g2, ctx = mk("B", b)
+    g2.declare(0, 9, 0, 2)
+    assert not g2.put(0, 0, "x")
+    assert [para_text(x) for x in g2.sheet_blocks()] == [
+        "(Sheet not read: the document's 2-cell limit was used up by the sheets before it; it spans A1:C10, 10 rows)"]
+    g3, _ = mk("C", b)
+    assert g3.sheet_blocks() == []  # nothing was put, so nothing was left out
+
+
+def test_cut_inside_a_sheet_names_the_cell():
+    g, _ = mk("S", Budget(cells=5))
+    fill(g, 0, 0, 0, 2)
+    assert g.put(1, 0, "x") and g.put(1, 1, "y") and not g.put(1, 2, "z")
+    out = g.sheet_blocks()
+    assert out[0].caption == "A1:C2" and para_text(out[-1]) == \
+        "(Sheet cut at C2 by the document's 5-cell limit; not read from there on)", out
+
+
+def test_island_work_budget_still_splits_long_runs():
+    old = limits.SHEET_ISLAND_STEPS
+    limits.SHEET_ISLAND_STEPS = 1
+    try:
+        g, _ = mk()
+        fill(g, 0, 1, 0, 1)
+        fill(g, 0, 1, 5, 5)
+        fill(g, 300, 301, 0, 1)
+        out = g.sheet_blocks()
+        assert [t.caption for t in out] == ["A1:F2", "A301:B302"], [getattr(t, "caption", t) for t in out]
+    finally:
+        limits.SHEET_ISLAND_STEPS = old
+
+
+def test_islands_are_cheap_on_a_full_sheet():
+    g, _ = mk()
+    for r in range(1_000):
+        for c in range(100):
+            g.put(r, c, "v")
+    t0 = time.monotonic()
+    out = g.sheet_blocks()
+    took = time.monotonic() - t0
+    assert len(out) == 1 and out[0].caption == "A1:CV1000" and took < 3, took
+
+
+def test_tall_islands_charge_their_rows():
+    # 15 sparse columns 66 apart are 15 islands of 100,000 rows; their rows, empty ones too, are held to GRID_SLOTS
+    # for the sheet with its cells, so 23,000 cells cannot make 1.5 million table rows past it
+    g, ctx = mk()
+    for k in range(15):
+        for r in range(0, limits.SHEET_ROWS, 64):
+            g.put(r, 66 * k, "v")
+    limits.GRID_SLOTS, saved = 500_000, limits.GRID_SLOTS
+    try:
+        out = g.sheet_blocks()
+    finally:
+        limits.GRID_SLOTS = saved
+    tables = [b for b in out if isinstance(b, Table)]
+    assert sum(len(t.rows) for t in tables) <= 500_000 and len(tables) < 15, len(tables)
+    assert "sheet S cut at 500000 grid slots" in ctx.warnings, ctx.warnings
+
+
+def test_spans_share_one_area_budget_a_sheet():
+    # three islands, each a 1000 x 2 merge: past GRID_SLOTS of span area for the sheet (not for each table), a merge
+    # is laid out as one cell, as the renderer lays out one table's
+    g, ctx = mk()
+    for k in range(3):
+        g.put(2000 * k, 0, "m")
+        g.merge(2000 * k, 2000 * k + 999, 0, 1)
+        g.put(2000 * k, 2, "n")
+    limits.GRID_SLOTS, saved = 5_000, limits.GRID_SLOTS
+    try:
+        out = g.sheet_blocks()
+    finally:
+        limits.GRID_SLOTS = saved
+    tables = [b for b in out if isinstance(b, Table)]
+    assert [(t.rows[0][0].rowspan, t.rows[0][0].colspan) for t in tables] == [(1000, 2), (1000, 2), (1, 1)], tables
+    assert [len(t.rows) for t in tables] == [1000] * 3 and not ctx.warnings, ctx.warnings
+
+
+def test_header_rows_marked():
+    g, _ = mk()
+    fill(g, 0, 2, 0, 1)
+    g.head_rows(0, 0)
+    t = g.sheet_blocks()[0]
+    assert t.rows[0][0].header and t.rows[0][1].header and not t.rows[1][0].header
+
+
+def test_record_blocks_keep_one_table():
+    g, _ = mk()
+    fill(g, 0, 1, 0, 0)
+    fill(g, 0, 1, 2, 2)
+    out = g.blocks()
+    assert len(out) == 1 and out[0].caption == "" and out[0].origin == "" and len(out[0].rows[0]) == 3
 
 
 def main():

@@ -84,6 +84,13 @@ def test_values_displayed():
         assert want in md, (want, md)
 
 
+def test_value_hidden_by_format():
+    md, _ = run([{"name": "S", "cells": {(0, 0): ("fmt", 5, ";;;"), (0, 1): "x"}}])
+    assert "|5|" not in md and "(1 hidden places left out)" in md, md
+    md, _ = run([{"name": "S", "cells": {(0, 0): ("fmt", 5, ";;;"), (0, 1): "x"}}], hidden=True)
+    assert "5" in md.replace("A1:B1", ""), md
+
+
 def test_formula_cached():
     md, _ = run([{"name": "S", "cells": {(0, 0): ("f", 3.0), (1, 0): ("f", "total")}}])
     assert "3" in md and "total" in md, md
@@ -195,7 +202,7 @@ def cells_of(sheet, **kw):
 
 def test_colinfo_last_column_0x100():
     info = rec(0x007D, struct.pack("<HHHHHH", 1, 0x100, 2560, 15, 1, 0))
-    wb = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, 1): "a", (0, 300): "c"},
+    wb = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, c): "a" for c in range(1, 301)},
                                       "records": [info]}]), Context(), sheet_grid.Budget())
     (t,) = wb.sheet_blocks(0)
     assert t.hidden_cols == frozenset(range(256)), sorted(t.hidden_cols)[-3:]  # columns 1..256 of 1..300
@@ -305,7 +312,8 @@ def test_sparse_far_rows():
                       sheet_grid.Budget())
     secs = wb.sections()
     assert time.monotonic() - t0 < 2
-    assert ctx.skipped["repeat"] == 1 and len(secs) == 1, ctx.skipped
+    assert len(secs) == 1 and not ctx.skipped, ctx.skipped
+    assert ["".join(i.text for i in b.inlines) for b in secs[0].blocks] == ["A1: top", "A65536: bottom"], secs[0].blocks
 
 
 def test_macro_sheet_quiet():
@@ -650,7 +658,8 @@ def test_txo_charged_to_sheet_characters():
 def test_embedded_workbook_skips_text_boxes():
     sheet = drawn([tbox(1025, cells(0, 2, 1, 3))], ["note"])
     wb = xls.Workbook(biff_workbook([sheet]), Context(), sheet_grid.Budget(chars=100), pictures=False)
-    plain = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, 0): "cell"}}]), Context(), sheet_grid.Budget())
+    plain = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, 0): "cell"}}]), Context(), sheet_grid.Budget(),
+                         pictures=False)
     assert wb.sheet_blocks(0) == plain.sheet_blocks(0) and wb.budget.chars == 100 - len("cell"), wb.sheet_blocks(0)
 
 

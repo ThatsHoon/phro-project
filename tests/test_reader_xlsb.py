@@ -263,6 +263,11 @@ def test_cells_displayed():
     assert "|5|" in out and not ctx.skipped, (out, ctx.skipped)
 
 
+def test_value_hidden_by_format():
+    out, ctx = md([{"name": "S", "cells": {(0, 0): ("fmt", 5, ";;;"), (0, 1): "x"}}])
+    assert "|5|" not in out and "(1 hidden places left out)" in out, out
+
+
 def test_formula_cached():
     tail = bytes([0, 0, 0xFF, 0xFF, 1, 2, 3])  # flags and formula bytes: never read
     records = [xlsb_row(0),

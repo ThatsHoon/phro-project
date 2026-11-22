@@ -14,7 +14,8 @@ section after its pictures, charged against `CHART_TOTAL` like the other formats
 text boxes: a TXO's text (cchText u16 at 10) is in the CONTINUEs after it, each starting with a flag byte (0 8-bit,
 1 UTF-16), but the last when there are two or more, which holds the formatting runs. It is charged against the sheet
 characters like a cell, and `xls_drawing.shapes` makes it a diagram node, a connector label or a paragraph; the sheet
-is one diagram scope, the workbook one connection budget. An embedded workbook reads no drawing and no TXO.
+is one diagram scope, the workbook one connection budget. An embedded workbook reads no drawing and no TXO, and its
+sheets are record tables (`Grid.blocks`): the object shows a range, not a sheet.
 """
 import copy
 import struct
@@ -25,10 +26,9 @@ from ..containers import flate
 from ..containers.zipx import Package
 from ..limits import ReadError
 from ..model import Doc, Section
-from ..numfmt import display
 from . import biff, biff_chart, cfb_route, sheet_grid, xls_alike, xls_crypt, xls_drawing, zip_route
 
-_ROW, _COLINFO, _MERGED = 0x0208, 0x007D, 0x00E5
+_ROW, _COLINFO, _MERGED, _DIMENSIONS = 0x0208, 0x007D, 0x00E5, 0x0200
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
 _FORMULA, _STRING = 0x0006, 0x0207
 _MSODRAWING = 0x00EC  # a sheet's drawing records, joined and read by xls_drawing
@@ -143,7 +143,7 @@ class Workbook:
             del self.cells[i]  # a sheet that fails leaves no half-read cells for a chart to use
             raise
         self._starts[i] = starts
-        blocks = grid.blocks()
+        blocks = grid.sheet_blocks() if self.pictures else grid.blocks()
         if (draw or texts) and self.pictures:  # an embedded workbook drops its drawing, so nothing is decoded
             blocks = self._drawn(blocks, b"".join(draw), texts)
         if draw and self.pictures:
@@ -178,7 +178,7 @@ class Workbook:
         code = self._code(ixfe)
         if isinstance(value, str) and code == "General":
             return value
-        return display(value, code, self.g.date1904)
+        return sheet_grid.shown(value, code, self.g.date1904)
 
     def _walk(self, offset: int, grid: sheet_grid.Grid, draw: list, starts: list, texts: list) -> None:
         """Walk sheet substream `offset` into `grid`; the sheet's MSODRAWING bodies, CONTINUEs joined, go into `draw`
@@ -243,6 +243,10 @@ class Workbook:
                 if size >= 10 and struct.unpack_from("<H", data, off + 8)[0] & 1:
                     first, last = struct.unpack_from("<HH", data, off)
                     grid.hide_cols(first, last)
+            elif rid == _DIMENSIONS:
+                if size >= 12:
+                    rw1, rw2, col1, col2 = struct.unpack_from("<IIHH", data, off)
+                    grid.declare(rw1, rw2 - 1, col1, col2 - 1)
             elif rid == _MERGED:
                 n = min(struct.unpack_from("<H", data, off)[0] if size >= 2 else 0, max(size - 2, 0) // 8)
                 for r1, r2, c1, c2 in struct.iter_unpack("<HHHH", data[off + 2:off + 2 + n * 8]):

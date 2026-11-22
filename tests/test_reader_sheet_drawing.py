@@ -315,7 +315,7 @@ def _plain_drawings():
 
 
 _HID = "(1 hidden places left out)\n\n"
-_TOP = "## Sheet: S\n\ncell\n\nHOW TO FILL\n\nstep one and two\n\n"
+_TOP = "## Sheet: S\n\nA1: cell\n\nHOW TO FILL\n\nstep one and two\n\n"
 _MORE = "\n\nBoxed\n\nrule\n\nGoal\n"
 _PLAIN = [  # what the reader wrote for these drawings before it read connectors: xlsx, xlsb; hidden left out, shown
     _HID + _TOP + "LATER-BOX\n", _TOP + "(hidden) SECRET-BOX\n\nLATER-BOX\n",

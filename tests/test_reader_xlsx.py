@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from reader import limits, markdown  # noqa: E402
 from reader.formats import ooxml, ooxml_sheets  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Link, NoteRef  # noqa: E402
+from reader.model import Context, Hidden, Link, NoteRef, Text  # noqa: E402
 from reader_fix import XLSX_REL, XLSX_SML, make_xlsx, xlsx_cell, xlsx_row  # noqa: E402
 import test_reader_xlsb as xb  # noqa: E402  (the drawing, anchor and chart fixtures)
 
@@ -171,7 +171,8 @@ def test_styled_rows_past_the_last_row_keep_later_sheets():
               sheet(xlsx_row(1, xlsx_cell("A1", "data", t="str")), name="B")]
     with patched("SHEET_SCAN", 2000), patched("SHEET_ROWS", 100):
         out, ctx = md(sheets, xfs=[0, 0])
-    assert "first" in out and "## Sheet: B\n\ndata" in out, out
+    assert "first" in out and "## Sheet: B\n\nA1: data" in out, out
+    assert "A1: first\n\n(Sheet cut at row 101 by the 100-row limit; not read from there on)" in out, out
     assert warned(ctx, "sheet A cut at 100 rows") and dict(+ctx.skipped) == {"sheet_cut": 1}, (ctx.warnings,
                                                                                                ctx.skipped)
 
@@ -220,7 +221,8 @@ def test_xml_error_keeps_rows():
     rows = xlsx_row(1, xlsx_cell("A1", "one", t="str")) + xlsx_row(2, xlsx_cell("A2", "two", t="str"))
     part = f'<?xml version="1.0"?><worksheet xmlns="{XLSX_SML}"><sheetData>{rows}<row r="3"><c r="A3"><v>th'
     out, ctx = md([sheet("", part=part)])
-    assert "one" in out and "two" in out and "th" not in out.replace("Sheet", ""), out
+    assert "A1:A2\none\ntwo\n\n(Sheet cut at row 3 by damaged XML; not read from there on)" in out, out
+    assert "th" not in out.replace("Sheet", "").replace("there", ""), out
     assert ctx.skipped["sheet_cut"] == 1 and warned(ctx, "cut at 1 XML error") and not ctx.skipped["sheet"], (
         ctx.warnings, ctx.skipped)
 
@@ -441,7 +443,7 @@ def test_hidden_rows_cols():
 
 
 def test_merge():
-    rows = xlsx_row(1, xlsx_cell("A1", "m", t="str"))
+    rows = xlsx_row(1, xlsx_cell("A1", "m", t="str"), xlsx_cell("C1", "n", t="str"))
     out, _ = md([sheet(rows, after='<mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>')])
     assert 'colspan="2"' in out, out
     out, ctx = md([sheet(rows, after='<mergeCells><mergeCell ref="bad"/><mergeCell ref="A1:B1"/></mergeCells>')])
@@ -458,6 +460,29 @@ def test_hyperlink_location():
     rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
     out, ctx = linked(rows, ['<hyperlink ref="A1" location="Sheet2!A1"/>'])
     assert "go" in out and "](" not in out and ctx.skipped["link"] == 0, (out, ctx.skipped)
+
+
+def test_hyperlink_location_is_named():
+    # a link inside the workbook names its place after the cell's text, with or without an r:id beside it (as
+    # LibreOffice writes one to the file itself)
+    rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"), xlsx_cell("B1", "jump", t="str"))
+    sh = sheet(rows, after='<hyperlinks><hyperlink ref="A1" location="Lists!A1"/>'
+                           '<hyperlink ref="B1" r:id="rL" location="\'My Sheet\'!B2"/></hyperlinks>',
+               rels=[("rL", "hyperlink", "../a.xlsx", True)])
+    doc, ctx, _ = parsed([sh])
+    cells = doc.blocks[0].blocks[0].rows[0]
+    assert cells[0].blocks[0].inlines == [Text("go"), Text(" → Lists!A1")], cells[0].blocks
+    assert cells[1].blocks[0].inlines == [Text("jump"), Text(" → 'My Sheet'!B2")], cells[1].blocks
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_value_hidden_by_format():
+    # a ;;; section shows nothing in Excel: the value is hidden content, left out and counted unless --hidden
+    rows = xlsx_row(1, xlsx_cell("A1", 5, s=1), xlsx_cell("B1", "x", t="str"))
+    doc, _, _ = parsed([sheet(rows)], numfmts={164: ";;;"}, xfs=[0, 164])
+    assert doc.blocks[0].blocks[0].rows[0][0].blocks[0].inlines == [Hidden([Text("5")])], doc.blocks[0].blocks
+    out, _ = md([sheet(rows)], numfmts={164: ";;;"}, xfs=[0, 164])
+    assert "5" not in out.replace("A1:B1", "") and "(1 hidden places left out)" in out, out
 
 
 def test_hyperlink_range():
@@ -561,7 +586,7 @@ def test_hyperlink_noteref_after_link():
     grid.put(0, 0, [NoteRef("n1"), Text("a"), NoteRef("n2"), Text("b")])
     me = ooxml_sheets._Sheets.__new__(ooxml_sheets._Sheets)
     me.ctx, me.scan = ctx, 0
-    me._link(grid, [(0, 0, 0, 0, LINK)])
+    me._link(grid, [(0, 0, 0, 0, LINK, None)])
     assert grid.get(0, 0) == [Link(LINK, [Text("a"), Text("b")]), NoteRef("n1"), NoteRef("n2")], grid.get(0, 0)
 
 
@@ -624,6 +649,12 @@ def test_legacy_comment():
     assert "v[^1]" in out and "[^1]: Comment by Ann: check" in out and not ctx.skipped, (out, ctx.skipped)
 
 
+def test_legacy_comment_author_prefix_dropped():
+    # Excel starts a legacy comment's text with its author's name and a colon; the note names the author once
+    out, ctx = commented(B2, leg=legacy_xml(("B2", 0, "Ann: check")))
+    assert "[^1]: Comment by Ann: check" in out and "Ann: Ann" not in out, out
+
+
 def test_threaded_wins():
     out, _ = commented(B2, leg=legacy_xml(("B2", 0, "[Threaded comment] placeholder")),
                        thr=threaded_xml(("B2", "p1", "t1", None, "real")), people=BO)
@@ -678,7 +709,7 @@ def test_comment_with_link():
                rels=[("rC", LEGACY, "../comments1.xml", False), ("rL", "hyperlink", LINK, True)])
     doc, _, _ = parsed([sh], extra_parts={LEG_PART: legacy_xml(("A1", 0, "n"))})
     cell = doc.blocks[0].blocks[0].inlines
-    assert isinstance(cell[0], Link) and isinstance(cell[-1], NoteRef), cell
+    assert cell[0] == Text("A1: ") and isinstance(cell[1], Link) and isinstance(cell[-1], NoteRef), cell
 
 
 def test_comment_on_empty_cell():

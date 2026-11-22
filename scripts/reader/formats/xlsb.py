@@ -18,7 +18,7 @@ from ..containers import biff12, cfb
 from ..containers.zipx import Package
 from ..limits import ReadError
 from ..model import Doc, Section
-from ..numfmt import code_for, display
+from ..numfmt import code_for
 from . import biff, cfb_route, sheet_drawing, sheet_grid
 from .xls import _hide
 
@@ -28,6 +28,7 @@ BRT_FMLA_STRING, BRT_FMLA_NUM, BRT_FMLA_BOOL, BRT_FMLA_ERROR = 8, 9, 10, 11
 BRT_COL_INFO = 60
 BRT_CELL_RSTRING = 62
 BRT_MERGE_CELL = 176
+BRT_WS_DIM = 148
 _ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!",
            0x2A: "#N/A", 0x2B: "#GETTING_DATA"}
 
@@ -248,7 +249,7 @@ class _Sheets:
             code = self._code[style] = code_for(xf[style], self.wb.formats) if style < len(xf) else "General"
         if isinstance(value, str) and code == "General":
             return value
-        return display(value, code, self.wb.date1904)
+        return sheet_grid.shown(value, code, self.wb.date1904)
 
     def sheet(self, name: str, part: str) -> list:
         if not part or not self.pkg.has(part):
@@ -286,13 +287,17 @@ class _Sheets:
                     f.skip(8)
                     if f.u16() & 1:
                         grid.hide_cols(first_col, last_col)
+                elif rid == BRT_WS_DIM:
+                    f = biff12.Fields(data, off, size)
+                    r1, r2, c1, c2 = f.u32(), f.u32(), f.u32(), f.u32()
+                    grid.declare(r1, r2, c1, c2)
                 elif rid == BRT_MERGE_CELL:
                     f = biff12.Fields(data, off, size)
                     r1, r2, c1, c2 = f.u32(), f.u32(), f.u32(), f.u32()
                     grid.merge(r1, r2, c1, c2)
             except (ValueError, struct.error):
                 self.ctx.skipped["record"] += 1
-        return grid.blocks() + self.draw.blocks(part)
+        return grid.sheet_blocks() + self.draw.blocks(part)
 
     def _cell(self, rid: int, f, style: int) -> str:
         """The displayed value of one cell record whose header has been read. A formula shows its cached value."""

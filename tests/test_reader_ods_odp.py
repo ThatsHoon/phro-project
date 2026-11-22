@@ -15,7 +15,7 @@ import reader  # noqa: E402
 from reader import limits, markdown  # noqa: E402
 from reader.formats import odf  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Code, Context  # noqa: E402
+from reader.model import Code, Context, Para, Text  # noqa: E402
 from diagram_fix import mermaid_ok  # noqa: E402
 from reader_fix import make_zip  # noqa: E402
 
@@ -97,15 +97,17 @@ def test_repeat_trap_fast():
     t0 = time.monotonic()
     out = md(path)
     assert time.monotonic() - t0 < 2
-    assert out == "## Sheet: S\n\nx\n", repr(out)
+    assert out == "## Sheet: S\n\nA1: x\n", repr(out)
 
 
 def test_display_text_first():
     cur = c("₩1,385.50", 'office:value-type="currency" office:value="1385.5"')
     pct = c("", 'office:value-type="percentage" office:value="0.25"')
     flt = c("", 'office:value-type="float" office:value="3.0"')
-    out = md(ods(sheet("S", [row(cur, pct, flt)])))
-    assert out == "## Sheet: S\n\n|₩1,385.50|25%|3|\n|---|---|---|\n", repr(out)
+    doc, _ = parse(ods(sheet("S", [row(cur, pct, flt)])))
+    t = doc.blocks[0].blocks[0]
+    assert (t.caption, t.origin) == ("A1:C1", "A1"), (t.caption, t.origin)
+    assert [c.blocks[0].inlines[0].text for c in t.rows[0]] == ["₩1,385.50", "25%", "3"], t.rows
 
 
 def test_interior_repeat_kept():
@@ -134,9 +136,9 @@ def test_interior_gap_and_trailing_dropped():
     xml = sheet("S", [row(c("a"), c("b")), row(extra='table:number-rows-repeated="500"'), row(c("z"), c("y")),
                       row(extra='table:number-rows-repeated="900000"')])
     doc, ctx = parse(ods(xml))
-    rows = doc.blocks[0].blocks[0].rows
-    assert len(rows) == 1 + 64 + 1, len(rows)  # the gap is capped, the trailing rows are gone
-    assert rows[-1][0].blocks[0].inlines[0].text == "z" and ctx.skipped["repeat"] == 1
+    blocks = doc.blocks[0].blocks  # the 500 empty rows part two islands; the trailing rows are gone
+    assert [(t.caption, len(t.rows)) for t in blocks] == [("A1:B1", 1), ("A502:B502", 1)], blocks
+    assert blocks[1].rows[0][0].blocks[0].inlines[0].text == "z" and not ctx.skipped, ctx.skipped
 
 
 def test_hidden_sheet_by_style():
@@ -153,6 +155,18 @@ def test_hidden_row():
                              row(c("filtered"), c("y"), extra='table:visibility="filter"'), row(c("c"), c("d"))])))
     assert "secret" not in out and "filtered" not in out and "(2 hidden places left out)" in out, out
     assert "a" in out and "d" in out
+
+
+def test_hidden_column_left_out_and_counted():
+    cols = ('<table:table-column/><table:table-column table:visibility="collapse"/>'
+            '<table:table-column table:number-columns-repeated="2" table:visibility="filter"/><table:table-column/>')
+    xml = sheet("S", [cols, row(c("a"), c("secret"), c("f1"), c("f2"), c("e")), row(c("b"), c(), c(), c(), c("g"))])
+    doc, _ = parse(ods(xml))
+    t = doc.blocks[0].blocks[0]
+    assert (t.caption, t.hidden_cols) == ("A1:E2 (hidden columns B-D)", frozenset({1, 2, 3})), (t.caption, t.hidden_cols)
+    out = md(ods(xml))
+    assert "secret" not in out and "f1" not in out and "(3 hidden places left out)" in out and "e" in out, out
+    assert "secret" in md(ods(xml), True)
 
 
 def test_sheet_merge():
@@ -222,8 +236,8 @@ def test_hostile_span_clamped():
     xml = sheet("S", [row(c("a", 'table:number-columns-spanned="999999999" table:number-rows-spanned="999999999"'), c("b")),
                       row(c("c"), c("d"))])
     doc, _ = parse(ods(xml))
-    a = doc.blocks[0].blocks[0].rows[0][0]
-    assert a.colspan == 1000 and a.rowspan == 2, (a.colspan, a.rowspan)  # the row span stops at the last row
+    # the spans are clamped to 1000; the cells under the merge are covered, so it is a lone cell led by its range
+    assert doc.blocks[0].blocks == [Para([Text("A1:ALL1000: "), Text("a")])], doc.blocks[0].blocks
 
 
 def test_nested_groups_depth():
@@ -488,10 +502,10 @@ def test_ods_shapes_connector():
     assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Left"]\n  n2["Right"]\n  n1 --> n2', t
     out = markdown.render(doc, tmp() / "a")
     # every drawn shape with text keeps it in the flow: the unlinked one after the diagram, before the frame
-    assert out == f"## Sheet: S\n\n|x|y|\n|---|---|\n\n```mermaid\n{t}\n```\n\nUnlinked\n\nFramed\n", out
+    assert out == f"## Sheet: S\n\nA1:B1\n|x|y|\n|---|---|\n\n```mermaid\n{t}\n```\n\nUnlinked\n\nFramed\n", out
     plain = '<table:table table:name="S"><table:shapes>' + shape('draw:id="a"', "Left", "0cm") + frame("Framed")
     assert md(ods(plain + '</table:shapes>' + row(c("x"), c("y")) + '</table:table>')) == (
-        "## Sheet: S\n\n|x|y|\n|---|---|\n\nFramed\n")  # no connector: the sheet reads as before
+        "## Sheet: S\n\nA1:B1\n|x|y|\n|---|---|\n\nFramed\n")  # no connector: the sheet reads as before
 
 
 def test_ods_shapes_text_kept_beside_connector():
@@ -504,7 +518,7 @@ def test_ods_shapes_text_kept_beside_connector():
     t = mermaid(doc.blocks[0].blocks)
     assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Start"]\n  n2["Stop"]\n  n1 --> n2', t
     out = markdown.render(doc, tmp() / "a")
-    assert out == f"## Sheet: S\n\nx\n\n```mermaid\n{t}\n```\n\nLEGEND\n\nLOOSE LABEL\n\nGrouped\n", out
+    assert out == f"## Sheet: S\n\nA1: x\n\n```mermaid\n{t}\n```\n\nLEGEND\n\nLOOSE LABEL\n\nGrouped\n", out
     assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
 
 

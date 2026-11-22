@@ -99,6 +99,7 @@ class Table:
     hidden_rows: frozenset = frozenset()
     hidden_cols: frozenset = frozenset()
     hidden: str = _hid()
+    origin: str = ""  # a sheet table's top-left cell (A1), the base of its addresses; "" off a sheet
 
 
 @dataclass
