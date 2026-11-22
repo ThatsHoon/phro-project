@@ -82,6 +82,10 @@ class Fields:
     def left(self) -> int:
         return self.end - self.pos
 
+    def raw(self, n: int) -> bytes:
+        at = self._take(n)
+        return self.data[at:at + n]
+
     def wide(self) -> str | None:
         """XLWideString / XLNullableWideString: a u32 cch, then UTF-16LE; 0xFFFFFFFF is None."""
         cch = self.u32()

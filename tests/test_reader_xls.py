@@ -18,8 +18,9 @@ from reader.formats import biff, sheet_grid, xls, xls_drawing  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Para, Text  # noqa: E402
 from diagram_fix import mermaid_ok  # noqa: E402
-from reader_fix import (biff as rec, biff_chart, biff_workbook, blip_metafile, blip_png, make_cfb, make_xls,  # noqa: E402
-                        oa_container, oa_fbse, oa_group, oa_record, oa_shape, oa_solver, xls_txo)
+from reader_fix import (biff as rec, biff_chart, biff_workbook, blip_metafile, blip_png,  # noqa: E402
+                        externsheet, make_cfb, make_xls, oa_container, oa_fbse, oa_group, oa_record, oa_shape,
+                        oa_solver, xls_txo)
 
 
 def run(sheets, hidden=False, **kw):
@@ -89,6 +90,36 @@ def test_value_hidden_by_format():
     assert "|5|" not in md and "(1 hidden places left out)" in md, md
     md, _ = run([{"name": "S", "cells": {(0, 0): ("fmt", 5, ";;;"), (0, 1): "x"}}], hidden=True)
     assert "5" in md.replace("A1:B1", ""), md
+
+
+def fmla(row, col, rgce, value=1.0, extra=b""):
+    """A FORMULA record with a cached number: rw, col, ixfe, the result, grbit, chn, cce, then the tokens."""
+    return rec(0x0006, struct.pack("<HHHdHIH", row, col, 15, value, 0, 0, len(rgce)) + rgce + extra)
+
+
+def ref_n(drow, dcol):
+    return struct.pack("<BhH", 0x2C, drow, 0xC000 | (dcol & 0xFF))
+
+
+def lbl(name, rgce):
+    return rec(0x0018, struct.pack("<HBBHHH4x", 0, 0, len(name), len(rgce), 0, 0) + b"\0" + name.encode() + rgce)
+
+
+def test_formulas_decoded_and_grouped():
+    shared = ref_n(0, -2) + ref_n(0, -1) + b"\x05"
+    exp = struct.pack("<BHH", 0x01, 1, 3)
+    recs = [fmla(r, 3, exp) for r in (1, 2, 3)]
+    recs.insert(1, rec(0x04BC, struct.pack("<HHBBBBH", 1, 3, 3, 3, 0, 3, len(shared)) + shared))
+    three_d = struct.pack("<BHHH", 0x3A, 0, 0, 0xC000) + struct.pack("<BHH", 0x23, 1, 0) + b"\x03"
+    recs.append(fmla(1, 4, three_d))
+    recs.append(fmla(1, 5, b"\x18\0\0"))
+    data = biff_workbook([{"name": "Data", "cells": {(0, 0): 5}}, {"name": "S", "records": recs}],
+                         globals_extra=externsheet(0) + lbl("TaxRate", struct.pack("<BH", 0x1E, 7)))
+    ctx = Context()
+    secs = xls.Workbook(data, ctx, sheet_grid.Budget()).sections()
+    p = secs[1].blocks[-1]
+    assert "".join(i.text for i in p.inlines) == "Formulas: D2:D4 =B2*C2; E2 =Data!A1+TaxRate; F2 =?", p
+    assert ctx.skipped["formula"] == 1, ctx.skipped
 
 
 def test_formula_cached():

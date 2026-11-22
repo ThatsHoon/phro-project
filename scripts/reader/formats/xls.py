@@ -2,7 +2,8 @@
 
 The container check, the BOUNDSHEET-ordered sheet walk, the ROW and COLINFO hidden flags and the cached formula values
 (a string result comes from the STRING record after FORMULA, past any SHRFMLA, ARRAY or TABLE) were checked against
-dochan `office_binary/xls.py` and anydoc `sheet/xls.rs`. Cells go through `numfmt.display`; formulas are never shown.
+dochan `office_binary/xls.py` and anydoc `sheet/xls.rs`. Cells go through `numfmt.display`. Each FORMULA's tokens
+(a shared or array one's from its SHRFMLA or ARRAY) are read by `ptg` into the sheet's formulas paragraph.
 Every count from the file is bounded by the record it sits in: MULRK uses its own length, nested BOF and EOF pairs are
 skipped by depth, and BOUNDSHEET offsets are checked against the stream. A FILEPASS workbook is decrypted by `xls_crypt`
 when its default password verifies, else it is `encrypted`. A compound file with no Workbook stream goes to
@@ -26,7 +27,7 @@ from ..containers import flate
 from ..containers.zipx import Package
 from ..limits import ReadError
 from ..model import Doc, Section
-from . import biff, biff_chart, cfb_route, sheet_grid, xls_alike, xls_crypt, xls_drawing, zip_route
+from . import biff, biff_chart, cfb_route, ptg, sheet_grid, xls_alike, xls_crypt, xls_drawing, zip_route
 
 _ROW, _COLINFO, _MERGED, _DIMENSIONS = 0x0208, 0x007D, 0x00E5, 0x0200
 _LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR = 0x00FD, 0x0204, 0x00D6, 0x0203, 0x027E, 0x00BD, 0x0205
@@ -34,6 +35,7 @@ _FORMULA, _STRING = 0x0006, 0x0207
 _MSODRAWING = 0x00EC  # a sheet's drawing records, joined and read by xls_drawing
 _TXO = 0x01B6        # a text box's text, in the CONTINUEs after it
 _AFTER_FORMULA = frozenset({0x04BC, 0x0221, 0x0236})  # SHRFMLA, ARRAY, TABLE: may sit between FORMULA and STRING
+_ANCHORED = {0x04BC: 8, 0x0221: 12}  # SHRFMLA and ARRAY: the offset of cce in the body
 _CELLS = frozenset({_LABELSST, _LABEL, _RSTRING, _NUMBER, _RK, _MULRK, _BOOLERR, _FORMULA})
 _ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!", 0x2A: "#N/A"}
 _WORKSHEET, _MACRO, _CHART, _VBA = 0, 1, 2, 6
@@ -137,12 +139,14 @@ class Workbook:
         draw: list = []
         starts: list = []
         texts: list = []
+        forms: tuple = ([], {})
         try:
-            self._walk(ref.offset, grid, draw, starts, texts)
+            self._walk(ref.offset, grid, draw, starts, texts, forms)
         except Exception:
             del self.cells[i]  # a sheet that fails leaves no half-read cells for a chart to use
             raise
         self._starts[i] = starts
+        ptg.put(grid, *forms, self._env(), self.ctx)
         blocks = grid.sheet_blocks() if self.pictures else grid.blocks()
         if (draw or texts) and self.pictures:  # an embedded workbook drops its drawing, so nothing is decoded
             blocks = self._drawn(blocks, b"".join(draw), texts)
@@ -180,15 +184,17 @@ class Workbook:
             return value
         return sheet_grid.shown(value, code, self.g.date1904)
 
-    def _walk(self, offset: int, grid: sheet_grid.Grid, draw: list, starts: list, texts: list) -> None:
+    def _walk(self, offset: int, grid: sheet_grid.Grid, draw: list, starts: list, texts: list,
+              forms: tuple) -> None:
         """Walk sheet substream `offset` into `grid`; the sheet's MSODRAWING bodies, CONTINUEs joined, go into `draw`
         (a TXO or OBJ is another record, and a TXO's CONTINUEs belong to it); each TXO's text goes into `texts`
         (`_txo`; none for an embedded workbook); the offset of each chart substream nested in it goes into
-        `starts`."""
+        `starts`. Each FORMULA's (row, col, tokens, extra) goes into forms[0], and the tokens of a SHRFMLA or ARRAY
+        into forms[1] under the cell of the FORMULA before it, which is the cell a PtgExp names."""
         data = self.data
         if not 0 <= offset < len(data):
             raise ReadError("damaged", "sheet offset outside the stream")
-        depth, pending = 0, None
+        depth, pending, last = 0, None, None
         for rec in self.st.records(offset):
             rid, off, size = rec.id, rec.off, rec.size
             if rid == biff.BOF:
@@ -220,6 +226,15 @@ class Workbook:
                     pending = self._cell(rec, grid)
                 except (ValueError, struct.error):
                     self.ctx.skipped["record"] += 1
+                if rid == _FORMULA:
+                    last = self._formula(rec, forms[0])
+            elif rid in _ANCHORED:
+                body = _body(data, rec)
+                at = _ANCHORED[rid]
+                if last is not None and len(body) >= at + 2:
+                    cce = struct.unpack_from("<H", body, at)[0]
+                    forms[1].setdefault(last, (body[at + 2:at + 2 + cce], body[at + 2 + cce:]))
+                last = None
             elif rid == _STRING:
                 if pending is not None and not grid.cut:
                     r, c, ixfe = pending
@@ -253,6 +268,29 @@ class Workbook:
                     grid.merge(r1, r2, c1, c2)
         if depth == 0:  # no record at all, or a stream cut before any BOF
             raise ReadError("damaged", "sheet does not start with a BOF")
+
+    def _formula(self, rec, out: list):
+        """Keep a FORMULA's (row, col, tokens, extra) in `out` (rw, col, ixfe, an 8-byte result, grbit, chn, then cce
+        and the tokens); its (row, col), or None for one too short to hold them."""
+        body = _body(self.data, rec)
+        if len(body) < 22:
+            return None
+        row, col = struct.unpack_from("<HH", body)
+        cce = struct.unpack_from("<H", body, 20)[0]
+        out.append((row, col, body[22:22 + cce], body[22 + cce:]))
+        return row, col
+
+    def _env(self) -> ptg.Env:
+        """The workbook's formula tables: a sheet name (a range of them `First:Last`) per XTI, None for one outside
+        the workbook, and the defined names in NAME order."""
+        sheets = []
+        for first, last in zip(self.g.externs, self.g.externs_last):
+            if 0 <= first <= last < len(self.g.sheets):
+                a, b = self.g.sheets[first].name, self.g.sheets[last].name
+                sheets.append(a if first == last else f"{a}:{b}")
+            else:
+                sheets.append(None)
+        return ptg.Env(False, sheets=sheets, names=[n.name for n in self.g.names])
 
     def _txo(self, rec, grid: sheet_grid.Grid) -> str:
         """The text of a TXO record, charged against the sheet characters (past them the sheet is cut, as by a cell).
@@ -317,6 +355,12 @@ class Workbook:
             elif res[0] == 2:
                 grid.put(row, col, _ERRORS.get(res[2], "#N/A"))
         return None
+
+
+def _body(data: bytes, rec) -> bytes:
+    """A record's body with its CONTINUEs joined."""
+    body = data[rec.off:rec.off + rec.size]
+    return body + b"".join(data[o:o + n] for o, n in rec.conts) if rec.conts else body
 
 
 def _hide(blocks: list) -> list:

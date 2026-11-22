@@ -268,8 +268,40 @@ def test_value_hidden_by_format():
     assert "|5|" not in out and "(1 hidden places left out)" in out, out
 
 
+def parsed(rgce, extra=b""):
+    """A CellParsedFormula: cce, the tokens, cb, the extra data."""
+    return struct.pack("<I", len(rgce)) + rgce + struct.pack("<I", len(extra)) + extra
+
+
+def fmla_num(col, rgce, extra=b"", value=1.0):
+    """A BrtFmlaNum: the cell, the cached number, grbitFlags, then the formula."""
+    return xlsb_cell(9, col, 0, struct.pack("<dH", value, 0) + parsed(rgce, extra))
+
+
+def test_formulas_decoded_and_grouped():
+    exp = struct.pack("<BI", 0x01, 1), struct.pack("<I", 3)
+    rel = struct.pack("<BIH", 0x2C, 0, 0xC000 | 0x3FFE) + struct.pack("<BIH", 0x2C, 0, 0xC000 | 0x3FFF) + b"\x05"
+    shr = biff12(427, struct.pack("<IIII", 1, 3, 3, 3) + parsed(rel))
+    three_d = struct.pack("<BHIH", 0x3A, 0, 0, 0xC000) + struct.pack("<BI", 0x23, 1) + b"\x03"
+    records = [xlsb_row(1), fmla_num(3, *exp), shr, fmla_num(4, three_d), fmla_num(5, b"\x18\x00\x00"),
+               xlsb_row(2), fmla_num(3, *exp), xlsb_row(3), fmla_num(3, *exp)]
+    book = [xlsb_bundle("Data", "rId1", 0, 1), xlsb_bundle("S", "rId2", 0, 2), biff12(353), biff12(357),
+            biff12(362, struct.pack("<IIii", 1, 0, 0, 0)), biff12(354),
+            biff12(39, struct.pack("<IBI", 0, 0, 0xFFFFFFFF) + xlsb_wide("TaxRate") + parsed(b"\x1e\x07\x00")
+                   + xlsb_wide(None))]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "a.xlsb"
+        make_xlsb(path, [{"name": "Data", "cells": {(0, 0): 5}}, {"name": "S", "records": records}],
+                  workbook_records=book)
+        ctx = Context()
+        doc = xlsb.parse(path, ctx)
+    p = doc.blocks[1].blocks[-1]
+    assert "".join(i.text for i in p.inlines) == "Formulas: D2:D4 =B2*C2; E2 =Data!A1+TaxRate; F2 =?", p
+    assert ctx.skipped["formula"] == 1 and ctx.skipped["record"] == 0, ctx.skipped
+
+
 def test_formula_cached():
-    tail = bytes([0, 0, 0xFF, 0xFF, 1, 2, 3])  # flags and formula bytes: never read
+    tail = struct.pack("<H", 0) + parsed(struct.pack("<BH", 0x1E, 1))  # flags, then the formula =1
     records = [xlsb_row(0),
                xlsb_cell(8, 0, 0, xlsb_wide("cached") + tail),
                xlsb_cell(9, 1, 0, struct.pack("<d", 2.5) + tail),
@@ -279,6 +311,7 @@ def test_formula_cached():
     for want in ("cached", "2.5", "#DIV/0!"):
         assert want in out, (want, out)
     assert "TRUE" in out.upper() and not ctx.skipped, (out, ctx.skipped)
+    assert "Formulas: A1:D1 =1" in out, out
 
 
 def test_rich_string_cell():

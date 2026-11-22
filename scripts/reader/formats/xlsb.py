@@ -5,8 +5,10 @@ styles.bin, BrtSSTItem, the row, cell, column and merge records) and the
 framing in `containers/biff12.py`. Parts are found through the package relationships, with the conventional names
 only when a relationship is absent; a part no relationship reaches is never read. Every handler runs per record:
 the record size gives an exact step, so a bad record is counted under `record` and the walk goes on. Cells go
-through `numfmt.display`; a formula shows its cached value and its expression is never read. A sheet that cannot
-be read, or whose workbook entry names no readable part, is counted under `sheet` and the others still come out.
+through `numfmt.display`; a formula shows its cached value, and its tokens (a shared or array one's from its
+BrtShrFmla or BrtArrFmla) are read by `ptg` into the sheet's formulas paragraph, 3-D references through BrtExternSheet
+and names through BrtName ([MS-XLSB] 2.4.647, 2.4.689, 2.5.173). A sheet that cannot be read, or whose workbook entry
+names no readable part, is counted under `sheet` and the others still come out.
 A sheet's charts and pictures come from `sheet_drawing` and follow the sheet's table in anchor order. A compound file named .xlsb goes to
 `cfb_route`: an encrypted package is `encrypted`, and another format's file is read by its own parser.
 """
@@ -19,7 +21,7 @@ from ..containers.zipx import Package
 from ..limits import ReadError
 from ..model import Doc, Section
 from ..numfmt import code_for
-from . import biff, cfb_route, sheet_drawing, sheet_grid
+from . import biff, cfb_route, ptg, sheet_drawing, sheet_grid
 from .xls import _hide
 
 BRT_ROW_HDR = 0
@@ -39,6 +41,10 @@ BRT_WB_PROP = 153
 BRT_BUNDLE_SH = 156
 BRT_BEGIN_CELL_XFS = 617
 BRT_END_CELL_XFS = 618
+BRT_NAME = 39
+BRT_SUP_BOOK_SRC, BRT_SUP_SELF, BRT_SUP_SAME, BRT_SUP_ADDIN = 355, 357, 358, 667
+BRT_EXTERN_SHEET = 362
+BRT_ARR_FMLA, BRT_SHR_FMLA = 426, 427
 
 _PARTS = {"workbook": "xl/workbook.bin", "styles": "xl/styles.bin", "sharedStrings": "xl/sharedStrings.bin"}
 
@@ -53,6 +59,9 @@ class _Wb:
         self.xf_fmt: list[int] = []
         self.formats: dict[int, str] = {}
         self.chartsheets: set[str] = set()  # sheet parts whose relationship is a chartsheet
+        self.supbooks: list[bool] = []  # one flag per supporting link: this workbook itself
+        self.xti: list[tuple[int, int, int]] = []  # (supporting link, first sheet, last sheet) per XTI
+        self.names: list[biff.DefinedName] = []  # one per BrtName, in order
 
 
 def _check_container(path) -> str | None:
@@ -118,6 +127,14 @@ def _workbook(pkg, part, rels, wb, ctx):
         try:
             if rid == BRT_WB_PROP:
                 wb.date1904 = biff12.Fields(data, off, size).u32() & 1 != 0
+            elif rid in (BRT_SUP_BOOK_SRC, BRT_SUP_SELF, BRT_SUP_SAME, BRT_SUP_ADDIN):
+                wb.supbooks.append(rid == BRT_SUP_SELF)
+            elif rid == BRT_EXTERN_SHEET and not wb.xti:
+                f = biff12.Fields(data, off, size)
+                n = min(f.u32(), f.left() // 12)
+                wb.xti = list(struct.iter_unpack("<Iii", data[f.pos:f.pos + n * 12]))
+            elif rid == BRT_NAME:
+                wb.names.append(_name(biff12.Fields(data, off, size)))
             elif rid == BRT_BUNDLE_SH:
                 n = index  # a short body must still use up its place, or every later fallback name slips
                 index += 1
@@ -140,6 +157,24 @@ def _workbook(pkg, part, rels, wb, ctx):
                         wb.sheets.append((f"Sheet {n + 1}", fallback[n].target, state))
         except (ValueError, struct.error):
             ctx.skipped["record"] += 1
+
+
+def _name(f) -> biff.DefinedName:
+    """A BrtName: flags (0x01 hidden, 0x20 built-in), chKey, itab (0xFFFFFFFF the workbook), the name and its
+    NameParsedFormula; `itab` becomes biff's one-based sheet index, 0 for the workbook."""
+    flags = f.u32()
+    f.u8()
+    itab = f.u32()
+    name = f.wide() or ""
+    rgce, extra = _formula(f)
+    return biff.DefinedName(name[6:] if name.startswith("_xlnm.") else name, flags,
+                            0 if itab == 0xFFFFFFFF else itab + 1, rgce, extra)
+
+
+def _formula(f) -> tuple[bytes, bytes]:
+    """A parsed formula (cce, the tokens, cb, the extra data) as (tokens, extra)."""
+    rgce = f.raw(f.u32())
+    return rgce, f.raw(f.u32())
 
 
 def _styles(pkg, part, wb, ctx):
@@ -261,6 +296,7 @@ class _Sheets:
             return self.draw.blocks(part)
         grid = sheet_grid.Grid(name, self.budget, self.ctx)
         row, lost = None, False  # lost: the row header was bad, so its row is counted (once) and its cells go with it
+        forms, anchored, last = [], {}, None  # each formula's (row, col, tokens, extra); shared and array ones by cell
         for rid, data, off, size in _walk(self.pkg, part, self.ctx):
             try:
                 if rid == BRT_ROW_HDR:
@@ -281,6 +317,20 @@ class _Sheets:
                     col = f.u32()
                     style = f.u32() & 0xFFFFFF
                     grid.put(row, col, self._cell(rid, f, style))
+                    if rid in _FORMULAS:
+                        last = None
+                        try:
+                            f.skip(2)
+                            forms.append((row, col, *_formula(f)))
+                            last = row, col
+                        except ValueError:
+                            self.ctx.skipped["formula"] += 1
+                elif rid in (BRT_SHR_FMLA, BRT_ARR_FMLA):
+                    f = biff12.Fields(data, off, size)
+                    f.skip(16 if rid == BRT_SHR_FMLA else 17)
+                    if last is not None:
+                        anchored.setdefault(last, _formula(f))
+                    last = None
                 elif rid == BRT_COL_INFO:
                     f = biff12.Fields(data, off, size)
                     first_col, last_col = f.u32(), f.u32()
@@ -297,7 +347,19 @@ class _Sheets:
                     grid.merge(r1, r2, c1, c2)
             except (ValueError, struct.error):
                 self.ctx.skipped["record"] += 1
+        ptg.put(grid, forms, anchored, self._env(), self.ctx)
         return grid.sheet_blocks() + self.draw.blocks(part)
+
+    def _env(self) -> ptg.Env:
+        """A sheet name (a range of them `First:Last`) per XTI, None for one outside the workbook, and the names."""
+        wb, sheets = self.wb, []
+        for book, first, last in wb.xti:
+            if book < len(wb.supbooks) and wb.supbooks[book] and 0 <= first <= last < len(wb.sheets):
+                a, b = wb.sheets[first][0], wb.sheets[last][0]
+                sheets.append(a if first == last else f"{a}:{b}")
+            else:
+                sheets.append(None)
+        return ptg.Env(True, sheets=sheets, names=[n.name for n in wb.names])
 
     def _cell(self, rid: int, f, style: int) -> str:
         """The displayed value of one cell record whose header has been read. A formula shows its cached value."""
@@ -321,6 +383,7 @@ class _Sheets:
 
 _CELLS = frozenset({BRT_CELL_RK, BRT_CELL_ERROR, BRT_CELL_BOOL, BRT_CELL_REAL, BRT_CELL_ST, BRT_CELL_ISST,
                     BRT_CELL_RSTRING, BRT_FMLA_STRING, BRT_FMLA_NUM, BRT_FMLA_BOOL, BRT_FMLA_ERROR})
+_FORMULAS = frozenset({BRT_FMLA_STRING, BRT_FMLA_NUM, BRT_FMLA_BOOL, BRT_FMLA_ERROR})
 
 
 def parse(path, ctx) -> Doc:

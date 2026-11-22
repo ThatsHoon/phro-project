@@ -26,6 +26,10 @@ SST = 0x00FC
 MSODRAWINGGROUP = 0x00EB
 SUPBOOK = 0x01AE
 EXTERNSHEET = 0x0017
+NAME = 0x0018
+_BUILTIN = ("Consolidate_Area", "Auto_Open", "Auto_Close", "Extract", "Database", "Criteria", "Print_Area",
+            "Print_Titles", "Recorder", "Data_Form", "Auto_Activate", "Auto_Deactivate", "Sheet_Title",
+            "_FilterDatabase")
 
 class Rec(NamedTuple):
     """One record of a stream; a plain 4-tuple unpacks the same way."""
@@ -257,6 +261,17 @@ class Globals:
     drawing: bytes = b""
     supbooks: list = field(default_factory=list)  # one flag per SUPBOOK: this workbook itself
     externs: list = field(default_factory=list)  # one sheet index per XTI (EXTERNSHEET), -1 when not a sheet here
+    externs_last: list = field(default_factory=list)  # the last sheet index of each XTI, -1 when not a sheet here
+    names: list = field(default_factory=list)  # one DefinedName per NAME (Lbl) record, in order
+
+
+@dataclass
+class DefinedName:
+    name: str
+    flags: int    # Lbl grbit: 0x01 hidden, 0x20 built-in
+    itab: int     # 0 for the workbook, else the one-based sheet index it is local to
+    rgce: bytes   # the parsed formula
+    extra: bytes  # its extra data
 
 
 def _cursor(st: Stream, rec: Rec, skip: int = 0) -> Cursor:
@@ -319,12 +334,34 @@ def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
     elif rid == EXTERNSHEET and size >= 2 and not g.externs:
         body = data[off:off + size] + b"".join(data[o:o + n] for o, n in rec.conts)
         n = min(struct.unpack_from("<H", body)[0], (len(body) - 2) // 6)
-        for book, first, _last in struct.iter_unpack("<Hhh", body[2:2 + n * 6]):
+        for book, first, last in struct.iter_unpack("<Hhh", body[2:2 + n * 6]):
             internal = book < len(g.supbooks) and g.supbooks[book]
             g.externs.append(first if internal and first >= 0 else -1)
+            g.externs_last.append(last if internal and last >= first >= 0 else -1)
+    elif rid == NAME:
+        g.names.append(_name(data[off:off + size] + b"".join(data[o:o + n] for o, n in rec.conts)))
     elif rid == MSODRAWINGGROUP:
         drawing.append(data[off:off + size])
         drawing.extend(data[o:o + n] for o, n in rec.conts)
+
+
+def _name(body: bytes) -> DefinedName:
+    """A Lbl record ([MS-XLS] 2.4.150): grbit, chKey, cch, cce, two reserved bytes, itab, four reserved bytes, the
+    name (a flag byte, then cch characters; a built-in name is one code) and cce bytes of formula. A damaged one keeps
+    its place with an empty name, so a PtgName index after it stays right."""
+    if len(body) < 15:
+        return DefinedName("", 0, 0, b"", b"")
+    flags, cch, cce, itab = struct.unpack_from("<HxBH2xH", body)
+    wide = body[14] & 1
+    end = 15 + cch * (2 if wide else 1)
+    raw = body[15:end]
+    if len(raw) != end - 15 or len(body) < end + cce:
+        return DefinedName("", 0, 0, b"", b"")
+    name = raw.decode("utf-16-le" if wide else "latin-1")
+    if flags & 0x20 and len(name) == 1:
+        code = ord(name)
+        name = _BUILTIN[code] if code < len(_BUILTIN) else name
+    return DefinedName(name, flags, itab, body[end:end + cce], body[end + cce:])
 
 
 def fmt_code(g: Globals, ixfe: int) -> str:
