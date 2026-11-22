@@ -239,6 +239,24 @@ def test_drawing_of_miniature_text_is_a_figure():
         assert "line 05 of it" in text and "Prose line 9 of the page" in text, text
 
 
+def test_table_after_a_line_with_a_superscript_keeps_its_place():
+    """A raised citation makes pieces of one line; the table drawn inside the paragraph after it still comes out,
+    after the paragraph."""
+    full = "Words that fill the whole width of the column of this page, line %d of the text"
+    ops = [text_ops(full % 0, x=72, y=700, size=10), text_ops("and the count went up in the species.", x=72, y=688, size=10)]
+    ops += [text_ops(t, x=237 + dx, y=692, size=6) for t, dx in (("2", 0), (",", 3.4), ("3", 5.2))]
+    ops.append(text_ops("It is therefore said that this goes on to the end", x=247, y=688, size=10))
+    ops += [text_ops(full % k, x=72, y=700 - 12 * k, size=10) for k in (2, 3, 4)]
+    ops += [rule_ops(72, 590 + 20 * r, 272, 590 + 20 * r) for r in range(4)]
+    ops += [rule_ops(72 + 100 * c, 590, 72 + 100 * c, 650) for c in range(3)]
+    ops += [text_ops("cell %d%d" % (r, c), x=80 + 100 * c, y=596 + 20 * r, size=10) for r in range(3) for c in range(2)]
+    ops.append(text_ops(full % 5, x=72, y=560, size=10))
+    text, ctx, _doc = md(simple_pdf([b" ".join(ops)]))
+    assert text.count("cell 00") == 1 and text.count("cell 21") == 1 and not ctx.skipped, (text, ctx.skipped)
+    assert text.index("line 4 of the text") < text.index("cell 21") < text.index("line 5 of the text"), text
+    assert "species.2,3It is therefore said" in text, text
+
+
 def test_picture_between_paragraphs_of_its_column():
     """A picture in the right column goes between that column's paragraphs, not into the left column's text."""
     left = b" ".join(text_ops("Left column line %d of text" % k, x=72, y=700 - 14 * k, size=10) for k in range(30))

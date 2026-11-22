@@ -278,7 +278,7 @@ def _figure_boxes(marks, page, tables, lines) -> list:
     and one inside a ruled table (`tables`, boxes, grown by pdf_tables.TOLERANCE: the squares a table's joints are
     filled with), are grouped where they lie within a FIGURE_CELL of one another or of one rule outside the ruled
     tables (`_groups_of`: a chart's bars meet on its axis); a group, with the pieces of the rules inside its box that
-    lie in no ruled table, is a figure by `_is_figure`. Groups whose boxes overlap are one figure. When no group is a
+    lie in no ruled table, is a figure by `_is_figure`. Groups whose boxes overlap are one figure when their union is one too. When no group is a
     figure, or more than FIGURES_PAGE are, the union of all the paths is tried as one (scattered marks that make a
     drawing together)."""
     def within(a, b):
@@ -288,20 +288,33 @@ def _figure_boxes(marks, page, tables, lines) -> list:
         return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
 
     def whole(box, pieces):
-        return pieces + sum(n for b, n, rule in marks if rule and within(b, box) and not any(within(b, t) for t in tables))
+        return pieces + sum(n for b, n in ruled if within(b, box))
     grown = [(t[0] - pdf_tables.TOLERANCE, t[1] - pdf_tables.TOLERANCE, t[2] + pdf_tables.TOLERANCE,
               t[3] + pdf_tables.TOLERANCE) for t in tables]
     paths = [(b, n, rule) for b, n, rule in marks
              if _cover(b, page) < limits.FIGURE_WHOLE and not any(within(b, t) for t in (tables if rule else grown))]
     if not any(not rule for _b, _n, rule in paths):
         return []
+    ruled = [(b, n) for b, n, rule in marks if rule and not any(within(b, t) for t in tables)]
     found = []
     for box, pieces in _groups_of(paths, page):
-        if _is_figure(box, whole(box, pieces), page, lines):
-            at = [i for i, f in enumerate(found) if f[0] < box[2] and box[0] < f[2] and f[1] < box[3] and box[1] < f[3]]
-            for i in reversed(at):
-                box = union(box, found.pop(i))
-            found.append(box)
+        if _cover(box, page) >= FIGURE_COVER and _is_figure(box, whole(box, pieces), page, lines):
+            found.append((box, pieces))
+    merged = True
+    while merged:
+        merged = False
+        for i, (a, n) in enumerate(found):
+            for j in range(i + 1, len(found)):
+                b, m = found[j]
+                if (a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+                        and _is_figure(union(a, b), n + m, page, lines)):
+                    found[i] = (union(a, b), n + m)
+                    del found[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    found = [box for box, _n in found]
     if found and len(found) <= FIGURES_PAGE:
         return sorted(found, key=lambda f: -(f[2] - f[0]) * (f[3] - f[1]))
     box, pieces = None, 0

@@ -176,10 +176,10 @@ def test_piece_that_goes_on_along_the_line_stays_in_its_paragraph():
                      ("1) to our stockholders over the same period of time", -0.007)):
         on = replace(lns[2], text=text, runs=[(text, "")],
                      box=(lns[1].box[2] - 0.1, lns[1].box[1] - dy, 426.0, lns[1].box[3] - dy))
-        got = [para_text(p) for p in L.paragraphs([lns[0], lns[1], on, lns[3]], L.SpacingModel())]
+        got = [para_text(p) for p in L.paragraphs(L._whole([lns[0], lns[1], on, lns[3]]), L.SpacingModel())]
         assert len(got) == 1 and "pregnancies.2" + text[:2] in got[0], got
     far = replace(lns[2], box=(lns[1].box[2] + 60, lns[1].box[1], 400.0, lns[1].box[3]))
-    assert len(L.paragraphs([lns[0], lns[1], far, lns[3]], L.SpacingModel())) > 1
+    assert len(L.paragraphs(L._whole([lns[0], lns[1], far, lns[3]]), L.SpacingModel())) > 1
 
 
 def test_toc_entry_ends_paragraph():

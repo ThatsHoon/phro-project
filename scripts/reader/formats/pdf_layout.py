@@ -758,7 +758,8 @@ def lines(fragments, links=(), gap=None) -> List[Line]:
     `vertical_lines`: on a page with vertical fonts, the fragments that run down the page and the
     one-glyph fragments stacked in a column (`_stacked`: a horizontal font's glyphs placed one by
     one down a column, among a vertical font's punctuation). Other text running down the page is
-    read as lines like any other.
+    read as lines like any other. A line that goes on along the one before it (a piece set off by
+    a superscript or a font change) is one line with it (`_whole`).
 
     A fragment that starts before the last one ended (a row whose cells are drawn right cell
     first, words drawn into the gaps a later string leaves) joins the line as `_Row.take_back`
@@ -807,7 +808,7 @@ def lines(fragments, links=(), gap=None) -> List[Line]:
             row = _Row(f, urls, d, a, gap)
         row.lo, row.hi, row.end = min(row.lo, s), max(row.hi, s + f.width), s + f.width
     flush(row, last)
-    return out + vertical_lines(vertical, links)
+    return _whole(out) + vertical_lines(vertical, links)
 
 
 def _tiers(frags) -> list:
@@ -985,18 +986,32 @@ def _along(prev, ln) -> bool:
 
 
 def _whole(lns) -> list:
-    """`lns` with each line that goes on along the one before it (`_along`) made one line with it."""
-    out = []
+    """`lns` with each line that goes on along the one before it (`_along`) made one line with it, a space between
+    them when they are over ALONG_SPACE sizes apart."""
+    out, chain = [], []
+
+    def close():
+        if len(chain) > 1:
+            first = chain[0]
+            runs, box = list(first.runs), first.box
+            for prev, ln in zip(chain, chain[1:]):
+                if ln.box[0] - prev.box[2] > ALONG_SPACE * first.size and not ln.vertical:
+                    runs.append((" ", ""))
+                runs.extend(ln.runs)
+                box = (min(box[0], ln.box[0]), min(box[1], ln.box[1]), max(box[2], ln.box[2]), max(box[3], ln.box[3]))
+            out[-1] = replace(first, text="".join(t for t, _ in runs), runs=runs, box=box)
+        chain.clear()
+    reach = None
     for ln in lns:
-        if out and _along(out[-1], ln):
-            prev = out[-1]
-            sep = " " if ln.box[0] - prev.box[2] > ALONG_SPACE * prev.size and not ln.vertical else ""
-            a, b = prev.box, ln.box
-            out[-1] = replace(prev, text=prev.text + sep + ln.text,
-                              runs=prev.runs + ([(sep, "")] if sep else []) + ln.runs,
-                              box=(min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])))
+        if chain and _along(reach, ln):
+            reach = replace(reach, box=(min(reach.box[0], ln.box[0]), min(reach.box[1], ln.box[1]),
+                                        max(reach.box[2], ln.box[2]), max(reach.box[3], ln.box[3])))
         else:
+            close()
             out.append(ln)
+            reach = ln
+        chain.append(ln)
+    close()
     return out
 
 
@@ -1046,10 +1061,7 @@ def paragraphs(lns, model, body=None) -> List[Para]:
 def _groups(lns, body=None) -> list:
     """The lines of each paragraph: a baseline step over PARA_GAP x the body pitch `body` (the
     `pitch` of these lines when None), a step that does not go forward, or a line that was ended
-    rather than wrapped (`_ended`) starts a new one; a line that goes on along the one before
-    (`_along`) is one line with it, a space between them when they are over ALONG_SPACE sizes
-    apart; a table-of-contents entry (`toc_entry`) ends its own."""
-    lns = _whole(lns)
+    rather than wrapped (`_ended`) starts a new one; a table-of-contents entry (`toc_entry`) ends its own."""
     body = pitch(lns) if body is None else body
     groups, cur, prev, right = [], [], None, -math.inf
     for ln in lns:
@@ -1378,7 +1390,7 @@ def marked_running(pages, boxes, headers, footers):
     for page, box in zip(pages, boxes):
         for ln in sorted(page, key=lambda ln: -ln.box[1]):
             text = _normal(ln.text)
-            if not text or ln.vertical or _PAGE_NUMBER.fullmatch(text) or _key(text) in seen:
+            if not text or _PAGE_NUMBER.fullmatch(text) or _key(text) in seen:
                 continue
             seen.add(_key(text))
             (headers if 2 * ln.box[1] > box[1] + box[3] else footers).append(ln.text)
