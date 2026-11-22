@@ -133,7 +133,7 @@ def test_deny_detail_capped():
         why = gate._why(kind, long)
         assert len(why) < gate.DETAIL_MAX + 40 and why.count("x") <= gate.DETAIL_MAX and "…" in why, (kind, len(why))
     assert gate._why("damaged", "internal error " + "y" * 5000).count("y") <= gate.DETAIL_MAX
-    assert gate._why("damaged", "short") == "the file looks damaged (short)"
+    assert gate._why("damaged", "short") == "the file looks damaged: short"
     assert gate.DETAIL_MAX == 200
 
 
@@ -160,7 +160,7 @@ def test_djvu_unsupported_detail():
     from djvu_fix import iff, page
     o = out(gate.decide(ev(put("a.djvu", iff(page(None))))))
     assert o["permissionDecision"] == "deny", o
-    assert "this file is not supported (no text layer:" in o["permissionDecisionReason"], o
+    assert "this file is not supported: no text layer:" in o["permissionDecisionReason"], o
 
 
 def test_phase4_formats_convert():
@@ -230,8 +230,8 @@ def test_vanished_entry_denied():
 
 def test_name_is_flattened():
     assert gate._name(Path("x/a\tb\nc.hwp")) == "a b c.hwp"
-    o = gate.deny_text(Path("x/a\tb.hwp"), "why")
-    assert o["hookSpecificOutput"]["permissionDecisionReason"].startswith("a b.hwp: why.")
+    o = gate._deny(Path("x/a\tb.hwp"), "damaged", "why")
+    assert o["hookSpecificOutput"]["permissionDecisionReason"].startswith("a b.hwp: the file looks damaged: why.")
 
 
 def test_unsupported_phase():
@@ -246,19 +246,50 @@ def test_unsupported_phase():
         reader.FORMATS.clear()
         reader.FORMATS.update(old)
     assert o["permissionDecision"] == "deny"
-    assert o["permissionDecisionReason"] == "x.zzq: this format is not supported yet.", o
+    assert o["permissionDecisionReason"] == (
+        "x.zzq: this format is not supported yet. Ask the user for the file saved as pdf."), o
 
 
-def test_retry_by_hand_only_where_it_can_help():
-    p = Path("d/a.docx")
-    for kind in ("unsupported", "encrypted", "drm", "too_large"):
-        why = out(gate._deny(p, kind, "x"))["permissionDecisionReason"]
-        assert "Retry by hand" not in why and why.endswith("."), why
-    for kind in ("damaged", "timeout"):
-        why = out(gate._deny(p, kind, "x"))["permissionDecisionReason"]
-        assert "Retry by hand: python -I -X utf8" in why, why
-    why = out(gate._deny(p, "damaged", "internal error KeyError"))["permissionDecisionReason"]
-    assert why.startswith("a.docx: reading failed (internal error KeyError). Retry by hand:"), why
+def _depth(text):
+    """The deepest nesting of round brackets in text."""
+    deep = level = 0
+    for ch in text:
+        level += (ch == "(") - (ch == ")")
+        deep = max(deep, level)
+    return deep
+
+
+def test_deny_texts_name_the_next_step():
+    """Only a timeout carries the retry command; every other kind ends with one sentence saying what can be done,
+    and no reason nests brackets."""
+    def r(p, kind, detail=""):
+        return out(gate._deny(Path(p), kind, detail))["permissionDecisionReason"]
+    protected = " phro-project cannot open protected files; ask the user for an unprotected copy."
+    assert r("d/a.hwp", "encrypted") == "a.hwp: the file is encrypted and needs a password." + protected
+    assert r("d/a.epub", "drm") == "a.epub: the file is DRM-protected." + protected
+    assert r("d/a.docx", "encrypted") == ("a.docx: the file is encrypted and needs a password. phro-project cannot"
+                                          " open protected files; ask the user for an unprotected copy, or for the"
+                                          " password and read it with the docx skill.")
+    assert r("d/a.doc", "unsupported", "Word 6/95") == (
+        "a.doc: this file is not supported: Word 6/95. Ask the user for the file saved as docx or pdf.")
+    assert r("d/a.xls", "damaged", "nothing readable (could not read: 1 chart)") == (
+        "a.xls: the file looks damaged: nothing readable (could not read: 1 chart). Ask the user for the file saved"
+        " again, as xlsx or pdf.")
+    assert r("d/a.pptx", "damaged", "x") == ("a.pptx: the file looks damaged: x. Read it with the pptx skill instead,"
+                                             " or ask the user for the file saved again, as pptx or pdf.")
+    assert r("d/a.hwp", "damaged", "internal error KeyError") == (
+        "a.hwp: reading failed: internal error KeyError. Ask the user for the file saved again, as hwpx or pdf.")
+    assert r("d/a.hwp", "too_large", gate.limits.BIG_INPUT) == (
+        "a.hwp: the file is over 512 MiB. That is phro-project's safety limit; ask the user for a smaller file, such"
+        " as the part they need saved on its own.")
+    for kind in ("unsupported", "encrypted", "drm", "too_large", "damaged"):
+        for name in ("a.docx", "a.pub", "a.pdf"):
+            why = r("d/" + name, kind, "x (y)")
+            assert "Retry by hand" not in why and why.endswith(".") and _depth(why) <= 1, why
+    why = r("d/a.xlsx", "timeout")
+    assert why.startswith(f"a.xlsx: conversion took over {gate.limits.CONVERT_SECONDS} seconds. Retry by hand:"
+                          f' python -I -X utf8 "{gate.READ_PY}" convert "'), why
+    assert why.endswith(" or read it with the xlsx skill."), why
 
 
 def test_allow_swaps_path_keeps_keys():
@@ -323,16 +354,18 @@ def test_edit_hint_before_lists():
     assert c.index("Read-only view") < c.index("Some parts") < c.index("Sections at"), c
 
 
-def test_deny_names_the_skill():
-    def r(d):
-        return d["hookSpecificOutput"]["permissionDecisionReason"]
-    t = r(gate._deny(Path("d/a.xlsx"), "damaged", "x"))
-    assert "Retry by hand: python -I -X utf8" in t and t.endswith(" or read it with the xlsx skill."), t
-    assert r(gate._deny(Path("d/a.docx"), "encrypted")) == (
-        "a.docx: the file is encrypted and needs a password. Read it with the docx skill instead.")
-    assert r(gate._deny(Path("d/a.hwp"), "encrypted")) == "a.hwp: the file is encrypted and needs a password."
-    assert r(gate.deny_text(Path("d/a.pptx"), "reading failed (internal error KeyError)")).endswith(
-        " or read it with the pptx skill.")
+def test_hook_cli_internal_error_deny():
+    """An exception in the gate is denied as damaged, without the retry command."""
+    code = ("import sys, io, json; sys.path.insert(0, sys.argv[1]); import read; from reader import gate; "
+            "gate.decide = lambda e: 1 / 0; sys.stdin = io.TextIOWrapper(io.BytesIO(json.dumps("
+            "{'tool_name': 'Read', 'tool_input': {'file_path': sys.argv[2]}}).encode())); read.main(['hook'])")
+    f = tmp() / "a.hwp"
+    f.write_bytes(bytes.fromhex("D0CF11E0"))
+    r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, str(HERE / "scripts"), str(f)],
+                       capture_output=True)
+    o = json.loads(r.stdout.decode("utf-8"))["hookSpecificOutput"]
+    assert o["permissionDecisionReason"] == ("a.hwp: reading failed: internal error ZeroDivisionError. Ask the user"
+                                             " for the file saved again, as hwpx or pdf."), o
 
 
 @contextmanager
@@ -756,7 +789,7 @@ def test_ooxml_four_converted():
         (d / "a.pdf").write_bytes(b"%PDF-1.7\n" + bytes(64))
         r = gate.decide(ev(d / "a.pdf"))  # a damaged pdf passes through to Claude's own Read
         assert r is not None and "permissionDecision" not in out(r), r
-        assert out(r)["additionalContext"].startswith("phro-project could not convert a.pdf ("), r
+        assert out(r)["additionalContext"].startswith("phro-project could not convert a.pdf: "), r
 
 
 def test_readme_formats_match():
@@ -1155,8 +1188,8 @@ def test_pdf_damaged_pass_through():
         o = out(r)
         assert set(o) == {"hookEventName", "additionalContext"} and o["hookEventName"] == "PreToolUse", o
         c = o["additionalContext"]
-        assert c.startswith("phro-project could not convert a.pdf (the file looks damaged ("), c
-        assert c.endswith("); Claude's own Read is used."), c
+        assert c.startswith("phro-project could not convert a.pdf: the file looks damaged: "), c
+        assert c.endswith(". Claude's own Read is used."), c
         assert (cache.root() / "failed" / cache.key(p, "native")).is_file()
         seen, real = [], gate.subprocess.run
         gate.subprocess.run = lambda cmd, **kw: seen.append(cmd) or real(cmd, **kw)
@@ -1175,7 +1208,7 @@ def test_pdf_timeout_pass_through():
         r = gate.decide(ev(p), command=[sys.executable, "-c", "import time; time.sleep(5)"], timeout=1)
         o = out(r)
         assert "permissionDecision" not in o, o
-        assert o["additionalContext"] == ("phro-project could not convert a.pdf (conversion took over 45 seconds); "
+        assert o["additionalContext"] == ("phro-project could not convert a.pdf: conversion took over 45 seconds. "
                                           "Claude's own Read is used."), o
         assert (cache.root() / "failed" / cache.key(p, "native")).is_file()
 
@@ -1187,7 +1220,8 @@ def test_pdf_encrypted_denies():
         o = out(gate.decide(ev(p)))
         assert o["permissionDecision"] == "deny", o
         assert o["permissionDecisionReason"] == (
-            "a.pdf: the file is encrypted and needs a password. Read it with the pdf skill instead."), o
+            "a.pdf: the file is encrypted and needs a password. phro-project cannot open protected files; ask the"
+            " user for an unprotected copy, or for the password and read it with the pdf skill."), o
 
 
 def test_offer_once_per_session():
@@ -1327,6 +1361,8 @@ def test_pdf_context_order():
     at = [c.index(m) for m in marks]
     assert at == sorted(at), (at, c)
     assert c.startswith("a.pdf was converted to Markdown by phro-project (3000 lines). 2 hidden places left out."), c
+    c = gate._context("a.pdf", _pdf_meta(hidden=1), md)
+    assert c.startswith("a.pdf was converted to Markdown by phro-project (3000 lines). 1 hidden place left out."), c
 
 
 def test_page_index_long():
@@ -1362,7 +1398,7 @@ def test_ascii_pdf_not_text():
 
 
 def test_unsupported_detail_reason():
-    assert gate._why("unsupported", "Excel 5.0/95 workbook") == "this file is not supported (Excel 5.0/95 workbook)"
+    assert gate._why("unsupported", "Excel 5.0/95 workbook") == "this file is not supported: Excel 5.0/95 workbook"
     assert gate._why("unsupported") == "this format is not supported yet"
 
 
@@ -1399,7 +1435,7 @@ def test_unsupported_mac_hint_fits():
         o = out(gate.decide(ev(p), command=child))
     assert o["permissionDecision"] == "deny", o
     assert "PHRO_READER_SOFFICE=1" in o["permissionDecisionReason"], o
-    assert "this file is not supported (" + detail + ")" in o["permissionDecisionReason"], o
+    assert "this file is not supported: " + detail + "." in o["permissionDecisionReason"], o
 
 
 def test_bundle_folder_passes():
@@ -1648,9 +1684,10 @@ def test_mpp_child_fail_kinds():
             def fail(kind, detail=""):
                 return [sys.executable, "-c", f"print('FAIL\\t{kind}\\t{detail}')"]
             r = reason_of(gate.decide(ev(project()), command=fail("encrypted", "password")))
-            assert r == "a.mpp: the file is encrypted and needs a password.", r
+            assert r == "a.mpp: the file is encrypted and needs a password. phro-project cannot open protected files; ask the user for an unprotected copy.", r
             r = reason_of(gate.decide(ev(project()), command=fail("damaged", "MPXJ could not read the file")))
-            assert r.startswith("a.mpp: the file looks damaged (MPXJ could not read the file). Retry by hand:"), r
+            assert r == ("a.mpp: the file looks damaged: MPXJ could not read the file. Ask the user for the file"
+                         " saved again, as pdf."), r
             r = reason_of(gate.decide(ev(project()), command=[sys.executable, "-c", "import time; time.sleep(5)"],
                                       timeout=1))
             assert r.startswith(f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds."), r
@@ -1661,7 +1698,8 @@ def test_mpp_child_fail_kinds():
             assert r == MPP_HEAD.format(name="a.mpp") + mpp_offer(v), r
             # another format's compound file named .mpp, which its own parser refuses: that parser's detail
             r = reason_of(gate.decide(ev(project()), command=fail("unsupported", "Excel 5.0/95 workbook")))
-            assert r == "a.mpp: this file is not supported (Excel 5.0/95 workbook).", r
+            assert r == ("a.mpp: this file is not supported: Excel 5.0/95 workbook. Ask the user for the file saved"
+                         " as pdf."), r
             assert pyenv.engine("mpp", v) == MPP_ENGINE
 
 
@@ -1721,7 +1759,7 @@ def test_mpp_child_default_timeout():
                 r = reason_of(gate.decide(ev(project())))
             finally:
                 gate._child = real
-    assert seen == [gate.limits.CONVERT_SECONDS] and "looks damaged (x)" in r, (seen, r)
+    assert seen == [gate.limits.CONVERT_SECONDS] and "looks damaged: x." in r, (seen, r)
 
 
 def test_mpp_too_large_before_engine():
@@ -1734,7 +1772,8 @@ def test_mpp_too_large_before_engine():
             r = reason_of(gate.decide(ev(p)))
         finally:
             gate.limits.MAX_INPUT = real
-    assert r == "a.mpp: the file is over 512 MiB.", r
+    assert r == ("a.mpp: the file is over 512 MiB. That is phro-project's safety limit; ask the user for a smaller"
+                 " file, such as the part they need saved on its own."), r
 
 
 # -- figures: the image backend id in the key, the image venv child and the image setup offer
@@ -1821,7 +1860,7 @@ def test_gate_routes_picture_extensions():
         q.write_bytes(mf.emf([mf.emf_textw(100, 200, "Emf")]))
         o = out(gate.decide(ev(q)))
         assert o["permissionDecision"] == "deny", o
-        assert "b.wmf: the file looks damaged (not a wmf file)." in o["permissionDecisionReason"], o
+        assert "b.wmf: the file looks damaged: not a wmf file." in o["permissionDecisionReason"], o
 
 
 def test_gate_image_offer_once_a_session():

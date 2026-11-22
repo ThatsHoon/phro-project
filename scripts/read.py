@@ -208,7 +208,7 @@ def cmd_hook(a) -> int:
         out = gate.decide(event)
     except Exception as e:
         p = gate.scope(event)
-        out = gate.deny_text(p, f"damaged: internal error {type(e).__name__}") if p else None
+        out = gate._deny(p, "damaged", f"internal error {type(e).__name__}") if p else None
     if out is not None:
         print(json.dumps(out, ensure_ascii=False))
     return 0

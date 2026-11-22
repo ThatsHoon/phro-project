@@ -287,7 +287,7 @@ def test_no_unicode_at_all_is_damaged():
     e = fails(path)
     assert e.kind == "damaged" and e.detail == "no text runs with Unicode", e
     why = gate._deny(path, e.kind, e.detail)["hookSpecificOutput"]["permissionDecisionReason"]
-    assert "looks damaged (no text runs with Unicode)" in why, why
+    assert "looks damaged: no text runs with Unicode." in why, why
 
 
 def test_xps_not_a_package():

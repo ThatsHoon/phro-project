@@ -33,6 +33,13 @@ SKILL_OF = {**dict.fromkeys(("docx", "docm", "dotx", "dotm"), "docx"),
             **dict.fromkeys(("xlsx", "xlsm", "xltx", "xltm"), "xlsx"),
             "pdf": "pdf"}
 EDIT_HINT = " Read-only view (no XML, cell addresses or formulas); to edit the file, use the {skill} skill."
+SAVE_AS = {**dict.fromkeys(("doc", "docx", "docm", "dotx", "dotm", "rtf", "odt", "wpd", "wp", "wp5", "wp6", "wp7",
+                            "wpt", "pages"), "docx or pdf"),
+           **dict.fromkeys(("xls", "xlsx", "xlsm", "xltx", "xltm", "xlsb", "ods", "numbers"), "xlsx or pdf"),
+           **dict.fromkeys(("ppt", "pptx", "pptm", "ppsx", "potx", "potm", "ppsm", "odp", "key"), "pptx or pdf"),
+           **dict.fromkeys(("hwp", "hwpx"), "hwpx or pdf")}
+PROTECTED = " phro-project cannot open protected files; ask the user for an unprotected copy"
+LARGE_PART = "the part they need saved on its own"
 
 # pdf
 PDF_HINT = ' Pages start at "## Page N" lines. Read-only view; to edit or create a pdf, use the pdf skill.'
@@ -41,7 +48,7 @@ OFFER = (' Built-in parser used; pypdfium2 (PyPI, 4 MB) reads tables, scans and 
 REPAIR = (' The pdf engine failed its file check, so the built-in parser was used; to repair it, ask the user and only'
           ' on their yes run: python -I -X utf8 "{read_py}" setup --venv "{dir}".')
 PAST_END = ' The pdf has {n} pages; pages="{a}-{b}" starts past its end.'
-PASS_TEXT = "phro-project could not convert {name} ({why}); Claude's own Read is used."
+PASS_TEXT = "phro-project could not convert {name}: {why}. Claude's own Read is used."
 DENY_KINDS = ("encrypted", "drm", "too_large")  # a pdf failing any other way goes to Claude's own Read
 FAILED_SECONDS = 86_400  # a failed pdf passes through at once for a day
 SUGGEST_PAGES = 20  # Claude's own Read takes at most 20 pdf pages a request
@@ -153,21 +160,24 @@ def _is_zip(path):
         return False
 
 
-def deny_text(path, why, retry=True):
-    """A deny; with retry, the convert command too (only where running it by hand can help)."""
-    reason = f"{_name(path)}: {why}."
-    skill = SKILL_OF.get(reader.ext_of(path))
-    if retry:
-        reason += f' Retry by hand: python -I -X utf8 "{READ_PY}" convert "{path}"'
-        if skill:
-            reason += f" or read it with the {skill} skill."
-    elif skill:
-        reason += f" Read it with the {skill} skill instead."
-    return {"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
-    }}
+def _next(path, kind):
+    """The one sentence a deny of `kind` ends with: what can be done next. The convert command only for a timeout,
+    the one failure that running it again can mend."""
+    ext = reader.ext_of(path)
+    skill = SKILL_OF.get(ext)
+    if kind == "timeout":
+        return (f' Retry by hand: python -I -X utf8 "{READ_PY}" convert "{path}"'
+                + (f" or read it with the {skill} skill." if skill else ""))
+    if kind in ("encrypted", "drm"):
+        if skill and kind == "encrypted":
+            return PROTECTED + f", or for the password and read it with the {skill} skill."
+        return PROTECTED + "."
+    if kind == "too_large":
+        skilled = f"read it with the {skill} skill instead, or " if skill else ""
+        return f" That is phro-project's safety limit; {skilled}ask the user for a smaller file, such as {LARGE_PART}."
+    ask = f" Read it with the {skill} skill instead, or ask" if skill else " Ask"
+    again = "" if kind == "unsupported" else " again,"
+    return f"{ask} the user for the file saved{again} as {SAVE_AS.get(ext, 'pdf')}."
 
 
 def _why(kind, detail=""):
@@ -176,20 +186,25 @@ def _why(kind, detail=""):
     if len(detail) > DETAIL_MAX:
         detail = detail[:DETAIL_MAX - 1] + "…"
     if kind == "damaged" and detail.startswith("internal error"):
-        return f"reading failed ({detail})"
+        return f"reading failed: {detail}"
     if kind == "damaged":
-        return f"the file looks damaged ({detail})"
+        return f"the file looks damaged: {detail}"
     if kind == "too_large":
         return TOO_LARGE.get(detail.split(":", 1)[0], REASONS["too_large"])
     if kind == "unsupported" and detail:
-        return f"this file is not supported ({detail})"
+        return f"this file is not supported: {detail}"
     if kind == "timeout" and detail == LATE:
         return LATE_TEXT
     return REASONS.get(kind) or f"{kind} {detail}".strip()
 
 
 def _deny(path, kind, detail=""):
-    return deny_text(path, _why(kind, detail), retry=kind in ("damaged", "timeout"))
+    """A deny of failure `kind`: the reason, then what can be done next."""
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": f"{_name(path)}: {_why(kind, detail)}." + _next(path, kind),
+    }}
 
 
 def _pass(path, why):
@@ -388,7 +403,7 @@ def _head(name, meta, assets):
         head += f", {m} image in {assets}; Read it to view" if m == 1 else f", {m} images in {assets}; Read them to view"
     head += ")."
     if k:
-        head += f" {k} hidden places left out."
+        head += f" {k} hidden place{'' if k == 1 else 's'} left out."
     return head
 
 
