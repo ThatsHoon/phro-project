@@ -267,9 +267,11 @@ def test_deny_texts_name_the_next_step():
     protected = " phro-project cannot open protected files; ask the user for an unprotected copy."
     assert r("d/a.hwp", "encrypted") == "a.hwp: the file is encrypted and needs a password." + protected
     assert r("d/a.epub", "drm") == "a.epub: the file is DRM-protected." + protected
-    assert r("d/a.docx", "encrypted") == ("a.docx: the file is encrypted and needs a password. phro-project cannot"
-                                          " open protected files; ask the user for an unprotected copy, or for the"
-                                          " password and read it with the docx skill.")
+    for name in ("a.docx", "a.xlsx", "a.pptx"):
+        assert r("d/" + name, "encrypted") == f"{name}: the file is encrypted and needs a password." + protected
+    assert r("d/a.pdf", "encrypted") == ("a.pdf: the file is encrypted and needs a password. phro-project cannot"
+                                         " open protected files; ask the user for an unprotected copy, or for the"
+                                         " password and read it with the pdf skill.")
     assert r("d/a.doc", "unsupported", "Word 6/95") == (
         "a.doc: this file is not supported: Word 6/95. Ask the user for the file saved as docx or pdf.")
     assert r("d/a.xls", "damaged", "nothing readable (could not read: 1 chart)") == (

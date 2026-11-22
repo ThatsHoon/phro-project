@@ -170,8 +170,8 @@ def _next(path, kind):
         return (f' Retry by hand: python -I -X utf8 "{READ_PY}" convert "{path}"'
                 + (f" or read it with the {skill} skill." if skill else ""))
     if kind in ("encrypted", "drm"):
-        if skill and kind == "encrypted":
-            return PROTECTED + f", or for the password and read it with the {skill} skill."
+        if skill == "pdf" and kind == "encrypted":
+            return PROTECTED + ", or for the password and read it with the pdf skill."
         return PROTECTED + "."
     if kind == "too_large":
         skilled = f"read it with the {skill} skill instead, or " if skill else ""
