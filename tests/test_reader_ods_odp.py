@@ -27,6 +27,7 @@ NS = ('xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
       'xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" '
       'xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" '
       'xmlns:xlink="http://www.w3.org/1999/xlink" '
+      'xmlns:script="urn:oasis:names:tc:opendocument:xmlns:script:1.0" '
       'xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"')
 MIME = "application/vnd.oasis.opendocument."
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
@@ -361,8 +362,62 @@ def test_shape_order_by_position():
 def test_shape_order_units_and_unpositioned():
     out = md(odp(page("p", frame("NOPOS"), frame("CCC", "0cm", "30mm"), frame("AAA", "0cm", "1in"),
                       frame("BBB", "0cm", "36pt"), frame("UNPARSE", "x", "y"), frame("DDD", "0cm", "192px"))))
-    order = [out.index(k) for k in ("BBB", "AAA", "CCC", "DDD", "NOPOS", "UNPARSE")]
+    order = [out.index(k) for k in ("NOPOS", "BBB", "AAA", "CCC", "UNPARSE", "DDD")]
     assert order == sorted(order), out
+
+
+def _box(text, x, y, w, h, cls=""):
+    return frame(text, f"{x}cm", f"{y}cm", cls, f'svg:width="{w}cm" svg:height="{h}cm"')
+
+
+def test_odp_reading_order_cuts_columns_and_rows_off_by_a_fraction():
+    shapes = [_box("Cons", 10, 2.1, 8, 0.9), _box("Vendor lock-in", 10, 4.1, 8, 0.9), _box("Pros", 0, 2, 8, 0.9),
+              _box("Fast to build", 0, 4, 8, 0.9), _box("Comparison", 0, 12, 18, 1, "title"),
+              _box("Plan", 0, 8, 5.6, 0.8), _box("Build", 6, 8.08, 5.6, 0.8), _box("Launch", 12, 7.92, 5.6, 0.8)]
+    out = md(odp(page("p", *shapes)))
+    assert out == ("## Slide 1: Comparison\n\nPros\n\nFast to build\n\nCons\n\nVendor lock-in\n\nPlan\n\nBuild\n\n"
+                   "Launch\n"), repr(out)
+
+
+def test_odp_master_and_footer_content_is_written_once():
+    style = ('<style:style style:name="{0}" style:family="drawing-page"><style:drawing-page-properties '
+             'presentation:display-footer="{1}" presentation:background-objects-visible="{2}"/></style:style>')
+    styles = style.format("dp1", "true", "true") + style.format("dp3", "true", "false") + style.format("dp4", "false",
+                                                                                                        "true")
+    field = ('<draw:frame presentation:class="footer"><draw:text-box><text:p><presentation:footer/></text:p>'
+             '</draw:text-box></draw:frame>')
+    masters = ('<style:master-page style:name="M">' + frame("Click to edit", cls="title") + field
+               + frame("ACME", x="1cm", y="17cm") + '</style:master-page>')
+    decl = '<presentation:footer-decl presentation:name="ftr1">Board 2026</presentation:footer-decl>'
+
+    def pg(name, text, st):
+        return (f'<draw:page draw:name="{name}" draw:style-name="{st}" draw:master-page-name="M" '
+                f'presentation:use-footer-name="ftr1">{frame(text)}</draw:page>')
+    out = md(odp(decl + pg("page1", "one", "dp1") + pg("page2", "two", "dp1") + pg("page3", "three", "dp3")
+                 + pg("page4", "four", "dp4"), styles, masters=masters))
+    assert out == ("## On slides 1-3\n\nBoard 2026\n\n## On slides 1-2, 4\n\nACME\n\n## Slide 1\n\none\n\n"
+                   "## Slide 2\n\ntwo\n\n## Slide 3\n\nthree\n\n## Slide 4\n\nfour\n"), repr(out)
+
+
+def test_odp_shape_and_picture_links_jumps_and_media_are_named():
+    def clicked(action, href=""):
+        h = f' xlink:href="{href}"' if href else ""
+        return ('<office:event-listeners><presentation:event-listener script:event-name="dom:click" '
+                f'presentation:action="{action}"{h}/></office:event-listeners>')
+    pic = '<draw:frame svg:x="0cm" svg:y="{0}cm"><draw:image xlink:href="Pictures/a.png"/>{1}</draw:frame>'
+    shapes = ['<draw:a xlink:href="https://example.com/x">' + frame("See it", "0cm", "1cm") + '</draw:a>',
+              frame("Compare", "0cm", "2cm", extra="").replace("</draw:text-box>",
+                                                                "</draw:text-box>" + clicked("show", "#page2")),
+              f'<draw:custom-shape svg:x="0cm" svg:y="3cm">{clicked("next-page")}<draw:enhanced-geometry/>'
+              '</draw:custom-shape>',
+              '<draw:a xlink:href="https://example.com/dash">' + pic.format(4, "") + '</draw:a>',
+              '<draw:frame draw:name="launch-demo" svg:x="0cm" svg:y="5cm"><draw:plugin xlink:href="Media/clip.mp4" '
+              'draw:mime-type="video/mp4"/><draw:image xlink:href="Pictures/a.png"/></draw:frame>']
+    doc, ctx = parse(odp(page("page1", *shapes) + page("page2", frame("two")), extra={"Pictures/a.png": PNG}))
+    out = markdown.render(doc, tmp() / "assets", False, ctx.skipped)
+    assert out == ("## Slide 1\n\n[See it](https://example.com/x)\n\nCompare (→ Slide 2)\n\nLink (→ next slide)\n\n"
+                   "![](assets/img-001.png)\n\n[Picture](https://example.com/dash)\n\n"
+                   "Video: launch-demo (poster below)\n\n![](assets/img-001.png)\n\n## Slide 2\n\ntwo\n"), repr(out)
 
 
 def test_impress_table_in_frame():

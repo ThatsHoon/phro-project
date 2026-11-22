@@ -1664,6 +1664,23 @@ def test_templates_not_walked():
     assert not ctx.skipped, ctx.skipped
 
 
+def test_template_drawables_are_written_once():
+    from iwork_fix import placeholder
+    first = archive(800, 5, pb((5, pb_ref(801)), (7, pb_ref(801)), (7, pb_ref(900)), (7, pb_ref(902))))
+    second = archive(810, 5, pb((7, pb_ref(904))))
+    doc, ctx = _keynote([{"title": "A", "body": "one", "template_ref": 800},
+                         {"title": "B", "body": "two", "template_ref": 800},
+                         {"title": "C", "body": "three", "template_ref": 810}],
+                        first, placeholder(801, 802), archive(802, 2001, storage("Double-click to edit")),
+                        shape(900, 901), archive(901, 2001, storage("ACME Internal")),
+                        shape(902, 903), archive(903, 2001, storage("Q3 review")),
+                        second, shape(904, 905), archive(905, 2001, storage("Only three")))
+    md = _md(doc, ctx)
+    assert md == ("## On slides 1-2\n\nACME Internal\n\nQ3 review\n\n## Slide 1: A\n\none\n\n## Slide 2: B\n\ntwo\n\n"
+                  "## Slide 3: C\n\nthree\n\nOnly three\n"), repr(md)
+    assert not ctx.skipped, ctx.skipped
+
+
 def test_slide_tree_cycle():
     # slide 2 is a child of slide 1 and names slide 1 as its child: the loop is cut, counted `depth` once
     doc, ctx = _keynote([{"title": "A", "children": [1]}, {"title": "B", "children": [0]}], tree=[0])
@@ -2078,6 +2095,23 @@ def test_09_picture_read_once_per_member():
     # three placements of one member: read once, each placement still charged
     doc, ctx, calls = _reads(pages09(_p("x") + _media("a.png") * 3, files={"a.png": PNG}))
     assert doc.blocks == [Para([Text("x")])] + [Image(PNG)] * 3 and calls == ["a.png"], (doc.blocks, calls)
+
+
+def test_09_master_slide_drawables_are_written_once():
+    def master(mid, text):
+        return (f'<key:master-slide sfa:ID="{mid}"><key:title-placeholder>' + _box(_p("MASTER TITLE"))
+                + '</key:title-placeholder><key:page><sf:layers><sf:layer><sf:drawables><sf:shape>'
+                + _box(_p(text)) + '</sf:shape></sf:drawables></sf:layer></sf:layers></key:page></key:master-slide>')
+
+    def on(mid, xml):
+        return xml.replace('key:depth="0">', f'key:depth="0"><key:master-ref sfa:IDREF="{mid}"/>', 1)
+    slides = (on("M1", slide09(_p("A"), _p("one"), n=0)) + on("M1", slide09(_p("B"), _p("two"), n=1))
+              + on("M2", slide09(_p("C"), _p("three"), n=2)))
+    doc, ctx = _x(keynote09(slides, masters=master("M1", "ACME Internal") + master("M2", "Only three")), "key")
+    md = _md(doc, ctx)
+    assert md == ("## On slides 1-2\n\nACME Internal\n\n## Slide 1: A\n\none\n\n## Slide 2: B\n\ntwo\n\n"
+                  "## Slide 3: C\n\nthree\n\nOnly three\n"), repr(md)
+    assert not ctx.skipped, ctx.skipped
 
 
 def test_09_keynote_loose_parts():

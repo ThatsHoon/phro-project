@@ -26,7 +26,9 @@ SlideNodeArchive {1 children, 2 slide, 4 isSkipped}; SlideArchive {5 titlePlaceh
 owned_drawables, 17 template_slide, 20 slideNumberPlaceholder, 27 note, 42 drawables_z_order}; NoteArchive 1
 containedStorage; PlaceholderArchive 1 its TSWP.ShapeInfoArchive super. Changes from docling: the title placeholder
 is the section title rather than a title block; the drawables follow `drawables_z_order` rather than docling's sort
-by position; isSkipped slides are kept as hidden (docling does not read it); a node's children are walked after it.
+by position; isSkipped slides are kept as hidden (docling does not read it); a node's children are walked after it;
+the drawables of a slide's template slide (17) that are not placeholders go to `deck.Repeated`, written once (on the
+slide when only one shows them).
 """
 import posixpath
 from collections.abc import Callable, Iterable
@@ -35,7 +37,7 @@ from .. import limits
 from ..containers import flate, pbwire, snappy
 from ..limits import ReadError
 from ..model import Bold, Context, Doc, Hidden, Image, Link, NoteRef, Para, Section
-from . import iwork_tables, iwork_text, sheet_grid
+from . import deck, iwork_tables, iwork_text, sheet_grid
 
 # unpacked bytes of all .iwa members of one document (the flate.Budget iwork builds). Measured 2026-11-15 on the
 # development machine (`test_reader_iwork.py measure snappy`): 256 MiB of 64 KiB blocks unpack in 2.43 s, so no lowering.
@@ -558,12 +560,35 @@ def _slide_title(store: Store, pid: int, text, doc: Doc, ctx) -> tuple[str, list
     return title, extra, comments
 
 
-def _slide(store: Store, sid: int, number: int, skipped: bool, text, doc: Doc, ctx) -> Section | None:
+def _drawn(store: Store, f: dict, left_out) -> list:
+    """The owned drawables (7) of a slide's fields `f` in `drawables_z_order` (42; those it does not list after, in
+    their stored order), each once, those in `left_out` left out, kept to ids in the store (so at most IWA_OBJECTS)."""
+    owned = [d for d in dict.fromkeys(iwork_text.refs(f, 7)) if d not in left_out and d in store.objects]
+    mine = set(owned)
+    drawn = [d for d in dict.fromkeys(iwork_text.refs(f, 42)) if d in mine]
+    placed = set(drawn)
+    return drawn + [d for d in owned if d not in placed]
+
+
+def _template(store: Store, tid: int, text, ctx) -> list:
+    """[blocks of each owned drawable of template slide `tid` that is not a placeholder or a comment], read once a
+    document; a template that cannot be read counts `master` and gives none."""
+    key = ("kn_template", tid)
+    if key not in store.cache:
+        store.cache[key] = []
+        with ctx.guard("master"):
+            f = store.get(tid, KN_SLIDE)
+            ids = [d for d in _drawn(store, f, ()) if _kind(store, d) not in (KN_PLACEHOLDER, COMMENT_INFO)]
+            store.cache[key] = [b for b in (drawable_blocks(store, d, ctx, text, "key") for d in ids) if b]
+    return store.cache[key]
+
+
+def _slide(store: Store, sid: int, number: int, skipped: bool, text, doc: Doc, ctx, repeated) -> Section | None:
     """KN.SlideArchive (5) as `Section("slide", title, number=n)`: the title placeholder (5) gives the title; the
-    body placeholder (6), then the owned drawables (7) in `drawables_z_order` (42; those it does not list after, in
-    their stored order) follow, each once, the title, body and slide-number (20) placeholders left out of the owned
-    list. A comment (2014) goes to `Section.comments`, the note (27 -> 15 {1 storage}) to `Section.notes`. The
-    template slide (17) is never read. A skipped slide is `hidden="hidden"`. A slide that fails counts `slide`."""
+    body placeholder (6), then the owned drawables (`_drawn`) follow, each once, the title, body and slide-number (20)
+    placeholders left out of the owned list. A comment (2014) goes to `Section.comments`, the note (27 -> 15 {1
+    storage}) to `Section.notes`, the template slide's (17) drawables (`_template`) to `repeated`. A skipped slide is
+    `hidden="hidden"`. A slide that fails counts `slide`."""
     sec, done = None, False
     with ctx.guard("slide"):
         f = store.get(sid, KN_SLIDE)
@@ -577,13 +602,7 @@ def _slide(store: Store, sid: int, number: int, skipped: bool, text, doc: Doc, c
             order.append(title)  # not a placeholder: read as any drawable, first
         if body is not None:
             order.append(body)
-        # each list deduplicated, and kept to ids in the store (so at most IWA_OBJECTS)
-        left_out = {title, body, slide_number}
-        owned = [d for d in dict.fromkeys(iwork_text.refs(f, 7)) if d not in left_out and d in store.objects]
-        mine = set(owned)
-        drawn = [d for d in dict.fromkeys(iwork_text.refs(f, 42)) if d in mine]
-        placed = set(drawn)
-        order += drawn + [d for d in owned if d not in placed]
+        order += _drawn(store, f, {title, body, slide_number})
         for d in dict.fromkeys(order):
             if _kind(store, d) == COMMENT_INFO:
                 s.comments.extend(_sticky(store, d, text, doc.notes, ctx))
@@ -600,6 +619,10 @@ def _slide(store: Store, sid: int, number: int, skipped: bool, text, doc: Doc, c
                     ctx.skipped["note"] += 1
                 else:
                     s.notes = text.blocks(storage)
+        template = iwork_text.ref(f, 17)
+        if _kind(store, template) == KN_SLIDE:
+            for blocks in _template(store, template, text, ctx):
+                repeated.add(number, blocks)
         sec, done = s, True
     return sec if done else None
 
@@ -609,8 +632,8 @@ def _keynote(store: Store, ctx) -> Doc | None:
     each KN.SlideNodeArchive (4) {1 children, 2 slide, 4 isSkipped} once, through `Store.follow` (a node on its own
     path counts `depth`), its slide under `ctx.guard("slide")` and then its children, numbered in that order. A node
     whose slide is missing or broken counts `slide` and keeps its number; a slide two nodes name is read once. The
-    theme's templates and masters are never reached. None without the root, or when its show lists no slide node
-    (so a renamed file tries the next app)."""
+    theme's templates are reached only as a slide's template slide. None without the root, or when its show lists no
+    slide node (so a renamed file tries the next app)."""
     root = min((i for i, (t, _) in store.objects.items() if t == KN_DOCUMENT), default=None)
     if root is None:
         return None
@@ -625,6 +648,7 @@ def _keynote(store: Store, ctx) -> Doc | None:
     text = iwork_text.TextReader(store, ctx, doc.notes, lambda d: drawable_blocks(store, d, ctx, text, "key"))
     seen: set[int] = set()
     number = 0
+    repeated = deck.Repeated()
 
     def visit(nid, depth):
         nonlocal number
@@ -642,13 +666,14 @@ def _keynote(store: Store, ctx) -> Doc | None:
             if _kind(store, slide) != KN_SLIDE:
                 ctx.skipped["slide"] += 1
             else:
-                sec = _slide(store, slide, number, skipped, text, doc, ctx)
+                sec = _slide(store, slide, number, skipped, text, doc, ctx, repeated)
                 if sec is not None:
                     doc.blocks.append(sec)
         store.follow(children, visit, depth + 1)
         return None
 
     store.follow(nodes, visit, 0)
+    doc.blocks[:0] = repeated.place(doc.blocks)
     return doc
 
 

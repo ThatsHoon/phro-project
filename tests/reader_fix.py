@@ -1444,13 +1444,16 @@ def _ppt_chars(text, as_bytes):
 
 def _ppt_style(text, indents, bold):
     """A StyleTextPropAtom (0x0FA1) for `text`, split into paragraphs at \\r: one paragraph run each (count u32, indent
-    u16, mask u32; a bulleted paragraph, indents[i] not None, has mask 0x1 and a bulletFlags u16 of 1), then character
+    u16, mask u32; a bulleted paragraph, indents[i] an int, has mask 0x1 and a bulletFlags u16 of 1; indents[i] a tuple
+    (level,) has that indent and mask 0, its bullet left to the master), then character
     runs (count u32, mask u32, style u16 when the mask is set; bold is mask and style 0x1) over every occurrence of the
     `bold` substrings. Each kind of run covers len(text) + 1 characters."""
     out = b""
     for para, indent in zip(text.split("\r"), indents):
         if indent is None:
             out += struct.pack("<IHI", len(para) + 1, 0, 0)
+        elif isinstance(indent, tuple):
+            out += struct.pack("<IHI", len(para) + 1, indent[0], 0)
         else:
             out += struct.pack("<IHIH", len(para) + 1, indent, 1, 1)
     marks = [0] * (len(text) + 1)
@@ -1505,15 +1508,56 @@ def ppt_anchor(box, *, child=False, wide=False):
     return oa_record(0xF010, struct.pack("<4i" if wide else "<4h", top, left, right, bottom))
 
 
+def _ppt_target(spec):
+    """The ExHyperlink a make_ppt shape dict names: a string `link`, a click {"url": URL} or {"slide": number} (as
+    ("slide", number)); None for none."""
+    link, click = spec.get("link"), spec.get("click") or {}
+    if isinstance(link, str):
+        return link
+    if "url" in click:
+        return click["url"]
+    if "slide" in click:
+        return ("slide", click["slide"])
+    return None
+
+
 def ppt_link_urls(specs) -> list:
-    """The distinct URLs (a string `link`) of make_ppt shape dicts, groups' children included, in order of first use."""
+    """The distinct hyperlink targets (`_ppt_target`) of make_ppt shape dicts, groups' children included, in order of
+    first use."""
     out = []
     for spec in specs:
-        link = spec.get("link")
-        if isinstance(link, str) and link not in out:
-            out.append(link)
+        target = _ppt_target(spec)
+        if target is not None and target not in out:
+            out.append(target)
         out.extend(u for u in ppt_link_urls(spec.get("children", ())) if u not in out)
     return out
+
+
+def ppt_media(specs) -> list:
+    """The make_ppt "media" shape dicts of `specs`, groups' children included."""
+    out = []
+    for spec in specs:
+        if spec.get("kind") == "media":
+            out.append(spec)
+        out.extend(ppt_media(spec.get("children", ())))
+    return out
+
+
+def _ppt_interactive(spec, urls):
+    """The InteractiveInfo container (0x0FF2) of a shape dict's `link` or `click`: an InteractiveInfoAtom (soundIdRef,
+    exHyperlinkIdRef, action, oleVerb, jump, flags, hyperlinkType, 3 unused). A string link or a click url is action 4
+    (hyperlink) of type 8 (URL), a click slide action 4 of type 7 (slide number), a click jump action 3 with that jump
+    code, a click action that action; any other link names no hyperlink."""
+    target = _ppt_target(spec)
+    ref = list(urls).index(target) + 1 if target is not None else 0
+    click = spec.get("click") or {}
+    if "jump" in click:
+        action, jump, kind = 3, click["jump"], 0xFF
+    elif target is not None:
+        action, jump, kind = 4, 0, 7 if isinstance(target, tuple) else 8
+    else:
+        action, jump, kind = click.get("action", 0), 0, 0xFF
+    return oa_container(0x0FF2, oa_record(0x0FF3, struct.pack("<IIBBBBB3x", 0, ref, action, 0, jump, 0, kind)))
 
 
 def ppt_shape(spec, ids, *, inside=False, urls=()):
@@ -1546,22 +1590,21 @@ def ppt_shape(spec, ids, *, inside=False, urls=()):
         out += oa_record(0xF00B, fopt, ver=3, inst=len(fopt) // 6)
     out += anchor
     data = b""
-    if kind == "object":
+    if kind in ("object", "media"):
         data += oa_record(0x0BC1, struct.pack("<I", spec["ex_obj_id"]))
     if spec.get("placeholder") is not None:
         data += oa_record(0x0BC3, struct.pack("<IBBH", 0, spec["placeholder"], 0, 0))
     if spec.get("ref") is not None:
         data += oa_record(0x0F9E, struct.pack("<I", spec["ref"]))
-    if spec.get("link"):
-        link = spec["link"]  # an InteractiveInfoAtom: soundIdRef, exHyperlinkIdRef, action, oleVerb, jump, flags, type
-        target = list(urls).index(link) + 1 if isinstance(link, str) else 0
-        data += oa_container(0x0FF2, oa_record(0x0FF3, struct.pack("<II8x", 0, target)))
+    if spec.get("link") or spec.get("click"):
+        data += _ppt_interactive(spec, urls)
     if data:
         out += oa_container(0xF011, data)
     if spec.get("text") is not None:
-        text = ppt_text(spec.get("text_kind", 1), spec["text"])
+        text = ppt_text(spec.get("text_kind", 1), spec["text"], indents=spec.get("indents"))
         if spec.get("link"):
-            text += oa_record(0x0FDF, struct.pack("<III", 0, len(spec["text"]), 0))
+            text += _ppt_interactive(spec, urls) + oa_record(0x0FDF, struct.pack("<II", 0, len(spec["text"])))
+        text += b"".join(oa_record(0x0FD8, struct.pack("<I", pos)) for pos in spec.get("fields", ()))
         out += oa_container(0xF00D, text)
     return oa_container(0xF004, out)
 
@@ -1571,9 +1614,46 @@ def ppt_slide_persist(pid, slide_id, texts=0):
     return oa_record(0x03F3, struct.pack("<IIiII", pid, 0, texts, slide_id, 0))
 
 
-def ppt_slide_atom(master_id, notes_id):
-    """A SlideAtom (0x03EF): geometry, 8 placeholder bytes, masterIdRef, notesIdRef, flags, unused."""
-    return oa_record(0x03EF, struct.pack("<I8sIIHH", 0, bytes(8), master_id, notes_id, 0x0007, 0), ver=2)
+def ppt_slide_atom(master_id, notes_id, flags=0x0007):
+    """A SlideAtom (0x03EF): geometry, 8 placeholder bytes, masterIdRef, notesIdRef, flags (fMasterObjects 0x1,
+    fMasterScheme 0x2, fMasterBackground 0x4), unused."""
+    return oa_record(0x03EF, struct.pack("<I8sIIHH", 0, bytes(8), master_id, notes_id, flags, 0), ver=2)
+
+
+def ppt_cstring(text, inst):
+    """A CString (0x0FBA) of `text`, UTF-16LE, record instance `inst`."""
+    return oa_record(0x0FBA, text.encode("utf-16le"), inst=inst)
+
+
+def ppt_headers_footers(footer, inst, *, shown=True):
+    """A HeadersFooters container (0x0FD9) of record instance `inst` (3 the document's slides, 0 one slide's): a
+    HeadersFootersAtom (formatId i16, flags u16 with fHasFooter 0x20 when `shown`) and the footer CString (instance
+    2)."""
+    return oa_container(0x0FD9, oa_record(0x0FDA, struct.pack("<hH", 0, 0x20 if shown else 0)),
+                        ppt_cstring(footer, 2), inst=inst)
+
+
+def ppt_master_style(inst, bullets):
+    """A TextMasterStyleAtom (0x0FA3) of text type `inst`: cLevels u16, then per level (a u16 level first from type 5
+    on) a TextPFException (mask 0x1 and bulletFlags 1 or 0; mask 0 for a None level) and an empty TextCFException."""
+    body = struct.pack("<H", len(bullets))
+    for level, bullet in enumerate(bullets):
+        if inst >= 5:
+            body += struct.pack("<H", level)
+        body += struct.pack("<I", 0) if bullet is None else struct.pack("<IH", 1, int(bullet))
+        body += struct.pack("<I", 0)
+    return oa_record(0x0FA3, body, inst=inst)
+
+
+def ppt_media_record(spec):
+    """The ExObjList record of a make_ppt "media" shape dict: media ("Video", path) is an ExMCIMovie (0x1007) holding
+    an ExVideoContainer (0x1005: ExMediaAtom 0x1004 with exObjId, then the path CString); ("Audio", path) an
+    ExWAVAudioLink (0x1010: ExMediaAtom, then the path CString)."""
+    kind, path = spec["media"]
+    media = oa_record(0x1004, struct.pack("<IHH", spec["ex_obj_id"], 0, 0)) + ppt_cstring(path, 0)
+    if kind == "Audio":
+        return oa_container(0x1010, media)
+    return oa_container(0x1007, oa_container(0x1005, media))
 
 
 def ppt_user_edit(last, directory, doc_ref, seed, crypt=None):
@@ -1652,7 +1732,7 @@ def _ppt_object(item, k):
 
 
 def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=(), objects=(), encrypt=None,
-             edits=1, raw_shapes=None, no_pictures_stream=False, encrypt_header=None):
+             edits=1, raw_shapes=None, no_pictures_stream=False, encrypt_header=None, master=None):
     """Write a .ppt compound file with PowerPoint Document, Current User and Pictures streams.
 
     slides: dicts with title (str), body (list of str paragraphs, or (text, indent) bulleted ones), bold (substrings
@@ -1664,7 +1744,11 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     \\x0b stays as written. notes: {slide number from 1: text}, NotesContainers listed in SlideListWithText instance 2
     (SlidePersistAtom slideId = the slide's slideId + 0x1000, which the SlideAtom's notesIdRef carries; NotesAtom
     slideIdRef = the slide's slideId; a value may be a dict {"shapes": [...]} of shape dicts instead of text).
-    master_text goes in the MainMaster (None: a master with no text). edits > 1 appends edits - 1 more
+    master_text goes in the MainMaster's title placeholder (OEPlaceholderAtom type 1; None: a master with no text).
+    master: {"shapes": shape dicts drawn on the MainMaster beside it, "styles": {text type: [bullet True, False or
+    None per indent level]} as its TextMasterStyleAtoms, "footer": text of the document's slide HeadersFooters
+    (instance 3, fHasFooter)}. A slide's footer key gives it its own HeadersFooters (instance 0) with that footer and
+    no_master clears its SlideAtom's fMasterObjects. edits > 1 appends edits - 1 more
     PersistDirectoryAtom + UserEditAtom pairs chained through lastEdit; each remaps slide 1 to a fresh copy.
     encrypt (any string, the password): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist
     object holding an RC4 CryptoAPI EncryptionVersionInfo (rc4_header(password), 128-bit; clear) and the UserEditAtom's
@@ -1687,7 +1771,12 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     bytes), text and text_kind (a text run of TextHeaderAtom type text_kind, 1 by default), placeholder (an
     OEPlaceholderAtom of that type in the ClientData), ref (an OutlineTextRefAtom index in the ClientData), link (the
     text carries an InteractiveInfo and a TextInteractiveInfoAtom; a string link is also a URL: an ExHyperlink
-    (ExHyperlinkAtom, CString) in the ExObjList of the DocumentContainer, named by the InteractiveInfoAtom). A group
+    (ExHyperlinkAtom, CString) in the ExObjList of the DocumentContainer, named by the InteractiveInfoAtom), click (the
+    shape's own InteractiveInfo in its ClientData: {"url": URL}, {"slide": number} an ExHyperlink whose location
+    CString (instance 3) is "slideId,number,Slide number", {"jump": code} or {"action": code}), indents (as ppt_text's,
+    for the shape's text), fields (positions in the text of SlideNumberMCAtoms, 0x0FD8). Kind "media" (keys media
+    ("Video" or "Audio", file path), ex_obj_id, pib, box) is a movie or sound shape: an ExObjRefAtom in its ClientData
+    naming a media record in the ExObjList. A group
     also has children (the shape dicts inside it), rect (its FSPGR rectangle, left, top, right, bottom), table (FOPT
     property 0x039F = 1; "tertiary" puts it in a tertiary FOPT, 0xF122) and flags (extra FSP flag bits, 0x40 flipH, 0x80
     flipV).
@@ -1719,7 +1808,10 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     pid_notes = {num: 3 + n + i for i, num in enumerate(sorted(notes))}
     pid_crypt = 3 + n + len(notes) if encrypt is not None else None
     objects = [_ppt_object(o, k) for k, o in enumerate(objects)]
-    urls = ppt_link_urls(s for slide in slides for s in slide.get("shapes", ()))
+    master = dict(master or {})
+    every = [s for slide in slides for s in slide.get("shapes", ())] + list(master.get("shapes", ()))
+    urls = ppt_link_urls(every)
+    media = ppt_media(every)
     pid_objects = [3 + n + len(notes) + (pid_crypt is not None) + k for k in range(len(objects))]
     slide_ids = [256 + k for k in range(n)]
     notes_slide_id = {num: slide_ids[num - 1] + 0x1000 for num in notes}
@@ -1742,7 +1834,10 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
 
     def slide_record(k):
         slide = slides[k]
-        parts = [ppt_slide_atom(master_slide_id, notes_slide_id.get(k + 1, 0))]
+        parts = [ppt_slide_atom(master_slide_id, notes_slide_id.get(k + 1, 0),
+                                0x0006 if slide.get("no_master") else 0x0007)]
+        if slide.get("footer") is not None:
+            parts.append(ppt_headers_footers(slide["footer"], 0))
         if slide.get("hidden"):
             parts.append(oa_record(0x03F9, struct.pack("<iIBBHB3x", 0, 0, 0, 0, 0x0004, 0)))
         if slide.get("no_drawing"):  # the text runs sit in the SlideContainer itself, with no PPDrawing
@@ -1784,13 +1879,17 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         dgg = oa_container(0xF000, oa_record(0xF006, struct.pack("<4I", 1026, 2, 1, 1)),
                            oa_container(0xF001, *store, inst=len(store)))
         doc_parts.append(oa_container(0x040B, dgg))
-    if objects or urls:
+    if objects or urls or media:
         embeds = [oa_container(0x0FCC, oa_record(0x0FCD, bytes(8)),
                                oa_record(0x0FC3, struct.pack("<5I", 1, 1, o["id"], 0, pid)))
                   for o, pid in zip(objects, pid_objects)]
         links = [oa_container(0x0FD7, oa_record(0x0FD3, struct.pack("<I", k + 1)),
-                              oa_record(0x0FBA, url.encode("utf-16le"), inst=1)) for k, url in enumerate(urls)]
-        doc_parts.append(oa_container(0x0409, oa_record(0x040A, struct.pack("<I", len(objects) + 1)), *embeds, *links))
+                              ppt_cstring(f"{slide_ids[url[1] - 1]},{url[1]},Slide {url[1]}", 3)
+                              if isinstance(url, tuple) else ppt_cstring(url, 1)) for k, url in enumerate(urls)]
+        doc_parts.append(oa_container(0x0409, oa_record(0x040A, struct.pack("<I", len(objects) + 1)), *embeds, *links,
+                                      *[ppt_media_record(m) for m in media]))
+    if master.get("footer") is not None:
+        doc_parts.append(ppt_headers_footers(master["footer"], 3))
     if notes:
         doc_parts.append(slide_list(2, [ppt_slide_persist(pid_notes[num], notes_slide_id[num]) for num in sorted(notes)]))
     stream, offsets = bytearray(), {}
@@ -1806,8 +1905,11 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         return at
 
     put(pid_doc, oa_container(0x03E8, *doc_parts))
-    master = [ppt_drawing(ppt_textbox(1025, ppt_text(0, master_text)))] if master_text is not None else []
-    put(pid_master, oa_container(0x03F8, ppt_slide_atom(0, 0), *master))
+    ids = [1025]
+    drawn = [ppt_shape({"text": master_text, "text_kind": 0, "placeholder": 1}, ids)] if master_text is not None else []
+    drawn += [ppt_shape(spec, ids, urls=urls) for spec in master.get("shapes", ())]
+    styles = [ppt_master_style(inst, bullets) for inst, bullets in sorted(master.get("styles", {}).items())]
+    put(pid_master, oa_container(0x03F8, ppt_slide_atom(0, 0), *styles, *([ppt_drawing(*drawn)] if drawn else [])))
     for k in range(n):
         put(pid_slides[k], slide_record(k))
     for num in sorted(notes):

@@ -318,6 +318,72 @@ def test_odp_saved_as_ppt():
     assert out == "## Slide 1: Renamed odp\n\nodp body\n", out
 
 
+def test_bullet_levels_inherit_from_the_master():
+    body = [("Grow revenue", (0,)), ("Enterprise deals", (1,)), ("Plain line", 0)]
+    shapes = [{"text": "T", "text_kind": 0, "placeholder": 13, "box": (0, 0, 500, 50)},
+              {"text": "\r".join(t for t, _ in body), "indents": [i for _, i in body], "box": (0, 100, 500, 300)},
+              {"text": "Aside", "text_kind": 4, "indents": [(0,)], "box": (0, 400, 500, 450)}]
+    styles = {1: [True, True], 4: [False]}
+    out, ctx = md([{"shapes": shapes}], master={"styles": styles})
+    assert out == "## Slide 1: T\n\n- Grow revenue\n  - Enterprise deals\n- Plain line\n\nAside\n", repr(out)
+    plain, _ = md([{"shapes": shapes}])
+    assert plain == "## Slide 1: T\n\nGrow revenue\n\nEnterprise deals\n\n- Plain line\n\nAside\n", repr(plain)
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_notes_from_every_text_shape_of_the_notes_page():
+    notes = {1: {"shapes": [{"text": "body note", "text_kind": 2, "placeholder": 12, "box": (0, 500, 500, 600)},
+                            {"text": "boxed aside", "text_kind": 4, "box": (0, 700, 500, 750)},
+                            {"text": "*", "text_kind": 4, "fields": [0], "box": (0, 800, 500, 850)}]}}
+    out, ctx = md([{"title": "T"}], notes=notes)
+    assert out == "## Slide 1: T\n\n> Notes: body note\n> boxed aside\n", repr(out)
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_master_and_footer_content_is_written_once():
+    from reader_fix import blip_png
+    png = b"\x89PNG\r\n\x1a\n" + b"P" * 24
+    master = {"shapes": [{"text": "ACME Internal", "text_kind": 4, "box": (0, 900, 300, 950)},
+                         {"kind": "picture", "pib": 1, "box": (800, 900, 900, 950)},
+                         {"text": "Click to edit footer", "text_kind": 4, "placeholder": 9, "box": (0, 0, 9, 9)}],
+              "footer": "Board 2026"}
+    slides = [{"title": "One"}, {"title": "Two", "no_master": True},
+              {"title": "Three", "footer": "Three only", "shapes": [
+                  {"text": "Three", "text_kind": 0, "placeholder": 13, "box": (0, 0, 500, 50)}]}]
+    out, ctx = md(slides, master=master, pictures=[blip_png(png)])
+    assert out == ("## On slides 1-2\n\nBoard 2026\n\n## On slides 1, 3\n\nACME Internal\n\n![](assets/img-001.png)\n\n"
+                   "## Slide 1: One\n\n## Slide 2: Two\n\n## Slide 3: Three\n\nThree only\n"), repr(out)
+    assert out.count("Click to edit") == 0 and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_reading_order_cuts_columns_and_rows_off_by_a_fraction():
+    shapes = [{"text": "Cons", "box": (500, 105, 900, 150)}, {"text": "Vendor lock-in", "box": (500, 205, 900, 250)},
+              {"text": "Pros", "box": (0, 100, 400, 145)}, {"text": "Fast to build", "box": (0, 200, 400, 245)},
+              {"text": "Comparison", "text_kind": 0, "placeholder": 13, "box": (0, 600, 900, 650)},
+              {"text": "Plan", "box": (0, 400, 280, 440)}, {"text": "Build", "box": (300, 404, 580, 444)},
+              {"text": "Launch", "box": (600, 396, 880, 436)}]
+    out, _ = md([{"shapes": shapes}])
+    assert out == ("## Slide 1: Comparison\n\nPros\n\nFast to build\n\nCons\n\nVendor lock-in\n\nPlan\n\nBuild\n\n"
+                   "Launch\n"), repr(out)
+
+
+def test_shape_and_picture_links_jumps_buttons_and_media_are_named():
+    from reader_fix import blip_png
+    png = b"\x89PNG\r\n\x1a\n" + b"P" * 24
+    shapes = [{"text": "See the comparison", "box": (0, 100, 500, 150), "click": {"slide": 2}},
+              {"kind": "picture", "pib": 1, "box": (0, 200, 500, 250), "click": {"url": "https://example.com/dash"}},
+              {"inst": 193, "box": (0, 300, 50, 350), "click": {"jump": 1}},
+              {"kind": "media", "media": ("Video", "C:\\clips\\launch-demo.avi"), "ex_obj_id": 7, "pib": 1,
+               "box": (0, 400, 500, 450)},
+              {"text": "run it", "box": (0, 500, 500, 550), "click": {"action": 1}}]
+    out, ctx = md([{"shapes": shapes}, {"title": "Two"}], pictures=[blip_png(png)])
+    assert out == ("## Slide 1\n\nSee the comparison (→ Slide 2)\n\n![](assets/img-001.png)\n\n"
+                   "[Picture](https://example.com/dash)\n\nNext button (→ next slide)\n\n"
+                   "Video: launch-demo.avi (poster below)\n\n![](assets/img-001.png)\n\nrun it (→ macro)\n\n"
+                   "## Slide 2: Two\n"), repr(out)
+    assert not ctx.skipped, ctx.skipped
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

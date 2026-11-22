@@ -5,9 +5,14 @@ bottom (i16, or i32 in 16 bytes) while a ChildAnchor and an FSPGR rectangle hold
 group maps the rectangle of its children's coordinates (FSPGR) onto its own anchor, flips included, and the maps of
 nested groups compose; a group whose FOPT property 0x039F has bit 0 set is a table whose grid is cut by the edges of
 its cells. [MS-ODRAW] and [MS-PPT] are knowledge only. The text atoms of a shape are those of `ppt_text`; this module
-also holds the record budget (`Walk`) and the text-atom walk the slide reader shares. For the slide's diagram a shape
-keeps its arrowheads, and a connector or line its two ends: its anchor's start corner (the far one on an axis its FSP
-flips) and the opposite corner, mapped like its box; the drawing's connector rules come with the shapes.
+also holds the record budget and lookups (`Walk`) and the text-atom walk the slide reader shares. For the slide's
+diagram a shape keeps its arrowheads, and a connector or line its two ends: its anchor's start corner (the far one on
+an axis its FSP flips) and the opposite corner, mapped like its box; the drawing's connector rules come with the shapes.
+A shape's mouse-click InteractiveInfoAtom (in its ClientData) is its `click`; in a ClientTextbox one followed by a
+TextInteractiveInfoAtom clicks that range of the text before it; the character a slide number, date, header or
+footer MetaCharAtom marks is a field and is dropped. `Walk.link` turns a click into (URL, jump words) and
+`Walk.styles` holds the master's bullets by text type for the text being read. The shapes read in `deck.order` over
+their anchors, a group's members inside the group.
 
 Hostile input: every record is bounded by `officeart.records`, the walk is iterative, groups nest `MAX_GROUPS` deep
 (deeper ones are skipped and counted under `depth`), every record spends the presentation's `BIN_RECORDS`, and a table
@@ -18,8 +23,8 @@ from dataclasses import dataclass, field
 
 from .. import limits, officeart
 from ..model import Cell, Table
+from . import deck, ppt_text
 from . import ppt_records as rec
-from . import ppt_text
 
 MAX_GROUPS = 32
 # Table cell edges within CLUSTER master units (576 per inch) are one grid line. A cell's edges are whole master units
@@ -37,7 +42,9 @@ _IDENTITY = (1.0, 1.0, 0.0, 0.0)  # sx, sy, dx, dy: slide = scale * group + offs
 
 
 class Walk:
-    """Shared budgets of one presentation: records walked, text characters emitted, table grid nodes and slots."""
+    """Shared budgets of one presentation (records walked, text characters emitted, table grid nodes and slots) and
+    its lookups: `styles`, {text type: [bullet per indent level]} of the master of what is read, and `link`, a click
+    (exHyperlinkIdRef, action, jump, hyperlinkType) to (URL or "", jump words or "")."""
 
     def __init__(self, ctx):
         self.ctx = ctx
@@ -45,6 +52,8 @@ class Walk:
         self.chars = limits.MAX_OUTPUT
         self.nodes = limits.TABLE_NODES
         self.slots = limits.GRID_SLOTS
+        self.styles = {}
+        self.link = lambda click: ("", "")
 
     def spend(self) -> bool:
         self.records -= 1
@@ -62,13 +71,25 @@ def _decode(data, start, size, typ) -> str:
     return raw.decode("latin-1")
 
 
+def click(data, body, size, walk):
+    """(exHyperlinkIdRef, action, jump, hyperlinkType) of the InteractiveInfoAtom inside an InteractiveInfo container,
+    or None without one."""
+    for _, _, typ, b, s in officeart.records(data, body, body + size):
+        if not walk.spend():
+            return None
+        if typ == rec.INTERACTIVE_INFO_ATOM and s >= 13:
+            ref, action, _, jump, _, kind = struct.unpack_from("<4xIBBBBB", data, b)
+            return ref, action, jump, kind
+    return None
+
+
 def texts(data, start, end, walk):
-    """The text in data[start:end] in document order, containers entered, as ["text", kind, text, style] and
-    ["ref", index] items."""
+    """The text in data[start:end] in document order, containers entered, as ["text", kind, text, style, clicked
+    ranges (begin, end, click), field positions] and ["ref", index] items."""
     items = []
-    stack = [(officeart.records(data, start, end), 4, None)]
+    stack = [(officeart.records(data, start, end), 4, None, None)]
     while stack:
-        it, kind, last = stack.pop()
+        it, kind, last, pending = stack.pop()
         for ver, inst, typ, body, size in it:
             if not walk.spend():
                 return items
@@ -77,21 +98,38 @@ def texts(data, start, end, walk):
                 # 0..8 reads as body text (test_unknown_text_header_type_is_body_text pins it)
                 kind = struct.unpack_from("<I", data, body)[0]
             elif typ in (rec.TEXT_CHARS_ATOM, rec.TEXT_BYTES_ATOM):
-                last = ["text", kind, _decode(data, body, size, typ), None]
+                last = ["text", kind, _decode(data, body, size, typ), None, [], []]
                 items.append(last)
-                kind = 4
+                kind, pending = 4, None
             elif typ == rec.STYLE_TEXT_PROP_ATOM and last is not None and last[3] is None:
                 last[3] = bytes(data[body:body + size])
             elif typ == rec.OUTLINE_TEXT_REF_ATOM and size >= 4:
                 items.append(["ref", struct.unpack_from("<I", data, body)[0]])
+            elif typ == rec.INTERACTIVE_INFO:
+                if inst == 0:
+                    pending = click(data, body, size, walk)
+            elif typ in rec.META_CHARS and size >= 4 and last is not None:
+                last[5].append(struct.unpack_from("<I", data, body)[0])
+            elif typ == rec.TEXT_INTERACTIVE_INFO_ATOM and size >= 8:
+                if pending is not None and last is not None:
+                    last[4].append((*struct.unpack_from("<II", data, body), pending))
+                pending = None
             elif ver == 0xF:
                 if len(stack) >= limits.MAX_DEPTH:
                     walk.ctx.skipped["record"] += 1
                     continue
-                stack.append((it, kind, last))
-                stack.append((officeart.records(data, body, body + size), 4, None))
+                stack.append((it, kind, last, pending))
+                stack.append((officeart.records(data, body, body + size), 4, None, None))
                 break
     return items
+
+
+def _levels(styles, kind) -> list:
+    """The master's bullets by indent level of text type `kind`: its own TextMasterStyleAtom's, a centre body, half or
+    quarter body falling back to the body's and a centre title to the title's, level by level."""
+    own, base = styles.get(kind, []), styles.get({5: 1, 6: 0, 7: 1, 8: 1}.get(kind), [])
+    return [a if a is not None else (base[k] if k < len(base) else None) for k, a in
+            enumerate(own + [None] * max(0, len(base) - len(own)))]
 
 
 def text_blocks(items, walk):
@@ -103,8 +141,14 @@ def text_blocks(items, walk):
         walk.chars -= len(item[2])
         if walk.chars < 0:
             raise ValueError("text budget")
-        blocks = ppt_text.blocks(item[2], item[3], walk.ctx)
-        out.append((item[1], blocks, " ".join(item[2].replace("\x0b", " ").replace("\r", " ").split())))
+        text = item[2]
+        for at in item[5]:
+            if at < len(text):
+                text = text[:at] + "\x00" + text[at + 1:]
+        links = [(b, e, *walk.link(c)) for b, e, c in item[4]]
+        blocks = ppt_text.blocks(text, item[3], walk.ctx, _levels(walk.styles, item[1]), links)
+        plain = text.replace("\x00", "").replace("\x0b", " ").replace("\r", " ")
+        out.append((item[1], blocks, " ".join(plain.split())))
     return out
 
 
@@ -132,18 +176,19 @@ class Shape:
     table: bool = False
     arrows: tuple = (False, False)
     ends: tuple | None = None  # a connector's or line's (start, end) points; None for another shape or no anchor
+    click: tuple | None = None  # its mouse-click (exHyperlinkIdRef, action, jump, hyperlinkType)
 
 
 class _Raw:
     """What one SpContainer says before it is placed."""
     __slots__ = ("flags", "stype", "spid", "table", "pib", "client", "child", "rect", "runs", "text_ref",
-                 "placeholder", "ole_ref", "arrows")
+                 "placeholder", "ole_ref", "arrows", "click")
 
     def __init__(self):
         self.flags = self.stype = self.spid = 0
         self.arrows = (False, False)
         self.table, self.pib, self.client, self.child, self.rect = False, None, None, None, None
-        self.runs, self.text_ref, self.placeholder, self.ole_ref = [], None, None, None
+        self.runs, self.text_ref, self.placeholder, self.ole_ref, self.click = [], None, None, None, None
 
 
 class _Frame:
@@ -195,10 +240,12 @@ def _shape(data, body, size, walk) -> _Raw:
                 if item[0] == "ref" and raw.text_ref is None:
                     raw.text_ref = item[1]
         elif typ == CLIENT_DATA:
-            for _, _, t, cb, cs in officeart.records(data, b, b + s):
+            for _, ci, t, cb, cs in officeart.records(data, b, b + s):
                 if not walk.spend():
                     break
-                if t == rec.OE_PLACEHOLDER_ATOM and cs >= 5:
+                if t == rec.INTERACTIVE_INFO and ci == 0 and raw.click is None:
+                    raw.click = click(data, cb, cs, walk)
+                elif t == rec.OE_PLACEHOLDER_ATOM and cs >= 5:
                     raw.placeholder = data[cb + 4]
                 elif t == rec.EX_OBJ_REF_ATOM and cs >= 4:
                     raw.ole_ref = struct.unpack_from("<I", data, cb)[0]
@@ -264,7 +311,7 @@ def _leaf(raw: _Raw, tf) -> Shape:
         kind = "text"
     shape = Shape(kind, text_ref=raw.text_ref, placeholder=raw.placeholder, pib=raw.pib, ole_ref=raw.ole_ref,
                   runs=raw.runs, blocks=[b for _, bl, _ in raw.runs for b in bl], spid=raw.spid, stype=raw.stype,
-                  arrows=raw.arrows)
+                  arrows=raw.arrows, click=raw.click)
     _place(shape, _box(raw), tf)
     if raw.stype == officeart.LINE_TYPE or raw.stype in officeart.CONNECTOR_TYPES:
         shape.ends = _ends(raw, _box(raw), tf)
@@ -417,19 +464,23 @@ def _table(group: Shape, budget: Walk):
 
 
 def ordered(shapes: list) -> list:
-    """`shapes` in reading order, by (top, left); a group sits where its own anchor puts it (the union of its anchored
-    members when it has none) and its members are ordered inside it. A shape with no anchor, and a group with no anchor
-    and no anchored member, sorts after the anchored ones, in record order; it does not pull a group's union to 0."""
+    """`shapes` in `deck.order` over their anchors; a group sits where its anchored members are (their union; its own
+    anchor when none is anchored) and its members are ordered inside it. A shape with no anchor, and a group with no
+    anchor and no anchored member, keeps its record place; it does not pull a group's union to 0."""
+    boxes = []
     for s in shapes:
+        box = (s.left, s.top, s.right, s.bottom) if s.anchored else None
         if s.kind == "group" and s.children:
             s.children = ordered(s.children)
-            if not s.anchored:
-                placed = [c for c in s.children if c.anchored]
-                if placed:
-                    s.top, s.left = min(c.top for c in placed), min(c.left for c in placed)
-                    s.bottom, s.right = max(c.bottom for c in placed), max(c.right for c in placed)
+            placed = [c for c in s.children if c.anchored]
+            if placed:
+                box = (min(c.left for c in placed), min(c.top for c in placed),
+                       max(c.right for c in placed), max(c.bottom for c in placed))
+                if not s.anchored:
+                    s.left, s.top, s.right, s.bottom = box
                     s.anchored = True
-    return sorted(shapes, key=lambda s: (0, s.top, s.left) if s.anchored else (1, 0, 0))
+        boxes.append(box)
+    return [shapes[i] for i in deck.order(boxes)]
 
 
 def flatten(shapes: list):

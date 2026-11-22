@@ -5,11 +5,21 @@ slideIdRef, the SlideShowSlideInfoAtom hidden flag and the text atoms (TextHeade
 StyleTextPropAtom) were checked against dochan `office_binary/ppt.py`, `ppt_structure.py` and `ppt_text.py` and anydoc
 `formats/ppt/mod.rs`. Slides are found through the persist chain of `ppt_records`; only a clear stream whose chain is
 unusable (no persist directory) is read by walking its top-level records, each SlideContainer in stream order, with
-its notes counted, not placed. Masters, notes masters and handouts are not read. A slide's text comes in shape
-order: an OutlineTextRefAtom puts the outline text block it names there, a ClientTextbox brings its own, and outline
-blocks nothing refers to follow. The shapes come in reading order from `ppt_shapes` (groups, tables and placeholders;
-date, number, footer and header placeholders are left out) and a title placeholder gives the slide its title. A slide
-that cannot be read is counted under `slide` and the others still come out. An object shape places the blocks
+its notes counted, not placed. A slide's text comes in shape order: an OutlineTextRefAtom puts the outline text block
+it names there, a ClientTextbox brings its own, and outline blocks nothing refers to follow. The shapes come in reading
+order from `ppt_shapes` (groups, tables and placeholders; date and number placeholders are left out) and a title
+placeholder gives the slide its title. A slide that cannot be read is counted under `slide` and the others still come
+out. A notes page gives every shape's text and pictures but its slide image and its date, number, footer and header.
+
+The master a SlideAtom's masterIdRef names (a title master's own master behind it) gives the slide's text the bullets
+of its TextMasterStyleAtoms by text type and indent level, and, when the SlideAtom's fMasterObjects is set, the
+shapes on it that are not placeholders. Those, the text of the slide's footer and header placeholders and the footer
+of its HeadersFooters (the slide's own, else the document's slide one, when fHasFooter is set) go to `deck.Repeated`:
+written once, on the slide when only one shows it. A click (InteractiveInfoAtom) on a shape or a text range is a link
+to its ExHyperlink's URL or the words of its jump ("Slide 2", "next slide", "macro"); a shape's click on text wraps the
+text, else a line of its label follows: an action button's ("Next button"), a picture's or object's "Picture", or
+"Link". A shape whose ExObjRefAtom names a movie or sound in the ExObjList is the line "Video: file name" (its poster
+picture after it). An object shape places the blocks
 `ppt_objects` reads from its OLE storage (an Excel chart or sheet, an MS Graph chart, an equation); one it cannot read
 shows its preview picture and is counted under `object`, a workbook with no table under `chart`. A picture shape
 becomes the Image of its pib (`ppt_pictures`: the BStore of the DocumentContainer's PPDrawingGroup, the BLIPs in the
@@ -22,20 +32,32 @@ password is decrypted first (`ppt_crypt`); the Persist keeps its offsets and rea
 file with no PowerPoint Document stream goes to `cfb_route` (another format's file named .ppt is read by its own
 parser), and a PowerPoint 95 file (a PP40 stream, or PowerPoint 95's short Current User) is `unsupported`.
 """
+import re
 import struct
 
 from .. import diagram, officeart
 from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
-from ..model import Doc, Section
+from ..model import Doc, Para, Section, Text
 from . import ppt_records as rec
-from . import cfb_route, ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, sheet_grid, zip_route
+from . import cfb_route, deck, ppt_crypt, ppt_objects, ppt_pictures, ppt_shapes, ppt_text, sheet_grid, zip_route
+from .word_fields import MAX_URL
 
 MAX_TITLE = 300
+MAX_NAME = 200
 _TITLES = (0, 6)
 _TITLE_SHAPE = -1  # the kind of a run in a title placeholder whose text atom says otherwise
 _PICTURE = -2      # the kind of a picture's run
+_FOOTERS = frozenset((9, 10))
+_PLACEHOLDERS = frozenset(range(1, 256))
+_NOTES_SKIPPED = ppt_shapes.SKIPPED | {5, 11}
+_HAS_FOOTER = 0x20
+_JUMPS = {1: "next slide", 2: "previous slide", 3: "first slide", 4: "last slide", 5: "last slide viewed",
+          6: "end of show"}
+_LINK_JUMPS = {0: "next slide", 1: "previous slide", 2: "first slide", 3: "last slide"}
+_BUTTONS = {189: "", 190: "Home", 191: "Help", 192: "Information", 193: "Next", 194: "Previous", 195: "Last",
+            196: "First", 197: "Return", 198: "Document", 199: "Sound", 200: "Movie"}
 
 
 class Presentation:
@@ -56,18 +78,146 @@ class Presentation:
             self.doc, pictures = unlocked
             self.persist.doc = self.doc
         self.walk = ppt_shapes.Walk(ctx)
+        self.walk.link = self._link
         self.budget = diagram.ConnectionBudget(ctx)  # the deck's edges, shared by every slide's diagram
         self.pictures = ppt_pictures.Pictures(self.doc, self._dgg(), pictures, flate.Budget(), ctx)
         self.objects = ppt_objects.Objects(self.doc, self.persist, flate.Budget(), sheet_grid.Budget(), ctx)
+        self.links, self.media, self.hf = {}, {}, (0, "")
+        self.numbers, self.masters, self.master_of = {}, {}, {}
+        self.repeated = deck.Repeated()
+        self._index()
+
+    def _document(self):
+        """(start, end) of the DocumentContainer's body; None without one. With no chain it is the first one among
+        the top-level records."""
+        if self.broken is None:
+            return self._container(self.persist.doc_ref, rec.DOCUMENT_CONTAINER)
+        return next(((body, body + size) for _, _, typ, body, size in officeart.records(self.doc)
+                     if typ == rec.DOCUMENT_CONTAINER), None)
+
+    def _children(self, body, size):
+        """The records of a container body, each one spending the walk."""
+        for item in officeart.records(self.doc, body, body + size):
+            if not self.walk.spend():
+                return
+            yield item
+
+    def _cstring(self, body, size) -> str:
+        return " ".join(bytes(self.doc[body:body + size]).decode("utf-16-le", "replace").replace("\x00", " ").split())
+
+    def _hf(self, body, size):
+        """(flags, footer text) of a HeadersFooters container."""
+        flags, footer = 0, ""
+        for _, inst, typ, b, sz in self._children(body, size):
+            if typ == rec.HEADERS_FOOTERS_ATOM and sz >= 4:
+                flags = struct.unpack_from("<H", self.doc, b + 2)[0]
+            elif typ == rec.CSTRING and inst == 2:
+                footer = self._cstring(b, sz)[:MAX_NAME]
+        return flags, footer
+
+    def _media(self, body, size):
+        """(exObjId, file name) of a movie's ExVideoContainer or a sound container; None without an ExMediaAtom."""
+        ref, name = None, ""
+        for _, _, typ, b, sz in self._children(body, size):
+            if typ == rec.EX_MEDIA_ATOM and sz >= 4:
+                ref = struct.unpack_from("<I", self.doc, b)[0]
+            elif typ == rec.CSTRING and not name:
+                name = re.split(r"[\\/]", self._cstring(b, sz))[-1][:MAX_NAME]
+        return None if ref is None else (ref, name)
+
+    def _index(self):
+        """The DocumentContainer's hyperlinks ({exHyperId: (target, location)}), movies and sounds ({exObjId: (kind,
+        file name)}) of its ExObjList, and its slides' HeadersFooters."""
+        span = self._document()
+        if span is None:
+            return
+        for _, inst, typ, body, size in self._children(span[0], span[1] - span[0]):
+            if typ == rec.HEADERS_FOOTERS and inst == 3:
+                self.hf = self._hf(body, size)
+            if typ != rec.EX_OBJ_LIST:
+                continue
+            for _, _, t, b, sz in self._children(body, size):
+                if t == rec.EX_HYPERLINK:
+                    ref, strings = None, {}
+                    for _, i, tt, bb, ss in self._children(b, sz):
+                        if tt == rec.EX_HYPERLINK_ATOM and ss >= 4:
+                            ref = struct.unpack_from("<I", self.doc, bb)[0]
+                        elif tt == rec.CSTRING:
+                            strings.setdefault(i, self._cstring(bb, ss))
+                    if ref is not None:
+                        self.links.setdefault(ref, (strings.get(1, ""), strings.get(3, "")))
+                elif t in rec.EX_MOVIES:
+                    video = next(((bb, ss) for _, _, tt, bb, ss in self._children(b, sz) if tt == rec.EX_VIDEO), None)
+                    got = self._media(*video) if video else None
+                    if got is not None:
+                        self.media.setdefault(got[0], ("Video", got[1]))
+                elif t in rec.EX_AUDIO:
+                    got = self._media(b, sz)
+                    if got is not None:
+                        self.media.setdefault(got[0], ("Audio", got[1]))
+
+    def _link(self, click):
+        """(URL or "", jump words or "") of a click (exHyperlinkIdRef, action, jump, hyperlinkType): a jump action its
+        move, a macro "macro", a hyperlink its URL, file or slide ("Slide 2"; nothing when the slide is not in the
+        deck) or its move. A hyperlink id the ExObjList does not hold is counted under `link`."""
+        ref, action, jump, kind = click
+        if action == 3:
+            return "", _JUMPS.get(jump, "")
+        if action == 1:
+            return "", "macro"
+        if action != 4:
+            return "", ""
+        if kind in _LINK_JUMPS:
+            return "", _LINK_JUMPS[kind]
+        got = self.links.get(ref)
+        if got is None:
+            self.ctx.skipped["link"] += 1
+            return "", ""
+        target, location = got
+        if kind == 7:
+            sid = location.partition(",")[0].strip()
+            number = self.numbers.get(int(sid)) if sid.isdigit() else None
+            return "", f"Slide {number}" if number else ""
+        return (target[:MAX_URL], "") if target else ("", "")
+
+    def _master(self, sid):
+        """(bullets by text type, [blocks of each shape that is not a placeholder]) of the master slide id `sid`
+        names; a title master (a SlideContainer) adds its own master's styles under its own and that master's shapes
+        before its own when its SlideAtom's fMasterObjects is set. Read once per master."""
+        if sid in self.master_of:
+            return self.master_of[sid]
+        self.master_of[sid] = ({}, [])
+        pid = self.masters.get(sid)
+        got = self.persist.obj(pid) if pid is not None else None
+        styles, items = {}, []
+        if got is not None and got[0] in (rec.MAIN_MASTER, rec.SLIDE_CONTAINER):
+            parent, drawing = None, None
+            for _, inst, typ, body, size in self._children(got[2], got[3]):
+                if typ == rec.TEXT_MASTER_STYLE_ATOM:
+                    styles.setdefault(inst, ppt_text.master_levels(bytes(self.doc[body:body + size]), inst))
+                elif typ == rec.SLIDE_ATOM and size >= 22 and got[0] == rec.SLIDE_CONTAINER:
+                    parent = struct.unpack_from("<I", self.doc, body + 12)[0], self.doc[body + 20] & 1
+                elif typ == rec.PP_DRAWING and drawing is None:
+                    drawing = (body, body + size)
+            if parent is not None:
+                base, shapes = self._master(parent[0])
+                styles = {**base, **styles}
+                if parent[1]:
+                    items.extend(shapes)
+            if drawing is not None:
+                saved, self.walk.styles = self.walk.styles, styles
+                with self.ctx.guard("master"):
+                    by_key = {}
+                    for _, blocks, _, key in self._drawn(drawing, [], _PLACEHOLDERS)[0]:
+                        by_key.setdefault(key, []).extend(blocks)
+                    items.extend(b for b in by_key.values() if b)
+                self.walk.styles = saved
+        self.master_of[sid] = (styles, items)
+        return styles, items
 
     def _dgg(self):
-        """(start, end) of the DggContainer inside the DocumentContainer's PPDrawingGroup; None without one. With no
-        chain the DocumentContainer is the first one among the top-level records."""
-        if self.broken is None:
-            span = self._container(self.persist.doc_ref, rec.DOCUMENT_CONTAINER)
-        else:
-            span = next(((body, body + size) for _, _, typ, body, size in officeart.records(self.doc)
-                         if typ == rec.DOCUMENT_CONTAINER), None)
+        """(start, end) of the DggContainer inside the DocumentContainer's PPDrawingGroup; None without one."""
+        span = self._document()
         if span is None:
             return None
         for _, _, typ, body, size in officeart.records(self.doc, *span):
@@ -104,12 +254,13 @@ class Presentation:
             out[inst] = entries
         return out
 
-    def _drawn(self, span, outline, skip=ppt_shapes.SKIPPED, dia=None):
+    def _drawn(self, span, outline, skip=ppt_shapes.SKIPPED, dia=None, furniture=None):
         """([(kind, blocks, plain text, key)] of a PPDrawing's shapes in reading order, the outline indexes they took).
-        A shape's OutlineTextRefAtom takes its outline block once; a skipped placeholder takes its block and drops it.
-        `key` is the shape's spid, or a key no rule names when it has none (0) or an earlier shape has it. With `dia`
-        every shape goes to that diagram under its key, a skipped placeholder with its text and no item. A drawing the
-        shape walk finds nothing in is read as plain text atoms in record order, keyed None."""
+        A shape's OutlineTextRefAtom takes its outline block once; a skipped placeholder takes its block and drops it,
+        a footer or header one into `furniture` when that is a list. `key` is the shape's spid, or a key no rule names
+        when it has none (0) or an earlier shape has it. With `dia` every shape goes to that diagram under its key, a
+        skipped placeholder with its text and no item. A drawing the shape walk finds nothing in is read as plain text
+        atoms in record order, keyed None."""
         if span is None:
             return [], set()
         shapes, rules = ppt_shapes.walk(self.doc, *span, self.ctx, self.walk)
@@ -140,10 +291,19 @@ class Presentation:
                 if dia is not None:
                     with self.ctx.guard("shape"):
                         self._register(dia, shape, key, runs, glue)
+                if furniture is not None and shape.placeholder in _FOOTERS:
+                    furniture.append([b for _, blocks, _ in runs for b in blocks])
                 continue
             mine = []
             if shape.kind == "picture":
                 image = self.pictures.image(shape.pib)
+                if image is not None:
+                    mine.append((_PICTURE, [image], ""))
+            elif shape.kind == "object" and shape.ole_ref in self.media:
+                kind, name = self.media[shape.ole_ref]
+                image = self.pictures.image(shape.pib) if shape.pib else None
+                line = f"{kind}: {name}" if name else kind
+                mine.append((_PICTURE, [Para([Text(line + (" (poster below)" if image is not None else ""))])], ""))
                 if image is not None:
                     mine.append((_PICTURE, [image], ""))
             elif shape.kind == "object":
@@ -161,6 +321,16 @@ class Presentation:
             title = shape.placeholder in ppt_shapes.TITLES
             mine.extend((_TITLE_SHAPE if title and kind not in _TITLES else kind, blocks, plain)
                         for kind, blocks, plain in runs)
+            if shape.click is not None:
+                url, jump = self._link(shape.click)
+                if url or jump:
+                    flat = [b for _, blocks, _ in mine for b in blocks]
+                    word = _BUTTONS.get(shape.stype)
+                    label = (f"{word} button" if word else "Button" if word is not None
+                             else "Picture" if shape.kind in ("picture", "object") else "Link")
+                    extra = deck.linked(flat, url, jump, label)[len(flat):]
+                    if extra:
+                        mine.append((4, extra, ""))
             if dia is not None:
                 with self.ctx.guard("shape"):
                     self._register(dia, shape, key, mine, glue)
@@ -189,18 +359,26 @@ class Presentation:
 
     def _slide_at(self, start, size, number, outline_span):
         """The slide section of the SlideContainer whose body is `size` bytes at `start`."""
-        outline = ppt_shapes.text_blocks(ppt_shapes.texts(self.doc, *outline_span, self.walk), self.walk)
-        hidden, drawing = False, None
+        hidden, drawing, atom, hf = False, None, None, None
         for _, _, typ, body, sz in officeart.records(self.doc, start, start + size):
             if typ == rec.SLIDE_SHOW_SLIDE_INFO_ATOM and sz >= 12:
                 hidden = bool(struct.unpack_from("<H", self.doc, body + 10)[0] & 0x0004)
             elif typ == rec.PP_DRAWING and drawing is None:
                 drawing = (body, body + sz)
+            elif typ == rec.SLIDE_ATOM and sz >= 22 and atom is None:
+                atom = struct.unpack_from("<I", self.doc, body + 12)[0], self.doc[body + 20] & 1
+            elif typ == rec.HEADERS_FOOTERS and hf is None:
+                hf = self._hf(body, sz)
+        styles, items = self._master(atom[0]) if atom is not None else ({}, [])
+        self.walk.styles = styles
+        outline = ppt_shapes.text_blocks(ppt_shapes.texts(self.doc, *outline_span, self.walk), self.walk)
         bare = drawing is None
         if bare:  # no PPDrawing: the text atoms the slide holds itself, in record order
             drawing = (start, start + size)
         dia = diagram.Diagram(self.ctx, self.budget)
-        ordered, used = self._drawn(drawing, outline, dia=dia)
+        furniture = []
+        ordered, used = self._drawn(drawing, outline, dia=dia, furniture=furniture)
+        self.walk.styles = {}
         # a slide list run the slide's own atoms already gave is the same text: read it once
         seen = {plain for _, _, plain, _ in ordered} if bare else set()
         ordered.extend((*o, None) for i, o in enumerate(outline) if i not in used and o[2] not in seen)
@@ -215,6 +393,14 @@ class Presentation:
         with self.ctx.guard("shape"):
             flow = dia.place(slots)
         sec.blocks.extend(flow)
+        if atom is not None and atom[1]:
+            for blocks in items:
+                self.repeated.add(number, blocks)
+        flags, footer = hf or self.hf
+        if flags & _HAS_FOOTER and footer:
+            self.repeated.add(number, [Para([Text(footer)])])
+        for blocks in furniture:
+            self.repeated.add(number, blocks)
         return sec
 
     def _notes(self, pid):
@@ -231,9 +417,8 @@ class Presentation:
         blocks = []
         if drawing is None:  # no PPDrawing: the text atoms the notes page holds itself
             drawing = span
-        for kind, bl, _, _ in self._drawn(drawing, [], ppt_shapes.SKIPPED | {5})[0]:
-            if kind in (2, _PICTURE):
-                blocks.extend(bl)
+        for _, bl, _, _ in self._drawn(drawing, [], _NOTES_SKIPPED)[0]:
+            blocks.extend(bl)
         return ref, blocks
 
     def _unchained(self) -> list:
@@ -256,13 +441,15 @@ class Presentation:
         self.ctx.skipped["record"] += 1
         if notes:
             self.ctx.skipped["note"] += notes
-        return secs
+        return self.repeated.place(secs) + secs
 
     def sections(self) -> list:
         if self.broken is not None:
             return self._unchained()
         lists = self._lists()
         secs, by_id = [], {}
+        self.numbers = {sid: number for number, (_, sid, _, _) in enumerate(lists.get(0, []), 1)}
+        self.masters = {sid: pid for pid, sid, _, _ in lists.get(1, [])}
         for number, (pid, sid, a, b) in enumerate(lists.get(0, []), 1):
             with self.ctx.guard("slide"):
                 sec = self._slide(pid, number, (a, b))
@@ -276,7 +463,7 @@ class Presentation:
                 sec = by_id.get(got[0])
                 if sec is not None and not sec.notes:
                     sec.notes = got[1]
-        return secs
+        return self.repeated.place(secs) + secs
 
 
 def _pp95(cf, current) -> bool:

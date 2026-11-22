@@ -148,10 +148,10 @@ def test_slide_link_runs_join():
     assert "[ab](https://example.com/x)" in out, out
 
 
-def test_shape_link_ignored():
+def test_shape_link_wraps_its_text():
     s = sp("plain").replace('name="s"/>', 'name="s"><a:hlinkClick r:id="rL"/></p:cNvPr>')
     out = md(deck([s], srels={1: [("rL", "hyperlink", "https://example.com/x", True)]}))
-    assert "plain" in out and "](" not in out, out
+    assert out == "## Slide 1\n\n[plain](https://example.com/x)\n", out
 
 
 def test_order_by_sldIdLst():
@@ -184,7 +184,7 @@ def test_hidden_shape():
 
 def test_skip_number_placeholders():
     out = md(deck([sp("t", "title") + sp("7", "sldNum") + sp("2026", "dt") + sp("f", "ftr") + sp("keep", "-")]))
-    assert "7" not in out and "2026" not in out and "keep" in out and "\nf" not in out, out
+    assert out == "## Slide 1: t\n\nkeep\n\nf\n", out
 
 
 def test_notes_blockquote():
@@ -448,7 +448,7 @@ _PLAIN = [  # what the reader wrote for these decks before it read connectors
     '## Slide 1\n\nfirst\n\ntop\n\nlater\n\nlast\n',
     '(1 hidden places left out)\n\n## Slide 1: x\n',
     '## Slide 1: x\n\n(hidden) secret\n',
-    '## Slide 1: t\n\nkeep\n',
+    '## Slide 1: t\n\nkeep\n\nf\n',
     '## Slide 1: T\n\nrule\n\n![d](assets/img-001.png)\n\nafter\n',
 ]
 
@@ -692,6 +692,124 @@ def test_timeout_on_comments_authors_notes_aborts():
             raise AssertionError(f"timeout on {names} was swallowed")
         finally:
             undo()
+
+
+# ---- structure the slides share with their layouts and masters
+def _styled(tag, inner, root_attrs=""):
+    styles = ('<p:txStyles><p:titleStyle/><p:bodyStyle><a:lvl1pPr><a:buChar char="o"/></a:lvl1pPr>'
+              '<a:lvl2pPr><a:buChar char="o"/></a:lvl2pPr><a:lvl3pPr><a:buChar char="o"/></a:lvl3pPr></p:bodyStyle>'
+              '<p:otherStyle/></p:txStyles>') if tag == "sldMaster" else ""
+    return f'<p:{tag} {NS}{root_attrs}><p:cSld><p:spTree>{inner}</p:spTree></p:cSld>{styles}</p:{tag}>'
+
+
+def styled_deck(slides, layouts, master, uses, notes=None, slide_attrs=None, extra=None, srels=None):
+    """slides: spTree xml; layouts and master: spTree xml, or (xml, root attributes); uses[i]: the 1-based layout of
+    slide i + 1. The master's txStyles bullet body levels 1 to 3 and its rId rI is ppt/media/logo.png."""
+    slide_attrs = slide_attrs or {}
+    parts = dict(extra or {})
+    for k, lay in enumerate(layouts, 1):
+        xml, a = lay if isinstance(lay, tuple) else (lay, "")
+        parts[f"ppt/slideLayouts/slideLayout{k}.xml"] = _styled("sldLayout", xml, " " + a)
+        parts[f"ppt/slideLayouts/_rels/slideLayout{k}.xml.rels"] = rels_xml(
+            [("rM", "slideMaster", "../slideMasters/slideMaster1.xml")])
+    xml, a = master if isinstance(master, tuple) else (master, "")
+    parts["ppt/slideMasters/slideMaster1.xml"] = _styled("sldMaster", xml, " " + a)
+    parts["ppt/slideMasters/_rels/slideMaster1.xml.rels"] = rels_xml([("rI", "image", "../media/logo.png")])
+    parts["ppt/media/logo.png"] = PNG
+    full = [(s if s.startswith("<p:sld") else sld(s)).replace("<p:sld ", f"<p:sld {slide_attrs[i]} ", 1)
+            if i in slide_attrs else s for i, s in enumerate(slides)]
+    srels = {i + 1: [("rL", "slideLayout", f"../slideLayouts/slideLayout{u}.xml")] + list((srels or {}).get(i + 1, []))
+             for i, u in enumerate(uses)}
+    return deck(full, notes=notes, extra=parts, srels=srels)
+
+
+def test_bullet_levels_inherit_from_layout_and_master():
+    paras = ('<a:p><a:r><a:t>Grow revenue</a:t></a:r></a:p>'
+             '<a:p><a:pPr lvl="1"/><a:r><a:t>Enterprise deals</a:t></a:r></a:p>'
+             '<a:p><a:pPr lvl="2"/><a:r><a:t>Two pilots</a:t></a:r></a:p>'
+             '<a:p><a:pPr lvl="1"><a:buNone/></a:pPr><a:r><a:t>Aside</a:t></a:r></a:p>')
+    layout = ('<p:sp><p:nvSpPr><p:cNvPr id="2" name="b"/><p:cNvSpPr/><p:nvPr><p:ph idx="1"/></p:nvPr></p:nvSpPr>'
+              '<p:spPr/><p:txBody><a:bodyPr/><a:lstStyle><a:lvl2pPr><a:buAutoNum type="arabicPeriod"/></a:lvl2pPr>'
+              '</a:lstStyle><a:p/></p:txBody></p:sp>')
+    body = sp(paras=paras, off=(0, 100), ext=(10, 10)).replace("<p:nvPr></p:nvPr>", '<p:nvPr><p:ph idx="1"/></p:nvPr>')
+    out = md(styled_deck([sp("T", "title") + body + sp("Free box", id=3, off=(0, 900), ext=(10, 10))],
+                         [layout], "", [1]))
+    assert out == "## Slide 1: T\n\n- Grow revenue\n  1. Enterprise deals\n    - Two pilots\n\nAside\n\nFree box\n", out
+
+
+def test_notes_from_every_text_shape_of_the_notes_page():
+    tbl = ('<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="6" name="t"/><p:cNvGraphicFramePr/><p:nvPr/>'
+           '</p:nvGraphicFramePr><p:xfrm><a:off x="0" y="400"/><a:ext cx="10" cy="10"/></p:xfrm><a:graphic>'
+           '<a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>cell note</a:t></a:r></a:p></a:txBody></a:tc>'
+           '</a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame>')
+    page = (sp("", "sldImg", id=2, paras="") + sp("body note", "body", id=3, off=(0, 100), ext=(10, 10))
+            + sp("box note", id=4, off=(0, 200), ext=(10, 10))
+            + grp(sp("grouped note", id=5, off=(0, 0), ext=(10, 10)), (0, 300), (10, 10), (0, 0), (10, 10))
+            + tbl + sp("77", "sldNum", id=7) + sp("hdr text", "hdr", id=8))
+    out = md(deck([sp("t", "title")], notes={1: page}))
+    assert "> Notes: body note\n> box note\n> grouped note\n> cell note" in out, out
+    assert "77" not in out and "hdr text" not in out, out
+
+
+def test_master_layout_and_footer_content_is_written_once():
+    logo = ('<p:pic><p:nvPicPr><p:cNvPr id="9" name="logo" descr="logo"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>'
+            '<p:blipFill><a:blip r:embed="rI"/></p:blipFill><p:spPr/></p:pic>')
+    master = _ph('type="title"', "Click to edit the title", off=(0, 0)) + sp("ACME Internal", id=8) + logo
+    layouts = [sp("Layout one note", id=5) + _ph('type="body"', "Click to edit text"), sp("Layout two note", id=5)]
+    slides = [sp(f"Title {k}", "title") + sp(f"body {k}", off=(0, 100), ext=(10, 10)) + sp("Board 2026", "ftr", id=4)
+              + sp("12", "sldNum", id=6) for k in (1, 2, 3)]
+    out = md(styled_deck(slides, layouts, master, [1, 1, 2], slide_attrs={1: 'showMasterSp="0"'}))
+    assert out == ("## On every slide\n\nBoard 2026\n\n## On slides 1, 3\n\nACME Internal\n\n"
+                   "![logo](assets/img-001.png)\n\n## Slide 1: Title 1\n\nbody 1\n\nLayout one note\n\n"
+                   "## Slide 2: Title 2\n\nbody 2\n\n## Slide 3: Title 3\n\nbody 3\n\nLayout two note\n"), out
+    hidden = md(styled_deck([sld(slides[0], show="0"), slides[1]], layouts, master, [1, 1]))
+    assert hidden.startswith("(1 hidden places left out)\n\n## On every slide\n\nACME Internal\n\n"
+                             "![logo](assets/img-001.png)\n\nLayout one note\n\nBoard 2026\n\n## Slide 2"), hidden
+
+
+def test_reading_order_cuts_columns_and_rows_off_by_a_fraction():
+    col = [("Pros", 0, 0, 4000, 500), ("Fast to build", 0, 600, 4000, 3000),
+           ("Cons", 5000, 0, 4000, 500), ("Vendor lock-in", 5000, 600, 4000, 3000)]
+    shapes = "".join(sp(t, id=10 + k, off=(x, y), ext=(w, h)) for k, (t, x, y, w, h) in enumerate(reversed(col)))
+    out = md(deck([sp("Options", "title") + shapes]))
+    assert out == "## Slide 1: Options\n\nPros\n\nFast to build\n\nCons\n\nVendor lock-in\n", out
+    steps = [("Plan", 0, 50), ("Build", 3000, 0), ("Launch", 6000, 100)]
+    out = md(deck([sp("Steps", "title") + "".join(sp(t, id=10 + k, off=(x, 5000 + y), ext=(2900, 1000))
+                                                  for k, (t, x, y) in enumerate(steps))]))
+    assert out == "## Slide 1: Steps\n\nPlan\n\nBuild\n\nLaunch\n", out
+
+
+def _pic(id, name, descr, rid, y, click="", nv=""):
+    return (f'<p:pic><p:nvPicPr><p:cNvPr id="{id}" name="{name}" descr="{descr}">{click}</p:cNvPr><p:cNvPicPr/>'
+            f'<p:nvPr>{nv}</p:nvPr></p:nvPicPr><p:blipFill><a:blip r:embed="{rid}"/></p:blipFill><p:spPr><a:xfrm>'
+            f'<a:off x="0" y="{y}"/><a:ext cx="10" cy="10"/></a:xfrm></p:spPr></p:pic>')
+
+
+def _clicked(shape, click):
+    return shape.replace('name="s"/>', f'name="s">{click}</p:cNvPr>', 1)
+
+
+def test_shape_and_picture_links_jumps_buttons_and_media_are_named():
+    pic = _pic(3, "p", "Map of the regions", "rI", 100, '<a:hlinkClick r:id="rU"/>')
+    box = _clicked(sp("See the comparison", id=4, off=(0, 200), ext=(10, 10)),
+                   '<a:hlinkClick r:id="rS" action="ppaction://hlinksldjump"/>')
+    dash = _clicked(sp("Open the dashboard", id=5, off=(0, 300), ext=(10, 10)), '<a:hlinkClick r:id="rD"/>')
+    button = _clicked(sp("", id=6, off=(0, 400), ext=(10, 10), paras="", prst="actionButtonForwardNext"),
+                      '<a:hlinkClick r:id="" action="ppaction://hlinkshowjump?jump=nextslide"/>')
+    video = _pic(7, "launch-demo.mp4", "", "rI", 500, '<a:hlinkClick r:id="" action="ppaction://media"/>',
+                 '<a:videoFile r:link="rV"/>')
+    back = sp(paras=f'<a:p>{run_link("back", "rS", "ppaction://hlinksldjump")}</a:p>', id=8, off=(0, 600), ext=(10, 10))
+    d = deck([sp("Links", "title") + pic + box + dash + button + video + back, sp("Second", "title")],
+             srels={1: [("rU", "hyperlink", "https://example.com/regions", True),
+                        ("rD", "hyperlink", "https://example.com/dash", True), ("rS", "slide", "slide2.xml"),
+                        ("rV", "video", "../media/media1.mp4"), ("rI", "image", "../media/i.png")]},
+             extra={"ppt/media/i.png": PNG, "ppt/media/media1.mp4": b"\x00" * 8})
+    out = md(d)
+    assert out.startswith(
+        "## Slide 1: Links\n\n![Map of the regions](assets/img-001.png)\n\n"
+        "[Map of the regions](https://example.com/regions)\n\nSee the comparison (→ Slide 2)\n\n"
+        "[Open the dashboard](https://example.com/dash)\n\nNext button (→ next slide)\n\n"
+        "Video: launch-demo.mp4 (poster below)\n\n![](assets/img-001.png)\n\nback (→ Slide 2)\n\n## Slide 2"), out
 
 
 def main():

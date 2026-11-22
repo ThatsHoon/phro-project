@@ -555,6 +555,8 @@ class _Render:
             head = f"## Query: {title}"
         elif s.kind == "master":
             head = f"## Master page: {title}"
+        elif s.kind == "repeated":
+            head = f"## On {title}"
         elif s.kind == "page" and s.number is not None:
             head = f"## Page {s.number}" + (f": {title}" if title else "")
         elif s.kind == "page" and title:
