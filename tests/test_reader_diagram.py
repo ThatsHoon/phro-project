@@ -651,8 +651,6 @@ def test_budget_cut():
 
 
 def test_group_takes_its_childrens_text():
-    # glue on a textless group: its node is named by the plain text below it, top to bottom in the flow, and those
-    # children leave the flow; a child that is an end itself, or hidden, keeps its own place
     d, _ = new()
     d.shape("G", [])
     d.shape("N", P("Routes"), parent="G")
@@ -666,7 +664,7 @@ def test_group_takes_its_childrens_text():
                    ("k", [])])
     assert lines(out) == ["flowchart TD", '  n1["Routes<br>attr"]', '  n2["B"]', "  n1 --> n2"], out
     assert out[1:] == secret, out
-    d, _ = new()  # a child that is an end is its own node, not the group's name
+    d, _ = new()
     d.shape("G", [])
     d.shape("N", P("N"), parent="G")
     d.shape("B", P("B"))
@@ -677,8 +675,6 @@ def test_group_takes_its_childrens_text():
 
 
 def test_port_resolves_to_named_ancestor():
-    # glue on a textless part of a group (a port), or a loose end landing on it, goes to its nearest ancestor with
-    # text
     d, _ = new()
     d.shape("U", P("User"), box=(0, 0, 10, 10))
     d.shape("P", [], box=(4, 4, 6, 6), parent="U", part=True)
@@ -689,7 +685,7 @@ def test_port_resolves_to_named_ancestor():
     ls = lines(d.place([("U", []), ("P", []), ("Q", []), ("B", []), ("k1", []), ("k2", [])]))
     assert ls == ["flowchart LR", '  n1["User"]', '  n2["B"]', "  n1 --> n2", "  %% inferred from position",
                   "  n2 --> n1"], ls
-    d, _ = new()  # a container never takes a port's glue; a port with no named ancestor stays a blank node
+    d, _ = new()
     d.shape("L", P("Lane"), box=(0, 0, 100, 100), container=True, title="Lane")
     d.shape("P", [], parent="L", part=True)
     d.shape("B", P("B"))
@@ -699,7 +695,6 @@ def test_port_resolves_to_named_ancestor():
 
 
 def test_glue_to_connector_follows_it():
-    # an end glued to another connector joins the shape glued at that connector's end nearest the glue point
     d, ctx = new()
     for k in "ABC":
         d.shape(k, P(k))
@@ -710,7 +705,7 @@ def test_glue_to_connector_follows_it():
     assert ls == ["flowchart TD", '  n1["A"]', '  n2["B"]', '  n3["C"]', "  n1 --> n2", "  n1 --> n3",
                   "  n3 --> n2"], ls
     assert not ctx.skipped, ctx.skipped
-    d, ctx = new()  # a loop of connectors, or a glue point equally near both ends, joins nothing
+    d, ctx = new()
     for k in "AB":
         d.shape(k, P(k))
     d.connector("x", begin="y", end="A", p0=(0, 0), p1=(1, 1))
@@ -720,7 +715,7 @@ def test_glue_to_connector_follows_it():
     out = d.place([("A", P("A")), ("B", P("B")), ("x", []), ("y", []), ("z", []), ("w", P("w"))])
     assert lines(out) == ["flowchart TD", '  n1["A"]', '  n2["B"]', "  n1 --> n2"], out
     assert ctx.skipped == {"connector_loose": 3}, ctx.skipped
-    d, ctx = new()  # glue to a connector with an end on a missing key joins nothing
+    d, ctx = new()
     for k in "AB":
         d.shape(k, P(k))
     d.connector("half", begin="A", end="gone", p0=(0, 0), p1=(9, 9))
@@ -744,8 +739,6 @@ def test_tree_keeps_blank_child():
 
 
 def test_connector_children_label_its_edge():
-    # text shapes inside a connector are its edge's label as start / own text / end, each child at the end it is
-    # nearer along the connector's route, an empty slot kept
     d, _ = new()
     d.shape("A", P("A"))
     d.shape("B", P("B"))
@@ -757,7 +750,7 @@ def test_connector_children_label_its_edge():
     slots = [("A", []), ("B", []), ("k", P("assoc")), ("r", P("-have")), ("m", P("1")), ("n", P("1..*")), ("e", [])]
     out = d.place(slots)
     assert lines(out)[-1] == '  n1 -->|"-have 1 / assoc / 1..*"| n2' and len(out) == 1, out
-    d, _ = new()  # an elbow route: a child near the corner's first leg is at the start, whatever the chord says
+    d, _ = new()
     d.shape("A", P("A"))
     d.shape("B", P("B"))
     d.connector("k", begin="A", end="B", p0=(0, 0), p1=(20, 10), path=[(0, 0), (20, 0), (20, 10)])
@@ -765,7 +758,7 @@ def test_connector_children_label_its_edge():
     d.shape("n", P("1"), box=(20.5, 7.5, 21.5, 8.5), parent="k")
     out = d.place([("A", []), ("B", []), ("k", []), ("r", P("-has")), ("n", P("1"))])
     assert lines(out)[-1] == '  n1 -->|"-has / / 1"| n2' and len(out) == 1, out
-    d, _ = new()  # written end to start: the label reads from the written start too
+    d, _ = new()
     d.shape("A", P("A"))
     d.shape("B", P("B"))
     d.connector("k", begin="A", end="B", p0=(0, 0), p1=(30, 0), arrows=(True, False))
@@ -773,7 +766,7 @@ def test_connector_children_label_its_edge():
     d.shape("n", P("1..*"), box=(27, 1, 29, 2), parent="k")
     out = d.place([("A", []), ("B", []), ("k", []), ("r", P("-have")), ("n", P("1..*"))])
     assert lines(out)[-1] == '  n2 -->|"1..* / / -have"| n1' and len(out) == 1, out
-    d, _ = new()  # past NAME characters: cut with …, the children's blocks follow the diagram
+    d, _ = new()
     d.shape("A", P("A"))
     d.shape("B", P("B"))
     d.connector("k", begin="A", end="B")
@@ -781,6 +774,14 @@ def test_connector_children_label_its_edge():
     out = d.place([("A", []), ("B", []), ("k", []), ("r", P("x" * 90))])
     assert lines(out)[-1] == '  n1 -->|"' + "x" * 80 + '…"| n2', out
     assert out[1:] == [Para([Text("n1 --> n2:")])] + P("x" * 90), out
+    d, _ = new()
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("k", begin="A", end="B", path=[(0, 0), (10, 0)])
+    d.shape("r", P("-has"), box=(1, 1, 2, 2), parent="k")
+    d.shape("m", P("uses"), box=(4, 1, 6, 2), parent="k")
+    out = d.place([("A", []), ("B", []), ("k", []), ("r", P("-has")), ("m", P("uses"))])
+    assert lines(out)[-1] == '  n1 -->|"-has / uses /"| n2', out
 
 
 def test_meaningful_kinds_and_names():
@@ -795,7 +796,7 @@ def test_meaningful_kinds_and_names():
     ls = lines(d.place([("Q", []), ("S", []), ("C", []), ("F", []), ("k1", []), ("k2", []), ("k3", [])]))
     assert ls == ["flowchart TD", '  n1{"ok?"}', '  n2>"Step"]', '  n3@{ shape: comment, label: "note" }',
                   '  n4["Firewall"]', "  n1 --> n2", "  n2 --> n3", "  n3 --> n4"], ls
-    d, _ = new()  # a part of its group goes to the group's text; a named shape that is no part keeps its name
+    d, _ = new()
     d.shape("G", [], name="Group")
     d.shape("T", P("Block"), parent="G")
     d.shape("P", [], parent="G", part=True)
@@ -807,7 +808,6 @@ def test_meaningful_kinds_and_names():
 
 
 def test_own_shapes_in_a_group_keep_their_ends():
-    # textless named icons in a plain group with a title text stay themselves: no self loop on the group
     d, _ = new()
     d.shape("G", [])
     d.shape("T", P("DMZ"), parent="G")
@@ -820,7 +820,7 @@ def test_own_shapes_in_a_group_keep_their_ends():
     assert out[0] == P("DMZ")[0] and lines(out[1:]) == [
         "flowchart TD", '  n1["Firewall"]', '  n2["Web server"]', '  n3["Internet"]', "  n3 --> n1",
         "  n1 --> n2"], out
-    d, _ = new()  # a page-sized group: a textless shape inside stays a blank node, the texts stay in the flow
+    d, _ = new()
     d.shape("BG", [], box=(0, 0, 100, 100))
     d.shape("Title", P("System context"), parent="BG", box=(0, 90, 100, 100))
     d.shape("U", P("User"), parent="BG", box=(0, 0, 10, 10))
@@ -828,7 +828,7 @@ def test_own_shapes_in_a_group_keep_their_ends():
     d.connector("k", begin="U", end="O")
     out = d.place([("BG", []), ("Title", P("System context")), ("U", P("User")), ("O", []), ("k", [])])
     assert out[0] == P("System context")[0] and lines(out[1:]) == ["flowchart TD", '  n1["User"]', "  n1 --> n2"], out
-    d, _ = new()  # a decision in a lane that is a plain group keeps its kind and name
+    d, _ = new()
     d.shape("L", [], box=(0, 0, 100, 20))
     d.shape("LT", P("Finance"), parent="L")
     d.shape("D", [], kind="decision", parent="L", name="Decision")
@@ -836,7 +836,7 @@ def test_own_shapes_in_a_group_keep_their_ends():
     d.connector("k", begin="A", end="D")
     ls = lines(d.place([("L", []), ("LT", P("Finance")), ("D", []), ("A", P("Approve")), ("k", [])]))
     assert ls == ["flowchart TD", '  n1{"Decision"}', '  n2["Approve"]', "  n2 --> n1"], ls
-    d, _ = new()  # a small shape on its group's border is a port, part of the group, named or not
+    d, _ = new()
     d.shape("G", [], box=(0, 0, 10, 10))
     d.shape("T", P("Pump"), parent="G", box=(2, 2, 8, 8))
     d.shape("Q", [], name="Rechteck", parent="G", box=(9.5, 4, 10, 6))
@@ -850,6 +850,25 @@ def test_own_shapes_in_a_group_keep_their_ends():
                         ("k2", []), ("k3", [])]))
     assert ls == ["flowchart LR", '  n1["Pump"]', '  n2["Valve"]', '  n3["Tank"]', "  n1 --> n3", "  n2 --> n3",
                   "  n1 --> n3"], ls
+    d, _ = new()
+    d.shape("G", [], box=(0, 0, 10, 30))
+    d.shape("RK", [], name="Rack", parent="G", box=(0, 0, 10, 30), part=False)
+    d.shape("S1", [], name="Server", parent="G", box=(0, 20, 10, 25), part=False)
+    d.shape("S2", [], name="Storage", parent="G", box=(0, 5, 10, 10), part=False)
+    d.shape("SW", P("Switch"), box=(30, 10, 40, 20))
+    d.connector("k1", begin="SW", end="S1")
+    d.connector("k2", begin="SW", end="S2")
+    out = d.place([("G", []), ("RK", []), ("S1", []), ("S2", []), ("SW", P("Switch")), ("k1", []), ("k2", [])])
+    items = [(b.level, b.inlines[0].text) for b in out if isinstance(b, ListItem)]
+    assert len(out) == 3 and items == [(0, "Switch"), (1, "Server"), (1, "Storage")], out
+    d, _ = new()
+    d.shape("G", [], box=(0, 0, 10, 10))
+    d.shape("T", P("DMZ"), parent="G", box=(2, 8, 8, 9))
+    d.shape("F", [], name="Firewall", parent="G", box=(0, 4, 1, 5), part=False)
+    d.shape("X", P("Internet"), box=(-20, 4, -18, 5))
+    d.connector("k", begin="X", end="F")
+    out = d.place([("G", []), ("T", P("DMZ")), ("F", []), ("X", P("Internet")), ("k", [])])
+    assert out[0] == P("DMZ")[0] and lines(out[1:])[1:] == ['  n1["Firewall"]', '  n2["Internet"]', "  n2 --> n1"], out
 
 
 def test_shape_data_never_makes_the_label():
@@ -868,8 +887,6 @@ def test_shape_data_never_makes_the_label():
 
 
 def test_floating_text_on_a_path_labels_its_edge():
-    # a one-line text box lying on a connector's route (within its own height, nearer that route than any other)
-    # is that edge's label; a text further off, or inside an end's box, stays in the flow
     d, _ = new()
     d.shape("A", P("A"), box=(0, 0, 2, 6))
     d.shape("B", P("B"), box=(10, 0, 12, 6))

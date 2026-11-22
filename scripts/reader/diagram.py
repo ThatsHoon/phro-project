@@ -32,9 +32,9 @@ numbers, escapes, orients and renders, and builds model blocks only.
   its first line cut at NAME plus `…` (or `(picture)`, `(table)`, `(chart)`, `(content)`), and its blocks follow the
   diagram after a `nK:` paragraph, and so does its `data` (Shape Data, never its label). A shape may name its
   group (`parent`). An end on a shape with no text and no text below it that is a part of its group moves up to the
-  group, and on while each is a part of its own, stopping at the first with text or text below: a part is flagged
-  `part` by its reader, or lies inside its group's box and either spans its full width or height or touches its
-  border at most PORT of its area. Never through a hidden shape, a container or a connector, at most
+  group, and on while each is a part of its own, stopping at the first with text or text below. The reader's
+  `part` verdict is final; with none, a part lies inside its group's box and either spans its full width or height
+  or touches its border at most PORT of its area. Never through a hidden shape, a container or a connector, at most
   `limits.MAX_DEPTH` up (text below counts only from shapes that are not edge ends). A textless node is labelled by
   the plain text of the shapes below it (not hidden, not containers, not ends, nor under one), in slot order, and
   those shapes leave the flow; else by its name. A hidden shape, or one left with no label, is a blank node; a hidden
@@ -64,9 +64,9 @@ NAME = 80             # characters of a shape's text that go into its node whole
 INFER_TOL = 0.02      # of the scope diagonal: how far a loose end may lie from the box it snaps to
 INFER_SHAPES = 2_000  # shapes a scope may have and still get its loose ends inferred
 COORD = 1e9           # a coordinate past this, in absolute value, makes the box unknown
-PORT = 0.125          # of its parent's box area: a shape at most this big touching the parent's border is a port
-PATH = 256            # points of a connector's route kept
-FLOAT_WORK = 4_000_000  # (text box, route segment) pairs one scope may measure for floating edge labels
+PORT = 0.125
+PATH = 256
+FLOAT_WORK = 4_000_000
 
 _NEWLINE = re.compile(r"\r\n|\r|\n")
 _KINDS = {"": ("[", "]"), "decision": ("{", "}"), "terminator": ("([", "])"), "circle": ("((", "))"),
@@ -109,7 +109,7 @@ class _Connector:
         self.begin, self.end, self.p0, self.p1 = begin, end, p0, p1
         self.arrows, self.label, self.line, self.hidden = arrows, label, line, hidden
         self.follow = follow  # the blocks that follow the diagram when it is an edge, or None
-        self.path = path      # its route's points on the page, begin to end, or None
+        self.path = path
 
 
 def _copy(c, **changes):
@@ -291,7 +291,7 @@ def _side(c, box) -> int:
     at, total = _along(c.path, _centre(box))
     if total <= 0:
         return 1
-    return 0 if 2 * at <= total else 2
+    return 0 if 2 * at < total else 2 if 2 * at > total else 1
 
 
 def _seg_point(a, b, p) -> float:
@@ -328,14 +328,16 @@ class Diagram:
         self.connectors: dict = {}  # key -> _Connector, in connector() order
 
     def shape(self, key, blocks: list, kind: str = "", box=None, hidden: bool = False, container: bool = False,
-              title: str = "", parent=None, name: str = "", part: bool = False, data=()) -> None:
-        """`parent` is the key of the group the shape sits in, and `part` says the shape is a piece of it (a master
-        shape's sub-shape); `name` stands for its text when it has none; `data` are blocks of its slot that describe
+              title: str = "", parent=None, name: str = "", part=None, data=()) -> None:
+        """`parent` is the key of the group the shape sits in, and `part` is the reader's verdict on whether the shape
+        is a piece of it (True for a master shape's sub-shape, False for an instance of its own master), None when the
+        reader cannot tell; `name` stands for its text when it has none; `data` are blocks of its slot that describe
         it (Shape Data) and never make its label."""
         if key in self.shapes:
             return
         self.shapes[key] = _Shape(blocks, kind if kind in _KINDS else "", _box(box), bool(hidden), bool(container),
-                                  (title or "").strip(), parent, " ".join((name or "").split())[:NAME], bool(part),
+                                  (title or "").strip(), parent, " ".join((name or "").split())[:NAME],
+                                  None if part is None else bool(part),
                                   list(data))
 
     def connector(self, key, begin=None, end=None, p0=None, p1=None, arrows=(None, None), label: str = "",
@@ -385,8 +387,8 @@ class Diagram:
 
     def _part(self, key) -> bool:
         s = self.shapes[key]
-        if s.part:
-            return True
+        if s.part is not None:
+            return s.part
         p = self.shapes.get(s.parent)
         if s.box is None or p is None or p.box is None:
             return False

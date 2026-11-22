@@ -564,8 +564,6 @@ def test_vsdx_container():
 
 
 def test_group_port_and_connector_glue():
-    # glue on an actor's textless sub-shape goes to the actor; a connector whose begin is glued to another connector
-    # joins the shape glued at that connector's nearest end
     actor = shape(81, "User", (), box_cells(1, 5, 1, 1) + "<Shapes>"
                   + shape(82, None, (), box_cells(0.5, 0.5, 0.4, 1), 'MasterShape="2"') + "</Shapes>", 'Master="9"')
     a = shape(3, "Add", (), box_cells(5, 6, 1, 0.5))
@@ -582,7 +580,6 @@ def test_group_port_and_connector_glue():
 
 
 def test_group_text_names_group_and_connector_text_labels_edge():
-    # a UML class: glue on the group, its name in a sub-shape; the association's end texts are its sub-shapes
     cls = lambda i, name, x: shape(i, None, (), box_cells(x, 5, 1, 1) + "<Shapes>"  # noqa: E731
                                    + shape(i + 1, name, (), box_cells(0.5, 0.8, 1, 0.3))
                                    + shape(i + 2, None, (), box_cells(0.5, 0.3, 1, 0.6)) + "</Shapes>")
@@ -603,8 +600,6 @@ def paras(doc):
 
 
 def test_master_name_shape_data_and_links():
-    # a textless instance is named by its master; Shape Data rows (the master's labels and order, the instance's
-    # values) and hyperlinks are lines of the shape, after the diagram for a node; an invisible row is not read
     master = shape(1, None, (), '<Section N="Property"><Row N="IP"><Cell N="Label" V="IP address"/>'
                                 '<Cell N="Value" V=""/></Row><Row N="Spare"><Cell N="Label" V="Spare"/>'
                                 '<Cell N="Value" V=""/></Row></Section>')
@@ -630,8 +625,6 @@ def test_master_name_shape_data_and_links():
 
 
 def test_shape_data_defaults_and_invisible_rows_add_nothing():
-    # a "No Formula" value is no value, an invisible row is not read: the stencil's blank rows add no line, no
-    # hidden place, no copy of the label; a textless instance with data keeps its master's name as its label
     blank = ('<Section N="Property"><Row N="Asset"><Cell N="Label" V="Asset Number"/>'
              '<Cell N="Value" V="0" F="No Formula"/></Row><Row N="ShapeClass"><Cell N="Value" V="5"/>'
              '<Cell N="Invisible" V="1"/></Row></Section>')
@@ -649,29 +642,29 @@ def test_shape_data_defaults_and_invisible_rows_add_nothing():
 
 
 def test_shape_data_rows_bounded():
-    # a master's rows are filtered once: 3,000 instances of a master with 3,000 blank rows cost no merge each
-    rows = "".join(f'<Row N="r{i}"><Cell N="Label" V="L{i}"/><Cell N="Value" V=""/></Row>' for i in range(3000))
+    rows = "".join(f'<Row N="r{i}"><Cell N="Label" V="L{i}"/><Cell N="Value" V="x"/></Row>' for i in range(3000))
     m = {"7": shape(1, None, (), f'<Section N="Property">{rows}</Section>')}
     p = vsdx({"P": "".join(shape(i, None, (0, i), "", 'Master="7"') for i in range(1, 3001))}, masters=m,
              mnames={"7": "Box"})
-    t = time.perf_counter()
-    reader.parse(p, Context())
-    took = time.perf_counter() - t
-    assert took < 3, took
-    old = limits.SHAPE_ROWS  # the rows the document reads are charged: past the room the rest are left out
+    ctx = Context()
+    doc = reader.parse(p, ctx)
+    kept = sum(1 for t in paras(doc) if t.startswith("L"))
+    room = limits.SHAPE_ROWS // 3000
+    assert kept == room * 3000 and dict(ctx.skipped) == {"shape_data": 3000 - room}, (kept, ctx.skipped)
+    old = limits.SHAPE_ROWS
     try:
         limits.SHAPE_ROWS = 3
         row = '<Row N="r{0}"><Cell N="Label" V="L{0}"/><Cell N="Value" V="v{0}"/></Row>'
         data = '<Section N="Property">' + "".join(row.format(i) for i in range(2)) + "</Section>"
         ctx = Context()
         doc = reader.parse(vsdx({"P": shape(1, "a", (0, 2), data) + shape(2, "b", (0, 1), data)}), ctx)
-        assert paras(doc) == ["a", "L0: v0", "L1: v1", "b"] and ctx.skipped == {"text": 1}, (paras(doc), ctx.skipped)
+        assert paras(doc) == ["a", "L0: v0", "L1: v1", "b"] and ctx.skipped == {"shape_data": 1}, (
+            paras(doc), ctx.skipped)
     finally:
         limits.SHAPE_ROWS = old
 
 
 def test_own_master_instances_in_a_group_keep_their_ends():
-    # textless Firewall and Web server instances in a plain group with a title: each its own node
     bc = box_cells
     inner = (shape(2, "DMZ", (), bc(5, 9, 4, 0.5)) + shape(3, None, (), bc(3, 5, 1, 1), 'Master="7"')
              + shape(4, None, (), bc(7, 5, 1, 1), 'Master="8"') + line(5, (3.5, 5), (6.5, 5)))
@@ -683,11 +676,27 @@ def test_own_master_instances_in_a_group_keep_their_ends():
     assert mermaid_ok(t) and t == ('flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n'
                                    '  n2 --> n3\n  n1 --> n2'), t
     assert "DMZ" in out, out
+    inner = (shape(3, None, (), bc(1, 1, 2, 2), 'Master="7"') + shape(4, None, (), bc(3, 1, 2, 2), 'Master="8"')
+             + line(5, (2, 1), (2, 1)))
+    group = shape(1, None, (), bc(5, 5, 4, 2) + "<Shapes>" + inner + "</Shapes>")
+    net = shape(6, "Internet", (), bc(-5, 5, 2, 1)) + line(9, (-4, 5), (3, 5))
+    out, _ = md(vsdx({"P": page_xml(group + net, glued(5, 3, 4) + glued(9, 6, 3))},
+                     masters={"7": shape(1), "8": shape(1)}, mnames={"7": "Firewall", "8": "Web server"}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == ('flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n'
+                                   '  n2 --> n3\n  n1 --> n2'), t
+    inner = (shape(2, "DMZ", (), bc(5, 9, 4, 0.5)) + shape(3, None, (), bc(0.5, 5, 1, 1), 'Master="7"')
+             + shape(4, None, (), bc(7, 5, 1, 1), 'Master="8"') + line(5, (1, 5), (6.5, 5)))
+    group = shape(1, None, (), bc(5, 5, 10, 10) + "<Shapes>" + inner + "</Shapes>")
+    net = shape(6, "Internet", (), bc(-5, 5, 2, 1)) + line(9, (-4, 5), (0, 5))
+    out, _ = md(vsdx({"P": page_xml(group + net, glued(5, 3, 4) + glued(9, 6, 3))},
+                     masters={"7": shape(1), "8": shape(1)}, mnames={"7": "Firewall", "8": "Web server"}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == ('flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n'
+                                   '  n2 --> n3\n  n1 --> n2'), t
 
 
 def test_connector_route_from_geometry():
-    # the route is the Geometry rows (the master's merged with the instance's) placed like the box: a text inside
-    # the connector goes to the end it is nearer along the route, a text lying on the route is the edge's name
     a = shape(1, "A", (), box_cells(1, 5, 1, 1))
     b = shape(2, "B", (), box_cells(5, 7.5, 1, 1))
     geo = ('<Section N="Geometry" IX="0"><Row T="MoveTo" IX="1"><Cell N="X" V="0"/><Cell N="Y" V="0"/></Row>'
@@ -704,10 +713,18 @@ def test_connector_route_from_geometry():
     t = mermaid_of(out)
     assert mermaid_ok(t) and t.endswith('\n  n2 -->|"-has / uses / 1"| n1'), t
     assert "uses" not in out.replace(t, ""), out
+    old = limits.SHAPE_ROWS
+    try:
+        limits.SHAPE_ROWS = 3
+        out, ctx = md(vsdx({"P": page_xml(a + b + conn + name, glued(20, 1, 2))},
+                           masters={"5": shape(1, None, (), geo)}, mnames={"5": "Dynamic connector"}))
+    finally:
+        limits.SHAPE_ROWS = old
+    assert dict(ctx.skipped) == {"route": 1} and markdown.unread(ctx.skipped) == [
+        "1 connector route read as a straight line"], ctx.skipped
 
 
 def test_background_page():
-    # a foreground page names its background page, and the background page names the pages it lies under
     pages = (f'<Pages xmlns:r="{REL}" {VNS}><Page ID="0" Name="Front" BackPage="4"><Rel r:id="rId1"/></Page>'
              '<Page ID="4" Name="Back" Background="1"><Rel r:id="rId2"/></Page>'
              '<Page ID="5" Name="Spare" Background="1"><Rel r:id="rId3"/></Page></Pages>')

@@ -24,8 +24,9 @@ cells in INHERITED its master shape's when it has none (each master shape's cell
 - **Kinds** from the NameU masters.xml gives the shape's own Master, else the shape's NameU, case-folded.
 - **Containers**: a User row msvStructureType whose Value is Container, the shape's own else its master shape's; its
   shown text is the subgraph title.
-- **Groups**: a sub-shape is registered with its group's key as its parent, and as a part of it when it names a
-  MasterShape and no Master of its own; a shape with its own Master is named by that master's NameU less a trailing
+- **Groups**: a sub-shape is registered with its group's key as its parent, as a part of it when it names a
+  MasterShape and no Master of its own, and as no part when it names its own Master (with neither, no verdict); a
+  shape with its own Master is named by that master's NameU less a trailing
   `.<digits>` copy number (what stands for it with no text).
 - **Routes**: a connector's Geometry rows (merged as Shape Data is) of the vertex types, in IX order, Rel rows scaled
   by Width and Height, placed as its box is placed, are its route.
@@ -35,7 +36,8 @@ cells in INHERITED its master shape's when it has none (each master shape's cell
   value and an Invisible row is not read. The lines follow the shape's text and picture in its slot and are its
   `data` in the diagram, never its label; each is charged as shape text. A master shape's rows are read once; the
   rows a shape takes and its own count against `limits.SHAPE_ROWS` a document, past which the shape's rows are not
-  read (counted `text` once for it).
+  read (counted `shape_data` once for it), and a connector whose Geometry rows are not read is routed by its
+  chord (counted `route`).
 - **Background pages**: a page whose BackPage names a Background page's ID begins with `Background page: <name>`; a
   background page begins with `Background of: <names>`, or `Background page` when none names it.
 """
@@ -62,7 +64,7 @@ CELLS = ("PinX", "PinY", "LocPinX", "LocPinY", "HideText", "Width", "Height", "A
 INHERITED = ("LocPinX", "LocPinY", "Width", "Height", "Angle", "FlipX", "FlipY", "BeginX", "BeginY", "EndX", "EndY",
              "BeginArrow", "EndArrow")
 ARROWS = ("BeginArrow", "EndArrow")
-_SUFFIX = re.compile(r"\.\d+$")  # Visio's copy number on a repeated master name ("Pipe flow arrow.10")
+_SUFFIX = re.compile(r"\.\d+$")
 _VERTICES = frozenset(("MoveTo", "LineTo", "ArcTo", "EllipticalArcTo", "PolylineTo", "NURBSTo", "SplineStart",
                        "SplineKnot", "RelMoveTo", "RelLineTo", "RelCubBezTo", "RelQuadBezTo", "RelEllipticalArcTo"))
 _KINDS = (("decision", "decision"), ("start/end", "terminator"), ("terminator", "terminator"), ("circle", "circle"),
@@ -290,9 +292,9 @@ class _Reader:
         self.master_names = {}    # Master ID -> its NameU in masters.xml
         self.masters = {}         # master part -> ({shape ID: element}, first top-level shape), or None: unreadable
         self.shapes = {}          # master shape element -> (text, hides it), so a shared shape is read once
-        self.mcells = {}          # master shape element -> (cells, structure type, LineStyle)
-        self.mrows = {}           # (master shape element, section) -> ({row key: (order, cells)}, shown rows)
-        self.rows_left = limits.SHAPE_ROWS  # Shape Data, hyperlink and Geometry rows the document may still read
+        self.mcells = {}
+        self.mrows = {}
+        self.rows_left = limits.SHAPE_ROWS
         self.style_index = None   # StyleSheet ID -> ({arrow cell: V}, its LineStyle), read on first use
         self.style_arrows = {}    # (StyleSheet ID, arrow cell) -> its value up the chain
         self.room = limits.MAX_OUTPUT  # shape text the document may still emit, copies counted (see `spend`)
@@ -418,7 +420,7 @@ class _Reader:
         m_cells, m_struct, m_style = self.master_cells(mel)
         props, links = self.merged(mel, el, "Property"), self.merged(mel, el, "Hyperlink")
         if props is None or links is None:
-            self.ctx.skipped["text"] += 1
+            self.ctx.skipped["shape_data"] += 1
         data = [Para([Text(line)]) for line in _data(props or [], links or []) if self.spend(line, "text")]
         blocks.extend(self.picture(el))
         c = dict(own_cells)
@@ -435,6 +437,8 @@ class _Reader:
             style = style if style is not None else m_style
             arrows = tuple(self.arrow(n, own_cells, m_cells, style) for n in ARROWS)
             rows = self.merged(mel, el, "Geometry")
+            if rows is None:
+                self.ctx.skipped["route"] += 1
             self.dia.connector(key, begin, end, _end(c, "Begin", dx, dy), _end(c, "End", dx, dy), arrows,
                                blocks=[] if hidden and text else blocks, path=_route(rows or [], c, dx, dy),
                                data=data)
@@ -446,7 +450,8 @@ class _Reader:
             struct = _structure(el)
             struct = struct if struct is not None else m_struct
             container = (struct or "").strip().strip('"').strip().casefold() == "container"
-            part = own is None and master is not None and attr(el, "MasterShape") is not None
+            part = (False if own is not None
+                    else True if master is not None and attr(el, "MasterShape") is not None else None)
             self.dia.shape(key, blocks, kind, _box(c, dx, dy), hidden and bool(text), container,
                            text if container and not hidden else "", parent, mname, part, data)
         out.append((sort, slot, blocks + data))

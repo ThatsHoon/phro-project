@@ -48,9 +48,7 @@ IMAGE_BYTES = 256 * 2**20
 # 600 bytes. A real document has thousands at most (a thousand-page form with ten tables a page has ten thousand);
 # ten times that is past any, and holds the tables to about 60 MB and a second or two of parse and render
 TABLE_NODES = 100_000
-# Shape Data, hyperlink and Geometry rows one vsdx document may read, a master shape's rows counted for each shape
-# that takes them
-SHAPE_ROWS = 1_000_000
+SHAPE_ROWS = 100_000
 SMARTART_NODES = 5_000  # SmartArt text items one document may emit, copies counted; one data part reads at most four times as many points and connections
 # metafile pictures (WMF, EMF, PICT, WPG, TIFF): each cap is read at call time
 FIGURE_CHARS = 20_000      # figure text per picture

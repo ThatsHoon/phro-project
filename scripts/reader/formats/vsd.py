@@ -100,8 +100,8 @@ bounded after the turn by Angle about the pin, plus its group's origin (no pin o
 parent. A shape naming a master page whose group is not of that master page is named by the stencil page's name
 (libvisio's `_nameFromId` at the stencil page's level + 1, read when the page is entered) less a trailing
 `.<digits>` copy number, and its kind is that name's, as vsdx finds it; a shape naming its group's master page is a
-part of the group. vsd has no containers (the User section is not read). A connector's route is the end points of its
-own first geometry section's rows (0x8A MoveTo, 0x8B LineTo, 0x8C ArcTo, 0x90 EllipticalArcTo, 0xA5 SplineStart,
+part of the group, and of any other shape vsd gives no verdict. vsd has no containers (the User section is not
+read). A connector's route is the end points of its own first geometry section's rows (0x8A MoveTo, 0x8B LineTo, 0x8C ArcTo, 0x90 EllipticalArcTo, 0xA5 SplineStart,
 0xA6 SplineKnot, 0xC1 PolylineTo, 0xC3 NURBSTo: X at 1, Y at 10; a later 0x89 Geometry ends it), placed as its box
 is placed. Diagram
 data never fails a page: registration and `place` run under `ctx.guard("shape")`, a failed `place` leaving the flow
@@ -342,7 +342,7 @@ class _Shape:
         self.hide = False
         self.begin = self.end = None  # glued ends (readMisc)
         self.runs = None      # 8-bit text's runs: [(count, codec)]
-        self.path = []        # its first geometry section's vertices, shape-local
+        self.path = []
         self.path_done = False
 
 
@@ -732,7 +732,7 @@ class _Reader:
         if it.conn is None:
             dia.shape(key, it.blocks, vsdx._kind(it.name), _bound(it.pin, it.geo, ox, oy),
                       it.hidden and bool(it.text), parent=None if it.parent in (0, NONE) else it.parent, name=it.name,
-                      part=it.part)
+                      part=True if it.part else None)
             return
         begin, end, arrows = it.conn
         bx, by, ex, ey = it.ends or (None, None, None, None)

@@ -924,8 +924,6 @@ def test_background_page():
                                                                    ("Back", ["Background page", "b"], "")]
     doc, _ = read(vsd_document(11, [{"shapes": [{"text": "x"}], "background": True}]))
     assert lines(doc.blocks[0]) == ["Background page", "x"]
-    # readPage: a page's background page by its pointer index, named on both pages; itself or a page that is not a
-    # background is none
     for version in (11, 6, 5):
         pages = [{"name": "Front", "shapes": [{"text": "f"}], "back": 1},
                  {"name": "Back", "background": True, "shapes": [{"text": "b"}], "back": 1},
@@ -937,8 +935,6 @@ def test_background_page():
 
 
 def test_group_and_connector_texts():
-    # glue on a textless group (a UML class): its node is named by the text inside it; the texts inside the
-    # connector are its edge's label, those near its begin first; none of them stays in the flow
     for version in (11, 6):
         shapes = [{"id": 1, "type": 0x47, "pin": (1.0, 5.0)},
                   {"id": 2, "parent": 1, "text": "Routes", "pin": (0.0, 0.5)},
@@ -960,8 +956,6 @@ def point(x, y):
 
 
 def test_connector_route_from_geometry():
-    # the connector's route is its geometry chunks placed like its box: a text inside it goes to the end it is
-    # nearer along the route, a text lying on the route is the edge's name
     route = [(0x89, bytes(16)), (0x8A, point(0.0, 0.0)), (0x8B, point(3.0, 0.0)), (0x8B, point(3.0, 2.0)),
              (0x89, bytes(16)), (0x8B, point(9.0, 9.0))]
     for version in (11, 6):
@@ -979,8 +973,6 @@ def test_connector_route_from_geometry():
 
 
 def test_own_master_instances_in_a_group_keep_their_ends():
-    # instances of other masters inside a plain group with a title text are their own nodes, named by their masters
-    # (less Visio's copy number); glue on them does not climb to the group
     stencils = [[{"id": 1, "pin": (0.0, 0.0)}], [{"id": 1, "pin": (0.0, 0.0)}]]
     for version in (11, 6):
         shapes = [{"id": 1, "type": 0x47, "pin": (5.0, 5.0, 5.0, 5.0, 10.0, 10.0)},
@@ -998,9 +990,6 @@ def test_own_master_instances_in_a_group_keep_their_ends():
 
 
 def test_master_names_and_kinds():
-    # a shape of a master is named by its stencil page when it has no text, and a name that says decision (or
-    # terminator, circle, database, callout, chevron) is its kind; a master's sub-shape takes no name, so glue on it
-    # goes to its named group
     stencils = [[{"id": 1, "pin": (0.0, 0.0)}], [{"id": 1, "pin": (0.0, 0.0)}],
                 [{"id": 1, "type": 0x47, "pin": (0.0, 0.0)}, {"id": 2, "parent": 1, "pin": (0.0, 0.0)}]]
     for version in (11, 6):
