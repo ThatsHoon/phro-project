@@ -2433,6 +2433,68 @@ def test_reexec_has_a_timeout():
     assert len(seen) == 1 and 25 < seen[0] <= 30, seen
 
 
+def _crowded(pdf):
+    """The meta of a long output with every clause the context can carry: images, hidden places, a time cut, a
+    garble warning, unread parts and, for pdf, unrendered and vector-figure pages and pages past the cut."""
+    from reader import limits
+    meta = _pdf_meta(pages=290, per=37, pages_total=384, images=84, hidden=3, partial=True,
+                     ocr={"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 61},
+                     warnings=["garbled", limits.OCR_LATE, limits.FIGURES_LATE],
+                     unread=["9 vector figures not shown", "2 charts", "1 embedded object"],
+                     unrendered=list(range(63, 290, 7)), figures=list(range(5, 290, 11)))
+    if not pdf:
+        for key in ("pages", "pages_total", "unrendered", "figures"):
+            meta.pop(key)
+        meta["headings"] = [[37 * i + 1, f"Chapter {i}: " + "a long chapter title " * 3] for i in range(290)]
+    return meta
+
+
+def test_context_never_passes_its_cap():
+    """Whatever the cache root's and the file name's length, the context stays under CONTEXT_MAX and keeps the
+    window and time-cut sentences and the pages past the cut; with an entry folder of up to 164 characters (the
+    default root's is 92) an index that shrinks instead of vanishing too, with index.md named when it was
+    written."""
+    window = " Lines 1-1666 of 10730; continue with offset=1667."
+    usual = 92
+    if len(str(tmp())) + 45 > usual:
+        print(f"skip: the usual entry length in test_context_never_passes_its_cap (temp folder {len(str(tmp()))} long)")
+    for pdf in (True, False):
+        ext = "pdf" if pdf else "epub"
+        for folder in (usual, usual + 72):
+            for name in (f"a.{ext}", "x" * 76 + f".{ext}"):
+                for offer in ("", gate.offer_text("v" * 60) if pdf else gate.IMAGE_OFFER.format(
+                        k=3, read_py=gate.READ_PY, dir="v" * 60)):
+                    base = tmp()
+                    md = base / ("r" * max(1, folder - len(str(base)) - 45)) / "48" / ("k" * 40) / "out.md"
+                    md.parent.mkdir(parents=True)
+                    root_len = len(str(md.parent))
+                    md.write_text("x\n", encoding="utf-8")
+                    c = gate._context(name, _crowded(pdf), md, offer=offer, window=window)
+                    case = (pdf, root_len, len(name), bool(offer), len(c))
+                    assert len(c) < gate.CONTEXT_MAX, (case, c)
+                    assert c.endswith(window + " Warning: the text may be garbled."), (case, c)
+                    assert " Cut by the time limit: 61 pictures not read by OCR" in c, (case, c)
+                    assert not pdf or ' are past the cut; Read the pdf with pages="291-310"' in c, (case, c)
+                    kind = "Pages" if pdf else "Sections"
+                    sample = kind + " at lines (all in index.md next to that assets folder): 1"
+                    pointer = kind + " at lines: index.md next to that assets folder."
+                    assert (md.parent / "index.md").is_file() == (sample in c or pointer in c), (case, c)
+                    assert root_len > usual + 72 or sample in c or pointer in c, (case, c)
+                    if root_len <= usual and len(name) < 10:
+                        meta = _crowded(pdf)
+                        for key in ("unread", "figures"):
+                            meta.pop(key, None)
+                        c = gate._context(name, meta, md, offer=offer, window=window)
+                        assert (sample in c or pointer in c) and len(c) < gate.CONTEXT_MAX, (case, c)
+    for root_len in (150, 400):
+        md = tmp().joinpath(*["r" * 49] * (root_len // 50)) / "out.md"
+        md.parent.mkdir(parents=True)
+        md.write_text("x\n", encoding="utf-8")
+        c = gate._context("x" * 400 + ".pdf", _crowded(True), md, offer=gate.offer_text("v" * 60), window=window)
+        assert len(c) < gate.CONTEXT_MAX and c.endswith(window + " Warning: the text may be garbled."), (len(c), c)
+        assert ' are past the cut; Read the pdf with pages="291-310"' in c, c
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

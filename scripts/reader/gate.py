@@ -313,11 +313,13 @@ def _write_index(target, head, lines):
         return target.is_file()
 
 
-def _index(meta, out_md, pdf, used, beside_assets=False):
-    """The index the context gives a long output: for pdf ` Pages at lines: page:line, …`, for the rest ` Sections
-    at lines: line title; …` (titles cut to INDEX_TITLE). Whole when it fits beside `used` characters; else every
-    k-th entry for the smallest k that fits, and the whole index in index.md beside out.md, named in the prefix
-    by its path, or as next to the assets folder when the context already gave that folder's path."""
+def _index(meta, out_md, pdf, beside_assets=False):
+    """(fit, floor) for the index the context gives a long output: for pdf ` Pages at lines: page:line, …`, for the
+    rest ` Sections at lines: line title; …` (titles cut to INDEX_TITLE). fit(room) is the whole index when it fits
+    in room; else every k-th entry for the smallest k that fits, and the whole index in index.md beside out.md,
+    named in the prefix by its path, or as next to the assets folder when the context already gave that folder's
+    path; else, index.md written, only the sentence naming it. floor is the room the whole index or that sentence
+    takes, the least the context keeps for it; (None, 0) when there is no index."""
     if pdf:
         name, sep, head = " Pages at lines", ", ", "Pages of out.md, as page:line"
         entries = full = [f"{p}:{line}" for p, line in page_index(meta)]
@@ -327,14 +329,21 @@ def _index(meta, out_md, pdf, used, beside_assets=False):
         entries = [f"{line} {t[:INDEX_TITLE].strip().replace(';', ',')}" for line, t in heads]
         full = [f"{line} {t}" for line, t in heads]
     if not entries:
-        return ""
-    room = CONTEXT_MAX - 1 - used
-    text, k = _sample(name + ": ", entries, sep, room)
+        return None, 0
     target = out_md.parent / "index.md"
-    if k == 1 or not _write_index(target, head, full):
-        return text
     where = "index.md next to that assets folder" if beside_assets else str(target)
-    return _sample(f"{name} (all in {where}): ", entries, sep, room)[0]
+    prefix = f"{name} (all in {where}): "
+    whole = name + ": " + sep.join(entries)
+
+    def fit(room):
+        if len(whole) <= room:
+            return whole
+        if not _write_index(target, head, full):
+            return _sample(name + ": ", entries, sep, room)[0]
+        text = _sample(prefix, entries, sep, room)[0]
+        return text or (pointer if len(pointer) <= room else "")
+    pointer = f"{name}: {where}."
+    return fit, min(len(whole), len(pointer))
 
 
 def _window(meta, ti):
@@ -364,35 +373,37 @@ def _count(v):
     return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
 
 
-def _past_cut(meta, upto=None):
+def _past_cut(meta, upto=None, short=False):
     """The sentence naming the pages after the page index's last one, up to `upto` (the pdf's last page when None),
-    and the pages= read that converts them; "" when there are none."""
+    and the pages= read that converts them, in fewer words when `short`; "" when there are none."""
     end = _count(meta.get("pages_total") if upto is None else upto)
     a = max((p for p, _ in page_index(meta)), default=0) + 1
     if a > end:
         return ""
     if a == end:
-        return f' Page {a} is past the cut; Read the pdf with pages="{a}" to read it.'
+        return f' Page {a} is past the cut; Read the pdf with pages="{a}"' + ("." if short else " to read it.")
     if end - a < SUGGEST_PAGES:
-        return f' Pages {a}-{end} are past the cut; Read the pdf with pages="{a}-{end}" to read them.'
-    return (f' Pages {a}-{end} are past the cut; Read the pdf with pages="{a}-{a + SUGGEST_PAGES - 1}", then the next'
-            f' {SUGGEST_PAGES} pages and so on, to read them.')
+        return (f' Pages {a}-{end} are past the cut; Read the pdf with pages="{a}-{end}"'
+                + ("." if short else " to read them."))
+    first = f' Pages {a}-{end} are past the cut; Read the pdf with pages="{a}-{a + SUGGEST_PAGES - 1}", then the next'
+    return first + (f" {SUGGEST_PAGES}." if short else f" {SUGGEST_PAGES} pages and so on, to read them.")
 
 
-def _time_cut(meta):
-    """What the deadline left out of a partial entry, one item each."""
+def _time_cut(meta, short=False):
+    """The sentence saying what the deadline left out of a partial entry, in fewer words when `short`; "" when
+    the entry is whole."""
     if meta.get("partial") is not True:
-        return []
+        return ""
     ocr = meta.get("ocr") if isinstance(meta.get("ocr"), dict) else {}
     items = []
     if at := _count(ocr.get("stopped_at")):
-        items.append(f"OCR stopped at page {at} (later scanned pages are linked as images)")
+        items.append(f"OCR stopped at page {at}" + ("" if short else " (later scanned pages are linked as images)"))
     if k := _count(ocr.get("pictures_left")):
-        items.append(f"{k} picture not read by OCR (Read it to view)" if k == 1
-                     else f"{k} pictures not read by OCR (Read them to view)")
+        items.append(f"{k} picture{'' if k == 1 else 's'} not read by OCR"
+                     + ("" if short else " (Read it to view)" if k == 1 else " (Read them to view)"))
     if limits.FIGURES_LATE in (meta.get("warnings") or []):
-        items.append("some figures not drawn (their text is included)")
-    return items
+        items.append("some figures not drawn" + ("" if short else " (their text is included)"))
+    return " Cut by the time limit: " + ", ".join(items) + "." if items else ""
 
 
 def _head(name, meta, assets):
@@ -409,46 +420,21 @@ def _head(name, meta, assets):
 
 
 def _context(name, meta, out_md, *, past_end="", offer="", upto=None, window=""):
-    """additionalContext for an allow, fitted under CONTEXT_MAX: for pdf, the head, PDF_HINT, the past-the-end
-    sentence, the offer (whole or not at all), the unrendered and figure pages, the unread list and the page index;
-    for the rest, the head, the edit hint, the image offer (whole or not at all), the unread list and the heading
-    index. Then, always given room: what the time cut, for pdf the pages past the cut (up to `upto`, the end of a
-    range read) and the read that gets them, the `window` sentence and the garble warning. The head names the
-    assets folder by its absolute path: the Read result does not show out.md's."""
+    """additionalContext for an allow, never past CONTEXT_MAX - 1 characters. Room goes first to the head (the file
+    name cut short when it must), what the time cut, for pdf the pages past the cut (up to `upto`, the end of a
+    range read) and the read that gets them, the `window` sentence, the garble warning, and the floor of a long
+    output's index; then, for pdf, the past-the-end sentence, PDF_HINT, the offer (whole or not at all), the
+    unrendered and figure pages, and for the rest the edit hint and the image offer (whole or not at all); then
+    the unread list; the index takes what is left. They read head, hint, past-the-end, offer, pages, unread, index,
+    then the time cut and the rest. The head names the assets folder by its absolute path: the Read result does
+    not show out.md's."""
     pdf = reader.ext_of(name) == "pdf"
-    head = _head(name, meta, f"{out_md.parent / 'assets'}{os.sep}")
-    cut = _time_cut(meta)
-    tail = (" Cut by the time limit: " + ", ".join(cut) + "." if cut else "") + (_past_cut(meta, upto) if pdf else "")
-    tail += window
-    if "garbled" in (meta.get("warnings") or []):
-        tail += " Warning: the text may be garbled."
-    if pdf:
-        head += PDF_HINT + past_end
-        runs = _runs(_ints(meta.get("unrendered")))
+    assets = f"{out_md.parent / 'assets'}{os.sep}"
+    garble = " Warning: the text may be garbled." if "garbled" in (meta.get("warnings") or []) else ""
 
-        def unrendered(used):
-            if not runs:
-                return ""
-            a, b = runs[0]
-            end = f'; Read the pdf with pages="{a}-{min(b, a + SUGGEST_PAGES - 1)}" to see them.'
-            return _clause(" Pages not shown as images: ", [_span(*r) for r in runs], end, used)
-        if offer and len(head) + len(offer) + len(tail) <= CONTEXT_MAX - 1:
-            # the offer comes again on a later Read; pages Claude cannot see here would be lost for good
-            if unrendered(len(head) + len(offer) + len(tail)) or not unrendered(len(head) + len(tail)):
-                head += offer
-        head += unrendered(len(head) + len(tail))
-        runs = _runs(_ints(meta.get("figures")))
-        if runs:
-            head += _clause(" Vector figures on pages ", [_span(*r) for r in runs], " are linked as images.",
-                            len(head) + len(tail))
-    else:
-        skill = SKILL_OF.get(reader.ext_of(name))
-        head += EDIT_HINT.format(skill=skill) if skill else ""
-        if offer and len(head) + len(offer) + len(tail) <= CONTEXT_MAX - 1:  # the image offer, whole or not at all
-            head += offer
-    unread = [" ".join(str(x).split()) for x in meta.get("unread") or []]
-    if unread:
-        head += _clause(" Some parts could not be read: ", unread, ".", len(head) + len(tail))
+    def tail_of(short):
+        return _time_cut(meta, short) + (_past_cut(meta, upto, short) if pdf else "") + window + garble
+    tail = tail_of(False)
     n = meta.get("lines", 0)
     long_out = isinstance(n, int) and n > INDEX_LINES
     if not long_out:
@@ -457,8 +443,59 @@ def _context(name, meta, out_md, *, past_end="", offer="", upto=None, window="")
                 long_out = len(out_md.read_text(encoding="utf-8", errors="replace")) > INDEX_CHARS
         except OSError:
             pass
-    index = _index(meta, out_md, pdf, len(head) + len(tail), bool(meta.get("images"))) if long_out else ""
-    return head + index + tail
+    fit, floor = _index(meta, out_md, pdf, bool(meta.get("images"))) if long_out else (None, 0)
+    head = _head(name, meta, assets)
+    over = len(head) + len(tail) + floor - (CONTEXT_MAX - 1)
+    ext = reader.ext_of(name)
+    stem = name[:len(name) - len(ext) - 1] if ext else name
+    if over > 0 and len(stem) > 2:
+        head = _head(stem[:max(1, len(stem) - over - 1)] + "…" + (f".{ext}" if ext else ""), meta, assets)
+    if len(head) + len(tail) + floor > CONTEXT_MAX - 1:
+        tail = tail_of(True)
+    if len(head) + len(tail) + floor > CONTEXT_MAX - 1:
+        fit, floor = None, 0
+    if len(head) + len(tail) > CONTEXT_MAX - 1:
+        head = head[:max(0, CONTEXT_MAX - 2 - len(tail))] + "…"
+    parts = {}
+
+    def used():
+        return len(head) + len(tail) + floor + sum(len(v) for v in parts.values())
+
+    def take(key, text):
+        if text and used() + len(text) <= CONTEXT_MAX - 1:
+            parts[key] = text
+    if pdf:
+        take("past_end", past_end)
+        take("hint", PDF_HINT)
+        runs = _runs(_ints(meta.get("unrendered")))
+
+        def unrendered(extra):
+            if not runs:
+                return ""
+            a, b = runs[0]
+            end = f'; Read the pdf with pages="{a}-{min(b, a + SUGGEST_PAGES - 1)}" to see them.'
+            return _clause(" Pages not shown as images: ", [_span(*r) for r in runs], end, used() + extra)
+        if offer and used() + len(offer) <= CONTEXT_MAX - 1:
+            # the offer comes again on a later Read; pages Claude cannot see here would be lost for good
+            if unrendered(len(offer)) or not unrendered(0):
+                parts["offer"] = offer
+        take("unrendered", unrendered(0))
+        runs = _runs(_ints(meta.get("figures")))
+        if runs:
+            take("figures", _clause(" Vector figures on pages ", [_span(*r) for r in runs], " are linked as images.",
+                                    used()))
+        order = ("hint", "past_end", "offer", "unrendered", "figures", "unread")
+    else:
+        skill = SKILL_OF.get(reader.ext_of(name))
+        take("hint", EDIT_HINT.format(skill=skill) if skill else "")
+        take("offer", offer)
+        order = ("hint", "offer", "unread")
+    unread = [" ".join(str(x).split()) for x in meta.get("unread") or []]
+    if unread:
+        take("unread", _clause(" Some parts could not be read: ", unread, ".", used()))
+    body = head + "".join(parts.get(key, "") for key in order)
+    index = fit(CONTEXT_MAX - 1 - len(body) - len(tail)) if fit else ""
+    return body + index + tail
 
 
 def _now():
