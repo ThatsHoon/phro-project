@@ -989,6 +989,43 @@ def test_own_master_instances_in_a_group_keep_their_ends():
         assert not ctx.skipped, ctx.skipped
 
 
+def test_named_instances_stay_out_of_a_group_that_says_nothing():
+    """vsd gives no verdict on a shape of its own master, so geometry decides whether it is a part of its group; a
+    shape with a name is never folded into a group that has no text of its own or below it (two icons side by side,
+    the units of a rack): the name would be lost and the edges would loop."""
+    one = [{"id": 1, "pin": (0.0, 0.0)}]
+    for version in (11, 6):
+        shapes = [{"id": 1, "type": 0x47, "pin": (5.0, 5.0, 2.0, 1.0, 4.0, 2.0)},
+                  {"id": 3, "parent": 1, "master": (0, 1), "pin": (1.0, 1.0, 1.0, 1.0, 2.0, 2.0)},
+                  {"id": 4, "parent": 1, "master": (1, 1), "pin": (3.0, 1.0, 1.0, 1.0, 2.0, 2.0)},
+                  {"id": 5, "parent": 1, "misc": misc(version, ends=(3, 4))},
+                  {"id": 6, "text": "Internet", "pin": (-5.0, 5.0, 1.0, 0.5, 2.0, 1.0)},
+                  {"id": 7, "misc": misc(version, ends=(6, 3))}]
+        doc, ctx = read(drawing([{"shapes": shapes}], version=version, stencils=[one, one],
+                                snames=["Firewall", "Web server"]))
+        want = 'flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n  n2 --> n3\n  n1 --> n2'
+        assert lines(doc.blocks[0]) == [want], (version, lines(doc.blocks[0]))
+        rack = [{"id": 1, "type": 0x47, "pin": (5.0, 15.0, 5.0, 15.0, 10.0, 30.0)},
+                {"id": 2, "parent": 1, "master": (0, 1), "pin": (5.0, 15.0, 5.0, 15.0, 10.0, 30.0)},
+                {"id": 3, "parent": 1, "master": (1, 1), "pin": (5.0, 22.5, 5.0, 2.5, 10.0, 5.0)},
+                {"id": 4, "parent": 1, "master": (2, 1), "pin": (5.0, 7.5, 5.0, 2.5, 10.0, 5.0)},
+                {"id": 6, "text": "Switch", "pin": (35.0, 15.0, 5.0, 5.0, 10.0, 10.0)},
+                {"id": 7, "misc": misc(version, ends=(6, 3))},
+                {"id": 8, "misc": misc(version, ends=(6, 4))}]
+        doc, ctx = read(drawing([{"shapes": rack}], version=version, stencils=[one, one, one],
+                                snames=["Rack", "Server", "Storage"]))
+        got = lines(doc.blocks[0])
+        assert got == ["- Switch", "- Server", "- Storage"], (version, got)
+        band = [{"id": 1, "type": 0x47, "pin": (5.0, 5.0, 2.0, 1.0, 4.0, 2.0)},
+                {"id": 2, "parent": 1, "text": "Routes", "pin": (2.0, 1.75, 2.0, 0.25, 4.0, 0.5)},
+                {"id": 3, "parent": 1, "master": (0, 1), "pin": (2.0, 0.75, 2.0, 0.75, 4.0, 1.5)},
+                {"id": 6, "text": "Internet", "pin": (-5.0, 5.0, 1.0, 0.5, 2.0, 1.0)},
+                {"id": 7, "misc": misc(version, ends=(6, 3))}]
+        doc, ctx = read(drawing([{"shapes": band}], version=version, stencils=[one], snames=["Feld"]))
+        got = lines(doc.blocks[0])[-1]
+        assert '["Routes"]' in got and "Feld" not in got, (version, got)
+
+
 def test_master_names_and_kinds():
     stencils = [[{"id": 1, "pin": (0.0, 0.0)}], [{"id": 1, "pin": (0.0, 0.0)}],
                 [{"id": 1, "type": 0x47, "pin": (0.0, 0.0)}, {"id": 2, "parent": 1, "pin": (0.0, 0.0)}]]

@@ -101,11 +101,11 @@ parent. A shape naming a master page whose group is not of that master page is n
 (libvisio's `_nameFromId` at the stencil page's level + 1, read when the page is entered) less a trailing
 `.<digits>` copy number, and its kind is that name's, as vsdx finds it; a shape naming its group's master page is a
 part of the group, and of any other shape vsd gives no verdict. vsd has no containers (the User section is not
-read). A connector's route is the end points of its own first geometry section's rows (0x8A MoveTo, 0x8B LineTo, 0x8C ArcTo, 0x90 EllipticalArcTo, 0xA5 SplineStart,
-0xA6 SplineKnot, 0xC1 PolylineTo, 0xC3 NURBSTo: X at 1, Y at 10; a later 0x89 Geometry ends it), placed as its box
-is placed. Diagram
-data never fails a page: registration and `place` run under `ctx.guard("shape")`, a failed `place` leaving the flow
-as it is. A `_VBA_PROJECT_CUR` storage counts `vba` once; macros are never read.
+read). A connector's route is the end points of its own first geometry section's rows (0x8A MoveTo, 0x8B LineTo, 0x8C
+ArcTo, 0x90 EllipticalArcTo, 0xA5 SplineStart, 0xA6 SplineKnot, 0xC1 PolylineTo, 0xC3 NURBSTo: X at 1, Y at 10; a later
+0x89 Geometry ends it), placed as its box is placed. Diagram data never fails a page: registration and `place` run
+under `ctx.guard("shape")`, a failed `place` leaving the flow as it is. A `_VBA_PROJECT_CUR` storage counts `vba` once;
+macros are never read.
 
 Background pages (readPage): the page chunk 0x15's u32 at 8 (v5 the s16 at 0) is the pointer index of its
 background page; a page naming another one that is a background page begins with `Background page: <name>`, and a

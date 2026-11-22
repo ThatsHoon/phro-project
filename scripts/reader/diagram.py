@@ -459,6 +459,9 @@ class Diagram:
                         cur = up
                         if up in texted or _label(p.blocks)[0]:
                             break
+                    if cur != k and s.part is None and s.name and cur not in texted \
+                            and not _label(self.shapes[cur].blocks)[0]:
+                        cur = k
                 memo[k] = cur
             return memo[k]
 

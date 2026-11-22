@@ -970,6 +970,10 @@ def measure():
               f"output {len(out) / 2**20:.1f} MiB, {dict(ctx.skipped)}")
 
 
+def test_shape_rows_budget_value():
+    assert limits.SHAPE_ROWS == 100_000
+
+
 def main():
     if sys.argv[1:] == ["measure"]:
         measure()
