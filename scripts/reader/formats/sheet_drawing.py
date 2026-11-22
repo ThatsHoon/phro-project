@@ -196,7 +196,7 @@ class Drawings:
                 out.append(Para([Text(text)], hidden=hidden))
 
     def chart(self, part: str, rid, out: list) -> None:
-        tbl = ooxml_base.chart(self.pkg, part, rid, self.ctx)
+        tbl = ooxml_base.chart(self.pkg, part, rid, self.ctx, workbook=True)
         if tbl is None:  # kept: a chart part with no series is "could not read" too, as in the slide and Word readers
             self.ctx.skipped["chart"] += 1
             return

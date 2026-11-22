@@ -277,7 +277,7 @@ def test_chart():
            '<hp:chart chartIDRef="Chart/chart1.xml"/></hp:case><hp:default><hp:t>대체</hp:t></hp:default>'
            '</hp:switch></hp:run></hp:p>')
     out = md(hwpx_doc(sec, extra={"Chart/chart1.xml": CHART}))
-    assert "Chart: bar" in out and "대체" not in out and "|A|5|" in out
+    assert "Chart: column" in out and "대체" not in out and "|A|5|" in out
 
 
 def test_header_pictures_and_charts_skipped():
@@ -348,7 +348,7 @@ def test_chart_placements_charged():
     out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
     assert time.monotonic() - t0 < 10, time.monotonic() - t0
     keep = limits.CHART_TOTAL // sum(len(r) for r in next(b for b in doc.blocks if hasattr(b, "rows")).rows)
-    assert ctx.skipped["chart"] == n - keep and out.count("Chart: bar") == keep, (ctx.skipped, out.count("Chart:"))
+    assert ctx.skipped["chart"] == n - keep and out.count("Chart: column") == keep, (ctx.skipped, out.count("Chart:"))
 
 
 def test_equation():

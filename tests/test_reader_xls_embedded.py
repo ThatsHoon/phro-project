@@ -46,7 +46,7 @@ def object_streams(data):
 
 def test_excel_chart_object():
     out, ctx = blocks_of(object_streams(excel_object([CHART], b"Excel.Chart.8")))
-    assert len(out) == 1 and isinstance(out[0], Table) and out[0].caption == "Chart: bar — Sales", out
+    assert len(out) == 1 and isinstance(out[0], Table) and out[0].caption == "Chart: column — Sales", out
     assert len(out[0].rows) == 4 and not ctx.skipped, (out[0].rows, ctx.skipped)
 
 
@@ -76,7 +76,7 @@ def test_cacheless_chart_reads_its_own_sheet():
     ctx = Context()
     with Compound(path) as cf:
         out = xls_embedded.blocks(cf, ctx, budget)
-    assert len(out) == 1 and render(out) == "Chart: bar\n||V|\n|---|---|\n|Q1|5|\n|Q2|6|\n", render(out)
+    assert len(out) == 1 and render(out) == "Chart: column\n||V|\n|---|---|\n|Q1|5|\n|Q2|6|\n", render(out)
     assert not ctx.skipped, ctx.skipped
     assert budget.cells < budget.cap_cells, "the sheet's cells are charged to the document's budget"
 
@@ -89,7 +89,7 @@ def test_cached_chart_does_not_walk_sheets():
     make_cfb(path, cacheless_object(sheets=sheets))
     with Compound(path) as cf:
         out = xls_embedded.blocks(cf, Context(), budget)
-    assert render(out) == "Chart: bar\n||V|\n|---|---|\n|z|7|\n", render(out)
+    assert render(out) == "Chart: column\n||V|\n|---|---|\n|z|7|\n", render(out)
     assert budget.cells == budget.cap_cells, "a chart with cached values reads no sheet"
 
 
@@ -106,7 +106,7 @@ def test_cached_chart_with_a_name_reference_reads_no_sheet():
         ctx = Context()
         with Compound(path) as cf:
             out = xls_embedded.blocks(cf, ctx, budget)
-        assert render(out) == f"Chart: bar\n||{want}|\n|---|---|\n|z|7|\n", render(out)
+        assert render(out) == f"Chart: column\n||{want}|\n|---|---|\n|z|7|\n", render(out)
         assert budget.cells == budget.cap_cells and budget.chars == budget.cap_chars, (name, budget.cells)
         assert not ctx.skipped, ctx.skipped
     # without a cache the name reference still reads the sheet it names
@@ -115,7 +115,7 @@ def test_cached_chart_with_a_name_reference_reads_no_sheet():
     make_cfb(path, cacheless_object(refs=refs))
     with Compound(path) as cf:
         out = xls_embedded.blocks(cf, Context(), sheet_grid.Budget())
-    assert render(out) == "Chart: bar\n||5|\n|---|---|\n|Q1|5|\n|Q2|6|\n", render(out)
+    assert render(out) == "Chart: column\n||5|\n|---|---|\n|Q1|5|\n|Q2|6|\n", render(out)
 
 
 def test_reference_outside_the_workbook_stays_empty():
@@ -128,7 +128,7 @@ def test_reference_outside_the_workbook_stays_empty():
     make_cfb(path, streams)
     with Compound(path) as cf:
         out = xls_embedded.blocks(cf, Context(), budget)
-    assert render(out) == "Chart: bar\n||V|\n|---|---|\n", render(out)
+    assert render(out) == "Chart: column\n||V|\n|---|---|\n", render(out)
     assert budget.cells == budget.cap_cells
 
 
@@ -153,7 +153,7 @@ def test_embedded_worksheet_pictures_not_decoded():
 def test_comp_obj_over_4096_bytes_is_not_read():
     from reader_fix import msgraph_object
     streams = object_streams(msgraph_object(["a"], [("S", [1])]))
-    assert render(blocks_of(streams)[0]).startswith("Chart: bar"), streams.keys()
+    assert render(blocks_of(streams)[0]).startswith("Chart: column"), streams.keys()
     big = dict(streams, **{"\x01CompObj": streams["\x01CompObj"] + bytes(5000)})
     out, ctx = blocks_of(big)  # not routed to MS Graph: the 0x0680 stream is no worksheet, counted under chart
     assert out == [] and ctx.skipped["chart"] == 1, (out, ctx.skipped)
@@ -166,7 +166,7 @@ def render(blocks):
 def test_whole_stream_chart():
     streams = {"Workbook": biff_chart(AB, title="Whole")}
     out, ctx = blocks_of(streams)
-    assert len(out) == 1 and out[0].caption == "Chart: bar — Whole", out
+    assert len(out) == 1 and out[0].caption == "Chart: column — Whole", out
 
 
 def test_no_workbook():
@@ -215,7 +215,7 @@ def test_doc_embedded_chart():
     p = dobj.embed_doc({1: obj}, preview=dobj.PNG_PREVIEW)
     d, ctx = dobj.parse(p)
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
-    assert out == "Chart: bar — Sales\n||A|\n|---|---|\n|Q1|1|\n|Q2|2|\n|Q3|3|\n", out
+    assert out == "Chart: column — Sales\n||A|\n|---|---|\n|Q1|1|\n|Q2|2|\n|Q3|3|\n", out
     assert not ctx.skipped, ctx.skipped
 
 
@@ -226,7 +226,7 @@ def test_doc_text_order():
     p = dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW)
     d, ctx = dobj.parse(p)
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
-    assert out.index("before") < out.index("after") < out.index("Chart: bar") < out.index("next"), out
+    assert out.index("before") < out.index("after") < out.index("Chart: column") < out.index("next"), out
     assert "![" not in out and "could not read" not in out, out
 
 

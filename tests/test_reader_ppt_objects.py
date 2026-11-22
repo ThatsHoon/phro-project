@@ -52,8 +52,8 @@ def test_excel_chart_in_ppt():
     slide = {"shapes": [{"text": "above", "box": (0, 10, 400, 50)}, obj(),
                         {"text": "below", "box": (0, 500, 400, 550)}]}
     out, ctx, assets = build([slide], objects=[(excel_object([CHART], b"Excel.Chart.8"), {"compressed": True})])
-    assert "Chart: bar — Sales" in out and "|Q2|2|" in out, out
-    assert out.index("above") < out.index("Chart: bar") < out.index("below"), out
+    assert "Chart: column — Sales" in out and "|Q2|2|" in out, out
+    assert out.index("above") < out.index("Chart: column") < out.index("below"), out
     assert not ctx.skipped, dict(ctx.skipped)
     # the same workbook raw (instance 0), as a sheet
     out, ctx, _ = build([{"shapes": [obj()]}], objects=[excel_object([GRID], b"Excel.Sheet.8")])
@@ -62,7 +62,7 @@ def test_excel_chart_in_ppt():
 
 def test_msgraph_in_ppt():
     out, ctx, _ = build([{"shapes": [obj()]}], objects=[(msgraph_object(*GRAPH), {"compressed": True})])
-    assert "Chart: bar\n||East|West|\n|---|---|---|\n|Q1|1|3|\n|Q2|2|4|" in out, out
+    assert "Chart: column\n||East|West|\n|---|---|---|\n|Q1|1|3|\n|Q2|2|4|" in out, out
     assert not ctx.skipped, dict(ctx.skipped)
 
 
@@ -128,7 +128,7 @@ def test_truncated_storage_counted():
 def test_object_in_encrypted_ppt():
     out, ctx, _ = build([{"shapes": [obj()]}], encrypt=PPT_DEFAULT,
                         objects=[(excel_object([CHART], b"Excel.Chart.8"), {"compressed": True})])
-    assert "Chart: bar — Sales" in out and not ctx.skipped, (out, dict(ctx.skipped))
+    assert "Chart: column — Sales" in out and not ctx.skipped, (out, dict(ctx.skipped))
 
 
 def struct_size(n):
@@ -139,7 +139,7 @@ def struct_size(n):
 def test_object_read_once_placed_twice():
     slides = [{"shapes": [obj()]}, {"shapes": [obj()]}]
     out, ctx, _ = build(slides, objects=[excel_object([CHART], b"Excel.Chart.8")])
-    assert out.count("Chart: bar — Sales") == 2 and not ctx.skipped, (out, dict(ctx.skipped))
+    assert out.count("Chart: column — Sales") == 2 and not ctx.skipped, (out, dict(ctx.skipped))
     # a bad object is counted at each placement, read once
     slides = [{"shapes": [obj()]}, {"shapes": [obj()]}]
     out, ctx, _ = build(slides, objects=[cfb({"Contents": b"x"})])

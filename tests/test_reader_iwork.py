@@ -1549,11 +1549,11 @@ def test_chart_table_caption():
     assert t.caption.startswith("Chart: ") and t.caption == "Chart: column — Sales", t.caption
     assert _cells(t) == [["", "A", "B"], ["r1", "1", "2"], ["r2", "3.5", ""]], _cells(t)
     assert not ctx.skipped, ctx.skipped
-    # by row: a series a row; a title the chart does not show is left out; the kind follows docling's table
+    # by row: a series a row; a title the chart does not show is left out; kind 7 is a stacked bar
     doc, ctx = _numbers(*chart(7, ["r1"], ["A", "B"], [[1, 2]], "Hidden", by_row=True, show_title=False),
                         sheets=[("S", [500])])
     [t] = _tables(doc)
-    assert t.caption == "Chart: bar" and _cells(t) == [["", "r1"], ["A", "1"], ["B", "2"]], (t.caption, _cells(t))
+    assert t.caption == "Chart: stacked bar" and _cells(t) == [["", "r1"], ["A", "1"], ["B", "2"]], (t.caption, _cells(t))
     # an unknown kind is "other"; a series with no name is named by its place
     doc, ctx = _numbers(*chart(99, [], [], [[4]], None), sheets=[("S", [500])])
     [t] = _tables(doc)
@@ -1561,6 +1561,14 @@ def test_chart_table_caption():
     # a chart that cannot be read counts `chart`, once
     doc, ctx = _numbers(archive(500, 5021, b"\x0a\x05ab"), sheets=[("S", [500])])
     assert not _tables(doc) and ctx.skipped == {"chart": 1}, ctx.skipped
+
+
+def test_chart_kinds_in_shared_words():
+    for code, want in ((6, "stacked column"), (7, "stacked bar"), (13, "3-D bar"), (19, "stacked 3-D area"),
+                       (25, "doughnut"), (26, "3-D doughnut"), (11, "mixed")):
+        doc, ctx = _numbers(*chart(code, ["r1"], ["A"], [[1]], None), sheets=[("S", [500])])
+        [t] = _tables(doc)
+        assert t.caption == f"Chart: {want}", (code, t.caption)
 
 
 def test_chart_cut():

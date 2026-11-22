@@ -317,7 +317,7 @@ def test_macro_sheet_quiet():
 def test_chart_sheet_table():
     chart = biff_chart([{"name": "A", "vals": [1, 2], "cats": ["x", "y"]}], title="T")
     md, _ = run([{"name": "Real", "cells": {(0, 0): "data"}}, {"name": "Chart1", "kind": 2, "raw": chart}])
-    assert "## Sheet: Chart1\n\nChart: bar — T\n||A|\n|---|---|\n|x|1|\n|y|2|\n" in md, md
+    assert "## Sheet: Chart1\n\nChart: column — T\n||A|\n|---|---|\n|x|1|\n|y|2|\n" in md, md
     assert "could not read" not in md, md
 
 

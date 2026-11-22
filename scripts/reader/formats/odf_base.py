@@ -12,6 +12,7 @@ import math
 import re
 
 from .. import diagram, limits
+from ..charts import caption, kind
 from ..containers.zipx import attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
 from ..markdown import blocks_len
@@ -42,6 +43,7 @@ GROUPS = frozenset({"g", "a"})
 _KINDS = {"flowchart-decision": "decision", "diamond": "decision", "flowchart-terminator": "terminator",
           "ellipse": "circle", "circle": "circle", "flowchart-connector": "circle", "can": "store",
           "flowchart-magnetic-disk": "store"}
+_CHART_KINDS = {"circle": "pie", "ring": "doughnut", "filled-radar": "filled radar"}
 _XML_ID = "{http://www.w3.org/XML/1998/namespace}id"
 
 
@@ -261,6 +263,18 @@ class Styles:
         return self.lists.get(name, {}).get(level)
 
 
+def _chart_props(root, name) -> dict:
+    """The style:chart-properties attributes, by local name, of the automatic style `name` of a chart object."""
+    if not name:
+        return {}
+    for styles in kids(root, "automatic-styles"):
+        for st in kids(styles, "style"):
+            if attr(st, "name") == name:
+                props = next(iter(kids(st, "chart-properties")), None)
+                return {local(k): v for k, v in props.attrib.items()} if props is not None else {}
+    return {}
+
+
 class Body:
     """Walks ODF text content into model blocks and inlines. Task 10 reuses it for cells and shapes."""
 
@@ -274,6 +288,7 @@ class Body:
         self.left = _BUDGET  # expansion budget still available
         self.chars_left = limits.SHEET_CHARS  # characters that copies (repeats, reused objects) may still add
         self.wt = {}  # id(Table) -> (Table, cells it expands to)
+        self.charts = {}
         self.glued = None  # odt read as one diagram scope: the shape ids connectors glue; None otherwise
         self.members = {}  # diagram key -> its element, waiting for place()
         self.keys = set()  # diagram keys given out
@@ -504,21 +519,39 @@ class Body:
         for body in kids(root, "body"):
             for c in body:
                 if local(c.tag) == "chart":
-                    return self.chart(c, d)
+                    return self.chart(c, d, root)
                 break
         self.ctx.skipped["object"] += 1
         return []
 
-    def chart(self, ch, d):
+    def chart(self, ch, d, root):
+        """A chart object as its local table under charts.caption: chart:class (circle a pie, ring a doughnut), the
+        plot area's chart:vertical (horizontal bars; vertical ones by default), chart:stacked, chart:percentage and
+        chart:three-dimensional, the title, and each axis title by its chart:dimension, x and y trading places when
+        the bars are horizontal."""
         ch = next(iter(kids(ch, "chart")), ch)  # office:chart wraps chart:chart
         cls = (attr(ch, "class") or "").replace("chart:", "", 1)[:64]
         title = next((_squash("".join(t.itertext()), 100) for t in kids(ch, "title")), "")
-        cap = ("Chart: " + cls if cls else "Chart") + (" — " + title if title else "")
+        plot = next(iter(kids(ch, "plot-area")), None)
+        props = _chart_props(root, attr(plot, "style-name") if plot is not None else None)
+        across = props.get("vertical") == "true"
+        on = {k for k, v in props.items() if v == "true"}
+        grouping = "percent" if "percentage" in on else "stacked" if "stacked" in on else ""
+        name = kind(_CHART_KINDS.get(cls, cls), across, grouping, "three-dimensional" in on) if cls else ""
+        axes = []
+        for ax in kids(plot, "axis") if plot is not None else ():
+            dim = attr(ax, "dimension") or ""
+            text = next((_squash("".join(t.itertext()), 100) for t in kids(ax, "title")), "")
+            if dim in ("x", "y", "z") and text:
+                axes.append((({"x": "y", "y": "x"}.get(dim, dim)) if across else dim, text))
+        cap = caption(name, title, axes)
         src = first(ch, "table")
         tbl = self.table(src, d + 1) if src is not None else None
         if tbl is None:
-            return [Para([Text(cap)])]
-        tbl.caption = cap
+            tbl = Para([Text(cap)])
+        else:
+            tbl.caption = cap
+        self.charts[id(tbl)] = tbl
         return [tbl]
 
     # ---- an odt body as one diagram scope
@@ -608,13 +641,19 @@ class Body:
             self.doc.blocks.extend(todo.pop())
 
     # ---- blocks
-    def blocks(self, el, d):
+    def blocks(self, el, d, aside=None):
+        """The blocks of el's children; with `aside`, the blocks of a frame right under el (a shape anchored to a sheet
+        cell) that holds only charts go there instead."""
         if d > limits.MAX_DEPTH:
             self.deep()
             return []
         out = []
         for c in el:
-            out.extend(self.block(c, d))
+            if aside is not None and local(c.tag) == "frame":
+                got = self.frame_blocks(c, d)
+                (aside if got and all(id(b) in self.charts for b in got) else out).extend(got)
+            else:
+                out.extend(self.block(c, d))
         return out
 
     def block(self, c, d):

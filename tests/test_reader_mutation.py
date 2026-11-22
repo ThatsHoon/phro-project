@@ -339,7 +339,7 @@ def ooxml_mutations(label, members, probe):
 
 
 def test_xlsx_mutations():
-    ooxml_mutations("xlsx", xlsx_seed(), "Chart: bar")
+    ooxml_mutations("xlsx", xlsx_seed(), "Chart: column")
 
 
 def test_docx_mutations():

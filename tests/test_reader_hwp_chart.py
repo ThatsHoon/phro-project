@@ -223,7 +223,7 @@ def native(**kw):
 def test_ooxml_chart_in_ole():
     # OOXMLChartContents with a barChart cache; the table sits where a picture would, between the paragraphs
     out, ctx = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(envelope({"OOXMLChartContents": CHART_XML}))}))
-    assert out == "앞\n\nChart: bar\n||S|\n|---|---|\n|A|5|\n\n뒤\n", out
+    assert out == "앞\n\nChart: column\n||S|\n|---|---|\n|A|5|\n\n뒤\n", out
     assert not ctx.skipped, ctx.skipped
 
 
@@ -262,7 +262,7 @@ def test_biff_chart_read():
     # an Excel chart in the nested file is a Chart: table where the object is, and nothing is counted
     item = envelope({"Workbook": biff_chart([{"name": "S", "vals": [5], "cats": ["A"]}], title="Sales 2024")})
     out, ctx = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(item)}))
-    assert out == "앞\n\nChart: bar — Sales 2024\n||S|\n|---|---|\n|A|5|\n\n뒤\n", out
+    assert out == "앞\n\nChart: column — Sales 2024\n||S|\n|---|---|\n|A|5|\n\n뒤\n", out
     assert "could not read" not in out and not ctx.skipped, (out, ctx.skipped)
     # a Workbook that holds no chart is still one chart counted
     item = envelope({"Workbook": b"\x09\x08" + bytes(30)})

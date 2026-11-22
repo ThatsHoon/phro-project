@@ -62,6 +62,7 @@ class _Sheet:
     def __init__(self, body, name, budget, chars):
         self.body, self.name, self.budget, self.chars = body, name, budget, chars  # cells and characters left for the document
         self.rows, self.hidden, self.spanned = [], set(), []
+        self.anchored = []
         self.gap, self.stop, self.cols_cut = 0, False, False
 
     def cut(self, what, n):
@@ -85,7 +86,10 @@ class _Sheet:
 
     def row(self, tr, d, header):
         rep = max(1, _int(attr(tr, "number-rows-repeated"), 1))
+        mark = len(self.anchored)
         cells, chars = self.cells(tr, d, header)
+        if attr(tr, "visibility") in _HIDE_ROW and len(self.anchored) > mark:
+            self.anchored[mark:] = self.body.hide(self.anchored[mark:])
         if not cells and not self.cols_cut:
             self.gap += rep
             return
@@ -173,7 +177,7 @@ class _Sheet:
             p = c[0]
             if len(p) == 0 and p.text and p.text.strip() and _ln(p.tag) == "p":
                 return [Para([Text(_WS.sub(" ", p.text))])], True
-        blocks = self.body.blocks(c, d + 1)
+        blocks = self.body.blocks(c, d + 1, self.anchored)
         if not blocks or _empty(blocks):
             v = _value(c)
             return ([Para([Text(v)])], True) if v else ([], False)
@@ -227,7 +231,7 @@ def sheets(pkg, ctx, content, styles_root) -> Doc:
 def _section(body, t, name, budget, chars, links) -> Section:
     sh = _Sheet(body, name, budget, chars)
     sh.walk(t, 0, False)
-    blocks = sh.result()
+    blocks = sh.result() + sh.anchored
     for shapes in kids(t, "shapes"):  # charts and pictures anchored to the sheet
         if not any(edge_like(el, body.styles) for el in shapes.iter()):
             for fr in kids(shapes, "frame"):

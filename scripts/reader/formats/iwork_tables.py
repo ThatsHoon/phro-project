@@ -39,7 +39,8 @@ whose cells hold only picture fills keeps its name as an empty Table's caption, 
 Charts (`chart_block`) are ported from docling `docling/backend/iwork/charts.py` (`iwa_chart`, `iwa_chart_grid`,
 `iwa_chart_title`, `CHART_TYPES`) at the same pin: `TSCH.ChartDrawableArchive` (5021) extension 10000 ->
 `ChartArchive` {1 type, 5 series direction, 7 grid, 10 -> 5023 title}, to `charts.series_table`. Changes from docling:
-a grid past CHART_CELLS is read in part and counted `chart_cut` (docling drops its data), a series without a name is
+a grid past CHART_CELLS is read in part and counted `chart_cut` (docling drops its data), the kind is named in
+charts.kind's words (stacked, 3-D and doughnut kept; docling reads them as the flat kind), a series without a name is
 "Series N" as in the other formats' charts, and a non-style archive is read once a document by id.
 """
 import collections
@@ -49,7 +50,7 @@ from decimal import Decimal
 from functools import lru_cache
 
 from .. import limits
-from ..charts import series_table
+from ..charts import caption, kind, series_table
 from ..containers import pbwire
 from ..model import Break, Cell, Hidden, Image, NoteRef, Table
 from ..numfmt import MAX_CODE, display
@@ -737,11 +738,14 @@ CHART_DRAWABLE, CHART_NON_STYLE = 5021, 5023  # TSCH.ChartDrawableArchive, TSCH.
 CHART_EXTENSION = 10000  # the drawable's ChartArchive, and the non-style archive's property map
 SERIES_BY_ROW = 1        # TSCH.SeriesDirection: each grid row a series (else each column)
 MAX_CHART_TITLE = 200    # characters of a chart title in its caption
-# TSCH.ChartType -> the kind docling's CHART_TYPES gives it (3D read as the flat kind); any other value is "other"
-CHART_KINDS = {1: "column", 2: "bar", 3: "line", 4: "area", 5: "pie", 6: "column", 7: "bar", 8: "area", 9: "scatter",
-               10: "mixed", 11: "mixed", 12: "column", 13: "bar", 14: "line", 15: "area", 16: "pie", 17: "column",
-               18: "bar", 19: "area", 20: "column", 21: "bar", 22: "bubble", 23: "scatter", 24: "bubble",
-               25: "donut", 26: "donut", 27: "radar"}
+CHART_KINDS = {k: kind(*v) for k, v in {
+    1: ("bar",), 2: ("bar", True), 3: ("line",), 4: ("area",), 5: ("pie",), 6: ("bar", False, "stacked"),
+    7: ("bar", True, "stacked"), 8: ("area", False, "stacked"), 9: ("scatter",), 10: ("mixed",), 11: ("mixed",),
+    12: ("bar", False, "", True), 13: ("bar", True, "", True), 14: ("line", False, "", True),
+    15: ("area", False, "", True), 16: ("pie", False, "", True), 17: ("bar", False, "stacked", True),
+    18: ("bar", True, "stacked", True), 19: ("area", False, "stacked", True), 20: ("bar",), 21: ("bar", True),
+    22: ("bubble",), 23: ("scatter",), 24: ("bubble",), 25: ("doughnut",), 26: ("doughnut", False, "", True),
+    27: ("radar",)}.items()}
 
 
 def _chart_value(v) -> str:
@@ -754,7 +758,7 @@ def _chart_value(v) -> str:
     x = pbwire.f64(x)
     if not math.isfinite(x):
         return ""
-    return str(int(x)) if x == int(x) and abs(x) < 1e16 else repr(x)
+    return display(x, "General")
 
 
 def _name(raw: list, i: int) -> str:
@@ -815,7 +819,6 @@ def _chart(store, chart_id, ctx, tally) -> Table:
         read += max(len(rows[-1]), 1)
     nid = ref(c, 10)
     title = _chart_title(store, nid, ctx) if nid is not None else ""
-    caption = f"Chart: {kind} — {title}" if title else f"Chart: {kind}"
     # series are built only as far as series_table places them (GRID_COLS - 1 of them, points near CHART_CELLS)
     if by_row:
         n_series, names = len(rows), row_names
@@ -842,7 +845,7 @@ def _chart(store, chart_id, ctx, tally) -> Table:
         tally.skipped["chart"] += 1
     # by row a cut row list drops series and a cut row drops points; by column the other way round
     series_cut = len(series) < n_series or (rows_cut if by_row else values_cut)
-    return series_table(caption, cats, series, series_cut, values_cut if by_row else rows_cut, tally)
+    return series_table(caption(kind, title), cats, series, series_cut, values_cut if by_row else rows_cut, tally)
 
 
 def chart_block(store, chart_id: int, ctx) -> Table | None:
