@@ -344,19 +344,96 @@ def test_ruby_keeps_base_and_ruby_text():
     assert md(hwp_file(hwp_para("앞" + FFFC, controls=(cut,)))) == "(could not read: 1 damaged record)\n\n앞\n"
 
 
-def test_memo_form_and_text_art_counted():
-    # their record layouts are not established: each is counted, never guessed; a memo's anchor text stays
-    memo = hwp_para("대상 " + FFFC + "앵커" + FFFC + " 끝", controls=((3, field(b"%%me"), b""), (4, b"%%me", b"")))
-    memos = hwp_record(hr.MEMO_LIST, 0, u32(1)) + sub_list(hwp_para("메모 내용", level=2), level=1)
-    assert md(hwp_file(memo + memos)) == "(could not read: 1 annotation)\n\n대상 앵커 끝\n"
-    form = (11, b"form", hwp_record(91, 2, bytes(20)))
-    assert md(hwp_file(hwp_para("동의 " + FFFC + "끝", controls=(form,)))) == "(could not read: 1 form field)\n\n동의 끝\n"
+def memo_field(number, author, slot=0):
+    command = f"MEMO/0/{number}/0/0/{author}/"
+    return field(b"%unk", command) + u32(7) + u32(slot)
+
+
+def memo_tail(number, *paras):
+    return hwp_record(hr.MEMO_LIST, 1, u32(number)) + sub_list(*paras, level=1)
+
+
+def memo_para(number, author, slot=0):
+    return hwp_para("대상 " + FFFC + "앵커" + FFFC + " 끝",
+                    controls=((3, memo_field(number, author, slot), b""), (4, b"%unk", b"")))
+
+
+def test_memo_becomes_a_comment():
+    # Hancom keeps a memo's paragraphs under the section's last paragraph, one level down: MEMO_LIST with the memo's
+    # number, a LIST_HEADER, the paragraphs. The field that carries that number is marked after its anchor text.
+    tail = memo_tail(1, hwp_para("확인 바람", level=1))
+    out = md(hwp_file(memo_para(1, "김검토") + hwp_para("끝 문단") + tail))
+    assert out == "대상 앵커[^1] 끝\n\n끝 문단\n\n[^1]: Comment by 김검토: 확인 바람\n", out
+    # the number in the field's trailing slot wins over the command's; two memos keep their own bodies
+    two = (memo_para(9, "가", slot=2) + memo_para(1, "나")
+           + memo_tail(1, hwp_para("하나", level=1)) + memo_tail(2, hwp_para("둘", level=1)))
+    doc, ctx = parse(hwp_file(two))
+    assert list(doc.notes) == ["cm-1", "cm-2"] and not ctx.skipped, ctx.skipped
+    assert "[^1]: Comment by 가: 둘" in md(hwp_file(two)) and "[^2]: Comment by 나: 하나" in md(hwp_file(two))
+    # the last section's tail holds the memos of the sections before it
+    out = md(hwp_file(memo_para(1, "김검토"), hwp_para("둘째 구역") + memo_tail(1, hwp_para("확인 바람", level=1))))
+    assert out == "대상 앵커[^1] 끝\n\n둘째 구역\n\n[^1]: Comment by 김검토: 확인 바람\n", out
+
+
+def test_memo_text_is_never_lost():
+    # a memo list no field names keeps its text where the section ends; a memo field without a list is counted
+    out = md(hwp_file(hwp_para("본문") + memo_tail(4, hwp_para("남은 메모", level=1))))
+    assert out == "본문\n\nComment: 남은 메모\n", out
+    doc, ctx = parse(hwp_file(memo_para(1, "김검토")))
+    assert ctx.skipped == {"annotation": 1}, ctx.skipped
+    # a master-page list in the tail is not a memo and adds nothing
+    other = sub_list(hwp_para("바탕쪽", level=1), level=1)
+    assert md(hwp_file(hwp_para("본문") + other + memo_tail(4, hwp_para("메모", level=1)))) == "본문\n\nComment: 메모\n"
+
+
+def form_obj(kind, props):
+    return (11, b"form", hwp_record(hr.FORM_OBJECT, 2, kind + bytes(8) + wstr(props)))
+
+
+def test_form_objects_give_their_value():
+    def one(kind, props):
+        return md(hwp_file(hwp_para("답 " + FFFC + " 끝", controls=(form_obj(kind, props),))))
+    common = "CommonSet:set:60:Name:wstring:2:c1 ForeColor:int:0 "
+    assert one(b"tbc+", common + "Caption:wstring:3:동의함 Value:int:1 ") == "답 ☑ 동의함 끝\n"
+    assert one(b"tbc+", common + "Caption:wstring:2:거부 Value:int:0 ") == "답 ☐ 거부 끝\n"
+    assert one(b"tbr+", common + "Caption:wstring:1:남 Value:int:1 ") == "답 ☑ 남 끝\n"
+    assert one(b"tbc+", common + "Caption:wstring:2:보류 Value:int:2 ") == "답 ☐ 보류 (indeterminate) 끝\n"
+    assert one(b"boc+", common + "Text:wstring:2:서울 ListBoxRows:int:4 ") == "답 서울 끝\n"
+    assert one(b"tde+", common + "Text:wstring:9:홍 길동: 가:나 MaxLength:int:0 ") == "답 홍 길동: 가:나 끝\n"
+    assert one(b"tbp+", common + "Caption:wstring:2:제출 ") == "답  끝\n"
+    # a record too short to hold its kind and string is counted, never guessed
+    short = (11, b"form", hwp_record(hr.FORM_OBJECT, 2, bytes(10)))
+    assert md(hwp_file(hwp_para("동의 " + FFFC + "끝", controls=(short,)))) == "(could not read: 1 form field)\n\n동의 끝\n"
+    # a string cut short, or a count that is not a number, still gives what the record holds
+    assert one(b"tde+", "Text:wstring:99:홍길동") == "답 홍길동 끝\n"
+    assert one(b"tde+", "Text:wstring:x:홍길동 Name") == "답  끝\n"
+
+
+def test_text_art_counted():
     art = (11, b"gso " + bytes(40) + u16(0),
            hwp_record(hr.SHAPE_COMPONENT, 2, b"tat$tat$" + bytes(32)) + hwp_record(hr.TEXTART, 3, bytes(40)))
     assert md(hwp_file(hwp_para("앞" + FFFC, controls=(art,)))) == "(could not read: 1 shape)\n\n앞\n"
 
 
-# ---- tables
+def test_click_here_guide_dropped_value_kept():
+    # an unfilled click-here field shows its guide text (the command's Direction): that is dropped. A value written
+    # without the filled bit (a form filled by a program) differs from the guide and is kept.
+    cmd = "Clickhere:set:60:Direction:wstring:6:여기에 입력 HelpState:wstring:0: Name:wstring:2:성명 "
+
+    def clk(text, attr=0):
+        return md(hwp_file(hwp_para("성명: " + FFFC + text + FFFC + " 끝",
+                                    controls=((3, field(b"%clk", cmd, attr), b""), (4, b"%clk", b"")))))
+    assert clk("여기에 입력") == "성명:  끝\n"
+    assert clk("홍길동") == "성명: 홍길동 끝\n"
+    assert clk("여기에 입력", 1 << 15) == "성명: 여기에 입력 끝\n"
+
+
+def test_equation_caption():
+    cap = sub_list(hwp_para("식 1. 질량과 에너지", level=2))
+    eq = (11, b"eqed" + u32(0), cap + hwp_record(hr.EQEDIT, 2, u32(0) + wstr("a over b") + bytes(8)))
+    assert md(hwp_file(hwp_para("앞" + FFFC, controls=(eq,)))) == "앞\n\n$$\\frac{a}{b}$$\n\n식 1. 질량과 에너지\n"
+
+
 def table_md(rows, **kw):
     return md(hwp_file(hwp_para(FFFC, controls=(hwp_table(rows, **kw),))))
 
@@ -517,6 +594,8 @@ def test_auto_alt_dropped():
     auto = "그림입니다.\r\n원본 그림의 이름: CLP0000a1b2.bmp\r\n원본 그림의 크기: 가로 1024pixel, 세로 768pixel"
     assert md(pic_file(hwp_picture(1, auto), streams=streams)) == "![](assets/img-001.png)\n"
     assert md(pic_file(hwp_picture(1, auto + "\r\n회사 로고"), streams=streams)) == "![회사 로고](assets/img-001.png)\n"
+    src = "그림입니다.\r\n출처: 통계청 2024"
+    assert md(pic_file(hwp_picture(1, src), streams=streams)) == "![출처: 통계청 2024](assets/img-001.png)\n"
 
 
 def test_picture_caption():

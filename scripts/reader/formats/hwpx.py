@@ -16,8 +16,8 @@ from ..containers.zipx import Package, attr, first, kids, local, parse_xml, reso
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Image, NoteRef, Para, Table, Text
 from .hancom import (
-    Frame, Obj, Scopes, State, alt_text, cut_command, diagrams, flat, heading_level, lone_equations, next_marker,
-    outline_marker, paragraph, place, plain, style_name_level,
+    Frame, Obj, Scopes, State, alt_text, button, cut_command, diagrams, flat, heading_level, lone_equations,
+    next_marker, outline_marker, paragraph, place, plain, style_name_level,
 )
 from .word_fields import comment_note
 
@@ -30,7 +30,7 @@ _OBJECTS = frozenset(("rect", "ellipse", "arc", "polygon", "curve", "line", "con
 _EDGES = ("connectLine", "line")
 _PAGE = ("PAPER", "PAGE")
 _ARROWS = {"_NOARROW": (False, False), "_ONEWAY": (False, True), "_BOTH": (True, True)}  # connectLine@type endings
-_CAPTIONED = _OBJECTS | {"equation", "chart", "ole"}
+_STATES = {"CHECKED": 1, "INDETERMINATE": 2}
 _BUTTONS = ("checkBtn", "radioBtn")
 _LISTS = ("comboBox", "listBox")
 
@@ -350,7 +350,8 @@ class _Reader(Scopes):
             url = cut_command(params["Command"]) if params.get("Command") else (params.get("Path") or "").strip()
             self.open_field(st, fid, url)
         else:
-            self.open_field(st, fid, unfilled=kind == "CLICK_HERE" and attr(el, "dirty") != "1")
+            self.open_field(st, fid, unfilled=kind == "CLICK_HERE" and attr(el, "dirty") != "1",
+                            guide=params.get("Direction") or "")
 
     def delete_end(self, st):
         for i in range(len(st.frames) - 1, 0, -1):
@@ -408,8 +409,7 @@ class _Reader(Scopes):
         elif n == "textart":
             self.art(el, st)
         elif n in _BUTTONS:
-            box = "☑" if (attr(el, "value") or "").upper() == "CHECKED" else "☐"
-            self.text(f"{box} {attr(el, 'captionText') or ''}".rstrip(), st)
+            self.text(button(_STATES.get((attr(el, "value") or "").upper(), 0), attr(el, "caption") or ""), st)
         elif n in _LISTS:
             self.choice(el, st)
         elif n == "edit":
@@ -440,11 +440,11 @@ class _Reader(Scopes):
         elif n == "drawText":
             st.extras.extend(self.sub(el, d, st.nohead))
         elif n == "secPr":
-            self.outline = attr(el, "outlineShapeIDRef") or self.outline
+            self.outline = attr(el, "outlineShapeIDRef")
         elif n != "caption":
             for c in el:
                 self.node(c, st, d + 1)
-        if n in _CAPTIONED:
+        if n not in ("tbl", "caption"):
             self.caption(el, st, d)
 
     def ruby(self, el, st):
@@ -459,10 +459,12 @@ class _Reader(Scopes):
             st.extras.append(Para([Text(t)]))
 
     def choice(self, el, st):
-        """A combo or list box: the shown text of the item its selectedValue names, else that value."""
+        """A combo or list box: the shown text of the item its selectedValue names, else that value; with no
+        selected value, its list item when it has just one (Hancom writes a combo box's shown text so)."""
         v = attr(el, "selectedValue") or ""
-        item = next((i for i in kids(el, "listItem") if attr(i, "value") == v), None)
-        self.text((attr(item, "displayText") if item is not None else None) or v, st)
+        items = kids(el, "listItem")
+        item = next((i for i in items if attr(i, "value") == v), None) if v else items[0] if len(items) == 1 else None
+        self.text((attr(item, "displayText") or attr(item, "value") if item is not None else None) or v, st)
 
     def caption(self, el, st, d):
         """An object's caption lists, as paragraphs after what the object reads as (hwp places them so)."""

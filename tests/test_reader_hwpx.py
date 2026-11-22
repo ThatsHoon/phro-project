@@ -271,6 +271,8 @@ def test_click_here_filled_value_kept():
     sec = ('<hp:p><hp:run><hp:t>성명: </hp:t>' + begin + '<hp:t>%s</hp:t>' + _fend(88) + '<hp:t> 끝</hp:t></hp:run></hp:p>')
     assert md(hwpx_doc(sec % ("1", "홍길동"))) == "성명: 홍길동 끝\n"
     assert md(hwpx_doc(sec % ("0", "이름을 입력하세요"))) == "성명:  끝\n"
+    # a value written without the dirty mark (a form filled by a program) is not the guide text: it is kept
+    assert md(hwpx_doc(sec % ("0", "홍길동"))) == "성명: 홍길동 끝\n"
 
 
 def test_table_and_picture_captions():
@@ -289,6 +291,9 @@ def test_table_and_picture_captions():
     rect = ('<hp:p><hp:run><hp:t>앞</hp:t><hp:rect>' + cap % ("BOTTOM", P("도형 1")) + '<hp:drawText><hp:subList>'
             + P("상자") + '</hp:subList></hp:drawText></hp:rect></hp:run></hp:p>')
     assert md(hwpx_doc(rect)) == "앞\n\n상자\n\n도형 1\n"
+    # any other object's caption is read too
+    video = '<hp:p><hp:run><hp:t>앞</hp:t><hp:video>' + cap % ("BOTTOM", P("동영상 1. 시연")) + '</hp:video></hp:run></hp:p>'
+    assert md(hwpx_doc(video)) == "앞\n\n동영상 1. 시연\n"
 
 
 OUTLINE = ('<hh:numbering id="1"><hh:paraHead level="1" start="1" numFormat="DIGIT">^1.</hh:paraHead>'
@@ -319,6 +324,12 @@ def test_outline_numbers():
                 + '</hp:subList><hp:cellAddr colAddr="1" rowAddr="1"/></hp:tc>')
     sec = '<hp:p><hp:run><hp:secPr outlineShapeIDRef="1"/></hp:run></hp:p>' + cell
     assert "|z|1. 칸 제목|" in md(hwpx_doc(sec, OUTLINE))
+    # the outline numbering is the section's own: a later section that names none numbers nothing
+    item = '<opf:item id="section1" href="Contents/section1.xml" media-type="application/xml"/>'
+    first = '<hp:p><hp:run><hp:secPr outlineShapeIDRef="1"/></hp:run></hp:p>' + P("첫 구역", pr="1")
+    second = '<hs:sec ' + NS + '><hp:p><hp:run><hp:secPr/></hp:run></hp:p>' + P("둘째 구역", pr="1") + '</hs:sec>'
+    out = md(hwpx_doc(first, OUTLINE, item, {"Contents/section1.xml": second}))
+    assert out == "# 1. 첫 구역\n\n# 둘째 구역\n", out
 
 
 def test_track_change_deleted():
@@ -471,13 +482,17 @@ def test_text_art_gives_its_text():
 
 
 def test_form_objects_give_their_value():
-    sec = ('<hp:p><hp:run><hp:t>동의 </hp:t><hp:checkBtn captionText="동의함" value="CHECKED" name="c1"/><hp:t>, </hp:t>'
-           '<hp:checkBtn captionText="거부" value="UNCHECKED"/><hp:t>, </hp:t><hp:radioBtn captionText="남" value="CHECKED"/>'
+    sec = ('<hp:p><hp:run><hp:t>동의 </hp:t><hp:checkBtn caption="동의함" value="CHECKED" name="c1"/><hp:t>, </hp:t>'
+           '<hp:checkBtn caption="거부" value="UNCHECKED"/><hp:t>, </hp:t><hp:radioBtn caption="남" value="CHECKED"/>'
            '<hp:t> 지역 </hp:t><hp:comboBox name="cb" selectedValue="SEOUL"><hp:listItem displayText="부산" value="BUSAN"/>'
            '<hp:listItem displayText="서울" value="SEOUL"/></hp:comboBox><hp:t> 이름 </hp:t><hp:edit name="e1">'
            '<hp:text>홍길동</hp:text></hp:edit><hp:t> 목록 </hp:t><hp:listBox selectedValue="기타"/>'
-           '<hp:btn captionText="제출"/></hp:run></hp:p>')
+           '<hp:btn caption="제출"/></hp:run></hp:p>')
     assert md(hwpx_doc(sec)) == "동의 ☑ 동의함, ☐ 거부, ☑ 남 지역 서울 이름 홍길동 목록 기타\n"
+    # a third state is said; a combo box with no selected value shows its one list item, as Hancom writes it
+    sec = ('<hp:p><hp:run><hp:checkBtn caption="보류" value="INDETERMINATE"/><hp:t> 지역 </hp:t>'
+           '<hp:comboBox selectedValue=""><hp:listItem displayText="" value="대전"/></hp:comboBox></hp:run></hp:p>')
+    assert md(hwpx_doc(sec)) == "☐ 보류 (indeterminate) 지역 대전\n"
 
 
 def test_ole_object_counted():

@@ -47,7 +47,7 @@ def test_tex_moved():
     assert tex("a times b le c ge d") == r"a \times b \le c \ge d"
     assert tex("alpha + Omega + omega") == r"\alpha + \Omega + \omega"
     assert tex("foo baz") == "foo baz"
-    assert tex("{" * 500 + "a" + "}" * 500) is None  # past _TEX_DEPTH groups the script is not translated
+    assert tex("{" * 500 + "a" + "}" * 500) is None  # past limits.TEX_DEPTH groups the script is not translated
 
 
 def test_tex_constructs():
@@ -97,6 +97,23 @@ def test_alt_text_drops_the_automatic_description():
     assert hancom.alt_text(auto) == "" and hancom.alt_text("그림입니다.") == ""
     assert hancom.alt_text(auto + "\n회사  로고") == "회사 로고"
     assert hancom.alt_text("설명: 회사 로고\n둘째 줄") == "설명: 회사 로고 둘째 줄" and hancom.alt_text("") == ""
+    # only the labels Hancom writes are dropped: a line the author wrote in the same form stays
+    assert hancom.alt_text("그림입니다.\n출처: 통계청 2024") == "출처: 통계청 2024"
+    assert hancom.alt_text("그림입니다. 원본 그림의 이름: a.bmp 원본 그림의 크기: 가로 1pixel, 세로 1pixel") == ""
+    assert hancom.alt_text("그림입니다. 회사 로고") == "회사 로고"
+
+
+def test_props_reads_hancoms_property_string():
+    p = hancom.props("CommonSet:set:60:Name:wstring:2:c1 Caption:wstring:5:a: b  Value:int:1 Enabled:bool:1")
+    assert p == {"Name": "c1", "Caption": "a: b ", "Value": "1", "Enabled": "1"}, p
+    assert hancom.props("") == {} and hancom.props("Text") == {} and hancom.props("Text:wstring") == {}
+    assert hancom.props("Text:wstring:٣:abc") == {}
+    assert len(hancom.props("K:int:1 " * 200_000)) == 1
+
+
+def test_button_states():
+    assert hancom.button(1, "동의") == "☑ 동의" and hancom.button(0, " 거부 ") == "☐ 거부"
+    assert hancom.button(2, "보류") == "☐ 보류 (indeterminate)" and hancom.button(1, "") == "☑"
 
 
 def test_paragraph_writes_every_number_it_takes():

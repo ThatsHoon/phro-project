@@ -8,8 +8,8 @@ from bisect import bisect_left
 from .. import diagram, limits
 from ..model import Bold, Break, Cell, Equation, Heading, Hidden, Link, ListItem, Math, NoteRef, Para, Table, Text
 
-AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다\.?$")
-_AUTO_FIELD = re.compile(r"^[^:.?!]{1,20}:")
+AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다\.?\s*")
+_AUTO_FIELD = re.compile(r"^(?:원본 그림의 이름|원본 그림의 크기|사진 찍은 날짜)\s*:")
 STYLE_HEAD = re.compile(r"^(?:개요|outline|heading)\s*(\d+)$", re.I)
 
 # HWP 5.0 binary numbering-format code (the index) to the hwpx numFormat name; anything else is DIGIT
@@ -30,7 +30,6 @@ _CIRCLED = {"CIRCLED_DIGIT": (0x2460, 20), "CIRCLED_LATIN_CAPITAL": (0x24B6, 26)
 
 
 # ---- equation script to TeX
-_TEX_DEPTH = 32
 
 
 def _both(names):
@@ -199,7 +198,7 @@ class _Eq:
     def primary(self):
         self.depth += 1
         try:
-            if self.depth > _TEX_DEPTH:
+            if self.depth > limits.TEX_DEPTH:
                 raise _Fail
             return self._primary()
         finally:
@@ -272,7 +271,7 @@ class _Eq:
         self.i += 1
         self.depth += 1
         try:
-            if self.depth > _TEX_DEPTH:
+            if self.depth > limits.TEX_DEPTH:
                 raise _Fail
             rows = [[]]
             while True:
@@ -476,16 +475,53 @@ def strip_marker(inlines, marker) -> bool:
 
 
 def alt_text(comment: str) -> str:
-    """A shape comment as alt text. The description Hancom writes on its own, a first line such as "그림입니다." and
-    the "<label>: <value>" lines right after it (the original file's name and size, the date a photo was taken), is
-    left out; what follows it is kept, its whitespace squashed."""
+    """A shape comment as alt text. The description Hancom writes on its own is left out: a lead such as "그림입니다."
+    and the lines it labels itself (the original picture's name and size, the date a photo was taken), on lines of
+    their own or run into the lead's line. What the author wrote is kept, its whitespace squashed."""
     lines = [ln.strip() for ln in re.split(r"\r\n|[\r\n]", comment.replace("\0", ""))]
-    k = 0
-    if AUTO_ALT.match(lines[0]):
+    lead = AUTO_ALT.match(lines[0])
+    if lead:
+        rest = lines[0][lead.end():]
         k = 1
         while k < len(lines) and _AUTO_FIELD.match(lines[k]):
             k += 1
-    return re.sub(r"\s+", " ", " ".join(lines[k:])).strip()
+        lines = ["" if _AUTO_FIELD.match(rest) else rest] + lines[k:]
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def props(s: str) -> dict:
+    """Hancom's property string (a form object's, a click-here field's command) as {key: value}. Entries are
+    "Key:wstring:N:" then exactly N characters, "Key:int:V" and "Key:bool:V" up to a space, and "Key:set:N:", whose
+    members follow as entries of their own. A first key wins; an entry that cannot be read ends the string."""
+    out, pos, n = {}, 0, len(s)
+    while pos < n:
+        a = s.find(":", pos)
+        b = s.find(":", a + 1) if a >= 0 else -1
+        if b < 0:
+            break
+        key, kind = s[pos:a].strip(), s[a + 1:b]
+        pos = b + 1
+        if kind in ("set", "wstring"):
+            c = s.find(":", pos)
+            count = s[pos:c] if c >= 0 else ""
+            if not (count.isascii() and count.isdigit()):
+                break
+            pos = c + 1
+            if kind == "set":
+                continue
+            value, pos = s[pos:pos + int(count)], pos + int(count)
+        else:
+            c = s.find(" ", pos)
+            c = n if c < 0 else c
+            value, pos = s[pos:c], c
+        out.setdefault(key, value)
+    return out
+
+
+def button(state: int, caption: str) -> str:
+    """A check box or radio button as text: its box (1 checked, 2 neither, else unchecked) and its caption."""
+    parts = ("☑" if state == 1 else "☐", caption.strip(), "(indeterminate)" if state == 2 else "")
+    return " ".join(x for x in parts if x)
 
 
 def flat(blocks) -> str:
@@ -506,8 +542,8 @@ def cut_command(s: str) -> str:
 
 
 class Frame:
-    """One open inline scope inside a paragraph: root, link (to `url`), pass, drop, deleted or memo (whose note id is
-    `url`)."""
+    """One open inline scope inside a paragraph: root, link (to `url`), pass, drop, deleted, memo (whose note id is
+    `url`) or guide (a click-here field not marked filled, whose guide text is `url`)."""
 
     def __init__(self, kind, fid=None, url=""):
         self.kind, self.id, self.url, self.inl = kind, fid, url, []
@@ -539,7 +575,8 @@ class Scopes:
 
     def close_to(self, st, n):
         """Close scopes until `n` are open: a link becomes a Link, a deletion Hidden, a pass gives its inlines to its
-        parent, a memo gives them followed by its note's mark, and a drop loses them."""
+        parent, a memo gives them followed by its note's mark, a guide gives them unless they are its guide text,
+        and a drop loses them."""
         while len(st.frames) > n:
             f = st.frames.pop()
             parent = st.frames[-1].inl
@@ -551,6 +588,8 @@ class Scopes:
                 parent.extend(f.inl)
                 if f.kind == "memo":
                     parent.append(NoteRef(f.url))
+            elif f.kind == "guide" and plain(f.inl).strip() != f.url.strip():
+                parent.extend(f.inl)
 
     def memo(self, st, fid, nid):
         """A memo's begin: the text up to its end is the text the memo is marked after (at the paragraph's end
@@ -571,16 +610,19 @@ class Scopes:
             st.eqs.append(m)
         self.add(st, m)
 
-    def open_field(self, st, fid=None, url="", unfilled=False):
-        """A field begin: a hyperlink with a target scopes a Link, an unfilled click-here field's guide text is
-        dropped, and any other field's text is kept."""
-        self.push(st, Frame("drop" if unfilled else "link" if url else "pass", fid, url))
+    def open_field(self, st, fid=None, url="", unfilled=False, guide=""):
+        """A field begin: a hyperlink with a target scopes a Link, any other field's text is kept, and a click-here
+        field not marked filled loses its text when that is its `guide` text (or when no guide text is known)."""
+        if unfilled:
+            self.push(st, Frame("guide", fid, guide) if guide.strip() else Frame("drop", fid))
+        else:
+            self.push(st, Frame("link" if url else "pass", fid, url))
 
     def close_field(self, st, ref=None):
         """A field end closes the innermost open field (the one whose id is `ref`, when given)."""
         for i in range(len(st.frames) - 1, 0, -1):
             f = st.frames[i]
-            if f.kind in ("link", "pass", "drop", "memo") and (ref is None or f.id == ref):
+            if f.kind in ("link", "pass", "drop", "memo", "guide") and (ref is None or f.id == ref):
                 self.close_to(st, i)
                 return
 

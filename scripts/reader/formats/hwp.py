@@ -19,6 +19,7 @@ its `controls.ts`. Every field comes from a record long enough to hold it, or is
 import re
 import struct
 from bisect import bisect_right
+from collections import deque
 from itertools import groupby
 
 from .. import diagram, limits
@@ -29,12 +30,12 @@ from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Image, NoteRef, Table, Text
 from . import hwpx, sheet_grid
 from .hancom import (
-    Frame, Obj, Scopes, State, alt_text, cut_command, diagrams, flat, heading_level, lone_equations, next_marker,
-    outline_marker, paragraph, place, plain, style_name_level,
+    Frame, Obj, Scopes, State, alt_text, button, cut_command, diagrams, flat, heading_level, lone_equations,
+    next_marker, outline_marker, paragraph, place, plain, props, style_name_level,
 )
 from .hwp_chart import ole_table
 from .hwp_records import (
-    CTRL_HEADER, EQEDIT, LIST_HEADER, MEMO_LIST, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT,
+    CTRL_HEADER, EQEDIT, FORM_OBJECT, LIST_HEADER, MEMO_LIST, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT,
     SHAPE_COMPONENT, SHAPE_LINE, SHAPE_OLE, SHAPE_PICTURE, TABLE, TEXTART, DocInfo, ParaShape, doc_info, file_header,
     first_tag, records, view_text,
 )
@@ -185,6 +186,17 @@ def _wstr(data: bytes, pos: int) -> str:
     return data[pos + 2:end - (end - pos) % 2].decode("utf-16-le", "replace")
 
 
+def _tail(recs) -> int:
+    """Where a section's tail starts: the first level-1 LIST_HEADER or MEMO_LIST after its last level-0 paragraph
+    header (a paragraph's own lists sit under a control, two levels down). Hancom keeps the memo lists and the extra
+    master pages there. len(recs) without one."""
+    last = next((i for i in range(len(recs) - 1, -1, -1) if recs[i].tag == PARA_HEADER and not recs[i].level), None)
+    if last is None:
+        return len(recs)
+    return next((k for k in range(last + 1, len(recs))
+                 if recs[k].level == 1 and recs[k].tag in (LIST_HEADER, MEMO_LIST)), len(recs))
+
+
 def _deleted(tags: bytes) -> list:
     """The units PARA_RANGE_TAG deletions cover (12-byte start, end, tag entries), merged into sorted edges
     [start, end, start, end, ...]: unit u is deleted when an odd number of edges are <= u. Backwards and empty ranges
@@ -232,6 +244,7 @@ class _Reader(Scopes):
         self.info = DocInfo(0, {}, [], [], [], [], [])
         self.budget = flate.Budget()  # one per document, shared by every inflation
         self.counts = {"fn": 0, "en": 0, "cm": 0}
+        self.memos = {}
         self.numbers = {}   # numbering id -> {level: counter}
         self.outline = 0    # the outline numbering id of the current section's secd
         self.blobs = {}     # (BinData stream name, inflated?, kind) -> its bytes, or None when it cannot be read
@@ -369,16 +382,47 @@ class _Reader(Scopes):
                     recs, self.view = self.tracked(n, name)
                 else:
                     recs = self.load(name, records)
+                cut = _tail(recs)
+                recs, tail = recs[:cut], recs[cut:]
                 scoped = self.collect = any(r.tag == SHAPE_COMPONENT and r.data[:4] in _EDGES for r in recs)
                 try:
                     blocks = self.paras(recs, 0, len(recs), 0, False)
                 finally:
                     self.collect = False
                 self.doc.blocks.extend(diagrams(self.ctx, self.edges, blocks) if scoped else blocks)
+                self.doc.blocks.extend(self.tail(tail))
                 good += 1
         if not good:
             raise ReadError("damaged", "no readable section")
+        for waiting in self.memos.values():
+            for nid, author in waiting:
+                self.doc.notes[nid] = comment_note([], author)
+                self.ctx.skipped["annotation"] += 1
         return self.doc
+
+    def tail(self, recs) -> list:
+        """A section's tail (_tail), as groups that each start at a level-1 MEMO_LIST or LIST_HEADER. A MEMO_LIST with
+        its u32 memo number and a LIST_HEADER right after it is a memo: its paragraphs become the comment note of the
+        first memo field with that number still waiting, in this section or one before; with no such field they are
+        returned, so the text stays at the section's end. Any other group (a master page) is not read."""
+        out = []
+        j, n = 0, len(recs)
+        while j < n:
+            memo = (recs[j].tag == MEMO_LIST and len(recs[j].data) >= 4 and j + 1 < n
+                    and recs[j + 1].level == 1 and recs[j + 1].tag == LIST_HEADER)
+            k = j + (2 if memo else 1)
+            while k < n and not (recs[k].level == 1 and recs[k].tag in (LIST_HEADER, MEMO_LIST)):
+                k += 1
+            if memo:
+                blocks = self.apart(recs, j + 2, k, 1, True)
+                waiting = self.memos.get(struct.unpack_from("<I", recs[j].data)[0])
+                if waiting:
+                    nid, author = waiting.popleft()
+                    self.doc.notes[nid] = comment_note(blocks, author)
+                else:
+                    out.extend(comment_note(blocks, ""))
+            j = k
+        return out
 
     # ---- record tree
     def end(self, recs, i) -> int:
@@ -401,9 +445,6 @@ class _Reader(Scopes):
         while j < end:
             if recs[j].tag == PARA_HEADER:
                 out.extend(self.para(recs, j, d, nohead))
-                j = self.end(recs, j)
-            elif recs[j].tag == MEMO_LIST:
-                self.ctx.skipped["annotation"] += 1
                 j = self.end(recs, j)
             else:
                 j += 1
@@ -654,13 +695,23 @@ class _Reader(Scopes):
         return self.end(recs, i)
 
     def equation(self, recs, i, st, d):
+        """EQEDIT's script (after its attr u32) as a formula; a caption list before it follows as paragraphs."""
         end = self.end(recs, i)
         data = recs[i].data
         inline = len(data) >= 8 and struct.unpack_from("<I", data, 4)[0] & 1  # common attr bit 0: like a character
-        for j in range(i + 1, end):
-            if recs[j].tag == EQEDIT:
-                self.formula(st, _wstr(recs[j].data, 4).replace("\0", ""), inline)  # attr u32, then the script
+        caption = []
+        j = i + 1
+        while j < end:
+            if recs[j].tag == LIST_HEADER:
+                k = self.list_end(recs, j)
+                caption.extend(self.apart(recs, j + 1, k, d + 1, True))
+                j = k
+            elif recs[j].tag == EQEDIT:
+                self.formula(st, _wstr(recs[j].data, 4).replace("\0", ""), inline)
                 break
+            else:
+                j = self.end(recs, j)
+        st.extras.extend(caption)
         return end
 
     def ruby(self, recs, i, st, d):
@@ -676,19 +727,47 @@ class _Reader(Scopes):
         return self.end(recs, i)
 
     def form(self, recs, i, st, d):
-        """A form object: its FORM_OBJECT record's layout is not established, so it is counted under field."""
-        self.ctx.skipped["field"] += 1
-        return self.end(recs, i)
+        """A form object. Its FORM_OBJECT record holds the kind in bytes 0-3 and, at 12, a property string
+        (hancom.props): a check box or radio button gives its box and Caption, a combo box or edit box its Text, a
+        push button nothing. A record that holds no kind this reader knows is counted under field."""
+        end = self.end(recs, i)
+        data = next((recs[j].data for j in range(i + 1, end) if recs[j].tag == FORM_OBJECT), b"")
+        kind, p = data[:4], props(_wstr(data, 12))
+        if kind in (b"tbc+", b"tbr+"):
+            v = p.get("Value", "")
+            self.text(button(int(v) if v in ("1", "2") else 0, p.get("Caption", "")), st, False)
+        elif kind in (b"boc+", b"tde+"):
+            self.text(p.get("Text", ""), st, False)
+        elif kind != b"tbp+":
+            self.ctx.skipped["field"] += 1
+        return end
 
     def field(self, recs, i, st, d):
-        """A field begin: the text up to its field end is a link, dropped (an unfilled %clk) or kept."""
+        """A field begin: id, attr u32, one byte, the command, the field's u32 id and a u32 memo number. The text up
+        to its field end is a link, a click-here field's value (its guide text, the command's Direction, is dropped
+        when the field is not marked filled), the anchor of a memo, or kept. A memo's command is
+        MEMO/<shape>/<number>/<id>/<id>/<author>/, whatever the control id (Hancom writes %unk); its paragraphs are in
+        a section's tail, so its note waits for them under its number (the trailing one, else the command's)."""
         data = recs[i].data
         cid = data[3::-1]
         attr = struct.unpack_from("<I", data, 4)[0] if len(data) >= 8 else 0
+        command = _wstr(data, 9)
         if cid == b"%hlk":
-            self.open_field(st, url=cut_command(_wstr(data, 9)))  # id, attr u32, one byte, then the command
+            self.open_field(st, url=cut_command(command))
+        elif command.startswith("MEMO/"):
+            part = command.split("/", 6)
+            k = 15 + 2 * struct.unpack_from("<H", data, 9)[0]
+            number = struct.unpack_from("<I", data, k)[0] if len(data) >= k + 4 else 0
+            if not number and len(part) > 2 and part[2].isascii() and part[2].isdigit():
+                number = int(part[2])
+            self.counts["cm"] += 1
+            nid = f"cm-{self.counts['cm']}"
+            self.doc.notes[nid] = []
+            self.memos.setdefault(number, deque()).append((nid, part[5] if len(part) > 6 else ""))
+            self.memo(st, None, nid)
         else:
-            self.open_field(st, unfilled=cid == b"%clk" and not attr & 0x8000)
+            unfilled = cid == b"%clk" and not attr & 0x8000
+            self.open_field(st, unfilled=unfilled, guide=props(command).get("Direction", "") if unfilled else "")
         return self.end(recs, i)
 
     def table(self, recs, i, st, d):
@@ -835,8 +914,8 @@ class _Reader(Scopes):
                     return self.end(recs, j)
                 before = self.ctx.skipped["object"], self.ctx.skipped["chart"]
                 tbl = ole_table(item, self.ctx, sheets=self.sheets)
-                lost = ("object" if self.ctx.skipped["object"] > before[0] else
-                        "chart" if self.ctx.skipped["chart"] > before[1] else None)
+                lost = None if tbl is not None else ("object" if self.ctx.skipped["object"] > before[0] else
+                                                    "chart" if self.ctx.skipped["chart"] > before[1] else None)
                 self.tables[item] = tbl, sum(len(r) for r in tbl.rows) if tbl is not None else 0, lost
             elif self.tables[item][2]:
                 self.ctx.skipped[self.tables[item][2]] += 1
