@@ -481,9 +481,17 @@ def test_data_range_names_the_sheet_cells():
               {"ref": [(0, area3d(0, 0, 0, 2, 2)), (1, area3d(0, 1, 2, 2, 2)), (2, area3d(0, 1, 2, 0, 0))]}]
     chart = biff_chart(series, cache=False)
     md = run([{"name": "Data", "cells": cells}, chart_sheet(chart)], globals_extra=externsheet(0))
-    assert "Chart: column. Data: Data!A1:C3\n" in md and md.count("\nQ2|2|4\n") == 2, md
+    assert md.rstrip().endswith("Chart: column. Data: Data!A1:C3") and md.count("\nQ2|2|4\n") == 1, md
     md = run([{"name": "Data", "cells": cells, "state": 1}, chart_sheet(chart)], globals_extra=externsheet(0))
-    assert "Chart: column. Data: Data!A1:C3\n" in md and md.count("\nQ2|2|4\n") == 1, md
+    assert "Chart: column. Data: Data!A1:C3\n||A|B|" in md and md.count("\nQ2|2|4\n") == 1, md
+    md = run([{"name": "Data", "cells": cells, "hidden_rows": [1]}, chart_sheet(chart)], globals_extra=externsheet(0))
+    assert "Chart: column. Data: Data!A1:C3\n||A|B|" in md and md.count("\nQ2|2|4\n") == 2, md
+    md = run([{"name": "Data", "cells": cells, "merges": [(1, 0, 2, 0)]}, chart_sheet(chart)],
+             globals_extra=externsheet(0))
+    assert "Chart: column. Data: Data!A1:C3\n||A|B|" in md, md
+    gap = {k: v for k, v in cells.items() if k != (2, 2)}
+    md = run([{"name": "Data", "cells": gap}, chart_sheet(biff_chart(series))], globals_extra=externsheet(0))
+    assert "Chart: column. Data: Data!A1:C3\n||A|B|" in md, md
     half = [series[0], {"name": "Typed", "ref": series[1]["ref"][1:]}]
     md = run([{"name": "Data", "cells": cells}, chart_sheet(biff_chart(half, cache=False))],
              globals_extra=externsheet(0))

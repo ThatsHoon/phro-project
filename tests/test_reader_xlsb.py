@@ -382,6 +382,23 @@ def test_chart_in_xlsb():
     assert not ctx.skipped, ctx.skipped
 
 
+def test_chart_of_cells_the_sheet_shows_keeps_its_caption_alone():
+    ranged = BAR.replace("<c:strRef>", "<c:strRef><c:f>S!$B$1</c:f>", 1).replace(
+        "<c:cat><c:strRef>", "<c:cat><c:strRef><c:f>S!$A$2</c:f>").replace(
+        "<c:numRef>", "<c:numRef><c:f>S!$B$2</c:f>")
+    parts = with_drawing(anchor(5, chart_frame("rId1")), rels=[("rId1", "chart", "../charts/chart1.xml")],
+                         extra={"xl/charts/chart1.xml": ranged})
+    cells = {(0, 1): "S", (1, 0): "Q1", (1, 1): "7"}
+    out, ctx = md([{"name": "S", "cells": cells}], extra_parts=parts)
+    assert out.count("Q1") == 1 and out.rstrip().endswith("Chart: column. Data: S!A1:B2"), out
+    assert not ctx.skipped, ctx.skipped
+    out, ctx = md([{"name": "S", "cells": {**cells, (1, 1): ""}}], extra_parts=parts)
+    assert out.count("Q1") == 2 and "\nQ1|7\n" in out, out
+    out, ctx = md([{"name": "S", "cells": {(0, 0): "top"}}, {"name": "T", "cells": cells}],
+                  extra_parts={**parts, "xl/charts/chart1.xml": ranged.replace("S!", "T!")})
+    assert out.count("Q1") == 1 and "Chart: column. Data: T!A1:B2\n" in out, out
+
+
 def test_picture_in_xlsb():
     parts = with_drawing(anchor(0, pic("rId1"), kind="oneCellAnchor"),
                          rels=[("rId1", "image", "../media/image1.png")], extra={"xl/media/image1.png": PNG})

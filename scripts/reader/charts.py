@@ -62,52 +62,68 @@ def _sheet(name: str) -> str:
 
 
 def _block(vals, names, cat):
-    """(top, left, bottom, right) of the block whose columns are the series: values one column each, side by side,
-    each name right above its values, the categories in the columns right before the first. None otherwise."""
+    """[(top, left, bottom, right)] of the block whose columns are the series: values one column each, side by side,
+    each name right above its values, the categories in the columns right before the first. After the block come its
+    parts that hold a value in every cell: the values, the names, the categories' last column. None otherwise."""
     _, r1, c1, r2, _ = vals[0]
     for k, v in enumerate(vals):
         if v[1:] != (r1, c1 + k, r2, c1 + k):
             return None
-    top = r1
+    right = c1 + len(vals) - 1
+    top, left, parts = r1, c1, [(r1, c1, r2, right)]
     if names[0] is not None:
         for k, n in enumerate(names):
             if n[1:] != (r1 - 1, c1 + k, r1 - 1, c1 + k):
                 return None
         top = r1 - 1
-    left = c1
+        parts.append((top, c1, top, right))
     if cat is not None:
         if (cat[1], cat[3], cat[4]) != (r1, r2, c1 - 1):
             return None
         left = cat[2]
-    return top, left, r2, c1 + len(vals) - 1
+        parts.append((r1, c1 - 1, r2, c1 - 1))
+    return [(top, left, r2, right)] + parts
 
 
-def data_range(series) -> str:
-    """The chart data range Excel would show, `Sheet1!A1:C9` (`, series in rows` when each series is a row), when
-    every series' values, and all or none of the names and the categories, are ranges of one sheet that make one
-    block laid out as a chart data range; else "".
+def data_block(series):
+    """The chart data range Excel would show, when every series' values, and all or none of the names and the
+    categories, are ranges of one sheet that make one block laid out as a chart data range; else None. It is
+    (sheet, whether each series is a row, the range, then its parts that hold a value in every cell: the values, the
+    names, the innermost categories), each (r1, c1, r2, c2), zero-based and inclusive.
     `series` holds (name, categories, values) per series: None when the chart has none, False for a literal or a
     reference that is not one range here, else (sheet, r1, c1, r2, c2), zero-based and inclusive."""
     if not series:
-        return ""
+        return None
     names, cats, vals = (list(x) for x in zip(*series))
     if None in vals or False in vals or False in names or False in cats or len(set(cats)) > 1:
-        return ""
+        return None
     if None in names and any(n is not None for n in names):
-        return ""
+        return None
     sheet = vals[0][0]
     if any(r[0] != sheet for r in vals + names + cats if r):
-        return ""
+        return None
     for by_rows in (False, True):
         def turn(r):
             return (r[0], r[2], r[1], r[4], r[3]) if r and by_rows else r
-        box = _block([turn(v) for v in vals], [turn(n) for n in names], turn(cats[0]))
-        if box is None:
-            continue
-        r1, c1, r2, c2 = (box[1], box[0], box[3], box[2]) if by_rows else box
-        a, b = _a1(r1, c1), _a1(r2, c2)
-        return f"{_sheet(sheet)}!{a if a == b else a + ':' + b}" + (", series in rows" if by_rows else "")
-    return ""
+        boxes = _block([turn(v) for v in vals], [turn(n) for n in names], turn(cats[0]))
+        if boxes is not None:
+            return (sheet, by_rows, *((b[1], b[0], b[3], b[2]) if by_rows else b for b in boxes))
+    return None
+
+
+def data_range(block) -> str:
+    """A data_block as a caption names it: `Sheet1!A1:C9`, `, series in rows` when each series is a row; "" for
+    None."""
+    if block is None:
+        return ""
+    sheet, by_rows, (r1, c1, r2, c2) = block[:3]
+    a, b = _a1(r1, c1), _a1(r2, c2)
+    return f"{_sheet(sheet)}!{a if a == b else a + ':' + b}" + (", series in rows" if by_rows else "")
+
+
+def source(block) -> tuple:
+    """A data_block as a chart's Table.source holds it."""
+    return () if block is None else (block[0], *block[2:])
 
 
 def _kid(el, name):
@@ -236,7 +252,7 @@ def _axes(plot) -> list:
 
 
 def _ref(holder):
-    """None without `holder`, else the range its c:f names as data_range takes it, or False for a literal or a
+    """None without `holder`, else the range its c:f names as data_block takes it, or False for a literal or a
     formula that is not one range."""
     if holder is None:
         return None
@@ -273,7 +289,7 @@ def _cell(text: str, header=False) -> Cell:
 def chart_table(space, ctx=None, workbook=False):
     """The chart's cached values as a Table, or None without series. A table is held to limits.CHART_CELLS cells
     (series first, then rows); a cut is counted in ctx.skipped["chart_cut"] when ctx is given. A chart of a workbook
-    (`workbook`) names its data_range in the caption too."""
+    (`workbook`) names its data_range in the caption too, and holds it as its `source` unless the table was cut."""
     plot = first(space, "plotArea")
     if plot is None:
         return None
@@ -290,8 +306,8 @@ def chart_table(space, ctx=None, workbook=False):
     chart = _kid(space, "chart")
     title = _title(_kid(chart, "title")) if chart is not None else ""
     date1904 = (_val(space, "date1904", "1") or "0") not in ("0", "false")
-    data = data_range([_ranges(s) for s in sers]) if workbook else ""
-    head = caption("+".join(kinds), title, _axes(plot), data)
+    block = data_block([_ranges(s) for s in sers]) if workbook else None
+    head = caption("+".join(kinds), title, _axes(plot), data_range(block))
 
     xy = not any(_kid(x, "val") is not None for x in sers)
     heads, cols, top, clamped, more = [], [], 0, False, False
@@ -343,7 +359,7 @@ def chart_table(space, ctx=None, workbook=False):
     rows = [[_cell(h, True) for h in heads]]
     for i in range(top):
         rows.append([_cell(c.get(i, "")) for c in cols])
-    return Table(rows, head)
+    return Table(rows, head, source=() if notes else source(block))
 
 
 def series_table(caption, cats, series, series_cut, points_cut, ctx) -> Table | None:

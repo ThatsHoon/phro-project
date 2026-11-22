@@ -19,7 +19,7 @@ anywhere in the stream.
 import struct
 
 from .. import limits
-from ..charts import CHART_ROWS, caption, data_range, kind, series_table
+from ..charts import CHART_ROWS, caption, data_block, data_range, kind, series_table, source
 from ..model import Context
 from ..numfmt import code_for, display
 from . import biff
@@ -92,7 +92,8 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
     resolves only against `seen`, the sheets already read (`cells` by default): when `cells` reads a sheet the first
     time a reference names it (an embedded workbook's), no sheet is read for a name alone.
 
-    `workbook` says the chart is one of the workbook `g`: its caption names its charts.data_range too."""
+    `workbook` says the chart is one of the workbook `g`: its caption names its charts.data_range too, and the
+    table holds it as its `source`."""
     st = biff.Stream(data, ctx) if st is None else st
     seen = cells if seen is None else seen
     f = _scan(data, start, st, ctx, biff.CHART_BOF)
@@ -102,7 +103,8 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
     series, texts, kinds, cache, end = f.series, f.texts, f.kinds, f.cache, f.end
     left = [MAX_POINTS - f.points]
     cuts = [f.cut_points]
-    named = data_range([_ranges(s, k, cache, g) for k, s in enumerate(series) if not s.aux]) if workbook else ""
+    block = data_block([_ranges(s, k, cache, g) for k, s in enumerate(series) if not s.aux]) if workbook else None
+    named = data_range(block)
     out, cats = [], {}
     for k, s in enumerate(series):
         name = s.name
@@ -117,8 +119,11 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
         if not s.aux:  # k stays the cache column of the series after it
             out.append((name, got[1]))
     n = max([max(d) + 1 for d in [cats] + [v for _, v in out] if d] + [0])
-    table = series_table(_caption(f, g, cells, left, cuts, named), [cats.get(i, "") for i in range(n)],
+    whole = _caption(f, g, cells, left, cuts, named)
+    table = series_table(whole, [cats.get(i, "") for i in range(n)],
                          [(name, [v.get(i, "") for i in range(n)]) for name, v in out], f.cut_series, cuts[0], ctx)
+    if table is not None and table.caption == whole:
+        table.source = source(block)
     return table, end
 
 
@@ -427,7 +432,7 @@ def _area(tokens: bytes, g):
 
 
 def _ranges(s: _Series, k: int, cache: dict, g):
-    """(name, categories, values) of series `k` as charts.data_range takes them: a role read from the sheet is its
+    """(name, categories, values) of series `k` as charts.data_block takes them: a role read from the sheet is its
     range (False when it names no sheet of this workbook), one typed in the chart (a SeriesText name, cached
     categories, any values not read from the sheet) is False, a name or categories the chart makes up is None."""
     def where(role, typed):
