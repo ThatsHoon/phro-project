@@ -14,6 +14,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
+from reader.formats import mtef  # noqa: E402
 from reader.formats.mtef import DEPTH, to_tex  # noqa: E402  (ModuleNotFoundError before mtef.py exists)
 from reader import markdown  # noqa: E402
 from reader.containers.cfb import CfbError, Compound  # noqa: E402
@@ -339,9 +340,9 @@ def test_objects_read_once():
     """An object named again and again is read and converted once; each reference to a missing one is a loss."""
     n = 300
     reads, converts = [], []
-    real_read, real_tex = Compound.read, doc_objects.mtef.to_tex
+    real_read, real_tex = Compound.read, mtef.to_tex
     Compound.read = lambda self, name: reads.append(name) or real_read(self, name)
-    doc_objects.mtef.to_tex = lambda data, lost=None: converts.append(1) or real_tex(data, lost)
+    mtef.to_tex = lambda data, lost=None: converts.append(1) or real_tex(data, lost)
     try:
         t0 = time.monotonic()
         d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(FRAC)}}, text="a" + EMBED * n + "\r"))
@@ -351,7 +352,7 @@ def test_objects_read_once():
         assert ctx.skipped == {"object": n}, ctx.skipped
         assert time.monotonic() - t0 < 10
     finally:
-        Compound.read, doc_objects.mtef.to_tex = real_read, real_tex
+        Compound.read, mtef.to_tex = real_read, real_tex
 
 
 def test_bad_streams_counted():
@@ -379,12 +380,12 @@ def test_bad_streams_counted():
             assert e.kind == "timeout"
     finally:
         Compound.read = real
-    old = doc_objects.mtef.MAX_BYTES
-    doc_objects.mtef.MAX_BYTES = len(FRAC) - 1
+    old = mtef.MAX_BYTES
+    mtef.MAX_BYTES = len(FRAC) - 1
     try:
         assert md(p) == "(could not read: 1 embedded object)\n\n![](assets/img-001.png)\n", md(p)
     finally:
-        doc_objects.mtef.MAX_BYTES = old
+        mtef.MAX_BYTES = old
 
 
 def test_partial_equation_kept_and_counted():

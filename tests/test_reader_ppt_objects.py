@@ -241,8 +241,9 @@ def test_failed_workbook_leaves_no_warning():
 
 
 def test_shared_helper_with_doc():
-    from reader.formats import doc_objects, mtef
-    assert hasattr(mtef, "native_tex") and doc_objects.mtef is mtef
+    from reader import embedded
+    from reader.formats import doc_objects
+    assert doc_objects.embedded is embedded and ppt_objects.embedded is embedded
 
 
 def main():

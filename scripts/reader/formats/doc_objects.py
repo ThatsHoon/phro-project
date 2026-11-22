@@ -3,11 +3,10 @@ dochan office_binary/ole_objects.py: the storage _<id>, Equation Native first, t
 
 Word writes an object as an EMBED field: the separator has fSpec and fOle2 and names the storage ObjectPool/_<id>
 (sprmCObjLocation, else sprmCPicLocation, a u32), and the result's \\x01 has fSpec and the preview's PICF at its
-PicLocation in the Data stream. An object is read once an id: an Equation Native is converted by mtef.to_tex after
-its EQNOLEFILEHDR (cbHdr bytes, a u16 first), and the equation replaces the preview, which is not read; a Workbook or
-Book stream is read by xls_embedded (its tables are placed after the paragraph, as a picture is; one it cannot
-read, or whose placement would pass CHART_TOTAL, is a chart: its preview stays, counted), and a CompObj naming
-MS Graph is a chart; anything else is another object. A document reads
+PicLocation in the Data stream. An object is read once an id, by embedded.storage: an equation replaces the preview,
+which is not read; a workbook, a chart package or a spreadsheet gives tables (placed after the paragraph, as a
+picture is; one that cannot be read, or whose placement would pass CHART_TOTAL, is a chart: its preview stays,
+counted); anything else is another object. A document reads
 256 objects at most, the rest counted under object. A storage that is not there,
 an equation that does not convert and a stream that cannot be read (missing, a broken chain, damaged or too large:
 ReadError's other kinds end the document) keep the preview; so does an equation converted in part (stopped early,
@@ -19,24 +18,18 @@ they are dropped).
 """
 import dataclasses
 
-from .. import images, limits
+from .. import embedded, images, limits
 from ..containers.cfb import CfbError
 from ..limits import ReadError
 from ..model import Math
-from . import mtef, sheet_grid, xls_embedded
+from . import sheet_grid
 
 _POOL = "OBJECTPOOL"
-_NATIVE = "EQUATION NATIVE"
-_BOOKS = ("WORKBOOK", "BOOK")
-_COMP_OBJ = "\x01COMPOBJ"
-_COMP_OBJ_MAX = 4096  # bytes of a CompObj stream read to find MS Graph's ProgID
-_HEADER_MAX = 0xFFFF  # an EQNOLEFILEHDR's cbHdr is a u16
 MAX_OBJECTS = 256     # objects one document reads (the rest are counted under object)
 
 # an object read: (kind, TeX, what the conversion lost)
 _MISSING = ("missing", "", frozenset())
 _BAD = ("bad", "", frozenset())
-_CHART = ("chart", "", frozenset())
 _OTHER = ("other", "", frozenset())
 
 
@@ -77,39 +70,10 @@ class Objects:
         streams = self.pool().get(f"_{oid}")
         if streams is None:
             return _MISSING
-        native = streams.get(_NATIVE)
-        if native is not None:
-            data = self.stream(native, _HEADER_MAX + mtef.MAX_BYTES)
-            if data is None:
-                return _BAD
-            lost = set()
-            try:
-                tex = mtef.native_tex(data, lost)
-            except ValueError:
-                return _BAD
-            return ("equation", tex, frozenset(lost))
-        if any(name in streams for name in _BOOKS):
-            return self.workbook(streams)
-        comp = streams.get(_COMP_OBJ)
-        if comp is not None and b"MSGraph" in (self.stream(comp, _COMP_OBJ_MAX) or b""):
-            return _CHART
-        return _OTHER
-
-    def workbook(self, streams):
-        """A Workbook or Book object: ("table", its tables, none lost) through xls_embedded, else a chart left
-        unread (the preview and the count stay). The reads of a failed workbook are not counted here, place() counts
-        the chart where it is shown."""
-        ctx = self.r.ctx
-        before, warned = ctx.skipped["chart"], len(ctx.warnings)
-        out = xls_embedded.blocks(_Storage(self, streams), ctx, self.sheets)
-        if out:
-            return ("table", out, frozenset())
-        del ctx.warnings[warned:]  # the guard's warning goes with its count: place() counts the chart where it is shown
-        if before:
-            ctx.skipped["chart"] = before
-        else:
-            ctx.skipped.pop("chart", None)
-        return _CHART
+        got = embedded.storage(_Storage(self, streams), self.r.ctx, self.sheets)
+        if got is None:
+            return _OTHER
+        return _BAD if got[0] == "bad" else got
 
     def stream(self, path, cap) -> bytes | None:
         """Stream `path`, or None when it is over `cap` bytes or cannot be read. A ReadError other than damaged or
@@ -211,9 +175,9 @@ class Objects:
 
 
 class _Storage:
-    """One ObjectPool storage as xls_embedded.blocks reads it: exists, size and read by stream name, through
-    Objects.stream so a stream is read under the same cap and ReadError rules (one that cannot be read is a KeyError,
-    which blocks counts as a failed chart)."""
+    """One ObjectPool storage as embedded.storage reads it: exists, size and read by stream name, through
+    Objects.stream so a stream is read under the same cap and ReadError rules (one that cannot be read is a
+    KeyError)."""
 
     def __init__(self, objects, streams):
         self.objects, self.streams = objects, streams
