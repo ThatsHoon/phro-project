@@ -159,7 +159,7 @@ def test_header_footer():
 
 def test_info_title():
     out = md(rb"{\rtf1{\info{\title Report}{\author Someone}}Body text\par}")
-    assert out.startswith("# Report\n") and "Body text" in out and "Someone" not in out, out
+    assert out == "Properties: author: Someone\n\n# Report\n\nBody text\n", out
 
 
 def test_group_depth():
@@ -263,6 +263,32 @@ def test_note_inside_note_is_text_of_outer():
     assert list(d.notes) == ["fn-1"]
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
     assert "[^1]: outer inner tail" in out, out
+
+
+def test_starred_footnote_is_a_note():
+    out = md(rb"{\rtf1 body{\*\footnote\pard\plain{\super\chftn} star note}\par tail{\*\footnote\ftnalt\pard end}\par}")
+    assert out == "body[^1]\n\ntail[^2]\n\n[^1]: star note\n[^2]: end\n", out
+    d, _ = parse(rtf_file(rb"{\rtf1 body{\*\footnote\pard x}\par}"))
+    assert list(d.notes) == ["fn-1"]
+    assert md(rb"{\rtf1 a{\*\unknown{\*\footnote x}}b\par}") == "ab\n"  # inside text left out it stays out
+
+
+def test_annotation_is_a_comment_with_its_author():
+    data = (rb"{\rtf1 text{\*\atnid KR}{\*\atnauthor Kyle Reese}\chatn{\*\annotation{\*\atnref 0}\pard\plain"
+            rb" ANNOTATION-TEXT}\par again{\*\atnid AB}\chatn{\*\annotation\pard initials only}\par}")
+    out = md(data)
+    assert out == ("text[^1]\n\nagain[^2]\n\n[^1]: Comment by Kyle Reese: ANNOTATION-TEXT\n"
+                   "[^2]: Comment by AB: initials only\n"), out
+
+
+def test_revisions_are_insertions_and_deletions_by_their_author():
+    data = (rb"{\rtf1{\*\revtbl {Unknown;}{Kim;}{Lee;}}Track {\revised\revauth1 INSERTED }{\revised\revauth1\b more}"
+            rb"{\deleted\revauthdel2 DELETED-TEXT} end {\revised anon}\par}")
+    out = md(data)
+    assert out == "(1 hidden places left out)\n\nTrack (inserted by Kim: INSERTED **more**) end (inserted: anon)\n", out
+    shown = md(data, hidden=True)
+    assert shown == "Track (inserted by Kim: INSERTED **more**)(deleted by Lee: DELETED-TEXT) end (inserted: anon)\n", shown
+    assert md(rb"{\rtf1 a{\revised\revauth7 b}\par}") == "a(inserted: b)\n"  # an author past the table
 
 
 def test_empty_note_is_dropped():
@@ -394,6 +420,19 @@ def test_style_chain_cut_keeps_near_styles():
     body = b"".join(b"\\pard\\s%d p%d\\par" % (i, i) for i in (41, 33, 32, 30))
     out = md(b"{\\rtf1{\\stylesheet" + styles + b"}" + body + b"}")
     assert out == "p41\n\np33\n\n## p32\n\n## p30\n", out
+
+
+def test_form_fields_show_their_state():
+    """A legacy check box shows ☒ or ☐ (\ffres, or \ffdefres when it is 25), a drop-down its chosen \ffl entry, a
+    text field its result; the field's name is not text."""
+    box = (rb"{\field{\*\fldinst{ FORMCHECKBOX }{{\*\formfield{\fftype1\ffres%d\ffhps20{\*\ffname Check1}"
+           rb"\ffdefres%d}}}}{\fldrslt }}")
+    dd = (rb"{\field{\*\fldinst{ FORMDROPDOWN }{{\*\formfield{\fftype2\ffres%d\ffhaslistbox{\*\ffname D1}\ffdefres0"
+          rb"{\*\ffl DD-FIRST}{\*\ffl DD-SECOND}}}}}{\fldrslt }}")
+    text = rb"{\field{\*\fldinst{ FORMTEXT }{{\*\formfield{\fftype0{\*\ffname T1}}}}}{\fldrslt typed}}"
+    src = (rb"{\rtf1\ansi agree " + box % (1, 0) + box % (0, 1) + box % (25, 1) + rb"\par pick " + dd % 1
+           + rb" or " + dd % 9 + rb"\par " + text + rb"\par}")
+    assert md(src) == "agree ☒☐☒\n\npick DD-SECOND or\n\ntyped\n", md(src)
 
 
 def md_mem(data, hidden=False):
@@ -557,6 +596,20 @@ def test_zip_and_compound_heads_never_loop_back_to_rtf():
         raise AssertionError("expected ReadError")
     except ReadError as e:
         assert e.kind == "damaged", e
+
+
+
+def test_info_properties():
+    """The \\info group's title is the title; its author, operator (the last author), subject, keywords, company,
+    creation and revision times and user properties are the properties line; its counts and doccomm are not."""
+    info = (rb"{\info{\title Lease}{\subject Unit 4}{\author Kim}{\operator Lee}{\keywords lease, rent}{\doccomm note}"
+            rb"{\*\company ACME}{\creatim\yr2024\mo3\dy5\hr10\min30}{\revtim\yr2024\mo4\dy1\hr8\min0}"
+            rb"{\printim\yr2024\mo4\dy2}\version3\nofpages1\nofwords3"
+            rb"{\*\userprops{\propname Client}\proptype30{\staticval Hanbit}{\propname Empty}\proptype30{\staticval }}}")
+    out = md(rb"{\rtf1" + info + rb"Body\par}")
+    assert out == ("Properties: subject: Unit 4; author: Kim; last author: Lee; created: 2024-03-05 10:30; "
+                   "modified: 2024-04-01 08:00; company: ACME; keywords: lease, rent; Client: Hanbit\n\n"
+                   "# Lease\n\nBody\n"), out
 
 
 def main():

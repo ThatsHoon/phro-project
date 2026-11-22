@@ -6,7 +6,8 @@ import unicodedata
 from bisect import bisect_left
 
 from .. import diagram, limits
-from ..model import Bold, Break, Cell, Equation, Heading, Hidden, Link, ListItem, Math, NoteRef, Para, Table, Text
+from ..model import (Bold, Break, Cell, Equation, Heading, Hidden, Inserted, Link, ListItem, Math, NoteRef, Para, Table,
+                     Text)
 
 AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다(?:\.\s*|\s+|$)")
 _AUTO_FIELD = re.compile(r"^(?:원본 그림의 이름|원본 그림의 크기|사진 찍은 날짜)\s*:")
@@ -430,12 +431,12 @@ def outline_marker(levels: dict, counters: dict, lvl: int):
 
 # ---- the inline model
 def itext(inlines) -> str:
-    """The visible text: Bold and Link opened, a Break as a space."""
+    """The visible text: Bold, Link and Inserted opened, a Break as a space."""
     out = ""
     for it in inlines:
         if isinstance(it, Text):
             out += it.text
-        elif isinstance(it, (Bold, Link)):
+        elif isinstance(it, (Bold, Link, Inserted)):
             out += itext(it.inlines)
         elif isinstance(it, Break):
             out += " "
@@ -453,7 +454,7 @@ def remove(inlines, ids) -> None:
     for it in inlines:
         if id(it) in ids:
             continue
-        if isinstance(it, (Bold, Link, Hidden)):
+        if isinstance(it, (Bold, Link, Hidden, Inserted)):
             remove(it.inlines, ids)
         keep.append(it)
     inlines[:] = keep
@@ -680,11 +681,12 @@ def paragraph(inlines, text, level, number=None, item=None):
 
 
 def _shown(inlines, ids, out) -> None:
-    """Add to `out` the id() of every inline in `ids` that is visible: inside Bold and Link, not inside Hidden."""
+    """Add to `out` the id() of every inline in `ids` that is visible: inside Bold, Link and Inserted, not inside
+    Hidden."""
     for it in inlines:
         if id(it) in ids:
             out.add(id(it))
-        elif isinstance(it, (Bold, Link)):
+        elif isinstance(it, (Bold, Link, Inserted)):
             _shown(it.inlines, ids, out)
 
 

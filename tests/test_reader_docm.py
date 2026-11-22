@@ -310,6 +310,20 @@ def test_vanish_and_del():
     assert "(1 hidden places left out)" in out2 and "zz" not in out2
 
 
+def test_tracked_changes_say_what_and_who():
+    body = ('<w:p><w:r><w:t xml:space="preserve">elit </w:t></w:r>'
+            '<w:ins w:id="1" w:author="Kyle Reese"><w:r><w:t xml:space="preserve">insert </w:t></w:r></w:ins>'
+            '<w:ins w:id="2" w:author="Kyle Reese"><w:r><w:rPr><w:b/></w:rPr><w:t>this</w:t></w:r></w:ins>'
+            '<w:r><w:t xml:space="preserve"> fringilla, </w:t></w:r>'
+            '<w:del w:id="3" w:author="Sarah"><w:r><w:delText xml:space="preserve">bibendum </w:delText></w:r></w:del>'
+            '<w:moveTo w:id="4" w:author="Sarah"><w:r><w:t>moved</w:t></w:r></w:moveTo>'
+            '<w:r><w:t xml:space="preserve"> est </w:t></w:r><w:ins w:id="5"><w:r><w:t>anon</w:t></w:r></w:ins></w:p>')
+    p = docm(body)
+    assert md(p) == ("(1 hidden places left out)\n\nelit (inserted by Kyle Reese: insert **this**) fringilla, "
+                     "(inserted by Sarah: moved) est (inserted: anon)\n"), md(p)
+    assert "fringilla, (deleted by Sarah: bibendum )(inserted by Sarah: moved)" in md(p, hidden=True), md(p, hidden=True)
+
+
 def test_sdt_placeholder_dropped():
     sdt = ('<w:sdt><w:sdtPr><w:showingPlcHdr/></w:sdtPr><w:sdtContent>' + P("여기에 입력") + '</w:sdtContent></w:sdt>'
            '<w:sdt><w:sdtPr/><w:sdtContent>' + P("채움") + '</w:sdtContent></w:sdt>'
@@ -751,6 +765,364 @@ def test_docx_group_hostile_glue_and_geometry():
     finally:
         diagram.Diagram.place = place
     assert markdown.render(doc, tmp() / "a") == "lead\n\nStart\n\nEnd\n" and dict(ctx.skipped) == {"shape": 1}
+
+
+
+# ---- Task 13: numbering, forms, special runs, imported parts, properties
+NUM_REL = (("rN", "numbering", "numbering.xml", False),)
+
+
+def lvl(ilvl, fmt, text, start=1):
+    return (f'<w:lvl w:ilvl="{ilvl}"><w:start w:val="{start}"/><w:numFmt w:val="{fmt}"/>'
+            f'<w:lvlText w:val="{text}"/></w:lvl>')
+
+
+def test_numbering_formats():
+    """Every numFmt a contract uses shows as Word shows it, not as a decimal."""
+    cases = (("decimalEnclosedParen", 1, "(1)"), ("decimalZero", 3, "03"), ("japaneseCounting", 11, "十一"),
+             ("chineseCounting", 20, "二十"), ("aiueo", 2, "ｲ"), ("iroha", 3, "ﾊ"), ("ordinal", 2, "2nd"),
+             ("ordinal", 11, "11th"), ("cardinalText", 21, "Twenty-one"), ("ordinalText", 3, "Third"),
+             ("ordinalText", 21, "Twenty-first"), ("cardinalText", 120, "One hundred twenty"),
+             ("koreanLegal", 2, "둘"), ("koreanCounting", 12, "십이"), ("ideographDigital", 10, "一〇"),
+             ("decimalFullWidth", 7, "７"), ("hex", 255, "FF"), ("chicago", 6, "††"), ("russianLower", 2, "б"))
+    for fmt, start, want in cases:
+        nm = ('<w:numbering {NS}><w:abstractNum w:abstractNumId="0">' + lvl(0, fmt, "%1", start)
+              + '</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>')
+        out = md(docm(P("x", num(0)), {"word/numbering.xml": nm}, NUM_REL))
+        assert out == f"{want} x\n", (fmt, out)
+
+
+def test_numbering_formats_past_their_sets():
+    """A letter format past its set repeats the letter (z, aa, bb); Chinese counting says the leading one and the
+    skipped place; legal forms say the one; the digital Korean forms are positional."""
+    from reader.formats.ooxml_styles import _fmt
+    got = [_fmt(n, "lowerLetter") for n in (26, 27, 28, 53)]
+    assert got == ["z", "aa", "bb", "aaa"], got
+    assert _fmt(15, "ganada") == "가가" and _fmt(16, "ganada") == "나나" and _fmt(27, "upperLetter") == "AA"
+    assert _fmt(10 ** 9, "lowerLetter") == str(10 ** 9)
+    got = [_fmt(n, "chineseCounting") for n in (10, 11, 20, 100, 101, 110, 111, 1001, 1010)]
+    assert got == ["十", "十一", "二十", "一百", "一百零一", "一百一十", "一百一十一", "一千零一", "一千零一十"], got
+    assert _fmt(101, "taiwaneseCountingThousand") == "一百零一" and _fmt(110, "japaneseCounting") == "百十"
+    got = [_fmt(n, "chineseLegalSimplified") for n in (10, 100, 105)]
+    assert got == ["壹拾", "壹佰", "壹佰零伍"], got
+    assert _fmt(10, "ideographLegalTraditional") == "壹拾" and _fmt(10, "japaneseLegal") == "壱拾"
+    assert _fmt(10, "koreanDigital") == "일영" and _fmt(21, "koreanDigital") == "이일"
+    assert _fmt(10, "koreanDigital2") == "一零" and _fmt(12, "koreanCounting") == "십이"
+    assert _fmt(1, "ideographEnclosedCircle") == "㊀" and _fmt(10, "ideographEnclosedCircle") == "㊉"
+    assert _fmt(11, "ideographEnclosedCircle") == "11"
+    got = [_fmt(n, "hebrew1") for n in (1, 11, 15, 16, 21, 100, 499)]
+    assert got == ["א", "יא", "טו", "טז", "כא", "ק", "תצט"], got
+    got = [_fmt(n, "arabicAbjad") for n in (1, 2, 3, 28)]
+    assert got == ["أ", "ب", "ج", "غ"], got
+    got = [_fmt(n, "ideographZodiacTraditional") for n in (1, 2, 11, 60, 61)]
+    assert got == ["甲子", "乙丑", "甲戌", "癸亥", "甲子"], got
+
+
+def test_numbering_style_link_and_instances():
+    """A list linked through a numbering style takes that style's levels; a second num of one abstractNum goes on
+    counting, a startOverride starts it again, and a lvlOverride's own lvl replaces the level."""
+    nm = ('<w:numbering {NS}>'
+          '<w:abstractNum w:abstractNumId="0"><w:styleLink w:val="LegalList"/>'
+          + lvl(0, "upperRoman", "Article %1.") + lvl(1, "lowerLetter", "(%2)") + '</w:abstractNum>'
+          '<w:abstractNum w:abstractNumId="1"><w:numStyleLink w:val="LegalList"/></w:abstractNum>'
+          '<w:abstractNum w:abstractNumId="2">' + lvl(0, "decimal", "%1.") + '</w:abstractNum>'
+          '<w:num w:numId="5"><w:abstractNumId w:val="0"/></w:num>'
+          '<w:num w:numId="6"><w:abstractNumId w:val="1"/></w:num>'
+          '<w:num w:numId="7"><w:abstractNumId w:val="2"/></w:num>'
+          '<w:num w:numId="8"><w:abstractNumId w:val="2"/></w:num>'
+          '<w:num w:numId="9"><w:abstractNumId w:val="2"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/>'
+          '</w:lvlOverride></w:num>'
+          '<w:abstractNum w:abstractNumId="3">' + lvl(0, "decimal", "%1.") + '</w:abstractNum>'
+          '<w:num w:numId="10"><w:abstractNumId w:val="3"/><w:lvlOverride w:ilvl="0">'
+          + lvl(0, "decimalEnclosedParen", "%1", 4) + '</w:lvlOverride></w:num>'
+          '</w:numbering>')
+    sty = styles('<w:style w:type="numbering" w:styleId="LegalList"><w:name w:val="Legal List"/><w:pPr>'
+                 '<w:numPr><w:numId w:val="5"/></w:numPr></w:pPr></w:style>')
+    body = (P("Scope", num(0, 6)) + P("first", num(1, 6)) + P("Terms", num(0, 6))
+            + P("a", num(0, 7)) + P("b", num(0, 8)) + P("c", num(0, 9)) + P("d", num(0, 7)) + P("e", num(0, 10)))
+    out = md(docm(body, {"word/numbering.xml": nm, **sty}, NUM_REL + STYLES_REL))
+    assert out == ("Article I. Scope\n  (a) first\nArticle II. Terms\n"
+                   "1. a\n2. b\n1. c\n2. d\n(4) e\n"), out
+
+
+def fld(instr, result="", ff=""):
+    sep = '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' + (f'<w:r><w:t>{result}</w:t></w:r>' if result else "") \
+        if result is not None else ""
+    return (f'<w:r><w:fldChar w:fldCharType="begin">{ff}</w:fldChar></w:r>'
+            f'<w:r><w:instrText xml:space="preserve"> {instr} </w:instrText></w:r>{sep}'
+            '<w:r><w:fldChar w:fldCharType="end"/></w:r>')
+
+
+def test_legacy_form_fields_show_their_state():
+    """A legacy check box shows ☒ or ☐ (w:checked, else w:default), a drop-down its chosen entry, a text field its
+    result; a content control's state still shows."""
+    box = '<w:ffData><w:name w:val="C1"/><w:checkBox><w:sizeAuto/><w:default w:val="0"/><w:checked/></w:checkBox></w:ffData>'
+    off = '<w:ffData><w:checkBox><w:default w:val="0"/></w:checkBox></w:ffData>'
+    on = '<w:ffData><w:checkBox><w:default/></w:checkBox></w:ffData>'
+    dd = ('<w:ffData><w:ddList><w:result w:val="1"/><w:listEntry w:val="DD-FIRST"/><w:listEntry w:val="DD-SECOND"/>'
+          '</w:ddList></w:ffData>')
+    dd0 = '<w:ffData><w:ddList><w:listEntry w:val="ONLY"/></w:ddList></w:ffData>'
+    text = '<w:ffData><w:textInput><w:default w:val="x"/></w:textInput></w:ffData>'
+    sdt = ('<w:sdt><w:sdtPr><w14:checkbox xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">'
+           '<w14:checked w14:val="1"/></w14:checkbox></w:sdtPr><w:sdtContent><w:r><w:t>☒</w:t></w:r></w:sdtContent></w:sdt>')
+    body = (f'<w:p><w:r><w:t xml:space="preserve">agree </w:t></w:r>{fld("FORMCHECKBOX", None, box)}'
+            f'{fld("FORMCHECKBOX", None, off)}{fld("FORMCHECKBOX", None, on)}</w:p>'
+            f'<w:p><w:r><w:t xml:space="preserve">pick </w:t></w:r>{fld("FORMDROPDOWN", None, dd)} {fld("FORMDROPDOWN", "", dd0)}</w:p>'
+            f'<w:p>{fld("FORMTEXT", "typed", text)}{sdt}</w:p>')
+    out = md(docm(body))
+    assert out == "agree ☒☐☒\n\npick DD-SECONDONLY\n\ntyped☒\n", out
+
+
+def test_ruby_is_base_then_reading():
+    ruby = ('<w:r><w:ruby><w:rubyPr><w:rubyAlign w:val="center"/></w:rubyPr><w:rt><w:r><w:t>かんじ</w:t></w:r></w:rt>'
+            '<w:rubyBase><w:r><w:t>漢字</w:t></w:r></w:rubyBase></w:ruby></w:r>')
+    out = md(docm(f'<w:p><w:r><w:t>前</w:t></w:r>{ruby}<w:r><w:t>後</w:t></w:r></w:p>'))
+    assert out == "前漢字(かんじ)後\n", out
+
+
+def test_symbol_characters():
+    """w:sym through the Symbol and Wingdings tables, a code in either's private-use form the same; another font's
+    code as itself; a private-use code of an unknown font is counted, and so is any code of a symbol font without a
+    table (its letters are pictures, not that letter); Wingdings 2's check marks are known."""
+    syms = ('<w:r><w:sym w:font="Wingdings" w:char="F0FC"/></w:r><w:r><w:sym w:font="Wingdings" w:char="A8"/></w:r>'
+            '<w:r><w:sym w:font="Symbol" w:char="F061"/></w:r><w:r><w:sym w:font="Arial" w:char="263A"/></w:r>'
+            '<w:r><w:sym w:font="Webdings" w:char="F021"/></w:r>')
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>ok</w:t></w:r>{syms}</w:p>'))
+    assert markdown.render(doc, tmp() / "a") == "ok✔◻α☺\n" and ctx.skipped["symbol"] == 1, ctx.skipped
+    syms = ('<w:r><w:sym w:font="Webdings" w:char="0061"/></w:r><w:r><w:sym w:font="Wingdings 3" w:char="007D"/></w:r>'
+            '<w:r><w:sym w:font="Wingdings 2" w:char="F052"/></w:r><w:r><w:sym w:font="Wingdings 2" w:char="A3"/></w:r>'
+            '<w:r><w:sym w:font="wingdings 2" w:char="F050"/></w:r><w:r><w:sym w:font="Wingdings 2" w:char="F054"/></w:r>'
+            '<w:r><w:sym w:font="MT Extra" w:char="0026"/></w:r><w:r><w:sym w:font="Marlett" w:char="0061"/></w:r>')
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>ok</w:t></w:r>{syms}</w:p>'))
+    assert markdown.render(doc, tmp() / "a") == "ok☑☐✓☒\n" and ctx.skipped["symbol"] == 4, \
+        (markdown.render(doc, tmp() / "a"), ctx.skipped)
+
+
+def test_vml_text_art_and_drawing_title():
+    """WordArt's v:textpath string is text after its paragraph; a drawing's title is its alt when it has no
+    description."""
+    art = ('<w:p><w:r><w:t>lead</w:t></w:r><w:r><w:pict><v:shape><v:textpath style="font-family:Arial" '
+           'string="WORDART-VML-TEXT"/></v:shape></w:pict></w:r></w:p>')
+    pic = ('<w:p><w:r><w:drawing><wp:inline><wp:docPr id="1" name="p" title="Floor plan"/><a:graphic><a:graphicData>'
+           '<pic:pic><pic:blipFill><a:blip r:embed="rI"/></pic:blipFill></pic:pic></a:graphicData></a:graphic>'
+           '</wp:inline></w:drawing></w:r></w:p>')
+    out = md(docm(art + pic, {"word/media/i.png": PNG}, (("rI", "image", "media/i.png", False),)))
+    assert out == "lead\n\nWORDART-VML-TEXT\n\n![Floor plan](assets/img-001.png)\n", out
+
+
+def chunk_docx():
+    inner = docm(P("CHUNK-DOCX") + '<w:p><w:r><w:t>n</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>',
+                 {"word/footnotes.xml": '<w:footnotes {NS}><w:footnote w:id="1">' + P("inner note")
+                  + '</w:footnote></w:footnotes>'},
+                 (("rF", "footnotes", "footnotes.xml", False),))
+    return inner.read_bytes()
+
+
+def test_alt_chunk_reads_its_part():
+    """An altChunk part is read by the reader's parser for its kind: HTML, RTF, plain text, a Word package (its note
+    kept apart from the document's own); a missing one is counted."""
+    body = (P("before") + '<w:altChunk r:id="rH"/><w:altChunk r:id="rR"/><w:altChunk r:id="rT"/>'
+            '<w:altChunk r:id="rD"/><w:altChunk r:id="rX"/>'
+            '<w:p><w:r><w:t>own</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>')
+    parts = {"word/a.html": b"<html><body><p>ALTCHUNK-<b>HTML</b></p></body></html>",
+             "word/b.rtf": rb"{\rtf1\ansi CHUNK-RTF\par}",
+             "word/c.txt": "CHUNK-TEXT line 1\r\nline 2\r\n".encode("utf-8"),
+             "word/d.docx": chunk_docx(),
+             "word/footnotes.xml": '<w:footnotes {NS}><w:footnote w:id="1">' + P("outer note") + '</w:footnote></w:footnotes>'}
+    rels = (("rH", "aFChunk", "a.html", False), ("rR", "aFChunk", "b.rtf", False), ("rT", "aFChunk", "c.txt", False),
+            ("rD", "aFChunk", "d.docx", False), ("rX", "aFChunk", "gone.html", False),
+            ("rF", "footnotes", "footnotes.xml", False))
+    doc, ctx = parse(docm(body, parts, rels))
+    out = markdown.render(doc, tmp() / "a")
+    assert out == ("before\n\nALTCHUNK-**HTML**\n\nCHUNK-RTF\n\nCHUNK-TEXT line 1\n\nline 2\n\nCHUNK-DOCX\n\nn[^1]\n\n"
+                   "own[^2]\n\n[^1]: inner note\n[^2]: outer note\n"), out
+    assert ctx.skipped["chunk"] == 1, ctx.skipped
+
+
+def test_alt_chunk_depth_is_capped():
+    """A Word package imported into itself stops at ALT_CHUNK_DEPTH levels, the rest counted."""
+    data = docm(P("leaf")).read_bytes()
+    for k in range(limits.ALT_CHUNK_DEPTH + 2):
+        data = docm(P(f"level{k}") + '<w:altChunk r:id="rD"/>', {"word/d.docx": data},
+                    (("rD", "aFChunk", "d.docx", False),)).read_bytes()
+    path = tmp() / "deep.docm"
+    path.write_bytes(data)
+    doc, ctx = parse(path)
+    out = markdown.render(doc, tmp() / "a")
+    assert out.count("level") == limits.ALT_CHUNK_DEPTH + 1 and "leaf" not in out and ctx.skipped["chunk"] == 1, \
+        (out, ctx.skipped)
+
+
+def test_alt_chunks_share_one_budget():
+    """Every imported part a document reads, at any level, is charged to ALT_CHUNKS and its bytes to ALT_CHUNK_BYTES
+    before it is read; past either the part is counted."""
+    leaf = docm(P("leaf")).read_bytes()
+    five = tuple((f"r{i}", "aFChunk", f"l{i}.docx", False) for i in range(5))
+    mid = docm(P("mid") + "".join(f'<w:altChunk r:id="r{i}"/>' for i in range(5)),
+               {f"word/l{i}.docx": leaf for i in range(5)}, five).read_bytes()
+    three = tuple((f"r{i}", "aFChunk", f"m{i}.docx", False) for i in range(3))
+    top = docm(P("top") + "".join(f'<w:altChunk r:id="r{i}"/>' for i in range(3)),
+               {f"word/m{i}.docx": mid for i in range(3)}, three)
+    old = limits.ALT_CHUNKS, limits.ALT_CHUNK_BYTES
+    try:
+        limits.ALT_CHUNKS = 6
+        doc, ctx = parse(top)
+        out = markdown.render(doc, tmp() / "a")
+        assert (out.count("mid"), out.count("leaf"), ctx.skipped["chunk"]) == (1, 5, 2), (out, ctx.skipped)
+        limits.ALT_CHUNKS, limits.ALT_CHUNK_BYTES = old[0], 40
+        text = docm(P("top") + '<w:altChunk r:id="rA"/><w:altChunk r:id="rB"/>',
+                    {"word/a.txt": b"SMALL", "word/b.txt": b"B" * 36},
+                    (("rA", "aFChunk", "a.txt", False), ("rB", "aFChunk", "b.txt", False)))
+        doc, ctx = parse(text)
+        out = markdown.render(doc, tmp() / "a")
+        assert out == "top\n\nSMALL\n" and ctx.skipped["chunk"] == 1, (out, ctx.skipped)
+    finally:
+        limits.ALT_CHUNKS, limits.ALT_CHUNK_BYTES = old
+
+
+def test_alt_chunk_of_another_kind_never_fails_the_document():
+    """A part that starts like a zip but is no Word package, one cut short, and an XML part that is not HTML are
+    counted; the body around them is read."""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("x.txt", "not a package")
+    flat = (b'<?xml version="1.0"?><pkg:package xmlns:pkg="http://schemas.microsoft.com/office/2006/xmlPackage">'
+            b'<pkg:part><pkg:binaryData>QUJDQUJDQUJD</pkg:binaryData></pkg:part></pkg:package>')
+    xhtml = b'<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>XHTML-CHUNK</p></body></html>'
+    body = (P("BEFORE") + '<w:altChunk r:id="rZ"/><w:altChunk r:id="rC"/><w:altChunk r:id="rF"/>'
+            '<w:altChunk r:id="rH"/>' + P("AFTER"))
+    parts = {"word/z.docx": buf.getvalue(), "word/c.docx": b"PK\x03\x04" + b"cut short",
+             "word/f.xml": flat, "word/h.xml": xhtml}
+    rels = (("rZ", "aFChunk", "z.docx", False), ("rC", "aFChunk", "c.docx", False),
+            ("rF", "aFChunk", "f.xml", False), ("rH", "aFChunk", "h.xml", False))
+    doc, ctx = parse(docm(body, parts, rels))
+    out = markdown.render(doc, tmp() / "a")
+    assert out == "BEFORE\n\nXHTML-CHUNK\n\nAFTER\n" and ctx.skipped["chunk"] == 3, (out, ctx.skipped)
+
+
+def test_alt_chunk_with_many_comments_reads_in_time():
+    body = P("BEFORE") + '<w:altChunk r:id="rH"/>' + P("AFTER")
+    part = b"<!---->" * 60 + b"<p>CHUNK</p>"
+    t = time.perf_counter()
+    out = md(docm(body, {"word/h.html": part}, (("rH", "aFChunk", "h.html", False),)))
+    assert time.perf_counter() - t < 5, time.perf_counter() - t
+    assert out == "BEFORE\n\nCHUNK\n\nAFTER\n", out
+
+
+def test_alt_chunk_of_broken_rtf_is_counted():
+    body = P("BEFORE") + '<w:altChunk r:id="rR"/>' + P("AFTER")
+    doc, ctx = parse(docm(body, {"word/r.rtf": b"{\\RTF1 hi}"}, (("rR", "aFChunk", "r.rtf", False),)))
+    out = markdown.render(doc, tmp() / "a")
+    assert out == "BEFORE\n\nAFTER\n" and ctx.skipped["chunk"] == 1, (out, ctx.skipped)
+
+
+def test_page_number_wording_and_picture_font_space():
+    from reader.formats import word_fields
+    for shell in ("Page of", "- -", "Seite von", "제 쪽", "제쪽", "제면", "pp.", "p.", "Página de"):
+        assert word_fields.page_shell(shell), shell
+    for kept in ("Report", "Seite 3 Entwurf", "제안서", "PPP", "PDE", "Depp", "면제", "제제"):
+        assert not word_fields.page_shell(kept), kept
+    assert word_fields.symbol("Webdings", 0x20) == " " and word_fields.symbol("Webdings", 0xF020) == " "
+    assert word_fields.symbol("Webdings", 0x21) is None
+    assert word_fields.symbol("Wingdings 2", 0x20) == " " and word_fields.symbol("Wingdings 2", 0x52) == "☑"
+
+
+CORE = ('<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>Lease</dc:title><dc:subject>Unit 4</dc:subject>'
+        '<dc:creator>Kim</dc:creator><cp:keywords>lease, rent</cp:keywords><dc:description></dc:description>'
+        '<cp:lastModifiedBy>Lee</cp:lastModifiedBy><cp:revision>3</cp:revision>'
+        '<dcterms:created xsi:type="dcterms:W3CDTF">2024-03-05T10:30:00Z</dcterms:created>'
+        '<dcterms:modified xsi:type="dcterms:W3CDTF">2024-04-01T08:00:00Z</dcterms:modified></cp:coreProperties>')
+APP = ('<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
+       '<Template>Normal.dotm</Template><TotalTime>4</TotalTime><Pages>1</Pages><Words>3</Words>'
+       '<Application>Microsoft Office Word</Application><Company>ACME</Company></Properties>')
+CUSTOM = ('<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" '
+          'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+          '<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="Client"><vt:lpwstr>Hanbit</vt:lpwstr></property>'
+          '<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="3" name="Due"><vt:filetime>2024-05-01T09:00:00Z'
+          '</vt:filetime></property>'
+          '<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="4" name="Empty"><vt:lpwstr></vt:lpwstr></property>'
+          '</Properties>')
+PACKAGE_RELS = "http://schemas.openxmlformats.org/package/2006/relationships"
+OFFICE_RELS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def test_document_properties():
+    """docProps' title is the title; what else is set and says something is one line at the top, in a fixed order;
+    the application, template, counts and an empty property are left out, and so is a last author who is the
+    author."""
+    root = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{OFFICE_RELS}/officeDocument" Target="word/document.xml"/>'
+            f'<Relationship Id="rId2" Type="{PACKAGE_RELS}/metadata/core-properties" Target="docProps/core.xml"/>'
+            f'<Relationship Id="rId3" Type="{OFFICE_RELS}/extended-properties" Target="docProps/app.xml"/>'
+            f'<Relationship Id="rId4" Type="{OFFICE_RELS}/custom-properties" Target="docProps/custom.xml"/>'
+            '</Relationships>')
+    parts = {"_rels/.rels": root, "docProps/core.xml": CORE, "docProps/app.xml": APP, "docProps/custom.xml": CUSTOM}
+    out = md(docm(P("body"), parts))
+    assert out == ("Properties: subject: Unit 4; author: Kim; last author: Lee; created: 2024-03-05 10:30; "
+                   "modified: 2024-04-01 08:00; company: ACME; keywords: lease, rent; Client: Hanbit; "
+                   "Due: 2024-05-01 09:00\n\n# Lease\n\nbody\n"), out
+    parts["docProps/core.xml"] = CORE.replace("<cp:lastModifiedBy>Lee", "<cp:lastModifiedBy>Kim")
+    parts["docProps/core.xml"] = parts["docProps/core.xml"].replace("<dc:title>Lease</dc:title>", "")
+    del parts["docProps/app.xml"], parts["docProps/custom.xml"]
+    out = md(docm(P("body"), parts))
+    assert out.startswith("Properties: subject: Unit 4; author: Kim; created: 2024-03-05 10:30; "
+                          "modified: 2024-04-01 08:00; keywords: lease, rent\n\nbody"), out
+
+
+def test_oversized_properties_part_is_counted():
+    """A properties part the package refuses (too large for its compressed size) is counted; the body is read."""
+    root = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{OFFICE_RELS}/officeDocument" Target="word/document.xml"/>'
+            f'<Relationship Id="rId4" Type="{OFFICE_RELS}/custom-properties" Target="docProps/custom.xml"/>'
+            '</Relationships>')
+    big = CUSTOM.replace("</Properties>", " " * (3 * 2**20) + "</Properties>")
+    doc, ctx = parse(docm(P("body"), {"_rels/.rels": root, "docProps/custom.xml": big}))
+    assert markdown.render(doc, tmp() / "a") == "body\n" and ctx.skipped["properties"] == 1, ctx.skipped
+
+
+def test_properties_an_application_writes_are_left_out():
+    """Custom properties an application stamps on every file (build numbers, sensitivity labels, content type ids)
+    say nothing about the document: only the author's own stay."""
+    def prop(pid, name, value):
+        return (f'<property fmtid="{{D5CDD505-2E9C-101B-9397-08002B2CF9AE}}" pid="{pid}" name="{name}">'
+                f'<vt:lpwstr>{value}</vt:lpwstr></property>')
+    custom = (CUSTOM.split("<property")[0] + prop(2, "KSOProductBuildVer", "1033-12.9.0.21549")
+              + prop(3, "ICV", "4A566D024B714F96833A365606725056_12")
+              + prop(4, "MSIP_Label_f42aa342-8706-4288-bd11-ebb85995028c_Enabled", "true")
+              + prop(5, "ContentTypeId", "0x0101009A1B") + prop(6, "Client", "Hanbit")
+              + prop(7, "_dlc_DocIdItemGuid", "7a1c") + prop(8, "ICVersion", "2") + prop(9, "Icv", "low")
+              + prop(10, "ContentTypeIdea", "draft") + "</Properties>")
+    root = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{OFFICE_RELS}/officeDocument" Target="word/document.xml"/>'
+            f'<Relationship Id="rId4" Type="{OFFICE_RELS}/custom-properties" Target="docProps/custom.xml"/>'
+            '</Relationships>')
+    out = md(docm(P("body"), {"_rels/.rels": root, "docProps/custom.xml": custom}))
+    assert out == ("Properties: Client: Hanbit; ICVersion: 2; Icv: low; ContentTypeIdea: draft\n\n"
+                   "body\n"), out
+
+
+def test_page_fields_dropped_in_headers():
+    """A header's PAGE, NUMPAGES or SECTIONPAGES result is left out, in a complex field or a simple one; in the body it
+    stays."""
+    hd = ('<w:hdr {NS}><w:p><w:r><w:t xml:space="preserve">HEADER-TEXT </w:t></w:r>' + fld("PAGE", "1")
+          + '<w:r><w:t xml:space="preserve"> of </w:t></w:r><w:fldSimple w:instr=" NUMPAGES \\* Arabic ">'
+          '<w:r><w:t>9</w:t></w:r></w:fldSimple></w:p></w:hdr>')
+    out = md(docm(f'<w:p><w:r><w:t xml:space="preserve">page </w:t></w:r>{fld("PAGE", "3")}</w:p>',
+                  {"word/header1.xml": hd}, (("rH", "header", "header1.xml", False),)))
+    assert out == "Header: HEADER-TEXT of\n\npage 3\n", out
+    for shell in ("Page {} of {}", "- {} -", "{} / {}", "{}쪽", "페이지 {}"):
+        a, _, b = shell.partition("{}")
+        b, _, c = b.partition("{}")
+        hd = ('<w:hdr {NS}><w:p><w:r><w:t xml:space="preserve">' + a + '</w:t></w:r>' + fld("PAGE", "1")
+              + '<w:r><w:t xml:space="preserve">' + b + '</w:t></w:r>'
+              + ('<w:fldSimple w:instr=" NUMPAGES "><w:r><w:t>9</w:t></w:r></w:fldSimple>' if "{}" in shell[len(a) + 2:]
+                 else "") + '<w:r><w:t xml:space="preserve">' + c + '</w:t></w:r></w:p></w:hdr>')
+        out = md(docm(P("body"), {"word/header1.xml": hd}, (("rH", "header", "header1.xml", False),)))
+        assert out == "body\n", (shell, out)
 
 
 def main():

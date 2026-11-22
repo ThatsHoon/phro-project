@@ -662,7 +662,7 @@ def test_tracked_deletion_hidden():
     out = _md(doc, ctx)
     assert "gone" not in out and "Keep stay" in out and "(1 hidden places left out)" in out, out
     shown = _md(doc, ctx, hidden=True)
-    assert "(hidden: gone )" in shown, shown
+    assert "(deleted: gone )" in shown, shown
     # a deletion table that cannot be read fails the storage rather than showing deleted text as body text
     body = archive(BODY, 2001, pb((3, "secret"), (22, b"\x0f")))
     assert _kind({"Index/Document.iwa": iwa_member(*pages_doc(BODY), body)}) == "damaged"
@@ -1716,7 +1716,7 @@ def test_slide_title_notes_and_hidden():
     md = _md(doc, ctx)
     assert "gone" not in md and "(1 hidden places left out)" in md, md
     md = _md(doc, ctx, hidden=True)
-    assert "(hidden: gone)" in md and "## Slide 1: Kept\n" in md, md
+    assert "(deleted: gone)" in md and "## Slide 1: Kept\n" in md, md
 
 
 def test_walk_resets_between_apps():

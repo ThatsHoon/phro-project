@@ -535,6 +535,8 @@ def _run(r, out, mode):
     if font is None:
         font = {"p": "\\mathrm", "0": "\\mathrm", "b": "\\mathbf", "1": "\\mathbf",
                 "bi": "\\boldsymbol", "3": "\\boldsymbol"}.get(_run_value(r, "sty"))
+        if font == "\\mathrm" and not any(c.isalpha() for c in text):
+            font = None
     inner = Tex()
     if mode == _ARRAY:
         for i, piece in enumerate(text.split("&")):

@@ -49,7 +49,13 @@ IMAGE_BYTES = 256 * 2**20
 # 600 bytes. A real document has thousands at most (a thousand-page form with ten tables a page has ten thousand);
 # ten times that is past any, and holds the tables to about 60 MB and a second or two of parse and render
 TABLE_NODES = 100_000
+FORM_BYTES = 16 * 2**20  # form field data one .doc reads, each place in its Data stream once; past it a form field
+#                          shows no state and is counted
 SHAPE_ROWS = 100_000
+ALT_CHUNK_DEPTH = 4  # altChunk parts one docx reads inside one another (a Word package imported into one imported)
+ALT_CHUNKS = 64  # altChunk parts one document reads, every level together
+ALT_CHUNK_BYTES = 2**27  # bytes of the altChunk parts one document reads, every level together
+PROPERTY_STREAM = 2**20  # bytes of a .doc SummaryInformation or DocumentSummaryInformation stream read; past it, none
 SMARTART_NODES = 5_000  # SmartArt text items one document may emit, copies counted; one data part reads at most four times as many points and connections
 # metafile pictures (WMF, EMF, PICT, WPG, TIFF): each cap is read at call time
 FIGURE_CHARS = 20_000      # figure text per picture

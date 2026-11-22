@@ -17,13 +17,13 @@ from ..containers.zipx import attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
 from ..markdown import blocks_len
 from ..model import (
-    Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem,
+    Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Inserted, Link, ListItem,
     NoteRef, Para, Section, Table, Text,
 )
 
 _DROP = frozenset({"page-number", "page-count", "annotation-end", "soft-page-break", "number", "bookmark",
-                   "bookmark-start", "bookmark-end", "change", "change-start", "change-end",
-                   "hidden-paragraph", "tracked-changes"})
+                   "bookmark-start", "bookmark-end", "hidden-paragraph", "tracked-changes"})
+_LEAVES = frozenset({"s", "tab", "line-break", "note", "annotation"})
 _CONTAINERS = frozenset({"table-of-content", "user-index", "alphabetical-index", "bibliography",
                          "illustration-index", "table-index", "object-index", "index-body",
                          "index-title", "numbered-paragraph"})
@@ -63,11 +63,26 @@ def _itext(inlines) -> str:
     for it in inlines:
         if isinstance(it, Text):
             out += it.text
-        elif isinstance(it, (Bold, Link)):
+        elif isinstance(it, (Bold, Link, Inserted)):
             out += _itext(it.inlines)
         elif isinstance(it, Break):
             out += " "
     return out
+
+
+def _join(out, it):
+    """Append `it`; an Inserted right after one by the same author joins it."""
+    if isinstance(it, Inserted) and out and isinstance(out[-1], Inserted) and out[-1].author == it.author:
+        out[-1].inlines.extend(it.inlines)
+    else:
+        out.append(it)
+
+
+def _lift(make, sub):
+    """`make(sub)`, or an Inserted around `make` of its content when all of `sub` is one author's insertion."""
+    if sub and all(isinstance(x, Inserted) and x.author == sub[0].author for x in sub):
+        return Inserted([make([y for x in sub for y in x.inlines])], sub[0].author)
+    return make(sub)
 
 
 def _flat(blocks) -> str:
@@ -292,6 +307,8 @@ class Body:
         self.glued = None  # odt read as one diagram scope: the shape ids connectors glue; None otherwise
         self.members = {}  # diagram key -> its element, waiting for place()
         self.keys = set()  # diagram keys given out
+        self.changes = {}  # changed-region id -> ("insertion", author) or ("deletion", its Hidden)
+        self.ins = None  # (id, author) of the insertion the walk is inside
 
     def hide(self, blocks):
         """Hidden copies of blocks; the originals may be shared with a cached object."""
@@ -372,14 +389,21 @@ class Body:
         out = []
         self._text(el.text, out)
         for c in el:
-            self._child(c, out, d)
+            ins = self.ins
+            if ins is not None and local(c.tag) in _LEAVES:
+                sub = []
+                self._child(c, sub, d)
+                for x in sub:
+                    _join(out, Inserted([x], ins[1]))
+            else:
+                self._child(c, out, d)
             self._text(c.tail, out)
         return out
 
-    @staticmethod
-    def _text(s, out):
+    def _text(self, s, out):
         if s:
-            out.append(Text(re.sub(r"[ \t\r\n]+", " ", s)))
+            t = Text(re.sub(r"[ \t\r\n]+", " ", s))
+            _join(out, Inserted([t], self.ins[1]) if self.ins is not None else t)
 
     def _child(self, c, out, d):
         n = local(c.tag)
@@ -388,16 +412,30 @@ class Body:
         elif n == "span":
             sub = self.inlines(c, d + 1)
             if sub and self.is_bold(attr(c, "style-name")):
-                out.append(Bold([y for x in sub for y in (x.inlines if isinstance(x, Bold) and not x.hidden else [x])]))
+                _join(out, _lift(lambda xs: Bold([y for x in xs for y in (
+                    x.inlines if isinstance(x, Bold) and not x.hidden else [x])]), sub))
             else:
-                out.extend(sub)
+                for x in sub:
+                    _join(out, x)
         elif n == "a":
             sub = self.inlines(c, d + 1)
             href = (attr(c, "href") or "").strip()[:2000]
             if href and not href.startswith("#"):
-                out.append(Link(href, sub))
+                _join(out, _lift(lambda xs: Link(href, xs), sub))
             else:
-                out.extend(sub)
+                for x in sub:
+                    _join(out, x)
+        elif n == "change-start":
+            got = self.changes.get(attr(c, "change-id"))
+            if got is not None and got[0] == "insertion":
+                self.ins = (attr(c, "change-id"), got[1])
+        elif n == "change-end":
+            if self.ins is not None and self.ins[0] == attr(c, "change-id"):
+                self.ins = None
+        elif n == "change":
+            got = self.changes.pop(attr(c, "change-id"), None)
+            if got is not None and got[0] == "deletion":
+                out.append(got[1])
         elif n == "s":
             out.append(Text(" " * min(max(_int(attr(c, "c"), 1), 1), _SPACES)))
         elif n == "tab":
@@ -408,12 +446,20 @@ class Body:
             self.note(c, out, d)
         elif n == "annotation":
             self.annotation(c, out, d)
+        elif n == "ruby":
+            for b in kids(c, "ruby-base"):
+                for x in self.inlines(b, d + 1):
+                    _join(out, x)
+            reading = _squash(" ".join("".join(t.itertext()) for t in kids(c, "ruby-text")))
+            if reading:
+                self._text(f"({reading})", out)
         elif n == "hidden-text":
             out.append(Hidden([Text(_squash(attr(c, "string-value") or "".join(c.itertext())))]))
         elif n == "frame":
             self.frame(c, d)
         elif n not in _DROP:
-            out.extend(self.inlines(c, d + 1))
+            for x in self.inlines(c, d + 1):
+                _join(out, x)
 
     def note(self, el, out, d):
         key = "en" if attr(el, "note-class") == "endnote" else "fn"
@@ -673,7 +719,8 @@ class Body:
                 return inner
             return [Section("chapter", blocks=self.hide(inner), hidden="hidden")] if inner else []
         if n == "tracked-changes":
-            return self.deletions(c)
+            self.tracked(c, d)
+            return []
         if n in _CONTAINERS:
             return self.blocks(c, d + 1)
         if n == "frame":
@@ -697,13 +744,29 @@ class Body:
             out = self.hide(out)
         return out
 
-    def deletions(self, tc):
-        out = []
+    def tracked(self, tc, d):
+        """The changed regions, by id, for the change marks of the text that follows: an insertion's author, and a
+        deletion's text as a Hidden of kind "deleted" with its author, its paragraphs joined by spaces."""
         for reg in kids(tc, "changed-region"):
-            for dl in kids(reg, "deletion"):
-                text = " ".join("".join(k.itertext()) for k in dl if local(k.tag) != "change-info")
-                out.append(Para([Hidden([Text(_squash(text))], "deleted")]))
-        return out
+            rid = attr(reg, "id")
+            for ch in reg:
+                kind = local(ch.tag)
+                if kind not in ("insertion", "deletion"):
+                    continue
+                who = next((_squash("".join(k.itertext()), 64) for info in kids(ch, "change-info")
+                            for k in kids(info, "creator")), "")
+                if kind == "insertion":
+                    self.changes[rid] = (kind, who)
+                    continue
+                inl = []
+                for k in ch:
+                    if local(k.tag) == "change-info":
+                        continue
+                    if inl:
+                        inl.append(Text(" "))
+                    inl.extend(self.inlines(k, d + 1) if local(k.tag) in ("p", "h") else
+                               [Text(_squash("".join(k.itertext()), 10_000))])
+                self.changes[rid] = (kind, Hidden(inl, "deleted", who))
 
     # ---- lists
     def list(self, lst, d):

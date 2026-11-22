@@ -12,7 +12,7 @@ from . import limits
 from .images import Assets, pixel_size, sniff
 from .limits import ReadError
 from .model import (
-    Bold, Break, Code, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math,
+    Bold, Break, Code, Doc, Equation, Heading, Hidden, Image, Inserted, Link, ListItem, Math,
     NoteRef, Para, Quote, Section, Table, Text,
 )
 
@@ -43,7 +43,7 @@ LOST = (
     (("scan",), "scanned page not shown", "scanned pages not shown"),
     (("textless",), "page with no text layer", "pages with no text layer"),
     (("figure",), "vector figure not shown", "vector figures not shown"),
-    (("field",), "form field", "form fields"),
+    (("field", "form"), "form field", "form fields"),
     (("annotation",), "annotation", "annotations"),
     (("document",), "document part", "document parts"),
     (("master",), "master slide", "master slides"),
@@ -67,6 +67,9 @@ LOST = (
     (("smartart",), "SmartArt diagram", "SmartArt diagrams"),
     (("smartart_cut",), "SmartArt diagram cut short", "SmartArt diagrams cut short"),
     (("object",), "embedded object", "embedded objects"),
+    (("chunk",), "imported part", "imported parts"),
+    (("symbol",), "symbol character", "symbol characters"),
+    (("properties",), "document properties part", "document properties parts"),
     (("link",), "link", "links"),
     (("links_cut",), "hyperlink list cut short", "hyperlink lists cut short"),
     (("connections_cut",), "connection list cut short", "connection lists cut short"),
@@ -287,6 +290,12 @@ def _plain(s):
     return re.sub(r"\s+", " ", s).strip().casefold()
 
 
+def _change_label(it, kind) -> str:
+    """"inserted" or "deleted", with " by <author>" when the change names one."""
+    author = one_line(getattr(it, "author", ""))
+    return f"{kind} by {author}" if author else kind
+
+
 def _inl_len(inl) -> int:
     n = 0
     for it in inl:
@@ -357,7 +366,7 @@ class _Render:
 
     # ---- inlines
     def inlines(self, items, m=BLOCK) -> str:
-        parts = []  # str or list-of-inlines for a bold run
+        parts = []  # str, list-of-inlines for a bold run, or an Inserted run of one author
         for it in items:
             if isinstance(it, Hidden) or it.hidden:
                 if not self.show:
@@ -366,7 +375,13 @@ class _Render:
                         self._hidden_marks(it)
                     continue
                 inner = self._one(it, m, as_hidden=True)
-                parts.append(f"(hidden: {inner})")
+                why = it.kind if isinstance(it, Hidden) else it.hidden
+                parts.append(f"({m.esc(_change_label(it, why)) if why == 'deleted' else 'hidden'}: {inner})")
+            elif isinstance(it, Inserted):
+                if parts and isinstance(parts[-1], Inserted) and parts[-1].author == it.author:
+                    parts[-1].inlines.extend(it.inlines)
+                else:
+                    parts.append(Inserted(list(it.inlines), it.author))
             elif isinstance(it, Bold) and not m.plain:
                 if parts and isinstance(parts[-1], list):
                     parts[-1].extend(it.inlines)
@@ -374,7 +389,16 @@ class _Render:
                     parts.append(list(it.inlines))
             else:
                 parts.append(self._one(it, m))
-        return "".join(self._bold(p, m) if isinstance(p, list) else p for p in parts)  # joined once: linear
+        return "".join(self._bold(p, m) if isinstance(p, list) else self._inserted(p, m) if isinstance(p, Inserted)
+                       else p for p in parts)  # joined once: linear
+
+    def _inserted(self, it, m):
+        inner = self.inlines(it.inlines, m)
+        core = inner.strip()
+        if not core:
+            return inner
+        lead, trail = inner[:len(inner) - len(inner.lstrip())], inner[len(inner.rstrip()):]
+        return f"{lead}({m.esc(_change_label(it, 'inserted'))}: {core}){trail}"
 
     def _bold(self, items, m):
         inner = self.inlines(items, m)
@@ -389,6 +413,8 @@ class _Render:
             return m.esc(it.text)
         if isinstance(it, Hidden):
             return self.inlines(it.inlines, m) if as_hidden else ""
+        if isinstance(it, Inserted):
+            return self._inserted(it, m)
         if isinstance(it, Bold):
             inner = self.inlines(it.inlines, m)
             return inner if m.plain else self._bold(it.inlines, m)
@@ -646,7 +672,7 @@ class _Render:
             if isinstance(it, Text):
                 if it.text.strip():
                     return True
-            elif isinstance(it, (Bold, Hidden)):
+            elif isinstance(it, (Bold, Hidden, Inserted)):
                 if self._inl_has_text(it.inlines):
                     return True
             elif isinstance(it, Link):
@@ -910,6 +936,9 @@ class _Render:
             self.ocr = dict(NO_OCR, **self.doc.meta.get("ocr", {}), pictures_left=left)
             self.ocr_hint = self.pictures is not None and self.pictures.s.hint
             status += ocr_notes(self.ocr, self.ocr_hint)
+        props = self.doc.meta.get("properties")
+        if props:
+            status.append("Properties: " + "; ".join(f"{k}: {v}" for k, v in props))
         if hf:
             status.append("\n".join(hf))
         top = status + top

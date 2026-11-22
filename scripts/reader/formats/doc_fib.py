@@ -14,6 +14,8 @@ FibRgFcLcb97 indices this reader uses (MS-DOC 2.5.6; dochan reads all but 73/74 
 PlcfandRef/Txt, 11 PlcfHdd, 12/13 PlcfBteChpx/Papx, 33 Clx, 36 GrpXstAtnOwners, 40 PlcSpaMom, 46/47
 PlcfendRef/Txt, 50 DggInfo, 56 PlcftxbxTxt, 58 PlcfHdrtxbxTxt, 73 PlfLst, 74 PlfLfo.
 """
+import codecs
+import datetime
 import struct
 from bisect import bisect_right
 from dataclasses import dataclass, replace
@@ -85,8 +87,8 @@ def fib(word: bytes) -> Fib:
         return k, pos + 2 + k * width
 
     csw, pos = count(0x20, 2)
-    if csw > 13:
-        out.lid_fe = struct.unpack_from("<H", word, 0x22 + 26)[0]
+    if n >= 0x3E:  # FibRgW97 is 14 words (MS-DOC 2.5.2: csw MUST be 14): a FIB that says fewer has lidFE there too
+        out.lid_fe = struct.unpack_from("<H", word, 0x3C)[0]
     cslw, end = count(pos, 4)
     lw = struct.unpack_from("<%dI" % min(cslw, 3 + len(STORIES)), word, pos + 2)
     for k, name in enumerate(STORIES):
@@ -424,8 +426,9 @@ def huge_papx(data: bytes, at: int) -> bytes | None:
 
 @dataclass(slots=True)
 class RunProps:
-    """Character properties: bold, vanish (hidden), deleted (a tracked deletion), special (fSpec: \\x01 and \\x08
-    are objects), pic (PicLocation: a Data stream offset), ole (fOle2) and obj (ObjLocation)."""
+    """Character properties: bold, vanish (hidden), deleted and inserted (tracked changes; rmark and rmark_del are
+    their authors' indices in SttbfRMark), special (fSpec: \\x01 and \\x08 are objects), pic (PicLocation: a Data
+    stream offset), ole (fOle2) and obj (ObjLocation)."""
     bold: bool = False
     vanish: bool = False
     deleted: bool = False
@@ -433,6 +436,9 @@ class RunProps:
     pic: int | None = None
     ole: bool = False
     obj: int | None = None
+    inserted: bool = False
+    rmark: int | None = None
+    rmark_del: int | None = None
 
 
 @dataclass(slots=True)
@@ -476,8 +482,9 @@ def _depth(arg: bytes) -> int:
 # The sprms the reader handles, each table the only place its handler looks an op up, so _READ (what last_sprms
 # keeps) is derived from them and cannot drift: a character toggle (ToggleOperand) -> its RunProps field; a
 # character value (u32) -> its field; a paragraph sprm -> (its ParaProps field, operand -> value).
-RUN_TOGGLES = {0x0835: "bold", 0x083C: "vanish", 0x0800: "deleted", 0x0855: "special", 0x080A: "ole"}
-RUN_VALUES = {0x6A03: "pic", 0x680E: "obj"}
+RUN_TOGGLES = {0x0835: "bold", 0x083C: "vanish", 0x0800: "deleted", 0x0801: "inserted", 0x0855: "special",
+               0x080A: "ole"}
+RUN_VALUES = {0x6A03: "pic", 0x680E: "obj", 0x4804: "rmark", 0x4863: "rmark_del"}
 PARA_SPRMS = {0x2640: ("outline", _u8), 0x2416: ("in_table", _flag), 0x2417: ("ttp", _flag),
               0x244B: ("inner_cell", _flag), 0x244C: ("inner_row", _flag), 0x6649: ("itap", _depth),
               0x260A: ("ilvl", _u8), 0x460B: ("ilfo", _uint), 0xD608: ("tdef", bytes)}
@@ -868,3 +875,124 @@ class Lists:
                 lv = formats.get(part) or (levels[part] if part < len(levels) else level)
                 out.append(number(cnt.get(part, lv.start), _NFC.get(lv.nfc, "DIGIT")))
         return "".join(out)[:MAX_MARKER].strip()
+
+
+# ---- property sets (MS-OLEPS 2.21 PropertySetStream, 2.20 PropertySet, 2.15 TypedPropertyValue, 2.17 Dictionary)
+SUMMARY_STREAM, DOC_SUMMARY_STREAM = "\x05SummaryInformation", "\x05DocumentSummaryInformation"
+_SUMMARY = bytes.fromhex("e0859ff2f94f6810ab9108002b27b3d9")      # FMTID_SummaryInformation
+_DOC_SUMMARY = bytes.fromhex("02d5cdd59c2e1b10939708002b2cf9ae")  # FMTID_DocSummaryInformation
+_USER = bytes.fromhex("05d5cdd59c2e1b10939708002b2cf9ae")         # FMTID_UserDefinedProperties
+_SUMMARY_LABELS = {2: "title", 3: "subject", 4: "author", 5: "keywords", 8: "last author", 12: "created",
+                   13: "modified"}
+_DOC_SUMMARY_LABELS = {15: "company"}
+_EPOCH = datetime.datetime(1601, 1, 1)
+
+
+def _codec(cp: int) -> str:
+    """The Python codec of a property set's CodePage: 1200 is UTF-16LE, an unknown one cp1252."""
+    name = "utf-16-le" if cp == 1200 else "utf-8" if cp == 65001 else f"cp{cp}"
+    try:
+        codecs.lookup(name)
+    except LookupError:
+        return "cp1252"
+    return name
+
+
+def _filetime(ticks: int) -> str | None:
+    """A FILETIME (100 ns ticks since 1601) as `YYYY-MM-DD HH:MM`; None for 0 or past year 9999."""
+    try:
+        return (_EPOCH + datetime.timedelta(microseconds=ticks // 10)).strftime("%Y-%m-%d %H:%M") if ticks else None
+    except OverflowError:
+        return None
+
+
+def _value(data: bytes, at: int, end: int, codec: str):
+    """The TypedPropertyValue at `at`: text for VT_LPSTR (in the set's code page) and VT_LPWSTR, a number for VT_I2,
+    VT_I4, VT_UI4 and VT_R8, yes or no for VT_BOOL, a date for VT_FILETIME; None for another type or one that does
+    not fit before `end`."""
+    if at + 4 > end:
+        return None
+    vt = struct.unpack_from("<H", data, at)[0]
+    at += 4
+    fixed = {0x02: "<h", 0x03: "<i", 0x13: "<I", 0x05: "<d", 0x0B: "<h", 0x40: "<Q"}.get(vt)
+    if fixed is not None:
+        if at + struct.calcsize(fixed) > end:
+            return None
+        v = struct.unpack_from(fixed, data, at)[0]
+        return ("yes" if v else "no") if vt == 0x0B else _filetime(v) if vt == 0x40 else v
+    if vt not in (0x1E, 0x1F) or at + 4 > end:
+        return None
+    n = struct.unpack_from("<I", data, at)[0] * (2 if vt == 0x1F else 1)
+    if at + 4 + n > end:
+        return None
+    raw = data[at + 4:at + 4 + n]
+    return raw.decode("utf-16-le" if vt == 0x1F else codec, "replace").split("\0", 1)[0]
+
+
+def _dictionary(data: bytes, at: int, end: int, codec: str) -> dict:
+    """{pid: name} of the Dictionary at `at`: a u32 count, then a pid, a u32 length (characters under code page 1200,
+    padded to 4 bytes, else bytes) and the name each; the entries that fit before `end`."""
+    out = {}
+    if at + 4 > end:
+        return out
+    count = struct.unpack_from("<I", data, at)[0]
+    pos, wide = at + 4, codec == "utf-16-le"
+    for _ in range(min(count, (end - pos) // 8)):
+        if pos + 8 > end:
+            break
+        pid, n = struct.unpack_from("<II", data, pos)
+        size = n * (2 if wide else 1)
+        if pos + 8 + size > end:
+            break
+        out[pid] = data[pos + 8:pos + 8 + size].decode(codec, "replace").split("\0", 1)[0]
+        pos += 8 + size + (-size % 4 if wide else 0)
+    return out
+
+
+def property_sets(data: bytes) -> dict:
+    """{FMTID: ({pid: value}, {pid: name})} of a PropertySetStream: its byte order 0xFFFE, one or two sets after the
+    28-byte header, each a FMTID and an offset; a set is its size, a count and (pid, offset) pairs, the CodePage at pid
+    1 and the Dictionary at pid 0. ValueError when the header or a set does not fit in the stream; a value that does
+    not fit is left out. One pass over the stream's bytes."""
+    if len(data) < 28 or data[:2] != b"\xfe\xff":
+        raise ValueError("not a property set stream")
+    n = struct.unpack_from("<I", data, 24)[0]
+    if not 0 < n <= 2 or 28 + 20 * n > len(data):
+        raise ValueError("property set count")
+    out = {}
+    for k in range(n):
+        fmtid, off = data[28 + 20 * k:44 + 20 * k], struct.unpack_from("<I", data, 44 + 20 * k)[0]
+        if off + 8 > len(data):
+            raise ValueError("property set outside the stream")
+        size, count = struct.unpack_from("<II", data, off)
+        end = off + size
+        if end > len(data) or size < 8 or count > (size - 8) // 8:
+            raise ValueError("property set size")
+        pairs = struct.unpack_from("<%dI" % (2 * count), data, off + 8)
+        entries = dict(zip(pairs[::2], pairs[1::2]))
+        cp = _value(data, off + entries[1], end, "cp1252") if 1 in entries else None
+        codec = _codec(cp & 0xFFFF if isinstance(cp, int) else 1252)
+        values = {pid: v for pid, rel in entries.items() if pid > 1
+                  and (v := _value(data, off + rel, end, codec)) is not None}
+        names = _dictionary(data, off + entries[0], end, codec) if 0 in entries else {}
+        out[fmtid] = (values, names)
+    return out
+
+
+def summary(streams: dict) -> tuple[str, list]:
+    """(title, (label, value) pairs) of the property sets read from SUMMARY_STREAM and DOC_SUMMARY_STREAM
+    ({stream: property_sets}): the summary's title, subject, author, keywords, last author and creation and save
+    times, the document summary's company, then the user-defined properties by their dictionary names."""
+    title, pairs = "", []
+    for stream, fmtid, labels in ((SUMMARY_STREAM, _SUMMARY, _SUMMARY_LABELS),
+                                  (DOC_SUMMARY_STREAM, _DOC_SUMMARY, _DOC_SUMMARY_LABELS)):
+        values = streams.get(stream, {}).get(fmtid, ({}, {}))[0]
+        for pid, label in labels.items():
+            v = values.get(pid)
+            if label == "title":
+                title = " ".join(str(v or "").split())[:200]
+            elif v is not None:
+                pairs.append((label, v))
+    values, names = streams.get(DOC_SUMMARY_STREAM, {}).get(_USER, ({}, {}))
+    pairs += [(names[pid], v) for pid, v in values.items() if pid in names]
+    return title, pairs

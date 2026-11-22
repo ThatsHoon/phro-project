@@ -247,7 +247,7 @@ def test_undo_hidden_and_shown():
     assert "Gone" not in out and "Keep" in out and "Also" in out
     assert "(1 hidden places left out)" in out, out
     shown = _md(doc, ctx, hidden=True)
-    assert "(hidden: Gone)" in shown, shown
+    assert "(deleted: Gone)" in shown, shown
     # inside an undo span a paragraph end and a bold change are deleted too: the paragraph runs on
     body = b"A\x80" + _undo(0) + b"x\xcc" + _on(12) + b"y" + _undo(1) + b"\x80B"
     doc, _ = _read(_wp6(body))

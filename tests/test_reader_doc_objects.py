@@ -471,7 +471,9 @@ def test_mtef_records():
     matrices, embellishments, text, symbols and v5's definitions."""
     # Equation Editor 3.0's own layout: FULL, a LINE holding FULL and a LINE, scripts after a SUB size, text '2'
     v3 = mtef_v3(b"\x0a" + l3(b"\x0a" + l3(c3("E=mc") + t3(15, b"\x0b", NULL3, l3(c3("2", 0x81))) + b"\x0a")))
-    assert to_tex(v3) == r"E=mc^{\text{2}}"
+    assert to_tex(v3) == r"E=mc^{2}"  # a text-style digit is upright in math already: no \text{}
+    assert to_tex(mtef_v3(c3("2", 0x81) + c3("ab", 0x81) + c3("+", 0x81) + c3("é", 0x81))) == r"\text{2ab+é}"
+    assert to_tex(mtef_v3(c3("x") + c3("(1)", 0x81))) == "x(1)"
     # sizes (FULL to SUBSYM, SIZE in its three forms), FONT, a nudged CHAR, a LINE with a RULER, trailing bytes
     size = b"\x09\x02\x80" + b"\x09\x65\x0c\x00" + b"\x09\x64\x01\x00\x01"
     nudged = bytes((0x82, 0x83, 0x81, 0x83)) + u16(ord("x"))  # CHAR with xfLMOVE: dx, dy, then typeface and MTCode
@@ -539,6 +541,27 @@ def test_mtef_bounds():
     tex = to_tex(mtef_v5(l5(t5(11, l5(c5("a")), l5(c5("b"))) * 20_000)))
     assert tex == r"\frac{a}{b}" * 20_000
     assert time.monotonic() - t0 < 20
+
+
+
+def test_floating_object_preview_written_once():
+    """A floating shape whose text box holds an object read whole (an equation that converted losslessly) does not
+    also draw its own picture, which is that object's preview; one whose object kept its preview still draws it."""
+    from reader_fix import dgg_with_bstore, doc_spa
+    box = "\x13 EMBED Equation.3 \x14\x15\r"
+    it = doc_stories("a\x08\r", textboxes=[box])
+    sep = 3 + box.index("\x14")  # the text box story follows the main story's three CPs
+    it["fc"][40] = doc_spa([(1, 1)])  # the shape the text box's FTXBXS names (spid 1)
+    it["fc"][50] = dgg_with_bstore([blip_png(PNG)], shapes=[(1, 1)])
+    chpx = [(1, 2, sp(SPEC)), (sep, sep + 1, sp(SPEC) + sp(OLE) + sp(PIC, 5))]
+    for objects, want, skipped in (({5: {"Equation Native": eq_native(FRAC)}},
+                                    [Para([Text("a")]), Equation(r"\frac{a}{b}")], {}),
+                                   ({5: {"\x01Ole10Native": bytes(8)}},
+                                    [Para([Text("a")]), Image(PNG, codepage="cp1252")], {"object": 1})):
+        p = make_doc(tmp() / "a.doc", it["pieces"], ccp=it["ccp"], fc=it["fc"], chpx=chpx,
+                     streams=object_pool(objects))
+        d, ctx = parse(p)
+        assert d.blocks == want and dict(ctx.skipped) == skipped, (d.blocks, ctx.skipped)
 
 
 def main():

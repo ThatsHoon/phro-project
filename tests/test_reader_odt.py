@@ -195,7 +195,26 @@ def test_tracked_deletion():
     p = odt_doc(body)
     out = md(p)
     assert "(1 hidden places left out)" in out and "옛말" not in out and "kim" not in out and "새말" in out
-    assert "(hidden: 옛말)" in md(p, hidden=True)
+    assert "(deleted by kim: 옛말)" in md(p, hidden=True)
+
+
+def test_tracked_changes_sit_at_their_place_with_their_author():
+    info = '<office:change-info><dc:creator>{}</dc:creator><dc:date>2026-01-01T00:00:00</dc:date></office:change-info>'
+    body = ('<text:tracked-changes>'
+            f'<text:changed-region text:id="ct1"><text:insertion>{info.format("Kim")}</text:insertion></text:changed-region>'
+            f'<text:changed-region text:id="ct2"><text:deletion>{info.format("Lee")}<text:p>old words</text:p>'
+            '</text:deletion></text:changed-region>'
+            f'<text:changed-region text:id="ct3"><text:insertion>{info.format("Kim")}</text:insertion></text:changed-region>'
+            '</text:tracked-changes>'
+            + P('new <text:change-start text:change-id="ct1"/>added<text:s/>text<text:change-end text:change-id="ct1"/>'
+                ' and <text:change text:change-id="ct2"/>end')
+            + P('a <text:span text:style-name="B"><text:change-start text:change-id="ct3"/>bold</text:span>')
+            + P('carried<text:change-end text:change-id="ct3"/> z'))
+    p = odt_doc(body, auto_styles='<style:style style:name="B" style:family="text">'
+                                  '<style:text-properties fo:font-weight="bold"/></style:style>')
+    assert md(p) == ("(1 hidden places left out)\n\nnew (inserted by Kim: added text) and end\n\n"
+                     "a (inserted by Kim: **bold**)\n\n(inserted by Kim: carried) z\n"), md(p)
+    assert "and (deleted by Lee: old words)end" in md(p, hidden=True), md(p, hidden=True)
 
 
 def test_page_fields_dropped():
@@ -605,6 +624,36 @@ def test_odt_place_failure_keeps_text():
         odf_base._swap = orig
     out = markdown.render(doc, tmp() / "a")
     assert ctx.skipped["shape"] == 1 and all(w in out for w in ("Alpha", "Beta", "go")), (out, ctx.skipped)
+
+
+
+META = ('<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        '<office:meta><meta:generator>LibreOffice/7.6</meta:generator><dc:title>Lease</dc:title>'
+        '<dc:subject>Unit 4</dc:subject><meta:initial-creator>Kim</meta:initial-creator><dc:creator>Lee</dc:creator>'
+        '<meta:creation-date>2024-03-05T10:30:00</meta:creation-date><dc:date>2024-04-01T08:00:00.123</dc:date>'
+        '<meta:keyword>lease</meta:keyword><meta:keyword>rent</meta:keyword><meta:editing-cycles>3</meta:editing-cycles>'
+        '<meta:document-statistic meta:page-count="1" meta:word-count="1"/>'
+        '<meta:user-defined meta:name="Client">Hanbit</meta:user-defined>'
+        '<meta:user-defined meta:name="Empty"></meta:user-defined></office:meta></office:document-meta>')
+
+
+def test_meta_properties():
+    """meta.xml's title is the title; the initial creator is the author, dc:creator the last author, then the dates,
+    keywords and user-defined fields; the generator, counts and editing cycles are not shown."""
+    out = md(odt_doc(P("body"), extra={"meta.xml": META}))
+    assert out == ("Properties: subject: Unit 4; author: Kim; last author: Lee; created: 2024-03-05 10:30; "
+                   "modified: 2024-04-01 08:00; keywords: lease, rent; Client: Hanbit\n\n# Lease\n\nbody\n"), out
+    out = md(odt_doc(P("body"), extra={"meta.xml": "<broken"}))
+    assert out == "body\n", out
+    big = META.replace("</office:document-meta>", " " * (3 * 2**20) + "</office:document-meta>")
+    doc, ctx = parse(odt_doc(P("body"), extra={"meta.xml": big}))
+    assert markdown.render(doc, tmp() / "a") == "body\n" and ctx.skipped["properties"] == 1, ctx.skipped
+
+
+def test_ruby_is_base_then_reading():
+    body = P('前<text:ruby><text:ruby-base>漢字</text:ruby-base><text:ruby-text>かんじ</text:ruby-text></text:ruby>後')
+    assert md(odt_doc(body)) == "前漢字(かんじ)後\n"
 
 
 def main():

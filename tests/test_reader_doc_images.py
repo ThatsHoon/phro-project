@@ -303,6 +303,63 @@ def test_field_instruction_and_ole_not_pictures():
     assert d.blocks == [Para([Text("a")])] and ctx.skipped == {"object": 1}, ctx.skipped
 
 
+def ffdata(kind, res, wdef=0, items=(), text=""):
+    """A form field's NilPICFAndBinData: the 68-byte header, then the FFData (MS-DOC 2.9.78)."""
+    def xstz(s):
+        return u16(len(s)) + s.encode("utf-16-le") + u16(0)
+    body = struct.pack("<IHHH", 0xFFFFFFFF, kind | res << 2, 0, 0) + xstz("F1")
+    body += xstz(text) if kind == 0 else u16(wdef)
+    body += xstz("") * 5
+    if kind == 2:
+        body += struct.pack("<HHH", 0xFFFF, len(items), 0) + b"".join(u16(len(s)) + s.encode("utf-16-le") for s in items)
+    return struct.pack("<IH", 0x44 + len(body), 0x44) + bytes(62) + body
+
+
+def test_form_data_is_read_once_a_field_and_only_for_a_form_field():
+    n = 200_000
+    dd = ffdata(2, 1, 0, ("DD-FIRST", "DD-SECOND" + "x" * 30_000))
+    text = "pick \x13 FORMDROPDOWN " + "\x01" * n + "\x15\r"
+    at = text.index("\x01")
+    p = inline_doc(dd, text, chpx=[(at, at + n, sp(SPEC) + sp(PIC, AT))])
+    t = time.perf_counter()
+    out = md(p)
+    assert time.perf_counter() - t < 10, time.perf_counter() - t
+    assert out.startswith("pick DD-SECONDxxx"), out[:40]
+    link = md(inline_doc(ffdata(1, 1), 'see \x13 HYPERLINK "http://example.com/" \x01\x14site\x15\r'))
+    assert "☒" not in link and "site" in link, link
+
+
+def test_form_data_at_one_place_is_read_once_a_document():
+    n = 100_000
+    dd = ffdata(2, 1, 0, ("DD-FIRST", "DD-SECOND" + "x" * 30_000))
+    p = inline_doc(dd, "\x13\x01\x15" * n + "\r", chpx=[(0, 3 * n, sp(SPEC) + sp(PIC, AT))])
+    t = time.perf_counter()
+    out = md(p)
+    assert time.perf_counter() - t < 10 and out.startswith("DD-SECONDxxx"), (time.perf_counter() - t, out[:40])
+    old = limits.FORM_BYTES
+    limits.FORM_BYTES = 0
+    try:
+        _, ctx = parse(inline_doc(dd, "pick \x13 FORMDROPDOWN \x01\x15\r"))
+    finally:
+        limits.FORM_BYTES = old
+    assert ctx.skipped["form"] == 1, ctx.skipped
+
+
+def test_form_fields_show_their_state():
+    """A legacy check box shows ☒ or ☐ (its result, else its default), a drop-down its chosen entry, a text field its
+    result; form data that cannot be read shows nothing."""
+    def box(res, default):
+        return md(inline_doc(ffdata(1, res, default), "agree \x13 FORMCHECKBOX \x01\x14\x15 end\r"))
+    assert box(1, 0) == "agree ☒ end\n" and box(0, 1) == "agree ☐ end\n" and box(25, 1) == "agree ☒ end\n", box(1, 0)
+    dd = ffdata(2, 1, 0, ("DD-FIRST", "DD-SECOND"))
+    assert md(inline_doc(dd, "pick \x13 FORMDROPDOWN \x01\x15\r")) == "pick DD-SECOND\n"
+    assert md(inline_doc(ffdata(2, 25, 0, ("ONLY",)), "pick \x13 FORMDROPDOWN \x01\x15\r")) == "pick ONLY\n"
+    assert md(inline_doc(ffdata(2, 7, 0, ("ONLY",)), "pick \x13 FORMDROPDOWN \x01\x15\r")) == "pick\n"
+    assert md(inline_doc(ffdata(0, 0, text="x"), "\x13 FORMTEXT \x01\x14typed\x15\r")) == "typed\n"
+    for cut in (3, 40, 75, 90):
+        assert md(inline_doc(dd[:cut], "pick \x13 FORMDROPDOWN \x01\x15\r")) == "pick\n", cut
+
+
 def test_duplicates_parsed_once_copies_counted():
     p = float_doc("\x08\x08\r", dgg_with_bstore([blip_png(PNG)], shapes=[(1025, 1), (1026, 1)]))
     out = tmp()

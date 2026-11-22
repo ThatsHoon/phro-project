@@ -1,16 +1,20 @@
 """OpenDocument entry point: package checks, kind dispatch and the odt path. Shared walking lives in odf_base.
 
 An odt body that holds a connector is read as one diagram scope (`Body.scope`, `Body.place`); one without reads as
-before."""
+before. An odt's meta.xml gives its title (Doc.title) and its properties line (`_meta`)."""
 from .. import diagram
-from ..containers.zipx import Package, kids, local
+from ..containers.zipx import Package, attr, first, kids, local
 from ..limits import ReadError
-from ..model import Doc
+from ..model import Doc, Para
 from . import odf_sheets, odf_slides
 from .odf_base import Body, Styles
+from .word_fields import properties, when
 
 _MIME = "application/vnd.oasis.opendocument."
 _BODY_KINDS = {"text": "text", "spreadsheet": "spreadsheet", "presentation": "presentation"}
+_META = {"subject": "subject", "initial-creator": "author", "creator": "last author", "creation-date": "created",
+         "date": "modified"}
+MAX_TITLE = 200
 
 
 # ---- package
@@ -68,6 +72,7 @@ def _text(pkg, ctx, content, styles_root) -> Doc:
     for c in office:
         with ctx.guard("block"):
             body.doc.blocks.extend(body.block(c, 0))
+    body.doc.blocks.extend(Para([got[1]]) for got in body.changes.values() if got[0] == "deletion")
     if body.glued is not None:
         with ctx.guard("shape"):
             body.place(diagram.ConnectionBudget(ctx))
@@ -75,7 +80,38 @@ def _text(pkg, ctx, content, styles_root) -> Doc:
     if styles_root is not None:
         with ctx.guard("header"):
             body.master(styles_root)
+    with ctx.guard("properties"):
+        _meta(pkg, ctx, body.doc)
     return body.doc
+
+
+def _meta(pkg, ctx, doc):
+    """meta.xml's dc:title as Doc.title; its subject, initial creator (the author), dc:creator (the last author),
+    creation and save dates, keywords and user-defined fields as Doc.meta["properties"]. The generator, statistics and
+    editing figures are left out. A meta.xml that cannot be read is counted under properties."""
+    try:
+        root = pkg.xml("meta.xml")
+    except ReadError as e:
+        if e.kind == "timeout":
+            raise
+        ctx.skipped["properties"] += 1
+        return
+    meta = first(root, "meta") if root is not None else None
+    if meta is None:
+        return
+    pairs, words = [], []
+    for el in meta:
+        n, text = local(el.tag), "".join(el.itertext())
+        if n == "title":
+            doc.title = " ".join(text.split())[:MAX_TITLE]
+        elif n in _META:
+            pairs.append((_META[n], when(text) if n in ("creation-date", "date") else text))
+        elif n == "keyword" and text.strip():
+            words.append(text.strip())
+        elif n == "user-defined":
+            pairs.append((attr(el, "name"), text))
+    if kept := properties(pairs + [("keywords", ", ".join(words))]):
+        doc.meta["properties"] = kept
 
 
 def parse(path, ctx) -> Doc:

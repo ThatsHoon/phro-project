@@ -510,6 +510,124 @@ def test_convert_end_to_end():
     assert "doc" in reader.BUILT and reader.FORMATS["doc"] == "doc"
 
 
+
+def handmade(text, lid, flags=0, lid_fe=0):
+    """A WordDocument with no table stream, as anydoc's handmade files are: a FibBase whose fcMin..fcMac hold the
+    text, lidFE at its Word 97 place, csw, cslw and cbRgFcLcb all 0."""
+    word = bytearray(1024)
+    struct.pack_into("<6H", word, 0, 0xA5EC, 0x00C1, 0, lid, 0, flags)
+    struct.pack_into("<II", word, 0x18, 1024, 1024 + len(text))
+    struct.pack_into("<H", word, 0x3C, lid_fe)
+    struct.pack_into("<I", word, 0x4C, len(text))
+    p = tmp() / "h.doc"
+    make_cfb(p, {"WordDocument": bytes(word) + text})
+    return p
+
+
+def test_no_table_stream_reads_the_main_stream():
+    """A .doc without a table stream is read from what its WordDocument holds: fcMin..fcMac as one piece of 8-bit
+    text in the code page of its language (lidFE in a Far East document)."""
+    p = handmade("Привет, мир!\rВторой абзац.\r".encode("cp1251"), 0x0419)
+    assert md(p) == "Привет, мир!\n\nВторой абзац.\n", md(p)
+    p = handmade("こんにちは世界。\r日本語の段落です。\r".encode("cp932"), 0, flags=0x4000, lid_fe=0x0411)
+    assert md(p) == "こんにちは世界。\n\n日本語の段落です。\n", md(p)
+    p = handmade("Привет, мир!\rВторой абзац.\r".encode("utf-16-le"), 0x0419)
+    assert md(p) == "Привет, мир!\n\nВторой абзац.\n", md(p)
+    p = handmade("Hello, world.\rSecond.\r".encode("utf-16-le"), 0x0409)
+    assert md(p) == "Hello, world.\n\nSecond.\n", md(p)
+    q = tmp() / "empty.doc"
+    word = bytearray(1024)
+    struct.pack_into("<6H", word, 0, 0xA5EC, 0x00C1, 0, 0x0409, 0, 0)
+    make_cfb(q, {"WordDocument": bytes(word)})
+    denied(q, "damaged")
+
+
+SUMMARY = "F29F85E0-4FF9-1068-AB91-08002B27B3D9"
+DOC_SUMMARY = "D5CDD502-2E9C-101B-9397-08002B2CF9AE"
+USER = "D5CDD505-2E9C-101B-9397-08002B2CF9AE"
+
+
+def filetime(y, mo, d, h=0, mi=0):
+    import datetime
+    t = datetime.datetime(y, mo, d, h, mi) - datetime.datetime(1601, 1, 1)
+    return (t.days * 86400 + t.seconds) * 10**7
+
+
+def prop_stream(*sets):
+    """A property set stream (MS-OLEPS PropertySetStream): one set a (FMTID, {pid: (vt, value)}, dictionary or None).
+    Values: VT_I2 2, VT_I4 3, VT_LPSTR 0x1E (cp1252), VT_LPWSTR 0x1F, VT_FILETIME 0x40; the dictionary (pid 0) maps
+    pids to cp1252 names."""
+    import uuid
+
+    def pad(b):
+        return b + bytes(-len(b) % 4)
+
+    def value(vt, v):
+        head = struct.pack("<HH", vt, 0)
+        if vt == 2:
+            return head + struct.pack("<hH", v, 0)
+        if vt == 3:
+            return head + struct.pack("<i", v)
+        if vt == 0x1E:
+            raw = v.encode("cp1252") + b"\0"
+            return head + pad(u32(len(raw)) + raw)
+        if vt == 0x1F:
+            raw = (v + "\0").encode("utf-16-le")
+            return head + pad(u32(len(raw) // 2) + raw)
+        return head + struct.pack("<Q", v)
+
+    blobs = []
+    for fmtid, props, names in sets:
+        entries = []
+        if names is not None:
+            body = u32(len(names)) + b"".join(u32(pid) + u32(len(n) + 1) + n.encode("cp1252") + b"\0"
+                                              for pid, n in names.items())
+            entries.append((0, pad(body)))
+        entries += [(pid, value(*pv)) for pid, pv in props.items()]
+        at = 8 + 8 * len(entries)
+        index, data = b"", b""
+        for pid, raw in entries:
+            index += u32(pid) + u32(at + len(data))
+            data += raw
+        blobs.append((uuid.UUID(fmtid).bytes_le, u32(8 + len(index) + len(data)) + u32(len(entries)) + index + data))
+    head = struct.pack("<HHI", 0xFFFE, 0, 0x00020006) + bytes(16) + u32(len(blobs))
+    at = len(head) + 20 * len(blobs)
+    out = b""
+    for fmtid, blob in blobs:
+        head += fmtid + u32(at + len(out))
+        out += blob
+    return head + out
+
+
+def test_summary_information_properties():
+    """SummaryInformation's title is the title; its subject, author, last author, creation and save times, the
+    DocumentSummaryInformation's company and the user-defined properties are the properties line. The template,
+    application, revision and counts are not."""
+    summary = prop_stream((SUMMARY, {1: (2, 1252), 2: (0x1E, "Lease"), 3: (0x1E, "Unit 4"), 4: (0x1E, "Kim"),
+                                     5: (0x1E, "lease, rent"), 7: (0x1E, "Normal.dot"), 8: (0x1E, "Lee"),
+                                     9: (0x1E, "3"), 12: (0x40, filetime(2024, 3, 5, 10, 30)),
+                                     13: (0x40, filetime(2024, 4, 1, 8, 0)), 14: (3, 1),
+                                     18: (0x1E, "Microsoft Office Word")}, None))
+    extra = prop_stream((DOC_SUMMARY, {1: (2, 1252), 15: (0x1E, "ACME")}, None),
+                        (USER, {1: (2, 1252), 2: (0x1F, "Hanbit"), 3: (0x1E, "")}, {2: "Client", 3: "Empty"}))
+    p = doc_file([("body\r", False)], streams={"\x05SummaryInformation": summary,
+                                               "\x05DocumentSummaryInformation": extra})
+    assert md(p) == ("Properties: subject: Unit 4; author: Kim; last author: Lee; created: 2024-03-05 10:30; "
+                     "modified: 2024-04-01 08:00; company: ACME; keywords: lease, rent; Client: Hanbit\n\n"
+                     "# Lease\n\nbody\n"), md(p)
+    p = doc_file([("body\r", False)], streams={"\x05SummaryInformation": summary[:60]})
+    d, ctx = parse(p)
+    assert markdown.render(d, tmp() / "a") == "body\n" and ctx.skipped["properties"] == 1, ctx.skipped
+    p = doc_file([("body\r", False)], streams={"\x05SummaryInformation": summary})
+    old = limits.PROPERTY_STREAM
+    try:
+        limits.PROPERTY_STREAM = len(summary) - 1
+        d, ctx = parse(p)
+    finally:
+        limits.PROPERTY_STREAM = old
+    assert markdown.render(d, tmp() / "a") == "body\n" and ctx.skipped["properties"] == 1, ctx.skipped
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

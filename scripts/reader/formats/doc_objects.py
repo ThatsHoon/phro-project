@@ -51,6 +51,7 @@ class Objects:
         self._viewable = {}  # Data offset -> whether its preview shows as an image
         self.sheets = sheet_grid.Budget()  # one for the document: the sheets of every embedded workbook share it
         self.chart_cells = 0  # table cells placed from embedded workbooks, copies counted (CHART_TOTAL)
+        self.whole = 0
 
     def pool(self) -> dict:
         """The ObjectPool's storages and their streams, from the compound file's paths, once."""
@@ -144,7 +145,9 @@ class Objects:
             with r.ctx.guard("chart"):
                 if st.run.deleted:  # tracked-deleted text stays dropped
                     return
-                if not self.tables(st, tex, "" if shown else "hidden"):
+                if self.tables(st, tex, "" if shown else "hidden"):
+                    self.whole += 1
+                else:
                     # past CHART_TOTAL: as a workbook that gave no table, the preview shows and a shown one is counted
                     preview = self.preview(at)
                     if preview is not None:
@@ -160,6 +163,7 @@ class Objects:
                 if shown and "depth" in lost:
                     r.deep()
                 if lost <= {"depth"}:
+                    self.whole += 1
                     return
             preview = self.preview(at)
             if preview is not None:

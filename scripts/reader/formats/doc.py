@@ -13,8 +13,9 @@ and the pair is joined only when a Text is built.
 Formatting (doc_fib's FKPs, Prms and Styles) is mapped to CPs through the pieces once, then the walk takes a story as
 segments of constant character properties: st.run is the segment's RunProps, so text, breaks and every handler see
 the properties of their own CP. A paragraph's properties are its mark's: the PAPX whose FC range holds the mark's FC.
-Bold text is Bold; vanished and deleted text are Hidden(..., "hidden") and Hidden(..., "deleted"), the shapes the docx
-reader gives w:vanish runs and w:del. Damaged formatting is counted under styles and never costs text.
+Bold text is Bold; vanished and deleted text are Hidden(..., "hidden") and Hidden(..., "deleted"), inserted text
+(sprmCFRMarkIns) an Inserted, the shapes the docx reader gives w:vanish runs, w:del and w:ins; a change's author is
+SttbfRMark's entry sprmCIbstRMark (sprmCIbstRMarkDel for a deletion, when set) names. Damaged formatting is counted under styles and never costs text.
 
 A paragraph in a list (sprmPIlfo) is a ListItem with doc_fib.Lists' marker, as the docx reader makes w:numPr ones.
 Paragraphs with a table depth (sprmPFInTable, sprmPItap) are grouped into tables as their marks come (MS-DOC
@@ -65,10 +66,11 @@ from .. import diagram, images, limits, officeart
 from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import IMAGE_BYTES, ReadError
-from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
+from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Inserted, Link, ListItem, NoteRef, Para, Table, Text
 from . import cfb_route, doc_fib, doc_objects, doc_pictures, zip_route
+from ..text import decode_8bit
 from .hancom import flat, lone_equations
-from .word_fields import MAX_INSTR, comment_note, hyperlink_url
+from .word_fields import MAX_FORM, MAX_INSTR, MAX_NAME, comment_note, form_data, hyperlink_url, properties
 
 _ZIP = b"PK\x03\x04"
 _RTF = b"{\\rtf"
@@ -81,7 +83,7 @@ _HUGE_PAPX = 0x6646
 _PLAIN = doc_fib.RunProps()
 
 # FibRgFcLcb97 indices of the stories' PLCs (MS-DOC 2.5.6) and GrpXstAtnOwners
-_HDD, _ATN_OWNERS, _TXBX, _HDR_TXBX = 11, 36, 56, 58
+_HDD, _ATN_OWNERS, _RMARK, _TXBX, _HDR_TXBX = 11, 36, 51, 56, 58
 # the note stories: story, id prefix, Ref and Txt PLC indices (PlcffndRef/Txt, PlcfendRef/Txt, PlcfandRef/Txt), the
 # size of a Ref data element (an FRD, or an ATRDPre10: xstUsrInitl, then ibst u16 at 20) and the kind a loss counts as
 _NOTES = (("footnote", "fn", 2, 3, 2, "footnotes"), ("endnote", "en", 46, 47, 2, "footnotes"),
@@ -144,7 +146,7 @@ def _shown(inlines) -> bool:
         if isinstance(it, Text):
             if it.text.strip():
                 return True
-        elif isinstance(it, (Bold, Link)) and _shown(it.inlines):
+        elif isinstance(it, (Bold, Link, Inserted)) and _shown(it.inlines):
             return True
     return False
 
@@ -158,10 +160,11 @@ class _Frame:
 
 class _Field:
     """An open field: its instruction so far, whether its result has begun, the index of the link frame it opened, the
-    ObjectPool id its separator names until the object is placed."""
+    ObjectPool id its separator names until the object is placed, what its form data shows (word_fields.form_data;
+    None until its first \\x01 is met)."""
 
     def __init__(self):
-        self.instr, self.size, self.result, self.frame, self.obj = [], 0, False, None, None
+        self.instr, self.size, self.result, self.frame, self.obj, self.form = [], 0, False, None, None, None
 
 
 class _Table:
@@ -305,11 +308,15 @@ class _Reader:
         self.chp, self.chp_at = [], []  # (cp0, cp1, CHPX grpprl, prm) in CP order, and their cp0s
         self.pap, self.pap_at = [], []  # (cp0, cp1, PAPX, prm) in CP order, and their cp0s
         self.data = None             # the Data stream once read; False when missing or unreadable
+        self.forms = {}              # place in the Data stream -> what its form field data shows
+        self.form_left = limits.FORM_BYTES
         self._prm, self._runs, self._paras = {}, {}, {}  # memos: prm -> sprms; run and paragraph properties
         self._huge, self._huge_read = {}, 0  # Data offset -> the sprms of its huge PAPX; the bytes read so far
         self.glue = None      # connector spid -> (start spid, end spid), the first rule naming it winning; read once
         self.ends = set()     # the spids the connector rules name
         self.slotted = False  # whether the main story holds a _Slot
+        self.rmarks = None    # SttbfRMark's names, once read
+        self.previewed = set()
 
     # ---- streams
     def stream(self, name) -> bytes:
@@ -318,12 +325,48 @@ class _Reader:
         except (KeyError, CfbError):  # missing, or a broken chain
             raise ReadError("damaged", f"{name} stream") from None
 
-    def table_stream(self, name) -> bytes:
-        """The table stream the FIB names; the other one when only that exists (dochan, anydoc)."""
+    def table_stream(self, name) -> bytes | None:
+        """The table stream the FIB names; the other one when only that exists (dochan, anydoc); None without
+        either."""
         for n in (name, "0Table" if name == "1Table" else "1Table"):
             if self.cf.exists(n):
                 return self.stream(n)
-        raise ReadError("damaged", "no table stream")
+        return None
+
+    def main_only(self):
+        """A WordDocument without a table stream, as anydoc reads one: the bytes fcMin..fcMac (FibBase 0x18 and
+        0x1C) are the main story: UTF-16 when a unit's high byte is zero (8-bit text holds no zero byte), else 8-bit
+        text in the code page of the document's language, decoded whole (a double-byte code page too); either way
+        held as one UTF-16 piece after the stream's bytes. The FIB's entries point into
+        the missing table, so none is read. A range that is empty or outside the stream is damaged."""
+        lo, hi = struct.unpack_from("<II", self.word, 0x18)
+        if not lo < hi <= len(self.word):
+            raise ReadError("damaged", "no table stream")
+        raw = self.word[lo:hi]
+        wide = not len(raw) % 2 and 0 in raw[1::2]
+        units = raw if wide else decode_8bit(raw, self.lid).encode("utf-16-le")
+        at = len(self.word) + len(self.word) % 2
+        self.word = self.word + bytes(at - len(self.word)) + units
+        self.pieces = [doc_fib.Piece(0, len(units) // 2, at, False, 0)]
+        self.fib.ccp = {**dict.fromkeys(doc_fib.STORIES, 0), "text": len(units) // 2}
+        self.fib.fc = []
+        self.table = b""
+
+    def properties(self):
+        """SummaryInformation's title as Doc.title; its subject, author, last author, keywords and creation and save
+        times, DocumentSummaryInformation's company and its user-defined properties as Doc.meta["properties"]
+        (doc_fib.summary). A stream past PROPERTY_STREAM, or one that is damaged, is counted under properties."""
+        got = {}
+        for name in (doc_fib.SUMMARY_STREAM, doc_fib.DOC_SUMMARY_STREAM):
+            if self.cf.exists(name):
+                with self.ctx.guard("properties"):
+                    if self.cf.size(name) > limits.PROPERTY_STREAM:
+                        raise ValueError("property stream too large")
+                    got[name] = doc_fib.property_sets(self.cf.read(name))
+        title, pairs = doc_fib.summary(got)
+        self.doc.title = title
+        if kept := properties(pairs):
+            self.doc.meta["properties"] = kept
 
     def run(self):
         # parse() calls this only after cfb_route.route returned None, which it does only when WordDocument exists
@@ -332,11 +375,14 @@ class _Reader:
         self.fib = f = doc_fib.fib(self.word)
         if f.encrypted or f.obfuscated:
             raise ReadError("encrypted")
-        self.table = self.table_stream(f.table)
-        self.pieces, cut = doc_fib.fit(doc_fib.pieces(self.table, *f.pair(doc_fib.CLX)), len(self.word))
-        if cut:
-            self.ctx.skipped["text"] += cut
         self.lid = f.lid_fe if f.far_east and f.lid_fe else f.lid
+        self.table = self.table_stream(f.table)
+        if self.table is None:
+            self.main_only()
+        else:
+            self.pieces, cut = doc_fib.fit(doc_fib.pieces(self.table, *f.pair(doc_fib.CLX)), len(self.word))
+            if cut:
+                self.ctx.skipped["text"] += cut
         self.ranges = doc_fib.story_ranges(f.ccp, self.pieces[-1].cp_end if self.pieces else 0)
         at = 0
         for name in doc_fib.STORIES:
@@ -345,15 +391,16 @@ class _Reader:
         self.props()
         self.notes()
         self.headers()
+        boxes = self.boxes("textbox", _TXBX, "block")
         main = []
         with self.ctx.guard("document"):
             main = self.story("text")
-        boxes = self.boxes("textbox", _TXBX, "block")
         self.doc.blocks.extend(self.connect(main, boxes) if self.slotted else main)
         for blocks in boxes.values():
             self.doc.blocks.extend(blocks)
         if self.styles.bad:
             self.ctx.skipped["styles"] += self.styles.bad
+        self.properties()
         return self.doc
 
     # ---- the other stories
@@ -380,6 +427,26 @@ class _Reader:
             out.append(raw[pos + 2:end].decode("utf-16-le", "replace"))
             pos = end
         return out
+
+    def rmark(self, ibst) -> str:
+        """The author SttbfRMark names at `ibst` (an extended STTB: 0xFFFF, u16 cData, u16 cbExtra, then a u16 count
+        and UTF-16 units a name, MS-DOC 2.9.274), "" past it or without one. Read once, names past an STTB that does
+        not fit left out."""
+        if self.rmarks is None:
+            self.rmarks = []
+            fc, lcb = self.fib.pair(_RMARK)
+            raw = self.table[fc:fc + lcb] if lcb and fc + lcb <= len(self.table) else b""
+            if len(raw) >= 6 and raw[:2] == b"\xff\xff":
+                n, extra = struct.unpack_from("<HH", raw, 2)
+                pos = 6
+                while len(self.rmarks) < n and pos + 2 <= len(raw):
+                    end = pos + 2 + 2 * struct.unpack_from("<H", raw, pos)[0]
+                    if end + extra > len(raw):
+                        break
+                    name = _C0.sub(" ", raw[pos + 2:end].decode("utf-16-le", "replace"))
+                    self.rmarks.append(" ".join(name.split())[:MAX_NAME])
+                    pos = end + extra
+        return self.rmarks[ibst] if ibst is not None and ibst < len(self.rmarks) else ""
 
     def storyless(self, name, kind, entries):
         """Story `name` has text (ccp > 0) but its PLCs hold no entry (`entries` false: left out, lcb 0, or empty), so
@@ -478,7 +545,10 @@ class _Reader:
         for i, a, b in spans:
             with self.ctx.guard(kind):
                 lid = struct.unpack_from("<i", data[i], 14)[0]
+                whole = self.objects.whole
                 out[lid if lid not in out else ("unkeyed", i)] = self.read(name, a, b)
+                if self.objects.whole > whole:
+                    self.previewed.add(lid)
         return out
 
     def connect(self, main, boxes) -> list:
@@ -700,17 +770,24 @@ class _Reader:
 
     def add(self, st, inline):
         """An inline into the open scope under the segment's properties: vanished goes into a Hidden, one per CHPX
-        run (as one w:r with w:vanish is in docx); deleted into a Hidden("deleted") that the deletion's next runs join
-        (as one w:del is)."""
+        run (as one w:r with w:vanish is in docx); deleted into a Hidden("deleted") and inserted into an Inserted
+        that the change's next runs by the same author join (as one w:del or w:ins is)."""
         inl = st.frames[-1].inl
         run = st.run
-        if run.deleted or run.vanish:
-            kind = "deleted" if run.deleted else "hidden"
+        if run.deleted or run.vanish or run.inserted:
+            if run.deleted:
+                box = Hidden([], "deleted", self.rmark(run.rmark_del if run.rmark_del is not None else run.rmark))
+            elif run.vanish:
+                box = Hidden([])
+            else:
+                box = Inserted([], self.rmark(run.rmark))
             h = st.hid
-            if inl and inl[-1] is h and h.kind == kind and (run.deleted or st.hid_seg == st.seg):
+            if inl and inl[-1] is h and type(h) is type(box) and getattr(h, "kind", "") == getattr(box, "kind", "") \
+                    and h.author == box.author and (not run.vanish or run.deleted or st.hid_seg == st.seg):
                 h.inlines.append(inline)
                 return
-            inline = st.hid = Hidden([inline], kind)
+            box.inlines.append(inline)
+            inline = st.hid = box
             st.hid_seg = st.seg
         inl.append(inline)
 
@@ -913,16 +990,40 @@ class _Reader:
             self.objects.place(st, f.obj, None)
         if f.frame is not None:
             self.close_to(st, f.frame)
+        if f.form:
+            self.text(st, f.form)
+
+    def form(self, at) -> str:
+        """What the form field data at `at` in the Data stream shows: a NilPICFAndBinData, its FFData after the
+        header its cbHeader gives, read up to MAX_FORM bytes. "" when it is not there. Each place is read once,
+        and the document reads limits.FORM_BYTES of them: past that a field is counted under `form`."""
+        if at in self.forms:
+            return self.forms[at]
+        data = self.data_stream()
+        if data is None or not 0 <= at <= len(data) - 6:
+            return ""
+        size, head = struct.unpack_from("<IH", data, at)
+        ff = data[at + head:at + min(size, MAX_FORM)]
+        if len(ff) > self.form_left:
+            self.ctx.skipped["form"] += 1
+            return ""
+        self.form_left -= len(ff)
+        self.forms[at] = form_data(ff)
+        return self.forms[at]
 
     # ---- pictures (doc_pictures.py reads them)
     def picture(self, st, cp):
         """An inline picture: a \\x01 with fSpec, its PICF at its PicLocation in the Data stream (0, the CHP's
         default, without sprmCPicLocation). In the result of a field that names an object it is that object, the
         PICF its preview (none with fOle2, which Word sets when the \\x01 shares the separator's run); elsewhere a
-        \\x01 with fOle2 is the object its ObjLocation, else PicLocation, names. One in a field instruction (a form
-        field's data) is not shown, as text there is not; one in a header is not read (a header is a line of text, as
+        \\x01 with fOle2 is the object its ObjLocation, else PicLocation, names. The first one in a FORM field's
+        instruction is the form field's data (form), not a picture; one in a header is not read (a header is a line of text, as
         in the docx reader). An inline drawing object without a picture is no loss."""
         run = st.run
+        if run.special and st.codes == 1 and not st.over and st.fields and not st.fields[-1].result \
+                and st.fields[-1].form is None:
+            named = "".join(st.fields[-1].instr).lstrip()[:4].upper()
+            st.fields[-1].form = self.form(run.pic or 0) if named in ("", "FORM") else ""
         if not run.special or st.name in _HEADER_STORIES or not self.live(st):
             return
         f = st.fields[-1] if st.fields else None
@@ -942,16 +1043,18 @@ class _Reader:
         """A floating object: a \\x08 with fSpec in the main story, the pictures of the shape its FSPA in PlcSpaMom
         names (doc_pictures.Pictures.floating), each read under guard("image"), then a _Slot when a connector rule
         names that shape. MS-DOC gives the stories other than the main and header ones no PlcfSpa, so a \\x08 there
-        is not resolved, and a header's is not read."""
+        is not resolved, and a header's is not read. A shape whose own text box placed an object whole (boxes, read
+        first) draws nothing: its picture is that object's preview, which the object stands for."""
         if not st.run.special or st.name != "text" or not self.live(st):
             return
+        spid = self.pictures.drawing().anchors.get(cp)
         pibs = []
-        with self.ctx.guard("image"):
-            pibs = self.pictures.floating(cp)
+        if spid not in self.previewed:
+            with self.ctx.guard("image"):
+                pibs = self.pictures.floating(cp)
         for pib in pibs:
             with self.ctx.guard("image"):
                 self.put_image(st, self.pictures.stored(pib))
-        spid = self.pictures.drawing().anchors.get(cp)
         if spid is not None and spid in self.linked():
             st.extras.append(_Slot(spid))
             self.slotted = True

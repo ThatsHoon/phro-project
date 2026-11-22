@@ -94,8 +94,14 @@ class _Node:
         self.kind, self.text, self.plain, self.scripts, self.code = kind, text, plain, scripts, code
 
 
+def _text(s) -> str:
+    """Text-style characters as TeX: in \\text{...} unless every one is an ASCII digit or sign, which math sets
+    upright already."""
+    return s if all(c.isascii() and not c.isalpha() and not c.isspace() for c in s) else r"\text{" + s + "}"
+
+
 def _join(nodes) -> str:
-    """A LINE's objects as TeX (dochan's join): runs of text characters become one \\text{...}, and sibling script
+    """A LINE's objects as TeX (dochan's join): runs of text characters become one _text, and sibling script
     templates one _{...}^{...} after the object before them. Objects without TeX (a character left out, an
     embellishment outside a character) are skipped."""
     out, text, sub, sup = [], [], [], []
@@ -104,7 +110,7 @@ def _join(nodes) -> str:
             continue
         if n.kind == _SCRIPT:
             if text:
-                out.append(r"\text{" + "".join(text) + "}")
+                out.append(_text("".join(text)))
                 text = []
             if n.scripts[0]:
                 sub.append(n.scripts[0])
@@ -118,13 +124,13 @@ def _join(nodes) -> str:
             text.append(n.text)
         else:
             if text:
-                out.append(r"\text{" + "".join(text) + "}")
+                out.append(_text("".join(text)))
                 text = []
             out.append(n.text)
     if sub or sup:
         out.append(("_{" + "".join(sub) + "}" if sub else "") + ("^{" + "".join(sup) + "}" if sup else ""))
     if text:
-        out.append(r"\text{" + "".join(text) + "}")
+        out.append(_text("".join(text)))
     return "".join(out)
 
 
@@ -392,7 +398,7 @@ class _Reader:
                 after.append(e[1])
         if not before:
             return node
-        base = r"\text{" + node.text + "}" if node.plain else node.text
+        base = _text(node.text) if node.plain else node.text
         return _Node(_CHAR, "".join(reversed(before)) + base + "".join(after))
 
     def template(self, name, sel, var, kids) -> _Node:
