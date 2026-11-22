@@ -287,8 +287,8 @@ def test_deny_texts_name_the_next_step():
     assert r("d/a.hwp", "damaged", "cache entry vanished") == (
         "a.hwp: reading failed: cache entry vanished. Read it again.")
     why = r("d/a.mpp", "timeout")
-    assert why == (f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds. A run by hand stops at the same"
-                   " limit; ask the user for a smaller project, or the project saved as xlsx or pdf."), why
+    assert why.startswith(f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds. Retry by hand: python"), why
+    assert why.endswith("a.mpp'."), why
     assert r("d/a.hwp", "too_large", gate.limits.BIG_INPUT) == (
         "a.hwp: the file is over 512 MiB. That is phro-project's safety limit; ask the user for a smaller file, such"
         " as the part they need saved on its own.")

@@ -677,7 +677,7 @@ class Grid:
         if not self.cut:
             self.why = (what, n, at)
         self.cut = True
-        self.ctx.warnings.append(f"sheet {self.name} cut at {n} {what}")
+        self.ctx.warnings.append(f"sheet {self.name} cut at " + ("the time limit" if what == "seconds" else f"{n} {what}"))
         self.ctx.skipped["sheet_cut"] += 1
         return False
 

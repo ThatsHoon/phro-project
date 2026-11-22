@@ -189,14 +189,11 @@ def _is_zip(path):
 
 def _next(path, kind, detail=""):
     """The one sentence a deny of `kind` ends with: what can be done next. The convert command only for a timeout,
-    the one failure that running it again can mend, and not for mpp, whose run by hand has the same limit; for a
+    the one failure that running it again can mend (a run by hand has HAND_SECONDS); for a
     failure of phro-project's own, not of the file, another way to read it, or the same Read again for a cache
     entry that went missing."""
     ext = reader.ext_of(path)
     skill = SKILL_OF.get(ext)
-    if kind == "timeout" and reader.FORMATS.get(ext) == "mpp":
-        return (" A run by hand stops at the same limit; ask the user for a smaller project, or the project saved"
-                f" as {SAVE_AS[ext]}.")
     if kind == "damaged" and detail == VANISHED:
         return " Read it again."
     if kind == "damaged" and detail.startswith(READER_FAULTS):

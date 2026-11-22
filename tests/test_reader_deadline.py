@@ -98,6 +98,7 @@ def test_a_workbook_stops_at_the_time_limit():
     out = shown(ooxml.parse_package(data, ctx), ctx)
     assert "v2" in out and "v3" not in out and "w1" not in out and REST in out, out
     assert "(Sheet cut at row 3 by the time limit; not read from there on)" in out, out
+    assert "sheet S cut at the time limit" in ctx.warnings, ctx.warnings
     ctx = stopping(7)
     out = shown(ooxml.parse_package(data, ctx), ctx)
     assert "v5" in out and "Sheet cut" not in out and "Sheet: T" not in out and REST in out, out

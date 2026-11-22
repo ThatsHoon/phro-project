@@ -24,6 +24,7 @@ SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one documen
 SHEET_RUNS = 20           # hidden row or column runs a sheet table's caption names; the rest are counted
 SHEET_ISLAND_STEPS = 8 * SHEET_CELLS  # cells (and columns) one sheet's island splits may visit, all levels together
 FORMULA_CHARS = 32_767    # the most characters a cell holds: a binary formula that spells more is not read
+FORMULA_BYTES = 65_535    # the most token bytes a BIFF8 record gives one formula: a longer one is not read
 FORMULA_GROUPS = 1_000    # cell ranges one sheet's formulas paragraph lists; the groups past them are counted
 SHEET_COMMENTS = 10_000   # cell comments one workbook may turn into notes; the rest are cut, counted once
 FACT_VALUES = 20          # values or ranges one entry of a sheet's fact lists; the rest are counted in the entry

@@ -190,6 +190,8 @@ class _Formula:
         return out
 
     def run(self) -> str:
+        if len(self.b) > limits.FORMULA_BYTES:
+            raise _Unknown("long")
         stack = []
         while self.at < len(self.b):
             ptg = self.b[self.at]
