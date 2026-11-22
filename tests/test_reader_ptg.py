@@ -108,6 +108,15 @@ def test_unknown_token_is_none():
     assert text(num(1) + num(2), env8()) is None
 
 
+def test_a_formula_longer_than_excel_writes_is_none():
+    from reader import limits
+    most = (limits.FORMULA_CHARS - 2) // 2
+    assert len(text(ref8(0, 0) + b"" * most, env8())) == limits.FORMULA_CHARS
+    assert text(ref8(0, 0) + b"" * (most + 1), env8()) is None
+    assert text((ref8(0, 0) + b"" * most) * 2 + b"", env8()) is None
+    assert text(ref8(0, 0) + (ref8(0, 0) + b"") * 4000, env8()) is None
+
+
 if __name__ == "__main__":
     import inspect
     for name, fn in list(globals().items()):

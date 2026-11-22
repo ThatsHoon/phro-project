@@ -113,9 +113,11 @@ class Objects:
             self.since = None
 
     def inner(self):
-        """A Context for the file an object holds: its own counts and warnings, this document's objects."""
+        """A Context for the file an object holds: its own counts and warnings, this document's objects and the
+        time its read may run to."""
         own = Context()
         own.embedded = self
+        own.stop, own.clock = self.ctx.stop, self.ctx.clock
         return own
 
     def load(self, data: bytes, ctx=None):

@@ -203,6 +203,79 @@ def test_other_workbooks_stop_at_the_time_limit():
     cut_mid("ods", oo.ods("".join(oo.sheet(f"S{i}", [oo.row(oo.c(t))]) for i, t in enumerate(words(str)))))
 
 
+def test_xls_formulas_stop_at_the_time_limit():
+    import struct
+    recs = b"".join(fx.biff(0x0006, struct.pack("<HHHdHIH", r, 1, 15, float(r), 0, 0, 9)
+                            + struct.pack("<Bd", 0x1F, 100.0 + r)) for r in range(6))
+    path = tmp() / "a.xls"
+    fx.make_xls(path, [{"name": "S", "cells": {(0, 0): "ALPHA"}, "records": [recs]}])
+    some = []
+    for n in range(1, 400):
+        ctx = stopping(n)
+        try:
+            out = shown(reader.parse(path, ctx), ctx)
+        except ReadError:
+            continue
+        if not ctx.skipped["time"]:
+            assert "B6 =105" in out, out
+            break
+        if "||5|" in out:
+            assert "B6 =105" not in out and REST in out, (n, out)
+            some.append("B1 =100" in out)
+    assert True in some, some
+
+
+def test_binary_records_and_shared_strings_stop_at_the_time_limit():
+    import struct
+    from reader.formats import biff
+    body = struct.pack("<II", 5000, 5000) + (struct.pack("<HB", 1, 0) + b"x") * 5000
+    assert len(biff.sst(biff.Cursor(body, [(0, len(body))]), Context().late)) == 5000
+    ctx = stopping(2)
+    got = biff.sst(biff.Cursor(body, [(0, len(body))]), ctx.late)
+    assert 0 < len(got) < 5000 and ctx.skipped["time"] == 1, len(got)
+    data = fx.biff(0x0203, bytes(14)) * 9
+    assert len(list(biff.Stream(data, Context()).records(0))) == 9
+    ctx = stopping(4)
+    assert len(list(biff.Stream(data, ctx).records(0))) == 3 and not ctx.skipped["record"], ctx.skipped
+
+
+def test_an_embedded_object_reads_on_the_document_clock():
+    from reader import embedded
+    ctx = stopping(3)
+    own = embedded.of(ctx).inner()
+    assert [own.late(), ctx.late(), own.late()] == [False, False, True] and own.skipped["time"] == 1
+
+
+def test_vba_modules_stop_at_the_time_limit():
+    import test_reader_vba as vb
+    streams = vb.project({n: (vb.SUB, 0x21) for n in "ABC"})
+    got, ctx = vb.read(streams)
+    assert [m[0] for m in got] == ["A", "B", "C"], got
+    got, ctx = vb.read(streams, stopping(2))
+    assert [m[0] for m in got] == ["A"] and ctx.skipped == {"time": 1, "vba_module": 2}, (got, ctx.skipped)
+
+
+def test_a_pages_body_stops_at_the_time_limit():
+    import test_reader_iwork as iw
+    from reader.formats import iwork
+    text = chr(10).join(words(str))
+    data = iw.iwork_zip({"Index/Document.iwa": iw.iwa_member(*iw.pages_doc(iw.BODY),
+                                                             iw.archive(iw.BODY, 2001, iw.storage(text)))})
+    mids = []
+    for n in range(1, 60):
+        ctx = stopping(n)
+        try:
+            out = shown(iwork.parse_bytes(data, ctx, "pages"), ctx)
+        except ReadError:
+            continue
+        if not ctx.skipped["time"]:
+            assert "OMEGA" in out, out
+            break
+        assert REST in out, out
+        mids.append("ALPHA" in out and "OMEGA" not in out)
+    assert True in mids, mids
+
+
 def test_paged_documents_and_books_stop_at_the_time_limit():
     cut_mid("xps", xp.xps_doc(words(xp.g)))
     cut_mid("epub", ep.epub_book({f"c{i}.xhtml": f"<p>{t}</p>" for i, t in enumerate(words(str))}))

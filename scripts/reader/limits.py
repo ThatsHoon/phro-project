@@ -21,6 +21,7 @@ SHEET_CELLS = 500_000     # cells one document's sheets may materialize
 SHEET_CHARS = 20_000_000  # characters of cell text, copies counted, one document's sheets may materialize
 SHEET_RUNS = 20           # hidden row or column runs a sheet table's caption names; the rest are counted
 SHEET_ISLAND_STEPS = 8 * SHEET_CELLS  # cells (and columns) one sheet's island splits may visit, all levels together
+FORMULA_CHARS = 8_192     # Excel's own limit of one formula's text: a binary formula that spells more is not read
 FORMULA_GROUPS = 1_000    # cell ranges one sheet's formulas paragraph lists; the groups past them are counted
 SHEET_COMMENTS = 10_000   # cell comments one workbook may turn into notes; the rest are cut, counted once
 FACT_VALUES = 20          # values or ranges one entry of a sheet's fact lists; the rest are counted in the entry

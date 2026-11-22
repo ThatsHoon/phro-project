@@ -71,6 +71,8 @@ class Stream:
         end = len(data) if end is None else min(end, len(data))
         pos = start
         while pos < end:
+            if self.ctx.late():
+                return
             if bank.records >= limits.BIN_RECORDS:
                 self.ctx.skipped["record"] += 1
                 return
@@ -238,12 +240,15 @@ def short_string(data: bytes, off: int) -> tuple[str, int]:
     return (raw.decode("utf-16-le", "replace") if unit == 2 else raw.decode("latin-1")), end
 
 
-def sst(cur: Cursor) -> list[str]:
-    """The strings of an SST record. cstUnique only caps the count; it never sizes anything."""
+def sst(cur: Cursor, late=None) -> list[str]:
+    """The strings of an SST record. cstUnique only caps the count; it never sizes anything. `late` is the read's
+    `Context.late`: asked now and then, a yes ends the table there."""
     cur.u32()
     unique = cur.u32()
     out: list[str] = []
     while len(out) < unique and not cur.at_end():
+        if late is not None and not len(out) & 1023 and late():
+            break
         try:
             out.append(cur.string())
         except ValueError:
@@ -376,7 +381,7 @@ def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
     elif rid == WINDOW1 and size >= 12:
         g.active = struct.unpack_from("<H", data, off + 10)[0]
     elif rid == SST and not g.sst:  # kept: a later SST fills an empty first one (a damaged first must not hide it)
-        g.sst = sst(_cursor(st, rec))
+        g.sst = sst(_cursor(st, rec), st.ctx.late)
     elif rid == SUPBOOK and size >= 4:
         cch = struct.unpack_from("<H", data, off + 2)[0]
         g.supbooks.append(cch == 0x0401)

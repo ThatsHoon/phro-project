@@ -15,6 +15,7 @@ import re
 import struct
 from dataclasses import dataclass, field, replace
 
+from .. import limits
 from . import sheet_grid
 
 _ERRORS = {0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!", 0x1D: "#NAME?", 0x24: "#NUM!",
@@ -133,9 +134,12 @@ def named(n, env: Env, ctx):
 def put(grid, forms: list, anchored: dict, env: Env, ctx) -> None:
     """Each cell's formula into the sheet's formulas paragraph (`Grid.formula`). `forms` holds each formula's
     (row, col, tokens, extra); one that is only a PtgExp takes the shared or array formula `anchored` keeps under the
-    cell it names, read once at that cell. A formula not read here is `?` and counted under formula."""
+    cell it names, read once at that cell. A formula not read here is `?` and counted under formula; past the
+    read's time the formulas left are not read."""
     done = {}
     for row, col, rgce, extra in forms:
+        if ctx.late():
+            break
         if not rgce or grid.cut and (row, col) not in grid.cells:
             continue
         at = exp(rgce, extra, env.wide)
@@ -214,6 +218,8 @@ class _Formula:
                 self.operand(0x20 + (ptg & 0x1F), stack)
             else:
                 raise _Unknown(ptg)
+            if stack and len(stack[-1]) > limits.FORMULA_CHARS:
+                raise _Unknown("long")
         if len(stack) != 1:
             raise _Unknown("stack")
         return stack[0]
