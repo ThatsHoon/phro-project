@@ -323,6 +323,8 @@ class _Render:
         self.empty = True  # nothing but status lines was rendered
         self.hidden_count = 0
         self.page_heads = 0  # page heads written, each starting with head_mark
+        self.page_at = None  # the number of the page section being rendered
+        self.left_pages = set()  # the page numbers of the pictures OCR left for the time
         self.head_mark = _HEAD_MARK + secrets.token_hex(8) + _HEAD_MARK
         self.depth = 0
         self.too_deep = 0  # subtrees left out for nesting past MAX_DEPTH
@@ -528,6 +530,8 @@ class _Render:
                 pic = self.assets.keep_picture(path, self.pictures.lines(b))
             if pic:
                 texts.append("Picture text: " + pic)
+            if self.page_at is not None and (b.data, b.page) in self.pictures.left:
+                self.left_pages.add(self.page_at)
         parts = [head] if head else []
         for s in texts:
             s = m.esc(s)
@@ -557,6 +561,7 @@ class _Render:
             head = f"## Master page: {title}"
         elif s.kind == "page" and s.number is not None:
             head = f"## Page {s.number}" + (f": {title}" if title else "")
+            self.page_at = s.number
         elif s.kind == "page" and title:
             head = f"## Page: {title}"
         if head and s.kind == "page":
@@ -906,6 +911,8 @@ class _Render:
         if "ocr" in self.doc.meta or self.pictures is not None:
             left = len(self.pictures.left) if self.pictures is not None else 0
             self.ocr = dict(NO_OCR, **self.doc.meta.get("ocr", {}), pictures_left=left)
+            if self.left_pages:
+                self.ocr["pictures_left_pages"] = sorted(self.left_pages)
             self.ocr_hint = self.pictures is not None and self.pictures.s.hint
             status += ocr_notes(self.ocr, self.ocr_hint)
         if hf:

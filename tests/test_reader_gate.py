@@ -1122,6 +1122,41 @@ def test_cut_pdf_is_one_stable_result():
         assert len(c) < 600, c
 
 
+def test_partial_pdf_reads_what_the_time_left_out():
+    """A pages= Read of pages inside a partial pdf's index converts that range alone when its pictures or scanned
+    pages were left for the time, and is cut from the whole entry when they were not; a range entry that is partial
+    is converted again on the next Read of it."""
+    from reader import cache, limits
+    with pdf_env():
+        p = four_pages()
+        assert out(gate.decide(ev(p)))["permissionDecision"] == "allow"
+        _edit_meta(p, partial=True, warnings=[limits.OCR_LATE],
+                   ocr={"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 1,
+                        "pictures_left_pages": [3]})
+        with children() as seen:
+            o = out(gate.decide(ev(p)))
+        assert seen == [] and ' Read the pdf with pages="3" for the text the time left out.' in \
+            o["additionalContext"], (seen, o)
+        with children() as seen:
+            o = out(gate.decide(ev(p, pages="1-2")))
+        assert seen == [] and o["updatedInput"]["offset"] == 1, (seen, o)
+        with children() as seen:
+            o = out(gate.decide(ev(p, pages="3-4")))
+        assert len(seen) == 1 and seen[0][-2:] == ["--pages", "3-4"], seen
+        got = Path(o["updatedInput"]["file_path"])
+        assert got.parent.name == cache.key(p, "native") + "-p3-4" and "Body3" in md_lines(o), o
+        assert "offset" not in o["updatedInput"] and "Body1" not in md_lines(o), o
+        meta = json.loads((got.parent / "meta.json").read_text(encoding="utf-8"))
+        (got.parent / "meta.json").write_text(json.dumps(dict(meta, partial=True)), encoding="utf-8")
+        with children() as seen:
+            o = out(gate.decide(ev(p, pages="3-4")))
+        assert len(seen) == 1 and Path(o["updatedInput"]["file_path"]) == got, (seen, o)
+        assert "partial" not in json.loads((got.parent / "meta.json").read_text(encoding="utf-8"))
+        with children() as seen:
+            out(gate.decide(ev(p, pages="3-4")))
+        assert seen == [], seen
+
+
 def test_cut_pages_named_in_runs():
     md = tmp() / "out.md"
     md.write_text("x\n", encoding="utf-8")
@@ -1144,13 +1179,27 @@ def test_partial_context_names_what_the_time_left_out():
     meta = {"lines": 5, "partial": True, "warnings": [limits.OCR_LATE, limits.FIGURES_LATE], "figures_left": 3,
             "ocr": {"pages": 2, "doubtful": 0, "failed": 0, "stopped_at": 7, "pictures_left": 63}}
     c = gate._context("a.docx", meta, md)
+    again = f' To read the rest, run: python -I -X utf8 "{gate.READ_PY}" convert "a.docx", then Read the file again.'
     assert c.endswith(" Cut by the time limit: OCR stopped at page 7 (later scanned pages are linked as images),"
                       " 63 pictures not read by OCR (Read them to view), some figures not drawn (their text is"
-                      " included)."), c
+                      " included)." + again), c
     meta["ocr"].update(stopped_at=None, pictures_left=1)
     meta["warnings"] = [limits.OCR_LATE]
     c = gate._context("a.docx", meta, md)
-    assert c.endswith(" Cut by the time limit: 1 picture not read by OCR (Read it to view)."), c
+    assert c.endswith(" Cut by the time limit: 1 picture not read by OCR (Read it to view)." + again), c
+    pdf = _pdf_meta(pages=40, partial=True, warnings=[limits.OCR_LATE],
+                    ocr={"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 9,
+                         "pictures_left_pages": [3, 5, 6, 30]})
+    c = gate._context("a.pdf", pdf, md)
+    assert ' 9 pictures not read by OCR (Read them to view). Read the pdf with pages="3-6" for the text the time' \
+           ' left out, then pages 7-30.' in c, c
+    pdf["ocr"].update(stopped_at=38, pictures_left_pages=[39])
+    c = gate._context("a.pdf", pdf, md)
+    assert ' Read the pdf with pages="38-40" for the text the time left out.' in c, c
+    pdf["ocr"].update(stopped_at=None, pictures_left=0, pictures_left_pages=[])
+    pdf["warnings"] = [limits.FIGURES_LATE]
+    c = gate._context("a.pdf", pdf, md)
+    assert c.endswith(f' convert "a.pdf", then Read the file again.'), c
     del meta["partial"]
     assert "Cut by the time limit" not in gate._context("a.docx", meta, md)
 
@@ -1947,7 +1996,8 @@ def test_gate_time_cut_is_kept():
         assert o1["updatedInput"]["file_path"] == o2["updatedInput"]["file_path"], (o1, o2)
         assert "LATE figure" in md_lines(o2), md_lines(o2)
         assert o2["additionalContext"].endswith(
-            " Cut by the time limit: some figures not drawn (their text is included)."), o2
+            " Cut by the time limit: some figures not drawn (their text is included). To read the rest, run:"
+            f' python -I -X utf8 "{gate.READ_PY}" convert "{p}", then Read the file again.'), o2
         q = sample("on time")
         assert out(run(q, base))["permissionDecision"] == "allow"
         assert out(gate.decide(ev(q), command=EXIT3))["permissionDecision"] == "allow"  # kept: a hit
@@ -2438,7 +2488,8 @@ def _crowded(pdf):
     garble warning, unread parts and, for pdf, unrendered and vector-figure pages and pages past the cut."""
     from reader import limits
     meta = _pdf_meta(pages=290, per=37, pages_total=384, images=84, hidden=3, partial=True,
-                     ocr={"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 61},
+                     ocr={"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 61,
+                          "pictures_left_pages": list(range(3, 290, 5))},
                      warnings=["garbled", limits.OCR_LATE, limits.FIGURES_LATE],
                      unread=["9 vector figures not shown", "2 charts", "1 embedded object"],
                      unrendered=list(range(63, 290, 7)), figures=list(range(5, 290, 11)))
@@ -2451,48 +2502,60 @@ def _crowded(pdf):
 
 def test_context_never_passes_its_cap():
     """Whatever the cache root's and the file name's length, the context stays under CONTEXT_MAX and keeps the
-    window and time-cut sentences and the pages past the cut; with an entry folder of up to 164 characters (the
-    default root's is 92) an index that shrinks instead of vanishing too, with index.md named when it was
-    written."""
-    window = " Lines 1-1666 of 10730; continue with offset=1667."
-    usual = 92
-    if len(str(tmp())) + 45 > usual:
-        print(f"skip: the usual entry length in test_context_never_passes_its_cap (temp folder {len(str(tmp()))} long)")
-    for pdf in (True, False):
-        ext = "pdf" if pdf else "epub"
-        for folder in (usual, usual + 72):
-            for name in (f"a.{ext}", "x" * 76 + f".{ext}"):
-                for offer in ("", gate.offer_text("v" * 60) if pdf else gate.IMAGE_OFFER.format(
-                        k=3, read_py=gate.READ_PY, dir="v" * 60)):
-                    base = tmp()
-                    md = base / ("r" * max(1, folder - len(str(base)) - 45)) / "48" / ("k" * 40) / "out.md"
-                    md.parent.mkdir(parents=True)
-                    root_len = len(str(md.parent))
-                    md.write_text("x\n", encoding="utf-8")
-                    c = gate._context(name, _crowded(pdf), md, offer=offer, window=window)
-                    case = (pdf, root_len, len(name), bool(offer), len(c))
-                    assert len(c) < gate.CONTEXT_MAX, (case, c)
-                    assert c.endswith(window + " Warning: the text may be garbled."), (case, c)
-                    assert " Cut by the time limit: 61 pictures not read by OCR" in c, (case, c)
-                    assert not pdf or ' are past the cut; Read the pdf with pages="291-310"' in c, (case, c)
-                    kind = "Pages" if pdf else "Sections"
-                    sample = kind + " at lines (all in index.md next to that assets folder): 1"
-                    pointer = kind + " at lines: index.md next to that assets folder."
-                    assert (md.parent / "index.md").is_file() == (sample in c or pointer in c), (case, c)
-                    assert root_len > usual + 72 or sample in c or pointer in c, (case, c)
-                    if root_len <= usual and len(name) < 10:
-                        meta = _crowded(pdf)
-                        for key in ("unread", "figures"):
-                            meta.pop(key, None)
-                        c = gate._context(name, meta, md, offer=offer, window=window)
-                        assert (sample in c or pointer in c) and len(c) < gate.CONTEXT_MAX, (case, c)
-    for root_len in (150, 400):
-        md = tmp().joinpath(*["r" * 49] * (root_len // 50)) / "out.md"
-        md.parent.mkdir(parents=True)
-        md.write_text("x\n", encoding="utf-8")
-        c = gate._context("x" * 400 + ".pdf", _crowded(True), md, offer=gate.offer_text("v" * 60), window=window)
-        assert len(c) < gate.CONTEXT_MAX and c.endswith(window + " Warning: the text may be garbled."), (len(c), c)
-        assert ' are past the cut; Read the pdf with pages="291-310"' in c, c
+    window and time-cut sentences, the read that gets what the time left out and the pages past the cut; at the
+    cache root's usual length (an entry folder of 92 characters, as under the default root) an index that shrinks
+    instead of vanishing is kept too, unless a long path fills the convert command that finishes a partial entry;
+    index.md is named whenever it was written. read.py lies where a plugin install puts it."""
+    old = gate.READ_PY
+    gate.READ_PY = "C:/Users/someone/.claude/plugins/cache/phro-markt/phro-project/0.16.0/scripts/read.py"
+    try:
+        window = " Lines 1-1666 of 10730; continue with offset=1667."
+        usual = 92
+        if len(str(tmp())) + 45 > usual:
+            print("skip: the usual entry length in test_context_never_passes_its_cap"
+                  f" (temp folder {len(str(tmp()))} long)")
+        for pdf in (True, False):
+            ext = "pdf" if pdf else "epub"
+            for folder in (usual, usual + 72):
+                for name in (f"a.{ext}", "x" * 76 + f".{ext}"):
+                    for offer in ("", gate.offer_text("v" * 60) if pdf else gate.IMAGE_OFFER.format(
+                            k=3, read_py=gate.READ_PY, dir="v" * 60)):
+                        base = tmp()
+                        md = base / ("r" * max(1, folder - len(str(base)) - 45)) / "48" / ("k" * 40) / "out.md"
+                        md.parent.mkdir(parents=True)
+                        root_len = len(str(md.parent))
+                        md.write_text("x\n", encoding="utf-8")
+                        c = gate._context(name, _crowded(pdf), md, offer=offer, window=window)
+                        case = (pdf, root_len, len(name), bool(offer), len(c))
+                        assert len(c) < gate.CONTEXT_MAX, (case, c)
+                        assert c.endswith(window + " Warning: the text may be garbled."), (case, c)
+                        assert " Cut by the time limit" in c, (case, c)
+                        reach = (' Read the pdf with pages="3-18" for the ' if pdf
+                                 else f' "{gate.READ_PY}" convert "{name}"')
+                        assert reach in c, (case, c)
+                        assert not pdf or ' are past the cut; Read the pdf with pages="291-310"' in c, (case, c)
+                        kind = "Pages" if pdf else "Sections"
+                        sample = kind + " at lines (all in index.md next to that assets folder): 1"
+                        pointer = kind + " at lines: index.md next to that assets folder."
+                        assert (md.parent / "index.md").is_file() == (sample in c or pointer in c), (case, c)
+                        long_command = not pdf and len(name) > 10
+                        assert root_len > usual or long_command or sample in c or pointer in c, (case, c)
+                        if root_len <= usual and len(name) < 10:
+                            meta = _crowded(pdf)
+                            for key in ("unread", "figures"):
+                                meta.pop(key, None)
+                            c = gate._context(name, meta, md, offer=offer, window=window)
+                            assert sample in c and len(c) < gate.CONTEXT_MAX, (case, c)
+        for root_len in (150, 400):
+            md = tmp().joinpath(*["r" * 49] * (root_len // 50)) / "out.md"
+            md.parent.mkdir(parents=True)
+            md.write_text("x\n", encoding="utf-8")
+            c = gate._context("x" * 400 + ".pdf", _crowded(True), md, offer=gate.offer_text("v" * 60), window=window)
+            assert len(c) < gate.CONTEXT_MAX and c.endswith(window + " Warning: the text may be garbled."), (len(c), c)
+            assert ' are past the cut; Read the pdf with pages="291-310"' in c, c
+            assert ' Read the pdf with pages="3-18" for the rest' in c, c
+    finally:
+        gate.READ_PY = old
 
 
 def main():

@@ -261,7 +261,9 @@ def cmd_convert(a) -> int:
                     k += f"-p{a.pages[0]}-{a.pages[1]}"
                 if a.hidden:
                     k += "-hidden"
-                out = cache.lookup(k) or cache.store(k, src, a.hidden, **opts)
+                out = cache.lookup(k)
+                if out is None or cache.partial(out):
+                    out = cache.store(k, src, a.hidden, again=out is not None, **opts)
         print(out / "out.md")
     except ReadError as e:
         print(f"FAIL	{e.kind}	{_flat(e.detail)}")

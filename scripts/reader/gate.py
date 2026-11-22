@@ -389,8 +389,48 @@ def _past_cut(meta, upto=None, short=False):
     return first + (f" {SUGGEST_PAGES}." if short else f" {SUGGEST_PAGES} pages and so on, to read them.")
 
 
+def _pending(meta):
+    """The pages of a partial pdf entry whose text the deadline left out: those whose pictures OCR did not read,
+    and from the page where page OCR stopped to the page index's last."""
+    if meta.get("partial") is not True:
+        return []
+    ocr = meta.get("ocr") if isinstance(meta.get("ocr"), dict) else {}
+    pages = set(_ints(ocr.get("pictures_left_pages")))
+    if at := _count(ocr.get("stopped_at")):
+        pages.update(range(at, max([at] + [p for p, _ in page_index(meta)]) + 1))
+    return sorted(pages)
+
+
+def _reach(path, meta, out_md, short=False):
+    """The sentence naming the read that gets what the deadline left out of a partial entry, in fewer words when
+    `short`: for a pdf range entry the same pages= read again, for a whole pdf the pages= read of the first pages
+    left (and how far they go), else the convert by hand that finishes the entry; "" when the entry is whole."""
+    if meta.get("partial") is not True:
+        return ""
+    rest = " for the rest" if short else " for the text the time left out"
+    if reader.ext_of(path) == "pdf":
+        _, a, b = (out_md.parent.name.split("-") + ["", ""])[:3]
+        if a[:1] == "p" and a[1:].isdigit() and b.isdigit():
+            return f' Read the pdf with pages="{_span(int(a[1:]), int(b))}" again{rest}.'
+        if pages := _pending(meta):
+            a = pages[0]
+            b = max(p for p in pages if p < a + SUGGEST_PAGES)
+            if pages[-1] == b:
+                more = "."
+            elif short:
+                more = f", then on to page {pages[-1]}."
+            else:
+                more = f", then pages {b + 1}-{pages[-1]}."
+            return f' Read the pdf with pages="{_span(a, b)}"{rest}' + more
+    run = f'python -I -X utf8 "{READ_PY}" convert "{path}"' + (" --engine pdfium" if meta.get("engine") == "pdfium"
+                                                                else "")
+    if short:
+        return f" For the rest, run {run} and Read again."
+    return f" To read the rest, run: {run}, then Read the file again."
+
+
 def _time_cut(meta, short=False):
-    """The sentence saying what the deadline left out of a partial entry, in fewer words when `short`; "" when
+    """The sentence saying what the deadline left out of a partial entry, without the list when `short`; "" when
     the entry is whole."""
     if meta.get("partial") is not True:
         return ""
@@ -403,7 +443,9 @@ def _time_cut(meta, short=False):
                      + ("" if short else " (Read it to view)" if k == 1 else " (Read them to view)"))
     if limits.FIGURES_LATE in (meta.get("warnings") or []):
         items.append("some figures not drawn" + ("" if short else " (their text is included)"))
-    return " Cut by the time limit: " + ", ".join(items) + "." if items else ""
+    if not items:
+        return ""
+    return " Cut by the time limit." if short else " Cut by the time limit: " + ", ".join(items) + "."
 
 
 def _head(name, meta, assets):
@@ -419,21 +461,23 @@ def _head(name, meta, assets):
     return head
 
 
-def _context(name, meta, out_md, *, past_end="", offer="", upto=None, window=""):
+def _context(path, meta, out_md, *, past_end="", offer="", upto=None, window=""):
     """additionalContext for an allow, never past CONTEXT_MAX - 1 characters. Room goes first to the head (the file
     name cut short when it must), what the time cut, for pdf the pages past the cut (up to `upto`, the end of a
     range read) and the read that gets them, the `window` sentence, the garble warning, and the floor of a long
     output's index; then, for pdf, the past-the-end sentence, PDF_HINT, the offer (whole or not at all), the
     unrendered and figure pages, and for the rest the edit hint and the image offer (whole or not at all); then
     the unread list; the index takes what is left. They read head, hint, past-the-end, offer, pages, unread, index,
-    then the time cut and the rest. The head names the assets folder by its absolute path: the Read result does
-    not show out.md's."""
+    then the time cut and the read that gets the rest, and the rest. The head names the assets folder by its
+    absolute path: the Read result does not show out.md's."""
+    name = _name(path)
     pdf = reader.ext_of(name) == "pdf"
     assets = f"{out_md.parent / 'assets'}{os.sep}"
     garble = " Warning: the text may be garbled." if "garbled" in (meta.get("warnings") or []) else ""
 
     def tail_of(short):
-        return _time_cut(meta, short) + (_past_cut(meta, upto, short) if pdf else "") + window + garble
+        return (_time_cut(meta, short) + _reach(path, meta, out_md, short) + (_past_cut(meta, upto, short) if pdf
+                                                                               else "") + window + garble)
     tail = tail_of(False)
     n = meta.get("lines", 0)
     long_out = isinstance(n, int) and n > INDEX_LINES
@@ -692,7 +736,7 @@ def _generic(event, path, start, timeout, command):
         if mark is not None and mark.exists():
             offer = ""
     limit, window = _window(meta, event["tool_input"])
-    context = _context(_name(path), meta, out_md, offer=offer, window=window)
+    context = _context(path, meta, out_md, offer=offer, window=window)
     if offer and mark is not None and offer in context:
         _touch(mark)
     return _allow(event, path, out_md, context, **limit)
@@ -762,7 +806,7 @@ def _mpp(event, path, start, timeout, command):
         return _deny(path, "damaged", "cache entry vanished")
     meta = _meta(entry)
     limit, window = _window(meta, event["tool_input"])
-    return _allow(event, path, out_md, _context(_name(path), meta, out_md, window=window), **limit)
+    return _allow(event, path, out_md, _context(path, meta, out_md, window=window), **limit)
 
 
 def parse_pages(v):
@@ -840,7 +884,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
         """(entry, None), or (None, the hook's output: a deny or a pass-through), or for `pages` that start past
         the pdf's end (None, None)."""
         got = cache.lookup(key)
-        if got is not None:
+        if got is not None and not (pages and cache.partial(got)):  # a partial range is converted again
             return got, None
         fail = _failed(cache.root() / "failed" / key)
         if fail is not None:
@@ -900,7 +944,8 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
             index = page_index(meta)
             if ranged:
                 upto = b
-            elif not index or b > max(p for p, _ in index):  # past the cut: convert that range alone, served whole
+            elif (not index or b > max(p for p, _ in index)  # past the cut, or left for the time: that range alone
+                  or any(a <= p <= b for p in _pending(meta))):
                 entry, result = convert(f"{k}-p{a}-{b}", (a, b))
                 if entry is None:
                     return result
@@ -925,7 +970,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
             offer = offer_text(venv, repair)
     limit, window = _window(meta, {**{k: v for k, v in event["tool_input"].items() if k not in drop}, **at})
     at.update(limit)
-    context = _context(_name(path), meta, out_md, past_end=past_end, offer=offer, upto=upto, window=window)
+    context = _context(path, meta, out_md, past_end=past_end, offer=offer, upto=upto, window=window)
     if offer and mark is not None and offer in context:
         _touch(mark)
     return _allow(event, path, out_md, context, drop, **at)

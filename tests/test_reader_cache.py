@@ -422,7 +422,9 @@ def test_cache_key_holds_image_backend():
 
 def test_time_cut_is_filed_partial():
     """Decision 4: a conversion whose figures or OCR the deadline cut is filed under its key with partial in its
-    meta, and the next convert returns that entry as is. A whole result carries no partial mark."""
+    meta. A convert by hand of a partial entry converts again and puts the new result in its place, partial while
+    the cut comes again and whole once it does not; a whole entry is returned as is. A whole result carries no
+    partial mark."""
     from reader import limits, raster
     calls = []
     late = []
@@ -440,10 +442,18 @@ def test_time_cut_is_filed_partial():
             c1, o1 = cli("convert", str(p))
             c2, o2 = cli("convert", str(p))
             k = cache.key(p, image=raster.backend())
-            assert c1 == c2 == 0 and len(calls) == 1, (calls, o1, o2)
+            assert c1 == c2 == 0 and len(calls) == 2, (calls, o1, o2)
             assert Path(o1.strip()).parent.name == k == Path(o2.strip()).parent.name, (o1, k)
             meta = json.loads((Path(o1.strip()).parent / "meta.json").read_text(encoding="utf-8"))
             assert meta["partial"] is True and cut in meta["warnings"], meta
+            late.clear()
+            c3, o3 = cli("convert", str(p))
+            c4, o4 = cli("convert", str(p))
+            assert c3 == c4 == 0 and len(calls) == 3 and o3 == o4 == o1, (calls, o3, o4)
+            meta = json.loads((Path(o3.strip()).parent / "meta.json").read_text(encoding="utf-8"))
+            assert "partial" not in meta and cut not in meta["warnings"], meta
+            assert [x.name for x in Path(o1.strip()).parent.parent.iterdir()] == [k], k
+            late[:] = [cut]
         late.clear()
         q = sample("on time")
         c3, o3 = cli("convert", str(q))
@@ -453,8 +463,9 @@ def test_time_cut_is_filed_partial():
 
 def test_figure_cache_carries_a_cut_read_further():
     """A read the deadline cut keeps the figures it finished (PNG, lines, warnings) in the figure cache under the
-    cache root. The cut document is filed partial and returned as is; another read of the same pictures (the hidden
-    variant here) takes the finished figures from the figure cache and gets further."""
+    cache root. The cut document is filed partial; the next convert of it reads again, takes the finished figures
+    from the figure cache and gets further, until the entry is whole; another read of the same pictures (the hidden
+    variant here) takes them all from the figure cache."""
     from metafile_fix import wmf, wmf_text
     from reader import limits, raster
     from reader.model import Image
@@ -477,7 +488,7 @@ def test_figure_cache_carries_a_cut_read_further():
             p = sample()
             k = cache.key(p, image=read._image_id("_teststub"))
             done = []
-            for n, args, name in ((6, (), k), (0, (), k), (4, ("--hidden",), k + "-hidden")):
+            for n, args, name in ((6, (), k), (4, (), k), (2, (), k), (0, ("--hidden",), k + "-hidden")):
                 calls.clear()
                 left[0] = 2
                 code, o = cli("convert", str(p), *args)
@@ -487,8 +498,8 @@ def test_figure_cache_carries_a_cut_read_further():
                 assert code == 0 and len(calls) == n and entry.name == name, (len(calls), n, o)
                 done.append(meta["figures"])
                 assert all(f"Figure text: pic{i}" in md for i in range(6)), md
-                assert "figure text cut" in meta["warnings"] and meta["partial"] is True, meta
-            assert done == [2, 2, 4], done
+                assert "figure text cut" in meta["warnings"] and (meta.get("partial") is True) == (len(done) < 3), meta
+            assert done == [2, 4, 6, 6], done
             assert (cache.root() / "figures").is_dir()
     finally:
         raster.convert = real

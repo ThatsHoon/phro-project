@@ -190,6 +190,16 @@ def _complete(d: Path) -> bool:
     return (d / "out.md").is_file() and (d / "meta.json").is_file()
 
 
+def partial(d: Path) -> bool:
+    """True when the entry at d was filed partial (decision 4): the deadline cut its figures or OCR."""
+    import json
+    try:
+        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and meta.get("partial") is True
+
+
 FIGURES = "figures"  # the folder under the root that holds converted figures (Figures)
 _FIG_MAGIC = b"PHROFIG1"
 
@@ -326,11 +336,13 @@ class OcrResults:
                 pass
 
 
-def store(k: str, src, hidden: bool = False, **opts) -> Path:
+def store(k: str, src, hidden: bool = False, again: bool = False, **opts) -> Path:
+    """Converts src into the entry for k and returns it; an entry already there is returned as is, or, with
+    `again`, put aside for the new one once that is done."""
     from . import images
     bucket = root() / k[:2]
     target = bucket / k
-    if _complete(target):
+    if _complete(target) and not again:
         return target
     with _lock:
         n = next(_counter)
@@ -354,6 +366,24 @@ def store(k: str, src, hidden: bool = False, **opts) -> Path:
         import json
         meta.update(extra)
         (tmp / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    if again and target.exists():
+        old_dir = bucket / f".tmp-old-{k}-{os.getpid()}-{n}"
+        try:
+            os.replace(target, old_dir)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return target
+        try:
+            os.replace(tmp, target)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            try:
+                os.replace(old_dir, target)
+            except OSError:
+                pass
+            return target
+        shutil.rmtree(old_dir, ignore_errors=True)
+        return target
     for attempt in (0, 1):
         try:
             os.replace(tmp, target)

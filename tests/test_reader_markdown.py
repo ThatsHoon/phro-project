@@ -932,6 +932,20 @@ def test_stop_note_for_pages_and_pictures():
     assert info["ocr"]["pictures_left"] == 2, info
 
 
+def test_pictures_left_name_their_pages():
+    """The pdf pages whose pictures OCR left for the time are kept, in order, with the count."""
+    info = {}
+    pages = [Section(kind="page", number=n, blocks=[Image(pic(shade=s))] if s else [P(f"text {n}")])
+             for n, s in ((1, 0), (2, 250), (3, 0), (4, 240), (5, 250))]
+    with stub(deadline=time.monotonic() + limits.FIGURE_RESERVE + 1, delay=30, answer=seen("Total 120")), \
+            tempfile.TemporaryDirectory() as d:
+        markdown.render(Doc(blocks=pages), Path(d), info=info)
+    assert info["ocr"]["pictures_left"] == 2 and info["ocr"]["pictures_left_pages"] == [2, 4, 5], info
+    with stub(answer=seen("Total 120")), tempfile.TemporaryDirectory() as d:
+        markdown.render(Doc(blocks=pages), Path(d), info=info)
+    assert info["ocr"]["pictures_left"] == 0 and "pictures_left_pages" not in info["ocr"], info
+
+
 def test_korean_hint_once():
     hint = ('(Korean OCR is not installed in Windows: Settings > Time & language > Language > add Korean with '
             '"Optical character recognition".)')
