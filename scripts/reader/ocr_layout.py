@@ -134,10 +134,14 @@ def read(frags, width, links=()) -> list:
     holding a line whose measured box reaches the middle band (a title, a full-width line, a narrow gutter) cut the
     page into bands; when the rows leave a gutter clear inside the band (`_gutter`), only the rows with a line over the
     gutter's middle do. A band clear of it with two clean columns reads its left column, then its right, a line that
-    goes on along the one before it made one with it (`pdf_layout._whole`: the bands are cut on lines of one row). The rows
+    goes on along the one before it made one with it (`pdf_layout._whole`: the bands are cut on lines made row by row,
+    so that each lies in one row). The rows
     between such bands keep the engine's order through `pdf_layout.reading_order`, taken over all of them at once."""
     ordered, row_of = _by_position(frags)
-    placed = pdf_layout.lines([replace(f, order=k) for k, f in enumerate(ordered)], links, whole=False)
+    numbered = [replace(f, order=k) for k, f in enumerate(ordered)]
+    gap = pdf_layout.word_gap(sorted((f for f in numbered if f.text and not f.hidden), key=lambda f: f.order))
+    placed = [ln for _row, fs in groupby(numbered, key=lambda f: row_of[f.order])
+              for ln in pdf_layout.lines(list(fs), links, gap, whole=False)]
     by_row = defaultdict(list)
     for ln in placed:
         by_row[row_of[ln.order]].append(ln)

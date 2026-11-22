@@ -759,8 +759,7 @@ def lines(fragments, links=(), gap=None, whole=True) -> List[Line]:
     one-glyph fragments stacked in a column (`_stacked`: a horizontal font's glyphs placed one by
     one down a column, among a vertical font's punctuation). Other text running down the page is
     read as lines like any other. A line that goes on along the one before it (a piece set off by
-    a superscript or a font change) is one line with it (`_whole`), unless `whole` is False: each
-    line then lies in one row.
+    a superscript or a font change) is one line with it (`_whole`), unless `whole` is False.
 
     A fragment that starts before the last one ended (a row whose cells are drawn right cell
     first, words drawn into the gaps a later string leaves) joins the line as `_Row.take_back`
