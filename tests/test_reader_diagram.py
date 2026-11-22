@@ -650,6 +650,152 @@ def test_budget_cut():
     assert ctx.skipped["connections_cut"] == 1, ctx.skipped
 
 
+def test_group_takes_its_childrens_text():
+    # glue on a textless group: its node is named by the plain text below it, top to bottom in the flow, and those
+    # children leave the flow; a child that is an end itself, or hidden, keeps its own place
+    d, _ = new()
+    d.shape("G", [])
+    d.shape("N", P("Routes"), parent="G")
+    d.shape("X", [], parent="G")
+    d.shape("H", P("secret", hidden="hidden"), hidden=True, parent="G")
+    d.shape("A", P("attr"), parent="X")
+    d.shape("B", P("B"))
+    d.connector("k", begin="G", end="B")
+    secret = P("secret", hidden="hidden")
+    out = d.place([("G", []), ("N", P("Routes")), ("X", []), ("A", P("attr")), ("H", secret), ("B", P("B")),
+                   ("k", [])])
+    assert lines(out) == ["flowchart TD", '  n1["Routes<br>attr"]', '  n2["B"]', "  n1 --> n2"], out
+    assert out[1:] == secret, out
+    d, _ = new()  # a child that is an end is its own node, not the group's name
+    d.shape("G", [])
+    d.shape("N", P("N"), parent="G")
+    d.shape("B", P("B"))
+    d.connector("k1", begin="G", end="B")
+    d.connector("k2", begin="N", end="B")
+    ls = lines(d.place([("G", []), ("N", P("N")), ("B", P("B")), ("k1", []), ("k2", [])]))
+    assert ls == ["flowchart TD", '  n2["N"]', '  n3["B"]', "  n1 --> n3", "  n2 --> n3"], ls
+
+
+def test_port_resolves_to_named_ancestor():
+    # glue on a textless child (a port), or a loose end landing on it, goes to its nearest ancestor with text
+    d, _ = new()
+    d.shape("U", P("User"), box=(0, 0, 10, 10))
+    d.shape("P", [], box=(4, 4, 6, 6), parent="U")
+    d.shape("Q", [], box=(4, 4, 5, 5), parent="P")
+    d.shape("B", P("B"), box=(50, 0, 60, 10))
+    d.connector("k1", begin="Q", end="B")
+    d.connector("k2", begin="B", p0=(55, 5), p1=(5, 5))
+    ls = lines(d.place([("U", []), ("P", []), ("Q", []), ("B", []), ("k1", []), ("k2", [])]))
+    assert ls == ["flowchart LR", '  n1["User"]', '  n2["B"]', "  n1 --> n2", "  %% inferred from position",
+                  "  n2 --> n1"], ls
+    d, _ = new()  # a container never takes a port's glue; a port with no named ancestor stays a blank node
+    d.shape("L", P("Lane"), box=(0, 0, 100, 100), container=True, title="Lane")
+    d.shape("P", [], parent="L")
+    d.shape("B", P("B"))
+    d.connector("k", begin="P", end="B")
+    assert lines(d.place([("L", []), ("P", []), ("B", []), ("k", [])])) == [
+        "flowchart TD", '  n2["B"]', "  n1 --> n2"]
+
+
+def test_glue_to_connector_follows_it():
+    # an end glued to another connector joins the shape glued at that connector's end nearest the glue point
+    d, ctx = new()
+    for k in "ABC":
+        d.shape(k, P(k))
+    d.connector("trunk", begin="A", end="B", p0=(0, 0), p1=(10, 0))
+    d.connector("branch", begin="trunk", end="C", p0=(0.1, 0), p1=(5, 5))
+    d.connector("chain", begin="branch", end="B", p0=(5, 5.2), p1=(10, 0))
+    ls = lines(d.place([(k, []) for k in "ABC"] + [("trunk", []), ("branch", []), ("chain", [])]))
+    assert ls == ["flowchart TD", '  n1["A"]', '  n2["B"]', '  n3["C"]', "  n1 --> n2", "  n1 --> n3",
+                  "  n3 --> n2"], ls
+    assert not ctx.skipped, ctx.skipped
+    d, ctx = new()  # a loop of connectors, or a glue point equally near both ends, joins nothing
+    for k in "AB":
+        d.shape(k, P(k))
+    d.connector("x", begin="y", end="A", p0=(0, 0), p1=(1, 1))
+    d.connector("y", begin="x", end="B", p0=(0, 0), p1=(2, 2))
+    d.connector("z", begin="A", end="B", p0=(0, 0), p1=(2, 0))
+    d.connector("w", begin="z", end="A", p0=(1, 0), p1=(0, 0))
+    out = d.place([("A", P("A")), ("B", P("B")), ("x", []), ("y", []), ("z", []), ("w", P("w"))])
+    assert lines(out) == ["flowchart TD", '  n1["A"]', '  n2["B"]', "  n1 --> n2"], out
+    assert ctx.skipped == {"connector_loose": 3}, ctx.skipped
+    d, ctx = new()  # glue to a connector with an end on a missing key joins nothing
+    for k in "AB":
+        d.shape(k, P(k))
+    d.connector("half", begin="A", end="gone", p0=(0, 0), p1=(9, 9))
+    d.connector("on", begin="half", end="B", p0=(0.1, 0), p1=(5, 5))
+    d.connector("ok", begin="A", end="B")
+    out = d.place([("A", P("A")), ("B", P("B")), ("half", []), ("on", []), ("ok", [])])
+    assert lines(out) == ["flowchart TD", '  n1["A"]', '  n2["B"]', "  n1 --> n2"], out
+    assert ctx.skipped == {"connector_loose": 2}, ctx.skipped
+
+
+def test_tree_keeps_blank_child():
+    d, _ = new()
+    for k in "RA":
+        d.shape(k, P(k))
+    d.shape("E", [])
+    d.connector("k1", begin="R", end="A")
+    d.connector("k2", begin="R", end="E")
+    out = d.place([("R", []), ("A", []), ("E", []), ("k1", []), ("k2", [])])
+    assert out == [ListItem(0, "-", [Text("R")]), ListItem(1, "-", [Text("A")]),
+                   ListItem(1, "-", [Text("(unlabelled shape)")])], out
+
+
+def test_connector_children_label_its_edge():
+    # text shapes inside a connector are its edge's label: those near its begin, its own text, those near its end
+    d, _ = new()
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("k", begin="A", end="B", p0=(0, 0), p1=(30, 0), blocks=P("assoc"))
+    d.shape("r", P("-have"), box=(1, 1, 3, 2), parent="k")
+    d.shape("m", P("1"), box=(1, -2, 2, -1), parent="k")
+    d.shape("n", P("1..*"), box=(27, 1, 29, 2), parent="k")
+    d.shape("e", [], box=(27, -2, 28, -1), parent="k")
+    slots = [("A", []), ("B", []), ("k", P("assoc")), ("r", P("-have")), ("m", P("1")), ("n", P("1..*")), ("e", [])]
+    out = d.place(slots)
+    assert lines(out)[-1] == '  n1 -->|"-have 1 / assoc / 1..*"| n2' and len(out) == 1, out
+    d, _ = new()  # written end to start: the label reads from the written start too
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("k", begin="A", end="B", p0=(0, 0), p1=(30, 0), arrows=(True, False))
+    d.shape("r", P("-have"), box=(1, 1, 3, 2), parent="k")
+    d.shape("n", P("1..*"), box=(27, 1, 29, 2), parent="k")
+    out = d.place([("A", []), ("B", []), ("k", []), ("r", P("-have")), ("n", P("1..*"))])
+    assert lines(out)[-1] == '  n2 -->|"1..* / -have"| n1' and len(out) == 1, out
+    d, _ = new()  # past NAME characters: cut with …, the children's blocks follow the diagram
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("k", begin="A", end="B")
+    d.shape("r", P("x" * 90), parent="k")
+    out = d.place([("A", []), ("B", []), ("k", []), ("r", P("x" * 90))])
+    assert lines(out)[-1] == '  n1 -->|"' + "x" * 80 + '…"| n2', out
+    assert out[1:] == [Para([Text("n1 --> n2:")])] + P("x" * 90), out
+
+
+def test_meaningful_kinds_and_names():
+    d, _ = new()
+    d.shape("Q", P("ok?"), kind="decision")
+    d.shape("S", P("Step"), kind="chevron")
+    d.shape("C", P("note"), kind="callout")
+    d.shape("F", [], name="Firewall")
+    d.connector("k1", begin="Q", end="S")
+    d.connector("k2", begin="S", end="C")
+    d.connector("k3", begin="C", end="F")
+    ls = lines(d.place([("Q", []), ("S", []), ("C", []), ("F", []), ("k1", []), ("k2", []), ("k3", [])]))
+    assert ls == ["flowchart TD", '  n1{"ok?"}', '  n2>"Step"]', '  n3@{ shape: comment, label: "note" }',
+                  '  n4["Firewall"]', "  n1 --> n2", "  n2 --> n3", "  n3 --> n4"], ls
+    d, _ = new()  # a name stands in only when no ancestor has text: a named port joins its group's text
+    d.shape("G", [], name="Group")
+    d.shape("T", P("Block"), parent="G")
+    d.shape("P", [], name="Rectangle", parent="G")
+    d.shape("J", [], name="Node", parent="X")
+    d.shape("X", [], name="Group")
+    d.connector("k1", begin="P", end="J")
+    ls = lines(d.place([("G", []), ("T", P("Block")), ("P", []), ("X", []), ("J", []), ("k1", [])]))
+    assert ls == ["flowchart TD", '  n1["Block"]', '  n2["Node"]', "  n1 --> n2"], ls
+
+
 def test_skip_kind_wording():
     sk = collections.Counter(connector_loose=2, infer_skipped=1)
     md = markdown.render(Doc(blocks=P("body")), Path(tempfile.mkdtemp()), skipped=sk)

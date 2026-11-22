@@ -563,6 +563,83 @@ def test_vsdx_container():
     assert mermaid_ok(t) and "subgraph" not in t and "Lane" in out, out
 
 
+def test_group_port_and_connector_glue():
+    # glue on an actor's textless sub-shape goes to the actor; a connector whose begin is glued to another connector
+    # joins the shape glued at that connector's nearest end
+    actor = shape(81, "User", (), box_cells(1, 5, 1, 1) + "<Shapes>" + shape(82, None, (), box_cells(0.5, 0.5, 0.4, 1))
+                  + "</Shapes>")
+    a = shape(3, "Add", (), box_cells(5, 6, 1, 0.5))
+    b = shape(4, "Edit", (), box_cells(5, 4, 1, 0.5))
+    plain = cell(BeginArrow=0, EndArrow=0)
+    trunk = line(21, (1.5, 5), (4.5, 6)).replace("</Shape>", plain + "</Shape>")
+    branch = line(16, (1.5, 5), (4.5, 4)).replace("</Shape>", plain + "</Shape>")
+    links = glued(21, 82, 3) + glued(16, 21, 4)
+    out, ctx = md(vsdx({"P": page_xml(actor + a + b + trunk + branch, links)}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Add"]\n  n2["User"]\n  n3["Edit"]\n  n2 --- n1\n  n2 --- n3', t
+    assert not ctx.skipped["connector_loose"] and out.count("User") == 1, (out, ctx.skipped)
+
+
+def test_group_text_names_group_and_connector_text_labels_edge():
+    # a UML class: glue on the group, its name in a sub-shape; the association's end texts are its sub-shapes
+    cls = lambda i, name, x: shape(i, None, (), box_cells(x, 5, 1, 1) + "<Shapes>"  # noqa: E731
+                                   + shape(i + 1, name, (), box_cells(0.5, 0.8, 1, 0.3))
+                                   + shape(i + 2, None, (), box_cells(0.5, 0.3, 1, 0.6)) + "</Shapes>")
+    assoc = (f'<Shape ID="20">' + cell(BeginX=1.5, BeginY=5, EndX=4.5, EndY=5, PinX=3, PinY=5, Width=3, Height=0,
+                                       LocPinX=1.5, LocPinY=0)
+             + "<Shapes>" + shape(21, "-have", (), box_cells(0.2, 0.1, 0.4, 0.2))
+             + shape(22, "1..*", (), box_cells(2.8, 0.1, 0.4, 0.2)) + "</Shapes></Shape>")
+    out, _ = md(vsdx({"P": page_xml(cls(1, "Routes", 1) + cls(10, "Bus", 5) + assoc, glued(20, 1, 10))}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Routes"]\n  n2["Bus"]\n  n1 -->|"-have / 1..*"| n2', t
+    assert out == f"## Page: P\n\n```mermaid\n{t}\n```\n", repr(out)
+
+
+def paras(doc):
+    """Each Para of each page as text, "hidden:" before a hidden one."""
+    return [("hidden:" if b.hidden else "") + "".join(t.text for t in b.inlines if isinstance(t, Text))
+            for sec in doc.blocks for b in sec.blocks if isinstance(b, Para)]
+
+
+def test_master_name_shape_data_and_links():
+    # a textless instance is named by its master; Shape Data rows (the master's labels and order, the instance's
+    # values) and hyperlinks are lines of the shape; an invisible row is hidden
+    master = shape(1, None, (), '<Section N="Property"><Row N="IP"><Cell N="Label" V="IP address"/>'
+                                '<Cell N="Value" V=""/></Row><Row N="Spare"><Cell N="Label" V="Spare"/>'
+                                '<Cell N="Value" V=""/></Row></Section>')
+    props = ('<Section N="Property"><Row N="IP"><Cell N="Value" V="10.0.0.5" U="STR"/></Row>'
+             '<Row N="Owner"><Cell N="Label" V="Owner"/><Cell N="Value" V="Ops team"/></Row></Section>'
+             '<Section N="Hyperlink"><Row N="Row_1"><Cell N="Description" V="Runbook"/>'
+             '<Cell N="Address" V="https://example.com/runbook"/><Cell N="SubAddress" V=""/></Row></Section>')
+    server = shape(1, "Server", (0, 9), props)
+    fw = shape(2, None, (0, 5), "", 'Master="7"')
+    out, ctx = md(vsdx({"P": page_xml(server + fw + shape(3), glued(3, 1, 2))}, masters={"7": master},
+                       mnames={"7": "Firewall"}))
+    t = mermaid_of(out)
+    want = ('flowchart TD\n  n1["Server<br>IP: 10.0.0.5<br>Owner: Ops team<br>Link: Runbook '
+            'https://example.com/runbook"]\n  n2["Firewall"]\n  n1 --> n2')
+    assert mermaid_ok(t) and t == want, t
+    secret = '<Row N="Key"><Cell N="Label" V="Key"/><Cell N="Value" V="s3cret"/><Cell N="Invisible" V="1"/></Row>'
+    own = props.replace("10.0.0.5", "10.0.0.6").replace("</Section><Section", secret + "</Section><Section")
+    doc = reader.parse(vsdx({"P": server + shape(2, None, (0, 5), own, 'Master="7"')}, masters={"7": master}),
+                       Context())
+    assert paras(doc) == ["Server", "IP: 10.0.0.5", "Owner: Ops team", "Link: Runbook https://example.com/runbook",
+                          "IP address: 10.0.0.6", "Owner: Ops team", "hidden:Key: s3cret",
+                          "Link: Runbook https://example.com/runbook"], paras(doc)
+
+
+def test_background_page():
+    # a foreground page names its background page, and the background page names the pages it lies under
+    pages = (f'<Pages xmlns:r="{REL}" {VNS}><Page ID="0" Name="Front" BackPage="4"><Rel r:id="rId1"/></Page>'
+             '<Page ID="4" Name="Back" Background="1"><Rel r:id="rId2"/></Page>'
+             '<Page ID="5" Name="Spare" Background="1"><Rel r:id="rId3"/></Page></Pages>')
+    p = vsdx({"Front": shape(1, "f"), "Back": shape(1, "b"), "Spare": shape(1, "s")},
+             extra={"visio/pages/pages.xml": pages})
+    out, _ = md(p)
+    assert out == ("## Page: Front\n\nBackground page: Back\n\nf\n\n## Page: Back\n\nBackground of: Front\n\nb\n\n"
+                   "## Page: Spare\n\nBackground page\n\ns\n"), repr(out)
+
+
 def test_group_child_box():
     # sub-shapes of a group at origin (10, 10): their boxes and the group's connector ends are page-absolute
     kids_ = shape(2, "A", (), box_cells(1, 1, 1, 1)) + shape(3, "B", (), box_cells(3, 1, 1, 1))

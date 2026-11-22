@@ -96,10 +96,16 @@ shown text is the label; hidden text is none and stays in the flow, hidden. Its 
 else its master shape's, else the first found up the line style chain (the shape's line style, else its master
 shape's), walked through at most `limits.MAX_DEPTH` sheets with a seen-set; none found is not known. Any other shape
 is a node: its box is (PinX - LocPinX, PinY - LocPinY) and (Width, Height), mirrored about the pin by FlipX and FlipY,
-bounded after the turn by Angle about the pin, plus its group's origin (no pin or no size: no box); its kind is ""
-(decision 9: the reader has no master names), and vsd has no containers (the User section is not read). Diagram
+bounded after the turn by Angle about the pin, plus its group's origin (no pin or no size: no box), its group its
+parent. A shape naming a master page whose group is not of that master page is named by the stencil page's name
+(libvisio's `_nameFromId` at the stencil page's level + 1, read when the page is entered), and its kind is that
+name's, as vsdx finds it; vsd has no containers (the User section is not read). Diagram
 data never fails a page: registration and `place` run under `ctx.guard("shape")`, a failed `place` leaving the flow
 as it is. A `_VBA_PROJECT_CUR` storage counts `vba` once; macros are never read.
+
+Background pages (readPage): the page chunk 0x15's u32 at 8 (v5 the s16 at 0) is the pointer index of its
+background page; a page naming another one that is a background page begins with `Background page: <name>`, and a
+background page with `Background of: <names>`, or `Background page` when none names it, as vsdx does.
 
 Page names: 0x32 starts the name list, each 0x33 is one name (a u32, s16 in v5, then text to a NUL); a name index
 0xC9 (u32 count, 13-byte records: name id, name id, element id, a byte) or 0x34 (u32 pairs) maps element ids to
@@ -354,29 +360,32 @@ _LOST = _Entry("", False, False)   # the stencil room was spent on it, or it inh
 
 
 class _Stencil:
-    __slots__ = ("ptr", "idx", "shapes", "first")
+    __slots__ = ("ptr", "idx", "shapes", "first", "name")
 
-    def __init__(self, ptr, idx):
-        self.ptr, self.idx = ptr, idx
+    def __init__(self, ptr, idx, name):
+        self.ptr, self.idx, self.name = ptr, idx, name
         self.shapes = {}      # shape id -> _Entry or _LOST; a blank shape keeps no entry (it reads as _EMPTY)
         self.first = NONE
 
 
 class _Item:
     """A page shape as the page's flow and diagram see it."""
-    __slots__ = ("sid", "parent", "pin", "geo", "ends", "blocks", "hidden", "text", "conn")
+    __slots__ = ("sid", "parent", "pin", "geo", "ends", "blocks", "hidden", "text", "conn", "name")
 
-    def __init__(self, sid, parent, pin, geo, ends, blocks, hidden, text, conn):
-        self.sid, self.parent, self.pin, self.geo, self.ends = sid, parent, pin, geo, ends
+    def __init__(self, sid, parent, pin, geo, ends, blocks, hidden, text, conn, name):
+        self.sid, self.parent, self.pin, self.geo, self.ends, self.name = sid, parent, pin, geo, ends, name
         self.blocks, self.hidden, self.text = blocks, hidden, text  # its text hidden; its shown text
         self.conn = conn      # a connector's (begin id, end id, arrows); None for a node
 
 
 class _Page:
-    __slots__ = ("ptr", "title", "items", "ids", "conns")
+    __slots__ = ("ptr", "title", "items", "ids", "conns", "idx", "background", "back", "masters")
 
-    def __init__(self, ptr):
+    def __init__(self, ptr, idx):
         self.ptr, self.title = ptr, ""
+        self.idx, self.background = idx, not ptr.format & 1
+        self.back = None
+        self.masters = {}
         self.items = []       # _Item of the shapes with text, a picture, an XForm or connector data, in walk order
         self.ids = {}         # shape id -> (parent, PinX, PinY, LocPinX, LocPinY), the first shape of an id; the
         #                       parent alone (an int) for a shape with no XForm, which offsets nothing
@@ -410,6 +419,7 @@ class _Reader:
         self.stream_sid = NONE  # the pointer index of the shape stream last entered (libvisio's m_currentShapeID)
         self.started = 0
         self.sections = []
+        self.done = []
 
     def take(self, n: int) -> int:
         """How many of `n` items the document's BIN_RECORDS meter lets a loop read; the first refusal counts
@@ -440,6 +450,7 @@ class _Reader:
             self.end_page()
         if not self.sections:
             raise ReadError("damaged", "no readable page")
+        vsdx._backgrounds(self.done)
         return Doc(blocks=self.sections)
 
     def enter(self, step):
@@ -454,7 +465,10 @@ class _Reader:
         elif t == STENCIL_PAGE:
             if self.stencil and self.collecting and self.spage is None and self.masters_read < vsdx.MASTERS:
                 self.masters_read += 1
-                self.spage = _Stencil(step.pointer, step.index)
+                name = ""
+                with self.ctx.guard("shape"):
+                    name = self.page_name(step.index, step.level + 1).strip()
+                self.spage = _Stencil(step.pointer, step.index, name)
         elif t == PAGE and not self.stencil:
             self.start_page(step)
         elif t in SHAPES:
@@ -511,6 +525,9 @@ class _Reader:
         elif t in SHAPES:
             if step is not None and self.home() is not None:
                 self.start_shape(step)
+        elif t == PAGE:
+            if not self.stencil and self.pages and self.pages[-1].back is None:
+                self.pages[-1].back = _s16w(c.data, 0, NONE) if self.v == 5 else _u32(c.data, 8, NONE)
         elif self.shape is not None and not self.shape.broken:
             handler = _HANDLERS.get(t)
             if handler is not None:
@@ -603,7 +620,7 @@ class _Reader:
 
     # ---- pages
     def start_page(self, step):
-        page = _Page(step.pointer)
+        page = _Page(step.pointer, step.index)
         self.pages.append(page)
         self.started += 1
         title = ""
@@ -620,6 +637,7 @@ class _Reader:
             sec = self.finish(page)
         if sec is not None:
             self.sections.append(sec)
+            self.done.append((page.idx, page.background, page.back, sec))
 
     def page_name(self, index, level) -> str:
         entry = self.index.get(level)
@@ -705,7 +723,8 @@ class _Reader:
         """One page shape in the page's diagram: a connector with its glue, end points, arrowheads and shown text, or
         a node with its blocks and box; (ox, oy) is its group's origin."""
         if it.conn is None:
-            dia.shape(key, it.blocks, "", _bound(it.pin, it.geo, ox, oy), it.hidden and bool(it.text))
+            dia.shape(key, it.blocks, vsdx._kind(it.name), _bound(it.pin, it.geo, ox, oy),
+                      it.hidden and bool(it.text), parent=None if it.parent in (0, NONE) else it.parent, name=it.name)
             return
         begin, end, arrows = it.conn
         bx, by, ex, ey = it.ends or (None, None, None, None)
@@ -849,6 +868,13 @@ class _Reader:
             self.stencil_room -= cost
             spage.shapes[s.sid] = _Entry(text, cut, hide, s.pin, s.geo, s.ends, s.arrows, s.line_style)
 
+    def master_name(self, s, page) -> str:
+        mp = s.master[0]
+        page.masters.setdefault(s.sid, mp)
+        if mp == NONE or page.masters.get(s.parent) == mp or mp not in self.spages:
+            return ""
+        return self.spages[mp].name
+
     def place(self, s, page):
         """A page shape: its text (its own, else its master's), hidden flag, picture, geometry and connector data."""
         entry, hidden = self.inherited(s)
@@ -891,8 +917,9 @@ class _Reader:
                 or s.end is not None:  # an XForm1D (BeginX and EndX) or a glued end
             conn = (s.begin, s.end, self.arrows_of(s))
             page.conns += 1
+        name = self.master_name(s, page)
         if blocks or s.pin is not None or conn is not None:
-            page.items.append(_Item(s.sid, s.parent, s.pin, s.geo, s.ends, blocks, hidden, text, conn))
+            page.items.append(_Item(s.sid, s.parent, s.pin, s.geo, s.ends, blocks, hidden, text, conn, name))
 
     # ---- chunk readers (libvisio's names)
     def xform(self, s, data):

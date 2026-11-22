@@ -4,11 +4,16 @@ Readers only extract: per scope they register each shape (`Diagram.shape`) and c
 their own shape keys, then hand the scope's flow to `Diagram.place` as `(key or None, blocks)` slots. The module
 numbers, escapes, orients and renders, and builds model blocks only.
 
-- **Edges.** A connector glued at both ends to registered shapes is an edge; a glue reference to a missing key or to a
-  connector (itself included) is not glue. A hidden connector is never an edge. Edges keep `connector()` order and go
-  through the document's `ConnectionBudget`, the glued ones first. A connector given its slot's blocks is labelled
-  with their plain text on one line when that is at most NAME characters; else as a node is (below), and as an edge
-  its blocks follow the diagram after an `nA --> nB:` paragraph, the edge as written.
+- **Edges.** A connector glued at both ends to registered shapes is an edge. An end glued to another connector joins
+  the shape glued at that connector's end nearest the end's point, followed through connectors up to
+  `limits.MAX_DEPTH`; with no point, a tie, a loop, or a hidden or loose connector on the way, and for a reference to
+  a missing key, it is not glue. A hidden connector is never an edge. Edges keep `connector()` order and go through
+  the document's `ConnectionBudget`, the glued ones first. A connector given its slot's blocks is labelled with their
+  plain text on one line when that is at most NAME characters; else as a node is (below), and as an edge its blocks
+  follow the diagram after an `nA --> nB:` paragraph, the edge as written. The shapes inside a connector (their
+  `parent` it) that show plain text join its label: those in its first third along begin to end, its own label with
+  those in its middle, those in its last third, each group's texts joined by a space and the groups by ` / `, read
+  from the written start; past NAME characters the label is cut with `…` and their blocks follow too.
 - **Loose ends.** A connector with an end not glued (a plain `line` only with an arrowhead set True) is a candidate,
   up to CONNECTIONS a document, snapped or not (`infer_skipped` once for a scope that has some past them). Each loose
   end's point lands on the smallest box holding it, else on the nearest within INFER_TOL of the diagonal of the box
@@ -20,16 +25,25 @@ numbers, escapes, orients and renders, and builds model blocks only.
 - **Nodes.** The edges' ends, numbered `n1`, `n2`, ... in the order their keys first appear in the slots, then the
   slotless ones in `shape()` order. Plain text of at most NAME characters is the whole label; any other content gets
   its first line cut at NAME plus `…` (or `(picture)`, `(table)`, `(chart)`, `(content)`), and its blocks follow the
-  diagram after a `nK:` paragraph. A hidden shape, or one with no text, is a blank node; a hidden one keeps its slot.
-  A blank node is declared (`nK[" "]`) only inside a subgraph; elsewhere it is written in its edges alone.
+  diagram after a `nK:` paragraph. A shape may name its group (`parent`). An end on a shape with no text and no
+  text below it moves to its nearest ancestor that has either; failing that it stays when it has a `name`, else it
+  moves to its nearest ancestor with one; never through a hidden shape, a container or a connector, at most
+  `limits.MAX_DEPTH` up (text below counts only from shapes that are not edge ends). A textless node is labelled by
+  the plain text of the shapes below it (not hidden, not containers, not ends, nor under one), in slot order, and
+  those shapes leave the flow; else by its name. A hidden shape, or one left with no label, is a blank node; a hidden
+  one keeps its slot. A blank node is declared (`nK[" "]`) only inside a subgraph; elsewhere it is written in its
+  edges alone. The kinds decision, terminator, circle, store, chevron (`nK>"…"]`) and callout
+  (`nK@{ shape: comment, label: "…" }`) have their own node forms.
 - **Containers.** A container shape (not hidden, with a box, not an edge end) holding a node's centre becomes
   `subgraph cK ["title"]`; the smallest box wins, containers nest the same way up to `limits.MAX_DEPTH`, and the nodes
   of deeper ones go to the deepest kept one. A container with no node is an ordinary shape, and so is every
   container of a scope with more than INFER_SHAPES of them or with no node box.
 - **Trees.** Directed unlabelled edges, one parent at most, one root reaching every node, a node with two or more
-  children, at most `smartart.MAX_LEVEL` levels and no subgraph: a `-` list instead of Mermaid.
+  children, at most `smartart.MAX_LEVEL` levels and no subgraph: a `-` list instead of Mermaid, a blank node's item
+  `(unlabelled shape)`.
 - **Placement.** The block goes at the first slot whose key is a node, an edge or a subgraph; the slots of the shown
-  nodes, the edges and the subgraphs are taken out. With no edge the slots come back unchanged.
+  nodes, the edges, the subgraphs and the shapes their labels took are taken out. With no edge the slots come back
+  unchanged.
 """
 import math
 import re
@@ -46,7 +60,7 @@ COORD = 1e9           # a coordinate past this, in absolute value, makes the box
 
 _NEWLINE = re.compile(r"\r\n|\r|\n")
 _KINDS = {"": ("[", "]"), "decision": ("{", "}"), "terminator": ("([", "])"), "circle": ("((", "))"),
-          "store": ("[(", ")]")}
+          "store": ("[(", ")]"), "chevron": (">", "]"), "callout": ("@{ shape: comment, label: ", " }")}
 
 
 class ConnectionBudget:
@@ -70,11 +84,12 @@ class ConnectionBudget:
 
 
 class _Shape:
-    __slots__ = ("blocks", "kind", "box", "hidden", "container", "title")
+    __slots__ = ("blocks", "kind", "box", "hidden", "container", "title", "parent", "name")
 
-    def __init__(self, blocks, kind, box, hidden, container, title):
+    def __init__(self, blocks, kind, box, hidden, container, title, parent, name):
         self.blocks, self.kind, self.box = blocks, kind, box
         self.hidden, self.container, self.title = hidden, container, title
+        self.parent, self.name = parent, name
 
 
 class _Connector:
@@ -238,6 +253,19 @@ def _edge_label(blocks):
     return _label(blocks)[0], list(blocks)
 
 
+def _side(c, box) -> int:
+    if box is None or c.p0 is None or c.p1 is None:
+        return 1
+    (x0, y0), (x1, y1) = c.p0, c.p1
+    dx, dy = x1 - x0, y1 - y0
+    length = dx * dx + dy * dy
+    if length <= 0:
+        return 1
+    cx, cy = _centre(box)
+    t = ((cx - x0) * dx + (cy - y0) * dy) / length
+    return 0 if t < 1 / 3 else 2 if t > 2 / 3 else 1
+
+
 def _edge(c, nid) -> tuple:
     """(from, arrow, to) of an edge as written: its node ids, swapped when only the start has an arrowhead."""
     arrow, swapped = _arrow(c.arrows)
@@ -265,11 +293,12 @@ class Diagram:
         self.connectors: dict = {}  # key -> _Connector, in connector() order
 
     def shape(self, key, blocks: list, kind: str = "", box=None, hidden: bool = False, container: bool = False,
-              title: str = "") -> None:
+              title: str = "", parent=None, name: str = "") -> None:
+        """`parent` is the key of the group the shape sits in; `name` stands for its text when it has none."""
         if key in self.shapes:
             return
         self.shapes[key] = _Shape(blocks, kind if kind in _KINDS else "", _box(box), bool(hidden), bool(container),
-                                  (title or "").strip())
+                                  (title or "").strip(), parent, " ".join((name or "").split())[:NAME])
 
     def connector(self, key, begin=None, end=None, p0=None, p1=None, arrows=(None, None), label: str = "",
                   line: bool = False, hidden: bool = False, blocks=None) -> None:
@@ -286,11 +315,127 @@ class Diagram:
     def _glued(self, key) -> bool:
         return key is not None and key in self.shapes and key not in self.connectors
 
+    def _through(self, key, p, own):
+        start, seen = key, {own}
+        for _ in range(limits.MAX_DEPTH):
+            c = self.connectors.get(key)
+            if c is None or key in seen or c.hidden or p is None or not all(
+                    self._glued(k) or k in self.connectors for k in (c.begin, c.end)):
+                return start
+            seen.add(key)
+            d0 = math.dist(p, c.p0) if c.p0 else math.inf
+            d1 = math.dist(p, c.p1) if c.p1 else math.inf
+            if d0 == d1:
+                return start
+            key, p = (c.begin, c.p0) if d0 < d1 else (c.end, c.p1)
+            if self._glued(key):
+                return key
+        return start
+
+    def _joined(self, key, c):
+        b = self._through(c.begin, c.p0, key) if c.begin in self.connectors else c.begin
+        e = self._through(c.end, c.p1, key) if c.end in self.connectors else c.end
+        if b == c.begin and e == c.end:
+            return c
+        return _Connector(b, e, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden, c.follow)
+
+    def _kids(self, pos) -> dict:
+        kids = {}
+        for k, s in self.shapes.items():
+            if s.parent is not None and s.parent != k:
+                kids.setdefault(s.parent, []).append(k)
+        return {p: sorted(v, key=pos.get) for p, v in kids.items()}
+
+    def _below(self, key, kids, stop, pos) -> list:
+        out, todo, seen = [], [(key, 0)], {key}
+        while todo:
+            k, d = todo.pop()
+            for c in kids.get(k, ()):
+                if c in seen or c in stop:
+                    continue
+                seen.add(c)
+                s = self.shapes[c]
+                if s.hidden or s.container:
+                    continue
+                text = _plain(s.blocks)
+                if text is not None and text.strip():
+                    out.append(c)
+                if d + 1 < limits.MAX_DEPTH:
+                    todo.append((c, d + 1))
+        return sorted(out, key=pos.get)
+
+    def _named(self, edges) -> list:
+        raw = {k for _, c in edges for k in (c.begin, c.end)}
+        texted = set()
+        for k, s in self.shapes.items():
+            if k in raw or s.hidden:
+                continue
+            text = _plain(s.blocks)
+            if text is None or not text.strip():
+                continue
+            seen, up = {k}, s.parent
+            for _ in range(limits.MAX_DEPTH):
+                p = self.shapes.get(up)
+                if p is None or up in seen or up in texted or p.hidden or p.container:
+                    break
+                texted.add(up)
+                seen.add(up)
+                up = p.parent
+        memo = {}
+
+        def up(k, has):
+            seen, key = {k}, self.shapes[k].parent
+            for _ in range(limits.MAX_DEPTH):
+                p = self.shapes.get(key)
+                if p is None or key in seen or p.hidden or p.container or key in self.connectors:
+                    return None
+                if has(key, p):
+                    return key
+                seen.add(key)
+                key = p.parent
+            return None
+
+        def named(k):
+            if k not in memo:
+                s = self.shapes[k]
+                memo[k] = k
+                if not s.hidden and k not in texted and not _label(s.blocks)[0]:
+                    got = up(k, lambda key, p: key in texted or _label(p.blocks)[0])
+                    if got is None and not s.name:
+                        got = up(k, lambda key, p: p.name)
+                    memo[k] = k if got is None else got
+            return memo[k]
+
+        out = []
+        for key, c in edges:
+            b, e = named(c.begin), named(c.end)
+            out.append((key, c if (b, e) == (c.begin, c.end)
+                        else _Connector(b, e, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden, c.follow)))
+        return out
+
+    def _labelled(self, key, c, kids, stop, pos):
+        below = self._below(key, kids, stop, pos)
+        if not below:
+            return c, below
+        sides = ([], [c.label] if c.label else [], [])
+        for d in below:
+            s = self.shapes[d]
+            sides[_side(c, s.box)].append(" ".join(_plain(s.blocks).split()))
+        parts = [" ".join(p) for p in sides if p]
+        if _arrow(c.arrows)[1]:
+            parts.reverse()
+        label, follow = " / ".join(parts), c.follow
+        if len(label) > NAME:
+            label = label[:NAME] + "…"
+            follow = (follow or []) + [b for d in below for b in self.shapes[d].blocks]
+        return _Connector(c.begin, c.end, c.p0, c.p1, c.arrows, label, c.line, c.hidden, follow), below
+
     def place(self, slots: list) -> list:
         glued, cands = [], []
         for k, c in self.connectors.items():
             if c.hidden:
                 continue
+            c = self._joined(k, c)
             if self._glued(c.begin) and self._glued(c.end):
                 glued.append((k, c))
             elif not c.line or any(a is True for a in c.arrows):
@@ -300,6 +445,12 @@ class Diagram:
         edges, nglued = taken, min(len(glued), len(taken))
         if not edges:
             return [b for _, blocks in slots for b in blocks]
+        rank = {}
+        for i, (key, _) in enumerate(slots):
+            rank.setdefault(key, i)
+        pos = {k: (rank.get(k, len(slots)), i) for i, k in enumerate(self.shapes)}
+        kids = self._kids(pos)
+        edges = self._named(edges)
         ends = {k for _, c in edges for k in (c.begin, c.end)}
         nodes = _ordered(ends, slots, self.shapes)
         nid = {k: f"n{i}" for i, k in enumerate(nodes, 1)}
@@ -307,13 +458,22 @@ class Diagram:
         groups = _ordered(set(parent) | set(member.values()), slots, self.shapes)
         cid = {k: f"c{i}" for i, k in enumerate(groups, 1)}
 
-        labels, follows, long = {}, [], set()
+        labels, follows, long, inside = {}, [], set(), set()
         for k in nodes:
             s = self.shapes[k]
-            labels[k], follow = ("", False) if s.hidden else _label(s.blocks)
+            blocks = s.blocks
+            labels[k], follow = ("", False) if s.hidden else _label(blocks)
+            if not s.hidden and not labels[k]:
+                below = self._below(k, kids, ends, pos)
+                if below:
+                    inside.update(below)
+                    blocks = [b for d in below for b in self.shapes[d].blocks]
+                    labels[k], follow = _label(blocks)
+                elif s.name:
+                    labels[k] = s.name
             if follow:
                 long.add(k)
-                follows += [Para([Text(f"{nid[k]}:")])] + list(s.blocks)
+                follows += [Para([Text(f"{nid[k]}:")])] + list(blocks)
         for k in groups:
             s = self.shapes[k]
             text = _plain(s.blocks)
@@ -324,6 +484,11 @@ class Diagram:
                 labels[k], follow = _label(s.blocks)
             if follow:
                 follows += [Para([Text(f"{cid[k]}:")])] + list(s.blocks)
+        stop = ends | inside | set(groups)
+        for i, (k, c) in enumerate(edges):
+            c, below = self._labelled(k, c, kids, stop, pos)
+            edges[i] = (k, c)
+            inside.update(below)
         for _, c in edges:
             if c.follow:
                 follows += [Para([Text(" ".join(_edge(c, nid)) + ":")])] + c.follow
@@ -333,7 +498,7 @@ class Diagram:
             items = [Code(self._mermaid(edges, nglued, nodes, nid, groups, cid, member, parent, labels), "mermaid")]
         block = items + follows
 
-        removed = {k for k in nodes if not self.shapes[k].hidden} | {k for k, _ in edges} | set(groups)
+        removed = {k for k in nodes if not self.shapes[k].hidden} | {k for k, _ in edges} | set(groups) | inside
         anchors = (set(nodes) | removed) - {None}
         removed.discard(None)
         out, placed = [], False
@@ -516,7 +681,7 @@ def _tree(edges, nodes, nid, labels, long):
         n, level = stack.pop()
         if level + 1 > smartart.MAX_LEVEL or len(items) >= len(nodes):
             return None
-        inlines = _inlines(f"{nid[n]} {labels[n]}" if n in long else labels[n])
+        inlines = _inlines(f"{nid[n]} {labels[n]}" if n in long else labels[n] or "(unlabelled shape)")
         items.append(ListItem(level, "-", inlines))
         stack += [(k, level + 1) for k in sorted(kids[n], key=rank.get, reverse=True)]
     return items if len(items) == len(nodes) else None

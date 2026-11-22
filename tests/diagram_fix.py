@@ -8,7 +8,7 @@ from its first use).
 import re
 
 _HEADER = re.compile(r"flowchart (TD|LR)")
-_NODE = re.compile(r'\s*(n\d+)(\["[^"\n]*"\]|\{"[^"\n]*"\}|\(\["[^"\n]*"\]\)|\(\("[^"\n]*"\)\)|\[\("[^"\n]*"\)\])')
+_NODE = re.compile(r'\s*(n\d+)(\["[^"\n]*"\]|\{"[^"\n]*"\}|\(\["[^"\n]*"\]\)|\(\("[^"\n]*"\)\)|\[\("[^"\n]*"\)\]|>"[^"\n]*"\]|@\{ shape: comment, label: "[^"\n]*" \})')
 _EDGE = re.compile(r'\s*(n\d+) (-->|<-->|---)(\|"[^"\n]*"\|)? (n\d+)')
 _SUB = re.compile(r'\s*subgraph c\d+ \["[^"\n]*"\]')
 _END = re.compile(r"\s*end")

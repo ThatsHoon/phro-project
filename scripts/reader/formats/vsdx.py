@@ -24,6 +24,14 @@ cells in INHERITED its master shape's when it has none (each master shape's cell
 - **Kinds** from the NameU masters.xml gives the shape's own Master, else the shape's NameU, case-folded.
 - **Containers**: a User row msvStructureType whose Value is Container, the shape's own else its master shape's; its
   shown text is the subgraph title.
+- **Groups**: a sub-shape is registered with its group's key as its parent; a shape with its own Master is named by
+  that master's NameU (what stands for it with no text).
+- **Shape Data and hyperlinks**: the Property rows (the master shape's in its order, each cell the shape gives with a
+  value overriding, then the shape's own new rows; a Del row is gone) with a Value are `label: value` lines (Label,
+  else the row name) after the shape's text, and the Hyperlink rows `Link: description address#subaddress`; an
+  Invisible row is hidden; each line is charged as shape text.
+- **Background pages**: a page whose BackPage names a Background page's ID begins with `Background page: <name>`; a
+  background page begins with `Background of: <names>`, or `Background page` when none names it.
 """
 import math
 
@@ -48,7 +56,7 @@ INHERITED = ("LocPinX", "LocPinY", "Width", "Height", "Angle", "FlipX", "FlipY",
              "BeginArrow", "EndArrow")
 ARROWS = ("BeginArrow", "EndArrow")
 _KINDS = (("decision", "decision"), ("start/end", "terminator"), ("terminator", "terminator"), ("circle", "circle"),
-          ("ellipse", "circle"), ("database", "store"))
+          ("ellipse", "circle"), ("database", "store"), ("callout", "callout"), ("chevron", "chevron"))
 
 
 def _kid(el, name):
@@ -85,6 +93,55 @@ def _structure(shape):
                 if attr(c, "N") == "Value" and attr(c, "V") is not None:
                     return attr(c, "V")
     return None
+
+
+def _rows(shape, name) -> list:
+    out = []
+    for sec in kids(shape, "Section"):
+        if attr(sec, "N") != name:
+            continue
+        for row in kids(sec, "Row"):
+            cells = {}
+            for c in kids(row, "Cell"):
+                n = attr(c, "N")
+                if n is not None and n not in cells:
+                    cells[n] = attr(c, "V")
+            out.append((attr(row, "N") or attr(row, "IX"), cells, _on(attr(row, "Del"))))
+        break
+    return out
+
+
+def _merged(inherited, own) -> list:
+    rows = {}
+    for i, (key, cells, gone) in enumerate(inherited):
+        k = ("master", i) if key is None else key
+        if not gone and k not in rows:
+            rows[k] = dict(cells)
+    for i, (key, cells, gone) in enumerate(own):
+        k = ("own", i) if key is None else key
+        if gone:
+            rows.pop(k, None)
+        else:
+            rows[k] = {**rows.get(k, {}), **{n: v for n, v in cells.items() if v is not None}}
+    return list(rows.items())
+
+
+def _data(props, links) -> list:
+    out = []
+    for key, c in props:
+        value = " ".join((c.get("Value") or "").split())
+        if not value:
+            continue
+        label = " ".join((c.get("Label") or "").split()) or (key if isinstance(key, str) else "")
+        out.append((f"{label}: {value}" if label else value, _on(c.get("Invisible"))))
+    for _, c in links:
+        address, sub = (c.get("Address") or "").strip(), (c.get("SubAddress") or "").strip()
+        target = address + ("#" + sub if sub else "")
+        if not target:
+            continue
+        desc = " ".join((c.get("Description") or "").split())
+        out.append((f"Link: {desc} {target}" if desc else f"Link: {target}", _on(c.get("Invisible"))))
+    return out
 
 
 def _on(v) -> bool:
@@ -189,7 +246,7 @@ class _Reader:
         self.master_names = {}    # Master ID -> its NameU in masters.xml
         self.masters = {}         # master part -> ({shape ID: element}, first top-level shape), or None: unreadable
         self.shapes = {}          # master shape element -> (text, hides it), so a shared shape is read once
-        self.mcells = {}          # master shape element -> (its cells, its structure type, its LineStyle)
+        self.mcells = {}          # master shape element -> (cells, structure type, LineStyle, data rows, links)
         self.style_index = None   # StyleSheet ID -> ({arrow cell: V}, its LineStyle), read on first use
         self.style_arrows = {}    # (StyleSheet ID, arrow cell) -> its value up the chain
         self.room = limits.MAX_OUTPUT  # shape text the document may still emit, copies counted (see `spend`)
@@ -225,7 +282,7 @@ class _Reader:
         root, _ = ooxml_base.load(self.pkg, pages)
         rels = ooxml_base.rels(self.pkg, pages, self.ctx)
         entries = kids(root, "Page")
-        doc, seen = Doc(), set()
+        doc, seen, meta = Doc(), set(), []
         for number, entry in enumerate(entries, 1):
             rel = rels.get(_rid(_kid(entry, "Rel")) or "") if _kid(entry, "Rel") is not None else None
             if rel is None or rel.external or not rel.type.endswith("/page") or not self.pkg.has(rel.target):
@@ -237,13 +294,16 @@ class _Reader:
             name = (attr(entry, "Name") or attr(entry, "NameU") or str(number)).strip()[:MAX_TITLE]
             try:
                 with self.ctx.guard("page"):
-                    doc.blocks.append(self.page(rel.target, name))
+                    sec = self.page(rel.target, name)
+                    doc.blocks.append(sec)
+                    meta.append((attr(entry, "ID"), _on(attr(entry, "Background")), attr(entry, "BackPage"), sec))
             except ReadError as e:
                 if e.kind != "damaged":
                     raise
                 self.ctx.skipped["page"] += 1
         if entries and not doc.blocks:
             raise ReadError("damaged", "no readable page")
+        _backgrounds(meta)
         return doc
 
     # ---- pages and shapes
@@ -257,7 +317,7 @@ class _Reader:
         shapes = _kid(root, "Shapes")
         out = []
         if shapes is not None:
-            self.walk(shapes, 0.0, 0.0, 0, out, None)
+            self.walk(shapes, 0.0, 0.0, 0, out, None, None)
         placed = sorted((e for e in out if e[0] is not None), key=lambda e: e[0])
         slots = [(key, blocks) for _, key, blocks in placed + [e for e in out if e[0] is None]]
         flow = [b for _, blocks in slots for b in blocks]
@@ -273,18 +333,18 @@ class _Reader:
         self.keys.add(k)
         return k
 
-    def walk(self, container, dx, dy, d, out, master):
+    def walk(self, container, dx, dy, d, out, master, parent):
         """Append (sort key or None, diagram key, blocks) for every Shape under `container`; (dx, dy) is the group
         origin, `master` the Master ID of the nearest enclosing instance (its sub-shapes name their master shape by
-        MasterShape)."""
+        MasterShape), `parent` the group's diagram key."""
         if d > limits.MAX_DEPTH:
             self.deep()
             return
         for el in kids(container, "Shape"):
             with self.ctx.guard("shape"):
-                self.shape(el, dx, dy, d, out, master)
+                self.shape(el, dx, dy, d, out, master, parent)
 
-    def shape(self, el, dx, dy, d, out, master):
+    def shape(self, el, dx, dy, d, out, master, parent):
         own_cells = _cells(el)
         x, y = _num(own_cells.get("PinX")), _num(own_cells.get("PinY"))
         sort = (-(y + dy), x + dx) if x is not None and y is not None else None
@@ -309,8 +369,11 @@ class _Reader:
         if text:
             inlines = inlines if inlines is not None else _inlines(text.strip("\n"))
             blocks.append(Para(inlines, hidden="hidden" if hidden else ""))
+        m_cells, m_struct, m_style, m_props, m_links = self.master_cells(mel)
+        for line, hid in _data(_merged(m_props, _rows(el, "Property")), _merged(m_links, _rows(el, "Hyperlink"))):
+            if self.spend(line, "text"):
+                blocks.append(Para([Text(line)], hidden="hidden" if hid else ""))
         blocks.extend(self.picture(el))
-        m_cells, m_struct, m_style = self.master_cells(mel)
         c = dict(own_cells)
         for n in INHERITED:
             if c.get(n) is None and m_cells.get(n) is not None:
@@ -335,13 +398,13 @@ class _Reader:
             struct = struct if struct is not None else m_struct
             container = (struct or "").strip().strip('"').strip().casefold() == "container"
             self.dia.shape(key, blocks, kind, _box(c, dx, dy), hidden and bool(text), container,
-                           text if container and not hidden else "")
+                           text if container and not hidden else "", parent, mname or "")
         out.append((sort, slot, blocks))
         sub = _kid(el, "Shapes")
         if sub is not None:  # a missing pin or loc-pin term counts as 0, the other term still applies
             ox = dx + (x or 0.0) - (_num(c.get("LocPinX")) or 0.0)
             oy = dy + (y or 0.0) - (_num(c.get("LocPinY")) or 0.0)
-            self.walk(sub, ox, oy, d + 1, out, master)
+            self.walk(sub, ox, oy, d + 1, out, master, key)
 
     def arrow(self, name, own, inherited, style):
         """An arrow cell's value: the shape's own, else its master shape's, else its LineStyle chain's; None: none."""
@@ -439,11 +502,13 @@ class _Reader:
         return self.shapes[el]
 
     def master_cells(self, el):
-        """(cells, User msvStructureType, LineStyle) of a master shape, read once; ({}, None, None) for none."""
+        """(cells, User msvStructureType, LineStyle, Property rows, Hyperlink rows) of a master shape, read once;
+        ({}, None, None, [], []) for none."""
         if el is None or el is False:
-            return {}, None, None
+            return {}, None, None, [], []
         if el not in self.mcells:
-            self.mcells[el] = (_cells(el), _structure(el), attr(el, "LineStyle"))
+            self.mcells[el] = (_cells(el), _structure(el), attr(el, "LineStyle"), _rows(el, "Property"),
+                               _rows(el, "Hyperlink"))
         return self.mcells[el]
 
     def master_index(self) -> dict:
@@ -517,6 +582,21 @@ class _Reader:
             self.ctx.skipped["image"] += 1
             return []
         return [Image(img.data)]
+
+
+def _backgrounds(meta):
+    back = {}
+    for pid, bg, _, sec in meta:
+        if bg and pid is not None:
+            back.setdefault(pid, sec)
+    under = {pid: [] for pid in back}
+    for pid, _, ref, sec in meta:
+        if ref in back and ref != pid:
+            sec.blocks.insert(0, Para([Text(f"Background page: {back[ref].title}")]))
+            under[ref].append(sec.title)
+    for pid, sec in back.items():
+        names = under[pid]
+        sec.blocks.insert(0, Para([Text("Background of: " + ", ".join(names) if names else "Background page")]))
 
 
 def parse(path, ctx) -> Doc:
