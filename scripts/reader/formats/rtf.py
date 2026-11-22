@@ -12,7 +12,7 @@ are gathered in one `Pending` and decoded together when anything else arrives.
 
 Group state (`_Group`). Every `{` clones the state of its parent and every `}` restores it. The fields are the
 font, `\\uc`, bold, hidden, the destination name, whether text is left out (`suppress`), where text is captured to
-(`cap`: a field instruction, the info title, a style name, list text, a picture's data), the paragraph's outline
+(`cap`: a field instruction, an info property, a style name, list text, a picture's data), the paragraph's outline
 level and style number, and its table and list state (`in_table`, `itap`, `ls`, `ilvl`).
 
 Output. Text goes to the current story (`_Story`): the body, a note, or a header or footer. A story keeps its own
@@ -66,6 +66,9 @@ paragraph being built and its own open fields, so a note or a header never ends 
   reads RTF held in memory and is what `parse` ends in.
 * Code pages: `\\ansicpg`, `\\deff`, the font table's `\\fN \\fcharsetN \\cpgN` and `\\fN` per group, through
   `rtf_lex.codec`.
+* Properties: the `\\info` group's `\\title` is Doc.title; its `\\subject`, `\\author`, `\\operator` (the last author),
+  `\\keywords`, `\\company`, `\\creatim` and `\\revtim` (`\\yr` `\\mo` `\\dy` `\\hr` `\\min`) and the `\\userprops`
+  pairs (`\\propname`, `\\staticval`) are Doc.meta["properties"] (word_fields.properties).
 """
 import re
 
@@ -77,7 +80,7 @@ from ..officeart import dib_to_bmp
 from .rtf_lex import BIN, CLOSE, HEX, OPEN, SYM, TEXT, WORD, Pending, codec, tokens
 from . import zip_route
 from .rtf_table import Tables
-from .word_fields import MAX_INSTR, MAX_NAME, comment_note, hyperlink_url
+from .word_fields import MAX_INSTR, MAX_NAME, MAX_PROPERTIES, MAX_PROPERTY, comment_note, hyperlink_url, properties
 
 MAX_GROUPS = 1_000      # groups nested deeper than this are skipped to their close
 MAX_FIELDS = 32         # fields nested deeper than this give their result and no link
@@ -92,20 +95,24 @@ _ZIP = b"PK\x03\x04"
 _BOM = b"\xef\xbb\xbf"
 _RTF = b"{\\rtf"
 _SPACE = b" \t\r\n\x0b\x0c\x00"
+_INFO = {"title": "title", "subject": "subject", "author": "author", "operator": "last author", "keywords": "keywords",
+         "company": "company"}
+_DATES = {"creatim": "created", "revtim": "modified"}
+_DATE_WORDS = ("yr", "mo", "dy", "hr", "min")
 _HEADING = re.compile(r"(?:heading|제목)\s*([1-9])$", re.I)
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
 _NONHEX = re.compile(rb"[^0-9a-fA-F]")
 
 # Destinations whose content is left out (anydoc's list), except the headers and footers, which fill Doc.headers and
-# Doc.footers, and the info title, which fills Doc.title. A bookmark start is added: anydoc captures its name, here
-# the name is simply not text.
+# Doc.footers, and the info properties, which are captured. A bookmark start is added: anydoc captures its name, here
+# the name is simply not text; so are company and a user property's name and value, which are info properties only.
 _SKIP = frozenset((
     "fonttbl", "colortbl", "stylesheet", "info", "object", "ftnsep", "ftnsepc", "aftnsep", "aftnsepc",
     "xmlnstbl", "themedata", "colorschememapping", "datastore", "latentstyles", "listtable", "listoverridetable",
     "rsidtbl", "generator", "filetbl", "revtbl", "datafield", "bkmkend",
     "template", "defchp", "defpap", "panose", "falt", "objdata", "blipuid", "nonshppict", "wgrffmtfilter",
     "pgdsctbl", "docvar", "sp", "sn", "sv", "shpinst", "background", "userprops", "operator", "author", "title",
-    "subject", "keywords", "doccomm", "creatim", "revtim", "printim", "bkmkstart",
+    "subject", "keywords", "doccomm", "creatim", "revtim", "printim", "bkmkstart", "company", "propname", "staticval",
 ))
 _HEADERS = {"header": "header", "headerl": "header", "headerr": "header", "headerf": "header",
             "footer": "footer", "footerl": "footer", "footerr": "footer", "footerf": "footer"}
@@ -320,7 +327,9 @@ class _Reader:
         self.levels = {}       # style number -> heading level, 0 for none (memo)
         self.ss_depth = -10    # depth of the stylesheet group, while inside it
         self.sty = None        # [style number, based on, name parts] of the stylesheet entry being read
-        self.title = []
+        self.info = {}
+        self.dates = {}
+        self.user = []
         self.data = b""        # the input the BIN tokens point into
         self.pic = None        # the picture being collected
         self.img_total = 0     # bytes of the pictures emitted so far (IMAGE_BYTES)
@@ -502,9 +511,15 @@ class _Reader:
                     if f.size < MAX_INSTR:
                         f.instr.append(s[:MAX_INSTR - f.size])
                         f.size += len(s)
-            elif cap == "title":
-                if sum(map(len, self.title)) < MAX_TITLE:
-                    self.title.append(s)
+            elif cap in _INFO:
+                parts = self.info.setdefault(cap, [])
+                if sum(map(len, parts)) < (MAX_TITLE if cap == "title" else MAX_PROPERTY):
+                    parts.append(s)
+            elif cap in ("propname", "staticval"):
+                pair = self.user[-1] if self.user else None
+                k = cap == "staticval"
+                if pair is not None and len(pair[k]) < (MAX_PROPERTY if k else MAX_NAME):
+                    pair[k] += s
             elif cap == "revtbl":
                 if self.revs_len < MAX_STYLES * MAX_NAME:
                     self.revs.append(s)
@@ -593,8 +608,13 @@ class _Reader:
         elif name in _SKIP:
             g = self.g
             g.suppress, g.dest = True, name
-            g.cap = "title" if name == "title" and self.stack and self.stack[-1].dest == "info" else \
-                "revtbl" if name == "revtbl" else ""
+            parent = self.stack[-1].dest if self.stack else ""
+            g.cap = name if name == "revtbl" or parent == "info" and (name in _INFO or name in _DATES) \
+                or parent == "userprops" and name in ("propname", "staticval") else ""
+            if g.cap == "propname" and len(self.user) < MAX_PROPERTIES:
+                self.user.append(["", ""])
+            elif g.cap in _DATES:
+                self.dates[name] = {}
             if name == "stylesheet":
                 self.ss_depth = len(self.stack)
 
@@ -603,7 +623,7 @@ class _Reader:
             "u": self.w_u, "uc": self.w_uc, "f": self.w_f, "b": self.w_b, "v": self.w_v, "plain": self.w_plain,
             "revised": self.w_revised, "deleted": self.w_deleted, "revauth": self.w_revauth,
             "revauthdel": self.w_revauthdel, "atnid": self.w_capture("atnid"), "atnauthor": self.w_capture("atnauthor"),
-            "annotation": self.w_annotation,
+            "annotation": self.w_annotation, **{name: self.w_date(name) for name in _DATE_WORDS},
             "pard": self.w_pard, "s": self.w_s, "sbasedon": self.w_sbasedon, "outlinelevel": self.w_outline,
             "ansicpg": self.w_ansicpg, "deff": self.w_deff,
             "fcharset": self.w_fcharset, "cpg": self.w_cpg,
@@ -1033,6 +1053,13 @@ class _Reader:
         atn["atnid"], atn["atnauthor"] = [], []
         self.note(fresh, " ".join(author.split())[:MAX_NAME])
 
+    def w_date(self, name):
+        def date(p, fresh):
+            g = self.g
+            if g.cap in _DATES and p is not None:
+                self.dates[g.cap][name] = p
+        return date
+
     def w_capture(self, name):
         def capture(p, fresh):
             g = self.g
@@ -1116,17 +1143,36 @@ def parse(path, ctx) -> Doc:
     return parse_bytes(data, ctx)
 
 
-def parse_bytes(data, ctx) -> Doc:
+def parse_bytes(data, ctx, spent=None) -> Doc:
     """Read RTF held in memory: `parse` after it has sent the zip and compound-file heads on. Nothing touches the
-    disk, so a caller can read bytes it never writes out."""
+    disk, so a caller can read bytes it never writes out. `spent`, when given, is {"images": the picture bytes the
+    document reading this RTF inside it (a docx altChunk) has placed}: they count against IMAGE_BYTES with this RTF's,
+    and the total is written back."""
     i = len(_BOM) if data.startswith(_BOM) else 0
     while i < len(data) and data[i] in _SPACE:
         i += 1
     if not data.startswith(_RTF, i):
         raise ReadError("damaged", "not an RTF file")
     r = _Reader(ctx)
+    if spent is not None:
+        r.img_total = spent["images"]
     r.run(memoryview(data)[i:] if i else data)
+    if spent is not None:
+        spent["images"] = r.img_total
     result = r.doc
     result.blocks = r.body.blocks
-    result.title = " ".join("".join(r.title).split())[:MAX_TITLE]
+    result.title = " ".join("".join(r.info.pop("title", ())).split())[:MAX_TITLE]
+    pairs = [(_INFO[k], "".join(v)) for k, v in r.info.items()]
+    pairs += [(_DATES[k], _date(d)) for k, d in r.dates.items()]
+    if kept := properties(pairs + [tuple(x) for x in r.user]):
+        result.meta["properties"] = kept
     return result
+
+
+def _date(d) -> str:
+    """`YYYY-MM-DD HH:MM` of an RTF time group's words; "" without a year in 1..9999."""
+    yr = d.get("yr", 0)
+    if not 0 < yr < 10_000:
+        return ""
+    mo, dy, hr, mi = (min(max(d.get(k, low), 0), 99) for k, low in (("mo", 1), ("dy", 1), ("hr", 0), ("min", 0)))
+    return f"{yr:04d}-{mo:02d}-{dy:02d} {hr:02d}:{mi:02d}"

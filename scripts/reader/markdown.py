@@ -67,6 +67,9 @@ LOST = (
     (("smartart",), "SmartArt diagram", "SmartArt diagrams"),
     (("smartart_cut",), "SmartArt diagram cut short", "SmartArt diagrams cut short"),
     (("object",), "embedded object", "embedded objects"),
+    (("chunk",), "imported part", "imported parts"),
+    (("symbol",), "symbol character", "symbol characters"),
+    (("properties",), "document properties part", "document properties parts"),
     (("link",), "link", "links"),
     (("links_cut",), "hyperlink list cut short", "hyperlink lists cut short"),
     (("connections_cut",), "connection list cut short", "connection lists cut short"),
@@ -931,6 +934,9 @@ class _Render:
             self.ocr = dict(NO_OCR, **self.doc.meta.get("ocr", {}), pictures_left=left)
             self.ocr_hint = self.pictures is not None and self.pictures.s.hint
             status += ocr_notes(self.ocr, self.ocr_hint)
+        props = self.doc.meta.get("properties")
+        if props:
+            status.append("Properties: " + "; ".join(f"{k}: {v}" for k, v in props))
         if hf:
             status.append("\n".join(hf))
         top = status + top

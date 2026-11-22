@@ -626,6 +626,33 @@ def test_odt_place_failure_keeps_text():
     assert ctx.skipped["shape"] == 1 and all(w in out for w in ("Alpha", "Beta", "go")), (out, ctx.skipped)
 
 
+
+META = ('<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        '<office:meta><meta:generator>LibreOffice/7.6</meta:generator><dc:title>Lease</dc:title>'
+        '<dc:subject>Unit 4</dc:subject><meta:initial-creator>Kim</meta:initial-creator><dc:creator>Lee</dc:creator>'
+        '<meta:creation-date>2024-03-05T10:30:00</meta:creation-date><dc:date>2024-04-01T08:00:00.123</dc:date>'
+        '<meta:keyword>lease</meta:keyword><meta:keyword>rent</meta:keyword><meta:editing-cycles>3</meta:editing-cycles>'
+        '<meta:document-statistic meta:page-count="1" meta:word-count="1"/>'
+        '<meta:user-defined meta:name="Client">Hanbit</meta:user-defined>'
+        '<meta:user-defined meta:name="Empty"></meta:user-defined></office:meta></office:document-meta>')
+
+
+def test_meta_properties():
+    """meta.xml's title is the title; the initial creator is the author, dc:creator the last author, then the dates,
+    keywords and user-defined fields; the generator, counts and editing cycles are not shown."""
+    out = md(odt_doc(P("body"), extra={"meta.xml": META}))
+    assert out == ("Properties: subject: Unit 4; author: Kim; last author: Lee; created: 2024-03-05 10:30; "
+                   "modified: 2024-04-01 08:00; keywords: lease, rent; Client: Hanbit\n\n# Lease\n\nbody\n"), out
+    out = md(odt_doc(P("body"), extra={"meta.xml": "<broken"}))
+    assert out == "body\n", out
+
+
+def test_ruby_is_base_then_reading():
+    body = P('前<text:ruby><text:ruby-base>漢字</text:ruby-base><text:ruby-text>かんじ</text:ruby-text></text:ruby>後')
+    assert md(odt_doc(body)) == "前漢字(かんじ)後\n"
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

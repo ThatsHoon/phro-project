@@ -431,6 +431,13 @@ class Body:
             self.note(c, out, d)
         elif n == "annotation":
             self.annotation(c, out, d)
+        elif n == "ruby":
+            for b in kids(c, "ruby-base"):
+                for x in self.inlines(b, d + 1):
+                    _join(out, x)
+            reading = _squash(" ".join("".join(t.itertext()) for t in kids(c, "ruby-text")))
+            if reading:
+                self._text(f"({reading})", out)
         elif n == "hidden-text":
             out.append(Hidden([Text(_squash(attr(c, "string-value") or "".join(c.itertext())))]))
         elif n == "frame":

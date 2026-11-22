@@ -159,7 +159,7 @@ def test_header_footer():
 
 def test_info_title():
     out = md(rb"{\rtf1{\info{\title Report}{\author Someone}}Body text\par}")
-    assert out.startswith("# Report\n") and "Body text" in out and "Someone" not in out, out
+    assert out == "Properties: author: Someone\n\n# Report\n\nBody text\n", out
 
 
 def test_group_depth():
@@ -583,6 +583,20 @@ def test_zip_and_compound_heads_never_loop_back_to_rtf():
         raise AssertionError("expected ReadError")
     except ReadError as e:
         assert e.kind == "damaged", e
+
+
+
+def test_info_properties():
+    """The \\info group's title is the title; its author, operator (the last author), subject, keywords, company,
+    creation and revision times and user properties are the properties line; its counts and doccomm are not."""
+    info = (rb"{\info{\title Lease}{\subject Unit 4}{\author Kim}{\operator Lee}{\keywords lease, rent}{\doccomm note}"
+            rb"{\*\company ACME}{\creatim\yr2024\mo3\dy5\hr10\min30}{\revtim\yr2024\mo4\dy1\hr8\min0}"
+            rb"{\printim\yr2024\mo4\dy2}\version3\nofpages1\nofwords3"
+            rb"{\*\userprops{\propname Client}\proptype30{\staticval Hanbit}{\propname Empty}\proptype30{\staticval }}}")
+    out = md(rb"{\rtf1" + info + rb"Body\par}")
+    assert out == ("Properties: subject: Unit 4; author: Kim; last author: Lee; created: 2024-03-05 10:30; "
+                   "modified: 2024-04-01 08:00; company: ACME; keywords: lease, rent; Client: Hanbit\n\n"
+                   "# Lease\n\nBody\n"), out
 
 
 def main():

@@ -7,16 +7,16 @@ place among the blocks that follow the paragraph. A group in a header or footer,
 """
 import re
 
-from .. import diagram, limits
-from ..containers.zipx import attr, kids, local
+from .. import diagram, html as xhtml, limits
+from ..containers.zipx import Package, attr, first, kids, local
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import (Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Inserted, Link, ListItem, Math, NoteRef,
                      Para, Table, Text)
-from . import omml, ooxml_base, smartart
+from . import omml, ooxml_base, rtf, smartart
 from .drawingml import Xf, arrows, glue, kid, kind, rule, xfrm
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
-from .word_fields import MAX_INSTR, MAX_NAME, MAX_URL, comment_note, hyperlink_url
+from .word_fields import MAX_INSTR, MAX_NAME, MAX_URL, comment_note, hyperlink_url, properties, symbol, when
 
 MAX_COLS = 1_000
 MAX_ALT = 200
@@ -25,6 +25,11 @@ _NOTE_SKIP = frozenset({"separator", "continuationSeparator", "continuationNotic
 _NOTE_REFS = {"footnoteReference": "fn-", "endnoteReference": "en-", "commentReference": "cm-"}
 _SKIP = frozenset({"pPr", "rPr", "sectPr", "tblPr", "trPr", "tcPr", "proofErr", "bookmarkStart", "bookmarkEnd",
                    "commentRangeStart", "commentRangeEnd", "docPr", "extent", "effectExtent", "lastRenderedPageBreak"})
+_PAGE_FIELD = re.compile(r"^\s*(?:PAGE|NUMPAGES|SECTIONPAGES)\b", re.I)
+_CORE = {"title": "title", "subject": "subject", "creator": "author", "lastModifiedBy": "last author",
+         "created": "created", "modified": "modified", "keywords": "keywords"}
+_SHARED = ("image_bytes", "chart_cells", "smartart_nodes", "opened", "budget")
+_PROPERTY_PARTS = ("/metadata/core-properties", "/extended-properties", "/custom-properties")
 
 
 # ---- inline helpers
@@ -44,6 +49,27 @@ def _author(el) -> str:
     return re.sub(r"\s+", " ", attr(el, "author") or "").strip()[:MAX_NAME]
 
 
+def _squash(s, n=MAX_ALT) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()[:n]
+
+
+def _renamed(blocks, notes, tag) -> None:
+    """Give every NoteRef in `blocks` and `notes` (a part read on its own: an altChunk) the id `<id>@<tag>`, and the
+    notes the same keys, so its ids cannot meet the document's. One walk."""
+    stack = [*blocks, *(b for v in notes.values() for b in v)]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, NoteRef):
+            x.id = f"{x.id}@{tag}"
+            continue
+        for name in ("inlines", "blocks", "notes", "comments"):
+            stack.extend(getattr(x, name, ()))
+        for row in getattr(x, "rows", ()):
+            stack.extend(row)
+    for key in list(notes):
+        notes[f"{key}@{tag}"] = notes.pop(key)
+
+
 def _flat(blocks) -> str:
     parts = []
     for b in blocks:
@@ -55,7 +81,8 @@ def _flat(blocks) -> str:
 
 
 class _Frame:
-    """One open inline scope inside a paragraph: root, link, inserted, deleted or hidden; a change's author."""
+    """One open inline scope inside a paragraph: root, link, inserted, deleted, hidden, drop (a page number's result
+    in a header, left out) or reading (a ruby's, put after its base); a change's author."""
 
     def __init__(self, kind, url="", author=""):
         self.kind, self.url, self.author, self.inl = kind, url, author, []
@@ -66,7 +93,7 @@ class _State:
         self.frames = [_Frame("root")]
         self.bold = False
         self.extras = []  # blocks that follow the paragraph: images, charts, text-box content
-        self.fields = []  # open fldChar fields: [instr parts, phase, frame index or None]
+        self.fields = []  # open fldChar fields: [instr parts, phase, frame index or None, form text, result start]
         self.alt = ""
 
 
@@ -78,8 +105,9 @@ class _Scope:
 
 
 class _Reader:
-    def __init__(self, pkg, part, ctx):
-        self.pkg, self.part, self.ctx = pkg, part, ctx
+    def __init__(self, pkg, part, ctx, chunk=0):
+        self.pkg, self.part, self.ctx, self.chunk = pkg, part, ctx, chunk
+        self.chunks = set()
         self.doc = Doc()
         self.styles, self.numbering = Styles(), Numbering()
         self.scope = None
@@ -131,6 +159,7 @@ class _Reader:
             if root is not None:
                 with self.ctx.guard("numbering"):
                     self.numbering.load(root)
+                    self.numbering.link(self.styles)
         for suffix, tag, prefix in (("/footnotes", "footnote", "fn-"), ("/endnotes", "endnote", "en-")):
             for name in self.related(suffix, "footnotes")[:1]:
                 root = self.open(name, "footnotes")
@@ -157,7 +186,48 @@ class _Reader:
         if body is None:
             raise ReadError("damaged", "no readable body")
         self.doc.blocks.extend(self.blocks(body, 0))
+        if not self.chunk:
+            with self.ctx.guard("properties"):
+                self.properties()
         return self.doc
+
+    # ---- document properties
+    def properties(self):
+        """docProps' core, extended and custom parts, by the package's own relationships: Doc.title, and the rest as
+        Doc.meta["properties"] (word_fields.properties). Only what says something about the document is kept: no
+        application, template or counts."""
+        got = {}
+        for rel in ooxml_base.rels(self.pkg, "", self.ctx).values():
+            kind = next((k for k in _PROPERTY_PARTS if rel.type.endswith(k)), None)
+            if kind is None or rel.external or not self.pkg.has(rel.target) or kind in got:
+                continue
+            try:
+                got[kind] = ooxml_base.load(self.pkg, rel.target)[0]
+            except ReadError as e:
+                if e.kind != "damaged":
+                    raise
+                self.ctx.skipped["properties"] += 1
+        pairs = []
+        core = got.get(_PROPERTY_PARTS[0])
+        for el in (core if core is not None else ()):
+            label = _CORE.get(local(el.tag))
+            if label is None:
+                continue
+            text = (el.text or "").strip()
+            if label == "title":
+                self.doc.title = _squash(text, MAX_ALT)
+            else:
+                pairs.append((label, when(text) if label in ("created", "modified") else text))
+        app = got.get(_PROPERTY_PARTS[1])
+        company = first(app, "Company") if app is not None else None
+        if company is not None:
+            pairs.append(("company", company.text))
+        for prop in kids(got[_PROPERTY_PARTS[2]], "property") if _PROPERTY_PARTS[2] in got else ():
+            value = next(iter(prop), None)
+            if value is not None:
+                pairs.append((attr(prop, "name"), when(value.text or "") if local(value.tag) == "filetime" else value.text))
+        if kept := properties(pairs):
+            self.doc.meta["properties"] = kept
 
     # ---- notes
     def load_notes(self, root, tag, prefix):
@@ -211,7 +281,67 @@ class _Reader:
         if n == "AlternateContent":
             chosen = self.choose(c)
             return self.blocks(chosen, d + 1) if chosen is not None else []
+        if n == "altChunk":
+            return self.alt_chunk(attr(c, "id"))
         return []
+
+    def alt_chunk(self, rid) -> list:
+        """An imported part (w:altChunk, its aFChunk relationship) read by the reader's own parser for its kind, by
+        its bytes, then its name: a Word package as a docx body (its counters shared with this one, so the document's
+        budgets hold), RTF (its pictures charged to IMAGE_BYTES with this document's), HTML, plain text. Its note ids
+        are renamed (_renamed). A part is read once, so a package cannot read one part many times over; one read
+        again, one past ALT_CHUNK_DEPTH levels, missing, unreadable or of another kind is counted under chunk."""
+        rel = self.scope.rels.get(rid or "")
+        data = None
+        if rel is not None and not rel.external and rel.type.endswith("/aFChunk") and self.pkg.has(rel.target) \
+                and rel.target not in self.chunks and self.chunk < limits.ALT_CHUNK_DEPTH:
+            self.chunks.add(rel.target)
+            try:
+                data = self.pkg.read(rel.target)
+            except ReadError as e:
+                if e.kind not in ("damaged", "too_large"):
+                    raise
+        if not data:
+            self.ctx.skipped["chunk"] += 1
+            return []
+        name = rel.target.lower()
+        head = data.lstrip(b"\xef\xbb\xbf \t\r\n")[:64].lower()
+        tag = f"chunk{self.chunk + 1}-{rid}"
+        if data.startswith(b"PK\x03\x04"):
+            from .ooxml import _main_part
+            with Package(data) as pkg:
+                sub = _Reader(pkg, _main_part(pkg), self.ctx, self.chunk + 1)
+                for k in _SHARED:
+                    setattr(sub, k, getattr(self, k))
+                doc = sub.run()
+                for k in _SHARED:
+                    setattr(self, k, getattr(sub, k))
+        elif head.startswith(b"{\\rtf"):
+            spent = {"images": self.image_bytes}
+            doc = rtf.parse_bytes(data, self.ctx, spent)
+            self.image_bytes = spent["images"]
+        elif head.startswith((b"<!doctype", b"<html", b"<?xml")) or name.endswith((".htm", ".html", ".xhtml")):
+            notes = {}
+            blocks = xhtml.blocks(xhtml.tree(data), css=xhtml.Css([]), load=lambda _: None, notes=notes,
+                                  ctx=self.ctx, part=tag)
+            kept = {k: notes[k] for k in xhtml.referenced(blocks, notes)}
+            for b in (blocks, *kept.values()):
+                xhtml.settle(b, kept)
+            self.doc.notes.update(kept)
+            return blocks
+        elif name.endswith(".txt"):
+            try:
+                text = data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = xhtml.decode(data) if data.startswith((b"\xff\xfe", b"\xfe\xff")) else \
+                    data.decode("cp1252", "replace")
+            return [Para([Text(line)]) for line in (x.strip() for x in text.splitlines()) if line]
+        else:
+            self.ctx.skipped["chunk"] += 1
+            return []
+        _renamed(doc.blocks, doc.notes, tag)
+        self.doc.notes.update(doc.notes)
+        return doc.blocks
 
     def choose(self, el):
         chosen = ooxml_base.alternate(el, self.scope.nsmap)
@@ -303,24 +433,53 @@ class _Reader:
         self.close_to(st, n)
 
     def field_char(self, el, st):
+        """A field's begin, separate or end. A HYPERLINK's result is a Link; a page number's (PAGE, NUMPAGES,
+        SECTIONPAGES) is dropped in a header or footer. A legacy form field (w:ffData) shows its state at its end
+        when its result shows nothing: a check box ☒ or ☐, a drop-down its chosen entry."""
         kind = attr(el, "fldCharType")
         if kind == "begin":
             if len(st.fields) < limits.MAX_DEPTH:
-                st.fields.append([[], "code", None])
+                st.fields.append([[], "code", None, self.form(first(el, "ffData")), None])
             else:
                 self.deep()
         elif kind == "separate" and st.fields:
             f = st.fields[-1]
             f[1] = "result"
-            url = hyperlink_url("".join(f[0]))
-            if url:
+            f[4] = (st.frames[-1], len(st.frames[-1].inl))
+            instr = "".join(f[0])
+            url = hyperlink_url(instr)
+            frame = _Frame("link", url) if url else _Frame("drop") if not self.diagrams and _PAGE_FIELD.match(instr) \
+                else None
+            if frame is not None:
                 idx = len(st.frames)
-                if self.push(st, _Frame("link", url)):
+                if self.push(st, frame):
                     f[2] = idx
         elif kind == "end" and st.fields:
             f = st.fields.pop()
             if f[2] is not None:
                 self.close_to(st, f[2])
+            if f[3] and (f[4] is None or not _itext(f[4][0].inl[f[4][1]:]).strip()):
+                self.text(f[3], st)
+
+    @staticmethod
+    def form(ff) -> str:
+        """What a legacy form field's w:ffData shows: ☒ or ☐ for a check box (w:checked, else w:default), a
+        drop-down's entry at w:result (else w:default, else the first), "" for anything else."""
+        if ff is None:
+            return ""
+        box = first(ff, "checkBox")
+        if box is not None:
+            mark = first(box, "checked")
+            mark = mark if mark is not None else first(box, "default")
+            return "☒" if mark is not None and _on(mark) else "☐"
+        dd = first(ff, "ddList")
+        if dd is None:
+            return ""
+        entries = [_val(e) or "" for e in kids(dd, "listEntry")]
+        pick = first(dd, "result")
+        pick = pick if pick is not None else first(dd, "default")
+        i = _int(_val(pick), 0) if pick is not None else 0
+        return _squash(entries[i]) if 0 <= i < len(entries) else ""
 
     def run_props(self, r):
         bold = vanish = rstyle = None
@@ -395,6 +554,8 @@ class _Reader:
             url = hyperlink_url(attr(el, "instr"))
             if url:
                 self.scoped(st, el, d, _Frame("link", url))
+            elif not self.diagrams and _PAGE_FIELD.match(attr(el, "instr") or ""):
+                return
             else:
                 for c in el:
                     self.node(c, st, d + 1)
@@ -431,7 +592,7 @@ class _Reader:
         elif n in ("inline", "anchor"):
             old = st.alt
             pr = kids(el, "docPr")
-            st.alt = re.sub(r"\s+", " ", (attr(pr[0], "descr") or "") if pr else old).strip()[:MAX_ALT]
+            st.alt = _squash((attr(pr[0], "descr") or attr(pr[0], "title") or "") if pr else old)
             for c in el:
                 self.node(c, st, d + 1)
             st.alt = old
@@ -445,11 +606,41 @@ class _Reader:
             self.extra(st, self.smartart(attr(el, "dm")))
         elif n == "txbxContent":
             self.extra(st, self.blocks(el, d + 1))
+        elif n == "textpath":
+            if text := _squash(attr(el, "string"), limits.MAX_OUTPUT):
+                self.extra(st, [Para([Text(text)])])
+        elif n == "sym":
+            try:
+                ch = symbol(attr(el, "font"), int(attr(el, "char") or "", 16))
+            except ValueError:
+                ch = None
+            if ch:
+                self.text(ch, st)
+            else:
+                self.ctx.skipped["symbol"] += 1
+        elif n == "ruby":
+            self.ruby(el, st, d)
         elif n in ("wgp", "wpc") and self.diagrams:
             self.group(el, st, d)
         elif n not in _SKIP:
             for c in el:
                 self.node(c, st, d + 1)
+
+    def ruby(self, el, st, d):
+        """Ruby as its base text, then its reading in parentheses: 漢字(かんじ)."""
+        for c in kids(el, "rubyBase"):
+            for x in c:
+                self.node(x, st, d + 1)
+        k = len(st.frames)
+        if not self.push(st, _Frame("reading")):
+            return
+        for c in kids(el, "rt"):
+            for x in c:
+                self.node(x, st, d + 1)
+        self.close_to(st, k + 1)
+        reading = _squash(_itext(st.frames.pop().inl), limits.MAX_OUTPUT)
+        if reading:
+            self.text(f"({reading})", st)
 
     # ---- drawing groups and canvases
     def group(self, el, st, d):

@@ -767,6 +767,212 @@ def test_docx_group_hostile_glue_and_geometry():
     assert markdown.render(doc, tmp() / "a") == "lead\n\nStart\n\nEnd\n" and dict(ctx.skipped) == {"shape": 1}
 
 
+
+# ---- Task 13: numbering, forms, special runs, imported parts, properties
+NUM_REL = (("rN", "numbering", "numbering.xml", False),)
+
+
+def lvl(ilvl, fmt, text, start=1):
+    return (f'<w:lvl w:ilvl="{ilvl}"><w:start w:val="{start}"/><w:numFmt w:val="{fmt}"/>'
+            f'<w:lvlText w:val="{text}"/></w:lvl>')
+
+
+def test_numbering_formats():
+    """Every numFmt a contract uses shows as Word shows it, not as a decimal."""
+    cases = (("decimalEnclosedParen", 1, "(1)"), ("decimalZero", 3, "03"), ("japaneseCounting", 11, "十一"),
+             ("chineseCounting", 20, "二十"), ("aiueo", 2, "ｲ"), ("iroha", 3, "ﾊ"), ("ordinal", 2, "2nd"),
+             ("ordinal", 11, "11th"), ("cardinalText", 21, "Twenty-One"), ("ordinalText", 3, "Third"),
+             ("koreanLegal", 2, "둘"), ("koreanCounting", 12, "십이"), ("ideographDigital", 10, "一〇"),
+             ("decimalFullWidth", 7, "７"), ("hex", 255, "FF"), ("chicago", 6, "††"), ("russianLower", 2, "б"))
+    for fmt, start, want in cases:
+        nm = ('<w:numbering {NS}><w:abstractNum w:abstractNumId="0">' + lvl(0, fmt, "%1", start)
+              + '</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>')
+        out = md(docm(P("x", num(0)), {"word/numbering.xml": nm}, NUM_REL))
+        assert out == f"{want} x\n", (fmt, out)
+
+
+def test_numbering_style_link_and_instances():
+    """A list linked through a numbering style takes that style's levels; a second num of one abstractNum goes on
+    counting, a startOverride starts it again, and a lvlOverride's own lvl replaces the level."""
+    nm = ('<w:numbering {NS}>'
+          '<w:abstractNum w:abstractNumId="0"><w:styleLink w:val="LegalList"/>'
+          + lvl(0, "upperRoman", "Article %1.") + lvl(1, "lowerLetter", "(%2)") + '</w:abstractNum>'
+          '<w:abstractNum w:abstractNumId="1"><w:numStyleLink w:val="LegalList"/></w:abstractNum>'
+          '<w:abstractNum w:abstractNumId="2">' + lvl(0, "decimal", "%1.") + '</w:abstractNum>'
+          '<w:num w:numId="5"><w:abstractNumId w:val="0"/></w:num>'
+          '<w:num w:numId="6"><w:abstractNumId w:val="1"/></w:num>'
+          '<w:num w:numId="7"><w:abstractNumId w:val="2"/></w:num>'
+          '<w:num w:numId="8"><w:abstractNumId w:val="2"/></w:num>'
+          '<w:num w:numId="9"><w:abstractNumId w:val="2"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/>'
+          '</w:lvlOverride></w:num>'
+          '<w:abstractNum w:abstractNumId="3">' + lvl(0, "decimal", "%1.") + '</w:abstractNum>'
+          '<w:num w:numId="10"><w:abstractNumId w:val="3"/><w:lvlOverride w:ilvl="0">'
+          + lvl(0, "decimalEnclosedParen", "%1", 4) + '</w:lvlOverride></w:num>'
+          '</w:numbering>')
+    sty = styles('<w:style w:type="numbering" w:styleId="LegalList"><w:name w:val="Legal List"/><w:pPr>'
+                 '<w:numPr><w:numId w:val="5"/></w:numPr></w:pPr></w:style>')
+    body = (P("Scope", num(0, 6)) + P("first", num(1, 6)) + P("Terms", num(0, 6))
+            + P("a", num(0, 7)) + P("b", num(0, 8)) + P("c", num(0, 9)) + P("d", num(0, 7)) + P("e", num(0, 10)))
+    out = md(docm(body, {"word/numbering.xml": nm, **sty}, NUM_REL + STYLES_REL))
+    assert out == ("Article I. Scope\n  (a) first\nArticle II. Terms\n"
+                   "1. a\n2. b\n1. c\n2. d\n(4) e\n"), out
+
+
+def fld(instr, result="", ff=""):
+    sep = '<w:r><w:fldChar w:fldCharType="separate"/></w:r>' + (f'<w:r><w:t>{result}</w:t></w:r>' if result else "") \
+        if result is not None else ""
+    return (f'<w:r><w:fldChar w:fldCharType="begin">{ff}</w:fldChar></w:r>'
+            f'<w:r><w:instrText xml:space="preserve"> {instr} </w:instrText></w:r>{sep}'
+            '<w:r><w:fldChar w:fldCharType="end"/></w:r>')
+
+
+def test_legacy_form_fields_show_their_state():
+    """A legacy check box shows ☒ or ☐ (w:checked, else w:default), a drop-down its chosen entry, a text field its
+    result; a content control's state still shows."""
+    box = '<w:ffData><w:name w:val="C1"/><w:checkBox><w:sizeAuto/><w:default w:val="0"/><w:checked/></w:checkBox></w:ffData>'
+    off = '<w:ffData><w:checkBox><w:default w:val="0"/></w:checkBox></w:ffData>'
+    on = '<w:ffData><w:checkBox><w:default/></w:checkBox></w:ffData>'
+    dd = ('<w:ffData><w:ddList><w:result w:val="1"/><w:listEntry w:val="DD-FIRST"/><w:listEntry w:val="DD-SECOND"/>'
+          '</w:ddList></w:ffData>')
+    dd0 = '<w:ffData><w:ddList><w:listEntry w:val="ONLY"/></w:ddList></w:ffData>'
+    text = '<w:ffData><w:textInput><w:default w:val="x"/></w:textInput></w:ffData>'
+    sdt = ('<w:sdt><w:sdtPr><w14:checkbox xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">'
+           '<w14:checked w14:val="1"/></w14:checkbox></w:sdtPr><w:sdtContent><w:r><w:t>☒</w:t></w:r></w:sdtContent></w:sdt>')
+    body = (f'<w:p><w:r><w:t xml:space="preserve">agree </w:t></w:r>{fld("FORMCHECKBOX", None, box)}'
+            f'{fld("FORMCHECKBOX", None, off)}{fld("FORMCHECKBOX", None, on)}</w:p>'
+            f'<w:p><w:r><w:t xml:space="preserve">pick </w:t></w:r>{fld("FORMDROPDOWN", None, dd)} {fld("FORMDROPDOWN", "", dd0)}</w:p>'
+            f'<w:p>{fld("FORMTEXT", "typed", text)}{sdt}</w:p>')
+    out = md(docm(body))
+    assert out == "agree ☒☐☒\n\npick DD-SECONDONLY\n\ntyped☒\n", out
+
+
+def test_ruby_is_base_then_reading():
+    ruby = ('<w:r><w:ruby><w:rubyPr><w:rubyAlign w:val="center"/></w:rubyPr><w:rt><w:r><w:t>かんじ</w:t></w:r></w:rt>'
+            '<w:rubyBase><w:r><w:t>漢字</w:t></w:r></w:rubyBase></w:ruby></w:r>')
+    out = md(docm(f'<w:p><w:r><w:t>前</w:t></w:r>{ruby}<w:r><w:t>後</w:t></w:r></w:p>'))
+    assert out == "前漢字(かんじ)後\n", out
+
+
+def test_symbol_characters():
+    """w:sym through the Symbol and Wingdings tables, a code in either's private-use form the same; another font's
+    code as itself; a private-use code of an unknown font is counted."""
+    syms = ('<w:r><w:sym w:font="Wingdings" w:char="F0FC"/></w:r><w:r><w:sym w:font="Wingdings" w:char="A8"/></w:r>'
+            '<w:r><w:sym w:font="Symbol" w:char="F061"/></w:r><w:r><w:sym w:font="Arial" w:char="263A"/></w:r>'
+            '<w:r><w:sym w:font="Webdings" w:char="F021"/></w:r>')
+    doc, ctx = parse(docm(f'<w:p><w:r><w:t>ok</w:t></w:r>{syms}</w:p>'))
+    assert markdown.render(doc, tmp() / "a") == "ok✔◻α☺\n" and ctx.skipped["symbol"] == 1, ctx.skipped
+
+
+def test_vml_text_art_and_drawing_title():
+    """WordArt's v:textpath string is text after its paragraph; a drawing's title is its alt when it has no
+    description."""
+    art = ('<w:p><w:r><w:t>lead</w:t></w:r><w:r><w:pict><v:shape><v:textpath style="font-family:Arial" '
+           'string="WORDART-VML-TEXT"/></v:shape></w:pict></w:r></w:p>')
+    pic = ('<w:p><w:r><w:drawing><wp:inline><wp:docPr id="1" name="p" title="Floor plan"/><a:graphic><a:graphicData>'
+           '<pic:pic><pic:blipFill><a:blip r:embed="rI"/></pic:blipFill></pic:pic></a:graphicData></a:graphic>'
+           '</wp:inline></w:drawing></w:r></w:p>')
+    out = md(docm(art + pic, {"word/media/i.png": PNG}, (("rI", "image", "media/i.png", False),)))
+    assert out == "lead\n\nWORDART-VML-TEXT\n\n![Floor plan](assets/img-001.png)\n", out
+
+
+def chunk_docx():
+    inner = docm(P("CHUNK-DOCX") + '<w:p><w:r><w:t>n</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>',
+                 {"word/footnotes.xml": '<w:footnotes {NS}><w:footnote w:id="1">' + P("inner note")
+                  + '</w:footnote></w:footnotes>'},
+                 (("rF", "footnotes", "footnotes.xml", False),))
+    return inner.read_bytes()
+
+
+def test_alt_chunk_reads_its_part():
+    """An altChunk part is read by the reader's parser for its kind: HTML, RTF, plain text, a Word package (its note
+    kept apart from the document's own); a missing one is counted."""
+    body = (P("before") + '<w:altChunk r:id="rH"/><w:altChunk r:id="rR"/><w:altChunk r:id="rT"/>'
+            '<w:altChunk r:id="rD"/><w:altChunk r:id="rX"/>'
+            '<w:p><w:r><w:t>own</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>')
+    parts = {"word/a.html": b"<html><body><p>ALTCHUNK-<b>HTML</b></p></body></html>",
+             "word/b.rtf": rb"{\rtf1\ansi CHUNK-RTF\par}",
+             "word/c.txt": "CHUNK-TEXT line 1\r\nline 2\r\n".encode("utf-8"),
+             "word/d.docx": chunk_docx(),
+             "word/footnotes.xml": '<w:footnotes {NS}><w:footnote w:id="1">' + P("outer note") + '</w:footnote></w:footnotes>'}
+    rels = (("rH", "aFChunk", "a.html", False), ("rR", "aFChunk", "b.rtf", False), ("rT", "aFChunk", "c.txt", False),
+            ("rD", "aFChunk", "d.docx", False), ("rX", "aFChunk", "gone.html", False),
+            ("rF", "footnotes", "footnotes.xml", False))
+    doc, ctx = parse(docm(body, parts, rels))
+    out = markdown.render(doc, tmp() / "a")
+    assert out == ("before\n\nALTCHUNK-**HTML**\n\nCHUNK-RTF\n\nCHUNK-TEXT line 1\n\nline 2\n\nCHUNK-DOCX\n\nn[^1]\n\n"
+                   "own[^2]\n\n[^1]: inner note\n[^2]: outer note\n"), out
+    assert ctx.skipped["chunk"] == 1, ctx.skipped
+
+
+def test_alt_chunk_depth_is_capped():
+    """A Word package imported into itself stops at ALT_CHUNK_DEPTH levels, the rest counted."""
+    data = docm(P("leaf")).read_bytes()
+    for k in range(limits.ALT_CHUNK_DEPTH + 2):
+        data = docm(P(f"level{k}") + '<w:altChunk r:id="rD"/>', {"word/d.docx": data},
+                    (("rD", "aFChunk", "d.docx", False),)).read_bytes()
+    path = tmp() / "deep.docm"
+    path.write_bytes(data)
+    doc, ctx = parse(path)
+    out = markdown.render(doc, tmp() / "a")
+    assert out.count("level") == limits.ALT_CHUNK_DEPTH + 1 and "leaf" not in out and ctx.skipped["chunk"] == 1, \
+        (out, ctx.skipped)
+
+
+CORE = ('<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>Lease</dc:title><dc:subject>Unit 4</dc:subject>'
+        '<dc:creator>Kim</dc:creator><cp:keywords>lease, rent</cp:keywords><dc:description></dc:description>'
+        '<cp:lastModifiedBy>Lee</cp:lastModifiedBy><cp:revision>3</cp:revision>'
+        '<dcterms:created xsi:type="dcterms:W3CDTF">2024-03-05T10:30:00Z</dcterms:created>'
+        '<dcterms:modified xsi:type="dcterms:W3CDTF">2024-04-01T08:00:00Z</dcterms:modified></cp:coreProperties>')
+APP = ('<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
+       '<Template>Normal.dotm</Template><TotalTime>4</TotalTime><Pages>1</Pages><Words>3</Words>'
+       '<Application>Microsoft Office Word</Application><Company>ACME</Company></Properties>')
+CUSTOM = ('<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" '
+          'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+          '<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="Client"><vt:lpwstr>Hanbit</vt:lpwstr></property>'
+          '<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="3" name="Due"><vt:filetime>2024-05-01T09:00:00Z'
+          '</vt:filetime></property>'
+          '<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="4" name="Empty"><vt:lpwstr></vt:lpwstr></property>'
+          '</Properties>')
+PACKAGE_RELS = "http://schemas.openxmlformats.org/package/2006/relationships"
+OFFICE_RELS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def test_document_properties():
+    """docProps' title is the title; what else is set and says something is one line at the top, in a fixed order;
+    the application, template, counts and an empty property are left out, and so is a last author who is the
+    author."""
+    root = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{OFFICE_RELS}/officeDocument" Target="word/document.xml"/>'
+            f'<Relationship Id="rId2" Type="{PACKAGE_RELS}/metadata/core-properties" Target="docProps/core.xml"/>'
+            f'<Relationship Id="rId3" Type="{OFFICE_RELS}/extended-properties" Target="docProps/app.xml"/>'
+            f'<Relationship Id="rId4" Type="{OFFICE_RELS}/custom-properties" Target="docProps/custom.xml"/>'
+            '</Relationships>')
+    parts = {"_rels/.rels": root, "docProps/core.xml": CORE, "docProps/app.xml": APP, "docProps/custom.xml": CUSTOM}
+    out = md(docm(P("body"), parts))
+    assert out == ("Properties: subject: Unit 4; author: Kim; last author: Lee; created: 2024-03-05 10:30; "
+                   "modified: 2024-04-01 08:00; company: ACME; keywords: lease, rent; Client: Hanbit; "
+                   "Due: 2024-05-01 09:00\n\n# Lease\n\nbody\n"), out
+    parts["docProps/core.xml"] = CORE.replace("<cp:lastModifiedBy>Lee", "<cp:lastModifiedBy>Kim")
+    parts["docProps/core.xml"] = parts["docProps/core.xml"].replace("<dc:title>Lease</dc:title>", "")
+    del parts["docProps/app.xml"], parts["docProps/custom.xml"]
+    out = md(docm(P("body"), parts))
+    assert out.startswith("Properties: subject: Unit 4; author: Kim; created: 2024-03-05 10:30; "
+                          "modified: 2024-04-01 08:00; keywords: lease, rent\n\nbody"), out
+
+
+def test_page_fields_dropped_in_headers():
+    """A header's PAGE, NUMPAGES or SECTIONPAGES result is left out, in a complex field or a simple one; in the body it
+    stays."""
+    hd = ('<w:hdr {NS}><w:p><w:r><w:t xml:space="preserve">HEADER-TEXT </w:t></w:r>' + fld("PAGE", "1")
+          + '<w:r><w:t xml:space="preserve"> of </w:t></w:r><w:fldSimple w:instr=" NUMPAGES \\* Arabic ">'
+          '<w:r><w:t>9</w:t></w:r></w:fldSimple></w:p></w:hdr>')
+    out = md(docm(f'<w:p><w:r><w:t xml:space="preserve">page </w:t></w:r>{fld("PAGE", "3")}</w:p>',
+                  {"word/header1.xml": hd}, (("rH", "header", "header1.xml", False),)))
+    assert out == "Header: HEADER-TEXT of\n\npage 3\n", out
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

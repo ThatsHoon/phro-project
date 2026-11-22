@@ -68,8 +68,9 @@ from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Inserted, Link, ListItem, NoteRef, Para, Table, Text
 from . import cfb_route, doc_fib, doc_objects, doc_pictures, zip_route
+from ..text import decode_8bit
 from .hancom import flat, lone_equations
-from .word_fields import MAX_INSTR, MAX_NAME, comment_note, hyperlink_url
+from .word_fields import MAX_INSTR, MAX_NAME, comment_note, hyperlink_url, properties
 
 _ZIP = b"PK\x03\x04"
 _RTF = b"{\\rtf"
@@ -312,6 +313,7 @@ class _Reader:
         self.ends = set()     # the spids the connector rules name
         self.slotted = False  # whether the main story holds a _Slot
         self.rmarks = None    # SttbfRMark's names, once read
+        self.previewed = set()
 
     # ---- streams
     def stream(self, name) -> bytes:
@@ -320,12 +322,45 @@ class _Reader:
         except (KeyError, CfbError):  # missing, or a broken chain
             raise ReadError("damaged", f"{name} stream") from None
 
-    def table_stream(self, name) -> bytes:
-        """The table stream the FIB names; the other one when only that exists (dochan, anydoc)."""
+    def table_stream(self, name) -> bytes | None:
+        """The table stream the FIB names; the other one when only that exists (dochan, anydoc); None without
+        either."""
         for n in (name, "0Table" if name == "1Table" else "1Table"):
             if self.cf.exists(n):
                 return self.stream(n)
-        raise ReadError("damaged", "no table stream")
+        return None
+
+    def main_only(self):
+        """A WordDocument without a table stream, as anydoc reads one: the bytes fcMin..fcMac (FibBase 0x18 and
+        0x1C) are the main story, 8-bit text in the code page of the document's language, decoded whole (a
+        double-byte code page too) and held as one UTF-16 piece after the stream's bytes. The FIB's entries point into
+        the missing table, so none is read. A range that is empty or outside the stream is damaged."""
+        lo, hi = struct.unpack_from("<II", self.word, 0x18)
+        if not lo < hi <= len(self.word):
+            raise ReadError("damaged", "no table stream")
+        units = decode_8bit(self.word[lo:hi], self.lid).encode("utf-16-le")
+        at = len(self.word) + len(self.word) % 2
+        self.word = self.word + bytes(at - len(self.word)) + units
+        self.pieces = [doc_fib.Piece(0, len(units) // 2, at, False, 0)]
+        self.fib.ccp = {**dict.fromkeys(doc_fib.STORIES, 0), "text": len(units) // 2}
+        self.fib.fc = []
+        self.table = b""
+
+    def properties(self):
+        """SummaryInformation's title as Doc.title; its subject, author, last author, keywords and creation and save
+        times, DocumentSummaryInformation's company and its user-defined properties as Doc.meta["properties"]
+        (doc_fib.summary). A stream past PROPERTY_STREAM, or one that is damaged, is counted under properties."""
+        got = {}
+        for name in (doc_fib.SUMMARY_STREAM, doc_fib.DOC_SUMMARY_STREAM):
+            if self.cf.exists(name):
+                with self.ctx.guard("properties"):
+                    if self.cf.size(name) > limits.PROPERTY_STREAM:
+                        raise ValueError("property stream too large")
+                    got[name] = doc_fib.property_sets(self.cf.read(name))
+        title, pairs = doc_fib.summary(got)
+        self.doc.title = title
+        if kept := properties(pairs):
+            self.doc.meta["properties"] = kept
 
     def run(self):
         # parse() calls this only after cfb_route.route returned None, which it does only when WordDocument exists
@@ -334,11 +369,14 @@ class _Reader:
         self.fib = f = doc_fib.fib(self.word)
         if f.encrypted or f.obfuscated:
             raise ReadError("encrypted")
-        self.table = self.table_stream(f.table)
-        self.pieces, cut = doc_fib.fit(doc_fib.pieces(self.table, *f.pair(doc_fib.CLX)), len(self.word))
-        if cut:
-            self.ctx.skipped["text"] += cut
         self.lid = f.lid_fe if f.far_east and f.lid_fe else f.lid
+        self.table = self.table_stream(f.table)
+        if self.table is None:
+            self.main_only()
+        else:
+            self.pieces, cut = doc_fib.fit(doc_fib.pieces(self.table, *f.pair(doc_fib.CLX)), len(self.word))
+            if cut:
+                self.ctx.skipped["text"] += cut
         self.ranges = doc_fib.story_ranges(f.ccp, self.pieces[-1].cp_end if self.pieces else 0)
         at = 0
         for name in doc_fib.STORIES:
@@ -347,15 +385,16 @@ class _Reader:
         self.props()
         self.notes()
         self.headers()
+        boxes = self.boxes("textbox", _TXBX, "block")
         main = []
         with self.ctx.guard("document"):
             main = self.story("text")
-        boxes = self.boxes("textbox", _TXBX, "block")
         self.doc.blocks.extend(self.connect(main, boxes) if self.slotted else main)
         for blocks in boxes.values():
             self.doc.blocks.extend(blocks)
         if self.styles.bad:
             self.ctx.skipped["styles"] += self.styles.bad
+        self.properties()
         return self.doc
 
     # ---- the other stories
@@ -500,7 +539,10 @@ class _Reader:
         for i, a, b in spans:
             with self.ctx.guard(kind):
                 lid = struct.unpack_from("<i", data[i], 14)[0]
+                whole = self.objects.whole
                 out[lid if lid not in out else ("unkeyed", i)] = self.read(name, a, b)
+                if self.objects.whole > whole:
+                    self.previewed.add(lid)
         return out
 
     def connect(self, main, boxes) -> list:
@@ -971,16 +1013,18 @@ class _Reader:
         """A floating object: a \\x08 with fSpec in the main story, the pictures of the shape its FSPA in PlcSpaMom
         names (doc_pictures.Pictures.floating), each read under guard("image"), then a _Slot when a connector rule
         names that shape. MS-DOC gives the stories other than the main and header ones no PlcfSpa, so a \\x08 there
-        is not resolved, and a header's is not read."""
+        is not resolved, and a header's is not read. A shape whose own text box placed an object whole (boxes, read
+        first) draws nothing: its picture is that object's preview, which the object stands for."""
         if not st.run.special or st.name != "text" or not self.live(st):
             return
+        spid = self.pictures.drawing().anchors.get(cp)
         pibs = []
-        with self.ctx.guard("image"):
-            pibs = self.pictures.floating(cp)
+        if spid not in self.previewed:
+            with self.ctx.guard("image"):
+                pibs = self.pictures.floating(cp)
         for pib in pibs:
             with self.ctx.guard("image"):
                 self.put_image(st, self.pictures.stored(pib))
-        spid = self.pictures.drawing().anchors.get(cp)
         if spid is not None and spid in self.linked():
             st.extras.append(_Slot(spid))
             self.slotted = True

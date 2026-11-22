@@ -56,6 +56,16 @@ def test_normal_text_styled():
     assert t(body) == "\\text{for all }\\mathbf{x} \\in \\mathbb{R}", t(body)
 
 
+def test_upright_runs_wrap_only_letters():
+    """A plain-style (m:sty p) run is \\mathrm{} only when it holds a letter: digits, signs and operators are upright
+    in TeX already."""
+    def up(x):
+        return f"<m:r>{pr('rPr', ('sty', 'p'))}<m:t>{x}</m:t></m:r>"
+    body = r("x") + up("=") + f"<m:f>{e(up('-') + r('b') + up('±') + up('4'), 'num')}{e(up('2') + r('a'), 'den')}</m:f>"
+    assert t(body) == "x=\\frac{-b\\pm4}{2a}", t(body)
+    assert t(up("d") + r("x") + up("max")) == "\\mathrm{d}x\\mathrm{max}", t(up("d") + r("x") + up("max"))
+
+
 def frac(kind=None):
     head = pr("fPr", ("type", kind)) if kind else ""
     return t(f"<m:f>{head}{e(r('a'), 'num')}{e(r('b'), 'den')}</m:f>")
