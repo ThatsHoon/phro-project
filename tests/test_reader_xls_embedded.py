@@ -362,13 +362,13 @@ def test_doc_workbook_in_vanished_text_is_hidden():
     assert "\n1|2\n" not in dobj.md(p, hidden=True), dobj.md(p, hidden=True)
 
 
-def test_ole_table_shares_budget():
-    # ole_table's sheets keyword is the document's budget: the embedded sheet's cells are drawn from it
+def test_ole_blocks_share_budget():
+    # ole_blocks' sheets keyword is the document's budget: the embedded sheet's cells are drawn from it
     from reader.formats import hwp_chart
     item = hchart.envelope(object_streams(excel_object([GRID], b"Excel.Sheet.8")))
     budget = sheet_grid.Budget()
-    tbl = hwp_chart.ole_table(item, Context(), sheets=budget)
-    assert tbl is not None and budget.cells == budget.cap_cells - 4, budget.cells
+    got = hwp_chart.ole_blocks(item, Context(), sheets=budget)
+    assert got and budget.cells == budget.cap_cells - 4, budget.cells
 
 
 def main():

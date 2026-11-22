@@ -1,4 +1,4 @@
-"""HWP OLE charts: a BinData OLE item to a Table.
+"""HWP OLE items: a BinData OLE item to the blocks it shows, a chart's Table first of all.
 
 The item is a 4-byte length, then a nested compound file; the length must be what follows it (dochan
 hwp/charts.py). In it, OOXMLChartContents is a DrawingML chart read by charts.chart_table; Contents a Hancom-native
@@ -6,18 +6,19 @@ chart (ChartOBJ revision 1.2), ported from rhwp src/ole_chart: the probe (parser
 archive slot order (grid.rs), the series axis from label records repeated after the grid (orientation.rs), the
 title (parser.rs) and the chart type at the end of the VtChart archive (the field order of legacy_presentation.rs
 parse_inner, whose whole object graph is not walked); a BIFF Workbook or Book is an embedded Excel object, read by
-xls_embedded (its first table is the item's).
+xls_embedded (its first table is the item's); any other item is read by embedded.storage (an equation, a package's
+tables).
 """
 import re
 import struct
 from dataclasses import dataclass
 
-from .. import limits
+from .. import embedded, limits
 from ..charts import caption, chart_table, series_table
 from ..containers.cfb import Compound, is_cfb
 from ..containers.zipx import parse_xml
 from ..limits import ReadError
-from ..model import Table
+from ..model import Equation, Table
 from ..numfmt import display
 from . import sheet_grid, xls_embedded
 
@@ -68,14 +69,18 @@ class _Grid:
         return v.text if isinstance(v, _Text) else None
 
 
-def ole_table(data: bytes, ctx, *, sheets: sheet_grid.Budget | None = None) -> Table | None:
-    """The chart in an OLE item as a Table. None, counted under object, for an item that is not a 4-byte length
-    and the compound file it gives, or that holds no chart; counted under chart for a BIFF Workbook with no table to
-    show or a chart that does not parse. A chart without series is None, not counted, as charts.chart_table has it.
-    A Workbook's sheets draw on `sheets`, the document's sheet_grid.Budget (a fresh one when None)."""
+def ole_blocks(data: bytes, ctx, *, sheets: sheet_grid.Budget | None = None) -> list:
+    """What an OLE item shows: its chart as one Table, else what embedded.storage reads in it (an Equation, a
+    package's Tables). Nothing, counted under object, for an item that is not a 4-byte length and the compound file
+    it gives, or that holds none of these; counted under chart for a BIFF Workbook with no table to show, a chart
+    that does not parse or a chart object left unread. A chart without series is nothing, not counted, as
+    charts.chart_table has it. A workbook's sheets draw on `sheets`, the document's sheet_grid.Budget (a fresh one
+    when None)."""
     if len(data) < 12 or struct.unpack_from("<I", data)[0] != len(data) - 4 or not is_cfb(data[4:12]):
         ctx.skipped["object"] += 1
-        return None
+        return []
+    if sheets is None:
+        sheets = sheet_grid.Budget()
     try:
         with Compound(data[4:]) as cf:
             if cf.exists("OOXMLChartContents"):
@@ -84,30 +89,39 @@ def ole_table(data: bytes, ctx, *, sheets: sheet_grid.Budget | None = None) -> T
                 xml = None
             elif cf.exists("Workbook") or cf.exists("Book"):
                 before = ctx.skipped["chart"]
-                found = xls_embedded.blocks(cf, ctx, sheet_grid.Budget() if sheets is None else sheets)
+                found = xls_embedded.blocks(cf, ctx, sheets)
                 table = next((b for b in found if isinstance(b, Table)), None)
                 if table is None and ctx.skipped["chart"] == before:
                     ctx.skipped["chart"] += 1
-                return table
+                return [] if table is None else [table]
             else:
-                ctx.skipped["object"] += 1
-                return None
+                got = embedded.storage(cf, ctx, sheets)
+                kind = got[0] if got else ""
+                if kind == "table":
+                    return got[1]
+                if kind == "equation":
+                    if got[2]:
+                        ctx.skipped["depth" if got[2] <= {"depth"} else "object"] += 1
+                    return [Equation(got[1])]
+                ctx.skipped["chart" if kind == "chart" else "object"] += 1
+                return []
     except ReadError as e:
         if e.kind not in ("damaged", "too_large"):
             raise
         ctx.skipped["object"] += 1
-        return None
+        return []
     except (KeyError, ValueError):  # a broken chain in the nested file
         ctx.skipped["object"] += 1
-        return None
+        return []
     try:
         with ctx.guard("chart"):  # a chart that does not parse is one chart, never a failed section
-            return chart_table(parse_xml(xml), ctx) if xml is not None else _native(native, ctx)
+            table = chart_table(parse_xml(xml), ctx) if xml is not None else _native(native, ctx)
+            return [] if table is None else [table]
     except ReadError as e:  # XML that does not parse
         if e.kind != "damaged":
             raise
         ctx.skipped["chart"] += 1
-    return None
+    return []
 
 
 # ---- Hancom-native charts (rhwp src/ole_chart)

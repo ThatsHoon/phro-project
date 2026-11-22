@@ -8,8 +8,8 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import embedded, limits  # noqa: E402  (ModuleNotFoundError before embedded.py exists)
-from reader.formats import sheet_grid  # noqa: E402
-from reader.model import Context, Table, Text  # noqa: E402
+from reader.formats import hwp_chart, sheet_grid  # noqa: E402
+from reader.model import Context, Equation, Table, Text  # noqa: E402
 from reader_fix import cfb_bytes, comp_obj, eq_native, make_xlsx, make_zip, xlsx_cell, xlsx_row  # noqa: E402
 import test_reader_doc_objects as in_doc  # noqa: E402
 import test_reader_docm as in_docm  # noqa: E402
@@ -17,6 +17,7 @@ import test_reader_odt as odt  # noqa: E402
 import test_reader_ppt_objects as in_ppt  # noqa: E402
 import test_reader_rtf as in_rtf  # noqa: E402
 import test_reader_slides as in_slides  # noqa: E402
+import test_reader_vsd as in_vsd  # noqa: E402
 
 CHART_MIME = "application/vnd.oasis.opendocument.chart"
 FORMULA_MIME = "application/vnd.oasis.opendocument.formula"
@@ -242,6 +243,48 @@ def test_rtf_object_data_is_bounded():
     finally:
         limits.EMBED_BYTES = old
     assert got == "a preview\n", repr(got)
+
+
+def vsd_object(chunks, y=1.0):
+    return {"type": 0x4E, "pin": (0.0, y), "chunks": [(0x98, in_vsd.foreign_type(2), {"level": 3}),
+                                                      (0x0C, in_vsd.EMF, {"level": 3}), *chunks]}
+
+
+def test_vsd_ole_data_object():
+    book, _ = cfb_bytes({"Package": workbook()})
+    eq, _ = cfb_bytes({"Equation Native": eq_native(in_ppt.X)})
+    half = len(book) // 2
+    shapes = [vsd_object([(0x1F, book[:half], {"level": 4}), (0x1F, book[half:], {"level": 4})], 2.0),
+              vsd_object([(0x1F, eq, {"level": 4})], 1.0)]
+    doc, ctx = in_vsd.read(in_vsd.drawing([{"shapes": shapes}]))
+    blocks = doc.blocks[0].blocks
+    assert cells(blocks[:1]) == [["Item", "Qty"], ["Pen", "3"]] and not ctx.skipped, (blocks, ctx.skipped)
+    assert isinstance(blocks[1], Equation) and blocks[1].tex == "x" and len(blocks) == 2, blocks
+    doc, ctx = in_vsd.read(in_vsd.drawing([{"shapes": [vsd_object([(0x1F, b"not a file", {"level": 4})]),
+                                                       vsd_object([])]}]))
+    assert doc.blocks[0].blocks == [] and ctx.skipped == {"object": 2}, (doc.blocks[0].blocks, ctx.skipped)
+    old = limits.EMBED_BYTES
+    limits.EMBED_BYTES = 64
+    try:
+        doc, ctx = in_vsd.read(in_vsd.drawing([{"shapes": [vsd_object([(0x1F, eq, {"level": 4})])]}]))
+    finally:
+        limits.EMBED_BYTES = old
+    assert doc.blocks[0].blocks == [] and ctx.skipped == {"object": 1}, (doc.blocks[0].blocks, ctx.skipped)
+
+
+def test_hwp_ole_item_that_is_no_chart():
+    def item(streams):
+        blob, _ = cfb_bytes(streams)
+        return struct.pack("<I", len(blob)) + blob
+
+    ctx = Context()
+    got = hwp_chart.ole_blocks(item({"Equation Native": eq_native(in_ppt.X)}), ctx)
+    assert len(got) == 1 and isinstance(got[0], Equation) and got[0].tex == "x" and not ctx.skipped, (got, ctx.skipped)
+    got = hwp_chart.ole_blocks(item({"Package": workbook()}), ctx)
+    assert cells(got) == [["Item", "Qty"], ["Pen", "3"]] and not ctx.skipped, (got, ctx.skipped)
+    assert hwp_chart.ole_blocks(item({"\x01CompObj": comp_obj(b"MSGraph.Chart.8")}), ctx) == []
+    assert hwp_chart.ole_blocks(item({"\x01Ole10Native": b"x" * 40}), ctx) == []
+    assert ctx.skipped == {"chart": 1, "object": 1}, ctx.skipped
 
 
 def main():

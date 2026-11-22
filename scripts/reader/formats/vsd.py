@@ -135,10 +135,10 @@ import datetime
 import math
 import struct
 
-from .. import diagram, images, limits, officeart, text as textmod
+from .. import diagram, embedded, images, limits, officeart, text as textmod
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
-from ..model import Doc, Image, Para, Section
+from ..model import Doc, Equation, Image, Para, Section
 from . import cfb_route, vsd_stream, vsdx, zip_route
 from .vsd_stream import Chunk
 
@@ -318,7 +318,7 @@ def number(fmt: int, cell: int, value: float) -> str:
 
 class _Shape:
     __slots__ = ("sid", "level", "parent", "master", "home", "pin", "text", "cut", "names", "names_size",
-                 "names_cut", "order", "fields", "ftype", "fformat", "data", "broken", "has_misc", "hide", "begin",
+                 "names_cut", "order", "fields", "ftype", "fformat", "data", "ole", "ole_size", "broken", "has_misc", "hide", "begin",
                  "end", "runs", "geo", "ends", "arrows", "line_style", "path", "path_done")
 
     def __init__(self, sid, level, parent, master, home, line_style=None):
@@ -337,6 +337,7 @@ class _Shape:
         self.fields = {}      # 0xA1: field id -> ("s", name id) or ("n", format, cell, value)
         self.ftype = self.fformat = None
         self.data = None
+        self.ole, self.ole_size = [], 0  # the object's OLE data chunks; past EMBED_BYTES none are kept
         self.broken = False
         self.has_misc = False  # a misc chunk of its own sets the hidden flag
         self.hide = False
@@ -408,6 +409,7 @@ class _Reader:
         self.room = limits.MAX_OUTPUT    # shape text the document may still emit (vsdx's charge)
         self.stencil_room = limits.MAX_OUTPUT  # stencil shape text the document may keep
         self.image_bytes = 0
+        self.objects = embedded.Objects(ctx)
         self.budget = diagram.ConnectionBudget(ctx)
         self.names = {}       # libvisio's m_names: 0x33 id -> its bytes; a 0x32 starts a new one
         self.index = {}       # level -> [name index chunk data, its type, the names it maps to, parsed or None]
@@ -1077,6 +1079,14 @@ class _Reader:
     def foreign_data(self, s, data):
         s.data = bytes(data)  # an inflated blob's buffer is not kept by the walk
 
+    def ole_data(self, s, data):
+        """readOLEData: the chunks of a shape's OLE object, in order, are one compound file."""
+        s.ole_size += len(data)
+        if s.ole_size > limits.EMBED_BYTES:
+            s.ole = []
+        else:
+            s.ole.append(bytes(data))
+
     # ---- a shape's text and picture
     def text_field(self, s, cid, data):
         """readTextField: v6 and v11 the cell type at 7, a string field's name id at 8, a number's value at 8 and
@@ -1175,10 +1185,20 @@ class _Reader:
         return "".join(out), cut
 
     def picture(self, s) -> list:
-        """The shape's picture: an OLE object counted `object`; a DIB through officeart.dib_to_bmp to a PNG; its
+        """The shape's picture: an OLE object by embedded.Objects from its OLE data (its equation or its tables; a
+        chart left unread counted `chart`, any other `object`); a DIB through officeart.dib_to_bmp to a PNG; its
         emitted bytes charged to IMAGE_BYTES and LINE to the room (past either counted `image`)."""
         if s.ftype == 2:
-            self.ctx.skipped["object"] += 1
+            got = self.objects.load(b"".join(s.ole)) if s.ole else None
+            kind = got[0] if got else ""
+            tables = self.objects.place(got) if kind == "table" else None
+            if tables is not None:
+                return tables
+            if kind == "equation":
+                if got[2]:
+                    self.ctx.skipped["depth" if got[2] <= {"depth"} else "object"] += 1
+                return [Equation(got[1])]
+            self.ctx.skipped["chart" if kind in ("chart", "table") else "object"] += 1
             return []
         data = s.data
         if data is None:
@@ -1213,7 +1233,7 @@ class _Reader:
 # chunk type -> the _Reader method that reads it (looked up per call); _BY_CHUNK's take the chunk, the rest its data
 _HANDLERS = {0x9B: "xform", 0x9D: "xform1d", 0x85: "line", 0x0E: "text", 0x2C: "name_list", 0x2D: "listed",
              0x66: "field_list", 0xA1: "field", 0xA4: "misc", 0x94: "char_ix", 0x98: "foreign_type",
-             0x0C: "foreign_data", 0x89: "geometry", **dict.fromkeys((0x8A, 0x8B, 0x8C, 0x90, 0xA5, 0xA6, 0xC1, 0xC3),
+             0x0C: "foreign_data", 0x1F: "ole_data", 0x89: "geometry", **dict.fromkeys((0x8A, 0x8B, 0x8C, 0x90, 0xA5, 0xA6, 0xC1, 0xC3),
                                                                      "vertex")}
 _BY_CHUNK = frozenset((0x2D, 0xA1))
 
