@@ -207,6 +207,12 @@ def test_image_and_auto_alt():
     assert md(p) == "![](assets/img-001.png)\n"
     p = hwpx_doc(pic % "회사 로고", hpf_items=items, extra={"BinData/image1.png": PNG})
     assert md(p) == "![회사 로고](assets/img-001.png)\n"
+    auto = ("그림입니다.\n원본 그림의 이름: CLP000012340001.bmp\n원본 그림의 크기: 가로 1024pixel, 세로 768pixel\n"
+            "사진 찍은 날짜: 2019년 05월 21일 오후 3:25")
+    p = hwpx_doc(pic % auto, hpf_items=items, extra={"BinData/image1.png": PNG})
+    assert md(p) == "![](assets/img-001.png)\n"
+    p = hwpx_doc(pic % (auto + "\n회사 로고"), hpf_items=items, extra={"BinData/image1.png": PNG})
+    assert md(p) == "![회사 로고](assets/img-001.png)\n"
 
 
 def test_footnote():
@@ -255,6 +261,75 @@ def test_click_here_dropped():
     sec = ('<hp:p><hp:run>' + _field(3, "CLICK_HERE") + '<hp:t>여기에 입력</hp:t>' + _fend(3)
            + '<hp:t>남음</hp:t></hp:run></hp:p>')
     assert md(hwpx_doc(sec)) == "남음\n"
+
+
+def test_click_here_filled_value_kept():
+    # a filled click-here field (dirty="1") holds its value between begin and end; the guide text is only in the
+    # Direction parameter and never shows, filled or not
+    begin = ('<hp:ctrl><hp:fieldBegin id="88" type="CLICK_HERE" name="성명" editable="1" dirty="%s"><hp:parameters>'
+             '<hp:stringParam name="Direction">이름을 입력하세요</hp:stringParam></hp:parameters></hp:fieldBegin></hp:ctrl>')
+    sec = ('<hp:p><hp:run><hp:t>성명: </hp:t>' + begin + '<hp:t>%s</hp:t>' + _fend(88) + '<hp:t> 끝</hp:t></hp:run></hp:p>')
+    assert md(hwpx_doc(sec % ("1", "홍길동"))) == "성명: 홍길동 끝\n"
+    assert md(hwpx_doc(sec % ("0", "이름을 입력하세요"))) == "성명:  끝\n"
+    # a value written without the dirty mark (a form filled by a program) is not the guide text: it is kept
+    assert md(hwpx_doc(sec % ("0", "홍길동"))) == "성명: 홍길동 끝\n"
+
+
+def test_table_and_picture_captions():
+    # a table's and a picture's caption list follow the object, as hwp has them
+    cap = '<hp:caption side="%s"><hp:subList>%s</hp:subList></hp:caption>'
+    tbl = ('<hp:p><hp:run><hp:t>표 앞</hp:t><hp:tbl>' + cap % ("TOP", P("표 7. 연도별 예산"))
+           + "<hp:tr>" + _tc("구분", 0, 0) + _tc("금액", 1, 0) + "</hp:tr><hp:tr>" + _tc("인건비", 0, 1)
+           + _tc("120", 1, 1) + "</hp:tr></hp:tbl></hp:run></hp:p>")
+    items = '<opf:item id="image1" href="BinData/image1.png" media-type="image/png"/>'
+    pic = ('<hp:p><hp:run><hp:pic>' + cap % ("BOTTOM", P("그림 3. 조직도"))
+           + '<hc:img binaryItemIDRef="image1"/></hp:pic><hp:t>그림 뒤</hp:t></hp:run></hp:p>')
+    out = md(hwpx_doc(tbl + pic, hpf_items=items, extra={"BinData/image1.png": PNG}))
+    assert out == ("표 앞\n\n|구분|금액|\n|---|---|\n|인건비|120|\n\n표 7. 연도별 예산\n\n그림 뒤\n\n"
+                   "![](assets/img-001.png)\n\n그림 3. 조직도\n"), out
+    # a shape's caption is a paragraph of its own, not text run into the paragraph that holds the shape
+    rect = ('<hp:p><hp:run><hp:t>앞</hp:t><hp:rect>' + cap % ("BOTTOM", P("도형 1")) + '<hp:drawText><hp:subList>'
+            + P("상자") + '</hp:subList></hp:drawText></hp:rect></hp:run></hp:p>')
+    assert md(hwpx_doc(rect)) == "앞\n\n상자\n\n도형 1\n"
+    # any other object's caption is read too
+    video = '<hp:p><hp:run><hp:t>앞</hp:t><hp:video>' + cap % ("BOTTOM", P("동영상 1. 시연")) + '</hp:video></hp:run></hp:p>'
+    assert md(hwpx_doc(video)) == "앞\n\n동영상 1. 시연\n"
+
+
+OUTLINE = ('<hh:numbering id="1"><hh:paraHead level="1" start="1" numFormat="DIGIT">^1.</hh:paraHead>'
+           '<hh:paraHead level="2" start="1" numFormat="HANGUL_SYLLABLE">^2.</hh:paraHead>'
+           '<hh:paraHead level="3" start="1" numFormat="DIGIT">^3)</hh:paraHead>'
+           '<hh:paraHead level="4" start="1" numFormat="DIGIT"/></hh:numbering>'
+           '<hh:paraPr id="1"><hh:heading type="OUTLINE" idRef="0" level="0"/></hh:paraPr>'
+           '<hh:paraPr id="2"><hh:heading type="OUTLINE" idRef="0" level="1"/></hh:paraPr>'
+           '<hh:paraPr id="4"><hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/paragraph">'
+           '<hh:heading type="OUTLINE" idRef="0" level="2"/></hp:case><hp:default><hh:heading type="NONE" idRef="0" '
+           'level="0"/></hp:default></hp:switch></hh:paraPr>'
+           '<hh:paraPr id="5"><hh:heading type="OUTLINE" idRef="0" level="3"/></hh:paraPr>')
+
+
+def test_outline_numbers():
+    # the section's outline numbering (secPr outlineShapeIDRef) numbers its outline paragraphs, a heading in a switch
+    # too; a paragraph demoted for its length keeps the number it took, a number typed in the text is not doubled,
+    # and a level whose format is empty gives none
+    sec = ('<hp:p><hp:run><hp:secPr outlineShapeIDRef="1"/></hp:run></hp:p>' + P("사업 개요", pr="1")
+           + P("본 사업은 지역 물류 체계를 개선하기 위하여 추진하는 것으로 세부 계획은 다음과 같이 정한다.", pr="2")
+           + P("나. 추진 목표", pr="2") + P("세부 항목", pr="4") + P("번호 없음", pr="5") + P("사업 내용", pr="1"))
+    out = md(hwpx_doc(sec, OUTLINE))
+    assert out == ("# 1. 사업 개요\n\n가. 본 사업은 지역 물류 체계를 개선하기 위하여 추진하는 것으로 세부 계획은 다음과 같이 "
+                   "정한다.\n\n## 나. 추진 목표\n\n### 1) 세부 항목\n\n#### 번호 없음\n\n# 2. 사업 내용\n"), out
+    # without a section outline numbering, and in a table cell, the outline paragraphs keep their own text only
+    assert md(hwpx_doc(P("사업 개요", pr="1"), OUTLINE)) == "# 사업 개요\n"
+    cell = _tbl(_tc("x", 0, 0) + _tc("y", 1, 0), _tc("z", 0, 1) + "<hp:tc><hp:subList>" + P("칸 제목", pr="1")
+                + '</hp:subList><hp:cellAddr colAddr="1" rowAddr="1"/></hp:tc>')
+    sec = '<hp:p><hp:run><hp:secPr outlineShapeIDRef="1"/></hp:run></hp:p>' + cell
+    assert "|z|1. 칸 제목|" in md(hwpx_doc(sec, OUTLINE))
+    # the outline numbering is the section's own: a later section that names none numbers nothing
+    item = '<opf:item id="section1" href="Contents/section1.xml" media-type="application/xml"/>'
+    first = '<hp:p><hp:run><hp:secPr outlineShapeIDRef="1"/></hp:run></hp:p>' + P("첫 구역", pr="1")
+    second = '<hs:sec ' + NS + '><hp:p><hp:run><hp:secPr/></hp:run></hp:p>' + P("둘째 구역", pr="1") + '</hs:sec>'
+    out = md(hwpx_doc(first, OUTLINE, item, {"Contents/section1.xml": second}))
+    assert out == "# 1. 첫 구역\n\n# 둘째 구역\n", out
 
 
 def test_track_change_deleted():
@@ -357,24 +432,88 @@ def test_equation():
     assert "값 $\\frac{a}{b}$" in md(hwpx_doc('<hp:p><hp:run><hp:t>값 </hp:t><hp:equation><hp:script>a over b</hp:script></hp:equation></hp:run></hp:p>'))
 
 
-def test_equation_script_to_tex():
-    tex = hwpx._tex
-    assert tex("a over b") == r"\frac{a}{b}"
-    assert tex("{a+b} over {c}") == r"\frac{a+b}{c}"
-    assert tex("sqrt x") == r"\sqrt{x}"
-    assert tex("sqrt {x+1}") == r"\sqrt{x+1}"
-    assert tex("x^2 + y_1") == "x^2 + y_1"
-    assert tex("a times b le c ge d") == r"a \times b \le c \ge d"
-    assert tex("alpha + Omega + omega") == r"\alpha + \Omega + \omega"
-    assert tex("foo bar") == "foo bar"
-    assert tex("{" * 500 + "a" + "}" * 500)  # deep groups do not recurse forever
-
-
 def test_text_box():
     sec = ('<hp:p><hp:run><hp:rect><hp:drawText><hp:subList>' + P("상자 글") + '</hp:subList></hp:drawText></hp:rect>'
            '<hp:t>밖</hp:t></hp:run></hp:p>')
     out = md(hwpx_doc(sec))
     assert "상자 글" in out and "밖" in out
+
+
+# ---- inline objects
+def test_ruby_keeps_base_and_ruby_text():
+    ruby = ('<hp:dutmal posType="TOP" szRatio="0" option="0" styleIDRef="0" align="CENTER"><hp:mainText>%s</hp:mainText>'
+            '<hp:subText>%s</hp:subText></hp:dutmal>')
+    sec = '<hp:p><hp:run><hp:t>앞 </hp:t>' + ruby % ("漢字", "한자") + '<hp:t> 뒤</hp:t></hp:run></hp:p>'
+    assert md(hwpx_doc(sec)) == "앞 漢字(한자) 뒤\n"
+    sec = '<hp:p><hp:run charPrIDRef="1">' + ruby % ("본말", "") + '</hp:run></hp:p>'
+    assert md(hwpx_doc(sec, '<hh:charPr id="1"><hh:bold/></hh:charPr>')) == "**본말**\n"
+
+
+def _memo(fid, body, author=None):
+    who = f'<hp:stringParam name="Author">{author}</hp:stringParam>' if author else ""
+    return (f'<hp:ctrl><hp:fieldBegin id="{fid}" type="MEMO" editable="1" dirty="1"><hp:parameters>{who}'
+            f'<hp:integerParam name="Number">1</hp:integerParam></hp:parameters><hp:subList>{body}</hp:subList>'
+            '</hp:fieldBegin></hp:ctrl>')
+
+
+def test_memo_becomes_a_comment():
+    # a memo field's sub-list is a comment note by its author, marked after the text the memo is anchored to
+    sec = ('<hp:p><hp:run><hp:t>대상 </hp:t>' + _memo(77, P("확인 바람"), "김검토") + '<hp:t>앵커 문구</hp:t>' + _fend(77)
+           + '<hp:t> 끝</hp:t></hp:run></hp:p>')
+    doc, _ = parse(hwpx_doc(sec))
+    assert list(doc.notes) == ["cm-1"]
+    assert md(hwpx_doc(sec)) == "대상 앵커 문구[^1] 끝\n\n[^1]: Comment by 김검토: 확인 바람\n"
+    # no author; a memo whose end is missing is marked at its paragraph's end; memos and hidden comments share cm-N
+    sec = ('<hp:p><hp:run><hp:ctrl><hp:hiddenComment><hp:subList>' + P("숨은") + '</hp:subList></hp:hiddenComment>'
+           '</hp:ctrl><hp:t>가</hp:t>' + _memo(5, P("메모 둘")) + '<hp:t>나</hp:t></hp:run></hp:p>')
+    doc, _ = parse(hwpx_doc(sec))
+    assert list(doc.notes) == ["cm-1", "cm-2"]
+    assert md(hwpx_doc(sec)) == "[^1]가나[^2]\n\n[^1]: Comment: 숨은\n[^2]: Comment: 메모 둘\n"
+
+
+def test_text_art_gives_its_text():
+    art = '<hp:textart id="5" text="%s"><hp:sz width="1000" height="1000"/><hp:textartPr fontName="굴림"/></hp:textart>'
+    sec = '<hp:p><hp:run><hp:t>앞</hp:t>' + art % "글맵시 문구" + '</hp:run></hp:p>'
+    assert md(hwpx_doc(sec)) == "앞\n\n글맵시 문구\n"
+    # in a section read as a diagram it is a shape that holds its text
+    sec = R(obj("rect", 1, "상자"), obj("textart", 2, attrs=' text="표어"'), conn(9, 1, 2))
+    out = md(hwpx_doc(sec))
+    assert "표어" in out and "상자" in out, out
+
+
+def test_form_objects_give_their_value():
+    sec = ('<hp:p><hp:run><hp:t>동의 </hp:t><hp:checkBtn caption="동의함" value="CHECKED" name="c1"/><hp:t>, </hp:t>'
+           '<hp:checkBtn caption="거부" value="UNCHECKED"/><hp:t>, </hp:t><hp:radioBtn caption="남" value="CHECKED"/>'
+           '<hp:t> 지역 </hp:t><hp:comboBox name="cb" selectedValue="SEOUL"><hp:listItem displayText="부산" value="BUSAN"/>'
+           '<hp:listItem displayText="서울" value="SEOUL"/></hp:comboBox><hp:t> 이름 </hp:t><hp:edit name="e1">'
+           '<hp:text>홍길동</hp:text></hp:edit><hp:t> 목록 </hp:t><hp:listBox selectedValue="기타"/>'
+           '<hp:btn caption="제출"/></hp:run></hp:p>')
+    assert md(hwpx_doc(sec)) == "동의 ☑ 동의함, ☐ 거부, ☑ 남 지역 서울 이름 홍길동 목록 기타\n"
+    # a third state is said; a combo box with no selected value shows its one list item, as Hancom writes it
+    sec = ('<hp:p><hp:run><hp:checkBtn caption="보류" value="INDETERMINATE"/><hp:t> 지역 </hp:t>'
+           '<hp:comboBox selectedValue=""><hp:listItem displayText="" value="대전"/></hp:comboBox></hp:run></hp:p>')
+    assert md(hwpx_doc(sec)) == "☐ 보류 (indeterminate) 지역 대전\n"
+
+
+def test_ole_object_counted():
+    items = '<opf:item id="ole1" href="BinData/ole1.ole" media-type="application/ole"/>'
+    sec = ('<hp:p><hp:run><hp:t>앞</hp:t><hp:ole id="11" objectType="EMBEDDED" binaryItemIDRef="ole1">'
+           '<hp:sz width="100" height="100"/></hp:ole><hp:t>뒤</hp:t></hp:run></hp:p>')
+    p = hwpx_doc(sec, hpf_items=items, extra={"BinData/ole1.ole": b"\xd0\xcf\x11\xe0" + bytes(60)})
+    doc, ctx = parse(p)
+    assert ctx.skipped["object"] == 1, ctx.skipped
+    assert markdown.render(doc, tmp() / "a", False, ctx.skipped) == "(could not read: 1 embedded object)\n\n앞뒤\n"
+
+
+def test_equation_never_wrong_tex():
+    eq = '<hp:p><hp:run><hp:t>식 </hp:t><hp:equation><hp:script>%s</hp:script></hp:equation></hp:run></hp:p>'
+    assert md(hwpx_doc(eq % "x_i over n")) == "식 $\\frac{x_i}{n}$\n"
+    assert md(hwpx_doc(eq % "rm{kg} cdot m")) == "식 `rm{kg} cdot m`\n"
+    assert md(hwpx_doc(eq % "a`b")) == "식 $a\\,b$\n"
+    assert md(hwpx_doc(eq % "a`b over c over d")) == "식 ``a`b over c over d``\n"
+    lone = '<hp:p><hp:run><hp:equation><hp:script>%s</hp:script></hp:equation></hp:run></hp:p>'
+    assert md(hwpx_doc(lone % "sum from{i=1} to {n} x_i")) == "$$\\sum_{i=1}^n x_i$$\n"
+    assert md(hwpx_doc(lone % "a over b over c")) == "`a over b over c`\n"
 
 
 # ---- connect lines as diagrams

@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from reader.formats import hancom  # noqa: E402
-from reader.model import Bold, Break, Cell, Equation, Hidden, Link, Math, Para, Text  # noqa: E402
+from reader.model import Bold, Break, Cell, Equation, Hidden, Link, Math, Text  # noqa: E402
 
 
 def test_number_kinds():
@@ -46,13 +46,93 @@ def test_tex_moved():
     assert tex("x^2 + y_1") == "x^2 + y_1"
     assert tex("a times b le c ge d") == r"a \times b \le c \ge d"
     assert tex("alpha + Omega + omega") == r"\alpha + \Omega + \omega"
-    assert tex("foo bar") == "foo bar"
-    assert tex("{" * 500 + "a" + "}" * 500)
+    assert tex("foo baz") == "foo baz"
+    assert tex("{" * 500 + "a" + "}" * 500) is None  # past limits.TEX_DEPTH groups the script is not translated
+
+
+def test_tex_constructs():
+    tex = hancom.tex
+    # a script binds tighter than over, which takes the one unit before it and the one after it
+    assert tex("x_i over n") == r"\frac{x_i}{n}"
+    assert tex("a^2 over b_1") == r"\frac{a^2}{b_1}"
+    assert tex("1 + a over b") == r"1 + \frac{a}{b}"
+    assert tex("LEFT ( a over b RIGHT )") == r"\left( \frac{a}{b} \right)"
+    assert tex("left { x right }") == r"\left\{ x \right\}"
+    assert tex("matrix{a & b # c & d}") == r"\begin{matrix}a & b \\ c & d\end{matrix}"
+    assert tex("pmatrix{1 & 0 # 0 & 1}") == r"\begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix}"
+    assert tex("cases{1 & x>0 # 0 & x<=0}") == r"\begin{cases}1 & x>0 \\ 0 & x\le0\end{cases}"
+    assert tex("root 3 of x") == r"\sqrt[3]{x}"
+    assert tex("sum from{i=1} to {n} x_i") == r"\sum_{i=1}^n x_i"
+    assert tex("int _0 ^1 f(x) dx") == r"\int_0^1 f(x) dx"
+    assert tex("lim from {x -> 0} {sin x} over x") == r"\lim_{x \rightarrow 0} \frac{\sin x}{x}"
+    assert tex("bar x + vec {AB}") == r"\bar{x} + \overrightarrow{AB}"
+    assert tex('"kg" cdot m') == r"\text{kg} \cdot m"
+    assert tex("한글 x") == r"\text{한글} x"
+    assert tex("") == "" and tex("  ") == ""
+
+
+def test_tex_refuses_what_it_cannot_translate():
+    # None, never a guess: chained over, a font switch that reaches past its group, a line break, an operand without
+    # braces before a script or over, from/to after anything but a big operator, an unknown or mixed-case keyword, a
+    # cases with three columns, an unclosed group, a double script
+    for s in ("a over b over c", "rm{kg} cdot m", "x # y", "a & b", "sqrt x over 2", "bar x _1", "a from b",
+              "Alpha", "Over", "alphabet", "cases{a & b & c}", "x_{i", "x^2^3", "a<<b", "left < x right >"):
+        assert hancom.tex(s) is None, s
+
+
+def test_equation_inline():
+    assert hancom.equation("a over b") == Math(r"\frac{a}{b}") and hancom.equation(" ") is None
+    assert hancom.equation("a over b over c") == Text("`a over b over c`")
+    assert hancom.equation("a`b  #\n c") == Text("``a`b # c``")
+    assert hancom.code_span("`x") == "`` `x ``" and hancom.code_span("x``") == "``` x`` ```"
 
 
 def test_regexes_moved():
     assert hancom.AUTO_ALT.match("그림입니다.") and not hancom.AUTO_ALT.match("그림 설명")
     assert hancom.STYLE_HEAD.match("개요 2").group(1) == "2" and not hancom.STYLE_HEAD.match("본문")
+
+
+def test_alt_text_drops_the_automatic_description():
+    auto = "그림입니다.\r\n원본 그림의 이름: a.bmp\r\n원본 그림의 크기: 가로 10pixel, 세로 7pixel\r\n사진 찍은 날짜: 2019년"
+    assert hancom.alt_text(auto) == "" and hancom.alt_text("그림입니다.") == ""
+    assert hancom.alt_text(auto + "\n회사  로고") == "회사 로고"
+    assert hancom.alt_text("설명: 회사 로고\n둘째 줄") == "설명: 회사 로고 둘째 줄" and hancom.alt_text("") == ""
+    # only the labels Hancom writes are dropped: a line the author wrote in the same form stays
+    assert hancom.alt_text("그림입니다.\n출처: 통계청 2024") == "출처: 통계청 2024"
+    assert hancom.alt_text("그림입니다. 원본 그림의 이름: a.bmp 원본 그림의 크기: 가로 1pixel, 세로 1pixel") == ""
+    assert hancom.alt_text("그림입니다. 회사 로고") == "회사 로고"
+    assert hancom.alt_text("선입니다만 굵다") == "선입니다만 굵다" and hancom.alt_text("표입니다") == ""
+
+
+def test_props_reads_hancoms_property_string():
+    p = hancom.props("CommonSet:set:60:Name:wstring:2:c1 Caption:wstring:5:a: b  Value:int:1 Enabled:bool:1")
+    assert p == {"Name": "c1", "Caption": "a: b ", "Value": "1", "Enabled": "1"}, p
+    assert hancom.props("") == {} and hancom.props("Text") == {} and hancom.props("Text:wstring") == {}
+    assert hancom.props("Text:wstring:٣:abc") == {}
+    assert len(hancom.props("K:int:1 " * 200_000)) == 1
+    assert hancom.props("A:int:1 Text:wstring:" + "9" * 5000 + ":abc") == {"A": "1"}
+
+
+def test_button_states():
+    assert hancom.button(1, "동의") == "☑ 동의" and hancom.button(0, " 거부 ") == "☐ 거부"
+    assert hancom.button(2, "보류") == "☐ 보류 (indeterminate)" and hancom.button(1, "") == "☑"
+    assert hancom.button(0, "IP R&&D연계") == "☐ IP R&D연계" and hancom.button(1, "확인(&O)") == "☑ 확인(O)"
+
+
+def test_paragraph_writes_every_number_it_takes():
+    # an outline number leads a heading and a demoted paragraph; a numbered paragraph that is a heading by its style
+    # writes its marker; a bullet never leads a heading; an empty paragraph gives no block
+    h = hancom.paragraph([Text("제목")], "제목", 2, "가.")
+    assert h.level == 2 and h.inlines == [Text("가. "), Text("제목")]
+    assert hancom.paragraph([Text("가. 본문")], "가. 본문", 0, "가.").inlines == [Text("가. "), Text("본문")]
+    assert hancom.paragraph([Text("x")], "x", 1, None, (0, "3)", "3)")).inlines == [Text("3) "), Text("x")]
+    assert hancom.paragraph([Text("x")], "x", 1, None, (0, "-", "-")).inlines == [Text("x")]
+    item = hancom.paragraph([Text("● y")], "● y", 0, None, (1, "-", "●"))
+    assert (item.level, item.marker, item.inlines) == (1, "-", [Text("y")])
+    assert hancom.paragraph([], "", 0, "1.") is None and hancom.paragraph([Text(" ")], "", 0, "1.").inlines == [Text(" ")]
+    assert hancom.outline_marker({1: ("", "DIGIT", 1)}, {}, 0) is None
+    cnt = {}
+    assert hancom.outline_marker({1: ("^1.", "DIGIT", 1)}, cnt, 0) == "1." and cnt == {0: 1}
 
 
 def test_place_moved():
@@ -107,8 +187,6 @@ def test_paragraph_rules():
     hl = hancom.heading_level
     assert hl(2, "짧은 제목") == 2 and hl(2, "x" * 121) == 0 and hl(2, "x" * 41 + ".") == 0 and hl(0, "") == 0
     assert hl(1, "x" * 39 + ".") == 1
-    assert hancom.comment_note([Para([Text("a")])]) == [Para([Text("Comment: "), Text("a")])]
-    assert hancom.comment_note([]) == [Para([Text("Comment:")])]
     assert hancom.cut_command(r"https://e.com/a\;b;1;0") == "https://e.com/a;b"
     assert hancom.plain([Text(" a \n"), Bold([Text("b")]), Break(), Text("c ")]) == "a b c"
 

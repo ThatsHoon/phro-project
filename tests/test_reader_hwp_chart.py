@@ -418,6 +418,13 @@ def test_ole_named_twice_read_once():
     assert len(calls) == 1, calls
 
 
+def test_unread_ole_counted_at_every_placement():
+    item = envelope({"Equation Native": b"\0" * 8})
+    out, ctx = read(doc(ole_shape(1), ole_shape(2), bins=items((2, 0, 1), (2, 0, 1)), streams={"BIN0001.OLE": item}))
+    assert ctx.skipped == {"object": 2}, ctx.skipped
+    assert out == "(could not read: 2 embedded objects)\n\n앞\n\n뒤\n", out
+
+
 def test_chart_placements_charged():
     # every placement of one chart is charged against CHART_TOTAL, as in docx and pptx: a chart near CHART_CELLS placed
     # 50 times is placed while the cells stay under the cap, each one past it is counted under chart, and the render

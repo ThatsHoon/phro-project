@@ -2,12 +2,14 @@
 inline model and paragraph rules both readers build paragraphs with, and the drawing objects (`Obj`) a section's
 diagrams are written from (`diagrams`)."""
 import re
+import unicodedata
 from bisect import bisect_left
 
 from .. import diagram, limits
 from ..model import Bold, Break, Cell, Equation, Heading, Hidden, Link, ListItem, Math, NoteRef, Para, Table, Text
 
-AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다\.?$")
+AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다(?:\.\s*|\s+|$)")
+_AUTO_FIELD = re.compile(r"^(?:원본 그림의 이름|원본 그림의 크기|사진 찍은 날짜)\s*:")
 STYLE_HEAD = re.compile(r"^(?:개요|outline|heading)\s*(\d+)$", re.I)
 
 # HWP 5.0 binary numbering-format code (the index) to the hwpx numFormat name; anything else is DIGIT
@@ -21,12 +23,6 @@ _PHONETIC = "일이삼사오육칠팔구십"
 _IDEOGRAPH = "一二三四五六七八九十"
 _ROMAN = ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
           (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"))
-_GREEK = ("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi pi rho sigma "
-          "tau upsilon phi chi psi omega").split()
-_GREEK_CAP = ("Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon", "Phi", "Psi", "Omega")
-_WORDS = {"times": "\\times", "le": "\\le", "ge": "\\ge",
-          **{g: "\\" + g for g in _GREEK}, **{g: "\\" + g for g in _GREEK_CAP}}
-_TEX_DEPTH = 32
 # kind -> (first code point, how many)
 _CIRCLED = {"CIRCLED_DIGIT": (0x2460, 20), "CIRCLED_LATIN_CAPITAL": (0x24B6, 26),
             "CIRCLED_LATIN_SMALL": (0x24D0, 26), "CIRCLED_HANGUL_SYLLABLE": (0x326E, 14),
@@ -34,54 +30,327 @@ _CIRCLED = {"CIRCLED_DIGIT": (0x2460, 20), "CIRCLED_LATIN_CAPITAL": (0x24B6, 26)
 
 
 # ---- equation script to TeX
-def _operand(toks, i, depth):
-    """One operand starting at toks[i]: ((text, inner-or-None), next index)."""
-    if i >= len(toks):
-        return ("", None), i
-    if toks[i] == "{" and depth < _TEX_DEPTH:
-        items, j = _group(toks, i + 1, depth + 1)
-        inner = _join(items)
-        return ("{" + inner + "}", inner), j
-    t = toks[i]
-    return (_WORDS.get(t, t), None), i + 1
 
 
-def _group(toks, i, depth):
-    out = []
-    while i < len(toks):
-        t = toks[i]
-        i += 1
-        if t == "}":
-            if depth:
-                return out, i
-            continue
-        if t == "{" and depth < _TEX_DEPTH:
-            items, i = _group(toks, i, depth + 1)
-            inner = _join(items)
-            out.append(("{" + inner + "}", inner))
-        elif t == "over" and out and i < len(toks):
-            (den, dinner), i = _operand(toks, i, depth)
-            s, inner = out.pop()
-            out.append((f"\\frac{{{inner if inner is not None else s}}}{{{dinner if dinner is not None else den}}}", None))
-        elif t == "sqrt" and i < len(toks):
-            (s, inner), i = _operand(toks, i, depth)
-            out.append((f"\\sqrt{{{inner if inner is not None else s}}}", None))
-        else:
-            out.append((_WORDS.get(t, t), None))
-    return out, i
+def _both(names):
+    return {k: v for n, v in names.items() for k in (n, n.upper())}
 
 
-def _join(items):
-    out = ""
-    for s, _ in items:
-        out += s if not out or s in "^_" or out[-1] in "^_" else " " + s
+_GREEK = ("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi pi rho sigma "
+          "tau upsilon phi chi psi omega").split()
+_GREEK_CAP = ("Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon", "Phi", "Psi", "Omega")
+_GREEK_LATIN = {"ALPHA": "A", "BETA": "B", "EPSILON": "E", "ZETA": "Z", "ETA": "H", "IOTA": "I", "KAPPA": "K",
+                "MU": "M", "NU": "N", "RHO": "P", "TAU": "T", "CHI": "X"}
+_SYMBOLS = {
+    **{g: "\\" + g for g in _GREEK},
+    **{g: "\\" + g for g in _GREEK_CAP}, **{g.upper(): "\\" + g for g in _GREEK_CAP},
+    **{k: f"\\mathrm{{{v}}}" for k, v in _GREEK_LATIN.items()},
+    **_both({"times": "\\times", "div": "\\div", "cdot": "\\cdot", "le": "\\le", "leq": "\\le", "ge": "\\ge",
+             "geq": "\\ge", "ne": "\\ne", "neq": "\\ne", "approx": "\\approx", "equiv": "\\equiv", "sim": "\\sim",
+             "propto": "\\propto", "inf": "\\infty", "partial": "\\partial", "nabla": "\\nabla", "cdots": "\\cdots",
+             "ldots": "\\ldots", "vdots": "\\vdots", "ddots": "\\ddots", "in": "\\in", "forall": "\\forall",
+             "exist": "\\exists", "therefore": "\\therefore", "because": "\\because", "emptyset": "\\emptyset",
+             "angle": "\\angle"}),
+    "rarrow": "\\rightarrow", "larrow": "\\leftarrow", "lrarrow": "\\leftrightarrow", "uparrow": "\\uparrow",
+    "downarrow": "\\downarrow", "RARROW": "\\Rightarrow", "LARROW": "\\Leftarrow", "LRARROW": "\\Leftrightarrow",
+    "UPARROW": "\\Uparrow", "DOWNARROW": "\\Downarrow",
+    "->": "\\rightarrow", "+-": "\\pm", "-+": "\\mp", "!=": "\\ne", "<=": "\\le", ">=": "\\ge", "=>": "\\Rightarrow",
+    **{f: "\\" + f for f in ("sin cos tan cot sec csc arcsin arccos arctan sinh cosh tanh coth log ln lg exp det "
+                             "max min gcd dim ker arg").split()},
+}
+_BIG = {**_both({"sum": "\\sum", "prod": "\\prod", "coprod": "\\coprod", "int": "\\int", "dint": "\\iint",
+                 "tint": "\\iiint", "oint": "\\oint", "union": "\\bigcup", "inter": "\\bigcap"}), "lim": "\\lim"}
+_ACCENTS = _both({"bar": ("\\bar", "\\overline"), "under": ("\\underline", "\\underline"),
+                  "vec": ("\\vec", "\\overrightarrow"), "hat": ("\\hat", "\\widehat"),
+                  "tilde": ("\\tilde", "\\widetilde"), "dot": ("\\dot", "\\dot"), "ddot": ("\\ddot", "\\ddot"),
+                  "acute": ("\\acute", None), "grave": ("\\grave", None), "check": ("\\check", None),
+                  "dyad": ("\\overleftrightarrow", "\\overleftrightarrow")})
+_FONTS = _both({"rm": "\\mathrm", "it": "\\mathit", "bold": "\\mathbf"})
+_ARRAYS = _both({"matrix": "{matrix}", "pmatrix": "{pmatrix}", "bmatrix": "{bmatrix}", "dmatrix": "{vmatrix}",
+                 "cases": "{cases}", "pile": "{matrix}", "lpile": "{array}{l}", "rpile": "{array}{r}"})
+_STRUCT = _both({w: w for w in "over atop sqrt root of from to left right sup sub".split()})
+_UNSURE = ("lim smallsum smallprod smallunion smallinter odint otint lsup lsub omicron vartheta varpi varsigma varphi "
+           "varepsilon varupsilon pm mp plusminus minusplus deg prime hbar ell aleph wp imag real circ bullet oplus "
+           "ominus otimes odot odiv vee wedge cup cap subset supset superset subseteq supseteq notin owns ni cong "
+           "simeq prec succ star dagger ddagger lbrace rbrace langle rangle lceil rceil lfloor rfloor not color box "
+           "arch eqalign triangle mapsto bigcap bigcup sqcup sqcap uplus top bot perp vdash dashv models exists hom "
+           "mod lnot neg xor buildrel rel overline underline infinity leftarrow rightarrow above below scale size "
+           "alignl alignr bigg").split()
+_KNOWN = re.compile("(?:" + "|".join(sorted({k.lower() for k in (*_SYMBOLS, *_BIG, *_ACCENTS, *_FONTS, *_ARRAYS,
+                                                                 *_STRUCT, *_UNSURE) if k.isalpha() and len(k) > 1},
+                                                key=len, reverse=True)) + ")", re.I)
+_TOKEN = re.compile(r'(\s*)("[^"\n]*"|<->|->|<-|<=|>=|=>|==|!=|\+-|-\+|<<|>>|[A-Za-z][A-Za-z0-9]*|[0-9]+(?:\.[0-9]+)?'
+                    r'|[ᄀ-ᇿ㄰-㆏가-힣㐀-䶿一-鿿]+|\S)')
+_PLAIN = frozenset("+-=<>()[]|,.;:!?*/@'")
+_SCRIPTS = {"^": "sup", "sup": "sup", "_": "sub", "sub": "sub", "from": "sub", "to": "sup"}
+_DELIMS = {"(": "(", ")": ")", "[": "[", "]": "]", "|": "|", "{": "\\{", "}": "\\}"}
+_ENDS = frozenset(("}", "&", "#", "right"))
+_CONTROL = re.compile(r"\\[A-Za-z]+$")
+_CJK = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3\u3400-\u4dbf\u4e00-\u9fff]+")
+
+
+class _Fail(Exception):
+    pass
+
+
+class _U:
+    """One unit of an equation: its TeX, its scripts, whether whitespace came before it in the script."""
+    __slots__ = ("base", "sub", "sup", "sp", "kind", "inner", "bare")
+
+    def __init__(self, base, sp, kind="", inner=None, bare=False):
+        self.base, self.sub, self.sup, self.sp = base, None, None, sp
+        self.kind, self.inner, self.bare = kind, inner, bare
+
+
+def _wrap(s):
+    return s if len(s) == 1 and s.isalnum() else "{" + s + "}"
+
+
+def _render(u):
+    out = u.base if u.base or (u.sub is None and u.sup is None) else "{}"
+    if u.sub is not None:
+        out += "_" + _wrap(u.sub)
+    if u.sup is not None:
+        out += "^" + _wrap(u.sup)
     return out
 
 
-def tex(script: str) -> str:
-    toks = re.findall(r"[{}^_]|[^\s{}^_]+", script or "")
-    items, _ = _group(toks, 0, 0)
-    return _join(items)
+def _arg(u):
+    return u.inner if u.inner is not None and u.sub is None and u.sup is None else _render(u)
+
+
+def _join(units):
+    out = []
+    for u in units:
+        s = _render(u)
+        if out and s and (u.sp or (s[0].isalpha() and _CONTROL.search(out[-1]))):
+            out.append(" ")
+        if s:
+            out.append(s)
+    return "".join(out)
+
+
+class _Eq:
+    def __init__(self, script):
+        self.toks = [(t, bool(m.group(1)), _STRUCT.get(t) or _SCRIPTS.get(t))
+                     for m in _TOKEN.finditer(script) for t in (m.group(2),)]
+        self.toks.append((None, False, None))
+        self.i, self.depth = 0, 0
+
+    def peek(self):
+        return self.toks[self.i][0]
+
+    def word(self):
+        return self.toks[self.i][2]
+
+    def run(self):
+        units = self.seq(frozenset())
+        if self.peek() is not None:
+            raise _Fail
+        return _join(units)
+
+    def seq(self, stops):
+        units = []
+        while True:
+            t = self.peek()
+            if t is None or t in stops or self.word() in stops:
+                return units
+            if t in _ENDS or self.word() == "right":
+                raise _Fail
+            w = self.word()
+            if w in ("over", "atop"):
+                self.i += 1
+                if not units or units[-1].kind in ("frac", "space") or units[-1].bare:
+                    raise _Fail
+                den = self.unit()
+                if den.kind == "space" or den.bare:
+                    raise _Fail
+                num = units.pop()
+                tex = f"\\frac{{{_arg(num)}}}{{{_arg(den)}}}" if w == "over" else f"{{{_arg(num)} \\atop {_arg(den)}}}"
+                units.append(_U(tex, num.sp, "frac"))
+                continue
+            units.append(self.unit())
+
+    def unit(self):
+        if self.peek() is None:
+            raise _Fail
+        u = self.primary()
+        while (which := _SCRIPTS.get(self.word())) is not None:
+            w = self.word()
+            if u.bare or u.kind == "space" or getattr(u, which) is not None:
+                raise _Fail
+            if w in ("from", "to") and u.kind != "big":
+                raise _Fail
+            self.i += 1
+            op = self.operand()
+            setattr(u, which, _arg(op))
+        return u
+
+    def operand(self):
+        t = self.peek()
+        if t is None or t in _ENDS or self.word() in _SCRIPTS or self.word() in ("over", "atop", "of", "right"):
+            raise _Fail
+        u = self.primary()
+        if u.kind == "space":
+            raise _Fail
+        return u
+
+    def primary(self):
+        self.depth += 1
+        try:
+            if self.depth > limits.TEX_DEPTH:
+                raise _Fail
+            return self._primary()
+        finally:
+            self.depth -= 1
+
+    def _primary(self):
+        t, sp, w = self.toks[self.i]
+        if w in _SCRIPTS:
+            return _U("", sp)
+        if t == "{":
+            self.i += 1
+            inner = _join(self.seq(frozenset(("}",))))
+            if self.peek() != "}":
+                raise _Fail
+            self.i += 1
+            return _U("{" + inner + "}", sp, inner=inner)
+        if w == "sqrt":
+            self.i += 1
+            x = self.operand()
+            return _U(f"\\sqrt{{{_arg(x)}}}", sp, bare=x.inner is None)
+        if w == "root":
+            self.i += 1
+            n = self.operand()
+            if self.word() != "of":
+                raise _Fail
+            self.i += 1
+            x = self.operand()
+            return _U(f"\\sqrt[{_arg(n)}]{{{_arg(x)}}}", sp, bare=x.inner is None)
+        if w == "left":
+            self.i += 1
+            left = self.delim()
+            inner = _join(self.seq(frozenset(("right",))))
+            if self.word() != "right":
+                raise _Fail
+            self.i += 1
+            return _U(f"\\left{left} {inner} \\right{self.delim()}", sp)
+        if t in _ACCENTS:
+            self.i += 1
+            x = self.operand()
+            a = _arg(x)
+            one, wide = _ACCENTS[t]
+            cmd = one if len(a) == 1 or re.fullmatch(r"\\[A-Za-z]+", a) else wide
+            if cmd is None:
+                raise _Fail
+            return _U(f"{cmd}{{{a}}}", sp, bare=x.inner is None)
+        if t in _FONTS:
+            self.i += 1
+            x = self.operand()
+            if self.peek() is not None and self.peek() not in _ENDS and self.word() != "right":
+                raise _Fail
+            return _U(f"{_FONTS[t]}{{{_arg(x)}}}", sp)
+        if t in _ARRAYS:
+            self.i += 1
+            return _U(self.array(t), sp)
+        if w is not None or t in _ENDS:
+            raise _Fail
+        self.i += 1
+        return self.atom(t, sp)
+
+    def delim(self):
+        t = self.peek()
+        if t not in _DELIMS:
+            raise _Fail
+        self.i += 1
+        return _DELIMS[t]
+
+    def array(self, name):
+        if self.peek() != "{":
+            raise _Fail
+        self.i += 1
+        self.depth += 1
+        try:
+            if self.depth > limits.TEX_DEPTH:
+                raise _Fail
+            rows = [[]]
+            while True:
+                rows[-1].append(_join(self.seq(frozenset(("}", "&", "#")))))
+                t = self.peek()
+                if t is None:
+                    raise _Fail
+                self.i += 1
+                if t == "}":
+                    break
+                if t == "#":
+                    rows.append([])
+        finally:
+            self.depth -= 1
+        width = max(map(len, rows))
+        low = name.lower()
+        if width > (1 if low.endswith("pile") else 2 if low == "cases" else 10):
+            raise _Fail
+        env = _ARRAYS[name]
+        return (f"\\begin{env}" + " \\\\ ".join(" & ".join(r) for r in rows)
+                + f"\\end{{{env[1:].split('}')[0]}}}")
+
+    def atom(self, t, sp):
+        if t in _BIG:
+            return _U(_BIG[t], sp, "big")
+        if t in _SYMBOLS:
+            return _U(_SYMBOLS[t], sp)
+        if t == "~":
+            return _U("\\ ", sp, "space")
+        if t == "`":
+            return _U("\\,", sp, "space")
+        if t[0] == '"' and len(t) > 1:
+            body = t[1:-1]
+            if re.search(r"[\\{}$&#^_%~]", body):
+                raise _Fail
+            return _U(f"\\text{{{body}}}", sp)
+        if t[0].isascii() and t[0].isalpha():
+            if _KNOWN.match(t):
+                raise _Fail
+            return _U(t, sp)
+        if t[0].isdigit() or t in _PLAIN:
+            return _U(t, sp)
+        if t in ("%", "$"):
+            return _U("\\" + t, sp)
+        if len(t) > 1 or not t.isascii():
+            if _CJK.fullmatch(t):
+                return _U(f"\\text{{{t}}}", sp)
+            if len(t) == 1 and unicodedata.category(t)[0] in "LNSP":
+                return _U(t, sp)
+        raise _Fail
+
+
+def tex(script: str):
+    """A Hancom equation script as TeX; "" for an empty one; None when any part of it is not translated with
+    certainty."""
+    eq = _Eq(script or "")
+    if eq.peek() is None:
+        return ""
+    try:
+        return eq.run()
+    except _Fail:
+        return None
+
+
+def code_span(s: str) -> str:
+    """s on one line as a Markdown code span, fenced past the longest run of backticks in it."""
+    s = re.sub(r"\s+", " ", s).strip()
+    fence = "`" * (max(map(len, re.findall("`+", s)), default=0) + 1)
+    pad = " " if s[:1] == "`" or s[-1:] == "`" else ""
+    return f"{fence}{pad}{s}{pad}{fence}"
+
+
+def equation(script: str):
+    """An equation script as an inline: Math with its TeX, the raw script as a code span when any part of it is not
+    translated with certainty (tex), None for an empty one."""
+    t = tex(script)
+    if t == "":
+        return None
+    return Math(t) if t is not None else Text(code_span(script))
 
 
 # ---- numbering markers
@@ -149,6 +418,16 @@ def next_marker(levels: dict, counters: dict, lvl: int) -> str:
     return re.sub(r"\^(\d)", sub, fmt).strip()[:64] or "-"
 
 
+def outline_marker(levels: dict, counters: dict, lvl: int):
+    """An outline paragraph's number at `lvl` from its numbering's levels (next_marker's shapes); None, the counters
+    left as they are, when that level has no format or its format gives no number."""
+    head = levels.get(lvl + 1)
+    if not head or not head[0]:
+        return None
+    mk = next_marker(levels, counters, lvl)
+    return mk if mk != "-" else None
+
+
 # ---- the inline model
 def itext(inlines) -> str:
     """The visible text: Bold and Link opened, a Break as a space."""
@@ -195,6 +474,58 @@ def strip_marker(inlines, marker) -> bool:
     return False
 
 
+def alt_text(comment: str) -> str:
+    """A shape comment as alt text. The description Hancom writes on its own is left out: a lead such as "그림입니다."
+    and the lines it labels itself (the original picture's name and size, the date a photo was taken), on lines of
+    their own or run into the lead's line. What the author wrote is kept, its whitespace squashed."""
+    lines = [ln.strip() for ln in re.split(r"\r\n|[\r\n]", comment.replace("\0", ""))]
+    lead = AUTO_ALT.match(lines[0])
+    if lead:
+        rest = lines[0][lead.end():]
+        k = 1
+        while k < len(lines) and _AUTO_FIELD.match(lines[k]):
+            k += 1
+        lines = ["" if _AUTO_FIELD.match(rest) else rest] + lines[k:]
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def props(s: str) -> dict:
+    """Hancom's property string (a form object's, a click-here field's command) as {key: value}. Entries are
+    "Key:wstring:N:" then exactly N characters, "Key:int:V" and "Key:bool:V" up to a space, and "Key:set:N:", whose
+    members follow as entries of their own. A first key wins; an entry that cannot be read ends the string."""
+    out, pos, n = {}, 0, len(s)
+    while pos < n:
+        a = s.find(":", pos)
+        b = s.find(":", a + 1) if a >= 0 else -1
+        if b < 0:
+            break
+        key, kind = s[pos:a].strip(), s[a + 1:b]
+        pos = b + 1
+        if kind in ("set", "wstring"):
+            c = s.find(":", pos)
+            count = s[pos:c] if c >= 0 else ""
+            if not (count.isascii() and count.isdigit()) or len(count) > 5:
+                break
+            pos = c + 1
+            if kind == "set":
+                continue
+            value, pos = s[pos:pos + int(count)], pos + int(count)
+        else:
+            c = s.find(" ", pos)
+            c = n if c < 0 else c
+            value, pos = s[pos:c], c
+        out.setdefault(key, value)
+    return out
+
+
+def button(state: int, caption: str) -> str:
+    """A check box or radio button as text: its box (1 checked, 2 neither, else unchecked) and its caption, an
+    access-key mark taken out (`&&` is one ampersand, a lone `&` marks the key after it)."""
+    parts = ("☑" if state == 1 else "☐", re.sub(r"&(.?)", r"\1", caption).strip(),
+             "(indeterminate)" if state == 2 else "")
+    return " ".join(x for x in parts if x)
+
+
 def flat(blocks) -> str:
     """Blocks as one line of text (headers and footers)."""
     parts = []
@@ -213,7 +544,8 @@ def cut_command(s: str) -> str:
 
 
 class Frame:
-    """One open inline scope inside a paragraph: root, link, pass, drop or deleted."""
+    """One open inline scope inside a paragraph: root, link (to `url`), pass, drop, deleted, memo (whose note id is
+    `url`) or guide (a click-here field not marked filled, whose guide text is `url`)."""
 
     def __init__(self, kind, fid=None, url=""):
         self.kind, self.id, self.url, self.inl = kind, fid, url, []
@@ -237,13 +569,16 @@ class Scopes:
     def add(self, st, inline):
         st.frames[-1].inl.append(inline)
 
-    def push(self, st, frame):
+    def push(self, st, frame) -> bool:
         if len(st.frames) < limits.MAX_DEPTH:
             st.frames.append(frame)
+            return True
+        return False
 
     def close_to(self, st, n):
         """Close scopes until `n` are open: a link becomes a Link, a deletion Hidden, a pass gives its inlines to its
-        parent and a drop loses them."""
+        parent, a memo gives them followed by its note's mark, a guide gives them unless they are its guide text,
+        and a drop loses them."""
         while len(st.frames) > n:
             f = st.frames.pop()
             parent = st.frames[-1].inl
@@ -251,14 +586,45 @@ class Scopes:
                 parent.append(Link(f.url, f.inl))
             elif f.kind == "deleted" and f.inl:
                 parent.append(Hidden(f.inl, "deleted"))
-            elif f.kind == "pass":
+            elif f.kind in ("pass", "memo"):
                 parent.extend(f.inl)
+                if f.kind == "memo":
+                    parent.append(NoteRef(f.url))
+            elif f.kind == "guide" and plain(f.inl).strip() != f.url.strip():
+                parent.extend(f.inl)
+
+    def memo(self, st, fid, nid):
+        """A memo's begin: the text up to its end is the text the memo is marked after (at the paragraph's end
+        without one; right here past MAX_DEPTH open scopes)."""
+        if not self.push(st, Frame("memo", fid, nid)):
+            self.add(st, NoteRef(nid))
+
+    def formula(self, st, script, inline=True):
+        """An equation: inline, Math (a lone one is shown on its own, lone_equations) or its script as a code span;
+        not inline, an Equation or a paragraph of the code span after the paragraph."""
+        m = equation(script)
+        if m is None:
+            return
+        if not inline:
+            st.extras.append(Equation(m.tex, True) if isinstance(m, Math) else Para([m]))
+            return
+        if isinstance(m, Math):
+            st.eqs.append(m)
+        self.add(st, m)
+
+    def open_field(self, st, fid=None, url="", unfilled=False, guide=""):
+        """A field begin: a hyperlink with a target scopes a Link, any other field's text is kept, and a click-here
+        field not marked filled loses its text when that is its `guide` text (or when no guide text is known)."""
+        if unfilled:
+            self.push(st, Frame("guide", fid, guide) if guide.strip() else Frame("drop", fid))
+        else:
+            self.push(st, Frame("link" if url else "pass", fid, url))
 
     def close_field(self, st, ref=None):
         """A field end closes the innermost open field (the one whose id is `ref`, when given)."""
         for i in range(len(st.frames) - 1, 0, -1):
             f = st.frames[i]
-            if f.kind in ("link", "pass", "drop") and (ref is None or f.id == ref):
+            if f.kind in ("link", "pass", "drop", "memo", "guide") and (ref is None or f.id == ref):
                 self.close_to(st, i)
                 return
 
@@ -283,6 +649,36 @@ def heading_level(level: int, text: str) -> int:
     return level
 
 
+def lead(inlines, number) -> None:
+    """Write `number` before the paragraph's text, dropping a copy of it typed there."""
+    strip_marker(inlines, number)
+    inlines.insert(0, Text(number + " "))
+
+
+def paragraph(inlines, text, level, number=None, item=None):
+    """The block a paragraph reads as, by the rules both readers share; None when nothing is left.
+
+    A paragraph with text at a heading `level` is a Heading. Otherwise `item` (level, marker, a typed copy of the
+    marker to drop or None), given for a numbered or bulleted paragraph, makes it a ListItem, and anything else is a
+    Para. `number`, an outline paragraph's number, leads its heading or its paragraph; a numbered paragraph's marker
+    leads its heading, so every number the counters take is written."""
+    if level and text:
+        mark = number or (item[1] if item and item[1] != "-" else None)
+        if mark:
+            lead(inlines, mark)
+        return Heading(level, inlines)
+    if item:
+        lvl, marker, typed = item
+        if typed:
+            strip_marker(inlines, typed)
+        return ListItem(lvl, marker, inlines) if inlines else None
+    if not inlines:
+        return None
+    if number and text:
+        lead(inlines, number)
+    return Para(inlines)
+
+
 def _shown(inlines, ids, out) -> None:
     """Add to `out` the id() of every inline in `ids` that is visible: inside Bold and Link, not inside Hidden."""
     for it in inlines:
@@ -304,15 +700,6 @@ def lone_equations(inlines, eqs) -> list:
         return []
     remove(inlines, ids)
     return [Equation(o.tex, True) for o in eqs if id(o) in ids]
-
-
-def comment_note(blocks) -> list:
-    """A hidden comment's paragraphs as a note that says it is one."""
-    if blocks and isinstance(blocks[0], Para):
-        blocks[0].inlines.insert(0, Text("Comment: "))
-    else:
-        blocks.insert(0, Para([Text("Comment:")]))
-    return blocks
 
 
 # ---- table cell grid

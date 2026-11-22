@@ -6,6 +6,7 @@ ZIP_TOTAL = 2**30
 ZIP_RATIO = 200
 ZIP_RATIO_FLOOR = 2**20  # the ratio is checked only for members over 1 MiB
 MAX_DEPTH = 64
+TEX_DEPTH = 32
 MAX_OUTPUT = 20 * 10**6
 CONVERT_SECONDS = 45
 HOOK_SECONDS = 55     # the gate's whole budget, hashing included, under the 60-second hook timeout in hooks.json
