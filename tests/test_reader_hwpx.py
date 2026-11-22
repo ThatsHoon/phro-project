@@ -261,7 +261,7 @@ def test_track_change_deleted():
     sec = ('<hp:p><hp:run><hp:t>새<hp:deleteBegin Id="1"/>옛<hp:deleteEnd/>글</hp:t></hp:run></hp:p>')
     out = md(hwpx_doc(sec))
     assert out.splitlines()[0] == "(1 hidden places left out)" and "옛" not in out and "새글" in out
-    assert "(hidden: 옛)" in md(hwpx_doc(sec), hidden=True)
+    assert "(deleted: 옛)" in md(hwpx_doc(sec), hidden=True)
 
 
 CHART = ('<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea>'

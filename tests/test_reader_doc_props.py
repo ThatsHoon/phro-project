@@ -348,6 +348,23 @@ def test_hidden_places_match_docx_runs():
     assert md(r).startswith("(2 hidden places left out)")
 
 
+def sttb(names):
+    """An extended STTB (fExtend 0xFFFF, u16 cData, cbExtra 0) of UTF-16 strings, as SttbfRMark is."""
+    return u16(0xFFFF) + u16(len(names)) + u16(0) + b"".join(u16(len(s)) + s.encode("utf-16-le") for s in names)
+
+
+def test_tracked_changes_say_what_and_who():
+    INSERTED, IBST, IBST_DEL = 0x0801, 0x4804, 0x4863
+    authors = {51: sttb(["Unknown", "Kim", "Lee"])}
+    p = doc_file([("a new more old b\r", False)], fc=authors,
+                 chpx=[(2, 6, sp(INSERTED, 1) + sp(IBST, 1)), (6, 10, sp(INSERTED, 1) + sp(IBST, 1) + sp(BOLD, 1)),
+                       (11, 14, sp(DELETED, 1) + sp(IBST_DEL, 2) + sp(IBST, 2)), (15, 16, sp(INSERTED, 1) + sp(IBST, 9))])
+    assert md(p) == "(1 hidden places left out)\n\na (inserted by Kim: new **more**)  (inserted: b)\n", md(p)
+    assert md(p, hidden=True) == "a (inserted by Kim: new **more**) (deleted by Lee: old) (inserted: b)\n", md(p, True)
+    q = doc_file([("a new b\r", False)], chpx=[(2, 5, sp(INSERTED, 1) + sp(IBST, 1))])  # no SttbfRMark
+    assert md(q) == "a (inserted: new) b\n", md(q)
+
+
 def test_hidden_link_shows_no_url():
     text = "a \x13 HYPERLINK \"https://x.example\" \x14go\x15 b\r"
     p = doc_file([(text, False)], chpx=[(2, len(text) - 3, sp(DELETED, 1))])

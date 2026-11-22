@@ -88,7 +88,7 @@ def test_hidden_included():
                       Section("slide", "T", number=2, hidden="hidden"),
                       Table([[c("h")], [c("v")], [c("w")]], hidden_rows=frozenset({1}))])
     out = R(doc, hidden=True)
-    assert "(hidden) secret" in out and "(hidden: old)" in out
+    assert "(hidden) secret" in out and "(deleted: old)" in out
     assert "## Slide 2: T (hidden)" in out and "(hidden) v" in out and "hidden places" not in out
 
 

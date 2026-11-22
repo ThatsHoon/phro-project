@@ -424,8 +424,9 @@ def huge_papx(data: bytes, at: int) -> bytes | None:
 
 @dataclass(slots=True)
 class RunProps:
-    """Character properties: bold, vanish (hidden), deleted (a tracked deletion), special (fSpec: \\x01 and \\x08
-    are objects), pic (PicLocation: a Data stream offset), ole (fOle2) and obj (ObjLocation)."""
+    """Character properties: bold, vanish (hidden), deleted and inserted (tracked changes; rmark and rmark_del are
+    their authors' indices in SttbfRMark), special (fSpec: \\x01 and \\x08 are objects), pic (PicLocation: a Data
+    stream offset), ole (fOle2) and obj (ObjLocation)."""
     bold: bool = False
     vanish: bool = False
     deleted: bool = False
@@ -433,6 +434,9 @@ class RunProps:
     pic: int | None = None
     ole: bool = False
     obj: int | None = None
+    inserted: bool = False
+    rmark: int | None = None
+    rmark_del: int | None = None
 
 
 @dataclass(slots=True)
@@ -476,8 +480,9 @@ def _depth(arg: bytes) -> int:
 # The sprms the reader handles, each table the only place its handler looks an op up, so _READ (what last_sprms
 # keeps) is derived from them and cannot drift: a character toggle (ToggleOperand) -> its RunProps field; a
 # character value (u32) -> its field; a paragraph sprm -> (its ParaProps field, operand -> value).
-RUN_TOGGLES = {0x0835: "bold", 0x083C: "vanish", 0x0800: "deleted", 0x0855: "special", 0x080A: "ole"}
-RUN_VALUES = {0x6A03: "pic", 0x680E: "obj"}
+RUN_TOGGLES = {0x0835: "bold", 0x083C: "vanish", 0x0800: "deleted", 0x0801: "inserted", 0x0855: "special",
+               0x080A: "ole"}
+RUN_VALUES = {0x6A03: "pic", 0x680E: "obj", 0x4804: "rmark", 0x4863: "rmark_del"}
 PARA_SPRMS = {0x2640: ("outline", _u8), 0x2416: ("in_table", _flag), 0x2417: ("ttp", _flag),
               0x244B: ("inner_cell", _flag), 0x244C: ("inner_row", _flag), 0x6649: ("itap", _depth),
               0x260A: ("ilvl", _u8), 0x460B: ("ilfo", _uint), 0xD608: ("tdef", bytes)}

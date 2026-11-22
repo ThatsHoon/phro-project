@@ -241,7 +241,7 @@ def test_tracked_deletion():
     o = tmp() / "out"
     reader.convert(p, o, hidden=True)
     shown = (o / "out.md").read_text(encoding="utf-8")
-    assert "남은(hidden: 지운)" in shown, shown
+    assert "남은(deleted: 지운)" in shown, shown
 
 
 def test_tracked_insertion_stays():
@@ -257,7 +257,7 @@ def test_tracked_deletion_inside_runs_and_fields():
     p = make_hwp(tmp() / "t.hwp", [hwp_para("가나마")], doc_info=di, flags=1 | TRACK,
                  extra={"ViewText/Section0": view})
     assert md(p) == "(1 hidden places left out)\n\n가**나**마\n", md(p)
-    assert md(p, hidden=True) == "가**나**(hidden: **다**라)마\n", md(p, hidden=True)
+    assert md(p, hidden=True) == "가**나**(deleted: **다**라)마\n", md(p, hidden=True)
     # a hyperlink field that a deletion starts inside: the link keeps its visible part, the rest is hidden
     fffc = "￼"
     hlk = b"%hlk" + struct.pack("<I", 0) + b"\0" + struct.pack("<H", 13) + "https://e.com".encode("utf-16-le")
@@ -294,7 +294,7 @@ def test_deleted_equation_paragraph():
     out = md(p)
     assert out == "(2 hidden places left out)\n\n앞\n", out
     shown = md(p, hidden=True)
-    assert shown == "앞\n\n(hidden: 값은 $\\frac{a}{b}$ 이다)\n\n(hidden: $\\frac{a}{b}$)\n", shown
+    assert shown == "앞\n\n(deleted: 값은 $\\frac{a}{b}$ 이다)\n\n(deleted: $\\frac{a}{b}$)\n", shown
 
 
 def test_tracked_hostile_ranges():

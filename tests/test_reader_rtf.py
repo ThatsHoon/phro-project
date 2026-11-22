@@ -265,6 +265,32 @@ def test_note_inside_note_is_text_of_outer():
     assert "[^1]: outer inner tail" in out, out
 
 
+def test_starred_footnote_is_a_note():
+    out = md(rb"{\rtf1 body{\*\footnote\pard\plain{\super\chftn} star note}\par tail{\*\footnote\ftnalt\pard end}\par}")
+    assert out == "body[^1]\n\ntail[^2]\n\n[^1]: star note\n[^2]: end\n", out
+    d, _ = parse(rtf_file(rb"{\rtf1 body{\*\footnote\pard x}\par}"))
+    assert list(d.notes) == ["fn-1"]
+    assert md(rb"{\rtf1 a{\*\unknown{\*\footnote x}}b\par}") == "ab\n"  # inside text left out it stays out
+
+
+def test_annotation_is_a_comment_with_its_author():
+    data = (rb"{\rtf1 text{\*\atnid KR}{\*\atnauthor Kyle Reese}\chatn{\*\annotation{\*\atnref 0}\pard\plain"
+            rb" ANNOTATION-TEXT}\par again{\*\atnid AB}\chatn{\*\annotation\pard initials only}\par}")
+    out = md(data)
+    assert out == ("text[^1]\n\nagain[^2]\n\n[^1]: Comment by Kyle Reese: ANNOTATION-TEXT\n"
+                   "[^2]: Comment by AB: initials only\n"), out
+
+
+def test_revisions_are_insertions_and_deletions_by_their_author():
+    data = (rb"{\rtf1{\*\revtbl {Unknown;}{Kim;}{Lee;}}Track {\revised\revauth1 INSERTED }{\revised\revauth1\b more}"
+            rb"{\deleted\revauthdel2 DELETED-TEXT} end {\revised anon}\par}")
+    out = md(data)
+    assert out == "(1 hidden places left out)\n\nTrack (inserted by Kim: INSERTED **more**) end (inserted: anon)\n", out
+    shown = md(data, hidden=True)
+    assert shown == "Track (inserted by Kim: INSERTED **more**)(deleted by Lee: DELETED-TEXT) end (inserted: anon)\n", shown
+    assert md(rb"{\rtf1 a{\revised\revauth7 b}\par}") == "a(inserted: b)\n"  # an author past the table
+
+
 def test_empty_note_is_dropped():
     d, _ = parse(rtf_file(rb"{\rtf1 a{\footnote\pard }b}"))
     assert d.notes == {}

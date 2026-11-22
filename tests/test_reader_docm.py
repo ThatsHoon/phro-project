@@ -310,6 +310,20 @@ def test_vanish_and_del():
     assert "(1 hidden places left out)" in out2 and "zz" not in out2
 
 
+def test_tracked_changes_say_what_and_who():
+    body = ('<w:p><w:r><w:t xml:space="preserve">elit </w:t></w:r>'
+            '<w:ins w:id="1" w:author="Kyle Reese"><w:r><w:t xml:space="preserve">insert </w:t></w:r></w:ins>'
+            '<w:ins w:id="2" w:author="Kyle Reese"><w:r><w:rPr><w:b/></w:rPr><w:t>this</w:t></w:r></w:ins>'
+            '<w:r><w:t xml:space="preserve"> fringilla, </w:t></w:r>'
+            '<w:del w:id="3" w:author="Sarah"><w:r><w:delText xml:space="preserve">bibendum </w:delText></w:r></w:del>'
+            '<w:moveTo w:id="4" w:author="Sarah"><w:r><w:t>moved</w:t></w:r></w:moveTo>'
+            '<w:r><w:t xml:space="preserve"> est </w:t></w:r><w:ins w:id="5"><w:r><w:t>anon</w:t></w:r></w:ins></w:p>')
+    p = docm(body)
+    assert md(p) == ("(1 hidden places left out)\n\nelit (inserted by Kyle Reese: insert **this**) fringilla, "
+                     "(inserted by Sarah: moved) est (inserted: anon)\n"), md(p)
+    assert "fringilla, (deleted by Sarah: bibendum )(inserted by Sarah: moved)" in md(p, hidden=True), md(p, hidden=True)
+
+
 def test_sdt_placeholder_dropped():
     sdt = ('<w:sdt><w:sdtPr><w:showingPlcHdr/></w:sdtPr><w:sdtContent>' + P("여기에 입력") + '</w:sdtContent></w:sdt>'
            '<w:sdt><w:sdtPr/><w:sdtContent>' + P("채움") + '</w:sdtContent></w:sdt>'

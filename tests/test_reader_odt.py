@@ -195,7 +195,26 @@ def test_tracked_deletion():
     p = odt_doc(body)
     out = md(p)
     assert "(1 hidden places left out)" in out and "옛말" not in out and "kim" not in out and "새말" in out
-    assert "(hidden: 옛말)" in md(p, hidden=True)
+    assert "(deleted by kim: 옛말)" in md(p, hidden=True)
+
+
+def test_tracked_changes_sit_at_their_place_with_their_author():
+    info = '<office:change-info><dc:creator>{}</dc:creator><dc:date>2026-01-01T00:00:00</dc:date></office:change-info>'
+    body = ('<text:tracked-changes>'
+            f'<text:changed-region text:id="ct1"><text:insertion>{info.format("Kim")}</text:insertion></text:changed-region>'
+            f'<text:changed-region text:id="ct2"><text:deletion>{info.format("Lee")}<text:p>old words</text:p>'
+            '</text:deletion></text:changed-region>'
+            f'<text:changed-region text:id="ct3"><text:insertion>{info.format("Kim")}</text:insertion></text:changed-region>'
+            '</text:tracked-changes>'
+            + P('new <text:change-start text:change-id="ct1"/>added<text:s/>text<text:change-end text:change-id="ct1"/>'
+                ' and <text:change text:change-id="ct2"/>end')
+            + P('a <text:span text:style-name="B"><text:change-start text:change-id="ct3"/>bold</text:span>')
+            + P('carried<text:change-end text:change-id="ct3"/> z'))
+    p = odt_doc(body, auto_styles='<style:style style:name="B" style:family="text">'
+                                  '<style:text-properties fo:font-weight="bold"/></style:style>')
+    assert md(p) == ("(1 hidden places left out)\n\nnew (inserted by Kim: added text) and end\n\n"
+                     "a (inserted by Kim: **bold**)\n\n(inserted by Kim: carried) z\n"), md(p)
+    assert "and (deleted by Lee: old words)end" in md(p, hidden=True), md(p, hidden=True)
 
 
 def test_page_fields_dropped():

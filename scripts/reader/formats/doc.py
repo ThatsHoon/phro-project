@@ -13,8 +13,9 @@ and the pair is joined only when a Text is built.
 Formatting (doc_fib's FKPs, Prms and Styles) is mapped to CPs through the pieces once, then the walk takes a story as
 segments of constant character properties: st.run is the segment's RunProps, so text, breaks and every handler see
 the properties of their own CP. A paragraph's properties are its mark's: the PAPX whose FC range holds the mark's FC.
-Bold text is Bold; vanished and deleted text are Hidden(..., "hidden") and Hidden(..., "deleted"), the shapes the docx
-reader gives w:vanish runs and w:del. Damaged formatting is counted under styles and never costs text.
+Bold text is Bold; vanished and deleted text are Hidden(..., "hidden") and Hidden(..., "deleted"), inserted text
+(sprmCFRMarkIns) an Inserted, the shapes the docx reader gives w:vanish runs, w:del and w:ins; a change's author is
+SttbfRMark's entry sprmCIbstRMark (sprmCIbstRMarkDel for a deletion, when set) names. Damaged formatting is counted under styles and never costs text.
 
 A paragraph in a list (sprmPIlfo) is a ListItem with doc_fib.Lists' marker, as the docx reader makes w:numPr ones.
 Paragraphs with a table depth (sprmPFInTable, sprmPItap) are grouped into tables as their marks come (MS-DOC
@@ -65,10 +66,10 @@ from .. import diagram, images, limits, officeart
 from ..containers import flate
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import IMAGE_BYTES, ReadError
-from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
+from ..model import Bold, Break, Cell, Doc, Heading, Hidden, Image, Inserted, Link, ListItem, NoteRef, Para, Table, Text
 from . import cfb_route, doc_fib, doc_objects, doc_pictures, zip_route
 from .hancom import flat, lone_equations
-from .word_fields import MAX_INSTR, comment_note, hyperlink_url
+from .word_fields import MAX_INSTR, MAX_NAME, comment_note, hyperlink_url
 
 _ZIP = b"PK\x03\x04"
 _RTF = b"{\\rtf"
@@ -81,7 +82,7 @@ _HUGE_PAPX = 0x6646
 _PLAIN = doc_fib.RunProps()
 
 # FibRgFcLcb97 indices of the stories' PLCs (MS-DOC 2.5.6) and GrpXstAtnOwners
-_HDD, _ATN_OWNERS, _TXBX, _HDR_TXBX = 11, 36, 56, 58
+_HDD, _ATN_OWNERS, _RMARK, _TXBX, _HDR_TXBX = 11, 36, 51, 56, 58
 # the note stories: story, id prefix, Ref and Txt PLC indices (PlcffndRef/Txt, PlcfendRef/Txt, PlcfandRef/Txt), the
 # size of a Ref data element (an FRD, or an ATRDPre10: xstUsrInitl, then ibst u16 at 20) and the kind a loss counts as
 _NOTES = (("footnote", "fn", 2, 3, 2, "footnotes"), ("endnote", "en", 46, 47, 2, "footnotes"),
@@ -144,7 +145,7 @@ def _shown(inlines) -> bool:
         if isinstance(it, Text):
             if it.text.strip():
                 return True
-        elif isinstance(it, (Bold, Link)) and _shown(it.inlines):
+        elif isinstance(it, (Bold, Link, Inserted)) and _shown(it.inlines):
             return True
     return False
 
@@ -310,6 +311,7 @@ class _Reader:
         self.glue = None      # connector spid -> (start spid, end spid), the first rule naming it winning; read once
         self.ends = set()     # the spids the connector rules name
         self.slotted = False  # whether the main story holds a _Slot
+        self.rmarks = None    # SttbfRMark's names, once read
 
     # ---- streams
     def stream(self, name) -> bytes:
@@ -380,6 +382,26 @@ class _Reader:
             out.append(raw[pos + 2:end].decode("utf-16-le", "replace"))
             pos = end
         return out
+
+    def rmark(self, ibst) -> str:
+        """The author SttbfRMark names at `ibst` (an extended STTB: 0xFFFF, u16 cData, u16 cbExtra, then a u16 count
+        and UTF-16 units a name, MS-DOC 2.9.274), "" past it or without one. Read once, names past an STTB that does
+        not fit left out."""
+        if self.rmarks is None:
+            self.rmarks = []
+            fc, lcb = self.fib.pair(_RMARK)
+            raw = self.table[fc:fc + lcb] if lcb and fc + lcb <= len(self.table) else b""
+            if len(raw) >= 6 and raw[:2] == b"\xff\xff":
+                n, extra = struct.unpack_from("<HH", raw, 2)
+                pos = 6
+                while len(self.rmarks) < n and pos + 2 <= len(raw):
+                    end = pos + 2 + 2 * struct.unpack_from("<H", raw, pos)[0]
+                    if end + extra > len(raw):
+                        break
+                    name = _C0.sub(" ", raw[pos + 2:end].decode("utf-16-le", "replace"))
+                    self.rmarks.append(" ".join(name.split())[:MAX_NAME])
+                    pos = end + extra
+        return self.rmarks[ibst] if ibst is not None and ibst < len(self.rmarks) else ""
 
     def storyless(self, name, kind, entries):
         """Story `name` has text (ccp > 0) but its PLCs hold no entry (`entries` false: left out, lcb 0, or empty), so
@@ -700,17 +722,24 @@ class _Reader:
 
     def add(self, st, inline):
         """An inline into the open scope under the segment's properties: vanished goes into a Hidden, one per CHPX
-        run (as one w:r with w:vanish is in docx); deleted into a Hidden("deleted") that the deletion's next runs join
-        (as one w:del is)."""
+        run (as one w:r with w:vanish is in docx); deleted into a Hidden("deleted") and inserted into an Inserted
+        that the change's next runs by the same author join (as one w:del or w:ins is)."""
         inl = st.frames[-1].inl
         run = st.run
-        if run.deleted or run.vanish:
-            kind = "deleted" if run.deleted else "hidden"
+        if run.deleted or run.vanish or run.inserted:
+            if run.deleted:
+                box = Hidden([], "deleted", self.rmark(run.rmark_del if run.rmark_del is not None else run.rmark))
+            elif run.vanish:
+                box = Hidden([])
+            else:
+                box = Inserted([], self.rmark(run.rmark))
             h = st.hid
-            if inl and inl[-1] is h and h.kind == kind and (run.deleted or st.hid_seg == st.seg):
+            if inl and inl[-1] is h and type(h) is type(box) and getattr(h, "kind", "") == getattr(box, "kind", "") \
+                    and h.author == box.author and (not run.vanish or run.deleted or st.hid_seg == st.seg):
                 h.inlines.append(inline)
                 return
-            inline = st.hid = Hidden([inline], kind)
+            box.inlines.append(inline)
+            inline = st.hid = box
             st.hid_seg = st.seg
         inl.append(inline)
 

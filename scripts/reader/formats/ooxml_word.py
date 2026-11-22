@@ -10,13 +10,13 @@ import re
 from .. import diagram, limits
 from ..containers.zipx import attr, kids, local
 from ..limits import IMAGE_BYTES, ReadError
-from ..model import (Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Link, ListItem, Math, NoteRef, Para,
-                     Table, Text)
+from ..model import (Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Inserted, Link, ListItem, Math, NoteRef,
+                     Para, Table, Text)
 from . import omml, ooxml_base, smartart
 from .drawingml import Xf, arrows, glue, kid, kind, rule, xfrm
 from .ooxml_base import int_of as _int, is_on as _on, val as _val
 from .ooxml_styles import Numbering, Styles, numpr
-from .word_fields import MAX_INSTR, MAX_URL, comment_note, hyperlink_url
+from .word_fields import MAX_INSTR, MAX_NAME, MAX_URL, comment_note, hyperlink_url
 
 MAX_COLS = 1_000
 MAX_ALT = 200
@@ -33,11 +33,15 @@ def _itext(inlines) -> str:
     for it in inlines:
         if isinstance(it, Text):
             out += it.text
-        elif isinstance(it, (Bold, Link)):
+        elif isinstance(it, (Bold, Link, Inserted)):
             out += _itext(it.inlines)
         elif isinstance(it, Break):
             out += " "
     return out
+
+
+def _author(el) -> str:
+    return re.sub(r"\s+", " ", attr(el, "author") or "").strip()[:MAX_NAME]
 
 
 def _flat(blocks) -> str:
@@ -51,10 +55,10 @@ def _flat(blocks) -> str:
 
 
 class _Frame:
-    """One open inline scope inside a paragraph: root, link, deleted or hidden."""
+    """One open inline scope inside a paragraph: root, link, inserted, deleted or hidden; a change's author."""
 
-    def __init__(self, kind, url=""):
-        self.kind, self.url, self.inl = kind, url, []
+    def __init__(self, kind, url="", author=""):
+        self.kind, self.url, self.author, self.inl = kind, url, author, []
 
 
 class _State:
@@ -276,8 +280,10 @@ class _Reader:
             parent = st.frames[-1].inl
             if f.kind == "link":
                 parent.append(Link(f.url, f.inl))
+            elif f.kind == "inserted":
+                parent.append(Inserted(f.inl, f.author))
             elif f.kind == "deleted":
-                parent.append(Hidden(f.inl, "deleted"))
+                parent.append(Hidden(f.inl, "deleted", f.author))
             elif f.kind == "hidden":
                 parent.append(Hidden(f.inl))
 
@@ -406,7 +412,9 @@ class _Reader:
                 for c in el:
                     self.node(c, st, d + 1)
         elif n in ("del", "moveFrom"):
-            self.scoped(st, el, d, _Frame("deleted"))
+            self.scoped(st, el, d, _Frame("deleted", author=_author(el)))
+        elif n in ("ins", "moveTo"):
+            self.scoped(st, el, d, _Frame("inserted", author=_author(el)))
         elif n == "sdt":
             for c in self.sdt_content(el):
                 self.node(c, st, d + 1)

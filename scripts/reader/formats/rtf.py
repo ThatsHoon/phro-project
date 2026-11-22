@@ -39,17 +39,20 @@ paragraph being built and its own open fields, so a note or a header never ends 
   `제목 N`, or based on one, the `\\sbasedon` chain walked iteratively, memoized and cut at 32 steps. A heading's
   bold is dropped.
 * The `\\*` rule: `\\*` counts only as the first token after `{`. That group leaves its text out unless its destination
-  is one this reader handles (fldinst, listtext, pntext, shppict, shptxt, nesttableprops). Leaving text out is a flag
-  on the group, not a skip to its close: a handled destination inside (a shape's text inside its instructions, an
+  is one this reader handles (fldinst, listtext, pntext, shppict, shptxt, nesttableprops, footnote, annotation).
+  Leaving text out is a flag on the group, not a skip to its close: a handled destination inside (a shape's text inside its instructions, an
   object's result) switches text on again.
 * Unicode: `\\uN` adds 65536 to a negative N; a high and a low surrogate combine, a lone one is U+FFFD. `\\ucN` is
   clamped to 0..10 and kept per group. After `\\u` the next N text bytes or `\\'hh` units are skipped; the skip ends
   at a brace or any other control word.
 * Hidden: `\\v` and `\\v0` runs are Hidden inlines. Their bytes still feed the skip and the pending decoder.
+* Tracked changes: `\\deleted` runs are a Hidden of kind "deleted", `\\revised` runs an Inserted, each with the author
+  the `\\revtbl` (entries ended by `;`) has at `\\revauthdelN` (a deletion's, else `\\revauthN`) or `\\revauthN`.
 * Notes: `{\\footnote ...}` is a NoteRef at its place and a block list in `Doc.notes`, the id `fn-N`; `\\ftnalt` makes it
   an endnote, `en-N`. The note's own `\\chftn` is dropped, so the number shows once at the reference and once at the
   definition. A note inside a note, or in a header, is read as text of the outer story. Past 10,000 notes the rest
-  are counted under `note`.
+  are counted under `note`. A comment (`\\annotation`) is a note `cm-N` as `word_fields.comment_note` writes it, its
+  author the `\\atnauthor` before it, else its `\\atnid` initials.
 * Fields: a HYPERLINK instruction wraps the field's result in a Link; any other field gives its result. Fields nest
   32 deep; a field past that keeps its result text and is counted under `depth`.
 * Depth: groups past 1,000 deep are skipped to their matching close, counted once under `depth` for each run.
@@ -69,12 +72,12 @@ import re
 from .. import images, limits
 from ..containers.cfb import Compound, is_cfb
 from ..limits import ReadError
-from ..model import Bold, Break, Doc, Heading, Hidden, Image, Link, ListItem, NoteRef, Para, Table, Text
+from ..model import Bold, Break, Doc, Heading, Hidden, Image, Inserted, Link, ListItem, NoteRef, Para, Table, Text
 from ..officeart import dib_to_bmp
 from .rtf_lex import BIN, CLOSE, HEX, OPEN, SYM, TEXT, WORD, Pending, codec, tokens
 from . import zip_route
 from .rtf_table import Tables
-from .word_fields import MAX_INSTR, hyperlink_url
+from .word_fields import MAX_INSTR, MAX_NAME, comment_note, hyperlink_url
 
 MAX_GROUPS = 1_000      # groups nested deeper than this are skipped to their close
 MAX_FIELDS = 32         # fields nested deeper than this give their result and no link
@@ -99,7 +102,7 @@ _NONHEX = re.compile(rb"[^0-9a-fA-F]")
 _SKIP = frozenset((
     "fonttbl", "colortbl", "stylesheet", "info", "object", "ftnsep", "ftnsepc", "aftnsep", "aftnsepc",
     "xmlnstbl", "themedata", "colorschememapping", "datastore", "latentstyles", "listtable", "listoverridetable",
-    "rsidtbl", "generator", "filetbl", "revtbl", "datafield", "bkmkend", "annotation", "atnid", "atnauthor",
+    "rsidtbl", "generator", "filetbl", "revtbl", "datafield", "bkmkend",
     "template", "defchp", "defpap", "panose", "falt", "objdata", "blipuid", "nonshppict", "wgrffmtfilter",
     "pgdsctbl", "docvar", "sp", "sn", "sv", "shpinst", "background", "userprops", "operator", "author", "title",
     "subject", "keywords", "doccomm", "creatim", "revtim", "printim", "bkmkstart",
@@ -126,17 +129,20 @@ _UNREAD = ("wbitmap", "pmmetafile")
 
 class _Group:
     """The state a `{` copies and a `}` restores."""
-    __slots__ = ("font", "uc", "bold", "hidden", "dest", "suppress", "cap", "sty", "outline",
-                 "in_table", "itap", "ilvl", "ls")
+    __slots__ = ("font", "uc", "bold", "hidden", "ins", "dele", "auth", "auth_del", "dest", "suppress", "cap", "sty",
+                 "outline", "in_table", "itap", "ilvl", "ls")
 
     def __init__(self):
         self.font = None      # \fN, None until set (the \deff font then)
         self.uc = 1           # \ucN: the bytes a \u fallback takes
         self.bold = False
         self.hidden = False   # \v
+        self.ins = self.dele = False
+        self.auth = self.auth_del = None
         self.dest = ""        # the last destination word seen here or in a parent
         self.suppress = False  # text is left out
-        self.cap = ""         # "fldinst", "title", "style", "list" or "pict": text is captured there, even when suppressed
+        self.cap = ""         # "fldinst", "title", "style", "list", "pict", "revtbl", "atnid" or "atnauthor": text is
+                              # captured there, even when suppressed
         self.sty = None       # \sN of the paragraph
         self.outline = None   # \outlinelevelN of the paragraph
         self.in_table = False  # \intbl
@@ -147,6 +153,7 @@ class _Group:
     def clone(self):
         n = _Group.__new__(_Group)
         n.font, n.uc, n.bold, n.hidden = self.font, self.uc, self.bold, self.hidden
+        n.ins, n.dele, n.auth, n.auth_del = self.ins, self.dele, self.auth, self.auth_del
         n.dest, n.suppress, n.cap, n.sty, n.outline = self.dest, self.suppress, self.cap, self.sty, self.outline
         n.in_table, n.itap, n.ilvl, n.ls = self.in_table, self.itap, self.ilvl, self.ls
         return n
@@ -175,11 +182,11 @@ class _Field:
 class _Story:
     """Where text goes: the body, a note, a header or a footer, with its paragraph under way and its open fields."""
     __slots__ = ("kind", "depth", "cur", "has", "pars", "fields", "blocks", "ref", "alt", "tbl", "mark", "mark_len",
-                 "extras", "kept", "pard")
+                 "extras", "kept", "pard", "author")
 
     def __init__(self, kind, depth):
         self.kind, self.depth = kind, depth
-        self.cur = []        # (hidden, bold, text) runs, and finished inlines
+        self.cur = []        # (hidden, bold, inserted, text) runs (see look), and finished inlines
         self.has = False     # the paragraph has something to show
         self.pars = 0        # paragraphs ended so far: a field that began in an earlier one starts at 0 in cur
         self.fields = []
@@ -192,6 +199,7 @@ class _Story:
         self.extras = []     # Images of the paragraph under way
         self.kept = None     # (sty, outline, ls, ilvl) a group closed inside the paragraph under way left to it
         self.pard = False    # a \pard came after the story's last \row: an empty paragraph then ends the table
+        self.author = None   # a comment's author: a note story with one is an annotation
 
 
 def _plain(inlines) -> str:
@@ -199,7 +207,7 @@ def _plain(inlines) -> str:
     for it in inlines:
         if isinstance(it, Text):
             out.append(it.text)
-        elif isinstance(it, (Bold, Link)):
+        elif isinstance(it, (Bold, Link, Inserted)):
             out.append(_plain(it.inlines))
         elif isinstance(it, Break):
             out.append(" ")
@@ -230,7 +238,7 @@ def _edge(inlines, first):
             k += 1
             continue
         t = it
-        if isinstance(it, Bold):
+        if isinstance(it, (Bold, Inserted)):
             if not it.inlines:
                 k += 1
                 continue
@@ -251,40 +259,46 @@ def _edge(inlines, first):
 
 
 def _build(items) -> list:
-    """Inlines from a story's pending items: adjacent runs of one look merge, consecutive hidden runs are one Hidden."""
-    out, hid, run = [], None, None  # run: [hidden, bold, parts]
+    """Inlines from a story's pending items: adjacent runs of one look merge; consecutive hidden runs of one kind and
+    author are one Hidden, consecutive inserted runs of one author one Inserted."""
+    out, box, run = [], None, None  # run: [hidden, bold, inserted, parts]; box: the open Hidden or Inserted
     for it in items:
         if type(it) is tuple:
-            if run is not None and run[0] == it[0] and run[1] == it[1]:
-                run[2].append(it[2])
+            if run is not None and run[0] == it[0] and run[1] == it[1] and run[2] == it[2]:
+                run[3].append(it[3])
                 continue
             if run is not None:
-                hid = _put_run(out, run, hid)
-            run = [it[0], it[1], [it[2]]]
+                box = _put_run(out, run, box)
+            run = [it[0], it[1], it[2], [it[3]]]
         else:
             if run is not None:
-                _put_run(out, run, hid)
+                _put_run(out, run, box)
                 run = None
-            hid = None
+            box = None
             out.append(it)
     if run is not None:
-        _put_run(out, run, hid)
+        _put_run(out, run, box)
     return out
 
 
-def _put_run(out, run, hid):
-    h, b, parts = run
+def _put_run(out, run, box):
+    h, b, ins, parts = run
     inl = Text("".join(parts))
     if b:
         inl = Bold([inl])
-    if not h:
+    if h:
+        if not (isinstance(box, Hidden) and (box.kind, box.author) == h):
+            box = Hidden([], *h)
+            out.append(box)
+    elif ins is not None:
+        if not (isinstance(box, Inserted) and box.author == ins):
+            box = Inserted([], ins)
+            out.append(box)
+    else:
         out.append(inl)
         return None
-    if hid is None:
-        hid = Hidden([])
-        out.append(hid)
-    hid.inlines.append(inl)
-    return hid
+    box.inlines.append(inl)
+    return box
 
 
 class _Reader:
@@ -315,7 +329,11 @@ class _Reader:
         # cost the same), so one legitimate table of more than TABLE_NODES cells is cut and counted under "cells" once.
         # Kept per document on purpose (ruled): a limit per table would let a file of many tables grow without bound.
         self.budget = [limits.TABLE_NODES]
-        self.n_notes = {"fn": 0, "en": 0}
+        self.n_notes = {"fn": 0, "en": 0, "cm": 0}
+        self.revs = []         # the revision table's text: its authors, each ended by ";"
+        self.revs_len = 0
+        self.authors = None    # the revision table's authors, once read
+        self.atn = {"atnid": [], "atnauthor": []}  # the next comment's initials and author
         self.body = _Story("body", 0)
         self.stories = [self.body]
         self.story = self.body
@@ -487,6 +505,14 @@ class _Reader:
             elif cap == "title":
                 if sum(map(len, self.title)) < MAX_TITLE:
                     self.title.append(s)
+            elif cap == "revtbl":
+                if self.revs_len < MAX_STYLES * MAX_NAME:
+                    self.revs.append(s)
+                    self.revs_len += len(s)
+            elif cap in self.atn:
+                parts = self.atn[cap]
+                if sum(map(len, parts)) < MAX_NAME:
+                    parts.append(s)
             elif cap == "list":
                 story = self.story
                 if story.mark_len < MAX_MARK:
@@ -500,9 +526,30 @@ class _Reader:
                 if not s:
                     return
             story = self.story
-            story.cur.append((g.hidden, g.bold, s))
+            story.cur.append((*self.look(), s))
             if not story.has and not s.isspace():
                 story.has = True
+
+    def look(self):
+        """The current group's (hidden, bold, inserted) for a run: hidden is None or a Hidden's (kind, author), a
+        deletion first; inserted is None or the insertion's author."""
+        g = self.g
+        if g.dele:
+            return ("deleted", self.author(g.auth_del if g.auth_del is not None else g.auth)), g.bold, None
+        if g.hidden:
+            return ("hidden", ""), g.bold, None
+        return None, g.bold, self.author(g.auth) if g.ins else None
+
+    def author(self, n) -> str:
+        """Entry n of the revision table, "" when it has none."""
+        if self.authors is None:
+            self.authors = [" ".join(a.split())[:MAX_NAME] for a in "".join(self.revs).split(";")[:-1]][:MAX_STYLES]
+        return self.authors[n] if n is not None and 0 <= n < len(self.authors) else ""
+
+    def why_hidden(self) -> str:
+        """The `hidden` of a break, a note mark or a picture written now: "deleted", "hidden" or ""."""
+        g = self.g
+        return "deleted" if g.dele else "hidden" if g.hidden else ""
 
     def add(self, inline):
         """A finished inline (a break, a note reference) into the current story."""
@@ -540,19 +587,23 @@ class _Reader:
         elif name in _LINE_WORDS:
             g = self.g
             if not g.suppress and not g.cap:
-                self.add(Break(hidden="hidden" if g.hidden else ""))
+                self.add(Break(hidden=self.why_hidden()))
         elif name in _HEADERS:
             self.header(_HEADERS[name])
         elif name in _SKIP:
             g = self.g
             g.suppress, g.dest = True, name
-            g.cap = "title" if name == "title" and self.stack and self.stack[-1].dest == "info" else ""
+            g.cap = "title" if name == "title" and self.stack and self.stack[-1].dest == "info" else \
+                "revtbl" if name == "revtbl" else ""
             if name == "stylesheet":
                 self.ss_depth = len(self.stack)
 
     def handlers(self):
         return {
             "u": self.w_u, "uc": self.w_uc, "f": self.w_f, "b": self.w_b, "v": self.w_v, "plain": self.w_plain,
+            "revised": self.w_revised, "deleted": self.w_deleted, "revauth": self.w_revauth,
+            "revauthdel": self.w_revauthdel, "atnid": self.w_capture("atnid"), "atnauthor": self.w_capture("atnauthor"),
+            "annotation": self.w_annotation,
             "pard": self.w_pard, "s": self.w_s, "sbasedon": self.w_sbasedon, "outlinelevel": self.w_outline,
             "ansicpg": self.w_ansicpg, "deff": self.w_deff,
             "fcharset": self.w_fcharset, "cpg": self.w_cpg,
@@ -607,9 +658,22 @@ class _Reader:
     def w_v(self, p, fresh):
         self.g.hidden = p != 0
 
+    def w_revised(self, p, fresh):
+        self.g.ins = p != 0
+
+    def w_deleted(self, p, fresh):
+        self.g.dele = p != 0
+
+    def w_revauth(self, p, fresh):
+        self.g.auth = p
+
+    def w_revauthdel(self, p, fresh):
+        self.g.auth_del = p
+
     def w_plain(self, p, fresh):
         g = self.g
-        g.bold = g.hidden = False
+        g.bold = g.hidden = g.ins = g.dele = False
+        g.auth = g.auth_del = None
         g.font = None  # the \deff font again
 
     def w_pard(self, p, fresh):
@@ -820,7 +884,7 @@ class _Reader:
             self.ctx.skipped["image"] += 1
             return
         self.img_total += len(data)
-        self.story.extras.append(Image(data, hidden="hidden" if g.hidden else ""))
+        self.story.extras.append(Image(data, hidden="deleted" if g.dele else "hidden" if g.hidden else ""))
 
     # ---- paragraphs
     def par(self):
@@ -961,15 +1025,38 @@ class _Reader:
 
     # ---- notes, headers and footers
     def w_footnote(self, p, fresh):
+        self.note(fresh, None)
+
+    def w_annotation(self, p, fresh):
+        atn = self.atn
+        author = "".join(atn["atnauthor"]).strip() or "".join(atn["atnid"]).strip()
+        atn["atnid"], atn["atnauthor"] = [], []
+        self.note(fresh, " ".join(author.split())[:MAX_NAME])
+
+    def w_capture(self, name):
+        def capture(p, fresh):
+            g = self.g
+            g.suppress, g.dest, g.cap = True, name, name
+            self.atn[name] = []
+        return capture
+
+    def note(self, fresh, author):
+        """A footnote, or a comment by `author` (a str): `{\\*\\footnote` and `{\\*\\annotation` are read as the plain
+        destinations are, unless their group is inside text that is left out."""
         g = self.g
+        if fresh == 2:
+            g.suppress = self.stack[-1].suppress if self.stack else False
         if g.suppress or g.cap or self.story.kind != "body":
+            if author is not None or fresh == 2:
+                g.suppress = True  # a comment, or a starred note, inside a note or a header is left out
             return  # inside a note or a header the text stays part of the outer story
         if len(self.doc.notes) >= MAX_NOTES:
             self.ctx.skipped["note"] += 1
             g.suppress = True
             return
         story = _Story("note", len(self.stack))
-        story.ref = NoteRef("", hidden="hidden" if g.hidden else "")
+        story.ref = NoteRef("", hidden=self.why_hidden())
+        story.author = author
         self.add(story.ref)
         self.stories.append(story)
         self.story = story
@@ -1001,10 +1088,10 @@ class _Reader:
                 return
             if not ref.hidden and _all_hidden(story.blocks):
                 ref.hidden = "hidden"  # a note whose whole text is hidden follows the hidden rule: so does its mark
-            prefix = "en" if story.alt else "fn"
+            prefix = "cm" if story.author is not None else "en" if story.alt else "fn"
             self.n_notes[prefix] += 1
             ref.id = f"{prefix}-{self.n_notes[prefix]}"
-            self.doc.notes[ref.id] = story.blocks
+            self.doc.notes[ref.id] = story.blocks if story.author is None else comment_note(story.blocks, story.author)
             return
         text = " ".join(t for t in map(_text, story.blocks) if t)
         lines = self.doc.headers if story.kind == "header" else self.doc.footers

@@ -194,13 +194,13 @@ def test_hidden_reference_matches_docx():
     # a w:footnoteReference in a w:vanish run or in w:del
     fn = (f'<w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p><w:r><w:footnoteRef/>'
           '<w:t xml:space="preserve"> 주석</w:t></w:r></w:p></w:footnote></w:footnotes>')
-    for op, wrap in ((VANISH, '<w:r><w:rPr><w:vanish/></w:rPr><w:footnoteReference w:id="1"/></w:r>'),
-                     (DELETED, '<w:del><w:r><w:footnoteReference w:id="1"/></w:r></w:del>')):
+    for op, wrap, why in ((VANISH, '<w:r><w:rPr><w:vanish/></w:rPr><w:footnoteReference w:id="1"/></w:r>', "hidden"),
+                          (DELETED, '<w:del><w:r><w:footnoteReference w:id="1"/></w:r></w:del>', "deleted")):
         p = story_doc("본문\x02\r", footnotes=[(2, "\x02 주석\r")], chpx=[(2, 3, sp(op, 1))])
         x = docx(f'<w:p><w:r><w:t>본문</w:t></w:r>{wrap}</w:p>', {"word/footnotes.xml": fn},
                  [("rF", "footnotes", "footnotes.xml")])
         assert md(p) == md(x) == "(1 hidden places left out)\n\n본문\n\n[^1]: 주석\n", (md(p), md(x))
-        assert md(p, True) == md(x, True) == "본문(hidden: [^1])\n\n[^1]: 주석\n", (md(p, True), md(x, True))
+        assert md(p, True) == md(x, True) == f"본문({why}: [^1])\n\n[^1]: 주석\n", (md(p, True), md(x, True))
     q = story_doc("a\x05\r", comments=[(1, 0, "\x05말\r")], authors=["Kim"], chpx=[(1, 2, sp(VANISH, 1))])
     assert md(q) == "(1 hidden places left out)\n\na\n\n[^1]: Comment by Kim: 말\n", md(q)
 

@@ -5,7 +5,7 @@ before."""
 from .. import diagram
 from ..containers.zipx import Package, kids, local
 from ..limits import ReadError
-from ..model import Doc
+from ..model import Doc, Para
 from . import odf_sheets, odf_slides
 from .odf_base import Body, Styles
 
@@ -68,6 +68,7 @@ def _text(pkg, ctx, content, styles_root) -> Doc:
     for c in office:
         with ctx.guard("block"):
             body.doc.blocks.extend(body.block(c, 0))
+    body.doc.blocks.extend(Para([got[1]]) for got in body.changes.values() if got[0] == "deletion")
     if body.glued is not None:
         with ctx.guard("shape"):
             body.place(diagram.ConnectionBudget(ctx))

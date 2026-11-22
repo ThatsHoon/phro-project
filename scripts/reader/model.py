@@ -1,7 +1,8 @@
 """The document model every format parser emits and the Markdown renderer reads.
 
 Parsers never write Markdown. Every block and inline accepts a keyword-only
-`hidden`: empty, or the reason it is hidden ("hidden" or "deleted").
+`hidden`: empty, or the reason it is hidden ("hidden" or "deleted"). A tracked deletion is a Hidden of kind
+"deleted", a tracked insertion an Inserted (shown); each carries its author, "" when the format names none.
 """
 import collections
 from contextlib import contextmanager
@@ -56,10 +57,18 @@ class Break:
 class Hidden:
     inlines: list
     kind: str = "hidden"
+    author: str = ""
     hidden: str = _hid()
 
 
-Inline = Union[Text, Bold, Link, NoteRef, Math, Break, Hidden]
+@dataclass
+class Inserted:
+    inlines: list
+    author: str = ""
+    hidden: str = _hid()
+
+
+Inline = Union[Text, Bold, Link, NoteRef, Math, Break, Hidden, Inserted]
 
 
 # blocks
