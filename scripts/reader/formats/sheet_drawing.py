@@ -11,6 +11,10 @@ Each drawing part is one diagram scope: its shapes, pictures and chart or SmartA
 their `cNvPr@id`, and its connectors (`xdr:cxnSp`, or an `sp` whose preset is a line) with their glue and arrowheads.
 Geometry is the `a:xfrm` through every enclosing group's chOff/chExt, else a oneCellAnchor's or absoluteAnchor's
 `xdr:pos`/`xdr:ext`; it is handed over in points. A part with no connector reads as before.
+
+A slicer or timeline is named (`Slicer: Product`, `Timeline: Date`): its AlternateContent takes the Choice that holds
+it even when that Choice's namespace is not understood, so the Fallback's sentence that slicers are not supported is
+never read.
 """
 import re
 
@@ -24,6 +28,7 @@ from .drawingml import Xf, arrows, glue, is_line, kid, kind, num, nv, rule, xfrm
 MAX_ANCHORS = 10_000  # drawing anchors one drawing part reads
 SHAPE_CHARS = 1_000_000  # characters of shape text one workbook's drawings emit; the rest is counted once as a shape
 _ANCHORS = ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor")
+_SLICERS = {"slicer": "Slicer", "timeslicer": "Timeline"}
 EMU_PT = 12_700  # EMU a point: geometry goes to the diagram in points, which keeps deep anchors within its bound
 
 
@@ -103,10 +108,13 @@ class Drawings:
         dia, keys, slots = diagram.Diagram(self.ctx, self.budget), set(), []
         for *_, a in found:
             spot = _spot(a)
-            for el, xf, frame, depth in self._descend(a, nsmap, ("chart", "pic", "relIds", "sp", "cxnSp"), Xf()):
+            for el, xf, frame, depth in self._descend(a, nsmap, ("chart", "pic", "relIds", "sp", "cxnSp", *_SLICERS),
+                                                      Xf()):
                 name, out = local(el.tag), []
                 if name == "sp":
                     self.shape(el, out)
+                elif name in _SLICERS:
+                    out.append(Para([Text(f"{_SLICERS[name]}: {attr(el, 'name') or ''}")]))
                 elif name == "chart":
                     self.chart(part, attr(el, "id"), out)
                 elif name == "relIds":
@@ -162,6 +170,9 @@ class Drawings:
                     yield el, at, frame, depth
                 elif name == "AlternateContent":
                     chosen = ooxml_base.alternate(el, nsmap)
+                    if chosen is None or local(chosen.tag) == "Fallback":
+                        chosen = next((c for c in el if local(c.tag) == "Choice"
+                                       and any(local(x.tag) in _SLICERS for x in c.iter())), chosen)
                     if chosen is None:
                         self.ctx.skipped["alternate"] += 1
                     else:

@@ -15,6 +15,13 @@ when it has some), so neither is charged to ZIP_TOTAL ahead of its drawings.
 A cell shows its cached value; a formula without one shows `=` and its text. Every formula, a shared one
 expanded to its master's pattern, goes to the sheet's formulas paragraph (`Grid.formula`). A sheet that cannot be read is counted
 under `sheet` and the others still come out; one whose XML breaks after its first row keeps the rows read.
+The workbook's own facts come before its sheets: its names, its external links by number (`[1]` as formulas write
+them) and its protection; a hidden built-in name (`_xlnm._FilterDatabase`, Excel's own record of a filter) is not
+content and is left out uncounted. A sheet's facts follow its formulas (`Grid.fact`), each a paragraph: its own
+names, its tables (table parts: name, range, header and totals rows), its filter, its validations, each conditional
+rule, each pivot table (from its cache definition: the source and the row, column, data and page fields) and its
+protection.
+Their elements are read as the part streams; a table or pivot part that cannot be read counts `table`.
 Charts and pictures come from `sheet_drawing`, one `Drawings` a workbook (one CHART_TOTAL and IMAGE_BYTES count),
 through the relationships the sheet read once: a worksheet's follow its grid in anchor order, and a chartsheet's are
 all it holds (one with nothing drawn has no section). A drawing ReadError other than a timeout costs only the drawings,
@@ -28,7 +35,7 @@ counts `link`.
 Cell comments become notes (legacy `comments` parts ported from dochan, threaded ones new). A thread is its root and
 then its replies, each a "Comment by <name>:" paragraph of one note, the names from the workbook's persons part; a
 legacy comment on a cell a thread covers is its placeholder and is dropped. The note's mark follows the cell's text
-(and its link); a commented cell with no value holds the mark alone. At most MAX_COMMENTS comments are read a
+(and its link); a commented cell with no value holds the mark alone. At most SHEET_COMMENTS comments are read a
 workbook (the rest counted once as `comments_cut`). The parts are streamed under _COMMENT_ELEMENTS closed elements each, empty
 and out-of-grid comments included. Notes are placed after the cells: first the cells that hold only a mark, then the
 marks appended to valued cells, each only if its put succeeds and its text fits the character budget that the cells
@@ -44,11 +51,10 @@ from datetime import datetime
 from .. import limits
 from ..containers.zipx import attr, iterparse, local
 from ..limits import ReadError
-from ..model import Doc, Link, NoteRef, Para, Section, Text
+from ..model import Doc, Para, Section, Text
 from ..numfmt import code_for
 from . import ooxml_base, sheet_drawing, sheet_grid
 from .word_fields import MAX_URL, comment_note
-from .xls import _hide
 
 _REF = re.compile(r"([A-Za-z]{1,3})([0-9]{1,7})")  # used with fullmatch
 _ESC = re.compile(r"_x([0-9A-Fa-f]{4})_")
@@ -62,9 +68,13 @@ STYLE_ELEMENTS = 1_000_000
 # (_x000D__x000A_), each two 7-character escapes for one character
 _RAW_PER_CHAR = 14
 _LINKS = 100_000  # hyperlink elements one sheet may collect; the rest are cut, counted once
-_SHEET_TAGS = frozenset({"col", "mergeCell", "hyperlink", "dimension"})
-_PARENT = {"col": "cols", "mergeCell": "mergeCells", "hyperlink": "hyperlinks", "dimension": "worksheet"}
-MAX_COMMENTS = 10_000  # comments one workbook may turn into notes; the rest are cut, counted once as `comments_cut`
+_FILTERS = frozenset({"filters", "customFilters", "top10", "dynamicFilter", "colorFilter", "iconFilter"})
+_PARENT = {"col": "cols", "mergeCell": "mergeCells", "hyperlink": "hyperlinks", "dimension": "worksheet",
+           "sheetProtection": "worksheet", "autoFilter": "worksheet", "cfRule": "conditionalFormatting",
+           "dataValidation": "dataValidations", "tablePart": "tableParts", "filter": "filters",
+           **dict.fromkeys(_FILTERS, "filterColumn")}
+_SHEET_TAGS = frozenset(_PARENT)
+_KEEP = frozenset({"formula1", "formula2"})
 _COMMENT_ELEMENTS = 200_000  # elements a comments, threaded comments or persons part may close; past it the part stops
 _BATCH = 256  # ended siblings a streamed element keeps before they are dropped together
 
@@ -117,6 +127,103 @@ def _range(ref):
     return min(r1, r2), max(r1, r2), min(c1, c2), max(c1, c2)
 
 
+def _on(value) -> bool:
+    return (value or "").strip().lower() in ("1", "true")
+
+
+def _sqref(text) -> str:
+    return ", ".join((text or "").split())
+
+
+def _validation(el) -> str | None:
+    """A `dataValidation` (or x14's) as `<ranges> <type> <rule>`; None for one that checks nothing."""
+    kind = attr(el, "type") or "none"
+    if kind == "none":
+        return None
+    sq, f1, f2 = attr(el, "sqref"), "", ""
+    for ch in el:
+        n = local(ch.tag)
+        if n == "sqref":
+            sq = ch.text
+        elif n in _KEEP:
+            text = ch.text if ch.text and ch.text.strip() else next((f.text for f in ch), "")
+            if n == "formula1":
+                f1 = (text or "").strip()
+            else:
+                f2 = (text or "").strip()
+    return sheet_grid.validation(_sqref(sq), kind, attr(el, "operator"), f1, f2, f1.startswith('"'))
+
+
+def _rule(el) -> str:
+    """A `cfRule` in a few words: its test, never its format."""
+    forms = [(f.text or "").strip() for f in el if local(f.tag) == "formula"] + ["", ""]
+    return sheet_grid.rule(attr(el, "type") or "", forms, op=attr(el, "operator"), text=attr(el, "text") or "",
+                           rank=attr(el, "rank") or 10, bottom=_on(attr(el, "bottom")),
+                           percent=_on(attr(el, "percent")),
+                           below=(attr(el, "aboveAverage") or "1").strip() in ("0", "false"),
+                           dev=attr(el, "stdDev"), period=attr(el, "timePeriod") or "")
+
+
+def _criterion(el, col: str, vals: list, more: int) -> str:
+    """One filter column's test on column `col`; a `filters` one's values were taken as they ended (`vals`, the
+    first FACT_VALUES, and `more` past them)."""
+    n = local(el.tag)
+    if n == "filters":
+        return sheet_grid.picked(col, vals, more, _on(attr(el, "blank")))
+    if n == "customFilters":
+        join = " and " if _on(attr(el, "and")) else " or "
+        return join.join(f"{col} {sheet_grid.OPS.get(attr(f, 'operator') or 'equal', '=')} {attr(f, 'val') or ''}"
+                         for f in el if local(f.tag) == "customFilter")
+    if n == "top10":
+        side = "bottom" if (attr(el, "top") or "1").strip() in ("0", "false") else "top"
+        return f"{col} {side} {attr(el, 'val') or ''}" + ("%" if _on(attr(el, "percent")) else "")
+    if n == "dynamicFilter":
+        return f"{col} {attr(el, 'type') or ''}".strip()
+    return f"{col} by {'color' if n == 'colorFilter' else 'icon'}"
+
+
+class _Facts:
+    """A sheet's facts as its part streams them, put on its grid after the stream."""
+
+    def __init__(self):
+        self.valid, self.rules, self.crit, self.tables, self.vals = [], [], [], [], []
+        self.filter, self.protect, self.more = None, False, 0
+
+    def end(self, tag, el, stack, names):
+        """An element of `_PARENT` beyond the grid's own has ended; `stack` holds its open ancestors."""
+        if tag == "dataValidation":
+            text = _validation(el)
+            if text:
+                self.valid.append((text, False))
+        elif tag == "cfRule":
+            sq = attr(stack[-1], "sqref")
+            if sq:
+                self.rules.append((_sqref(sq), _rule(el)))
+        elif tag == "filter":
+            if len(self.vals) < limits.FACT_VALUES:
+                self.vals.append(attr(el, "val") or "")
+            else:
+                self.more += 1
+        elif tag in _FILTERS:
+            if len(stack) >= 3 and names.get(stack[-2].tag) == "autoFilter" and names.get(stack[-3].tag) == "worksheet":
+                rng = _range(attr(stack[-2], "ref"))
+                col = _int(attr(stack[-1], "colId"))
+                if rng is not None and col is not None and col >= 0:
+                    self.crit.append((_criterion(el, sheet_grid.letters(rng[2] + col), self.vals, self.more), False))
+            self.vals, self.more = [], 0
+        elif tag == "autoFilter":
+            ref = (attr(el, "ref") or "").strip()
+            if ref:
+                self.filter = ref, self.crit
+            self.crit = []
+        elif tag == "sheetProtection":
+            self.protect = _on(attr(el, "sheet"))
+        elif tag == "tablePart":
+            rid = attr(el, "id")
+            if rid:
+                self.tables.append(rid)
+
+
 def _int(s, default=None):
     try:
         return int(s)
@@ -135,6 +242,11 @@ class _Wb:
         self.formats: dict[int, str] = {}
         self.chartsheets: set[str] = set()  # sheet parts whose relationship is a chartsheet
         self.part = ""  # the workbook part
+        self.at: dict[int, int] = {}
+        self.names: list[tuple[str, bool]] = []
+        self.local: dict[int, list] = {}
+        self.externals: list[str] = []
+        self.protect: list[tuple[str, bool]] = []
 
 
 def _skip(ctx, kind, e):
@@ -178,10 +290,30 @@ def _workbook(root, rels, wb, ctx):
         n = local(el.tag)
         if n == "workbookPr":
             wb.date1904 = (attr(el, "date1904") or "").strip().lower() in ("1", "true")
+        elif n == "workbookProtection":
+            wb.protect = [(f"workbook {w}", False) for w, a in (("structure", "lockStructure"),
+                                                               ("windows", "lockWindows")) if _on(attr(el, a))]
+        elif n == "externalReferences":
+            wb.externals = [attr(x, "id") or "" for x in el if local(x.tag) == "externalReference"]
+        elif n == "definedNames":
+            for d in el:
+                if local(d.tag) != "definedName":
+                    continue
+                name = attr(d, "name") or ""
+                if name.startswith("_xlnm.") and _on(attr(d, "hidden")):
+                    continue
+                entry = (f"{name[6:] if name.startswith('_xlnm.') else name} = {_unescape((d.text or '').strip())}",
+                         _on(attr(d, "hidden")))
+                at = _int(attr(d, "localSheetId"))
+                if at is None:
+                    wb.names.append(entry)
+                elif at in wb.at:
+                    wb.local.setdefault(wb.at[at], []).append(entry)
         elif n == "sheets":
-            for sh in el:
+            for i, sh in enumerate(el):
                 if local(sh.tag) != "sheet":
                     continue
+                wb.at[i] = len(wb.sheets)
                 rel = rels.get(attr(sh, "id") or "")
                 if rel is None or rel.external or not rel.type.endswith(("/worksheet", "/chartsheet")):
                     ctx.skipped["sheet"] += 1  # a macro or dialog sheet, or no relationship at all
@@ -338,7 +470,7 @@ class _Sheets:
             if not blocks and part in self.wb.chartsheets:  # a chartsheet with nothing drawn has no section
                 continue
             if state in _HIDDEN:
-                out.append(Section("sheet", name, blocks=_hide(blocks), hidden="hidden"))
+                out.append(Section("sheet", name, blocks=sheet_grid.hide(blocks), hidden="hidden"))
             else:
                 out.append(Section("sheet", name, blocks=blocks))
         return out
@@ -388,6 +520,7 @@ class _Sheets:
             return self._drawn(part, relmap)
         row, col, cells, rows_seen = -1, -1, 0, False  # cells: the `c` elements open
         links = []  # (r1, r2, c1, c2, url, place) of the hyperlinks, applied after the stream
+        facts = _Facts()
         shared = {}
         stack, done, names = [], [], {}  # the open path, and the ended children each open element still holds
         marks = self._comments(part, no, relmap, keys)  # (row, col) -> (note key, characters)
@@ -443,12 +576,14 @@ class _Sheets:
                             rng = _range(el.get("ref"))
                             if rng is not None:
                                 grid.declare(*rng)
+                        elif tag != "col":
+                            facts.end(tag, el, stack, names)
                         elif (el.get("hidden") or "").strip().lower() in ("1", "true"):
                             lo, hi = _int(el.get("min")), _int(el.get("max"))
                             if lo is not None and hi is not None and lo >= 1:
                                 grid.hide_cols(lo - 1, hi - 1)
                     if not cells:  # outside a cell an ended element is let go, as `_drop` does (inlined for speed)
-                        if kids or tag == "c":  # a cell's subtree goes once the cell is read
+                        if kids and tag not in _KEEP or tag == "c":
                             del el[:]
                         if stack:
                             done[-1] += 1
@@ -461,9 +596,91 @@ class _Sheets:
             grid.stop("XML error", 1, (max(row, 0), None))  # decision 12: the rows read are kept
         self._place(grid, marks, hidden)
         self._link(grid, links)
+        self._facts(grid, part, no, facts, relmap)
         blocks = grid.sheet_blocks()
         self._sweep(blocks, keys)
         return blocks + self._drawn(part, relmap)
+
+    def _facts(self, grid, part, no, facts, relmap):
+        """The sheet's facts in their order on `grid`: names, tables, filter, validations, rules, pivots, protection."""
+        grid.fact("Names", self.wb.local.get(no - 1, []))
+        rels = self._sheet_rels(part, relmap)
+        for rid in facts.tables:
+            rel = rels.get(rid)
+            if rel is not None and not rel.external and rel.type.endswith("/table"):
+                self._table(grid, rel.target)
+        if facts.filter:
+            ref, crit = facts.filter
+            if crit:
+                grid.fact(f"Filter {ref}", crit)
+            else:
+                grid.fact("Filter", [(ref, False)])
+        grid.fact("Validation", facts.valid)
+        for sq, rule in facts.rules:
+            grid.fact(f"Conditional {sq}", [(rule, False)])
+        for rel in rels.values():
+            if not rel.external and rel.type.endswith("/pivotTable"):
+                self._pivot(grid, rel.target)
+        if facts.protect:
+            grid.fact("Protected", [("sheet", False)])
+
+    def _table(self, grid, target):
+        """A table part: `Table <name> <range>` and its header and totals rows."""
+        try:
+            root, _ = ooxml_base.load(self.pkg, target)
+        except ReadError as e:
+            _skip(self.ctx, "table", e)
+            return
+        rng = _range(attr(root, "ref"))
+        if rng is None:
+            self.ctx.skipped["table"] += 1
+            return
+        grid.table(attr(root, "displayName") or attr(root, "name") or "", *rng,
+                   bool(_int(attr(root, "headerRowCount"), 1)), bool(_int(attr(root, "totalsRowCount"), 0)))
+
+    def _pivot(self, grid, target):
+        """A pivot table part: `Pivot <name> <range>`, its cache's source and its fields by their cache names."""
+        try:
+            root, _ = ooxml_base.load(self.pkg, target)
+            cache = next((r.target for r in ooxml_base.rels(self.pkg, target, self.ctx).values()
+                          if not r.external and r.type.endswith("/pivotCacheDefinition")), None)
+            fields, source = [], ""
+            if cache is not None:
+                croot, _ = ooxml_base.load(self.pkg, cache)
+                for el in croot:
+                    n = local(el.tag)
+                    if n == "cacheFields":
+                        fields = [attr(f, "name") or "" for f in el if local(f.tag) == "cacheField"]
+                    elif n == "cacheSource":
+                        ws = next((x for x in el if local(x.tag) == "worksheetSource"), None)
+                        if ws is not None:
+                            sheet, ref = attr(ws, "sheet"), attr(ws, "ref")
+                            source = attr(ws, "name") or (f"{sheet}!{ref}" if sheet and ref else ref or "")
+                        else:
+                            source = attr(el, "type") or ""
+        except ReadError as e:
+            _skip(self.ctx, "table", e)
+            return
+
+        def name(i):
+            return fields[i] if i is not None and 0 <= i < len(fields) else None
+
+        about, ref = [("source " + source, False)] if source else [], ""
+        for el in root:
+            n = local(el.tag)
+            if n == "location":
+                ref = attr(el, "ref") or ""
+            elif n in ("rowFields", "colFields", "pageFields", "dataFields"):
+                got = [attr(f, "name") or name(_int(attr(f, "fld"))) if n == "dataFields"
+                       else name(_int(attr(f, "fld" if n == "pageFields" else "x"))) for f in el]
+                got = [g for g in got if g]
+                if got:
+                    word = {"rowFields": "rows", "colFields": "columns", "pageFields": "filters",
+                            "dataFields": "values"}[n]
+                    about.append((f"{word} {', '.join(got)}", False))
+        order = {"source": 0, "rows": 1, "columns": 2, "values": 3, "filters": 4}
+        about.sort(key=lambda e: order[e[0].split(" ", 1)[0]])
+        grid.fact(f"Pivot {attr(root, 'name') or ''} {ref}".rstrip(), about or [("no fields", False)])
 
     def _drawn(self, part, relmap) -> list:
         """The sheet's charts and pictures in anchor order, from the relationships the sheet read once. A drawing
@@ -591,10 +808,10 @@ class _Sheets:
         return marks
 
     def _take(self, n=0) -> bool:
-        """Count a comment against MAX_COMMENTS (the cut counted once); `n` characters are only checked here."""
+        """Count a comment against SHEET_COMMENTS (the cut counted once); `n` characters are only checked here."""
         if self.comments_cut:
             return False
-        if self.comment_count >= MAX_COMMENTS or self.budget.chars < n:
+        if self.comment_count >= limits.SHEET_COMMENTS or self.budget.chars < n:
             self._cut_comments()
             return False
         self.comment_count += 1
@@ -639,7 +856,7 @@ class _Sheets:
     def _threaded(self, target, per_cell, sizes, covered):
         """Each thread is its root then its replies in file order (a reply of a reply follows its parent); a reply
         whose parent is unknown starts a thread. A visited set lists each comment once, so a parent cycle ends; the
-        comments no walk reaches follow in file order. At most MAX_COMMENTS are kept while streaming."""
+        comments no walk reaches follow in file order. At most SHEET_COMMENTS are kept while streaming."""
         items, text = [], ""  # (id, parentId, cell, person, text)
         for name, el, tags in self._ended(target):
             if name == "text" and tags[-1:] == ["threadedComment"]:
@@ -677,74 +894,18 @@ class _Sheets:
                 stack.extend(reversed(kids[n]))
 
     def _place(self, grid, marks, hidden):
-        """Put the marks after the cells. A mark on a cell that holds a value is appended to it (`Grid.append`, which
-        still works once the sheet is cut); a cell that holds nothing gets the mark alone, which needs an uncut grid.
-        A note is kept only if its mark is placed and its text fits the character budget; otherwise it is dropped
-        and `comments_cut` counted. A comment on a merged-away cell goes to the origin of the merge that renders
-        (the origin's own comment first), as `Grid.covers` resolves it. A note on a hidden row or column (its own
-        or its mark's), or on a hidden sheet, is hidden with its place."""
-        if not marks:
-            return
-        moved = grid.covers(marks)
-        targets: dict = {}
-        for pos, (key, size) in marks.items():
-            t = moved.get(pos, pos)
-            targets.setdefault(t, [])
-            targets[t].insert(0 if t == pos else len(targets[t]), (key, size, pos))
-        order = [t for t in targets if grid.get(*t) is None] + [t for t in targets if grid.get(*t) is not None]
-        b = grid.budget
-
-        def hides(pos):
-            return pos[0] in grid.rows_h or pos[1] in grid.cols_h
-
-        for t in order:
-            fit, total = [], 0
-            for key, size, pos in targets[t]:
-                if b.chars - total >= size:
-                    fit.append((key, pos))
-                    total += size
-                else:
-                    self.notes.pop(key, None)
-                    self._cut_comments()
-            if not fit:
-                continue
-            refs = [NoteRef(k) for k, _ in fit]
-            if grid.get(*t) is not None:
-                ok = grid.append(t[0], t[1], refs)
-            else:
-                ok = grid.put(t[0], t[1], refs)
-            if ok:
-                b.chars -= total
-                for k, pos in fit:
-                    if hidden or hides(t) or hides(pos):
-                        self.notes[k] = _hide(self.notes[k])
-            else:
-                for k, _ in fit:
-                    self.notes.pop(k, None)
-                self._cut_comments()
+        """Put the marks after the cells (`Grid.place_notes`); a note dropped there counts `comments_cut`."""
+        if grid.place_notes(marks, self.notes, hidden):
+            self._cut_comments()
 
     def _sweep(self, blocks, keys):
         """Drop this sheet's notes whose mark did not reach the output; that is counted as `comments_cut`."""
-        if not keys:
-            return
-        live, stack = set(), list(blocks)
-        while stack:
-            x = stack.pop()
-            if isinstance(x, NoteRef):
-                live.add(x.id)
-                continue
-            for name in ("inlines", "blocks"):
-                stack.extend(getattr(x, name, ()))
-            for row in getattr(x, "rows", ()):
-                stack.extend(row)
-        for k in keys:
-            if k not in live and self.notes.pop(k, None) is not None:
-                self._cut_comments()
+        if sheet_grid.sweep(blocks, keys, self.notes):
+            self._cut_comments()
 
     def _link(self, grid, links):
-        """Decision 9: wrap the valued cells of each range in a Link, or follow them with `→ place` for a place in
-        the workbook. The cost min(area, cells held) is charged to the scan count before the range is walked; a link
-        that no longer fits is counted under `link`."""
+        """Decision 9: each range through `Grid.link`. Its cost min(area, cells held) is charged to the scan count
+        before the range is walked; a link that no longer fits is counted under `link`."""
         cap = limits.SHEET_SCAN
         for item in links:
             if item is None or grid.cut:
@@ -753,18 +914,7 @@ class _Sheets:
             if self.scan + min((r2 - r1 + 1) * (c2 - c1 + 1), len(grid.cells)) > cap:
                 self.ctx.skipped["link"] += 1
                 continue
-            found, cost = grid.held(r1, r2, c1, c2)
-            self.scan += cost
-            for r, c in found:
-                value = grid.get(r, c)
-                inl = sheet_grid.text_inlines(value) if isinstance(value, str) else list(value)
-                body = [x for x in inl if not isinstance(x, NoteRef)]
-                if not body or any(isinstance(x, Link) for x in body):  # nothing to link, or already linked
-                    continue
-                marks = [x for x in inl if isinstance(x, NoteRef)]
-                linked = body + [Text(f" → {place}")] if place else [Link(url, body)]
-                if not grid.put(r, c, linked + marks):
-                    break  # the budget is gone; the cell keeps its old value
+            self.scan += grid.link(r1, r2, c1, c2, url, place)
 
     def _cell(self, el, row: int, col: int, shared: dict):
         """The displayed value of a `c` element at (row, col) by its type, and its formula's pattern or None. The
@@ -839,10 +989,66 @@ class _Sheets:
         return self.show(delta.days + (delta.seconds + delta.microseconds / 1e6) / 86400, style)
 
 
+def _external(pkg, wb, rid, ctx) -> str | None:
+    """Where an external link part points: its book's path, or its DDE or OLE source; None (counted under `link`)
+    when the part or its path cannot be read."""
+    rel = ooxml_base.rels(pkg, wb.part, ctx).get(rid)
+    if rel is None or rel.external or not rel.type.endswith("/externalLink"):
+        ctx.skipped["link"] += 1
+        return None
+    try:
+        root, _ = ooxml_base.load(pkg, rel.target)
+    except ReadError as e:
+        _skip(ctx, "link", e)
+        return None
+    own = ooxml_base.rels(pkg, rel.target, ctx)
+    for el in root:
+        n = local(el.tag)
+        if n == "ddeLink":
+            return f"DDE {attr(el, 'ddeService') or ''}|{attr(el, 'ddeTopic') or ''}"
+        if n in ("externalBook", "oleLink"):
+            path = own.get(attr(el, "id") or "")
+            if path is not None and path.target:
+                return path.target if n == "externalBook" else f"OLE {attr(el, 'progId') or ''} {path.target}"
+    ctx.skipped["link"] += 1
+    return None
+
+
+def _cache_names(pkg, wb, ctx) -> set:
+    """The `name` of each slicer and timeline cache part of the workbook: Excel keeps a defined name (`#N/A`) for
+    each, its own record and not content. A cache part that cannot be read counts `document`."""
+    out = set()
+    for rel in ooxml_base.rels(pkg, wb.part, ctx).values():
+        if rel.external or not rel.type.endswith(("/slicerCache", "/timelineCache")):
+            continue
+        try:
+            root, _ = ooxml_base.load(pkg, rel.target)
+        except ReadError as e:
+            _skip(ctx, "document", e)
+            continue
+        out.add(attr(root, "name") or "")
+    return out
+
+
+def _book_facts(pkg, wb, budget, ctx) -> list:
+    """The workbook's own facts, before its sheets: its names (but a slicer's or timeline's cache name), its
+    external links by number, its protection."""
+    links = []
+    for n, rid in enumerate(wb.externals, 1):
+        target = _external(pkg, wb, rid, ctx)
+        if target:
+            links.append((f"[{n}] {target}", False))
+    caches = _cache_names(pkg, wb, ctx)
+    names = [e for e in wb.names if e[0].split(" = ", 1)[0] not in caches]
+    return (sheet_grid.listed("Names", names, budget, ctx) + sheet_grid.listed("External links", links, budget, ctx)
+            + sheet_grid.listed("Protected", wb.protect, budget, ctx))
+
+
 def parse_sheets(pkg, part, ctx) -> Doc:
     wb = read_workbook(pkg, part, ctx)
     sheets = _Sheets(pkg, wb, ctx)
+    lead = _book_facts(pkg, wb, sheets.budget, ctx)
     secs = sheets.sections() if wb.sheets else []
     if not secs:
         raise ReadError("damaged", "no readable sheets")
-    return Doc(blocks=secs, notes=sheets.notes)
+    return Doc(blocks=lead + secs, notes=sheets.notes)

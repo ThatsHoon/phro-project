@@ -12,7 +12,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
-from reader.formats.sheet_grid import Budget, Grid, address, formula_text, pattern, text_inlines  # noqa: E402
+from reader.formats.sheet_grid import Budget, Grid, address, formula_text, listed, pattern, text_inlines  # noqa: E402
 from reader.model import Bold, Break, Context, Doc, Hidden, Link, NoteRef, Para, Table, Text  # noqa: E402
 
 
@@ -663,8 +663,36 @@ def test_formula_groups_past_the_cap_are_counted():
         p = g.sheet_blocks()[-1]
     finally:
         limits.FORMULA_GROUPS = saved
-    assert para_text(p) == "Formulas: A1 =0+1; B1 =1+1; (1 more formula groups not listed)", para_text(p)
+    assert para_text(p) == "Formulas: A1 =0+1; B1 =1+1; (1 more not listed)", para_text(p)
     assert ctx.skipped["formula"] == 1, ctx.skipped
+
+
+def test_facts_follow_the_formulas_one_paragraph_each():
+    g, _ = mk()
+    g.put(0, 0, "1")
+    g.formula(0, 0, pattern("1+1", 0, 0))
+    g.fact("Validation", [('A1 list "a,b"', False), ("B1 whole > 0", False)])
+    g.fact("Protected", [("sheet", False)])
+    out = g.sheet_blocks()
+    assert [para_text(p) for p in out[-3:]] == ["Formulas: A1 =1+1", 'Validation: A1 list "a,b"; B1 whole > 0',
+                                                "Protected: sheet"], out[-3:]
+
+
+def test_hidden_facts_follow_the_shown_ones_and_all_hidden_hides_the_paragraph():
+    ctx = Context()
+    p, = listed("Names", [("_F = S!$A$1", True), ("Rate = S!$B$1", False)], Budget(), ctx)
+    assert p.inlines == [Text("Names: "), Text("Rate = S!$B$1"), Hidden([Text("; _F = S!$A$1")])], p.inlines
+    p, = listed("Names", [("_F = S!$A$1", True)], Budget(), ctx)
+    assert p.inlines == [Hidden([Text("Names: "), Text("_F = S!$A$1")])], p.inlines
+    assert listed("Names", [], Budget(), ctx) == []
+
+
+def test_facts_past_the_characters_are_counted():
+    ctx = Context()
+    budget = Budget(chars=12)
+    p, = listed("Names", [("A = S!$A$1", False), ("B = S!$B$1", False)], budget, ctx)
+    assert para_text(p) == "Names: A = S!$A$1; (1 more not listed)", para_text(p)
+    assert ctx.skipped["fact"] == 1 and budget.chars == 0, (ctx.skipped, budget.chars)
 
 
 def test_header_rows_marked():

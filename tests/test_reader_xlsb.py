@@ -16,7 +16,7 @@ from reader.containers import biff12 as b12  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
 from reader.formats import xlsb  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context  # noqa: E402
+from reader.model import Context, Link, NoteRef, Para, Table, Text  # noqa: E402
 from reader_fix import (biff12, make_cfb, make_xlsb, make_zip, xlsb_bundle, xlsb_cell, xlsb_row,  # noqa: E402
                         xlsb_wide)
 
@@ -295,7 +295,7 @@ def test_formulas_decoded_and_grouped():
                   workbook_records=book)
         ctx = Context()
         doc = xlsb.parse(path, ctx)
-    p = doc.blocks[1].blocks[-1]
+    p = doc.blocks[2].blocks[-1]
     assert "".join(i.text for i in p.inlines) == "Formulas: D2:D4 =B2*C2; E2 =Data!A1+TaxRate; F2 =?", p
     assert ctx.skipped["formula"] == 1 and ctx.skipped["record"] == 0, ctx.skipped
 
@@ -503,10 +503,10 @@ def test_chart_without_series_is_unread():
 def test_swallowed_error_leaves_no_section():
     real = xlsb._Sheets.sheet
 
-    def flaky(self, name, part):
+    def flaky(self, name, part, no, hidden):
         if name in ("A", "B"):
             raise RuntimeError("boom")  # the first sheet too: nothing earlier to be mixed up with
-        return real(self, name, part)
+        return real(self, name, part, no, hidden)
 
     xlsb._Sheets.sheet = flaky
     try:
@@ -526,6 +526,196 @@ def test_chartsheet_chart():
     assert "## Sheet: Graph" in out and "Chart: bar" in out and not ctx.skipped, (out, ctx.skipped)
     out, ctx = md([{"name": "Empty", "chartsheet": True}, {"name": "B", "cells": {(0, 0): "x"}}])
     assert "Empty" not in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def doc_of(sheets, **kw):
+    """Build an .xlsb and parse it: (Doc, ctx)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "a.xlsb"
+        make_xlsb(path, sheets, **kw)
+        ctx = Context()
+        return xlsb.parse(path, ctx), ctx
+
+
+def texts(blocks) -> list:
+    """The text of each paragraph, a Hidden run's text in brackets."""
+    return ["".join(i.text if isinstance(i, Text) else "[" + "".join(t.text for t in i.inlines) + "]"
+                    for i in b.inlines) for b in blocks if isinstance(b, Para)]
+
+
+def cell_inlines(table, r, c):
+    return table.rows[r][c].blocks[0].inlines
+
+
+def rels(*items):
+    """A relationships part; an item is (id, type, target) or (id, type, target, True) for an external target."""
+    body = "".join(f'<Relationship Id="{i[0]}" Type="{REL}{i[1]}" Target="{i[2]}"'
+                   + (' TargetMode="External"' if i[3:] else "") + "/>" for i in items)
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{body}</Relationships>')
+
+
+def rfx(r1, r2, c1, c2):
+    return struct.pack("<4I", r1, r2, c1, c2)
+
+
+def sqrfx(*ranges):
+    return struct.pack("<i", len(ranges)) + b"".join(rfx(*r) for r in ranges)
+
+
+def hlink(r, c, rid="", place=""):
+    """A BrtHLink: the range, relId, location, tooltip and display."""
+    return biff12(494, rfx(r, r, c, c) + xlsb_wide(rid) + xlsb_wide(place) + xlsb_wide("") + xlsb_wide(""))
+
+
+def test_hyperlinks_on_their_cells():
+    records = [hlink(0, 0, rid="rId1"), hlink(0, 1, place="Data!A1"), hlink(0, 2, rid="rId9")]
+    parts = {"xl/worksheets/_rels/sheet1.bin.rels": rels(("rId1", "hyperlink", "https://example.com/north", True))}
+    doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "site", (0, 1): "go", (0, 2): "odd"}, "records": records}],
+                      extra_parts=parts)
+    t = doc.blocks[0].blocks[0]
+    assert isinstance(t, Table), doc.blocks[0].blocks
+    assert cell_inlines(t, 0, 0) == [Link("https://example.com/north", [Text("site")])], cell_inlines(t, 0, 0)
+    assert cell_inlines(t, 0, 1) == [Text("go"), Text(" → Data!A1")], cell_inlines(t, 0, 1)
+    assert cell_inlines(t, 0, 2) == [Text("odd")] and ctx.skipped["link"] == 1, (cell_inlines(t, 0, 2), ctx.skipped)
+
+
+def comment(author, r, c, text):
+    """BrtBeginComment (iauthor, the cell, a GUID), BrtCommentText (a RichStr with no runs), BrtEndComment."""
+    return (biff12(635, struct.pack("<i", author) + rfx(r, r, c, c) + bytes(16))
+            + biff12(637, b"\x01" + xlsb_wide(text) + struct.pack("<I", 0)) + biff12(636))
+
+
+def test_comments_on_their_cells_with_author():
+    part = (biff12(628) + biff12(630) + biff12(632, xlsb_wide("Ann")) + biff12(632, xlsb_wide("Bob")) + biff12(631)
+            + biff12(633) + comment(0, 0, 0, "Ann:\nDivision by zero on purpose") + comment(1, 3, 2, "Check  this")
+            + biff12(634) + biff12(629))
+    parts = {"xl/worksheets/_rels/sheet1.bin.rels": rels(("rId1", "comments", "../comments1.bin")),
+             "xl/comments1.bin": part}
+    doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x", (0, 1): "y", (1, 0): "z"}}], extra_parts=parts)
+    t = doc.blocks[0].blocks[0]
+    first = cell_inlines(t, 0, 0)
+    assert first[0] == Text("x") and isinstance(first[1], NoteRef), first
+    assert texts(doc.notes[first[1].id]) == ["Comment by Ann: Division by zero on purpose"], doc.notes
+    second = doc.blocks[0].blocks[1].inlines
+    assert second[0] == Text("C4: ") and isinstance(second[1], NoteRef), second
+    assert texts(doc.notes[second[1].id]) == ["Comment by Bob: Check this"] and not ctx.skipped, (doc.notes, ctx.skipped)
+
+
+def name(flags, itab, text, rgce):
+    """A BrtName: flags, chKey, itab (0xFFFFFFFF the workbook), the name, its formula, a null comment."""
+    return biff12(39, struct.pack("<IBI", flags, 0, itab) + xlsb_wide(text) + parsed(rgce) + xlsb_wide(None))
+
+
+def test_names_workbook_first_sheet_scoped_on_the_sheet():
+    book = [xlsb_bundle("S", "rId1", 0, 1),
+            name(0, 0xFFFFFFFF, "Rate", struct.pack("<Bd", 0x1F, 0.07)),
+            name(0, 0, "Local", struct.pack("<BH", 0x1E, 5)),
+            name(1, 0xFFFFFFFF, "Secret", struct.pack("<BH", 0x1E, 9)),
+            name(0x21, 0, "_xlnm._FilterDatabase", struct.pack("<BH", 0x1E, 1))]
+    doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x"}}], workbook_records=book)
+    assert texts(doc.blocks[:1]) == ["Names: Rate = 0.07[; Secret = 9]"], doc.blocks[:1]
+    assert texts(doc.blocks[1].blocks)[1:] == ["Names: Local = 5"] and not ctx.skipped, (doc.blocks[1].blocks, ctx.skipped)
+
+
+def dval(flags, f1, f2, *ranges):
+    """A BrtDVal: the flags, the ranges, four null strings, two DVParsedFormulas."""
+    return biff12(64, struct.pack("<I", flags) + sqrfx(*ranges) + xlsb_wide(None) * 4 + parsed(f1) + parsed(f2))
+
+
+def test_validation_lists_and_bounds():
+    pick = dval(3, b"\x17" + struct.pack("<H", 11) + "Open\0Closed".encode("utf-16-le"), b"", (1, 8, 0, 0))
+    whole = dval(1, struct.pack("<BH", 0x1E, 0), struct.pack("<BH", 0x1E, 1000), (1, 8, 1, 2))
+    above = dval(2 | 4 << 20, struct.pack("<Bd", 0x1F, 0.5), b"", (0, 0, 7, 7))
+    records = [biff12(573, bytes(18)), pick, whole, above, biff12(574)]
+    doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x"}, "records": records}])
+    assert texts(doc.blocks[0].blocks)[1:] == ['Validation: A2:A9 list "Open,Closed"; B2:C9 whole between 0 and 1000; '
+                                           "H1 decimal > 0.5"] and not ctx.skipped, (doc.blocks[0].blocks, ctx.skipped)
+
+
+def cf_rule(kind, template, param=0, flags=0, text=None, f1=b""):
+    """A BrtBeginCFRule (iType, iTemplate, dxfId, iPri, iParam, two reserved, flags, three cbFmla, strParam, rgce1)
+    and its BrtEndCFRule."""
+    body = struct.pack("<7IH3I", kind, template, 0, 1, param, 0, 0, flags, len(f1), 0, 0) + xlsb_wide(text)
+    return biff12(463, body + (parsed(f1) if f1 else b"")) + biff12(464)
+
+
+def test_conditional_formats_one_line_a_rule():
+    above = struct.pack("<BI", 0x24, 4) + struct.pack("<H", 0xC000 | 5) + struct.pack("<BH", 0x1E, 100) + b"\x0d"
+    records = [biff12(461, struct.pack("<II", 6, 0) + sqrfx((4, 7, 5, 5))),
+               cf_rule(1, 0, param=5, f1=struct.pack("<BH", 0x1E, 150)),
+               cf_rule(2, 1, f1=above),
+               cf_rule(5, 5, param=10, flags=0x08 | 0x10),
+               cf_rule(2, 8, text="late", f1=b"\x1d\x01"),
+               cf_rule(4, 3),
+               cf_rule(2, 0x19, param=1, flags=0x04),
+               biff12(462)]
+    doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x"}, "records": records}])
+    assert texts(doc.blocks[0].blocks)[1:] == ["Conditional F5:F8: cell > 150", "Conditional F5:F8: formula =F5>100",
+                                           "Conditional F5:F8: bottom 10%", 'Conditional F5:F8: contains "late"',
+                                           "Conditional F5:F8: data bar", "Conditional F5:F8: 1 std dev above average"], \
+        doc.blocks[0].blocks
+    assert not ctx.skipped, ctx.skipped
+
+
+def column(col, *inner):
+    return biff12(163, struct.pack("<IH", col, 0)) + b"".join(inner) + biff12(164)
+
+
+def test_autofilter_range_and_criteria():
+    records = [biff12(161, rfx(0, 40, 0, 3)),
+               column(2, biff12(165, struct.pack("<II", 0, 0)), biff12(167, xlsb_wide("Open")),
+                      biff12(167, xlsb_wide("Hold")), biff12(166)),
+               column(3, biff12(172, struct.pack("<I", 0)), biff12(174, struct.pack("<BBd", 4, 4, 5)),
+                      biff12(174, struct.pack("<BBd", 4, 1, 9)), biff12(173)),
+               column(1, biff12(170, struct.pack("<Bdd", 0x01, 3, 0))),
+               column(0, biff12(171, struct.pack("<IBdd", 9, 0, 0, 0))),
+               biff12(162)]
+    doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x"}, "records": records}])
+    assert texts(doc.blocks[0].blocks)[1:] == ["Filter A1:D41: C is Open, Hold; D > 5 and D < 9; B top 3; A today"], \
+        doc.blocks[0].blocks
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_table_parts_give_name_range_and_totals_row():
+    table = biff12(343, rfx(0, 9, 0, 2) + struct.pack("<5I", 0, 1, 1, 1, 0) + struct.pack("<6I", *[0xFFFFFFFF] * 6)
+                   + struct.pack("<I", 0) + xlsb_wide("Table1") + xlsb_wide("Sales") + xlsb_wide(None) * 4) + biff12(344)
+    records = [biff12(660, struct.pack("<I", 1)), biff12(661, xlsb_wide("rId1")), biff12(662)]
+    parts = {"xl/worksheets/_rels/sheet1.bin.rels": rels(("rId1", "table", "../tables/table1.bin")),
+             "xl/tables/table1.bin": table}
+    doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x"}, "records": records}], extra_parts=parts)
+    assert texts(doc.blocks[0].blocks)[1:] == ["Table Sales A1:C10: header row 1; totals row 10"], doc.blocks[0].blocks
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_protection_and_external_links():
+    book = [xlsb_bundle("S", "rId1", 0, 1), biff12(353), biff12(355, xlsb_wide("rId9")),
+            biff12(355, xlsb_wide("rId10")), biff12(357), biff12(362, struct.pack("<I", 0)), biff12(354),
+            biff12(534, struct.pack("<HHH", 0, 0, 3))]
+    parts = {"xl/_rels/workbook.bin.rels": rels(("rId1", "worksheet", "worksheets/sheet1.bin"),
+                                                ("rId2", "styles", "styles.bin"),
+                                                ("rId3", "sharedStrings", "sharedStrings.bin"),
+                                                ("rId9", "externalLink", "externalLinks/externalLink1.bin"),
+                                                ("rId10", "externalLink", "externalLinks/externalLink2.bin")),
+             "xl/externalLinks/externalLink1.bin": biff12(360, struct.pack("<H", 0) + xlsb_wide("rId1")
+                                                          + xlsb_wide(None)) + biff12(361),
+             "xl/externalLinks/_rels/externalLink1.bin.rels": rels(("rId1", "externalLinkPath",
+                                                                    "file:///C:/x/budget.xlsb", True)),
+             "xl/externalLinks/externalLink2.bin": biff12(360, struct.pack("<H", 1) + xlsb_wide("Excel")
+                                                          + xlsb_wide("Book1")) + biff12(361)}
+    records = [biff12(535, struct.pack("<HI", 0, 1) + struct.pack("<15I", *[0] * 15))]
+    doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x"}, "records": records}], workbook_records=book,
+                      extra_parts=parts)
+    assert texts(doc.blocks[:2]) == ["External links: [1] file:///C:/x/budget.xlsb; [2] DDE Excel|Book1",
+                                     "Protected: workbook structure; workbook windows"], doc.blocks[:2]
+    assert texts(doc.blocks[2].blocks)[1:] == ["Protected: sheet"] and not ctx.skipped, (doc.blocks[2].blocks, ctx.skipped)
+
+
+def test_macros_present_line():
+    _, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x"}}], extra_parts={"xl/vbaProject.bin": b"\0" * 8})
+    assert ctx.skipped["vba"] == 1, ctx.skipped
+    _, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x"}}])
+    assert not ctx.skipped["vba"], ctx.skipped
 
 
 def main():

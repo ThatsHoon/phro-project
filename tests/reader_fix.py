@@ -1348,7 +1348,8 @@ def _xlsx_rels(items) -> str:
     return f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="{_PKG_REL}">{body}</Relationships>'
 
 
-def make_xlsx(path, sheets, *, shared=None, numfmts=None, xfs=None, date1904=False, wb_rels=(), extra_parts=None):
+def make_xlsx(path, sheets, *, shared=None, numfmts=None, xfs=None, date1904=False, wb_rels=(), extra_parts=None,
+              book=""):
     """Write an .xlsx package: content types, rels, workbook.xml, styles.xml, sharedStrings.xml and one part per sheet
     dict; with path None nothing is written and the zip's bytes are returned.
 
@@ -1360,6 +1361,7 @@ def make_xlsx(path, sheets, *, shared=None, numfmts=None, xfs=None, date1904=Fal
     `shared` is a list of raw `si` inner XML strings. `numfmts` ({id: code}) and `xfs` (the `cellXfs` numFmtId list,
     default [0]) write `xl/styles.xml`. `wb_rels` adds workbook relationships ((id, type, target, external), ids after
     the generated ones). `extra_parts` adds or replaces parts ({name: bytes | str}); a None value leaves one out.
+    `book` is raw XML after the workbook's `sheets`.
     """
     sheets = list(sheets)
     nums = [sh.get("number", i + 1) for i, sh in enumerate(sheets)]
@@ -1412,7 +1414,7 @@ def make_xlsx(path, sheets, *, shared=None, numfmts=None, xfs=None, date1904=Fal
     rels.extend(wb_rels)
     pr = '<workbookPr date1904="1"/>' if date1904 else "<workbookPr/>"
     members["xl/workbook.xml"] = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook {ns}>{pr}'
-                                  f'<sheets>{"".join(entries)}</sheets></workbook>')
+                                  f'<sheets>{"".join(entries)}</sheets>{book}</workbook>')
     members["xl/_rels/workbook.xml.rels"] = _xlsx_rels(rels)
     members["_rels/.rels"] = _xlsx_rels([("rId1", "officeDocument", "xl/workbook.xml", False)])
     overrides.insert(0, ("xl/workbook.xml", f"{_XLSX_CT}sheet.main+xml"))

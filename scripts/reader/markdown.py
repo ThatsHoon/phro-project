@@ -79,6 +79,7 @@ LOST = (
     (("chart_cut",), "chart cut short", "charts cut short"),
     (("cells",), "table cut short", "tables cut short"),
     (("formula",), "formula not shown", "formulas not shown"),
+    (("fact",), "workbook fact not shown", "workbook facts not shown"),
     (("repeat",), "repeated row or cell cut short", "repeated rows or cells cut short"),
     (("record",), "damaged record", "damaged records"),
     (("depth",), "place nested too deeply", "places nested too deeply"),

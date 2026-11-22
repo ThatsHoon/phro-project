@@ -113,6 +113,23 @@ def text(rgce: bytes, extra: bytes, env: Env):
         return None
 
 
+def shown(rgce: bytes, extra: bytes, env: Env, ctx) -> str:
+    """A fact's formula text (a validation's, a rule's, a name's); `?`, counted under formula, for one not read."""
+    got = text(rgce, extra, env)
+    if got is None:
+        ctx.skipped["formula"] += 1
+        return "?"
+    return got
+
+
+def named(n, env: Env, ctx):
+    """A defined name (biff.DefinedName) as (`name = formula`, hidden); None for one with no formula or a hidden
+    built-in one (flags 0x01 and 0x20: Excel's own record, as `_FilterDatabase`)."""
+    if not n.name or not n.rgce or n.flags & 0x21 == 0x21:
+        return None
+    return f"{n.name} = {shown(n.rgce, n.extra, env, ctx)}", bool(n.flags & 1)
+
+
 def put(grid, forms: list, anchored: dict, env: Env, ctx) -> None:
     """Each held cell's formula into the sheet's formulas paragraph (`Grid.formula`). `forms` holds each formula's
     (row, col, tokens, extra); one that is only a PtgExp takes the shared or array formula `anchored` keeps under the

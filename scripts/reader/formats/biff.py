@@ -3,7 +3,13 @@
 Offsets follow the [MS-XLS] layouts and were checked against dochan `office_binary/xls.py` (RK numbers, BOUNDSHEET,
 FORMAT, XF, DATEMODE and the SST) and anydoc `sheet/xls.rs` (the record walk and the string continuation rule).
 A record body stays an offset into the one stream `bytes`; only a string split by CONTINUE is assembled.
+
+A BIFF5 (Excel 5.0/95) workbook has the same records with byte strings in the CODEPAGE's code page: a sheet name
+and a format code take a one-byte length, a cell's text a two-byte one, and no string has a flags byte. Its globals
+keep that code page in `ansi` (None for BIFF8); its names, external sheets and drawing records differ and are not
+read, each NAME counted under `fact`.
 """
+import codecs
 import struct
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -27,6 +33,10 @@ MSODRAWINGGROUP = 0x00EB
 SUPBOOK = 0x01AE
 EXTERNSHEET = 0x0017
 NAME = 0x0018
+PROTECT = 0x0012
+WINDOWPROTECT = 0x0019
+CODEPAGE = 0x0042
+_CODECS = {1200: "utf-16-le", 367: "ascii", 32768: "mac_roman"}
 _BUILTIN = ("Consolidate_Area", "Auto_Open", "Auto_Close", "Extract", "Database", "Criteria", "Print_Area",
             "Print_Titles", "Recorder", "Data_Form", "Auto_Activate", "Auto_Deactivate", "Sheet_Title",
             "_FilterDatabase")
@@ -192,8 +202,11 @@ class Cursor:
             out.append(chunk if wide else chunk.decode("latin-1").encode("utf-16-le"))
         return b"".join(out).decode("utf-16-le", "replace")
 
-    def string(self) -> str:
-        """An XLUnicodeString; rich-text runs and phonetic bytes are skipped."""
+    def string(self, ansi: str | None = None) -> str:
+        """An XLUnicodeString; rich-text runs and phonetic bytes are skipped. With a BIFF5 code page `ansi`, a
+        two-byte length and that many bytes in it."""
+        if ansi:
+            return self.read(self.u16()).decode(ansi, "replace")
         n = self.u16()
         flags = self.u8()
         runs = self.u16() if flags & 0x08 else 0
@@ -263,6 +276,9 @@ class Globals:
     externs: list = field(default_factory=list)  # one sheet index per XTI (EXTERNSHEET), -1 when not a sheet here
     externs_last: list = field(default_factory=list)  # the last sheet index of each XTI, -1 when not a sheet here
     names: list = field(default_factory=list)  # one DefinedName per NAME (Lbl) record, in order
+    books: list = field(default_factory=list)
+    protect: list = field(default_factory=list)
+    ansi: str | None = None
 
 
 @dataclass
@@ -285,11 +301,9 @@ def read_globals(st: Stream) -> Globals:
     if first is None or first.id != BOF or first.size < 4:
         raise ReadError("damaged", "not a BIFF8 workbook")
     vers, dt = struct.unpack_from("<HH", data, first.off)
-    if vers == 0x0500:
-        raise ReadError("unsupported", "Excel 5.0/95 workbook")
-    if vers != 0x0600 or dt != 0x0005:
+    if vers not in (0x0500, 0x0600) or dt != 0x0005:
         raise ReadError("damaged", "not a BIFF8 workbook")
-    g = Globals()
+    g = Globals(ansi="cp1252" if vers == 0x0500 else None)
     drawing = []
     for rec in it:
         rid = rec.id
@@ -304,23 +318,48 @@ def read_globals(st: Stream) -> Globals:
     return g
 
 
+def _codec(n: int) -> str:
+    """The Python codec of a CODEPAGE value; cp1252 for one Python does not know."""
+    name = _CODECS.get(n, f"cp{n}")
+    try:
+        codecs.lookup(name)
+    except LookupError:
+        return "cp1252"
+    return name
+
+
 def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
     data = st.data
     rid, off, size = rec.id, rec.off, rec.size
-    if rid == BOUNDSHEET:
+    if g.ansi and rid in (SST, SUPBOOK, EXTERNSHEET, NAME, MSODRAWINGGROUP):
+        if rid == NAME:
+            st.ctx.skipped["fact"] += 1
+        return
+    if rid == CODEPAGE and g.ansi and size >= 2:
+        g.ansi = _codec(struct.unpack_from("<H", data, off)[0])
+    elif rid == BOUNDSHEET:
         try:
             if size < 8:
                 raise ValueError("short BOUNDSHEET")
             pos, state, kind = struct.unpack_from("<IBB", data, off)
-            name, _ = short_string(data[off + 6:off + size], 0)
+            if g.ansi:
+                n = data[off + 6]
+                if 7 + n > size:
+                    raise ValueError("short BOUNDSHEET")
+                name = data[off + 7:off + 7 + n].decode(g.ansi, "replace")
+            else:
+                name, _ = short_string(data[off + 6:off + size], 0)
             g.sheets.append(SheetRef(name, pos, state & 3, kind))
         except ValueError:
             # a damaged one keeps its place, so the sheet indexes after it (itabCur, EXTERNSHEET) stay right; its
             # offset is outside every stream, so the sheet walk counts it under `sheet`
             g.sheets.append(SheetRef("", -1, 0, 0))
-    elif rid == FORMAT and size >= 4:
+    elif rid == FORMAT and size >= 3:
         fid = struct.unpack_from("<H", data, off)[0]
-        g.formats[fid] = _cursor(st, rec, 2).string()
+        if g.ansi:
+            g.formats[fid] = data[off + 3:off + 3 + data[off + 2]].decode(g.ansi, "replace")
+        elif size >= 4:
+            g.formats[fid] = _cursor(st, rec, 2).string()
     elif rid == XF and size >= 4:
         g.xf_fmt.append(struct.unpack_from("<H", data, off + 2)[0])
     elif rid == DATEMODE and size >= 2:
@@ -330,7 +369,17 @@ def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
     elif rid == SST and not g.sst:  # kept: a later SST fills an empty first one (a damaged first must not hide it)
         g.sst = sst(_cursor(st, rec))
     elif rid == SUPBOOK and size >= 4:
-        g.supbooks.append(struct.unpack_from("<H", data, off + 2)[0] == 0x0401)
+        cch = struct.unpack_from("<H", data, off + 2)[0]
+        g.supbooks.append(cch == 0x0401)
+        if cch not in (0x0401, 0x3A01):
+            try:
+                cur = _cursor(st, rec, 4)
+                g.books.append(virtual_path(cur.chars(cch, bool(cur.u8() & 1))))
+            except ValueError:
+                g.books.append("")
+    elif rid in (PROTECT, WINDOWPROTECT) and size >= 2:
+        if struct.unpack_from("<H", data, off)[0]:
+            g.protect.append("workbook structure" if rid == PROTECT else "workbook windows")
     elif rid == EXTERNSHEET and size >= 2 and not g.externs:
         body = data[off:off + size] + b"".join(data[o:o + n] for o, n in rec.conts)
         n = min(struct.unpack_from("<H", body)[0], (len(body) - 2) // 6)
@@ -343,6 +392,27 @@ def _globals_record(st: Stream, g: Globals, rec: Rec, drawing: list) -> None:
     elif rid == MSODRAWINGGROUP:
         drawing.append(data[off:off + size])
         drawing.extend(data[o:o + n] for o, n in rec.conts)
+
+
+def virtual_path(s: str) -> str:
+    """A SUPBOOK's VirtualPath ([MS-XLS] 2.5.277) as a path: 0x01 and a drive letter (`@` a UNC share), 0x02 the
+    root of the same drive, 0x03 a separator, 0x04 the parent folder, 0x05 a length and a URL or UNC name kept as
+    it is; 0x06 to 0x08 (Excel's startup and library folders) are left out."""
+    out, i = [], 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\x01" and i + 1 < len(s):
+            out.append("\\\\" if s[i + 1] == "@" else s[i + 1] + ":" + ("" if s[i + 2:i + 3] == "\x03" else "\\"))
+            i += 2
+            continue
+        if ch == "\x05" and i + 1 < len(s):
+            n = ord(s[i + 1])
+            out.append(s[i + 2:i + 2 + n])
+            i += 2 + n
+            continue
+        out.append({"\x02": "\\", "\x03": "\\", "\x04": "..\\"}.get(ch, "" if ch in "\x06\x07\x08" else ch))
+        i += 1
+    return "".join(out)
 
 
 def _name(body: bytes) -> DefinedName:

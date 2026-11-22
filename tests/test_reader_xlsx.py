@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from reader import limits, markdown  # noqa: E402
 from reader.formats import ooxml, ooxml_sheets  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Hidden, Link, NoteRef, Text  # noqa: E402
+from reader.model import Context, Hidden, Link, NoteRef, Para, Text  # noqa: E402
 from reader_fix import XLSX_REL, XLSX_SML, make_xlsx, xlsx_cell, xlsx_row  # noqa: E402
 import test_reader_xlsb as xb  # noqa: E402  (the drawing, anchor and chart fixtures)
 
@@ -432,6 +432,174 @@ def linked(rows, links, rels=True, **kw):
     return md([sh], **kw)
 
 
+def texts(blocks) -> list:
+    """The text of each paragraph, a Hidden run's text in brackets."""
+    out = []
+    for b in blocks:
+        if isinstance(b, Para):
+            out.append("".join(i.text if isinstance(i, Text) else "[" + "".join(t.text for t in i.inlines) + "]"
+                               for i in b.inlines))
+    return out
+
+
+ONE = xlsx_row(1, xlsx_cell("A1", "v", t="str"))
+X14 = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
+XM = "http://schemas.microsoft.com/office/excel/2006/main"
+
+
+def test_defined_names_workbook_first_sheet_scoped_on_the_sheet():
+    book = ('<definedNames><definedName name="TaxRate">Lists!$B$1</definedName>'
+            '<definedName name="_xlnm._FilterDatabase" localSheetId="1" hidden="1">S!$A$1:$B$3</definedName>'
+            '<definedName name="Secret" localSheetId="1" hidden="1">S!$D$1</definedName>'
+            '<definedName name="_xlnm.Print_Area" localSheetId="1">S!$A$1:$C$9</definedName>'
+            '<definedName name="Local" localSheetId="1">S!$C$1</definedName></definedNames>')
+    doc, ctx, _ = parsed([sheet(ONE, name="Lists"), sheet(ONE)], book=book)
+    assert texts(doc.blocks[:1]) == ["Names: TaxRate = Lists!$B$1"], doc.blocks[:1]
+    assert texts(doc.blocks[2].blocks)[-1] == ("Names: Print_Area = S!$A$1:$C$9; Local = S!$C$1"
+                                              "[; Secret = S!$D$1]"), \
+        doc.blocks[2].blocks
+    assert texts(doc.blocks[1].blocks) == ["A1: v"], doc.blocks[1].blocks
+
+
+def test_slicer_and_timeline_cache_names_left_out():
+    """The name Excel keeps for each slicer and timeline cache (`Slicer_Product = #N/A`) is its own record, not
+    content: a workbook name that a slicerCache or timelineCache part names is left out."""
+    book = ('<definedNames><definedName name="NativeTimeline_Date">#N/A</definedName>'
+            '<definedName name="Rate">0.07</definedName><definedName name="Slicer_Product">#N/A</definedName>'
+            '</definedNames>')
+    rels = [("rS", "http://schemas.microsoft.com/office/2007/relationships/slicerCache",
+             "slicerCaches/slicerCache1.xml", False),
+            ("rT", "http://schemas.microsoft.com/office/2011/relationships/timelineCache",
+             "timelineCaches/timelineCache1.xml", False)]
+    parts = {"xl/slicerCaches/slicerCache1.xml": f'<slicerCacheDefinition xmlns="{X14}" name="Slicer_Product" '
+                                                 'sourceName="Product"/>',
+             "xl/timelineCaches/timelineCache1.xml":
+                 '<timelineCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" '
+                 'name="NativeTimeline_Date" sourceName="Date"/>'}
+    doc, ctx, _ = parsed([sheet(ONE)], book=book, wb_rels=rels, extra_parts=parts)
+    assert texts(doc.blocks[:1]) == ["Names: Rate = 0.07"] and not ctx.skipped, (doc.blocks[:1], ctx.skipped)
+
+
+def test_data_validation_lists_and_bounds():
+    after = ('<dataValidations count="2"><dataValidation type="list" allowBlank="1" sqref="J5:J8">'
+             '<formula1>"Open,Closed,Pending"</formula1></dataValidation>'
+             '<dataValidation type="whole" sqref="D5:E8 G1"><formula1>0</formula1><formula2>1000</formula2>'
+             '</dataValidation><dataValidation type="decimal" operator="greaterThan" sqref="H1">'
+             '<formula1>0.5</formula1></dataValidation></dataValidations>'
+             f'<extLst><ext uri="{{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}}" xmlns:x14="{X14}">'
+             f'<x14:dataValidations count="1" xmlns:xm="{XM}"><x14:dataValidation type="list">'
+             '<x14:formula1><xm:f>Lists!$A$1:$A$3</xm:f></x14:formula1><xm:sqref>B2:B9</xm:sqref>'
+             '</x14:dataValidation></x14:dataValidations></ext></extLst>')
+    doc, _, _ = parsed([sheet(ONE, after=after)])
+    assert texts(doc.blocks[0].blocks)[-1] == ('Validation: J5:J8 list "Open,Closed,Pending"; '
+                                              "D5:E8, G1 whole between 0 and 1000; H1 decimal > 0.5; "
+                                              "B2:B9 list =Lists!$A$1:$A$3"), doc.blocks[0].blocks
+
+
+def test_conditional_formats_one_line_a_rule():
+    after = ('<conditionalFormatting sqref="F5:F8"><cfRule type="cellIs" dxfId="0" priority="1" '
+             'operator="greaterThan"><formula>150</formula></cfRule><cfRule type="expression" priority="2">'
+             '<formula>$A5="x"</formula></cfRule></conditionalFormatting><conditionalFormatting sqref="B1:B9 C1">'
+             '<cfRule type="top10" rank="3" bottom="1" priority="3"/><cfRule type="colorScale" priority="4">'
+             '<colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFFF0000"/><color rgb="FF00FF00"/>'
+             '</colorScale></cfRule><cfRule type="containsText" operator="containsText" text="ok" priority="5">'
+             '<formula>NOT(ISERROR(SEARCH("ok",B1)))</formula></cfRule></conditionalFormatting>')
+    doc, _, _ = parsed([sheet(ONE, after=after)])
+    assert texts(doc.blocks[0].blocks)[1:] == ["Conditional F5:F8: cell > 150", 'Conditional F5:F8: formula =$A5="x"',
+                                               "Conditional B1:B9, C1: bottom 3", "Conditional B1:B9, C1: color scale",
+                                               'Conditional B1:B9, C1: contains "ok"'], doc.blocks[0].blocks
+
+
+def test_autofilter_range_and_criteria():
+    after = ('<autoFilter ref="A1:D41"><filterColumn colId="2"><filters><filter val="Open"/><filter val="Pending"/>'
+             '</filters></filterColumn><filterColumn colId="3"><customFilters and="1">'
+             '<customFilter operator="greaterThan" val="5"/><customFilter operator="lessThan" val="9"/>'
+             '</customFilters></filterColumn></autoFilter>')
+    doc, _, _ = parsed([sheet(ONE, after=after)])
+    assert texts(doc.blocks[0].blocks)[-1] == "Filter A1:D41: C is Open, Pending; D > 5 and D < 9", \
+        doc.blocks[0].blocks
+    doc, _, _ = parsed([sheet(ONE, after='<autoFilter ref="A1:B3"/>')])
+    assert texts(doc.blocks[0].blocks)[-1] == "Filter: A1:B3", doc.blocks[0].blocks
+
+
+def test_sheet_and_workbook_protection_are_flags():
+    doc, _, _ = parsed([sheet(ONE, after='<sheetProtection sheet="1" objects="1"/>'),
+                        sheet(ONE, name="T", after='<sheetProtection sheet="0"/>')],
+                       book='<workbookProtection lockStructure="1" lockWindows="0"/>')
+    assert texts(doc.blocks[:1]) == ["Protected: workbook structure"], doc.blocks[:1]
+    assert texts(doc.blocks[1].blocks)[-1] == "Protected: sheet", doc.blocks[1].blocks
+    assert texts(doc.blocks[2].blocks) == ["A1: v"], doc.blocks[2].blocks
+
+
+TABLE = ('<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" '
+         'displayName="Orders" ref="A1:D6" totalsRowCount="1"><autoFilter ref="A1:D5"/><tableColumns count="1">'
+         '<tableColumn id="1" name="Item"/></tableColumns></table>')
+
+
+def test_table_parts_give_name_range_and_totals_row():
+    sh = sheet(ONE, after='<tableParts count="1"><tablePart r:id="rT"/></tableParts>',
+               rels=[("rT", "table", "../tables/table1.xml", False)])
+    doc, ctx, _ = parsed([sh], extra_parts={"xl/tables/table1.xml": TABLE})
+    assert texts(doc.blocks[0].blocks)[-1] == "Table Orders A1:D6: header row 1; totals row 6", doc.blocks[0].blocks
+    assert not ctx.skipped, ctx.skipped
+
+
+PIVOT = ('<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotSales" '
+         'cacheId="1" dataCaption="Values"><location ref="A3:B7" firstHeaderRow="1" firstDataRow="1" '
+         'firstDataCol="1"/><pivotFields count="4"><pivotField axis="axisRow"/><pivotField axis="axisPage"/>'
+         '<pivotField/><pivotField dataField="1"/></pivotFields><rowFields count="1"><field x="0"/></rowFields>'
+         '<colFields count="2"><field x="2"/><field x="-2"/></colFields><pageFields count="1">'
+         '<pageField fld="1" hier="-1"/></pageFields><dataFields count="1"><dataField name="Sum of Amount" fld="3"/>'
+         '</dataFields></pivotTableDefinition>')
+CACHE = ('<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+         '<cacheSource type="worksheet"><worksheetSource ref="A1:D41" sheet="Data"/></cacheSource>'
+         '<cacheFields count="4"><cacheField name="Product"/><cacheField name="Region"/><cacheField name="Date"/>'
+         '<cacheField name="Amount"/></cacheFields></pivotCacheDefinition>')
+
+
+def test_pivot_table_source_and_fields():
+    sh = sheet(ONE, rels=[("rP", "pivotTable", "../pivotTables/pivotTable1.xml", False)])
+    parts = {"xl/pivotTables/pivotTable1.xml": PIVOT, "xl/pivotCache/pivotCacheDefinition1.xml": CACHE,
+             "xl/pivotTables/_rels/pivotTable1.xml.rels":
+                 xb.rels_xml(("rId1", "pivotCacheDefinition", "../pivotCache/pivotCacheDefinition1.xml"))}
+    doc, ctx, _ = parsed([sh], extra_parts=parts)
+    assert texts(doc.blocks[0].blocks)[-1] == ("Pivot PivotSales A3:B7: source Data!A1:D41; rows Product; "
+                                              "columns Date; values Sum of Amount; filters Region"), \
+        doc.blocks[0].blocks
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_external_link_targets_listed_by_number():
+    parts = {"xl/externalLinks/externalLink1.xml":
+             f'<externalLink xmlns="{XLSX_SML}" xmlns:r="{XLSX_REL}"><externalBook r:id="rId1"/></externalLink>',
+             "xl/externalLinks/_rels/externalLink1.xml.rels":
+                 '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                 'relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/'
+                 '2006/relationships/externalLinkPath" Target="file:///C:/x/budget.xlsx" TargetMode="External"/>'
+                 '</Relationships>'}
+    doc, ctx, _ = parsed([sheet(ONE)], book='<externalReferences><externalReference r:id="rX"/></externalReferences>',
+                         wb_rels=[("rX", "externalLink", "externalLinks/externalLink1.xml", False)],
+                         extra_parts=parts)
+    assert texts(doc.blocks[:1]) == ["External links: [1] file:///C:/x/budget.xlsx"], doc.blocks[:1]
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_slicer_and_timeline_named_not_their_fallback_text():
+    def slicer(kind, uri, prefix, name):
+        frame = (f'<xdr:graphicFrame><a:graphic><a:graphicData uri="{uri}"><{prefix}:{kind} xmlns:{prefix}="{uri}" '
+                 f'name="{name}"/></a:graphicData></a:graphic></xdr:graphicFrame>')
+        fallback = ('<xdr:sp><xdr:txBody><a:p><a:r><a:t>This shape represents a table slicer. Table slicers are '
+                    'not supported in this version of Excel.</a:t></a:r></a:p></xdr:txBody></xdr:sp>')
+        return (f'<mc:AlternateContent><mc:Choice Requires="{prefix}" xmlns:{prefix}="{uri}">{frame}</mc:Choice>'
+                f'<mc:Fallback>{fallback}</mc:Fallback></mc:AlternateContent>')
+    parts = drawn(1, xb.anchor(0, slicer("slicer", "http://schemas.microsoft.com/office/drawing/2010/slicer",
+                                         "sle15", "Product")),
+                  xb.anchor(5, slicer("timeslicer", "http://schemas.microsoft.com/office/drawing/2012/timeslicer",
+                                      "tsle", "Date")))
+    doc, ctx, _ = parsed([sheet(ONE, rels=[DRAWING])], extra_parts=parts)
+    assert texts(doc.blocks[0].blocks) == ["A1: v", "Slicer: Product", "Timeline: Date"], doc.blocks[0].blocks
+
+
 def test_hidden_rows_cols():
     rows = (xlsx_row(1, xlsx_cell("A1", "shown", t="str"), xlsx_cell("B1", "hc", t="str"))
             + xlsx_row(2, xlsx_cell("A2", "hr", t="str"), attrs='hidden="1"'))
@@ -727,7 +895,7 @@ def test_thread_cycle():
 def test_comment_cap():
     rows = "".join(xlsx_row(r, xlsx_cell(f"A{r}", "x", t="str")) for r in range(1, 6))
     leg = legacy_xml(*[(f"A{r}", 0, f"n{r}") for r in range(1, 6)])
-    with patched("MAX_COMMENTS", 3, ooxml_sheets):
+    with patched("SHEET_COMMENTS", 3):
         out, ctx = commented(rows, leg=leg)
     assert "[^3]" in out and "[^4]" not in out and ctx.skipped["comments_cut"] == 1, (out, ctx.skipped)
 

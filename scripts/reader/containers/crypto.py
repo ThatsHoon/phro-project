@@ -5,8 +5,11 @@ AES-192 and AES-256 and CBC mode for the pdf standard security handler.
 HWP distribution documents decrypt whole sections with these two, so the
 block loop is table-driven: four 32-bit lookups per column per round, the key
 schedule once per call, and one struct call each way for the whole buffer.
+CBC encryption chains its blocks one at a time on one key schedule. The tables
+are built on first use, so importing this module costs nothing.
 """
 import struct
+from functools import cache
 
 from .. import limits
 
@@ -28,7 +31,8 @@ def _mul(a, b):
     return r
 
 
-def _build():
+@cache
+def _tables():
     # Rijndael S-box: multiplicative inverse in GF(2^8), then the affine map.
     inv = [0] * 256
     for x in range(1, 256):
@@ -56,53 +60,56 @@ def _build():
     return sbox, isbox, tabs(te0), tabs(td0)
 
 
-_SBOX, _ISBOX, _TE, _TD = _build()
-
 
 def _round_keys(key):
     nk = len(key) // 4
     if len(key) not in (16, 24, 32):
         raise ValueError("AES needs a 16-, 24- or 32-byte key")
     rounds = nk + 6
+    sb = _tables()[0]
     w = list(struct.unpack(f">{nk}I", key))
     rcon = 1
     for i in range(nk, 4 * (rounds + 1)):
         t = w[i - 1]
         if i % nk == 0:
             t = ((t << 8) | (t >> 24)) & _M
-            t = (_SBOX[t >> 24] << 24 | _SBOX[(t >> 16) & 255] << 16
-                 | _SBOX[(t >> 8) & 255] << 8 | _SBOX[t & 255])
+            t = (sb[t >> 24] << 24 | sb[(t >> 16) & 255] << 16
+                 | sb[(t >> 8) & 255] << 8 | sb[t & 255])
             t ^= rcon << 24
             rcon = _xtime(rcon)
         elif nk > 6 and i % nk == 4:
-            t = (_SBOX[t >> 24] << 24 | _SBOX[(t >> 16) & 255] << 16
-                 | _SBOX[(t >> 8) & 255] << 8 | _SBOX[t & 255])
+            t = (sb[t >> 24] << 24 | sb[(t >> 16) & 255] << 16
+                 | sb[(t >> 8) & 255] << 8 | sb[t & 255])
         w.append(w[i - nk] ^ t)
     return w
 
 
 def _inverse_keys(w, rounds=10):
     """Round keys for the equivalent inverse cipher (middle rounds InvMixColumns'd)."""
-    td0, td1, td2, td3 = _TD
+    sb, _, _, (td0, td1, td2, td3) = _tables()
     out = []
     for r in range(rounds, -1, -1):
         rk = w[4 * r:4 * r + 4]
         if 0 < r < rounds:
-            rk = [td0[_SBOX[x >> 24]] ^ td1[_SBOX[(x >> 16) & 255]]
-                  ^ td2[_SBOX[(x >> 8) & 255]] ^ td3[_SBOX[x & 255]] for x in rk]
+            rk = [td0[sb[x >> 24]] ^ td1[sb[(x >> 16) & 255]]
+                  ^ td2[sb[(x >> 8) & 255]] ^ td3[sb[x & 255]] for x in rk]
         out.extend(rk)
     return out
 
 
-def _quads(rk, rounds=10):
+def _schedule(key, decrypt: bool):
+    """A key's round keys for one direction, as (middle rounds, first, last), each a quadruple."""
+    rounds = len(key) // 4 + 6
+    rk = _round_keys(key)
+    if decrypt:
+        rk = _inverse_keys(rk, rounds)
     end = 4 * rounds
     return [tuple(rk[i:i + 4]) for i in range(4, end, 4)], rk[0:4], rk[end:end + 4]
 
 
-def _encrypt_words(words, rk, rounds=10):
-    t0, t1, t2, t3 = _TE
-    sb = _SBOX
-    mid, (k0, k1, k2, k3), (f0, f1, f2, f3) = _quads(rk, rounds)
+def _encrypt_words(words, sched):
+    sb, _, (t0, t1, t2, t3), _ = _tables()
+    mid, (k0, k1, k2, k3), (f0, f1, f2, f3) = sched
     out = []
     add = out.extend
     for i in range(0, len(words), 4):
@@ -124,10 +131,9 @@ def _encrypt_words(words, rk, rounds=10):
     return out
 
 
-def _decrypt_words(words, rk, rounds=10):
-    t0, t1, t2, t3 = _TD
-    sb = _ISBOX
-    mid, (k0, k1, k2, k3), (f0, f1, f2, f3) = _quads(rk, rounds)
+def _decrypt_words(words, sched):
+    _, sb, _, (t0, t1, t2, t3) = _tables()
+    mid, (k0, k1, k2, k3), (f0, f1, f2, f3) = sched
     out = []
     add = out.extend
     for i in range(0, len(words), 4):
@@ -149,26 +155,24 @@ def _decrypt_words(words, rk, rounds=10):
     return out
 
 
-def _crypt(key, data, transform):
-    rk = _round_keys(key)
-    rounds = len(key) // 4 + 6
-    if transform is _decrypt_words:
-        rk = _inverse_keys(rk, rounds)
+def _crypt(key, data, decrypt: bool):
+    sched = _schedule(key, decrypt)
     n = len(data) // 16
     if not n:
         return bytes(data)
     words = struct.unpack(f">{n * 4}I", data[:n * 16])
-    return struct.pack(f">{n * 4}I", *transform(words, rk, rounds)) + bytes(data[n * 16:])
+    transform = _decrypt_words if decrypt else _encrypt_words
+    return struct.pack(f">{n * 4}I", *transform(words, sched)) + bytes(data[n * 16:])
 
 
 def aes_ecb_encrypt(key: bytes, data: bytes) -> bytes:
     """Encrypt whole 16-byte blocks with a 16-, 24- or 32-byte key; a trailing partial block is returned as is."""
-    return _crypt(key, data, _encrypt_words)
+    return _crypt(key, data, False)
 
 
 def aes_ecb_decrypt(key: bytes, data: bytes) -> bytes:
     """Decrypt whole 16-byte blocks with a 16-, 24- or 32-byte key; a trailing partial block is returned as is."""
-    return _crypt(key, data, _decrypt_words)
+    return _crypt(key, data, True)
 
 
 aes128_ecb_encrypt = aes_ecb_encrypt
@@ -198,16 +202,15 @@ def aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
 
 
 def aes_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
-    """CBC encrypt without padding; blocks chain, so they run one at a time."""
+    """CBC encrypt without padding; blocks chain, so they run one at a time on one key schedule."""
     _cbc_check(key, iv, data)
-    prev = int.from_bytes(iv, "big")
+    sched = _schedule(key, False)
+    a, b, c, d = struct.unpack(">4I", iv)
     out = []
-    for i in range(0, len(data), 16):
-        x = int.from_bytes(data[i:i + 16], "big") ^ prev
-        c = aes_ecb_encrypt(key, x.to_bytes(16, "big"))
-        out.append(c)
-        prev = int.from_bytes(c, "big")
-    return b"".join(out)
+    for w0, w1, w2, w3 in struct.iter_unpack(">4I", data):
+        a, b, c, d = _encrypt_words((w0 ^ a, w1 ^ b, w2 ^ c, w3 ^ d), sched)
+        out += (a, b, c, d)
+    return struct.pack(f">{len(out)}I", *out)
 
 
 class MsvcRand:
