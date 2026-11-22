@@ -254,8 +254,42 @@ def test_conditional_rules_one_line_each():
     test = struct.pack("<BHH", 0x24, 4, 0xC005) + struct.pack("<BH", 0x1E, 100) + b"\x0d"
     form = rec(0x01B1, struct.pack("<BBHH", 2, 0, len(test), 0) + bytes(6) + test)
     doc, _ = book([{"name": "S", "cells": {(0, 0): "x"}, "records": [condfmt, cell, form]}])
-    assert texts(doc.blocks[0].blocks)[1:] == ["Conditional F5:F8: cell > 150", "Conditional F5:F8: formula =F5>100"], \
+    assert texts(doc.blocks[0].blocks)[1:] == ["Conditional: F5:F8 cell > 150; F5:F8 formula =F5>100"], \
         doc.blocks[0].blocks
+
+
+def test_pivot_view_names_its_range_and_values_and_unread_facts_are_counted():
+    view = rec(0x00B0, struct.pack("<4H", 2, 6, 0, 1) + struct.pack("<16H", *[0] * 16)
+               + struct.pack("<HH", 10, 4) + b"\0PivotSales" + b"\0Data")
+    item = rec(0x00C5, struct.pack("<7H", 3, 0, 0, 0, 0, 0, 13) + b"\0Sum of Amount")
+    bare = rec(0x00B0, struct.pack("<4H", 9, 12, 3, 4) + struct.pack("<16H", *[0] * 16)
+               + struct.pack("<HH", 2, 0) + b"\x01" + "피벗".encode("utf-16-le"))
+    unread = [rec(0x0872, bytes(30)), rec(0x087A, bytes(30)), rec(0x00B0, bytes(10))]
+    doc, ctx = book([{"name": "S", "cells": {(0, 0): "x"}, "records": [view, item, bare, *unread]}])
+    assert texts(doc.blocks[0].blocks)[1:] == ["Pivot PivotSales A3:B7: values Sum of Amount", "Pivot: 피벗 D10:E13"], \
+        doc.blocks[0].blocks
+    assert ctx.skipped == {"fact": 2, "record": 1}, ctx.skipped
+
+
+def test_hyperlink_with_a_location_keeps_its_file():
+    records = [hlink(0, 0, 0, 0, url="https://example.com/page", place="section2"),
+               hlink(0, 0, 1, 1, path="other.xls", place="Sheet1!A1")]
+    doc, ctx = book([{"name": "S", "cells": {(0, 0): "site", (0, 1): "file"}, "records": records}])
+    t = doc.blocks[0].blocks[0]
+    assert cell_inlines(t, 0, 0) == [Link("https://example.com/page#section2", [Text("site")])], cell_inlines(t, 0, 0)
+    assert cell_inlines(t, 0, 1) == [Link("..\\other.xls#Sheet1!A1", [Text("file")])], cell_inlines(t, 0, 1)
+
+
+def test_formula_with_an_empty_text_result_is_listed():
+    def formula(r, value):
+        tokens = struct.pack("<BHH", 0x44, r, 0xC000) + struct.pack("<BH", 0x1E, 2) + b"\x05"
+        return rec(0x0006, struct.pack("<HHH", r, 1, 15) + value + struct.pack("<HIH", 0, 0, len(tokens)) + tokens)
+
+    empty = bytes([3, 0, 0, 0, 0, 0, 0xFF, 0xFF])
+    records = [formula(0, struct.pack("<d", 2.0)), formula(1, empty), formula(2, struct.pack("<d", 6.0))]
+    doc, ctx = book([{"name": "S", "cells": {(0, 0): "1", (1, 0): "2", (2, 0): "3"}, "records": records}])
+    assert texts(doc.blocks[0].blocks)[-1] == "Formulas: B1:B3 =A1*2" and not ctx.skipped, \
+        (doc.blocks[0].blocks, ctx.skipped)
 
 
 def test_autofilter_range_from_its_name_and_criteria():

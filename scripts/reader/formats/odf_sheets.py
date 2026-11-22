@@ -144,15 +144,17 @@ class _Sheet:
                     return
                 for c in range(col, col + crep) if form else ():
                     grid.formula(r, c, sheet_grid.pattern(form, r, c))
-                if cs > 1 or rs > 1:
+                    if grid.cut:
+                        return
+                if (cs > 1 or rs > 1) and not grid.merges_cut:
                     for c in range(col, col + crep):
                         grid.merge(r, r + rs - 1, c, c + cs - 1)
 
     # ---- cells
     def cells(self, tr, d) -> list:
         """(column, repeats, column span, row span, blocks or None, their characters, formula) of the row's cells that
-        hold something or span. A cell's repeats end one column past SHEET_COLS, where `put` stops the sheet, and
-        the row ends with it."""
+        hold something, have a formula or span. A cell's repeats end one column past SHEET_COLS, where `put` stops
+        the sheet, and the row ends with it."""
         out, col = [], 0
         for c in tr:
             n = _ln(c.tag)
@@ -167,7 +169,7 @@ class _Sheet:
             if n == "table-cell":
                 form = _of(attr(c, "formula")) if c.attrib else ""
                 blocks, text = self.blocks(c, d, form)
-                if text or cs > 1 or rs > 1:
+                if text or form or cs > 1 or rs > 1:
                     out.append((col, min(rep, max(1, limits.SHEET_COLS + 1 - col)), cs, rs,
                                 tuple(blocks) if text else None, blocks_len(blocks), form))
                     if col + rep > limits.SHEET_COLS:

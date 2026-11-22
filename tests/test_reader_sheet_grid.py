@@ -12,7 +12,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
-from reader.formats.sheet_grid import Budget, Grid, address, formula_text, listed, pattern, text_inlines  # noqa: E402
+from reader.formats.sheet_grid import Budget, Grid, address, formula_text, listed, pattern, ruled, text_inlines  # noqa: E402
 from reader.model import Bold, Break, Context, Doc, Hidden, Link, NoteRef, Para, Table, Text  # noqa: E402
 
 
@@ -689,10 +689,122 @@ def test_hidden_facts_follow_the_shown_ones_and_all_hidden_hides_the_paragraph()
 
 def test_facts_past_the_characters_are_counted():
     ctx = Context()
-    budget = Budget(chars=12)
+    budget = Budget(chars=19)
     p, = listed("Names", [("A = S!$A$1", False), ("B = S!$B$1", False)], budget, ctx)
     assert para_text(p) == "Names: A = S!$A$1; (1 more not listed)", para_text(p)
     assert ctx.skipped["fact"] == 1 and budget.chars == 0, (ctx.skipped, budget.chars)
+
+
+def test_references_inside_quoted_sheet_names_and_structured_references_stay_text():
+    cases = [("'Q1 2024'!B2*2", 1, 0, "'Q1 2024'!B5*2", 4, 0),
+             ("'It''s A1'!$A1+A1", 0, 1, "'It''s A1'!$A3+A3", 2, 1),
+             ("Tbl[[#This Row],[Q1]]*B2", 1, 2, "Tbl[[#This Row],[Q1]]*B3", 2, 2),
+             ("SUM(Tbl[Q1])+[1]Sheet1!A1", 0, 0, "SUM(Tbl[Q1])+[1]Sheet1!A2", 1, 0),
+             ('"it''s B2"&B2&\'x"y\'!B2', 1, 0, '"it''s B2"&B3&\'x"y\'!B3', 2, 0)]
+    for text, r, c, moved, r2, c2 in cases:
+        pat = pattern(text, r, c)
+        assert formula_text(pat, r, c) == text, (text, pat)
+        assert formula_text(pat, r2, c2) == moved, (text, formula_text(pat, r2, c2))
+    assert pattern("'Q1 2024'!B2*2", 1, 0) == pattern("'Q1 2024'!B5*2", 4, 0)
+    t0 = time.perf_counter()
+    pattern("[a" * 20_000 + "'b" * 20_001, 0, 0)
+    assert time.perf_counter() - t0 < 2
+
+
+def test_formula_of_a_cell_without_a_value_is_listed_and_charged():
+    budget = Budget(cells=20)
+    g, _ = mk(budget=budget)
+    for r in range(12):
+        if r % 3:
+            g.put(r, 1, "v")
+        g.formula(r, 1, pattern(f'IF(A{r + 1}>4,"",A{r + 1}*2)', r, 1))
+    assert para_text(g.sheet_blocks()[-1]) == 'Formulas: B1:B12 =IF(A1>4,"",A1*2)', g.sheet_blocks()[-1]
+    assert budget.cells == 8, budget.cells
+    g, ctx = mk(budget=Budget(cells=1))
+    g.formula(0, 0, pattern("1+1", 0, 0))
+    g.formula(1, 0, pattern("1+2", 1, 0))
+    g.formula(2, 0, pattern("1+3", 2, 0))
+    out = g.sheet_blocks()
+    assert [para_text(p) for p in out] == ["(Sheet cut at A2 by the document's 1-cell limit; not read from there on)",
+                                           "Formulas: A1 =1+1"], out
+    assert ctx.skipped["sheet_cut"] == 1, ctx.skipped
+
+
+def test_cut_paragraph_follows_the_tables_before_the_formulas():
+    g, _ = mk("S", Budget(cells=2))
+    g.put(0, 0, "1")
+    g.put(0, 1, "2")
+    g.formula(0, 1, pattern("A1+1", 0, 1))
+    assert not g.put(1, 0, "3")
+    g.fact("Protected", [("sheet", False)])
+    out = g.sheet_blocks()
+    assert [para_text(p) for p in out[1:]] == ["(Sheet cut at A2 by the document's 2-cell limit; not read from there on)",
+                                               "Formulas: B1 =A1+1", "Protected: sheet"], out[1:]
+
+
+def test_listing_stops_building_entries_at_the_cap_and_charges_the_label():
+    ctx, made = Context(), []
+
+    def entries():
+        for i in range(1000):
+            made.append(i)
+            yield f"e{i}", False
+
+    p, = listed("L", entries(), Budget(), ctx, cap=3, total=1000)
+    assert para_text(p) == "L: e0; e1; e2; (997 more not listed)" and len(made) == 4, (para_text(p), len(made))
+    budget = Budget(chars=10)
+    assert listed("A long label", [("x", False)], budget, ctx) == []
+    assert ctx.skipped["fact"] == 998 and budget.chars == 10, (ctx.skipped, budget.chars)
+    budget = Budget(chars=12)
+    p, = listed("Names", [("ab", False)], budget, ctx)
+    assert para_text(p) == "Names: ab" and budget.chars == 1, budget.chars
+
+
+def test_facts_past_the_item_cap_are_counted():
+    g, ctx = mk()
+    g.put(0, 0, "1")
+    g.fact("Names", [(f"n{i} = {i}", False) for i in range(5)])
+    limits.FACT_ITEMS, saved = 2, limits.FACT_ITEMS
+    try:
+        p = g.sheet_blocks()[-1]
+    finally:
+        limits.FACT_ITEMS = saved
+    assert para_text(p) == "Names: n0 = 0; n1 = 1; (3 more not listed)" and ctx.skipped["fact"] == 3, para_text(p)
+
+
+def test_rules_join_their_ranges_and_list_them_up_to_the_cap():
+    rules = [(["F5:F8"], "cell > 150"), (["B1:B9", "C1"], "top 3"), (["H1", "F5:F8"], "cell > 150")]
+    rules += [([f"A{i}"], "blank") for i in range(1, limits.FACT_VALUES + 11)]
+    many = ", ".join(f"A{i}" for i in range(1, limits.FACT_VALUES + 1))
+    assert ruled(rules) == [("F5:F8, H1 cell > 150", False), ("B1:B9, C1 top 3", False),
+                            (f"{many} and 10 more blank", False)], ruled(rules)
+
+
+def test_link_with_a_place_keeps_its_url():
+    g, ctx = mk()
+    ctx.name = "Book One.xlsx"
+    for c, v in enumerate(("site", "jump", "own", "other")):
+        g.put(0, c, v)
+    g.link(0, 0, 0, 0, "https://example.com/page", "section2")
+    g.link(0, 0, 1, 1, None, "Lists!A1")
+    g.link(0, 0, 2, 2, "../Book%20One.xlsx", "Lists!B2")
+    g.link(0, 0, 3, 3, "other.xlsx", "Sheet1!A1")
+    assert g.get(0, 0) == [Link("https://example.com/page#section2", [Text("site")])], g.get(0, 0)
+    assert g.get(0, 1) == [Text("jump"), Text(" → Lists!A1")], g.get(0, 1)
+    assert g.get(0, 2) == [Text("own"), Text(" → Lists!B2")], g.get(0, 2)
+    assert g.get(0, 3) == [Link("other.xlsx#Sheet1!A1", [Text("other")])], g.get(0, 3)
+
+
+def test_record_table_caption_names_its_hidden_runs():
+    g, _ = mk()
+    fill(g, 0, 3, 0, 2)
+    g.hide_rows(1, 2)
+    g.hide_cols(1, 1)
+    t, = g.blocks()
+    assert t.caption == "(hidden rows 2-3; hidden columns B)", t.caption
+    g, _ = mk()
+    fill(g, 0, 1, 0, 1)
+    assert g.blocks()[0].caption == ""
 
 
 def test_header_rows_marked():

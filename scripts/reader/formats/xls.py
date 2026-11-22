@@ -46,6 +46,8 @@ _MSODRAWING = 0x00EC  # a sheet's drawing records, joined and read by xls_drawin
 _TXO = 0x01B6        # a text box's text, in the CONTINUEs after it
 _OBJ, _NOTE, _HLINK, _DV, _CONDFMT, _CF = 0x005D, 0x001C, 0x01B8, 0x01BE, 0x01B0, 0x01B1
 _AUTOFILTERINFO, _AUTOFILTER = 0x009D, 0x009E
+_SXVIEW, _SXDI = 0x00B0, 0x00C5
+_UNREAD = frozenset({0x0872, 0x0878, 0x087A})
 _COMMENT = 0x19
 _OBJ5 = {5: None, 8: "image"}
 _URL_MONIKER = bytes.fromhex("e0c9ea79f9bace118c8200aa004ba90b")   # {79EAC9E0-BAF9-11CE-8C82-00AA004BA90B}
@@ -212,7 +214,9 @@ class Workbook:
         return blocks
 
     def _facts(self, i, grid, sh):
-        """The sheet's facts in their order: its names, its filter, its validations, its rules, its protection."""
+        """The sheet's facts in their order: its names, its filter, its validations, its rules, its pivot tables
+        (SXVIEW: the range, 16 fields, the lengths of its name and its data name, the name; an SXDI's name is a
+        value it shows), its protection. A table (FEAT11, FEAT12) and a CF12 rule are counted under fact."""
         grid.fact("Names", [e for e in (ptg.named(n, sh.env, self.ctx) for n in self.g.names if n.itab == i + 1)
                             if e])
         rng = self._filter_range(i) if sh.filtered else None
@@ -224,8 +228,12 @@ class Workbook:
             else:
                 grid.fact("Filter", [(where, False)])
         grid.fact("Validation", sh.valid)
-        for where, rule in sh.rules:
-            grid.fact(f"Conditional {where}", [(rule, False)])
+        grid.fact("Conditional", sheet_grid.ruled(sh.rules))
+        for name, where, values in sh.pivots:
+            if values:
+                grid.fact(" ".join(filter(None, ("Pivot", name, where))), [("values " + ", ".join(values), False)])
+            else:
+                grid.fact("Pivot", [(f"{name} {where}".strip(), False)])
         if sh.protect:
             grid.fact("Protected", [("sheet", False)])
 
@@ -439,7 +447,19 @@ class Workbook:
             return [sheet_grid.span(*r) for r in _refs(body, 12)], bound[0], bound[2]
         elif rid == _CF:
             if cond is not None:
-                sh.rules.append((", ".join(cond[0]), self._cf(body, replace(sh.env, row=cond[1], col=cond[2]))))
+                sh.rules.append((cond[0], self._cf(body, replace(sh.env, row=cond[1], col=cond[2]))))
+        elif rid == _SXVIEW:
+            r1, r2, c1, c2 = struct.unpack_from("<4H", body)
+            n = struct.unpack_from("<H", body, 40)[0]
+            if r1 > r2 or c1 > c2 or len(body) < 45:
+                raise ValueError("pivot view")
+            sh.pivots.append((_hname(body, 44, n), sheet_grid.span(r1, r2, c1, c2), []))
+        elif rid == _SXDI:
+            n = struct.unpack_from("<H", body, 12)[0]
+            if sh.pivots and n != 0xFFFF and len(sh.pivots[-1][2]) < limits.FACT_VALUES:
+                sh.pivots[-1][2].append(_hname(body, 14, n))
+        elif rid in _UNREAD:
+            self.ctx.skipped["fact"] += 1
         elif rid == _AUTOFILTER:
             sh.crit.append(body)
         elif rid == _AUTOFILTERINFO:
@@ -588,11 +608,21 @@ class _Sheet:
         self.comments: dict[int, str] = {}
         self.notes: list = []
         self.links: list = []
-        self.valid, self.rules, self.crit = [], [], []
+        self.valid, self.rules, self.crit, self.pivots = [], [], [], []
         self.protect = self.filtered = False
 
 
-_FACTS = frozenset({_NOTE, _HLINK, _DV, _CONDFMT, _CF, _AUTOFILTERINFO, _AUTOFILTER, biff.PROTECT})
+_FACTS = frozenset({_NOTE, _HLINK, _DV, _CONDFMT, _CF, _AUTOFILTERINFO, _AUTOFILTER, biff.PROTECT, _SXVIEW, _SXDI,
+                    *_UNREAD})
+
+
+def _hname(body: bytes, pos: int, n: int) -> str:
+    """An XLUnicodeStringNoCch of `n` characters at `pos`: a flags byte (bit 0: UTF-16), then the characters."""
+    wide = body[pos] & 1
+    raw = body[pos + 1:pos + 1 + n * (2 if wide else 1)]
+    if len(raw) < n * (2 if wide else 1):
+        raise ValueError("string cut")
+    return raw.decode("utf-16-le" if wide else "latin-1", "replace").strip()
 
 
 def _refs(body: bytes, pos: int) -> list:

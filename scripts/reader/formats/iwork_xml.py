@@ -678,7 +678,7 @@ class Reader:
         if not out:
             return []
         if isinstance(out[0], Table):
-            out[0].caption = name
+            out[0].caption = f"{name} {out[0].caption}".strip()
             return out[:1]
         return [Table([[Cell(out[:1])]], caption=name)]  # one cell: Grid gives a paragraph
 

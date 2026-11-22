@@ -18,7 +18,8 @@ SHEET_RUNS = 20           # hidden row or column runs a sheet table's caption na
 SHEET_ISLAND_STEPS = 8 * SHEET_CELLS  # cells (and columns) one sheet's island splits may visit, all levels together
 FORMULA_GROUPS = 1_000    # cell ranges one sheet's formulas paragraph lists; the groups past them are counted
 SHEET_COMMENTS = 10_000   # cell comments one workbook may turn into notes; the rest are cut, counted once
-FACT_VALUES = 20          # values one filter column's line lists; the rest are counted in the line
+FACT_VALUES = 20          # values or ranges one entry of a sheet's fact lists; the rest are counted in the entry
+FACT_ITEMS = 1_000        # entries one fact paragraph of a sheet lists; the rest are counted
 # XML elements one xlsx workbook's sheet parts may close, styled empty cells included, and the entries its shared-string
 # table may hold. ooxml_sheets caps the other streamed parts: the shared strings at SST_ELEMENTS (2) times this many
 # closed elements, the styles at STYLE_ELEMENTS (1,000,000). Measured: 2,000,000 cells stream in 1.4 s, the whole xlsx

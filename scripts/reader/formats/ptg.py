@@ -75,7 +75,7 @@ _ARITY = {
     287: 3, 288: 2, 289: 4, 290: 3, 291: 3, 292: 3, 293: 4, 294: 1, 295: 3, 296: 1, 297: 3, 298: 1, 299: 2,
     300: 3, 301: 3, 302: 4, 303: 2, 304: 2, 305: 2, 306: 2, 307: 2, 308: 2, 309: 3, 310: 2, 311: 2, 312: 2,
     313: 2, 314: 2, 315: 2, 316: 4, 325: 2, 326: 2, 327: 2, 328: 2, 331: 2, 332: 2, 337: 2, 342: 1, 343: 1,
-    346: 2, 347: 1, 350: 4, 351: 3, 352: 1, 353: 2, 360: 1, 368: 1}
+    346: 2, 347: 1, 350: 4, 351: 3, 352: 1, 353: 2, 360: 1, 368: 1, 480: 2}
 
 
 class _Unknown(Exception):
@@ -131,12 +131,12 @@ def named(n, env: Env, ctx):
 
 
 def put(grid, forms: list, anchored: dict, env: Env, ctx) -> None:
-    """Each held cell's formula into the sheet's formulas paragraph (`Grid.formula`). `forms` holds each formula's
+    """Each cell's formula into the sheet's formulas paragraph (`Grid.formula`). `forms` holds each formula's
     (row, col, tokens, extra); one that is only a PtgExp takes the shared or array formula `anchored` keeps under the
     cell it names, read once at that cell. A formula not read here is `?` and counted under formula."""
     done = {}
     for row, col, rgce, extra in forms:
-        if (row, col) not in grid.cells:
+        if not rgce or grid.cut and (row, col) not in grid.cells:
             continue
         at = exp(rgce, extra, env.wide)
         if at is None:

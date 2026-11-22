@@ -80,6 +80,7 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     t0 = time.monotonic()
     src, out_dir = Path(src), Path(out_dir)
     ctx = Context()
+    ctx.name = src.name
     if FORMATS.get(ext_of(src)) in ("pdf", "djvu"):  # the page loop's deadline runs from the process start
         opts.setdefault("started", STARTED)
     backend, store, deadline = ocr.backend() if backend is None else backend, None, None

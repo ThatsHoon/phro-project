@@ -25,14 +25,15 @@ import re
 from bisect import bisect_left, bisect_right, insort
 from itertools import groupby
 from operator import itemgetter
+from urllib.parse import unquote
 
 from .. import limits
 from ..markdown import blocks_len
 from ..numfmt import display
 from ..model import Bold, Break, Cell, Hidden, Link, NoteRef, Para, Table, Text
 
-_GAP = 64            # empty rows a record table keeps between two rows that hold values; the longest run inside an island
-_MERGES = 100_000    # merged ranges one sheet may keep
+_GAP = 64
+_MERGES = 100_000
 _FIRST_ROW, _FIRST_COL, _LAST_ROW, _LAST_COL = (itemgetter(i) for i in range(4))
 _FIRST_TWO = itemgetter(0, 1)
 
@@ -93,7 +94,7 @@ def text_inlines(text: str) -> list:
 
 
 _REF = re.compile(
-    r'("(?:[^"]|"")*")'
+    r"""("(?:[^"]|"")*"|'(?:[^']|'')*'|\[(?:[^\[\]]|\[[^\[\]]*\])*\])"""
     r"|(?<![\w.$\]])(\$?)([A-Z]{1,3})(\$?)([1-9][0-9]{0,6})(?![\w(!\[])"
     r"|(?<![\w.$:\]])(\$?)([A-Z]{1,3}):(\$?)([A-Z]{1,3})(?![\w(!\[$:])"
     r"|(?<![\w.$:\]])(\$?)([1-9][0-9]{0,6}):(\$?)([1-9][0-9]{0,6})(?![\w(!\[$:.])")
@@ -115,7 +116,8 @@ def _part(dollar: str, value: int, base: int):
 def pattern(text: str, row: int, col: int) -> tuple:
     """The R1C1 pattern of a formula's A1 text at (row, col): the text between its references, and each reference as
     a tuple of its coordinates (an absolute one ("$", n), a relative one its offset from the cell). The cells of one
-    fill-down or fill-right have one pattern. A reference past the sheet's last row or column stays text."""
+    fill-down or fill-right have one pattern. A reference past the sheet's last row or column stays text, and so
+    does all of a string, a quoted sheet name and a bracketed part (a structured reference, a workbook index)."""
     out, at = [], 0
     for m in _REF.finditer(text):
         g = m.groups()
@@ -228,6 +230,29 @@ def rule(kind: str, forms=("", ""), op=None, text: str = "", rank=10, bottom=Fal
     return _RULES.get(kind, kind)
 
 
+def ruled(rules) -> list:
+    """Conditional format rules ((ranges, rule) in the file's order) as a fact's entries, `<ranges> <rule>`: the
+    ranges of one rule joined, a range said once, the first FACT_VALUES of them and how many more."""
+    groups = {}
+    for ranges, rule in rules:
+        got = groups.get(rule)
+        if got is None:
+            got = groups[rule] = [{}, 0]
+        for r in ranges:
+            if r in got[0]:
+                continue
+            if len(got[0]) < limits.FACT_VALUES:
+                got[0][r] = None
+            else:
+                got[1] += 1
+    return [(", ".join(shown) + (f" and {more:,} more" if more else "") + " " + rule, False)
+            for rule, (shown, more) in groups.items() if shown]
+
+
+def _leaf(url: str) -> str:
+    return unquote(url.replace("\\", "/").rsplit("/", 1)[-1]).casefold()
+
+
 def span(r1: int, r2: int, c1: int, c2: int) -> str:
     """An inclusive zero-based range in A1 form, one cell as its address."""
     return address(r1, c1) if (r1, c1) == (r2, c2) else f"{address(r1, c1)}:{address(r2, c2)}"
@@ -264,12 +289,22 @@ def sweep(blocks: list, keys: list, notes: dict) -> int:
     return gone
 
 
-def listed(label: str, entries, budget, ctx, kind: str = "fact", cap: int = 0) -> list:
+def listed(label: str, entries, budget, ctx, kind: str = "fact", cap: int = 0, total=None) -> list:
     """One paragraph, `label: ` and its entries joined by `; `, or none for no entries. An entry is (text, hidden)
     or (text, hidden, units); the shown ones come first, in order, then the hidden ones, each a Hidden run (all
-    hidden, the whole paragraph is). Each is charged its characters to `budget`; past them, or past `cap` units when
-    one is given, the rest are counted under `kind` and the paragraph says how many."""
-    entries = sorted(entries, key=itemgetter(1))
+    hidden, the whole paragraph is). The label and each entry are charged their characters to `budget`; past them,
+    or past `cap` units when one is given, the rest are counted under `kind` and the paragraph says how many (a
+    label that does not fit leaves no paragraph). With `total`, `entries` is an iterator of that many entries
+    already in that order, read only as far as it is listed."""
+    if total is None:
+        entries = sorted(entries, key=itemgetter(1))
+        total = len(entries)
+    if not total:
+        return []
+    if budget.chars < len(label) + 2:
+        ctx.skipped[kind] += total
+        return []
+    budget.chars -= len(label) + 2
     body, units, shown, visible = [], 0, 0, 0
     for text, hid, *n in entries:
         units += n[0] if n else 1
@@ -280,12 +315,10 @@ def listed(label: str, entries, budget, ctx, kind: str = "fact", cap: int = 0) -
         body.append(Hidden([Text(text)]) if hid else Text(text))
         shown += 1
         visible += not hid
-    rest = len(entries) - shown
+    rest = total - shown
     if rest:
         ctx.skipped[kind] += rest
         body.append(Text(f"{'; ' if visible else ''}({rest:,} more not listed)"))
-    if not body:
-        return []
     if not visible and not rest:
         return [Para([Hidden([Text(f"{label}: ")] + [t for h in body for t in h.inlines])])]
     return [Para([Text(f"{label}: ")] + body)]
@@ -442,6 +475,13 @@ def _runs(spans, name) -> str:
     return ", ".join(shown) + (f" and {more:,} more" if more > 0 else "")
 
 
+def _hidden_note(hr, hc) -> str:
+    """`(hidden rows 2-3; hidden columns B)` for the hidden runs inside a table, or ""."""
+    notes = ([f"hidden rows {_runs(hr, _row_name)}"] if hr else []) + \
+            ([f"hidden columns {_runs(hc, letters)}"] if hc else [])
+    return f"({'; '.join(notes)})" if notes else ""
+
+
 def _split_rows(items, same_span, steps) -> list:
     """`items` (r1, c1, r2, c2), sorted by r1, cut on its empty row runs; two neighbours stay together when the run
     between them is at most _GAP rows and (with `same_span`) they cover the same columns."""
@@ -519,7 +559,7 @@ class Grid:
         self.name, self.budget, self.ctx = name, budget, ctx
         self.cells = {}
         self.merges = []
-        self._seen = set()  # the merges kept, so an exact duplicate is dropped before the cap counts it
+        self._seen = set()
         self.rows_h, self.cols_h, self.heads = _Ranges(), _Ranges(), _Ranges()
         self.cut = False
         self._merges_cut = False
@@ -610,9 +650,13 @@ class Grid:
         return self.cells.get((row, col))
 
     def link(self, r1: int, r2: int, c1: int, c2: int, url, place) -> int:
-        """Decision 9: wrap the valued cells of the range in a Link to `url`, or follow them with `→ place` for a
-        place in the workbook; a cell already linked, or holding only note marks, is left. The cost of the walk
-        (`held`) is returned; past the character budget the rest keep their old values."""
+        """Decision 9: wrap the valued cells of the range in a Link to `url`, `#place` after it when the link names
+        a place in that file, or follow them with `→ place` for a place in this workbook (no URL, or one whose
+        last part is this file's own name); a cell already linked, or holding only note marks, is left. The cost of
+        the walk (`held`) is returned; past the character budget the rest keep their old values."""
+        if url and place and self.ctx.name and _leaf(url) == self.ctx.name.casefold():
+            url = None
+        target = f"{url}#{place}" if url and place else url
         found, cost = self.held(r1, r2, c1, c2)
         for r, c in found:
             value = self.get(r, c)
@@ -621,7 +665,7 @@ class Grid:
             if not body or any(isinstance(x, Link) for x in body):
                 continue
             marks = [x for x in inl if isinstance(x, NoteRef)]
-            linked = body + [Text(f" → {place}")] if place else [Link(url, body)]
+            linked = [Link(target, body)] if target else body + [Text(f" → {place}")]
             if not self.put(r, c, linked + marks):
                 break
         return cost
@@ -688,7 +732,7 @@ class Grid:
         r2, c2 = min(r2, limits.SHEET_ROWS - 1), min(c2, limits.SHEET_COLS - 1)
         if r1 > r2 or c1 > c2 or (r1 == r2 and c1 == c2):
             return
-        m = (r1, c1, r2, c2)  # reading order of the first cell, then the extent
+        m = (r1, c1, r2, c2)
         if m in self._seen:
             return
         if len(self.merges) >= _MERGES:
@@ -698,6 +742,11 @@ class Grid:
             return
         self._seen.add(m)
         self.merges.append(m)
+
+    @property
+    def merges_cut(self) -> bool:
+        """Whether the merged ranges have reached their cap: no further one is kept."""
+        return self._merges_cut
 
     def _stop_merges(self):
         self.ctx.warnings.append(f"sheet {self.name} cut at {_MERGES} merged ranges")
@@ -778,7 +827,8 @@ class Grid:
         return items
 
     def blocks(self) -> list:
-        """A record table: one Table, rows before the first value trimmed and empty runs past _GAP shrunk to it."""
+        """A record table: one Table, rows before the first value trimmed and empty runs past _GAP shrunk to it;
+        its caption names the hidden rows and columns inside it."""
         items = self._items()
         if not items:
             return []
@@ -802,21 +852,24 @@ class Grid:
             if (r2, c2) == (r, c) and not hidden_rows and not hidden_cols:
                 return self._blocks(text)
         out = self._layout(items, new.__getitem__, pos + 1, c0, c1 - c0 + 1, [0, 0])
-        return [Table(out, hidden_rows=hidden_rows, hidden_cols=hidden_cols)]
+        note = _hidden_note(self.rows_h.within(rows[0], rows[-1]) if self.rows_h else [],
+                            self.cols_h.within(c0, c1) if self.cols_h else [])
+        return [Table(out, caption=note, hidden_rows=hidden_rows, hidden_cols=hidden_cols)]
 
     def sheet_blocks(self) -> list:
-        """A sheet: one Table an island in reading order (a lone cell a paragraph), then the cut paragraph."""
+        """A sheet: one Table an island in reading order (a lone cell a paragraph), then the cut paragraph, the
+        formulas and the facts (FACT_ITEMS entries each)."""
         out, slots = [], [0, 0]
         for part in self._islands(self._items()):
             if slots[0] > limits.GRID_SLOTS:
                 break
             out.extend(self._island(part, slots))
-        out.extend(self._formulas())
-        for label, entries in self.facts:
-            out.extend(listed(label, entries, self.budget, self.ctx))
         line = self._cut_line()
         if line:
             out.append(Para([Text(line)]))
+        out.extend(self._formulas())
+        for label, entries in self.facts:
+            out.extend(listed(label, entries, self.budget, self.ctx, cap=limits.FACT_ITEMS))
         return out
 
     @staticmethod
@@ -852,9 +905,8 @@ class Grid:
         if len(items) == 1 and not hr and not hc:
             return self._addressed(rng, items[0][4])
         out = self._layout(items, lambda r: r - r0, r1 - r0 + 1, c0, c1 - c0 + 1, slots)
-        notes = ([f"hidden rows {_runs(hr, lambda x: str(x + 1))}"] if hr else []) + \
-                ([f"hidden columns {_runs(hc, letters)}"] if hc else [])
-        return [Table(out, caption=rng + (f" ({'; '.join(notes)})" if notes else ""),
+        note = _hidden_note(hr, hc)
+        return [Table(out, caption=rng + (" " + note if note else ""),
                       hidden_rows=frozenset(x - r0 for a, b in hr for x in range(a, b + 1)),
                       hidden_cols=frozenset(x - c0 for a, b in hc for x in range(a, b + 1)),
                       origin=address(r0, c0))]
@@ -878,16 +930,24 @@ class Grid:
         self.fact(f"Table {name} {span(r1, r2, c1, c2)}", about or [("no header row", False)])
 
     def formula(self, row: int, col: int, pat: tuple):
-        """Keep the formula pattern (from `pattern`) of a cell `put` holds, for the sheet's formulas paragraph."""
-        if (row, col) in self.cells:
-            self.formulas[(row, col)] = self._patterns.setdefault(pat, pat)
+        """Keep a cell's formula pattern (from `pattern`) for the sheet's formulas paragraph. A cell that holds no
+        value (its result is empty) is charged a cell; past the cells the sheet is cut there, as `put` cuts it."""
+        at = (row, col)
+        if at not in self.cells and at not in self.formulas:
+            if self.cut or row < 0 or col < 0 or row >= limits.SHEET_ROWS or col >= limits.SHEET_COLS:
+                return
+            if self.budget.cells <= 0:
+                self.stop("cells", self.budget.cap_cells, at)
+                return
+            self.budget.cells -= 1
+        self.formulas[at] = self._patterns.setdefault(pat, pat)
 
     def _formulas(self) -> list:
         """Decision 5: the sheet's formulas as one paragraph: `Formulas: ` and an entry for each pattern, its ranges
         (a column run of cells, runs of one extent in neighbouring columns one range) and its A1 text at the first,
         in reading order of their first cells. Cells in hidden rows or columns make entries of their own, hidden,
         after the shown ones. Each entry is charged its characters; past FORMULA_GROUPS ranges or the characters the
-        rest are counted under `formula` and the paragraph says how many (`listed`)."""
+        rest are counted under `formula` and the paragraph says how many (`listed`), their texts never made."""
         if not self.formulas:
             return []
         runs = {}
@@ -916,7 +976,7 @@ class Grid:
                                               else f"{address(r1, c1)}:{address(r2, c2)}" for r1, c1, r2, c2 in ranges)
                                     + " =" + formula_text(pat, r, c), hid, len(ranges))
                                    for hid, (r, c), pat, ranges in entries),
-                      self.budget, self.ctx, "formula", limits.FORMULA_GROUPS)
+                      self.budget, self.ctx, "formula", limits.FORMULA_GROUPS, len(entries))
 
     def _cut_line(self) -> str:
         """Where the sheet was cut, by what, and what the file declares past it; "" for a sheet read whole."""
@@ -925,7 +985,7 @@ class Grid:
         what, n, at = self.why
         reason = _REASONS.get(what, "the {n:,} " + what + " limit").format(n=n)
         dim = self.dim
-        if not self.cells and what in _SPENT:
+        if not self.cells and not self.formulas and what in _SPENT:
             line = f"(Sheet not read: {reason} was used up by the sheets before it"
             if dim:
                 span = f"{address(dim[0], dim[2])}:{address(dim[1], dim[3])}"

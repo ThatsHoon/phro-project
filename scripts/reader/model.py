@@ -163,6 +163,7 @@ class Context:
     def __init__(self):
         self.warnings: list[str] = []
         self.skipped: collections.Counter = collections.Counter()
+        self.name = ""
 
     @contextmanager
     def guard(self, kind: str):

@@ -127,6 +127,36 @@ def test_formulas_read():
     assert "".join(i.text for i in p.inlines) == 'Formulas: B1:B2 =A1+1; C1 =SUM(Other!A1:A3,"a;b")', p
 
 
+def test_formula_of_a_cell_without_a_value_is_listed():
+    f = 'office:value-type="string" office:string-value="" table:formula="{}"'
+    xml = sheet("S", [row(c("1"), c("", f.format("of:=IF([.A1]>4;&quot;&quot;;[.A1]*2)"))),
+                      row(c("2"), c("4", f.format("of:=IF([.A2]>4;&quot;&quot;;[.A2]*2)")))])
+    doc, ctx = parse(ods(xml))
+    p = doc.blocks[0].blocks[-1]
+    assert "".join(i.text for i in p.inlines) == 'Formulas: B1:B2 =IF(A1>4,"",A1*2)' and not ctx.skipped, p
+
+
+def test_repeated_empty_merges_and_formulas_are_budgeted():
+    merged = c(extra='table:number-columns-repeated="1000" table:number-columns-spanned="2"')
+    xml = sheet("S", [row(c("x")), row(merged, extra='table:number-rows-repeated="100000"')])
+    t0 = time.monotonic()
+    doc, ctx = parse(ods(xml))
+    assert time.monotonic() - t0 < 20 and ctx.skipped["sheet_cut"] == 1, (time.monotonic() - t0, ctx.skipped)
+    form = c(extra='table:number-columns-repeated="1000" table:formula="of:=[.A1]+1" office:value-type="string" '
+                   'office:string-value=""')
+    xml = sheet("S", [row(c("x")), row(form, extra='table:number-rows-repeated="100000"')])
+    t0 = time.monotonic()
+    old = limits.SHEET_CELLS
+    limits.SHEET_CELLS = 5000
+    try:
+        doc, ctx = parse(ods(xml))
+    finally:
+        limits.SHEET_CELLS = old
+    assert time.monotonic() - t0 < 20 and ctx.skipped["sheet_cut"] == 1, (time.monotonic() - t0, ctx.skipped)
+    assert any("5,000-cell limit" in "".join(i.text for i in b.inlines) for b in doc.blocks[0].blocks
+               if isinstance(b, Para)), doc.blocks[0].blocks[-3:]
+
+
 def test_value_types():
     cells = [c("", 'office:value-type="date" office:date-value="2026-01-02"'),
              c("", 'office:value-type="time" office:time-value="PT01H02M03S"'),

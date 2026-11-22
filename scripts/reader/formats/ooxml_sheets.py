@@ -72,6 +72,7 @@ _FILTERS = frozenset({"filters", "customFilters", "top10", "dynamicFilter", "col
 _PARENT = {"col": "cols", "mergeCell": "mergeCells", "hyperlink": "hyperlinks", "dimension": "worksheet",
            "sheetProtection": "worksheet", "autoFilter": "worksheet", "cfRule": "conditionalFormatting",
            "dataValidation": "dataValidations", "tablePart": "tableParts", "filter": "filters",
+           "dateGroupItem": "filters", "sqref": "conditionalFormatting",
            **dict.fromkeys(_FILTERS, "filterColumn")}
 _SHEET_TAGS = frozenset(_PARENT)
 _KEEP = frozenset({"formula1", "formula2"})
@@ -135,6 +136,14 @@ def _sqref(text) -> str:
     return ", ".join((text or "").split())
 
 
+def _date_group(el) -> str:
+    """A `dateGroupItem` as the date it picks, down to its grouping: 2024, 2024-03, 2024-03-09, then the time."""
+    parts = [_int(attr(el, k)) for k in ("year", "month", "day", "hour", "minute", "second")]
+    day = "-".join(f"{v:02d}" for v in parts[:3] if v is not None)
+    time = ":".join(f"{v:02d}" for v in parts[3:] if v is not None)
+    return f"{day} {time}".strip()
+
+
 def _validation(el) -> str | None:
     """A `dataValidation` (or x14's) as `<ranges> <type> <rule>`; None for one that checks nothing."""
     kind = attr(el, "type") or "none"
@@ -156,7 +165,7 @@ def _validation(el) -> str | None:
 
 def _rule(el) -> str:
     """A `cfRule` in a few words: its test, never its format."""
-    forms = [(f.text or "").strip() for f in el if local(f.tag) == "formula"] + ["", ""]
+    forms = [(f.text or "").strip() for f in el if local(f.tag) in ("formula", "f")] + ["", ""]
     return sheet_grid.rule(attr(el, "type") or "", forms, op=attr(el, "operator"), text=attr(el, "text") or "",
                            rank=attr(el, "rank") or 10, bottom=_on(attr(el, "bottom")),
                            percent=_on(attr(el, "percent")),
@@ -183,11 +192,14 @@ def _criterion(el, col: str, vals: list, more: int) -> str:
 
 
 class _Facts:
-    """A sheet's facts as its part streams them, put on its grid after the stream."""
+    """A sheet's facts as its part streams them, put on its grid after the stream. An x14 rule takes its ranges from
+    the `sqref` that ends its `conditionalFormatting`: `pending` holds the rules of the open one (`owner`), and those
+    of one that ends without ranges are `lost`."""
 
     def __init__(self):
         self.valid, self.rules, self.crit, self.tables, self.vals = [], [], [], [], []
         self.filter, self.protect, self.more = None, False, 0
+        self.owner, self.pending, self.lost = None, [], 0
 
     def end(self, tag, el, stack, names):
         """An element of `_PARENT` beyond the grid's own has ended; `stack` holds its open ancestors."""
@@ -198,10 +210,23 @@ class _Facts:
         elif tag == "cfRule":
             sq = attr(stack[-1], "sqref")
             if sq:
-                self.rules.append((_sqref(sq), _rule(el)))
-        elif tag == "filter":
+                self.rules.append((sq.split(), _rule(el)))
+            else:
+                if self.owner is not stack[-1]:
+                    self.lost += len(self.pending)
+                    self.owner, self.pending = stack[-1], []
+                self.pending.append(_rule(el))
+        elif tag == "sqref":
+            if self.owner is stack[-1]:
+                ranges = (el.text or "").split()
+                if ranges:
+                    self.rules.extend((ranges, rule) for rule in self.pending)
+                else:
+                    self.lost += len(self.pending)
+                self.owner, self.pending = None, []
+        elif tag == "filter" or tag == "dateGroupItem":
             if len(self.vals) < limits.FACT_VALUES:
-                self.vals.append(attr(el, "val") or "")
+                self.vals.append(attr(el, "val") or "" if tag == "filter" else _date_group(el))
             else:
                 self.more += 1
         elif tag in _FILTERS:
@@ -313,11 +338,11 @@ def _workbook(root, rels, wb, ctx):
             for i, sh in enumerate(el):
                 if local(sh.tag) != "sheet":
                     continue
-                wb.at[i] = len(wb.sheets)
                 rel = rels.get(attr(sh, "id") or "")
                 if rel is None or rel.external or not rel.type.endswith(("/worksheet", "/chartsheet")):
-                    ctx.skipped["sheet"] += 1  # a macro or dialog sheet, or no relationship at all
+                    ctx.skipped["sheet"] += 1
                     continue
+                wb.at[i] = len(wb.sheets)
                 if rel.type.endswith("/chartsheet"):
                     wb.chartsheets.add(rel.target)
                 wb.sheets.append((_unescape(attr(sh, "name") or ""), rel.target, attr(sh, "state") or ""))
@@ -616,8 +641,9 @@ class _Sheets:
             else:
                 grid.fact("Filter", [(ref, False)])
         grid.fact("Validation", facts.valid)
-        for sq, rule in facts.rules:
-            grid.fact(f"Conditional {sq}", [(rule, False)])
+        grid.fact("Conditional", sheet_grid.ruled(facts.rules))
+        if facts.lost or facts.pending:
+            self.ctx.skipped["fact"] += facts.lost + len(facts.pending)
         for rel in rels.values():
             if not rel.external and rel.type.endswith("/pivotTable"):
                 self._pivot(grid, rel.target)
@@ -692,29 +718,29 @@ class _Sheets:
             return []
 
     def _collect(self, el, part, links, grid, relmap):
-        """Keep the range and the place of a `hyperlink` with a `location`, or the range and URL of one that names an
-        external hyperlink relationship; an `r:id` that names none counts `link`. Past _LINKS the rest are cut,
+        """Keep the range of a `hyperlink`, the URL of the external hyperlink relationship it names and its
+        `location`; an `r:id` that names none counts `link` unless a location is left. Past _LINKS the rest are cut,
         counted once."""
         rid, place = attr(el, "id"), (el.get("location") or "").strip()
         if not rid and not place:
             return
         if len(links) >= _LINKS:
             if len(links) == _LINKS:
-                links.append(None)  # the cut is counted once
+                links.append(None)
                 self.ctx.warnings.append(f"sheet {grid.name} cut at {_LINKS} hyperlinks")
                 self.ctx.skipped["links_cut"] += 1
             return
         rng = _range(el.get("ref"))
         if rng is None:
             return
-        if place:
-            links.append((*rng, None, place[:MAX_URL]))
-            return
-        rel = self._sheet_rels(part, relmap).get(rid)
-        if rel is None or not rel.external or not rel.type.endswith("/hyperlink") or not rel.target:
+        rel = self._sheet_rels(part, relmap).get(rid) if rid else None
+        url = None
+        if rel is not None and rel.external and rel.type.endswith("/hyperlink") and rel.target:
+            url = rel.target[:MAX_URL]
+        elif not place:
             self.ctx.skipped["link"] += 1
             return
-        links.append((*rng, rel.target[:MAX_URL], None))
+        links.append((*rng, url, place[:MAX_URL] or None))
 
     def _sheet_rels(self, part, relmap) -> dict:
         """The sheet's relationships, read once whether that succeeds or fails."""
@@ -944,7 +970,7 @@ class _Sheets:
             return self.show(_rich(inline), style), pat
         if v is None or not v.text and t != "str":
             return ("=" + sheet_grid.formula_text(pat, row, col) if pat is not None else ""), pat
-        return self._value(v.text, t, style), pat
+        return self._value(v.text or "", t, style), pat
 
     def _value(self, text: str, t: str, style: int):
         """A cached value's text by the cell's type."""

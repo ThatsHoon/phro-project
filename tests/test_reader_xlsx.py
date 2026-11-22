@@ -505,9 +505,35 @@ def test_conditional_formats_one_line_a_rule():
              '</colorScale></cfRule><cfRule type="containsText" operator="containsText" text="ok" priority="5">'
              '<formula>NOT(ISERROR(SEARCH("ok",B1)))</formula></cfRule></conditionalFormatting>')
     doc, _, _ = parsed([sheet(ONE, after=after)])
-    assert texts(doc.blocks[0].blocks)[1:] == ["Conditional F5:F8: cell > 150", 'Conditional F5:F8: formula =$A5="x"',
-                                               "Conditional B1:B9, C1: bottom 3", "Conditional B1:B9, C1: color scale",
-                                               'Conditional B1:B9, C1: contains "ok"'], doc.blocks[0].blocks
+    assert texts(doc.blocks[0].blocks)[1:] == ['Conditional: F5:F8 cell > 150; F5:F8 formula =$A5="x"; '
+                                               'B1:B9, C1 bottom 3; B1:B9, C1 color scale; B1:B9, C1 contains "ok"'], \
+        doc.blocks[0].blocks
+
+
+def test_conditional_formats_of_one_rule_are_one_entry_inside_the_budget():
+    after = "".join(f'<conditionalFormatting sqref="A{i}:B{i} D{i}"><cfRule type="cellIs" operator="greaterThan" '
+                    f'priority="{i}"><formula>5</formula></cfRule></conditionalFormatting>' for i in range(1, 3001))
+    doc, ctx, _ = parsed([sheet(ONE, after=after)])
+    got = texts(doc.blocks[0].blocks)[1:]
+    first = ", ".join(x for i in range(1, 11) for x in (f"A{i}:B{i}", f"D{i}"))
+    assert got == [f"Conditional: {first} and 5,980 more cell > 5"], got[0][:300]
+
+
+def test_x14_conditional_format_takes_its_ranges_from_its_sqref_child():
+    after = ('<conditionalFormatting sqref="D1:D9"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/>'
+             '<cfvo type="max"/><color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting>'
+             f'<extLst><ext uri="{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}" xmlns:x14="{X14}">'
+             f'<x14:conditionalFormattings xmlns:xm="{XM}"><x14:conditionalFormatting>'
+             '<x14:cfRule type="dataBar" id="{1}"><x14:dataBar/></x14:cfRule><xm:sqref>D1:D9</xm:sqref>'
+             '</x14:conditionalFormatting><x14:conditionalFormatting><x14:cfRule type="expression" priority="2">'
+             '<xm:f>Lists!$A1&gt;3</xm:f></x14:cfRule><x14:cfRule type="iconSet" priority="3"/>'
+             '<xm:sqref>E1:E9 G1</xm:sqref></x14:conditionalFormatting><x14:conditionalFormatting>'
+             '<x14:cfRule type="expression"><xm:f>1</xm:f></x14:cfRule></x14:conditionalFormatting>'
+             '</x14:conditionalFormattings></ext></extLst>')
+    doc, ctx, _ = parsed([sheet(ONE, after=after)])
+    assert texts(doc.blocks[0].blocks)[1:] == ["Conditional: D1:D9 data bar; E1:E9, G1 formula =Lists!$A1>3; "
+                                               "E1:E9, G1 icon set"], doc.blocks[0].blocks
+    assert ctx.skipped == {"fact": 1}, ctx.skipped
 
 
 def test_autofilter_range_and_criteria():
@@ -520,6 +546,13 @@ def test_autofilter_range_and_criteria():
         doc.blocks[0].blocks
     doc, _, _ = parsed([sheet(ONE, after='<autoFilter ref="A1:B3"/>')])
     assert texts(doc.blocks[0].blocks)[-1] == "Filter: A1:B3", doc.blocks[0].blocks
+    after = ('<autoFilter ref="A1:B3"><filterColumn colId="0"><filters blank="1"><filter val="x"/>'
+             '<dateGroupItem year="2024" month="3" dateTimeGrouping="month"/>'
+             '<dateGroupItem year="2025" month="1" day="9" dateTimeGrouping="day"/>'
+             '<dateGroupItem year="2026" dateTimeGrouping="year"/></filters></filterColumn></autoFilter>')
+    doc, _, _ = parsed([sheet(ONE, after=after)])
+    assert texts(doc.blocks[0].blocks)[-1] == "Filter A1:B3: A is x, 2024-03, 2025-01-09, 2026, (blank)", \
+        doc.blocks[0].blocks
 
 
 def test_sheet_and_workbook_protection_are_flags():
@@ -649,6 +682,14 @@ def test_formula_without_cached_value_shows_in_its_cell():
     assert formulas_of(doc) == "Formulas: B1 =A1*2; C1:C2 =A1+1", formulas_of(doc)
 
 
+def test_formula_with_an_empty_text_result_keeps_the_sheet_and_its_formula():
+    rows = "".join(xlsx_row(r, xlsx_cell(f"A{r}", r),
+                            xlsx_cell(f"B{r}", "" if r % 2 else "v", t="str", f=f'IF(A{r}>4,"",A{r}*2)'))
+                   for r in range(1, 5))
+    doc, ctx, _ = parsed([sheet(rows)])
+    assert formulas_of(doc) == 'Formulas: B1:B4 =IF(A1>4,"",A1*2)' and not ctx.skipped, (formulas_of(doc), ctx.skipped)
+
+
 def test_hyperlink_external():
     rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"))
     out, ctx = linked(rows, ['<hyperlink ref="A1" r:id="rL"/>'])
@@ -662,8 +703,6 @@ def test_hyperlink_location():
 
 
 def test_hyperlink_location_is_named():
-    # a link inside the workbook names its place after the cell's text, with or without an r:id beside it (as
-    # LibreOffice writes one to the file itself)
     rows = xlsx_row(1, xlsx_cell("A1", "go", t="str"), xlsx_cell("B1", "jump", t="str"))
     sh = sheet(rows, after='<hyperlinks><hyperlink ref="A1" location="Lists!A1"/>'
                            '<hyperlink ref="B1" r:id="rL" location="\'My Sheet\'!B2"/></hyperlinks>',
@@ -671,8 +710,13 @@ def test_hyperlink_location_is_named():
     doc, ctx, _ = parsed([sh])
     cells = doc.blocks[0].blocks[0].rows[0]
     assert cells[0].blocks[0].inlines == [Text("go"), Text(" → Lists!A1")], cells[0].blocks
-    assert cells[1].blocks[0].inlines == [Text("jump"), Text(" → 'My Sheet'!B2")], cells[1].blocks
+    assert cells[1].blocks[0].inlines == [Link("../a.xlsx#'My Sheet'!B2", [Text("jump")])], cells[1].blocks
     assert not ctx.skipped, ctx.skipped
+    ctx = Context()
+    ctx.name = "a.xlsx"
+    doc = ooxml.parse_package(make_xlsx(None, [sh]), ctx)
+    cells = doc.blocks[0].blocks[0].rows[0]
+    assert cells[1].blocks[0].inlines == [Text("jump"), Text(" → 'My Sheet'!B2")], cells[1].blocks
 
 
 def test_value_hidden_by_format():

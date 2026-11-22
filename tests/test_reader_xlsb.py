@@ -651,11 +651,20 @@ def test_conditional_formats_one_line_a_rule():
                cf_rule(2, 0x19, param=1, flags=0x04),
                biff12(462)]
     doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "x"}, "records": records}])
-    assert texts(doc.blocks[0].blocks)[1:] == ["Conditional F5:F8: cell > 150", "Conditional F5:F8: formula =F5>100",
-                                           "Conditional F5:F8: bottom 10%", 'Conditional F5:F8: contains "late"',
-                                           "Conditional F5:F8: data bar", "Conditional F5:F8: 1 std dev above average"], \
-        doc.blocks[0].blocks
+    assert texts(doc.blocks[0].blocks)[1:] == ['Conditional: F5:F8 cell > 150; F5:F8 formula =F5>100; '
+                                               'F5:F8 bottom 10%; F5:F8 contains "late"; F5:F8 data bar; '
+                                               'F5:F8 1 std dev above average'], doc.blocks[0].blocks
     assert not ctx.skipped, ctx.skipped
+
+
+def test_hyperlink_with_a_location_keeps_its_file_and_a_pivot_part_is_counted():
+    records = [hlink(0, 0, rid="rId1", place="Sheet1!A1")]
+    parts = {"xl/worksheets/_rels/sheet1.bin.rels": rels(("rId1", "hyperlink", "other.xlsb", True),
+                                                         ("rId2", "pivotTable", "../pivotTables/pivotTable1.bin"))}
+    doc, ctx = doc_of([{"name": "S", "cells": {(0, 0): "file", (0, 1): "y"}, "records": records}], extra_parts=parts)
+    t = doc.blocks[0].blocks[0]
+    assert cell_inlines(t, 0, 0) == [Link("other.xlsb#Sheet1!A1", [Text("file")])], cell_inlines(t, 0, 0)
+    assert ctx.skipped == {"fact": 1}, ctx.skipped
 
 
 def column(col, *inner):

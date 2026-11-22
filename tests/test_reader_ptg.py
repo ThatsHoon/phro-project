@@ -71,6 +71,7 @@ def test_functions():
             + struct.pack("<BBH", 0x42, 3, 1))
     assert text(cond, env8()) == "IF(A1>0,1,2)"
     assert text(num(1) + struct.pack("<BBH", 0x22, 1, 4), env12()) == "SUM(1)"
+    assert text(ref12(0, 0) + num(0) + struct.pack("<BH", 0x41, 480), env12()) == "IFERROR(A1,0)"
 
 
 def test_shared_formula_offsets():

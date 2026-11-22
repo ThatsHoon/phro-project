@@ -467,14 +467,13 @@ class _Sheets:
         if rid == BRT_HLINK:
             rng = _rfx(f)
             target, place = f.wide() or "", (f.wide() or "").strip()
-            if place:
+            rel = rels.get(target) if target else None
+            if rel is not None and rel.external and rel.type.endswith("/hyperlink") and rel.target:
+                facts.links.append((*rng, rel.target[:MAX_URL], place[:MAX_URL] or None))
+            elif place:
                 facts.links.append((*rng, None, place[:MAX_URL]))
             elif target:
-                rel = rels.get(target)
-                if rel is None or not rel.external or not rel.type.endswith("/hyperlink") or not rel.target:
-                    self.ctx.skipped["link"] += 1
-                else:
-                    facts.links.append((*rng, rel.target[:MAX_URL], None))
+                self.ctx.skipped["link"] += 1
         elif rid == BRT_DVAL:
             text = self._dval(f, env)
             if text:
@@ -487,7 +486,7 @@ class _Sheets:
         elif rid == BRT_BEGIN_CF_RULE:
             if facts.cond:
                 r1, _, c1, _ = facts.cond[0]
-                facts.rules.append((", ".join(sheet_grid.span(*r) for r in facts.cond),
+                facts.rules.append(([sheet_grid.span(*r) for r in facts.cond],
                                     self._rule(f, replace(env, row=r1, col=c1))))
         elif rid == BRT_SHEET_PROTECTION:
             f.skip(2)
@@ -604,8 +603,10 @@ class _Sheets:
             else:
                 grid.fact("Filter", [(where, False)])
         grid.fact("Validation", facts.valid)
-        for where, rule in facts.rules:
-            grid.fact(f"Conditional {where}", [(rule, False)])
+        grid.fact("Conditional", sheet_grid.ruled(facts.rules))
+        pivots = sum(1 for rel in rels.values() if not rel.external and rel.type.endswith("/pivotTable"))
+        if pivots:
+            self.ctx.skipped["fact"] += pivots
         if facts.protect:
             grid.fact("Protected", [("sheet", False)])
 
