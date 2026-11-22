@@ -288,6 +288,7 @@ class Body:
         self.left = _BUDGET  # expansion budget still available
         self.chars_left = limits.SHEET_CHARS  # characters that copies (repeats, reused objects) may still add
         self.wt = {}  # id(Table) -> (Table, cells it expands to)
+        self.charts = {}
         self.glued = None  # odt read as one diagram scope: the shape ids connectors glue; None otherwise
         self.members = {}  # diagram key -> its element, waiting for place()
         self.keys = set()  # diagram keys given out
@@ -547,8 +548,10 @@ class Body:
         src = first(ch, "table")
         tbl = self.table(src, d + 1) if src is not None else None
         if tbl is None:
-            return [Para([Text(cap)])]
-        tbl.caption = cap
+            tbl = Para([Text(cap)])
+        else:
+            tbl.caption = cap
+        self.charts[id(tbl)] = tbl
         return [tbl]
 
     # ---- an odt body as one diagram scope
@@ -639,15 +642,16 @@ class Body:
 
     # ---- blocks
     def blocks(self, el, d, aside=None):
-        """The blocks of el's children; with `aside`, the blocks of the frames right under el (the shapes anchored to
-        a sheet cell) go there instead."""
+        """The blocks of el's children; with `aside`, the blocks of a frame right under el (a shape anchored to a sheet
+        cell) that holds only charts go there instead."""
         if d > limits.MAX_DEPTH:
             self.deep()
             return []
         out = []
         for c in el:
             if aside is not None and local(c.tag) == "frame":
-                aside.extend(self.frame_blocks(c, d))
+                got = self.frame_blocks(c, d)
+                (aside if got and all(id(b) in self.charts for b in got) else out).extend(got)
             else:
                 out.extend(self.block(c, d))
         return out

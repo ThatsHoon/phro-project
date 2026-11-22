@@ -19,17 +19,17 @@ _CELL = re.compile(r"[A-Za-z]{1,3}\d+|[Rr]\d*[Cc]\d*")
 CHART_ROWS = 10_000
 
 
-def kind(family: str, horizontal=None, grouping: str = "", three_d: bool = False) -> str:
-    """A chart kind in the words every reader uses: `column` and `bar` for vertical and horizontal bars (`bar` when the
-    file does not say), after `stacked ` or `100% stacked ` (grouping "stacked" or "percent") and `3-D `."""
-    name = ("column" if horizontal is False else "bar") if family == "bar" else family
+def kind(family: str, horizontal: bool = False, grouping: str = "", three_d: bool = False) -> str:
+    """A chart kind in the words every reader uses: `column` and `bar` for vertical and horizontal bars, after
+    `stacked ` or `100% stacked ` (grouping "stacked" or "percent") and `3-D `."""
+    name = ("bar" if horizontal else "column") if family == "bar" else family
     head = {"stacked": "stacked ", "percent": "100% stacked "}.get(grouping, "")
     return head + ("3-D " if three_d else "") + name
 
 
 def caption(kinds: str, title: str = "", axes=(), data: str = "") -> str:
-    """`Chart: <kind> — <title> (x: <title>; y: <title>)`, then `. Data: <range>` when the chart's cells are named
-    instead of written. `axes` are (letter, title) pairs, x the horizontal axis, y the vertical one, z the depth; a
+    """`Chart: <kind> — <title> (x: <title>; y: <title>)`, then `. Data: <range>` when the chart names the cells it
+    is drawn from. `axes` are (letter, title) pairs, x the horizontal axis, y the vertical one, z the depth; a
     second axis of a letter is `y2`."""
     out = f"Chart: {kinds}" if kinds else "Chart"
     if title:
@@ -82,13 +82,13 @@ def _block(vals, names, cat):
     return top, left, r2, c1 + len(vals) - 1
 
 
-def data_range(series, shown) -> str:
+def data_range(series) -> str:
     """The chart data range Excel would show, `Sheet1!A1:C9` (`, series in rows` when each series is a row), when
-    every series' values, and all or none of the names and the categories, are ranges of one sheet in `shown` (the
-    sheets whose cells the output holds) that make one block of a sheet laid out as a chart data range; else "".
+    every series' values, and all or none of the names and the categories, are ranges of one sheet that make one
+    block laid out as a chart data range; else "".
     `series` holds (name, categories, values) per series: None when the chart has none, False for a literal or a
     reference that is not one range here, else (sheet, r1, c1, r2, c2), zero-based and inclusive."""
-    if not series or not shown:
+    if not series:
         return ""
     names, cats, vals = (list(x) for x in zip(*series))
     if None in vals or False in vals or False in names or False in cats or len(set(cats)) > 1:
@@ -96,7 +96,7 @@ def data_range(series, shown) -> str:
     if None in names and any(n is not None for n in names):
         return ""
     sheet = vals[0][0]
-    if sheet not in shown or any(r[0] != sheet for r in vals + names + cats if r):
+    if any(r[0] != sheet for r in vals + names + cats if r):
         return ""
     for by_rows in (False, True):
         def turn(r):
@@ -105,8 +105,6 @@ def data_range(series, shown) -> str:
         if box is None:
             continue
         r1, c1, r2, c2 = (box[1], box[0], box[3], box[2]) if by_rows else box
-        if r2 >= limits.SHEET_ROWS or c2 >= limits.SHEET_COLS:
-            return ""
         a, b = _a1(r1, c1), _a1(r2, c2)
         return f"{_sheet(sheet)}!{a if a == b else a + ':' + b}" + (", series in rows" if by_rows else "")
     return ""
@@ -216,9 +214,7 @@ def _kind(ch, base: str) -> str:
     base = base[:-2] if three else base
     if base == "ofPie":
         return ("bar" if _val(ch, "ofPieType") == "bar" else "pie") + " of pie"
-    horizontal = None
-    if base == "bar" and _kid(ch, "barDir") is not None:
-        horizontal = _val(ch, "barDir", "col") == "bar"
+    horizontal = base == "bar" and _val(ch, "barDir", "col") == "bar"
     return kind(base, horizontal, _GROUPING.get(_val(ch, "grouping") or "", ""), three)
 
 
@@ -274,11 +270,10 @@ def _cell(text: str, header=False) -> Cell:
     return Cell([Para([Text(text)])] if text else [], header=header)
 
 
-def chart_table(space, ctx=None, sheets=None):
+def chart_table(space, ctx=None, workbook=False):
     """The chart's cached values as a Table, or None without series. A table is held to limits.CHART_CELLS cells
-    (series first, then rows); a cut is counted in ctx.skipped["chart_cut"] when ctx is given. With `sheets`, the
-    names of the sheets whose cells the output holds (a chart of a workbook), a chart whose data_range is found is a
-    Table with no rows whose caption names the range."""
+    (series first, then rows); a cut is counted in ctx.skipped["chart_cut"] when ctx is given. A chart of a workbook
+    (`workbook`) names its data_range in the caption too."""
     plot = first(space, "plotArea")
     if plot is None:
         return None
@@ -295,10 +290,8 @@ def chart_table(space, ctx=None, sheets=None):
     chart = _kid(space, "chart")
     title = _title(_kid(chart, "title")) if chart is not None else ""
     date1904 = (_val(space, "date1904", "1") or "0") not in ("0", "false")
-    data = data_range([_ranges(s) for s in sers], sheets) if sheets else ""
+    data = data_range([_ranges(s) for s in sers]) if workbook else ""
     head = caption("+".join(kinds), title, _axes(plot), data)
-    if data:
-        return Table([], head)
 
     xy = not any(_kid(x, "val") is not None for x in sers)
     heads, cols, top, clamped, more = [], [], 0, False, False

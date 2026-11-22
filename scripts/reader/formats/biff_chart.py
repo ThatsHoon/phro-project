@@ -20,7 +20,7 @@ import struct
 
 from .. import limits
 from ..charts import CHART_ROWS, caption, data_range, kind, series_table
-from ..model import Context, Table
+from ..model import Context
 from ..numfmt import code_for, display
 from . import biff
 
@@ -82,7 +82,7 @@ class _Found:
 
 
 def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.Stream | None = None,
-          seen: dict | None = None, sheet: bool = False):
+          seen: dict | None = None, workbook: bool = False):
     """The chart substream whose BOF is at `start`: (its Table or None, the offset after its EOF). `cells` maps a
     sheet index to {(row, col): displayed text}; a sheet it lacks has no cells. A substream that cannot be read is
     counted under `chart` and the offset is where the walk stopped. `st` is the workbook's Stream over `data`, so
@@ -92,8 +92,7 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
     resolves only against `seen`, the sheets already read (`cells` by default): when `cells` reads a sheet the first
     time a reference names it (an embedded workbook's), no sheet is read for a name alone.
 
-    `sheet` says the chart is one of the workbook `g` whose visible sheets the output holds: a chart whose series are
-    one block of a visible sheet (charts.data_range) is a Table with no rows whose caption names that range."""
+    `workbook` says the chart is one of the workbook `g`: its caption names its charts.data_range too."""
     st = biff.Stream(data, ctx) if st is None else st
     seen = cells if seen is None else seen
     f = _scan(data, start, st, ctx, biff.CHART_BOF)
@@ -103,11 +102,7 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
     series, texts, kinds, cache, end = f.series, f.texts, f.kinds, f.cache, f.end
     left = [MAX_POINTS - f.points]
     cuts = [f.cut_points]
-    if sheet:
-        shown = {s.name for s in g.sheets if not s.state}
-        where = data_range([_ranges(s, k, cache, g) for k, s in enumerate(series) if not s.aux], shown)
-        if where:
-            return Table([], _caption(f, g, cells, left, cuts, where)), end
+    named = data_range([_ranges(s, k, cache, g) for k, s in enumerate(series) if not s.aux]) if workbook else ""
     out, cats = [], {}
     for k, s in enumerate(series):
         name = s.name
@@ -122,7 +117,7 @@ def chart(data: bytes, start: int, g: biff.Globals, cells: dict, ctx, st: biff.S
         if not s.aux:  # k stays the cache column of the series after it
             out.append((name, got[1]))
     n = max([max(d) + 1 for d in [cats] + [v for _, v in out] if d] + [0])
-    table = series_table(_caption(f, g, cells, left, cuts), [cats.get(i, "") for i in range(n)],
+    table = series_table(_caption(f, g, cells, left, cuts, named), [cats.get(i, "") for i in range(n)],
                          [(name, [v.get(i, "") for i in range(n)]) for name, v in out], f.cut_series, cuts[0], ctx)
     return table, end
 
@@ -364,7 +359,7 @@ def _kind(rid: int, data: bytes, off: int, size: int):
     if rid == _BAR:
         flags = struct.unpack_from("<H", data, off + 4)[0] if size >= 6 else None
         if flags is None:
-            return "bar", None, ""
+            return "bar", False, ""
         return "bar", bool(flags & 1), "percent" if flags & 6 == 6 else "stacked" if flags & 2 else ""
     if rid in _STACKED:
         flags = struct.unpack_from("<H", data, off)[0] if size >= 2 else 0

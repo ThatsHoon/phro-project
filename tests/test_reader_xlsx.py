@@ -822,8 +822,8 @@ def test_drawing_image_and_chart():
     parts.update({"xl/charts/chart1.xml": xb.BAR, "xl/media/image1.png": xb.PNG})
     rows = xlsx_row(1, xlsx_cell("A1", "top", t="str"), xlsx_cell("B1", "next", t="str"))
     out, ctx = md([sheet(rows, rels=[DRAWING])], extra_parts=parts)
-    assert "|top|next|" in out and "Chart: bar" in out and "|Q1|7|" in out, out
-    assert out.index("|top|next|") < out.index("assets/img-001.png") < out.index("Chart: bar"), out  # anchor order
+    assert "|top|next|" in out and "Chart: column" in out and "|Q1|7|" in out, out
+    assert out.index("|top|next|") < out.index("assets/img-001.png") < out.index("Chart: column"), out  # anchor order
     assert not ctx.skipped, ctx.skipped
 
 
@@ -833,7 +833,7 @@ def test_chartsheet():
     sheets = [sheet(xlsx_row(1, xlsx_cell("A1", "cells", t="str")), name="W"),
               {"name": "Graph", "chartsheet": True, "rels": [DRAWING]}]
     out, ctx = md(sheets, extra_parts=parts)
-    assert "## Sheet: Graph" in out and "Chart: bar" in out and out.index("## Sheet: Graph") < out.index("Chart: bar")
+    assert "## Sheet: Graph" in out and "Chart: column" in out and out.index("## Sheet: Graph") < out.index("Chart: column")
     assert not ctx.skipped, ctx.skipped
     out, ctx = md([sheets[0], {"name": "Empty", "chartsheet": True}])
     assert "cells" in out and "Empty" not in out and not ctx.skipped, (out, ctx.skipped)
@@ -849,7 +849,7 @@ def test_chart_total_shared():
                     rels=[("rD", "drawing", "../drawings/drawing2.xml", False)])]
     with patched("CHART_TOTAL", 6):  # one BAR table is 4 cells
         out, ctx = md(sheets, extra_parts=parts)
-    assert out.count("Chart: bar") == 1 and ctx.skipped["chart"] == 1, (out, ctx.skipped)
+    assert out.count("Chart: column") == 1 and ctx.skipped["chart"] == 1, (out, ctx.skipped)
 
 
 def test_cut_sheet_not_opened():

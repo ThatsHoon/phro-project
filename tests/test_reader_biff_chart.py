@@ -481,9 +481,9 @@ def test_data_range_names_the_sheet_cells():
               {"ref": [(0, area3d(0, 0, 0, 2, 2)), (1, area3d(0, 1, 2, 2, 2)), (2, area3d(0, 1, 2, 0, 0))]}]
     chart = biff_chart(series, cache=False)
     md = run([{"name": "Data", "cells": cells}, chart_sheet(chart)], globals_extra=externsheet(0))
-    assert "Chart: column. Data: Data!A1:C3\n" in md and md.count("|Q2|") == 1, md
+    assert "Chart: column. Data: Data!A1:C3\n" in md and md.count("|Q2|2|4|") == 2, md
     md = run([{"name": "Data", "cells": cells, "state": 1}, chart_sheet(chart)], globals_extra=externsheet(0))
-    assert "Data:" not in md and "|Q2|2|4|" in md, md
+    assert "Chart: column. Data: Data!A1:C3\n" in md and md.count("|Q2|2|4|") == 1, md
     half = [series[0], {"name": "Typed", "ref": series[1]["ref"][1:]}]
     md = run([{"name": "Data", "cells": cells}, chart_sheet(biff_chart(half, cache=False))],
              globals_extra=externsheet(0))

@@ -62,7 +62,7 @@ class _Sheet:
     def __init__(self, body, name, budget, chars):
         self.body, self.name, self.budget, self.chars = body, name, budget, chars  # cells and characters left for the document
         self.rows, self.hidden, self.spanned = [], set(), []
-        self.anchored = []  # blocks of the frames anchored to cells, placed after the table
+        self.anchored = []
         self.gap, self.stop, self.cols_cut = 0, False, False
 
     def cut(self, what, n):

@@ -38,11 +38,11 @@ def test_drawings_direct():
     ctx = Context()
     blocks = Drawings(package(), ctx).blocks(SHEET)
     assert [type(b) for b in blocks] == [Image, Table], blocks  # row order: the picture at row 0 first
-    assert blocks[1].caption == "Chart: bar", blocks[1].caption
+    assert blocks[1].caption == "Chart: column", blocks[1].caption
     assert not ctx.skipped, dict(ctx.skipped)
 
 
-def test_chart_over_shown_sheet_names_its_range():
+def test_chart_names_its_range_and_keeps_its_cells():
     ranged = BAR.replace("<c:strRef>", "<c:strRef><c:f>Sheet1!$B$1</c:f>", 1).replace(
         "<c:cat><c:strRef>", "<c:cat><c:strRef><c:f>Sheet1!$A$2</c:f>").replace(
         "<c:numRef>", "<c:numRef><c:f>Sheet1!$B$2</c:f>")
@@ -52,10 +52,8 @@ def test_chart_over_shown_sheet_names_its_range():
         "xl/drawings/_rels/drawing1.xml.rels": rels_xml(("rId1", "chart", "../charts/chart1.xml")),
         "xl/charts/chart1.xml": ranged,
     }
-    for shown, want in (({"Sheet1"}, ("Chart: bar. Data: Sheet1!A1:B2", 0)), ({"Other"}, ("Chart: bar", 2))):
-        ctx = Context()
-        (t,) = Drawings(Package(make_zip(None, members)), ctx, shown).blocks(SHEET)
-        assert (t.caption, len(t.rows)) == want, (t.caption, t.rows)
+    (t,) = Drawings(Package(make_zip(None, members)), Context()).blocks(SHEET)
+    assert (t.caption, len(t.rows)) == ("Chart: column. Data: Sheet1!A1:B2", 2), (t.caption, t.rows)
 
 
 def test_drawing_seen_once():

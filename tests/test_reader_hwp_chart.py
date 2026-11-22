@@ -223,7 +223,7 @@ def native(**kw):
 def test_ooxml_chart_in_ole():
     # OOXMLChartContents with a barChart cache; the table sits where a picture would, between the paragraphs
     out, ctx = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(envelope({"OOXMLChartContents": CHART_XML}))}))
-    assert out == "앞\n\nChart: bar\n||S|\n|---|---|\n|A|5|\n\n뒤\n", out
+    assert out == "앞\n\nChart: column\n||S|\n|---|---|\n|A|5|\n\n뒤\n", out
     assert not ctx.skipped, ctx.skipped
 
 

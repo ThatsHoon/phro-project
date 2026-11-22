@@ -548,6 +548,20 @@ def test_chart_in_a_cell_is_one_table_after_the_sheet():
             ["", "1월", "2월"], ["서울", "1200", "1350"], ["부산", "860", "910"]], chart.rows
 
 
+def test_picture_and_text_box_in_a_cell_stay_in_their_row():
+    def pic(n):
+        return (f'<table:table-cell><draw:frame draw:name="p{n}"><draw:image xlink:href="Pictures/{n}.png"/>'
+                f'<svg:title>photo {n}</svg:title></draw:frame></table:table-cell>')
+    box = ('<table:table-cell><draw:frame draw:name="tb"><draw:text-box>' + P("note in box")
+           + '</draw:text-box></draw:frame></table:table-cell>')
+    rows = [row(c("item"), c("photo")), row(c("apple"), pic(1)),
+            row(c("pear"), pic(2), extra='table:visibility="collapse"'), row(c("fig"), box)]
+    path = ods(sheet("S", rows), extra={f"Pictures/{i}.png": PNG for i in (1, 2)})
+    out = md(path)
+    assert "|apple|![photo 1](assets/img-001.png)|" in out and "|fig|note in box|" in out, out
+    assert out.startswith("(1 hidden places left out)") and "photo 2" not in out, out
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

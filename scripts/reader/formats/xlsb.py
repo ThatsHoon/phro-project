@@ -216,7 +216,7 @@ class _Sheets:
         self.pkg, self.wb, self.ctx = pkg, wb, ctx
         self.budget = sheet_grid.Budget()
         self.used: set[str] = set()      # sheet parts read
-        self.draw = sheet_drawing.Drawings(pkg, ctx, {n for n, _, s in self.wb.sheets if s not in (1, 2)})
+        self.draw = sheet_drawing.Drawings(pkg, ctx)  # charts and pictures; one image byte count and chart cell count
         self._code: dict[int, str] = {}
 
     def sections(self) -> list:

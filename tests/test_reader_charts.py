@@ -46,7 +46,7 @@ def test_bar_by_idx():
             + ser("B", cache([(1, "20"), (0, "10")]))
             + "</c:barChart>")
     t = chart_table(space(plot, "매출"))
-    assert t.caption == "Chart: bar — 매출"
+    assert t.caption == "Chart: column — 매출"
     assert cells(t) == [["", "A", "B"], ["1분기", "5200", "10"], ["2분기", "4800", "20"]]
 
 
@@ -57,7 +57,7 @@ def test_percent_and_thousands():
             + ser("Q", cache([(0, "0.5")], fmt="0%"))
             + "</c:barChart>")
     t = chart_table(space(plot))
-    assert t.caption == "Chart: bar"
+    assert t.caption == "Chart: column"
     assert cells(t) == [["", "P", "N", "Q"], ["a", "12.5%", "1,234,567", "50%"]]
 
 
@@ -82,7 +82,7 @@ def test_combo_type():
     plot = ("<c:barChart>" + ser("A", cache([(0, "1")]), [(0, "a")]) + "</c:barChart>"
             "<c:lineChart>" + ser("B", cache([(0, "2")])) + "</c:lineChart>")
     t = chart_table(space(plot, "T"))
-    assert t.caption.startswith("Chart: bar+line")
+    assert t.caption.startswith("Chart: column+line")
     assert cells(t)[0] == ["", "A", "B"]
 
 
@@ -109,10 +109,10 @@ def test_rows_follow_points_not_ptCount_and_series_are_capped():
     empty = '<c:numCache><c:ptCount val="10000"/></c:numCache>'
     ctx = Context()
     t = chart_table(space("<c:barChart>" + ser("A", empty) * 50 + "</c:barChart>"), ctx)
-    assert len(t.rows) == 1 and t.caption == "Chart: bar" and not ctx.skipped
+    assert len(t.rows) == 1 and t.caption == "Chart: column" and not ctx.skipped
     plot = "<c:barChart>" + ser("A", cache([(0, "1")])) * 1500 + "</c:barChart>"
     t = chart_table(space(plot), ctx)
-    assert len(t.rows[0]) == limits.GRID_COLS and t.caption == f"Chart: bar (first {limits.GRID_COLS - 1} series)"
+    assert len(t.rows[0]) == limits.GRID_COLS and t.caption == f"Chart: column (first {limits.GRID_COLS - 1} series)"
     assert ctx.skipped["chart_cut"] == 1
 
 
@@ -153,7 +153,7 @@ def test_caption_kind_direction_grouping_and_axes():
              ('<c:barDir val="bar"/><c:grouping val="clustered"/>', "bar"),
              ('<c:barDir val="col"/><c:grouping val="stacked"/>', "stacked column"),
              ('<c:barDir val="bar"/><c:grouping val="percentStacked"/>', "100% stacked bar"),
-             ('<c:barDir/>', "column")]
+             ('<c:barDir/>', "column"), ("", "column")]
     for head, want in cases:
         t = chart_table(space(f"<c:barChart>{head}{one}</c:barChart>", "T"))
         assert t.caption == f"Chart: {want} — T", (head, t.caption)
@@ -215,29 +215,82 @@ def ranged(name_f, cat_f, val_f, name="A"):
     return f"<c:ser>{tx}{cat}<c:val>{ref(val_f, [(0, '1'), (1, '2')])}</c:val></c:ser>"
 
 
-def test_data_range_instead_of_cells():
+def test_data_range_named_and_cells_kept():
     cols = ("<c:barChart>" + ranged("Sheet1!$B$1", "Sheet1!$A$2:$A$3", "Sheet1!$B$2:$B$3")
             + ranged("Sheet1!$C$1", "Sheet1!$A$2:$A$3", "Sheet1!$C$2:$C$3", "B") + "</c:barChart>")
-    t = chart_table(space(cols, "T"), sheets={"Sheet1"})
-    assert t.caption == "Chart: bar — T. Data: Sheet1!A1:C3" and t.rows == [], (t.caption, t.rows)
+    t = chart_table(space(cols, "T"), workbook=True)
+    assert t.caption == "Chart: column — T. Data: Sheet1!A1:C3", t.caption
+    assert cells(t) == [["", "A", "B"], ["a", "1", "1"], ["b", "2", "2"]], cells(t)
     rows = ("<c:barChart>" + ranged("'My Data'!$A$2", "'My Data'!$B$1:$C$1", "'My Data'!$B$2:$C$2")
             + ranged("'My Data'!$A$3", "'My Data'!$B$1:$C$1", "'My Data'!$B$3:$C$3", "B") + "</c:barChart>")
-    t = chart_table(space(rows), sheets={"My Data"})
-    assert t.caption == "Chart: bar. Data: 'My Data'!A1:C3, series in rows" and t.rows == [], t.caption
-    keep = [(cols, None), (cols, {"Other"}),
+    t = chart_table(space(rows), workbook=True)
+    assert t.caption == "Chart: column. Data: 'My Data'!A1:C3, series in rows" and len(t.rows) == 3, t.caption
+    keep = [(cols, False),
             ("<c:barChart>" + ranged("", "Sheet1!$A$2:$A$3", "Sheet1!$B$2:$B$3")
-             + ranged("Sheet1!$C$1", "Sheet1!$A$2:$A$3", "Sheet1!$C$2:$C$3") + "</c:barChart>", {"Sheet1"}),
+             + ranged("Sheet1!$C$1", "Sheet1!$A$2:$A$3", "Sheet1!$C$2:$C$3") + "</c:barChart>", True),
             ("<c:barChart>" + ranged("[1]Sheet1!$B$1", "[1]Sheet1!$A$2:$A$3", "[1]Sheet1!$B$2:$B$3")
-             + "</c:barChart>", {"Sheet1"}),
+             + "</c:barChart>", True),
             ("<c:barChart>" + ranged("Sheet1!$B$1", "Sheet1!$A$2:$A$3", "Sheet1!$B$2:$B$3")
-             + ranged("Sheet1!$D$1", "Sheet1!$A$2:$A$3", "Sheet1!$D$2:$D$3") + "</c:barChart>", {"Sheet1"}),
+             + ranged("Sheet1!$D$1", "Sheet1!$A$2:$A$3", "Sheet1!$D$2:$D$3") + "</c:barChart>", True),
             ("<c:barChart>" + ranged("Sheet1!$B$1", "Sheet1!$A$2:$A$3", "Sheet1!$B$2:$B$3")
-             + ranged("Sheet2!$C$1", "Sheet1!$A$2:$A$3", "Sheet1!$C$2:$C$3") + "</c:barChart>", {"Sheet1", "Sheet2"}),
+             + ranged("Sheet2!$C$1", "Sheet1!$A$2:$A$3", "Sheet1!$C$2:$C$3") + "</c:barChart>", True),
             ("<c:barChart><c:ser><c:tx><c:v>L</c:v></c:tx><c:val>" + ref("Sheet1!$B$2:$B$3", [(0, "1")])
-             + "</c:val></c:ser></c:barChart>", {"Sheet1"})]
-    for plot, sheets in keep:
-        t = chart_table(space(plot), sheets=sheets)
-        assert "Data:" not in t.caption and len(t.rows) > 1, (sheets, t.caption)
+             + "</c:val></c:ser></c:barChart>", True)]
+    for plot, workbook in keep:
+        t = chart_table(space(plot), workbook=workbook)
+        assert "Data:" not in t.caption and len(t.rows) > 1, (workbook, t.caption)
+
+
+def test_cached_numbers_show_as_their_format_says():
+    plot = ("<c:barChart>" + ser("A", cache([(0, "1")], fmt="0.00"), [(0, "a")])
+            + ser("B", cache([(0, "2.5")], fmt="0")) + ser("C", cache([(0, "1234.5")], fmt="#,##0.00"))
+            + ser("D", cache([(0, "1e-7")], fmt="General")) + ser("E", f"<c:strRef>{cache([(0, '1.0')], 'str')}</c:strRef>")
+            + "</c:barChart>")
+    assert cells(chart_table(space(plot)))[1] == ["a", "1.00", "3", "1,234.50", "0.0000001", "1.0"]
+
+
+def workbook_chart(hidden_row=False, plot_vis_only="0"):
+    """A workbook whose sheet S holds Year/Fresh/Salt in A1:C4 and whose chart over it caches all three years."""
+    import tempfile
+    from reader.formats import ooxml
+    from reader.model import Context
+    from reader_fix import make_xlsx, xlsx_cell, xlsx_row
+    from test_reader_xlsb import anchor, chart_frame, drawing_xml, rels_xml
+    years, fresh, salt = ["2019", "2020", "2021"], ["120", "135", "150"], ["80", "95", "100"]
+    rows = xlsx_row(1, *(xlsx_cell(f"{c}1", t, t="str") for c, t in zip("ABC", ("Year", "Fresh", "Salt"))))
+    for i, (y, f, s) in enumerate(zip(years, fresh, salt), 2):
+        attrs = 'hidden="1"' if hidden_row and i == 4 else ""
+        rows += xlsx_row(i, xlsx_cell(f"A{i}", y), xlsx_cell(f"B{i}", f), xlsx_cell(f"C{i}", s), attrs=attrs)
+    sers = "".join(
+        f"<c:ser><c:tx><c:strRef><c:f>S!${col}$1</c:f>{cache([(0, name)], 'str')}</c:strRef></c:tx>"
+        f"<c:cat><c:numRef><c:f>S!$A$2:$A$4</c:f>{cache(list(enumerate(years)))}</c:numRef></c:cat>"
+        f"<c:val><c:numRef><c:f>S!${col}$2:${col}$4</c:f>{cache(list(enumerate(vals)))}</c:numRef></c:val></c:ser>"
+        for col, name, vals in (("B", "Fresh", fresh), ("C", "Salt", salt)))
+    chart = (f'<c:chartSpace {NS}><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>{sers}</c:barChart>'
+             f'</c:plotArea><c:plotVisOnly val="{plot_vis_only}"/></c:chart></c:chartSpace>')
+    parts = {"xl/drawings/drawing1.xml": drawing_xml(anchor(6, chart_frame("rId1"))),
+             "xl/drawings/_rels/drawing1.xml.rels": rels_xml(("rId1", "chart", "../charts/chart1.xml")),
+             "xl/charts/chart1.xml": chart}
+    sheet = {"name": "S", "rows": rows, "rels": [("rD", "drawing", "../drawings/drawing1.xml", False)]}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "a.xlsx"
+        make_xlsx(path, [sheet], extra_parts=parts)
+        doc = ooxml.parse(path, Context())
+    return next(b for s in doc.blocks for b in s.blocks if getattr(b, "caption", "").startswith("Chart"))
+
+
+def test_workbook_chart_keeps_every_value_and_names_its_range():
+    from reader import limits
+    want = [["", "Fresh", "Salt"], ["2019", "120", "80"], ["2020", "135", "95"], ["2021", "150", "100"]]
+    t = workbook_chart(hidden_row=True, plot_vis_only="0")
+    assert t.caption == "Chart: column. Data: S!A1:C4" and cells(t) == want, (t.caption, cells(t))
+    old = limits.SHEET_CELLS
+    limits.SHEET_CELLS = 6
+    try:
+        t = workbook_chart()
+    finally:
+        limits.SHEET_CELLS = old
+    assert cells(t) == want, (t.caption, cells(t))
 
 
 def main():

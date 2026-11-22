@@ -339,8 +339,8 @@ def test_chart_in_xlsb():
                          rels=[("rId1", "chart", "../charts/chart1.xml"), ("rId2", "image", "../media/image1.png")],
                          extra={"xl/charts/chart1.xml": BAR, "xl/media/image1.png": PNG})
     out, ctx = md([{"name": "S", "cells": {(0, 0): "top"}}], extra_parts=parts)
-    assert "Chart: bar" in out and "|Q1|7|" in out, out
-    assert out.index("top") < out.index("Chart: bar") < out.index("assets/img-001.png"), out  # anchor order
+    assert "Chart: column" in out and "|Q1|7|" in out, out
+    assert out.index("top") < out.index("Chart: column") < out.index("assets/img-001.png"), out  # anchor order
     assert not ctx.skipped, ctx.skipped
 
 
@@ -383,7 +383,7 @@ def test_absolute_anchor_chart():
                          + "<xdr:clientData/></xdr:absoluteAnchor>",
                          rels=[("rId1", "chart", "../charts/chart1.xml")], extra={"xl/charts/chart1.xml": BAR})
     out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
-    assert "Chart: bar" in out and not ctx.skipped, (out, ctx.skipped)
+    assert "Chart: column" in out and not ctx.skipped, (out, ctx.skipped)
 
 
 def test_alternate_anchor_places_one_image():
@@ -428,7 +428,7 @@ def test_chart_past_chart_total():
         out, ctx = md([{"name": "S", "cells": {(0, 0): "t"}}], extra_parts=parts)
     finally:
         limits.CHART_TOTAL = old
-    assert out.count("Chart: bar") == 1 and ctx.skipped["chart"] == 1, (out, dict(ctx.skipped))
+    assert out.count("Chart: column") == 1 and ctx.skipped["chart"] == 1, (out, dict(ctx.skipped))
     assert "(could not read: 1 chart)" in out, out
 
 
@@ -485,7 +485,7 @@ def test_chartsheet_chart():
                          + "<xdr:clientData/></xdr:absoluteAnchor>",
                          rels=[("rId1", "chart", "../charts/chart1.xml")], extra={"xl/charts/chart1.xml": BAR})
     out, ctx = md([{"name": "Graph", "chartsheet": True}, {"name": "B", "cells": {(0, 0): "x"}}], extra_parts=parts)
-    assert "## Sheet: Graph" in out and "Chart: bar" in out and not ctx.skipped, (out, ctx.skipped)
+    assert "## Sheet: Graph" in out and "Chart: column" in out and not ctx.skipped, (out, ctx.skipped)
     out, ctx = md([{"name": "Empty", "chartsheet": True}, {"name": "B", "cells": {(0, 0): "x"}}])
     assert "Empty" not in out and not ctx.skipped, (out, ctx.skipped)
 
