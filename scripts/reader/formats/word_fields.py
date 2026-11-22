@@ -47,9 +47,9 @@ WINGDINGS.pop(0x7F)
 WINGDINGS2 = {0x4F: "✗", 0x50: "✓", 0x51: "☒", 0x52: "☑", 0x53: "☒", 0x54: "☒", 0xA3: "☐"}
 _PICTURE_FONTS = frozenset(("webdings", "wingdings 2", "wingdings 3", "mt extra", "marlett", "bookshelf symbol 7",
                             "zapfdingbats", "zapf dingbats", "monotype sorts", "ms outlook", "ms reference specialty"))
-_APP_PROPERTY = re.compile(r"^(?:KSOProductBuildVer|ICV|ContentTypeId|MSIP_Label_|_dlc_|_MarkAsFinal$|"
-                           r"MediaServiceImageTags$|GrammarlyDocumentId$|_NewReviewCycle$|TaxCatchAll)", re.I)
-_PAGE_SHELL = re.compile(r"(?:pages?|of|쪽|페이지|면|[\W_])*", re.I)
+_APP_PROPERTY = re.compile(r"^(?:KSOProductBuildVer$|ICV$|ContentTypeId$|MSIP_Label_|_dlc_|_MarkAsFinal$|"
+                           r"MediaServiceImageTags$|GrammarlyDocumentId$|_NewReviewCycle$|TaxCatchAll)")
+_PAGE_SHELL = re.compile(r"(?:pages?|pg|p|of|seite|von|sur|de|página|쪽|페이지|면|제|[\W_])*", re.I)
 
 
 def page_shell(text: str) -> bool:
@@ -61,7 +61,7 @@ def page_shell(text: str) -> bool:
 def symbol(font: str, code: int) -> str | None:
     """The character a symbol font's code shows: Symbol through the Adobe Symbol table, Wingdings through WINGDINGS,
     Wingdings 2's check marks through WINGDINGS2, a code in their private-use form (U+F020-U+F0FF) the same; a font
-    whose letters are pictures (_PICTURE_FONTS) has no other character; any other font's code as itself when it is
+    whose letters are pictures (_PICTURE_FONTS) has its space and no other character; any other font's code as itself when it is
     not a private-use one. None when nothing is known."""
     face = (font or "").strip().lower()
     low = code - 0xF000 if 0xF020 <= code <= 0xF0FF else code
@@ -72,7 +72,7 @@ def symbol(font: str, code: int) -> str | None:
     if face == "wingdings 2":
         return WINGDINGS2.get(low)
     if face in _PICTURE_FONTS:
-        return None
+        return " " if low == 0x20 else None
     if 0 < code < 0x110000 and not 0xE000 <= code <= 0xF8FF and not 0xD800 <= code <= 0xDFFF:
         return chr(code)
     return None

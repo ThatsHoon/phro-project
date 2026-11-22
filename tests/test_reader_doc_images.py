@@ -315,6 +315,20 @@ def ffdata(kind, res, wdef=0, items=(), text=""):
     return struct.pack("<IH", 0x44 + len(body), 0x44) + bytes(62) + body
 
 
+def test_form_data_is_read_once_a_field_and_only_for_a_form_field():
+    n = 200_000
+    dd = ffdata(2, 1, 0, ("DD-FIRST", "DD-SECOND" + "x" * 30_000))
+    text = "pick \x13 FORMDROPDOWN " + "\x01" * n + "\x15\r"
+    at = text.index("\x01")
+    p = inline_doc(dd, text, chpx=[(at, at + n, sp(SPEC) + sp(PIC, AT))])
+    t = time.perf_counter()
+    out = md(p)
+    assert time.perf_counter() - t < 10, time.perf_counter() - t
+    assert out.startswith("pick DD-SECONDxxx"), out[:40]
+    link = md(inline_doc(ffdata(1, 1), 'see \x13 HYPERLINK "http://example.com/" \x01\x14site\x15\r'))
+    assert "☒" not in link and "site" in link, link
+
+
 def test_form_fields_show_their_state():
     """A legacy check box shows ☒ or ☐ (its result, else its default), a drop-down its chosen entry, a text field its
     result; form data that cannot be read shows nothing."""

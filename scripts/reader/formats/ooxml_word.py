@@ -30,7 +30,7 @@ _PAGE_FIELD = re.compile(r"^\s*(?:PAGE|NUMPAGES|SECTIONPAGES)\b", re.I)
 _CORE = {"title": "title", "subject": "subject", "creator": "author", "lastModifiedBy": "last author",
          "created": "created", "modified": "modified", "keywords": "keywords"}
 _SHARED = ("image_bytes", "chart_cells", "smartart_nodes", "opened", "budget", "chunk_parts", "chunk_bytes")
-_HTML_ROOT = re.compile(rb"^\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--.*?-->\s*)*(?:<!doctype\s+html\b|<(?:\w+:)?html[\s>])",
+_HTML_ROOT = re.compile(rb"^\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--(?:(?!-->).)*-->\s*)*(?:<!doctype\s+html\b|<(?:\w+:)?html[\s>])",
                         re.I | re.S)
 _PROPERTY_PARTS = ("/metadata/core-properties", "/extended-properties", "/custom-properties")
 
@@ -337,8 +337,15 @@ class _Reader:
                 return []
         elif head.startswith(b"{\\rtf"):
             spent = {"images": self.image_bytes}
-            doc = rtf.parse_bytes(data, self.ctx, spent)
-            self.image_bytes = spent["images"]
+            try:
+                doc = rtf.parse_bytes(data, self.ctx, spent)
+            except ReadError as e:
+                if e.kind == "timeout":
+                    raise
+                self.ctx.skipped["chunk"] += 1
+                return []
+            finally:
+                self.image_bytes = spent["images"]
         elif _HTML_ROOT.match(data[:4096].lstrip(b"\xef\xbb\xbf")) or (
                 not head.startswith(b"<?xml") and name.endswith((".htm", ".html", ".xhtml"))):
             notes = {}

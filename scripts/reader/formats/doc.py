@@ -160,10 +160,11 @@ class _Frame:
 
 class _Field:
     """An open field: its instruction so far, whether its result has begun, the index of the link frame it opened, the
-    ObjectPool id its separator names until the object is placed, what its form data shows (word_fields.form_data)."""
+    ObjectPool id its separator names until the object is placed, what its form data shows (word_fields.form_data;
+    None until its first \\x01 is met)."""
 
     def __init__(self):
-        self.instr, self.size, self.result, self.frame, self.obj, self.form = [], 0, False, None, None, ""
+        self.instr, self.size, self.result, self.frame, self.obj, self.form = [], 0, False, None, None, None
 
 
 class _Table:
@@ -1004,12 +1005,14 @@ class _Reader:
         """An inline picture: a \\x01 with fSpec, its PICF at its PicLocation in the Data stream (0, the CHP's
         default, without sprmCPicLocation). In the result of a field that names an object it is that object, the
         PICF its preview (none with fOle2, which Word sets when the \\x01 shares the separator's run); elsewhere a
-        \\x01 with fOle2 is the object its ObjLocation, else PicLocation, names. One in a field instruction is a form
-        field's data (form), not a picture; one in a header is not read (a header is a line of text, as
+        \\x01 with fOle2 is the object its ObjLocation, else PicLocation, names. The first one in a FORM field's
+        instruction is the form field's data (form), not a picture; one in a header is not read (a header is a line of text, as
         in the docx reader). An inline drawing object without a picture is no loss."""
         run = st.run
-        if run.special and st.codes == 1 and not st.over and st.fields and not st.fields[-1].result:
-            st.fields[-1].form = self.form(run.pic or 0)
+        if run.special and st.codes == 1 and not st.over and st.fields and not st.fields[-1].result \
+                and st.fields[-1].form is None:
+            named = "".join(st.fields[-1].instr).lstrip()[:4].upper()
+            st.fields[-1].form = self.form(run.pic or 0) if named in ("", "FORM") else ""
         if not run.special or st.name in _HEADER_STORIES or not self.live(st):
             return
         f = st.fields[-1] if st.fields else None

@@ -1002,6 +1002,32 @@ def test_alt_chunk_of_another_kind_never_fails_the_document():
     assert out == "BEFORE\n\nXHTML-CHUNK\n\nAFTER\n" and ctx.skipped["chunk"] == 3, (out, ctx.skipped)
 
 
+def test_alt_chunk_with_many_comments_reads_in_time():
+    body = P("BEFORE") + '<w:altChunk r:id="rH"/>' + P("AFTER")
+    part = b"<!---->" * 60 + b"<p>CHUNK</p>"
+    t = time.perf_counter()
+    out = md(docm(body, {"word/h.html": part}, (("rH", "aFChunk", "h.html", False),)))
+    assert time.perf_counter() - t < 5, time.perf_counter() - t
+    assert out == "BEFORE\n\nCHUNK\n\nAFTER\n", out
+
+
+def test_alt_chunk_of_broken_rtf_is_counted():
+    body = P("BEFORE") + '<w:altChunk r:id="rR"/>' + P("AFTER")
+    doc, ctx = parse(docm(body, {"word/r.rtf": b"{\\RTF1 hi}"}, (("rR", "aFChunk", "r.rtf", False),)))
+    out = markdown.render(doc, tmp() / "a")
+    assert out == "BEFORE\n\nAFTER\n" and ctx.skipped["chunk"] == 1, (out, ctx.skipped)
+
+
+def test_page_number_wording_and_picture_font_space():
+    from reader.formats import word_fields
+    for shell in ("Page of", "- -", "Seite von", "제 쪽", "p.", "Página de"):
+        assert word_fields.page_shell(shell), shell
+    for kept in ("Report", "Seite 3 Entwurf", "제안서"):
+        assert not word_fields.page_shell(kept), kept
+    assert word_fields.symbol("Webdings", 0x20) == " " and word_fields.symbol("Webdings", 0xF020) == " "
+    assert word_fields.symbol("Webdings", 0x21) is None
+
+
 CORE = ('<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" '
         'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>Lease</dc:title><dc:subject>Unit 4</dc:subject>'
@@ -1067,13 +1093,15 @@ def test_properties_an_application_writes_are_left_out():
               + prop(3, "ICV", "4A566D024B714F96833A365606725056_12")
               + prop(4, "MSIP_Label_f42aa342-8706-4288-bd11-ebb85995028c_Enabled", "true")
               + prop(5, "ContentTypeId", "0x0101009A1B") + prop(6, "Client", "Hanbit")
-              + prop(7, "_dlc_DocIdItemGuid", "7a1c") + "</Properties>")
+              + prop(7, "_dlc_DocIdItemGuid", "7a1c") + prop(8, "ICVersion", "2") + prop(9, "Icv", "low")
+              + prop(10, "ContentTypeIdea", "draft") + "</Properties>")
     root = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
             f'<Relationship Id="rId1" Type="{OFFICE_RELS}/officeDocument" Target="word/document.xml"/>'
             f'<Relationship Id="rId4" Type="{OFFICE_RELS}/custom-properties" Target="docProps/custom.xml"/>'
             '</Relationships>')
     out = md(docm(P("body"), {"_rels/.rels": root, "docProps/custom.xml": custom}))
-    assert out == "Properties: Client: Hanbit\n\nbody\n", out
+    assert out == ("Properties: Client: Hanbit; ICVersion: 2; Icv: low; ContentTypeIdea: draft\n\n"
+                   "body\n"), out
 
 
 def test_page_fields_dropped_in_headers():
