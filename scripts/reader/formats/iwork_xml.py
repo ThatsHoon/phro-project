@@ -75,7 +75,9 @@ counts `slide` and keeps its number), is `Section("slide", title, number=n)`: th
 body placeholder, then the drawables of `key:page`, each under its own guard as in Pages (the master's layer proxy
 is not followed, nor the placeholder refs), then `key:notes` as `Section.notes`; sticky notes, on the page or in
 `key:sticky-notes`, are "Comment: …" lines in `Section.comments`. A comment no field names is kept as an unmarked
-note, and an attachment no ref places counts `object`. The theme's master slides are never read.
+note, and an attachment no ref places counts `object`. The master slide a slide's `key:master-ref` names gives the
+drawables of its `key:page` (read once, its placeholders not) to `deck.Repeated`: written once, on the slide when
+only one shows them; the theme's other master slides are never read.
 
 Numbers (`ls:document`): each `ls:workspace` (a workspace is not searched for more), under `ctx.guard("sheet")`, is
 `Section("sheet", ls:workspace-name)`: its tables, pictures and text boxes in order, each under its own guard as in
@@ -106,7 +108,7 @@ from .. import limits
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Heading, Image, Link, ListItem, NoteRef, Para, Section, Table, Text
 from ..numfmt import display
-from . import iwork_iwa, sheet_grid
+from . import deck, iwork_iwa, sheet_grid
 from .iwork_tables import EPOCH_SERIAL, ISO_DATE, ISO_TIME
 from .iwork_text import LINK_SCHEMES, OBJECT_REPLACEMENT, STYLE_CHAIN, level, plain
 from .word_fields import MAX_URL, comment_note
@@ -138,6 +140,7 @@ STYLESHEETS = frozenset({SL + "stylesheet", KEY + "stylesheet", SF + "stylesheet
 PROTOTYPES, FLOATING = SL + "section-prototypes", SL + "drawables"
 PAGES_PRUNE = STYLESHEETS | {HEADER, FOOTER, FOOTNOTES, ANNOTATIONS, ANNOTATION, PROTOTYPES}
 SLIDE_LIST, SLIDE, PAGE, NOTES = KEY + "slide-list", KEY + "slide", KEY + "page", KEY + "notes"
+MASTER_REF, MASTER_SLIDE = KEY + "master-ref", KEY + "master-slide"
 TITLE_PH, BODY_PH, STICKIES = KEY + "title-placeholder", KEY + "body-placeholder", KEY + "sticky-notes"
 KEY_PRUNE = STYLESHEETS | {SF + "proxy-master-layer", ANNOTATIONS, ANNOTATION}
 THEMES = KEY + "theme-list"  # the theme's master slides
@@ -1232,6 +1235,24 @@ class Reader:
                     stack.append(iter(it.inlines))
         return " ".join(" ".join(lines).split())[:iwork_iwa.MAX_TITLE]
 
+    def _master(self, slide) -> list:
+        """The blocks of the drawables on the `key:page` of the master slide `slide`'s `key:master-ref` names, read
+        once a document; [] without one."""
+        ref = next((c.get(IDREF) for c in slide if c.tag == MASTER_REF), None)
+        master = self.ids.get(ref) if ref else None
+        if master is None or master.tag != MASTER_SLIDE:
+            return []
+        key = ("master", ref)
+        if key not in self._cache:
+            self._cache[key] = []
+            with self.ctx.guard("master"):
+                got = []
+                for c in master:
+                    if c.tag == PAGE:
+                        self._drawables(c, got)
+                self._cache[key] = got
+        return self._cache[key]
+
     def _slide(self, slide, number: int) -> Section:
         sec = Section("slide", number=number)
         self.sink = sec.comments
@@ -1261,7 +1282,7 @@ class Reader:
         return sec
 
     def keynote(self) -> Doc:
-        number = 0
+        number, repeated, slides = 0, deck.Repeated(), []
         for lst in self.root:
             if lst.tag != SLIDE_LIST:
                 continue
@@ -1270,7 +1291,10 @@ class Reader:
                     continue
                 number += 1
                 with self.ctx.guard("slide"):
-                    self.doc.blocks.append(self._slide(slide, number))
+                    sec = self._slide(slide, number)
+                    slides.append(sec)
+                    repeated.add(number, self._master(slide))
+        self.doc.blocks.extend(repeated.place(slides) + slides)
         self._leftovers()
         for a in self.attachments:  # no ref placed it: a slide has no place for it
             if id(a) not in self.placed and id(a) not in self.entered:

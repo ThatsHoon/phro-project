@@ -459,7 +459,8 @@ def keynote_doc(slides: list[dict], tree=None) -> list[bytes]:
     children, 2 slide, 4 isSkipped} -> KN.SlideArchive (5) {5 title, 6 body, 7 owned drawables, 17 template slide,
     27 note, 42 drawables_z_order}. Keys: title, body, notes (text; each a placeholder or note with its storage, the
     title and body text a string or `storage` bytes), note, drawables and z_order (ids the caller adds), skipped,
-    children (slide indexes), template (text of a template slide only the theme lists). `tree` lists the slide
+    children (slide indexes), template (text of a template slide only the theme lists), template_ref (a template
+    slide id the caller adds, perhaps shared). `tree` lists the slide
     indexes in the slide tree, all by default."""
     tree = range(len(slides)) if tree is None else tree
     out = [archive(KEYNOTE_ROOT, 1, pb((2, pb_ref(SHOW)))),
@@ -484,6 +485,8 @@ def keynote_doc(slides: list[dict], tree=None) -> list[bytes]:
             out += [archive(ids["template"], 5, pb((5, pb_ref(ids["template_title"])))),
                     placeholder(ids["template_title"], ids["template_text"]),
                     archive(ids["template_text"], 2001, storage(s["template"]))]
+        elif "template_ref" in s:
+            fields.append((17, pb_ref(s["template_ref"])))
         if "note" in s:  # a KN.NoteArchive id the caller adds (perhaps shared)
             fields.append((27, pb_ref(s["note"])))
         elif "notes" in s:

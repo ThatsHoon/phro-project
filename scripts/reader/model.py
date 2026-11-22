@@ -142,7 +142,7 @@ class Code:
 
 @dataclass
 class Section:
-    kind: str  # slide | sheet | chapter | page | table | query | master
+    kind: str  # slide | sheet | chapter | page | table | query | master | repeated
     title: str = ""
     number: int | None = None
     blocks: list = field(default_factory=list)

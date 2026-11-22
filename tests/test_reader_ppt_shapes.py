@@ -5,6 +5,7 @@ Run: python -I -X utf8 tests/test_reader_ppt_shapes.py
 import struct
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -13,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader import limits, markdown, officeart  # noqa: E402
-from reader.formats import ppt_shapes  # noqa: E402
+from reader.formats import deck, ppt_shapes  # noqa: E402
 from reader.model import Code, Context, Table  # noqa: E402
 from diagram_fix import mermaid_ok  # noqa: E402
 from reader_fix import (make_ppt, oa_container, oa_group, oa_record, oa_shape, oa_solver,  # noqa: E402
@@ -81,9 +82,7 @@ def test_footer_placeholders():
                         {"placeholder": 9, "ref": 1, "box": (0, 900, 100, 950)},
                         text("shown", (0, 100, 100, 150))]}
     out, _ = md([slide])
-    for t in ("date text", "number text", "footer text", "header text", "kept body"):
-        assert t not in out, (t, out)
-    assert "shown" in out, out
+    assert out == "## Slide 1: T\n\nshown\n\nfooter text\n\nheader text\n\nkept body\n", repr(out)
 
 
 def test_group_transform():
@@ -180,7 +179,7 @@ def test_anchor_16_bytes():
     assert out.index("first") < out.index("second"), out
 
 
-def test_hyperlink_keeps_text_only():
+def test_hyperlink_wraps_its_text():
     url = "http://example.com/target"
     d = Path(tempfile.mkdtemp())
     path = d / "a.ppt"
@@ -188,8 +187,17 @@ def test_hyperlink_keeps_text_only():
     assert url.encode("utf-16le") in info["doc_stream"], "the fixture holds no URL"
     ctx = Context()
     out = markdown.render(reader.parse(path, ctx), d / "assets", False, ctx.skipped)
-    assert "click here" in out and "](" not in out and "example.com" not in out and "http" not in out, out
+    assert out == f"## Slide 1\n\n[click here]({url})\n", out
     assert not ctx.skipped, ctx.skipped
+
+
+def test_many_field_marks_in_one_text_stay_linear():
+    n = 200_000
+    item = ["text", 4, "ab" * n, None, [], list(range(0, 2 * n, 2))]
+    t = time.perf_counter()
+    out = ppt_shapes.text_blocks([item], ppt_shapes.Walk(Context()))
+    assert time.perf_counter() - t < 8, time.perf_counter() - t
+    assert out[0][2] == "b" * n
 
 
 def slide_with_refs(*refs):
@@ -212,22 +220,22 @@ def test_bad_or_repeated_outline_ref_follows_unreferenced():
     assert out.count("Beta tail") == 1 and out.count("Alpha body") == 1, out
 
 
-def test_unanchored_shapes_sort_after_anchored_in_record_order():
+def test_unanchored_shapes_keep_their_record_place():
     shapes = [{"text": "free one"}, text("low", (0, 500, 100, 550)), {"text": "free two"},
               text("high", (0, 100, 100, 150))]
     out, _ = md([{"shapes": shapes}])
-    assert out.index("high") < out.index("low") < out.index("free one") < out.index("free two"), out
+    assert out.index("free one") < out.index("free two") < out.index("high") < out.index("low"), out
 
 
 def test_unanchored_member_does_not_pull_group_union():
     group = {"kind": "group", "children": [{"text": "free member"}, text("g low", (0, 500, 100, 550)),
                                            text("g high", (0, 400, 100, 450))]}
     sibling = text("sibling", (0, 300, 100, 350))
-    shapes = ppt_shapes.ordered(walked([group, sibling]))
+    shapes = ppt_shapes.ordered(walked([group, sibling]), deck.Order())
     union = next(s for s in shapes if s.kind == "group")
     assert (union.top, union.left, union.bottom, union.right) == (400, 0, 550, 100), vars(union)
     out, _ = md([{"shapes": [group, sibling]}])
-    assert out.index("sibling") < out.index("g high") < out.index("g low") < out.index("free member"), out
+    assert out.index("sibling") < out.index("free member") < out.index("g high") < out.index("g low"), out
 
 
 def test_table_edges_within_tolerance_are_one_line():
@@ -422,7 +430,7 @@ _PLAIN = [  # what the reader wrote for these decks before it read connectors
     '## Slide 1: Big idea\n\ndetail\n',
     '## Slide 1\n\nB\n\nA\n\nCee\n',
     '## Slide 1\n\n|a1|b1|\n|---|---|\n|c1|d1|\n',
-    '## Slide 1\n\nlow\n\nfree one\n\nfree two\n',
+    '## Slide 1\n\nfree one\n\nlow\n\nfree two\n',
     '(1 hidden places left out)\n\n## Slide 1: T\n\nkept body\n',
     '## Slide 1\n\nChoice\n\nrule\n\nDone\n',
 ]

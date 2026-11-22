@@ -56,6 +56,7 @@ ALT_CHUNK_DEPTH = 4  # altChunk parts one docx reads inside one another (a Word 
 ALT_CHUNKS = 64  # altChunk parts one document reads, every level together
 ALT_CHUNK_BYTES = 2**27  # bytes of the altChunk parts one document reads, every level together
 PROPERTY_STREAM = 2**20  # bytes of a .doc SummaryInformation or DocumentSummaryInformation stream read; past it, none
+XYCUT_WORK = 400_000  # boxes the reading orders of one document may sort, summed over their cuts (deck.Order): about a second; then (top, left)
 SMARTART_NODES = 5_000  # SmartArt text items one document may emit, copies counted; one data part reads at most four times as many points and connections
 # metafile pictures (WMF, EMF, PICT, WPG, TIFF): each cap is read at call time
 FIGURE_CHARS = 20_000      # figure text per picture
