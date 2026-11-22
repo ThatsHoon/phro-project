@@ -521,21 +521,22 @@ def _reading_key(frag):
     return frag.x, frag.y
 
 
-def _cell_lines(fragments, cache):
-    """Lines of the fragments of a cell. The cache holds identical inputs once."""
+def _cell_lines(fragments, cache, gap):
+    """Lines of the fragments of a cell, spaced by the page's word gap `gap`. The cache holds
+    identical inputs once."""
     key = tuple(id(frag) for frag in fragments)
     if cache is not None and key in cache:
         return cache[key]
     # in reading order (dochan's key), whatever order the page drew them in; lines() follows
     # `order`, so the copies are numbered by that sort
     ordered = sorted(fragments, key=_reading_key)
-    out = pdf_layout.lines([replace(f, order=i) for i, f in enumerate(ordered)])
+    out = pdf_layout.lines([replace(f, order=i) for i, f in enumerate(ordered)], gap=gap)
     if cache is not None:
         cache[key] = out
     return out
 
 
-def _assign_text(grid, owners, boxes, xs, ys, fragments, mdl, breaks, reference_points, line_cache):
+def _assign_text(grid, owners, boxes, xs, ys, fragments, mdl, breaks, reference_points, line_cache, gap):
     """Each fragment goes to the cell holding its reference point. Returns the orders taken
     and, per cell key, the (y, kind, order, seq, block) events of its paragraphs."""
     by_cell = defaultdict(list)
@@ -556,7 +557,7 @@ def _assign_text(grid, owners, boxes, xs, ys, fragments, mdl, breaks, reference_
     events = defaultdict(list)
     for key, frags in by_cell.items():
         groups = [[]]
-        for line in _cell_lines(frags, line_cache):
+        for line in _cell_lines(frags, line_cache, gap):
             # a line whose baseline reaches the top of a nested table is above it: break after it
             if groups[-1] and not line.vertical and any(
                     line.box[1] < y <= groups[-1][-1].box[1] for y in breaks.get(key, ())):
@@ -573,7 +574,7 @@ def _assign_text(grid, owners, boxes, xs, ys, fragments, mdl, breaks, reference_
 _NUMBER = re.compile(r"[+−-]?\d[\d,]*(?:\.\d+)?%?")
 
 
-def _numeric_row_rules(horizontal, vertical, xs, ys, fragments, tolerance, reference_points, line_cache):
+def _numeric_row_rules(horizontal, vertical, xs, ys, fragments, tolerance, reference_points, line_cache, gap):
     """Split a ruled band only when three numeric columns agree on every row: all text must align
     with the same baselines, and every inner column edge must be ruled across the whole band."""
     if (len(xs) < 4 or len(fragments) * len(ys) > MAX_INTERSECTION_CHECKS
@@ -602,7 +603,7 @@ def _numeric_row_rules(horizontal, vertical, xs, ys, fragments, tolerance, refer
         columns = defaultdict(list)
         for column, fragment in bands[band]:
             columns[column].append(fragment)
-        lns = [_cell_lines(columns[c], line_cache) for c in range(len(xs) - 1)]
+        lns = [_cell_lines(columns[c], line_cache, gap) for c in range(len(xs) - 1)]
         numeric = [column for column in lns if len(column) >= 2 and all(
             not line.vertical and line.text.split() and all(
                 _NUMBER.fullmatch(word) for word in line.text.split()) for line in column)]
@@ -1048,6 +1049,7 @@ def tables(segments, fragments, page_number, budget, cut, short=(), model=None,
     dash_runs = _short_dash_runs(short, tol)
     index = _fragment_index(fragments)
     line_cache = {}
+    gap = pdf_layout.word_gap(fragments)
     reference_points = {id(frag): point for point, frag in index[0]}
     separated = []
     component_boxes = {}
@@ -1088,7 +1090,7 @@ def tables(segments, fragments, page_number, budget, cut, short=(), model=None,
         if bbox[2] - bbox[0] >= 8 and bbox[3] - bbox[1] >= 8:
             if len(xs) >= 4:   # the numeric rule needs three columns
                 hs, ys = _numeric_row_rules(hs, vs, xs, ys, _fragments_inside(index, bbox), tol,
-                                            reference_points, line_cache)
+                                            reference_points, line_cache, gap)
             components.append((bbox, hs, vs, xs, ys))
     components.sort(key=lambda v: -_area(v[0]))
     remaining = MAX_PAGE_CELLS
@@ -1145,7 +1147,7 @@ def tables(segments, fragments, page_number, budget, cut, short=(), model=None,
         own_orders, events = _assign_text(
             node.grid, node.owners, node.boxes, node.xs, node.ys,
             [frag for frag in _fragments_inside(index, node.bbox) if frag.order not in used_orders],
-            mdl, breaks, reference_points, line_cache)
+            mdl, breaks, reference_points, line_cache, gap)
         for child in node.children:
             events[child.owner_key].append((child.bbox[3], 1, child.anchor, 0, _to_table(child.grid)))
         for key, blocks in events.items():

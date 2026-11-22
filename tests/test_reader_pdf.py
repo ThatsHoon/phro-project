@@ -319,17 +319,17 @@ def test_bad_coord_is_text():
 def test_after_loop_page_isolated():
     real = pdf_layout.paragraphs
 
-    def paragraphs(lns, model):
+    def paragraphs(lns, model, *body):
         if any(ln.text == "P2" for ln in lns):
             raise ValueError("broken paragraphs")
-        return real(lns, model)
+        return real(lns, model, *body)
 
     with patched(pdf_layout, "paragraphs", paragraphs):
         text, ctx, _ = md(simple_pdf([text_ops(f"P{n}") for n in range(1, 4)]))
     assert "P1" in text and "P3" in text and "P2" not in text, text
     assert ctx.skipped == {"page": 1}, ctx.skipped
 
-    def timeout(lns, model):
+    def timeout(lns, model, *body):
         raise ReadError("timeout", "paragraphs")
 
     with patched(pdf_layout, "paragraphs", timeout):

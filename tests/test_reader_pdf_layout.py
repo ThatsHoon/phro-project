@@ -135,10 +135,35 @@ def test_paragraph_break():
     assert para_text(out[1]) == "next para"
 
 
+LONG = "so the first line of the paragraph runs on to "  # a first line longer than the next, so the next one wrapped
+
+
 def _paras(*lines):
     """The paragraph texts of lines set 14 apart, one paragraph's spacing."""
     fr = [frag(t, 72, 700 - 14 * k) for k, t in enumerate(lines)]
     return [para_text(p) for p in L.paragraphs(L.lines(numbered(fr)), L.SpacingModel())]
+
+
+def test_ended_line_ends_paragraph():
+    # at one pitch, a line the next first word would have fitted after was ended, not wrapped: a
+    # heading over its text, the items of a list; a line that wrapped joins the next
+    assert _paras("Accuracy of information",
+                  "All information will be used to assess if the applicant is",
+                  "entitled to a certificate. An application may:",
+                  "o Result in rejection of the application",
+                  "o Raise doubts about the ability of the applicant to",
+                  "control the operation",
+                  "o Result in delays") == [
+        "Accuracy of information",
+        "All information will be used to assess if the applicant is entitled to a certificate. An"
+        " application may:",
+        "o Result in rejection of the application",
+        "o Raise doubts about the ability of the applicant to control the operation",
+        "o Result in delays"]
+    # items of one length, each set off by its marker
+    assert _paras("Here is a numbered list:", "1) Number bullet 1", "2) Number bullet 2", "3) Number bullet 3") == [
+        "Here is a numbered list:", "1) Number bullet 1", "2) Number bullet 2", "3) Number bullet 3"]
+    assert _paras("• Bullet one", "• Bullet two") == ["• Bullet one", "• Bullet two"]
 
 
 def test_toc_entry_ends_paragraph():
@@ -165,17 +190,11 @@ def test_toc_leader_forms():
 
 def test_toc_ending_needs_leader_and_label():
     # a prose ellipsis is 3 dots, short of a leader: the lines join
-    assert _paras("Well... I", "the text goes on") == ["Well... I the text goes on"]
-    assert _paras("values 1, 2, ... 10", "the text goes on") == [
-        "values 1, 2, ... 10 the text goes on"]
-    assert _paras("and so on ... iv", "the text goes on") == ["and so on ... iv the text goes on"]
-    assert _paras("pages ‥. 4", "the text goes on") == ["pages ‥. 4 the text goes on"]
+    for line in ("Well... I", "values 1, 2, ... 10", "and so on ... iv", "pages ‥. 4"):
+        assert _paras(LONG + line, "the text goes on") == [LONG + line + " the text goes on"], line
     # dots with no page label, a number with no leader, or too short a leader: the lines join
-    assert _paras("and so on...", "the text goes on") == ["and so on... the text goes on"]
-    assert _paras("chapter 12", "the text goes on") == ["chapter 12 the text goes on"]
-    assert _paras("as in Fig.. 3", "the text goes on") == ["as in Fig.. 3 the text goes on"]
-    assert _paras("so . . 3", "the text goes on") == ["so . . 3 the text goes on"]
-    assert _paras("and then... did", "the text goes on") == ["and then... did the text goes on"]
+    for line in ("and so on...", "chapter 12", "as in Fig.. 3", "so . . 3", "and then... did"):
+        assert _paras(LONG + line, "the text goes on") == [LONG + line + " the text goes on"], line
 
 
 def test_content_order_kept():
@@ -314,6 +333,155 @@ def test_link_survives_hyphen_join():
 def test_xps_columns_lifted():
     runs = [(1.0, 10.0, 12.0, "a", 0)]
     assert xps._columns(runs, 600) == [runs]
+
+
+def _tight_line(words, y, size=10.0, word_gap=0.14, kern=-0.02):
+    """One fragment of words set with no space glyphs: each glyph 0.5 em wide, a kern between
+    letters and `word_gap` em between words, as a tightly set newspaper column draws them."""
+    text, offsets, gaps, pos = "", [], [], 0.0
+    for w, word in enumerate(words):
+        for k, ch in enumerate(word):
+            step = (word_gap if w and not k else kern if text else 0.0) * size
+            pos += step
+            text += ch
+            offsets.append(pos)
+            gaps.append(step)
+            pos += 0.5 * size
+    offsets.append(pos)
+    return frag(text, 72, y, size=size, width=pos, char_offsets=tuple(offsets), char_gaps=tuple(gaps))
+
+
+def test_tight_line_keeps_spaces():
+    rows = [["Heute", "lest", "ihr", "die", "letzte", "Ausgabe"],
+            ["der", "Pendler", "zeitung", "zwanzig", "Minuten"],
+            ["Damit", "geht", "ein", "Stück", "Geschichte", "zu", "Ende"]]
+    fr = [_tight_line(r, 700 - 12 * k) for k, r in enumerate(rows)]
+    assert texts(L.lines(numbered(fr))) == [" ".join(r) for r in rows]
+    assert L.GAP_FLOOR <= L.word_gap(fr) < 0.14
+    loose = [_tight_line(r, 700 - 12 * k, word_gap=0.3, kern=0.0) for k, r in enumerate(rows)]
+    assert texts(L.lines(numbered(loose))) == [" ".join(r) for r in rows]
+    assert L.word_gap(loose[:1]) == L.GAP
+
+
+def test_letter_spaced_page_splits_its_own_gaps():
+    rows = [["WORD", "ONE", "TWO"], ["MORE", "WORDS", "HERE"], ["AND", "THE", "LAST", "ROW"]]
+    fr = [_tight_line(r, 700 - 14 * k, size=12.0, word_gap=0.4, kern=0.1) for k, r in enumerate(rows)]
+    assert texts(L.lines(numbered(fr))) == [" ".join(r) for r in rows]
+
+
+def test_word_fragments_keep_the_fixed_gap():
+    # one fragment per word, as OCR gives them: every gap is a word gap, none a letter gap, so the
+    # most common one parts words too
+    fr, x = [], 72.0
+    words = "the quick brown fox jumps over a lazy dog and runs".split()
+    for k in range(60):
+        w = words[k % len(words)]
+        fr.append(frag(w, x, 700 - 14 * (k // 6)))
+        x = 72.0 if k % 6 == 5 else x + len(w) * 6 + 12 * (0.28 + 0.02 * (k % 5))
+    assert L.word_gap(numbered(fr)) == L.GAP
+    assert texts(L.lines(fr))[0] == "the quick brown fox jumps over", texts(L.lines(fr))
+
+
+def test_own_spaces_keep_words_whole():
+    # a page whose words are set apart by space glyphs: its other gaps are letter spacing, here
+    # glyphs placed one by one with up to 0.15 em of jitter, and split no word
+    rows = ["ODBC DRIVER CALL FAILED", "PARTITION VIEW TEST REPORT", "BITMAP INDEX AND SPACE",
+            "CORRUPTED BLOCK OBJECT FINDER", "DATABASE INTERNAL RECOVERY"]
+    fr = []
+    for k, row in enumerate(rows):
+        jitter = [0.02, -0.01, 0.0, 0.15, 0.01, -0.09, 0.03, 0.0]
+        text, offsets, gaps, pos = "", [], [], 0.0
+        for i, ch in enumerate(row):
+            step = 0.0 if not text or ch == " " or text[-1] == " " else jitter[i % len(jitter)] * 10
+            pos += step
+            text += ch
+            offsets.append(pos)
+            gaps.append(step)
+            pos += (0.25 if ch == " " else 0.5) * 10
+        offsets.append(pos)
+        fr.append(frag(text, 72, 700 - 12 * k, size=10.0, width=pos, char_offsets=tuple(offsets),
+                       char_gaps=tuple(gaps)))
+    assert texts(L.lines(numbered(fr))) == rows
+    assert L.word_gap(fr) == L.GAP
+
+
+def test_loose_leading_is_one_paragraph():
+    text = ["이 편람은 1991년 사무관리규정 제정 시", "처음 발간된 이후 여러 차례", "개정되어 왔다.",
+            "둘째 문단은 여기서", "시작한다."]
+    ys = [700, 681, 662, 633, 614]
+    # justified: a line that wraps runs to the measure
+    fr = [frag(t, 72, y, size=12, **({"width": 132.0} if t[-1] != "." else {})) for t, y in zip(text, ys)]
+    out = [para_text(p) for p in L.paragraphs(L.lines(numbered(fr)), L.SpacingModel())]
+    assert len(out) == 2, out
+    assert out[0].endswith("개정되어 왔다.") and out[1].startswith("둘째")
+
+
+def test_spaced_out_lines_stay_apart():
+    # form labels 3 sizes apart are items, not a paragraph in loose leading: no pitch is measured from them
+    fr = [frag(t, 72, 700 - 36 * k, size=12) for k, t in enumerate(("Check boxes: A B", "Radio buttons: yes no",
+                                                                     "Drop-down:", "Signature:"))]
+    lns = L.lines(numbered(fr))
+    assert L.pitch(lns) == (L.LEADING, L.LEADING)
+    assert len(L.paragraphs(lns, L.SpacingModel(), L.pitch(lns))) == 4
+
+
+def test_pitch_measured_by_text_not_by_stray_lines():
+    body = [frag("body line number %d of the page" % k, 72, 700 - 19 * k) for k in range(4)]
+    tab = [frag(ch, 560, 600 - 9 * k, size=9) for k, ch in enumerate("행정업무운영개요")]
+    lns = L.lines(numbered(body + tab))
+    assert abs(L.pitch(lns)[0] - 19 / 12) < 0.05
+    assert len(L.paragraphs(lns[:4], L.SpacingModel(), L.pitch(lns))) == 1
+
+
+def test_wrapped_heading_is_one_heading():
+    fr = [frag("A Study of Stress-", 72, 740, size=20), frag("Induced Failures", 72, 716, size=20)]
+    fr += [frag("body text of the paper goes on here", 72, 680 - 14 * k) for k in range(4)]
+    lns = L.lines(numbered(fr))
+    out = L.place(lns, [], {0: 3, 1: 3}, L.SpacingModel())
+    assert [type(b).__name__ for b in out] == ["Heading", "Para"]
+    assert "".join(t.text for t in out[0].inlines) == "A Study of Stress- Induced Failures"
+
+
+def test_math_alphanumerics_fold():
+    out = L.lines(numbered([frag("𝑉ℎ𝑖𝑔ℎ = 𝐀𝟏", 72, 700)]))
+    assert texts(out) == ["Vhigh = A1"]
+
+
+def _paged(n, header):
+    fr = [frag(header, 72, 760), frag(f"Downloaded from repo.example.org on {n} May", 20, 200,
+                                       dir_x=0.0, dir_y=1.0, up_x=-1.0, up_y=0.0, width=200.0)]
+    for i in range(3):
+        fr.append(frag(f"body {n} line {i} of the text", 72, 700 - 14 * i))
+    return L.lines(numbered(fr))
+
+
+def test_running_header_with_page_number_inside():
+    pages = [_paged(n, f"{44 + n} Smith et al., 2020, Vol. {n % 2 + 3}") for n in range(1, 7)]
+    headers, footers, drops = L.running(pages, [(0, 0, 612, 792)] * 6)
+    for lns, drop in zip(pages, drops):
+        kept = [ln.text for i, ln in enumerate(lns) if i not in drop]
+        assert all(t.startswith("body") for t in kept), kept
+    assert headers[0].startswith("45 Smith")
+
+
+def test_vertical_column_keeps_punctuation():
+    down = dict(dir_x=0.0, dir_y=-1.0, up_x=1.0, up_y=0.0, width=8.0, vertical=True)
+    col = []
+    for k, ch in enumerate("中「含む」を"):
+        kw = down if ch in "「」" else {}
+        col.append(frag(ch, 421, 614 - 8 * k, size=8, **({"width": 8.0} | kw)))
+    col += [frag(ch, 384, 614 - 8 * k, size=8, width=8.0) for k, ch in enumerate("以下")]
+    assert texts(L.lines(numbered(col))) == ["中「含む」を", "以下"]
+
+
+def test_vertical_tiers():
+    # two tiers of columns parted by one empty row: each tier's columns are read before the next
+    # tier's; a column's own empty cell does not part it
+    down = dict(dir_x=0.0, dir_y=-1.0, up_x=1.0, up_y=0.0, width=8.0, vertical=True)
+    cells = {421: {614: "上", 606: "段", 598: "一", 582: "続", 566: "下", 558: "段", 550: "一"},
+             410: {614: "上", 606: "段", 598: "二", 590: "終", 582: "わ", 566: "下", 558: "段", 550: "二"}}
+    fr = [frag(ch, x, y, size=8, **down) for x, col in cells.items() for y, ch in col.items()]
+    assert texts(L.lines(numbered(fr))) == ["上段一続", "上段二終わ", "下段一", "下段二"], texts(L.lines(fr))
 
 
 def test_scale():
