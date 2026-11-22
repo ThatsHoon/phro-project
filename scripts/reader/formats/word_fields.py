@@ -49,7 +49,7 @@ _PICTURE_FONTS = frozenset(("webdings", "wingdings 2", "wingdings 3", "mt extra"
                             "zapfdingbats", "zapf dingbats", "monotype sorts", "ms outlook", "ms reference specialty"))
 _APP_PROPERTY = re.compile(r"^(?:KSOProductBuildVer$|ICV$|ContentTypeId$|MSIP_Label_|_dlc_|_MarkAsFinal$|"
                            r"MediaServiceImageTags$|GrammarlyDocumentId$|_NewReviewCycle$|TaxCatchAll)")
-_PAGE_WORDS = frozenset("page pages pg p of seite von sur de página 쪽 페이지 면 제".split())
+_PAGE_WORDS = frozenset("page pages pg p pp of seite von sur de página 쪽 페이지 면 제 제쪽 제면 제페이지".split())
 
 
 def page_shell(text: str) -> bool:

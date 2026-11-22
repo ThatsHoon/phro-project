@@ -1020,7 +1020,7 @@ def test_alt_chunk_of_broken_rtf_is_counted():
 
 def test_page_number_wording_and_picture_font_space():
     from reader.formats import word_fields
-    for shell in ("Page of", "- -", "Seite von", "제 쪽", "p.", "Página de"):
+    for shell in ("Page of", "- -", "Seite von", "제 쪽", "제쪽", "제면", "pp.", "p.", "Página de"):
         assert word_fields.page_shell(shell), shell
     for kept in ("Report", "Seite 3 Entwurf", "제안서", "PPP", "PDE", "Depp", "면제", "제제"):
         assert not word_fields.page_shell(kept), kept
