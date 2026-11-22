@@ -69,21 +69,79 @@ def _fallback() -> Path:
     return _private
 
 
+CODE = "code"  # the folder under the root that keeps code digests (code_digest)
+KEYS = "keys"  # the folder under the root that keeps document keys (key)
+
+
+def _is_hex(text: str) -> bool:
+    return len(text) == 40 and all(ch in "0123456789abcdef" for ch in text)
+
+
+def _memo_get(name: str, m: str) -> str | None:
+    try:
+        text = (root() / name / m[:2] / m).read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text if _is_hex(text) else None
+
+
+def _memo_put(name: str, m: str, value: str) -> None:
+    """Keeps `value` under memo id `m`, written atomically; a disk that cannot be written is no error."""
+    f = root() / name / m[:2] / m
+    with _lock:
+        n = next(_counter)
+    tmp = f.parent / f".tmp-{m}-{os.getpid()}-{n}"
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(value, encoding="ascii")
+        os.replace(tmp, f)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _sources(top: str) -> list:
+    """The *.py and *.json files under top as sorted (relative posix path, absolute path, size, mtime_ns)."""
+    found, dirs = [], [top]
+    while dirs:
+        with os.scandir(dirs.pop()) as it:
+            for e in it:
+                if e.is_dir(follow_symlinks=False):
+                    dirs.append(e.path)
+                elif os.path.splitext(e.name)[1] in (".py", ".json") and e.is_file():
+                    st = e.stat()
+                    found.append((os.path.relpath(e.path, top).replace(os.sep, "/"), e.path, st.st_size,
+                                  st.st_mtime_ns))
+    return sorted(found)
+
+
 def code_digest(base=None) -> str:
     """sha1 over the reader's own source (sorted relative paths and bytes, CRLF read as LF), so a code change
-    misses the cache; the installed package's digest is worked out once per process."""
+    misses the cache. Kept in the cache root under a hash of the folder and its files' (path, size, mtime) list,
+    and worked out again only when that list changes; the installed package's digest once per process."""
     global _code
     if base is None and _code is not None:
         return _code
-    top = Path(base) if base is not None else Path(__file__).resolve().parent
-    h = hashlib.sha1()
-    files = [f for f in top.rglob("*") if f.suffix in (".py", ".json") and f.is_file()]
-    for f in sorted(files, key=lambda q: q.relative_to(top).as_posix()):
-        h.update(f.relative_to(top).as_posix().encode("utf-8") + b"\0")
-        h.update(f.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    top = os.path.abspath(base if base is not None else os.path.dirname(os.path.abspath(__file__)))
+    files = _sources(top)
+    listing = hashlib.sha1(os.path.normcase(top).encode("utf-8", "replace") + b"\0")
+    for rel, _, size, mtime in files:
+        listing.update(f"{rel}\0{size}\0{mtime}\0".encode("utf-8", "replace"))
+    m = listing.hexdigest()
+    digest = _memo_get(CODE, m)
+    if digest is None:
+        h = hashlib.sha1()
+        for rel, path, _, _ in files:
+            h.update(rel.encode("utf-8") + b"\0")
+            with open(path, "rb") as f:
+                h.update(f.read().replace(b"\r\n", b"\n") + b"\0")
+        digest = h.hexdigest()
+        _memo_put(CODE, m, digest)
     if base is None:
-        _code = h.hexdigest()
-    return h.hexdigest()
+        _code = digest
+    return digest
 
 
 def key(path, engine: str = "", image: str = "", ocr: str = "") -> str:
@@ -98,10 +156,23 @@ def key(path, engine: str = "", image: str = "", ocr: str = "") -> str:
         h.update(b"image:" + image.encode() + b"\0")
     if ocr:
         h.update(b"ocr:" + ocr.encode("utf-8", "replace") + b"\0")
+    st = os.stat(path)
+    seen = (st.st_size, st.st_mtime_ns, st.st_ino)
+    memo = h.copy()
+    memo.update(b"file:" + os.path.normcase(os.path.abspath(path)).encode("utf-8", "surrogatepass") + b"\0"
+                + repr(seen).encode())
+    m = memo.hexdigest()
+    k = _memo_get(KEYS, m)
+    if k is not None:
+        return k
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
             h.update(chunk)
-    return h.hexdigest()
+        after = os.fstat(f.fileno())
+    k = h.hexdigest()
+    if (after.st_size, after.st_mtime_ns, after.st_ino) == seen:
+        _memo_put(KEYS, m, k)
+    return k
 
 
 def lookup(k: str):
@@ -313,7 +384,7 @@ def prune(days: int = 30) -> int:
                     f.unlink()
             except OSError:
                 pass
-    for name in (FIGURES, OCR):
+    for name in (FIGURES, OCR, CODE, KEYS):
         # converted figures and OCR results: unused for `days` (a lookup touches them), or a writer's leftover
         # after a day
         files = base / name
@@ -331,7 +402,8 @@ def prune(days: int = 30) -> int:
                 except OSError:
                     pass
     for bucket in base.iterdir():
-        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined", FIGURES, OCR):
+        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined", FIGURES, OCR,
+                                                  CODE, KEYS):
             continue
         for d in bucket.iterdir():
             if d.name.startswith(".tmp-"):

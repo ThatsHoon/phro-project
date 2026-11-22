@@ -726,7 +726,7 @@ def test_import_is_light():
     assert r.returncode == 0, r.stderr
     lines = r.stdout.splitlines()
     assert lines[0] == "None"
-    assert lines[1] == "['reader', 'reader.gate', 'reader.limits']", lines[1]
+    assert lines[1] == "['reader', 'reader.exts', 'reader.gate', 'reader.limits']", lines[1]
 
 
 def hook(payload):
@@ -763,6 +763,7 @@ def test_hooks_json_entry():
     assert e["matcher"] == "^Read$"
     c = e["hooks"][0]
     assert c["type"] == "command" and c["command"].endswith('read.py" hook') and c["timeout"] == 60
+    assert c["command"].startswith("python -I -S -X utf8 "), c["command"]
     assert {"SessionStart", "SubagentStart", "UserPromptSubmit"} <= set(h)
 
 
@@ -2211,6 +2212,64 @@ def test_gate_passes_ocr_id_to_child():
         assert Path(o["updatedInput"]["file_path"]).parent.name == cache.key(p, "native", ocr=oid), o
         o = out(gate.decide(ev(p, pages="3-4")))
         assert Path(o["updatedInput"]["file_path"]).parent.name == cache.key(p, "native", ocr=oid), o
+
+
+HOOK_MODULES = """import io, runpy, sys
+read_py, data = sys.argv[1], sys.stdin.buffer.read()
+sys.stdin = io.TextIOWrapper(io.BytesIO(data))
+sys.argv = [read_py, "hook"]
+try:
+    runpy.run_path(read_py, run_name="__main__")
+    code = None
+except SystemExit as e:
+    code = e.code
+sys.stdout.flush()
+print("MODULES", code, ",".join(m for m in ("argparse", "pathlib", "reader") if m in sys.modules))
+"""
+
+
+def _hook_modules(raw):
+    """What `read.py hook` printed before its exit, its exit code, and which of argparse, pathlib and reader it
+    imported, for stdin `raw` (bytes)."""
+    r = subprocess.run([sys.executable, "-I", "-S", "-X", "utf8", "-c", HOOK_MODULES, str(READ)], input=raw,
+                       capture_output=True)
+    lines = r.stdout.decode("utf-8").splitlines()
+    assert lines and lines[-1].startswith("MODULES "), (r.stdout, r.stderr[-400:])
+    _, code, mods = lines[-1].split(" ", 2)
+    return lines[:-1], code, mods
+
+
+def test_hook_skips_a_non_document_before_any_import():
+    """`read.py hook` reads the event's file_path values from the raw bytes and ends at once when none is a
+    document, before argparse, pathlib or reader is imported; any doubt (an escaped key or extension, a duplicate
+    key, an unfinished string) takes the full path, which reaches the same decision."""
+    skip = [
+        b'{"tool_name": "Read", "tool_input": {"file_path": "C:\\\\x\\\\a.py"}}',
+        b'{"tool_name":"Read","tool_input":{"file_path" : "C:/Users/me/notes.md", "limit": 5}}',
+        b'{"tool_name": "Bash", "tool_input": {"command": "ls"}}',
+        b'{"tool_input": {"file_path": "a.py"}, "note": "{\\"file_path\\": \\"x.docx\\"}"}',
+        b'{"tool_input": {"file_path": ".docx"}}',
+        b'{"tool_input": {"file_path": "a.docx."}}',
+        b'{"tool_input": {"file_path": null}}',
+        b"[" * 100_000,
+    ]
+    for raw in skip:
+        printed, code, mods = _hook_modules(raw)
+        assert printed == [] and code == "0" and mods == "", (raw[:80], printed, code, mods)
+    full = [
+        b'{"tool_name": "Read", "tool_input": {"file_path": "C:\\\\x\\\\a.docx"}}',
+        b'{"tool_input": {"file_path": "C:/x/A.DOCX"}}',
+        b'{"tool_input": {"file_p\\u0061th": "a.docx"}}',
+        b'{"tool_input": {"file_path": "a.do\\u0063x"}}',
+        b'{"tool_input": {"file_path": "a.py", "file_path": "b.pdf"}}',
+        b'{"tool_input": {"file_path": "dir/a.docx/"}}',
+        b'{"tool_input": {"file_path": "..docx"}}',
+        b'{"tool_input": {"file_path": "a.\\u212aey"}}',
+        b'{"tool_input": {"file_path": "a.docx',
+    ]
+    for raw in full:
+        printed, code, mods = _hook_modules(raw)
+        assert printed == [] and code == "0" and "reader" in mods.split(","), (raw[:80], printed, code, mods)
 
 
 def main():

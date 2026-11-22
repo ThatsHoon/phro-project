@@ -17,6 +17,76 @@ def _place(paths: list, here: str) -> list:
 
 sys.path[:] = _place(sys.path, _HERE)
 
+_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+_HEX = frozenset("0123456789abcdefABCDEF")
+_SPACE = " \t\n\r"
+
+
+def _strings(s: str):
+    """Every JSON string of s as (start, end, decoded text), found by the quotes alone; None when one is unfinished
+    or holds an escape JSON refuses."""
+    out, i = [], 0
+    while (i := s.find('"', i)) >= 0:
+        start, i, parts = i, i + 1, []
+        while True:
+            q, b = s.find('"', i), s.find("\\", i)
+            if q < 0:
+                return None
+            if b < 0 or q < b:
+                parts.append(s[i:q])
+                i = q + 1
+                break
+            parts.append(s[i:b])
+            c = s[b + 1:b + 2]
+            if c == "u" and len(s[b + 2:b + 6]) == 4 and _HEX.issuperset(s[b + 2:b + 6]):
+                parts.append(chr(int(s[b + 2:b + 6], 16)))
+                i = b + 6
+            elif c in _ESCAPES:
+                parts.append(_ESCAPES[c])
+                i = b + 2
+            else:
+                return None
+        out.append((start, i, "".join(parts)))
+    return out
+
+
+def _suffix(path: str) -> str:
+    """reader.ext_of(path) without pathlib: the last part's suffix as PurePath gives it, lower case, no dot."""
+    name = os.path.basename(os.path.normpath(path)) if path else ""
+    i = name.rfind(".")
+    return name[i + 1:].lower() if 0 < i < len(name) - 1 else ""
+
+
+def _not_a_document(raw: bytes) -> bool:
+    """True when no "file_path" value of the hook event names an extension the reader takes: the Read goes ahead
+    without the gate. Any doubt is False, and the gate decides."""
+    s = raw.decode("utf-8", "replace")
+    strings = _strings(s)
+    if strings is None:
+        return False
+    exts = {}
+    with open(os.path.join(_HERE, "reader", "exts.py"), encoding="utf-8") as f:
+        exec(f.read(), exts)
+    for n, (_, end, text) in enumerate(strings):
+        j = end
+        while j < len(s) and s[j] in _SPACE:
+            j += 1
+        if text != "file_path" or s[j:j + 1] != ":":
+            continue
+        j += 1
+        while j < len(s) and s[j] in _SPACE:
+            j += 1
+        if n + 1 < len(strings) and strings[n + 1][0] == j and _suffix(strings[n + 1][2]) in exts["FORMATS"]:
+            return False
+    return True
+
+
+_HOOK_INPUT = None
+if __name__ == "__main__" and sys.argv[1:] == ["hook"]:
+    _HOOK_INPUT = sys.stdin.buffer.read()
+    if _not_a_document(_HOOK_INPUT):
+        sys.exit(0)
+
 import argparse
 import contextlib
 import json
@@ -201,7 +271,8 @@ def cmd_prune(a) -> int:
 def cmd_hook(a) -> int:
     from reader import gate
     try:
-        event = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
+        raw = sys.stdin.buffer.read() if _HOOK_INPUT is None else _HOOK_INPUT
+        event = json.loads(raw.decode("utf-8", "replace"))
     except (ValueError, RecursionError):
         return 0
     try:

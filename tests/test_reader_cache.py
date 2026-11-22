@@ -25,6 +25,7 @@ from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc, Para, Text  # noqa: E402
 
 os.environ["PHRO_READER_OCR"] = "none"  # decision 8: OCR off, keys as before, except in the OCR id tests
+os.environ.setdefault("PHRO_READER_CACHE", tempfile.mkdtemp())  # keys and digests leave memos in the cache root
 
 READ = HERE / "scripts" / "read.py"
 STUB = "reader.formats._teststub"
@@ -817,6 +818,74 @@ def test_cut_ocr_page_without_text_is_late():
     assert out.name == k and meta["partial"] is True and limits.OCR_LATE in meta["warnings"], (out.name, meta)
     assert meta["ocr"]["stopped_at"] == 1 and meta["ocr"]["failed"] == 0, meta["ocr"]
     assert "(OCR stopped at page 1 for the time; later scanned pages are shown as images)" in text, text
+
+
+def _memos(base, name):
+    d = base / name
+    return sorted(f for f in d.rglob("*") if f.is_file()) if d.is_dir() else []
+
+
+def test_code_digest_memo():
+    """The code digest is kept in the cache root under the sources' (path, size, mtime) list: the same list takes
+    the kept digest without reading a source; a source rewritten at the same size with a new mtime is read again."""
+    old = os.environ.get("PHRO_READER_CACHE")
+    root = tmp()
+    os.environ["PHRO_READER_CACHE"] = str(root)
+    try:
+        src = tmp()
+        (src / "a.py").write_text("x = 1\n")
+        (src / "sub").mkdir()
+        (src / "sub" / "b.json").write_text("{}")
+        d0 = cache.code_digest(src)
+        memos = _memos(root, "code")
+        assert len(memos) == 1 and memos[0].read_text(encoding="ascii") == d0, memos
+        memos[0].write_text("f" * 40, encoding="ascii")
+        assert cache.code_digest(src) == "f" * 40
+        f = src / "a.py"
+        st = f.stat()
+        f.write_text("x = 2\n")
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+        d1 = cache.code_digest(src)
+        assert d1 not in (d0, "f" * 40), d1
+        f.write_text("x = 1\n")
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 2 * 10 ** 9))
+        assert cache.code_digest(src) == d0
+        (src / "c.py").write_text("")
+        assert cache.code_digest(src) not in (d0, d1)
+    finally:
+        if old is None:
+            os.environ.pop("PHRO_READER_CACHE", None)
+        else:
+            os.environ["PHRO_READER_CACHE"] = old
+
+
+def test_key_memo_by_stat():
+    """A document whose (path, size, mtime) has a remembered key takes it without hashing the bytes; the key itself
+    stays the content hash, so new bytes at the same size with a new mtime give a new key. prune clears old memos."""
+    with stub():
+        p = sample("one")
+        k1 = cache.key(p)
+        root = cache.root()
+        assert len(_memos(root, "keys")) == 1
+        st = os.stat(p)
+        p.write_text("two")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert cache.key(p) == k1
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+        k2 = cache.key(p)
+        q = tmp() / "b.txtx"
+        q.write_text("two")
+        assert k2 != k1 and k2 == cache.key(q), (k1, k2)
+        assert cache.key(p, "native") != k2
+        p.write_text("one")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 2 * 10 ** 9))
+        assert cache.key(p) == k1
+        memos = _memos(root, "keys") + _memos(root, "code")
+        assert len(memos) >= 5, memos
+        for f in memos[:2]:
+            os.utime(f, (time.time() - 40 * 86400,) * 2)
+        assert cache.prune(30) >= 2
+        assert all(f.exists() == (i >= 2) for i, f in enumerate(memos)), memos
 
 
 def main():
