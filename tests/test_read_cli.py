@@ -210,7 +210,8 @@ def test_tiff_pages_become_text():
         text, meta = convert(path)
     page = f"{SCANNED}\n\nAlpha beta gamma delta epsilon"
     assert text == f"(2 scanned pages read by OCR)\n\n{page}\n\n{page}\n", text
-    assert meta["ocr"] == {"pages": 2, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 0}, meta
+    assert meta["ocr"] == {"pages": 2, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 0,
+                           "pictures_doubtful": 0, "pictures_blank": 0}, meta
     doubtful = words("Alpha beta gamma")
     doubtful["unread"] = {"share": 0.5, "box": None, "area": 0.0}
     with stub_engine(answer=doubtful):
@@ -239,7 +240,8 @@ def test_tiff_late_pages_are_images():
         text, meta = convert(tiff_file(pages(2)))
     assert text.startswith("(OCR stopped at page 1; read the file again to continue)\n\n"), text
     assert SCANNED not in text and "page 1" in text and "page 2" in text, text  # the pages as today, past the time
-    assert meta["ocr"] == {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": 1, "pictures_left": 0}, meta
+    assert meta["ocr"] == {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": 1, "pictures_left": 0,
+                           "pictures_doubtful": 0, "pictures_blank": 0}, meta
     assert limits.OCR_LATE in meta["warnings"], meta
 
 
@@ -257,7 +259,8 @@ def test_tiff_page_without_pixels_counts_as_failed():
     finally:
         raster.gray = real
     assert text.startswith("(1 scanned page read by OCR)\n\n(OCR failed on 1 page; shown as an image.)\n\n"), text
-    assert meta["ocr"] == {"pages": 1, "doubtful": 0, "failed": 1, "stopped_at": None, "pictures_left": 0}, meta
+    assert meta["ocr"] == {"pages": 1, "doubtful": 0, "failed": 1, "stopped_at": None, "pictures_left": 0,
+                           "pictures_doubtful": 0, "pictures_blank": 0}, meta
 
 
 def test_tiff_discarded_layout_leaves_no_skips():
@@ -326,7 +329,8 @@ def test_meta_json_has_ocr_counts():
     with stub_engine(answer=words("Hello world", "second line")):
         meta = reader.convert(docx(png(80, 80)), out)
     on_disk = json.loads((out / "meta.json").read_text(encoding="utf-8"))
-    counts = {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 0}
+    counts = {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 0,
+              "pictures_doubtful": 0, "pictures_blank": 0}
     assert meta["ocr"] == on_disk["ocr"] == counts, on_disk
     text = (out / "out.md").read_text(encoding="utf-8")
     assert text == "Before\n\n![](assets/img-001.png)\n\nPicture text: Hello world / second line\n\nAfter\n", text

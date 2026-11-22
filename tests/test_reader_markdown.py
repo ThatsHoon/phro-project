@@ -884,10 +884,32 @@ def test_picture_text_cut_at_figure_chars():
 def test_photo_gets_no_picture_text():
     with stub(answer=seen("▒▓░ ◆◇◆ ▒▒")) as (_, sent):
         out = R(Doc(blocks=[Image(pic())]))
-    assert out == "![](assets/img-001.png)\n" and len(sent) == 1, (out, sent)
+    assert out == "(OCR text of 1 picture left out as doubtful)\n\n![](assets/img-001.png)\n", out
+    assert len(sent) == 1, sent
     with stub() as (_, sent):  # one word only: under OCR_MIN_WORDS
         out = R(Doc(blocks=[Image(pic())]))
     assert out == "![](assets/img-001.png)\n" and len(sent) == 1, (out, sent)
+
+
+def test_doubtful_and_blank_pictures_counted_and_said():
+    def conf(answer, c):
+        for w in answer["page"]["words"]:
+            w["conf"] = c
+        return answer
+
+    flat = images.gray_png(Gray(80, 80, bytes([250]) * 6400))
+    info = {}
+    with stub(answer=conf(seen("Total 120", "Net 80"), 40.0)) as (_, sent), tempfile.TemporaryDirectory() as d:
+        out = markdown.render(Doc(blocks=[Image(pic()), Image(pic(shade=240)), Image(pic()), Image(flat)]), Path(d),
+                              info=info)
+    assert out == ("(OCR text of 2 pictures left out as doubtful)\n\n(1 blank picture not sent to OCR)\n\n"
+                   "![](assets/img-001.png)\n\n![](assets/img-002.png)\n\n![](assets/img-001.png)\n\n"
+                   "![](assets/img-003.png)\n"), out
+    assert (info["ocr"]["pictures_doubtful"], info["ocr"]["pictures_blank"]) == (2, 1), info
+    assert len(sent) == 3, sent
+    with stub(answer=conf(seen("Total 120", "Net 80"), 95.0)), tempfile.TemporaryDirectory() as d:
+        out = markdown.render(Doc(blocks=[Image(pic())]), Path(d), info=info)
+    assert out == f"![](assets/img-001.png)\n\n{TEXT}\n" and info["ocr"]["pictures_doubtful"] == 0, out
 
 
 def test_status_lines_singular_and_plural():
@@ -901,7 +923,8 @@ def test_status_lines_singular_and_plural():
     one = {"pages": 1, "doubtful": 0, "failed": 1, "stopped_at": None}
     out, info = lines(one)
     assert out == "(1 scanned page read by OCR)\n\n(OCR failed on 1 page; shown as an image.)\n\nbody\n", out
-    assert info["ocr"] == dict(one, pictures_left=0) and info["ocr_hint"] is False, info
+    assert info["ocr"] == dict(one, pictures_left=0, pictures_doubtful=0, pictures_blank=0), info
+    assert info["ocr_hint"] is False, info
     out, _ = lines({"pages": 3, "doubtful": 1, "failed": 2, "stopped_at": None}, skipped={"page": 1})
     assert out == ("(could not read: 1 page)\n\n"
                    "(3 scanned pages read by OCR; 1 of them doubtful, shown with the page image)\n\n"

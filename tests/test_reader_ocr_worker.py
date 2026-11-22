@@ -58,6 +58,11 @@ def gray(w: int, h: int = 4, v: int = 255) -> Gray:
     return Gray(w, h, bytes([v]) * (w * h))
 
 
+def inked(w: int, h: int = 4) -> Gray:
+    """A white bitmap with one black pixel: a picture the session sends (one of a single value is `ocr.blank`)."""
+    return Gray(w, h, bytes(1) + bytes([255]) * (w * h - 1))
+
+
 def words(r) -> list[str]:
     return [w.text for w in r.page.words]
 
@@ -174,14 +179,14 @@ def test_results_out_of_order_matched_by_id():
     with stub(delays=[4.0, 0.0, 2.0]):
         s = ocr.Session(time.monotonic() + 60, BACKEND, cmd=STUB)
         try:
-            ts = [s.submit(gray(w), "picture", 150.0) for w in (11, 12, 13)]
+            ts = [s.submit(inked(w), "picture", 150.0) for w in (11, 12, 13)]
             assert len({t.id for t in ts}) == 3 and all(t.kind == "picture" and t.dpi == 150.0 for t in ts)
             t0 = time.monotonic()
             r = s.wait(ts[1])
             assert r.status == "done" and words(r) == ["w12"]
             assert time.monotonic() - t0 < 1.9, "the quick answer waited for the slow one"
             assert words(s.wait(ts[2])) == ["w13"] and words(s.wait(ts[0])) == ["w11"]
-            assert all(s.wait(t).verdict is None for t in ts)  # pictures are not judged
+            assert all(s.wait(t).verdict.kind == "trusted" for t in ts)  # a picture is judged by its text alone
             assert not s.late and not s.hint
             try:  # a ticket of another session is refused, and costs this one nothing
                 s.wait(ocr.Ticket(999, "page", "0" * 40, 200.0))
@@ -287,7 +292,7 @@ def test_cache_hit_skips_worker():
         with stub(answer={"hint": True}):
             s = ocr.Session(time.monotonic() + 60, BACKEND, cmd=STUB, store=store)
             try:
-                t = s.submit(gray(11), "page", 200.0)
+                t = s.submit(inked(11), "page", 200.0)
                 assert s.wait(t).status == "done" and s.hint
             finally:
                 s.close()
@@ -295,7 +300,7 @@ def test_cache_hit_skips_worker():
         nowhere = [str(d / "no-such-worker.exe")]
         s2 = ocr.Session(time.monotonic() + 60, BACKEND, cmd=nowhere, store=store)
         try:
-            t2 = s2.submit(gray(11), "page", 200.0)
+            t2 = s2.submit(inked(11), "page", 200.0)
             assert t2.key == t.key
             r = s2.wait(t2)
             assert r.status == "done" and words(r) == ["w11"] and r.verdict.kind == "trusted"
@@ -304,10 +309,10 @@ def test_cache_hit_skips_worker():
             old = limits.OCR_UNREAD_NOCONF  # the verdict is judged again on load, with the threshold of the day
             limits.OCR_UNREAD_NOCONF = -1.0
             try:
-                assert s2.wait(s2.submit(gray(11), "page", 200.0)).verdict.kind == "doubtful"
+                assert s2.wait(s2.submit(inked(11), "page", 200.0)).verdict.kind == "doubtful"
             finally:
                 limits.OCR_UNREAD_NOCONF = old
-            miss = s2.submit(gray(11), "picture", 200.0)  # the same pixels read as a picture are another entry
+            miss = s2.submit(inked(11), "picture", 200.0)  # the same pixels read as a picture are another entry
             assert miss.key != t.key and s2.wait(miss).status == "failed"  # the worker cannot start
         finally:
             s2.close()
@@ -766,7 +771,7 @@ def test_no_deadline():
             finally:
                 s.close()
     with ocr.opened(None, BACKEND, cmd=STUB) as s:
-        assert s.wait(s.submit(gray(11), "picture", 200.0)).status == "done"
+        assert s.wait(s.submit(inked(11), "picture", 200.0)).status == "done"
 
 
 def test_code_hashed_on_first_key_only():

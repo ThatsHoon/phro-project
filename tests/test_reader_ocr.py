@@ -6,7 +6,8 @@ Run: python -I -X utf8 tests/test_reader_ocr.py
 import json
 import math
 import sys
-from dataclasses import asdict
+import time
+from dataclasses import asdict, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -60,10 +61,16 @@ def text(p: OcrPage) -> str:
     return " ".join(w.text for w in p.words)
 
 
+def rp(g, eng, deadline, kind, dpi=limits.OCR_DPI):
+    """read_page's (page, hint); (None, False) when no engine gave a page."""
+    got = ocr.read_page(g, eng, deadline, kind, dpi)
+    return (None, False) if got is None else (got.page, got.hint)
+
+
 def test_latin_page_goes_to_tess_eng():
     win = Win(lambda g: page(ENGLISH))
     tess = Tess({"eng", "kor"}, lambda g, langs: page(ENGLISH, "tess-" + langs, conf=96))
-    got, hint = ocr.read_page(G, ocr.Engines(win, tess, True), FAR, "page")
+    got, hint = rp(G, ocr.Engines(win, tess, True), FAR, "page")
     assert got.engine == "tess-eng", got.engine
     assert tess.calls == [("eng", limits.TESS_PSM_LATIN)], tess.calls
     assert len(win.calls) == 1 and hint is False
@@ -71,10 +78,10 @@ def test_latin_page_goes_to_tess_eng():
 
 def test_latin_page_without_tess_keeps_windows():
     win = Win(lambda g: page(ENGLISH))
-    got, hint = ocr.read_page(G, ocr.Engines(win, None, True), FAR, "page")
+    got, hint = rp(G, ocr.Engines(win, None, True), FAR, "page")
     assert got.engine == "win-ko" and text(got) == " ".join(ENGLISH)
     tess = Tess({"kor"})  # Tesseract without eng keeps Windows too
-    got, hint = ocr.read_page(G, ocr.Engines(win, tess, True), FAR, "page")
+    got, hint = rp(G, ocr.Engines(win, tess, True), FAR, "page")
     assert got.engine == "win-ko" and tess.calls == [] and hint is False
 
 
@@ -83,7 +90,7 @@ def test_mixed_korean_english_stays_windows():
     assert abs(ocr.latin_share(p) - 0.3) < 1e-9 and ocr.latin_share(p) < limits.OCR_LATIN
     win = Win(lambda g: p)
     tess = Tess({"eng", "kor"})
-    got, hint = ocr.read_page(G, ocr.Engines(win, tess, True), FAR, "page")
+    got, hint = rp(G, ocr.Engines(win, tess, True), FAR, "page")
     assert got.engine == "win-ko" and text(got) == "가나다라마바사 abc"
     assert tess.calls == [] and hint is False
 
@@ -91,7 +98,7 @@ def test_mixed_korean_english_stays_windows():
 def test_junk_on_non_korean_engine_goes_to_tess_kor():
     win = Win(lambda g: page(JUNK, "win-en-us"), engine="win-en-us")
     tess = Tess({"eng", "kor"})
-    got, hint = ocr.read_page(G, ocr.Engines(win, tess, False), FAR, "page")
+    got, hint = rp(G, ocr.Engines(win, tess, False), FAR, "page")
     assert got.engine == "tess-kor+eng" and text(got) == " ".join(CLEAN_KO)
     assert tess.calls == [("kor+eng", limits.TESS_PSM_KOR)], tess.calls
     assert len(win.calls) == 1 and hint is False  # the re-read is clean: no rotation
@@ -100,12 +107,12 @@ def test_junk_on_non_korean_engine_goes_to_tess_kor():
 def test_junk_without_tess_kor_sets_hint():
     win = Win(lambda g: page(JUNK, "win-en-us"), engine="win-en-us")
     for tess in (None, Tess({"eng"})):
-        got, hint = ocr.read_page(G, ocr.Engines(win, tess, False), FAR, "picture")
+        got, hint = rp(G, ocr.Engines(win, tess, False), FAR, "picture")
         assert got.engine == "win-en-us" and hint is True
         assert tess is None or tess.calls == []
     # a Korean Windows engine that gives junk is not a missing-language case
     win = Win(lambda g: page(JUNK))
-    got, hint = ocr.read_page(G, ocr.Engines(win, None, True), FAR, "picture")
+    got, hint = rp(G, ocr.Engines(win, None, True), FAR, "picture")
     assert got.engine == "win-ko" and hint is False
 
 
@@ -115,26 +122,26 @@ def test_no_windows_uses_tess_present_langs():
              ({"kor"}, ("kor", limits.TESS_PSM_KOR))]
     for langs, call in cases:
         tess = Tess(langs)
-        got, hint = ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page")
+        got, hint = rp(G, ocr.Engines(None, tess, False), FAR, "page")
         assert tess.calls == [call], (langs, tess.calls)
         assert got.engine == "tess-" + call[0] and hint is False
     tess = Tess({"osd"})  # neither kor nor eng
-    assert ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page") == (None, False)
+    assert rp(G, ocr.Engines(None, tess, False), FAR, "page") == (None, False)
     assert tess.calls == []
-    assert ocr.read_page(G, ocr.Engines(None, None, False), FAR, "page") == (None, False)
+    assert rp(G, ocr.Engines(None, None, False), FAR, "page") == (None, False)
 
 
 def test_no_page_from_windows_falls_back_to_tess():
     for langs, call in (({"kor", "eng"}, ("kor+eng", limits.TESS_PSM_KOR)), ({"eng"}, ("eng", limits.TESS_PSM_LATIN))):
         win = Win(lambda g: None, engine="win-en-us")
         tess = Tess(langs)
-        got, hint = ocr.read_page(G, ocr.Engines(win, tess, False), FAR, "page")
+        got, hint = rp(G, ocr.Engines(win, tess, False), FAR, "page")
         assert got is not None and got.engine == "tess-" + call[0] and text(got) == " ".join(CLEAN_KO)
         assert tess.calls == [call], tess.calls
         assert len(win.calls) == 1 and hint is False
     win = Win(lambda g: None)
-    assert ocr.read_page(G, ocr.Engines(win, None, True), FAR, "page") == (None, False)  # no Tesseract
-    assert ocr.read_page(G, ocr.Engines(win, Tess({"osd"}), True), FAR, "page") == (None, False)
+    assert rp(G, ocr.Engines(win, None, True), FAR, "page") == (None, False)  # no Tesseract
+    assert rp(G, ocr.Engines(win, Tess({"osd"}), True), FAR, "page") == (None, False)
 
 
 def test_windows_fallback_stops_at_deadline():
@@ -148,7 +155,7 @@ def test_windows_fallback_stops_at_deadline():
     saved = ocr._now
     ocr._now = lambda: clock[0]
     try:
-        got = ocr.read_page(G, ocr.Engines(Win(late), tess, True), 110.0, "page")
+        got = rp(G, ocr.Engines(Win(late), tess, True), 110.0, "page")
     finally:
         ocr._now = saved
     assert got == (None, False) and tess.calls == []
@@ -158,7 +165,7 @@ def test_engine_error_propagates():
     def boom(g):
         raise OSError("engine fault")
     try:
-        ocr.read_page(G, ocr.Engines(Win(boom), None, True), FAR, "page")
+        rp(G, ocr.Engines(Win(boom), None, True), FAR, "page")
     except OSError as e:
         assert "engine fault" in str(e)
     else:
@@ -168,54 +175,62 @@ def test_engine_error_propagates():
 def test_upside_down_page_takes_180():
     flipped = rotate(G, 180).data
     win = Win(lambda g: page(CLEAN_KO) if g.data == flipped else page(JUNK))
-    got, hint = ocr.read_page(G, ocr.Engines(win, None, True), FAR, "page")
+    got, hint = rp(G, ocr.Engines(win, None, True), FAR, "page")
     assert got.turn == 180 and text(got) == " ".join(CLEAN_KO), (got.turn, text(got))
     assert [c.data for c in win.calls] == [rotate(G, t).data for t in (0, 180)]  # a clean turn ends the search
     assert hint is False
 
 
 def by_turn(out: dict) -> Win:
-    """A stand-in Windows engine giving `out[turn]` (a list of word texts) for the bitmap turned by `turn`."""
+    """A stand-in Windows engine giving `out[turn]` (a list of word texts) for the bitmap turned by `turn`, and JUNK
+    for any other bitmap (a turn read again at another scale)."""
     turned = {rotate(G, t).data: t for t in (0, 90, 180, 270)}
-    return Win(lambda g: page(out[turned[g.data]]))
+    return Win(lambda g: page(out.get(turned.get(g.data), JUNK)))
 
 
 def test_rotation_empty_turn_does_not_stop():
     win = by_turn({0: JUNK, 180: [], 90: JUNK, 270: CLEAN_KO})  # a sideways page: nothing at 180
-    got, _ = ocr.read_page(G, ocr.Engines(win, None, True), FAR, "page")
+    got, _ = rp(G, ocr.Engines(win, None, True), FAR, "page")
     assert got.turn == 270 and text(got) == " ".join(CLEAN_KO), got.turn
     assert [c.data for c in win.calls] == [rotate(G, t).data for t in (0, 180, 90, 270)]
 
 
 def test_rotation_stops_at_clean_90():
     win = by_turn({0: JUNK, 180: JUNK, 90: CLEAN_KO, 270: CLEAN_KO * 3})
-    got, _ = ocr.read_page(G, ocr.Engines(win, None, True), FAR, "page")
+    got, _ = rp(G, ocr.Engines(win, None, True), FAR, "page")
     assert got.turn == 90 and text(got) == " ".join(CLEAN_KO), got.turn
     assert [c.data for c in win.calls] == [rotate(G, t).data for t in (0, 180, 90)]
 
 
 def test_rotation_keeps_most_good_text():
-    turned = {rotate(G, t).data: t for t in (0, 90, 180, 270)}
-    out = {0: JUNK, 90: ["ㄱ가나다라마바사아자", "ㅋ"], 180: JUNK, 270: ["가나"]}  # 90: 10 good, some junk
-    win = Win(lambda g: page(out[turned[g.data]]))
-    got, _ = ocr.read_page(G, ocr.Engines(win, None, True), FAR, "page")
+    out = {0: JUNK, 90: ["ㄱ가나다라마바사아자", "ㅋ"], 180: JUNK, 270: ["ㄱ가나", "ㅋ"]}  # all doubtful
+    got, _ = rp(G, ocr.Engines(by_turn(out), None, True), FAR, "page")
     assert got.turn == 90 and text(got) == "ㄱ가나다라마바사아자 ㅋ", got.turn
+
+
+def test_rotation_ranks_by_doubt_before_score():
+    out = {0: JUNK, 180: ["가나다라마바사아자차카타파하" * 3, "ㅋㅋ"], 90: CLEAN_KO, 270: CLEAN_KO}
+    assert ocr._score(page(out[180])) > ocr._score(page(CLEAN_KO))
+    win = by_turn(out)
+    got, _ = rp(G, ocr.Engines(win, None, True), FAR, "page")
+    assert got.turn == 90 and text(got) == " ".join(CLEAN_KO), (got.turn, text(got))
+    assert [c.data for c in win.calls] == [rotate(G, t).data for t in (0, 180, 90)]
 
 
 def test_rotation_hint_follows_chosen_pass():
     flipped = rotate(G, 180).data
     win = Win(lambda g: page(CLEAN_KO, "win-en-us") if g.data == flipped else page(JUNK, "win-en-us"),
               engine="win-en-us")
-    got, hint = ocr.read_page(G, ocr.Engines(win, None, False), FAR, "page")
+    got, hint = rp(G, ocr.Engines(win, None, False), FAR, "page")
     assert got.turn == 180 and hint is False  # the junk was the turn, not a missing language
     win = Win(lambda g: page(JUNK, "win-en-us"), engine="win-en-us")
-    got, hint = ocr.read_page(G, ocr.Engines(win, None, False), FAR, "page")
-    assert got.turn == 0 and hint is True and len(win.calls) == 4
+    got, hint = rp(G, ocr.Engines(win, None, False), FAR, "page")
+    assert got.turn == 0 and hint is True and len(win.calls) == 5  # four turns, then turn 0 at twice the scale
 
 
 def test_picture_read_once():
     win = Win(lambda g: page(JUNK))
-    got, _ = ocr.read_page(G, ocr.Engines(win, None, True), FAR, "picture")
+    got, _ = rp(G, ocr.Engines(win, None, True), FAR, "picture")
     assert got.turn == 0 and len(win.calls) == 1 and win.calls[0].data == G.data
 
 
@@ -232,7 +247,7 @@ def test_rotation_stops_at_deadline():
     saved = ocr._now
     ocr._now = lambda: clock[0]
     try:
-        got, hint = ocr.read_page(G, ocr.Engines(win, tess, False), deadline, "page")
+        got, hint = rp(G, ocr.Engines(win, tess, False), deadline, "page")
     finally:
         ocr._now = saved
     assert got.turn == 0 and text(got) == " ".join(JUNK)
@@ -384,20 +399,20 @@ def test_skew_doubt_only_for_psm_kor_reads():
 def test_no_windows_latin_page_read_again_by_eng():
     """I7: without Windows OCR, a kor+eng page of Latin letters is read again by eng at TESS_PSM_LATIN."""
     tess = Tess({"kor", "eng"}, lambda g, langs: page(ENGLISH, "tess-" + langs, conf=96))
-    got, hint = ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page")
+    got, hint = rp(G, ocr.Engines(None, tess, False), FAR, "page")
     assert tess.calls == [("kor+eng", limits.TESS_PSM_KOR), ("eng", limits.TESS_PSM_LATIN)], tess.calls
     assert got.engine == "tess-eng" and hint is False
     tess = Tess({"kor", "eng"}, lambda g, langs: page(ENGLISH if langs == "kor+eng" else [], "tess-" + langs))
-    got, _ = ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page")
+    got, _ = rp(G, ocr.Engines(None, tess, False), FAR, "page")
     assert got.engine == "tess-kor+eng", got.engine  # a re-read with no words keeps the first
     tess = Tess({"kor", "eng"})  # Korean: no re-read
-    ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page")
+    rp(G, ocr.Engines(None, tess, False), FAR, "page")
     assert tess.calls == [("kor+eng", limits.TESS_PSM_KOR)], tess.calls
     tess = Tess({"eng"}, lambda g, langs: page(ENGLISH, "tess-" + langs, conf=96))  # eng alone read it already
-    ocr.read_page(G, ocr.Engines(None, tess, False), FAR, "page")
+    rp(G, ocr.Engines(None, tess, False), FAR, "page")
     assert tess.calls == [("eng", limits.TESS_PSM_LATIN)], tess.calls
     tess = Tess({"kor", "eng"}, lambda g, langs: page(ENGLISH, "tess-" + langs, conf=96))
-    got, _ = ocr.read_page(G, ocr.Engines(Win(lambda g: None), tess, True), FAR, "page")  # Windows gave no page
+    got, _ = rp(G, ocr.Engines(Win(lambda g: None), tess, True), FAR, "page")  # Windows gave no page
     assert got.engine == "tess-eng" and tess.calls[-1] == ("eng", limits.TESS_PSM_LATIN), tess.calls
 
 
@@ -417,7 +432,6 @@ def test_picture_lines_need_two_words():
     assert ocr.picture_lines(one) == []
     two = page(["hello", "world", "next", "line"], lines=[0, 0, 1, 1])
     assert ocr.picture_lines(two) == ocr_layout.reading_lines(two) == ["hello world", "next line"], ocr.picture_lines(two)
-    assert ocr.picture_lines(page(["hello"] + JUNK)) == []
     saved = limits.OCR_MIN_WORDS
     limits.OCR_MIN_WORDS = 5
     try:
@@ -458,12 +472,12 @@ def test_empty_reread_keeps_windows_page():
     empty = lambda g, langs: OcrPage(200, 100, [], 0.0, 0, "tess-" + langs, "v1")  # noqa: E731
     win = Win(lambda g: page(ENGLISH))
     tess = Tess({"eng", "kor"}, empty)
-    got, hint = ocr.read_page(G, ocr.Engines(win, tess, True), FAR, "page")
+    got, hint = rp(G, ocr.Engines(win, tess, True), FAR, "page")
     assert got.engine == "win-ko" and text(got) == " ".join(ENGLISH) and hint is False
     assert tess.calls == [("eng", limits.TESS_PSM_LATIN)]
     win = Win(lambda g: page(JUNK, "win-en-us"), engine="win-en-us")
     tess = Tess({"eng", "kor"}, empty)
-    got, hint = ocr.read_page(G, ocr.Engines(win, tess, False), FAR, "picture")
+    got, hint = rp(G, ocr.Engines(win, tess, False), FAR, "picture")
     assert got.engine == "win-en-us" and text(got) == " ".join(JUNK) and hint is False
     assert tess.calls == [("kor+eng", limits.TESS_PSM_KOR)]
 
@@ -471,12 +485,12 @@ def test_empty_reread_keeps_windows_page():
 def test_none_reread_keeps_windows_page():
     win = Win(lambda g: page(ENGLISH))
     tess = Tess({"eng", "kor"}, lambda g, langs: None)
-    got, hint = ocr.read_page(G, ocr.Engines(win, tess, True), FAR, "page")
+    got, hint = rp(G, ocr.Engines(win, tess, True), FAR, "page")
     assert got.engine == "win-ko" and text(got) == " ".join(ENGLISH) and hint is False
     assert tess.calls == [("eng", limits.TESS_PSM_LATIN)]
     win = Win(lambda g: page(JUNK, "win-en-us"), engine="win-en-us")
     tess = Tess({"eng", "kor"}, lambda g, langs: None)
-    got, hint = ocr.read_page(G, ocr.Engines(win, tess, False), FAR, "picture")
+    got, hint = rp(G, ocr.Engines(win, tess, False), FAR, "picture")
     assert got.engine == "win-en-us" and text(got) == " ".join(JUNK) and hint is False
     assert tess.calls == [("kor+eng", limits.TESS_PSM_KOR)]
 
@@ -498,6 +512,140 @@ def test_judge_at_threshold():
     p = page(CLEAN_KO * 5, "tess-kor+eng", conf=float(limits.OCR_CONF))
     assert sum(w.conf for w in p.words) / len(p.words) == limits.OCR_CONF  # exactly at it: not under
     assert ocr.judge(p, clean).kind == "trusted"
+
+WHITE = Gray(200, 100, bytes([255]) * 20_000)  # the frame of `page`, no ink: a page read with no doubt
+NOISY = Gray(200, 100, bytes(0 if i % 7 == 1 else 255 for i in range(20_000)))  # ink everywhere, turns differ
+
+
+def answer(p: OcrPage) -> dict:
+    return {"page": asdict(p), "rules": [], "unread": None, "hint": False}
+
+
+def test_picture_verdict_by_text_signals():
+    def kind(p):
+        return ocr._result_of(answer(p), "picture").verdict.kind
+    assert kind(page(CLEAN_KO, "tess-kor+eng", conf=95.0)) == "trusted"
+    assert kind(page(ENGLISH)) == "trusted"  # Windows: no confidence, no junk
+    assert kind(page(CLEAN_KO, "tess-kor+eng", conf=50.0)) == "doubtful"
+    low = page(CLEAN_KO * 10, "tess-kor+eng", conf=95.0)
+    low.words[0].conf = low.words[1].conf = 10.0
+    assert kind(low) == "doubtful"  # 2 of 20 words low: over OCR_LOW, mean still over OCR_CONF
+    assert kind(page(["가나"] + JUNK)) == "doubtful"
+    sloped = page(["가나", "다라", "마바"], "tess-kor+eng", conf=95.0)
+    for i, w in enumerate(sloped.words):
+        w.y += 20 * i
+    assert kind(replace(sloped, psm=limits.TESS_PSM_KOR)) == "doubtful"
+    assert kind(sloped) == "trusted"
+
+
+def test_picture_lines_leave_doubt_to_the_verdict():
+    assert ocr.picture_lines(page(["hello"] + JUNK)) == ["hello " + " ".join(JUNK)]
+
+
+def test_blank_picture_not_sent():
+    assert ocr.blank(Gray(80, 80, bytes([200]) * 6400))
+    assert ocr.blank(Gray(80, 80, bytes(200 + i % (limits.OCR_FLAT + 1) for i in range(6400))))
+    one = bytearray([200]) * 6400
+    one[1] = 0  # off the sparse sample: the whole bitmap is looked at
+    assert not ocr.blank(Gray(80, 80, bytes(one)))
+    assert not ocr.blank(Gray(80, 80, bytes(200 + i % (limits.OCR_FLAT + 2) for i in range(6400))))
+    s = ocr.Session(time.monotonic() + 60, ("win-ko", "test"), cmd=[sys.executable, "-c", "raise SystemExit(3)"])
+    try:
+        t = s.submit(Gray(80, 80, bytes([200]) * 6400), "picture", 96.0)
+        assert s.wait(t).status == "blank" and s._state == "idle", (s.wait(t), s._state)
+        t = s.submit(Gray(80, 80, bytes(one)), "picture", 96.0)
+        assert s.wait(t).status != "blank"
+        t = s.submit(Gray(80, 80, bytes([200]) * 6400), "page", 96.0)
+        assert s.wait(t).status != "blank"  # a blank page is still read: the page verdict calls it blank
+    finally:
+        s.close()
+
+
+def test_latin_windows_read_without_doubt_not_read_again():
+    win = Win(lambda g: page(ENGLISH, "win-en-us"), engine="win-en-us")
+    tess = Tess({"eng", "kor"}, lambda g, langs: page(ENGLISH, "tess-" + langs, conf=96))
+    got, _ = rp(WHITE, ocr.Engines(win, tess, False), FAR, "page")
+    assert got.engine == "win-en-us" and tess.calls == [], (got.engine, tess.calls)
+    got, _ = rp(WHITE, ocr.Engines(win, tess, False), FAR, "picture")
+    assert got.engine == "win-en-us" and tess.calls == [], (got.engine, tess.calls)
+    got, _ = rp(NOISY, ocr.Engines(win, tess, False), FAR, "page")  # doubtful by its unread ink
+    assert got.engine == "tess-eng" and tess.calls == [("eng", limits.TESS_PSM_LATIN)], tess.calls
+    tess.calls.clear()
+    got, _ = rp(WHITE, ocr.Engines(win, tess, True), FAR, "page")  # a Korean engine misreads Latin letters
+    assert got.engine == "tess-eng" and tess.calls == [("eng", limits.TESS_PSM_LATIN)], tess.calls
+
+
+def test_reading_carries_the_page_measures():
+    win = Win(lambda g: page(CLEAN_KO))
+    got = ocr.read_page(NOISY, ocr.Engines(win, None, True), FAR, "page", 200.0)
+    assert got.unread is not None and got.unread.share > limits.OCR_UNREAD, got.unread
+    assert ocr.judge(got.page, got.unread).kind == "doubtful"
+    got = ocr.read_page(NOISY, ocr.Engines(win, None, True), FAR, "picture", 200.0)
+    assert got.unread is None and got.rules == []
+
+
+def test_junk_page_read_again_at_another_scale():
+    win = Win(lambda g: page(CLEAN_KO if g.w == 2 * G.w else JUNK))
+    tess = Tess({"kor", "eng"}, lambda g, langs: page(CLEAN_KO, "tess-" + langs, conf=50.0))
+    got, _ = rp(G, ocr.Engines(win, tess, True), FAR, "page")
+    assert text(got) == " ".join(CLEAN_KO) and got.turn == 0 and got.engine == "win-ko", (text(got), got.engine)
+    assert [(c.w, c.h) for c in win.calls] == [(4, 2), (4, 2), (2, 4), (2, 4), (8, 4)], win.calls
+    assert win.calls[-1].data == bytes(b for row in (G.data[:4], G.data[4:]) for b in
+                                       bytes(v for v in row for _ in (0, 1)) * 2)
+    assert tess.calls == [], tess.calls  # the read at twice the scale has no doubt: no other engine
+    assert (got.w, got.h) == (100, 50) and (got.words[0].x, got.words[0].w) == (5, 25), got
+
+
+def test_junk_page_read_again_by_the_other_engine():
+    win = Win(lambda g: page(JUNK))
+    tess = Tess({"kor", "eng"}, lambda g, langs: page(CLEAN_KO, "tess-" + langs, conf=95.0))
+    got, _ = rp(G, ocr.Engines(win, tess, True), FAR, "page")
+    assert got.engine == "tess-kor+eng" and got.turn == 0, (got.engine, got.turn)
+    assert len(win.calls) == 5 and tess.calls == [("kor+eng", limits.TESS_PSM_KOR)], (len(win.calls), tess.calls)
+    tess = Tess({"kor", "eng"}, lambda g, langs: page(CLEAN_KO, "tess-" + langs, conf=50.0))
+    got, _ = rp(G, ocr.Engines(Win(lambda g: page(JUNK)), tess, True), FAR, "page")
+    assert got.engine == "tess-kor+eng" and got.turn == 0, got.engine  # both doubtful: the more good text
+    tess = Tess({"kor", "eng"}, lambda g, langs: page(JUNK, "tess-" + langs, conf=40.0))
+    got, _ = rp(G, ocr.Engines(None, tess, False), FAR, "page")
+    assert len(tess.calls) == 5 and got.engine == "tess-kor+eng"  # no Windows: no other engine
+
+
+def test_doubtful_turns_rank_by_score():
+    turned = {rotate(NOISY, t).data: t for t in (0, 90, 180, 270)}
+    out = {0: ["가나다라마바사아자차카타파하" * 2, "ㅋ"], 180: JUNK, 90: ["가"], 270: JUNK}
+    win = Win(lambda g: page(out.get(turned.get(g.data), JUNK)))
+    got, _ = rp(NOISY, ocr.Engines(win, None, True), FAR, "page")
+    assert got.turn == 0 and text(got) == " ".join(out[0]), (got.turn, text(got))  # every turn doubtful by its ink
+
+
+def test_big_junk_page_read_again_at_half_scale():
+    win = Win(lambda g: page(JUNK))
+    saved = ocr.images._MAX_PIXELS
+    ocr.images._MAX_PIXELS = 4 * G.w * G.h - 1
+    try:
+        rp(G, ocr.Engines(win, None, True), FAR, "page")
+    finally:
+        ocr.images._MAX_PIXELS = saved
+    assert (win.calls[-1].w, win.calls[-1].h) == (2, 1), win.calls[-1]
+
+
+def test_reread_stops_at_deadline():
+    clock = [100.0]
+
+    def junk(g):
+        if len(win.calls) == 4:
+            clock[0] = 111.0
+        return page(JUNK)
+
+    win = Win(junk)
+    tess = Tess({"kor", "eng"})
+    saved = ocr._now
+    ocr._now = lambda: clock[0]
+    try:
+        rp(G, ocr.Engines(win, tess, True), 110.0, "page")
+    finally:
+        ocr._now = saved
+    assert len(win.calls) == 4 and tess.calls == [], (len(win.calls), tess.calls)
 
 
 def main():

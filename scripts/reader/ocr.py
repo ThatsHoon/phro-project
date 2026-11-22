@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import images, limits
-from .ocr_pixels import Gray, Unread, rotate
+from .ocr_pixels import Gray, Unread, fit, rotate, rules, threshold, unread
 
 
 @dataclass
@@ -202,17 +202,20 @@ def _tess_page(tess, g: Gray, deadline: float) -> OcrPage | None:
     return _latin_again(tess, g, page, deadline) or page
 
 
-def _read_once(g: Gray, eng: Engines, deadline: float) -> tuple[OcrPage | None, bool]:
-    """One pass of the engine choice on `g` as it stands: (page, hint)."""
+def _read_once(g: Gray, eng: Engines, deadline: float, doubt) -> tuple[OcrPage | None, bool]:
+    """One pass of the engine choice on `g` as it stands: (page, hint). `doubt(page)` says whether a Windows read
+    is in doubt; a Latin one is read again by Tesseract eng when it is, or when the Windows engine reads Korean (it
+    misreads Latin letters as Hangul and digits)."""
     tess = eng.tess
     if eng.win is None:
         return _tess_page(tess, g, deadline), False
     page = eng.win.recognize(g, deadline)
     if page is None:  # Windows gave no page: Tesseract as on a machine without Windows OCR, while time is left
         return _tess_page(tess, g, deadline), False
-    again = _latin_again(tess, g, page, deadline)
-    if again is not None:
-        return again, False
+    if latin_share(page) >= limits.OCR_LATIN and (eng.win_korean or doubt(page)):
+        again = _latin_again(tess, g, page, deadline)
+        if again is not None:
+            return again, False
     if not eng.win_korean and junk_share(page) > limits.OCR_JUNK:
         if tess is None or "kor" not in tess.langs:
             return page, True  # decision 13: a non-Korean Windows engine, junk, and no Tesseract kor
@@ -222,41 +225,133 @@ def _read_once(g: Gray, eng: Engines, deadline: float) -> tuple[OcrPage | None, 
     return page, False
 
 
-def read_page(g: Gray, eng: Engines, deadline: float, kind: str) -> tuple[OcrPage | None, bool]:
-    """The page read by the engine chosen for it, and whether it calls for the Korean hint (decision 13).
+@dataclass
+class Reading:
+    """`read_page`'s result: the page, whether it calls for the Korean hint (decision 13), and for a page its rules
+    (pixel boxes x0, y0, x1, y1) and unread ink, measured on `rotate(g, page.turn)`; a picture has neither."""
+    page: OcrPage
+    hint: bool
+    rules: list = field(default_factory=list)
+    unread: Unread | None = None
 
-    `kind` is "page" or "picture". A page whose 0-degree pass has a junk share over OCR_JUNK is read again turned
-    clockwise by 180, 90 and 270 degrees, in that order, while time is left. The search stops at the first turn whose
-    pass has words and a junk share of at most OCR_JUNK. The pass with the best `_score` is kept, with its `turn` set
-    and its hint. A picture is read once (decision 11). `deadline` is a time.monotonic() value. (None, False) when no
-    engine gives a page. An engine's OSError is not caught here: the worker catches it per job.
 
-    The returned page's `w`, `h` and boxes are in the frame of `rotate(g, page.turn)`. The caller computes the page's
-    `threshold`, `rules` and `Unread` on that turned bitmap, so `judge`'s `Verdict.box` is in the same frame. The
-    picture shown is cut from the image as it is stored, not from the turned bitmap: the caller turns the box back
-    first (`pdf._unturned`).
+def blank(g: Gray) -> bool:
+    """No two pixels of `g` are more than OCR_FLAT levels apart: there is nothing on it to read. A sparse sample
+    settles almost every bitmap; only a flat one is looked at whole."""
+    return all(max(d) - min(d) <= limits.OCR_FLAT for d in (g.data[::64], g.data))
+
+
+def _doubled(g: Gray) -> Gray:
+    """`g` at twice its width and height, each pixel repeated."""
+    wide = bytearray(2 * len(g.data))
+    wide[0::2] = g.data
+    wide[1::2] = g.data
+    row = 2 * g.w
+    return Gray(2 * g.w, 2 * g.h, b"".join(bytes(wide[i:i + row]) * 2 for i in range(0, len(wide), row)))
+
+
+def _framed(page: OcrPage, sx: float, sy: float) -> OcrPage:
+    """`page` with its size, word boxes and ink boxes scaled by (sx, sy)."""
+    def box(x, y, w, h):
+        return round(x * sx), round(y * sy), max(1, round(w * sx)), max(1, round(h * sy))
+    words = [replace(w, **dict(zip("xywh", box(w.x, w.y, w.w, w.h)))) for w in page.words]
+    ink = None if page.ink is None else [box(*b) for b in page.ink]
+    return replace(page, w=round(page.w * sx), h=round(page.h * sy), words=words, ink=ink)
+
+
+def _measurer(g: Gray, dpi: float):
+    """A function giving a page's (rules, unread ink) on `rotate(g, page.turn)`, with the page's `ink` boxes when the
+    engine gives them (its word boxes are then deskewed). Each turn's threshold and rules are found once, each
+    page's unread ink once."""
+    turns, pages = {}, {}
+
+    def measure(page: OcrPage) -> tuple[list, Unread]:
+        if id(page) not in pages:
+            if page.turn not in turns:
+                turned = rotate(g, page.turn)
+                thr = threshold(turned)
+                turns[page.turn] = turned, thr, rules(turned, dpi, thr)
+            turned, thr, found = turns[page.turn]
+            boxes = page.ink if page.ink is not None else [(w.x, w.y, w.w, w.h) for w in page.words]
+            pages[id(page)] = page, (found, unread(turned, boxes, found, thr))
+        return pages[id(page)][1]
+    return measure
+
+
+def read_page(g: Gray, eng: Engines, deadline: float, kind: str, dpi: float = limits.OCR_DPI) -> Reading | None:
+    """The page read by the engine chosen for it (`Reading`), None when no engine gives a page.
+
+    `kind` is "page" or "picture"; `dpi` is the bitmap's resolution, which the rules are found at. A picture is read
+    once (decision 11). A page whose 0-degree pass has a junk share over OCR_JUNK is read again turned clockwise by
+    180, 90 and 270 degrees, in that order, while time is left; the search stops at the first turn whose pass has
+    words and a junk share of at most OCR_JUNK. When the best of them is still doubtful (`judge`), its turn is read
+    again at another scale (twice the size when that stays within images._MAX_PIXELS, else half) and then by the
+    other engine, until a read is not doubtful. The best pass is the one not doubtful, then the one with the best
+    `_score`; it keeps its `turn` and its hint. `deadline` is a time.monotonic()
+    value, checked before each pass. An engine's OSError is not caught here: the worker catches it per job.
+
+    The returned page's `w`, `h` and boxes are in the frame of `rotate(g, page.turn)`, as are the rules and the
+    unread ink, so `judge`'s `Verdict.box` is in the same frame. The picture shown is cut from the image as it is
+    stored, not from the turned bitmap: the caller turns the box back first (`pdf._unturned`).
     """
     if kind not in ("page", "picture"):
         raise ValueError(f"kind {kind!r}")
-    page, hint = _read_once(g, eng, deadline)
-    if page is None:
-        return None, False
-    if kind == "picture" or junk_share(page) <= limits.OCR_JUNK:
-        return page, hint
-    best, best_hint, best_score = page, hint, _score(page)
-    for turn in _TURNS:
-        if _now() >= deadline:
-            break
-        p, h = _read_once(rotate(g, turn), eng, deadline)
-        if p is None:
-            continue
-        p = replace(p, turn=turn)
-        s = _score(p)
-        if s > best_score:
-            best, best_hint, best_score = p, h, s
-        if p.words and junk_share(p) <= limits.OCR_JUNK:  # a clean turn ends the search; an empty one does not
-            break
-    return best, best_hint
+    if kind == "picture":
+        page, hint = _read_once(g, eng, deadline, _text_doubt)
+        return None if page is None else Reading(page, hint)
+    measure = _measurer(g, dpi)
+
+    def doubtful(p: OcrPage) -> bool:
+        return _text_doubt(p) or judge(p, measure(p)[1]).kind == "doubtful"
+
+    def rank(p: OcrPage) -> tuple:
+        return not doubtful(p), _score(p)
+
+    def at(turn: int, k: float) -> tuple[OcrPage | None, bool]:
+        base = rotate(g, turn)
+        seen = base if k == 1 else _doubled(base) if k > 1 else fit(base, None, max_side=max(base.w, base.h) - 1)
+        sx, sy = base.w / seen.w, base.h / seen.h
+        backs = {}
+
+        def back(p: OcrPage) -> OcrPage:
+            if id(p) not in backs:
+                q = replace(p, turn=turn)
+                backs[id(p)] = p, (q if seen is base else _framed(q, sx, sy))
+            return backs[id(p)][1]
+        p, h = _read_once(seen, eng, deadline, lambda p: doubtful(back(p)))
+        return (None, h) if p is None else (back(p), h)
+
+    def other(turn: int, p: OcrPage) -> tuple[OcrPage | None, bool]:
+        base = rotate(g, turn)
+        if eng.win is not None and p.engine == eng.win.engine:
+            got = _tess_page(eng.tess, base, deadline)
+        else:
+            got = eng.win.recognize(base, deadline) if eng.win is not None else None
+        return (None if got is None else replace(got, turn=turn)), False
+
+    best = at(0, 1)
+    if best[0] is None:
+        return None
+    if junk_share(best[0]) > limits.OCR_JUNK:
+        for turn in _TURNS:
+            if _now() >= deadline:
+                break
+            p, h = at(turn, 1)
+            if p is None:
+                continue
+            if rank(p) > rank(best[0]):
+                best = p, h
+            if p.words and junk_share(p) <= limits.OCR_JUNK:  # a clean turn ends the search; an empty one does not
+                break
+        turn = best[0].turn
+        k = 2 if 4 * g.w * g.h <= images._MAX_PIXELS else 0.5
+        for again in (lambda: at(turn, k), lambda: other(turn, best[0])):
+            if not doubtful(best[0]) or _now() >= deadline:
+                break
+            p, h = again()
+            if p is not None and rank(p) > rank(best[0]):
+                best = p, h
+    return Reading(best[0], best[1], *measure(best[0]))
 
 
 # ---- the verdict -----------------------------------------------------------------------------------------------------
@@ -287,6 +382,20 @@ def skew(page: OcrPage) -> float:
     return abs(math.degrees(math.atan(sxy / sxx))) if sxx else 0.0
 
 
+def _text_doubt(page: OcrPage) -> bool:
+    """The doubt the text itself gives (`judge`'s first signals): its junk share passes OCR_JUNK, the words' mean
+    confidence (when they carry one) is under OCR_CONF, the share of those words under OCR_LOW_WORD passes OCR_LOW,
+    or the lines of a read at TESS_PSM_KOR slope past OCR_SKEW degrees. A picture's text is judged by these alone:
+    the ink of a picture is mostly not text."""
+    confs = [w.conf for w in page.words if w.conf is not None]
+    return bool(
+        junk_share(page) > limits.OCR_JUNK
+        or (confs and sum(confs) / len(confs) < limits.OCR_CONF)
+        or (confs and sum(1 for c in confs if c < limits.OCR_LOW_WORD) / len(confs) > limits.OCR_LOW)
+        or (page.psm == limits.TESS_PSM_KOR and skew(page) > limits.OCR_SKEW)
+    )
+
+
 def judge(page: OcrPage, un: Unread) -> Verdict:
     """Doubtful when the junk share passes OCR_JUNK, the words' mean confidence (when they carry one) is under
     OCR_CONF, the share of those words under OCR_LOW_WORD passes OCR_LOW, the lines of a page read at TESS_PSM_KOR
@@ -304,14 +413,7 @@ def judge(page: OcrPage, un: Unread) -> Verdict:
     `un` must be computed on `rotate(g, page.turn)`, the frame the page's boxes are in, so `Verdict.box` is a
     fractional box of that turned bitmap."""
     confs = [w.conf for w in page.words if w.conf is not None]
-    doubtful = (
-        junk_share(page) > limits.OCR_JUNK
-        or (confs and sum(confs) / len(confs) < limits.OCR_CONF)
-        or (confs and sum(1 for c in confs if c < limits.OCR_LOW_WORD) / len(confs) > limits.OCR_LOW)
-        or (page.psm == limits.TESS_PSM_KOR and skew(page) > limits.OCR_SKEW)
-        or (not page.words and (un.share > 0 or un.spread > limits.OCR_FLAT))
-    )
-    if doubtful:
+    if _text_doubt(page) or (not page.words and (un.share > 0 or un.spread > limits.OCR_FLAT)):
         return Verdict("doubtful", None)
     picture = un.box is not None and un.density >= limits.OCR_AREA_DENSITY
     if un.share > (limits.OCR_UNREAD if confs or picture else limits.OCR_UNREAD_NOCONF):
@@ -322,9 +424,9 @@ def judge(page: OcrPage, un: Unread) -> Verdict:
 
 
 def picture_lines(page: OcrPage) -> list[str]:
-    """The text lines of a picture for `Picture text:`, in reading order; empty under OCR_MIN_WORDS words or past
-    OCR_JUNK, in the order of `ocr_layout.reading_lines`."""
-    if len(page.words) < limits.OCR_MIN_WORDS or junk_share(page) > limits.OCR_JUNK:
+    """The text lines of a picture for `Picture text:`, in the order of `ocr_layout.reading_lines`; empty under
+    OCR_MIN_WORDS words. Whether they are written is the picture's verdict."""
+    if len(page.words) < limits.OCR_MIN_WORDS:
         return []
     from .ocr_layout import reading_lines
     return reading_lines(page)
@@ -509,8 +611,10 @@ class Ticket:
 
 @dataclass
 class Result:
-    """A ticket's outcome. `status`: "done" (`page` is set; for a page, `unread` and `verdict` too), "failed" (the
-    worker died, could not start, refused the job, or no engine gave a page) or "late" (the deadline came first).
+    """A ticket's outcome. `status`: "done" (`page` and `verdict` are set; for a page, `unread` too), "blank" (a
+    picture with nothing on it to read, `blank`, not sent), "failed" (the worker died, could not start, refused the
+    job, or no engine gave a page) or "late" (the deadline came first). A picture's verdict is "doubtful" or
+    "trusted", by its text alone (`_text_doubt`).
     `rules` are pixel boxes (x0, y0, x1, y1) and `unread` the unread ink, both in the frame of
     `rotate(g, page.turn)`; a picture has no rules and no unread. `hint`: it calls for the Korean hint (decision 13)."""
     status: str
@@ -589,7 +693,7 @@ def _result_of(d: dict, kind: str) -> Result:
         rules.append(tuple(_int(v) for v in b))
     un = _unread_of(d["unread"])
     if kind == "picture":
-        return Result("done", page, rules, un, None, hint)
+        return Result("done", page, rules, un, Verdict("doubtful" if _text_doubt(page) else "trusted", None), hint)
     if un is None:
         raise ValueError("a page answer without unread ink")
     return Result("done", page, rules, un, judge(page, un), hint)
@@ -759,6 +863,11 @@ class Session:
             dpi = math.nan
         if not math.isfinite(dpi) or dpi <= 0:  # a resolution tag of 0/0, say: the page is still read
             dpi = float(limits.OCR_DPI)
+        if kind == "picture" and blank(g):
+            t = Ticket(next(self._ids), kind, "", dpi)
+            with self._cond:
+                self._file(t, Result("blank"))
+            return t
         key = picture_key(g, *self.backend, kind=kind, dpi=dpi)
         t = Ticket(next(self._ids), kind, key, dpi)
         hit = self._cached(key, kind)
