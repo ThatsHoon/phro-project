@@ -128,7 +128,7 @@ def ocr_notes(counts: dict, hint: bool) -> list:
         doubt = f"; {m} of them doubtful, shown with the page image" if m else ""
         out.append(f"({n} scanned page{'' if n == 1 else 's'} read by OCR{doubt})")
     if counts["stopped_at"] is not None:
-        out.append(f"(OCR stopped at page {counts['stopped_at']}; read the file again to continue)")
+        out.append(f"(OCR stopped at page {counts['stopped_at']} for the time; later scanned pages are shown as images)")
     elif k := counts["pictures_left"]:
         out.append(f"(OCR stopped; {k} picture{'' if k == 1 else 's'} not read)")
     if f := counts["failed"]:
@@ -349,6 +349,8 @@ class _Render:
         self.empty = True  # nothing but status lines was rendered
         self.hidden_count = 0
         self.page_heads = 0  # page heads written, each starting with head_mark
+        self.page_at = None  # the number of the page section being rendered
+        self.left_pages = set()  # the page numbers of the pictures OCR left for the time
         self.head_mark = _HEAD_MARK + secrets.token_hex(8) + _HEAD_MARK
         self.depth = 0
         self.too_deep = 0  # subtrees left out for nesting past MAX_DEPTH
@@ -571,6 +573,8 @@ class _Render:
                 pic = self.assets.keep_picture(path, self.pictures.lines(b))
             if pic:
                 texts.append("Picture text: " + pic)
+            if self.page_at is not None and (b.data, b.page) in self.pictures.left:
+                self.left_pages.add(self.page_at)
         parts = [head] if head else []
         for s in texts:
             s = m.esc(s)
@@ -602,6 +606,7 @@ class _Render:
             head = f"## On {title}"
         elif s.kind == "page" and s.number is not None:
             head = f"## Page {s.number}" + (f": {title}" if title else "")
+            self.page_at = s.number
         elif s.kind == "page" and title:
             head = f"## Page: {title}"
         if head and s.kind == "page":
@@ -952,6 +957,8 @@ class _Render:
             p = self.pictures
             counts = {f"pictures_{k}": 0 if p is None else len(getattr(p, k)) for k in ("left", "doubtful", "blank")}
             self.ocr = dict(NO_OCR, **self.doc.meta.get("ocr", {}), **counts)
+            if self.left_pages:
+                self.ocr["pictures_left_pages"] = sorted(self.left_pages)
             self.ocr_hint = self.pictures is not None and self.pictures.s.hint
             status += ocr_notes(self.ocr, self.ocr_hint)
         props = self.doc.meta.get("properties")

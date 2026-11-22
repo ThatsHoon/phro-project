@@ -3,31 +3,13 @@ are imported only there; heavier imports happen inside functions."""
 import time
 from pathlib import Path
 
+from .exts import FORMATS
+
 VERSION = "0.10.0"
 
 # when the reader was imported: the CLI child passes it to the pdf and djvu page loops' deadlines
 STARTED = time.monotonic()
 
-# extension -> module name under reader.formats
-FORMATS = {
-    "hwpx": "hwpx", "hwp": "hwp",
-    "odt": "odf", "ods": "odf", "odp": "odf",
-    "docm": "ooxml", "pptm": "ooxml", "ppsx": "ooxml",
-    "docx": "ooxml", "dotx": "ooxml", "dotm": "ooxml",
-    "pptx": "ooxml", "potx": "ooxml", "potm": "ooxml", "ppsm": "ooxml",
-    "xlsx": "ooxml", "xlsm": "ooxml", "xltx": "ooxml", "xltm": "ooxml",
-    "vsdx": "vsdx", "epub": "epub", "xps": "xps", "oxps": "xps",
-    "doc": "doc", "xls": "xls", "ppt": "ppt", "xlsb": "xlsb",
-    "rtf": "rtf", "wpd": "wpd", "wp": "wpd", "wp5": "wpd", "wp6": "wpd", "wp7": "wpd", "wpt": "wpd",
-    "mobi": "mobi", "azw3": "mobi",
-    "pages": "iwork", "numbers": "iwork", "key": "iwork",
-    "djvu": "djvu", "djv": "djvu",
-    "mdb": "jet", "accdb": "jet", "mde": "jet", "accde": "jet", "accdr": "jet",
-    "pub": "pub", "vsd": "vsd", "vst": "vsd", "vsdm": "vsdx", "vstx": "vsdx", "mpp": "mpp", "mpt": "mpp",
-    "pdf": "pdf",
-    "wmf": "picture", "emf": "picture", "wmz": "picture", "emz": "picture", "tif": "picture", "tiff": "picture",
-    "pct": "picture", "pict": "picture", "wpg": "picture",
-}
 
 # extensions with a working parser; each format task adds its own
 BUILT = {"hwpx", "hwp", "doc", "xls", "odt", "ods", "odp", "docm", "pptm", "ppsx", "vsdx", "epub", "xps", "oxps", "xlsb", "ppt", "rtf",

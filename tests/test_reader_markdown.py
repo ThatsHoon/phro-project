@@ -943,7 +943,7 @@ def test_stop_note_for_pages_and_pictures():
     with tempfile.TemporaryDirectory() as d:
         out = markdown.render(Doc(blocks=[P("body")], meta={"ocr": {"pages": 40, "doubtful": 0, "failed": 0,
                                                                      "stopped_at": 41}}), Path(d))
-    assert out == ("(40 scanned pages read by OCR)\n\n(OCR stopped at page 41; read the file again to continue)"
+    assert out == ("(40 scanned pages read by OCR)\n\n(OCR stopped at page 41 for the time; later scanned pages are shown as images)"
                    "\n\nbody\n"), out
     info = {}
     with stub(deadline=time.monotonic() + limits.FIGURE_RESERVE + 1, delay=30, answer=seen("Total 120")), \
@@ -953,6 +953,20 @@ def test_stop_note_for_pages_and_pictures():
     assert out == ("(OCR stopped; 2 pictures not read)\n\n![](assets/img-001.png)\n\n![](assets/img-002.png)\n\n"
                    "![](assets/img-001.png)\n"), out
     assert info["ocr"]["pictures_left"] == 2, info
+
+
+def test_pictures_left_name_their_pages():
+    """The pdf pages whose pictures OCR left for the time are kept, in order, with the count."""
+    info = {}
+    pages = [Section(kind="page", number=n, blocks=[Image(pic(shade=s))] if s else [P(f"text {n}")])
+             for n, s in ((1, 0), (2, 250), (3, 0), (4, 240), (5, 250))]
+    with stub(deadline=time.monotonic() + limits.FIGURE_RESERVE + 1, delay=30, answer=seen("Total 120")), \
+            tempfile.TemporaryDirectory() as d:
+        markdown.render(Doc(blocks=pages), Path(d), info=info)
+    assert info["ocr"]["pictures_left"] == 2 and info["ocr"]["pictures_left_pages"] == [2, 4, 5], info
+    with stub(answer=seen("Total 120")), tempfile.TemporaryDirectory() as d:
+        markdown.render(Doc(blocks=pages), Path(d), info=info)
+    assert info["ocr"]["pictures_left"] == 0 and "pictures_left_pages" not in info["ocr"], info
 
 
 def test_korean_hint_once():

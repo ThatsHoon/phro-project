@@ -4,12 +4,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import reader
 from reader import limits
 
 INDEX_LINES = 2000
 INDEX_CHARS = 10_000
+INDEX_TITLE = 30  # characters of a heading in the context's index; index.md holds the whole title
 CONTEXT_MAX = 600
 DETAIL_MAX = 200  # characters of a failure detail in a deny reason (`_why`); the file controls some of it
 READ_PY = Path(__file__).resolve().parents[1] / "read.py"
@@ -32,6 +34,16 @@ SKILL_OF = {**dict.fromkeys(("docx", "docm", "dotx", "dotm"), "docx"),
             **dict.fromkeys(("xlsx", "xlsm", "xltx", "xltm"), "xlsx"),
             "pdf": "pdf"}
 EDIT_HINT = " Read-only view (no XML, cell addresses or formulas); to edit the file, use the {skill} skill."
+SAVE_AS = {**dict.fromkeys(("doc", "docx", "docm", "dotx", "dotm", "rtf", "odt", "wpd", "wp", "wp5", "wp6", "wp7",
+                            "wpt", "pages"), "docx or pdf"),
+           **dict.fromkeys(("xls", "xlsx", "xlsm", "xltx", "xltm", "xlsb", "ods", "numbers"), "xlsx or pdf"),
+           **dict.fromkeys(("ppt", "pptx", "pptm", "ppsx", "potx", "potm", "ppsm", "odp", "key"), "pptx or pdf"),
+           **dict.fromkeys(("hwp", "hwpx"), "hwpx or pdf"),
+           **dict.fromkeys(("vsd", "vst"), "vsdx or pdf"), **dict.fromkeys(("mpp", "mpt"), "xlsx or pdf")}
+PROTECTED = " phro-project cannot open protected files; ask the user for an unprotected copy"
+VANISHED = "cache entry vanished"
+READER_FAULTS = ("internal error", "conversion gave no output", VANISHED)
+LARGE_PART = "the part they need saved on its own"
 
 # pdf
 PDF_HINT = ' Pages start at "## Page N" lines. Read-only view; to edit or create a pdf, use the pdf skill.'
@@ -40,9 +52,10 @@ OFFER = (' Built-in parser used; pypdfium2 (PyPI, 4 MB) reads tables, scans and 
 REPAIR = (' The pdf engine failed its file check, so the built-in parser was used; to repair it, ask the user and only'
           ' on their yes run: python -I -X utf8 "{read_py}" setup --venv "{dir}".')
 PAST_END = ' The pdf has {n} pages; pages="{a}-{b}" starts past its end.'
-PASS_TEXT = "phro-project could not convert {name} ({why}); Claude's own Read is used."
+PASS_TEXT = "phro-project could not convert {name}: {why}. Claude's own Read is used."
 DENY_KINDS = ("encrypted", "drm", "too_large")  # a pdf failing any other way goes to Claude's own Read
-FAILED_SECONDS = 86_400  # a failed pdf passes through at once for a day
+FAILED_SECONDS = 86_400  # a failed pdf passes through, and a timed-out conversion is denied, at once for a day
+PRUNE_SECONDS = 86_400
 SUGGEST_PAGES = 20  # Claude's own Read takes at most 20 pdf pages a request
 
 # mpp and mpt: read only through MPXJ in the mpp venv; until it is ready every Read is denied with one of these
@@ -114,6 +127,28 @@ def _name(path):
     return " ".join(Path(path).name.split())
 
 
+def _quoted(path):
+    """`path` as one word of a command line that bash and PowerShell read alike: in single quotes, where neither
+    expands anything; a path with a single quote, which the two shells escape differently, as a percent-encoded
+    file: URI in single quotes, with no character either shell reads (read.py's `source` takes it back). A long-path prefix
+    (\\\\?\\) is left off."""
+    s = str(path)
+    if s.startswith("\\\\?\\UNC\\"):
+        s = "\\\\" + s[8:]
+    elif s.startswith("\\\\?\\"):
+        s = s[4:]
+    if "'" not in s:
+        return "'" + s + "'"
+    s = s.replace("\\", "/")
+    lead = "file:" if s.startswith("//") else "file:///" if s[1:3] == ":/" else "file://" if s.startswith("/") else "file:"
+    return "'" + lead + quote(s, safe="/:") + "'"
+
+
+def _by_hand(path, engine=""):
+    script = f'"{READ_PY}"' if "'" in str(READ_PY) else _quoted(READ_PY)
+    return f"python -I -X utf8 {script} convert {_quoted(path)}" + (f" --engine {engine}" if engine else "")
+
+
 def looks_like_text(path):
     """True for a plain-text file (no NUL in the first 4 KiB, valid UTF-8, not RTF, no pdf header in 1 KiB)."""
     try:
@@ -152,21 +187,33 @@ def _is_zip(path):
         return False
 
 
-def deny_text(path, why, retry=True):
-    """A deny; with retry, the convert command too (only where running it by hand can help)."""
-    reason = f"{_name(path)}: {why}."
-    skill = SKILL_OF.get(reader.ext_of(path))
-    if retry:
-        reason += f' Retry by hand: python -I -X utf8 "{READ_PY}" convert "{path}"'
-        if skill:
-            reason += f" or read it with the {skill} skill."
-    elif skill:
-        reason += f" Read it with the {skill} skill instead."
-    return {"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": "deny",
-        "permissionDecisionReason": reason,
-    }}
+def _next(path, kind, detail=""):
+    """The one sentence a deny of `kind` ends with: what can be done next. The convert command only for a timeout,
+    the one failure that running it again can mend, and not for mpp, whose run by hand has the same limit; for a
+    failure of phro-project's own, not of the file, another way to read it, or the same Read again for a cache
+    entry that went missing."""
+    ext = reader.ext_of(path)
+    skill = SKILL_OF.get(ext)
+    if kind == "timeout" and reader.FORMATS.get(ext) == "mpp":
+        return (" A run by hand stops at the same limit; ask the user for a smaller project, or the project saved"
+                f" as {SAVE_AS[ext]}.")
+    if kind == "damaged" and detail == VANISHED:
+        return " Read it again."
+    if kind == "damaged" and detail.startswith(READER_FAULTS):
+        return (f" Read it with the {skill} skill instead, or tell" if skill else " Tell") + \
+            " the user phro-project failed on this file."
+    if kind == "timeout":
+        return f" Retry by hand: {_by_hand(path)}" + (f" or read it with the {skill} skill." if skill else ".")
+    if kind in ("encrypted", "drm"):
+        if skill == "pdf" and kind == "encrypted":
+            return PROTECTED + ", or for the password and read it with the pdf skill."
+        return PROTECTED + "."
+    if kind == "too_large":
+        skilled = f"read it with the {skill} skill instead, or " if skill else ""
+        return f" That is phro-project's safety limit; {skilled}ask the user for a smaller file, such as {LARGE_PART}."
+    ask = f" Read it with the {skill} skill instead, or ask" if skill else " Ask"
+    again = "" if kind == "unsupported" else " again,"
+    return f"{ask} the user for the file saved{again} as {SAVE_AS.get(ext, 'pdf')}."
 
 
 def _why(kind, detail=""):
@@ -174,21 +221,26 @@ def _why(kind, detail=""):
     DETAIL_MAX characters (a zip member name in it is the file's, up to 64 KB)."""
     if len(detail) > DETAIL_MAX:
         detail = detail[:DETAIL_MAX - 1] + "…"
-    if kind == "damaged" and detail.startswith("internal error"):
-        return f"reading failed ({detail})"
+    if kind == "damaged" and detail.startswith(READER_FAULTS):
+        return f"reading failed: {detail}"
     if kind == "damaged":
-        return f"the file looks damaged ({detail})"
+        return f"the file looks damaged: {detail}"
     if kind == "too_large":
         return TOO_LARGE.get(detail.split(":", 1)[0], REASONS["too_large"])
     if kind == "unsupported" and detail:
-        return f"this file is not supported ({detail})"
+        return f"this file is not supported: {detail}"
     if kind == "timeout" and detail == LATE:
         return LATE_TEXT
     return REASONS.get(kind) or f"{kind} {detail}".strip()
 
 
 def _deny(path, kind, detail=""):
-    return deny_text(path, _why(kind, detail), retry=kind in ("damaged", "timeout"))
+    """A deny of failure `kind`: the reason, then what can be done next."""
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": f"{_name(path)}: {_why(kind, detail)}." + _next(path, kind, detail),
+    }}
 
 
 def _pass(path, why):
@@ -224,7 +276,7 @@ _CLEAN.update({c: None for c in (*range(0x200b, 0x2010), 0x061c, 0x2060, 0xfeff)
 
 
 def _heading(text):
-    return " ".join(str(text).translate(_CLEAN).split())[:60].strip()
+    return " ".join(str(text).translate(_CLEAN).split())
 
 
 def _clause(prefix, entries, end, used):
@@ -268,68 +320,206 @@ def page_index(meta):
     return sorted(pairs, key=lambda pl: pl[1])
 
 
-def _page_lines(meta, used):
-    """` Pages at lines: p:line, …` with every k-th page, for the smallest k that fits."""
-    prefix = " Pages at lines: "
-    entries = [f"{p}:{line}" for p, line in page_index(meta)]
+def _sample(prefix, entries, sep, room):
+    """(prefix and every k-th entry, k) for the smallest k whose text fits in room, `sep` and "…" ending it when the
+    last entry is not in the sample; ("", 0) when not even the first fits."""
     for k in range(1, len(entries) + 1):
-        mark = "" if (len(entries) - 1) % k == 0 else ", …"  # ", …" when the last page is not in the sample
-        text = prefix + ", ".join(entries[::k]) + mark
-        if used + len(text) <= CONTEXT_MAX - 1:
-            return text
-    return ""
+        mark = "" if (len(entries) - 1) % k == 0 else sep + "…"
+        text = prefix + sep.join(entries[::k]) + mark
+        if len(text) <= room:
+            return text, k
+    return "", 0
 
 
-def _head(name, meta):
+def _write_index(target, head, lines):
+    """index.md beside out.md: `head`, then one entry a line; True when it is there."""
+    if target.is_file():
+        return True
+    tmp = target.with_name(f".tmp-index-{os.getpid()}")
+    try:
+        tmp.write_text(head + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+        return True
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return target.is_file()
+
+
+def _index(meta, out_md, pdf, beside_assets=False):
+    """(fit, floor) for the index the context gives a long output: for pdf ` Pages at lines: page:line, …`, for the
+    rest ` Sections at lines: line title; …` (titles cut to INDEX_TITLE). fit(room) is the whole index when it fits
+    in room; else every k-th entry for the smallest k that fits, and the whole index in index.md beside out.md,
+    named in the prefix by its path, or as next to the assets folder when the context already gave that folder's
+    path; else, index.md written, only the sentence naming it. floor is the room the whole index or that sentence
+    takes, the least the context keeps for it; (None, 0) when there is no index."""
+    if pdf:
+        name, sep, head = " Pages at lines", ", ", "Pages of out.md, as page:line"
+        entries = full = [f"{p}:{line}" for p, line in page_index(meta)]
+    else:
+        name, sep, head = " Sections at lines", "; ", "Sections of out.md, as line and title"
+        heads = [(line, t) for line, text in meta.get("headings") or [] if (t := _heading(text))]
+        entries = [f"{line} {t[:INDEX_TITLE].strip().replace(';', ',')}" for line, t in heads]
+        full = [f"{line} {t}" for line, t in heads]
+    if not entries:
+        return None, 0
+    target = out_md.parent / "index.md"
+    where = "index.md next to that assets folder" if beside_assets else str(target)
+    prefix = f"{name} (all in {where}): "
+    whole = name + ": " + sep.join(entries)
+
+    def fit(room):
+        if len(whole) <= room:
+            return whole
+        if not _write_index(target, head, full):
+            return _sample(name + ": ", entries, sep, room)[0]
+        text = _sample(prefix, entries, sep, room)[0]
+        return text or (pointer if len(pointer) <= room else "")
+    pointer = f"{name}: {where}."
+    return fit, min(len(whole), len(pointer))
+
+
+def _window(meta, ti, span=None, pages=""):
+    """({"limit": n}, the sentence that says so) for a read without a limit whose lines from its offset (`span` of
+    them, the gate's own limit for a pages= piece, else Read's READ_LINES) would pass READ_TOKENS or READ_BYTES by
+    meta's line_bytes; ({}, "") when they fit, the read has its own limit or the offset is not a line number. The
+    sentence names `pages`, the range of a pages= read, with the offset to go on from: that offset alone would be
+    a line of another entry or another piece."""
+    sizes = meta.get("line_bytes")
+    off = ti.get("offset", 1)
+    if "limit" in ti or not isinstance(sizes, list) or not isinstance(off, int) or isinstance(off, bool):
+        return {}, ""
+    s, m = max(1, off), len(sizes)
+    stop = min(m, s - 1 + (span or limits.READ_LINES))
+    cap = min(limits.READ_TOKENS * limits.READ_TOKEN_BYTES, limits.READ_BYTES)
+    used, e = 0, s - 1
+    for b in sizes[s - 1:stop]:
+        b = _count(b)
+        if used + b > cap:
+            break
+        used, e = used + b, e + 1
+    if e >= stop:
+        return {}, ""
+    e = max(e, s)
+    more = f'pages="{pages}" ' if pages else ""
+    return {"limit": e - s + 1}, f" Lines {s}-{e} of {m}; continue with {more}offset={e + 1}."
+
+
+def _count(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def _past_cut(meta, upto=None, short=False):
+    """The sentence naming the pages after the page index's last one, up to `upto` (the pdf's last page when None),
+    and the pages= read that converts them, in fewer words when `short`; "" when there are none."""
+    end = _count(meta.get("pages_total") if upto is None else upto)
+    a = max((p for p, _ in page_index(meta)), default=0) + 1
+    if a > end:
+        return ""
+    if a == end:
+        return f' Page {a} is past the cut; Read the pdf with pages="{a}"' + ("." if short else " to read it.")
+    if end - a < SUGGEST_PAGES:
+        return (f' Pages {a}-{end} are past the cut; Read the pdf with pages="{a}-{end}"'
+                + ("." if short else " to read them."))
+    first = f' Pages {a}-{end} are past the cut; Read the pdf with pages="{a}-{a + SUGGEST_PAGES - 1}", then the next'
+    return first + (f" {SUGGEST_PAGES}." if short else f" {SUGGEST_PAGES} pages and so on, to read them.")
+
+
+def _pending(meta):
+    """The pages of a partial pdf entry whose text the deadline left out: those whose pictures OCR did not read,
+    and from the page where page OCR stopped to the page index's last."""
+    if meta.get("partial") is not True:
+        return []
+    ocr = meta.get("ocr") if isinstance(meta.get("ocr"), dict) else {}
+    pages = set(_ints(ocr.get("pictures_left_pages")))
+    if at := _count(ocr.get("stopped_at")):
+        pages.update(range(at, max([at] + [p for p, _ in page_index(meta)]) + 1))
+    return sorted(pages)
+
+
+def _reach(path, meta, out_md, short=False):
+    """The sentence naming the read that gets what the deadline left out of a partial entry, in fewer words when
+    `short`: for a pdf range entry the same pages= read again, for a whole pdf the pages= read of the first pages
+    left (and how far they go), else the convert by hand that finishes the entry (it names the native engine for a
+    pdf entry read natively, and no engine for one pdfium read: read.py then goes to the pdf venv by itself, so
+    either run stores under the entry's own key); "" when the entry is whole."""
+    if meta.get("partial") is not True:
+        return ""
+    rest = " for the rest" if short else " for the text the time left out"
+    if reader.ext_of(path) == "pdf":
+        _, a, b = (out_md.parent.name.split("-") + ["", ""])[:3]
+        if a[:1] == "p" and a[1:].isdigit() and b.isdigit():
+            return f' Read the pdf with pages="{_span(int(a[1:]), int(b))}" again{rest}.'
+        if pages := _pending(meta):
+            a = pages[0]
+            b = max(p for p in pages if p < a + SUGGEST_PAGES)
+            if pages[-1] == b:
+                more = "."
+            elif short:
+                more = f", then on to page {pages[-1]}."
+            else:
+                more = f", then pages {b + 1}-{pages[-1]}."
+            return f' Read the pdf with pages="{_span(a, b)}"{rest}' + more
+    run = _by_hand(path, "native" if reader.ext_of(path) == "pdf" and meta.get("engine") == "native" else "")
+    if short:
+        return f" For the rest, run {run} and Read again."
+    return f" To read the rest, run: {run}, then Read the file again."
+
+
+def _time_cut(meta, short=False):
+    """The sentence saying what the deadline left out of a partial entry, without the list when `short`; "" when
+    the entry is whole."""
+    if meta.get("partial") is not True:
+        return ""
+    ocr = meta.get("ocr") if isinstance(meta.get("ocr"), dict) else {}
+    items = []
+    if at := _count(ocr.get("stopped_at")):
+        items.append(f"OCR stopped at page {at}" + ("" if short else " (later scanned pages are linked as images)"))
+    if k := _count(ocr.get("pictures_left")):
+        items.append(f"{k} picture{'' if k == 1 else 's'} not read by OCR"
+                     + ("" if short else " (Read it to view)" if k == 1 else " (Read them to view)"))
+    if limits.FIGURES_LATE in (meta.get("warnings") or []):
+        items.append("some figures not drawn" + ("" if short else " (their text is included)"))
+    if not items:
+        return ""
+    return " Cut by the time limit." if short else " Cut by the time limit: " + ", ".join(items) + "."
+
+
+def _head(name, meta, assets):
     n = meta.get("lines", 0)
     m = meta.get("images", 0)
     k = meta.get("hidden", 0)
     head = f"{name} was converted to Markdown by phro-project ({n} line{'' if n == 1 else 's'}"
     if m:
-        head += f", {m} image in assets/; Read it to view" if m == 1 else f", {m} images in assets/; Read them to view"
+        head += f", {m} image in {assets}; Read it to view" if m == 1 else f", {m} images in {assets}; Read them to view"
     head += ")."
     if k:
-        head += f" {k} hidden places left out."
+        head += f" {k} hidden place{'' if k == 1 else 's'} left out."
     return head
 
 
-def _context(name, meta, out_md, *, past_end="", offer=""):
-    """additionalContext for an allow, fitted under CONTEXT_MAX: for pdf, the head, PDF_HINT, the past-the-end
-    sentence, the offer (whole or not at all), the unrendered and figure pages, the unread list and the page index;
-    for the rest, the head, the edit hint, the image offer (whole or not at all), the unread list and the heading
-    index. The garble warning goes last."""
+def _context(path, meta, out_md, *, past_end="", offer="", upto=None, window=""):
+    """additionalContext for an allow, never past CONTEXT_MAX - 1 characters but for a partial entry whose convert
+    command, never cut, holds a long path. Room goes first to the head (the file name cut short when it must, by
+    no more than the sentences kept need) with, for all but pdf, the edit hint (dropped before the index's floor
+    is), what the time cut, for pdf the pages past the
+    cut (up to `upto`, the end of a range read) and the read that gets them, the `window` sentence, the garble
+    warning, and the floor of a long output's index; then, for pdf, the past-the-end sentence, PDF_HINT, the offer
+    (whole or not at all), the unrendered and figure pages, and for the rest the image offer (whole or not at all);
+    then the unread list; the index takes what is left. They read head, hint, past-the-end, offer, pages, unread,
+    index, then the time cut and the read that gets the rest, and the rest. The head names the assets folder by its
+    absolute path: the Read result does not show out.md's."""
+    name = _name(path)
     pdf = reader.ext_of(name) == "pdf"
-    head = _head(name, meta)
-    tail = ""
-    if "garbled" in (meta.get("warnings") or []):
-        tail = " Warning: the text may be garbled."
-    if pdf:
-        head += PDF_HINT + past_end
-        runs = _runs(_ints(meta.get("unrendered")))
+    assets = f"{out_md.parent / 'assets'}{os.sep}"
+    garble = " Warning: the text may be garbled." if "garbled" in (meta.get("warnings") or []) else ""
 
-        def unrendered(used):
-            if not runs:
-                return ""
-            a, b = runs[0]
-            end = f'; Read the pdf with pages="{a}-{min(b, a + SUGGEST_PAGES - 1)}" to see them.'
-            return _clause(" Pages not shown as images: ", [_span(*r) for r in runs], end, used)
-        if offer and len(head) + len(offer) + len(tail) <= CONTEXT_MAX - 1:
-            # the offer comes again on a later Read; pages Claude cannot see here would be lost for good
-            if unrendered(len(head) + len(offer) + len(tail)) or not unrendered(len(head) + len(tail)):
-                head += offer
-        head += unrendered(len(head) + len(tail))
-        runs = _runs(_ints(meta.get("figures")))
-        if runs:
-            head += _clause(" Vector figures on pages ", [_span(*r) for r in runs], " are linked as images.",
-                            len(head) + len(tail))
-    else:
-        skill = SKILL_OF.get(reader.ext_of(name))
-        head += EDIT_HINT.format(skill=skill) if skill else ""
-        if offer and len(head) + len(offer) + len(tail) <= CONTEXT_MAX - 1:  # the image offer, whole or not at all
-            head += offer
-    unread = [" ".join(str(x).split()) for x in meta.get("unread") or []]
-    if unread:
-        head += _clause(" Some parts could not be read: ", unread, ".", len(head) + len(tail))
+    def tail_of(short):
+        return (_time_cut(meta, short) + _reach(path, meta, out_md, short) + (_past_cut(meta, upto, short) if pdf
+                                                                               else "") + window + garble)
+    tail = tail_of(False)
     n = meta.get("lines", 0)
     long_out = isinstance(n, int) and n > INDEX_LINES
     if not long_out:
@@ -338,14 +528,65 @@ def _context(name, meta, out_md, *, past_end="", offer=""):
                 long_out = len(out_md.read_text(encoding="utf-8", errors="replace")) > INDEX_CHARS
         except OSError:
             pass
-    index = ""
-    heads = meta.get("headings") or []
-    if long_out and pdf:
-        index = _page_lines(meta, len(head) + len(tail))
-    elif long_out and heads:
-        entries = [f'{line} "{t}"' for line, text in heads if (t := _heading(text))]
-        index = _clause(" Sections at lines: ", entries, "", len(head) + len(tail))
-    return head + index + tail
+    fit, floor = _index(meta, out_md, pdf, bool(meta.get("images"))) if long_out else (None, 0)
+    ext = reader.ext_of(name)
+    skill = SKILL_OF.get(ext)
+    edit = EDIT_HINT.format(skill=skill) if skill and not pdf else ""
+    stem = name[:len(name) - len(ext) - 1] if ext else name
+
+    def headed(tail, edit, floor):
+        head = _head(name, meta, assets) + edit
+        over = len(head) + len(tail) + floor - (CONTEXT_MAX - 1)
+        if over > 0 and len(stem) > 2:
+            head = _head(stem[:max(1, len(stem) - over - 1)] + "…" + (f".{ext}" if ext else ""), meta, assets) + edit
+        return head
+    for tail, hint, low in ((tail, edit, floor), (tail_of(True), edit, floor), (tail_of(True), "", floor),
+                            (tail_of(True), edit, 0), (tail_of(True), "", 0)):
+        head = headed(tail, hint, low)
+        if len(head) + len(tail) + low <= CONTEXT_MAX - 1:
+            break
+    if not low:
+        fit, floor = None, 0
+    if len(head) + len(tail) > CONTEXT_MAX - 1:
+        head = head[:max(0, CONTEXT_MAX - 2 - len(tail))] + "…"
+    parts = {}
+
+    def used():
+        return len(head) + len(tail) + floor + sum(len(v) for v in parts.values())
+
+    def take(key, text):
+        if text and used() + len(text) <= CONTEXT_MAX - 1:
+            parts[key] = text
+    if pdf:
+        take("past_end", past_end)
+        take("hint", PDF_HINT)
+        runs = _runs(_ints(meta.get("unrendered")))
+
+        def unrendered(extra):
+            if not runs:
+                return ""
+            a, b = runs[0]
+            end = f'; Read the pdf with pages="{a}-{min(b, a + SUGGEST_PAGES - 1)}" to see them.'
+            return _clause(" Pages not shown as images: ", [_span(*r) for r in runs], end, used() + extra)
+        if offer and used() + len(offer) <= CONTEXT_MAX - 1:
+            # the offer comes again on a later Read; pages Claude cannot see here would be lost for good
+            if unrendered(len(offer)) or not unrendered(0):
+                parts["offer"] = offer
+        take("unrendered", unrendered(0))
+        runs = _runs(_ints(meta.get("figures")))
+        if runs:
+            take("figures", _clause(" Vector figures on pages ", [_span(*r) for r in runs], " are linked as images.",
+                                    used()))
+        order = ("hint", "past_end", "offer", "unrendered", "figures", "unread")
+    else:
+        take("offer", offer)
+        order = ("offer", "unread")
+    unread = [" ".join(str(x).split()) for x in meta.get("unread") or []]
+    if unread:
+        take("unread", _clause(" Some parts could not be read: ", unread, ".", used()))
+    body = head + "".join(parts.get(key, "") for key in order)
+    index = fit(CONTEXT_MAX - 1 - len(body) - len(tail)) if fit else ""
+    return body + index + tail
 
 
 def _now():
@@ -407,6 +648,8 @@ def _child(cmd, start, timeout):
                            errors="replace", timeout=budget, env=env)
     except subprocess.TimeoutExpired:
         return None, "timeout", LATE if budget < timeout else ""
+    finally:
+        _prune_daily()
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
     last = lines[-1] if lines else ""
     if last.startswith("FAIL\t"):
@@ -416,6 +659,41 @@ def _child(cmd, start, timeout):
     if r.returncode != 0 or out is None or out.name != "out.md" or not out.is_file():
         return None, "damaged", "conversion gave no output"
     return out.parent, "", ""
+
+
+def _detached(cmd):
+    """Starts cmd with no standard streams, in its own process group, and does not wait for it."""
+    if _windows():
+        kw = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        kw = {"start_new_session": True}
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    except OSError:
+        pass
+
+
+def _prune_daily():
+    """After a miss: a detached `read.py prune` when the "pruned" marker in the cache root is PRUNE_SECONDS old,
+    so the cache is pruned at most once a day off the Read's clock; a root without the marker only gets it."""
+    import time
+    from reader import cache
+    mark = cache.root() / "pruned"
+    try:
+        due = time.time() - mark.stat().st_mtime >= PRUNE_SECONDS
+    except OSError:
+        _touch(mark)
+        return
+    if due:
+        _touch(mark)
+        _detached([sys.executable, "-I", "-X", "utf8", str(READ_PY), "prune"])
+
+
+def _remember(mark, kind, detail):
+    """Keeps a timeout of the conversion's own budget in `mark`, so the next Read is denied at once; a timeout the
+    hook's remaining time caused (LATE) is not kept: the next Read has its full budget."""
+    if kind == "timeout" and detail != LATE:
+        _touch(mark, _why(kind, detail))
 
 
 def _meta(entry):
@@ -469,11 +747,16 @@ def _generic(event, path, start, timeout, command):
     repair = False
     venv = None if _windows() else pyenv.venv_dir("image")
     image, ocr = image_backend(venv), ocr_backend()
-    entry = cache.lookup(cache.key(path, image=image, ocr=ocr))
+    k = cache.key(path, image=image, ocr=ocr)
+    entry = cache.lookup(k)
     if entry is None and image.startswith("resvg-") and not pyenv.verify(venv, "image"):
         image, repair = "none", True  # the child works out "none" too: its own check fails the same way
-        entry = cache.lookup(cache.key(path, image=image, ocr=ocr))
+        k = cache.key(path, image=image, ocr=ocr)
+        entry = cache.lookup(k)
     if entry is None:
+        mark = cache.root() / "failed" / k
+        if _failed(mark) is not None:
+            return _deny(path, "timeout")
         # the child hashes the bytes itself: a file saved after this hash must not be filed under the key
         if command:
             cmd = command
@@ -485,10 +768,11 @@ def _generic(event, path, start, timeout, command):
         except OSError as e:  # the venv's interpreter could not be started
             entry, kind, detail = None, "damaged", f"internal error {type(e).__name__}"
         if entry is None:
+            _remember(mark, kind, detail)
             return _deny(path, kind, detail)
     out_md = entry / "out.md"
     if not out_md.is_file():
-        return _deny(path, "damaged", "cache entry vanished")
+        return _deny(path, "damaged", VANISHED)
     meta = _meta(entry)
     left = meta.get("figures_left")
     offer, mark = "", None
@@ -498,10 +782,11 @@ def _generic(event, path, start, timeout, command):
         mark = _offer_mark(event)
         if mark is not None and mark.exists():
             offer = ""
-    context = _context(_name(path), meta, out_md, offer=offer)
+    limit, window = _window(meta, event["tool_input"])
+    context = _context(path, meta, out_md, offer=offer, window=window)
     if offer and mark is not None and offer in context:
         _touch(mark)
-    return _allow(event, path, out_md, context)
+    return _allow(event, path, out_md, context, **limit)
 
 
 def mpp_reason(path):
@@ -541,8 +826,12 @@ def _mpp(event, path, start, timeout, command):
     engine = pyenv.engine(kind="mpp", venv=venv)
     if not engine:
         return _mpp_deny(path)
-    entry = cache.lookup(cache.key(path, engine))
+    k = cache.key(path, engine)
+    entry = cache.lookup(k)
     if entry is None:
+        mark = cache.root() / "failed" / k
+        if _failed(mark) is not None:
+            return _deny(path, "timeout")
         if not pyenv.verify(venv, "mpp"):  # a venv whose files changed after setup never runs
             return _mpp_deny(path)
         if command is not None:
@@ -557,11 +846,14 @@ def _mpp(event, path, start, timeout, command):
         if entry is None:
             if kind == "unsupported" and detail in ("", MPP_UNSUPPORTED):
                 return _mpp_deny(path)
+            _remember(mark, kind, detail)
             return _deny(path, kind, detail)
     out_md = entry / "out.md"
     if not out_md.is_file():
-        return _deny(path, "damaged", "cache entry vanished")
-    return _allow(event, path, out_md, _context(_name(path), _meta(entry), out_md))
+        return _deny(path, "damaged", VANISHED)
+    meta = _meta(entry)
+    limit, window = _window(meta, event["tool_input"])
+    return _allow(event, path, out_md, _context(path, meta, out_md, window=window), **limit)
 
 
 def parse_pages(v):
@@ -636,13 +928,15 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
     verified = []  # the venv's file check runs once, before the first pdfium child of this call
 
     def convert(key, pages=None):
-        """(entry, None), or (None, the hook's output: a deny or a pass-through)."""
+        """(entry, None), or (None, the hook's output: a deny or a pass-through), or for `pages` that start past
+        the pdf's end (None, None). A range entry that is partial is converted again; when that fails, the partial
+        entry is the result."""
         got = cache.lookup(key)
-        if got is not None:
+        if got is not None and not (pages and cache.partial(got)):
             return got, None
         fail = _failed(cache.root() / "failed" / key)
         if fail is not None:
-            return None, _pass(path, fail)
+            return got, None if got is not None else _pass(path, fail)
         if engine != "native" and not verified:
             verified.append(True)
             if not pyenv.verify(venv):
@@ -656,28 +950,36 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
         if pages:
             cmd += ["--pages", f"{pages[0]}-{pages[1]}"]
         try:
-            got, kind, detail = _child(cmd, start, timeout)
+            new, kind, detail = _child(cmd, start, timeout)
         except OSError as e:  # the interpreter could not be started
-            got, kind, detail = None, "damaged", f"internal error {type(e).__name__}"
-        if got is not None:
-            return got, None
-        if kind in DENY_KINDS:
+            new, kind, detail = None, "damaged", f"internal error {type(e).__name__}"
+        if new is not None:
+            return new, None
+        if pages and kind == "damaged" and detail.startswith(f"pages {pages[0]}-{pages[1]} past the end"):
+            return None, None
+        if kind in DENY_KINDS and got is None:
             return None, _deny(path, kind, detail)
         why = _why(kind, detail)
         if not (kind == "timeout" and detail == LATE):  # the next Read has its full budget: let it try again
             _touch(cache.root() / "failed" / key, why)
-        return None, _pass(path, why)
+        return got, None if got is not None else _pass(path, why)
 
+    rng = parse_pages(event["tool_input"].get("pages"))
+    ranged = False
+    if entry is None and rng is not None:
+        entry, result = convert(f"{k}-p{rng[0]}-{rng[1]}", rng)
+        if entry is None and result is not None:
+            return result
+        ranged = entry is not None
     if entry is None:
         entry, result = convert(k)
         if entry is None:
             return result
     if not (entry / "out.md").is_file():
-        return _pass(path, _why("damaged", "cache entry vanished"))
+        return _pass(path, _why("damaged", VANISHED))
     meta = _meta(entry)
-    rng = parse_pages(event["tool_input"].get("pages"))
     total = meta.get("pages_total")
-    past_end, at, drop = "", {}, ("pages",)  # fact F4a: updatedInput replaces the input, so pages can go
+    past_end, at, drop, upto, named = "", {}, ("pages",), None, ""  # fact F4a: updatedInput replaces the input, so pages can go
     if rng is not None and isinstance(total, int) and not isinstance(total, bool):
         a, b = rng
         if a > total:
@@ -686,32 +988,44 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
             b = min(b, total)
             if _all_unrendered(meta, a, b):
                 return None
-            drop = ("pages", "offset", "limit")  # the range decides what is read
+            drop = ("pages", "offset", "limit")
+            named = _span(a, b)
             index = page_index(meta)
-            if not index or b > max(p for p, _ in index):  # past the cut: convert that range alone, served whole
-                entry, result = convert(f"{k}-p{a}-{b}", (a, b))
-                if entry is None:
+            line = event["tool_input"].get("offset")
+            line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None
+            if not ranged and (not index or b > max(p for p, _ in index) or any(a <= p <= b for p in _pending(meta))):
+                got, result = convert(f"{k}-p{a}-{b}", (a, b))
+                if got is not None:
+                    if not (got / "out.md").is_file():
+                        return _pass(path, _why("damaged", VANISHED))
+                    entry, meta, ranged = got, _meta(got), True
+                    if _all_unrendered(meta, a, b):
+                        return None
+                elif not any(a <= p <= b for p, _ in index):
                     return result
-                if not (entry / "out.md").is_file():
-                    return _pass(path, _why("damaged", "cache entry vanished"))
-                meta = _meta(entry)
-                if _all_unrendered(meta, a, b):
-                    return None
+            if ranged:
+                upto = b
+                if line is not None:
+                    at["offset"] = line
             else:
                 first = next(((p, line) for p, line in index if p >= a), None)
                 if first is None or first[0] > b:  # none of the range was read: Claude's own Read reads it
                     return None
-                at["offset"] = first[1]
                 after = next((line for p, line in index if p > b), None)
+                inside = line is not None and first[1] <= line and (after is None or line < after)
+                at["offset"] = line if inside else first[1]
                 if after is not None:
-                    at["limit"] = after - first[1]
+                    at["limit"] = after - at["offset"]
     out_md = entry / "out.md"
     offer, mark = "", None
     if engine == "native" and not pyenv.forced_native() and not pyenv.declined():
         mark = _offer_mark(event)
         if mark is None or not mark.exists():
             offer = offer_text(venv, repair)
-    context = _context(_name(path), meta, out_md, past_end=past_end, offer=offer)
+    kept = {k: v for k, v in event["tool_input"].items() if k not in drop}
+    limit, window = _window(meta, {**kept, **{k: v for k, v in at.items() if k != "limit"}}, at.get("limit"), named)
+    at.update(limit)
+    context = _context(path, meta, out_md, past_end=past_end, offer=offer, upto=upto, window=window)
     if offer and mark is not None and offer in context:
         _touch(mark)
     return _allow(event, path, out_md, context, drop, **at)

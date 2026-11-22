@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import VERSION, convert
-from .limits import FIGURES_LATE, OCR_LATE
+from .limits import FIGURES_LATE, OCR_LATE, READ_BYTES, READ_TOKEN_BYTES, READ_TOKENS
 
 _counter = itertools.count()
 _lock = threading.Lock()
@@ -69,21 +69,79 @@ def _fallback() -> Path:
     return _private
 
 
+CODE = "code"  # the folder under the root that keeps code digests (code_digest)
+KEYS = "keys"  # the folder under the root that keeps document keys (key)
+
+
+def _is_hex(text: str) -> bool:
+    return len(text) == 40 and all(ch in "0123456789abcdef" for ch in text)
+
+
+def _memo_get(name: str, m: str) -> str | None:
+    try:
+        text = (root() / name / m[:2] / m).read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text if _is_hex(text) else None
+
+
+def _memo_put(name: str, m: str, value: str) -> None:
+    """Keeps `value` under memo id `m`, written atomically; a disk that cannot be written is no error."""
+    f = root() / name / m[:2] / m
+    with _lock:
+        n = next(_counter)
+    tmp = f.parent / f".tmp-{m}-{os.getpid()}-{n}"
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(value, encoding="ascii")
+        os.replace(tmp, f)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _sources(top: str) -> list:
+    """The *.py and *.json files under top as sorted (relative posix path, absolute path, size, mtime_ns)."""
+    found, dirs = [], [top]
+    while dirs:
+        with os.scandir(dirs.pop()) as it:
+            for e in it:
+                if e.is_dir(follow_symlinks=False):
+                    dirs.append(e.path)
+                elif os.path.splitext(e.name)[1] in (".py", ".json") and e.is_file():
+                    st = e.stat()
+                    found.append((os.path.relpath(e.path, top).replace(os.sep, "/"), e.path, st.st_size,
+                                  st.st_mtime_ns))
+    return sorted(found)
+
+
 def code_digest(base=None) -> str:
     """sha1 over the reader's own source (sorted relative paths and bytes, CRLF read as LF), so a code change
-    misses the cache; the installed package's digest is worked out once per process."""
+    misses the cache. Kept in the cache root under a hash of the folder and its files' (path, size, mtime) list,
+    and worked out again only when that list changes; the installed package's digest once per process."""
     global _code
     if base is None and _code is not None:
         return _code
-    top = Path(base) if base is not None else Path(__file__).resolve().parent
-    h = hashlib.sha1()
-    files = [f for f in top.rglob("*") if f.suffix in (".py", ".json") and f.is_file()]
-    for f in sorted(files, key=lambda q: q.relative_to(top).as_posix()):
-        h.update(f.relative_to(top).as_posix().encode("utf-8") + b"\0")
-        h.update(f.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    top = os.path.abspath(base if base is not None else os.path.dirname(os.path.abspath(__file__)))
+    files = _sources(top)
+    listing = hashlib.sha1(os.path.normcase(top).encode("utf-8", "replace") + b"\0")
+    for rel, _, size, mtime in files:
+        listing.update(f"{rel}\0{size}\0{mtime}\0".encode("utf-8", "replace"))
+    m = listing.hexdigest()
+    digest = _memo_get(CODE, m)
+    if digest is None:
+        h = hashlib.sha1()
+        for rel, path, _, _ in files:
+            h.update(rel.encode("utf-8") + b"\0")
+            with open(path, "rb") as f:
+                h.update(f.read().replace(b"\r\n", b"\n") + b"\0")
+        digest = h.hexdigest()
+        _memo_put(CODE, m, digest)
     if base is None:
-        _code = h.hexdigest()
-    return h.hexdigest()
+        _code = digest
+    return digest
 
 
 def key(path, engine: str = "", image: str = "", ocr: str = "") -> str:
@@ -98,10 +156,23 @@ def key(path, engine: str = "", image: str = "", ocr: str = "") -> str:
         h.update(b"image:" + image.encode() + b"\0")
     if ocr:
         h.update(b"ocr:" + ocr.encode("utf-8", "replace") + b"\0")
+    st = os.stat(path)
+    seen = (st.st_size, st.st_mtime_ns, st.st_ino)
+    memo = h.copy()
+    memo.update(b"file:" + os.path.normcase(os.path.abspath(path)).encode("utf-8", "surrogatepass") + b"\0"
+                + repr(seen).encode())
+    m = memo.hexdigest()
+    k = _memo_get(KEYS, m)
+    if k is not None:
+        return k
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
             h.update(chunk)
-    return h.hexdigest()
+        after = os.fstat(f.fileno())
+    k = h.hexdigest()
+    if (after.st_size, after.st_mtime_ns, after.st_ino) == seen:
+        _memo_put(KEYS, m, k)
+    return k
 
 
 def lookup(k: str):
@@ -119,14 +190,25 @@ def _complete(d: Path) -> bool:
     return (d / "out.md").is_file() and (d / "meta.json").is_file()
 
 
+def partial(d: Path) -> bool:
+    """True when the entry at d was filed partial (decision 4): the deadline cut its figures or OCR."""
+    import json
+    try:
+        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and meta.get("partial") is True
+
+
 FIGURES = "figures"  # the folder under the root that holds converted figures (Figures)
 _FIG_MAGIC = b"PHROFIG1"
 
 
 class Figures:
     """Converted figures, one file each at <dir>/<k[:2]>/<k>: the PNG (if any), the text lines and the figure's own
-    warnings. A read the deadline cut is not filed, but the figures it finished are kept here, so the next read
-    takes them and gets further. Figures cut by the time are never stored. Written atomically; prune clears them."""
+    warnings. A read the deadline cut is filed partial, and the figures it finished are kept here, so another read
+    of the same pictures takes them and gets further. Figures cut by the time are never stored. Written atomically;
+    prune clears them."""
 
     def __init__(self, dir: Path):
         self.dir = Path(dir)
@@ -200,8 +282,8 @@ OCR = "ocr"  # the folder under the root that holds per-picture OCR results (Ocr
 class OcrResults:
     """Per-picture OCR results, one JSON file each at <dir>/<k[:2]>/<k>, keyed by `ocr.picture_key`: the worker's
     answer fields (page, rules, unread, hint). The verdict is not stored: the Session judges a loaded result again,
-    so a calibrated threshold applies to it. A read the deadline cut keeps the pictures it finished here, so the
-    next read continues (decision 12). Written atomically; prune clears them as it does figures."""
+    so a calibrated threshold applies to it. A read the deadline cut keeps the pictures it finished here, so another
+    read of the same pictures continues (decision 12). Written atomically; prune clears them as it does figures."""
 
     def __init__(self, dir: Path):
         self.dir = Path(dir)
@@ -254,11 +336,13 @@ class OcrResults:
                 pass
 
 
-def store(k: str, src, hidden: bool = False, **opts) -> Path:
+def store(k: str, src, hidden: bool = False, again: bool = False, **opts) -> Path:
+    """Converts src into the entry for k and returns it; an entry already there is returned as is, or, with
+    `again`, put aside for the new one once that is done."""
     from . import images
     bucket = root() / k[:2]
     target = bucket / k
-    if _complete(target):
+    if _complete(target) and not again:
         return target
     with _lock:
         n = next(_counter)
@@ -272,11 +356,34 @@ def store(k: str, src, hidden: bool = False, **opts) -> Path:
         raise
     finally:
         images.FIGURE_CACHE = old
+    extra = {}
     if {FIGURES_LATE, OCR_LATE} & set(meta.get("warnings") or []):
-        # figures or OCR cut by the deadline, like a conversion that ran out of time: handed out from its temporary
-        # folder (prune clears it after a day) and never filed under k, so the next read converts again (and takes
-        # the figures and OCR results it finished from their own caches)
-        return tmp
+        extra["partial"] = True
+    if (tmp / "out.md").stat().st_size > min(READ_TOKENS * READ_TOKEN_BYTES, READ_BYTES):
+        lines = (tmp / "out.md").read_bytes().split(b"\n")
+        extra["line_bytes"] = [len(x) + 1 for x in (lines[:-1] if lines[-1] == b"" else lines)]
+    if extra:
+        import json
+        meta.update(extra)
+        (tmp / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    if again and target.exists():
+        old_dir = bucket / f".tmp-old-{k}-{os.getpid()}-{n}"
+        try:
+            os.replace(target, old_dir)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return target
+        try:
+            os.replace(tmp, target)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            try:
+                os.replace(old_dir, target)
+            except OSError:
+                pass
+            return target
+        shutil.rmtree(old_dir, ignore_errors=True)
+        return target
     for attempt in (0, 1):
         try:
             os.replace(tmp, target)
@@ -307,7 +414,7 @@ def prune(days: int = 30) -> int:
                     f.unlink()
             except OSError:
                 pass
-    for name in (FIGURES, OCR):
+    for name in (FIGURES, OCR, CODE, KEYS):
         # converted figures and OCR results: unused for `days` (a lookup touches them), or a writer's leftover
         # after a day
         files = base / name
@@ -325,7 +432,8 @@ def prune(days: int = 30) -> int:
                 except OSError:
                     pass
     for bucket in base.iterdir():
-        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined", FIGURES, OCR):
+        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined", FIGURES, OCR,
+                                                  CODE, KEYS):
             continue
         for d in bucket.iterdir():
             if d.name.startswith(".tmp-"):

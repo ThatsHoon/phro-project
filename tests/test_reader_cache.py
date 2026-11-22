@@ -25,6 +25,7 @@ from reader.limits import ReadError  # noqa: E402
 from reader.model import Context, Doc, Para, Text  # noqa: E402
 
 os.environ["PHRO_READER_OCR"] = "none"  # decision 8: OCR off, keys as before, except in the OCR id tests
+os.environ.setdefault("PHRO_READER_CACHE", tempfile.mkdtemp())
 
 READ = HERE / "scripts" / "read.py"
 STUB = "reader.formats._teststub"
@@ -419,10 +420,12 @@ def test_cache_key_holds_image_backend():
     assert r.returncode == 0 and Path(r.stdout.strip()).parent.name == cache.key(f, "native"), r.stdout
 
 
-def test_time_cut_figures_not_kept():
-    """A conversion whose figures the deadline cut is handed out, but not filed under its key: the next convert reads
-    the file again. Every other result is kept."""
-    from reader import limits
+def test_time_cut_is_filed_partial():
+    """Decision 4: a conversion whose figures or OCR the deadline cut is filed under its key with partial in its
+    meta. A convert by hand of a partial entry converts again and puts the new result in its place, partial while
+    the cut comes again and whole once it does not; a whole entry is returned as is. A whole result carries no
+    partial mark."""
+    from reader import limits, raster
     calls = []
     late = []
 
@@ -432,25 +435,37 @@ def test_time_cut_figures_not_kept():
         mod = sys.modules[STUB]
         plain = mod.parse
         mod.parse = lambda path, ctx: Doc(blocks=plain(path, ctx).blocks, warnings=list(late))
-        late.append(limits.FIGURES_LATE)
-        assert limits.FIGURES_LATE == "figures not rendered: time"
-        p = sample()
-        c1, o1 = cli("convert", str(p))
-        c2, o2 = cli("convert", str(p))
-        assert c1 == c2 == 0 and len(calls) == 2, (calls, o1, o2)
-        assert Path(o1.strip()).read_text() == "hello\n" and Path(o2.strip()).is_file()
-        from reader import raster
-        k = cache.key(p, image=raster.backend())
-        assert cache.lookup(k) is None and Path(o1.strip()).parent.name != k, o1
+        for cut in (limits.FIGURES_LATE, limits.OCR_LATE):
+            calls.clear()
+            late[:] = [cut]
+            p = sample(cut)
+            c1, o1 = cli("convert", str(p))
+            c2, o2 = cli("convert", str(p))
+            k = cache.key(p, image=raster.backend())
+            assert c1 == c2 == 0 and len(calls) == 2, (calls, o1, o2)
+            assert Path(o1.strip()).parent.name == k == Path(o2.strip()).parent.name, (o1, k)
+            meta = json.loads((Path(o1.strip()).parent / "meta.json").read_text(encoding="utf-8"))
+            assert meta["partial"] is True and cut in meta["warnings"], meta
+            late.clear()
+            c3, o3 = cli("convert", str(p))
+            c4, o4 = cli("convert", str(p))
+            assert c3 == c4 == 0 and len(calls) == 3 and o3 == o4 == o1, (calls, o3, o4)
+            meta = json.loads((Path(o3.strip()).parent / "meta.json").read_text(encoding="utf-8"))
+            assert "partial" not in meta and cut not in meta["warnings"], meta
+            assert [x.name for x in Path(o1.strip()).parent.parent.iterdir()] == [k], k
+            late[:] = [cut]
         late.clear()
-        c3, o3 = cli("convert", str(p))
-        c4, o4 = cli("convert", str(p))
-        assert c3 == c4 == 0 and len(calls) == 3 and Path(o3.strip()).parent.name == k == Path(o4.strip()).parent.name
+        q = sample("on time")
+        c3, o3 = cli("convert", str(q))
+        meta = json.loads((Path(o3.strip()).parent / "meta.json").read_text(encoding="utf-8"))
+        assert c3 == 0 and "partial" not in meta, meta
 
 
 def test_figure_cache_carries_a_cut_read_further():
     """A read the deadline cut keeps the figures it finished (PNG, lines, warnings) in the figure cache under the
-    cache root; the next read takes them from there and gets further. The cut document itself is still not filed."""
+    cache root. The cut document is filed partial; the next convert of it reads again, takes the finished figures
+    from the figure cache and gets further, until the entry is whole; another read of the same pictures (the hidden
+    variant here) takes them all from the figure cache."""
     from metafile_fix import wmf, wmf_text
     from reader import limits, raster
     from reader.model import Image
@@ -473,24 +488,19 @@ def test_figure_cache_carries_a_cut_read_further():
             p = sample()
             k = cache.key(p, image=read._image_id("_teststub"))
             done = []
-            for n in (6, 4, 2):  # each read converts two more; the ones before come from the figure cache
+            for n, args, name in ((6, (), k), (4, (), k), (2, (), k), (0, ("--hidden",), k + "-hidden")):
                 calls.clear()
                 left[0] = 2
-                code, o = cli("convert", str(p))
+                code, o = cli("convert", str(p), *args)
                 entry = Path(o.strip()).parent
                 meta = json.loads((entry / "meta.json").read_text(encoding="utf-8"))
                 md = (entry / "out.md").read_text(encoding="utf-8")
-                assert code == 0 and len(calls) == n, (len(calls), n, o)
+                assert code == 0 and len(calls) == n and entry.name == name, (len(calls), n, o)
                 done.append(meta["figures"])
                 assert all(f"Figure text: pic{i}" in md for i in range(6)), md
-                assert "figure text cut" in meta["warnings"], meta
-            assert done == [2, 4, 6], done
-            assert Path(o.strip()).parent.name == k and cache.lookup(k) is not None  # the whole read is filed
+                assert "figure text cut" in meta["warnings"] and (meta.get("partial") is True) == (len(done) < 3), meta
+            assert done == [2, 4, 6, 6], done
             assert (cache.root() / "figures").is_dir()
-            calls.clear()
-            left[0] = 0
-            code, o = cli("convert", str(p))  # filed: a cache hit, nothing converted
-            assert code == 0 and calls == [] and Path(o.strip()).parent.name == k
     finally:
         raster.convert = real
 
@@ -737,7 +747,7 @@ def test_store_replaces_incomplete_target():
 def test_cut_ocr_page_files_the_document():
     """M6: a lone TIFF page whose OCR outlasts the session is answered cut before the stop: the page is read, the
     conversion is filed under its document key, and the cut answer stays out of the per-picture cache. A page that
-    still goes late (a worker that runs past its `left`) keeps the conversion out of the document cache."""
+    still goes late (a worker that runs past its `left`) files the conversion partial."""
     if sys.platform != "win32":
         print("skip: test_cut_ocr_page_files_the_document (needs GDI+)")
         return
@@ -758,7 +768,7 @@ def test_cut_ocr_page_files_the_document():
                 finally:
                     os.environ.pop(raster.DEADLINE_ENV, None)
                 meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
-                assert (out.name == k) is honor, (honor, out.name, meta["warnings"])
+                assert out.name == k and (meta.get("partial") is True) is not honor, (honor, out.name, meta)
                 assert (meta["ocr"]["pages"] == 1) is honor, (honor, meta["ocr"])
                 assert (limits.OCR_LATE in meta["warnings"]) is not honor, (honor, meta["warnings"])
                 kept = [p for p in (cache.root() / cache.OCR).rglob("*") if p.is_file()]
@@ -810,15 +820,83 @@ def test_queued_ocr_pages_answer_before_the_stop():
 
 def test_cut_ocr_page_without_text_is_late():
     """N5: a page cut by the time before any page was read is late, not failed: the stop note shows and the
-    conversion is not filed under its document key."""
+    conversion is filed partial under its document key."""
     if sys.platform != "win32":
         print("skip: test_cut_ocr_page_without_text_is_late (needs GDI+)")
         return
     from reader import limits
     out, k, meta, text = _scan_store(1, {"answer": {"ok": False, "cut": True}}, 2)
-    assert out.name != k and limits.OCR_LATE in meta["warnings"], (out.name, meta["warnings"])
+    assert out.name == k and meta["partial"] is True and limits.OCR_LATE in meta["warnings"], (out.name, meta)
     assert meta["ocr"]["stopped_at"] == 1 and meta["ocr"]["failed"] == 0, meta["ocr"]
-    assert "(OCR stopped at page 1; read the file again to continue)" in text, text
+    assert "(OCR stopped at page 1 for the time; later scanned pages are shown as images)" in text, text
+
+
+def _memos(base, name):
+    d = base / name
+    return sorted(f for f in d.rglob("*") if f.is_file()) if d.is_dir() else []
+
+
+def test_code_digest_memo():
+    """The code digest is kept in the cache root under the sources' (path, size, mtime) list: the same list takes
+    the kept digest without reading a source; a source rewritten at the same size with a new mtime is read again."""
+    old = os.environ.get("PHRO_READER_CACHE")
+    root = tmp()
+    os.environ["PHRO_READER_CACHE"] = str(root)
+    try:
+        src = tmp()
+        (src / "a.py").write_text("x = 1\n")
+        (src / "sub").mkdir()
+        (src / "sub" / "b.json").write_text("{}")
+        d0 = cache.code_digest(src)
+        memos = _memos(root, "code")
+        assert len(memos) == 1 and memos[0].read_text(encoding="ascii") == d0, memos
+        memos[0].write_text("f" * 40, encoding="ascii")
+        assert cache.code_digest(src) == "f" * 40
+        f = src / "a.py"
+        st = f.stat()
+        f.write_text("x = 2\n")
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+        d1 = cache.code_digest(src)
+        assert d1 not in (d0, "f" * 40), d1
+        f.write_text("x = 1\n")
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 2 * 10 ** 9))
+        assert cache.code_digest(src) == d0
+        (src / "c.py").write_text("")
+        assert cache.code_digest(src) not in (d0, d1)
+    finally:
+        if old is None:
+            os.environ.pop("PHRO_READER_CACHE", None)
+        else:
+            os.environ["PHRO_READER_CACHE"] = old
+
+
+def test_key_memo_by_stat():
+    """A document whose (path, size, mtime) has a remembered key takes it without hashing the bytes; the key itself
+    stays the content hash, so new bytes at the same size with a new mtime give a new key. prune clears old memos."""
+    with stub():
+        p = sample("one")
+        k1 = cache.key(p)
+        root = cache.root()
+        assert len(_memos(root, "keys")) == 1
+        st = os.stat(p)
+        p.write_text("two")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert cache.key(p) == k1
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+        k2 = cache.key(p)
+        q = tmp() / "b.txtx"
+        q.write_text("two")
+        assert k2 != k1 and k2 == cache.key(q), (k1, k2)
+        assert cache.key(p, "native") != k2
+        p.write_text("one")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 2 * 10 ** 9))
+        assert cache.key(p) == k1
+        memos = _memos(root, "keys") + _memos(root, "code")
+        assert len(memos) >= 5, memos
+        for f in memos[:2]:
+            os.utime(f, (time.time() - 40 * 86400,) * 2)
+        assert cache.prune(30) >= 2
+        assert all(f.exists() == (i >= 2) for i, f in enumerate(memos)), memos
 
 
 def main():

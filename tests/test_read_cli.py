@@ -32,6 +32,17 @@ def tmp():
     return Path(tempfile.mkdtemp())
 
 
+def test_convert_takes_a_file_uri():
+    assert read.source("d/a b.docx") == "d/a b.docx"
+    assert read.source("file:///C:/d:/a.docx") in ("file:///C:/d:/a.docx", "/C:/d:/a.docx")
+    assert read.source("file:d/it%27s%20%24%28x%29.docx") == os.path.join("d", "it's $(x).docx")
+    if os.name == "nt":
+        assert read.source("file:///C:/d/John%27s%20report.docx") == "C:\\d\\John's report.docx"
+        assert read.source("file://host/d/a%27.docx") == "\\\\host\\d\\a'.docx"
+    else:
+        assert read.source("file:///d/it%27s.docx") == "/d/it's.docx"
+
+
 def test_internal_error_keeps_document_text_out():
     def boom(src):
         raise RuntimeError("line 3 of the document: account 1234")
@@ -238,7 +249,7 @@ def test_tiff_late_pages_are_images():
         return
     with stub_engine(deadline=limits.FIGURE_RESERVE + 2, delay=30, answer=words("Alpha beta")):
         text, meta = convert(tiff_file(pages(2)))
-    assert text.startswith("(OCR stopped at page 1; read the file again to continue)\n\n"), text
+    assert text.startswith("(OCR stopped at page 1 for the time; later scanned pages are shown as images)\n\n"), text
     assert SCANNED not in text and "page 1" in text and "page 2" in text, text  # the pages as today, past the time
     assert meta["ocr"] == {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": 1, "pictures_left": 0,
                            "pictures_doubtful": 0, "pictures_blank": 0}, meta
@@ -300,7 +311,7 @@ def test_tiff_crop_is_gray_from_the_read_pixels():
     assert "![Picture on page 1](assets/img-001.png)" in text, text
 
 
-def test_late_conversion_not_filed():
+def test_late_conversion_filed_partial():
     from reader import cache
     path = docx(png(80, 80))
     with stub_engine(deadline=limits.FIGURE_RESERVE + 2, delay=30, answer=words("Hello world")):
@@ -309,7 +320,7 @@ def test_late_conversion_not_filed():
         filed = cache.lookup(k)
         meta = json.loads((got / "meta.json").read_text(encoding="utf-8"))
         text = (got / "out.md").read_text(encoding="utf-8")
-    assert got.name.startswith(".tmp-") and filed is None, (got, filed)
+    assert got.name == k and filed == got and meta["partial"] is True, (got, filed, meta)
     assert limits.OCR_LATE in meta["warnings"] and limits.FIGURES_LATE not in meta["warnings"], meta
     assert meta["ocr"]["pictures_left"] == 1, meta
     assert text.startswith("(OCR stopped; 1 picture not read)\n\n"), text
