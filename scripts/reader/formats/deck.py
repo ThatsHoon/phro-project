@@ -1,17 +1,18 @@
 """What the slide readers (pptx, ppt, odp, Keynote) share: the reading order of a slide's shapes, and the content
 the masters, layouts and footers put on more than one slide.
 
-`order` is a recursive XY-cut over the shapes' boxes. A set of boxes is split in two at its widest gap, between rows
+`Order` reads a document's slides: calling it is a recursive XY-cut over one set of shapes' boxes. A set of boxes is split in two at its widest gap, between rows
 (a cut across y) or between columns (a cut across x), rows on a tie, and each part is read the same way; a set with no
-gap reads by (top, left). A box counts from a quarter of the smallest height (width) in the set in from each edge, so
+gap reads by (top, left), and so does one
+whose only cut is between columns that overlap. A box counts from a quarter of the smallest height (width) in the set in from each edge, so
 two rows (columns) that overlap by less than half the smallest box still part, a row whose boxes sit a fraction of a
 line off is one row, and a small box at the edge of a large one does not cut it.
 A shape with no box keeps its place in the source: it goes just before the first read of the boxed shapes that follow
-it, or last. The work (boxes sorted, summed over every split) stops at XYCUT_WORK; the sets left then read by (top,
-left).
+it, or last. The work (boxes sorted, summed over every split of every call) stops at XYCUT_WORK, one budget a
+document; the sets left then read by (top, left).
 
 `Repeated` gathers what each slide shows from its master, layout and footer, keyed by what it shows (text, pictures by
-their bytes). `place` puts an item one slide shows on that slide, after its own blocks, and writes the items several
+their bytes); the key of one list of blocks is worked out once, however many slides show it. `place` puts an item one slide shows on that slide, after its own blocks, and writes the items several
 slides show once, before the slides, under one `Section("repeated")` per set of slides: "every slide" when it is all
 of them, else the slide numbers ("slides 2-4, 7"). A set whose slides are all hidden is hidden.
 """
@@ -50,31 +51,37 @@ def _part(ids, boxes, axis):
     return best[0], [s[4] for s in spans[:k]], [s[4] for s in spans[k:]]
 
 
-def order(boxes) -> list:
-    """The indexes of `boxes` ((x0, y0, x1, y1) each, or None) in reading order."""
-    norm = {i: (min(b[0], b[2]), min(b[1], b[3]), max(b[0], b[2]), max(b[1], b[3]))
-            for i, b in enumerate(boxes) if b is not None}
-    seq, work, stack = [], limits.XYCUT_WORK, [list(norm)]
-    while stack:
-        ids = stack.pop()
-        cut = None
-        if len(ids) > 1 and work >= len(ids):
-            work -= len(ids)
-            rows, cols = _part(ids, norm, 1), _part(ids, norm, 0)
-            cut = rows if cols is None or (rows is not None and rows[0] >= cols[0]) else cols
-        if cut is None:
-            seq.extend(sorted(ids, key=lambda i: (norm[i][1], norm[i][0], i)))
-        else:
-            stack += [cut[2], cut[1]]
-    rank = {i: r for r, i in enumerate(seq)}
-    keys, ahead = [], len(seq)
-    for i in range(len(boxes) - 1, -1, -1):
-        if i in rank:
-            ahead = min(ahead, rank[i])
-            keys.append((rank[i], 1, i))
-        else:
-            keys.append((ahead, 0, i))
-    return [i for *_, i in sorted(keys)]
+class Order:
+    def __init__(self):
+        self.left = limits.XYCUT_WORK
+
+    def __call__(self, boxes) -> list:
+        """The indexes of `boxes` ((x0, y0, x1, y1) each, or None) in reading order."""
+        norm = {i: (min(b[0], b[2]), min(b[1], b[3]), max(b[0], b[2]), max(b[1], b[3]))
+                for i, b in enumerate(boxes) if b is not None}
+        seq, stack = [], [list(norm)]
+        while stack:
+            ids = stack.pop()
+            cut = None
+            if len(ids) > 1 and self.left >= len(ids):
+                self.left -= len(ids)
+                rows, cols = _part(ids, norm, 1), _part(ids, norm, 0)
+                cut = rows if cols is None or (rows is not None and rows[0] >= cols[0]) else cols
+                if rows is None and cut is not None and cut[0] < 0:
+                    cut = None
+            if cut is None:
+                seq.extend(sorted(ids, key=lambda i: (norm[i][1], norm[i][0], i)))
+            else:
+                stack += [cut[2], cut[1]]
+        rank = {i: r for r, i in enumerate(seq)}
+        keys, ahead = [], len(seq)
+        for i in range(len(boxes) - 1, -1, -1):
+            if i in rank:
+                ahead = min(ahead, rank[i])
+                keys.append((rank[i], 1, i))
+            else:
+                keys.append((ahead, 0, i))
+        return [i for *_, i in sorted(keys)]
 
 
 def _text(inlines) -> bool:
@@ -142,11 +149,15 @@ def _span(numbers) -> str:
 class Repeated:
     def __init__(self):
         self.items = {}
+        self.keys = {}
 
     def add(self, number, blocks):
         """One item `number`'s slide shows from its master, layout or footer."""
         if blocks:
-            self.items.setdefault(_key(blocks), (blocks, set()))[1].add(number)
+            known = self.keys.get(id(blocks))
+            if known is None:
+                known = self.keys[id(blocks)] = (blocks, _key(blocks))
+            self.items.setdefault(known[1], (blocks, set()))[1].add(number)
 
     def place(self, slides: list) -> list:
         """Put the items on `slides` (their Sections): the Sections that go before them."""

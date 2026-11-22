@@ -5,6 +5,7 @@ Run: python -I -X utf8 tests/test_reader_ppt_shapes.py
 import struct
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -13,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader import limits, markdown, officeart  # noqa: E402
-from reader.formats import ppt_shapes  # noqa: E402
+from reader.formats import deck, ppt_shapes  # noqa: E402
 from reader.model import Code, Context, Table  # noqa: E402
 from diagram_fix import mermaid_ok  # noqa: E402
 from reader_fix import (make_ppt, oa_container, oa_group, oa_record, oa_shape, oa_solver,  # noqa: E402
@@ -190,6 +191,15 @@ def test_hyperlink_wraps_its_text():
     assert not ctx.skipped, ctx.skipped
 
 
+def test_many_field_marks_in_one_text_stay_linear():
+    n = 200_000
+    item = ["text", 4, "ab" * n, None, [], list(range(0, 2 * n, 2))]
+    t = time.perf_counter()
+    out = ppt_shapes.text_blocks([item], ppt_shapes.Walk(Context()))
+    assert time.perf_counter() - t < 8, time.perf_counter() - t
+    assert out[0][2] == "b" * n
+
+
 def slide_with_refs(*refs):
     """A slide whose outline holds two runs (Alpha body, Beta tail) and whose shapes refer to the given indexes."""
     return {"title": "Head", "body": ["Alpha body"], "extra": [(1, "Beta tail")], "outline": True,
@@ -221,7 +231,7 @@ def test_unanchored_member_does_not_pull_group_union():
     group = {"kind": "group", "children": [{"text": "free member"}, text("g low", (0, 500, 100, 550)),
                                            text("g high", (0, 400, 100, 450))]}
     sibling = text("sibling", (0, 300, 100, 350))
-    shapes = ppt_shapes.ordered(walked([group, sibling]))
+    shapes = ppt_shapes.ordered(walked([group, sibling]), deck.Order())
     union = next(s for s in shapes if s.kind == "group")
     assert (union.top, union.left, union.bottom, union.right) == (400, 0, 550, 100), vars(union)
     out, _ = md([{"shapes": [group, sibling]}])

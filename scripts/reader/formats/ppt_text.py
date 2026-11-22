@@ -11,6 +11,7 @@ TextMasterStyleAtom of its text type ([MS-PPT] 2.9.35: cLevels u16, then per lev
 on, a TextPFException and a TextCFException), read by `master_levels`.
 """
 import bisect
+import heapq
 import struct
 
 from ..model import Bold, Break, Link, ListItem, Para, Text
@@ -158,16 +159,35 @@ def _inlines(text: str, lo: int, hi: int, bold: list) -> list:
     return flat
 
 
-def _clicked(text: str, lo: int, hi: int, bold: list, links) -> list:
-    """The inlines of text[lo:hi] with each clicked range (begin, end, url, jump) of `links` inside its Link and its
-    jump after it, `(→ next slide)`."""
-    cuts = sorted({lo, hi} | {p for b, e, _, _ in links for p in (b, e) if lo < p < hi})
-    out = []
-    for a, b in zip(cuts, cuts[1:]):
+def _pieces(links) -> list:
+    """The clicked ranges (begin, end, url, jump) as (begin, end, range) pieces in text order that do not overlap:
+    where ranges overlap, the first one given has the piece."""
+    marks = sorted({p for b, e, _, _ in links for p in (b, e)})
+    starts = sorted(range(len(links)), key=lambda k: links[k][0])
+    out, live, at = [], [], 0
+    for a, b in zip(marks, marks[1:]):
+        while at < len(starts) and links[starts[at]][0] <= a:
+            heapq.heappush(live, starts[at])
+            at += 1
+        while live and links[live[0]][1] < b:
+            heapq.heappop(live)
+        if live:
+            out.append((a, b, links[live[0]]))
+    return out
+
+
+def _clicked(text: str, lo: int, hi: int, bold: list, pieces, begins) -> list:
+    """The inlines of text[lo:hi] with each piece of `pieces` (`_pieces`, `begins` their begins) inside its range's
+    Link and the range's jump after its end, `(→ next slide)`."""
+    out, at = [], lo
+    for k in range(max(bisect.bisect_right(begins, lo) - 1, 0), bisect.bisect_left(begins, hi)):
+        a, b, hit = max(pieces[k][0], lo), min(pieces[k][1], hi), pieces[k][2]
+        if b <= a:
+            continue
+        out.extend(_inlines(text, at, a, bold))
+        at = b
         inl = _inlines(text, a, b, bold)
-        hit = next((k for k in links if k[0] <= a and b <= k[1]), None)
-        if not inl or hit is None:
-            out.extend(inl)
+        if not inl:
             continue
         if hit[2]:
             out.append(Link(hit[2], inl))
@@ -175,6 +195,7 @@ def _clicked(text: str, lo: int, hi: int, bold: list, links) -> list:
             out.extend(inl)
         if hit[3] and b == min(hit[1], hi):
             out.append(Text(f" (→ {hit[3]})"))
+    out.extend(_inlines(text, at, hi, bold))
     return out
 
 
@@ -192,11 +213,12 @@ def blocks(text: str, style: bytes | None, ctx=None, levels=(), links=()) -> lis
             starts, props, bold = [0], [(None, 0)], []
             if ctx is not None:
                 ctx.skipped["record"] += 1
-    links = [k for k in links if k[2] or k[3]]
+    pieces = _pieces([k for k in links if k[2] or k[3]])
+    begins = [p[0] for p in pieces]
     out, at = [], 0
     for para in text.split("\r"):
         end = at + len(para)
-        inl = _clicked(text, at, end, bold, links) if links else _inlines(text, at, end, bold)
+        inl = _clicked(text, at, end, bold, pieces, begins) if pieces else _inlines(text, at, end, bold)
         if inl:
             bullet, indent = props[max(bisect.bisect_right(starts, at) - 1, 0)]
             if bullet is None:

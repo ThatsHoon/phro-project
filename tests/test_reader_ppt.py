@@ -5,6 +5,7 @@ Run: python -I -X utf8 tests/test_reader_ppt.py
 import struct
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -13,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import reader  # noqa: E402
 from reader import markdown  # noqa: E402
-from reader.formats import ppt_text  # noqa: E402
+from reader.formats import ppt_shapes, ppt_text  # noqa: E402
+from reader.model import Link, Para  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
 from reader_fix import make_cfb, make_ppt  # noqa: E402
@@ -329,6 +331,51 @@ def test_bullet_levels_inherit_from_the_master():
     plain, _ = md([{"shapes": shapes}])
     assert plain == "## Slide 1: T\n\nGrow revenue\n\nEnterprise deals\n\n- Plain line\n\nAside\n", repr(plain)
     assert not ctx.skipped, ctx.skipped
+
+
+def test_title_slide_footer_left_out_when_the_document_omits_it():
+    slides = [{"title": "One"}, {"title": "Two", "layout": 1}, {"title": "Three", "layout": 1}]
+    out, ctx = md(slides, master={"footer": "Board 2026", "omit_title": True})
+    assert out == "## On slides 2-3\n\nBoard 2026\n\n## Slide 1: One\n\n## Slide 2: Two\n\n## Slide 3: Three\n", repr(out)
+    kept, _ = md(slides, master={"footer": "Board 2026"})
+    assert kept.startswith("## On every slide\n\nBoard 2026\n"), repr(kept)
+
+
+def test_failed_slide_does_not_leave_its_bullets_to_the_notes():
+    aside = {"text": "Aside", "text_kind": 4, "indents": [(0,)], "box": (0, 400, 500, 450)}
+    slides = [{"title": "One"}, {"shapes": [{"text": "BOOM", "text_kind": 4, "box": (0, 0, 500, 50)}]}]
+    real = ppt_shapes.ordered
+
+    def failing(shapes, order):
+        if any(run[2] == "BOOM" for s in shapes for run in s.runs):
+            raise ValueError("boom")
+        return real(shapes, order)
+
+    ppt_shapes.ordered = failing
+    try:
+        out, ctx = md(slides, master={"styles": {4: [True]}}, notes={1: {"shapes": [aside]}})
+    finally:
+        ppt_shapes.ordered = real
+    assert "> Notes: Aside" in out and "- Aside" not in out, out
+    assert ctx.skipped["slide"] == 1, ctx.skipped
+
+
+def test_many_clicked_ranges_stay_linear():
+    n = 8000
+    links = [(2 * k, 2 * k + 1, f"https://example.com/{k}", "") for k in range(n)]
+    t = time.perf_counter()
+    out = ppt_text.blocks("a\r" * n, None, None, (), links)
+    assert time.perf_counter() - t < 6, time.perf_counter() - t
+    assert len(out) == n and all(isinstance(b, Para) and isinstance(b.inlines[0], Link) for b in out), out[:2]
+    assert out[5].inlines[0].url == "https://example.com/5"
+
+
+def test_overlapping_clicked_ranges_first_one_wins():
+    links = [(2, 6, "https://example.com/a", ""), (0, 8, "https://example.com/b", "next slide")]
+    out = ppt_text.blocks("01234567", None, None, (), links)
+    got = [(i.url, "".join(t.text for t in i.inlines)) if isinstance(i, Link) else i.text for i in out[0].inlines]
+    assert got == [("https://example.com/b", "01"), ("https://example.com/a", "2345"),
+                   ("https://example.com/b", "67"), " (→ next slide)"], got
 
 
 def test_notes_from_every_text_shape_of_the_notes_page():

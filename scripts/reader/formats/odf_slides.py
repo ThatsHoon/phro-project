@@ -1,6 +1,6 @@
 """OpenDocument presentations (.odp): one slide section per draw:page, shapes in reading order.
 
-The shapes read in `deck.order` over their svg boxes (x, y, width, height; a line's or connector's two ends); a group
+The shapes read in `deck.Order` over their svg boxes (x, y, width, height; a line's or connector's two ends); a group
 or a draw:a is one unit, at the union of its members' boxes, its members ordered inside it. Each slide is one diagram
 scope: its shapes and connectors (groups flattened) go to `diagram.Diagram` through `odf_base.register`; titles are
 registered without a slot.
@@ -57,6 +57,7 @@ class _Slides:
     def __init__(self, body):
         self.body = body
         self.budget = diagram.ConnectionBudget(body.ctx)  # the deck's edges, shared by every slide's diagram
+        self.order = deck.Order()
         self.numbers = {}
         self.masters = {}
 
@@ -76,12 +77,11 @@ class _Slides:
                 out.append((_box(el), (el, link)))
         return out
 
-    @staticmethod
-    def read(units):
-        for i in deck.order([b for b, _ in units]):
+    def read(self, units):
+        for i in self.order([b for b, _ in units]):
             item = units[i][1]
             if isinstance(item, list):
-                yield from _Slides.read(item)
+                yield from self.read(item)
             else:
                 yield item
 

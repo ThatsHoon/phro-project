@@ -5,8 +5,8 @@ Comments (legacy `p:cm`, modern `p188:cm` with replies) become the Section's `co
 A placeholder with no box of its own takes its layout's (by idx, then type), then its master's. A paragraph's bullet
 comes from the first of its own pPr, its shape's lstStyle, its layout's and master's placeholder lstStyle and the
 master's txStyles (title, body or other) that names one; `buNone` there makes it a paragraph.
-The shapes read in `deck.order` over their boxes, a group's members inside the group. The notes are every shape of the
-notes page but its slide image, number, date, header and footer placeholders. What is not a placeholder on the master
+The shapes read in `deck.Order` over their boxes, a group's members inside the group. The notes are every shape of the
+notes page, its pictures too, but its slide image, number, date, header and footer placeholders. What is not a placeholder on the master
 and the layout (unless the slide or the layout sets showMasterSp="0"), and the slide's footer and header text, go to
 `deck.Repeated`. A shape's or picture's a:hlinkClick wraps its text in the link (an external URL) or follows it as
 `(→ Slide 2)` (a slide or show jump); a textless one is named (its action button, its alt text) on a line of its own.
@@ -88,16 +88,16 @@ def _box_of(entry):
     return (min(b[0] for b in got), min(b[1] for b in got), max(b[2] for b in got), max(b[3] for b in got))
 
 
-def _reading_order(out) -> list:
-    """(key, blocks) of the walked (box, key, blocks, members) entries in `deck.order`, a group's members read in
+def _reading_order(out, order) -> list:
+    """(key, blocks) of the walked (box, key, blocks, members) entries in `deck.Order`, a group's members read in
     the group's place."""
     got = []
-    for i in deck.order([_box_of(e) for e in out]):
+    for i in order([_box_of(e) for e in out]):
         _, key, blocks, members = out[i]
         if members is None:
             got.append((key, blocks))
         else:
-            got.extend(_reading_order(members))
+            got.extend(_reading_order(members, order))
     return got
 
 
@@ -143,6 +143,7 @@ class _Reader:
         self.furniture = {}
         self.numbers = {}
         self.repeated = deck.Repeated()
+        self.order = deck.Order()
         self.budget = diagram.ConnectionBudget(ctx)  # the deck's edges, shared by every slide's diagram
         self.dia = None    # the current slide's diagram
         self.keys = set()  # the current slide's diagram keys given out so far
@@ -205,7 +206,7 @@ class _Reader:
         self.dia, self.keys = diagram.Diagram(self.ctx, self.budget), set()
         if tree is not None:
             self.walk(tree, Xf(), 0, False, out, titles)
-        slots = _reading_order(out)
+        slots = _reading_order(out, self.order)
         flow = [b for _, blocks in slots for b in blocks]
         with self.ctx.guard("shape"):
             flow = self.dia.place(slots)
@@ -366,7 +367,7 @@ class _Reader:
                     out = []
                     if tree is not None:
                         self.walk(tree, Xf(), 0, False, out, [])
-                    self.furniture[part.name] = [blocks for _, blocks in _reading_order(out)]
+                    self.furniture[part.name] = [blocks for _, blocks in _reading_order(out, self.order)]
             except ReadError as e:
                 if e.kind not in ("damaged", "too_large"):
                     raise
@@ -392,7 +393,7 @@ class _Reader:
                     out = []
                     if tree is not None:
                         self.walk(tree, Xf(), 0, False, out, [])
-                    return [b for _, blocks in _reading_order(out) for b in blocks if not isinstance(b, Image)]
+                    return [b for _, blocks in _reading_order(out, self.order) for b in blocks]
             except ReadError as e:  # a member of an open package: any kind but a timeout skips this part
                 if e.kind == "timeout":
                     raise

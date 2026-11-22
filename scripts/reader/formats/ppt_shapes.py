@@ -11,7 +11,7 @@ an axis its FSP flips) and the opposite corner, mapped like its box; the drawing
 A shape's mouse-click InteractiveInfoAtom (in its ClientData) is its `click`; in a ClientTextbox one followed by a
 TextInteractiveInfoAtom clicks that range of the text before it; the character a slide number, date, header or
 footer MetaCharAtom marks is a field and is dropped. `Walk.link` turns a click into (URL, jump words) and
-`Walk.styles` holds the master's bullets by text type for the text being read. The shapes read in `deck.order` over
+`Walk.styles` holds the master's bullets by text type for the text being read. The shapes read in `deck.Order` over
 their anchors, a group's members inside the group.
 
 Hostile input: every record is bounded by `officeart.records`, the walk is iterative, groups nest `MAX_GROUPS` deep
@@ -54,6 +54,7 @@ class Walk:
         self.slots = limits.GRID_SLOTS
         self.styles = {}
         self.link = lambda click: ("", "")
+        self.order = deck.Order()
 
     def spend(self) -> bool:
         self.records -= 1
@@ -141,10 +142,11 @@ def text_blocks(items, walk):
         walk.chars -= len(item[2])
         if walk.chars < 0:
             raise ValueError("text budget")
-        text = item[2]
+        chars = list(item[2])
         for at in item[5]:
-            if at < len(text):
-                text = text[:at] + "\x00" + text[at + 1:]
+            if at < len(chars):
+                chars[at] = "\x00"
+        text = "".join(chars)
         links = [(b, e, *walk.link(c)) for b, e, c in item[4]]
         blocks = ppt_text.blocks(text, item[3], walk.ctx, _levels(walk.styles, item[1]), links)
         plain = text.replace("\x00", "").replace("\x0b", " ").replace("\r", " ")
@@ -157,7 +159,9 @@ class Shape:
     """One shape in slide coordinates. `runs` holds the shape's text as (TextHeaderAtom type, blocks, plain text);
     `blocks` is the blocks of those runs (or a table's one Table). `text_ref` is the OutlineTextRefAtom index, `pib`
     the picture's BStore index and `ole_ref` the ExObjRefAtom id; `anchored` is false when the shape had no anchor
-    (a group with none gets it from `ordered` when a member has one)."""
+    (a group with none gets it from `ordered` when a member has one). `ends` is a connector's or line's (start, end)
+    points, None for another shape or no anchor; `click` its mouse-click (exHyperlinkIdRef, action, jump,
+    hyperlinkType)."""
     kind: str
     top: float = 0.0
     left: float = 0.0
@@ -175,8 +179,8 @@ class Shape:
     stype: int = 0
     table: bool = False
     arrows: tuple = (False, False)
-    ends: tuple | None = None  # a connector's or line's (start, end) points; None for another shape or no anchor
-    click: tuple | None = None  # its mouse-click (exHyperlinkIdRef, action, jump, hyperlinkType)
+    ends: tuple | None = None
+    click: tuple | None = None
 
 
 class _Raw:
@@ -463,15 +467,15 @@ def _table(group: Shape, budget: Walk):
     group.children = []
 
 
-def ordered(shapes: list) -> list:
-    """`shapes` in `deck.order` over their anchors; a group sits where its anchored members are (their union; its own
+def ordered(shapes: list, order) -> list:
+    """`shapes` in `order` (a `deck.Order`) over their anchors; a group sits where its anchored members are (their union; its own
     anchor when none is anchored) and its members are ordered inside it. A shape with no anchor, and a group with no
     anchor and no anchored member, keeps its record place; it does not pull a group's union to 0."""
     boxes = []
     for s in shapes:
         box = (s.left, s.top, s.right, s.bottom) if s.anchored else None
         if s.kind == "group" and s.children:
-            s.children = ordered(s.children)
+            s.children = ordered(s.children, order)
             placed = [c for c in s.children if c.anchored]
             if placed:
                 box = (min(c.left for c in placed), min(c.top for c in placed),
@@ -480,7 +484,7 @@ def ordered(shapes: list) -> list:
                     s.left, s.top, s.right, s.bottom = box
                     s.anchored = True
         boxes.append(box)
-    return [shapes[i] for i in deck.order(boxes)]
+    return [shapes[i] for i in order(boxes)]
 
 
 def flatten(shapes: list):

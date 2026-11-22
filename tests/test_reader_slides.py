@@ -751,6 +751,17 @@ def test_notes_from_every_text_shape_of_the_notes_page():
     assert "77" not in out and "hdr text" not in out, out
 
 
+def test_notes_page_picture_is_kept():
+    pic = ('<p:pic><p:nvPicPr><p:cNvPr id="5" name="p"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>'
+           '<p:blipFill><a:blip r:embed="rI"/></p:blipFill><p:spPr/></p:pic>')
+    d = deck([sp("t", "title")], notes={1: sp("body note", "body", id=3) + pic},
+             extra={"ppt/notesSlides/_rels/notesSlide1.xml.rels": rels_xml([("rI", "image", "../media/i.png")]),
+                    "ppt/media/i.png": PNG})
+    doc, ctx = parse(d)
+    out = markdown.render(doc, tmp() / "assets")
+    assert "> Notes: body note" in out and "![](assets/img-001.png)" in out and not ctx.skipped, (out, ctx.skipped)
+
+
 def test_master_layout_and_footer_content_is_written_once():
     logo = ('<p:pic><p:nvPicPr><p:cNvPr id="9" name="logo" descr="logo"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>'
             '<p:blipFill><a:blip r:embed="rI"/></p:blipFill><p:spPr/></p:pic>')

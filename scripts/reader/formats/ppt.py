@@ -14,7 +14,8 @@ out. A notes page gives every shape's text and pictures but its slide image and 
 The master a SlideAtom's masterIdRef names (a title master's own master behind it) gives the slide's text the bullets
 of its TextMasterStyleAtoms by text type and indent level, and, when the SlideAtom's fMasterObjects is set, the
 shapes on it that are not placeholders. Those, the text of the slide's footer and header placeholders and the footer
-of its HeadersFooters (the slide's own, else the document's slide one, when fHasFooter is set) go to `deck.Repeated`:
+of its HeadersFooters (the slide's own, else the document's slide one, when fHasFooter is set; not on a title slide
+when the DocumentAtom's fOmitTitlePlace is set) go to `deck.Repeated`:
 written once, on the slide when only one shows it. A click (InteractiveInfoAtom) on a shape or a text range is a link
 to its ExHyperlink's URL or the words of its jump ("Slide 2", "next slide", "macro"); a shape's click on text wraps the
 text, else a line of its label follows: an action button's ("Next button"), a picture's or object's "Picture", or
@@ -83,6 +84,7 @@ class Presentation:
         self.pictures = ppt_pictures.Pictures(self.doc, self._dgg(), pictures, flate.Budget(), ctx)
         self.objects = ppt_objects.Objects(self.doc, self.persist, flate.Budget(), sheet_grid.Budget(), ctx)
         self.links, self.media, self.hf = {}, {}, (0, "")
+        self.omit_title = False
         self.numbers, self.masters, self.master_of = {}, {}, {}
         self.repeated = deck.Repeated()
         self._index()
@@ -134,6 +136,8 @@ class Presentation:
         for _, inst, typ, body, size in self._children(span[0], span[1] - span[0]):
             if typ == rec.HEADERS_FOOTERS and inst == 3:
                 self.hf = self._hf(body, size)
+            elif typ == rec.DOCUMENT_ATOM and size >= 38:
+                self.omit_title = bool(self.doc[body + 37])
             if typ != rec.EX_OBJ_LIST:
                 continue
             for _, _, t, b, sz in self._children(body, size):
@@ -206,12 +210,14 @@ class Presentation:
                     items.extend(shapes)
             if drawing is not None:
                 saved, self.walk.styles = self.walk.styles, styles
-                with self.ctx.guard("master"):
-                    by_key = {}
-                    for _, blocks, _, key in self._drawn(drawing, [], _PLACEHOLDERS)[0]:
-                        by_key.setdefault(key, []).extend(blocks)
-                    items.extend(b for b in by_key.values() if b)
-                self.walk.styles = saved
+                try:
+                    with self.ctx.guard("master"):
+                        by_key = {}
+                        for _, blocks, _, key in self._drawn(drawing, [], _PLACEHOLDERS)[0]:
+                            by_key.setdefault(key, []).extend(blocks)
+                        items.extend(b for b in by_key.values() if b)
+                finally:
+                    self.walk.styles = saved
         self.master_of[sid] = (styles, items)
         return styles, items
 
@@ -277,7 +283,7 @@ class Presentation:
         glue, keys = {}, set()
         for a, b, c in rules:  # spidC -> (spidA, spidB); the first rule naming a connector wins
             glue.setdefault(c, (a, b))
-        for shape in ppt_shapes.flatten(ppt_shapes.ordered(shapes)):
+        for shape in ppt_shapes.flatten(ppt_shapes.ordered(shapes, self.walk.order)):
             key = shape.spid if shape.spid and shape.spid not in keys else ("unkeyed", len(keys))
             keys.add(key)
             ref = shape.text_ref
@@ -366,19 +372,22 @@ class Presentation:
             elif typ == rec.PP_DRAWING and drawing is None:
                 drawing = (body, body + sz)
             elif typ == rec.SLIDE_ATOM and sz >= 22 and atom is None:
-                atom = struct.unpack_from("<I", self.doc, body + 12)[0], self.doc[body + 20] & 1
+                atom = (struct.unpack_from("<I", self.doc, body + 12)[0], self.doc[body + 20] & 1,
+                        struct.unpack_from("<I", self.doc, body)[0] == 0)
             elif typ == rec.HEADERS_FOOTERS and hf is None:
                 hf = self._hf(body, sz)
         styles, items = self._master(atom[0]) if atom is not None else ({}, [])
-        self.walk.styles = styles
-        outline = ppt_shapes.text_blocks(ppt_shapes.texts(self.doc, *outline_span, self.walk), self.walk)
         bare = drawing is None
         if bare:  # no PPDrawing: the text atoms the slide holds itself, in record order
             drawing = (start, start + size)
         dia = diagram.Diagram(self.ctx, self.budget)
         furniture = []
-        ordered, used = self._drawn(drawing, outline, dia=dia, furniture=furniture)
-        self.walk.styles = {}
+        self.walk.styles = styles
+        try:
+            outline = ppt_shapes.text_blocks(ppt_shapes.texts(self.doc, *outline_span, self.walk), self.walk)
+            ordered, used = self._drawn(drawing, outline, dia=dia, furniture=furniture)
+        finally:
+            self.walk.styles = {}
         # a slide list run the slide's own atoms already gave is the same text: read it once
         seen = {plain for _, _, plain, _ in ordered} if bare else set()
         ordered.extend((*o, None) for i, o in enumerate(outline) if i not in used and o[2] not in seen)
@@ -397,7 +406,7 @@ class Presentation:
             for blocks in items:
                 self.repeated.add(number, blocks)
         flags, footer = hf or self.hf
-        if flags & _HAS_FOOTER and footer:
+        if flags & _HAS_FOOTER and footer and not (self.omit_title and atom is not None and atom[2]):
             self.repeated.add(number, [Para([Text(footer)])])
         for blocks in furniture:
             self.repeated.add(number, blocks)

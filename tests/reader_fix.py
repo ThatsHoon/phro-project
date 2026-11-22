@@ -1614,10 +1614,10 @@ def ppt_slide_persist(pid, slide_id, texts=0):
     return oa_record(0x03F3, struct.pack("<IIiII", pid, 0, texts, slide_id, 0))
 
 
-def ppt_slide_atom(master_id, notes_id, flags=0x0007):
-    """A SlideAtom (0x03EF): geometry, 8 placeholder bytes, masterIdRef, notesIdRef, flags (fMasterObjects 0x1,
-    fMasterScheme 0x2, fMasterBackground 0x4), unused."""
-    return oa_record(0x03EF, struct.pack("<I8sIIHH", 0, bytes(8), master_id, notes_id, flags, 0), ver=2)
+def ppt_slide_atom(master_id, notes_id, flags=0x0007, layout=0):
+    """A SlideAtom (0x03EF): geometry (`layout`, 0 a title slide), 8 placeholder bytes, masterIdRef, notesIdRef,
+    flags (fMasterObjects 0x1, fMasterScheme 0x2, fMasterBackground 0x4), unused."""
+    return oa_record(0x03EF, struct.pack("<I8sIIHH", layout, bytes(8), master_id, notes_id, flags, 0), ver=2)
 
 
 def ppt_cstring(text, inst):
@@ -1747,7 +1747,8 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     master_text goes in the MainMaster's title placeholder (OEPlaceholderAtom type 1; None: a master with no text).
     master: {"shapes": shape dicts drawn on the MainMaster beside it, "styles": {text type: [bullet True, False or
     None per indent level]} as its TextMasterStyleAtoms, "footer": text of the document's slide HeadersFooters
-    (instance 3, fHasFooter)}. A slide's footer key gives it its own HeadersFooters (instance 0) with that footer and
+    (instance 3, fHasFooter), "omit_title": the DocumentAtom's fOmitTitlePlace}. A slide's "layout" is its
+    SlideAtom geometry (0, a title slide, when not given). A slide's footer key gives it its own HeadersFooters (instance 0) with that footer and
     no_master clears its SlideAtom's fMasterObjects. edits > 1 appends edits - 1 more
     PersistDirectoryAtom + UserEditAtom pairs chained through lastEdit; each remaps slide 1 to a fresh copy.
     encrypt (any string, the password): the CurrentUserAtom headerToken 0xF3D1C4DF, a CryptSession10Container persist
@@ -1835,7 +1836,7 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     def slide_record(k):
         slide = slides[k]
         parts = [ppt_slide_atom(master_slide_id, notes_slide_id.get(k + 1, 0),
-                                0x0006 if slide.get("no_master") else 0x0007)]
+                                0x0006 if slide.get("no_master") else 0x0007, slide.get("layout", 0))]
         if slide.get("footer") is not None:
             parts.append(ppt_headers_footers(slide["footer"], 0))
         if slide.get("hidden"):
@@ -1869,7 +1870,8 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         outline = runs(slides[k]) if slides[k].get("outline") else []
         slwt.append(ppt_slide_persist(pid_slides[k], slide_ids[k], len(outline)))
         slwt.extend(outline)
-    doc_parts = [oa_record(0x03E9, bytes(40), ver=1), slide_list(0, slwt),
+    doc_atom = bytes(37) + bytes([1 if master.get("omit_title") else 0]) + bytes(2)
+    doc_parts = [oa_record(0x03E9, doc_atom, ver=1), slide_list(0, slwt),
                  slide_list(1, [ppt_slide_persist(pid_master, master_slide_id)])]
     pic_stream, store = bytearray(), []
     for blip in pictures:
