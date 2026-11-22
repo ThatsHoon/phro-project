@@ -1022,10 +1022,11 @@ def test_page_number_wording_and_picture_font_space():
     from reader.formats import word_fields
     for shell in ("Page of", "- -", "Seite von", "제 쪽", "p.", "Página de"):
         assert word_fields.page_shell(shell), shell
-    for kept in ("Report", "Seite 3 Entwurf", "제안서"):
+    for kept in ("Report", "Seite 3 Entwurf", "제안서", "PPP", "PDE", "Depp", "면제", "제제"):
         assert not word_fields.page_shell(kept), kept
     assert word_fields.symbol("Webdings", 0x20) == " " and word_fields.symbol("Webdings", 0xF020) == " "
     assert word_fields.symbol("Webdings", 0x21) is None
+    assert word_fields.symbol("Wingdings 2", 0x20) == " " and word_fields.symbol("Wingdings 2", 0x52) == "☑"
 
 
 CORE = ('<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '

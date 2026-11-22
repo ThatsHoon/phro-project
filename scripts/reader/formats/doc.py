@@ -308,6 +308,8 @@ class _Reader:
         self.chp, self.chp_at = [], []  # (cp0, cp1, CHPX grpprl, prm) in CP order, and their cp0s
         self.pap, self.pap_at = [], []  # (cp0, cp1, PAPX, prm) in CP order, and their cp0s
         self.data = None             # the Data stream once read; False when missing or unreadable
+        self.forms = {}              # place in the Data stream -> what its form field data shows
+        self.form_left = limits.FORM_BYTES
         self._prm, self._runs, self._paras = {}, {}, {}  # memos: prm -> sprms; run and paragraph properties
         self._huge, self._huge_read = {}, 0  # Data offset -> the sprms of its huge PAPX; the bytes read so far
         self.glue = None      # connector spid -> (start spid, end spid), the first rule naming it winning; read once
@@ -993,12 +995,21 @@ class _Reader:
 
     def form(self, at) -> str:
         """What the form field data at `at` in the Data stream shows: a NilPICFAndBinData, its FFData after the
-        header its cbHeader gives, read up to MAX_FORM bytes. "" when it is not there."""
+        header its cbHeader gives, read up to MAX_FORM bytes. "" when it is not there. Each place is read once,
+        and the document reads limits.FORM_BYTES of them: past that a field is counted under `form`."""
+        if at in self.forms:
+            return self.forms[at]
         data = self.data_stream()
         if data is None or not 0 <= at <= len(data) - 6:
             return ""
         size, head = struct.unpack_from("<IH", data, at)
-        return form_data(data[at + head:at + min(size, MAX_FORM)])
+        ff = data[at + head:at + min(size, MAX_FORM)]
+        if len(ff) > self.form_left:
+            self.ctx.skipped["form"] += 1
+            return ""
+        self.form_left -= len(ff)
+        self.forms[at] = form_data(ff)
+        return self.forms[at]
 
     # ---- pictures (doc_pictures.py reads them)
     def picture(self, st, cp):

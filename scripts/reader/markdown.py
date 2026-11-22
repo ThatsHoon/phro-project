@@ -43,7 +43,7 @@ LOST = (
     (("scan",), "scanned page not shown", "scanned pages not shown"),
     (("textless",), "page with no text layer", "pages with no text layer"),
     (("figure",), "vector figure not shown", "vector figures not shown"),
-    (("field",), "form field", "form fields"),
+    (("field", "form"), "form field", "form fields"),
     (("annotation",), "annotation", "annotations"),
     (("document",), "document part", "document parts"),
     (("master",), "master slide", "master slides"),

@@ -49,13 +49,13 @@ _PICTURE_FONTS = frozenset(("webdings", "wingdings 2", "wingdings 3", "mt extra"
                             "zapfdingbats", "zapf dingbats", "monotype sorts", "ms outlook", "ms reference specialty"))
 _APP_PROPERTY = re.compile(r"^(?:KSOProductBuildVer$|ICV$|ContentTypeId$|MSIP_Label_|_dlc_|_MarkAsFinal$|"
                            r"MediaServiceImageTags$|GrammarlyDocumentId$|_NewReviewCycle$|TaxCatchAll)")
-_PAGE_SHELL = re.compile(r"(?:pages?|pg|p|of|seite|von|sur|de|página|쪽|페이지|면|제|[\W_])*", re.I)
+_PAGE_WORDS = frozenset("page pages pg p of seite von sur de página 쪽 페이지 면 제".split())
 
 
 def page_shell(text: str) -> bool:
     """Whether a header or footer line whose page numbers were dropped holds only their wording ("Page of",
     "- -", "/"), which says nothing without them."""
-    return _PAGE_SHELL.fullmatch(text) is not None
+    return all(w in _PAGE_WORDS for w in re.findall(r"[^\W_]+", text.casefold()))
 
 
 def symbol(font: str, code: int) -> str | None:
@@ -69,10 +69,8 @@ def symbol(font: str, code: int) -> str | None:
         return SYMBOL.get(low)
     if face == "wingdings":
         return WINGDINGS.get(low)
-    if face == "wingdings 2":
-        return WINGDINGS2.get(low)
     if face in _PICTURE_FONTS:
-        return " " if low == 0x20 else None
+        return " " if low == 0x20 else WINGDINGS2.get(low) if face == "wingdings 2" else None
     if 0 < code < 0x110000 and not 0xE000 <= code <= 0xF8FF and not 0xD800 <= code <= 0xDFFF:
         return chr(code)
     return None

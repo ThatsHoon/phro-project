@@ -329,6 +329,22 @@ def test_form_data_is_read_once_a_field_and_only_for_a_form_field():
     assert "☒" not in link and "site" in link, link
 
 
+def test_form_data_at_one_place_is_read_once_a_document():
+    n = 100_000
+    dd = ffdata(2, 1, 0, ("DD-FIRST", "DD-SECOND" + "x" * 30_000))
+    p = inline_doc(dd, "\x13\x01\x15" * n + "\r", chpx=[(0, 3 * n, sp(SPEC) + sp(PIC, AT))])
+    t = time.perf_counter()
+    out = md(p)
+    assert time.perf_counter() - t < 10 and out.startswith("DD-SECONDxxx"), (time.perf_counter() - t, out[:40])
+    old = limits.FORM_BYTES
+    limits.FORM_BYTES = 0
+    try:
+        _, ctx = parse(inline_doc(dd, "pick \x13 FORMDROPDOWN \x01\x15\r"))
+    finally:
+        limits.FORM_BYTES = old
+    assert ctx.skipped["form"] == 1, ctx.skipped
+
+
 def test_form_fields_show_their_state():
     """A legacy check box shows ☒ or ☐ (its result, else its default), a drop-down its chosen entry, a text field its
     result; form data that cannot be read shows nothing."""
