@@ -16,11 +16,16 @@ from them is a stream that cannot be read). What comes back is what the object s
   * None: anything else (a PDF's CONTENTS, a packager's Ole10Native, a Word or PowerPoint document, bytes that are
     no container). The caller keeps the object's preview picture and counts it under object.
 
+An OOXML package keeps its objects as parts a relationship names (`Parts`): each is read once, MAX_OBJECTS at
+most, and the tables of all of them are charged, copies counted, against CHART_TOTAL.
+
 A compound file's `Package` (Office), `package_stream` or `EmbeddedOdf` (LibreOffice) stream holds the object's own
 file and is read as bytes again, DEPTH levels at most; a stream or package over EMBED_BYTES is not read. A ReadError
 that only says this object cannot be read (damaged, too large, unsupported, encrypted) gives None; any other ends
 the document, as it does everywhere.
 """
+import copy
+
 from . import limits
 from .containers.cfb import CfbError, Compound, is_cfb
 from .containers.zipx import Package
@@ -28,6 +33,7 @@ from .limits import ReadError
 from .model import Cell, Context, Equation, Para, Section, Table
 
 DEPTH = 4  # objects inside objects that are opened
+MAX_OBJECTS = 256  # embedded parts one package reads (the rest are not read)
 NATIVE = "Equation Native"
 _PACKAGES = ("Package", "package_stream", "EmbeddedOdf")
 _COMP_OBJ = "\x01CompObj"
@@ -36,6 +42,50 @@ _SKIP = ("damaged", "too_large", "unsupported", "encrypted")
 _NONE = frozenset()
 CHART = ("chart", [], _NONE)
 BAD = ("bad", "", _NONE)
+
+
+class Parts:
+    """The embedded objects of one OOXML package `pkg`."""
+
+    def __init__(self, pkg, ctx):
+        self.pkg, self.ctx = pkg, ctx
+        self.sheets = None  # the one sheet_grid.Budget of every embedded workbook, made with the first object
+        self.cells = 0      # table cells placed, copies counted
+        self._read = {}     # part name -> what `read` gave
+
+    def get(self, part: str, rid):
+        """The object relationship `rid` of `part` names; None when it names none inside the package."""
+        from .formats import ooxml_base
+        return self.rel(ooxml_base.rels(self.pkg, part, self.ctx).get(rid) if rid else None)
+
+    def rel(self, rel):
+        """The object at relationship `rel`'s target, read once; None when it is external, missing, over EMBED_BYTES,
+        past MAX_OBJECTS or not read."""
+        if rel is None or rel.external or not self.pkg.has(rel.target):
+            return None
+        name = rel.target
+        if name not in self._read:
+            if len(self._read) >= MAX_OBJECTS:
+                return None
+            self._read[name] = None
+            if self.pkg.size(name) <= limits.EMBED_BYTES:
+                if self.sheets is None:
+                    from .formats import sheet_grid
+                    self.sheets = sheet_grid.Budget()
+                try:
+                    self._read[name] = read(self.pkg.read(name), self.ctx, self.sheets)
+                except ReadError as e:
+                    if e.kind not in _SKIP:
+                        raise
+        return self._read[name]
+
+    def place(self, got) -> list | None:
+        """Copies of a "table" object's tables for one placement, or None when they would pass CHART_TOTAL (the
+        caller counts a chart, as for a workbook that gave no table)."""
+        self.cells += sum(len(row) for t in got[1] for row in t.rows)
+        if self.cells > limits.CHART_TOTAL:
+            return None
+        return [copy.copy(t) for t in got[1]]
 
 
 def read(data: bytes, ctx, sheets, depth: int = 0):

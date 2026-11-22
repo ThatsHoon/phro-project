@@ -11,8 +11,10 @@ from reader.formats import sheet_grid  # noqa: E402
 from reader.model import Context, Table, Text  # noqa: E402
 from reader_fix import cfb_bytes, comp_obj, eq_native, make_xlsx, make_zip, xlsx_cell, xlsx_row  # noqa: E402
 import test_reader_doc_objects as in_doc  # noqa: E402
+import test_reader_docm as in_docm  # noqa: E402
 import test_reader_odt as odt  # noqa: E402
 import test_reader_ppt_objects as in_ppt  # noqa: E402
+import test_reader_slides as in_slides  # noqa: E402
 
 CHART_MIME = "application/vnd.oasis.opendocument.chart"
 FORMULA_MIME = "application/vnd.oasis.opendocument.formula"
@@ -109,6 +111,87 @@ def test_chart_package_in_a_ppt():
     slide = {"shapes": [{"text": "above", "box": (0, 10, 400, 50)}, in_ppt.obj(pib=1)]}
     out, ctx, assets = in_ppt.build([slide], objects=[stg], pictures=[in_ppt.blip_png(in_ppt.PNG)])
     assert "Chart: column — 매출\n연도|값\n-|-\n2025|3\n" in out and not assets and not ctx.skipped, (out, assets, ctx.skipped)
+
+
+OLE_REL = "oleObject"
+PKG_REL = "package"
+
+
+def word_object(rid, pic="rP"):
+    return ('<w:p><w:r><w:t>before</w:t></w:r><w:r><w:object><v:shape id="s1">'
+            f'<v:imagedata r:id="{pic}" o:title="preview"/></v:shape>'
+            f'<o:OLEObject xmlns:o="urn:schemas-microsoft-com:office:office" Type="Embed" ProgID="Excel.Sheet.12" '
+            f'ShapeID="s1" DrawAspect="Content" ObjectID="_1" r:id="{rid}"/></w:object></w:r>'
+            '<w:r><w:t>after</w:t></w:r></w:p>').replace("o:title", "title")
+
+
+def docx(rels, parts):
+    return in_docm.docm(word_object("rO"), parts={"word/media/p.png": in_docm.PNG, **parts},
+                        rels=[("rP", "image", "media/p.png", False)] + rels)
+
+
+def test_xlsx_inside_a_docx():
+    p = docx([("rO", PKG_REL, "embeddings/book.xlsx", False)], {"word/embeddings/book.xlsx": workbook()})
+    doc, ctx = in_docm.parse(p)
+    out = in_docm.md(p)
+    assert out == "beforeafter\n\nA1:B2\nItem|Qty\n-|-\nPen|3\n" and not ctx.skipped, (out, ctx.skipped)
+    blob, _ = cfb_bytes({"Equation Native": eq_native(in_ppt.X)})
+    p = docx([("rO", OLE_REL, "embeddings/eq.bin", False)], {"word/embeddings/eq.bin": blob})
+    assert in_docm.md(p) == "before$x$after\n", in_docm.md(p)
+    blob, _ = cfb_bytes({"CONTENTS": b"%PDF-1.4"})
+    p = docx([("rO", OLE_REL, "embeddings/o.bin", False)], {"word/embeddings/o.bin": blob})
+    out = in_docm.md(p)
+    assert out.startswith("beforeafter\n\n![preview") and "img-001.png" in out, out
+    p = docx([("rO", OLE_REL, "https://example.com/x.xlsx", True)], {})
+    assert in_docm.md(p).startswith("beforeafter\n\n![preview"), in_docm.md(p)
+    p = docx([], {})
+    assert in_docm.md(p).startswith("beforeafter\n\n![preview"), in_docm.md(p)
+
+
+def ole_frame(rid, pic=None):
+    inner = (f'<p:pic><p:nvPicPr><p:cNvPr id="9" name="preview"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>'
+             f'<p:blipFill><a:blip r:embed="{pic}"/></p:blipFill><p:spPr/></p:pic>') if pic else ""
+    return ('<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="4" name="Object 1"/><p:cNvGraphicFramePr/><p:nvPr/>'
+            '</p:nvGraphicFramePr><p:xfrm><a:off x="0" y="900"/><a:ext cx="100" cy="100"/></p:xfrm><a:graphic>'
+            '<a:graphicData uri="http://schemas.openxmlformats.org/presentationml/2006/ole">'
+            f'<p:oleObj name="Worksheet" r:id="{rid}" progId="Excel.Sheet.12"><p:embed/>{inner}</p:oleObj>'
+            '</a:graphicData></a:graphic></p:graphicFrame>')
+
+
+def test_ole_object_workbook_on_a_slide():
+    p = in_slides.deck([in_slides.sp("Title", ph="title") + ole_frame("rO", "rP")],
+                       srels={1: [("rO", PKG_REL, "../embeddings/book.xlsx"), ("rP", "image", "../media/p.png")]},
+                       extra={"ppt/embeddings/book.xlsx": workbook(), "ppt/media/p.png": in_docm.PNG})
+    doc, ctx = in_slides.parse(p)
+    out = in_slides.md(p)
+    assert out == "## Slide 1: Title\n\nA1:B2\nItem|Qty\n-|-\nPen|3\n" and not ctx.skipped, (out, ctx.skipped)
+    blob, _ = cfb_bytes({"CONTENTS": b"%PDF-1.4"})
+    p = in_slides.deck([ole_frame("rO", "rP")],
+                       srels={1: [("rO", OLE_REL, "../embeddings/o.bin"), ("rP", "image", "../media/p.png")]},
+                       extra={"ppt/embeddings/o.bin": blob, "ppt/media/p.png": in_docm.PNG})
+    doc, ctx = in_slides.parse(p)
+    out = in_slides.md(p)
+    assert "img-001.png" in out and not ctx.skipped, (out, ctx.skipped)
+    p = in_slides.deck([ole_frame("rO")], srels={1: [("rO", OLE_REL, "../embeddings/o.bin")]},
+                       extra={"ppt/embeddings/o.bin": blob})
+    doc, ctx = in_slides.parse(p)
+    assert ctx.skipped == {"object": 1}, ctx.skipped
+
+
+def test_ole_object_in_a_sheet():
+    rows = xlsx_row(1, xlsx_cell("A1", inline="<t>host</t>"), xlsx_cell("B1", "1"))
+    after = '<oleObjects><oleObject progId="Excel.Chart.8" shapeId="1025" r:id="rO"/></oleObjects>'
+    blob, _ = cfb_bytes({"package_stream": chart_package()})
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject"
+    data = make_xlsx(None, [{"name": "S", "rows": rows, "after": after,
+                             "rels": [("rO", rel, "../embeddings/o.bin", False)]}],
+                     extra_parts={"xl/embeddings/o.bin": blob})
+    from reader import markdown
+    from reader.formats import ooxml
+    import tempfile
+    ctx = Context()
+    out = markdown.render(ooxml.parse_package(data, ctx), Path(tempfile.mkdtemp()), False, ctx.skipped)
+    assert out == "## Sheet: S\n\nA1:B1\nhost|1\n-|-\n\nChart: column — 매출\n연도|값\n-|-\n2025|3\n", out
 
 
 def main():

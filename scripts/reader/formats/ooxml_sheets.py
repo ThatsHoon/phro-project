@@ -48,10 +48,10 @@ import posixpath
 import re
 from datetime import datetime
 
-from .. import limits
+from .. import embedded, limits
 from ..containers.zipx import attr, iterparse, local
 from ..limits import ReadError
-from ..model import Doc, Para, Section, Text
+from ..model import Doc, Equation, Para, Section, Text
 from ..numfmt import code_for
 from . import ooxml_base, sheet_drawing, sheet_grid
 from .word_fields import MAX_URL, comment_note
@@ -477,6 +477,7 @@ class _Sheets:
     def __init__(self, pkg, wb, ctx):
         self.pkg, self.wb, self.ctx = pkg, wb, ctx
         self.budget = sheet_grid.Budget()
+        self.objects = embedded.Parts(pkg, ctx)
         self.draw = sheet_drawing.Drawings(pkg, ctx)  # charts and pictures; one image byte count and chart cell count
         self.scan = 0                    # elements the sheet parts have closed, all sheets together
         self.used: set[str] = set()      # sheet parts read
@@ -715,13 +716,37 @@ class _Sheets:
         grid.fact(f"Pivot {attr(root, 'name') or ''} {ref}".rstrip(), about or [("no fields", False)])
 
     def _drawn(self, part, relmap) -> list:
-        """The sheet's charts and pictures in anchor order, from the relationships the sheet read once. A drawing
-        ReadError other than a timeout costs only the drawings, counted under `object`."""
+        """The sheet's charts and pictures in anchor order, then its embedded objects, from the relationships the
+        sheet read once. A drawing ReadError other than a timeout costs only the drawings, counted under `object`."""
+        rels = self._sheet_rels(part, relmap)
         try:
-            return self.draw.blocks(part, self._sheet_rels(part, relmap))
+            out = self.draw.blocks(part, rels)
         except ReadError as e:
             _skip(self.ctx, "object", e)
-            return []
+            out = []
+        return out + self._embedded(rels)
+
+    def _embedded(self, rels) -> list:
+        """The sheet's embedded objects (its oleObject and package relationships, in id order), by embedded.Parts: an
+        equation or tables after the sheet's drawings. One that is not read is counted under object, a chart left
+        unread under chart; the sheet's legacy drawing holds its preview, which is not read."""
+        out = []
+        for rid in sorted(rels):
+            rel = rels[rid]
+            if rel.external or not rel.type.endswith(("/oleObject", "/package")):
+                continue
+            got = self.objects.rel(rel)
+            kind = got[0] if got else ""
+            tables = self.objects.place(got) if kind == "table" else None
+            if tables is not None:
+                out.extend(tables)
+            elif kind == "equation":
+                out.append(Equation(got[1]))
+                if got[2]:
+                    self.ctx.skipped["depth" if got[2] <= {"depth"} else "object"] += 1
+            else:
+                self.ctx.skipped["chart" if kind in ("chart", "table") else "object"] += 1
+        return out
 
     def _collect(self, el, part, links, grid, relmap):
         """Keep the range of a `hyperlink`, the URL of the external hyperlink relationship it names and its

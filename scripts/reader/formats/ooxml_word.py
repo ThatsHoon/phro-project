@@ -7,7 +7,7 @@ place among the blocks that follow the paragraph. A group in a header or footer,
 """
 import re
 
-from .. import diagram, html as xhtml, limits
+from .. import diagram, embedded, html as xhtml, limits
 from ..containers.zipx import Package, attr, first, kids, local
 from ..limits import IMAGE_BYTES, ReadError
 from ..model import (Bold, Break, Cell, Doc, Equation, Heading, Hidden, Image, Inserted, Link, ListItem, Math, NoteRef,
@@ -118,6 +118,7 @@ class _Reader:
         self.scope = None
         self.image_bytes = 0
         self.chart_cells = 0
+        self.objects = embedded.Parts(pkg, ctx)
         self.smartart_nodes = 0
         self.opened = 0  # tables opened so far (TABLE_NODES)
         self.budget = diagram.ConnectionBudget(ctx)  # the document's edges, shared by every group's diagram
@@ -631,6 +632,8 @@ class _Reader:
             self.picture(st, attr(el, "id"), re.sub(r"\s+", " ", attr(el, "title") or "").strip()[:MAX_ALT])
         elif n == "chart":
             self.chart(st, attr(el, "id"))
+        elif n == "object":
+            self.ole(el, st, d)
         elif n == "relIds":
             self.extra(st, self.smartart(attr(el, "dm")))
         elif n == "txbxContent":
@@ -740,6 +743,31 @@ class _Reader:
             self.ctx.skipped["image"] += 1
             return
         self.extra(st, [Image(img.data, st.alt if alt is None else alt)])
+
+    def ole(self, el, st, d):
+        """An embedded object (w:object): the part its o:OLEObject names, by embedded.Parts. An equation stands in
+        the line and tables follow the paragraph, in place of the preview picture; an object that is not read keeps
+        its preview, a chart left unread is counted, and an equation converted in part keeps both."""
+        rid = next((attr(e, "id") for e in el.iter() if local(e.tag) == "OLEObject"), None)
+        got = self.objects.get(self.scope.part, rid)
+        kind = got[0] if got else ""
+        if kind == "equation":
+            self.add(st, Math(got[1]))
+            if "depth" in got[2]:
+                self.deep()
+            if got[2] <= {"depth"}:
+                return
+            self.ctx.skipped["object"] += 1
+        elif kind == "table":
+            tables = self.objects.place(got)
+            if tables is not None:
+                self.extra(st, tables)
+                return
+            self.ctx.skipped["chart"] += 1
+        elif kind == "chart":
+            self.ctx.skipped["chart"] += 1
+        for c in el:
+            self.node(c, st, d + 1)
 
     def chart(self, st, rid):
         tbl = ooxml_base.chart(self.pkg, self.scope.part, rid, self.ctx)
