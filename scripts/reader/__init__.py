@@ -42,7 +42,10 @@ def parse(path, ctx, **opts):
     precheck(path)
     ext = ext_of(path)
     mod = importlib.import_module("reader.formats." + FORMATS[ext])
-    return mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
+    doc = mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
+    if ctx.vba:
+        doc.meta["vba"] = ctx.vba
+    return doc
 
 
 def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:

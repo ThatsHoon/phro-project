@@ -136,6 +136,7 @@ import math
 import struct
 
 from .. import diagram, embedded, images, limits, officeart, text as textmod
+from ..containers import vba
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Doc, Equation, Image, Para, Section
@@ -1254,17 +1255,15 @@ def parse(path, ctx) -> Doc:
 def parse_compound(src, ctx) -> Doc | str:
     """Read the compound file `src` (a path or its bytes, nothing is written): the Doc, or the name of the other
     parser `cfb_route` picks for a compound file that holds no VisioDocument stream. `parse` ends in it."""
-    vba = False
     try:
         with Compound(src) as cf:
             other = cfb_route.route(cf, "vsd", "no VisioDocument stream")
             data = cf.read("VisioDocument") if other is None else None
-            vba = any(n.upper().startswith("_VBA_PROJECT_CUR/") for n in cf.names())
+            if other is None:
+                vba.compound(cf, ctx, any(n.upper().startswith("_VBA_PROJECT_CUR/") for n in cf.names()))
     except (KeyError, CfbError):
         raise ReadError("damaged", "VisioDocument stream") from None
     if other is not None:
         return other
-    if vba:
-        ctx.skipped["vba"] = 1  # macros are never read; named once
     version, _ = vsd_stream.header(data)
     return _Reader(data, version, ctx).run()

@@ -42,9 +42,10 @@ def _cache(pkg) -> dict:
 
 
 def macros(pkg, ctx):
-    """Name a package's VBA project once: macros are never read, however many projects there are."""
+    """A package's VBA projects: their modules go to ctx.vba (containers.vba); one that cannot be read is named."""
     if any(n.rsplit("/", 1)[-1].lower() == "vbaproject.bin" for n in pkg.names):
-        ctx.skipped["vba"] = 1
+        from ..containers import vba
+        ctx.vba += vba.package(pkg, ctx)
 
 
 def rels(pkg, part, ctx=None) -> dict:

@@ -24,7 +24,7 @@ location) lands on its cells through `Grid.link`, charged to one SHEET_SCAN coun
 its external SUPBOOK paths by number and its protection come before its sheets; a sheet's own names, its filter (an
 AUTOFILTERINFO: its `_FilterDatabase` range and the AUTOFILTER criteria), its validations (DV), its conditional rules
 (CONDFMT and CF, the formulas at the record's end) and its PROTECT follow its formulas (`Grid.fact`). A
-`_VBA_PROJECT_CUR` storage counts `vba` once; macros are never read.
+`_VBA_PROJECT_CUR` storage is a VBA project: its modules are read by containers.vba.
 """
 import re
 from dataclasses import replace
@@ -32,7 +32,7 @@ import struct
 
 from .. import diagram, limits
 from ..containers.cfb import CfbError, Compound
-from ..containers import flate
+from ..containers import flate, vba
 from ..containers.zipx import Package
 from ..limits import ReadError
 from ..model import Doc, Para, Section, Text
@@ -754,13 +754,12 @@ def parse_compound(src, ctx) -> Doc | str:
             other = cfb_route.route(cf, "xls", "no Workbook stream")
             if other is None:
                 data = cf.read("Workbook" if cf.exists("Workbook") else "Book")
-            vba = any(n.upper().startswith("_VBA_PROJECT_CUR/") for n in cf.names())
+            if other is None:
+                vba.compound(cf, ctx, any(n.upper().startswith("_VBA_PROJECT_CUR/") for n in cf.names()))
     except (KeyError, CfbError):
         raise ReadError("damaged", "Workbook stream") from None
     if other is not None:
         return other
-    if vba:
-        ctx.skipped["vba"] = 1
     wb = Workbook(data, ctx, sheet_grid.Budget())
     lead = wb.book_facts()
     secs = wb.sections()

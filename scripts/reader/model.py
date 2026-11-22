@@ -174,6 +174,8 @@ class Context:
         self.warnings: list[str] = []
         self.skipped: collections.Counter = collections.Counter()
         self.name = ""
+        self.vba: list = []   # (name, kind, source) of the VBA modules read (containers.vba)
+        self.vba_bytes = 0    # bytes of VBA source read so far (VBA_BYTES)
 
     @contextmanager
     def guard(self, kind: str):

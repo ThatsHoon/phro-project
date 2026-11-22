@@ -108,7 +108,7 @@ glued ends and arrowheads not known. Nodes take their type's kind
 arrowhead field, so their pages have no diagram.
 
 Links. `pub_quill.links` give one `Para([Text("Links: "), Link(u, [Text(u)]), Text(", "), ...])` at the end. VBA: a
-storage named VBA anywhere (Publisher's `VBA/`, Word's `Macros/VBA/`) counts `vba` once; macros are never read.
+storage named VBA anywhere (Publisher's `VBA/`, Word's `Macros/VBA/`) is a project read by containers.vba; macros are never read.
 
 Bounds (each read at call time). One `pub_contents.Meter` of `limits.BIN_RECORDS` a document: the directory, every
 Contents block walked (page list, page chunks, shape, table and CELLS chunks), each page visited, each shape placed,
@@ -134,7 +134,7 @@ from bisect import bisect_left, bisect_right
 from itertools import islice
 
 from .. import diagram, images, limits, officeart
-from ..containers import flate
+from ..containers import flate, vba
 from ..containers.cfb import CfbError, Compound, is_cfb
 from ..limits import ReadError
 from ..model import Bold, Cell, Doc, Image, Link, Para, Section, Table, Text
@@ -895,8 +895,7 @@ def parse_compound(src, ctx) -> Doc | str:
                     raise ReadError("damaged", "not a Publisher Contents stream")
                 if contents[2] not in (V2000, V2002):
                     raise ReadError("unsupported", f"unknown Publisher version (Contents byte 0x{contents[2]:02X})")
-                if any(_vba(n) for n in cf.names()):
-                    ctx.skipped["vba"] = 1  # macros are never read; named once
+                vba.compound(cf, ctx, any(_vba(n) for n in cf.names()))
                 if contents[2] == V2000:
                     older = True
                     if cf.exists(QUILL):
