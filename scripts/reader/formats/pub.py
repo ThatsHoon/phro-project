@@ -506,7 +506,7 @@ class _Pages:
             if seq in seen or ref is None or ref.type != self.PAGE or seq in self.DUMMY:
                 continue
             seen.add(seq)
-            if not self.meter.tick():
+            if not self.meter.tick() or self.ctx.late():
                 break
             with self.ctx.guard("page"):
                 master, shapes = self._page(ref)

@@ -173,6 +173,8 @@ class _Reader:
             if rel is not None and not rel.external:
                 self.numbers.setdefault(rel.target, number)
         for number, entry in enumerate(entries, 1):
+            if self.ctx.late():
+                break
             rel = rels.get(_rid(entry) or "")
             if rel is None or rel.external or not rel.type.endswith("/slide") or not self.pkg.has(rel.target):
                 self.ctx.skipped["slide"] += 1
@@ -410,6 +412,8 @@ class _Reader:
             self.deep()
             return
         for el in container:
+            if self.ctx.late():
+                break
             with self.ctx.guard("shape"):
                 self.shape(el, xf, d, hidden, out, titles)
 

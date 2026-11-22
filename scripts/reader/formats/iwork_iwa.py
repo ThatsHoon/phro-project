@@ -501,6 +501,8 @@ def _numbers(store: Store, ctx) -> Doc | None:
     doc = Doc()
     text = iwork_text.TextReader(store, ctx, doc.notes, lambda d: drawable_blocks(store, d, ctx, text, "numbers"))
     for sid in dict.fromkeys(sheets):
+        if ctx.late():
+            break
         sec = _sheet(store, sid, text, doc, ctx)
         if sec is not None:
             doc.blocks.append(sec)
@@ -653,6 +655,8 @@ def _keynote(store: Store, ctx) -> Doc | None:
     def visit(nid, depth):
         nonlocal number
         children, slide, skipped, read = [], None, False, False
+        if ctx.late():
+            return None
         with ctx.guard("slide"):
             nf = store.get(nid, KN_NODE)
             children = [c for c in dict.fromkeys(iwork_text.refs(nf, 1)) if _kind(store, c) == KN_NODE]

@@ -478,6 +478,8 @@ class TextReader:
         closed: set = set()
         start = 0
         for line in text.split("\n"):
+            if self.ctx.late():
+                break
             end = start + len(line)
             out.extend(self._paragraph(text, start, end, t, closed))
             start = end + 1

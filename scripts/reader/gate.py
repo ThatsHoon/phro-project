@@ -189,14 +189,11 @@ def _is_zip(path):
 
 def _next(path, kind, detail=""):
     """The one sentence a deny of `kind` ends with: what can be done next. The convert command only for a timeout,
-    the one failure that running it again can mend, and not for mpp, whose run by hand has the same limit; for a
+    the one failure that running it again can mend (a run by hand has HAND_SECONDS); for a
     failure of phro-project's own, not of the file, another way to read it, or the same Read again for a cache
     entry that went missing."""
     ext = reader.ext_of(path)
     skill = SKILL_OF.get(ext)
-    if kind == "timeout" and reader.FORMATS.get(ext) == "mpp":
-        return (" A run by hand stops at the same limit; ask the user for a smaller project, or the project saved"
-                f" as {SAVE_AS[ext]}.")
     if kind == "damaged" and detail == VANISHED:
         return " Read it again."
     if kind == "damaged" and detail.startswith(READER_FAULTS):
@@ -442,7 +439,8 @@ def _pending(meta):
 def _reach(path, meta, out_md, short=False):
     """The sentence naming the read that gets what the deadline left out of a partial entry, in fewer words when
     `short`: for a pdf range entry the same pages= read again, for a whole pdf the pages= read of the first pages
-    left (and how far they go), else the convert by hand that finishes the entry (it names the native engine for a
+    left (and how far they go), else the convert by hand that finishes the entry, or that one was cut too when
+    the entry is a hand run's whose read the time cut (it names the native engine for a
     pdf entry read natively, and no engine for one pdfium read: read.py then goes to the pdf venv by itself, so
     either run stores under the entry's own key); "" when the entry is whole."""
     if meta.get("partial") is not True:
@@ -462,6 +460,9 @@ def _reach(path, meta, out_md, short=False):
             else:
                 more = f", then pages {b + 1}-{pages[-1]}."
             return f' Read the pdf with pages="{_span(a, b)}"{rest}' + more
+    late = {limits.READ_LATE, limits.OCR_LATE, limits.FIGURES_LATE} & set(meta.get("warnings") or [])
+    if late == {limits.READ_LATE} and _count(meta.get("read_budget")) > limits.CONVERT_SECONDS:
+        return " A run by hand was cut too." if short else " A run by hand stopped at the time limit too."
     run = _by_hand(path, "native" if reader.ext_of(path) == "pdf" and meta.get("engine") == "native" else "")
     if short:
         return f" For the rest, run {run} and Read again."
@@ -482,6 +483,8 @@ def _time_cut(meta, short=False):
                      + ("" if short else " (Read it to view)" if k == 1 else " (Read them to view)"))
     if limits.FIGURES_LATE in (meta.get("warnings") or []):
         items.append("some figures not drawn" + ("" if short else " (their text is included)"))
+    if limits.READ_LATE in (meta.get("warnings") or []):
+        items.append("the rest of the document not read")
     if not items:
         return ""
     return " Cut by the time limit." if short else " Cut by the time limit: " + ", ".join(items) + "."

@@ -497,6 +497,8 @@ class _Sheets:
     def sections(self) -> list:
         read = []
         for no, (name, part, state) in enumerate(self.wb.sheets, 1):
+            if self.ctx.late():
+                break
             blocks = None  # stays None when the guard swallows an error, so the check below is real
             self.draw.grid = None
             try:

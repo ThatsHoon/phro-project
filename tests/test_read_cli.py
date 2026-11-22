@@ -398,7 +398,7 @@ def test_convert_probes_ocr_once():
 
     def counted():
         calls.append(1)
-        return "", ""
+        return "win-ko", "1"
 
     def opened(deadline, backend, **k):
         seen.append(backend)
@@ -409,8 +409,8 @@ def test_convert_probes_ocr_once():
             calls.clear()
             seen.clear()
             with env(PHRO_READER_CACHE=str(tmp())), contextlib.redirect_stdout(io.StringIO()):
-                code = read.main(["convert", str(docx(png(80, 80)))] + extra)
-            assert code == 0 and calls == [1] and seen == [("", "")], (extra, code, calls, seen)
+                code = read.main(["convert", str(docx(png(8, 8)))] + extra)
+            assert code == 0 and calls == [1] and seen == [("win-ko", "1")], (extra, code, calls, seen)
     finally:
         ocr_probe.backend, ocr.opened = saved
 

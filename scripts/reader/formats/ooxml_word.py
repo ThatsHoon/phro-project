@@ -260,6 +260,8 @@ class _Reader:
             return []
         out = []
         for c in container:
+            if self.ctx.late():
+                break
             with self.ctx.guard("block"):
                 out.extend(self.block(c, d))
         return out

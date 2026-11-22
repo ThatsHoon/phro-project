@@ -433,7 +433,9 @@ class _Reader:
 
     def take(self, n: int) -> int:
         """How many of `n` items the document's BIN_RECORDS meter lets a loop read; the first refusal counts
-        `record` once for the document."""
+        `record` once for the document. Past the read's time it lets none."""
+        if self.ctx.late():
+            self.items = 0
         if n <= self.items:
             self.items -= n
             return n

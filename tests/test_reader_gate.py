@@ -287,8 +287,8 @@ def test_deny_texts_name_the_next_step():
     assert r("d/a.hwp", "damaged", "cache entry vanished") == (
         "a.hwp: reading failed: cache entry vanished. Read it again.")
     why = r("d/a.mpp", "timeout")
-    assert why == (f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds. A run by hand stops at the same"
-                   " limit; ask the user for a smaller project, or the project saved as xlsx or pdf."), why
+    assert why.startswith(f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds. Retry by hand: python"), why
+    assert why.endswith("a.mpp'."), why
     assert r("d/a.hwp", "too_large", gate.limits.BIG_INPUT) == (
         "a.hwp: the file is over 512 MiB. That is phro-project's safety limit; ask the user for a smaller file, such"
         " as the part they need saved on its own.")
@@ -2537,12 +2537,12 @@ sys.exit(read.main(["convert", sys.argv[2], "--out", sys.argv[3]]))
 """
 
 
-def test_convert_by_hand_has_the_hook_deadline():
-    """`read.py convert` run by hand gets PHRO_READER_DEADLINE CONVERT_SECONDS from its start, as the hook's child
-    does; one already set is kept."""
+def test_convert_by_hand_has_its_own_deadline():
+    """`read.py convert` run by hand gets PHRO_READER_DEADLINE HAND_SECONDS from its start (the hook's child has
+    the hook's); one already set is kept."""
     import time
     p = sample("x")
-    for given in (None, "12345.5"):
+    for given in (None, "99999999999.5"):
         o = tmp()
         env = {k: v for k, v in os.environ.items() if k != "PHRO_READER_DEADLINE"}
         if given:
@@ -2555,7 +2555,7 @@ def test_convert_by_hand_has_the_hook_deadline():
         if given:
             assert got == given, got
         else:
-            assert t + gate.limits.CONVERT_SECONDS - 5 < float(got) < time.time() + gate.limits.CONVERT_SECONDS, got
+            assert t + gate.limits.HAND_SECONDS - 5 < float(got) < time.time() + gate.limits.HAND_SECONDS, got
 
 
 def test_reexec_has_a_timeout():

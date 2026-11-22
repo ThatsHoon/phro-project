@@ -222,7 +222,7 @@ def modules(cf, prefix: str, ctx) -> list | None:
         ctx.skipped["vba_module"] += max(lost, told - len(entries))
     out = []
     for k, m in enumerate(entries):
-        if ctx.vba_modules >= limits.VBA_MODULES or _spent(ctx):
+        if ctx.vba_modules >= limits.VBA_MODULES or _spent(ctx) or ctx.late():
             ctx.skipped["vba_module"] += len(entries) - k
             break
         ctx.vba_modules += 1

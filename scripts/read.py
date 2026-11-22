@@ -95,7 +95,7 @@ from pathlib import Path
 READ_PY = Path(__file__).resolve()
 
 import reader
-from reader.limits import CONVERT_SECONDS, ReadError
+from reader.limits import CONVERT_SECONDS, HAND_SECONDS, ReadError
 
 
 def _flat(x) -> str:
@@ -240,7 +240,7 @@ def cmd_convert(a) -> int:
     from reader import cache
     if not os.environ.get("PHRO_READER_DEADLINE"):
         import time
-        os.environ["PHRO_READER_DEADLINE"] = repr(time.time() + CONVERT_SECONDS)
+        os.environ["PHRO_READER_DEADLINE"] = repr(time.time() + HAND_SECONDS)
     a.file = source(a.file)
     src = Path(a.file)
     code = _reexec(a)

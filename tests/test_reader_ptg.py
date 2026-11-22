@@ -108,6 +108,24 @@ def test_unknown_token_is_none():
     assert text(num(1) + num(2), env8()) is None
 
 
+def test_a_formula_longer_than_excel_writes_is_none():
+    from reader import limits
+    most = (limits.FORMULA_CHARS - 2) // 2
+    assert len(text(ref8(0, 0) + bytes([0x15]) * most, env8())) == 2 + 2 * most
+    assert text(ref8(0, 0) + bytes([0x15]) * (most + 1), env8()) is None
+    assert text((ref8(0, 0) + bytes([0x15]) * most) * 2 + bytes([3]), env8()) is None
+    assert len(text(ref8(0, 0) + (ref8(0, 0) + bytes([3])) * 4000, env8())) == 12002
+    assert text(ref8(0, 0) + (ref8(0, 0) + bytes([3])) * 11000, env8()) is None
+
+
+def test_a_formula_of_more_bytes_than_a_record_holds_is_none():
+    from reader import limits
+    volatile = bytes([0x19, 1, 0, 0])
+    fits = (limits.FORMULA_BYTES - 5) // 4
+    assert text(ref8(0, 0) + volatile * fits, env8()) == "A1"
+    assert text(ref8(0, 0) + volatile * (fits + 1), env8()) is None
+
+
 if __name__ == "__main__":
     import inspect
     for name, fn in list(globals().items()):

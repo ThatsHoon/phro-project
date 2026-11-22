@@ -750,6 +750,8 @@ class _Reader:
         text, cp_of = story.text, story.cp_of
         on, drop, controls = self.on, self.drop, _CONTROL.finditer
         for i0, i1, st.run, st.seg in self.segments(story):
+            if self.ctx.late():
+                break
             pos = i0
             for m in controls(text, i0, i1):
                 i = m.start()

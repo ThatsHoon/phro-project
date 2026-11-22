@@ -504,6 +504,19 @@ def test_framing_probe_exemption():
         raise AssertionError("cut")
 
 
+def test_attr_takes_the_first_attribute_of_that_local_name():
+    import xml.etree.ElementTree as ET
+    from reader.containers.zipx import attr, local
+    el = ET.fromstring('<a xmlns:p="urn:p" xmlns:q="urn:q" q:name="2" name="1" p:name="3" rename="4" p:e="5"/>')
+    assert attr(el, "name") == "2" and attr(el, "rename") == "4" and attr(el, "e") == "5", el.attrib
+    assert attr(el, "ame") is None and attr(el, "nam", "d") == "d" and attr(el, "") is None
+    assert attr(ET.fromstring('<a name="1" xmlns:q="urn:q" q:name="2"/>'), "name") == "1"
+    assert local("{urn:p}name") == "name" and local("name") == "name" and local("{a}b}c") == "c"
+    assert local(None) == "" and local(ET.Comment) == "" and local("") == ""
+    many = [local("{urn:x}t%d" % k) for k in range(10000)]
+    assert many == ["t%d" % k for k in range(10000)] and local("{urn:x}t9999") == "t9999"
+
+
 def main():
     if sys.argv[1:] == ["measure"]:
         measure()

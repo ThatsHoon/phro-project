@@ -48,37 +48,70 @@ def parse(path, ctx, **opts):
     return doc
 
 
+def _end(default: float) -> float:
+    """The time.monotonic() time PHRO_READER_DEADLINE names (a wall-clock time), `default` with none set."""
+    import math
+    import os
+    import time
+    try:
+        wall = float(os.environ.get("PHRO_READER_DEADLINE", ""))
+    except ValueError:
+        return default
+    return time.monotonic() + (wall - time.time()) if math.isfinite(wall) else default
+
+
 def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     """Convert src into out_dir/out.md, out_dir/assets/ and out_dir/meta.json.
 
-    Parsing and rendering run inside an OCR session (`ocr.opened`) when an OCR engine is here: `backend`, the
-    (id, version) the caller keyed the read with, else `ocr.backend()`,
-    its results cached per picture under the cache root; its deadline is PHRO_READER_DEADLINE's, none without it.
+    With an OCR engine here (`backend`, the (id, version) the caller keyed the read with, else
+    `ocr_probe.backend()`), an OCR session (`ocr.opened`) is open while a pdf or a picture file is parsed, and
+    while a document holding a raster picture OCR may read is rendered; no other read loads the OCR modules. Its
+    results are cached per picture under the cache root; its deadline is PHRO_READER_DEADLINE's, none without it.
     meta.json then holds the OCR counts ("ocr"), and OCR_LATE among the warnings when the time left pages or
-    pictures unread."""
+    pictures unread. The convert ends at PHRO_READER_DEADLINE (CONVERT_SECONDS after the process start without it):
+    a format reads no further part past READ_SECONDS in CONVERT_SECONDS of that time (`Context.late`) and the render
+    writes no further block past RENDER_SECONDS in CONVERT_SECONDS of it. The output then holds what was read and says so, with READ_LATE
+    among the warnings and the seconds the read was given as meta "read_budget"."""
+    import contextlib
     import json
     import time
-    from . import markdown, ocr
-    from .limits import OCR_LATE, ReadError
+    from . import markdown
+    from .limits import CONVERT_SECONDS, OCR_LATE, READ_LATE, READ_SECONDS, RENDER_SECONDS, ReadError
     from .model import Context
     from . import text
     t0 = time.monotonic()
     src, out_dir = Path(src), Path(out_dir)
     ctx = Context()
     ctx.name = src.name
+    span = _end(STARTED + CONVERT_SECONDS) - STARTED
+    ctx.stop = STARTED + span * READ_SECONDS / CONVERT_SECONDS
     if FORMATS.get(ext_of(src)) in ("pdf", "djvu"):  # the page loop's deadline runs from the process start
         opts.setdefault("started", STARTED)
-    backend, store, deadline = ocr.backend() if backend is None else backend, None, None
-    if backend[0]:
-        from . import cache, raster
-        store = cache.OcrResults(cache.root() / cache.OCR)
+    if backend is None:
+        from . import ocr_probe
+        backend = ocr_probe.backend()
+
+    def session():
+        from . import cache, ocr, raster
         wall = raster._env_deadline()
         deadline = None if wall is None else time.monotonic() + (wall - time.time())
+        return stack.enter_context(ocr.opened(deadline, backend, store=cache.OcrResults(cache.root() / cache.OCR)))
+
     info = {}
-    with ocr.opened(deadline, backend, store=store):
-        doc = parse(src, ctx, **opts)
+    with contextlib.ExitStack() as stack:
+        eager = backend[0] and FORMATS.get(ext_of(src)) in ("pdf", "picture")
+        if eager:
+            session()
+        try:
+            doc = parse(src, ctx, **opts)
+        except ReadError as e:
+            if e.kind == "damaged" and ctx.skipped["time"]:
+                raise ReadError("damaged", "nothing read within the time limit") from None
+            raise
         out_dir.mkdir(parents=True, exist_ok=True)
-        md = markdown.render(doc, out_dir / "assets", hidden, ctx.skipped, info)
+        md = markdown.render(doc, out_dir / "assets", hidden, ctx.skipped, info,
+                             ocr=session if backend[0] and not eager else None,
+                             stop=STARTED + span * RENDER_SECONDS / CONVERT_SECONDS)
     if info["empty"] and info["lost"]:  # every content part failed: nothing was read
         raise ReadError("damaged", "nothing readable (could not read: " + ", ".join(info["lost"]) + ")")
     (out_dir / "out.md").write_text(md, encoding="utf-8", newline="\n")
@@ -87,6 +120,8 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     if "garbled" not in warnings and text.garble_ratio(md) > text.GARBLED:  # a parser may have found it (pub 97)
         warnings.append("garbled")
     warnings += [w for w in info["warnings"] if w not in warnings]  # the figure warnings, each once
+    if ctx.skipped["time"] or info["late"]:
+        warnings.append(READ_LATE)
     counts = info["ocr"]
     if counts and (counts["stopped_at"] is not None or counts["pictures_left"]) and OCR_LATE not in warnings:
         warnings.append(OCR_LATE)
@@ -104,6 +139,8 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
         "figures": info["figures"],  # metafile, PICT, WPG and TIFF pictures written as PNG
         "figures_left": info["figures_left"],  # those kept as the original file
     }
+    if READ_LATE in warnings:
+        meta["read_budget"] = round(ctx.stop - STARTED)  # seconds from the process start the read was given
     if doc.meta.get("vba"):
         meta["vba"] = len(doc.meta["vba"])  # VBA modules whose source is under assets/vba/
     if doc.meta and "engine" in doc.meta:

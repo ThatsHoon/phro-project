@@ -5,6 +5,7 @@ Parsers never write Markdown. Every block and inline accepts a keyword-only
 "deleted", a tracked insertion an Inserted (shown); each carries its author, "" when the format names none.
 """
 import collections
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Union
@@ -173,16 +174,30 @@ class Context:
 
     `vba` holds (name, kind, source) of the VBA modules read (containers.vba), `vba_modules` how many modules were
     opened (VBA_MODULES) and `vba_bytes` the bytes decompressed for them (VBA_BYTES). `embedded` is the document's
-    embedded.Objects, made by embedded.of."""
+    embedded.Objects, made by embedded.of. `stop` is the `clock()` time the read may run to (reader.convert sets
+    it), None for no limit."""
 
     def __init__(self):
         self.warnings: list[str] = []
         self.skipped: collections.Counter = collections.Counter()
+        self.stop = None
+        self.clock = time.monotonic
         self.name = ""
         self.vba: list = []
         self.vba_modules = 0
         self.vba_bytes = 0
         self.embedded = None
+
+    def late(self) -> bool:
+        """Whether the read's time is over. A format asks before each row, record, page or part, stops reading at
+        a yes and keeps what it read; the first yes is counted in skipped["time"]."""
+        if self.stop is None:
+            return False
+        if not self.skipped["time"]:
+            if self.clock() < self.stop:
+                return False
+            self.skipped["time"] = 1
+        return True
 
     @contextmanager
     def guard(self, kind: str):

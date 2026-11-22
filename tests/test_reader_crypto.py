@@ -150,6 +150,22 @@ def test_throughput():
     assert took < 10, took
 
 
+def test_rc4_of_the_system_matches_the_byte_loop():
+    import random
+    from reader.containers import crypto
+    rnd = random.Random(7)
+    for _ in range(200):
+        key = bytes(rnd.randrange(256) for _ in range(rnd.choice((1, 5, 16, 40, 128))))
+        data = bytes(rnd.randrange(256) for _ in range(rnd.choice((0, 1, 7, 300, 5000))))
+        skip = rnd.choice((0, 0, 3, 1024))
+        want = crypto._rc4_loop(key, data, skip)
+        assert crypto.rc4(key, data, skip) == want, (key, len(data), skip)
+        got = crypto._rc4_system(key, data, skip)
+        assert got is None or got == want, (key, len(data), skip)
+    if sys.platform == "win32":
+        assert crypto._rc4_system(b"Key", b"Plaintext", 0).hex() == "bbf316e8d940af0ad3"
+
+
 def test_rc4_vectors():
     assert rc4(b"Key", b"Plaintext").hex() == "bbf316e8d940af0ad3"
     assert rc4(b"Wiki", b"pedia").hex() == "1021bf0420"

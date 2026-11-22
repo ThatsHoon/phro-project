@@ -383,7 +383,9 @@ class _Reader:
                 total_close += 1
         seen_open = seen_close = 0
         leaf = None  # the group state in force when the root closed
-        for t in tokens(data):
+        for ticks, t in enumerate(tokens(data)):
+            if not ticks & 1023 and self.ctx.late():
+                break
             k = t[0]
             if k == OPEN:
                 seen_open += 1

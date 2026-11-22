@@ -695,6 +695,8 @@ class Body:
             return []
         out = []
         for c in el:
+            if self.ctx.late():
+                break
             if aside is not None and local(c.tag) == "frame":
                 got = self.frame_blocks(c, d)
                 (aside if got and all(id(b) in self.charts for b in got) else out).extend(got)

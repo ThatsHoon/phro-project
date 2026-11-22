@@ -5,6 +5,8 @@ Ported from Apache Tika (Apache-2.0) `mobi/PalmDatabase.java`, `mobi/PalmDoc.jav
 backwards, a PalmDOC distance of 0 or past the output, HUFF/CDIC tables out of bounds, phrase nesting, a phrase that
 refers to itself, a dictionary over `HUFF_DICT` and a phrase over `HUFF_PHRASE`.
 """
+import re
+
 from ..limits import ReadError
 
 MOBI_TEXT = 64 * 2**20
@@ -94,21 +96,28 @@ def _entry_size(rec: bytes, length: int) -> int:
     return size
 
 
+_PLAIN = re.compile(rb"[\x00\x09-\x7f]*")
+
+
 def palmdoc(rec: bytes, limit: int) -> tuple[bytes, bool]:
     """PalmDOC LZ77: (output, True when it stopped at `limit`). A bad back reference raises ValueError."""
     out = bytearray()
     i = 0
     end = len(rec)
     cut = False
+    plain = _PLAIN.match
     while i < end:
         if len(out) >= limit:
             cut = True
             break
         c = rec[i]
-        i += 1
         if c == 0 or 9 <= c <= 0x7F:
-            out.append(c)
-        elif c <= 8:
+            j = min(plain(rec, i).end(), i + limit - len(out))
+            out += rec[i:j]
+            i = j
+            continue
+        i += 1
+        if c <= 8:
             n = min(c, end - i)
             take = min(n, limit - len(out))
             out += rec[i:i + take]
@@ -132,12 +141,13 @@ def palmdoc(rec: bytes, limit: int) -> tuple[bytes, bool]:
             run = (pair & 7) + 3
             if dist == 0 or dist > len(out):
                 raise ValueError("PalmDOC distance outside the output")
-            for _ in range(run):
-                if len(out) >= limit:
-                    cut = True
-                    break
-                out.append(out[-dist])
-            if cut:
+            take = min(run, limit - len(out))
+            if dist >= take:
+                out += out[len(out) - dist:len(out) - dist + take]
+            else:
+                out += (bytes(out[-dist:]) * (take // dist + 1))[:take]
+            if take < run:
+                cut = True
                 break
     return bytes(out), cut
 

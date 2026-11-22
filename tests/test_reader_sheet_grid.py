@@ -743,7 +743,7 @@ def test_listing_stops_building_entries_at_the_cap_and_charges_the_label():
             yield f"e{i}", False
 
     p, = listed("L", entries(), Budget(), ctx, cap=3, total=1000)
-    assert para_text(p) == "L: e0; e1; e2; (997 more not listed)" and len(made) == 4, (para_text(p), len(made))
+    assert para_text(p) == "L: e0; e1; e2; (997 more not listed)" and len(made) == 3, (para_text(p), len(made))
     budget = Budget(chars=10)
     assert listed("A long label", [("x", False)], budget, ctx) == []
     assert ctx.skipped["fact"] == 998 and budget.chars == 10, (ctx.skipped, budget.chars)

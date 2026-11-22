@@ -95,10 +95,13 @@ LOST = (
 NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"),
          ("kf8_fallback", "KF8 layout (the MOBI 6 copy was read)"), ("plain_text", "book markup (read as plain text)"),
          ("page_images", "page images (text layer only)"), ("linked_data", "linked tables' data (in other files)"),
-         ("toc", "table of contents (its headings are not marked)"))
+         ("toc", "table of contents (its headings are not marked)"), ("time", "the rest past the time limit"))
 # counted too, but they only change formatting or reading order, so they are not reported
 INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story",
                       "char_positions", "attribute", "merge", "duplicate", "jet_page8"})  # char_positions: pdf glyph positions dropped, the text kept
+
+
+_REST = dict(NAMED)["time"]
 
 
 def lost(skipped) -> list:
@@ -233,6 +236,11 @@ class _Pictures:
 
     KINDS = frozenset({"png", "jpg", "bmp", "gif", "tiff"})
 
+    @classmethod
+    def reads(cls, im: Image) -> bool:
+        """Whether `im` is a picture of a kind OCR reads, not read by its parser."""
+        return not im.ocr and len(im.data) >= 16 and sniff(im.data) in cls.KINDS
+
     def __init__(self, s, doc: Doc, show: bool, grid):
         from . import raster
         self.s = s
@@ -248,7 +256,7 @@ class _Pictures:
             k = (im.data, im.page)
             if im.ocr or k in self.tickets or k in self.late or k in passed:
                 continue
-            if len(im.data) < 16 or sniff(im.data) not in self.KINDS:
+            if not self.reads(im):
                 passed.add(k)
                 continue
             late = bool(self.late) or time.monotonic() >= stop
@@ -382,8 +390,8 @@ def _broken(line: str) -> str:
         if end is None:
             a = line.rfind(" ", start + 1, stop + 1)
             if a < 0:
-                end = _SENTENCE_END.search(line, stop)
                 a = line.find(" ", stop)
+                end = _SENTENCE_END.search(line, stop, n if a < 0 else a + 1)
                 if end is not None and 0 <= a <= end.start():
                     end = None
         if end is not None and end.group(1) is not None:
@@ -444,8 +452,12 @@ def blocks_len(blocks, d=0) -> int:
 
 
 class _Render:
-    def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool, skipped=None, drop=frozenset(), pictures=None):
+    def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool, skipped=None, drop=frozenset(), pictures=None,
+                 counted=False, stop=None):
         self.doc, self.assets_dir, self.show = doc, assets_dir, show_hidden
+        self.counted = counted  # an OCR engine is here: the OCR counts are given though no picture went to it
+        self.stop = stop  # the time.monotonic() past which no further block is written
+        self.late = False  # a block was left out for it
         self.pictures = pictures  # the _Pictures OCR reads, or None without a session
         self.ocr = None  # the OCR counts (NO_OCR's keys and the pictures_ ones), set by body when there are any
         self.ocr_hint = False
@@ -597,6 +609,9 @@ class _Render:
             out = []
             for b in blocks:
                 if self.size > limits.MAX_OUTPUT:
+                    break
+                if self.stop is not None and (self.late or time.monotonic() >= self.stop):
+                    self.late = True
                     break
                 if self.depth == 1:
                     self.top += 1
@@ -1125,9 +1140,11 @@ class _Render:
             status.append(f"({self.hidden_count} hidden places left out)")
         if self.too_deep:
             status.append(f"({self.too_deep} places nested too deeply left out)")
+        if self.late and _REST not in self.unread:
+            self.unread.append(_REST)
         if self.unread:
             status.append("(could not read: " + ", ".join(self.unread) + ")")
-        if "ocr" in self.doc.meta or self.pictures is not None:
+        if "ocr" in self.doc.meta or self.pictures is not None or self.counted:
             p = self.pictures
             counts = {f"pictures_{k}": 0 if p is None else len(getattr(p, k)) for k in ("left", "doubtful", "blank")}
             self.ocr = dict(NO_OCR, **self.doc.meta.get("ocr", {}), **counts)
@@ -1229,7 +1246,7 @@ def _cap(s: str) -> str:
     return "\n".join(out) + "\n" + _TRUNC + "\n"
 
 
-def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=None) -> str:
+def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=None, ocr=None, stop=None) -> str:
     """Render a Doc to Markdown. The Doc is not modified.
 
     `skipped` is the parse context's skip counter; what it says was lost becomes a "(could not read: ...)" line.
@@ -1237,21 +1254,28 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     "images" (how many viewable images the output links to), "figures" and "figures_left" (pictures converted to PNG,
     and figure kinds kept as the original file), "warnings" (the figure warnings, sorted) and "pages" (the line numbers of the page heads it wrote, for stats; None
     when it wrote none, or a head did not survive to the output), "ocr" (doc.meta["ocr"]'s counts with
-    "pictures_left", "pictures_doubtful" and "pictures_blank"; None with neither those counts nor an OCR session)
+    "pictures_left", "pictures_doubtful" and "pictures_blank"; None with neither those counts nor an OCR session or `ocr`)
     and "ocr_hint" (the Korean hint was written).
 
     With an OCR session (`ocr.session()`), the raster pictures are sent to it first (`_Pictures`), and each one's
-    words follow its link as `Picture text:`, placed as `Figure text:` is.
+    words follow its link as `Picture text:`, placed as `Figure text:` is. With none open, `ocr` is the caller's way
+    to open one (it returns the session): it is called when the document holds a picture OCR may read. `stop` is
+    the time.monotonic() past which no further block is written: the output then says the rest was not read, and
+    `info` has "late" true.
     """
-    ocr = sys.modules.get(__package__ + ".ocr")  # no session can be open unless ocr was imported
-    s = ocr.session() if ocr is not None else None
-    pictures = _Pictures(s, doc, hidden, _Render(doc, Path(assets_dir), hidden)._grid) if s is not None else None
-    r = _Render(doc, Path(assets_dir), hidden, skipped, pictures=pictures)
+    mod = sys.modules.get(__package__ + ".ocr")  # no session can be open unless ocr was imported
+    s = mod.session() if mod is not None else None
+    grid = _Render(doc, Path(assets_dir), hidden)._grid
+    if s is None and ocr is not None and any(_Pictures.reads(im) for im in _images(doc, hidden, grid)):
+        s = ocr()
+    pictures = _Pictures(s, doc, hidden, grid) if s is not None else None
+    r = _Render(doc, Path(assets_dir), hidden, skipped, pictures=pictures, counted=ocr is not None, stop=stop)
     text = r.body()
     if r.dangling:  # a hidden-only note's mark was shown: render again with those marks left out (and unnumbered)
         drop = frozenset(r.dangling)
         del text, r  # the first render is not kept while the second runs
-        r = _Render(doc, Path(assets_dir), hidden, skipped, drop=drop, pictures=pictures)
+        r = _Render(doc, Path(assets_dir), hidden, skipped, drop=drop, pictures=pictures, counted=ocr is not None,
+                    stop=stop)
         text = r.body()
     text = _normalize(text)  # rebound, so the raw text is not held while _cap runs
     pages = None
@@ -1261,7 +1285,7 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
         text = text.replace(r.head_mark, "")
     md = _cap(text)
     if info is not None:
-        info.update(unread=r.unread, lost=r.lost, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked),
+        info.update(late=r.late, unread=r.unread, lost=r.lost, empty=r.empty and not r.hidden_count and not r.too_deep, images=len(r.linked),
                     pages=pages, figures=r.assets.figures, figures_left=r.assets.figures_left,
                     warnings=sorted(r.assets.warnings), ocr=r.ocr, ocr_hint=r.ocr_hint)
     return md

@@ -1287,6 +1287,8 @@ class Reader:
             if lst.tag != SLIDE_LIST:
                 continue
             for slide in lst:
+                if self.ctx.late():
+                    break
                 if slide.tag != SLIDE:
                     continue
                 number += 1
@@ -1322,6 +1324,8 @@ class Reader:
         …" lines in `Section.comments`. A sheet that fails counts `sheet` and adds nothing. The template's parts
         outside the workspaces are never read."""
         for ws in self._workspaces():
+            if self.ctx.late():
+                break
             with self.ctx.guard("sheet"):
                 sec = Section("sheet", (ws.get(WORKSPACE_NAME) or "").strip())
                 self.sink = sec.comments

@@ -226,7 +226,7 @@ class _Notes:
     def read(self, pending):
         """The notes of the tasks put, (task, ID, name, active) in order, read only while the notes are open."""
         for t, ident, name, active in pending:
-            if not self.open:
+            if not self.open or self.ctx.late():
                 break
             note = ""
             with self.ctx.guard("record"):

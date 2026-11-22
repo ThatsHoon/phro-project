@@ -518,6 +518,13 @@ def test_guard_isolates():
     raise AssertionError("ReadError swallowed")
 
 
+def test_garble_ratio_counts_each_bad_character():
+    for cp in list(range(0x300)) + [0xFFFC, 0xFFFD, 0xFFFE, 0x1F600]:
+        bad = cp == 0xFFFD or (cp < 32 and cp not in (9, 10)) or 127 <= cp < 160
+        assert text.garble_ratio("ab" + chr(cp) + "c") == (0.25 if bad else 0.0), hex(cp)
+    assert text.garble_ratio("") == 0.0 and text.garble_ratio("\x01\x02") == 1.0
+
+
 def test_garble_ratio_and_squash():
     assert text.garble_ratio("ab�\x01") == 0.5
     assert text.garble_ratio("a\tb\n") == 0.0 and text.garble_ratio("") == 0.0
@@ -780,6 +787,17 @@ def test_long_paragraph_is_broken_in_linear_time():
     out = R(doc)
     took = time.perf_counter() - t0
     assert max(map(len, out.split("\n"))) <= limits.LINE_CHARS and took < 2.0, took
+
+
+def test_long_words_are_broken_in_linear_time():
+    word = "x" * (limits.LINE_CHARS + 1)
+    doc = Doc(blocks=[P(" ".join([word] * 1500))])
+    t0 = time.perf_counter()
+    out = R(doc)
+    took = time.perf_counter() - t0
+    assert out.split() == [word] * 1500 and out.count(" ") == 0 and took < 2.0, took
+    long = "y" * (limits.LINE_CHARS + 5)
+    assert R(Doc(blocks=[P(long + "a. b " + long + " c")])) == long + "a.\nb\n" + long + "\nc\n"
 
 
 def test_document_text_cannot_write_a_merged_line():

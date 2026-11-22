@@ -602,7 +602,7 @@ def _walk6(data, start, end, story, st, depth=0):
     undo = False
     last_fail = -2   # where the last failed check was
     junk_end = -1    # the end of the extent the failed groups of the run declared
-    while pos < end:
+    while pos < end and not st.ctx.late():
         b = data[pos]
         if b < 0x80:
             stop = cls.find(b"\x00", pos - start)
@@ -1096,7 +1096,7 @@ def _walk5(data, start, end, story, st, depth=0):
     pos = start
     last_fail = -2
     junk_end = -1
-    while pos < end:
+    while pos < end and not st.ctx.late():
         b = data[pos]
         if 0x20 <= b <= 0x7E:
             stop = cls.find(b"\x00", pos - start)
@@ -1345,7 +1345,7 @@ def _walk42(data, start, end, story, st, depth=0):
     pos = start
     last_fail = -2
     junk_end = -1
-    while pos < end:
+    while pos < end and not st.ctx.late():
         b = data[pos]
         if 0x20 <= b <= 0x7E:
             stop = cls.find(b"\x00", pos - start)

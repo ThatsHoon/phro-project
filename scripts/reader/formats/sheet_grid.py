@@ -312,7 +312,11 @@ def listed(label: str, entries, budget, ctx, kind: str = "fact", cap: int = 0, t
         return []
     budget.chars -= len(label) + 2
     body, units, shown, visible = [], 0, 0, 0
-    for text, hid, *n in entries:
+    entries = iter(entries)
+    while not cap or units < cap:  # an entry past the cap is not asked for: asking may read it
+        text, hid, *n = next(entries, (None, False))
+        if text is None:
+            break
         units += n[0] if n else 1
         if cap and units > cap or len(text) + 2 > budget.chars:
             break
@@ -546,8 +550,8 @@ class _Spans:
 _REASONS = {"rows": "the {n:,}-row limit", "columns": "the {n:,}-column limit",
             "cells": "the document's {n:,}-cell limit", "characters": "the document's {n:,}-character limit",
             "scanned XML elements": "the workbook's {n:,}-element limit", "grid slots": "the {n:,}-slot table limit",
-            "XML error": "damaged XML"}
-_SPENT = frozenset({"cells", "characters", "scanned XML elements"})
+            "XML error": "damaged XML", "seconds": "the time limit"}
+_SPENT = frozenset({"cells", "characters", "scanned XML elements", "seconds"})
 
 
 def _drain(items):
@@ -659,6 +663,7 @@ class Grid:
         self.cut = False
         self._merges_cut = False
         self.why = None
+        self._row = None
         self.dim = None
         self.formulas = {}
         self._patterns = {}
@@ -672,7 +677,7 @@ class Grid:
         if not self.cut:
             self.why = (what, n, at)
         self.cut = True
-        self.ctx.warnings.append(f"sheet {self.name} cut at {n} {what}")
+        self.ctx.warnings.append(f"sheet {self.name} cut at " + ("the time limit" if what == "seconds" else f"{n} {what}"))
         self.ctx.skipped["sheet_cut"] += 1
         return False
 
@@ -689,6 +694,10 @@ class Grid:
             return False
         if not value or row < 0 or col < 0:
             return True
+        if row != self._row:
+            self._row = row
+            if self.ctx.late():
+                return self.stop("seconds", limits.READ_SECONDS, (row, None))
         b = self.budget
         if row >= limits.SHEET_ROWS:
             return self.stop("rows", limits.SHEET_ROWS, (row, col))
@@ -970,8 +979,8 @@ class Grid:
         if line:
             out.append(Para([Text(line)]))
         out.extend(self._formulas())
-        for label, entries in self.facts:
-            out.extend(listed(label, entries, self.budget, self.ctx, cap=limits.FACT_ITEMS))
+        for label, entries, total in self.facts:
+            out.extend(listed(label, entries, self.budget, self.ctx, cap=limits.FACT_ITEMS, total=total))
         return out
 
     @staticmethod
@@ -1021,9 +1030,10 @@ class Grid:
             return [Para([Text(f"{rng}: ")] + list(first.inlines), hidden=first.hidden)] + blocks[1:]
         return [Para([Text(f"{rng}:")])] + blocks
 
-    def fact(self, label: str, entries: list):
-        """A paragraph of the sheet's facts after its formulas: `label` and its (text, hidden) entries, by `listed`."""
-        self.facts.append((label, entries))
+    def fact(self, label: str, entries, total=None):
+        """A paragraph of the sheet's facts after its formulas: `label` and its (text, hidden) entries, by `listed`
+        (with `total`, an iterator of that many, as `listed` takes it)."""
+        self.facts.append((label, entries, total))
 
     def table(self, name: str, r1: int, r2: int, c1: int, c2: int, heads: bool, totals: bool):
         """A table's fact: `Table <name> <range>` and its header and totals rows."""
