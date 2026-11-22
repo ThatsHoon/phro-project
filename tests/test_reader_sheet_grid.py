@@ -711,7 +711,7 @@ def test_references_inside_quoted_sheet_names_and_structured_references_stay_tex
     assert time.perf_counter() - t0 < 2
 
 
-def test_formula_of_a_cell_without_a_value_is_listed_and_charged():
+def test_formula_of_a_cell_without_a_value_is_listed_and_spends_no_cell():
     budget = Budget(cells=20)
     g, _ = mk(budget=budget)
     for r in range(12):
@@ -719,15 +719,7 @@ def test_formula_of_a_cell_without_a_value_is_listed_and_charged():
             g.put(r, 1, "v")
         g.formula(r, 1, pattern(f'IF(A{r + 1}>4,"",A{r + 1}*2)', r, 1))
     assert para_text(g.sheet_blocks()[-1]) == 'Formulas: B1:B12 =IF(A1>4,"",A1*2)', g.sheet_blocks()[-1]
-    assert budget.cells == 8, budget.cells
-    g, ctx = mk(budget=Budget(cells=1))
-    g.formula(0, 0, pattern("1+1", 0, 0))
-    g.formula(1, 0, pattern("1+2", 1, 0))
-    g.formula(2, 0, pattern("1+3", 2, 0))
-    out = g.sheet_blocks()
-    assert [para_text(p) for p in out] == ["(Sheet cut at A2 by the document's 1-cell limit; not read from there on)",
-                                           "Formulas: A1 =1+1"], out
-    assert ctx.skipped["sheet_cut"] == 1, ctx.skipped
+    assert budget.cells == 12 and budget.blank == limits.BLANK_FORMULAS - 4, (budget.cells, budget.blank)
 
 
 def test_cut_paragraph_follows_the_tables_before_the_formulas():
@@ -821,6 +813,34 @@ def test_record_blocks_keep_one_table():
     fill(g, 0, 1, 2, 2)
     out = g.blocks()
     assert len(out) == 1 and out[0].caption == "" and out[0].origin == "" and len(out[0].rows[0]) == 3
+
+
+def test_valueless_formulas_have_their_own_budget():
+    ctx = Context()
+    budget = Budget()
+    budget.blank = 2
+    g = Grid("S", budget, ctx)
+    for r in range(4):
+        g.formula(r, 0, pattern("=B1&\"\"", r, 0))
+    assert len(g.formulas) == 2 and ctx.skipped["formula"] == 2 and not g.cut and g.formulas_cut, ctx.skipped
+    assert g.put(0, 1, "kept") and budget.cells == budget.cap_cells - 1
+
+
+def test_ruled_counts_each_range_once():
+    rules = [([f"A{k}:A{k}" for k in range(1, 201)], "x > 1")] * 3
+    assert ruled(rules)[0][0].endswith(f"A{limits.FACT_VALUES} and 180 more x > 1"), ruled(rules)
+
+
+def test_link_place_is_one_fragment():
+    ctx = Context()
+    ctx.name = "own.xlsx"
+    g = Grid("S", Budget(), ctx)
+    g.put(0, 0, "a")
+    g.put(1, 0, "b")
+    g.link(0, 0, 0, 0, "https://example.com/b.xlsx", "'Sheet 2'!A1")
+    g.link(1, 1, 0, 0, "https://example.com/p#top", "Sheet1!A1")
+    urls = [next(x.url for x in g.get(r, 0) if hasattr(x, "url")) for r in (0, 1)]
+    assert urls == ["https://example.com/b.xlsx#'Sheet%202'!A1", "https://example.com/p#top"], urls
 
 
 def main():

@@ -25,7 +25,7 @@ import re
 from bisect import bisect_left, bisect_right, insort
 from itertools import groupby
 from operator import itemgetter
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from .. import limits
 from ..markdown import blocks_len
@@ -235,18 +235,16 @@ def ruled(rules) -> list:
     ranges of one rule joined, a range said once, the first FACT_VALUES of them and how many more."""
     groups = {}
     for ranges, rule in rules:
-        got = groups.get(rule)
-        if got is None:
-            got = groups[rule] = [{}, 0]
-        for r in ranges:
-            if r in got[0]:
-                continue
-            if len(got[0]) < limits.FACT_VALUES:
-                got[0][r] = None
-            else:
-                got[1] += 1
-    return [(", ".join(shown) + (f" and {more:,} more" if more else "") + " " + rule, False)
-            for rule, (shown, more) in groups.items() if shown]
+        groups.setdefault(rule, {}).update(dict.fromkeys(ranges))
+    out = []
+    for rule, ranges in groups.items():
+        shown, more = list(ranges)[:limits.FACT_VALUES], len(ranges) - limits.FACT_VALUES
+        if shown:
+            out.append((", ".join(shown) + (f" and {more:,} more" if more > 0 else "") + " " + rule, False))
+    return out
+
+
+_PLACE_SAFE = "!$&'()*+,;=:@/?"
 
 
 def _leaf(url: str) -> str:
@@ -333,11 +331,13 @@ def _column_major(item):
 
 
 class Budget:
-    """Cells and characters left for a document's sheets; shared, so embedded workbooks count too."""
+    """Cells, characters and valueless formula cells left for a document's sheets; shared, so embedded workbooks
+    count too."""
 
     def __init__(self, cells=None, chars=None):
         self.cells = self.cap_cells = limits.SHEET_CELLS if cells is None else cells
         self.chars = self.cap_chars = limits.SHEET_CHARS if chars is None else chars
+        self.blank = limits.BLANK_FORMULAS
 
 
 class _Ranges:
@@ -650,13 +650,13 @@ class Grid:
         return self.cells.get((row, col))
 
     def link(self, r1: int, r2: int, c1: int, c2: int, url, place) -> int:
-        """Decision 9: wrap the valued cells of the range in a Link to `url`, `#place` after it when the link names
-        a place in that file, or follow them with `→ place` for a place in this workbook (no URL, or one whose
+        """Decision 9: wrap the valued cells of the range in a Link to `url`, `#place` after it (as one fragment, its spaces escaped; a URL that has a
+        fragment keeps its own) when the link names a place in that file, or follow them with `→ place` for a place in this workbook (no URL, or one whose
         last part is this file's own name); a cell already linked, or holding only note marks, is left. The cost of
         the walk (`held`) is returned; past the character budget the rest keep their old values."""
         if url and place and self.ctx.name and _leaf(url) == self.ctx.name.casefold():
             url = None
-        target = f"{url}#{place}" if url and place else url
+        target = f"{url}#{quote(place, safe=_PLACE_SAFE)}" if url and place and "#" not in url else url
         found, cost = self.held(r1, r2, c1, c2)
         for r, c in found:
             value = self.get(r, c)
@@ -931,16 +931,22 @@ class Grid:
 
     def formula(self, row: int, col: int, pat: tuple):
         """Keep a cell's formula pattern (from `pattern`) for the sheet's formulas paragraph. A cell that holds no
-        value (its result is empty) is charged a cell; past the cells the sheet is cut there, as `put` cuts it."""
+        value (its result is empty) is charged to BLANK_FORMULAS, the document's; past them it is counted under
+        `formula` and the sheet goes on."""
         at = (row, col)
         if at not in self.cells and at not in self.formulas:
             if self.cut or row < 0 or col < 0 or row >= limits.SHEET_ROWS or col >= limits.SHEET_COLS:
                 return
-            if self.budget.cells <= 0:
-                self.stop("cells", self.budget.cap_cells, at)
+            if self.budget.blank <= 0:
+                self.ctx.skipped["formula"] += 1
                 return
-            self.budget.cells -= 1
+            self.budget.blank -= 1
         self.formulas[at] = self._patterns.setdefault(pat, pat)
+
+    @property
+    def formulas_cut(self) -> bool:
+        """Whether a formula of a cell with no value would now be counted, not kept."""
+        return self.budget.blank <= 0
 
     def _formulas(self) -> list:
         """Decision 5: the sheet's formulas as one paragraph: `Formulas: ` and an entry for each pattern, its ranges

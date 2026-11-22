@@ -461,6 +461,15 @@ def test_defined_names_workbook_first_sheet_scoped_on_the_sheet():
     assert texts(doc.blocks[1].blocks) == ["A1: v"], doc.blocks[1].blocks
 
 
+def test_workbook_names_past_the_cap_are_counted():
+    book = "<definedNames>" + "".join(f'<definedName name="N{k}">S!$A${k + 1}</definedName>'
+                                      for k in range(limits.FACT_ITEMS + 7)) + "</definedNames>"
+    doc, ctx, _ = parsed([sheet(ONE)], book=book)
+    names = texts(doc.blocks[:1])[0]
+    assert names.startswith("Names: N0 = S!$A$1; ") and f"N{limits.FACT_ITEMS} =" not in names, names[-80:]
+    assert ctx.skipped["fact"] == 7, ctx.skipped
+
+
 def test_slicer_and_timeline_cache_names_left_out():
     """The name Excel keeps for each slicer and timeline cache (`Slicer_Product = #N/A`) is its own record, not
     content: a workbook name that a slicerCache or timelineCache part names is left out."""
@@ -549,7 +558,8 @@ def test_autofilter_range_and_criteria():
     after = ('<autoFilter ref="A1:B3"><filterColumn colId="0"><filters blank="1"><filter val="x"/>'
              '<dateGroupItem year="2024" month="3" dateTimeGrouping="month"/>'
              '<dateGroupItem year="2025" month="1" day="9" dateTimeGrouping="day"/>'
-             '<dateGroupItem year="2026" dateTimeGrouping="year"/></filters></filterColumn></autoFilter>')
+             '<dateGroupItem year="2026" dateTimeGrouping="year"/><dateGroupItem dateTimeGrouping="year"/>'
+             '<dateGroupItem month="4" dateTimeGrouping="month"/></filters></filterColumn></autoFilter>')
     doc, _, _ = parsed([sheet(ONE, after=after)])
     assert texts(doc.blocks[0].blocks)[-1] == "Filter A1:B3: A is x, 2024-03, 2025-01-09, 2026, (blank)", \
         doc.blocks[0].blocks
@@ -710,7 +720,7 @@ def test_hyperlink_location_is_named():
     doc, ctx, _ = parsed([sh])
     cells = doc.blocks[0].blocks[0].rows[0]
     assert cells[0].blocks[0].inlines == [Text("go"), Text(" → Lists!A1")], cells[0].blocks
-    assert cells[1].blocks[0].inlines == [Link("../a.xlsx#'My Sheet'!B2", [Text("jump")])], cells[1].blocks
+    assert cells[1].blocks[0].inlines == [Link("../a.xlsx#'My%20Sheet'!B2", [Text("jump")])], cells[1].blocks
     assert not ctx.skipped, ctx.skipped
     ctx = Context()
     ctx.name = "a.xlsx"
@@ -1206,6 +1216,19 @@ def measure(n=2_000_000):
     print(f"SCAN {n} {secs:.2f}")
     secs, ctx = worst()
     print(f"WORST {secs:.2f}")
+
+
+def test_valueless_formulas_do_not_spend_the_cells_of_later_sheets():
+    old = limits.SHEET_CELLS, limits.BLANK_FORMULAS
+    limits.SHEET_CELLS, limits.BLANK_FORMULAS = 50, 20
+    try:
+        blank = "".join(f'<row r="{r}">' + "".join(f'<c r="{col}{r}" t="str"><f>IF($A{r}="","",1)</f><v></v></c>'
+                                                    for col in "BCDEFGHIJK") + "</row>" for r in range(1, 11))
+        data = '<row r="1"><c r="A1" t="inlineStr"><is><t>kim</t></is></c><c r="B1"><v>42</v></c></row>'
+        out, ctx = md([sheet(blank, name="Template"), sheet(data, name="Data")])
+    finally:
+        limits.SHEET_CELLS, limits.BLANK_FORMULAS = old
+    assert "|kim|42|" in out and ctx.skipped["formula"] >= 80 and not ctx.skipped["sheet_cut"], (out, ctx.skipped)
 
 
 def main():

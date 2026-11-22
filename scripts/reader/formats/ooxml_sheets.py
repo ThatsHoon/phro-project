@@ -137,8 +137,11 @@ def _sqref(text) -> str:
 
 
 def _date_group(el) -> str:
-    """A `dateGroupItem` as the date it picks, down to its grouping: 2024, 2024-03, 2024-03-09, then the time."""
+    """A `dateGroupItem` as the date it picks, down to its grouping: 2024, 2024-03, 2024-03-09, then the time; "" for one
+    with no year."""
     parts = [_int(attr(el, k)) for k in ("year", "month", "day", "hour", "minute", "second")]
+    if parts[0] is None:
+        return ""
     day = "-".join(f"{v:02d}" for v in parts[:3] if v is not None)
     time = ":".join(f"{v:02d}" for v in parts[3:] if v is not None)
     return f"{day} {time}".strip()
@@ -226,7 +229,9 @@ class _Facts:
                 self.owner, self.pending = None, []
         elif tag == "filter" or tag == "dateGroupItem":
             if len(self.vals) < limits.FACT_VALUES:
-                self.vals.append(attr(el, "val") or "" if tag == "filter" else _date_group(el))
+                val = attr(el, "val") or "" if tag == "filter" else _date_group(el)
+                if val or tag == "filter":
+                    self.vals.append(val)
             else:
                 self.more += 1
         elif tag in _FILTERS:
@@ -1066,7 +1071,7 @@ def _book_facts(pkg, wb, budget, ctx) -> list:
             links.append((f"[{n}] {target}", False))
     caches = _cache_names(pkg, wb, ctx)
     names = [e for e in wb.names if e[0].split(" = ", 1)[0] not in caches]
-    return (sheet_grid.listed("Names", names, budget, ctx) + sheet_grid.listed("External links", links, budget, ctx)
+    return (sheet_grid.listed("Names", names, budget, ctx, cap=limits.FACT_ITEMS) + sheet_grid.listed("External links", links, budget, ctx, cap=limits.FACT_ITEMS)
             + sheet_grid.listed("Protected", wb.protect, budget, ctx))
 
 

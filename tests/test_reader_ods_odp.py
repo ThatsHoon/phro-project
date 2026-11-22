@@ -144,17 +144,23 @@ def test_repeated_empty_merges_and_formulas_are_budgeted():
     assert time.monotonic() - t0 < 20 and ctx.skipped["sheet_cut"] == 1, (time.monotonic() - t0, ctx.skipped)
     form = c(extra='table:number-columns-repeated="1000" table:formula="of:=[.A1]+1" office:value-type="string" '
                    'office:string-value=""')
-    xml = sheet("S", [row(c("x")), row(form, extra='table:number-rows-repeated="100000"')])
+    xml = sheet("S", [row(c("x")), row(form, extra='table:number-rows-repeated="100000"')]) + sheet("T", [row(c("kept"))])
     t0 = time.monotonic()
-    old = limits.SHEET_CELLS
-    limits.SHEET_CELLS = 5000
+    old = limits.BLANK_FORMULAS
+    limits.BLANK_FORMULAS = 5000
     try:
         doc, ctx = parse(ods(xml))
     finally:
-        limits.SHEET_CELLS = old
-    assert time.monotonic() - t0 < 20 and ctx.skipped["sheet_cut"] == 1, (time.monotonic() - t0, ctx.skipped)
-    assert any("5,000-cell limit" in "".join(i.text for i in b.inlines) for b in doc.blocks[0].blocks
-               if isinstance(b, Para)), doc.blocks[0].blocks[-3:]
+        limits.BLANK_FORMULAS = old
+    assert time.monotonic() - t0 < 20 and not ctx.skipped["sheet_cut"], (time.monotonic() - t0, ctx.skipped)
+    assert ctx.skipped["formula"] >= 100_000 * 1000 - 5000 - limits.FORMULA_GROUPS, ctx.skipped
+    assert "kept" in markdown.render(doc, tmp() / "a"), ctx.skipped
+    spanned = "".join(c(extra='table:number-columns-spanned="2"') + "<table:covered-table-cell/>" for _ in range(1000))
+    xml = "".join(sheet(f"S{k}", [row(c("x")), row(spanned, extra='table:number-rows-repeated="100000"')])
+                  for k in range(3))
+    t0 = time.monotonic()
+    doc, ctx = parse(ods(xml))
+    assert time.monotonic() - t0 < 12, (time.monotonic() - t0, ctx.skipped)
 
 
 def test_value_types():

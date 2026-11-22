@@ -138,7 +138,7 @@ class Workbook:
         names = [e for e in (ptg.named(n, env, self.ctx) for n in self.g.names if n.itab == 0) if e]
         links = [(f"[{k}] {p}", False) for k, p in enumerate(self.g.books, 1) if p]
         b, ctx = self.budget, self.ctx
-        return (sheet_grid.listed("Names", names, b, ctx) + sheet_grid.listed("External links", links, b, ctx)
+        return (sheet_grid.listed("Names", names, b, ctx, cap=limits.FACT_ITEMS) + sheet_grid.listed("External links", links, b, ctx, cap=limits.FACT_ITEMS)
                 + sheet_grid.listed("Protected", [(p, False) for p in self.g.protect], b, ctx))
 
     def _charts(self, shown: list) -> dict:

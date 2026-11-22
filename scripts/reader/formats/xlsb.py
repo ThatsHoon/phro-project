@@ -320,7 +320,7 @@ class _Sheets:
             if target:
                 links.append((f"[{k}] {target}", False))
         b, ctx = self.budget, self.ctx
-        return (sheet_grid.listed("Names", names, b, ctx) + sheet_grid.listed("External links", links, b, ctx)
+        return (sheet_grid.listed("Names", names, b, ctx, cap=limits.FACT_ITEMS) + sheet_grid.listed("External links", links, b, ctx, cap=limits.FACT_ITEMS)
                 + sheet_grid.listed("Protected", self.wb.protect, b, ctx))
 
     def _external(self, rid: str) -> str | None:
