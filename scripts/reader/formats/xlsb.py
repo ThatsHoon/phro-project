@@ -346,9 +346,10 @@ class _Sheets:
         return None
 
     def sections(self) -> list:
-        out = []
+        read = []
         for no, (name, part, state) in enumerate(self.wb.sheets, 1):
             blocks = None  # stays None when the guard swallows an error, so the check below is real
+            self.draw.grid = None
             try:
                 with self.ctx.guard("sheet"):
                     blocks = self.sheet(name, part, no, state in (1, 2))
@@ -361,11 +362,12 @@ class _Sheets:
                 continue
             if not blocks and part in self.wb.chartsheets:  # a chartsheet with nothing drawn has no section
                 continue
-            if state in (1, 2):
-                out.append(Section("sheet", name, blocks=sheet_grid.hide(blocks), hidden="hidden"))
-            else:
-                out.append(Section("sheet", name, blocks=blocks))
-        return out
+            if state not in (1, 2):
+                self.draw.wrote(name)
+            read.append((name, state in (1, 2), blocks))
+        self.draw.settle()
+        return [Section("sheet", name, blocks=sheet_grid.hide(blocks), hidden="hidden") if hidden
+                else Section("sheet", name, blocks=blocks) for name, hidden, blocks in read]
 
     def show(self, value, style: int) -> str:
         code = self._code.get(style)
@@ -453,7 +455,9 @@ class _Sheets:
         try:
             if grid.place_notes(self._marks(no, rels, keys), self.notes, hidden):
                 self._cut_notes()
-            blocks = grid.sheet_blocks() + self.draw.blocks(part)
+            blocks = grid.sheet_blocks()
+            self.draw.grid = grid
+            blocks += self.draw.blocks(part)
             if sheet_grid.sweep(blocks, keys, self.notes):
                 self._cut_notes()
         except BaseException:

@@ -22,7 +22,7 @@ from .. import diagram, limits
 from ..containers.zipx import attr, kids, local, first
 from ..limits import ReadError
 from ..model import Para, Text
-from . import ooxml_base, smartart
+from . import ooxml_base, sheet_grid, smartart
 from .drawingml import Xf, arrows, glue, is_line, kid, kind, num, nv, rule, xfrm
 
 MAX_ANCHORS = 10_000  # drawing anchors one drawing part reads
@@ -54,7 +54,8 @@ def _text(el) -> str:
 
 
 class Drawings:
-    """The drawings of one workbook, sharing one image byte count and one chart cell count."""
+    """The drawings of one workbook, sharing one image byte count and one chart cell count. Its charts and what
+    its shown sheets wrote are kept, so a chart drawn from cells a sheet shows keeps its caption alone (`settle`)."""
 
     def __init__(self, pkg, ctx):
         self.pkg, self.ctx = pkg, ctx
@@ -65,6 +66,21 @@ class Drawings:
         self.shape_chars = 0         # shape text characters placed (SHAPE_CHARS)
         self.shape_cut = False       # shape text was dropped past SHAPE_CHARS (counted once)
         self.budget = diagram.ConnectionBudget(ctx)  # the workbook's edges, shared by every drawing part's diagram
+        self.charts: list = []       # chart tables placed
+        self.charted = any("chart" in n.lower() for n in pkg.names)  # a package without such a member has no chart
+        self.written: dict = {}      # casefolded name of a shown sheet -> its Grid.written(), None for a name met twice
+        self.grid = None             # the Grid the sheet being read made its blocks from
+
+    def wrote(self, name: str) -> None:
+        """The sheet whose blocks were made from `grid` last is in the output, shown."""
+        if self.charted and self.grid is not None:
+            key = name.casefold()
+            self.written[key] = None if key in self.written else self.grid.written()
+        self.grid = None
+
+    def settle(self) -> None:
+        """Once every sheet is read: sheet_grid.settle for the workbook's charts."""
+        sheet_grid.settle(self.charts, self.written)
 
     def blocks(self, part: str, rels: dict | None = None) -> list:
         """The charts and pictures of the drawing parts that the sheet relationships name, in anchor order. `rels` is
@@ -216,6 +232,7 @@ class Drawings:
             self.ctx.skipped["chart"] += 1
         else:
             out.append(tbl)
+            self.charts.append(tbl)
 
     def picture(self, part: str, rid, out: list) -> None:
         img = ooxml_base.image(self.pkg, part, rid)

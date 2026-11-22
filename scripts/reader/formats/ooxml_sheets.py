@@ -495,9 +495,10 @@ class _Sheets:
         self._code: dict[int, str] = {}
 
     def sections(self) -> list:
-        out = []
+        read = []
         for no, (name, part, state) in enumerate(self.wb.sheets, 1):
             blocks = None  # stays None when the guard swallows an error, so the check below is real
+            self.draw.grid = None
             try:
                 with self.ctx.guard("sheet"):
                     blocks = self.sheet(name, part, no, state in _HIDDEN)
@@ -508,11 +509,12 @@ class _Sheets:
                 continue
             if not blocks and part in self.wb.chartsheets:  # a chartsheet with nothing drawn has no section
                 continue
-            if state in _HIDDEN:
-                out.append(Section("sheet", name, blocks=sheet_grid.hide(blocks), hidden="hidden"))
-            else:
-                out.append(Section("sheet", name, blocks=blocks))
-        return out
+            if state not in _HIDDEN:
+                self.draw.wrote(name)
+            read.append((name, state in _HIDDEN, blocks))
+        self.draw.settle()
+        return [Section("sheet", name, blocks=sheet_grid.hide(blocks), hidden="hidden") if hidden
+                else Section("sheet", name, blocks=blocks) for name, hidden, blocks in read]
 
     def code(self, style: int) -> str:
         """The format code of a cell style index; an index past the `cellXfs` list is General."""
@@ -634,6 +636,7 @@ class _Sheets:
         self._link(grid, links)
         self._facts(grid, part, no, facts, relmap)
         blocks = grid.sheet_blocks()
+        self.draw.grid = grid
         self._sweep(blocks, keys)
         return blocks + self._drawn(part, relmap)
 

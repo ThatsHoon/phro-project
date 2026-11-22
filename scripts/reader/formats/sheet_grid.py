@@ -18,6 +18,8 @@ it.
 first value trimmed and a long run of empty rows shrunk to _GAP.
 The workbook readers share how a hyperlink lands on its cells (`Grid.link`), how note marks land on theirs
 (`Grid.place_notes`) and how notes whose mark did not reach the output are dropped (`sweep`).
+A workbook chart drawn from cells a shown sheet wrote keeps its caption alone (`settle`): the caption names the range,
+and the sheet's own table holds the cells. `Grid.written()` is what a sheet wrote, kept after its cells are let go.
 """
 import copy
 import heapq
@@ -334,6 +336,60 @@ def _row_name(r: int) -> str:
 
 def _column_major(item):
     return item[0][1], item[0][0]
+
+
+class Written:
+    """What a sheet read whole wrote to the output: the columns holding a value in each row, as runs, its hidden rows
+    and columns and its merged ranges."""
+
+    def __init__(self, grid):
+        rows = {}
+        for r, c in sorted(grid.cells):
+            runs = rows.get(r)
+            if runs is None:
+                rows[r] = [(c, c)]
+            elif runs[-1][1] == c - 1:
+                runs[-1] = (runs[-1][0], c)
+            else:
+                runs.append((c, c))
+        self.rows, self.rows_h, self.cols_h, self.merges = rows, grid.rows_h, grid.cols_h, grid.merges
+
+    def holds(self, box, parts, left: list) -> bool:
+        """Whether the output shows every cell of the range `box` as the sheet holds it: no hidden row or column and
+        no merged range meets it, and every cell of each of `parts` holds a value. All are (r1, c1, r2, c2). The rows
+        and merged ranges looked at are charged to `left[0]`; past it the answer is no."""
+        r1, c1, r2, c2 = box
+        if (self.rows_h and self.rows_h.within(r1, r2)) or (self.cols_h and self.cols_h.within(c1, c2)):
+            return False
+        left[0] -= len(self.merges) + sum(p[2] - p[0] + 1 for p in parts)
+        if left[0] < 0:
+            return False
+        if any(m[0] <= r2 and m[2] >= r1 and m[1] <= c2 and m[3] >= c1 for m in self.merges):
+            return False
+        for a, b, c, d in parts:
+            for r in range(a, c + 1):
+                runs = self.rows.get(r)
+                if not runs:
+                    return False
+                i = bisect_right(runs, (b, limits.SHEET_COLS)) - 1
+                if i < 0 or runs[i][1] < d:
+                    return False
+        return True
+
+
+def settle(charts, written: dict) -> None:
+    """A workbook chart whose data range a shown sheet wrote whole keeps its caption alone: the caption names the
+    range and the sheet's table holds the cells. `charts` are the workbook's chart Tables, `written` {the casefolded
+    name of a shown sheet: its Grid.written()}. The charts share one limits.SHEET_SCAN of rows looked at; past it
+    they keep their tables."""
+    left, seen = [limits.SHEET_SCAN], set()
+    for t in charts:
+        if not t.source or id(t) in seen:
+            continue
+        seen.add(id(t))
+        sheet = written.get(t.source[0].casefold())
+        if sheet is not None and sheet.holds(t.source[1], t.source[2:], left):
+            t.rows = []
 
 
 class Budget:
@@ -761,6 +817,11 @@ class Grid:
     def _stop_merges(self):
         self.ctx.warnings.append(f"sheet {self.name} cut at {_MERGES} merged ranges")
         self.ctx.skipped["sheet_cut"] += 1
+
+    def written(self):
+        """What the sheet wrote, once its blocks are made: None for a sheet that was cut, or whose merged ranges
+        were."""
+        return None if self.cut or self._merges_cut else Written(self)
 
     def hide_row(self, r: int):
         self.hide_rows(r, r)

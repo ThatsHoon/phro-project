@@ -90,6 +90,7 @@ class Workbook:
                 raise ReadError("encrypted")
         self.cells: dict[int, dict] = {}
         self._blocks: dict[int, list] = {}
+        self._grids: dict = {}  # sheet index -> its Grid, for the charts drawn from its cells
         self._fmt: dict[int, str] = {}
         self.flate = flate.Budget()  # one inflate budget and one image byte count for the whole document's pictures
         self.spent = [0, 0]  # image bytes placed, picture placements read
@@ -125,6 +126,13 @@ class Workbook:
                     continue
             shown.append((i, ref, blocks))
         tables = self._charts(shown)
+        charts = [t for found in tables.values() for t in found]
+        named, written = {t.source[0].casefold() for t in charts if t.source}, {}
+        for i, ref, _ in shown:
+            key = ref.name.casefold()
+            if key in named and not ref.state and i in self._grids:
+                written[key] = None if key in written else self._grids[i].written()
+        sheet_grid.settle(charts, written)
         out = []
         for i, ref, blocks in shown:
             blocks = blocks + tables.get(i, [])
@@ -193,6 +201,7 @@ class Workbook:
                 self.notes.pop(k, None)
             raise
         self._blocks[i] = blocks
+        self._grids[i] = grid
         return blocks
 
     def _sheet_tail(self, i, ref, grid, sh, keys) -> list:

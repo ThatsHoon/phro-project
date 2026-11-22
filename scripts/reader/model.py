@@ -110,6 +110,7 @@ class Table:
     hidden_cols: frozenset = frozenset()
     hidden: str = _hid()
     origin: str = ""  # a sheet table's top-left cell (A1), the base of its addresses; "" off a sheet
+    source: tuple = ()  # a workbook chart's data: the sheet's name, then (r1, c1, r2, c2) of its charts.data_block
 
 
 @dataclass
