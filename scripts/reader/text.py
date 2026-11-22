@@ -3,14 +3,14 @@ import re
 
 
 GARBLED = 0.05   # a garble_ratio past it makes the text "garbled" (reader.convert, pub_2k's 97 text)
+_BAD = re.compile("[\ufffd\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def garble_ratio(s: str) -> float:
     """Share of U+FFFD and control characters other than tab and newline."""
     if not s:
         return 0.0
-    bad = sum(1 for ch in s if ch == "�" or (ord(ch) < 32 and ch not in "\t\n") or 127 <= ord(ch) < 160)
-    return bad / len(s)
+    return len(_BAD.findall(s)) / len(s)
 
 
 def squash(s: str) -> str:

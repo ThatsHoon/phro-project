@@ -122,13 +122,23 @@ def parse_xml_ns(data: bytes, max_nodes: int | None = None):
     return root, builder.ns
 
 
+_LOCAL: dict = {}
+_LOCALS = 4096  # tag names `local` remembers
+
+
 def local(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+    name = _LOCAL.get(tag)
+    if name is None:
+        name = tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+        if len(_LOCAL) < _LOCALS:
+            _LOCAL[tag] = name
+    return name
 
 
 def attr(el, name: str, default=None):
+    n = -len(name)
     for k, v in el.attrib.items():
-        if local(k) == name:
+        if k.endswith(name) and (len(k) == -n or k[n - 1] == "}"):
             return v
     return default
 

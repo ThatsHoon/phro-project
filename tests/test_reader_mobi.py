@@ -165,6 +165,64 @@ def test_palmdoc_bad_distance():
     raises(ValueError, palmdoc, b"abc" + bytes([0x80 | v >> 8, v & 0xFF]), 100)  # past the output
 
 
+def palmdoc_by_byte(rec, limit):
+    """PalmDOC LZ77 one byte at a time, as the format describes it: what `palmdoc` must give."""
+    out, i, end = bytearray(), 0, len(rec)
+    while i < end:
+        if len(out) >= limit:
+            return bytes(out), True
+        c = rec[i]
+        i += 1
+        if c == 0 or 9 <= c <= 0x7F:
+            out.append(c)
+        elif c <= 8:
+            n = min(c, end - i)
+            take = min(n, limit - len(out))
+            out += rec[i:i + take]
+            i += c
+            if take < n:
+                return bytes(out), True
+        elif c >= 0xC0:
+            out.append(0x20)
+            if len(out) >= limit:
+                return bytes(out), True
+            out.append(c ^ 0x80)
+        else:
+            if i >= end:
+                break
+            pair = (c << 8) | rec[i]
+            i += 1
+            dist, run = (pair >> 3) & 0x7FF, (pair & 7) + 3
+            if dist == 0 or dist > len(out):
+                raise ValueError("distance")
+            for _ in range(run):
+                if len(out) >= limit:
+                    return bytes(out), True
+                out.append(out[-dist])
+    return bytes(out), False
+
+
+def test_palmdoc_matches_the_byte_by_byte_decoder():
+    import random
+    rnd = random.Random(11)
+    seen = set()
+    for k in range(4000):
+        n = rnd.randrange(0, 60)
+        kind = k % 4
+        rec = bytes(rnd.choice((rnd.randrange(256), rnd.randrange(9, 0x80), rnd.randrange(0x80, 0xC0), 1, 8))
+                    if kind else rnd.randrange(9, 0x80) for _ in range(n))
+        limit = rnd.choice((0, 1, 2, 7, 30, 200))
+        try:
+            want = palmdoc_by_byte(rec, limit)
+        except ValueError:
+            raises(ValueError, palmdoc, rec, limit)
+            seen.add("error")
+            continue
+        assert palmdoc(rec, limit) == want, (rec, limit, palmdoc(rec, limit), want)
+        seen.add(want[1])
+    assert seen == {"error", True, False}, seen
+
+
 def test_palmdoc_distance_off_by_one():
     v = (4 << 3) | 0
     raises(ValueError, palmdoc, b"abc" + bytes([0x80 | v >> 8, v & 0xFF]), 100)   # len(out) + 1

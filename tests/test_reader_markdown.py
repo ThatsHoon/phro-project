@@ -518,6 +518,13 @@ def test_guard_isolates():
     raise AssertionError("ReadError swallowed")
 
 
+def test_garble_ratio_counts_each_bad_character():
+    for cp in list(range(0x300)) + [0xFFFC, 0xFFFD, 0xFFFE, 0x1F600]:
+        bad = cp == 0xFFFD or (cp < 32 and cp not in (9, 10)) or 127 <= cp < 160
+        assert text.garble_ratio("ab" + chr(cp) + "c") == (0.25 if bad else 0.0), hex(cp)
+    assert text.garble_ratio("") == 0.0 and text.garble_ratio("\x01\x02") == 1.0
+
+
 def test_garble_ratio_and_squash():
     assert text.garble_ratio("ab�\x01") == 0.5
     assert text.garble_ratio("a\tb\n") == 0.0 and text.garble_ratio("") == 0.0
