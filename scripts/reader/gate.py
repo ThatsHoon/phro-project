@@ -37,7 +37,8 @@ SAVE_AS = {**dict.fromkeys(("doc", "docx", "docm", "dotx", "dotm", "rtf", "odt",
                             "wpt", "pages"), "docx or pdf"),
            **dict.fromkeys(("xls", "xlsx", "xlsm", "xltx", "xltm", "xlsb", "ods", "numbers"), "xlsx or pdf"),
            **dict.fromkeys(("ppt", "pptx", "pptm", "ppsx", "potx", "potm", "ppsm", "odp", "key"), "pptx or pdf"),
-           **dict.fromkeys(("hwp", "hwpx"), "hwpx or pdf")}
+           **dict.fromkeys(("hwp", "hwpx"), "hwpx or pdf"),
+           **dict.fromkeys(("vsd", "vst"), "vsdx or pdf"), **dict.fromkeys(("mpp", "mpt"), "xlsx or pdf")}
 PROTECTED = " phro-project cannot open protected files; ask the user for an unprotected copy"
 VANISHED = "cache entry vanished"
 READER_FAULTS = ("internal error", "conversion gave no output", VANISHED)
@@ -125,6 +126,21 @@ def _name(path):
     return " ".join(Path(path).name.split())
 
 
+def _quoted(path):
+    """`path` as one word of a command line, in single quotes so a shell expands nothing in it; a long-path prefix
+    (\\\\?\\) is left off."""
+    s = str(path)
+    if s.startswith("\\\\?\\UNC\\"):
+        s = "\\\\" + s[8:]
+    elif s.startswith("\\\\?\\"):
+        s = s[4:]
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _by_hand(path, engine=""):
+    return f"python -I -X utf8 {_quoted(READ_PY)} convert {_quoted(path)}" + (f" --engine {engine}" if engine else "")
+
+
 def looks_like_text(path):
     """True for a plain-text file (no NUL in the first 4 KiB, valid UTF-8, not RTF, no pdf header in 1 KiB)."""
     try:
@@ -172,15 +188,14 @@ def _next(path, kind, detail=""):
     skill = SKILL_OF.get(ext)
     if kind == "timeout" and reader.FORMATS.get(ext) == "mpp":
         return (" A run by hand stops at the same limit; ask the user for a smaller project, or the project saved"
-                " as pdf.")
+                f" as {SAVE_AS[ext]}.")
     if kind == "damaged" and detail == VANISHED:
         return " Read it again."
     if kind == "damaged" and detail.startswith(READER_FAULTS):
         return (f" Read it with the {skill} skill instead, or tell" if skill else " Tell") + \
             " the user phro-project failed on this file."
     if kind == "timeout":
-        return (f' Retry by hand: python -I -X utf8 "{READ_PY}" convert "{path}"'
-                + (f" or read it with the {skill} skill." if skill else ""))
+        return f" Retry by hand: {_by_hand(path)}" + (f" or read it with the {skill} skill." if skill else ".")
     if kind in ("encrypted", "drm"):
         if skill == "pdf" and kind == "encrypted":
             return PROTECTED + ", or for the password and read it with the pdf skill."
@@ -358,10 +373,12 @@ def _index(meta, out_md, pdf, beside_assets=False):
     return fit, min(len(whole), len(pointer))
 
 
-def _window(meta, ti, span=None):
+def _window(meta, ti, span=None, pages=""):
     """({"limit": n}, the sentence that says so) for a read without a limit whose lines from its offset (`span` of
     them, the gate's own limit for a pages= piece, else Read's READ_LINES) would pass READ_TOKENS or READ_BYTES by
-    meta's line_bytes; ({}, "") when they fit, the read has its own limit or the offset is not a line number."""
+    meta's line_bytes; ({}, "") when they fit, the read has its own limit or the offset is not a line number. The
+    sentence names `pages`, the range of a pages= read, with the offset to go on from: that offset alone would be
+    a line of another entry or another piece."""
     sizes = meta.get("line_bytes")
     off = ti.get("offset", 1)
     if "limit" in ti or not isinstance(sizes, list) or not isinstance(off, int) or isinstance(off, bool):
@@ -378,7 +395,8 @@ def _window(meta, ti, span=None):
     if e >= stop:
         return {}, ""
     e = max(e, s)
-    return {"limit": e - s + 1}, f" Lines {s}-{e} of {m}; continue with offset={e + 1}."
+    more = f'pages="{pages}" ' if pages else ""
+    return {"limit": e - s + 1}, f" Lines {s}-{e} of {m}; continue with {more}offset={e + 1}."
 
 
 def _count(v):
@@ -416,7 +434,9 @@ def _pending(meta):
 def _reach(path, meta, out_md, short=False):
     """The sentence naming the read that gets what the deadline left out of a partial entry, in fewer words when
     `short`: for a pdf range entry the same pages= read again, for a whole pdf the pages= read of the first pages
-    left (and how far they go), else the convert by hand that finishes the entry; "" when the entry is whole."""
+    left (and how far they go), else the convert by hand that finishes the entry (it names the native engine for a
+    pdf entry read natively, and no engine for one pdfium read: read.py then goes to the pdf venv by itself, so
+    either run stores under the entry's own key); "" when the entry is whole."""
     if meta.get("partial") is not True:
         return ""
     rest = " for the rest" if short else " for the text the time left out"
@@ -434,8 +454,7 @@ def _reach(path, meta, out_md, short=False):
             else:
                 more = f", then pages {b + 1}-{pages[-1]}."
             return f' Read the pdf with pages="{_span(a, b)}"{rest}' + more
-    run = f'python -I -X utf8 "{READ_PY}" convert "{path}"' + (" --engine pdfium" if meta.get("engine") == "pdfium"
-                                                                else "")
+    run = _by_hand(path, "native" if reader.ext_of(path) == "pdf" and meta.get("engine") == "native" else "")
     if short:
         return f" For the rest, run {run} and Read again."
     return f" To read the rest, run: {run}, then Read the file again."
@@ -474,8 +493,10 @@ def _head(name, meta, assets):
 
 
 def _context(path, meta, out_md, *, past_end="", offer="", upto=None, window=""):
-    """additionalContext for an allow, never past CONTEXT_MAX - 1 characters. Room goes first to the head (the file
-    name cut short when it must) with, for all but pdf, the edit hint, what the time cut, for pdf the pages past the
+    """additionalContext for an allow, never past CONTEXT_MAX - 1 characters but for a partial entry whose convert
+    command, never cut, holds a long path. Room goes first to the head (the file name cut short when it must, by
+    no more than the sentences kept need) with, for all but pdf, the edit hint (dropped before the index's floor
+    is), what the time cut, for pdf the pages past the
     cut (up to `upto`, the end of a range read) and the read that gets them, the `window` sentence, the garble
     warning, and the floor of a long output's index; then, for pdf, the past-the-end sentence, PDF_HINT, the offer
     (whole or not at all), the unrendered and figure pages, and for the rest the image offer (whole or not at all);
@@ -503,14 +524,20 @@ def _context(path, meta, out_md, *, past_end="", offer="", upto=None, window="")
     ext = reader.ext_of(name)
     skill = SKILL_OF.get(ext)
     edit = EDIT_HINT.format(skill=skill) if skill and not pdf else ""
-    head = _head(name, meta, assets) + edit
-    over = len(head) + len(tail) + floor - (CONTEXT_MAX - 1)
     stem = name[:len(name) - len(ext) - 1] if ext else name
-    if over > 0 and len(stem) > 2:
-        head = _head(stem[:max(1, len(stem) - over - 1)] + "…" + (f".{ext}" if ext else ""), meta, assets) + edit
-    if len(head) + len(tail) + floor > CONTEXT_MAX - 1:
-        tail = tail_of(True)
-    if len(head) + len(tail) + floor > CONTEXT_MAX - 1:
+
+    def headed(tail, edit, floor):
+        head = _head(name, meta, assets) + edit
+        over = len(head) + len(tail) + floor - (CONTEXT_MAX - 1)
+        if over > 0 and len(stem) > 2:
+            head = _head(stem[:max(1, len(stem) - over - 1)] + "…" + (f".{ext}" if ext else ""), meta, assets) + edit
+        return head
+    for tail, hint, low in ((tail, edit, floor), (tail_of(True), edit, floor), (tail_of(True), "", floor),
+                            (tail_of(True), edit, 0), (tail_of(True), "", 0)):
+        head = headed(tail, hint, low)
+        if len(head) + len(tail) + low <= CONTEXT_MAX - 1:
+            break
+    if not low:
         fit, floor = None, 0
     if len(head) + len(tail) > CONTEXT_MAX - 1:
         head = head[:max(0, CONTEXT_MAX - 2 - len(tail))] + "…"
@@ -894,13 +921,14 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
 
     def convert(key, pages=None):
         """(entry, None), or (None, the hook's output: a deny or a pass-through), or for `pages` that start past
-        the pdf's end (None, None)."""
+        the pdf's end (None, None). A range entry that is partial is converted again; when that fails, the partial
+        entry is the result."""
         got = cache.lookup(key)
-        if got is not None and not (pages and cache.partial(got)):  # a partial range is converted again
+        if got is not None and not (pages and cache.partial(got)):
             return got, None
         fail = _failed(cache.root() / "failed" / key)
         if fail is not None:
-            return None, _pass(path, fail)
+            return got, None if got is not None else _pass(path, fail)
         if engine != "native" and not verified:
             verified.append(True)
             if not pyenv.verify(venv):
@@ -914,19 +942,19 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
         if pages:
             cmd += ["--pages", f"{pages[0]}-{pages[1]}"]
         try:
-            got, kind, detail = _child(cmd, start, timeout)
+            new, kind, detail = _child(cmd, start, timeout)
         except OSError as e:  # the interpreter could not be started
-            got, kind, detail = None, "damaged", f"internal error {type(e).__name__}"
-        if got is not None:
-            return got, None
+            new, kind, detail = None, "damaged", f"internal error {type(e).__name__}"
+        if new is not None:
+            return new, None
         if pages and kind == "damaged" and detail.startswith(f"pages {pages[0]}-{pages[1]} past the end"):
             return None, None
-        if kind in DENY_KINDS:
+        if kind in DENY_KINDS and got is None:
             return None, _deny(path, kind, detail)
         why = _why(kind, detail)
         if not (kind == "timeout" and detail == LATE):  # the next Read has its full budget: let it try again
             _touch(cache.root() / "failed" / key, why)
-        return None, _pass(path, why)
+        return got, None if got is not None else _pass(path, why)
 
     rng = parse_pages(event["tool_input"].get("pages"))
     ranged = False
@@ -943,7 +971,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
         return _pass(path, _why("damaged", VANISHED))
     meta = _meta(entry)
     total = meta.get("pages_total")
-    past_end, at, drop, upto = "", {}, ("pages",), None  # fact F4a: updatedInput replaces the input, so pages can go
+    past_end, at, drop, upto, named = "", {}, ("pages",), None, ""  # fact F4a: updatedInput replaces the input, so pages can go
     if rng is not None and isinstance(total, int) and not isinstance(total, bool):
         a, b = rng
         if a > total:
@@ -952,28 +980,34 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
             b = min(b, total)
             if _all_unrendered(meta, a, b):
                 return None
-            drop = ("pages", "offset", "limit")  # the range decides what is read
+            drop = ("pages", "offset", "limit")
+            named = _span(a, b)
             index = page_index(meta)
+            line = event["tool_input"].get("offset")
+            line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None
+            if not ranged and (not index or b > max(p for p, _ in index) or any(a <= p <= b for p in _pending(meta))):
+                got, result = convert(f"{k}-p{a}-{b}", (a, b))
+                if got is not None:
+                    if not (got / "out.md").is_file():
+                        return _pass(path, _why("damaged", VANISHED))
+                    entry, meta, ranged = got, _meta(got), True
+                    if _all_unrendered(meta, a, b):
+                        return None
+                elif not any(a <= p <= b for p, _ in index):
+                    return result
             if ranged:
                 upto = b
-            elif (not index or b > max(p for p, _ in index)  # past the cut, or left for the time: that range alone
-                  or any(a <= p <= b for p in _pending(meta))):
-                entry, result = convert(f"{k}-p{a}-{b}", (a, b))
-                if entry is None:
-                    return result
-                if not (entry / "out.md").is_file():
-                    return _pass(path, _why("damaged", VANISHED))
-                meta, upto = _meta(entry), b
-                if _all_unrendered(meta, a, b):
-                    return None
+                if line is not None:
+                    at["offset"] = line
             else:
                 first = next(((p, line) for p, line in index if p >= a), None)
                 if first is None or first[0] > b:  # none of the range was read: Claude's own Read reads it
                     return None
-                at["offset"] = first[1]
                 after = next((line for p, line in index if p > b), None)
+                inside = line is not None and first[1] <= line and (after is None or line < after)
+                at["offset"] = line if inside else first[1]
                 if after is not None:
-                    at["limit"] = after - first[1]
+                    at["limit"] = after - at["offset"]
     out_md = entry / "out.md"
     offer, mark = "", None
     if engine == "native" and not pyenv.forced_native() and not pyenv.declined():
@@ -981,7 +1015,7 @@ def _pdf_read(event, path, start, timeout, command, venv, engine, repair):
         if mark is None or not mark.exists():
             offer = offer_text(venv, repair)
     kept = {k: v for k, v in event["tool_input"].items() if k not in drop}
-    limit, window = _window(meta, {**kept, **{k: v for k, v in at.items() if k != "limit"}}, at.get("limit"))
+    limit, window = _window(meta, {**kept, **{k: v for k, v in at.items() if k != "limit"}}, at.get("limit"), named)
     at.update(limit)
     context = _context(path, meta, out_md, past_end=past_end, offer=offer, upto=upto, window=window)
     if offer and mark is not None and offer in context:

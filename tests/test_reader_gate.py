@@ -288,7 +288,7 @@ def test_deny_texts_name_the_next_step():
         "a.hwp: reading failed: cache entry vanished. Read it again.")
     why = r("d/a.mpp", "timeout")
     assert why == (f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds. A run by hand stops at the same"
-                   " limit; ask the user for a smaller project, or the project saved as pdf."), why
+                   " limit; ask the user for a smaller project, or the project saved as xlsx or pdf."), why
     assert r("d/a.hwp", "too_large", gate.limits.BIG_INPUT) == (
         "a.hwp: the file is over 512 MiB. That is phro-project's safety limit; ask the user for a smaller file, such"
         " as the part they need saved on its own.")
@@ -298,8 +298,12 @@ def test_deny_texts_name_the_next_step():
             assert "Retry by hand" not in why and why.endswith(".") and _depth(why) <= 1, why
     why = r("d/a.xlsx", "timeout")
     assert why.startswith(f"a.xlsx: conversion took over {gate.limits.CONVERT_SECONDS} seconds. Retry by hand:"
-                          f' python -I -X utf8 "{gate.READ_PY}" convert "'), why
-    assert why.endswith(" or read it with the xlsx skill."), why
+                          f" python -I -X utf8 '{gate.READ_PY}' convert '"), why
+    assert why.endswith("' or read it with the xlsx skill."), why
+    why = r("d/a.hwp", "timeout")
+    assert why.endswith("a.hwp'."), why
+    assert r("d/a.vsd", "damaged", "x").endswith(" Ask the user for the file saved again, as vsdx or pdf.")
+    assert r("d/a.mpp", "damaged", "x").endswith(" Ask the user for the file saved again, as xlsx or pdf.")
 
 
 def test_allow_swaps_path_keeps_keys():
@@ -1084,7 +1088,53 @@ def test_pages_piece_fits_the_read_window():
         lines = md_lines(o)
         u = o["updatedInput"]
         assert u["offset"] == 1 and u["limit"] == 2 < lines.index("## Page 4"), (u, lines)
-        assert o["additionalContext"].endswith(f" Lines 1-2 of {n}; continue with offset=3."), o
+        assert o["additionalContext"].endswith(f' Lines 1-2 of {n}; continue with pages="1-3" offset=3.'), o
+        o = out(gate.decide(ev(p, pages="1-3", offset=3)))
+        u = o["updatedInput"]
+        assert u["offset"] == 3 and u["offset"] + u["limit"] - 1 < md_lines(o).index("## Page 4") + 1, u
+        assert "pages" not in u and f' Lines 3-{2 + u["limit"]} of {n}; continue with pages="1-3" offset=' in \
+            o["additionalContext"], o
+        o = out(gate.decide(ev(p, pages="2-3", offset=1)))
+        assert o["updatedInput"]["offset"] == md_lines(o).index("## Page 2") + 1, o["updatedInput"]
+
+
+def test_pages_offset_continues_inside_a_range_entry():
+    """A pages= Read served by its own range entry keeps the offset: it is a line of that entry."""
+    from reader import cache, limits
+    with pdf_env():
+        p = four_pages()
+        assert out(gate.decide(ev(p)))["permissionDecision"] == "allow"
+        _edit_meta(p, partial=True, warnings=[limits.OCR_LATE],
+                   ocr={"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 1,
+                        "pictures_left_pages": [3]})
+        o = out(gate.decide(ev(p, pages="3-4")))
+        got = Path(o["updatedInput"]["file_path"])
+        assert got.parent.name == cache.key(p, "native") + "-p3-4", got
+        n = len(got.read_text(encoding="utf-8").splitlines())
+        meta = json.loads((got.parent / "meta.json").read_text(encoding="utf-8"))
+        meta["line_bytes"] = [25_000] * n
+        (got.parent / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        o = out(gate.decide(ev(p, pages="3-4")))
+        assert o["additionalContext"].endswith(f' Lines 1-2 of {n}; continue with pages="3-4" offset=3.'), o
+        o = out(gate.decide(ev(p, pages="3-4", offset=3)))
+        assert o["updatedInput"]["offset"] == 3 and Path(o["updatedInput"]["file_path"]) == got, o["updatedInput"]
+
+
+def test_failed_range_convert_gives_the_text_already_held():
+    """A range left for the time whose own convert fails is cut from the whole entry, this Read and the next."""
+    from reader import limits
+    late = [sys.executable, "-c", "print('FAIL\\ttimeout\\t')"]
+    with pdf_env():
+        p = four_pages()
+        assert out(gate.decide(ev(p)))["permissionDecision"] == "allow"
+        _edit_meta(p, partial=True, warnings=[limits.OCR_LATE],
+                   ocr={"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None, "pictures_left": 1,
+                        "pictures_left_pages": [3]})
+        for _ in range(2):
+            o = out(gate.decide(ev(p, pages="3-4"), command=late))
+            assert o.get("permissionDecision") == "allow", o
+            lines = md_lines(o)
+            assert lines[o["updatedInput"]["offset"] - 1] == "## Page 3" and "Body3" in lines, o["updatedInput"]
 
 
 def test_pages_offset_limit():
@@ -1213,7 +1263,7 @@ def test_partial_context_names_what_the_time_left_out():
     meta = {"lines": 5, "partial": True, "warnings": [limits.OCR_LATE, limits.FIGURES_LATE], "figures_left": 3,
             "ocr": {"pages": 2, "doubtful": 0, "failed": 0, "stopped_at": 7, "pictures_left": 63}}
     c = gate._context("a.docx", meta, md)
-    again = f' To read the rest, run: python -I -X utf8 "{gate.READ_PY}" convert "a.docx", then Read the file again.'
+    again = f" To read the rest, run: python -I -X utf8 '{gate.READ_PY}' convert 'a.docx', then Read the file again."
     assert c.endswith(" Cut by the time limit: OCR stopped at page 7 (later scanned pages are linked as images),"
                       " 63 pictures not read by OCR (Read them to view), some figures not drawn (their text is"
                       " included)." + again), c
@@ -1233,7 +1283,15 @@ def test_partial_context_names_what_the_time_left_out():
     pdf["ocr"].update(stopped_at=None, pictures_left=0, pictures_left_pages=[])
     pdf["warnings"] = [limits.FIGURES_LATE]
     c = gate._context("a.pdf", pdf, md)
-    assert c.endswith(f' convert "a.pdf", then Read the file again.'), c
+    pdf["engine"] = "pdfium"
+    c = gate._context("a.pdf", pdf, md)
+    assert c.endswith(" convert 'a.pdf', then Read the file again."), c
+    pdf["engine"] = "native"
+    c = gate._context("a.pdf", pdf, md)
+    assert c.endswith(" convert 'a.pdf' --engine native, then Read the file again."), c
+    assert gate._quoted("d/it's $(x) `y`.docx") == "'d/it'\\''s $(x) `y`.docx'"
+    assert gate._quoted("\\\\?\\C:\\d\\a.docx") == "'C:\\d\\a.docx'"
+    assert gate._quoted("\\\\?\\UNC\\host\\d\\a.docx") == "'\\\\host\\d\\a.docx'"
     del meta["partial"]
     assert "Cut by the time limit" not in gate._context("a.docx", meta, md)
 
@@ -1773,7 +1831,7 @@ def test_mpp_child_fail_kinds():
             assert r == "a.mpp: the file is encrypted and needs a password. phro-project cannot open protected files; ask the user for an unprotected copy.", r
             r = reason_of(gate.decide(ev(project()), command=fail("damaged", "MPXJ could not read the file")))
             assert r == ("a.mpp: the file looks damaged: MPXJ could not read the file. Ask the user for the file"
-                         " saved again, as pdf."), r
+                         " saved again, as xlsx or pdf."), r
             r = reason_of(gate.decide(ev(project(data=b"slow")), command=[sys.executable, "-c",
                                                                          "import time; time.sleep(5)"], timeout=1))
             assert r.startswith(f"a.mpp: conversion took over {gate.limits.CONVERT_SECONDS} seconds."), r
@@ -1785,7 +1843,7 @@ def test_mpp_child_fail_kinds():
             # another format's compound file named .mpp, which its own parser refuses: that parser's detail
             r = reason_of(gate.decide(ev(project()), command=fail("unsupported", "Excel 5.0/95 workbook")))
             assert r == ("a.mpp: this file is not supported: Excel 5.0/95 workbook. Ask the user for the file saved"
-                         " as pdf."), r
+                         " as xlsx or pdf."), r
             assert pyenv.engine("mpp", v) == MPP_ENGINE
 
 
@@ -1958,6 +2016,9 @@ def test_gate_image_offer_once_a_session():
         from reader import pyenv
         venv = pyenv.venv_dir("image")
         offer = gate.IMAGE_OFFER.format(k=2, read_py=gate.READ_PY, dir=venv)
+        if len(offer) > 420:
+            print(f"skip: test_gate_image_offer_once_a_session (the offer alone is {len(offer)} long here)")
+            return
         assert offer == (" 2 figures (WMF/EMF/PICT/WPG/TIFF) are not shown as images; their text is included. To show"
                          f' them, ask the user, then run python -I -X utf8 "{gate.READ_PY}" setup --for image --venv'
                          f' "{venv}" (--decline instead if they never want it).'), offer
@@ -2031,7 +2092,7 @@ def test_gate_time_cut_is_kept():
         assert "LATE figure" in md_lines(o2), md_lines(o2)
         assert o2["additionalContext"].endswith(
             " Cut by the time limit: some figures not drawn (their text is included). To read the rest, run:"
-            f' python -I -X utf8 "{gate.READ_PY}" convert "{p}", then Read the file again.'), o2
+            f" python -I -X utf8 {gate._quoted(gate.READ_PY)} convert {gate._quoted(p)}, then Read the file again."), o2
         q = sample("on time")
         assert out(run(q, base))["permissionDecision"] == "allow"
         assert out(gate.decide(ev(q), command=EXIT3))["permissionDecision"] == "allow"  # kept: a hit
@@ -2565,7 +2626,7 @@ def test_context_never_passes_its_cap():
                         assert c.endswith(window + " Warning: the text may be garbled."), (case, c)
                         assert " Cut by the time limit" in c, (case, c)
                         reach = (' Read the pdf with pages="3-18" for the ' if pdf
-                                 else f' "{gate.READ_PY}" convert "{name}"')
+                                 else f" '{gate.READ_PY}' convert '{name}'")
                         assert reach in c, (case, c)
                         assert not pdf or ' are past the cut; Read the pdf with pages="291-310"' in c, (case, c)
                         kind = "Pages" if pdf else "Sections"
@@ -2580,6 +2641,14 @@ def test_context_never_passes_its_cap():
                                 meta.pop(key, None)
                             c = gate._context(name, meta, md, offer=offer, window=window)
                             assert sample in c and len(c) < gate.CONTEXT_MAX, (case, c)
+        base = tmp()
+        md = base / ("r" * max(1, usual - len(str(base)) - 45)) / "48" / ("k" * 40) / "out.md"
+        md.parent.mkdir(parents=True)
+        md.write_text("x\n", encoding="utf-8")
+        if len(str(md.parent)) <= usual:
+            c = gate._context("d" * 36 + "/a.docx", _crowded(False), md, window=window)
+            assert "Sections at lines" in c and len(c) < gate.CONTEXT_MAX, c
+            assert " a.docx was converted" in " " + c and "to edit the file" not in c, c
         for root_len in (150, 400):
             md = tmp().joinpath(*["r" * 49] * (root_len // 50)) / "out.md"
             md.parent.mkdir(parents=True)
