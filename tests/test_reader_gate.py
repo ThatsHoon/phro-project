@@ -1289,7 +1289,17 @@ def test_partial_context_names_what_the_time_left_out():
     pdf["engine"] = "native"
     c = gate._context("a.pdf", pdf, md)
     assert c.endswith(" convert 'a.pdf' --engine native, then Read the file again."), c
-    assert gate._quoted("d/it's $(x) `y`.docx") == "'d/it'\\''s $(x) `y`.docx'"
+    assert gate._quoted("d/it $(x) `y`.docx") == "'d/it $(x) `y`.docx'"
+    assert gate._quoted("d/it's $(x) `y`.docx") == "file:d/it%27s%20%24%28x%29%20%60y%60.docx"
+    assert gate._quoted("C:\\d\\John's report.docx") == "file:///C:/d/John%27s%20report.docx"
+    assert gate._quoted("\\\\host\\d\\a' ; echo X ; '.docx") == "file://host/d/a%27%20%3B%20echo%20X%20%3B%20%27.docx"
+    assert gate._quoted("/d/it's.docx") == "file:///d/it%27s.docx"
+    saved = gate.READ_PY
+    gate.READ_PY = Path("C:/Users/O'Brien/read.py")
+    try:
+        assert gate._by_hand("a.docx").startswith('python -I -X utf8 "'), gate._by_hand("a.docx")
+    finally:
+        gate.READ_PY = saved
     assert gate._quoted("\\\\?\\C:\\d\\a.docx") == "'C:\\d\\a.docx'"
     assert gate._quoted("\\\\?\\UNC\\host\\d\\a.docx") == "'\\\\host\\d\\a.docx'"
     del meta["partial"]

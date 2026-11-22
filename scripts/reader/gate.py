@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import reader
 from reader import limits
@@ -127,18 +128,25 @@ def _name(path):
 
 
 def _quoted(path):
-    """`path` as one word of a command line, in single quotes so a shell expands nothing in it; a long-path prefix
+    """`path` as one word of a command line that bash and PowerShell read alike: in single quotes, where neither
+    expands anything; a path with a single quote, which the two shells escape differently, as a percent-encoded
+    file: URI with no character either shell reads (read.py's `source` takes it back). A long-path prefix
     (\\\\?\\) is left off."""
     s = str(path)
     if s.startswith("\\\\?\\UNC\\"):
         s = "\\\\" + s[8:]
     elif s.startswith("\\\\?\\"):
         s = s[4:]
-    return "'" + s.replace("'", "'\\''") + "'"
+    if "'" not in s:
+        return "'" + s + "'"
+    s = s.replace("\\", "/")
+    lead = "file:" if s.startswith("//") else "file:///" if s[1:3] == ":/" else "file://" if s.startswith("/") else "file:"
+    return lead + quote(s, safe="/:")
 
 
 def _by_hand(path, engine=""):
-    return f"python -I -X utf8 {_quoted(READ_PY)} convert {_quoted(path)}" + (f" --engine {engine}" if engine else "")
+    script = f'"{READ_PY}"' if "'" in str(READ_PY) else _quoted(READ_PY)
+    return f"python -I -X utf8 {script} convert {_quoted(path)}" + (f" --engine {engine}" if engine else "")
 
 
 def looks_like_text(path):

@@ -147,6 +147,15 @@ _VENV_KIND = {"pdf": "pdf", "mpp": "mpp", "mpt": "mpp"}
 _VENV_ENGINE = {"pdf": "pdfium", "mpp": "mpxj"}
 
 
+def source(arg: str) -> str:
+    """The path `convert` was given: as it stands, or the path of a percent-encoded file: URI (the gate writes one
+    for a path no quoting carries through both bash and PowerShell)."""
+    if not arg.startswith("file:"):
+        return arg
+    from urllib.request import url2pathname
+    return url2pathname(arg[5:])
+
+
 def _reexec(a):
     kind = _VENV_KIND.get(reader.ext_of(Path(a.file)))
     if a.engine is not None or kind is None:
@@ -229,6 +238,7 @@ def cmd_convert(a) -> int:
     if not os.environ.get("PHRO_READER_DEADLINE"):
         import time
         os.environ["PHRO_READER_DEADLINE"] = repr(time.time() + CONVERT_SECONDS)
+    a.file = source(a.file)
     src = Path(a.file)
     code = _reexec(a)
     if code is not None:

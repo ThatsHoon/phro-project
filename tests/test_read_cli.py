@@ -32,6 +32,16 @@ def tmp():
     return Path(tempfile.mkdtemp())
 
 
+def test_convert_takes_a_file_uri():
+    assert read.source("d/a b.docx") == "d/a b.docx"
+    assert read.source("file:d/it%27s%20%24%28x%29.docx") == os.path.join("d", "it's $(x).docx")
+    if os.name == "nt":
+        assert read.source("file:///C:/d/John%27s%20report.docx") == "C:\\d\\John's report.docx"
+        assert read.source("file://host/d/a%27.docx") == "\\\\host\\d\\a'.docx"
+    else:
+        assert read.source("file:///d/it%27s.docx") == "/d/it's.docx"
+
+
 def test_internal_error_keeps_document_text_out():
     def boom(src):
         raise RuntimeError("line 3 of the document: account 1234")
