@@ -115,6 +115,18 @@ def test_interior_repeat_kept():
     assert "|a|a|a|" in out.replace(" ", ""), out
 
 
+def test_formulas_read():
+    f = 'office:value-type="float" office:value="{}" table:formula="{}"'
+    xml = sheet("S", [row(c("1"), c("2", f.format(2, "of:=[.A1]+1")),
+                          c("", 'table:formula="of:=SUM([$Other.A1:.A3];&quot;a;b&quot;)"')),
+                      row(c("3"), c("4", f.format(4, "of:=[.A2]+1")), c("x"))])
+    doc, _ = parse(ods(xml))
+    blocks = doc.blocks[0].blocks
+    assert blocks[0].rows[0][2].blocks[0].inlines[0].text == '=SUM(Other!A1:A3,"a;b")', blocks[0].rows[0]
+    p = blocks[-1]
+    assert "".join(i.text for i in p.inlines) == 'Formulas: B1:B2 =A1+1; C1 =SUM(Other!A1:A3,"a;b")', p
+
+
 def test_value_types():
     cells = [c("", 'office:value-type="date" office:date-value="2026-01-02"'),
              c("", 'office:value-type="time" office:time-value="PT01H02M03S"'),
@@ -124,7 +136,7 @@ def test_value_types():
     out = md(ods(sheet("S", [row(*cells)])))
     for want in ("2026-01-02", "PT01H02M03S", "TRUE", "FALSE", "2.5"):
         assert want in out, out
-    assert "A1+1" not in out
+    assert "A1+1" in out
 
 
 def test_interior_repeat_kept():

@@ -12,7 +12,8 @@ under a closed-element cap (SST_ELEMENTS, STYLE_ELEMENTS); one that is named but
 sheet part is streamed, and every element it closes is charged to the workbook's scan count, capped at `SHEET_SCAN`.
 A sheet reached once the count is spent is cut without being opened, its comments unread (counted as `comments_cut`
 when it has some), so neither is charged to ZIP_TOTAL ahead of its drawings.
-A cell shows its cached value; a formula without one shows `=` and its text. A sheet that cannot be read is counted
+A cell shows its cached value; a formula without one shows `=` and its text. Every formula, a shared one
+expanded to its master's pattern, goes to the sheet's formulas paragraph (`Grid.formula`). A sheet that cannot be read is counted
 under `sheet` and the others still come out; one whose XML breaks after its first row keeps the rows read.
 Charts and pictures come from `sheet_drawing`, one `Drawings` a workbook (one CHART_TOTAL and IMAGE_BYTES count),
 through the relationships the sheet read once: a worksheet's follow its grid in anchor order, and a chartsheet's are
@@ -387,6 +388,7 @@ class _Sheets:
             return self._drawn(part, relmap)
         row, col, cells, rows_seen = -1, -1, 0, False  # cells: the `c` elements open
         links = []  # (r1, r2, c1, c2, url, place) of the hyperlinks, applied after the stream
+        shared = {}
         stack, done, names = [], [], {}  # the open path, and the ended children each open element still holds
         marks = self._comments(part, no, relmap, keys)  # (row, col) -> (note key, characters)
         try:
@@ -425,9 +427,11 @@ class _Sheets:
                         cells -= 1
                         c = _col(el.get("r"))
                         col = c if c is not None else col + 1
-                        value = self._cell(el)
+                        value, pat = self._cell(el, max(row, 0), col, shared)
                         if value and not grid.put(max(row, 0), col, value):
                             break  # the grid is cut: nothing more can be put
+                        if pat is not None:
+                            grid.formula(max(row, 0), col, pat)
                     elif tag in _SHEET_TAGS and not cells and stack and names.get(stack[-1].tag) == _PARENT[tag]:
                         if tag == "hyperlink":
                             self._collect(el, part, links, grid, relmap)
@@ -762,8 +766,10 @@ class _Sheets:
                 if not grid.put(r, c, linked + marks):
                     break  # the budget is gone; the cell keeps its old value
 
-    def _cell(self, el) -> str:
-        """The displayed value of a `c` element by its type: the cached value first, then `=` and the formula."""
+    def _cell(self, el, row: int, col: int, shared: dict):
+        """The displayed value of a `c` element at (row, col) by its type, and its formula's pattern or None. The
+        cached value is shown; a formula cell without one shows `=` and its formula. A shared formula's master keeps
+        its pattern under its `si`, and the cells that name the `si` take it; a data table's formula is not kept."""
         t = el.get("t") or "n"
         v = f = inline = None
         for ch in el:
@@ -775,11 +781,23 @@ class _Sheets:
             elif n == "is":
                 inline = ch
         style = _int(el.get("s"), 0)
+        pat = None
+        if f is not None and f.get("t") != "dataTable":
+            text = _unescape(f.text or "")
+            if f.get("t") == "shared":
+                if text:
+                    shared[f.get("si")] = sheet_grid.pattern(text, row, col)
+                pat = shared.get(f.get("si"))
+            elif text:
+                pat = sheet_grid.pattern(text, row, col)
         if t == "inlineStr" and inline is not None:
-            return self.show(_rich(inline), style)
-        if v is None:
-            return "=" + _unescape(f.text) if f is not None and f.text else ""
-        text = v.text or ""
+            return self.show(_rich(inline), style), pat
+        if v is None or not v.text and t != "str":
+            return ("=" + sheet_grid.formula_text(pat, row, col) if pat is not None else ""), pat
+        return self._value(v.text, t, style), pat
+
+    def _value(self, text: str, t: str, style: int):
+        """A cached value's text by the cell's type."""
         if t == "s":
             i = _int(text.strip())
             return self.show(self.wb.sst[i], style) if i is not None and 0 <= i < len(self.wb.sst) else ""

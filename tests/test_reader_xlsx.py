@@ -117,7 +117,7 @@ def test_escapes():
 def test_formula_cache_wins():
     rows = xlsx_row(1, xlsx_cell("A1", 2, f="1+1"), xlsx_cell("B1", "k", t="str", f='"k"'))
     out, _ = md([sheet(rows)])
-    assert "|2|k|" in out and "1+1" not in out, out
+    assert "|2|k|" in out and out.count("1+1") == 1 and 'Formulas: A1 =1+1; B1 ="k"' in out, out
 
 
 def test_formula_without_cache():
@@ -448,6 +448,37 @@ def test_merge():
     assert 'colspan="2"' in out, out
     out, ctx = md([sheet(rows, after='<mergeCells><mergeCell ref="bad"/><mergeCell ref="A1:B1"/></mergeCells>')])
     assert 'colspan="2"' in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def formulas_of(doc):
+    p = doc.blocks[0].blocks[-1]
+    return "".join(i.text for i in p.inlines)
+
+
+def test_shared_formula_fill_down_is_one_entry():
+    rows = [xlsx_row(r, xlsx_cell(f"B{r}", r), xlsx_cell(f"C{r}", 2),
+                     xlsx_cell(f"D{r}", 2 * r, f='<f t="shared" ref="D2:D5" si="0">B2*C2</f>' if r == 2
+                               else '<f t="shared" si="0"/>')) for r in range(2, 6)]
+    doc, ctx, _ = parsed([sheet("".join(rows))])
+    assert formulas_of(doc) == "Formulas: D2:D5 =B2*C2" and not ctx.skipped, (formulas_of(doc), ctx.skipped)
+
+
+def test_formula_pattern_break_listed_on_its_own():
+    rows = [xlsx_row(r, xlsx_cell(f"B{r}", r), xlsx_cell(f"D{r}", 2 * r, f="B4+1" if r == 4 else f"B{r}*2"))
+            for r in range(2, 6)]
+    doc, _, _ = parsed([sheet("".join(rows))])
+    assert formulas_of(doc) == "Formulas: D2:D3, D5 =B2*2; D4 =B4+1", formulas_of(doc)
+
+
+def test_formula_without_cached_value_shows_in_its_cell():
+    rows = xlsx_row(1, xlsx_cell("A1", 3), xlsx_cell("B1", f="<f>A1*2</f><v></v>"),
+                    xlsx_cell("C1", f='<f t="shared" ref="C1:C2" si="1">A1+1</f>'))
+    rows += xlsx_row(2, xlsx_cell("A2", 4), xlsx_cell("C2", f='<f t="shared" si="1"/>'))
+    doc, _, _ = parsed([sheet(rows)])
+    t = doc.blocks[0].blocks[0]
+    assert [c.blocks[0].inlines[0].text for c in t.rows[0]] == ["3", "=A1*2", "=A1+1"], t.rows
+    assert t.rows[1][2].blocks[0].inlines[0].text == "=A2+1", t.rows[1]
+    assert formulas_of(doc) == "Formulas: B1 =A1*2; C1:C2 =A1+1", formulas_of(doc)
 
 
 def test_hyperlink_external():

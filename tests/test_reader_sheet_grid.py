@@ -12,7 +12,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
-from reader.formats.sheet_grid import Budget, Grid, address, text_inlines  # noqa: E402
+from reader.formats.sheet_grid import Budget, Grid, address, formula_text, pattern, text_inlines  # noqa: E402
 from reader.model import Bold, Break, Context, Doc, Hidden, Link, NoteRef, Para, Table, Text  # noqa: E402
 
 
@@ -612,6 +612,59 @@ def test_spans_share_one_area_budget_a_sheet():
     tables = [b for b in out if isinstance(b, Table)]
     assert [(t.rows[0][0].rowspan, t.rows[0][0].colspan) for t in tables] == [(1000, 2), (1000, 2), (1, 1)], tables
     assert [len(t.rows) for t in tables] == [1000] * 3 and not ctx.warnings, ctx.warnings
+
+
+def test_formula_pattern_round_trip():
+    cases = [("B2*C2", 1, 3, "B3*C3", 2, 3), ("SUM($A$1:A1)", 0, 1, "SUM($A$1:A5)", 4, 1),
+             ("Other!A$1+'My Sheet'!$B2", 0, 0, "Other!B$1+'My Sheet'!$B3", 1, 1),
+             ('IF(A1="B2",LOG10(A1),A:A)', 0, 1, 'IF(A2="B2",LOG10(A2),A:A)', 1, 1),
+             ("SUM(2:2)+Q1!A1", 1, 0, "SUM(3:3)+Q1!A2", 2, 0), ("1.5E10+TAX1", 0, 0, "1.5E10+TAX2", 1, 0)]
+    for text, r, c, moved, r2, c2 in cases:
+        pat = pattern(text, r, c)
+        assert formula_text(pat, r, c) == text, (text, pat)
+        assert formula_text(pat, r2, c2) == moved, (text, formula_text(pat, r2, c2))
+    assert formula_text(pattern("A1", 0, 1), 0, 0) == "#REF!"
+    assert pattern("B2*C2", 1, 3) == pattern("B3*C3", 2, 3) != pattern("B2*C2", 2, 3)
+
+
+def test_fill_down_is_one_entry_and_a_break_is_listed_on_its_own():
+    g, _ = mk()
+    for r in range(1, 2001):
+        g.put(r, 3, str(r))
+        g.formula(r, 3, pattern(f"B{r + 1}*C{r + 1}", r, 3))
+    g.formula(999, 3, pattern("B1000+1", 999, 3))
+    g.put(1, 4, "t")
+    g.formula(1, 4, pattern("SUM(D2:D2001)", 1, 4))
+    out = g.sheet_blocks()
+    assert para_text(out[-1]) == "Formulas: D2:D999, D1001:D2001 =B2*C2; E2 =SUM(D2:D2001); D1000 =B1000+1", out[-1]
+
+
+def test_formula_ranges_join_across_columns_and_hidden_ones_are_hidden():
+    g, _ = mk()
+    for r in range(3):
+        for c in range(2):
+            g.put(r, c, "1")
+            g.formula(r, c, pattern(f"{'XY'[c]}{r + 1}*2", r, c))
+    g.put(5, 0, "2")
+    g.formula(5, 0, pattern("A1", 5, 0))
+    g.hide_rows(5, 5)
+    p = g.sheet_blocks()[-1]
+    assert p.inlines[:2] == [Text("Formulas: "), Text("A1:B3 =X1*2")], p.inlines
+    assert p.inlines[2] == Hidden([Text("; A6 =A1")]), p.inlines
+
+
+def test_formula_groups_past_the_cap_are_counted():
+    g, ctx = mk()
+    for c in range(3):
+        g.put(0, c, "1")
+        g.formula(0, c, pattern(f"{c}+1", 0, c))
+    limits.FORMULA_GROUPS, saved = 2, limits.FORMULA_GROUPS
+    try:
+        p = g.sheet_blocks()[-1]
+    finally:
+        limits.FORMULA_GROUPS = saved
+    assert para_text(p) == "Formulas: A1 =0+1; B1 =1+1; (1 more formula groups not listed)", para_text(p)
+    assert ctx.skipped["formula"] == 1, ctx.skipped
 
 
 def test_header_rows_marked():

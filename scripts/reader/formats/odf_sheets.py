@@ -4,7 +4,8 @@ Each table's cells go to a Grid at their sheet addresses, so an ods sheet is spl
 merged and cut as the xlsx, xls and xlsb sheets are: one `Budget` for the document, a cell repeated by
 `number-columns-repeated` or a row by `number-rows-repeated` put once a copy (and charged once a copy), empty ones
 only counted. A row or column whose `table:visibility` is collapse or filter is hidden; a `table-header-rows` row is a
-header row; a span is a merge, its covered cells passed over.
+header row; a span is a merge, its covered cells passed over. A `table:formula` (OpenFormula, read as A1 text by `_of`)
+goes to the sheet's formulas paragraph once a copy, and shows in its cell when the cell has no value type.
 
 A sheet's `table:shapes` that holds a connector is one diagram scope: every shape and connector in it, groups walked
 into, goes to `diagram.Diagram` through `odf_base.register`; each with text, and each top-level frame, has a slot after
@@ -27,6 +28,8 @@ _NAMES = {}  # element tag -> local name; a sheet repeats a few tags millions of
 _GROUPS = ("table-header-rows", "table-rows", "table-row-group")
 _COLUMN_GROUPS = ("table-header-columns", "table-columns", "table-column-group")
 _HIDE = frozenset({"collapse", "filter"})
+_OF_HEAD = re.compile(r"(?:[a-z]+:)?=")
+_OF_TOKEN = re.compile(r'"(?:[^"]|"")*"|\[[^\]]*\]|;')
 
 
 def _ln(tag):
@@ -40,8 +43,29 @@ def _plain(v):
     return re.sub(r"\.0+$", "", v.strip())[:64]
 
 
+def _of(form) -> str:
+    """An OpenFormula's text in A1 form without its `=`: `[.A1]` is A1, `[$Other.A1:.B2]` is Other!A1:B2, and the
+    `;` between arguments is `,`. "" for an attribute that is not a formula."""
+    m = _OF_HEAD.match(form or "")
+    return _OF_TOKEN.sub(_of_token, form[m.end():]) if m else ""
+
+
+def _of_token(m) -> str:
+    s = m.group()
+    if s == ";":
+        return ","
+    if s[0] == '"':
+        return s
+    ends = []
+    for p in s[1:-1].split(":"):
+        i = p.rfind(".")
+        ends.append((p[:i].lstrip("$"), p[i + 1:]) if i >= 0 else ("", p))
+    sheet = ends[0][0]
+    return (sheet + "!" if sheet else "") + ":".join(cell if sh in ("", sheet) else f"{sh}!{cell}" for sh, cell in ends)
+
+
 def _value(c) -> str:
-    """The cell's value as text when it has no display text; formulas are never shown."""
+    """The cell's value as text when it has no display text."""
     t = attr(c, "value-type")
     if t in ("float", "currency"):
         return _plain(attr(c, "value") or "")
@@ -115,18 +139,20 @@ class _Sheet:
             grid.head_rows(r0, r0 + rep - 1)
         cells = self.cells(tr, d)
         for r in range(r0, min(r0 + rep, limits.SHEET_ROWS + 1)) if cells else ():
-            for col, crep, cs, rs, value, size in cells:
+            for col, crep, cs, rs, value, size, form in cells:
                 if value is not None and not grid.put_cols(r, col, col + crep - 1, value, size):
                     return
+                for c in range(col, col + crep) if form else ():
+                    grid.formula(r, c, sheet_grid.pattern(form, r, c))
                 if cs > 1 or rs > 1:
                     for c in range(col, col + crep):
                         grid.merge(r, r + rs - 1, c, c + cs - 1)
 
     # ---- cells
     def cells(self, tr, d) -> list:
-        """(column, repeats, column span, row span, blocks or None, their characters) of the row's cells that hold
-        something or span. A cell's repeats end one column past SHEET_COLS, where `put` stops the sheet, and the row
-        ends with it."""
+        """(column, repeats, column span, row span, blocks or None, their characters, formula) of the row's cells that
+        hold something or span. A cell's repeats end one column past SHEET_COLS, where `put` stops the sheet, and
+        the row ends with it."""
         out, col = [], 0
         for c in tr:
             n = _ln(c.tag)
@@ -139,24 +165,26 @@ class _Sheet:
                     cs = min(max(_int(attr(c, "number-columns-spanned"), 1), 1), _SPAN)
                     rs = min(max(_int(attr(c, "number-rows-spanned"), 1), 1), _SPAN)
             if n == "table-cell":
-                blocks, text = self.blocks(c, d)
+                form = _of(attr(c, "formula")) if c.attrib else ""
+                blocks, text = self.blocks(c, d, form)
                 if text or cs > 1 or rs > 1:
                     out.append((col, min(rep, max(1, limits.SHEET_COLS + 1 - col)), cs, rs,
-                                tuple(blocks) if text else None, blocks_len(blocks)))
+                                tuple(blocks) if text else None, blocks_len(blocks), form))
                     if col + rep > limits.SHEET_COLS:
                         break
             col += rep
         return out
 
-    def blocks(self, c, d):
-        """(blocks, whether they carry anything but blank paragraphs)."""
+    def blocks(self, c, d, form=""):
+        """(blocks, whether they carry anything but blank paragraphs); a formula cell with no value type shows `=`
+        and its formula."""
         if len(c) == 1:  # the common cell: one plain paragraph
             p = c[0]
             if len(p) == 0 and p.text and p.text.strip() and _ln(p.tag) == "p":
                 return [Para([Text(_WS.sub(" ", p.text))])], True
         blocks = self.body.blocks(c, d + 1)
         if not blocks or _empty(blocks):
-            v = _value(c)
+            v = _value(c) or ("=" + form if form and attr(c, "value-type") is None else "")
             return ([Para([Text(v)])], True) if v else ([], False)
         for a in kids(c, "annotation"):
             out = []

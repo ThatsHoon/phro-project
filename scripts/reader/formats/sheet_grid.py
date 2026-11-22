@@ -9,12 +9,15 @@ number of cells put, never the sheet's extent.
 parts stay one island when the empty run between them is at most _GAP long and they span the same columns, or rows),
 each a Table whose `origin` is its top-left cell and whose caption gives its range and its hidden row and column runs,
 so a row's place in the table gives its address. An island of one cell is a paragraph led by its address (a merged
-cell's range). Where the sheet was cut a paragraph says so: the cell, the limit, and what the file declares lies past
+cell's range). The cells' formulas follow as one paragraph (`_formulas`, Decision 5): cells whose formulas share
+one R1C1 pattern (`pattern`) are one entry, so a fill-down is one entry and a cell that breaks it its own. Where the
+sheet was cut a paragraph says so: the cell, the limit, and what the file declares lies past
 it.
 `Grid.blocks()` gives a record table (an Access table, a project's tasks, an iWork table): one Table, rows before the
 first value trimmed and a long run of empty rows shrunk to _GAP.
 """
 import heapq
+import re
 from bisect import bisect_left, bisect_right, insort
 from itertools import groupby
 from operator import itemgetter
@@ -83,6 +86,89 @@ def text_inlines(text: str) -> list:
         if part:
             inl.append(Text(part))
     return inl
+
+
+_REF = re.compile(
+    r'("(?:[^"]|"")*")'
+    r"|(?<![\w.$\]])(\$?)([A-Z]{1,3})(\$?)([1-9][0-9]{0,6})(?![\w(!\[])"
+    r"|(?<![\w.$:\]])(\$?)([A-Z]{1,3}):(\$?)([A-Z]{1,3})(?![\w(!\[$:])"
+    r"|(?<![\w.$:\]])(\$?)([1-9][0-9]{0,6}):(\$?)([1-9][0-9]{0,6})(?![\w(!\[$:.])")
+_MAX_ROW, _MAX_COL = 1_048_576, 16_384
+
+
+def _col_no(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n - 1
+
+
+def _part(dollar: str, value: int, base: int):
+    """One coordinate of a reference: ("$", value) when absolute, else its offset from `base`."""
+    return ("$", value) if dollar else value - base
+
+
+def pattern(text: str, row: int, col: int) -> tuple:
+    """The R1C1 pattern of a formula's A1 text at (row, col): the text between its references, and each reference as
+    a tuple of its coordinates (an absolute one ("$", n), a relative one its offset from the cell). The cells of one
+    fill-down or fill-right have one pattern. A reference past the sheet's last row or column stays text."""
+    out, at = [], 0
+    for m in _REF.finditer(text):
+        g = m.groups()
+        if g[0] is not None:
+            continue
+        if g[2] is not None:
+            r, c = int(g[4]) - 1, _col_no(g[2])
+            if r >= _MAX_ROW or c >= _MAX_COL:
+                continue
+            ref = ("c", _part(g[3], r, row), _part(g[1], c, col))
+        elif g[6] is not None:
+            a, b = _col_no(g[6]), _col_no(g[8])
+            if max(a, b) >= _MAX_COL:
+                continue
+            ref = ("k", _part(g[5], a, col), _part(g[7], b, col))
+        else:
+            a, b = int(g[10]) - 1, int(g[12]) - 1
+            if max(a, b) >= _MAX_ROW:
+                continue
+            ref = ("r", _part(g[9], a, row), _part(g[11], b, row))
+        out.append(text[at:m.start()])
+        out.append(ref)
+        at = m.end()
+    out.append(text[at:])
+    return tuple(out)
+
+
+def _place(part, base: int, limit: int):
+    """A coordinate's (dollar, zero-based value) at `base`; None off the sheet."""
+    if isinstance(part, tuple):
+        return part
+    v = part + base
+    return ("", v) if 0 <= v < limit else None
+
+
+def formula_text(pat: tuple, row: int, col: int) -> str:
+    """The A1 text of a pattern at (row, col); a reference shifted off the sheet is #REF!."""
+    out = []
+    for piece in pat:
+        if isinstance(piece, str):
+            out.append(piece)
+        elif piece[0] == "c":
+            r, c = _place(piece[1], row, _MAX_ROW), _place(piece[2], col, _MAX_COL)
+            out.append("#REF!" if r is None or c is None else f"{c[0]}{_letters(c[1])}{r[0]}{r[1] + 1}")
+        else:
+            limit, base, name = (_MAX_COL, col, _letters) if piece[0] == "k" else (_MAX_ROW, row, _row_name)
+            a, b = _place(piece[1], base, limit), _place(piece[2], base, limit)
+            out.append("#REF!" if a is None or b is None else f"{a[0]}{name(a[1])}:{b[0]}{name(b[1])}")
+    return "".join(out)
+
+
+def _row_name(r: int) -> str:
+    return str(r + 1)
+
+
+def _column_major(item):
+    return item[0][1], item[0][0]
 
 
 class Budget:
@@ -311,6 +397,8 @@ class Grid:
         self._merges_cut = False
         self.why = None
         self.dim = None
+        self.formulas = {}
+        self._patterns = {}
 
     # ---- input
     def stop(self, what, n, at=None):
@@ -532,6 +620,7 @@ class Grid:
             if slots[0] > limits.GRID_SLOTS:
                 break
             out.extend(self._island(part, slots))
+        out.extend(self._formulas())
         line = self._cut_line()
         if line:
             out.append(Para([Text(line)]))
@@ -584,6 +673,61 @@ class Grid:
             first = blocks[0]
             return [Para([Text(f"{rng}: ")] + list(first.inlines), hidden=first.hidden)] + blocks[1:]
         return [Para([Text(f"{rng}:")])] + blocks
+
+    def formula(self, row: int, col: int, pat: tuple):
+        """Keep the formula pattern (from `pattern`) of a cell `put` holds, for the sheet's formulas paragraph."""
+        if (row, col) in self.cells:
+            self.formulas[(row, col)] = self._patterns.setdefault(pat, pat)
+
+    def _formulas(self) -> list:
+        """Decision 5: the sheet's formulas as one paragraph: `Formulas: ` and an entry for each pattern, its ranges
+        (a column run of cells, runs of one extent in neighbouring columns one range) and its A1 text at the first,
+        in reading order of their first cells. Cells in hidden rows or columns make entries of their own, hidden,
+        after the shown ones. Each entry is charged its characters; past FORMULA_GROUPS ranges or the characters the
+        rest are counted under `formula` and the paragraph says how many."""
+        if not self.formulas:
+            return []
+        runs = {}
+        for (r, c), pat in sorted(self.formulas.items(), key=_column_major):
+            key = (pat, r in self.rows_h or c in self.cols_h, c)
+            got = runs.get(key)
+            if got and got[-1][1] == r - 1:
+                got[-1][1] = r
+            else:
+                runs.setdefault(key, []).append([r, r])
+        rects = {}
+        for (pat, hid, c), spans in runs.items():
+            group = rects.setdefault((pat, hid), {})
+            for r1, r2 in spans:
+                cols = group.setdefault((r1, r2), [])
+                if cols and cols[-1][1] == c - 1:
+                    cols[-1][1] = c
+                else:
+                    cols.append([c, c])
+        entries = []
+        for (pat, hid), group in rects.items():
+            ranges = sorted((r1, c1, r2, c2) for (r1, r2), cols in group.items() for c1, c2 in cols)
+            entries.append((hid, ranges[0][:2], pat, ranges))
+        entries.sort(key=_FIRST_TWO)
+        body, units, shown, visible = [], 0, 0, 0
+        for hid, (r, c), pat, ranges in entries:
+            units += len(ranges)
+            text = ", ".join(address(r1, c1) if (r1, c1) == (r2, c2) else f"{address(r1, c1)}:{address(r2, c2)}"
+                             for r1, c1, r2, c2 in ranges) + " =" + formula_text(pat, r, c)
+            if units > limits.FORMULA_GROUPS or len(text) + 2 > self.budget.chars:
+                break
+            self.budget.chars -= len(text) + 2
+            text = ("; " if shown else "") + text
+            body.append(Hidden([Text(text)]) if hid else Text(text))
+            shown += 1
+            visible += not hid
+        rest = len(entries) - shown
+        if rest:
+            self.ctx.skipped["formula"] += rest
+            body.append(Text(f"{'; ' if visible else ''}({rest:,} more formula groups not listed)"))
+        if not visible and not rest:
+            return [Para([Hidden([Text("Formulas: ")] + [t for h in body for t in h.inlines])])]
+        return [Para([Text("Formulas: ")] + body)]
 
     def _cut_line(self) -> str:
         """Where the sheet was cut, by what, and what the file declares past it; "" for a sheet read whole."""
