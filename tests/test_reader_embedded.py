@@ -308,6 +308,21 @@ def test_a_graph_objects_tail_walk_counts_its_records():
     assert walked[0] == walked[1], walked
 
 
+def test_objects_are_read_within_the_documents_seconds():
+    ticks = iter(range(10**6))
+    old = embedded.clock, limits.EMBED_SECONDS
+    embedded.clock, limits.EMBED_SECONDS = (lambda: float(next(ticks))), 2.5
+    try:
+        ctx = Context()
+        got = [embedded.of(ctx).load(workbook()) for _ in range(6)]
+        blob, _ = cfb_bytes({"Equation Native": eq_native(in_ppt.X)})
+        late = embedded.read(blob, ctx, embedded.of(ctx).budget())
+    finally:
+        embedded.clock, limits.EMBED_SECONDS = old
+    assert got[0][0] == "table" and got[3:] == [None] * 3 and late is None, (got, late)
+    assert 2.5 <= embedded.of(ctx).spent < 4.5, embedded.of(ctx).spent
+
+
 def test_a_parser_error_costs_only_the_object():
     bad = nest(0, book='<bookViews><workbookView activeTab="²"/></bookViews>')
     got, ctx = read(bad)

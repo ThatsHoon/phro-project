@@ -31,12 +31,16 @@ OpenDocument one its first) and only that sheet is read; what the read counted g
 the table. A stream or package over EMBED_BYTES is not read. The work objects cause is the document's too: what
 their packages inflate to (EMBED_TOTAL), the XML elements built into trees while one is read (EMBED_NODES), the
 BIFF records walked (BIN_RECORDS, the document's own streams with them) and the xls bytes decrypted
-(EMBED_DECRYPT); an object that would pass one of them is not read. A ReadError that only says this object cannot be read
+(EMBED_DECRYPT); an object that would pass one of them is not read. Whatever an object makes the reader do, the
+objects of one document are read for EMBED_SECONDS at most: one reached after that is not read (None), as past
+MAX_OBJECTS. A ReadError that only says this object cannot be read
 (damaged, too large, unsupported, encrypted) gives None, and so does any error that is no ReadError; any other
 ReadError ends the document, as it does everywhere.
 """
+import contextlib
 import copy
 import struct
+import time
 
 from . import limits
 from .containers.cfb import CfbError, Compound, is_cfb
@@ -55,6 +59,9 @@ _NONE = frozenset()
 CHART = ("chart", [], _NONE)
 BAD = ("bad", "", _NONE)
 UNREAD = ("unread", "", _NONE)
+
+
+clock = time.perf_counter
 
 
 def of(ctx):
@@ -77,6 +84,8 @@ class Objects:
         self.records = 0    # records walked in BIFF streams, the document's own and its objects'
         self.nodes = 0      # XML elements built into trees while objects were read
         self.decrypted = 0  # bytes of xls streams decrypted
+        self.spent = 0.0    # seconds the objects read so far took
+        self.since = None   # when the outermost object being read began
 
     def budget(self):
         """The document's one sheet_grid.Budget."""
@@ -84,6 +93,24 @@ class Objects:
             from .formats import sheet_grid
             self.sheets = sheet_grid.Budget()
         return self.sheets
+
+    def late(self) -> bool:
+        """Whether reading the document's objects has taken EMBED_SECONDS: the ones left are not read."""
+        spent = self.spent if self.since is None else self.spent + clock() - self.since
+        return spent >= limits.EMBED_SECONDS
+
+    @contextlib.contextmanager
+    def timed(self):
+        """Counts the time one object takes; an object read inside another is in the outer one's time."""
+        if self.since is not None:
+            yield
+            return
+        self.since = clock()
+        try:
+            yield
+        finally:
+            self.spent += clock() - self.since
+            self.since = None
 
     def inner(self):
         """A Context for the file an object holds: its own counts and warnings, this document's objects."""
@@ -163,18 +190,18 @@ def read(data: bytes, ctx, sheets):
     """The object held in `data` (a zip package or a compound file), as the module names it. `sheets` is the
     document's one sheet_grid.Budget."""
     objs = of(ctx)
-    if objs.depth > DEPTH or len(data) > limits.EMBED_BYTES:
+    if objs.depth > DEPTH or len(data) > limits.EMBED_BYTES or objs.late():
         return None
     try:
         if data[:4] == b"PK\x03\x04":
             objs.depth += 1
             try:
-                with charged(objs):
+                with objs.timed(), charged(objs):
                     return _package(data, ctx)
             finally:
                 objs.depth -= 1
         if is_cfb(data[:8]):
-            with Compound(data) as cf:
+            with objs.timed(), Compound(data) as cf:
                 return storage(cf, ctx, sheets)
     except ReadError as e:
         if e.kind not in _SKIP:
@@ -187,9 +214,11 @@ def read(data: bytes, ctx, sheets):
 def storage(cf, ctx, sheets):
     """The object whose streams `cf` holds, as the module names it."""
     objs = of(ctx)
+    if objs.late():
+        return None
     objs.depth += 1
     try:
-        with charged(objs):
+        with objs.timed(), charged(objs):
             return _storage(cf, ctx, sheets)
     except ReadError as e:
         if e.kind not in _SKIP:
