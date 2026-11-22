@@ -62,6 +62,7 @@ Tasks are grouped into streams that own disjoint files. A stream runs in its own
 | S8 pdf | 1 | `formats/pdf.py`, `pdf_layout.py`, `pdf_tables.py`, `pdf_pdfium.py`, `pdfnative/*` |
 | S9 ocr-ebook | 1 | `ocr.py`, `formats/epub.py`, `mobi.py`, `html.py`, `css.py` |
 | S10 renderer | 2 | `markdown.py`, `images.py`, `text.py`, `formats/jet.py` |
+| S12 runtime | 2 | `reader/__init__.py`, import structure of every module, `containers/zipx.py`, `containers/palmdb.py`, `text.py` (`garble_ratio`), the deadline checks in every format's main loop |
 | S11 embedded | 2 | new `embedded.py`, new `containers/vba.py`, call sites in `doc_objects.py`, `ooxml_word.py`, `rtf.py`, `ooxml_slides.py`, `ppt_objects.py`, `vsd.py`, `ooxml_sheets.py`, `xls.py` |
 
 ---
@@ -142,7 +143,7 @@ Tasks are grouped into streams that own disjoint files. A stream runs in its own
 - xlsx/xlsm/xlsb/xls: defined names, data-validation lists, tables (ListObjects: name, range, totals row), autofilter range, pivot tables (source, row/column/data fields; the cached result stays as the cells show it), conditional-format rules as one line each, sheet protection as a flag, external link targets. Each is a short block after the sheet's tables; none repeats cell values.
 - xls `HLINK` and `NOTE` records, xlsb `BrtHLink` and comment parts: links on their cells, notes with cell address and author.
 - The slicer fallback sentence is not content.
-- `containers/crypto.py` builds its tables on first use, not at import.
+- `containers/crypto.py` builds its tables on first use, not at import, and builds a key's round keys once per key, not once per block (`perf.md` F5: 25,858 key schedules, 71 % of one workbook's time).
 - Tests: one per construct on in-memory parts or records.
 
 ### Task 10 (S4): hwpx fields, captions and outline numbers; hwp outline numbers
@@ -214,6 +215,7 @@ Tasks are grouped into streams that own disjoint files. A stream runs in its own
 **Findings:** `pages.md` §1, §2, §8, §9, §15, §16, §17. **Files:** `formats/pdf.py`, `pdf_pdfium.py`, `pdfnative/*`; tests `tests/test_reader_pdf.py`, `tests/test_reader_pdfium.py`, `tests/test_reader_pdf_native.py`.
 
 - Decision 8.
+- A page picture is encoded to PNG only after it is chosen for the output, and at zlib level 1 (`perf.md` F4: 64 % of one document's time went to encoding pictures before the choice; under load the page timed out and the same input gave no pictures).
 - A vector chart is a figure: the figure test counts what the paths draw, not only how many there are; a figure's own text stays with the figure and the figure sits between paragraphs of its column.
 - AcroForm fields at their place, with empty fields and choices; the outline and page labels feed the heading index; attachments are listed; an IRM wrapper is `drm`.
 - Tests: one per bullet.
@@ -227,9 +229,10 @@ Tasks are grouped into streams that own disjoint files. A stream runs in its own
 
 ### Task 19 (S9): OCR does not hand over junk
 
-**Findings:** `pages.md` §3, §18, `output.md` F12. **Files:** `ocr.py`, `limits.py`; tests `tests/test_reader_ocr.py`.
+**Findings:** `pages.md` §3, §18, `output.md` F12, `perf.md` F1. **Files:** `ocr.py`, `limits.py`; tests `tests/test_reader_ocr.py`.
 
 - Picture text passes the same doubt signals as a page; doubtful picture text is not written.
+- A picture is sent to OCR only when a cheap look at its pixels says it can hold text (the ink and rule measures `ocr_pixels` already has), and a Latin page that Windows read with no doubt is not read again by Tesseract (`perf.md` F1: OCR is 57 % of wall time and 76 % of CPU over the 36 documents that start it; one e-book takes 8.0 s with it and 0.73 s without, for 480 bytes of text).
 - A junk page is read again at another scale and by the other engine before it is called doubtful, and the best read is kept by the doubt signals, not by `_score` alone.
 - Tests: with stand-in engines.
 
@@ -262,6 +265,26 @@ Tasks are grouped into streams that own disjoint files. A stream runs in its own
 
 - Decision 7. MS-OVBA decompression and the `dir` stream; budgets in `limits.py` for modules and bytes.
 - Tests: a compressed container round trip from a hand-built chunk; a module list; a hostile module name.
+
+### Task 25 (S1): time limits hold on every path
+
+**Findings:** `perf.md` F7 (gate and CLI parts), F8, F11, F12. **Files:** `gate.py`, `cache.py`, `scripts/read.py`; tests `tests/test_reader_gate.py`, `tests/test_reader_cache.py`.
+
+- A document whose conversion timed out is remembered (by its key and the code digest), so the next Read denies at once with the timeout text instead of paying 45 s again.
+- `read.py convert` run by hand has the same deadline as the hook's child, and the venv re-exec has a timeout.
+- A `pages="A-B"` read of a pdf with no whole-document entry converts that range only.
+- The cache prunes itself at most once a day, off the allow path's clock.
+- Tests: second Read of a timed-out document starts no child; a ranged read starts one child for the range only; prune runs once for two reads on the same day.
+
+### Task 26 (S12): no format runs past the deadline, and nothing unused is loaded
+
+**Findings:** `perf.md` F6, F7 (format part), F9, F10, F13. **Files:** see the Streams table; tests in each format's test file and a new `tests/test_reader_deadline.py`.
+
+- One deadline clock, set by `reader.convert`, checked in every format's record, row, page and part loops (19 formats have count caps only). Past it the format stops, keeps what it read and says what it did not read.
+- A read imports only what its format uses: OCR and raster load when a picture needs them; xlsx does not load the xls modules.
+- The per-unit Python loops the profiles name are replaced with C-speed calls: `zipx.local` per member, PalmDOC decompression, `garble_ratio`.
+- A mobi's picture records are not copied while the model holds them.
+- Tests: a stand-in clock stops each format family mid-document with a partial result and a status line; `sys.modules` after a tiny xlsx read holds no xls, ocr or raster module.
 
 ### Task 24: measure
 
