@@ -274,6 +274,7 @@ class _Wb:
         self.chartsheets: set[str] = set()  # sheet parts whose relationship is a chartsheet
         self.part = ""  # the workbook part
         self.at: dict[int, int] = {}
+        self.active = 0  # the first workbookView's activeTab: a position in the `sheets` element
         self.names: list[tuple[str, bool]] = []
         self.local: dict[int, list] = {}
         self.externals: list[str] = []
@@ -324,6 +325,10 @@ def _workbook(root, rels, wb, ctx):
         elif n == "workbookProtection":
             wb.protect = [(f"workbook {w}", False) for w, a in (("structure", "lockStructure"),
                                                                ("windows", "lockWindows")) if _on(attr(el, a))]
+        elif n == "bookViews":
+            tab = next((attr(v, "activeTab") or "" for v in el if local(v.tag) == "workbookView"), "")
+            if tab.isascii() and tab.isdigit() and len(tab) < 10:
+                wb.active = int(tab)
         elif n == "externalReferences":
             wb.externals = [attr(x, "id") or "" for x in el if local(x.tag) == "externalReference"]
         elif n == "definedNames":
@@ -476,8 +481,8 @@ class _Sheets:
 
     def __init__(self, pkg, wb, ctx):
         self.pkg, self.wb, self.ctx = pkg, wb, ctx
-        self.budget = sheet_grid.Budget()
         self.objects = embedded.Parts(pkg, ctx)
+        self.budget = self.objects.objects.budget()
         self.draw = sheet_drawing.Drawings(pkg, ctx)  # charts and pictures; one image byte count and chart cell count
         self.scan = 0                    # elements the sheet parts have closed, all sheets together
         self.used: set[str] = set()      # sheet parts read
@@ -731,7 +736,7 @@ class _Sheets:
         equation or tables after the sheet's drawings. One that is not read is counted under object, a chart left
         unread under chart; the sheet's legacy drawing holds its preview, which is not read."""
         out = []
-        for rid in sorted(rels):
+        for rid in sorted(rels, key=lambda r: (len(r), r)):
             rel = rels[rid]
             if rel.external or not rel.type.endswith(("/oleObject", "/package")):
                 continue
@@ -1099,6 +1104,20 @@ def _book_facts(pkg, wb, budget, ctx) -> list:
     names = [e for e in wb.names if e[0].split(" = ", 1)[0] not in caches]
     return (sheet_grid.listed("Names", names, budget, ctx, cap=limits.FACT_ITEMS) + sheet_grid.listed("External links", links, budget, ctx, cap=limits.FACT_ITEMS)
             + sheet_grid.listed("Protected", wb.protect, budget, ctx))
+
+
+def active_sheet(pkg, part, ctx) -> list:
+    """The blocks of the workbook's active sheet, of its first shown sheet when that one is hidden or not in the
+    list: what an embedded workbook shows, the only sheet of it that is read. [] when it is not read."""
+    wb = read_workbook(pkg, part, ctx)
+    at = wb.at.get(wb.active)
+    pick = wb.sheets[at] if at is not None and wb.sheets[at][2] not in _HIDDEN else \
+        next((s for s in wb.sheets if s[2] not in _HIDDEN), None)
+    if pick is None:
+        return []
+    wb.sheets = [pick]
+    secs = _Sheets(pkg, wb, ctx).sections()
+    return secs[0].blocks if secs else []
 
 
 def parse_sheets(pkg, part, ctx) -> Doc:

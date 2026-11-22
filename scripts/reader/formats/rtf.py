@@ -184,7 +184,7 @@ class _Pic:
 
 class _Obj:
     """An \\object being read: its objdata's hex chunks or raw bytes so far, and whether it was shown."""
-    __slots__ = ("depth", "hex", "raw", "chars", "nraw", "dead", "seen", "shown")
+    __slots__ = ("depth", "hex", "raw", "chars", "nraw", "dead", "seen", "shown", "counted")
 
     def __init__(self, depth):
         self.depth = depth    # the group depth of the \object group
@@ -193,6 +193,7 @@ class _Obj:
         self.dead = False     # over EMBED_BYTES: nothing more is collected and the object is not read
         self.seen = False     # an objdata group was met (a second one is skipped)
         self.shown = False    # the object was placed, so its result is left out
+        self.counted = False  # the object was counted (a chart left unread, an equation converted in part)
 
 
 class _Field:
@@ -351,7 +352,7 @@ class _Reader:
         self.data = b""        # the input the BIN tokens point into
         self.pic = None        # the picture being collected
         self.obj = None        # the object being read
-        self.objects = embedded.Objects(ctx)
+        self.objects = embedded.of(ctx)
         self.img_total = 0     # bytes of the pictures emitted so far (IMAGE_BYTES)
         # Cells the tables of the document may still take: one budget for the whole document, shared by every table
         # and charged per cell, as doc.py's is. It is the bound on hostile input (many tiny tables or one huge one
@@ -491,6 +492,8 @@ class _Reader:
         obj = self.obj
         if obj is not None:
             if depth == obj.depth:
+                if obj.seen and not obj.shown and not obj.counted:
+                    self.ctx.skipped["object"] += 1
                 self.obj = None
             elif closing.cap == "objdata":
                 self.finish_object(closing)
@@ -793,11 +796,12 @@ class _Reader:
         g = self.g
         if not g.suppress and not g.cap and self.obj is None:
             self.obj = _Obj(len(self.stack))
-        g.suppress, g.dest = True, "object"
+        g.suppress, g.dest, g.cap = True, "object", ""
 
     def w_objdata(self, p, fresh):
         g, obj = self.g, self.obj
-        if obj is not None and not obj.seen and not g.cap and len(self.stack) == obj.depth + 1:
+        g.cap = ""
+        if obj is not None and not obj.seen and len(self.stack) == obj.depth + 1:
             obj.seen, g.cap = True, "objdata"
         g.suppress, g.dest = True, "objdata"
 
@@ -974,10 +978,12 @@ class _Reader:
                 obj.shown = True
             else:
                 skipped["object"] += 1
+                obj.counted = True
         elif kind == "table":
             tables = self.objects.place(got)
             if tables is None:
                 skipped["chart"] += 1
+                obj.counted = True
             else:
                 for t in tables:
                     t.hidden = hidden
@@ -985,6 +991,7 @@ class _Reader:
                 obj.shown = True
         elif kind == "chart":
             skipped["chart"] += 1
+            obj.counted = True
 
     def finish_pict(self, g):
         """The pict group closes: its Image goes after the paragraph under way (before the next cell, in a table)."""

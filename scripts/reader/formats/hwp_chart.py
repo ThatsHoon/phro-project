@@ -74,13 +74,13 @@ def ole_blocks(data: bytes, ctx, *, sheets: sheet_grid.Budget | None = None) -> 
     package's Tables). Nothing, counted under object, for an item that is not a 4-byte length and the compound file
     it gives, or that holds none of these; counted under chart for a BIFF Workbook with no table to show, a chart
     that does not parse or a chart object left unread. A chart without series is nothing, not counted, as
-    charts.chart_table has it. A workbook's sheets draw on `sheets`, the document's sheet_grid.Budget (a fresh one
+    charts.chart_table has it. A workbook's sheets draw on `sheets`, the document's sheet_grid.Budget (the one of `ctx`
     when None)."""
     if len(data) < 12 or struct.unpack_from("<I", data)[0] != len(data) - 4 or not is_cfb(data[4:12]):
         ctx.skipped["object"] += 1
         return []
     if sheets is None:
-        sheets = sheet_grid.Budget()
+        sheets = embedded.of(ctx).budget()
     try:
         with Compound(data[4:]) as cf:
             if cf.exists("OOXMLChartContents"):

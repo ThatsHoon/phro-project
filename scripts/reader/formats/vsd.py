@@ -410,7 +410,7 @@ class _Reader:
         self.room = limits.MAX_OUTPUT    # shape text the document may still emit (vsdx's charge)
         self.stencil_room = limits.MAX_OUTPUT  # stencil shape text the document may keep
         self.image_bytes = 0
-        self.objects = embedded.Objects(ctx)
+        self.objects = embedded.of(ctx)
         self.budget = diagram.ConnectionBudget(ctx)
         self.names = {}       # libvisio's m_names: 0x33 id -> its bytes; a 0x32 starts a new one
         self.index = {}       # level -> [name index chunk data, its type, the names it maps to, parsed or None]

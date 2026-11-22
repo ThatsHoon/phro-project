@@ -14,7 +14,7 @@ reads as before: only its top-level frames."""
 import math
 import re
 
-from .. import diagram, limits
+from .. import diagram, embedded, limits
 from ..containers.zipx import attr, kids, local
 from ..limits import ReadError
 from ..markdown import blocks_len
@@ -219,12 +219,14 @@ class _Sheet:
         return self.grid.sheet_blocks()
 
 
-def sheets(pkg, ctx, content, styles_root) -> Doc:
+def sheets(pkg, ctx, content, styles_root, first=False) -> Doc:
+    """The workbook's sheets, over the document's one Budget; with `first` the read ends with the first sheet that
+    is shown (an embedded workbook)."""
     body = Body(pkg, ctx, Styles(content, styles_root))
     office = next((c for b in kids(content, "body") for c in b if local(c.tag) == "spreadsheet"), None)
     if office is None:
         raise ReadError("damaged", "no readable body")
-    budget, found, ok = sheet_grid.Budget(), 0, 0
+    budget, found, ok = embedded.of(ctx).budget(), 0, 0
     links = diagram.ConnectionBudget(ctx)  # the workbook's edges, shared by every sheet's diagram
     for t in kids(office, "table"):  # sheets of the same name are kept: each is a separate element
         found += 1
@@ -233,6 +235,8 @@ def sheets(pkg, ctx, content, styles_root) -> Doc:
             with ctx.guard("sheet"):
                 body.doc.blocks.append(_section(body, t, name, budget, links))
                 ok += 1
+                if first and not body.doc.blocks[-1].hidden:
+                    break
         except ReadError as e:
             if e.kind != "damaged":
                 raise

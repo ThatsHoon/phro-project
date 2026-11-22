@@ -22,7 +22,6 @@ from .. import embedded, images, limits
 from ..containers.cfb import CfbError
 from ..limits import ReadError
 from ..model import Math
-from . import sheet_grid
 
 _POOL = "OBJECTPOOL"
 MAX_OBJECTS = 256     # objects one document reads (the rest are counted under object)
@@ -42,7 +41,7 @@ class Objects:
         self._pool = None    # storage name (upper case) -> {stream name (upper case): path}
         self._objects = {}   # id -> an object read
         self._viewable = {}  # Data offset -> whether its preview shows as an image
-        self.sheets = sheet_grid.Budget()  # one for the document: the sheets of every embedded workbook share it
+        self.sheets = embedded.of(reader.ctx).budget()
         self.chart_cells = 0  # table cells placed from embedded workbooks, copies counted (CHART_TOTAL)
         self.whole = 0
 

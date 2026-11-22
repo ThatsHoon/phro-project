@@ -553,8 +553,8 @@ class _Reader:
 
     def ole(self, el, rid):
         """An embedded object (p:oleObj) of frame `el`, by embedded.Parts: its equation or its tables; one that is not
-        read shows the frame's preview picture, counted under object when it has none, and a chart left unread is
-        counted under chart."""
+        read shows the frame's preview picture and is counted under object, a chart left unread under chart. An
+        object the package does not hold (a link) is counted only when it has no preview either."""
         got = self.objects.get(self.scope.part, rid)
         kind = got[0] if got else ""
         if kind == "equation":
@@ -571,7 +571,7 @@ class _Reader:
         blocks += self.picture(el, next((e for e in el.iter() if local(e.tag) == "cNvPr"), None))
         if kind == "chart":
             self.ctx.skipped["chart"] += 1
-        elif kind == "equation" or len(blocks) == 0:
+        elif kind or not blocks:
             self.ctx.skipped["object"] += 1
         return blocks
 

@@ -176,6 +176,7 @@ class Context:
         self.name = ""
         self.vba: list = []   # (name, kind, source) of the VBA modules read (containers.vba)
         self.vba_bytes = 0    # bytes of VBA source read so far (VBA_BYTES)
+        self.embedded = None  # the document's embedded.Objects, made by embedded.of
 
     @contextmanager
     def guard(self, kind: str):

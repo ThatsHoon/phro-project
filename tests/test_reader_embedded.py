@@ -39,7 +39,8 @@ def workbook(active=0):
 
 def read(data, depth=0):
     ctx = Context()
-    return embedded.read(data, ctx, sheet_grid.Budget(), depth), ctx
+    embedded.of(ctx).depth = depth
+    return embedded.read(data, ctx, sheet_grid.Budget()), ctx
 
 
 def cells(tables):
@@ -101,6 +102,94 @@ def test_nesting_and_size_are_bounded():
         limits.EMBED_BYTES = saved
 
 
+SHEET_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/package"
+
+
+def nest(levels, fan=1, book=""):
+    """An xlsx whose one sheet holds `fan` copies of the xlsx of the level below, `levels` deep; the innermost
+    holds the cell `deep`."""
+    data = make_xlsx(None, [{"name": "S", "rows": xlsx_row(1, xlsx_cell("A1", inline="<t>deep</t>"))}], book=book)
+    for level in range(levels):
+        rows = xlsx_row(1, xlsx_cell("A1", inline=f"<t>level{level}</t>"))
+        data = make_xlsx(None, [{"name": "S", "rows": rows,
+                                 "rels": [(f"rO{k}", SHEET_REL, f"../embeddings/b{k}.xlsx", False)
+                                          for k in range(fan)]}],
+                         extra_parts={f"xl/embeddings/b{k}.xlsx": data for k in range(fan)})
+    return data
+
+
+def host(data):
+    from reader.formats import ooxml
+    ctx = Context()
+    doc = ooxml.parse_package(data, ctx)
+    return doc, ctx
+
+
+def flat(doc):
+    out = []
+
+    def walk(blocks):
+        for b in blocks:
+            if isinstance(b, Table):
+                out.extend(c for row in cells([b]) for c in row)
+            walk(getattr(b, "blocks", ()))
+    walk(doc.blocks)
+    return out
+
+
+def test_workbooks_inside_workbooks_stop_at_depth():
+    doc, ctx = host(nest(embedded.DEPTH + 1))
+    assert "A1: deep" in flat(doc) and not ctx.skipped, (flat(doc), ctx.skipped)
+    doc, ctx = host(nest(embedded.DEPTH + 2))
+    got = flat(doc)
+    assert "A1: deep" not in got and "A1: level0" in got and ctx.skipped == {"object": 1}, (got, ctx.skipped)
+
+
+def test_workbooks_inside_workbooks_share_the_object_count():
+    doc, ctx = host(nest(3, fan=8))
+    objs = embedded.of(ctx)
+    assert objs.count == embedded.MAX_OBJECTS and objs.depth == 0, (objs.count, objs.depth)
+    assert ctx.skipped["object"] > 0, ctx.skipped
+
+
+def test_embedded_workbook_reads_one_sheet_under_the_documents_budget():
+    ctx = Context()
+    budget = embedded.of(ctx).budget()
+    before = budget.cells
+    got = embedded.read(workbook(), ctx, budget)
+    assert cells(got[1]) == [["Item", "Qty"], ["Pen", "3"]] and before - budget.cells == 4, before - budget.cells
+    old = limits.SHEET_CELLS
+    limits.SHEET_CELLS = 2
+    try:
+        ctx = Context()
+        got = embedded.read(workbook(), ctx, embedded.of(ctx).budget())
+    finally:
+        limits.SHEET_CELLS = old
+    assert got[0] == "table" and sum(ctx.skipped.values()) > 0, (got, ctx.skipped)
+
+
+def test_a_parser_error_costs_only_the_object():
+    bad = nest(0, book='<bookViews><workbookView activeTab="²"/></bookViews>')
+    got, ctx = read(bad)
+    assert got is not None and cells(got[1]) == [["A1: deep"]], got
+    got, ctx = read(nest(0, book='<bookViews><workbookView activeTab="' + "9" * 5000 + '"/></bookViews>'))
+    assert cells(got[1]) == [["A1: deep"]], got
+    saved = embedded._package
+    embedded._package = lambda *a: 1 // 0
+    try:
+        got, ctx = read(workbook())
+        assert got is None, got
+        p = docx([("rO", PKG_REL, "embeddings/book.xlsx", False)], {"word/embeddings/book.xlsx": workbook()})
+        doc, ctx = in_docm.parse(p)
+        out = in_docm.md(p)
+        assert out.startswith("beforeafter\n\n![preview") and ctx.skipped == {"object": 1}, (out, ctx.skipped)
+        d, ctx = in_rtf.parse(in_rtf.rtf_file(b"{\\rtf1 a " + rtf_object(ole1(workbook(), b"Excel.Sheet.12"))
+                                              + b"\\par}"))
+        assert ctx.skipped == {"object": 1}, ctx.skipped
+    finally:
+        embedded._package = saved
+
+
 def test_chart_package_in_a_doc():
     p = in_doc.embed_doc({1: {"package_stream": chart_package()}}, preview=in_doc.PNG_PREVIEW)
     out = in_doc.md(p)
@@ -145,10 +234,19 @@ def test_xlsx_inside_a_docx():
     p = docx([("rO", OLE_REL, "embeddings/o.bin", False)], {"word/embeddings/o.bin": blob})
     out = in_docm.md(p)
     assert out.startswith("beforeafter\n\n![preview") and "img-001.png" in out, out
+    assert in_docm.parse(p)[1].skipped == {"object": 1}
     p = docx([("rO", OLE_REL, "https://example.com/x.xlsx", True)], {})
     assert in_docm.md(p).startswith("beforeafter\n\n![preview"), in_docm.md(p)
+    assert not in_docm.parse(p)[1].skipped
     p = docx([], {})
     assert in_docm.md(p).startswith("beforeafter\n\n![preview"), in_docm.md(p)
+    blob, _ = cfb_bytes({"Equation Native": b"\x00" * 40})
+    p = docx([("rO", OLE_REL, "embeddings/eq.bin", False)], {"word/embeddings/eq.bin": blob})
+    assert in_docm.parse(p)[1].skipped == {"object": 1}
+    blob, _ = cfb_bytes({"CONTENTS": b"%PDF-1.4"})
+    p = in_docm.docm(word_object("rO").replace('<v:imagedata r:id="rP" title="preview"/>', ""),
+                     parts={"word/embeddings/o.bin": blob}, rels=[("rO", OLE_REL, "embeddings/o.bin", False)])
+    assert in_docm.md(p) == "beforeafter\n" and in_docm.parse(p)[1].skipped == {"object": 1}, in_docm.md(p)
 
 
 def ole_frame(rid, pic=None):
@@ -174,7 +272,7 @@ def test_ole_object_workbook_on_a_slide():
                        extra={"ppt/embeddings/o.bin": blob, "ppt/media/p.png": in_docm.PNG})
     doc, ctx = in_slides.parse(p)
     out = in_slides.md(p)
-    assert "img-001.png" in out and not ctx.skipped, (out, ctx.skipped)
+    assert "img-001.png" in out and ctx.skipped == {"object": 1}, (out, ctx.skipped)
     p = in_slides.deck([ole_frame("rO")], srels={1: [("rO", OLE_REL, "../embeddings/o.bin")]},
                        extra={"ppt/embeddings/o.bin": blob})
     doc, ctx = in_slides.parse(p)
@@ -225,13 +323,38 @@ def test_rtf_object_workbook_follows_its_paragraph():
 def test_rtf_object_that_is_not_read_keeps_its_result():
     d, ctx = in_rtf.parse(in_rtf.rtf_file(b"{\\rtf1 a " + rtf_object(ole1(b"not a file", b"Package")) + b"\\par}"))
     got = in_rtf.markdown.render(d, in_rtf.tmp() / "assets", False, ctx.skipped)
-    assert got == "a preview\n" and not ctx.skipped, (got, ctx.skipped)
+    assert got == "(could not read: 1 embedded object)\n\na preview\n" and ctx.skipped == {"object": 1}, (got, ctx.skipped)
+    d, ctx = in_rtf.parse(in_rtf.rtf_file(b"{\\rtf1 a " + rtf_object(ole1(b"%PDF-1.4", b"Package"), result=b"")
+                                          + b"\\par}"))
+    assert ctx.skipped == {"object": 1}, ctx.skipped
+    d, ctx = in_rtf.parse(in_rtf.rtf_file(b"{\\rtf1 a {\\object\\objlink{\\result preview}}\\par}"))
+    assert not ctx.skipped, ctx.skipped
     for data in (b"\x01\x05", ole1(b"")[:20], struct.pack("<II", 0x501, 1) + b"\0" * 40):
         got = in_rtf.md(b"{\\rtf1 a " + rtf_object(data) + b"\\par}")
-        assert got == "a preview\n", (data, got)
+        assert got == "(could not read: 1 embedded object)\n\na preview\n", (data, got)
     blob, _ = cfb_bytes({"\x01CompObj": comp_obj(b"MSGraph.Chart.8")})
     d, ctx = in_rtf.parse(in_rtf.rtf_file(b"{\\rtf1 a " + rtf_object(ole1(blob)) + b"\\par}"))
     assert ctx.skipped == {"chart": 1}, ctx.skipped
+
+
+def test_rtf_object_in_a_captured_destination_adds_nothing_to_it():
+    obj = rtf_object(ole1(b"not a file", b"Package"))
+    d, ctx = in_rtf.parse(in_rtf.rtf_file(b"{\\rtf1{\\info{\\title T " + obj + b"}}body\\par}"))
+    assert d.title == "T", d.title
+    got = in_rtf.md(b"{\\rtf1 {\\listtext 1. " + obj + b"}item\\par}")
+    assert "Equation" not in got and "0105" not in got, got
+
+
+def test_rtf_objects_past_the_count_are_counted():
+    old = embedded.MAX_OBJECTS
+    embedded.MAX_OBJECTS = 2
+    try:
+        blob, _ = cfb_bytes({"Equation Native": eq_native(in_ppt.X)})
+        body = b"".join(rtf_object(ole1(blob)) for _ in range(5))
+        d, ctx = in_rtf.parse(in_rtf.rtf_file(b"{\\rtf1 a " + body + b"\\par}"))
+    finally:
+        embedded.MAX_OBJECTS = old
+    assert ctx.skipped == {"object": 3}, ctx.skipped
 
 
 def test_rtf_object_data_is_bounded():
@@ -242,7 +365,18 @@ def test_rtf_object_data_is_bounded():
         got = in_rtf.md(b"{\\rtf1 a " + rtf_object(ole1(blob)) + b"\\par}")
     finally:
         limits.EMBED_BYTES = old
-    assert got == "a preview\n", repr(got)
+    assert got == "(could not read: 1 embedded object)\n\na preview\n", repr(got)
+
+
+def test_sheet_objects_follow_their_relationship_numbers():
+    rows = xlsx_row(1, xlsx_cell("A1", inline="<t>host</t>"))
+    data = make_xlsx(None, [{"name": "S", "rows": rows,
+                             "rels": [(f"rId{n}", SHEET_REL, f"../embeddings/b{n}.xlsx", False) for n in (10, 2)]}],
+                     extra_parts={"xl/embeddings/b10.xlsx": chart_package("ten"),
+                                  "xl/embeddings/b2.xlsx": chart_package("two")})
+    doc, ctx = host(data)
+    caps = [b.caption for s in doc.blocks for b in getattr(s, "blocks", ()) if isinstance(b, Table)]
+    assert [c for c in caps if c and "Chart" in c] == ["Chart: column — two", "Chart: column — ten"], caps
 
 
 def vsd_object(chunks, y=1.0):

@@ -22,13 +22,13 @@ from bisect import bisect_right
 from collections import deque
 from itertools import groupby
 
-from .. import diagram, limits
+from .. import diagram, embedded, limits
 from ..containers import flate
 from ..containers.cfb import Compound, is_cfb
 from ..images import sniff
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Image, NoteRef, Table, Text
-from . import hwpx, sheet_grid
+from . import hwpx
 from .hancom import (
     Frame, Obj, Scopes, State, alt_text, button, cut_command, diagrams, flat, heading_level, lone_equations,
     next_marker, outline_marker, paragraph, place, plain, props, style_name_level,
@@ -252,7 +252,7 @@ class _Reader(Scopes):
         self.opened = 0     # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
         self.chart_cells = 0  # chart table cells placed so far, copies counted (CHART_TOTAL)
-        self.sheets = sheet_grid.Budget()  # one for the document: the sheets of every embedded workbook share it
+        self.sheets = embedded.of(ctx).budget()
         self.objects = 0      # OLE items read so far (MAX_OBJECTS)
         self.margins = False  # walking a header or footer, whose pictures and objects are skipped
         # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
