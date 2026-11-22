@@ -107,7 +107,7 @@ Tasks are grouped into streams that own disjoint files. A stream runs in its own
 - Caption: kind with direction and grouping (`column`, `bar`, `stacked column`, `100% stacked bar`), title, axis titles `(x: Year; y: Units)`.
 - Category values that are date serials under a date format are written as dates; General numbers are written with at most 15 significant digits (`4.4`, not `4.4000000000000004`).
 - Scatter and bubble series each keep their own x values; multi-level categories keep every level.
-- A chart whose series all come from one range of the same sheet names that range (`Data: Sheet1!A1:C9`) instead of repeating the cells; charts over other sources keep their table.
+- A chart whose series all come from one range of the same sheet names that range in its caption (`Data: Sheet1!A1:C9`). The chart table is always kept here; dropping rows the sheet output already holds is Task 27.
 - An ods chart is one table with its title, not cells joined by ` / ` and ` ; `.
 - Tests: one per bullet, on in-memory chart parts.
 
@@ -285,6 +285,13 @@ Tasks are grouped into streams that own disjoint files. A stream runs in its own
 - The per-unit Python loops the profiles name are replaced with C-speed calls: `zipx.local` per member, PalmDOC decompression, `garble_ratio`.
 - A mobi's picture records are not copied while the model holds them.
 - Tests: a stand-in clock stops each format family mid-document with a partial result and a status line; `sys.modules` after a tiny xlsx read holds no xls, ocr or raster module.
+
+### Task 27 (S10, after Task 21): a workbook chart does not repeat cells the sheet already shows
+
+**Findings:** `sheet.md` §5, §11, review `s2-charts-review.md` Important 1. **Files:** `formats/sheet_grid.py`, `ooxml_sheets.py`, `xlsb.py`, `xls.py`, `iwork_tables.py`, `charts.py`; tests in the sheet and chart tests.
+
+- After a workbook's sheets are read, a chart whose caption names a range keeps only its caption when every cell of that range was written to the output: no hidden row or column inside it, no cut, the sheet shown. Otherwise the chart keeps its table.
+- Tests: all cells shown gives caption only; a hidden row inside the range with plotVisOnly=0 keeps the table; a sheet cut by the cell budget keeps the table.
 
 ### Task 24: measure
 
