@@ -18,8 +18,8 @@ copy of a combo, or to the stripped text of flow 0 in a KF8-only book.
 
 Headings come from the NCX index (tag 1 position, tag 4 depth, as foliate-js `getNCX` reads it): a marker, byte 0x1e and
 the depth digit, is inserted at each position in the same pass as the link anchors (both in the coordinates of the text
-before any insert, so neither shifts the other), and after `html.blocks` a paragraph that starts with one becomes a
-heading. Python counts 0x1e as white space (regex white space, `str.strip`), which html.py would turn into a space, so the parts
+before any insert, so neither shifts the other), and after `html.blocks` a paragraph or list item that starts with
+one becomes a heading (`html.promote`). Python counts 0x1e as white space (regex white space, `str.strip`), which html.py would turn into a space, so the parts
 carry byte 0x0e instead from the moment they are parsed. Footnotes follow the sup-link heuristic of `_mark_notes`.
 """
 import bisect
@@ -34,12 +34,11 @@ from .. import images, limits
 from ..containers import palmdb
 from ..containers.palmdb import HuffCdic, Palm, palmdoc, record_cap, text_cap, trailing
 from ..limits import ReadError
-from ..model import Break, Context, Doc, Heading, Image, Para, Section, Table, Text
+from ..model import Context, Doc, Para, Section, Text
 
 MOBI_ANCHORS = 100_000  # anchors one book may insert
 MAX_SHEETS = 32         # stylesheets one chapter may use
 MAX_TITLE = 300         # characters of the book title (EXTH 503, else record 0's full title); 4x as many bytes read
-NCX_ITEMS = 10_000      # NCX entries read; labels are cut at MAX_LABEL
 MAX_LABEL = 300
 MAX_EXTH = 1024         # EXTH records read
 MAX_EXTH_VALUES = 64    # values kept per EXTH type
@@ -69,7 +68,6 @@ _BLOCK_TAG = re.compile(r"<\s*/?\s*(?:p|div|br|hr|h[1-6]|li|ul|ol|dl|dt|dd|tr|ta
 _DEAD = re.compile(r"<\s*(script|style)\b", re.I)
 _CLOSE = {"script": re.compile(r"</\s*script\b", re.I), "style": re.compile(r"</\s*style\b", re.I)}
 _TAG = re.compile(r"<[^<>]*>")
-_MARK = re.compile("\x0e([0-5])")
 _POSID = re.compile(r"(?:fp|kp)(\d{1,12})\Z")
 _NOTE_BLOCKS = frozenset(("p", "div", "li", "aside", "blockquote"))
 _NOTEREF = frozenset(("noteref", "doc-noteref"))
@@ -483,9 +481,9 @@ def _ncx(palm, head: Head, base: int, ctx) -> list:
     """The NCX of a book as (position, depth, label): tag 1 is the byte position in the text, tag 4 the depth, tag 3 the
     CNCX offset of the label (cut at MAX_LABEL). In a KF8 book (version 8) the position is (fid, offset) from tag 6
     when it has both, as foliate-js `getNCX` and its TOC read it (the same pair as a `kindle:pos` link), else tag 1.
-    At most NCX_ITEMS entries are kept (the index itself is bounded by INDX_ENTRIES, which bounds the allocation); an
-    entry with no position is left out. An index that cannot be read gives [] with no count, so the book reads as
-    without one. `base` is the record the KF8 indexes count from (0 for MOBI 6)."""
+    At most limits.TOC_ITEMS entries are kept (the index itself is bounded by INDX_ENTRIES, which bounds the
+    allocation); an entry with no position is left out. An index that cannot be read gives [] with no count, so the
+    book reads as without one. `base` is the record the KF8 indexes count from (0 for MOBI 6)."""
     if head.ncx == NULL:
         return []
     try:
@@ -493,7 +491,7 @@ def _ncx(palm, head: Head, base: int, ctx) -> list:
     except _STRUCTURAL:
         return []
     out = []
-    for _, tags in itertools.islice(index, NCX_ITEMS):
+    for _, tags in itertools.islice(index, limits.TOC_ITEMS):
         at = tags.get(6)
         pos = (at[0], at[1]) if head.version >= 8 and at and len(at) >= 2 else (tags.get(1) or [None])[0]
         if pos is None:
@@ -745,7 +743,7 @@ def _kf8(data: bytes, palm: Palm, head: Head, kf8: Head, base: int, ctx) -> tupl
 def _title(head: Head) -> str:
     codec = _CODECS.get(head.encoding, "utf-8")
     for raw in (head.exth.get(EXTH_TITLE) or [b""])[:1] + [head.full_title]:
-        title = " ".join(raw[:MAX_TITLE * 4].decode(codec, errors="replace").split())[:MAX_TITLE]
+        title = xhtml.book_title(raw[:MAX_TITLE * 4].decode(codec, errors="replace"), MAX_TITLE)
         if title:
             return title
     return ""
@@ -810,7 +808,7 @@ def _mobi6(text: bytes, palm: Palm, head: Head, ctx) -> tuple:
 def _chapters(pieces, load, css, encoding: int, ctx, headings: bool = False, text_len: int = 0) -> tuple:
     """(chapter sections, kept notes) of the text pieces. Each piece is parsed as one part under ctx.guard("chapter");
     notes are found over all the parts (_mark_notes) before any is read into blocks. headings: the pieces carry NCX
-    markers, which become headings (_promote) and are stripped; text_len is the length of the text the link targets
+    markers, which become headings (html.promote) and are stripped; text_len is the length of the text the link targets
     count in."""
     trees = []
     for piece in pieces:
@@ -837,7 +835,7 @@ def _chapters(pieces, load, css, encoding: int, ctx, headings: bool = False, tex
             with ctx.guard("chapter"):
                 blocks = xhtml.blocks(node, css=css(node), load=load, notes=notes, ctx=ctx)
                 if headings:
-                    blocks = _promote(blocks)
+                    blocks = xhtml.promote(blocks)
                 if blocks:
                     sections.append(Section("chapter", number=len(sections) + 1, blocks=blocks))
         except ReadError as e:
@@ -849,7 +847,7 @@ def _chapters(pieces, load, css, encoding: int, ctx, headings: bool = False, tex
     for k in keep:
         doc_notes[k] = notes[k]
         if headings:
-            _strip(notes[k])
+            xhtml.strip_marks(notes[k])
     if len(notes) > len(doc_notes):
         ctx.skipped["note"] += len(notes) - len(doc_notes)
     for s in sections:
@@ -857,87 +855,6 @@ def _chapters(pieces, load, css, encoding: int, ctx, headings: bool = False, tex
     for nb in doc_notes.values():
         xhtml.settle(nb, doc_notes)
     return sections, doc_notes
-
-
-# ---- headings from the NCX
-def _strip(blocks):
-    """Every heading marker removed from every text under blocks: paragraphs, headings, list items, quotes, table cells
-    and captions, and the inlines inside inlines."""
-    work = [blocks]
-    while work:
-        for b in work.pop():
-            if isinstance(b, Table):
-                b.caption = _MARK.sub("", b.caption)
-                work.extend(c.blocks for row in b.rows for c in row)
-            if hasattr(b, "blocks"):
-                work.append(b.blocks)
-            todo = [b]
-            while todo:
-                o = todo.pop()
-                if isinstance(o, Image):
-                    o.alt = _MARK.sub("", o.alt)
-                    continue
-                if not hasattr(o, "inlines"):
-                    continue
-                for it in o.inlines:
-                    if isinstance(it, Text):
-                        it.text = _MARK.sub("", it.text)
-                    elif hasattr(it, "inlines"):
-                        todo.append(it)
-
-
-def _depth(inlines):
-    """The depth digit of the marker a run of inlines starts with, else None."""
-    while inlines:
-        first = inlines[0]
-        if isinstance(first, Text):
-            m = _MARK.match(first.text)
-            return int(m.group(1)) if m else None
-        if not hasattr(first, "inlines"):
-            return None
-        inlines = first.inlines
-    return None
-
-
-def _blank(inlines) -> bool:
-    todo = [inlines]
-    while todo:
-        for it in todo.pop():
-            if isinstance(it, Text):
-                if it.text.strip():
-                    return False
-            elif hasattr(it, "inlines"):
-                todo.append(it.inlines)
-            elif not isinstance(it, Break):
-                return False
-    return True
-
-
-def _promote(blocks: list) -> list:
-    """A Para whose text starts with a heading marker becomes Heading(depth + 1). A paragraph that is only a marker (the
-    position fell between two tags) gives its depth to the paragraph after it and goes. Every marker is then stripped
-    from every inline, headings and table cells included."""
-    out, pending = [], None
-    for b in blocks:
-        if isinstance(b, Para):
-            d = _depth(b.inlines)
-            _strip([b])
-            if d is not None and _blank(b.inlines):
-                pending = d
-                continue
-            if d is None:
-                d = pending
-            if d is not None:
-                while b.inlines and isinstance(b.inlines[0], Text) and not b.inlines[0].text.strip():
-                    del b.inlines[0]
-                if b.inlines and isinstance(b.inlines[0], Text):
-                    b.inlines[0].text = b.inlines[0].text.lstrip()
-                b = Heading(d + 1, b.inlines, hidden=b.hidden)
-        else:
-            _strip([b])
-        pending = None
-        out.append(b)
-    return out
 
 
 # ---- footnotes by the sup-link heuristic

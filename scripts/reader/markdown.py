@@ -90,7 +90,8 @@ LOST = (
 # Named items: reported after the counted ones, by name only (a flag, not a count).
 NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"),
          ("kf8_fallback", "KF8 layout (the MOBI 6 copy was read)"), ("plain_text", "book markup (read as plain text)"),
-         ("page_images", "page images (text layer only)"), ("linked_data", "linked tables' data (in other files)"))
+         ("page_images", "page images (text layer only)"), ("linked_data", "linked tables' data (in other files)"),
+         ("toc", "table of contents (its headings are not marked)"))
 # counted too, but they only change formatting or reading order, so they are not reported
 INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story",
                       "char_positions", "attribute", "merge", "duplicate", "jet_page8"})  # char_positions: pdf glyph positions dropped, the text kept
@@ -119,7 +120,8 @@ KOREAN_HINT = ('(Korean OCR is not installed in Windows: Settings > Time & langu
 
 
 def ocr_notes(counts: dict, hint: bool) -> list:
-    """The OCR status lines of `counts` (NO_OCR's keys and "pictures_left"), in their order; the Korean hint last."""
+    """The OCR status lines of `counts` (NO_OCR's keys, "pictures_left", "pictures_doubtful" and "pictures_blank"), in
+    their order; the Korean hint last."""
     out = []
     n, m = counts["pages"], counts["doubtful"]
     if n:
@@ -131,6 +133,10 @@ def ocr_notes(counts: dict, hint: bool) -> list:
         out.append(f"(OCR stopped; {k} picture{'' if k == 1 else 's'} not read)")
     if f := counts["failed"]:
         out.append("(OCR failed on 1 page; shown as an image.)" if f == 1 else f"(OCR failed on {f} pages; shown as images.)")
+    if d := counts["pictures_doubtful"]:
+        out.append(f"(OCR text of {d} picture{'' if d == 1 else 's'} left out as doubtful)")
+    if b := counts["pictures_blank"]:
+        out.append(f"({b} blank picture{'' if b == 1 else 's'} not sent to OCR)")
     if hint:
         out.append(KOREAN_HINT)
     return out
@@ -177,7 +183,8 @@ class _Pictures:
     A picture not queued by FIGURE_RESERVE before the session's stop goes late at once, so the ones queued keep that
     time to be read; after it, and past the stop, no further picture is sent, and one whose header (images.pixel_size)
     gives a long side under OCR_MIN_EDGE is passed over. A picture that went late, or was not sent for the time, is
-    put in `left` when the render writes it (`lines`), so one the render leaves out is not counted."""
+    put in `left` when the render writes it (`lines`), so one the render leaves out is not counted; so are one whose
+    OCR text is left out as doubtful, in `doubtful`, and one with nothing on it to read (`ocr.blank`), in `blank`."""
 
     KINDS = frozenset({"png", "jpg", "bmp", "gif", "tiff"})
 
@@ -187,6 +194,8 @@ class _Pictures:
         self.tickets = {}  # (bytes, page) -> Ticket
         self.late = set()  # (bytes, page) of the pictures not read for the time
         self.left = set()  # those of them the render wrote
+        self.doubtful = set()
+        self.blank = set()
         stop = s.deadline - limits.FIGURE_RESERVE
         until = stop - limits.FIGURE_RESERVE
         passed = set()
@@ -232,12 +241,18 @@ class _Pictures:
         r = self.s.wait(t)
         if r.status == "late":
             self.left.add(k)
+        if r.status == "blank":
+            self.blank.add(k)
         if r.status != "done":
             return []
         try:
-            return ocr.picture_lines(r.page)
+            got = ocr.picture_lines(r.page)
         except Exception:  # noqa: BLE001 - OCR never makes a document fail
             return []
+        if got and r.verdict.kind == "doubtful":
+            self.doubtful.add(k)
+            return []
+        return got
 
 
 class _Mode:
@@ -323,7 +338,7 @@ class _Render:
     def __init__(self, doc: Doc, assets_dir: Path, show_hidden: bool, skipped=None, drop=frozenset(), pictures=None):
         self.doc, self.assets_dir, self.show = doc, assets_dir, show_hidden
         self.pictures = pictures  # the _Pictures OCR reads, or None without a session
-        self.ocr = None  # the OCR counts (NO_OCR's keys and "pictures_left"), set by body when there are any
+        self.ocr = None  # the OCR counts (NO_OCR's keys and the pictures_ ones), set by body when there are any
         self.ocr_hint = False
         self.drop = drop  # ids of hidden-only notes whose marks are left out with their definitions
         self.marked: set[str] = set()  # ids of notes whose mark was shown
@@ -934,8 +949,9 @@ class _Render:
         if self.unread:
             status.append("(could not read: " + ", ".join(self.unread) + ")")
         if "ocr" in self.doc.meta or self.pictures is not None:
-            left = len(self.pictures.left) if self.pictures is not None else 0
-            self.ocr = dict(NO_OCR, **self.doc.meta.get("ocr", {}), pictures_left=left)
+            p = self.pictures
+            counts = {f"pictures_{k}": 0 if p is None else len(getattr(p, k)) for k in ("left", "doubtful", "blank")}
+            self.ocr = dict(NO_OCR, **self.doc.meta.get("ocr", {}), **counts)
             self.ocr_hint = self.pictures is not None and self.pictures.s.hint
             status += ocr_notes(self.ocr, self.ocr_hint)
         props = self.doc.meta.get("properties")
@@ -1010,7 +1026,8 @@ def render(doc: Doc, assets_dir: Path, hidden: bool = False, skipped=None, info=
     "images" (how many viewable images the output links to), "figures" and "figures_left" (pictures converted to PNG,
     and figure kinds kept as the original file), "warnings" (the figure warnings, sorted) and "pages" (the line numbers of the page heads it wrote, for stats; None
     when it wrote none, or a head did not survive to the output), "ocr" (doc.meta["ocr"]'s counts with
-    "pictures_left"; None with neither those counts nor an OCR session) and "ocr_hint" (the Korean hint was written).
+    "pictures_left", "pictures_doubtful" and "pictures_blank"; None with neither those counts nor an OCR session)
+    and "ocr_hint" (the Korean hint was written).
 
     With an OCR session (`ocr.session()`), the raster pictures are sent to it first (`_Pictures`), and each one's
     words follow its link as `Picture text:`, placed as `Figure text:` is.

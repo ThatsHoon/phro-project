@@ -423,7 +423,8 @@ def test_page_image_not_read_again():
 
 def test_bmp_picture_read():
     with reading(answer=TWO) as sent:
-        out = render(Image(bmp(70, 70, 24, (bytes([200]) * 210 + b"\0\0") * 70)))
+        row = bytes([200]) * 210 + b"\0\0"
+        out = render(Image(bmp(70, 70, 24, bytes(3) + row[3:] + row * 69)))
     assert sent == [(70, 70, "picture")], sent
     assert out == "![](assets/img-001.png)\n\nPicture text: Total 120\n", out
 

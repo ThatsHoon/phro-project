@@ -2,6 +2,8 @@
 
 `tree` builds a depth-limited Node tree with the stdlib HTMLParser, `Css` answers the two questions the
 reader cares about (is this hidden, is this bold), and `blocks` turns a tree into document-model blocks.
+MathML becomes TeX (`mathml`). A table of contents marks its targets with MARK and a depth digit, which
+`promote` turns into headings (epub marks the tree, mobi the text).
 This module is named html on purpose: reader/ itself must never be on sys.path, so the stdlib `html.parser`
 below still resolves to the standard library.
 """
@@ -17,6 +19,7 @@ from urllib.parse import unquote
 from . import limits
 from .containers.zipx import resolve
 from .css import MAX_SHEET, Css  # noqa: F401  (re-exported)
+from .formats import omml
 from .model import Bold, Break, Cell, Context, Heading, Hidden, Image, Link, ListItem, Math, NoteRef, Para, Quote, Table, Text
 
 MAX_DOC = 16 * 2**20       # bytes of one document that are parsed
@@ -296,6 +299,47 @@ def _tidy(items: list) -> list:
     return res
 
 
+@dataclass
+class _Cap:
+    """A picture whose alt is one letter (an opening quote mark may come before it), held in its paragraph until the paragraph shows whether it opens a
+    word (a drop cap: the letter stays and the picture goes) or not (the picture stays, after the paragraph)."""
+    node: Node
+
+
+def _cap_letter(node) -> str:
+    alt = node.attrs.get("alt", "").strip()
+    return alt if alt[-1:].isalpha() and (len(alt) == 1 or (len(alt) == 2 and alt[0] in "\"'“‘«「『")) else ""
+
+
+def _uncap(items: list) -> list:
+    out = []
+    for it in items:
+        if isinstance(it, _Cap):
+            continue
+        if hasattr(it, "inlines") and it.inlines:
+            it.inlines[:] = _uncap(it.inlines)
+            if not it.inlines:
+                continue
+        out.append(it)
+    return out
+
+
+def _caps(items: list, imgs: list) -> list:
+    """items with every _Cap resolved: the one that leads the paragraph, with a letter right after it, becomes its
+    letter and its picture leaves imgs; any other goes, its picture staying in imgs."""
+    chain = [items]
+    while chain[-1] and hasattr(chain[-1][0], "inlines"):
+        chain.append(chain[-1][0].inlines)
+    lead = chain[-1]
+    if lead and isinstance(lead[0], _Cap):
+        after = next((part[1] for part in reversed(chain) if len(part) > 1), None)
+        if isinstance(after, Text) and after.text[:1].isalpha():
+            node = lead[0].node
+            lead[0] = Text(_cap_letter(node))
+            imgs[:] = [im for im in imgs if im is not node]
+    return _uncap(items)
+
+
 class _Walk:
     def __init__(self, css, load, notes, ctx, part):
         self.css, self.load, self.notes, self.ctx, self.part = css, load, notes, ctx, part
@@ -322,7 +366,7 @@ class _Walk:
         return True
 
     def hid(self, k) -> bool:
-        return "hidden" in k.attrs or self.css.display_none(k, ())
+        return "hidden" in k.attrs or self.css.hidden(k, ())
 
     # ---- inlines
     def inl(self, k, cur, imgs):
@@ -333,7 +377,7 @@ class _Walk:
         t = k.tag
         if t in DROP or self.take_note(k):
             return
-        if "hidden" in k.attrs or self.css.display_none(k, ()):
+        if self.hid(k):
             sub = []
             self.inl_inner(k, sub, imgs)
             if sub:
@@ -352,6 +396,8 @@ class _Walk:
         elif t in ("img", "image"):
             if imgs is not None:
                 imgs.append(k)
+                if _cap_letter(k):
+                    cur.append(_Cap(k))
             elif k.attrs.get("alt"):
                 cur.append(Text(k.attrs["alt"][:MAX_ALT]))
         elif t == "a":
@@ -362,9 +408,9 @@ class _Walk:
                     cur.append(Text("(" + _ws(text_of(c)).strip() + ")"))
                 else:
                     self.inl(c, cur, imgs)
-        elif t == "math":
-            alt = k.attrs.get("alttext", "").strip()[:2000]
-            cur.append(Math(alt) if alt else Text(_ws(text_of(k))))
+        elif _local(t) == "math":
+            tex = mathml(k) or k.attrs.get("alttext", "").strip()[:2000]
+            cur.append(Math(tex) if tex else Text(_ws(text_of(k))))
         elif t == "epub:switch":
             for c in k.children:
                 if isinstance(c, Node) and c.tag == "epub:default":
@@ -418,7 +464,7 @@ class _Walk:
         cur, imgs = [], []
 
         def flush():
-            items = _tidy(cur)
+            items = _tidy(_caps(_tidy(cur), imgs))
             if items:
                 if li and li[0] is not None:
                     out.append(ListItem(lvl, li[0], items))
@@ -497,7 +543,11 @@ class _Walk:
         ordered = k.tag == "ol"
         n = _int(k.attrs.get("start"), 1)
         for c in k.children:
-            if isinstance(c, str) or self.take_note(c) or c.tag in DROP:
+            if isinstance(c, str):
+                if MARK in c:
+                    self.flow([c], out, lvl, None)
+                continue
+            if self.take_note(c) or c.tag in DROP:
                 continue
             if c.tag == "li":
                 self.item(c, out, lvl, f"{n}." if ordered else "-")
@@ -560,6 +610,278 @@ def blocks(root: Node, *, css: Css, load: Callable[[str], bytes | None], notes: 
             ctx.skipped[kind] += int(n)
             if ctx.skipped[kind] == int(n):
                 ctx.warnings.append(f"{kind}: {msg}")
+    return out
+
+
+# ---- MathML
+_BIG_OPS = frozenset("∑∏∐⋀⋁⋂⋃⨀⨁⨂⨄⨆∫∬∭∮∯∰⨌")
+_LIMIT_NAMES = frozenset({"lim", "liminf", "limsup", "max", "min", "sup", "inf", "det", "gcd", "Pr"})
+_SILENT = frozenset({"annotation", "annotation-xml", "none", "mprescripts", "mspace", "malignmark", "maligngroup"})
+
+
+_PRESENTED = frozenset({"mi", "mn", "mo", "mtext", "ms", "annotation"})
+_VARIANT = {"bold": "\\mathbf", "double-struck": "\\mathbb", "script": "\\mathcal", "fraktur": "\\mathfrak",
+            "sans-serif": "\\mathsf", "monospace": "\\mathtt", "bold-italic": "\\boldsymbol",
+            "bold-script": "\\mathcal", "bold-fraktur": "\\mathfrak"}
+
+
+def _local(tag: str) -> str:
+    return tag.rpartition(":")[2]
+
+
+def _args(node) -> list:
+    return [c for c in node.children if isinstance(c, Node)]
+
+
+def _token(node) -> str:
+    return _ws(text_of(node)).strip()
+
+
+def mathml(node) -> str:
+    """TeX of a MathML element without delimiters: a TeX annotation of `semantics` as written, else the presentation
+    markup through the TeX buffer the Office Math reader writes with. Past limits.MAX_DEPTH an element is its text.
+    "" for a tree with no presentation token and no annotation (Content MathML): its text is not the formula."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if _local(n.tag) in _PRESENTED:
+            break
+        stack.extend(_args(n))
+    else:
+        return ""
+    out = omml.Tex()
+    _mm(node, out, 0)
+    return out.finish()
+
+
+def _mm_arg(node, depth) -> omml.Tex:
+    out = omml.Tex()
+    _mm(node, out, depth)
+    return out
+
+
+def _big(node) -> bool:
+    """An operator that takes its under and over parts as limits: a large operator or a limit-like function name."""
+    return _local(node.tag) in ("mo", "mi") and (_token(node) in _BIG_OPS or _token(node) in _LIMIT_NAMES)
+
+
+def _mm(n, out, depth):
+    if isinstance(n, str):
+        if n.strip():
+            out.push_math_text(_ws(n).strip())
+        return
+    if depth > limits.MAX_DEPTH:
+        out.push_math_text(_token(n))
+        return
+    t, a = _local(n.tag), _args(n)
+    if t in ("mi", "mn", "mo"):
+        s = _token(n)
+        variant = n.attrs.get("mathvariant", "").strip().lower()
+        font = _VARIANT.get(variant) or ("\\mathrm" if variant == "normal" and t == "mi" and len(s) > 1 else None)
+        name = omml.function_name(s) if t != "mn" and len(s) > 1 and not font else None
+        if name:
+            out.push_macro(name)
+        elif font and s:
+            inner = omml.Tex()
+            inner.push_math_text(s)
+            out.push_command(font, inner)
+        else:
+            out.push_math_text(s)
+    elif t in ("mtext", "ms"):
+        s = _token(n)
+        if s:
+            out.push_text_mode(s)
+    elif t == "mfrac" and len(a) >= 2:
+        num, den = _mm_arg(a[0], depth + 1), _mm_arg(a[1], depth + 1)
+        if n.attrs.get("linethickness", "").strip() in ("0", "0px", "0em", "0pt"):
+            out.push_char("{")
+            out.push_tex(num)
+            out.push_macro("\\atop")
+            out.push_tex(den)
+            out.push_char("}")
+        else:
+            out.push_macro("\\frac")
+            out.push_group(num)
+            out.push_group(den)
+    elif t == "msqrt":
+        inner = omml.Tex()
+        for c in n.children:
+            _mm(c, inner, depth + 1)
+        out.push_command("\\sqrt", inner)
+    elif t == "mroot" and len(a) >= 2:
+        out.push_macro("\\sqrt")
+        out.push_char("[")
+        out.push_tex(_mm_arg(a[1], depth + 1))
+        out.push_char("]")
+        out.push_group(_mm_arg(a[0], depth + 1))
+    elif t in ("msub", "msup", "msubsup", "munder", "mover", "munderover") and len(a) >= 2:
+        _scripts(t, a, out, depth)
+    elif t == "mmultiscripts" and a:
+        rest = a[1:]
+        cut = next((i for i, c in enumerate(rest) if _local(c.tag) == "mprescripts"), len(rest))
+        _pairs(rest[cut + 1:], out, depth, "{}")
+        out.push_base(_mm_arg(a[0], depth + 1))
+        _pairs(rest[:cut], out, depth, "")
+    elif t == "mfenced":
+        seps = "".join(n.attrs.get("separators", ",").split())
+        out.push_math_text(n.attrs.get("open", "("))
+        for i, c in enumerate(a):
+            if i and seps:
+                out.push_math_text(seps[min(i - 1, len(seps) - 1)])
+            _mm(c, out, depth + 1)
+        out.push_math_text(n.attrs.get("close", ")"))
+    elif t == "mtable":
+        out.push_str("\\begin{matrix}")
+        rows = [r for r in a if _local(r.tag) in ("mtr", "mlabeledtr")]
+        for i, row in enumerate(rows):
+            if i:
+                out.push_str(" \\\\")
+            cells = [c for c in _args(row) if _local(c.tag) == "mtd"][1 if _local(row.tag) == "mlabeledtr" else 0:]
+            for j, cell in enumerate(cells):
+                out.push_str(" & " if j else " ")
+                out.push_tex(_mm_arg(cell, depth + 2))
+        out.push_str(" \\end{matrix}")
+    elif t == "semantics":
+        tex = next((_token(c) for c in a if _local(c.tag) == "annotation"
+                    and "tex" in c.attrs.get("encoding", "").lower()), "")
+        if tex:
+            out.push_str(tex)
+        elif a:
+            _mm(a[0], out, depth + 1)
+    elif t not in _SILENT:
+        for c in n.children:
+            _mm(c, out, depth + 1)
+
+
+def _scripts(t, a, out, depth):
+    base = _mm_arg(a[0], depth + 1)
+    big = _big(a[0])
+    if t in ("munder", "mover") and not big and _local(a[1].tag) == "mo":
+        cmd = omml.accent(_token(a[1]))
+        if cmd:
+            out.push_command(cmd, base)
+            return
+    lower = a[1] if t in ("msub", "msubsup", "munder", "munderover") else None
+    upper = a[1] if t in ("msup", "mover") else a[2] if len(a) > 2 and t in ("msubsup", "munderover") else None
+    if t[1] == "s" or big:
+        out.push_base(base)
+        for mark, part in (("_", lower), ("^", upper)):
+            if part is not None:
+                out.push_char(mark)
+                out.push_group(_mm_arg(part, depth + 1))
+        return
+    for cmd, part in (("\\underset", lower), ("\\overset", upper)):
+        if part is not None:
+            wrapped = omml.Tex()
+            wrapped.push_macro(cmd)
+            wrapped.push_group(_mm_arg(part, depth + 1))
+            wrapped.push_group(base)
+            base = wrapped
+    out.push_tex(base)
+
+
+def _pairs(parts, out, depth, lead):
+    """The (subscript, superscript) pairs of mmultiscripts; `none` leaves its side out."""
+    for i in range(0, len(parts) - 1, 2):
+        out.push_str(lead)
+        for mark, part in (("_", parts[i]), ("^", parts[i + 1])):
+            if _local(part.tag) != "none":
+                out.push_char(mark)
+                out.push_group(_mm_arg(part, depth + 1))
+
+
+# ---- headings from a table of contents
+MARK = "\x0e"
+_MARK = re.compile("\x0e([0-5])")
+
+
+def book_title(raw: str, limit: int) -> str:
+    """A book title on one line, cut at limit; the placeholder "Unknown" (Calibre's, for a book with no title) is no
+    title."""
+    title = " ".join(raw.split())[:limit]
+    return "" if title.casefold() == "unknown" else title
+
+
+def strip_marks(blocks):
+    """Every heading marker (MARK and its depth digit) removed from every text under blocks: paragraphs, headings, list
+    items, quotes, table cells and captions, and the inlines inside inlines."""
+    work = [blocks]
+    while work:
+        for b in work.pop():
+            if isinstance(b, Table):
+                b.caption = _MARK.sub("", b.caption)
+                work.extend(c.blocks for row in b.rows for c in row)
+            if hasattr(b, "blocks"):
+                work.append(b.blocks)
+            todo = [b]
+            while todo:
+                o = todo.pop()
+                if isinstance(o, Image):
+                    o.alt = _MARK.sub("", o.alt)
+                    continue
+                if not hasattr(o, "inlines"):
+                    continue
+                for it in o.inlines:
+                    if isinstance(it, Text):
+                        it.text = _MARK.sub("", it.text)
+                    elif hasattr(it, "inlines"):
+                        todo.append(it)
+
+
+def _mark_depth(inlines):
+    """The depth digit of the marker a run of inlines starts with, else None."""
+    while inlines:
+        first = inlines[0]
+        if isinstance(first, Text):
+            m = _MARK.match(first.text)
+            return int(m.group(1)) if m else None
+        if not hasattr(first, "inlines"):
+            return None
+        inlines = first.inlines
+    return None
+
+
+def _blank(inlines) -> bool:
+    todo = [inlines]
+    while todo:
+        for it in todo.pop():
+            if isinstance(it, Text):
+                if it.text.strip():
+                    return False
+            elif hasattr(it, "inlines"):
+                todo.append(it.inlines)
+            elif not isinstance(it, Break):
+                return False
+    return True
+
+
+def promote(blocks: list) -> list:
+    """A paragraph or list item whose text starts with a heading marker becomes Heading(depth + 1), its one bold run
+    unwrapped. One that is only a marker (the position fell between two tags) gives its depth to the paragraph or list
+    item after it and goes. Every marker is then stripped from every inline, headings and table cells included."""
+    out, pending = [], None
+    for b in blocks:
+        if isinstance(b, (Para, ListItem)):
+            d = _mark_depth(b.inlines)
+            strip_marks([b])
+            if d is not None and _blank(b.inlines):
+                pending = d
+                continue
+            if d is None:
+                d = pending
+            if d is not None:
+                items = b.inlines
+                while items and isinstance(items[0], Text) and not items[0].text.strip():
+                    del items[0]
+                if len(items) == 1 and isinstance(items[0], Bold) and not items[0].hidden:
+                    items = items[0].inlines
+                if items and isinstance(items[0], Text):
+                    items[0].text = items[0].text.lstrip()
+                b = Heading(d + 1, items, hidden=b.hidden)
+        else:
+            strip_marks([b])
+        pending = None
+        out.append(b)
     return out
 
 

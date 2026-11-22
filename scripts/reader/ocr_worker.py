@@ -16,16 +16,16 @@ from collections import deque
 from dataclasses import asdict
 
 from . import limits, ocr
-from .ocr_pixels import Gray, rotate, rules, threshold, unread
+from .ocr_pixels import Gray
 
 
 def _job(head: dict, body: bytes, eng: ocr.Engines, got: float) -> dict:
-    """One job's answer. Pages get their rules and unread ink in the page's turned frame, the ink measured with the
-    page's `ink` boxes when the engine gives them (its word boxes are then deskewed); pictures get neither. The job's
-    deadline is `left` seconds after `got`, the time.monotonic() its head was read, so a job that waits for a thread
-    keeps it. An answer read while the deadline passed carries `"cut": true`: the rotation search or a re-read may
-    have been cut short, so the Session never caches it; one cut before the engine gave any page is
-    `{"id", "ok": false, "cut": true}`, which the Session files late. A head without `left` has no deadline."""
+    """One job's answer: `ocr.read_page`'s `Reading`, the rules and unread ink of a page in its turned frame; a
+    picture has neither. The job's deadline is `left` seconds after `got`, the time.monotonic() its head was read,
+    so a job that waits for a thread keeps it. An answer read while the deadline passed carries `"cut": true`: the
+    rotation search or a re-read may have been cut short, so the Session never caches it; one cut before the engine
+    gave any page is `{"id", "ok": false, "cut": true}`, which the Session files late. A head without `left` has no
+    deadline."""
     jid, kind = head["id"], head["kind"]
     dpi = float(head["dpi"])
     left = head.get("left")
@@ -39,24 +39,17 @@ def _job(head: dict, body: bytes, eng: ocr.Engines, got: float) -> dict:
         # running natively, so the deadline is the only bound, and the Session kills this process at its stop
         deadline = got + left
     g = Gray(head["w"], head["h"], body)
-    page, hint = ocr.read_page(g, eng, deadline, kind)
+    reading = ocr.read_page(g, eng, deadline, kind, dpi)
     cut = time.monotonic() >= deadline
-    if page is None:
+    if reading is None:
         if cut:
             return {"id": jid, "ok": False, "cut": True}
-        return {"id": jid, "ok": True, "page": None, "rules": [], "unread": None, "hint": hint}
-    if kind != "page":
-        res = {"id": jid, "ok": True, "page": asdict(page), "rules": [], "unread": None, "hint": hint}
-    else:
-        turned = rotate(g, page.turn)  # the frame the page's boxes are in
-        thr = threshold(turned)
-        found = rules(turned, dpi, thr)
-        boxes = page.ink if page.ink is not None else [(w.x, w.y, w.w, w.h) for w in page.words]
-        un = unread(turned, boxes, found, thr)
-        res = {"id": jid, "ok": True, "page": asdict(page), "rules": [list(b) for b in found],
-               "unread": {"share": un.share, "box": None if un.box is None else list(un.box), "area": un.area,
-                          "density": un.density, "spread": un.spread},
-               "hint": hint}
+        return {"id": jid, "ok": True, "page": None, "rules": [], "unread": None, "hint": False}
+    un = reading.unread
+    res = {"id": jid, "ok": True, "page": asdict(reading.page), "rules": [list(b) for b in reading.rules],
+           "unread": None if un is None else {"share": un.share, "box": None if un.box is None else list(un.box),
+                                               "area": un.area, "density": un.density, "spread": un.spread},
+           "hint": reading.hint}
     if cut:
         res["cut"] = True
     return res

@@ -1,4 +1,5 @@
-"""The small CSS cascade the document reader needs: display:none and bold, nothing else."""
+"""The small CSS cascade the document reader needs: hidden (display:none, visibility:hidden or collapse) and bold,
+nothing else."""
 import re
 
 MAX_SHEET = 2**20     # characters of one stylesheet that are read
@@ -6,6 +7,7 @@ MAX_SELECTORS = 5000  # simple selectors one Css keeps
 MAX_BRACES = 200_000  # braces one stylesheet is scanned for
 MAX_RULES = 20_000    # rules one stylesheet may yield
 
+_PROPS = frozenset({"display", "visibility", "font-weight"})
 _SEL = re.compile(r"^([A-Za-z][A-Za-z0-9:\-]*)?(?:\.([\w\-]+))?$")
 
 
@@ -56,12 +58,13 @@ def _rules(s: str, stats: dict):
 
 
 def _decls(body: str) -> dict:
-    """{display|font-weight: (value, important)} of one declaration block; the last one wins unless !important."""
+    """{display|visibility|font-weight: (value, important)} of one declaration block; the last one wins unless
+    !important."""
     out = {}
     for d in body[:10_000].split(";"):
         name, sep, val = d.partition(":")
         name = name.strip().lower()
-        if not sep or name not in ("display", "font-weight"):
+        if not sep or name not in _PROPS:
             continue
         val, imp = val.strip().lower(), False
         if "!important" in val:
@@ -72,7 +75,7 @@ def _decls(body: str) -> dict:
 
 
 class Css:
-    """Selectors tag, .class, tag.class and comma lists for display and font-weight; the rest is ignored."""
+    """Selectors tag, .class, tag.class and comma lists for display, visibility and font-weight; the rest is ignored."""
 
     def __init__(self, sheets: list[str]):
         self._idx: dict = {}  # (tag, class) -> {prop: (important, order, value)}
@@ -120,9 +123,13 @@ class Css:
                 best[name] = (rank, val)
         return {k: v[1] for k, v in best.items()}
 
-    def display_none(self, node, ancestors) -> bool:
-        """True when node, or any of `ancestors`, has display:none."""
-        return any(self._props(n).get("display") == "none" for n in (node, *ancestors))
+    def hidden(self, node, ancestors) -> bool:
+        """True when node, or any of `ancestors`, has display:none or visibility:hidden or collapse."""
+        for n in (node, *ancestors):
+            props = self._props(n)
+            if props.get("display") == "none" or props.get("visibility") in ("hidden", "collapse"):
+                return True
+        return False
 
     def bold(self, node) -> bool:
         v = self._props(node).get("font-weight", "")

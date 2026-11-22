@@ -9,7 +9,8 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from reader import markdown  # noqa: E402
+from reader import html as xhtml  # noqa: E402
+from reader import limits, markdown  # noqa: E402
 from reader.containers import palmdb  # noqa: E402
 from reader.containers.palmdb import HuffCdic, Palm, palmdoc, record_cap, text_cap, trailing  # noqa: E402
 from reader.formats import mobi  # noqa: E402
@@ -1105,12 +1106,12 @@ def test_ncx_skipped_when_text_has_1e():
 
 def test_ncx_items_cap():
     entries = [(NCX_BODY.index(b"<p>Chapter A"), 0, "A"), (NCX_BODY.index(b"<p>Sub B"), 1, "B")]
-    old = mobi.NCX_ITEMS
-    mobi.NCX_ITEMS = 1
+    old = limits.TOC_ITEMS
+    limits.TOC_ITEMS = 1
     try:
         doc, ctx = _read(_ncx_book(NCX_BODY, entries))
     finally:
-        mobi.NCX_ITEMS = old
+        limits.TOC_ITEMS = old
     assert _headings(doc) == [(1, "Chapter A")] and not ctx.skipped
     long = _ncx_book(NCX_BODY, [(5, 0, "x" * 1000)])
     assert len(mobi._ncx(Palm(long), mobi._head(Palm(long).record(0)), 0, Context())[0][2]) == mobi.MAX_LABEL
@@ -1186,7 +1187,7 @@ def test_one_chapter_book_takes_an_early_sup_link_as_a_note():
 def test_strip_alt_of_images():
     from reader.model import Image as Img
     img = Img(b"x", "a" + chr(14) + "1b")
-    mobi._strip([img])
+    xhtml.strip_marks([img])
     assert img.alt == "ab"
 
 
@@ -1293,6 +1294,23 @@ def test_parse_path():
         p = Path(d) / "b.mobi"
         p.write_bytes(_mobi(BOOK))
         assert len(mobi.parse(p, Context()).blocks) == 2
+
+
+def test_ncx_list_item_becomes_heading():
+    text = (b'<html><body><ol><li id="t1"><b>Plan</b></li></ol><p>text</p><ol><li><b>1. Part</b></li></ol>'
+            b'<p>body</p><ol><li>item</li></ol></body></html>')
+    entries = [(text.index(b"<li id"), 0, "Plan"), (text.index(b"<li><b>1."), 1, "1. Part")]
+    doc, ctx = _read(_ncx_book(text, entries))
+    assert _headings(doc) == [(1, "Plan"), (2, "1. Part")], _headings(doc)
+    assert [type(b).__name__ for b in _blocks(doc)] == ["Heading", "Para", "Heading", "Para", "ListItem"]
+    assert "\x0e" not in _md(doc, ctx)
+
+
+def test_placeholder_title_left_out():
+    doc, _ = _read(_mobi(BOOK, exth={503: b"Unknown"}, title=b"Unknown"))
+    assert doc.title == "", doc.title
+    doc, _ = _read(_mobi(BOOK, exth={503: b"Unknown"}, title=b"Real"))
+    assert doc.title == "Real", doc.title
 
 
 def main():
