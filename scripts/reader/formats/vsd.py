@@ -98,8 +98,12 @@ shape's), walked through at most `limits.MAX_DEPTH` sheets with a seen-set; none
 is a node: its box is (PinX - LocPinX, PinY - LocPinY) and (Width, Height), mirrored about the pin by FlipX and FlipY,
 bounded after the turn by Angle about the pin, plus its group's origin (no pin or no size: no box), its group its
 parent. A shape naming a master page whose group is not of that master page is named by the stencil page's name
-(libvisio's `_nameFromId` at the stencil page's level + 1, read when the page is entered), and its kind is that
-name's, as vsdx finds it; vsd has no containers (the User section is not read). Diagram
+(libvisio's `_nameFromId` at the stencil page's level + 1, read when the page is entered) less a trailing
+`.<digits>` copy number, and its kind is that name's, as vsdx finds it; a shape naming its group's master page is a
+part of the group. vsd has no containers (the User section is not read). A connector's route is the end points of its
+own first geometry section's rows (0x8A MoveTo, 0x8B LineTo, 0x8C ArcTo, 0x90 EllipticalArcTo, 0xA5 SplineStart,
+0xA6 SplineKnot, 0xC1 PolylineTo, 0xC3 NURBSTo: X at 1, Y at 10; a later 0x89 Geometry ends it), placed as its box
+is placed. Diagram
 data never fails a page: registration and `place` run under `ctx.guard("shape")`, a failed `place` leaving the flow
 as it is. A `_VBA_PROJECT_CUR` storage counts `vba` once; macros are never read.
 
@@ -315,7 +319,7 @@ def number(fmt: int, cell: int, value: float) -> str:
 class _Shape:
     __slots__ = ("sid", "level", "parent", "master", "home", "pin", "text", "cut", "names", "names_size",
                  "names_cut", "order", "fields", "ftype", "fformat", "data", "broken", "has_misc", "hide", "begin",
-                 "end", "runs", "geo", "ends", "arrows", "line_style")
+                 "end", "runs", "geo", "ends", "arrows", "line_style", "path", "path_done")
 
     def __init__(self, sid, level, parent, master, home, line_style=None):
         self.sid, self.level, self.parent, self.master, self.home = sid, level, parent, master, home
@@ -338,6 +342,8 @@ class _Shape:
         self.hide = False
         self.begin = self.end = None  # glued ends (readMisc)
         self.runs = None      # 8-bit text's runs: [(count, codec)]
+        self.path = []        # its first geometry section's vertices, shape-local
+        self.path_done = False
 
 
 class _Entry:
@@ -370,10 +376,11 @@ class _Stencil:
 
 class _Item:
     """A page shape as the page's flow and diagram see it."""
-    __slots__ = ("sid", "parent", "pin", "geo", "ends", "blocks", "hidden", "text", "conn", "name")
+    __slots__ = ("sid", "parent", "pin", "geo", "ends", "blocks", "hidden", "text", "conn", "name", "part", "path")
 
-    def __init__(self, sid, parent, pin, geo, ends, blocks, hidden, text, conn, name):
+    def __init__(self, sid, parent, pin, geo, ends, blocks, hidden, text, conn, name, part, path):
         self.sid, self.parent, self.pin, self.geo, self.ends, self.name = sid, parent, pin, geo, ends, name
+        self.part, self.path = part, path
         self.blocks, self.hidden, self.text = blocks, hidden, text  # its text hidden; its shown text
         self.conn = conn      # a connector's (begin id, end id, arrows); None for a node
 
@@ -724,13 +731,17 @@ class _Reader:
         a node with its blocks and box; (ox, oy) is its group's origin."""
         if it.conn is None:
             dia.shape(key, it.blocks, vsdx._kind(it.name), _bound(it.pin, it.geo, ox, oy),
-                      it.hidden and bool(it.text), parent=None if it.parent in (0, NONE) else it.parent, name=it.name)
+                      it.hidden and bool(it.text), parent=None if it.parent in (0, NONE) else it.parent, name=it.name,
+                      part=it.part)
             return
         begin, end, arrows = it.conn
         bx, by, ex, ey = it.ends or (None, None, None, None)
         p0 = (bx + ox, by + oy) if bx is not None and by is not None else None
         p1 = (ex + ox, ey + oy) if ex is not None and ey is not None else None
-        dia.connector(key, begin, end, p0, p1, arrows, blocks=[] if it.hidden and it.text else it.blocks)
+        px, py, lx, ly = it.pin or (None, None, None, None)
+        _, _, a, fx, fy = it.geo or (None, None, None, None, None)
+        path = vsdx._placed(it.path, px, py, lx, ly, a, fx, fy, ox, oy) if px is not None and py is not None else []
+        dia.connector(key, begin, end, p0, p1, arrows, blocks=[] if it.hidden and it.text else it.blocks, path=path)
 
     @staticmethod
     def origin(ids, memo, sid):
@@ -868,12 +879,15 @@ class _Reader:
             self.stencil_room -= cost
             spage.shapes[s.sid] = _Entry(text, cut, hide, s.pin, s.geo, s.ends, s.arrows, s.line_style)
 
-    def master_name(self, s, page) -> str:
+    def master_name(self, s, page) -> tuple:
+        """(name, part): the stencil page's name for a shape naming a master page its group is not of, and whether
+        it is a sub-shape of its group's master."""
         mp = s.master[0]
         page.masters.setdefault(s.sid, mp)
-        if mp == NONE or page.masters.get(s.parent) == mp or mp not in self.spages:
-            return ""
-        return self.spages[mp].name
+        part = mp != NONE and page.masters.get(s.parent) == mp
+        if mp == NONE or part or mp not in self.spages:
+            return "", part
+        return vsdx._master_name(self.spages[mp].name), False
 
     def place(self, s, page):
         """A page shape: its text (its own, else its master's), hidden flag, picture, geometry and connector data."""
@@ -917,9 +931,10 @@ class _Reader:
                 or s.end is not None:  # an XForm1D (BeginX and EndX) or a glued end
             conn = (s.begin, s.end, self.arrows_of(s))
             page.conns += 1
-        name = self.master_name(s, page)
+        name, part = self.master_name(s, page)
         if blocks or s.pin is not None or conn is not None:
-            page.items.append(_Item(s.sid, s.parent, s.pin, s.geo, s.ends, blocks, hidden, text, conn, name))
+            page.items.append(_Item(s.sid, s.parent, s.pin, s.geo, s.ends, blocks, hidden, text, conn, name, part,
+                                    s.path))
 
     # ---- chunk readers (libvisio's names)
     def xform(self, s, data):
@@ -954,6 +969,19 @@ class _Reader:
             if at + 8 <= n:
                 ends[i] = _f64(data, at)
         s.ends = ends
+
+    def geometry(self, s, data):
+        """readGeometry: a section after the first one with vertices ends the route."""
+        if s.path:
+            s.path_done = True
+
+    def vertex(self, s, data):
+        """The end point of a MoveTo, LineTo, ArcTo, EllipticalArcTo, PolylineTo, NURBSTo, SplineStart or SplineKnot
+        (readMoveTo: X at 1, Y at 10, a unit byte before each double), one item of the meter, up to `diagram.PATH`
+        a shape."""
+        if s.path_done or len(data) < 18 or len(s.path) >= diagram.PATH or not self.take(1):
+            return
+        s.path.append((_f64(data, 1), _f64(data, 10)))
 
     def line(self, s, data):
         """readLine of a shape: its start and end markers (see markers); the last 0x85 wins."""
@@ -1185,7 +1213,8 @@ class _Reader:
 # chunk type -> the _Reader method that reads it (looked up per call); _BY_CHUNK's take the chunk, the rest its data
 _HANDLERS = {0x9B: "xform", 0x9D: "xform1d", 0x85: "line", 0x0E: "text", 0x2C: "name_list", 0x2D: "listed",
              0x66: "field_list", 0xA1: "field", 0xA4: "misc", 0x94: "char_ix", 0x98: "foreign_type",
-             0x0C: "foreign_data"}
+             0x0C: "foreign_data", 0x89: "geometry", **dict.fromkeys((0x8A, 0x8B, 0x8C, 0x90, 0xA5, 0xA6, 0xC1, 0xC3),
+                                                                     "vertex")}
 _BY_CHUNK = frozenset((0x2D, 0xA1))
 
 

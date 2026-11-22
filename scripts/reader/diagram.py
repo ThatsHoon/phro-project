@@ -11,9 +11,14 @@ numbers, escapes, orients and renders, and builds model blocks only.
   the document's `ConnectionBudget`, the glued ones first. A connector given its slot's blocks is labelled with their
   plain text on one line when that is at most NAME characters; else as a node is (below), and as an edge its blocks
   follow the diagram after an `nA --> nB:` paragraph, the edge as written. The shapes inside a connector (their
-  `parent` it) that show plain text join its label: those in its first third along begin to end, its own label with
-  those in its middle, those in its last third, each group's texts joined by a space and the groups by ` / `, read
-  from the written start; past NAME characters the label is cut with `…` and their blocks follow too.
+  `parent` it) that show plain text join its label at the end nearer their box's centre along its route (`path`,
+  else the chord between its end points; none, or a tie, the middle): the label is `start / label / end`, read from
+  the written start, each slot's texts joined by a space and an empty slot kept, or the connector's own label alone
+  when both end slots are empty. A one-line text box of at most NAME characters that is in no group, not an edge end
+  and not inside an end's box joins the middle slot of the edge whose route passes nearest its centre, within its
+  own height and INFER_TOL of the scope diagonal, when no other route is as near (none past FLOAT_WORK box-segment
+  pairs a scope). Past NAME characters the label is cut with `…` and the taken shapes' blocks follow too; their
+  `data` follows always.
 - **Loose ends.** A connector with an end not glued (a plain `line` only with an arrowhead set True) is a candidate,
   up to CONNECTIONS a document, snapped or not (`infer_skipped` once for a scope that has some past them). Each loose
   end's point lands on the smallest box holding it, else on the nearest within INFER_TOL of the diagonal of the box
@@ -25,9 +30,11 @@ numbers, escapes, orients and renders, and builds model blocks only.
 - **Nodes.** The edges' ends, numbered `n1`, `n2`, ... in the order their keys first appear in the slots, then the
   slotless ones in `shape()` order. Plain text of at most NAME characters is the whole label; any other content gets
   its first line cut at NAME plus `…` (or `(picture)`, `(table)`, `(chart)`, `(content)`), and its blocks follow the
-  diagram after a `nK:` paragraph. A shape may name its group (`parent`). An end on a shape with no text and no
-  text below it moves to its nearest ancestor that has either; failing that it stays when it has a `name`, else it
-  moves to its nearest ancestor with one; never through a hidden shape, a container or a connector, at most
+  diagram after a `nK:` paragraph, and so does its `data` (Shape Data, never its label). A shape may name its
+  group (`parent`). An end on a shape with no text and no text below it that is a part of its group moves up to the
+  group, and on while each is a part of its own, stopping at the first with text or text below: a part is flagged
+  `part` by its reader, or lies inside its group's box and either spans its full width or height or touches its
+  border at most PORT of its area. Never through a hidden shape, a container or a connector, at most
   `limits.MAX_DEPTH` up (text below counts only from shapes that are not edge ends). A textless node is labelled by
   the plain text of the shapes below it (not hidden, not containers, not ends, nor under one), in slot order, and
   those shapes leave the flow; else by its name. A hidden shape, or one left with no label, is a blank node; a hidden
@@ -57,6 +64,9 @@ NAME = 80             # characters of a shape's text that go into its node whole
 INFER_TOL = 0.02      # of the scope diagonal: how far a loose end may lie from the box it snaps to
 INFER_SHAPES = 2_000  # shapes a scope may have and still get its loose ends inferred
 COORD = 1e9           # a coordinate past this, in absolute value, makes the box unknown
+PORT = 0.125          # of its parent's box area: a shape at most this big touching the parent's border is a port
+PATH = 256            # points of a connector's route kept
+FLOAT_WORK = 4_000_000  # (text box, route segment) pairs one scope may measure for floating edge labels
 
 _NEWLINE = re.compile(r"\r\n|\r|\n")
 _KINDS = {"": ("[", "]"), "decision": ("{", "}"), "terminator": ("([", "])"), "circle": ("((", "))"),
@@ -84,21 +94,29 @@ class ConnectionBudget:
 
 
 class _Shape:
-    __slots__ = ("blocks", "kind", "box", "hidden", "container", "title", "parent", "name")
+    __slots__ = ("blocks", "kind", "box", "hidden", "container", "title", "parent", "name", "part", "data")
 
-    def __init__(self, blocks, kind, box, hidden, container, title, parent, name):
+    def __init__(self, blocks, kind, box, hidden, container, title, parent, name, part, data):
         self.blocks, self.kind, self.box = blocks, kind, box
         self.hidden, self.container, self.title = hidden, container, title
-        self.parent, self.name = parent, name
+        self.parent, self.name, self.part, self.data = parent, name, part, data
 
 
 class _Connector:
-    __slots__ = ("begin", "end", "p0", "p1", "arrows", "label", "line", "hidden", "follow")
+    __slots__ = ("begin", "end", "p0", "p1", "arrows", "label", "line", "hidden", "follow", "path")
 
-    def __init__(self, begin, end, p0, p1, arrows, label, line, hidden, follow=None):
+    def __init__(self, begin, end, p0, p1, arrows, label, line, hidden, follow=None, path=None):
         self.begin, self.end, self.p0, self.p1 = begin, end, p0, p1
         self.arrows, self.label, self.line, self.hidden = arrows, label, line, hidden
         self.follow = follow  # the blocks that follow the diagram when it is an edge, or None
+        self.path = path      # its route's points on the page, begin to end, or None
+
+
+def _copy(c, **changes):
+    out = _Connector(c.begin, c.end, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden, c.follow, c.path)
+    for k, v in changes.items():
+        setattr(out, k, v)
+    return out
 
 
 def _box(box):
@@ -253,17 +271,34 @@ def _edge_label(blocks):
     return _label(blocks)[0], list(blocks)
 
 
+def _along(path, p) -> tuple:
+    best, at, total = math.inf, 0.0, 0.0
+    for (ax, ay), (bx, by) in zip(path, path[1:]):
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        t = 0.0 if length2 <= 0 else min(1.0, max(0.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / length2))
+        d = math.hypot(p[0] - ax - t * dx, p[1] - ay - t * dy)
+        length = math.sqrt(length2)
+        if d < best:
+            best, at = d, total + t * length
+        total += length
+    return at, total
+
+
 def _side(c, box) -> int:
-    if box is None or c.p0 is None or c.p1 is None:
+    if box is None or c.path is None:
         return 1
-    (x0, y0), (x1, y1) = c.p0, c.p1
-    dx, dy = x1 - x0, y1 - y0
-    length = dx * dx + dy * dy
-    if length <= 0:
+    at, total = _along(c.path, _centre(box))
+    if total <= 0:
         return 1
-    cx, cy = _centre(box)
-    t = ((cx - x0) * dx + (cy - y0) * dy) / length
-    return 0 if t < 1 / 3 else 2 if t > 2 / 3 else 1
+    return 0 if 2 * at <= total else 2
+
+
+def _seg_point(a, b, p) -> float:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length2 = dx * dx + dy * dy
+    t = 0.0 if length2 <= 0 else min(1.0, max(0.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length2))
+    return math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy)
 
 
 def _edge(c, nid) -> tuple:
@@ -293,24 +328,33 @@ class Diagram:
         self.connectors: dict = {}  # key -> _Connector, in connector() order
 
     def shape(self, key, blocks: list, kind: str = "", box=None, hidden: bool = False, container: bool = False,
-              title: str = "", parent=None, name: str = "") -> None:
-        """`parent` is the key of the group the shape sits in; `name` stands for its text when it has none."""
+              title: str = "", parent=None, name: str = "", part: bool = False, data=()) -> None:
+        """`parent` is the key of the group the shape sits in, and `part` says the shape is a piece of it (a master
+        shape's sub-shape); `name` stands for its text when it has none; `data` are blocks of its slot that describe
+        it (Shape Data) and never make its label."""
         if key in self.shapes:
             return
         self.shapes[key] = _Shape(blocks, kind if kind in _KINDS else "", _box(box), bool(hidden), bool(container),
-                                  (title or "").strip(), parent, " ".join((name or "").split())[:NAME])
+                                  (title or "").strip(), parent, " ".join((name or "").split())[:NAME], bool(part),
+                                  list(data))
 
     def connector(self, key, begin=None, end=None, p0=None, p1=None, arrows=(None, None), label: str = "",
-                  line: bool = False, hidden: bool = False, blocks=None) -> None:
+                  line: bool = False, hidden: bool = False, blocks=None, path=None, data=()) -> None:
         """`blocks`, when given, are what the connector's slot holds: they make the label (see `_edge_label`), and
-        when they are more than a short plain text they follow the diagram should it become an edge."""
+        when they are more than a short plain text they follow the diagram should it become an edge; `data` follow
+        it too and never make its label. `path` is its route's points on the page, begin to end."""
         if key in self.connectors:
             return
         follow = None
         if blocks is not None:
             label, follow = _edge_label(blocks)
-        self.connectors[key] = _Connector(begin, end, _point(p0), _point(p1), arrows, (label or "").strip(),
-                                          bool(line), bool(hidden), follow)
+        if data:
+            follow = (follow or []) + list(data)
+        p0, p1 = _point(p0), _point(p1)
+        points = [q for q in (_point(p) for p in list(path or ())[:PATH]) if q is not None]
+        route = points if len(points) >= 2 else [p0, p1] if p0 and p1 else None
+        self.connectors[key] = _Connector(begin, end, p0, p1, arrows, (label or "").strip(), bool(line),
+                                          bool(hidden), follow, route)
 
     def _glued(self, key) -> bool:
         return key is not None and key in self.shapes and key not in self.connectors
@@ -337,7 +381,22 @@ class Diagram:
         e = self._through(c.end, c.p1, key) if c.end in self.connectors else c.end
         if b == c.begin and e == c.end:
             return c
-        return _Connector(b, e, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden, c.follow)
+        return _copy(c, begin=b, end=e)
+
+    def _part(self, key) -> bool:
+        s = self.shapes[key]
+        if s.part:
+            return True
+        p = self.shapes.get(s.parent)
+        if s.box is None or p is None or p.box is None:
+            return False
+        (x0, y0, x1, y1), (px0, py0, px1, py1) = s.box, p.box
+        area = (px1 - px0) * (py1 - py0)
+        tol = 0.01 * math.hypot(px1 - px0, py1 - py0)
+        inside = x0 >= px0 - tol and y0 >= py0 - tol and x1 <= px1 + tol and y1 <= py1 + tol
+        touches = min(abs(x0 - px0), abs(y0 - py0), abs(x1 - px1), abs(y1 - py1)) <= tol
+        band = max(abs(x0 - px0), abs(x1 - px1)) <= tol or max(abs(y0 - py0), abs(y1 - py1)) <= tol
+        return area > 0 and inside and (band or touches and (x1 - x0) * (y1 - y0) <= PORT * area)
 
     def _kids(self, pos) -> dict:
         kids = {}
@@ -383,52 +442,82 @@ class Diagram:
                 up = p.parent
         memo = {}
 
-        def up(k, has):
-            seen, key = {k}, self.shapes[k].parent
-            for _ in range(limits.MAX_DEPTH):
-                p = self.shapes.get(key)
-                if p is None or key in seen or p.hidden or p.container or key in self.connectors:
-                    return None
-                if has(key, p):
-                    return key
-                seen.add(key)
-                key = p.parent
-            return None
-
         def named(k):
             if k not in memo:
-                s = self.shapes[k]
-                memo[k] = k
+                s, cur = self.shapes[k], k
                 if not s.hidden and k not in texted and not _label(s.blocks)[0]:
-                    got = up(k, lambda key, p: key in texted or _label(p.blocks)[0])
-                    if got is None and not s.name:
-                        got = up(k, lambda key, p: p.name)
-                    memo[k] = k if got is None else got
+                    seen = {k}
+                    for _ in range(limits.MAX_DEPTH):
+                        up = self.shapes[cur].parent
+                        p = self.shapes.get(up)
+                        if (not self._part(cur) or p is None or up in seen or p.hidden or p.container
+                                or up in self.connectors):
+                            break
+                        seen.add(up)
+                        cur = up
+                        if up in texted or _label(p.blocks)[0]:
+                            break
+                memo[k] = cur
             return memo[k]
 
         out = []
         for key, c in edges:
             b, e = named(c.begin), named(c.end)
-            out.append((key, c if (b, e) == (c.begin, c.end)
-                        else _Connector(b, e, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden, c.follow)))
+            out.append((key, c if (b, e) == (c.begin, c.end) else _copy(c, begin=b, end=e)))
         return out
 
-    def _labelled(self, key, c, kids, stop, pos):
-        below = self._below(key, kids, stop, pos)
-        if not below:
-            return c, below
+    def _floating(self, edges, stop) -> dict:
+        ends = [self.shapes[k].box for _, c in edges for k in (c.begin, c.end) if self.shapes[k].box]
+        cands = []
+        for k, s in self.shapes.items():
+            if (k in stop or k in self.connectors or s.parent in self.shapes or s.hidden or s.container
+                    or s.box is None):
+                continue
+            text = _plain(s.blocks)
+            if text is None or not text.strip() or "\n" in text.strip() or len(text) > NAME:
+                continue
+            cx, cy = _centre(s.box)
+            if s.box[3] > s.box[1] and not any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in ends):
+                cands.append(k)
+        paths = [(i, c.path) for i, (_, c) in enumerate(edges) if c.path]
+        if not cands or len(cands) * sum(len(p) - 1 for _, p in paths) > FLOAT_WORK:
+            return {}
+        out, reach = {}, INFER_TOL * self._diag([(k, s.box) for k, s in self.shapes.items() if s.box])
+        for k in cands:
+            box = self.shapes[k].box
+            centre = _centre(box)
+            best, second, at = math.inf, math.inf, None
+            for i, path in paths:
+                d = min(_seg_point(a, b, centre) for a, b in zip(path, path[1:]))
+                if d < best:
+                    best, second, at = d, best, i
+                elif d < second:
+                    second = d
+            if at is not None and best <= min(box[3] - box[1], reach) and second > best:
+                out.setdefault(at, []).append(k)
+        return out
+
+    def _labelled(self, c, below, floating):
+        if not below and not floating:
+            return c
         sides = ([], [c.label] if c.label else [], [])
         for d in below:
             s = self.shapes[d]
             sides[_side(c, s.box)].append(" ".join(_plain(s.blocks).split()))
-        parts = [" ".join(p) for p in sides if p]
+        for d in floating:
+            sides[1].append(" ".join(_plain(self.shapes[d].blocks).split()))
+        a, m, e = (" ".join(p) for p in sides)
         if _arrow(c.arrows)[1]:
-            parts.reverse()
-        label, follow = " / ".join(parts), c.follow
+            a, e = e, a
+        label = " ".join(f"{a} / {m} / {e}".split()) if a or e else m
+        taken, follow = below + floating, c.follow
         if len(label) > NAME:
             label = label[:NAME] + "…"
-            follow = (follow or []) + [b for d in below for b in self.shapes[d].blocks]
-        return _Connector(c.begin, c.end, c.p0, c.p1, c.arrows, label, c.line, c.hidden, follow), below
+            follow = (follow or []) + [b for d in taken for b in self.shapes[d].blocks]
+        data = [b for d in taken for b in self.shapes[d].data]
+        if data:
+            follow = (follow or []) + data
+        return _copy(c, label=label, follow=follow)
 
     def place(self, slots: list) -> list:
         glued, cands = [], []
@@ -463,17 +552,19 @@ class Diagram:
             s = self.shapes[k]
             blocks = s.blocks
             labels[k], follow = ("", False) if s.hidden else _label(blocks)
+            data = [] if s.hidden else list(s.data)
             if not s.hidden and not labels[k]:
                 below = self._below(k, kids, ends, pos)
                 if below:
                     inside.update(below)
                     blocks = [b for d in below for b in self.shapes[d].blocks]
+                    data += [b for d in below for b in self.shapes[d].data]
                     labels[k], follow = _label(blocks)
                 elif s.name:
                     labels[k] = s.name
-            if follow:
+            if follow or data:
                 long.add(k)
-                follows += [Para([Text(f"{nid[k]}:")])] + list(blocks)
+                follows += [Para([Text(f"{nid[k]}:")])] + (list(blocks) if follow else []) + data
         for k in groups:
             s = self.shapes[k]
             text = _plain(s.blocks)
@@ -485,10 +576,11 @@ class Diagram:
             if follow:
                 follows += [Para([Text(f"{cid[k]}:")])] + list(s.blocks)
         stop = ends | inside | set(groups)
+        below = [self._below(k, kids, stop, pos) for k, _ in edges]
+        floating = self._floating(edges, stop.union(*below))
         for i, (k, c) in enumerate(edges):
-            c, below = self._labelled(k, c, kids, stop, pos)
-            edges[i] = (k, c)
-            inside.update(below)
+            edges[i] = (k, self._labelled(c, below[i], floating.get(i, [])))
+            inside.update(below[i], floating.get(i, []))
         for _, c in edges:
             if c.follow:
                 follows += [Para([Text(" ".join(_edge(c, nid)) + ":")])] + c.follow
@@ -526,14 +618,7 @@ class Diagram:
                 return []
             cands = cands[:self.budget.infer]
         self.budget.infer -= len(cands)
-        xs = [v for _, b in boxed for v in (b[0], b[2])]
-        ys = [v for _, b in boxed for v in (b[1], b[3])]
-        for c in self.connectors.values():
-            for p in (c.p0, c.p1):
-                if p:
-                    xs.append(p[0])
-                    ys.append(p[1])
-        diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys)) if xs else 0.0
+        diag = self._diag(boxed)
         targets = [] if diag <= 0 else [(k, b, (b[2] - b[0]) * (b[3] - b[1])) for k, b in boxed
                                         if not self.shapes[k].container and k not in self.connectors]
         tol = INFER_TOL * diag
@@ -542,11 +627,21 @@ class Diagram:
             a = c.begin if self._glued(c.begin) else _snap(c.p0, targets, tol)
             b = c.end if self._glued(c.end) else _snap(c.p1, targets, tol)
             if a is not None and b is not None and a != b:
-                out.append((k, _Connector(a, b, c.p0, c.p1, c.arrows, c.label, c.line, c.hidden, c.follow)))
+                out.append((k, _copy(c, begin=a, end=b)))
             elif (a is not None or b is not None or c.begin is not None or c.end is not None
                   or any(x is True for x in c.arrows)):
                 self.ctx.skipped["connector_loose"] += 1  # meant to join something: not a decoration
         return out
+
+    def _diag(self, boxed) -> float:
+        xs = [v for _, b in boxed for v in (b[0], b[2])]
+        ys = [v for _, b in boxed for v in (b[1], b[3])]
+        for c in self.connectors.values():
+            for p in (c.p0, c.p1):
+                if p:
+                    xs.append(p[0])
+                    ys.append(p[1])
+        return math.hypot(max(xs) - min(xs), max(ys) - min(ys)) if xs else 0.0
 
     def _containers(self, nodes, ends):
         """({node: its innermost kept container}, {kept container: its parent or None}) for the nodes held. Nothing

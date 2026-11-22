@@ -24,16 +24,23 @@ cells in INHERITED its master shape's when it has none (each master shape's cell
 - **Kinds** from the NameU masters.xml gives the shape's own Master, else the shape's NameU, case-folded.
 - **Containers**: a User row msvStructureType whose Value is Container, the shape's own else its master shape's; its
   shown text is the subgraph title.
-- **Groups**: a sub-shape is registered with its group's key as its parent; a shape with its own Master is named by
-  that master's NameU (what stands for it with no text).
+- **Groups**: a sub-shape is registered with its group's key as its parent, and as a part of it when it names a
+  MasterShape and no Master of its own; a shape with its own Master is named by that master's NameU less a trailing
+  `.<digits>` copy number (what stands for it with no text).
+- **Routes**: a connector's Geometry rows (merged as Shape Data is) of the vertex types, in IX order, Rel rows scaled
+  by Width and Height, placed as its box is placed, are its route.
 - **Shape Data and hyperlinks**: the Property rows (the master shape's in its order, each cell the shape gives with a
   value overriding, then the shape's own new rows; a Del row is gone) with a Value are `label: value` lines (Label,
-  else the row name) after the shape's text, and the Hyperlink rows `Link: description address#subaddress`; an
-  Invisible row is hidden; each line is charged as shape text.
+  else the row name), and the Hyperlink rows `Link: description address#subaddress`; a "No Formula" cell holds no
+  value and an Invisible row is not read. The lines follow the shape's text and picture in its slot and are its
+  `data` in the diagram, never its label; each is charged as shape text. A master shape's rows are read once; the
+  rows a shape takes and its own count against `limits.SHAPE_ROWS` a document, past which the shape's rows are not
+  read (counted `text` once for it).
 - **Background pages**: a page whose BackPage names a Background page's ID begins with `Background page: <name>`; a
   background page begins with `Background of: <names>`, or `Background page` when none names it.
 """
 import math
+import re
 
 from .. import diagram, limits
 from ..containers.zipx import Package, attr, kids, local
@@ -55,6 +62,9 @@ CELLS = ("PinX", "PinY", "LocPinX", "LocPinY", "HideText", "Width", "Height", "A
 INHERITED = ("LocPinX", "LocPinY", "Width", "Height", "Angle", "FlipX", "FlipY", "BeginX", "BeginY", "EndX", "EndY",
              "BeginArrow", "EndArrow")
 ARROWS = ("BeginArrow", "EndArrow")
+_SUFFIX = re.compile(r"\.\d+$")  # Visio's copy number on a repeated master name ("Pipe flow arrow.10")
+_VERTICES = frozenset(("MoveTo", "LineTo", "ArcTo", "EllipticalArcTo", "PolylineTo", "NURBSTo", "SplineStart",
+                       "SplineKnot", "RelMoveTo", "RelLineTo", "RelCubBezTo", "RelQuadBezTo", "RelEllipticalArcTo"))
 _KINDS = (("decision", "decision"), ("start/end", "terminator"), ("terminator", "terminator"), ("circle", "circle"),
           ("ellipse", "circle"), ("database", "store"), ("callout", "callout"), ("chevron", "chevron"))
 
@@ -96,52 +106,86 @@ def _structure(shape):
 
 
 def _rows(shape, name) -> list:
+    """[(row N or IX, {cell N: V, "T": row type}, deleted)] of the shape's first `name` section; a cell whose
+    formula is "No Formula" holds no value ("")."""
     out = []
     for sec in kids(shape, "Section"):
         if attr(sec, "N") != name:
             continue
         for row in kids(sec, "Row"):
-            cells = {}
+            cells = {"T": attr(row, "T")}
             for c in kids(row, "Cell"):
                 n = attr(c, "N")
                 if n is not None and n not in cells:
-                    cells[n] = attr(c, "V")
+                    cells[n] = "" if attr(c, "F") == "No Formula" else attr(c, "V")
             out.append((attr(row, "N") or attr(row, "IX"), cells, _on(attr(row, "Del"))))
         break
     return out
 
 
-def _merged(inherited, own) -> list:
-    rows = {}
-    for i, (key, cells, gone) in enumerate(inherited):
-        k = ("master", i) if key is None else key
-        if not gone and k not in rows:
-            rows[k] = dict(cells)
-    for i, (key, cells, gone) in enumerate(own):
-        k = ("own", i) if key is None else key
-        if gone:
-            rows.pop(k, None)
-        else:
-            rows[k] = {**rows.get(k, {}), **{n: v for n, v in cells.items() if v is not None}}
-    return list(rows.items())
+def _shown(name, cells) -> bool:
+    if name == "Geometry":
+        return True
+    if _on(cells.get("Invisible")):
+        return False
+    if name == "Property":
+        return bool((cells.get("Value") or "").strip())
+    return bool((cells.get("Address") or "").strip() or (cells.get("SubAddress") or "").strip())
 
 
 def _data(props, links) -> list:
     out = []
     for key, c in props:
-        value = " ".join((c.get("Value") or "").split())
-        if not value:
+        if not _shown("Property", c):
             continue
+        value = " ".join(c["Value"].split())
         label = " ".join((c.get("Label") or "").split()) or (key if isinstance(key, str) else "")
-        out.append((f"{label}: {value}" if label else value, _on(c.get("Invisible"))))
+        out.append(f"{label}: {value}" if label else value)
     for _, c in links:
+        if not _shown("Hyperlink", c):
+            continue
         address, sub = (c.get("Address") or "").strip(), (c.get("SubAddress") or "").strip()
         target = address + ("#" + sub if sub else "")
-        if not target:
-            continue
         desc = " ".join((c.get("Description") or "").split())
-        out.append((f"Link: {desc} {target}" if desc else f"Link: {target}", _on(c.get("Invisible"))))
+        out.append(f"Link: {desc} {target}" if desc else f"Link: {target}")
     return out
+
+
+def _master_name(name) -> str:
+    return _SUFFIX.sub("", (name or "").strip())
+
+
+def _placed(points, px, py, lx, ly, a, fx, fy, ox, oy) -> list:
+    """Shape-local points on the page, as the box is placed: less the LocPin, mirrored by the flips, turned by Angle
+    about the pin, plus the pin and the group's origin."""
+    co, si = math.cos(a or 0.0), math.sin(a or 0.0)
+    out = []
+    for x, y in points:
+        rx, ry = x - (lx or 0.0), y - (ly or 0.0)
+        rx, ry = -rx if fx else rx, -ry if fy else ry
+        out.append((px + ox + rx * co - ry * si, py + oy + rx * si + ry * co))
+    return out
+
+
+def _route(rows, c, ox, oy) -> list:
+    """A 1-D shape's Geometry vertices on the page, in IX order; Rel rows scaled by Width and Height."""
+    px, py, w, h = (_num(c.get(n)) for n in ("PinX", "PinY", "Width", "Height"))
+    if px is None or py is None:
+        return []
+    order = sorted(rows, key=lambda r: (_num(r[0]) is None, _num(r[0]) or 0.0))
+    points = []
+    for _, cells in order:
+        t = cells.get("T") or ""
+        x, y = _num(cells.get("X")), _num(cells.get("Y"))
+        if t not in _VERTICES or x is None or y is None:
+            continue
+        if t.startswith("Rel"):
+            if w is None or h is None:
+                continue
+            x, y = x * w, y * h
+        points.append((x, y))
+    return _placed(points, px, py, _num(c.get("LocPinX")), _num(c.get("LocPinY")), _num(c.get("Angle")),
+                   _on(c.get("FlipX")), _on(c.get("FlipY")), ox, oy)
 
 
 def _on(v) -> bool:
@@ -246,7 +290,9 @@ class _Reader:
         self.master_names = {}    # Master ID -> its NameU in masters.xml
         self.masters = {}         # master part -> ({shape ID: element}, first top-level shape), or None: unreadable
         self.shapes = {}          # master shape element -> (text, hides it), so a shared shape is read once
-        self.mcells = {}          # master shape element -> (cells, structure type, LineStyle, data rows, links)
+        self.mcells = {}          # master shape element -> (cells, structure type, LineStyle)
+        self.mrows = {}           # (master shape element, section) -> ({row key: (order, cells)}, shown rows)
+        self.rows_left = limits.SHAPE_ROWS  # Shape Data, hyperlink and Geometry rows the document may still read
         self.style_index = None   # StyleSheet ID -> ({arrow cell: V}, its LineStyle), read on first use
         self.style_arrows = {}    # (StyleSheet ID, arrow cell) -> its value up the chain
         self.room = limits.MAX_OUTPUT  # shape text the document may still emit, copies counted (see `spend`)
@@ -369,10 +415,11 @@ class _Reader:
         if text:
             inlines = inlines if inlines is not None else _inlines(text.strip("\n"))
             blocks.append(Para(inlines, hidden="hidden" if hidden else ""))
-        m_cells, m_struct, m_style, m_props, m_links = self.master_cells(mel)
-        for line, hid in _data(_merged(m_props, _rows(el, "Property")), _merged(m_links, _rows(el, "Hyperlink"))):
-            if self.spend(line, "text"):
-                blocks.append(Para([Text(line)], hidden="hidden" if hid else ""))
+        m_cells, m_struct, m_style = self.master_cells(mel)
+        props, links = self.merged(mel, el, "Property"), self.merged(mel, el, "Hyperlink")
+        if props is None or links is None:
+            self.ctx.skipped["text"] += 1
+        data = [Para([Text(line)]) for line in _data(props or [], links or []) if self.spend(line, "text")]
         blocks.extend(self.picture(el))
         c = dict(own_cells)
         for n in INHERITED:
@@ -387,19 +434,22 @@ class _Reader:
             style = attr(el, "LineStyle")
             style = style if style is not None else m_style
             arrows = tuple(self.arrow(n, own_cells, m_cells, style) for n in ARROWS)
+            rows = self.merged(mel, el, "Geometry")
             self.dia.connector(key, begin, end, _end(c, "Begin", dx, dy), _end(c, "End", dx, dy), arrows,
-                               blocks=[] if hidden and text else blocks)
+                               blocks=[] if hidden and text else blocks, path=_route(rows or [], c, dx, dy),
+                               data=data)
             if hidden and text:  # hidden text is no label: it keeps its place in the flow
                 slot = None
         else:
-            mname = self.master_names.get(own) if own is not None else None
+            mname = _master_name(self.master_names.get(own)) if own is not None else ""
             kind = _kind(mname if mname else attr(el, "NameU"))
             struct = _structure(el)
             struct = struct if struct is not None else m_struct
             container = (struct or "").strip().strip('"').strip().casefold() == "container"
+            part = own is None and master is not None and attr(el, "MasterShape") is not None
             self.dia.shape(key, blocks, kind, _box(c, dx, dy), hidden and bool(text), container,
-                           text if container and not hidden else "", parent, mname or "")
-        out.append((sort, slot, blocks))
+                           text if container and not hidden else "", parent, mname, part, data)
+        out.append((sort, slot, blocks + data))
         sub = _kid(el, "Shapes")
         if sub is not None:  # a missing pin or loc-pin term counts as 0, the other term still applies
             ox = dx + (x or 0.0) - (_num(c.get("LocPinX")) or 0.0)
@@ -502,14 +552,48 @@ class _Reader:
         return self.shapes[el]
 
     def master_cells(self, el):
-        """(cells, User msvStructureType, LineStyle, Property rows, Hyperlink rows) of a master shape, read once;
-        ({}, None, None, [], []) for none."""
+        """(cells, User msvStructureType, LineStyle) of a master shape, read once; ({}, None, None) for none."""
         if el is None or el is False:
-            return {}, None, None, [], []
+            return {}, None, None
         if el not in self.mcells:
-            self.mcells[el] = (_cells(el), _structure(el), attr(el, "LineStyle"), _rows(el, "Property"),
-                               _rows(el, "Hyperlink"))
+            self.mcells[el] = (_cells(el), _structure(el), attr(el, "LineStyle"))
         return self.mcells[el]
+
+    def merged(self, mel, el, name):
+        """[(row key, cells)] of the shape's `name` rows over its master shape's, in the master's order then the
+        shape's new rows: each cell the shape gives with a value overriding, a Del row gone. The master's rows are
+        read once and only its shown ones (`_shown`) are taken; the rows taken and the shape's own are charged to
+        SHAPE_ROWS. None when they pass what is left."""
+        own = _rows(el, name)
+        index, shown = self.master_rows(mel, name)
+        if len(own) + len(shown) > self.rows_left:
+            self.rows_left = 0
+            return None
+        self.rows_left -= len(own) + len(shown)
+        rows = {k: (at, cells) for at, k, cells in shown}
+        for i, (key, cells, gone) in enumerate(own):
+            k = ("own", i) if key is None else key
+            if gone:
+                rows.pop(k, None)
+                continue
+            at, base = rows.get(k) or index.get(k) or (len(index) + i, {})
+            rows[k] = (at, {**base, **{n: v for n, v in cells.items() if v is not None}})
+        return [(k, cells) for k, (_, cells) in sorted(rows.items(), key=lambda e: e[1][0])]
+
+    def master_rows(self, el, name):
+        if el is None or el is False:
+            return {}, []
+        if (el, name) not in self.mrows:
+            index, shown = {}, []
+            for i, (key, cells, gone) in enumerate(_rows(el, name)):
+                k = ("master", i) if key is None else key
+                if gone or k in index:
+                    continue
+                index[k] = (i, cells)
+                if _shown(name, cells):
+                    shown.append((i, k, cells))
+            self.mrows[(el, name)] = (index, shown)
+        return self.mrows[(el, name)]
 
     def master_index(self) -> dict:
         """{Master ID: part} from masters.xml through its relationships (the first entry of an ID wins); fills

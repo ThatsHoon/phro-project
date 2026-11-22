@@ -949,8 +949,51 @@ def test_group_and_connector_texts():
                   {"id": 21, "parent": 20, "text": "-have", "pin": (0.1, 0.0)},
                   {"id": 22, "parent": 20, "text": "1..*", "pin": (2.8, 0.0)}]
         doc, ctx = read(drawing([{"shapes": shapes}], version=version))
-        assert lines(doc.blocks[0]) == ['flowchart LR\n  n1["Routes"]\n  n2["Bus"]\n  n1 -->|"-have / 1..*"| n2'], (
+        assert lines(doc.blocks[0]) == ['flowchart LR\n  n1["Routes"]\n  n2["Bus"]\n  n1 -->|"-have / / 1..*"| n2'], (
             version, lines(doc.blocks[0]))
+        assert not ctx.skipped, ctx.skipped
+
+
+def point(x, y):
+    """A MoveTo or LineTo chunk's data (readMoveTo): X and Y, each a unit byte and a double."""
+    return b"\x00" + struct.pack("<d", x) + b"\x00" + struct.pack("<d", y)
+
+
+def test_connector_route_from_geometry():
+    # the connector's route is its geometry chunks placed like its box: a text inside it goes to the end it is
+    # nearer along the route, a text lying on the route is the edge's name
+    route = [(0x89, bytes(16)), (0x8A, point(0.0, 0.0)), (0x8B, point(3.0, 0.0)), (0x8B, point(3.0, 2.0)),
+             (0x89, bytes(16)), (0x8B, point(9.0, 9.0))]
+    for version in (11, 6):
+        shapes = [{"id": 1, "text": "A", "pin": (1.0, 5.0, 0.5, 0.5, 1.0, 1.0)},
+                  {"id": 2, "text": "B", "pin": (5.0, 7.5, 0.5, 0.5, 1.0, 1.0)},
+                  {"id": 20, "pin": (3.0, 6.0, 1.5, 1.0, 3.0, 2.0), "ends": (1.5, 5.0, 4.5, 7.0),
+                   "misc": misc(version, ends=(1, 2)), "chunks": route},
+                  {"id": 21, "parent": 20, "text": "-has", "pin": (2.3, -0.15, 0.2, 0.1, 0.4, 0.2)},
+                  {"id": 22, "parent": 20, "text": "1", "pin": (3.1, 1.6, 0.1, 0.1, 0.2, 0.2)},
+                  {"id": 30, "text": "uses", "pin": (3.0, 5.08, 0.5, 0.1, 1.0, 0.2)}]
+        doc, ctx = read(drawing([{"shapes": shapes}], version=version))
+        assert lines(doc.blocks[0]) == ['flowchart LR\n  n1["B"]\n  n2["A"]\n  n2 -->|"-has / uses / 1"| n1'], (
+            version, lines(doc.blocks[0]))
+        assert not ctx.skipped, ctx.skipped
+
+
+def test_own_master_instances_in_a_group_keep_their_ends():
+    # instances of other masters inside a plain group with a title text are their own nodes, named by their masters
+    # (less Visio's copy number); glue on them does not climb to the group
+    stencils = [[{"id": 1, "pin": (0.0, 0.0)}], [{"id": 1, "pin": (0.0, 0.0)}]]
+    for version in (11, 6):
+        shapes = [{"id": 1, "type": 0x47, "pin": (5.0, 5.0, 5.0, 5.0, 10.0, 10.0)},
+                  {"id": 2, "parent": 1, "text": "DMZ", "pin": (5.0, 9.0)},
+                  {"id": 3, "parent": 1, "master": (0, 1), "pin": (3.0, 5.0)},
+                  {"id": 4, "parent": 1, "master": (1, 1), "pin": (7.0, 5.0)},
+                  {"id": 5, "parent": 1, "misc": misc(version, ends=(3, 4))},
+                  {"id": 6, "text": "Internet", "pin": (-5.0, 5.0)},
+                  {"id": 7, "misc": misc(version, ends=(6, 3))}]
+        doc, ctx = read(drawing([{"shapes": shapes}], version=version, stencils=stencils,
+                                snames=["Firewall", "Web server.3"]))
+        want = 'flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n  n2 --> n3\n  n1 --> n2'
+        assert lines(doc.blocks[0]) == ["DMZ", want], (version, lines(doc.blocks[0]))
         assert not ctx.skipped, ctx.skipped
 
 
