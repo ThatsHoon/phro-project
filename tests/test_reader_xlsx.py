@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from reader import limits, markdown  # noqa: E402
 from reader.formats import ooxml, ooxml_sheets  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
-from reader.model import Context, Hidden, Link, NoteRef, Para, Text  # noqa: E402
+from reader.model import Context, Hidden, Link, NoteRef, Para, Table, Text  # noqa: E402
 from reader_fix import XLSX_REL, XLSX_SML, make_xlsx, xlsx_cell, xlsx_row  # noqa: E402
 import test_reader_xlsb as xb  # noqa: E402  (the drawing, anchor and chart fixtures)
 
@@ -1230,6 +1230,154 @@ def test_valueless_formulas_do_not_spend_the_cells_of_later_sheets():
     finally:
         limits.SHEET_CELLS, limits.BLANK_FORMULAS = old
     assert "\nkim|42\n" in out and ctx.skipped["formula"] >= 80 and not ctx.skipped["sheet_cut"], (out, ctx.skipped)
+
+
+def ranged(sheet_name="S"):
+    """xb.BAR drawn from B1 (name), A2 (category) and B2 (value) of `sheet_name`, hidden cells plotted."""
+    return xb.BAR.replace("<c:strRef>", f"<c:strRef><c:f>{sheet_name}!$B$1</c:f>", 1).replace(
+        "<c:cat><c:strRef>", f"<c:cat><c:strRef><c:f>{sheet_name}!$A$2</c:f>").replace(
+        "<c:numRef>", f"<c:numRef><c:f>{sheet_name}!$B$2</c:f>").replace(
+        "</c:plotArea>", '</c:plotArea><c:plotVisOnly val="0"/>')
+
+
+NAME, CAT, VAL = xlsx_cell("B1", "S", t="str"), xlsx_cell("A2", "Q1", t="str"), xlsx_cell("B2", "7")
+PLOTTED = xlsx_row(1, NAME) + xlsx_row(2, CAT, VAL)
+
+
+def charted(sheets, chart=None, **kw):
+    """(the chart's Table, markdown, ctx) of a workbook whose first sheet draws `chart` (default `ranged()`); `kw`
+    goes to make_xlsx."""
+    parts = drawn(1, xb.anchor(5, xb.chart_frame("rId1")), rels=[("rId1", "chart", "../charts/chart1.xml")])
+    parts["xl/charts/chart1.xml"] = ranged() if chart is None else chart
+    sheets = [dict(sheets[0], rels=[DRAWING])] + list(sheets[1:])
+    doc, ctx, _ = parsed(sheets, extra_parts=parts, **kw)
+    (t,) = [b for s in doc.blocks for b in getattr(s, "blocks", ()) if isinstance(b, Table)
+            and b.caption.startswith("Chart")]
+    with tempfile.TemporaryDirectory() as d:
+        return t, markdown.render(doc, Path(d) / "assets", False, ctx.skipped), ctx
+
+
+def test_chart_of_cells_the_sheet_shows_keeps_its_caption_alone():
+    t, out, ctx = charted([sheet(PLOTTED)])
+    assert t.caption == "Chart: column. Data: S!A1:B2" and t.rows == [], (t.caption, t.rows)
+    assert out.count("Q1") == 1 and "\nChart: column. Data: S!A1:B2\n" in out and not ctx.skipped, (out, ctx.skipped)
+
+
+def test_chart_of_another_shown_sheets_cells_keeps_its_caption_alone():
+    top = sheet(xlsx_row(1, xlsx_cell("A1", "top", t="str")), name="First")
+    t, out, _ = charted([top, sheet(PLOTTED, name="Data")], ranged("Data"))
+    assert t.caption == "Chart: column. Data: Data!A1:B2" and t.rows == [] and out.count("Q1") == 1, (t.rows, out)
+    t, out, _ = charted([top, sheet(PLOTTED, name="data")], ranged("Data"))
+    assert t.rows == [], t.rows
+    t, out, _ = charted([top, sheet(PLOTTED, name="Data", state="hidden")], ranged("Data"))
+    assert len(t.rows) == 2 and out.count("Q1") == 1, (t.rows, out)
+    t, out, _ = charted([top], ranged("Data"))
+    assert len(t.rows) == 2, t.rows
+
+
+def test_chart_keeps_its_table_when_its_range_holds_a_hidden_row_or_column():
+    t, out, _ = charted([sheet(xlsx_row(1, NAME) + xlsx_row(2, CAT, VAL, attrs='hidden="1"'))])
+    assert len(t.rows) == 2 and "\nQ1|7\n" in out, (t.rows, out)
+    t, out, _ = charted([sheet(PLOTTED, before='<cols><col min="2" max="2" hidden="1"/></cols>')])
+    assert len(t.rows) == 2 and "\nQ1|7\n" in out, (t.rows, out)
+    t, out, _ = charted([sheet(PLOTTED + xlsx_row(3, xlsx_cell("A3", "below", t="str"), attrs='hidden="1"'))])
+    assert t.rows == [], t.rows
+
+
+def test_chart_keeps_its_table_when_its_sheet_is_cut():
+    with patched("SHEET_CELLS", 2):
+        t, out, ctx = charted([sheet(PLOTTED)])
+    assert len(t.rows) == 2 and ctx.skipped["sheet_cut"] == 1 and "\nQ1|7\n" in out, (t.rows, ctx.skipped, out)
+
+
+def test_chart_keeps_its_table_when_a_cell_of_its_range_is_not_in_the_sheet():
+    for rows in (xlsx_row(1, NAME) + xlsx_row(2, CAT), xlsx_row(2, CAT, VAL), xlsx_row(1, NAME) + xlsx_row(2, VAL)):
+        t, out, _ = charted([sheet(rows)])
+        assert len(t.rows) == 2 and "\nQ1|7\n" in out, (rows, t.rows, out)
+
+
+def test_chart_keeps_its_table_when_a_merge_meets_its_range():
+    merged = '<mergeCells count="1"><mergeCell ref="A2:A3"/></mergeCells>'
+    t, out, _ = charted([sheet(PLOTTED, after=merged)])
+    assert len(t.rows) == 2, t.rows
+    t, out, _ = charted([sheet(PLOTTED, after=merged.replace("A2:A3", "D1:E1"))])
+    assert t.rows == [], t.rows
+
+
+def test_chart_keeps_its_table_when_the_sheet_shows_a_cell_of_its_range_as_something_else():
+    t, out, _ = charted([sheet(xlsx_row(1, NAME) + xlsx_row(2, CAT, xlsx_cell("B2", f="A1+1")))])
+    assert len(t.rows) == 2 and "\nQ1|=A1+1\n" in out and "\nQ1|7\n" in out, (t.rows, out)
+    t, out, _ = charted([sheet(xlsx_row(1, NAME) + xlsx_row(2, CAT, xlsx_cell("B2", "7", s=1)))],
+                        numfmts={164: ";;;"}, xfs=[0, 164])
+    assert len(t.rows) == 2 and "hidden places left out" in out and "\nQ1|7\n" in out, (t.rows, out)
+    t, out, _ = charted([sheet(xlsx_row(1, NAME) + xlsx_row(2, CAT, xlsx_cell("B2", "7", f="A1+1")))])
+    assert t.rows == [] and out.count("Q1") == 1, (t.rows, out)
+
+
+def test_chart_keeps_its_table_when_two_sheets_answer_to_its_sheet_name():
+    top = sheet(xlsx_row(1, xlsx_cell("A1", "top", t="str")), name="First")
+    for other in ({"state": "hidden"}, {}):
+        for names in (("Data", "data"), ("data", "Data")):
+            sheets = [top, sheet(PLOTTED, name=names[0], **other), sheet(PLOTTED, name=names[1])]
+            t, _, _ = charted(sheets, ranged("Data"))
+            assert len(t.rows) == 2, (other, names, t.rows)
+
+
+def test_chart_cut_short_keeps_its_table():
+    tall = "".join(xlsx_row(r, xlsx_cell(f"A{r}", "c", t="str"), xlsx_cell(f"B{r}", str(r))) for r in range(2, 8))
+    chart = ranged().replace("$A$2", "$A$2:$A$7").replace("$B$2", "$B$2:$B$7")
+    with patched("CHART_CELLS", 2):
+        t, out, ctx = charted([sheet(xlsx_row(1, NAME) + tall)], chart)
+    assert t.caption.endswith("(first 0 points)") and len(t.rows) == 1 and ctx.skipped["chart_cut"] == 1, \
+        (t.caption, t.rows, ctx.skipped)
+
+
+def test_chart_keeps_its_table_when_the_sheets_merges_or_layout_were_cut():
+    from reader.formats import sheet_grid
+    far = '<mergeCells count="2"><mergeCell ref="D1:E1"/><mergeCell ref="D2:E2"/></mergeCells>'
+    with patched("_MERGES", 1, sheet_grid):
+        t, _, _ = charted([sheet(PLOTTED, after=far)])
+    assert len(t.rows) == 2, t.rows
+    with patched("GRID_SLOTS", 3):
+        t, _, ctx = charted([sheet(PLOTTED)])
+    assert len(t.rows) == 2 and ctx.skipped["sheet_cut"] == 1, (t.rows, ctx.skipped)
+
+
+def test_ranges_meets_matches_a_walk_and_holds_walks_no_hidden_range():
+    import random
+    from reader.formats import sheet_grid
+    rnd = random.Random(5)
+    for _ in range(300):
+        rg, spans = sheet_grid._Ranges(), []
+        for _ in range(rnd.randrange(0, 6)):
+            a = rnd.randrange(0, 40)
+            spans.append((a, a + rnd.randrange(0, 5)))
+            rg.add(*spans[-1])
+        a = rnd.randrange(0, 45)
+        b = a + rnd.randrange(0, 8)
+        assert rg.meets(a, b) == any(x <= b and y >= a for x, y in spans), (spans, a, b)
+    w = sheet_grid.Written.__new__(sheet_grid.Written)
+    w.rows, w.merges, w.rows_h, w.cols_h = {0: [(0, 1)], 1: [(0, 1)]}, [], sheet_grid._Ranges(), sheet_grid._Ranges()
+    for k in range(5, 2005, 2):
+        w.rows_h.add(k, k)
+        w.cols_h.add(k, k)
+
+    def walked(self, a, b):
+        raise AssertionError("walked the hidden ranges")
+
+    with patched("within", walked, sheet_grid._Ranges):
+        assert w.holds((0, 0, 1, 1), [(0, 0, 1, 1)], [100]) and not w.holds((0, 0, 5, 1), [(0, 0, 1, 1)], [100])
+        assert not w.holds((0, 0, 1, 7), [(0, 0, 1, 1)], [100])
+
+
+def test_charts_past_the_scan_count_keep_their_tables():
+    tall = "".join(xlsx_row(r, xlsx_cell(f"A{r}", "c", t="str"), xlsx_cell(f"B{r}", str(r))) for r in range(2, 8))
+    chart = ranged().replace("$A$2", "$A$2:$A$7").replace("$B$2", "$B$2:$B$7")
+    t, _, _ = charted([sheet(xlsx_row(1, NAME) + tall)], chart)
+    assert t.caption == "Chart: column. Data: S!A1:B7" and t.rows == [], (t.caption, t.rows)
+    with patched("SHEET_SCAN", 10):
+        t, _, _ = charted([sheet(xlsx_row(1, NAME) + tall)], chart)
+    assert len(t.rows) == 2, t.rows
 
 
 def main():
