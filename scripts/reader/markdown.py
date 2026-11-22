@@ -74,6 +74,8 @@ LOST = (
     (("infer_skipped",), "diagram too large to place loose connectors", "diagrams too large to place loose connectors"),
     (("glyphs",), "text run without Unicode", "text runs without Unicode"),
     (("text",), "text run cut short", "text runs cut short"),
+    (("shape_data",), "shape's data left out", "shapes' data left out"),
+    (("route",), "connector route read as a straight line", "connector routes read as straight lines"),
     (("truncated", "node", "parse"), "chapter cut short", "chapters cut short"),
     (("sheet_cut",), "sheet cut short", "sheets cut short"),
     (("chart_cut",), "chart cut short", "charts cut short"),

@@ -603,10 +603,15 @@ def shape_chunks(s, version, level=1):
     return b"".join(parts)
 
 
-def page_stream(shapes, version):
-    """A page as real files hold it: one chunk stream, the page chunk 0x15 then each shape's chunks (`shape_chunks`,
-    the shape chunk at header level 1)."""
-    return vsd_chunk(0x15, bytes(0x30), version=version, cid=NONE) + b"".join(shape_chunks(s, version) for s in shapes)
+def page_stream(shapes, version, back=None):
+    """A page as real files hold it: one chunk stream, the page chunk 0x15 (readPage: its background page's pointer
+    index `back`, u32 at 8, v5 s16 at 0; zero bytes when None) then each shape's chunks (`shape_chunks`, the shape
+    chunk at header level 1)."""
+    head = bytearray(0x30)
+    if back is not None:
+        struct.pack_into("<h" if version == 5 else "<I", head, 0 if version == 5 else 8, back)
+    return (vsd_chunk(0x15, bytes(head), version=version, cid=NONE)
+            + b"".join(shape_chunks(s, version) for s in shapes))
 
 
 def style_list(lay, sheets, version):
@@ -622,22 +627,24 @@ def style_list(lay, sheets, version):
     return lay.put(vsd_list(ptrs, version=version, ptype=0x1A), 0x1A, 0x50)
 
 
-def drawing(pages, version=11, stencils=(), extra=(), more_stencils=(), styles=(), late_styles=False):
+def drawing(pages, version=11, stencils=(), extra=(), more_stencils=(), styles=(), late_styles=False, snames=()):
     """A VisioDocument laid out as real files: the trailer list holds the name list (0x32: one 0x33 name per page;
     Visio 5 one blob of 0x33 records), the style sheets (`styles`, see style_list), the stencils (0x1D: each stencil
     page 0x1E a list of shape streams, a shape's id its "id" else its index), `extra` ((type, format, stream bytes);
     real files hold their font list 0x18 before the pages), then the pages list (0x27: each page a chunk stream, then
     the name index 0xC9 naming page k by name k), then the style sheets when `late_styles`. A page is a dict: "name",
-    "shapes", "background", "compressed" (the stream LZ77-coded, format bit 1). `more_stencils` is a second stencil
-    list after the first."""
+    "shapes", "background", "back" (its background page's index), "compressed" (the stream LZ77-coded, format bit 1).
+    `more_stencils` is a second stencil list after the first. `snames` name the first list's stencil pages in order
+    (names after the pages' in the name list, and a name index 0xC9 in the stencil list)."""
     lay = Layout(version)
     unit = 2 if version == 11 else 1
     if version == 5:  # readName2 skips an s16 (VSD5Parser::getInt), then 8-bit text to a NUL
-        recs = [(0x33, struct.pack("<h", 1) + encode(p.get("name", ""), 5) + b"\x00") for p in pages]
+        recs = [(0x33, struct.pack("<h", 1) + encode(n, 5) + b"\x00") for n in [p.get("name", "") for p in pages]
+                + list(snames)]
         top = [lay.put(v5_records(recs), 0x32, 0x40)]
     else:
-        names = [lay.put(struct.pack("<I", 1) + encode(p.get("name", ""), version) + bytes(unit), 0x33, 0x40)
-                 for p in pages]
+        names = [lay.put(struct.pack("<I", 1) + encode(n, version) + bytes(unit), 0x33, 0x40)
+                 for n in [p.get("name", "") for p in pages] + list(snames)]
         top = [lay.put(vsd_list(names, version=version), 0x32, 0x50)]
     if styles and not late_styles:
         top.append(style_list(lay, styles, version))
@@ -648,11 +655,20 @@ def drawing(pages, version=11, stencils=(), extra=(), more_stencils=(), styles=(
         for sp in stencil_list:
             shapes = [lay.put(shape_chunks(s, version, level=0), s.get("type", 0x48), 0xD0) for s in sp]
             spages.append(lay.put(vsd_list(shapes, version=version, ptype=0x1E), 0x1E, 0x50))
+        if snames and stencil_list is stencils:
+            first = len(pages)
+            if version == 5:
+                index = struct.pack("<H", len(snames)) + b"".join(struct.pack("<HH", first + k, k)
+                                                                  for k in range(len(snames)))
+            else:
+                index = struct.pack("<I", len(snames)) + b"".join(struct.pack("<IIIB", first + k, first + k, k, 0)
+                                                                  for k in range(len(snames)))
+            spages.append(lay.put(index, 0xC9, 0x40))
         top.append(lay.put(vsd_list(spages, version=version, ptype=0x1D), 0x1D, 0x50))
     top += [lay.put(raw, t, fmt) for t, fmt, raw in extra]
     ptrs = []
     for p in pages:
-        raw, fmt = page_stream(p["shapes"], version), 0xD0 if p.get("background") else 0xD1
+        raw, fmt = page_stream(p["shapes"], version, p.get("back")), 0xD0 if p.get("background") else 0xD1
         if p.get("compressed"):
             raw, fmt = lz77(raw), fmt | 2
         ptrs.append(lay.put(raw, 0x15, fmt))
@@ -904,9 +920,127 @@ def test_image_bytes():
 def test_background_page():
     doc, ctx = read(drawing([{"name": "Front", "shapes": [{"text": "f"}]},
                              {"name": "Back", "background": True, "shapes": [{"text": "b"}]}]))
-    assert [(s.title, lines(s), s.hidden) for s in doc.blocks] == [("Front", ["f"], ""), ("Back", ["b"], "")]
+    assert [(s.title, lines(s), s.hidden) for s in doc.blocks] == [("Front", ["f"], ""),
+                                                                   ("Back", ["Background page", "b"], "")]
     doc, _ = read(vsd_document(11, [{"shapes": [{"text": "x"}], "background": True}]))
-    assert lines(doc.blocks[0]) == ["x"]
+    assert lines(doc.blocks[0]) == ["Background page", "x"]
+    for version in (11, 6, 5):
+        pages = [{"name": "Front", "shapes": [{"text": "f"}], "back": 1},
+                 {"name": "Back", "background": True, "shapes": [{"text": "b"}], "back": 1},
+                 {"name": "Other", "shapes": [{"text": "o"}], "back": 0}]
+        doc, _ = read(drawing(pages, version=version))
+        assert [(s.title, lines(s)) for s in doc.blocks] == [
+            ("Front", ["Background page: Back", "f"]), ("Back", ["Background of: Front", "b"]),
+            ("Other", ["o"])], (version, [(s.title, lines(s)) for s in doc.blocks])
+
+
+def test_group_and_connector_texts():
+    for version in (11, 6):
+        shapes = [{"id": 1, "type": 0x47, "pin": (1.0, 5.0)},
+                  {"id": 2, "parent": 1, "text": "Routes", "pin": (0.0, 0.5)},
+                  {"id": 3, "parent": 1, "pin": (0.0, 0.0)},
+                  {"id": 10, "type": 0x47, "pin": (5.0, 5.0)},
+                  {"id": 11, "parent": 10, "text": "Bus", "pin": (0.0, 0.5)},
+                  {"id": 20, "pin": (2.0, 5.5), "ends": (2.0, 5.5, 5.0, 5.5), "misc": misc(version, ends=(1, 10))},
+                  {"id": 21, "parent": 20, "text": "-have", "pin": (0.1, 0.0)},
+                  {"id": 22, "parent": 20, "text": "1..*", "pin": (2.8, 0.0)}]
+        doc, ctx = read(drawing([{"shapes": shapes}], version=version))
+        assert lines(doc.blocks[0]) == ['flowchart LR\n  n1["Routes"]\n  n2["Bus"]\n  n1 -->|"-have / / 1..*"| n2'], (
+            version, lines(doc.blocks[0]))
+        assert not ctx.skipped, ctx.skipped
+
+
+def point(x, y):
+    """A MoveTo or LineTo chunk's data (readMoveTo): X and Y, each a unit byte and a double."""
+    return b"\x00" + struct.pack("<d", x) + b"\x00" + struct.pack("<d", y)
+
+
+def test_connector_route_from_geometry():
+    route = [(0x89, bytes(16)), (0x8A, point(0.0, 0.0)), (0x8B, point(3.0, 0.0)), (0x8B, point(3.0, 2.0)),
+             (0x89, bytes(16)), (0x8B, point(9.0, 9.0))]
+    for version in (11, 6):
+        shapes = [{"id": 1, "text": "A", "pin": (1.0, 5.0, 0.5, 0.5, 1.0, 1.0)},
+                  {"id": 2, "text": "B", "pin": (5.0, 7.5, 0.5, 0.5, 1.0, 1.0)},
+                  {"id": 20, "pin": (3.0, 6.0, 1.5, 1.0, 3.0, 2.0), "ends": (1.5, 5.0, 4.5, 7.0),
+                   "misc": misc(version, ends=(1, 2)), "chunks": route},
+                  {"id": 21, "parent": 20, "text": "-has", "pin": (2.3, -0.15, 0.2, 0.1, 0.4, 0.2)},
+                  {"id": 22, "parent": 20, "text": "1", "pin": (3.1, 1.6, 0.1, 0.1, 0.2, 0.2)},
+                  {"id": 30, "text": "uses", "pin": (3.0, 5.08, 0.5, 0.1, 1.0, 0.2)}]
+        doc, ctx = read(drawing([{"shapes": shapes}], version=version))
+        assert lines(doc.blocks[0]) == ['flowchart LR\n  n1["B"]\n  n2["A"]\n  n2 -->|"-has / uses / 1"| n1'], (
+            version, lines(doc.blocks[0]))
+        assert not ctx.skipped, ctx.skipped
+
+
+def test_own_master_instances_in_a_group_keep_their_ends():
+    stencils = [[{"id": 1, "pin": (0.0, 0.0)}], [{"id": 1, "pin": (0.0, 0.0)}]]
+    for version in (11, 6):
+        shapes = [{"id": 1, "type": 0x47, "pin": (5.0, 5.0, 5.0, 5.0, 10.0, 10.0)},
+                  {"id": 2, "parent": 1, "text": "DMZ", "pin": (5.0, 9.0)},
+                  {"id": 3, "parent": 1, "master": (0, 1), "pin": (3.0, 5.0)},
+                  {"id": 4, "parent": 1, "master": (1, 1), "pin": (7.0, 5.0)},
+                  {"id": 5, "parent": 1, "misc": misc(version, ends=(3, 4))},
+                  {"id": 6, "text": "Internet", "pin": (-5.0, 5.0)},
+                  {"id": 7, "misc": misc(version, ends=(6, 3))}]
+        doc, ctx = read(drawing([{"shapes": shapes}], version=version, stencils=stencils,
+                                snames=["Firewall", "Web server.3"]))
+        want = 'flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n  n2 --> n3\n  n1 --> n2'
+        assert lines(doc.blocks[0]) == ["DMZ", want], (version, lines(doc.blocks[0]))
+        assert not ctx.skipped, ctx.skipped
+
+
+def test_named_instances_stay_out_of_a_group_that_says_nothing():
+    """vsd gives no verdict on a shape of its own master, so geometry decides whether it is a part of its group; a
+    shape with a name is never folded into a group that has no text of its own or below it (two icons side by side,
+    the units of a rack): the name would be lost and the edges would loop."""
+    one = [{"id": 1, "pin": (0.0, 0.0)}]
+    for version in (11, 6):
+        shapes = [{"id": 1, "type": 0x47, "pin": (5.0, 5.0, 2.0, 1.0, 4.0, 2.0)},
+                  {"id": 3, "parent": 1, "master": (0, 1), "pin": (1.0, 1.0, 1.0, 1.0, 2.0, 2.0)},
+                  {"id": 4, "parent": 1, "master": (1, 1), "pin": (3.0, 1.0, 1.0, 1.0, 2.0, 2.0)},
+                  {"id": 5, "parent": 1, "misc": misc(version, ends=(3, 4))},
+                  {"id": 6, "text": "Internet", "pin": (-5.0, 5.0, 1.0, 0.5, 2.0, 1.0)},
+                  {"id": 7, "misc": misc(version, ends=(6, 3))}]
+        doc, ctx = read(drawing([{"shapes": shapes}], version=version, stencils=[one, one],
+                                snames=["Firewall", "Web server"]))
+        want = 'flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n  n2 --> n3\n  n1 --> n2'
+        assert lines(doc.blocks[0]) == [want], (version, lines(doc.blocks[0]))
+        rack = [{"id": 1, "type": 0x47, "pin": (5.0, 15.0, 5.0, 15.0, 10.0, 30.0)},
+                {"id": 2, "parent": 1, "master": (0, 1), "pin": (5.0, 15.0, 5.0, 15.0, 10.0, 30.0)},
+                {"id": 3, "parent": 1, "master": (1, 1), "pin": (5.0, 22.5, 5.0, 2.5, 10.0, 5.0)},
+                {"id": 4, "parent": 1, "master": (2, 1), "pin": (5.0, 7.5, 5.0, 2.5, 10.0, 5.0)},
+                {"id": 6, "text": "Switch", "pin": (35.0, 15.0, 5.0, 5.0, 10.0, 10.0)},
+                {"id": 7, "misc": misc(version, ends=(6, 3))},
+                {"id": 8, "misc": misc(version, ends=(6, 4))}]
+        doc, ctx = read(drawing([{"shapes": rack}], version=version, stencils=[one, one, one],
+                                snames=["Rack", "Server", "Storage"]))
+        got = lines(doc.blocks[0])
+        assert got == ["- Switch", "- Server", "- Storage"], (version, got)
+        band = [{"id": 1, "type": 0x47, "pin": (5.0, 5.0, 2.0, 1.0, 4.0, 2.0)},
+                {"id": 2, "parent": 1, "text": "Routes", "pin": (2.0, 1.75, 2.0, 0.25, 4.0, 0.5)},
+                {"id": 3, "parent": 1, "master": (0, 1), "pin": (2.0, 0.75, 2.0, 0.75, 4.0, 1.5)},
+                {"id": 6, "text": "Internet", "pin": (-5.0, 5.0, 1.0, 0.5, 2.0, 1.0)},
+                {"id": 7, "misc": misc(version, ends=(6, 3))}]
+        doc, ctx = read(drawing([{"shapes": band}], version=version, stencils=[one], snames=["Feld"]))
+        got = lines(doc.blocks[0])[-1]
+        assert '["Routes"]' in got and "Feld" not in got, (version, got)
+
+
+def test_master_names_and_kinds():
+    stencils = [[{"id": 1, "pin": (0.0, 0.0)}], [{"id": 1, "pin": (0.0, 0.0)}],
+                [{"id": 1, "type": 0x47, "pin": (0.0, 0.0)}, {"id": 2, "parent": 1, "pin": (0.0, 0.0)}]]
+    for version in (11, 6):
+        shapes = [{"id": 1, "master": (0, 1), "text": "ok?", "pin": (0.0, 9.0)},
+                  {"id": 2, "master": (1, 1), "pin": (0.0, 5.0)},
+                  {"id": 3, "misc": misc(version, ends=(1, 2))},
+                  {"id": 4, "type": 0x47, "master": (2, NONE), "pin": (5.0, 9.0)},
+                  {"id": 5, "parent": 4, "master": (2, 2), "pin": (0.0, 0.0)},
+                  {"id": 6, "misc": misc(version, ends=(5, 2))}]
+        doc, ctx = read(drawing([{"shapes": shapes}], version=version, stencils=stencils,
+                                snames=["Decision", "Firewall", "Class"]))
+        want = 'flowchart TD\n  n1{"ok?"}\n  n2["Class"]\n  n3["Firewall"]\n  n1 --> n3\n  n2 --> n3'
+        assert lines(doc.blocks[0]) == [want], (version, lines(doc.blocks[0]))
+        assert not ctx.skipped, ctx.skipped
 
 
 def test_inflated_stream():

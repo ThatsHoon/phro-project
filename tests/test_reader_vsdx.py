@@ -563,6 +563,178 @@ def test_vsdx_container():
     assert mermaid_ok(t) and "subgraph" not in t and "Lane" in out, out
 
 
+def test_group_port_and_connector_glue():
+    actor = shape(81, "User", (), box_cells(1, 5, 1, 1) + "<Shapes>"
+                  + shape(82, None, (), box_cells(0.5, 0.5, 0.4, 1), 'MasterShape="2"') + "</Shapes>", 'Master="9"')
+    a = shape(3, "Add", (), box_cells(5, 6, 1, 0.5))
+    b = shape(4, "Edit", (), box_cells(5, 4, 1, 0.5))
+    plain = cell(BeginArrow=0, EndArrow=0)
+    trunk = line(21, (1.5, 5), (4.5, 6)).replace("</Shape>", plain + "</Shape>")
+    branch = line(16, (1.5, 5), (4.5, 4)).replace("</Shape>", plain + "</Shape>")
+    links = glued(21, 82, 3) + glued(16, 21, 4)
+    out, ctx = md(vsdx({"P": page_xml(actor + a + b + trunk + branch, links)}, masters={"9": shape(1)},
+                       mnames={"9": "Actor"}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Add"]\n  n2["User"]\n  n3["Edit"]\n  n2 --- n1\n  n2 --- n3', t
+    assert not ctx.skipped["connector_loose"] and out.count("User") == 1, (out, ctx.skipped)
+
+
+def test_group_text_names_group_and_connector_text_labels_edge():
+    cls = lambda i, name, x: shape(i, None, (), box_cells(x, 5, 1, 1) + "<Shapes>"  # noqa: E731
+                                   + shape(i + 1, name, (), box_cells(0.5, 0.8, 1, 0.3))
+                                   + shape(i + 2, None, (), box_cells(0.5, 0.3, 1, 0.6)) + "</Shapes>")
+    assoc = (f'<Shape ID="20">' + cell(BeginX=1.5, BeginY=5, EndX=4.5, EndY=5, PinX=3, PinY=5, Width=3, Height=0,
+                                       LocPinX=1.5, LocPinY=0)
+             + "<Shapes>" + shape(21, "-have", (), box_cells(0.2, 0.1, 0.4, 0.2))
+             + shape(22, "1..*", (), box_cells(2.8, 0.1, 0.4, 0.2)) + "</Shapes></Shape>")
+    out, _ = md(vsdx({"P": page_xml(cls(1, "Routes", 1) + cls(10, "Bus", 5) + assoc, glued(20, 1, 10))}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart LR\n  n1["Routes"]\n  n2["Bus"]\n  n1 -->|"-have / / 1..*"| n2', t
+    assert out == f"## Page: P\n\n```mermaid\n{t}\n```\n", repr(out)
+
+
+def paras(doc):
+    """Each Para of each page as text, "hidden:" before a hidden one."""
+    return [("hidden:" if b.hidden else "") + "".join(t.text for t in b.inlines if isinstance(t, Text))
+            for sec in doc.blocks for b in sec.blocks if isinstance(b, Para)]
+
+
+def test_master_name_shape_data_and_links():
+    master = shape(1, None, (), '<Section N="Property"><Row N="IP"><Cell N="Label" V="IP address"/>'
+                                '<Cell N="Value" V=""/></Row><Row N="Spare"><Cell N="Label" V="Spare"/>'
+                                '<Cell N="Value" V=""/></Row></Section>')
+    props = ('<Section N="Property"><Row N="IP"><Cell N="Value" V="10.0.0.5" U="STR"/></Row>'
+             '<Row N="Owner"><Cell N="Label" V="Owner"/><Cell N="Value" V="Ops team"/></Row></Section>'
+             '<Section N="Hyperlink"><Row N="Row_1"><Cell N="Description" V="Runbook"/>'
+             '<Cell N="Address" V="https://example.com/runbook"/><Cell N="SubAddress" V=""/></Row></Section>')
+    server = shape(1, "Server", (0, 9), props)
+    fw = shape(2, None, (0, 5), "", 'Master="7"')
+    out, ctx = md(vsdx({"P": page_xml(server + fw + shape(3), glued(3, 1, 2))}, masters={"7": master},
+                       mnames={"7": "Firewall"}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Server"]\n  n2["Firewall"]\n  n1 --> n2', t
+    want = "```\n\nn1:\n\nIP: 10.0.0.5\n\nOwner: Ops team\n\nLink: Runbook https://example.com/runbook\n"
+    assert out.endswith(want), out
+    secret = '<Row N="Key"><Cell N="Label" V="Key"/><Cell N="Value" V="s3cret"/><Cell N="Invisible" V="1"/></Row>'
+    own = props.replace("10.0.0.5", "10.0.0.6").replace("</Section><Section", secret + "</Section><Section")
+    doc = reader.parse(vsdx({"P": server + shape(2, None, (0, 5), own, 'Master="7"')}, masters={"7": master}),
+                       Context())
+    assert paras(doc) == ["Server", "IP: 10.0.0.5", "Owner: Ops team", "Link: Runbook https://example.com/runbook",
+                          "IP address: 10.0.0.6", "Owner: Ops team", "Link: Runbook https://example.com/runbook"], (
+        paras(doc))
+
+
+def test_shape_data_defaults_and_invisible_rows_add_nothing():
+    blank = ('<Section N="Property"><Row N="Asset"><Cell N="Label" V="Asset Number"/>'
+             '<Cell N="Value" V="0" F="No Formula"/></Row><Row N="ShapeClass"><Cell N="Value" V="5"/>'
+             '<Cell N="Invisible" V="1"/></Row></Section>')
+    ip = ('<Section N="Property"><Row N="IP"><Cell N="Label" V="IP address"/><Cell N="Value" V="10.0.0.1"/></Row>'
+          '</Section>')
+    router = shape(1, "Router", (0, 9), "", 'Master="7"')
+    fw = shape(2, None, (0, 5), ip, 'Master="8"')
+    out, ctx = md(vsdx({"P": page_xml(router + fw + shape(3), glued(3, 1, 2))},
+                       masters={"7": shape(1, None, (), blank), "8": shape(1, None, (), blank)},
+                       mnames={"7": "Router", "8": "Firewall.12"}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == 'flowchart TD\n  n1["Router"]\n  n2["Firewall"]\n  n1 --> n2', t
+    assert out.endswith("```\n\nn2:\n\nIP address: 10.0.0.1\n") and "hidden" not in out, out
+    assert not ctx.skipped, ctx.skipped
+
+
+def test_shape_data_rows_bounded():
+    rows = "".join(f'<Row N="r{i}"><Cell N="Label" V="L{i}"/><Cell N="Value" V="x"/></Row>' for i in range(3000))
+    m = {"7": shape(1, None, (), f'<Section N="Property">{rows}</Section>')}
+    p = vsdx({"P": "".join(shape(i, None, (0, i), "", 'Master="7"') for i in range(1, 3001))}, masters=m,
+             mnames={"7": "Box"})
+    ctx = Context()
+    doc = reader.parse(p, ctx)
+    kept = sum(1 for t in paras(doc) if t.startswith("L"))
+    room = limits.SHAPE_ROWS // 3000
+    assert kept == room * 3000 and dict(ctx.skipped) == {"shape_data": 3000 - room}, (kept, ctx.skipped)
+    old = limits.SHAPE_ROWS
+    try:
+        limits.SHAPE_ROWS = 3
+        row = '<Row N="r{0}"><Cell N="Label" V="L{0}"/><Cell N="Value" V="v{0}"/></Row>'
+        data = '<Section N="Property">' + "".join(row.format(i) for i in range(2)) + "</Section>"
+        ctx = Context()
+        doc = reader.parse(vsdx({"P": shape(1, "a", (0, 2), data) + shape(2, "b", (0, 1), data)}), ctx)
+        assert paras(doc) == ["a", "L0: v0", "L1: v1", "b"] and ctx.skipped == {"shape_data": 1}, (
+            paras(doc), ctx.skipped)
+    finally:
+        limits.SHAPE_ROWS = old
+
+
+def test_own_master_instances_in_a_group_keep_their_ends():
+    bc = box_cells
+    inner = (shape(2, "DMZ", (), bc(5, 9, 4, 0.5)) + shape(3, None, (), bc(3, 5, 1, 1), 'Master="7"')
+             + shape(4, None, (), bc(7, 5, 1, 1), 'Master="8"') + line(5, (3.5, 5), (6.5, 5)))
+    group = shape(1, None, (), bc(5, 5, 10, 10) + "<Shapes>" + inner + "</Shapes>")
+    net = shape(6, "Internet", (), bc(-5, 5, 2, 1)) + line(9, (-4, 5), (2.5, 5))
+    out, _ = md(vsdx({"P": page_xml(group + net, glued(5, 3, 4) + glued(9, 6, 3))},
+                     masters={"7": shape(1), "8": shape(1)}, mnames={"7": "Firewall", "8": "Web server"}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == ('flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n'
+                                   '  n2 --> n3\n  n1 --> n2'), t
+    assert "DMZ" in out, out
+    inner = (shape(3, None, (), bc(1, 1, 2, 2), 'Master="7"') + shape(4, None, (), bc(3, 1, 2, 2), 'Master="8"')
+             + line(5, (2, 1), (2, 1)))
+    group = shape(1, None, (), bc(5, 5, 4, 2) + "<Shapes>" + inner + "</Shapes>")
+    net = shape(6, "Internet", (), bc(-5, 5, 2, 1)) + line(9, (-4, 5), (3, 5))
+    out, _ = md(vsdx({"P": page_xml(group + net, glued(5, 3, 4) + glued(9, 6, 3))},
+                     masters={"7": shape(1), "8": shape(1)}, mnames={"7": "Firewall", "8": "Web server"}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == ('flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n'
+                                   '  n2 --> n3\n  n1 --> n2'), t
+    inner = (shape(2, "DMZ", (), bc(5, 9, 4, 0.5)) + shape(3, None, (), bc(0.5, 5, 1, 1), 'Master="7"')
+             + shape(4, None, (), bc(7, 5, 1, 1), 'Master="8"') + line(5, (1, 5), (6.5, 5)))
+    group = shape(1, None, (), bc(5, 5, 10, 10) + "<Shapes>" + inner + "</Shapes>")
+    net = shape(6, "Internet", (), bc(-5, 5, 2, 1)) + line(9, (-4, 5), (0, 5))
+    out, _ = md(vsdx({"P": page_xml(group + net, glued(5, 3, 4) + glued(9, 6, 3))},
+                     masters={"7": shape(1), "8": shape(1)}, mnames={"7": "Firewall", "8": "Web server"}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t == ('flowchart LR\n  n1["Internet"]\n  n2["Firewall"]\n  n3["Web server"]\n'
+                                   '  n2 --> n3\n  n1 --> n2'), t
+
+
+def test_connector_route_from_geometry():
+    a = shape(1, "A", (), box_cells(1, 5, 1, 1))
+    b = shape(2, "B", (), box_cells(5, 7.5, 1, 1))
+    geo = ('<Section N="Geometry" IX="0"><Row T="MoveTo" IX="1"><Cell N="X" V="0"/><Cell N="Y" V="0"/></Row>'
+           '<Row T="LineTo" IX="2"><Cell N="X" V="3"/><Cell N="Y" V="2"/></Row></Section>')
+    own = ('<Section N="Geometry" IX="0"><Row T="LineTo" IX="2"><Cell N="X" V="3"/><Cell N="Y" V="0"/></Row>'
+           '<Row T="LineTo" IX="3"><Cell N="X" V="3"/><Cell N="Y" V="2"/></Row></Section>')
+    kids_ = shape(21, "-has", (), box_cells(2.3, -0.15, 0.4, 0.2)) + shape(22, "1", (), box_cells(3.1, 1.6, 0.2, 0.2))
+    conn = (f'<Shape ID="20" Master="5">' + cell(BeginX=1.5, BeginY=5, EndX=4.5, EndY=7, PinX=3, PinY=6, Width=3,
+                                                  Height=2, LocPinX=1.5, LocPinY=1)
+            + own + f"<Shapes>{kids_}</Shapes></Shape>")
+    name = shape(30, "uses", (), box_cells(3, 5.08, 1, 0.2))
+    out, _ = md(vsdx({"P": page_xml(a + b + conn + name, glued(20, 1, 2))}, masters={"5": shape(1, None, (), geo)},
+                     mnames={"5": "Dynamic connector"}))
+    t = mermaid_of(out)
+    assert mermaid_ok(t) and t.endswith('\n  n2 -->|"-has / uses / 1"| n1'), t
+    assert "uses" not in out.replace(t, ""), out
+    old = limits.SHAPE_ROWS
+    try:
+        limits.SHAPE_ROWS = 3
+        out, ctx = md(vsdx({"P": page_xml(a + b + conn + name, glued(20, 1, 2))},
+                           masters={"5": shape(1, None, (), geo)}, mnames={"5": "Dynamic connector"}))
+    finally:
+        limits.SHAPE_ROWS = old
+    assert dict(ctx.skipped) == {"route": 1} and markdown.unread(ctx.skipped) == [
+        "1 connector route read as a straight line"], ctx.skipped
+
+
+def test_background_page():
+    pages = (f'<Pages xmlns:r="{REL}" {VNS}><Page ID="0" Name="Front" BackPage="4"><Rel r:id="rId1"/></Page>'
+             '<Page ID="4" Name="Back" Background="1"><Rel r:id="rId2"/></Page>'
+             '<Page ID="5" Name="Spare" Background="1"><Rel r:id="rId3"/></Page></Pages>')
+    p = vsdx({"Front": shape(1, "f"), "Back": shape(1, "b"), "Spare": shape(1, "s")},
+             extra={"visio/pages/pages.xml": pages})
+    out, _ = md(p)
+    assert out == ("## Page: Front\n\nBackground page: Back\n\nf\n\n## Page: Back\n\nBackground of: Front\n\nb\n\n"
+                   "## Page: Spare\n\nBackground page\n\ns\n"), repr(out)
+
+
 def test_group_child_box():
     # sub-shapes of a group at origin (10, 10): their boxes and the group's connector ends are page-absolute
     kids_ = shape(2, "A", (), box_cells(1, 1, 1, 1)) + shape(3, "B", (), box_cells(3, 1, 1, 1))
@@ -796,6 +968,10 @@ def measure():
         print(f"{name}: {mib:.2f} MiB, parse {parsed:.2f} s, with render {took:.2f} s, {took / mib:.1f} s/MiB, "
               f"peak {peak / 2**20:.0f} MiB, "
               f"output {len(out) / 2**20:.1f} MiB, {dict(ctx.skipped)}")
+
+
+def test_shape_rows_budget_value():
+    assert limits.SHAPE_ROWS == 100_000
 
 
 def main():

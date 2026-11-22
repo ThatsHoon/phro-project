@@ -650,6 +650,264 @@ def test_budget_cut():
     assert ctx.skipped["connections_cut"] == 1, ctx.skipped
 
 
+def test_group_takes_its_childrens_text():
+    d, _ = new()
+    d.shape("G", [])
+    d.shape("N", P("Routes"), parent="G")
+    d.shape("X", [], parent="G")
+    d.shape("H", P("secret", hidden="hidden"), hidden=True, parent="G")
+    d.shape("A", P("attr"), parent="X")
+    d.shape("B", P("B"))
+    d.connector("k", begin="G", end="B")
+    secret = P("secret", hidden="hidden")
+    out = d.place([("G", []), ("N", P("Routes")), ("X", []), ("A", P("attr")), ("H", secret), ("B", P("B")),
+                   ("k", [])])
+    assert lines(out) == ["flowchart TD", '  n1["Routes<br>attr"]', '  n2["B"]', "  n1 --> n2"], out
+    assert out[1:] == secret, out
+    d, _ = new()
+    d.shape("G", [])
+    d.shape("N", P("N"), parent="G")
+    d.shape("B", P("B"))
+    d.connector("k1", begin="G", end="B")
+    d.connector("k2", begin="N", end="B")
+    ls = lines(d.place([("G", []), ("N", P("N")), ("B", P("B")), ("k1", []), ("k2", [])]))
+    assert ls == ["flowchart TD", '  n2["N"]', '  n3["B"]', "  n1 --> n3", "  n2 --> n3"], ls
+
+
+def test_port_resolves_to_named_ancestor():
+    d, _ = new()
+    d.shape("U", P("User"), box=(0, 0, 10, 10))
+    d.shape("P", [], box=(4, 4, 6, 6), parent="U", part=True)
+    d.shape("Q", [], box=(4, 4, 5, 5), parent="P", part=True)
+    d.shape("B", P("B"), box=(50, 0, 60, 10))
+    d.connector("k1", begin="Q", end="B")
+    d.connector("k2", begin="B", p0=(55, 5), p1=(5, 5))
+    ls = lines(d.place([("U", []), ("P", []), ("Q", []), ("B", []), ("k1", []), ("k2", [])]))
+    assert ls == ["flowchart LR", '  n1["User"]', '  n2["B"]', "  n1 --> n2", "  %% inferred from position",
+                  "  n2 --> n1"], ls
+    d, _ = new()
+    d.shape("L", P("Lane"), box=(0, 0, 100, 100), container=True, title="Lane")
+    d.shape("P", [], parent="L", part=True)
+    d.shape("B", P("B"))
+    d.connector("k", begin="P", end="B")
+    assert lines(d.place([("L", []), ("P", []), ("B", []), ("k", [])])) == [
+        "flowchart TD", '  n2["B"]', "  n1 --> n2"]
+
+
+def test_glue_to_connector_follows_it():
+    d, ctx = new()
+    for k in "ABC":
+        d.shape(k, P(k))
+    d.connector("trunk", begin="A", end="B", p0=(0, 0), p1=(10, 0))
+    d.connector("branch", begin="trunk", end="C", p0=(0.1, 0), p1=(5, 5))
+    d.connector("chain", begin="branch", end="B", p0=(5, 5.2), p1=(10, 0))
+    ls = lines(d.place([(k, []) for k in "ABC"] + [("trunk", []), ("branch", []), ("chain", [])]))
+    assert ls == ["flowchart TD", '  n1["A"]', '  n2["B"]', '  n3["C"]', "  n1 --> n2", "  n1 --> n3",
+                  "  n3 --> n2"], ls
+    assert not ctx.skipped, ctx.skipped
+    d, ctx = new()
+    for k in "AB":
+        d.shape(k, P(k))
+    d.connector("x", begin="y", end="A", p0=(0, 0), p1=(1, 1))
+    d.connector("y", begin="x", end="B", p0=(0, 0), p1=(2, 2))
+    d.connector("z", begin="A", end="B", p0=(0, 0), p1=(2, 0))
+    d.connector("w", begin="z", end="A", p0=(1, 0), p1=(0, 0))
+    out = d.place([("A", P("A")), ("B", P("B")), ("x", []), ("y", []), ("z", []), ("w", P("w"))])
+    assert lines(out) == ["flowchart TD", '  n1["A"]', '  n2["B"]', "  n1 --> n2"], out
+    assert ctx.skipped == {"connector_loose": 3}, ctx.skipped
+    d, ctx = new()
+    for k in "AB":
+        d.shape(k, P(k))
+    d.connector("half", begin="A", end="gone", p0=(0, 0), p1=(9, 9))
+    d.connector("on", begin="half", end="B", p0=(0.1, 0), p1=(5, 5))
+    d.connector("ok", begin="A", end="B")
+    out = d.place([("A", P("A")), ("B", P("B")), ("half", []), ("on", []), ("ok", [])])
+    assert lines(out) == ["flowchart TD", '  n1["A"]', '  n2["B"]', "  n1 --> n2"], out
+    assert ctx.skipped == {"connector_loose": 2}, ctx.skipped
+
+
+def test_tree_keeps_blank_child():
+    d, _ = new()
+    for k in "RA":
+        d.shape(k, P(k))
+    d.shape("E", [])
+    d.connector("k1", begin="R", end="A")
+    d.connector("k2", begin="R", end="E")
+    out = d.place([("R", []), ("A", []), ("E", []), ("k1", []), ("k2", [])])
+    assert out == [ListItem(0, "-", [Text("R")]), ListItem(1, "-", [Text("A")]),
+                   ListItem(1, "-", [Text("(unlabelled shape)")])], out
+
+
+def test_connector_children_label_its_edge():
+    d, _ = new()
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("k", begin="A", end="B", p0=(0, 0), p1=(30, 0), blocks=P("assoc"))
+    d.shape("r", P("-have"), box=(1, 1, 3, 2), parent="k")
+    d.shape("m", P("1"), box=(12, -2, 13, -1), parent="k")
+    d.shape("n", P("1..*"), box=(27, 1, 29, 2), parent="k")
+    d.shape("e", [], box=(27, -2, 28, -1), parent="k")
+    slots = [("A", []), ("B", []), ("k", P("assoc")), ("r", P("-have")), ("m", P("1")), ("n", P("1..*")), ("e", [])]
+    out = d.place(slots)
+    assert lines(out)[-1] == '  n1 -->|"-have 1 / assoc / 1..*"| n2' and len(out) == 1, out
+    d, _ = new()
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("k", begin="A", end="B", p0=(0, 0), p1=(20, 10), path=[(0, 0), (20, 0), (20, 10)])
+    d.shape("r", P("-has"), box=(13, -1.5, 15, -0.5), parent="k")
+    d.shape("n", P("1"), box=(20.5, 7.5, 21.5, 8.5), parent="k")
+    out = d.place([("A", []), ("B", []), ("k", []), ("r", P("-has")), ("n", P("1"))])
+    assert lines(out)[-1] == '  n1 -->|"-has / / 1"| n2' and len(out) == 1, out
+    d, _ = new()
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("k", begin="A", end="B", p0=(0, 0), p1=(30, 0), arrows=(True, False))
+    d.shape("r", P("-have"), box=(1, 1, 3, 2), parent="k")
+    d.shape("n", P("1..*"), box=(27, 1, 29, 2), parent="k")
+    out = d.place([("A", []), ("B", []), ("k", []), ("r", P("-have")), ("n", P("1..*"))])
+    assert lines(out)[-1] == '  n2 -->|"1..* / / -have"| n1' and len(out) == 1, out
+    d, _ = new()
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("k", begin="A", end="B")
+    d.shape("r", P("x" * 90), parent="k")
+    out = d.place([("A", []), ("B", []), ("k", []), ("r", P("x" * 90))])
+    assert lines(out)[-1] == '  n1 -->|"' + "x" * 80 + '…"| n2', out
+    assert out[1:] == [Para([Text("n1 --> n2:")])] + P("x" * 90), out
+    d, _ = new()
+    d.shape("A", P("A"))
+    d.shape("B", P("B"))
+    d.connector("k", begin="A", end="B", path=[(0, 0), (10, 0)])
+    d.shape("r", P("-has"), box=(1, 1, 2, 2), parent="k")
+    d.shape("m", P("uses"), box=(4, 1, 6, 2), parent="k")
+    out = d.place([("A", []), ("B", []), ("k", []), ("r", P("-has")), ("m", P("uses"))])
+    assert lines(out)[-1] == '  n1 -->|"-has / uses /"| n2', out
+
+
+def test_meaningful_kinds_and_names():
+    d, _ = new()
+    d.shape("Q", P("ok?"), kind="decision")
+    d.shape("S", P("Step"), kind="chevron")
+    d.shape("C", P("note"), kind="callout")
+    d.shape("F", [], name="Firewall")
+    d.connector("k1", begin="Q", end="S")
+    d.connector("k2", begin="S", end="C")
+    d.connector("k3", begin="C", end="F")
+    ls = lines(d.place([("Q", []), ("S", []), ("C", []), ("F", []), ("k1", []), ("k2", []), ("k3", [])]))
+    assert ls == ["flowchart TD", '  n1{"ok?"}', '  n2>"Step"]', '  n3@{ shape: comment, label: "note" }',
+                  '  n4["Firewall"]', "  n1 --> n2", "  n2 --> n3", "  n3 --> n4"], ls
+    d, _ = new()
+    d.shape("G", [], name="Group")
+    d.shape("T", P("Block"), parent="G")
+    d.shape("P", [], parent="G", part=True)
+    d.shape("J", [], name="Node", parent="X")
+    d.shape("X", [], name="Group")
+    d.connector("k1", begin="P", end="J")
+    ls = lines(d.place([("G", []), ("T", P("Block")), ("P", []), ("X", []), ("J", []), ("k1", [])]))
+    assert ls == ["flowchart TD", '  n1["Block"]', '  n2["Node"]', "  n1 --> n2"], ls
+
+
+def test_own_shapes_in_a_group_keep_their_ends():
+    d, _ = new()
+    d.shape("G", [])
+    d.shape("T", P("DMZ"), parent="G")
+    d.shape("F", [], name="Firewall", parent="G")
+    d.shape("S", [], name="Web server", parent="G")
+    d.shape("X", P("Internet"))
+    d.connector("k1", begin="X", end="F")
+    d.connector("k2", begin="F", end="S")
+    out = d.place([("G", []), ("T", P("DMZ")), ("F", []), ("S", []), ("X", P("Internet")), ("k1", []), ("k2", [])])
+    assert out[0] == P("DMZ")[0] and lines(out[1:]) == [
+        "flowchart TD", '  n1["Firewall"]', '  n2["Web server"]', '  n3["Internet"]', "  n3 --> n1",
+        "  n1 --> n2"], out
+    d, _ = new()
+    d.shape("BG", [], box=(0, 0, 100, 100))
+    d.shape("Title", P("System context"), parent="BG", box=(0, 90, 100, 100))
+    d.shape("U", P("User"), parent="BG", box=(0, 0, 10, 10))
+    d.shape("O", [], parent="BG", box=(50, 50, 60, 60))
+    d.connector("k", begin="U", end="O")
+    out = d.place([("BG", []), ("Title", P("System context")), ("U", P("User")), ("O", []), ("k", [])])
+    assert out[0] == P("System context")[0] and lines(out[1:]) == ["flowchart TD", '  n1["User"]', "  n1 --> n2"], out
+    d, _ = new()
+    d.shape("L", [], box=(0, 0, 100, 20))
+    d.shape("LT", P("Finance"), parent="L")
+    d.shape("D", [], kind="decision", parent="L", name="Decision")
+    d.shape("A", P("Approve"), parent="L")
+    d.connector("k", begin="A", end="D")
+    ls = lines(d.place([("L", []), ("LT", P("Finance")), ("D", []), ("A", P("Approve")), ("k", [])]))
+    assert ls == ["flowchart TD", '  n1{"Decision"}', '  n2["Approve"]', "  n2 --> n1"], ls
+    d, _ = new()
+    d.shape("G", [], box=(0, 0, 10, 10))
+    d.shape("T", P("Pump"), parent="G", box=(2, 2, 8, 8))
+    d.shape("Q", [], name="Rechteck", parent="G", box=(9.5, 4, 10, 6))
+    d.shape("I", [], name="Valve", parent="G", box=(4, 4, 5, 5))
+    d.shape("H", [], name="Feld", parent="G", box=(0, 7, 10, 10))
+    d.shape("B", P("Tank"), box=(20, 0, 30, 10))
+    d.connector("k1", begin="Q", end="B")
+    d.connector("k2", begin="I", end="B")
+    d.connector("k3", begin="H", end="B")
+    ls = lines(d.place([("G", []), ("T", P("Pump")), ("Q", []), ("I", []), ("H", []), ("B", []), ("k1", []),
+                        ("k2", []), ("k3", [])]))
+    assert ls == ["flowchart LR", '  n1["Pump"]', '  n2["Valve"]', '  n3["Tank"]', "  n1 --> n3", "  n2 --> n3",
+                  "  n1 --> n3"], ls
+    d, _ = new()
+    d.shape("G", [], box=(0, 0, 10, 30))
+    d.shape("RK", [], name="Rack", parent="G", box=(0, 0, 10, 30), part=False)
+    d.shape("S1", [], name="Server", parent="G", box=(0, 20, 10, 25), part=False)
+    d.shape("S2", [], name="Storage", parent="G", box=(0, 5, 10, 10), part=False)
+    d.shape("SW", P("Switch"), box=(30, 10, 40, 20))
+    d.connector("k1", begin="SW", end="S1")
+    d.connector("k2", begin="SW", end="S2")
+    out = d.place([("G", []), ("RK", []), ("S1", []), ("S2", []), ("SW", P("Switch")), ("k1", []), ("k2", [])])
+    items = [(b.level, b.inlines[0].text) for b in out if isinstance(b, ListItem)]
+    assert len(out) == 3 and items == [(0, "Switch"), (1, "Server"), (1, "Storage")], out
+    d, _ = new()
+    d.shape("G", [], box=(0, 0, 10, 10))
+    d.shape("T", P("DMZ"), parent="G", box=(2, 8, 8, 9))
+    d.shape("F", [], name="Firewall", parent="G", box=(0, 4, 1, 5), part=False)
+    d.shape("X", P("Internet"), box=(-20, 4, -18, 5))
+    d.connector("k", begin="X", end="F")
+    out = d.place([("G", []), ("T", P("DMZ")), ("F", []), ("X", P("Internet")), ("k", [])])
+    assert out[0] == P("DMZ")[0] and lines(out[1:])[1:] == ['  n1["Firewall"]', '  n2["Internet"]', "  n2 --> n1"], out
+
+
+def test_shape_data_never_makes_the_label():
+    d, _ = new()
+    d.shape("F", [], name="Firewall", data=P("IP address: 10.0.0.1"))
+    d.shape("X", P("Internet"), data=P("Owner: Ops"))
+    d.shape("Y", P("Lan"))
+    d.connector("k", begin="X", end="F", data=P("Speed: 1G"))
+    d.connector("j", begin="F", end="Y")
+    out = d.place([("F", P("IP address: 10.0.0.1")), ("X", P("Internet") + P("Owner: Ops")), ("Y", P("Lan")),
+                   ("k", P("Speed: 1G")), ("j", [])])
+    assert lines(out[:1]) == ["flowchart TD", '  n1["Firewall"]', '  n2["Internet"]', '  n3["Lan"]', "  n2 --> n1",
+                              "  n1 --> n3"], out
+    assert out[1:] == ([Para([Text("n1:")])] + P("IP address: 10.0.0.1") + [Para([Text("n2:")])] + P("Owner: Ops")
+                       + [Para([Text("n2 --> n1:")])] + P("Speed: 1G")), out
+
+
+def test_floating_text_on_a_path_labels_its_edge():
+    d, _ = new()
+    d.shape("A", P("A"), box=(0, 0, 2, 6))
+    d.shape("B", P("B"), box=(10, 0, 12, 6))
+    d.connector("k1", begin="A", end="B", path=[(2, 1), (10, 1)])
+    d.connector("k2", begin="A", end="B", path=[(2, 2.5), (6, 2.5), (6, 3.5), (10, 3.5)])
+    d.connector("k3", begin="A", end="B", path=[(2, 5), (10, 5)])
+    d.shape("L1", P("S11el"), box=(4, 1.1, 8, 1.4))
+    d.shape("L2", P("S12el"), box=(6.5, 3.55, 9, 3.8))
+    d.shape("L3", P("S13el"), box=(4, 5.05, 8, 5.3))
+    d.shape("T", P("Title"), box=(4, 8, 8, 8.5))
+    d.shape("N", P("note"), box=(1.2, 0.9, 1.9, 1.1))
+    slots = [(k, P(k)) for k in "AB"] + [("k1", []), ("k2", []), ("k3", [])] + [
+        ("L1", P("S11el")), ("L2", P("S12el")), ("L3", P("S13el")), ("T", P("Title")), ("N", P("note"))]
+    d.shape("F", [])
+    d.shape("FL", P("Frame"), parent="F", box=(4, 0.6, 8, 0.9))
+    out = d.place(slots + [("F", []), ("FL", P("Frame"))])
+    assert lines(out[:1]) == ["flowchart LR", '  n1["A"]', '  n2["B"]', '  n1 -->|"S11el"| n2',
+                              '  n1 -->|"S12el"| n2', '  n1 -->|"S13el"| n2'], out
+    assert out[1:] == P("Title") + P("note") + P("Frame"), out
+
+
 def test_skip_kind_wording():
     sk = collections.Counter(connector_loose=2, infer_skipped=1)
     md = markdown.render(Doc(blocks=P("body")), Path(tempfile.mkdtemp()), skipped=sk)
