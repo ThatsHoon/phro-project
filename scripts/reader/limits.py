@@ -47,7 +47,9 @@ DECRYPT_BYTES = 32 * 2**20  # bytes one xls or ppt stream may decrypt
 VBA_MODULES = 256           # VBA modules one document reads, all its projects together
 VBA_BYTES = 2 * 2**20       # bytes one document's VBA projects decompress to or scan (dir streams and source)
 EMBED_BYTES = 16 * 2**20    # bytes of one Excel workbook stream embedded in an hwp or doc object
-EMBED_TOTAL = 16 * EMBED_BYTES  # bytes the packages embedded in one document inflate to, all together
+EMBED_TOTAL = 4 * EMBED_BYTES  # bytes the packages embedded in one document inflate to, all together
+EMBED_NODES = 2_000_000     # XML elements built into trees for one document's embedded objects, all together
+EMBED_DECRYPT = EMBED_BYTES  # bytes one document's xls streams decrypt together, once it has decrypted one
 JET_WORK_TOTAL = 32 * 2**20  # work one Access file may spend on its rows, in units of about 0.2 us (a text byte
 #                               decoded; jet.py prices rows and cells in them), at most 10 a byte of the file and 1 MiB
 JET_PAGE_CACHE = 8_192       # decoded pages one Access file with a Jet3/Jet4 db_key keeps (32 MiB at 4 KiB)

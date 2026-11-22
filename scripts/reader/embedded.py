@@ -28,7 +28,10 @@ An object inside an object is read under the same `Objects`, DEPTH levels at mos
 (Office), `package_stream` or `EmbeddedOdf` (LibreOffice) stream, which holds the object's own file, and the
 objects of an embedded workbook's sheet. An embedded workbook shows one sheet (an OOXML one its active sheet, an
 OpenDocument one its first) and only that sheet is read; what the read counted goes to the document's counts with
-the table. A stream or package over EMBED_BYTES is not read. A ReadError that only says this object cannot be read
+the table. A stream or package over EMBED_BYTES is not read. The work objects cause is the document's too: what
+their packages inflate to (EMBED_TOTAL), the XML elements built into trees while one is read (EMBED_NODES), the
+BIFF records walked (BIN_RECORDS, the document's own streams with them) and the xls bytes decrypted
+(EMBED_DECRYPT); an object that would pass one of them is not read. A ReadError that only says this object cannot be read
 (damaged, too large, unsupported, encrypted) gives None, and so does any error that is no ReadError; any other
 ReadError ends the document, as it does everywhere.
 """
@@ -37,7 +40,7 @@ import struct
 
 from . import limits
 from .containers.cfb import CfbError, Compound, is_cfb
-from .containers.zipx import Package
+from .containers.zipx import Package, charged
 from .limits import ReadError
 from .model import Cell, Context, Equation, Para, Section, Table
 
@@ -72,6 +75,8 @@ class Objects:
         self.depth = 0      # objects open around the one being read
         self.inflated = 0   # bytes the members read from embedded packages inflate to
         self.records = 0    # records walked in BIFF streams, the document's own and its objects'
+        self.nodes = 0      # XML elements built into trees while objects were read
+        self.decrypted = 0  # bytes of xls streams decrypted
 
     def budget(self):
         """The document's one sheet_grid.Budget."""
@@ -164,7 +169,8 @@ def read(data: bytes, ctx, sheets):
         if data[:4] == b"PK\x03\x04":
             objs.depth += 1
             try:
-                return _package(data, ctx)
+                with charged(objs):
+                    return _package(data, ctx)
             finally:
                 objs.depth -= 1
         if is_cfb(data[:8]):
@@ -183,7 +189,8 @@ def storage(cf, ctx, sheets):
     objs = of(ctx)
     objs.depth += 1
     try:
-        return _storage(cf, ctx, sheets)
+        with charged(objs):
+            return _storage(cf, ctx, sheets)
     except ReadError as e:
         if e.kind not in _SKIP:
             raise
@@ -253,7 +260,7 @@ def _shown(blocks, own, ctx):
 def _odf(data, ctx):
     from .formats import odf_sheets
     from .formats.odf_base import Body, Styles, kids, local
-    with Package(data, of(ctx)) as pkg:
+    with Package(data) as pkg:
         if not pkg.has("content.xml"):
             return None
         root = pkg.xml("content.xml")
@@ -276,7 +283,7 @@ def _odf(data, ctx):
 
 def _workbook(data, ctx):
     from .formats import ooxml, ooxml_base, ooxml_sheets
-    with Package(data, of(ctx)) as pkg:
+    with Package(data) as pkg:
         part = ooxml._main_part(pkg)
         root, _ = ooxml_base.load(pkg, part)
         if ooxml_base.local(root.tag) != "workbook":

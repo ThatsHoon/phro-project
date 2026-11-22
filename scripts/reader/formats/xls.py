@@ -30,7 +30,7 @@ import re
 from dataclasses import replace
 import struct
 
-from .. import diagram, limits
+from .. import diagram, embedded, limits
 from ..containers.cfb import CfbError, Compound
 from ..containers import flate, vba
 from ..containers.zipx import Package
@@ -74,6 +74,10 @@ class Workbook:
         self.g = biff.read_globals(self.st)
         if self.g.filepass is not None:
             # only the default password is tried; the clear stream keeps its FILEPASS record, so its id is blanked
+            held = embedded.of(ctx)
+            if held.decrypted and held.decrypted + len(data) > limits.EMBED_DECRYPT:
+                raise ReadError("encrypted")
+            held.decrypted += len(data)
             clear = None if self.g.ansi else xls_crypt.decrypt(data, self.g.filepass)
             if clear is None:
                 raise ReadError("encrypted")

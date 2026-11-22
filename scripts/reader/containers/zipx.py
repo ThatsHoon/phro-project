@@ -1,4 +1,5 @@
 """Safe zip package access and namespace-agnostic XML helpers."""
+import contextlib
 import io
 import posixpath
 import zipfile
@@ -46,7 +47,24 @@ def _declares_entities(data: bytes) -> bool:
 _XML_ERRORS = (ET.ParseError, LookupError, ValueError)
 
 
+_held = None
+
+
+@contextlib.contextmanager
+def charged(objects):
+    """While this is open an embedded object of the document is being read: every Package opened and every XML
+    tree built is charged to `objects`, the document's embedded.Objects (limits.EMBED_TOTAL, limits.EMBED_NODES)."""
+    global _held
+    before, _held = _held, objects
+    try:
+        yield
+    finally:
+        _held = before
+
+
 def parse_xml(data: bytes):
+    if _held is not None:
+        return parse_xml_ns(data)[0]
     if _declares_entities(data):
         raise ReadError("damaged", "XML declares a DOCTYPE or ENTITY")
     try:
@@ -85,6 +103,10 @@ def parse_xml_ns(data: bytes, max_nodes: int | None = None):
     ElementTree holds about 80 bytes an element however small its text."""
     if _declares_entities(data):
         raise ReadError("damaged", "XML declares a DOCTYPE or ENTITY")
+    held = _held
+    if held is not None:
+        left = max(limits.EMBED_NODES - held.nodes, 0)
+        max_nodes = left if max_nodes is None else min(max_nodes, left)
     builder = _NsBuilder(max_nodes)
     try:
         parser = ET.XMLParser(target=builder)
@@ -94,6 +116,9 @@ def parse_xml_ns(data: bytes, max_nodes: int | None = None):
         raise ReadError("too_large", f"{limits.BIG_PART}: XML of more than {max_nodes} elements") from None
     except _XML_ERRORS as e:
         raise ReadError("damaged", f"XML parse error: {e}")
+    finally:
+        if held is not None:
+            held.nodes += max_nodes - max(builder.left, 0)
     return root, builder.ns
 
 
@@ -194,8 +219,8 @@ def iterparse(stream, events=("end",), chunk=65536):
 class Package:
     def __init__(self, path: Path, objects=None):
         """`path` is a path, or the package's bytes (read in memory; every check below is the same). `objects` is
-        the document's embedded.Objects when the package is one the document embeds: what its members inflate to
-        is charged to the document's EMBED_TOTAL as well."""
+        the document's embedded.Objects when the package is one the document embeds, as is every package opened
+        under `charged`: what its members inflate to is charged to the document's EMBED_TOTAL as well."""
         if isinstance(path, (bytes, bytearray, memoryview)):
             path = io.BytesIO(bytes(path))
         try:
@@ -213,7 +238,7 @@ class Package:
             self._lower[k] = n
         self._seen = set()
         self._total = 0
-        self._objects = objects
+        self._objects = _held if objects is None else objects
 
     def close(self):
         self._zip.close()

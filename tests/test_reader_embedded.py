@@ -10,8 +10,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from reader import embedded, limits  # noqa: E402  (ModuleNotFoundError before embedded.py exists)
 from reader.formats import hwp_chart, sheet_grid  # noqa: E402
 from reader.model import Context, Equation, Table, Text  # noqa: E402
-from reader_fix import (XLSX_SML, cfb_bytes, comp_obj, eq_native, excel_object, make_xlsx, make_zip,  # noqa: E402
-                        xlsx_cell, xlsx_row)
+from reader_fix import (XLSX_SML, cfb_bytes, comp_obj, encrypt_xls, eq_native, excel_object, make_xlsx,  # noqa: E402
+                        make_zip, msgraph_object, xlsx_cell, xlsx_row)
 import test_reader_doc_objects as in_doc  # noqa: E402
 import test_reader_docm as in_docm  # noqa: E402
 import test_reader_odt as odt  # noqa: E402
@@ -249,6 +249,63 @@ def test_embedded_packages_inflate_under_one_total():
         limits.EMBED_TOTAL = old
     assert got[0][0] == "table" and got[3] is None, got
     assert 0 < embedded.of(ctx).inflated <= 2 * size, (embedded.of(ctx).inflated, size)
+
+
+def test_a_package_past_the_total_inflates_nothing():
+    import zipfile
+    real, reads = zipfile.ZipFile.read, []
+    old = limits.EMBED_TOTAL
+    limits.EMBED_TOTAL = 0
+    zipfile.ZipFile.read = lambda self, *a, **k: (reads.append(a), real(self, *a, **k))[1]
+    try:
+        ctx = Context()
+        got = [embedded.of(ctx).load(data) for data in (workbook(), chart_package())]
+    finally:
+        limits.EMBED_TOTAL, zipfile.ZipFile.read = old, real
+    assert got == [None, None] and not reads and embedded.of(ctx).inflated == 0, (got, reads)
+
+
+def test_trees_of_embedded_packages_are_built_under_one_count():
+    ctx = Context()
+    for data in (workbook(), chart_package()):
+        assert embedded.of(ctx).load(data)[0] == "table", data[:30]
+    used = embedded.of(ctx).nodes
+    assert used > 20, used
+    old = limits.EMBED_NODES
+    limits.EMBED_NODES = used + used // 2
+    try:
+        ctx = Context()
+        got = [embedded.of(ctx).load(data) for data in (workbook(), chart_package()) * 3]
+    finally:
+        limits.EMBED_NODES = old
+    assert [g[0] for g in got[:2]] == ["table", "table"] and got[4:] == [None, None], got
+    assert embedded.of(ctx).nodes <= used + used // 2, (embedded.of(ctx).nodes, used)
+
+
+def test_embedded_xls_workbooks_decrypt_under_one_total():
+    grid = {"name": "S", "cells": {(0, 0): 1, (0, 1): 2}}
+    stream = encrypt_xls([grid], "VelvetSweatshop", "rc4")
+    blob, _ = cfb_bytes({"Workbook": stream, "\x01CompObj": comp_obj(b"Excel.Sheet.8")})
+    old = limits.EMBED_DECRYPT
+    limits.EMBED_DECRYPT = 2 * len(stream) + len(stream) // 2
+    try:
+        ctx = Context()
+        got = [embedded.read(blob, ctx, embedded.of(ctx).budget()) for _ in range(4)]
+    finally:
+        limits.EMBED_DECRYPT = old
+    assert [cells(g[1]) for g in got[:2]] == [[["1", "2"]]] * 2, got[:2]
+    assert not got[3][1] and embedded.of(ctx).decrypted == 2 * len(stream), (got[3], embedded.of(ctx).decrypted)
+
+
+def test_a_graph_objects_tail_walk_counts_its_records():
+    walked = []
+    for at in ("in", "after"):
+        ctx = Context()
+        blob = msgraph_object(["Q1"], [("East", [1])], codepage=949, codepage_at=at)
+        got = embedded.read(blob, ctx, embedded.of(ctx).budget())
+        assert got[0] == "table" and not ctx.skipped, (at, got, ctx.skipped)
+        walked.append(embedded.of(ctx).records)
+    assert walked[0] == walked[1], walked
 
 
 def test_a_parser_error_costs_only_the_object():
