@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import VERSION, convert
-from .limits import FIGURES_LATE, OCR_LATE, READ_BYTES, READ_TOKEN_BYTES, READ_TOKENS
+from .limits import FIGURES_LATE, OCR_LATE, READ_BYTES, READ_LATE, READ_TOKEN_BYTES, READ_TOKENS
 
 _counter = itertools.count()
 _lock = threading.Lock()
@@ -191,7 +191,8 @@ def _complete(d: Path) -> bool:
 
 
 def partial(d: Path) -> bool:
-    """True when the entry at d was filed partial (decision 4): the deadline cut its figures or OCR."""
+    """True when the entry at d was filed partial (decision 4): the deadline cut its figures, its OCR or the read
+    itself."""
     import json
     try:
         meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
@@ -357,7 +358,7 @@ def store(k: str, src, hidden: bool = False, again: bool = False, **opts) -> Pat
     finally:
         images.FIGURE_CACHE = old
     extra = {}
-    if {FIGURES_LATE, OCR_LATE} & set(meta.get("warnings") or []):
+    if {FIGURES_LATE, OCR_LATE, READ_LATE} & set(meta.get("warnings") or []):
         extra["partial"] = True
     if (tmp / "out.md").stat().st_size > min(READ_TOKENS * READ_TOKEN_BYTES, READ_BYTES):
         lines = (tmp / "out.md").read_bytes().split(b"\n")

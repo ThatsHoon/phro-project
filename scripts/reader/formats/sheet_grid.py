@@ -461,8 +461,8 @@ class _Spans:
 _REASONS = {"rows": "the {n:,}-row limit", "columns": "the {n:,}-column limit",
             "cells": "the document's {n:,}-cell limit", "characters": "the document's {n:,}-character limit",
             "scanned XML elements": "the workbook's {n:,}-element limit", "grid slots": "the {n:,}-slot table limit",
-            "XML error": "damaged XML"}
-_SPENT = frozenset({"cells", "characters", "scanned XML elements"})
+            "XML error": "damaged XML", "seconds": "the time limit"}
+_SPENT = frozenset({"cells", "characters", "scanned XML elements", "seconds"})
 
 
 def _drain(items):
@@ -574,6 +574,7 @@ class Grid:
         self.cut = False
         self._merges_cut = False
         self.why = None
+        self._row = None
         self.dim = None
         self.formulas = {}
         self._patterns = {}
@@ -604,6 +605,10 @@ class Grid:
             return False
         if not value or row < 0 or col < 0:
             return True
+        if row != self._row:
+            self._row = row
+            if self.ctx.late():
+                return self.stop("seconds", limits.READ_SECONDS, (row, None))
         b = self.budget
         if row >= limits.SHEET_ROWS:
             return self.stop("rows", limits.SHEET_ROWS, (row, col))

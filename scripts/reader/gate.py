@@ -482,6 +482,8 @@ def _time_cut(meta, short=False):
                      + ("" if short else " (Read it to view)" if k == 1 else " (Read them to view)"))
     if limits.FIGURES_LATE in (meta.get("warnings") or []):
         items.append("some figures not drawn" + ("" if short else " (their text is included)"))
+    if limits.READ_LATE in (meta.get("warnings") or []):
+        items.append("the rest of the document not read")
     if not items:
         return ""
     return " Cut by the time limit." if short else " Cut by the time limit: " + ", ".join(items) + "."

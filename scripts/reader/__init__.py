@@ -56,18 +56,20 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     while a document holding a raster picture OCR may read is rendered; no other read loads the OCR modules. Its
     results are cached per picture under the cache root; its deadline is PHRO_READER_DEADLINE's, none without it.
     meta.json then holds the OCR counts ("ocr"), and OCR_LATE among the warnings when the time left pages or
-    pictures unread."""
+    pictures unread. A format reads no further part READ_SECONDS after the process start (`Context.late`): the
+    output then holds what was read and says so, with READ_LATE among the warnings."""
     import contextlib
     import json
     import time
     from . import markdown
-    from .limits import OCR_LATE, ReadError
+    from .limits import OCR_LATE, READ_LATE, READ_SECONDS, ReadError
     from .model import Context
     from . import text
     t0 = time.monotonic()
     src, out_dir = Path(src), Path(out_dir)
     ctx = Context()
     ctx.name = src.name
+    ctx.stop = STARTED + READ_SECONDS
     if FORMATS.get(ext_of(src)) in ("pdf", "djvu"):  # the page loop's deadline runs from the process start
         opts.setdefault("started", STARTED)
     if backend is None:
@@ -97,6 +99,8 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     if "garbled" not in warnings and text.garble_ratio(md) > text.GARBLED:  # a parser may have found it (pub 97)
         warnings.append("garbled")
     warnings += [w for w in info["warnings"] if w not in warnings]  # the figure warnings, each once
+    if ctx.skipped["time"]:
+        warnings.append(READ_LATE)
     counts = info["ocr"]
     if counts and (counts["stopped_at"] is not None or counts["pictures_left"]) and OCR_LATE not in warnings:
         warnings.append(OCR_LATE)

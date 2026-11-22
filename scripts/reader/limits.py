@@ -9,6 +9,9 @@ MAX_DEPTH = 64
 TEX_DEPTH = 32
 MAX_OUTPUT = 20 * 10**6
 CONVERT_SECONDS = 45
+READ_SECONDS = 36.0   # from the process start: past them a format reads no further part (Context.late)
+# the warning of a document whose later part the time left unread
+READ_LATE = "read not finished: time"
 HOOK_SECONDS = 55     # the gate's whole budget, hashing included, under the 60-second hook timeout in hooks.json
 HOOK_CHILD_MIN = 5    # with less than this left the gate denies instead of starting a conversion
 SHEET_ROWS = 100_000
