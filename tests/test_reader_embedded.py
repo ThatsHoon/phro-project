@@ -323,6 +323,22 @@ def test_objects_are_read_within_the_documents_seconds():
     assert 2.5 <= embedded.of(ctx).spent < 4.5, embedded.of(ctx).spent
 
 
+def test_a_late_hwp_workbook_item_is_not_read():
+    blob = excel_object([{"name": "S", "cells": {(0, 0): 1, (0, 1): 2}}], b"Excel.Sheet.8")
+    item = struct.pack("<I", len(blob)) + blob
+    ctx = Context()
+    got = hwp_chart.ole_blocks(item, ctx)
+    assert cells(got) == [["1", "2"]] and embedded.of(ctx).spent > 0, (got, embedded.of(ctx).spent)
+    old = limits.EMBED_SECONDS
+    limits.EMBED_SECONDS = 0
+    try:
+        ctx = Context()
+        got = hwp_chart.ole_blocks(item, ctx)
+    finally:
+        limits.EMBED_SECONDS = old
+    assert got == [] and ctx.skipped == {"object": 1}, (got, ctx.skipped)
+
+
 def test_a_parser_error_costs_only_the_object():
     bad = nest(0, book='<bookViews><workbookView activeTab="²"/></bookViews>')
     got, ctx = read(bad)

@@ -75,7 +75,17 @@ def ole_blocks(data: bytes, ctx, *, sheets: sheet_grid.Budget | None = None) -> 
     it gives, or that holds none of these; counted under chart for a BIFF Workbook with no table to show, a chart
     that does not parse or a chart object left unread. A chart without series is nothing, not counted, as
     charts.chart_table has it. A workbook's sheets draw on `sheets`, the document's sheet_grid.Budget (the one of `ctx`
-    when None)."""
+    when None). An item reached after the document's embedded.Objects ran out of time is not read, counted under
+    object."""
+    objs = embedded.of(ctx)
+    if objs.late():
+        ctx.skipped["object"] += 1
+        return []
+    with objs.timed():
+        return _item(data, ctx, sheets)
+
+
+def _item(data: bytes, ctx, sheets) -> list:
     if len(data) < 12 or struct.unpack_from("<I", data)[0] != len(data) - 4 or not is_cfb(data[4:12]):
         ctx.skipped["object"] += 1
         return []

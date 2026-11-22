@@ -71,7 +71,7 @@ class Objects:
             return _MISSING
         got = embedded.storage(_Storage(self, streams), self.r.ctx, self.sheets)
         if got is None:
-            return _OTHER
+            return _BAD if embedded.of(self.r.ctx).late() else _OTHER
         return _BAD if got[0] == "bad" else got
 
     def stream(self, path, cap) -> bytes | None:

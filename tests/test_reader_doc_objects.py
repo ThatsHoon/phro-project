@@ -124,6 +124,18 @@ def test_equation_fraction():
     assert md(p) == "$$\\frac{a}{b}$$\n", md(p)
 
 
+def test_a_late_equation_is_counted():
+    from reader import limits
+    p = embed_doc({1: {"Equation Native": eq_native(FRAC)}}, preview=PNG_PREVIEW)
+    old = limits.EMBED_SECONDS
+    limits.EMBED_SECONDS = 0
+    try:
+        d, ctx = parse(p)
+    finally:
+        limits.EMBED_SECONDS = old
+    assert not any(isinstance(b, Equation) for b in d.blocks) and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
+
+
 def test_equation_sub_sup():
     assert to_tex(SUBSUP) == "x_{1}^{2}"
     # v3's one SCRIPT template: variation 2 has both slots, 0 the superscript, 1 the subscript
