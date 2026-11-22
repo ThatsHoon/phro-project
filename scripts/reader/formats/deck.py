@@ -4,7 +4,8 @@ the masters, layouts and footers put on more than one slide.
 `Order` reads a document's slides: calling it is a recursive XY-cut over one set of shapes' boxes. A set of boxes is split in two at its widest gap, between rows
 (a cut across y) or between columns (a cut across x), rows on a tie, and each part is read the same way; a set with no
 gap reads by (top, left), and so does one
-whose only cut is between columns that overlap. A box counts from a quarter of the smallest height (width) in the set in from each edge, so
+whose only cut is between columns that overlap where a box of one column sits above or below a box of the other it
+overlaps (boxes stacked, not side by side). A box counts from a quarter of the smallest height (width) in the set in from each edge, so
 two rows (columns) that overlap by less than half the smallest box still part, a row whose boxes sit a fraction of a
 line off is one row, and a small box at the edge of a large one does not cut it.
 A shape with no box keeps its place in the source: it goes just before the first read of the boxed shapes that follow
@@ -67,12 +68,28 @@ class Order:
                 self.left -= len(ids)
                 rows, cols = _part(ids, norm, 1), _part(ids, norm, 0)
                 cut = rows if cols is None or (rows is not None and rows[0] >= cols[0]) else cols
-                if rows is None and cut is not None and cut[0] < 0:
+                if rows is None and cut is not None and cut[0] < 0 and self._stacked(cut, norm):
                     cut = None
             if cut is None:
                 seq.extend(sorted(ids, key=lambda i: (norm[i][1], norm[i][0], i)))
             else:
                 stack += [cut[2], cut[1]]
+        return self._placed(seq, boxes)
+
+    def _stacked(self, cut, norm) -> bool:
+        """Whether a column cut through overlapping boxes parts a box from one above or below it: some pair, one box
+        from each side, overlaps across x and not across y. A cut with more pairs than the work left counts as one."""
+        edge = min(norm[i][0] for i in cut[2])
+        first = [norm[i] for i in cut[1] if norm[i][2] > edge]
+        edge = max(b[2] for b in first)
+        second = [norm[i] for i in cut[2] if norm[i][0] < edge]
+        if self.left < len(first) * len(second):
+            return True
+        self.left -= len(first) * len(second)
+        return any(a[2] > b[0] and (a[3] <= b[1] or b[3] <= a[1]) for a in first for b in second)
+
+    @staticmethod
+    def _placed(seq, boxes) -> list:
         rank = {i: r for r, i in enumerate(seq)}
         keys, ahead = [], len(seq)
         for i in range(len(boxes) - 1, -1, -1):

@@ -67,6 +67,14 @@ def test_repeated_keys_an_item_once():
     assert len(rep.items) == 1 and len(next(iter(rep.items.values()))[1]) == 399
 
 
+def test_side_by_side_boxes_that_overlap_a_little_read_left_first():
+    pair = [(0, 100, 520, 400), (480, 90, 1000, 400)]
+    assert deck.Order()(pair) == [0, 1], deck.Order()(pair)
+    assert deck.Order()([(0, 0, 1000, 60)] + pair) == [0, 1, 2]
+    stacked = [(300, 300, 1000, 400), (0, 100, 520, 200)]
+    assert deck.Order()(stacked) == [1, 0], deck.Order()(stacked)
+
+
 def main():
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
