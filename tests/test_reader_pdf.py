@@ -199,6 +199,46 @@ def test_scattered_icons_are_no_figure():
         assert "Column 0 prose line 0 runs on" in text and "Column 1 prose line 29 runs on" in text, text
 
 
+def _blocks(cells, size=20):
+    return b" ".join(b"%d %d %d %d re f" % (x, y, size, size) for x, y in cells)
+
+
+def _prose(y0, lines=10):
+    return b" ".join(text_ops("Prose line %d of the page runs on across the column to its end" % k, x=72,
+                              y=y0 - 14 * k, size=10) for k in range(lines))
+
+
+def test_two_drawings_apart_are_two_figures():
+    """Drawings apart on a page are figures each, and the prose between them stays the page's text."""
+    upper = _blocks([(100 + 24 * c, 560 + 24 * r) for c in range(10) for r in range(5)])
+    lower = _blocks([(100 + 24 * c, 100 + 24 * r) for c in range(10) for r in range(5)])
+    text, ctx, doc = md(simple_pdf([upper + b" " + lower + b" " + _prose(480)]))
+    assert doc.meta["unrendered"] == [1, 1] and ctx.skipped["figure"] == 2, (doc.meta, ctx.skipped)
+    assert "Prose line 0 of the page" in text and "Prose line 9 of the page" in text, text
+
+
+def test_bars_on_one_axis_are_one_figure():
+    """Bars apart that stand on one ruled axis are one drawing; without the axis they are marks apart."""
+    bars = _blocks([(100 + 80 * c, 560 + 24 * r) for c in range(3) for r in range(4)])
+    rest = _blocks([(500, 100)]) + b" " + _prose(480)
+    text, ctx, doc = md(simple_pdf([bars + b" 0.5 w 90 556 m 290 556 l S " + rest]))
+    assert doc.meta["unrendered"] == [1] and "Prose line 9 of the page" in text, (doc.meta, text)
+    text, ctx, doc = md(simple_pdf([bars + b" " + rest]))
+    assert doc.meta["unrendered"] == [] and not ctx.skipped, (doc.meta, ctx.skipped)
+
+
+def test_drawing_of_miniature_text_is_a_figure():
+    """Lines too small to read inside a drawing are its text; lines of body size in a frame are a text box."""
+    ring = _blocks([(100 + 24 * c, y) for c in range(11) for y in (560, 680)]
+                   + [(x, 584 + 24 * r) for x in (100, 340) for r in range(4)])
+    for size, figure in ((1.5, True), (10, False)):
+        inner = b" ".join(text_ops("Words of a page shown small, line %02d of it" % k, x=150, y=600 + 12 * k, size=size)
+                          for k in range(6))
+        text, ctx, doc = md(simple_pdf([ring + b" " + inner + b" " + _prose(480)]))
+        assert (doc.meta["unrendered"] == [1]) == figure and ("Figure text: Words" in text) == figure, (size, doc.meta, text)
+        assert "line 05 of it" in text and "Prose line 9 of the page" in text, text
+
+
 def test_picture_between_paragraphs_of_its_column():
     """A picture in the right column goes between that column's paragraphs, not into the left column's text."""
     left = b" ".join(text_ops("Left column line %d of text" % k, x=72, y=700 - 14 * k, size=10) for k in range(30))
@@ -359,6 +399,16 @@ def test_outline_headings():
                       catalog={"Outlines": Ref(300)}, extra_objects=outline_items([(1, "Intro", 0)]))
     text, _, _ = md(data)
     assert "### Intro" in text and text.count("Intro") == 1, text
+
+
+def test_outline_title_over_two_lines_is_one_heading():
+    data = simple_pdf([text_ops("Paying Wages, Pensions,", y=720) + b" " + text_ops("or  Annuities", y=706)
+                       + b" " + text_ops("Body line one that is the text", y=680)
+                       + b" " + text_ops("Body line two", y=666)],
+                      catalog={"Outlines": Ref(300)},
+                      extra_objects=outline_items([(1, "Paying Wages, Pensions, or Annuities", 0)]))
+    text, _, _ = md(data)
+    assert "### Paying Wages, Pensions, or Annuities" + chr(10) in text and text.count("Annuities") == 1, text
 
 
 def test_outline_and_page_labels():
@@ -857,7 +907,7 @@ def test_caps():
     assert (pdf.PDF_PAGES, pdf.PDF_DEADLINE, pdf.PDF_PAGE_SECONDS) == (5_000, 36.0, 4.0)
     assert (pdf.PDF_PAGE_CHARS, pdf.PDF_RENDERS) == (200_000, 100)
     assert (pdf.RENDER_DPI, pdf.CROP_DPI, pdf.RENDER_LONG) == (110, 150, 1_568)
-    assert (pdf.SCAN_COVER, pdf.FIGURE_PATHS, pdf.FIGURE_COVER) == (0.5, 32, 0.04)
+    assert (pdf.SCAN_COVER, pdf.FIGURE_PATHS, pdf.FIGURE_COVER) == (0.5, 32, 0.03)
     assert (pdf.FIGURE_PAD, limits.FIGURE_WHOLE, pdf.TINY_PT) == (6.0, 0.7, 1.0)
     assert (pdf.IMAGE_MIN_PX, pdf.IMAGE_MIN_PT) == (32, 16.0)
     assert (pdf.PDF_PAGE_OBJECTS, pdf.PDF_PAGE_IMAGES) == (100_000, 64)

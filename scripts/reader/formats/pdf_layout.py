@@ -971,6 +971,35 @@ def _breaks(prev, ln, body) -> bool:
     return step is None or step <= 0 or step > PARA_GAP * body[1 if ln.vertical else 0]
 
 
+ALONG_SPACE = 0.15
+
+
+def _along(prev, ln) -> bool:
+    """Whether `ln` goes on along the visual line of `prev`: on its baseline within half a size,
+    starting where it ends, under a size apart (a piece set off by a superscript or a font change)."""
+    step = _step(prev, ln)
+    if step is None or abs(step) >= 0.5 or prev.direction != "ltr" or ln.direction != "ltr":
+        return False
+    gap = prev.box[1] - ln.box[3] if ln.vertical else ln.box[0] - prev.box[2]
+    return -0.5 * prev.size < gap < prev.size
+
+
+def _whole(lns) -> list:
+    """`lns` with each line that goes on along the one before it (`_along`) made one line with it."""
+    out = []
+    for ln in lns:
+        if out and _along(out[-1], ln):
+            prev = out[-1]
+            sep = " " if ln.box[0] - prev.box[2] > ALONG_SPACE * prev.size and not ln.vertical else ""
+            a, b = prev.box, ln.box
+            out[-1] = replace(prev, text=prev.text + sep + ln.text,
+                              runs=prev.runs + ([(sep, "")] if sep else []) + ln.runs,
+                              box=(min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])))
+        else:
+            out.append(ln)
+    return out
+
+
 def _ended(prev, ln, right) -> bool:
     """Whether `prev` was ended rather than wrapped before `ln`: `ln` starts with a list marker
     (LIST_MARK: a bullet, or a number of up to 3 digits closed by `.` or `)`), or past the end of
@@ -1017,8 +1046,10 @@ def paragraphs(lns, model, body=None) -> List[Para]:
 def _groups(lns, body=None) -> list:
     """The lines of each paragraph: a baseline step over PARA_GAP x the body pitch `body` (the
     `pitch` of these lines when None), a step that does not go forward, or a line that was ended
-    rather than wrapped (`_ended`) starts a new one, and a table-of-contents entry (`toc_entry`)
-    ends its own."""
+    rather than wrapped (`_ended`) starts a new one; a line that goes on along the one before
+    (`_along`) is one line with it, a space between them when they are over ALONG_SPACE sizes
+    apart; a table-of-contents entry (`toc_entry`) ends its own."""
+    lns = _whole(lns)
     body = pitch(lns) if body is None else body
     groups, cur, prev, right = [], [], None, -math.inf
     for ln in lns:
@@ -1125,13 +1156,35 @@ def body_size(all_lines) -> float:
     return 0.0
 
 
-def heading_level(text: str, size: float, body: float) -> Optional[int]:
-    """3 at 1.5 x the body size, 4 at 1.25 x; none for a long line or one with under 2 letters."""
+HEAD_STEP = 1.15    # x the body size a rare size starts at to be a heading's
+HEAD_SHARE = 0.03   # of a document's chars set at a size or above it: under it the size is rare
+HEAD_CHARS = 60     # chars of a line that is a heading by a rare size under 1.25 x the body
+
+
+def heading_floor(all_lines, body: float) -> float:
+    """The smallest size from HEAD_STEP x `body` up at which and above which under HEAD_SHARE of
+    the chars (spaces aside) are set, for `heading_level`; 1.25 x the body when there is none."""
+    sizes = Counter()
+    for ln in all_lines:
+        if ln.size > 0:
+            sizes[ln.size] += sum(1 for ch in ln.text if not ch.isspace())
+    most, seen, floor = HEAD_SHARE * sum(sizes.values()), 0, body * 1.25
+    for size in sorted(sizes, reverse=True):
+        seen += sizes[size]
+        if size < body * HEAD_STEP or seen > most:
+            break
+        floor = min(floor, size)
+    return floor
+
+
+def heading_level(text: str, size: float, body: float, floor: Optional[float] = None) -> Optional[int]:
+    """3 at 1.5 x the body size, 4 at 1.25 x, and 4 for a line of up to HEAD_CHARS chars from
+    `floor` (`heading_floor`) up; none for a long line or one with under 2 letters."""
     if body <= 0 or size <= 0 or len(text) > 120 or sum(c.isalpha() for c in text) < 2:
         return None
     if size >= body * 1.5:
         return 3
-    if size >= body * 1.25:
+    if size >= body * 1.25 or (floor is not None and size >= floor and len(text) <= HEAD_CHARS):
         return 4
     return None
 
@@ -1315,6 +1368,20 @@ def _key(text: str) -> str:
     page number inside a header); a line of numbers alone stays as it is."""
     keyed = _DIGITS.sub("#", text)
     return keyed if sum(ch.isalpha() for ch in keyed) >= 3 else text
+
+
+def marked_running(pages, boxes, headers, footers):
+    """Add to `headers` and `footers` the /Artifact lines of tagged pages (`pages`, each page's lines
+    in its `boxes` view), each text once a document by its `_key`: a line in the upper half of its
+    page is a header. Page-number lines and the texts already there are left out."""
+    seen = {_key(_normal(t)) for t in headers + footers}
+    for page, box in zip(pages, boxes):
+        for ln in sorted(page, key=lambda ln: -ln.box[1]):
+            text = _normal(ln.text)
+            if not text or ln.vertical or _PAGE_NUMBER.fullmatch(text) or _key(text) in seen:
+                continue
+            seen.add(_key(text))
+            (headers if 2 * ln.box[1] > box[1] + box[3] else footers).append(ln.text)
 
 
 def running(pages, boxes) -> Tuple[List[str], List[str], List[set]]:

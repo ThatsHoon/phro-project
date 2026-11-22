@@ -166,6 +166,22 @@ def test_ended_line_ends_paragraph():
     assert _paras("• Bullet one", "• Bullet two") == ["• Bullet one", "• Bullet two"]
 
 
+def test_piece_that_goes_on_along_the_line_stays_in_its_paragraph():
+    from dataclasses import replace
+    fr = [frag(t, 72, 700 - 14 * k) for k, t in zip(
+        (0, 1, 1, 2), ["A long first line of the paragraph that fills the column up", "risk of pregnancies.2",
+                       "x", "and the last line of it."])]
+    lns = [L.lines(numbered([f]))[0] for f in fr]
+    for text, dy in ((",3 It is, therefore, important to know more than that", 0.007),
+                     ("1) to our stockholders over the same period of time", -0.007)):
+        on = replace(lns[2], text=text, runs=[(text, "")],
+                     box=(lns[1].box[2] - 0.1, lns[1].box[1] - dy, 426.0, lns[1].box[3] - dy))
+        got = [para_text(p) for p in L.paragraphs([lns[0], lns[1], on, lns[3]], L.SpacingModel())]
+        assert len(got) == 1 and "pregnancies.2" + text[:2] in got[0], got
+    far = replace(lns[2], box=(lns[1].box[2] + 60, lns[1].box[1], 400.0, lns[1].box[3]))
+    assert len(L.paragraphs([lns[0], lns[1], far, lns[3]], L.SpacingModel())) > 1
+
+
 def test_toc_entry_ends_paragraph():
     # evenly spaced table-of-contents entries: each one ends at its leader and page label
     assert _paras("Introduction ........ 1", "Scope · · · ··········· 12",
@@ -277,6 +293,14 @@ def test_heading_by_size():
     assert L.heading_level("Chapter one", 12, 10) is None
     assert L.heading_level("x" * 130, 15, 10) is None
     assert L.heading_level("1.", 15, 10) is None
+    lns = L.lines(numbered([frag("Body text of the page that goes on and on " * 3, 72, 700 - 14 * k) for k in range(60)]
+                           + [frag("Section two of the book", 72, 760, size=14)]))
+    floor = L.heading_floor(lns, L.body_size(lns))
+    assert floor == 14 and L.heading_level("Section two of the book", 14, 12, floor) == 4, floor
+    assert L.heading_level("x" * 61, 14, 12, floor) is None and L.heading_level("Section", 13, 12, floor) is None
+    many = L.lines(numbered([frag("Body text of the page that goes on and on " * 3, 72, 700 - 14 * k) for k in range(60)]
+                            + [frag("A quoted part set a little larger " * 3, 300, 700 - 16 * k, size=14) for k in range(9)]))
+    assert L.heading_floor(many, 12) == 15, L.heading_floor(many, 12)
 
 
 def test_body_size():

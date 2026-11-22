@@ -87,6 +87,33 @@ def test_page_the_tree_does_not_cover():
     assert "Running head" in text and "Plain unmarked line number 5" in text, text
 
 
+def _artifact_pages(pages):
+    tree = struct_tree({601: ("P", 600, 0)}, [601])
+    tree[699] = {"Nums": [k for n in range(len(pages)) for k in (n, [Ref(601)])]}
+    return simple_pdf(pages, catalog={"StructTreeRoot": Ref(600), "MarkInfo": {"Marked": True}},
+                      page_extra=[{"StructParents": n} for n in range(len(pages))], extra_objects=tree)
+
+
+def test_artifact_text_is_said_once_and_hidden_text_is_counted():
+    def page(n):
+        return (b"/Artifact BMC " + text_ops("Confidential - plan", y=770) + b" " + text_ops("Page %d" % n, y=30)
+                + b" " + text_ops("Regional office", y=44) + b" " + text_ops("Userid: CPM", x=-500, y=400) + b" EMC "
+                + b"/P << /MCID 0 >> BDC " + text_ops("Body of page %d that is the text of it." % n, y=600) + b" EMC")
+    text, ctx, _doc = md(_artifact_pages([page(1), page(2)]))
+    assert text.count("Header: Confidential - plan") == 1 and text.count("Footer: Regional office") == 1, text
+    assert text.count("Confidential") == 1 and "Page 1" not in lines(text) and "Userid" not in text, text
+    assert "(2 hidden places left out)" in text, text
+    text, ctx, _doc = md(_artifact_pages([page(1), page(2)]), hidden=True)
+    assert text.count("Userid: CPM") == 2, text
+
+
+def test_page_whose_text_is_mostly_artifact_reads_by_layout():
+    ops = (b"/H1 << /MCID 0 >> BDC " + text_ops("Title", y=740) + b" EMC /Artifact BMC "
+           + b" ".join(text_ops("Body line number %d of the page" % k, y=700 - 14 * k) for k in range(20)) + b" EMC")
+    text, _ctx, _doc = md(_artifact_pages([ops]))
+    assert "Body line number 19 of the page" in text and "Header:" not in text, text
+
+
 def test_unmarked_lines_keep_their_place():
     # on a tagged page, lines in no marked content go among the blocks by their top, in their own order
     text = ["First tagged paragraph of the page body", "Second tagged paragraph of the page body",
@@ -217,6 +244,35 @@ def test_tree_walk_bounded():
         assert tags.page(0) == {} and len(tags.elements) == 0, (tags.page(0), len(tags.elements))
     finally:
         tagged.STRUCT_DEPTH = saved
+
+
+def test_parent_tree_read_once_and_bounded():
+    import time
+    tree = struct_tree({601: ("P", 600, 0)}, [601])
+    tree[699] = {"Kids": [Ref(698)]}
+    tree[698] = {"Kids": [Ref(697), Ref(696)]}
+    tree[697] = {"Limits": [0, 0], "Nums": [0, [Ref(601)]]}
+    tree[696] = {"Limits": [1, 1], "Nums": [1, [Ref(601)]]}
+    extra = {"StructParents": 1}
+    tags = tagged.read(PDFFile(simple_pdf([b""], catalog={"StructTreeRoot": Ref(600), "MarkInfo": {"Marked": True}},
+                                          page_extra=extra, extra_objects=tree)))
+    assert list(tags.page(0)) == [0], tags.page(0)
+    tree[699] = {"Kids": [Ref(699)] * 3000 + [Ref(697)]}
+    tags = tagged.read(PDFFile(simple_pdf([b""] * 3, catalog={"StructTreeRoot": Ref(600),
+                                                             "MarkInfo": {"Marked": True}},
+                                          page_extra={"StructParents": 0}, extra_objects=tree)))
+    t = time.perf_counter()
+    got = [list(tags.page(i)) for i in range(3)]
+    assert time.perf_counter() - t < 1 and got == [[0]] * 3, (time.perf_counter() - t, got)
+    saved = tagged.TREE_ITEMS
+    tagged.TREE_ITEMS = 2000
+    try:
+        tags = tagged.read(PDFFile(simple_pdf([b""], catalog={"StructTreeRoot": Ref(600),
+                                                             "MarkInfo": {"Marked": True}},
+                                              page_extra={"StructParents": 0}, extra_objects=tree)))
+        assert tags.page(0) == {}, tags.page(0)
+    finally:
+        tagged.TREE_ITEMS = saved
 
 
 def main():

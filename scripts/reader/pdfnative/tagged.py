@@ -23,11 +23,12 @@ holds what lies in it outside a label and a body. An id with no block ancestor i
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .annotations import text_string
+from .annotations import _key, text_string
 from .objects import PDFName, PDFRef
 from .structure import PDFFile
 
-TREE_NODES = 10_000      # parent tree nodes one lookup visits
+TREE_NODES = 10_000      # parent tree nodes one file's tree is read from
+TREE_ITEMS = 1_000_000   # /Kids entries and /Nums pairs one file's parent tree is read from
 STRUCT_DEPTH = 100       # elements from a marked-content id up to the root
 PAGE_IDS = 100_000       # marked-content ids read for one page
 ROW_CELLS = 10_000       # cells read in one table row
@@ -71,6 +72,7 @@ class Tags:
         self._direct: Dict[int, int] = {}
         self._pages: Dict[int, Dict[int, Tuple[int, int]]] = {}
         self._root_places: Optional[dict] = None
+        self._numbers: Optional[dict] = None
 
     # -- elements
 
@@ -197,29 +199,34 @@ class Tags:
         return out
 
     def _lookup(self, number: int):
-        """The parent tree's value for `number`: a number tree walk (7.9.7) down the /Kids whose
-        /Limits hold it, at most TREE_NODES nodes."""
-        pdf = self.pdf
-        stack, seen = [self.tree], 0
-        while stack and seen < TREE_NODES:
-            node = pdf.resolve(stack.pop())
-            seen += 1
-            if not isinstance(node, dict):
-                continue
-            nums = pdf.resolve(node.get("Nums"))
-            if isinstance(nums, list):
-                for i in range(0, len(nums) - 1, 2):
-                    if pdf.resolve(nums[i]) == number:
-                        return nums[i + 1]
-            kids = pdf.resolve(node.get("Kids"))
-            for kid in reversed(kids[:TREE_NODES] if isinstance(kids, list) else ()):
-                below = pdf.resolve(kid)
-                limits = pdf.resolve(below.get("Limits")) if isinstance(below, dict) else None
-                ends = [pdf.resolve(v) for v in limits] if isinstance(limits, list) and len(limits) == 2 else []
-                if ends and all(isinstance(v, int) for v in ends) and not ends[0] <= number <= ends[1]:
+        """The parent tree's value for `number`. The number tree (7.9.7) is read once a file, each
+        node once, from at most TREE_NODES nodes and TREE_ITEMS entries; a tree past either gives
+        no value, so its pages read by their layout."""
+        if self._numbers is None:
+            pdf, out = self.pdf, {}
+            stack, seen, left = [self.tree], set(), TREE_ITEMS
+            while stack and left >= 0:
+                ref = stack.pop()
+                if _key(ref) in seen:
                     continue
-                stack.append(kid)
-        return None
+                seen.add(_key(ref))
+                node = pdf.resolve(ref)
+                if len(seen) > TREE_NODES:
+                    left = -1
+                if not isinstance(node, dict) or left < 0:
+                    continue
+                nums, kids = pdf.resolve(node.get("Nums")), pdf.resolve(node.get("Kids"))
+                nums, kids = nums if isinstance(nums, list) else [], kids if isinstance(kids, list) else []
+                left -= len(nums) // 2 + len(kids)
+                if left < 0:
+                    continue
+                for i in range(0, len(nums) - 1, 2):
+                    at = nums[i] if isinstance(nums[i], int) else pdf.resolve(nums[i])
+                    if isinstance(at, int) and not isinstance(at, bool):
+                        out.setdefault(at, nums[i + 1])
+                stack.extend(kids)
+            self._numbers = out if left >= 0 else {}
+        return self._numbers.get(number)
 
     # -- queries
 

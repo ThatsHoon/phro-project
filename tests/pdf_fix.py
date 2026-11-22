@@ -729,7 +729,7 @@ def tagged_pdf(marked=True, ruled=False):
                       extra_objects={**tree, 30: picture})
 
 
-TAGGED_MD = ["## Page 1", "### Annual report", "Body text that runs over two lines.", "1. First item",
+TAGGED_MD = ["Header: Running head of the report", "## Page 1", "### Annual report", "Body text that runs over two lines.", "1. First item",
              "2. Second item", "|Name|Score|", "|Kim|90|", "![A bar chart of scores](assets/img-001.png)",
              "Note text", "x minus y"]
 
