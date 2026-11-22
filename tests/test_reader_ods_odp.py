@@ -163,6 +163,29 @@ def test_repeated_empty_merges_and_formulas_are_budgeted():
     assert time.monotonic() - t0 < 12, (time.monotonic() - t0, ctx.skipped)
 
 
+def test_repeated_formula_text_is_budgeted():
+    long = "of:=" + "+".join(["[.A1]"] * 200)
+    for value in ('office:value-type="string" office:string-value=""', 'office:value-type="float" office:value="7"'):
+        form = c("7" if "float" in value else "",
+                 f'table:number-columns-repeated="1000" table:formula="{long}" {value}')
+        xml = sheet("S", [row(c("x")), row(form, extra='table:number-rows-repeated="100000"')]) + \
+            sheet("T", [row(c("", 'office:value-type="float" office:value="2" table:formula="of:=[.B1]+1"'))])
+        t0 = time.monotonic()
+        doc, ctx = parse(ods(xml))
+        out = markdown.render(doc, tmp() / "a")
+        assert time.monotonic() - t0 < 25 and ctx.skipped["formula"] > 100_000, (time.monotonic() - t0, ctx.skipped)
+        assert ("B1+1" in out) == ("float" not in value), out[-300:]
+    merged = c(extra='table:number-columns-spanned="2" table:formula="of:=[.A1]+1" office:value-type="string" '
+                     'office:string-value=""')
+    old = limits.BLANK_FORMULAS
+    limits.BLANK_FORMULAS = 20
+    try:
+        doc, ctx = parse(ods(sheet("S", [row(c("x")), row(merged, extra='table:number-rows-repeated="500"')])))
+    finally:
+        limits.BLANK_FORMULAS = old
+    assert ctx.skipped["formula"] == 480, ctx.skipped
+
+
 def test_value_types():
     cells = [c("", 'office:value-type="date" office:date-value="2026-01-02"'),
              c("", 'office:value-type="time" office:time-value="PT01H02M03S"'),

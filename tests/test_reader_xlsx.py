@@ -721,6 +721,7 @@ def test_hyperlink_location_is_named():
     cells = doc.blocks[0].blocks[0].rows[0]
     assert cells[0].blocks[0].inlines == [Text("go"), Text(" → Lists!A1")], cells[0].blocks
     assert cells[1].blocks[0].inlines == [Link("../a.xlsx#'My%20Sheet'!B2", [Text("jump")])], cells[1].blocks
+    assert ooxml_sheets.sheet_grid.fragment("시트 1!A(1") == "시트%201!A%281", ooxml_sheets.sheet_grid.fragment("시트 1!A(1")
     assert not ctx.skipped, ctx.skipped
     ctx = Context()
     ctx.name = "a.xlsx"

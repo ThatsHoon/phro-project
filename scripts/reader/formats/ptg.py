@@ -148,8 +148,7 @@ def put(grid, forms: list, anchored: dict, env: Env, ctx) -> None:
             pat = done[at]
         if pat is None:
             ctx.skipped["formula"] += 1
-            pat = _UNREAD
-        grid.formula(row, col, pat)
+        grid.formula(row, col, _UNREAD if pat is None else pat, pat is not None)
 
 
 def _pattern(rgce, extra, env, row, col):

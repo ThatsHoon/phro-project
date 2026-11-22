@@ -137,22 +137,27 @@ class _Sheet:
             grid.hide_rows(r0, r0 + rep - 1)
         if header:
             grid.head_rows(r0, r0 + rep - 1)
-        cells, end, state = self.cells(tr, d), min(r0 + rep, limits.SHEET_ROWS + 1), None
+        cells, end, state, budget = self.cells(tr, d), min(r0 + rep, limits.SHEET_ROWS + 1), None, grid.budget
         for r in range(r0, end) if cells else ():
-            if state != (grid.merges_cut, grid.formulas_cut):
-                state = grid.merges_cut, grid.formulas_cut
-                kept = [c for c in cells if c[4] is not None or (c[6] and not state[1])
-                        or ((c[2] > 1 or c[3] > 1) and not state[0])]
-                if state[1]:
-                    self.body.ctx.skipped["formula"] += (end - r) * sum(
-                        c[1] for c in cells if c[4] is None and c[6])
-                cells = kept
+            if state != (grid.merges_cut, grid.formulas_cut, budget.copies <= 0):
+                state = grid.merges_cut, grid.formulas_cut, budget.copies <= 0
+                gone = [c[6] and (state[1] and c[4] is None or state[2] and (rep > 1 or c[1] > 1)) for c in cells]
+                if any(gone):
+                    self.body.ctx.skipped["formula"] += (end - r) * sum(c[1] for c, g in zip(cells, gone) if g)
+                cells = [c[:6] + ("",) if g else c for c, g in zip(cells, gone)]
+                cells = [c for c in cells if c[4] is not None or c[6] or ((c[2] > 1 or c[3] > 1) and not state[0])]
                 if not cells:
                     return
             for col, crep, cs, rs, value, size, form in cells:
                 if value is not None and not grid.put_cols(r, col, col + crep - 1, value, size):
                     return
+                copied = len(form) if rep > 1 or crep > 1 else 0
                 for c in range(col, col + crep) if form else ():
+                    if budget.copies < copied:
+                        budget.copies = 0
+                        self.body.ctx.skipped["formula"] += col + crep - c
+                        break
+                    budget.copies -= copied
                     grid.formula(r, c, sheet_grid.pattern(form, r, c))
                     if grid.cut:
                         return

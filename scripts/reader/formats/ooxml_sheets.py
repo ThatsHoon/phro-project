@@ -238,7 +238,8 @@ class _Facts:
             if len(stack) >= 3 and names.get(stack[-2].tag) == "autoFilter" and names.get(stack[-3].tag) == "worksheet":
                 rng = _range(attr(stack[-2], "ref"))
                 col = _int(attr(stack[-1], "colId"))
-                if rng is not None and col is not None and col >= 0:
+                empty = tag == "filters" and not self.vals and not self.more and not _on(attr(el, "blank"))
+                if rng is not None and col is not None and col >= 0 and not empty:
                     self.crit.append((_criterion(el, sheet_grid.letters(rng[2] + col), self.vals, self.more), False))
             self.vals, self.more = [], 0
         elif tag == "autoFilter":

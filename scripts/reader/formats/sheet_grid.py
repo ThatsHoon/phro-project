@@ -244,7 +244,13 @@ def ruled(rules) -> list:
     return out
 
 
-_PLACE_SAFE = "!$&'()*+,;=:@/?"
+_PLACE_UNSAFE = re.compile(r"[\s()<>\[\]%#\\]")
+
+
+def fragment(text: str) -> str:
+    """A place in a file as a URL fragment: white space and the characters that end or break a Markdown link target
+    percent-encoded, every other one (letters of any script) as it is."""
+    return _PLACE_UNSAFE.sub(lambda m: quote(m.group()), text)
 
 
 def _leaf(url: str) -> str:
@@ -331,13 +337,14 @@ def _column_major(item):
 
 
 class Budget:
-    """Cells, characters and valueless formula cells left for a document's sheets; shared, so embedded workbooks
-    count too."""
+    """Cells, characters, valueless formula cells and characters of repeated formula text left for a document's
+    sheets; shared, so embedded workbooks count too."""
 
     def __init__(self, cells=None, chars=None):
         self.cells = self.cap_cells = limits.SHEET_CELLS if cells is None else cells
         self.chars = self.cap_chars = limits.SHEET_CHARS if chars is None else chars
         self.blank = limits.BLANK_FORMULAS
+        self.copies = limits.FORMULA_COPY_CHARS
 
 
 class _Ranges:
@@ -656,7 +663,7 @@ class Grid:
         the walk (`held`) is returned; past the character budget the rest keep their old values."""
         if url and place and self.ctx.name and _leaf(url) == self.ctx.name.casefold():
             url = None
-        target = f"{url}#{quote(place, safe=_PLACE_SAFE)}" if url and place and "#" not in url else url
+        target = f"{url}#{fragment(place)}" if url and place and "#" not in url else url
         found, cost = self.held(r1, r2, c1, c2)
         for r, c in found:
             value = self.get(r, c)
@@ -929,19 +936,21 @@ class Grid:
                 ([(f"totals row {r2 + 1}", False)] if totals else [])
         self.fact(f"Table {name} {span(r1, r2, c1, c2)}", about or [("no header row", False)])
 
-    def formula(self, row: int, col: int, pat: tuple):
-        """Keep a cell's formula pattern (from `pattern`) for the sheet's formulas paragraph. A cell that holds no
-        value (its result is empty) is charged to BLANK_FORMULAS, the document's; past them it is counted under
-        `formula` and the sheet goes on."""
+    def formula(self, row: int, col: int, pat: tuple, count: bool = True) -> bool:
+        """Keep a cell's formula pattern (from `pattern`) for the sheet's formulas paragraph; whether it was kept. A
+        cell that holds no value (its result is empty) is charged to BLANK_FORMULAS, the document's; past them it is
+        counted under `formula` (unless the caller has counted it: `count`) and the sheet goes on."""
         at = (row, col)
         if at not in self.cells and at not in self.formulas:
             if self.cut or row < 0 or col < 0 or row >= limits.SHEET_ROWS or col >= limits.SHEET_COLS:
-                return
+                return False
             if self.budget.blank <= 0:
-                self.ctx.skipped["formula"] += 1
-                return
+                if count:
+                    self.ctx.skipped["formula"] += 1
+                return False
             self.budget.blank -= 1
         self.formulas[at] = self._patterns.setdefault(pat, pat)
+        return True
 
     @property
     def formulas_cut(self) -> bool:
