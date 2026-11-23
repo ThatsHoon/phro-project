@@ -256,6 +256,35 @@ def test_formula_object():
     assert md(odt_doc(body, extra={"Object 2/content.xml": plain})) == "$$x + 1$$\n"
 
 
+def test_objects_are_read_through_the_documents_objects():
+    from reader import embedded
+    body = "".join(P(frame(f'<draw:object xlink:href="./Object {i}"/>')) for i in range(3))
+    p = odt_doc(body, extra={f"Object {i}/content.xml": chart_xml(title=f"t{i}") for i in range(3)})
+    old = embedded.MAX_OBJECTS
+    embedded.MAX_OBJECTS = 2
+    try:
+        doc, ctx = parse(p)
+    finally:
+        embedded.MAX_OBJECTS = old
+    out = markdown.render(doc, tmp() / "a")
+    assert "t0" in out and "t1" in out and "t2" not in out and ctx.skipped["object"] == 1, (out, dict(ctx.skipped))
+    assert ctx.embedded.count == 2 and ctx.embedded.spent > 0
+    old = limits.EMBED_SECONDS
+    limits.EMBED_SECONDS = 0
+    try:
+        doc, ctx = parse(p)
+    finally:
+        limits.EMBED_SECONDS = old
+    assert "t0" not in markdown.render(doc, tmp() / "b") and ctx.skipped["object"] == 3, dict(ctx.skipped)
+    old = limits.EMBED_NODES
+    limits.EMBED_NODES = 5
+    try:
+        doc, ctx = parse(p)
+    finally:
+        limits.EMBED_NODES = old
+    assert "t0" not in markdown.render(doc, tmp() / "c") and ctx.skipped["object"] == 3, dict(ctx.skipped)
+
+
 def test_charts_xmlns_math_not_formula():
     body = frame('<draw:object xlink:href="./Object 1"/>')
     xml = chart_xml()  # NS declares xmlns:math on the root, as LibreOffice charts do

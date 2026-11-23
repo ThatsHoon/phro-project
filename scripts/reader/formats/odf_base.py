@@ -5,15 +5,19 @@ Drawing shapes and connectors go to `diagram.Diagram` through `register`: keyed 
 `svg:x1`…`svg:y2`, in cm (`draw:transform` is not applied); arrowheads from the graphic style chain. An odt body that
 holds a connector is one scope: the shapes connectors glue and the connectors leave a `_Slot` in the flow, and
 `Body.place` puts the diagram at the first one that anchors it once the body is read.
+
+An object a frame names (`Object N/content.xml`) is read once, through the document's embedded.Objects: past
+MAX_OBJECTS, or once the objects have taken EMBED_SECONDS, it is not read; its tree is charged to EMBED_NODES. One
+not read, or that does not parse, is counted under object.
 """
 import collections
 import copy
 import math
 import re
 
-from .. import diagram, limits
+from .. import diagram, embedded, limits
 from ..charts import caption, kind
-from ..containers.zipx import attr, first, kids, local, parse_xml, resolve
+from ..containers.zipx import attr, charged, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
 from ..markdown import blocks_len
 from ..model import (
@@ -543,12 +547,18 @@ class Body:
             blocks = self.objects[name]
             return blocks if self.take(self.weight(blocks), chars=blocks_len(blocks)) else []
         self.objects[name] = []  # also breaks an object that refers to itself
+        objs = embedded.of(self.ctx)
+        if objs.count >= embedded.MAX_OBJECTS or objs.late():
+            self.ctx.skipped["object"] += 1
+            return []
+        objs.count += 1
         data = self.data(name, "object")
         if data:
             try:
-                self.objects[name] = self.object_blocks(parse_xml(data), d)
+                with objs.timed(), charged(objs):
+                    self.objects[name] = self.object_blocks(parse_xml(data), d)
             except ReadError as e:
-                if e.kind != "damaged":
+                if e.kind not in ("damaged", "too_large"):
                     raise
                 self.ctx.skipped["object"] += 1
         return self.objects[name]
