@@ -466,6 +466,9 @@ def test_caption_direction_grouping_and_axes():
     for flags, name in cases:
         md = run([DATA, chart_sheet(biff_chart(AB, kinds=((0x1017, struct.pack("<HHH", 0, 0, flags)),)))])
         assert f"Chart: {name}\n||A|B|" in md, (flags, md)
+    for short in (b"", bytes(2), bytes(4)):
+        md = run([DATA, chart_sheet(biff_chart(AB, kinds=((0x1017, short), (0x1017, struct.pack("<HHH", 0, 0, 1)))))])
+        assert "Chart: column+bar\n||A|B|" in md, (short, md)
     md = run([DATA, chart_sheet(biff_chart(AB, kinds=((0x101A, struct.pack("<H", 3)),)))])
     assert "Chart: 100% stacked area\n" in md, md
     titled = biff_chart(AB, title="Sales", extra=axis_title(3, "Quarter") + axis_title(2, "Units"))

@@ -122,6 +122,21 @@ def test_formulas_decoded_and_grouped():
     assert ctx.skipped["formula"] == 1, ctx.skipped
 
 
+def test_unread_valueless_formula_counted_once():
+    empty = rec(0x0006, struct.pack("<HHH", 1, 5, 15) + bytes([3, 0, 0, 0, 0, 0, 0xFF, 0xFF])
+                + struct.pack("<HIH", 0, 0, 3) + b"\x18\0\0")
+    for blank, shown in ((0, False), (5, True)):
+        old, limits.BLANK_FORMULAS = limits.BLANK_FORMULAS, blank
+        try:
+            ctx = Context()
+            secs = xls.Workbook(biff_workbook([{"name": "S", "cells": {(0, 0): "a"}, "records": [empty]}]), ctx,
+                                sheet_grid.Budget()).sections()
+        finally:
+            limits.BLANK_FORMULAS = old
+        texts = ["".join(i.text for i in b.inlines) for b in secs[0].blocks]
+        assert ctx.skipped["formula"] == 1 and ("Formulas: F2 =?" in texts) == shown, (blank, ctx.skipped, texts)
+
+
 def texts(blocks) -> list:
     """The text of each paragraph, a Hidden run's text in brackets."""
     return ["".join(i.text if isinstance(i, Text) else "[" + "".join(t.text for t in i.inlines) + "]"

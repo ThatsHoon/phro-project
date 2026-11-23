@@ -174,7 +174,7 @@ def test_repeated_formula_text_is_budgeted():
         t0 = time.monotonic()
         doc, ctx = parse(ods(xml))
         out = markdown.render(doc, tmp() / "a")
-        assert time.monotonic() - t0 < 25 and ctx.skipped["formula"] > 100_000, (time.monotonic() - t0, ctx.skipped)
+        assert time.monotonic() - t0 < 25 and ctx.skipped["formula"] == 99_999_000, (time.monotonic() - t0, ctx.skipped)
         assert ("B1+1" in out) == ("float" not in value), out[-300:]
     merged = c(extra='table:number-columns-spanned="2" table:formula="of:=[.A1]+1" office:value-type="string" '
                      'office:string-value=""')

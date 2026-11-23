@@ -553,8 +553,10 @@ def test_autofilter_range_and_criteria():
     doc, _, _ = parsed([sheet(ONE, after=after)])
     assert texts(doc.blocks[0].blocks)[-1] == "Filter A1:D41: C is Open, Pending; D > 5 and D < 9", \
         doc.blocks[0].blocks
-    doc, _, _ = parsed([sheet(ONE, after='<autoFilter ref="A1:B3"/>')])
-    assert texts(doc.blocks[0].blocks)[-1] == "Filter: A1:B3", doc.blocks[0].blocks
+    for empty in ('<autoFilter ref="A1:B3"/>', '<autoFilter ref="A1:B3"><filterColumn colId="0"><filters/>'
+                  '</filterColumn></autoFilter>'):
+        doc, _, _ = parsed([sheet(ONE, after=empty)])
+        assert texts(doc.blocks[0].blocks)[-1] == "Filter: A1:B3", (empty, doc.blocks[0].blocks)
     after = ('<autoFilter ref="A1:B3"><filterColumn colId="0"><filters blank="1"><filter val="x"/>'
              '<dateGroupItem year="2024" month="3" dateTimeGrouping="month"/>'
              '<dateGroupItem year="2025" month="1" day="9" dateTimeGrouping="day"/>'
