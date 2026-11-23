@@ -189,6 +189,13 @@ def test_joined_line_has_the_size_of_most_of_its_text():
                    box=(big.box[2] + 0.5, big.box[1], 400.0, big.box[3]), size=big.size / 2)
     got = L._whole([big, body])
     assert len(got) == 1 and got[0].size == body.size and got[0].text.startswith("23."), got
+    pieces, x = [], 72.0
+    for text, size in (("a body piece", 10.0), ("A Larger Title", 20.0), ("another piece", 10.0)):
+        pieces.append(replace(big, text=text, runs=[(text, "")], box=(x, big.box[1], x + 5 * len(text), big.box[3]),
+                              size=size))
+        x += 5 * len(text) + 0.5
+    got = L._whole(pieces)
+    assert len(got) == 1 and got[0].size == 10.0, got
 
 
 def test_toc_entry_ends_paragraph():

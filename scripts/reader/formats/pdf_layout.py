@@ -987,8 +987,9 @@ def _along(prev, ln) -> bool:
 
 def _whole(lns) -> list:
     """`lns` with each line that goes on along the one before it (`_along`) made one line with it, a space between
-    them when they are over ALONG_SPACE of the smaller one's size apart. The line has the size of the piece with the
-    most chars (a large number or initial before the body's words does not make a heading of them)."""
+    them when they are over ALONG_SPACE of the smaller one's size apart. The line has the size that holds the most of
+    its chars over all its pieces (a large number or initial before the body's words does not make a heading of
+    them)."""
     out, chain = [], []
 
     def close():
@@ -1000,8 +1001,11 @@ def _whole(lns) -> list:
                     runs.append((" ", ""))
                 runs.extend(ln.runs)
                 box = (min(box[0], ln.box[0]), min(box[1], ln.box[1]), max(box[2], ln.box[2]), max(box[3], ln.box[3]))
+            chars = Counter()
+            for ln in chain:
+                chars[ln.size] += len(ln.text)
             out[-1] = replace(first, text="".join(t for t, _ in runs), runs=runs, box=box,
-                              size=max(chain, key=lambda ln: len(ln.text)).size)
+                              size=max(chars, key=chars.get))
         chain.clear()
     reach = None
     for ln in lns:
