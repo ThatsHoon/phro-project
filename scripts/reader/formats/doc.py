@@ -36,8 +36,9 @@ fields, lists and tables work in them too. Footnotes, endnotes and comments are 
 the CP of its reference character (\\x02 for a note, \\x05 for a comment) and Txt range i its text, relative to its
 story; each becomes doc.notes[id] and the reference a NoteRef where the walk meets that very CP. A comment is
 word_fields.comment_note's, as in the docx reader, the author from GrpXstAtnOwners. Headers and footers are the
-PlcfHdd stories after the six separators, six a section, each one line of doc.headers or doc.footers. Text boxes
-(PlcftxbxTxt) follow the main text in story order; header text boxes (PlcfHdrtxbxTxt) are header lines. A story
+PlcfHdd stories after the six separators, six a section, each one line of doc.headers or doc.footers. A text box
+(PlcftxbxTxt) follows the paragraph of its shape's anchor (`drawn`), hidden as the anchor's run, and one no anchor
+names (a group member's) the main text, in story order; header text boxes (PlcfHdrtxbxTxt) are header lines. A story
 with text (ccp > 0) whose PLCs hold no entry, left out or empty, is counted once under its kind.
 
 Pictures are doc_pictures.py's, read through officeart.py. An inline picture is a \\x01 with fSpec whose PicLocation
@@ -332,6 +333,7 @@ class _Reader:
         self.slotted = False  # whether the main story holds a _Slot
         self.rmarks = None    # SttbfRMark's names, once read
         self.previewed = set()
+        self.textboxes = {}  # {lid: blocks} of the main story's text boxes not yet placed at their anchors
 
     # ---- streams
     def stream(self, name) -> bytes:
@@ -410,7 +412,7 @@ class _Reader:
         self.props()
         self.notes()
         self.headers()
-        boxes = self.boxes("textbox", _TXBX, "block")
+        boxes = self.textboxes = self.boxes("textbox", _TXBX, "block")
         main = []
         with self.ctx.guard("document"):
             main = self.story("text")
@@ -1108,7 +1110,8 @@ class _Reader:
     def drawn(self, st, cp):
         """A floating object: a \\x08 with fSpec in the main story, the pictures of the shape its FSPA in PlcSpaMom
         names (doc_pictures.Pictures.floating), each read under guard("image"), then a _Slot when a connector rule
-        names that shape. MS-DOC gives the stories other than the main and header ones no PlcfSpa, so a \\x08 there
+        names that shape, else the shape's text box, hidden as the anchor's run (as the docx reader places
+        w:txbxContent). MS-DOC gives the stories other than the main and header ones no PlcfSpa, so a \\x08 there
         is not resolved, and a header's is not read. A shape whose own text box placed an object whole (boxes, read
         first) draws nothing: its picture is that object's preview, which the object stands for."""
         if not st.run.special or st.name != "text" or not self.live(st):
@@ -1124,6 +1127,12 @@ class _Reader:
         if spid is not None and spid in self.linked():
             st.extras.append(_Slot(spid))
             self.slotted = True
+        elif spid in self.textboxes:
+            hidden = "deleted" if st.run.deleted else "hidden" if st.run.vanish else ""
+            for b in self.textboxes.pop(spid):
+                if hidden and b.hidden != "deleted":
+                    b.hidden = hidden
+                st.extras.append(b)
 
     def linked(self) -> set:
         """The spids the main drawing's connector rules name, 0 (no shape) left out; read once, with self.glue."""

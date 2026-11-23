@@ -302,14 +302,27 @@ def test_textbox_node_not_repeated():
     assert md(q) == out.removeprefix("Header: 가위\n\n"), md(q)
 
 
+def test_textbox_at_its_anchor():
+    """A text box whose shape is anchored in the main text follows the anchor's paragraph, hidden as the anchor's run,
+    as the docx reader places w:txbxContent (generated-doc-f5e8d72df5: the chart its box holds reads before the next
+    paragraph); a text box no anchor names follows the main text."""
+    p = drawn_doc("본문\x08\r다음\r", [1], rules=(), textboxes=["상자\r", "떠돌이\r"])
+    assert md(p) == "본문\n\n상자\n\n다음\n\n떠돌이\n", md(p)
+    q = story_doc("본문\x08\r다음\r", fc={40: doc_spa([(2, 1)]), 50: dgg_with_bstore([], SHAPES, solver=b"")},
+                  chpx=[(2, 3, sp(SPEC) + sp(VANISH))], textboxes=["상자\r"])
+    d, ctx = parse(q)
+    assert d.blocks == [Para([Text("본문")]), Para([Text("상자")], hidden="hidden"), Para([Text("다음")])], d.blocks
+    assert md(q) == "(1 hidden places left out)\n\n본문\n\n다음\n", md(q)
+
+
 def test_unconnected_textbox_unchanged():
-    # a third text box, its shape anchored but named by no rule, stays after the main text, as today
+    # a third text box, its shape anchored but named by no rule, is no node: it follows its anchor's paragraph
     shapes = SHAPES[:2] + [oa_shape(3, inst=TEXT_BOX), oa_shape(4, inst=CONNECTOR, props=END_ARROW)]
     p = drawn_doc("본문\x08\x08\x08\x08\r다음\r", [1, 2, 3, 4], shapes, [(1, 2, 4)],
                   textboxes=["가\r", "나\r", "다\r"])
     d, ctx = parse(p)
     assert mermaid(d) == FLOW and not ctx.skipped, ctx.skipped
-    assert md(p) == f"본문\n\n```mermaid\n{FLOW}\n```\n\n다음\n\n다\n", md(p)
+    assert md(p) == f"본문\n\n```mermaid\n{FLOW}\n```\n\n다\n\n다음\n", md(p)
 
 
 def test_doc_connector_label():
@@ -321,10 +334,10 @@ def test_doc_connector_label():
 
 
 def test_doc_without_solver_unchanged():
-    # no SolverContainer: the DggInfo bytes are the fixture's old ones and the text boxes follow the main text
+    # no SolverContainer: the DggInfo bytes are the fixture's old ones and the text boxes follow their anchors
     assert dgg_with_bstore([], SHAPES) == dgg_with_bstore([], SHAPES, solver=b"")
     p = drawn_doc("본문\x08\x08\x08\r다음\r", [1, 2, 3], rules=(), textboxes=["가\r", "나\r"])
-    assert md(p) == "본문\n\n다음\n\n가\n\n나\n", md(p)
+    assert md(p) == "본문\n\n가\n\n나\n\n다음\n", md(p)
 
 
 def test_doc_rule_missing_spid():
@@ -333,7 +346,7 @@ def test_doc_rule_missing_spid():
     p = drawn_doc("본문\x08\x08\x08\r다음\r", [1, 2, 3], rules=[(1, 9, 3)], textboxes=["가\r", "나\r"])
     d, ctx = parse(p)
     assert ctx.skipped == {"connector_loose": 1}, ctx.skipped
-    assert d.blocks == [Para([Text("본문")]), Para([Text("가")]), Para([Text("다음")]), Para([Text("나")])], d.blocks
+    assert d.blocks == [Para([Text("본문")]), Para([Text("가")]), Para([Text("나")]), Para([Text("다음")])], d.blocks
     # spid 0 is no shape: a rule naming it there makes no slot
     q = drawn_doc("본문\x08\x08\r다음\r", [1, 3], rules=[(1, 0, 3), (0, 0, 0)], textboxes=["가\r", "나\r"])
     d, ctx = parse(q)
