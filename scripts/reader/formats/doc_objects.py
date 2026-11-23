@@ -12,9 +12,9 @@ an equation that does not convert and a stream that cannot be read (missing, a b
 ReadError's other kinds end the document) keep the preview; so does an equation converted in part (stopped early,
 symbols left out), after its TeX. What is not read is counted where the object is shown:
 a chart under chart, the rest under object (another object only when its preview is missing or not viewable: Assets'
-VIEWABLE kinds, a BMP when bmp_to_png reads it). An object in vanished or deleted text is hidden as its text is and
-never counted (a workbook's tables are Hidden copies in vanished text, which --hidden shows; in tracked-deleted text
-they are dropped).
+VIEWABLE kinds, a BMP when bmp_to_png reads it). An object in vanished or deleted text is hidden as its text is (a
+workbook's tables are copies hidden as the text, which --hidden shows) and what of it is not read is counted all the
+same, as the docx and RTF readers count it.
 """
 import dataclasses
 
@@ -103,27 +103,23 @@ class Objects:
         if obj is None:
             return
         kind, tex, lost = obj
-        shown = not (st.run.vanish or st.run.deleted)
         if kind == "table":
             with r.ctx.guard("chart"):
-                if st.run.deleted:  # tracked-deleted text stays dropped
-                    return
-                if self.tables(st, tex, "" if shown else "hidden"):
+                if self.tables(st, tex, "deleted" if st.run.deleted else "hidden" if st.run.vanish else ""):
                     self.whole += 1
                 else:
-                    # past CHART_TOTAL: as a workbook that gave no table, the preview shows and a shown one is counted
+                    # past CHART_TOTAL: as a workbook that gave no table, the preview shows and the chart is counted
                     preview = self.preview(at)
                     if preview is not None:
                         r.put_image(st, preview)
-                    if shown:
-                        r.ctx.skipped["chart"] += 1
+                    r.ctx.skipped["chart"] += 1
             return
         with r.ctx.guard("chart" if kind == "chart" else "object"):
             if kind == "equation":
                 m = Math(tex)
                 r.add(st, m)
                 st.eqs.append(m)
-                if shown and "depth" in lost:
+                if "depth" in lost:
                     r.deep()
                 if lost <= {"depth"}:
                     self.whole += 1
@@ -131,8 +127,6 @@ class Objects:
             preview = self.preview(at)
             if preview is not None:
                 r.put_image(st, preview)
-            if not shown:
-                return
             if kind == "chart":
                 r.ctx.skipped["chart"] += 1
             elif kind != "other" or preview is None or not self.viewable(at, preview):
@@ -143,12 +137,12 @@ class Objects:
         goes (st.extras): a Markdown table is a block and cannot sit in the middle of a line of text, and doc pictures
         follow the same rule (test_doc_text_order pins it). Each placement is charged, copies counted, against
         CHART_TOTAL; past it none of the placement's tables is placed (False) and the caller shows the preview and
-        counts the chart, as for a workbook that gave no table. `hidden` marks the tables placed in vanished text."""
+        counts the chart, as for a workbook that gave no table. `hidden` marks the tables placed in vanished or
+        deleted text."""
         cells = sum(len(row) for t in tables for row in t.rows)
         self.chart_cells += cells
         if self.chart_cells > limits.CHART_TOTAL:
             return False
-        # in vanished text the tables are Hidden copies, which --hidden shows
         st.extras.extend(dataclasses.replace(t, hidden=hidden) if hidden else t for t in tables)
         return True
 

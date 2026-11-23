@@ -213,8 +213,10 @@ def test_equation_alone_is_display():
 
 
 def test_object_in_hidden_text():
-    """An object in vanished or deleted text is hidden as its text is and never counted: an equation stays inline
-    Math in its Hidden (even alone in its paragraph), a preview is a hidden Image."""
+    """An object in vanished or deleted text is hidden as its text is: an equation stays inline Math in its Hidden
+    (even alone in its paragraph), a preview is a hidden Image. One that cannot be read is counted as anywhere else,
+    as the docx and RTF readers count it: the hidden count says what the view leaves out, this one what was not
+    read."""
     eq = {1: {"Equation Native": eq_native(FRAC)}}
     for props, kind in ((sp(VANISH), "hidden"), (sp(DELETED), "deleted")):
         d, ctx = parse(embed_doc(eq, text="a" + EMBED + "\r", preview=PNG_PREVIEW, props=props))
@@ -222,12 +224,13 @@ def test_object_in_hidden_text():
         d, ctx = parse(embed_doc(eq, preview=PNG_PREVIEW, props=props))
         assert d.blocks == [Para([Hidden([Math(r"\frac{a}{b}")], kind)])] and not ctx.skipped, d.blocks
         # a chart, a failed equation, another object with a preview that is not viewable, a missing storage
-        for objs, preview in (({1: {"Workbook": WORKBOOK}}, PNG_PREVIEW),
-                              ({1: {"Equation Native": b"bad"}}, PNG_PREVIEW),
-                              ({1: {"\x01Ole10Native": bytes(8)}}, EMF_PREVIEW), ({2: {"x": b"x"}}, None)):
+        for objs, preview, lost in (({1: {"Workbook": WORKBOOK}}, PNG_PREVIEW, "chart"),
+                                    ({1: {"Equation Native": b"bad"}}, PNG_PREVIEW, "object"),
+                                    ({1: {"\x01Ole10Native": bytes(8)}}, EMF_PREVIEW, "object"),
+                                    ({2: {"x": b"x"}}, None, "object")):
             d, ctx = parse(embed_doc(objs, text="a" + EMBED + "\r", preview=preview, props=props))
             pic = [Image(EMF if preview is EMF_PREVIEW else PNG, hidden=kind, codepage="cp1252")] if preview else []
-            assert d.blocks == [Para([Text("a")])] + pic and not ctx.skipped, (objs, d.blocks, ctx.skipped)
+            assert d.blocks == [Para([Text("a")])] + pic and ctx.skipped == {lost: 1}, (objs, d.blocks, ctx.skipped)
     p = embed_doc(eq, text="a" + EMBED + "\r", props=sp(VANISH))
     assert md(p) == "(1 hidden places left out)\n\na\n", md(p)
     assert md(p, hidden=True) == "a(hidden: $\\frac{a}{b}$)\n", md(p, hidden=True)
@@ -411,14 +414,14 @@ def test_partial_equation_kept_and_counted():
     d, ctx = parse(p)
     assert d.blocks == [Equation("a"), Image(PNG, codepage="cp1252")] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)
     assert md(p) == "(could not read: 1 embedded object)\n\n$$a$$\n\n![](assets/img-001.png)\n", md(p)
-    # beside text: inline Math, the preview after the paragraph; hidden, both hidden and nothing counted
+    # beside text: inline Math, the preview after the paragraph; hidden, both hidden and the loss still counted
     d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}, text="z" + EMBED + "\r",
                              preview=PNG_PREVIEW))
     assert d.blocks == [Para([Text("z"), Math("a")]), Image(PNG, codepage="cp1252")] and ctx.skipped == {"object": 1}, d.blocks
     d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}, text="z" + EMBED + "\r",
                              preview=PNG_PREVIEW, props=sp(VANISH)))
     assert d.blocks == [Para([Text("z"), Hidden([Math("a")], "hidden")]), Image(PNG, hidden="hidden", codepage="cp1252")], d.blocks
-    assert not ctx.skipped, ctx.skipped
+    assert ctx.skipped == {"object": 1}, ctx.skipped
     # no preview: the partial equation alone, still counted once
     d, ctx = parse(embed_doc({1: {"Equation Native": eq_native(mtef_v5(body))}}))
     assert d.blocks == [Equation("a")] and ctx.skipped == {"object": 1}, (d.blocks, ctx.skipped)

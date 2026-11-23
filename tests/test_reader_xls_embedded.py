@@ -346,20 +346,17 @@ def test_doc_workbook_past_chart_total_shows_preview():
 
 
 def test_doc_workbook_in_vanished_text_is_hidden():
-    # vanished text goes through the Hidden path, so --hidden shows the table; tracked-deleted text stays dropped
+    # vanished or tracked-deleted text goes through the Hidden path, so --hidden shows the table, as docx and RTF do
     obj = object_streams(excel_object([GRID], b"Excel.Sheet.8"))
     text = "a" + dobj.EMBED + "\r"
-    p = dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW, props=dobj.sp(dobj.VANISH))
-    shown = dobj.md(p, hidden=True)
-    assert "1|2\n-|-\n3|4" in shown, shown
-    plain = dobj.md(p)
-    assert "\n1|2\n" not in plain and "hidden places left out" in plain, plain
-    d, ctx = dobj.parse(p)
-    assert not ctx.skipped, ctx.skipped
-    p = dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW, props=dobj.sp(dobj.DELETED))
-    d, ctx = dobj.parse(p)
-    assert not any(isinstance(b, Table) for b in d.blocks) and not ctx.skipped, (d.blocks, ctx.skipped)
-    assert "\n1|2\n" not in dobj.md(p, hidden=True), dobj.md(p, hidden=True)
+    for props, kind in ((dobj.sp(dobj.VANISH), "hidden"), (dobj.sp(dobj.DELETED), "deleted")):
+        p = dobj.embed_doc({1: obj}, text=text, preview=dobj.PNG_PREVIEW, props=props)
+        shown = dobj.md(p, hidden=True)
+        assert "1|2\n-|-\n3|4" in shown, shown
+        plain = dobj.md(p)
+        assert "\n1|2\n" not in plain and "hidden places left out" in plain, plain
+        d, ctx = dobj.parse(p)
+        assert [b.hidden for b in d.blocks if isinstance(b, Table)] == [kind] and not ctx.skipped, (d.blocks, ctx.skipped)
 
 
 def test_ole_blocks_share_budget():
