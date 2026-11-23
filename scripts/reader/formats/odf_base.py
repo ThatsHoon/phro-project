@@ -294,6 +294,23 @@ def _chart_props(root, name) -> dict:
     return {}
 
 
+class _Folder:
+    """The members under `prefix` of package `pkg`, as the package of the OpenDocument object that folder holds: its
+    content.xml, styles.xml and pictures, its links resolved inside it."""
+
+    def __init__(self, pkg, prefix):
+        self.pkg, self.prefix = pkg, prefix
+
+    def has(self, name) -> bool:
+        return self.pkg.has(self.prefix + name)
+
+    def read(self, name) -> bytes:
+        return self.pkg.read(self.prefix + name)
+
+    def xml(self, name):
+        return self.pkg.xml(self.prefix + name)
+
+
 class Body:
     """Walks ODF text content into model blocks and inlines. Task 10 reuses it for cells and shapes."""
 
@@ -532,6 +549,11 @@ class Body:
                 self.frame(k, d + 1)
 
     def obj(self, el, d):
+        """The blocks of a draw:object or draw:object-ole, read once a target. A folder of the package that holds a
+        content.xml is an OpenDocument object: a formula, a chart, or a text or presentation read whole as a document
+        (embedded.document) from that folder (`_Folder`). A member file is another application's object, read by
+        embedded.read: its equation, its tables or its document; a chart left unread is counted under chart, anything
+        else under object, and the frame then shows its replacement picture."""
         href = attr(el, "href")
         if not href:
             for c in el:
@@ -540,30 +562,52 @@ class Body:
             return []
         base = self.safe(href)
         name = base + "/content.xml" if base else None
-        if name is None or not self.pkg.has(name):
+        if name is None or not (self.pkg.has(name) or self.pkg.has(base)):
             self.ctx.skipped["object"] += 1
             return []
-        if name in self.objects:  # a reused object costs what it expands to
-            blocks = self.objects[name]
+        if base in self.objects:  # a reused object costs what it expands to
+            blocks = self.objects[base]
             return blocks if self.take(self.weight(blocks), chars=blocks_len(blocks)) else []
-        self.objects[name] = []  # also breaks an object that refers to itself
+        self.objects[base] = []  # also breaks an object that refers to itself
         objs = embedded.of(self.ctx)
         if objs.count >= embedded.MAX_OBJECTS or objs.late():
             self.ctx.skipped["object"] += 1
             return []
         objs.count += 1
+        if not self.pkg.has(name):
+            self.objects[base] = self.foreign(base)
+            return self.objects[base]
         data = self.data(name, "object")
         if data:
             try:
                 with objs.timed(), charged(objs):
-                    self.objects[name] = self.object_blocks(parse_xml(data), d)
+                    self.objects[base] = self.object_blocks(parse_xml(data), d, base)
             except ReadError as e:
                 if e.kind not in ("damaged", "too_large"):
                     raise
                 self.ctx.skipped["object"] += 1
-        return self.objects[name]
+        return self.objects[base]
 
-    def object_blocks(self, root, d):
+    def foreign(self, name) -> list:
+        """The blocks of member `name`, another application's object (embedded.read)."""
+        data = self.data(name, "object")
+        objs = embedded.of(self.ctx)
+        got = embedded.read(data, self.ctx, objs.budget()) if data else None
+        kind = got[0] if got else ""
+        if kind == "equation":
+            if got[2]:
+                self.ctx.skipped["depth" if got[2] <= {"depth"} else "object"] += 1
+            return [Equation(got[1])]
+        placed = objs.place(got) if kind in ("table", "document") else None
+        if placed is not None:
+            return placed
+        if data:
+            self.ctx.skipped["chart" if kind in ("chart", "table") else "object"] += 1
+        return []
+
+    def object_blocks(self, root, d, folder=None):
+        """The blocks of an OpenDocument object whose content root is `root`: a formula, a chart, or (with the
+        package `folder` that holds it) a text or presentation read whole."""
         if local(root.tag) == "math":
             tex = ""
             for a in root.iter():
@@ -576,6 +620,13 @@ class Body:
             for c in body:
                 if local(c.tag) == "chart":
                     return self.chart(c, d, root)
+                if local(c.tag) in ("text", "presentation") and folder is not None:
+                    from . import odf
+                    what = "OpenDocument text" if local(c.tag) == "text" else "OpenDocument presentation"
+                    view = _Folder(self.pkg, folder + "/")
+                    got = embedded.document(lambda own: odf.read_package(view, own), self.ctx, what)
+                    if got is not None:
+                        return got[1]
                 break
         self.ctx.skipped["object"] += 1
         return []

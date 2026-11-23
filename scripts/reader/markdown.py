@@ -70,6 +70,7 @@ LOST = (
     (("smartart",), "SmartArt diagram", "SmartArt diagrams"),
     (("smartart_cut",), "SmartArt diagram cut short", "SmartArt diagrams cut short"),
     (("object",), "embedded object", "embedded objects"),
+    (("object_cut",), "embedded object cut short", "embedded objects cut short"),
     (("chunk",), "imported part", "imported parts"),
     (("symbol",), "symbol character", "symbol characters"),
     (("properties",), "document properties part", "document properties parts"),

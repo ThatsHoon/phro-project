@@ -736,7 +736,7 @@ class _Sheets:
 
     def _embedded(self, rels) -> list:
         """The sheet's embedded objects (its oleObject and package relationships, in id order), by embedded.Parts: an
-        equation or tables after the sheet's drawings. One that is not read is counted under object, a chart left
+        equation, tables or a document after the sheet's drawings. One that is not read is counted under object, a chart left
         unread under chart; the sheet's legacy drawing holds its preview, which is not read."""
         out = []
         for rid in sorted(rels, key=lambda r: (len(r), r)):
@@ -745,7 +745,7 @@ class _Sheets:
                 continue
             got = self.objects.rel(rel)
             kind = got[0] if got else ""
-            tables = self.objects.place(got) if kind == "table" else None
+            tables = self.objects.place(got) if kind in ("table", "document") else None
             if tables is not None:
                 out.extend(tables)
             elif kind == "equation":

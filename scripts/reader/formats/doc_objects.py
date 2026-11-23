@@ -103,6 +103,12 @@ class Objects:
         if obj is None:
             return
         kind, tex, lost = obj
+        if kind == "document":
+            with r.ctx.guard("object"):
+                hidden = "deleted" if st.run.deleted else "hidden" if st.run.vanish else ""
+                st.extras.extend(dataclasses.replace(b, hidden=hidden) if hidden else b for b in tex)
+                self.whole += 1
+            return
         if kind == "table":
             with r.ctx.guard("chart"):
                 if self.tables(st, tex, "deleted" if st.run.deleted else "hidden" if st.run.vanish else ""):
@@ -174,6 +180,9 @@ class _Storage:
 
     def __init__(self, objects, streams):
         self.objects, self.streams = objects, streams
+
+    def names(self) -> list:
+        return list(self.streams)
 
     def exists(self, name) -> bool:
         return name.upper() in self.streams

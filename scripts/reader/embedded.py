@@ -13,9 +13,13 @@ from them is a stream that cannot be read). What comes back is what the object s
     (`sheet_tables`);
   * ("chart", [], frozenset()): a workbook or MS Graph object that gave no table. Its reads leave no count and no
     warning behind: the caller counts the chart where it shows the preview;
+  * ("document", [Quote], frozenset()): a Word document (an OOXML package, or a compound file's WordDocument stream),
+    a presentation (an OOXML package, or a PowerPoint Document stream) or an OpenDocument text or presentation
+    package, read whole (`document`) and quoted. The caller places it where it would place tables; nothing of it is
+    charged to CHART_TOTAL;
   * ("bad", "", frozenset()): an equation that cannot be read or does not convert;
-  * None: anything else (a PDF's CONTENTS, a packager's Ole10Native, a Word or PowerPoint document, bytes that are
-    no container, an object whose parser failed). The caller keeps the object's preview picture and counts it
+  * None: anything else (a PDF's CONTENTS, a packager's Ole10Native, bytes that are no container, an object whose
+    parser failed). The caller keeps the object's preview picture and counts it
     under object.
 
 A document has one `Objects` (`of(ctx)`), whatever reads through it: MAX_OBJECTS at most, the sheets of every
@@ -34,7 +38,9 @@ their packages inflate to (EMBED_TOTAL), the XML elements built into trees while
 BIFF records walked (BIN_RECORDS, the document's own streams with them) and the xls bytes decrypted
 (EMBED_DECRYPT); an object that would pass one of them is not read. Whatever an object makes the reader do, the
 objects of one document are read for EMBED_SECONDS at most: one reached after that is not read (None), as past
-MAX_OBJECTS. A ReadError that only says this object cannot be read
+MAX_OBJECTS. A document an object holds is read in its own Context (`_Reading`), late once the host's read is or
+once the objects' EMBED_SECONDS are spent: it then keeps what it read, counted under object_cut. A ReadError that
+only says this object cannot be read
 (damaged, too large, unsupported, encrypted) gives None, and so does any error that is no ReadError; any other
 ReadError ends the document, as it does everywhere.
 """
@@ -47,7 +53,7 @@ from . import limits
 from .containers.cfb import CfbError, Compound, is_cfb
 from .containers.zipx import Package, charged
 from .limits import ReadError
-from .model import Cell, Context, Equation, NoteRef, Para, Section, Table
+from .model import Cell, Context, Doc, Equation, NoteRef, Para, Quote, Section, Table, Text
 
 DEPTH = 4  # objects inside objects that are opened
 MAX_OBJECTS = 256  # embedded objects one document reads (the rest are not read)
@@ -136,11 +142,31 @@ class Objects:
 
     def place(self, got) -> list | None:
         """Copies of a "table" object's tables for one placement, or None when they would pass CHART_TOTAL (the
-        caller counts a chart, as for a workbook that gave no table)."""
+        caller counts a chart, as for a workbook that gave no table); a "document" object's quote, never charged."""
+        if got[0] == "document":
+            return [copy.copy(b) for b in got[1]]
         self.cells += sum(len(row) for t in got[1] for row in t.rows)
         if self.cells > limits.CHART_TOTAL:
             return None
         return [copy.copy(t) for t in got[1]]
+
+
+class _Reading(Context):
+    """The Context a document an object holds is read in: the host's (`host`) objects and stop, late once the host's
+    read is (counted time) or once the objects' EMBED_SECONDS are spent (counted object_cut)."""
+
+    def __init__(self, host):
+        super().__init__()
+        self.host, self.embedded = host, of(host)
+        self.stop, self.clock = host.stop, host.clock
+
+    def late(self) -> bool:
+        if not (self.skipped["time"] or self.skipped["object_cut"]):
+            if self.host.late():
+                self.skipped["time"] = 1
+            elif self.embedded.late():
+                self.skipped["object_cut"] = 1
+        return bool(self.skipped["time"] or self.skipped["object_cut"])
 
 
 class Parts:
@@ -254,6 +280,12 @@ def _storage(cf, ctx, sheets):
             if cf.size(name) > limits.EMBED_BYTES:
                 return None
             return read(cf.read(name), ctx, sheets)
+    if cf.exists("WordDocument"):
+        from .formats import doc
+        return document(lambda own: doc.read_compound(cf, own), ctx, "Word document")
+    if cf.exists("PowerPoint Document"):
+        from .formats import ppt
+        return document(lambda own: ppt.read_compound(cf, own), ctx, "PowerPoint presentation")
     before, warned = ctx.skipped["chart"], len(ctx.warnings)
     out = xls_embedded.blocks(cf, ctx, sheets)
     if out:
@@ -291,31 +323,67 @@ def _package(data, ctx):
         if kind == "odf":
             return _odf(pkg, ctx)
         if kind == "ooxml":
-            return _workbook(pkg, ctx)
+            return _ooxml(pkg, ctx)
     return None
+
+
+def _rekey(out, notes, ctx):
+    """The `notes` the blocks `out` mark go to the document (`ctx.notes`), each under a key of its own."""
+    base, stack = f"embedded {len(ctx.notes)}: ", list(out)
+    while stack:
+        x = stack.pop()
+        if isinstance(x, NoteRef):
+            if x.id in notes:
+                ctx.notes[base + x.id] = notes[x.id]
+                x.id = base + x.id
+            continue
+        for name in ("inlines", "blocks"):
+            stack.extend(getattr(x, name, ()))
+        for row in getattr(x, "rows", ()):
+            stack.extend(row)
 
 
 def _shown(out, own, ctx, notes=None):
     """The tables `out`, with what reading them counted in `own`; the `notes` they mark go to the document
-    (`ctx.notes`), each under a key of its own. With no table, a chart, or UNREAD when the read counted something
-    it left out."""
+    (`_rekey`). With no table, a chart, or UNREAD when the read counted something it left out."""
     if not out:
         return UNREAD if own.skipped else CHART
     ctx.skipped.update(own.skipped)
     if notes:
-        base, stack = f"embedded {len(ctx.notes)}: ", list(out)
-        while stack:
-            x = stack.pop()
-            if isinstance(x, NoteRef):
-                if x.id in notes:
-                    ctx.notes[base + x.id] = notes[x.id]
-                    x.id = base + x.id
-                continue
-            for name in ("inlines", "blocks"):
-                stack.extend(getattr(x, name, ()))
-            for row in getattr(x, "rows", ()):
-                stack.extend(row)
+        _rekey(out, notes, ctx)
     return "table", out, _NONE
+
+
+def document(parse, ctx, what):
+    """The "document" object `parse` reads in a `_Reading` of `ctx`: one Quote of a line naming it ("Embedded
+    <what>", its title after a colon), its properties line, its header and footer lines (as markdown writes a
+    document's own) and its blocks. What it counted and warned goes to `ctx`, its notes and those of its own objects
+    to the document (`_rekey`). None when `parse` gives no Doc."""
+    from .markdown import _PAGE_ONLY
+    own = _Reading(ctx)
+    doc = parse(own)
+    if not isinstance(doc, Doc):
+        return None
+    title = " ".join(doc.title.split())
+    lines = [f"Embedded {what}" + (f": {title}" if title else "")]
+    props = doc.meta.get("properties")
+    if props:
+        lines.append("Properties: " + "; ".join(f"{k}: {v}" for k, v in props))
+    for label, items in (("Header", doc.headers), ("Footer", doc.footers)):
+        kept = []
+        for it in items:
+            it = " ".join(it.split())
+            if it and it not in kept and not _PAGE_ONLY.match(it):
+                kept.append(it)
+        if kept:
+            lines.append(f"{label}: " + " | ".join(kept))
+    quote = Quote([Para([Text(s)]) for s in lines] + doc.blocks)
+    _rekey([quote], {**doc.notes, **own.notes}, ctx)
+    ctx.skipped.update(own.skipped)
+    if own.skipped["time"]:
+        ctx.skipped["time"] = 1
+    ctx.warnings.extend(w for w in own.warnings if w not in ctx.warnings)
+    return "document", [quote], _NONE
 
 
 def _odf(pkg, ctx):
@@ -324,9 +392,14 @@ def _odf(pkg, ctx):
     if not pkg.has("content.xml"):
         return None
     root = pkg.xml("content.xml")
+    inner = [c for b in kids(root, "body") for c in b]
+    for c in inner:
+        if local(c.tag) in ("text", "presentation"):
+            from .formats import odf
+            what = "OpenDocument text" if local(c.tag) == "text" else "OpenDocument presentation"
+            return document(lambda own: odf.read_package(pkg, own), ctx, what)
     own = of(ctx).inner()
     body = Body(pkg, own, Styles(root, None))
-    inner = [c for b in kids(root, "body") for c in b]
     if local(root.tag) == "math" or any(local(c.tag) == "chart" for c in inner):
         got = body.object_blocks(root, 0)
         if got and isinstance(got[0], Equation):
@@ -341,11 +414,16 @@ def _odf(pkg, ctx):
     return None
 
 
-def _workbook(pkg, ctx):
-    from .formats import ooxml, ooxml_base, ooxml_sheets
+def _ooxml(pkg, ctx):
+    from .formats import ooxml, ooxml_base, ooxml_sheets, ooxml_slides, ooxml_word
     part = ooxml._main_part(pkg)
     root, _ = ooxml_base.load(pkg, part)
-    if ooxml_base.local(root.tag) != "workbook":
+    kind = ooxml_base.local(root.tag)
+    if kind == "document":
+        return document(lambda own: ooxml_word.parse_word(pkg, part, own), ctx, "Word document")
+    if kind == "presentation":
+        return document(lambda own: ooxml_slides.parse_slides(pkg, part, own), ctx, "PowerPoint presentation")
+    if kind != "workbook":
         return None
     own = of(ctx).inner()
     sec, notes = ooxml_sheets.active_sheet(pkg, part, own)

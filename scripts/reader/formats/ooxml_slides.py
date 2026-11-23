@@ -556,7 +556,7 @@ class _Reader:
         return []
 
     def ole(self, el, rid):
-        """An embedded object (p:oleObj) of frame `el`, by embedded.Parts: its equation or its tables; one that is not
+        """An embedded object (p:oleObj) of frame `el`, by embedded.Parts: its equation, its tables or its document; one that is not
         read shows the frame's preview picture and is counted under object, a chart left unread under chart. An
         object the package does not hold (a link) is counted only when it has no preview either."""
         got = self.objects.get(self.scope.part, rid)
@@ -566,7 +566,7 @@ class _Reader:
                 self.deep()
             if got[2] <= {"depth"}:
                 return [Equation(got[1], False)]
-        elif kind == "table":
+        elif kind in ("table", "document"):
             tables = self.objects.place(got)
             if tables is not None:
                 return tables

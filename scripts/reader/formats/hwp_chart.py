@@ -71,7 +71,7 @@ class _Grid:
 
 def ole_blocks(data: bytes, ctx, *, sheets: sheet_grid.Budget | None = None) -> list:
     """What an OLE item shows: its chart as one Table, else what embedded.storage reads in it (an Equation, a
-    package's Tables). Nothing, counted under object, for an item that is not a 4-byte length and the compound file
+    package's Tables, a document's Quote). Nothing, counted under object, for an item that is not a 4-byte length and the compound file
     it gives, or that holds none of these; counted under chart for a BIFF Workbook with no table to show, a chart
     that does not parse or a chart object left unread. A chart without series is nothing, not counted, as
     charts.chart_table has it. A workbook's sheets draw on `sheets`, the document's sheet_grid.Budget (the one of `ctx`
@@ -107,7 +107,7 @@ def _item(data: bytes, ctx, sheets) -> list:
             else:
                 got = embedded.storage(cf, ctx, sheets)
                 kind = got[0] if got else ""
-                if kind == "table":
+                if kind in ("table", "document"):
                     return got[1]
                 if kind == "equation":
                     if got[2]:

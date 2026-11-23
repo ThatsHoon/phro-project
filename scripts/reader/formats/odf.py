@@ -116,11 +116,16 @@ def _meta(pkg, ctx, doc):
         doc.meta["properties"] = kept
 
 
+def read_package(pkg, ctx) -> Doc:
+    """The Doc of the open package `pkg`: its text, spreadsheet or presentation."""
+    kind, content, styles_root = _open(pkg, ctx)
+    if kind == "text":
+        return _text(pkg, ctx, content, styles_root)
+    if kind == "spreadsheet":
+        return odf_sheets.sheets(pkg, ctx, content, styles_root)
+    return odf_slides.slides(pkg, ctx, content, styles_root)
+
+
 def parse(path, ctx) -> Doc:
     with Package(path) as pkg:
-        kind, content, styles_root = _open(pkg, ctx)
-        if kind == "text":
-            return _text(pkg, ctx, content, styles_root)
-        if kind == "spreadsheet":
-            return odf_sheets.sheets(pkg, ctx, content, styles_root)
-        return odf_slides.slides(pkg, ctx, content, styles_root)
+        return read_package(pkg, ctx)

@@ -507,13 +507,22 @@ def parse_compound(src, ctx) -> Doc | str:
     parser `cfb_route` picks for a compound file that holds no PowerPoint Document stream. `parse` ends in it."""
     try:
         with Compound(src) as cf:
-            other = cfb_route.route(cf, "ppt", "no PowerPoint Document stream")
-            if other is None:
-                current = cf.read("Current User") if cf.exists("Current User") else None
-                if _pp95(cf, current):
-                    raise ReadError("unsupported", cfb_route.PP95)
-                data = cf.read("PowerPoint Document")
-                pictures = cf.read("Pictures") if cf.exists("Pictures") else None
+            return read_compound(cf, ctx)
+    except CfbError:
+        raise ReadError("damaged", "PowerPoint Document stream") from None
+
+
+def read_compound(cf, ctx) -> Doc | str:
+    """What `parse_compound` gives, for the open compound file `cf` (any object with exists, size and read by stream
+    name)."""
+    try:
+        other = cfb_route.route(cf, "ppt", "no PowerPoint Document stream")
+        if other is None:
+            current = cf.read("Current User") if cf.exists("Current User") else None
+            if _pp95(cf, current):
+                raise ReadError("unsupported", cfb_route.PP95)
+            data = cf.read("PowerPoint Document")
+            pictures = cf.read("Pictures") if cf.exists("Pictures") else None
     except (KeyError, CfbError):
         raise ReadError("damaged", "PowerPoint Document stream") from None
     if other is not None:

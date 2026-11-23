@@ -957,8 +957,8 @@ class _Reader:
             (obj.raw if nraw else obj.hex).append(chunk)
 
     def finish_object(self, g):
-        """The objdata group closes: the object's equation goes in the line and its tables after the paragraph
-        under way. An equation converted in part is counted and keeps the result too."""
+        """The objdata group closes: the object's equation goes in the line and its tables or document after the
+        paragraph under way. An equation converted in part is counted and keeps the result too."""
         obj = self.obj
         if obj.dead:
             return
@@ -983,7 +983,7 @@ class _Reader:
             else:
                 skipped["object"] += 1
                 obj.counted = True
-        elif kind == "table":
+        elif kind in ("table", "document"):
             tables = self.objects.place(got)
             if tables is None:
                 skipped["chart"] += 1

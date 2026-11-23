@@ -137,6 +137,8 @@ class Objects:
             if "depth" in lost:
                 self.ctx.skipped["depth"] += 1
             return list(blocks), False
+        if kind == "document":
+            return list(blocks), False
         for t in blocks:
             if isinstance(t, Table):
                 self.chart_cells += sum(len(row) for row in t.rows)

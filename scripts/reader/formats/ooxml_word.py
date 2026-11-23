@@ -748,7 +748,7 @@ class _Reader:
 
     def ole(self, el, st, d):
         """An embedded object (w:object): the part its o:OLEObject names, by embedded.Parts. An equation stands in
-        the line and tables follow the paragraph, in place of the preview picture; an object that is not read keeps
+        the line and tables or a document follow the paragraph, in place of the preview picture; an object that is not read keeps
         its preview and is counted under object, a chart left unread under chart, and an equation converted in part
         keeps both. An object the package does not hold (a link) keeps its preview, not counted."""
         rid = next((attr(e, "id") for e in el.iter() if local(e.tag) == "OLEObject"), None)
@@ -761,7 +761,7 @@ class _Reader:
             if got[2] <= {"depth"}:
                 return
             self.ctx.skipped["object"] += 1
-        elif kind == "table":
+        elif kind in ("table", "document"):
             tables = self.objects.place(got)
             if tables is not None:
                 self.extra(st, tables)

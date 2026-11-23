@@ -1190,13 +1190,13 @@ class _Reader:
         return "".join(out), cut
 
     def picture(self, s) -> list:
-        """The shape's picture: an OLE object by embedded.Objects from its OLE data (its equation or its tables; a
+        """The shape's picture: an OLE object by embedded.Objects from its OLE data (its equation, tables or document; a
         chart left unread counted `chart`, any other `object`); a DIB through officeart.dib_to_bmp to a PNG; its
         emitted bytes charged to IMAGE_BYTES and LINE to the room (past either counted `image`)."""
         if s.ftype == 2:
             got = self.objects.load(b"".join(s.ole)) if s.ole else None
             kind = got[0] if got else ""
-            tables = self.objects.place(got) if kind == "table" else None
+            tables = self.objects.place(got) if kind in ("table", "document") else None
             if tables is not None:
                 return tables
             if kind == "equation":
