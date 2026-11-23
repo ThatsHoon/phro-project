@@ -183,11 +183,12 @@ def test_encrypted():
 
 
 def test_word95():
-    e = denied(doc_file([("x\r", False)], nfib=0x0068), "unsupported")
-    assert e.detail == "word 6/95"
+    # an nFib below 0xC1 is the Word 6/95 layout (test_reader_doc6 reads real ones): a Word 97 FIB under it, and a
+    # Word 6 FIB of zeros, have no text range (fcMin 0, inside the FIB)
+    denied(doc_file([("x\r", False)], nfib=0x0068), "damaged")
     p = tmp() / "w6.doc"
-    make_cfb(p, {"WordDocument": u16(0xA5DC) + u16(0x0065) + bytes(500)})  # Word 6/95's own wIdent
-    assert denied(p, "unsupported").detail == "word 6/95"
+    make_cfb(p, {"WordDocument": u16(0xA5DC) + u16(0x0065) + bytes(500)})
+    denied(p, "damaged")
 
 
 def test_not_word():
@@ -409,12 +410,12 @@ def test_table_stream_missing_or_other():
 def test_story_text_slices():
     word = b"\0" * 10 + "가나다".encode("utf-16-le") + "xyz".encode("cp1251")
     pcs = [doc_fib.Piece(0, 3, 10, False, 0), doc_fib.Piece(3, 6, 16, True, 0)]
-    assert doc_fib.story_text(word, pcs, 0, 6, 0x0419) == "가나다xyz"
-    assert doc_fib.story_text(word, pcs, 1, 5, 0x0419) == "나다xy"
-    assert doc_fib.story_text(word, pcs, 5, 99, 0x0419) == "z"
-    assert doc_fib.story_text(word, pcs, 6, 6, 0x0419) == ""
+    assert doc_fib.story_text(word, pcs, 0, 6, "cp1251") == "가나다xyz"
+    assert doc_fib.story_text(word, pcs, 1, 5, "cp1251") == "나다xy"
+    assert doc_fib.story_text(word, pcs, 5, 99, "cp1251") == "z"
+    assert doc_fib.story_text(word, pcs, 6, 6, "cp1251") == ""
     odd = "가".encode("utf-16-le") + b"A"  # a Unicode piece whose last unit is cut: the whole units only
-    assert doc_fib.story_text(odd, [doc_fib.Piece(0, 2, 0, False, 0)], 0, 2, 0x0409) == "가"
+    assert doc_fib.story_text(odd, [doc_fib.Piece(0, 2, 0, False, 0)], 0, 2, "cp1252") == "가"
 
 
 # ---- the walk Tasks 10-14 extend
@@ -468,13 +469,13 @@ def test_story_maps_index_and_cp():
     hi, lo = chr(0xD83D), chr(0xDE00)  # 😀 as the two UTF-16 units Story keeps
     word = "a😀".encode("utf-16-le") + b"xyz"
     pcs = [doc_fib.Piece(0, 3, 0, False, 0), doc_fib.Piece(10, 13, 6, True, 0)]
-    s = doc_fib.story(word, pcs, 0, 13, 0x0409)
-    assert s.text == "a" + hi + lo + "xyz" and doc_fib.story_text(word, pcs, 0, 13, 0x0409) == s.text
+    s = doc_fib.story(word, pcs, 0, 13, "cp1252")
+    assert s.text == "a" + hi + lo + "xyz" and doc_fib.story_text(word, pcs, 0, 13, "cp1252") == s.text
     assert [s.cp_of(i) for i in range(7)] == [0, 1, 2, 10, 11, 12, 13]
     assert [s.index_of(cp) for cp in (0, 2, 3, 5, 10, 12, 13, 99)] == [0, 2, 3, 3, 3, 5, 6, 6]
-    part = doc_fib.story(word, pcs, 2, 12, 0x0409)  # starts inside the pair: one unit per CP still
+    part = doc_fib.story(word, pcs, 2, 12, "cp1252")  # starts inside the pair: one unit per CP still
     assert part.text == lo + "xy" and part.cp_of(0) == 2 and part.cp_of(1) == 10 and part.index_of(11) == 2
-    empty = doc_fib.story(word, pcs, 4, 9, 0x0409)  # all in the gap
+    empty = doc_fib.story(word, pcs, 4, 9, "cp1252")  # all in the gap
     assert empty.text == "" and empty.cp_of(0) == 4 and empty.index_of(7) == 0
 
 

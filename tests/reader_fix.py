@@ -364,11 +364,12 @@ def _doc_pcds(clx):
     return out
 
 
-def _doc_fkp(spans, pcds, papx, pn):
+def _doc_fkp(spans, pcds, papx, pn, old=False):
     """FKP pages and their PlcBte for (cp0, cp1, bytes) spans: each span is mapped to FCs through the pieces (split
     where a piece ends), the runs are sorted by FC and the gaps between them filled with runs without properties, so
     each page's runs are contiguous. A CHPX is cb u8 + grpprl; a PAPX (bytes: istd u16 + grpprl) is cb u8 with size
-    2cb - 1 for an odd size, else 0 and cb' u8 with size 2cb'. Pages are numbered from `pn`."""
+    2cb - 1 for an odd size, else 0 and cb' u8 with size 2cb'. Pages are numbered from `pn`. `old` writes Word 6
+    pages: a PAPX is cw u8 and 2cw bytes (padded to even), a BX is 7 bytes and a PlcBte PN u16."""
     starts = [p[0] for p in pcds]
     runs = []
     for c0, c1, data in spans:
@@ -385,13 +386,15 @@ def _doc_fkp(spans, pcds, papx, pn):
         if filled and filled[-1][1] < r[0]:
             filled.append((filled[-1][1], r[0], b""))
         filled.append(r)
-    width = 13 if papx else 1
+    width = (7 if old else 13) if papx else 1
 
     def blob(data):
         if not data:
             return b""
         if not papx:
             return bytes([len(data)]) + data
+        if old:
+            return bytes([(len(data) + 1) // 2]) + data + bytes(len(data) % 2)
         return bytes([(len(data) + 1) // 2]) + data if len(data) % 2 else bytes([0, len(data) // 2]) + data
 
     pages, fcs, pns, i = [], [], [], 0
@@ -421,6 +424,8 @@ def _doc_fkp(spans, pcds, papx, pn):
     if not pages:
         return b"", b""
     fcs.append(filled[-1][1])
+    if old:
+        return b"".join(pages), struct.pack("<%dI%dH" % (len(fcs), len(pns)), *fcs, *pns)
     return b"".join(pages), struct.pack("<%dI" % (2 * len(pages) + 1), *fcs, *pns)
 
 
@@ -784,6 +789,93 @@ def make_doc(path, pieces, *, lid=0x0409, nfib=0x00C1, flags=0x0200, ccp=None, f
     assert len(fib) <= DOC_EXTRA
     out = {"WordDocument": fib.ljust(DOC_EXTRA, b"\0") + bytes(body) + pages,
            "1Table" if flags & 0x0200 else "0Table": bytes(table)}
+    out.update(streams or {})
+    path = Path(path)
+    make_cfb(path, out)
+    return path
+
+
+DOC6_MIN = 0x300  # fcMin of make_doc6: the FIB fills the bytes before it
+
+
+def doc6_stsh(styles, codec="cp1252"):
+    """A Word 6 STSH for make_doc6's fc={1: ...}: cbStshi 14 and the Stshi (cstd, cbSTDBaseInFile 8, ...), then an
+    STD a slot (cb u16, 0 for None): the 8-byte base (sti, sgc | istdBase << 4, cupx | istdNext << 4, bchUpe 0), the
+    name (u8 count, 8-bit text, NUL), then the UPXs from even offsets (cbUpx u16 and its bytes, padded to even).
+    `styles` are (sti, sgc, istd_base, name, papx, chpx) as doc_stsh's, sgc 1 a paragraph style (UpxPapx: its istd +
+    papx, then UpxChpx: chpx) and 2 a character style (UpxChpx only), the grpprls in Word 6 sprms."""
+    stshi = struct.pack("<7H", len(styles), 8, 1, 0x4B, 15, 0, 0)
+    out = bytearray(struct.pack("<H", len(stshi)) + stshi)
+    for istd, s in enumerate(styles):
+        if s is None:
+            out += struct.pack("<H", 0)
+            continue
+        sti, sgc, based, name, papx, chpx = s
+        raw = name.encode(codec)
+        std = bytearray(struct.pack("<4H", sti & 0xFFF, sgc | based << 4, 2 if sgc == 1 else 1, 0))
+        std += bytes([len(raw)]) + raw + b"\0"
+        upxs = ([struct.pack("<H", istd) + bytes(papx)] if sgc == 1 else []) + [bytes(chpx)]
+        for u in upxs:
+            std += bytes(len(std) % 2) + struct.pack("<H", len(u)) + u
+        out += struct.pack("<H", len(std)) + std
+    return bytes(out)
+
+
+def make_doc6(path, pieces, *, lid=0x0409, chse=0, nfib=101, flags=0, ccp=None, fc=None, chpx=None, papx=None,
+              codec="cp1252", streams=None, cpn=None, ident=0xA5DC):
+    """Write a Word 6/95 .doc compound file: no table stream, everything in WordDocument.
+
+    The FIB (`ident`: 0xA5DC, or 0xA5EC as Word 95 writes it; `nfib`, `lid`, `flags`: fComplex 0x0004 makes the pieces a Clx, fEncrypted 0x0100; chse
+    at 0x14; fcMin, fcMac, cbMac at 0x18; the story lengths at 0x34; FibRgFcLcb entries 0-37 as (fc u32, lcb u32)
+    pairs from 0x58 and 38 on from 0x192; pnChpFirst, pnPapFirst, cpnBteChp, cpnBtePap at 0x18A) fills the bytes
+    before DOC6_MIN. The text of `pieces` (str, each `codec` bytes, one CP a byte) follows from DOC6_MIN in CP order;
+    without fComplex the pieces are one run of text, with it the Clx (one Pcdt, PCD fc the plain file offset) is
+    entry 33 unless `fc` gives it. Each `fc` entry (index -> bytes) follows the text in index order, then the FKP
+    pages of `chpx` and `papx` (make_doc's spans, Word 6 sprms) from the next 512-byte boundary, their PlcBte (u16
+    PNs) at 12 and 13 unless `fc` gives them. `cpn` overrides (cpnBteChp, cpnBtePap). `ccp` sets story lengths by
+    DOC_STORIES name; "text" takes the CPs the others leave. `streams` adds streams."""
+    body, cps, pcds = bytearray(), [0], []
+    for text in pieces:
+        raw = text.encode(codec)
+        pcds.append(struct.pack("<HIH", 0, DOC6_MIN + len(body), 0))
+        body += raw
+        cps.append(cps[-1] + len(raw))
+    fc_mac = DOC6_MIN + len(body)
+    lengths = dict(ccp or {})
+    if "text" not in lengths:
+        lengths["text"] = max(0, cps[-1] - sum(lengths.values()))
+    entries = dict(fc or {})
+    if flags & 0x0004 and 33 not in entries:
+        plc = struct.pack("<%dI" % len(cps), *cps) + b"".join(pcds)
+        entries[33] = b"\x02" + struct.pack("<I", len(plc)) + plc
+    pairs = [(0, 0)] * 60
+    for i in sorted(entries):
+        pairs[i] = (DOC6_MIN + len(body), len(entries[i]))
+        body += bytes(entries[i])
+    pages, btes, counts = b"", {}, {12: 0, 13: 0}
+    first = -(-(DOC6_MIN + len(body)) // 512)
+    pcd = [(cps[k], cps[k + 1], struct.unpack_from("<I", pcds[k], 2)[0], 1) for k in range(len(pieces))]
+    for index, spans in ((12, chpx), (13, papx)):
+        if spans and index not in entries:
+            blob, btes[index] = _doc_fkp(spans, pcd, index == 13, first + len(pages) // 512, old=True)
+            counts[index] = len(blob) // 512
+            pages += blob
+    if pages:
+        body += bytes(first * 512 - DOC6_MIN - len(body)) + pages
+    for index in sorted(btes):
+        pairs[index] = (DOC6_MIN + len(body), len(btes[index]))
+        body += btes[index]
+    cpn_chp, cpn_pap = cpn if cpn is not None else (counts[12], counts[13])
+    head = bytearray(DOC6_MIN)
+    struct.pack_into("<7H", head, 0, ident, nfib, 0, lid, 0, flags, nfib)
+    struct.pack_into("<H", head, 0x14, chse)
+    struct.pack_into("<3I", head, 0x18, DOC6_MIN, fc_mac, DOC6_MIN + len(body))
+    struct.pack_into("<8I", head, 0x34, *(lengths.get(name, 0) for name in DOC_STORIES))
+    for i, (f, n) in enumerate(pairs):
+        struct.pack_into("<II", head, (0x58 + 8 * i) if i < 38 else (0x192 + 8 * (i - 38)), f, n)
+    struct.pack_into("<4H", head, 0x18A, first if counts[12] else 0, first + counts[12] if counts[13] else 0,
+                     cpn_chp, cpn_pap)
+    out = {"WordDocument": bytes(head) + bytes(body)}
     out.update(streams or {})
     path = Path(path)
     make_cfb(path, out)

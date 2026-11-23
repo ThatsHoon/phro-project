@@ -1,5 +1,12 @@
-"""Word 97-2003 binary structures: the FIB, the piece table, the text of a story's CP range, the formatting (sprms,
-CHPX and PAPX FKPs, piece Prms and the style sheet), a table row's TDefTable, and the lists with their numbers.
+"""Word 97-2003 and Word 6/95 binary structures: the FIB, the piece table, the text of a story's CP range, the
+formatting (sprms, CHPX and PAPX FKPs, piece Prms and the style sheet), a table row's TDefTable, and the lists with
+their numbers.
+
+Word 6/95 (an nFib from 101 to below 0xC1, wIdent 0xA5EC or 0xA5DC) keeps every table in WordDocument, its text 8-bit in the code page
+of the document's language (one byte a CP, a double-byte character two CPs), its sprms one-byte codes that
+_OLD_SPRMS maps to the Word 97 sprms they match, its PlcBte PNs u16 and its PAPX BXs 7 bytes; its FIB is a fixed
+layout (FibRgFcLcb entries 0-37 from 0x58, 38 on from 0x192), its STD base 8 bytes with an 8-bit name. Written from
+the Word 6 binary file format (the FIB, the FKPs, the STSH and the sprm table), checked against a Word 6 file.
 
 Written from MS-DOC (2.5.1 Fib, 2.9.38 Clx, 2.9.177 PlcPcd, 2.9.73 FcCompressed, 2.4.1 retrieving text, 2.2.5 Sprm
 and Prm, 2.9.33/2.9.175 ChpxFkp/PapxFkp, 2.9.271 STSH, 2.4.6 applying properties, TDefTableOperand and TCGRF, PlfLst,
@@ -16,6 +23,7 @@ PlcfendRef/Txt, 50 DggInfo, 56 PlcftxbxTxt, 58 PlcfHdrtxbxTxt, 73 PlfLst, 74 Plf
 """
 import codecs
 import datetime
+import re
 import struct
 from bisect import bisect_right
 from dataclasses import dataclass, replace
@@ -32,7 +40,11 @@ STORIES = ("text", "footnote", "header", "macro", "annotation", "endnote", "text
 PIECES = 1_000_000  # pieces one PlcPcd may declare; past it the piece table is not read
 _IDENT = 0xA5EC
 _OLD_IDENTS = (0xA5DB, 0xA5DC)  # the wIdent of Word 2 and of Word 6/95
-_WORD97 = 0x00C1  # the lowest nFib of the Word 97 layout
+_WORD6, _WORD97 = 101, 0x00C1  # the lowest nFib of the Word 6 and of the Word 97 layout
+_OLD_HEAD = 0x192   # where a Word 6 FIB's FibRgFcLcb entry 38 starts, after the PN fields at 0x18A
+_OLD_PAIRS = 59     # Word 6 FibRgFcLcb entries read: 0 to 58 (PlcfHdrtxbxTxt)
+_OLD_UNUSED = (40, 41, 50)  # entries Word 97 gives PlcSpaMom, PlcSpaHdr and DggInfo; Word 6 leaves them unused
+MAC = 256  # a Word 6 FIB's chse for text in the Macintosh character set
 
 
 @dataclass
@@ -43,9 +55,16 @@ class Fib:
     far_east: bool
     encrypted: bool
     obfuscated: bool
-    table: str                   # the table stream: "1Table" or "0Table"
+    table: str                   # the table stream: "1Table", "0Table", or "WordDocument" for Word 6
     ccp: dict[str, int]          # story name -> its length in CPs
     fc: list[tuple[int, int]]    # FibRgFcLcb97 (fc, lcb) pairs
+    old: bool = False            # the Word 6/95 layout
+    complex: bool = False        # Word 6 fComplex: the text is a piece table, else fcMin..fcMac
+    chse: int = 0                # Word 6: the character set, MAC or Windows
+    fc_min: int = 0
+    fc_mac: int = 0
+    pn_first: tuple = (0, 0)     # Word 6 pnChpFirst, pnPapFirst: the first FKP page of each kind
+    cpn: tuple = (0, 0)          # Word 6 cpnBteChp, cpnBtePap: how many FKP pages of each kind
 
     def pair(self, i: int) -> tuple:
         """The (fc, lcb) of FibRgFcLcb97 entry i; (0, 0) when the FIB has no such entry."""
@@ -62,16 +81,19 @@ class Piece:
 
 
 def fib(word: bytes) -> Fib:
-    """The FIB at the head of the WordDocument stream. Past FibBase an encrypted FIB is ciphertext, so for an
-    encrypted or obfuscated document only FibBase is read."""
+    """The FIB at the head of the WordDocument stream, Word 97 or Word 6/95 (an nFib below 0xC1, _old_fib). Past
+    FibBase an encrypted FIB is ciphertext, so for an encrypted or obfuscated document only FibBase is read. Word 2
+    and older (wIdent 0xA5DB, or an nFib below 101) are unsupported."""
     n = len(word)
     if n < 2 or struct.unpack_from("<H", word)[0] not in (_IDENT, *_OLD_IDENTS):
         raise ReadError("damaged", "not a Word document")
     if n < 34:
         raise ReadError("damaged", "FIB")
     ident, nfib, _, lid, _, flags = struct.unpack_from("<6H", word)
-    if ident != _IDENT or nfib < _WORD97:
-        raise ReadError("unsupported", "word 6/95")
+    if ident == _OLD_IDENTS[0] or nfib < _WORD6:
+        raise ReadError("unsupported", "word 2")
+    if nfib < _WORD97:
+        return _old_fib(word, nfib, lid, flags)
     out = Fib(nfib, lid, 0, bool(flags & 0x4000), bool(flags & 0x0100), bool(flags & 0x8000),
               "1Table" if flags & 0x0200 else "0Table", {name: 0 for name in STORIES}, [])
     if out.encrypted or out.obfuscated:
@@ -99,6 +121,44 @@ def fib(word: bytes) -> Fib:
     return out
 
 
+def _old_fib(word: bytes, nfib: int, lid: int, flags: int) -> Fib:
+    """A Word 6/95 FIB: flags fComplex 0x0004 and fEncrypted 0x0100; chse u16 at 0x14; fcMin and fcMac at 0x18; the
+    story lengths, u32 in STORIES order, at 0x34; FibRgFcLcb entries 0-37 at 0x58 and 38 on at 0x192, (fc, lcb) u32
+    pairs into WordDocument, read to entry 58 or as far as the stream holds; pnChpFirst, pnPapFirst, cpnBteChp and
+    cpnBtePap u16 at 0x18A. A stream shorter than the fixed fields is damaged."""
+    n = len(word)
+    if n < _OLD_HEAD:
+        raise ReadError("damaged", "FIB")
+    out = Fib(nfib, lid, 0, False, bool(flags & 0x0100), False, "WordDocument", {name: 0 for name in STORIES}, [],
+              old=True, complex=bool(flags & 0x0004))
+    if out.encrypted:
+        return out
+    out.chse = struct.unpack_from("<H", word, 0x14)[0]
+    out.fc_min, out.fc_mac = struct.unpack_from("<II", word, 0x18)
+    out.ccp = dict(zip(STORIES, struct.unpack_from("<%dI" % len(STORIES), word, 0x34)))
+    more = min(_OLD_PAIRS - 38, (n - _OLD_HEAD) // 8)
+    pairs = list(struct.iter_unpack("<II", word[0x58:0x58 + 8 * 38]))
+    pairs += struct.iter_unpack("<II", word[_OLD_HEAD:_OLD_HEAD + 8 * more])
+    out.fc = [(0, 0) if i in _OLD_UNUSED else p for i, p in enumerate(pairs)]
+    chp, pap, cpn_chp, cpn_pap = struct.unpack_from("<4H", word, 0x18A)
+    out.pn_first, out.cpn = (chp, pap), (cpn_chp, cpn_pap)
+    return out
+
+
+def old_codec(f: Fib) -> str:
+    """The codec of a Word 6 file's 8-bit text: Mac Roman for the Macintosh character set, else the code page of its
+    language, a double-byte one too (story() then gives each double-byte character its two CPs)."""
+    return "mac_roman" if f.chse == MAC else codepage(f.lid)
+
+
+def old_text(f: Fib) -> list["Piece"]:
+    """The one piece of a Word 6 file without a piece table: fcMin..fcMac of WordDocument, 8-bit; damaged when
+    fcMin is inside the FIB or past fcMac."""
+    if not _OLD_HEAD <= f.fc_min <= f.fc_mac:
+        raise ReadError("damaged", "text range")
+    return [Piece(0, f.fc_mac - f.fc_min, f.fc_min, True, 0)]
+
+
 def _prc_walk(clx) -> tuple[list[tuple[int, int]], int]:
     """The (start, end) of each Prc grpprl (clxt 1, u16 cb, grpprl) at the head of a Clx, cut to the Clx, and where
     the Prcs end. Each Prc moves on by at least 3 bytes."""
@@ -118,10 +178,11 @@ def prcs(table: bytes, fc: int, lcb: int) -> list[bytes]:
     return [clx[a:b] for a, b in _prc_walk(clx)[0]]
 
 
-def pieces(table: bytes, fc: int, lcb: int) -> list[Piece]:
+def pieces(table: bytes, fc: int, lcb: int, old: bool = False) -> list[Piece]:
     """The pieces of the Clx at table[fc:fc + lcb]: Prc records (clxt 1, u16 cb, grpprl) are skipped, then the Pcdt
-    (clxt 2, u32 lcb) holds the PlcPcd, n + 1 CPs and n 8-byte PCDs (fc u32 at 2, prm u16 at 6). A Clx outside the
-    stream, without a Pcdt, with a PlcPcd size that is not 4 + 12n or with decreasing CPs is damaged."""
+    (clxt 2, u32 lcb) holds the PlcPcd, n + 1 CPs and n 8-byte PCDs (fc u32 at 2, prm u16 at 6). A Word 97 fc is an
+    FcCompressed; an `old` (Word 6) one is the plain offset of 8-bit text. A Clx outside the stream, without a Pcdt,
+    with a PlcPcd size that is not 4 + 12n or with decreasing CPs is damaged."""
     if lcb == 0:
         raise ReadError("damaged", "no piece table")
     if fc + lcb > len(table):
@@ -143,6 +204,9 @@ def pieces(table: bytes, fc: int, lcb: int) -> list[Piece]:
         a, b = cps[i], cps[i + 1]
         if b < a:
             raise ReadError("damaged", "piece table CPs")
+        if old:
+            out.append(Piece(a, b, raw, True, prm))
+            continue
         compressed = bool(raw & 0x40000000)
         at = raw & 0x3FFFFFFF
         out.append(Piece(a, b, at // 2 if compressed else at, compressed, prm))
@@ -195,26 +259,29 @@ def compressed_codepage(lid: int) -> str:
 
 @dataclass
 class Story:
-    """The text of CPs [cp0, cp1), one str unit a CP: a surrogate pair stays two units until a Text is built. A part
-    is the run of one piece inside the range; part k starts at text index idx[k] and CP cps[k]."""
+    """The text of CPs [cp0, cp1), one str unit a character of width[k] CPs: one, a surrogate pair staying two units
+    until a Text is built, or two for a double-byte character of Word 6 text. A part is a run of one piece inside the
+    range whose characters have one width; part k starts at text index idx[k] and CP cps[k]."""
     text: str
     idx: list[int]
     cps: list[int]
     cp0: int
     cp1: int
+    width: list[int]
 
     def cp_of(self, i: int) -> int:
         """The CP of text index i; len(text) is the CP after the last part."""
         k = bisect_right(self.idx, i) - 1
-        return self.cp0 if k < 0 else self.cps[k] + i - self.idx[k]
+        return self.cp0 if k < 0 else self.cps[k] + (i - self.idx[k]) * self.width[k]
 
     def index_of(self, cp: int) -> int:
-        """The text index of `cp`; a CP no piece holds maps to the index of the next CP that one does."""
+        """The text index of `cp`; a CP no piece holds maps to the index of the next CP that one does, and so does a
+        CP inside a double-byte character: the character belongs to the run holding its first byte."""
         k = bisect_right(self.cps, cp) - 1
         if k < 0:
             return 0
         n = (self.idx[k + 1] if k + 1 < len(self.idx) else len(self.text)) - self.idx[k]
-        return self.idx[k] + min(cp - self.cps[k], n)
+        return self.idx[k] + min(-(-(cp - self.cps[k]) // self.width[k]), n)
 
 
 def _units(raw: bytes) -> str:
@@ -229,11 +296,38 @@ def _units(raw: bytes) -> str:
     return w.decode("utf-32-le", "surrogatepass")
 
 
-def story(word: bytes, pcs: list[Piece], cp0: int, cp1: int, lid: int) -> Story:
-    """The Story of CPs [cp0, cp1): compressed pieces in compressed_codepage(lid), the rest UTF-16LE units. Pieces
-    are in CP order; the parts are joined once."""
-    parts, idx, cps, n = [], [], [], 0
-    codec = compressed_codepage(lid)
+_LEADS = {"cp932": rb"\x81-\x9f\xe0-\xfc", "cp936": rb"\x81-\xfe", "cp949": rb"\x81-\xfe", "cp950": rb"\x81-\xfe"}
+_DBCS_RUNS = {c: re.compile(rb"((?:[%s].)+)|([^%s]+)|." % (lead, lead), re.S) for c, lead in _LEADS.items()}
+
+
+def _fixed(raw: bytes, codec: str, width: int) -> str:
+    """raw decoded `width` bytes a character: the whole run at once, else, when the code page does not define one,
+    each character alone, U+FFFD for one that is not one character."""
+    s = raw.decode(codec, "replace")
+    if len(s) * width == len(raw):
+        return s
+    return "".join(t if len(t := raw[i:i + width].decode(codec, "replace")) == 1 else "�"
+                   for i in range(0, len(raw), width))
+
+
+def _dbcs(raw: bytes, codec: str):
+    """(text, width, byte offset) of each run of double-byte (a lead byte and the byte after it) or single-byte
+    characters of raw in a double-byte code page; a lead byte without a byte after it is U+FFFD, one byte."""
+    for m in _DBCS_RUNS[codec].finditer(raw):
+        if m.group(1) is not None:
+            yield _fixed(m.group(1), codec, 2), 2, m.start()
+        elif m.group(2) is not None:
+            yield _fixed(m.group(2), codec, 1), 1, m.start()
+        else:
+            yield "�", 1, m.start()
+
+
+def story(word: bytes, pcs: list[Piece], cp0: int, cp1: int, codec: str) -> Story:
+    """The Story of CPs [cp0, cp1): compressed pieces one byte a CP in `codec` (compressed_codepage for Word 97,
+    old_codec for Word 6, whose double-byte characters are two CPs), the rest UTF-16LE units. Pieces are in CP order;
+    the parts are joined once."""
+    parts, idx, cps, width, n = [], [], [], [], 0
+    dbcs = codec in _DBCS
     for i in range(max(bisect_right(pcs, cp0, key=_cp) - 1, 0), len(pcs)):
         p = pcs[i]
         if p.cp >= cp1:
@@ -242,20 +336,23 @@ def story(word: bytes, pcs: list[Piece], cp0: int, cp1: int, lid: int) -> Story:
         if a >= b:
             continue
         if p.compressed:
-            s = bytes(word[p.fc + a - p.cp:p.fc + b - p.cp]).decode(codec, "replace")
+            raw = bytes(word[p.fc + a - p.cp:p.fc + b - p.cp])
+            runs = _dbcs(raw, codec) if dbcs else ((raw.decode(codec, "replace"), 1, 0),)
         else:
-            s = _units(word[p.fc + 2 * (a - p.cp):p.fc + 2 * (b - p.cp)])
-        if s:
-            parts.append(s)
-            idx.append(n)
-            cps.append(a)
-            n += len(s)
-    return Story("".join(parts), idx, cps, cp0, cp1)
+            runs = ((_units(word[p.fc + 2 * (a - p.cp):p.fc + 2 * (b - p.cp)]), 1, 0),)
+        for s, w, at in runs:
+            if s:
+                parts.append(s)
+                idx.append(n)
+                cps.append(a + at)
+                width.append(w)
+                n += len(s)
+    return Story("".join(parts), idx, cps, cp0, cp1, width)
 
 
-def story_text(word: bytes, pcs: list[Piece], cp0: int, cp1: int, lid: int) -> str:
+def story_text(word: bytes, pcs: list[Piece], cp0: int, cp1: int, codec: str) -> str:
     """The text of story(); its surrogates are still unpaired units."""
-    return story(word, pcs, cp0, cp1, lid).text
+    return story(word, pcs, cp0, cp1, codec).text
 
 
 # ---- formatting: sprms, FKPs, Prms and the style sheet
@@ -264,11 +361,22 @@ _WIDE = (0xD606, 0xD608)           # sprmTDefTable10 and sprmTDefTable: u16 cb, 
 _CHG_TABS = 0xC615                 # sprmPChgTabs: u8 cb, 255 a sentinel
 
 
-def sprms(grpprl: bytes) -> list[tuple[int, bytes]]:
-    """The (op, operand) pairs of a grpprl. The operand size comes from op >> 13 (MS-DOC 2.2.5.1); a variable one is
-    a u8 length, except sprmTDefTable and sprmTDefTable10, whose u16 cb counts the operand plus one, and
-    sprmPChgTabs with cb 255, sized by its deleted (4 bytes each) and added (3 bytes each) tab counts. A truncated
-    tail stops the list; every sprm moves on by at least 3 bytes."""
+def _chg_tabs(grpprl: bytes, pos: int) -> int | None:
+    """The size of a sprmPChgTabs operand of cb 255 at pos: its deleted (4 bytes each) and added (3 bytes each) tab
+    counts; None when they do not fit."""
+    n = len(grpprl)
+    if pos >= n or pos + 1 + 4 * grpprl[pos] >= n:
+        return None
+    return 2 + 4 * grpprl[pos] + 3 * grpprl[pos + 1 + 4 * grpprl[pos]]
+
+
+def sprms(grpprl: bytes, old: bool = False) -> list[tuple[int, bytes]]:
+    """The (op, operand) pairs of a grpprl; `old` reads Word 6 sprms (_old_sprms). The operand size comes from
+    op >> 13 (MS-DOC 2.2.5.1); a variable one is a u8 length, except sprmTDefTable and sprmTDefTable10, whose u16 cb
+    counts the operand plus one, and sprmPChgTabs with cb 255 (_chg_tabs). A truncated tail stops the list; every
+    sprm moves on by at least 3 bytes."""
+    if old:
+        return _old_sprms(grpprl)
     out, pos, n = [], 0, len(grpprl)
     while pos + 2 <= n:
         op = grpprl[pos] | grpprl[pos + 1] << 8
@@ -286,9 +394,9 @@ def sprms(grpprl: bytes) -> list[tuple[int, bytes]]:
                 size = grpprl[pos]
                 pos += 1
                 if op == _CHG_TABS and size == 255:
-                    if pos >= n or pos + 1 + 4 * grpprl[pos] >= n:
+                    size = _chg_tabs(grpprl, pos)
+                    if size is None:
                         break
-                    size = 2 + 4 * grpprl[pos] + 3 * grpprl[pos + 1 + 4 * grpprl[pos]]
         if pos + size > n:
             break
         out.append((op, bytes(grpprl[pos:pos + size])))
@@ -296,32 +404,113 @@ def sprms(grpprl: bytes) -> list[tuple[int, bytes]]:
     return out
 
 
+# Word 6 sprms: the operand bytes of each one-byte code (_V a u8 length first, _V2 a u16 cb counting the operand
+# plus one, _TABS sprmPChgTabs); a code not listed stops the grpprl, as its size is unknown
+_V, _V2, _TABS = -1, -2, -3
+_OLD_SIZES = {
+    2: 2, 3: _V, **dict.fromkeys(range(4, 12), 1), 12: _V, 13: 1, 14: 1, 15: _V, **dict.fromkeys(range(16, 20), 2),
+    20: 4, 21: 2, 22: 2, 23: _TABS, 24: 1, 25: 1, **dict.fromkeys(range(26, 29), 2), 29: 1,
+    **dict.fromkeys(range(30, 37), 2), 37: 1, **dict.fromkeys(range(38, 44), 2), 44: 1,
+    **dict.fromkeys(range(45, 50), 2), **dict.fromkeys(range(50, 59), 1), 59: 2, 60: 2, 61: 1,
+    65: 1, 66: 1, 67: 1, 68: _V, 69: 2, 70: 4, 71: 1, 72: 2, 73: 3, 74: _V, 75: 1, 80: 2, 81: _V, 82: _V, 83: 0,
+    **dict.fromkeys(range(85, 93), 1), 93: 2, 94: 1, 95: 3, 96: 2, 97: 2, 98: 1, 99: 2, 100: 1, 101: 2, 102: 1,
+    103: _V, 104: 1, 105: _V, 106: _V, 107: 2, 108: _V, 109: 2, 110: 2, 117: 1, 118: 1, 119: 1, 120: 12,
+    **dict.fromkeys(range(121, 125), 2),
+    131: 1, 132: 1, 133: _V, 136: 3, 137: 3, 138: 1, 139: 1, 140: 2, 141: 2, 142: 1, 143: 1, 144: 2, 145: 2, 146: 1,
+    147: 1, 148: 2, 149: 2, 150: 1, 151: 1, 152: 1, 153: 1, 154: 2, 155: 2, 156: 2, 157: 2, 158: 1, 159: 1, 160: 2,
+    161: 2, 162: 1, 163: 1, **dict.fromkeys(range(164, 172), 2),
+    182: 2, 183: 2, 184: 2, 185: 1, 186: 1, 187: 12, 188: _V2, 189: 2, 190: _V2, 191: _V, 192: 4, 193: 5, 194: 4,
+    195: 2, 196: 4, 197: 2, 198: 2, 199: 5, 200: 4,
+}
+# the Word 6 sprms this reader reads -> the Word 97 sprm of the same meaning and operand (sprmTDefTable's operand
+# is rebuilt, _tdef6)
+_OLD_SPRMS = {2: 0x4600, 24: 0x2416, 25: 0x2417, 65: 0x0800, 66: 0x0801, 68: 0x6A03, 69: 0x4804, 75: 0x080A,
+              80: 0x4A30, 85: 0x0835, 92: 0x083C, 117: 0x0855, 190: 0xD608}
+_OLD_DEF_TABLE = 190
+_TC6 = 10          # bytes of a Word 6 TC: rgf u16, then four 2-byte BRCs
+_TC6_GRF = 0x01E3  # the TC bits a TCGRF reads the same: fFirstMerged and fMerged (horzMerge), fVertMerge and
+                   # fVertRestart (vertMerge), vertAlign
+
+
+def _tdef6(arg: bytes) -> bytes:
+    """A Word 6 sprmTDefTable operand as a Word 97 one: itcMac and the cell boundaries kept, each whole 10-byte TC
+    widened to a 20-byte TC80 holding its TCGRF bits."""
+    if not arg or len(arg) < 1 + 2 * (arg[0] + 1):
+        return arg
+    head = 1 + 2 * (arg[0] + 1)
+    tcs = [struct.unpack_from("<H", arg, at)[0] & _TC6_GRF
+           for at in range(head, head + _TC6 * min(arg[0], (len(arg) - head) // _TC6), _TC6)]
+    return arg[:head] + b"".join(struct.pack("<H", g) + bytes(TC80 - 2) for g in tcs)
+
+
+def _old_sprms(grpprl: bytes) -> list[tuple[int, bytes]]:
+    """The (op, operand) pairs of a Word 6 grpprl, each op its _OLD_SPRMS Word 97 sprm, else the Word 6 code (below
+    256, no Word 97 sprm this reader reads). A code without a known size or a truncated tail stops the list; every
+    sprm moves on by at least one byte."""
+    out, pos, n = [], 0, len(grpprl)
+    while pos < n:
+        op = grpprl[pos]
+        pos += 1
+        kind = _OLD_SIZES.get(op)
+        if kind is None:
+            break
+        size = kind
+        if kind == _V2:
+            if pos + 2 > n:
+                break
+            size = max(0, (grpprl[pos] | grpprl[pos + 1] << 8) - 1)
+            pos += 2
+        elif kind < 0:
+            if pos >= n:
+                break
+            size = grpprl[pos]
+            pos += 1
+            if kind == _TABS and size == 255:
+                size = _chg_tabs(grpprl, pos)
+                if size is None:
+                    break
+        if pos + size > n:
+            break
+        arg = bytes(grpprl[pos:pos + size])
+        pos += size
+        out.append((_OLD_SPRMS.get(op, op), _tdef6(arg) if op == _OLD_DEF_TABLE else arg))
+    return out
+
+
 _PAGE = 512
 _PN = 0x3FFFFF  # PnFkpChpx / PnFkpPapx: the page number is the low 22 bits
 
 
-def fkp_runs(word: bytes, bte: bytes, kind: str, ctx) -> list[tuple[int, int, bytes]]:
+def fkp_runs(word: bytes, bte: bytes, kind: str, ctx, old: Fib | None = None) -> list[tuple[int, int, bytes]]:
     """The (fc0, fc1, data) runs of the FKP pages a PlcBteChpx or PlcBtePapx (`bte`: n + 1 FCs, n PnFkp u32) names;
     `kind` is "chpx" (data: the CHPX grpprl) or "papx" (data: GrpPrlAndIstd, istd u16 then the grpprl). A page is
     512 bytes at (pn & 0x3FFFFF) * 512 in WordDocument, crun at byte 511, then crun + 1 FCs and crun one-byte
     offsets (CHPX) or 13-byte BXs (PAPX); an offset times 2 is where the CHPX (cb u8, grpprl) or PapxInFkp (cb u8:
     2cb - 1 bytes, or 0 then cb' u8: 2cb' bytes) starts, 0 being no properties. A page named twice is read once.
-    A BTE whose size is not 4 + 8n, a page past the stream, a crun whose tables pass byte 511, and a run with
+    With `old`, the Word 6 FIB, the PNs are u16, a BX is 7 bytes and a PAPX cw u8 then 2cw bytes; a PlcBte naming
+    fewer pages than cpnBte stands for that many pages from pnFirst on (Word 6 writes the PlcBte short). A BTE
+    whose size is not 4 + 8n (4 + 6n), a page past the stream, a crun whose tables pass byte 511, and a run with
     decreasing FCs or whose offset points into the tables or past byte 511 are skipped and counted under styles;
     so are the entries of a BTE naming more pages than WordDocument holds, past that many."""
     if not bte:
         return []
-    if len(bte) < 12 or (len(bte) - 4) % 8:
+    papx = kind == "papx"
+    each = 6 if old else 8
+    if len(bte) < 4 + each or (len(bte) - 4) % each:
         ctx.skipped["styles"] += 1
         return []
-    n = (len(bte) - 4) // 8
-    k = min(n, len(word) // _PAGE)  # every page is a different 512 bytes of WordDocument
-    if k < n:
+    n = (len(bte) - 4) // each
+    pns = struct.unpack_from("<%d%s" % (n, "H" if old else "I"), bte, 4 * (n + 1))
+    if old:
+        first, cpn = old.pn_first[papx], old.cpn[papx]
+        if n < cpn and first:
+            pns = range(first, first + cpn)
+    k = min(len(pns), len(word) // _PAGE)  # every page is a different 512 bytes of WordDocument
+    if k < len(pns):
         ctx.skipped["styles"] += 1
-    papx = kind == "papx"
-    width = 13 if papx else 1
+    width = (7 if old else 13) if papx else 1
     out, seen = [], set()
-    for pn in struct.unpack_from("<%dI" % k, bte, 4 * (n + 1)):
+    for pn in pns[:k]:
         pn &= _PN
         if pn in seen:
             continue
@@ -353,6 +542,8 @@ def fkp_runs(word: bytes, bte: bytes, kind: str, ctx) -> list[tuple[int, int, by
             cb = page[off]
             if not papx:
                 start, size = off + 1, cb
+            elif old:
+                start, size = off + 1, 2 * cb
             elif cb:
                 start, size = off + 1, 2 * cb - 1
             else:
@@ -404,14 +595,19 @@ _ISPRM = {0x0C: 0x260A, 0x18: 0x2416, 0x19: 0x2417, 0x41: 0x0800, 0x4B: 0x080A, 
           0x75: 0x0855, 0x78: 0x2640}
 
 
-def prm_sprms(prm: int, prc: list[bytes]) -> list[tuple[int, bytes]] | None:
+def prm_sprms(prm: int, prc: list[bytes], old: bool = False) -> list[tuple[int, bytes]] | None:
     """The sprms a piece's Prm adds: bit 0 clear is Prm0, isprm (bits 1-7) and a one-byte val (bits 8-15); bit 0 set
-    is Prm1, igrpprl (bits 1-15) indexing the Clx Prc list, its sprms cut to last_sprms. None when that index is past
-    the list."""
+    is Prm1, igrpprl (bits 1-15) indexing the Clx Prc list, its sprms cut to last_sprms. An `old` (Word 6) Prm0's
+    isprm is the sprm itself, read when its operand is one byte; its Prc grpprls are Word 6 sprms. None when the
+    index is past the list."""
     if prm & 1:
         k = prm >> 1
-        return last_sprms(sprms(prc[k])) if k < len(prc) else None
-    op = _ISPRM.get(prm >> 1 & 0x7F)
+        return last_sprms(sprms(prc[k], old)) if k < len(prc) else None
+    isprm = prm >> 1 & 0x7F
+    if old:
+        op = _OLD_SPRMS.get(isprm) if _OLD_SIZES.get(isprm) == 1 else None
+    else:
+        op = _ISPRM.get(isprm)
     return [(op, bytes((prm >> 8,)))] if op else []
 
 
@@ -545,9 +741,10 @@ class Styles:
     """The style sheet (STSH) and the properties its istdBase chains give. `bad` counts the damage met: a cut STSH or
     STD, a chain cut at STYLE_DEPTH links or by a cycle; the caller adds it to ctx.skipped["styles"]."""
 
-    def __init__(self, stsh: bytes = b""):
+    def __init__(self, stsh: bytes = b"", old: bool = False, codec: str = "cp1252"):
         self.stds: dict[int, _Std] = {}
         self.bad = 0
+        self.old, self.codec = old, codec  # a Word 6 STSH: Word 6 sprms, names 8-bit in codec
         self._chains: dict[int, list] = {}
         self._runs: dict[tuple, RunProps] = {}
         self._paras: dict[int, ParaProps] = {}
@@ -555,14 +752,14 @@ class Styles:
             self._read(stsh)
 
     def _read(self, stsh: bytes):
-        """cbStshi u16 and the Stshi (cstd u16, cbSTDBaseInFile u16, ...), then cstd LPStds (cbStd u16, the STD; 0 is
-        an empty slot), all inside the STSH's own lcb."""
+        """cbStshi u16 and the Stshi (cstd u16, cbSTDBaseInFile u16: 10 or more, 8 for Word 6, ...), then cstd
+        LPStds (cbStd u16, the STD; 0 is an empty slot), all inside the STSH's own lcb."""
         n = len(stsh)
         if n < 6:
             self.bad += 1
             return
         cb, cstd, base = struct.unpack_from("<3H", stsh)
-        if cb < 4 or 2 + cb > n or base < 10:
+        if cb < 4 or 2 + cb > n or base < (8 if self.old else 10):
             self.bad += 1
             return
         pos = 2 + cb
@@ -584,22 +781,27 @@ class Styles:
 
     def _std(self, raw: bytes, base: int) -> "_Std | None":
         """One STD: StdfBase (sti in the low 12 bits; stk and istdBase; cupx), the rest of the cbSTDBaseInFile-byte
-        Stdf, the name (u16 count, UTF-16, u16 0), then cupx UPXs (cbUpx u16 and its bytes), each from an even
-        offset. A paragraph style (stk 1) has UpxPapx (istd + grpprl) and UpxChpx; a character style (2) UpxChpx; a
-        table style (3) UpxTapx, UpxPapx and UpxChpx; a numbering style (4) UpxPapx. A cut STD is counted: its
-        name cut, it is left out; its UPXs cut, it keeps those read."""
+        Stdf, the name (u16 count, UTF-16, u16 0; Word 6: u8 count, 8-bit, a 0 byte), then cupx UPXs (cbUpx u16 and
+        its bytes), each from an even offset. A paragraph style (stk 1) has UpxPapx (istd + grpprl) and UpxChpx; a
+        character style (2) UpxChpx; a table style (3) UpxTapx, UpxPapx and UpxChpx; a numbering style (4) UpxPapx.
+        A cut STD is counted: its name cut, it is left out; its UPXs cut, it keeps those read."""
         n = len(raw)
         if n < base + 2:
             self.bad += 1
             return None
         w0, w1, w2 = struct.unpack_from("<3H", raw)
         stk, cupx = w1 & 0xF, w2 & 0xF
-        at = base + 2 + 2 * struct.unpack_from("<H", raw, base)[0]
+        if self.old:
+            at = base + 1 + raw[base]
+            name = raw[base + 1:at].decode(self.codec, "replace")
+            at += 1
+        else:
+            at = base + 2 + 2 * struct.unpack_from("<H", raw, base)[0]
+            name = raw[base + 2:at].decode("utf-16-le", "replace")
+            at += 2
         if at > n:
             self.bad += 1
             return None
-        name = raw[base + 2:at].decode("utf-16-le", "replace")
-        at += 2
         upx = []
         for _ in range(cupx):
             at += at & 1
@@ -613,7 +815,7 @@ class Styles:
         chpx_at = {1: 1, 2: 0, 3: 2}.get(stk)
         papx = upx[papx_at][2:] if papx_at is not None and papx_at < len(upx) else b""
         chpx = upx[chpx_at] if chpx_at is not None and chpx_at < len(upx) else b""
-        return _Std(w0 & 0xFFF, w1 >> 4, name, last_sprms(sprms(papx)), last_sprms(sprms(chpx)))
+        return _Std(w0 & 0xFFF, w1 >> 4, name, last_sprms(sprms(papx, self.old)), last_sprms(sprms(chpx, self.old)))
 
     def chain(self, istd: int) -> list:
         """The STDs from the root of istd's istdBase chain down to istd's own: at most STYLE_DEPTH, a cycle cut

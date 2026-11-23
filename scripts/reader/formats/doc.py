@@ -1,4 +1,10 @@
-"""Word 97-2003 binary (.doc) to the document model.
+"""Word 97-2003 and Word 6/95 binary (.doc) to the document model.
+
+A Word 6/95 file (doc_fib's old FIB) is read on the same path: its tables are in WordDocument, which is also where its
+pictures' PicLocations point; its text is 8-bit (doc_fib.old_codec), a piece table when fComplex, else fcMin..fcMac;
+its sprms are mapped to Word 97 ones as they are read; a comment's ATRD is 20 bytes (ibst at 10) and the authors 8-bit
+Pascal strings; PlcfHdd holds only the stories the DOP's and each section's grpfIhdt name (old_hdd). It has no list
+tables (its numbering, ANLD, is not read) and no OfficeArt drawings.
 
 The text is one CP stream cut into stories (doc_fib.STORIES). A story is walked once: plain runs are text, and every
 character below 0x20 other than a tab goes to its handler in _Reader.SPECIAL, paragraph marks included. Logic follows
@@ -88,6 +94,10 @@ _HDD, _ATN_OWNERS, _RMARK, _TXBX, _HDR_TXBX = 11, 36, 51, 56, 58
 # size of a Ref data element (an FRD, or an ATRDPre10: xstUsrInitl, then ibst u16 at 20) and the kind a loss counts as
 _NOTES = (("footnote", "fn", 2, 3, 2, "footnotes"), ("endnote", "en", 46, 47, 2, "footnotes"),
           ("annotation", "cm", 4, 5, 30, "comments"))
+_ATRD6 = 20  # bytes of a Word 6 ATRD: xstUsrInitl (u8 count, 9 bytes), ibst u16 at 10, ak, grfbmc, lTagBkmk
+_SED, _DOP = 6, 31  # FibRgFcLcb indices of PlcfSed and the DOP
+_SED_CB = 12        # bytes of a SED: fn, fcSepx i32 at 2, fnMpr, fcMpr
+_GPRF_IHDT = 153    # the Word 6 sprmSGprfIhdt: the header and footer stories a section has, one bit each
 _FTXBXS = 22      # bytes of an FTXBXS: reusable01, reusable02, fReusable i16 at 8, itxbxsDest, lid, txidUndo
 _SEPARATORS = 6   # PlcfHdd stories before the first section's: the footnote and endnote separators and notices
 _SECTION = 6      # PlcfHdd stories a section: even header, odd header, even footer, odd footer, first header, footer
@@ -123,12 +133,15 @@ def _plc(data: bytes, cb: int) -> tuple[list[int], list[bytes]]:
     return cps, [data[at + cb * i:at + cb * (i + 1)] for i in range(n)] if cb else []
 
 
-def _author(atrd: bytes, owners: list[str]) -> str:
+def _author(atrd: bytes, owners: list[str], codec: str | None = None) -> str:
     """A comment's author: GrpXstAtnOwners[ibst], else (ibst past the list, or the name empty) the initials of the
-    ATRDPre10's xstUsrInitl (u16 count, at most 9 UTF-16 units). Control characters become spaces."""
-    ibst = struct.unpack_from("<H", atrd, 20)[0]
+    ATRDPre10's xstUsrInitl (u16 count, at most 9 UTF-16 units). A Word 6 ATRD (`codec` its 8-bit text's) has ibst at
+    10 and xstUsrInitl a u8 count and at most 9 bytes. Control characters become spaces."""
+    ibst = struct.unpack_from("<H", atrd, 10 if codec else 20)[0]
     name = owners[ibst] if ibst < len(owners) else ""
-    if not name:
+    if not name and codec:
+        name = atrd[1:1 + min(atrd[0], 9)].decode(codec, "replace")
+    elif not name:
         name = atrd[2:2 + 2 * min(struct.unpack_from("<H", atrd)[0], 9)].decode("utf-16-le", "replace")
     return _C0.sub(" ", name)
 
@@ -296,7 +309,9 @@ class _Reader:
         self.table = b""
         self.fib = None
         self.pieces = []
-        self.lid = 0x0409  # the language of compressed text (doc_fib.compressed_codepage)
+        self.lid = 0x0409  # the document's language
+        self.codec = "cp1252"  # the codec of compressed text: doc_fib.compressed_codepage, or old_codec for Word 6
+        self.old = False   # a Word 6/95 file
         self.ranges = {}   # story name -> (cp0, cp1), clamped to the CPs the pieces hold
         self.base = {}     # story name -> its first CP, unclamped: a story PLC's CPs count from it
         self.note_at = {}     # CP -> the id of the footnote or endnote whose reference (\x02) is there
@@ -376,11 +391,15 @@ class _Reader:
         if f.encrypted or f.obfuscated:
             raise ReadError("encrypted")
         self.lid = f.lid_fe if f.far_east and f.lid_fe else f.lid
-        self.table = self.table_stream(f.table)
+        self.old = f.old
+        self.codec = doc_fib.old_codec(f) if f.old else doc_fib.compressed_codepage(self.lid)
+        self.table = self.word if f.old else self.table_stream(f.table)
         if self.table is None:
             self.main_only()
         else:
-            self.pieces, cut = doc_fib.fit(doc_fib.pieces(self.table, *f.pair(doc_fib.CLX)), len(self.word))
+            pcs = (doc_fib.pieces(self.table, *f.pair(doc_fib.CLX), old=f.old) if f.complex or not f.old
+                   else doc_fib.old_text(f))
+            self.pieces, cut = doc_fib.fit(pcs, len(self.word))
             if cut:
                 self.ctx.skipped["text"] += cut
         self.ranges = doc_fib.story_ranges(f.ccp, self.pieces[-1].cp_end if self.pieces else 0)
@@ -414,29 +433,38 @@ class _Reader:
         return _plc(self.table[fc:fc + lcb], cb)
 
     def owners(self) -> list[str]:
-        """GrpXstAtnOwners: the comment authors, an Xst (u16 count, UTF-16 units) each. The list ends where an Xst does
-        not fit, or at as many names as an ibst can index; it is empty when it is outside the table stream."""
+        """GrpXstAtnOwners: the comment authors, an Xst (u16 count, UTF-16 units) each, or in Word 6 an 8-bit Pascal
+        string (u8 count). The list ends where a name does not fit, or at as many names as an ibst can index; it is
+        empty when it is outside the table stream."""
         fc, lcb = self.fib.pair(_ATN_OWNERS)
         if not lcb or fc + lcb > len(self.table):
             return []
         raw, out, pos = self.table[fc:fc + lcb], [], 0
-        while pos + 2 <= lcb and len(out) < _OWNERS:
-            end = pos + 2 + 2 * struct.unpack_from("<H", raw, pos)[0]
+        head, unit = (1, 1) if self.old else (2, 2)
+        while pos + head <= lcb and len(out) < _OWNERS:
+            count = raw[pos] if self.old else struct.unpack_from("<H", raw, pos)[0]
+            end = pos + head + unit * count
             if end > lcb:
                 break
-            out.append(raw[pos + 2:end].decode("utf-16-le", "replace"))
+            out.append(raw[pos + head:end].decode(self.codec if self.old else "utf-16-le", "replace"))
             pos = end
         return out
 
     def rmark(self, ibst) -> str:
         """The author SttbfRMark names at `ibst` (an extended STTB: 0xFFFF, u16 cData, u16 cbExtra, then a u16 count
-        and UTF-16 units a name, MS-DOC 2.9.274), "" past it or without one. Read once, names past an STTB that does
-        not fit left out."""
+        and UTF-16 units a name, MS-DOC 2.9.274; Word 6: u16 the STTB's size, then a u8 count and 8-bit text a
+        name), "" past it or without one. Read once, names past an STTB that does not fit left out."""
         if self.rmarks is None:
             self.rmarks = []
             fc, lcb = self.fib.pair(_RMARK)
             raw = self.table[fc:fc + lcb] if lcb and fc + lcb <= len(self.table) else b""
-            if len(raw) >= 6 and raw[:2] == b"\xff\xff":
+            if self.old and len(raw) >= 2:
+                end, pos = min(struct.unpack_from("<H", raw)[0], len(raw)), 2
+                while pos < end and pos + 1 + raw[pos] <= end:
+                    name = _C0.sub(" ", raw[pos + 1:pos + 1 + raw[pos]].decode(self.codec, "replace"))
+                    self.rmarks.append(" ".join(name.split())[:MAX_NAME])
+                    pos += 1 + raw[pos]
+            elif len(raw) >= 6 and raw[:2] == b"\xff\xff":
                 n, extra = struct.unpack_from("<HH", raw, 2)
                 pos = 6
                 while len(self.rmarks) < n and pos + 2 <= len(raw):
@@ -467,18 +495,19 @@ class _Reader:
         counted once (storyless)."""
         pending = []
         for name, prefix, ref_index, txt_index, cb, kind in _NOTES:
+            comment = name == "annotation"
             with self.ctx.guard(kind):
-                refs, data = self.story_plc(ref_index, cb)
+                refs, data = self.story_plc(ref_index, _ATRD6 if comment and self.old else cb)
                 txt, _ = self.story_plc(txt_index, 0)
                 n, have = len(data), max(len(txt) - 1, 0)
                 self.storyless(name, kind, n or have)
                 k = min(n, have)
                 if k and txt[k] > self.fib.ccp[name]:
                     raise ValueError("note text past its story")
-                comment = name == "annotation"
                 owners = self.owners() if comment and k else []
+                codec = self.codec if self.old else None
                 found = [(refs[i], (f"{prefix}-{i + 1}", name, txt[i], txt[i + 1], kind,
-                                    _author(data[i], owners) if comment else None))
+                                    _author(data[i], owners, codec) if comment else None))
                          for i in range(k) if txt[i] < txt[i + 1]]
                 at = self.comment_at if comment else self.note_at
                 for cp, note in found:
@@ -509,13 +538,16 @@ class _Reader:
             cps, _ = self.story_plc(_HDD, 0)
             end = len(cps) - 1
             self.storyless("header", "header", end > 0)
-            if end > _SEPARATORS and (end - _SEPARATORS) % _SECTION == 1:
-                end -= 1
-            if end > _SEPARATORS and cps[end] > self.fib.ccp["header"]:
+            if self.old:
+                slots = self.old_hdd(end)
+            else:
+                if end > _SEPARATORS and (end - _SEPARATORS) % _SECTION == 1:
+                    end -= 1
+                slots = [(k, (k - _SEPARATORS) % _SECTION) for k in range(_SEPARATORS, end)]
+            if slots and cps[slots[-1][0] + 1] > self.fib.ccp["header"]:
                 raise ValueError("header past its story")
-            spans = [(k, cps[k], cps[k + 1]) for k in range(_SEPARATORS, end) if cps[k] < cps[k + 1]]
-        for k, a, b in spans:
-            footer = (k - _SEPARATORS) % _SECTION in _FOOTERS
+            spans = [(slot in _FOOTERS, cps[k], cps[k + 1]) for k, slot in slots if cps[k] < cps[k + 1]]
+        for footer, a, b in spans:
             with self.ctx.guard("footer" if footer else "header"):
                 text = flat(self.read("header", a, b))
                 if text:
@@ -524,6 +556,34 @@ class _Reader:
             text = flat(blocks)
             if text:
                 self.doc.headers.append(text)
+
+    def old_hdd(self, end) -> list[tuple[int, int]]:
+        """(PlcfHdd entry, its place among a section's six stories) of a Word 6 file, whose PlcfHdd holds only the
+        stories that exist: first one per bit of the DOP's grpfIhdt (byte 1; its six low bits are the footnote and
+        endnote separators and notices), then for each section of PlcfSed (n + 1 CPs, 12-byte SEDs, fcSepx at 2
+        naming a SEPX, cb u16 then a Word 6 grpprl, in WordDocument) one per bit of its sprmSGprfIhdt, bit k place k.
+        The entries past `end` (the last one being the guard paragraph mark) are left out; a SED whose SEPX is not
+        in the stream has no stories (fcSepx -1 is a section without a SEPX)."""
+        fc, lcb = self.fib.pair(_DOP)
+        dop = self.table[fc:fc + lcb] if 2 <= lcb and fc + lcb <= len(self.table) else b"\0\0"
+        k = (dop[1] & 0x3F).bit_count()
+        _, seds = self.story_plc(_SED, _SED_CB)
+        out, seen = [], {}
+        for sed in seds:
+            at = struct.unpack_from("<i", sed, 2)[0]
+            bits = seen.get(at)
+            if bits is None:
+                bits = seen[at] = 0
+                if 0 <= at and at + 2 <= len(self.word):
+                    grpprl = self.word[at + 2:at + 2 + struct.unpack_from("<H", self.word, at)[0]]
+                    for op, arg in doc_fib.sprms(grpprl, True):
+                        if op == _GPRF_IHDT:
+                            bits = seen[at] = arg[0]
+            for place in range(_SECTION):
+                if bits >> place & 1:
+                    out.append((k, place))
+                    k += 1
+        return [(i, place) for i, place in out if i < end]
 
     def boxes(self, name, index, kind) -> dict:
         """{lid: blocks} of each text box of PlcftxbxTxt or PlcfHdrtxbxTxt, in story order: a range a text box,
@@ -598,19 +658,20 @@ class _Reader:
         guard("styles") (the lists under guard("numbering")): a damaged one leaves its default (no styles, no lists, no
         runs) and costs formatting only."""
         with self.ctx.guard("styles"):
-            self.styles = doc_fib.Styles(self.plc(doc_fib.STSH))
+            self.styles = doc_fib.Styles(self.plc(doc_fib.STSH), self.old, self.codec)
         with self.ctx.guard("numbering"):
             self.lists = doc_fib.Lists(self.table, self.fib.pair(doc_fib.PLF_LST), self.fib.pair(doc_fib.PLF_LFO))
         if self.lists.bad:
             self.ctx.skipped["numbering"] += self.lists.bad
         with self.ctx.guard("styles"):
             self.prc = doc_fib.prcs(self.table, *self.fib.pair(doc_fib.CLX))
+        old = self.fib if self.old else None
         with self.ctx.guard("styles"):
-            fkp = doc_fib.fkp_runs(self.word, self.plc(doc_fib.BTE_CHPX), "chpx", self.ctx)
+            fkp = doc_fib.fkp_runs(self.word, self.plc(doc_fib.BTE_CHPX), "chpx", self.ctx, old)
             self.chp = doc_fib.cp_runs(fkp, self.pieces)
             self.chp_at = [r[0] for r in self.chp]
         with self.ctx.guard("styles"):
-            fkp = doc_fib.fkp_runs(self.word, self.plc(doc_fib.BTE_PAPX), "papx", self.ctx)
+            fkp = doc_fib.fkp_runs(self.word, self.plc(doc_fib.BTE_PAPX), "papx", self.ctx, old)
             self.pap = doc_fib.cp_runs(fkp, self.pieces)
             self.pap_at = [r[0] for r in self.pap]
 
@@ -618,7 +679,7 @@ class _Reader:
         """The sprms of a piece's Prm; a Prm1 past the Prc list is counted under styles once per value."""
         hit = self._prm.get(prm)
         if hit is None:
-            hit = doc_fib.prm_sprms(prm, self.prc)
+            hit = doc_fib.prm_sprms(prm, self.prc, self.old)
             if hit is None:
                 self.ctx.skipped["styles"] += 1
                 hit = []
@@ -626,7 +687,10 @@ class _Reader:
         return hit
 
     def data_stream(self):
-        """The Data stream, read once; None when it is missing or cannot be read."""
+        """The Data stream, read once; None when it is missing or cannot be read. A Word 6 file has none: what a
+        PicLocation names is in WordDocument."""
+        if self.old:
+            return self.word
         if self.data is None:
             try:
                 self.data = self.cf.read("Data")
@@ -637,7 +701,7 @@ class _Reader:
     def papx_sprms(self, grpprl) -> list:
         """A PAPX's sprms, cut to doc_fib.last_sprms, a sprmPHugePapx replaced where it stands by the grpprl it points
         at in the Data stream."""
-        ops = doc_fib.sprms(grpprl)
+        ops = doc_fib.sprms(grpprl, self.old)
         if any(op == _HUGE_PAPX for op, _ in ops):
             out = []
             for op, arg in ops:
@@ -683,7 +747,7 @@ class _Reader:
         key = (istd, data, prm)
         hit = self._runs.get(key)
         if hit is None:
-            hit = self._runs[key] = self.styles.run(istd, doc_fib.sprms(data) + self.prm_sprms(prm))
+            hit = self._runs[key] = self.styles.run(istd, doc_fib.sprms(data, self.old) + self.prm_sprms(prm))
         return hit
 
     def segments(self, story) -> list:
@@ -730,7 +794,7 @@ class _Reader:
     # ---- the walk
     def story(self, name) -> list:
         cp0, cp1 = self.ranges[name]
-        s = doc_fib.story(self.word, self.pieces, cp0, cp1, self.lid)
+        s = doc_fib.story(self.word, self.pieces, cp0, cp1, self.codec)
         return self.walk(_State(name, s))
 
     def read(self, name, cp0, cp1) -> list:
@@ -738,7 +802,7 @@ class _Reader:
         pieces hold."""
         a, b = self.ranges[name]
         base = self.base[name]
-        s = doc_fib.story(self.word, self.pieces, min(max(base + cp0, a), b), min(max(base + cp1, a), b), self.lid)
+        s = doc_fib.story(self.word, self.pieces, min(max(base + cp0, a), b), min(max(base + cp1, a), b), self.codec)
         return self.walk(_State(name, s))
 
     def walk(self, st) -> list:
