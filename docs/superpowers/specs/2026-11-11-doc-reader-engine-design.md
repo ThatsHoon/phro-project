@@ -2,13 +2,13 @@
 
 ## Goal
 
-phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all formats in scope: the 28 of decision 1, and since decision 7 also docx, pptx, xlsx and xlsm with their template and macro variants, since decision 8 pdf, with phase 3 the WordPerfect variants wp, wp5, wp6, wp7 and wpt, with phase 4 the variants mde, accde, accdr, djv, vst, vsdm, vstx and mpt, and since decision 11 the picture files wmf, emf, wmz, emz, tif, tiff, pct, pict and wpg (63 extensions). The standard library is not a goal (the user, 2026-11-16): parsers and libraries are chosen for token efficiency, compute efficiency and the AI understanding every content type; a third-party library is used wherever it measurably beats our own code, installed only on the user's yes. The parsers built so far are Python with no third-party imports; libraries in use today (decision 8: pypdfium2 for pdf, in a plugin-managed venv created only with the user's yes, with a stdlib parser beside it; decision 9: MPXJ for mpp, which reads only through its opt-in venv; decision 11: resvg_py and Pillow for pictures on macOS and Linux, in the opt-in image venv). It is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
+phro-project gets a built-in document reader. When Claude is about to `Read` a document that Claude Code cannot read well by itself, a hook turns it into compact Markdown (plus viewable images) and hands Claude that file instead. One engine does the conversion for all formats in scope: the 28 of decision 1, and since decision 7 also docx, pptx, xlsx and xlsm with their template and macro variants, since decision 8 pdf, with phase 3 the WordPerfect variants wp, wp5, wp6, wp7 and wpt, with phase 4 the variants mde, accde, accdr, djv, vst, vsdm, vstx and mpt, and since decision 11 the picture files wmf, emf, wmz, emz, tif, tiff, pct, pict and wpg (63 extensions). The standard library is not a goal (the user, 2026-11-16): parsers and libraries are chosen for token efficiency, compute efficiency and the AI understanding every content type; a third-party library is used wherever it measurably beats our own code, installed only on the user's yes. The parsers built so far are Python with no third-party imports; libraries in use today (decision 8: pypdfium2 for pdf, in a plugin-managed venv created only with the user's yes, with a stdlib parser beside it; decision 13: a port of MPXJ's reader for mpp, under the LGPL; decision 11: resvg_py and Pillow for pictures on macOS and Linux, in the opt-in image venv). It is rebuilt from what reverse engineering the bench's engines taught us, not wrapped around them.
 
 This is stage 4 of the user's request. Stages 1 to 3 (clone, test, report) are done: `C:\Users\hunje\research\ai-document-reader-plugins\bench` and its reports.
 
 Success:
 
-- Every in-scope extension converts through the gate with no software outside the plugin-managed venvs. pdf converts with none at all through its stdlib parser; the optional pdf venv holds only pypdfium2 and is created only with the user's yes (phase 2d). mpp has no stdlib path: it converts only through the mpp venv (MPXJ and JPype), created only with the user's yes, using a Java already on PATH. The plugin never installs Java (phase 4). Pictures (WMF, EMF, PICT, WPG, TIFF) become PNGs on Windows with nothing installed, through GDI+; on macOS and Linux through the image venv, created only with the user's yes; their text needs nothing (decision 11). Scanned pages and raster pictures are read by OCR when an engine is present: Windows OCR, built in, and Tesseract when the user has it. The reader installs no OCR engine (decision 12).
+- Every in-scope extension converts through the gate with no software outside the plugin-managed venvs. pdf converts with none at all through its stdlib parser; the optional pdf venv holds only pypdfium2 and is created only with the user's yes (phase 2d). mpp converts with nothing installed, through a port of MPXJ's reader (decision 13); no Java is used. Pictures (WMF, EMF, PICT, WPG, TIFF) become PNGs on Windows with nothing installed, through GDI+; on macOS and Linux through the image venv, created only with the user's yes; their text needs nothing (decision 11). Scanned pages and raster pictures are read by OCR when an engine is present: Windows OCR, built in, and Tesseract when the user has it. The reader installs no OCR engine (decision 12).
 - On the bench, for every format with scored documents, the engine's fidelity is at least the current recommended route's minus 0.01, and its calibrated tokens are at most that route's plus 5%. Where it misses, the format's report says why and what it would take. For docx, pptx, xlsx and xlsm the route is the skill's own read command run on the original file, and the skill's own load is reported in its own column (decision 7).
 - A document never reaches Claude as raw binary: the gate either swaps in the Markdown or blocks the Read with a reason.
 - Nothing is printed into a session that does not read a document. The plugin's always-on token cost does not change.
@@ -28,6 +28,7 @@ Success:
 10. (User, 2026-11-17.) Diagrams as specified in `2026-11-17-doc-reader-diagrams-design.md`: shapes joined by connectors become a Mermaid flowchart, or a nested list for a branching tree, and connector ends left loose are placed by position.
 11. (User, 2026-11-18.) Metafiles as specified in `2026-11-18-doc-reader-metafiles-design.md`: WMF, EMF, PICT, WPG and TIFF pictures become PNG links followed by their text, drawn by GDI+ on Windows and by our SVG writer and resvg_py elsewhere.
 12. (User, 2026-11-19.) OCR as specified in `2026-11-19-doc-reader-ocr-design.md`: scanned pdf and TIFF pages give their text, plus the page image when the page is doubtful, and raster pictures get `Picture text:`. Windows OCR is reached through ctypes; Tesseract `eng` reads Latin pages when present.
+13. (User, 2026-11-23.) mpp is read natively by a port of MPXJ's MPPReader (LGPL-2.1, `mpp_read`, `mpp_blocks`, `mpp8` and `mpp_calendars`, each carrying the LGPL notice); the opt-in MPXJ venv of decision 9 and its Java are gone. mpp is the one format whose port may come from LGPL code; every other port stays MIT, BSD, Apache or MPL.
 
 ## Reverse-engineering findings that shape the design
 
@@ -49,7 +50,7 @@ No engine wins a format on every axis; each wins different items. The engine tak
 | mobi/azw3 | Tika `parser/mobi` (PalmDB, PalmDOC, HUFF/CDIC) | foliate-js (KF8 assembly, links) | KFX, Topaz, skeleton-less KF8 read from flow 0; fall back KF8 → MOBI6 → stripped text |
 | pages/numbers/key | docling (own Snappy, protobuf wire reader, IWA objects) | numbers-parser: field numbers, tile row = tileid × tile size, cell v5; keynote-parser field numbers; an iWork '09 XML reader | trailing empties, `None` in merges, LZVN members, bundle folders |
 
-Licenses: dochan, kordoc, rhwp, anydoc, docling, xberg, markitdown, numbers-parser, foliate-js and keynote-parser are MIT, and Apache Tika is Apache-2.0. Code ported from them is credited in `THIRD_PARTY_NOTICES.md`. djvu-rs is MIT, Jackcess and Apache POI are Apache-2.0, and libmspub and libvisio are MPL-2.0; each file ported from libmspub or libvisio carries the MPL-2.0 header. MuPDF (AGPL), Calibre (GPL), libwpd/librevenge (MPL/LGPL), Apple's `.proto` files (numbers-parser's and keynote-parser's), mdbtools (LGPL), MPXJ (LGPL) and DjVuLibre (GPL) are used as format knowledge only, never copied; MPXJ is installed into the mpp venv and called.
+Licenses: dochan, kordoc, rhwp, anydoc, docling, xberg, markitdown, numbers-parser, foliate-js and keynote-parser are MIT, and Apache Tika is Apache-2.0. Code ported from them is credited in `THIRD_PARTY_NOTICES.md`. djvu-rs is MIT, Jackcess and Apache POI are Apache-2.0, and libmspub and libvisio are MPL-2.0; each file ported from libmspub or libvisio carries the MPL-2.0 header. MuPDF (AGPL), Calibre (GPL), libwpd/librevenge (MPL/LGPL), Apple's `.proto` files (numbers-parser's and keynote-parser's), mdbtools (LGPL) and DjVuLibre (GPL) are used as format knowledge only, never copied; MPXJ (LGPL) is ported for mpp alone (decision 13), its four files keeping the LGPL notice.
 
 ## Architecture
 
@@ -70,10 +71,10 @@ scripts/reader/
                doc.py xls.py ppt.py xlsb.py rtf.py wpd.py wpd_charsets.py mobi.py
                iwork.py iwork_iwa.py iwork_text.py iwork_tables.py iwork_xml.py
                djvu.py jet.py jet_pages.py jet_sql.py pub.py pub_2k.py pub_contents.py pub_quill.py
-               vsd.py vsd_stream.py mpp.py mpp_mpxj.py
+               vsd.py vsd_stream.py mpp.py mpp_read.py mpp_blocks.py mpp8.py mpp_calendars.py mpp_notes.py
                pdf.py pdf_pdfium.py pdf_layout.py pdf_tables.py
   pdfnative/                    stdlib pdf parser (dochan port)
-  pyenv.py pysetup.py           the pdf, mpp and image venvs: location, ready marker, setup
+  pyenv.py pysetup.py           the pdf and image venvs: location, ready marker, setup
 ```
 
 Each format module exposes one function, `parse(path: Path, ctx: Context) -> Doc`. It reads through a container module and emits model blocks; it never writes Markdown. `markdown.render(doc, assets_dir) -> str` is the only place output format and token rules live, so every format gets the same rules.
@@ -86,7 +87,7 @@ Each format module exposes one function, `parse(path: Path, ctx: Context) -> Doc
 | `convert <file> [--out DIR] [--hidden]` | converts one file, prints the out.md path |
 | `formats` | lists extensions and their module |
 | `prune [--days 30]` | deletes cache entries not used for N days |
-| `setup [--for pdf\|mpp\|image] [--venv DIR] [--check] [--decline] [--remove]` | creates, checks or removes the pdf (default), mpp or image venv; run only on the user's yes |
+| `setup [--for pdf\|image] [--venv DIR] [--check] [--decline] [--remove]` | creates, checks or removes the pdf (default) or image venv; run only on the user's yes |
 
 ### Document model
 
@@ -155,12 +156,12 @@ The gate ships in phase 1. A format whose phase is not built yet is denied with 
 | 2c | docx, pptx, xlsx, xlsm, dotx, dotm, potx, potm, ppsm, xltx, xltm | `ooxml_sheets`, `sheet_drawing` (moved out of xlsb), `omml`, streamed zip parts |
 | 2d | pdf | `pdfenv` (now `pyenv`) and `read.py setup` (the pypdfium2 venv), `pdfnative/` (dochan's parser), `pdf_layout`, `pdf_tables` (dochan's table assembly), AES-256 and CBC in `crypto`; specified in `2026-11-14-doc-reader-pdf-design.md` |
 | 3 | wpd (with wp, wp5, wp6, wp7, wpt), mobi, azw3, pages, numbers, key | `palmdb`, `snappy`, `pbwire`; specified in `2026-11-15-doc-reader-phase3-design.md` |
-| 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp (opt-in) | `bzz`, `jet_pages`, `vsd_stream`, `pub_contents`, `pub_quill`, `pyenv` (mpp); specified in `2026-11-15-doc-reader-phase4-design.md` |
+| 4 | djvu (text layer only), mdb, accdb, pub, vsd, mpp | `bzz`, `jet_pages`, `vsd_stream`, `pub_contents`, `pub_quill`, `mpp_read`, `mpp_blocks`, `mpp8` (decision 13); specified in `2026-11-15-doc-reader-phase4-design.md`, whose mpp venv decision 13 replaced |
 | diagrams | every format with drawings: vsd, vsdx, ppt, pptx, doc, docx, xls, xlsx, odp, odt, ods, pub, hwp, hwpx | `diagram`; specified in `2026-11-17-doc-reader-diagrams-design.md` |
 | metafiles | wmf, emf, wmz, emz, tif, tiff, pct, pict, wpg, and the pictures in every format | `vector`, `metafile`, `pict`, `wpg`, `fonts`, `raster`, `emf_write`, `svg_write`, `pyenv` (image); specified in `2026-11-18-doc-reader-metafiles-design.md` |
 | ocr | scanned pdf pages, TIFF pages and the raster pictures in every format | `ocr`, `ocr_win`, `ocr_tess`, the `ocr-worker` command; specified in `2026-11-19-doc-reader-ocr-design.md` |
 
-Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-reader-plugins/notes/*-survey.md`, rulings in `rea-decisions.md`). A format that cannot reach the success bar stays "unsupported" with the reason recorded; mpp is one: unsupported by default, read only through the opt-in `read.py setup --for mpp` path when Java and the user's install are present.
+Phases 3 and 4 were reverse engineered on 2026-11-14 (`research/ai-document-reader-plugins/notes/*-survey.md`, rulings in `rea-decisions.md`). A format that cannot reach the success bar stays "unsupported" with the reason recorded. mpp was one, read only through an opt-in MPXJ venv, until decision 13 ported MPXJ's reader.
 
 ## Testing
 

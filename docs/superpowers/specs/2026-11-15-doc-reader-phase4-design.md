@@ -2,6 +2,8 @@
 
 Approved 2026-11-16, with its Defaults, on the user's go-ahead to run the remaining work ("남은 작업 계속 진행해라"). It amends `docs/superpowers/specs/2026-11-11-doc-reader-engine-design.md` (the engine spec); the engine spec edits listed at the end are made in the same commit. It builds on phase 2d (`2026-11-14-doc-reader-pdf-design.md`) and comes after phase 3. Notes behind it, outside this repository: `research/ai-document-reader-plugins/notes/djvu-access-survey.md` and `notes/pub-vsd-mpp-survey.md` (the surveys), `notes/rea-decisions.md` (the rulings) and `notes/sample-collection-report.md` (the downloads).
 
+**Superseded for mpp (2026-11-23).** Everything below about Project (the MPXJ venv, JPype, Java, `read.py setup --for mpp`, `mpp_mpxj.py`, the "not installed" deny and the "No pure-Python mpp" rule) describes a path that was built and then removed. mpp is now read natively by a port of MPXJ's MPPReader under the LGPL: engine spec decision 13, and the README's Project paragraph. The rest of this spec stands.
+
 ## Goal
 
 The gate converts djvu (its text layer only), Access databases (mdb, accdb, mde, accde, accdr), Publisher (pub) and Visio binary (vsd). The vsdx reader gains master text and a connection list, so vsd and vsdx give the same output. Project (mpp) stays "unsupported", with one opt-in path: MPXJ in a plugin-managed venv, installed only on the user's yes, using Java that is already on PATH.

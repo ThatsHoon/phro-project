@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Superseded for mpp (2026-11-23).** This plan's mpp tasks (the MPXJ venv, `mpp_mpxj.py`, `setup --for mpp`) were built and later removed: mpp is read natively by a port of MPXJ's MPPReader (engine spec decision 13). Do not re-run them.
+
 **Goal:** The Read gate converts djvu (its text layer only), Access databases (`mdb`, `accdb`, `mde`, `accde`, `accdr`), Publisher (`pub`) and Visio binary (`vsd`, `vst`) with no install (the engine's own parsers; the standard library is not a goal, see Global Constraints). vsdx (and `vsdm`, `vstx`) gains master text and a connection list, so vsd and vsdx give the same output. Project (`mpp`, `mpt`) stays denied, with one opt-in path: MPXJ in a plugin-managed venv, installed only on the user's yes, using Java already on PATH.
 
 **Architecture:**

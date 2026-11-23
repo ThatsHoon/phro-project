@@ -870,6 +870,18 @@ def test_notices_credit_port_sources():
                 assert any(fnmatch.fnmatch(rel, p) for p in paths), (proj, rel)
 
 
+def test_notices_list_every_lgpl_port():
+    import re
+    text = (HERE / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    sec = text.split("## mpxj\n", 1)[1].split("\n## ", 1)[0]
+    listed = set(re.findall(r"`(scripts/[^`]+)`", next(ln for ln in sec.splitlines() if ln.startswith("Ported:"))))
+    ported = {f.relative_to(HERE).as_posix() for f in sorted((HERE / "scripts" / "reader").rglob("*.py"))
+              if f.read_text(encoding="utf-8").startswith("# Ported from MPXJ")}
+    assert ported and listed == ported, (sorted(ported - listed), sorted(listed - ported))
+    count = {3: "three", 4: "four", 5: "five", 6: "six"}[len(ported)]
+    assert f"The LGPL covers those {count} files only" in sec, count
+
+
 MPL_HEAD = ("# This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the"
             " MPL was not", "# distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.")
 
