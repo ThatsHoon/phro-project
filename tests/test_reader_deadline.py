@@ -170,6 +170,18 @@ def test_the_render_writes_no_block_past_its_stop():
     assert out.count(REST) == 1, out
 
 
+def test_a_convert_whose_render_is_past_its_stop_is_late():
+    from reader import limits
+    src, dst = dm.docm(dm.P("ALPHA")), tmp() / "out"
+    old, limits.RENDER_SECONDS = limits.RENDER_SECONDS, -limits.CONVERT_SECONDS
+    try:
+        meta = reader.convert(src, dst, backend=("", ""))
+    finally:
+        limits.RENDER_SECONDS = old
+    out = (dst / "out.md").read_text(encoding="utf-8")
+    assert limits.READ_LATE in meta["warnings"] and REST in out and "ALPHA" not in out, (meta, out)
+
+
 def test_the_render_stops_inside_a_big_table():
     import types
     from reader.model import Cell, Doc, Table, Text, Para
