@@ -578,7 +578,26 @@ def test_huffcdic_book():
     doc, ctx = _read(_pdb([rec0, bytes([0, 1, 2, 3]), huff] + cdics))
     assert "hello" in _text_of(doc.blocks) and not ctx.skipped
     rec0 = _rec0(compression=17480, text_length=40, text_records=1, huff_record=2, huff_count=9)   # outside the file
-    assert raises(ReadError, mobi.parse_bytes, _pdb([rec0, bytes([0]), huff] + cdics), Context()).kind == "damaged"
+    doc, ctx = _read(_pdb([rec0, bytes([0, 1, 2, 3]), huff] + cdics))
+    assert "hello" in _text_of(doc.blocks) and not ctx.skipped
+    assert ctx.warnings == ["HUFF/CDIC is 2 records, not 9 as the MOBI head says"], ctx.warnings
+
+
+def test_huffcdic_records_the_head_misplaces_are_found():
+    # a head whose HUFF/CDIC fields point at the text records (huff_record 1, as in a public corpus book): the HUFF
+    # record and its CDICs after the text are used, and the warning says so
+    huff, cdics = _huff_tables([b"<html><body>", b"<p>he", b"llo</p>", b"</body></html>"])
+    for first, count in ((1, 2), (1, 9), (0, 0)):
+        rec0 = _rec0(compression=17480, text_length=40, text_records=1, huff_record=first, huff_count=count)
+        doc, ctx = _read(_pdb([rec0, bytes([0, 1, 2, 3]), huff] + cdics + [b"\xff\xd8\xff\xe0"]))
+        assert "hello" in _text_of(doc.blocks) and not ctx.skipped, (first, count, ctx.skipped)
+        assert ctx.warnings == [f"HUFF/CDIC records found at record 2, not at {first} as the MOBI head says"] + (
+            [] if count == 2 else [f"HUFF/CDIC is 2 records, not {count} as the MOBI head says"]), ctx.warnings
+    # with no HUFF record after the text, or a HUFF without its CDIC, the book stays damaged
+    rec0 = _rec0(compression=17480, text_length=40, text_records=1, huff_record=1, huff_count=2)
+    for tail in ([], [huff], [huff, b"CDIX" + cdics[0][4:]]):
+        assert raises(ReadError, mobi.parse_bytes, _pdb([rec0, bytes([0, 1, 2, 3])] + tail), Context()).kind \
+            == "damaged", tail
 
 
 def test_palmdoc_book():

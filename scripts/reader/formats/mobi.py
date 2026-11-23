@@ -167,6 +167,24 @@ def _refuse(head: Head):
 
 
 # ---- text
+def _huff_records(palm: Palm, head: Head, ctx) -> tuple:
+    """The HUFF record and how many records it makes with the CDIC records right after it: the one the head names,
+    else the first after the text records. A head that names another record or count is named in ctx.warnings."""
+    first, count = head.huff_record, head.huff_count
+    at = first if 1 <= first < palm.count and palm.record(first)[:4] == b"HUFF" else next(
+        (k for k in range(head.text_records + 1, palm.count) if palm.record(k)[:4] == b"HUFF"), None)
+    n = 1
+    while at is not None and at + n < palm.count and palm.record(at + n)[:4] == b"CDIC":
+        n += 1
+    if at is None or n < 2:
+        raise ReadError("damaged", "no HUFF record with its CDIC records")
+    if at != first:
+        ctx.warnings.append(f"HUFF/CDIC records found at record {at}, not at {first} as the MOBI head says")
+    if n != count:
+        ctx.warnings.append(f"HUFF/CDIC is {n} records, not {count} as the MOBI head says")
+    return at, n
+
+
 def _text(palm: Palm, head: Head, file_size: int, ctx) -> bytes:
     """Text records 1..n, each trimmed of its trailing entries and unpacked to its cap, joined. A record that fails or
     is cut counts `record`; text past text_cap is cut and counts `truncated` once."""
@@ -176,9 +194,7 @@ def _text(palm: Palm, head: Head, file_size: int, ctx) -> bytes:
         bad += 1
     huff = None
     if head.compression == 17480:
-        first, count = head.huff_record, head.huff_count
-        if count < 2 or first < 1 or first + count > palm.count:
-            raise ReadError("damaged", "HUFF/CDIC records are outside the file")
+        first, count = _huff_records(palm, head, ctx)
         try:
             huff = HuffCdic(palm.record(first), [palm.record(first + i) for i in range(1, count)])
         except ValueError as e:
