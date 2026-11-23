@@ -209,6 +209,41 @@ def test_joined_line_keeps_the_space_its_piece_ended_with():
     assert texts(got) == ["15. 과장 전결사항인 기안문을"], texts(got)
 
 
+def spread(text, x, letter, word, size=12.0):
+    """One fragment per glyph of `text`, glyphs `letter` sizes apart and words `word` sizes apart, no space glyph."""
+    out = []
+    for w in text.split():
+        for ch in w:
+            out.append(frag(ch, x, 700, size))
+            x += 0.5 * size + letter * size
+        x += (word - letter) * size
+    return numbered(out)
+
+
+def test_letterspaced_line_is_read_as_words():
+    """A heading set 0.14-0.26 em apart on a page whose word gap is 0.11 em reads as its words (d534be6721 p. 4);
+    single digits a whole em apart and a line with space glyphs keep their spaces."""
+    frags = spread("CAPITAL REALLOCATION", 72, 0.2, 0.7)
+    for k, f in enumerate(frags):
+        f.x += (0.03 if k % 2 else -0.03) * f.size
+    assert texts(L.lines(frags, gap=0.11)) == ["CAPITAL REALLOCATION"]
+    assert texts(L.lines(spread("Q1-15 Q2-15 Q3-15", 72, 0.2, 3.0), gap=0.11)) == ["Q1-15 Q2-15 Q3-15"]
+    assert texts(L.lines(spread("1 2 3 4 5 6", 72, 1.0, 1.0), gap=0.11)) == ["1 2 3 4 5 6"]
+    assert texts(L.lines(numbered([frag("a b c d e f", 72, 700)]), gap=0.11)) == ["a b c d e f"]
+
+
+def test_math_line_with_uneven_gaps_keeps_its_spaces():
+    """A formula's glyphs stand apart by thin, medium and thick spaces, not by one letter gap: its median gap passes
+    the page's word gap, but too few gaps lie near it for tracking (2ac390d3bd)."""
+    out, x = [], 72.0
+    for text, before in [("if", 0), ("j", 0.66), ("∈", 0.22), ("Z", 0.26), ("M", 0), (",", 0.51), ("S", 0.28),
+                         ("=", 0.31), ("0", 0.51)]:
+        x += before * 12
+        out.append(frag(text, x, 700))
+        x += out[-1].width
+    assert texts(L.lines(numbered(out), gap=0.2)) == ["if j ∈ ZM , S = 0"]
+
+
 def test_toc_entry_ends_paragraph():
     # evenly spaced table-of-contents entries: each one ends at its leader and page label
     assert _paras("Introduction ........ 1", "Scope · · · ··········· 12",

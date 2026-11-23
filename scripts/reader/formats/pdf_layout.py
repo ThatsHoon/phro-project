@@ -368,6 +368,10 @@ GUTTER = 2.0
 SIZE_TOLERANCE = 1.0
 PIECE_OVERLAP = 0.1   # a piece overlapping a placed one by over this many sizes has no slot
 LINE_PIECES = 2_000   # word pieces one out-of-order line holds; past it a fragment starts a line
+LETTER_GAPS = 6   # glyph gaps a line needs to be read as letterspaced
+LETTER_SHARE = 0.75   # share of them within LETTER_SPREAD sizes of their median: one letter gap, not a formula's
+LETTER_SPREAD = 0.08  # thin, medium and thick spaces
+LETTER_MAX = 0.4  # a letter gap past this many sizes is glyphs set apart (one-glyph cells), not tracking
 
 
 @dataclass
@@ -669,6 +673,35 @@ class _Row:
         self.parts = other.parts + self.parts
         return True
 
+    def respace(self):
+        """When the median gap between the line's glyphs passes its word gap (a heading set letterspaced, its glyphs
+        0.14-0.26 sizes apart on a page whose words stand 0.11 apart), up to LETTER_MAX sizes, and LETTER_SHARE of the
+        gaps lie near it, that median is the line's letter gap: its pieces are rebuilt with a word gap half a space
+        past it. Lines whose glyph pairs are mostly within a fragment and no wider than the word gap are passed by
+        counts alone."""
+        chars = sum(len(f.text) for f in self.frags)
+        spaces = chars - sum(len("".join(f.text.split())) for f in self.frags)
+        wide = len(self.frags) - 1
+        for f in self.frags:
+            lim = self.gap * abs(f.size)
+            if f.char_gaps and max(f.char_gaps) > lim:
+                wide += sum(g > lim for g in f.char_gaps)
+        if chars - 1 < LETTER_GAPS or 2 * wide < chars - 1 - 2 * spaces:
+            return
+        glyphs = sorted((g for f, urls in self.parts for g in _glyphs(f, urls)), key=lambda g: g[0])
+        gaps = [(b[0] - a[1]) / size for a, b in zip(glyphs, glyphs[1:])
+                if not a[2].isspace() and not b[2].isspace() and (size := max(abs(a[4]), abs(b[4]))) > 0]
+        if len(gaps) < LETTER_GAPS:
+            return
+        letter = statistics.median(gaps)
+        if (not self.gap < letter <= LETTER_MAX
+                or sum(abs(g - letter) <= LETTER_SPREAD for g in gaps) < LETTER_SHARE * len(gaps)):
+            return
+        space = statistics.median(f.space_width / abs(f.size) if f.size and f.space_width > 0 else 0.25
+                                  for f in self.frags)
+        self.gap, self.starts = letter + 0.5 * space, None
+        self.index()
+
     def line_chars(self):
         return self.chars if self.starts is None else _piece_chars(self.pieces, self.gap)
 
@@ -785,6 +818,7 @@ def lines(fragments, links=(), gap=None, whole=True) -> List[Line]:
             return last
         if last is not None and row.take_row(last):
             out.pop()
+        row.respace()
         chars = row.line_chars()
         if any(not c[0].isspace() for c in chars):
             out.append(_make_line(row.frags, chars))
