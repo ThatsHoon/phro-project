@@ -42,7 +42,9 @@ def parse(path, ctx, **opts):
     precheck(path)
     ext = ext_of(path)
     mod = importlib.import_module("reader.formats." + FORMATS[ext])
-    doc = mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
+    from .containers import zipx
+    with zipx.clocked(ctx.late if ctx.stop is not None else None):
+        doc = mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
     if ctx.vba:
         doc.meta["vba"] = ctx.vba
     doc.notes.update(ctx.notes)

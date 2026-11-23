@@ -63,6 +63,39 @@ def test_xml_refuses_doctype():
     assert zipx.local(zipx.parse_xml(b"<x/>").tag) == "x"
 
 
+def test_a_big_xml_part_stops_at_the_read_clock():
+    data = b"<r>" + b"<a>x</a>" * 600_000 + b"</r>"
+    looks = []
+    with zipx.clocked(lambda: looks.append(1) or len(looks) >= 2):
+        root = zipx.parse_xml(data)
+        assert len(looks) == 2 and 0 < len(root) < 600_000 and root[-2].text == "x", (len(looks), len(root))
+        assert zipx.parse_xml(b"<x/>").tag == "x" and len(looks) == 2
+    with zipx.clocked(lambda: False):
+        assert len(zipx.parse_xml_ns(data)[0]) == 600_000
+    assert len(zipx.parse_xml(data)) == 600_000 and zipx._late is None
+    seen = []
+    real = zipx.parse_xml_ns
+
+    def spy(*a, **k):
+        seen.append(zipx._late)
+        return real(*a, **k)
+    from reader.model import Context
+    ctx = Context()
+    ctx.stop = float("inf")
+    zipx.parse_xml_ns = spy
+    try:
+        reader.parse(make_zip(Path(tempfile.mkdtemp()) / "a.docx", {
+            "[Content_Types].xml": b"<Types/>",
+            "_rels/.rels": b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                           b'<Relationship Id="r" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                           b'relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+            "word/document.xml": b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/'
+                                 b'main"><w:body><w:p><w:r><w:t>hi</w:t></w:r></w:p></w:body></w:document>'}), ctx)
+    finally:
+        zipx.parse_xml_ns = real
+    assert seen and all(s == ctx.late for s in seen) and zipx._late is None, seen
+
+
 def test_not_a_zip_is_damaged():
     p = tmp() / "n.zip"
     p.write_bytes(b"hello")

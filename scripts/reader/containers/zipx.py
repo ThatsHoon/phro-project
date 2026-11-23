@@ -48,6 +48,21 @@ _XML_ERRORS = (ET.ParseError, LookupError, ValueError)
 
 
 _held = None
+_late = None
+_PIECE = 1 << 20  # bytes of a big XML part fed to the parser between two looks at the read's clock
+
+
+@contextlib.contextmanager
+def clocked(late):
+    """While this is open an XML part longer than _PIECE is parsed a piece at a time and asks `late` (the read's
+    Context.late, or None for no limit) after each: once it says yes the parse stops and gives the tree built so far,
+    its open elements as far as they were read, and the format stops at its own next look."""
+    global _late
+    before, _late = _late, late
+    try:
+        yield
+    finally:
+        _late = before
 
 
 @contextlib.contextmanager
@@ -63,7 +78,7 @@ def charged(objects):
 
 
 def parse_xml(data: bytes):
-    if _held is not None:
+    if _held is not None or _late is not None and len(data) > _PIECE:
         return parse_xml_ns(data)[0]
     if _declares_entities(data):
         raise ReadError("damaged", "XML declares a DOCTYPE or ENTITY")
@@ -81,6 +96,7 @@ class _NsBuilder(ET.TreeBuilder):
         super().__init__()
         self.ns = {}
         self.left = max_nodes
+        self.top = None
 
     def start_ns(self, prefix, uri):
         self.ns.setdefault(prefix, set()).add(uri)
@@ -90,7 +106,10 @@ class _NsBuilder(ET.TreeBuilder):
             self.left -= 1
             if self.left < 0:
                 raise _TooMany()
-        return super().start(tag, attrs)
+        el = super().start(tag, attrs)
+        if self.top is None:
+            self.top = el
+        return el
 
 
 class _TooMany(Exception):
@@ -108,9 +127,18 @@ def parse_xml_ns(data: bytes, max_nodes: int | None = None):
         left = max(limits.EMBED_NODES - held.nodes, 0)
         max_nodes = left if max_nodes is None else min(max_nodes, left)
     builder = _NsBuilder(max_nodes)
+    late = _late if len(data) > _PIECE else None
     try:
         parser = ET.XMLParser(target=builder)
-        parser.feed(data)
+        if late is None:
+            parser.feed(data)
+        else:
+            for at in range(0, len(data), _PIECE):
+                parser.feed(data[at:at + _PIECE])
+                if at + _PIECE < len(data) and late():
+                    if builder.top is None:
+                        raise ReadError("damaged", "XML not read: the time ran out before its first element")
+                    return builder.top, builder.ns
         root = parser.close()
     except _TooMany:
         raise ReadError("too_large", f"{limits.BIG_PART}: XML of more than {max_nodes} elements") from None
