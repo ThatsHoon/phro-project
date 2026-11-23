@@ -234,6 +234,39 @@ def test_picture_read_once():
     assert got.turn == 0 and len(win.calls) == 1 and win.calls[0].data == G.data
 
 
+def test_latin_document_picture_not_latin_to_windows_goes_to_tesseract():
+    """In a picture of a Latin document ("latin-picture"), a Korean Windows engine's words that are not Latin are its
+    misreading of a caption or a drawing, with no confidence for picture_kept to drop them by: Tesseract reads the
+    picture as on a machine without Windows OCR (its empty read too). A Latin read, an empty one, a read without
+    Tesseract eng and one by a Windows engine that does not read Korean go as for any picture."""
+    noise = Win(lambda g: page(["($너넣1", "요7329"]))
+    tess = Tess({"eng", "kor"}, lambda g, langs: page(ENGLISH, "tess-" + langs, conf=96))
+    got, hint = rp(G, ocr.Engines(noise, tess, True), FAR, "latin-picture")
+    assert len(noise.calls) == 1 and got.engine == "tess-eng" and hint is False, got.engine
+    assert tess.calls == [("kor+eng", limits.TESS_PSM_KOR), ("eng", limits.TESS_PSM_LATIN)], tess.calls
+    blank = Tess({"eng", "kor"}, lambda g, langs: page([], "tess-" + langs))
+    got, _ = rp(G, ocr.Engines(noise, blank, True), FAR, "latin-picture")
+    assert got.engine == "tess-kor+eng" and got.words == [], got.engine
+    got, _ = rp(G, ocr.Engines(noise, tess, True), FAR, "picture")
+    assert got.engine == "win-ko", got.engine
+    latin = Win(lambda g: page(ENGLISH))
+    for kind in ("picture", "latin-picture"):
+        dark = Tess({"eng", "kor"}, lambda g, langs: page([], "tess-" + langs))
+        got, _ = rp(G, ocr.Engines(latin, dark, True), FAR, kind)
+        assert got.engine == "win-ko" and dark.calls == [("eng", limits.TESS_PSM_LATIN)], (kind, dark.calls)
+    en = Win(lambda g: page(["가나다"], "win-en-us"), engine="win-en-us")
+    for eng in (ocr.Engines(noise, None, True), ocr.Engines(noise, Tess({"kor"}), True),
+                ocr.Engines(Win(lambda g: page([])), Tess({"eng", "kor"}), True), ocr.Engines(en, None, False)):
+        got, _ = rp(G, eng, FAR, "latin-picture")
+        assert got.engine == eng.win.engine and (eng.tess is None or eng.tess.calls == []), got.engine
+    try:
+        ocr.read_page(G, ocr.Engines(noise, tess, True), FAR, "drawing")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown kind was read")
+
+
 def test_rotation_stops_at_deadline():
     clock = [100.0]
     deadline = 110.0
@@ -527,6 +560,7 @@ def test_picture_verdict_by_the_words_it_keeps():
     assert kind(page(CLEAN_KO, "tess-kor+eng", conf=95.0)) == "trusted"
     assert kind(page(ENGLISH)) == "trusted"  # Windows: no confidence, no junk
     assert kind(page(CLEAN_KO, "tess-kor+eng", conf=50.0)) == "doubtful"
+    assert ocr._result_of(answer(page(CLEAN_KO, "tess-kor+eng", conf=50.0)), "latin-picture").verdict.kind == "doubtful"
     low = page(["w%d" % i for i in range(20)], "tess-kor+eng", conf=86.0)
     low.words[3].conf = low.words[7].conf = 10.0
     assert kind(low) == "trusted"  # a readable picture under OCR_CONF and over OCR_LOW: its low words alone go

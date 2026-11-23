@@ -202,16 +202,22 @@ def _tess_page(tess, g: Gray, deadline: float) -> OcrPage | None:
     return _latin_again(tess, g, page, deadline) or page
 
 
-def _read_once(g: Gray, eng: Engines, deadline: float, doubt) -> tuple[OcrPage | None, bool]:
+def _read_once(g: Gray, eng: Engines, deadline: float, doubt, latin: bool = False) -> tuple[OcrPage | None, bool]:
     """One pass of the engine choice on `g` as it stands: (page, hint). `doubt(page)` says whether a Windows read
     is in doubt; a Latin one is read again by Tesseract eng when it is, or when the Windows engine reads Korean (it
-    misreads Latin letters as Hangul and digits)."""
+    misreads Latin letters as Hangul and digits). With `latin` (a picture of a Latin document), a Korean Windows
+    engine's read with words that are not Latin is taken for its misreading of a caption or a drawing, which gives
+    no confidence to drop such words by: Tesseract reads the picture as on a machine without Windows OCR."""
     tess = eng.tess
     if eng.win is None:
         return _tess_page(tess, g, deadline), False
     page = eng.win.recognize(g, deadline)
     if page is None:  # Windows gave no page: Tesseract as on a machine without Windows OCR, while time is left
         return _tess_page(tess, g, deadline), False
+    if latin and eng.win_korean and page.words and latin_share(page) < limits.OCR_LATIN \
+            and tess is not None and "eng" in tess.langs:
+        again = _tess_page(tess, g, deadline)
+        return (page if again is None else again), False
     if latin_share(page) >= limits.OCR_LATIN and (eng.win_korean or doubt(page)):
         again = _latin_again(tess, g, page, deadline)
         if again is not None:
@@ -278,26 +284,33 @@ def _measurer(g: Gray, dpi: float):
     return measure
 
 
+KINDS = ("page", "picture", "latin-picture")
+PICTURES = ("picture", "latin-picture")
+
+
 def read_page(g: Gray, eng: Engines, deadline: float, kind: str, dpi: float = limits.OCR_DPI) -> Reading | None:
     """The page read by the engine chosen for it (`Reading`), None when no engine gives a page.
 
-    `kind` is "page" or "picture"; `dpi` is the bitmap's resolution, which the rules are found at. A picture is read
-    once (decision 11). A page whose 0-degree pass has a junk share over OCR_JUNK is read again turned clockwise by
-    180, 90 and 270 degrees, in that order, while time is left; the search stops at the first turn whose pass has
-    words and a junk share of at most OCR_JUNK. When the best of them is still doubtful (`judge`), its turn is read
-    again at another scale (twice the size when that stays within images._MAX_PIXELS, else half) and then by the
-    other engine, until a read is not doubtful. The best pass is the one not doubtful, then the one with the best
-    `_score`; it keeps its `turn` and its hint. `deadline` is a time.monotonic()
-    value, checked before each pass. An engine's OSError is not caught here: the worker catches it per job.
+    `kind` is one of KINDS: "page", "picture", or "latin-picture", a picture of a document whose own text is Latin;
+    `dpi` is the bitmap's resolution, which the rules are found at. A picture is read once (decision 11), a
+    "latin-picture" as `_read_once` reads one with `latin`.
+
+    A page whose 0-degree pass has a junk share over OCR_JUNK is read again turned clockwise by 180, 90 and 270
+    degrees, in that order, while time is left; the search stops at the first turn whose pass has words and a junk
+    share of at most OCR_JUNK, and the best turn is the one not doubtful (`judge`), then the one with the best
+    `_score`. When that best pass is still doubtful, its turn is read again at twice the size (when that stays within
+    images._MAX_PIXELS) and then, for a Windows pass, by Tesseract; a re-read takes its place only when it is not
+    doubtful. The pass kept keeps its `turn` and its hint. `deadline` is a time.monotonic() value, checked before
+    each pass. An engine's OSError is not caught here: the worker catches it per job.
 
     The returned page's `w`, `h` and boxes are in the frame of `rotate(g, page.turn)`, as are the rules and the
     unread ink, so `judge`'s `Verdict.box` is in the same frame. The picture shown is cut from the image as it is
     stored, not from the turned bitmap: the caller turns the box back first (`pdf._unturned`).
     """
-    if kind not in ("page", "picture"):
+    if kind not in KINDS:
         raise ValueError(f"kind {kind!r}")
-    if kind == "picture":
-        page, hint = _read_once(g, eng, deadline, lambda p: picture_kept(p) is None)
+    if kind in PICTURES:
+        page, hint = _read_once(g, eng, deadline, lambda p: picture_kept(p) is None, kind == "latin-picture")
         return None if page is None else Reading(page, hint)
     measure = _measurer(g, dpi)
 
@@ -480,9 +493,9 @@ def __getattr__(name):
 def picture_key(g: Gray, engine: str, version: str, *, kind: str = "picture", dpi: float = 0.0) -> str:
     """The per-picture cache key: SHA-1 over the size and Gray8 pixels, the engine id and version, `CODE` (which
     covers the worker too), the reader's version, and the current values of `_KEY_LIMITS`, read at call time, so a
-    calibrated limit never serves a reading made under the old one. A page (`kind` "page") is another entry than the
-    same pixels read as a picture, and its dpi is hashed too: a page's result carries rules, found at that dpi, and
-    its unread ink."""
+    calibrated limit never serves a reading made under the old one. A page or a "latin-picture" is another entry
+    than the same pixels read as a "picture", and its kind and dpi are hashed: a page's result carries rules, found
+    at that dpi, and its unread ink, and a "latin-picture" may be read by another engine."""
     from . import VERSION
     h = hashlib.sha1(f"{g.w}x{g.h}\0".encode())
     h.update(g.data)
@@ -705,7 +718,7 @@ def _result_of(d: dict, kind: str) -> Result:
             raise ValueError("rule box")
         rules.append(tuple(_int(v) for v in b))
     un = _unread_of(d["unread"])
-    if kind == "picture":
+    if kind in PICTURES:
         return Result("done", page, rules, un, Verdict("trusted" if picture_kept(page) is not None else "doubtful", None), hint)
     if un is None:
         raise ValueError("a page answer without unread ink")
@@ -868,7 +881,7 @@ class Session:
         """A ticket for `g`. Over OCR_QUEUE_BYTES, waits for room until `until` (a time.monotonic() value; None: no
         bound of its own), and at most until the stop: still over budget at `until`, the ticket is "late" at once,
         its pixels not queued and the session going on; at the stop, the session expires."""
-        if kind not in ("page", "picture"):
+        if kind not in KINDS:
             raise ValueError(f"kind {kind!r}")
         try:
             dpi = float(dpi)
@@ -876,7 +889,7 @@ class Session:
             dpi = math.nan
         if not math.isfinite(dpi) or dpi <= 0:  # a resolution tag of 0/0, say: the page is still read
             dpi = float(limits.OCR_DPI)
-        if kind == "picture" and blank(g):
+        if kind in PICTURES and blank(g):
             t = Ticket(next(self._ids), kind, "", dpi)
             with self._cond:
                 self._file(t, Result("blank"))

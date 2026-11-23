@@ -1195,6 +1195,24 @@ def test_picture_text_cut_at_figure_chars():
     assert info["warnings"] == ["figure text cut"], info
 
 
+def test_pictures_of_a_latin_document_sent_as_latin():
+    """A document whose own text has OCR_SCRIPT_LETTERS letters or more, at least OCR_LATIN of them Latin, sends its
+    pictures as "latin-picture"; a Korean one, or one with fewer letters, as "picture". Its blank pictures are still
+    not sent."""
+    latin = P("The quick brown fox jumps over the lazy dog. " * 10)
+    assert sum(c.isalpha() for c in latin.inlines[0].text) >= limits.OCR_SCRIPT_LETTERS
+    korean = P("다람쥐 헌 쳇바퀴에 타고파. " * 30)
+    mixed = [latin, P("가" * 100)]
+    flat = images.gray_png(Gray(80, 80, bytes([250]) * 6400))
+    for blocks, kind in (([latin], "latin-picture"), ([korean], "picture"), ([P("Figure 1")], "picture"),
+                         (mixed, "picture"), ([Table([[Cell([latin])]])], "latin-picture")):
+        info = {}
+        with stub(answer=seen("Total 120", "Net 80")) as (_, sent), tempfile.TemporaryDirectory() as d:
+            out = markdown.render(Doc(blocks=blocks + [Image(pic()), Image(flat)]), Path(d), info=info)
+        assert sent == [(80, 80, kind), (80, 80, kind)] and TEXT in out, (kind, sent)
+        assert info["ocr"]["pictures_blank"] == 1, info
+
+
 def test_photo_gets_no_picture_text():
     with stub(answer=seen("▒▓░ ◆◇◆ ▒▒")) as (_, sent):
         out = R(Doc(blocks=[Image(pic())]))

@@ -463,7 +463,8 @@ def test_unreadable_toc_counted():
     out, ctx = md(epub_book({"c.xhtml": "<p>Plan</p>"}, extra={"OEBPS/toc.ncx": "<ncx><navMap"},
                             manifest_extra=NCX_ITEM))
     assert "Plan" in out and "# Plan" not in out and ctx.skipped["toc"] == 1, (out, ctx.skipped)
-    assert markdown.unread(ctx.skipped) == ["table of contents (its headings are not marked)"], ctx.skipped
+    assert markdown.unread(ctx.skipped) == ["table of contents (its headings, or the rest of them, are not marked)"], \
+        ctx.skipped
 
 
 def test_placeholder_title_left_out():

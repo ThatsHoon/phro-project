@@ -132,7 +132,10 @@ OCR_FLAT = 16              # gray range (levels) up to which a page with no word
 OCR_SKEW = 0.5             # degrees the lines of a TESS_PSM_KOR read may slope before the page is doubtful; spike:
 #                            straight pages 0.00-0.09, text pages turned 2 degrees 1.84-1.94 (CER 0.28-0.66)
 OCR_ANSWER_MARGIN = 2      # seconds before the session's stop by which the worker must have answered a job
-OCR_LATIN = 0.9            # share of Latin letters from which Tesseract eng reads a Windows page again
+OCR_LATIN = 0.9            # share of Latin letters from which Tesseract eng reads a Windows page again, and from which
+#                            a document's own text makes its pictures "latin-picture"
+OCR_SCRIPT_LETTERS = 200   # letters of a document's own text (a paragraph) from which they tell its script; a few
+#                            captions ("Figure 1") under screenshots do not
 OCR_JUNK = 0.03            # share of junk characters over which a page is doubtful and a picture gets no text; clean
 #                            spike pages at most 0.003, noisy 0-0.033: the other signals carry the noisy pages
 OCR_UNREAD = 0.07          # share of dark pixels outside the word boxes over which a page is doubtful; spike: clean text

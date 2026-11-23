@@ -23,6 +23,8 @@ _NEWLINE = re.compile(r"\r\n?|\n")  # what ends a markdown line (_normalize turn
 _TITLE_BREAK = re.compile(r"[\r\n\t]")  # a heading title's line breaks (and tabs) become spaces...
 _TITLE_DROP = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")  # ...and its other controls go
 _HIDDEN_LINE = re.compile(r"^\((\d+) hidden places left out\)$")
+_LETTER = re.compile(r"[^\W\d_]")
+_LATIN_LETTER = re.compile(r"[^\W\d_\u0250-\u1dff\u1f00-\U0010ffff]")  # ocr._latin: under U+0250, or U+1E00-1EFF
 _TRUNC = "(output truncated at 20 MB)"
 # with a random tail drawn per render (_Render.head_mark), starts each page head while the document renders,
 # so render() knows the lines it wrote (stats counts those alone, so a "## Page N" line inside a comment is
@@ -95,7 +97,8 @@ LOST = (
 NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"),
          ("kf8_fallback", "KF8 layout (the MOBI 6 copy was read)"), ("plain_text", "book markup (read as plain text)"),
          ("page_images", "page images (text layer only)"), ("linked_data", "linked tables' data (in other files)"),
-         ("toc", "table of contents (its headings are not marked)"), ("time", "the rest past the time limit"))
+         ("toc", "table of contents (its headings, or the rest of them, are not marked)"),
+         ("time", "the rest past the time limit"))
 # counted too, but they only change formatting or reading order, so they are not reported
 INTERNAL = frozenset({"styles", "numbering", "rels", "manifest", "css", "encryption", "transform", "story",
                       "char_positions", "attribute", "merge", "duplicate", "jet_page8"})  # char_positions: pdf glyph positions dropped, the text kept
@@ -224,10 +227,31 @@ def _running(doc: Doc, show: bool, grid) -> dict:
     return {k: _on(v) for k, v in kinds.items() if len(v) >= limits.RUNNING_PICTURE}
 
 
+def _latin_document(doc: Doc) -> bool:
+    """Whether the document's own text (its Text and Code, hidden or not, notes, headers and footers too; not the
+    pictures' OCR) has OCR_SCRIPT_LETTERS letters or more, at least OCR_LATIN of them Latin (as ocr.latin_share
+    counts them)."""
+    letters = latin = 0
+    stack, seen = [doc.blocks, list(doc.notes.values()), doc.headers, doc.footers], set()
+    while stack:
+        x = stack.pop()
+        if isinstance(x, list):
+            if id(x) not in seen:
+                seen.add(id(x))
+                stack.extend(x)
+        elif isinstance(x, (Text, Code)):
+            letters += len(_LETTER.findall(x.text))
+            latin += len(_LATIN_LETTER.findall(x.text))
+        elif hasattr(x, "__dataclass_fields__"):
+            stack.extend(v for v in vars(x).values() if isinstance(v, list))
+    return letters >= limits.OCR_SCRIPT_LETTERS and latin >= limits.OCR_LATIN * letters
+
+
 class _Pictures:
     """The raster pictures OCR reads: each Image with `ocr` "" whose bytes are a PNG, JPEG, BMP, GIF or TIFF and whose
     pixels (raster.gray) have a long side of at least OCR_MIN_EDGE, submitted to the session as the render starts,
-    once for the same bytes, and collected as the render writes them.
+    once for the same bytes, and collected as the render writes them; as "latin-picture" when the document's own
+    text is Latin (`_latin_document`).
 
     A picture not queued by FIGURE_RESERVE before the session's stop goes late at once, so the ones queued keep that
     time to be read; after it, and past the stop, no further picture is sent, and one whose header (images.pixel_size)
@@ -253,6 +277,7 @@ class _Pictures:
         stop = s.deadline - limits.FIGURE_RESERVE
         until = stop - limits.FIGURE_RESERVE
         passed = set()
+        kind = None
         for im in _images(doc, show, grid):
             k = (im.data, im.page)
             if im.ocr or k in self.tickets or k in self.late or k in passed:
@@ -275,7 +300,9 @@ class _Pictures:
             if max(g.w, g.h) < limits.OCR_MIN_EDGE:
                 passed.add(k)
                 continue
-            t = s.submit(g, "picture", dpi, until=until)
+            if kind is None:
+                kind = "latin-picture" if _latin_document(doc) else "picture"
+            t = s.submit(g, kind, dpi, until=until)
             r = s.peek(t)
             if r is not None and r.status == "late":
                 self.late.add(k)

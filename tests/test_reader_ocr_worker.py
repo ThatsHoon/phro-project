@@ -325,6 +325,7 @@ def test_key_changes_with_engine_version():
     assert k != ocr.picture_key(g, "win-ko", "10.0.2")
     assert k != ocr.picture_key(g, "win-en-us", "10.0.1")
     assert k != ocr.picture_key(g, "tess", "10.0.1")
+    assert k != ocr.picture_key(g, "win-ko", "10.0.1", kind="latin-picture")
     assert k != ocr.picture_key(gray(11, v=0), "win-ko", "10.0.1")
     assert k != ocr.picture_key(Gray(4, 11, g.data), "win-ko", "10.0.1")
     assert len(ocr.CODE) == 40
