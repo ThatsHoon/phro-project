@@ -3,7 +3,9 @@ dochan office_binary/ole_objects.py: the storage _<id>, Equation Native first, t
 
 Word writes an object as an EMBED field: the separator has fSpec and fOle2 and names the storage ObjectPool/_<id>
 (sprmCObjLocation, else sprmCPicLocation, a u32), and the result's \\x01 has fSpec and the preview's PICF at its
-PicLocation in the Data stream. An object is read once an id, by embedded.storage: an equation replaces the preview,
+PicLocation in the Data stream. An object is read once an id, by embedded.storage, which sees every stream of the
+storage, those of its own storages too (an embedded Word file's Macros/, a workbook's _VBA_PROJECT_CUR/): an
+equation replaces the preview,
 which is not read; a workbook, a chart package or a spreadsheet gives tables (placed after the paragraph, as a
 picture is; one that cannot be read, or whose placement would pass CHART_TOTAL, is a chart: its preview stays,
 counted); anything else is another object. A document reads
@@ -46,13 +48,14 @@ class Objects:
         self.whole = 0
 
     def pool(self) -> dict:
-        """The ObjectPool's storages and their streams, from the compound file's paths, once."""
+        """The ObjectPool's storages and their streams (by path inside the storage, its own storages' included), from
+        the compound file's paths, once."""
         if self._pool is None:
             self._pool = {}
             for path in self.r.cf.names():
                 parts = path.split("/")
-                if len(parts) == 3 and parts[0].upper() == _POOL:
-                    self._pool.setdefault(parts[1].upper(), {}).setdefault(parts[2].upper(), path)
+                if len(parts) >= 3 and parts[0].upper() == _POOL:
+                    self._pool.setdefault(parts[1].upper(), {}).setdefault("/".join(parts[2:]).upper(), path)
         return self._pool
 
     def get(self, oid):

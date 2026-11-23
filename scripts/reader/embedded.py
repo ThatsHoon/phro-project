@@ -39,7 +39,10 @@ BIFF records walked (BIN_RECORDS, the document's own streams with them) and the 
 (EMBED_DECRYPT); an object that would pass one of them is not read. Whatever an object makes the reader do, the
 objects of one document are read for EMBED_SECONDS at most: one reached after that is not read (None), as past
 MAX_OBJECTS. A document an object holds is read in its own Context (`_Reading`), late once the host's read is or
-once the objects' EMBED_SECONDS are spent: it then keeps what it read, counted under object_cut. A ReadError that
+once the objects' EMBED_SECONDS are spent: it then keeps what it read, counted under object_cut. The VBA project of
+an embedded document or workbook (its package's vbaProject.bin, a Word file's `Macros/`, an Excel file's
+`_VBA_PROJECT_CUR/`, a presentation's own) is read over the document's VBA budget and its modules go to the
+document's, each kind marked "in an embedded <what>" (`_macros`). A ReadError that
 only says this object cannot be read
 (damaged, too large, unsupported, encrypted) gives None, and so does any error that is no ReadError; any other
 ReadError ends the document, as it does everywhere.
@@ -50,6 +53,7 @@ import struct
 import time
 
 from . import limits
+from .containers import vba
 from .containers.cfb import CfbError, Compound, is_cfb
 from .containers.zipx import Package, charged
 from .limits import ReadError
@@ -130,6 +134,7 @@ class Objects:
         own = Context()
         own.embedded = self
         own.stop, own.clock = self.ctx.stop, self.ctx.clock
+        own.vba_modules, own.vba_bytes = self.ctx.vba_modules, self.ctx.vba_bytes
         return own
 
     def load(self, data: bytes, ctx=None):
@@ -159,6 +164,7 @@ class _Reading(Context):
         super().__init__()
         self.host, self.embedded = host, of(host)
         self.stop, self.clock = host.stop, host.clock
+        self.vba_modules, self.vba_bytes = host.vba_modules, host.vba_bytes
 
     def late(self) -> bool:
         if not (self.skipped["time"] or self.skipped["object_cut"]):
@@ -282,10 +288,18 @@ def _storage(cf, ctx, sheets):
             return read(cf.read(name), ctx, sheets)
     if cf.exists("WordDocument"):
         from .formats import doc
-        return document(lambda own: doc.read_compound(cf, own), ctx, "Word document")
+
+        def word(own):
+            vba.compound(cf, own, "Macros/")
+            return doc.read_compound(cf, own)
+        return document(word, ctx, "Word document")
     if cf.exists("PowerPoint Document"):
         from .formats import ppt
         return document(lambda own: ppt.read_compound(cf, own), ctx, "PowerPoint presentation")
+    if cf.exists("Workbook") or cf.exists("Book"):
+        own = of(ctx).inner()
+        vba.compound(cf, own, "_VBA_PROJECT_CUR/")
+        _macros(own, ctx, "Excel workbook")
     before, warned = ctx.skipped["chart"], len(ctx.warnings)
     out = xls_embedded.blocks(cf, ctx, sheets)
     if out:
@@ -362,6 +376,7 @@ def document(parse, ctx, what):
     from .markdown import _PAGE_ONLY
     own = _Reading(ctx)
     doc = parse(own)
+    _macros(own, ctx, what)
     if not isinstance(doc, Doc):
         return None
     title = " ".join(doc.title.split())
@@ -384,6 +399,19 @@ def document(parse, ctx, what):
         ctx.skipped["time"] = 1
     ctx.warnings.extend(w for w in own.warnings if w not in ctx.warnings)
     return "document", [quote], _NONE
+
+
+def _macros(own, ctx, what):
+    """What the read in `own` (a Context `Objects.inner` or `_Reading` made, starting from the document's VBA budget)
+    found of VBA goes to the document's `ctx`: its modules, each kind marked "in an embedded `what`", the budget it
+    left and its vba and vba_module counts."""
+    ctx.vba += [(name, f"{kind}, in an embedded {what}", source) for name, kind, source in own.vba]
+    ctx.vba_modules, ctx.vba_bytes = own.vba_modules, own.vba_bytes
+    if own.skipped.pop("vba", 0):
+        ctx.skipped["vba"] = 1
+    lost = own.skipped.pop("vba_module", 0)
+    if lost:
+        ctx.skipped["vba_module"] += lost
 
 
 def _odf(pkg, ctx):
@@ -419,12 +447,18 @@ def _ooxml(pkg, ctx):
     part = ooxml._main_part(pkg)
     root, _ = ooxml_base.load(pkg, part)
     kind = ooxml_base.local(root.tag)
-    if kind == "document":
-        return document(lambda own: ooxml_word.parse_word(pkg, part, own), ctx, "Word document")
-    if kind == "presentation":
-        return document(lambda own: ooxml_slides.parse_slides(pkg, part, own), ctx, "PowerPoint presentation")
+    if kind in ("document", "presentation"):
+        parse, what = ((ooxml_word.parse_word, "Word document") if kind == "document" else
+                       (ooxml_slides.parse_slides, "PowerPoint presentation"))
+
+        def package(own):
+            ooxml_base.macros(pkg, own)
+            return parse(pkg, part, own)
+        return document(package, ctx, what)
     if kind != "workbook":
         return None
     own = of(ctx).inner()
+    ooxml_base.macros(pkg, own)
+    _macros(own, ctx, "Excel workbook")
     sec, notes = ooxml_sheets.active_sheet(pkg, part, own)
     return _shown(sheet_tables(sec.blocks, sec.title) if sec is not None else [], own, ctx, notes)

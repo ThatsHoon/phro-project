@@ -368,6 +368,108 @@ def test_ppt_project_is_read():
     assert "vba" not in doc.meta and not ctx.skipped, ctx.skipped
 
 
+MOD = [("NewMacros", "module, in an embedded Word document", 'Sub Hello()\n    MsgBox "안녕"\nEnd Sub')]
+
+
+def test_macros_of_an_embedded_document_are_the_hosts():
+    import test_reader_doc_objects as in_doc_objects
+    import test_reader_embedded as emb
+    import test_reader_embedded_docs as docs
+    blob, _ = cfb_bytes(project({"NewMacros": (SUB, 0x21), "ThisDocument": (EMPTY, 0x22)}))
+    p = emb.docx([("rO", emb.PKG_REL, "embeddings/w.docm", False)],
+                 {"word/embeddings/w.docm": docs.word(parts={"word/vbaProject.bin": blob})})
+    doc, ctx = in_docm.parse(p)
+    assert doc.meta.get("vba") == MOD and not ctx.skipped, (doc.meta.get("vba"), ctx.skipped)
+    old = {**docs.streams(docs.old_word()), **project({"NewMacros": (SUB, 0x21)}, "Macros/")}
+    _, ctx = in_doc_objects.parse(in_doc_objects.embed_doc({1: old}, preview=in_doc_objects.PNG_PREVIEW))
+    assert ctx.vba == MOD and not ctx.skipped, (ctx.vba, ctx.skipped)
+    deck = Path(tempfile.mkdtemp()) / "i.ppt"
+    make_ppt(deck, [{"title": "Plan"}], vba=blob)
+    p = emb.docx([("rO", emb.OLE_REL, "embeddings/o.bin", False)], {"word/embeddings/o.bin": deck.read_bytes()})
+    doc, ctx = in_docm.parse(p)
+    want = [(MOD[0][0], "module, in an embedded PowerPoint presentation", MOD[0][2])]
+    assert doc.meta.get("vba") == want and not ctx.skipped, (doc.meta.get("vba"), ctx.skipped)
+    # the host's own module and the embedded one, both written; the embedded one's file is numbered
+    host = in_docm.docm(in_docm.P("Hi") + emb.word_object("rO"),
+                        parts={"word/vbaProject.bin": blob, "word/media/p.png": in_docm.PNG,
+                               "word/embeddings/w.docm": docs.word(parts={"word/vbaProject.bin": blob})},
+                        rels=[("rP", "image", "media/p.png", False), ("rO", emb.PKG_REL, "embeddings/w.docm", False)])
+    doc, ctx = in_docm.parse(host)
+    md, out = render(doc, ctx)
+    folder = out / "assets" / "vba"
+    assert md.startswith("VBA modules (source in assets/vba/): NewMacros.bas (module, 3 lines); NewMacros-2.bas "
+                         '("NewMacros", module, in an embedded Word document, 3 lines)\n\n'), md
+    assert sorted(p.name for p in folder.glob("*.bas")) == ["NewMacros-2.bas", "NewMacros.bas"], list(folder.glob("*"))
+    # a project the embedded document cannot read is the host's to name
+    p = emb.docx([("rO", emb.PKG_REL, "embeddings/w.docm", False)],
+                 {"word/embeddings/w.docm": docs.word(parts={"word/vbaProject.bin": b"x"})})
+    doc, ctx = in_docm.parse(p)
+    assert "vba" not in doc.meta and ctx.skipped == {"vba": 1}, (doc.meta.get("vba"), ctx.skipped)
+
+
+def test_macros_of_an_embedded_workbook_are_the_hosts():
+    import test_reader_doc_objects as in_doc_objects
+    import test_reader_embedded as emb
+    from reader_fix import excel_object, make_xlsx, xlsx_cell, xlsx_row
+    blob, _ = cfb_bytes(project({"Module1": (SUB, 0x21)}))
+    want = [("Module1", "module, in an embedded Excel workbook", MOD[0][2])]
+    rows = xlsx_row(1, xlsx_cell("A1", inline="<t>Pen</t>"), xlsx_cell("B1", "3"))
+    for vba_part, got_vba, skipped in ((blob, want, {}), (b"x", None, {"vba": 1})):
+        book = make_xlsx(None, [{"name": "S", "rows": rows}], extra_parts={"xl/vbaProject.bin": vba_part})
+        p = emb.docx([("rO", emb.PKG_REL, "embeddings/b.xlsm", False)], {"word/embeddings/b.xlsm": book})
+        doc, ctx = in_docm.parse(p)
+        assert doc.meta.get("vba") == got_vba and ctx.skipped == skipped, (doc.meta.get("vba"), ctx.skipped)
+    with Compound(excel_object([{"name": "S", "cells": {(0, 0): "Pen", (0, 1): 3}}])) as cf:
+        book = {n: cf.read(n) for n in cf.names()}
+    biff5 = {"Book" if n == "Workbook" else n: data for n, data in book.items()}  # the stream named as BIFF5 names it
+    for stg, extra in ((book, project({"Module1": (SUB, 0x21)}, "_VBA_PROJECT_CUR/")),
+                       (biff5, project({"Module1": (SUB, 0x21)}, "_VBA_PROJECT_CUR/")),
+                       (book, {"_VBA_PROJECT_CUR/VBA/x": b"1"})):
+        _, ctx = in_doc_objects.parse(in_doc_objects.embed_doc({1: {**stg, **extra}},
+                                                              preview=in_doc_objects.PNG_PREVIEW))
+        named = "VBA/dir" not in "".join(extra)
+        assert ctx.vba == ([] if named else want), (list(stg), ctx.vba)
+        assert ctx.skipped.get("vba") == (1 if named else None), ctx.skipped
+    # a workbook that shows no table still gives the host what its project lost, and is no unread object
+    gone = {"VBA/dir": dir_stream([("Module1", "Module1", 7, 0x21), ("Gone", "Gone", 7, 0x21)]),
+            "VBA/Module1": b"compild" + container(SUB.encode("cp949"))}
+    book = make_xlsx(None, [{"name": "S", "rows": ""}], extra_parts={"xl/vbaProject.bin": cfb_bytes(gone)[0]})
+    p = emb.docx([("rO", emb.PKG_REL, "embeddings/b.xlsm", False)], {"word/embeddings/b.xlsm": book})
+    doc, ctx = in_docm.parse(p)
+    assert doc.meta.get("vba") == want and ctx.skipped["vba_module"] == 1 and not ctx.skipped["object"], ctx.skipped
+
+
+def test_embedded_macros_spend_the_documents_budget():
+    import test_reader_embedded as emb
+    import test_reader_embedded_docs as docs
+    blob, _ = cfb_bytes(project({"NewMacros": (SUB, 0x21)}))
+    host = in_docm.docm(in_docm.P("Hi") + emb.word_object("rO"),
+                        parts={"word/vbaProject.bin": blob, "word/media/p.png": in_docm.PNG,
+                               "word/embeddings/w.docm": docs.word(parts={"word/vbaProject.bin": blob})},
+                        rels=[("rP", "image", "media/p.png", False), ("rO", emb.PKG_REL, "embeddings/w.docm", False)])
+    from reader_fix import make_xlsx
+    book = make_xlsx(None, [{"name": "S", "rows": ""}], extra_parts={"xl/vbaProject.bin": blob})
+    workbook = in_docm.docm(in_docm.P("Hi") + emb.word_object("rO"),
+                            parts={"word/vbaProject.bin": blob, "word/media/p.png": in_docm.PNG,
+                                   "word/embeddings/b.xlsm": book},
+                            rels=[("rP", "image", "media/p.png", False), ("rO", emb.PKG_REL, "embeddings/b.xlsm", False)])
+    two = in_docm.docm(in_docm.P("Hi") + emb.word_object("rO") + emb.word_object("rQ"),
+                       parts={"word/media/p.png": in_docm.PNG,
+                              "word/embeddings/w.docm": docs.word(parts={"word/vbaProject.bin": blob}),
+                              "word/embeddings/v.docm": docs.word(parts={"word/vbaProject.bin": blob})},
+                       rels=[("rP", "image", "media/p.png", False), ("rO", emb.PKG_REL, "embeddings/w.docm", False),
+                             ("rQ", emb.PKG_REL, "embeddings/v.docm", False)])
+    old = limits.VBA_MODULES
+    limits.VBA_MODULES = 1
+    try:
+        for p, kind in ((host, "module"), (workbook, "module"), (two, "module, in an embedded Word document")):
+            doc, ctx = in_docm.parse(p)
+            assert [m[1] for m in doc.meta["vba"]] == [kind] and ctx.skipped["vba_module"] == 1, (doc.meta, ctx.skipped)
+            assert ctx.vba_modules == 1, ctx.vba_modules
+    finally:
+        limits.VBA_MODULES = old
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
