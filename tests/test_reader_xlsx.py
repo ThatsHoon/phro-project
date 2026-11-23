@@ -1412,3 +1412,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_chart_keeps_its_table_when_a_sheet_its_name_answers_to_was_not_read():
+    top = sheet(xlsx_row(1, xlsx_cell("A1", "top", t="str")), name="First")
+    bad = DOCTYPE + f'<worksheet xmlns="{XLSX_SML}"><sheetData/></worksheet>'
+    for failed in (sheet("", name="Data", missing=True), sheet("", name="Data", part=bad.encode())):
+        t, out, ctx = charted([top, failed, sheet(PLOTTED, name="data")], ranged("Data"))
+        assert len(t.rows) == 2 and ctx.skipped["sheet"] == 1, (failed, t.rows, ctx.skipped)
+    t, out, ctx = charted([top, {"name": "Data", "chartsheet": True}, sheet(PLOTTED, name="data")], ranged("Data"))
+    assert len(t.rows) == 2 and not ctx.skipped, (t.rows, ctx.skipped)

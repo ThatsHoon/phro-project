@@ -492,6 +492,14 @@ def test_data_range_names_the_sheet_cells():
     gap = {k: v for k, v in cells.items() if k != (2, 2)}
     md = run([{"name": "Data", "cells": gap}, chart_sheet(biff_chart(series))], globals_extra=externsheet(0))
     assert "Chart: column. Data: Data!A1:C3\n||A|B|" in md, md
+    for first in ({"state": 1}, {}):
+        twins = [{"name": "Data", "cells": cells, **first}, {"name": "data", "cells": cells}]
+        for sheets in (twins, twins[::-1]):
+            md = run(sheets + [chart_sheet(chart)], globals_extra=externsheet(0))
+            assert md.rstrip().endswith("\nQ2|2|4"), (first, md)
+    md = patched(limits, CHART_CELLS=6)(lambda: run([{"name": "Data", "cells": cells}, chart_sheet(chart)],
+                                                     globals_extra=externsheet(0)))
+    assert "Chart: column. Data: Data!A1:C3 (" in md and md.rstrip().endswith("\nQ1|1|3"), md
     half = [series[0], {"name": "Typed", "ref": series[1]["ref"][1:]}]
     md = run([{"name": "Data", "cells": cells}, chart_sheet(biff_chart(half, cache=False))],
              globals_extra=externsheet(0))
