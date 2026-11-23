@@ -286,6 +286,26 @@ def test_a_package_past_the_total_inflates_nothing():
     assert got == [None, None] and not reads and embedded.of(ctx).inflated == 0, (got, reads)
 
 
+def test_an_embedded_package_is_opened_and_its_members_read_once():
+    import zipfile
+    packages = (workbook(), chart_package())
+    real_read, real_init, reads, opens = zipfile.ZipFile.read, zipfile.ZipFile.__init__, [], []
+
+    def init(self, *a, **k):
+        opens.append(self)
+        real_init(self, *a, **k)
+    zipfile.ZipFile.read = lambda self, name, *a, **k: (reads.append((id(self), getattr(name, "filename", name))),
+                                                        real_read(self, name, *a, **k))[1]
+    zipfile.ZipFile.__init__ = init
+    try:
+        got = [embedded.of(Context()).load(data) for data in packages]
+    finally:
+        zipfile.ZipFile.read, zipfile.ZipFile.__init__ = real_read, real_init
+    assert [g[0] for g in got] == ["table", "table"], got
+    names = [n for _, n in reads]
+    assert len(opens) == 2 and "_rels/.rels" in names and len(reads) == len(set(reads)), (len(opens), names)
+
+
 def test_trees_of_embedded_packages_are_built_under_one_count():
     ctx = Context()
     for data in (workbook(), chart_package()):

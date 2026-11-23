@@ -22,27 +22,28 @@ _VISIO = "http://schemas.microsoft.com/visio/2010/relationships/document"
 def route(path) -> str:
     """"odf", "vsdx" or "ooxml" for the zip at `path` (a ReadError for a file that is no zip)."""
     with Package(path) as pkg:
-        if pkg.has("mimetype") and pkg.size("mimetype") <= _MIME_MAX:
-            try:
-                mime = pkg.read("mimetype")[:_MIME_MAX].decode("utf-8", "replace").strip()
-            except ReadError as e:
-                if e.kind != "damaged":
-                    raise  # an encrypted ODF stays encrypted
-                mime = ""
-            if mime.startswith(_MIME):
-                return "odf"
-        if pkg.has("content.xml") and not pkg.has("[Content_Types].xml"):
-            return "odf"
+        return kind(pkg)
+
+
+def kind(pkg) -> str:
+    """"odf", "vsdx" or "ooxml" for the open package `pkg`; its root relationships stay in ooxml_base's cache for
+    the parser that reads it next."""
+    from .ooxml_base import rels
+    if pkg.has("mimetype") and pkg.size("mimetype") <= _MIME_MAX:
         try:
-            root = pkg.rels("")
+            mime = pkg.read("mimetype")[:_MIME_MAX].decode("utf-8", "replace").strip()
         except ReadError as e:
             if e.kind != "damaged":
-                raise
-            root = {}
-        rels = [r for r in root.values() if not r.external]
-        if not any(r.type.endswith("/officeDocument") for r in rels) and any(
-                r.type == _VISIO and pkg.has(r.target) for r in rels):
-            return "vsdx"
+                raise  # an encrypted ODF stays encrypted
+            mime = ""
+        if mime.startswith(_MIME):
+            return "odf"
+    if pkg.has("content.xml") and not pkg.has("[Content_Types].xml"):
+        return "odf"
+    root = [r for r in rels(pkg, "").values() if not r.external]
+    if not any(r.type.endswith("/officeDocument") for r in root) and any(
+            r.type == _VISIO and pkg.has(r.target) for r in root):
+        return "vsdx"
     return "ooxml"
 
 

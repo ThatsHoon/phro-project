@@ -286,11 +286,12 @@ def sheet_tables(blocks, sheet: str) -> list:
 
 def _package(data, ctx):
     from .formats import zip_route
-    kind = zip_route.route(data)
-    if kind == "odf":
-        return _odf(data, ctx)
-    if kind == "ooxml":
-        return _workbook(data, ctx)
+    with Package(data) as pkg:
+        kind = zip_route.kind(pkg)
+        if kind == "odf":
+            return _odf(pkg, ctx)
+        if kind == "ooxml":
+            return _workbook(pkg, ctx)
     return None
 
 
@@ -317,37 +318,35 @@ def _shown(out, own, ctx, notes=None):
     return "table", out, _NONE
 
 
-def _odf(data, ctx):
+def _odf(pkg, ctx):
     from .formats import odf_sheets
     from .formats.odf_base import Body, Styles, kids, local
-    with Package(data) as pkg:
-        if not pkg.has("content.xml"):
-            return None
-        root = pkg.xml("content.xml")
-        own = of(ctx).inner()
-        body = Body(pkg, own, Styles(root, None))
-        inner = [c for b in kids(root, "body") for c in b]
-        if local(root.tag) == "math" or any(local(c.tag) == "chart" for c in inner):
-            got = body.object_blocks(root, 0)
-            if got and isinstance(got[0], Equation):
-                return "equation", got[0].tex, _NONE
-            if local(root.tag) == "math":
-                return BAD
-            return _shown(_tables(got), own, ctx)
-        if any(local(c.tag) == "spreadsheet" for c in inner):
-            doc = odf_sheets.sheets(pkg, own, root, None, first=True)
-            sec = next((b for b in doc.blocks if isinstance(b, Section) and not b.hidden), None)
-            return _shown(sheet_tables(sec.blocks, sec.title) if sec is not None else [], own, ctx, doc.notes)
+    if not pkg.has("content.xml"):
+        return None
+    root = pkg.xml("content.xml")
+    own = of(ctx).inner()
+    body = Body(pkg, own, Styles(root, None))
+    inner = [c for b in kids(root, "body") for c in b]
+    if local(root.tag) == "math" or any(local(c.tag) == "chart" for c in inner):
+        got = body.object_blocks(root, 0)
+        if got and isinstance(got[0], Equation):
+            return "equation", got[0].tex, _NONE
+        if local(root.tag) == "math":
+            return BAD
+        return _shown(_tables(got), own, ctx)
+    if any(local(c.tag) == "spreadsheet" for c in inner):
+        doc = odf_sheets.sheets(pkg, own, root, None, first=True)
+        sec = next((b for b in doc.blocks if isinstance(b, Section) and not b.hidden), None)
+        return _shown(sheet_tables(sec.blocks, sec.title) if sec is not None else [], own, ctx, doc.notes)
     return None
 
 
-def _workbook(data, ctx):
+def _workbook(pkg, ctx):
     from .formats import ooxml, ooxml_base, ooxml_sheets
-    with Package(data) as pkg:
-        part = ooxml._main_part(pkg)
-        root, _ = ooxml_base.load(pkg, part)
-        if ooxml_base.local(root.tag) != "workbook":
-            return None
-        own = of(ctx).inner()
-        sec, notes = ooxml_sheets.active_sheet(pkg, part, own)
-        return _shown(sheet_tables(sec.blocks, sec.title) if sec is not None else [], own, ctx, notes)
+    part = ooxml._main_part(pkg)
+    root, _ = ooxml_base.load(pkg, part)
+    if ooxml_base.local(root.tag) != "workbook":
+        return None
+    own = of(ctx).inner()
+    sec, notes = ooxml_sheets.active_sheet(pkg, part, own)
+    return _shown(sheet_tables(sec.blocks, sec.title) if sec is not None else [], own, ctx, notes)
