@@ -426,17 +426,17 @@ def test_stored_ole_marked_compressed():
 
 def test_ole_named_twice_read_once():
     calls = []
-    old = hwp.ole_blocks
+    old = hwp_chart.ole_blocks
 
     def spy(data, ctx, **kw):
         calls.append(len(data))
         return old(data, ctx, **kw)
-    hwp.ole_blocks = spy
+    hwp_chart.ole_blocks = spy
     try:
         out, ctx = read(doc(ole_shape(1), ole_shape(2), bins=items((2, 0, 1), (2, 0, 1)),
                             streams={"BIN0001.OLE": deflate(native())}, before="", after=""))
     finally:
-        hwp.ole_blocks = old
+        hwp_chart.ole_blocks = old
     assert out == TABLE + "\n" + TABLE, out
     assert len(calls) == 1, calls
 

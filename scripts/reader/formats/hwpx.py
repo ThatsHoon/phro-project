@@ -8,10 +8,12 @@ inside an `hp:container`, and at top level from `hp:pos` only when it is relativ
 """
 import fnmatch
 import re
+import struct
 from itertools import groupby
 
 from .. import diagram, limits
 from ..charts import chart_table
+from ..containers.cfb import is_cfb
 from ..containers.zipx import Package, attr, first, kids, local, parse_xml, resolve
 from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Image, NoteRef, Para, Table, Text
@@ -19,6 +21,7 @@ from .hancom import (
     Frame, Obj, Scopes, State, alt_text, button, cut_command, diagrams, flat, heading_level, lone_equations,
     next_marker, outline_marker, paragraph, place, plain, style_name_level,
 )
+from .hwp_chart import Items
 from .word_fields import comment_note
 
 HPF = "Contents/content.hpf"
@@ -183,6 +186,7 @@ class _Reader(Scopes):
         self.opened = 0  # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
         self.chart_cells = 0  # chart table cells placed so far, copies counted (CHART_TOTAL)
+        self.items = Items(ctx)  # the OLE items read so far
         self.margins = False  # walking a header or footer, whose pictures and charts are skipped
         self.budget = diagram.ConnectionBudget(ctx)  # the document's edges, shared by every section's diagrams
         self.collect = False  # reading drawing objects as hancom.Obj: in a section with a line, not in a sub-list
@@ -420,8 +424,7 @@ class _Reader(Scopes):
             t = first(el, "text")
             self.text(t.text if t is not None else "", st)
         elif n == "ole":
-            if not self.margins:
-                self.ctx.skipped["object"] += 1
+            self.ole(el, st)
         elif n in ("footNote", "endNote"):
             key = "fn" if n == "footNote" else "en"
             self.counts[key] += 1
@@ -544,6 +547,25 @@ class _Reader(Scopes):
             self.ctx.skipped["chart"] += 1
             return
         st.extras.append(tbl)
+
+    def ole(self, el, st):
+        """An OLE object: its BinData member read as hwp reads the item (hwp_chart.Items), whose 4-byte length is added
+        to a bare compound file; what it shows stands where it sits, every placement charged against CHART_TOTAL with
+        the charts. In a header or footer it is skipped, neither read nor counted."""
+        if self.margins:
+            return
+        data = self.part_bytes(self.images.get(attr(el, "binaryItemIDRef")), "object")
+        if data is None:
+            return
+        if is_cfb(data[:8]):
+            data = struct.pack("<I", len(data)) + data
+        blocks, cells = self.items.show(data)
+        if blocks:
+            self.chart_cells += cells
+            if self.chart_cells > limits.CHART_TOTAL:
+                self.ctx.skipped["chart"] += 1
+            else:
+                st.extras.extend(blocks)
 
     # ---- tables
     def table(self, tbl, d):

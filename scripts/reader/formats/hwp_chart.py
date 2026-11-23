@@ -32,6 +32,8 @@ _SIBLINGS = (b"VtBackdrop\0", b"VtBackDrop\0", b"VtChartSection\0", b"VtFootnote
 _TITLES = (b"VtChartTitle\0", b"VtTitle\0")
 _TITLE_SCAN = 4096   # bytes after a title marker searched for its text (a title sits right after its class)
 _ECHO_FACTOR = 16    # bytes the label echo searches may scan together, per byte of the stream
+MAX_OBJECTS = 256    # OLE items one document reads (the rest are counted under object)
+_LOSSES = ("object", "chart", "depth")  # what a read of an OLE item counts, again at each later placement
 # VtChChartType, MSChart's documented constants (3D and 2D bar, drawn vertical, line, area, step, combination, 2D
 # pie, XY), with 10 and 11 (horizontal bar) and 13 (3D pie) from the 27-type table VtSeries' painter selectors index
 # (rhwp legacy_presentation.rs reads 27 of them); anything else is unknown, as rhwp's OleChartType
@@ -83,6 +85,32 @@ def ole_blocks(data: bytes, ctx, *, sheets: sheet_grid.Budget | None = None) -> 
         return []
     with objs.timed():
         return _item(data, ctx, sheets)
+
+
+class Items:
+    """A document's OLE items (an hwp BinData item, an hwpx BinData member), keyed by their bytes: each is read once by
+    ole_blocks, with the document's sheet budget, and at most MAX_OBJECTS of them are (the rest are counted under
+    object, unread). What an item's read counted (an item not read, an equation converted in part) is counted again at
+    every later placement, under the kind its first read counted it as."""
+
+    def __init__(self, ctx):
+        self.ctx, self.read, self.sheets = ctx, {}, embedded.of(ctx).budget()
+
+    def show(self, data: bytes) -> tuple[list, int]:
+        """What `data` shows at this placement, and the table cells in it (for CHART_TOTAL)."""
+        ctx = self.ctx
+        if data not in self.read:
+            if len(self.read) >= MAX_OBJECTS:
+                ctx.skipped["object"] += 1
+                return [], 0
+            before = {k: ctx.skipped[k] for k in _LOSSES}
+            blocks = ole_blocks(data, ctx, sheets=self.sheets)
+            lost = next((k for k in _LOSSES if ctx.skipped[k] > before[k]), None)
+            self.read[data] = blocks, sum(len(r) for b in blocks if isinstance(b, Table) for r in b.rows), lost
+        elif self.read[data][2]:
+            ctx.skipped[self.read[data][2]] += 1
+        blocks, cells, _ = self.read[data]
+        return blocks, cells
 
 
 def _item(data: bytes, ctx, sheets) -> list:

@@ -299,17 +299,17 @@ def test_doc_object_cap():
 
 
 def test_hwp_object_cap():
-    from reader.formats import hwp
+    from reader.formats import hwp_chart
     items = [object_streams(excel_object([(G1, G2)[k % 2]], b"Excel.Sheet.8")) for k in range(3)]
     items[2] = object_streams(excel_object([{"name": "S", "cells": {(0, 0): 9, (0, 1): 9}}], b"Excel.Sheet.8"))
     shapes = [hchart.ole_shape(k) for k in (1, 2, 3)]
     streams = {f"BIN000{k + 1}.OLE": hchart.deflate(hchart.envelope(s)) for k, s in enumerate(items)}
-    old = hwp.MAX_OBJECTS
-    hwp.MAX_OBJECTS = 2
+    old = hwp_chart.MAX_OBJECTS
+    hwp_chart.MAX_OBJECTS = 2
     try:
         out, ctx = hchart.read(hchart.doc(*shapes, streams=streams))
     finally:
-        hwp.MAX_OBJECTS = old
+        hwp_chart.MAX_OBJECTS = old
     assert out.count("\n1|2\n") == 1 and out.count("\n5|6\n") == 1 and "\n9|9\n" not in out, out
     assert ctx.skipped == {"object": 1}, ctx.skipped
 

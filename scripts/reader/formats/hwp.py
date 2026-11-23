@@ -22,7 +22,7 @@ from bisect import bisect_right
 from collections import deque
 from itertools import groupby
 
-from .. import diagram, embedded, limits
+from .. import diagram, limits
 from ..containers import flate
 from ..containers.cfb import Compound, is_cfb
 from ..images import sniff
@@ -33,7 +33,7 @@ from .hancom import (
     Frame, Obj, Scopes, State, alt_text, button, cut_command, diagrams, flat, heading_level, lone_equations,
     next_marker, outline_marker, paragraph, place, plain, props, style_name_level,
 )
-from .hwp_chart import ole_blocks
+from .hwp_chart import Items
 from .hwp_records import (
     CTRL_HEADER, EQEDIT, FORM_OBJECT, LIST_HEADER, MEMO_LIST, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT,
     SHAPE_COMPONENT, SHAPE_LINE, SHAPE_OLE, SHAPE_PICTURE, TABLE, TEXTART, DocInfo, ParaShape, doc_info, file_header,
@@ -46,8 +46,6 @@ _V3 = b"HWP Document File V3"
 _DRM = (b"SCDSA", b"\x9b DRMONE")  # SoftCamp and Fasoo DRM containers (rhwp parser/mod.rs)
 _SECTION = re.compile(r"(bodytext|viewtext)/section(\d+)", re.I)
 _SECTIONS = 1000
-MAX_OBJECTS = 256  # OLE items one document reads (the rest are counted under object)
-_OLE_LOSSES = ("object", "chart", "depth")  # what a read of an OLE item counts, again at each later placement
 _DELETE = 0x11  # the PARA_RANGE_TAG kind (top byte of its tag) of a tracked deletion; 0x10, an insertion, stays
 # control characters: one unit (char class) unless listed here; these take eight units
 _EXTENDED = frozenset((1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23))  # the k-th one owns the k-th CTRL_HEADER
@@ -249,12 +247,10 @@ class _Reader(Scopes):
         self.numbers = {}   # numbering id -> {level: counter}
         self.outline = 0    # the outline numbering id of the current section's secd
         self.blobs = {}     # (BinData stream name, inflated?, kind) -> its bytes, or None when it cannot be read
-        self.tables = {}    # an OLE item's bytes -> (the blocks it shows, their table cells, the kind it was counted under)
+        self.items = Items(ctx)  # the OLE items read so far
         self.opened = 0     # tables opened so far (TABLE_NODES)
         self.image_bytes = 0  # picture bytes placed so far, copies counted (IMAGE_BYTES)
         self.chart_cells = 0  # chart table cells placed so far, copies counted (CHART_TOTAL)
-        self.sheets = embedded.of(ctx).budget()
-        self.objects = 0      # OLE items read so far (MAX_OBJECTS)
         self.margins = False  # walking a header or footer, whose pictures and objects are skipped
         # the current section came from ViewText, whose PARA_RANGE_TAG deletions are pending changes; BodyText already
         # holds the accepted text (dochan reader.py), so a range left in it hides nothing
@@ -902,30 +898,17 @@ class _Reader(Scopes):
         return self.end(recs, j)
 
     def ole(self, recs, j, st, d, g, alt):
-        """SHAPE_OLE: the BinData item at offset 12, an OLE object. What it shows (hwp_chart.ole_blocks: a chart's
-        table, an equation, a package's tables) stands where a picture would; an item two shapes name is read once,
-        but every placement is charged against
+        """SHAPE_OLE: the BinData item at offset 12, an OLE object. What it shows (hwp_chart.Items: a chart's table,
+        an equation, a package's tables, a document) stands where a picture would; every placement is charged against
         CHART_TOTAL, as in the Word and slide readers, and one past it is counted under chart instead. In a header or
-        footer it is skipped (margin). What an item's read counted (an item not read, an equation converted in part)
-        is counted at every placement, under the kind its first read counted it as."""
+        footer it is skipped (margin)."""
         if self.margins:
             return self.end(recs, j)
         data = recs[j].data
         bid = struct.unpack_from("<H", data, 12)[0] if len(data) >= 14 else 0
         item = self.bin_data(bid, "object")
         if item is not None:
-            if item not in self.tables:
-                self.objects += 1
-                if self.objects > MAX_OBJECTS:  # past the cap: counted under object, not read
-                    self.ctx.skipped["object"] += 1
-                    return self.end(recs, j)
-                before = {k: self.ctx.skipped[k] for k in _OLE_LOSSES}
-                blocks = ole_blocks(item, self.ctx, sheets=self.sheets)
-                lost = next((k for k in _OLE_LOSSES if self.ctx.skipped[k] > before[k]), None)
-                self.tables[item] = blocks, sum(len(r) for b in blocks if isinstance(b, Table) for r in b.rows), lost
-            elif self.tables[item][2]:
-                self.ctx.skipped[self.tables[item][2]] += 1
-            blocks, cells, _ = self.tables[item]
+            blocks, cells = self.items.show(item)
             if blocks:
                 self.chart_cells += cells
                 if self.chart_cells > limits.CHART_TOTAL:

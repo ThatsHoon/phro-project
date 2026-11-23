@@ -2,6 +2,7 @@
 
 Run: python -I -X utf8 tests/test_reader_hwpx.py
 """
+import struct
 import sys
 import tempfile
 from pathlib import Path
@@ -495,14 +496,119 @@ def test_form_objects_give_their_value():
     assert md(hwpx_doc(sec)) == "☐ 보류 (indeterminate) 지역 대전\n"
 
 
+def _ole(ref):
+    return (f'<hp:ole id="11" objectType="EMBEDDED" binaryItemIDRef="{ref}"><hp:sz width="100" height="100"/>'
+            '</hp:ole>')
+
+
+def ole_doc(refs, members, header=()):
+    """A paragraph 앞, an hp:ole per id of `refs`, 뒤; `members` maps an item id to its BinData/<id>.ole bytes (None:
+    listed, with no member); `header` holds the ids of hp:ole objects in a header."""
+    items = "".join(f'<opf:item id="{i}" href="BinData/{i}.ole" media-type="application/ole"/>' for i in members)
+    head = ""
+    if header:
+        head = ('<hp:p><hp:run><hp:ctrl><hp:header><hp:subList><hp:p><hp:run><hp:t>머리말</hp:t>'
+                + "".join(_ole(r) for r in header) + '</hp:run></hp:p></hp:subList></hp:header></hp:ctrl></hp:run></hp:p>')
+    sec = head + '<hp:p><hp:run><hp:t>앞</hp:t>' + "".join(_ole(r) for r in refs) + '<hp:t>뒤</hp:t></hp:run></hp:p>'
+    return hwpx_doc(sec, hpf_items=items, extra={f"BinData/{i}.ole": b for i, b in members.items() if b is not None})
+
+
+def ole_item(streams, prefixed=True):
+    """An OLE item as hwp keeps it (a u32 length, then the compound file), or the bare compound file."""
+    from reader_fix import cfb_bytes
+    blob, _ = cfb_bytes(streams)
+    return struct.pack("<I", len(blob)) + blob if prefixed else blob
+
+
+def test_ole_objects_shown():
+    # each OLE object shows what hwp's would, where it stands: a chart's table, an equation, a workbook's table and an
+    # embedded Word document (OOXML, and a bare compound file's WordDocument)
+    from reader_fix import eq_native
+    import test_reader_embedded as emb
+    import test_reader_embedded_docs as docs
+    import test_reader_ppt_objects as in_ppt
+    members = {"c": ole_item({"OOXMLChartContents": CHART.encode()}), "e": ole_item({"Equation Native": eq_native(in_ppt.X)}),
+               "w": ole_item({"Package": emb.workbook()}), "d": ole_item({"Package": docs.word()}),
+               "o": docs.old_word()}
+    doc, ctx = parse(ole_doc(list(members), members))
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert not ctx.skipped, ctx.skipped
+    marks = ("앞뒤", "Chart: column", "\nA|5\n", "$$x$$", "Pen", docs.WORD_MD, docs.DOC_MD)
+    at = [out.find(m) for m in marks]
+    assert -1 not in at and at == sorted(at), (at, out)
+
+
 def test_ole_object_counted():
-    items = '<opf:item id="ole1" href="BinData/ole1.ole" media-type="application/ole"/>'
-    sec = ('<hp:p><hp:run><hp:t>앞</hp:t><hp:ole id="11" objectType="EMBEDDED" binaryItemIDRef="ole1">'
-           '<hp:sz width="100" height="100"/></hp:ole><hp:t>뒤</hp:t></hp:run></hp:p>')
-    p = hwpx_doc(sec, hpf_items=items, extra={"BinData/ole1.ole": b"\xd0\xcf\x11\xe0" + bytes(60)})
+    # an item that is no OLE item, an empty one, one the manifest does not list, a listed one with no member and an
+    # hp:ole naming no item each cost one embedded object
+    items = {"ole1": b"\xd0\xcf\x11\xe0" + bytes(60), "ole3": b"", "ole2": None}
+    p = ole_doc(["ole1", "ole3", "ole9", "ole2"], items)
     doc, ctx = parse(p)
-    assert ctx.skipped["object"] == 1, ctx.skipped
-    assert markdown.render(doc, tmp() / "a", False, ctx.skipped) == "(could not read: 1 embedded object)\n\n앞뒤\n"
+    assert ctx.skipped == {"object": 4}, ctx.skipped
+    assert markdown.render(doc, tmp() / "a", False, ctx.skipped) == "(could not read: 4 embedded objects)\n\n앞뒤\n"
+    doc, ctx = parse(hwpx_doc('<hp:p><hp:run><hp:t>앞</hp:t><hp:ole/></hp:run></hp:p>'))
+    assert ctx.skipped == {"object": 1}, ctx.skipped
+
+
+def test_ole_in_header_skipped_unread():
+    from reader.formats import hwp_chart
+    calls = []
+    old = hwp_chart.ole_blocks
+
+    def spy(data, ctx, **kw):
+        calls.append(len(data))
+        return old(data, ctx, **kw)
+    hwp_chart.ole_blocks = spy
+    try:
+        doc, ctx = parse(ole_doc([], {"c": ole_item({"OOXMLChartContents": CHART.encode()}), "x": None}, header=["c", "x"]))
+    finally:
+        hwp_chart.ole_blocks = old
+    assert doc.headers == ["머리말"] and not ctx.skipped and not calls, (doc.headers, ctx.skipped, calls)
+
+
+def test_ole_named_twice_read_once():
+    from reader.formats import hwp_chart
+    calls = []
+    old = hwp_chart.ole_blocks
+
+    def spy(data, ctx, **kw):
+        calls.append(len(data))
+        return old(data, ctx, **kw)
+    hwp_chart.ole_blocks = spy
+    try:
+        doc, ctx = parse(ole_doc(["c", "c"], {"c": ole_item({"OOXMLChartContents": CHART.encode()})}))
+    finally:
+        hwp_chart.ole_blocks = old
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert out.count("Chart: column") == 2 and len(calls) == 1 and not ctx.skipped, (out, calls, ctx.skipped)
+
+
+def test_ole_objects_capped():
+    from reader.formats import hwp_chart
+    old = hwp_chart.MAX_OBJECTS
+    hwp_chart.MAX_OBJECTS = 1
+    try:
+        doc, ctx = parse(ole_doc(["a", "b", "a"], {"a": ole_item({"OOXMLChartContents": CHART.encode()}),
+                                                  "b": ole_item({"OOXMLChartContents": CHART.encode() + b" "})}))
+    finally:
+        hwp_chart.MAX_OBJECTS = old
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert out.count("Chart: column") == 2 and ctx.skipped == {"object": 1}, (out, ctx.skipped)
+
+
+def test_ole_charts_share_chart_total():
+    # an OLE chart's table is charged against CHART_TOTAL with the hp:chart tables: past it, it is counted under chart
+    old = limits.CHART_TOTAL
+    limits.CHART_TOTAL = 4
+    items = ('<opf:item id="c" href="BinData/c.ole" media-type="application/ole"/>')
+    sec = '<hp:p><hp:run><hp:chart chartIDRef="Chart/chart1.xml"/>' + _ole("c") + '</hp:run></hp:p>'
+    try:
+        doc, ctx = parse(hwpx_doc(sec, hpf_items=items, extra={"Chart/chart1.xml": CHART,
+                                                               "BinData/c.ole": ole_item({"OOXMLChartContents": CHART.encode()})}))
+    finally:
+        limits.CHART_TOTAL = old
+    out = markdown.render(doc, tmp() / "a", False, ctx.skipped)
+    assert out.count("Chart: column") == 1 and ctx.skipped == {"chart": 1}, (out, ctx.skipped)
 
 
 def test_equation_never_wrong_tex():
