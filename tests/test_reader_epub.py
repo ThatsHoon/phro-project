@@ -506,6 +506,37 @@ def test_mathml_becomes_tex():
     assert "d" in tex(f"<math>{deep}</math>")
 
 
+def test_mathml_fonts_and_annotations():
+    """mathvariant comes down from mstyle and math, a token's own overriding it; a styled letter is not styled again;
+    the two-style variants keep both; the presentation in annotation-xml stands for content markup, and alttext for
+    a tree with content markup in it; a text/plain annotation is not TeX."""
+    def tex(math):
+        out, _ = md(epub_book({"c.xhtml": f"<p>f: {math}</p>"}, title=""))
+        return out.strip()[3:]
+    cases = [
+        ('<math><mstyle mathvariant="bold"><mi>v</mi></mstyle><mo>+</mo><mi>w</mi></math>', "$\\mathbf{v}+w$"),
+        ('<math mathvariant="bold"><mi>x</mi></math>', "$\\mathbf{x}$"),
+        ('<math><mstyle mathvariant="bold"><mi mathvariant="normal">x</mi><mn>2</mn></mstyle></math>',
+         "$x\\mathbf{2}$"),
+        ('<math><mi mathvariant="double-struck">ℝ</mi></math>', "$\\mathbb{R}$"),
+        ('<math><mi mathvariant="bold-sans-serif">A</mi></math>', "$\\boldsymbol{\\mathsf{A}}$"),
+        ('<math><mi mathvariant="sans-serif-bold-italic">a</mi></math>',
+         "$\\boldsymbol{\\mathsf{\\mathit{a}}}$"),
+        ('<math><mi mathvariant="bold-script">C</mi></math>', "$\\boldsymbol{\\mathcal{C}}$"),
+        ('<math><mi mathvariant="italic">ab</mi><mi mathvariant="italic">x</mi></math>', "$\\mathit{ab}x$"),
+        ('<math><semantics><apply><eq/><ci>E</ci><ci>m</ci></apply><annotation-xml encoding="MathML-Presentation">'
+         '<mrow><mi>E</mi><mo>=</mo><mi>m</mi></mrow></annotation-xml></semantics></math>', "$E=m$"),
+        ('<math alttext="x=a+b"><mrow><mi>x</mi><mo>=</mo><apply><plus/><ci>a</ci><ci>b</ci></apply></mrow></math>',
+         "$x=a+b$"),
+        ('<math alttext="z"><semantics><mi>z</mi><annotation encoding="text/plain">zed</annotation></semantics>'
+         '</math>', "$z$"),
+        ('<math alttext="q"><semantics><apply><plus/><ci>a</ci><ci>b</ci></apply>'
+         '<annotation encoding="text/plain">a plus b</annotation></semantics></math>', "$q$"),
+    ]
+    bad = [(m, got, want) for m, want in cases if (got := tex(m)) != want]
+    assert not bad, bad
+
+
 def test_visibility_hidden_is_hidden():
     out, _ = md(epub_book({"c.xhtml": '<p>shown</p><p class="v">secret</p><p style="visibility: collapse">x2</p>'
                                       '<p>a <span style="visibility:hidden">b</span> c</p>'},

@@ -748,10 +748,15 @@ _LIMIT_NAMES = frozenset({"lim", "liminf", "limsup", "max", "min", "sup", "inf",
 _SILENT = frozenset({"annotation", "annotation-xml", "none", "mprescripts", "mspace", "malignmark", "maligngroup"})
 
 
-_PRESENTED = frozenset({"mi", "mn", "mo", "mtext", "ms", "annotation"})
-_VARIANT = {"bold": "\\mathbf", "double-struck": "\\mathbb", "script": "\\mathcal", "fraktur": "\\mathfrak",
-            "sans-serif": "\\mathsf", "monospace": "\\mathtt", "bold-italic": "\\boldsymbol",
-            "bold-script": "\\mathcal", "bold-fraktur": "\\mathfrak"}
+_PRESENTED = frozenset({"mi", "mn", "mo", "mtext", "ms"})
+_CONTENT = frozenset({"apply", "bind", "ci", "cn", "csymbol", "cs", "cbytes", "cerror", "share"})
+_TEX_ENCODING = re.compile(r"\b(la)?tex\b")
+_PRESENTATION = frozenset({"mathml-presentation", "application/mathml-presentation+xml"})
+_VARIANT = {"bold": ("\\mathbf",), "italic": ("\\mathit",), "bold-italic": ("\\boldsymbol",),
+            "double-struck": ("\\mathbb",), "script": ("\\mathcal",), "bold-script": ("\\boldsymbol", "\\mathcal"),
+            "fraktur": ("\\mathfrak",), "bold-fraktur": ("\\boldsymbol", "\\mathfrak"), "sans-serif": ("\\mathsf",),
+            "bold-sans-serif": ("\\boldsymbol", "\\mathsf"), "sans-serif-italic": ("\\mathsf", "\\mathit"),
+            "sans-serif-bold-italic": ("\\boldsymbol", "\\mathsf", "\\mathit"), "monospace": ("\\mathtt",)}
 
 
 def _local(tag: str) -> str:
@@ -766,27 +771,65 @@ def _token(node) -> str:
     return _ws(text_of(node)).strip()
 
 
+def _tex_note(n) -> bool:
+    """An `annotation` holding TeX (application/x-tex, LaTeX and the like; not text/plain)."""
+    return _local(n.tag) == "annotation" and bool(_TEX_ENCODING.search(n.attrs.get("encoding", "").lower()))
+
+
+def _presentation_note(n) -> bool:
+    return _local(n.tag) == "annotation-xml" and n.attrs.get("encoding", "").strip().lower() in _PRESENTATION
+
+
+def _scan(node) -> tuple[bool, bool]:
+    """(a presentation token or TeX annotation is in `node`, Content MathML is in it), an annotation-xml looked into
+    only when it is presentation markup."""
+    presented = content = False
+    stack = [node]
+    while stack and not (presented and content):
+        n = stack.pop()
+        t = _local(n.tag)
+        if t in _PRESENTED or _tex_note(n):
+            presented = True
+        elif t in _CONTENT:
+            content = True
+        elif t != "annotation-xml" or _presentation_note(n):
+            stack.extend(_args(n))
+    return presented, content
+
+
 def mathml(node) -> str:
     """TeX of a MathML element without delimiters: a TeX annotation of `semantics` as written, else the presentation
-    markup through the TeX buffer the Office Math reader writes with. Past limits.MAX_DEPTH an element is its text.
-    "" for a tree with no presentation token and no annotation (Content MathML): its text is not the formula."""
-    stack = [node]
-    while stack:
-        n = stack.pop()
-        if _local(n.tag) in _PRESENTED:
-            break
-        stack.extend(_args(n))
-    else:
+    markup through the TeX buffer the Office Math reader writes with (for content markup with its presentation in a
+    MathML-Presentation annotation-xml, that). Past limits.MAX_DEPTH an element is its text. The element's
+    `alttext` for a tree with Content MathML in it, which the conversion does not read; "" for one with no
+    presentation token and no TeX annotation: its text is not the formula."""
+    presented, content = _scan(node)
+    alt = node.attrs.get("alttext", "").strip()[:2000]
+    if content and alt:
+        return alt
+    if not presented:
         return ""
     out = omml.Tex()
     _mm(node, out, 0)
     return out.finish()
 
 
-def _mm_arg(node, depth) -> omml.Tex:
+def _mm_arg(node, depth, v="") -> omml.Tex:
     out = omml.Tex()
-    _mm(node, out, depth)
+    _mm(node, out, depth, v)
     return out
+
+
+def _font(variant: str, t: str, s: str) -> tuple:
+    """The font commands of a token's `mathvariant`, outermost first: none for an italic or normal letter (TeX's
+    default), nor for characters already styled (𝐀, ℝ), which their own command writes."""
+    if variant == "normal":
+        return ("\\mathrm",) if t == "mi" and len(s) > 1 else ()
+    if variant == "italic" and t == "mi" and len(s) == 1:
+        return ()
+    if s.strip() and all(omml.fold_alnum(c) is not None for c in s if not c.isspace()):
+        return ()
+    return _VARIANT.get(variant, ())
 
 
 def _big(node) -> bool:
@@ -794,7 +837,8 @@ def _big(node) -> bool:
     return _local(node.tag) in ("mo", "mi") and (_token(node) in _BIG_OPS or _token(node) in _LIMIT_NAMES)
 
 
-def _mm(n, out, depth):
+def _mm(n, out, depth, v=""):
+    """`n` written to `out`; `v` is the mathvariant an enclosing mstyle or math gives its tokens."""
     if isinstance(n, str):
         if n.strip():
             out.push_math_text(_ws(n).strip())
@@ -803,17 +847,22 @@ def _mm(n, out, depth):
         out.push_math_text(_token(n))
         return
     t, a = _local(n.tag), _args(n)
+    if t in ("mstyle", "math"):
+        v = n.attrs.get("mathvariant", "").strip().lower() or v
     if t in ("mi", "mn", "mo"):
         s = _token(n)
-        variant = n.attrs.get("mathvariant", "").strip().lower()
-        font = _VARIANT.get(variant) or ("\\mathrm" if variant == "normal" and t == "mi" and len(s) > 1 else None)
+        font = _font(n.attrs.get("mathvariant", "").strip().lower() or v, t, s)
         name = omml.function_name(s) if t != "mn" and len(s) > 1 and not font else None
         if name:
             out.push_macro(name)
         elif font and s:
             inner = omml.Tex()
             inner.push_math_text(s)
-            out.push_command(font, inner)
+            for cmd in reversed(font[1:]):
+                wrapped = omml.Tex()
+                wrapped.push_command(cmd, inner)
+                inner = wrapped
+            out.push_command(font[0], inner)
         else:
             out.push_math_text(s)
     elif t in ("mtext", "ms"):
@@ -821,7 +870,7 @@ def _mm(n, out, depth):
         if s:
             out.push_text_mode(s)
     elif t == "mfrac" and len(a) >= 2:
-        num, den = _mm_arg(a[0], depth + 1), _mm_arg(a[1], depth + 1)
+        num, den = _mm_arg(a[0], depth + 1, v), _mm_arg(a[1], depth + 1, v)
         if n.attrs.get("linethickness", "").strip() in ("0", "0px", "0em", "0pt"):
             out.push_char("{")
             out.push_tex(num)
@@ -835,29 +884,29 @@ def _mm(n, out, depth):
     elif t == "msqrt":
         inner = omml.Tex()
         for c in n.children:
-            _mm(c, inner, depth + 1)
+            _mm(c, inner, depth + 1, v)
         out.push_command("\\sqrt", inner)
     elif t == "mroot" and len(a) >= 2:
         out.push_macro("\\sqrt")
         out.push_char("[")
-        out.push_tex(_mm_arg(a[1], depth + 1))
+        out.push_tex(_mm_arg(a[1], depth + 1, v))
         out.push_char("]")
-        out.push_group(_mm_arg(a[0], depth + 1))
+        out.push_group(_mm_arg(a[0], depth + 1, v))
     elif t in ("msub", "msup", "msubsup", "munder", "mover", "munderover") and len(a) >= 2:
-        _scripts(t, a, out, depth)
+        _scripts(t, a, out, depth, v)
     elif t == "mmultiscripts" and a:
         rest = a[1:]
         cut = next((i for i, c in enumerate(rest) if _local(c.tag) == "mprescripts"), len(rest))
-        _pairs(rest[cut + 1:], out, depth, "{}")
-        out.push_base(_mm_arg(a[0], depth + 1))
-        _pairs(rest[:cut], out, depth, "")
+        _pairs(rest[cut + 1:], out, depth, "{}", v)
+        out.push_base(_mm_arg(a[0], depth + 1, v))
+        _pairs(rest[:cut], out, depth, "", v)
     elif t == "mfenced":
         seps = "".join(n.attrs.get("separators", ",").split())
         out.push_math_text(n.attrs.get("open", "("))
         for i, c in enumerate(a):
             if i and seps:
                 out.push_math_text(seps[min(i - 1, len(seps) - 1)])
-            _mm(c, out, depth + 1)
+            _mm(c, out, depth + 1, v)
         out.push_math_text(n.attrs.get("close", ")"))
     elif t == "mtable":
         out.push_str("\\begin{matrix}")
@@ -868,22 +917,25 @@ def _mm(n, out, depth):
             cells = [c for c in _args(row) if _local(c.tag) == "mtd"][1 if _local(row.tag) == "mlabeledtr" else 0:]
             for j, cell in enumerate(cells):
                 out.push_str(" & " if j else " ")
-                out.push_tex(_mm_arg(cell, depth + 2))
+                out.push_tex(_mm_arg(cell, depth + 2, v))
         out.push_str(" \\end{matrix}")
     elif t == "semantics":
-        tex = next((_token(c) for c in a if _local(c.tag) == "annotation"
-                    and "tex" in c.attrs.get("encoding", "").lower()), "")
+        tex = next((_token(c) for c in a if _tex_note(c)), "")
+        shown = next((c for c in a[1:] if _presentation_note(c)), None) if a and not _scan(a[0])[0] else None
         if tex:
             out.push_str(tex)
+        elif shown is not None:
+            for c in shown.children:
+                _mm(c, out, depth + 1, v)
         elif a:
-            _mm(a[0], out, depth + 1)
+            _mm(a[0], out, depth + 1, v)
     elif t not in _SILENT:
         for c in n.children:
-            _mm(c, out, depth + 1)
+            _mm(c, out, depth + 1, v)
 
 
-def _scripts(t, a, out, depth):
-    base = _mm_arg(a[0], depth + 1)
+def _scripts(t, a, out, depth, v):
+    base = _mm_arg(a[0], depth + 1, v)
     big = _big(a[0])
     if t in ("munder", "mover") and not big and _local(a[1].tag) == "mo":
         cmd = omml.accent(_token(a[1]))
@@ -897,26 +949,26 @@ def _scripts(t, a, out, depth):
         for mark, part in (("_", lower), ("^", upper)):
             if part is not None:
                 out.push_char(mark)
-                out.push_group(_mm_arg(part, depth + 1))
+                out.push_group(_mm_arg(part, depth + 1, v))
         return
     for cmd, part in (("\\underset", lower), ("\\overset", upper)):
         if part is not None:
             wrapped = omml.Tex()
             wrapped.push_macro(cmd)
-            wrapped.push_group(_mm_arg(part, depth + 1))
+            wrapped.push_group(_mm_arg(part, depth + 1, v))
             wrapped.push_group(base)
             base = wrapped
     out.push_tex(base)
 
 
-def _pairs(parts, out, depth, lead):
+def _pairs(parts, out, depth, lead, v):
     """The (subscript, superscript) pairs of mmultiscripts; `none` leaves its side out."""
     for i in range(0, len(parts) - 1, 2):
         out.push_str(lead)
         for mark, part in (("_", parts[i]), ("^", parts[i + 1])):
             if _local(part.tag) != "none":
                 out.push_char(mark)
-                out.push_group(_mm_arg(part, depth + 1))
+                out.push_group(_mm_arg(part, depth + 1, v))
 
 
 # ---- headings from a table of contents
