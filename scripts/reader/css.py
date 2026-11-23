@@ -1,5 +1,5 @@
-"""The small CSS cascade the document reader needs: hidden (display:none, visibility:hidden or collapse) and bold,
-nothing else."""
+"""The small CSS cascade the document reader needs: visibility (display:none, visibility hidden, collapse or
+visible) and bold, nothing else."""
 import re
 
 MAX_SHEET = 2**20     # characters of one stylesheet that are read
@@ -123,13 +123,15 @@ class Css:
                 best[name] = (rank, val)
         return {k: v[1] for k, v in best.items()}
 
-    def hidden(self, node, ancestors) -> bool:
-        """True when node, or any of `ancestors`, has display:none or visibility:hidden or collapse."""
-        for n in (node, *ancestors):
-            props = self._props(n)
-            if props.get("display") == "none" or props.get("visibility") in ("hidden", "collapse"):
-                return True
-        return False
+    def visibility(self, node) -> str:
+        """How node's own rules show it: "none" (display:none: it and all inside it are gone, nothing inside can
+        show), "hidden" (visibility hidden or collapse, which its descendants inherit until one says visible),
+        "visible", or "" (it says nothing and inherits)."""
+        props = self._props(node)
+        if props.get("display") == "none":
+            return "none"
+        v = props.get("visibility")
+        return "hidden" if v in ("hidden", "collapse") else "visible" if v == "visible" else ""
 
     def bold(self, node) -> bool:
         v = self._props(node).get("font-weight", "")

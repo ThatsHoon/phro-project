@@ -1,7 +1,7 @@
 """Tolerant XHTML/HTML walker with a small CSS cascade; epub and mobi use it.
 
 `tree` builds a depth-limited Node tree with the stdlib HTMLParser, `Css` answers the two questions the
-reader cares about (is this hidden, is this bold), and `blocks` turns a tree into document-model blocks.
+reader cares about (how is this shown, is this bold), and `blocks` turns a tree into document-model blocks.
 MathML becomes TeX (`mathml`). A table of contents marks its targets with MARK and a depth digit, which
 `promote` turns into headings (epub marks the tree, mobi the text).
 This module is named html on purpose: reader/ itself must never be on sys.path, so the stdlib `html.parser`
@@ -336,14 +336,95 @@ def _caps(items: list, imgs: list) -> list:
         if isinstance(after, Text) and after.text[:1].isalpha():
             node = lead[0].node
             lead[0] = Text(_cap_letter(node))
-            imgs[:] = [im for im in imgs if im is not node]
+            imgs[:] = [im for im in imgs if im[0] is not node]
     return _uncap(items)
+
+
+@dataclass
+class _Shown:
+    """Inlines that show (visibility:visible) inside a visibility-hidden element, held until that element hides
+    what is around them (_unhide); never left in a block."""
+    inlines: list
+
+
+def _has_shown(it) -> bool:
+    if isinstance(it, _Shown):
+        return True
+    return not isinstance(it, Hidden) and any(_has_shown(x) for x in getattr(it, "inlines", ()))
+
+
+def _unhide(items: list) -> list:
+    """items of a visibility-hidden element with their _Shown runs let out: each run around them becomes a Hidden
+    (one of only spaces and breaks stays, as visibility keeps its room), and an inline that holds one is split the
+    same way inside."""
+    out, run = [], []
+
+    def put():
+        if run:
+            if _blank(run):
+                out.extend(run)
+            else:
+                out.append(Hidden(run[:]))
+            run.clear()
+    for it in items:
+        if isinstance(it, _Shown):
+            put()
+            out.extend(it.inlines)
+        elif _has_shown(it):
+            put()
+            it.inlines[:] = _unhide(it.inlines)
+            out.append(it)
+        else:
+            run.append(it)
+    put()
+    return out
+
+
+def _shows(b, kept) -> bool:
+    """Whether block b holds anything that shows inside a hiding element: a block in `kept` (ids of the blocks a
+    visible element gave) or a _Shown run."""
+    if id(b) in kept:
+        return True
+    if b.hidden:
+        return False
+    if isinstance(b, Table):
+        return any(_shows(x, kept) for row in b.rows for c in row for x in c.blocks)
+    if isinstance(b, Quote):
+        return any(_shows(x, kept) for x in b.blocks)
+    return any(_has_shown(i) for i in getattr(b, "inlines", ()))
+
+
+def _hide(blocks, kept):
+    """Mark the blocks a hiding element gave hidden. With `kept` (something inside showed), what shows stays: a
+    kept block, a paragraph's shown runs (_unhide), and the shown parts of a quote or of a table's rows, the rest
+    of a table going as hidden rows."""
+    for b in blocks:
+        if kept is None or not _shows(b, kept):
+            b.hidden = "hidden"
+        elif id(b) in kept:
+            continue
+        elif isinstance(b, Quote):
+            _hide(b.blocks, kept)
+        elif isinstance(b, Table):
+            rows = set()
+            for r, row in enumerate(b.rows):
+                if any(_shows(x, kept) for c in row for x in c.blocks):
+                    for c in row:
+                        _hide(c.blocks, kept)
+                else:
+                    rows.add(r)
+            b.hidden_rows = b.hidden_rows | rows
+        else:
+            b.inlines[:] = _unhide(b.inlines)
 
 
 class _Walk:
     def __init__(self, css, load, notes, ctx, part):
         self.css, self.load, self.notes, self.ctx, self.part = css, load, notes, ctx, part
         self.data_bytes = 0
+        self.hiding = 0     # 0 shown, 1 inside visibility hidden (a visible element shows), 2 inside display:none
+        self.shown = 0      # visible elements met inside visibility hidden ones
+        self.kept = set()   # ids of the blocks they gave
 
     # ---- notes and hidden
     def note_key(self, href: str):
@@ -361,29 +442,75 @@ class _Walk:
             self.ctx.skipped["note"] += 1
         elif key not in self.notes:
             nb = []
+            hiding, self.hiding = self.hiding, 0
             self.flow(k.children, nb, 0, None)
+            self.hiding = hiding
             self.notes[key] = nb
         return True
 
-    def hid(self, k) -> bool:
-        return "hidden" in k.attrs or self.css.hidden(k, ())
+    def enter(self, k) -> tuple:
+        """(the hiding inside node k, k's role): "hide" when k starts hiding (display:none or the hidden attribute,
+        visibility hidden or collapse), "show" when it is visible inside visibility hidden, else ""."""
+        h = self.hiding
+        v = "none" if "hidden" in k.attrs else self.css.visibility(k)
+        if h == 2 or not v:
+            return h, ""
+        if v == "none":
+            return 2, "" if h else "hide"
+        if v == "hidden":
+            return 1, "" if h else "hide"
+        return (0, "show") if h == 1 else (h, "")
+
+    def within(self, level, role, build) -> tuple:
+        """What build(out) gives at hiding `level`, and whether anything inside it showed past a hiding."""
+        hiding, before, self.hiding = self.hiding, self.shown, level
+        got = []
+        build(got)
+        self.hiding = hiding
+        shows = self.shown != before
+        if role == "show":
+            self.shown += 1
+        return got, shows
+
+    def scoped(self, k, out, build):
+        """build(out) inside block node k, its blocks hidden when k hides them (_hide) and kept when it shows."""
+        level, role = self.enter(k)
+        if not role and level == self.hiding:
+            build(out)
+            return
+        got, shows = self.within(level, role, build)
+        if role == "hide":
+            _hide(got, self.kept if shows else None)
+        elif role == "show":
+            self.kept.update(map(id, got))
+        out.extend(got)
 
     # ---- inlines
     def inl(self, k, cur, imgs):
-        """Append the inline form of node k (or string) to cur; img elements go to imgs, or become alt text."""
+        """Append the inline form of node k (or string) to cur; img elements go to imgs (with whether they are
+        hidden), or become alt text."""
         if isinstance(k, str):
             cur.append(Text(_ws(k)))
             return
         t = k.tag
         if t in DROP or self.take_note(k):
             return
-        if self.hid(k):
-            sub = []
-            self.inl_inner(k, sub, imgs)
-            if sub:
-                cur.append(Hidden(sub))
+        level, role = self.enter(k)
+        if not role and level == self.hiding:
+            self.inl_inner(k, cur, imgs)
             return
-        self.inl_inner(k, cur, imgs)
+        got, shows = self.within(level, role, lambda o: self.inl_inner(k, o, imgs))
+        if not got:
+            return
+        if role == "hide":
+            if shows:
+                cur.extend(_unhide(got))
+            else:
+                cur.append(Hidden(got))
+        elif role == "show":
+            cur.append(_Shown(got))
+        else:
+            cur.extend(got)
 
     def inl_children(self, k, cur, imgs):
         for c in k.children:
@@ -395,7 +522,7 @@ class _Walk:
             cur.append(Break())
         elif t in ("img", "image"):
             if imgs is not None:
-                imgs.append(k)
+                imgs.append((k, self.hiding > 0))
                 if _cap_letter(k):
                     cur.append(_Cap(k))
             elif k.attrs.get("alt"):
@@ -471,9 +598,14 @@ class _Walk:
                     li[0] = None
                 else:
                     out.append(Para(items))
-            for im in imgs:
+            for im, dim in imgs:
                 b = self.image(im)
                 if b is not None:
+                    if dim:
+                        b.hidden = "hidden"
+                    elif self.hiding:
+                        self.kept.add(id(b))
+                        self.shown += 1
                     out.append(b)
             cur.clear()
             imgs.clear()
@@ -484,14 +616,7 @@ class _Walk:
             if k.tag in DROP or self.take_note(k):
                 continue
             flush()
-            if self.hid(k):
-                tmp = []
-                self.block(k, tmp, lvl, li)
-                for b in tmp:
-                    b.hidden = "hidden"
-                out.extend(tmp)
-            else:
-                self.block(k, out, lvl, li)
+            self.scoped(k, out, lambda o: self.block(k, o, lvl, li))
         flush()
 
     def block(self, k, out, lvl, li):
@@ -556,12 +681,7 @@ class _Walk:
                 self.flow([c], out, lvl, None)
 
     def item(self, c, out, lvl, marker):
-        tmp = []
-        self.flow(c.children, tmp, lvl, [marker])
-        if self.hid(c):
-            for b in tmp:
-                b.hidden = "hidden"
-        out.extend(tmp)
+        self.scoped(c, out, lambda o: self.flow(c.children, o, lvl, [marker]))
 
     def table(self, k, out):
         rows, caption = [], ""
@@ -582,15 +702,24 @@ class _Walk:
         width = max(max((len(r) for r in cells), default=0), 1)  # a span never reaches past the real grid
         built, hidden_rows = [], set()
         for r, row in enumerate(cells):
-            if self.hid(rows[r]):
+
+            def build(line):
+                for c in row:
+                    rs = _int(c.attrs.get("rowspan"), 1)
+                    rs = len(cells) - r if rs == 0 else min(rs, len(cells) - r)
+                    blocks = []
+                    self.flow(c.children, blocks, 0, None)
+                    line.append(Cell(blocks, max(1, rs), min(max(1, _int(c.attrs.get("colspan"), 1)), width),
+                                     c.tag == "th"))
+            level, role = self.enter(rows[r])
+            line, shows = self.within(level, role, build)
+            if role == "hide" and shows:
+                for c in line:
+                    _hide(c.blocks, self.kept)
+            elif role == "hide":
                 hidden_rows.add(r)
-            line = []
-            for c in row:
-                rs = _int(c.attrs.get("rowspan"), 1)
-                rs = len(cells) - r if rs == 0 else min(rs, len(cells) - r)
-                blocks = []
-                self.flow(c.children, blocks, 0, None)
-                line.append(Cell(blocks, max(1, rs), min(max(1, _int(c.attrs.get("colspan"), 1)), width), c.tag == "th"))
+            elif role == "show":
+                self.kept.update(id(b) for c in line for b in c.blocks)
             built.append(line)
         if any(built):
             out.append(Table(built, caption, frozenset(hidden_rows)))

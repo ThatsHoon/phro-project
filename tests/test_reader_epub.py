@@ -134,13 +134,12 @@ def test_css_cascade():
 
     def n(tag, **a):
         return xhtml.Node(tag, {k.replace("_", "-"): v for k, v in a.items()}, [])
-    assert c.hidden(n("p"), ())
-    assert not c.hidden(n("p", **{"class": "show"}), ())
-    assert not c.hidden(n("p", **{"class": "show", "style": "display:block"}), ())
-    assert c.hidden(n("div", **{"class": "y", "style": "display:block"}), ())
-    assert c.hidden(n("div", style="display: none"), ())
+    assert c.visibility(n("p")) == "none"
+    assert c.visibility(n("p", **{"class": "show"})) == ""
+    assert c.visibility(n("p", **{"class": "show", "style": "display:block"})) == ""
+    assert c.visibility(n("div", **{"class": "y", "style": "display:block"})) == "none"
+    assert c.visibility(n("div", style="display: none")) == "none"
     assert c.bold(n("span", **{"class": "x"})) and not c.bold(n("span"))
-    assert c.hidden(n("div"), (n("div", style="display:none"),)) is True
 
 
 def test_inline_hidden_and_hidden_attr():
@@ -284,10 +283,10 @@ def test_huge_css_is_capped():
     t0 = time.monotonic()
     c = xhtml.Css(["x" * 3_000_000 + "{display:none}", "/*" * 500_000, ".a{display:none}" * 300_000])
     assert time.monotonic() - t0 < 5
-    assert xhtml.Css([" " * 2**20 + ".a{display:none}"]).hidden(xhtml.Node("p", {"class": "a"}, []), ()) is False
+    assert xhtml.Css([" " * 2**20 + ".a{display:none}"]).visibility(xhtml.Node("p", {"class": "a"}, [])) == ""
     many = xhtml.Css(["".join(f".k{i}{{display:none}}" for i in range(20_000))])
-    assert not many.hidden(xhtml.Node("p", {"class": "k19999"}, []), ())  # past the selector cap
-    assert many.hidden(xhtml.Node("p", {"class": "k5"}, []), ()) and c
+    assert not many.visibility(xhtml.Node("p", {"class": "k19999"}, []))  # past the selector cap
+    assert many.visibility(xhtml.Node("p", {"class": "k5"}, [])) == "none" and c
 
 
 def test_stylesheet_hrefs_stay_in_package():
@@ -511,8 +510,29 @@ def test_visibility_hidden_is_hidden():
                                       '<p>a <span style="visibility:hidden">b</span> c</p>'},
                           css=".v{visibility:hidden}"))
     assert "secret" not in out and "x2" not in out and " b " not in out and "(3 hidden places left out)" in out, out
-    c = xhtml.Css([".v{visibility:hidden} .w{visibility:visible}"])
-    assert c.hidden(xhtml.Node("p", {"class": "v"}, []), ()) and not c.hidden(xhtml.Node("p", {"class": "w"}, []), ())
+    c = xhtml.Css([".v{visibility:hidden} .w{visibility:visible} .n{display:none;visibility:visible}"])
+    assert c.visibility(xhtml.Node("p", {"class": "v"}, [])) == "hidden"
+    assert c.visibility(xhtml.Node("p", {"class": "w"}, [])) == "visible"
+    assert c.visibility(xhtml.Node("p", {"class": "n"}, [])) == "none"
+    assert c.visibility(xhtml.Node("p", {}, [])) == ""
+
+
+def test_visible_child_of_a_visibility_hidden_parent_shows():
+    body = ('<p style="visibility:hidden">x<span style="visibility:visible">y</span></p>'
+            '<div class="v"><p>a1</p><p class="w">b1</p><blockquote><p>c1</p><p class="w">d1</p></blockquote></div>'
+            '<p>e1 <span class="v">f1 <b>g1 <span class="w">h1</span></b> i1</span> j1</p>'
+            '<ul class="v"><li>k1</li><li class="w">l1</li></ul>'
+            '<div style="display:none"><p class="w">gone1</p></div><p hidden=""><span class="w">gone2</span></p>'
+            '<p class="v">m1 <span style="display:none">n1 <span class="w">gone3</span></span></p>')
+    path = epub_book({"c.xhtml": body}, css=".v{visibility:hidden} .w{visibility:visible}")
+    out, _ = md(path)
+    for word in ("y", "b1", "d1", "e1", "**h1**", "j1", "- l1"):
+        assert word in out, (word, out)
+    for word in ("x", "a1", "c1", "f1", "g1", "i1", "k1", "gone", "m1", "n1"):
+        assert word not in out.replace("hidden places", ""), (word, out)
+    doc = reader.parse(path, Context())
+    shown = markdown.render(doc, tmp() / "assets", True)
+    assert "(hidden: x)y" in shown and "(hidden) a1" in shown and "_Shown" not in shown, shown
 
 
 def test_drop_cap_picture_gives_its_letter():
