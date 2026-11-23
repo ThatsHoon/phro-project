@@ -61,6 +61,10 @@ class Record(bytes):
     """A VtString cell whose record payload is these bytes, as they are."""
 
 
+class Int(int):
+    """A VtInteger cell: an i32 value, then its VtValue base."""
+
+
 class Spy(bytes):
     """A stream that counts the substring searches made in it and the bytes each may scan."""
     calls = scanned = 0
@@ -108,6 +112,12 @@ class Archive:
             self.next_object += 1
             self.ty(b"VtString\0")
             self.out += i16(len(value)) + value + b"\0"
+            self.value_base()
+        elif isinstance(value, Int):
+            self.out += i32(self.next_object)
+            self.next_object += 1
+            self.ty(b"VtInteger\0")
+            self.out += i32(value)
             self.value_base()
         elif isinstance(value, bytes):  # raw slot bytes
             self.out += value
@@ -232,6 +242,19 @@ def test_native_chart():
     out, ctx = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(native())}, before="", after=""))
     assert out == TABLE, out
     assert not ctx.skipped, ctx.skipped
+
+
+def test_native_chart_of_whole_numbers():
+    # Hancom writes whole numbers as VtInteger cells (an i32, then VtValue), mixed with VtDouble ones
+    cells = dict(ROWS) | {6: Int(10), 8: Int(30), 10: Int(5), 11: Int(0)}
+    item = envelope({"Contents": contents(3, 4, cells)})
+    out, ctx = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(item)}, before="", after=""))
+    assert out == TABLE, out
+    assert not ctx.skipped, ctx.skipped
+    cells[10] = Int(-7)
+    item = envelope({"Contents": contents(3, 4, cells)})
+    out, _ = read(doc(ole_shape(1), streams={"BIN0001.OLE": deflate(item)}, before="", after=""))
+    assert "\n1분기|10|-7\n" in out, out
 
 
 def test_native_chart_series_in_columns():

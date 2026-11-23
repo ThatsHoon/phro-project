@@ -24,8 +24,8 @@ from . import sheet_grid, xls_embedded
 
 # grid.rs: the classes a data grid is made of; any other name in it means the shape cannot be trusted
 _GRID, _MATRIX, _COLLECTION, _OBJECT = b"VtDataGrid\0", b"VtMatrix\0", b"VtCollection\0", b"VtObject\0"
-_DOUBLE, _STRING, _VALUE = b"VtDouble\0", b"VtString\0", b"VtValue\0"
-_CLASSES = frozenset((_GRID, _MATRIX, _COLLECTION, _OBJECT, _DOUBLE, _STRING, _VALUE))
+_DOUBLE, _INTEGER, _STRING, _VALUE = b"VtDouble\0", b"VtInteger\0", b"VtString\0", b"VtValue\0"
+_CLASSES = frozenset((_GRID, _MATRIX, _COLLECTION, _OBJECT, _DOUBLE, _INTEGER, _STRING, _VALUE))
 # the sibling objects whose names end the grid's window (grid.rs OBJECT_MARKERS)
 _SIBLINGS = (b"VtBackdrop\0", b"VtBackDrop\0", b"VtChartSection\0", b"VtFootnote\0", b"VtLegend\0", b"VtPlot\0",
              b"VtPrintInformation\0", b"VtChartTitle\0", b"VtTitle\0")
@@ -170,7 +170,7 @@ class _Archive:
     """grid.rs ArchiveReader. An object is an i32 id (-1 none, an id seen before a reference to that object) and,
     the first time, its class: an i32 type id, the first time followed by a u16 length, the name and a u16 version.
     Then its fields, then its base class's. Only the grid's classes are known, each base is fixed and a cell holds
-    a VtDouble or a VtString, so the input cannot nest anything: the recursion is at most four classes deep."""
+    a VtDouble, a VtInteger (an i32: Hancom's whole numbers) or a VtString, so the input cannot nest anything: the recursion is at most four classes deep."""
 
     def __init__(self, data: bytes, at: int):
         self.data, self.at = data, at
@@ -223,6 +223,10 @@ class _Archive:
             self.take("<H", 2)  # precision
             self.base(_VALUE)
             return v
+        elif name == _INTEGER:
+            v = float(self.take("<i", 4))
+            self.base(_VALUE)
+            return v
         elif name == _STRING:
             n = self.take("<h", 2)
             start = end = self.at
@@ -263,7 +267,7 @@ class _Archive:
         if oid in self.objects:
             return self.objects[oid]
         name = self.type()
-        if name not in (_DOUBLE, _STRING):  # base checks alone would let a cell hold another grid
+        if name not in (_DOUBLE, _INTEGER, _STRING):  # base checks alone would let a cell hold another grid
             raise _Bad("a cell that is not a value")
         v = self.objects[oid] = self.body(name)
         return v
