@@ -123,6 +123,7 @@ def unread(skipped) -> list:
 
 _RESERVED = re.compile(r"(?i)con|prn|aux|nul|(com|lpt)[\d\u00b9\u00b2\u00b3]")
 VBA_NAMED = 20
+TABLE_LOOK = 256  # rows of a table written between two looks at the render's stop
 NO_OCR = {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None}  # a parser's doc.meta["ocr"] counts
 KOREAN_HINT = ('(Korean OCR is not installed in Windows: Settings > Time & language > Language > add Korean with '
                '"Optical character recognition".)')
@@ -601,6 +602,13 @@ class _Render:
         return self.note_no[nid]
 
     # ---- blocks
+    def overdue(self) -> bool:
+        """Whether the render is past its stop (it then stays late): asked before each block and every
+        TABLE_LOOK rows of a table, so one big sheet does not carry the render past it."""
+        if self.stop is not None and (self.late or time.monotonic() >= self.stop):
+            self.late = True
+        return self.late
+
     def blocks(self, blocks) -> list:
         """Rendered pieces as (kind, text); kind 'li' pieces stay tight."""
         if not self._enter():
@@ -610,8 +618,7 @@ class _Render:
             for b in blocks:
                 if self.size > limits.MAX_OUTPUT:
                     break
-                if self.stop is not None and (self.late or time.monotonic() >= self.stop):
-                    self.late = True
+                if self.overdue():
                     break
                 if self.depth == 1:
                     self.top += 1
@@ -1027,7 +1034,7 @@ class _Render:
         if ncols == 1:
             lines, used, written = [], 0, []
             for r in range(nrows):
-                if self.size + used > limits.MAX_OUTPUT:
+                if self.size + used > limits.MAX_OUTPUT or not r % TABLE_LOOK and r and self.overdue():
                     break
                 h = hid(r)
                 if h is None:
@@ -1049,7 +1056,7 @@ class _Render:
         shown = 0
         used = 0  # a table stops growing once the document would pass the output cap
         for r in range(nrows):
-            if self.size + used > limits.MAX_OUTPUT:
+            if self.size + used > limits.MAX_OUTPUT or not r % TABLE_LOOK and r and self.overdue():
                 break
             h = hid(r)
             if h is None:

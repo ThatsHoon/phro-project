@@ -170,6 +170,23 @@ def test_the_render_writes_no_block_past_its_stop():
     assert out.count(REST) == 1, out
 
 
+def test_the_render_stops_inside_a_big_table():
+    import types
+    from reader.model import Cell, Doc, Table, Text, Para
+    for width in (1, 3):
+        rows = [[Cell([Para([Text(f"r{r}c{c}")])]) for c in range(width)] for r in range(2000)]
+        doc = Doc(blocks=[Table(rows), Para([Text("OMEGA")])])
+        looks = itertools.count(1)
+        real, markdown.time = markdown.time, types.SimpleNamespace(monotonic=lambda: next(looks))
+        info = {}
+        try:
+            out = markdown.render(doc, tmp() / "assets", False, None, info, stop=3)
+        finally:
+            markdown.time = real
+        assert info["late"] and "r511c0" in out and "r512c0" not in out and "OMEGA" not in out, (width, out[-200:])
+        assert REST in out, out[-200:]
+
+
 def cut_mid(label, path):
     """The document at `path` holds ALPHA in its first part and OMEGA in its last: read with a clock that is over at
     its n-th look, for every n, it gives its parts in order up to where the time ran out and says the rest was not
