@@ -375,7 +375,9 @@ class _Reader:
         self.data = data
         # the totals of braces, to tell a stray close from the root's real one
         total_open = total_close = 0
-        for t in tokens(data):
+        for ticks, t in enumerate(tokens(data)):
+            if not ticks & 1023 and self.ctx.late():
+                break
             k = t[0]
             if k == OPEN:
                 total_open += 1

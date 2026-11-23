@@ -212,6 +212,28 @@ def test_word_documents_stop_at_the_time_limit():
     cut_mid("doc", dc.doc_file([(t + "\r", True) for t in words(str)]))
 
 
+def test_rtf_brace_count_stops_at_the_time_limit():
+    from reader.formats import rtf
+    path = tmp() / "b.rtf"
+    path.write_bytes(b"{\\rtf1 ALPHA\\par " + b"m\\par " * 5000 + b"}")
+    real, seen = rtf.tokens, []
+
+    def counting(data):
+        for t in real(data):
+            seen.append(1)
+            yield t
+    rtf.tokens = counting
+    try:
+        ctx = stopping(1)
+        try:
+            reader.parse(path, ctx)
+        except ReadError:
+            pass
+    finally:
+        rtf.tokens = real
+    assert ctx.skipped["time"] and len(seen) < 100, len(seen)
+
+
 def test_decks_stop_at_the_time_limit():
     cut_mid("pptx", sl.deck(words(lambda t: sl.sp(t, "title"))))
     cut_mid("odp", oo.odp("".join(oo.page(f"p{i}", oo.frame(t)) for i, t in enumerate(words(str)))))
