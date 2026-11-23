@@ -187,6 +187,22 @@ def test_repeated_formula_text_is_budgeted():
     assert ctx.skipped["formula"] == 480, ctx.skipped
 
 
+def test_repeated_absolute_formula_is_read_once():
+    form = c("3", 'table:number-columns-repeated="100" office:value-type="float" office:value="3" '
+                  'table:formula="of:=[.$A$1]*[$Cfg.$B$2]+100"')
+    rel = c("4", 'table:number-columns-repeated="100" office:value-type="float" office:value="4" '
+                 'table:formula="of:=[.A1]+1"')
+    xml = sheet("S", [row(form, rel, extra='table:number-rows-repeated="50"')]) + sheet("Cfg", [row(c("x"))])
+    old = limits.FORMULA_COPY_CHARS
+    limits.FORMULA_COPY_CHARS = 1000
+    try:
+        doc, ctx = parse(ods(xml))
+    finally:
+        limits.FORMULA_COPY_CHARS = old
+    out = markdown.render(doc, tmp() / "a")
+    assert "A1:CV50 =$A$1*Cfg!$B$2+100" in out and 0 < ctx.skipped["formula"] < 5000, (ctx.skipped, out[-300:])
+
+
 def test_value_types():
     cells = [c("", 'office:value-type="date" office:date-value="2026-01-02"'),
              c("", 'office:value-type="time" office:time-value="PT01H02M03S"'),

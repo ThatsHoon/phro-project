@@ -30,7 +30,8 @@ SHEET_COMMENTS = 10_000   # cell comments one workbook may turn into notes; the 
 FACT_VALUES = 20          # values or ranges one entry of a sheet's fact lists; the rest are counted in the entry
 FACT_ITEMS = 1_000        # entries one fact paragraph of a sheet lists; the rest are counted
 FORMULA_COPY_CHARS = 4_000_000  # characters of formula text one document's sheets read again for repeated cells
-#                                 (an ods cell or row written once and repeated); the copies past them are counted
+#                                 (an ods cell or row written once and repeated); the copies past them are counted.
+#                                 A formula with no relative reference is read once, whatever its copies
 BLANK_FORMULAS = 100_000  # formula cells with no value one document's sheets keep; the rest are counted
 # XML elements the sheet parts of one document's xlsx workbooks may open, styled empty cells included, and the entries
 # a shared-string table may hold. ooxml_sheets caps the other streamed parts: the shared strings at SST_ELEMENTS (2)

@@ -147,6 +147,11 @@ def pattern(text: str, row: int, col: int) -> tuple:
     return tuple(out)
 
 
+def fixed(pat: tuple) -> bool:
+    """Whether pattern `pat` holds no relative reference, so it is the same at every cell."""
+    return all(not isinstance(p, tuple) or isinstance(p[1], tuple) and isinstance(p[2], tuple) for p in pat)
+
+
 def _place(part, base: int, limit: int):
     """A coordinate's (dollar, zero-based value) at `base`; None off the sheet."""
     if isinstance(part, tuple):

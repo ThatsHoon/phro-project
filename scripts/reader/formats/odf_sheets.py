@@ -5,7 +5,9 @@ merged and cut as the xlsx, xls and xlsb sheets are: one `Budget` for the docume
 `number-columns-repeated` or a row by `number-rows-repeated` put once a copy (and charged once a copy), empty ones
 only counted. A row or column whose `table:visibility` is collapse or filter is hidden; a `table-header-rows` row is a
 header row; a span is a merge, its covered cells passed over. A `table:formula` (OpenFormula, read as A1 text by `_of`)
-goes to the sheet's formulas paragraph once a copy, and shows in its cell when the cell has no value type.
+goes to the sheet's formulas paragraph once a copy (a repeated one read again for each, charged to
+FORMULA_COPY_CHARS, unless it holds no relative reference: then it is read once), and shows in its cell when the
+cell has no value type.
 
 A sheet's `table:shapes` that holds a connector is one diagram scope: every shape and connector in it, groups walked
 into, goes to `diagram.Diagram` through `odf_base.register`; each with text, and each top-level frame, has a slot after
@@ -142,10 +144,12 @@ class _Sheet:
         cells, end, state, budget = self.cells(tr, d), min(r0 + rep, limits.SHEET_ROWS + 1), None, grid.budget
         if attr(tr, "visibility") in _HIDE and len(self.anchored) > mark:
             self.anchored[mark:] = self.body.hide(self.anchored[mark:])
+        same = {}
         for r in range(r0, end) if cells else ():
             if state != (grid.merges_cut, grid.formulas_cut, budget.copies <= 0):
                 state = grid.merges_cut, grid.formulas_cut, budget.copies <= 0
-                gone = [c[6] and (state[1] and c[4] is None or state[2] and (rep > 1 or c[1] > 1)) for c in cells]
+                gone = [c[6] and (state[1] and c[4] is None or state[2] and (rep > 1 or c[1] > 1) and c[0] not in same)
+                        for c in cells]
                 if any(gone):
                     self.body.ctx.skipped["formula"] += (end - r) * sum(c[1] for c, g in zip(cells, gone) if g)
                 cells = [c[:6] + ("",) if g else c for c, g in zip(cells, gone)]
@@ -157,12 +161,17 @@ class _Sheet:
                     return
                 copied = len(form) if rep > 1 or crep > 1 else 0
                 for c in range(col, col + crep) if form else ():
-                    if budget.copies < copied:
-                        budget.copies = 0
-                        self.body.ctx.skipped["formula"] += col + crep - c
-                        break
-                    budget.copies -= copied
-                    grid.formula(r, c, sheet_grid.pattern(form, r, c))
+                    pat = same.get(col)
+                    if pat is None:
+                        if budget.copies < copied:
+                            budget.copies = 0
+                            self.body.ctx.skipped["formula"] += col + crep - c
+                            break
+                        budget.copies -= copied
+                        pat = sheet_grid.pattern(form, r, c)
+                        if copied and sheet_grid.fixed(pat):
+                            same[col] = pat
+                    grid.formula(r, c, pat)
                     if grid.cut:
                         return
                 if (cs > 1 or rs > 1) and not grid.merges_cut:
