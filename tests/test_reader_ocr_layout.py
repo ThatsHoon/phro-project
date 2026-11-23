@@ -211,6 +211,25 @@ def test_one_inflated_box_does_not_set_size():
     assert {f.size for f in ocr_layout.fragments(page(words), 72.0)} == {20.0}
 
 
+def test_boxes_reaching_into_the_next_line_do_not_set_size():
+    """Two engine lines of a figure 13 px apart, as Tesseract gave them: three boxes of the lower line and one of the
+    upper reach 28 px, over both. The lines keep the size of their words and are read apart, not woven into one row
+    (`in mostproduction`)."""
+    upper = [("production", 141, 166, 95, 9), ("and", 214, 154, 19, 28), ("the", 241, 166, 18, 7),
+             ("stabilization", 264, 166, 34, 7), ("of", 345, 166, 12, 7), ("wild", 360, 166, 26, 7),
+             ("caught", 391, 166, 41, 9)]
+    lower = [("species", 67, 180, 88, 8), ("in", 109, 167, 13, 28), ("most", 128, 180, 26, 8),
+             ("areas", 160, 179, 70, 7), ("of", 198, 167, 10, 28), ("the", 214, 167, 17, 28),
+             ("world,", 235, 179, 34, 7), ("as", 277, 181, 13, 5), ("illustrated", 294, 179, 64, 7),
+             ("in", 363, 181, 11, 5), ("the", 380, 179, 17, 7)]
+    p = page([word(t, x, y, w, h, n) for n, line in enumerate((upper, lower)) for t, x, y, w, h in line],
+             w=1025, h=1025)
+    assert sorted({f.size for f in ocr_layout.fragments(p, 72.0)}) == [8.0, 9.0]
+    got = ocr_layout.reading_lines(p)
+    assert " ".join(got) == ("production and the stabilization of wild caught species in most areas of the world, as"
+                             " illustrated in the"), got
+
+
 def body_page(big: bool) -> OcrPage:
     words = [word("Results", 100, 60, 280, 40 if big else 20, 0)]
     for r in range(5):

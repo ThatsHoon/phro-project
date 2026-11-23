@@ -17,13 +17,14 @@ from .ocr import OcrPage, Result
 
 SCANNED = "_Scanned page, text by OCR._"
 BAND = 0.05  # a line within this share of the width from the middle crosses it, as in `xps._columns`
+EM_SPREAD = 2.5  # a word box past this many times its line's median box is not the em (a word's box spans 0.5-1 em)
 
 
 def _em(heights) -> int:
-    """The tallest box of a line of up to 4 words, else the second tallest: a box with both an ascender and a
-    descender spans about the em, and one box grown by noise is passed over."""
-    hs = sorted(heights)
-    return hs[-1] if len(hs) <= 4 else hs[-2]
+    """The tallest box of a line no taller than EM_SPREAD times its median box: a box with both an ascender and a
+    descender spans about the em, and boxes grown by noise or reaching into the next line are passed over."""
+    cap = EM_SPREAD * statistics.median(heights)
+    return max(h for h in heights if h <= cap)
 
 
 def fragments(page: OcrPage, dpi: float) -> list:
@@ -32,7 +33,7 @@ def fragments(page: OcrPage, dpi: float) -> list:
     by_line = defaultdict(list)
     for w in page.words:
         by_line[w.line].append(w)
-    shared = {n: (statistics.median(w.y + w.h for w in ws), _em(w.h for w in ws)) for n, ws in by_line.items()}
+    shared = {n: (statistics.median(w.y + w.h for w in ws), _em([w.h for w in ws])) for n, ws in by_line.items()}
     out = []
     for i, w in enumerate(page.words):
         bottom, height = shared[w.line]
