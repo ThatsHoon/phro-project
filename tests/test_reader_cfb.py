@@ -344,12 +344,12 @@ def test_msproject_progid():
         def read(self, name):
             raise CfbError("short chain")
     assert cfb_route.progid(Unreadable()) == ""
-    # a .doc compound file holding only the MSProject CompObj is handed to mpp (unsupported without the engine)
+    # a .doc compound file holding only the MSProject CompObj is handed to mpp, which finds no Project data
     d = tmp()
     p = d / "plan.doc"
     p.write_bytes(cfb_bytes({"\x01CompObj": prog})[0])
     e = raises(ReadError, reader.parse, p, Context())
-    assert e.kind == "unsupported" and e.detail == "Microsoft Project files are read only through MPXJ", e
+    assert e.kind == "damaged" and e.detail == "the Project data could not be read", e
 
 
 def main():

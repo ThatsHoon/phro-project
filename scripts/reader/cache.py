@@ -145,10 +145,10 @@ def code_digest(base=None) -> str:
 
 
 def key(path, engine: str = "", image: str = "", ocr: str = "") -> str:
-    """`engine`: pdf's (native or pdfium) and mpp's (mpxj) engine id. `image`: the figure backend id ("gdiplus",
-    "resvg-…" or "none") every other format's key carries, so a file read with no backend is read again once one is
-    there. `ocr`: the OCR backend id and version (`gate.ocr_backend()`) every key but mpp's carries, so installing or
-    updating an engine reads the file again; empty, the key is the one from before OCR."""
+    """`engine`: pdf's engine id (native or pdfium). `image`: the figure backend id ("gdiplus", "resvg-…" or
+    "none") every other format's key carries, so a file read with no backend is read again once one is there. `ocr`:
+    the OCR backend id and version (`gate.ocr_backend()`) every key carries, so installing or updating an engine
+    reads the file again; empty, the key is the one from before OCR."""
     h = hashlib.sha1(VERSION.encode() + b"\0" + code_digest().encode() + b"\0")
     if engine:
         h.update(engine.encode() + b"\0")
@@ -433,8 +433,7 @@ def prune(days: int = 30) -> int:
                 except OSError:
                     pass
     for bucket in base.iterdir():
-        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", "mpp-declined", FIGURES, OCR,
-                                                  CODE, KEYS):
+        if not bucket.is_dir() or bucket.name in ("offers", "failed", "pdf-declined", FIGURES, OCR, CODE, KEYS):
             continue
         for d in bucket.iterdir():
             if d.name.startswith(".tmp-"):

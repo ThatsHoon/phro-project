@@ -25,7 +25,7 @@ import read  # noqa: E402
 from reader import pyenv, pysetup  # noqa: E402
 from reader.model import Context  # noqa: E402
 
-KEYS = ("PHRO_READER_CACHE", "PHRO_READER_PYENV", "PHRO_READER_MPPENV", "CLAUDE_PLUGIN_DATA")
+KEYS = ("PHRO_READER_CACHE", "PHRO_READER_PYENV", "CLAUDE_PLUGIN_DATA")
 
 
 @contextmanager
@@ -35,7 +35,7 @@ def env(**over):
     d = Path(tempfile.mkdtemp())
     try:
         os.environ["PHRO_READER_CACHE"] = str(d / "cache" / "reader")
-        for k in ("PHRO_READER_PYENV", "PHRO_READER_MPPENV", "CLAUDE_PLUGIN_DATA"):
+        for k in ("PHRO_READER_PYENV", "CLAUDE_PLUGIN_DATA"):
             os.environ.pop(k, None)
         for k, v in over.items():
             if v is None:
@@ -639,7 +639,7 @@ def test_read_py_before_site_packages():
 
 def test_pdf_kind_default():
     with env() as d:
-        assert pyenv.KINDS == ("pdf", "mpp", "image")
+        assert pyenv.KINDS == ("pdf", "image")
         assert pyenv.venv_dir() == pyenv.venv_dir("pdf")
         assert pyenv.requirements_hash() == pyenv.requirements_hash("pdf")
         assert pyenv.declined() == pyenv.declined("pdf") is False
@@ -673,456 +673,13 @@ def test_not_venv_names_kind():
 
 
 def test_unknown_kind_refused():
-    for fn in (lambda: pyenv.venv_dir("zip"), lambda: pyenv.declined("zip"), lambda: pyenv.engine("zip")):
+    for fn in (lambda: pyenv.venv_dir("zip"), lambda: pyenv.declined("zip"), lambda: pyenv.engine("zip"),
+               lambda: pyenv.venv_dir("mpp")):
         try:
             fn()
         except ValueError:
             continue
         raise AssertionError("an unknown kind was accepted")
-
-
-# ---- kind "mpp": MPXJ and JPype in a venv, Java found on PATH (nothing is installed; java, pip and the smoke run are stubs)
-
-JAVA_EXE = str(Path(tempfile.gettempdir()) / "fake-jdk" / "bin" / "java.exe")
-
-
-@contextmanager
-def which_java(path):
-    """pyenv.find_java() answers `path` (None: no java)."""
-    real = pyenv.find_java
-    pyenv.find_java = lambda: path
-    try:
-        yield
-    finally:
-        pyenv.find_java = real
-
-
-def jdk(d, rel=("bin", "server", "jvm.dll")):
-    home = Path(d) / "jdk"
-    jvm = home.joinpath(*rel)
-    jvm.parent.mkdir(parents=True, exist_ok=True)
-    jvm.write_bytes(b"")
-    return home
-
-
-def java_run(home, version="21.0.5", bits=None):
-    """A stub for subprocess.run: `java -XshowSettings:properties -version` prints its settings on stderr."""
-    bits = pyenv.python_bits() if bits is None else bits
-    err = (f"Property settings:\n    java.home = {home}\n    java.version = {version}\n"
-           f"    sun.arch.data.model = {bits}\n    os.name = Windows 11\n\nopenjdk version \"{version}\"\n")
-
-    def run(cmd, **kw):
-        run.cmd, run.kw = cmd, kw
-        return types.SimpleNamespace(returncode=0, stdout="", stderr=err)
-    return run
-
-
-def fake_mpp_venv(tmp):
-    """A fake mpp venv: an interpreter file, pyvenv.cfg with an existing home, and one dist-info with a RECORD
-    for each of mpxj and jpype1 (no ready.json: setup writes it)."""
-    import base64
-    import hashlib
-    d = Path(tmp)
-    py = pyenv.interpreter(d)
-    py.parent.mkdir(parents=True, exist_ok=True)
-    py.write_bytes(b"")
-    (d / "pyvenv.cfg").write_text(f"home = {d.parent}\nversion = 3.12.0\n", encoding="utf-8")
-    site = d / "Lib" / "site-packages"
-    for name, ver in (("mpxj", "16.10.0"), ("JPype1", "1.7.1")):
-        mod = site / name.lower() / "__init__.py"
-        mod.parent.mkdir(parents=True, exist_ok=True)
-        data = f"# {name}\n".encode()
-        mod.write_bytes(data)
-        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
-        info = site / f"{name}-{ver}.dist-info"
-        info.mkdir(exist_ok=True)
-        (info / "RECORD").write_bytes(
-            f"{name.lower()}/__init__.py,sha256={digest},{len(data)}\n{name}-{ver}.dist-info/RECORD,,\n".encode())
-
-
-class MppStub(Stub):
-    def __init__(self, java, **kw):
-        super().__init__(**kw)
-        self.java_result = java
-
-    def java(self):
-        self.calls.append("java")
-        return self.java_result
-
-    def make_venv(self, tmp):
-        self.calls.append("make_venv")
-        fake_mpp_venv(tmp)
-
-    def versions(self, python):
-        self.calls.append("versions")
-        return "16.10.0", "1.7.1", pyenv.record_digests(Path(python).parent.parent, "mpp")
-
-    def smoke(self, python, java):
-        self.calls.append("smoke")
-        self.smoked_with = java
-        return self.smoke_result
-
-
-def mpp_info(d, **kw):
-    """The dict java_info returns for a stub JDK under d."""
-    home = jdk(d)
-    with which_java(JAVA_EXE):
-        return pyenv.java_info(run=java_run(home, **kw))
-
-
-def mpp_ready(d):
-    """A READY mpp venv at d/mpp-venv made by setup with stubs (call inside which_java(JAVA_EXE))."""
-    dest = d / "mpp-venv"
-    out = pysetup.setup(dest, MppStub(mpp_info(d)), kind="mpp")
-    assert out.startswith("READY\t"), out
-    return dest
-
-
-def with_kind_pdf(venv):
-    path = Path(venv) / "ready.json"
-    ready = json.loads(path.read_text(encoding="utf-8"))
-    path.write_text(json.dumps({**ready, "kind": "pdf"}), encoding="utf-8")
-
-
-def test_mpp_requirements_pinned():
-    text = pyenv.REQUIREMENTS["mpp"].read_text(encoding="utf-8")
-    assert "mpxj==16.10.0" in text and "jpype1==1.7.1" in text
-    assert "sha256:5cc44621b58c9d218afd26f4a4a6baa614b41d207a69f8f4ff16a8f6d6f2e5cd" in text
-    blocks, cur = {}, None
-    for ln in text.splitlines():
-        if ln.startswith("#") or not ln.strip():
-            continue
-        if not ln.startswith(" "):
-            cur = ln.split("==")[0]
-            blocks[cur] = []
-        blocks[cur].append(ln)
-    assert set(blocks) == {"mpxj", "jpype1", "packaging"}, set(blocks)
-    assert len(blocks["mpxj"]) == 2 and len(blocks["jpype1"]) == 45 and len(blocks["packaging"]) == 2
-    assert re.fullmatch(r"packaging==\d+(\.\d+)+ \\", blocks["packaging"][0]), blocks["packaging"][0]
-    assert len(re.findall(r"--hash=sha256:[0-9a-f]{64}", "\n".join(blocks["jpype1"]))) == 44
-    for name, lines in blocks.items():
-        assert all(ln.endswith("\\") for ln in lines[:-1]) and not lines[-1].endswith("\\"), name
-        assert all(re.fullmatch(r"    --hash=sha256:[0-9a-f]{64}( \\)?", ln) for ln in lines[1:]), name
-
-
-def test_java_major():
-    assert pyenv.java_major("1.8.0_392") == 8
-    assert pyenv.java_major("21.0.5") == 21
-    assert pyenv.java_major("17") == 17
-    assert pyenv.java_major("abc") is None
-    assert pyenv.java_major("21-ea") == 21
-    assert pyenv.JAVA_FLOOR == 8 and pyenv.MPXJ_VERSION == "16.10.0"
-
-
-def test_java_info_parses():
-    with env() as d:
-        home = jdk(d)
-        run = java_run(home)
-        with which_java(JAVA_EXE):
-            info = pyenv.java_info(run=run)
-        assert info == {"path": JAVA_EXE, "major": 21, "home": str(home),
-                        "jvm": str(home / "bin" / "server" / "jvm.dll"), "bits": pyenv.python_bits()}, info
-        assert run.cmd == [JAVA_EXE, "-XshowSettings:properties", "-version"] and run.kw["timeout"] == 30
-        home8 = jdk(d / "j8", ("jre", "lib", "server", "libjvm.so"))
-        with which_java(JAVA_EXE):
-            info = pyenv.java_info(run=java_run(home8, version="1.8.0_392"))
-        assert info["major"] == 8 and info["jvm"] == str(home8 / "jre" / "lib" / "server" / "libjvm.so"), info
-
-
-def test_java_too_old():
-    with env() as d:
-        with which_java(JAVA_EXE):
-            got = pyenv.java_info(run=java_run(jdk(d), version="1.7.0_80"))
-        assert got == "Java 7 found; MPXJ needs Java 8 or later", got
-
-
-def test_java_no_jvm_library():
-    with env() as d:
-        home = Path(d) / "empty-jdk"
-        home.mkdir()
-        with which_java(JAVA_EXE):
-            got = pyenv.java_info(run=java_run(home))
-        assert got == f"no JVM library under {home}", got
-
-
-def test_java_run_failures():
-    def boom(cmd, **kw):
-        raise OSError("nope")
-
-    def late(cmd, **kw):
-        raise subprocess.TimeoutExpired(cmd, 30)
-    with which_java(JAVA_EXE):
-        for run in (boom, late):
-            got = pyenv.java_info(run=run)
-            assert isinstance(got, str) and got.startswith("java did not run"), got
-        got = pyenv.java_info(run=lambda cmd, **kw: types.SimpleNamespace(returncode=0, stdout="", stderr="x"))
-        assert isinstance(got, str) and "version" in got, got
-
-
-class JavaStub(MppStub):
-    """java() runs the real java_info against a stub JDK."""
-
-    def __init__(self, home, **kw):
-        super().__init__(None)
-        self.home, self.kw = home, kw
-
-    def java(self):
-        self.calls.append("java")
-        return pyenv.java_info(run=java_run(self.home, **self.kw))
-
-
-def test_java_bits_mismatch_fails():
-    with env() as d:
-        py = pyenv.python_bits()
-        other = 32 if py == 64 else 64
-        with which_java(JAVA_EXE):
-            got = pyenv.java_info(run=java_run(jdk(d), bits=other))
-            assert got == f"{other}-bit Java with {py}-bit Python", got
-            dest = d / "sub" / "mpp-venv"
-            steps = JavaStub(jdk(d), bits=other)
-            out = pysetup.setup(dest, steps, kind="mpp")
-        assert out == f"FAIL\tjava\t{other}-bit Java with {py}-bit Python", out
-        assert steps.calls == ["java"]
-        assert not (d / "sub").exists()
-
-
-def test_no_java_fails():
-    with env() as d:
-        with which_java(None):
-            assert pyenv.java_info() == "java not found on PATH"
-            dest = d / "sub" / "mpp-venv"
-            steps = MppStub(pyenv.java_info())
-            out = pysetup.setup(dest, steps, kind="mpp")
-        assert out == "FAIL\tjava\tjava not found on PATH", out
-        assert steps.calls == ["java"] and not (d / "sub").exists()
-
-
-def test_mpp_setup_ready():
-    with env() as d:
-        from reader import cache
-        decl = cache.root() / "mpp-declined"
-        decl.write_text("", encoding="utf-8")
-        home = jdk(d)
-        steps = MppStub(mpp_info(d))
-        dest = d / "mpp-venv"
-        with which_java(JAVA_EXE):
-            out = pysetup.setup(dest, steps, kind="mpp")
-            assert out == f"READY\t{dest}\tmpxj-16.10.0-java21", out
-            assert steps.calls == ["java", "make_venv", "pip", "versions", "smoke"], steps.calls
-            assert steps.smoked_with["jvm"] == str(home / "bin" / "server" / "jvm.dll")
-            ready = json.loads((dest / "ready.json").read_text(encoding="utf-8"))
-            assert ready["kind"] == "mpp" and ready["mpxj"] == "16.10.0" and ready["jpype1"] == "1.7.1"
-            assert ready["requirements"] == pyenv.requirements_hash("mpp")
-            assert "pypdfium2" not in ready and set(ready["records"]) == {"mpxj", "jpype1"}
-            assert ready["java"] == {"path": JAVA_EXE, "major": 21, "home": str(home),
-                                     "jvm": str(home / "bin" / "server" / "jvm.dll"), "bits": pyenv.python_bits()}
-            assert pyenv.state(dest, "mpp") == "READY" and pyenv.verify(dest, "mpp") is True
-            assert pyenv.engine("mpp", dest) == "mpxj-16.10.0-java21"
-            assert pysetup.check(dest, "mpp") == f"READY\t{dest}\tmpxj-16.10.0-java21"
-            assert pyenv.mpp_engine_id("16.10.0", 21) == "mpxj-16.10.0-java21"
-        assert json.loads((cache.root() / "mpp-venv.json").read_text(encoding="utf-8")) == {"venv": str(dest)}
-        assert not decl.exists() and not pyenv.declined("mpp")
-        assert leftovers(dest) == []
-
-
-def test_mpp_without_java_not_ready():
-    with env() as d:
-        with which_java(JAVA_EXE):
-            dest = mpp_ready(d)
-        with which_java(None):
-            assert pyenv.state(dest, "mpp") == "STALE" and pyenv.engine("mpp", dest) == ""
-            assert pyenv.verify(dest, "mpp") is False
-            assert pysetup.check(dest, "mpp") == f"STALE\t{dest}"
-
-
-def test_java_gone_not_ready():
-    with env() as d:
-        with which_java(JAVA_EXE):
-            dest = mpp_ready(d)
-            assert pyenv.state(dest, "mpp") == "READY"
-        with which_java(str(Path(tempfile.gettempdir()) / "other-jdk" / "bin" / "java.exe")):
-            assert pyenv.state(dest, "mpp") == "STALE" and pyenv.engine("mpp", dest) == ""
-            assert pyenv.verify(dest, "mpp") is False
-        with which_java(JAVA_EXE):
-            (Path(d) / "jdk" / "bin" / "server" / "jvm.dll").unlink()  # the JVM library moved away
-            assert pyenv.state(dest, "mpp") == "STALE" and pyenv.engine("mpp", dest) == ""
-
-
-def test_pins_changed_stale():
-    with env() as d:
-        with which_java(JAVA_EXE):
-            dest = mpp_ready(d)
-            old = pyenv.REQUIREMENTS["mpp"]
-            changed = Path(d) / "requirements-mpp.txt"
-            changed.write_text(old.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
-            pyenv.REQUIREMENTS["mpp"] = changed
-            try:
-                assert pyenv.state(dest, "mpp") == "STALE" and pyenv.engine("mpp", dest) == ""
-            finally:
-                pyenv.REQUIREMENTS["mpp"] = old
-            assert pyenv.state(dest, "mpp") == "READY"
-
-
-def test_mpp_verify_record_mismatch():
-    with env() as d:
-        with which_java(JAVA_EXE):
-            dest = mpp_ready(d)
-            rec = next(dest.rglob("JPype1-1.7.1.dist-info")) / "RECORD"
-            rec.write_bytes(rec.read_bytes() + b"x/y.py,sha256=AAAA,1\n")
-            assert pyenv.verify(dest, "mpp") is False
-            assert pyenv.state(dest, "mpp") == "READY"  # the cheap check does not hash
-
-
-def test_kind_mismatch_is_broken():
-    with env() as d:
-        pv = pdf_fix.fake_venv(d / "pv")
-        assert pyenv.state(pv, "pdf") == "READY"
-        assert pyenv.state(pv, "mpp") == "BROKEN"  # a ready.json with no kind is a pdf venv
-        with which_java(JAVA_EXE):
-            mv = mpp_ready(d)
-        assert pyenv.state(mv, "pdf") == "BROKEN"
-
-
-def test_mpp_decline_and_remove():
-    with env() as d:
-        from reader import cache
-        assert pysetup.decline("mpp") == "DECLINED"
-        assert (cache.root() / "mpp-declined").is_file()
-        assert pyenv.declined("mpp") is True and pyenv.declined("pdf") is False
-        pv = pdf_fix.fake_venv(d / "pv")
-        with_kind_pdf(pv)
-        assert pysetup.remove(pv, "mpp") == f"FAIL\tinstall\t{pv.resolve()} is not a mpp venv"
-        assert pv.is_dir()
-        with which_java(JAVA_EXE):
-            mv = mpp_ready(d)
-        assert pysetup.remove(mv, "pdf") == f"FAIL\tinstall\t{mv.resolve()} is not a pdf venv"
-        assert pysetup.remove(mv, "mpp") == f"REMOVED\t{mv.resolve()}"
-        assert not mv.exists() and not (cache.root() / "mpp-venv.json").exists()
-
-
-def test_mpp_setup_refuses_pdf_venv():
-    with env() as d:
-        pv = pdf_fix.fake_venv(d / "pv")
-        with_kind_pdf(pv)
-        steps = MppStub(mpp_info(d))
-        with which_java(JAVA_EXE):
-            out = pysetup.setup(pv, steps, kind="mpp")
-        assert out == f"FAIL\tinstall\t{pv.resolve()} is not a mpp venv", out
-        assert (pv / "ready.json").is_file()
-
-
-def test_mpp_venv_dir_order():
-    with env() as d:
-        os.environ["PHRO_READER_MPPENV"] = str(d / "X")
-        os.environ["CLAUDE_PLUGIN_DATA"] = str(d / "D")
-        assert pyenv.venv_dir("mpp") == d / "X"
-        assert pyenv.venv_dir("pdf") == d / "D" / "pdf-venv"
-        del os.environ["PHRO_READER_MPPENV"]
-        assert pyenv.venv_dir("mpp") == d / "D" / "mpp-venv"
-        del os.environ["CLAUDE_PLUGIN_DATA"]
-        from reader import cache
-        (cache.root() / "mpp-venv.json").write_text(json.dumps({"venv": str(d / "P")}), encoding="utf-8")
-        assert pyenv.venv_dir("mpp") == d / "P"
-        assert pyenv.venv_dir("pdf") != d / "P"
-
-
-def test_mpp_off():
-    with env() as d:
-        with which_java(JAVA_EXE):
-            dest = mpp_ready(d)
-            assert pyenv.engine("mpp", dest) == "mpxj-16.10.0-java21"
-            os.environ["PHRO_READER_MPPENV"] = "off"
-            assert pyenv.forced_native("mpp") and not pyenv.forced_native("pdf") and not pyenv.forced_native()
-            assert pyenv.engine("mpp", dest) == ""
-            assert str(pyenv.venv_dir("mpp")) != "off"  # "off" is not a folder name
-
-
-def test_mpp_engine_id_from_module():
-    # the venv child reads mpxj's version from its metadata and the java major from <sys.prefix>/ready.json
-    import importlib.metadata as md
-    with env() as d:
-        with which_java(JAVA_EXE):
-            dest = mpp_ready(d)
-        real, prefix = md.version, sys.prefix
-        md.version = lambda name: "16.10.0" if name == "mpxj" else real(name)
-        sys.prefix = str(dest)
-        try:
-            assert pyenv.engine_id_from_module("mpp") == "mpxj-16.10.0-java21"
-        finally:
-            sys.prefix, md.version = prefix, real
-
-
-def test_prune_skips_mpp_declined():
-    import inspect
-    from reader import cache
-    assert '"mpp-declined"' in inspect.getsource(cache.prune)
-
-
-def _fake_java_in(folder):
-    folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
-    exe = folder / ("java.exe" if sys.platform == "win32" else "java")
-    exe.write_bytes(b"")  # a clean empty file: it is never run, the run is stubbed
-    return exe
-
-
-@contextmanager
-def path_and_cwd(path, cwd):
-    old_path, old_cwd = os.environ.get("PATH"), os.getcwd()
-    os.environ["PATH"] = path
-    os.chdir(cwd)
-    try:
-        yield
-    finally:
-        os.chdir(old_cwd)
-        if old_path is None:
-            os.environ.pop("PATH", None)
-        else:
-            os.environ["PATH"] = old_path
-
-
-def test_find_java_absolute_entries_only():
-    with env() as d:
-        planted = _fake_java_in(d / "planted")
-        good = _fake_java_in(d / "good")
-        # the current directory and relative / empty PATH entries are never searched
-        with path_and_cwd(os.pathsep.join(["", ".", "planted", "rel"]),
-                          d / "planted"):
-            assert pyenv.find_java() is None
-            assert pyenv.java_info() == "java not found on PATH"
-        with path_and_cwd(os.pathsep.join(["", ".", "rel", str(good.parent)]), d / "planted"):
-            got = pyenv.find_java()
-            assert os.path.normcase(got) == os.path.normcase(str(good)) and os.path.isabs(got), got
-        with path_and_cwd(str(d / "empty-dir"), d):
-            assert pyenv.find_java() is None
-
-
-def test_java_info_runs_the_full_path():
-    with env() as d:
-        planted = _fake_java_in(d / "planted")
-        good = _fake_java_in(d / "good")
-        home = jdk(d)
-        run = java_run(home)
-        with path_and_cwd(os.pathsep.join([".", str(good.parent)]), d / "planted"):
-            info = pyenv.java_info(run=run)
-        nc = os.path.normcase
-        assert nc(info["path"]) == nc(str(good)) and run.cmd[0] == info["path"], (info, run.cmd)
-        assert nc(run.cmd[0]) != nc(str(planted)) and run.cmd[0] != "java"
-
-
-def test_state_ignores_a_planted_java():
-    with env() as d:
-        good = _fake_java_in(d / "good")
-        planted = _fake_java_in(d / "planted")
-        dest = d / "mpp-venv"
-        with path_and_cwd(str(good.parent), d):
-            info = pyenv.java_info(run=java_run(jdk(d)))
-        assert pysetup.setup(dest, MppStub(info), kind="mpp").startswith("READY	")
-        with path_and_cwd(os.pathsep.join([".", str(good.parent)]), d / "planted"):
-            assert pyenv.state(dest, "mpp") == "READY"
-        with path_and_cwd(".", d / "planted"):  # only a planted java in the cwd: not found, so STALE
-            assert pyenv.state(dest, "mpp") == "STALE"
-        assert planted.is_file()
 
 
 # ---- kind "image": resvg_py and Pillow for figures off Windows -----------------------------------------------------------
@@ -1195,7 +752,7 @@ def image_ready(d):
 
 
 def test_image_kind_paths_and_env():
-    assert pyenv.KINDS == ("pdf", "mpp", "image")
+    assert pyenv.KINDS == ("pdf", "image")
     assert pyenv._ENV["image"] == "PHRO_READER_IMAGEENV"
     assert pyenv._DISTS["image"] == ("resvg-py", "pillow")
     assert pyenv.REQUIREMENTS["image"].name == "requirements-image.txt" and pyenv.REQUIREMENTS["image"].is_file()
@@ -1212,7 +769,7 @@ def test_image_kind_paths_and_env():
             assert pyenv.venv_dir("image") == d / "elsewhere" and not pyenv.forced_native("image")
             os.environ["PHRO_READER_IMAGEENV"] = "off"
             assert pyenv.forced_native("image") and pyenv.engine("image") == "none"
-            assert not pyenv.forced_native("pdf") and not pyenv.forced_native("mpp")
+            assert not pyenv.forced_native("pdf")
         finally:
             if old is None:
                 os.environ.pop("PHRO_READER_IMAGEENV", None)

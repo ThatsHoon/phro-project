@@ -1081,7 +1081,7 @@ class Lists:
 
 # ---- property sets (MS-OLEPS 2.21 PropertySetStream, 2.20 PropertySet, 2.15 TypedPropertyValue, 2.17 Dictionary)
 SUMMARY_STREAM, DOC_SUMMARY_STREAM = "\x05SummaryInformation", "\x05DocumentSummaryInformation"
-_SUMMARY = bytes.fromhex("e0859ff2f94f6810ab9108002b27b3d9")      # FMTID_SummaryInformation
+SUMMARY_FMTID = bytes.fromhex("e0859ff2f94f6810ab9108002b27b3d9")  # FMTID_SummaryInformation
 _DOC_SUMMARY = bytes.fromhex("02d5cdd59c2e1b10939708002b2cf9ae")  # FMTID_DocSummaryInformation
 _USER = bytes.fromhex("05d5cdd59c2e1b10939708002b2cf9ae")         # FMTID_UserDefinedProperties
 _SUMMARY_LABELS = {2: "title", 3: "subject", 4: "author", 5: "keywords", 8: "last author", 12: "created",
@@ -1186,7 +1186,7 @@ def summary(streams: dict) -> tuple[str, list]:
     ({stream: property_sets}): the summary's title, subject, author, keywords, last author and creation and save
     times, the document summary's company, then the user-defined properties by their dictionary names."""
     title, pairs = "", []
-    for stream, fmtid, labels in ((SUMMARY_STREAM, _SUMMARY, _SUMMARY_LABELS),
+    for stream, fmtid, labels in ((SUMMARY_STREAM, SUMMARY_FMTID, _SUMMARY_LABELS),
                                   (DOC_SUMMARY_STREAM, _DOC_SUMMARY, _DOC_SUMMARY_LABELS)):
         values = streams.get(stream, {}).get(fmtid, ({}, {}))[0]
         for pid, label in labels.items():

@@ -1,5 +1,5 @@
-"""Document reader: turns documents into compact Markdown. Third-party engines (pdf, mpp) live in plugin-managed venvs and
-are imported only there; heavier imports happen inside functions."""
+"""Document reader: turns documents into compact Markdown. The optional third-party engines (pdf, image) live in
+plugin-managed venvs and are imported only there; heavier imports happen inside functions."""
 import time
 from pathlib import Path
 

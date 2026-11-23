@@ -117,12 +117,6 @@ def _pages(text):
 
 
 def _engine_id(wanted) -> str:
-    if wanted == "mpxj":
-        try:
-            from reader import pyenv
-            return pyenv.engine_id_from_module("mpp")
-        except Exception:
-            return ""
     if wanted != "pdfium":
         return "native"
     try:
@@ -143,8 +137,8 @@ def _deadline_left() -> float:
     return max(0.0, wall - time.time()) if math.isfinite(wall) else float(CONVERT_SECONDS)
 
 
-_VENV_KIND = {"pdf": "pdf", "mpp": "mpp", "mpt": "mpp"}
-_VENV_ENGINE = {"pdf": "pdfium", "mpp": "mpxj"}
+_VENV_KIND = {"pdf": "pdf"}
+_VENV_ENGINE = {"pdf": "pdfium"}
 
 
 def source(arg: str) -> str:
@@ -213,11 +207,11 @@ def cmd_setup(a) -> int:
 
 
 def _image_id(fmt) -> str:
-    """The figure backend id of the cache key for format module `fmt`: none for pdf and mpp (their venv children
-    have no figure backend: the engine id alone). On Windows the gate's own id (gate.image_backend), so GDI+ is not
+    """The figure backend id of the cache key for format module `fmt`: none for pdf (its venv child has no
+    figure backend: the engine id alone). On Windows the gate's own id (gate.image_backend), so GDI+ is not
     started just for a key and the child files the read where the gate looks even when GdiplusStartup fails here;
     elsewhere the image venv's id as this process works it out (raster.backend)."""
-    if fmt in ("pdf", "mpp"):
+    if fmt == "pdf":
         return ""
     if sys.platform == "win32":
         from reader import gate
@@ -226,12 +220,9 @@ def _image_id(fmt) -> str:
     return raster.backend()
 
 
-def _ocr_id(fmt) -> tuple[str, str]:
-    """The OCR backend (id, version) for format module `fmt`: the gate's own probe (ocr_probe.backend), so the child
-    files the read where the gate looks; none for mpp, which has no pictures. Worked out once: the key carries it
-    (gate.ocr_key) and reader.convert opens its OCR session with it."""
-    if fmt == "mpp":
-        return "", ""
+def _ocr_id() -> tuple[str, str]:
+    """The OCR backend (id, version): the gate's own probe (ocr_probe.backend), so the child files the read where the
+    gate looks. Worked out once: the key carries it (gate.ocr_key) and reader.convert opens its OCR session with it."""
     from reader import ocr_probe
     return ocr_probe.backend()
 
@@ -251,16 +242,12 @@ def cmd_convert(a) -> int:
             reader.precheck(src)
             opts, engine = {}, ""
             fmt = reader.FORMATS.get(reader.ext_of(src))
-            opts["backend"] = _ocr_id(fmt)
+            opts["backend"] = _ocr_id()
             if fmt == "pdf":
                 engine = _engine_id("pdfium" if a.engine == "pdfium" else "native")
                 opts["engine"] = "native" if engine == "native" else "pdfium"
                 if a.pages:
                     opts["pages"] = a.pages
-            elif fmt == "mpp" and a.engine == "mpxj":
-                engine = _engine_id("mpxj")
-                if engine:
-                    opts["engine"] = "mpxj"
             if a.out:
                 out = Path(a.out)
                 reader.convert(src, out, a.hidden, **opts)
@@ -338,11 +325,11 @@ def main(argv=None) -> int:
     c.add_argument("--out")
     c.add_argument("--hidden", action="store_true")
     c.add_argument("--key", help=argparse.SUPPRESS)
-    c.add_argument("--engine", choices=("pdfium", "native", "mpxj"))
+    c.add_argument("--engine", choices=("pdfium", "native"))
     c.add_argument("--pages", type=_pages, metavar="A-B")
     c.set_defaults(fn=cmd_convert)
     s = sub.add_parser("setup")
-    s.add_argument("--for", dest="kind", choices=("pdf", "mpp", "image"), default="pdf")
+    s.add_argument("--for", dest="kind", choices=("pdf", "image"), default="pdf")
     s.add_argument("--venv")
     mode = s.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true")

@@ -1,5 +1,5 @@
-"""Creating an optional venv (kind "pdf": pypdfium2; kind "mpp": MPXJ and JPype, with a Java found on PATH;
-kind "image": resvg_py and Pillow, not on Windows, where GDI+ draws pictures).
+"""Creating an optional venv (kind "pdf": pypdfium2; kind "image": resvg_py and Pillow, not on Windows, where
+GDI+ draws pictures).
 Runs only from `read.py setup`: nothing else imports it.
 
 Each step that touches the system sits in `Steps`, so tests replace them with stubs.
@@ -92,38 +92,6 @@ class Steps:
 
 
 SMOKE_TIMEOUT = 180
-# Run in the venv with -I -c: argv[1] is the recorded JVM library. Starting the JVM through JPype and loading
-# MPPReader catches a 32/64-bit mismatch between Python and Java, and a Java that cannot host MPXJ.
-SMOKE_MPP = (
-    "import sys, jpype, mpxj\n"
-    "jpype.startJVM(sys.argv[1], '-Xmx1024m', '-Djava.awt.headless=true')\n"
-    "jpype.JClass('org.mpxj.mpp.MPPReader')\n"
-    "print('phro-mpp-ok')\n")
-
-
-class MppSteps(Steps):
-    """Steps for kind "mpp": the java check, the versions of mpxj and jpype1, and the JPype smoke run."""
-
-    def java(self):
-        return pyenv.java_info()
-
-    def versions(self, python):
-        code = ("import json; from importlib.metadata import version as v; "
-                "print(json.dumps([v('mpxj'), v('jpype1')]))")
-        r = _run([str(python), "-I", "-X", "utf8", "-c", code])
-        if r.returncode != 0:
-            raise RuntimeError((r.stderr or r.stdout).strip())
-        mpxj, jpype = json.loads(r.stdout.strip().splitlines()[-1])
-        return mpxj, jpype, pyenv.record_digests(Path(python).parent.parent, "mpp")
-
-    def smoke(self, python, java):
-        try:
-            r = _run([str(python), "-I", "-X", "utf8", "-c", SMOKE_MPP, java["jvm"]], timeout=SMOKE_TIMEOUT)
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return r.returncode == 0 and "phro-mpp-ok" in r.stdout
-
-
 # Run in the venv with -I -c: resvg_py draws a one-line SVG with text, and the answer must be a PNG.
 SMOKE_IMAGE = (
     "import resvg_py\n"
@@ -245,12 +213,7 @@ def setup(venv, steps=None, kind="pdf") -> str:
     pyenv._check(kind)
     if kind == "image" and sys.platform == "win32":  # before anything is made: GDI+ draws pictures there
         return "FAIL\timage\tthe image venv is not needed on Windows (GDI+ draws pictures)"
-    steps = steps or {"mpp": MppSteps, "image": ImageSteps}.get(kind, Steps)()
-    java = None
-    if kind == "mpp":  # before anything is made: no Java, no folder
-        java = steps.java()
-        if isinstance(java, str):
-            return f"FAIL\tjava\t{_flat(java)}"
+    steps = steps or {"image": ImageSteps}.get(kind, Steps)()
     venv = Path(venv).resolve()
     try:
         venv.parent.mkdir(parents=True, exist_ok=True)
@@ -267,7 +230,7 @@ def setup(venv, steps=None, kind="pdf") -> str:
         _clean_leftovers(venv, tmp)
         shutil.rmtree(tmp, ignore_errors=True)
         try:
-            return _build(venv, tmp, steps, kind, java)
+            return _build(venv, tmp, steps, kind)
         except Exception as e:  # noqa: BLE001
             return f"FAIL\tinstall\t{_flat(e)}"
         finally:
@@ -276,7 +239,7 @@ def setup(venv, steps=None, kind="pdf") -> str:
         _release(lock, token)
 
 
-def _build(venv: Path, tmp: Path, steps, kind="pdf", java=None) -> str:
+def _build(venv: Path, tmp: Path, steps, kind="pdf") -> str:
     try:
         steps.make_venv(tmp)
     except Exception as e:  # noqa: BLE001
@@ -296,18 +259,14 @@ def _build(venv: Path, tmp: Path, steps, kind="pdf", java=None) -> str:
     except Exception as e:  # noqa: BLE001
         return f"FAIL\tversions\t{_flat(e)}"
     try:
-        smoked = steps.smoke(python, java) if kind == "mpp" else steps.smoke(python)
+        smoked = steps.smoke(python)
     except Exception as e:  # noqa: BLE001
         return f"FAIL\tsmoke\t{_flat(e)}"
     if not smoked:
-        return {"mpp": "FAIL\tsmoke\tJPype could not start the JVM and load MPXJ",
-                "image": "FAIL\tsmoke\tthe test SVG did not render with resvg_py",
+        return {"image": "FAIL\tsmoke\tthe test SVG did not render with resvg_py",
                 }.get(kind, "FAIL\tsmoke\tthe test page did not read with pdfium")
     ready = {"kind": kind, "requirements": pyenv.requirements_hash(kind), "python": _python_info(tmp)}
-    if kind == "mpp":  # versions() gave (mpxj, jpype1, records)
-        ready.update({"mpxj": version, "jpype1": build, "java": java, "records": records})
-        engine = pyenv.mpp_engine_id(version, java["major"])
-    elif kind == "image":  # versions() gave (resvg-py, pillow, records)
+    if kind == "image":  # versions() gave (resvg-py, pillow, records)
         ready.update({"resvg": version, "pillow": build, "records": records})
         engine = pyenv.image_engine_id(version, build)
     else:
@@ -348,8 +307,6 @@ def check(venv, kind="pdf") -> str:
         ready = pyenv._ready(venv)
         if kind == "image":
             return f"READY\t{venv}\t{pyenv.image_engine_id(ready.get('resvg'), ready.get('pillow'))}"
-        if kind == "mpp":
-            return f"READY\t{venv}\t{pyenv.mpp_engine_id(ready.get('mpxj'), ready['java']['major'])}"
         return f"READY\t{venv}\t{pyenv.engine_id(ready.get('pypdfium2'), ready.get('pdfium'))}"
     return f"{st}\t{venv}"
 

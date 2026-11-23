@@ -265,7 +265,6 @@ def run_cli(*args, env_extra=None, prefix=None):
     env["PHRO_READER_CACHE"] = str(tmp())
     env["PYTHONUTF8"] = "1"
     env["PHRO_READER_PYENV"] = "off"  # a pdf convert must not re-run in the user's own pdf venv
-    env["PHRO_READER_MPPENV"] = "off"  # nor an mpp convert in the user's own mpp venv
     r = subprocess.run([sys.executable, "-I", "-X", "utf8", *(prefix or [str(READ)]), *args],
                        capture_output=True, text=True, encoding="utf-8", env=env)
     return r
@@ -399,7 +398,7 @@ def test_key_engine():
 
 
 def test_cache_key_holds_image_backend():
-    """The image backend id is in the key after the engine id; the CLI puts it in every key but pdf's and mpp's."""
+    """The image backend id is in the key after the engine id; the CLI puts it in every key but pdf's."""
     from reader import raster
     from pdf_fix import text_ops
     p = sample()
@@ -607,9 +606,9 @@ def fake_tess():
                 os.environ[k] = v
 
 
-def test_mpp_and_pdf_keys_ignore_image():
-    """read.py gives the image backend to every key but pdf's and mpp's (their venv children have no figure backend),
-    and the gate's OCR backend id to every key but mpp's."""
+def test_pdf_key_ignores_image():
+    """read.py gives the image backend to every key but pdf's (its venv child has no figure backend), and the gate's
+    OCR backend id to every key, a Project file's too."""
     from pdf_fix import text_ops
     from reader import gate
     seen = []
@@ -618,15 +617,15 @@ def test_mpp_and_pdf_keys_ignore_image():
     def spy(path, engine="", image="", ocr=""):
         seen.append((Path(path).suffix, engine, image, ocr))
         return real(path, engine, image, ocr)
-    old = {k: os.environ.get(k) for k in ("PHRO_READER_MPPENV", "PHRO_READER_PYENV")}
-    os.environ["PHRO_READER_MPPENV"] = os.environ["PHRO_READER_PYENV"] = "off"
+    old = {k: os.environ.get(k) for k in ("PHRO_READER_PYENV",)}
+    os.environ["PHRO_READER_PYENV"] = "off"
     cache.key = spy
     try:
         with stub(), fake_tess():
             oid = gate.ocr_backend()
             m = tmp() / "x.mpp"
             m.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + bytes(600))
-            cli("convert", str(m), "--engine", "mpxj")  # no mpp venv here: unsupported, but the key is worked out
+            cli("convert", str(m))
             cli("convert", str(_pdf_file([text_ops("Hi")])), "--engine", "native")
             cli("convert", str(sample()))
     finally:
@@ -637,7 +636,7 @@ def test_mpp_and_pdf_keys_ignore_image():
             else:
                 os.environ[k] = v
     from reader import raster
-    assert "tess:" in oid and seen == [(".mpp", "", "", ""), (".pdf", "native", "", oid),
+    assert "tess:" in oid and seen == [(".mpp", "", raster.backend(), oid), (".pdf", "native", "", oid),
                                        (".txtx", "", raster.backend(), oid)], (oid, seen)
 
 
