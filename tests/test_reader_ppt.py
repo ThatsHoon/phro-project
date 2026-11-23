@@ -422,11 +422,13 @@ def test_shape_and_picture_links_jumps_buttons_and_media_are_named():
               {"inst": 193, "box": (0, 300, 50, 350), "click": {"jump": 1}},
               {"kind": "media", "media": ("Video", "C:\\clips\\launch-demo.avi"), "ex_obj_id": 7, "pib": 1,
                "box": (0, 400, 500, 450)},
-              {"text": "run it", "box": (0, 500, 500, 550), "click": {"action": 1}}]
+              {"text": "run it", "box": (0, 500, 500, 550), "click": {"action": 1}},
+              {"text": "run that", "box": (0, 600, 500, 650), "click": {"action": 1, "macro": " Module1.Hello\r\n"}}]
     out, ctx = md([{"shapes": shapes}, {"title": "Two"}], pictures=[blip_png(png)])
     assert out == ("## Slide 1\n\nSee the comparison (→ Slide 2)\n\n![](assets/img-001.png)\n\n"
                    "[Picture](https://example.com/dash)\n\nNext button (→ next slide)\n\n"
                    "Video: launch-demo.avi (poster below)\n\n![](assets/img-001.png)\n\nrun it (→ macro)\n\n"
+                   "run that (→ macro Module1.Hello)\n\n"
                    "## Slide 2: Two\n"), repr(out)
     assert not ctx.skipped, ctx.skipped
 

@@ -8,13 +8,15 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
+import reader  # noqa: E402
 from reader import gate, limits, markdown  # noqa: E402
+from reader.containers.officecrypt import PPT_DEFAULT  # noqa: E402
 from reader.containers import vba  # noqa: E402  (ModuleNotFoundError before vba.py exists)
 from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import ooxml  # noqa: E402
 from reader.containers.zipx import Package  # noqa: E402
 from reader.model import Context, Doc, Para, Text  # noqa: E402
-from reader_fix import cfb_bytes  # noqa: E402
+from reader_fix import cfb_bytes, make_ppt, oa_container, oa_record  # noqa: E402
 import test_reader_doc as in_doc  # noqa: E402
 import test_reader_docm as in_docm  # noqa: E402
 import test_reader_pub as in_pub  # noqa: E402
@@ -337,6 +339,33 @@ def test_xls_project_is_read():
     streams = project({"Module1": (SUB, 0x21)}, "_VBA_PROJECT_CUR/")
     _, ctx = in_xls.book([{"name": "S", "cells": {(0, 0): "x"}}], streams=streams)
     assert [m[:2] for m in ctx.vba] == [("Module1", "module")] and not ctx.skipped, (ctx.vba, ctx.skipped)
+
+
+def ppt(vba_item, **kw):
+    """(Doc, Context) of a one-slide .ppt whose VBAInfoAtom names `vba_item` (make_ppt's vba)."""
+    path = Path(tempfile.mkdtemp()) / "a.ppt"
+    make_ppt(path, [{"title": "T"}], vba=vba_item, **kw)
+    ctx = Context()
+    return reader.parse(path, ctx), ctx
+
+
+def test_ppt_project_is_read():
+    blob, _ = cfb_bytes(project({"Module1": (SUB, 0x21), "Slide1": (EMPTY, 0x22)}))
+    want = [("Module1", "module", 'Sub Hello()\n    MsgBox "안녕"\nEnd Sub')]
+    decoy = oa_container(0x1388, oa_record(0x0400, struct.pack("<3I", 99, 1, 2)))  # a ProgTags child, not a VBAInfo
+    for item, kw in ((blob, {}), ((blob, {"compressed": True}), {}), (blob, {"encrypt": PPT_DEFAULT}),
+                     ({"data": blob, "before": decoy, "after": oa_container(0x07D0)}, {})):
+        doc, ctx = ppt(item, **kw)
+        assert doc.meta.get("vba") == want and not ctx.skipped, (kw, doc.meta.get("vba"), ctx.skipped)
+    # a short atom (the next record's header would complete it to the storage's persist id, 4) and a VBAInfo with no
+    # atom name a project that is not read, as do a missing storage and ones that hold no project
+    for item in ({"data": blob, "atom": b"\x04\x00", "after": oa_record(1)}, {"data": blob, "atom": None},
+                 {"ref": 99}, b"no compound file", cfb_bytes({"Other": b"1"})[0], cfb_bytes({"VBA/x": b"1"})[0],
+                 ({"body": b"\x10\x00\x00\x00garbage zlib", "compressed": True})):
+        doc, ctx = ppt(item)
+        assert "vba" not in doc.meta and ctx.skipped == {"vba": 1}, (item, doc.meta.get("vba"), ctx.skipped)
+    doc, ctx = ppt(None)
+    assert "vba" not in doc.meta and not ctx.skipped, ctx.skipped
 
 
 def main():

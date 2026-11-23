@@ -1641,7 +1641,8 @@ def _ppt_interactive(spec, urls):
     """The InteractiveInfo container (0x0FF2) of a shape dict's `link` or `click`: an InteractiveInfoAtom (soundIdRef,
     exHyperlinkIdRef, action, oleVerb, jump, flags, hyperlinkType, 3 unused). A string link or a click url is action 4
     (hyperlink) of type 8 (URL), a click slide action 4 of type 7 (slide number), a click jump action 3 with that jump
-    code, a click action that action; any other link names no hyperlink."""
+    code, a click action that action (with a macro name, a MacroNameAtom: CString instance 2, after the atom); any
+    other link names no hyperlink."""
     target = _ppt_target(spec)
     ref = list(urls).index(target) + 1 if target is not None else 0
     click = spec.get("click") or {}
@@ -1651,7 +1652,8 @@ def _ppt_interactive(spec, urls):
         action, jump, kind = 4, 0, 7 if isinstance(target, tuple) else 8
     else:
         action, jump, kind = click.get("action", 0), 0, 0xFF
-    return oa_container(0x0FF2, oa_record(0x0FF3, struct.pack("<IIBBBBB3x", 0, ref, action, 0, jump, 0, kind)))
+    macro = [ppt_cstring(click["macro"], 2)] if "macro" in click else []
+    return oa_container(0x0FF2, oa_record(0x0FF3, struct.pack("<IIBBBBB3x", 0, ref, action, 0, jump, 0, kind)), *macro)
 
 
 def ppt_shape(spec, ids, *, inside=False, urls=()):
@@ -1826,7 +1828,7 @@ def _ppt_object(item, k):
 
 
 def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=(), objects=(), encrypt=None,
-             edits=1, raw_shapes=None, no_pictures_stream=False, encrypt_header=None, master=None):
+             edits=1, raw_shapes=None, no_pictures_stream=False, encrypt_header=None, master=None, vba=None):
     """Write a .ppt compound file with PowerPoint Document, Current User and Pictures streams.
 
     slides: dicts with title (str), body (list of str paragraphs, or (text, indent) bulleted ones), bold (substrings
@@ -1886,6 +1888,11 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     (instance 1: a u32 size and zlib data; else instance 0, the raw bytes), ex_obj_id (k + 1 for the k-th object by
     default) and body (bytes that replace the persist object's whole body as written, for example garbage zlib data;
     with compressed it is written as given, size field included). A tuple's options are such a dict.
+    vba: the VBA project storage, an `objects` item (ex_obj_id aside): an ExOleObjStg persist object after the objects'
+    and a DocInfoList (0x07D0) of the DocumentContainer holding a VBAInfo (0x03FF) whose VBAInfoAtom (0x0400) names it
+    (persistIdRef, fHasMacros 1, version 2). A dict's "ref" writes no storage and names that persist id instead,
+    "atom" replaces the atom's body (None: no atom), "before" (record bytes) goes into the DocInfoList before the VBAInfo and "after"
+    into the DocumentContainer after the DocInfoList.
     An object shape (kind "object") has ex_obj_id (an ExObjRefAtom in its ClientData), pib (its preview picture,
     optional) and the box and text keys of a text shape.
 
@@ -1908,6 +1915,8 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
     urls = ppt_link_urls(every)
     media = ppt_media(every)
     pid_objects = [3 + n + len(notes) + (pid_crypt is not None) + k for k in range(len(objects))]
+    project = _ppt_object(vba, 0) if vba is not None and not (isinstance(vba, dict) and "ref" in vba) else None
+    pid_vba = 3 + n + len(notes) + (pid_crypt is not None) + len(objects) if project is not None else None
     slide_ids = [256 + k for k in range(n)]
     notes_slide_id = {num: slide_ids[num - 1] + 0x1000 for num in notes}
     master_slide_id = 0x80000000
@@ -1986,6 +1995,12 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
                                       *[ppt_media_record(m) for m in media]))
     if master.get("footer") is not None:
         doc_parts.append(ppt_headers_footers(master["footer"], 3))
+    if vba is not None:
+        opts = vba if isinstance(vba, dict) else vba[1] if isinstance(vba, tuple) else {}
+        atom = opts.get("atom", struct.pack("<3I", vba["ref"] if project is None else pid_vba, 1, 2))
+        info = oa_container(0x03FF, oa_record(0x0400, atom, ver=2) if atom is not None else b"")
+        doc_parts.append(oa_container(0x07D0, opts.get("before", b""), info))
+        doc_parts.append(opts.get("after", b""))
     if notes:
         doc_parts.append(slide_list(2, [ppt_slide_persist(pid_notes[num], notes_slide_id[num]) for num in sorted(notes)]))
     stream, offsets = bytearray(), {}
@@ -2014,9 +2029,11 @@ def make_ppt(path, slides, *, notes=None, master_text="Click to edit", pictures=
         put(pid_crypt, oa_record(0x2F14, encrypt_header if encrypt_header is not None else rc4_header(encrypt)))
     for o, pid in zip(objects, pid_objects):
         put(pid, oa_record(0x1011, o["body"], inst=1 if o["compressed"] else 0))
+    if project is not None:
+        put(pid_vba, oa_record(0x1011, project["body"], inst=1 if project["compressed"] else 0))
     first_slide = offsets.get(pid_slides[0]) if n else None
     user_edits, directories, last, slots = [], [], 0, {}
-    seed = 3 + n + len(notes) + (pid_crypt is not None) + len(objects)
+    seed = 3 + n + len(notes) + (pid_crypt is not None) + len(objects) + (project is not None)
     for e in range(max(edits, 1)):
         changed = dict(offsets) if e == 0 else {}
         if e and n:

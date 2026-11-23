@@ -8,7 +8,7 @@ its cells. [MS-ODRAW] and [MS-PPT] are knowledge only. The text atoms of a shape
 also holds the record budget and lookups (`Walk`) and the text-atom walk the slide reader shares. For the slide's
 diagram a shape keeps its arrowheads, and a connector or line its two ends: its anchor's start corner (the far one on
 an axis its FSP flips) and the opposite corner, mapped like its box; the drawing's connector rules come with the shapes.
-A shape's mouse-click InteractiveInfoAtom (in its ClientData) is its `click`; in a ClientTextbox one followed by a
+A shape's mouse-click InteractiveInfoAtom (in its ClientData), with its MacroNameAtom's name, is its `click`; in a ClientTextbox one followed by a
 TextInteractiveInfoAtom clicks that range of the text before it; the character a slide number, date, header or
 footer MetaCharAtom marks is a field and is dropped. `Walk.link` turns a click into (URL, jump words) and
 `Walk.styles` holds the master's bullets by text type for the text being read. The shapes read in `deck.Order` over
@@ -73,15 +73,18 @@ def _decode(data, start, size, typ) -> str:
 
 
 def click(data, body, size, walk):
-    """(exHyperlinkIdRef, action, jump, hyperlinkType) of the InteractiveInfoAtom inside an InteractiveInfo container,
-    or None without one."""
+    """(exHyperlinkIdRef, action, jump, hyperlinkType, macro name) of the InteractiveInfoAtom inside an InteractiveInfo
+    container and its MacroNameAtom (its CString; "" without one), or None without the atom."""
+    got, name = None, ""
     for _, _, typ, b, s in officeart.records(data, body, body + size):
         if not walk.spend():
             return None
         if typ == rec.INTERACTIVE_INFO_ATOM and s >= 13:
             ref, action, _, jump, _, kind = struct.unpack_from("<4xIBBBBB", data, b)
-            return ref, action, jump, kind
-    return None
+            got = ref, action, jump, kind
+        elif typ == rec.CSTRING:
+            name = bytes(data[b:b + s]).decode("utf-16-le", "replace")
+    return None if got is None else (*got, name)
 
 
 def texts(data, start, end, walk):

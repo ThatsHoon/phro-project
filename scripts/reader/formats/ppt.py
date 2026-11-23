@@ -17,12 +17,15 @@ shapes on it that are not placeholders. Those, the text of the slide's footer an
 of its HeadersFooters (the slide's own, else the document's slide one, when fHasFooter is set; not on a title slide
 when the DocumentAtom's fOmitTitlePlace is set) go to `deck.Repeated`:
 written once, on the slide when only one shows it. A click (InteractiveInfoAtom) on a shape or a text range is a link
-to its ExHyperlink's URL or the words of its jump ("Slide 2", "next slide", "macro"); a shape's click on text wraps the
+to its ExHyperlink's URL or the words of its jump ("Slide 2", "next slide", "macro Module1.Run" with the MacroNameAtom's
+name); a shape's click on text wraps the
 text, else a line of its label follows: an action button's ("Next button"), a picture's or object's "Picture", or
 "Link". A shape whose ExObjRefAtom names a movie or sound in the ExObjList is the line "Video: file name" (its poster
 picture after it). An object shape places the blocks
 `ppt_objects` reads from its OLE storage (an Excel chart or sheet, an MS Graph chart, an equation); one it cannot read
-shows its preview picture and is counted under `object`, a workbook with no table under `chart`. A picture shape
+shows its preview picture and is counted under `object`, a workbook with no table under `chart`. The VBAInfoAtom
+of the DocumentContainer's DocInfoList names the VBA project, an ExOleObjStg whose storage `ppt_objects` hands to
+containers.vba; one that cannot be read is named under vba. A picture shape
 becomes the Image of its pib (`ppt_pictures`: the BStore of the DocumentContainer's PPDrawingGroup, the BLIPs in the
 `Pictures` stream) at its place; one that cannot be placed is counted under `image`. Each slide is one diagram scope:
 every shape (the title and left-out placeholders too) goes to `diagram.Diagram` under its spid, in master units after
@@ -129,15 +132,18 @@ class Presentation:
 
     def _index(self):
         """The DocumentContainer's hyperlinks ({exHyperId: (target, location)}), movies and sounds ({exObjId: (kind,
-        file name)}) of its ExObjList, and its slides' HeadersFooters."""
+        file name)}) of its ExObjList, its slides' HeadersFooters and the VBA project its DocInfoList names."""
         span = self._document()
         if span is None:
             return
+        project = None
         for _, inst, typ, body, size in self._children(span[0], span[1] - span[0]):
             if typ == rec.HEADERS_FOOTERS and inst == 3:
                 self.hf = self._hf(body, size)
             elif typ == rec.DOCUMENT_ATOM and size >= 38:
                 self.omit_title = bool(self.doc[body + 37])
+            elif typ == rec.DOC_INFO_LIST and project is None:
+                project = self._project(body, size)
             if typ != rec.EX_OBJ_LIST:
                 continue
             for _, _, t, b, sz in self._children(body, size):
@@ -159,16 +165,30 @@ class Presentation:
                     got = self._media(b, sz)
                     if got is not None:
                         self.media.setdefault(got[0], ("Audio", got[1]))
+        if project is not None:
+            self.objects.project(project)
+
+    def _project(self, body, size) -> int | None:
+        """The persistIdRef of the VBAInfoAtom in a DocInfoList's VBAInfo, 0 (an id no object has) when the VBAInfo's
+        atom is missing or short; None without a VBAInfo."""
+        for _, _, typ, b, sz in self._children(body, size):
+            if typ == rec.VBA_INFO:
+                for _, _, t, bb, ss in self._children(b, sz):
+                    if t == rec.VBA_INFO_ATOM:
+                        return struct.unpack_from("<I", self.doc, bb)[0] if ss >= 4 else 0
+                return 0
+        return None
 
     def _link(self, click):
-        """(URL or "", jump words or "") of a click (exHyperlinkIdRef, action, jump, hyperlinkType): a jump action its
-        move, a macro "macro", a hyperlink its URL, file or slide ("Slide 2"; nothing when the slide is not in the
+        """(URL or "", jump words or "") of a click (exHyperlinkIdRef, action, jump, hyperlinkType, macro name): a jump
+        action its move, a macro "macro" and its name, a hyperlink its URL, file or slide ("Slide 2"; nothing when the slide is not in the
         deck) or its move. A hyperlink id the ExObjList does not hold is counted under `link`."""
-        ref, action, jump, kind = click
+        ref, action, jump, kind, macro = click
         if action == 3:
             return "", _JUMPS.get(jump, "")
         if action == 1:
-            return "", "macro"
+            macro = " ".join(macro.split())[:MAX_NAME]
+            return "", f"macro {macro}" if macro else "macro"
         if action != 4:
             return "", ""
         if kind in _LINK_JUMPS:

@@ -1,14 +1,14 @@
 """VBA project source ([MS-OVBA]): the modules of a project storage, decompressed and decoded, never run.
 
 A project is a storage holding `VBA/dir` and one stream a module: Office packages keep it as the compound file
-vbaProject.bin, Word's .doc under `Macros/`, Excel's .xls and Visio's .vsd under `_VBA_PROJECT_CUR/`, Publisher at
-the root. A reader names the storage of its own format (`compound`), so the project of an object the file embeds
-is never taken for the document's. `dir` is a compressed container (2.4.1) of records `id u16, size u32, data`
-(PROJECTVERSION 0x0009 alone holds two more bytes than its size says): PROJECTCODEPAGE 0x0003 gives the code page
-of the names and the source, PROJECTMODULES 0x000F how many modules follow; a module is MODULENAME 0x0019 (its
-Unicode form 0x0047 wins), MODULESTREAMNAME 0x001A (Unicode 0x0032), MODULEOFFSET 0x0031 (where the source's
-compressed container starts in the stream, after the compiled code), MODULETYPE 0x0021 (a procedural module) or
-0x0022 (a document, class or form module), and ends at 0x002B.
+vbaProject.bin, Word's .doc under `Macros/`, Excel's .xls and Visio's .vsd under `_VBA_PROJECT_CUR/`, Publisher at the
+root, PowerPoint's .ppt at the root of the ExOleObjStg its VBAInfoAtom names. A reader names the storage of its own
+format (`compound`), so the project of an object the file embeds is never taken for the document's. `dir` is a
+compressed container (2.4.1) of records `id u16, size u32, data` (PROJECTVERSION 0x0009 alone holds two more bytes than
+its size says): PROJECTCODEPAGE 0x0003 gives the code page of the names and the source, PROJECTMODULES 0x000F how many
+modules follow; a module is MODULENAME 0x0019 (its Unicode form 0x0047 wins), MODULESTREAMNAME 0x001A (Unicode 0x0032),
+MODULEOFFSET 0x0031 (where the source's compressed container starts in the stream, after the compiled code), MODULETYPE
+0x0021 (a procedural module) or 0x0022 (a document, class or form module), and ends at 0x002B.
 
 `modules` gives (name, kind, source) for each module that holds code: its `Attribute` lines are left out, all but a
 procedure's VB_Description, and a module with no other line is not listed. One document reads at most VBA_MODULES

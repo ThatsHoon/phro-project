@@ -17,12 +17,14 @@ An equation converted in part (stopped early, symbols left out) keeps its TeX, i
 `partial` says the caller may also show the preview; lists dropped past mtef.DEPTH are counted under depth at each
 placement. A workbook that fails inside xls_embedded (damaged, encrypted, a chart with no table) is read once and
 remembered as an unread chart, as in doc: `blocks` gives ([], True), its chart count is taken back and the caller
-shows the preview and counts one chart at each placement (never an object).
+shows the preview and counts one chart at each placement (never an object). `project` reads the VBA project's
+ExOleObjStg the same way, its storage the project's root.
 """
 import struct
 
 from .. import embedded, limits, officeart
-from ..containers import flate
+from ..containers import flate, vba
+from ..containers.cfb import CfbError, Compound
 from ..limits import ReadError
 from ..model import Equation, Table
 from . import sheet_grid
@@ -110,6 +112,25 @@ class Objects:
             if e.kind not in _SKIP:
                 raise
             return None
+
+    def project(self, pid: int):
+        """The VBA project of the VBAInfoAtom's persistIdRef `pid` (a VbaProjectStg: an ExOleObjStg whose storage is the
+        project's root): its modules go to ctx.vba (containers.vba); a project that cannot be read is named."""
+        got = None
+        try:
+            raw = self._storage(pid)
+            if raw is not None:
+                with Compound(raw) as cf:
+                    got = vba.modules(cf, "", self.ctx)
+        except CfbError:
+            pass
+        except ReadError as e:
+            if e.kind not in _SKIP:
+                raise
+        if got is None:
+            self.ctx.skipped["vba"] = 1
+        else:
+            self.ctx.vba += got
 
     def blocks(self, ex_obj_id: int | None) -> tuple[list | None, bool]:
         """(blocks, unread) of object `ex_obj_id` for one placement. blocks is None when the object is not read (the
