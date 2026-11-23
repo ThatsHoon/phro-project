@@ -16,7 +16,7 @@ block's largest offset plus its field's size is its `max` (MPXJ's getMaxFixedDat
 the map names (_SIZES, by the field's data type, generated from MPXJ's tables). A file without a field map uses the
 version's default map, whose `max` stays 0. Only the fields the reader shows are named (_FIELDS); the others count
 toward `max` alone. A field named twice keeps its last entry. MPP14 names fields 29, 35 and 36 its scheduled duration,
-start and finish.
+start and finish, and fields 27, 43 and 44 the estimated baseline's duration, start and finish.
 """
 import math
 import struct
@@ -39,7 +39,9 @@ CONSTRAINTS = ("AS_SOON_AS_POSSIBLE", "AS_LATE_AS_POSSIBLE", "MUST_START_ON", "M
 
 # (field, data type, units field) by MPP field index
 _TASK = {14: ("name", "STRING"), 15: ("notes", "NOTES"), 16: ("wbs", "STRING"), 17: ("constraint", "CONSTRAINT"),
-         23: ("id", "INTEGER"), 24: ("milestone", "BOOLEAN"), 26: ("subproject_file", "STRING"), 29: ("duration", "DURATION", "duration_units"),
+         23: ("id", "INTEGER"), 24: ("milestone", "BOOLEAN"),
+         27: ("baseline_duration", "DURATION", "baseline_duration_units"), 43: ("baseline_start", "DATE"),
+         44: ("baseline_finish", "DATE"), 179: ("baseline_duration_units", "TIME_UNITS"), 26: ("subproject_file", "STRING"), 29: ("duration", "DURATION", "duration_units"),
          32: ("percent", "PERCENTAGE"), 35: ("start", "DATE"), 36: ("finish", "DATE"), 39: ("late_start", "DATE"),
          40: ("late_finish", "DATE"), 41: ("actual_start", "DATE"),
          42: ("actual_finish", "DATE"), 85: ("outline_level", "SHORT"),
@@ -49,9 +51,12 @@ _TASK = {14: ("name", "STRING"), 15: ("notes", "NOTES"), 16: ("wbs", "STRING"), 
          255: ("subproject_task_id", "INTEGER"), 1279: ("active", "BOOLEAN"), 1283: ("start", "DATE"),
          1284: ("finish", "DATE"), 1288: ("manual_duration", "DURATION", "manual_units"),
          1289: ("manual_units", "TIME_UNITS"), 1338: ("scheduled_start", "DATE"), 1339: ("scheduled_finish", "DATE"),
-         1340: ("scheduled_duration", "DURATION", "duration_units")}
-_TASK14 = {**_TASK, 27: None, 29: ("scheduled_duration", "DURATION", "duration_units"),
-           35: ("scheduled_start", "DATE"), 36: ("scheduled_finish", "DATE"), 43: None, 44: None}
+         1340: ("scheduled_duration", "DURATION", "duration_units"), 1299: ("baseline_start", "DATE"),
+         1300: ("baseline_finish", "DATE"), 1301: ("baseline_duration", "DURATION", "baseline_duration_units")}
+_TASK14 = {**_TASK, 27: ("baseline_estimated_duration", "DURATION", "baseline_duration_units"),
+           29: ("scheduled_duration", "DURATION", "duration_units"), 35: ("scheduled_start", "DATE"),
+           36: ("scheduled_finish", "DATE"), 43: ("baseline_estimated_start", "DATE"),
+           44: ("baseline_estimated_finish", "DATE")}
 _RESOURCE = {0: ("id", "INTEGER"), 1: ("name", "STRING"), 4: ("max_units", "UNITS"), 27: ("unique_id", "INTEGER"),
              57: ("available_from", "DATE"), 58: ("available_to", "DATE"), 276: ("availability", "BINARY"),
              808: ("active", "BOOLEAN")}
@@ -111,7 +116,9 @@ DEFAULTS = {
                   ("actual_finish", F, 0, 100, 0), ("late_finish", F, 0, 152, 0), ("wbs", V, 0, 65535, 10),
                   ("name", V, 0, 65535, 11), ("subproject_task_unique_id", V, 0, 65535, 9),
                   ("subproject_task_id", V, 0, 65535, 79), ("notes", V, 0, 65535, 144),
-                  ("subproject_file", V, 0, 65535, 160)),
+                  ("subproject_file", V, 0, 65535, 160), ("baseline_duration", F, 0, 74, 0),
+                  ("baseline_duration_units", F, 0, 78, 0), ("baseline_start", F, 0, 104, 0),
+                  ("baseline_finish", F, 0, 108, 0)),
     (12, "task"): (("unique_id", F, 0, 0, 86), ("id", F, 0, 4, 23), ("late_start", F, 0, 12, 39),
                    ("outline_level", F, 0, 40, 249), ("duration", F, 0, 60, 29), ("duration_units", F, 0, 64, 181),
                    ("constraint", F, 0, 80, 17), ("start", F, 0, 88, 35), ("finish", F, 0, 92, 36),
@@ -119,7 +126,9 @@ DEFAULTS = {
                    ("actual_finish", F, 0, 100, 42), ("late_finish", F, 0, 152, 40), ("wbs", V, 0, 65535, 16),
                    ("name", V, 0, 65535, 14), ("subproject_task_unique_id", V, 0, 65535, 242),
                    ("subproject_task_id", V, 0, 65535, 255), ("notes", V, 0, 65535, 15),
-                   ("subproject_file", V, 0, 65535, 26)),
+                   ("subproject_file", V, 0, 65535, 26), ("baseline_duration", F, 0, 74, 27),
+                   ("baseline_duration_units", F, 0, 78, 179), ("baseline_start", F, 0, 104, 43),
+                   ("baseline_finish", F, 0, 108, 44)),
     (14, "task"): (("unique_id", F, 0, 0, 86), ("id", F, 0, 4, 23), ("late_start", F, 0, 12, 39),
                    ("outline_level", F, 0, 40, 249), ("scheduled_duration", F, 0, 42, 29),
                    ("duration_units", F, 0, 46, 181), ("constraint", F, 0, 56, 17),
@@ -130,7 +139,11 @@ DEFAULTS = {
                    ("subproject_task_id", V, 0, 65535, 255), ("notes", V, 0, 65535, 15),
                    ("subproject_file", V, 0, 65535, 26), ("start", F, 1, 50, 1283),
                    ("finish", F, 1, 54, 1284), ("manual_duration", F, 1, 58, 1288),
-                   ("manual_units", F, 1, 62, 1289)),
+                   ("manual_units", F, 1, 62, 1289), ("baseline_estimated_start", V, 0, 65535, 43),
+                   ("baseline_estimated_finish", V, 0, 65535, 44), ("baseline_estimated_duration", V, 0, 65535, 27),
+                   ("baseline_duration_units", V, 0, 65535, 179),
+                   ("baseline_start", V, 1, 65535, 1299), ("baseline_finish", V, 1, 65535, 1300),
+                   ("baseline_duration", V, 1, 65535, 1301)),
     (9, "resource"): (("unique_id", F, 0, 0, 0), ("id", F, 0, 4, 0), ("available_from", F, 0, 20, 0),
                       ("available_to", F, 0, 24, 0), ("max_units", F, 0, 44, 0), ("name", V, 0, 65535, 1),
                       ("availability", V, 0, 65535, 142)),

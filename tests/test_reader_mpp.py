@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
+from reader.containers.cfb import Compound  # noqa: E402
 from reader.formats import cfb_route, mpp, mpp_notes, mpp_read  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Bold, Context, Doc, Heading, ListItem, Para, Table, Text  # noqa: E402
@@ -29,6 +30,7 @@ HEADER = "\nID|Outline|Name|Duration|Start|Finish|% Complete|Predecessors|Resour
 BENCH = Path("C:/Users/hunje/research/ai-document-reader-plugins/bench")
 JUNIT = BENCH / "engines" / "mpxj" / "src" / "junit" / "data"
 JUNIT_REF = Path(__file__).parent / "fixtures" / "mpp" / "junit.json"
+BASELINES = Path(__file__).parent / "fixtures" / "mpp" / "baselines.json"
 
 
 def raises(exc, fn, *a, **kw):
@@ -130,7 +132,9 @@ def test_broken_fat_damaged():
 
 def test_junit_parity():
     """Each of MPXJ's own test files (the bench corpus's mpp files among them) reads to the Markdown MPXJ's MPPReader
-    gave for it (its sha256, first 16 hex digits, in fixtures/mpp/junit.json), or is refused as MPXJ refused it."""
+    gave for it (its sha256, first 16 hex digits, in fixtures/mpp/junit.json), or is refused as MPXJ refused it. The
+    39 files with a baseline date carry the Baseline columns MPXJ's Markdown had none of: their other cells are
+    MPXJ's, and their baselines are MPXJ's by test_baselines_match_mpxj."""
     if not JUNIT.is_dir():
         print(f"skip: no MPXJ test data at {JUNIT}")
         return
@@ -144,6 +148,41 @@ def test_junit_parity():
             got = e.kind
         if got != ref:
             bad.append(rel)
+    assert not bad, (len(bad), bad[:5])
+
+
+def test_baselines_match_mpxj():
+    """Every task of MPXJ's test files has the baseline start, finish and duration MPXJ 16.10.0 gave it (the tasks
+    with a baseline date or a duration other than 0, in fixtures/mpp/baselines.json); no other task has a date."""
+    if not JUNIT.is_dir():
+        print(f"skip: no MPXJ test data at {JUNIT}")
+        return
+    want = json.loads(BASELINES.read_text(encoding="utf-8"))
+    bad = []
+    for rel in json.loads(JUNIT_REF.read_text(encoding="utf-8")):
+        try:
+            with Compound(JUNIT / rel) as cf:
+                p = mpp_read.read(cf)
+        except ReadError:
+            continue
+        rows = want.get(rel, {})
+        for t in p.tasks:
+            if t.null:
+                continue
+            f, d = t.f, t.f.get("baseline_duration")
+            got = [None if f.get(k) is None else f[k].isoformat(timespec="minutes")
+                   for k in ("baseline_start", "baseline_finish")]
+            got.append(None if not isinstance(d, tuple) else [float(d[0]), d[1]])
+            ref = rows.get(str(t.uid))
+            if ref is None:
+                ok = got[0] is None and got[1] is None and (got[2] is None or got[2][0] == 0)
+            else:
+                ok = got[:2] == ref[:2] and (got[2] is None) == (ref[2] is None) and (
+                    got[2] is None or math.isclose(got[2][0], ref[2][0], abs_tol=1e-9) and got[2][1] == ref[2][1])
+            if not ok:
+                bad.append((rel, t.uid, got, ref))
+        if p.baseline != any(r[0] or r[1] for r in rows.values()):
+            bad.append((rel, "baseline", p.baseline))
     assert not bad, (len(bad), bad[:5])
 
 
@@ -326,6 +365,25 @@ def test_build_output():
     name0 = tables[0].rows[1][2].blocks[0].inlines
     assert isinstance(name0[0], Bold) and name0[0].inlines == [Text("Launch")]
     assert tables[0].rows[4][2].blocks[0].inlines[-1] == Text(" (milestone)")
+
+
+def test_baseline_columns_shown_when_a_task_has_a_baseline():
+    md = render(mpp.build(sample_project(), Context()), Context())
+    assert "Baseline" not in md, md
+    p = sample_project()
+    t = p.tasks[1]
+    t.f.update(baseline_start=datetime(2026, 1, 5, 8), baseline_finish=datetime(2026, 1, 7, 17),
+               baseline_duration=(3.0, "DAYS"))
+    p.tasks[2].f["baseline_duration"] = (0.0, "DAYS")
+    md = render(mpp.build(p, Context()), Context())
+    assert "Baseline" not in md, md
+    p.baseline = True
+    md = render(mpp.build(p, Context()), Context())
+    lines = md.splitlines()
+    assert ("ID|Outline|Name|Duration|Start|Finish|Baseline duration|Baseline start|Baseline finish|% Complete|"
+            "Predecessors|Resources") in lines, md
+    assert "1|1.1|Design|5d|2026-01-05|2026-01-09|3d|2026-01-05|2026-01-07|100%||Ann[50%], Bob" in lines, md
+    assert "|2|1.2|Build|2.5h|2026-01-12|2026-01-12|||||1FS+2d, 0SS, 1FF-1d||" in lines, md
 
 
 def test_build_partial_line_and_title():

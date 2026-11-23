@@ -200,6 +200,10 @@ def tasks(cf, p: Project):
         f = t.f
         f["actual_finish"] = B.timestamp(data, 108)
         f["actual_start"] = B.timestamp(data, 104)
+        f["baseline_duration"] = B.adjusted(p, get_int(data, 82), B.duration_units(get_short(data, 72),
+                                                                                   p.duration_units))
+        f["baseline_finish"] = B.timestamp(data, 116)
+        f["baseline_start"] = B.timestamp(data, 112)
         ext.read_all(_TASK_READS)
         f["created"] = B.timestamp(data, 138)
         f["duration"] = B.adjusted(p, get_int(data, 68), B.duration_units(get_short(data, 72), p.duration_units))

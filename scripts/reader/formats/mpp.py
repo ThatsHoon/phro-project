@@ -5,7 +5,8 @@ another format's compound file named .mpp, handed to `cfb_route` as ppt's parse_
 to `zip_route`.
 
 `build` (spec "Project", Output): the project title, one `Start · Finish · Status date` line (the parts that are set),
-`## Tasks` and `## Resources` through `sheet_grid.Grid` (one `Budget` a document, so SHEET_ROWS, SHEET_CELLS and
+`## Tasks` (with Baseline duration, start and finish after Finish when the project has a baseline date) and
+`## Resources` through `sheet_grid.Grid` (one `Budget` a document, so SHEET_ROWS, SHEET_CELLS and
 SHEET_CHARS bound them; every task or resource visited counts toward SHEET_ROWS, null ones too), then `## Notes`, a
 ListItem per task note cut at MPP_NOTE characters (counted `text`) and charged against the same Budget's characters
 only after both grids, so a note never takes a task row's or a resource's characters (past them the notes stop,
@@ -26,6 +27,7 @@ from . import cfb_route, mpp_notes, mpp_read, sheet_grid, zip_route
 NOT_PROJECT = "no MSProject CompObj"
 MPP_NOTE = 20_000
 TASK_COLUMNS = ("ID", "Outline", "Name", "Duration", "Start", "Finish", "% Complete", "Predecessors", "Resources")
+BASELINE_COLUMNS = ("Baseline duration", "Baseline start", "Baseline finish")
 RESOURCE_COLUMNS = ("ID", "Name", "Type", "Max units")
 UNITS = {"MINUTES": "m", "HOURS": "h", "DAYS": "d", "WEEKS": "w", "MONTHS": "mo", "YEARS": "y", "PERCENT": "%",
          "ELAPSED_MINUTES": "em", "ELAPSED_HOURS": "eh", "ELAPSED_DAYS": "ed", "ELAPSED_WEEKS": "ew",
@@ -145,8 +147,13 @@ def _name_cell(name: str, summary: bool, milestone: bool) -> list:
     return inl
 
 
-def _task(project, t, room: int):
-    """(row values, active, ID, name) of a task that is not null, else None."""
+def _baselined(t) -> bool:
+    return t.f.get("baseline_start") is not None or t.f.get("baseline_finish") is not None
+
+
+def _task(project, t, room: int, baseline: bool):
+    """(row values, active, ID, name) of a task that is not null, else None; with `baseline`, its baseline cells
+    after Finish (empty for a task with no baseline date)."""
     if t.null:
         return None
     f = t.f
@@ -157,6 +164,9 @@ def _task(project, t, room: int):
     row = [ident, wbs or ("" if level is None else str(level)), _name_cell(name, t.summary, t.milestone),
            duration_text(f.get("duration")), _day(f.get("start")), _day(f.get("finish")), pct + "%" if pct else "",
            _joined(_predecessors(project, t), room), _joined(_assignments(project, t), room)]
+    if baseline:
+        row[6:6] = ([duration_text(f.get("baseline_duration")), _day(f.get("baseline_start")),
+                     _day(f.get("baseline_finish"))] if _baselined(t) else ["", "", ""])
     return row, t.active, ident, " ".join(name.split())
 
 
@@ -207,7 +217,11 @@ class _Notes:
 def _tasks(project, ctx, budget, pending) -> list:
     """The Tasks table; each task put is appended to `pending` (task, ID, name, active) for its note."""
     grid = sheet_grid.Grid("Tasks", budget, ctx)
-    _put(grid, 0, list(TASK_COLUMNS))
+    baseline = project.baseline
+    columns = list(TASK_COLUMNS)
+    if baseline:
+        columns[6:6] = BASELINE_COLUMNS
+    _put(grid, 0, columns)
     r = seen = 1
     for t in project.tasks:
         if grid.cut:
@@ -218,7 +232,7 @@ def _tasks(project, ctx, budget, pending) -> list:
         seen += 1
         got = None
         with ctx.guard("record"):
-            got = _task(project, t, budget.chars)
+            got = _task(project, t, budget.chars, baseline)
         if got is None:
             continue
         row, active, ident, name = got

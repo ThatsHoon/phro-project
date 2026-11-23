@@ -6,8 +6,9 @@ MPP12Reader, MPP14Reader, ProjectPropertiesReader, ConstraintFactory, ResourceAs
 and of the parts of ProjectFile, TaskContainer, Task, Resource and RelationContainer they rely on
 (the ID and unique ID maps, updateStructure, the WBS and outline numbers, predecessor de-duplication).
 
-`read` returns a Project; `mpp.build` turns it into the Doc. Calendars, custom fields, views, baselines, time-phased
-data, recurring tasks and hyperlinks are not read; nor are enterprise columns or unique ID clashes (MPXJ renumbers
+`read` returns a Project; `mpp.build` turns it into the Doc. A task's baseline duration, start and finish are read
+(an empty one from its estimated baseline, as MPPReader's copyEstimatedBaselineFields does); Baselines 1-10, baseline
+cost and work, calendars, custom fields, views, time-phased data, recurring tasks and hyperlinks are not read; nor are enterprise columns or unique ID clashes (MPXJ renumbers
 clashing unique IDs at the end, which no output shows). A Project password set to read the file is `encrypted`; a
 read MPXJ fails with an exception (a value past the end of its block, a missing stream, a bad magic number, a task
 order it cannot fix) is `damaged`.
@@ -182,7 +183,8 @@ class Relation:
 
 class Project:
     """ProjectFile: the tasks with their ID and unique ID maps, the resources, the assignments by task unique ID and
-    the predecessors by successor task; and the project properties."""
+    the predecessors by successor task; and the project properties. `baseline`: whether a task that is not null has
+    a baseline start or finish."""
 
     def __init__(self):
         self.tasks, self.ids, self.uids = [], {}, {}
@@ -190,7 +192,7 @@ class Project:
         self.assigned, self.preds = {}, {}
         self.title = self.start = self.finish = self.status = None
         self.duration_units, self.minutes_per_day, self.minutes_per_week, self.days_per_month = "DAYS", 0, 0, 0
-        self.auto_wbs = False
+        self.auto_wbs = self.baseline = False
 
     def add_task(self) -> Task:
         t = Task()
@@ -766,12 +768,18 @@ def post_process(p: Project, order: dict, null_order: dict):
 
 
 def finish(p: Project):
-    """MPPReader.read after the variant reader: updateStructure with outline numbers, then each task's summary flag
-    and the relations a task's own summary has to it removed."""
+    """MPPReader.read after the variant reader: updateStructure with outline numbers, then each task's summary flag,
+    the relations a task's own summary has to it removed and an empty baseline field set from its estimated one
+    (copyEstimatedBaselineFields)."""
     update_structure(p)
     for t in p.tasks:
         external_project = t.f.get("subproject_file") is not None and not t.f.get("external_task")
         t.summary = bool(t.children) or external_project
+        for name in ("duration", "start", "finish"):
+            if t.f.get("baseline_" + name) is None:
+                t.f["baseline_" + name] = t.f.get("baseline_estimated_" + name)
+        if not t.null and (t.f.get("baseline_start") is not None or t.f.get("baseline_finish") is not None):
+            p.baseline = True
     for t in p.tasks:
         for rel in [r for r in p.predecessors(t) if t.outline_number is not None
                     and r.pred.outline_number is not None
