@@ -322,9 +322,11 @@ A VBA storage (`_VBA_PROJECT_CUR`) sets the named item "VBA macros".
   - A summary task's name is bold, and a milestone gets ` (milestone)`.
   - Predecessors are written `3FS+2d`, resources `Name[50%]`. A duration is its own unit with a trailing `.0` dropped (`5d`, `2.5h`).
   - Null tasks are skipped. Inactive tasks are hidden rows.
+  - When a task has a baseline date, `Baseline duration | Baseline start | Baseline finish` follow Finish.
 - `## Resources`: `ID | Name | Type | Max units`.
+- `## Calendars`: one `ListItem` per calendar, `**Standard** (default): Mon-Fri 08:00-12:00, 13:00-17:00; Sat-Sun non-working`; a resource calendar shows only the days it sets (`**Ann** (based on Standard): Fri non-working`) and is left out when it sets none. Its exceptions and work weeks are items under it (`2026-12-24 to 2026-12-26 (Winter break): non-working`, `the 1st Saturday of every month, 2026-01-03 to 2026-12-05, 12 times: 09:00-12:00`).
 - `## Notes`: one `ListItem` per task note, `ID Name: note`, cut at `MPP_NOTE` (20,000) characters.
-- Calendars, views, filters, baselines and time-phased data are not read.
+- Views, filters, Baselines 1-10 and time-phased data are not read.
 
 ## Model and renderer
 

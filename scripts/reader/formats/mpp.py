@@ -4,25 +4,29 @@ The compound file is opened once. One whose `\\x01CompObj` clipboard format or P
 another format's compound file named .mpp, handed to `cfb_route` as ppt's parse_compound does. A zip named .mpp goes
 to `zip_route`.
 
-`build` (spec "Project", Output): the project title, one `Start · Finish · Status date` line (the parts that are set),
-`## Tasks` (with Baseline duration, start and finish after Finish when the project has a baseline date) and
-`## Resources` through `sheet_grid.Grid` (one `Budget` a document, so SHEET_ROWS, SHEET_CELLS and
-SHEET_CHARS bound them; every task or resource visited counts toward SHEET_ROWS, null ones too), then `## Notes`, a
-ListItem per task note cut at MPP_NOTE characters (counted `text`) and charged against the same Budget's characters
-only after both grids, so a note never takes a task row's or a resource's characters (past them the notes stop,
-counted `sheet_cut` once, and no later note is read). Null tasks are skipped, inactive tasks and resources are hidden
-rows (their notes hidden items), a summary task's name is bold and a milestone's ends in ` (milestone)`. A
-predecessor or resource list is read only until its text passes the characters left. Each task and resource is put
-under `ctx.guard("record")` and only once read whole.
+`build` (spec "Project", Output): the project title, one `Start · Finish · Status date` line (the parts that are
+set), `## Tasks` (with Baseline duration, start and finish after Finish when the project has a baseline date) and
+`## Resources` through `sheet_grid.Grid` (one `Budget` a document, so SHEET_ROWS, SHEET_CELLS and SHEET_CHARS bound
+them; every task or resource visited counts toward SHEET_ROWS, null ones too), then `## Calendars` and `## Notes`,
+charged in that order against the same Budget's characters only after both grids, so neither takes a task row's or a
+resource's characters (past them the list stops, counted `sheet_cut` once, and nothing later in it is read). A
+calendar is a ListItem with its days from Monday, equal neighbours joined (`Mon-Fri 08:00-12:00, 13:00-17:00;
+Sat-Sun non-working`, an end at midnight shown 24:00); a derived (resource) calendar shows only the days it sets
+itself and is left out when it sets nothing; its exceptions and work weeks are items under it. Calendars that could
+not be read are counted `record`. A note is a ListItem cut at MPP_NOTE characters (counted `text`). Null tasks are
+skipped, inactive tasks and resources are hidden rows (their notes hidden items), a summary task's name is bold and
+a milestone's ends in ` (milestone)`. A predecessor or resource list is read only until its text passes the
+characters left. Each task and resource is put under `ctx.guard("record")` and only once read whole.
 """
 import math
 import re
+from datetime import date
 
 from .. import limits
 from ..containers.cfb import Compound, is_cfb
 from ..limits import ReadError
 from ..model import Bold, Doc, Heading, ListItem, Para, Text
-from . import cfb_route, mpp_notes, mpp_read, sheet_grid, zip_route
+from . import cfb_route, mpp_calendars, mpp_notes, mpp_read, sheet_grid, zip_route
 
 NOT_PROJECT = "no MSProject CompObj"
 MPP_NOTE = 20_000
@@ -36,6 +40,12 @@ RELATIONS = {"FINISH_START": "FS", "START_START": "SS", "FINISH_FINISH": "FF", "
 _ENUM = re.compile(r"[A-Z][A-Z_]{0,31}")
 SEP = ", "
 DOT = " · "
+DAYS = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+WEEKDAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+          "November", "December")
+FROM_MONDAY = (1, 2, 3, 4, 5, 6, 0)
+ORDINALS = ("1st", "2nd", "3rd", "4th")
 
 
 def parse(path, ctx) -> Doc:
@@ -214,6 +224,147 @@ class _Notes:
                                    hidden="" if active else "hidden"))
 
 
+def _clock(seconds: int, end: bool = False) -> str:
+    if end and seconds == 0:
+        return "24:00"
+    h, m, s = seconds // 3600, seconds // 60 % 60, seconds % 60
+    return f"{h:02}:{m:02}" + (f":{s:02}" if s else "")
+
+
+def hours_text(ranges) -> str:
+    """`08:00-12:00, 13:00-17:00`, or `non-working` for none."""
+    if not ranges:
+        return "non-working"
+    return SEP.join(f"{_clock(a)}-{_clock(b, True)}" for a, b in ranges)
+
+
+def _one_line(text) -> str:
+    return " ".join((text or "").split())
+
+
+def days_text(days, own: bool) -> str:
+    """The days from Monday as `Mon-Fri 08:00-12:00; Sat-Sun non-working`, equal neighbours joined. With `own`, only
+    the days set (not default); otherwise each day as it works, a default one by the parent's or the standard week."""
+    texts = []
+    for day in FROM_MONDAY:
+        kind = days.types[day]
+        if own:
+            if kind in (None, mpp_calendars.DEFAULT):
+                texts.append(None)
+                continue
+            hours = days.hours[day]
+        else:
+            kind = days.day_type(day)
+            hours = days.get_hours(day)
+        working = kind == mpp_calendars.WORKING
+        texts.append("working" if working and not hours else hours_text(hours if working else None))
+    out, k = [], 0
+    while k < 7:
+        j = k
+        while j + 1 < 7 and texts[j + 1] == texts[k]:
+            j += 1
+        if texts[k] is not None:
+            first, last = DAYS[FROM_MONDAY[k]], DAYS[FROM_MONDAY[j]]
+            out.append((first if j == k else f"{first}-{last}") + " " + texts[k])
+        k = j + 1
+    return "; ".join(out)
+
+
+def _date(d) -> str:
+    return "?" if d is None else d.isoformat()
+
+
+def _span(start, end) -> str:
+    return _date(start) if start == end else f"{_date(start)} to {_date(end)}"
+
+
+def _nth(n) -> str:
+    return ORDINALS[n - 1] if isinstance(n, int) and 1 <= n <= 4 else "last"
+
+
+def _month(m) -> str:
+    return MONTHS[m - 1] if isinstance(m, int) and 1 <= m <= 12 else f"month {m}"
+
+
+def recurrence_text(r) -> str:
+    """`every 2 weeks on Mon, Fri, 2023-05-12 to 2023-12-12, 8 times` from an mpp_calendars.Recurring."""
+    n = r.frequency
+    day = next((WEEKDAYS[d] for d in FROM_MONDAY if d in r.days), "?")
+    if r.kind == "DAILY":
+        what = f"every {n} days"
+    elif r.kind == "WEEKLY":
+        on = SEP.join(DAYS[d] for d in FROM_MONDAY if d in r.days)
+        what = ("every week" if n == 1 else f"every {n} weeks") + (f" on {on}" if on else "")
+    elif r.kind == "MONTHLY":
+        every = "every month" if n == 1 else f"every {n} months"
+        what = f"the {_nth(r.day_number)} {day} of {every}" if r.relative else f"day {r.day_number} of {every}"
+    elif r.relative:
+        what = f"the {_nth(r.day_number)} {day} of {_month(r.month)} every year"
+    else:
+        what = f"every year on {_month(r.month)} {r.day_number}"
+    out = f"{what}, {_span(r.start, r.finish)}"
+    return f"{out}, {r.occurrences} times" if r.occurrences else out
+
+
+def _named(text: str, name) -> str:
+    name = _one_line(name)
+    return f"{text} ({name})" if name else text
+
+
+def _exception_text(e) -> str:
+    when = recurrence_text(e.recurring) if e.recurring else _span(e.start, e.end)
+    return _named(when, e.name) + ": " + hours_text(e.ranges)
+
+
+def _week_text(w) -> str:
+    return _named(f"Week {_span(w.start, w.finish)}", w.name) + ": " + (days_text(w, True) or "default days")
+
+
+def _exception_start(e):
+    d = e.recurring.start if e.recurring else e.start
+    return d is None, d or date.min
+
+
+def _calendar(cal, default) -> list:
+    """(level, name, text) items of a calendar (name bold, on the calendar's own item only), or [] for a derived one
+    that sets nothing of its own."""
+    derived = cal.parent is not None
+    days = days_text(cal, derived)
+    if derived and not days and not cal.exceptions and not cal.weeks:
+        return []
+    notes = (["default"] if cal is default else []) + ([f"based on {_one_line(cal.parent.name)}"] if derived else [])
+    rest = (f" ({SEP.join(notes)})" if notes else "") + (f": {days}" if days else "")
+    items = [(0, _one_line(cal.name) or f"Calendar {cal.uid}", rest)]
+    items += [(1, "", _exception_text(e)) for e in sorted(cal.exceptions, key=_exception_start)]
+    items += [(1, "", _week_text(w)) for w in cal.weeks]
+    return items
+
+
+def _calendars(project, ctx, budget) -> list:
+    """The Calendars list, each item charged against the Budget's characters; once they are spent the list stops,
+    counted sheet_cut once."""
+    if project.calendars is None:
+        ctx.warnings.append("calendars could not be read")
+        ctx.skipped["record"] += 1
+        return []
+    out = []
+    for cal in project.calendars:
+        if ctx.late():
+            break
+        items = []
+        with ctx.guard("record"):
+            items = _calendar(cal, project.default_calendar)
+        for level, name, text in items:
+            n = len(name) + len(text)
+            if budget.chars < n:
+                ctx.warnings.append(f"calendars cut at {budget.cap_chars} characters")
+                ctx.skipped["sheet_cut"] += 1
+                return out
+            budget.chars -= n
+            out.append(ListItem(level, "-", ([Bold([Text(name)])] if name else []) + ([Text(text)] if text else [])))
+    return out
+
+
 def _tasks(project, ctx, budget, pending) -> list:
     """The Tasks table; each task put is appended to `pending` (task, ID, name, active) for its note."""
     grid = sheet_grid.Grid("Tasks", budget, ctx)
@@ -292,6 +443,9 @@ def build(project, ctx) -> Doc:
     res = _resources(project, ctx, budget)
     if res:
         blocks += [Heading(2, [Text("Resources")])] + res
+    cals = _calendars(project, ctx, budget)
+    if cals:
+        blocks += [Heading(2, [Text("Calendars")])] + cals
     notes = _Notes(ctx, budget)
     notes.read(pending)
     if notes.items:

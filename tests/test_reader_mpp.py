@@ -7,11 +7,12 @@ Run: python -I -X utf8 tests/test_reader_mpp.py
 import hashlib
 import json
 import math
+import re
 import struct
 import sys
 import tempfile
 import zipfile
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -20,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from reader import limits, markdown  # noqa: E402
 from reader.containers.cfb import Compound  # noqa: E402
-from reader.formats import cfb_route, mpp, mpp_notes, mpp_read  # noqa: E402
+from reader.formats import cfb_route, mpp, mpp_calendars, mpp_notes, mpp_read, sheet_grid  # noqa: E402
 from reader.limits import ReadError  # noqa: E402
 from reader.model import Bold, Context, Doc, Heading, ListItem, Para, Table, Text  # noqa: E402
 from reader_fix import cfb_bytes, comp_obj  # noqa: E402
@@ -31,6 +32,8 @@ BENCH = Path("C:/Users/hunje/research/ai-document-reader-plugins/bench")
 JUNIT = BENCH / "engines" / "mpxj" / "src" / "junit" / "data"
 JUNIT_REF = Path(__file__).parent / "fixtures" / "mpp" / "junit.json"
 BASELINES = Path(__file__).parent / "fixtures" / "mpp" / "baselines.json"
+CALENDARS = Path(__file__).parent / "fixtures" / "mpp" / "calendars.json"
+CALENDAR_LIST = re.compile(r"\n\n## Calendars\n.*?(?=\n\n## |\n\Z)", re.S)
 
 
 def raises(exc, fn, *a, **kw):
@@ -134,7 +137,8 @@ def test_junit_parity():
     """Each of MPXJ's own test files (the bench corpus's mpp files among them) reads to the Markdown MPXJ's MPPReader
     gave for it (its sha256, first 16 hex digits, in fixtures/mpp/junit.json), or is refused as MPXJ refused it. The
     39 files with a baseline date carry the Baseline columns MPXJ's Markdown had none of: their other cells are
-    MPXJ's, and their baselines are MPXJ's by test_baselines_match_mpxj."""
+    MPXJ's, and their baselines are MPXJ's by test_baselines_match_mpxj. The Calendars list, which MPXJ's Markdown
+    had no part of, is left out of the hash: test_calendars_match_mpxj checks the calendars."""
     if not JUNIT.is_dir():
         print(f"skip: no MPXJ test data at {JUNIT}")
         return
@@ -143,7 +147,8 @@ def test_junit_parity():
     for rel, ref in want.items():
         ctx = Context()
         try:
-            got = hashlib.sha256(render(mpp.parse(JUNIT / rel, ctx), ctx).encode("utf-8")).hexdigest()[:16]
+            md = CALENDAR_LIST.sub("", render(mpp.parse(JUNIT / rel, ctx), ctx))
+            got = hashlib.sha256(md.encode("utf-8")).hexdigest()[:16]
         except ReadError as e:
             got = e.kind
         if got != ref:
@@ -184,6 +189,198 @@ def test_baselines_match_mpxj():
         if p.baseline != any(r[0] or r[1] for r in rows.values()):
             bad.append((rel, "baseline", p.baseline))
     assert not bad, (len(bad), bad[:5])
+
+
+def _clock(seconds):
+    h, m, s = seconds // 3600, seconds // 60 % 60, seconds % 60
+    return f"{h:02}:{m:02}" + (f":{s:02}" if s else "")
+
+
+def _ranges(hours):
+    return None if hours is None else [[_clock(a), _clock(b)] for a, b in hours]
+
+
+def _iso(d):
+    return None if d is None else d.isoformat()
+
+
+def _days(c):
+    return [[c.types[i], _ranges(c.hours[i])] for i in range(7)]
+
+
+def _recurrence(r):
+    if r is None:
+        return None
+    names = ("SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY")
+    first = next((names[i] for i in (1, 2, 3, 4, 5, 6, 0) if i in r.days), None)
+    return [_iso(r.start), _iso(r.finish), r.kind.capitalize(), bool(r.relative), r.occurrences, r.frequency,
+            r.day_number, first, r.month, None]
+
+
+def calendar_dump(p) -> dict:
+    """The calendars as the MPXJ dump behind fixtures/mpp/calendars.json lists them: the default's unique ID, and
+    each calendar's unique ID, name, parent, days (Sunday first: own type, own ranges), exceptions (sorted), work
+    weeks and the resources using it."""
+    cals = []
+    for c in p.calendars:
+        exc = sorted(([None if e.recurring else _iso(e.start), None if e.recurring else _iso(e.end), e.name,
+                       _ranges(e.ranges), _recurrence(e.recurring)] for e in c.exceptions), key=json.dumps)
+        cals.append({"uid": c.uid, "name": c.name, "parent": None if c.parent is None else c.parent.uid,
+                     "days": _days(c), "exceptions": exc,
+                     "weeks": [[w.name, _iso(w.start), _iso(w.finish), _days(w)] for w in c.weeks],
+                     "resources": sorted(r.uid for r in p.resources if r.calendar is c)})
+    return {"default": None if p.default_calendar is None else p.default_calendar.uid, "calendars": cals}
+
+
+def test_calendars_match_mpxj():
+    """Every calendar of MPXJ's test files, with its days, hours, exceptions, recurrences, work weeks, parent and
+    resources, is the one MPXJ 16.10.0 read (the sha256 of that dump, first 16 hex digits, in
+    fixtures/mpp/calendars.json); the default calendar is MPXJ's too."""
+    if not JUNIT.is_dir():
+        print(f"skip: no MPXJ test data at {JUNIT}")
+        return
+    want = json.loads(CALENDARS.read_text(encoding="utf-8"))
+    bad = []
+    for rel, ref in want.items():
+        with Compound(JUNIT / rel) as cf:
+            p = mpp_read.read(cf)
+        dump = json.dumps(calendar_dump(p), sort_keys=True, separators=(",", ":"))
+        if hashlib.sha256(dump.encode("utf-8")).hexdigest()[:16] != ref:
+            bad.append(rel)
+    assert not bad, (len(bad), bad[:5])
+
+
+def _day_bytes(ranges=None, default=False, tenths=False) -> bytes:
+    """A 60-byte day: the flag (1 for default), the range count, starts at 8 and durations at 20 (u16 tenths of a
+    minute, or i32 with `tenths` as a work week's are)."""
+    b = bytearray(60)
+    if default:
+        b[0] = 1
+        return bytes(b)
+    ranges = ranges or []
+    struct.pack_into("<H", b, 2, len(ranges))
+    for k, (start, minutes) in enumerate(ranges):
+        struct.pack_into("<H", b, 8 + 2 * k, start * 10)
+        struct.pack_into("<i" if tenths else "<H", b, 20 + 4 * k, minutes * 10)
+    return bytes(b)
+
+
+def _days_since(d) -> int:
+    return (d - date(1983, 12, 31)).days
+
+
+def calendar_data() -> bytes:
+    """MPP12/14 calendar data: Monday 09:00-17:00 and the rest default; an exception recurring every 2 weeks on
+    Monday and Friday, named Off; then a work week Q1 with a default Sunday, Monday 10:00-14:00 (and a range of 0
+    minutes, left out) and a non-working Tuesday."""
+    hours = b"".join(_day_bytes(default=True) if day != 1 else _day_bytes([(9 * 60, 8 * 60)]) for day in range(7))
+    exc = bytearray(92)
+    struct.pack_into("<HHH", exc, 0, _days_since(date(2026, 1, 2)), _days_since(date(2026, 6, 26)), 13)
+    struct.pack_into("<H", exc, 72, 6)
+    exc[76] = 0x22
+    struct.pack_into("<H", exc, 78, 2)
+    struct.pack_into("<i", exc, 88, 6)
+    week = [_day_bytes(default=True), _day_bytes([(10 * 60, 4 * 60), (0, 0)], tenths=True), _day_bytes()]
+    week = b"".join(week + [_day_bytes(default=True)] * 4)
+    week += struct.pack("<HH8xi", _days_since(date(2026, 2, 2)), _days_since(date(2026, 3, 1)), 4)
+    return (hours + struct.pack("<H2x", 1) + bytes(exc) + "Off".encode("utf-16-le") + b"\0\0" + bytes(4) + week
+            + "Q1".encode("utf-16-le"))
+
+
+def test_calendar_exceptions_and_work_weeks_read():
+    """The hours, a recurring exception and a work week (none is in MPXJ's test files) of MPP12/14 calendar data;
+    a recurrence type MPXJ cannot take fails."""
+    data = calendar_data()
+    default = mpp_calendars.Calendar()
+    mpp_calendars._hours(None, None, default, True, 0)
+    cal = mpp_calendars.Calendar()
+    mpp_calendars._hours(data, default, cal, True, 0)
+    mpp_calendars._exceptions12(data, cal)
+    assert cal.types[1] == "WORKING" and cal.hours[1] == [(9 * 3600, 17 * 3600)]
+    assert cal.types[0] == "NON_WORKING" and cal.hours[0] == [] and cal.hours[2] == list(mpp_calendars.DEFAULT_HOURS)
+    (e,) = cal.exceptions
+    r = e.recurring
+    assert e.name == "Off" and e.ranges == [] and r.kind == "WEEKLY" and r.days == {1, 5} and r.frequency == 2
+    assert (r.start, r.finish, r.occurrences) == (date(2026, 1, 2), date(2026, 6, 26), 13)
+    (w,) = cal.weeks
+    assert w.name == "Q1" and (w.start, w.finish) == (date(2026, 2, 2), date(2026, 3, 1))
+    assert w.types[:3] == ["DEFAULT", "WORKING", "NON_WORKING"] and w.hours[0] is None and w.hours[2] == []
+    assert w.hours[1] == [(10 * 3600, 14 * 3600)], w.hours[1]
+    bad = bytearray(data)
+    struct.pack_into("<H", bad, 424 + 72, 0)
+    raises(ValueError, mpp_calendars._exceptions12, bytes(bad), mpp_calendars.Calendar())
+
+
+def calendar_project():
+    """Standard (the default) with a night shift Monday; Ann's calendar based on it with Friday off, a holiday and a
+    monthly working day; Bob's sets nothing of its own."""
+    std = mpp_calendars.default_base()
+    std.uid = 1
+    std.hours[1] = [(22 * 3600, 0)]
+    ann = mpp_calendars.default_derived()
+    ann.uid, ann.name = 2, "Ann"
+    ann.set_parent(std)
+    ann.set_working(5, False)
+    hol = mpp_calendars.CalendarException(date(2026, 12, 24), date(2026, 12, 26))
+    hol.name = "Winter\nbreak"
+    rec = mpp_calendars.Recurring(date(2026, 1, 3), date(2026, 12, 5), "MONTHLY", True, 12)
+    rec.days, rec.day_number, rec.frequency = {6}, 1, 1
+    monthly = mpp_calendars.CalendarException(None, None, rec)
+    monthly.ranges = [(9 * 3600, 12 * 3600)]
+    ann.exceptions = [hol, monthly]
+    bob = mpp_calendars.default_derived()
+    bob.uid, bob.name = 3, "Bob"
+    bob.set_parent(std)
+    p = project("T")
+    p.calendars, p.default_calendar = [std, ann, bob], std
+    return p
+
+
+def test_calendars_listed():
+    ctx = Context()
+    doc = mpp.build(calendar_project(), ctx)
+    md = render(doc, ctx)
+    assert [b.inlines[0].text for b in doc.blocks if isinstance(b, Heading)] == ["Tasks", "Calendars"]
+    lines = md.split("## Calendars\n\n")[1].splitlines()
+    assert lines == ["- **Standard** (default): Mon 22:00-24:00; Tue-Fri 08:00-12:00, 13:00-17:00; Sat-Sun non-working",
+                     "- **Ann** (based on Standard): Fri non-working",
+                     "  - the 1st Saturday of every month, 2026-01-03 to 2026-12-05, 12 times: 09:00-12:00",
+                     "  - 2026-12-24 to 2026-12-26 (Winter break): non-working"], lines
+    assert not ctx.skipped.get("record") and not ctx.skipped.get("sheet_cut")
+
+
+def test_recurrence_and_days_text():
+    r = mpp_calendars.Recurring(date(2026, 1, 1), date(2026, 3, 1), "WEEKLY", False, 0)
+    r.days, r.frequency = {0, 3}, 1
+    assert mpp.recurrence_text(r) == "every week on Wed, Sun, 2026-01-01 to 2026-03-01"
+    r.kind, r.frequency = "DAILY", 3
+    assert mpp.recurrence_text(r) == "every 3 days, 2026-01-01 to 2026-03-01"
+    r.kind, r.relative, r.day_number, r.month = "YEARLY", False, 4, 7
+    assert mpp.recurrence_text(r) == "every year on July 4, 2026-01-01 to 2026-03-01"
+    r.relative, r.days, r.day_number = True, {4}, 5
+    assert mpp.recurrence_text(r) == "the last Thursday of July every year, 2026-01-01 to 2026-03-01"
+    r.kind, r.relative, r.day_number, r.frequency = "MONTHLY", False, 15, 2
+    assert mpp.recurrence_text(r) == "day 15 of every 2 months, 2026-01-01 to 2026-03-01"
+    w = mpp_calendars.Week()
+    assert mpp.days_text(w, True) == ""
+    w.set_working(0, False)
+    w.set_type(3, "WORKING")
+    w.hours[3] = [(1800, 3630)]
+    assert mpp.days_text(w, True) == "Wed 00:30-01:00:30; Sun non-working"
+
+
+def test_calendars_share_the_character_budget():
+    """Calendar items are charged against the Budget's characters, past them the list stops (sheet_cut once);
+    calendars that could not be read are counted `record`."""
+    ctx = Context()
+    items = mpp._calendars(calendar_project(), ctx, sheet_grid.Budget(chars=100))
+    assert len(items) == 1 and ctx.skipped["sheet_cut"] == 1, items
+    assert "calendars cut at 100 characters" in ctx.warnings
+    p = project("T")
+    p.calendars = None
+    ctx = Context()
+    md = render(mpp.build(p, ctx), ctx)
+    assert "Calendars" not in md and ctx.skipped["record"] == 1 and "calendars could not be read" in ctx.warnings
 
 
 def test_duration_relation_resource_text():

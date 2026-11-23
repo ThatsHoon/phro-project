@@ -7,11 +7,12 @@ and of the parts of ProjectFile, TaskContainer, Task, Resource and RelationConta
 (the ID and unique ID maps, updateStructure, the WBS and outline numbers, predecessor de-duplication).
 
 `read` returns a Project; `mpp.build` turns it into the Doc. A task's baseline duration, start and finish are read
-(an empty one from its estimated baseline, as MPPReader's copyEstimatedBaselineFields does); Baselines 1-10, baseline
-cost and work, calendars, custom fields, views, time-phased data, recurring tasks and hyperlinks are not read; nor are enterprise columns or unique ID clashes (MPXJ renumbers
-clashing unique IDs at the end, which no output shows). A Project password set to read the file is `encrypted`; a
-read MPXJ fails with an exception (a value past the end of its block, a missing stream, a bad magic number, a task
-order it cannot fix) is `damaged`.
+(an empty one from its estimated baseline, as MPPReader's copyEstimatedBaselineFields does), and the calendars by
+`mpp_calendars` (calendars that cannot be read leave `calendars` None where MPXJ fails the file); Baselines 1-10,
+baseline cost and work, custom fields, views, time-phased data, recurring tasks and hyperlinks are not read; nor are
+enterprise columns or unique ID clashes (MPXJ renumbers clashing unique IDs at the end, which no output shows). A
+Project password set to read the file is `encrypted`; a read MPXJ fails with an exception (a value past the end of
+its block, a missing stream, a bad magic number, a task order it cannot fix) is `damaged`.
 """
 import re
 from datetime import datetime, timedelta
@@ -160,7 +161,7 @@ class Task:
 
 class Resource:
     def __init__(self):
-        self.f, self.kind, self.max_units = {}, "WORK", None
+        self.f, self.kind, self.max_units, self.calendar = {}, "WORK", None, None
 
     @property
     def uid(self):
@@ -193,6 +194,7 @@ class Project:
         self.title = self.start = self.finish = self.status = None
         self.duration_units, self.minutes_per_day, self.minutes_per_week, self.days_per_month = "DAYS", 0, 0, 0
         self.auto_wbs = self.baseline = False
+        self.calendars, self.default_calendar = [], None
 
     def add_task(self) -> Task:
         t = Task()
@@ -331,6 +333,7 @@ class _Reader:
         self.pp = B.props(self.coded("Props"))
         properties(self.p, self.pp, self.cf)
         self.subprojects()
+        self.calendars()
         self.resources()
         self.tasks()
         self.relations()
@@ -429,6 +432,14 @@ class _Reader:
             self.external.add(prev)
             self.sub[prev] = sp
 
+    def calendars(self):
+        """The calendars, or None in `p.calendars` when they cannot be read (MPXJ fails the whole file)."""
+        from . import mpp_calendars
+        try:
+            self.p.calendars, self.p.default_calendar, self.resource_calendars = mpp_calendars.read(self)
+        except (IndexError, KeyError, ValueError):
+            self.p.calendars, self.resource_calendars = None, {}
+
     def resources(self):
         v, p = self.v, self.p
         fm = FieldMap(v, "resource", self.pp, p)
@@ -468,6 +479,7 @@ class _Reader:
             p.populate(r, fm.read_all(uid, [data, fd2.item(k) if fd2 else None], vd), p.resource_uids)
             r.f["id"] = get_int(data, fm.offset("id") if v == 14 else 4)
             p.set_uid(r, uid, p.resource_uids)
+            r.calendar = self.resource_calendars.get(uid)
             r.max_units = max_units(r, now)
             m = meta.item(k)
             if v == 12:
@@ -770,7 +782,8 @@ def post_process(p: Project, order: dict, null_order: dict):
 def finish(p: Project):
     """MPPReader.read after the variant reader: updateStructure with outline numbers, then each task's summary flag,
     the relations a task's own summary has to it removed and an empty baseline field set from its estimated one
-    (copyEstimatedBaselineFields)."""
+    (copyEstimatedBaselineFields); then the derived calendars no resource uses are dropped and a resource calendar
+    with no name takes its resource's ("Unnamed Resource" for none)."""
     update_structure(p)
     for t in p.tasks:
         external_project = t.f.get("subproject_file") is not None and not t.f.get("external_task")
@@ -785,6 +798,12 @@ def finish(p: Project):
                     and r.pred.outline_number is not None
                     and t.outline_number.startswith(r.pred.outline_number + ".")]:
             p.remove_predecessor(t, rel)
+    if p.calendars:
+        used = {r.calendar.uid for r in p.resources if r.calendar is not None}
+        p.calendars = [c for c in p.calendars if c.parent is None or c.uid in used]
+        for r in p.resources:
+            if r.calendar is not None and not r.calendar.name:
+                r.calendar.name = r.f.get("name") or "Unnamed Resource"
     if p.start is None:
         p.start = min((d for t in p.tasks if (t.uid or 0) != 0 and (d := _task_start(t)) is not None), default=None)
     if p.finish is None:

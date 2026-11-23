@@ -1,16 +1,17 @@
 # Ported from MPXJ (https://www.mpxj.org), copyright (c) Packwood Software, under the GNU Lesser General Public
 # License 2.1 or later. This module is distributed under the same license: see https://www.gnu.org/licenses/lgpl-2.1.
 """Microsoft Project 98 (MPP8): a port of MPXJ's MPP8Reader with Props8, FixFix, FixDeferFix and ExtendedData,
-reading into mpp_read's Project. Under `   1`: the project Props, then the resources, tasks, relations and
-assignments, each a FixFix of fixed-size items whose strings and extended data sit in the FixDeferFix beside it.
+reading into mpp_read's Project. Under `   1`: the project Props, then the calendars, resources, tasks, relations
+and assignments, each a FixFix of fixed-size items whose strings and extended data sit in the FixDeferFix beside it.
 
 Every extended data value MPXJ reads is read here too, the custom fields included, so a value whose bytes do not fit
-fails the file as it fails MPXJ (mpp_read turns it into `damaged`). Calendars, views, tables, recurring task data and
-hyperlinks are not read.
+fails the file as it fails MPXJ (mpp_read turns it into `damaged`); calendars that cannot be read leave
+`calendars` None instead. Views, tables, recurring task data and hyperlinks are not read.
 """
 from datetime import datetime
 
 from . import mpp_blocks as B
+from . import mpp_calendars as C
 from .mpp_read import (END_NA, RELATION_TYPES, START_NA, Assignment, Project, Resource, get_byte, get_int,
                        get_long, get_short, max_units, properties)
 
@@ -144,19 +145,79 @@ class Extended:
 def read(cf) -> Project:
     """The Project of an MPP8 compound file."""
     p = Project()
-    properties(p, props8(cf.read(DIR + "Props")), cf)
-    resources(cf, p)
+    props = props8(cf.read(DIR + "Props"))
+    properties(p, props, cf)
+    try:
+        by_id = calendars(cf, p, props)
+    except (IndexError, KeyError, ValueError):
+        p.calendars, p.default_calendar, by_id = None, None, {}
+    resources(cf, p, by_id)
     tasks(cf, p)
     relations(cf, p)
     assignments(cf, p)
     return p
 
 
+def calendars(cf, p: Project, props: dict) -> dict:
+    """MPP8Reader.processCalendarData: each 36-byte item's ID, base ID, name and extended data, whose item 8 points to
+    the hours (7 days of 40 bytes after 4) and exceptions (44 bytes each after them); a calendar with none is a
+    default base or derived calendar. A derived calendar's parent is its base when that is found. Returns the
+    calendars by unique ID."""
+    d = "TBkndCal/"
+    fixed = fixfix(cf.read(DIR + d + "FixFix   0"), 36)
+    var = FixDeferFix(cf.read(DIR + d + "FixDeferFix   0"))
+    by_id, pending = {}, []
+    for data in fixed:
+        uid, base = get_int(data, 0), get_int(data, 4)
+        name = var.unicode(_offset(data, 20))
+        if uid < 0:
+            continue
+        off = -1 - (Extended(var, _offset(data, 32)).get("int", 8) or 0)
+        if off == -1:
+            cal = C.default_derived() if base > 0 else C.default_base()
+        else:
+            cal = C.Calendar()
+            _calendar8(var.bytes(off), cal, base)
+        if base > 0:
+            pending.append((cal, base))
+        else:
+            cal.name = name
+        cal.uid = uid
+        p.calendars.append(cal)
+        by_id[uid] = cal
+    for cal, base in pending:
+        if base in by_id:
+            cal.set_parent(by_id[base])
+    p.default_calendar = C.default_of(p.calendars, props)
+    return by_id
+
+
+def _calendar8(ext, cal, base: int):
+    for day in range(7):
+        at = 4 + 40 * day
+        if get_short(ext, at) == 1:
+            cal.set_working(day, C.DEFAULT_WEEK[day])
+            if cal.working(day):
+                cal.add_hours(day).extend(C.DEFAULT_HOURS)
+            elif base <= 0:
+                cal.add_hours(day)
+            continue
+        count = get_short(ext, at + 2)
+        hours = cal.add_hours(day)
+        cal.set_working(day, count != 0)
+        hours.extend(C.time_range(ext, at + 8 + 2 * k, at + 16 + 4 * k) for k in range(count))
+    for k in range(get_short(ext, 0)):
+        at = 4 + 40 * 7 + 44 * k
+        e = C.CalendarException(C.get_date(ext, at), C.get_date(ext, at + 2))
+        cal.exceptions.append(e)
+        e.ranges = [C.time_range(ext, at + 12 + 2 * i, at + 20 + 4 * i) for i in range(get_short(ext, at + 6))]
+
+
 def _var(cf, d: str) -> FixDeferFix:
     return FixDeferFix(cf.read(DIR + d + "FixDeferFix   0"))
 
 
-def resources(cf, p: Project):
+def resources(cf, p: Project, calendars: dict):
     d = "TBkndRsc/"
     var, now = None, datetime.now()
     for data in fixfix(cf.read(DIR + d + "FixFix   0"), RESOURCE_SIZE):
@@ -177,6 +238,7 @@ def resources(cf, p: Project):
         r.f["available_to"] = B.timestamp(data, 32) or END_NA
         r.f["max_units"] = get_int(data, 52) / 100
         r.max_units = max_units(r, now)
+        r.calendar = calendars.get(get_int(data, 24))
 
 
 def tasks(cf, p: Project):
