@@ -448,6 +448,8 @@ class _Reader:
     # ---- the walk
     def run(self) -> Doc:
         for step in vsd_stream.Tree(self.data, self.v, self.ctx).walk():
+            if self.ctx.late():
+                break
             if self.shape is not None and step.level <= self.shape.level:
                 self.flush()
             if step.kind == "enter":

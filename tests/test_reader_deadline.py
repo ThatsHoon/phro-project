@@ -188,17 +188,18 @@ def test_the_render_stops_inside_a_big_table():
 
 
 def cut_mid(label, path):
-    """The document at `path` holds ALPHA in its first part and OMEGA in its last: read with a clock that is over at
-    its n-th look, for every n, it gives its parts in order up to where the time ran out and says the rest was not
-    read; some n stops it between the two."""
+    """The document at `path` (or the Doc a function of the Context gives) holds ALPHA in its first part and OMEGA in
+    its last: read with a clock that is over at its n-th look, for every n, it gives its parts in order up to where
+    the time ran out and says the rest was not read; some n stops it between the two."""
+    read = path if callable(path) else lambda ctx: reader.parse(path, ctx)
     ctx = Context()
-    out = shown(reader.parse(path, ctx), ctx)
+    out = shown(read(ctx), ctx)
     assert "ALPHA" in out and "OMEGA" in out and REST not in out, (label, out)
     mids = []
     for n in range(1, 400):
         ctx = stopping(n)
         try:
-            out = shown(reader.parse(path, ctx), ctx)
+            out = shown(read(ctx), ctx)
         except ReadError as e:
             assert ctx.skipped["time"], (label, n, e)
             continue
@@ -251,12 +252,102 @@ def test_rtf_brace_count_stops_at_the_time_limit():
     assert ctx.skipped["time"] and len(seen) < 100, len(seen)
 
 
+def fewer_parts(label, path):
+    """Read with a clock that is over at its n-th look, the document at `path` gives fewer top-level parts than it
+    holds for some n (none, when the read fails for the time)."""
+    whole = len(reader.parse(path, Context()).blocks)
+    for n in range(1, 400):
+        ctx = stopping(n)
+        try:
+            got = len(reader.parse(path, ctx).blocks)
+        except ReadError:
+            got = 0
+        if not ctx.skipped["time"]:
+            break
+        if got < whole:
+            return
+    raise AssertionError(f"{label}: every part was read past the time limit")
+
+
+def at(name, data):
+    path = tmp() / name
+    path.write_bytes(data)
+    return path
+
+
 def test_decks_stop_at_the_time_limit():
+    import test_reader_ppt as pp
     cut_mid("pptx", sl.deck(words(lambda t: sl.sp(t, "title"))))
     cut_mid("odp", oo.odp("".join(oo.page(f"p{i}", oo.frame(t)) for i, t in enumerate(words(str)))))
     path = tmp() / "a.ppt"
     fx.make_ppt(path, [{"title": t, "body": []} for t in words(str)])
     cut_mid("ppt", path)
+    _, path, info = pp.build([{"title": t} for t in words(str)])
+    pp.rewrite(path, info, info["doc_stream"][:info["directories"][0]])  # no chain: the slides in stream order
+    cut_mid("ppt without its persist chain", path)
+
+
+def test_wordperfect_stops_at_the_time_limit():
+    import test_reader_wpd as wp
+    text = [t.encode() for t in words(str)]
+    cut_mid("wp6", at("a.wpd", wp._wp6(b"\xcc".join(text))))
+    cut_mid("wp5", at("a.wpd", wp._wp5(b"\x0a".join(text))))
+    cut_mid("wp4.2", at("a.wpd", b"\xc0\x00\x00\x00\x00\xc0" + b"\x0a".join(text)))
+
+
+def test_drawings_and_publications_stop_at_the_time_limit():
+    import test_reader_pub as pb
+    import test_reader_vsd as vs
+    pages = [{"name": f"P{i}", "shapes": [{"text": t}]} for i, t in enumerate(words(str))]
+    cut_mid("vsd", at("a.vsd", fx.cfb_bytes({"VisioDocument": vs.drawing(pages)})[0]))
+    seqs = [0x30 + k for k in range(5)]
+    cut_mid("pub", at("a.pub", fx.pub_file([pb.page(0x21 + k, [s]) for k, s in enumerate(seqs)],
+                                           [pb.shape(s, k + 1) for k, s in enumerate(seqs)],
+                                           list(enumerate(words(str), 1)))))
+
+
+def test_databases_stop_at_the_time_limit():
+    import jet_fix as jf
+    cut_mid("mdb", at("a.mdb", jf.jet_db(1, [jf.Tbl(t, [jf.Col("ID", jf.LONG)], [[1]]) for t in words(str)])))
+
+
+def test_iwork_stops_at_the_time_limit():
+    import iwork_fix as iw
+    import test_reader_iwork as ti
+    doc = iw.iwa_member(*iw.numbers_doc([(t, []) for t in words(str)]))
+    cut_mid("numbers", at("a.numbers", iw.iwork_zip({"Index/Document.iwa": doc})))
+    doc = iw.iwa_member(*iw.keynote_doc([{"title": t} for t in words(str)]))
+    fewer_parts("keynote", at("a.key", iw.iwork_zip({"Index/Document.iwa": doc})))
+    cut_mid("keynote '09", at("a.key", iw.keynote09("".join(iw.slide09(ti._p(t), n=i)
+                                                            for i, t in enumerate(words(str))))))
+    cut_mid("numbers '09", at("a.numbers", iw.numbers09("".join(ti._ws(t, ti._table09("T", [["x"]]))
+                                                               for t in words(str)))))
+
+
+def test_project_notes_and_calendars_stop_at_the_time_limit():
+    import test_reader_mpp as mp
+    from reader.formats import mpp, mpp_calendars
+    tasks = [mp.task(i, f"t{i}", notes=t) for i, t in enumerate(words(str), 1)]
+    cut_mid("mpp notes", lambda ctx: mpp.build(mp.project(tasks=tasks), ctx))
+    mids = []
+    for n in range(1, 400):  # the notes stop on their own, after every task is listed
+        ctx = stopping(n)
+        out = shown(mpp.build(mp.project(tasks=tasks), ctx), ctx)
+        if not ctx.skipped["time"]:
+            break
+        mids.append("t5" in out and "ALPHA" in out and "OMEGA" not in out)
+    assert True in mids, mids
+    p = mp.project(tasks=[mp.task(1, "t1")])
+    base = mpp_calendars.default_base()
+    base.uid = 1
+    p.calendars, p.default_calendar = [base], base
+    for i, t in enumerate(words(str), 2):
+        cal = mpp_calendars.default_derived()
+        cal.uid, cal.name = i, t
+        cal.set_parent(base)
+        cal.set_working(5, False)
+        p.calendars.append(cal)
+    cut_mid("mpp calendars", lambda ctx: mpp.build(p, ctx))
 
 
 def test_other_workbooks_stop_at_the_time_limit():
