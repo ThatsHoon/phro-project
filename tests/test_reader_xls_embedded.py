@@ -54,7 +54,7 @@ def test_excel_sheet_object():
     out, ctx = blocks_of(object_streams(excel_object([GRID], b"Excel.Sheet.8")))
     assert len(out) == 1 and isinstance(out[0], Table), out
     text = markdown.render(Doc(blocks=out), tmp() / "a", False, {})
-    assert text == "1|2\n-|-\n3|4\n", text
+    assert text == "Embedded sheet S\n1|2\n-|-\n3|4\n", text
     assert not ctx.skipped, ctx.skipped
 
 
@@ -234,7 +234,7 @@ def test_hwp_embedded_sheet():
     item = hchart.envelope(object_streams(excel_object([GRID], b"Excel.Sheet.8")))
     path = hchart.doc(hchart.ole_shape(1), streams={"BIN0001.OLE": hchart.deflate(item)})
     out, ctx = hchart.read(path)
-    assert out == "앞\n\n1|2\n-|-\n3|4\n\n뒤\n", out
+    assert out == "앞\n\nEmbedded sheet S\n1|2\n-|-\n3|4\n\n뒤\n", out
     assert not ctx.skipped, ctx.skipped
 
 
@@ -245,11 +245,11 @@ def test_one_cell_sheet_placed():
     p = dobj.embed_doc({1: one}, preview=dobj.PNG_PREVIEW)
     d, ctx = dobj.parse(p)
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
-    assert out == "only cell\n", (out, ctx.skipped)
+    assert out == "Embedded sheet S\n\nonly cell\n", (out, ctx.skipped)
     assert not ctx.skipped, ctx.skipped
     path = hchart.doc(hchart.ole_shape(1), streams={"BIN0001.OLE": hchart.deflate(hchart.envelope(one))})
     out, ctx = hchart.read(path)
-    assert out == "앞\n\nonly cell\n\n뒤\n" and not ctx.skipped, (out, ctx.skipped)
+    assert out == "앞\n\nEmbedded sheet S\n\nonly cell\n\n뒤\n" and not ctx.skipped, (out, ctx.skipped)
 
 
 G1 = {"name": "S", "cells": {(0, 0): 1, (0, 1): 2, (1, 0): 3, (1, 1): 4}}
@@ -280,7 +280,7 @@ def test_doc_objects_share_one_sheet_budget():
     finally:
         limits.SHEET_CELLS = old
     out = markdown.render(d, tmp() / "assets", False, ctx.skipped)
-    assert out == ("(could not read: 1 chart, 1 sheet cut short)\n\naa\n\n1|2\n-|-\n3|4\n\n"
+    assert out == ("(could not read: 1 chart, 1 sheet cut short)\n\naa\n\nEmbedded sheet S\n1|2\n-|-\n3|4\n\n"
                    "![](assets/img-001.png)\n"), out
     assert "5|" not in out and ctx.skipped["chart"] == 1, ctx.skipped
 

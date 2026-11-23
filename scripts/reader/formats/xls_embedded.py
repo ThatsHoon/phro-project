@@ -20,10 +20,9 @@ Graph stream that does not parse, or a chart that gives no table is counted unde
 import re
 import struct
 
-from .. import limits
+from .. import embedded, limits
 from ..containers.cfb import CfbError
 from ..limits import ReadError
-from ..model import Cell, Para, Table
 from . import biff, biff_chart, sheet_grid, xls
 
 _BOOKS = ("Workbook", "Book")
@@ -95,9 +94,7 @@ def _read(cf, name, ctx, budget):
         return [tbl] if tbl is not None else None
     if ref.kind != xls._WORKSHEET:
         return None
-    # a lone cell comes from the grid as a Para: it is kept as a 1x1 Table, which the placement code counts and places
-    return [b if isinstance(b, Table) else Table([[Cell([b])]])
-            for b in wb.sheet_blocks(wb.g.active) if isinstance(b, (Table, Para))]
+    return embedded.sheet_tables(wb.sheet_blocks(wb.g.active), ref.name)
 
 
 class _OwnCells:

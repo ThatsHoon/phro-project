@@ -9,7 +9,8 @@ from them is a stream that cannot be read). What comes back is what the object s
   * ("table", [Table, ...], frozenset()): a `Workbook` or `Book` stream through xls_embedded.blocks (the active
     sheet, a chart, an MS Graph datasheet); an OOXML workbook's active sheet; an OpenDocument chart package (one
     Table under its chart caption) or spreadsheet package (its first sheet). Only tables are kept, a lone cell or
-    line as a 1x1 Table, so a caller counts and places them one way;
+    line as a 1x1 Table, so a caller counts and places them one way; a sheet's are captioned as its own
+    (`sheet_tables`);
   * ("chart", [], frozenset()): a workbook or MS Graph object that gave no table. Its reads leave no count and no
     warning behind: the caller counts the chart where it shows the preview;
   * ("bad", "", frozenset()): an equation that cannot be read or does not convert;
@@ -273,6 +274,16 @@ def _tables(blocks) -> list:
     return [b if isinstance(b, Table) else Table([[Cell([b])]]) for b in blocks if isinstance(b, (Table, Para))]
 
 
+def sheet_tables(blocks, sheet: str) -> list:
+    """The tables of embedded sheet `sheet`'s blocks (`_tables`), each captioned "Embedded sheet <sheet>", its own
+    caption (the range) after a colon: the addresses are the embedded workbook's, not the host's."""
+    out = _tables(blocks)
+    for t in out:
+        head = "Embedded sheet" + (f" {sheet}" if sheet else "")
+        t.caption = f"{head}: {t.caption}" if t.caption else head
+    return out
+
+
 def _package(data, ctx):
     from .formats import zip_route
     kind = zip_route.route(data)
@@ -283,11 +294,10 @@ def _package(data, ctx):
     return None
 
 
-def _shown(blocks, own, ctx, notes=None):
-    """The tables of `blocks`, with what reading them counted in `own`; the `notes` they mark go to the document
+def _shown(out, own, ctx, notes=None):
+    """The tables `out`, with what reading them counted in `own`; the `notes` they mark go to the document
     (`ctx.notes`), each under a key of its own. With no table, a chart, or UNREAD when the read counted something
     it left out."""
-    out = _tables(blocks)
     if not out:
         return UNREAD if own.skipped else CHART
     ctx.skipped.update(own.skipped)
@@ -323,11 +333,11 @@ def _odf(data, ctx):
                 return "equation", got[0].tex, _NONE
             if local(root.tag) == "math":
                 return BAD
-            return _shown(got, own, ctx)
+            return _shown(_tables(got), own, ctx)
         if any(local(c.tag) == "spreadsheet" for c in inner):
             doc = odf_sheets.sheets(pkg, own, root, None, first=True)
             sec = next((b for b in doc.blocks if isinstance(b, Section) and not b.hidden), None)
-            return _shown(sec.blocks if sec is not None else [], own, ctx, doc.notes)
+            return _shown(sheet_tables(sec.blocks, sec.title) if sec is not None else [], own, ctx, doc.notes)
     return None
 
 
@@ -339,5 +349,5 @@ def _workbook(data, ctx):
         if ooxml_base.local(root.tag) != "workbook":
             return None
         own = of(ctx).inner()
-        blocks, notes = ooxml_sheets.active_sheet(pkg, part, own)
-        return _shown(blocks, own, ctx, notes)
+        sec, notes = ooxml_sheets.active_sheet(pkg, part, own)
+        return _shown(sheet_tables(sec.blocks, sec.title) if sec is not None else [], own, ctx, notes)

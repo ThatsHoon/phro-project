@@ -382,12 +382,25 @@ def test_a_parser_error_costs_only_the_object():
         embedded._package = saved
 
 
+def test_embedded_sheet_tables_say_so():
+    """An embedded workbook's tables are captioned as its sheet's, so their addresses do not read as the host's: an
+    OOXML workbook's active sheet, an OpenDocument spreadsheet's first and a BIFF workbook's active one."""
+    got, ctx = read(workbook())
+    assert [t.caption for t in got[1]] == ["Embedded sheet Data: A1:B2"], got
+    import test_reader_ods_odp as ods
+    rows = "".join(f"<table:table-row>{odt.cell(a)}{odt.cell(b)}</table:table-row>" for a, b in (("x", "y"), ("1", "2")))
+    got, ctx = read(Path(ods.ods(f'<table:table table:name="T">{rows}</table:table>')).read_bytes())
+    assert [t.caption for t in got[1]] == ["Embedded sheet T: A1:B2"], got
+    got, ctx = read(excel_object([{"name": "S", "cells": {(0, 0): 1, (0, 1): 2}}]))
+    assert [t.caption.split(":")[0] for t in got[1]] == ["Embedded sheet S"], got
+
+
 def test_chart_package_in_a_doc():
     p = in_doc.embed_doc({1: {"package_stream": chart_package()}}, preview=in_doc.PNG_PREVIEW)
     out = in_doc.md(p)
     assert out == "Chart: column — 매출\n연도|값\n-|-\n2025|3\n", out
     p = in_doc.embed_doc({1: {"Package": workbook()}}, preview=in_doc.PNG_PREVIEW)
-    assert in_doc.md(p) == "A1:B2\nItem|Qty\n-|-\nPen|3\n", in_doc.md(p)
+    assert in_doc.md(p) == "Embedded sheet Data: A1:B2\nItem|Qty\n-|-\nPen|3\n", in_doc.md(p)
 
 
 def test_chart_package_in_a_ppt():
@@ -418,7 +431,7 @@ def test_xlsx_inside_a_docx():
     p = docx([("rO", PKG_REL, "embeddings/book.xlsx", False)], {"word/embeddings/book.xlsx": workbook()})
     doc, ctx = in_docm.parse(p)
     out = in_docm.md(p)
-    assert out == "beforeafter\n\nA1:B2\nItem|Qty\n-|-\nPen|3\n" and not ctx.skipped, (out, ctx.skipped)
+    assert out == "beforeafter\n\nEmbedded sheet Data: A1:B2\nItem|Qty\n-|-\nPen|3\n" and not ctx.skipped, (out, ctx.skipped)
     blob, _ = cfb_bytes({"Equation Native": eq_native(in_ppt.X)})
     p = docx([("rO", OLE_REL, "embeddings/eq.bin", False)], {"word/embeddings/eq.bin": blob})
     assert in_docm.md(p) == "before$x$after\n", in_docm.md(p)
@@ -457,7 +470,7 @@ def test_ole_object_workbook_on_a_slide():
                        extra={"ppt/embeddings/book.xlsx": workbook(), "ppt/media/p.png": in_docm.PNG})
     doc, ctx = in_slides.parse(p)
     out = in_slides.md(p)
-    assert out == "## Slide 1: Title\n\nA1:B2\nItem|Qty\n-|-\nPen|3\n" and not ctx.skipped, (out, ctx.skipped)
+    assert out == "## Slide 1: Title\n\nEmbedded sheet Data: A1:B2\nItem|Qty\n-|-\nPen|3\n" and not ctx.skipped, (out, ctx.skipped)
     blob, _ = cfb_bytes({"CONTENTS": b"%PDF-1.4"})
     p = in_slides.deck([ole_frame("rO", "rP")],
                        srels={1: [("rO", OLE_REL, "../embeddings/o.bin"), ("rP", "image", "../media/p.png")]},
@@ -509,7 +522,7 @@ def test_rtf_object_equation_stands_in_the_line():
 def test_rtf_object_workbook_follows_its_paragraph():
     blob, _ = cfb_bytes({"Package": workbook()})
     got = in_rtf.md(b"{\\rtf1 a " + rtf_object(ole1(blob, b"Excel.Sheet.12")) + b" b\\par c\\par}")
-    assert got == "a  b\n\nA1:B2\nItem|Qty\n-|-\nPen|3\n\nc\n", repr(got)
+    assert got == "a  b\n\nEmbedded sheet Data: A1:B2\nItem|Qty\n-|-\nPen|3\n\nc\n", repr(got)
 
 
 def test_rtf_object_that_is_not_read_keeps_its_result():

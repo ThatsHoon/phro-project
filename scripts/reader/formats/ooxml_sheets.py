@@ -1110,19 +1110,19 @@ def _book_facts(pkg, wb, budget, ctx) -> list:
 
 
 def active_sheet(pkg, part, ctx) -> tuple:
-    """The blocks of the workbook's active sheet, of its first shown sheet when that one is hidden or not in the
-    list, and its notes: what an embedded workbook shows, the only sheet of it that is read. ([], {}) when it is
+    """The Section of the workbook's active sheet, of its first shown sheet when that one is hidden or not in the
+    list, and its notes: what an embedded workbook shows, the only sheet of it that is read. (None, {}) when it is
     not read."""
     wb = read_workbook(pkg, part, ctx)
     at = wb.at.get(wb.active)
     pick = wb.sheets[at] if at is not None and wb.sheets[at][2] not in _HIDDEN else \
         next((s for s in wb.sheets if s[2] not in _HIDDEN), None)
     if pick is None:
-        return [], {}
+        return None, {}
     wb.sheets = [pick]
     sheets = _Sheets(pkg, wb, ctx)
     secs = sheets.sections()
-    return (secs[0].blocks if secs else []), sheets.notes
+    return (secs[0] if secs else None), sheets.notes
 
 
 def parse_sheets(pkg, part, ctx) -> Doc:
