@@ -173,7 +173,8 @@ class Context:
     """Passed to every parse(): collects warnings and isolates per-part failures.
 
     `vba` holds (name, kind, source) of the VBA modules read (containers.vba), `vba_modules` how many modules were
-    opened (VBA_MODULES) and `vba_bytes` the bytes decompressed for them (VBA_BYTES). `embedded` is the document's
+    opened (VBA_MODULES) and `vba_bytes` the bytes decompressed for them (VBA_BYTES). `scripts` holds (name, kind,
+    source) of the Hancom document scripts read (hancom.scripts). `embedded` is the document's
     embedded.Objects, made by embedded.of. `notes` holds the notes of embedded workbooks, key -> blocks, which
     reader.parse adds to Doc.notes. `stop` is the `clock()` time the read may run to (reader.convert sets it), None
     for no limit."""
@@ -187,6 +188,7 @@ class Context:
         self.vba: list = []
         self.vba_modules = 0
         self.vba_bytes = 0
+        self.scripts: list = []
         self.embedded = None
         self.notes: dict = {}
 

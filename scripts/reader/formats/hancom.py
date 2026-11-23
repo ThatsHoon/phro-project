@@ -1,6 +1,6 @@
 """Helpers shared by the Hancom parsers (hwpx and hwp): equation scripts, numbering markers, the cell grid, the
 inline model and paragraph rules both readers build paragraphs with, and the drawing objects (`Obj`) a section's
-diagrams are written from (`diagrams`)."""
+diagrams are written from (`diagrams`), and the document scripts (`scripts`)."""
 import re
 import unicodedata
 from bisect import bisect_left
@@ -895,3 +895,28 @@ def _section(ctx, budget, tops) -> tuple:
         spans.append((start, len(slots)))
     parts = _write(ctx, budget, regs, slots)
     return {id(t): [b for p in parts[a:b] for b in p] for t, (a, b) in zip(tops, spans)}, parts[-1]
+
+
+SCRIPT_PARTS = ("header", "source", "pre-source", "post-source")
+# what Hancom writes into a new document, whitespace runs as one space: a part that is only this was not written
+_SCRIPT_NEW = {"header": "var Documents = XHwpDocuments; var Document = Documents.Active_XHwpDocument;",
+               "source": "function OnDocument_New() { //todo : }"}
+
+
+def scripts(texts) -> list:
+    """(name, kind, source) of a document's JScript parts, `texts` in SCRIPT_PARTS order (hwp's DefaultJScript holds
+    all four, hwpx the first two). A blank part, or one that is what a new document holds, is left out; a BOM is
+    dropped, line ends become LF and blank lines before and after the text go."""
+    out = []
+    for name, text in zip(SCRIPT_PARTS, texts):
+        text = text.removeprefix("\ufeff")
+        flat = " ".join(text.split())
+        if not flat or flat == _SCRIPT_NEW.get(name):
+            continue
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        while not lines[0].strip():
+            lines.pop(0)
+        while not lines[-1].strip():
+            lines.pop()
+        out.append((name, f"JScript {name}", "\n".join(lines)))
+    return out

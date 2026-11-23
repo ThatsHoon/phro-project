@@ -19,7 +19,7 @@ from ..limits import ReadError
 from ..model import Bold, Break, Cell, Doc, Image, NoteRef, Para, Table, Text
 from .hancom import (
     Frame, Obj, Scopes, State, alt_text, button, cut_command, diagrams, flat, heading_level, lone_equations,
-    next_marker, outline_marker, paragraph, place, plain, style_name_level,
+    next_marker, outline_marker, paragraph, place, plain, scripts, style_name_level,
 )
 from .hwp_chart import Items
 from .word_fields import comment_note
@@ -265,6 +265,17 @@ class _Reader(Scopes):
                 good += 1
         if not good:
             raise ReadError("damaged", "no readable section")
+        texts = []
+        for key in ("headersc", "sourcesc"):
+            href = self.images.get(key)
+            name = self.find(href)
+            data = None
+            if name is not None and self.pkg.size(name) <= limits.SCRIPT_BYTES:
+                data = self.part_bytes(href, "script")
+            elif href is not None:
+                self.ctx.skipped["script"] += 1
+            texts.append("" if data is None else data.decode("utf-16-le", "replace"))
+        self.ctx.scripts += scripts(texts)
         return self.doc
 
     # ---- blocks

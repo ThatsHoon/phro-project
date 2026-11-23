@@ -31,13 +31,13 @@ from ..model import Bold, Break, Cell, Doc, Image, NoteRef, Table, Text
 from . import hwpx
 from .hancom import (
     Frame, Obj, Scopes, State, alt_text, button, cut_command, diagrams, flat, heading_level, lone_equations,
-    next_marker, outline_marker, paragraph, place, plain, props, style_name_level,
+    next_marker, outline_marker, paragraph, place, plain, props, scripts, style_name_level,
 )
 from .hwp_chart import Items
 from .hwp_records import (
     CTRL_HEADER, EQEDIT, FORM_OBJECT, LIST_HEADER, MEMO_LIST, PARA_CHAR_SHAPE, PARA_HEADER, PARA_RANGE_TAG, PARA_TEXT,
-    SHAPE_COMPONENT, SHAPE_LINE, SHAPE_OLE, SHAPE_PICTURE, TABLE, TEXTART, DocInfo, ParaShape, doc_info, file_header,
-    first_tag, records, view_text,
+    SHAPE_COMPONENT, SHAPE_LINE, SHAPE_OLE, SHAPE_PICTURE, TABLE, TEXTART, DocInfo, ParaShape, distributed, doc_info,
+    file_header, first_tag, records, view_text,
 )
 from .word_fields import comment_note
 
@@ -46,6 +46,7 @@ _V3 = b"HWP Document File V3"
 _DRM = (b"SCDSA", b"\x9b DRMONE")  # SoftCamp and Fasoo DRM containers (rhwp parser/mod.rs)
 _SECTION = re.compile(r"(bodytext|viewtext)/section(\d+)", re.I)
 _SECTIONS = 1000
+_DIST_HEAD = struct.pack("<I", 256 << 20 | 28)  # DISTRIBUTE_DOC_DATA's record header: tag 28, 256 bytes
 _DELETE = 0x11  # the PARA_RANGE_TAG kind (top byte of its tag) of a tracked deletion; 0x10, an insertion, stays
 # control characters: one unit (char class) unless listed here; these take eight units
 _EXTENDED = frozenset((1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23))  # the k-th one owns the k-th CTRL_HEADER
@@ -354,6 +355,39 @@ class _Reader(Scopes):
             return self.load(name, records), False
         return records(data, self.ctx), True
 
+    def read_scripts(self):
+        """The document's JScript (pyhwp; hwp 5.0 spec, Scripts storage): Scripts/DefaultJScript, encrypted as ViewText
+        when it opens with DISTRIBUTE_DOC_DATA (a distribution document, or one saved again from it with FileHeader's
+        flag cleared) and then raw deflate when the document is compressed (its CRC-32 and length after), holds
+        parts of an i32 count of UTF-16 units and the text, ended by -1 or the stream's end; hancom.scripts names
+        the first four. A stream over SCRIPT_BYTES, stored or inflated, or broken is named under
+        script; so is a cut one, or one with a part cut short, whose parts before the cut are read."""
+        cut = False
+        try:
+            data = self.cf.read("Scripts/DefaultJScript")
+            if len(data) > limits.SCRIPT_BYTES:
+                raise ReadError("too_large", f"{limits.BIG_PART}: script stream over {limits.SCRIPT_BYTES} bytes")
+            if data[:4] == _DIST_HEAD:
+                data = distributed(data)
+            if self.head.compressed:
+                data = flate.inflate(data, self.budget, limits.SCRIPT_BYTES)
+        except KeyError:
+            return
+        except ReadError as e:
+            if e.kind not in ("damaged", "too_large"):
+                raise
+            self.ctx.skipped["script"] = 1
+            return
+        except flate.Truncated as e:
+            data, cut = e.data, True
+        except ValueError:  # a broken chain, not a distribution stream, not deflate
+            self.ctx.skipped["script"] = 1
+            return
+        texts, short = _script_parts(data)
+        if cut or short:
+            self.ctx.skipped["script"] = 1
+        self.ctx.scripts += scripts(texts)
+
     def run(self):
         try:
             self.head = h = file_header(self.cf)
@@ -393,6 +427,7 @@ class _Reader(Scopes):
                 good += 1
         if not good:
             raise ReadError("damaged", "no readable section")
+        self.read_scripts()
         for waiting in self.memos.values():
             for nid, author in waiting:
                 self.doc.notes[nid] = comment_note([], author)
@@ -916,6 +951,21 @@ class _Reader(Scopes):
                 else:
                     st.extras.extend(blocks)
         return self.end(recs, j)
+
+
+def _script_parts(data) -> tuple:
+    """The texts of DefaultJScript's first four parts read whole, and whether a part was cut short."""
+    texts, pos = [], 0
+    while len(texts) < 4 and pos < len(data):
+        n = int.from_bytes(data[pos:pos + 4], "little", signed=True)
+        end = pos + 4 + 2 * n
+        if pos + 4 > len(data) or n < -1 or end > len(data):
+            return texts, True
+        if n == -1:
+            break
+        texts.append(data[pos + 4:end].decode("utf-16-le", "replace"))
+        pos = end
+    return texts, False
 
 
 def parse(path, ctx) -> Doc:

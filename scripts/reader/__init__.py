@@ -47,6 +47,8 @@ def parse(path, ctx, **opts):
         doc = mod.parse(path, ctx, **opts) if opts else mod.parse(path, ctx)
     if ctx.vba:
         doc.meta["vba"] = ctx.vba
+    if ctx.scripts:
+        doc.meta["scripts"] = ctx.scripts
     doc.notes.update(ctx.notes)
     return doc
 
@@ -146,6 +148,8 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
         meta["read_budget"] = round(ctx.stop - STARTED)  # seconds from the process start the read was given
     if doc.meta.get("vba"):
         meta["vba"] = len(doc.meta["vba"])  # VBA modules whose source is under assets/vba/
+    if doc.meta.get("scripts"):
+        meta["scripts"] = len(doc.meta["scripts"])  # Hancom scripts whose source is under assets/scripts/
     if doc.meta and "engine" in doc.meta:
         meta.update(engine=doc.meta["engine"], pages_total=doc.meta.get("pages_total"),
                     unrendered=doc.meta.get("unrendered"), figures=doc.meta.get("figures"), pages=st["pages"])

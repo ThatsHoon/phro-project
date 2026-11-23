@@ -110,17 +110,35 @@ def first_tag(data: bytes) -> int:
 
 
 def view_text(data: bytes, compressed: bool, budget: flate.Budget) -> bytes:
-    """A distribution document's ViewText/Section<N> stream as its plain record stream (dochan hwp/distdoc.py).
+    """A distribution document's ViewText/Section<N> stream as its plain record stream: `distributed` decrypts it,
+    then it is inflated with `budget` when `compressed`.
+
+    Raises ValueError when the result does not start with a PARA_HEADER (a wrong key or damaged ciphertext decrypts
+    to garbage). A cut deflate stream that does start with one raises flate.Truncated with what inflated, as inflate
+    does.
+    """
+    out = distributed(data)
+    if compressed:
+        try:
+            out = flate.inflate(out, budget)
+        except flate.Truncated as e:
+            if first_tag(e.data) != PARA_HEADER:
+                raise ValueError("distribution section does not start with a paragraph") from None
+            raise
+    if first_tag(out) != PARA_HEADER:
+        raise ValueError("distribution section does not start with a paragraph")
+    return out
+
+
+def distributed(data: bytes) -> bytes:
+    """A distribution document's encrypted stream (ViewText/Section<N>, Scripts/DefaultJScript) decrypted, as it
+    is stored in a document that is not one (dochan hwp/distdoc.py).
 
     The stream opens with DISTRIBUTE_DOC_DATA (tag 28, 256 bytes). Its bytes 0-3 are a u32 LE seed for the MSVC
     rand stream, which is XORed over the payload run by run from byte 0 (key = rand() & 0xFF, n = (rand() & 0xF) +
     1, then the next n bytes); the seed's own four bytes stay as they are, as rhwp decodes them. The AES-128 key is
     the 16 decoded bytes at 4 + (decoded[0] & 0xF). Everything after the record is AES-128-ECB ciphertext in whole
-    blocks, decrypted a megabyte at a time and inflated with `budget` when `compressed`.
-
-    Raises ValueError for any other layout, or when the result does not start with a PARA_HEADER (a wrong key or
-    damaged ciphertext decrypts to garbage). A cut deflate stream that does start with one raises flate.Truncated
-    with what inflated, as inflate does.
+    blocks, decrypted a megabyte at a time. Raises ValueError for any other layout.
     """
     if len(data) < 4:
         raise ValueError("no DISTRIBUTE_DOC_DATA record")
@@ -144,18 +162,8 @@ def view_text(data: bytes, compressed: bool, budget: flate.Budget) -> bytes:
     body = memoryview(data)[start + _DIST_DATA:]
     if not body or len(body) % 16:
         raise ValueError("distribution ciphertext is not whole AES blocks")
-    out = b"".join([crypto.aes128_ecb_decrypt(key, bytes(body[i:i + _AES_CHUNK]))
-                    for i in range(0, len(body), _AES_CHUNK)])
-    if compressed:
-        try:
-            out = flate.inflate(out, budget)
-        except flate.Truncated as e:
-            if first_tag(e.data) != PARA_HEADER:
-                raise ValueError("distribution section does not start with a paragraph") from None
-            raise
-    if first_tag(out) != PARA_HEADER:
-        raise ValueError("distribution section does not start with a paragraph")
-    return out
+    return b"".join([crypto.aes128_ecb_decrypt(key, bytes(body[i:i + _AES_CHUNK]))
+                     for i in range(0, len(body), _AES_CHUNK)])
 
 
 @dataclass

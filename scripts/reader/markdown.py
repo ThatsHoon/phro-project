@@ -95,7 +95,7 @@ LOST = (
     (("vba_module",), "VBA module", "VBA modules"),
 )
 # Named items: reported after the counted ones, by name only (a flag, not a count).
-NAMED = (("vba", "VBA macros"), ("xfa", "XFA form"), ("attachment", "attached files"),
+NAMED = (("vba", "VBA macros"), ("script", "Hancom scripts"), ("xfa", "XFA form"), ("attachment", "attached files"),
          ("kf8_fallback", "KF8 layout (the MOBI 6 copy was read)"), ("plain_text", "book markup (read as plain text)"),
          ("page_images", "page images (text layer only)"), ("linked_data", "linked tables' data (in other files)"),
          ("toc", "table of contents (its headings, or the rest of them, are not marked)"),
@@ -126,7 +126,7 @@ def unread(skipped) -> list:
 # ---- OCR: the status lines (decision 7) and the pictures read (decision 1)
 
 _RESERVED = re.compile(r"(?i)con|prn|aux|nul|(com|lpt)[\d\u00b9\u00b2\u00b3]")
-VBA_NAMED = 20
+SOURCES_NAMED = 20
 TABLE_LOOK = 256  # rows of a table written between two looks at the render's stop
 NO_OCR = {"pages": 0, "doubtful": 0, "failed": 0, "stopped_at": None}  # a parser's doc.meta["ocr"] counts
 KOREAN_HINT = ('(Korean OCR is not installed in Windows: Settings > Time & language > Language > add Korean with '
@@ -1165,8 +1165,8 @@ class _Render:
                     kept.append(it)
             if kept:
                 hf.append(f"{label}: " + " | ".join(kept))
-        mods = self.doc.meta.get("vba")
-        self.empty = not text and not hf and not self.unviewable and not mods
+        mods, codes = self.doc.meta.get("vba"), self.doc.meta.get("scripts")
+        self.empty = not text and not hf and not self.unviewable and not mods and not codes
         title = one_line(self.doc.title)
         if title:
             first = pieces[0][1].replace(self.head_mark, "") if pieces else ""
@@ -1194,7 +1194,9 @@ class _Render:
         if props:
             status.append("Properties: " + "; ".join(f"{k}: {v}" for k, v in props))
         if mods:
-            status.append(self._vba(mods))
+            status.append(self._sources(mods, "vba", "bas", "module", "VBA modules"))
+        if codes:
+            status.append(self._sources(codes, "scripts", "js", "script", "Hancom scripts"))
         if hf:
             status.append("\n".join(hf))
         top = status + top
@@ -1203,17 +1205,17 @@ class _Render:
             return "\n\n".join(top + ([text] if text else []) + [tail])
         return "\n\n".join(top + ([text] if text else []))
 
-    def _vba(self, mods) -> str:
-        """The line naming the VBA modules, their source written to <assets>/vba/<module>.bas. A file name keeps
-        the module name's letters, digits, `_` and `-` (64 at most, anything else `_`); a name Windows reserves
-        for a device gets a leading `_`, and a name already taken, whatever its case, a number. A module whose
-        file is not named as it is has its own name, quoted, beside the file's. The line names VBA_NAMED modules and
-        counts the rest; every module's file is written."""
-        folder = self.assets_dir / "vba"
-        folder.mkdir(parents=True, exist_ok=True)
-        taken, items = set(), []
-        for name, kind, source in mods:
-            stem = re.sub(r"[^\w-]", "_", name)[:64] or "module"
+    def _sources(self, items, folder, ext, blank, what) -> str:
+        """The line naming a document's macro or script sources, (name, kind, source) each, their source written to
+        <assets>/<folder>/<name>.<ext>. A file name keeps the name's letters, digits, `_` and `-` (64 at most,
+        anything else `_`; `blank` for none); a name Windows reserves for a device gets a leading `_`, and a name
+        already taken, whatever its case, a number. A source whose file is not named as it is has its own name,
+        quoted, beside the file's. The line names SOURCES_NAMED sources and counts the rest; every file is written."""
+        path = self.assets_dir / folder
+        path.mkdir(parents=True, exist_ok=True)
+        taken, named = set(), []
+        for name, kind, source in items:
+            stem = re.sub(r"[^\w-]", "_", name)[:64] or blank
             if _RESERVED.fullmatch(stem):
                 stem = "_" + stem
             base, n = stem, 1
@@ -1221,15 +1223,15 @@ class _Render:
                 n += 1
                 stem = f"{base}-{n}"
             taken.add(stem.lower())
-            (folder / f"{stem}.bas").write_text(source + "\n", encoding="utf-8", newline="\n")
+            (path / f"{stem}.{ext}").write_text(source + "\n", encoding="utf-8", newline="\n")
             lines = source.count("\n") + 1
             shown = one_line(name)[:64]
             own = "" if stem == name or not shown else json.dumps(shown, ensure_ascii=False) + ", "
-            items.append(f"{stem}.bas ({own}{kind}, {lines} line{'s' if lines != 1 else ''})")
-        more = len(items) - VBA_NAMED
+            named.append(f"{stem}.{ext} ({own}{kind}, {lines} line{'s' if lines != 1 else ''})")
+        more = len(named) - SOURCES_NAMED
         if more > 0:
-            items[VBA_NAMED:] = [f"and {more} more"]
-        return f"VBA modules (source in {self.assets_dir.name}/vba/): " + "; ".join(items)
+            named[SOURCES_NAMED:] = [f"and {more} more"]
+        return f"{what} (source in {self.assets_dir.name}/{folder}/): " + "; ".join(named)
 
     def _note_defs(self) -> str:
         notes = self.doc.notes
