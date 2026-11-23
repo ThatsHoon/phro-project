@@ -1,7 +1,9 @@
 """Content-hash cache: entries live at <root>/<sha1[:2]>/<sha1>/ (out.md, assets/, meta.json)."""
 import hashlib
 import itertools
+import math
 import os
+import re
 import shutil
 import stat
 import sys
@@ -11,8 +13,14 @@ import time
 from pathlib import Path
 
 from . import VERSION, convert
-from .limits import FIGURES_LATE, OCR_LATE, READ_BYTES, READ_LATE, READ_TOKEN_BYTES, READ_TOKENS
+from .limits import (CJK_TOKENS, DIGITS_TOKENS, FIGURES_LATE, HANGUL_TOKENS, LETTER_RUN_TOKENS, LETTER_TOKENS,
+                     OCR_LATE, READ_BYTES, READ_LATE, READ_TOKENS, SPACE_RUN_TOKENS)
 
+_LETTERS = re.compile(r"[A-Za-z]+")
+_DIGITS = re.compile(r"[0-9]+")
+_SPACES = re.compile(r" +")
+_HANGUL = re.compile(r"[㄰-㆏가-힣]")
+_CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿]")
 _counter = itertools.count()
 _lock = threading.Lock()
 _code = None
@@ -337,6 +345,26 @@ class OcrResults:
                 pass
 
 
+def line_tokens(text: str) -> list:
+    """Read's tokens for each line of text as Read numbers them, by the estimate in limits, and never fewer than
+    the line's UTF-8 bytes, its newline counted, times READ_TOKENS / READ_BYTES."""
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    out = []
+    for s in lines:
+        size = len(s.encode("utf-8")) + 1
+        ascii_ = len(s.encode("ascii", "ignore"))
+        letters, digits, spaces = _LETTERS.findall(s), _DIGITS.findall(s), _SPACES.findall(s)
+        hangul, cjk = len(_HANGUL.findall(s)), len(_CJK.findall(s))
+        lc, dc = sum(map(len, letters)), sum(map(len, digits))
+        est = (LETTER_RUN_TOKENS * len(letters) + LETTER_TOKENS * lc + SPACE_RUN_TOKENS * len(spaces)
+               + DIGITS_TOKENS * sum((len(d) + 2) // 3 for d in digits) + ascii_ + 1 - lc - dc - sum(map(len, spaces))
+               + HANGUL_TOKENS * hangul + CJK_TOKENS * cjk + size - 1 - ascii_ - 3 * (hangul + cjk))
+        out.append(max(math.ceil(est), -(-size * READ_TOKENS // READ_BYTES)))
+    return out
+
+
 def store(k: str, src, hidden: bool = False, again: bool = False, **opts) -> Path:
     """Converts src into the entry for k and returns it; an entry already there is returned as is, or, with
     `again`, put aside for the new one once that is done."""
@@ -360,9 +388,8 @@ def store(k: str, src, hidden: bool = False, again: bool = False, **opts) -> Pat
     extra = {}
     if {FIGURES_LATE, OCR_LATE, READ_LATE} & set(meta.get("warnings") or []):
         extra["partial"] = True
-    if (tmp / "out.md").stat().st_size > min(READ_TOKENS * READ_TOKEN_BYTES, READ_BYTES):
-        lines = (tmp / "out.md").read_bytes().split(b"\n")
-        extra["line_bytes"] = [len(x) + 1 for x in (lines[:-1] if lines[-1] == b"" else lines)]
+    if sum(tokens := line_tokens((tmp / "out.md").read_text(encoding="utf-8"))) > READ_TOKENS:
+        extra["line_tokens"] = tokens
     if extra:
         import json
         meta.update(extra)

@@ -157,8 +157,18 @@ OCR_LATE = "ocr not finished: time"
 READ_LINES = 2_000
 LINE_CHARS = 2_000         # a paragraph's line is broken to this (Read cuts a longer line)
 READ_TOKENS = 20_000
-READ_TOKEN_BYTES = 3       # the estimate: one token per 3 UTF-8 bytes of a line, its newline counted
 READ_BYTES = 240_000
+# the estimate of Read's tokens for a line, fitted to the counts Read gave for 30 samples (tables of digits, Korean,
+# English and Chinese prose, code, Markdown, random letters, base64, Hangul, Thai and emoji): at or above the count of
+# each written text, and at least 0.8 of each random one's, which READ_TOKENS' room under 25,000 covers. Each other
+# ASCII character, the newline among them, is one token and each other character its UTF-8 bytes, the most a token
+# can hold.
+LETTER_RUN_TOKENS = 0.45   # per run of ASCII letters
+LETTER_TOKENS = 0.57       # per ASCII letter
+SPACE_RUN_TOKENS = 0.1     # per run of spaces
+DIGITS_TOKENS = 1.5        # per three digits of a run, or fewer at its end
+HANGUL_TOKENS = 1.8        # per Hangul syllable or jamo
+CJK_TOKENS = 1.65          # per kana or CJK ideograph
 KINDS = ("unsupported", "encrypted", "drm", "damaged", "too_large", "timeout")
 # a too_large detail starts with one of these and a colon, so the gate can name the limit that was hit
 BIG_INPUT = "input"  # the file is over MAX_INPUT

@@ -499,16 +499,16 @@ def big_sample(paras=7000):
 
 
 def test_long_output_gets_a_window():
-    """An output past the Read window: a read without offset or limit gets the limit that fits READ_TOKENS (one
-    token per READ_TOKEN_BYTES bytes, the newline counted) and READ_BYTES, and the context says how to go on."""
-    from reader import limits
+    """An output past the Read window: a read without offset or limit gets the limit whose lines' estimated tokens
+    fit READ_TOKENS, and the context says how to go on."""
+    from reader import cache, limits
     with stub() as base:
         p = big_sample()
         o = out(run(p, base))
-        md = Path(o["updatedInput"]["file_path"]).read_bytes()
+        md = Path(o["updatedInput"]["file_path"]).read_text(encoding="utf-8")
         assert len(md) > 690_000, len(md)
-        sizes = [len(x) + 1 for x in md.split(b"\n")[:-1]]
-        cap = min(limits.READ_TOKENS * limits.READ_TOKEN_BYTES, limits.READ_BYTES)
+        sizes = cache.line_tokens(md)
+        cap = limits.READ_TOKENS
         n = o["updatedInput"]["limit"]
         assert sum(sizes[:n]) <= cap < sum(sizes[:n + 1]) and "offset" not in o["updatedInput"], (n, o)
         assert o["additionalContext"].endswith(f" Lines 1-{n} of {len(sizes)}; continue with offset={n + 1}."), o
@@ -521,6 +521,18 @@ def test_long_output_gets_a_window():
             assert {k: o["updatedInput"].get(k) for k in keys} == keys and " Lines " not in o["additionalContext"], o
         o = out(run(sample("short"), base))
         assert "limit" not in o["updatedInput"] and " Lines " not in o["additionalContext"], o
+
+
+def test_dense_digits_get_a_window_read_takes():
+    """Single digits between commas, as dense as the digit grids Read counted at one token per byte: the window
+    holds at most READ_TOKENS bytes, which no text can pass in tokens."""
+    from reader import limits
+    with stub() as base:
+        o = out(run(sample("|".join(",".join("1234567890"[(i + j) % 10] for j in range(30)) for i in range(500))),
+                    base))
+        md = Path(o["updatedInput"]["file_path"]).read_bytes()
+        n = o["updatedInput"]["limit"]
+        assert len(md) < 40_000 and sum(len(x) + 1 for x in md.split(b"\n")[:n]) <= limits.READ_TOKENS, (len(md), n)
 
 def test_child_hashes_the_file_itself():
     # a key handed to the child would file a document saved in between under the old content's key
@@ -1100,7 +1112,7 @@ def test_pages_piece_fits_the_read_window():
         p = four_pages()
         o = out(gate.decide(ev(p)))
         n = len(md_lines(o))
-        _edit_meta(p, line_bytes=[25_000] * n)
+        _edit_meta(p, line_tokens=[8_000] * n)
         o = out(gate.decide(ev(p, pages="1-3")))
         lines = md_lines(o)
         u = o["updatedInput"]
@@ -1129,7 +1141,7 @@ def test_pages_offset_continues_inside_a_range_entry():
         assert got.parent.name == cache.key(p, "native") + "-p3-4", got
         n = len(got.read_text(encoding="utf-8").splitlines())
         meta = json.loads((got.parent / "meta.json").read_text(encoding="utf-8"))
-        meta["line_bytes"] = [25_000] * n
+        meta["line_tokens"] = [8_000] * n
         (got.parent / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
         o = out(gate.decide(ev(p, pages="3-4")))
         assert o["additionalContext"].endswith(f' Lines 1-2 of {n}; continue with pages="3-4" offset=3.'), o

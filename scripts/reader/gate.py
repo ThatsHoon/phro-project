@@ -370,17 +370,17 @@ def _index(meta, out_md, pdf, beside_assets=False):
 
 def _window(meta, ti, span=None, pages=""):
     """({"limit": n}, the sentence that says so) for a read without a limit whose lines from its offset (`span` of
-    them, the gate's own limit for a pages= piece, else Read's READ_LINES) would pass READ_TOKENS or READ_BYTES by
-    meta's line_bytes; ({}, "") when they fit, the read has its own limit or the offset is not a line number. The
+    them, the gate's own limit for a pages= piece, else Read's READ_LINES) would pass READ_TOKENS by meta's
+    line_tokens; ({}, "") when they fit, the read has its own limit or the offset is not a line number. The
     sentence names `pages`, the range of a pages= read, with the offset to go on from: that offset alone would be
     a line of another entry or another piece."""
-    sizes = meta.get("line_bytes")
+    sizes = meta.get("line_tokens")
     off = ti.get("offset", 1)
     if "limit" in ti or not isinstance(sizes, list) or not isinstance(off, int) or isinstance(off, bool):
         return {}, ""
     s, m = max(1, off), len(sizes)
     stop = min(m, s - 1 + (span or limits.READ_LINES))
-    cap = min(limits.READ_TOKENS * limits.READ_TOKEN_BYTES, limits.READ_BYTES)
+    cap = limits.READ_TOKENS
     used, e = 0, s - 1
     for b in sizes[s - 1:stop]:
         b = _count(b)

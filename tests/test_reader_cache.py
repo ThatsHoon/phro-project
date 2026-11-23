@@ -111,6 +111,23 @@ def test_unsupported_ext():
     raise AssertionError("ReadError not raised")
 
 
+def test_line_tokens_cover_reads_count():
+    """Counts Claude Code's Read gave, less 8 of its own: 30 single digits between bars, 60 tokens a line with the
+    newline; a one-letter line, 2; 3,000 lines of base64 from random.Random(11), 231,244, which as random text must be
+    estimated at READ_TOKENS / 25,000 of it at least. A line of spaces is charged its bytes / 12, so READ_TOKENS of
+    lines stay under READ_BYTES too."""
+    import base64
+    import random
+    from reader import limits
+    grid = "|".join("526018159083016613186091390996") + "\n"
+    assert cache.line_tokens(grid * 3) == cache.line_tokens(grid) * 3 and cache.line_tokens(grid)[0] >= 60
+    assert cache.line_tokens("x") == cache.line_tokens("x\n") and cache.line_tokens("x")[0] >= 2
+    r = random.Random(11)
+    b64 = "".join(base64.b64encode(r.randbytes(60)).decode() + "\n" for _ in range(3000))
+    assert sum(cache.line_tokens(b64)) >= 231_244 * limits.READ_TOKENS / 25_000, sum(cache.line_tokens(b64))
+    assert cache.line_tokens(" " * 1199) == [100], cache.line_tokens(" " * 1199)
+
+
 def test_cache_hit_skips_convert():
     calls = []
     with stub(calls):
