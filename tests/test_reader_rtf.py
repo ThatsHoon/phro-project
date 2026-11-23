@@ -18,7 +18,12 @@ from reader.limits import ReadError  # noqa: E402
 from reader.model import Context  # noqa: E402
 from metafile_fix import pict, pict_longtext  # noqa: E402
 from reader import images  # noqa: E402
-from reader.model import Image  # noqa: E402
+from reader.model import Equation, Image, Math  # noqa: E402
+from reader.formats.rtf import _plain  # noqa: E402
+from reader.formats import omml  # noqa: E402
+import xml.etree.ElementTree as ET  # noqa: E402
+
+OMML_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 from reader_fix import make_doc, make_zip  # noqa: E402
 
 
@@ -610,6 +615,118 @@ def test_info_properties():
     assert out == ("Properties: subject: Unit 4; author: Kim; last author: Lee; created: 2024-03-05 10:30; "
                    "modified: 2024-04-01 08:00; company: ACME; keywords: lease, rent; Client: Hanbit\n\n"
                    "# Lease\n\nBody\n"), out
+
+
+# ---- Office Math (\mmath)
+def mdoc(body, head=rb"{\rtf1\ansi\ansicpg1252"):
+    return parse(rtf_file(head + body + b"}"))
+
+
+def kinds(blocks):
+    return [type(b).__name__ for b in blocks]
+
+
+def maths(inlines):
+    return [(i.tex, i.hidden) for i in inlines if isinstance(i, Math)]
+
+
+def test_math_inline_in_line():
+    d, ctx = mdoc(rb"Roots {\mmath{\*\moMath{\rtlch\fcs1 \af0 }{\mr x}{\mr =}{\mf{\mfPr{\mctrlPr\i\f0 }}{\mnum{\mr 1}}"
+                  rb"{\mden{\mr 2}}}}} here.\par")
+    assert kinds(d.blocks) == ["Para"], d.blocks
+    inl = d.blocks[0].inlines
+    assert [type(i).__name__ for i in inl] == ["Text", "Math", "Text"], inl
+    assert (inl[0].text, inl[1].tex, inl[2].text) == ("Roots ", r"x=\frac{1}{2}", " here."), inl
+    assert not ctx.skipped, ctx.skipped
+    out = md(rb"{\rtf1 a {\mmath{\*\moMath{\mr x}}} b\par}")
+    assert out == "a $x$ b\n", out
+
+
+def test_math_para_follows_paragraph():
+    d, _ = mdoc(rb"Before {\mmath{\*\moMathPara{\moMathParaPr{\mjc centerGroup}}{\*\moMath{\mr y}}{\*\moMath{\mr z}}}}"
+                rb" after\par Next\par {\mmath{\*\moMathPara{\*\moMath{\mr w}}}}\par")
+    assert kinds(d.blocks) == ["Para", "Equation", "Equation", "Para", "Equation"], d.blocks
+    assert [(b.tex, b.display) for b in d.blocks if isinstance(b, Equation)] == [("y", True), ("z", True), ("w", True)]
+    assert _plain(d.blocks[0].inlines) == "Before  after", d.blocks[0]
+
+
+def test_math_properties():
+    r"""A property is a parameter on the word (\msty0) or the text of its group ({\mchr ...}); a group that names no
+    math element is see-through, its text the run's; hex text is decoded in the document's code page."""
+    cases = [
+        (rb"{\mr\mscr0\msty0 max}", r"\mathrm{max}"),
+        (rb"{\mrad{\mradPr{\mdegHide on}{\mctrlPr\f0 }}{\mdeg}{\me{\mr b}}}", r"\sqrt{b}"),
+        (rb"{\mrad{\mdeg{\mr 3}}{\me{\mr b}}}", r"\sqrt[3]{b}"),
+        (rb"{\mnary{\mnaryPr{\mchr \u8721 ?}{\mlimLoc undOvr}}{\msub{\mr i}}{\msup{\mr n}}{\me{\mr x}}}",
+         r"\sum_{i}^{n}{x}"),
+        (rb"{\msSup{\me{\mr{\i\f0 c}}}{\msup{\mr 2}}}", r"c^{2}"),
+        (rb"{\mr -b\'b1}", r"-b\pm"),
+        (rb"{\i\f0 {\mr a}{\mr b}}", "ab"),
+        (rb"{\mnary{\mnaryPr{\mlimLoc undOvr }}{\msub{\mr i}}{\msup{\mr n}}{\me{\mr x}}}", r"\int\limits_{i}^{n}{x}"),
+        (rb"{\mnary{\mnaryPr\mchr}{\msub}{\msup}{\me{\mr x}}}", r"\int{x}"),
+    ]
+    for body, want in cases:
+        d, _ = mdoc(rb"{\mmath{\*\moMath" + body + rb"}}\par")
+        got = maths(d.blocks[0].inlines) if d.blocks else []
+        assert got == [(want, "")], (body, got)
+
+
+def test_math_tree_is_ooxml_tree():
+    """Past omml's depth an element is its plain text: a property's value is not text there, as in OOXML, and text
+    after an element stays after it."""
+    n = 70
+    body = rb"{\md{\mdPr{\mbegChr [}}{\me " * n + rb"x{\mr\msty2 a}{\i b}" + rb"}}" * n
+    d, _ = mdoc(rb"{\mmath{\*\moMath" + body + rb"}}\par")
+    x = ('<m:d><m:dPr><m:begChr m:val="["/></m:dPr><m:e>' * n
+         + 'x<m:r><m:rPr><m:sty m:val="2"/></m:rPr><m:t>a</m:t></m:r>b' + "</m:e></m:d>" * n)
+    want = omml.tex(ET.fromstring(f'<m:oMath xmlns:m="{OMML_NS}">{x}</m:oMath>'))
+    assert want == r"\left[" * 32 + "xab" + r"\right)" * 32, want
+    assert maths(d.blocks[0].inlines) == [(want, "")], d.blocks[0].inlines[0].tex[-80:]
+
+
+def test_math_lines_of_a_zone():
+    d, _ = mdoc(rb"{\mmath{\*\moMath{\mr a}}{\*\moMath{\mr b}}}\par")
+    inl = d.blocks[0].inlines
+    assert [type(i).__name__ for i in inl] == ["Math", "Break", "Math"], inl
+    assert maths(inl) == [("a", ""), ("b", "")]
+
+
+def test_math_picture_fallback_skipped():
+    png = (rb"89504e470d0a1a0a0000000d494844520000000200000002080600000072b60d240000001549444154789c6394acb8f39f8181"
+           rb"8181094480300024350270cd4262d30000000049454e44ae426082")
+    d, ctx = mdoc(rb"{\mmath{\*\moMath{\mr E}}{\mmathPict{\*\shppict{\pict\pngblip " + png + rb"}}}}\par")
+    assert kinds(d.blocks) == ["Para"], d.blocks
+    assert maths(d.blocks[0].inlines) == [("E", "")]
+    assert not ctx.skipped, ctx.skipped
+    d, _ = mdoc(rb"a{\mmathPict{\*\shppict{\pict\pngblip " + png + rb"}}}\par")
+    assert kinds(d.blocks) == ["Para", "Image"], d.blocks
+
+
+def test_math_zone_inside_zone():
+    """An \\mmath inside a zone, where a group read text again (\\shptxt), is a group of that zone."""
+    d, _ = mdoc(rb"{\mmath{\*\moMath{\mr a}{\shptxt{\mmath{\mr b}}}}}\par")
+    assert maths(d.blocks[0].inlines) == [("ab", "")], d.blocks
+
+
+def test_math_hidden_and_deleted():
+    d, _ = mdoc(rb"a{\v{\mmath{\*\moMath{\mr x}}}}{\deleted{\mmath{\*\moMath{\mr y}}}}\par"
+                rb"{\v{\mmath{\*\moMathPara{\*\moMath{\mr z}}}}}\par")
+    assert maths(d.blocks[0].inlines) == [("x", "hidden"), ("y", "deleted")], d.blocks
+    assert [(b.tex, b.hidden) for b in d.blocks[1:]] == [("z", "hidden")], d.blocks
+
+
+def test_math_left_out_where_text_is():
+    d, _ = mdoc(rb"a{\*\xyz{\mmath{\*\moMath{\mr x}}}}b{\*\mmath{\*\moMath{\mr y}}}"
+                rb"{\*\mmathPr\mmathFont34\mbrkBin0}c{\mr d}\par")
+    inl = d.blocks[0].inlines
+    assert [(type(i).__name__, getattr(i, "text", None) or getattr(i, "tex", None)) for i in inl] == [
+        ("Text", "ab"), ("Math", "y"), ("Text", "cd")], inl
+
+
+def test_math_unclosed_zone():
+    d, _ = parse(rtf_file(rb"{\rtf1 a {\mmath{\*\moMath{\mr x}{\mr y"))
+    inl = d.blocks[0].inlines
+    assert (inl[0].text, maths(inl)) == ("a ", [("xy", "")]), inl
 
 
 def main():

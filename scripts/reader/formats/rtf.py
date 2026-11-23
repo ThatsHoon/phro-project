@@ -35,6 +35,13 @@ paragraph being built and its own open fields, so a note or a header never ends 
   `\\objdata` (hex or `\\bin`, EMBED_BYTES at most) holds an embedded OLE1 object is read by embedded.Objects: an
   equation stands in the line, tables follow the paragraph, and its `\\result` is left out; any other object keeps
   its `\\result`, and a chart left unread is counted.
+* Math: an `\\mmath` group where text is read is an Office Math zone, read as anydoc reads it (`rtf/mod.rs`). Each
+  group inside is the OMML element its first math control word names (`\\mf` is m:f, `\\mr` m:r), a later one a
+  property of it, its parameter the value; a group that names none is see-through; text goes to the innermost
+  element. The text of an element other than a run is its value, kept as m:val as OOXML writes it, so the tree is
+  OOXML's. It goes to `omml`: an m:oMathPara's lines are display Equations after the paragraph, else each
+  m:oMath is a Math in the line, a Break between two. `\\mmathPict`, the picture written for readers without math,
+  is left out. Math control words outside a zone are nothing.
 * Paragraphs: `\\par` and `\\sect` end one; `\\line`, `\\lbr`, `\\page` and `\\column` are a Break; `\\tab` is a space;
   `\\pard` resets the paragraph's outline and style. A paragraph with no text is dropped.
 * Headings: `\\outlinelevelN` (0..8) gives level N+1; so does a paragraph style `\\sN` named `heading N` or
@@ -73,15 +80,16 @@ paragraph being built and its own open fields, so a note or a header never ends 
   pairs (`\\propname`, `\\staticval`) are Doc.meta["properties"] (word_fields.properties).
 """
 import re
+from xml.etree.ElementTree import Element, SubElement
 
 from .. import embedded, images, limits
 from ..containers.cfb import Compound, is_cfb
 from ..limits import ReadError
-from ..model import (Bold, Break, Doc, Heading, Hidden, Image, Inserted, Link, ListItem, Math, NoteRef, Para, Table,
-                     Text)
+from ..model import (Bold, Break, Doc, Equation, Heading, Hidden, Image, Inserted, Link, ListItem, Math, NoteRef, Para,
+                     Table, Text)
 from ..officeart import dib_to_bmp
 from .rtf_lex import BIN, CLOSE, HEX, OPEN, SYM, TEXT, WORD, Pending, codec, tokens
-from . import zip_route
+from . import omml, zip_route
 from .rtf_table import Tables
 from .word_fields import (FORM_DEFAULT, MAX_ENTRIES, MAX_INSTR, MAX_NAME, MAX_PROPERTIES, MAX_PROPERTY, comment_note,
                           form_state, hyperlink_url, properties)
@@ -136,6 +144,23 @@ _PAR_WORDS = frozenset(("par", "sect"))
 _BLIPS = {"pngblip": "png", "jpegblip": "jpeg", "emfblip": "emf", "wmetafile": "wmf", "dibitmap": "dib",
           "macpict": "pict"}
 _UNREAD = ("wbitmap", "pmmetafile")
+_M = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+_VAL = _M + "val"
+_CONTENT = frozenset((_M + "r", _M + "t"))  # the elements whose text is text; any other's is its m:val
+# every OMML element name, its control word without the m (anydoc's list)
+_OMML = frozenset((
+    "acc", "accPr", "aln", "alnScr", "argPr", "argSz", "bar", "barPr", "baseJc", "begChr", "borderBox", "borderBoxPr",
+    "box", "boxPr", "brk", "brkBin", "brkBinSub", "cGp", "cGpRule", "chr", "count", "cSp", "ctrlPr", "d", "defJc",
+    "deg", "degHide", "den", "diff", "dispDef", "dPr", "e", "endChr", "eqArr", "eqArrPr", "f", "fName", "fPr", "func",
+    "funcPr", "groupChr", "groupChrPr", "grow", "hideBot", "hideLeft", "hideRight", "hideTop", "interSp", "intLim",
+    "intraSp", "jc", "lim", "limLoc", "limLow", "limLowPr", "limUpp", "limUppPr", "lit", "lMargin", "m", "mathFont",
+    "mathPr", "maxDist", "mc", "mcJc", "mcPr", "mcs", "mPr", "mr", "nary", "naryLim", "naryPr", "noBreak", "nor", "num",
+    "objDist", "oMath", "oMathPara", "oMathParaPr", "opEmu", "phant", "phantPr", "plcHide", "pos", "postSp", "preSp",
+    "r", "rad", "radPr", "rMargin", "rPr", "rSp", "rSpRule", "scr", "sepChr", "show", "shp", "smallFrac", "sPre",
+    "sPrePr", "sSub", "sSubPr", "sSubSup", "sSubSupPr", "sSup", "sSupPr", "strikeBLTR", "strikeH", "strikeTLBR",
+    "strikeV", "sty", "sub", "subHide", "sup", "supHide", "t", "transp", "type", "vertJc", "wrapIndent", "wrapRight",
+    "zeroAsc", "zeroDesc", "zeroWid",
+))
 
 
 class _Group:
@@ -152,8 +177,8 @@ class _Group:
         self.auth = self.auth_del = None
         self.dest = ""        # the last destination word seen here or in a parent
         self.suppress = False  # text is left out
-        self.cap = ""         # "fldinst", "title", "style", "list", "pict", "revtbl", "atnid" or "atnauthor": text is
-                              # captured there, even when suppressed
+        self.cap = ""         # "fldinst", "title", "style", "list", "pict", "math", "revtbl", "atnid" or "atnauthor":
+                              # text is captured there, even when suppressed
         self.sty = None       # \sN of the paragraph
         self.outline = None   # \outlinelevelN of the paragraph
         self.in_table = False  # \intbl
@@ -194,6 +219,47 @@ class _Obj:
         self.seen = False     # an objdata group was met (a second one is skipped)
         self.shown = False    # the object was placed, so its result is left out
         self.counted = False  # the object was counted (a chart left unread, an equation converted in part)
+
+
+class _Math:
+    """An \\mmath zone being read: its open groups as elements, innermost last, each with its depth; the first is the
+    zone, a tag of "" a group that named no element yet."""
+    __slots__ = ("depth", "open")
+
+    def __init__(self, depth):
+        self.depth = depth
+        self.open = [(depth, Element(""))]
+
+    def close(self):
+        _, el = self.open.pop()
+        parent = self.open[-1][1]
+        if el.tag:
+            if el.tag not in _CONTENT and el.text and not len(el):
+                el.set(_VAL, el.text.strip())
+                el.text = None
+            parent.append(el)
+        else:
+            _text_to(parent, el.text)
+            parent.extend(el)
+
+    def word(self, name, p):
+        el = self.open[-1][1]
+        if not el.tag:
+            el.tag = _M + name
+        else:
+            prop = SubElement(el, _M + name)
+            if p is not None:
+                prop.set(_VAL, str(p))
+
+
+def _text_to(el, s):
+    """Text after what `el` holds so far."""
+    if not s:
+        return
+    if len(el):
+        el[-1].tail = (el[-1].tail or "") + s
+    else:
+        el.text = (el.text or "") + s
 
 
 class _Field:
@@ -352,6 +418,7 @@ class _Reader:
         self.data = b""        # the input the BIN tokens point into
         self.pic = None        # the picture being collected
         self.obj = None        # the object being read
+        self.math = None       # the \mmath zone being read
         self.objects = embedded.of(ctx)
         self.img_total = 0     # bytes of the pictures emitted so far (IMAGE_BYTES)
         # Cells the tables of the document may still take: one budget for the whole document, shared by every table
@@ -474,6 +541,8 @@ class _Reader:
         g = self.g = self.g.clone()
         if g.cap in ("pict", "objdata"):
             g.cap, g.suppress = "", True  # a group inside a picture (its uid, its properties) is not data
+        elif g.cap == "math":
+            self.math.open.append((len(self.stack), Element("")))
         elif g.cap == "style" and len(self.stack) != self.ss_depth + 1:
             g.cap = ""
         elif g.dest == "stylesheet" and len(self.stack) == self.ss_depth + 1:
@@ -493,6 +562,12 @@ class _Reader:
         closing = self.g
         if self.pic is not None and depth == self.pic.depth:
             self.finish_pict(closing)
+        math = self.math
+        if math is not None:
+            if depth == math.depth:
+                self.finish_math(closing)
+            elif math.open[-1][0] == depth:
+                math.close()
         obj = self.obj
         if obj is not None:
             if depth == obj.depth:
@@ -563,6 +638,8 @@ class _Reader:
                 entries = fields[-1].form["entries"] if fields and fields[-1].form else None
                 if entries and len(entries[-1]) < MAX_NAME:
                     entries[-1] += s[:MAX_NAME]
+            elif cap == "math":
+                _text_to(self.math.open[-1][1], s)
             elif cap == "formfield":
                 pass
             elif cap == "revtbl":
@@ -686,6 +763,7 @@ class _Reader:
             "nestcell": self.w_end(True, "cell"), "nestrow": self.w_end(True, "row"), "trleft": self.w_trleft,
             **{name: self.w_blip(kind) for name, kind in _BLIPS.items()},
             **{name: self.w_blip(None) for name in _UNREAD},
+            "mmath": self.w_mmath, "mmathPict": self.w_mmath_pict, **{"m" + name: self.w_math(name) for name in _OMML},
         }
 
     def w_u(self, p, fresh):
@@ -942,6 +1020,40 @@ class _Reader:
             self.pict_fail(pic)
         else:
             pic.raw.append(bytes(self.data[off:off + n]))
+
+    # ---- math
+    def w_mmath(self, p, fresh):
+        g = self.g
+        if (self.stack[-1].suppress if fresh == 2 and self.stack else g.suppress) or g.cap:
+            return
+        self.math = _Math(len(self.stack))
+        g.cap = "math"
+
+    def w_mmath_pict(self, p, fresh):
+        g = self.g
+        if g.cap == "math":
+            g.cap, g.suppress = "", True
+
+    def w_math(self, name):
+        def word(p, fresh):
+            if self.g.cap == "math":
+                self.math.word(name, p)
+        return word
+
+    def finish_math(self, g):
+        """The zone's group closes: its equations into the story, display ones after the paragraph under way."""
+        zone, self.math = self.math.open[0][1], None
+        hidden = "deleted" if g.dele else "hidden" if g.hidden else ""
+        story = self.story
+        paras = [c for c in zone if omml.is_math(c, "oMathPara")]
+        if paras:
+            story.extras.extend(Equation(t, hidden=hidden) for para in paras for t in omml.lines(para))
+            return
+        for i, t in enumerate(omml.lines(zone)):
+            if i:
+                story.cur.append(Break(hidden=hidden))
+            story.cur.append(Math(t, hidden=hidden))
+            story.has = True
 
     # ---- objects
     def obj_data(self, chunk, chars, nraw):
