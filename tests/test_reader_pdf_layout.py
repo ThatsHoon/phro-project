@@ -198,6 +198,17 @@ def test_joined_line_has_the_size_of_most_of_its_text():
     assert len(got) == 1 and got[0].size == 10.0, got
 
 
+def test_joined_line_keeps_the_space_its_piece_ended_with():
+    """A large number on its own baseline cuts a heading's words into two lines, which are joined again: the space
+    the first piece's last fragment ends with stays, though the next piece starts under a space's width after it (a
+    pdf from Hangul, 301936fe18 p. 290)."""
+    got = L.lines(numbered([frag("15.", 124.32, 321.52, 24.96, width=31.88),
+                            frag("과장 ", 166.68, 328.12, width=24.92),
+                            frag("전결사항인 ", 192.36, 328.12, width=56.72),
+                            frag("기안문을", 249.84, 328.12, width=46.04)]))
+    assert texts(got) == ["15. 과장 전결사항인 기안문을"], texts(got)
+
+
 def test_toc_entry_ends_paragraph():
     # evenly spaced table-of-contents entries: each one ends at its leader and page label
     assert _paras("Introduction ........ 1", "Scope · · · ··········· 12",

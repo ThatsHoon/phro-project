@@ -380,6 +380,7 @@ class Line:
     vertical: bool = False
     direction: str = "ltr"
     tag: int = -1   # the structure element whose block it is, on a tagged page (`tagged_place`)
+    spaced: bool = False   # its last fragment along the line ends with a space, which `text` leaves out
 
 
 def _unit(x, y, default):
@@ -515,8 +516,9 @@ def _runs(chars):
 def _make_line(frags, chars, vertical=False):
     runs = _runs(chars)
     main = max(frags, key=lambda f: len(f.text))
+    last = max(frags, key=lambda f: along(f) + f.width)
     return Line("".join(t for t, _ in runs), runs, box_of(frags), main.size,
-                min(f.order for f in frags), vertical, writing_direction(main))
+                min(f.order for f in frags), vertical, writing_direction(main), spaced=last.text[-1:].isspace())
 
 
 def _glyphs(f, urls):
@@ -987,7 +989,8 @@ def _along(prev, ln) -> bool:
 
 def _whole(lns) -> list:
     """`lns` with each line that goes on along the one before it (`_along`) made one line with it, a space between
-    them when they are over ALONG_SPACE of the smaller one's size apart. The line has the size that holds the most of
+    them when they are over ALONG_SPACE of the smaller one's size apart or the first ended with a space (`spaced`).
+    The line has the size that holds the most of
     its chars over all its pieces (a large number or initial before the body's words does not make a heading of
     them)."""
     out, chain = [], []
@@ -997,7 +1000,7 @@ def _whole(lns) -> list:
             first = chain[0]
             runs, box = list(first.runs), first.box
             for prev, ln in zip(chain, chain[1:]):
-                if ln.box[0] - prev.box[2] > ALONG_SPACE * min(prev.size, ln.size) and not ln.vertical:
+                if (ln.box[0] - prev.box[2] > ALONG_SPACE * min(prev.size, ln.size) or prev.spaced) and not ln.vertical:
                     runs.append((" ", ""))
                 runs.extend(ln.runs)
                 box = (min(box[0], ln.box[0]), min(box[1], ln.box[1]), max(box[2], ln.box[2]), max(box[3], ln.box[3]))
@@ -1005,7 +1008,7 @@ def _whole(lns) -> list:
             for ln in chain:
                 chars[ln.size] += len(ln.text)
             out[-1] = replace(first, text="".join(t for t, _ in runs), runs=runs, box=box,
-                              size=max(chars, key=chars.get))
+                              size=max(chars, key=chars.get), spaced=chain[-1].spaced)
         chain.clear()
     reach = None
     for ln in lns:
