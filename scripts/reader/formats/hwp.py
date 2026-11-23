@@ -47,6 +47,7 @@ _DRM = (b"SCDSA", b"\x9b DRMONE")  # SoftCamp and Fasoo DRM containers (rhwp par
 _SECTION = re.compile(r"(bodytext|viewtext)/section(\d+)", re.I)
 _SECTIONS = 1000
 MAX_OBJECTS = 256  # OLE items one document reads (the rest are counted under object)
+_OLE_LOSSES = ("object", "chart", "depth")  # what a read of an OLE item counts, again at each later placement
 _DELETE = 0x11  # the PARA_RANGE_TAG kind (top byte of its tag) of a tracked deletion; 0x10, an insertion, stays
 # control characters: one unit (char class) unless listed here; these take eight units
 _EXTENDED = frozenset((1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23))  # the k-th one owns the k-th CTRL_HEADER
@@ -905,8 +906,8 @@ class _Reader(Scopes):
         table, an equation, a package's tables) stands where a picture would; an item two shapes name is read once,
         but every placement is charged against
         CHART_TOTAL, as in the Word and slide readers, and one past it is counted under chart instead. In a header or
-        footer it is skipped (margin). An item that is not read is counted at every placement, under the kind its
-        first read counted it as."""
+        footer it is skipped (margin). What an item's read counted (an item not read, an equation converted in part)
+        is counted at every placement, under the kind its first read counted it as."""
         if self.margins:
             return self.end(recs, j)
         data = recs[j].data
@@ -918,10 +919,9 @@ class _Reader(Scopes):
                 if self.objects > MAX_OBJECTS:  # past the cap: counted under object, not read
                     self.ctx.skipped["object"] += 1
                     return self.end(recs, j)
-                before = self.ctx.skipped["object"], self.ctx.skipped["chart"]
+                before = {k: self.ctx.skipped[k] for k in _OLE_LOSSES}
                 blocks = ole_blocks(item, self.ctx, sheets=self.sheets)
-                lost = None if blocks else ("object" if self.ctx.skipped["object"] > before[0] else
-                                            "chart" if self.ctx.skipped["chart"] > before[1] else None)
+                lost = next((k for k in _OLE_LOSSES if self.ctx.skipped[k] > before[k]), None)
                 self.tables[item] = blocks, sum(len(r) for b in blocks if isinstance(b, Table) for r in b.rows), lost
             elif self.tables[item][2]:
                 self.ctx.skipped[self.tables[item][2]] += 1

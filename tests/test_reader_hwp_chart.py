@@ -448,6 +448,16 @@ def test_unread_ole_counted_at_every_placement():
     assert out == "(could not read: 2 embedded objects)\n\n앞\n\n뒤\n", out
 
 
+def test_partial_equation_counted_at_every_placement():
+    # an equation converted in part keeps its TeX and is counted, at each of its two placements as an unread one is
+    from reader_fix import eq_native, mtef_v5
+    from test_reader_doc_objects import c5, l5
+    item = envelope({"Equation Native": eq_native(mtef_v5(l5(c5("a") + bytes((99, 0)) + c5("b"))))})
+    out, ctx = read(doc(ole_shape(1), ole_shape(2), bins=items((2, 0, 1), (2, 0, 1)), streams={"BIN0001.OLE": item}))
+    assert ctx.skipped == {"object": 2}, ctx.skipped
+    assert out.count("$$a$$") == 2, out
+
+
 def test_chart_placements_charged():
     # every placement of one chart is charged against CHART_TOTAL, as in docx and pptx: a chart near CHART_CELLS placed
     # 50 times is placed while the cells stay under the cap, each one past it is counted under chart, and the render
