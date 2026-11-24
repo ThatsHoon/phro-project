@@ -300,9 +300,13 @@ class _Folder:
 
     def __init__(self, pkg, prefix):
         self.pkg, self.prefix = pkg, prefix
+        self.names = [n[len(prefix):] for n in pkg.names if n.startswith(prefix)]
 
     def has(self, name) -> bool:
         return self.pkg.has(self.prefix + name)
+
+    def size(self, name) -> int:
+        return self.pkg.size(self.prefix + name)
 
     def read(self, name) -> bytes:
         return self.pkg.read(self.prefix + name)

@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Union
 
+from . import limits
 from .limits import ReadError
 
 
@@ -174,7 +175,8 @@ class Context:
 
     `vba` holds (name, kind, source) of the VBA modules read (containers.vba), `vba_modules` how many modules were
     opened (VBA_MODULES) and `vba_bytes` the bytes decompressed for them (VBA_BYTES). `scripts` holds (name, kind,
-    source) of the Hancom document scripts read (hancom.scripts). `embedded` is the document's
+    source, file extension) of the document's other scripts read (hancom.scripts, odf.macros), `script_files` and
+    `script_bytes` what the OpenDocument ones charged (script_room). `embedded` is the document's
     embedded.Objects, made by embedded.of. `notes` holds the notes of embedded workbooks, key -> blocks, which
     reader.parse adds to Doc.notes. `stop` is the `clock()` time the read may run to (reader.convert sets it), None
     for no limit."""
@@ -189,8 +191,19 @@ class Context:
         self.vba_modules = 0
         self.vba_bytes = 0
         self.scripts: list = []
+        self.script_files = 0
+        self.script_bytes = 0
         self.embedded = None
         self.notes: dict = {}
+
+    def script_room(self, n: int) -> bool:
+        """Whether one more macro file of `n` bytes fits the document's SCRIPT_FILES and SCRIPT_BYTES, charged to
+        them when it does."""
+        if self.script_files >= limits.SCRIPT_FILES or self.script_bytes + n > limits.SCRIPT_BYTES:
+            return False
+        self.script_files += 1
+        self.script_bytes += n
+        return True
 
     def late(self) -> bool:
         """Whether the read's time is over. A format asks before each row, record, page or part, stops reading at

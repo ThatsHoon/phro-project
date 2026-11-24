@@ -23,7 +23,7 @@ import test_reader_hwpx as in_hwpx  # noqa: E402
 HEADER = "var Documents = XHwpDocuments;\r\nvar Document = Documents.Active_XHwpDocument;\r\n"
 NEW = "function OnDocument_New()\r\n{\r\n\t//todo : \r\n}\r\n"
 OPEN = 'function OnDocument_Open()\r\n{\r\n\tDocument.Run("x");\r\n}\r\n'
-OPENED = ("source", "JScript source", 'function OnDocument_Open()\n{\n\tDocument.Run("x");\n}')
+OPENED = ("source", "JScript source", 'function OnDocument_Open()\n{\n\tDocument.Run("x");\n}', "js")
 DIST = 1 << 2
 
 
@@ -67,9 +67,10 @@ def test_a_new_documents_scripts_are_left_out():
 
 def test_every_part_a_new_document_lacks_is_listed():
     doc, ctx = hwp(packed(raw("var n = 1;\r\n", NEW, "\r\n  before();\r\n\r\n", "after();\rdone();", "fifth();")))
-    assert doc.meta.get("scripts") == [("header", "JScript header", "var n = 1;"),
-                                       ("pre-source", "JScript pre-source", "  before();"),
-                                       ("post-source", "JScript post-source", "after();\ndone();")], doc.meta.get("scripts")
+    assert doc.meta.get("scripts") == [("header", "JScript header", "var n = 1;", "js"),
+                                       ("pre-source", "JScript pre-source", "  before();", "js"),
+                                       ("post-source", "JScript post-source", "after();\ndone();", "js")
+                                       ], doc.meta.get("scripts")
     assert not ctx.skipped, ctx.skipped
     # what follows the fourth part is not read, so stray bytes there lose nothing
     doc, ctx = hwp(packed(raw(HEADER, OPEN, "", "", end=False) + b"\x01"))
@@ -117,11 +118,11 @@ def test_a_distribution_documents_scripts_are_decrypted():
     # a header part 28 units long starts as the record's tag does, without its size
     head = "var Documents = XHwpDoc; //x"
     doc, ctx = hwp(raw(head, OPEN), 0)
-    assert len(head) == 28 and doc.meta.get("scripts") == [("header", "JScript header", head), OPENED], ctx.skipped
+    assert len(head) == 28 and doc.meta.get("scripts") == [("header", "JScript header", head, "js"), OPENED], ctx.skipped
 
 
 def test_parts_before_a_cut_are_kept():
-    head = ("header", "JScript header", "var n = 1;")
+    head = ("header", "JScript header", "var n = 1;", "js")
     doc, ctx = hwp(packed(raw("var n = 1;\r\n", OPEN)[:-6]))
     assert doc.meta.get("scripts") == [head] and ctx.skipped == {"script": 1}, (doc.meta.get("scripts"), ctx.skipped)
     long = packed(raw("var n = 1;\r\n", "".join(f"x{i:x};" for i in range(20000))))
@@ -172,9 +173,9 @@ def render(doc, ctx):
 
 def test_out_md_lists_scripts_and_the_source_is_a_file():
     doc = Doc(blocks=[Para([Text("body")])])
-    doc.meta["scripts"] = [OPENED, ("header", "JScript header", "var n = 1;")]
+    doc.meta["scripts"] = [OPENED, ("header", "JScript header", "var n = 1;", "js")]
     md, out = render(doc, Context())
-    assert md == ("Hancom scripts (source in assets/scripts/): source.js (JScript source, 4 lines); "
+    assert md == ("Document scripts (source in assets/scripts/): source.js (JScript source, 4 lines); "
                   "header.js (JScript header, 1 line)\n\nbody\n"), md
     folder = out / "assets" / "scripts"
     assert (folder / "source.js").read_text(encoding="utf-8") == OPENED[2] + "\n"
@@ -182,7 +183,7 @@ def test_out_md_lists_scripts_and_the_source_is_a_file():
     ctx = Context()
     ctx.skipped["script"] = 1
     md, _ = render(Doc(blocks=[Para([Text("body")])]), ctx)
-    assert md == "(could not read: Hancom scripts)\n\nbody\n", md
+    assert md == "(could not read: document scripts)\n\nbody\n", md
 
 
 def test_the_gate_names_the_scripts_folder():
@@ -191,10 +192,10 @@ def test_the_gate_names_the_scripts_folder():
         md.write_text("x\n", encoding="utf-8")
         folder = str(Path(tmp) / "assets" / "scripts") + gate.os.sep
         c = gate._context("a.hwp", {"lines": 5, "scripts": 2}, md)
-        assert f"2 Hancom scripts in {folder}; Read one to see its source" in c, c
+        assert f"2 document scripts in {folder}; Read one to see its source" in c, c
         c = gate._context("a.hwp", {"lines": 5, "scripts": 1}, md)
-        assert f"1 Hancom script in {folder}" in c, c
-        assert "Hancom" not in gate._context("a.hwp", {"lines": 5, "scripts": True}, md)
+        assert f"1 document script in {folder}" in c, c
+        assert "document script" not in gate._context("a.hwp", {"lines": 5, "scripts": True}, md)
 
 
 def test_convert_writes_the_script_count():

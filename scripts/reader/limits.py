@@ -55,7 +55,9 @@ BIN_RECORDS = 2_000_000    # records of one document's BIFF streams, one BIFF12 
 DECRYPT_BYTES = 32 * 2**20  # bytes one xls or ppt stream may decrypt
 VBA_MODULES = 256           # VBA modules one document reads, all its projects together
 VBA_BYTES = 2 * 2**20       # bytes one document's VBA projects decompress to or scan (dir streams and source)
-SCRIPT_BYTES = 2 * 2**20    # bytes of one Hancom script stream (hwp, inflated) or part (hwpx)
+SCRIPT_BYTES = 2 * 2**20    # bytes of one Hancom script stream (hwp, inflated) or part (hwpx); of all the
+#                             OpenDocument macro files one document reads, the documents it embeds with it
+SCRIPT_FILES = 256          # OpenDocument macro files (Basic modules, scripts) one document reads, as SCRIPT_BYTES
 EMBED_BYTES = 16 * 2**20    # bytes of one Excel workbook stream embedded in an hwp or doc object
 EMBED_TOTAL = 4 * EMBED_BYTES  # bytes the packages embedded in one document inflate to, all together
 EMBED_NODES = 2_000_000     # XML elements built into trees for one document's embedded objects, all together

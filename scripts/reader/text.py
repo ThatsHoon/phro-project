@@ -6,6 +6,17 @@ GARBLED = 0.05   # a garble_ratio past it makes the text "garbled" (reader.conve
 _BAD = re.compile("[\ufffd\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
+def source(text: str) -> str:
+    """Program source as a file holds it: a BOM dropped, line ends LF, the blank lines before and after the code
+    gone; "" for a blank one."""
+    lines = text.removeprefix("﻿").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
 def garble_ratio(s: str) -> float:
     """Share of U+FFFD and control characters other than tab and newline."""
     if not s:

@@ -135,6 +135,7 @@ class Objects:
         own.embedded = self
         own.stop, own.clock = self.ctx.stop, self.ctx.clock
         own.vba_modules, own.vba_bytes = self.ctx.vba_modules, self.ctx.vba_bytes
+        own.script_files, own.script_bytes = self.ctx.script_files, self.ctx.script_bytes
         return own
 
     def load(self, data: bytes, ctx=None):
@@ -165,6 +166,7 @@ class _Reading(Context):
         self.host, self.embedded = host, of(host)
         self.stop, self.clock = host.stop, host.clock
         self.vba_modules, self.vba_bytes = host.vba_modules, host.vba_bytes
+        self.script_files, self.script_bytes = host.script_files, host.script_bytes
 
     def late(self) -> bool:
         if not (self.skipped["time"] or self.skipped["object_cut"]):
@@ -402,13 +404,16 @@ def document(parse, ctx, what):
 
 
 def _macros(own, ctx, what):
-    """What the read in `own` (a Context `Objects.inner` or `_Reading` made, starting from the document's VBA budget)
-    found of VBA goes to the document's `ctx`: its modules, each kind marked "in an embedded `what`", the budget it
-    left and its vba and vba_module counts."""
+    """What the read in `own` (a Context `Objects.inner` or `_Reading` made, starting from the document's VBA and
+    scripts budgets) found of VBA and other scripts goes to the document's `ctx`: its modules and scripts, each kind
+    marked "in an embedded `what`", the budgets it left and its vba, vba_module and script counts."""
     ctx.vba += [(name, f"{kind}, in an embedded {what}", source) for name, kind, source in own.vba]
     ctx.vba_modules, ctx.vba_bytes = own.vba_modules, own.vba_bytes
-    if own.skipped.pop("vba", 0):
-        ctx.skipped["vba"] = 1
+    ctx.scripts += [(name, f"{kind}, in an embedded {what}", source, ext) for name, kind, source, ext in own.scripts]
+    ctx.script_files, ctx.script_bytes = own.script_files, own.script_bytes
+    for key in ("vba", "script"):
+        if own.skipped.pop(key, 0):
+            ctx.skipped[key] = 1
     lost = own.skipped.pop("vba_module", 0)
     if lost:
         ctx.skipped["vba_module"] += lost
@@ -436,7 +441,11 @@ def _odf(pkg, ctx):
             return BAD
         return _shown(_tables(got), own, ctx)
     if any(local(c.tag) == "spreadsheet" for c in inner):
+        from .formats import odf
         doc = odf_sheets.sheets(pkg, own, root, None, first=True)
+        with own.guard("script"):
+            odf.macros(pkg, own, odf.locked(pkg, own))
+        _macros(own, ctx, "OpenDocument spreadsheet")
         sec = next((b for b in doc.blocks if isinstance(b, Section) and not b.hidden), None)
         return _shown(sheet_tables(sec.blocks, sec.title) if sec is not None else [], own, ctx, doc.notes)
     return None

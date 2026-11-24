@@ -8,6 +8,7 @@ from bisect import bisect_left
 from .. import diagram, limits
 from ..model import (Bold, Break, Cell, Equation, Heading, Hidden, Inserted, Link, ListItem, Math, NoteRef, Para, Table,
                      Text)
+from ..text import source
 
 AUTO_ALT = re.compile(r"^(그림|사각형|선|타원|글상자|표|수식)입니다(?:\.\s*|\s+|$)")
 _AUTO_FIELD = re.compile(r"^(?:원본 그림의 이름|원본 그림의 크기|사진 찍은 날짜)\s*:")
@@ -904,19 +905,12 @@ _SCRIPT_NEW = {"header": "var Documents = XHwpDocuments; var Document = Document
 
 
 def scripts(texts) -> list:
-    """(name, kind, source) of a document's JScript parts, `texts` in SCRIPT_PARTS order (hwp's DefaultJScript holds
-    all four, hwpx the first two). A blank part, or one that is what a new document holds, is left out; a BOM is
-    dropped, line ends become LF and blank lines before and after the text go."""
+    """(name, kind, source, "js") of a document's JScript parts, `texts` in SCRIPT_PARTS order (hwp's DefaultJScript
+    holds all four, hwpx the first two), each as text.source gives it. A blank part, or one that is what a new
+    document holds, is left out."""
     out = []
     for name, text in zip(SCRIPT_PARTS, texts):
-        text = text.removeprefix("\ufeff")
-        flat = " ".join(text.split())
-        if not flat or flat == _SCRIPT_NEW.get(name):
-            continue
-        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        while not lines[0].strip():
-            lines.pop(0)
-        while not lines[-1].strip():
-            lines.pop()
-        out.append((name, f"JScript {name}", "\n".join(lines)))
+        text = source(text)
+        if text and " ".join(text.split()) != _SCRIPT_NEW.get(name):
+            out.append((name, f"JScript {name}", text, "js"))
     return out

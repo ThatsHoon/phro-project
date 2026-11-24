@@ -93,9 +93,13 @@ LOST = (
     (("record",), "damaged record", "damaged records"),
     (("depth",), "place nested too deeply", "places nested too deeply"),
     (("vba_module",), "VBA module", "VBA modules"),
+    (("dialog",), "Basic dialog", "Basic dialogs"),
 )
 # Named items: reported after the counted ones, by name only (a flag, not a count).
-NAMED = (("vba", "VBA macros"), ("script", "Hancom scripts"), ("xfa", "XFA form"), ("attachment", "attached files"),
+NAMED = (("vba", "VBA macros"), ("script", "document scripts"),
+         ("script_locked", "password-protected Basic libraries"),
+         ("linked_basic", "linked Basic libraries (in other files)"), ("xfa", "XFA form"),
+         ("attachment", "attached files"),
          ("kf8_fallback", "KF8 layout (the MOBI 6 copy was read)"), ("plain_text", "book markup (read as plain text)"),
          ("page_images", "page images (text layer only)"), ("linked_data", "linked tables' data (in other files)"),
          ("toc", "table of contents (its headings, or the rest of them, are not marked)"),
@@ -1194,9 +1198,9 @@ class _Render:
         if props:
             status.append("Properties: " + "; ".join(f"{k}: {v}" for k, v in props))
         if mods:
-            status.append(self._sources(mods, "vba", "bas", "module", "VBA modules"))
+            status.append(self._sources([(*m, "bas") for m in mods], "vba", "module", "VBA modules"))
         if codes:
-            status.append(self._sources(codes, "scripts", "js", "script", "Hancom scripts"))
+            status.append(self._sources(codes, "scripts", "script", "Document scripts"))
         if hf:
             status.append("\n".join(hf))
         top = status + top
@@ -1205,24 +1209,24 @@ class _Render:
             return "\n\n".join(top + ([text] if text else []) + [tail])
         return "\n\n".join(top + ([text] if text else []))
 
-    def _sources(self, items, folder, ext, blank, what) -> str:
-        """The line naming a document's macro or script sources, (name, kind, source) each, their source written to
-        <assets>/<folder>/<name>.<ext>. A file name keeps the name's letters, digits, `_` and `-` (64 at most,
-        anything else `_`; `blank` for none); a name Windows reserves for a device gets a leading `_`, and a name
-        already taken, whatever its case, a number. A source whose file is not named as it is has its own name,
+    def _sources(self, items, folder, blank, what) -> str:
+        """The line naming a document's macro or script sources, (name, kind, source, ext) each, their source written
+        to <assets>/<folder>/<name>.<ext>. A file name keeps the name's letters, digits, `_` and `-` (64 at most,
+        anything else `_`; `blank` for none); a name Windows reserves for a device gets a leading `_`, and a file
+        name already taken, whatever its case, a number. A source whose file is not named as it is has its own name,
         quoted, beside the file's. The line names SOURCES_NAMED sources and counts the rest; every file is written."""
         path = self.assets_dir / folder
         path.mkdir(parents=True, exist_ok=True)
         taken, named = set(), []
-        for name, kind, source in items:
+        for name, kind, source, ext in items:
             stem = re.sub(r"[^\w-]", "_", name)[:64] or blank
             if _RESERVED.fullmatch(stem):
                 stem = "_" + stem
             base, n = stem, 1
-            while stem.lower() in taken:
+            while f"{stem}.{ext}".lower() in taken:
                 n += 1
                 stem = f"{base}-{n}"
-            taken.add(stem.lower())
+            taken.add(f"{stem}.{ext}".lower())
             (path / f"{stem}.{ext}").write_text(source + "\n", encoding="utf-8", newline="\n")
             lines = source.count("\n") + 1
             shown = one_line(name)[:64]

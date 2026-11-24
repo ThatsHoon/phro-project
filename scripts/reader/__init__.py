@@ -149,7 +149,7 @@ def convert(src, out_dir, hidden=False, backend=None, **opts) -> dict:
     if doc.meta.get("vba"):
         meta["vba"] = len(doc.meta["vba"])  # VBA modules whose source is under assets/vba/
     if doc.meta.get("scripts"):
-        meta["scripts"] = len(doc.meta["scripts"])  # Hancom scripts whose source is under assets/scripts/
+        meta["scripts"] = len(doc.meta["scripts"])  # other scripts (Hancom, OpenDocument) whose source is under assets/scripts/
     if doc.meta and "engine" in doc.meta:
         meta.update(engine=doc.meta["engine"], pages_total=doc.meta.get("pages_total"),
                     unrendered=doc.meta.get("unrendered"), figures=doc.meta.get("figures"), pages=st["pages"])

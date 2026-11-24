@@ -487,7 +487,7 @@ def _head(name, meta, assets):
     head = f"{name} was converted to Markdown by phro-project ({n} line{'' if n == 1 else 's'}"
     if m:
         head += f", {m} image in {assets}; Read it to view" if m == 1 else f", {m} images in {assets}; Read them to view"
-    for key, what, folder in (("vba", "VBA module", "vba"), ("scripts", "Hancom script", "scripts")):
+    for key, what, folder in (("vba", "VBA module", "vba"), ("scripts", "document script", "scripts")):
         v = meta.get(key, 0)
         if isinstance(v, int) and not isinstance(v, bool) and v > 0:
             head += f", {v} {what}{'' if v == 1 else 's'} in {assets}{folder}{os.sep}; Read one to see its source"
